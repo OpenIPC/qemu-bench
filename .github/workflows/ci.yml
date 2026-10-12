@@ -637,6 +637,45 @@ jobs:
           kill $QEMU_PID 2>/dev/null || true
           exit 1
 
+      - name: "Guest reboot boots the kernel again"
+        timeout-minutes: 4
+        run: |
+          # init=/bin/false: PID 1 exits, the kernel panics, and panic=1
+          # sends it through its restart handler a second later (SC_SYSRES
+          # on every matrix SoC).  A second "Linux version" banner proves
+          # the whole reset path: the guest's restart code reaches
+          # SC_SYSRES (hi3516cv100's tcm_slow_reset), QEMU resets, and the
+          # rebooted kernel gets far enough to print (the vendor GIC
+          # driver's GDIF flag at sysctrl+0x130 must not survive reset).
+          # 3.x kernels that ignore a missing init= still exec /bin/false.
+          QEMU=./qemu-src/build/qemu-system-arm
+          : > reboot-output.txt
+          timeout 180 $QEMU \
+            -M ${{ matrix.machine }} -smp ${{ matrix.smp || 1 }} \
+            -kernel "qemu-boot/uImage.${{ matrix.soc }}" \
+            -initrd "qemu-boot/rootfs.squashfs.${{ matrix.soc }}" \
+            -nographic -serial file:reboot-output.txt -monitor none \
+            -nic user,restrict=on \
+            -append '${{ matrix.append }} init=/bin/false panic=1' \
+            -d unimp,guest_errors -D qemu-boot/qemu-reboot.log &
+          QEMU_PID=$!
+
+          for i in $(seq 1 170); do
+            if [ "$(grep -c 'Linux version' reboot-output.txt 2>/dev/null)" -ge 2 ]; then
+              kill $QEMU_PID 2>/dev/null || true
+              echo "=== Reboot OK: kernel booted a second time after ${i} s ==="
+              exit 0
+            fi
+            sleep 1
+          done
+
+          kill $QEMU_PID 2>/dev/null || true
+          echo "=== FAIL: no second boot after the guest restarted ==="
+          grep -c SC_SYSRES qemu-boot/qemu-reboot.log || true
+          echo "--- Last 30 lines of output ---"
+          tail -30 reboot-output.txt
+          exit 1
+
       - name: "Guest clock runs at wall-clock speed"
         timeout-minutes: 5
         # The login prompt appears even when the guest timebase disagrees
