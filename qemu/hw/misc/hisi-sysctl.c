@@ -61,6 +61,14 @@ struct HisiSysctlState {
     uint32_t v1_chip_id_88;
     uint32_t v1_chip_id_8c;
     uint32_t regs[HISI_SYSCTL_NREGS];
+    /*
+     * Power-on image of regs[]: whatever machine init stored (SYSSTAT boot
+     * straps, per-SoC preset words), captured at the first system reset,
+     * which runs after machine init and before the guest.  Later resets
+     * restore it, discarding every word the guest wrote.
+     */
+    uint32_t por_regs[HISI_SYSCTL_NREGS];
+    bool por_valid;
     qemu_irq remap_clear;       /* SC_CTRL bit 8 level */
 };
 
@@ -164,10 +172,20 @@ static void hisi_sysctl_reset(DeviceState *dev)
     HisiSysctlState *s = HISI_SYSCTL(dev);
 
     /*
-     * Only the boot remap returns to its reset value; the other words
-     * keep what machine init stored (e.g. the SYSSTAT boot straps).
+     * SC_SYSRES is a whole-chip reset: every word returns to its power-on
+     * value, not just the boot remap.  The vendor 4.9 GIC driver depends
+     * on that: it stamps 0x47444946 ("GDIF") at +0x130 after initialising
+     * the distributor and skips gic_dist_init() when the stamp is already
+     * there, so a stamp that survived the reset leaves the freshly reset
+     * GIC disabled and the rebooted kernel without a timer interrupt.
      * Whoever consumes "remap-clear" restores its own reset state.
      */
+    if (!s->por_valid) {
+        memcpy(s->por_regs, s->regs, sizeof(s->por_regs));
+        s->por_valid = true;
+    } else {
+        memcpy(s->regs, s->por_regs, sizeof(s->regs));
+    }
     s->regs[0] &= ~SC_CTRL_REMAP_CLEAR;
 }
 
