@@ -39,6 +39,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiSysctlState, HISI_SYSCTL)
  */
 #define SC_CTRL_REMAP_CLEAR     (1 << 8)
 
+/*
+ * SC_CTRL[2:0] requests a system clock mode (2 = slow, 4 = normal) and
+ * SC_CTRL[6:3] reports the mode the clock tree is in.  There is no PLL to
+ * wait for here, so the status follows the request at once.  The V1 3.0.8
+ * kernel's tcm_slow_reset (mach-hi3518/tcm_reset.S) requests slow mode and
+ * polls the status for it before writing SC_SYSRES.
+ */
+#define SC_CTRL_MODE_CTRL_MASK      0x7
+#define SC_CTRL_MODE_STATUS_SHIFT   3
+#define SC_CTRL_MODE_STATUS_MASK    (0xf << SC_CTRL_MODE_STATUS_SHIFT)
+
 struct HisiSysctlState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -78,7 +89,9 @@ static uint64_t hisi_sysctl_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case 0x00: /* SC_CTRL */
-        return s->regs[0];
+        return (s->regs[0] & ~SC_CTRL_MODE_STATUS_MASK) |
+               ((s->regs[0] & SC_CTRL_MODE_CTRL_MASK)
+                << SC_CTRL_MODE_STATUS_SHIFT);
     case 0x04: /* SC_SYSRES — system reset (write-only, read returns 0) */
         return 0;
     case 0x88: /* V1 chip ID register (read-only, write-ignored) */

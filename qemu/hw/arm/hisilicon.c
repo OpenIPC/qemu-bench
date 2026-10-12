@@ -5010,9 +5010,13 @@ static void hisilicon_common_init(MachineState *machine,
          * for V1–V5 IPC kernels.  Skip when RAM lives at 0 (e.g. STB family
          * Hi3798CV200) — the trap would conflict with the system memory. */
         MemoryRegion *trap = g_new(MemoryRegion, 1);
-        if (c->cpu_srst_offset) {
+        if (c->cpu_srst_offset || !c->use_gic) {
             /* RAM, not ROM: the kernel's SMP bringup writes CPU1's reset
-             * trampoline here (see hisilicon_cpu1_reset). */
+             * trampoline here (see hisilicon_cpu1_reset), and the V1
+             * 3.0.8 kernel's arch_reset() copies its tcm_slow_reset stub
+             * to physical 0x100 and jumps to it (mach-hi3518/tcm_reset.S);
+             * with ROM the copy is dropped and the restart prefetch-aborts
+             * forever instead of reaching SC_SYSRES. */
             memory_region_init_ram(trap, NULL, "hisilicon.trapnull",
                                    0x1000, &error_fatal);
         } else {
@@ -5022,8 +5026,9 @@ static void hisilicon_common_init(MachineState *machine,
         memory_region_add_subregion(sysmem, 0, trap);
         uint32_t insn[2] = { cpu_to_le32(0xe3a00000),   /* mov r0, #0 */
                              cpu_to_le32(0xe12fff1e) };  /* bx lr      */
-        address_space_write_rom(&address_space_memory, 0,
-                                MEMTXATTRS_UNSPECIFIED, insn, 8);
+        /* A ROM blob, so every system reset rewrites it over whatever the
+         * previous kernel left in the RAM variant. */
+        rom_add_blob_fixed("hisilicon.trapnull", insn, sizeof(insn), 0);
     }
 
     /* RAM */
