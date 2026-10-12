@@ -4701,15 +4701,22 @@ static void hisilicon_write_bootrom(MemoryRegion *sysmem,
 typedef struct {
     ARMCPU  *cpu;
     uint64_t entry;
-    MemoryRegion *alias0;       /* reset-time mask-ROM alias at 0 */
+    MemoryRegion *alias0;       /* reset-time mask-ROM alias at 0, or NULL */
 } HisiMaskromReset;
 
+/*
+ * Restart CPU0 at @entry on every system reset.  Shared by the -bios
+ * mask-ROM path (which also re-enables its alias at 0) and the flash-boot
+ * paths, which have no mask-ROM alias.
+ */
 static void hisilicon_maskrom_cpu_reset(void *opaque)
 {
     HisiMaskromReset *info = opaque;
     CPUState *cs = CPU(info->cpu);
 
-    memory_region_set_enabled(info->alias0, true);
+    if (info->alias0) {
+        memory_region_set_enabled(info->alias0, true);
+    }
     cpu_reset(cs);
     cpu_set_pc(cs, info->entry);
 }
