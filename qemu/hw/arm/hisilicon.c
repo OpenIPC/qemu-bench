@@ -4673,8 +4673,10 @@ static void hisilicon_write_bootrom(MemoryRegion *sysmem,
                                0x1000, &error_fatal);
     }
     memory_region_add_subregion(sysmem, 0, bootrom);
-    address_space_write_rom(&address_space_memory, 0,
-                            MEMTXATTRS_UNSPECIFIED, rom, sizeof(rom));
+    /* A ROM blob, so every system reset reinstalls the boot ROM.  On
+     * ARM926 it is RAM and U-Boot has overwritten it with its vectors;
+     * the reboot must start from the boot ROM again, not from those. */
+    rom_add_blob_fixed("hisilicon.bootrom", rom, sizeof(rom), 0);
 }
 
 /*
@@ -5878,9 +5880,17 @@ static void hisilicon_common_init(MachineState *machine,
             info->cpu = cpu[0];
             info->entry = c->uboot_load_addr;
             qemu_register_reset(hisilicon_maskrom_cpu_reset, info);
+        } else {
+            /* ARMv7/v5: boot ROM at 0x0 (built by hisilicon_write_bootrom)
+             * copies U-Boot from the flash window to DDR; CPU starts at
+             * reset 0.  With no -kernel nothing else resets CPU0, so
+             * without this a guest SC_SYSRES reset every device but left
+             * U-Boot spinning in its reset loop. */
+            HisiMaskromReset *info = g_new0(HisiMaskromReset, 1);
+            info->cpu = cpu[0];
+            info->entry = 0;
+            qemu_register_reset(hisilicon_maskrom_cpu_reset, info);
         }
-        /* else ARMv7/v5: boot ROM at 0x0 (built by hisilicon_write_bootrom)
-         * copies U-Boot from the flash window to DDR; CPU starts at reset 0. */
     } else if (bios_boot) {
         /* Mask-ROM emulation: the bootrom ELF is already in ROM at
          * 0x04000000, and a reset hook redirects PC there.  Nothing else
