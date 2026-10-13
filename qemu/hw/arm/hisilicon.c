@@ -4673,8 +4673,10 @@ static void hisilicon_write_bootrom(MemoryRegion *sysmem,
                                0x1000, &error_fatal);
     }
     memory_region_add_subregion(sysmem, 0, bootrom);
-    address_space_write_rom(&address_space_memory, 0,
-                            MEMTXATTRS_UNSPECIFIED, rom, sizeof(rom));
+    /* A ROM blob, so every system reset reinstalls the boot ROM.  On
+     * ARM926 it is RAM and U-Boot has overwritten it with its vectors;
+     * the reboot must start from the boot ROM again, not from those. */
+    rom_add_blob_fixed("hisilicon.bootrom", rom, sizeof(rom), 0);
 }
 
 /*
@@ -4701,15 +4703,22 @@ static void hisilicon_write_bootrom(MemoryRegion *sysmem,
 typedef struct {
     ARMCPU  *cpu;
     uint64_t entry;
-    MemoryRegion *alias0;       /* reset-time mask-ROM alias at 0 */
+    MemoryRegion *alias0;       /* reset-time mask-ROM alias at 0, or NULL */
 } HisiMaskromReset;
 
+/*
+ * Restart CPU0 at @entry on every system reset.  Shared by the -bios
+ * mask-ROM path (which also re-enables its alias at 0) and the flash-boot
+ * paths, which have no mask-ROM alias.
+ */
 static void hisilicon_maskrom_cpu_reset(void *opaque)
 {
     HisiMaskromReset *info = opaque;
     CPUState *cs = CPU(info->cpu);
 
-    memory_region_set_enabled(info->alias0, true);
+    if (info->alias0) {
+        memory_region_set_enabled(info->alias0, true);
+    }
     cpu_reset(cs);
     cpu_set_pc(cs, info->entry);
 }
@@ -5003,9 +5012,13 @@ static void hisilicon_common_init(MachineState *machine,
          * for V1–V5 IPC kernels.  Skip when RAM lives at 0 (e.g. STB family
          * Hi3798CV200) — the trap would conflict with the system memory. */
         MemoryRegion *trap = g_new(MemoryRegion, 1);
-        if (c->cpu_srst_offset) {
+        if (c->cpu_srst_offset || !c->use_gic) {
             /* RAM, not ROM: the kernel's SMP bringup writes CPU1's reset
-             * trampoline here (see hisilicon_cpu1_reset). */
+             * trampoline here (see hisilicon_cpu1_reset), and the V1
+             * 3.0.8 kernel's arch_reset() copies its tcm_slow_reset stub
+             * to physical 0x100 and jumps to it (mach-hi3518/tcm_reset.S);
+             * with ROM the copy is dropped and the restart prefetch-aborts
+             * forever instead of reaching SC_SYSRES. */
             memory_region_init_ram(trap, NULL, "hisilicon.trapnull",
                                    0x1000, &error_fatal);
         } else {
@@ -5015,8 +5028,9 @@ static void hisilicon_common_init(MachineState *machine,
         memory_region_add_subregion(sysmem, 0, trap);
         uint32_t insn[2] = { cpu_to_le32(0xe3a00000),   /* mov r0, #0 */
                              cpu_to_le32(0xe12fff1e) };  /* bx lr      */
-        address_space_write_rom(&address_space_memory, 0,
-                                MEMTXATTRS_UNSPECIFIED, insn, 8);
+        /* A ROM blob, so every system reset rewrites it over whatever the
+         * previous kernel left in the RAM variant. */
+        rom_add_blob_fixed("hisilicon.trapnull", insn, sizeof(insn), 0);
     }
 
     /* RAM */
@@ -5866,9 +5880,17 @@ static void hisilicon_common_init(MachineState *machine,
             info->cpu = cpu[0];
             info->entry = c->uboot_load_addr;
             qemu_register_reset(hisilicon_maskrom_cpu_reset, info);
+        } else {
+            /* ARMv7/v5: boot ROM at 0x0 (built by hisilicon_write_bootrom)
+             * copies U-Boot from the flash window to DDR; CPU starts at
+             * reset 0.  With no -kernel nothing else resets CPU0, so
+             * without this a guest SC_SYSRES reset every device but left
+             * U-Boot spinning in its reset loop. */
+            HisiMaskromReset *info = g_new0(HisiMaskromReset, 1);
+            info->cpu = cpu[0];
+            info->entry = 0;
+            qemu_register_reset(hisilicon_maskrom_cpu_reset, info);
         }
-        /* else ARMv7/v5: boot ROM at 0x0 (built by hisilicon_write_bootrom)
-         * copies U-Boot from the flash window to DDR; CPU starts at reset 0. */
     } else if (bios_boot) {
         /* Mask-ROM emulation: the bootrom ELF is already in ROM at
          * 0x04000000, and a reset hook redirects PC there.  Nothing else

@@ -39,6 +39,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiSysctlState, HISI_SYSCTL)
  */
 #define SC_CTRL_REMAP_CLEAR     (1 << 8)
 
+/*
+ * SC_CTRL[2:0] requests a system clock mode (2 = slow, 4 = normal) and
+ * SC_CTRL[6:3] reports the mode the clock tree is in.  There is no PLL to
+ * wait for here, so the status follows the request at once.  The V1 3.0.8
+ * kernel's tcm_slow_reset (mach-hi3518/tcm_reset.S) requests slow mode and
+ * polls the status for it before writing SC_SYSRES.
+ */
+#define SC_CTRL_MODE_CTRL_MASK      0x7
+#define SC_CTRL_MODE_STATUS_SHIFT   3
+#define SC_CTRL_MODE_STATUS_MASK    (0xf << SC_CTRL_MODE_STATUS_SHIFT)
+
 struct HisiSysctlState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -61,6 +72,14 @@ struct HisiSysctlState {
     uint32_t v1_chip_id_88;
     uint32_t v1_chip_id_8c;
     uint32_t regs[HISI_SYSCTL_NREGS];
+    /*
+     * Power-on image of regs[]: whatever machine init stored (SYSSTAT boot
+     * straps, per-SoC preset words), captured at the first system reset,
+     * which runs after machine init and before the guest.  Later resets
+     * restore it, discarding every word the guest wrote.
+     */
+    uint32_t por_regs[HISI_SYSCTL_NREGS];
+    bool por_valid;
     qemu_irq remap_clear;       /* SC_CTRL bit 8 level */
 };
 
@@ -70,7 +89,9 @@ static uint64_t hisi_sysctl_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case 0x00: /* SC_CTRL */
-        return s->regs[0];
+        return (s->regs[0] & ~SC_CTRL_MODE_STATUS_MASK) |
+               ((s->regs[0] & SC_CTRL_MODE_CTRL_MASK)
+                << SC_CTRL_MODE_STATUS_SHIFT);
     case 0x04: /* SC_SYSRES — system reset (write-only, read returns 0) */
         return 0;
     case 0x88: /* V1 chip ID register (read-only, write-ignored) */
@@ -164,10 +185,20 @@ static void hisi_sysctl_reset(DeviceState *dev)
     HisiSysctlState *s = HISI_SYSCTL(dev);
 
     /*
-     * Only the boot remap returns to its reset value; the other words
-     * keep what machine init stored (e.g. the SYSSTAT boot straps).
+     * SC_SYSRES is a whole-chip reset: every word returns to its power-on
+     * value, not just the boot remap.  The vendor 4.9 GIC driver depends
+     * on that: it stamps 0x47444946 ("GDIF") at +0x130 after initialising
+     * the distributor and skips gic_dist_init() when the stamp is already
+     * there, so a stamp that survived the reset leaves the freshly reset
+     * GIC disabled and the rebooted kernel without a timer interrupt.
      * Whoever consumes "remap-clear" restores its own reset state.
      */
+    if (!s->por_valid) {
+        memcpy(s->por_regs, s->regs, sizeof(s->por_regs));
+        s->por_valid = true;
+    } else {
+        memcpy(s->regs, s->por_regs, sizeof(s->regs));
+    }
     s->regs[0] &= ~SC_CTRL_REMAP_CLEAR;
 }
 

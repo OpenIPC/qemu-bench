@@ -1335,6 +1335,52 @@ static void hisi_fmc_finalize(Object *obj)
     g_free(s->block_ever_unlocked);
 }
 
+/*
+ * SC_SYSRES resets the controller, which is part of the SoC: its registers
+ * return to their power-on values and a register-mode result still parked
+ * in the I/O buffer is dropped, so the boot ROM's memory-window reads see
+ * flash again rather than the last operation's data.
+ *
+ * The SPI flash chip is a separate part that the SoC reset does not reach,
+ * so its state is deliberately kept: SR/SR2/SR3 (QE and WPS are
+ * non-volatile), the WPS block locks and the SPI-NAND feature registers.
+ * On a camera these survive a warm reboot as well.
+ */
+static void hisi_fmc_reset(DeviceState *dev)
+{
+    HisiFmcState *s = HISI_FMC(dev);
+
+    s->cfg = 0;
+    if (s->has_nand && !s->has_nor) {
+        /* NAND-only board: the boot ROM XIPs NAND, as set up in realize. */
+        s->cfg = FLASH_TYPE_SPI_NAND << FMC_CFG_FLASH_SEL_SHIFT;
+    }
+    s->global_cfg = 0;
+    s->spi_timing = 0;
+    s->fmc_int = 0;
+    s->int_en = 0;
+    s->cmd = 0;
+    s->addrh = 0;
+    s->addrl = 0;
+    s->op = 0;
+    s->op_cfg = 0;
+    s->spi_op_addr = 0;
+    s->data_num = 0;
+    s->dma_len = 0;
+    s->dma_saddr = 0;
+    s->dma_ahb_ctrl = 0;
+    s->dma_saddr_oob = 0;
+    s->dma_saddrh_d0 = 0;
+    s->dma_saddrh_oob = 0;
+    s->op_ctrl = 0;
+    s->status = 0;
+
+    s->iobuf_valid = false;
+    memset(s->iobuf, 0, sizeof(s->iobuf));
+
+    hisi_fmc_update_irq(s);
+}
+
 static const Property hisi_fmc_properties[] = {
     /* Register-map variant: 0 = HiFMC V100 (default), 1 = fmc100 (lotus,fmc
      * on Goke xmorca / GK7206).  Same IP, shuffled register offsets. */
@@ -1371,6 +1417,7 @@ static void hisi_fmc_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = hisi_fmc_realize;
+    device_class_set_legacy_reset(dc, hisi_fmc_reset);
     device_class_set_props(dc, hisi_fmc_properties);
 }
 
