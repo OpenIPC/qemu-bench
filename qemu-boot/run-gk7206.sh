@@ -4,7 +4,7 @@
 #
 # The machine is gk7206v12a (2Gb DDR3L, 256 MiB) to match the SDK target the
 # kernel below is built for.  MACHINE=gk7206v10 selects the V10 model (same
-# die map, 64 MiB); append -m 256M if the initramfs does not fit in that.
+# die map, 64 MiB of its own).
 #
 # Boots the vendor XMedia SDK kernel (linux-5.10.y, xmorca_defconfig) to full
 # Linux userspace on the emulated dual-Cortex-A7 MP2.  The kernel image is a
@@ -30,8 +30,9 @@
 #  FLASH unset (default) — INITRAMFS boot.  Root is the SDK busybox rootfs
 #    packed as an uncompressed cpio (initramfs.cpio = tiny banner init).
 #    INITRD/RDINIT override the userspace.  The unpacked busybox rootfs
-#    needs more than the machine's default mem=32M, so Linux gets 200M and
-#    the xmedia MMZ is moved above it (0x4c800000, the remaining 56M).
+#    needs more than the machine's default mem=32M, so this mode always
+#    runs with -m 256M (whatever MACHINE is), gives Linux 200M and moves
+#    the xmedia MMZ above it (0x4c800000, the remaining 56M).
 #
 #  FLASH=1 — SPI-NOR FLASH boot.  Attaches a 16 MiB NOR image (nor-16m.img)
 #    to the emulated fmc100 flash controller; the kernel enumerates the chip
@@ -63,7 +64,7 @@ fi
 INITRD="${INITRD:-$HERE/gk7206/rootfs.cpio}"
 RDINIT="${RDINIT:-/sbin/init}"
 
-exec "$QEMU" -M "$MACHINE" -nographic -display none \
+exec "$QEMU" -M "$MACHINE" -m 256M -nographic -display none \
     -serial mon:stdio -monitor none \
     -kernel "$KERNEL" \
     -initrd "$INITRD" \
