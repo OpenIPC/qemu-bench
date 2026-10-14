@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 30 IPC + 11 DVR/NVR + 1 STB (ARMv7-A)
+- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (46 total)
+## Supported Machines (47 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -41,6 +41,7 @@ Builds two QEMU targets:
 | `gk7205v530` | V4/Goke V500 | Cortex-A7 | GIC | — | —¹ |
 | `gk7202v330` | V4/Goke V500 | Cortex-A7 | GIC | — | —¹ |
 | `gk7206v10` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
+| `gk7206v12a` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
 | `hi3516cv608` | V5 | Cortex-A7 MP2 | GIC | 5.10 | — |
 | `hi3516cv610` | **V5** | Cortex-A7 MP2 | GIC | **5.10** | yes |
 | `hi3516cv613` | V5 | Cortex-A7 MP2 | GIC | 5.10 | — |
@@ -49,7 +50,8 @@ Builds two QEMU targets:
 them with; they build and register. The four Goke V500 parts share the
 `xmedia,sp804` timer wiring (`hisi-xmsp804.c`) that the V500 kernel needs.
 
-² `gk7206v10` (codename "xmorca") boots the **vendor** XMedia SDK kernel
+² `gk7206v10` and `gk7206v12a` (codename "xmorca"; same die, 64 vs 256 MiB
+embedded DDR) boot the **vendor** XMedia SDK kernel
 (linux-5.10.y, `xmorca_defconfig`) and busybox userspace, not OpenIPC — via
 `qemu-boot/run-gk7206.sh` for an initramfs boot or `FLASH=1` for a SPI-NOR
 boot with a jffs2 root. No vendor artifacts are committed here; see the script

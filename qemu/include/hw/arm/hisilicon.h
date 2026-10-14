@@ -434,7 +434,7 @@ typedef struct HisiSoCConfig {
  * Goke third generation (2025-2026) — Goke's own designs on the XMedia
  * "Lotus" SDK (ShiMetaPi shimetapi_pico_gx), split into two product lines
  * the way HiSilicon splits 3516 (mainstream) / 3519 (high-end):
- *   GK7206 — codename "xmorca",  Cortex-A7 MP2, embedded DDR, 5M.
+ *   GK7206 — codename "xmorca",  Cortex-A7 MP2, embedded DDR, 5M (V10) / 4K (V11+).
  *   GK7606 — codename "xmfalcon", Cortex-A55, external DDR, 4K.
  * Both keep the gk7205v5xx-style 0x12xxxxxx control block (sysctl
  * 0x12020000, CRG 0x12010000, UART 0x12040000, xmedia,sp804 0x12000000),
@@ -442,10 +442,15 @@ typedef struct HisiSoCConfig {
  * coprocessor.  The chip ID is read from REG_SC_CHIPID = sysctl_base + 0xEE0
  * (= 0x12020EE0, verified in the SDK u-boot arch-xmorca/platform.h).  The
  * ID *values* below are PLACEHOLDERS pending a live SCSYSID/CHIPID capture —
- * the silicon value is not encoded anywhere in the SDK source (u-boot just
- * prints whatever it reads).  Boot does not depend on them (ipctool reads
- * them post-boot); they follow the 0x72050500-style Goke encoding. */
-#define GOKE_SOC_ID_7206V10     0x72060010  /* GK7206V10, dual A7 MP2, 1.0 TOPS; placeholder */
+ * the xmorca values are not in the SDK source (u-boot and the kernel just
+ * print whatever they read).  They follow the encoding the SDK kernel's
+ * lotus/machine/xmfalcon/include/platform.h uses for its siblings
+ * (CHIPID_XM7605V12 = 0x76050120, CHIPID_XM7606V13 = 0x76060130): part
+ * number, then the Vxy version as 0xxy0.  The "A" suffix's encoding is
+ * unknown.  The 5.10 kernel only prints the xmorca ID (/proc/soc_info);
+ * no driver branches on it. */
+#define GOKE_SOC_ID_7206V10     0x72060100  /* GK7206V10, dual A7 MP2, 1.0 TOPS; placeholder */
+#define GOKE_SOC_ID_7206V12A    0x72060120  /* GK7206V12A, 2Gb DDR3L, 4K; placeholder */
 #define GOKE_SOC_ID_7606V1      0x76060100  /* GK7606V1, A55 4K; placeholder */
 
 #endif /* HW_ARM_HISILICON_H */
