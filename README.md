@@ -166,6 +166,7 @@ qemu/
 ├── hw/misc/hisi-fmc.c           # HiFMC V100 flash controller (CV200+, flash-file for dumps)
 ├── hw/misc/hisi-gzip.c          # Hardware GZIP decompressor (U-Boot hw_compressed)
 ├── hw/misc/hisi-sfc350.c        # HISFC350 flash controller (CV100, AV100)
+├── hw/misc/hisi-ddrc-v1.c       # V1 DDR controller/PHY: DDR dead until reg_info runs
 ├── hw/misc/hisi-himci.c         # DW MMC (himciv200) SD/MMC controller
 ├── hw/misc/hisi-regbank.c       # Generic RAM-backed register bank
 ├── hw/misc/hisi-ive.c           # IVE: 18 ops (SAD, CCL, Sub, Thresh, Erode...)

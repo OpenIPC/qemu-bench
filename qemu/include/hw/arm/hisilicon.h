@@ -126,6 +126,26 @@ typedef struct HisiSoCConfig {
     uint32_t        v1_chip_id_88; /* 1=CV100, 2=18EV100, 3=18AV100 */
     uint32_t        v1_chip_id_8c; /* bits[14:8]: 0x10=18CV100, 0x57=18EV100 */
 
+    /*
+     * V1 flash boot runs U-Boot in place from the SPI NOR window, the way
+     * the silicon does, instead of copying it to DDR first.  Its start.S
+     * only walks the reg_info table at image offset 0x40 (PLL, DDR
+     * controller, pin mux) when it finds itself outside DDR, so a copy
+     * to DDR skipped that table and an image whose table was empty booted
+     * here and bricked real boards (OpenIPC/firmware#2593).  It also
+     * creates the hisi-ddrc-v1 controller: DDR reads as zero and drops
+     * writes until the table has started the DDR PHY.
+     */
+    bool            v1_xip_boot;
+
+    /*
+     * CRG register that reports PLL lock, one bit per PLL, and the bits
+     * that read as locked.  V1 reg_info tables poll CRG+0xe8 for 0xf
+     * after programming the four PLLs.  0 = no such register.
+     */
+    uint32_t        crg_pll_lock_offset;
+    uint32_t        crg_pll_lock_bits;
+
     /* UARTs (PL011) */
     int             num_uarts;
     hwaddr          uart_bases[HISI_MAX_UARTS];

@@ -46,6 +46,9 @@ jobs:
       - name: CPU1 release via CRG soft-reset (hisi-crg, -bios path)
         run: bash qemu/tests/test-hisi-smp-release.sh
 
+      - name: V1 DDR needs the reg_info table (hisi-ddrc-v1, flash boot)
+        run: bash qemu/tests/test-hisi-v1-ddr-init.sh
+
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
         with:

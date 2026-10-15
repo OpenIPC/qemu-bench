@@ -53,6 +53,8 @@ struct HisiCrgState {
     MemoryRegion iomem;
     uint32_t regs[HISI_CRG_REG_COUNT];
     uint32_t cpu_srst_offset;   /* 0 = disabled, e.g. 0x78 for CV500 */
+    uint32_t pll_lock_offset;   /* per-PLL lock status, 0 = none */
+    uint32_t pll_lock_bits;     /* bits that read as locked there */
     qemu_irq cpu1_reset;        /* CPU1_SRST_REQ level, 1 = in reset */
 };
 
@@ -85,6 +87,15 @@ static uint64_t hisi_crg_read(void *opaque, hwaddr offset, unsigned size)
     /* PLL status registers always report locked */
     if (is_pll_status_reg(offset)) {
         val |= PLL_LOCK_BIT;
+    }
+
+    /*
+     * V1 keeps one lock bit per PLL in a single status register
+     * (CRG+0xe8), and its U-Boot reg_info table waits there for all four
+     * after reprogramming them.  There is no PLL to lose lock.
+     */
+    if (s->pll_lock_offset && offset == s->pll_lock_offset) {
+        val |= s->pll_lock_bits;
     }
 
     return val;
@@ -154,6 +165,8 @@ static void hisi_crg_reset(DeviceState *dev)
 
 static const Property hisi_crg_properties[] = {
     DEFINE_PROP_UINT32("cpu-srst-offset", HisiCrgState, cpu_srst_offset, 0),
+    DEFINE_PROP_UINT32("pll-lock-offset", HisiCrgState, pll_lock_offset, 0),
+    DEFINE_PROP_UINT32("pll-lock-bits", HisiCrgState, pll_lock_bits, 0),
 };
 
 static void hisi_crg_class_init(ObjectClass *klass, const void *data)
