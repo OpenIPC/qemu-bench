@@ -123,15 +123,24 @@ check() {
     fi
 }
 
-# run <machine> <case> [extra args...] -> UART text on stdout
+# run <machine> <case> [extra args...] -> UART text on stdout.  The guest
+# ends in a loop, so timeout's 124 is the only good exit; anything else
+# (QEMU refused the machine, crashed) is reported instead of the UART, and
+# the UART file is removed first so a run that never opened it cannot
+# hand back the previous case's output.
 run() {
-    local machine="$1" case="$2"
+    local machine="$1" case="$2" rc=0
     shift 2
+    rm -f "$TMP/uart"
     : > "$TMP/log"
     timeout 5 "$QEMU" -M "$machine,flash-file=$TMP/$case.bin" "$@" \
         -nodefaults -display none -monitor none \
         -serial "file:$TMP/uart" -d guest_errors -D "$TMP/log" \
-        >/dev/null 2>&1 || true
+        >"$TMP/qemu.out" 2>&1 || rc=$?
+    if [ "$rc" -ne 124 ]; then
+        echo "qemu exited $rc: $(head -c 200 "$TMP/qemu.out")"
+        return
+    fi
     tr -d '\r\n' < "$TMP/uart"
 }
 

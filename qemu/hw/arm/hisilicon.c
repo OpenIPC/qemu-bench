@@ -271,7 +271,7 @@ static const HisiSoCConfig hi3518av100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,
+    .timer_freq         = 100000000,    /* BPLL 200 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -304,12 +304,22 @@ static const HisiSoCConfig hi3518av100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
+    /*
+     * PLL defaults: the words this SoC's reg_info table writes, so a
+     * -kernel boot and a flash boot (which runs the table) give the
+     * kernel the same clocks.  OpenIPC/u-boot-hi3516cv100's hi3518cv100
+     * and hi3518ev100 tables, and HiSilicon's SDK reg_info_hi3518a.bin,
+     * all program BPLL CRG4/CRG5 = 0x11000000/0x00683064: refdiv=3,
+     * fbdiv=100, pstdiv 1/2 -> 24*100/12 = 200 MHz bus, so the timer runs
+     * at 100 MHz (hi3516cv100's fbdiv=110 gives its 110 MHz).  From the
+     * tables, not read back from a board.
+     */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },
-        { 0x04, (1 << 12) | 46 },
-        { 0x10, (1 << 24) | (1 << 27) },
-        { 0x14, (3 << 12) | 25 },
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
     .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
@@ -361,7 +371,7 @@ static const HisiSoCConfig hi3518cv100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,
+    .timer_freq         = 100000000,    /* BPLL 200 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -394,12 +404,22 @@ static const HisiSoCConfig hi3518cv100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
+    /*
+     * PLL defaults: the words this SoC's reg_info table writes, so a
+     * -kernel boot and a flash boot (which runs the table) give the
+     * kernel the same clocks.  OpenIPC/u-boot-hi3516cv100's hi3518cv100
+     * and hi3518ev100 tables, and HiSilicon's SDK reg_info_hi3518a.bin,
+     * all program BPLL CRG4/CRG5 = 0x11000000/0x00683064: refdiv=3,
+     * fbdiv=100, pstdiv 1/2 -> 24*100/12 = 200 MHz bus, so the timer runs
+     * at 100 MHz (hi3516cv100's fbdiv=110 gives its 110 MHz).  From the
+     * tables, not read back from a board.
+     */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },
-        { 0x04, (1 << 12) | 46 },
-        { 0x10, (1 << 24) | (1 << 27) },
-        { 0x14, (3 << 12) | 25 },
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
     .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
@@ -453,7 +473,7 @@ static const HisiSoCConfig hi3518ev100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,
+    .timer_freq         = 100000000,    /* BPLL 200 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -486,12 +506,22 @@ static const HisiSoCConfig hi3518ev100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
+    /*
+     * PLL defaults: the words this SoC's reg_info table writes, so a
+     * -kernel boot and a flash boot (which runs the table) give the
+     * kernel the same clocks.  OpenIPC/u-boot-hi3516cv100's hi3518cv100
+     * and hi3518ev100 tables, and HiSilicon's SDK reg_info_hi3518a.bin,
+     * all program BPLL CRG4/CRG5 = 0x11000000/0x00683064: refdiv=3,
+     * fbdiv=100, pstdiv 1/2 -> 24*100/12 = 200 MHz bus, so the timer runs
+     * at 100 MHz (hi3516cv100's fbdiv=110 gives its 110 MHz).  From the
+     * tables, not read back from a board.
+     */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },
-        { 0x04, (1 << 12) | 46 },
-        { 0x10, (1 << 24) | (1 << 27) },
-        { 0x14, (3 << 12) | 25 },
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
     .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
