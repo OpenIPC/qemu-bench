@@ -108,6 +108,10 @@
  *   V5:        0x11xxxxxx peripherals, GIC @ 0x124xxxxx, RAM @ 0x40000000
  */
 
+/* V1 DDR controller and DDR PHY (inside the misc block), see hisi-ddrc-v1 */
+#define HISI_V1_DDRC_BASE       0x20110000
+#define HISI_V1_DDRPHY_BASE     0x20120400
+
 /*
  * Hi3516CV100 (V1): pre-2015, 2M mainstream.  ARM926EJ-S @550MHz.
  * Video: H.264, 1080P@30fps.  Memory: 64MB DDR2.
@@ -136,6 +140,7 @@ static const HisiSoCConfig hi3516cv100_soc = {
                           "mmz=anonymous,0,0x82000000,32M",
 
     .ram_base           = 0x80000000,
+    .v1_xip_boot        = true,         /* reg_info brings DDR up */
     .sram_base          = 0x04010000,
     .sram_size          = 64 * KiB,
 
@@ -144,6 +149,8 @@ static const HisiSoCConfig hi3516cv100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
+    .crg_pll_lock_bits  = 0xf,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },
@@ -152,7 +159,7 @@ static const HisiSoCConfig hi3516cv100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,     /* 50 MHz (AXI 100MHz / prescale 2) */
+    .timer_freq         = 110000000,    /* BPLL 220 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -187,21 +194,24 @@ static const HisiSoCConfig hi3516cv100_soc = {
     .wdt_freq           = 3000000,
 
     /*
-     * PLL register defaults.
+     * PLL register defaults: what the OpenIPC U-Boot reg_info table writes,
+     * read back from a Hi3516CV100 board (lab hi3516cv100-imx122, CRG0..
+     * CRG5 and the CRG+0xe8 lock word).  A flash boot now runs that table
+     * (v1_xip_boot), so these have to agree with it or the kernel would
+     * derive one timer clock on a -kernel boot and another after U-Boot.
      * Kernel computes: clk = 24M * fbdiv / (2 * refdiv * pstdiv1 * pstdiv2)
      *
-     * APLL (CRG0/CRG1): CPU clock ~552 MHz.
-     *   pstdiv1=1, pstdiv2=1, refdiv=1, fbdiv=46: 24*46/2 = 552 MHz.
-     * BPLL (CRG4/CRG5): AXI bus clock 100 MHz.
-     *   pstdiv1=1, pstdiv2=1, refdiv=3, fbdiv=25: 24*25/6 = 100 MHz.
-     *   Timer clock = busclk / prescale(2) = 50 MHz.
+     * BPLL (CRG4/CRG5): pstdiv1=1, pstdiv2=2, refdiv=3, fbdiv=110:
+     *   24*110/12 = 220 MHz bus.  Timer clock = busclk / prescale(2) =
+     *   110 MHz; that board's kernel prints "sched_clock: 32 bits at
+     *   110MHz".  APLL (CRG0/CRG1) carries the same words.
      */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },   /* CRG0: pstdiv1=1, pstdiv2=1 */
-        { 0x04, (1 << 12) | 46 },           /* CRG1: refdiv=1, fbdiv=46 */
-        { 0x10, (1 << 24) | (1 << 27) },   /* CRG4: pstdiv1=1, pstdiv2=1 */
-        { 0x14, (3 << 12) | 25 },           /* CRG5: refdiv=3, fbdiv=25 */
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x0068306e },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
     /*
@@ -209,10 +219,9 @@ static const HisiSoCConfig hi3516cv100_soc = {
      * hardware during init.  Without mapped regions, reads return 0
      * from QEMU's "unimplemented" handler, causing poll loops to hang.
      */
-    .num_regbanks       = 8,
+    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
-        { "hisi-ddr",    0x20110000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
@@ -243,6 +252,7 @@ static const HisiSoCConfig hi3518av100_soc = {
                           "mmz=anonymous,0,0x82000000,32M",
 
     .ram_base           = 0x80000000,
+    .v1_xip_boot        = true,         /* reg_info brings DDR up */
     .sram_base          = 0x04010000,
     .sram_size          = 64 * KiB,
 
@@ -251,6 +261,8 @@ static const HisiSoCConfig hi3518av100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
+    .crg_pll_lock_bits  = 0xf,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },
@@ -259,7 +271,7 @@ static const HisiSoCConfig hi3518av100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,
+    .timer_freq         = 100000000,    /* BPLL 200 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -292,18 +304,27 @@ static const HisiSoCConfig hi3518av100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
+    /*
+     * PLL defaults: the words this SoC's reg_info table writes, so a
+     * -kernel boot and a flash boot (which runs the table) give the
+     * kernel the same clocks.  OpenIPC/u-boot-hi3516cv100's hi3518cv100
+     * and hi3518ev100 tables, and HiSilicon's SDK reg_info_hi3518a.bin,
+     * all program BPLL CRG4/CRG5 = 0x11000000/0x00683064: refdiv=3,
+     * fbdiv=100, pstdiv 1/2 -> 24*100/12 = 200 MHz bus, so the timer runs
+     * at 100 MHz (hi3516cv100's fbdiv=110 gives its 110 MHz).  From the
+     * tables, not read back from a board.
+     */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },
-        { 0x04, (1 << 12) | 46 },
-        { 0x10, (1 << 24) | (1 << 27) },
-        { 0x14, (3 << 12) | 25 },
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
-    .num_regbanks       = 8,
+    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
-        { "hisi-ddr",    0x20110000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
@@ -331,6 +352,7 @@ static const HisiSoCConfig hi3518cv100_soc = {
                           "mmz=anonymous,0,0x82000000,32M",
 
     .ram_base           = 0x80000000,
+    .v1_xip_boot        = true,         /* reg_info brings DDR up */
     .sram_base          = 0x04010000,
     .sram_size          = 64 * KiB,
 
@@ -339,6 +361,8 @@ static const HisiSoCConfig hi3518cv100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
+    .crg_pll_lock_bits  = 0xf,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },
@@ -347,7 +371,7 @@ static const HisiSoCConfig hi3518cv100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,
+    .timer_freq         = 100000000,    /* BPLL 200 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -380,18 +404,27 @@ static const HisiSoCConfig hi3518cv100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
+    /*
+     * PLL defaults: the words this SoC's reg_info table writes, so a
+     * -kernel boot and a flash boot (which runs the table) give the
+     * kernel the same clocks.  OpenIPC/u-boot-hi3516cv100's hi3518cv100
+     * and hi3518ev100 tables, and HiSilicon's SDK reg_info_hi3518a.bin,
+     * all program BPLL CRG4/CRG5 = 0x11000000/0x00683064: refdiv=3,
+     * fbdiv=100, pstdiv 1/2 -> 24*100/12 = 200 MHz bus, so the timer runs
+     * at 100 MHz (hi3516cv100's fbdiv=110 gives its 110 MHz).  From the
+     * tables, not read back from a board.
+     */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },
-        { 0x04, (1 << 12) | 46 },
-        { 0x10, (1 << 24) | (1 << 27) },
-        { 0x14, (3 << 12) | 25 },
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
-    .num_regbanks       = 8,
+    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
-        { "hisi-ddr",    0x20110000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
@@ -421,6 +454,7 @@ static const HisiSoCConfig hi3518ev100_soc = {
                           "mmz=anonymous,0,0x82000000,32M",
 
     .ram_base           = 0x80000000,
+    .v1_xip_boot        = true,         /* reg_info brings DDR up */
     .sram_base          = 0x04010000,
     .sram_size          = 64 * KiB,
 
@@ -429,6 +463,8 @@ static const HisiSoCConfig hi3518ev100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
+    .crg_pll_lock_bits  = 0xf,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },
@@ -437,7 +473,7 @@ static const HisiSoCConfig hi3518ev100_soc = {
     .num_timers         = 2,
     .timer_bases        = { 0x20000000, 0x20010000 },
     .timer_irqs         = { 3, 4 },
-    .timer_freq         = 50000000,
+    .timer_freq         = 100000000,    /* BPLL 200 MHz bus / prescale 2 */
 
     .num_spis           = 2,
     .spi_bases          = { 0x200C0000, 0x200E0000 },
@@ -470,18 +506,27 @@ static const HisiSoCConfig hi3518ev100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
+    /*
+     * PLL defaults: the words this SoC's reg_info table writes, so a
+     * -kernel boot and a flash boot (which runs the table) give the
+     * kernel the same clocks.  OpenIPC/u-boot-hi3516cv100's hi3518cv100
+     * and hi3518ev100 tables, and HiSilicon's SDK reg_info_hi3518a.bin,
+     * all program BPLL CRG4/CRG5 = 0x11000000/0x00683064: refdiv=3,
+     * fbdiv=100, pstdiv 1/2 -> 24*100/12 = 200 MHz bus, so the timer runs
+     * at 100 MHz (hi3516cv100's fbdiv=110 gives its 110 MHz).  From the
+     * tables, not read back from a board.
+     */
     .num_crg_defaults   = 4,
     .crg_defaults       = {
-        { 0x00, (1 << 24) | (1 << 27) },
-        { 0x04, (1 << 12) | 46 },
-        { 0x10, (1 << 24) | (1 << 27) },
-        { 0x14, (3 << 12) | 25 },
+        { 0x00, 0x11000000 },               /* CRG0: APLL post dividers */
+        { 0x04, 0x0068306e },               /* CRG1: APLL refdiv/fbdiv  */
+        { 0x10, 0x11000000 },               /* CRG4: BPLL post dividers */
+        { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
-    .num_regbanks       = 8,
+    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
-        { "hisi-ddr",    0x20110000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
@@ -4380,6 +4425,38 @@ static void hisilicon_write_bootrom(MemoryRegion *sysmem,
         return;
     }
 
+    /*
+     * V1: hand off to the flash window and let U-Boot run in place.  On
+     * silicon the SPI NOR is remapped at 0 and the reset code jumps into
+     * the window through _clr_remap_spi_entry; starting at the window
+     * skips only that jump.  From there start.S walks its reg_info table,
+     * which is what brings the PLLs and DDR up (see hisi-ddrc-v1), and
+     * only then copies itself to DDR.  Address 0 stays RAM: relocate
+     * copies U-Boot's exception table there.
+     */
+    if (c->v1_xip_boot) {
+        uint32_t v1rom[] = {
+            cpu_to_le32(0xea000006),    /* b reset_handler (word 8)    */
+            cpu_to_le32(0xe1b0f00e),    /* movs pc, lr  (undef: skip)  */
+            cpu_to_le32(0xeafffffe),    /* b .  (SWI)                  */
+            cpu_to_le32(0xeafffffe),    /* b .  (prefetch abort)       */
+            cpu_to_le32(0xe25ef004),    /* subs pc, lr, #4 (dabort)    */
+            cpu_to_le32(0xeafffffe),    /* b .  (reserved)             */
+            cpu_to_le32(0xeafffffe),    /* b .  (IRQ)                  */
+            cpu_to_le32(0xeafffffe),    /* b .  (FIQ)                  */
+            cpu_to_le32(0xe321f0d3),    /* msr cpsr_c, #0xD3           */
+            cpu_to_le32(0xe51ff004),    /* ldr pc, [pc, #-4]           */
+            cpu_to_le32(c->fmc_mem_base),
+        };
+        MemoryRegion *v1bootrom = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(v1bootrom, NULL, "hisilicon.bootrom",
+                               0x1000, &error_fatal);
+        memory_region_add_subregion(sysmem, 0, v1bootrom);
+        rom_add_blob_fixed("hisilicon.bootrom", v1rom, sizeof(v1rom), 0);
+        return;
+    }
+
     hwaddr flash_src = c->fmc_mem_base;         /* e.g. 0x14000000 */
     hwaddr ram_dst   = c->ram_base;             /* e.g. 0x40000000 */
     hwaddr uboot_entry = 0;   /* jump target; defaults to ram_dst (set below) */
@@ -5075,6 +5152,27 @@ static void hisilicon_common_init(MachineState *machine,
     /* RAM */
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
 
+    /*
+     * V1 DDR controller + PHY.  On a flash boot DDR stays unusable until
+     * U-Boot's reg_info table starts the PHY, so an image built without
+     * the table fails here as it does on a board (OpenIPC/firmware#2593).
+     * The PHY window sits inside the hisi-misc regbank, hence priority 1.
+     */
+    if (c->v1_xip_boot) {
+        DeviceState *ddrc = qdev_new("hisi-ddrc-v1");
+        SysBusDevice *ddrcbus = SYS_BUS_DEVICE(ddrc);
+
+        if (flash_boot) {
+            qdev_prop_set_uint64(ddrc, "ram-size", machine->ram_size);
+        }
+        sysbus_realize_and_unref(ddrcbus, &error_fatal);
+        sysbus_mmio_map(ddrcbus, 0, HISI_V1_DDRC_BASE);
+        sysbus_mmio_map_overlap(ddrcbus, 1, HISI_V1_DDRPHY_BASE, 1);
+        if (flash_boot) {
+            sysbus_mmio_map_overlap(ddrcbus, 2, c->ram_base, 1);
+        }
+    }
+
     /* CPUs — secondary CPUs start halted (held in reset until kernel brings them up) */
     for (n = 0; n < smp_cpus; n++) {
         cpuobj[n] = object_new(machine->cpu_type);
@@ -5295,6 +5393,10 @@ static void hisilicon_common_init(MachineState *machine,
         DeviceState *crg = qdev_new("hisi-crg");
         if (c->cpu_srst_offset) {
             qdev_prop_set_uint32(crg, "cpu-srst-offset", c->cpu_srst_offset);
+        }
+        if (c->crg_pll_lock_offset) {
+            qdev_prop_set_uint32(crg, "pll-lock-offset", c->crg_pll_lock_offset);
+            qdev_prop_set_uint32(crg, "pll-lock-bits", c->crg_pll_lock_bits);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(crg), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(crg), 0, c->crg_base);

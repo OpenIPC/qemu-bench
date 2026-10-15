@@ -75,6 +75,7 @@ Device register tests (self-contained, need a built QEMU):
 bash qemu/tests/test-hisi-wdt.sh        # SP805 watchdog
 bash qemu/tests/test-hisi-rtc.sh
 bash qemu/tests/test-hisi-mipi-rx.sh
+bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
 ```
 
 Full-boot tests need firmware, in one of two shapes.
@@ -183,7 +184,12 @@ in this order:
 
 1. **flash boot** — `-machine <soc>,flash-file=img` *and no `-kernel`*. On
    ARMv7/v5 a synthetic boot ROM is written at address 0 that copies U-Boot
-   from the flash window to DDR and jumps, like silicon. On aarch64 V5 the
+   from the flash window to DDR and jumps, like silicon. The V1 quartet
+   (`v1_xip_boot`) instead jumps into the flash window and U-Boot runs in
+   place: its reg_info table at image offset 0x40 is what brings DDR up, and
+   `hisi-ddrc-v1` keeps DDR reading zero until that table starts the DDR PHY,
+   so an image built without the table fails as on silicon
+   (OpenIPC/firmware#2593). On aarch64 V5 the
    gzip self-extracting `u-boot-z.bin` payload is located inside the image (by
    scanning for the reset branch + `0xdeadbeef` self-descriptor run, so a
    GSL-signed full NOR image works too), loaded at `uboot_load_addr`, and CPU0
