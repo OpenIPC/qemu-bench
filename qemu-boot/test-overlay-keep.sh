@@ -135,14 +135,21 @@ fail=0
 # The kernel must really have refused it, or this test proves nothing.  Its
 # own "Incompatible feature node (0xe008)" is below console loglevel; what
 # reaches the console is busybox mount's failure.
+refused=0
 if tr -d '\r' < "$CONSOLE" | grep -aqE 'mounting /dev/mtdblock[0-9]+ on /overlay failed'; then
     echo "ok   the kernel refused the overlay (no jffs2 xattr support)"
+    refused=1
 else
-    echo "FAIL: the kernel did not refuse the xattr overlay; the scenario was not reproduced"
+    # A kernel with jffs2 xattrs mounts the overlay and writes to it, as it
+    # should: nothing here can then say whether init would have kept it.
+    echo "FAIL: the kernel mounted the xattr overlay, so the scenario was not reproduced;" \
+         "pass a kernel built without CONFIG_JFFS2_FS_XATTR (--kernel)"
     fail=1
 fi
 
-if python3 - "$FLASH" "$DATA_IMG" "$((DATA_OFF_KB * 1024))" <<'PY'
+if [ "$refused" = "0" ]; then
+    :
+elif python3 - "$FLASH" "$DATA_IMG" "$((DATA_OFF_KB * 1024))" <<'PY'
 import sys
 fw = open(sys.argv[1], 'rb').read()
 img = open(sys.argv[2], 'rb').read()

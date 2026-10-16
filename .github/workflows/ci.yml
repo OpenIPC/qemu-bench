@@ -532,20 +532,24 @@ jobs:
             # 32 MB board where sysupgrade's RAM phase is tightest.
             flash_tests: true
             overlay_keep: true
+            # Last xm510 kernel without jffs2 xattrs (before firmware#2606).
+            overlay_keep_kernel: nightly-20261015-1d9c834
 
           # Xiongmai XM530 (hw/arm/xiongmai.c): dual Cortex-A5 MPCore (A9
           # stand-in, GIC, TWD, PL310), xmsfc v2, DWMAC at 0x10010000.  CPU1
           # comes up through REG_SC_REMAP + REG_CPU1_SOFT_RST as on silicon.
           #
-          # mem= goes FIRST, as OpenIPC's U-Boot passes it: load_xiongmai
-          # sizes MMZ from the first argument, and without it lays MMZ over
-          # all of RAM, majestic Oopses in mmz, never stops the xm_wdt that
-          # the same script started, and the guest resets a minute later.
+          # The flash tests put mem= FIRST (cmdline_prefix), as OpenIPC's
+          # U-Boot passes it: load_xiongmai sizes MMZ from the first
+          # argument, and without it lays MMZ over all of RAM, majestic
+          # Oopses in mmz, never stops the xm_wdt the same script started,
+          # and the guest resets a minute later.  Not on the -initrd boot
+          # above: QEMU loads the initrd high in RAM, past a mem=32M kernel.
           - name: xm530
             soc: xm530
             machine: xm530
             smp: 2
-            append: "mem=32M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
             ping_linux: true
             flash_rw: true
             flash_rw_mem: 64M
@@ -560,7 +564,7 @@ jobs:
             soc: xm530
             machine: xm550
             smp: 2
-            append: "mem=32M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
 
     continue-on-error: ${{ matrix.allow_failure == true }}
 
@@ -818,8 +822,23 @@ jobs:
               exit 0 ;;
             *) echo "::error::unexpected compare status '${st}'"; exit 1 ;;
           esac
+          # The scenario needs a kernel WITHOUT jffs2 xattrs meeting an
+          # overlay written with them.  xm510 has had them since
+          # firmware#2606, so the kernel comes from the last nightly before
+          # that (matrix.overlay_keep_kernel), and the rootfs -- the thing
+          # under test -- from the current release.  A pinned asset that has
+          # gone is an error, not a skip: the coverage must not vanish quietly.
+          kernel="qemu-boot/uImage.${{ matrix.soc }}"
+          if [ -n "${{ matrix.overlay_keep_kernel }}" ]; then
+            curl -fsSL "https://github.com/OpenIPC/firmware/releases/download/${{ matrix.overlay_keep_kernel }}/openipc.${{ matrix.soc }}-nor-lite.tgz" \
+              -o "$d/pinned.tgz" ||
+              { echo "::error::cannot fetch the pinned kernel from ${{ matrix.overlay_keep_kernel }}"; exit 1; }
+            tar xzf "$d/pinned.tgz" -C "$d" "uImage.${{ matrix.soc }}"
+            kernel="$d/uImage.${{ matrix.soc }}"
+          fi
           bash qemu-boot/test-overlay-keep.sh \
             --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
+            --kernel "$kernel" \
             --qemu ./qemu-src/build/qemu-system-arm \
             --output-dir "$RUNNER_TEMP/overlay-keep-${{ matrix.soc }}" \
             --mem "${{ matrix.flash_rw_mem || '128M' }}" \
