@@ -514,13 +514,21 @@ jobs:
 
           # Xiongmai XM510 (hw/arm/xiongmai.c): the vendor 3.0.101 kernel on a
           # PL190 VIC, SP804, xmsfc NOR and the xmmac DWMAC 10/100.  No
-          # uboot_bin -- OpenIPC publishes no XM U-Boot -- and no flash_rw
-          # until test-flash-rw.sh stops assuming hi_sfc.
+          # uboot_bin -- OpenIPC publishes no XM U-Boot.  flash_rw runs the
+          # xmsfc erase/program path on an 8 MiB NOR, the only size the
+          # XM510 kernel's chip table knows.
           - name: xm510
             soc: xm510
             machine: xm510
             append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
             ping_linux: true
+            flash_rw: true
+            flash_rw_mem: 32M
+            mtd_name: xm_sfc
+            flash_mb: 8
+            # sysupgrade, firstboot and the firmware#2613 overlay case, on the
+            # 32 MB board where sysupgrade's RAM phase is tightest.
+            flash_tests: true
 
     continue-on-error: ${{ matrix.allow_failure == true }}
 
@@ -715,8 +723,65 @@ jobs:
             --machine "${{ matrix.machine }}" \
             --qemu ./qemu-src/build/qemu-system-arm \
             --output-dir "qemu-boot/flash-rw-${{ matrix.soc }}" \
-            --mem 128M \
+            --mem "${{ matrix.flash_rw_mem || '128M' }}" \
+            --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
+            --flash-mb "${{ matrix.flash_mb || 16 }}" \
             --timeout 240
+
+      - name: "Flash-level firmware tests: dependencies"
+        if: matrix.flash_tests
+        run: sudo apt-get install -y --no-install-recommends mtd-utils attr squashfs-tools dosfstools
+
+      - name: "sysupgrade from a local archive"
+        if: matrix.flash_tests
+        timeout-minutes: 12
+        run: |
+          bash qemu-boot/test-sysupgrade.sh \
+            --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
+            --qemu ./qemu-src/build/qemu-system-arm \
+            --output-dir "$RUNNER_TEMP/sysupgrade-${{ matrix.soc }}" \
+            --mem "${{ matrix.flash_rw_mem || '128M' }}" \
+            --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
+            --flash-mb "${{ matrix.flash_mb || 16 }}"
+
+      - name: "firstboot wipes the overlay"
+        if: matrix.flash_tests
+        timeout-minutes: 10
+        run: |
+          bash qemu-boot/test-firstboot.sh \
+            --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
+            --qemu ./qemu-src/build/qemu-system-arm \
+            --output-dir "$RUNNER_TEMP/firstboot-${{ matrix.soc }}" \
+            --mem "${{ matrix.flash_rw_mem || '128M' }}" \
+            --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
+            --flash-mb "${{ matrix.flash_mb || 16 }}"
+
+      - name: "init keeps an unmountable overlay that holds settings (firmware#2613)"
+        if: matrix.flash_tests
+        timeout-minutes: 6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The fix is OpenIPC/firmware 5c01f0a92.  Release images built before
+        # it erase the overlay, which is the bug, not a reason to go red here:
+        # run once the image under test carries the commit, which the build
+        # SHA in its os-release says.
+        run: |
+          d=$(mktemp -d)
+          unsquashfs -q -d "$d/r" "qemu-boot/rootfs.squashfs.${{ matrix.soc }}" usr/lib/os-release >/dev/null
+          sha=$(sed -n 's/^BUILD_ID=.*-\([0-9a-f]\{7,\}\)$/\1/p' "$d/r/usr/lib/os-release")
+          echo "image build: ${sha:-unknown}"
+          st=$(gh api "repos/OpenIPC/firmware/compare/5c01f0a92...${sha:-0}" --jq .status 2>/dev/null || true)
+          if [ "$st" != "ahead" ] && [ "$st" != "identical" ]; then
+            echo "::notice::release image ${sha:-?} predates firmware#2613 (compare: ${st:-n/a}); skipped"
+            exit 0
+          fi
+          bash qemu-boot/test-overlay-keep.sh \
+            --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
+            --qemu ./qemu-src/build/qemu-system-arm \
+            --output-dir "$RUNNER_TEMP/overlay-keep-${{ matrix.soc }}" \
+            --mem "${{ matrix.flash_rw_mem || '128M' }}" \
+            --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
+            --flash-mb "${{ matrix.flash_mb || 16 }}"
 
       - name: "Linux network test"
         if: matrix.ping_linux
