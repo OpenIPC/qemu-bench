@@ -535,16 +535,24 @@ jobs:
           # Xiongmai XM530 (hw/arm/xiongmai.c): dual Cortex-A5 MPCore (A9
           # stand-in, GIC, TWD, PL310), xmsfc v2, DWMAC at 0x10010000.  CPU1
           # comes up through REG_SC_REMAP + REG_CPU1_SOFT_RST as on silicon.
-          # No flash tests yet: load_xiongmai starts xm_wdt, majestic Oopses
-          # in the unmodelled media blocks before it can stop it, and the
-          # watchdog resets the guest ~60 s after insmod -- after login and
-          # the network check, but inside the flash tests.
+          #
+          # mem= goes FIRST, as OpenIPC's U-Boot passes it: load_xiongmai
+          # sizes MMZ from the first argument, and without it lays MMZ over
+          # all of RAM, majestic Oopses in mmz, never stops the xm_wdt that
+          # the same script started, and the guest resets a minute later.
           - name: xm530
             soc: xm530
             machine: xm530
             smp: 2
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+            append: "mem=32M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
             ping_linux: true
+            flash_rw: true
+            flash_rw_mem: 64M
+            mtd_name: xm_sfc
+            flash_mb: 8
+            cmdline_prefix: "mem=32M"
+            flash_tests: true
+            overlay_keep: false
 
           # XM550 is the XM530 die with 128 MB; OpenIPC ships it the xm530
           # image, so this boots that bundle on the 128 MB machine.
@@ -552,7 +560,7 @@ jobs:
             soc: xm530
             machine: xm550
             smp: 2
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+            append: "mem=32M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
 
     continue-on-error: ${{ matrix.allow_failure == true }}
 
@@ -750,6 +758,7 @@ jobs:
             --mem "${{ matrix.flash_rw_mem || '128M' }}" \
             --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
             --flash-mb "${{ matrix.flash_mb || 16 }}" \
+            --cmdline-prefix "${{ matrix.cmdline_prefix || '' }}" \
             --timeout 240
 
       - name: "Flash-level firmware tests: dependencies"
@@ -766,7 +775,8 @@ jobs:
             --output-dir "$RUNNER_TEMP/sysupgrade-${{ matrix.soc }}" \
             --mem "${{ matrix.flash_rw_mem || '128M' }}" \
             --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
-            --flash-mb "${{ matrix.flash_mb || 16 }}"
+            --flash-mb "${{ matrix.flash_mb || 16 }}" \
+            --cmdline-prefix "${{ matrix.cmdline_prefix || '' }}"
 
       - name: "firstboot wipes the overlay"
         if: matrix.flash_tests
@@ -778,10 +788,13 @@ jobs:
             --output-dir "$RUNNER_TEMP/firstboot-${{ matrix.soc }}" \
             --mem "${{ matrix.flash_rw_mem || '128M' }}" \
             --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
-            --flash-mb "${{ matrix.flash_mb || 16 }}"
+            --flash-mb "${{ matrix.flash_mb || 16 }}" \
+            --cmdline-prefix "${{ matrix.cmdline_prefix || '' }}"
 
       - name: "init keeps an unmountable overlay that holds settings (firmware#2613)"
-        if: matrix.flash_tests
+        # Only a kernel without jffs2 xattrs can refuse the overlay; XM530's
+        # has them, so there the scenario cannot happen (overlay_keep: false).
+        if: matrix.flash_tests && matrix.overlay_keep != false
         timeout-minutes: 6
         env:
           GH_TOKEN: ${{ github.token }}
@@ -810,7 +823,8 @@ jobs:
             --output-dir "$RUNNER_TEMP/overlay-keep-${{ matrix.soc }}" \
             --mem "${{ matrix.flash_rw_mem || '128M' }}" \
             --mtd-name "${{ matrix.mtd_name || 'hi_sfc' }}" \
-            --flash-mb "${{ matrix.flash_mb || 16 }}"
+            --flash-mb "${{ matrix.flash_mb || 16 }}" \
+            --cmdline-prefix "${{ matrix.cmdline_prefix || '' }}"
 
       - name: "Linux network test"
         if: matrix.ping_linux
