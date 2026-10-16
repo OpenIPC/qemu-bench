@@ -43,6 +43,14 @@ typedef struct XmSoCConfig {
     hwaddr      sys_base;
     uint32_t    sys_rsten;
     uint32_t    sys_rst;
+    uint32_t    sys_pll_lock_mask;  /* xm-sysctl pll-lock-mask */
+
+    /* On-chip SRAM: U-Boot's first stack, before DDR is up. */
+    hwaddr      sram_base;
+    uint32_t    sram_size;
+
+    /* DDR controller: only U-Boot's training touches it (xm-ddrc). */
+    hwaddr      ddrc_base;
 
     /* Interrupt controller: a PL190-layout VIC (XM510). */
     hwaddr      vic_base;

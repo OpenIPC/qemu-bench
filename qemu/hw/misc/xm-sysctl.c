@@ -12,6 +12,11 @@
  *
  * Without it a guest "reboot" spins in the restart handler forever.
  *
+ * U-Boot's lowlevel init also programs each PLL and spins until its status
+ * word reads 1 (XM510: control at +0x04/+0x18/+0x20, lock at +0x08/+0x1C/
+ * +0x28).  The words named in pll-lock-mask (bit n = offset 4n) are those
+ * status words: they always read locked.
+ *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
  *
@@ -37,12 +42,16 @@ struct XmSysctlState {
     uint32_t regs[XM_SYSCTL_SIZE / 4];
     uint32_t rsten_offset;
     uint32_t rst_offset;
+    uint32_t pll_lock_mask;
 };
 
 static uint64_t xm_sysctl_read(void *opaque, hwaddr offset, unsigned size)
 {
     XmSysctlState *s = XM_SYSCTL(opaque);
 
+    if (offset < 32 * 4 && (s->pll_lock_mask & (1u << (offset / 4)))) {
+        return 1;
+    }
     return s->regs[offset / 4];
 }
 
@@ -92,6 +101,7 @@ static void xm_sysctl_realize(DeviceState *dev, Error **errp)
 static const Property xm_sysctl_properties[] = {
     DEFINE_PROP_UINT32("rsten-offset", XmSysctlState, rsten_offset, 0x30),
     DEFINE_PROP_UINT32("rst-offset", XmSysctlState, rst_offset, 0x34),
+    DEFINE_PROP_UINT32("pll-lock-mask", XmSysctlState, pll_lock_mask, 0),
 };
 
 static void xm_sysctl_class_init(ObjectClass *klass, const void *data)

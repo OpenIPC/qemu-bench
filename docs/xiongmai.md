@@ -27,6 +27,8 @@ neither are the flash controller, GPIO or I2C. Hence a family of its own in
 | Ethernet | DWMAC 10/100 0x20040000, IRQ 3, RMII PHY at MDIO 1 | DWMAC 0x10010000, SPI 3 |
 | SD/MMC | Arasan SDHCI 0x50000000 (IRQ 24), 0x50010000 (IRQ 25) | 0x50000000 / 0x50100000, SPI 41 / 42 |
 | GPIO / mux | 0x10020000, one register per pin | same |
+| SRAM | 0x04000000 (U-Boot's first stack, sp = 0x04001000) | — |
+| DDRC | Synopsys uPCTL 0x100B0000, PHY 0x100B2000 | — |
 | Boot | ATAGs at 0x80000100, machine 8888, `mtdparts=xm_sfc:` | same |
 
 ## Sources
@@ -57,6 +59,43 @@ neither are the flash controller, GPIO or I2C. Hence a family of its own in
 - **SD:** `drivers/mmc/host/arasan.{c,h}`. These use standard SDHCI offsets,
   and `arasan_set_clock()` waits on CLOCK_CTRL's internal-clock-stable bit,
   which upstream `generic-sdhci` provides.
+
+## Booting a flash dump
+
+The CPU starts at 0x0, which is the xmsfc read window, so a full flash image
+boots its own U-Boot in place. There is no mask ROM to emulate:
+
+```sh
+qemu-system-arm -M xm510,flash-file=dump.bin -nographic -serial mon:stdio
+```
+
+This was checked with an XM510 dump (W25Q64CV, U-Boot 2014.04 "Dec 16 2016"):
+U-Boot trains DDR, reads the kernel with `sf`, `bootm`s it, and the camera's
+own kernel and rootfs reach `login:`. The dump is written back as the guest
+erases and programs, so work on a copy.
+
+OpenIPC publishes no XM U-Boot, so CI cannot do this; it boots the release
+kernel with `-kernel` against a synthetic NOR instead.
+
+What U-Boot needs before DDR, read from its code since there is no public
+source:
+
+- **PLL lock:** each PLL is programmed through SYS and polled until its
+  status word reads 1. Those words are SYS +0x08, +0x1C and +0x28, which
+  `xm-sysctl` holds locked (`pll-lock-mask`).
+- **SRAM:** the first stack is at 0x04001000, in on-chip SRAM. 64 KiB is
+  mapped, a guess.
+- **DDR controller:** a Synopsys uPCTL at 0x100B0000. The `xm-ddrc` model
+  provides:
+  - SCTL/STAT, where state requests (CFG, GO, …) are reached at once;
+  - MCMD `start_cmd` (bit 31), which self-clears;
+  - POWSTAT `power_up_done`;
+  - the PHY's training-done word at +0x1038.
+
+  The kernel's commented-out `DDRC_BASE 0x20110000` is not where U-Boot finds
+  it.
+- **Flash size:** the XM510 kernel's xmsfc chip table knows only 8 MiB parts
+  (W25Q64CV 0xef4017, MX25L6405D 0xc22017), so tests use an 8 MiB NOR.
 
 ## Model notes
 
