@@ -41,6 +41,7 @@ TIMEOUT=180
 KERNEL=""
 ROOTFS=""
 MTD_NAME="hi_sfc"
+CMDLINE_PREFIX=""
 FLASH_MB=16
 
 while [ $# -gt 0 ]; do
@@ -54,6 +55,7 @@ while [ $# -gt 0 ]; do
         --kernel)     KERNEL="$2"; shift 2 ;;
         --rootfs)     ROOTFS="$2"; shift 2 ;;
         --mtd-name)   MTD_NAME="$2"; shift 2 ;;
+        --cmdline-prefix) CMDLINE_PREFIX="$2"; shift 2 ;;
         --flash-mb)   FLASH_MB="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -102,7 +104,7 @@ dd if="$ROOTFS" of="$FLASH" bs=1k seek=$((BOOT_KB + ENV_KB + KERN_KB)) conv=notr
 dd if="$DATA_IMG" of="$FLASH" bs=1k seek="$DATA_OFF_KB" conv=notrunc 2>/dev/null
 MTDPARTS="${MTD_NAME}:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel)"
 MTDPARTS="${MTDPARTS},${ROOTFS_KB}k(rootfs),-(rootfs_data)"
-APPEND="console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
+APPEND="${CMDLINE_PREFIX:+$CMDLINE_PREFIX }console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
 APPEND="${APPEND} init=/init mtdparts=${MTDPARTS}"
 
 CONSOLE="$OUTDIR/overlay-keep-console.txt"
@@ -133,14 +135,21 @@ fail=0
 # The kernel must really have refused it, or this test proves nothing.  Its
 # own "Incompatible feature node (0xe008)" is below console loglevel; what
 # reaches the console is busybox mount's failure.
+refused=0
 if tr -d '\r' < "$CONSOLE" | grep -aqE 'mounting /dev/mtdblock[0-9]+ on /overlay failed'; then
     echo "ok   the kernel refused the overlay (no jffs2 xattr support)"
+    refused=1
 else
-    echo "FAIL: the kernel did not refuse the xattr overlay; the scenario was not reproduced"
+    # A kernel with jffs2 xattrs mounts the overlay and writes to it, as it
+    # should: nothing here can then say whether init would have kept it.
+    echo "FAIL: the kernel mounted the xattr overlay, so the scenario was not reproduced;" \
+         "pass a kernel built without CONFIG_JFFS2_FS_XATTR (--kernel)"
     fail=1
 fi
 
-if python3 - "$FLASH" "$DATA_IMG" "$((DATA_OFF_KB * 1024))" <<'PY'
+if [ "$refused" = "0" ]; then
+    :
+elif python3 - "$FLASH" "$DATA_IMG" "$((DATA_OFF_KB * 1024))" <<'PY'
 import sys
 fw = open(sys.argv[1], 'rb').read()
 img = open(sys.argv[2], 'rb').read()
