@@ -90,8 +90,13 @@ APPEND="${APPEND} init=/init mtdparts=${MTDPARTS}"
 # before its RAM pivot and refuses while this script holds the card.
 cat > "$OUTDIR/autostart.sh" <<'AUTOSTART'
 #!/bin/sh
-grep -q . /etc/majestic.yaml 2>/dev/null || exit 0
-echo "FB_SEEN_SETTING=$(grep -c firstboot-test- /etc/majestic.yaml)"
+# Only the planted setting triggers the wipe: after it, /etc/majestic.yaml is
+# the rootfs's stock file, and boot 2 must not wipe and reboot again.
+if ! grep -q firstboot-test- /etc/majestic.yaml 2>/dev/null; then
+	echo "FB_SEEN_SETTING=0"
+	exit 0
+fi
+echo "FB_SEEN_SETTING=1"
 cd / && ( sleep 3; firstboot; echo "FB_RC=$?" ) </dev/null >/dev/console 2>&1 &
 AUTOSTART
 
@@ -160,6 +165,9 @@ if run_guest "$C2" 180 'login:' && grep -aq 'login:' "$C2"; then
     echo "ok   the wiped camera boots to login"
 else
     echo "FAIL: the wiped camera does not reach login"; fail=1
+fi
+if grep -aq 'FB_SEEN_SETTING=1' "$C2"; then
+    echo "FAIL: boot 2 still saw the planted setting in /etc"; fail=1
 fi
 
 if [ "$fail" = "0" ]; then

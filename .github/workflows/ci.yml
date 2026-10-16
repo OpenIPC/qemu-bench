@@ -770,11 +770,16 @@ jobs:
           unsquashfs -q -d "$d/r" "qemu-boot/rootfs.squashfs.${{ matrix.soc }}" usr/lib/os-release >/dev/null
           sha=$(sed -n 's/^BUILD_ID=.*-\([0-9a-f]\{7,\}\)$/\1/p' "$d/r/usr/lib/os-release")
           echo "image build: ${sha:-unknown}"
-          st=$(gh api "repos/OpenIPC/firmware/compare/5c01f0a92...${sha:-0}" --jq .status 2>/dev/null || true)
-          if [ "$st" != "ahead" ] && [ "$st" != "identical" ]; then
-            echo "::notice::release image ${sha:-?} predates firmware#2613 (compare: ${st:-n/a}); skipped"
-            exit 0
-          fi
+          [ -n "$sha" ] || { echo "::error::no build SHA in the image's os-release"; exit 1; }
+          st=$(gh api "repos/OpenIPC/firmware/compare/5c01f0a92...${sha}" --jq .status) ||
+            { echo "::error::cannot compare ${sha} with 5c01f0a92"; exit 1; }
+          case "$st" in
+            ahead|identical) ;;
+            behind|diverged)
+              echo "::notice::release image ${sha} does not contain firmware#2613 (compare: ${st}); skipped"
+              exit 0 ;;
+            *) echo "::error::unexpected compare status '${st}'"; exit 1 ;;
+          esac
           bash qemu-boot/test-overlay-keep.sh \
             --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
             --qemu ./qemu-src/build/qemu-system-arm \

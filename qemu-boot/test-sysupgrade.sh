@@ -16,7 +16,7 @@
 # host then checks what the guest cannot check for itself:
 #
 #   1. the kernel and rootfs partitions hold the archive's images byte for byte
-#   2. rootfs_data was not touched (no -n)
+#   2. a saved setting planted in rootfs_data survives the upgrade (no -n)
 #   3. a second boot from that flash reaches login
 #
 # The archive's rootfs must differ from the one on flash, or (1) proves
@@ -64,6 +64,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$SOC" ] && [ -n "$MACHINE" ] || { echo "--soc and --machine required" >&2; exit 2; }
+command -v mkfs.jffs2 >/dev/null || { echo "=== FAIL: needs mkfs.jffs2 (mtd-utils) ==="; exit 1; }
 mkdir -p "$OUTDIR"
 
 : "${KERNEL:=qemu-boot/uImage.${SOC}}"
@@ -102,9 +103,20 @@ FLASH_BYTES=$(( FLASH_MB * 1024 * 1024 ))
 [ $(( FLASH_BYTES - DATA_OFF )) -ge $((256 * 1024)) ] ||
     { echo "=== FAIL: no room for rootfs_data in ${FLASH_MB} MiB ==="; exit 1; }
 
+# The camera's settings: a mountable overlay with a uniquely marked
+# majestic.yaml, which the upgrade must leave in place.
+MARK="sysupgrade-test-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+DATA_DIR="$OUTDIR/overlay-src"
+rm -rf "$DATA_DIR"; mkdir -p "$DATA_DIR/etc"
+echo "# $MARK" > "$DATA_DIR/etc/majestic.yaml"
+DATA_IMG="$OUTDIR/rootfs_data.jffs2"
+mkfs.jffs2 -l -e 0x10000 -p $(( FLASH_BYTES - DATA_OFF )) -d "$DATA_DIR" -o "$DATA_IMG" ||
+    { echo "=== FAIL: mkfs.jffs2 ==="; exit 1; }
+
 FLASH="$OUTDIR/flash.bin"
 head -c "$FLASH_BYTES" /dev/zero | tr '\000' '\377' > "$FLASH"
 dd if="$ROOTFS" of="$FLASH" bs=1k seek=$((ROOTFS_OFF / 1024)) conv=notrunc 2>/dev/null
+dd if="$DATA_IMG" of="$FLASH" bs=1k seek=$((DATA_OFF / 1024)) conv=notrunc 2>/dev/null
 MTDPARTS="${MTD_NAME}:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel)"
 MTDPARTS="${MTDPARTS},${ROOTFS_KB}k(rootfs),-(rootfs_data)"
 APPEND="console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
@@ -127,6 +139,7 @@ cat > "$OUTDIR/autostart.sh" <<AUTOSTART
 # Once only: the upgrade reboots, and the second boot mounts this card again.
 [ -e /overlay/.sysupgrade-test-ran ] && exit 0
 touch /overlay/.sysupgrade-test-ran
+echo "SU_SEEN_SETTING=\$(grep -c sysupgrade-test- /etc/majestic.yaml 2>/dev/null)"
 echo "SU_START_MARK"
 # sysupgrade unmounts /mnt before its RAM pivot and refuses while this very
 # script holds the card open, so run it from /tmp, detached, once we are gone.
@@ -170,6 +183,11 @@ run_guest "$C1" "$TIMEOUT"; exited=$?
 
 fail=0
 grep -aq SU_START_MARK "$C1" || { echo "FAIL: the SD hook never ran sysupgrade"; fail=1; }
+if grep -aq 'SU_SEEN_SETTING=1' "$C1"; then
+    echo "ok   the planted overlay was mounted (the setting was in /etc)"
+else
+    echo "FAIL: the planted setting was not visible in /etc; nothing to preserve"; fail=1
+fi
 rc=$(tr -d '\r' < "$C1" | sed -n 's/.*SU_RC=\([0-9]\+\).*/\1/p' | head -1)
 if [ -n "$rc" ]; then
     echo "FAIL: sysupgrade returned $rc without rebooting"; fail=1
@@ -180,7 +198,7 @@ else
 fi
 
 python3 - "$FLASH" "$OUTDIR/flash.before" "$KERNEL" "$NEW_ROOTFS" \
-    "$KERN_OFF" "$ROOTFS_OFF" "$DATA_OFF" <<'PY' || fail=1
+    "$KERN_OFF" "$ROOTFS_OFF" "$DATA_OFF" "$MARK" <<'PY' || fail=1
 import sys
 fw, before = (open(p, 'rb').read() for p in sys.argv[1:3])
 kern, rootfs = (open(p, 'rb').read() for p in sys.argv[3:5])
@@ -191,12 +209,11 @@ for name, off, img in (('kernel', koff, kern), ('rootfs', roff, rootfs)):
         print(f'ok   {name} partition holds the archive\'s image')
     else:
         print(f'FAIL: {name} partition does not hold the archive\'s image'); ok = False
-if fw[doff:] == before[doff:]:
-    print('ok   rootfs_data left alone (no -n)')
+# The hook itself writes to the overlay, so compare the setting, not bytes.
+if sys.argv[8].encode() in fw[doff:]:
+    print('ok   the saved setting is still in rootfs_data')
 else:
-    # init formats a blank rootfs_data on first boot, before the upgrade:
-    # that is expected; only report it.
-    print('note rootfs_data changed (first-boot jffs2 format and the hook\'s mark)')
+    print('FAIL: the upgrade lost the saved setting in rootfs_data'); ok = False
 sys.exit(0 if ok else 1)
 PY
 
