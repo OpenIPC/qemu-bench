@@ -39,6 +39,8 @@ jobs:
           [ "$count" -ge 21 ]
           # aarch64 V5 machines (Hi3519DV500 / Hi3516DV500)
           ./qemu-src/build/qemu-system-aarch64 -machine help | grep -E 'hi3519dv500|hi3516dv500'
+          # Xiongmai family (hw/arm/xiongmai.c), not HiSilicon-derived
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm510 '
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -509,6 +511,16 @@ jobs:
             append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
             ping_linux: true
             uboot_bin: u-boot-hi3536dv100-universal.bin
+
+          # Xiongmai XM510 (hw/arm/xiongmai.c): the vendor 3.0.101 kernel on a
+          # PL190 VIC, SP804, xmsfc NOR and the xmmac DWMAC 10/100.  No
+          # uboot_bin -- OpenIPC publishes no XM U-Boot -- and no flash_rw
+          # until test-flash-rw.sh stops assuming hi_sfc.
+          - name: xm510
+            soc: xm510
+            machine: xm510
+            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+            ping_linux: true
 
     continue-on-error: ${{ matrix.allow_failure == true }}
 
