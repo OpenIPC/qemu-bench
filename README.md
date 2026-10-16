@@ -100,8 +100,22 @@ the rest is licensed IP (PrimeCell PL011/SP804/SP805/PL190, Synopsys DWMAC,
 Arasan SDHCI). So the family has its own table and init in
 `hw/arm/xiongmai.c` rather than `HisiSoCConfig` slots; addresses and their
 sources are in [docs/xiongmai.md](docs/xiongmai.md). `xm510` boots the OpenIPC
-`xm510_lite` release with `qemu-boot/run-xm510.sh` — login, guest reboot and
-the full network check (DHCP, ICMP, SSH, routed DNS). XM530/XM550 are next.
+`xm510_lite` release with `qemu-boot/run-xm510.sh`, and boots a full camera
+flash dump through its own U-Boot with `-M xm510,flash-file=dump.bin`.
+
+CI covers:
+- login;
+- guest reboot;
+- the network: DHCP, ICMP, SSH and routed DNS;
+- SPI-NOR erase/program;
+- the firmware's flash paths, each run by the firmware's own SD-card hook
+  and checked on the host:
+  - `sysupgrade --archive` (`test-sysupgrade.sh`);
+  - `firstboot` (`test-firstboot.sh`);
+  - init keeping an overlay this kernel cannot mount (`test-overlay-keep.sh`,
+    firmware#2613).
+
+XM530/XM550 are next.
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -194,7 +208,8 @@ qemu/
 ├── hw/i2c/hisi-imx335.c         # IMX335 image sensor I2C device
 ├── include/hw/arm/hisilicon.h   # SoC config structure + constants
 ├── hw/arm/xiongmai.c            # Xiongmai XM510 machine (own family)
-├── hw/misc/xm-sysctl.c          # XM SYS_CTRL: RAM-backed, soft reset
+├── hw/misc/xm-sysctl.c          # XM SYS_CTRL: soft reset, PLL lock
+├── hw/misc/xm-ddrc.c            # XM510 uPCTL DDR controller (U-Boot)
 ├── hw/misc/xm-sfc.c             # xmsfc v1 SPI-NOR controller (flash-file)
 ├── hw/net/xm-dwmac.c            # xmmac: DWMAC 10/100, XM MAC layout
 ├── include/hw/arm/xiongmai.h    # XmSoCConfig
@@ -213,6 +228,9 @@ qemu-boot/
 ├── run-gk7205v510-nand.sh       # Boot a GD5F1GM7 SPI-NAND camera dump
 ├── run-cv610.sh
 ├── run-xm510.sh                 # Xiongmai XM510, OpenIPC xm510_lite
+├── test-sysupgrade.sh           # sysupgrade --archive on emulated NOR
+├── test-firstboot.sh            # firstboot wipes the overlay, camera boots
+├── test-overlay-keep.sh         # firmware#2613: unmountable overlay survives
 ├── test-ive-init.c              # IVE basic test (hw_id, dma, sad, ccl)
 ├── test-ive-ops.c               # IVE operations test for QEMU (register-level)
 ├── test-ive-mpi.c               # IVE operations test for real board (MPI API)
