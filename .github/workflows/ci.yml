@@ -531,6 +531,7 @@ jobs:
             # sysupgrade, firstboot and the firmware#2613 overlay case, on the
             # 32 MB board where sysupgrade's RAM phase is tightest.
             flash_tests: true
+            overlay_keep: true
 
           # Xiongmai XM530 (hw/arm/xiongmai.c): dual Cortex-A5 MPCore (A9
           # stand-in, GIC, TWD, PL310), xmsfc v2, DWMAC at 0x10010000.  CPU1
@@ -552,7 +553,6 @@ jobs:
             flash_mb: 8
             cmdline_prefix: "mem=32M"
             flash_tests: true
-            overlay_keep: false
 
           # XM550 is the XM530 die with 128 MB; OpenIPC ships it the xm530
           # image, so this boots that bundle on the 128 MB machine.
@@ -792,9 +792,10 @@ jobs:
             --cmdline-prefix "${{ matrix.cmdline_prefix || '' }}"
 
       - name: "init keeps an unmountable overlay that holds settings (firmware#2613)"
-        # Only a kernel without jffs2 xattrs can refuse the overlay; XM530's
-        # has them, so there the scenario cannot happen (overlay_keep: false).
-        if: matrix.flash_tests && matrix.overlay_keep != false
+        # Only a kernel without jffs2 xattrs can refuse the overlay, so rows
+        # opt in (overlay_keep: true); XM530's kernel has them.  Opt-in, not
+        # "!= false": Actions compares a missing value equal to false.
+        if: matrix.flash_tests && matrix.overlay_keep == true
         timeout-minutes: 6
         env:
           GH_TOKEN: ${{ github.token }}
