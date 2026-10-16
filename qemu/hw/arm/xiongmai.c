@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/units.h"
+#include "qemu/log.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/xiongmai.h"
@@ -203,14 +204,41 @@ static void xm_remap(void *opaque, int n, int level)
  * REG_CPU1_SOFT_RST: CPU1 leaves reset at PC 0, in the state CPU0 runs in
  * (non-secure SVC: these CPUs have no EL3 here).
  */
+static void xm_cpu1_on(CPUState *cs, run_on_cpu_data data)
+{
+    const int ret = arm_set_cpu_on(arm_cpu_mp_affinity(ARM_CPU(cs)),
+                                   0, 0, 1, false);
+
+    if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 release failed (%d)\n", ret);
+    }
+}
+
 static void xm_cpu1_reset(void *opaque, int n, int level)
 {
-    const uint64_t mpidr = arm_cpu_mp_affinity(ARM_CPU(opaque));
+    ARMCPU *cpu1 = ARM_CPU(opaque);
+    const uint64_t mpidr = arm_cpu_mp_affinity(cpu1);
+    int ret;
 
     if (level) {
-        arm_set_cpu_off(mpidr);
-    } else {
-        arm_set_cpu_on(mpidr, 0, 0, 1, false);
+        ret = arm_set_cpu_off(mpidr);
+        if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS &&
+            ret != QEMU_ARM_POWERCTL_IS_OFF) {
+            qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 hold failed (%d)\n", ret);
+        }
+        return;
+    }
+    ret = arm_set_cpu_on(mpidr, 0, 0, 1, false);
+    if (ret == QEMU_ARM_POWERCTL_ALREADY_ON) {
+        /*
+         * Hold and release are two back-to-back register writes, and the
+         * power-off a hold asks for runs later, on CPU1 itself.  A release
+         * that finds CPU1 still on queues behind that power-off on the same
+         * CPU, so it lands once CPU1 really is off.
+         */
+        async_run_on_cpu(CPU(cpu1), xm_cpu1_on, RUN_ON_CPU_NULL);
+    } else if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 release failed (%d)\n", ret);
     }
 }
 
@@ -357,12 +385,17 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             MemoryRegion *win = sysbus_mmio_get_region(SYS_BUS_DEVICE(sfc), 1);
             MemoryRegion *boot = g_new(MemoryRegion, 1);
             MemoryRegion *low = g_new(MemoryRegion, 1);
+            const uint64_t span = MIN(memory_region_size(win),
+                                      memory_region_size(machine->ram));
 
             memory_region_init_alias(boot, NULL, "xiongmai.boot-alias", win, 0,
                                      memory_region_size(win));
             memory_region_add_subregion(sysmem, 0, boot);
-            memory_region_init_ram(low, NULL, "xiongmai.remap-ram", 64 * KiB,
-                                   &error_fatal);
+            /* Remapped, address 0 is DDR itself, as REG_SC_REMAP is on the
+             * HiSilicon parts these were templated on: what the kernel
+             * writes there is what CPU1 fetches, and is in DDR too. */
+            memory_region_init_alias(low, NULL, "xiongmai.remap-ddr",
+                                     machine->ram, 0, span);
             memory_region_add_subregion_overlap(sysmem, 0, low, 1);
             memory_region_set_enabled(low, false);
             qdev_connect_gpio_out_named(sys, "remap", 0,

@@ -123,9 +123,10 @@ static void xm_sysctl_reset(DeviceState *dev)
     for (i = 0; i < s->num_init_offsets && i < s->num_init_values; i++) {
         s->regs[s->init_offsets[i] / 4] = s->init_values[i];
     }
-    /* After a reset CPU1 reads as held, and address 0 is the flash again. */
+    /* After a reset CPU1 is held, and address 0 is the flash again. */
     if (s->cpu1_offset) {
         s->regs[s->cpu1_offset / 4] = 1;
+        qemu_irq_raise(s->cpu1_reset);
     }
     qemu_irq_lower(s->remap);
 }

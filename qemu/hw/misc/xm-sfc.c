@@ -480,7 +480,8 @@ static void xm_sfc_realize(DeviceState *dev, Error **errp)
         return;
     }
     if (!s->jedec) {
-        s->jedec = s->size > 8 * MiB ? 0xef4018 : 0xef4017;
+        /* The XM510 (v1) kernel's table has no 16 MiB part at all. */
+        s->jedec = s->version == 2 && s->size > 8 * MiB ? 0xef4018 : 0xef4017;
     }
     memory_region_init_io(&s->regs, OBJECT(s),
                           s->version == 2 ? &xm_sfc_v2_regs_ops
