@@ -8,7 +8,7 @@ Builds two QEMU targets:
 - `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (48 total)
+## Supported Machines (50 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -93,6 +93,8 @@ modelled yet.
 | Machine | CPU | IRQ | Kernel | Boot tested |
 |---------|-----|-----|--------|-------------|
 | `xm510` | Cortex-A5 (A9 stand-in) | PL190 VIC | 3.0.101 vendor | yes |
+| `xm530` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes |
+| `xm550` | Cortex-A5 ×2 (A9 stand-in), 128 MB | GIC | 3.10.103 vendor | yes |
 
 Not HiSilicon parts, although their BSP kernels started from HiSilicon
 templates: the memory map and the flash controller (xmsfc) are Xiongmai's own,
@@ -115,7 +117,13 @@ CI covers:
   - init keeping an overlay this kernel cannot mount (`test-overlay-keep.sh`,
     firmware#2613).
 
-XM530/XM550 are next.
+`xm530` and `xm550` boot the `xm530_lite` release with `-smp 2`: CPU1 is
+released through `REG_SC_REMAP` and `REG_CPU1_SOFT_RST` as on silicon. CI
+covers login, both CPUs, guest reboot and clock on both, plus the network
+check on `xm530`. Their flash tests wait on media stubs. The stock image
+starts `xm_wdt` (60 s), and only majestic stops it. In QEMU majestic Oopses
+in the unmodelled media blocks first, so the guest resets a minute after
+the modules load.
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -207,10 +215,10 @@ qemu/
 ├── hw/i2c/hisi-i2c.c            # HiBVT I2C controller
 ├── hw/i2c/hisi-imx335.c         # IMX335 image sensor I2C device
 ├── include/hw/arm/hisilicon.h   # SoC config structure + constants
-├── hw/arm/xiongmai.c            # Xiongmai XM510 machine (own family)
+├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 machines
 ├── hw/misc/xm-sysctl.c          # XM SYS_CTRL: soft reset, PLL lock
 ├── hw/misc/xm-ddrc.c            # XM510 uPCTL DDR controller (U-Boot)
-├── hw/misc/xm-sfc.c             # xmsfc v1 SPI-NOR controller (flash-file)
+├── hw/misc/xm-sfc.c             # xmsfc v1/v2 SPI-NOR controller (flash-file)
 ├── hw/net/xm-dwmac.c            # xmmac: DWMAC 10/100, XM MAC layout
 ├── include/hw/arm/xiongmai.h    # XmSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build

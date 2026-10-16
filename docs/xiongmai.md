@@ -12,7 +12,7 @@ neither are the flash controller, GPIO or I2C. Hence a family of its own in
 
 ## Summary
 
-| | XM510 (modelled) | XM530 / XM550 (not yet) |
+| | XM510 | XM530 / XM550 |
 |---|---|---|
 | CPU | 1× Cortex-A5, MIDR 410fc051 — `cortex-a9` stand-in | 2× Cortex-A5 MPCore, A9-layout private region at 0x20200000 |
 | IRQ | PL190-layout VIC at 0x20010000, 32 lines | GICv2 (dist +0x1000, CPU +0x100) |
@@ -27,8 +27,9 @@ neither are the flash controller, GPIO or I2C. Hence a family of its own in
 | Ethernet | DWMAC 10/100 0x20040000, IRQ 3, RMII PHY at MDIO 1 | DWMAC 0x10010000, SPI 3 |
 | SD/MMC | Arasan SDHCI 0x50000000 (IRQ 24), 0x50010000 (IRQ 25) | 0x50000000 / 0x50100000, SPI 41 / 42 |
 | GPIO / mux | 0x10020000, one register per pin | same |
-| SRAM | 0x04000000 (U-Boot's first stack, sp = 0x04001000) | — |
-| DDRC | Synopsys uPCTL 0x100B0000, PHY 0x100B2000 | — |
+| SRAM | 0x04000000 (U-Boot's first stack, sp = 0x04001000) | same |
+| DDRC | Synopsys uPCTL 0x100B0000, PHY 0x100B2000 | same block (U-Boot references both pages) |
+| Watchdog clock | 93.75 kHz (24 MHz/256) | 46.875 kHz (12 MHz/256) |
 | Boot | ATAGs at 0x80000100, machine 8888, `mtdparts=xm_sfc:` | same |
 
 ## Sources
@@ -96,6 +97,37 @@ source:
   it.
 - **Flash size:** the XM510 kernel's xmsfc chip table knows only 8 MiB parts
   (W25Q64CV 0xef4017, MX25L6405D 0xc22017), so tests use an 8 MiB NOR.
+
+## XM530 / XM550
+
+- **SMP:** `set_scu_boot_addr()` in `mach-xm530/hotplug.c` brings up CPU1 in
+  three steps. `xm-sysctl` models each one, and `xiongmai.c` wires them to
+  memory and CPU power:
+  1. It writes 1 to `REG_SC_REMAP` (SYS+0x204) and waits for it to read back.
+     That puts RAM at address 0, where the boot flash is aliased at reset.
+  2. It writes `ldr pc, [pc, #-4]; .word secondary_startup` at physical 0.
+  3. With RSTEN set, it writes `0xCA11C100`, then 1, to `REG_CPU1_SOFT_RST`
+     (SYS+0x8C), holding CPU1 in reset and then releasing it.
+- **TWD rate:** `core.c` computes it from the PLL words:
+  12 MHz / refdiv × fbdiv, then ÷ (div + 1) by CPUCLK.
+  - QEMU's TWD ticks at 100 MHz. Under `-kernel` nothing has programmed the
+    PLLs, so they reset to values that give exactly that: PLLA 0x1901 and
+    CPUCLK 0x0B.
+  - U-Boot programs a 150 MHz TWD instead, so local-timer ticks on a
+    flash-booted guest run 1.5× off.
+- **PLL lock:** XM530's U-Boot polls the PLL control words themselves
+  (SYS +0x08, +0x10, +0x18, +0x20) until bit 31 (LOCK) reads 1
+  (`pll-lock31-mask`).
+- **xmsfc v2:** see `xm-sfc.c`. With no JEDEC ID given, the flash reports the
+  Winbond part of the image's size: W25Q64CV for 8 MiB, W25Q128BV for 16 MiB.
+- **Watchdog:** `xm_wdt.ko`'s init starts the SP805 with a 60 s timeout, and
+  only majestic stops or feeds it (`watchdog_disabled_platform()`,
+  majestic `src/xm/sdk.c`; OpenIPC/firmware#743). In QEMU majestic Oopses in
+  the unmodelled media blocks before it gets there, so the guest resets
+  about 60 s after `load_xiongmai`. That is long enough for login and the
+  network check, but not for the flash tests.
+- **XM550 dump:** booting a full XM550 flash image gets through U-Boot's PLL
+  setup but not further yet.
 
 ## Model notes
 

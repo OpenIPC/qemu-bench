@@ -1,5 +1,6 @@
 /*
- * Xiongmai XM510 SPI-NOR flash controller ("xmsfc", v1).
+ * Xiongmai SPI-NOR flash controller ("xmsfc"): v1 on XM510, v2 on
+ * XM530/XM550.
  *
  * Not a HiSilicon hifmc: Xiongmai's own register block, as driven by
  * drivers/mtd/devices/xmsfc/xmsfc.c in the vendor 3.0.101 kernel and by the
@@ -23,6 +24,17 @@
  *  - the read window (16 MiB at 0x0): the kernel's mtd read is a memcpy from
  *    it, and U-Boot runs from it in place, so it is a ROM device that reads
  *    the flash array directly.
+ *
+ * v2 (drivers/mtd/devices/xmsfc/xmsfc_v2.[ch] in the 3.10.103 kernel) is a
+ * new register layout over the same idea, at 0x100F4000:
+ *      CTRL +0x00  CFG1 +0x04  CFG2 +0x08  ADDR +0x0C  OP   +0x10
+ *      CMD  +0x14  SRW  +0x18  RW_NUM +0x1C  PRE_CMD +0x20  PST_CMD +0x24
+ *      ST   +0x2C  R_SR_ID +0x30  MODE_ST +0x40  CACHE_CMD +0x44
+ *      RAM  +0x2000 (256 bytes, packed four to a word)
+ *      OP1 erase, OP3 read status/ID (RW_NUM+1 bytes into R_SR_ID),
+ *      OP4 page program (RW_NUM+1 bytes from RAM); done bit (1 << (op-1)).
+ * MODE_ST reads 0 there: the driver then uses single-line commands.  The
+ * read window is at 0x60000000.
  *
  * Erases and programs are written through to flash-file, so what the guest
  * stores survives a reboot, as on a camera.
@@ -58,6 +70,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmSfcState, XM_SFC)
 
 #define WINDOW_SIZE   (16 * MiB)
 
+#define V2_CTRL       0x00
+#define V2_CFG1       0x04
+#define V2_CFG2       0x08
+#define V2_ADDR       0x0C
+#define V2_OP         0x10
+#define V2_CMD        0x14
+#define V2_SRW        0x18
+#define V2_RW_NUM     0x1C
+#define V2_PRE_CMD    0x20
+#define V2_PST_CMD    0x24
+#define V2_TDEL       0x28
+#define V2_ST         0x2C
+#define V2_R_SR_ID    0x30
+#define V2_INT_MSK    0x38
+#define V2_MODE_ST    0x40
+#define V2_CACHE_CMD  0x44
+#define V2_RAM        0x2000
+#define V2_REGS_SIZE  0x2100
+
 struct XmSfcState {
     SysBusDevice parent_obj;
 
@@ -65,6 +96,7 @@ struct XmSfcState {
     MemoryRegion window;
 
     uint32_t mode, addr, cmd, srw, wrnum, bsel, st, srr, cache_cmd;
+    uint32_t v2_regs[V2_RAM / 4];   /* v2 registers with no side effect */
     uint8_t buf[BUF_BYTES];
     uint8_t sr1, sr2;
 
@@ -74,6 +106,7 @@ struct XmSfcState {
     char *flash_file;
     uint32_t size;
     uint32_t jedec;
+    uint32_t version;
 };
 
 static void xm_sfc_persist(XmSfcState *s, uint32_t off, uint32_t len)
@@ -293,6 +326,115 @@ static const MemoryRegionOps xm_sfc_regs_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * v2 reuses the v1 engines: erase/program/read-register act on cmd, addr,
+ * wrnum (RW_NUM) and buf (RAM), and the answer to a register read lands in
+ * srr (R_SR_ID), wrnum + 1 bytes of it.
+ */
+static void xm_sfc_v2_op(XmSfcState *s, uint32_t op)
+{
+    switch (op) {
+    case 1:
+        xm_sfc_erase(s);
+        break;
+    case 3:
+        s->bsel = s->wrnum;
+        xm_sfc_read_reg(s);
+        break;
+    case 4:
+        xm_sfc_program(s);
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "xm-sfc: v2 operation %u\n", op);
+        break;
+    }
+    s->st = op >= 1 && op <= 10 ? 1u << (op - 1) : 0;
+}
+
+static uint64_t xm_sfc_v2_read(void *opaque, hwaddr off, unsigned size)
+{
+    XmSfcState *s = opaque;
+
+    if (off >= V2_RAM && off < V2_RAM + BUF_BYTES) {
+        uint32_t v = 0, i;
+        for (i = 0; i < size && off - V2_RAM + i < BUF_BYTES; i++) {
+            v |= (uint32_t)s->buf[off - V2_RAM + i] << (8 * i);
+        }
+        return v;
+    }
+    switch (off) {
+    case V2_ADDR:
+        return s->addr;
+    case V2_CMD:
+        return s->cmd;
+    case V2_SRW:
+        return s->srw;
+    case V2_RW_NUM:
+        return s->wrnum;
+    case V2_ST:
+        return s->st;
+    case V2_R_SR_ID:
+        return s->srr;
+    case V2_MODE_ST:
+        return 0;             /* single-line mode */
+    default:
+        if (off < V2_RAM && !(off & 3)) {
+            return s->v2_regs[off / 4];
+        }
+        qemu_log_mask(LOG_UNIMP, "xm-sfc: v2 read 0x%" HWADDR_PRIx "\n", off);
+        return 0;
+    }
+}
+
+static void xm_sfc_v2_write(void *opaque, hwaddr off, uint64_t val,
+                            unsigned size)
+{
+    XmSfcState *s = opaque;
+
+    if (off >= V2_RAM && off < V2_RAM + BUF_BYTES) {
+        uint32_t i;
+        for (i = 0; i < size && off - V2_RAM + i < BUF_BYTES; i++) {
+            s->buf[off - V2_RAM + i] = val >> (8 * i);
+        }
+        return;
+    }
+    switch (off) {
+    case V2_ADDR:
+        s->addr = val;
+        break;
+    case V2_OP:
+        xm_sfc_v2_op(s, val);
+        break;
+    case V2_CMD:
+        s->cmd = val & 0xff;
+        break;
+    case V2_SRW:
+        s->srw = val;
+        break;
+    case V2_RW_NUM:
+        s->wrnum = val;
+        break;
+    default:
+        /* CTRL, CFG1/2, PRE/PST_CMD, TDEL, interrupt and cache registers
+         * shape the SPI cycle on silicon and change nothing here. */
+        if (off < V2_RAM && !(off & 3)) {
+            s->v2_regs[off / 4] = val;
+            break;
+        }
+        qemu_log_mask(LOG_UNIMP, "xm-sfc: v2 write 0x%" HWADDR_PRIx
+                      " = 0x%" PRIx64 "\n", off, val);
+        break;
+    }
+}
+
+static const MemoryRegionOps xm_sfc_v2_regs_ops = {
+    .read = xm_sfc_v2_read,
+    .write = xm_sfc_v2_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /* The read window ignores writes, as the controller does. */
 static void xm_sfc_window_write(void *opaque, hwaddr off, uint64_t val,
                                 unsigned size)
@@ -333,8 +475,19 @@ static void xm_sfc_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    memory_region_init_io(&s->regs, OBJECT(s), &xm_sfc_regs_ops, s,
-                          "xm-sfc.regs", REGS_SIZE);
+    if (s->version != 1 && s->version != 2) {
+        error_setg(errp, "xm-sfc: version must be 1 or 2");
+        return;
+    }
+    if (!s->jedec) {
+        /* The XM510 (v1) kernel's table has no 16 MiB part at all. */
+        s->jedec = s->version == 2 && s->size > 8 * MiB ? 0xef4018 : 0xef4017;
+    }
+    memory_region_init_io(&s->regs, OBJECT(s),
+                          s->version == 2 ? &xm_sfc_v2_regs_ops
+                                          : &xm_sfc_regs_ops,
+                          s, "xm-sfc.regs",
+                          s->version == 2 ? V2_REGS_SIZE : REGS_SIZE);
     sysbus_init_mmio(sbd, &s->regs);
 
     memory_region_init_rom_device(&s->window, OBJECT(s), &xm_sfc_window_ops,
@@ -360,13 +513,16 @@ static void xm_sfc_reset(DeviceState *dev)
     s->mode = s->addr = s->cmd = s->srw = s->wrnum = 0;
     s->bsel = s->st = s->srr = s->cache_cmd = 0;
     s->sr1 = s->sr2 = 0;
+    memset(s->v2_regs, 0, sizeof(s->v2_regs));
 }
 
 static const Property xm_sfc_props[] = {
     DEFINE_PROP_STRING("flash-file", XmSfcState, flash_file),
     DEFINE_PROP_UINT32("size", XmSfcState, size, 8 * MiB),
-    /* W25Q64CV: the first entry of the vendor driver's table. */
-    DEFINE_PROP_UINT32("jedec", XmSfcState, jedec, 0xef4017),
+    /* 0: the Winbond part of the image's size, from the vendor tables --
+     * W25Q64CV (8 MiB, both versions) or W25Q128BV (16 MiB, v2 only). */
+    DEFINE_PROP_UINT32("jedec", XmSfcState, jedec, 0),
+    DEFINE_PROP_UINT32("version", XmSfcState, version, 1),
 };
 
 static void xm_sfc_class_init(ObjectClass *klass, const void *data)

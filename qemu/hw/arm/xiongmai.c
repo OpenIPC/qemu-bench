@@ -5,12 +5,14 @@
  * init.  See include/hw/arm/xiongmai.h for why this is a family of its own.
  *
  * Boots the OpenIPC xm510_lite kernel (vendor 3.0.101, ATAGs, MACH 8888)
- * with -kernel/-initrd to a shell.
+ * and the xm530_lite one (vendor 3.10.103, same machine number) with
+ * -kernel/-initrd to a shell, and a camera's own flash through its U-Boot.
  */
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/units.h"
+#include "qemu/log.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/xiongmai.h"
@@ -20,7 +22,10 @@
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
+#include "hw/irq.h"
 #include "hw/sysbus.h"
+#include "qobject/qlist.h"
+#include "target/arm/arm-powerctl.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
 #include "net/net.h"
@@ -66,7 +71,9 @@ static const XmSoCConfig xm510_soc = {
     .sdhci_bases        = { 0x50000000, 0x50010000 },
     .sdhci_irqs         = { 24, 25 },
     .wdt_base           = 0x20060000,
-    .wdt_freq           = 24000000,
+    /* xm_wdt.ko loads 93750 * t / 2 for a t-second timeout, and an SP805
+     * resets on its second expiry: a 24 MHz / 256 clock. */
+    .wdt_freq           = 93750,
     .ddrc_base          = 0x100B0000,           /* from U-Boot, see xm-ddrc */
     .num_regbanks       = 7,
     .regbanks           = {
@@ -79,6 +86,90 @@ static const XmSoCConfig xm510_soc = {
         { "xm-isp",      0x40000000, 0x100000 }, /* ISP / VI */
     },
 };
+
+/*
+ * XM530: two Cortex-A5 in an MPCore with the A9's private-region layout
+ * (SCU, GIC CPU interface, TWD, GIC distributor), a PL310, 64 MB DDR.
+ * The device lines keep their XM510 numbers, now as GIC SPIs.  The flash
+ * window moved to 0x60000000 with the v2 controller; address 0 aliases it
+ * at reset and becomes RAM once the kernel sets REG_SC_REMAP.
+ *
+ * mach-xm530/include/mach/platform.h, irqs.h; core.c (clocks, TWD rate
+ * from the PLL words); platsmp.c, hotplug.c (CPU1 release).
+ */
+static const XmSoCConfig xm530_soc = {
+    .desc               = "Xiongmai XM530 (2x Cortex-A5 stand-in A9, GIC)",
+    .cpu_type           = ARM_CPU_TYPE_NAME("cortex-a9"),
+    .max_cpus           = 2,
+    .ram_base           = 0x80000000,
+    .ram_size_default   = 64 * MiB,
+    .board_id           = 8888,
+    .sys_base           = 0x20000000,
+    .sys_rsten          = 0x80,
+    .sys_rst            = 0x84,
+    .sys_remap          = 0x204,                /* REG_SC_REMAP */
+    .sys_cpu1_rst       = 0x8C,                 /* REG_CPU1_SOFT_RST */
+    /*
+     * core.c: pll = 12 MHz / refdiv * fbdiv / (postdiv + 1) from PLLA_CTRL,
+     * twd = pll / (div + 1) from CPUCLK_CTRL.  QEMU's TWD ticks at 100 MHz
+     * (10 ns per prescaler step), so: refdiv 1, fbdiv 100 -> 1.2 GHz, /12.
+     */
+    .num_sys_init       = 2,
+    .sys_init_offsets   = { 0x08, 0x28 },
+    .sys_init_values    = { (100 << 6) | 1, 11 },
+    /* U-Boot 2014.04 ("Mar 15 2019") programs four PLLs and spins until
+     * each control word reads negative: bit 31 is LOCK. */
+    .sys_pll_lock31_mask = (1u << (0x08 / 4)) | (1u << (0x10 / 4)) |
+                           (1u << (0x18 / 4)) | (1u << (0x20 / 4)),
+    /* U-Boot's first stack, sp = 0x04001000 as on XM510. */
+    .sram_base          = 0x04000000,
+    .sram_size          = 64 * KiB,
+    .mpcore_base        = 0x20200000,           /* ARM_INTNL_BASE */
+    .num_spi            = 64,
+    .l2x0_base          = 0x20210000,           /* REG_BASE_L2CACHE */
+    .num_uarts          = 3,
+    .uart_bases         = { 0x10030000, 0x10040000, 0x10050000 },
+    .uart_irqs          = { 0, 1, 2 },
+    .num_timers         = 2,
+    .timer_bases        = { 0x100C0000, 0x100D0000 },
+    .timer_irqs         = { 4, 5 },
+    .timer_freq         = 12000000,             /* sp804_clk */
+    .sfc_base           = 0x100F4000,           /* XM_SFC_V2_CTRL */
+    .sfc_window         = 0x60000000,           /* XMSF_BASE_ADDR */
+    .sfc_version        = 2,
+    .mac_base           = 0x10010000,           /* GMAC_BASE */
+    .mac_irq            = 3,
+    .num_sdhci          = 2,
+    .sdhci_bases        = { 0x50000000, 0x50100000 },
+    .sdhci_irqs         = { 41, 42 },
+    .wdt_base           = 0x20060000,
+    /* xm_wdt.ko: 46875 * t / 2, so 12 MHz / 256.  Unfed, it resets the
+     * camera 60 s after insmod (the default timeout), as in the lab. */
+    .wdt_freq           = 46875,
+    .ddrc_base          = 0x100B0000,           /* same uPCTL as XM510 */
+    .num_regbanks       = 6,
+    .regbanks           = {
+        { "xm-gpio",     0x10020000, 0x10000 },
+        { "xm-i2c",      0x10000000, 0x10000 },
+        { "xm-dma",      0x20020000, 0x10000 },  /* DMAC_BASE */
+        { "xm-rtc",      0x100A0000, 0x10000 },
+        { "xm-i2s",      0x10060000, 0x10000 },
+        { "xm-isp",      0x40000000, 0x400000 }, /* ISP / VI, 0x4004..0x4020 */
+    },
+};
+
+/* XM550: the XM530 die with 128 MB DDR. */
+static const XmSoCConfig *xm550_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = xm530_soc;
+        c.desc = "Xiongmai XM550 (2x Cortex-A5 stand-in A9, GIC, 128 MB)";
+        c.ram_size_default = 128 * MiB;
+    }
+    return &c;
+}
 
 typedef struct XmMachineState {
     MachineState parent_obj;
@@ -100,20 +191,98 @@ static void xm_machine_set_flash_file(Object *obj, const char *value,
     s->flash_file = g_strdup(value);
 }
 
+/*
+ * REG_SC_REMAP: address 0 is the boot flash until the guest asks for RAM
+ * there, which the kernel does to plant CPU1's trampoline.
+ */
+static void xm_remap(void *opaque, int n, int level)
+{
+    memory_region_set_enabled(opaque, level);
+}
+
+/*
+ * REG_CPU1_SOFT_RST: CPU1 leaves reset at PC 0, in the state CPU0 runs in
+ * (non-secure SVC: these CPUs have no EL3 here).
+ */
+static void xm_cpu1_on(CPUState *cs, run_on_cpu_data data)
+{
+    const int ret = arm_set_cpu_on(arm_cpu_mp_affinity(ARM_CPU(cs)),
+                                   0, 0, 1, false);
+
+    if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 release failed (%d)\n", ret);
+    }
+}
+
+static void xm_cpu1_reset(void *opaque, int n, int level)
+{
+    ARMCPU *cpu1 = ARM_CPU(opaque);
+    const uint64_t mpidr = arm_cpu_mp_affinity(cpu1);
+    int ret;
+
+    if (level) {
+        ret = arm_set_cpu_off(mpidr);
+        if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS &&
+            ret != QEMU_ARM_POWERCTL_IS_OFF) {
+            qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 hold failed (%d)\n", ret);
+        }
+        return;
+    }
+    ret = arm_set_cpu_on(mpidr, 0, 0, 1, false);
+    if (ret == QEMU_ARM_POWERCTL_ALREADY_ON) {
+        /*
+         * Hold and release are two back-to-back register writes, and the
+         * power-off a hold asks for runs later, on CPU1 itself.  A release
+         * that finds CPU1 still on queues behind that power-off on the same
+         * CPU, so it lands once CPU1 really is off.
+         */
+        async_run_on_cpu(CPU(cpu1), xm_cpu1_on, RUN_ON_CPU_NULL);
+    } else if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 release failed (%d)\n", ret);
+    }
+}
+
+/* Secondaries wait for REG_CPU1_SOFT_RST, never for boot.c's pen: at 0 it
+ * would overwrite the trampoline the kernel writes there itself. */
+static void xm_write_secondary_boot(ARMCPU *cpu,
+                                    const struct arm_boot_info *info)
+{
+}
+
+static void xm_reset_secondary(ARMCPU *cpu, const struct arm_boot_info *info)
+{
+}
+
 static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 {
+    DeviceState *sys = NULL;
     static struct arm_boot_info binfo;
     MemoryRegion *sysmem = get_system_memory();
-    qemu_irq pic[32];
+    const int smp_cpus = machine->smp.cpus;
+    qemu_irq pic[XM_MAX_IRQ];
+    ARMCPU *cpus[2] = { NULL };
     ARMCPU *cpu;
     int n;
 
-    cpu = ARM_CPU(object_new(machine->cpu_type));
-    /* The vendor kernel is entered in SVC by U-Boot; no secure world. */
-    if (object_property_find(OBJECT(cpu), "has_el3")) {
-        object_property_set_bool(OBJECT(cpu), "has_el3", false, &error_fatal);
+    for (n = 0; n < smp_cpus; n++) {
+        Object *o = object_new(machine->cpu_type);
+        /* The vendor kernel is entered in SVC by U-Boot; no secure world. */
+        if (object_property_find(o, "has_el3")) {
+            object_property_set_bool(o, "has_el3", false, &error_fatal);
+        }
+        if (object_property_find(o, "reset-cbar")) {
+            object_property_set_int(o, "reset-cbar", c->mpcore_base,
+                                    &error_fatal);
+        }
+        /* CPU1 waits for REG_CPU1_SOFT_RST, as on silicon. */
+        if (n > 0) {
+            object_property_set_bool(o, "start-powered-off", true,
+                                     &error_fatal);
+        }
+        qdev_realize(DEVICE(o), NULL, &error_fatal);
+        cpus[n] = ARM_CPU(o);
     }
-    qdev_realize(DEVICE(cpu), NULL, &error_fatal);
+    cpu = cpus[0];
 
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
 
@@ -124,22 +293,62 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         memory_region_add_subregion(sysmem, c->sram_base, sram);
     }
 
-    /* PL190-layout VIC: the vendor entry macro reads IRQSTATUS at +0 and
-     * nothing else, and init writes INTENCLEAR/INTSELECT/SOFTINTCLEAR at the
-     * PL190 offsets (REG_INTC_* in platform.h). */
-    DeviceState *vic = sysbus_create_varargs("pl190", c->vic_base,
-            qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ),
-            qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ),
-            NULL);
-    for (n = 0; n < 32; n++) {
-        pic[n] = qdev_get_gpio_in(vic, n);
+    if (c->mpcore_base) {
+        DeviceState *mp = qdev_new("a9mpcore_priv");
+        SysBusDevice *mpbus = SYS_BUS_DEVICE(mp);
+
+        qdev_prop_set_uint32(mp, "num-cpu", smp_cpus);
+        qdev_prop_set_uint32(mp, "num-irq", c->num_spi + 32);
+        sysbus_realize_and_unref(mpbus, &error_fatal);
+        sysbus_mmio_map(mpbus, 0, c->mpcore_base);
+        /* Outputs grouped per kind: IRQ 0..N-1, FIQ N..2N-1, ... */
+        for (n = 0; n < smp_cpus; n++) {
+            sysbus_connect_irq(mpbus, n,
+                qdev_get_gpio_in(DEVICE(cpus[n]), ARM_CPU_IRQ));
+            sysbus_connect_irq(mpbus, n + smp_cpus,
+                qdev_get_gpio_in(DEVICE(cpus[n]), ARM_CPU_FIQ));
+            sysbus_connect_irq(mpbus, n + 2 * smp_cpus,
+                qdev_get_gpio_in(DEVICE(cpus[n]), ARM_CPU_VIRQ));
+            sysbus_connect_irq(mpbus, n + 3 * smp_cpus,
+                qdev_get_gpio_in(DEVICE(cpus[n]), ARM_CPU_VFIQ));
+        }
+        for (n = 0; n < c->num_spi; n++) {
+            pic[n] = qdev_get_gpio_in(mp, n);
+        }
+    } else {
+        /* PL190-layout VIC: the vendor entry macro reads IRQSTATUS at +0
+         * and nothing else, and init writes INTENCLEAR/INTSELECT/
+         * SOFTINTCLEAR at the PL190 offsets (REG_INTC_* in platform.h). */
+        DeviceState *vic = sysbus_create_varargs("pl190", c->vic_base,
+                qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ),
+                qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ),
+                NULL);
+        for (n = 0; n < 32; n++) {
+            pic[n] = qdev_get_gpio_in(vic, n);
+        }
+    }
+
+    if (c->l2x0_base) {
+        sysbus_create_simple("l2x0", c->l2x0_base, NULL);
     }
 
     if (c->sys_base) {
-        DeviceState *sys = qdev_new("xm-sysctl");
+        sys = qdev_new("xm-sysctl");
         qdev_prop_set_uint32(sys, "rsten-offset", c->sys_rsten);
         qdev_prop_set_uint32(sys, "rst-offset", c->sys_rst);
         qdev_prop_set_uint32(sys, "pll-lock-mask", c->sys_pll_lock_mask);
+        qdev_prop_set_uint32(sys, "pll-lock31-mask", c->sys_pll_lock31_mask);
+        qdev_prop_set_uint32(sys, "remap-offset", c->sys_remap);
+        qdev_prop_set_uint32(sys, "cpu1-offset", c->sys_cpu1_rst);
+        if (c->num_sys_init) {
+            QList *offs = qlist_new(), *vals = qlist_new();
+            for (n = 0; n < c->num_sys_init; n++) {
+                qlist_append_int(offs, c->sys_init_offsets[n]);
+                qlist_append_int(vals, c->sys_init_values[n]);
+            }
+            qdev_prop_set_array(sys, "init-offsets", offs);
+            qdev_prop_set_array(sys, "init-values", vals);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sys), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sys), 0, c->sys_base);
     }
@@ -167,9 +376,36 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         if (ms->flash_file) {
             qdev_prop_set_string(sfc, "flash-file", ms->flash_file);
         }
+        qdev_prop_set_uint32(sfc, "version", c->sfc_version ? c->sfc_version : 1);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sfc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sfc), 0, c->sfc_base);
         sysbus_mmio_map(SYS_BUS_DEVICE(sfc), 1, c->sfc_window);
+
+        if (c->sfc_window && c->sys_remap && sys) {
+            MemoryRegion *win = sysbus_mmio_get_region(SYS_BUS_DEVICE(sfc), 1);
+            MemoryRegion *boot = g_new(MemoryRegion, 1);
+            MemoryRegion *low = g_new(MemoryRegion, 1);
+            const uint64_t span = MIN(memory_region_size(win),
+                                      memory_region_size(machine->ram));
+
+            memory_region_init_alias(boot, NULL, "xiongmai.boot-alias", win, 0,
+                                     memory_region_size(win));
+            memory_region_add_subregion(sysmem, 0, boot);
+            /* Remapped, address 0 is DDR itself, as REG_SC_REMAP is on the
+             * HiSilicon parts these were templated on: what the kernel
+             * writes there is what CPU1 fetches, and is in DDR too. */
+            memory_region_init_alias(low, NULL, "xiongmai.remap-ddr",
+                                     machine->ram, 0, span);
+            memory_region_add_subregion_overlap(sysmem, 0, low, 1);
+            memory_region_set_enabled(low, false);
+            qdev_connect_gpio_out_named(sys, "remap", 0,
+                                        qemu_allocate_irq(xm_remap, low, 0));
+        }
+    }
+
+    if (sys && c->sys_cpu1_rst && smp_cpus > 1) {
+        qdev_connect_gpio_out_named(sys, "cpu1-reset", 0,
+                                    qemu_allocate_irq(xm_cpu1_reset, cpus[1], 0));
     }
 
     if (c->mac_base) {
@@ -216,6 +452,8 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     binfo.ram_size = machine->ram_size;
     binfo.loader_start = c->ram_base;
     binfo.board_id = c->board_id;
+    binfo.write_secondary_boot = xm_write_secondary_boot;
+    binfo.secondary_cpu_reset_hook = xm_reset_secondary;
     arm_load_kernel(cpu, machine, &binfo);
 }
 
@@ -231,6 +469,7 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         mc->default_cpu_type = config.cpu_type;                      \
         mc->default_ram_size = config.ram_size_default;              \
         mc->default_ram_id = "xiongmai.ram";                         \
+        mc->max_cpus = config.max_cpus ? config.max_cpus : 1;        \
         mc->ignore_memory_transaction_failures = true;               \
         object_class_property_add_str(OBJECT_CLASS(mc), "flash-file", \
             xm_machine_get_flash_file, xm_machine_set_flash_file);   \
@@ -243,3 +482,5 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
                             arm_machine_interfaces)
 
 DEFINE_XM_MACHINE("xm510", xm510, xm510_soc)
+DEFINE_XM_MACHINE("xm530", xm530, xm530_soc)
+DEFINE_XM_MACHINE("xm550", xm550, (*xm550_config()))
