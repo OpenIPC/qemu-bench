@@ -118,12 +118,17 @@ CI covers:
     firmware#2613).
 
 `xm530` and `xm550` boot the `xm530_lite` release with `-smp 2`: CPU1 is
-released through `REG_SC_REMAP` and `REG_CPU1_SOFT_RST` as on silicon. CI
-covers login, both CPUs, guest reboot and clock on both, plus the network
-check on `xm530`. Their flash tests wait on media stubs. The stock image
-starts `xm_wdt` (60 s), and only majestic stops it. In QEMU majestic Oopses
-in the unmodelled media blocks first, so the guest resets a minute after
-the modules load.
+released through `REG_SC_REMAP` and `REG_CPU1_SOFT_RST` as on silicon.
+
+CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
+also runs the network check and the flash tests: erase/program,
+sysupgrade and firstboot.
+
+Boot them with `mem=` as the **first** kernel argument, as OpenIPC's U-Boot
+does (`mem=32M`). `load_xiongmai` sizes MMZ from the first argument. If it
+is missing, MMZ covers all of RAM, kernel included. majestic then Oopses
+in `mmz` and never stops the `xm_wdt` the script started, and the guest
+resets a minute later.
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 

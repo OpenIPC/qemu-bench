@@ -41,6 +41,7 @@ TIMEOUT=180
 KERNEL=""
 ROOTFS=""
 MTD_NAME="hi_sfc"
+CMDLINE_PREFIX=""
 FLASH_MB=16
 
 while [ $# -gt 0 ]; do
@@ -54,6 +55,7 @@ while [ $# -gt 0 ]; do
         --kernel)     KERNEL="$2"; shift 2 ;;
         --rootfs)     ROOTFS="$2"; shift 2 ;;
         --mtd-name)   MTD_NAME="$2"; shift 2 ;;
+        --cmdline-prefix) CMDLINE_PREFIX="$2"; shift 2 ;;
         --flash-mb)   FLASH_MB="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -102,7 +104,7 @@ dd if="$ROOTFS" of="$FLASH" bs=1k seek=$((BOOT_KB + ENV_KB + KERN_KB)) conv=notr
 dd if="$DATA_IMG" of="$FLASH" bs=1k seek="$DATA_OFF_KB" conv=notrunc 2>/dev/null
 MTDPARTS="${MTD_NAME}:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel)"
 MTDPARTS="${MTDPARTS},${ROOTFS_KB}k(rootfs),-(rootfs_data)"
-APPEND="console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
+APPEND="${CMDLINE_PREFIX:+$CMDLINE_PREFIX }console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
 APPEND="${APPEND} init=/init mtdparts=${MTDPARTS}"
 
 CONSOLE="$OUTDIR/overlay-keep-console.txt"

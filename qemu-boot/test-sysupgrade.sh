@@ -44,6 +44,7 @@ KERNEL=""
 ROOTFS=""
 NEW_ROOTFS=""
 MTD_NAME="hi_sfc"
+CMDLINE_PREFIX=""
 FLASH_MB=16
 
 while [ $# -gt 0 ]; do
@@ -58,6 +59,7 @@ while [ $# -gt 0 ]; do
         --rootfs)     ROOTFS="$2"; shift 2 ;;
         --new-rootfs) NEW_ROOTFS="$2"; shift 2 ;;
         --mtd-name)   MTD_NAME="$2"; shift 2 ;;
+        --cmdline-prefix) CMDLINE_PREFIX="$2"; shift 2 ;;
         --flash-mb)   FLASH_MB="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -119,7 +121,7 @@ dd if="$ROOTFS" of="$FLASH" bs=1k seek=$((ROOTFS_OFF / 1024)) conv=notrunc 2>/de
 dd if="$DATA_IMG" of="$FLASH" bs=1k seek=$((DATA_OFF / 1024)) conv=notrunc 2>/dev/null
 MTDPARTS="${MTD_NAME}:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel)"
 MTDPARTS="${MTDPARTS},${ROOTFS_KB}k(rootfs),-(rootfs_data)"
-APPEND="console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
+APPEND="${CMDLINE_PREFIX:+$CMDLINE_PREFIX }console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
 APPEND="${APPEND} init=/init mtdparts=${MTDPARTS}"
 
 # The archive sysupgrade is pointed at: the release bundle's shape, with the
@@ -136,6 +138,12 @@ tar czf "$OUTDIR/$ARCHIVE" -C "$ARCH_DIR" .
 
 cat > "$OUTDIR/autostart.sh" <<AUTOSTART
 #!/bin/sh
+# Once per boot, and straight to the console.  The 3.10 XM530 kernel can
+# deliver the card's add event twice, so automount may run this twice; and
+# automount's logger pipe dies with everything else in sysupgrade's pivot.
+[ -e /tmp/.sysupgrade-ran ] && exit 0
+touch /tmp/.sysupgrade-ran
+exec >/dev/console 2>&1
 # Once only: the upgrade reboots, and the second boot mounts this card again.
 [ -e /overlay/.sysupgrade-test-ran ] && exit 0
 touch /overlay/.sysupgrade-test-ran
@@ -145,7 +153,7 @@ echo "SU_START_MARK"
 # script holds the card open, so run it from /tmp, detached, once we are gone.
 cp /mnt/mmcblk0p1/${ARCHIVE} /tmp/ && cd / &&
 	( sleep 3; sysupgrade --archive=/tmp/${ARCHIVE} -z; echo "SU_RC=\$?" ) \
-		</dev/null >/dev/console 2>&1 &
+		</dev/null &
 AUTOSTART
 
 SD="$OUTDIR/sd.img"

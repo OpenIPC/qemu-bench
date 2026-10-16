@@ -120,12 +120,22 @@ source:
   (`pll-lock31-mask`).
 - **xmsfc v2:** see `xm-sfc.c`. With no JEDEC ID given, the flash reports the
   Winbond part of the image's size: W25Q64CV for 8 MiB, W25Q128BV for 16 MiB.
-- **Watchdog:** `xm_wdt.ko`'s init starts the SP805 with a 60 s timeout, and
-  only majestic stops or feeds it (`watchdog_disabled_platform()`,
-  majestic `src/xm/sdk.c`; OpenIPC/firmware#743). In QEMU majestic Oopses in
-  the unmodelled media blocks before it gets there, so the guest resets
-  about 60 s after `load_xiongmai`. That is long enough for login and the
-  network check, but not for the flash tests.
+- **Watchdog and `mem=`:** `xm_wdt.ko`'s init starts the SP805 with a 60 s
+  timeout, and only majestic stops or feeds it (`watchdog_disabled_platform()`,
+  majestic `src/xm/sdk.c`; OpenIPC/firmware#743). majestic gets there only if
+  MMZ is sane:
+  - `load_xiongmai` takes `mem=` from the first kernel argument (`awk
+    '{print $1}'`) to place MMZ, as U-Boot passes it (`mem=32M console=…`).
+  - With `console=` first, MMZ is laid over 0x80000000 + all of RAM,
+    kernel included.
+  - majestic then Oopses in `mmz` (called from `xm530_rgn`), and the
+    watchdog resets the guest a minute later.
+
+  With `mem=32M` first, majestic starts and the camera stays up. That is
+  how the flash tests run on XM530 (`--cmdline-prefix mem=32M`).
+- **#2613 does not apply on XM530:** its kernel has jffs2 xattr support, so
+  it mounts an xattr overlay. `test-overlay-keep.sh` runs on XM510, whose
+  kernel lacks it.
 - **XM550 dump:** booting a full XM550 flash image gets through U-Boot's PLL
   setup but not further yet.
 

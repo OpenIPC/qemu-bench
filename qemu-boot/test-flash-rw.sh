@@ -49,7 +49,12 @@
 #   test-flash-rw.sh --soc hi3516ev300 --machine hi3516ev300,sensor=none \
 #       --qemu ./qemu-src/build/qemu-system-arm --output-dir <dir> \
 #       [--mem 128M] [--timeout 240] [--kernel <uImage>] [--rootfs <squashfs>]
-#       [--mtd-name hi_sfc] [--flash-mb 16]
+#       [--mtd-name hi_sfc] [--flash-mb 16] [--cmdline-prefix "mem=32M"]
+#
+# --cmdline-prefix goes first on the kernel command line.  Xiongmai's
+# load_xiongmai sizes MMZ from mem= as the FIRST argument, the way U-Boot
+# passes it; without it MMZ is laid over the whole of RAM, kernel included,
+# and majestic Oopses in mmz (all four flash scripts take it).
 #
 # --mtd-name is the controller name mtdparts= keys on (xm_sfc for Xiongmai),
 # --flash-mb the synthetic NOR's size.  The XM510 kernel only knows 8 MiB
@@ -66,6 +71,7 @@ TIMEOUT=240
 KERNEL=""
 ROOTFS=""
 MTD_NAME="hi_sfc"
+CMDLINE_PREFIX=""
 FLASH_MB=16
 
 while [ $# -gt 0 ]; do
@@ -79,6 +85,7 @@ while [ $# -gt 0 ]; do
         --kernel)        KERNEL="$2"; shift 2 ;;
         --rootfs)        ROOTFS="$2"; shift 2 ;;
         --mtd-name)      MTD_NAME="$2"; shift 2 ;;
+        --cmdline-prefix) CMDLINE_PREFIX="$2"; shift 2 ;;
         --flash-mb)      FLASH_MB="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -117,7 +124,7 @@ if [ "$LEFT_KB" -gt "$DATA_KB" ]; then
 else
     MTDPARTS="${MTDPARTS},-(rootfs_data)"
 fi
-APPEND="console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
+APPEND="${CMDLINE_PREFIX:+$CMDLINE_PREFIX }console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
 APPEND="${APPEND} init=/init mtdparts=${MTDPARTS}"
 
 # The SD card carries the firmware's unattended hook and the payload.  Results
@@ -128,6 +135,12 @@ head -c 524288 /dev/urandom > "$PAYLOAD"
 
 cat > "$OUTDIR/autostart.sh" <<AUTOSTART
 #!/bin/sh
+# Once per boot, and straight to the console.  The 3.10 XM530 kernel can
+# deliver the card's add event twice, so automount may run this twice; and
+# automount's logger pipe dies with everything else in sysupgrade's pivot.
+[ -e /tmp/.flash-rw-ran ] && exit 0
+touch /tmp/.flash-rw-ran
+exec >/dev/console 2>&1
 M=/dev/mtd${TEST_MTD}
 P=/mnt/mmcblk0p1/payload.bin
 flash_eraseall \$M >/dev/null 2>&1; echo "RW_ERASE_RC=\$?"
