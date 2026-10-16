@@ -34,6 +34,11 @@ echo "Copying HiSilicon SoC sources..."
 
 cp qemu/hw/arm/hisilicon.c          "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/hisilicon.h  "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/arm/xiongmai.c           "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/xiongmai.h   "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/misc/xm-sfc.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -140,6 +145,46 @@ if ! grep -q hisilicon "$QEMU_DIR/hw/arm/meson.build"; then
     echo "  patched hw/arm/meson.build"
 else
     echo "  hw/arm/meson.build already patched"
+fi
+
+# Xiongmai XM510/XM530/XM550: a family of its own (hw/arm/xiongmai.c), not
+# HiSilicon-derived silicon. One guarded append serves a fresh tree and an
+# existing one alike, since nothing here predates it.
+if ! grep -q "^config XIONGMAI$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config XIONGMAI
+    bool
+    default y
+    depends on TCG && ARM
+    select PL190
+    select PL011
+    select ARM_TIMER
+    select CMSDK_APB_WATCHDOG
+    select HISI_MISC
+    select SDHCI
+KCONFIG
+    echo "  hw/arm/Kconfig: added XIONGMAI"
+fi
+if ! grep -q xm-sfc "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sfc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-sfc.c"
+fi
+if ! grep -q xm-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sysctl.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-sysctl.c"
+fi
+if ! grep -q xm-dwmac "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-dwmac.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  hw/net/meson.build: added xm-dwmac.c"
+fi
+if ! grep -q xiongmai "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xiongmai.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added xiongmai.c"
 fi
 
 # hw/misc/Kconfig
