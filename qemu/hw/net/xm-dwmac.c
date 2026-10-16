@@ -90,6 +90,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmDwmacState, XM_DWMAC)
 
 #define PHY_ADDR        1
 #define FRAME_MAX       1536
+/* FRAME_FLT bits, as xmmac's dwmac100.h names them (MAC_CONTROL_*) */
+#define FLT_PR          (1u << 0)       /* promiscuous */
+#define FLT_DBF         (1u << 11)      /* disable broadcast frames */
 #define RX_START_DELAY_NS  (1000 * 1000)   /* 1 ms; see DMA_CONTROL */
 #define REGS_SIZE       0x10000
 
@@ -114,6 +117,7 @@ struct XmDwmacState {
 
     uint8_t frame[FRAME_MAX];
     uint32_t frame_len;
+    bool frame_overflow;
 
     /* Receive DMA has started fetching descriptors; see DMA_CONTROL. */
     bool rx_running;
@@ -224,28 +228,38 @@ static void xm_dwmac_tx(XmDwmacState *s)
         }
         if (d.des1 & DES1_TFS) {
             s->frame_len = 0;
+            s->frame_overflow = false;
         }
         const uint32_t len1 = d.des1 & 0x7ff;
-        const uint32_t len2 = (d.des1 >> 11) & 0x7ff;
-        if (s->frame_len + len1 <= FRAME_MAX) {
+        const uint32_t len2 = (d.des1 & DES1_TCH) ? 0 : (d.des1 >> 11) & 0x7ff;
+        /* Past FRAME_MAX the whole frame is dropped, never its prefix sent. */
+        if (s->frame_len + len1 + len2 > FRAME_MAX) {
+            s->frame_overflow = true;
+        }
+        if (!s->frame_overflow) {
             dma_memory_read(&address_space_memory, d.des2,
                             s->frame + s->frame_len, len1,
                             MEMTXATTRS_UNSPECIFIED);
             s->frame_len += len1;
-        }
-        if (!(d.des1 & DES1_TCH) && len2 && s->frame_len + len2 <= FRAME_MAX) {
-            dma_memory_read(&address_space_memory, d.des3,
-                            s->frame + s->frame_len, len2,
-                            MEMTXATTRS_UNSPECIFIED);
-            s->frame_len += len2;
+            if (len2) {
+                dma_memory_read(&address_space_memory, d.des3,
+                                s->frame + s->frame_len, len2,
+                                MEMTXATTRS_UNSPECIFIED);
+                s->frame_len += len2;
+            }
         }
         s->cur_tx_buf = d.des2;
         if (d.des1 & DES1_TLS) {
-            if (s->mac_ctrl & MAC_CONTROL_TE) {
+            if (s->frame_overflow) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "xm-dwmac: TX frame over %d bytes dropped\n",
+                              FRAME_MAX);
+            } else if (s->mac_ctrl & MAC_CONTROL_TE) {
                 qemu_send_packet(qemu_get_queue(s->nic), s->frame,
                                  s->frame_len);
             }
             s->frame_len = 0;
+            s->frame_overflow = false;
             if (d.des1 & DES1_TIC) {
                 s->status |= ST_TI;
             }
@@ -268,6 +282,30 @@ static bool xm_dwmac_can_receive(NetClientState *nc)
     return d.des0 & DES0_OWN;
 }
 
+/* Perfect filter on ADDR0 for unicast; multicast is let through whatever
+ * the hash says, which only hands the guest a superset to filter. */
+static bool xm_dwmac_accept(XmDwmacState *s, const uint8_t *da)
+{
+    static const uint8_t bcast[ETH_ALEN] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    };
+    const uint8_t own[ETH_ALEN] = {
+        s->addr_lo, s->addr_lo >> 8, s->addr_lo >> 16, s->addr_lo >> 24,
+        s->addr_hi, s->addr_hi >> 8,
+    };
+
+    if (s->frame_flt & FLT_PR) {
+        return true;
+    }
+    if (!memcmp(da, bcast, ETH_ALEN)) {
+        return !(s->frame_flt & FLT_DBF);
+    }
+    if (da[0] & 1) {
+        return true;
+    }
+    return !memcmp(da, own, ETH_ALEN);
+}
+
 static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
                                 size_t size)
 {
@@ -277,6 +315,9 @@ static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
     int guard = 64;
 
     if (!s->rx_running || !(s->mac_ctrl & MAC_CONTROL_RE)) {
+        return size;
+    }
+    if (size < ETH_ALEN || !xm_dwmac_accept(s, buf)) {
         return size;
     }
     /* The frame length excludes the FCS: with checksum offload off the
@@ -316,6 +357,17 @@ static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
         xm_dwmac_write_des0(at, des0);
         s->cur_rx = xm_dwmac_next(at, &d, s->rx_base);
     }
+    if (done < total) {
+        /* Ran out of guard before the frame did: like a ring with no free
+         * descriptor, the frame is lost rather than half-delivered. */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "xm-dwmac: RX frame of %zu bytes spans over 64 "
+                      "descriptors, dropped\n", size);
+        s->status |= ST_RU;
+        s->missed++;
+        xm_dwmac_update_irq(s);
+        return size;
+    }
     s->status |= ST_RI;
     xm_dwmac_update_irq(s);
     return size;
@@ -341,6 +393,7 @@ static void xm_dwmac_soft_reset(XmDwmacState *s)
     s->rx_base = s->tx_base = 0;
     s->cur_tx = s->cur_rx = 0;
     s->frame_len = 0;
+    s->frame_overflow = false;
     xm_dwmac_update_irq(s);
 }
 

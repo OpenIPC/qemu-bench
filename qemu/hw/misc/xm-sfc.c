@@ -325,9 +325,11 @@ static void xm_sfc_realize(DeviceState *dev, Error **errp)
             s->size = len;
         }
     }
-    if (!s->size || s->size > WINDOW_SIZE) {
-        error_setg(errp, "xm-sfc: flash size 0x%x not in (0, 16 MiB]",
-                   s->size);
+    /* Whole 64 KiB sectors, as every NOR chip is: erase and page program
+     * then never reach past the array. */
+    if (!s->size || s->size > WINDOW_SIZE || (s->size & (64 * KiB - 1))) {
+        error_setg(errp, "xm-sfc: flash size 0x%x is not a multiple of "
+                   "64 KiB in (0, 16 MiB]", s->size);
         return;
     }
 
