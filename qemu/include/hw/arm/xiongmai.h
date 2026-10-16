@@ -22,6 +22,8 @@
 #define XM_MAX_TIMER    2
 #define XM_MAX_REGBANK  16
 #define XM_MAX_SDHCI    2
+#define XM_MAX_SYS_INIT 4
+#define XM_MAX_IRQ      96      /* 32 private + 64 SPIs on XM530 */
 
 typedef struct XmRegbank {
     const char *name;
@@ -32,6 +34,7 @@ typedef struct XmRegbank {
 typedef struct XmSoCConfig {
     const char *desc;
     const char *cpu_type;
+    int         max_cpus;       /* XM530/XM550: dual Cortex-A5 MPCore */
 
     hwaddr      ram_base;
     uint64_t    ram_size_default;
@@ -44,6 +47,12 @@ typedef struct XmSoCConfig {
     uint32_t    sys_rsten;
     uint32_t    sys_rst;
     uint32_t    sys_pll_lock_mask;  /* xm-sysctl pll-lock-mask */
+    uint32_t    sys_pll_lock31_mask; /* xm-sysctl pll-lock31-mask */
+    uint32_t    sys_remap;          /* REG_SC_REMAP, 0 = none */
+    uint32_t    sys_cpu1_rst;       /* REG_CPU1_SOFT_RST, 0 = none */
+    int         num_sys_init;
+    uint32_t    sys_init_offsets[XM_MAX_SYS_INIT];
+    uint32_t    sys_init_values[XM_MAX_SYS_INIT];
 
     /* On-chip SRAM: U-Boot's first stack, before DDR is up. */
     hwaddr      sram_base;
@@ -52,8 +61,13 @@ typedef struct XmSoCConfig {
     /* DDR controller: only U-Boot's training touches it (xm-ddrc). */
     hwaddr      ddrc_base;
 
-    /* Interrupt controller: a PL190-layout VIC (XM510). */
+    /* Interrupt controller: a PL190-layout VIC (XM510), or the A5 MPCore
+     * private region (A9 layout: SCU +0, GIC CPU +0x100, TWD +0x600, GIC
+     * dist +0x1000) with the device lines as GIC SPIs (XM530). */
     hwaddr      vic_base;
+    hwaddr      mpcore_base;
+    int         num_spi;
+    hwaddr      l2x0_base;      /* PL310, 0 = none */
 
     int         num_uarts;
     hwaddr      uart_bases[XM_MAX_UART];
@@ -66,9 +80,12 @@ typedef struct XmSoCConfig {
     int         timer_irqs[XM_MAX_TIMER];
     uint32_t    timer_freq;
 
-    /* xmsfc SPI-NOR controller and the window its flash reads through. */
+    /* xmsfc SPI-NOR controller and the window its flash reads through.
+     * When the window is not at 0, address 0 aliases it until the guest
+     * remaps RAM there (SYS sys_remap), which is how the CPU boots. */
     hwaddr      sfc_base;
     hwaddr      sfc_window;
+    int         sfc_version;
 
     /* Synopsys DWMAC (10/100 core on XM510). */
     hwaddr      mac_base;
