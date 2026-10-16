@@ -19,7 +19,10 @@
 #include "hw/clock.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
+#include "hw/sd/sd.h"
 #include "hw/sysbus.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
@@ -41,6 +44,12 @@ static const XmSoCConfig xm510_soc = {
     .sys_base           = 0x20000000,           /* SYS_CTRL_BASE */
     .sys_rsten          = 0x30,
     .sys_rst            = 0x34,
+    /* PLL status words polled by U-Boot 2014.04's lowlevel init. */
+    .sys_pll_lock_mask  = (1u << (0x08 / 4)) | (1u << (0x1c / 4)) |
+                          (1u << (0x28 / 4)),
+    /* U-Boot sets sp = 0x04001000 before DDR training. */
+    .sram_base          = 0x04000000,
+    .sram_size          = 64 * KiB,
     .vic_base           = 0x20010000,           /* INTC_BASE */
     .num_uarts          = 3,
     .uart_bases         = { 0x10030000, 0x10040000, 0x10050000 },
@@ -58,6 +67,7 @@ static const XmSoCConfig xm510_soc = {
     .sdhci_irqs         = { 24, 25 },
     .wdt_base           = 0x20060000,
     .wdt_freq           = 24000000,
+    .ddrc_base          = 0x100B0000,           /* from U-Boot, see xm-ddrc */
     .num_regbanks       = 7,
     .regbanks           = {
         { "xm-gpio",     0x10020000, 0x10000 },  /* GPIO + pin mux */
@@ -107,6 +117,13 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
 
+    if (c->sram_size) {
+        MemoryRegion *sram = g_new(MemoryRegion, 1);
+        memory_region_init_ram(sram, NULL, "xiongmai.sram", c->sram_size,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, c->sram_base, sram);
+    }
+
     /* PL190-layout VIC: the vendor entry macro reads IRQSTATUS at +0 and
      * nothing else, and init writes INTENCLEAR/INTSELECT/SOFTINTCLEAR at the
      * PL190 offsets (REG_INTC_* in platform.h). */
@@ -122,8 +139,13 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         DeviceState *sys = qdev_new("xm-sysctl");
         qdev_prop_set_uint32(sys, "rsten-offset", c->sys_rsten);
         qdev_prop_set_uint32(sys, "rst-offset", c->sys_rst);
+        qdev_prop_set_uint32(sys, "pll-lock-mask", c->sys_pll_lock_mask);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sys), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sys), 0, c->sys_base);
+    }
+
+    if (c->ddrc_base) {
+        sysbus_create_simple("xm-ddrc", c->ddrc_base, NULL);
     }
 
     for (n = 0; n < c->num_uarts; n++) {
@@ -163,6 +185,15 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sd), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sd), 0, c->sdhci_bases[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(sd), 0, pic[c->sdhci_irqs[n]]);
+
+        DriveInfo *di = drive_get(IF_SD, 0, n);
+        if (di) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(sd, "sd-bus"),
+                                   &error_fatal);
+        }
     }
 
     if (c->wdt_base) {

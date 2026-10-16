@@ -38,6 +38,7 @@ cp qemu/hw/arm/xiongmai.c           "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/xiongmai.h   "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/xm-sfc.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-ddrc.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
@@ -175,6 +176,11 @@ if ! grep -q xm-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sysctl.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-sysctl.c"
+fi
+if ! grep -q xm-ddrc "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-ddrc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-ddrc.c"
 fi
 if ! grep -q xm-dwmac "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-dwmac.c'))" \

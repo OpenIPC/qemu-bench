@@ -49,6 +49,11 @@
 #   test-flash-rw.sh --soc hi3516ev300 --machine hi3516ev300,sensor=none \
 #       --qemu ./qemu-src/build/qemu-system-arm --output-dir <dir> \
 #       [--mem 128M] [--timeout 240] [--kernel <uImage>] [--rootfs <squashfs>]
+#       [--mtd-name hi_sfc] [--flash-mb 16]
+#
+# --mtd-name is the controller name mtdparts= keys on (xm_sfc for Xiongmai),
+# --flash-mb the synthetic NOR's size.  The XM510 kernel only knows 8 MiB
+# chips, so there rootfs_data shrinks to whatever the 8 MiB leaves.
 #
 set -u
 
@@ -60,6 +65,8 @@ MEM="128M"
 TIMEOUT=240
 KERNEL=""
 ROOTFS=""
+MTD_NAME="hi_sfc"
+FLASH_MB=16
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -71,6 +78,8 @@ while [ $# -gt 0 ]; do
         --timeout|--login-timeout) TIMEOUT="$2"; shift 2 ;;
         --kernel)        KERNEL="$2"; shift 2 ;;
         --rootfs)        ROOTFS="$2"; shift 2 ;;
+        --mtd-name)      MTD_NAME="$2"; shift 2 ;;
+        --flash-mb)      FLASH_MB="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -84,7 +93,7 @@ for f in "$KERNEL" "$ROOTFS"; do
     [ -f "$f" ] || { echo "=== FAIL: missing $f ==="; exit 1; }
 done
 
-# 16 MiB synthetic NOR: the rootfs the guest boots from, a 1 MiB scratch "test"
+# Synthetic NOR (16 MiB by default): the rootfs the guest boots from, a 1 MiB scratch "test"
 # partition that is NOT the rootfs so erasing and rewriting it is safe, and a
 # rootfs_data for the overlay.  The kernel still arrives via -kernel; nothing
 # writes mtd2.
@@ -93,13 +102,21 @@ ROOTFS_KB=$(( ( ($(stat -c %s "$ROOTFS") + 65535) / 65536 ) * 64 ))
 ROOTFS_OFF_KB=$((BOOT_KB + ENV_KB + KERN_KB))
 TEST_OFF=$(( (ROOTFS_OFF_KB + ROOTFS_KB) * 1024 ))
 TEST_MTD=4
+LEFT_KB=$(( FLASH_MB * 1024 - (ROOTFS_OFF_KB + ROOTFS_KB + TEST_KB) ))
+[ "$LEFT_KB" -ge 256 ] || {
+    echo "=== FAIL: rootfs does not fit a ${FLASH_MB} MiB flash with room for an overlay ==="
+    exit 1; }
 
 FLASH="$OUTDIR/flash.bin"
-dd if=/dev/zero of="$FLASH" bs=1M count=16 2>/dev/null
+dd if=/dev/zero of="$FLASH" bs=1M count="$FLASH_MB" 2>/dev/null
 dd if="$ROOTFS" of="$FLASH" bs=1k seek="$ROOTFS_OFF_KB" conv=notrunc 2>/dev/null
-MTDPARTS="hi_sfc:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel)"
+MTDPARTS="${MTD_NAME}:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel)"
 MTDPARTS="${MTDPARTS},${ROOTFS_KB}k(rootfs),${TEST_KB}k(test)"
-MTDPARTS="${MTDPARTS},${DATA_KB}k(rootfs_data),-(spare)"
+if [ "$LEFT_KB" -gt "$DATA_KB" ]; then
+    MTDPARTS="${MTDPARTS},${DATA_KB}k(rootfs_data),-(spare)"
+else
+    MTDPARTS="${MTDPARTS},-(rootfs_data)"
+fi
 APPEND="console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs"
 APPEND="${APPEND} init=/init mtdparts=${MTDPARTS}"
 
