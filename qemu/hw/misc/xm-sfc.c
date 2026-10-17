@@ -58,6 +58,26 @@
  * clear nothing is protected; and SR3 survives a machine reset but not a
  * QEMU restart -- flash-file holds the array only, and "wps" sets the
  * power-up state of every run.
+ *
+ * SPI NAND (v2, "nand-file"): the controller in NAND mode, as the vendor
+ * U-Boot's xmsfc_v2_nand.c drives it. Raw pages of 2048 data + 64 spare
+ * bytes, 64 to a 128 KiB block; a W25N01GV (EF AA 21) unless "nand-id" says
+ * otherwise. OP1 runs an addressed command without data (0x13 page read to
+ * the cache, 0x10 program execute, 0xD8 block erase, row in ADDR), OP2 a
+ * bare command (0xFF reset), OP3 reads (0x9F ID, 0x0F feature at ADDR,
+ * 0x03/0x0B the cache from column ADDR into RAM at the same offset) and OP4
+ * writes (0x1F feature, 0x02/0x84 RAM into the cache at column ADDR; 0x02
+ * clears the cache first). Programs AND into the page. The part powers up
+ * with every block protected (feature A0 = 0x7C): a program or erase then
+ * fails with P_FAIL/E_FAIL in feature C0 until A0 is cleared, as the
+ * vendor driver does before each one.
+ *
+ * NOTHING DOCUMENTS HOW THE XM530 BOOTS FROM SPI NAND. The model assumes
+ * the read window in bus-read mode serves the NAND's page data linearly,
+ * spare bytes skipped, so the CPU runs U-Boot in place from it as from NOR
+ * (the vendor tree links a NAND U-Boot at 0x60001000, behind a 4 KiB
+ * header). It is an unverified guess, here so that a NAND U-Boot can be
+ * exercised at all; it says nothing about silicon.
  */
 
 #include "qemu/osdep.h"
@@ -131,7 +151,24 @@ struct XmSfcState {
     uint32_t jedec;
     uint32_t version;
     bool wps;                 /* power up with SR3.WPS set */
+
+    /* SPI NAND */
+    char *nand_file;
+    int nand_fd;
+    uint8_t *nand;            /* raw pages, data then spare */
+    uint32_t nand_pages;
+    uint32_t nand_id;
+    uint8_t cache[2048 + 64];
+    uint8_t feat_a0, feat_b0, feat_c0;
 };
+
+#define NAND_DATA       2048
+#define NAND_SPARE      64
+#define NAND_RAW        (NAND_DATA + NAND_SPARE)
+#define NAND_PPB        64      /* pages per block */
+#define NAND_A0_BP      0x78    /* BP3..BP0: any set protects (TB aside) */
+#define NAND_C0_EFAIL   0x04
+#define NAND_C0_PFAIL   0x08
 
 static void xm_sfc_persist(XmSfcState *s, uint32_t off, uint32_t len)
 {
@@ -423,8 +460,184 @@ static void xm_sfc_v2_data_read(XmSfcState *s)
     }
 }
 
+static void xm_sfc_nand_persist(XmSfcState *s, uint32_t page, uint32_t n)
+{
+    if (s->nand_fd < 0) {
+        return;
+    }
+    if (pwrite(s->nand_fd, s->nand + (size_t)page * NAND_RAW,
+               (size_t)n * NAND_RAW, (off_t)page * NAND_RAW) !=
+        (ssize_t)n * NAND_RAW) {
+        error_report("xm-sfc: write-through to %s failed at page %u: %s",
+                     s->nand_file, page, strerror(errno));
+    }
+}
+
+/* The window shows page data linearly (see the header): keep it in step */
+static void xm_sfc_nand_window(XmSfcState *s, uint32_t page, uint32_t n)
+{
+    uint32_t i;
+
+    for (i = page; i < page + n; i++) {
+        const uint64_t lin = (uint64_t)i * NAND_DATA;
+        if (lin + NAND_DATA > s->size) {
+            break;
+        }
+        memcpy(s->array + lin, s->nand + (size_t)i * NAND_RAW, NAND_DATA);
+        memory_region_flush_rom_device(&s->window, lin, NAND_DATA);
+    }
+}
+
+static void xm_sfc_nand_op1(XmSfcState *s)
+{
+    const uint32_t row = s->addr;
+    uint32_t i;
+
+    switch (s->cmd) {
+    case 0x13:                /* page read to cache */
+        if (row >= s->nand_pages) {
+            memset(s->cache, 0xff, sizeof(s->cache));
+            break;
+        }
+        memcpy(s->cache, s->nand + (size_t)row * NAND_RAW, NAND_RAW);
+        break;
+    case 0x10:                /* program execute */
+        s->feat_c0 &= ~NAND_C0_PFAIL;
+        if (row >= s->nand_pages || (s->feat_a0 & NAND_A0_BP)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "xm-sfc: NAND program of page "
+                          "0x%x failed (protected or past the end)\n", row);
+            s->feat_c0 |= NAND_C0_PFAIL;
+            break;
+        }
+        for (i = 0; i < NAND_RAW; i++) {
+            s->nand[(size_t)row * NAND_RAW + i] &= s->cache[i];
+        }
+        xm_sfc_nand_persist(s, row, 1);
+        xm_sfc_nand_window(s, row, 1);
+        break;
+    case 0xD8: {              /* block erase */
+        const uint32_t first = row & ~(NAND_PPB - 1);
+        s->feat_c0 &= ~NAND_C0_EFAIL;
+        if (first >= s->nand_pages || (s->feat_a0 & NAND_A0_BP)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "xm-sfc: NAND erase of page "
+                          "0x%x failed (protected or past the end)\n", row);
+            s->feat_c0 |= NAND_C0_EFAIL;
+            break;
+        }
+        memset(s->nand + (size_t)first * NAND_RAW, 0xff,
+               (size_t)NAND_PPB * NAND_RAW);
+        xm_sfc_nand_persist(s, first, NAND_PPB);
+        xm_sfc_nand_window(s, first, NAND_PPB);
+        break;
+    }
+    default:
+        qemu_log_mask(LOG_UNIMP, "xm-sfc: NAND OP1 opcode 0x%02x\n", s->cmd);
+        break;
+    }
+}
+
+static uint8_t *xm_sfc_nand_feature(XmSfcState *s)
+{
+    switch (s->addr & 0xff) {
+    case 0xA0:
+        return &s->feat_a0;
+    case 0xB0:
+        return &s->feat_b0;
+    case 0xC0:
+        return &s->feat_c0;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-sfc: NAND feature 0x%02x\n",
+                      s->addr & 0xff);
+        return NULL;
+    }
+}
+
+static void xm_sfc_nand_reset_features(XmSfcState *s)
+{
+    s->feat_a0 = 0x7C;        /* every block protected at power-up */
+    s->feat_b0 = 0x18;        /* on-die ECC on, buffer mode */
+    s->feat_c0 = 0;
+}
+
+static void xm_sfc_nand_op(XmSfcState *s, uint32_t op)
+{
+    const uint32_t n = MIN(s->wrnum + 1, V2_RAM_BYTES);
+    const uint32_t col = s->addr & 0xfff;
+    uint8_t *f;
+    uint32_t i;
+
+    switch (op) {
+    case 1:
+        xm_sfc_nand_op1(s);
+        break;
+    case 2:
+        if (s->cmd == 0xFF) {
+            xm_sfc_nand_reset_features(s);
+        } else {
+            qemu_log_mask(LOG_UNIMP, "xm-sfc: NAND OP2 opcode 0x%02x\n",
+                          s->cmd);
+        }
+        break;
+    case 3:
+        switch (s->cmd) {
+        case 0x9F:            /* ID, first byte highest */
+            s->srr = 0;
+            for (i = 0; i < MIN(n, 3); i++) {
+                s->srr = (s->srr << 8) | ((s->nand_id >> (16 - 8 * i)) & 0xff);
+            }
+            break;
+        case 0x0F:
+            f = xm_sfc_nand_feature(s);
+            s->srr = f ? *f : 0;
+            break;
+        case 0x03:
+        case 0x0B:            /* cache -> RAM, at the same column */
+            for (i = 0; i < n && col + i < V2_RAM_BYTES; i++) {
+                s->v2_ram[col + i] = col + i < NAND_RAW ? s->cache[col + i]
+                                                        : 0xff;
+            }
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "xm-sfc: NAND OP3 opcode 0x%02x\n",
+                          s->cmd);
+            break;
+        }
+        break;
+    case 4:
+        switch (s->cmd) {
+        case 0x1F:
+            f = xm_sfc_nand_feature(s);
+            if (f) {
+                *f = s->srw & 0xff;
+            }
+            break;
+        case 0x02:            /* program load: cache to 0xff, then load */
+            memset(s->cache, 0xff, sizeof(s->cache));
+            /* fall through */
+        case 0x84:            /* random program load */
+            for (i = 0; i < n && col + i < NAND_RAW; i++) {
+                s->cache[col + i] = s->v2_ram[col + i];
+            }
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "xm-sfc: NAND OP4 opcode 0x%02x\n",
+                          s->cmd);
+            break;
+        }
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "xm-sfc: NAND operation %u\n", op);
+        break;
+    }
+    s->st = op >= 1 && op <= 10 ? 1u << (op - 1) : 0;
+}
+
 static void xm_sfc_v2_op(XmSfcState *s, uint32_t op)
 {
+    if (s->nand) {
+        xm_sfc_nand_op(s, op);
+        return;
+    }
     switch (op) {
     case 1:
         xm_sfc_erase(s);
@@ -557,7 +770,39 @@ static void xm_sfc_realize(DeviceState *dev, Error **errp)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     s->fd = -1;
-    if (s->flash_file && *s->flash_file) {
+    s->nand_fd = -1;
+    if (s->nand_file && *s->nand_file) {
+        off_t len;
+
+        if (s->version != 2) {
+            error_setg(errp, "xm-sfc: SPI NAND needs the v2 controller");
+            return;
+        }
+        s->nand_fd = open(s->nand_file, O_RDWR);
+        if (s->nand_fd < 0) {
+            error_setg_errno(errp, errno, "xm-sfc: cannot open %s",
+                             s->nand_file);
+            return;
+        }
+        len = lseek(s->nand_fd, 0, SEEK_END);
+        if (len <= 0 || len % ((off_t)NAND_PPB * NAND_RAW)) {
+            error_setg(errp, "xm-sfc: %s is not whole blocks of 64 raw "
+                       "pages of %u bytes", s->nand_file, NAND_RAW);
+            return;
+        }
+        s->nand_pages = len / NAND_RAW;
+        s->nand = g_malloc(len);
+        if (pread(s->nand_fd, s->nand, len, 0) != len) {
+            error_setg_errno(errp, errno, "xm-sfc: cannot read %s",
+                             s->nand_file);
+            return;
+        }
+        /* The window: page data, linearly, as far as it reaches */
+        s->size = MIN((uint64_t)s->nand_pages * NAND_DATA, WINDOW_SIZE);
+        if (!s->nand_id) {
+            s->nand_id = 0xefaa21;      /* W25N01GV */
+        }
+    } else if (s->flash_file && *s->flash_file) {
         s->fd = open(s->flash_file, O_RDWR);
         if (s->fd < 0) {
             error_setg_errno(errp, errno, "xm-sfc: cannot open %s",
@@ -599,7 +844,9 @@ static void xm_sfc_realize(DeviceState *dev, Error **errp)
     }
     s->array = memory_region_get_ram_ptr(&s->window);
     memset(s->array, 0xff, s->size);
-    if (s->fd >= 0 &&
+    if (s->nand) {
+        xm_sfc_nand_window(s, 0, s->size / NAND_DATA);
+    } else if (s->fd >= 0 &&
         pread(s->fd, s->array, s->size, 0) != (ssize_t)s->size) {
         error_setg_errno(errp, errno, "xm-sfc: cannot read %s",
                          s->flash_file);
@@ -621,6 +868,7 @@ static void xm_sfc_reset(DeviceState *dev)
     s->blocks_locked = s->sr3 & SR3_WPS;
     memset(s->v2_regs, 0, sizeof(s->v2_regs));
     memset(s->v2_ram, 0, sizeof(s->v2_ram));
+    xm_sfc_nand_reset_features(s);
 }
 
 static const Property xm_sfc_props[] = {
@@ -633,6 +881,10 @@ static const Property xm_sfc_props[] = {
     /* Power up as a Xiongmai bootloader leaves the part: SR3.WPS set, every
      * block locked, erases and programs dropped until 0x98 or WPS cleared. */
     DEFINE_PROP_BOOL("wps", XmSfcState, wps, false),
+    /* SPI NAND instead of NOR (v2): raw pages, 2048 + 64 bytes each */
+    DEFINE_PROP_STRING("nand-file", XmSfcState, nand_file),
+    /* 0: W25N01GV (EF AA 21) */
+    DEFINE_PROP_UINT32("nand-id", XmSfcState, nand_id, 0),
 };
 
 static void xm_sfc_class_init(ObjectClass *klass, const void *data)
