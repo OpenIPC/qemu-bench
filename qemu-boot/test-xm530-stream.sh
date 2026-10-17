@@ -11,14 +11,17 @@
 #
 #   1. majestic encoded at least --frames H.264 pictures
 #   2. the jobs concatenate into a stream ffmpeg decodes with no errors,
-#      frame for frame, at the SPS's size
-#   3. it holds more than one IDR, so the SPS/PPS majestic rewrites per GOP
-#      are carried and followed
+#      frame for frame, at majestic's main-channel size (--size)
+#   3. every IDR job carries its own SPS and PPS, and there is more than
+#      one, so the headers majestic rewrites per GOP are followed
+#   4. the pictures are live: xm-vi stamps its frame number into the top
+#      left as 16 binary blocks, and it must rise from frame to frame, so
+#      an encoder fed a stale buffer fails
 #
 # Usage:
 #   test-xm530-stream.sh --qemu ./qemu-src/build/qemu-system-arm \
 #       --output-dir <dir> [--machine xm530] [--kernel <uImage>] \
-#       [--rootfs <squashfs>] [--frames 60] [--timeout 240]
+#       [--rootfs <squashfs>] [--frames 60] [--size 704x576] [--timeout 240]
 #
 set -u
 
@@ -28,6 +31,7 @@ OUTDIR="."
 KERNEL="qemu-boot/uImage.xm530"
 ROOTFS="qemu-boot/rootfs.squashfs.xm530"
 FRAMES=60
+SIZE=704x576
 TIMEOUT=240
 
 while [ $# -gt 0 ]; do
@@ -38,6 +42,7 @@ while [ $# -gt 0 ]; do
         --kernel)     KERNEL="$2"; shift 2 ;;
         --rootfs)     ROOTFS="$2"; shift 2 ;;
         --frames)     FRAMES="$2"; shift 2 ;;
+        --size)       SIZE="$2"; shift 2 ;;
         --timeout)    TIMEOUT="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -84,28 +89,72 @@ fi
 STREAM="$OUTDIR/stream.h264"
 find "$DUMP" -name '*.h264' | sort | xargs -r cat > "$STREAM"
 if [ "$jobs" -gt 0 ]; then
-    errs=$(ffmpeg -v error -err_detect explode -i "$STREAM" -f null - 2>&1)
-    if [ -z "$errs" ]; then
-        echo "ok   ffmpeg decodes the stream with no errors"
-    else
-        echo "FAIL: ffmpeg: $(echo "$errs" | head -3)"; fail=1
-    fi
-    info=$(ffprobe -v error -count_frames -show_entries \
-           stream=nb_read_frames,width,height,profile -of default=nw=1 "$STREAM")
-    decoded=$(echo "$info" | sed -n 's/^nb_read_frames=//p')
-    if [ "$decoded" = "$jobs" ]; then
-        echo "ok   $decoded frames decoded, one per job ($(echo "$info" |
-              grep -E '^(profile|width|height)=' | tr '\n' ' '))"
-    else
-        echo "FAIL: $decoded frames decoded from $jobs jobs"; fail=1
-    fi
-    idrs=$(ffprobe -v error -show_entries frame=key_frame -of csv=p=0 "$STREAM" |
-           grep -c '^1')
-    if [ "$idrs" -ge 2 ]; then
-        echo "ok   $idrs IDRs, each with the SPS/PPS majestic wrote for it"
-    else
-        echo "FAIL: $idrs IDR in the stream, wanted at least 2"; fail=1
-    fi
+    python3 - "$DUMP" "$STREAM" "$SIZE" <<'PY' || fail=1
+import os, subprocess, sys
+
+dump, stream, size = sys.argv[1:]
+w, h = (int(v) for v in size.split('x'))
+fail = 0
+
+def check(ok, what):
+    global fail
+    print(('ok   ' if ok else 'FAIL: ') + what)
+    fail |= not ok
+
+def nal_types(data):
+    i, out = 0, []
+    while True:
+        i = data.find(b'\x00\x00\x01', i)
+        if i < 0 or i + 3 >= len(data):
+            return out
+        out.append(data[i + 3] & 0x1f)
+        i += 3
+
+# 3. every IDR job carries the SPS and PPS ahead of its slice
+idrs = bad = 0
+for name in sorted(os.listdir(dump)):
+    if not name.endswith('.h264'):
+        continue
+    t = nal_types(open(os.path.join(dump, name), 'rb').read())
+    if 5 in t:
+        idrs += 1
+        ahead = t[:t.index(5)]
+        bad += not (7 in ahead and 8 in ahead)
+check(idrs >= 2 and not bad,
+      '%d IDR jobs, %d without their own SPS/PPS (want >= 2 and 0)' % (idrs, bad))
+
+# 2. a clean decode, one frame per job, at the expected size
+jobs = sum(n.endswith('.h264') for n in os.listdir(dump))
+r = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode', '-i', stream,
+                    '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'], capture_output=True)
+check(r.returncode == 0 and not r.stderr,
+      'ffmpeg decodes the stream (exit %d)%s' % (r.returncode,
+      ': ' + r.stderr.decode(errors='replace')[:300] if r.stderr else ''))
+info = dict(l.split('=', 1) for l in subprocess.run(
+    ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+     'stream=width,height,profile', '-of', 'default=nw=1', stream],
+    capture_output=True, text=True).stdout.split())
+check((info.get('width'), info.get('height')) == (str(w), str(h)),
+      'picture %sx%s, want %s (%s)' % (info.get('width'), info.get('height'),
+                                       size, info.get('profile')))
+fs = w * h * 3 // 2
+frames = len(r.stdout) // fs if r.returncode == 0 else 0
+check(frames == jobs, '%d frames decoded from %d jobs' % (frames, jobs))
+
+# 4. xm-vi's frame number, 16 blocks of 16 px across the top left, MSB first
+counts = []
+for f in range(frames):
+    y = r.stdout[f * fs:f * fs + w * h]
+    v = 0
+    for b in range(16):
+        v = (v << 1) | (y[8 * w + b * 16 + 8] > 128)
+    counts.append(v)
+rising = all(b > a for a, b in zip(counts, counts[1:]))
+check(frames > 1 and rising,
+      'the VI frame number rises through every picture (%s .. %s)' %
+      (counts[:3], counts[-3:]))
+sys.exit(fail)
+PY
 fi
 
 if [ "$fail" = "0" ]; then
