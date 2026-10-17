@@ -66,10 +66,24 @@ struct XmI2cState {
     uint32_t ctrl, addr, wcnt, rcnt, st;
 };
 
+/*
+ * A transfer that cannot move its whole programmed count is not done: the
+ * driver then times out as it would on silicon, rather than taking a short
+ * register-address write for a complete one and reading the wrong register.
+ * (The driver queues one byte past WCNT, a terminator, which is not sent.)
+ */
 static void xm_i2c_write_xfer(XmI2cState *s)
 {
-    uint32_t n = MIN(s->wcnt, fifo8_num_used(&s->tx));
-    bool ok = !i2c_start_send(s->bus, s->addr & 0x7f);
+    uint32_t n = s->wcnt;
+    bool ok;
+
+    if (n > fifo8_num_used(&s->tx)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-i2c: write of %u bytes with %u "
+                      "queued\n", n, fifo8_num_used(&s->tx));
+        fifo8_reset(&s->tx);
+        return;
+    }
+    ok = !i2c_start_send(s->bus, s->addr & 0x7f);
 
     while (ok && n--) {
         ok = !i2c_send(s->bus, fifo8_pop(&s->tx));
@@ -83,9 +97,14 @@ static void xm_i2c_write_xfer(XmI2cState *s)
 
 static void xm_i2c_read_xfer(XmI2cState *s)
 {
-    uint32_t n = MIN(s->rcnt, XM_I2C_FIFO);
+    uint32_t n = s->rcnt;
 
     fifo8_reset(&s->rx);
+    if (n > XM_I2C_FIFO) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-i2c: read of %u bytes, FIFO is %u\n",
+                      n, XM_I2C_FIFO);
+        return;
+    }
     if (i2c_start_recv(s->bus, s->addr & 0x7f)) {
         i2c_end_transfer(s->bus);
         return;
