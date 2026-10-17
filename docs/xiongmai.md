@@ -160,6 +160,21 @@ source:
 
 ## Model notes
 
+- **xmsfc status registers:** both versions keep SR1, SR2 and SR3.
+  - Reads: 0x05, 0x35 and 0x15 (OP3).
+  - Writes (OP4): 0x01 writes SR1, or SR1 and SR2 with two bytes; 0x31
+    writes SR2; 0x11 writes SR3. On v2 every other OP4 opcode is a page
+    program, so before this an SR3 write ANDed the data RAM into flash.
+  - SR3 is non-volatile: it survives a machine reset.
+- **xmsfc per-block protection (`-global xm-sfc.wps=on`):** the part powers
+  up as Xiongmai bootloaders leave it, with SR3.WPS set.
+  - Protection then comes from per-block lock bits, all set at power-up, and
+    erases and programs are dropped with no error, as on silicon. With
+    `-d guest_errors` the log names each one.
+  - 0x98 (v2 OP1 with no address) unlocks every block until the next reset;
+    clearing WPS with 0x11 returns the part to BP protection for good.
+  - Off by default, so existing images behave as before.
+
 - **xm-dwmac RX start:** receive DMA starts 1 ms (virtual time) after the
   driver sets DMA_CONTROL.SR.
   - The delay exists because the vendor `stmmac_open()` sets SR before

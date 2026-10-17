@@ -44,6 +44,15 @@
  *
  * Erases and programs are written through to flash-file, so what the guest
  * stores survives a reboot, as on a camera.
+ *
+ * Status registers, on both versions: 0x05/0x35/0x15 read SR1/SR2/SR3, and a
+ * status write (v1 OP4, v2 OP4) with 0x01 (one or two bytes), 0x31 or 0x11
+ * writes SR1(+SR2)/SR2/SR3. Every other OP4 opcode on v2 is a page program.
+ * With "wps" set the part powers up as Xiongmai bootloaders leave it:
+ * SR3.WPS on, so protection comes from per-block lock bits, all locked at
+ * power-up, and erases and programs are dropped as on silicon. 0x98 (v2 OP1
+ * without an address) unlocks every block, and clearing WPS returns the part
+ * to BP protection, which is what the OpenIPC U-Boot does at probe.
  */
 
 #include "qemu/osdep.h"
@@ -106,7 +115,8 @@ struct XmSfcState {
     uint32_t v2_regs[V2_RAM / 4];   /* v2 registers with no side effect */
     uint8_t v2_ram[V2_RAM_BYTES];
     uint8_t buf[BUF_BYTES];
-    uint8_t sr1, sr2;
+    uint8_t sr1, sr2, sr3;
+    bool blocks_locked;       /* per-block locks, live while SR3.WPS */
 
     uint8_t *array;           /* the flash, size bytes */
     int fd;                   /* flash-file, or -1 */
@@ -115,6 +125,7 @@ struct XmSfcState {
     uint32_t size;
     uint32_t jedec;
     uint32_t version;
+    bool wps;                 /* power up with SR3.WPS set */
 };
 
 static void xm_sfc_persist(XmSfcState *s, uint32_t off, uint32_t len)
@@ -126,6 +137,20 @@ static void xm_sfc_persist(XmSfcState *s, uint32_t off, uint32_t len)
         error_report("xm-sfc: write-through to %s failed at 0x%x: %s",
                      s->flash_file, off, strerror(errno));
     }
+}
+
+#define SR3_WPS 0x04
+
+/* Per-block protection drops the operation, as on silicon: no error. */
+static bool xm_sfc_locked(XmSfcState *s, const char *what)
+{
+    if ((s->sr3 & SR3_WPS) && s->blocks_locked) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "xm-sfc: %s at 0x%x dropped: block locked (SR3.WPS)\n",
+                      what, s->addr);
+        return true;
+    }
+    return false;
 }
 
 static void xm_sfc_erase(XmSfcState *s)
@@ -142,8 +167,17 @@ static void xm_sfc_erase(XmSfcState *s)
     case 0xD8:
         len = 64 * KiB;
         break;
+    case 0x98:                /* global block unlock: no address, no data */
+        s->blocks_locked = false;
+        return;
+    case 0x06:                /* write enable / disable: nothing to model */
+    case 0x04:
+        return;
     case 0xC7:
     case 0x60:
+        if (xm_sfc_locked(s, "chip erase")) {
+            return;
+        }
         memset(s->array, 0xff, s->size);
         memory_region_flush_rom_device(&s->window, 0, s->size);
         xm_sfc_persist(s, 0, s->size);
@@ -154,6 +188,9 @@ static void xm_sfc_erase(XmSfcState *s)
     }
 
     const uint32_t off = s->addr & ~(len - 1);
+    if (xm_sfc_locked(s, "erase")) {
+        return;
+    }
     if (off >= s->size) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-sfc: erase at 0x%x past the end\n",
                       s->addr);
@@ -176,6 +213,9 @@ static void xm_sfc_program(XmSfcState *s)
     if (page >= s->size) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "xm-sfc: program at 0x%x past the end\n", s->addr);
+        return;
+    }
+    if (xm_sfc_locked(s, "program")) {
         return;
     }
     for (i = 0; i < n; i++) {
@@ -205,6 +245,9 @@ static void xm_sfc_read_reg(XmSfcState *s)
     case 0x35:
         out[0] = s->sr2;
         break;
+    case 0x15:
+        out[0] = s->sr3;
+        break;
     default:
         qemu_log_mask(LOG_UNIMP, "xm-sfc: read opcode 0x%02x\n", s->cmd);
         break;
@@ -215,17 +258,31 @@ static void xm_sfc_read_reg(XmSfcState *s)
     s->srr = v;
 }
 
+static bool xm_sfc_is_status_write(uint32_t cmd)
+{
+    return cmd == 0x01 || cmd == 0x31 || cmd == 0x11;
+}
+
 static void xm_sfc_write_reg(XmSfcState *s)
 {
-    if (s->cmd != 0x01) {
-        qemu_log_mask(LOG_UNIMP, "xm-sfc: write opcode 0x%02x\n", s->cmd);
-        return;
-    }
-    if (s->bsel >= 1) {
-        s->sr1 = (s->srw >> 8) & 0xfc;
+    switch (s->cmd) {
+    case 0x01:
+        if (s->bsel >= 1) {
+            s->sr1 = (s->srw >> 8) & 0xfc;
+            s->sr2 = s->srw & 0xff;
+        } else {
+            s->sr1 = s->srw & 0xfc;
+        }
+        break;
+    case 0x31:
         s->sr2 = s->srw & 0xff;
-    } else {
-        s->sr1 = s->srw & 0xfc;
+        break;
+    case 0x11:
+        s->sr3 = s->srw & 0xff;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "xm-sfc: write opcode 0x%02x\n", s->cmd);
+        break;
     }
 }
 
@@ -376,7 +433,7 @@ static void xm_sfc_v2_op(XmSfcState *s, uint32_t op)
         xm_sfc_read_reg(s);
         break;
     case 4:
-        if (s->cmd == 0x01) {
+        if (xm_sfc_is_status_write(s->cmd)) {
             s->bsel = s->wrnum;
             xm_sfc_write_reg(s);
         } else {
@@ -544,6 +601,7 @@ static void xm_sfc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_init_mmio(sbd, &s->window);
+    s->sr3 = s->wps ? SR3_WPS : 0;
 }
 
 static void xm_sfc_reset(DeviceState *dev)
@@ -553,6 +611,9 @@ static void xm_sfc_reset(DeviceState *dev)
     s->mode = s->addr = s->cmd = s->srw = s->wrnum = 0;
     s->bsel = s->st = s->srr = s->cache_cmd = 0;
     s->sr1 = s->sr2 = 0;
+    /* SR3 is non-volatile: what the guest wrote stays. The per-block locks
+     * are set again at every power-up while WPS is on. */
+    s->blocks_locked = s->sr3 & SR3_WPS;
     memset(s->v2_regs, 0, sizeof(s->v2_regs));
     memset(s->v2_ram, 0, sizeof(s->v2_ram));
 }
@@ -564,6 +625,9 @@ static const Property xm_sfc_props[] = {
      * W25Q64CV (8 MiB, both versions) or W25Q128BV (16 MiB, v2 only). */
     DEFINE_PROP_UINT32("jedec", XmSfcState, jedec, 0),
     DEFINE_PROP_UINT32("version", XmSfcState, version, 1),
+    /* Power up as a Xiongmai bootloader leaves the part: SR3.WPS set, every
+     * block locked, erases and programs dropped until 0x98 or WPS cleared. */
+    DEFINE_PROP_BOOL("wps", XmSfcState, wps, false),
 };
 
 static void xm_sfc_class_init(ObjectClass *klass, const void *data)
