@@ -111,9 +111,11 @@ typedef struct XmSoCConfig {
     const char *sensor_type;
     uint8_t     sensor_addr;
 
-    /* Video input (xm-vi), XM530: one interrupt per channel from vi_irq. */
+    /* Video input (xm-vi), XM530: one interrupt per channel from vi_irq,
+     * and the ISP's two frame interrupts (bayer, lum) from isp_irq. */
     hwaddr      vi_base;
     int         vi_irq;
+    int         isp_irq;
 
     /* Hantro H1 encoder (xm-h1), XM530: hx280enc base_port / irq. */
     hwaddr      h1_base;

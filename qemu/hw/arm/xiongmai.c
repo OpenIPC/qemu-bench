@@ -163,6 +163,7 @@ static const XmSoCConfig xm530_soc = {
     /* xm530_vi.ko: ioremap(0x30000000, 1 MiB), IRQ 65..68 for chn 0..3. */
     .vi_base            = 0x30000000,
     .vi_irq             = 33,
+    .isp_irq            = 25,
     /* hx280enc's module defaults: base_port=0x20070000 irq=77 (SPI 45). */
     .h1_base            = 0x20070000,
     .h1_irq             = 45,
@@ -521,6 +522,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 
         for (n = 0; n < 4; n++) {
             sysbus_connect_irq(SYS_BUS_DEVICE(vi), n, pic[c->vi_irq + n]);
+        }
+        for (n = 0; n < 2; n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(vi), 4 + n, pic[c->isp_irq + n]);
         }
     }
 

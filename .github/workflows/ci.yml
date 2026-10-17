@@ -19,7 +19,7 @@ jobs:
             build-essential ninja-build meson pkg-config \
             libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libslirp-dev \
             python3 python3-venv git gcc-arm-linux-gnueabi libc6-dev-armel-cross \
-            python3-pil
+            python3-pil ffmpeg
 
       - name: Build QEMU
         run: bash qemu/setup.sh
@@ -59,6 +59,12 @@ jobs:
       # libjpeg's encode of the same frame.
       - name: Hantro H1 JPEG encode (xm-h1)
         run: python3 qemu/tests/test-xm-h1-jpeg.py
+
+      # H.264 the way Hantro's library drives it: majestic's own SPS/PPS
+      # ahead of the output, the header remainder in STR_HDR_REM; ffmpeg must
+      # decode every frame.
+      - name: Hantro H1 H.264 encode (xm-h1)
+        run: python3 qemu/tests/test-xm-h1-h264.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4

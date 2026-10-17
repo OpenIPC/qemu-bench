@@ -14,10 +14,18 @@
  *   0xF0080+c*0x20 interrupt enable; +4 the height plus one
  *   0xF008C+c*0x20 interrupt status: set with a frame, cleared by writing 0
  *
- * When a channel is enabled, a timer delivers frames at frame-rate: the
- * next of its two buffers gets a test pattern (moving colour bars over a
- * frame counter), its done bit is set and the channel's line raised
- * (SPI 33 + c; the driver's vi_back_int takes the channel as dev_id).
+ * The ISP's two frame interrupts sit in the same grid, below the channels:
+ * 0xF0040 (isp_irq_bayer, SPI 25) and 0xF0060 (isp_irq_lum, SPI 26), enable
+ * at +0, status at +0xC.  They are what keeps VI running: when majestic
+ * calls XM_MPI_ISP_MemInit the driver stops every channel, and it is the
+ * ISP's per-frame handler that starts them again, so without these lines
+ * the pipeline stalls after a handful of frames.
+ *
+ * Each frame period a timer raises the enabled ISP lines, then for every
+ * enabled channel fills the next of its two buffers with a test pattern
+ * (moving colour bars over a frame counter), sets its done bit and raises
+ * the channel's line (SPI 33 + c; the driver's vi_back_int takes the
+ * channel as dev_id).
  *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
@@ -40,13 +48,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmViState, XM_VI)
 #define XM_VI_SIZE      0x100000
 #define XM_VI_CHANNELS  4
 #define XM_VI_WIN(c)    (0x84000 + (c) * 0x1000)
-#define XM_VI_INT(c)    (0xF0080 + (c) * 0x20)
+#define XM_VI_IRQ_BLK(b) (0xF0000 + (b) * 0x20)
+#define XM_VI_ISP_LINES 2
+#define XM_VI_ISP(i)    XM_VI_IRQ_BLK(2 + (i))
+#define XM_VI_INT(c)    XM_VI_IRQ_BLK(4 + (c))
 #define XM_VI_DDR       0x80000000u
 
 struct XmViState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq[XM_VI_CHANNELS];
+    qemu_irq isp_irq[XM_VI_ISP_LINES];
     uint32_t regs[XM_VI_SIZE / 4];
     QEMUTimer *timer;
     uint32_t fps;
@@ -115,6 +127,12 @@ static void xm_vi_tick(void *opaque)
     XmViState *s = opaque;
     int c;
 
+    for (c = 0; c < XM_VI_ISP_LINES; c++) {
+        if (R(s, XM_VI_ISP(c)) & 1) {
+            R(s, XM_VI_ISP(c) + 0x0C) = 1;
+            qemu_irq_raise(s->isp_irq[c]);
+        }
+    }
     for (c = 0; c < XM_VI_CHANNELS; c++) {
         if (!xm_vi_enabled(s, c)) {
             continue;
@@ -150,6 +168,11 @@ static void xm_vi_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             qemu_irq_lower(s->irq[c]);
         }
     }
+    for (c = 0; c < XM_VI_ISP_LINES; c++) {
+        if (off == XM_VI_ISP(c) + 0x0C && !val) {
+            qemu_irq_lower(s->isp_irq[c]);
+        }
+    }
 }
 
 static const MemoryRegionOps xm_vi_ops = {
@@ -170,6 +193,9 @@ static void xm_vi_reset(DeviceState *dev)
         qemu_irq_lower(s->irq[n]);
         s->frame[n] = 0;
     }
+    for (n = 0; n < XM_VI_ISP_LINES; n++) {
+        qemu_irq_lower(s->isp_irq[n]);
+    }
     timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
 
@@ -183,6 +209,9 @@ static void xm_vi_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     for (n = 0; n < XM_VI_CHANNELS; n++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[n]);
+    }
+    for (n = 0; n < XM_VI_ISP_LINES; n++) {
+        sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->isp_irq[n]);
     }
     s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, xm_vi_tick, s);
 }

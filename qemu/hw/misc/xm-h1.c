@@ -23,12 +23,19 @@
  *
  * JPEG: baseline, 4:2:0, the Annex K Huffman tables hantro_jpeg puts in the
  * header, ending with EOI.  The frame completes before the start write
- * returns.  H.264 is not encoded yet.
+ * returns.
+ *
+ * H.264 (mode 3): Hantro's library writes the SPS and PPS itself, up to an
+ * 8-byte aligned ADDR_OUTPUT_STREAM, and hands the H1 the bits that did not
+ * fit: STR_HDR_REM_MSB/LSB, RLC_CTRL[28:23] of them.  The model emits those
+ * first, then a slice from hantro-h264.c fitted to the SPS/PPS it reads
+ * back out of the stream buffer.  ENC_CTRL's intra bit makes it an IDR;
+ * ENC_CTRL0[31:26] is the QP.
  *
  * dump-dir (-global xm-h1.dump-dir=DIR) keeps every job on the host, to see
  * what a guest's encoder actually produced: a JPEG job as a complete
  * frame-NNNNN.jpg (the model writes the JFIF header the driver would, from
- * the programmed quantisers), any other job as frame-NNNNN.bin, the bytes
+ * the programmed quantisers), an H.264 job as frame-NNNNN.h264, the bytes
  * the H1 wrote; and each job's registers as frame-NNNNN.regs.
  *
  * Copyright (c) 2026 OpenIPC.
@@ -44,6 +51,7 @@
 #include "qom/object.h"
 #include "system/dma.h"
 #include "hw/qdev-properties.h"
+#include "hantro-h264.h"
 #include <math.h>
 
 #define TYPE_XM_H1 "xm-h1"
@@ -80,7 +88,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmH1State, XM_H1)
 #define H1_REG_IN_IMG_CTRL          0x03c
 #define   H1_IN_ROW_LEN(v)          (((v) >> 12) & 0x3fff)
 #define   H1_IN_FMT(v)              (((v) >> 2) & 0xf)
+#define H1_REG_ENC_CTRL0            0x040
+#define   H1_CTRL0_INIT_QP(v)       (((v) >> 26) & 0x3f)
+#define   H1_ENC_PIC_INTRA          (1u << 3)
+#define   H1_ENC_MODE_H264          3
+#define H1_REG_STR_HDR_REM_MSB      0x058
+#define H1_REG_STR_HDR_REM_LSB      0x05c
 #define H1_REG_STR_BUF_LIMIT        0x060
+#define H1_REG_RLC_CTRL             0x094
+#define   H1_RLC_STR_OFFS(v)        (((v) >> 23) & 0x3f)
 #define H1_REG_JPEG_LUMA_QUAT       0x100
 #define H1_REG_JPEG_CHROMA_QUAT     0x140
 
@@ -91,6 +107,7 @@ struct XmH1State {
     uint32_t regs[H1_REGS_SIZE / 4];
     char *dump_dir;
     uint32_t jobs;
+    H264Enc h264;
 };
 
 /* ---- JPEG baseline encoder ------------------------------------------ */
@@ -481,6 +498,87 @@ static void xm_h1_jpeg(XmH1State *s)
     g_free(cr);
 }
 
+static void xm_h1_h264(XmH1State *s)
+{
+    const uint32_t ctrl = s->regs[H1_REG_ENC_CTRL / 4];
+    const uint32_t img = s->regs[H1_REG_IN_IMG_CTRL / 4];
+    const int mbw = H1_ENC_WIDTH_MB(ctrl), mbh = H1_ENC_HEIGHT_MB(ctrl);
+    const int stride = H1_IN_ROW_LEN(img) ? H1_IN_ROW_LEN(img) : mbw * 16;
+    const bool idr = ctrl & H1_ENC_PIC_INTRA;
+    const hwaddr out = s->regs[H1_REG_ADDR_OUTPUT_STREAM / 4];
+    const uint32_t cap = s->regs[H1_REG_STR_BUF_LIMIT / 4];
+    const int rem_bits = H1_RLC_STR_OFFS(s->regs[H1_REG_RLC_CTRL / 4]);
+    const uint64_t rem = ((uint64_t)s->regs[H1_REG_STR_HDR_REM_MSB / 4] << 32) |
+                         s->regs[H1_REG_STR_HDR_REM_LSB / 4];
+    uint8_t rem_bytes[8];
+    uint8_t hdr[512 + 8];
+    size_t hdr_at = 512;                /* the headers' start in hdr, if any */
+    int i, nrem = rem_bits / 8;
+
+    if (!mbw || !mbh || H1_IN_FMT(img) != 1) {
+        qemu_log_mask(LOG_UNIMP, "xm-h1: H.264 %dx%d MB, input format %d\n",
+                      mbw, mbh, H1_IN_FMT(img));
+        return;
+    }
+    if (rem_bits % 8) {
+        qemu_log_mask(LOG_UNIMP, "xm-h1: %d header bits, not whole bytes\n",
+                      rem_bits);
+    }
+    for (i = 0; i < nrem; i++) {
+        rem_bytes[i] = rem >> (56 - 8 * i);
+    }
+    if (idr) {
+        /* the SPS/PPS the library wrote, completed by the remainder */
+        dma_memory_read(&address_space_memory, out - 512, hdr, 512,
+                        MEMTXATTRS_UNSPECIFIED);
+        memcpy(hdr + 512, rem_bytes, nrem);
+        h264_enc_parse_headers(&s->h264, hdr, 512 + nrem);
+        /* the last SPS's start code: the dump of an IDR job carries the
+         * headers it was coded against, so the files concatenate into a
+         * stream any decoder plays even when rate control rewrites the PPS */
+        for (i = 512 - 5; i >= 0; i--) {
+            if (!hdr[i] && !hdr[i + 1] && hdr[i + 2] == 1 &&
+                (hdr[i + 3] & 0x1f) == 7) {
+                hdr_at = i > 0 && !hdr[i - 1] ? i - 1 : i;
+                break;
+            }
+        }
+    }
+
+    g_autofree uint8_t *y = g_malloc((size_t)stride * mbh * 16);
+    g_autofree uint8_t *uv = g_malloc((size_t)stride * mbh * 8);
+    dma_memory_read(&address_space_memory, s->regs[H1_REG_ADDR_IN_PLANE_0 / 4],
+                    y, (size_t)stride * mbh * 16, MEMTXATTRS_UNSPECIFIED);
+    dma_memory_read(&address_space_memory, s->regs[H1_REG_ADDR_IN_PLANE_1 / 4],
+                    uv, (size_t)stride * mbh * 8, MEMTXATTRS_UNSPECIFIED);
+
+    g_autofree uint8_t *buf = g_malloc(MAX(cap, 16));
+    memcpy(buf, rem_bytes, MIN(nrem, (int)cap));
+    size_t n = h264_enc_frame(&s->h264, idr,
+                              H1_CTRL0_INIT_QP(s->regs[H1_REG_ENC_CTRL0 / 4]),
+                              mbw, mbh, y, stride, uv, stride,
+                              buf + nrem, cap > (uint32_t)nrem ? cap - nrem : 0);
+    if (!n) {
+        qemu_log_mask(LOG_UNIMP, "xm-h1: no SPS/PPS this encoder handles "
+                      "(CABAC, POC type 0/2, progressive) before the stream\n");
+    }
+    n += nrem;
+    if (n > cap) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-h1: H.264 output over the %u-byte "
+                      "buffer, truncated\n", cap);
+        n = cap;
+    }
+    dma_memory_write(&address_space_memory, out, buf, n,
+                     MEMTXATTRS_UNSPECIFIED);
+    if (s->dump_dir) {
+        g_autofree uint8_t *file = g_malloc(512 - hdr_at + n);
+        memcpy(file, hdr + hdr_at, 512 - hdr_at);
+        memcpy(file + 512 - hdr_at, buf, n);
+        xm_h1_dump(s, "h264", file, 512 - hdr_at + n);
+    }
+    s->regs[H1_REG_STR_BUF_LIMIT / 4] = n * 8;
+}
+
 static void xm_h1_update_irq(XmH1State *s)
 {
     const uint32_t v = s->regs[H1_REG_INTERRUPT / 4];
@@ -497,15 +595,8 @@ static void xm_h1_start(XmH1State *s)
     }
     if (H1_ENC_MODE(ctrl) == H1_ENC_MODE_JPEG) {
         xm_h1_jpeg(s);
-    } else if (s->dump_dir) {
-        /* What software put in the stream buffer ahead of the H1's output
-         * (SPS/PPS on an IDR frame), up to the output pointer. */
-        const hwaddr out = s->regs[H1_REG_ADDR_OUTPUT_STREAM / 4];
-        uint8_t pre[256];
-        dma_memory_read(&address_space_memory, out - sizeof(pre), pre,
-                        sizeof(pre), MEMTXATTRS_UNSPECIFIED);
-        xm_h1_dump(s, "pre", pre, sizeof(pre));
-        qemu_log_mask(LOG_UNIMP, "xm-h1: encode mode %u\n", H1_ENC_MODE(ctrl));
+    } else if (H1_ENC_MODE(ctrl) == H1_ENC_MODE_H264) {
+        xm_h1_h264(s);
     } else {
         qemu_log_mask(LOG_UNIMP, "xm-h1: encode mode %u\n", H1_ENC_MODE(ctrl));
     }
