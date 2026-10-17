@@ -51,8 +51,13 @@
  * With "wps" set the part powers up as Xiongmai bootloaders leave it:
  * SR3.WPS on, so protection comes from per-block lock bits, all locked at
  * power-up, and erases and programs are dropped as on silicon. 0x98 (v2 OP1
- * without an address) unlocks every block, and clearing WPS returns the part
- * to BP protection, which is what the OpenIPC U-Boot does at probe.
+ * without an address) unlocks every block, and clearing WPS ends the
+ * per-block mode, which is what the OpenIPC U-Boot does at probe.
+ *
+ * Two limits: the BP bits in SR1 are stored but never enforced, so with WPS
+ * clear nothing is protected; and SR3 survives a machine reset but not a
+ * QEMU restart -- flash-file holds the array only, and "wps" sets the
+ * power-up state of every run.
  */
 
 #include "qemu/osdep.h"
