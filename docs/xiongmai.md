@@ -277,6 +277,9 @@ plane within 45 dB of the 4×4-averaged source.
   errors, IDRs every 25 frames.
 - RTSP and HTTP stay 401 until the camera is claimed; the dump is how
   the stream is checked without one.
+- CI runs it on every change: `qemu-boot/test-xm530-stream.sh` boots the
+  release from flash, lets majestic start on its own, and requires 60
+  dumped jobs that ffmpeg decodes frame for frame, with at least two IDRs.
 - H.265 on the Mali VE stays out of scope.
 
 ## Model notes

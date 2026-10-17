@@ -570,6 +570,7 @@ jobs:
             flash_mb: 8
             cmdline_prefix: "mem=32M"
             flash_tests: true
+            stream_test: true
 
           # XM550 is the XM530 die with 128 MB; OpenIPC ships it the xm530
           # image, so this boots that bundle on the 128 MB machine.
@@ -777,6 +778,20 @@ jobs:
             --flash-mb "${{ matrix.flash_mb || 16 }}" \
             --cmdline-prefix "${{ matrix.cmdline_prefix || '' }}" \
             --timeout 240
+
+      # majestic, left to start on its own, must reach the H1 and produce
+      # H.264 ffmpeg decodes: VI, the ISP's frame interrupts and the
+      # encoder model together.  Judged from the dumped jobs, since the
+      # camera stays unclaimed.
+      - name: "majestic H.264 end to end"
+        if: matrix.stream_test
+        timeout-minutes: 6
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          bash qemu-boot/test-xm530-stream.sh \
+            --machine "${{ matrix.machine }}" \
+            --qemu ./qemu-src/build/qemu-system-arm \
+            --output-dir "$RUNNER_TEMP/stream-${{ matrix.soc }}"
 
       - name: "Flash-level firmware tests: dependencies"
         if: matrix.flash_tests
