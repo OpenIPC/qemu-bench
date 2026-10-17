@@ -42,6 +42,10 @@ static void hisi_imx335_reset_regs(HisiIMX335State *s)
     s->regs[0x316A - IMX335_REG_BASE] = 0x7C;  /* IMX335 detect: (v&0xFC)==0x7C */
     s->regs[0x3078 - IMX335_REG_BASE] = 0x01;  /* hint check */
     s->regs[0x341C - IMX335_REG_BASE] = 0x00;  /* not 0x47 (IMX334) */
+    /* BLKLEVEL, power-on 0x032.  Xiongmai's libsns_X50 sensor_get_chip()
+     * tells an IMX335 at 0x1A by reading 0x3302 == 0x32. */
+    s->regs[0x3302 - IMX335_REG_BASE] = 0x32;
+    s->regs[0x3303 - IMX335_REG_BASE] = 0x00;
 }
 
 static int hisi_imx335_event(I2CSlave *i2c, enum i2c_event event)

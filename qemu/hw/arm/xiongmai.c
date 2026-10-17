@@ -23,6 +23,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
 #include "hw/irq.h"
+#include "hw/i2c/i2c.h"
 #include "hw/sysbus.h"
 #include "qobject/qlist.h"
 #include "target/arm/arm-powerctl.h"
@@ -154,6 +155,14 @@ static const XmSoCConfig xm530_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x50000000, 0x50100000 },
     .sdhci_irqs         = { 41, 42 },
+    /* xm_i2c.ko's bus 0, with a Sony IMX335 at 0x1A (ipctool probes 0x34
+     * >> 1) -- the sensor of the lab XM550 and OpenIPC's X50 profile. */
+    .i2c_base           = 0x10000000,
+    .sensor_type        = "hisi-imx335",
+    .sensor_addr        = 0x1A,
+    /* hx280enc's module defaults: base_port=0x20070000 irq=77 (SPI 45). */
+    .h1_base            = 0x20070000,
+    .h1_irq             = 45,
     .wdt_base           = 0x20060000,
     /* xm_wdt.ko: 46875 * t / 2, so 12 MHz / 256.  Unfed, it resets the
      * camera 60 s after insmod (the default timeout), as in the lab. */
@@ -168,7 +177,7 @@ static const XmSoCConfig xm530_soc = {
     .num_regbanks       = 6,
     .regbanks           = {
         { "xm-gpio",     0x10020000, 0x10000 },
-        { "xm-i2c",      0x10000000, 0x10000 },
+        { "xm-i2c1",     0x10001000, 0x0F000 },  /* xm_i2c1, unmodelled */
         { "xm-dma",      0x20020000, 0x10000 },  /* DMAC_BASE */
         { "xm-rtc",      0x100A0000, 0x10000 },
         { "xm-i2s",      0x10060000, 0x10000 },
@@ -493,6 +502,19 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             qdev_realize_and_unref(card, qdev_get_child_bus(sd, "sd-bus"),
                                    &error_fatal);
         }
+    }
+
+    if (c->i2c_base) {
+        DeviceState *i2c = sysbus_create_simple("xm-i2c", c->i2c_base, NULL);
+
+        if (c->sensor_type) {
+            i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c, "i2c")),
+                                    c->sensor_type, c->sensor_addr);
+        }
+    }
+
+    if (c->h1_base) {
+        sysbus_create_simple("xm-h1", c->h1_base, pic[c->h1_irq]);
     }
 
     if (c->wdt_base) {

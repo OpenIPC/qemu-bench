@@ -158,6 +158,54 @@ source:
      which is how U-Boot sets QE. Treated as a page program, it had been
      ANDing two bytes into flash offset 0.
 
+## XM530 media pipeline (in progress)
+
+What majestic's vendor SDK talks to on XM530. Everything here was read from
+the vendor modules and the MPI statically linked into majestic.
+
+| Block | Where | Model |
+|---|---|---|
+| I2C (`xm_i2c.ko`) | 0x10000000 | `xm-i2c`, a byte FIFO in front of the bus |
+| Sensor | I2C 0x1A | `hisi-imx335` |
+| Hantro H1 (`xm530_h264.ko`, hx280enc) | 0x20070000, SPI 45 | `xm-h1`, ID and synthesis config only |
+| Mali-V500/V550 (`mve_base`/`mve_rsrc`) | 0x21000000 | none (H.265: out of scope) |
+
+**I2C (`xm-i2c`).** The controller has these registers:
+
+| Offset | Name | Use |
+|---|---|---|
+| +0x00 | CTRL | 0x0B starts a write, 0x803 starts a read; bit 6 / bit 7 pulse TX / RX FIFO resets |
+| +0x0C | ADDR | 7-bit slave address |
+| +0x10 / +0x14 | TX / RX data | one byte per access |
+| +0x18 / +0x1C | WCNT / RCNT | byte counts |
+| +0x44 | CLR | write-1-to-clear for ST |
+| +0x48 | ST | bit 4 write done, bit 5 read done |
+
+The start bits clear when a transfer ends. The driver pulses the FIFO
+resets as `old | bit` then `old`, so a start command left in CTRL would
+launch another transfer.
+
+**Sensor.** `libsns_X50`'s `sensor_get_chip()` tells an IMX335 by reading
+0x3302 == 0x32. That is the BLKLEVEL power-on default, which
+`hisi-imx335` now has.
+
+**H.264 and JPEG run on the H1, through Hantro's own `H264Enc` and
+`JpegEnc`.** Both are linked into majestic and drive the H1 via EWL and
+`/dev/h264`. Only H.265 uses the Mali VE (`/dev/mv500`).
+
+For `XM_MPI_VENC_CreateChn` to succeed on the H1, two registers matter:
+- swreg0 must carry an H1 product ID (0x8290);
+- swreg63 (+0xFC) must advertise the codecs, H.264 and JPEG bits and the
+  max width. With it 0, every channel failed `XM_ERR_VENC_NOT_CONFIG`.
+
+**Status:**
+- majestic configures the sensor, VI channels 0 and 1, and VENC chn 1
+  (H.264 704×576).
+- `/proc/umap/venc` shows chn 1 created, asking for frames (`GetFrErr`
+  climbing).
+- Still missing: VI frame delivery, the JPEG channel, and the H1 actually
+  encoding.
+
 ## Model notes
 
 - **xm-dwmac RX start:** receive DMA starts 1 ms (virtual time) after the

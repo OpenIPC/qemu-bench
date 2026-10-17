@@ -105,6 +105,16 @@ typedef struct XmSoCConfig {
     hwaddr      sdhci_bases[XM_MAX_SDHCI];
     int         sdhci_irqs[XM_MAX_SDHCI];
 
+    /* XM I2C controller (xm-i2c) and the sensor on it: a qdev type of an
+     * I2C slave (the hisi-* sensor models) at a 7-bit address. */
+    hwaddr      i2c_base;
+    const char *sensor_type;
+    uint8_t     sensor_addr;
+
+    /* Hantro H1 encoder (xm-h1), XM530: hx280enc base_port / irq. */
+    hwaddr      h1_base;
+    int         h1_irq;
+
     /* SP805 watchdog (xm_wdt.ko unlocks it with 0x1ACCE551 at +0xC00). */
     hwaddr      wdt_base;
     uint32_t    wdt_freq;
