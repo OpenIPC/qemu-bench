@@ -167,7 +167,8 @@ the vendor modules and the MPI statically linked into majestic.
 |---|---|---|
 | I2C (`xm_i2c.ko`) | 0x10000000 | `xm-i2c`, a byte FIFO in front of the bus |
 | Sensor | I2C 0x1A | `hisi-imx335` |
-| Hantro H1 (`xm530_h264.ko`, hx280enc) | 0x20070000, SPI 45 | `xm-h1`, ID and synthesis config only |
+| VI (`xm530_vi.ko`) | 0x30000000, SPI 33–36 | `xm-vi`, test-pattern frames |
+| Hantro H1 (`xm530_h264.ko`, hx280enc) | 0x20070000, SPI 45 | `xm-h1`: JPEG encodes; H.264 not yet |
 | Mali-V500/V550 (`mve_base`/`mve_rsrc`) | 0x21000000 | none (H.265: out of scope) |
 
 **I2C (`xm-i2c`).** The controller has these registers:
@@ -198,13 +199,56 @@ For `XM_MPI_VENC_CreateChn` to succeed on the H1, two registers matter:
 - swreg63 (+0xFC) must advertise the codecs, H.264 and JPEG bits and the
   max width. With it 0, every channel failed `XM_ERR_VENC_NOT_CONFIG`.
 
+**H1 JPEG (`xm-h1`).** The encoder follows the open-source H1 driver in
+mainline Linux (`drivers/media/platform/verisilicon`: `hantro_h1_regs.h`,
+`hantro_h1_jpeg_enc.c`, `hantro_jpeg.c`), not vendor code:
+- `ENC_CTRL` with EN and JPEG mode starts a job: baseline, 4:2:0, the
+  Annex K Huffman tables, quantisers from `JPEG_LUMA/CHROMA_QUAT` in
+  `hw_reorder` order;
+- the scan and EOI go to `ADDR_OUTPUT_STREAM`;
+- `STR_BUF_LIMIT` returns the bit count, and `INTERRUPT` gets
+  `FRAME_RDY | IRQ`.
+
+`qemu/tests/test-xm-h1-jpeg.py` drives it over qtest with that driver's
+register sequence. The output must decode and match libjpeg's own encode
+of the frame.
+
+swreg63 puts JPEG at bit 25 (VS 24, VP8 26, H.264 27), as Hantro's EWL
+reads it. With JPEG at 26, majestic's JPEG channel failed
+`XM_ERR_VENC_NOT_CONFIG`.
+
+`-global xm-h1.dump-dir=DIR` keeps every job:
+- JPEG jobs as complete `.jpg` files, the model writing the header the
+  driver would;
+- other jobs as the bytes written, with what software put ahead of them
+  (`.pre`);
+- each job's registers as `.regs`.
+
+**VI (`xm-vi`).** Learnt from the driver's register writes. For channel `c`,
+in window `W = 0x84000 + c*0x1000`:
+- `W+0x40/0x44` and `W+0xC0/0xC4` are buffer 0/1 luma and chroma, stored
+  as `(addr - 0x80000000) >> 3`, NV12;
+- `W+0x20/0x28` is the stride ÷ 8, `W+0x24` the width, `W+0x34` the
+  enable;
+- `0xF0080 + c*0x20` is the interrupt enable, `+4` the height + 1, and
+  `+0xC` the status, cleared by writing 0;
+- `W+0x08` holds one done bit per buffer.
+
+Enabled channels get a moving test pattern at `fps` (default 10).
+
+**H.264 on XM needs CABAC.** majestic's XM backend asks for Main profile.
+The Hantro library writes an SPS with profile 77 and a PPS with
+`entropy_coding_mode_flag = 1` ahead of the H1's output, which the model
+can read from guest memory.
+
 **Status:**
-- majestic configures the sensor, VI channels 0 and 1, and VENC chn 1
-  (H.264 704×576).
-- `/proc/umap/venc` shows chn 1 created, asking for frames (`GetFrErr`
-  climbing).
-- Still missing: VI frame delivery, the JPEG channel, and the H1 actually
-  encoding.
+- majestic configures the sensor and VI, and creates VENC chn 1 (H.264
+  704×576) and chn 2 (JPEG).
+- VI delivers frames: `RecvCnt`/`SendCnt` climb, and VENC chn 1 starts
+  with `SucCnt` > 0.
+- H.264 jobs aren't encoded yet, so frames back up after a few.
+- Next: H.264 (CABAC, I slices).
+- H.265 on the Mali VE stays out of scope.
 
 ## Model notes
 

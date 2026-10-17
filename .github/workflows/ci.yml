@@ -18,7 +18,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential ninja-build meson pkg-config \
             libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libslirp-dev \
-            python3 python3-venv git gcc-arm-linux-gnueabi libc6-dev-armel-cross
+            python3 python3-venv git gcc-arm-linux-gnueabi libc6-dev-armel-cross \
+            python3-pil
 
       - name: Build QEMU
         run: bash qemu/setup.sh
@@ -52,6 +53,12 @@ jobs:
 
       - name: V1 DDR needs the reg_info table (hisi-ddrc-v1, flash boot)
         run: bash qemu/tests/test-hisi-v1-ddr-init.sh
+
+      # The Hantro H1 driven over qtest the way mainline Linux's
+      # hantro_h1_jpeg_enc.c drives it; the JPEG must decode and match
+      # libjpeg's encode of the same frame.
+      - name: Hantro H1 JPEG encode (xm-h1)
+        run: python3 qemu/tests/test-xm-h1-jpeg.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
