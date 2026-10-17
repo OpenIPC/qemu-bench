@@ -39,6 +39,8 @@ cp qemu/include/hw/arm/xiongmai.h   "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/xm-sfc.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-ddrc.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-h1.c             "$QEMU_DIR/hw/misc/"
+cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
@@ -164,6 +166,8 @@ config XIONGMAI
     select CMSDK_APB_WATCHDOG
     select HISI_MISC
     select SDHCI
+    select I2C
+    select HISI_I2C
 KCONFIG
     echo "  hw/arm/Kconfig: added XIONGMAI"
 fi
@@ -181,6 +185,16 @@ if ! grep -q xm-ddrc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-ddrc.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-ddrc.c"
+fi
+if ! grep -q xm-h1 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-h1.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-h1.c"
+fi
+if ! grep -q xm-i2c "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-i2c.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added xm-i2c.c"
 fi
 if ! grep -q xm-dwmac "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-dwmac.c'))" \
