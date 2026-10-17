@@ -141,12 +141,12 @@ static const XmSoCConfig xm530_soc = {
     .sfc_window         = 0x60000000,           /* XMSF_BASE_ADDR */
     .sfc_version        = 2,
     /*
-     * The XM550 U-Boot 2014.04 ("Mar 15 2019") is linked at 0x08000000.
-     * Before relocation it runs from the boot alias at 0 but walks
-     * init_sequence through its link address (0x08022cbc), and its board
-     * code and table entries are 0x0800xxxx: on silicon the flash answers
-     * there too.  Without it the walk reads 0, every init step is skipped
-     * -- dram_init included -- and U-Boot relocates below 0x80000000.
+     * The XM550 U-Boot 2014.04 ("Mar 15 2019") is linked at 0x08000000, and
+     * a flash boot starts CPU0 at this alias (xm_flash_boot_reset): before
+     * it relocates, U-Boot runs here and reads init_sequence (0x08022cbc)
+     * and its board tables through it.  Without the alias that walk reads
+     * 0, every init step is skipped -- dram_init included -- and U-Boot
+     * relocates below 0x80000000.
      */
     .sfc_text_alias     = 0x08000000,
     .mac_base           = 0x10010000,           /* GMAC_BASE */
