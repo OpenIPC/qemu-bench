@@ -79,15 +79,28 @@ static const XmSoCConfig xm510_soc = {
     .ddrc_base          = 0x100B0000,           /* from U-Boot, see xm-ddrc */
     .num_ddrc_done      = 2,
     .ddrc_done          = { 0x0048, 0x1038 },
-    .num_regbanks       = 7,
+    .num_regbanks       = 4,
+    /* The XM530 I2C controller; XM510 boards carry an SOI JX-H62, which
+     * ipcinfo and the vendor libsns find at 0x30. */
+    .i2c_base           = 0x10000000,
+    .sensor_type        = "hisi-jxh62",
+    .sensor_addr        = 0x30,
+    /* xm510_vi.ko and the ISP share 0x40000000: vi_back_v is IRQ 18, and
+     * vi_front_v with isp_irq IRQ 16. */
+    .vi_base            = 0x40000000,
+    .vi_layout          = "xm510",
+    .vi_irq             = 18,
+    .vi_irqs            = 1,
+    .isp_irq            = 16,
+    .isp_irqs           = 1,
+    /* hx280enc on XM510: base_port=0x20070000 irq=26. */
+    .h1_base            = 0x20070000,
+    .h1_irq             = 26,
     .regbanks           = {
         { "xm-gpio",     0x10020000, 0x10000 },  /* GPIO + pin mux */
-        { "xm-i2c",      0x10000000, 0x10000 },
         { "xm-dma",      0x20020000, 0x10000 },  /* PL330, until modelled */
-        { "xm-h264",     0x20070000, 0x10000 },  /* Hantro H1 */
         { "xm-rtc",      0x100A0000, 0x10000 },
         { "xm-i2s",      0x10060000, 0x10000 },
-        { "xm-isp",      0x40000000, 0x100000 }, /* ISP / VI */
     },
 };
 
@@ -162,8 +175,11 @@ static const XmSoCConfig xm530_soc = {
     .sensor_addr        = 0x1A,
     /* xm530_vi.ko: ioremap(0x30000000, 1 MiB), IRQ 65..68 for chn 0..3. */
     .vi_base            = 0x30000000,
+    .vi_layout          = "xm530",
     .vi_irq             = 33,
+    .vi_irqs            = 4,
     .isp_irq            = 25,
+    .isp_irqs           = 2,
     /* hx280enc's module defaults: base_port=0x20070000 irq=77 (SPI 45). */
     .h1_base            = 0x20070000,
     .h1_irq             = 45,
@@ -518,12 +534,15 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     }
 
     if (c->vi_base) {
-        DeviceState *vi = sysbus_create_simple("xm-vi", c->vi_base, NULL);
+        DeviceState *vi = qdev_new("xm-vi");
 
-        for (n = 0; n < 4; n++) {
+        qdev_prop_set_string(vi, "soc", c->vi_layout);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vi), 0, c->vi_base);
+        for (n = 0; n < c->vi_irqs; n++) {
             sysbus_connect_irq(SYS_BUS_DEVICE(vi), n, pic[c->vi_irq + n]);
         }
-        for (n = 0; n < 2; n++) {
+        for (n = 0; n < c->isp_irqs; n++) {
             sysbus_connect_irq(SYS_BUS_DEVICE(vi), 4 + n, pic[c->isp_irq + n]);
         }
     }

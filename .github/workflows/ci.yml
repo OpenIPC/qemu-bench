@@ -532,21 +532,31 @@ jobs:
           # uboot_bin -- OpenIPC publishes no XM U-Boot.  flash_rw runs the
           # xmsfc erase/program path on an 8 MiB NOR, the only size the
           # XM510 kernel's chip table knows.
+          # mem= first, as U-Boot passes it: load_xiongmai sizes MMZ from the
+          # first argument, and without it lays MMZ over the whole kernel.
+          # Since the media blocks are modelled, VI and the H1 really write
+          # those buffers, and the guest dies or corrupts its overlay.
+          # mem=20M rather than the board's 18M: the -initrd boot needs it
+          # (QEMU loads the initrd at 16 MiB, half of RAM), and at 18M
+          # `sysupgrade --archive` refuses on silicon too, with no room in
+          # /tmp to unpack it.  test-xm-stream.sh runs the board's 18M.
           - name: xm510
             soc: xm510
             machine: xm510
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+            append: "mem=20M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
             ping_linux: true
             flash_rw: true
             flash_rw_mem: 32M
             mtd_name: xm_sfc
             flash_mb: 8
+            cmdline_prefix: "mem=20M"
             # sysupgrade, firstboot and the firmware#2613 overlay case, on the
             # 32 MB board where sysupgrade's RAM phase is tightest.
             flash_tests: true
             overlay_keep: true
             # Last xm510 kernel without jffs2 xattrs (before firmware#2606).
             overlay_keep_kernel: nightly-20261015-1d9c834
+            stream_test: true
 
           # Xiongmai XM530 (hw/arm/xiongmai.c): dual Cortex-A5 MPCore (A9
           # stand-in, GIC, TWD, PL310), xmsfc v2, DWMAC at 0x10010000.  CPU1
@@ -788,8 +798,8 @@ jobs:
         timeout-minutes: 6
         run: |
           sudo apt-get install -y --no-install-recommends ffmpeg
-          bash qemu-boot/test-xm530-stream.sh \
-            --machine "${{ matrix.machine }}" \
+          bash qemu-boot/test-xm-stream.sh \
+            --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
             --qemu ./qemu-src/build/qemu-system-arm \
             --output-dir "$RUNNER_TEMP/stream-${{ matrix.soc }}"
 

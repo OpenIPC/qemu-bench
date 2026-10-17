@@ -1,9 +1,10 @@
 #!/bin/bash
 #
-# majestic's H.264 on the emulated XM530, end to end.
+# majestic's H.264 on an emulated Xiongmai camera, end to end.
 #
 # Boots the release kernel and rootfs from a synthetic NOR the way the flash
-# tests do (mem= first, as OpenIPC's U-Boot passes it), leaves majestic to
+# tests do (mem= first, as OpenIPC's U-Boot passes it; it is what sizes MMZ
+# and the VI buffer count in load_xiongmai), leaves majestic to
 # start on its own, and has the H1 model keep every job it encodes
 # (-global xm-h1.dump-dir).  No login, no claim: RTSP and HTTP stay 401 on an
 # unclaimed camera, so the stream is judged from the encoder's side.  The
@@ -16,26 +17,41 @@
 #      one, so the headers majestic rewrites per GOP are followed
 #   4. the pictures are live: xm-vi stamps its frame number into the top
 #      left as 16 binary blocks, and it must rise from frame to frame, so
-#      an encoder fed a stale buffer fails
+#      an encoder fed a stale buffer fails.  --settle frames at the start
+#      are exempt: XM510's VI driver hands out a frame it queued before
+#      VENC started after the first two new ones.
+#
+# --soc picks the release, the board's mem= and RAM, the CPUs, majestic's
+# main-channel size and the settle count; the other options override it.
+#
+#   xm530  xm530 release, mem=32M of 64M, 2 CPUs, 704x576 (H.265 main
+#          channel unavailable, so H.264 is the D1 feeder)
+#   xm510  xm510 release, mem=18M of 32M as U-Boot passes it (three VI
+#          buffers), 1 CPU, 1280x720
 #
 # Usage:
-#   test-xm530-stream.sh --qemu ./qemu-src/build/qemu-system-arm \
-#       --output-dir <dir> [--machine xm530] [--kernel <uImage>] \
-#       [--rootfs <squashfs>] [--frames 60] [--size 704x576] [--timeout 240]
+#   test-xm-stream.sh --soc xm530|xm510 --output-dir <dir> \
+#       [--qemu PATH] [--machine M] [--kernel <uImage>] [--rootfs <squashfs>] \
+#       [--frames 60] [--size WxH] [--settle N] [--kernel-mem 18M] \
+#       [--timeout 240]
 #
 set -u
 
-MACHINE=xm530
+SOC=xm530
+MACHINE=""
 QEMU="./qemu-src/build/qemu-system-arm"
 OUTDIR="."
-KERNEL="qemu-boot/uImage.xm530"
-ROOTFS="qemu-boot/rootfs.squashfs.xm530"
+KERNEL=""
+ROOTFS=""
 FRAMES=60
-SIZE=704x576
+SIZE=""
+SETTLE=""
+KMEM=""
 TIMEOUT=240
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --soc)        SOC="$2"; shift 2 ;;
         --machine)    MACHINE="$2"; shift 2 ;;
         --qemu)       QEMU="$2"; shift 2 ;;
         --output-dir) OUTDIR="$2"; shift 2 ;;
@@ -43,10 +59,20 @@ while [ $# -gt 0 ]; do
         --rootfs)     ROOTFS="$2"; shift 2 ;;
         --frames)     FRAMES="$2"; shift 2 ;;
         --size)       SIZE="$2"; shift 2 ;;
+        --settle)     SETTLE="$2"; shift 2 ;;
+        --kernel-mem) KMEM="$2"; shift 2 ;;
         --timeout)    TIMEOUT="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+case "$SOC" in
+    xm530) P_MEM=32M; P_RAM=64M; P_SMP=2; P_SIZE=704x576;  P_SETTLE=0 ;;
+    xm510) P_MEM=18M; P_RAM=32M; P_SMP=1; P_SIZE=1280x720; P_SETTLE=3 ;;
+    *) echo "unknown --soc $SOC" >&2; exit 2 ;;
+esac
+: "${MACHINE:=$SOC}" "${SIZE:=$P_SIZE}" "${SETTLE:=$P_SETTLE}" "${KMEM:=$P_MEM}"
+: "${KERNEL:=qemu-boot/uImage.$SOC}" "${ROOTFS:=qemu-boot/rootfs.squashfs.$SOC}"
 
 command -v ffmpeg >/dev/null || { echo "=== FAIL: needs ffmpeg ==="; exit 1; }
 for f in "$KERNEL" "$ROOTFS"; do
@@ -62,11 +88,11 @@ FLASH="$OUTDIR/flash.bin"
 head -c $((8 * 1024 * 1024)) /dev/zero | tr '\000' '\377' > "$FLASH"
 dd if="$ROOTFS" of="$FLASH" bs=1k seek=$((BOOT_KB + ENV_KB + KERN_KB)) conv=notrunc 2>/dev/null
 MTDPARTS="xm_sfc:${BOOT_KB}k(boot),${ENV_KB}k(env),${KERN_KB}k(kernel),${ROOTFS_KB}k(rootfs),-(rootfs_data)"
-APPEND="mem=32M console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs init=/init mtdparts=${MTDPARTS}"
+APPEND="mem=$KMEM console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs init=/init mtdparts=${MTDPARTS}"
 
 CONSOLE="$OUTDIR/console.txt"; rm -f "$CONSOLE"
 echo "=== booting $MACHINE, waiting for $FRAMES H.264 jobs (<= ${TIMEOUT}s) ==="
-"$QEMU" -M "$MACHINE",flash-file="$FLASH" -smp 2 -m 64M -kernel "$KERNEL" \
+"$QEMU" -M "$MACHINE",flash-file="$FLASH" -smp "$P_SMP" -m "$P_RAM" -kernel "$KERNEL" \
     -global xm-h1.dump-dir="$DUMP" \
     -nographic -serial file:"$CONSOLE" -monitor none \
     -nic user,restrict=on -append "$APPEND" >/dev/null 2>"$OUTDIR/qemu.err" &
@@ -89,10 +115,11 @@ fi
 STREAM="$OUTDIR/stream.h264"
 find "$DUMP" -name '*.h264' | sort | xargs -r cat > "$STREAM"
 if [ "$jobs" -gt 0 ]; then
-    python3 - "$DUMP" "$STREAM" "$SIZE" <<'PY' || fail=1
+    python3 - "$DUMP" "$STREAM" "$SIZE" "$SETTLE" <<'PY' || fail=1
 import os, subprocess, sys
 
-dump, stream, size = sys.argv[1:]
+dump, stream, size, settle = sys.argv[1:]
+settle = int(settle)
 w, h = (int(v) for v in size.split('x'))
 fail = 0
 
@@ -149,10 +176,11 @@ for f in range(frames):
     for b in range(16):
         v = (v << 1) | (y[8 * w + b * 16 + 8] > 128)
     counts.append(v)
-rising = all(b > a for a, b in zip(counts, counts[1:]))
-check(frames > 1 and rising,
-      'the VI frame number rises through every picture (%s .. %s)' %
-      (counts[:3], counts[-3:]))
+live = counts[settle:]
+rising = all(b > a for a, b in zip(live, live[1:]))
+check(len(live) > 1 and rising,
+      'the VI frame number rises through every picture%s (%s .. %s)' %
+      (' after the first %d' % settle if settle else '', live[:3], live[-3:]))
 sys.exit(fail)
 PY
 fi
