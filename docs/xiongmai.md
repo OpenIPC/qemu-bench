@@ -167,7 +167,8 @@ the vendor modules and the MPI statically linked into majestic.
 |---|---|---|
 | I2C (`xm_i2c.ko`) | 0x10000000 | `xm-i2c`, a byte FIFO in front of the bus |
 | Sensor | I2C 0x1A | `hisi-imx335` |
-| Hantro H1 (`xm530_h264.ko`, hx280enc) | 0x20070000, SPI 45 | `xm-h1`, ID and synthesis config only |
+| VI (`xm530_vi.ko`) | 0x30000000, SPI 33–36; ISP SPI 25–26 | `xm-vi`, test-pattern frames and the ISP's frame interrupts |
+| Hantro H1 (`xm530_h264.ko`, hx280enc) | 0x20070000, SPI 45 | `xm-h1`: JPEG and H.264 (I slices, CABAC) |
 | Mali-V500/V550 (`mve_base`/`mve_rsrc`) | 0x21000000 | none (H.265: out of scope) |
 
 **I2C (`xm-i2c`).** The controller has these registers:
@@ -198,13 +199,85 @@ For `XM_MPI_VENC_CreateChn` to succeed on the H1, two registers matter:
 - swreg63 (+0xFC) must advertise the codecs, H.264 and JPEG bits and the
   max width. With it 0, every channel failed `XM_ERR_VENC_NOT_CONFIG`.
 
+**H1 JPEG (`xm-h1`).** The encoder follows the open-source H1 driver in
+mainline Linux (`drivers/media/platform/verisilicon`: `hantro_h1_regs.h`,
+`hantro_h1_jpeg_enc.c`, `hantro_jpeg.c`), not vendor code:
+- `ENC_CTRL` with EN and JPEG mode starts a job: baseline, 4:2:0, the
+  Annex K Huffman tables, quantisers from `JPEG_LUMA/CHROMA_QUAT` in
+  `hw_reorder` order;
+- the scan and EOI go to `ADDR_OUTPUT_STREAM`;
+- `STR_BUF_LIMIT` returns the bit count, and `INTERRUPT` gets
+  `FRAME_RDY | IRQ`.
+
+`qemu/tests/test-xm-h1-jpeg.py` drives it over qtest with that driver's
+register sequence. The output must decode and match libjpeg's own encode
+of the frame.
+
+swreg63 puts JPEG at bit 25 (VS 24, VP8 26, H.264 27), as Hantro's EWL
+reads it. With JPEG at 26, majestic's JPEG channel failed
+`XM_ERR_VENC_NOT_CONFIG`.
+
+`-global xm-h1.dump-dir=DIR` keeps every job:
+- JPEG jobs as complete `.jpg` files, the model writing the header the
+  driver would;
+- H.264 jobs as `.h264`, the bytes the H1 wrote, an IDR job with the
+  SPS/PPS the library put ahead of it, so `cat *.h264` plays;
+- each job's registers as `.regs`.
+
+**VI (`xm-vi`).** Learnt from the driver's register writes. For channel `c`,
+in window `W = 0x84000 + c*0x1000`:
+- `W+0x40/0x44` and `W+0xC0/0xC4` are buffer 0/1 luma and chroma, stored
+  as `(addr - 0x80000000) >> 3`, NV12;
+- `W+0x20/0x28` is the stride ÷ 8, `W+0x24` the width, `W+0x34` the
+  enable;
+- `0xF0080 + c*0x20` is the interrupt enable, `+4` the height + 1, and
+  `+0xC` the status, cleared by writing 0;
+- `W+0x08` holds one done bit per buffer.
+
+Enabled channels get a moving test pattern at `fps` (default 10).
+
+The ISP's two frame interrupts sit in the same grid below the channels:
+- `0xF0040`: `isp_irq_bayer`, SPI 25;
+- `0xF0060`: `isp_irq_lum`, SPI 26;
+- enable at +0, status at +0xC.
+
+They keep VI running. `XM_MPI_ISP_MemInit` stops every channel, and the
+ISP's per-frame handler is what starts them again. Without these lines,
+VI stopped after six frames.
+
+**H1 H.264 (`xm-h1`, `hantro-h264.c`).** Hantro's library writes the SPS and
+PPS in software, up to an 8-byte aligned `ADDR_OUTPUT_STREAM`, and leaves
+the H1 the bits that didn't fit: `STR_HDR_REM_MSB/LSB`, with
+`RLC_CTRL[28:23]` of them. The model:
+- emits those bits first;
+- parses the SPS/PPS back out of the stream buffer on every IDR. Rate
+  control rewrites the PPS's `pic_init_qp` between GOPs;
+- writes a slice that fits them: frame_num and POC widths, PPS id,
+  deblocking control, `slice_qp_delta` against the PPS's QP.
+
+Each picture is:
+- one I slice, an IDR when `ENC_CTRL` has the intra bit;
+- every macroblock I_16x16 with DC prediction;
+- only DC coefficients sent.
+
+So the frame comes back at 4×4-block resolution, with exact decoder-matching
+reconstruction. majestic's XM backend asks for Main profile, so the PPS is
+CABAC; the arithmetic coder and residual coding follow x264
+(GPL-2.0-or-later). CAVLC PPSs are not handled yet.
+
+`qemu/tests/test-xm-h1-h264.py` feeds it majestic's own SPS/PPS over qtest,
+with a QP change at the second IDR. ffmpeg must decode every frame, each
+plane within 45 dB of the 4×4-averaged source.
+
 **Status:**
-- majestic configures the sensor, VI channels 0 and 1, and VENC chn 1
-  (H.264 704×576).
-- `/proc/umap/venc` shows chn 1 created, asking for frames (`GetFrErr`
-  climbing).
-- Still missing: VI frame delivery, the JPEG channel, and the H1 actually
-  encoding.
+- majestic configures the sensor and VI, and creates VENC chn 1 (H.264
+  704×576) and chn 2 (JPEG).
+- VI, the ISP interrupts, and H1 H.264 run at the VI frame rate. A 55 s
+  run's dump plays as 498 Main-profile 704×576 frames with no decoder
+  errors, IDRs every 25 frames.
+- RTSP and HTTP stay 401 until the camera is claimed; the dump is how
+  the stream is checked without one.
+- H.265 on the Mali VE stays out of scope.
 
 ## Model notes
 

@@ -160,6 +160,10 @@ static const XmSoCConfig xm530_soc = {
     .i2c_base           = 0x10000000,
     .sensor_type        = "hisi-imx335",
     .sensor_addr        = 0x1A,
+    /* xm530_vi.ko: ioremap(0x30000000, 1 MiB), IRQ 65..68 for chn 0..3. */
+    .vi_base            = 0x30000000,
+    .vi_irq             = 33,
+    .isp_irq            = 25,
     /* hx280enc's module defaults: base_port=0x20070000 irq=77 (SPI 45). */
     .h1_base            = 0x20070000,
     .h1_irq             = 45,
@@ -510,6 +514,17 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         if (c->sensor_type) {
             i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c, "i2c")),
                                     c->sensor_type, c->sensor_addr);
+        }
+    }
+
+    if (c->vi_base) {
+        DeviceState *vi = sysbus_create_simple("xm-vi", c->vi_base, NULL);
+
+        for (n = 0; n < 4; n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(vi), n, pic[c->vi_irq + n]);
+        }
+        for (n = 0; n < 2; n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(vi), 4 + n, pic[c->isp_irq + n]);
         }
     }
 
