@@ -13,6 +13,13 @@
  *   +0x0048  POWSTAT  bit 0 power_up_done
  *   +0x1038           (PHY side) reads 1 once training is done
  *
+ * Those last two are XM510's; XM530's U-Boot spins on +0x00F4 and +0x00F8
+ * instead.  The words that read as done are a property, done-offsets.
+ * XM530's also programs PHY +0xA8 and waits for +0xB8 to read the same
+ * value back: a status word that echoes a request once it is applied.
+ * Such pairs are mirror-reads (status) / mirror-of (request), offsets from
+ * the block base.
+ *
  * Everything else is RAM-backed so the init's read-modify-writes survive.
  * DDR itself is plain RAM in QEMU, so there is nothing to train.
  *
@@ -24,6 +31,8 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "hw/qdev-properties.h"
+#include "qapi/error.h"
 #include "qom/object.h"
 
 #define TYPE_XM_DDRC "xm-ddrc"
@@ -34,23 +43,34 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmDdrcState, XM_DDRC)
 #define DDRC_STAT           0x0008
 #define DDRC_CMD            0x0040
 #define DDRC_CMD_BUSY       (1u << 31)
-#define DDRC_READY          0x0048
-#define DDRC_TRAIN_DONE     0x1038
 
 struct XmDdrcState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     uint32_t regs[XM_DDRC_SIZE / 4];
+    uint32_t num_done;
+    uint32_t *done;
+    uint32_t num_mirror, num_mirror_of;
+    uint32_t *mirror, *mirror_of;
 };
 
 static uint64_t xm_ddrc_read(void *opaque, hwaddr offset, unsigned size)
 {
     XmDdrcState *s = XM_DDRC(opaque);
 
+    uint32_t i;
+
+    for (i = 0; i < s->num_done; i++) {
+        if (offset == s->done[i]) {
+            return 1;
+        }
+    }
+    for (i = 0; i < s->num_mirror; i++) {
+        if (offset == s->mirror[i]) {
+            return s->regs[s->mirror_of[i] / 4];
+        }
+    }
     switch (offset) {
-    case DDRC_READY:
-    case DDRC_TRAIN_DONE:
-        return 1;
     case DDRC_CMD:
         return s->regs[offset / 4] & ~DDRC_CMD_BUSY;
     default:
@@ -97,9 +117,47 @@ static void xm_ddrc_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
 }
 
+static void xm_ddrc_realize(DeviceState *dev, Error **errp)
+{
+    XmDdrcState *s = XM_DDRC(dev);
+    uint32_t i;
+
+    for (i = 0; i < s->num_done; i++) {
+        if (s->done[i] >= XM_DDRC_SIZE || (s->done[i] & 3)) {
+            error_setg(errp, "xm-ddrc: bad done offset 0x%x", s->done[i]);
+            return;
+        }
+    }
+    if (s->num_mirror != s->num_mirror_of) {
+        error_setg(errp, "xm-ddrc: mirror-reads and mirror-of differ in length");
+        return;
+    }
+    for (i = 0; i < s->num_mirror; i++) {
+        if (s->mirror[i] >= XM_DDRC_SIZE || (s->mirror[i] & 3) ||
+            s->mirror_of[i] >= XM_DDRC_SIZE || (s->mirror_of[i] & 3)) {
+            error_setg(errp, "xm-ddrc: bad mirror pair 0x%x/0x%x",
+                       s->mirror[i], s->mirror_of[i]);
+            return;
+        }
+    }
+}
+
+static const Property xm_ddrc_props[] = {
+    DEFINE_PROP_ARRAY("done-offsets", XmDdrcState, num_done, done,
+                      qdev_prop_uint32, uint32_t),
+    DEFINE_PROP_ARRAY("mirror-reads", XmDdrcState, num_mirror, mirror,
+                      qdev_prop_uint32, uint32_t),
+    DEFINE_PROP_ARRAY("mirror-of", XmDdrcState, num_mirror_of, mirror_of,
+                      qdev_prop_uint32, uint32_t),
+};
+
 static void xm_ddrc_class_init(ObjectClass *klass, const void *data)
 {
-    device_class_set_legacy_reset(DEVICE_CLASS(klass), xm_ddrc_reset);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    device_class_set_legacy_reset(dc, xm_ddrc_reset);
+    device_class_set_props(dc, xm_ddrc_props);
+    dc->realize = xm_ddrc_realize;
 }
 
 static const TypeInfo xm_ddrc_info = {

@@ -136,8 +136,27 @@ source:
 - **#2613 does not apply on XM530:** its kernel has jffs2 xattr support, so
   it mounts an xattr overlay. `test-overlay-keep.sh` runs on XM510, whose
   kernel lacks it.
-- **XM550 dump:** booting a full XM550 flash image gets through U-Boot's PLL
-  setup but not further yet.
+- **XM550 flash boot:** `-M xm550,flash-file=dump.bin -smp 2` runs a camera's
+  own U-Boot 2014.04 ("Mar 15 2019") through to `login:`. The dump tested
+  carries an OpenIPC 3.10.103 kernel and rootfs: U-Boot `sf read`s the
+  kernel, both CPUs come up, the root is mounted from flash, majestic starts,
+  and the jffs2 overlay is written as on a camera. Getting there took five
+  things, each read from that U-Boot:
+  1. **A flash alias at 0x08000000** (`sfc_text_alias`). U-Boot is linked
+     there, walks `init_sequence` through link addresses before relocating,
+     and returns into its relocated copy at `here + reloc_off`. That only
+     works if it already runs at its link address, so a flash boot starts
+     CPU0 at the alias. That points at a mask ROM jumping there; nothing
+     documents it.
+  2. **PLL lock** on bit 31 of SYS +0x08/+0x10/+0x18/+0x20.
+  3. **DDR polls:** uPCTL +0xF4/+0xF8 read 1, and PHY +0xB8 echoes +0xA8
+     (`done-offsets`, `mirror-reads`/`mirror-of` on `xm-ddrc`).
+  4. **xmsfc v2 data reads:** OP3 with a read opcode (0x6B) fills the 4 KiB
+     RAM buffer at the flash address modulo 4 KiB. U-Boot reads 16 × 256
+     bytes, then the whole buffer.
+  5. **Status writes:** OP4 with opcode 0x01 writes the status register,
+     which is how U-Boot sets QE. Treated as a page program, it had been
+     ANDing two bytes into flash offset 0.
 
 ## Model notes
 
