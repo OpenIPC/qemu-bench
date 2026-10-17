@@ -208,6 +208,25 @@ For `XM_MPI_VENC_CreateChn` to succeed on the H1, two registers matter:
 
 ## Model notes
 
+- **xmsfc status registers:** both versions keep SR1, SR2 and SR3.
+  - Reads: 0x05, 0x35 and 0x15 (OP3).
+  - Writes (OP4): 0x01 writes SR1, or SR1 and SR2 with two bytes; 0x31
+    writes SR2; 0x11 writes SR3. On v2 every other OP4 opcode is a page
+    program, so before this an SR3 write ANDed the data RAM into flash.
+  - SR3 is non-volatile: it survives a machine reset (not a QEMU restart).
+- **xmsfc per-block protection (`-global xm-sfc.wps=on`):** the part powers
+  up as Xiongmai bootloaders leave it, with SR3.WPS set.
+  - Protection then comes from per-block lock bits, all set at power-up, and
+    erases and programs are dropped with no error, as on silicon. With
+    `-d guest_errors` the log names each one.
+  - 0x98 (v2 OP1 with no address) unlocks every block until the next reset;
+    clearing WPS with 0x11 ends the per-block mode.
+  - Off by default, so existing images behave as before.
+  - Not modelled: the BP bits in SR1 are stored but never enforced, so once
+    WPS is clear nothing is protected. SR3 survives a machine reset but not a
+    QEMU restart: `flash-file` holds the array only, and `wps` sets the
+    power-up state of every run.
+
 - **xm-dwmac RX start:** receive DMA starts 1 ms (virtual time) after the
   driver sets DMA_CONTROL.SR.
   - The delay exists because the vendor `stmmac_open()` sets SR before
