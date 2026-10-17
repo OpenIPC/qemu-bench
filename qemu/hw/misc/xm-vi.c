@@ -41,6 +41,7 @@
 #include "qemu/timer.h"
 #include "hw/qdev-properties.h"
 #include "system/dma.h"
+#include "qapi/error.h"
 
 #define TYPE_XM_VI "xm-vi"
 OBJECT_DECLARE_SIMPLE_TYPE(XmViState, XM_VI)
@@ -69,12 +70,28 @@ struct XmViState {
 
 static bool xm_vi_enabled(XmViState *s, int c)
 {
-    return (R(s, XM_VI_WIN(c) + 0x34) & 1) && (R(s, XM_VI_INT(c)) & 1);
+    return R(s, XM_VI_WIN(c) + 0x34) & 1;
+}
+
+/* An interrupt block's line: status pending and the enable bit set, so a
+ * masked channel still captures and only the interrupt is held back. */
+static void xm_vi_update_irq(XmViState *s)
+{
+    int n;
+
+    for (n = 0; n < XM_VI_CHANNELS; n++) {
+        qemu_set_irq(s->irq[n], R(s, XM_VI_INT(n) + 0x0C) &&
+                                (R(s, XM_VI_INT(n)) & 1));
+    }
+    for (n = 0; n < XM_VI_ISP_LINES; n++) {
+        qemu_set_irq(s->isp_irq[n], R(s, XM_VI_ISP(n) + 0x0C) &&
+                                    (R(s, XM_VI_ISP(n)) & 1));
+    }
 }
 
 /* Moving SMPTE-ish bars, a frame counter in the top-left as binary
  * blocks, so a stuck or repeated frame shows. */
-static void xm_vi_pattern(XmViState *s, int c)
+static bool xm_vi_pattern(XmViState *s, int c)
 {
     static const uint8_t bars[8][3] = {           /* Y, Cb, Cr */
         { 235, 128, 128 }, { 210, 16, 146 }, { 170, 166, 16 },
@@ -93,9 +110,9 @@ static void xm_vi_pattern(XmViState *s, int c)
     int x, y;
 
     if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || ys < w || cs < w) {
-        return;
+        return false;
     }
-    line = g_malloc(MAX(ys, cs));
+    line = g_malloc(w);
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             const int bar = ((x + shift) % w) * 8 / w;
@@ -120,6 +137,7 @@ static void xm_vi_pattern(XmViState *s, int c)
                          w & ~1, MEMTXATTRS_UNSPECIFIED);
     }
     g_free(line);
+    return true;
 }
 
 static void xm_vi_tick(void *opaque)
@@ -130,21 +148,20 @@ static void xm_vi_tick(void *opaque)
     for (c = 0; c < XM_VI_ISP_LINES; c++) {
         if (R(s, XM_VI_ISP(c)) & 1) {
             R(s, XM_VI_ISP(c) + 0x0C) = 1;
-            qemu_irq_raise(s->isp_irq[c]);
         }
     }
     for (c = 0; c < XM_VI_CHANNELS; c++) {
-        if (!xm_vi_enabled(s, c)) {
+        /* a buffer the geometry does not allow is not a frame */
+        if (!xm_vi_enabled(s, c) || !xm_vi_pattern(s, c)) {
             continue;
         }
-        xm_vi_pattern(s, c);
         R(s, XM_VI_WIN(c) + 0x08) = 1u << (s->frame[c] & 1);
         R(s, XM_VI_INT(c) + 0x0C) = 1;
-        qemu_irq_raise(s->irq[c]);
         s->frame[c]++;
     }
-    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              1000 / MAX(s->fps, 1));
+    xm_vi_update_irq(s);
+    timer_mod_ns(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                 NANOSECONDS_PER_SECOND / s->fps);
 }
 
 static uint64_t xm_vi_read(void *opaque, hwaddr off, unsigned size)
@@ -158,20 +175,11 @@ static void xm_vi_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     XmViState *s = XM_VI(opaque);
 
-    int c;
-
     qemu_log_mask(LOG_UNIMP, "xm-vi: [0x%05" HWADDR_PRIx "] = 0x%08" PRIx64
                   "\n", off, val);
     s->regs[off / 4] = val;
-    for (c = 0; c < XM_VI_CHANNELS; c++) {
-        if (off == XM_VI_INT(c) + 0x0C && !val) {
-            qemu_irq_lower(s->irq[c]);
-        }
-    }
-    for (c = 0; c < XM_VI_ISP_LINES; c++) {
-        if (off == XM_VI_ISP(c) + 0x0C && !val) {
-            qemu_irq_lower(s->isp_irq[c]);
-        }
+    if (off >= XM_VI_IRQ_BLK(0)) {
+        xm_vi_update_irq(s);
     }
 }
 
@@ -220,8 +228,18 @@ static const Property xm_vi_props[] = {
     DEFINE_PROP_UINT32("fps", XmViState, fps, 10),
 };
 
+static void xm_vi_realize(DeviceState *dev, Error **errp)
+{
+    XmViState *s = XM_VI(dev);
+
+    if (s->fps < 1 || s->fps > 1000) {
+        error_setg(errp, "xm-vi: fps must be 1..1000, not %u", s->fps);
+    }
+}
+
 static void xm_vi_class_init(ObjectClass *klass, const void *data)
 {
+    DEVICE_CLASS(klass)->realize = xm_vi_realize;
     device_class_set_legacy_reset(DEVICE_CLASS(klass), xm_vi_reset);
     device_class_set_props(DEVICE_CLASS(klass), xm_vi_props);
 }

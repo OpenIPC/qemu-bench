@@ -20,6 +20,7 @@ H1 = jt.H1
 REG = dict(jt.REG, ENC_CTRL0=0x040, HDR_REM_MSB=0x058, HDR_REM_LSB=0x05c,
            RLC_CTRL=0x094)
 ENC_EN, MODE_H264, PIC_INTRA = 1, 3 << 1, 1 << 3
+INT_ERROR, INT_BUF_FULL = 1 << 3, 1 << 5    # Hantro's ASIC_STATUS_ERROR / _BUFF_FULL
 
 # SPS and PPS as the library leaves them: the PPS's last byte is the remainder
 HEADERS = bytes.fromhex('00000001274d001f8d6a0b012684000003000400000300ca10'
@@ -77,6 +78,24 @@ def main():
             check(0 < n < BUF_SIZE, 'frame %d: %d stream bytes' % (f, n))
             stream += pre + q.read(out, n)
             q.writel(H1 + REG['INTERRUPT'], 0)
+
+        # a job that cannot be done is not reported as a frame
+        def bad_job(what, limit, row, expect):
+            q.write(BUF_ADDR, b'\xa5' * 64)
+            q.writel(H1 + REG['IN_IMG_CTRL'], (row << 12) | (jt.FMT_YUV420SP << 2))
+            q.writel(H1 + REG['OUT'], BUF_ADDR)
+            q.writel(H1 + REG['STR_BUF_LIMIT'], limit)
+            q.writel(H1 + REG['RLC_CTRL'], 0)
+            q.writel(H1 + REG['ENC_CTRL'], ((w // 16) << 19) | ((h // 16) << 10) |
+                     MODE_H264 | ENC_EN)
+            irq = q.readl(H1 + REG['INTERRUPT'])
+            check(irq & expect and not irq & jt.INT_FRAME_RDY,
+                  '%s: 0x%x, not FRAME_RDY' % (what, irq))
+            check(q.read(BUF_ADDR, 64) == b'\xa5' * 64, '%s: nothing written' % what)
+            q.writel(H1 + REG['INTERRUPT'], 0)
+
+        bad_job('a 64-byte stream buffer', 64, w, INT_BUF_FULL)
+        bad_job('a row shorter than the picture', BUF_SIZE, w - 16, INT_ERROR)
     finally:
         q.close()
 

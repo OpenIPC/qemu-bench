@@ -72,6 +72,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmH1State, XM_H1)
 
 /* hantro_h1_regs.h */
 #define H1_REG_INTERRUPT            0x004
+/* 0x08 and 0x20 as Hantro's own encoder names them (encasiccontroller.h):
+ * ASIC_STATUS_ERROR and ASIC_STATUS_BUFF_FULL */
+#define   H1_INT_BUF_FULL           (1u << 5)
+#define   H1_INT_ERROR              (1u << 3)
 #define   H1_INT_FRAME_RDY          (1u << 2)
 #define   H1_INT_DIS                (1u << 1)
 #define   H1_INT_BIT                (1u << 0)
@@ -395,7 +399,31 @@ static void jfif_append(GByteArray *b, int w, int h, const uint8_t ql[64],
     g_byte_array_append(b, sos, sizeof(sos));
 }
 
-static void xm_h1_jpeg(XmH1State *s)
+/* swreg63 advertises 1920 pixels; the stride must cover the picture so
+ * every read stays inside the input copy, and stay a row's worth */
+#define H1_MAX_WIDTH_MB   (1920 / 16)
+#define H1_MAX_HEIGHT_MB  (4096 / 16)
+
+static bool xm_h1_geometry_ok(const char *what, int mbw, int mbh, int stride)
+{
+    if (!mbw || !mbh || mbw > H1_MAX_WIDTH_MB || mbh > H1_MAX_HEIGHT_MB ||
+        stride < mbw * 16 || stride > 4096) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-h1: %s %dx%d MB, stride %d\n",
+                      what, mbw, mbh, stride);
+        return false;
+    }
+    return true;
+}
+
+/* Host memory for the output: the programmed limit, but never more than a
+ * frame of this size can take (6 bytes a pixel covers JPEG at quality 1). */
+static uint32_t xm_h1_out_cap(XmH1State *s, int mbw, int mbh)
+{
+    return MIN(s->regs[H1_REG_STR_BUF_LIMIT / 4],
+               (uint32_t)mbw * mbh * 256 * 6 + 4096);
+}
+
+static uint32_t xm_h1_jpeg(XmH1State *s)
 {
     const uint32_t ctrl = s->regs[H1_REG_ENC_CTRL / 4];
     const uint32_t img = s->regs[H1_REG_IN_IMG_CTRL / 4];
@@ -408,10 +436,12 @@ static void xm_h1_jpeg(XmH1State *s)
     BitWriter bw = { 0 };
     int dc[3] = { 0, 0, 0 }, i, mx, my;
 
-    if (!mbw || !mbh || (fmt != 0 && fmt != 1)) {
-        qemu_log_mask(LOG_UNIMP, "xm-h1: JPEG %dx%d MB, input format %d\n",
-                      mbw, mbh, fmt);
-        return;
+    if (fmt != 0 && fmt != 1) {
+        qemu_log_mask(LOG_UNIMP, "xm-h1: JPEG input format %d\n", fmt);
+        return H1_INT_ERROR;
+    }
+    if (!xm_h1_geometry_ok("JPEG", mbw, mbh, stride)) {
+        return H1_INT_ERROR;
     }
     for (i = 0; i < 64; i++) {
         const uint32_t lw = s->regs[H1_REG_JPEG_LUMA_QUAT / 4 + i / 4];
@@ -444,7 +474,7 @@ static void xm_h1_jpeg(XmH1State *s)
                         (stride / 2) * (h / 2), MEMTXATTRS_UNSPECIFIED);
     }
 
-    bw.cap = s->regs[H1_REG_STR_BUF_LIMIT / 4];
+    bw.cap = xm_h1_out_cap(s, mbw, mbh);
     bw.buf = g_malloc(MAX(bw.cap, 1));
     for (my = 0; my < mbh; my++) {
         for (mx = 0; mx < mbw; mx++) {
@@ -478,27 +508,30 @@ static void xm_h1_jpeg(XmH1State *s)
     bw_byte(&bw, 0xff);                             /* EOI */
     bw_byte(&bw, 0xd9);
     if (bw.overflow) {
+        /* nothing is written: the driver sees BUFF_FULL, not a short scan */
         qemu_log_mask(LOG_GUEST_ERROR, "xm-h1: JPEG output over the %u-byte "
-                      "buffer, truncated\n", (unsigned)bw.cap);
+                      "buffer\n", (unsigned)bw.cap);
+    } else {
+        dma_memory_write(&address_space_memory,
+                         s->regs[H1_REG_ADDR_OUTPUT_STREAM / 4], bw.buf, bw.n,
+                         MEMTXATTRS_UNSPECIFIED);
+        /* hantro_h1_jpeg_enc_done(): bytesused = STR_BUF_LIMIT / 8 */
+        s->regs[H1_REG_STR_BUF_LIMIT / 4] = bw.n * 8;
     }
-    dma_memory_write(&address_space_memory,
-                     s->regs[H1_REG_ADDR_OUTPUT_STREAM / 4], bw.buf, bw.n,
-                     MEMTXATTRS_UNSPECIFIED);
-    if (s->dump_dir) {
+    if (s->dump_dir && !bw.overflow) {
         g_autoptr(GByteArray) f = g_byte_array_new();
         jfif_append(f, w, h, ql, qc);
         g_byte_array_append(f, bw.buf, bw.n);
         xm_h1_dump(s, "jpg", f->data, f->len);
     }
-    /* hantro_h1_jpeg_enc_done(): bytesused = STR_BUF_LIMIT / 8 */
-    s->regs[H1_REG_STR_BUF_LIMIT / 4] = bw.n * 8;
     g_free(bw.buf);
     g_free(y);
     g_free(cb);
     g_free(cr);
+    return bw.overflow ? H1_INT_BUF_FULL : H1_INT_FRAME_RDY;
 }
 
-static void xm_h1_h264(XmH1State *s)
+static uint32_t xm_h1_h264(XmH1State *s)
 {
     const uint32_t ctrl = s->regs[H1_REG_ENC_CTRL / 4];
     const uint32_t img = s->regs[H1_REG_IN_IMG_CTRL / 4];
@@ -506,7 +539,7 @@ static void xm_h1_h264(XmH1State *s)
     const int stride = H1_IN_ROW_LEN(img) ? H1_IN_ROW_LEN(img) : mbw * 16;
     const bool idr = ctrl & H1_ENC_PIC_INTRA;
     const hwaddr out = s->regs[H1_REG_ADDR_OUTPUT_STREAM / 4];
-    const uint32_t cap = s->regs[H1_REG_STR_BUF_LIMIT / 4];
+    const uint32_t cap = xm_h1_out_cap(s, mbw, mbh);
     const int rem_bits = H1_RLC_STR_OFFS(s->regs[H1_REG_RLC_CTRL / 4]);
     const uint64_t rem = ((uint64_t)s->regs[H1_REG_STR_HDR_REM_MSB / 4] << 32) |
                          s->regs[H1_REG_STR_HDR_REM_LSB / 4];
@@ -515,10 +548,13 @@ static void xm_h1_h264(XmH1State *s)
     size_t hdr_at = 512;                /* the headers' start in hdr, if any */
     int i, nrem = rem_bits / 8;
 
-    if (!mbw || !mbh || H1_IN_FMT(img) != 1) {
-        qemu_log_mask(LOG_UNIMP, "xm-h1: H.264 %dx%d MB, input format %d\n",
-                      mbw, mbh, H1_IN_FMT(img));
-        return;
+    if (H1_IN_FMT(img) != 1) {
+        qemu_log_mask(LOG_UNIMP, "xm-h1: H.264 input format %d\n",
+                      H1_IN_FMT(img));
+        return H1_INT_ERROR;
+    }
+    if (!xm_h1_geometry_ok("H.264", mbw, mbh, stride)) {
+        return H1_INT_ERROR;
     }
     if (rem_bits % 8) {
         qemu_log_mask(LOG_UNIMP, "xm-h1: %d header bits, not whole bytes\n",
@@ -561,12 +597,15 @@ static void xm_h1_h264(XmH1State *s)
     if (!n) {
         qemu_log_mask(LOG_UNIMP, "xm-h1: no SPS/PPS this encoder handles "
                       "(CABAC, POC type 0/2, progressive) before the stream\n");
+        return H1_INT_ERROR;
     }
     n += nrem;
     if (n > cap) {
+        /* Hantro's library answers BUFF_FULL with a bigger buffer or a
+         * skipped frame; nothing is written */
         qemu_log_mask(LOG_GUEST_ERROR, "xm-h1: H.264 output over the %u-byte "
-                      "buffer, truncated\n", cap);
-        n = cap;
+                      "buffer\n", cap);
+        return H1_INT_BUF_FULL;
     }
     dma_memory_write(&address_space_memory, out, buf, n,
                      MEMTXATTRS_UNSPECIFIED);
@@ -577,6 +616,7 @@ static void xm_h1_h264(XmH1State *s)
         xm_h1_dump(s, "h264", file, 512 - hdr_at + n);
     }
     s->regs[H1_REG_STR_BUF_LIMIT / 4] = n * 8;
+    return H1_INT_FRAME_RDY;
 }
 
 static void xm_h1_update_irq(XmH1State *s)
@@ -589,20 +629,21 @@ static void xm_h1_update_irq(XmH1State *s)
 static void xm_h1_start(XmH1State *s)
 {
     const uint32_t ctrl = s->regs[H1_REG_ENC_CTRL / 4];
+    uint32_t status = H1_INT_ERROR;
 
     if (s->dump_dir) {
         xm_h1_dump_regs(s);
     }
     if (H1_ENC_MODE(ctrl) == H1_ENC_MODE_JPEG) {
-        xm_h1_jpeg(s);
+        status = xm_h1_jpeg(s);
     } else if (H1_ENC_MODE(ctrl) == H1_ENC_MODE_H264) {
-        xm_h1_h264(s);
+        status = xm_h1_h264(s);
     } else {
         qemu_log_mask(LOG_UNIMP, "xm-h1: encode mode %u\n", H1_ENC_MODE(ctrl));
     }
     s->jobs++;
     s->regs[H1_REG_ENC_CTRL / 4] &= ~H1_ENC_EN;
-    s->regs[H1_REG_INTERRUPT / 4] |= H1_INT_FRAME_RDY | H1_INT_BIT;
+    s->regs[H1_REG_INTERRUPT / 4] |= status | H1_INT_BIT;
     xm_h1_update_irq(s);
 }
 
