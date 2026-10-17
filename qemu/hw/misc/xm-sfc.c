@@ -30,9 +30,15 @@
  *      CTRL +0x00  CFG1 +0x04  CFG2 +0x08  ADDR +0x0C  OP   +0x10
  *      CMD  +0x14  SRW  +0x18  RW_NUM +0x1C  PRE_CMD +0x20  PST_CMD +0x24
  *      ST   +0x2C  R_SR_ID +0x30  MODE_ST +0x40  CACHE_CMD +0x44
- *      RAM  +0x2000 (256 bytes, packed four to a word)
- *      OP1 erase, OP3 read status/ID (RW_NUM+1 bytes into R_SR_ID),
- *      OP4 page program (RW_NUM+1 bytes from RAM); done bit (1 << (op-1)).
+ *      RAM  +0x2000 (4 KiB, packed four to a word)
+ *      OP1 erase; done bit (1 << (op-1)) for every operation.
+ *      OP3 read: status/ID (RW_NUM+1 bytes into R_SR_ID), or for a data-read
+ *          opcode RW_NUM+1 bytes from ADDR into RAM at ADDR mod 4 KiB.  That
+ *          is the XM550 U-Boot's sf read: sixteen 256-byte 0x6B reads at
+ *          consecutive addresses, then the whole 4 KiB read out of RAM.
+ *      OP4 write: with CMD 0x01 the status register (SRW, RW_NUM+1 bytes --
+ *          U-Boot sets QE this way), otherwise a page program of RW_NUM+1
+ *          bytes from RAM offset 0 (the kernel's xmsfc_reg_write()).
  * MODE_ST reads 0 there: the driver then uses single-line commands.  The
  * read window is at 0x60000000.
  *
@@ -87,7 +93,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmSfcState, XM_SFC)
 #define V2_MODE_ST    0x40
 #define V2_CACHE_CMD  0x44
 #define V2_RAM        0x2000
-#define V2_REGS_SIZE  0x2100
+#define V2_RAM_BYTES  0x1000
+#define V2_REGS_SIZE  (V2_RAM + V2_RAM_BYTES)
 
 struct XmSfcState {
     SysBusDevice parent_obj;
@@ -97,6 +104,7 @@ struct XmSfcState {
 
     uint32_t mode, addr, cmd, srw, wrnum, bsel, st, srr, cache_cmd;
     uint32_t v2_regs[V2_RAM / 4];   /* v2 registers with no side effect */
+    uint8_t v2_ram[V2_RAM_BYTES];
     uint8_t buf[BUF_BYTES];
     uint8_t sr1, sr2;
 
@@ -331,6 +339,28 @@ static const MemoryRegionOps xm_sfc_regs_ops = {
  * wrnum (RW_NUM) and buf (RAM), and the answer to a register read lands in
  * srr (R_SR_ID), wrnum + 1 bytes of it.
  */
+/* SPI NOR data-read opcodes: single, fast, dual/quad output and I/O. */
+static bool xm_sfc_is_data_read(uint32_t cmd)
+{
+    switch (cmd) {
+    case 0x03: case 0x0B: case 0x3B: case 0x6B: case 0xBB: case 0xEB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void xm_sfc_v2_data_read(XmSfcState *s)
+{
+    const uint32_t n = MIN(s->wrnum + 1, V2_RAM_BYTES);
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        const uint32_t a = s->addr + i;
+        s->v2_ram[a % V2_RAM_BYTES] = a < s->size ? s->array[a] : 0xff;
+    }
+}
+
 static void xm_sfc_v2_op(XmSfcState *s, uint32_t op)
 {
     switch (op) {
@@ -338,11 +368,21 @@ static void xm_sfc_v2_op(XmSfcState *s, uint32_t op)
         xm_sfc_erase(s);
         break;
     case 3:
+        if (xm_sfc_is_data_read(s->cmd)) {
+            xm_sfc_v2_data_read(s);
+            break;
+        }
         s->bsel = s->wrnum;
         xm_sfc_read_reg(s);
         break;
     case 4:
-        xm_sfc_program(s);
+        if (s->cmd == 0x01) {
+            s->bsel = s->wrnum;
+            xm_sfc_write_reg(s);
+        } else {
+            memcpy(s->buf, s->v2_ram, BUF_BYTES);
+            xm_sfc_program(s);
+        }
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "xm-sfc: v2 operation %u\n", op);
@@ -355,10 +395,10 @@ static uint64_t xm_sfc_v2_read(void *opaque, hwaddr off, unsigned size)
 {
     XmSfcState *s = opaque;
 
-    if (off >= V2_RAM && off < V2_RAM + BUF_BYTES) {
+    if (off >= V2_RAM && off < V2_RAM + V2_RAM_BYTES) {
         uint32_t v = 0, i;
-        for (i = 0; i < size && off - V2_RAM + i < BUF_BYTES; i++) {
-            v |= (uint32_t)s->buf[off - V2_RAM + i] << (8 * i);
+        for (i = 0; i < size && off - V2_RAM + i < V2_RAM_BYTES; i++) {
+            v |= (uint32_t)s->v2_ram[off - V2_RAM + i] << (8 * i);
         }
         return v;
     }
@@ -391,10 +431,10 @@ static void xm_sfc_v2_write(void *opaque, hwaddr off, uint64_t val,
 {
     XmSfcState *s = opaque;
 
-    if (off >= V2_RAM && off < V2_RAM + BUF_BYTES) {
+    if (off >= V2_RAM && off < V2_RAM + V2_RAM_BYTES) {
         uint32_t i;
-        for (i = 0; i < size && off - V2_RAM + i < BUF_BYTES; i++) {
-            s->buf[off - V2_RAM + i] = val >> (8 * i);
+        for (i = 0; i < size && off - V2_RAM + i < V2_RAM_BYTES; i++) {
+            s->v2_ram[off - V2_RAM + i] = val >> (8 * i);
         }
         return;
     }
@@ -514,6 +554,7 @@ static void xm_sfc_reset(DeviceState *dev)
     s->bsel = s->st = s->srr = s->cache_cmd = 0;
     s->sr1 = s->sr2 = 0;
     memset(s->v2_regs, 0, sizeof(s->v2_regs));
+    memset(s->v2_ram, 0, sizeof(s->v2_ram));
 }
 
 static const Property xm_sfc_props[] = {

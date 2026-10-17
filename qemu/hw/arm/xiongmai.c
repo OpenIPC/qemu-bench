@@ -30,6 +30,7 @@
 #include "system/block-backend.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
+#include "system/reset.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
 
@@ -75,6 +76,8 @@ static const XmSoCConfig xm510_soc = {
      * resets on its second expiry: a 24 MHz / 256 clock. */
     .wdt_freq           = 93750,
     .ddrc_base          = 0x100B0000,           /* from U-Boot, see xm-ddrc */
+    .num_ddrc_done      = 2,
+    .ddrc_done          = { 0x0048, 0x1038 },
     .num_regbanks       = 7,
     .regbanks           = {
         { "xm-gpio",     0x10020000, 0x10000 },  /* GPIO + pin mux */
@@ -137,6 +140,15 @@ static const XmSoCConfig xm530_soc = {
     .sfc_base           = 0x100F4000,           /* XM_SFC_V2_CTRL */
     .sfc_window         = 0x60000000,           /* XMSF_BASE_ADDR */
     .sfc_version        = 2,
+    /*
+     * The XM550 U-Boot 2014.04 ("Mar 15 2019") is linked at 0x08000000.
+     * Before relocation it runs from the boot alias at 0 but walks
+     * init_sequence through its link address (0x08022cbc), and its board
+     * code and table entries are 0x0800xxxx: on silicon the flash answers
+     * there too.  Without it the walk reads 0, every init step is skipped
+     * -- dram_init included -- and U-Boot relocates below 0x80000000.
+     */
+    .sfc_text_alias     = 0x08000000,
     .mac_base           = 0x10010000,           /* GMAC_BASE */
     .mac_irq            = 3,
     .num_sdhci          = 2,
@@ -147,6 +159,12 @@ static const XmSoCConfig xm530_soc = {
      * camera 60 s after insmod (the default timeout), as in the lab. */
     .wdt_freq           = 46875,
     .ddrc_base          = 0x100B0000,           /* same uPCTL as XM510 */
+    /* XM550 U-Boot: spins on +0xF4, then +0xF8, reading 1. */
+    .num_ddrc_done      = 2,
+    .ddrc_done          = { 0x00F4, 0x00F8 },
+    /* ...then programs PHY +0xA8 and waits for +0xB8 to echo it. */
+    .ddrc_mirror        = 0x10B8,
+    .ddrc_mirror_of     = 0x10A8,
     .num_regbanks       = 6,
     .regbanks           = {
         { "xm-gpio",     0x10020000, 0x10000 },
@@ -240,6 +258,24 @@ static void xm_cpu1_reset(void *opaque, int n, int level)
     } else if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 release failed (%d)\n", ret);
     }
+}
+
+/*
+ * Flash boot on XM530: U-Boot is linked at the text alias (0x08000000) and
+ * is not position-independent across its relocation -- it returns into the
+ * relocated copy at "here + reloc_off", which only lands if it was already
+ * running at its link address.  So on silicon the CPU starts there, which
+ * points at a mask ROM jumping to flash; nothing documents it, and the
+ * U-Boot is the evidence.  Without -kernel, reset starts CPU0 there.
+ */
+static hwaddr xm_flash_boot_pc;
+
+static void xm_flash_boot_reset(void *opaque)
+{
+    CPUState *cs = CPU(opaque);
+
+    cpu_reset(cs);
+    cpu_set_pc(cs, xm_flash_boot_pc);
 }
 
 /* Secondaries wait for REG_CPU1_SOFT_RST, never for boot.c's pen: at 0 it
@@ -354,7 +390,23 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     }
 
     if (c->ddrc_base) {
-        sysbus_create_simple("xm-ddrc", c->ddrc_base, NULL);
+        DeviceState *ddrc = qdev_new("xm-ddrc");
+        QList *done = qlist_new();
+
+        for (n = 0; n < c->num_ddrc_done; n++) {
+            qlist_append_int(done, c->ddrc_done[n]);
+        }
+        qdev_prop_set_array(ddrc, "done-offsets", done);
+        if (c->ddrc_mirror) {
+            QList *m = qlist_new(), *mo = qlist_new();
+
+            qlist_append_int(m, c->ddrc_mirror);
+            qlist_append_int(mo, c->ddrc_mirror_of);
+            qdev_prop_set_array(ddrc, "mirror-reads", m);
+            qdev_prop_set_array(ddrc, "mirror-of", mo);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ddrc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ddrc), 0, c->ddrc_base);
     }
 
     for (n = 0; n < c->num_uarts; n++) {
@@ -400,6 +452,17 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             memory_region_set_enabled(low, false);
             qdev_connect_gpio_out_named(sys, "remap", 0,
                                         qemu_allocate_irq(xm_remap, low, 0));
+        }
+        if (c->sfc_text_alias) {
+            MemoryRegion *win = sysbus_mmio_get_region(SYS_BUS_DEVICE(sfc), 1);
+            MemoryRegion *text = g_new(MemoryRegion, 1);
+
+            memory_region_init_alias(text, NULL, "xiongmai.text-alias", win, 0,
+                                     memory_region_size(win));
+            memory_region_add_subregion(sysmem, c->sfc_text_alias, text);
+            if (!machine->kernel_filename) {
+                xm_flash_boot_pc = c->sfc_text_alias;
+            }
         }
     }
 
@@ -455,6 +518,11 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     binfo.write_secondary_boot = xm_write_secondary_boot;
     binfo.secondary_cpu_reset_hook = xm_reset_secondary;
     arm_load_kernel(cpu, machine, &binfo);
+    /* After arm_load_kernel(): its own per-CPU reset hook runs in
+     * registration order and would put the PC back to 0. */
+    if (xm_flash_boot_pc) {
+        qemu_register_reset(xm_flash_boot_reset, cpu);
+    }
 }
 
 #define DEFINE_XM_MACHINE(namestr, tag, config)                      \

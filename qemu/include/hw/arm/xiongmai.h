@@ -60,6 +60,10 @@ typedef struct XmSoCConfig {
 
     /* DDR controller: only U-Boot's training touches it (xm-ddrc). */
     hwaddr      ddrc_base;
+    int         num_ddrc_done;
+    uint32_t    ddrc_done[4];   /* xm-ddrc done-offsets */
+    hwaddr      ddrc_mirror;    /* xm-ddrc: reads of this offset ... */
+    hwaddr      ddrc_mirror_of; /* ... return this one; 0 = none */
 
     /* Interrupt controller: a PL190-layout VIC (XM510), or the A5 MPCore
      * private region (A9 layout: SCU +0, GIC CPU +0x100, TWD +0x600, GIC
@@ -86,6 +90,10 @@ typedef struct XmSoCConfig {
     hwaddr      sfc_base;
     hwaddr      sfc_window;
     int         sfc_version;
+    /* A second alias of the flash window, where U-Boot is linked
+     * (CONFIG_SYS_TEXT_BASE): it reads its own tables there before it
+     * relocates.  0 = none. */
+    hwaddr      sfc_text_alias;
 
     /* Synopsys DWMAC (10/100 core on XM510). */
     hwaddr      mac_base;

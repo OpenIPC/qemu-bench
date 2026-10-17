@@ -119,6 +119,8 @@ CI covers:
 
 `xm530` and `xm550` boot the `xm530_lite` release with `-smp 2`: CPU1 is
 released through `REG_SC_REMAP` and `REG_CPU1_SOFT_RST` as on silicon.
+An XM550 camera's full flash dump boots through its own U-Boot to `login:`
+with `-M xm550,flash-file=dump.bin -smp 2`.
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,
