@@ -227,6 +227,28 @@ For `XM_MPI_VENC_CreateChn` to succeed on the H1, two registers matter:
     QEMU restart: `flash-file` holds the array only, and `wps` sets the
     power-up state of every run.
 
+- **xmsfc SPI NAND (`-global xm-sfc.nand-file=<raw image>`, v2 only):**
+  the controller in NAND mode, as the vendor U-Boot's `xmsfc_v2_nand.c`
+  drives it.
+  - The image is raw pages of 2048 data + 64 spare bytes, 64 to a 128 KiB
+    block. The part is a W25N01GV (EF AA 21) unless `nand-id` says otherwise.
+  - OP1 runs an addressed command without data: 0x13 page read to the cache,
+    0x10 program execute, 0xD8 block erase. ADDR holds the row.
+  - OP2 is a bare command (0xFF reset).
+  - OP3 reads: 0x9F ID, 0x0F feature at ADDR, and 0x03/0x0B copy the cache
+    from column ADDR into the RAM at the same offset.
+  - OP4 writes: 0x1F feature, and 0x02/0x84 copy RAM into the cache at
+    column ADDR. 0x02 first clears the cache.
+  - Programs AND into the page, and are written through to the file.
+  - The part powers up with every block protected (feature A0 = 0x7C).
+    Until A0 is cleared, as the vendor driver does before each program and
+    erase, those fail with P_FAIL/E_FAIL in feature C0.
+  - **The boot path is a guess.** Nothing documents how the XM530 boots from
+    SPI NAND. The model has the read window serve the NAND's page data
+    linearly, spare skipped, so U-Boot runs in place from it as from NOR.
+    The vendor tree links a NAND U-Boot at 0x60001000, behind a 4 KiB
+    header. This exists so a NAND U-Boot can be exercised at all; it says
+    nothing about silicon.
 - **xm-dwmac RX start:** receive DMA starts 1 ms (virtual time) after the
   driver sets DMA_CONTROL.SR.
   - The delay exists because the vendor `stmmac_open()` sets SR before
