@@ -277,10 +277,63 @@ plane within 45 dB of the 4×4-averaged source.
   errors, IDRs every 25 frames.
 - RTSP and HTTP stay 401 until the camera is claimed; the dump is how
   the stream is checked without one.
-- CI runs it on every change: `qemu-boot/test-xm530-stream.sh` boots the
+- CI runs it on every change: `qemu-boot/test-xm-stream.sh` boots the
   release from flash, lets majestic start on its own, and requires 60
   dumped jobs that ffmpeg decodes frame for frame, with at least two IDRs.
 - H.265 on the Mali VE stays out of scope.
+
+## XM510 media pipeline
+
+The same blocks as XM530, found the same way, from the register traffic of
+the vendor modules:
+
+| Block | Where | Model |
+|---|---|---|
+| I2C (`xm_i2c.ko`) | 0x10000000 | `xm-i2c`, unchanged from XM530 |
+| Sensor | I2C 0x30 | `hisi-jxh62`, the SOI JX-H62 on XM510 boards |
+| VI and ISP (`xm510_vi.ko`, `xm510_isp.ko`) | 0x40000000, IRQ 16 and 18 | `xm-vi` with `soc=xm510` |
+| Hantro H1 (`xm510_h264.ko`, hx280enc) | 0x20070000, IRQ 26 | `xm-h1` |
+
+**Sensor.** ipcinfo and the vendor `libsns` read the SOI product ID from
+registers 0x0A/0x0B at 0x30; 0xA062 is the H62.
+- `hisi-jxh62` is `hisi-f37` with that ID. Both are RAM behind the ID.
+- With no sensor on the bus, majestic stopped at "Not Support This Sensor!".
+
+**VI.** It's the XM530 design at other offsets, with up to three buffers and
+a single back-end interrupt for every channel. `load_xiongmai` sets
+`VI_BUFF=3` for an 18M kernel and 2 otherwise. For channel `c`, in `W = 0x81000 +
+c*0x1000`:
+- `W+0x00/04/08` and `W+0x10/14/18` are buffer 0/1/2 luma and chroma, as
+  `(addr - 0x80000000) >> 3`;
+- `W+0x20/0x28` is the stride ÷ 8, `W+0x24` the width, `W+0x34` the enable;
+- `W+0x38` is the last buffer index: 2 for three buffers, 1 for two, when
+  buffer 2's registers stay 0;
+- `W+0x3C` is the buffer the hardware writes next. The driver takes the one
+  before it as the finished frame; reading it as 0 gave buffer 2 every time;
+- `W+0x48` is 1 for a finished frame. It isn't a per-buffer mask: the
+  driver ignores 2 and 4;
+- `W+0x4C` is an overflow flag. When it's non-zero, the handler clears it
+  and drops the frame.
+
+There's no height register. Chroma follows luma, so the height is
+`(chroma - luma) / stride`: 720 and 576 for the two channels majestic sets up.
+
+Interrupt blocks follow XM530's shape, enable at +0 and status at +0xC:
+- `0xF0010` is `vi_front_v` and `isp_irq` (IRQ 16);
+- `0xF0030` is `vi_back_v` (IRQ 18), with a status bit per channel.
+
+**Status:**
+- majestic finds the H62 and creates VENC chn 0, H.264 1280×720 Main.
+- Every VI frame is encoded at the VI rate.
+- After VENC starts, the driver first hands out two new frames and then
+  one it had queued before; from then on the order is strict.
+- `test-xm-stream.sh --soc xm510` runs in CI, booting with `mem=18M` as
+  U-Boot passes it.
+- XM510's other CI boots use `mem=20M` first. Without a `mem=`,
+  `load_xiongmai` lays MMZ over the whole kernel, and now that VI and the H1
+  really write their buffers, the guest dies. At 18M, `sysupgrade --archive`
+  refuses: /tmp has no room to unpack the archive (4170 KB needed, 3656 KB
+  free). That would happen on silicon too.
 
 ## Model notes
 
@@ -337,6 +390,4 @@ plane within 45 dB of the 4×4-averaged source.
   - On silicon the same race exists, but only for a frame arriving within
     microseconds of `ifconfig up`.
 - **Regbanks:** blocks with no model yet are RAM-backed `hisi-regbank` stubs,
-  so drivers and vendor modules can map them: GPIO, I2C, PL330, Hantro H1,
-  RTC, I2S and ISP. `xm510_h264.ko` still reports "Resource busy" at insmod;
-  the media blocks are out of scope for now.
+  so drivers and vendor modules can map them: GPIO, PL330, RTC and I2S.
