@@ -5171,9 +5171,13 @@ static void hisilicon_common_init(MachineState *machine,
      * Left unmapped, that U-Boot resets in a loop here and the probes see
      * no memory instead of the wrap. So mirror RAM across the rest of a
      * 1 GiB window, under every device, so MMIO in that range still wins.
-     * DDR parts are powers of two; another -m is left as it is.
+     * DDR parts are powers of two; another -m is left as it is. A V1
+     * flash boot goes without: there RAM is unusable until U-Boot trains
+     * the PHY, which hisi-ddrc-v1 models with an overlay over the primary
+     * range only, and a mirror of the raw RAM would get around it.
      */
-    if (c->ram_base && is_power_of_2(machine->ram_size)) {
+    if (c->ram_base && is_power_of_2(machine->ram_size) &&
+        !(c->v1_xip_boot && flash_boot)) {
         for (uint64_t off = machine->ram_size; off < 1 * GiB;
              off += machine->ram_size) {
             MemoryRegion *mirror = g_new(MemoryRegion, 1);
