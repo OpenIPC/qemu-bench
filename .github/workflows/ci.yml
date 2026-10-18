@@ -44,6 +44,9 @@ jobs:
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm510 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm530 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm550 '
+          # Goke GK7101/GK7102 (hw/arm/goke.c), Goke's own Ambarella-IP design
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7101 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7102 '
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -70,6 +73,13 @@ jobs:
       # vendor ISP drive it: output levels, input lines, mux bits kept.
       - name: XM530 pad GPIO (xm-gpio)
         run: python3 qemu/tests/test-xm-gpio.py
+
+      # The GK710x models driven over qtest at the silicon addresses the
+      # vendor HAL drives: boot-ROM header, SPI-NOR byte order and
+      # write-back, timer edge into the VIC, I2C to a sensor, watchdog.
+      # Boot tests need the vendor HAL, which is not redistributable.
+      - name: Goke GK710x devices (gk-sflash, gk-vic, gk-idc, ...)
+        run: python3 qemu/tests/test-gk710x.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4

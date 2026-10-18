@@ -33,6 +33,7 @@ struct HisiRegbankState {
     char *name;
     uint32_t autoclear_offset;  /* register offset with auto-clear bits */
     uint32_t autoclear_mask;    /* bits to clear on write (e.g. START bit) */
+    bool sub_word;              /* accept 8/16-bit accesses too */
 };
 
 static uint64_t hisi_regbank_read(void *opaque, hwaddr offset, unsigned size)
@@ -61,6 +62,21 @@ static const MemoryRegionOps hisi_regbank_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The same bank for blocks whose drivers use byte and halfword accesses
+ * (Goke's HAL has readb/readw for every block): narrower accesses become
+ * read-modify-writes of the 32-bit word.
+ */
+static const MemoryRegionOps hisi_regbank_subword_ops = {
+    .read = hisi_regbank_read,
+    .write = hisi_regbank_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
 static void hisi_regbank_realize(DeviceState *dev, Error **errp)
 {
     HisiRegbankState *s = HISI_REGBANK(dev);
@@ -72,7 +88,9 @@ static void hisi_regbank_realize(DeviceState *dev, Error **errp)
 
     s->regs = g_new0(uint32_t, s->size / 4);
 
-    memory_region_init_io(&s->iomem, OBJECT(dev), &hisi_regbank_ops, s,
+    memory_region_init_io(&s->iomem, OBJECT(dev),
+                          s->sub_word ? &hisi_regbank_subword_ops
+                                      : &hisi_regbank_ops, s,
                           s->name ? s->name : TYPE_HISI_REGBANK, s->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
@@ -84,6 +102,7 @@ static const Property hisi_regbank_properties[] = {
                        autoclear_offset, 0),
     DEFINE_PROP_UINT32("autoclear-mask", HisiRegbankState,
                        autoclear_mask, 0),
+    DEFINE_PROP_BOOL("sub-word", HisiRegbankState, sub_word, false),
 };
 
 static void hisi_regbank_class_init(ObjectClass *klass, const void *data)

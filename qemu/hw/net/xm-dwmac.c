@@ -33,6 +33,8 @@
 #include "qom/object.h"
 #include "system/dma.h"
 
+#include <zlib.h>
+
 #define TYPE_XM_DWMAC "xm-dwmac"
 OBJECT_DECLARE_SIMPLE_TYPE(XmDwmacState, XM_DWMAC)
 
@@ -114,6 +116,8 @@ struct XmDwmacState {
     uint32_t cur_tx, cur_rx, cur_tx_buf, cur_rx_buf;
 
     uint16_t phy_bmcr;
+    uint32_t regs_size;
+    bool rx_fcs;
 
     uint8_t frame[FRAME_MAX];
     uint32_t frame_len;
@@ -322,8 +326,19 @@ static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
     }
     /* The frame length excludes the FCS: with checksum offload off the
      * core drops it, and both vendor drivers are built not to subtract it
-     * (EDIT_ZENGCHUANJIE in xmmac/stmmac_main.c). */
-    const size_t total = size;
+     * (EDIT_ZENGCHUANJIE in xmmac/stmmac_main.c).  A core that keeps it
+     * (rx-fcs: Goke, whose kernel driver subtracts 4) stores it after the
+     * frame and counts it in the length. */
+    uint8_t fcs_frame[FRAME_MAX + 4];
+    const uint8_t *data = buf;
+    size_t len = size;
+    if (s->rx_fcs && size <= FRAME_MAX) {
+        memcpy(fcs_frame, buf, size);
+        stl_le_p(fcs_frame + size, crc32(0, buf, size));
+        data = fcs_frame;
+        len = size + 4;
+    }
+    const size_t total = len;
 
     while (done < total && guard--) {
         XmDesc d;
@@ -338,9 +353,9 @@ static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
         }
         const uint32_t room = d.des1 & 0x7ff;
         const uint32_t n = MIN(room, total - done);
-        const uint32_t from_buf = done < size ? MIN(n, size - done) : 0;
+        const uint32_t from_buf = done < len ? MIN(n, len - done) : 0;
         if (from_buf) {
-            dma_memory_write(&address_space_memory, d.des2, buf + done,
+            dma_memory_write(&address_space_memory, d.des2, data + done,
                              from_buf, MEMTXATTRS_UNSPECIFIED);
         }
         done += n;
@@ -565,7 +580,7 @@ static void xm_dwmac_realize(DeviceState *dev, Error **errp)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     memory_region_init_io(&s->mmio, OBJECT(s), &xm_dwmac_ops, s,
-                          "xm-dwmac", REGS_SIZE);
+                          "xm-dwmac", s->regs_size);
     sysbus_init_mmio(sbd, &s->mmio);
     sysbus_init_irq(sbd, &s->irq);
     s->rx_start = timer_new_ns(QEMU_CLOCK_VIRTUAL, xm_dwmac_rx_start, s);
@@ -594,6 +609,10 @@ static void xm_dwmac_reset(DeviceState *dev)
 
 static const Property xm_dwmac_props[] = {
     DEFINE_NIC_PROPERTIES(XmDwmacState, conf),
+    /* The window the SoC decodes: 64 KiB on Xiongmai; the Goke GK710x
+     * has only the MAC and DMA pages before its VIC2. */
+    DEFINE_PROP_UINT32("regs-size", XmDwmacState, regs_size, REGS_SIZE),
+    DEFINE_PROP_BOOL("rx-fcs", XmDwmacState, rx_fcs, false),
 };
 
 static void xm_dwmac_class_init(ObjectClass *klass, const void *data)

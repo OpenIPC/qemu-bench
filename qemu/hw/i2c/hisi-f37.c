@@ -6,6 +6,8 @@
  *               (8-bit) = 0x40 (7-bit) and checks (0x0A << 8) | 0x0B.
  *   hisi-jxh62  JX-H62, ID 0xA062, at 0x60 (8-bit) = 0x30 (7-bit): the
  *               sensor on XM510 boards.  ipcinfo identifies it the same way.
+ *   hisi-jxh42  JX-H42, ID 0xA042, at 0x30 as well: Goke GK7102 boards
+ *               ("rb jxh42" U-Boot and kernel builds).
  *
  * Everything else is RAM: the sensor tables the ISP writes read back.
  *
@@ -22,6 +24,7 @@
 
 #define TYPE_HISI_F37 "hisi-f37"
 #define TYPE_HISI_JXH62 "hisi-jxh62"
+#define TYPE_HISI_JXH42 "hisi-jxh42"
 OBJECT_DECLARE_TYPE(HisiF37State, HisiSoiClass, HISI_F37)
 
 struct HisiSoiClass {
@@ -105,6 +108,11 @@ static void hisi_jxh62_class_init(ObjectClass *klass, const void *data)
     HISI_F37_CLASS(klass)->id = 0xA062;
 }
 
+static void hisi_jxh42_class_init(ObjectClass *klass, const void *data)
+{
+    HISI_F37_CLASS(klass)->id = 0xA042;
+}
+
 static void hisi_f37_register_types(void)
 {
     static const TypeInfo types[] = {
@@ -118,6 +126,10 @@ static void hisi_f37_register_types(void)
             .name          = TYPE_HISI_JXH62,
             .parent        = TYPE_HISI_F37,
             .class_init    = hisi_jxh62_class_init,
+        }, {
+            .name          = TYPE_HISI_JXH42,
+            .parent        = TYPE_HISI_F37,
+            .class_init    = hisi_jxh42_class_init,
         },
     };
     int i;

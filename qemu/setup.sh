@@ -46,6 +46,14 @@ cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/gpio/xm-gpio.c           "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
+cp qemu/hw/arm/goke.c               "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/goke.h       "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/misc/gk-vic.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/gk-timer.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/gk-wdt.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/gk-sflash.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/gk-ephy.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/i2c/gk-idc.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -172,8 +180,19 @@ config XIONGMAI
     select SDHCI
     select I2C
     select HISI_I2C
+    select XM_DWMAC
 KCONFIG
     echo "  hw/arm/Kconfig: added XIONGMAI"
+fi
+# The DWMAC model serves Goke too: its own symbol, selected by both.
+if ! grep -q "^config XM_DWMAC$" "$QEMU_DIR/hw/net/Kconfig"; then
+    printf '\nconfig XM_DWMAC\n    bool\n' >> "$QEMU_DIR/hw/net/Kconfig"
+    echo "  hw/net/Kconfig: added XM_DWMAC"
+fi
+if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q XM_DWMAC; then
+    sed -i '/^config XIONGMAI$/,/^$/ s/^    select HISI_I2C$/    select HISI_I2C\n    select XM_DWMAC/' \
+        "$QEMU_DIR/hw/arm/Kconfig"
+    echo "  hw/arm/Kconfig: XIONGMAI selects XM_DWMAC"
 fi
 if ! grep -q xm-sfc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sfc.c'))" \
@@ -216,14 +235,58 @@ if ! grep -q xm-i2c "$QEMU_DIR/hw/i2c/meson.build"; then
     echo "  hw/i2c/meson.build: added xm-i2c.c"
 fi
 if ! grep -q xm-dwmac "$QEMU_DIR/hw/net/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-dwmac.c'))" \
+    echo "system_ss.add(when: 'CONFIG_XM_DWMAC', if_true: files('xm-dwmac.c'))" \
         >> "$QEMU_DIR/hw/net/meson.build"
     echo "  hw/net/meson.build: added xm-dwmac.c"
+elif grep -q "CONFIG_XIONGMAI', if_true: files('xm-dwmac.c')" "$QEMU_DIR/hw/net/meson.build"; then
+    sed -i "s/CONFIG_XIONGMAI', if_true: files('xm-dwmac.c')/CONFIG_XM_DWMAC', if_true: files('xm-dwmac.c')/" \
+        "$QEMU_DIR/hw/net/meson.build"
+    echo "  hw/net/meson.build: xm-dwmac.c now under XM_DWMAC"
 fi
 if ! grep -q xiongmai "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xiongmai.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added xiongmai.c"
+fi
+
+# Goke GK7101/GK7102: Goke's own Ambarella-IP design (hw/arm/goke.c), seen
+# by its software through a register-scrambling HAL. Same guarded appends
+# as Xiongmai, for a fresh tree and an existing one alike.
+if ! grep -q "^config GOKE$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config GOKE
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+    select OR_IRQ
+    select PTIMER
+    select HISI_MISC
+    select SDHCI
+    select UNIMP
+    select XM_DWMAC
+    select I2C
+    select HISI_I2C
+KCONFIG
+    echo "  hw/arm/Kconfig: added GOKE"
+fi
+for f in gk-vic gk-timer gk-wdt gk-sflash gk-ephy; do
+    if ! grep -q "'$f.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_GOKE', if_true: files('$f.c'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $f.c"
+    fi
+done
+if ! grep -q "'gk-idc.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_GOKE', if_true: files('gk-idc.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added gk-idc.c"
+fi
+if ! grep -q "'goke.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_GOKE', if_true: files('goke.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added goke.c"
 fi
 
 # hw/misc/Kconfig
