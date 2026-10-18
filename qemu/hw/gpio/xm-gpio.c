@@ -122,8 +122,14 @@ static void xm_gpio_set_input(void *opaque, int pad, int level)
 static void xm_gpio_reset(DeviceState *dev)
 {
     XmGpioState *s = XM_GPIO(dev);
+    uint32_t pad;
 
     memset(s->regs, 0, sizeof(s->regs));
+    /* Every pad comes out of reset undriven, so whatever its output line
+     * was holding drops with it. */
+    for (pad = 0; pad < s->pads; pad++) {
+        qemu_set_irq(s->out[pad], 0);
+    }
 }
 
 static void xm_gpio_realize(DeviceState *dev, Error **errp)

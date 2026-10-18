@@ -15,6 +15,7 @@ from importlib import import_module
 jt = import_module('test-xm-h1-jpeg')
 
 BASE = 0x10020000
+SYS = 0x20000000
 OUT_EN, OUT_HIGH, IN_EN, IN_LEVEL = 1 << 10, 1 << 11, 1 << 12, 1 << 13
 
 
@@ -52,6 +53,26 @@ def main():
         # past the pads: plain RAM (control words, the light ADC)
         q.writel(BASE + 0x3e0, 0x80)
         check(q.readl(BASE + 0x3e0) == 0x80, 'a control word past the pads is RAM')
+
+        # reset: the pads come back undriven, and so do their output lines
+        def lines(cmd):
+            q.f.write(cmd + '\n'); q.f.flush()
+            seen = []
+            while True:
+                r = q.f.readline().strip()
+                seen.append(r)
+                if r.startswith(('OK', 'FAIL', 'ERR')):
+                    return seen
+        lines('irq_intercept_out /machine/xm-gpio')
+        seen = lines('writel 0x%x 0x%x' % (pad(3), OUT_EN | OUT_HIGH))
+        seen += lines('readl 0x%x' % pad(3))
+        check('IRQ raise 3' in seen, 'pad 3 driven high raises output line 3')
+        lines('writel 0x%x 1' % (SYS + 0x80))
+        seen = lines('writel 0x%x 0xca110000' % (SYS + 0x84))
+        for _ in range(3):
+            seen += lines('readl 0x%x' % pad(3))
+        check('IRQ lower 3' in seen, 'a machine reset lowers output line 3')
+        check(q.readl(pad(3)) == 0, 'and clears the pad register')
     finally:
         q.close()
 
