@@ -81,14 +81,27 @@ struct GkSflashState {
     uint8_t ear;        /* extended address register: 16 MiB bank */
 };
 
+/*
+ * The image is the flash: a change the guest sees must be on disk too.  A
+ * write that cannot be completed leaves the two apart for good, so it ends
+ * the run rather than letting the guest go on as if it had worked.
+ */
 static void gk_sflash_persist(GkSflashState *s, uint32_t off, uint32_t len)
 {
-    if (s->fd < 0) {
-        return;
-    }
-    if (pwrite(s->fd, s->array + off, len, off) != (ssize_t)len) {
-        error_report("gk-sflash: write-through to %s failed at 0x%x: %s",
-                     s->flash_file, off, strerror(errno));
+    while (s->fd >= 0 && len) {
+        ssize_t n = pwrite(s->fd, s->array + off, len, off);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            error_report("gk-sflash: write-through to %s failed at 0x%x: %s",
+                         s->flash_file, off,
+                         n < 0 ? strerror(errno) : "no progress");
+            exit(1);
+        }
+        off += n;
+        len -= n;
     }
 }
 
@@ -158,7 +171,8 @@ static uint32_t gk_sflash_data_read(GkSflashState *s)
     }
     switch (CMD_CODE(s->cmd)) {
     case 0x9F:                          /* RDID */
-        return s->jedec & ((1ull << (8 * n)) - 1);
+        /* The ID's bytes in the order they leave the chip. */
+        return n ? s->jedec >> (8 * (3 - MIN(n, 3))) : 0;
     case 0x05:                          /* RDSR */
         return s->sr[0];
     case 0x35:                          /* RDSR2 */
@@ -208,29 +222,42 @@ static void gk_sflash_data_write(GkSflashState *s, uint32_t val)
         return;
     }
     switch (CMD_CODE(s->cmd)) {
-    case 0x01:                          /* WRSR (+ SR2 as second byte) */
-        if (n >= 2) {
-            s->sr[0] = (s->sr[0] & 3) | ((val >> 8) & 0xFC);
+    case 0x01:
+    case 0x31:
+    case 0x11:
+    case 0xC5:
+        /* Status and extended-address writes need WREN, and use it up. */
+        if (!(s->sr[0] & SR1_WEL)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "gk-sflash: register write "
+                          "0x%02x without WREN\n", CMD_CODE(s->cmd));
+            return;
+        }
+        switch (CMD_CODE(s->cmd)) {
+        case 0x01:                      /* WRSR (+ SR2 as second byte) */
+            if (n >= 2) {
+                s->sr[0] = (s->sr[0] & 3) | ((val >> 8) & 0xFC);
+                s->sr[1] = val & 0xFF;
+            } else {
+                s->sr[0] = (s->sr[0] & 3) | (val & 0xFC);
+            }
+            break;
+        case 0x31:                      /* WRSR2 */
             s->sr[1] = val & 0xFF;
-        } else {
-            s->sr[0] = (s->sr[0] & 3) | (val & 0xFC);
+            break;
+        case 0x11:                      /* WRSR3 */
+            s->sr[2] = val & 0xFF;
+            break;
+        default:                        /* WREAR */
+            s->ear = val & 0xFF;
+            break;
         }
         s->sr[0] &= ~SR1_WEL;
         break;
-    case 0x31:                          /* WRSR2 */
-        s->sr[1] = val & 0xFF;
-        s->sr[0] &= ~SR1_WEL;
-        break;
-    case 0x11:                          /* WRSR3 */
-        s->sr[2] = val & 0xFF;
-        s->sr[0] &= ~SR1_WEL;
-        break;
-    case 0xC5:                          /* WREAR */
-        s->ear = val & 0xFF;
-        break;
     case 0x02:
     case 0x32:
-    case 0x38:                          /* page program, any lane width */
+    case 0x38: {                        /* page program, any lane width */
+        uint32_t first = s->addr;
+
         if (!(s->sr[0] & SR1_WEL)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "gk-sflash: program without WREN\n");
@@ -239,15 +266,23 @@ static void gk_sflash_data_write(GkSflashState *s, uint32_t val)
         for (i = 0; i < n; i++) {
             /* Within the page, as a NOR chip wraps it. */
             uint32_t a = s->addr;
-            uint8_t b = val >> (8 * (n - 1 - i));
 
             s->addr = (s->addr & ~0xFFu) | ((s->addr + 1) & 0xFF);
             if (a < s->size) {
-                s->array[a] &= b;
-                gk_sflash_persist(s, a, 1);
+                s->array[a] &= val >> (8 * (n - 1 - i));
+            }
+        }
+        /* Written back once: up to the page end, and past a wrap. */
+        if (first < s->size) {
+            uint32_t run = MIN(n, 0x100 - (first & 0xFF));
+
+            gk_sflash_persist(s, first, MIN(run, s->size - first));
+            if (run < n) {
+                gk_sflash_persist(s, first & ~0xFFu, n - run);
             }
         }
         break;
+    }
     default:
         qemu_log_mask(LOG_UNIMP, "gk-sflash: write for opcode 0x%02x\n",
                       CMD_CODE(s->cmd));
@@ -339,6 +374,15 @@ static void gk_sflash_realize(DeviceState *dev, Error **errp)
         if (s->fd < 0) {
             error_setg_errno(errp, errno, "gk-sflash: cannot open %s",
                              s->flash_file);
+            return;
+        }
+        /* Two machines on one image would each write back from their
+         * own copy, undoing the other's erases. */
+        if (qemu_lock_fd(s->fd, 0, 0, true)) {
+            error_setg(errp, "gk-sflash: %s is in use by another process",
+                       s->flash_file);
+            close(s->fd);
+            s->fd = -1;
             return;
         }
         len = lseek(s->fd, 0, SEEK_END);

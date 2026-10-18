@@ -332,7 +332,13 @@ static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
     uint8_t fcs_frame[FRAME_MAX + 4];
     const uint8_t *data = buf;
     size_t len = size;
-    if (s->rx_fcs && size <= FRAME_MAX) {
+    if (s->rx_fcs && size > FRAME_MAX) {
+        /* Past what the core takes with its FCS: dropped, not delivered
+         * under the other length convention. */
+        s->missed++;
+        return size;
+    }
+    if (s->rx_fcs) {
         memcpy(fcs_frame, buf, size);
         stl_le_p(fcs_frame + size, crc32(0, buf, size));
         data = fcs_frame;

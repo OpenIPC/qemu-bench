@@ -17,7 +17,9 @@
  * Undone, what is left is plain IP: the UART is an ordinary 16550 and the
  * VIC is PL190-shaped.  The models here are of the silicon as the HAL
  * drives it, recovered by executing the HAL for every fictitious address
- * (version 0x20160913, the SDK v2.0.0 blob; both camera dumps carry it).
+ * (qemu-boot/gk710x-halmap.py).  HAL 20151223 (the camera dumps), 20160324
+ * (the SDK's prebuilt U-Boots) and 20160913 (the SDK source) give the same
+ * map but for the I2S and crypto bit shuffles.
  *
  * The bit permutation that matters for wiring is the VIC's: the kernel's
  * IRQ n (mach-gk710x/include/mach/irqs.h) is VIC input irq_line[n].

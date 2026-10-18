@@ -132,6 +132,10 @@ def test_sflash(qt, path):
     print('gk-sflash')
     sf(qt, 0x9F | SEND_CMD | NBYTES(3))
     check('RDID: GD25Q of 1 MiB', qt.readl(SFLASH), 0xC84014)
+    sf(qt, 0x9F | SEND_CMD | NBYTES(1))
+    check('RDID, 1 byte: manufacturer first', qt.readl(SFLASH), 0xC8)
+    sf(qt, 0x9F | SEND_CMD | NBYTES(2))
+    check('RDID, 2 bytes', qt.readl(SFLASH), 0xC840)
 
     img = open(path, 'rb').read()
     sf(qt, 0x03 | SEND_CMD | ADDR3 | WORD, 0x10010)
@@ -143,6 +147,10 @@ def test_sflash(qt, path):
     sf(qt, 0x20 | SEND_CMD | ADDR3 | RWN_NONE, 0x10000)      # no WREN
     check('erase without WREN ignored', open(path, 'rb').read()[0x10010],
           img[0x10010])
+
+    sf(qt, 0xC5 | SEND_CMD | RWN_WRITE | NBYTES(1), 1)      # no WREN
+    sf(qt, 0xC8 | SEND_CMD | NBYTES(1))
+    check('WREAR without WREN ignored', qt.readl(SFLASH), 0)
 
     sf(qt, 0x06 | SEND_CMD | RWN_NONE)
     sf(qt, 0x05 | SEND_CMD | NBYTES(1))
@@ -224,6 +232,28 @@ def test_wdt(qt):
     qt.writel(WDT + 0x0C, 0)
 
 
+def test_rejections(qemu, path):
+    """Images and command lines the machine must refuse, with a reason."""
+    print('rejections')
+    bad = path + '.short'
+    img = bytearray(open(path, 'rb').read()[:0x10000])
+    # The write list's last pair cut in half by the end of the image.
+    img[:0x10000] = be_words([0x474B3731, 0x30310801, 1, 0xC0800000, 0, 0,
+                              0x5A5A5A5A] + [DDRC, 0] * 8188 + [DDRC])
+    assert len(img) == 0x10000
+    open(bad, 'wb').write(img)
+    r = subprocess.run([qemu, '-M', 'gk7102,flash-file=' + bad,
+                        '-display', 'none', '-nodefaults'],
+                       capture_output=True, text=True, timeout=20)
+    check('truncated boot header refused',
+          'runs past the image' in r.stderr, True)
+    r = subprocess.run([qemu, '-M', 'gk7102', '-display', 'none',
+                        '-nodefaults', '-kernel', '/dev/null',
+                        '-append', 'mem=100M'],
+                       capture_output=True, text=True, timeout=20)
+    check('mem= beyond DDR refused', 'does not fit' in r.stderr, True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -243,6 +273,7 @@ def main():
         test_wdt(qt)
     finally:
         qt.close()
+    test_rejections(args.qemu, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
 

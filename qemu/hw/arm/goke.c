@@ -138,14 +138,17 @@ static const GkSoCConfig *gk7102_config(void)
     return &c;
 }
 
-typedef struct GkMachineState {
+/* An abstract parent for both machines: the state and properties they
+ * share, and a checked cast. */
+#define TYPE_GK_MACHINE MACHINE_TYPE_NAME("gk")
+OBJECT_DECLARE_SIMPLE_TYPE(GkMachineState, GK_MACHINE)
+
+struct GkMachineState {
     MachineState parent_obj;
     char *flash_file;
     char *hal_file;
     char *sensor;
-} GkMachineState;
-
-#define GK_MACHINE(obj) ((GkMachineState *)(obj))
+};
 
 static char *gk_machine_get_flash_file(Object *obj, Error **errp)
 {
@@ -271,10 +274,21 @@ static bool gk_boot_rom_setup(const char *path, const GkSoCConfig *c,
     nwords = GKW(2);
     load = GKW(3);
     writes = g_array_new(false, false, sizeof(uint32_t));
-    for (i = 7; 4 * (i + 1) <= len; ) {
+    for (i = 7; ; ) {
+        if (4 * (uint64_t)(i + 1) > len) {
+            error_report("goke: %s: boot header write list runs past the "
+                         "image", path);
+            exit(1);
+        }
         w = GKW(i);
         if (w == 0) {
             break;
+        }
+        /* A poll is three words, a write two; both must be whole. */
+        if (4 * (uint64_t)(i + (w == GK_BOOT_POLL ? 3 : 2)) > len) {
+            error_report("goke: %s: boot header write list runs past the "
+                         "image", path);
+            exit(1);
         }
         if (w == GK_BOOT_POLL) {
             i += 3;
@@ -368,12 +382,31 @@ static bool gk_find_hal(const char *path, uint8_t *hal)
     return false;
 }
 
-/* mem=, which these kernels cannot do without: before arm_load_kernel(). */
+/*
+ * mem=, which these kernels cannot do without: before arm_load_kernel().
+ * Linux runs from PHYS_OFFSET, 2 MiB into DDR, and the BSB and the 64 KiB
+ * user page come out of what lies above it (gk_map_io), so mem= must leave
+ * room for them in the DDR there is.
+ */
+#define GK_PPM_SIZE         (2 * MiB)
+#define GK_USR_SIZE         (64 * KiB)
+
 static uint32_t gk_kernel_mem(MachineState *machine, const GkSoCConfig *c)
 {
     const char *cmdline = machine->kernel_cmdline ?: "";
     const char *mem = strstr(cmdline, "mem=");
+    const uint64_t room = machine->ram_size > GK_PPM_SIZE + c->bsb_mb * MiB +
+                          GK_USR_SIZE + MiB
+                          ? machine->ram_size - GK_PPM_SIZE -
+                            c->bsb_mb * MiB - GK_USR_SIZE
+                          : 0;
+    uint32_t mem_mb = MIN(c->kernel_mem_mb, room / MiB);
 
+    if (!room) {
+        error_report("goke: -m %" PRIu64 "M leaves no room for Linux",
+                     machine->ram_size / MiB);
+        exit(1);
+    }
     if (mem) {
         const char *end;
         uint64_t bytes;
@@ -382,12 +415,18 @@ static uint32_t gk_kernel_mem(MachineState *machine, const GkSoCConfig *c)
             error_report("goke: cannot parse '%s'", mem);
             exit(1);
         }
+        if (bytes > room) {
+            error_report("goke: mem=%" PRIu64 "M does not fit: %" PRIu64
+                         " MiB of DDR leave %" PRIu64 "M above the kernel's "
+                         "2 MiB and the BSB", bytes / MiB,
+                         machine->ram_size / MiB, room / MiB);
+            exit(1);
+        }
         return bytes / MiB;
     }
     machine->kernel_cmdline = g_strdup_printf("%s%smem=%uM", cmdline,
-                                              *cmdline ? " " : "",
-                                              c->kernel_mem_mb);
-    return c->kernel_mem_mb;
+                                              *cmdline ? " " : "", mem_mb);
+    return mem_mb;
 }
 
 static void gk_kernel_handoff(MachineState *machine, const GkSoCConfig *c,
@@ -660,6 +699,44 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
     }
 }
 
+static void gk_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->default_ram_id = "goke.ram";
+    mc->ignore_memory_transaction_failures = true;
+    object_class_property_add_str(oc, "flash-file",
+        gk_machine_get_flash_file, gk_machine_set_flash_file);
+    object_class_property_set_description(oc, "flash-file",
+        "SPI NOR image as dumped from the camera (boot header at 0); "
+        "erases and programs are written back to it");
+    object_class_property_add_str(oc, "sensor",
+        gk_machine_get_sensor, gk_machine_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "image sensor on I2C 0: none (default), jxh42, jxh62, f37");
+    object_class_property_add_str(oc, "hal-file",
+        gk_machine_get_hal_file, gk_machine_set_hal_file);
+    object_class_property_set_description(oc, "hal-file",
+        "image holding the vendor HAL for -kernel boots (a U-Boot "
+        "binary or flash dump; default: flash-file)");
+}
+
+static const TypeInfo gk_machine_info = {
+    .name           = TYPE_GK_MACHINE,
+    .parent         = TYPE_MACHINE,
+    .abstract       = true,
+    .instance_size  = sizeof(GkMachineState),
+    .class_init     = gk_machine_class_init,
+    .interfaces     = arm_machine_interfaces,
+};
+
+static void gk_machine_register_types(void)
+{
+    type_register_static(&gk_machine_info);
+}
+
+type_init(gk_machine_register_types)
+
 #define DEFINE_GK_MACHINE(namestr, tag, config)                      \
     static void tag##_init(MachineState *machine)                    \
     {                                                                \
@@ -671,27 +748,8 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
         mc->init = tag##_init;                                       \
         mc->default_cpu_type = config.cpu_type;                      \
         mc->default_ram_size = config.ram_size_default;              \
-        mc->default_ram_id = "goke.ram";                             \
-        mc->ignore_memory_transaction_failures = true;               \
-        object_class_property_add_str(OBJECT_CLASS(mc), "flash-file", \
-            gk_machine_get_flash_file, gk_machine_set_flash_file);   \
-        object_class_property_set_description(OBJECT_CLASS(mc),      \
-            "flash-file", "SPI NOR image as dumped from the camera "  \
-            "(boot header at 0); erases and programs are written "    \
-            "back to it");                                           \
-        object_class_property_add_str(OBJECT_CLASS(mc), "sensor",    \
-            gk_machine_get_sensor, gk_machine_set_sensor);           \
-        object_class_property_set_description(OBJECT_CLASS(mc),      \
-            "sensor", "image sensor on I2C 0: none (default), "      \
-            "jxh42, jxh62, f37");                                    \
-        object_class_property_add_str(OBJECT_CLASS(mc), "hal-file",  \
-            gk_machine_get_hal_file, gk_machine_set_hal_file);       \
-        object_class_property_set_description(OBJECT_CLASS(mc),      \
-            "hal-file", "image holding the vendor HAL for -kernel "  \
-            "boots (a U-Boot binary or flash dump; default: "        \
-            "flash-file)");                                          \
     }                                                                \
-    DEFINE_MACHINE_EXTENDED(namestr, MACHINE, GkMachineState,        \
+    DEFINE_MACHINE_EXTENDED(namestr, GK_MACHINE, GkMachineState,     \
                             tag##_class_init, false,                  \
                             arm_machine_interfaces)
 
