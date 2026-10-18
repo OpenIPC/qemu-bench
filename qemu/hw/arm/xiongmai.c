@@ -194,9 +194,9 @@ static const XmSoCConfig xm530_soc = {
     /* ...then programs PHY +0xA8 and waits for +0xB8 to echo it. */
     .ddrc_mirror        = 0x10B8,
     .ddrc_mirror_of     = 0x10A8,
-    .num_regbanks       = 6,
+    .gpio_base          = 0x10020000,
+    .num_regbanks       = 5,
     .regbanks           = {
-        { "xm-gpio",     0x10020000, 0x10000 },
         { "xm-i2c1",     0x10001000, 0x0F000 },  /* xm_i2c1, unmodelled */
         { "xm-dma",      0x20020000, 0x10000 },  /* DMAC_BASE */
         { "xm-rtc",      0x100A0000, 0x10000 },
@@ -549,6 +549,16 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 
     if (c->h1_base) {
         sysbus_create_simple("xm-h1", c->h1_base, pic[c->h1_irq]);
+    }
+
+    if (c->gpio_base) {
+        /* A named child, so qtest and a board can reach its input lines at
+         * /machine/xm-gpio. */
+        DeviceState *gpio = qdev_new("xm-gpio");
+
+        object_property_add_child(OBJECT(machine), "xm-gpio", OBJECT(gpio));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, c->gpio_base);
     }
 
     if (c->wdt_base) {

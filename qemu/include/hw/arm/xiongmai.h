@@ -120,6 +120,9 @@ typedef struct XmSoCConfig {
     int         isp_irq, isp_irqs;
 
     /* Hantro H1 encoder (xm-h1), XM530: hx280enc base_port / irq. */
+    /* Pad controller (xm-gpio), XM530: a register per pad, mux and GPIO. */
+    hwaddr      gpio_base;
+
     hwaddr      h1_base;
     int         h1_irq;
 
