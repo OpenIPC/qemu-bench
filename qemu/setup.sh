@@ -54,6 +54,19 @@ cp qemu/hw/misc/gk-wdt.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-sflash.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-ephy.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/gk-idc.c             "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/ak-l2.c             "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/ak-ddrc.c           "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/ak-l2.h     "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/char/ak-uart.c           "$QEMU_DIR/hw/char/"
+cp qemu/hw/ssi/ak-spi.c             "$QEMU_DIR/hw/ssi/"
+cp qemu/hw/ssi/ak-spinor.c          "$QEMU_DIR/hw/ssi/"
+cp qemu/hw/gpio/ak-gpio.c           "$QEMU_DIR/hw/gpio/"
+cp qemu/hw/usb/ak-usb.c             "$QEMU_DIR/hw/usb/"
+cp qemu/hw/i2c/ak-i2c.c             "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/sd/ak-mci.c              "$QEMU_DIR/hw/sd/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -287,6 +300,47 @@ if ! grep -q "'goke.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_GOKE', if_true: files('goke.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added goke.c"
+fi
+
+# Anyka AK39xx: ARM926 camera SoCs (hw/arm/anyka.c).  Same guarded
+# appends as Goke, for a fresh tree and an existing one alike.
+if ! grep -q "^config ANYKA$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config ANYKA
+    bool
+    default y
+    depends on TCG && ARM
+    select PTIMER
+    select HISI_MISC
+    select UNIMP
+    select SSI
+    select I2C
+    select XM_DWMAC
+    select SD
+KCONFIG
+    echo "  hw/arm/Kconfig: added ANYKA"
+else
+    for sym in I2C XM_DWMAC SD; do
+        if ! sed -n '/^config ANYKA$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config ANYKA\$/,/^\$/{/select SSI\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: ANYKA now selects $sym"
+        fi
+    done
+fi
+for f in misc/ak-sysctrl misc/ak-l2 misc/ak-ddrc char/ak-uart ssi/ak-spi ssi/ak-spinor gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
+    if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('${f#*/}.c'))" \
+            >> "$QEMU_DIR/hw/${f%/*}/meson.build"
+        echo "  hw/${f%/*}/meson.build: added ${f#*/}.c"
+    fi
+done
+if ! grep -q "'anyka.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_ANYKA', if_true: files('anyka.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added anyka.c"
 fi
 
 # hw/misc/Kconfig
