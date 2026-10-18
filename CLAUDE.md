@@ -169,6 +169,16 @@ designated initialisers make last-writer-wins. Caveat: array members such as
 `.regbanks` / `.uart_bases` cannot be partially overridden; re-list the whole
 array when a die differs.
 
+Two non-HiSilicon families have their own table and init instead of
+`HisiSoCConfig` slots: Xiongmai XM510/XM530/XM550 (`hw/arm/xiongmai.c`,
+`docs/xiongmai.md`) and Goke GK7101/GK7102 (`hw/arm/goke.c`,
+`docs/goke-gk710x.md`). On GK710x the vendor code reaches registers only
+through a HAL blob that relocates, reorders and bit-permutes them: model the
+silicon at the addresses the HAL drives (`qemu-boot/gk710x-halmap.py` prints
+them), never the fictitious `0x90000000`/`0xA0000000` map the drivers use.
+Its flash images are byte-swapped per 32-bit word, and `-kernel` boots need
+`hal-file=` (the HAL is vendor code; it is not shipped).
+
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB
 outliers. `hardware_reference.md` (CV300/EV300, from SDK DTS) and
