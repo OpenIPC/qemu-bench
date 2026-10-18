@@ -407,7 +407,28 @@ Interrupt blocks follow XM530's shape, enable at +0 and status at +0xC:
   - the `gpio-xm530` kernel driver (OpenIPC/linux#98) drives them through
     `/sys/class/gpio` instead.
 
-  XM510 has a different, packed layout and keeps its stub.
+- **GPIO (`xm510-gpio`), XM510:** the same 0x10020000, but banked, eight pins
+  a port, ports 0..8:
+  - mux word of port P at `+P*4`: pin b is a GPIO while bits b, 8+b and 16+b,
+    its three functions, are all clear;
+  - data at `+0x40 + P*0x10`: writes latch the output levels, reads give the
+    pins, the latch where the output is enabled and the input line elsewhere;
+  - output enable at `+0x44 + P*0x10`, 1 = output.
+
+  Pin b of port P is line P*8 + b, qdev GPIO input/output N at
+  `/machine/xm-gpio` as on XM530, and every change in what a pin drives is
+  logged as `xm510-gpio: gpio N high/low/released`. A muxed pin drives
+  nothing. `+8`/`+C` of a port and everything past the ports stay RAM,
+  `+0xD0` included: that is the MAC's speed select, which the `xmmac` driver
+  sets for 100 Mb/s, not a tenth port. So is the IR-cut block at `+0x100`:
+  the stock ISP daemon unlocks it with `0x1ACCE551`, writes the direction to
+  `+0x104` and drives `+0x108` for 200 ms, with port 6 pin 7 (line 55) as the
+  driver's enable. On a lab XM510 that moves the filter; here it only holds
+  what was written.
+
+  The layout is the vendor's `sdio1_sd.c`/`sdio2_wifi.c` helpers and a lab
+  XM510's registers at rest. The stock nightly boots to the same rest state:
+  mux 0/1/5/7 = `0x3000`/`0x300500`/`0xf`/`0x1`, and port 8 driving pin 1
+  (line 65) high.
 - **Regbanks:** blocks with no model yet are RAM-backed `hisi-regbank` stubs,
-  so drivers and vendor modules can map them: PL330, RTC, I2S, and the GPIO
-  block on XM510.
+  so drivers and vendor modules can map them: PL330, RTC and I2S.

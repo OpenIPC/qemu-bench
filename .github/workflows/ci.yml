@@ -74,6 +74,10 @@ jobs:
       - name: XM530 pad GPIO (xm-gpio)
         run: python3 qemu/tests/test-xm-gpio.py
 
+      # XM510's banked GPIO: data/output enable per port, muxed pins idle.
+      - name: XM510 GPIO (xm510-gpio)
+        run: python3 qemu/tests/test-xm510-gpio.py
+
       # The GK710x models driven over qtest at the silicon addresses the
       # vendor HAL drives: boot-ROM header, SPI-NOR byte order and
       # write-back, timer edge into the VIC, I2C to a sensor, watchdog.
