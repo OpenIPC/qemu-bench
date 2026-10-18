@@ -5162,6 +5162,33 @@ static void hisilicon_common_init(MachineState *machine,
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
 
     /*
+     * The DDR controller decodes its whole window and the fitted chip
+     * ignores the address bits it does not have, so on silicon an access
+     * past the end of RAM wraps back onto it. Firmware relies on that:
+     * U-Boot's get_ram_size() and the Goke kernel's DRAM probe measure the
+     * chip by the wrap, and a U-Boot built for a bigger part relocates to
+     * the top of the size it was told and still runs, inside the alias.
+     * Left unmapped, that U-Boot resets in a loop here and the probes see
+     * no memory instead of the wrap. So mirror RAM across the rest of a
+     * 1 GiB window, under every device, so MMIO in that range still wins.
+     * DDR parts are powers of two; another -m is left as it is.
+     */
+    if (c->ram_base && is_power_of_2(machine->ram_size)) {
+        for (uint64_t off = machine->ram_size; off < 1 * GiB;
+             off += machine->ram_size) {
+            MemoryRegion *mirror = g_new(MemoryRegion, 1);
+            char *name = g_strdup_printf("hisilicon.ram-wrap@0x%" PRIx64,
+                                         (uint64_t)c->ram_base + off);
+
+            memory_region_init_alias(mirror, NULL, name, machine->ram, 0,
+                                     machine->ram_size);
+            memory_region_add_subregion_overlap(sysmem, c->ram_base + off,
+                                                mirror, -1000);
+            g_free(name);
+        }
+    }
+
+    /*
      * V1 DDR controller + PHY.  On a flash boot DDR stays unusable until
      * U-Boot's reg_info table starts the PHY, so an image built without
      * the table fails here as it does on a board (OpenIPC/firmware#2593).
