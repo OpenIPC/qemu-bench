@@ -239,6 +239,11 @@ typedef struct HisiSoCConfig {
     int             num_i2c;
     hwaddr          i2c_bases[HISI_MAX_I2C];
     const char     *i2c_type;       /* NULL = "hisi-i2c", or "hisi-i2c-v1" */
+    /* GIC SPI of each controller; 0 = not wired. A kernel whose device tree
+     * gives the controllers interrupts runs i2c-hibvt in interrupt mode and
+     * waits for them -- 1 s per message, then "rx/tx timeout", when the line
+     * goes nowhere. */
+    int             i2c_irqs[HISI_MAX_I2C];
 
     /* MIPI RX (CSI-2 / LVDS receiver) */
     hwaddr          mipi_rx_base;   /* 0 = no MIPI RX */

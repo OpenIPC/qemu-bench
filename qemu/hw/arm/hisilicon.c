@@ -1012,6 +1012,9 @@ static const HisiSoCConfig hi3516cv500_soc = {
     .num_i2c            = 7,
     .i2c_bases          = { 0x120B0000, 0x120B1000, 0x120B2000, 0x120B3000,
                             0x120B5000, 0x120B6000, 0x120B7000 },
+    /* I2C0-3 are SPI 11-14, I2C5-7 SPI 77-79 (Hi3516CV500/AV300/DV300 data
+     * sheets' interrupt table; OpenIPC/linux hisilicon-hi3516cv500 #94). */
+    .i2c_irqs           = { 11, 12, 13, 14, 77, 78, 79 },
 
     .mipi_rx_base       = 0x113A0000,
     .mipi_rx_irq        = 57,
@@ -1130,6 +1133,9 @@ static const HisiSoCConfig hi3516av300_soc = {
     .num_i2c            = 7,
     .i2c_bases          = { 0x120B0000, 0x120B1000, 0x120B2000, 0x120B3000,
                             0x120B5000, 0x120B6000, 0x120B7000 },
+    /* I2C0-3 are SPI 11-14, I2C5-7 SPI 77-79 (Hi3516CV500/AV300/DV300 data
+     * sheets' interrupt table; OpenIPC/linux hisilicon-hi3516cv500 #94). */
+    .i2c_irqs           = { 11, 12, 13, 14, 77, 78, 79 },
 
     .mipi_rx_base       = 0x113A0000,
     .mipi_rx_irq        = 57,
@@ -1255,6 +1261,9 @@ static const HisiSoCConfig hi3516dv300_soc = {
     .num_i2c            = 7,
     .i2c_bases          = { 0x120B0000, 0x120B1000, 0x120B2000, 0x120B3000,
                             0x120B5000, 0x120B6000, 0x120B7000 },
+    /* I2C0-3 are SPI 11-14, I2C5-7 SPI 77-79 (Hi3516CV500/AV300/DV300 data
+     * sheets' interrupt table; OpenIPC/linux hisilicon-hi3516cv500 #94). */
+    .i2c_irqs           = { 11, 12, 13, 14, 77, 78, 79 },
 
     .mipi_rx_base       = 0x113A0000,
     .mipi_rx_irq        = 57,
@@ -5640,6 +5649,9 @@ static void hisilicon_common_init(MachineState *machine,
         i2c_devs[n] = qdev_new(i2c_type);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c_devs[n]), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(i2c_devs[n]), 0, c->i2c_bases[n]);
+        if (c->i2c_irqs[n]) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(i2c_devs[n]), 0, pic[c->i2c_irqs[n]]);
+        }
     }
 
     /* MIPI RX */
