@@ -389,5 +389,25 @@ Interrupt blocks follow XM530's shape, enable at +0 and status at +0xC:
     result was RX packets: 0 and no DHCP lease.
   - On silicon the same race exists, but only for a frame arriving within
     microseconds of `ifconfig up`.
+- **Pad GPIO (`xm-gpio`), XM530/XM550:** 0x10020000, one register per pad,
+  its mux and its GPIO. The bits are:
+  - MUX1-3: bits 1-3;
+  - drive strength: bits 7:6;
+  - output enable: bit 10;
+  - output level: bit 11;
+  - input enable: bit 12;
+  - input level: bit 13, read only.
+
+  A lab XM550 populates pads 0..99; the words after them are control
+  registers and stay RAM. Bit 13 reads the driven level while output is
+  enabled, otherwise the pad's input line: qdev GPIO input N at
+  `/machine/xm-gpio`, for qtest. Every output change is logged under
+  `-d unimp` as `xm-gpio: pad N high/low`, which shows who drives what:
+  - the stock vendor ISP pulses the IR-cut pair, pads 1/2, at start;
+  - the `gpio-xm530` kernel driver (OpenIPC/linux#98) drives them through
+    `/sys/class/gpio` instead.
+
+  XM510 has a different, packed layout and keeps its stub.
 - **Regbanks:** blocks with no model yet are RAM-backed `hisi-regbank` stubs,
-  so drivers and vendor modules can map them: GPIO, PL330, RTC and I2S.
+  so drivers and vendor modules can map them: PL330, RTC, I2S, and the GPIO
+  block on XM510.

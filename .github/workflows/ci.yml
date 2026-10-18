@@ -66,6 +66,11 @@ jobs:
       - name: Hantro H1 H.264 encode (xm-h1)
         run: python3 qemu/tests/test-xm-h1-h264.py
 
+      # The XM530 pad controller as the gpio-xm530 kernel driver and the
+      # vendor ISP drive it: output levels, input lines, mux bits kept.
+      - name: XM530 pad GPIO (xm-gpio)
+        run: python3 qemu/tests/test-xm-gpio.py
+
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
         with:
