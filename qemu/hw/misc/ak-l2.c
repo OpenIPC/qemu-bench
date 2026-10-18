@@ -97,6 +97,7 @@ static void ak_l2_clear(AkL2State *s, int n)
     b->status = 0;
     b->dev_blk = 0;
     b->mem_blk = 0;
+    b->frac_blk = -1;
 }
 
 uint8_t *ak_l2_mem(AkL2State *s)
@@ -197,7 +198,6 @@ static bool ak_l2_frac_step(AkL2State *s)
     unsigned l2addr = (req >> 1) & 0x7F;
     unsigned len = ((req >> 10) & 0x3F) + 1;
     hwaddr ddr = AK_DDR_BASE | ((fa >> 2) & 0x30000000) | (fa & 0x0FFFFFFF);
-    bool covers_last = len > 0x3C;
     uint8_t *p;
     int n;
 
@@ -212,12 +212,21 @@ static bool ak_l2_frac_step(AkL2State *s)
         n = l2addr >> 3;
         p = ak_l2_block(s, n, l2addr & 7);
     }
+    /*
+     * A fraction is a whole block's worth of handshake, however short:
+     * towards L2 it fills the block, out of L2 it drains it.  The kernel
+     * then also writes the last word of a short filled block to "inform
+     * full" (l2_combuf_wait_dma_finish); frac_blk makes that a no-op.
+     */
     if (req & DMAREQ_FRAC_TO_L2) {
+        if (n >= 0 && s->buf[n].status >= AK_L2_COMBUF_BLOCKS) {
+            return false;       /* no room for it yet */
+        }
         dma_memory_read(&address_space_memory, ddr, p, len,
                         MEMTXATTRS_UNSPECIFIED);
-        if (n >= 0 && covers_last &&
-            s->buf[n].status < AK_L2_COMBUF_BLOCKS) {
+        if (n >= 0) {
             s->buf[n].status++;
+            s->buf[n].frac_blk = l2addr & 7;
         }
     } else {
         if (n >= 0 && !s->buf[n].status) {
@@ -225,7 +234,7 @@ static bool ak_l2_frac_step(AkL2State *s)
         }
         dma_memory_write(&address_space_memory, ddr, p, len,
                          MEMTXATTRS_UNSPECIFIED);
-        if (n >= 0 && covers_last) {
+        if (n >= 0) {
             s->buf[n].status--;
         }
     }
@@ -277,6 +286,10 @@ static void ak_l2_cpu_handshake(AkL2State *s, hwaddr addr, unsigned size,
         return;
     }
     b = &s->buf[n];
+    if (write && b->frac_blk == (addr % AK_L2_COMBUF_SIZE) / AK_L2_BLOCK) {
+        b->frac_blk = -1;       /* a fraction DMA already filled it */
+        return;
+    }
     if (write) {
         if (b->status < AK_L2_COMBUF_BLOCKS) {
             b->status++;
@@ -473,6 +486,7 @@ static const VMStateDescription vmstate_ak_l2_buf = {
         VMSTATE_UINT8(status, AkL2Buf),
         VMSTATE_UINT8(dev_blk, AkL2Buf),
         VMSTATE_UINT8(mem_blk, AkL2Buf),
+        VMSTATE_INT8(frac_blk, AkL2Buf),
         VMSTATE_UINT32(dma_left, AkL2Buf),
         VMSTATE_UINT32(dma_addr, AkL2Buf),
         VMSTATE_END_OF_LIST()

@@ -180,8 +180,15 @@ static bool ak_spi_run(AkSpiState *s)
     while (s->cnt) {
         uint8_t out = 0xFF, in;
 
+        /*
+         * Room for what comes back first: nothing is taken off the TX
+         * side for a byte that cannot be clocked.
+         */
         if (ak_spi_rx_l2(s) && !tx_only && s->rxblk_len == AK_L2_BLOCK &&
             !ak_spi_flush_rxblk(s)) {
+            break;
+        }
+        if (!tx_only && !ak_spi_rx_l2(s) && fifo8_is_full(&s->rxfifo)) {
             break;
         }
         if (!rx_only) {
@@ -204,10 +211,6 @@ static bool ak_spi_run(AkSpiState *s)
                 out = fifo8_pop(&s->txfifo);
             }
         }
-        if (!tx_only && !ak_spi_rx_l2(s) && fifo8_is_full(&s->rxfifo)) {
-            break;
-        }
-
         in = ssi_transfer(s->bus, out);
         s->cnt--;
         progress = true;
@@ -390,10 +393,20 @@ static const Property ak_spi_properties[] = {
                        AK_L2_DEV_SPI0_TX),
 };
 
+static int ak_spi_post_load(void *opaque, int version_id)
+{
+    AkSpiState *s = opaque;
+
+    ak_spi_update_cs(s);
+    ak_spi_update_irq(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_spi = {
     .name = TYPE_AK_SPI,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_spi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(con, AkSpiState),
         VMSTATE_UINT32(inten, AkSpiState),

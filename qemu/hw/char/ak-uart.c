@@ -280,10 +280,17 @@ static const Property ak_uart_properties[] = {
     DEFINE_PROP_UINT32("index", AkUartState, index, 0),
 };
 
+static int ak_uart_post_load(void *opaque, int version_id)
+{
+    ak_uart_update_irq(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_uart = {
     .name = TYPE_AK_UART,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_uart_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(conf1, AkUartState),
         VMSTATE_UINT32(conf2, AkUartState),

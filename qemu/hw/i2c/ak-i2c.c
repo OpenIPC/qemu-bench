@@ -233,10 +233,17 @@ static void ak_i2c_init(Object *obj)
     s->bus = i2c_init_bus(DEVICE(obj), "i2c");
 }
 
+static int ak_i2c_post_load(void *opaque, int version_id)
+{
+    ak_i2c_update_irq(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_i2c = {
     .name = TYPE_AK_I2C,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_i2c_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, AkI2cState),
         VMSTATE_UINT32_ARRAY(cmd, AkI2cState, 4),

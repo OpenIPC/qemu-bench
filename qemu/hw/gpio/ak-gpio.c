@@ -51,11 +51,8 @@ struct AkGpioState {
 
 static uint32_t ak_gpio_level(AkGpioState *s, int b)
 {
-    uint32_t in = ~(uint32_t)(s->input_low >> (32 * b));
+    uint32_t in = b < 2 ? ~(uint32_t)(s->input_low >> (32 * b)) : 0xFFFFFFFF;
 
-    if (b == 2) {
-        in = 0xFFFFFFFF;
-    }
     return (s->regs[R_DIR][b] & s->regs[R_OUT][b]) |
            (~s->regs[R_DIR][b] & in);
 }
@@ -154,10 +151,17 @@ static const Property ak_gpio_properties[] = {
     DEFINE_PROP_UINT64("input-low", AkGpioState, input_low, 0),
 };
 
+static int ak_gpio_post_load(void *opaque, int version_id)
+{
+    ak_gpio_update(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_gpio = {
     .name = TYPE_AK_GPIO,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_gpio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_2DARRAY(regs, AkGpioState, R_NUM, AK_GPIO_BANKS),
         VMSTATE_END_OF_LIST()

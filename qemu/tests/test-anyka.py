@@ -19,7 +19,12 @@ script plays the vendor drivers (docs/anyka.md):
   - the GMAC (xm-dwmac): the PHY over MDIO, and a TX ring of the driver's
     24-byte descriptors (descriptor skip length 2) walked to its end;
   - ak-mci with no card: a command times out, interrupting through MASK,
-    and reading STATUS clears it.
+    and reading STATUS clears it;
+  - a full-duplex PIO transfer that fills the RX FIFO loses no TX byte, and
+    an L2 read whose DMA ends in a short fraction drains the buffer;
+  - outside qtest: a flash image smaller than an erase block is refused,
+    machine state migrates to a file and back on five- and ten-timer
+    parts, and a file-backed flash blocks migration.
 
     python3 qemu/tests/test-anyka.py [--qemu PATH]
 """
@@ -264,6 +269,80 @@ def test_spi(qt, path):
           bytes(i * 7 & 0xFF for i in range(0x12000, 0x12004)))
 
 
+def test_spi_more(qt, path):
+    print('ak-spi: duplex with a full RX FIFO, L2 fraction tail')
+    img = open(path, 'rb').read()
+    # RDID shifted out with 11 filler bytes, both directions, OUT written
+    # three words ahead of IN: the third waits for FIFO room, intact.
+    qt.writel(SPI0, 0x270)
+    qt.writel(SPI0 + 0x0C, 12)
+    for w in (0x9F, 0, 0):
+        qt.writel(SPI0 + 0x18, w)
+    got = b''.join(qt.readl(SPI0 + 0x1C).to_bytes(4, 'little')
+                   for _ in range(3))
+    check('12 bytes in step with the 12 sent', got,
+          b'\xFF' + bytes.fromhex('c84017') * 3 + bytes.fromhex('c840'))
+    spi_end(qt)
+
+    # 100 bytes: one 64-byte block by DMA, the 36-byte tail by fraction
+    # DMA out of block 1 of buffer 1.
+    dst = DDR + 0x300000
+    qt.writel(L2 + 0x88, (1 << 1) | (1 << 17))
+    qt.writel(L2 + 0x90, 1 << 21)
+    qt.writel(L2 + 0x88, (1 << 1) | (1 << 17) | (1 << 25))
+    spi_tx(qt, b'\x03\x01\x90\x00')
+    qt.writel(SPI0, 0x271)
+    qt.writel(SPI0 + 0x14, 0x10001)
+    qt.writel(SPI0 + 0x0C, 100)
+    qt.writel(L2 + 0x04, dst)
+    qt.writel(L2 + 0x44, 1)
+    qt.writel(L2 + 0x80, (1 << 25) | 1)
+    qt.writel(L2 + 0x84, (3 << 28) | ((dst + 64) & 0x0FFFFFFF))
+    qt.writel(L2 + 0x80, 1 | (1 << 9) | (35 << 10) | (((1 << 3) | 1) << 1))
+    check('fraction DMA done', qt.readl(L2 + 0x80) & (1 << 9), 0)
+    check('buffer drained', (qt.readl(L2 + 0xA0) >> 4) & 0xF, 0)
+    got = b''.join(qt.readl(dst + i).to_bytes(4, 'little')
+                   for i in range(0, 100, 4))
+    check('100 bytes via block + fraction DMA', got, img[0x19000:0x19064])
+    qt.writel(SPI0 + 0x14, 0)
+    qt.writel(L2 + 0x88, 0)
+    spi_end(qt)
+
+
+def hmp(qemu, args, cmds):
+    """Run QEMU with an HMP monitor on stdio; return what it printed."""
+    p = subprocess.run([qemu] + args + ['-display', 'none', '-nodefaults',
+                                        '-monitor', 'stdio'],
+                       input='\n'.join(cmds + ['quit']) + '\n',
+                       capture_output=True, text=True, timeout=60)
+    return p.stdout + p.stderr
+
+
+def test_rejections_and_migration(qemu, tmp, path):
+    print('flash size, migration')
+    small = os.path.join(tmp, 'small.bin')
+    open(small, 'wb').write(b'\xFF' * 0x8000)
+    out = subprocess.run([qemu, '-M', 'ak3918ev300,flash-file=' + small,
+                          '-display', 'none', '-nodefaults', '-S'],
+                         capture_output=True, text=True, timeout=30)
+    check('a 32 KiB flash image is refused',
+          out.returncode != 0 and '64 KiB' in out.stderr, True)
+    for m in ('ak3918ev300', 'ak3919ev330'):
+        mig = os.path.join(tmp, m + '.mig')
+        out = hmp(qemu, ['-M', m, '-S'],
+                  ['migrate file:' + mig, 'info migrate'])
+        check('%s: state saved' % m, 'completed' in out and
+              'Assertion' not in out and os.path.getsize(mig) > 0, True)
+        out = hmp(qemu, ['-M', m, '-S', '-incoming', 'file:' + mig],
+                  ['info status'])
+        check('%s: and loaded back' % m, 'error' not in out.lower() and
+              'Assertion' not in out, True)
+    out = hmp(qemu, ['-M', 'ak3918ev300,flash-file=' + path, '-S'],
+              ['migrate file:' + os.path.join(tmp, 'blocked.mig')])
+    check('file-backed flash blocks migration', 'written through' in out,
+          True)
+
+
 def test_misc(qt):
     print('ak-gpio, ak-ddrc, ak-i2c')
     check('GPIO inputs pulled up', qt.readl(GPIO + 0x18), 0xFFFFFFFF)
@@ -359,6 +438,7 @@ def main():
         test_sysctrl(qt)
         test_uart(qt, out)
         test_spi(qt, path)
+        test_spi_more(qt, path)
         test_misc(qt)
         test_mac(qt)
         test_mci(qt)
@@ -367,6 +447,7 @@ def main():
     path330 = os.path.join(tmp, 'flash330.bin')
     make_image(path330, b'ANYKAH3B')
     test_ev330(args.qemu, path330)
+    test_rejections_and_migration(args.qemu, tmp, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
 

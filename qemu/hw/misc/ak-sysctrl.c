@@ -386,7 +386,7 @@ static void ak_sysctrl_reset(DeviceState *dev)
     s->regs[R_CPU_PLL] = 0x011253C8;
     s->regs[R_ASIC_PLL] = 0x018213C8;
     s->regs[R_PERI_PLL1] = 0x000012C8;
-    for (n = 0; n < s->num_timers; n++) {
+    for (n = 0; n < AK_TIMER_MAX; n++) {
         AkTimer *t = &s->timer[n];
 
         ptimer_transaction_begin(t->ptimer);
@@ -414,6 +414,7 @@ static void ak_sysctrl_reset(DeviceState *dev)
         s->rtc[1] = ((tm.tm_wday & 7) << 10) | (tm.tm_mday << 5) | tm.tm_hour;
         s->rtc[2] = (MAX(tm.tm_year - 80, 0) << 4) | (tm.tm_mon + 1);
     }
+    ak_sysctrl_update(s);
 }
 
 static void ak_sysctrl_realize(DeviceState *dev, Error **errp)
@@ -426,7 +427,11 @@ static void ak_sysctrl_realize(DeviceState *dev, Error **errp)
                    AK_TIMER_MAX);
         return;
     }
-    for (n = 0; n < s->num_timers; n++) {
+    /*
+     * All AK_TIMER_MAX, though only num_timers decode: the VMState saves
+     * the whole array, and a NULL ptimer there trips its save path.
+     */
+    for (n = 0; n < AK_TIMER_MAX; n++) {
         AkTimer *t = &s->timer[n];
 
         t->parent = s;
@@ -476,10 +481,17 @@ static const VMStateDescription vmstate_ak_timer = {
     }
 };
 
+static int ak_sysctrl_post_load(void *opaque, int version_id)
+{
+    ak_sysctrl_update(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_sysctrl = {
     .name = TYPE_AK_SYSCTRL,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_sysctrl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS),
         VMSTATE_UINT32(level, AkSysctrlState),

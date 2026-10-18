@@ -14,7 +14,10 @@
  * the descriptor in the boot header (SPIP, hw/arm/anyka.c), and parts like
  * the ZB25VQ64 or XM25QH64A have no m25p80 model.  The command set is the
  * common 3-byte-address one plus 4-byte mode for the parts above 16 MiB.
- * Erases and programs are written back to the flash-file.
+ * Erases and programs are written back to the flash-file.  The file is
+ * the flash, so a machine with one cannot be migrated or snapshotted
+ * (the destination would reopen it while the source still writes it);
+ * without one, the contents travel in the migration stream.
  */
 
 #include "qemu/osdep.h"
@@ -25,6 +28,7 @@
 #include "qemu/units.h"
 #include "hw/qdev-properties.h"
 #include "hw/ssi/ssi.h"
+#include "migration/blocker.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
 
@@ -51,6 +55,7 @@ struct AkSpinorState {
     uint32_t size;
     int fd;
     uint8_t *array;
+    Error *migration_blocker;
 
     uint8_t phase;
     uint8_t cmd;
@@ -339,15 +344,23 @@ static void ak_spinor_realize(SSIPeripheral *dev, Error **errp)
             return;
         }
         len = lseek(s->fd, 0, SEEK_END);
-        if (len <= 0 || len > 128 * MiB || (len & (len - 1))) {
-            error_setg(errp, "ak-spinor: %s is not a power-of-two size up "
-                       "to 128 MiB", s->flash_file);
+        if (len < 64 * KiB || len > 128 * MiB || (len & (len - 1))) {
+            error_setg(errp, "ak-spinor: %s is not a power-of-two size "
+                       "from 64 KiB to 128 MiB", s->flash_file);
+            return;
+        }
+        error_setg(&s->migration_blocker, "ak-spinor: flash-file %s is "
+                   "written through; it cannot be migrated", s->flash_file);
+        if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
             return;
         }
         s->size = len;
     }
-    if (!s->size || (s->size & (s->size - 1))) {
-        error_setg(errp, "ak-spinor: size must be a power of two");
+    /* At least one 64 KiB erase block, so no erase reaches past it. */
+    if (s->size < 64 * KiB || s->size > 128 * MiB ||
+        (s->size & (s->size - 1))) {
+        error_setg(errp, "ak-spinor: size must be a power of two from "
+                   "64 KiB to 128 MiB");
         return;
     }
     s->array = g_malloc(s->size);
@@ -362,6 +375,24 @@ static const Property ak_spinor_properties[] = {
     DEFINE_PROP_STRING("flash-file", AkSpinorState, flash_file),
     DEFINE_PROP_UINT32("jedec", AkSpinorState, jedec, 0xC84017),
     DEFINE_PROP_UINT32("size", AkSpinorState, size, 8 * MiB),
+};
+
+static bool ak_spinor_array_needed(void *opaque)
+{
+    AkSpinorState *s = opaque;
+
+    return s->fd < 0;
+}
+
+static const VMStateDescription vmstate_ak_spinor_array = {
+    .name = TYPE_AK_SPINOR "/array",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ak_spinor_array_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_VBUFFER_UINT32(array, AkSpinorState, 1, NULL, size),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 static const VMStateDescription vmstate_ak_spinor = {
@@ -380,6 +411,10 @@ static const VMStateDescription vmstate_ak_spinor = {
         VMSTATE_UINT8_ARRAY(sr, AkSpinorState, 3),
         VMSTATE_BOOL(four_byte, AkSpinorState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ak_spinor_array,
+        NULL
     }
 };
 

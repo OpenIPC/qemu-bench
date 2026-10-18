@@ -35,7 +35,9 @@ qemu-system-arm -M ak3918ev300,flash-file=dump.bin -nographic -nic none
 ```
 
 `flash-file=` is the camera's whole SPI NOR, booted the way the mask ROM
-does. Erases and programs are written back to it, so boot a copy.
+does. Erases and programs are written back to it, so boot a copy; for the
+same reason a machine with one cannot be migrated or snapshotted (without
+one, the flash contents travel in the migration stream).
 `flash-jedec=0xEF4017` overrides the JEDEC ID the flash answers with (by
 default the one the boot header's SPIP descriptor names, which is what the
 vendor drivers check against). `-kernel` boots a kernel directly with ATAGs

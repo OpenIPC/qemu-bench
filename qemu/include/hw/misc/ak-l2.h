@@ -45,6 +45,7 @@ typedef struct AkL2Buf {
     uint8_t status;     /* filled blocks, 0..8 */
     uint8_t dev_blk;    /* peripheral side: next block it fills or drains */
     uint8_t mem_blk;    /* DMA side: next block the engine moves */
+    int8_t frac_blk;    /* block a fraction DMA filled, or -1 */
     uint32_t dma_left;  /* blocks the running DMA still has to move */
     uint32_t dma_addr;
 } AkL2Buf;

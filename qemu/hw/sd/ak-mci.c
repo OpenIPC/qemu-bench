@@ -285,10 +285,17 @@ static void ak_mci_init(Object *obj)
               "sd-bus");
 }
 
+static int ak_mci_post_load(void *opaque, int version_id)
+{
+    ak_mci_update_irq(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_mci = {
     .name = TYPE_AK_MCI,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_mci_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(clock, AkMciState),
         VMSTATE_UINT32(arg, AkMciState),
