@@ -81,6 +81,15 @@ jobs:
       - name: Goke GK710x devices (gk-sflash, gk-vic, gk-idc, ...)
         run: python3 qemu/tests/test-gk710x.py
 
+      # The Anyka AK39xx models driven over qtest the way the vendor drivers
+      # drive them: mask-ROM staging of the boot header, timer into the
+      # two-level interrupt controller, UART and SPI through L2 memory
+      # (PIO and DMA), SPI-NOR write-back, both I2C layouts, the GMAC's
+      # PHY and 24-byte descriptor ring, an empty SD slot.  Boot tests
+      # need camera dumps, which are vendor firmware.
+      - name: Anyka AK39xx devices (ak-sysctrl, ak-l2, ak-spi, ...)
+        run: python3 qemu/tests/test-anyka.py
+
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
         with:

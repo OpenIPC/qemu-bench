@@ -19,6 +19,9 @@
  * Normal descriptors, four words: des0 status (OWN bit 31), des1 control
  * (buf1 size 10:0, buf2 size 21:11, chained 24, end of ring 25; TX also
  * first 29, last 30, IRQ-on-completion 31), des2 buf1, des3 buf2 or next.
+ * In a ring, BUS_MODE's descriptor skip length (DSL, 6:2) puts that many
+ * words between one descriptor and the next: 0 for xmmac, 2 for the Anyka
+ * AK39 driver, whose descriptors carry two software words.
  */
 
 #include "qemu/osdep.h"
@@ -68,6 +71,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmDwmacState, XM_DWMAC)
 #define DMA_CUR_RX_BUF  0x1054
 
 #define DMA_BUS_SWR     (1u << 0)
+#define DMA_BUS_DSL(v)  (((v) >> 2) & 0x1f)
 #define DMA_CONTROL_SR  (1u << 1)
 #define DMA_CONTROL_ST  (1u << 13)
 
@@ -163,6 +167,8 @@ static uint16_t xm_dwmac_phy_read(XmDwmacState *s, int reg)
         return 0x01e1;
     case 5:  /* ANLPAR: partner does the same, acknowledged */
         return 0x45e1;
+    case 6:  /* ANER: the partner negotiates (Anyka's driver keys on it) */
+        return 0x0001;
     default:
         return 0;
     }
@@ -201,9 +207,12 @@ static void xm_dwmac_write_des0(hwaddr addr, uint32_t des0)
                      MEMTXATTRS_UNSPECIFIED);
 }
 
-/* The next descriptor: chained via des3, the list base at end of ring, or
- * the next one in a contiguous ring. */
-static uint32_t xm_dwmac_next(uint32_t cur, const XmDesc *d, uint32_t base)
+/*
+ * The next descriptor: chained via des3, the list base at end of ring, or
+ * the next one in the ring, DSL words past this one's end.
+ */
+static uint32_t xm_dwmac_next(XmDwmacState *s, uint32_t cur, const XmDesc *d,
+                              uint32_t base)
 {
     if (d->des1 & DES1_TER) {
         return base;
@@ -211,7 +220,7 @@ static uint32_t xm_dwmac_next(uint32_t cur, const XmDesc *d, uint32_t base)
     if (d->des1 & DES1_TCH) {
         return d->des3;
     }
-    return cur + sizeof(XmDesc);
+    return cur + sizeof(XmDesc) + 4 * DMA_BUS_DSL(s->bus_mode);
 }
 
 static void xm_dwmac_tx(XmDwmacState *s)
@@ -269,7 +278,7 @@ static void xm_dwmac_tx(XmDwmacState *s)
             }
         }
         xm_dwmac_write_des0(at, d.des0 & ~DES0_OWN);
-        s->cur_tx = xm_dwmac_next(at, &d, s->tx_base);
+        s->cur_tx = xm_dwmac_next(s, at, &d, s->tx_base);
     }
     xm_dwmac_update_irq(s);
 }
@@ -376,7 +385,7 @@ static ssize_t xm_dwmac_receive(NetClientState *nc, const uint8_t *buf,
             des0 |= RDES0_LS | ((uint32_t)total << RDES0_FL_SHIFT);
         }
         xm_dwmac_write_des0(at, des0);
-        s->cur_rx = xm_dwmac_next(at, &d, s->rx_base);
+        s->cur_rx = xm_dwmac_next(s, at, &d, s->rx_base);
     }
     if (done < total) {
         /* Ran out of guard before the frame did: like a ring with no free

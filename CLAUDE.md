@@ -169,7 +169,7 @@ designated initialisers make last-writer-wins. Caveat: array members such as
 `.regbanks` / `.uart_bases` cannot be partially overridden; re-list the whole
 array when a die differs.
 
-Two non-HiSilicon families have their own table and init instead of
+Non-HiSilicon families have their own table and init instead of
 `HisiSoCConfig` slots: Xiongmai XM510/XM530/XM550 (`hw/arm/xiongmai.c`,
 `docs/xiongmai.md`) and Goke GK7101/GK7102 (`hw/arm/goke.c`,
 `docs/goke-gk710x.md`). On GK710x the vendor code reaches registers only
@@ -178,6 +178,14 @@ silicon at the addresses the HAL drives (`qemu-boot/gk710x-halmap.py` prints
 them), never the fictitious `0x90000000`/`0xA0000000` map the drivers use.
 Its flash images are byte-swapped per 32-bit word, and `-kernel` boots need
 `hal-file=` (the HAL is vendor code; it is not shipped).
+
+Anyka AK39xx (`hw/arm/anyka.c`, `docs/anyka.md`) is a third such family:
+ARM926 parts whose UART and SPI move data through the L2 buffer SRAM
+(`hw/misc/ak-l2.c`), not FIFOs. Its mask ROM is a synthetic program at
+address 0 that replays the boot header's register script on the CPU -- the
+script must land after device reset, which a reset handler does not -- and
+the boot NOR is `ak-spinor`, not m25p80, because the vendor drivers send
+fast-read dummies as ordinary TX bytes.
 
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB

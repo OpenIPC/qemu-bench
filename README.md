@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 2 Goke GK710x (ARM1176)
+- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 2 Goke GK710x (ARM1176) + 6 Anyka AK39xx (ARM926)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (52 total)
+## Supported Machines (58 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -159,6 +159,33 @@ with `-kernel`/`-initrd` given a vendor HAL to load —
 
 ¹ `gk7101` is the same die and models; no GK7101 image was at hand.
 
+### Anyka AK39xx family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `ak3918ev200` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 3.4.35 vendor | yes |
+| `ak3916ev300` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 3.4.35 vendor | yes¹ |
+| `ak3918ev300` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 3.4.35 vendor | yes |
+| `ak3919ev300` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 3.4.35 vendor | —² |
+| `ak3918ev330` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
+| `ak3919ev330` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
+
+Anyka's camera SoCs, unrelated to HiSilicon: one memory map from the
+AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330), in
+`hw/arm/anyka.c`. The UART and the SPI master move their data through the
+L2 buffer SRAM rather than FIFOs, which `hw/misc/ak-l2.c` models with its
+block handshakes and DMA. A camera's SPI-NOR dump boots the way the mask ROM
+does -- boot-header register script, then U-Boot (EV200 / EV300) or the
+EV330's L2-resident first stage -- through the vendor U-Boot and kernel to
+the vendor application and `login:`: `-M ak3918ev300,flash-file=dump.bin`.
+Flash writes go back to the file. Ethernet (the Synopsys GMAC, on
+`xm-dwmac`) works from both the vendor U-Boot and kernels: `-nic user`.
+The SoC list from the SDKs, the map, the boot header and the dumps tried
+are in [docs/anyka.md](docs/anyka.md).
+
+¹ An AK3916EV301 dump.  ² Same die and models as a tested sibling; no image
+was at hand.
+
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
 | Machine | Generation | CPU | IRQ | Boot tested |
@@ -262,6 +289,18 @@ qemu/
 ├── hw/misc/gk-sflash.c          # Goke SPI-NOR controller (flash-file)
 ├── hw/misc/gk-ephy.c            # Internal Ethernet PHY, memory-mapped MII
 ├── hw/i2c/gk-idc.c              # Ambarella IDC I2C master
+├── hw/arm/anyka.c               # Anyka AK39xx machines, synthetic mask ROM
+├── hw/misc/ak-sysctrl.c         # AK39 SYSCTRL: chip ID, IRQ controller, timers, WDT, RTC
+├── hw/misc/ak-l2.c              # L2 buffer SRAM + DMA (UART / SPI data path)
+├── hw/misc/ak-ddrc.c            # DDR2 controller (init-done poll)
+├── hw/char/ak-uart.c            # UART on L2 rings
+├── hw/ssi/ak-spi.c              # SPI master, PIO + L2
+├── hw/ssi/ak-spinor.c           # Byte-wise SPI NOR (flash-file, any JEDEC ID)
+├── hw/gpio/ak-gpio.c            # GPIO (pull-up inputs, flash CS on EV330)
+├── hw/i2c/ak-i2c.c              # I2C, EV200/EV300 and EV330 layouts
+├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
+├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
+├── include/hw/arm/anyka.h       # AkSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
 qemu-boot/
