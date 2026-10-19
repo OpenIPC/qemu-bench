@@ -26,7 +26,7 @@ neither are the flash controller, GPIO or I2C. Hence a family of its own in
 | SPI-NOR | xmsfc v1, regs 0x100F0000, data window at 0x0 (16 MiB) | xmsfc v2, regs 0x100F4000, window 0x60000000 |
 | Ethernet | DWMAC 10/100 0x20040000, IRQ 3, RMII PHY at MDIO 1 | DWMAC 0x10010000, SPI 3 |
 | SD/MMC | Arasan SDHCI 0x50000000 (IRQ 24), 0x50010000 (IRQ 25) | 0x50000000 / 0x50100000, SPI 41 / 42 |
-| GPIO / mux | 0x10020000, one register per pin | same |
+| GPIO / mux | 0x10020000, banked: eight pins a port, ports 0..8 (mux `+P*4`, data/OE `+0x40 + P*0x10`) | 0x10020000, one register per pad |
 | SRAM | 0x04000000 (U-Boot's first stack, sp = 0x04001000) | same |
 | DDRC | Synopsys uPCTL 0x100B0000, PHY 0x100B2000 | same block (U-Boot references both pages) |
 | Watchdog clock | 93.75 kHz (24 MHz/256) | 46.875 kHz (12 MHz/256) |

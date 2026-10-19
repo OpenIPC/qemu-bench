@@ -7,7 +7,7 @@ No guest: QEMU runs under qtest and this script writes the registers.
 
     python3 qemu/tests/test-xm510-gpio.py [--qemu PATH]
 """
-import argparse, os, sys
+import argparse, os, re, sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(__file__))
@@ -100,6 +100,11 @@ def main():
     log = open(os.path.join(q.dir, 'qemu.err')).read()
     check('xm510-gpio: gpio 65 high' in log and 'xm510-gpio: gpio 65 low' in log,
           'output changes are logged under -d unimp')
+    check('xm510-gpio: gpio 3 released' in log,
+          'the reset logs the release of a pin it was driving')
+    # 29 was let go when muxed again; 3 and 65 were still driven at reset.
+    released = sorted({int(n) for n in re.findall(r'gpio (\d+) released', log)})
+    check(released == [3, 29, 65], 'and of no pin that was not driven')
 
     print('=== %s: xm510-gpio ===' % ('PASS' if not fails else 'FAIL'))
     return 1 if fails else 0

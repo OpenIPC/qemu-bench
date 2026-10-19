@@ -169,8 +169,12 @@ static void xm510_gpio_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     /* Every pin comes out of reset an undriven input, so whatever its output
-     * line was holding drops with it. */
+     * line was holding drops with it -- logged like any other release, so a
+     * reset in the middle of a drive is visible in the trace. */
     for (int n = 0; n < XM510_GPIO_LINES; n++) {
+        if (s->driven[n] >= 0) {
+            qemu_log_mask(LOG_UNIMP, "xm510-gpio: gpio %d released\n", n);
+        }
         s->driven[n] = -1;
         qemu_set_irq(s->out[n], 0);
     }
@@ -180,6 +184,8 @@ static void xm510_gpio_realize(DeviceState *dev, Error **errp)
 {
     Xm510GpioState *s = XM510_GPIO(dev);
 
+    /* Undriven before the first reset, too: the reset reads it. */
+    memset(s->driven, -1, sizeof(s->driven));
     memory_region_init_io(&s->iomem, OBJECT(dev), &xm510_gpio_ops, s,
                           TYPE_XM510_GPIO, XM510_GPIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
