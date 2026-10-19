@@ -79,7 +79,10 @@ static const XmSoCConfig xm510_soc = {
     .ddrc_base          = 0x100B0000,           /* from U-Boot, see xm-ddrc */
     .num_ddrc_done      = 2,
     .ddrc_done          = { 0x0048, 0x1038 },
-    .num_regbanks       = 4,
+    /* Banked, eight pins a port: xm510-gpio, not XM530's xm-gpio. */
+    .gpio_base          = 0x10020000,
+    .gpio_type          = "xm510-gpio",
+    .num_regbanks       = 3,
     /* The XM530 I2C controller; XM510 boards carry an SOI JX-H62, which
      * ipcinfo and the vendor libsns find at 0x30. */
     .i2c_base           = 0x10000000,
@@ -97,7 +100,6 @@ static const XmSoCConfig xm510_soc = {
     .h1_base            = 0x20070000,
     .h1_irq             = 26,
     .regbanks           = {
-        { "xm-gpio",     0x10020000, 0x10000 },  /* GPIO + pin mux */
         { "xm-dma",      0x20020000, 0x10000 },  /* PL330, until modelled */
         { "xm-rtc",      0x100A0000, 0x10000 },
         { "xm-i2s",      0x10060000, 0x10000 },
@@ -553,8 +555,8 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 
     if (c->gpio_base) {
         /* A named child, so qtest and a board can reach its input lines at
-         * /machine/xm-gpio. */
-        DeviceState *gpio = qdev_new("xm-gpio");
+         * /machine/xm-gpio, whichever of the two layouts the part has. */
+        DeviceState *gpio = qdev_new(c->gpio_type ? c->gpio_type : "xm-gpio");
 
         object_property_add_child(OBJECT(machine), "xm-gpio", OBJECT(gpio));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);

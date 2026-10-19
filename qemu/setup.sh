@@ -45,6 +45,7 @@ cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h26
 cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/gpio/xm-gpio.c           "$QEMU_DIR/hw/gpio/"
+cp qemu/hw/gpio/xm510-gpio.c        "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
 cp qemu/hw/arm/goke.c               "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/goke.h       "$QEMU_DIR/include/hw/arm/"
@@ -241,6 +242,11 @@ if ! grep -q xm-gpio "$QEMU_DIR/hw/gpio/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-gpio.c'))" \
         >> "$QEMU_DIR/hw/gpio/meson.build"
     echo "  hw/gpio/meson.build: added xm-gpio.c"
+fi
+if ! grep -q xm510-gpio "$QEMU_DIR/hw/gpio/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm510-gpio.c'))" \
+        >> "$QEMU_DIR/hw/gpio/meson.build"
+    echo "  hw/gpio/meson.build: added xm510-gpio.c"
 fi
 if ! grep -q xm-i2c "$QEMU_DIR/hw/i2c/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-i2c.c'))" \
