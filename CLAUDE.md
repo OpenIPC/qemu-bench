@@ -187,6 +187,18 @@ script must land after device reset, which a reset handler does not -- and
 the boot NOR is `ak-spinor`, not m25p80, because the vendor drivers send
 fast-read dummies as ordinary TX bytes.
 
+SigmaStar/MStar infinity2m (`hw/arm/sigmastar.c`, `docs/sigmastar.md`) is a
+fourth: Cortex-A7 parts whose blocks sit in 16-bit RIU register banks at
+`0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
+at +1). `sstar-riu` is mapped under every model as storage plus the status
+bits the boot chain polls; `-d unimp` reports hot polls and
+`-global sstar-riu.trace=<banks>` logs a bank. The machine sets
+`minimum_page_bits = 12`: with QEMU's default 1 KiB ARM pages a region that
+starts inside one 1 KiB page and covers the next is registered with a
+misaligned offset, and its first access dies in `iotlb_to_section`. Any
+machine with 512-byte-aligned MMIO blocks larger than 1 KiB is exposed to
+the same assertion.
+
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB
 outliers. `hardware_reference.md` (CV300/EV300, from SDK DTS) and

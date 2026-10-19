@@ -47,6 +47,10 @@ jobs:
           # Goke GK7101/GK7102 (hw/arm/goke.c), Goke's own Ambarella-IP design
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7101 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7102 '
+          # SigmaStar infinity2m (hw/arm/sigmastar.c)
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssr621q '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd202d '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd201 '
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -93,6 +97,16 @@ jobs:
       # need camera dumps, which are vendor firmware.
       - name: Anyka AK39xx devices (ak-sysctrl, ak-l2, ak-spi, ...)
         run: python3 qemu/tests/test-anyka.py
+
+      # The SigmaStar infinity2m models driven over qtest the way the vendor
+      # IPL, U-Boot and kernel drive them: mask-ROM staging of the IPL, RIU
+      # storage and boot status bits, timers into the main-intc, the FSP's
+      # three-command sequences and the BDMA page program written back to
+      # the image, the EMAC's 16-bit halves and a frame on the wire, EHCI
+      # through the halves with a USB keyboard, AHCI with a disk, GE and
+      # vsync.  Boot tests need an NVR flash dump, which is vendor firmware.
+      - name: SigmaStar infinity2m devices (sstar-fsp, sstar-emac, ...)
+        run: python3 qemu/tests/test-sigmastar.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4

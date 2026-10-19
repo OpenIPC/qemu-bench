@@ -68,6 +68,20 @@ cp qemu/hw/gpio/ak-gpio.c           "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/usb/ak-usb.c             "$QEMU_DIR/hw/usb/"
 cp qemu/hw/i2c/ak-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/sd/ak-mci.c              "$QEMU_DIR/hw/sd/"
+cp qemu/hw/arm/sigmastar.c          "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/sigmastar.h  "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/misc/sstar-riu.c         "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/sstar-riu.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/intc/sstar-intc.c        "$QEMU_DIR/hw/intc/"
+cp qemu/hw/timer/sstar-timer.c      "$QEMU_DIR/hw/timer/"
+cp qemu/hw/char/sstar-uart.c        "$QEMU_DIR/hw/char/"
+cp qemu/hw/ssi/sstar-fsp.c          "$QEMU_DIR/hw/ssi/"
+cp qemu/include/hw/ssi/sstar-fsp.h  "$QEMU_DIR/include/hw/ssi/"
+cp qemu/hw/dma/sstar-bdma.c         "$QEMU_DIR/hw/dma/"
+cp qemu/hw/net/sstar-emac.c         "$QEMU_DIR/hw/net/"
+cp qemu/hw/display/mstar-ge.c       "$QEMU_DIR/hw/display/"
+cp qemu/hw/display/mstar-disp.c     "$QEMU_DIR/hw/display/"
+cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -347,6 +361,46 @@ if ! grep -q "'anyka.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_ANYKA', if_true: files('anyka.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added anyka.c"
+fi
+
+# SigmaStar (MStar) ARMv7: Cortex-A7 SoCs behind the RIU (hw/arm/sigmastar.c).
+# Same guarded appends as Anyka, for a fresh tree and an existing one alike.
+if ! grep -q "^config SIGMASTAR$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config SIGMASTAR
+    bool
+    default y
+    depends on TCG && ARM
+    select A15MPCORE
+    select ARM_GIC
+    select SERIAL_MM
+    select UNIMP
+    select USB_EHCI_SYSBUS
+    select AHCI_SYSBUS
+KCONFIG
+    echo "  hw/arm/Kconfig: added SIGMASTAR"
+else
+    for sym in A15MPCORE ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS; do
+        if ! sed -n '/^config SIGMASTAR$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config SIGMASTAR\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: SIGMASTAR now selects $sym"
+        fi
+    done
+fi
+for f in misc/sstar-riu intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+    if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
+            >> "$QEMU_DIR/hw/${f%/*}/meson.build"
+        echo "  hw/${f%/*}/meson.build: added ${f#*/}.c"
+    fi
+done
+if ! grep -q "'sigmastar.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sigmastar.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added sigmastar.c"
 fi
 
 # hw/misc/Kconfig
