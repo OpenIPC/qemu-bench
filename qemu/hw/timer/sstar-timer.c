@@ -39,6 +39,7 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "qom/object.h"
 #include "system/runstate.h"
 #include "hw/misc/sstar-riu.h"
@@ -361,12 +362,40 @@ static const Property sstar_timer_props[] = {
                      SstarRiuState *),
 };
 
+static const VMStateDescription vmstate_sstar_piu_timer = {
+    .name = TYPE_SSTAR_TIMER "/timer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, SstarPiuTimer, 0x10),
+        VMSTATE_INT64(start_ns, SstarPiuTimer),
+        VMSTATE_UINT16(latch, SstarPiuTimer),
+        VMSTATE_BOOL(running, SstarPiuTimer),
+        VMSTATE_TIMER_PTR(timer, SstarPiuTimer),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_sstar_timer = {
+    .name = TYPE_SSTAR_TIMER,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(t, SstarTimerState, NUM_TIMERS, 1,
+                             vmstate_sstar_piu_timer, SstarPiuTimer),
+        VMSTATE_UINT16_ARRAY(wdt, SstarTimerState, 0x10),
+        VMSTATE_TIMER_PTR(wdt_timer, SstarTimerState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void sstar_timer_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, sstar_timer_reset);
     device_class_set_props(dc, sstar_timer_props);
+    dc->vmsd = &vmstate_sstar_timer;
 }
 
 static const TypeInfo sstar_timer_info = {

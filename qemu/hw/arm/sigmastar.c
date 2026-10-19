@@ -425,9 +425,11 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     uint64_t off;
     int n;
 
-    if (machine->ram_size > SS_DRAM_WINDOW) {
-        error_report("sigmastar: at most %" PRIu64 " MiB of DRAM",
-                     (uint64_t)SS_DRAM_WINDOW / MiB);
+    /* The MIU decodes a power of two; the window repeats it. */
+    if (machine->ram_size > SS_DRAM_WINDOW ||
+        !is_power_of_2(machine->ram_size)) {
+        error_report("sigmastar: DRAM must be a power of two up to %" PRIu64
+                     " MiB", (uint64_t)SS_DRAM_WINDOW / MiB);
         exit(1);
     }
     if (sms->flash_file) {

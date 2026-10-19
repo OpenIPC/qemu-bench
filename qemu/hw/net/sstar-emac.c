@@ -54,6 +54,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -188,8 +189,8 @@ static ssize_t emac_receive(NetClientState *nc, const uint8_t *buf,
     hwaddr da = emac_desc_addr(s, s->rx_idx);
     uint32_t desc[2], len, flags, crc;
 
-    if (!(s->regs[G_CTL / 4] & CTL_RE)) {
-        return size;            /* receiver off: dropped on the wire */
+    if (!(s->regs[G_CTL / 4] & CTL_RE) || size < ETH_ALEN) {
+        return size;            /* receiver off, or a runt: dropped */
     }
     if (dma_memory_read(&address_space_memory, da, desc, 8,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
@@ -258,9 +259,13 @@ static void emac_transmit(SstarEmacState *s)
     uint32_t len = s->regs[G_TCR / 4] & 0x7FF;
 
     if (len) {
-        dma_memory_read(&address_space_memory,
-                        DRAM_BASE + (s->regs[G_TAR / 4] & 0x1FFFFFFF),
-                        frame, len, MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_read(&address_space_memory,
+                            DRAM_BASE + (s->regs[G_TAR / 4] & 0x1FFFFFFF),
+                            frame, len, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "sstar-emac: TX buffer at 0x%08x "
+                          "is not readable\n", s->regs[G_TAR / 4]);
+            return;
+        }
         qemu_send_packet(qemu_get_queue(s->nic), frame, len);
     }
     s->regs[G_ISR / 4] |= ISR_TCOM;
@@ -537,6 +542,8 @@ static const VMStateDescription vmstate_sstar_emac = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, SstarEmacState, EMAC_NREGS),
         VMSTATE_UINT32(rx_idx, SstarEmacState),
+        VMSTATE_UINT32(pend_g, SstarEmacState),
+        VMSTATE_UINT16(pend_lo, SstarEmacState),
         VMSTATE_END_OF_LIST()
     }
 };

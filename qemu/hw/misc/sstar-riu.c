@@ -33,6 +33,7 @@
 #include "qemu/module.h"
 #include "qemu/cutils.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "hw/qdev-properties.h"
 #include "hw/misc/sstar-riu.h"
 #include "system/runstate.h"
@@ -284,6 +285,17 @@ static const Property sstar_riu_props[] = {
     DEFINE_PROP_STRING("trace", SstarRiuState, trace),
 };
 
+static const VMStateDescription vmstate_sstar_riu = {
+    .name = TYPE_SSTAR_RIU,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER_POINTER_UNSAFE(regs, SstarRiuState, 1,
+                                      RIU_NREGS * sizeof(uint16_t)),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void sstar_riu_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -291,6 +303,7 @@ static void sstar_riu_class_init(ObjectClass *oc, const void *data)
     dc->realize = sstar_riu_realize;
     device_class_set_legacy_reset(dc, sstar_riu_reset);
     device_class_set_props(dc, sstar_riu_props);
+    dc->vmsd = &vmstate_sstar_riu;
 }
 
 static const TypeInfo sstar_riu_info = {

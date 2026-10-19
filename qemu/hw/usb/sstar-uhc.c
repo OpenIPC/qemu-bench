@@ -10,10 +10,7 @@
  * ehci_readl/ehci_writel, which always write the low half first).  One
  * RIU bank (0x200 bytes) holds the 0x100 bytes of EHCI registers.
  *
- * The EHCI itself is QEMU's fusbh200-ehci-usb, which has this layout.
- * Halves are combined here: a write commits the whole register when its
- * high half lands, so USBSTS and PORTSC see their write-1-to-clear bits
- * once.  The UTMI PHY and USBC wrapper banks beside each UHC are RIU
+ * The EHCI itself is QEMU's fusbh200-ehci-usb, which has this layout.  The UTMI PHY and USBC wrapper banks beside each UHC are RIU
  * storage (sstar-riu).
  *
  * DMA: with "MIU lower bound address subtraction" on, the controller
@@ -51,8 +48,6 @@ struct SstarUhcState {
     MemoryRegion dma_sys;
     MemoryRegion dma_low;
     AddressSpace dma_as;
-    uint32_t pend_g;
-    uint16_t pend_lo;
 };
 
 /* The EHCI's registers are a container (caps, operational, ports). */
@@ -82,39 +77,39 @@ static uint64_t sstar_uhc_read(void *opaque, hwaddr off, unsigned size)
     return size == 1 ? half & 0xff : half;
 }
 
+/* Write-1-to-clear bits: written back as read, they would be acknowledged. */
+static uint32_t uhc_w1c_bits(uint32_t g)
+{
+    switch (g) {
+    case 0x14:                  /* USBSTS: USBINT .. IAA */
+        return 0x3F;
+    case 0x30:                  /* PORTSC: CSC, PEC, OCC */
+        return 0x2A;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Each half (or byte of one) goes to the EHCI as it lands, merged with the
+ * live rest of the register, whose write-1-to-clear bits read as 0: the
+ * drivers write low half then high half, but MStar's glue also writes
+ * single halves and bytes.
+ */
 static void sstar_uhc_write(void *opaque, hwaddr off, uint64_t val,
                             unsigned size)
 {
     SstarUhcState *s = opaque;
     uint32_t w = off >> 2, g = (w >> 1) * 4;
+    uint32_t shift = (w & 1) * 16 + (size == 1 && (off & 1) ? 8 : 0);
+    uint32_t mask = (size == 1 ? 0xFFu : 0xFFFFu) << shift;
     uint32_t cur;
-    uint16_t half;
 
     if ((off & 3) >= 2 || g >= UHC_EHCI_SIZE) {
         return;
     }
-    cur = uhc_ehci_read(s, g);
-    half = cur >> ((w & 1) * 16);
-    if (size == 1) {
-        half = (off & 1) ? (half & 0x00ff) | ((val & 0xff) << 8)
-                         : (half & 0xff00) | (val & 0xff);
-    } else {
-        half = val;
-    }
-    if (!(w & 1)) {
-        /* The low half waits for its high half. */
-        s->pend_g = g;
-        s->pend_lo = half;
-        return;
-    }
-    /*
-     * A high half with no low half before it writes 0 there, rather than
-     * the live value: that would acknowledge USBSTS and PORTSC's pending
-     * write-1-to-clear bits.
-     */
-    uhc_ehci_write(s, g, (s->pend_g == g ? s->pend_lo : 0) |
-                         ((uint32_t)half << 16));
-    s->pend_g = UINT32_MAX;
+    cur = uhc_ehci_read(s, g) & ~uhc_w1c_bits(g);
+    uhc_ehci_write(s, g, (cur & ~mask) | (((uint32_t)val << shift) & mask));
 }
 
 static const MemoryRegionOps sstar_uhc_ops = {
@@ -124,13 +119,6 @@ static const MemoryRegionOps sstar_uhc_ops = {
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
 };
-
-static void sstar_uhc_reset(DeviceState *dev)
-{
-    SstarUhcState *s = SSTAR_UHC(dev);
-
-    s->pend_g = UINT32_MAX;
-}
 
 static void sstar_uhc_init(Object *obj)
 {
@@ -172,7 +160,6 @@ static void sstar_uhc_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = sstar_uhc_realize;
-    device_class_set_legacy_reset(dc, sstar_uhc_reset);
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
 }
 

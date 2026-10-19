@@ -40,6 +40,7 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "hw/ssi/sstar-fsp.h"
 #include "migration/blocker.h"
 
@@ -634,6 +635,33 @@ static const Property sstar_fsp_props[] = {
     DEFINE_PROP_UINT32("size", SstarFspState, size, 16 * MiB),
 };
 
+/*
+ * The flash array is the XIU ROM device's RAM, which migrates by itself;
+ * a file-backed flash blocks migration.
+ */
+static const VMStateDescription vmstate_sstar_fsp = {
+    .name = TYPE_SSTAR_FSP,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(isp, SstarFspState, 0x80),
+        VMSTATE_UINT16_ARRAY(fsp, SstarFspState, 0x80),
+        VMSTATE_UINT16_ARRAY(qspi, SstarFspState, 0x80),
+        VMSTATE_UINT8_ARRAY(rbf, SstarFspState, 16),
+        VMSTATE_BOOL(done, SstarFspState),
+        VMSTATE_UINT8_ARRAY(sr, SstarFspState, 3),
+        VMSTATE_BOOL(wel, SstarFspState),
+        VMSTATE_UINT8(cmd, SstarFspState),
+        VMSTATE_UINT32(addr, SstarFspState),
+        VMSTATE_UINT32(pos, SstarFspState),
+        VMSTATE_BOOL(selected, SstarFspState),
+        VMSTATE_UINT8(isp_rdata, SstarFspState),
+        VMSTATE_UINT8_ARRAY(outside, SstarFspState, SSTAR_FSP_OUTSIDE_MAX),
+        VMSTATE_UINT32(outside_len, SstarFspState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void sstar_fsp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -641,6 +669,7 @@ static void sstar_fsp_class_init(ObjectClass *oc, const void *data)
     dc->realize = sstar_fsp_realize;
     device_class_set_legacy_reset(dc, sstar_fsp_reset);
     device_class_set_props(dc, sstar_fsp_props);
+    dc->vmsd = &vmstate_sstar_fsp;
 }
 
 static const TypeInfo sstar_fsp_info = {

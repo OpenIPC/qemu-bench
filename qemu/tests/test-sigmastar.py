@@ -20,7 +20,9 @@ IPL, U-Boot and kernel drivers (docs/sigmastar.md):
   - sstar-uhc: EHCI capability registers through the halves, a USB
     keyboard on the root port;
   - SATA: the AHCI capability registers, a disk on port 0;
-  - mstar-ge reads idle; mstar-disp latches vsync and clears it on W1C.
+  - mstar-ge reads idle; mstar-disp latches vsync and clears it on W1C;
+  - outside qtest: machine state migrates to a file and back, and a
+    file-backed flash blocks migration.
 
     python3 qemu/tests/test-sigmastar.py [--qemu PATH]
 """
@@ -325,6 +327,10 @@ def test_uhc(qt):
     qt.writew(UHC0 + 2 * 0x10 + 4, 0x0008)
     check('USBCMD reads back', qt.readw(UHC0 + 2 * 0x10) & 1, 1)
     check('USBSTS: running', qt.readw(UHC0 + 2 * 0x14) & 0x1000, 0)
+    # A lone low half (U-Boot's stack writes them) lands at once.
+    qt.writew(UHC0 + 2 * 0x10, 0)
+    check('lone low-half write stops it', qt.readw(UHC0 + 2 * 0x14) & 0x1000,
+          0x1000)
 
 
 def test_sata(qt):
@@ -344,6 +350,32 @@ def test_display(qt):
     check('vsync latched', qt.readw(TOP + 0x08) & 8, 8)
     qt.writew(TOP + 0x08, 8)
     check('W1C clears it', qt.readw(TOP + 0x08) & 8, 0)
+
+
+def hmp(qemu, args, cmds):
+    """Run QEMU with an HMP monitor on stdio; return what it printed."""
+    p = subprocess.run([qemu] + args + ['-display', 'none', '-nodefaults',
+                                        '-monitor', 'stdio'],
+                       input='\n'.join(cmds + ['quit']) + '\n',
+                       capture_output=True, text=True, timeout=60)
+    return p.stdout + p.stderr
+
+
+def test_migration(qemu, tmp, path):
+    print('migration')
+    mig = os.path.join(tmp, 'ssr621q.mig')
+    out = hmp(qemu, ['-M', 'ssr621q', '-S'],
+              ['migrate file:' + mig, 'info migrate'])
+    check('state saved', 'completed' in out and 'Assertion' not in out and
+          os.path.getsize(mig) > 0, True)
+    out = hmp(qemu, ['-M', 'ssr621q', '-S', '-incoming', 'file:' + mig],
+              ['info status', 'xp /1hx 0x%x' % riu(0x1038, 0x33)])
+    check('and loaded back, RIU state included',
+          'error' not in out.lower() and '0x1101' in out, True)
+    out = hmp(qemu, ['-M', 'ssr621q,flash-file=' + path, '-S'],
+              ['migrate file:' + os.path.join(tmp, 'blocked.mig')])
+    check('file-backed flash blocks migration', 'written through' in out,
+          True)
 
 
 def main():
@@ -378,6 +410,7 @@ def main():
         test_display(qt)
     finally:
         qt.close()
+    test_migration(args.qemu, tmp, path)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 

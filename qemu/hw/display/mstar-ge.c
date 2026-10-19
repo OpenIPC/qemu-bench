@@ -22,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "qom/object.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -129,6 +130,17 @@ struct MStarGeState {
 #define GE_IRQ_STATUS   (0x3 << 12)
 #define GE_IRQ_CLR      (0x3 << 10)
 
+/*
+ * Surface addresses are offsets into the MIU0 window (DRAM); masked to it,
+ * so that no surface, pitch or position reaches past DRAM into MMIO.
+ */
+#define GE_DRAM_WINDOW  (512 * 1024 * 1024)
+
+static hwaddr ge_dram(MStarGeState *s, uint64_t off)
+{
+    return s->dram_base + (off & (GE_DRAM_WINDOW - 1));
+}
+
 static unsigned ge_bpp(unsigned fmt)
 {
     return fmt == GE_FMT_ARGB8888 ? 4 : 2;
@@ -206,12 +218,10 @@ static uint32_t ge_from_argb(unsigned fmt, uint32_t argb)
 static void mstar_ge_bitblt(MStarGeState *s)
 {
     const uint16_t *r = s->regs;
-    uint32_t src = s->dram_base +
-                   (((uint32_t)r[GE_SRC_ADDR_H / 4] << 16) |
-                     r[GE_SRC_ADDR_L / 4]);
-    uint32_t dst = s->dram_base +
-                   (((uint32_t)r[GE_DST_ADDR_H / 4] << 16) |
-                     r[GE_DST_ADDR_L / 4]);
+    uint64_t src = ((uint32_t)r[GE_SRC_ADDR_H / 4] << 16) |
+                   r[GE_SRC_ADDR_L / 4];
+    uint64_t dst = ((uint32_t)r[GE_DST_ADDR_H / 4] << 16) |
+                   r[GE_DST_ADDR_L / 4];
     unsigned spit = r[GE_SRC_PITCH / 4], dpit = r[GE_DST_PITCH / 4];
     unsigned sfmt = r[GE_FMT / 4] & 0xf, dfmt = (r[GE_FMT / 4] >> 8) & 0xf;
     unsigned w = r[GE_WIDTH / 4], h = r[GE_HEIGHT / 4];
@@ -237,8 +247,9 @@ static void mstar_ge_bitblt(MStarGeState *s)
     for (row = 0; row < h; row++) {
         uint8_t sbuf[GE_MAX_DIM * 4], dbuf[GE_MAX_DIM * 4];
         unsigned orow = vflip ? h - 1 - row : row;
-        uint32_t srow = src + row * spit;
-        uint32_t drow = dst + (dy + orow) * dpit + dx * dbpp;
+        hwaddr srow = ge_dram(s, src + (uint64_t)row * spit);
+        hwaddr drow = ge_dram(s, dst + (uint64_t)(dy + orow) * dpit +
+                                 (uint64_t)dx * dbpp);
 
         if (address_space_read(&address_space_memory, srow,
                                MEMTXATTRS_UNSPECIFIED, sbuf,
@@ -281,9 +292,8 @@ static uint32_t ge_start_argb(MStarGeState *s)
 static void ge_put_pixel(MStarGeState *s, int x, int y, uint32_t argb)
 {
     const uint16_t *r = s->regs;
-    uint32_t dst = s->dram_base +
-                   (((uint32_t)r[GE_DST_ADDR_H / 4] << 16) |
-                     r[GE_DST_ADDR_L / 4]);
+    uint64_t dst = ((uint32_t)r[GE_DST_ADDR_H / 4] << 16) |
+                   r[GE_DST_ADDR_L / 4];
     unsigned dpit = r[GE_DST_PITCH / 4];
     unsigned dfmt = (r[GE_FMT / 4] >> 8) & 0xf;
     unsigned dbpp = ge_bpp(dfmt);
@@ -307,7 +317,8 @@ static void ge_put_pixel(MStarGeState *s, int x, int y, uint32_t argb)
         stw_le_p(buf, px);
     }
     address_space_write(&address_space_memory,
-                        dst + (unsigned)y * dpit + (unsigned)x * dbpp,
+                        ge_dram(s, dst + (uint64_t)y * dpit +
+                                   (uint64_t)x * dbpp),
                         MEMTXATTRS_UNSPECIFIED, buf, dbpp);
 }
 
@@ -450,12 +461,23 @@ static const Property mstar_ge_properties[] = {
     DEFINE_PROP_UINT32("dram-base", MStarGeState, dram_base, 0),
 };
 
+static const VMStateDescription vmstate_mstar_ge = {
+    .name = TYPE_MSTAR_GE,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, MStarGeState, MSTAR_GE_NUM_REGS),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void mstar_ge_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, mstar_ge_reset);
     device_class_set_props(dc, mstar_ge_properties);
+    dc->vmsd = &vmstate_mstar_ge;
 }
 
 static const TypeInfo mstar_ge_types[] = {

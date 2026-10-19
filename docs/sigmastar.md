@@ -162,7 +162,10 @@ back for a 32-bit wrap.
   the RIU's 16-bit halves. The controllers take physical and MIU bus
   addresses alike. `usb-bus.0` is the vendor's `Sstar-ehci-1` (UHC0),
   `usb-bus.1` `Sstar-ehci-2`, `usb-bus.2` `Sstar-ehci-3`. `usb-tablet`,
-  `usb-kbd` and `usb-storage` attach as USB 2.0 devices.
+  `usb-kbd` and `usb-storage` attach as USB 2.0 devices. Each 16-bit half
+  (or byte) is written through at once, merged with the live rest of the
+  register minus its write-1-to-clear bits: U-Boot's USB stack writes
+  single halves, and finds a `usb-storage` stick on `usb-bus.1`.
 - **SATA**. QEMU's `sysbus-ahci`, one port, `-drive if=ide,index=0`. The NVR
   formats a blank disk at boot (its own WFS filesystem, no partition
   table). The vendor driver passes MIU bus addresses, and runs the PRD high words through the
@@ -182,7 +185,5 @@ back for a 32-bit wrap.
   but not scanned out).
 - I2C controllers, SAR ADC, RTC (the kernel warns that RTCPWC has no power),
   the MMU block (`HAL_MMU_Reset timeout`), audio.
-- U-Boot's own USB stack still times out starting the host controller, so U-Boot
-  finds no USB storage; Linux's does.
 - infinity3 (MSC313E), infinity6 and mercury5 parts. Daniel Palmer's
   `mstar-miyoo-working` branch has the infinity3 and mercury5 maps.

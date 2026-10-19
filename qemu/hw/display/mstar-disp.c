@@ -46,6 +46,7 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "qom/object.h"
@@ -162,6 +163,13 @@ static uint16_t riu_reg_merge(const uint16_t *regs, hwaddr addr,
                       : (v & 0xff00) | (val & 0xff);
 }
 
+/* A plane address plus a row offset, kept inside the MIU0 window. */
+static hwaddr mstar_disp_dram(hwaddr plane, uint64_t off)
+{
+    return MSTARV7_MIU0_BASE +
+           ((plane - MSTARV7_MIU0_BASE + off) & (MSTARV7_MIU0_WINDOW - 1));
+}
+
 static void mstar_disp_update_top_irq(MStarDispState *s)
 {
     bool flag = s->topregs[TOP_VSYNC_FLAG / 4] & TOP_VSYNC_BIT;
@@ -198,8 +206,8 @@ static bool mstar_disp_draw_mop(MStarDispState *s, uint32_t *dst,
     hwaddr caddr = MSTARV7_MIU0_BASE +
                    ((((hwaddr)((ch << 16) | cl)) << MOP_ADDR_SHIFT)
                     & (MSTARV7_MIU0_WINDOW - 1));
-    g_autofree uint8_t *yplane = NULL;
-    g_autofree uint8_t *cplane = NULL;
+    g_autofree uint8_t *yrow = NULL;
+    g_autofree uint8_t *crow = NULL;
     uint32_t x, y;
 
     if (!(s->mopregs[MOP_REG(MOP_WIN_EN)] & 1) || w == 0 || h == 0) {
@@ -215,17 +223,19 @@ static bool mstar_disp_draw_mop(MStarDispState *s, uint32_t *dst,
         return false;
     }
 
-    yplane = g_malloc(pitch * h);
-    cplane = g_malloc(pitch * ((h + 1) / 2));
-    address_space_read(&address_space_memory, yaddr, MEMTXATTRS_UNSPECIFIED,
-                       yplane, pitch * h);
-    address_space_read(&address_space_memory, caddr, MEMTXATTRS_UNSPECIFIED,
-                       cplane, pitch * ((h + 1) / 2));
-
+    /* One visible row at a time: the guest picks pitch and height. */
+    yrow = g_malloc(w);
+    crow = g_malloc(w);
     for (y = 0; y < h; y++) {
-        const uint8_t *yr = yplane + y * pitch;
-        const uint8_t *cr = cplane + (y / 2) * pitch;
+        const uint8_t *yr = yrow, *cr = crow;
         uint32_t *d = dst + y * sw;
+
+        address_space_read(&address_space_memory,
+                           mstar_disp_dram(yaddr, (uint64_t)y * pitch),
+                           MEMTXATTRS_UNSPECIFIED, yrow, w);
+        address_space_read(&address_space_memory,
+                           mstar_disp_dram(caddr, (uint64_t)(y / 2) * pitch),
+                           MEMTXATTRS_UNSPECIFIED, crow, w);
 
         for (x = 0; x < w; x++) {
             int yy = yr[x];
@@ -278,14 +288,19 @@ static void mstar_disp_draw_gop(MStarDispState *s, uint32_t *dst,
     }
     /* What of each line fits in the pitch. */
     w = MIN(sw, pitch / bpp);
+    if (w == 0) {
+        return;
+    }
 
-    buf = g_malloc(pitch * sh);
-    address_space_read(&address_space_memory, fbaddr, MEMTXATTRS_UNSPECIFIED,
-                       buf, pitch * sh);
-
+    /* One visible row at a time: the guest picks the pitch. */
+    buf = g_malloc(w * bpp);
     for (y = 0; y < sh; y++) {
-        const uint8_t *src = buf + y * pitch;
+        const uint8_t *src = buf;
         uint32_t *d = dst + y * sw;
+
+        address_space_read(&address_space_memory,
+                           mstar_disp_dram(fbaddr, (uint64_t)y * pitch),
+                           MEMTXATTRS_UNSPECIFIED, buf, w * bpp);
 
         for (x = 0; x < w; x++) {
             uint8_t r, g, b;
@@ -556,6 +571,23 @@ static const Property mstar_disp_properties[] = {
     DEFINE_PROP_BOOL("flip", MStarDispState, flip, false),
 };
 
+static const VMStateDescription vmstate_mstar_disp = {
+    .name = TYPE_MSTAR_DISP,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(gopregs, MStarDispState,
+                             MSTAR_DISP_GOP_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(topregs, MStarDispState,
+                             MSTAR_DISP_TOP_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(mopregs, MStarDispState,
+                             MSTAR_DISP_MOP_NUM_REGS),
+        VMSTATE_TIMER_PTR(vblank, MStarDispState),
+        VMSTATE_TIMER_PTR(gop_pulse, MStarDispState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void mstar_disp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -563,6 +595,7 @@ static void mstar_disp_class_init(ObjectClass *oc, const void *data)
     dc->realize = mstar_disp_realize;
     device_class_set_legacy_reset(dc, mstar_disp_reset);
     device_class_set_props(dc, mstar_disp_properties);
+    dc->vmsd = &vmstate_mstar_disp;
 }
 
 static const TypeInfo mstar_disp_types[] = {
