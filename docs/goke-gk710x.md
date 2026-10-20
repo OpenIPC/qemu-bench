@@ -142,6 +142,14 @@ straight through; `-d unimp` logs anything reaching either window.
   subtracts 4 from every received length. With `phytype=0` (U-Boot's
   default) the kernel reads the internal PHY's MII registers from memory,
   register *n* at `0x60022000 + 4n` (`gk-ephy`), not over MDIO.
+- **SD.** A standard SDHCI underneath (`generic-sdhci`), with two Goke
+  quirks the vendor driver (`gk_sdio2_v1_00.c`) depends on. CAP bit 27
+  must be set (`SD_CAP_INTMODE`; without it `gk_sd_probe` fails with
+  `-ENODEV` and no message). The write-protect pin level reads inverted
+  ("1 read only, 0 write": `wp-inverted`). The vendor kernel takes card
+  detect from a GPIO, active low, which reads 0 here, so it always sees a
+  card; the model's PRESENTSTATE has card-inserted only with `-drive
+  if=sd`.
 - **USB.** Mentor MUSB. Plain memory, except CONFIGDATA (`+0x1F`) reads
   DYNFIFO | SOFTCONE: with 0 there the vendor driver finds no bulk FIFO,
   fails the probe and oopses in its own error path.
@@ -254,7 +262,8 @@ their S addresses as they are.
 | sflash | `0x90016000` | as on the GK710x |
 | EPHY | `0x90022000` | as on the GK710x |
 | DDRC | `0x90002000` | `+0x04` = `0x00100344` (64 MiB) / `0x00100354` (128 MiB), read back by U-Boot's `dram_init` |
-| RCT, GPIO, SD, PMU, ... | `hardware.h` | storage (`hisi-regbank`) |
+| SDIO0 / SDC1 | `0x90000000` / `0x90010000` | the vendor `sd.h` layout, below |
+| RCT, GPIO, PMU, ... | `hardware.h` | storage (`hisi-regbank`) |
 
 **DMA.** The GK7102C U-Boot checks the DMA controller before anything
 else. It builds one descriptor at `0xC1000000` (from the I2S FIFO at
@@ -277,9 +286,47 @@ EN | RST), then does the DDR set-up of the SDK's GK7102S table. That
 watchdog does not reset the machine during the boot: a 90 s run reaches
 `login:` and stays there.
 
-**SD.** Not modelled. The S drivers use the vendor's halfword register
-layout directly, which the GK710x HAL turns into a standard SDHCI. The
-two controllers are storage, so the kernel's probe finds no card.
+**SD.** SDIO0 (`0x90000000`, SD_IRQ 8) and SDC1 (`0x90010000`, SD1_IRQ
+22) are `generic-sdhci` behind `gk-remap`, in the vendor's register
+layout (`mach-gk710xs/include/mach/sd.h`, U-Boot `arch-gk7101s`
+`REG_SDIO_*`): halfword and word registers, and byte registers inside
+them. The rows come from the GK710x HAL's `hw_writew`/`hw_writel` and
+`hw_writeb` with their `hw_read*` counterparts. The byte accessors have
+their own map, so the same address means different things by width:
+`+0x2C` as a word is CONTROL00 (only bits 0–3 reach SDHCI `0x28`), while
+`+0x2C`/`+0x2D` as bytes are host and power control. The S `sd.h` swaps
+SD_XFR_MUL_SEL / SD_XFR_CTH_SEL (bits 4, 5) relative to the GK710x one,
+and that row is composed with the swap. `-drive if=sd,index=0` puts a
+card in SDIO0, `index=1` in SDC1.
+
+| S register (driver offset) | width | SDHCI | bits (driver → SDHCI) |
+|---|---|---|---|
+| DMA_ADDR `0x00` | 32 | `0x00` | |
+| XFR `0x04` | 16 | `0x0C` | 0→1, 1→2, 2→0, 4→5, 5→4 (BLKCNT_EN, AC12_EN, DMA_EN, MUL, CTH) |
+| NIXEN `0x06` / EIXEN `0x08` | 16 | `0x38` / `0x3A` | EIXEN: 1→2, 2→3, 3→4, 4→1 |
+| BLK_CNT `0x0A` / BLK_SZ `0x0C` | 16 | `0x06` / `0x04` | |
+| NISEN `0x0E` / EISEN `0x10` | 16 | `0x34` / `0x36` | EISEN: 1↔2, 4↔5 |
+| NIS `0x12` / EIS `0x14` | 16 | `0x30` / `0x32` | NIS: 1→2, 2→3, 3→1, 5↔6 |
+| CMD `0x16` | 16 | `0x0E` | 4↔5 (DATA, CHKIDX); bit 2 not passed |
+| TMO `0x18` (byte) | 8 | `0x2E` | |
+| RESET `0x19` (byte) | 8 | `0x2F` | 0↔1 (CMD 1, ALL 2 → SDHCI ALL 1, CMD 2) |
+| CLK `0x1A` | 16 | `0x2C` | |
+| RSP0–3 `0x1C`–`0x28` | 32 | `0x10`–`0x1C` | |
+| HOST `0x2C` (byte) | 8 | `0x28` | 2↔3 (8-bit, high speed) |
+| PWR `0x2D` (byte) | 8 | `0x29` | |
+| GAP `0x2E` / WAK `0x2F` (bytes) | 8 | `0x2A` / `0x2B` | GAP 1↔2, 4↔7; WAK 0↔1 |
+| STA `0x30` | 32 | `0x24` | 1↔2, 8→9, 9→10, 10→8; 3–7, 12–15, 29–31 not passed |
+| ARG `0x34` | 32 | `0x08` | |
+| CAP `0x38` | 32 | `0x40` | 22↔23 (SUS_RES, DMA); 6, 14, 15, 19, 20, 28–31 not passed |
+| AC12ES `0x3C` | 32 | `0x3C` | 0→1, 1→2, 2→3, 3→0; 5, 6, 8–31 not passed |
+| DATA `0x40` | 32 | `0x20` | |
+
+Reads are the exact inverse of the writes, bit for bit.
+
+With a FAT card (MBR, one FAT32 partition) the GK7102C camera's own kernel
+finds it: `mmc0: new ultra high speed SDR12 SD card`, `mmcblk0: p1`. It
+mounts the partition, reads a file from it, and writes a 320 KiB file
+that lands byte for byte in the image.
 
 **Flash images.** As on the GK710x, the chip holds every word byte-swapped.
 A dump read out by software (`sf read`, `/dev/mtd`) is in CPU order, and

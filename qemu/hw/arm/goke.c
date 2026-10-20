@@ -171,9 +171,13 @@ static const GkSoCConfig gk7101s_soc = {
     .wdt_base           = 0xA0006000,
     .wdt_irq            = 11,
     .sflash_base        = 0x90016000,
-    /* SD controllers at 0x90000000 / 0x90010000 are left as storage: the
-     * S HAL passes the vendor's halfword register layout through, which is
-     * not the standard SDHCI one the GK710x HAL makes of it. */
+    /* SDIO0 and SDC1: the vendor's halfword register layout, which the
+     * GK710x HAL turns into a standard SDHCI -- generic-sdhci behind
+     * gk-remap.  -drive if=sd,index=0 / index=1 puts a card in each. */
+    .sdhci_base         = 0x90000000,
+    .sdhci_irq          = 8,                    /* SD_IRQ */
+    .sdhci1_base        = 0x90010000,
+    .sdhci1_irq         = 22,                   /* SD1_IRQ */
     .usb_base           = 0x90006000,
     .dma_base           = 0x90003000,
     .dma_irq            = 21,                   /* DMA_IRQ */
@@ -182,15 +186,13 @@ static const GkSoCConfig gk7101s_soc = {
     .ephy_base          = 0x90022000,
     .idc_bases          = { 0xA0003000, 0xA0004000 },
     .idc_irqs           = { 9, 58 },
-    .num_regbanks       = 18,
+    .num_regbanks       = 16,
     .regbanks           = {
-        { "gk-sdc",      0x90000000, 0x1000 },
         { "gk-efuse",    0x90001000, 0x1000 },
         { "gk-ddrc",     0x90002000, 0x1000 },
         { "gk-vo",       0x90004000, 0x1000 },
         { "gk-crypt",    0x90005000, 0x1000 },
         { "gk-i2s",      0x9000A000, 0x1000 },
-        { "gk-sdc1",     0x90010000, 0x1000 },
         /* AHB general regs, ADC, audio codec, USB PHY, DDR PHY. */
         { "gk-ahb-greg", 0x90020000, 0x2000 },
         { "gk-pmu",      0x90080000, 0x50000 }, /* PMU, RTC, 8051 code */
@@ -704,14 +706,26 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->sflash_base);
 
-    if (c->sdhci_base) {
-        DriveInfo *di = drive_get(IF_SD, 0, 0);
+    for (n = 0; n < 2; n++) {
+        const hwaddr base = n ? c->sdhci1_base : c->sdhci_base;
+        DriveInfo *di = drive_get(IF_SD, 0, n);
 
+        if (!base) {
+            continue;
+        }
         dev = qdev_new("generic-sdhci");
+        /* QEMU's default capabilities and bit 27, which the vendor driver
+         * (gk_sdio2_v1_00.c, SD_CAP_INTMODE) refuses a controller
+         * without; the HAL passes it through unchanged. */
+        qdev_prop_set_uint64(dev, "capareg", 0x057834b4 | (1u << 27));
+        /* Write-protect pin level the other way round from SDHCI: the
+         * driver reads PRESENTSTATE bit 19 set as read-only ("1 read
+         * only, 0 write", gk_sd_get_ro). */
+        qdev_prop_set_bit(dev, "wp-inverted", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->sdhci_base);
+        gk_map_model(c, dev, base, "sdio", 0x1000);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                           gk_irq(vic, c, c->sdhci_irq));
+                           gk_irq(vic, c, n ? c->sdhci1_irq : c->sdhci_irq));
         if (di) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);
 

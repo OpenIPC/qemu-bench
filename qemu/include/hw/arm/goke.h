@@ -81,6 +81,8 @@ typedef struct GkSoCConfig {
 
     hwaddr      sdhci_base;
     int         sdhci_irq;
+    hwaddr      sdhci1_base;    /* GK710xS: the second SD controller */
+    int         sdhci1_irq;
 
     hwaddr      usb_base;       /* Mentor MUSB core, see goke.c */
 

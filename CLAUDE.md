@@ -175,7 +175,10 @@ Non-HiSilicon families have their own table and init instead of
 `docs/goke-gk710x.md`). On GK710x the vendor code reaches registers only
 through a HAL blob that relocates, reorders and bit-permutes them: model the
 silicon at the addresses the HAL drives (`qemu-boot/gk710x-halmap.py` prints
-them), never the fictitious `0x90000000`/`0xA0000000` map the drivers use.
+them), never the fictitious `0x90000000`/`0xA0000000` map the drivers use. The
+GK710xS die (`gk7101s`/`gk7102s`, the GK7102C) is the exception: its HAL
+passes most accesses through, so its blocks are modelled at those driver
+addresses, behind `gk-remap` where the S layout differs.
 Its flash images are byte-swapped per 32-bit word, and `-kernel` boots need
 `hal-file=` (the HAL is vendor code; it is not shipped).
 
