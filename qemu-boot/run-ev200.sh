@@ -12,11 +12,15 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 QEMU="$REPO_ROOT/qemu-src/build/qemu-system-arm"
 
 TAP="${TAP:-tap0}"
+# NIC_OPTS — extra comma-separated options appended to the chosen
+# nic spec (typically used to add hostfwd entries for SLIRP, e.g.
+# NIC_OPTS=,hostfwd=tcp::1234-:1234 to expose an in-guest port).
+NIC_OPTS="${NIC_OPTS:-}"
 if ip link show "$TAP" &>/dev/null 2>&1; then
-    NIC_ARGS="-nic tap,ifname=$TAP,script=no,downscript=no"
+    NIC_ARGS="-nic tap,ifname=$TAP,script=no,downscript=no${NIC_OPTS}"
     echo "Using bridged TAP networking ($TAP)"
 else
-    NIC_ARGS="-nic user"
+    NIC_ARGS="-nic user${NIC_OPTS}"
     echo "TAP not available; using SLIRP user-mode networking"
 fi
 
