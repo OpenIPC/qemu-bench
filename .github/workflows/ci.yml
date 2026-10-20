@@ -1083,10 +1083,13 @@ jobs:
           retention-days: 7
 
   # hi3516cv610 (V5).  Unlike the SoCs in the matrix above, OpenIPC ships
-  # cv610 as a single firmware.bin (a FIT holding the kernel + dtb, with the
-  # SquashFS rootfs appended) under the SoC-family name "hi3516cv6xx",
-  # "ultimate" variant.  Split it into kernel/dtb/rootfs and boot like
-  # qemu-boot/run-cv610.sh.
+  # cv610 as a single firmware.bin under the SoC-family name "hi3516cv6xx",
+  # "ultimate" variant: since OpenIPC/firmware#2638 the split NOR image (a
+  # legacy uImage -- the zImage with its DTB appended -- then the SquashFS at
+  # the next 64 KiB) in openipc.hi3516cv6xx-nor-ultimate-split.tgz; before it
+  # a FIT holding the kernel + dtb with the SquashFS appended, in the plain
+  # package.  Take whichever is published, split it into kernel(/dtb)/rootfs
+  # and boot like qemu-boot/run-cv610.sh.
   boot-hi3516cv610:
     name: Boot hi3516cv610
     needs: build
@@ -1110,20 +1113,41 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-arm
 
       - name: Download and split OpenIPC firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd qemu-boot
-          curl -sL "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.hi3516cv6xx-nor-ultimate.tgz" \
-              -o openipc.hi3516cv6xx-nor-ultimate.tgz
-          tar xzf openipc.hi3516cv6xx-nor-ultimate.tgz
+          # The split package on latest, else the plain one; and when latest
+          # has neither (between a format change and the nightly that
+          # publishes the new one) the newest nightly-* release with either.
+          fetch() {
+            for name in openipc.hi3516cv6xx-nor-ultimate-split.tgz openipc.hi3516cv6xx-nor-ultimate.tgz; do
+              curl -sfL "https://github.com/OpenIPC/firmware/releases/download/$1/$name" -o fw.tgz && return 0
+            done
+            return 1
+          }
+          if ! fetch latest; then
+            for tag in $(gh release list -R OpenIPC/firmware --limit 30 --json tagName --jq '.[].tagName' | grep '^nightly-'); do
+              fetch "$tag" && { echo "from $tag"; break; }
+            done
+          fi
+          tar xzf fw.tgz
           FW=firmware.bin.hi3516cv6xx
-          # FIT: image 1 = linux_kernel (zImage), image 0 = fdt-1 (dtb).
-          dumpimage -T flat_dt -p 1 -o uImage.hi3516cv610 "$FW"
-          dumpimage -T flat_dt -p 0 -o cv610.dtb          "$FW"
-          # SquashFS rootfs is appended right after the FIT.
+          if [ "$(od -An -tx1 -N4 "$FW" | tr -d ' \n')" = 27051956 ]; then
+            # Split image: the uImage (64-byte header + data, size big-endian
+            # at byte 12), its DTB appended to the zImage inside, so no -dtb.
+            set -- $(od -An -tu1 -j12 -N4 "$FW")
+            head -c $(( 64 + (($1 << 24) | ($2 << 16) | ($3 << 8) | $4) )) "$FW" > uImage.hi3516cv610
+          else
+            # FIT: image 1 = linux_kernel (zImage), image 0 = fdt-1 (dtb).
+            dumpimage -T flat_dt -p 1 -o uImage.hi3516cv610 "$FW"
+            dumpimage -T flat_dt -p 0 -o cv610.dtb          "$FW"
+          fi
+          # SquashFS rootfs is appended right after the kernel.
           sqoff=$(grep -aboP 'hsqs' "$FW" | head -1 | cut -d: -f1)
           dd if="$FW" of=rootfs.squashfs.hi3516cv610 bs=64k iflag=skip_bytes \
               skip="$sqoff" status=none
-          ls -la uImage.hi3516cv610 cv610.dtb rootfs.squashfs.hi3516cv610
+          ls -la uImage.hi3516cv610 rootfs.squashfs.hi3516cv610 cv610.dtb 2>/dev/null || true
 
       - name: "OpenIPC kernel + rootfs boot"
         timeout-minutes: 4
@@ -1133,7 +1157,7 @@ jobs:
           QEMU=./qemu-src/build/qemu-system-arm
           timeout 150 $QEMU -M hi3516cv610 -m 256M \
             -kernel qemu-boot/uImage.hi3516cv610 \
-            -dtb qemu-boot/cv610.dtb \
+            $( [ -f qemu-boot/cv610.dtb ] && echo -dtb qemu-boot/cv610.dtb ) \
             -initrd qemu-boot/rootfs.squashfs.hi3516cv610 \
             -nographic -serial mon:stdio -nic user,restrict=on \
             -append 'mem=128M console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs' \
