@@ -375,6 +375,59 @@ def split_nals(au):
 # RTSP / RTP
 
 
+class H264File:
+    """Replay a raw H.264 stream (Annex B), looping, like H264Pattern.
+
+    For reproducing what a real camera sends: capture one with e.g.
+    ffmpeg -rtsp_transport tcp -i rtsp://CAMERA/... -c copy -an -t 20
+    -f h264 cam.h264
+    """
+
+    def __init__(self, path, width, height, fps):
+        data = open(path, "rb").read()
+        self.w, self.h, self.fps, self.gop = width, height, fps, 0
+        self.aus = []
+        self.sps_nal = self.pps_nal = None
+        au, vcl = [], False
+        for n in split_nals(data):
+            if not n:
+                continue
+            t = n[0] & 0x1F
+            first_mb0 = t in (1, 5) and len(n) > 1 and n[1] & 0x80
+            # a new access unit: an AUD/SPS/PPS/SEI, or a picture's first
+            # slice, after the previous picture's slices
+            if vcl and (t in (6, 7, 8, 9) or first_mb0):
+                self.aus.append(au)
+                au, vcl = [], False
+            if t == 7 and self.sps_nal is None:
+                self.sps_nal = n
+            if t == 8 and self.pps_nal is None:
+                self.pps_nal = n
+            au.append(n)
+            vcl |= t in (1, 5)
+        if vcl:
+            self.aus.append(au)
+        # start, and loop, at the first IDR
+        idrs = [i for i, a in enumerate(self.aus)
+                if any(x[0] & 0x1F == 5 for x in a)]
+        if not idrs or not self.sps_nal or not self.pps_nal:
+            raise SystemExit("%s: no SPS/PPS/IDR in it" % path)
+        self.aus = self.aus[idrs[0]:]
+        self.n = 0
+
+    def sps(self):
+        return b"\x00\x00\x00\x01" + self.sps_nal
+
+    def pps(self):
+        return b"\x00\x00\x00\x01" + self.pps_nal
+
+    def picture(self):
+        au = self.aus[self.n % len(self.aus)]
+        self.n += 1
+        idr = any(x[0] & 0x1F == 5 for x in au)
+        return b"".join(b"\x00\x00\x00\x01" + x for x in au), idr
+
+
 class Stream:
     """One shared encoder; clients read the latest access units."""
 
@@ -856,6 +909,8 @@ def main():
                     " NVRs live-view their split screens from it")
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--gop", type=int, default=20)
+    ap.add_argument("--file", help="stream this raw H.264 file (looped) "
+                    "instead of the pattern; --size/--fps describe it")
     ap.add_argument("--write", help="write an Annex B file and exit")
     ap.add_argument("--frames", type=int, default=50)
     ap.add_argument("--relay", type=int, metavar="PORT",
@@ -867,7 +922,10 @@ def main():
         relay(ARGS.bind, ARGS.relay)
         return
     w, h = (int(x) for x in ARGS.size.split("x"))
-    pat = H264Pattern(w, h, ARGS.fps, ARGS.gop)
+    if ARGS.file:
+        pat = H264File(ARGS.file, w, h, ARGS.fps)
+    else:
+        pat = H264Pattern(w, h, ARGS.fps, ARGS.gop)
 
     if ARGS.write:
         with open(ARGS.write, "wb") as f:
@@ -876,7 +934,7 @@ def main():
         return
 
     streams = {"main": Stream(pat)}
-    if ARGS.sub_size == ARGS.size:
+    if ARGS.sub_size == ARGS.size or ARGS.file:
         streams["sub"] = streams["main"]
     else:
         sw, sh = (int(x) for x in ARGS.sub_size.split("x"))

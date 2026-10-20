@@ -40,8 +40,9 @@ if [ -n "$CAMERA" ]; then
     CAM="$SCRIPT_DIR/fake-ipcam.py"
     CAM_HTTP=${CAM_HTTP:-18080}
     CAM_RTSP=${CAM_RTSP:-18554}
+    # CAM_ARGS: more options, e.g. "--file cam.h264 --size 1920x1080 --fps 25"
     python3 "$CAM" --http "$CAM_HTTP" --rtsp "$CAM_RTSP" \
-        --advertise 192.168.1.10 &
+        --advertise 192.168.1.10 $CAM_ARGS &
     CAM_PID=$!
     trap 'kill $CAM_PID 2>/dev/null' EXIT
     # One relay process per guest connection (a tcp: chardev is one
