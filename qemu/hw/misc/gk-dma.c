@@ -41,6 +41,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
@@ -198,23 +199,27 @@ static void gk_dma_run(GkDmaState *s, int n)
     gk_dma_update(s);
 }
 
+/* Byte and halfword accesses reach the bytes of their word. */
 static uint64_t gk_dma_read(void *opaque, hwaddr off, unsigned size)
 {
     GkDmaState *s = opaque;
+    const unsigned shift = 8 * (off & 3);
 
-    return *gk_dma_reg(s, off & ~3);
+    return extract64(*gk_dma_reg(s, off & ~3), shift, 8 * size);
 }
 
 static void gk_dma_write(void *opaque, hwaddr off, uint64_t val,
                          unsigned size)
 {
     GkDmaState *s = opaque;
+    const unsigned shift = 8 * (off & 3);
     int n;
 
     off &= ~3;
     if (off == DMA_INT) {
         return;                         /* read only */
     }
+    val = deposit64(*gk_dma_reg(s, off), shift, 8 * size, val);
     *gk_dma_reg(s, off) = val;
     for (n = 0; n < GK_DMA_CHANS; n++) {
         if (off == DMA_CTR(n) && (val & CTR_EN)) {
@@ -234,7 +239,8 @@ static const MemoryRegionOps gk_dma_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
-    .impl.min_access_size = 4,
+    .valid.unaligned = false,
+    .impl.min_access_size = 1,
     .impl.max_access_size = 4,
 };
 

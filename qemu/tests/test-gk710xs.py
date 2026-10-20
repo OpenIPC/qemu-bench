@@ -19,7 +19,9 @@ mach-gk710xs headers (docs/goke-gk710x.md):
     channel's INT bit is set until STA is cleared; a count that is not a
     whole number of units moves its tail too; a count of 0xFFFFFFFF is
     cut to the 22-bit field instead of running forever; an unreachable
-    descriptor or source stops the channel with BE and no done.
+    descriptor or source stops the channel with BE and no done;
+  - byte stores: merged into the register they hit, through gk-remap and
+    into gk-dma (a byte store of EN starts a channel).
 
     python3 qemu/tests/test-gk710xs.py [--qemu PATH]
 """
@@ -259,6 +261,30 @@ def test_dma_edges(qt):
     qt.writel(DMAC + 0x338, 0)
 
 
+def test_byte_stores(qt):
+    print('byte stores')
+    qt.writel(TIMER + 0x38, 0x00345678)         # T3 RELOAD
+    qt.writeb(TIMER + 0x3B, 0x12)
+    check('gk-remap: byte merged into the register', qt.readl(TIMER + 0x38),
+          0x12345678)
+    check('gk-remap: byte read back', qt.readb(TIMER + 0x39), 0x56)
+
+    desc, src, dst = RAM + 0x7000, RAM + 0x7100, RAM + 0x7200
+    qt.writel(src, 0xCAFEF00D)
+    qt.writel(dst, 0)
+    for i, w in enumerate([src, dst, desc + 0x18, 0, 4, ATTR(2)]):
+        qt.writel(desc + 4 * i, w)
+    qt.writel(DMAC + 0x30C, desc)
+    qt.writeb(DMAC + 0x32F, 0xC0)               # CTR(1) top byte: EN | D
+    check('gk-dma: byte store of EN runs the channel', qt.readl(dst),
+          0xCAFEF00D)
+    qt.writel(DMAC + 0x310, 0x11223344)         # DA(2)
+    qt.writeb(DMAC + 0x311, 0xAA)
+    check('gk-dma: byte merged into DA(2)', qt.readl(DMAC + 0x310),
+          0x1122AA44)
+    qt.writel(DMAC + 0x338, 0)
+
+
 def test_rejection(qemu, path):
     print('rejections')
     cpu = path + '.cpu'
@@ -290,6 +316,7 @@ def main():
         test_idc(qt)
         test_dma(qt)
         test_dma_edges(qt)
+        test_byte_stores(qt)
     finally:
         qt.close()
     test_rejection(args.qemu, path)

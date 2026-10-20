@@ -38,6 +38,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "exec/memattrs.h"
@@ -237,9 +238,9 @@ static uint32_t gk_remap_bits(const int8_t map[32], uint32_t v)
     return out;
 }
 
-static uint64_t gk_remap_read(void *opaque, hwaddr off, unsigned size)
+/* One whole driver register, through the table. */
+static uint32_t gk_remap_read_reg(GkRemapState *s, hwaddr off)
 {
-    GkRemapState *s = opaque;
     const GkRemapReg *r = gk_remap_find(s, off);
     hwaddr model = r ? r->model : off;
     uint64_t v = 0;
@@ -252,10 +253,8 @@ static uint64_t gk_remap_read(void *opaque, hwaddr off, unsigned size)
     return r && r->perm ? gk_remap_bits(r->r, v) : v;
 }
 
-static void gk_remap_write(void *opaque, hwaddr off, uint64_t v,
-                           unsigned size)
+static void gk_remap_write_reg(GkRemapState *s, hwaddr off, uint64_t v)
 {
-    GkRemapState *s = opaque;
     const GkRemapReg *r = gk_remap_find(s, off);
     hwaddr model = r ? r->model : off;
 
@@ -269,6 +268,33 @@ static void gk_remap_write(void *opaque, hwaddr off, uint64_t v,
                                  MEMTXATTRS_UNSPECIFIED);
 }
 
+/*
+ * The HAL has byte and halfword accessors for every block, so narrower
+ * accesses are decoded too: a read takes its bytes out of the register,
+ * a write merges them into its current value (a read of it, then a write
+ * of the whole register).  None of the models behind gk-remap changes
+ * state on a read, so the merge has no side effect of its own.
+ */
+static uint64_t gk_remap_read(void *opaque, hwaddr off, unsigned size)
+{
+    GkRemapState *s = opaque;
+
+    return extract64(gk_remap_read_reg(s, off & ~3), 8 * (off & 3),
+                     8 * size);
+}
+
+static void gk_remap_write(void *opaque, hwaddr off, uint64_t v,
+                           unsigned size)
+{
+    GkRemapState *s = opaque;
+
+    if (size < 4) {
+        v = deposit64(gk_remap_read_reg(s, off & ~3), 8 * (off & 3),
+                      8 * size, v);
+    }
+    gk_remap_write_reg(s, off & ~3, v);
+}
+
 static const MemoryRegionOps gk_remap_ops = {
     .read = gk_remap_read,
     .write = gk_remap_write,
@@ -276,7 +302,8 @@ static const MemoryRegionOps gk_remap_ops = {
     /* The HAL has byte and halfword accessors for every block. */
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
-    .impl.min_access_size = 4,
+    .valid.unaligned = false,
+    .impl.min_access_size = 1,
     .impl.max_access_size = 4,
 };
 
