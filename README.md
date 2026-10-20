@@ -8,7 +8,7 @@ Builds two QEMU targets:
 - `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (61 total)
+## Supported Machines (63 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
