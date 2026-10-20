@@ -381,6 +381,11 @@ def test_vpu(qt):
     check('decoders: AVC and HEVC', qt.readl(VPU + 0x128), 0x0C)
     check('product name', qt.readl(VPU + 0x11C), 0x57353131)
     qt.writel(VPU + 0x48, 0x8940)                   # VINT_ENABLE, as mi_vdec
+    # a ring QEMU would have to copy gigabytes out of: refused
+    qt.writel(VPU + 0x11C, 0)
+    qt.writel(VPU + 0x120, 0xFFFFFFFF)
+    check('CREATE_INSTANCE: 4 GiB ring refused',
+          vpu_cmd(qt, 0x08, inst=0x20000), 0)
     BS, BS_SIZE = 0x400000, 0x100000
     qt.writel(VPU + 0x11C, BS)
     qt.writel(VPU + 0x120, BS_SIZE)

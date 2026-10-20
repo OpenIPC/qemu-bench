@@ -59,6 +59,7 @@
 #include "migration/vmstate.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 
@@ -139,6 +140,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarVpuState, SSTAR_VPU)
 #define VPU_MAX_FB          32
 #define VPU_QUEUE_DEPTH     2
 #define VPU_REPORT_WORDS    64          /* the result area 0x100..0x1FC */
+#define VPU_BS_MAX          (64 * MiB)  /* bitstream ring */
+#define VPU_OUT_MAX         8192        /* output picture side */
 
 /* more registers: the per-command parameter / result words */
 #define W5_BS_RD_PTR                0x0118
@@ -389,13 +392,15 @@ static uint8_t *bs_fetch(VpuInst *in, uint32_t rd, uint32_t len)
 {
     uint32_t end = in->bs_start + in->bs_size;
     uint32_t first = MIN(len, end - rd);
-    uint8_t *buf = g_malloc(len + 64);   /* + AV_INPUT_BUFFER_PADDING_SIZE */
+    uint8_t *buf;
 
+    /* len is within the ring, which vpu_create_instance capped */
+    buf = g_malloc((size_t)len + AV_INPUT_BUFFER_PADDING_SIZE);
     vpu_dram_read(rd, buf, first);
     if (len > first) {
         vpu_dram_read(in->bs_start, buf + first, len - first);
     }
-    memset(buf + len, 0, 64);
+    memset(buf + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     return buf;
 }
 
@@ -591,7 +596,11 @@ static uint32_t pic_type(AVFrame *f, uint32_t std)
         t = 1u << 0;
         break;
     }
+#ifdef AV_FRAME_FLAG_KEY
     if (f->flags & AV_FRAME_FLAG_KEY) {
+#else
+    if (f->key_frame) {                 /* FFmpeg before 6.1 */
+#endif
         t |= (std == STD_AVC ? 5 : 19) << 4;    /* IDR nal_unit_type */
     }
     return t;
@@ -901,27 +910,55 @@ static void inst_destroy(VpuInst *in)
     memset(in, 0, sizeof(*in));
 }
 
+/*
+ * Open decoder instances hold host decoder state, which does not migrate:
+ * block migration while there is one.
+ */
+static void vpu_update_blocker(SstarVpuState *s)
+{
+    bool any = false;
+    int i;
+
+    for (i = 0; i < VPU_MAX_INST; i++) {
+        any |= s->inst[i].used;
+    }
+    if (any && !s->migration_blocker) {
+        error_setg(&s->migration_blocker, "sstar-vpu: decoder instances "
+                   "hold host decoder state");
+        /* fails (and frees it) only while a migration is under way */
+        migrate_add_blocker(&s->migration_blocker, NULL);
+    } else if (!any && s->migration_blocker) {
+        migrate_del_blocker(&s->migration_blocker);
+    }
+}
+
 static void vpu_create_instance(SstarVpuState *s)
 {
     uint32_t info = vpu_reg(s, W5_CMD_INSTANCE_INFO);
     VpuInst *in = vpu_cur_inst(s);
     uint32_t std = info >> 16;
 
+    uint32_t start = vpu_reg(s, W5_CMD_DEC_BS_START_ADDR);
+    uint32_t size = vpu_reg(s, W5_CMD_DEC_BS_SIZE);
+
     if (std != STD_HEVC && std != STD_AVC) {
         vpu_cmd_done(s, false, SYSERR_UNKNOWN_CODEC_STD);
+        return;
+    }
+    /* A ring QEMU can hold: whatever is in it is copied out per command. */
+    if (!size || size > VPU_BS_MAX || start > UINT32_MAX - size) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-vpu: bitstream ring 0x%x+0x%x"
+                      "\n", start, size);
+        vpu_cmd_done(s, false, SYSERR_QUEUEING_FAIL);
         return;
     }
     inst_destroy(in);
     in->used = true;
     in->std = std;
-    in->bs_start = vpu_reg(s, W5_CMD_DEC_BS_START_ADDR);
-    in->bs_size = vpu_reg(s, W5_CMD_DEC_BS_SIZE);
+    in->bs_start = start;
+    in->bs_size = size;
     in->rd = in->wr = in->bs_start;
-    if (!s->migration_blocker) {
-        error_setg(&s->migration_blocker, "sstar-vpu: decoder instances "
-                   "hold host decoder state");
-        migrate_add_blocker(&s->migration_blocker, NULL);
-    }
+    vpu_update_blocker(s);
     vpu_queue_status(s, in);
     vpu_cmd_done(s, true, 0);
 }
@@ -949,8 +986,9 @@ static void vpu_queue_cmd(SstarVpuState *s, uint32_t cmd)
     c->opt = vpu_reg(s, W5_COMMAND_OPTION);
     if (cmd == W5_DEC_PIC) {
         c->out.flags = vpu_reg(s, W5_CMD_DEC_OUT_FLAGS);
-        c->out.w = vpu_reg(s, W5_CMD_DEC_OUT_SIZE) >> 16;
-        c->out.h = vpu_reg(s, W5_CMD_DEC_OUT_SIZE) & 0xFFFF;
+        c->out.w = MIN(vpu_reg(s, W5_CMD_DEC_OUT_SIZE) >> 16, VPU_OUT_MAX);
+        c->out.h = MIN(vpu_reg(s, W5_CMD_DEC_OUT_SIZE) & 0xFFFF,
+                       VPU_OUT_MAX);
         c->out.y = vpu_reg(s, W5_CMD_DEC_OUT_LUMA);
         c->out.c = vpu_reg(s, W5_CMD_DEC_OUT_CHROMA);
         c->out.stride = vpu_reg(s, W5_CMD_DEC_OUT_STRIDE);
@@ -1153,6 +1191,7 @@ static void vpu_command(SstarVpuState *s)
         break;
     case W5_DESTROY_INSTANCE:
         inst_destroy(in);
+        vpu_update_blocker(s);
         vpu_cmd_done(s, true, 0);
         break;
     case W5_FLUSH_INSTANCE:
@@ -1284,6 +1323,7 @@ static void sstar_vpu_write(void *opaque, hwaddr off, uint64_t val,
             for (i = 0; i < VPU_MAX_INST; i++) {
                 inst_destroy(&s->inst[i]);
             }
+            vpu_update_blocker(s);
             s->regs[W5_VCPU_CUR_PC >> 2] = 0;
             s->regs[W5_VPU_VINT_REASON >> 2] = 0;
             vpu_update_irq(s);
@@ -1315,6 +1355,7 @@ static void sstar_vpu_reset(DeviceState *dev)
     for (i = 0; i < VPU_MAX_INST; i++) {
         inst_destroy(&s->inst[i]);
     }
+    vpu_update_blocker(s);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->fio, 0, sizeof(s->fio));
     qemu_set_irq(s->irq, 0);
@@ -1333,7 +1374,7 @@ static void sstar_vpu_init(Object *obj)
 
 /*
  * The registers only: open decoder instances hold host decoder state and
- * block migration (vpu_create_instance).
+ * block migration (vpu_update_blocker).
  */
 static const VMStateDescription vmstate_sstar_vpu = {
     .name = TYPE_SSTAR_VPU,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-A fake IP camera for emulated NVRs: ONVIF (Profile S subset) + RTSP/RTP
-serving a synthetic H.264 test pattern.
+A fake IP camera for emulated NVRs: ONVIF (Profile S subset) + RTSP with
+RTP interleaved over TCP, serving a synthetic H.264 test pattern.
 
 The H.264 stream needs no encoder library.  Every picture is lossless:
 the IDR codes each macroblock as I_PCM, and the P pictures that follow
@@ -444,7 +444,7 @@ class RTSPHandler(socketserver.StreamRequestHandler):
         super().setup()
         self.session = "%08X" % random.getrandbits(32)
         self.channel = 0
-        self.udp = None
+        self.pumper = None
         self.playing = False
         self.lock = threading.Lock()        # RTSP replies vs RTP writes
         self.ssrc = random.getrandbits(32)
@@ -524,22 +524,17 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                            body=self.sdp())
             elif method == "SETUP":
                 tr = hdrs.get("transport", "")
-                if "interleaved" in tr or "TCP" in tr:
-                    ch = 0
-                    for part in tr.split(";"):
-                        if part.startswith("interleaved="):
-                            ch = int(part[12:].split("-")[0])
-                    self.channel = ch
-                    rtr = "RTP/AVP/TCP;unicast;interleaved=%d-%d" % (ch,
-                                                                     ch + 1)
-                else:
-                    cport = 0
-                    for part in tr.split(";"):
-                        if part.startswith("client_port="):
-                            cport = int(part[12:].split("-")[0])
-                    self.udp = (self.client_address[0], cport)
-                    rtr = ("RTP/AVP;unicast;client_port=%d-%d;"
-                           "server_port=6970-6971" % (cport, cport + 1))
+                if "interleaved" not in tr and "TCP" not in tr:
+                    # RTP over UDP would go to the --relay process, not
+                    # the guest: clients retry with TCP interleaving.
+                    self.reply(cseq, "461 Unsupported Transport")
+                    continue
+                ch = 0
+                for part in tr.split(";"):
+                    if part.startswith("interleaved="):
+                        ch = int(part[12:].split("-")[0])
+                self.channel = ch
+                rtr = "RTP/AVP/TCP;unicast;interleaved=%d-%d" % (ch, ch + 1)
                 rtr += ';ssrc=%08X;mode="play"' % self.ssrc
                 self.track = req.split()[1]
                 self.pick_stream(self.track)
@@ -555,9 +550,16 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                     % (self.track, self.seq,
                        int(nxt * 90000 / st.pat.fps) & 0xFFFFFFFF)])
                 if not self.playing:
+                    if self.pumper:
+                        self.pumper.join()      # a PAUSEd one, stopping
                     self.playing = True
-                    threading.Thread(target=self.pump, daemon=True).start()
-            elif method in ("GET_PARAMETER", "SET_PARAMETER", "PAUSE"):
+                    self.pumper = threading.Thread(target=self.pump,
+                                                   daemon=True)
+                    self.pumper.start()
+            elif method == "PAUSE":
+                self.playing = False            # the pump stops
+                self.reply(cseq, headers=["Session: " + self.session])
+            elif method in ("GET_PARAMETER", "SET_PARAMETER"):
                 self.reply(cseq, headers=["Session: " + self.session])
             elif method == "TEARDOWN":
                 self.reply(cseq, headers=["Session: " + self.session])
@@ -566,13 +568,11 @@ class RTSPHandler(socketserver.StreamRequestHandler):
             else:
                 self.reply(cseq, "501 Not Implemented")
 
-    def send_rtp(self, usock, rtcp, p):
-        if usock:
-            usock.sendto(p, (self.udp[0], self.udp[1] + rtcp))
-        else:
-            with self.lock:
-                self.wfile.write(struct.pack(">BBH", 0x24,
-                                             self.channel + rtcp, len(p)) + p)
+    def send_rtp(self, rtcp, p):
+        """RTP (or RTCP) interleaved on the RTSP connection."""
+        with self.lock:
+            self.wfile.write(struct.pack(">BBH", 0x24, self.channel + rtcp,
+                                         len(p)) + p)
 
     def pump(self):
         st = self.stream
@@ -580,8 +580,6 @@ class RTSPHandler(socketserver.StreamRequestHandler):
         seq = self.seq
         last = -1
         started = False
-        usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) \
-            if self.udp else None
         packets = octets = 0
         last_sr = 0
         try:
@@ -598,13 +596,13 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                     for p in pkts:
                         packets += 1
                         octets += len(p) - 12
-                        self.send_rtp(usock, 0, p)
+                        self.send_rtp(0, p)
                 if time.monotonic() - last_sr >= 1:
                     last_sr = time.monotonic()
-                    self.send_rtp(usock, 1, rtcp_sr(ssrc, ts, packets,
-                                                    octets))
+                    self.send_rtp(1, rtcp_sr(ssrc, ts, packets, octets))
         except OSError:
             pass
+        self.seq = seq                  # a PLAY after PAUSE carries on
         self.playing = False
 
 
