@@ -138,6 +138,94 @@ static const GkSoCConfig *gk7102_config(void)
     return &c;
 }
 
+/*
+ * GK7101S / GK7102S: the S die (the GK7102C cameras are this family too;
+ * their U-Boot carries the SDK's gk7101s HAL byte for byte).  The blocks
+ * are where mach-gk710xs/include/mach/hardware.h puts them; its kernel
+ * drives all but the UARTs and SSI directly, in the drivers' register
+ * layout.  The VIC, timers, watchdog, IDC and GMAC are the GK710x models
+ * behind gk-remap, which applies the GK710x HAL's register moves and bit
+ * permutations in front of them -- for the VIC that is the line wiring,
+ * so the GK710x irq_line table holds here too.  The IRQ numbers
+ * (mach-gk710xs irqs.h) are the GK710x ones.
+ */
+static const GkSoCConfig gk7101s_soc = {
+    .desc               = "Goke GK7101S (ARM1176, 128 MB DDR)",
+    .cpu_type           = ARM_CPU_TYPE_NAME("arm1176"),
+    .ram_base           = 0xC0000000,
+    .ram_size_default   = 128 * MiB,
+    .board_id           = 3988,                 /* MACH_GOKE_IPC */
+    .vic_base           = { 0x90008000, 0x90009000 },
+    .irq_line           = GK710X_IRQ_LINES,
+    .num_idle_high_irqs = 1,
+    .idle_high_irqs     = { 62 },
+    .num_uarts          = 3,
+    .uart_bases         = { 0xA0005000, 0xA001F000, 0xA001E000 },
+    .uart_irqs          = { 31, 15, 27 },       /* UART0/1/2_IRQ */
+    /* U-Boot arch-gk7101s/serial.h: UART_BASE_FREQ = 48 MHz / 2; the boot
+     * ROM programs DLL 13 for 115200 from it. */
+    .uart_clk           = 24000000,
+    .timer_base         = 0xA0000000,
+    .timer_irqs         = { 18, 19, 20 },
+    .apb_freq           = 69000000,             /* gk7101s/timer.c APB_CLK */
+    .wdt_base           = 0xA0006000,
+    .wdt_irq            = 11,
+    .sflash_base        = 0x90016000,
+    /* SD controllers at 0x90000000 / 0x90010000 are left as storage: the
+     * S HAL passes the vendor's halfword register layout through, which is
+     * not the standard SDHCI one the GK710x HAL makes of it. */
+    .usb_base           = 0x90006000,
+    .dma_base           = 0x90003000,
+    .dma_irq            = 21,                   /* DMA_IRQ */
+    .mac_base           = 0x9000E000,
+    .mac_irq            = 1,
+    .ephy_base          = 0x90022000,
+    .idc_bases          = { 0xA0003000, 0xA0004000 },
+    .idc_irqs           = { 9, 58 },
+    .num_regbanks       = 18,
+    .regbanks           = {
+        { "gk-sdc",      0x90000000, 0x1000 },
+        { "gk-efuse",    0x90001000, 0x1000 },
+        { "gk-ddrc",     0x90002000, 0x1000 },
+        { "gk-vo",       0x90004000, 0x1000 },
+        { "gk-crypt",    0x90005000, 0x1000 },
+        { "gk-i2s",      0x9000A000, 0x1000 },
+        { "gk-sdc1",     0x90010000, 0x1000 },
+        /* AHB general regs, ADC, audio codec, USB PHY, DDR PHY. */
+        { "gk-ahb-greg", 0x90020000, 0x2000 },
+        { "gk-pmu",      0x90080000, 0x50000 }, /* PMU, RTC, 8051 code */
+        { "gk-tssi",     0xA0001000, 0x1000 },
+        { "gk-ssi2",     0xA0002000, 0x1000 },
+        { "gk-adc2",     0xA0007000, 0x1000 },
+        { "gk-ssi1",     0xA0008000, 0x1000 },
+        { "gk-gpio",     0xA0009000, 0x1000 },
+        { "gk-pwm",      0xA000A000, 0x4000 },
+        { "gk-apb-110",  0xA0110000, 0x20000 },
+        { "gk-mem",      0xA0150000, 0x20000 },
+        { "gk-rct",      0xA0170000, 0x1000 },
+    },
+    .hal_addr           = 0xC0012000,
+    /* U-Boot include/configs/gk7101s.h, 128 MiB: mem=50M bsbsize=4M. */
+    .kernel_mem_mb      = 50,
+    .bsb_mb             = 4,
+    .s_layout           = true,
+};
+
+/* GK7102S: 64 MiB in the package; gk7101s.h gives it mem=36M bsbsize=2M. */
+static const GkSoCConfig *gk7102s_config(void)
+{
+    static GkSoCConfig c;
+
+    if (!c.desc) {
+        c = gk7101s_soc;
+        c.desc = "Goke GK7102S / GK7102C (ARM1176, 64 MB DDR)";
+        c.ram_size_default = 64 * MiB;
+        c.kernel_mem_mb = 36;
+        c.bsb_mb = 2;
+    }
+    return &c;
+}
+
 /* An abstract parent for both machines: the state and properties they
  * share, and a checked cast. */
 #define TYPE_GK_MACHINE MACHINE_TYPE_NAME("gk")
@@ -212,11 +300,19 @@ static const struct {
  *   w3      load and entry address w4, w5  (not used here)
  *   w6      0x5A5A5A5A             then (address, value) register writes,
  *   0xFFFFFFFE, address, value     = poll address until it reads value,
+ *   0xFFFFFFFF, count              = a delay (the GK7102C ROM table waits
+ *                                    like this between the bytes it sends
+ *                                    out of UART0),
  *   0                              = end; U-Boot follows the 0.
+ *
+ * w1 is 0x30310801 on the GK710x, 0x30360801 on the SDK's GK710xS images,
+ * 0x304308EF on the GK7102C cameras; the table itself names the registers,
+ * so it is not checked.
  */
 #define GK_BOOT_MAGIC       0x474B3731      /* "GK71" */
 #define GK_BOOT_MARK        0x5A5A5A5A
 #define GK_BOOT_POLL        0xFFFFFFFE
+#define GK_BOOT_DELAY       0xFFFFFFFF
 
 typedef struct GkBootRom {
     ARMCPU *cpu;
@@ -269,6 +365,13 @@ static bool gk_boot_rom_setup(const char *path, const GkSoCConfig *c,
     }
 #define GKW(i) ldl_be_p(img + 4 * (i))
     if (len < 64 || GKW(0) != GK_BOOT_MAGIC || GKW(6) != GK_BOOT_MARK) {
+        if (len >= 64 && ldl_le_p(img) == GK_BOOT_MAGIC) {
+            error_report("goke: %s is in CPU byte order, as `sf write` takes "
+                         "it or a software dump reads; the flash holds every "
+                         "word byte-swapped, so swap them for flash-file=",
+                         path);
+            exit(1);
+        }
         return false;
     }
     nwords = GKW(2);
@@ -292,6 +395,10 @@ static bool gk_boot_rom_setup(const char *path, const GkSoCConfig *c,
         }
         if (w == GK_BOOT_POLL) {
             i += 3;
+            continue;
+        }
+        if (w == GK_BOOT_DELAY) {
+            i += 2;
             continue;
         }
         g_array_append_val(writes, w);
@@ -344,14 +451,21 @@ static bool gk_boot_rom_setup(const char *path, const GkSoCConfig *c,
 #define GK_U2K_TOTAL_MEM    0x28
 #define GK_U2K_SIZE         0x2C
 
-static const uint32_t gk_hal_prologue[4] = {
-    0xE92D45F8,     /* push {r3-r8, sl, lr} */
-    0xE1A04000,     /* mov r4, r0 */
-    0xE1A05001,     /* mov r5, r1 */
-    0xE1A06002,     /* mov r6, r2 */
+static const uint32_t gk_hal_prologue[2][4] = {
+    {
+        0xE92D45F8,     /* GK710x: push {r3-r8, sl, lr} */
+        0xE1A04000,     /* mov r4, r0 */
+        0xE1A05001,     /* mov r5, r1 */
+        0xE1A06002,     /* mov r6, r2 */
+    }, {
+        0xE59F0048,     /* GK710xS: ldr r0, [pc, #0x48] */
+        0xE59F3048,     /* ldr r3, [pc, #0x48] */
+        0xE5830000,     /* str r0, [r3] */
+        0xE59F3044,     /* ldr r3, [pc, #0x44] */
+    },
 };
 
-static bool gk_find_hal(const char *path, uint8_t *hal)
+static bool gk_find_hal(const char *path, uint8_t *hal, bool s_layout)
 {
     g_autofree uint8_t *img = NULL;
     gsize len, off;
@@ -369,7 +483,7 @@ static bool gk_find_hal(const char *path, uint8_t *hal)
                 w[i] = swap ? ldl_be_p(img + off + 4 * i)
                             : ldl_le_p(img + off + 4 * i);
             }
-            if (memcmp(w, gk_hal_prologue, sizeof(w))) {
+            if (memcmp(w, gk_hal_prologue[s_layout], sizeof(w))) {
                 continue;
             }
             for (i = 0; i < GK_HAL_SIZE; i += 4) {
@@ -441,7 +555,7 @@ static void gk_kernel_handoff(MachineState *machine, const GkSoCConfig *c,
                      "into: pass hal-file=<U-Boot or flash image>");
         exit(1);
     }
-    if (!gk_find_hal(src, hal)) {
+    if (!gk_find_hal(src, hal, c->s_layout)) {
         error_report("goke: no GK710x HAL found in %s", src);
         exit(1);
     }
@@ -480,6 +594,28 @@ static qemu_irq gk_irq(DeviceState *vic[2], const GkSoCConfig *c, int n)
                             c->irq_line[n % GK_VIC_LINES]);
 }
 
+/*
+ * Map a model at base: as it is, or on the S die through gk-remap in the
+ * named S register layout.
+ */
+static void gk_map_model(const GkSoCConfig *c, DeviceState *dev, hwaddr base,
+                         const char *layout, uint32_t size)
+{
+    DeviceState *remap;
+
+    if (!c->s_layout || !layout) {
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
+        return;
+    }
+    remap = qdev_new("gk-remap");
+    qdev_prop_set_string(remap, "layout", layout);
+    qdev_prop_set_uint32(remap, "size", size);
+    object_property_set_link(OBJECT(remap), "target", OBJECT(dev),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(remap), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(remap), 0, base);
+}
+
 static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
 {
     GkMachineState *gms = GK_MACHINE(machine);
@@ -513,7 +649,7 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
         vic[n] = qdev_new("gk-vic");
         qdev_prop_set_uint32(vic[n], "idle-high", idle);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vic[n]), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(vic[n]), 0, c->vic_base[n]);
+        gk_map_model(c, vic[n], c->vic_base[n], "vic", 0x1000);
     }
     /* Both VICs drive the core's nIRQ / nFIQ (they are not daisy-chained:
      * the kernel scans VIC1, then VIC2, mach-gk710x/irq.c). */
@@ -549,7 +685,7 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
     dev = qdev_new("gk-timer");
     qdev_prop_set_uint32(dev, "freq", c->apb_freq);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->timer_base);
+    gk_map_model(c, dev, c->timer_base, "timer", 0x1000);
     for (n = 0; n < 3; n++) {
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
                            gk_irq(vic, c, c->timer_irqs[n]));
@@ -558,7 +694,7 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
     dev = qdev_new("gk-wdt");
     qdev_prop_set_uint32(dev, "freq", c->apb_freq);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->wdt_base);
+    gk_map_model(c, dev, c->wdt_base, "wdt", 0x1000);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, gk_irq(vic, c, c->wdt_irq));
 
     dev = qdev_new("gk-sflash");
@@ -590,8 +726,11 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
         if (!c->idc_bases[n]) {
             continue;
         }
-        dev = sysbus_create_simple("gk-idc", c->idc_bases[n],
-                                   gk_irq(vic, c, c->idc_irqs[n]));
+        dev = qdev_new("gk-idc");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        gk_map_model(c, dev, c->idc_bases[n], "idc", 0x1000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           gk_irq(vic, c, c->idc_irqs[n]));
         if (n == 0 && gms->sensor && strcmp(gms->sensor, "none")) {
             int i;
 
@@ -618,12 +757,17 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
          * every received length (gk_eth_v1_00.c), U-Boot's does not. */
         qdev_prop_set_bit(dev, "rx-fcs", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->mac_base);
+        gk_map_model(c, dev, c->mac_base, "gmac", 0x2000);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            gk_irq(vic, c, c->mac_irq));
     }
     if (c->ephy_base) {
         sysbus_create_simple("gk-ephy", c->ephy_base, NULL);
+    }
+
+    if (c->dma_base) {
+        sysbus_create_simple("gk-dma", c->dma_base,
+                             gk_irq(vic, c, c->dma_irq));
     }
 
     if (c->usb_base) {
@@ -755,3 +899,5 @@ type_init(gk_machine_register_types)
 
 DEFINE_GK_MACHINE("gk7101", gk7101, gk7101_soc)
 DEFINE_GK_MACHINE("gk7102", gk7102, (*gk7102_config()))
+DEFINE_GK_MACHINE("gk7101s", gk7101s, gk7101s_soc)
+DEFINE_GK_MACHINE("gk7102s", gk7102s, (*gk7102s_config()))
