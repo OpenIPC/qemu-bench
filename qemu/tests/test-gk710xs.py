@@ -21,7 +21,11 @@ mach-gk710xs headers (docs/goke-gk710x.md):
     cut to the 22-bit field instead of running forever; an unreachable
     descriptor or source stops the channel with BE and no done;
   - byte stores: merged into the register they hit, through gk-remap and
-    into gk-dma (a byte store of EN starts a channel).
+    into gk-dma (a byte store of EN starts a channel);
+  - SDIO0 (generic-sdhci behind gk-remap, the S sd.h layout): card detect
+    with and without -drive, the capabilities the vendor driver insists
+    on, the byte RESET register's own bit order, and a card brought up and
+    sector 0 read by SDMA with the S transfer-mode bits.
 
     python3 qemu/tests/test-gk710xs.py [--qemu PATH]
 """
@@ -48,7 +52,7 @@ TIMER3_IRQ = 20
 
 
 class QTest:
-    def __init__(self, qemu, machine):
+    def __init__(self, qemu, machine, extra=()):
         self.dir = tempfile.mkdtemp()
         path = os.path.join(self.dir, 'qtest.sock')
         srv = socket.socket(socket.AF_UNIX)
@@ -57,7 +61,7 @@ class QTest:
         self.proc = subprocess.Popen(
             [qemu, '-M', machine, '-machine', 'accel=qtest',
              '-display', 'none', '-nodefaults', '-qtest', 'unix:' + path,
-             '-serial', 'null'],
+             '-serial', 'null'] + list(extra),
             stdout=subprocess.DEVNULL,
             stderr=open(os.path.join(self.dir, 'qemu.err'), 'w'))
         srv.settimeout(20)
@@ -77,6 +81,12 @@ class QTest:
 
     def readl(self, a):
         return int(self.cmd('readl 0x%x' % a).split()[1], 16)
+
+    def writew(self, a, v):
+        self.cmd('writew 0x%x 0x%x' % (a, v))
+
+    def readw(self, a):
+        return int(self.cmd('readw 0x%x' % a).split()[1], 16)
 
     def writeb(self, a, v):
         self.cmd('writeb 0x%x 0x%x' % (a, v))
@@ -285,6 +295,91 @@ def test_byte_stores(qt):
     qt.writel(DMAC + 0x338, 0)
 
 
+# SDIO0, mach-gk710xs/include/mach/sd.h offsets and bits
+SD = 0x90000000
+SD_DMA_ADDR, SD_XFR, SD_BLK_CNT, SD_BLK_SZ, SD_NIS, SD_EIS = \
+    0x00, 0x04, 0x0A, 0x0C, 0x12, 0x14
+SD_CMD, SD_RESET, SD_CLK, SD_RSP0, SD_PWR, SD_STA, SD_ARG, SD_CAP = \
+    0x16, 0x19, 0x1A, 0x1C, 0x2D, 0x30, 0x34, 0x38
+SD_NISEN = 0x0E
+RSP_NONE, RSP_136, RSP_48, RSP_48BUSY = 0, 1, 2, 3
+CMD_CHKCRC, CMD_DATA, CMD_CHKIDX = 0x08, 0x10, 0x20
+XFR_BLKCNT_EN, XFR_DMA_EN, XFR_MUL_SEL, XFR_CTH_SEL = 0x01, 0x04, 0x10, 0x20
+NIS_CMD_DONE, NIS_XFR_DONE = 0x0001, 0x0008
+RESET_CMD, RESET_ALL = 0x01, 0x02
+
+
+def sd_cmd(qt, idx, arg, flags, wait=NIS_CMD_DONE):
+    qt.writel(SD + SD_ARG, arg)
+    qt.writew(SD + SD_CMD, idx << 8 | flags)
+    nis = qt.readw(SD + SD_NIS)
+    qt.writew(SD + SD_NIS, nis)
+    qt.writew(SD + SD_EIS, qt.readw(SD + SD_EIS))
+    return nis
+
+
+def test_sd_registers(qt):
+    print('SDIO0 without a card')
+    cap = qt.readl(SD + SD_CAP)
+    check('CAP: INTMODE, 3.3 V, DMA (what gk_sd_probe needs)',
+          cap & 0x09800000, 0x09800000)
+    check('STA: no card inserted', qt.readl(SD + SD_STA) & 0x00010000, 0)
+
+
+def test_sd_card(qemu, card, sector0):
+    print('SDIO0 with -drive if=sd')
+    qt = QTest(qemu, 'gk7102s', ['-drive', 'if=sd,file=%s,format=raw' % card])
+    try:
+        check('STA: card inserted', qt.readl(SD + SD_STA) & 0x00010000,
+              0x00010000)
+        qt.writeb(SD + SD_PWR, 0x0F)                # 3.3 V, on
+        qt.writew(SD + SD_CLK, 0x0001)              # internal clock on
+        check('CLK: internal clock stable', qt.readw(SD + SD_CLK) & 0x2, 0x2)
+        qt.writew(SD + SD_CLK, 0x0005)              # SD clock on
+        qt.writeb(SD + SD_RESET, RESET_CMD)         # vendor bit 0: CMD line
+        check('RESET 0x01 (CMD) keeps the clock', qt.readw(SD + SD_CLK) & 0x5,
+              0x5)
+        qt.writeb(SD + SD_RESET, RESET_ALL)         # vendor bit 1: all
+        check('RESET 0x02 (ALL) stops the clock', qt.readw(SD + SD_CLK), 0)
+        check('RESET reads back done', qt.readb(SD + SD_RESET), 0)
+
+        qt.writeb(SD + SD_PWR, 0x0F)
+        qt.writew(SD + SD_CLK, 0x0005)
+        qt.writew(SD + SD_NISEN, 0xFFFF)            # status latching on
+        qt.writew(SD + 0x10, 0xFFFF)
+        r48 = RSP_48 | CMD_CHKCRC | CMD_CHKIDX
+        sd_cmd(qt, 0, 0, RSP_NONE)
+        sd_cmd(qt, 8, 0x1AA, r48)
+        check('CMD8 echo', qt.readl(SD + SD_RSP0) & 0xFFF, 0x1AA)
+        for _ in range(10):
+            sd_cmd(qt, 55, 0, r48)
+            sd_cmd(qt, 41, 0x40FF8000, RSP_48)
+            if qt.readl(SD + SD_RSP0) & 0x80000000:
+                break
+        check('ACMD41: card ready', qt.readl(SD + SD_RSP0) >> 31, 1)
+        sd_cmd(qt, 2, 0, RSP_136 | CMD_CHKCRC)
+        sd_cmd(qt, 3, 0, r48)
+        rca = qt.readl(SD + SD_RSP0) >> 16
+        sd_cmd(qt, 7, rca << 16, RSP_48BUSY | CMD_CHKCRC | CMD_CHKIDX)
+        sd_cmd(qt, 16, 512, r48)
+
+        buf = RAM + 0x10000
+        qt.writel(SD + SD_DMA_ADDR, buf)
+        qt.writew(SD + SD_BLK_SZ, 0x7000 | 512)
+        qt.writew(SD + SD_BLK_CNT, 1)
+        qt.writew(SD + SD_XFR, XFR_DMA_EN | XFR_BLKCNT_EN | XFR_CTH_SEL)
+        nis = sd_cmd(qt, 17, 0, r48 | CMD_DATA)
+        check('CMD17: command and transfer done',
+              nis & (NIS_CMD_DONE | NIS_XFR_DONE), NIS_CMD_DONE | NIS_XFR_DONE)
+        got = b''.join(struct.pack('<I', qt.readl(buf + 4 * i))
+                       for i in range(128))
+        check('sector 0 read by SDMA into RAM', got == sector0, True)
+        check('XFR reads back in S bits', qt.readw(SD + SD_XFR),
+              XFR_DMA_EN | XFR_BLKCNT_EN | XFR_CTH_SEL)
+    finally:
+        qt.close()
+
+
 def test_rejection(qemu, path):
     print('rejections')
     cpu = path + '.cpu'
@@ -317,8 +412,14 @@ def main():
         test_dma(qt)
         test_dma_edges(qt)
         test_byte_stores(qt)
+        test_sd_registers(qt)
     finally:
         qt.close()
+    card = os.path.join(os.path.dirname(path), 'card.img')
+    sector0 = bytes((i * 13 + 7) & 0xFF for i in range(510)) + b'\x55\xAA'
+    with open(card, 'wb') as f:
+        f.write(sector0 + b'\0' * ((4 << 20) - 512))
+    test_sd_card(args.qemu, card, sector0)
     test_rejection(args.qemu, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
