@@ -224,6 +224,9 @@ class H264Pattern:
         span = max(1, self.w - 64)
         t = (n * 8) % (2 * span)
         bx = t if t < span else 2 * span - t
+        # the areas that may differ from the previous picture
+        self.dirty = [(bx - 8, self.h * 2 // 3, 80, 48),
+                      (8, 8, 8 + len("%06d %s" % (n, "00:00:00")) * 16, 36)]
         rect(bx, self.h * 2 // 3, 64, 48, (81, 90, 240))
         rect(bx + 16, self.h * 2 // 3 + 12, 32, 24, (235, 128, 128))
         # the frame counter and wall-clock time, top left
@@ -292,8 +295,22 @@ class H264Pattern:
         b.ue(1)                                 # disable_deblocking_filter
         skip = 0
         kind = {}                   # macroblock -> total_coeff, for nC
+        maybe = None
+        if not idr:
+            # only the macroblocks the moving parts touch can differ
+            maybe = set()
+            for x, y, w, h in self.dirty:
+                for my in range(max(0, y // 16), min(self.mbh,
+                                                     (y + h + 15) // 16)):
+                    for mx in range(max(0, x // 16),
+                                    min(self.mbw, (x + w + 15) // 16)):
+                        maybe.add((mx, my))
         for my in range(self.mbh):
             for mx in range(self.mbw):
+                if maybe is not None and (mx, my) not in maybe:
+                    skip += 1
+                    kind[mx, my] = 0
+                    continue
                 pcm = self.mb_pcm(planes, mx, my)
                 if not idr and pcm == self.prev[my * self.mbw + mx]:
                     skip += 1
@@ -433,6 +450,7 @@ class RTSPHandler(socketserver.StreamRequestHandler):
         self.ssrc = random.getrandbits(32)
         self.seq = random.getrandbits(16)
         self.track = ""
+        self.stream = self.server.streams["main"]
 
     def reply(self, cseq, code="200 OK", headers=(), body=b""):
         msg = "RTSP/1.0 %s\r\nCSeq: %s\r\n" % (code, cseq)
@@ -444,8 +462,15 @@ class RTSPHandler(socketserver.StreamRequestHandler):
         with self.lock:
             self.wfile.write(msg.encode() + body)
 
+    def pick_stream(self, url):
+        """The sub stream for URLs that ask for it, as cameras name it."""
+        path = url.lower()
+        sub = any(k in path for k in ("sub", "stream2", "subtype=1",
+                                      "channel=2", "/102", "/12"))
+        self.stream = self.server.streams["sub" if sub else "main"]
+
     def sdp(self):
-        st = self.server.stream
+        st = self.stream
         sprop = "%s,%s" % (base64.b64encode(st.sps).decode(),
                            base64.b64encode(st.pps).decode())
         plid = st.sps[1:4].hex()
@@ -493,6 +518,7 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                                           "GET_PARAMETER, SET_PARAMETER"])
             elif method == "DESCRIBE":
                 url = req.split()[1]
+                self.pick_stream(url)
                 self.reply(cseq, headers=["Content-Type: application/sdp",
                                           "Content-Base: %s/" % url],
                            body=self.sdp())
@@ -516,11 +542,12 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                            "server_port=6970-6971" % (cport, cport + 1))
                 rtr += ';ssrc=%08X;mode="play"' % self.ssrc
                 self.track = req.split()[1]
+                self.pick_stream(self.track)
                 self.reply(cseq, headers=["Transport: " + rtr,
                                           "Session: %s;timeout=60"
                                           % self.session])
             elif method == "PLAY":
-                st = self.server.stream
+                st = self.stream
                 nxt = st.au[2] + 1 if st.au else 0
                 self.reply(cseq, headers=[
                     "Session: " + self.session, "Range: npt=0.000-",
@@ -548,7 +575,7 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                                              self.channel + rtcp, len(p)) + p)
 
     def pump(self):
-        st = self.server.stream
+        st = self.stream
         ssrc = self.ssrc
         seq = self.seq
         last = -1
@@ -824,7 +851,11 @@ def main():
                     help="the camera's address as the NVR sees it")
     ap.add_argument("--advertise-http", type=int, default=80)
     ap.add_argument("--advertise-rtsp", type=int, default=554)
-    ap.add_argument("--size", default="640x360")
+    ap.add_argument("--size", default="640x360",
+                    help="main stream size")
+    ap.add_argument("--sub-size", default="640x360",
+                    help="sub stream size (rtsp URLs with 'sub' in them):"
+                    " NVRs live-view their split screens from it")
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--gop", type=int, default=20)
     ap.add_argument("--write", help="write an Annex B file and exit")
@@ -846,11 +877,17 @@ def main():
                 f.write(pat.picture()[0])
         return
 
-    stream = Stream(pat)
+    streams = {"main": Stream(pat)}
+    if ARGS.sub_size == ARGS.size:
+        streams["sub"] = streams["main"]
+    else:
+        sw, sh = (int(x) for x in ARGS.sub_size.split("x"))
+        streams["sub"] = Stream(H264Pattern(sw, sh, ARGS.fps, ARGS.gop))
     for port, handler, extra in ((ARGS.rtsp, RTSPHandler, None),
                                  (ARGS.http, HTTPHandler, None)):
         srv = TServer((ARGS.bind, port), handler)
-        srv.stream = stream
+        srv.streams = streams
+        srv.stream = streams["main"]
         srv.advertise = ARGS.advertise
         srv.advertise_http = ARGS.advertise_http
         srv.advertise_rtsp = ARGS.advertise_rtsp
