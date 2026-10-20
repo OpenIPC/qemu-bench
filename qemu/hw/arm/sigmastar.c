@@ -47,6 +47,7 @@
 #define SS_PERIPHBASE       0x16000000
 #define SS_DRAM_BASE        0x20000000
 #define SS_DRAM_WINDOW      (512 * MiB)
+#define SS_DRAM_ALIASED     (2 * SS_DRAM_WINDOW)    /* to 0x60000000 */
 #define SS_IMI_BASE         0xA0000000
 #define SS_IMI_SIZE         (64 * KiB)
 
@@ -82,6 +83,7 @@
 #define SS_SPI_SATA         50
 #define SS_SPI_GE           57
 #define SS_SPI_EMAC         58
+#define SS_SPI_VPU          53
 #define SS_SPI_UART0        66
 #define SS_SPI_UART1        67
 #define SS_SPI_UART2        71
@@ -463,10 +465,13 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
 
     /*
      * DRAM, mirrored through the whole 512 MiB MIU0 window as the address
-     * decode wraps: the IPL sizes DRAM by looking for the wrap.
+     * decode wraps: the IPL sizes DRAM by looking for the wrap.  The next
+     * 512 MiB repeat it again: the Xiongmai U-Boot converts its logo into
+     * "dstAddr + 0x20000000" with dstAddr already a CPU address (0x2DD00000
+     * becomes 0x4DD00000), and the NVR shows it.
      */
     memory_region_add_subregion(sysmem, SS_DRAM_BASE, machine->ram);
-    for (off = machine->ram_size; off + machine->ram_size <= SS_DRAM_WINDOW;
+    for (off = machine->ram_size; off + machine->ram_size <= SS_DRAM_ALIASED;
          off += machine->ram_size) {
         MemoryRegion *alias = g_new(MemoryRegion, 1);
 
@@ -512,7 +517,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     chip_id[0].val = c->chip_id;
     sstar_riu_add_defaults(SSTAR_RIU(riu), chip_id);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(riu), &error_fatal);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(riu), 0, SSTAR_RIU_BASE, -1);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(riu), 0, SSTAR_RIU_BASE, -2);
 
     intc = qdev_new("sstar-intc");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(intc), &error_fatal);
@@ -663,6 +668,18 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                        ss_spi(gic, intc, SS_SPI_DISP_TOP));
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
                        ss_spi(gic, intc, SS_SPI_GOP_VSYNC));
+
+    /*
+     * The video decoder, a Chips&Media WAVE5 VPU (mi_vdec: ioremap of
+     * 0x1F344000, registers from +0x800).  The vendor driver reaches WAVE5
+     * offsets up to the backbone at 0xFE00, through the kernel's static
+     * map of the RIU, so the window spans 64 KiB: under every other model,
+     * over the RIU's storage.
+     */
+    dev = qdev_new("sstar-vpu");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, 0x1F344800, -1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ss_spi(gic, intc, SS_SPI_VPU));
 
     /* GE 2D engine: MI_GFX composites the GUI through it */
     dev = qdev_new("mstar-ge");

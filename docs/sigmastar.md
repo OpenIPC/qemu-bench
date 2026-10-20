@@ -97,7 +97,7 @@ The U-Boot console is password protected.
 | `0x1F2A2000` | EMAC, RIU view (16-bit halves) | `sstar-emac` |
 | `0x1F343C00` | EMAC, X32 view (32-bit) | `sstar-emac` |
 | `0x1F345000` | SATA AHCI, one port | `sysbus-ahci` |
-| `0x20000000` | DRAM, mirrored through the 512 MiB MIU0 window | RAM |
+| `0x20000000` | DRAM, mirrored through the 512 MiB MIU0 window and the 512 MiB after it (the Xiongmai U-Boot writes its logo at `0x4DD00000`) | RAM |
 | `0xA0000000` | IMI SRAM, 64 KiB | RAM |
 
 A register `r` of RIU bank `b` is at `0x1F000000 + b * 0x200 + r * 4`; its
@@ -127,6 +127,7 @@ its edge "FIQ" group (mask `0x44`, polarity `0x48`, write-1-to-clear status
 | 37 | FSP |
 | 50 | SATA |
 | 52, 82 | GOP vsync, display top vsync |
+| 53 | video decoder (VPU) |
 | 57 | GE |
 | 58 | EMAC |
 | 63, 65, 87 | UHC2, UHC1, UHC0 |
@@ -171,18 +172,66 @@ back for a 32-bit wrap.
   table). The vendor driver passes MIU bus addresses, and runs the PRD high words through the
   same subtraction (`0` becomes `0xE0000000`), so the bus masters' address
   space repeats there.
-- **Display** (`mstar-disp`). GOP 1 is composited over the MOP video plane and
-  scanned out to a graphic console, sized from the GOP stretch window
+- **Display** (`mstar-disp`). GOP 1 is composited over the MOP video windows
+  and scanned out to a graphic console, sized from the GOP stretch window
   (1280×1024 on the NVR); RGB565, ARGB1555, ARGB4444, ARGB8888 and ABGR8888.
-  The NVR's Sofia draws its GUI in ARGB1555 through the GE.
+  The NVR's Sofia draws its GUI in ARGB1555 through the GE, with the GOP's
+  transparent colour (reg `0x00` bit 11, key in regs `0x24`/`0x25`: black)
+  keyed so the live view shows through. The MOP has 16 windows, `0x40`
+  bytes apart from bank `0x1406`: NV12 address (regs 2-5, 16-byte units),
+  the rectangle on screen (6-9), pitch (`0x0A`), source size (`0x0B`,
+  `0x0C`) and source/destination ratios in 1/4096ths (`0x0D`, `0x0E`); the
+  9-split puts each channel in a 426×340 cell.
+- **Video decoder** (`sstar-vpu`). A Chips&Media WAVE511 at `0x1F344800`,
+  modelled at its firmware's mailbox (no firmware runs; `chagall.bin` is
+  loaded and ignored): boot, decoder instances, the bitstream ring,
+  INIT_SEQ and DEC_PIC with their interrupts and result reports, decoded by
+  libavcodec (H.264, HEVC). The SigmaStar driver differs from mainline
+  Linux's `wave5` in where the completions and the queue status are read
+  and in passing an output buffer with each DEC_PIC, which the firmware's
+  scaler fills (NV12, at the size the display window wants) and the result
+  hands back with the picture's VLC buffer; the file's header comment has
+  the register-level detail, read off `mi_vdec.ko`. `qemu/setup.sh` builds
+  the decoding in when pkg-config finds libavcodec and libavutil
+  (`libavcodec-dev`); without them the device still runs the protocol, but
+  finds no sequence in any stream. `-global sstar-vpu.trace=on` logs the
+  mailbox and each decoded picture.
 - **GE** (`mstar-ge`). Always idle with an empty command queue; executes
   bitblt, rectangle fill and line, and raises its job-done interrupt.
+
+## Live view
+
+The NVR shows an RTSP camera's stream once one is on its network.
+`qemu-boot/fake-ipcam.py` is such a camera: ONVIF and RTSP on the host,
+streaming a lossless synthetic H.264 test pattern (colour bars, a frame
+counter, a moving box) that it encodes itself, with no encoder library.
+`CAMERA=1` makes the run script start it and put it at `192.168.1.10`:
+
+```bash
+CAMERA=1 FLASH=nvr.bin HDD=disk.img bash qemu-boot/run-ssr621q.sh
+```
+
+Then, in the GUI, open the digital channel page (数字通道配置: the first
+boot's setup wizard offers it after its device search, as 继续添加; the
+dump's login is `ucxe` / `3hfrxa`) → `+` on channel 1 → protocol `RTSP`,
+address `192.168.1.10`, port `554` → OK (the on-screen keyboard; the USB
+keyboard does not reach these fields). The NVR logs in, plays both
+streams, and the first cell of the live view shows the pattern. The
+channel is kept in the flash, so later boots reconnect on their own.
+Discovery (ONVIF WS-Discovery, Xiongmai's broadcast) needs multicast,
+which SLIRP does not carry; the camera answers ONVIF too, for adding it
+as an ONVIF device by address.
+
+Sofia does not always start feeding a camera's stream to the decoder
+after boot: `/proc/mi_modules/mi_vdec/mi_vdec0` then shows the channel
+started but `SendCnt` 0, the cell keeps its "H.265+" placeholder, and
+another boot is the cure.
 
 ## Not modelled
 
 - HDMI TX: no EDID, so the NVR falls back to its default output mode.
-- The video decoder, the scalers and the remaining GOPs (GOP 0 is programmed
-  but not scanned out).
+- The DIVP/DIP scalers (the VPU's own scaler serves the live view) and the
+  remaining GOPs (GOP 0 is programmed but not scanned out).
 - I2C controllers, SAR ADC, RTC (the kernel warns that RTCPWC has no power),
   the MMU block (`HAL_MMU_Reset timeout`), audio.
 - infinity3 (MSC313E), infinity6 and mercury5 parts. Daniel Palmer's
