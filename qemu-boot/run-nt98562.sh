@@ -10,6 +10,9 @@
 # The release goes into an 8 MiB SPI NOR image laid out the OpenIPC way
 # (qemu-boot/nor-<soc>.bin, made once and then kept: it is the camera's
 # flash, rootfs_data and all), and the kernel mounts its root from it.
+# After a new release download the image still holds the old rootfs: the
+# script says so, and REBUILD=1 lays the new one out (dropping what the
+# old image had written to rootfs_data).
 # The uImage carries no DTB; the machine builds one.
 #
 # FLASH=image.bin boots a whole flash image instead, the way the chip does:
@@ -36,7 +39,15 @@ if [ ! -f "$KERNEL" ] || [ ! -f "$ROOTFS" ]; then
     echo "need $KERNEL and $ROOTFS: unpack openipc.$SOC-nor-lite.tgz here" >&2
     exit 1
 fi
-if [ ! -f "$NOR" ]; then
+if [ -f "$NOR" ] && [ -z "$REBUILD" ] && \
+        { [ "$ROOTFS" -nt "$NOR" ] || [ "$KERNEL" -nt "$NOR" ]; }; then
+    echo "$NOR predates $(basename "$ROOTFS")/$(basename "$KERNEL"):" \
+         "it holds the previous release's rootfs." >&2
+    echo "Run with REBUILD=1 to lay out the new release (rootfs_data is" \
+         "lost), or delete it." >&2
+    exit 1
+fi
+if [ ! -f "$NOR" ] || [ -n "$REBUILD" ]; then
     python3 - "$KERNEL" "$ROOTFS" "$NOR" <<'PY'
 import sys
 kernel, rootfs, nor = sys.argv[1:]

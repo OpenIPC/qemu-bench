@@ -18,7 +18,7 @@
  *   0x18 READ_N      DATALEN bytes, to the FIFO (PIO) or DMASTART (DMA)
  *   0x19 WRITE_N     DATALEN bytes, from the FIFO or DMASTART
  *   0x1D AUTO_STATUS cmd 1 polled like BLK_ERSE's cmd 2, byte in CTRL_STS
- *   0x1E DUMMY_CLOCK DUMMY_CLOCK_NUM + 1 clocks
+ *   0x1E DUMMY_CLOCK DUMMY_CLOCK_NUM + 1 clocks, as whole bytes
  *
  * Each completes with CTRL_STS bit 12, an interrupt on SPI 29 with
  * INTMASK bit 12, which the driver waits for after every operation; its
@@ -26,7 +26,10 @@
  * controller's for each operation, or software's: SPI_CFG bit 1 selects
  * manual mode and bit 4 then drives CS (0 asserted), which is how a read
  * strings CMD_ADDR, DUMMY_CLOCK and READ_N into one transfer.  The PIO
- * FIFO holds 16 words; FIFO_STS reports the count, full and empty.
+ * FIFO holds 16 words; FIFO_STS reports the count, full and empty.  A PIO
+ * read streams through a 4 KiB buffer and completes with its last byte; a
+ * PIO write completes when the data port has taken DATALEN bytes, at once
+ * for none.
  *
  * The flash is a generic SPI NOR answering with JEDEC ID "jedec"; erases
  * and programs complete at once and are written through to flash-file.
@@ -308,6 +311,9 @@ static void nvt_flash_update_irq(NvtFlashState *s)
 
 static void nvt_flash_complete(NvtFlashState *s)
 {
+    if (s->rd_left) {
+        return;                     /* still streaming a PIO read */
+    }
     if (!nvt_flash_manual_cs(s)) {
         spi_deselect(s);
     }
@@ -353,14 +359,19 @@ static void nvt_flash_poll_status(NvtFlashState *s, uint8_t cmd)
     *reg(s, REG_CTRL_STS) = (*reg(s, REG_CTRL_STS) & ~0xFFu) | st;
 }
 
-static void nvt_flash_fifo_load(NvtFlashState *s, uint32_t len)
+/*
+ * Clock the next part of a PIO read into the buffer the data port drains.
+ * A read longer than the buffer is refilled as it empties, and completes
+ * when its last byte has been clocked in.
+ */
+static void nvt_flash_fifo_load(NvtFlashState *s)
 {
-    uint32_t i;
+    uint32_t len = MIN(s->rd_left, NVT_FLASH_BUF), i;
 
-    len = MIN(len, NVT_FLASH_BUF);
     for (i = 0; i < len; i++) {
         s->buf[i] = spi_xfer(s, 0);
     }
+    s->rd_left -= len;
     s->buf_len = ROUND_UP(len, 4);
     s->buf_pos = 0;
 }
@@ -377,6 +388,7 @@ static void nvt_flash_run(NvtFlashState *s, uint32_t ctrl0)
 
     s->busy = true;
     s->buf_len = s->buf_pos = 0;
+    s->rd_left = 0;
 
     switch (op) {
     case OP_CMD:
@@ -389,8 +401,12 @@ static void nvt_flash_run(NvtFlashState *s, uint32_t ctrl0)
         nvt_flash_send_addr(s);
         break;
     case OP_DUMMY_CLOCK:
+        /*
+         * The NOR here takes its dummy phase as whole bytes, so a partial
+         * byte of clocks (DUMMY_CLOCK_NUM < 7) still spends one.
+         */
         nvt_flash_begin(s);
-        for (n = ((*reg(s, REG_DUMMY_CLK) & 7) + 1) / 8; n; n--) {
+        for (n = DIV_ROUND_UP((*reg(s, REG_DUMMY_CLK) & 7) + 1, 8); n; n--) {
             spi_xfer(s, 0);
         }
         break;
@@ -403,12 +419,14 @@ static void nvt_flash_run(NvtFlashState *s, uint32_t ctrl0)
     case OP_READ_ID:
         nvt_flash_begin(s);
         spi_xfer(s, cmd);
-        nvt_flash_fifo_load(s, len);
+        s->rd_left = len;
+        nvt_flash_fifo_load(s);
         break;
     case OP_READ_N:
         nvt_flash_begin(s);
         if (!dma) {
-            nvt_flash_fifo_load(s, len);
+            s->rd_left = len;
+            nvt_flash_fifo_load(s);
             break;
         }
         a = *reg(s, REG_DMASTART);
@@ -424,10 +442,13 @@ static void nvt_flash_run(NvtFlashState *s, uint32_t ctrl0)
         break;
     case OP_WRITE_N:
         nvt_flash_begin(s);
-        if (!dma) {
+        if (!dma && len) {
             /* Completes once the data port has taken DATALEN bytes. */
             s->wr_left = len;
             return;
+        }
+        if (!dma) {
+            break;
         }
         a = *reg(s, REG_DMASTART);
         for (done = 0; done < len; done += n) {
@@ -482,13 +503,19 @@ static uint64_t nvt_flash_mmio_read(void *opaque, hwaddr off, unsigned size)
         }
         v = ldl_le_p(s->buf + s->buf_pos);
         s->buf_pos += 4;
+        if (s->buf_pos >= s->buf_len && s->rd_left) {
+            nvt_flash_fifo_load(s);
+            if (!s->rd_left) {
+                nvt_flash_complete(s);
+            }
+        }
         return v;
     case REG_FIFO_STS:
         return nvt_flash_fifo_sts(s);
     case REG_CTRL0:
         return *reg(s, off) | (s->busy ? CTRL0_OPER_EN : 0);
     default:
-        return *reg(s, off);
+        return off < NVT_FLASH_REGS_SIZE ? *reg(s, off) : 0;
     }
 }
 
@@ -496,7 +523,7 @@ static void nvt_flash_mmio_write(void *opaque, hwaddr off, uint64_t val,
                                  unsigned size)
 {
     NvtFlashState *s = opaque;
-    uint32_t old = *reg(s, off), i;
+    uint32_t i;
     uint8_t b[4];
 
     switch (off) {
@@ -506,6 +533,7 @@ static void nvt_flash_mmio_write(void *opaque, hwaddr off, uint64_t val,
             spi_deselect(s);
             s->busy = false;
             s->wr_left = 0;
+            s->rd_left = 0;
             s->buf_len = s->buf_pos = 0;
         }
         if (val & CTRL0_OPER_EN) {
@@ -513,7 +541,7 @@ static void nvt_flash_mmio_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     case REG_CTRL_STS:
-        *reg(s, off) = old & ~(val & STS_W1C);
+        *reg(s, off) &= ~(val & STS_W1C);
         nvt_flash_update_irq(s);
         break;
     case REG_INTMASK:
@@ -575,6 +603,7 @@ static void nvt_flash_reset(DeviceState *dev)
     s->selected = false;
     s->busy = false;
     s->wr_left = 0;
+    s->rd_left = 0;
     s->buf_len = s->buf_pos = 0;
     s->wel = false;
     s->addr4 = false;
@@ -657,6 +686,7 @@ static const VMStateDescription vmstate_nvt_flash = {
         VMSTATE_UINT32(buf_len, NvtFlashState),
         VMSTATE_UINT32(buf_pos, NvtFlashState),
         VMSTATE_UINT32(wr_left, NvtFlashState),
+        VMSTATE_UINT32(rd_left, NvtFlashState),
         VMSTATE_BOOL(busy, NvtFlashState),
         VMSTATE_UINT8_ARRAY(sr, NvtFlashState, 2),
         VMSTATE_BOOL(wel, NvtFlashState),

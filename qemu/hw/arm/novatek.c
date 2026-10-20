@@ -349,6 +349,8 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
 #define NVT_FLASH_FDT_OFF   0x10000
 #define NVT_SHMINFO_SIZE    328
 #define NVT_BCL1            0x314C4342      /* "BCL1" */
+#define NVT_BCL1_HDR        16
+#define NVT_UBOOT_MAX       (8 * MiB)       /* U-Boot's region is 6.75 MiB */
 
 static int nvt_fdt_reg(const void *fdt, const char *path, int cells,
                        uint64_t *base, uint64_t *size)
@@ -425,7 +427,7 @@ static bool nvt_lz_uncompress(const uint8_t *in, uint32_t inlen,
     return outpos == outlen;
 }
 
-static void nvt_flash_boot(NvtFlashState *flash)
+static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size)
 {
     uint8_t hdr[16];
     g_autofree uint8_t *fdt = NULL;
@@ -464,7 +466,8 @@ static void nvt_flash_boot(NvtFlashState *flash)
     }
     strcat(path, "/partition_uboot");
     if (nvt_fdt_reg(fdt, path, 2, &ub_off, &ub_size) ||
-        ub_off + ub_size > flash->size || ub_size > 8 * MiB) {
+        ub_off + ub_size > flash->size || ub_size < 4 ||
+        ub_size > NVT_UBOOT_MAX) {
         error_report("novatek: no usable partition_uboot in the flash's "
                      "device tree");
         exit(1);
@@ -473,9 +476,17 @@ static void nvt_flash_boot(NvtFlashState *flash)
     part = g_malloc(ub_size);
     nvt_flash_read(flash, ub_off, part, ub_size);
     if (ldl_le_p(part) == NVT_BCL1) {
+        uint32_t alg, raw, comp;
+
+        if (ub_size < NVT_BCL1_HDR) {
+            error_report("novatek: BCL1 U-Boot partition shorter than its "
+                         "header");
+            exit(1);
+        }
         /* NVTPACK_BFC_HDR: FourCC, algorithm, sizes big-endian. */
-        uint32_t alg = ldl_be_p(part + 4) & 0xFF;
-        uint32_t raw = ldl_be_p(part + 8), comp = ldl_be_p(part + 12);
+        alg = ldl_be_p(part + 4) & 0xFF;
+        raw = ldl_be_p(part + 8);
+        comp = ldl_be_p(part + 12);
 
         if (alg != 9) {
             error_report("novatek: U-Boot is BCL1 algorithm %u; only LZ (9) "
@@ -483,13 +494,14 @@ static void nvt_flash_boot(NvtFlashState *flash)
                          alg);
             exit(1);
         }
-        if (comp > ub_size - 16 || raw > ub_max) {
+        if (comp > ub_size - NVT_BCL1_HDR || raw > ub_max ||
+            raw > NVT_UBOOT_MAX) {
             error_report("novatek: BCL1 U-Boot sizes 0x%x/0x%x do not fit",
                          comp, raw);
             exit(1);
         }
         uboot = g_malloc(raw);
-        if (!nvt_lz_uncompress(part + 16, comp, uboot, raw)) {
+        if (!nvt_lz_uncompress(part + NVT_BCL1_HDR, comp, uboot, raw)) {
             error_report("novatek: BCL1 U-Boot does not unpack");
             exit(1);
         }
@@ -507,6 +519,12 @@ static void nvt_flash_boot(NvtFlashState *flash)
     memcpy(shm + 112, "COMMINFO", 8);       /* comm.CommInfo_1 */
     if (shm_size < sizeof(shm) || fdt_len > fdt_max) {
         error_report("novatek: nvt_memory_cfg regions too small");
+        exit(1);
+    }
+    if (fdt_addr + fdt_len > ram_size || shm_addr + sizeof(shm) > ram_size ||
+        ub_addr + ub_len > ram_size) {
+        error_report("novatek: nvt_memory_cfg places the boot images past "
+                     "the end of RAM (0x%" PRIx64 ")", ram_size);
         exit(1);
     }
 
@@ -641,7 +659,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     arm_load_kernel(cpu, machine, &binfo);
 
     if (!machine->kernel_filename && nms->flash_file) {
-        nvt_flash_boot(NVT_FLASH(flash));
+        nvt_flash_boot(NVT_FLASH(flash), machine->ram_size);
     }
 }
 

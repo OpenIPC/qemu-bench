@@ -27,6 +27,7 @@ struct NvtFlashState {
     uint8_t buf[NVT_FLASH_BUF];
     uint32_t buf_len, buf_pos;
     uint32_t wr_left;
+    uint32_t rd_left;           /* PIO read bytes not yet clocked in */
 
     /* the SPI NOR */
     uint8_t *array;

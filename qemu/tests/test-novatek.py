@@ -417,6 +417,39 @@ def test_flash(qt, path):
     check('program reached the image file', img[0x30010:0x30018],
           bytes(range(0x11, 0x99, 0x11)))
 
+    check('past the registers reads 0', qt.readl(FLASH + 0x300), 0)
+    flash_op(qt, OP_WRITE_N, 0x02, length=0, write=True)
+    check('a zero-length PIO write completes', flash_done(qt), True)
+    check('and interrupts', gic_pending(qt, SPI_FLASH), True)
+    qt.writel(FLASH + 0x48, 1 << 12)
+
+    # A PIO read longer than the 4 KiB buffer streams through it
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x03, row=0x50000)
+    flash_op(qt, OP_READ_N, 0x03, length=0x2000)
+    check('an 8 KiB PIO read is not complete before it is drained',
+          flash_done(qt), False)
+    got = b''.join(qt.readl(FLASH + 0x100).to_bytes(4, 'little')
+                   for _ in range(0x800))
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    check('8 KiB PIO read', got, img[0x50000:0x52000])
+    check('and completes with its last word', flash_done(qt), True)
+
+    # FAST_READ with a dummy setting under a byte of clocks
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x0B, row=0x60000)
+    qt.writel(FLASH + 0xC0, 3)
+    flash_op(qt, 0x1E, 0x0B)
+    flash_op(qt, OP_READ_N, 0x0B, length=16)
+    got = b''.join(qt.readl(FLASH + 0x100).to_bytes(4, 'little')
+                   for _ in range(4))
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    check('FAST_READ after four dummy clocks', got, img[0x60000:0x60010])
+
 
 # ---- flash boot ROM ----------------------------------------------------
 
@@ -489,12 +522,14 @@ def lz_pack(data, marker=0xF7):
     return bytes(out)
 
 
-def make_boot_image(path):
+def make_boot_image(path, part_size=0x40000, bcl=None):
     rng = random.Random(7)
     head = bytes(rng.randrange(256) for _ in range(300)) + b'\xf7' * 3
     payload = head + head[-64:] * 40 + bytes(range(256))
     packed = lz_pack(payload)
-    bcl = b'BCL1' + struct.pack('>III', 9, len(payload), len(packed)) + packed
+    if bcl is None:
+        bcl = b'BCL1' + struct.pack('>III', 9, len(payload), len(packed)) + \
+            packed
     tree = {
         'nvt_memory_cfg': {
             '#address-cells': cells(1), '#size-cells': cells(1),
@@ -505,7 +540,7 @@ def make_boot_image(path):
         'nor@f0400000': {
             'compatible': b'nvt,nvt_spinor\0',
             '#address-cells': cells(2), '#size-cells': cells(2),
-            'partition_uboot': {'reg': cells(0, 0x50000, 0, 0x40000)},
+            'partition_uboot': {'reg': cells(0, 0x50000, 0, part_size)},
         },
     }
     img = bytearray(b'\xff' * (8 << 20))
@@ -537,13 +572,24 @@ def test_boot_rom(qemu, tmp):
               (qt.readl(0), qt.readl(4)) == (0xE51FF004, 0x3900000), True)
     finally:
         qt.close()
+    def refused(img, what):
+        out = subprocess.run([qemu, '-M', 'nt98562,flash-file=' + img,
+                              '-display', 'none', '-nodefaults', '-S'],
+                             capture_output=True, text=True, timeout=30)
+        # exit(1) with a message, not a signal
+        check(what, out.returncode == 1 and 'novatek:' in out.stderr, True)
+
     blank = os.path.join(tmp, 'blank.bin')
     open(blank, 'wb').write(b'\xff' * (8 << 20))
-    out = subprocess.run([qemu, '-M', 'nt98562,flash-file=' + blank,
-                          '-display', 'none', '-nodefaults', '-S'],
-                         capture_output=True, text=True, timeout=30)
-    check('an image without a device tree is refused',
-          out.returncode != 0 and 'no device tree' in out.stderr, True)
+    refused(blank, 'an image without a device tree is refused')
+    bad = os.path.join(tmp, 'bad.bin')
+    make_boot_image(bad, part_size=0)
+    refused(bad, 'a zero-length uboot partition is refused')
+    make_boot_image(bad, part_size=8, bcl=b'BCL1\0\0\0\x09')
+    refused(bad, 'a BCL1 partition shorter than its header is refused')
+    make_boot_image(bad, bcl=b'BCL1' + struct.pack('>III', 9, 0xF0000000, 8) +
+                    b'\xf7' * 8)
+    refused(bad, 'a BCL1 header declaring 3.75 GiB is refused')
 
 
 def find_nodes(dtb, names):
