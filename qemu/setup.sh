@@ -86,6 +86,13 @@ cp qemu/hw/display/mstar-ge.c       "$QEMU_DIR/hw/display/"
 cp qemu/hw/display/mstar-disp.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
 cp qemu/hw/misc/sstar-vpu.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/novatek.h    "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/misc/nvt-top.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-cg.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-wdt.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
+cp qemu/hw/rtc/nvt-rtc.c            "$QEMU_DIR/hw/rtc/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -435,6 +442,47 @@ if ! grep -q "'sigmastar.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sigmastar.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added sigmastar.c"
+fi
+
+# Novatek NT9856x (NA51089): Cortex-A9 camera SoCs (hw/arm/novatek.c).
+# Same guarded appends as SigmaStar, for a fresh tree and an existing one
+# alike.
+if ! grep -q "^config NOVATEK$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config NOVATEK
+    bool
+    default y
+    depends on TCG && ARM
+    select A9MPCORE
+    select PL310
+    select PTIMER
+    select SERIAL_MM
+    select UNIMP
+    select HISI_MISC
+KCONFIG
+    echo "  hw/arm/Kconfig: added NOVATEK"
+else
+    for sym in A9MPCORE PL310 PTIMER SERIAL_MM UNIMP HISI_MISC; do
+        if ! sed -n '/^config NOVATEK$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config NOVATEK\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: NOVATEK now selects $sym"
+        fi
+    done
+fi
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt gpio/nvt-gpio rtc/nvt-rtc; do
+    if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
+            >> "$QEMU_DIR/hw/${f%/*}/meson.build"
+        echo "  hw/${f%/*}/meson.build: added ${f#*/}.c"
+    fi
+done
+if ! grep -q "'novatek.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('novatek.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added novatek.c"
 fi
 
 # hw/misc/Kconfig

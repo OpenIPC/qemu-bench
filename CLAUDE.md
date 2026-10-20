@@ -204,6 +204,21 @@ from a timer, because the vendor driver arms its wait for the interrupt
 after issuing the command and loses a completion raised inside the
 doorbell write.
 
+Novatek NT9856x / NA51089 (`hw/arm/novatek.c`, `docs/novatek.md`) is a
+fifth: a Cortex-A9 whose MPCore is at `0xFFD00000` (the `0xF1500000` GIC in
+the SDK headers is stale) with Novatek blocks from `0xF0000000`. With
+`-kernel` the machine generates the device tree, because the OpenIPC uImage
+has none. The vendor drivers are particular about it. `fdt_add_subnode()`
+prepends, so nodes come out in reverse creation order, and two orders
+matter: `nvt,core_clk` must precede `nvt,periph_clk`, and the pinmux
+children of the TOP node are indexed by position. The A9 timers run at
+`cpu_clk / 8` from CG's PLL8, which `nvt-cg` resets to 800 MHz to match
+QEMU's fixed 100 MHz MPCore timers. The MIDR is r4p1, because Linux refuses
+the global timer on r0p0. Reboot goes through the RTC (power-on alarm, then
+power off), so the RTC node is required. The kernel has no RAM disk driver,
+so boot tests use an initramfs (`qemu-boot/test-novatek-boot.sh`), not the
+boot matrix.
+
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB
 outliers. `hardware_reference.md` (CV300/EV300, from SDK DTS) and

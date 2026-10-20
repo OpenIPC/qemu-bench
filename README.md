@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7)
+- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (63 total)
+## Supported Machines (65 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -224,6 +224,25 @@ devices and the Xiongmai `xmuart` console switch are in
 
 ¹ Same die and models as `ssr621q`; no image was at hand.
 
+### Novatek NT9856x family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98562` | Cortex-A9, 64 MB in package | GIC | 4.19.91 vendor (DT) | yes¹ |
+| `nt98566` | Cortex-A9, 128 MB in package | GIC | 4.19.91 vendor (DT) | yes¹ |
+
+Novatek's NA51089 camera dies, in `hw/arm/novatek.c`: an A9 MPCore at
+`0xFFD00000` and Novatek's own blocks from `0xF0000000` (TOP/chip ID, the
+clock generator, watchdog, RTC, GPIO), with 16550-compatible UARTs. The
+OpenIPC `nt98562_lite` / `nt98566_lite` kernel carries no device tree; the
+machine builds one from the SDK's board files, and the kernel boots to a
+shell with `-kernel`: `qemu-boot/run-nt98562.sh`. `reboot` works the vendor
+way, by arming the RTC's power-on alarm and powering off. SDKs, map, device
+tree and clock notes are in [docs/novatek.md](docs/novatek.md).
+
+¹ With `-kernel` and an initramfs: the SPI flash controller (so flash boot)
+and Ethernet are not modelled yet.
+
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
 | Machine | Generation | CPU | IRQ | Boot tested |
@@ -246,7 +265,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 46 machines build and register. Every machine marked "yes" above boots
+All 65 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -354,6 +373,13 @@ qemu/
 ├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
 ├── hw/display/mstar-ge.c        # GE 2D engine (ported)
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
+├── hw/arm/novatek.c             # Novatek NT9856x machines, generated device tree
+├── hw/misc/nvt-top.c            # TOP: pinmux storage, chip ID
+├── hw/misc/nvt-cg.c             # Clock generator: PLL ratios, gates, resets
+├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
+├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
+├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
+├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
 qemu-boot/
@@ -372,6 +398,8 @@ qemu-boot/
 ├── run-xm510.sh                 # Xiongmai XM510, OpenIPC xm510_lite
 ├── run-gk7102.sh                # Goke GK7102: flash dump, or OpenIPC + vendor HAL
 ├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
+├── run-nt98562.sh               # Novatek NT98562/NT98566, OpenIPC lite via initramfs
+├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script, reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map

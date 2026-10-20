@@ -51,6 +51,9 @@ jobs:
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssr621q '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd202d '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd201 '
+          # Novatek NT9856x (hw/arm/novatek.c)
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98562 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98566 '
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -118,6 +121,14 @@ jobs:
       # vsync.  Boot tests need an NVR flash dump, which is vendor firmware.
       - name: SigmaStar infinity2m devices (sstar-fsp, sstar-emac, ...)
         run: python3 qemu/tests/test-sigmastar.py
+
+      # The Novatek NT9856x models driven over qtest the way the vendor
+      # kernel drives them: chip ID, the CG PLL8 rate periph_clk comes from,
+      # the keyed watchdog (interrupt, reset, the kernel's manual reset),
+      # GPIO pads and both interrupt kinds, the RTC's CSET handshake and its
+      # power-off-with-alarm reboot, and the device tree the machine builds.
+      - name: Novatek NT9856x devices (nvt-top, nvt-cg, nvt-rtc, ...)
+        run: python3 qemu/tests/test-novatek.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
@@ -1101,6 +1112,47 @@ jobs:
   # a FIT holding the kernel + dtb with the SquashFS appended, in the plain
   # package.  Take whichever is published, split it into kernel(/dtb)/rootfs
   # and boot like qemu-boot/run-cv610.sh.
+  # OpenIPC nt98562/nt98566 lite: the release kernel, with the device tree
+  # the machine builds, to a PID-1 script that checks the vendor drivers
+  # bound and reboots (RTC power-off with the wake alarm armed).  Not in the
+  # boot matrix: that boots the SquashFS from a RAM disk, and this kernel
+  # has none; flash boot is not modelled yet.
+  boot-novatek:
+    name: Boot ${{ matrix.soc }}
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [nt98562, nt98566]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0 squashfs-tools cpio
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      - name: Download OpenIPC firmware
+        run: |
+          cd qemu-boot
+          curl -sfL -o fw.tgz \
+            "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.${{ matrix.soc }}-nor-lite.tgz"
+          tar xzf fw.tgz
+
+      - name: Boot to PID 1 and reboot
+        run: bash qemu-boot/test-novatek-boot.sh --soc ${{ matrix.soc }}
+
   boot-hi3516cv610:
     name: Boot hi3516cv610
     needs: build
