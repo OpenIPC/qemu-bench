@@ -566,7 +566,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     if (c->wdt_base) {
         Clock *wdt_clk = clock_new(OBJECT(machine), "wdt-clk");
         clock_set_hz(wdt_clk, c->wdt_freq);
-        DeviceState *wdt = qdev_new("cmsdk-apb-watchdog");
+        /* The SP805 identity, not the CMSDK one: Linux's sp805_wdt binds
+         * on the AMBA ID, and that driver is what gives /dev/watchdog. */
+        DeviceState *wdt = qdev_new("arm-sp805");
         qdev_connect_clock_in(wdt, "WDOGCLK", wdt_clk);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(wdt), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(wdt), 0, c->wdt_base);
