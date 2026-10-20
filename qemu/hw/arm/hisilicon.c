@@ -2826,8 +2826,31 @@ static const HisiSoCConfig hi3519dv500_soc = {
     .gpio_irq_start     = 23,
     .gpio0_input_high   = (1u << 0),    /* GPIO0_0 update-button pull-up (high) */
 
-    .num_regbanks       = 7,
+    /* SD: vendor dtsi mmc1 "SDIO" @0x10030000 (GIC_SPI 51) is the card slot,
+     * mmc2 "SDIO1" @0x10040000 (52); listed in that order so -drive if=sd
+     * index 0 is the slot.  The eMMC controller @0x10020000 (50) is left
+     * out: NOR boards have none, and the U-Boot registers it only on eMMC
+     * builds. */
+    .num_sdhci          = 2,
+    .sdhci_bases        = { 0x10030000, 0x10040000 },
+    .sdhci_irqs         = { 51, 52 },
+
+    /* USB 3 DRD (vendor hi3519dv500_family_usb.dtsi): DWC3 @0x10320000,
+     * GIC_SPI 60, run as an xHCI host.  Its global registers (GCTL,
+     * GUSB3PIPECTL, G[TR]XTHRCFG at +0xc1xx/+0xc2xx) lie past QEMU's xHCI
+     * window and get a regbank below, with the USB2 PHY, the USB3 misc
+     * block and the OTP trim words the vendor PHY bring-up touches. */
+    .xhci_base          = 0x10320000,
+    .xhci_irq           = 60,
+    .xhci_slots         = 4,
+    .xhci_intrs         = 1,
+
+    .num_regbanks       = 11,
     .regbanks           = {
+        { "hisi-usb-dwc3",   0x1032C000, 0x4000  },   /* DWC3 globals */
+        { "hisi-usb2phy",    0x17350000, 0x1000  },
+        { "hisi-usb3misc",   0x17A40000, 0x5000  },
+        { "hisi-otp",        0x101E0000, 0x1000  },   /* USB trim / vendor id */
         { "hisi-misc",       0x11024000, 0x5000  },
         { "hisi-ddr",        0x11140000, 0x20000 },
         /* Pinmux (IOCFG) controllers — vendor sys_config: iocfg=0x10260000,
@@ -2902,8 +2925,31 @@ static const HisiSoCConfig hi3516dv500_soc = {
     .gpio_irq_start     = 23,
     .gpio0_input_high   = (1u << 0),    /* GPIO0_0 update-button pull-up (high) */
 
-    .num_regbanks       = 7,
+    /* SD: vendor dtsi mmc1 "SDIO" @0x10030000 (GIC_SPI 51) is the card slot,
+     * mmc2 "SDIO1" @0x10040000 (52); listed in that order so -drive if=sd
+     * index 0 is the slot.  The eMMC controller @0x10020000 (50) is left
+     * out: NOR boards have none, and the U-Boot registers it only on eMMC
+     * builds. */
+    .num_sdhci          = 2,
+    .sdhci_bases        = { 0x10030000, 0x10040000 },
+    .sdhci_irqs         = { 51, 52 },
+
+    /* USB 3 DRD (vendor hi3519dv500_family_usb.dtsi): DWC3 @0x10320000,
+     * GIC_SPI 60, run as an xHCI host.  Its global registers (GCTL,
+     * GUSB3PIPECTL, G[TR]XTHRCFG at +0xc1xx/+0xc2xx) lie past QEMU's xHCI
+     * window and get a regbank below, with the USB2 PHY, the USB3 misc
+     * block and the OTP trim words the vendor PHY bring-up touches. */
+    .xhci_base          = 0x10320000,
+    .xhci_irq           = 60,
+    .xhci_slots         = 4,
+    .xhci_intrs         = 1,
+
+    .num_regbanks       = 11,
     .regbanks           = {
+        { "hisi-usb-dwc3",   0x1032C000, 0x4000  },   /* DWC3 globals */
+        { "hisi-usb2phy",    0x17350000, 0x1000  },
+        { "hisi-usb3misc",   0x17A40000, 0x5000  },
+        { "hisi-otp",        0x101E0000, 0x1000  },   /* USB trim / vendor id */
         { "hisi-misc",       0x11024000, 0x5000  },
         { "hisi-ddr",        0x11140000, 0x20000 },
         /* Pinmux (IOCFG) controllers — vendor sys_config: iocfg=0x10260000,
