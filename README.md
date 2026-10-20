@@ -22,6 +22,7 @@ Builds two QEMU targets:
 | `hi3516av100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516dv100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516cv300` | V3 | ARM926EJ-S | VIC | 3.18.20 | yes |
+| `hi3516ev100` | V3 | ARM926EJ-S | VIC | 3.18.20 | yes |
 | `hi3516cv500` | V3.5 | Cortex-A7 ×2 | GIC | 4.9.37 | yes |
 | `hi3516dv300` | V4A | Cortex-A7 ×2 | GIC | 4.9.37 | yes |
 | `hi3516av300` | V4A | Cortex-A7 ×2 | GIC | 4.9.37 | yes |
