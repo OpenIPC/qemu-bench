@@ -13,9 +13,11 @@ plays the vendor drivers (docs/novatek.md):
     expiry raises SPI 57 and the status write-back acknowledges it; a
     reset-mode expiry and the kernel's manual reset both reset the machine;
   - nvt-gpio: SET / CLR / DIR / DATA, input pads, a rising-edge interrupt
-    on C_GPIO 3 and a level-low one on D_GPIO 0 through SPI 24;
+    on C_GPIO 3 and a level-low one on D_GPIO 0 through SPI 24; the "out"
+    lines follow the pad drivers through direction changes and a reset;
   - nvt-rtc: a kept-alive RTC (key, oscillator) reading the host's year;
-    a CSET commits the time and raises SPI 56; powering off with the
+    a CSET commits the time and raises SPI 56; the daily alarm and the
+    driver's wake alarm (PWRALM, committed by CSET) go off; powering off with the
     power-on alarm armed is the vendor reboot, and resets the machine;
   - the 16550 UART at its reg-shift-2 offsets;
   - the generated device tree: compatible, the clock nodes in the order
@@ -63,13 +65,17 @@ class QTest:
         srv.settimeout(20)
         self.sock, _ = srv.accept()
         self.f = self.sock.makefile('rw', buffering=1)
+        self.irqs = {}
 
     def cmd(self, line):
         self.f.write(line + '\n')
         self.f.flush()
         while True:
             r = self.f.readline().strip()
-            if r.startswith(('OK', 'FAIL', 'ERR')):
+            if r.startswith('IRQ '):
+                _, how, n = r.split()
+                self.irqs[int(n)] = how == 'raise'
+            elif r.startswith(('OK', 'FAIL', 'ERR')):
                 return r
 
     def writel(self, a, v):
@@ -172,6 +178,7 @@ def test_wdt(qt):
 def test_gpio(qt):
     print('nvt-gpio')
     gic_enable(qt, SPI_GPIO)
+    qt.cmd('irq_intercept_out /machine/nvt-gpio out')
     # P_GPIO 5 (bank 1) as an output
     qt.writel(GPIO + 0x24, 1 << 5)
     qt.writel(GPIO + 0x44, 1 << 5)
@@ -186,6 +193,17 @@ def test_gpio(qt):
     qt.pin(0x20 + 5, 1)
     check('an output pad ignores its input', qt.readl(GPIO + 0x04) &
           (1 << 5), 0)
+    # out line 37 = P_GPIO 5: high output, to input, latch cleared, output
+    qt.writel(GPIO + 0x44, 1 << 5)
+    check('out line follows a high output', qt.irqs.get(0x25), True)
+    qt.pin(0x20 + 5, 0)
+    qt.writel(GPIO + 0x24, 0)
+    check('released as an input', qt.irqs.get(0x25), False)
+    qt.writel(GPIO + 0x64, 1 << 5)
+    qt.writel(GPIO + 0x24, 1 << 5)
+    check('a low output again stays low', qt.irqs.get(0x25), False)
+    check('DATA agrees', qt.readl(GPIO + 0x04) & (1 << 5), 0)
+    qt.writel(GPIO + 0x44, 1 << 5)
 
     # Interrupt 0 is C_GPIO 3: rising edge
     qt.writel(GPIO + 0xA0, 0)
@@ -218,6 +236,18 @@ def test_gpio(qt):
     check('cleared once the pad goes high', qt.readl(GPIO + 0xC0) & 1, 0)
     check('SPI 24 idle', gic_pending(qt, SPI_GPIO), False)
 
+    # A reset makes every pin an input again (manual watchdog reset)
+    check('P_GPIO 5 still driven high', qt.irqs.get(0x25), True)
+    qt.writel(WDT + 0x00, WDT_KEY | 0x01)
+    qt.writel(WDT + 0x0C, 1)
+    qt.step(1000)
+    check('reset releases it', qt.irqs.get(0x25), False)
+
+
+def rtc_tod(qt):
+    t = qt.readl(RTC + 0x00)
+    return (t & 0x3F) + ((t >> 6) & 0x3F) * 60 + ((t >> 12) & 0x1F) * 3600
+
 
 def rtc_year(qt):
     days = qt.readl(RTC + 0x04) & 0xFFFF
@@ -243,6 +273,33 @@ def test_rtc(qt):
     check('time committed', qt.readl(RTC + 0x00) & 0x1FFC0,
           (4 << 6) | (3 << 12))
     check('day committed', qt.readl(RTC + 0x04) & 0xFFFF, 36524)
+    # The daily alarm, 3 s ahead, with the alarm interrupt on
+    tod = rtc_tod(qt) + 3
+    qt.writel(RTC + 0x08, (tod % 60) | ((tod // 60 % 60) << 6) |
+              ((tod // 3600 % 24) << 12))
+    qt.writel(RTC + 0x10, 1)
+    qt.step(1500 * 1000 * 1000)
+    check('daily alarm not yet', qt.readl(RTC + 0x0C) & 1, 0)
+    qt.step(3000 * 1000 * 1000)
+    check('daily alarm goes off', qt.readl(RTC + 0x0C) & 1, 1)
+    check('SPI 56 pending for it', gic_pending(qt, SPI_RTC), True)
+    qt.writel(RTC + 0x0C, 1)
+    check('acknowledged', gic_pending(qt, SPI_RTC), False)
+    qt.writel(RTC + 0x08, 0x1FFFF)
+
+    # rtc-na51055.c set_alarm: the wake alarm in PWRALM, through a CSET
+    day = qt.readl(RTC + 0x04) & 0xFFFF
+    tod = rtc_tod(qt) + 3
+    qt.writel(RTC + 0x10, (1 << 6) | (1 << 7) | 1)
+    qt.writel(RTC + 0x20, (tod % 60) | ((tod // 60 % 60) << 6) |
+              ((tod // 3600 % 24) << 12) | ((day & 0x1F) << 20))
+    check('PWRALM is shadowed until the CSET', qt.readl(RTC + 0x20), 0)
+    qt.writel(RTC + 0x10, qt.readl(RTC + 0x10) | (1 << 2))
+    qt.writel(RTC + 0x0C, 1 << 8)
+    qt.step(4500 * 1000 * 1000)
+    check('wake alarm goes off', qt.readl(RTC + 0x0C) & 1, 1)
+    qt.writel(RTC + 0x0C, 1)
+
     # plat-na51089/reset.c reboot: arm the power-on alarm, power off
     qt.writel(CG + 0x10, 0)
     qt.writel(RTC + 0x18, 1 << 3)
@@ -318,7 +375,8 @@ def main():
     args = ap.parse_args()
     tmp = tempfile.mkdtemp()
 
-    qt = QTest(args.qemu, 'nt98562')
+    # The RTC on the virtual clock, so clock_step moves it.
+    qt = QTest(args.qemu, 'nt98562', ['-rtc', 'clock=vm'])
     try:
         test_top_cg(qt)
         test_wdt(qt)

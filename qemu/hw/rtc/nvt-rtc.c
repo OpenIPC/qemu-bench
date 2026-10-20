@@ -5,7 +5,11 @@
  *
  *   0x00 TIMER    [5:0] sec [11:6] min [16:12] hour
  *   0x04 DAYKEY   [15:0] days since 1900-01-01, [19:16] key
- *   0x08 ALARM    0x20 PWRALM (power-on alarm), 0x14 DATA, 0x24 OSCAN
+ *   0x08 ALARM    daily alarm, TIMER's layout (reset 0x1FFFF: hour 31,
+ *                 never)
+ *   0x20 PWRALM   power-on alarm: TIMER's layout, [24:20] the low five
+ *                 bits of the day; the driver's wake alarm (set_alarm)
+ *   0x14 DATA     0x24 OSCAN
  *   0x0C STATUS   bit 0 alarm, bit 1 SRST busy, bit 2 ready, bit 8 CSET
  *                 done; alarm and CSET are write-1-to-clear
  *   0x10 CTRL     bit 0 alarm int, bit 1 SRST, bit 2 CSET, bits 3..7 and
@@ -14,12 +18,13 @@
  *                 power alarm enable / disable (self-clearing)
  *   0x1C PWBCSTS  bit 0 power alarm armed, bit 1 core power valid
  *
- * Writes to TIMER, DAYKEY and the alarms land in shadow registers that a
+ * Writes to TIMER, DAYKEY and PWRALM land in shadow registers that a
  * CSET copies across, raising CSET done; the driver sleeps on that
  * interrupt (rtc_cset_work) before every access.  A key other than 0xA,
  * or an oscillator setting other than 0x9, makes it treat the RTC as
  * having lost power and reset it to 1970: both read as a kept-alive RTC
- * here, and the time is the host's.
+ * here, and the time is the host's.  Either alarm matching the clock sets
+ * the alarm status, an interrupt with CTRL's alarm enable.
  *
  * Reboot goes through here (plat-na51089/reset.c): the kernel arms the
  * power-on alarm a few seconds ahead and powers the chip off, and the
@@ -80,6 +85,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtRtcState, NVT_RTC)
 
 #define RTC_KEY         0xA         /* RTC_INT_KEY */
 #define RTC_OSC_CFG     0x9         /* RTC_INT_OSC_ANALOG_CFG */
+#define RTC_ALARM_RESET 0x0001FFFF  /* RTC_ALARM_REG_DEFAULT */
 
 /* 1900-01-01 to 1970-01-01 */
 #define DAYS_1900_TO_1970   25567
@@ -89,6 +95,7 @@ struct NvtRtcState {
 
     MemoryRegion iomem;
     qemu_irq irq;
+    QEMUTimer *alarm_timer;
 
     /* RTC time = this + rtc_clock seconds, in seconds since 1900. */
     int64_t base;
@@ -104,6 +111,7 @@ struct NvtRtcState {
     /* what a CSET commits */
     uint32_t set_timer;
     uint32_t set_daykey;
+    uint32_t set_pwralm;
 };
 
 static int64_t nvt_rtc_clock_secs(void)
@@ -129,6 +137,67 @@ static void nvt_rtc_update_irq(NvtRtcState *s)
     qemu_set_irq(s->irq, level);
 }
 
+/* Seconds into the day a TIMER-layout word names, or -1 if none. */
+static int64_t nvt_rtc_tod(uint32_t v)
+{
+    uint32_t sec = v & 0x3F, min = (v >> 6) & 0x3F, hour = (v >> 12) & 0x1F;
+
+    if (sec > 59 || min > 59 || hour > 23) {
+        return -1;
+    }
+    return sec + min * 60 + hour * 3600;
+}
+
+/* The next time, after now, either alarm matches; -1 if neither can. */
+static int64_t nvt_rtc_next_alarm(NvtRtcState *s, int64_t now)
+{
+    const int64_t today = now / 86400;
+    int64_t next = -1, t, tod;
+    int k;
+
+    tod = nvt_rtc_tod(s->alarm);
+    if (tod >= 0) {
+        next = today * 86400 + tod;
+        if (next <= now) {
+            next += 86400;
+        }
+    }
+    tod = nvt_rtc_tod(s->pwralm);
+    if (tod >= 0) {
+        for (k = 0; k <= 32; k++) {
+            t = (today + k) * 86400 + tod;
+            if (((today + k) & 0x1F) == ((s->pwralm >> 20) & 0x1F) &&
+                t > now) {
+                if (next < 0 || t < next) {
+                    next = t;
+                }
+                break;
+            }
+        }
+    }
+    return next;
+}
+
+static void nvt_rtc_rearm(NvtRtcState *s)
+{
+    int64_t next = nvt_rtc_next_alarm(s, nvt_rtc_now(s));
+
+    if (next < 0) {
+        timer_del(s->alarm_timer);
+        return;
+    }
+    timer_mod(s->alarm_timer, (next - s->base) * NANOSECONDS_PER_SECOND);
+}
+
+static void nvt_rtc_alarm_fired(void *opaque)
+{
+    NvtRtcState *s = opaque;
+
+    s->status |= STS_ALARM;
+    nvt_rtc_update_irq(s);
+    nvt_rtc_rearm(s);
+}
+
 static void nvt_rtc_cset(NvtRtcState *s)
 {
     int64_t now = nvt_rtc_now(s);
@@ -147,6 +216,10 @@ static void nvt_rtc_cset(NvtRtcState *s)
     if (s->ctrl & CTRL_KEY_SEL) {
         s->key = (s->set_daykey >> 16) & 0xF;
     }
+    if (s->ctrl & CTRL_PWRALM_SEL) {
+        s->pwralm = s->set_pwralm;
+    }
+    nvt_rtc_rearm(s);
     s->ctrl &= ~(CTRL_CSET | CTRL_SELS);
     s->status |= STS_CSET;
     nvt_rtc_update_irq(s);
@@ -199,6 +272,7 @@ static void nvt_rtc_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case RTC_ALARM:
         s->alarm = val;
+        nvt_rtc_rearm(s);
         break;
     case RTC_STATUS:
         s->status &= ~(val & (STS_ALARM | STS_CSET));
@@ -211,6 +285,9 @@ static void nvt_rtc_write(void *opaque, hwaddr offset, uint64_t val,
             s->key = 0;
             s->ctrl = 0;
             s->status = 0;
+            s->alarm = RTC_ALARM_RESET;
+            s->pwralm = 0;
+            nvt_rtc_rearm(s);
             nvt_rtc_update_irq(s);
             break;
         }
@@ -244,7 +321,7 @@ static void nvt_rtc_write(void *opaque, hwaddr offset, uint64_t val,
         s->pwbcsts &= ~(val & ~(PWBCSTS_ALM | PWBCSTS_COREPWR));
         break;
     case RTC_PWRALM:
-        s->pwralm = val;
+        s->set_pwralm = val;
         break;
     case RTC_OSCAN:
         s->oscan = val & 0xFF;
@@ -281,10 +358,12 @@ static void nvt_rtc_realize(DeviceState *dev, Error **errp)
     NvtRtcState *s = NVT_RTC(dev);
     struct tm tm;
 
+    s->alarm_timer = timer_new_ns(rtc_clock, nvt_rtc_alarm_fired, s);
     qemu_get_timedate(&tm, 0);
     nvt_rtc_set_now(s, mktimegm(&tm) + (int64_t)DAYS_1900_TO_1970 * 86400);
     s->key = RTC_KEY;
     s->oscan = RTC_OSC_CFG;
+    s->alarm = RTC_ALARM_RESET;
 }
 
 static void nvt_rtc_init(Object *obj)
@@ -316,7 +395,11 @@ static int nvt_rtc_post_save(void *opaque)
 
 static int nvt_rtc_post_load(void *opaque, int version_id)
 {
-    return nvt_rtc_post_save(opaque);
+    NvtRtcState *s = opaque;
+
+    nvt_rtc_set_now(s, s->base);
+    nvt_rtc_rearm(s);
+    return 0;
 }
 
 static const VMStateDescription vmstate_nvt_rtc = {
@@ -339,6 +422,7 @@ static const VMStateDescription vmstate_nvt_rtc = {
         VMSTATE_UINT32(pwbcsts, NvtRtcState),
         VMSTATE_UINT32(set_timer, NvtRtcState),
         VMSTATE_UINT32(set_daykey, NvtRtcState),
+        VMSTATE_UINT32(set_pwralm, NvtRtcState),
         VMSTATE_END_OF_LIST()
     }
 };

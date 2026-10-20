@@ -18,8 +18,9 @@
  * nvt_gpio_irq_table[n] (bits 32..39 being DGPIO bits 0..7).  All of them
  * share one GIC line.
  *
- * GPIO lines: "in" 0..255 drive input pads, "out" 0..255 follow output
- * pads, both by pin number.
+ * GPIO lines, by pin number: "in" 0..255 drive the pads of input pins;
+ * "out" 0..255 are the pad drivers, the latch while a pin is an output
+ * and low while it is an input.
  */
 
 #include "qemu/osdep.h"
@@ -85,6 +86,7 @@ struct NvtGpioState {
     uint32_t dir[NVT_GPIO_BANKS];
     uint32_t input[NVT_GPIO_BANKS];
     uint32_t pad[NVT_GPIO_BANKS];       /* last level seen, for edges */
+    uint32_t driven[NVT_GPIO_BANKS];    /* what the "out" lines carry */
     /* Interrupt words: [0] GPIO at 0x80.., [1] DGPIO at 0xC0.. */
     uint32_t regs[GPIO_REGS_END / 4];
 };
@@ -140,12 +142,14 @@ static void nvt_gpio_update(NvtGpioState *s)
     }
 
     for (b = 0; b < NVT_GPIO_BANKS; b++) {
-        const uint32_t changed = (level[b] ^ s->pad[b]) & s->dir[b];
+        const uint32_t drive = s->latch[b] & s->dir[b];
+        const uint32_t changed = drive ^ s->driven[b];
 
         s->pad[b] = level[b];
+        s->driven[b] = drive;
         for (n = 0; n < 32; n++) {
             if (changed & (1u << n)) {
-                qemu_set_irq(s->out[b * 32 + n], (level[b] >> n) & 1);
+                qemu_set_irq(s->out[b * 32 + n], (drive >> n) & 1);
             }
         }
     }
@@ -229,7 +233,15 @@ static void nvt_gpio_set_input(void *opaque, int line, int level)
 static void nvt_gpio_reset(DeviceState *dev)
 {
     NvtGpioState *s = NVT_GPIO(dev);
+    int n;
 
+    /* Every pin comes out of reset an input: release what was driven. */
+    for (n = 0; n < NVT_GPIO_PINS; n++) {
+        if (s->driven[n / 32] & (1u << (n % 32))) {
+            qemu_irq_lower(s->out[n]);
+        }
+    }
+    memset(s->driven, 0, sizeof(s->driven));
     memset(s->latch, 0, sizeof(s->latch));
     memset(s->dir, 0, sizeof(s->dir));
     memset(s->regs, 0, sizeof(s->regs));
@@ -259,6 +271,7 @@ static const VMStateDescription vmstate_nvt_gpio = {
         VMSTATE_UINT32_ARRAY(dir, NvtGpioState, NVT_GPIO_BANKS),
         VMSTATE_UINT32_ARRAY(input, NvtGpioState, NVT_GPIO_BANKS),
         VMSTATE_UINT32_ARRAY(pad, NvtGpioState, NVT_GPIO_BANKS),
+        VMSTATE_UINT32_ARRAY(driven, NvtGpioState, NVT_GPIO_BANKS),
         VMSTATE_UINT32_ARRAY(regs, NvtGpioState, GPIO_REGS_END / 4),
         VMSTATE_END_OF_LIST()
     }

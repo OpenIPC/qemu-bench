@@ -110,9 +110,11 @@ With the real ratio, every delay and jiffy would run 20% slow.
   interrupts or resets. A write of 1 to MANUAL (`+0x0C`) resets at once
   while the watchdog is enabled; the kernel's restart hook uses it. The
   driver is a module (`na51055_wdt.ko`).
-- **`nvt-rtc`.** Writes to TIMER, DAYKEY and the alarms are shadowed until
-  a CSET commits them. CSET completion is an interrupt the driver sleeps on
-  before every access, so it has to fire. A key other than `0xA`, or an
+- **`nvt-rtc`.** Writes to TIMER, DAYKEY and PWRALM (the power-on alarm,
+  which the driver's wake alarm uses) are shadowed until a CSET commits
+  them. PWRALM and the daily ALARM go off on the RTC clock, setting the alarm
+  status and, with CTRL's alarm enable, SPI 56. CSET completion is an
+  interrupt the driver sleeps on before every access, so it has to fire. A key other than `0xA`, or an
   oscillator config other than `0x9`, makes the driver treat the RTC as
   power-lost and reset it to 1970. The model presents both, with the host's
   time. Reboot goes through the RTC: the vendor reboot notifier arms the
@@ -123,7 +125,9 @@ With the real ratio, every delay and jiffy would run 20% slow.
 - **`nvt-gpio`.** Eight 32-pin groups (C, P, S, L, D, H, A, DSI at
   `0x00`–`0xE0`), with DATA/DIR/SET/CLR words per group. Only 40 pins can
   interrupt, through a fixed table (`nvt_gpio_irq_table`), all on SPI 24.
-  QOM lines `in`/`out` are numbered by pin, at `/machine/nvt-gpio`.
+  QOM lines `in`/`out` are numbered by pin, at `/machine/nvt-gpio`. An
+  `out` line is the pad driver: the latch while the pin is an output, low
+  while it is an input or after a reset.
 - **UARTs.** 16550 registers at a stride of 4. `nvt_serial.c` adds DMA
   registers at `+0x80`, which read zero here, so the driver stays in PIO.
 
