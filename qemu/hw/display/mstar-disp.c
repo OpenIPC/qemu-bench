@@ -569,6 +569,26 @@ static void mstar_disp_gfx_update(void *opaque)
     if (sw && sh) {
         w = sw;
         h = sh;
+    } else {
+        /* No GOP timing yet (U-Boot's logo): fit the video windows. */
+        uint32_t mw = 0, mh = 0;
+        int n;
+
+        for (n = 0; n < MOP_NUM_WIN; n++) {
+            const uint16_t *r =
+                &s->mopregs[(MOP_WIN0 + n * MOP_WIN_STRIDE) / 4];
+            uint32_t hend = r[MOP_WIN_HEND / 4] & 0xfff;
+            uint32_t vend = r[MOP_WIN_VEND / 4] & 0xfff;
+
+            if ((r[MOP_WIN_EN / 4] & 1) && hend && vend) {
+                mw = MAX(mw, hend + 1);
+                mh = MAX(mh, vend + 1);
+            }
+        }
+        if (mw && mh) {
+            w = mw;
+            h = mh;
+        }
     }
     if (w != s->width || h != s->height) {
         s->width = w;

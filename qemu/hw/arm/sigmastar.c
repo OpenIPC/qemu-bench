@@ -47,6 +47,7 @@
 #define SS_PERIPHBASE       0x16000000
 #define SS_DRAM_BASE        0x20000000
 #define SS_DRAM_WINDOW      (512 * MiB)
+#define SS_DRAM_ALIASED     (2 * SS_DRAM_WINDOW)    /* to 0x60000000 */
 #define SS_IMI_BASE         0xA0000000
 #define SS_IMI_SIZE         (64 * KiB)
 
@@ -464,10 +465,13 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
 
     /*
      * DRAM, mirrored through the whole 512 MiB MIU0 window as the address
-     * decode wraps: the IPL sizes DRAM by looking for the wrap.
+     * decode wraps: the IPL sizes DRAM by looking for the wrap.  The next
+     * 512 MiB repeat it again: the Xiongmai U-Boot converts its logo into
+     * "dstAddr + 0x20000000" with dstAddr already a CPU address (0x2DD00000
+     * becomes 0x4DD00000), and the NVR shows it.
      */
     memory_region_add_subregion(sysmem, SS_DRAM_BASE, machine->ram);
-    for (off = machine->ram_size; off + machine->ram_size <= SS_DRAM_WINDOW;
+    for (off = machine->ram_size; off + machine->ram_size <= SS_DRAM_ALIASED;
          off += machine->ram_size) {
         MemoryRegion *alias = g_new(MemoryRegion, 1);
 

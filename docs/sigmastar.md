@@ -97,7 +97,7 @@ The U-Boot console is password protected.
 | `0x1F2A2000` | EMAC, RIU view (16-bit halves) | `sstar-emac` |
 | `0x1F343C00` | EMAC, X32 view (32-bit) | `sstar-emac` |
 | `0x1F345000` | SATA AHCI, one port | `sysbus-ahci` |
-| `0x20000000` | DRAM, mirrored through the 512 MiB MIU0 window | RAM |
+| `0x20000000` | DRAM, mirrored through the 512 MiB MIU0 window and the 512 MiB after it (the Xiongmai U-Boot writes its logo at `0x4DD00000`) | RAM |
 | `0xA0000000` | IMI SRAM, 64 KiB | RAM |
 
 A register `r` of RIU bank `b` is at `0x1F000000 + b * 0x200 + r * 4`; its
