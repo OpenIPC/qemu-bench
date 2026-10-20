@@ -94,6 +94,12 @@ HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)
 python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$WORK/www" \
     >/dev/null 2>&1 &
 HTTP_PID=$!
+# guestfwd connects when QEMU starts: the server must be listening by then.
+for _ in $(seq 50); do
+    python3 -c "import socket; socket.create_connection(('127.0.0.1', $HTTP_PORT), 1)" \
+        2>/dev/null && break
+    sleep 0.2
+done
 cat > "$WORK/initramfs/udhcpc.sh" <<'DHCP'
 #!/bin/sh
 [ "$1" = bound ] || exit 0
