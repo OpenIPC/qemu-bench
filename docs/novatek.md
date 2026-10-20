@@ -4,7 +4,8 @@ Novatek's NT9856x IP-camera SoCs (internal name NA51089): one Cortex-A9
 with DDR in the package and Novatek's own peripheral blocks from
 `0xF0000000`. One machine file (`hw/arm/novatek.c`) covers the family with a
 table entry per part. It boots the OpenIPC `nt98562_lite` / `nt98566_lite`
-kernel with `-kernel` to a shell. Flash boot and Ethernet come next; see
+kernel with its root on the emulated SPI NOR, and boots a whole flash image
+through the vendor U-Boot. Ethernet comes next; see
 [Not modelled](#not-modelled).
 
 ## What the SDKs support
@@ -51,8 +52,8 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | GPIO | `0xF0070000` | 24 | `nvt-gpio` |
 | UART1 / 2 / 3 | `0xF0290000` / `0xF0300000` / `0xF0310000` | 43 / 44 / 45 | 16550, reg-shift 2 |
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | — |
-| SPI NOR / NAND controller | `0xF0400000` | 29 | — |
-| SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | — |
+| SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR) |
+| SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio` (empty slot) |
 | USB 2.0 | `0xF0600000` | 27 | — |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
@@ -131,6 +132,66 @@ With the real ratio, every delay and jiffy would run 20% slow.
 - **UARTs.** 16550 registers at a stride of 4. `nvt_serial.c` adds DMA
   registers at `+0x80`, which read zero here, so the driver stays in PIO.
 
+## SPI NOR and the flash controller
+
+`nvt-flash` is the controller at `0xF0400000` with the boot NOR behind it,
+backed by `-M nt98562,flash-file=img`. Erases and programs are written
+through to the file, which must be a power of two from 1 to 32 MiB. The
+controller sequences operations: software loads COMMAND, ROWADDR (the flash
+address, sent MSB first in `MODULE0.row_addr + 1` bytes) and DATALEN, then
+writes an operation code with OPER_EN into CTRL0 (`nvt_flash_spi_cmd.c`).
+Command, command+address, dummy clocks, read and write of N bytes (through
+the 16-word PIO FIFO or by DMA), status read, auto-status poll and block
+erase are modelled. Each operation ends with CTRL_STS bit 12, which raises
+SPI 29. The driver sleeps on that interrupt after every operation. CS is
+either the controller's, per operation, or software's (SPI_CFG bit 1 for
+manual, bit 4 for the level). A read holds CS low across CMD_ADDR, DUMMY_CLOCK
+and READ_N.
+
+The kernel's `spinor.c` with `trace-stdtable` matches a flash on the
+capacity byte alone. So the default JEDEC ID is a Winbond W25Q of the
+image's size, and an 8 MiB part is "STDR64FW": dual-output reads (0x3B), 64
+KiB 0xD8 erases. The MTD is named after `nvt-devname`, so OpenIPC's command
+line is
+`mtdparts=spi_nor.0:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)`.
+
+Writes from busybox `flashcp` go out as 256-byte DMA page programs. It pads a
+short last buffer to 4 KiB, as on silicon. Smaller writes are PIO programs.
+`test-novatek-boot.sh` checks both kinds against the image file.
+
+## Flash boot
+
+On silicon the mask ROM loads the 32 KiB loader (`LD9856xA.bin`) into SRAM.
+The loader trains DDR with closed libraries and then, per `bl_func.c`:
+
+1. copies the FDT from the fixed `fdt` partition (flash `0x10000`) to
+   `/nvt_memory_cfg/fdt`;
+2. loads `partition_uboot` to `/nvt_memory_cfg/uboot`, unpacking it if it is
+   BCL1;
+3. fills the 328-byte SHMINFO at `/nvt_memory_cfg/shmem`;
+4. calls U-Boot's entry.
+
+DDR needs no training here, so with `flash-file=` and no `-kernel` the
+machine does steps 1–4 itself and leaves `ldr pc, [pc, #-4]` plus U-Boot's
+address at 0 for the CPU to start on. The SHMINFO is what U-Boot's
+`nvt_shminfo_init()` hangs without: `"LD_NVT"` at +0 and the FDT address at
++44 (`arch/arm/include/asm/nvt-common/shm_info.h`).
+
+BCL1 is Novatek's container: the FourCC, then the algorithm and the
+big-endian uncompressed and compressed sizes, then the data. Algorithm 9 is
+an LZ77 with a marker byte and 7-bit variable-length lengths and offsets
+(U-Boot's `lz_uncompress`), and it is unpacked here. Algorithm 11 is LZMA
+through a mask-ROM routine and is refused.
+
+The SDK ships NVTPACK update packages, not flash dumps.
+`qemu-boot/nvtpack2flash.py FW98562A.bin nor.bin` lays one out the way the
+vendor U-Boot's updater writes it. It places each partition where the
+pack's own device tree says (`nvtpack/index/idN` → `partition_<name>`) and
+strips the 64-byte CKSM header from the rootfs and app images. Booted with
+`FLASH=nor.bin qemu-boot/run-nt98562.sh`, the SDK's `FW98562A.bin` runs
+U-Boot 2019.04 (SPI NOR probed, empty SD slot, `nvt_boot`), the kernel and
+the vendor init scripts.
+
 ## Running
 
 ```bash
@@ -138,27 +199,28 @@ cd qemu-boot && curl -sL \
   https://github.com/OpenIPC/firmware/releases/download/latest/openipc.nt98562-nor-lite.tgz \
   | tar xz && cd ..
 bash qemu-boot/run-nt98562.sh               # SOC=nt98566 for the 128 MB part
+FLASH=nor.bin bash qemu-boot/run-nt98562.sh # a whole flash image
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
 python3 qemu/tests/test-novatek.py
 ```
 
 The release rootfs is SquashFS, and this kernel has no RAM disk driver, so
 the boot matrix's `-initrd rootfs.squashfs root=/dev/ram0` does not apply.
-`run-nt98562.sh` repacks the rootfs as an initramfs, which needs `mem=`
-beyond the device tree's Linux part. `test-novatek-boot.sh` uses a small
-initramfs with busybox and an `/init` script instead. That script checks the
-device tree, the clocksource, and the pinctrl, GPIO, RTC and watchdog drivers,
-then runs `reboot -f` under `-no-reboot`.
+`run-nt98562.sh` lays the release into an 8 MiB NOR image
+(`qemu-boot/nor-<soc>.bin`, kept between runs) and mounts root from it.
+`test-novatek-boot.sh` boots the kernel into a small initramfs (busybox and
+an `/init` script) with the same NOR attached. The script checks the device
+tree, the clocksource, the pinctrl, GPIO, RTC and watchdog drivers and the
+MTD. It reads, erases and programs the flash, then runs `reboot -f` under
+`-no-reboot`.
 
 ## Not modelled
 
-- The SPI NOR/NAND controller at `0xF0400000` (`drivers/mtd/nvt_flash_spi`),
-  and so flash boot. The plan is a synthetic boot ROM that, like the
-  silicon's loader, puts the FDT at `0x100000` and U-Boot at `0x03900000`
-  and fills the `LD_NVT` shared-memory block at `0x200000`. The real 32 KiB
-  loader is skipped: it trains DDR from its ConfigRAM table with closed
-  libraries (`Reset_560.a`).
+- SPI NAND behind `nvt-flash` (the 566 boards), and the real loader: it
+  trains DDR from its ConfigRAM table with closed libraries
+  (`Reset_560.a`).
+- An SD card: the SDIO hosts answer as empty slots.
 - Ethernet: a DWC EQoS (GMAC 4.x) MAC. QEMU has no model of it, and
   `xm-dwmac` is GMAC 3.x with a different descriptor format.
-- SDIO, USB, the Novatek timer, PWM, I2C, crypto/OTP, and the HDAL media
+- USB, the Novatek timer, PWM, I2C, crypto/OTP, and the HDAL media
   blocks.
