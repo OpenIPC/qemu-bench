@@ -32,7 +32,11 @@
  * write-back TDES3 keeps FD / LD only, its low half being error flags.  Rx
  * read format: RDES0 buffer, RDES3 OWN, IOC bit 30; write-back: RDES3 FD,
  * LD, packet length [14:0] -- without the FCS, which the driver does not
- * strip (DWC_ETH_QOS_clean_rx_irq).  yinit() polls DSR0 until RPS0 reads
+ * strip (DWC_ETH_QOS_clean_rx_irq).  A frame longer than RBSZ spans
+ * descriptors; Rx stops at the tail pointer; the packet filter (MPFR,
+ * MAC address registers) decides what is taken at all.  A Tx frame is
+ * gathered across tail writes, and one too long for the MAC is dropped
+ * with ES / JT in its last write-back.  yinit() polls DSR0 until RPS0 reads
  * 3 (running, waiting for a packet) and re-initialises the core until it
  * does.
  *
@@ -60,6 +64,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtEqosState, NVT_EQOS)
 #define EQOS_SIZE           0x4000
 
 #define MAC_MCR             0x0000
+#define MAC_MPFR            0x0008
 #define MAC_ISR             0x00B0
 #define MAC_VR              0x0110
 #define MAC_HFR0            0x011C
@@ -117,6 +122,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtEqosState, NVT_EQOS)
 #define DES3_CTXT           (1u << 30)
 #define DES3_FD             (1u << 29)
 #define DES3_LD             (1u << 28)
+#define TDES3_ES            (1u << 15)      /* write-back: error summary */
+#define TDES3_JT            (1u << 14)      /* write-back: jabber timeout */
+#define MPFR_PR             (1u << 0)
+#define MPFR_HUC            (1u << 1)
+#define MPFR_HMC            (1u << 2)
+#define MPFR_PM             (1u << 4)
+#define MPFR_DBF            (1u << 5)
+#define MPFR_RA             (1u << 31)
+#define MAC_ADDR_AE         (1u << 31)
 #define RDES3_IOC           (1u << 30)
 #define TDES2_IOC           (1u << 31)
 
@@ -142,6 +156,10 @@ struct NvtEqosState {
     uint32_t cur_tx, cur_rx;            /* descriptor indices */
     uint32_t rps;                       /* Rx process state, DSR0 [11:8] */
     bool irq_level;
+    /* the Tx frame being gathered, kept across tail-pointer writes */
+    uint8_t tx_frame[EQOS_MAX_FRAME];
+    uint32_t tx_len;
+    bool tx_overflow;
     uint16_t phy[32];
 };
 
@@ -281,8 +299,7 @@ static void nvt_eqos_set_state(NvtEqosState *s)
 
 static void nvt_eqos_tx(NvtEqosState *s)
 {
-    uint8_t frame[EQOS_MAX_FRAME];
-    uint32_t len = 0, d[4], n = 0, l1, l2;
+    uint32_t d[4], n = 0, l1, l2;
     const uint32_t ring = nvt_eqos_ring_len(s, false);
     dma_addr_t a;
 
@@ -299,30 +316,44 @@ static void nvt_eqos_tx(NvtEqosState *s)
             *ch(s, CH_SR) |= SR_TBU;
             break;
         }
-        if (!(d[3] & DES3_CTXT)) {
+        if (d[3] & DES3_CTXT) {
+            d[3] = 0;
+        } else {
             if (d[3] & DES3_FD) {
-                len = 0;
+                s->tx_len = 0;
+                s->tx_overflow = false;
             }
             l1 = d[2] & 0x3FFF;
             l2 = (d[2] >> 16) & 0x3FFF;
-            if (len + l1 + l2 <= sizeof(frame)) {
-                dma_memory_read(&address_space_memory, d[0], frame + len,
-                                l1, MEMTXATTRS_UNSPECIFIED);
-                dma_memory_read(&address_space_memory, d[1],
-                                frame + len + l1, l2,
+            if (s->tx_overflow || s->tx_len + l1 + l2 > EQOS_MAX_FRAME) {
+                s->tx_overflow = true;
+            } else {
+                dma_memory_read(&address_space_memory, d[0],
+                                s->tx_frame + s->tx_len, l1,
                                 MEMTXATTRS_UNSPECIFIED);
-                len += l1 + l2;
+                dma_memory_read(&address_space_memory, d[1],
+                                s->tx_frame + s->tx_len + l1, l2,
+                                MEMTXATTRS_UNSPECIFIED);
+                s->tx_len += l1 + l2;
             }
+            /* Write-back format: FD / LD kept, error flags in the low
+             * half, no timestamp.  A frame too long to gather is dropped
+             * as a jabber timeout rather than sent cut short. */
+            d[3] &= DES3_FD | DES3_LD;
             if (d[3] & DES3_LD) {
-                qemu_send_packet(qemu_get_queue(s->nic), frame, len);
-                len = 0;
+                if (s->tx_overflow) {
+                    d[3] |= TDES3_ES | TDES3_JT;
+                } else {
+                    qemu_send_packet(qemu_get_queue(s->nic), s->tx_frame,
+                                     s->tx_len);
+                }
+                s->tx_len = 0;
+                s->tx_overflow = false;
             }
             if (d[2] & TDES2_IOC) {
                 *ch(s, CH_SR) |= SR_TI;
             }
         }
-        /* Write-back format: FD / LD kept, no error bits, no timestamp. */
-        d[3] &= DES3_FD | DES3_LD;
         d[0] = d[1] = 0;
         nvt_eqos_write_desc(a, d);
         *ch(s, CH_CHTDR) = a;
@@ -331,49 +362,127 @@ static void nvt_eqos_tx(NvtEqosState *s)
     nvt_eqos_update_irq(s);
 }
 
+static uint32_t nvt_eqos_rx_bufsz(NvtEqosState *s)
+{
+    uint32_t bufsz = (*ch(s, CH_RCR) >> 1) & 0x3FFF;   /* RBSZ [14:1] */
+
+    return bufsz ? bufsz & ~3u : 2048;
+}
+
+/*
+ * How many descriptors from the current one the DMA may fill: owned by it
+ * and short of the tail pointer, which the DMA stops at (the driver points
+ * it at the last descriptor it refilled).
+ */
+static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
+{
+    const uint32_t ring = nvt_eqos_ring_len(s, true);
+    uint32_t n, d[4];
+    dma_addr_t a;
+
+    if (!(*ch(s, CH_RCR) & RCR_SR) || !(*reg(s, MAC_MCR) & MCR_RE)) {
+        return 0;
+    }
+    for (n = 0; n < want && n < ring; n++) {
+        a = nvt_eqos_desc(s, true, (s->cur_rx + n) % ring);
+        if (a == *ch(s, CH_RDTP)) {
+            break;
+        }
+        nvt_eqos_read_desc(a, d);
+        if (!(d[3] & DES3_OWN)) {
+            break;
+        }
+    }
+    return n;
+}
+
 static bool nvt_eqos_can_receive(NetClientState *nc)
 {
     NvtEqosState *s = qemu_get_nic_opaque(nc);
-    uint32_t d[4];
 
-    if (!(*ch(s, CH_RCR) & RCR_SR) || !(*reg(s, MAC_MCR) & MCR_RE)) {
-        return false;
+    return nvt_eqos_rx_avail(s, 1) > 0;
+}
+
+/* The MAC packet filter: promiscuous / receive-all, broadcast, multicast
+ * (all, or through the hash filter, taken as passing everything), and
+ * unicast against the enabled MAC address registers. */
+static bool nvt_eqos_accept(NvtEqosState *s, const uint8_t *buf, size_t size)
+{
+    const uint32_t mpfr = *reg(s, MAC_MPFR);
+    uint32_t hi, lo;
+    int i;
+
+    if (size < 6 || (mpfr & (MPFR_PR | MPFR_RA))) {
+        return true;
     }
-    nvt_eqos_read_desc(nvt_eqos_desc(s, true, s->cur_rx), d);
-    return d[3] & DES3_OWN;
+    if (is_broadcast_ether_addr(buf)) {
+        return !(mpfr & MPFR_DBF);
+    }
+    if (is_multicast_ether_addr(buf)) {
+        return mpfr & (MPFR_PM | MPFR_HMC);
+    }
+    if (mpfr & MPFR_HUC) {
+        return true;
+    }
+    for (i = 0; i < 32; i++) {
+        hi = *reg(s, MAC_ADDR0_HI + 8 * i);
+        lo = *reg(s, MAC_ADDR0_LO + 8 * i);
+        if (i && !(hi & MAC_ADDR_AE)) {
+            continue;
+        }
+        if (ldl_le_p(buf) == lo && lduw_le_p(buf + 4) == (hi & 0xFFFF)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static ssize_t nvt_eqos_receive(NetClientState *nc, const uint8_t *buf,
                                 size_t size)
 {
     NvtEqosState *s = qemu_get_nic_opaque(nc);
-    const uint32_t bufsz = *ch(s, CH_RCR) & 0x7FFE;
-    uint32_t d[4], len;
+    const uint32_t bufsz = nvt_eqos_rx_bufsz(s);
+    const uint32_t ring = nvt_eqos_ring_len(s, true);
+    uint32_t need = DIV_ROUND_UP(size, bufsz), done = 0, i, chunk, d[4];
     dma_addr_t a;
 
-    if (!nvt_eqos_can_receive(nc)) {
+    if (!nvt_eqos_accept(s, buf, size)) {
+        return size;                /* filtered out: not for us */
+    }
+    if (size == 0 || need >= ring) {
+        return size;                /* can never fit the ring: dropped */
+    }
+    if (nvt_eqos_rx_avail(s, need) < need) {
         s->rps = RPS_SUSPENDED;
         *ch(s, CH_SR) |= SR_RBU;
         nvt_eqos_update_irq(s);
-        return 0;
+        return 0;                   /* queued until the guest refills */
     }
-    a = nvt_eqos_desc(s, true, s->cur_rx);
-    nvt_eqos_read_desc(a, d);
-    len = MIN(size, bufsz ? bufsz : 2048);
-    dma_memory_write(&address_space_memory, d[0], buf, len,
-                     MEMTXATTRS_UNSPECIFIED);
-    /* IOC, or the Rx watchdog (RIWT), which the driver uses for the
-     * descriptors it leaves IOC clear on; it is taken to expire at once. */
-    if ((d[3] & RDES3_IOC) || (*ch(s, CH_RIWTR) & 0xFF)) {
-        *ch(s, CH_SR) |= SR_RI;
+
+    /* Spread over as many buffers as it takes: FD on the first, LD and
+     * the frame length (no FCS) on the last. */
+    for (i = 0; i < need; i++) {
+        a = nvt_eqos_desc(s, true, s->cur_rx);
+        nvt_eqos_read_desc(a, d);
+        chunk = MIN(size - done, bufsz);
+        dma_memory_write(&address_space_memory, d[0], buf + done, chunk,
+                         MEMTXATTRS_UNSPECIFIED);
+        done += chunk;
+        /* IOC, or the Rx watchdog (RIWT), which the driver uses for the
+         * descriptors it leaves IOC clear on; it is taken to expire at
+         * once. */
+        if ((d[3] & RDES3_IOC) || (*ch(s, CH_RIWTR) & 0xFF)) {
+            *ch(s, CH_SR) |= SR_RI;
+        }
+        d[1] = 0;
+        d[2] = 0;
+        d[3] = (i == 0 ? DES3_FD : 0) |
+               (i == need - 1 ? DES3_LD | size : 0);
+        nvt_eqos_write_desc(a, d);
+        *ch(s, CH_CHRDR) = a;
+        *ch(s, CH_CHRBAR) = d[0];
+        s->cur_rx = (s->cur_rx + 1) % ring;
     }
-    d[1] = 0;
-    d[2] = 0;
-    d[3] = DES3_FD | DES3_LD | len;
-    nvt_eqos_write_desc(a, d);
-    *ch(s, CH_CHRDR) = a;
-    *ch(s, CH_CHRBAR) = d[0];
-    s->cur_rx = (s->cur_rx + 1) % nvt_eqos_ring_len(s, true);
     nvt_eqos_update_irq(s);
     return size;
 }
@@ -400,6 +509,8 @@ static void nvt_eqos_soft_reset(NvtEqosState *s)
                             (s->conf.macaddr.a[2] << 16) |
                             ((uint32_t)s->conf.macaddr.a[3] << 24);
     s->cur_tx = s->cur_rx = 0;
+    s->tx_len = 0;
+    s->tx_overflow = false;
     s->rps = RPS_STOPPED;
     s->irq_level = false;
     qemu_irq_lower(s->irq);
@@ -553,6 +664,9 @@ static const VMStateDescription vmstate_nvt_eqos = {
         VMSTATE_UINT32(cur_rx, NvtEqosState),
         VMSTATE_UINT32(rps, NvtEqosState),
         VMSTATE_BOOL(irq_level, NvtEqosState),
+        VMSTATE_UINT8_ARRAY(tx_frame, NvtEqosState, EQOS_MAX_FRAME),
+        VMSTATE_UINT32(tx_len, NvtEqosState),
+        VMSTATE_BOOL(tx_overflow, NvtEqosState),
         VMSTATE_UINT16_ARRAY(phy, NvtEqosState, 32),
         VMSTATE_END_OF_LIST()
     }

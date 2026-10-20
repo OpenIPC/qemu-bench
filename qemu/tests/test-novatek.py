@@ -31,7 +31,10 @@ plays the vendor drivers (docs/novatek.md):
     keys on (MDIO present, one queue), the software reset, the Rx DMA
     state yinit() polls for, a frame sent through a Tx descriptor (seen in
     a filter-dump pcap) with its write-back and interrupt, and the
-    Novatek ETH_ISR summary the ISR checks first;
+    Novatek ETH_ISR summary the ISR checks first; a frame split across two
+    tail writes, an over-long one dropped with ES / JT; frames injected
+    through a socket netdev: unicast filtering, a frame spanning 64-byte
+    buffers, Rx stopping at its tail pointer until it moves;
   - the 16550 UART at its reg-shift-2 offsets;
   - the generated device tree: compatible, the clock nodes in the order
     of_clk_init() needs, the pinmux children in the driver's order;
@@ -653,6 +656,93 @@ def test_eqos(qt, pcap):
     data = open(pcap, 'rb').read()
     check('the frame went out on the wire', frame in data, True)
 
+    # A frame in two descriptors, the tail moved past only the first
+    part1, part2 = frame[:20], bytes(reversed(frame[20:]))
+    write_bytes(qt, 0x00102000, part1)
+    write_bytes(qt, 0x00103000, part2)
+    tx_desc(qt, 1, 0x00102000, len(part1), (1 << 29))              # FD
+    tx_desc(qt, 2, 0x00103000, len(part2), (1 << 28))              # LD
+    qt.writel(ETH + 0x1100 + 0x20, 0x00100020)
+    qt.writel(ETH + 0x1100 + 0x20, 0x00100030)
+    qt.cmd('clock_step 1000')
+    data = open(pcap, 'rb').read()
+    check('a frame split across tail writes goes out whole',
+          (part1 + part2) in data, True)
+
+    # Over-long: 2 x 8000 bytes, more than the MAC takes
+    tx_desc(qt, 3, 0x00110000, 8000, (1 << 29))
+    tx_desc(qt, 0, 0x00110000, 8000, (1 << 28))
+    qt.writel(ETH + 0x1100 + 0x20, 0x00100010)
+    check('an over-long frame is dropped with ES / JT',
+          qt.readl(0x0010000C) & 0xC000, 0xC000)
+
+
+def write_bytes(qt, addr, data):
+    for i in range(0, len(data), 4):
+        qt.writel(addr + i,
+                  int.from_bytes(data[i:i + 4].ljust(4, b'\0'), 'little'))
+
+
+def tx_desc(qt, idx, buf, length, flags):
+    a = 0x00100000 + 16 * idx
+    qt.writel(a, buf)
+    qt.writel(a + 4, 0)
+    qt.writel(a + 8, length)
+    qt.writel(a + 12, (1 << 31) | flags | length)
+
+
+MAC = bytes.fromhex('525400123456')
+
+
+def test_eqos_rx(qt, sock, port):
+    print('nvt-eqos receive')
+    ring, bufs = 0x00200000, 0x00210000
+    qt.writel(ETH + 0x300, 0x80000000 | MAC[4] | (MAC[5] << 8))
+    qt.writel(ETH + 0x304, int.from_bytes(MAC[:4], 'little'))
+    for i in range(4):
+        qt.writel(ring + 16 * i, bufs + 0x100 * i)
+        qt.writel(ring + 16 * i + 12, (1 << 31) | (1 << 30) | (1 << 24))
+    qt.writel(ETH + 0x1100 + 0x1C, ring)                    # RDLAR
+    qt.writel(ETH + 0x1100 + 0x30, 3)                       # 4 descriptors
+    qt.writel(ETH + 0x1100 + 0x28, ring + 0x30)             # tail: desc 3
+    qt.writel(ETH + 0x0000, 3)
+    qt.writel(ETH + 0x1100 + 0x08, 1 | (64 << 1))           # SR, RBSZ 64
+
+    def send(frame):
+        sock.sendto(frame, ('127.0.0.1', port))
+        for _ in range(20):
+            qt.cmd('clock_step 1000000')
+
+    def rdes3(i):
+        return qt.readl(ring + 16 * i + 12)
+
+    other = bytes.fromhex('020000000001') + MAC + b'\x08\x00' + bytes(50)
+    send(other)
+    check('a frame for another station is filtered out',
+          rdes3(0) >> 31, 1)
+    big = MAC + bytes.fromhex('020000000002') + b'\x08\x00' + \
+        bytes(range(86))
+    send(big)
+    check('a 100-byte frame spans two 64-byte buffers: FD on the first',
+          rdes3(0) & 0xB0000000, 0x20000000)
+    check('LD and the frame length on the second',
+          rdes3(1) & 0xB0007FFF, 0x10000000 | len(big))
+    got = b''.join(qt.readl(bufs + i).to_bytes(4, 'little')
+                   for i in range(0, 64, 4)) + \
+        b''.join(qt.readl(bufs + 0x100 + i).to_bytes(4, 'little')
+                 for i in range(0, 36, 4))
+    check('and the bytes are the frame', got[:len(big)], big)
+    small = MAC + bytes.fromhex('020000000003') + b'\x08\x00' + bytes(30)
+    send(small)
+    check('the next frame takes descriptor 2', rdes3(2) >> 28 & 3, 3)
+    send(small)
+    check('descriptor 3 is the tail: the DMA stops short of it',
+          rdes3(3) >> 31, 1)
+    qt.writel(ETH + 0x1100 + 0x28, ring)                    # tail: desc 0
+    for _ in range(20):
+        qt.cmd('clock_step 1000000')
+    check('and fills it once the tail moves on', rdes3(3) >> 28 & 3, 3)
+
 
 def find_nodes(dtb, names):
     """Offsets of FDT_BEGIN_NODE tokens naming these nodes, -1 if absent."""
@@ -741,6 +831,23 @@ def main():
         test_eqos(qt, pcap)
     finally:
         qt.close()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('127.0.0.1', 0))
+    peer = sock.getsockname()[1]
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(('127.0.0.1', 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    qt = QTest(args.qemu, 'nt98562',
+               ['-netdev', 'socket,id=n0,udp=127.0.0.1:%d,'
+                'localaddr=127.0.0.1:%d' % (peer, port),
+                '-nic', 'none', '-global', 'nvt-eqos.netdev=n0'])
+    try:
+        test_eqos_rx(qt, sock, port)
+    finally:
+        qt.close()
+        sock.close()
 
     qt = QTest(args.qemu, 'nt98566')
     try:

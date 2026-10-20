@@ -52,7 +52,12 @@ if [ ! -f "$KERNEL" ] || [ ! -f "$ROOTFS" ]; then
 fi
 
 WORK=$(mktemp -d)
-trap '[ -n "${KEEP:-}" ] || rm -rf "$WORK"' EXIT
+HTTP_PID=
+cleanup() {
+    [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null
+    [ -n "${KEEP:-}" ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 # The OpenIPC 8 MiB NOR layout: 256k(boot),64k(env),2048k(kernel),
 # 5120k(rootfs),-(rootfs_data).
@@ -139,7 +144,6 @@ timeout 180 "$QEMU" -M "$MACHINE,flash-file=$NOR" -nographic -monitor none \
     > "$WORK/console.log" 2>&1
 rc=$?
 set -e
-kill "$HTTP_PID" 2>/dev/null || true
 cat "$WORK/console.log"
 
 fail=0
