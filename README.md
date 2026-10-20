@@ -5,7 +5,7 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 2 Goke GK710x (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7)
+- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
 ## Supported Machines (61 total)
@@ -138,6 +138,8 @@ resets a minute later.
 |---------|-----|-----|--------|-------------|
 | `gk7101` | ARM1176, 128 MB | 2× VIC (PL190-shaped) | 3.4.43 vendor | —¹ |
 | `gk7102` | ARM1176, 64 MB in package | 2× VIC (PL190-shaped) | 3.4.43 vendor | yes |
+| `gk7101s` | ARM1176, 128 MB | 2× VIC | 3.4.43 vendor | —¹ |
+| `gk7102s` | ARM1176, 64 MB (GK7102S, GK7102C) | 2× VIC | 3.4.43 vendor | yes |
 
 Goke's own first SoC, unrelated to the HiSilicon-derived GK7205 line above:
 Ambarella A5s IP (VIC, timers, watchdog, IDC I2C), a 16550, a Synopsys GMAC
@@ -157,7 +159,17 @@ with `-kernel`/`-initrd` given a vendor HAL to load —
 `qemu-boot/run-gk7102.sh` — since the kernel calls into it. `sensor=jxh42`
 (or `jxh62`, `f37`) puts an SOI sensor on I2C 0.
 
-¹ `gk7101` is the same die and models; no GK7101 image was at hand.
+`gk7101s`/`gk7102s` are the later S die (the GK7102C cameras are this
+family): the same IP at the drivers' own 0x9000_0000 / 0xA000_0000 map and
+register layouts, which the vendor kernel uses directly. They reuse the
+GK710x models behind `gk-remap`, plus a DMA controller the GK7102C U-Boot
+tests at start. A GK7102C camera dump boots through its U-Boot and kernel
+to the vendor application and `login:` with
+`-M gk7102s,flash-file=<image in chip byte order>`
+(`qemu-boot/run-gk7102s.sh` converts a software dump).
+
+¹ `gk7101`/`gk7101s` are the same dies and models with 128 MiB; no image of
+either was at hand.
 
 ### Anyka AK39xx family (`qemu-system-arm`)
 
@@ -312,6 +324,8 @@ qemu/
 ├── hw/misc/gk-sflash.c          # Goke SPI-NOR controller (flash-file)
 ├── hw/misc/gk-ephy.c            # Internal Ethernet PHY, memory-mapped MII
 ├── hw/i2c/gk-idc.c              # Ambarella IDC I2C master
+├── hw/misc/gk-remap.c           # GK710xS register layouts over the GK710x models
+├── hw/misc/gk-dma.c             # GK710xS DMA controller (descriptor chains)
 ├── hw/arm/anyka.c               # Anyka AK39xx machines, synthetic mask ROM
 ├── hw/misc/ak-sysctrl.c         # AK39 SYSCTRL: chip ID, IRQ controller, timers, WDT, RTC
 ├── hw/misc/ak-l2.c              # L2 buffer SRAM + DMA (UART / SPI data path)

@@ -89,6 +89,12 @@ jobs:
       - name: Goke GK710x devices (gk-sflash, gk-vic, gk-idc, ...)
         run: python3 qemu/tests/test-gk710x.py
 
+      # The GK7102S / GK7102C machine: the same models in the S register
+      # layouts the vendor drivers use directly (gk-remap), its boot
+      # header, and the DMA controller the GK7102C U-Boot checks.
+      - name: Goke GK710xS devices (gk-remap, gk-dma)
+        run: python3 qemu/tests/test-gk710xs.py
+
       # The Anyka AK39xx models driven over qtest the way the vendor drivers
       # drive them: mask-ROM staging of the boot header, timer into the
       # two-level interrupt controller, UART and SPI through L2 memory
