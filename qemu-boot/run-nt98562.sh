@@ -18,16 +18,26 @@
 # FLASH=image.bin boots a whole flash image instead, the way the chip does:
 # the machine's boot ROM loads the vendor U-Boot from it.  A Novatek SDK
 # update package (FW9856xA.bin) becomes one with
-# qemu-boot/nvtpack2flash.py.  Ethernet is not modelled yet (docs/novatek.md).
+# qemu-boot/nvtpack2flash.py.  Networking is bridged TAP when tap0 exists
+# (qemu-boot/net-setup.sh), else SLIRP.
 #
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 QEMU="$REPO_ROOT/qemu-src/build/qemu-system-arm"
 SOC="${SOC:-nt98562}"
 
+TAP="${TAP:-tap0}"
+if ip link show "$TAP" &>/dev/null; then
+    NIC_ARGS="-nic tap,ifname=$TAP,script=no,downscript=no"
+    echo "Using bridged TAP networking ($TAP)"
+else
+    NIC_ARGS="-nic user"
+    echo "TAP not available; using SLIRP user-mode networking"
+fi
+
 if [ -n "$FLASH" ]; then
     exec "$QEMU" -M "$SOC,flash-file=$FLASH" \
-        -nographic -serial mon:stdio \
+        -nographic -serial mon:stdio $NIC_ARGS \
         -d unimp,guest_errors -D "$SCRIPT_DIR/qemu-$SOC.log" \
         "$@"
 fi
@@ -62,7 +72,7 @@ fi
 
 exec "$QEMU" -M "$SOC,flash-file=$NOR" \
     -kernel "$KERNEL" \
-    -nographic -serial mon:stdio \
+    -nographic -serial mon:stdio $NIC_ARGS \
     -append "console=ttyS0,115200 root=/dev/mtdblock3 rootfstype=squashfs mtdparts=spi_nor.0:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)" \
     -d unimp,guest_errors -D "$SCRIPT_DIR/qemu-$SOC.log" \
     "$@"

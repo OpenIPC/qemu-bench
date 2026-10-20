@@ -17,6 +17,9 @@
 #     payload flashcp'd onto it (DMA page programs) and 100 bytes dd'd at
 #     256 KiB four at a time (PIO), all of which the host then finds byte
 #     for byte in the image file, the rest still erased;
+#   - Ethernet (nvt-eqos under the vendor DWC_ETH_QOS driver): a DHCP
+#     lease from QEMU's user network, then a 1 MiB file fetched over HTTP
+#     from the host (guestfwd), checksummed against the original;
 #   - "reboot -f": the kernel's reboot notifier arms the RTC power-on
 #     alarm and powers off, which resets the machine, and -no-reboot turns
 #     that into a clean exit.
@@ -79,6 +82,20 @@ cp "$WORK/rootfs/bin/busybox" "$WORK/initramfs/bin/"
 cp -a "$WORK/rootfs/lib/libc.so" "$WORK/rootfs/lib/ld-musl-armhf.so.1" \
     "$WORK/initramfs/lib/"
 cp "$WORK/payload.bin" "$WORK/pio.bin" "$WORK/initramfs/"
+mkdir -p "$WORK/www"
+head -c 1048576 /dev/urandom > "$WORK/www/blob.bin"
+BLOB_MD5=$(md5sum < "$WORK/www/blob.bin" | cut -d' ' -f1)
+HTTP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$WORK/www" \
+    >/dev/null 2>&1 &
+HTTP_PID=$!
+cat > "$WORK/initramfs/udhcpc.sh" <<'DHCP'
+#!/bin/sh
+[ "$1" = bound ] || exit 0
+/bin/busybox ifconfig "$interface" "$ip" netmask "$subnet"
+/bin/busybox route add default gw "$router"
+DHCP
+chmod +x "$WORK/initramfs/udhcpc.sh"
 # The watchdog driver is a module (CONFIG_NA51055_WATCHDOG=m).
 if [ -n "$WDT_KO" ]; then
     cp "$WORK/rootfs/$WDT_KO" "$WORK/initramfs/lib/"
@@ -102,9 +119,14 @@ echo "NVT-ROOTFS-MD5: $($bb dd if=/dev/mtdblock3 bs=64k 2>/dev/null | $bb md5sum
 $bb flash_eraseall /dev/mtd4 >/dev/null 2>&1 && echo "NVT-ERASE: ok"
 $bb flashcp -v /payload.bin /dev/mtd4 >/dev/null 2>&1 && echo "NVT-FLASHCP: ok"
 $bb dd if=/pio.bin of=/dev/mtd4 bs=4 seek=65536 2>/dev/null && echo "NVT-PIO: ok"
+$bb ifconfig lo up
+$bb ifconfig eth0 up
+$bb udhcpc -i eth0 -n -q -t 5 -s /udhcpc.sh >/dev/null 2>&1 && echo "NVT-DHCP: ok"
+echo "NVT-HTTP-MD5: $($bb wget -q -O - http://10.0.2.100:@PORT@/blob.bin | $bb md5sum)"
 echo "NVT-BOOT-OK"
 $bb reboot -f
 INIT
+sed -i "s/@PORT@/$HTTP_PORT/" "$WORK/initramfs/init"
 chmod +x "$WORK/initramfs/init"
 (cd "$WORK/initramfs" && find . | cpio -o -H newc 2>/dev/null) > "$WORK/initramfs.cpio"
 
@@ -113,9 +135,11 @@ set +e
 timeout 180 "$QEMU" -M "$MACHINE,flash-file=$NOR" -nographic -monitor none \
     -serial stdio -no-reboot -kernel "$KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
+    -nic user,restrict=on,guestfwd=tcp:10.0.2.100:$HTTP_PORT-tcp:127.0.0.1:$HTTP_PORT \
     > "$WORK/console.log" 2>&1
 rc=$?
 set -e
+kill "$HTTP_PID" 2>/dev/null || true
 cat "$WORK/console.log"
 
 fail=0
@@ -156,6 +180,8 @@ else
     echo "FAIL: the image file does not hold the payload"
     fail=1
 fi
+expect 'NVT-DHCP: ok' 'DHCP lease over nvt-eqos'
+expect "NVT-HTTP-MD5: $BLOB_MD5" '1 MiB over HTTP, intact'
 expect 'NVT-BOOT-OK' 'PID 1 ran to the end'
 expect 'restarting\.\.\.\.\.' 'reboot reached the vendor notifier'
 if [ $rc -ne 0 ]; then

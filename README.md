@@ -245,7 +245,8 @@ scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
-¹ Ethernet is not modelled yet.
+¹ Ethernet works from the kernel (DHCP, a file over HTTP); the vendor
+U-Boot's network path is untested.
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -385,6 +386,7 @@ qemu/
 ├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
 ├── hw/ssi/nvt-flash.c           # SPI NOR controller (operation sequencer, flash-file)
 ├── hw/sd/nvt-sdio.c             # SDIO hosts with an empty slot
+├── hw/net/nvt-eqos.c            # DWC Ethernet QoS (GMAC 4.x) + embedded PHY
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
@@ -406,7 +408,7 @@ qemu-boot/
 ├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
 ├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR image
-├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script, NOR r/w, reboot
+├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map

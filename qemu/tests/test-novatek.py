@@ -27,6 +27,11 @@ plays the vendor drivers (docs/novatek.md):
     BCL1/LZ-packed "U-Boot") leaves U-Boot unpacked at
     /nvt_memory_cfg/uboot, the device tree and the "LD_NVT" SHMINFO where
     the tree says, and a branch at 0; an image with no tree is refused;
+  - nvt-eqos: the embedded PHY over MDIO, the HW feature bits the driver
+    keys on (MDIO present, one queue), the software reset, the Rx DMA
+    state yinit() polls for, a frame sent through a Tx descriptor (seen in
+    a filter-dump pcap) with its write-back and interrupt, and the
+    Novatek ETH_ISR summary the ISR checks first;
   - the 16550 UART at its reg-shift-2 offsets;
   - the generated device tree: compatible, the clock nodes in the order
     of_clk_init() needs, the pinmux children in the driver's order;
@@ -51,10 +56,12 @@ RTC = 0xF0060000
 GPIO = 0xF0070000
 UART0 = 0xF0290000
 FLASH = 0xF0400000
+ETH = 0xF02B0000
 GICD = 0xFFD01000
 
 SPI_GPIO = 24
 SPI_FLASH = 29
+SPI_ETH = 34
 SPI_RTC = 56
 SPI_WDT = 57
 
@@ -592,9 +599,64 @@ def test_boot_rom(qemu, tmp):
     refused(bad, 'a BCL1 header declaring 3.75 GiB is refused')
 
 
+# ---- nvt-eqos ----------------------------------------------------------
+
+def mdio_read(qt, phy, reg):
+    qt.writel(ETH + 0x200, (phy << 21) | (reg << 16) | (3 << 2) | 1)
+    check('MDIO read %d completes' % reg, qt.readl(ETH + 0x200) & 1, 0)
+    return qt.readl(ETH + 0x204) & 0xFFFF
+
+
+def test_eqos(qt, pcap):
+    print('nvt-eqos')
+    gic_enable(qt, SPI_ETH)
+    check('HW_FEATURE0: MII and MDIO (SMASEL)',
+          qt.readl(ETH + 0x11C) & 0x21, 0x21)
+    check('HW_FEATURE2: one Tx and one Rx queue', qt.readl(ETH + 0x124), 0)
+    check('BMSR at PHY 1: link up, autoneg done',
+          mdio_read(qt, 1, 1) & 0x24, 0x24)
+    check('no PHY at address 0', mdio_read(qt, 0, 1), 0xFFFF)
+
+    qt.writel(ETH + 0x1000, 1)
+    check('DMA software reset is immediate', qt.readl(ETH + 0x1000) & 1, 0)
+
+    # One Tx descriptor at 0x00100000, a 60-byte frame at 0x00101000
+    frame = bytes.fromhex('ffffffffffff525400123456') + b'\x08\x06' + \
+        bytes(range(46))
+    for i in range(0, len(frame), 4):
+        qt.writel(0x00101000 + i,
+                  int.from_bytes(frame[i:i + 4].ljust(4, b'\0'), 'little'))
+    qt.writel(0x00100000, 0x00101000)                       # TDES0
+    qt.writel(0x00100004, 0)                                # TDES1
+    qt.writel(0x00100008, (1 << 31) | len(frame))           # IOC, length
+    qt.writel(0x0010000C, (1 << 31) | (1 << 29) | (1 << 28) | len(frame))
+    qt.writel(ETH + 0x1100 + 0x14, 0x00100000)              # TDLAR
+    qt.writel(ETH + 0x1100 + 0x2C, 3)                       # 4 descriptors
+    qt.writel(ETH + 0x1100 + 0x34, (1 << 15) | 1)           # NIE, TIE
+    qt.writel(ETH + 0x0000, 3)                              # TE, RE
+    qt.writel(ETH + 0x1100 + 0x04, 1)                       # ST
+    qt.writel(ETH + 0x1100 + 0x08, 1)                       # SR
+    check('Rx DMA running, waiting for a packet (RPS0 = 3)',
+          (qt.readl(ETH + 0x100C) >> 8) & 0xF, 3)
+    qt.writel(ETH + 0x1100 + 0x20, 0x00100010)              # tail: 1 desc
+    tdes3 = qt.readl(0x0010000C)
+    check('Tx write-back: OWN clear, FD/LD, no error bits',
+          tdes3, (1 << 29) | (1 << 28))
+    check('TI in the channel status', qt.readl(ETH + 0x1160) & 1, 1)
+    check('SPI 34 pending', gic_pending(qt, SPI_ETH), True)
+    check('ETH_ISR summarises it',
+          (qt.readl(ETH + 0x3008) & 0x3F) != 0, True)
+    qt.writel(ETH + 0x1160, 1)
+    check('write-1-to-clear releases it', gic_pending(qt, SPI_ETH), False)
+    check('and ETH_ISR with it', qt.readl(ETH + 0x3008), 0)
+    qt.cmd('clock_step 1000')
+    data = open(pcap, 'rb').read()
+    check('the frame went out on the wire', frame in data, True)
+
+
 def find_nodes(dtb, names):
-    pos = [dtb.find(n.encode() + b'\0') for n in names]
-    return pos
+    """Offsets of FDT_BEGIN_NODE tokens naming these nodes, -1 if absent."""
+    return [dtb.find(b'\0\0\0\x01' + n.encode() + b'\0') for n in names]
 
 
 def test_fdt(qemu, tmp):
@@ -668,6 +730,17 @@ def main():
     finally:
         qt.close()
     test_boot_rom(args.qemu, tmp)
+
+    pcap = os.path.join(tmp, 'eth.pcap')
+    qt = QTest(args.qemu, 'nt98562',
+               ['-netdev', 'user,id=n0,restrict=on',
+                '-nic', 'none',
+                '-global', 'nvt-eqos.netdev=n0',
+                '-object', 'filter-dump,id=d0,netdev=n0,file=' + pcap])
+    try:
+        test_eqos(qt, pcap)
+    finally:
+        qt.close()
 
     qt = QTest(args.qemu, 'nt98566')
     try:
