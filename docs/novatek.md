@@ -4,8 +4,8 @@ Novatek's NT9856x IP-camera SoCs (internal name NA51089): one Cortex-A9
 with DDR in the package and Novatek's own peripheral blocks from
 `0xF0000000`. One machine file (`hw/arm/novatek.c`) covers the family with a
 table entry per part. It boots the OpenIPC `nt98562_lite` / `nt98566_lite`
-kernel with its root on the emulated SPI NOR, and boots a whole flash image
-through the vendor U-Boot. Ethernet comes next; see
+kernel with its root on the emulated SPI NOR and Ethernet up, and boots a
+whole flash image through the vendor U-Boot. What is left is in
 [Not modelled](#not-modelled).
 
 ## What the SDKs support
@@ -51,7 +51,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | RTC + power button | `0xF0060000` | 56 | `nvt-rtc` |
 | GPIO | `0xF0070000` | 24 | `nvt-gpio` |
 | UART1 / 2 / 3 | `0xF0290000` / `0xF0300000` / `0xF0310000` | 43 / 44 / 45 | 16550, reg-shift 2 |
-| Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | — |
+| Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
 | SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR) |
 | SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio` (empty slot) |
 | USB 2.0 | `0xF0600000` | 27 | — |
@@ -192,6 +192,41 @@ strips the 64-byte CKSM header from the rootfs and app images. Booted with
 U-Boot 2019.04 (SPI NOR probed, empty SD slot, `nvt_boot`), the kernel and
 the vendor init scripts.
 
+## Ethernet
+
+`nvt-eqos` is the 16 KiB block at `0xF02B0000`: a Synopsys DWC Ethernet QoS
+(GMAC 4.x) core at 0x0000 (MAC), 0x0C00 (MTL) and 0x1000 (DMA, channel 0 at
+0x1100), the Novatek glue at 0x3000 and the embedded PHY's analog block at
+0x3800. The kernel driver is the Synopsys reference driver (`DWC_ETH_QOS`,
+built in as `ntkimethmac`), and these are the points it depends on:
+
+- **MDIO.** HW_FEATURE0 must advertise it (SMASEL, bit 5); without it the
+  driver prints "MDIO is not present" and runs with no PHY. It then scans
+  for the first address whose BMSR is neither 0 nor 0xFFFF. The model has a
+  generic 100 Mb/s PHY at address 1 with the link up, and phylib binds
+  genphy to it.
+- **Queues.** HW_FEATURE2 reads 0: one Tx and one Rx queue, so only DMA
+  channel 0 is modelled.
+- **Rx state.** `DWC_ETH_QOS_yinit()` polls DMA_DEBUG_STATUS0 until RPS0
+  reads 3 ("running, waiting for a packet") and re-initializes the core
+  until it does.
+- **ETH_ISR.** The ISR first reads ETH_ISR, glue register 0x3008, and
+  returns IRQ_NONE unless its low 6 bits are set. A model that leaves it 0
+  gets an interrupt storm. It reads the core's interrupt line in bit 0.
+- **Descriptors.** Descriptors are four words with OWN in DES3 bit 31. Tx
+  write-back keeps only FD and LD in TDES3, whose low half is error flags in
+  that format. Rx write-back carries the length without the FCS, because the
+  driver does not strip it.
+- **Rx interrupts.** The driver sets IOC on only some Rx descriptors and
+  leaves the rest to the Rx watchdog (RIWT). RI is raised for every frame
+  while RIWT is set.
+
+Whether the board is wired for RMII or the embedded PHY comes from the
+pinmux (`eth` = 0x22 on the EVB: the embedded PHY), and the driver's
+power-on writes to the 0x3800 block are kept as storage.
+`test-novatek-boot.sh` takes a DHCP lease from `-nic user` and fetches a
+1 MiB file over HTTP, checksummed.
+
 ## Running
 
 ```bash
@@ -211,8 +246,8 @@ the boot matrix's `-initrd rootfs.squashfs root=/dev/ram0` does not apply.
 `test-novatek-boot.sh` boots the kernel into a small initramfs (busybox and
 an `/init` script) with the same NOR attached. The script checks the device
 tree, the clocksource, the pinctrl, GPIO, RTC and watchdog drivers and the
-MTD. It reads, erases and programs the flash, then runs `reboot -f` under
-`-no-reboot`.
+MTD. It reads, erases and programs the flash, takes a DHCP lease and
+fetches a file over HTTP, then runs `reboot -f` under `-no-reboot`.
 
 ## Not modelled
 
@@ -220,7 +255,8 @@ MTD. It reads, erases and programs the flash, then runs `reboot -f` under
   trains DDR from its ConfigRAM table with closed libraries
   (`Reset_560.a`).
 - An SD card: the SDIO hosts answer as empty slots.
-- Ethernet: a DWC EQoS (GMAC 4.x) MAC. QEMU has no model of it, and
-  `xm-dwmac` is GMAC 3.x with a different descriptor format.
+- Ethernet in the vendor U-Boot (`eth_na51089.c`), which is untested, and
+  the EQoS features the driver leaves off: checksum offload, TSO,
+  timestamps, more queues.
 - USB, the Novatek timer, PWM, I2C, crypto/OTP, and the HDAL media
   blocks.

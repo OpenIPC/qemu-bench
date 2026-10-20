@@ -24,6 +24,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/ssi/nvt-flash.h"
 #include "hw/sysbus.h"
+#include "net/net.h"
 #include "system/address-spaces.h"
 #include "system/device_tree.h"
 #include "system/system.h"
@@ -41,12 +42,14 @@
 #define NVT_RTC_BASE        0xF0060000
 #define NVT_GPIO_BASE       0xF0070000
 #define NVT_FLASH_BASE      0xF0400000
+#define NVT_ETH_BASE        0xF02B0000
 #define NVT_MPCORE_BASE     0xFFD00000
 #define NVT_L2_BASE         0xFFE00000
 
 /* GIC SPI numbers (nvt-peri.dtsi) */
 #define NVT_IRQ_GPIO        24
 #define NVT_IRQ_FLASH       29
+#define NVT_IRQ_ETH         34
 #define NVT_IRQ_RTC         56
 #define NVT_IRQ_WDT         57
 #define NVT_IRQ_L2          96
@@ -324,6 +327,16 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
     qemu_fdt_setprop_cell(fdt, path, "clock-frequency", 48000000);
     qemu_fdt_setprop_string(fdt, path, "nvt-devname", "spi_nor.0");
     qemu_fdt_setprop_cell(fdt, path, "trace-stdtable", 1);
+
+    /* The MAC, its Novatek glue and the embedded PHY in one 16 KiB block;
+     * the vendor node maps the first 0x3800 and reaches past it. */
+    qemu_fdt_add_subnode(fdt, "/eth@f02b0000");
+    qemu_fdt_setprop_string(fdt, "/eth@f02b0000", "compatible",
+                            "nvt,synopsys_eth");
+    qemu_fdt_setprop_cells(fdt, "/eth@f02b0000", "reg", NVT_ETH_BASE, 0x3800);
+    nvt_fdt_irq(fdt, "/eth@f02b0000", NVT_IRQ_ETH);
+    qemu_fdt_setprop_cell(fdt, "/eth@f02b0000", "sp-clk", 0);
+    qemu_fdt_setprop_cell(fdt, "/eth@f02b0000", "ref-clk-out", 0);
 
     qemu_fdt_add_subnode(fdt, "/wdt@f0050000");
     qemu_fdt_setprop_string(fdt, "/wdt@f0050000", "compatible",
@@ -615,6 +628,12 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_GPIO_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_GPIO]);
+
+    dev = qdev_new("nvt-eqos");
+    qemu_configure_nic_device(dev, true, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_ETH_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_ETH]);
 
     /* Empty SD slots: U-Boot looks for an update image on the card. */
     for (n = 0; n < ARRAY_SIZE(nvt_sdio); n++) {

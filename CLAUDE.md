@@ -221,6 +221,9 @@ boot matrix. A `flash-file` without `-kernel` boots through a stand-in for
 the closed loader: FDT from flash 0x10000, a BCL1/LZ-packed U-Boot unpacked
 to `nvt_memory_cfg/uboot`, and the `LD_NVT` SHMINFO U-Boot hangs without.
 SDK `FW*.bin` packages become flash images with `qemu-boot/nvtpack2flash.py`.
+Its Ethernet (`hw/net/nvt-eqos.c`) is a DWC EQoS 4.x under the Synopsys
+reference driver, which needs HW_FEATURE0's MDIO bit to look for a PHY and
+returns IRQ_NONE unless the Novatek glue's ETH_ISR (+0x3008) is non-zero.
 Do not run a flash boot under `-d unimp -D` into `/tmp` (a tmpfs): a
 firmware polling an unmodelled block fills it in seconds.
 
