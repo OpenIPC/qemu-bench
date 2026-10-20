@@ -82,6 +82,11 @@ jobs:
       - name: XM510 GPIO (xm510-gpio)
         run: python3 qemu/tests/test-xm510-gpio.py
 
+      # The XM510/XM530 watchdog: SP805 identity, so Linux's sp805_wdt
+      # binds; fed it stays armed, unfed it resets the machine.
+      - name: XM SP805 watchdog (arm-sp805)
+        run: python3 qemu/tests/test-xm-sp805.py
+
       # The GK710x models driven over qtest at the silicon addresses the
       # vendor HAL drives: boot-ROM header, SPI-NOR byte order and
       # write-back, timer edge into the VIC, I2C to a sensor, watchdog.
