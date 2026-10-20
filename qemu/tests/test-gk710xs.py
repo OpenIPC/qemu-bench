@@ -301,7 +301,7 @@ SD_DMA_ADDR, SD_XFR, SD_BLK_CNT, SD_BLK_SZ, SD_NIS, SD_EIS = \
     0x00, 0x04, 0x0A, 0x0C, 0x12, 0x14
 SD_CMD, SD_RESET, SD_CLK, SD_RSP0, SD_PWR, SD_STA, SD_ARG, SD_CAP = \
     0x16, 0x19, 0x1A, 0x1C, 0x2D, 0x30, 0x34, 0x38
-SD_NISEN = 0x0E
+SD_NISEN, SD_DATA = 0x0E, 0x40
 RSP_NONE, RSP_136, RSP_48, RSP_48BUSY = 0, 1, 2, 3
 CMD_CHKCRC, CMD_DATA, CMD_CHKIDX = 0x08, 0x10, 0x20
 XFR_BLKCNT_EN, XFR_DMA_EN, XFR_MUL_SEL, XFR_CTH_SEL = 0x01, 0x04, 0x10, 0x20
@@ -376,6 +376,38 @@ def test_sd_card(qemu, card, sector0):
         check('sector 0 read by SDMA into RAM', got == sector0, True)
         check('XFR reads back in S bits', qt.readw(SD + SD_XFR),
               XFR_DMA_EN | XFR_BLKCNT_EN | XFR_CTH_SEL)
+
+        # A byte write to a write-1-to-clear status register clears only
+        # the bits it writes: 0 into NIS's high byte leaves CMD_DONE.
+        qt.writel(SD + SD_ARG, rca << 16)
+        qt.writew(SD + SD_CMD, 13 << 8 | r48)
+        check('CMD13: CMD_DONE pending', qt.readw(SD + SD_NIS) & NIS_CMD_DONE,
+              NIS_CMD_DONE)
+        qt.writeb(SD + SD_NIS + 1, 0)
+        check('NIS high-byte write keeps CMD_DONE',
+              qt.readw(SD + SD_NIS) & NIS_CMD_DONE, NIS_CMD_DONE)
+        qt.writeb(SD + SD_NIS, NIS_CMD_DONE)
+        check('NIS low-byte write clears CMD_DONE',
+              qt.readw(SD + SD_NIS) & NIS_CMD_DONE, 0)
+        qt.writew(SD + SD_NIS, 0xFFFF)
+
+        # A halfword write of host control leaves power control, which
+        # sits in the same model word, as it was.
+        qt.writew(SD + 0x2C, 0x0002)                # 4-bit bus
+        check('CONTROL00 halfword write keeps PWR', qt.readb(SD + SD_PWR),
+              0x0F)
+        check('CONTROL00 halfword write lands', qt.readb(SD + 0x2C) & 0x2, 0x2)
+        qt.writew(SD + 0x2C, 0x0000)
+
+        # Byte reads of the data port take one byte each, not a word.
+        qt.writew(SD + SD_BLK_SZ, 512)
+        qt.writew(SD + SD_BLK_CNT, 1)
+        qt.writew(SD + SD_XFR, XFR_BLKCNT_EN | XFR_CTH_SEL)
+        sd_cmd(qt, 17, 0, r48 | CMD_DATA)
+        got = bytes(qt.readb(SD + SD_DATA + i) for i in range(4))
+        got += struct.pack('<I', qt.readl(SD + SD_DATA))
+        check('PIO: byte reads, then a word, of the data port',
+              got == sector0[:8], True)
     finally:
         qt.close()
 

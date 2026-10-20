@@ -65,6 +65,8 @@ typedef struct GkRemapReg {
     uint8_t size;           /* 1, 2 or 4 bytes, the same on both sides
                              * (0: 4); a 1-byte row is used only by byte
                              * accesses */
+    bool w1c;               /* write 1 to clear: a partial write leaves
+                             * the other bytes 0, not their value */
 } GkRemapReg;
 
 /* Generated from the GK710x HAL 20160913. */
@@ -196,49 +198,49 @@ static const GkRemapReg gk_remap_vic[] = {
 };
 
 static const GkRemapReg gk_remap_sdio[] = {
-    { .off = 0x00, .model = 0x00, .size = 4 },	/* SDMA address */
+    { .off = 0x00, .model = 0x00, .size = 4 }, /* SDMA address */
     /* S sd.h: bit 4 MUL_SEL, bit 5 CTH_SEL (card to host) -- the GK710x
      * one has them the other way round, which this row composes in. */
-    { .off = 0x04, .model = 0x0c, .size = 2, .perm = true,	/* MOD: transfer mode */
+    { .off = 0x04, .model = 0x0c, .size = 2, .perm = true, /* MOD: transfer mode */
       .w = { 1, 2, 0, -1, 5, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 2, 0, 1, -1, 5, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x06, .model = 0x38, .size = 2 },	/* NOR_INT_SIG_EN */
-    { .off = 0x08, .model = 0x3a, .size = 2, .perm = true,	/* ERR_INT_SIG_EN */
+    { .off = 0x06, .model = 0x38, .size = 2 }, /* NOR_INT_SIG_EN */
+    { .off = 0x08, .model = 0x3a, .size = 2, .perm = true, /* ERR_INT_SIG_EN */
       .w = { 0, 2, 3, 4, 1, 5, 6, 7, 8, -1, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 4, 1, 2, 3, 5, 6, 7, 8, -1, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x0a, .model = 0x06, .size = 2 },	/* BLK_COU: block count */
-    { .off = 0x0c, .model = 0x04, .size = 2 },	/* BLK_SIZ: block size */
-    { .off = 0x0e, .model = 0x34, .size = 2 },	/* NOR_INT_STA_EN */
-    { .off = 0x10, .model = 0x36, .size = 2, .perm = true,	/* ERR_INT_STA_EN */
+    { .off = 0x0a, .model = 0x06, .size = 2 }, /* BLK_COU: block count */
+    { .off = 0x0c, .model = 0x04, .size = 2 }, /* BLK_SIZ: block size */
+    { .off = 0x0e, .model = 0x34, .size = 2 }, /* NOR_INT_STA_EN */
+    { .off = 0x10, .model = 0x36, .size = 2, .perm = true, /* ERR_INT_STA_EN */
       .w = { 0, 2, 1, 3, 5, 4, 6, 7, 8, -1, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 2, 1, 3, 5, 4, 6, 7, 8, -1, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x12, .model = 0x30, .size = 2, .perm = true,	/* NOR_INT_STA */
+    { .off = 0x12, .model = 0x30, .size = 2, .perm = true, .w1c = true, /* NOR_INT_STA */
       .w = { 0, 2, 3, 1, 4, 6, 5, 7, 8, 9, -1, -1, -1, -1, -1, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 3, 1, 2, 4, 6, 5, 7, 8, 9, -1, -1, -1, -1, -1, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x14, .model = 0x32, .size = 2 },	/* ERR_INT_STA */
-    { .off = 0x16, .model = 0x0e, .size = 2, .perm = true,	/* COMM: command */
+    { .off = 0x14, .model = 0x32, .size = 2, .w1c = true }, /* ERR_INT_STA */
+    { .off = 0x16, .model = 0x0e, .size = 2, .perm = true, /* COMM: command */
       .w = { 0, 1, -1, 3, 5, 4, 6, 7, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 1, -1, 3, 5, 4, 6, 7, 8, 9, 10, 11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x18, .model = 0x2e, .size = 2 },	/* SF_RST_CTRL: timeout, reset */
-    { .off = 0x1a, .model = 0x2c, .size = 2 },	/* CLK_CTRL */
-    { .off = 0x1c, .model = 0x10, .size = 4 },	/* RESP0 */
-    { .off = 0x20, .model = 0x14, .size = 4 },	/* RESP1 */
-    { .off = 0x24, .model = 0x18, .size = 4 },	/* RESP2 */
-    { .off = 0x28, .model = 0x1c, .size = 4 },	/* RESP3 */
-    { .off = 0x2c, .model = 0x28, .size = 4, .perm = true,	/* CONTROL00: host control */
+    { .off = 0x18, .model = 0x2e, .size = 2 }, /* SF_RST_CTRL: timeout, reset */
+    { .off = 0x1a, .model = 0x2c, .size = 2 }, /* CLK_CTRL */
+    { .off = 0x1c, .model = 0x10, .size = 4 }, /* RESP0 */
+    { .off = 0x20, .model = 0x14, .size = 4 }, /* RESP1 */
+    { .off = 0x24, .model = 0x18, .size = 4 }, /* RESP2 */
+    { .off = 0x28, .model = 0x1c, .size = 4 }, /* RESP3 */
+    { .off = 0x2c, .model = 0x28, .size = 4, .perm = true, /* CONTROL00: host control */
       .w = { 0, 1, 3, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 1, 3, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x30, .model = 0x24, .size = 4, .perm = true,	/* PRESENTSTATE */
+    { .off = 0x30, .model = 0x24, .size = 4, .perm = true, /* PRESENTSTATE */
       .w = { 0, 2, 1, -1, -1, -1, -1, -1, 9, 10, 8, 11, -1, -1, -1, -1, 16, 18, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, -1, -1, -1 },
       .r = { 0, 2, 1, -1, -1, -1, -1, -1, 10, 8, 9, 11, -1, -1, -1, -1, 16, 18, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, -1, -1, -1 } },
-    { .off = 0x34, .model = 0x08, .size = 4 },	/* ARG */
-    { .off = 0x38, .model = 0x40, .size = 4, .perm = true,	/* CAP */
+    { .off = 0x34, .model = 0x08, .size = 4 }, /* ARG */
+    { .off = 0x38, .model = 0x40, .size = 4, .perm = true, /* CAP */
       .w = { 0, 1, 2, 3, 4, 5, -1, 7, 8, 9, 10, 11, 12, 13, -1, -1, 16, 17, 18, -1, -1, 21, 23, 22, 24, 25, 26, 27, -1, -1, -1, -1 },
       .r = { 0, 1, 2, 3, 4, 5, -1, 7, 8, 9, 10, 11, 12, 13, -1, -1, 16, 17, 18, -1, -1, 21, 23, 22, 24, 25, 26, 27, -1, -1, -1, -1 } },
-    { .off = 0x3c, .model = 0x3c, .size = 4, .perm = true,	/* AUTOCMD12ERRSTATUS */
+    { .off = 0x3c, .model = 0x3c, .size = 4, .perm = true, /* AUTOCMD12ERRSTATUS */
       .w = { 1, 2, 3, 0, 4, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 3, 0, 1, 2, 4, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x40, .model = 0x20, .size = 4 },	/* BUFFERDATAPORT */
+    { .off = 0x40, .model = 0x20, .size = 4 }, /* BUFFERDATAPORT */
     /*
      * The byte registers inside them, as byte accesses reach them: the
      * GK710x HAL's byte accessors decode these on their own, with their
@@ -246,33 +248,39 @@ static const GkRemapReg gk_remap_sdio[] = {
      * resets (CMD 1, ALL 2, DAT 4 on the vendor's side), host and power
      * control (sd.h "Byte" registers).
      */
-    { .off = 0x18, .model = 0x2e, .size = 1 },	/* TMO: data timeout */
-    { .off = 0x19, .model = 0x2f, .size = 1, .perm = true,	/* RESET (CMD 1, ALL 2, DAT 4) */
+    { .off = 0x18, .model = 0x2e, .size = 1 }, /* TMO: data timeout */
+    { .off = 0x19, .model = 0x2f, .size = 1, .perm = true, /* RESET (CMD 1, ALL 2, DAT 4) */
       .w = { 1, 0, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 1, 0, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x2c, .model = 0x28, .size = 1, .perm = true,	/* HOST: host control */
+    { .off = 0x2c, .model = 0x28, .size = 1, .perm = true, /* HOST: host control */
       .w = { 0, 1, 3, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 1, 3, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x2d, .model = 0x29, .size = 1 },	/* PWR: power control */
-    { .off = 0x2e, .model = 0x2a, .size = 1, .perm = true,	/* GAP: block gap control */
+    { .off = 0x2d, .model = 0x29, .size = 1 }, /* PWR: power control */
+    { .off = 0x2e, .model = 0x2a, .size = 1, .perm = true, /* GAP: block gap control */
       .w = { 0, 2, 1, 3, 7, 5, 6, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 0, 2, 1, 3, 7, 5, 6, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
-    { .off = 0x2f, .model = 0x2b, .size = 1, .perm = true,	/* WAK: wakeup control */
+    { .off = 0x2f, .model = 0x2b, .size = 1, .perm = true, /* WAK: wakeup control */
       .w = { 1, 0, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
       .r = { 1, 0, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 } },
 };
 
+/*
+ * narrow: the model takes byte and halfword accesses itself
+ * (generic-sdhci), so a partial access to a register whose bits are not
+ * permuted goes to it as it is, with no read of the whole register.
+ */
 static const struct {
     const char *name;
     const GkRemapReg *regs;
     int num_regs;
+    bool narrow;
 } gk_remap_blocks[] = {
     { "timer", gk_remap_timer, ARRAY_SIZE(gk_remap_timer) },
     { "wdt",   gk_remap_wdt,   ARRAY_SIZE(gk_remap_wdt) },
     { "idc",   gk_remap_idc,   ARRAY_SIZE(gk_remap_idc) },
     { "gmac",  gk_remap_gmac,  ARRAY_SIZE(gk_remap_gmac) },
     { "vic",   gk_remap_vic,   ARRAY_SIZE(gk_remap_vic) },
-    { "sdio",  gk_remap_sdio,  ARRAY_SIZE(gk_remap_sdio) },
+    { "sdio",  gk_remap_sdio,  ARRAY_SIZE(gk_remap_sdio), true },
 };
 
 struct GkRemapState {
@@ -286,6 +294,7 @@ struct GkRemapState {
     MemoryRegion *target_mr;
     const GkRemapReg *regs;
     int num_regs;
+    bool narrow;
 };
 
 /*
@@ -375,12 +384,42 @@ static void gk_remap_write_reg(GkRemapState *s, const GkRemapHit *h,
  * halfwords and words.  A read takes each register's bytes out of it.  A
  * write of a whole register writes it; a write of part of one merges its
  * bytes into the register's current value (a read of it, then a write of
- * the whole register).  The merge read is plain for the timer, watchdog,
- * IDC, GMAC and VIC models; on the SD controller a partial write of a
- * write-1-to-clear status register or of the data port would have the
- * read's effect too, which the vendor driver, using the registers' own
- * widths, never asks for.
+ * the whole register), or into 0 for a write-1-to-clear register, so
+ * only the bits written are cleared; for a permuted register the merge
+ * is into the model register's raw value (gk_remap_write_part).  The merge read is plain for the
+ * timer, watchdog, IDC, GMAC and VIC models.  On a narrow block a part of
+ * an unpermuted register is accessed in the model directly, so neither a
+ * read nor a write of part of the SD data port moves more data than it
+ * covers.
  */
+/*
+ * Part of a permuted register: merged into the model register's own value,
+ * so the model bits outside the bytes written -- those of the other driver
+ * bytes, and those the row does not pass at all (CONTROL00 carries only
+ * host control, and the power, gap and wakeup bytes beside it in the
+ * model's word) -- stay as they are.
+ */
+static void gk_remap_write_part(GkRemapState *s, const GkRemapHit *h,
+                                unsigned in, unsigned n, uint64_t part)
+{
+    uint64_t raw = 0;
+    uint32_t mask = gk_remap_bits(h->r->w, deposit64(0, 8 * in, 8 * n, ~0ull));
+    uint32_t bits = gk_remap_bits(h->r->w, deposit64(0, 8 * in, 8 * n, part));
+
+    memory_region_dispatch_read(s->target_mr, h->model, &raw,
+                                size_memop(h->size), MEMTXATTRS_UNSPECIFIED);
+    raw = (raw & ~(uint64_t)mask) | bits;
+    memory_region_dispatch_write(s->target_mr, h->model, raw,
+                                 size_memop(h->size), MEMTXATTRS_UNSPECIFIED);
+}
+
+static bool gk_remap_direct(GkRemapState *s, const GkRemapHit *h,
+                            unsigned n)
+{
+    return s->narrow && n < h->size && h->model != GK_REMAP_NONE &&
+           !(h->r && h->r->perm);
+}
+
 static uint64_t gk_remap_read(void *opaque, hwaddr off, unsigned size)
 {
     GkRemapState *s = opaque;
@@ -391,9 +430,16 @@ static uint64_t gk_remap_read(void *opaque, hwaddr off, unsigned size)
         GkRemapHit h = gk_remap_find(s, pos, size);
         unsigned in = pos - h.off;
         unsigned n = MIN(h.size - in, off + size - pos);
+        uint64_t part = 0;
 
-        v |= extract64(gk_remap_read_reg(s, &h), 8 * in, 8 * n)
-             << (8 * (pos - off));
+        if (gk_remap_direct(s, &h, n)) {
+            memory_region_dispatch_read(s->target_mr, h.model + in, &part,
+                                        size_memop(n),
+                                        MEMTXATTRS_UNSPECIFIED);
+        } else {
+            part = extract64(gk_remap_read_reg(s, &h), 8 * in, 8 * n);
+        }
+        v |= part << (8 * (pos - off));
         pos += n;
     }
     return v;
@@ -411,8 +457,23 @@ static void gk_remap_write(void *opaque, hwaddr off, uint64_t v,
         unsigned n = MIN(h.size - in, off + size - pos);
         uint64_t part = extract64(v, 8 * (pos - off), 8 * n);
 
+        if (gk_remap_direct(s, &h, n)) {
+            memory_region_dispatch_write(s->target_mr, h.model + in, part,
+                                         size_memop(n),
+                                         MEMTXATTRS_UNSPECIFIED);
+            pos += n;
+            continue;
+        }
+        if (n < h.size && h.r && h.r->perm && !h.r->w1c &&
+            h.model != GK_REMAP_NONE) {
+            gk_remap_write_part(s, &h, in, n, part);
+            pos += n;
+            continue;
+        }
         if (n < h.size) {
-            part = deposit64(gk_remap_read_reg(s, &h), 8 * in, 8 * n, part);
+            uint64_t cur = h.r && h.r->w1c ? 0 : gk_remap_read_reg(s, &h);
+
+            part = deposit64(cur, 8 * in, 8 * n, part);
         }
         gk_remap_write_reg(s, &h, part);
         pos += n;
@@ -444,6 +505,7 @@ static void gk_remap_realize(DeviceState *dev, Error **errp)
         if (s->layout && !strcmp(s->layout, gk_remap_blocks[i].name)) {
             s->regs = gk_remap_blocks[i].regs;
             s->num_regs = gk_remap_blocks[i].num_regs;
+            s->narrow = gk_remap_blocks[i].narrow;
             break;
         }
     }
