@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (65 total)
+## Supported Machines (66 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -22,6 +22,7 @@ Builds two QEMU targets:
 | `hi3516av100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516dv100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516cv300` | V3 | ARM926EJ-S | VIC | 3.18.20 | yes |
+| `hi3516ev100` | V3 | ARM926EJ-S | VIC | 3.18.20 | yes |
 | `hi3516cv500` | V3.5 | Cortex-A7 ×2 | GIC | 4.9.37 | yes |
 | `hi3516dv300` | V4A | Cortex-A7 ×2 | GIC | 4.9.37 | yes |
 | `hi3516av300` | V4A | Cortex-A7 ×2 | GIC | 4.9.37 | yes |

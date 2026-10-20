@@ -507,6 +507,15 @@ jobs:
             uboot_bin: u-boot-hi3516cv300-universal.bin
             flash_mem: 256M
 
+          # The 1M sibling of cv300: same die and map, 64 MiB, SCSYSID0
+          # variant byte 4.
+          - name: hi3516ev100
+            soc: hi3516ev100
+            machine: hi3516ev100
+            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+            ping_linux: true
+            uboot_bin: u-boot-hi3516ev100-universal.bin
+
           # cv500 family covers av300 (same die, av300 is variant id 5);
           # one Linux + U-Boot gate exercises both.  flash_mem=1G because
           # the OpenIPC cv500 U-Boot is built assuming the platform-max

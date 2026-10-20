@@ -926,6 +926,80 @@ static const HisiSoCConfig hi3516cv300_soc = {
 };
 
 /*
+ * Hi3516EV100 (V3): the 1M sibling of Hi3516CV300 -- the same die, peripheral
+ * map, boot ROM and SDK; 64 MiB of in-package DDR.  It identifies itself only
+ * by the sub-variant byte of SCSYSID0 (4; 0 is CV300), which ipctool and the
+ * vendor sys.ko read.  OpenIPC builds it from the cv300 tree (U-Boot
+ * hi3516ev100_config, kernel hisilicon-hi3516cv300, the same DT).
+ */
+static const HisiSoCConfig hi3516ev100_soc = {
+    .name               = "hi3516ev100",
+    .desc               = "HiSilicon Hi3516EV100 (ARM926EJ-S)",
+    .cpu_type           = ARM_CPU_TYPE_NAME("arm926"),
+    .soc_id             = HISI_SOC_ID_CV300,
+    .chipid_byte_layout = true,            /* V3: byte-wise SCSYSID0..3 */
+    .chip_variant       = 4,               /* SCSYSID0[31:24] = 4 -> "3516EV100" */
+    .default_sensor     = "imx291",        /* Sony 1080p Starvis on V3 ref boards */
+    .hwrng_base         = 0x120C0000,      /* HISEC_TRNG_CTRL (V3) */
+    .hwrng_data_offset  = 0x204,
+    /* EV100 is the CV300 die in a 64 MiB SiP package (DDR2 512 Mb):
+     * kernel 32 MiB, vendor mmz.ko the upper 32 MiB at 0x82000000.
+     * No mmz= injected, as on CV300 (see there). */
+    .ram_size_default   = 64 * MiB,
+    .kernel_mem_mb      = 32,
+    .extra_cmdline      = NULL,
+
+    .ram_base           = 0x80000000,
+    .sram_base          = 0x04010000,
+    .sram_size          = 64 * KiB,
+
+    .use_gic            = false,
+    .vic_base           = 0x10040000,
+
+    .sysctl_base        = 0x12020000,
+    .crg_base           = 0x12010000,
+
+    .num_uarts          = 3,
+    .uart_bases         = { 0x12100000, 0x12101000, 0x12102000 },
+    .uart_irqs          = { 5, 30, 25 },
+
+    .num_timers         = 2,
+    .timer_bases        = { 0x12000000, 0x12001000 },
+    .timer_irqs         = { 3, 4 },
+    .timer_freq         = 3000000,      /* kernel: "sched_clock: 32 bits at
+                                         * 3000kHz", -kernel and U-Boot alike */
+
+    .num_spis           = 2,
+    .spi_bases          = { 0x12120000, 0x12121000 },
+    .spi_irqs           = { 6, 7 },
+
+    .fmc_ctrl_base      = 0x10000000,
+    .fmc_mem_base       = 0x14000000,
+
+    .gpio_base          = 0x12140000,
+    .gpio_count         = 9,
+    .gpio_stride        = 0x1000,
+    .gpio_irq           = 31,           /* shared for all ports (VIC) */
+
+    .dma_base           = 0x10030000,
+    .dma_irq            = 14,
+
+    .femac_base         = 0x10050000,
+    .femac_irq          = 12,
+
+    .num_i2c            = 2,
+    .i2c_bases          = { 0x12110000, 0x12112000 },
+
+    .num_himci          = 3,
+    .himci_bases        = { 0x100c0000, 0x100d0000, 0x100e0000 },
+    .himci_irqs         = { 18, 27, 27 },
+
+    .wdt_base           = 0x12080000,
+    .wdt_irq            = -1,
+    .wdt_freq           = 3000000,
+};
+
+/*
  * Timer clocks of the Hi3516EV200/EV300 SDK family (EV200, EV300, 18EV300,
  * DV200 and their Goke rebrands) and of the CV500/AV300/DV300 SDK.  Their
  * DTS clock the SP804s (arm,sp804 / hisilicon,hisp804) from the fixed 3 MHz
@@ -6292,6 +6366,7 @@ DEFINE_HISI_MACHINE("hi3516cv200", hi3516cv200, hi3516cv200_soc)
 DEFINE_HISI_MACHINE("hi3516av100", hi3516av100, hi3516av100_soc)
 DEFINE_HISI_MACHINE("hi3516dv100", hi3516dv100, hi3516dv100_soc)
 DEFINE_HISI_MACHINE("hi3516cv300", hi3516cv300, hi3516cv300_soc)
+DEFINE_HISI_MACHINE("hi3516ev100", hi3516ev100, hi3516ev100_soc)
 DEFINE_HISI_MACHINE("hi3516cv500", hi3516cv500, hi3516cv500_soc)
 DEFINE_HISI_MACHINE("hi3516av300", hi3516av300, hi3516av300_soc)
 DEFINE_HISI_MACHINE("hi3516dv300", hi3516dv300, hi3516dv300_soc)
