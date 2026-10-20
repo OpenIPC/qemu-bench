@@ -23,6 +23,13 @@
  *
  * The bit permutation that matters for wiring is the VIC's: the kernel's
  * IRQ n (mach-gk710x/include/mach/irqs.h) is VIC input irq_line[n].
+ *
+ * The GK7101S / GK7102S die (and the GK7102C, the same family) runs the
+ * same drivers, but its kernel reaches all blocks but the UARTs and SSI
+ * directly: they sit at the 0x90000000 / 0xA0000000 addresses in the
+ * drivers' own register layout.  Those blocks are the GK710x models seen
+ * through gk-remap (hw/misc/gk-remap.c), which applies the GK710x HAL's
+ * moves in front of them.
  */
 #ifndef HW_ARM_GOKE_H
 #define HW_ARM_GOKE_H
@@ -77,6 +84,9 @@ typedef struct GkSoCConfig {
 
     hwaddr      usb_base;       /* Mentor MUSB core, see goke.c */
 
+    hwaddr      dma_base;       /* gk-dma, in the vendor layout */
+    int         dma_irq;
+
     /* Synopsys GMAC (xm-dwmac) and the internal PHY (gk-ephy). */
     hwaddr      mac_base;
     int         mac_irq;
@@ -94,6 +104,10 @@ typedef struct GkSoCConfig {
      * from PHYS_OFFSET (0xC0200000); the rest is the DSP's. */
     uint32_t    kernel_mem_mb;
     uint32_t    bsb_mb;         /* bitstream buffer carve-out, U2K word */
+
+    /* GK710xS: the VIC, timer, watchdog, IDC and GMAC models are mapped
+     * through gk-remap in the S register layout. */
+    bool        s_layout;
 } GkSoCConfig;
 
 #endif /* HW_ARM_GOKE_H */

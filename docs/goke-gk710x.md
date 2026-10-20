@@ -9,11 +9,8 @@ package (GK7101: 128 MiB, external). The vendor BSP is
 3.4.43 (`arch/arm/mach-gk710x`, `plat-goke`), no device tree, ATAGs,
 machine `GOKE_IPC` (3988).
 
-Machines: `gk7101`, `gk7102` in `qemu/hw/arm/goke.c`.
-
-GK7101S/GK7102S (`mach-gk710xs`, `board/goke/gk7101s`) are a different
-die revision with a different HAL (registers at the fictitious addresses
-themselves, other shuffles) and are not modelled.
+Machines: `gk7101`, `gk7102` in `qemu/hw/arm/goke.c`; the S die,
+`gk7101s` and `gk7102s`, is described in its own section below.
 
 ## The HAL
 
@@ -213,6 +210,93 @@ kernels run with any.
 - OpenIPC `gk7102` lite (`-kernel` / `-initrd`, HAL from an SDK U-Boot):
   login prompt, DHCP, `reboot`, SPI-NOR erase / program from Linux written
   back to the image, I2C reads of a `sensor=jxh42` ID.
+
+## GK7101S / GK7102S / GK7102C
+
+The S die (`mach-gk710xs`, U-Boot `board/goke/gk7101s`) runs the same
+drivers with a different HAL (`gk7101s_hal_data.h`, version 20160804). The
+GK7102C cameras are this family: their U-Boot (2012.10, "GK7102C
+devkit-v1.1", 2020) carries that HAL byte for byte. Machines `gk7101s`
+(128 MiB) and `gk7102s` (64 MiB).
+
+**Where the blocks are.** The kernel does not use the HAL for most
+blocks. `mach-gk710xs/include/mach/gk710xs.h` sets `*_HAL_MODE 0` for
+all of them except the UARTs and SSI, so the VIC, timers, watchdog, IDC,
+GMAC, DMA, SD, GPIO and RCT are plain loads and stores at the
+`hardware.h` addresses — AHB `0x90000000`, APB `0xA0000000`, the same
+offsets as the GK710x drivers' map — in the drivers' register layout.
+The interrupt entry code reads the VIC's IRQ status at `+0x30` directly.
+The S HAL's own register shuffles (VIC, eFuse, crypto, UARTs) matter only
+for the UARTs, where it makes the same standard 16550 of them as the
+GK710x HAL does.
+
+**How they are modelled.** Same drivers, same Ambarella IP: an S block
+is a GK710x model with the GK710x HAL applied in front of it. `gk-remap`
+(`hw/misc/gk-remap.c`) is that front, for the VIC, the timers, the
+watchdog, both IDCs and the GMAC. Its tables were taken from the GK710x
+HAL under Unicorn. The S headers define the same offsets and bits as the
+GK710x ones for these blocks, with one exception: `timer.h` swaps each
+timer's overflow-interrupt and clock-select bits (S: `OFn = 0x40 >> n`,
+`CSLn = 0x04 >> n`), so that row is composed with the swap. The VIC wiring
+(kernel IRQ *n* = model line `irq_line[n]`) and the IRQ numbers are the
+GK710x ones. The UARTs, sflash, internal PHY, GPIO, DDRC and USB sit at
+their S addresses as they are.
+
+| Block | S address | S layout (driver offsets) |
+|---|---|---|
+| VIC1 / VIC2 | `0x90008000` / `0x90009000` | SENSE 0x00, EVENT 0x04, BOTHEDGE 0x08, INT_SEL 0x0C, INTEN 0x10, INTEN_CLR 0x14, RAW 0x18, SOFTEN 0x1C, SOFTEN_CLR 0x20, PROTEN 0x24, IRQ_STA 0x30, FIQ_STA 0x34, EDGE_CLR 0x38 |
+| Timers | `0xA0000000` | T1 STATUS 0x00, MATCH1 0x04, MATCH2 0x08, CTR 0x0C, T2 0x14–0x1C, T3 0x20–0x28, RELOAD 0x30 / 0x34 / 0x38; CTR: EN1/2/3 0x400/0x200/0x100, OF1/2/3 0x40/0x20/0x10, CSL1/2/3 0x04/0x02/0x01; 69 MHz |
+| Watchdog | `0xA0006000` | CONTROL 0x00 (EN 1, INT 2, RST 4), TIMEOUT 0x04, CLR_TMO 0x08, STATUS 0x0C, RELOAD 0x10, RESTART 0x14 (`0x4755`), RST_WD 0x18 |
+| IDC / IDC2 | `0xA0003000` / `0xA0004000` | PSLL 0x00, PSLH 0x04, FMCTRL 0x08, CTRL 0x0C (STOP 1, START 2, ACK 4, IF 8), STS 0x10, ENR 0x14, DATA 0x18, FMDATA 0x1C |
+| GMAC | `0x9000E000` | MAC CFG 0x00, GMII_ADDR 0x04, GMII_DATA 0x08, FRAME_FILTER 0x0C, HASH 0x10/0x14, FLOW 0x18, MAC0 0x40/0x44, VERSION 0x58; DMA TX/RX poll 0x1000/0x1004, BUS_MODE 0x1008, RX/TX list 0x100C/0x1010, STATUS 0x1014, INTEN 0x101C, OPMODE 0x1020 |
+| DMA | `0x90003000` | INT 0x304, DA(n) 0x308 + 4n, CTR(n) 0x31C + 16n, SRC 0x320 + 16n, DST 0x324 + 16n, STA 0x328 + 16n (`gk-dma`) |
+| UART0 / 1 / 2 | `0xA0005000` / `0xA001F000` / `0xA001E000` | 16550, `regshift 2`, 24 MHz |
+| sflash | `0x90016000` | as on the GK710x |
+| EPHY | `0x90022000` | as on the GK710x |
+| DDRC | `0x90002000` | `+0x04` = `0x00100344` (64 MiB) / `0x00100354` (128 MiB), read back by U-Boot's `dram_init` |
+| RCT, GPIO, SD, PMU, ... | `hardware.h` | storage (`hisi-regbank`) |
+
+**DMA.** The GK7102C U-Boot checks the DMA controller before anything
+else. It builds one descriptor at `0xC1000000` (from the I2S FIFO at
+`0x9000A080`, 32 bytes, EOC), writes it to channel 1's DA (`+0x30C`) and
+`EN | D` to its CTR (`+0x32C`), and expects DA to have moved on to the
+descriptor's `next` (or one past it). Otherwise it prints `DMA reboot`
+and resets through the watchdog. It touches the controller directly, not
+through the HAL. `gk-dma` models the controller in the S layout
+(`mach-gk710xs/include/mach/dma.h`, descriptors from `plat-goke`
+`gk_dma_req_t`). It runs a whole transfer when EN is set: descriptor
+chains, report words, and the channel's INT bit and interrupt (DMA_IRQ
+21).
+
+**Boot header.** The format is the same, with `w1` `0x30360801` on the
+SDK's S images and `0x304308EF` on the GK7102C. The GK7102C table also
+uses `0xFFFFFFFF, n` (a delay) between the bytes it sends out of UART0
+("\r\n.\r\n": the first console output). Its table first sets the RCT
+PLLs and UART, then arms the watchdog (reload `0x2AEA5400`, CONTROL
+EN | RST), then does the DDR set-up of the SDK's GK7102S table. That
+watchdog does not reset the machine during the boot: a 90 s run reaches
+`login:` and stays there.
+
+**SD.** Not modelled. The S drivers use the vendor's halfword register
+layout directly, which the GK710x HAL turns into a standard SDHCI. The
+two controllers are storage, so the kernel's probe finds no card.
+
+**Flash images.** As on the GK710x, the chip holds every word byte-swapped.
+A dump read out by software (`sf read`, `/dev/mtd`) is in CPU order, and
+the machine refuses it with that hint. `qemu-boot/run-gk7102s.sh`
+converts one.
+
+**Tested:** `roxiq.bin`, a GK7102C camera dump (7.09 MiB software dump,
+GD25Q64C, padded to 8 MiB). U-Boot passes its DMA check, prints its
+banner and `HAL: 20160804`, and probes the flash and the internal PHY.
+At its prompt, `ping` and `tftpboot` (CRC32 matches the host file) work,
+`sf erase/write/read` + `cmp.b` agree, and `reset` goes through the
+watchdog. Autoboot loads the 3.4.43 kernel, which lays out
+BSB/DSP/USR from the U2K words, takes the GPIO map, calibrates its delay
+loop on timer 3 and mounts the squashfs root. Userspace brings `eth0` up
+and starts the vendor application (which stops at the unmodelled DSP),
+and `login:` appears. The one jffs2 CRC error is past the end of the
+dump.
 
 ## Sources
 

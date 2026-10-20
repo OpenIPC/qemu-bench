@@ -54,6 +54,8 @@ cp qemu/hw/misc/gk-timer.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-wdt.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-sflash.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-ephy.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/gk-remap.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/gk-dma.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/gk-idc.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
@@ -305,7 +307,7 @@ config GOKE
 KCONFIG
     echo "  hw/arm/Kconfig: added GOKE"
 fi
-for f in gk-vic gk-timer gk-wdt gk-sflash gk-ephy; do
+for f in gk-vic gk-timer gk-wdt gk-sflash gk-ephy gk-remap gk-dma; do
     if ! grep -q "'$f.c'" "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_GOKE', if_true: files('$f.c'))" \
             >> "$QEMU_DIR/hw/misc/meson.build"
