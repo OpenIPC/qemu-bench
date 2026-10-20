@@ -25,6 +25,18 @@
  * on to that descriptor's next).  EN then drops, STA reports done and the
  * channel's INT bit raises the interrupt until STA is written.
  *
+ * Counts are 22 bits, as the CTR field and the kernel's limit on
+ * xfr_count (0x3FFFFF, mach-gk710xs dma.c) have them; higher bits of a
+ * descriptor's count are ignored.  A count that is not a whole number of
+ * transfer units has its tail moved a byte at a time, so the reported
+ * count is what was moved.
+ *
+ * A descriptor that cannot be fetched, or a source or destination that
+ * cannot be accessed, stops the channel there: DA is left at the failing
+ * descriptor, DD / DN are not set, and STA gets BE (bit 25).  The vendor
+ * headers name the STA bits but not their meaning; BE is taken as the
+ * bus error.  The INT bit then reports that status as for any other.
+ *
  * The other registers (the FIO channel at 0x380 up) are plain storage.
  */
 
@@ -64,7 +76,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(GkDmaState, GK_DMA)
 #define DESC_TS(a)      (((a) >> 19) & 3)
 
 #define STA_DD          (1u << 28)      /* descriptor done */
+#define STA_BE          (1u << 25)      /* bus error: see the top */
 #define STA_DN          (1u << 22)      /* transfer done */
+#define DMA_COUNT_MASK  0x3FFFFF
 
 /* A chain longer than this is a loop: stop and report a done. */
 #define GK_DMA_MAX_DESC 4096
@@ -96,20 +110,28 @@ static void gk_dma_update(GkDmaState *s)
     qemu_set_irq(s->irq, pending != 0);
 }
 
-/* Move count bytes in units of 1 << ts; a side that is not memory is a
- * FIFO, read or written at the same address every time. */
-static void gk_dma_move(uint32_t src, uint32_t dst, uint32_t count,
+/*
+ * Move count (at most DMA_COUNT_MASK) bytes in units of 1 << ts, the tail
+ * that is not a whole unit a byte at a time; a side that is not memory is
+ * a FIFO, read or written at the same address every time.  False if an
+ * access failed: the transfer stops there.
+ */
+static bool gk_dma_move(uint32_t src, uint32_t dst, uint32_t count,
                         unsigned ts, bool src_inc, bool dst_inc)
 {
-    const unsigned unit = 1u << ts;
     uint8_t buf[8];
-    uint32_t done;
 
-    for (done = 0; done + unit <= count; done += unit) {
-        address_space_read(&address_space_memory, src, MEMTXATTRS_UNSPECIFIED,
-                           buf, unit);
-        address_space_write(&address_space_memory, dst,
-                            MEMTXATTRS_UNSPECIFIED, buf, unit);
+    count &= DMA_COUNT_MASK;
+    while (count) {
+        const unsigned unit = count >= (1u << ts) ? 1u << ts : 1;
+
+        if (address_space_read(&address_space_memory, src,
+                               MEMTXATTRS_UNSPECIFIED, buf, unit) != MEMTX_OK ||
+            address_space_write(&address_space_memory, dst,
+                                MEMTXATTRS_UNSPECIFIED, buf, unit) != MEMTX_OK) {
+            return false;
+        }
+        count -= unit;
         if (src_inc) {
             src += unit;
         }
@@ -117,6 +139,7 @@ static void gk_dma_move(uint32_t src, uint32_t dst, uint32_t count,
             dst += unit;
         }
     }
+    return true;
 }
 
 static void gk_dma_run(GkDmaState *s, int n)
@@ -129,21 +152,28 @@ static void gk_dma_run(GkDmaState *s, int n)
         uint32_t d[6];
         int i;
 
+        sta = STA_DD | STA_DN;
         for (i = 0; i < GK_DMA_MAX_DESC; i++) {
             if (dma_memory_read(&address_space_memory, da, d, sizeof(d),
-                                MEMTXATTRS_UNSPECIFIED)) {
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
                 qemu_log_mask(LOG_GUEST_ERROR, "gk-dma: channel %d: no "
                               "descriptor at 0x%08x\n", n, da);
+                sta = STA_BE;
                 break;
             }
             for (int w = 0; w < 6; w++) {
                 d[w] = le32_to_cpu(d[w]);
             }
-            gk_dma_move(d[0], d[1], d[4], DESC_TS(d[5]),
-                        d[5] & DESC_RM, d[5] & DESC_WM);
+            if (!gk_dma_move(d[0], d[1], d[4], DESC_TS(d[5]),
+                             d[5] & DESC_RM, d[5] & DESC_WM)) {
+                qemu_log_mask(LOG_GUEST_ERROR, "gk-dma: channel %d: "
+                              "transfer of descriptor 0x%08x failed\n", n, da);
+                sta = STA_BE;
+                break;
+            }
             if (d[3]) {
                 uint32_t rpt = cpu_to_le32(STA_DD | STA_DN |
-                                           (d[4] & 0x3FFFFF));
+                                           (d[4] & DMA_COUNT_MASK));
 
                 address_space_write(&address_space_memory, d[3],
                                     MEMTXATTRS_UNSPECIFIED, &rpt, 4);
@@ -154,11 +184,14 @@ static void gk_dma_run(GkDmaState *s, int n)
             }
         }
         *gk_dma_reg(s, DMA_DA(n)) = da;
-        sta = STA_DD | STA_DN;
-    } else {
-        gk_dma_move(*gk_dma_reg(s, DMA_SRC(n)), *gk_dma_reg(s, DMA_DST(n)),
-                    CTR_COUNT(ctr), CTR_TS(ctr), ctr & CTR_RM, ctr & CTR_WM);
+    } else if (gk_dma_move(*gk_dma_reg(s, DMA_SRC(n)),
+                           *gk_dma_reg(s, DMA_DST(n)), CTR_COUNT(ctr),
+                           CTR_TS(ctr), ctr & CTR_RM, ctr & CTR_WM)) {
         sta = STA_DN | CTR_COUNT(ctr);
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "gk-dma: channel %d: transfer "
+                      "failed\n", n);
+        sta = STA_BE;
     }
     *gk_dma_reg(s, DMA_CTR(n)) = ctr & ~CTR_EN;
     *gk_dma_reg(s, DMA_STA(n)) = sta;

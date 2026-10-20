@@ -16,7 +16,10 @@ mach-gk710xs headers (docs/goke-gk710x.md):
     S idc.h offsets and CTRL bits;
   - gk-dma: one descriptor run as the GK7102C U-Boot checks it at start --
     DA moves on to the descriptor's next, the data and the report land, the
-    channel's INT bit is set until STA is cleared.
+    channel's INT bit is set until STA is cleared; a count that is not a
+    whole number of units moves its tail too; a count of 0xFFFFFFFF is
+    cut to the 22-bit field instead of running forever; an unreachable
+    descriptor or source stops the channel with BE and no done.
 
     python3 qemu/tests/test-gk710xs.py [--qemu PATH]
 """
@@ -72,6 +75,12 @@ class QTest:
 
     def readl(self, a):
         return int(self.cmd('readl 0x%x' % a).split()[1], 16)
+
+    def writeb(self, a, v):
+        self.cmd('writeb 0x%x 0x%x' % (a, v))
+
+    def readb(self, a):
+        return int(self.cmd('readb 0x%x' % a).split()[1], 16)
 
     def step(self, ns):
         self.cmd('clock_step %d' % ns)
@@ -198,6 +207,58 @@ def test_dma(qt):
     check('STA cleared, INT drops', qt.readl(DMAC + 0x304), 0)
 
 
+# gk-dma descriptor attr: EOC | WM | RM | ID; ts 0/2 = 1/4-byte units.
+def ATTR(ts): return (1 << 24) | (1 << 23) | (1 << 22) | (ts << 19) | 0x4
+STA_BE, STA_DD, STA_DN = 1 << 25, 1 << 28, 1 << 22
+NOWHERE = 0x50000000                    # nothing decodes it
+
+
+def dma_run(qt, desc, words, chan=1):
+    for i, w in enumerate(words):
+        qt.writel(desc + 4 * i, w)
+    qt.writel(DMAC + 0x308 + 4 * chan, desc)
+    qt.writel(DMAC + 0x31C + 16 * chan, 0xC0000000)
+    return qt.readl(DMAC + 0x328 + 16 * chan)
+
+
+def test_dma_edges(qt):
+    print('gk-dma: tails, bounds, failures')
+    desc, src, dst = RAM + 0x4000, RAM + 0x5000, RAM + 0x6000
+    for i in range(16):
+        qt.writel(src + 4 * i, 0x01020304 + 0x04040404 * i)
+        qt.writel(dst + 4 * i, 0)
+    sta = dma_run(qt, desc, [src, dst, desc + 0x18, 0, 0x22, ATTR(2)])
+    check('34 bytes in 4-byte units: done', sta & (STA_DD | STA_DN),
+          STA_DD | STA_DN)
+    check('the 2-byte tail moved', qt.readb(dst + 0x21), qt.readb(src + 0x21))
+    check('nothing past the count', qt.readb(dst + 0x22), 0)
+    qt.writel(DMAC + 0x338, 0)
+
+    big_src, big_dst = RAM + 0x100000, RAM + 0x800000
+    qt.writeb(big_dst + 0x3FFFFF, 0)
+    qt.writeb(big_src + 0x3FFFFE, 0x5A)
+    qt.writeb(big_src + 0x3FFFFF, 0x77)
+    sta = dma_run(qt, desc, [big_src, big_dst, desc + 0x18, 0, 0xFFFFFFFF,
+                             ATTR(0)])
+    check('count 0xFFFFFFFF in bytes: finishes', sta & STA_DN, STA_DN)
+    check('cut to 0x3FFFFF bytes', qt.readb(big_dst + 0x3FFFFE), 0x5A)
+    check('nothing past 0x3FFFFF bytes', qt.readb(big_dst + 0x3FFFFF), 0)
+    qt.writel(DMAC + 0x338, 0)
+
+    qt.writel(DMAC + 0x30C, NOWHERE)
+    qt.writel(DMAC + 0x32C, 0xC0000000)
+    sta = qt.readl(DMAC + 0x338)
+    check('unreachable descriptor: BE, not done', sta, STA_BE)
+    check('DA left at it', qt.readl(DMAC + 0x30C), NOWHERE)
+    check('INT reports the error', qt.readl(DMAC + 0x304), 0x2)
+    qt.writel(DMAC + 0x338, 0)
+
+    sta = dma_run(qt, desc, [NOWHERE, dst, desc + 0x18, 0, 0x10, ATTR(2)])
+    check('unreachable source: BE, not done', sta, STA_BE)
+    check('DA left at the descriptor', qt.readl(DMAC + 0x30C), desc)
+    qt.writel(DMAC + 0x338, 0)
+
+
 def test_rejection(qemu, path):
     print('rejections')
     cpu = path + '.cpu'
@@ -228,6 +289,7 @@ def main():
         test_wdt(qt)
         test_idc(qt)
         test_dma(qt)
+        test_dma_edges(qt)
     finally:
         qt.close()
     test_rejection(args.qemu, path)
