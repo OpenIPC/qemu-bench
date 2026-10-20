@@ -1023,18 +1023,17 @@ static void hisi_fmc_ctrl_write(void *opaque, hwaddr offset,
              * driver reads back from the memory window like every other op). */
             if (s->variant != FMC_VARIANT_FMC100 &&
                 (value & FMC_OP_READ_STATUS_EN)) {
-                /* Hardware reads SPI status register directly into FMC_STATUS.
-                 * The actual SPI opcode in FMC_CMD selects WHICH register. */
-                uint8_t cmd = s->cmd & 0xFF;
-                switch (cmd) {
-                case SPI_CMD_READ_STATUS:   s->status = s->sr;  break;
-                case SPI_CMD_READ_STATUS2:  s->status = s->sr2; break;
-                case SPI_CMD_READ_STATUS3:  s->status = s->sr3; break;
-                case 0x3D: /* Read Block Lock — always report unlocked */
-                    s->status = 0;
-                    break;
-                default: s->status = s->sr; break;
-                }
+                /* The controller issues RDSR (05h) on its own and latches SR1
+                 * into FMC_STATUS; FMC_CMD is not consulted.  The vendor
+                 * drivers rely on that and leave FMC_CMD holding the previous
+                 * op's opcode -- U-Boot 2022.10's QE setup reads SR2 with 35h
+                 * just before.  Choosing the register by that stale opcode
+                 * returned SR2's QE bit as WEL, write_enable skipped WREN, the
+                 * WRSR was dropped and every boot printed "Disable Quad
+                 * failed! reg: 0x2".  Measured on a gk7205v200: with WEL set
+                 * (SR1 0x02) and SR3 0x08, FMC_STATUS reads 0x02 with FMC_CMD
+                 * = 15h as with 05h. */
+                s->status = s->sr;
                 s->iobuf_valid = true;
             } else {
                 /* Only mark iobuf valid if the command actually wrote to it.
