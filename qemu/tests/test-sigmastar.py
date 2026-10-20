@@ -415,12 +415,14 @@ def vpu_decode(qt, bs):
     import importlib
     sys.dont_write_bytecode = True
     cam = importlib.import_module('fake-ipcam')
-    au = cam.H264Pattern(64, 48).picture()[0]
-    au += bytes(-len(au) % 4)
-    for i in range(0, len(au), 4):
-        qt.writel(DRAM + bs + i, int.from_bytes(au[i:i + 4], 'little'))
+    pat = cam.H264Pattern(64, 48)
+    idr, p1 = pat.picture()[0], pat.picture()[0]
+    stream = idr + p1
+    stream += bytes(-len(stream) % 4)
+    for i in range(0, len(stream), 4):
+        qt.writel(DRAM + bs + i, int.from_bytes(stream[i:i + 4], 'little'))
     qt.writel(VPU + 0x118, bs)
-    qt.writel(VPU + 0x11C, bs + len(au))
+    qt.writel(VPU + 0x11C, bs + len(idr))
     qt.writel(VPU + 0x120, 0x80000001)
     vpu_cmd(qt, 0x40, inst=0x20000, opt=1)
     qt.step(10000000)
@@ -434,23 +436,32 @@ def vpu_decode(qt, bs):
     qt.writel(VPU + 0x118, 0)
     qt.writel(VPU + 0x120, 2)
     check('SET_FB', vpu_cmd(qt, 0x80, inst=0x20000, opt=0x18), 1)
-    # DEC_PIC, the picture scaled to 32x24 NV12 at OUT, VLC buffer VLC
+    # Two DEC_PICs: the host's chunks need not be pictures.  The first
+    # holds half the IDR, the second its rest and the next picture's start.
     OUT, VLC = 0x600000, 0x5F0000
-    qt.writel(VPU + 0x118, bs)
-    qt.writel(VPU + 0x11C, bs + len(au))
-    qt.writel(VPU + 0x120, 0x80000001)
-    qt.writel(VPU + 0x150, 0x8221)
-    qt.writel(VPU + 0x154, (32 << 16) | 24)
-    qt.writel(VPU + 0x158, OUT)
-    qt.writel(VPU + 0x15C, OUT + 32 * 24)
-    qt.writel(VPU + 0x164, 32)
-    qt.writel(VPU + 0x168, VLC)
-    check('DEC_PIC queued', vpu_cmd(qt, 0x100, inst=0x20000, opt=0), 1)
-    qt.step(10000000)
-    check('done: DEC_PIC reason, instance index in 0x1FC',
-          (qt.readl(VPU + 0x4C) & 0x100, qt.readl(VPU + 0x1FC)), (0x100, 0))
-    vpu_cmd(qt, 0x4000, inst=0x20000, opt=2)
-    check('decoded and displayed: buffer 0',
+    half = len(idr) // 2
+
+    def dec_pic(wr):
+        qt.writel(VPU + 0x11C, bs + wr)
+        qt.writel(VPU + 0x120, 0x80000001)
+        qt.writel(VPU + 0x150, 0x8221)
+        qt.writel(VPU + 0x154, (32 << 16) | 24)
+        qt.writel(VPU + 0x158, OUT)
+        qt.writel(VPU + 0x15C, OUT + 32 * 24)
+        qt.writel(VPU + 0x164, 32)
+        qt.writel(VPU + 0x168, VLC)
+        check('DEC_PIC queued', vpu_cmd(qt, 0x100, inst=0x20000, opt=0), 1)
+        qt.step(10000000)
+        qt.writel(VPU + 0x1E8, 0)
+        vpu_cmd(qt, 0x4000, inst=0x20000, opt=2)
+
+    dec_pic(half)
+    check('half a picture: nothing decoded, black shown',
+          (qt.readl(VPU + 0x170), qt.readl(VPU + 0x174),
+           qt.readb(DRAM + OUT)), (0xFFFFFFFE, 0, 16))
+    check('done: instance index in 0x1FC', qt.readl(VPU + 0x1FC), 0)
+    dec_pic(len(stream))
+    check('the IDR, once the next picture starts: decoded, displayed',
           (qt.readl(VPU + 0x170), qt.readl(VPU + 0x174)), (0, 0))
     check('picture: IDR', qt.readl(VPU + 0x160), (5 << 4) | 1)
     check('output buffer and VLC buffer given back',

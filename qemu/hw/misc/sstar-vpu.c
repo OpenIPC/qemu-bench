@@ -290,6 +290,8 @@ typedef struct VpuInst {
     AVPacket *pkt;
     AVFrame *out[VPU_MAX_FB];   /* decoded, waiting for a DEC_PIC */
     int nout;
+    AVFrame *last;              /* the last picture shown, to show again */
+    int last_slot;
     bool drained;
 #endif
 } VpuInst;
@@ -406,11 +408,18 @@ static uint32_t bs_advance(VpuInst *in, uint32_t rd, uint32_t n)
     return rd;
 }
 
-static void inst_free_codec(VpuInst *in)
+static void inst_drop_frames(VpuInst *in)
 {
     while (in->nout) {
         av_frame_free(&in->out[--in->nout]);
     }
+    av_frame_free(&in->last);
+    in->slot_busy = 0;
+}
+
+static void inst_free_codec(VpuInst *in)
+{
+    inst_drop_frames(in);
     av_parser_close(in->parser);
     in->parser = NULL;
     av_packet_free(&in->pkt);
@@ -429,6 +438,11 @@ static bool inst_open_codec(VpuInst *in)
     in->ctx = avcodec_alloc_context3(codec);
     in->ctx->apply_cropping = 0;    /* the firmware reports the crop */
     in->ctx->thread_count = 1;
+    /*
+     * Every DEC_PIC must give its picture back at once (the driver forces
+     * a display latency of 0: FORCE_FB_LATENCY_PLUS1 = 1).
+     */
+    in->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     in->ctx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
     if (avcodec_open2(in->ctx, codec, NULL) < 0) {
         avcodec_free_context(&in->ctx);
@@ -546,6 +560,22 @@ static void inst_write_out(VpuOut *o, AVFrame *f)
     }
 }
 
+/* Black, for a DEC_PIC that comes before any picture. */
+static void inst_blank_out(VpuOut *o)
+{
+    uint32_t w = MIN(o->w, o->stride), y;
+    g_autofree uint8_t *row = g_malloc(w);
+
+    memset(row, 16, w);
+    for (y = 0; y < o->h; y++) {
+        vpu_dram_write(o->y + y * o->stride, row, w);
+    }
+    memset(row, 128, w);
+    for (y = 0; y < o->h / 2; y++) {
+        vpu_dram_write(o->c + y * o->stride, row, w);
+    }
+}
+
 static uint32_t pic_type(AVFrame *f, uint32_t std)
 {
     uint32_t t;
@@ -574,7 +604,20 @@ static int inst_display(VpuInst *in, VpuReport *r, VpuOut *o)
     int slot;
 
     if (!in->nout) {
-        return IDX_NOT_YET;
+        /*
+         * Nothing new: show the last picture again.  A DEC_PIC that gives
+         * no picture back leaves the driver's output task waiting until
+         * it times out (10 s) and resets the decoder.
+         */
+        if (!o || !o->y) {
+            return IDX_NOT_YET;
+        }
+        if (!in->last) {
+            inst_blank_out(o);          /* nothing decoded yet */
+            return 0;
+        }
+        inst_write_out(o, in->last);
+        return in->last_slot;
     }
     f = in->out[0];
     memmove(in->out, in->out + 1, --in->nout * sizeof(in->out[0]));
@@ -591,7 +634,9 @@ static int inst_display(VpuInst *in, VpuReport *r, VpuOut *o)
     }
     rep_set(r, W5_RET_DEC_PIC_TYPE, pic_type(f, in->std));
     rep_set(r, W5_RET_DEC_PIC_POC, in->pics++);
-    av_frame_free(&f);
+    av_frame_free(&in->last);
+    in->last = f;
+    in->last_slot = slot;
     in->slot_busy &= ~(1u << slot);
     return slot;
 }
@@ -613,6 +658,41 @@ static int inst_free_slot(VpuInst *in)
         }
     }
     return -1;
+}
+
+/*
+ * Decode one access unit into a free frame buffer index (the tag the
+ * picture comes back with).  Pictures beyond what the DEC_PICs can show
+ * are dropped, oldest first: the host shows one per command.
+ */
+static void inst_decode_au(VpuInst *in, const uint8_t *au, int len,
+                           int *decoded)
+{
+    int slot = inst_free_slot(in);
+    int before = in->nout;
+
+    while (slot < 0 && in->nout) {
+        AVFrame *f = in->out[0];
+
+        if (f->pts >= 0 && f->pts < VPU_MAX_FB) {
+            in->slot_busy &= ~(1u << f->pts);
+        }
+        av_frame_free(&f);
+        memmove(in->out, in->out + 1, --in->nout * sizeof(in->out[0]));
+        before = in->nout;
+        slot = inst_free_slot(in);
+    }
+    if (slot < 0) {
+        return;
+    }
+    in->slot_busy |= 1u << slot;
+    inst_send(in, au, len, slot);
+    if (in->nout == before) {
+        /* no picture (yet, or an error): the index is free again */
+        in->slot_busy &= ~(1u << slot);
+    } else {
+        *decoded = slot;
+    }
 }
 
 /*
@@ -639,9 +719,9 @@ static void inst_init_seq(SstarVpuState *s, VpuInst *in, VpuCmd *c,
         goto fail;
     }
     avcodec_flush_buffers(ctx);
-    while (in->nout) {
-        av_frame_free(&in->out[--in->nout]);
-    }
+    inst_drop_frames(in);
+    av_parser_close(in->parser);
+    in->parser = av_parser_init(ctx->codec_id);
     in->pic_w = ctx->coded_width;
     in->pic_h = ctx->coded_height;
     in->crop_l = in->crop_t = 0;
@@ -685,52 +765,49 @@ static void inst_dec_pic(SstarVpuState *s, VpuInst *in, VpuCmd *c,
     uint32_t au_start = in->rd;
     int decoded = IDX_NONE, display;
     hwaddr off;
-    int slot;
 
     if (!in->ctx) {
         decoded = IDX_NONE;
     } else if (len) {
         g_autofree uint8_t *buf = bs_fetch(in, in->rd, len);
-        const uint8_t *au = buf;
-        int aulen = len, used = len;
+        uint32_t pos = 0;
 
-        slot = inst_free_slot(in);
-        if (slot < 0) {
-            decoded = IDX_NO_FB;
-            goto show;
-        }
-        if (!(c->bs_opt & BSOPT_EXPLICIT_END)) {
-            uint8_t *pout;
-            int psize;
+        /*
+         * The host's chunks are not pictures: one may end inside a picture
+         * or hold the end of one and the start of the next, explicit end
+         * flag or not.  Find the access units the way the firmware does,
+         * by parsing (a picture is complete once the next one starts), and
+         * decode each.
+         */
+        while (pos < len) {
+            uint8_t *au;
+            int aulen;
+            int used = av_parser_parse2(in->parser, in->ctx, &au, &aulen,
+                                        buf + pos, len - pos, AV_NOPTS_VALUE,
+                                        AV_NOPTS_VALUE, 0);
 
-            /* ring mode: one access unit per command */
-            used = av_parser_parse2(in->parser, in->ctx, &pout, &psize,
-                                    buf, len, AV_NOPTS_VALUE,
-                                    AV_NOPTS_VALUE, 0);
-            if (!psize && (c->bs_opt & BSOPT_STREAM_END)) {
-                av_parser_parse2(in->parser, in->ctx, &pout, &psize,
-                                 NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-            }
-            au = pout;
-            aulen = psize;
-        }
-        in->rd = bs_advance(in, in->rd, used);
-        if (aulen > 0) {
-            int before = in->nout;
-
-            in->slot_busy |= 1u << slot;
-            if (inst_send(in, au, aulen, slot) < 0 &&
-                in->nout == before) {
-                in->slot_busy &= ~(1u << slot);
-            } else {
-                decoded = slot;
+            pos += used;
+            if (aulen > 0) {
+                inst_decode_au(in, au, aulen, &decoded);
+            } else if (!used) {
+                break;
             }
         }
+        if (c->bs_opt & BSOPT_STREAM_END) {
+            uint8_t *au;
+            int aulen;
+
+            av_parser_parse2(in->parser, in->ctx, &au, &aulen, NULL, 0,
+                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            if (aulen > 0) {
+                inst_decode_au(in, au, aulen, &decoded);
+            }
+        }
+        in->rd = bs_advance(in, in->rd, len);
     } else if ((c->bs_opt & BSOPT_STREAM_END) && !in->drained) {
         inst_send(in, NULL, 0, -1);     /* drain */
         in->drained = true;
     }
-show:
     display = inst_display(in, r, &c->out);
     if (display == IDX_NOT_YET && in->drained && !in->nout) {
         display = IDX_NO_FB;            /* -1: the end of the sequence */
@@ -999,11 +1076,11 @@ static void vpu_flush_instance(SstarVpuState *s, VpuInst *in)
     in->nqueue = in->nreport = 0;
     in->slot_busy = 0;
 #ifdef SSTAR_VPU_LIBAVCODEC
-    while (in->nout) {
-        av_frame_free(&in->out[--in->nout]);
-    }
+    inst_drop_frames(in);
     if (in->ctx) {
         avcodec_flush_buffers(in->ctx);
+        av_parser_close(in->parser);
+        in->parser = av_parser_init(in->ctx->codec_id);
     }
     in->drained = false;
 #endif
