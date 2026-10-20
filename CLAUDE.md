@@ -217,7 +217,12 @@ QEMU's fixed 100 MHz MPCore timers. The MIDR is r4p1, because Linux refuses
 the global timer on r0p0. Reboot goes through the RTC (power-on alarm, then
 power off), so the RTC node is required. The kernel has no RAM disk driver,
 so boot tests use an initramfs (`qemu-boot/test-novatek-boot.sh`), not the
-boot matrix.
+boot matrix. A `flash-file` without `-kernel` boots through a stand-in for
+the closed loader: FDT from flash 0x10000, a BCL1/LZ-packed U-Boot unpacked
+to `nvt_memory_cfg/uboot`, and the `LD_NVT` SHMINFO U-Boot hangs without.
+SDK `FW*.bin` packages become flash images with `qemu-boot/nvtpack2flash.py`.
+Do not run a flash boot under `-d unimp -D` into `/tmp` (a tmpfs): a
+firmware polling an unmodelled block fills it in seconds.
 
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB

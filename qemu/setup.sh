@@ -93,6 +93,9 @@ cp qemu/hw/misc/nvt-cg.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-wdt.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/rtc/nvt-rtc.c            "$QEMU_DIR/hw/rtc/"
+cp qemu/hw/ssi/nvt-flash.c          "$QEMU_DIR/hw/ssi/"
+cp qemu/hw/sd/nvt-sdio.c            "$QEMU_DIR/hw/sd/"
+cp qemu/include/hw/ssi/nvt-flash.h  "$QEMU_DIR/include/hw/ssi/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -472,7 +475,7 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt gpio/nvt-gpio rtc/nvt-rtc; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

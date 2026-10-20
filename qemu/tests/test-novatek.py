@@ -19,6 +19,14 @@ plays the vendor drivers (docs/novatek.md):
     a CSET commits the time and raises SPI 56; the daily alarm and the
     driver's wake alarm (PWRALM, committed by CSET) go off; powering off with the
     power-on alarm armed is the vendor reboot, and resets the machine;
+  - nvt-flash, the way nvt_flash_spi_cmd.c drives it: the JEDEC ID by
+    PIO, a manual-CS read (CMD_ADDR then READ_N), a DMA read into RAM, a
+    block erase with its RDSR poll and a PIO page program, both written
+    back to the image file, and the completion interrupt on SPI 29;
+  - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
+    BCL1/LZ-packed "U-Boot") leaves U-Boot unpacked at
+    /nvt_memory_cfg/uboot, the device tree and the "LD_NVT" SHMINFO where
+    the tree says, and a branch at 0; an image with no tree is refused;
   - the 16550 UART at its reg-shift-2 offsets;
   - the generated device tree: compatible, the clock nodes in the order
     of_clk_init() needs, the pinmux children in the driver's order;
@@ -28,7 +36,9 @@ plays the vendor drivers (docs/novatek.md):
 """
 import argparse
 import os
+import random
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -40,9 +50,11 @@ WDT = 0xF0050000
 RTC = 0xF0060000
 GPIO = 0xF0070000
 UART0 = 0xF0290000
+FLASH = 0xF0400000
 GICD = 0xFFD01000
 
 SPI_GPIO = 24
+SPI_FLASH = 29
 SPI_RTC = 56
 SPI_WDT = 57
 
@@ -102,7 +114,10 @@ def check(what, got, want):
     global failures
     ok = got == want
     failures += not ok
-    shown = got if isinstance(got, (bool, str)) else hex(got)
+    if isinstance(got, bytes):
+        shown = got[:8].hex() + ('...' if len(got) > 8 else '')
+    else:
+        shown = got if isinstance(got, (bool, str)) else hex(got)
     print('  %s: %s (%s)' % ('PASS' if ok else 'FAIL', what, shown))
 
 
@@ -321,6 +336,262 @@ def test_uart(qt):
     check('LCR reads back', qt.readl(UART0 + 0x0C), 0x03)
 
 
+# ---- nvt-flash ---------------------------------------------------------
+
+OP_READ_ID, OP_CMD, OP_CMD_ADDR, OP_BLK_ERSE = 0x06, 0x07, 0x0C, 0x05
+OP_READ_N, OP_WRITE_N = 0x18, 0x19
+
+
+def flash_op(qt, op, cmd, row=0, length=0, dma=False, write=False):
+    qt.writel(FLASH + 0x48, 1 << 12)            # clear COMP
+    qt.writel(FLASH + 0x34, cmd)
+    qt.writel(FLASH + 0x3C, row)
+    qt.writel(FLASH + 0x104, length)
+    qt.writel(FLASH + 0x10C, 1 | (2 if dma else 0) | (4 if write else 0))
+    qt.writel(FLASH + 0x20, op | (1 << 12))
+
+
+def flash_done(qt):
+    return bool(qt.readl(FLASH + 0x48) & (1 << 12))
+
+
+def test_flash(qt, path):
+    print('nvt-flash')
+    img = open(path, 'rb').read()
+    gic_enable(qt, SPI_FLASH)
+    qt.writel(FLASH + 0x44, 1 << 12)            # completion interrupt
+    qt.writel(FLASH + 0x00, 2 << 2)             # 3 row-address bytes
+
+    flash_op(qt, OP_READ_ID, 0x9F, length=4)
+    check('READ_ID completes', flash_done(qt), True)
+    check('SPI 29 pending', gic_pending(qt, SPI_FLASH), True)
+    check('JEDEC ID through the FIFO (W25Q64 for 8 MiB)',
+          qt.readl(FLASH + 0x100) & 0xFFFFFF, 0x1740EF)
+    qt.writel(FLASH + 0x48, 1 << 12)
+    check('status write-back acknowledges', gic_pending(qt, SPI_FLASH),
+          False)
+
+    # spiflash_read_data: CS manual and low across CMD_ADDR + READ_N
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x03, row=0x1234)
+    flash_op(qt, OP_READ_N, 0x03, length=16)
+    words = b''.join(qt.readl(FLASH + 0x100).to_bytes(4, 'little')
+                     for _ in range(4))
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    check('PIO read under manual CS', words, img[0x1234:0x1244])
+
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x03, row=0x20000)
+    qt.writel(FLASH + 0x110, 0x01000000)
+    flash_op(qt, OP_READ_N, 0x03, length=256, dma=True)
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    got = b''.join(qt.readl(0x01000000 + i).to_bytes(4, 'little')
+                   for i in range(0, 256, 4))
+    check('DMA read into RAM', got, img[0x20000:0x20100])
+
+    # spinor_erase_sector: WREN, then BLK_ERSE (cmd, address, RDSR polled)
+    flash_op(qt, OP_CMD, 0x06)
+    qt.writel(FLASH + 0xBC, (1 << 8) | 0)       # mask WIP, want 0
+    flash_op(qt, OP_BLK_ERSE, 0xD8 | (0x05 << 8), row=0x30000)
+    check('block erase completes', flash_done(qt), True)
+    # spiflash_page_program, PIO: WREN, CMD_ADDR, WRITE_N, data port
+    flash_op(qt, OP_CMD, 0x06)
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x02, row=0x30010)
+    flash_op(qt, OP_WRITE_N, 0x02, length=8, write=True)
+    check('a PIO write waits for its data', flash_done(qt), False)
+    qt.writel(FLASH + 0x100, 0x44332211)
+    qt.writel(FLASH + 0x100, 0x88776655)
+    check('and completes with it', flash_done(qt), True)
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    img = open(path, 'rb').read()
+    check('erase reached the image file',
+          img[0x30000:0x30010] + img[0x30018:0x40000] ==
+          b'\xff' * (0x10000 - 8), True)
+    check('program reached the image file', img[0x30010:0x30018],
+          bytes(range(0x11, 0x99, 0x11)))
+
+    check('past the registers reads 0', qt.readl(FLASH + 0x300), 0)
+    flash_op(qt, OP_WRITE_N, 0x02, length=0, write=True)
+    check('a zero-length PIO write completes', flash_done(qt), True)
+    check('and interrupts', gic_pending(qt, SPI_FLASH), True)
+    qt.writel(FLASH + 0x48, 1 << 12)
+
+    # A PIO read longer than the 4 KiB buffer streams through it
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x03, row=0x50000)
+    flash_op(qt, OP_READ_N, 0x03, length=0x2000)
+    check('an 8 KiB PIO read is not complete before it is drained',
+          flash_done(qt), False)
+    got = b''.join(qt.readl(FLASH + 0x100).to_bytes(4, 'little')
+                   for _ in range(0x800))
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    check('8 KiB PIO read', got, img[0x50000:0x52000])
+    check('and completes with its last word', flash_done(qt), True)
+
+    # FAST_READ with a dummy setting under a byte of clocks
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    flash_op(qt, OP_CMD_ADDR, 0x0B, row=0x60000)
+    qt.writel(FLASH + 0xC0, 3)
+    flash_op(qt, 0x1E, 0x0B)
+    flash_op(qt, OP_READ_N, 0x0B, length=16)
+    got = b''.join(qt.readl(FLASH + 0x100).to_bytes(4, 'little')
+                   for _ in range(4))
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    check('FAST_READ after four dummy clocks', got, img[0x60000:0x60010])
+
+
+# ---- flash boot ROM ----------------------------------------------------
+
+def fdt_blob(tree):
+    """Flatten {name: {prop: bytes | {child...}}} into a DTB."""
+    strings = bytearray()
+    struct_ = bytearray()
+
+    def string(name):
+        i = strings.find(name.encode() + b'\0')
+        if i < 0:
+            i = len(strings)
+            strings.extend(name.encode() + b'\0')
+        return i
+
+    def node(name, body):
+        struct_.extend(struct.pack('>I', 1) + name.encode() + b'\0')
+        while len(struct_) % 4:
+            struct_.append(0)
+        for k, v in body.items():
+            if isinstance(v, bytes):
+                struct_.extend(struct.pack('>III', 3, len(v), string(k)) + v)
+                while len(struct_) % 4:
+                    struct_.append(0)
+        for k, v in body.items():
+            if isinstance(v, dict):
+                node(k, v)
+        struct_.extend(struct.pack('>I', 2))
+
+    node('', tree)
+    struct_.extend(struct.pack('>I', 9))
+    rsv = b'\0' * 16
+    off_rsv = 40
+    off_struct = off_rsv + len(rsv)
+    off_strings = off_struct + len(struct_)
+    total = off_strings + len(strings)
+    hdr = struct.pack('>10I', 0xD00DFEED, total, off_struct, off_strings,
+                      off_rsv, 17, 16, 0, len(strings), len(struct_))
+    return hdr + rsv + bytes(struct_) + bytes(strings)
+
+
+def cells(*v):
+    return struct.pack('>%dI' % len(v), *v)
+
+
+def lz_pack(data, marker=0xF7):
+    """BCL's LZ77: literals, marker escapes, (length, offset) references."""
+    def var(v):
+        out = [v & 0x7F]
+        v >>= 7
+        while v:
+            out.append(0x80 | (v & 0x7F))
+            v >>= 7
+        return bytes(reversed(out))
+    out = bytearray([marker])
+    i = 0
+    while i < len(data):
+        # a reference back to a 64-byte-aligned repeat, when there is one
+        if i >= 64 and data[i:i + 64] == data[i - 64:i]:
+            n = 64
+            while i + n < len(data) and data[i + n] == data[i + n - 64]:
+                n += 1
+            out += bytes([marker]) + var(n) + var(64)
+            i += n
+            continue
+        out.append(data[i])
+        if data[i] == marker:
+            out.append(0)
+        i += 1
+    return bytes(out)
+
+
+def make_boot_image(path, part_size=0x40000, bcl=None):
+    rng = random.Random(7)
+    head = bytes(rng.randrange(256) for _ in range(300)) + b'\xf7' * 3
+    payload = head + head[-64:] * 40 + bytes(range(256))
+    packed = lz_pack(payload)
+    if bcl is None:
+        bcl = b'BCL1' + struct.pack('>III', 9, len(payload), len(packed)) + \
+            packed
+    tree = {
+        'nvt_memory_cfg': {
+            '#address-cells': cells(1), '#size-cells': cells(1),
+            'fdt': {'reg': cells(0x100000, 0x100000)},
+            'shmem': {'reg': cells(0x200000, 0x100000)},
+            'uboot': {'reg': cells(0x3900000, 0x6C0000)},
+        },
+        'nor@f0400000': {
+            'compatible': b'nvt,nvt_spinor\0',
+            '#address-cells': cells(2), '#size-cells': cells(2),
+            'partition_uboot': {'reg': cells(0, 0x50000, 0, part_size)},
+        },
+    }
+    img = bytearray(b'\xff' * (8 << 20))
+    dtb = fdt_blob(tree)
+    img[0x10000:0x10000 + len(dtb)] = dtb
+    img[0x50000:0x50000 + len(bcl)] = bcl
+    open(path, 'wb').write(img)
+    return payload, dtb
+
+
+def test_boot_rom(qemu, tmp):
+    print('flash boot ROM')
+    path = os.path.join(tmp, 'boot.bin')
+    payload, dtb = make_boot_image(path)
+    qt = QTest(qemu, 'nt98562,flash-file=' + path)
+    try:
+        def ram(a, n):
+            return b''.join(qt.readl(a + i).to_bytes(4, 'little')
+                            for i in range(0, n, 4))[:n]
+        check('U-Boot unpacked from BCL1 at /nvt_memory_cfg/uboot',
+              ram(0x3900000, len(payload)), payload)
+        check('device tree copied to /nvt_memory_cfg/fdt',
+              ram(0x100000, len(dtb)), dtb)
+        shm = ram(0x200000, 48)
+        check('SHMINFO says LD_NVT', shm[:6], b'LD_NVT')
+        check('and points at the device tree',
+              struct.unpack_from('<I', shm, 44)[0], 0x100000)
+        check('a branch to U-Boot at 0',
+              (qt.readl(0), qt.readl(4)) == (0xE51FF004, 0x3900000), True)
+    finally:
+        qt.close()
+    def refused(img, what):
+        out = subprocess.run([qemu, '-M', 'nt98562,flash-file=' + img,
+                              '-display', 'none', '-nodefaults', '-S'],
+                             capture_output=True, text=True, timeout=30)
+        # exit(1) with a message, not a signal
+        check(what, out.returncode == 1 and 'novatek:' in out.stderr, True)
+
+    blank = os.path.join(tmp, 'blank.bin')
+    open(blank, 'wb').write(b'\xff' * (8 << 20))
+    refused(blank, 'an image without a device tree is refused')
+    bad = os.path.join(tmp, 'bad.bin')
+    make_boot_image(bad, part_size=0)
+    refused(bad, 'a zero-length uboot partition is refused')
+    make_boot_image(bad, part_size=8, bcl=b'BCL1\0\0\0\x09')
+    refused(bad, 'a BCL1 partition shorter than its header is refused')
+    make_boot_image(bad, bcl=b'BCL1' + struct.pack('>III', 9, 0xF0000000, 8) +
+                    b'\xf7' * 8)
+    refused(bad, 'a BCL1 header declaring 3.75 GiB is refused')
+
+
 def find_nodes(dtb, names):
     pos = [dtb.find(n.encode() + b'\0') for n in names]
     return pos
@@ -385,6 +656,18 @@ def main():
         test_uart(qt)
     finally:
         qt.close()
+
+    flash = os.path.join(tmp, 'flash.bin')
+    open(flash, 'wb').write(random.Random(3).randbytes(8 << 20))
+    # -kernel keeps the boot ROM, which wants an NVT image, out of it
+    stub = os.path.join(tmp, 'stub.bin')
+    open(stub, 'wb').write(b'\xfe\xff\xff\xea')     # b .
+    qt = QTest(args.qemu, 'nt98562,flash-file=' + flash, ['-kernel', stub])
+    try:
+        test_flash(qt, flash)
+    finally:
+        qt.close()
+    test_boot_rom(args.qemu, tmp)
 
     qt = QTest(args.qemu, 'nt98566')
     try:

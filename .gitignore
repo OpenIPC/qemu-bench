@@ -4,7 +4,7 @@ qemu-boot/*.md5sum
 qemu-boot/uImage.*
 qemu-boot/rootfs.squashfs.*
 qemu-boot/rootfs-*.squashfs.*
-qemu-boot/rootfs-*.cpio
+qemu-boot/nor-*.bin
 qemu-boot/ipctool
 qemu-boot/qemu-*.log
 u-boot-hi3516cv200-universal.bin

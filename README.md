@@ -236,12 +236,15 @@ Novatek's NA51089 camera dies, in `hw/arm/novatek.c`: an A9 MPCore at
 clock generator, watchdog, RTC, GPIO), with 16550-compatible UARTs. The
 OpenIPC `nt98562_lite` / `nt98566_lite` kernel carries no device tree; the
 machine builds one from the SDK's board files, and the kernel boots to a
-shell with `-kernel`: `qemu-boot/run-nt98562.sh`. `reboot` works the vendor
-way, by arming the RTC's power-on alarm and powering off. SDKs, map, device
-tree and clock notes are in [docs/novatek.md](docs/novatek.md).
+shell with its root on the emulated SPI NOR: `qemu-boot/run-nt98562.sh`.
+A whole flash image boots the way the chip does, the machine standing in for
+the closed DDR-training loader: the SDK's own `FW98562A.bin`, laid out by
+`qemu-boot/nvtpack2flash.py`, runs the vendor U-Boot, kernel and init
+scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). `reboot` works the
+vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
+device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
-¹ With `-kernel` and an initramfs: the SPI flash controller (so flash boot)
-and Ethernet are not modelled yet.
+¹ Ethernet is not modelled yet.
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -379,6 +382,8 @@ qemu/
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
 ├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
+├── hw/ssi/nvt-flash.c           # SPI NOR controller (operation sequencer, flash-file)
+├── hw/sd/nvt-sdio.c             # SDIO hosts with an empty slot
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
@@ -398,8 +403,9 @@ qemu-boot/
 ├── run-xm510.sh                 # Xiongmai XM510, OpenIPC xm510_lite
 ├── run-gk7102.sh                # Goke GK7102: flash dump, or OpenIPC + vendor HAL
 ├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
-├── run-nt98562.sh               # Novatek NT98562/NT98566, OpenIPC lite via initramfs
-├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script, reboot
+├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
+├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR image
+├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script, NOR r/w, reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map
