@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 2 Goke GK710x (ARM1176) + 6 Anyka AK39xx (ARM926)
+- `qemu-system-arm` — 31 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 2 Goke GK710x (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
 
-## Supported Machines (58 total)
+## Supported Machines (61 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -186,6 +186,29 @@ are in [docs/anyka.md](docs/anyka.md).
 ¹ An AK3916EV301 dump.  ² Same die and models as a tested sibling; no image
 was at hand.
 
+### SigmaStar / MStar family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `ssr621q` | Cortex-A7 ×2, 256 MB in package | GIC + main-intc | 4.9.84 vendor | yes |
+| `ssd202d` | Cortex-A7 ×2, 128 MB in package | GIC + main-intc | — | —¹ |
+| `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
+
+SigmaStar's (formerly MStar's) infinity2m dies, in `hw/arm/sigmastar.c`:
+every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
+SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
+IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
+Xiongmai's Sofia GUI on the emulated HDMI output, with the mouse and keyboard
+on USB and the HDD on SATA:
+`FLASH=nvr.bin HDD=disk.img qemu-boot/run-ssr621q.sh`. Ethernet works from
+both U-Boot and the kernel. The display and 2D engine models are ported from
+Daniel Palmer's MStar QEMU work ([fifteenhex/qemu](https://github.com/fifteenhex/qemu)),
+as are the SSD202D register findings the boot chain relies on. Map, boot,
+devices and the Xiongmai `xmuart` console switch are in
+[docs/sigmastar.md](docs/sigmastar.md).
+
+¹ Same die and models as `ssr621q`; no image was at hand.
+
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
 | Machine | Generation | CPU | IRQ | Boot tested |
@@ -301,6 +324,18 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m machines, synthetic mask ROM
+├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
+├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
+├── hw/timer/sstar-timer.c       # PIU timers + watchdog
+├── hw/char/sstar-uart.c         # 16550 on the RIU stride + DesignWare USR
+├── hw/ssi/sstar-fsp.c           # ISP/FSP/QSPI SPI-NOR controller, XIU window (flash-file)
+├── hw/dma/sstar-bdma.c          # BDMA (flash -> IMI, MIU -> FSP page program)
+├── hw/net/sstar-emac.c          # EMAC + internal PHY
+├── hw/usb/sstar-uhc.c           # EHCI hosts behind the RIU (fusbh200-ehci-usb)
+├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
+├── hw/display/mstar-ge.c        # GE 2D engine (ported)
+├── include/hw/arm/sigmastar.h   # SsSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
 qemu-boot/
@@ -318,6 +353,8 @@ qemu-boot/
 ├── run-cv610.sh
 ├── run-xm510.sh                 # Xiongmai XM510, OpenIPC xm510_lite
 ├── run-gk7102.sh                # Goke GK7102: flash dump, or OpenIPC + vendor HAL
+├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
+├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map
 ├── test-sysupgrade.sh           # sysupgrade --archive on emulated NOR
 ├── test-firstboot.sh            # firstboot wipes the overlay, camera boots
