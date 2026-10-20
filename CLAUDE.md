@@ -197,7 +197,12 @@ bits the boot chain polls; `-d unimp` reports hot polls and
 starts inside one 1 KiB page and covers the next is registered with a
 misaligned offset, and its first access dies in `iotlb_to_section`. Any
 machine with 512-byte-aligned MMIO blocks larger than 1 KiB is exposed to
-the same assertion.
+the same assertion. Its video decoder (`hw/misc/sstar-vpu.c`) is a WAVE5
+modelled at the firmware's mailbox, decoding with libavcodec when pkg-config
+finds it at build time (CI builds without it); queued commands complete
+from a timer, because the vendor driver arms its wait for the interrupt
+after issuing the command and loses a completion raised inside the
+doorbell write.
 
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB

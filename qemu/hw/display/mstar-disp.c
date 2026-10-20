@@ -7,9 +7,10 @@
  * interrupt the framebuffer driver waits on.
  *
  * The primary GOP window (WIN0, the RGB plane the vendor fbdev and DRM
- * fbcon use) and the MOP video plane (WIN0, a semi-planar YUV420
- * overlay the boot logo uses) are composited - the GOP over the MOP,
- * using the GOP's alpha - and scanned out to a QEMU console. The
+ * fbcon use) and the MOP video windows (semi-planar YUV420 surfaces: the
+ * boot logo, the NVR's live-view channels) are composited - the GOP over
+ * the MOP, opaque but for its transparent colour when keyed - and
+ * scanned out to a QEMU console. The
  * display-top vsync interrupt is generated each frame. The UI is
  * composited into the GOP plane by the GE 2D engine (mstar-ge.c); the
  * whole frame is redrawn on every update.
@@ -88,6 +89,10 @@ struct MStarDispState {
 };
 
 /* GOP registers */
+#define GOP_CTRL0           0x00
+#define GOP_CTRL0_TRS_EN    (1 << 11)   /* transparent colour keying */
+#define GOP_TRS_CLR_L       0x90        /* the key, RGB888 */
+#define GOP_TRS_CLR_H       0x94
 #define GOP_STRETCH_W       0xc0
 #define GOP_STRETCH_H       0xc4
 #define GOP_WIN0            0x200
@@ -109,21 +114,32 @@ struct MStarDispState {
 #define TOP_VSYNC_BIT       (1 << 3)
 
 /*
- * MOP (video/overlay) window registers, relative to the window base
- * at MOP + 0x200. The plane is semi-planar YUV420 (NV12); the vendor
- * u-boot points it at the JPEG-decoded boot logo.
+ * MOP (video/overlay) windows: 16 of them, 0x40 bytes apart from MOP +
+ * 0x200 (banks 0x1406/0x1407). Each scans a semi-planar YUV420 (NV12)
+ * surface into a rectangle of the screen, scaled by source/destination
+ * ratios in 1/4096ths. The vendor u-boot points window 0 at the JPEG-
+ * decoded boot logo; the SSR621Q's mi_disp gives each live-view channel
+ * a window (the 9-split: 426x340 cells). Read off the running NVR.
  */
 #define MOP_WIN0            0x200
+#define MOP_WIN_STRIDE      0x40
+#define MOP_NUM_WIN         16
 #define MOP_WIN_EN          0x00        /* bit0 enable */
 #define MOP_WIN_YADDRL      0x08
 #define MOP_WIN_YADDRH      0x0c
 #define MOP_WIN_CADDRL      0x10
 #define MOP_WIN_CADDRH      0x14
+#define MOP_WIN_HST         0x18        /* on the screen, inclusive */
+#define MOP_WIN_HEND        0x1c
+#define MOP_WIN_VST         0x20
+#define MOP_WIN_VEND        0x24
 #define MOP_WIN_PITCH       0x28        /* luma stride, 16 byte units */
 #define MOP_WIN_SRCW        0x2c        /* source width - 1 */
 #define MOP_WIN_SRCH        0x30        /* source height - 1 */
+#define MOP_WIN_HRATIO      0x34        /* source / destination, 4.12 */
+#define MOP_WIN_VRATIO      0x38
+#define MOP_RATIO_ONE       0x1000
 #define MOP_ADDR_SHIFT      4
-#define MOP_REG(r)          ((MOP_WIN0 + (r)) / 4)
 
 #define MSTAR_DISP_DEFAULT_W    640
 #define MSTAR_DISP_DEFAULT_H    480
@@ -184,73 +200,117 @@ static inline uint8_t mstar_disp_clamp(int v)
 }
 
 /*
- * Draw the MOP (video) plane, a semi-planar YUV420 (NV12) surface, as
- * the background. Returns false (leaving the caller to clear to black)
- * if the window is disabled.
+ * Draw the MOP (video) windows, semi-planar YUV420 (NV12) surfaces,
+ * as the background: each is scaled into its rectangle on the screen.
+ * Returns false (leaving the caller to clear to black) if none is
+ * enabled.
  */
-static bool mstar_disp_draw_mop(MStarDispState *s, uint32_t *dst,
-                                uint32_t sw, uint32_t sh)
+static bool mstar_disp_draw_mop_win(MStarDispState *s, int n, uint32_t *dst,
+                                    uint32_t sw, uint32_t sh)
 {
-    uint32_t yl = s->mopregs[MOP_REG(MOP_WIN_YADDRL)];
-    uint32_t yh = s->mopregs[MOP_REG(MOP_WIN_YADDRH)] & 0xfff;
-    uint32_t cl = s->mopregs[MOP_REG(MOP_WIN_CADDRL)];
-    uint32_t ch = s->mopregs[MOP_REG(MOP_WIN_CADDRH)] & 0xfff;
-    uint32_t w = (s->mopregs[MOP_REG(MOP_WIN_SRCW)] & 0xfff) + 1;
-    uint32_t h = (s->mopregs[MOP_REG(MOP_WIN_SRCH)] & 0xfff) + 1;
-    uint32_t pitch = (s->mopregs[MOP_REG(MOP_WIN_PITCH)] & 0x1fff)
-                     << MOP_ADDR_SHIFT;
+    const uint16_t *r = &s->mopregs[(MOP_WIN0 + n * MOP_WIN_STRIDE) / 4];
+    uint32_t sx0 = r[MOP_WIN_HST / 4] & 0xfff;
+    uint32_t sx1 = r[MOP_WIN_HEND / 4] & 0xfff;
+    uint32_t sy0 = r[MOP_WIN_VST / 4] & 0xfff;
+    uint32_t sy1 = r[MOP_WIN_VEND / 4] & 0xfff;
+    uint32_t w = (r[MOP_WIN_SRCW / 4] & 0xfff) + 1;
+    uint32_t h = (r[MOP_WIN_SRCH / 4] & 0xfff) + 1;
+    uint32_t hratio = r[MOP_WIN_HRATIO / 4];
+    uint32_t vratio = r[MOP_WIN_VRATIO / 4];
+    uint32_t pitch = (r[MOP_WIN_PITCH / 4] & 0x1fff) << MOP_ADDR_SHIFT;
     /* Masked to the MIU0 window, as for the GOP (mstar_disp_draw_gop). */
     hwaddr yaddr = MSTARV7_MIU0_BASE +
-                   ((((hwaddr)((yh << 16) | yl)) << MOP_ADDR_SHIFT)
-                    & (MSTARV7_MIU0_WINDOW - 1));
+        ((((hwaddr)(((r[MOP_WIN_YADDRH / 4] & 0xfff) << 16) |
+                    r[MOP_WIN_YADDRL / 4])) << MOP_ADDR_SHIFT)
+         & (MSTARV7_MIU0_WINDOW - 1));
     hwaddr caddr = MSTARV7_MIU0_BASE +
-                   ((((hwaddr)((ch << 16) | cl)) << MOP_ADDR_SHIFT)
-                    & (MSTARV7_MIU0_WINDOW - 1));
+        ((((hwaddr)(((r[MOP_WIN_CADDRH / 4] & 0xfff) << 16) |
+                    r[MOP_WIN_CADDRL / 4])) << MOP_ADDR_SHIFT)
+         & (MSTARV7_MIU0_WINDOW - 1));
     g_autofree uint8_t *yrow = NULL;
     g_autofree uint8_t *crow = NULL;
-    uint32_t x, y;
+    uint32_t dw, dh, x, y, last = UINT32_MAX;
 
-    if (!(s->mopregs[MOP_REG(MOP_WIN_EN)] & 1) || w == 0 || h == 0) {
+    if (!(r[MOP_WIN_EN / 4] & 1)) {
         return false;
     }
     if (pitch == 0) {
         pitch = ROUND_UP(w, 2);
     }
     /* Whole chroma pairs within the pitch, an odd last row included. */
-    w = MIN(MIN(w, sw), pitch & ~1u);
-    h = MIN(h, sh);
-    if (w == 0) {
+    w = MIN(w, pitch & ~1u);
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        /* No rectangle (the U-Boot logo): unscaled at the origin. */
+        sx0 = sy0 = 0;
+        sx1 = w - 1;
+        sy1 = h - 1;
+        hratio = vratio = MOP_RATIO_ONE;
+    }
+    if (!hratio) {
+        hratio = MOP_RATIO_ONE;
+    }
+    if (!vratio) {
+        vratio = MOP_RATIO_ONE;
+    }
+    if (w == 0 || sx0 >= sw || sy0 >= sh) {
         return false;
     }
+    dw = MIN(sx1, sw - 1) - sx0 + 1;
+    dh = MIN(sy1, sh - 1) - sy0 + 1;
 
-    /* One visible row at a time: the guest picks pitch and height. */
+    /* One source row at a time: the guest picks pitch and height. */
     yrow = g_malloc(w);
     crow = g_malloc(w);
-    for (y = 0; y < h; y++) {
-        const uint8_t *yr = yrow, *cr = crow;
-        uint32_t *d = dst + y * sw;
+    for (y = 0; y < dh; y++) {
+        uint32_t srcy = MIN((uint64_t)y * vratio / MOP_RATIO_ONE, h - 1);
+        uint32_t *d = dst + (sy0 + y) * sw + sx0;
 
-        address_space_read(&address_space_memory,
-                           mstar_disp_dram(yaddr, (uint64_t)y * pitch),
-                           MEMTXATTRS_UNSPECIFIED, yrow, w);
-        address_space_read(&address_space_memory,
-                           mstar_disp_dram(caddr, (uint64_t)(y / 2) * pitch),
-                           MEMTXATTRS_UNSPECIFIED, crow, w);
-
-        for (x = 0; x < w; x++) {
-            int yy = yr[x];
-            int uu = cr[x & ~1u] - 128;         /* Cb */
-            int vv = cr[(x & ~1u) + 1] - 128;   /* Cr */
+        if (srcy != last) {
+            address_space_read(&address_space_memory,
+                               mstar_disp_dram(yaddr, (uint64_t)srcy * pitch),
+                               MEMTXATTRS_UNSPECIFIED, yrow, w);
+            address_space_read(&address_space_memory,
+                               mstar_disp_dram(caddr,
+                                               (uint64_t)(srcy / 2) * pitch),
+                               MEMTXATTRS_UNSPECIFIED, crow, w);
+            last = srcy;
+        }
+        for (x = 0; x < dw; x++) {
+            uint32_t srcx = MIN((uint64_t)x * hratio / MOP_RATIO_ONE, w - 1);
+            int yy = yrow[srcx];
+            int uu = crow[srcx & ~1u] - 128;         /* Cb */
+            int vv = crow[(srcx & ~1u) + 1] - 128;   /* Cr */
             /* Full-range (JFIF) BT.601 YCbCr -> RGB */
-            uint8_t r = mstar_disp_clamp(yy + ((91881 * vv) >> 16));
+            uint8_t rr = mstar_disp_clamp(yy + ((91881 * vv) >> 16));
             uint8_t g = mstar_disp_clamp(yy -
                             ((22554 * uu + 46802 * vv) >> 16));
             uint8_t b = mstar_disp_clamp(yy + ((116130 * uu) >> 16));
 
-            d[x] = 0xff000000 | (r << 16) | (g << 8) | b;
+            d[x] = 0xff000000 | (rr << 16) | (g << 8) | b;
         }
     }
     return true;
+}
+
+static bool mstar_disp_draw_mop(MStarDispState *s, uint32_t *dst,
+                                uint32_t sw, uint32_t sh)
+{
+    bool any = false;
+    int n;
+
+    for (n = 0; n < MOP_NUM_WIN; n++) {
+        const uint16_t *r = &s->mopregs[(MOP_WIN0 + n * MOP_WIN_STRIDE) / 4];
+
+        if (!(r[MOP_WIN_EN / 4] & 1)) {
+            continue;
+        }
+        if (!any) {
+            memset(dst, 0, (size_t)sw * sh * 4);
+            any = true;
+        }
+        mstar_disp_draw_mop_win(s, n, dst, sw, sh);
+    }
+    return any;
 }
 
 /* Composite the GOP (RGB overlay) plane over the surface using its alpha */
@@ -277,6 +337,9 @@ static void mstar_disp_draw_gop(MStarDispState *s, uint32_t *dst,
     uint32_t bpp = is32 ? 4 : 2;
     uint32_t pitch = (s->gopregs[GOP_WIN0_PITCH / 4] & 0x7ff)
                      << GOP_ADDR_SHIFT;
+    bool key_en = s->gopregs[GOP_CTRL0 / 4] & GOP_CTRL0_TRS_EN;
+    uint32_t key = ((s->gopregs[GOP_TRS_CLR_H / 4] & 0xff) << 16) |
+                   s->gopregs[GOP_TRS_CLR_L / 4];
     g_autofree uint8_t *buf = NULL;
     uint32_t x, y, w;
 
@@ -336,7 +399,12 @@ static void mstar_disp_draw_gop(MStarDispState *s, uint32_t *dst,
              * constant alpha of 255 (sstar_FB_SetBlending aType=1,
              * constAlpha=255), so the plane is opaque: the per-pixel
              * alpha is ignored (the UI leaves it at 0 on most pixels).
+             * Only the transparent colour, when keyed, lets the video
+             * through (the NVR's live view: black).
              */
+            if (key_en && ((r << 16) | (g << 8) | b) == key) {
+                continue;
+            }
             d[x] = 0xff000000 | (r << 16) | (g << 8) | b;
         }
     }

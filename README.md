@@ -201,7 +201,10 @@ IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
 Xiongmai's Sofia GUI on the emulated HDMI output, with the mouse and keyboard
 on USB and the HDD on SATA:
 `FLASH=nvr.bin HDD=disk.img qemu-boot/run-ssr621q.sh`. Ethernet works from
-both U-Boot and the kernel. The display and 2D engine models are ported from
+both U-Boot and the kernel. With a camera on its network the NVR shows live
+video: the WAVE5 video decoder is modelled at its firmware's interface and
+decodes with libavcodec, and `CAMERA=1` adds `qemu-boot/fake-ipcam.py`, an
+RTSP/ONVIF camera streaming a self-encoded H.264 test pattern. The display and 2D engine models are ported from
 Daniel Palmer's MStar QEMU work ([fifteenhex/qemu](https://github.com/fifteenhex/qemu)),
 as are the SSD202D register findings the boot chain relies on. Map, boot,
 devices and the Xiongmai `xmuart` console switch are in
@@ -333,6 +336,7 @@ qemu/
 ├── hw/dma/sstar-bdma.c          # BDMA (flash -> IMI, MIU -> FSP page program)
 ├── hw/net/sstar-emac.c          # EMAC + internal PHY
 ├── hw/usb/sstar-uhc.c           # EHCI hosts behind the RIU (fusbh200-ehci-usb)
+├── hw/misc/sstar-vpu.c          # WAVE5 video decoder, firmware interface + libavcodec
 ├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
 ├── hw/display/mstar-ge.c        # GE 2D engine (ported)
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
@@ -355,6 +359,7 @@ qemu-boot/
 ├── run-gk7102.sh                # Goke GK7102: flash dump, or OpenIPC + vendor HAL
 ├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
+├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map
 ├── test-sysupgrade.sh           # sysupgrade --archive on emulated NOR
 ├── test-firstboot.sh            # firstboot wipes the overlay, camera boots

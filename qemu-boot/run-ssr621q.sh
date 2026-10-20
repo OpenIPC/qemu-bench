@@ -16,6 +16,11 @@
 # tablet and keyboard are attached for it.  SLIRP is put on the NVR's
 # default 192.168.1.0/24 (the NVR is 192.168.1.9).
 #
+# CAMERA=1 also starts qemu-boot/fake-ipcam.py, an RTSP/ONVIF camera with a
+# test pattern, and puts it at 192.168.1.10 for the NVR to add (the
+# "Live view" section of docs/sigmastar.md); decoding it needs a QEMU built
+# with libavcodec.
+#
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 QEMU="$REPO_ROOT/qemu-src/build/qemu-system-arm"
@@ -30,9 +35,24 @@ if [ -n "$HDD" ]; then
     DISK_ARGS=(-drive "if=ide,index=0,file=$HDD,format=raw")
 fi
 
-exec "$QEMU" -M ssr621q,flash-file="$FLASH" \
+NIC=user,net=192.168.1.0/24,host=192.168.1.1,restrict=on
+if [ -n "$CAMERA" ]; then
+    CAM="$SCRIPT_DIR/fake-ipcam.py"
+    CAM_HTTP=${CAM_HTTP:-18080}
+    CAM_RTSP=${CAM_RTSP:-18554}
+    python3 "$CAM" --http "$CAM_HTTP" --rtsp "$CAM_RTSP" \
+        --advertise 192.168.1.10 &
+    CAM_PID=$!
+    trap 'kill $CAM_PID 2>/dev/null' EXIT
+    # One relay process per guest connection (a tcp: chardev is one
+    # connection that every guest connection would share).
+    NIC="$NIC,guestfwd=tcp:192.168.1.10:80-cmd:python3 $CAM --relay $CAM_HTTP"
+    NIC="$NIC,guestfwd=tcp:192.168.1.10:554-cmd:python3 $CAM --relay $CAM_RTSP"
+fi
+
+"$QEMU" -M ssr621q,flash-file="$FLASH" \
     -serial mon:stdio \
-    -nic user,net=192.168.1.0/24,host=192.168.1.1,restrict=on \
+    -nic "$NIC" \
     -device usb-tablet,bus=usb-bus.0 -device usb-kbd,bus=usb-bus.1 \
     "${DISK_ARGS[@]}" \
     -d unimp,guest_errors -D "$SCRIPT_DIR/qemu-ssr621q.log" \

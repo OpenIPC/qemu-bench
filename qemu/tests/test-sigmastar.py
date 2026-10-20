@@ -55,6 +55,7 @@ EMAC = 0x1F2A2000
 EMAC_X32 = 0x1F343C00
 UHC0 = riu(0x1424, 0)
 SATA = 0x1F345000
+VPU = 0x1F344800
 GE = riu(0x1409, 0)
 TOP = riu(0x1128, 0)
 
@@ -121,7 +122,7 @@ def shown(v):
         return v
     if isinstance(v, bytes):
         return v[:8].hex() + ('...' if len(v) > 8 else '')
-    if isinstance(v, list):
+    if isinstance(v, (list, tuple)):
         return ' '.join(hex(x) for x in v)
     return hex(v)
 
@@ -352,6 +353,114 @@ def test_display(qt):
     check('W1C clears it', qt.readw(TOP + 0x08) & 8, 0)
 
 
+def vpu_cmd(qt, cmd, inst=None, opt=None):
+    """Issue a WAVE5 command; return RET_SUCCESS."""
+    if inst is not None:
+        qt.writel(VPU + 0x110, inst)
+    if opt is not None:
+        qt.writel(VPU + 0x104, opt)
+    qt.writel(VPU + 0x70, 1)                        # BUSY_STATUS
+    qt.writel(VPU + 0x100, cmd)
+    qt.writel(VPU + 0x38, 1)                        # HOST_INT_REQ
+    check('command 0x%x: not busy after' % cmd, qt.readl(VPU + 0x70), 0)
+    return qt.readl(VPU + 0x108)
+
+
+def test_vpu(qt):
+    print('sstar-vpu')
+    qt.writel(VPU + 0x20, 0xFE14)                   # FIO read, bus status
+    check('FIO ready', qt.readl(VPU + 0x20) >> 31, 1)
+    check('backbone bus idle', qt.readl(VPU + 0x24), 0x3F)
+    check('firmware not running', qt.readl(VPU + 0x04), 0)
+    qt.writel(VPU + 0x100, 1)                       # INIT_VPU
+    qt.writel(VPU + 0x6C, 1)                        # REMAP_CORE_START
+    check('INIT_VPU done', (qt.readl(VPU + 0x70), qt.readl(VPU + 0x108)),
+          (0, 1))
+    check('firmware running', qt.readl(VPU + 0x04) != 0, True)
+    check('GET_VPU_INFO', vpu_cmd(qt, 0x4000, opt=0), 1)
+    check('decoders: AVC and HEVC', qt.readl(VPU + 0x128), 0x0C)
+    check('product name', qt.readl(VPU + 0x11C), 0x57353131)
+    qt.writel(VPU + 0x48, 0x8940)                   # VINT_ENABLE, as mi_vdec
+    BS, BS_SIZE = 0x400000, 0x100000
+    qt.writel(VPU + 0x11C, BS)
+    qt.writel(VPU + 0x120, BS_SIZE)
+    check('CREATE_INSTANCE, H.264', vpu_cmd(qt, 0x08, inst=0x20000), 1)
+    # INIT_SEQ on an empty ring: queued, done from the timer
+    qt.writel(VPU + 0x118, BS)
+    qt.writel(VPU + 0x11C, BS)
+    qt.writel(VPU + 0x120, 0x80000001)
+    check('INIT_SEQ queued', vpu_cmd(qt, 0x40, inst=0x20000, opt=1), 1)
+    check('instance queue: 1', (qt.readl(VPU + 0x1F4) >> 16) & 0xFF, 1)
+    check('no interrupt yet', qt.readl(VPU + 0x44), 0)
+    qt.step(10000000)
+    check('done: INIT_SEQ reason, instance 0 in QUEUE_CMD_DONE_INST',
+          (qt.readl(VPU + 0x44), qt.readl(VPU + 0x4C), qt.readl(VPU + 0x1E8)),
+          (1, 0x40, 1))
+    qt.writel(VPU + 0x1E8, 0)
+    qt.writel(VPU + 0x34, 0x40)                     # VINT_REASON_CLR
+    qt.writel(VPU + 0x3C, 1)                        # VINT_CLEAR
+    check('interrupt cleared', qt.readl(VPU + 0x44), 0)
+    check('GET_RESULT', vpu_cmd(qt, 0x4000, inst=0x20000, opt=2), 1)
+    check('empty ring: no sequence', qt.readl(VPU + 0x1DC), 0)
+    check('a second GET_RESULT: not ready',
+          (vpu_cmd(qt, 0x4000, inst=0x20000, opt=2), qt.readl(VPU + 0x10C)),
+          (0, 0x800))
+    vpu_decode(qt, BS)
+
+
+def vpu_decode(qt, bs):
+    """Decode the fake camera's first picture, if libavcodec is built in."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(
+        __file__)), '../../qemu-boot'))
+    import importlib
+    sys.dont_write_bytecode = True
+    cam = importlib.import_module('fake-ipcam')
+    au = cam.H264Pattern(64, 48).picture()[0]
+    au += bytes(-len(au) % 4)
+    for i in range(0, len(au), 4):
+        qt.writel(DRAM + bs + i, int.from_bytes(au[i:i + 4], 'little'))
+    qt.writel(VPU + 0x118, bs)
+    qt.writel(VPU + 0x11C, bs + len(au))
+    qt.writel(VPU + 0x120, 0x80000001)
+    vpu_cmd(qt, 0x40, inst=0x20000, opt=1)
+    qt.step(10000000)
+    qt.writel(VPU + 0x1E8, 0)
+    vpu_cmd(qt, 0x4000, inst=0x20000, opt=2)
+    if not qt.readl(VPU + 0x1DC):
+        print('  decoding skipped: built without libavcodec')
+        return
+    check('sequence: 64x48', qt.readl(VPU + 0x14C), (64 << 16) | 48)
+    # SET_FB, the compressed group: three buffers (only counted)
+    qt.writel(VPU + 0x118, 0)
+    qt.writel(VPU + 0x120, 2)
+    check('SET_FB', vpu_cmd(qt, 0x80, inst=0x20000, opt=0x18), 1)
+    # DEC_PIC, the picture scaled to 32x24 NV12 at OUT, VLC buffer VLC
+    OUT, VLC = 0x600000, 0x5F0000
+    qt.writel(VPU + 0x118, bs)
+    qt.writel(VPU + 0x11C, bs + len(au))
+    qt.writel(VPU + 0x120, 0x80000001)
+    qt.writel(VPU + 0x150, 0x8221)
+    qt.writel(VPU + 0x154, (32 << 16) | 24)
+    qt.writel(VPU + 0x158, OUT)
+    qt.writel(VPU + 0x15C, OUT + 32 * 24)
+    qt.writel(VPU + 0x164, 32)
+    qt.writel(VPU + 0x168, VLC)
+    check('DEC_PIC queued', vpu_cmd(qt, 0x100, inst=0x20000, opt=0), 1)
+    qt.step(10000000)
+    check('done: DEC_PIC reason, instance index in 0x1FC',
+          (qt.readl(VPU + 0x4C) & 0x100, qt.readl(VPU + 0x1FC)), (0x100, 0))
+    vpu_cmd(qt, 0x4000, inst=0x20000, opt=2)
+    check('decoded and displayed: buffer 0',
+          (qt.readl(VPU + 0x170), qt.readl(VPU + 0x174)), (0, 0))
+    check('picture: IDR', qt.readl(VPU + 0x160), (5 << 4) | 1)
+    check('output buffer and VLC buffer given back',
+          (qt.readl(VPU + 0x188), qt.readl(VPU + 0x1A0)), (OUT, VLC))
+    # row 5, left of the counter: the first colour bar, Y 235, Cb/Cr 128
+    check('NV12 written: luma', qt.readb(DRAM + OUT + 5 * 32), 235)
+    check('NV12 written: chroma', qt.readw(DRAM + OUT + 32 * 24 + 2 * 32),
+          0x8080)
+
+
 def hmp(qemu, args, cmds):
     """Run QEMU with an HMP monitor on stdio; return what it printed."""
     p = subprocess.run([qemu] + args + ['-display', 'none', '-nodefaults',
@@ -408,6 +517,7 @@ def main():
         test_uhc(qt)
         test_sata(qt)
         test_display(qt)
+        test_vpu(qt)
     finally:
         qt.close()
     test_migration(args.qemu, tmp, path)

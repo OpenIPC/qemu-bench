@@ -82,6 +82,7 @@ cp qemu/hw/net/sstar-emac.c         "$QEMU_DIR/hw/net/"
 cp qemu/hw/display/mstar-ge.c       "$QEMU_DIR/hw/display/"
 cp qemu/hw/display/mstar-disp.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
+cp qemu/hw/misc/sstar-vpu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
@@ -397,6 +398,23 @@ for f in misc/sstar-riu intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/ss
         echo "  hw/${f%/*}/meson.build: added ${f#*/}.c"
     fi
 done
+# The VPU model decodes with libavcodec when it is there (pkg-config), and
+# answers its registers without pictures when it is not.  (The define
+# reaches every system_ss file; only sstar-vpu.c looks at it.)
+if ! grep -q "'sstar-vpu.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'MESON'
+sstar_avcodec = dependency('libavcodec', required: false)
+sstar_avutil = dependency('libavutil', required: false)
+if sstar_avcodec.found() and sstar_avutil.found()
+  system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: [files('sstar-vpu.c'),
+    sstar_avcodec, sstar_avutil,
+    declare_dependency(compile_args: '-DSSTAR_VPU_LIBAVCODEC')])
+else
+  system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-vpu.c'))
+endif
+MESON
+    echo "  hw/misc/meson.build: added sstar-vpu.c"
+fi
 if ! grep -q "'sigmastar.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sigmastar.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
