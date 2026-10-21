@@ -229,6 +229,11 @@ A 128/256 MiB `flash-file` is a W25N SPI NAND instead of a NOR (FDT then at
 two command bytes and has whole-page ops 0x15/0x16 with the OOB in the spare
 SRAM at +0x200. The OpenIPC kernels lack the NAND driver, so it is tested
 with the vendor `FW98566A.bin` (`qemu-boot/test-novatek-nand.sh`).
+Its USB host (`hw/usb/nvt-usb.c`) is QEMU's FUSBH200 EHCI plus the
+FOTG200 glue. The driver reads the port speed from +0x80 and finds the
+block at 0xFF600000, not 0xF0600000. It needs `nvt-otp` and the
+`nvt_otp` DT node for its PHY trim. No shipped kernel has the driver;
+`qemu-boot/build-novatek-usb-kernel.sh` builds one.
 Its SD hosts (`hw/sd/nvt-sdio.c`) DMA through a descriptor table under
 Linux but a plain address under U-Boot (`0x1FC` = 1). Linux relies on the
 clock framework's CG reset pulse to undo that, so `nvt-cg` drives

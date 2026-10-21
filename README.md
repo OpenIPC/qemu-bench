@@ -245,7 +245,9 @@ scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). The 566 boards' SPI NAND
 is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
 (`qemu-boot/test-novatek-nand.sh`). SD cards attach with
 `-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
-vendor U-Boot read and write them. `reboot` works the
+vendor U-Boot read and write them. The USB host (FOTG200) works under the
+vendor EHCI driver; no shipped kernel enables it, so
+`qemu-boot/build-novatek-usb-kernel.sh` builds one. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
@@ -386,11 +388,13 @@ qemu/
 ├── hw/misc/nvt-top.c            # TOP: pinmux storage, chip ID
 ├── hw/misc/nvt-cg.c             # Clock generator: PLL ratios, gates, resets
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
+├── hw/misc/nvt-otp.c            # OTP / eFuse controller, blank array
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
 ├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
 ├── hw/ssi/nvt-flash.c           # SPI NOR controller (operation sequencer, flash-file)
 ├── hw/sd/nvt-sdio.c             # Novatek SD hosts (descriptor / plain DMA, PIO)
 ├── hw/net/nvt-eqos.c            # DWC Ethernet QoS (GMAC 4.x) + embedded PHY
+├── hw/usb/nvt-usb.c             # Novatek FOTG200 host: FUSBH200 EHCI + OTG glue
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
@@ -414,6 +418,8 @@ qemu-boot/
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
+├── build-novatek-usb-kernel.sh  # OpenIPC nt9856x kernel + EHCI/usb-storage, for the USB test
+├── test-novatek-usb.sh          # NT9856x USB stick under the vendor EHCI driver
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
