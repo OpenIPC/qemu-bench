@@ -9,7 +9,7 @@
  *
  *   0x00 CFG       bit 0 software reset (clears itself); [3:1] key width
  *                  256 << n bits; [5:4] 0 normal, 1 / 2 CRC32 of N / of
- *                  E or D (key checks; not modelled)
+ *                  E or D (key checks; not modelled: they never finish)
  *   0x04 CTRL      bit 0 starts; it clears when the result is in
  *   0x08 INT_ENB   0x0C INT_STS: bit 0 done (write 1 to clear), bit 1
  *                  busy; SPI 20 = STS & ENB
@@ -179,7 +179,8 @@ static void nvt_rsa_update_irq(NvtRsaState *s)
     qemu_set_irq(s->irq, !!(*reg(s, RSA_INT_STS) & *reg(s, RSA_INT_ENB)));
 }
 
-static void nvt_rsa_run(NvtRsaState *s)
+/* Run the operation CFG names; false if the model does not do it. */
+static bool nvt_rsa_run(NvtRsaState *s)
 {
     uint32_t cfg = *reg(s, RSA_CFG);
     int width = (cfg >> 1) & 7, mode = (cfg >> 4) & 3, n;
@@ -187,21 +188,22 @@ static void nvt_rsa_run(NvtRsaState *s)
 
     if (mode) {
         qemu_log_mask(LOG_UNIMP, "nvt-rsa: CRC32 key check mode %d\n", mode);
-        return;
+        return false;
     }
     if (width > 3) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-rsa: key width %d bits\n",
                       256 << width);
-        return;
+        return false;
     }
     n = 8 << width;
     if (!(s->sram[PORT_N][0] & 1)) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-rsa: even modulus\n");
         memset(s->sram[PORT_DATA], 0, n * 4);
-        return;
+        return true;
     }
     bn_mod_exp(r, s->sram[PORT_DATA], s->sram[PORT_ED], s->sram[PORT_N], n);
     memcpy(s->sram[PORT_DATA], r, n * 4);
+    return true;
 }
 
 /* The port at 'off' and its index register. */
@@ -257,8 +259,13 @@ static void nvt_rsa_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     case RSA_CTRL:
-        if (val & 1) {
-            nvt_rsa_run(s);
+        /*
+         * An operation the model does not do (the CRC32 key checks, a
+         * width past this die's SRAM) never completes, as a request the
+         * engine cannot run: the driver times it out.  The Linux driver
+         * asks for neither.
+         */
+        if ((val & 1) && nvt_rsa_run(s)) {
             *reg(s, RSA_INT_STS) |= 1;
         }
         break;

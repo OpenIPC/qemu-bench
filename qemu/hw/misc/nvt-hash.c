@@ -238,7 +238,8 @@ static void nvt_hash_key_pad(NvtHashState *s, uint8_t *blk, uint8_t pad)
     }
 }
 
-static void nvt_hash_run(NvtHashState *s, uint32_t cfg)
+/* Run a chunk; false if its DMA failed, with OUT then cleared. */
+static bool nvt_hash_run(NvtHashState *s, uint32_t cfg)
 {
     int mode = (cfg >> 4) & 3;
     bool hmac = mode >= 2;
@@ -251,7 +252,7 @@ static void nvt_hash_run(NvtHashState *s, uint32_t cfg)
 
     if (!(cfg & CFG_DMA)) {
         qemu_log_mask(LOG_UNIMP, "nvt-hash: PIO mode\n");
-        return;
+        return false;
     }
     sha_init(&c, mode & 1);
     if (cfg & CFG_IV_REGS) {
@@ -270,7 +271,7 @@ static void nvt_hash_run(NvtHashState *s, uint32_t cfg)
         if (dma_memory_read(&address_space_memory, src + done, buf, n,
                             MEMTXATTRS_UNSPECIFIED)) {
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-hash: DMA read failed\n");
-            return;
+            return false;
         }
         for (i = 0; i < n; i += 64) {
             sha_block(&c, buf + i);
@@ -282,7 +283,7 @@ static void nvt_hash_run(NvtHashState *s, uint32_t cfg)
         if (dma_memory_read(&address_space_memory, src + done, buf, n,
                             MEMTXATTRS_UNSPECIFIED)) {
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-hash: DMA read failed\n");
-            return;
+            return false;
         }
         sha_final(&c, buf, n, (uint64_t)*reg(s, HS_PADLEN) + (hmac ? 64 : 0));
         if (hmac && (cfg & CFG_HMAC_OPAD)) {
@@ -302,6 +303,7 @@ static void nvt_hash_run(NvtHashState *s, uint32_t cfg)
     for (i = 0; i < 8; i++) {
         *reg(s, HS_OUT + 4 * i) = bswap32(c.h[i]);
     }
+    return true;
 }
 
 static uint64_t nvt_hash_read(void *opaque, hwaddr off, unsigned size)
@@ -324,8 +326,15 @@ static void nvt_hash_write(void *opaque, hwaddr off, uint64_t val,
         }
         *reg(s, off) = val;
         if (val & CFG_START) {
-            /* The whole chunk at once: it is done before the next access. */
-            nvt_hash_run(s, val);
+            /*
+             * The whole chunk at once: it is done before the next access.
+             * One the engine could not read leaves no digest behind --
+             * not the last request's -- and is still done, so the driver
+             * sees the zeros rather than waiting out its timeout.
+             */
+            if (!nvt_hash_run(s, val)) {
+                memset(reg(s, HS_OUT), 0, 32);
+            }
             *reg(s, HS_INT_STS) |= 1;
         }
         break;

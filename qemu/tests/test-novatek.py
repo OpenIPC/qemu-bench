@@ -66,14 +66,16 @@ plays the vendor drivers (docs/novatek.md):
     and a machine reset restoring timer 0;
   - nvt-crypto, the way na51089_crypto.c and U-Boot drive it: a PIO
     AES block (FIPS-197), and by descriptor DMA AES-CBC and CTR
-    (SP 800-38A; CV written back, a partial last block), GCM (the McGrew
+    (SP 800-38A; CV written back, a partial last block, a block split
+    across two descriptor entries), GCM (the McGrew
     and Viega cases; the tag from S0 and GHASH), DES and 3DES, the OTP
     key manager's (blank, zero) key and "get S0", with SPI 38;
   - nvt-hash: SHA-1 / SHA-256 padded by the engine, a message in two
     chunks chained through the IV registers, HMAC-SHA-1 / -256 (RFC 2202,
-    4231), SPI 28;
+    4231), an unreadable chunk leaving no digest, SPI 28;
   - nvt-rsa: 256, 512 and 2048-bit modular exponentiation through the
-    SRAM ports, against Python's pow(), SPI 20;
+    SRAM ports, against Python's pow(), SPI 20; a CRC32 key check never
+    reporting done;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -1195,6 +1197,24 @@ def test_crypto(qt):
     back, _, _, _ = crypto_dma(qt, 2, 1, out, k, bytes(range(16)), True)
     check('and decrypted back', back, p)
 
+    # The same two blocks in two entries split 7 bytes in, each with its
+    # own destination: the block across the split still encrypts.
+    desc = bytearray(0x80 + 32 * 16)
+    desc[0:16] = k
+    desc[0x20:0x30] = bytes(range(16))
+    struct.pack_into('<I', desc, 0x40, 2 << 4 | 1 << 8)
+    struct.pack_into('<IIII', desc, 0x80, SRC, DST, 7, 0)
+    struct.pack_into('<IIII', desc, 0x90, SRC + 0x100, DST + 0x100, 25, 1)
+    qt.write(SRC, p[:7])
+    qt.write(SRC + 0x100, p[7:])
+    qt.write(DESC, bytes(desc))
+    qt.writel(CRYPTO + 0x50, DESC)
+    qt.writel(CRYPTO + 0x04, 0x10)
+    check('AES-CBC, a block split across two entries',
+          (qt.read(DST, 7) + qt.read(DST + 0x100, 25)).hex(),
+          '7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2')
+    qt.writel(CRYPTO + 0x0C, 0x10)
+
     ctr = bytes.fromhex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff')
     out, cv, _, _ = crypto_dma(qt, 2, 4, p[:16] + p[16:21], k, ctr)
     check('AES-128-CTR (F.5.1), 21 bytes: a partial last block',
@@ -1287,6 +1307,12 @@ def test_hash(qt):
                  1 << 13 | 1 << 21 | 1 << 22, key=b'Jefe')
     check('HMAC-SHA-256 (RFC 4231 case 2)', d.hex(),
           '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
+    qt.writel(HASH + 0x0C, 1)
+    qt.writel(HASH + 0x94, 0xE0000000)          # nothing there
+    qt.writel(HASH + 0x9C, 64)
+    qt.writel(HASH + 0x00, 0x2 | 1 << 4 | 1 << 12 | 1 << 13)
+    check('a chunk it cannot read: done, and no digest left behind',
+          (qt.readl(HASH + 0x0C) & 1, qt.readl(HASH + 0x70)), (1, 0))
 
 
 def rsa_load(qt, port, value, words):
@@ -1319,6 +1345,10 @@ def test_rsa(qt):
           (qt.readl(RSA + 0x0C) & 1, gic_pending(qt, SPI_RSA)), (1, True))
     qt.writel(RSA + 0x0C, 1)
     check('the write-back drops SPI 20', gic_pending(qt, SPI_RSA), False)
+    qt.writel(RSA + 0x00, 1 << 4 | 3 << 1)          # CRC32 of N
+    qt.writel(RSA + 0x04, 1)
+    check('a CRC32 key check (not modelled) never reports done',
+          qt.readl(RSA + 0x0C) & 1, 0)
 
 
 # ---- nvt-usb, nvt-otp -------------------------------------------------------

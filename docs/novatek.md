@@ -555,7 +555,8 @@ and opad blocks itself when asked.
 **`nvt-rsa`** computes DATA ^ E/D mod N, from 256 to 2048 bits. The driver
 writes the operands little-endian into the engine's SRAM through three
 auto-incrementing ports, and reads the result back the same way. The CRC32
-key-check modes are not modelled.
+key-check modes are not modelled: such a request never reports done, and
+the driver (which never asks for one) would time it out.
 
 The engines complete each request at once. The ciphers are implemented
 in the model itself: AES from QEMU's `crypto/aes.c`, and DES, SHA, GHASH

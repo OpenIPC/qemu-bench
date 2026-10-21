@@ -31,10 +31,12 @@
  *
  * The blocks form one data stream, up to the first that ends a group;
  * in GCM that first group is the associated data and a second group the
- * text.  The engine writes back CV, the IV that continues the stream
- * (the last cipher block in CBC and CFB, the last keystream block in OFB,
- * the next counter in CTR and GCM): the driver chains requests longer
- * than 32 blocks through it, and CCM takes its CBC-MAC from it.  S0 is
+ * text; a cipher block may straddle two entries.  The engine writes back
+ * CV, the IV that continues the stream (the last cipher block in CBC and
+ * CFB, the last keystream block in OFB, the next counter in CTR): the
+ * driver chains requests longer than 32 blocks through it, and CCM takes
+ * its CBC-MAC from it.  GCM requests are never chained, and the driver
+ * only checks their CV is set: it is the last counter block used.  S0 is
  * E(K, first counter block): GCM's E(K, J0), or, with "get S0" in CTR
  * mode, the A0 block CCM needs, the text then starting at the next
  * counter.  GHASH is the GCM hash over the associated data, the
@@ -376,6 +378,11 @@ typedef struct {
     uint8_t ks[16];             /* keystream block of the stream modes */
     uint8_t fb[16];             /* CFB: the cipher block being collected */
     int used;                   /* bytes of ks consumed; bsize = none */
+    /* ECB / CBC: a block split between descriptor entries, as collected */
+    uint8_t part[16];
+    uint32_t part_dst[16];
+    bool part_write[16];
+    int part_len;
     NvtGhash gh;
     uint64_t aad_len, text_len;
 } NvtCryptoReq;
@@ -437,7 +444,7 @@ static void req_process(NvtCryptoReq *r, uint8_t *p, size_t n)
     switch (r->op) {
     case OP_ECB:
     case OP_CBC:
-        /* the driver keeps these block-aligned; a tail is left alone */
+        /* whole blocks: req_feed_blocks() carries the rest */
         for (i = 0; i + b <= n; i += b) {
             memcpy(in, p + i, b);
             if (r->op == OP_CBC && !r->decrypt) {
@@ -479,6 +486,51 @@ static void req_process(NvtCryptoReq *r, uint8_t *p, size_t n)
         r->text_len += n;
         break;
     }
+}
+
+/*
+ * ECB / CBC: n bytes of one descriptor entry, bound for dst.  A block
+ * split across entries is collected, then transformed and written back
+ * byte by byte to where each byte was headed.
+ */
+static bool req_feed_blocks(NvtCryptoReq *r, uint8_t *p, uint32_t n,
+                            uint32_t dst, bool write)
+{
+    AddressSpace *as = &address_space_memory;
+    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    int b = r->c.bsize, k;
+    uint32_t i = 0, whole;
+
+    if (r->part_len) {
+        for (; i < n && r->part_len < b; i++, r->part_len++) {
+            r->part[r->part_len] = p[i];
+            r->part_dst[r->part_len] = dst + i;
+            r->part_write[r->part_len] = write;
+        }
+        if (r->part_len < b) {
+            return true;
+        }
+        req_process(r, r->part, b);
+        r->part_len = 0;
+        for (k = 0; k < b; k++) {
+            if (r->part_write[k] &&
+                dma_memory_write(as, r->part_dst[k], &r->part[k], 1, attrs)) {
+                return false;
+            }
+        }
+    }
+    whole = (n - i) / b * b;
+    req_process(r, p + i, whole);
+    if (write && whole &&
+        dma_memory_write(as, dst + i, p + i, whole, attrs)) {
+        return false;
+    }
+    for (i += whole; i < n; i++, r->part_len++) {
+        r->part[r->part_len] = p[i];
+        r->part_dst[r->part_len] = dst + i;
+        r->part_write[r->part_len] = write;
+    }
+    return true;
 }
 
 /* The chaining value the descriptor's CV gets. */
@@ -563,6 +615,13 @@ static bool nvt_crypto_dma(NvtCryptoState *s, hwaddr desc)
                 r->aad_len += n;
                 continue;
             }
+            if (r->op == OP_ECB || r->op == OP_CBC) {
+                if (!req_feed_blocks(r, buf, n, dst + done,
+                                     !(cfg & BLK_NO_WRITE))) {
+                    goto out;
+                }
+                continue;
+            }
             req_process(r, buf, n);
             if (!(cfg & BLK_NO_WRITE) &&
                 dma_memory_write(as, dst + done, buf, n, attrs)) {
@@ -582,6 +641,11 @@ static bool nvt_crypto_dma(NvtCryptoState *s, hwaddr desc)
     if (!group_end) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "nvt-crypto: descriptor without a last block\n");
+    }
+    if (r->part_len) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "nvt-crypto: %d bytes short of a whole block, "
+                      "not written\n", r->part_len);
     }
 
     if (r->op == OP_GCM) {
