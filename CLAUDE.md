@@ -237,7 +237,9 @@ Its USB host (`hw/usb/nvt-usb.c`) is QEMU's FUSBH200 EHCI plus the
 FOTG200 glue. The driver reads the port speed from +0x80 and finds the
 block at 0xFF600000, not 0xF0600000. It needs `nvt-otp` and the
 `nvt_otp` DT node for its PHY trim. No shipped kernel has the driver;
-`qemu-boot/build-novatek-usb-kernel.sh` builds one.
+`qemu-boot/build-novatek-test-kernel.sh` builds one, along with the PWM
+driver (`nvt-pwm`; HDAL's kdrv_comm refuses the vendor `nvt,nvt_pwm`
+node).
 Its SD hosts (`hw/sd/nvt-sdio.c`) DMA through a descriptor table under
 Linux but a plain address under U-Boot (`0x1FC` = 1). Linux relies on the
 clock framework's CG reset pulse to undo that, so `nvt-cg` drives

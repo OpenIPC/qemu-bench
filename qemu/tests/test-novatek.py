@@ -50,6 +50,11 @@ plays the vendor drivers (docs/novatek.md):
     four-byte chunks, the DT / DR / BERR status and SPI 41, a NACK from an
     empty address followed by the driver's lone STOP, an i2cdetect-style
     quick write, and the empty second and third controllers;
+  - nvt-pwm, the way pwm-na51055.c drives it: PERIOD and its extension,
+    ENABLE starting a channel (and its "out" line, high with a nonzero
+    duty), DISABLE stopping it with INT_STS and SPI 26, a cycle-count run
+    ending on its own after cycles x base period at 30 MHz, a divider load
+    flagging CLKDIV_LOAD_STS;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -900,6 +905,54 @@ def test_i2c(qt):
         check('%s is empty' % name, sts & I2C_BERR, I2C_BERR)
 
 
+# ---- nvt-pwm -----------------------------------------------------------------
+
+PWM = 0xF0210000
+SPI_PWM = 26
+
+
+def test_pwm(qt):
+    print('nvt-pwm')
+    gic_enable(qt, SPI_PWM)
+    qt.cmd('irq_intercept_out /machine/nvt-pwm out')
+    # nvt_pwm_config(): 1 ms at 50 %, base 30000 / fall 15000
+    qt.writel(PWM + 0x04, (0x30 << 16) | (0x98 << 8))
+    qt.writel(PWM + 0x230, (0x75 << 16) | (0x3A << 8))
+    qt.writel(PWM + 0xE0, 1)                        # INT_ENABLE channel 0
+    qt.writel(PWM + 0x100, 1)
+    check('ENABLE reads channel 0 running', qt.readl(PWM + 0x100), 1)
+    check('its out line is high', qt.irqs.get(0), True)
+    qt.writel(PWM + 0x104, 1)
+    check('DISABLE stops it', qt.readl(PWM + 0x100), 0)
+    check('INT_STS bit 0: stopped', qt.readl(PWM + 0xF0) & 1, 1)
+    check('SPI 26', gic_pending(qt, SPI_PWM), True)
+    check('out low again', qt.irqs.get(0), False)
+    qt.writel(PWM + 0xF0, 1)
+    check('INT_STS write-back drops it', gic_pending(qt, SPI_PWM), False)
+
+    # nvt_pwm_set_cycle(): 20 cycles x 30000 ticks at 30 MHz = 20 ms
+    qt.writel(PWM + 0x00, 20)
+    qt.writel(PWM + 0x100, 1)
+    qt.step(19 * 1000 * 1000)
+    check('a 20-cycle run: still running at 19 ms', qt.readl(PWM + 0x100), 1)
+    qt.step(2 * 1000 * 1000)
+    check('stopped by 21 ms', qt.readl(PWM + 0x100), 0)
+    check('with INT_STS and SPI 26',
+          (qt.readl(PWM + 0xF0) & 1, gic_pending(qt, SPI_PWM)), (1, True))
+    qt.writel(PWM + 0xF0, 1)
+
+    qt.writel(PWM + 0x04, 0x30 << 16)               # duty 0: fall 0 in
+    qt.writel(PWM + 0x230, 0x75 << 16)              # both bytes
+    qt.writel(PWM + 0x00, 0)
+    qt.writel(PWM + 0x100, 1)
+    check('a zero duty keeps out low', qt.irqs.get(0), False)
+    qt.writel(PWM + 0x104, 1)
+    qt.writel(PWM + 0x10C, 0x2)
+    check('CLKDIV_LOAD flags CLKDIV_LOAD_STS', qt.readl(PWM + 0xFC), 0x2)
+    qt.writel(PWM + 0xF4, 0x55)
+    check('the micro-step status word is storage', qt.readl(PWM + 0xF4), 0x55)
+
+
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
 
 USB = 0xF0600000
@@ -1369,6 +1422,7 @@ def test_fdt(qemu, tmp):
     check('chip-ID node for nvt_get_chip_id()', b'nvt,nvt_top' in data, True)
     check('the USB host and OTP nodes ehci-na51089.c needs',
           b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
+    check('the PWM node pwm-na51055.c binds', b'nvt,nvt_pwm\0' in data, True)
     check('three I2C nodes under the names i2c-nvt.c clocks by',
           find_nodes(data, ['i2c@f0220000', 'i2c2@f0350000',
                             'i2c3@f03a0000']).count(-1), 0)
@@ -1496,6 +1550,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566,sensor=sc401ai')
     try:
         test_i2c(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_pwm(qt)
     finally:
         qt.close()
 

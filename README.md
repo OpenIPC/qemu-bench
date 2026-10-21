@@ -247,7 +247,8 @@ is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
 `-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
 vendor U-Boot read and write them. The USB host (FOTG200) works under the
 vendor EHCI driver; no shipped kernel enables it, so
-`qemu-boot/build-novatek-usb-kernel.sh` builds one. The three I2C
+`qemu-boot/build-novatek-test-kernel.sh` builds one (with the PWM driver
+too, which nothing shipped builds either). The three I2C
 controllers work under the vendor driver, and `sensor=sc401ai` (or
 `sc501ai`) puts a SmartSens chip on I2C 0, which OpenIPC's `ipcinfo` and
 `load_novatek` detect and load the driver for. `reboot` works the
@@ -392,6 +393,7 @@ qemu/
 ├── hw/misc/nvt-cg.c             # Clock generator: PLL ratios, gates, resets
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
 ├── hw/misc/nvt-otp.c            # OTP / eFuse controller, blank array
+├── hw/misc/nvt-pwm.c            # PWM: enable/disable, cycle-count runs, stop interrupts
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
 ├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
 ├── hw/ssi/nvt-flash.c           # SPI NOR controller (operation sequencer, flash-file)
@@ -422,8 +424,9 @@ qemu-boot/
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
-├── build-novatek-usb-kernel.sh  # OpenIPC nt9856x kernel + EHCI/usb-storage, for the USB test
+├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM, for the USB and PWM tests
 ├── test-novatek-usb.sh          # NT9856x USB stick under the vendor EHCI driver
+├── test-novatek-pwm.sh          # NT9856x PWM through /sys/class/pwm (pwm-na51055.c)
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
