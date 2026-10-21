@@ -227,6 +227,22 @@ power-on writes to the 0x3800 block are kept as storage.
 `test-novatek-boot.sh` takes a DHCP lease from `-nic user` and fetches a
 1 MiB file over HTTP, checksummed.
 
+The vendor U-Boot's driver (`eth_na51089.c`) runs on the same model
+unchanged: `ping`, `dhcp` and a 1 MiB `tftp` from `-nic user,tftp=dir`,
+its `crc32` matching the host's. Reaching its prompt takes a key already
+waiting at "Hit any key to stop autoboot", since the SDK build has
+`bootdelay` 0 and keeps its environment nowhere, so nothing can be saved.
+QEMU's 16550 used to lose that key, which is what
+`qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch` fixes. A byte
+that arrives before U-Boot sets up the UART sits in RBR and the backend
+stops polling. U-Boot then resets the receive FIFO and only reads LSR, and
+QEMU never asked the backend for more input: the vCPU spinning on LSR made
+no main-loop events, so the line stalled until Linux read RBR.
+`qemu-boot/test-novatek-uboot-net.sh --flash nor.bin` starts QEMU paused
+with the console on a socket, queues the key, and runs the network checks.
+It needs a vendor image, so it is not in CI. `test-novatek.py` covers the
+UART fix with a small echo guest instead.
+
 ## Running
 
 ```bash
@@ -235,6 +251,7 @@ cd qemu-boot && curl -sL \
   | tar xz && cd ..
 bash qemu-boot/run-nt98562.sh               # SOC=nt98566 for the 128 MB part
 FLASH=nor.bin bash qemu-boot/run-nt98562.sh # a whole flash image
+bash qemu-boot/test-novatek-uboot-net.sh --flash nor.bin   # vendor U-Boot net
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
 python3 qemu/tests/test-novatek.py
 ```
@@ -255,8 +272,7 @@ fetches a file over HTTP, then runs `reboot -f` under `-no-reboot`.
   trains DDR from its ConfigRAM table with closed libraries
   (`Reset_560.a`).
 - An SD card: the SDIO hosts answer as empty slots.
-- Ethernet in the vendor U-Boot (`eth_na51089.c`), which is untested, and
-  the EQoS features the driver leaves off: checksum offload, TSO,
+- The EQoS features the drivers leave off: checksum offload, TSO,
   timestamps, more queues.
 - USB, the Novatek timer, PWM, I2C, crypto/OTP, and the HDAL media
   blocks.

@@ -35,7 +35,9 @@ plays the vendor drivers (docs/novatek.md):
     tail writes, an over-long one dropped with ES / JT; frames injected
     through a socket netdev: unicast filtering, a frame spanning 64-byte
     buffers, Rx stopping at its tail pointer until it moves;
-  - the 16550 UART at its reg-shift-2 offsets;
+  - the 16550 UART at its reg-shift-2 offsets, and input that arrived
+    before the guest set the UART up still flowing after it resets the
+    receive FIFO (qemu/patches/0003, the vendor U-Boot's autoboot stop);
   - the generated device tree: compatible, the clock nodes in the order
     of_clk_init() needs, the pinmux children in the driver's order;
   - outside qtest: machine state migrates to a file and back.
@@ -744,6 +746,61 @@ def test_eqos_rx(qt, sock, port):
     check('and fills it once the tail moves on', rdes3(3) >> 28 & 3, 3)
 
 
+# ldr r0,=0xF0290000; FCR = 7; 1: wait for LSR.DR; RBR -> THR; b 1b
+UART_ECHO = [0xE59F001C, 0xE3A01007, 0xE5801008, 0xE5901014, 0xE3110001,
+             0x0AFFFFFC, 0xE5902000, 0xE5802000, 0xEAFFFFF9, 0xF0290000]
+
+
+def test_uart_rx_after_fifo_reset(qemu, tmp):
+    """Bytes queued on the backend before the guest initialises its UART:
+    one lands in RBR (FIFO off) and the backend stops polling.  The guest
+    then resets the receive FIFO and spins on LSR, never reading RBR -- as
+    U-Boot's ns16550 tstc() does at "Hit any key to stop autoboot".  A
+    spinning vCPU makes no main-loop events, so without
+    qemu/patches/0003 nothing more ever arrives.  Needs a real guest:
+    qtest's own commands wake the main loop and hide the stall."""
+    print('UART input across a receive-FIFO reset')
+    kernel = os.path.join(tmp, 'echo.bin')
+    open(kernel, 'wb').write(struct.pack('<%dI' % len(UART_ECHO), *UART_ECHO))
+    ser_path = os.path.join(tmp, 'echo-ser.sock')
+    mon_path = os.path.join(tmp, 'echo-mon.sock')
+    proc = subprocess.Popen(
+        [qemu, '-M', 'nt98562', '-display', 'none', '-nodefaults', '-S',
+         '-kernel', kernel,
+         '-serial', 'unix:%s,server=on,wait=off' % ser_path,
+         '-monitor', 'unix:%s,server=on,wait=off' % mon_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            if os.path.exists(ser_path) and os.path.exists(mon_path):
+                break
+            time.sleep(0.05)
+        ser = socket.socket(socket.AF_UNIX)
+        ser.connect(ser_path)
+        mon = socket.socket(socket.AF_UNIX)
+        mon.connect(mon_path)
+        ser.sendall(b'abc')
+        time.sleep(0.3)
+        mon.sendall(b'cont\n')
+        got = b''
+        ser.settimeout(0.2)
+        end = time.time() + 3
+        while time.time() < end and b'c' not in got:
+            try:
+                got += ser.recv(64)
+            except socket.timeout:
+                pass
+        # 'a' sat in RBR and went with the FIFO reset, as on silicon
+        check('input queued before UART init is echoed after its FIFO '
+              'reset', got.endswith(b'bc'), True)
+        mon.sendall(b'quit\n')
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def find_nodes(dtb, names):
     """Offsets of FDT_BEGIN_NODE tokens naming these nodes, -1 if absent."""
     return [dtb.find(b'\0\0\0\x01' + n.encode() + b'\0') for n in names]
@@ -856,6 +913,7 @@ def main():
     finally:
         qt.close()
 
+    test_uart_rx_after_fifo_reset(args.qemu, tmp)
     test_fdt(args.qemu, tmp)
     test_migration(args.qemu, tmp)
 
