@@ -75,21 +75,24 @@ else:
 
 ser.settimeout(0.2)
 log = b''
+pos = 0                             # where the next search starts
 
 
 def until(pattern, secs):
-    """Read until pattern shows up after the current point, or time out."""
-    global log
-    start = len(log)
+    """Read until pattern shows up past the last match, or time out."""
+    global log, pos
     end = time.time() + secs
-    while time.time() < end:
-        if pattern in log[start:]:
+    while True:
+        i = log.find(pattern, pos)
+        if i >= 0:
+            pos = i + len(pattern)
             return True
+        if time.time() >= end:
+            return False
         try:
             log += ser.recv(65536)
         except socket.timeout:
             pass
-    return pattern in log[start:]
 
 
 PROMPT = re.compile(rb'(=>|#|\$|:) $')
@@ -97,10 +100,11 @@ PROMPT = re.compile(rb'(=>|#|\$|:) $')
 
 def prompt(secs):
     """Wait for a U-Boot prompt ending the output ("nvt@na51089: ", "=> ")."""
-    global log
+    global log, pos
     end = time.time() + secs
     while time.time() < end:
         if PROMPT.search(log.split(b'\n')[-1]):
+            pos = len(log)
             return True
         try:
             log += ser.recv(65536)
@@ -112,22 +116,24 @@ def prompt(secs):
 ser.sendall(b' ' * 16)              # waiting at the autoboot check
 mon.sendall(b'cont\n')
 results = []
-until(b'Hit any key', 30)
-ser.sendall(b'\r')
-results.append(('autoboot stopped at the U-Boot prompt',
-                prompt(10) and b'Starting kernel' not in log))
-# dhcp first: the built-in ipaddr (192.168.1.99) is not on SLIRP's net
-ser.sendall(b'dhcp 0x1000000 blob.bin\r')
-results.append(('DHCP lease', until(b'DHCP client bound', 20)))
-results.append(('TFTP 1 MiB', until(b'Bytes transferred = 1048576', 60)))
-prompt(10)
-ser.sendall(b'ping 10.0.2.2\r')
-results.append(('ping the gateway', until(b'is alive', 20)))
-prompt(10)
-ser.sendall(b'crc32 0x1000000 0x100000\r')
-results.append(('crc32 matches the host (%s)' % crc,
-                until(('==> ' + crc).encode(), 20)))
-mon.sendall(b'quit\n')
+try:
+    until(b'Hit any key', 30)
+    ser.sendall(b'\r')
+    results.append(('autoboot stopped at the U-Boot prompt',
+                    prompt(10) and b'Starting kernel' not in log))
+    # dhcp first: the built-in ipaddr (192.168.1.99) is not on SLIRP's net
+    ser.sendall(b'dhcp 0x1000000 blob.bin\r')
+    results.append(('DHCP lease', until(b'DHCP client bound', 20)))
+    results.append(('TFTP 1 MiB', until(b'Bytes transferred = 1048576', 60)))
+    prompt(10)
+    ser.sendall(b'ping 10.0.2.2\r')
+    results.append(('ping the gateway', until(b'is alive', 20)))
+    prompt(10)
+    ser.sendall(b'crc32 0x1000000 0x100000\r')
+    results.append(('crc32 matches the host (%s)' % crc,
+                    until(('==> ' + crc).encode(), 20)))
+finally:
+    mon.sendall(b'quit\n')
 
 sys.stdout.write(log.decode('latin1'))
 print()
@@ -139,6 +145,13 @@ sys.exit(fail)
 PY
 rc=$?
 set -e
+# Python quits QEMU through the monitor; if it died before that, do it here
+# rather than wait on a QEMU still paused under -S.
+for _ in $(seq 50); do
+    kill -0 "$QPID" 2>/dev/null || break
+    sleep 0.1
+done
+kill "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
 QPID=
 exit $rc

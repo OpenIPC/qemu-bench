@@ -47,6 +47,7 @@ plays the vendor drivers (docs/novatek.md):
 import argparse
 import os
 import random
+import re
 import socket
 import struct
 import subprocess
@@ -780,7 +781,21 @@ def test_uart_rx_after_fifo_reset(qemu, tmp):
         mon = socket.socket(socket.AF_UNIX)
         mon.connect(mon_path)
         ser.sendall(b'abc')
-        time.sleep(0.3)
+        # Still paused: wait until 'a' really sits in RBR (LSR.DR, read
+        # through the monitor, which does not touch RBR) -- the state the
+        # stall needs -- before the guest runs.
+        mon.settimeout(0.2)
+        dr = False
+        for _ in range(100):
+            mon.sendall(b'xp /1wx 0x%x\n' % (UART0 + 0x14))
+            time.sleep(0.05)
+            try:
+                if re.search(rb': 0x[0-9a-f]*[13579bdf]\b', mon.recv(4096)):
+                    dr = True
+                    break
+            except socket.timeout:
+                pass
+        check('a byte waits in RBR before the guest runs', dr, True)
         mon.sendall(b'cont\n')
         got = b''
         ser.settimeout(0.2)
@@ -792,7 +807,7 @@ def test_uart_rx_after_fifo_reset(qemu, tmp):
                 pass
         # 'a' sat in RBR and went with the FIFO reset, as on silicon
         check('input queued before UART init is echoed after its FIFO '
-              'reset', got.endswith(b'bc'), True)
+              'reset', got, b'bc')
         mon.sendall(b'quit\n')
         proc.wait(timeout=10)
     finally:
