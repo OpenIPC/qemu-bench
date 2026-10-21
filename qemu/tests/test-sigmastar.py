@@ -27,7 +27,9 @@ IPL, U-Boot and kernel drivers (docs/sigmastar.md):
     python3 qemu/tests/test-sigmastar.py [--qemu PATH]
 """
 import argparse
+import atexit
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -112,6 +114,7 @@ class QTest:
     def close(self):
         self.proc.kill()
         self.proc.wait()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 failures = 0
@@ -510,6 +513,7 @@ def main():
         '../../qemu-src/build/qemu-system-arm'))
     args = ap.parse_args()
     tmp = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, tmp, True)
     path = os.path.join(tmp, 'nor.bin')
     out = os.path.join(tmp, 'uart.out')
     pcap = os.path.join(tmp, 'net.pcap')
