@@ -46,6 +46,12 @@ def main():
     a = ap.parse_args()
 
     d = bytearray(open(a.flash, 'rb').read())
+    if a.offset < 0 or a.size < 8 or a.offset + a.size > len(d):
+        raise SystemExit('the environment at 0x%x (0x%x bytes) is not inside '
+                         '%s (0x%x bytes)' % (a.offset, a.size, a.flash, len(d)))
+    if not a.uboot and not 0 <= a.uboot_at < a.offset:
+        raise SystemExit('U-Boot at 0x%x is not before the environment'
+                         % a.uboot_at)
     if a.uboot:
         uboot = open(a.uboot, 'rb').read()
     else:

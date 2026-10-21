@@ -12,6 +12,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/host-utils.h"
+#include "qemu/units.h"
 #include "hw/arm/nvt-lzma.h"
 
 #define LZMA_HDR            13
@@ -165,9 +167,29 @@ static void probs_init(Prob *p, size_t n)
     }
 }
 
+/*
+ * A header an encoder writes: lc/lp/pb in range, a dictionary of 2^n or
+ * 3 * 2^(n-1) bytes from 4 KiB to 1 GiB (the xz/LZMA SDK presets), an
+ * unpacked size that is "unknown" or below 1 GiB, and the range coder's
+ * leading zero byte.  The dictionary test is what tells a packed image
+ * from a plain one: an AArch64 U-Boot passes the rest (byte 0 is the low
+ * byte of "b reset", byte 13 the top of a _TEXT_BASE below 4 GiB).
+ */
 bool nvt_lzma_probe(const uint8_t *in, size_t inlen)
 {
-    return inlen > LZMA_HDR && in[0] < 9 * 5 * 5 && in[LZMA_HDR] == 0;
+    uint32_t dict;
+    uint64_t unpack;
+
+    if (inlen <= LZMA_HDR || in[0] >= 9 * 5 * 5 || in[LZMA_HDR] != 0) {
+        return false;
+    }
+    dict = ldl_le_p(in + 1);
+    unpack = ldq_le_p(in + 5);
+    if (dict < 4 * KiB || dict > 1 * GiB ||
+        !(is_power_of_2(dict) || (dict % 3 == 0 && is_power_of_2(dict / 3)))) {
+        return false;
+    }
+    return unpack == UINT64_MAX || unpack < 1 * GiB;
 }
 
 ssize_t nvt_lzma_decode(const uint8_t *in, size_t inlen,

@@ -197,8 +197,11 @@ static void nvt_lcd300_scanout(NvtLcd300State *s, uint32_t *dst,
         }
         switch (ctrl & 0xF) {
         case FMT_YUV420SP:
-            nvt_lcd300_draw_yuv(a0, *reg(s, base + LCD_CH_ADDR1), dst, cw,
-                                ch, stride);
+            /* Chroma comes in U/V pairs: an even number of pixels. */
+            if (cw & ~1) {
+                nvt_lcd300_draw_yuv(a0, *reg(s, base + LCD_CH_ADDR1), dst,
+                                    cw & ~1, ch, stride);
+            }
             break;
         case FMT_ARGB1555:
         case FMT_ARGB8888:

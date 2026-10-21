@@ -192,25 +192,60 @@ static void silence(hwaddr addr, uint32_t len)
     }
 }
 
+/*
+ * The longest RX buffer set up: every active channel completes on the same
+ * tick, so the tick is as long as the longest of them (the vendor queues
+ * the same size on every channel).  0 when there is none.
+ */
+static uint32_t rx_len(NvtDaiState *s, uint32_t mask)
+{
+    uint32_t len = 0;
+    int k;
+
+    for (k = 0; k < DAI_RXM_CHANNELS; k++) {
+        if (mask & (1u << k)) {
+            len = MAX(len, buf_bytes(s, DAI_RXM_SIZE(k)));
+        }
+    }
+    return len ? len : buf_bytes(s, DAI_RX_SIZE(0));
+}
+
+static bool rx_running(NvtDaiState *s)
+{
+    uint32_t ctrl = *reg(s, DAI_CTRL);
+
+    return (ctrl & CTRL_RX_DMA) && (ctrl & CTRL_RX);
+}
+
+/* Start the RX clock: a running receiver with a buffer to fill. */
+static void nvt_dai_rx_arm(NvtDaiState *s)
+{
+    uint32_t len = rx_len(s, rx_channels(s));
+
+    if (rx_running(s) && len && !timer_pending(s->rx_timer)) {
+        timer_mod(s->rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  buf_period_ns(len));
+    }
+}
+
 static void nvt_dai_rx_tick(void *opaque)
 {
     NvtDaiState *s = opaque;
-    uint32_t ctrl = *reg(s, DAI_CTRL), mask, len = 0;
+    uint32_t mask = rx_channels(s), len = rx_len(s, mask);
     int k;
 
-    if (!(ctrl & CTRL_RX_DMA) || !(ctrl & CTRL_RX)) {
+    /* No buffer, no completion: a later one restarts the clock. */
+    if (!rx_running(s) || !len) {
         return;
     }
-    mask = rx_channels(s);
     for (k = 0; k < DAI_RXM_CHANNELS; k++) {
         if (mask & (1u << k)) {
-            len = buf_bytes(s, DAI_RXM_SIZE(k));
-            silence(*reg(s, DAI_RXM_ADDR(k)), len);
+            silence(*reg(s, DAI_RXM_ADDR(k)),
+                    buf_bytes(s, DAI_RXM_SIZE(k)));
         }
     }
     if (mask == 1 && !buf_bytes(s, DAI_RXM_SIZE(0))) {
-        len = buf_bytes(s, DAI_RX_SIZE(0));
-        silence(*reg(s, DAI_RX_ADDR(0)), len);
+        silence(*reg(s, DAI_RX_ADDR(0)), buf_bytes(s, DAI_RX_SIZE(0)));
     }
     *reg(s, DAI_STS0) |= STS0_RX_DONE;
     *reg(s, DAI_CH_STS_DONE) |= mask;
@@ -243,9 +278,26 @@ static void nvt_dai_tx_tick(void *opaque)
               buf_period_ns(len));
 }
 
+/* Start the TX clock: a running transmitter with a buffer to play. */
+static void nvt_dai_tx_arm(NvtDaiState *s)
+{
+    uint32_t len = 0;
+    int n;
+
+    for (n = 0; n < 2; n++) {
+        if ((*reg(s, DAI_CTRL) & CTRL_TX(n)) &&
+            (tx_channels(s) & (1u << n))) {
+            len = MAX(len, buf_bytes(s, DAI_TX_SIZE(n)));
+        }
+    }
+    if (len && !timer_pending(s->tx_timer)) {
+        timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  buf_period_ns(len));
+    }
+}
+
 static void nvt_dai_ctrl(NvtDaiState *s, uint32_t old, uint32_t val)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t rise = val & ~old;
     int n;
 
@@ -257,23 +309,13 @@ static void nvt_dai_ctrl(NvtDaiState *s, uint32_t old, uint32_t val)
             nvt_dai_tx_load(s);
         }
     }
-    if ((val & CTRL_RX_DMA) && (val & CTRL_RX)) {
-        if (!timer_pending(s->rx_timer)) {
-            uint32_t len = buf_bytes(s, DAI_RXM_SIZE(ctz32(rx_channels(s) |
-                                                    (1u << 31))));
-
-            timer_mod(s->rx_timer, now + buf_period_ns(len ? len :
-                      buf_bytes(s, DAI_RX_SIZE(0))));
-        }
+    if (rx_running(s)) {
+        nvt_dai_rx_arm(s);
     } else {
         timer_del(s->rx_timer);
     }
-    if (tx_channels(s) && (val & (CTRL_TX(0) | CTRL_TX(1)))) {
-        if (!timer_pending(s->tx_timer)) {
-            timer_mod(s->tx_timer, now +
-                      buf_period_ns(MAX(buf_bytes(s, DAI_TX_SIZE(0)),
-                                        buf_bytes(s, DAI_TX_SIZE(1)))));
-        }
+    if (val & (CTRL_TX(0) | CTRL_TX(1))) {
+        nvt_dai_tx_arm(s);
     } else {
         timer_del(s->tx_timer);
     }
@@ -315,12 +357,27 @@ static void nvt_dai_write(void *opaque, hwaddr offset, uint64_t value,
     case DAI_CTRL:
         nvt_dai_ctrl(s, old, val);
         break;
+    case DAI_TX_SIZE(0):
+    case DAI_TX_SIZE(1):
+        nvt_dai_tx_arm(s);
+        break;
+    case DAI_RX_SIZE(0):
+    case DAI_RX_SIZE(1):
+        nvt_dai_rx_arm(s);
+        break;
     case DAI_INT_EN0:
     case DAI_INT_EN1:
     case DAI_CH_EN_DONE:
     case DAI_CH_EN_LOAD:
     case DAI_CH_EN_C8:
         nvt_dai_update_irq(s);
+        break;
+    default:
+        if (offset >= DAI_RXM_SIZE(0) &&
+            offset <= DAI_RXM_SIZE(DAI_RXM_CHANNELS - 1) &&
+            (offset - DAI_RXM_SIZE(0)) % 0x20 == 0) {
+            nvt_dai_rx_arm(s);
+        }
         break;
     }
 }

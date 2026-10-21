@@ -728,19 +728,27 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
             exit(1);
         }
         ub_len = raw;
-    } else if (nvt_lzma_probe(part, ub_size)) {
-        ssize_t raw;
-
-        uboot = g_malloc(MIN(ub_max, NVT_UBOOT_MAX));
-        raw = nvt_lzma_decode(part, ub_size, uboot, MIN(ub_max, NVT_UBOOT_MAX));
-        if (raw < 4) {
-            error_report("novatek: LZMA U-Boot does not unpack");
-            exit(1);
-        }
-        ub_len = raw;
     } else {
-        uboot = g_steal_pointer(&part);
-        ub_len = MIN(ub_size, ub_max);
+        /*
+         * Xiongmai's NA51103 U-Boot is LZMA; anything that does not unpack
+         * as such is taken as a plain image, as before.
+         */
+        if (nvt_lzma_probe(part, ub_size)) {
+            ssize_t raw;
+
+            uboot = g_malloc(MIN(ub_max, NVT_UBOOT_MAX));
+            raw = nvt_lzma_decode(part, ub_size, uboot,
+                                  MIN(ub_max, NVT_UBOOT_MAX));
+            if (raw >= 4) {
+                ub_len = raw;
+            } else {
+                g_clear_pointer(&uboot, g_free);
+            }
+        }
+        if (!uboot) {
+            uboot = g_steal_pointer(&part);
+            ub_len = MIN(ub_size, ub_max);
+        }
     }
 
     /* SHMINFO (arch/arm/include/asm/nvt-common/shm_info.h), as the loader
@@ -1493,7 +1501,7 @@ static void novatek_a64_init(MachineState *machine, const NvtSoCConfig *c)
 
     if (machine->kernel_filename && !machine->dtb) {
         error_report("novatek: %s needs the firmware's device tree (-dtb)",
-                     machine->cpu_type);
+                     MACHINE_GET_CLASS(machine)->name);
         exit(1);
     }
     binfo.ram_size = MIN(c->linux_mem, machine->ram_size);
