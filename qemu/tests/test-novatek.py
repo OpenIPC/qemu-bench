@@ -56,6 +56,14 @@ plays the vendor drivers (docs/novatek.md):
     duty), DISABLE stopping it with INT_STS and SPI 26, a cycle-count run
     ending on its own after cycles x base period at 30 MHz, a divider load
     flagging CLKDIV_LOAD_STS;
+  - nvt-timer, the way timer_cfg() and U-Boot drive it: timer 0
+    running free at 1 MHz out of reset, a one-shot timer counting to its
+    target, flagging STS and SPI 0 and stopping, a free-running one on
+    divider 1 wrapping and going on, a divider change mid-period (and
+    repeated ones at 600 kHz keeping every tick), 3 MHz periods without
+    drift, a switch to one shot mid-period, RELOAD,
+    a disabled timer holding its count, STS without INT raising nothing,
+    and a machine reset restoring timer 0;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -986,6 +994,122 @@ def test_pwm(qt):
     check('the micro-step status word is storage', qt.readl(PWM + 0xF4), 0x55)
 
 
+# ---- nvt-timer ---------------------------------------------------------------
+
+TIMER = 0xF0040000
+SPI_TIMER = 0
+
+
+def tmr(n, off):
+    return TIMER + 0x100 + n * 0x10 + off
+
+
+def timer_cfg(qt, n, target, ctrl):
+    """timer_cfg(): stop, clear status, enable the interrupt, start."""
+    qt.writel(tmr(n, 0), 0)
+    qt.writel(TIMER + 0x10, 1 << n)
+    qt.writel(TIMER + 0x20, qt.readl(TIMER + 0x20) | 1 << n)
+    qt.writel(tmr(n, 4), target)
+    qt.writel(tmr(n, 0), ctrl)
+
+
+def test_timer(qt):
+    print('nvt-timer')
+    gic_enable(qt, SPI_TIMER)
+    check('timer 0 runs free out of reset (U-Boot\'s microsecond clock)',
+          qt.readl(tmr(0, 0)), 3)
+    t0 = qt.readl(tmr(0, 8))
+    qt.step(5000 * 1000)
+    check('COUNTER 0 advances 5000 in 5 ms: 1 MHz',
+          qt.readl(tmr(0, 8)) - t0, 5000)
+
+    # one shot, divider 0: 1000 ticks
+    timer_cfg(qt, 3, 999, 1)
+    check('enable reads back at once (timer_cfg() polls it)',
+          qt.readl(tmr(3, 0)) & 1, 1)
+    qt.step(400 * 1000)
+    check('one shot: 400 counted at 400 us', qt.readl(tmr(3, 8)), 400)
+    qt.step(599 * 1000)
+    check('no status before the target', qt.readl(TIMER + 0x10) & 1 << 3, 0)
+    qt.step(1000)
+    check('STS bit 3 at 1 ms, and SPI 0',
+          (qt.readl(TIMER + 0x10) & 1 << 3, gic_pending(qt, SPI_TIMER)),
+          (1 << 3, True))
+    check('a one-shot timer stops, enable clear and COUNTER at its target',
+          (qt.readl(tmr(3, 0)) & 1, qt.readl(tmr(3, 8))), (0, 999))
+    qt.writel(TIMER + 0x10, 1 << 3)
+    check('STS write-back drops SPI 0', gic_pending(qt, SPI_TIMER), False)
+
+    # free run, divider 1 at 3 MHz / (5 + 1) = 500 kHz: a 2 ms period
+    qt.writel(TIMER + 0x30, (5 << 8) | 1 << 17)
+    timer_cfg(qt, 5, 999, 7)
+    qt.step(2000 * 1000)
+    check('free run on divider 1: STS at 2 ms (500 kHz)',
+          qt.readl(TIMER + 0x10) & 1 << 5, 1 << 5)
+    qt.writel(TIMER + 0x10, 1 << 5)
+    check('it goes on', qt.readl(tmr(5, 0)) & 1, 1)
+    qt.step(1000 * 1000)
+    check('wrapped: 500 counted 1 ms into the next period',
+          qt.readl(tmr(5, 8)), 500)
+    qt.writel(TIMER + 0x30, (2 << 8) | 1 << 17)     # 1 MHz
+    qt.step(250 * 1000)
+    check('a divider change carries the count on at the new rate',
+          qt.readl(tmr(5, 8)), 750)
+    qt.writel(tmr(5, 0xC), 1)
+    qt.step(100 * 1000)
+    check('RELOAD starts a new period', qt.readl(tmr(5, 8)), 100)
+    qt.writel(tmr(5, 0), 6)
+    held = qt.readl(tmr(5, 8))
+    qt.step(1000 * 1000)
+    check('disabled, the count holds', qt.readl(tmr(5, 8)), held)
+    qt.step(2000 * 1000)
+    check('and no more status', qt.readl(TIMER + 0x10) & 1 << 5, 0)
+    qt.writel(TIMER + 0x20, 0)
+    qt.writel(tmr(7, 4), 9)
+    qt.writel(tmr(7, 0), 1)
+    qt.step(20 * 1000)
+    check('a status bit without its INT bit raises nothing',
+          (qt.readl(TIMER + 0x10) & 1 << 7, gic_pending(qt, SPI_TIMER)),
+          (1 << 7, False))
+    qt.writel(TIMER + 0x10, 1 << 7)
+    qt.writel(tmr(5, 8), 1234)
+    check('COUNTER is read-only', qt.readl(tmr(5, 8)), held)
+    # divider 1 at 3 MHz / (4 + 1) = 600 kHz: a tick is 1666.7 ns, so a
+    # rebase that went through nanoseconds and back would lose it
+    qt.writel(TIMER + 0x30, (4 << 8) | 1 << 17)
+    timer_cfg(qt, 11, 0xFFFFFF, 5)
+    qt.step(1700)
+    counts = []
+    for _ in range(5):
+        qt.writel(TIMER + 0x30, (4 << 8) | 1 << 17)
+        counts.append(qt.readl(tmr(11, 8)))
+    check('divider rewrites at 600 kHz keep the count (1, not back to 0)',
+          counts, [1] * 5)
+    qt.writel(tmr(11, 0), 0)
+    # 3 MHz, a 1 us period: no drift from rounding each period to 333 ns
+    qt.writel(TIMER + 0x30, 1 << 17)
+    timer_cfg(qt, 12, 2, 7)
+    qt.writel(TIMER + 0x20, 0)
+    qt.step(10 * 1000 * 1000 + 334)
+    check('3 MHz, period 3 ticks: 10 ms and 334 ns in, count 1',
+          qt.readl(tmr(12, 8)), 1)
+    qt.writel(tmr(12, 0), 5)                        # free run -> one shot
+    qt.step(1000)
+    check('switched to one shot mid-period: it ends there and stops',
+          (qt.readl(tmr(12, 0)) & 1, qt.readl(tmr(12, 8))), (0, 2))
+    qt.writel(TIMER + 0x10, 0xFFFFF)
+    # The machine reset (the kernel's manual watchdog reset) restarts
+    # timer 0 as the loader leaves it, and stops the rest.
+    qt.writel(tmr(9, 4), 0xFFFF)
+    qt.writel(tmr(9, 0), 1)
+    qt.writel(WDT + 0x00, 0x5A960112)
+    qt.writel(WDT + 0x00, 0x5A960113)
+    qt.writel(WDT + 0x0C, 1)
+    qt.step(1000)
+    check('a machine reset: timer 0 free-running again, timer 9 stopped',
+          (qt.readl(tmr(0, 0)), qt.readl(tmr(9, 0))), (3, 0))
+
+
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
 
 USB = 0xF0600000
@@ -1456,6 +1580,9 @@ def test_fdt(qemu, tmp):
     check('the USB host and OTP nodes ehci-na51089.c needs',
           b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
     check('the PWM node pwm-na51055.c binds', b'nvt,nvt_pwm\0' in data, True)
+    check('the timer node kdrv_comm.ko binds: timer@f0040000, nvt,nvt_timer',
+          find_nodes(data, ['timer@f0040000'])[0] > 0 and
+          b'nvt,nvt_timer\0' in data, True)
     check('the eMMC host node: mmc@f0510000, nvt,nvt_mmc3',
           find_nodes(data, ['mmc@f0510000'])[0] > 0 and
           b'nvt,nvt_mmc3\0' in data, True)
@@ -1601,6 +1728,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_pwm(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98562')
+    try:
+        test_timer(qt)
     finally:
         qt.close()
 

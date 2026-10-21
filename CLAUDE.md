@@ -217,7 +217,10 @@ matter: `nvt,core_clk` must precede `nvt,periph_clk`, and the pinmux
 children of the TOP node are indexed by position. The A9 timers run at
 `cpu_clk / 8` from CG's PLL8, which `nvt-cg` resets to 800 MHz to match
 QEMU's fixed 100 MHz MPCore timers. The MIDR is r4p1, because Linux refuses
-the global timer on r0p0. Reboot goes through the RTC (power-on alarm, then
+the global timer on r0p0. The Novatek timer block (`nvt-timer`) is not
+Linux's clock, but the vendor U-Boot reads its timer 0 as microseconds
+since power-on, so it comes out of reset running free, as the loader
+leaves it. Reboot goes through the RTC (power-on alarm, then
 power off), so the RTC node is required. The kernel has no RAM disk driver,
 so boot tests use an initramfs (`qemu-boot/test-novatek-boot.sh`), not the
 boot matrix. A `flash-file` without `-kernel` boots through a stand-in for

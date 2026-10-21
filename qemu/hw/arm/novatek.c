@@ -59,6 +59,7 @@
 #define NVT_IRQ_GPIO        24
 #define NVT_IRQ_USB         27
 #define NVT_IRQ_PWM         26
+#define NVT_IRQ_TIMER       0
 #define NVT_IRQ_FLASH       29
 #define NVT_IRQ_ETH         34
 #define NVT_IRQ_RTC         56
@@ -138,7 +139,6 @@ static const struct {
 } nvt_regbanks[] = {
     { "nvt-ddrc",   NVT_DDRC_BASE,  0x10000 },
     { "nvt-pad",    NVT_PAD_BASE,   0x10000 },
-    { "nvt-timer",  NVT_TIMER_BASE, 0x10000 },
 };
 
 /*
@@ -408,6 +408,14 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
                               nvt_sdio[n].emmc ? 8 : 4);
         g_free(upath);
     }
+
+    /* The HDAL's kdrv_comm.ko times with these (timer_open_sys_timer()). */
+    qemu_fdt_add_subnode(fdt, "/timer@f0040000");
+    qemu_fdt_setprop_string(fdt, "/timer@f0040000", "compatible",
+                            "nvt,nvt_timer");
+    qemu_fdt_setprop_cells(fdt, "/timer@f0040000", "reg", NVT_TIMER_BASE,
+                           0x300);
+    nvt_fdt_irq(fdt, "/timer@f0040000", NVT_IRQ_TIMER);
 
     /* The vendor trees' node, which the kernel's pwm-na51055.c binds where
      * it is built; the HDAL's kdrv_comm.ko binds only nvt,nvt_kdrv_pwm. */
@@ -755,6 +763,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0, pic[NVT_IRQ_GPIO]);
 
     sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
+    sysbus_create_simple("nvt-timer", NVT_TIMER_BASE, pic[NVT_IRQ_TIMER]);
 
     /* Named, so qtest and a board can watch its "out" lines. */
     dev = qdev_new("nvt-pwm");
