@@ -56,7 +56,8 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
 | SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR, or a W25N SPI NAND) |
 | SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio`, an SD card from `-drive if=sd,index=0` / `1` |
-| USB 2.0 | `0xF0600000` | 27 | — |
+| USB 2.0 (FOTG200) | `0xF0600000`, alias `0xFF600000` | 27 | `nvt-usb`, host side; devices from `-device usb-*` |
+| OTP / eFuse | `0xF0660000` | | `nvt-otp`, blank |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
 | PL310 | `0xFFE00000` | 96 | `l2x0` |
@@ -310,6 +311,66 @@ What runs:
 - The vendor `FW98566A.bin` Linux finds the card and its hotplug mounts
   the partition.
 
+## USB
+
+The block at `0xF0600000` is a Faraday FOTG200 dual-role controller. Its
+host side has an EHCI laid out like Faraday's FUSBH200, which QEMU already
+models: capabilities at 0x00, operational registers at 0x10, no
+CONFIGFLAG, and the single port's PORTSC at 0x30. The vendor kernel's
+`ehci_def.h` uses that layout under `CONFIG_USB_NVTIVOT_HCD`. `nvt-usb` is
+`fusbh200-ehci-usb` with the rest of the 64 KiB block behind it, which the
+host driver (`ehci-na51089.c`) programs:
+
+- **+0x80 OTG control/status.** Bits [23:22] give the speed of the device
+  on the port (0 full, 1 low, 2 high). `ehci_hub_control()` reads them
+  instead of PORTSC's (`has_tt`, `ehci_port_speed()`), so a high-speed
+  stick shows up as high speed. A_BUS_REQ / A_BUS_DROP are stored.
+- +0x100, +0x1C8, +0x30C, +0x400 and the UTMI PHY at +0x1000 are
+  storage.
+
+On NA51089 the driver does not use the address in the device tree. Unless
+TOP's version word reads 0x48210000 it adds 0x0F000000, so it maps
+`0xFF600000`, and the machine maps the block at both addresses. Before
+starting the controller, `nvtim_init_usbhc()` reads the PHY trim with
+`efuse_readParamOps()`. That oopses unless the OTP driver is bound, and
+the OTP driver's code (a shipped object) spins on the eFuse status bits.
+So the device tree has the vendor's `nvt_otp@f0660000` node, and `nvt-otp`
+models the handshake. Bit 0 of 0x20 powers the array and 0x30 bit 0 reports
+it ready. A read sets 0x20 bit 4, which clears when done, with 0x30 bit 1
+set (write 1 to clear) and the word at 0x08. The array reads as blank, so
+every caller keeps its default trim. The device side (`nvt,fotg200_udc`)
+is not modelled.
+
+No shipped firmware for these SoCs has a USB host driver. The OpenIPC
+kernels are built without `CONFIG_USB_EHCI_HCD`, and the SDK's kernel and
+U-Boot leave USB off. `qemu-boot/build-novatek-usb-kernel.sh` builds the
+same kernel OpenIPC builds, with EHCI and USB storage added, to test
+against:
+
+- the source is `openipc/linux` branch `novatek-nt9856x`;
+- the config is OpenIPC's `nt98566.generic.config`;
+- the toolchain is OpenIPC's own, and the build runs in-tree like
+  Buildroot. An out-of-tree build loses the OTP driver's shipped object.
+
+Then:
+
+```bash
+bash qemu-boot/build-novatek-usb-kernel.sh --out usbk
+bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel usbk/uImage.nt9856x-usb
+```
+
+`--soc` names the OpenIPC release whose rootfs supplies busybox
+(`qemu-boot/rootfs.squashfs.<soc>`); the kernel runs on either machine.
+
+That test attaches a QEMU `usb-storage` stick
+(`-device usb-storage,drive=...`). It checks that `ehci-nvtivot` binds at
+`0xFF600000` and the stick enumerates at high speed (480 Mb/s) as `sda`.
+It reads 1 MiB the host put there, writes 192 KiB raw that the host then
+finds in the image, and keeps a vfat file across a remount: 11/11 on
+nt98562 and nt98566. `test-novatek.py` covers the model in CI: the
+EHCI at both addresses, PORTSC and the OTG speed bits with and without a
+device, a port reset, the glue storage, and the OTP handshake.
+
 ## Ethernet
 
 `nvt-eqos` is the 16 KiB block at `0xF02B0000`: a Synopsys DWC Ethernet QoS
@@ -374,6 +435,8 @@ SOC=nt98566 FLASH=nand.bin bash qemu-boot/run-nt98562.sh   # FW98566A.bin, NAND
 bash qemu-boot/test-novatek-uboot.sh --flash nor.bin       # vendor U-Boot: net, SD
 bash qemu-boot/test-novatek-nand.sh --flash nand.bin       # NAND: U-Boot, UBIFS
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
+bash qemu-boot/build-novatek-usb-kernel.sh --out usbk      # see USB
+bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel usbk/uImage.nt9856x-usb
 python3 qemu/tests/test-novatek.py
 ```
 
@@ -401,5 +464,6 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   SDIO (non-memory) cards, and card hot-plug.
 - The EQoS features the drivers leave off: checksum offload, TSO,
   timestamps, more queues.
-- USB, the Novatek timer, PWM, I2C, crypto/OTP, and the HDAL media
-  blocks.
+- The FOTG200's device (gadget) side, and OTP contents other than blank
+  (no trims, keys or secure boot).
+- The Novatek timer, PWM, I2C, crypto, and the HDAL media blocks.

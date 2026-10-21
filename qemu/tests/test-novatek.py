@@ -38,6 +38,14 @@ plays the vendor drivers (docs/novatek.md):
     interrupt on SPI 30; the CG reset pulse (0x84 bit 2) returning the
     host to descriptor mode; card detect on C_GPIO 9; an empty slot
     timing out;
+  - nvt-usb, the FOTG200 host as ehci-na51089.c sees it: EHCI
+    capabilities (CAPLENGTH 0x10, one port) at 0xF0600000 and at the
+    0xFF600000 alias the driver uses on NA51089, PORTSC at 0x30 showing a
+    usb-storage stick, the OTG register's [23:22] speed (high), the glue
+    registers and PHY as storage, a port reset enabling the port; with no
+    device, no connect and speed 0;
+  - nvt-otp: power-up and ready, a read starting, finishing and reading a
+    blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
     BCL1/LZ-packed "U-Boot") leaves U-Boot unpacked at
     /nvt_memory_cfg/uboot, the device tree and the "LD_NVT" SHMINFO where
@@ -157,7 +165,7 @@ def check(what, got, want):
     if isinstance(got, bytes):
         shown = got[:8].hex() + ('...' if len(got) > 8 else '')
     else:
-        shown = got if isinstance(got, (bool, str, tuple)) else hex(got)
+        shown = got if isinstance(got, (bool, str, tuple, list)) else hex(got)
     print('  %s: %s (%s)' % ('PASS' if ok else 'FAIL', what, shown))
 
 
@@ -790,6 +798,73 @@ def test_sdio(qt, card):
           sd_cmd(qt, 8, 0x1AA, base=SDIO2), SD_CMD_SENT | SD_RSP_TIMEOUT)
 
 
+# ---- nvt-usb, nvt-otp -------------------------------------------------------
+
+USB = 0xF0600000
+USB_ALIAS = 0xFF600000
+OTP = 0xF0660000
+
+
+def test_usb(qt, stick):
+    print('nvt-usb' + (' (a usb-storage stick)' if stick else ' (no device)'))
+    if not stick:
+        check('no device: PORTSC connect clear', qt.readl(USB + 0x30) & 1, 0)
+        check('and OTG speed 0', qt.readl(USB + 0x80) >> 22 & 3, 0)
+        return
+    for base, where in ((USB, '0xF0600000'), (USB_ALIAS, '0xFF600000')):
+        caps = qt.readl(base)
+        check('%s: CAPLENGTH 0x10, EHCI 1.00' % where,
+              (caps & 0xFF, caps >> 16), (0x10, 0x0100))
+        check('%s: HCSPARAMS one port' % where, qt.readl(base + 4) & 0xF, 1)
+    check('PORTSC at 0x30: the stick is connected',
+          qt.readl(USB + 0x30) & 3, 3)
+    check('OTG register [23:22]: high speed (ehci_port_speed)',
+          qt.readl(USB + 0x80) >> 22 & 3, 2)
+    qt.writel(USB + 0x80, 1 << 4)                       # A_BUS_REQ
+    check('OTG register keeps what is written', qt.readl(USB + 0x80),
+          (1 << 4) | (2 << 22))
+    for off in (0x100, 0x1C8, 0x30C, 0x400, 0x1000 + 0x51 * 4):
+        qt.writel(USB + off, 0x5A5A0000 | off)
+    check('glue and PHY registers are storage',
+          [qt.readl(USB + off) for off in (0x100, 0x400, 0x1144)],
+          [0x5A5A0100, 0x5A5A0400, 0x5A5A1144])
+    check('the alias reaches the same glue', qt.readl(USB_ALIAS + 0x400),
+          0x5A5A0400)
+    # ehci_hub_control SetPortFeature(RESET), then clear it
+    qt.writel(USB + 0x30, (1 << 8))
+    qt.writel(USB + 0x30, 0)
+    check('a port reset enables the port', qt.readl(USB + 0x30) >> 2 & 1, 1)
+    # A machine reset (the kernel's manual watchdog reset) clears the glue
+    # as well as the EHCI.
+    qt.writel(WDT + 0x00, 0x5A960112)
+    qt.writel(WDT + 0x00, 0x5A960113)
+    qt.writel(WDT + 0x0C, 1)
+    qt.step(1000)
+    check('a machine reset clears the glue, PHY and OTG bits',
+          (qt.readl(USB + 0x400), qt.readl(USB + 0x1144),
+           qt.readl(USB + 0x80) & 0x30), (0, 0, 0))
+    check('and the EHCI: port disabled again',
+          qt.readl(USB + 0x30) >> 2 & 1, 0)
+
+
+def test_otp(qt):
+    print('nvt-otp')
+    check('powered down: not ready', qt.readl(OTP + 0x30) & 1, 0)
+    qt.writel(OTP + 0x20, 1)
+    check('efuse_open: CTRL bit 0, then STATUS bit 0',
+          qt.readl(OTP + 0x30) & 1, 1)
+    qt.writel(OTP + 0x04, 5)
+    qt.writel(OTP + 0x20, 1 | (1 << 4))
+    check('efuse_read: the start bit clears',
+          qt.readl(OTP + 0x20) & (1 << 4), 0)
+    check('STATUS bit 1: read done', qt.readl(OTP + 0x30) & 2, 2)
+    check('a blank array reads 0', qt.readl(OTP + 0x08), 0)
+    qt.writel(OTP + 0x30, 2)
+    check('writing bit 1 back clears it', qt.readl(OTP + 0x30) & 2, 0)
+    qt.writel(OTP + 0x20, 0)
+    check('efuse_close: not ready again', qt.readl(OTP + 0x30) & 1, 0)
+
+
 # ---- flash boot ROM ----------------------------------------------------
 
 def fdt_blob(tree):
@@ -1190,6 +1265,8 @@ def test_fdt(qemu, tmp):
     check('pinmux children in PIN_FUNC order',
           all(0 < a < b for a, b in zip(order, order[1:])), True)
     check('chip-ID node for nvt_get_chip_id()', b'nvt,nvt_top' in data, True)
+    check('the USB host and OTP nodes ehci-na51089.c needs',
+          b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
     check('the NOR under spinor.c', b'nvt,nvt_spinor\0' in data and
           b'spi_nor.0\0' in data, True)
 
@@ -1311,8 +1388,20 @@ def run(args, tmp):
     finally:
         qt.close()
 
+    stick = os.path.join(tmp, 'stick.img')
+    open(stick, 'wb').write(bytes(1 << 20))
+    qt = QTest(args.qemu, 'nt98566',
+               ['-drive', 'if=none,id=s,format=raw,file=' + stick,
+                '-device', 'usb-storage,drive=s'])
+    try:
+        test_usb(qt, True)
+        test_otp(qt)
+    finally:
+        qt.close()
+
     qt = QTest(args.qemu, 'nt98566')
     try:
+        test_usb(qt, False)
         print('nt98566')
         check('same die, same chip ID', qt.readl(TOP + 0xF0) >> 16, 0x7021)
         check('no card: C_GPIO 9 high', qt.readl(GPIO + 0x00) >> 9 & 1, 1)

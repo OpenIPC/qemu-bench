@@ -47,11 +47,15 @@
 #define NVT_GPIO_BASE       0xF0070000
 #define NVT_FLASH_BASE      0xF0400000
 #define NVT_ETH_BASE        0xF02B0000
+#define NVT_USB_BASE        0xF0600000
+#define NVT_OTP_BASE        0xF0660000
+#define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */
 #define NVT_MPCORE_BASE     0xFFD00000
 #define NVT_L2_BASE         0xFFE00000
 
 /* GIC SPI numbers (nvt-peri.dtsi) */
 #define NVT_IRQ_GPIO        24
+#define NVT_IRQ_USB         27
 #define NVT_IRQ_FLASH       29
 #define NVT_IRQ_ETH         34
 #define NVT_IRQ_RTC         56
@@ -368,6 +372,22 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         g_free(upath);
     }
 
+    /* The OTP / eFuse block: drivers (the USB PHY trim among them) call
+     * efuse_readParamOps(), which needs this driver bound. */
+    qemu_fdt_add_subnode(fdt, "/nvt_otp@f0660000");
+    qemu_fdt_setprop_string(fdt, "/nvt_otp@f0660000", "compatible",
+                            "nvt,nvt_otp");
+    qemu_fdt_setprop_cells(fdt, "/nvt_otp@f0660000", "reg", NVT_OTP_BASE,
+                           0x70);
+
+    /* ehci-na51089.c (CONFIG_USB_EHCI_HCD_NVTIVOT); FOTG200's device
+     * side, nvt,fotg200_udc, is not modelled. */
+    path = "/nvt_usb2host@f0600000";
+    qemu_fdt_add_subnode(fdt, path);
+    qemu_fdt_setprop_string(fdt, path, "compatible", "nvt,ehci-nvtivot");
+    qemu_fdt_setprop_cells(fdt, path, "reg", NVT_USB_BASE, 0x10000);
+    nvt_fdt_irq(fdt, path, NVT_IRQ_USB);
+
     /* The MAC, its Novatek glue and the embedded PHY in one 16 KiB block;
      * the vendor node maps the first 0x3800 and reaches past it. */
     qemu_fdt_add_subnode(fdt, "/eth@f02b0000");
@@ -673,6 +693,34 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(gpio), 0, NVT_GPIO_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0, pic[NVT_IRQ_GPIO]);
+
+    sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
+
+    /*
+     * USB: the EHCI (region 0) over the FOTG200 glue (region 1), at the
+     * block's address and at the alias ehci-na51089.c uses on NA51089.
+     */
+    dev = qdev_new("nvt-usb");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_USB]);
+    for (n = 0; n < 2; n++) {
+        MemoryRegion *ehci = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+        MemoryRegion *glue = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
+        hwaddr base = n ? NVT_USB_ALIAS : NVT_USB_BASE;
+
+        if (n) {
+            MemoryRegion *a = g_new(MemoryRegion, 2);
+
+            memory_region_init_alias(&a[0], OBJECT(dev), "nvt-usb.ehci-alias",
+                                     ehci, 0, memory_region_size(ehci));
+            memory_region_init_alias(&a[1], OBJECT(dev), "nvt-usb.glue-alias",
+                                     glue, 0, memory_region_size(glue));
+            ehci = &a[0];
+            glue = &a[1];
+        }
+        memory_region_add_subregion_overlap(sysmem, base, glue, 1);
+        memory_region_add_subregion_overlap(sysmem, base, ehci, 2);
+    }
 
     dev = qdev_new("nvt-eqos");
     qemu_configure_nic_device(dev, true, NULL);
