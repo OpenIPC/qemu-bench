@@ -22,6 +22,9 @@
 #     there read back intact (descriptor DMA), 192 KiB written raw that the
 #     host then finds in the card image, and a vfat made on the partition
 #     holding a copied file across a remount;
+#   - an eMMC on SDIO3 (the same driver, "nvt,nvt_mmc3"): found as an MMC
+#     card on an 8-bit bus, 512 KiB the host put there read back intact,
+#     and 192 KiB written raw that the host then finds in the image;
 #   - I2C (nvt-i2c under the vendor i2c-nvt driver) with sensor=sc401ai:
 #     three adapters, i2cdetect finding the sensor at 0x30 on bus 0, and the
 #     release's own ipcinfo naming it sc401ai, as load_novatek asks it to;
@@ -101,6 +104,13 @@ img[32 << 20:33 << 20] = os.urandom(1 << 20)
 open(sys.argv[1], 'wb').write(img)
 PY
 SD_MD5=$(dd if="$SD" bs=1M skip=32 count=1 2>/dev/null | md5sum | cut -d' ' -f1)
+# A 32 MiB eMMC: 512 KiB of host data at 2 MiB, room at 8 MiB.
+EMMC=$WORK/emmc.img
+python3 -c "
+import os, sys
+d = bytearray(32 << 20); d[2 << 20:(2 << 20) + (512 << 10)] = os.urandom(512 << 10)
+open(sys.argv[1], 'wb').write(d)" "$EMMC"
+EMMC_MD5=$(dd if="$EMMC" bs=64k skip=32 count=8 2>/dev/null | md5sum | cut -d' ' -f1)
 PAYLOAD_MD5=$(md5sum < "$WORK/payload.bin" | cut -d' ' -f1)
 
 unsquashfs -q -d "$WORK/rootfs" "$ROOTFS" bin/busybox lib usr/bin/ipcinfo >/dev/null
@@ -168,6 +178,11 @@ for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0p1 ] && break; $bb sleep 1; d
 [ -b /dev/mmcblk0p1 ] && echo "NVT-SD: ok"
 echo "NVT-SD-READ-MD5: $($bb dd if=/dev/mmcblk0 bs=1M skip=32 count=1 2>/dev/null | $bb md5sum)"
 $bb dd if=/payload.bin of=/dev/mmcblk0 bs=64k seek=768 conv=fsync 2>/dev/null && echo "NVT-SD-WRITE: ok"
+for i in 1 2 3 4 5; do [ -b /dev/mmcblk2 ] && break; $bb sleep 1; done
+$bb grep -q MMC /sys/class/mmc_host/mmc2/mmc2:*/type 2>/dev/null && echo "NVT-EMMC: ok"
+$bb dmesg | $bb grep -q "f0510000.mmc: .*8-bit" && echo "NVT-EMMC-8BIT: ok"
+echo "NVT-EMMC-READ-MD5: $($bb dd if=/dev/mmcblk2 bs=64k skip=32 count=8 2>/dev/null | $bb md5sum)"
+$bb dd if=/payload.bin of=/dev/mmcblk2 bs=64k seek=128 conv=fsync 2>/dev/null && echo "NVT-EMMC-WRITE: ok"
 $bb mkfs.vfat /dev/mmcblk0p1 >/dev/null 2>&1 && $bb mount -t vfat /dev/mmcblk0p1 /mnt && \
     $bb cp /payload.bin /mnt/payload.bin && $bb umount /mnt && \
     $bb mount -t vfat /dev/mmcblk0p1 /mnt && \
@@ -191,6 +206,7 @@ timeout 180 "$QEMU" -M "$MACHINE,flash-file=$NOR,sensor=sc401ai" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
     -nic user,restrict=on,guestfwd=tcp:10.0.2.100:$HTTP_PORT-tcp:127.0.0.1:$HTTP_PORT \
     -drive if=sd,index=0,format=raw,file="$SD" \
+    -drive if=sd,index=2,format=raw,file="$EMMC" \
     > "$WORK/console.log" 2>&1
 rc=$?
 set -e
@@ -232,6 +248,16 @@ then
     echo "PASS: both writes landed in the image file, the rest erased"
 else
     echo "FAIL: the image file does not hold the payload"
+    fail=1
+fi
+expect 'NVT-EMMC: ok' 'eMMC on SDIO3 found as an MMC card'
+expect 'NVT-EMMC-8BIT: ok' 'its host in 8-bit mode'
+expect "NVT-EMMC-READ-MD5: $EMMC_MD5" '512 KiB read back from the eMMC intact'
+expect 'NVT-EMMC-WRITE: ok' '192 KiB written raw to the eMMC'
+if [ "$(dd if="$EMMC" bs=64k skip=128 count=3 2>/dev/null | md5sum | cut -d' ' -f1)" = "$PAYLOAD_MD5" ]; then
+    echo "PASS: the raw write is in the eMMC image"
+else
+    echo "FAIL: the raw write is not in the eMMC image"
     fail=1
 fi
 expect 'NVT-I2C: ok' 'three I2C adapters registered'

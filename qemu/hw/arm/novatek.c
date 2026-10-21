@@ -107,8 +107,10 @@ static const struct {
 
 /*
  * The SD hosts: card n from -drive if=sd,index=n.  reset is the host's
- * nvt-cg "sys-reset" line (CG_SYS_RESET_REG1 bit 2 / 3).  The EVB device
- * trees take SDIO1's card detect from C_GPIO 9, low with a card in.
+ * nvt-cg "sys-reset" line (CG_SYS_RESET_REG1 bit 2 / 3 / 14).  The EVB
+ * device trees take SDIO1's card detect from C_GPIO 9, low with a card
+ * in.  SDIO3 is the eMMC host (cfg_562_EMMC_EVB: mmc@f0510000,
+ * "nvt,nvt_mmc3", SPI 32): its "card" is an eMMC, 8 bits wide here.
  */
 #define NVT_SD_CD_GPIO      9
 
@@ -117,9 +119,11 @@ static const struct {
     int irq;
     int reset;
     const char *compat;
+    bool emmc;
 } nvt_sdio[] = {
-    { 0xF0420000, 30, 32 + 2, "nvt,nvt_mmc" },
-    { 0xF0500000, 31, 32 + 3, "nvt,nvt_mmc2" },
+    { 0xF0420000, 30, 32 + 2,  "nvt,nvt_mmc",  false },
+    { 0xF0500000, 31, 32 + 3,  "nvt,nvt_mmc2", false },
+    { 0xF0510000, 32, 32 + 14, "nvt,nvt_mmc3", true },
 };
 
 /*
@@ -400,7 +404,8 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         qemu_fdt_setprop_cell(fdt, upath, "max-frequency", 48000000);
         qemu_fdt_setprop_cell(fdt, upath, "voltage-switch", 0);
         qemu_fdt_setprop_cell(fdt, upath, "max-voltage", 3300);
-        qemu_fdt_setprop_cell(fdt, upath, "bus-width", 4);
+        qemu_fdt_setprop_cell(fdt, upath, "bus-width",
+                              nvt_sdio[n].emmc ? 8 : 4);
         g_free(upath);
     }
 
@@ -828,7 +833,8 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
                          !di);
         }
         if (di) {
-            DeviceState *card = qdev_new(TYPE_SD_CARD);
+            DeviceState *card = qdev_new(nvt_sdio[n].emmc ? TYPE_EMMC
+                                                           : TYPE_SD_CARD);
 
             qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
                                     &error_fatal);
