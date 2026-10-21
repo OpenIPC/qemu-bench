@@ -1,11 +1,13 @@
 #!/bin/bash
-# The vendor U-Boot on emulated NT9856x, timer, networking and SD card:
-# its "boot time" stamps read timer 0 counting; stop autoboot, then take
-# a DHCP lease and TFTP 1 MiB from the user network, ping its gateway,
-# and compare U-Boot's crc32 of what landed with the host's; find the SD
-# card (nvt_ivot_mmc.c over nvt-sdio, plain DMA), read its partition
-# table, read 256 KiB the host put on it with a matching crc32, and write
-# them back elsewhere on the card, where the host finds them.
+# The vendor U-Boot on emulated NT9856x, timer, networking, SD card and
+# crypto: its "boot time" stamps read timer 0 counting; stop autoboot,
+# then take a DHCP lease and TFTP 1 MiB from the user network, ping its
+# gateway, and compare U-Boot's crc32 of what landed with the host's; find
+# the SD card (nvt_ivot_mmc.c over nvt-sdio, plain DMA), read its
+# partition table, read 256 KiB the host put on it with a matching crc32,
+# and write them back elsewhere on the card, where the host finds them;
+# run nvt_encrypt, which encrypts a block with the crypto engine under an
+# OTP key (zero, the OTP being blank) and decrypts it again.
 #
 # The vendor U-Boot (eth_na51089.c over nvt-eqos) comes from a whole flash
 # image -- the SDK's FW98562A.bin through qemu-boot/nvtpack2flash.py, or a
@@ -185,6 +187,20 @@ try:
     ser.sendall(b'mmc write 0x1000000 0x18000 0x200\r')
     results.append(('mmc write of the same 256 KiB',
                     until(b'512 blocks written: OK', 30)))
+    prompt(10)
+    # nvt_encrypt: AES-128-ECB of 01 02 .. 16 by DMA (nvt-crypto) under
+    # key set 0 from the OTP key manager -- blank, so a zero key -- and
+    # back again
+    ser.sendall(b'nvt_encrypt 0\r')
+    results.append(('nvt_encrypt: AES-128 of its sample block under the '
+                    'blank OTP key',
+                    until(b'Encrypt operation success', 10) and
+                    until(b'fb ee 76 ee 11 de 1f bf 27 78 5c 25 21 83 ed 52',
+                          5)))
+    results.append(('and decrypted back',
+                    until(b'Decrypt operation success', 10) and
+                    until(b' 1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16',
+                          5)))
     prompt(10)
 finally:
     mon.sendall(b'quit\n')

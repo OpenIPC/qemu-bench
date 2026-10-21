@@ -242,7 +242,11 @@ block at 0xFF600000, not 0xF0600000. It needs `nvt-otp` and the
 `nvt_otp` DT node for its PHY trim. No shipped kernel has the driver;
 `qemu-boot/build-novatek-test-kernel.sh` builds one, along with the PWM
 driver (`nvt-pwm`; HDAL's kdrv_comm refuses the vendor `nvt,nvt_pwm`
-node).
+node) and the crypto drivers with the kernel's self-tests on, which
+check `nvt-crypto`, `nvt-hash` and `nvt-rsa` against known-answer vectors
+(`qemu-boot/test-novatek-crypto.sh`). Those models implement their
+ciphers themselves (AES from QEMU's `crypto/aes.c`), because QEMU 10.2 has
+no built-in cipher backend and CI may build without one.
 Its SD hosts (`hw/sd/nvt-sdio.c`) DMA through a descriptor table under
 Linux but a plain address under U-Boot (`0x1FC` = 1). Linux relies on the
 clock framework's CG reset pulse to undo that, so `nvt-cg` drives

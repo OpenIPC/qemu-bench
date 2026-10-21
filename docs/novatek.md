@@ -61,6 +61,9 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF03A0000` | 41 / 42 / 60 | `nvt-i2c` (`/dev/i2c-0..2`); `sensor=` puts a sensor on the first |
 | USB 2.0 (FOTG200) | `0xF0600000`, alias `0xFF600000` | 27 | `nvt-usb`, host side; devices from `-device usb-*` |
 | OTP / eFuse | `0xF0660000` | | `nvt-otp`, blank |
+| Crypto (AES, DES, 3DES) | `0xF0620000` | 38 | `nvt-crypto` |
+| Hash (SHA-1/256, HMAC) | `0xF0670000` | 28 | `nvt-hash` |
+| RSA | `0xF06A0000` | 20 | `nvt-rsa` |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
 | PL310 | `0xFFE00000` | 96 | `l2x0` |
@@ -514,6 +517,90 @@ nt98562 and nt98566. `test-novatek.py` covers the model in CI: the
 EHCI at both addresses, PORTSC and the OTG speed bits with and without a
 device, a port reset, the glue storage, and the OTP handshake.
 
+## Crypto
+
+There are three security engines, each with its vendor driver in
+`drivers/crypto/nvt_ivot/` (`na51089_crypto.c`, `na51089_hash.c` and
+`na51089_rsa.c`). The device tree has the vendor nodes: `crypto@f0620000`,
+`hash@f0670000` and `rsa@f06a0000`, with `mclk = <1>`. U-Boot's
+`IOAddress.h` puts the hash engine at `0xF0700000`; the vendor device tree
+and the clock driver (`f0670000.hash`) say `0xF0670000`, and that is
+where it is.
+
+**`nvt-crypto`** runs AES-128/256, DES and 3DES in ECB, CBC, CFB, OFB and
+CTR, and AES-GCM. The driver builds CCM from CBC and CTR passes.
+
+- **PIO:** one ECB block through the KEY, IN and OUT registers.
+- **DMA:** a 0x280-byte descriptor holds the key, the IV, the CTR step and
+  a header (direction, cipher, mode, key source, "get S0"). It ends in up
+  to 32 `{src, dst, length, cfg}` blocks. The blocks form one stream up to
+  the block flagged last; in GCM the first such group is the associated
+  data.
+- **Write-back:** the engine writes three values into the descriptor, and
+  the driver depends on all of them:
+  - **CV**, the IV that continues the stream. The driver chains requests
+    longer than 32 blocks through it, takes CCM's CBC-MAC from it, and
+    treats a CV still zero as an engine that has not finished.
+  - **S0** = E(K, first counter block).
+  - **GHASH** over the associated data, the ciphertext and their lengths.
+    The GCM tag is S0 ^ GHASH.
+- **Key manager:** with the key-source bit set, the key comes from an OTP
+  key set. The OTP is blank, so that key is zero.
+
+**`nvt-hash`** runs SHA-1, SHA-256 and their HMACs by DMA. Requests come
+in chunks: the state carries over through the IV registers, the engine
+pads the last chunk to the length in PADLEN, and it adds the HMAC's ipad
+and opad blocks itself when asked.
+
+**`nvt-rsa`** computes DATA ^ E/D mod N, from 256 to 2048 bits. The driver
+writes the operands little-endian into the engine's SRAM through three
+auto-incrementing ports, and reads the result back the same way. The CRC32
+key-check modes are not modelled: such a request never reports done, and
+the driver (which never asks for one) would time it out.
+
+The engines complete each request at once. The ciphers are implemented
+in the model itself: AES from QEMU's `crypto/aes.c`, and DES, SHA, GHASH
+and a Montgomery bignum in the files. So nothing depends on which crypto
+library QEMU was built with.
+
+No shipped kernel enables these drivers. The vendor U-Boot does use the
+cipher engine: `nvt_encrypt` and the encrypted-kernel path, keyed from
+the OTP. `build-novatek-test-kernel.sh` (see USB) builds all three drivers
+with the kernel's crypto self-tests on. testmgr then checks every
+algorithm the drivers register, as it registers, against the kernel's
+known-answer vectors:
+
+```bash
+bash qemu-boot/test-novatek-crypto.sh --kernel testk/uImage.nt9856x-test
+```
+
+That test checks `/proc/crypto` and reports 26/26:
+
+- 22 `na51089-*` algorithms, `rsa` among them, report `selftest: passed`;
+- testmgr has no vectors for DES and 3DES in CFB and OFB, so those four
+  pass without having run.
+
+Breaking the models on purpose (one output bit flipped) makes AES, DES,
+GCM, CCM, SHA, HMAC and RSA fail, so the tests do reach the emulated
+engines.
+
+`test-novatek-uboot.sh` runs the vendor U-Boot's `nvt_encrypt 0`:
+AES-128-ECB of its sample block under the OTP key, then decrypted back.
+The ciphertext must be `fb ee 76 ee ...`, AES-128 under a zero key.
+
+`test-novatek.py` checks the engines at register level, in CI:
+
+- **Cipher:**
+  - AES by PIO (FIPS-197);
+  - AES-CBC and CTR (SP 800-38A), checking CV and a partial last block;
+  - GCM (the McGrew and Viega vectors), checking that S0 ^ GHASH gives the
+    tag;
+  - DES and 3DES, and a key-manager key.
+- **Hash:** SHA-1 and SHA-256 padded by the engine, a message hashed in two
+  chunks, and HMAC (RFC 2202 and RFC 4231).
+- **RSA:** 256, 512 and 2048-bit exponentiation, checked against Python's
+  `pow()`.
+
 ## Ethernet
 
 `nvt-eqos` is the 16 KiB block at `0xF02B0000`: a Synopsys DWC Ethernet QoS
@@ -618,4 +705,6 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   generator's real PWM dividers (cycle runs are timed at a nominal 30 MHz).
 - The Novatek timer's other cores (its DST routing and their status
   words are storage, and every interrupt goes to SPI 0).
-- Crypto, and the HDAL media blocks.
+- The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
+  OTP key sets other than blank (the key manager hands out zeros).
+- The HDAL media blocks.
