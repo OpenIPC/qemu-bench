@@ -834,6 +834,17 @@ def test_usb(qt, stick):
     qt.writel(USB + 0x30, (1 << 8))
     qt.writel(USB + 0x30, 0)
     check('a port reset enables the port', qt.readl(USB + 0x30) >> 2 & 1, 1)
+    # A machine reset (the kernel's manual watchdog reset) clears the glue
+    # as well as the EHCI.
+    qt.writel(WDT + 0x00, 0x5A960112)
+    qt.writel(WDT + 0x00, 0x5A960113)
+    qt.writel(WDT + 0x0C, 1)
+    qt.step(1000)
+    check('a machine reset clears the glue, PHY and OTG bits',
+          (qt.readl(USB + 0x400), qt.readl(USB + 0x1144),
+           qt.readl(USB + 0x80) & 0x30), (0, 0, 0))
+    check('and the EHCI: port disabled again',
+          qt.readl(USB + 0x30) >> 2 & 1, 0)
 
 
 def test_otp(qt):

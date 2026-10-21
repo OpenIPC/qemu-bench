@@ -31,31 +31,38 @@ while [ $# -gt 0 ]; do
     esac
 done
 mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)         # --out may be relative: we cd into it
 cd "$OUT"
 
 GH=https://github.com/openipc
 RAW=https://raw.githubusercontent.com/OpenIPC/firmware/master
 
+# Unpack a tarball into DIR only if it all arrives: a failed or partial
+# download leaves no DIR, so the next run fetches it again.
+fetch() {
+    local url=$1 dir=$2
+
+    [ -d "$dir" ] && return
+    rm -rf "$dir.part"
+    mkdir "$dir.part"
+    curl -fsSL "$url" | tar xz -C "$dir.part" --strip-components=1
+    mv "$dir.part" "$dir"
+}
+
 if [ -z "$CROSS" ]; then
-    if [ ! -d toolchain ]; then
-        echo "Fetching OpenIPC's novatek-nt9856x toolchain"
-        mkdir toolchain
-        curl -sL "$GH/firmware/releases/download/toolchain/toolchain.novatek-nt9856x.tgz" |
-            tar xz -C toolchain --strip-components=1
-    fi
+    echo "OpenIPC's novatek-nt9856x toolchain"
+    fetch "$GH/firmware/releases/download/toolchain/toolchain.novatek-nt9856x.tgz" \
+        toolchain
     gcc=$(find "$OUT/toolchain/bin" -name '*-gcc' -type f -o -name '*-gcc' -type l |
           grep -v -- '-cc1' | head -1)
     CROSS=${gcc%gcc}
 fi
 echo "Cross compiler: ${CROSS}gcc"
 
-if [ ! -d linux ]; then
-    echo "Fetching openipc/linux $REF"
-    mkdir linux
-    curl -sL "$GH/linux/archive/$REF.tar.gz" | tar xz -C linux --strip-components=1
-fi
+echo "openipc/linux $REF"
+fetch "$GH/linux/archive/$REF.tar.gz" linux
 
-curl -sL "$RAW/br-ext-chip-novatek/board/nt9856x/nt98566.generic.config" \
+curl -fsSL "$RAW/br-ext-chip-novatek/board/nt9856x/nt98566.generic.config" \
     -o linux/.config
 cat >> linux/.config <<'EOF'
 CONFIG_USB_EHCI_HCD=y

@@ -355,9 +355,12 @@ against:
 Then:
 
 ```bash
-bash qemu-boot/build-novatek-usb-kernel.sh --out /path/to/build
-bash qemu-boot/test-novatek-usb.sh --kernel /path/to/build/uImage.nt9856x-usb
+bash qemu-boot/build-novatek-usb-kernel.sh --out usbk
+bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel usbk/uImage.nt9856x-usb
 ```
+
+`--soc` names the OpenIPC release whose rootfs supplies busybox
+(`qemu-boot/rootfs.squashfs.<soc>`); the kernel runs on either machine.
 
 That test attaches a QEMU `usb-storage` stick
 (`-device usb-storage,drive=...`). It checks that `ehci-nvtivot` binds at
@@ -432,7 +435,8 @@ SOC=nt98566 FLASH=nand.bin bash qemu-boot/run-nt98562.sh   # FW98566A.bin, NAND
 bash qemu-boot/test-novatek-uboot.sh --flash nor.bin       # vendor U-Boot: net, SD
 bash qemu-boot/test-novatek-nand.sh --flash nand.bin       # NAND: U-Boot, UBIFS
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
-bash qemu-boot/test-novatek-usb.sh --kernel uImage.nt9856x-usb   # see USB
+bash qemu-boot/build-novatek-usb-kernel.sh --out usbk      # see USB
+bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel usbk/uImage.nt9856x-usb
 python3 qemu/tests/test-novatek.py
 ```
 

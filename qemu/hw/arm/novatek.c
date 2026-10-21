@@ -372,8 +372,6 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         g_free(upath);
     }
 
-    /* The MAC, its Novatek glue and the embedded PHY in one 16 KiB block;
-     * the vendor node maps the first 0x3800 and reaches past it. */
     /* The OTP / eFuse block: drivers (the USB PHY trim among them) call
      * efuse_readParamOps(), which needs this driver bound. */
     qemu_fdt_add_subnode(fdt, "/nvt_otp@f0660000");
@@ -390,6 +388,8 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
     qemu_fdt_setprop_cells(fdt, path, "reg", NVT_USB_BASE, 0x10000);
     nvt_fdt_irq(fdt, path, NVT_IRQ_USB);
 
+    /* The MAC, its Novatek glue and the embedded PHY in one 16 KiB block;
+     * the vendor node maps the first 0x3800 and reaches past it. */
     qemu_fdt_add_subnode(fdt, "/eth@f02b0000");
     qemu_fdt_setprop_string(fdt, "/eth@f02b0000", "compatible",
                             "nvt,synopsys_eth");
