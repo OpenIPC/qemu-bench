@@ -171,8 +171,10 @@ try:
              until(b'Mounted root (ubifs filesystem)', 120))
         step('vendor shell', until(SHELL, 120))
         prompt(20)
+        # an MD5 only for the whole 256 KiB, synced
         ser.sendall(b'dd if=/dev/urandom of=/nandtest bs=1024 count=256 '
-                    b'2>/dev/null; sync; echo MD5=$(md5sum < /nandtest)\r')
+                    b'2>/dev/null && [ $(wc -c < /nandtest) = 262144 ] && '
+                    b'sync && echo MD5=$(md5sum < /nandtest)\r')
         m = until(MD5, 60)
         written = m.group(1) if m else None
         step('a file written and synced to UBIFS', written)

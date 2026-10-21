@@ -20,6 +20,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtFlashState, NVT_FLASH)
 #define NVT_NAND_OOB        64
 #define NVT_NAND_RAW        (NVT_NAND_PAGE + NVT_NAND_OOB)
 #define NVT_NAND_BLOCK      64
+#define NVT_SPARE_SIZE      0x80    /* spare SRAM at +0x200 */
 
 struct NvtFlashState {
     SysBusDevice parent_obj;
@@ -58,6 +59,7 @@ struct NvtFlashState {
     uint32_t pages;
     uint8_t cache[NVT_NAND_RAW];
     uint8_t feat[3];            /* A0 protection, B0 configuration, C0 status */
+    uint8_t spare[NVT_SPARE_SIZE];  /* the OOB, byte for byte */
 };
 
 /* What the flash holds at off, for the machine's boot ROM; on a NAND, off

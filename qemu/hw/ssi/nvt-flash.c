@@ -229,8 +229,9 @@ static void nand_deselect(NvtFlashState *s)
     uint32_t i, off;
 
     switch (s->cmd) {
-    case 0xFF:                              /* RESET */
+    case 0xFF:                              /* RESET: power-on state */
         s->wel = false;
+        s->feat[NAND_FEAT_CFG] = NAND_CFG_ECCEN | NAND_CFG_BUF;
         s->feat[NAND_FEAT_STS] = 0;
         break;
     case 0x06:                              /* WRITE ENABLE */
@@ -636,11 +637,6 @@ static void nvt_flash_dma_out(NvtFlashState *s, dma_addr_t a, uint32_t len)
     *reg(s, REG_DMACURRENT) = a + len;
 }
 
-static uint8_t *nvt_flash_spare(NvtFlashState *s)
-{
-    return (uint8_t *)reg(s, REG_SPARE);
-}
-
 /*
  * DATA_RD3: load the page into the NAND's cache, wait for it, then read
  * from the column on -- DATALEN bytes of data to memory, the page's OOB to
@@ -651,7 +647,7 @@ static void nvt_flash_data_rd3(NvtFlashState *s, uint32_t cmd, uint32_t len,
                                bool dma)
 {
     uint32_t col = *reg(s, REG_COLADDR) & 0xFFF, i;
-    uint8_t *spare = nvt_flash_spare(s);
+    uint8_t *spare = s->spare;
 
     spi_select(s);
     spi_xfer(s, cmd);
@@ -664,7 +660,13 @@ static void nvt_flash_data_rd3(NvtFlashState *s, uint32_t cmd, uint32_t len,
     nvt_flash_send_col(s);
     spi_xfer(s, 0);                         /* dummy */
     if (col >= NVT_NAND_PAGE) {
-        len = MIN(len, NVT_NAND_RAW - col);
+        /* Up to the page's last OOB byte: at most NVT_NAND_OOB, so
+         * inside the spare SRAM. */
+        if (col >= NVT_NAND_RAW) {
+            qemu_log_mask(LOG_GUEST_ERROR, "nvt-flash: DATA_RD3 column "
+                          "0x%x past the page\n", col);
+        }
+        len = col < NVT_NAND_RAW ? MIN(len, NVT_NAND_RAW - col) : 0;
         for (i = 0; i < len; i++) {
             spare[i] = spi_xfer(s, 0);
         }
@@ -700,7 +702,7 @@ static void nvt_flash_prog_cmd(NvtFlashState *s, uint32_t cmd, uint32_t len,
                                bool dma)
 {
     uint32_t col = *reg(s, REG_COLADDR) & 0xFFF, i;
-    uint8_t *spare = nvt_flash_spare(s);
+    uint8_t *spare = s->spare;
 
     spi_select(s);
     spi_xfer(s, cmd);
@@ -878,6 +880,8 @@ static uint64_t nvt_flash_mmio_read(void *opaque, hwaddr off, unsigned size)
         return v;
     case REG_FIFO_STS:
         return nvt_flash_fifo_sts(s);
+    case REG_SPARE ... REG_SPARE + NVT_SPARE_SIZE - 4:
+        return ldl_le_p(s->spare + (off - REG_SPARE));
     case REG_CTRL0:
         return *reg(s, off) | (s->busy ? CTRL0_OPER_EN : 0);
     default:
@@ -944,6 +948,9 @@ static void nvt_flash_mmio_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     case REG_FIFO_STS:
+        break;
+    case REG_SPARE ... REG_SPARE + NVT_SPARE_SIZE - 4:
+        stl_le_p(s->spare + (off - REG_SPARE), val);
         break;
     default:
         if (off < NVT_FLASH_REGS_SIZE) {
@@ -1093,7 +1100,7 @@ fail:
 static const VMStateDescription vmstate_nvt_flash = {
     .name = TYPE_NVT_FLASH,
     .version_id = 2,
-    .minimum_version_id = 2,
+    .minimum_version_id = 1,        /* a NOR's v1 state still loads */
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtFlashState, NVT_FLASH_REGS_SIZE / 4),
         VMSTATE_UINT8_ARRAY(buf, NvtFlashState, NVT_FLASH_BUF),
@@ -1109,9 +1116,11 @@ static const VMStateDescription vmstate_nvt_flash = {
         VMSTATE_UINT32(addr, NvtFlashState),
         VMSTATE_UINT32(pos, NvtFlashState),
         VMSTATE_BOOL(selected, NvtFlashState),
-        VMSTATE_UINT8_ARRAY(cache, NvtFlashState, NVT_NAND_RAW),
-        VMSTATE_UINT8_ARRAY(feat, NvtFlashState, 3),
-        VMSTATE_VBUFFER_UINT32(array, NvtFlashState, 2, NULL, array_size),
+        /* array_size is size on a NOR, as v1 sized the buffer */
+        VMSTATE_VBUFFER_UINT32(array, NvtFlashState, 1, NULL, array_size),
+        VMSTATE_UINT8_ARRAY_V(cache, NvtFlashState, NVT_NAND_RAW, 2),
+        VMSTATE_UINT8_ARRAY_V(feat, NvtFlashState, 3, 2),
+        VMSTATE_UINT8_ARRAY_V(spare, NvtFlashState, NVT_SPARE_SIZE, 2),
         VMSTATE_END_OF_LIST()
     }
 };

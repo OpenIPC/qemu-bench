@@ -572,6 +572,21 @@ def test_nand(qt, path, with_oob):
     check('with the OOB in the spare SRAM', qt.read(FLASH + 0x200, OOB),
           oob or b'\xff' * OOB)
 
+    # A column past the OOB reads nothing, whatever DATALEN says
+    qt.write(FLASH + 0x200, b'\x5a' * 0x80)
+    nand_read_page(qt, 5, col=0xFFF, length=0x100000, dma=False)
+    check('a column past the page completes', flash_done(qt), True)
+    check('and leaves the spare SRAM alone', qt.read(FLASH + 0x200, 0x80),
+          b'\x5a' * 0x80)
+    check('the controller still answers', nand_feature(qt, 0xB0), 0x18)
+
+    # RESET returns B0 to its power-on value
+    nand_module0(qt, 2)
+    flash_op(qt, OP_CMD_ADDR, 0x1F, row=(0xB0 << 8) | 0x08)
+    check('SET_FEATURE B0: ECC off', nand_feature(qt, 0xB0), 0x08)
+    flash_op(qt, OP_CMD, 0xFF)
+    check('RESET restores ECC-E', nand_feature(qt, 0xB0), 0x18)
+
     # nand_cmd_erase_block: WEN, then BLK_ERSE polling GET_FEATURE C0
     nand_module0(qt, 1)
     flash_op(qt, OP_CMD, 0x06)
