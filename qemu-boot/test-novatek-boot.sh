@@ -17,6 +17,11 @@
 #     payload flashcp'd onto it (DMA page programs) and 100 bytes dd'd at
 #     256 KiB four at a time (PIO), all of which the host then finds byte
 #     for byte in the image file, the rest still erased;
+#   - an SD card on SDIO1 (nvt-sdio under the release's own
+#     mmc_na51055.ko): the card found and its MBR read, 1 MiB the host put
+#     there read back intact (descriptor DMA), 192 KiB written raw that the
+#     host then finds in the card image, and a vfat made on the partition
+#     holding a copied file across a remount;
 #   - Ethernet (nvt-eqos under the vendor DWC_ETH_QOS driver): a DHCP
 #     lease from QEMU's user network, then a 1 MiB file fetched over HTTP
 #     from the host (guestfwd), checksummed against the original;
@@ -80,6 +85,21 @@ open(pio, 'wb').write(os.urandom(100))
 PY
 ROOTFS_MD5=$(dd if="$NOR" bs=64k skip=37 count=80 2>/dev/null | md5sum | cut -d' ' -f1)
 
+# A 64 MiB card: one FAT partition at 1..16 MiB (the guest formats it),
+# 1 MiB of host data at 32 MiB, and 48 MiB left for the guest to write.
+SD=$WORK/sd.img
+python3 - "$SD" <<'PY'
+import os, struct, sys
+img = bytearray(64 << 20)
+part = struct.pack('<B3sB3sII', 0, b'\0\0\0', 0x0C, b'\0\0\0', 2048, 30720)
+img[446:446 + 16] = part
+img[510:512] = b'\x55\xaa'
+img[32 << 20:33 << 20] = os.urandom(1 << 20)
+open(sys.argv[1], 'wb').write(img)
+PY
+SD_MD5=$(dd if="$SD" bs=1M skip=32 count=1 2>/dev/null | md5sum | cut -d' ' -f1)
+PAYLOAD_MD5=$(md5sum < "$WORK/payload.bin" | cut -d' ' -f1)
+
 unsquashfs -q -d "$WORK/rootfs" "$ROOTFS" bin/busybox lib >/dev/null
 WDT_KO=$(cd "$WORK/rootfs" && find lib/modules -name na51055_wdt.ko | head -1)
 mkdir -p "$WORK/initramfs"/{bin,lib,proc,sys,dev}
@@ -111,6 +131,12 @@ chmod +x "$WORK/initramfs/udhcpc.sh"
 if [ -n "$WDT_KO" ]; then
     cp "$WORK/rootfs/$WDT_KO" "$WORK/initramfs/lib/"
 fi
+# So is the SD stack: mmc_core, mmc_block and the Novatek host.
+for ko in mmc_core mmc_block mmc_na51055; do
+    f=$(cd "$WORK/rootfs" && find lib/modules -name "$ko.ko" | head -1)
+    [ -n "$f" ] && cp "$WORK/rootfs/$f" "$WORK/initramfs/lib/"
+done
+mkdir -p "$WORK/initramfs/mnt"
 ln -s busybox "$WORK/initramfs/bin/sh"
 cat > "$WORK/initramfs/init" <<'INIT'
 #!/bin/sh
@@ -130,6 +156,15 @@ echo "NVT-ROOTFS-MD5: $($bb dd if=/dev/mtdblock3 bs=64k 2>/dev/null | $bb md5sum
 $bb flash_eraseall /dev/mtd4 >/dev/null 2>&1 && echo "NVT-ERASE: ok"
 $bb flashcp -v /payload.bin /dev/mtd4 >/dev/null 2>&1 && echo "NVT-FLASHCP: ok"
 $bb dd if=/pio.bin of=/dev/mtd4 bs=4 seek=65536 2>/dev/null && echo "NVT-PIO: ok"
+for ko in mmc_core mmc_block mmc_na51055; do $bb insmod /lib/$ko.ko; done
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0p1 ] && break; $bb sleep 1; done
+[ -b /dev/mmcblk0p1 ] && echo "NVT-SD: ok"
+echo "NVT-SD-READ-MD5: $($bb dd if=/dev/mmcblk0 bs=1M skip=32 count=1 2>/dev/null | $bb md5sum)"
+$bb dd if=/payload.bin of=/dev/mmcblk0 bs=64k seek=768 conv=fsync 2>/dev/null && echo "NVT-SD-WRITE: ok"
+$bb mkfs.vfat /dev/mmcblk0p1 >/dev/null 2>&1 && $bb mount -t vfat /dev/mmcblk0p1 /mnt && \
+    $bb cp /payload.bin /mnt/payload.bin && $bb umount /mnt && \
+    $bb mount -t vfat /dev/mmcblk0p1 /mnt && \
+    echo "NVT-SD-VFAT-MD5: $($bb md5sum < /mnt/payload.bin)" && $bb umount /mnt
 $bb ifconfig lo up
 $bb ifconfig eth0 up
 $bb udhcpc -i eth0 -n -q -t 5 -s /udhcpc.sh >/dev/null 2>&1 && echo "NVT-DHCP: ok"
@@ -147,6 +182,7 @@ timeout 180 "$QEMU" -M "$MACHINE,flash-file=$NOR" -nographic -monitor none \
     -serial stdio -no-reboot -kernel "$KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
     -nic user,restrict=on,guestfwd=tcp:10.0.2.100:$HTTP_PORT-tcp:127.0.0.1:$HTTP_PORT \
+    -drive if=sd,index=0,format=raw,file="$SD" \
     > "$WORK/console.log" 2>&1
 rc=$?
 set -e
@@ -190,6 +226,16 @@ else
     echo "FAIL: the image file does not hold the payload"
     fail=1
 fi
+expect 'NVT-SD: ok' 'SD card found, its partition table read'
+expect "NVT-SD-READ-MD5: $SD_MD5" '1 MiB read back from the card intact'
+expect 'NVT-SD-WRITE: ok' '192 KiB written raw to the card'
+if [ "$(dd if="$SD" bs=64k skip=768 count=3 2>/dev/null | md5sum | cut -d' ' -f1)" = "$PAYLOAD_MD5" ]; then
+    echo "PASS: the raw write is in the card image"
+else
+    echo "FAIL: the raw write is not in the card image"
+    fail=1
+fi
+expect "NVT-SD-VFAT-MD5: $PAYLOAD_MD5" 'vfat made on the card keeps a file across a remount'
 expect 'NVT-DHCP: ok' 'DHCP lease over nvt-eqos'
 expect "NVT-HTTP-MD5: $BLOB_MD5" '1 MiB over HTTP, intact'
 expect 'NVT-BOOT-OK' 'PID 1 ran to the end'

@@ -229,6 +229,10 @@ A 128/256 MiB `flash-file` is a W25N SPI NAND instead of a NOR (FDT then at
 two command bytes and has whole-page ops 0x15/0x16 with the OOB in the spare
 SRAM at +0x200. The OpenIPC kernels lack the NAND driver, so it is tested
 with the vendor `FW98566A.bin` (`qemu-boot/test-novatek-nand.sh`).
+Its SD hosts (`hw/sd/nvt-sdio.c`) DMA through a descriptor table under
+Linux but a plain address under U-Boot (`0x1FC` = 1). Linux relies on the
+clock framework's CG reset pulse to undo that, so `nvt-cg` drives
+"sys-reset" lines into them.
 Its Ethernet (`hw/net/nvt-eqos.c`) is a DWC EQoS 4.x under the Synopsys
 reference driver, which needs HW_FEATURE0's MDIO bit to look for a PHY and
 returns IRQ_NONE unless the Novatek glue's ETH_ISR (+0x3008) is non-zero.
@@ -236,7 +240,7 @@ Do not run a flash boot under `-d unimp -D` into `/tmp` (a tmpfs): a
 firmware polling an unmodelled block fills it in seconds. Its vendor U-Boot
 has `bootdelay` 0 and no saved environment, so the only way to its prompt is
 a key queued before the CPU runs: start QEMU with `-S` and the serial line
-on a socket (`qemu-boot/test-novatek-uboot-net.sh`). Keyboard input to any
+on a socket (`qemu-boot/test-novatek-uboot.sh`). Keyboard input to any
 16550 that a guest resets before reading relies on
 `qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch`.
 
