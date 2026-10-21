@@ -1400,8 +1400,8 @@ def hmp(qemu, args, cmds):
 
 def test_migration(qemu, tmp):
     print('migration')
-    for m in ('nt98562', 'nt98566'):
-        mig = os.path.join(tmp, m + '.mig')
+    for m in ('nt98562', 'nt98566', 'nt98566,sensor=sc401ai'):
+        mig = os.path.join(tmp, m.replace(',', '_') + '.mig')
         out = hmp(qemu, ['-M', m, '-S'],
                   ['migrate file:' + mig, 'info migrate'])
         check('%s: state saved' % m, 'completed' in out and

@@ -127,6 +127,9 @@ static void nvt_i2c_chunk(NvtI2cState *s)
                 i2c_nack(s->bus);
             }
         } else if (i2c_send(s->bus, data >> (8 * i))) {
+            /* A NACKed byte ends the transfer here: the driver's lone
+             * STOP that follows then has nothing to send or end. */
+            nvt_i2c_stop(s);
             sts |= STS_BERR | STS_NACK;
             break;
         }
