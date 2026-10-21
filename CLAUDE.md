@@ -229,6 +229,10 @@ A 128/256 MiB `flash-file` is a W25N SPI NAND instead of a NOR (FDT then at
 two command bytes and has whole-page ops 0x15/0x16 with the OOB in the spare
 SRAM at +0x200. The OpenIPC kernels lack the NAND driver, so it is tested
 with the vendor `FW98566A.bin` (`qemu-boot/test-novatek-nand.sh`).
+Its I2C (`hw/i2c/nvt-i2c.c`) moves PIO chunks of up to four bytes,
+with per-byte START/STOP/NACK flags in CONFIG. `sensor=` puts a
+`hisi-smartsens` chip at 0x30 on bus 0 from novatek.c's own table, not
+hisilicon's strcmp chain. The default is none.
 Its USB host (`hw/usb/nvt-usb.c`) is QEMU's FUSBH200 EHCI plus the
 FOTG200 glue. The driver reads the port speed from +0x80 and finds the
 block at 0xFF600000, not 0xF0600000. It needs `nvt-otp` and the

@@ -20,6 +20,7 @@
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "hw/char/serial-mm.h"
+#include "hw/i2c/i2c.h"
 #include "hw/irq.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
@@ -72,6 +73,34 @@ static const struct {
     { 0xF0290000, 43, 24000000 },
     { 0xF0300000, 44, 48000000 },
     { 0xF0310000, 45, 48000000 },
+};
+
+/*
+ * The I2C controllers: i2c-nvt.c names its clock after the device
+ * ("f0350000.i2c2"), so the nodes keep the vendor's names; id n makes the
+ * adapter /dev/i2c-n.
+ */
+static const struct {
+    const char *node;
+    hwaddr base;
+    int irq;
+} nvt_i2c[] = {
+    { "i2c",  0xF0220000, 41 },
+    { "i2c2", 0xF0350000, 42 },
+    { "i2c3", 0xF03A0000, 60 },
+};
+
+/*
+ * Image sensors for sensor=: SmartSens parts the OpenIPC release has a
+ * driver for (nvt_sen_<name>.ko), at 0x30 on I2C 0 where ipcinfo's
+ * Novatek HAL probes (ssens_addrs 0x60, 8-bit), chip ID at 0x3107/0x3108.
+ */
+static const struct {
+    const char *name;
+    uint8_t id_high, id_low;
+} nvt_sensors[] = {
+    { "sc401ai", 0xCD, 0x2E },
+    { "sc501ai", 0xCE, 0x1F },
 };
 
 /*
@@ -158,6 +187,7 @@ struct NvtMachineState {
 
     char *flash_file;
     uint32_t flash_jedec;
+    char *sensor;
     NvtFlashState *flash;
 };
 
@@ -369,6 +399,20 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         qemu_fdt_setprop_cell(fdt, upath, "voltage-switch", 0);
         qemu_fdt_setprop_cell(fdt, upath, "max-voltage", 3300);
         qemu_fdt_setprop_cell(fdt, upath, "bus-width", 4);
+        g_free(upath);
+    }
+
+    for (n = ARRAY_SIZE(nvt_i2c) - 1; n >= 0; n--) {
+        upath = g_strdup_printf("/%s@%" HWADDR_PRIx, nvt_i2c[n].node,
+                                nvt_i2c[n].base);
+        qemu_fdt_add_subnode(fdt, upath);
+        qemu_fdt_setprop_string(fdt, upath, "compatible", "nvt,nvt_i2c");
+        qemu_fdt_setprop_cells(fdt, upath, "reg", nvt_i2c[n].base, 0x100);
+        nvt_fdt_irq(fdt, upath, nvt_i2c[n].irq);
+        qemu_fdt_setprop_cell(fdt, upath, "clock-frequency", 400000);
+        qemu_fdt_setprop_cell(fdt, upath, "id", n);
+        qemu_fdt_setprop_cell(fdt, upath, "#address-cells", 1);
+        qemu_fdt_setprop_cell(fdt, upath, "#size-cells", 0);
         g_free(upath);
     }
 
@@ -621,6 +665,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     MemoryRegion *sysmem = get_system_memory();
     qemu_irq pic[NVT_NUM_IRQ - 32];
     DeviceState *mp, *dev, *flash, *cg, *gpio;
+    I2CBus *i2c0 = NULL;
     SysBusDevice *mpbus;
     Object *cpuobj;
     ARMCPU *cpu;
@@ -695,6 +740,30 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0, pic[NVT_IRQ_GPIO]);
 
     sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
+
+    for (n = 0; n < ARRAY_SIZE(nvt_i2c); n++) {
+        dev = sysbus_create_simple("nvt-i2c", nvt_i2c[n].base,
+                                   pic[nvt_i2c[n].irq]);
+        if (n == 0) {
+            i2c0 = (I2CBus *)qdev_get_child_bus(dev, "i2c");
+        }
+    }
+    if (nms->sensor && strcmp(nms->sensor, "none")) {
+        for (n = 0; n < ARRAY_SIZE(nvt_sensors); n++) {
+            if (!strcmp(nms->sensor, nvt_sensors[n].name)) {
+                break;
+            }
+        }
+        if (n == ARRAY_SIZE(nvt_sensors)) {
+            error_report("novatek: unknown sensor '%s' (none, sc401ai, "
+                         "sc501ai)", nms->sensor);
+            exit(1);
+        }
+        dev = DEVICE(i2c_slave_new("hisi-smartsens", 0x30));
+        qdev_prop_set_uint8(dev, "id_high", nvt_sensors[n].id_high);
+        qdev_prop_set_uint8(dev, "id_low", nvt_sensors[n].id_low);
+        i2c_slave_realize_and_unref(I2C_SLAVE(dev), i2c0, &error_fatal);
+    }
 
     /*
      * USB: the EHCI (region 0) over the FOTG200 glue (region 1), at the
@@ -807,6 +876,20 @@ static void nvt_machine_set_flash_file(Object *obj, const char *value,
     s->flash_file = g_strdup(value);
 }
 
+static char *nvt_machine_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(NVT_MACHINE(obj)->sensor);
+}
+
+static void nvt_machine_set_sensor(Object *obj, const char *value,
+                                   Error **errp)
+{
+    NvtMachineState *s = NVT_MACHINE(obj);
+
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
+}
+
 static void nvt_machine_get_flash_jedec(Object *obj, Visitor *v,
                                         const char *name, void *opaque,
                                         Error **errp)
@@ -839,6 +922,10 @@ static void nvt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "flash-jedec",
         "JEDEC ID the flash answers with; default a Winbond W25Q (NOR) or "
         "W25N (NAND) of the image's size");
+    object_class_property_add_str(oc, "sensor",
+        nvt_machine_get_sensor, nvt_machine_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "Image sensor on I2C 0 (none, sc401ai, sc501ai); default none");
 }
 
 static const TypeInfo nvt_machine_info = {

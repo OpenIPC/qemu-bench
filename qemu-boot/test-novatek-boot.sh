@@ -22,6 +22,9 @@
 #     there read back intact (descriptor DMA), 192 KiB written raw that the
 #     host then finds in the card image, and a vfat made on the partition
 #     holding a copied file across a remount;
+#   - I2C (nvt-i2c under the vendor i2c-nvt driver) with sensor=sc401ai:
+#     three adapters, i2cdetect finding the sensor at 0x30 on bus 0, and the
+#     release's own ipcinfo naming it sc401ai, as load_novatek asks it to;
 #   - Ethernet (nvt-eqos under the vendor DWC_ETH_QOS driver): a DHCP
 #     lease from QEMU's user network, then a 1 MiB file fetched over HTTP
 #     from the host (guestfwd), checksummed against the original;
@@ -100,9 +103,10 @@ PY
 SD_MD5=$(dd if="$SD" bs=1M skip=32 count=1 2>/dev/null | md5sum | cut -d' ' -f1)
 PAYLOAD_MD5=$(md5sum < "$WORK/payload.bin" | cut -d' ' -f1)
 
-unsquashfs -q -d "$WORK/rootfs" "$ROOTFS" bin/busybox lib >/dev/null
+unsquashfs -q -d "$WORK/rootfs" "$ROOTFS" bin/busybox lib usr/bin/ipcinfo >/dev/null
 WDT_KO=$(cd "$WORK/rootfs" && find lib/modules -name na51055_wdt.ko | head -1)
-mkdir -p "$WORK/initramfs"/{bin,lib,proc,sys,dev}
+mkdir -p "$WORK/initramfs"/{bin,lib,proc,sys,dev,usr/bin}
+cp "$WORK/rootfs/usr/bin/ipcinfo" "$WORK/initramfs/usr/bin/"
 cp "$WORK/rootfs/bin/busybox" "$WORK/initramfs/bin/"
 cp -a "$WORK/rootfs/lib/libc.so" "$WORK/rootfs/lib/ld-musl-armhf.so.1" \
     "$WORK/initramfs/lib/"
@@ -156,6 +160,9 @@ echo "NVT-ROOTFS-MD5: $($bb dd if=/dev/mtdblock3 bs=64k 2>/dev/null | $bb md5sum
 $bb flash_eraseall /dev/mtd4 >/dev/null 2>&1 && echo "NVT-ERASE: ok"
 $bb flashcp -v /payload.bin /dev/mtd4 >/dev/null 2>&1 && echo "NVT-FLASHCP: ok"
 $bb dd if=/pio.bin of=/dev/mtd4 bs=4 seek=65536 2>/dev/null && echo "NVT-PIO: ok"
+[ -c /dev/i2c-0 ] && [ -c /dev/i2c-1 ] && [ -c /dev/i2c-2 ] && echo "NVT-I2C: ok"
+$bb i2cdetect -y 0 2>/dev/null | $bb grep -q "^30: 30" && echo "NVT-I2C-DETECT: ok"
+echo "NVT-SENSOR: $(/usr/bin/ipcinfo --short-sensor 2>/dev/null)"
 for ko in mmc_core mmc_block mmc_na51055; do $bb insmod /lib/$ko.ko; done
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0p1 ] && break; $bb sleep 1; done
 [ -b /dev/mmcblk0p1 ] && echo "NVT-SD: ok"
@@ -178,7 +185,8 @@ chmod +x "$WORK/initramfs/init"
 
 echo "Booting $KERNEL on -M $MACHINE"
 set +e
-timeout 180 "$QEMU" -M "$MACHINE,flash-file=$NOR" -nographic -monitor none \
+timeout 180 "$QEMU" -M "$MACHINE,flash-file=$NOR,sensor=sc401ai" \
+    -nographic -monitor none \
     -serial stdio -no-reboot -kernel "$KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
     -nic user,restrict=on,guestfwd=tcp:10.0.2.100:$HTTP_PORT-tcp:127.0.0.1:$HTTP_PORT \
@@ -226,6 +234,9 @@ else
     echo "FAIL: the image file does not hold the payload"
     fail=1
 fi
+expect 'NVT-I2C: ok' 'three I2C adapters registered'
+expect 'NVT-I2C-DETECT: ok' 'i2cdetect finds the sensor at 0x30'
+expect 'NVT-SENSOR: sc401ai' 'ipcinfo identifies it as sc401ai'
 expect 'NVT-SD: ok' 'SD card found, its partition table read'
 expect "NVT-SD-READ-MD5: $SD_MD5" '1 MiB read back from the card intact'
 expect 'NVT-SD-WRITE: ok' '192 KiB written raw to the card'

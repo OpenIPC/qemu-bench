@@ -98,6 +98,7 @@ cp qemu/hw/ssi/nvt-flash.c          "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/sd/nvt-sdio.c            "$QEMU_DIR/hw/sd/"
 cp qemu/hw/net/nvt-eqos.c           "$QEMU_DIR/hw/net/"
 cp qemu/hw/usb/nvt-usb.c            "$QEMU_DIR/hw/usb/"
+cp qemu/hw/i2c/nvt-i2c.c            "$QEMU_DIR/hw/i2c/"
 cp qemu/include/hw/ssi/nvt-flash.h  "$QEMU_DIR/include/hw/ssi/"
 cp qemu/include/hw/misc/hisi-fastboot.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-sysctl.c       "$QEMU_DIR/hw/misc/"
@@ -468,10 +469,11 @@ config NOVATEK
     select HISI_MISC
     select SD
     select USB_EHCI_SYSBUS
+    select HISI_I2C
 KCONFIG
     echo "  hw/arm/Kconfig: added NOVATEK"
 else
-    for sym in A9MPCORE PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS; do
+    for sym in A9MPCORE PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C; do
         if ! sed -n '/^config NOVATEK$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config NOVATEK\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -480,7 +482,7 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

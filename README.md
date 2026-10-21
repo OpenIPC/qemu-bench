@@ -247,7 +247,10 @@ is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
 `-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
 vendor U-Boot read and write them. The USB host (FOTG200) works under the
 vendor EHCI driver; no shipped kernel enables it, so
-`qemu-boot/build-novatek-usb-kernel.sh` builds one. `reboot` works the
+`qemu-boot/build-novatek-usb-kernel.sh` builds one. The three I2C
+controllers work under the vendor driver, and `sensor=sc401ai` (or
+`sc501ai`) puts a SmartSens chip on I2C 0, which OpenIPC's `ipcinfo` and
+`load_novatek` detect and load the driver for. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
@@ -395,6 +398,7 @@ qemu/
 ├── hw/sd/nvt-sdio.c             # Novatek SD hosts (descriptor / plain DMA, PIO)
 ├── hw/net/nvt-eqos.c            # DWC Ethernet QoS (GMAC 4.x) + embedded PHY
 ├── hw/usb/nvt-usb.c             # Novatek FOTG200 host: FUSBH200 EHCI + OTG glue
+├── hw/i2c/nvt-i2c.c             # Novatek I2C controllers (PIO chunks)
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
