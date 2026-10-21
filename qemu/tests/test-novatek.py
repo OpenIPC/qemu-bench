@@ -59,7 +59,9 @@ plays the vendor drivers (docs/novatek.md):
   - nvt-timer, the way timer_cfg() and U-Boot drive it: timer 0
     running free at 1 MHz out of reset, a one-shot timer counting to its
     target, flagging STS and SPI 0 and stopping, a free-running one on
-    divider 1 wrapping and going on, a divider change mid-period, RELOAD,
+    divider 1 wrapping and going on, a divider change mid-period (and
+    repeated ones at 600 kHz keeping every tick), 3 MHz periods without
+    drift, a switch to one shot mid-period, RELOAD,
     a disabled timer holding its count, STS without INT raising nothing,
     and a machine reset restoring timer 0;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
@@ -1072,6 +1074,30 @@ def test_timer(qt):
     qt.writel(TIMER + 0x10, 1 << 7)
     qt.writel(tmr(5, 8), 1234)
     check('COUNTER is read-only', qt.readl(tmr(5, 8)), held)
+    # divider 1 at 3 MHz / (4 + 1) = 600 kHz: a tick is 1666.7 ns, so a
+    # rebase that went through nanoseconds and back would lose it
+    qt.writel(TIMER + 0x30, (4 << 8) | 1 << 17)
+    timer_cfg(qt, 11, 0xFFFFFF, 5)
+    qt.step(1700)
+    counts = []
+    for _ in range(5):
+        qt.writel(TIMER + 0x30, (4 << 8) | 1 << 17)
+        counts.append(qt.readl(tmr(11, 8)))
+    check('divider rewrites at 600 kHz keep the count (1, not back to 0)',
+          counts, [1] * 5)
+    qt.writel(tmr(11, 0), 0)
+    # 3 MHz, a 1 us period: no drift from rounding each period to 333 ns
+    qt.writel(TIMER + 0x30, 1 << 17)
+    timer_cfg(qt, 12, 2, 7)
+    qt.writel(TIMER + 0x20, 0)
+    qt.step(10 * 1000 * 1000 + 334)
+    check('3 MHz, period 3 ticks: 10 ms and 334 ns in, count 1',
+          qt.readl(tmr(12, 8)), 1)
+    qt.writel(tmr(12, 0), 5)                        # free run -> one shot
+    qt.step(1000)
+    check('switched to one shot mid-period: it ends there and stops',
+          (qt.readl(tmr(12, 0)) & 1, qt.readl(tmr(12, 8))), (0, 2))
+    qt.writel(TIMER + 0x10, 0xFFFFF)
     # The machine reset (the kernel's manual watchdog reset) restarts
     # timer 0 as the loader leaves it, and stops the rest.
     qt.writel(tmr(9, 4), 0xFFFF)

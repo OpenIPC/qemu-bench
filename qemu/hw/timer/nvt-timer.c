@@ -62,7 +62,13 @@ typedef struct {
     NvtTimerState *s;
     int n;
     QEMUTimer *qt;
-    int64_t start_ns;       /* when the current period's count was 0 */
+    /*
+     * The count is kept in whole ticks from the start: base_ticks at
+     * base_ns, plus what the current rate has added since.  A rate change
+     * moves the base, so nothing is ever converted back and forth.
+     */
+    int64_t base_ns;
+    uint64_t base_ticks;
     uint32_t target;        /* the period's target, from TARGET */
 } NvtTimerChannel;
 
@@ -98,43 +104,63 @@ static uint64_t nvt_timer_hz(NvtTimerState *s, int n)
     return 1000000;
 }
 
-/* Ticks counted in the current period, uncapped. */
-static uint64_t nvt_timer_elapsed(NvtTimerChannel *c)
+/* Ticks counted since the timer started, across periods. */
+static uint64_t nvt_timer_ticks(NvtTimerChannel *c)
 {
-    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - c->start_ns;
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - c->base_ns;
 
-    return muldiv64(MAX(ns, 0), nvt_timer_hz(c->s, c->n),
-                    NANOSECONDS_PER_SECOND);
+    return c->base_ticks + muldiv64(MAX(ns, 0), nvt_timer_hz(c->s, c->n),
+                                    NANOSECONDS_PER_SECOND);
 }
 
-/* Arm the QEMU timer for the end of the current period. */
+static uint64_t nvt_timer_period(NvtTimerChannel *c)
+{
+    return (uint64_t)c->target + 1;
+}
+
+/*
+ * Arm the QEMU timer for the next period end: the first instant at which
+ * nvt_timer_ticks() reaches it, so a late callback still sees it reached.
+ */
 static void nvt_timer_schedule(NvtTimerChannel *c)
 {
-    uint64_t ticks = (uint64_t)c->target + 1;
+    uint64_t hz = nvt_timer_hz(c->s, c->n);
+    uint64_t period = nvt_timer_period(c);
+    uint64_t end = (nvt_timer_ticks(c) / period + 1) * period;
+    uint64_t d = end - c->base_ticks;
+    uint64_t ns = muldiv64(d, NANOSECONDS_PER_SECOND, hz);
 
-    timer_mod(c->qt, c->start_ns + muldiv64(ticks, NANOSECONDS_PER_SECOND,
-                                            nvt_timer_hz(c->s, c->n)));
+    if (muldiv64(ns, hz, NANOSECONDS_PER_SECOND) < d) {
+        ns++;
+    }
+    timer_mod(c->qt, c->base_ns + ns);
 }
 
 static void nvt_timer_start(NvtTimerChannel *c)
 {
-    c->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    c->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    c->base_ticks = 0;
     c->target = *treg(c->s, c->n, TMR_TARGET);
     nvt_timer_schedule(c);
 }
 
 /*
- * The clock of a running timer changed (CLKDIV, or CTRL's divider select):
- * it goes on from the count it had reached, at the new rate.
+ * The clock or mode of a running timer changed (CLKDIV, or CTRL's divider
+ * select or free-run bit): it goes on from the count it had reached in
+ * this period, sampled at the old rate.
  */
-static void nvt_timer_rebase(NvtTimerChannel *c, uint64_t count)
+static void nvt_timer_rebase(NvtTimerChannel *c, uint64_t ticks)
 {
-    c->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
-                  muldiv64(count, NANOSECONDS_PER_SECOND,
-                           nvt_timer_hz(c->s, c->n));
+    c->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    c->base_ticks = ticks;
     nvt_timer_schedule(c);
 }
 
+/*
+ * A period ended -- one or several, if the callback ran late: the status
+ * bit is set once, a one-shot timer stops at its target, a free-running
+ * one is armed for the next end after now.
+ */
 static void nvt_timer_expired(void *opaque)
 {
     NvtTimerChannel *c = opaque;
@@ -143,9 +169,6 @@ static void nvt_timer_expired(void *opaque)
 
     *reg(s, TMR_STS) |= 1u << c->n;
     if (*ctrl & CTRL_FREE_RUN) {
-        c->start_ns += muldiv64((uint64_t)c->target + 1,
-                                NANOSECONDS_PER_SECOND,
-                                nvt_timer_hz(s, c->n));
         nvt_timer_schedule(c);
     } else {
         *ctrl &= ~CTRL_EN;
@@ -154,14 +177,29 @@ static void nvt_timer_expired(void *opaque)
     nvt_timer_update_irq(s);
 }
 
+/* Complete a period end that is due but whose callback has not run. */
+static void nvt_timer_catch_up(NvtTimerChannel *c)
+{
+    if (timer_pending(c->qt) &&
+        timer_expire_time_ns(c->qt) <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(c->qt);
+        nvt_timer_expired(c);
+    }
+}
+
 static uint32_t nvt_timer_counter(NvtTimerState *s, int n)
 {
     NvtTimerChannel *c = &s->ch[n];
+    uint64_t ticks;
 
     if (!(*treg(s, n, TMR_CTRL) & CTRL_EN)) {
         return *treg(s, n, TMR_COUNTER);
     }
-    return MIN(nvt_timer_elapsed(c), (uint64_t)c->target);
+    ticks = nvt_timer_ticks(c);
+    if (*treg(s, n, TMR_CTRL) & CTRL_FREE_RUN) {
+        return ticks % nvt_timer_period(c);
+    }
+    return MIN(ticks, (uint64_t)c->target);
 }
 
 static uint64_t nvt_timer_read(void *opaque, hwaddr off, unsigned size)
@@ -184,36 +222,42 @@ static uint64_t nvt_timer_read(void *opaque, hwaddr off, unsigned size)
 static void nvt_timer_write_ctrl(NvtTimerState *s, int n, uint32_t val)
 {
     NvtTimerChannel *c = &s->ch[n];
-    uint32_t old = *treg(s, n, TMR_CTRL);
+    uint32_t old;
+    uint64_t ticks = 0;
 
-    uint32_t count = nvt_timer_counter(s, n);
-
+    nvt_timer_catch_up(c);
+    old = *treg(s, n, TMR_CTRL);
+    if (old & CTRL_EN) {
+        ticks = nvt_timer_counter(s, n);
+    }
     if ((old & CTRL_EN) && !(val & CTRL_EN)) {
         /* Stopped: the count holds where it was. */
-        *treg(s, n, TMR_COUNTER) = count;
+        *treg(s, n, TMR_COUNTER) = ticks;
         timer_del(c->qt);
     }
     *treg(s, n, TMR_CTRL) = val & 0x7;
     if (!(old & CTRL_EN) && (val & CTRL_EN)) {
         nvt_timer_start(c);
-    } else if ((old & val & CTRL_EN) && ((old ^ val) & CTRL_DIV1)) {
-        nvt_timer_rebase(c, count);
+    } else if ((old & val & CTRL_EN) &&
+               ((old ^ val) & (CTRL_DIV1 | CTRL_FREE_RUN))) {
+        nvt_timer_rebase(c, ticks);
     }
 }
 
 static void nvt_timer_write_clkdiv(NvtTimerState *s, uint32_t val)
 {
-    uint32_t count[TMR_NUM];
+    uint64_t ticks[TMR_NUM];
     int n;
 
     for (n = 0; n < TMR_NUM; n++) {
-        count[n] = nvt_timer_counter(s, n);
+        nvt_timer_catch_up(&s->ch[n]);
+        ticks[n] = nvt_timer_counter(s, n);
     }
     *reg(s, TMR_CLKDIV) = val;
     for (n = 0; n < TMR_NUM; n++) {
         if ((*treg(s, n, TMR_CTRL) & (CTRL_EN | CTRL_DIV1)) ==
             (CTRL_EN | CTRL_DIV1)) {
-            nvt_timer_rebase(&s->ch[n], count[n]);
+            nvt_timer_rebase(&s->ch[n], ticks[n]);
         }
     }
 }
@@ -233,6 +277,7 @@ static void nvt_timer_write(void *opaque, hwaddr off, uint64_t val,
         case TMR_COUNTER:
             return;                     /* read only */
         case TMR_RELOAD:
+            nvt_timer_catch_up(&s->ch[n]);
             if ((val & 1) && (*treg(s, n, TMR_CTRL) & CTRL_EN)) {
                 nvt_timer_start(&s->ch[n]);
             }
@@ -308,7 +353,8 @@ static const VMStateDescription vmstate_nvt_timer_channel = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(qt, NvtTimerChannel),
-        VMSTATE_INT64(start_ns, NvtTimerChannel),
+        VMSTATE_INT64(base_ns, NvtTimerChannel),
+        VMSTATE_UINT64(base_ticks, NvtTimerChannel),
         VMSTATE_UINT32(target, NvtTimerChannel),
         VMSTATE_END_OF_LIST()
     }

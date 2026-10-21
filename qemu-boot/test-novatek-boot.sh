@@ -290,7 +290,7 @@ fi
 expect "NVT-SD-VFAT-MD5: $PAYLOAD_MD5" 'vfat made on the card keeps a file across a remount'
 expect 'NVT-DHCP: ok' 'DHCP lease over nvt-eqos'
 expect "NVT-HTTP-MD5: $BLOB_MD5" '1 MiB over HTTP, intact'
-if grep -q 'NVT-TIMER0-1S: 1[0-9][0-9][0-9][0-9][0-9][0-9]' "$WORK/console.log"; then
+if grep -Eq 'NVT-TIMER0-1S: 1[0-9]{6}\s*$' "$WORK/console.log"; then
     echo "PASS: timer 0 counts about 1000000 across a 1 s sleep (1 MHz)"
 else
     echo "FAIL: timer 0 does not count at 1 MHz"
