@@ -4,7 +4,8 @@ Novatek's NT9856x IP-camera SoCs (internal name NA51089): one Cortex-A9
 with DDR in the package and Novatek's own peripheral blocks from
 `0xF0000000`. One machine file (`hw/arm/novatek.c`) covers the family with a
 table entry per part. It boots the OpenIPC `nt98562_lite` / `nt98566_lite`
-kernel with its root on the emulated SPI NOR and Ethernet up, and boots a
+kernel with its root on the emulated SPI NOR, Ethernet up and an SD card,
+and boots a
 whole flash image through the vendor U-Boot, on SPI NOR or (the 566 boards)
 SPI NAND with a UBIFS root. What is left is in
 [Not modelled](#not-modelled).
@@ -54,7 +55,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | UART1 / 2 / 3 | `0xF0290000` / `0xF0300000` / `0xF0310000` | 43 / 44 / 45 | 16550, reg-shift 2 |
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
 | SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR, or a W25N SPI NAND) |
-| SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio` (empty slot) |
+| SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio`, an SD card from `-drive if=sd,index=0` / `1` |
 | USB 2.0 | `0xF0600000` | 27 | — |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
@@ -252,6 +253,63 @@ the vendor init scripts. A NAND pack (`FW98566A.bin`) comes out as the
 128 MiB NAND's data, its UBI rootfs as ubinize made it. It boots the same
 way with `SOC=nt98566 FLASH=nand.bin`.
 
+## SD card
+
+`nvt-sdio` is the Novatek SD host (`na51055_mmc{,host,reg}` in the kernel,
+`nvt_ivot_mmc` in U-Boot) with QEMU's `sd-card` on its bus:
+`-drive if=sd,index=0,format=raw,file=sd.img` puts a card in SDIO1 and
+`index=1` one in SDIO2. The OpenIPC rootfs carries the driver as modules
+(`mmc_core.ko`, `mmc_block.ko`, `mmc_na51055.ko`); vfat is built in.
+
+The drivers set the data phase up first: DATA_LENGTH, FIFO_CTRL (DMA or
+PIO, direction), DATA_EN, then FIFO_EN. Then they write the command
+with CMD_EN, and the data moves with it. Command completion is CMD_SENT,
+plus RSP_CRC_OK with a response. An R2 goes to RSP3..RSP0, with bits
+127..96 in RSP3, because the drivers read RSP3 into `resp[0]`. The drivers
+send R2 with LONG_RSP alone, not NEED_RSP. A DMA transfer completes at
+once, so CMD_SENT, RSP_CRC_OK, DATA_END and DATA_CRC_OK arrive together,
+and the kernel's IRQ handler takes them in that order. FIFO_EN and DATA_EN
+clear when a transfer ends.
+
+The two drivers DMA differently through the same register at `+0x110`:
+
+- **Linux** (`SDIO_SCATTER_DMA`) gives a table of 3-word descriptors:
+  valid/end/act=2, length, address, at most 128.
+- **U-Boot** writes `0x1FC` = 1 and the buffer's own address.
+
+Linux never clears `0x1FC`. On silicon the block is reset under it: the
+clock framework drops and raises the host's CG_SYS_RESET_REG1 bit (2 for
+SDIO1, 3 for SDIO2) when it prepares the clock
+(`nvt_composite_gate_clk_prepare`, DO_RESET), and U-Boot does the same by
+hand. `nvt-cg` drives a "sys-reset" line for every SYS_RESET bit, and the
+machine wires those two into the hosts, so the U-Boot to Linux handover
+works as on the chip.
+
+Buffers that are not cache-line aligned, such as the 8-byte SCR, go by
+PIO. In its command-done handler the driver drains or fills DATA_PORT, 16
+words when FIFO_STS says full (read) or empty (write), the rest when the
+count matches. DATA_END follows the last word. BUS_STATUS bit 0 reads
+"not busy", which the kernel checks before every data request.
+
+Card detect: the generated device tree gives no `cd_gpio`, so the kernel
+takes the slot as full, and an empty one just times out (RSP_TIMEOUT).
+The vendor EVB trees use `cd_gpio = <9 0 0>`, C_GPIO 9 low with a card
+in. The machine drives that pad low when SDIO1 has a card and high
+otherwise.
+
+What runs:
+
+- `test-novatek-boot.sh` (CI) loads the release's modules. It finds the
+  card and its MBR, and reads 1 MiB the host put there, matching the
+  host's md5. It writes 192 KiB raw, which the host then finds in the card
+  image. It also makes a vfat on the partition that keeps a file across a
+  remount.
+- `test-novatek-uboot.sh` with a vendor image runs `mmc info` (SD 3.0,
+  4-bit, high speed), `mmc part`, a 256 KiB `mmc read` whose `crc32`
+  matches the host's, and an `mmc write` the host finds in the image.
+- The vendor `FW98566A.bin` Linux finds the card and its hotplug mounts
+  the partition.
+
 ## Ethernet
 
 `nvt-eqos` is the 16 KiB block at `0xF02B0000`: a Synopsys DWC Ethernet QoS
@@ -298,8 +356,9 @@ that arrives before U-Boot sets up the UART sits in RBR and the backend
 stops polling. U-Boot then resets the receive FIFO and only reads LSR, and
 QEMU never asked the backend for more input: the vCPU spinning on LSR made
 no main-loop events, so the line stalled until Linux read RBR.
-`qemu-boot/test-novatek-uboot-net.sh --flash nor.bin` starts QEMU paused
-with the console on a socket, queues the key, and runs the network checks.
+`qemu-boot/test-novatek-uboot.sh --flash nor.bin` starts QEMU paused
+with the console on a socket, queues the key, and runs the network and SD
+card checks.
 It needs a vendor image, so it is not in CI. `test-novatek.py` covers the
 UART fix with a small echo guest instead.
 
@@ -312,7 +371,7 @@ cd qemu-boot && curl -sL \
 bash qemu-boot/run-nt98562.sh               # SOC=nt98566 for the 128 MB part
 FLASH=nor.bin bash qemu-boot/run-nt98562.sh # a whole flash image
 SOC=nt98566 FLASH=nand.bin bash qemu-boot/run-nt98562.sh   # FW98566A.bin, NAND
-bash qemu-boot/test-novatek-uboot-net.sh --flash nor.bin   # vendor U-Boot net
+bash qemu-boot/test-novatek-uboot.sh --flash nor.bin       # vendor U-Boot: net, SD
 bash qemu-boot/test-novatek-nand.sh --flash nand.bin       # NAND: U-Boot, UBIFS
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
 python3 qemu/tests/test-novatek.py
@@ -325,8 +384,10 @@ the boot matrix's `-initrd rootfs.squashfs root=/dev/ram0` does not apply.
 `test-novatek-boot.sh` boots the kernel into a small initramfs (busybox and
 an `/init` script) with the same NOR attached. The script checks the device
 tree, the clocksource, the pinctrl, GPIO, RTC and watchdog drivers and the
-MTD. It reads, erases and programs the flash, takes a DHCP lease and
-fetches a file over HTTP, then runs `reboot -f` under `-no-reboot`.
+MTD. It reads, erases and programs the flash, reads and writes an SD card
+and a vfat on it, takes a DHCP lease and fetches a file over HTTP, then
+runs `reboot -f` under `-no-reboot`. Any run script takes a card the same
+way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
 
 ## Not modelled
 
@@ -336,7 +397,8 @@ fetches a file over HTTP, then runs `reboot -f` under `-no-reboot`.
 - SPI NAND other than the two Winbond parts, 4 KiB pages, bit errors and
   bad blocks, and the controller's own Reed-Solomon ECC (used only when a
   part's on-die ECC is off).
-- An SD card: the SDIO hosts answer as empty slots.
+- SDIO3 (`0xF0510000`, the eMMC host), UHS / 1.8 V signalling and tuning,
+  SDIO (non-memory) cards, and card hot-plug.
 - The EQoS features the drivers leave off: checksum offload, TSO,
   timestamps, more queues.
 - USB, the Novatek timer, PWM, I2C, crypto/OTP, and the HDAL media

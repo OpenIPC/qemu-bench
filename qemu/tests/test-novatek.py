@@ -29,6 +29,15 @@ plays the vendor drivers (docs/novatek.md):
     DMA, the OOB into the spare SRAM, and the OOB alone), a block erase
     and an SPI_PROG_CMD page program polled through GET_FEATURE C0, the
     image file afterwards; a malformed image size is refused;
+  - nvt-sdio with an SD card, the way na51055_mmc.c and U-Boot drive it:
+    card init (CMD0/8/55/41/2/3/7, R2 in RSP3..0 as the drivers read
+    it), single- and multi-block reads by descriptor-table DMA (Linux)
+    and by plain DMA with 0x1FC set (U-Boot), a DMA write, PIO reads and
+    writes through the data port with FIFO_STS full / count / empty and
+    DATA_END after the last word, the 8-byte SCR by PIO, the status
+    interrupt on SPI 30; the CG reset pulse (0x84 bit 2) returning the
+    host to descriptor mode; card detect on C_GPIO 9; an empty slot
+    timing out;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
     BCL1/LZ-packed "U-Boot") leaves U-Boot unpacked at
     /nvt_memory_cfg/uboot, the device tree and the "LD_NVT" SHMINFO where
@@ -57,6 +66,7 @@ import argparse
 import os
 import random
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -133,6 +143,8 @@ class QTest:
     def close(self):
         self.proc.kill()
         self.proc.wait()
+        self.sock.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 failures = 0
@@ -145,7 +157,7 @@ def check(what, got, want):
     if isinstance(got, bytes):
         shown = got[:8].hex() + ('...' if len(got) > 8 else '')
     else:
-        shown = got if isinstance(got, (bool, str)) else hex(got)
+        shown = got if isinstance(got, (bool, str, tuple)) else hex(got)
     print('  %s: %s (%s)' % ('PASS' if ok else 'FAIL', what, shown))
 
 
@@ -632,6 +644,152 @@ def test_nand(qt, path, with_oob):
           b'\xff' * PAGE)
 
 
+# ---- nvt-sdio --------------------------------------------------------------
+
+SDIO = 0xF0420000
+SDIO2 = 0xF0500000
+SPI_SDIO = 30
+SD_CMD_SENT, SD_RSP_OK, SD_RSP_TIMEOUT = 0x40, 0x10, 0x04
+SD_DATA_END, SD_DATA_OK = 0x80, 0x20
+
+
+def sd_cmd(qt, idx, arg=0, rsp='short', base=SDIO):
+    """sdiohost_sendcmd: clear the status, ARG, CMD, then CMD_EN."""
+    qt.writel(base + 0x28, 0xFFFFFFFF)
+    qt.writel(base + 0x04, arg)
+    v = idx | {'none': 0, 'short': 1 << 6, 'long': 1 << 7}[rsp]
+    qt.writel(base, v)
+    qt.writel(base, v | (1 << 9))
+    return qt.readl(base + 0x28)
+
+
+def sd_data(qt, length, blksz=512, dma=True, write=False, addr=0):
+    """sdiohost_setupdatatransfer{dma,pio}: before the command."""
+    qt.writel(SDIO + 0x1C, (blksz << 16))
+    qt.writel(SDIO + 0x110, addr)
+    qt.writel(SDIO + 0x104, length)
+    fifo = (2 if dma else 0) | (4 if write else 0)
+    qt.writel(SDIO + 0x10C, fifo)
+    qt.writel(SDIO + 0x1C, (blksz << 16) | (1 << 6))
+    qt.writel(SDIO + 0x10C, fifo | 1)
+
+
+def test_sdio(qt, card):
+    print('nvt-sdio')
+    img = open(card, 'rb').read()
+    gic_enable(qt, SPI_SDIO)
+    check('BUS_STATUS: card not busy', qt.readl(SDIO + 0x40) & 1, 1)
+    check('card detect: C_GPIO 9 low with a card in',
+          qt.readl(GPIO + 0x00) >> 9 & 1, 0)
+    qt.writel(SDIO, 1 << 10)
+    check('SDC_RST clears itself', qt.readl(SDIO) & (1 << 10), 0)
+    qt.writel(SDIO + 0x30, 0xFF)
+
+    check('CMD0: CMD_SENT', sd_cmd(qt, 0, rsp='none'), SD_CMD_SENT)
+    check('and SPI 30', gic_pending(qt, SPI_SDIO), True)
+    check('CMD8: R7 echoes the check pattern',
+          (sd_cmd(qt, 8, 0x1AA), qt.readl(SDIO + 0x08) & 0xFFF),
+          (SD_CMD_SENT | SD_RSP_OK, 0x1AA))
+    sd_cmd(qt, 55)
+    sd_cmd(qt, 41, 0x40FF8000)
+    check('ACMD41: powered up', qt.readl(SDIO + 0x08) >> 31, 1)
+    sd_cmd(qt, 2, rsp='long')
+    check('CMD2: CID MID in RSP3[31:24] (resp[0])',
+          qt.readl(SDIO + 0x14) >> 24, 0xAA)
+    check('and the end bit in RSP0[0]', qt.readl(SDIO + 0x08) & 1, 1)
+    sd_cmd(qt, 3)
+    rca = qt.readl(SDIO + 0x08) >> 16
+    check('CMD3: an RCA', rca != 0, True)
+    sd_cmd(qt, 7, rca << 16)
+    sd_cmd(qt, 16, 512)
+
+    # Linux: a descriptor table, here two 256-byte segments
+    qt.write(0x00800000, struct.pack('<6I', 1 | (2 << 4), 256, 0x01000000,
+                                     1 | 2 | (2 << 4), 256, 0x01100000))
+    sd_data(qt, 512, addr=0x00800000)
+    sts = sd_cmd(qt, 17, 3 * 512)
+    check('CMD17 by descriptor DMA: command and data done together', sts,
+          SD_CMD_SENT | SD_RSP_OK | SD_DATA_END | SD_DATA_OK)
+    check('block 3 in the two segments',
+          qt.read(0x01000000, 256) + qt.read(0x01100000, 256),
+          img[3 * 512:4 * 512])
+    check('FIFO_EN clears with the transfer', qt.readl(SDIO + 0x10C) & 1, 0)
+
+    # U-Boot: 0x1FC = 1, the buffer address itself
+    qt.writel(SDIO + 0x1FC, 1)
+    sd_data(qt, 4 * 512, addr=0x01200000)
+    sts = sd_cmd(qt, 18, 20 * 512)
+    sd_cmd(qt, 12)
+    check('CMD18 by plain DMA: four blocks', qt.read(0x01200000, 2048),
+          img[20 * 512:24 * 512])
+    check('DATA_END', sts & SD_DATA_END, SD_DATA_END)
+    payload = random.Random(11).randbytes(512)
+    qt.write(0x01300000, payload)
+    sd_data(qt, 512, addr=0x01300000, write=True)
+    sts = sd_cmd(qt, 24, 10 * 512)
+    check('CMD24 by DMA completes', sts & SD_DATA_END, SD_DATA_END)
+    check('block 10 written to the card image',
+          open(card, 'rb').read()[10 * 512:11 * 512], payload)
+
+    # A descriptor table shorter than DATA_LENGTH fails, not succeeds
+    qt.writel(SDIO + 0x1FC, 0)
+    qt.write(0x00800000, struct.pack('<3I', 1 | 2 | (2 << 4), 256, 0x01000000))
+    sd_data(qt, 512, addr=0x00800000)
+    sts = sd_cmd(qt, 17, 3 * 512)
+    check('descriptors 256 bytes short: DATA_TIMEOUT | DMA_ERROR, no DATA_END',
+          sts & (0x08 | (1 << 19) | SD_DATA_END), 0x08 | (1 << 19))
+    sd_cmd(qt, 12)
+    # A command the card does not answer leaves no data phase armed
+    sd_data(qt, 512, addr=0x00800000)
+    qt.writel(SDIO + 0x28, 0xFFFFFFFF)
+    qt.writel(SDIO + 0x04, 0)
+    qt.writel(SDIO, 5 | (1 << 6) | (1 << 9))          # CMD5: no SDIO
+    check('a timed-out command disarms its data phase',
+          (qt.readl(SDIO + 0x28) & 0x0C, qt.readl(SDIO + 0x10C) & 1,
+           qt.readl(SDIO + 0x1C) >> 6 & 1), (0x04, 0, 0))
+    qt.writel(SDIO + 0x1FC, 1)
+
+    # PIO, as for unaligned buffers
+    sd_data(qt, 512, dma=False)
+    sts = sd_cmd(qt, 17, 3 * 512)
+    check('PIO CMD17: command done, data waiting', sts & SD_DATA_END, 0)
+    check('FIFO_STS full, 16 words', qt.readl(SDIO + 0x108), 0x200 | 16)
+    got = b''.join(qt.readl(SDIO + 0x100).to_bytes(4, 'little')
+                   for _ in range(128))
+    check('block 3 through the data port', got, img[3 * 512:4 * 512])
+    check('DATA_END after the last word',
+          qt.readl(SDIO + 0x28) & SD_DATA_END, SD_DATA_END)
+    check('FIFO_STS empty', qt.readl(SDIO + 0x108), 0x100)
+    payload = random.Random(12).randbytes(512)
+    sd_data(qt, 512, dma=False, write=True)
+    sd_cmd(qt, 24, 11 * 512)
+    for i in range(0, 512, 4):
+        qt.writel(SDIO + 0x100, int.from_bytes(payload[i:i + 4], 'little'))
+    check('PIO CMD24: DATA_END after the last word',
+          qt.readl(SDIO + 0x28) & SD_DATA_END, SD_DATA_END)
+    check('block 11 written to the card image',
+          open(card, 'rb').read()[11 * 512:12 * 512], payload)
+    sd_cmd(qt, 55, rca << 16)
+    sd_data(qt, 8, blksz=8, dma=False)
+    sd_cmd(qt, 51)
+    check('ACMD51: the 8-byte SCR waits as two words',
+          qt.readl(SDIO + 0x108) & 0x3F, 2)
+    scr = qt.readl(SDIO + 0x100).to_bytes(4, 'little')
+    qt.readl(SDIO + 0x100)
+    check('SCR structure version 0 (byte 0 high nibble)', scr[0] >> 4, 0)
+    check('and DATA_END', qt.readl(SDIO + 0x28) & SD_DATA_END, SD_DATA_END)
+
+    # nvt_composite_gate_clk_prepare: SYS_RESET1 bit 2 low, then high
+    qt.writel(CG + 0x84, qt.readl(CG + 0x84) & ~(1 << 2))
+    qt.writel(CG + 0x84, qt.readl(CG + 0x84) | (1 << 2))
+    check('the CG reset pulse returns it to descriptor DMA',
+          (qt.readl(SDIO + 0x1FC), qt.readl(SDIO + 0x30)), (0, 0))
+    check('and drops the interrupt', gic_pending(qt, SPI_SDIO), False)
+
+    check('the empty SDIO2 slot times out',
+          sd_cmd(qt, 8, 0x1AA, base=SDIO2), SD_CMD_SENT | SD_RSP_TIMEOUT)
+
+
 # ---- flash boot ROM ----------------------------------------------------
 
 def fdt_blob(tree):
@@ -1076,7 +1234,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default='./qemu-src/build/qemu-system-arm')
     args = ap.parse_args()
-    tmp = tempfile.mkdtemp()
+    # Images up to 128 MiB go here, under /tmp: always remove them.
+    with tempfile.TemporaryDirectory() as tmp:
+        run(args, tmp)
+
+
+def run(args, tmp):
 
     # The RTC on the virtual clock, so clock_step moves it.
     qt = QTest(args.qemu, 'nt98562', ['-rtc', 'clock=vm'])
@@ -1139,10 +1302,20 @@ def main():
         qt.close()
         sock.close()
 
+    card = os.path.join(tmp, 'sd.img')
+    open(card, 'wb').write(random.Random(9).randbytes(4 << 20))
+    qt = QTest(args.qemu, 'nt98562',
+               ['-drive', 'if=sd,index=0,format=raw,file=' + card])
+    try:
+        test_sdio(qt, card)
+    finally:
+        qt.close()
+
     qt = QTest(args.qemu, 'nt98566')
     try:
         print('nt98566')
         check('same die, same chip ID', qt.readl(TOP + 0xF0) >> 16, 0x7021)
+        check('no card: C_GPIO 9 high', qt.readl(GPIO + 0x00) >> 9 & 1, 1)
     finally:
         qt.close()
 
@@ -1151,7 +1324,8 @@ def main():
     test_migration(args.qemu, tmp)
 
     print('%d failure(s)' % failures)
-    sys.exit(1 if failures else 0)
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

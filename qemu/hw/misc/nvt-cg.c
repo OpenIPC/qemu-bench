@@ -9,7 +9,13 @@
  *   0x04 PLL_STAT        lock status: reads back PLL_EN
  *   0x10 SYS_CLK_RATE    [1:0] CPU clock: 0 80 MHz, 1 PLL8, 2 480 MHz
  *   0x70..0x7C CLK_EN    gates; reset 0 would leave every block stopped
- *   0x80..0x88 SYS_RESET 1 = out of reset
+ *   0x80..0x88 SYS_RESET 1 = out of reset.  Each bit is also a GPIO line,
+ *                        "sys-reset" n = (offset - 0x80) * 8 + bit, high
+ *                        while the block is held in reset: the clock
+ *                        framework pulses a block's bit when it prepares
+ *                        its clock (nvt_composite_gate_clk_prepare,
+ *                        DO_RESET), and U-Boot does it by hand -- e.g.
+ *                        0x84 bits 2 / 3 / 14 for the SDIO hosts
  *   PLLn base + 0x20/0x24/0x28  ratio bytes 0/1/2; rate = 12 MHz *
  *                        ratio / 131072 (nvt_pll_clk_recalc_rate)
  *
@@ -22,6 +28,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
@@ -37,6 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtCgState, NVT_CG)
 #define CG_CLK_EN3          0x7C
 #define CG_SYS_RESET0       0x80
 #define CG_SYS_RESET2       0x88
+#define CG_RESET_LINES      96
 
 #define CPU_CLK_SEL_PLL8    1
 
@@ -45,6 +53,7 @@ struct NvtCgState {
 
     MemoryRegion iomem;
     uint32_t regs[NVT_CG_SIZE / 4];
+    qemu_irq sys_reset[CG_RESET_LINES];
 };
 
 /* PLL ratio-register bases and the ratios the vendor loader programs
@@ -77,8 +86,19 @@ static void nvt_cg_write(void *opaque, hwaddr offset, uint64_t val,
                          unsigned size)
 {
     NvtCgState *s = opaque;
+    uint32_t changed = s->regs[offset / 4] ^ val;
+    int bit, line;
 
     s->regs[offset / 4] = val;
+    if (offset < CG_SYS_RESET0 || offset > CG_SYS_RESET2) {
+        return;
+    }
+    for (bit = 0; bit < 32; bit++) {
+        if (changed & (1u << bit)) {
+            line = (offset - CG_SYS_RESET0) * 8 + bit;
+            qemu_set_irq(s->sys_reset[line], !(val & (1u << bit)));
+        }
+    }
 }
 
 static const MemoryRegionOps nvt_cg_ops = {
@@ -104,6 +124,9 @@ static void nvt_cg_reset(DeviceState *dev)
     for (off = CG_SYS_RESET0; off <= CG_SYS_RESET2; off += 4) {
         s->regs[off / 4] = 0xFFFFFFFF;
     }
+    for (i = 0; i < CG_RESET_LINES; i++) {
+        qemu_irq_lower(s->sys_reset[i]);
+    }
     for (i = 0; i < ARRAY_SIZE(nvt_cg_plls); i++) {
         off = nvt_cg_plls[i].base + 0x20;
         s->regs[off / 4] = nvt_cg_plls[i].ratio & 0xFF;
@@ -119,6 +142,8 @@ static void nvt_cg_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &nvt_cg_ops, s, TYPE_NVT_CG,
                           NVT_CG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    qdev_init_gpio_out_named(DEVICE(obj), s->sys_reset, "sys-reset",
+                             CG_RESET_LINES);
 }
 
 static const VMStateDescription vmstate_nvt_cg = {

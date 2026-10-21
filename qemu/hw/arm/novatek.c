@@ -20,12 +20,16 @@
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "hw/char/serial-mm.h"
+#include "hw/irq.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
+#include "hw/sd/sd.h"
 #include "hw/ssi/nvt-flash.h"
 #include "hw/sysbus.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "system/device_tree.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
@@ -66,12 +70,21 @@ static const struct {
     { 0xF0310000, 45, 48000000 },
 };
 
+/*
+ * The SD hosts: card n from -drive if=sd,index=n.  reset is the host's
+ * nvt-cg "sys-reset" line (CG_SYS_RESET_REG1 bit 2 / 3).  The EVB device
+ * trees take SDIO1's card detect from C_GPIO 9, low with a card in.
+ */
+#define NVT_SD_CD_GPIO      9
+
 static const struct {
     hwaddr base;
     int irq;
+    int reset;
+    const char *compat;
 } nvt_sdio[] = {
-    { 0xF0420000, 30 },
-    { 0xF0500000, 31 },
+    { 0xF0420000, 30, 32 + 2, "nvt,nvt_mmc" },
+    { 0xF0500000, 31, 32 + 3, "nvt,nvt_mmc2" },
 };
 
 /*
@@ -337,6 +350,24 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         qemu_fdt_setprop_cell(fdt, path, "trace-stdtable", 1);
     }
 
+    /*
+     * The SD hosts (na51055_mmc.c, which names its clock after the device,
+     * "f0420000.mmc").  No cd_gpio: the driver then takes the slot as
+     * always full, and an empty one just times out.
+     */
+    for (n = ARRAY_SIZE(nvt_sdio) - 1; n >= 0; n--) {
+        upath = g_strdup_printf("/mmc@%" HWADDR_PRIx, nvt_sdio[n].base);
+        qemu_fdt_add_subnode(fdt, upath);
+        qemu_fdt_setprop_string(fdt, upath, "compatible", nvt_sdio[n].compat);
+        qemu_fdt_setprop_cells(fdt, upath, "reg", nvt_sdio[n].base, 0x1000);
+        nvt_fdt_irq(fdt, upath, nvt_sdio[n].irq);
+        qemu_fdt_setprop_cell(fdt, upath, "max-frequency", 48000000);
+        qemu_fdt_setprop_cell(fdt, upath, "voltage-switch", 0);
+        qemu_fdt_setprop_cell(fdt, upath, "max-voltage", 3300);
+        qemu_fdt_setprop_cell(fdt, upath, "bus-width", 4);
+        g_free(upath);
+    }
+
     /* The MAC, its Novatek glue and the embedded PHY in one 16 KiB block;
      * the vendor node maps the first 0x3800 and reaches past it. */
     qemu_fdt_add_subnode(fdt, "/eth@f02b0000");
@@ -569,7 +600,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     static struct arm_boot_info binfo;
     MemoryRegion *sysmem = get_system_memory();
     qemu_irq pic[NVT_NUM_IRQ - 32];
-    DeviceState *mp, *dev, *flash;
+    DeviceState *mp, *dev, *flash, *cg, *gpio;
     SysBusDevice *mpbus;
     Object *cpuobj;
     ARMCPU *cpu;
@@ -621,9 +652,9 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_TOP_BASE, 1);
 
-    dev = qdev_new("nvt-cg");
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_CG_BASE, 1);
+    cg = qdev_new("nvt-cg");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(cg), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(cg), 0, NVT_CG_BASE, 1);
 
     dev = qdev_new("nvt-wdt");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
@@ -637,11 +668,11 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
 
     /* A named child, so qtest and a board can reach its pins at
      * /machine/nvt-gpio. */
-    dev = qdev_new("nvt-gpio");
-    object_property_add_child(OBJECT(machine), "nvt-gpio", OBJECT(dev));
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_GPIO_BASE, 1);
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_GPIO]);
+    gpio = qdev_new("nvt-gpio");
+    object_property_add_child(OBJECT(machine), "nvt-gpio", OBJECT(gpio));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(gpio), 0, NVT_GPIO_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0, pic[NVT_IRQ_GPIO]);
 
     dev = qdev_new("nvt-eqos");
     qemu_configure_nic_device(dev, true, NULL);
@@ -649,10 +680,27 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_ETH_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_ETH]);
 
-    /* Empty SD slots: U-Boot looks for an update image on the card. */
     for (n = 0; n < ARRAY_SIZE(nvt_sdio); n++) {
-        sysbus_create_simple("nvt-sdio", nvt_sdio[n].base,
-                             pic[nvt_sdio[n].irq]);
+        DriveInfo *di = drive_get(IF_SD, 0, n);
+
+        dev = qdev_new("nvt-sdio");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, nvt_sdio[n].base, 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[nvt_sdio[n].irq]);
+        qdev_connect_gpio_out_named(cg, "sys-reset", nvt_sdio[n].reset,
+                                    qdev_get_gpio_in_named(dev, "reset", 0));
+        if (n == 0) {
+            qemu_set_irq(qdev_get_gpio_in_named(gpio, "in", NVT_SD_CD_GPIO),
+                         !di);
+        }
+        if (di) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                   &error_fatal);
+        }
     }
 
     flash = qdev_new(TYPE_NVT_FLASH);

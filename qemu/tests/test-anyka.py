@@ -29,7 +29,9 @@ script plays the vendor drivers (docs/anyka.md):
     python3 qemu/tests/test-anyka.py [--qemu PATH]
 """
 import argparse
+import atexit
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -90,6 +92,7 @@ class QTest:
     def close(self):
         self.proc.kill()
         self.proc.wait()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 failures = 0
@@ -428,6 +431,7 @@ def main():
     args = ap.parse_args()
 
     tmp = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, tmp, True)
     path = os.path.join(tmp, 'flash.bin')
     out = os.path.join(tmp, 'uart0.txt')
     code = make_image(path)

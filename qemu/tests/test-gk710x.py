@@ -17,7 +17,9 @@ drivers, at the silicon addresses (docs/goke-gk710x.md):
     python3 qemu/tests/test-gk710x.py [--qemu PATH]
 """
 import argparse
+import atexit
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -80,6 +82,7 @@ class QTest:
     def close(self):
         self.proc.kill()
         self.proc.wait()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 failures = 0
@@ -262,7 +265,9 @@ def main():
         root, 'qemu-src/build/qemu-system-arm'))
     args = ap.parse_args()
 
-    path = os.path.join(tempfile.mkdtemp(), 'flash.bin')
+    tmp = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, tmp, True)
+    path = os.path.join(tmp, 'flash.bin')
     code = make_image(path)
     qt = QTest(args.qemu, 'gk7102,flash-file=%s,sensor=jxh42' % path)
     try:

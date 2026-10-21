@@ -243,7 +243,9 @@ the closed DDR-training loader: the SDK's own `FW98562A.bin`, laid out by
 `qemu-boot/nvtpack2flash.py`, runs the vendor U-Boot, kernel and init
 scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). The 566 boards' SPI NAND
 is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
-(`qemu-boot/test-novatek-nand.sh`). `reboot` works the
+(`qemu-boot/test-novatek-nand.sh`). SD cards attach with
+`-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
+vendor U-Boot read and write them. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
@@ -387,7 +389,7 @@ qemu/
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
 ├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
 ├── hw/ssi/nvt-flash.c           # SPI NOR controller (operation sequencer, flash-file)
-├── hw/sd/nvt-sdio.c             # SDIO hosts with an empty slot
+├── hw/sd/nvt-sdio.c             # Novatek SD hosts (descriptor / plain DMA, PIO)
 ├── hw/net/nvt-eqos.c            # DWC Ethernet QoS (GMAC 4.x) + embedded PHY
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
@@ -411,7 +413,7 @@ qemu-boot/
 ├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
-├── test-novatek-uboot-net.sh    # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping
+├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern

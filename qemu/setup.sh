@@ -464,10 +464,11 @@ config NOVATEK
     select SERIAL_MM
     select UNIMP
     select HISI_MISC
+    select SD
 KCONFIG
     echo "  hw/arm/Kconfig: added NOVATEK"
 else
-    for sym in A9MPCORE PL310 PTIMER SERIAL_MM UNIMP HISI_MISC; do
+    for sym in A9MPCORE PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD; do
         if ! sed -n '/^config NOVATEK$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config NOVATEK\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym

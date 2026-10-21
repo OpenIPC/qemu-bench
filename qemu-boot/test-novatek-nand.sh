@@ -12,7 +12,7 @@
 #
 # What it checks:
 #   - U-Boot ("nvt spinand", W25N01GV) at its prompt -- reached as in
-#     test-novatek-uboot-net.sh, a key waiting before the CPU starts --
+#     test-novatek-uboot.sh, a key waiting before the CPU starts --
 #     takes 256 KiB by TFTP, erases two blocks past the partitions, writes
 #     it there and reads it back, and its crc32 matches the host's;
 #   - nvt_boot (its bootcmd; this U-Boot has no "run") brings up the

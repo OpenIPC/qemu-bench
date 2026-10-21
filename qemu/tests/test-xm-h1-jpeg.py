@@ -12,7 +12,7 @@ an independent copy of the Annex K tables the model encodes with.
 
     python3 qemu/tests/test-xm-h1-jpeg.py [--qemu PATH] [--keep OUT.jpg]
 """
-import argparse, io, math, os, socket, subprocess, sys, tempfile, time
+import argparse, atexit, io, math, os, shutil, socket, subprocess, sys, tempfile, time
 
 from PIL import Image
 
@@ -82,6 +82,13 @@ class QTest:
 
     def close(self):
         self.proc.kill(); self.proc.wait()
+        # QEMU's stderr outlives the dir: test-xm-gpio and test-xm510-gpio
+        # check its -d unimp lines after close().
+        try:
+            self.err = open(os.path.join(self.dir, 'qemu.err')).read()
+        except OSError:
+            self.err = ''
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def test_frame(w, h):
@@ -166,6 +173,7 @@ def main():
     hw_c = bytes(cq[i] for i in HW_REORDER)
 
     dump = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, dump, True)
     q = QTest(a.qemu, a.machine, ('-global', 'xm-h1.dump-dir=' + dump))
     try:
         check(q.readl(H1 + REG['ID']) >> 16 == 0x8290, 'swreg0 reports an H1 (0x8290)')

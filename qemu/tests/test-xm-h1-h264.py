@@ -9,7 +9,7 @@ backend writes (Main profile, CABAC); the model has to fit its slices to them.
 
     python3 qemu/tests/test-xm-h1-h264.py [--qemu PATH] [--keep OUT.h264]
 """
-import argparse, math, os, subprocess, sys, tempfile
+import argparse, atexit, math, os, shutil, subprocess, sys, tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(__file__))
@@ -48,6 +48,7 @@ def main():
     src = jt.test_frame(w, h)
     y_plane, uv = jt.to_nv12(src)
     dump = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, dump, True)
     q = jt.QTest(a.qemu, a.machine, ('-global', 'xm-h1.dump-dir=' + dump))
     stream = b''
     try:
@@ -102,6 +103,7 @@ def main():
     if a.keep:
         open(a.keep, 'wb').write(stream)
     tmp = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, tmp, True)
     path = os.path.join(tmp, 'out.h264')
     open(path, 'wb').write(stream)
     r = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode',
