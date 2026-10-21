@@ -22,6 +22,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtFlashState, NVT_FLASH)
 #define NVT_NAND_BLOCK      64
 #define NVT_SPARE_SIZE      0x80    /* spare SRAM at +0x200 */
 
+/* 32 MiB of NOR at most, in 4 KiB sectors */
+#define NVT_NOR_LOCK_BYTES  (32 * 1024 * 1024 / 4096 / 8)
+
 struct NvtFlashState {
     SysBusDevice parent_obj;
 
@@ -46,6 +49,9 @@ struct NvtFlashState {
     int fd;
     Error *migration_blocker;
     uint8_t sr[2];
+    uint8_t sr3;
+    /* W25Q individual block locks (SR3 WPS): one bit per 4 KiB sector */
+    uint8_t lock[NVT_NOR_LOCK_BYTES];
     bool wel;
     bool addr4;
     uint8_t cmd;
