@@ -10,11 +10,12 @@
 #     bytes, 0x00309800, and the extended register (0x230) the high ones,
 #     0x00753A00;
 #   - enable sets channel 0 in ENABLE (0x100), which the driver polls;
-#   - disable returns -- the driver waits for the stop interrupt -- and
-#     clears it;
+#   - disable returns -- the driver waits for the stop interrupt -- leaving
+#     ENABLE clear and INT_STS (0xF0) cleared by the driver's ISR;
 #   - the vendor "cycle" attribute: 20 periods, and enable then waits for
 #     the channel to stop on its own (the cycle-count interrupt), leaving
-#     ENABLE clear.
+#     ENABLE and INT_STS clear; a disable after that returns too (the
+#     driver sees ENABLE clear and does not wait).
 #
 # The busybox comes from the OpenIPC release rootfs.
 #
@@ -72,8 +73,9 @@ p=$c/pwm0
 echo 1000000 > $p/period && echo 500000 > $p/duty_cycle && echo "NVT-PWM-CONFIG: ok"
 echo "NVT-PWM-PERIOD: $($bb devmem 0xF0210004) $($bb devmem 0xF0210230)"
 echo 1 > $p/enable && echo "NVT-PWM-ENABLE: $($bb devmem 0xF0210100)"
-echo 0 > $p/enable && echo "NVT-PWM-DISABLE: $($bb devmem 0xF0210100)"
-echo 20 > $p/cycle && echo 1 > $p/enable && echo "NVT-PWM-CYCLES: $($bb devmem 0xF0210100)"
+echo 0 > $p/enable && echo "NVT-PWM-DISABLE: $($bb devmem 0xF0210100) $($bb devmem 0xF02100F0)"
+echo 20 > $p/cycle && echo 1 > $p/enable && echo "NVT-PWM-CYCLES: $($bb devmem 0xF0210100) $($bb devmem 0xF02100F0)"
+echo 0 > $p/enable && echo "NVT-PWM-OFF-AFTER-CYCLES: ok"
 echo "NVT-PWM-OK"
 $bb reboot -f
 INIT
@@ -103,8 +105,9 @@ expect 'NVT-PWM-CHIP: [0-9]' 'pwm-na51055 registers a pwmchip'
 expect 'NVT-PWM-CONFIG: ok' 'period 1 ms, duty 50 %'
 expect 'NVT-PWM-PERIOD: 0x00309800 0x00753A00' 'base period 30000, fall 15000 in PERIOD and its extension'
 expect 'NVT-PWM-ENABLE: 0x00000001' 'enable starts channel 0'
-expect 'NVT-PWM-DISABLE: 0x00000000' 'disable returns on the stop interrupt and stops it'
-expect 'NVT-PWM-CYCLES: 0x00000000' 'a 20-cycle run ends on its own, enable waiting for it'
+expect 'NVT-PWM-DISABLE: 0x00000000 0x00000000' 'disable returns on the stop interrupt; stopped, status cleared'
+expect 'NVT-PWM-CYCLES: 0x00000000 0x00000000' 'a 20-cycle run ends on its own, enable waiting for it'
+expect 'NVT-PWM-OFF-AFTER-CYCLES: ok' 'turning it off after the run returns'
 expect 'NVT-PWM-OK' 'PID 1 ran to the end'
 if [ $rc -ne 0 ]; then
     echo "FAIL: QEMU exited $rc (124: a wait never ended)"

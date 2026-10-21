@@ -404,8 +404,8 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         g_free(upath);
     }
 
-    /* Bound by the HDAL's kdrv_comm.ko (/proc/pwm) on the OpenIPC
-     * release, or the kernel's pwm-na51055.c where it is built. */
+    /* The vendor trees' node, which the kernel's pwm-na51055.c binds where
+     * it is built; the HDAL's kdrv_comm.ko binds only nvt,nvt_kdrv_pwm. */
     qemu_fdt_add_subnode(fdt, "/pwm@f0210000");
     qemu_fdt_setprop_string(fdt, "/pwm@f0210000", "compatible",
                             "nvt,nvt_pwm");

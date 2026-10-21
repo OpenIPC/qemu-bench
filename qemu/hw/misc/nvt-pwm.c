@@ -1,9 +1,10 @@
 /*
  * Novatek NA51055 / NA51089 PWM controller at 0xF0210000 (SPI 26).
  *
- * Two drivers bind "nvt,nvt_pwm": the kernel's PWM-framework driver
- * (drivers/pwm/pwm-na51055.c, sysfs) and the HDAL kdrv_comm.ko the
- * OpenIPC release loads at boot (/proc/pwm/cmd).  Registers, from the
+ * The kernel's PWM-framework driver (drivers/pwm/pwm-na51055.c, sysfs)
+ * binds "nvt,nvt_pwm", the vendor trees' node.  The HDAL kdrv_comm.ko the
+ * OpenIPC release loads has a PWM driver too, but it binds only
+ * "nvt,nvt_kdrv_pwm" and refuses "nvt,nvt_pwm".  Registers, from the
  * former and the HDAL's pwm_reg.h:
  *
  *   0x00 + 8n  CTRL n     [15:0] cycle count: 0 runs free, otherwise the
@@ -189,8 +190,6 @@ static void nvt_pwm_write(void *opaque, hwaddr off, uint64_t val,
         *reg(s, PWM_CLKDIV_STS) |= val;
         break;
     case PWM_INT_STS:
-    case PWM_INT_STS + 4:
-    case PWM_INT_STS + 8:
     case PWM_CLKDIV_STS:
         *reg(s, off) &= ~val;
         break;
@@ -246,10 +245,24 @@ static void nvt_pwm_init(Object *obj)
     }
 }
 
+/* The out lines are derived state: drive them again from what arrived. */
+static int nvt_pwm_post_load(void *opaque, int version_id)
+{
+    NvtPwmState *s = opaque;
+    int n;
+
+    for (n = 0; n < PWM_CHANNELS; n++) {
+        nvt_pwm_set_out(s, n);
+    }
+    nvt_pwm_update(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_nvt_pwm = {
     .name = TYPE_NVT_PWM,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = nvt_pwm_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtPwmState, PWM_REGS_SIZE / 4),
         VMSTATE_UINT32(running, NvtPwmState),

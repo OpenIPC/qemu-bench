@@ -949,6 +949,8 @@ def test_pwm(qt):
     qt.writel(PWM + 0x104, 1)
     qt.writel(PWM + 0x10C, 0x2)
     check('CLKDIV_LOAD flags CLKDIV_LOAD_STS', qt.readl(PWM + 0xFC), 0x2)
+    qt.writel(PWM + 0xF4, 0x55)
+    check('the micro-step status word is storage', qt.readl(PWM + 0xF4), 0x55)
 
 
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
