@@ -1,0 +1,28 @@
+serial: resume a stalled backend when FCR resets the receive FIFO
+
+serial_can_receive() reports no room while RBR holds a byte (FIFO off)
+or the FIFO is full, and the chardev backend then stops polling until
+the frontend calls qemu_chr_fe_accept_input().  Reading RBR does that;
+an FCR write with RFR -- which empties the FIFO and clears DR -- did
+not.  Input that arrived before a guest initialised its UART (one byte
+in RBR, FIFO off) therefore stalled the line for good if the guest's
+next step was a FIFO reset and its input check reads only LSR, as
+U-Boot's ns16550 tstc() does: no further byte was ever delivered, and
+"Hit any key to stop autoboot" could not be answered.  Seen with the
+Novatek NT9856x vendor U-Boot 2019.04 (bootdelay 0): keys queued from
+power-on reached the guest only once Linux read RBR.
+
+---
+diff --git a/hw/char/serial.c b/hw/char/serial.c
+index 03fec3f..c2407c2 100644
+--- a/hw/char/serial.c
++++ b/hw/char/serial.c
+@@ -417,6 +417,8 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+             timer_del(s->fifo_timeout_timer);
+             s->timeout_ipending = 0;
+             fifo8_reset(&s->recv_fifo);
++            /* Room again: a backend stalled on a full RBR / FIFO resumes. */
++            qemu_chr_fe_accept_input(&s->chr);
+         }
+ 
+         if (val & UART_FCR_XFR) {

@@ -245,8 +245,8 @@ scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
-¹ Ethernet works from the kernel (DHCP, a file over HTTP); the vendor
-U-Boot's network path is untested.
+¹ Ethernet works from the kernel (DHCP, a file over HTTP) and from the
+vendor U-Boot (`ping`, `dhcp`, `tftp`).
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -409,6 +409,7 @@ qemu-boot/
 ├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
+├── test-novatek-uboot-net.sh    # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map

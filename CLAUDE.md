@@ -228,7 +228,12 @@ Its Ethernet (`hw/net/nvt-eqos.c`) is a DWC EQoS 4.x under the Synopsys
 reference driver, which needs HW_FEATURE0's MDIO bit to look for a PHY and
 returns IRQ_NONE unless the Novatek glue's ETH_ISR (+0x3008) is non-zero.
 Do not run a flash boot under `-d unimp -D` into `/tmp` (a tmpfs): a
-firmware polling an unmodelled block fills it in seconds.
+firmware polling an unmodelled block fills it in seconds. Its vendor U-Boot
+has `bootdelay` 0 and no saved environment, so the only way to its prompt is
+a key queued before the CPU runs: start QEMU with `-S` and the serial line
+on a socket (`qemu-boot/test-novatek-uboot-net.sh`). Keyboard input to any
+16550 that a guest resets before reading relies on
+`qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch`.
 
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB
