@@ -241,7 +241,9 @@ shell with its root on the emulated SPI NOR: `qemu-boot/run-nt98562.sh`.
 A whole flash image boots the way the chip does, the machine standing in for
 the closed DDR-training loader: the SDK's own `FW98562A.bin`, laid out by
 `qemu-boot/nvtpack2flash.py`, runs the vendor U-Boot, kernel and init
-scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). `reboot` works the
+scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). The 566 boards' SPI NAND
+is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
+(`qemu-boot/test-novatek-nand.sh`). `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
@@ -407,9 +409,10 @@ qemu-boot/
 ├── run-gk7102.sh                # Goke GK7102: flash dump, or OpenIPC + vendor HAL
 ├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
 ├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
-├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR image
+├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot-net.sh    # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping
+├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map

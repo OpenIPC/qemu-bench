@@ -18,7 +18,8 @@
 # FLASH=image.bin boots a whole flash image instead, the way the chip does:
 # the machine's boot ROM loads the vendor U-Boot from it.  A Novatek SDK
 # update package (FW9856xA.bin) becomes one with
-# qemu-boot/nvtpack2flash.py.  Networking is bridged TAP when tap0 exists
+# qemu-boot/nvtpack2flash.py; a 128 MiB one is the 566 boards' SPI NAND
+# (SOC=nt98566).  Networking is bridged TAP when tap0 exists
 # (qemu-boot/net-setup.sh), else SLIRP.
 #
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

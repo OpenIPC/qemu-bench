@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Turn a Novatek NVTPACK firmware (FW9856xA.bin) into a raw SPI-NOR image.
+"""Turn a Novatek NVTPACK firmware (FW9856xA.bin) into a raw flash image.
 
 Novatek SDKs ship update packages, not flash dumps.  An NVTPACK starts
 with the GUID {D6012E07-10BC-4F91-B28A-352F82261A50}; the partition count
 is at 0x18, and a table of (offset, size, partition index) words follows
 the 0x80-byte header.  Partition 1 is the device tree, and it says where
-the rest go: its nor node's nvtpack/index/idN/partition_name names the
-partition_<name> node whose reg is that partition's flash range.
+the rest go: its nor (or nand) node's nvtpack/index/idN/partition_name
+names the partition_<name> node whose reg is that partition's flash range.
+
+A SPI-NAND pack (566_NAND) becomes the NAND's data, every page's OOB left
+erased, which is what `-M nt98566,flash-file=` takes for a 128 MiB image;
+the UBI rootfs goes in as ubinize made it.
 
 The layout matches what the vendor U-Boot's updater (nvt_ivot_fw_update.c)
 writes.  The rootfs and app images carry a 64-byte CKSM header, which it
@@ -69,7 +73,8 @@ def flash_layout(fdt):
     flash size partition_all gives (None without one)."""
     nodes = dict(fdt_nodes(fdt))
     nor = next(p for p, v in nodes.items()
-               if v.get('compatible', b'').startswith(b'nvt,nvt_spinor'))
+               if v.get('compatible', b'').startswith((b'nvt,nvt_spinor',
+                                                       b'nvt,nvt_spinand')))
     layout = {}
     for path, props in nodes.items():
         prefix = nor + '/nvtpack/index/id'
