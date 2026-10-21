@@ -37,7 +37,8 @@ plays the vendor drivers (docs/novatek.md):
     DATA_END after the last word, the 8-byte SCR by PIO, the status
     interrupt on SPI 30; the CG reset pulse (0x84 bit 2) returning the
     host to descriptor mode; card detect on C_GPIO 9; an empty slot
-    timing out;
+    timing out; SDIO3 with an eMMC: CMD1 / 2 / 3 / 7, the 512-byte
+    EXT_CSD by descriptor DMA, and its CG reset bit (0x84 bit 14);
   - nvt-usb, the FOTG200 host as ehci-na51089.c sees it: EHCI
     capabilities (CAPLENGTH 0x10, one port) at 0xF0600000 and at the
     0xFF600000 alias the driver uses on NA51089, PORTSC at 0x30 showing a
@@ -682,15 +683,47 @@ def sd_cmd(qt, idx, arg=0, rsp='short', base=SDIO):
     return qt.readl(base + 0x28)
 
 
-def sd_data(qt, length, blksz=512, dma=True, write=False, addr=0):
+def sd_data(qt, length, blksz=512, dma=True, write=False, addr=0,
+            base=SDIO):
     """sdiohost_setupdatatransfer{dma,pio}: before the command."""
-    qt.writel(SDIO + 0x1C, (blksz << 16))
-    qt.writel(SDIO + 0x110, addr)
-    qt.writel(SDIO + 0x104, length)
+    qt.writel(base + 0x1C, (blksz << 16))
+    qt.writel(base + 0x110, addr)
+    qt.writel(base + 0x104, length)
     fifo = (2 if dma else 0) | (4 if write else 0)
-    qt.writel(SDIO + 0x10C, fifo)
-    qt.writel(SDIO + 0x1C, (blksz << 16) | (1 << 6))
-    qt.writel(SDIO + 0x10C, fifo | 1)
+    qt.writel(base + 0x10C, fifo)
+    qt.writel(base + 0x1C, (blksz << 16) | (1 << 6))
+    qt.writel(base + 0x10C, fifo | 1)
+
+
+SDIO3 = 0xF0510000
+
+
+def test_emmc(qt):
+    print('nvt-sdio: SDIO3 with an eMMC')
+    qt.writel(SDIO3 + 0x30, 0xFF)
+    sd_cmd(qt, 0, rsp='none', base=SDIO3)
+    for _ in range(10):                             # CMD1 until not busy
+        sd_cmd(qt, 1, 0x40FF8080, base=SDIO3)
+        if qt.readl(SDIO3 + 0x08) >> 31:
+            break
+    check('CMD1 (SEND_OP_COND): powered up (OCR bit 31)',
+          qt.readl(SDIO3 + 0x08) >> 31, 1)
+    sd_cmd(qt, 2, rsp='long', base=SDIO3)
+    sd_cmd(qt, 3, 1 << 16, base=SDIO3)              # the host picks the RCA
+    sd_cmd(qt, 7, 1 << 16, base=SDIO3)
+    qt.write(0x00800000, struct.pack('<3I', 1 | 2 | (2 << 4), 512, 0x01000000))
+    sd_data(qt, 512, addr=0x00800000, base=SDIO3)
+    sts = sd_cmd(qt, 8, 0, base=SDIO3)
+    ext = qt.read(0x01000000, 512)
+    check('CMD8 (SEND_EXT_CSD) by descriptor DMA', sts & SD_DATA_END,
+          SD_DATA_END)
+    check('EXT_CSD: a revision, and SEC_COUNT for 4 MiB',
+          (ext[192] > 0, struct.unpack_from('<I', ext, 212)[0]),
+          (True, (4 << 20) // 512))
+    qt.writel(SDIO3 + 0x1FC, 1)
+    qt.writel(CG + 0x84, qt.readl(CG + 0x84) & ~(1 << 14))
+    qt.writel(CG + 0x84, qt.readl(CG + 0x84) | (1 << 14))
+    check('CG 0x84 bit 14 resets SDIO3', qt.readl(SDIO3 + 0x1FC), 0)
 
 
 def test_sdio(qt, card):
@@ -1423,6 +1456,9 @@ def test_fdt(qemu, tmp):
     check('the USB host and OTP nodes ehci-na51089.c needs',
           b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
     check('the PWM node pwm-na51055.c binds', b'nvt,nvt_pwm\0' in data, True)
+    check('the eMMC host node: mmc@f0510000, nvt,nvt_mmc3',
+          find_nodes(data, ['mmc@f0510000'])[0] > 0 and
+          b'nvt,nvt_mmc3\0' in data, True)
     check('three I2C nodes under the names i2c-nvt.c clocks by',
           find_nodes(data, ['i2c@f0220000', 'i2c2@f0350000',
                             'i2c3@f03a0000']).count(-1), 0)
@@ -1544,6 +1580,15 @@ def run(args, tmp):
                ['-drive', 'if=sd,index=0,format=raw,file=' + card])
     try:
         test_sdio(qt, card)
+    finally:
+        qt.close()
+
+    emmc = os.path.join(tmp, 'emmc.img')
+    open(emmc, 'wb').write(bytes(4 << 20))
+    qt = QTest(args.qemu, 'nt98566',
+               ['-drive', 'if=sd,index=2,format=raw,file=' + emmc])
+    try:
+        test_emmc(qt)
     finally:
         qt.close()
 

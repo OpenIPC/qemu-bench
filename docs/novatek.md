@@ -56,6 +56,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
 | SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR, or a W25N SPI NAND) |
 | SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio`, an SD card from `-drive if=sd,index=0` / `1` |
+| SDIO 3 (eMMC host) | `0xF0510000` | 32 | `nvt-sdio`, an eMMC from `-drive if=sd,index=2` |
 | PWM | `0xF0210000` | 26 | `nvt-pwm` |
 | I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF03A0000` | 41 / 42 / 60 | `nvt-i2c` (`/dev/i2c-0..2`); `sensor=` puts a sensor on the first |
 | USB 2.0 (FOTG200) | `0xF0600000`, alias `0xFF600000` | 27 | `nvt-usb`, host side; devices from `-device usb-*` |
@@ -313,6 +314,29 @@ What runs:
 - The vendor `FW98566A.bin` Linux finds the card and its hotplug mounts
   the partition.
 
+### eMMC
+
+SDIO3 at `0xF0510000` (SPI 32) is the same host as SDIO1/2. It is the
+SDK's eMMC board's `mmc@f0510000` (`cfg_562_EMMC_EVB`), compatible
+`nvt,nvt_mmc3`, which the same `na51055_mmc` driver serves, and its CG
+reset is `CG_SYS_RESET_REG1` bit 14. `-drive if=sd,index=2` puts QEMU's
+`emmc` card on it. The generated tree gives it `bus-width = <8>` and no
+`cd_gpio`, so the driver runs it 8 bits wide and takes it as always
+present.
+
+The SDK's eMMC board wires the bus 4 bits wide and sets `voltage-switch`.
+Here the node keeps `voltage-switch = <0>` and the card stays at high
+speed (no HS200). With the release's `mmc_na51055.ko` the eMMC comes up as
+"new high speed MMC card" on `mmc2`, block device `mmcblk2`.
+`test-novatek-boot.sh` (CI) checks that it is an MMC card on an 8-bit
+host, reads back 512 KiB the host put there, and writes 192 KiB raw that
+the host then finds in the image. `test-novatek.py` runs the eMMC
+sequence against the registers: CMD1 until ready, CMD2 / 3 / 7, and the
+512-byte EXT_CSD by descriptor DMA. It also checks SDIO3's CG reset bit
+and the device-tree node. The shipped vendor firmware is NOR / NAND and
+registers only SDIO1, so eMMC boot (the SDK's `nvt-na51089_emmc_defconfig`)
+is not exercised.
+
 ## I2C and the image sensor
 
 `nvt-i2c` is the controller `i2c-nvt.c` drives, three instances
@@ -539,7 +563,8 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
 - SPI NAND other than the two Winbond parts, 4 KiB pages, bit errors and
   bad blocks, and the controller's own Reed-Solomon ECC (used only when a
   part's on-die ECC is off).
-- SDIO3 (`0xF0510000`, the eMMC host), UHS / 1.8 V signalling and tuning,
+- UHS / 1.8 V signalling and tuning, eMMC HS200 and boot partitions (the
+  eMMC has none unless built with `-device emmc,boot-partition-size=`),
   SDIO (non-memory) cards, and card hot-plug.
 - The EQoS features the drivers leave off: checksum offload, TSO,
   timestamps, more queues.

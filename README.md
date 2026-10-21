@@ -245,7 +245,8 @@ scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). The 566 boards' SPI NAND
 is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
 (`qemu-boot/test-novatek-nand.sh`). SD cards attach with
 `-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
-vendor U-Boot read and write them. The USB host (FOTG200) works under the
+vendor U-Boot read and write them. An eMMC attaches to the third host
+(SDIO3) with `-drive if=sd,index=2`. The USB host (FOTG200) works under the
 vendor EHCI driver; no shipped kernel enables it, so
 `qemu-boot/build-novatek-test-kernel.sh` builds one (with the PWM driver
 too, which nothing shipped builds either). The three I2C
