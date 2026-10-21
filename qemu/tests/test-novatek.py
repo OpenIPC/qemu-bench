@@ -731,6 +731,24 @@ def test_sdio(qt, card):
     check('block 10 written to the card image',
           open(card, 'rb').read()[10 * 512:11 * 512], payload)
 
+    # A descriptor table shorter than DATA_LENGTH fails, not succeeds
+    qt.writel(SDIO + 0x1FC, 0)
+    qt.write(0x00800000, struct.pack('<3I', 1 | 2 | (2 << 4), 256, 0x01000000))
+    sd_data(qt, 512, addr=0x00800000)
+    sts = sd_cmd(qt, 17, 3 * 512)
+    check('descriptors 256 bytes short: DATA_TIMEOUT | DMA_ERROR, no DATA_END',
+          sts & (0x08 | (1 << 19) | SD_DATA_END), 0x08 | (1 << 19))
+    sd_cmd(qt, 12)
+    # A command the card does not answer leaves no data phase armed
+    sd_data(qt, 512, addr=0x00800000)
+    qt.writel(SDIO + 0x28, 0xFFFFFFFF)
+    qt.writel(SDIO + 0x04, 0)
+    qt.writel(SDIO, 5 | (1 << 6) | (1 << 9))          # CMD5: no SDIO
+    check('a timed-out command disarms its data phase',
+          (qt.readl(SDIO + 0x28) & 0x0C, qt.readl(SDIO + 0x10C) & 1,
+           qt.readl(SDIO + 0x1C) >> 6 & 1), (0x04, 0, 0))
+    qt.writel(SDIO + 0x1FC, 1)
+
     # PIO, as for unaligned buffers
     sd_data(qt, 512, dma=False)
     sts = sd_cmd(qt, 17, 3 * 512)

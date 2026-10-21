@@ -92,6 +92,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtSdioState, NVT_SDIO)
 #define STS_DATA_CRC_OK     (1u << 5)
 #define STS_CMD_SENT        (1u << 6)
 #define STS_DATA_END        (1u << 7)
+#define STS_DMA_ERROR       (1u << 19)
 #define PHY_SW_RST          (1u << 0)
 #define FIFO_EN             (1u << 0)
 #define FIFO_DMA            (1u << 1)
@@ -138,39 +139,50 @@ static void nvt_sdio_data_done(NvtSdioState *s, uint32_t sts)
     *reg(s, SDIO_STATUS) |= sts;
 }
 
-/* Move len bytes between the card and guest memory at addr. */
-static void nvt_sdio_dma_chunk(NvtSdioState *s, dma_addr_t addr,
+/*
+ * Move len bytes between the card and guest memory at addr; false if guest
+ * memory failed, which stops there (no garbage reaches the card).
+ */
+static bool nvt_sdio_dma_chunk(NvtSdioState *s, dma_addr_t addr,
                                uint32_t len, bool write)
 {
     uint8_t buf[512];
     uint32_t n;
+    bool ok = true;
 
-    while (len) {
+    while (len && ok) {
         n = MIN(len, sizeof(buf));
         if (write) {
-            dma_memory_read(&address_space_memory, addr, buf, n,
-                            MEMTXATTRS_UNSPECIFIED);
-            sdbus_write_data(&s->sdbus, buf, n);
+            ok = dma_memory_read(&address_space_memory, addr, buf, n,
+                                 MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
+            if (ok) {
+                sdbus_write_data(&s->sdbus, buf, n);
+            }
         } else {
             sdbus_read_data(&s->sdbus, buf, n);
-            dma_memory_write(&address_space_memory, addr, buf, n,
-                             MEMTXATTRS_UNSPECIFIED);
+            ok = dma_memory_write(&address_space_memory, addr, buf, n,
+                                  MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
         }
         addr += n;
         len -= n;
     }
     *reg(s, SDIO_DMA_CURR) = addr;
+    if (!ok) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-sdio: DMA to bad address "
+                      "0x%" PRIx64 "\n", (uint64_t)addr);
+    }
+    return ok;
 }
 
-static void nvt_sdio_dma(NvtSdioState *s, uint32_t len, bool write)
+/* True when all len bytes moved. */
+static bool nvt_sdio_dma(NvtSdioState *s, uint32_t len, bool write)
 {
     dma_addr_t des = *reg(s, SDIO_DMA_ADDR);
     uint32_t w[3], n;
     int i;
 
     if (*reg(s, SDIO_DMA_MODE) & DMA_MODE_PLAIN) {
-        nvt_sdio_dma_chunk(s, des, len, write);
-        return;
+        return nvt_sdio_dma_chunk(s, des, len, write);
     }
     for (i = 0; i < DES_MAX && len; i++, des += DES_SIZE) {
         if (dma_memory_read(&address_space_memory, des, w, sizeof(w),
@@ -183,7 +195,9 @@ static void nvt_sdio_dma(NvtSdioState *s, uint32_t len, bool write)
         }
         if (((w[0] >> DES_ACT_SHIFT) & 3) == DES_ACT_TRAN) {
             n = MIN(len, le32_to_cpu(w[1]) & LEN_MASK);
-            nvt_sdio_dma_chunk(s, le32_to_cpu(w[2]), n, write);
+            if (!nvt_sdio_dma_chunk(s, le32_to_cpu(w[2]), n, write)) {
+                return false;
+            }
             len -= n;
         }
         if (w[0] & DES_END) {
@@ -194,6 +208,7 @@ static void nvt_sdio_dma(NvtSdioState *s, uint32_t len, bool write)
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-sdio: descriptors end 0x%x "
                       "bytes short of DATA_LENGTH\n", len);
     }
+    return !len;
 }
 
 /* The data phase of the command just sent, when one was set up. */
@@ -216,7 +231,11 @@ static uint32_t nvt_sdio_data(NvtSdioState *s)
         s->pio_left = len;
         return 0;
     }
-    nvt_sdio_dma(s, len, write);
+    if (!nvt_sdio_dma(s, len, write)) {
+        /* What both drivers take as a failed transfer. */
+        nvt_sdio_data_done(s, 0);
+        return STS_DATA_TIMEOUT | STS_DMA_ERROR;
+    }
     nvt_sdio_data_done(s, 0);
     return STS_DATA_END | STS_DATA_CRC_OK;
 }
@@ -243,7 +262,8 @@ static void nvt_sdio_command(NvtSdioState *s)
             *reg(s, SDIO_RSP0) = ldl_be_p(rsp);
         }
         if (!rlen) {
-            *reg(s, SDIO_STATUS) |= sts | STS_RSP_TIMEOUT;
+            /* No data follows a command the card did not take. */
+            nvt_sdio_data_done(s, sts | STS_RSP_TIMEOUT);
             return;
         }
         *reg(s, SDIO_RSP_CMD) = req.cmd;
@@ -316,7 +336,7 @@ static void nvt_sdio_write(void *opaque, hwaddr off, uint64_t val,
     case SDIO_CMD:
         *reg(s, off) = val & ~(CMD_EN | CMD_SDC_RST);
         if (val & CMD_SDC_RST) {
-            s->pio_left = 0;
+            nvt_sdio_data_done(s, 0);       /* disarms any data phase */
             *reg(s, SDIO_STATUS) = 0;
         }
         if (val & CMD_EN) {
