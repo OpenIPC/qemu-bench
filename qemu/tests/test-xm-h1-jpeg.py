@@ -82,6 +82,12 @@ class QTest:
 
     def close(self):
         self.proc.kill(); self.proc.wait()
+        # QEMU's stderr outlives the dir: test-xm-gpio and test-xm510-gpio
+        # check its -d unimp lines after close().
+        try:
+            self.err = open(os.path.join(self.dir, 'qemu.err')).read()
+        except OSError:
+            self.err = ''
         shutil.rmtree(self.dir, ignore_errors=True)
 
 

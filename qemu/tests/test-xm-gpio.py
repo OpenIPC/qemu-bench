@@ -76,7 +76,7 @@ def main():
     finally:
         q.close()
 
-    log = open(os.path.join(q.dir, 'qemu.err')).read()
+    log = q.err
     check('xm-gpio: pad 1 high' in log and 'xm-gpio: pad 1 low' in log,
           'output changes are logged under -d unimp')
 

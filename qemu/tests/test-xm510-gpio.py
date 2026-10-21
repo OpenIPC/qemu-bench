@@ -97,7 +97,7 @@ def main():
     finally:
         q.close()
 
-    log = open(os.path.join(q.dir, 'qemu.err')).read()
+    log = q.err
     check('xm510-gpio: gpio 65 high' in log and 'xm510-gpio: gpio 65 low' in log,
           'output changes are logged under -d unimp')
     check('xm510-gpio: gpio 3 released' in log,
