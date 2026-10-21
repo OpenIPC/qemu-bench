@@ -141,6 +141,7 @@ struct NvtMachineState {
 
     char *flash_file;
     uint32_t flash_jedec;
+    NvtFlashState *flash;
 };
 
 static const NvtSoCConfig *nvt_config;
@@ -161,6 +162,7 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
 {
     const NvtSoCConfig *c = nvt_config;
     MachineState *ms = MACHINE(qdev_get_machine());
+    bool nand = NVT_MACHINE(ms)->flash->nand;
     uint32_t gic, periph_clk, l2;
     const char *path;
     char *upath;
@@ -318,15 +320,22 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
     nvt_fdt_irq(fdt, "/gpio@f0070000", NVT_IRQ_GPIO);
     qemu_fdt_setprop_cell(fdt, "/gpio@f0070000", "#gpio-cells", 2);
 
-    /* spinor.c names the MTD after nvt-devname: mtdparts=spi_nor.0:... */
-    qemu_fdt_add_subnode(fdt, "/nor@f0400000");
-    path = "/nor@f0400000";
-    qemu_fdt_setprop_string(fdt, path, "compatible", "nvt,nvt_spinor");
+    /*
+     * spinor.c / spinand.c name the MTD after nvt-devname:
+     * mtdparts=spi_nor.0:... or spi_nand.0:..., as cfg_566_IPCAM1_EVB has.
+     */
+    path = nand ? "/nand@f0400000" : "/nor@f0400000";
+    qemu_fdt_add_subnode(fdt, path);
+    qemu_fdt_setprop_string(fdt, path, "compatible",
+                            nand ? "nvt,nvt_spinand" : "nvt,nvt_spinor");
     qemu_fdt_setprop_cells(fdt, path, "reg", NVT_FLASH_BASE, 0x1000);
     nvt_fdt_irq(fdt, path, NVT_IRQ_FLASH);
     qemu_fdt_setprop_cell(fdt, path, "clock-frequency", 48000000);
-    qemu_fdt_setprop_string(fdt, path, "nvt-devname", "spi_nor.0");
-    qemu_fdt_setprop_cell(fdt, path, "trace-stdtable", 1);
+    qemu_fdt_setprop_string(fdt, path, "nvt-devname",
+                            nand ? "spi_nand.0" : "spi_nor.0");
+    if (!nand) {
+        qemu_fdt_setprop_cell(fdt, path, "trace-stdtable", 1);
+    }
 
     /* The MAC, its Novatek glue and the embedded PHY in one 16 KiB block;
      * the vendor node maps the first 0x3800 and reaches past it. */
@@ -352,14 +361,16 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
  * Flash boot.  On silicon the mask ROM loads the 32 KiB loader
  * (LD9856xA.bin) into SRAM; it trains DDR with closed libraries
  * (Reset_560.a) and then, in bl_func.c: copies the FDT from the fixed fdt
- * partition (0x10000) to /nvt_memory_cfg/fdt, loads the uboot partition to
+ * partition (0x10000 on NOR, block 2 -- 0x40000 -- on NAND) to
+ * /nvt_memory_cfg/fdt, loads the uboot partition to
  * /nvt_memory_cfg/uboot -- unpacking a BCL1 one -- fills the SHMINFO block
  * at /nvt_memory_cfg/shmem that U-Boot's nvt_shminfo_init() insists on
  * ("LD_NVT", the FDT address), and calls U-Boot's entry.  DDR needs no
  * training here, so the machine does those steps itself and leaves a
  * two-word branch at 0 for the CPU to start on.
  */
-#define NVT_FLASH_FDT_OFF   0x10000
+#define NVT_NOR_FDT_OFF     0x10000
+#define NVT_NAND_FDT_OFF    0x40000
 #define NVT_SHMINFO_SIZE    328
 #define NVT_BCL1            0x314C4342      /* "BCL1" */
 #define NVT_BCL1_HDR        16
@@ -450,14 +461,15 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size)
     uint64_t fdt_addr, fdt_max, ub_addr, ub_max, shm_addr, shm_size;
     uint64_t ub_off, ub_len, ub_size;
     uint32_t stub[2], fdt_len;
+    uint32_t fdt_off = flash->nand ? NVT_NAND_FDT_OFF : NVT_NOR_FDT_OFF;
     char path[96];
     int nor;
 
-    nvt_flash_read(flash, NVT_FLASH_FDT_OFF, hdr, sizeof(hdr));
+    nvt_flash_read(flash, fdt_off, hdr, sizeof(hdr));
     if (ldl_be_p(hdr) != FDT_MAGIC) {
         error_report("novatek: no device tree at flash 0x%x: not a Novatek "
                      "flash image (qemu-boot/nvtpack2flash.py makes one from "
-                     "an FW*.bin)", NVT_FLASH_FDT_OFF);
+                     "an FW*.bin)", fdt_off);
         exit(1);
     }
     fdt_len = ldl_be_p(hdr + 4);
@@ -466,15 +478,16 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size)
         exit(1);
     }
     fdt = g_malloc(fdt_len);
-    nvt_flash_read(flash, NVT_FLASH_FDT_OFF, fdt, fdt_len);
-    nor = fdt_node_offset_by_compatible(fdt, -1, "nvt,nvt_spinor");
+    nvt_flash_read(flash, fdt_off, fdt, fdt_len);
+    nor = fdt_node_offset_by_compatible(fdt, -1, flash->nand ?
+                                        "nvt,nvt_spinand" : "nvt,nvt_spinor");
     if (fdt_check_header(fdt) ||
         nvt_fdt_reg(fdt, "/nvt_memory_cfg/fdt", 1, &fdt_addr, &fdt_max) ||
         nvt_fdt_reg(fdt, "/nvt_memory_cfg/uboot", 1, &ub_addr, &ub_max) ||
         nvt_fdt_reg(fdt, "/nvt_memory_cfg/shmem", 1, &shm_addr, &shm_size) ||
         nor < 0 || fdt_get_path(fdt, nor, path, sizeof(path) - 20)) {
         error_report("novatek: the flash's device tree lacks nvt_memory_cfg "
-                     "or the nor node");
+                     "or the %s node", flash->nand ? "nand" : "nor");
         exit(1);
     }
     strcat(path, "/partition_uboot");
@@ -525,9 +538,10 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size)
     }
 
     /* SHMINFO (arch/arm/include/asm/nvt-common/shm_info.h), as the loader
-     * leaves it: name, boot storage SPI NOR, FDT address, normal boot. */
+     * leaves it: name, boot storage (2 SPI NAND, 3 SPI NOR), FDT address,
+     * normal boot. */
     memcpy(shm, "LD_NVT", 6);
-    stw_le_p(shm + 42, 3);                  /* boot.LdStorage */
+    stw_le_p(shm + 42, flash->nand ? 2 : 3);    /* boot.LdStorage */
     stl_le_p(shm + 44, fdt_addr);           /* boot.fdt_addr */
     memcpy(shm + 112, "COMMINFO", 8);       /* comm.CommInfo_1 */
     if (shm_size < sizeof(shm) || fdt_len > fdt_max) {
@@ -649,6 +663,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     qdev_prop_set_uint32(dev, "jedec", nms->flash_jedec);
     object_property_add_child(OBJECT(machine), "nvt-flash", OBJECT(dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    nms->flash = NVT_FLASH(dev);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_FLASH_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_FLASH]);
 
@@ -720,13 +735,14 @@ static void nvt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "flash-file",
         nvt_machine_get_flash_file, nvt_machine_set_flash_file);
     object_class_property_set_description(oc, "flash-file",
-        "SPI NOR image (power-of-two size, 1..32 MiB); erases and programs "
-        "are written back to it");
+        "SPI NOR image (power-of-two size, 1..32 MiB) or SPI NAND image "
+        "(128 or 256 MiB, or 2112 bytes a page with the OOB); erases and "
+        "programs are written back to it");
     object_class_property_add(oc, "flash-jedec", "uint32",
         nvt_machine_get_flash_jedec, nvt_machine_set_flash_jedec, NULL, NULL);
     object_class_property_set_description(oc, "flash-jedec",
-        "JEDEC ID the SPI NOR answers with; default a Winbond W25Q of the "
-        "image's size");
+        "JEDEC ID the flash answers with; default a Winbond W25Q (NOR) or "
+        "W25N (NAND) of the image's size");
 }
 
 static const TypeInfo nvt_machine_info = {

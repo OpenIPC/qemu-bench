@@ -23,10 +23,18 @@ plays the vendor drivers (docs/novatek.md):
     PIO, a manual-CS read (CMD_ADDR then READ_N), a DMA read into RAM, a
     block erase with its RDSR poll and a PIO page program, both written
     back to the image file, and the completion interrupt on SPI 29;
+  - nvt-flash in SPI NAND mode, the way spinand.c drives a W25N01GV, on
+    a 128 MiB image of data alone and on one with each page's OOB: the
+    ID after its address byte, GET / SET_FEATURE, DATA_RD3 page reads (by
+    DMA, the OOB into the spare SRAM, and the OOB alone), a block erase
+    and an SPI_PROG_CMD page program polled through GET_FEATURE C0, the
+    image file afterwards; a malformed image size is refused;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
     BCL1/LZ-packed "U-Boot") leaves U-Boot unpacked at
     /nvt_memory_cfg/uboot, the device tree and the "LD_NVT" SHMINFO where
     the tree says, and a branch at 0; an image with no tree is refused;
+    a NAND image (device tree in block 2, a plain U-Boot) boots the same
+    way, its SHMINFO naming SPI NAND;
   - nvt-eqos: the embedded PHY over MDIO, the HW feature bits the driver
     keys on (MDIO present, one queue), the software reset, the Rx DMA
     state yinit() polls for, a frame sent through a Tx descriptor (seen in
@@ -39,7 +47,8 @@ plays the vendor drivers (docs/novatek.md):
     before the guest set the UART up still flowing after it resets the
     receive FIFO (qemu/patches/0003, the vendor U-Boot's autoboot stop);
   - the generated device tree: compatible, the clock nodes in the order
-    of_clk_init() needs, the pinmux children in the driver's order;
+    of_clk_init() needs, the pinmux children in the driver's order; the
+    flash node spinand.c binds when the image is a NAND;
   - outside qtest: machine state migrates to a file and back.
 
     python3 qemu/tests/test-novatek.py [--qemu PATH]
@@ -108,6 +117,12 @@ class QTest:
 
     def readl(self, a):
         return int(self.cmd('readl 0x%x' % a).split()[1], 16)
+
+    def read(self, a, n):
+        return bytes.fromhex(self.cmd('read 0x%x %d' % (a, n)).split()[1][2:])
+
+    def write(self, a, data):
+        self.cmd('write 0x%x %d 0x%s' % (a, len(data), data.hex()))
 
     def step(self, ns):
         self.cmd('clock_step %d' % ns)
@@ -464,6 +479,159 @@ def test_flash(qt, path):
     check('FAST_READ after four dummy clocks', got, img[0x60000:0x60010])
 
 
+# ---- nvt-flash, SPI NAND --------------------------------------------------
+
+OP_CMD_STS, OP_SPI_PROG_CMD, OP_DATA_RD3 = 0x0B, 0x15, 0x16
+NAND_MODE = 1 << 19                 # MODULE0.nand_type, spi_flash_type 0
+PAGE, OOB, RAW = 2048, 64, 2112
+NAND_SIZE = 128 << 20
+
+
+def make_nand(path, with_oob):
+    """A 128 MiB NAND: pages 0..191 numbered, page 5's OOB (if kept) set."""
+    data = bytearray(b'\xff' * NAND_SIZE)
+    for p in range(192):
+        data[p * PAGE:(p + 1) * PAGE] = (struct.pack('<I', p) * 512)
+    if not with_oob:
+        open(path, 'wb').write(data)
+        return
+    raw = bytearray(b'\xff' * (NAND_SIZE // PAGE * RAW))
+    for p in range(192):
+        raw[p * RAW:p * RAW + PAGE] = data[p * PAGE:(p + 1) * PAGE]
+    raw[5 * RAW + PAGE:6 * RAW] = bytes(range(0x40, 0x80))
+    open(path, 'wb').write(raw)
+
+
+def nand_page(path, with_oob, p):
+    """(data, oob) of page p in the image file."""
+    with open(path, 'rb') as f:
+        if with_oob:
+            f.seek(p * RAW)
+            b = f.read(RAW)
+            return b[:PAGE], b[PAGE:]
+        f.seek(p * PAGE)
+        return f.read(PAGE), None
+
+
+def nand_module0(qt, row, col=2):
+    qt.writel(FLASH + 0x00, NAND_MODE | ((row - 1) << 2) | (col - 1))
+
+
+def nand_read_page(qt, page, col=0, length=PAGE, dma=True):
+    """spinand_read_page: PAGE_READ, poll, CACHE_READX4, status."""
+    nand_module0(qt, 3)
+    qt.writel(FLASH + 0x38, col)
+    qt.writel(FLASH + 0xB4, 0x0F | (0xC0 << 8))     # COMMAND2: cmd 5, 6
+    qt.writel(FLASH + 0xBC, 1 << 8)                 # OIP == 0
+    qt.writel(FLASH + 0x110, 0x01000000)
+    flash_op(qt, OP_DATA_RD3, 0x13 | (0x0F << 8) | (0xC0 << 16) | (0x6B << 24),
+             row=page, length=length, dma=dma)
+
+
+def nand_feature(qt, addr):
+    nand_module0(qt, 1)
+    flash_op(qt, OP_CMD_STS, 0x0F | (addr << 8), length=1)
+    return qt.readl(FLASH + 0x48) & 0xFF
+
+
+def test_nand(qt, path, with_oob):
+    print('nvt-flash, SPI NAND (%s)' % ('with OOB' if with_oob else
+                                        'data only'))
+    gic_enable(qt, SPI_FLASH)
+    qt.writel(FLASH + 0x44, 1 << 12)
+
+    nand_module0(qt, 1)
+    flash_op(qt, OP_READ_ID, 0x9F, length=4)
+    check('READ_ID: W25N01GV after the address byte',
+          qt.readl(FLASH + 0x100), 0x0021AAEF)
+    check('configuration B0: on-die ECC, buffer mode', nand_feature(qt, 0xB0),
+          0x18)
+
+    # spi_nand_unlock_bp / nand_cmd_write_status: CMD_ADDR, 2 "row" bytes
+    nand_module0(qt, 2)
+    flash_op(qt, OP_CMD_ADDR, 0x1F, row=(0xA0 << 8) | 0x38)
+    check('SET_FEATURE A0', nand_feature(qt, 0xA0), 0x38)
+    nand_module0(qt, 2)
+    flash_op(qt, OP_CMD_ADDR, 0x1F, row=(0xA0 << 8) | 0x00)
+    check('and back to unlocked', nand_feature(qt, 0xA0), 0)
+
+    data, oob = nand_page(path, with_oob, 5)
+    nand_read_page(qt, 5)
+    check('DATA_RD3 completes', flash_done(qt), True)
+    check('and interrupts', gic_pending(qt, SPI_FLASH), True)
+    check('page 5 by DMA', qt.read(0x01000000, PAGE), data)
+    check('its OOB in the spare SRAM', qt.read(FLASH + 0x200, OOB),
+          oob or b'\xff' * OOB)
+    check('status (cmd 5 + 6) in CTRL_STS: ready, no ECC error',
+          qt.readl(FLASH + 0x48) & 0xFF, 0)
+    qt.writel(FLASH + 0x48, 1 << 12)
+
+    qt.write(FLASH + 0x200, b'\0' * OOB)
+    nand_read_page(qt, 5, col=PAGE, length=OOB, dma=False)
+    check('a spare-only read completes undrained', flash_done(qt), True)
+    check('with the OOB in the spare SRAM', qt.read(FLASH + 0x200, OOB),
+          oob or b'\xff' * OOB)
+
+    # A column past the OOB reads nothing, whatever DATALEN says
+    qt.write(FLASH + 0x200, b'\x5a' * 0x80)
+    nand_read_page(qt, 5, col=0xFFF, length=0x100000, dma=False)
+    check('a column past the page completes', flash_done(qt), True)
+    check('and leaves the spare SRAM alone', qt.read(FLASH + 0x200, 0x80),
+          b'\x5a' * 0x80)
+    check('the controller still answers', nand_feature(qt, 0xB0), 0x18)
+
+    # RESET returns B0 to its power-on value
+    nand_module0(qt, 2)
+    flash_op(qt, OP_CMD_ADDR, 0x1F, row=(0xB0 << 8) | 0x08)
+    check('SET_FEATURE B0: ECC off', nand_feature(qt, 0xB0), 0x08)
+    flash_op(qt, OP_CMD, 0xFF)
+    check('RESET restores ECC-E', nand_feature(qt, 0xB0), 0x18)
+
+    # nand_cmd_erase_block: WEN, then BLK_ERSE polling GET_FEATURE C0
+    nand_module0(qt, 1)
+    flash_op(qt, OP_CMD, 0x06)
+    check('WEN sets WEL', nand_feature(qt, 0xC0), 0x02)
+    nand_module0(qt, 3)
+    qt.writel(FLASH + 0xBC, 1 << 8)
+    flash_op(qt, OP_BLK_ERSE, 0xD8 | (0x0F << 8) | (0xC0 << 16), row=64)
+    check('block erase completes', flash_done(qt), True)
+    check('with E_FAIL clear and WEL dropped',
+          qt.readl(FLASH + 0x48) & 0xFF, 0)
+    check('block 1 erased in the file',
+          all(nand_page(path, with_oob, p)[0] == b'\xff' * PAGE
+              for p in (64, 100, 127)), True)
+    check('block 2 untouched', nand_page(path, with_oob, 128)[0],
+          struct.pack('<I', 128) * 512)
+
+    # spinand_program_page: spare SRAM, then SPI_PROG_CMD by DMA
+    payload = random.Random(5).randbytes(PAGE)
+    spare = bytes(range(0xC0, 0x100))
+    qt.write(0x01000000, payload)
+    qt.write(FLASH + 0x200, spare)
+    nand_module0(qt, 3)
+    qt.writel(FLASH + 0x38, 0)
+    qt.writel(FLASH + 0xB4, 0xC0)                   # COMMAND2: cmd 5
+    qt.writel(FLASH + 0xBC, 1 << 8)
+    qt.writel(FLASH + 0x110, 0x01000000)
+    flash_op(qt, OP_SPI_PROG_CMD, 0x06 | (0x32 << 8) | (0x10 << 16) |
+             (0x0F << 24), row=67, length=PAGE, dma=True, write=True)
+    check('SPI_PROG_CMD completes', flash_done(qt), True)
+    check('with P_FAIL clear', qt.readl(FLASH + 0x48) & 0x08, 0)
+    d, o = nand_page(path, with_oob, 67)
+    check('page 67 programmed in the file', d, payload)
+    if with_oob:
+        check('its OOB from the spare SRAM', o, spare)
+    qt.write(0x01000000, b'\0' * PAGE)
+    nand_read_page(qt, 67)
+    check('and reads back', qt.read(0x01000000, PAGE), payload)
+
+    # PROGRAM EXECUTE without WEN programs nothing (W25N)
+    nand_module0(qt, 3)
+    flash_op(qt, OP_CMD_ADDR, 0x10, row=68)
+    check('no program without WEL', nand_page(path, with_oob, 68)[0],
+          b'\xff' * PAGE)
+
+
 # ---- flash boot ROM ----------------------------------------------------
 
 def fdt_blob(tree):
@@ -535,7 +703,7 @@ def lz_pack(data, marker=0xF7):
     return bytes(out)
 
 
-def make_boot_image(path, part_size=0x40000, bcl=None):
+def make_boot_image(path, part_size=0x40000, bcl=None, nand=False):
     rng = random.Random(7)
     head = bytes(rng.randrange(256) for _ in range(300)) + b'\xf7' * 3
     payload = head + head[-64:] * 40 + bytes(range(256))
@@ -550,16 +718,24 @@ def make_boot_image(path, part_size=0x40000, bcl=None):
             'shmem': {'reg': cells(0x200000, 0x100000)},
             'uboot': {'reg': cells(0x3900000, 0x6C0000)},
         },
-        'nor@f0400000': {
-            'compatible': b'nvt,nvt_spinor\0',
+        ('nand@f0400000' if nand else 'nor@f0400000'): {
+            'compatible': b'nvt,nvt_spinand\0' if nand else
+                          b'nvt,nvt_spinor\0',
             '#address-cells': cells(2), '#size-cells': cells(2),
-            'partition_uboot': {'reg': cells(0, 0x50000, 0, part_size)},
+            'partition_uboot': {'reg': cells(0, 0xC0000 if nand else 0x50000,
+                                             0, part_size)},
         },
     }
-    img = bytearray(b'\xff' * (8 << 20))
     dtb = fdt_blob(tree)
-    img[0x10000:0x10000 + len(dtb)] = dtb
-    img[0x50000:0x50000 + len(bcl)] = bcl
+    if nand:
+        # cfg_566_IPCAM1_EVB: the tree in block 2, U-Boot as built
+        img = bytearray(b'\xff' * NAND_SIZE)
+        img[0x40000:0x40000 + len(dtb)] = dtb
+        img[0xC0000:0xC0000 + len(payload)] = payload
+    else:
+        img = bytearray(b'\xff' * (8 << 20))
+        img[0x10000:0x10000 + len(dtb)] = dtb
+        img[0x50000:0x50000 + len(bcl)] = bcl
     open(path, 'wb').write(img)
     return payload, dtb
 
@@ -590,7 +766,8 @@ def test_boot_rom(qemu, tmp):
                               '-display', 'none', '-nodefaults', '-S'],
                              capture_output=True, text=True, timeout=30)
         # exit(1) with a message, not a signal
-        check(what, out.returncode == 1 and 'novatek:' in out.stderr, True)
+        check(what, out.returncode == 1 and
+              ('novatek:' in out.stderr or 'nvt-flash:' in out.stderr), True)
 
     blank = os.path.join(tmp, 'blank.bin')
     open(blank, 'wb').write(b'\xff' * (8 << 20))
@@ -603,6 +780,22 @@ def test_boot_rom(qemu, tmp):
     make_boot_image(bad, bcl=b'BCL1' + struct.pack('>III', 9, 0xF0000000, 8) +
                     b'\xf7' * 8)
     refused(bad, 'a BCL1 header declaring 3.75 GiB is refused')
+    open(bad, 'wb').write(b'\xff' * (100 << 20))
+    refused(bad, 'a 100 MiB image, neither NOR nor NAND, is refused')
+
+    nand = os.path.join(tmp, 'boot-nand.bin')
+    payload, dtb = make_boot_image(nand, nand=True)
+    qt = QTest(qemu, 'nt98566,flash-file=' + nand)
+    try:
+        check('NAND: the plain U-Boot copied to /nvt_memory_cfg/uboot',
+              qt.read(0x3900000, len(payload)), payload)
+        check('the device tree from block 2', qt.read(0x100000, len(dtb)),
+              dtb)
+        check('SHMINFO boot.LdStorage: SPI NAND',
+              struct.unpack_from('<H', qt.read(0x200000 + 42, 2))[0], 2)
+    finally:
+        qt.close()
+    os.unlink(nand)
 
 
 # ---- nvt-eqos ----------------------------------------------------------
@@ -839,6 +1032,21 @@ def test_fdt(qemu, tmp):
     check('pinmux children in PIN_FUNC order',
           all(0 < a < b for a, b in zip(order, order[1:])), True)
     check('chip-ID node for nvt_get_chip_id()', b'nvt,nvt_top' in data, True)
+    check('the NOR under spinor.c', b'nvt,nvt_spinor\0' in data and
+          b'spi_nor.0\0' in data, True)
+
+    nand = os.path.join(tmp, 'fdt-nand.bin')
+    with open(nand, 'wb') as f:
+        f.truncate(NAND_SIZE)
+    subprocess.run([qemu, '-M', 'nt98566,flash-file=' + nand,
+                    '-machine', 'dumpdtb=' + dtb, '-kernel', kernel,
+                    '-display', 'none', '-nodefaults'],
+                   capture_output=True, timeout=30)
+    data = open(dtb, 'rb').read()
+    check('a NAND image gets the node spinand.c binds',
+          b'nvt,nvt_spinand\0' in data and b'spi_nand.0\0' in data and
+          b'nvt,nvt_spinor' not in data, True)
+    os.unlink(nand)
 
 
 def hmp(qemu, args, cmds):
@@ -892,6 +1100,16 @@ def main():
     finally:
         qt.close()
     test_boot_rom(args.qemu, tmp)
+
+    for with_oob in (False, True):
+        nand = os.path.join(tmp, 'nand.bin')
+        make_nand(nand, with_oob)
+        qt = QTest(args.qemu, 'nt98566,flash-file=' + nand, ['-kernel', stub])
+        try:
+            test_nand(qt, nand, with_oob)
+        finally:
+            qt.close()
+        os.unlink(nand)
 
     pcap = os.path.join(tmp, 'eth.pcap')
     qt = QTest(args.qemu, 'nt98562',

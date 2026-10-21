@@ -5,7 +5,8 @@ with DDR in the package and Novatek's own peripheral blocks from
 `0xF0000000`. One machine file (`hw/arm/novatek.c`) covers the family with a
 table entry per part. It boots the OpenIPC `nt98562_lite` / `nt98566_lite`
 kernel with its root on the emulated SPI NOR and Ethernet up, and boots a
-whole flash image through the vendor U-Boot. What is left is in
+whole flash image through the vendor U-Boot, on SPI NOR or (the 566 boards)
+SPI NAND with a UBIFS root. What is left is in
 [Not modelled](#not-modelled).
 
 ## What the SDKs support
@@ -52,7 +53,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | GPIO | `0xF0070000` | 24 | `nvt-gpio` |
 | UART1 / 2 / 3 | `0xF0290000` / `0xF0300000` / `0xF0310000` | 43 / 44 / 45 | 16550, reg-shift 2 |
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
-| SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR) |
+| SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR, or a W25N SPI NAND) |
 | SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio` (empty slot) |
 | USB 2.0 | `0xF0600000` | 27 | — |
 | On-chip SRAM | `0xF07C0000` | | — |
@@ -159,15 +160,71 @@ Writes from busybox `flashcp` go out as 256-byte DMA page programs. It pads a
 short last buffer to 4 KiB, as on silicon. Smaller writes are PIO programs.
 `test-novatek-boot.sh` checks both kinds against the image file.
 
+## SPI NAND
+
+The 566 boards (`cfg_566_IPCAM1_EVB`) boot from SPI NAND on the same
+controller, which `spinand.c` (kernel and U-Boot) switches to NAND mode:
+`MODULE0` bit 19 (`nand_type`) set, bit 20 (`spi_flash_type`) clear. A
+`flash-file` of 128 or 256 MiB makes the flash a Winbond W25N01GV or
+W25N02KV: ID `EF AA 21` / `22`, 2 KiB pages with 64 bytes of OOB, 128 KiB
+blocks, both in the drivers' ID tables. The image is either the data alone,
+with the OOB kept in memory as erased, or every page followed by its OOB
+(2112 bytes a page). The chip is modelled at the SPI byte level. It has a
+2112-byte cache register, PAGE DATA READ (`0x13`), the cache reads
+(`0x03`/`0x0B`/`0x3B`/`0x6B`: column, dummy, data) and the program loads,
+which AND into the page as NAND does. PROGRAM EXECUTE (`0x10`) and BLOCK
+ERASE (`0xD8`) need WEL. The feature registers are GET/SET FEATURE at
+A0/B0/C0. B0 resets to `0x18` (ECC-E, BUF), so the drivers pick on-die
+ECC, and the status never reports an ECC error. Block protection (A0) is
+storage only.
+
+In NAND mode the controller changes how some operations go out on the bus,
+which the drivers rely on:
+
+- a status read is GET_FEATURE plus the feature address: two command bytes
+  for CMD_STS, AUTO_STATUS and BLK_ERSE's poll (`0x0F 0xC0`);
+- READ_ID clocks one address byte before the ID;
+- `0x16` DATA_RD3 is a whole page read. It sends cmd 1 (PAGE READ) and the
+  3-byte row, polls cmd 2 + cmd 3, then sends cmd 4 (cache read x4), the
+  2-byte column and a dummy byte. DATALEN bytes go to DMASTART and the
+  page's OOB to the spare SRAM at `+0x200`; a column in the OOB fills the
+  spare SRAM alone. COMMAND2's cmd 5 + cmd 6 (`+0xB4`) then read the status
+  into CTRL_STS[7:0], where the driver looks for ECC bits;
+- `0x15` SPI_PROG_CMD is a whole page program. It sends cmd 1 (WEN), then
+  cmd 2 (load x4) with the column, DATALEN bytes from DMASTART and the spare
+  SRAM as the OOB, then cmd 3 (PROGRAM EXECUTE) with the row, and polls
+  cmd 4 + COMMAND2[7:0].
+
+The spare SRAM holds the OOB byte for byte: the drivers copy it word by word
+to and from their page buffer (`nand_cmd_write_spare_sram`). Sub-page and
+OOB-only writes take the manual-CS path in NOR mode instead (CMD_ADDR,
+WRITE_N, then CMD_ADDR `0x10`). It needs nothing NAND-specific from the
+controller.
+
+The OpenIPC nt9856x kernels are built without `CONFIG_MTD_SPINAND`, so the
+NAND is exercised with the vendor firmware: the SDK's 566_NAND
+`FW98566A.bin` through `nvtpack2flash.py`. The vendor U-Boot probes the
+W25N01GV, reads the kernel from NAND and boots it. Linux attaches UBI on
+the rootfs partition and mounts UBIFS read-write as root, then reaches the
+vendor shell. Its writes go back to the image file and are there on the
+next boot. The only UBI complaint, "could not find any anchor PEB", comes
+from the vendor image, which leaves UBI no free PEB for a fastmap.
+`qemu-boot/test-novatek-nand.sh --flash nand.bin` runs the whole check.
+U-Boot round-trips 256 KiB through `nand erase/write/read` and `crc32`,
+and the image file holds it afterwards. Linux keeps a file on UBIFS across
+`reboot -f`. The test takes about 20 s. `test-novatek.py` plays the
+drivers' register sequences against both image formats in CI.
+
 ## Flash boot
 
 On silicon the mask ROM loads the 32 KiB loader (`LD9856xA.bin`) into SRAM.
 The loader trains DDR with closed libraries and then, per `bl_func.c`:
 
-1. copies the FDT from the fixed `fdt` partition (flash `0x10000`) to
-   `/nvt_memory_cfg/fdt`;
-2. loads `partition_uboot` to `/nvt_memory_cfg/uboot`, unpacking it if it is
-   BCL1;
+1. copies the FDT from the fixed `fdt` partition to `/nvt_memory_cfg/fdt`:
+   flash `0x10000` on NOR, block 2 (`FDT_OFFSET`, `0x40000`) on NAND;
+2. loads `partition_uboot` (from the tree's `nor` or `nand` node) to
+   `/nvt_memory_cfg/uboot`, unpacking it if it is BCL1. The 566 NAND image
+   stores it plain;
 3. fills the 328-byte SHMINFO at `/nvt_memory_cfg/shmem`;
 4. calls U-Boot's entry.
 
@@ -175,7 +232,8 @@ DDR needs no training here, so with `flash-file=` and no `-kernel` the
 machine does steps 1–4 itself and leaves `ldr pc, [pc, #-4]` plus U-Boot's
 address at 0 for the CPU to start on. The SHMINFO is what U-Boot's
 `nvt_shminfo_init()` hangs without: `"LD_NVT"` at +0 and the FDT address at
-+44 (`arch/arm/include/asm/nvt-common/shm_info.h`).
++44 (`arch/arm/include/asm/nvt-common/shm_info.h`). `boot.LdStorage` at +42
+says 3 (SPI NOR) or 2 (SPI NAND).
 
 BCL1 is Novatek's container: the FourCC, then the algorithm and the
 big-endian uncompressed and compressed sizes, then the data. Algorithm 9 is
@@ -190,7 +248,9 @@ pack's own device tree says (`nvtpack/index/idN` → `partition_<name>`) and
 strips the 64-byte CKSM header from the rootfs and app images. Booted with
 `FLASH=nor.bin qemu-boot/run-nt98562.sh`, the SDK's `FW98562A.bin` runs
 U-Boot 2019.04 (SPI NOR probed, empty SD slot, `nvt_boot`), the kernel and
-the vendor init scripts.
+the vendor init scripts. A NAND pack (`FW98566A.bin`) comes out as the
+128 MiB NAND's data, its UBI rootfs as ubinize made it. It boots the same
+way with `SOC=nt98566 FLASH=nand.bin`.
 
 ## Ethernet
 
@@ -251,7 +311,9 @@ cd qemu-boot && curl -sL \
   | tar xz && cd ..
 bash qemu-boot/run-nt98562.sh               # SOC=nt98566 for the 128 MB part
 FLASH=nor.bin bash qemu-boot/run-nt98562.sh # a whole flash image
+SOC=nt98566 FLASH=nand.bin bash qemu-boot/run-nt98562.sh   # FW98566A.bin, NAND
 bash qemu-boot/test-novatek-uboot-net.sh --flash nor.bin   # vendor U-Boot net
+bash qemu-boot/test-novatek-nand.sh --flash nand.bin       # NAND: U-Boot, UBIFS
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
 python3 qemu/tests/test-novatek.py
 ```
@@ -268,9 +330,12 @@ fetches a file over HTTP, then runs `reboot -f` under `-no-reboot`.
 
 ## Not modelled
 
-- SPI NAND behind `nvt-flash` (the 566 boards), and the real loader: it
-  trains DDR from its ConfigRAM table with closed libraries
-  (`Reset_560.a`).
+- The real loader: it trains DDR from its ConfigRAM table with closed
+  libraries (`Reset_560.a`). Its NAND path also skips bad blocks; the
+  stand-in reads the FDT and U-Boot at their nominal offsets.
+- SPI NAND other than the two Winbond parts, 4 KiB pages, bit errors and
+  bad blocks, and the controller's own Reed-Solomon ECC (used only when a
+  part's on-die ECC is off).
 - An SD card: the SDIO hosts answer as empty slots.
 - The EQoS features the drivers leave off: checksum offload, TSO,
   timestamps, more queues.
