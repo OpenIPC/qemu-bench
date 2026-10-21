@@ -56,6 +56,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
 | SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR, or a W25N SPI NAND) |
 | SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio`, an SD card from `-drive if=sd,index=0` / `1` |
+| I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF03A0000` | 41 / 42 / 60 | `nvt-i2c` (`/dev/i2c-0..2`); `sensor=` puts a sensor on the first |
 | USB 2.0 (FOTG200) | `0xF0600000`, alias `0xFF600000` | 27 | `nvt-usb`, host side; devices from `-device usb-*` |
 | OTP / eFuse | `0xF0660000` | | `nvt-otp`, blank |
 | On-chip SRAM | `0xF07C0000` | | — |
@@ -311,6 +312,40 @@ What runs:
 - The vendor `FW98566A.bin` Linux finds the card and its hotplug mounts
   the partition.
 
+## I2C and the image sensor
+
+`nvt-i2c` is the controller `i2c-nvt.c` drives, three instances
+(`/dev/i2c-0..2`, the device tree's `id`). The node names (`i2c@`,
+`i2c2@`, `i2c3@`) are the vendor's, because the driver gets its clock by
+device name (`f0350000.i2c2`). A message moves in PIO chunks of up to four
+bytes. DATA holds the bytes, and CONFIG gives the chunk's length [18:16]
+and, per byte i, START before it (bit 8+i), STOP after it (12+i) and the
+master's NACK (4+i). Writing CTRL with TB_EN starts the chunk. A byte
+with START is the address byte; it opens or restarts a transfer on the
+bus, and the bytes after it are sent or received as its R/W bit says. A
+chunk ends with STS.DT (sent), STS.DR (received, data in DATA from byte 1
+of the first chunk) or STS.BERR when nothing ACKs. The driver then sends a
+lone STOP. The bus always reads free. The DMA, VD-synchronised writes
+(`i2c_nvtim_xfer_msg_vd`) are not modelled.
+
+`-M nt98566,sensor=sc401ai` (or `sc501ai`) puts a SmartSens sensor at
+0x30 on I2C 0, the repo's `hisi-smartsens` model with that part's chip
+ID (0xCD2E or 0xCE1F at 0x3107/0x3108). That is where OpenIPC's `ipcinfo`
+looks on Novatek (`ssens_addrs` 0x60, 8-bit). The OpenIPC release
+carries drivers for exactly those parts (`nvt_sen_sc401ai.ko`, …). The
+default is `sensor=none`. With a sensor, the stock init behaves as on a
+camera: `load_novatek` gets `sc401ai` from `ipcinfo --short-sensor`,
+loads the HDAL stack and `nvt_sen_sc401ai.ko`, and majestic starts. Boot
+still reaches the login prompt. Nothing past the sensor's registers is
+modelled: no MIPI receiver or ISP, so no frames.
+
+`test-novatek-boot.sh` runs with `sensor=sc401ai` and checks three
+adapters, `i2cdetect` finding 0x30, and the release's own `ipcinfo`
+naming the part. `test-novatek.py` replays the driver's chunk sequences:
+the chip-ID read (address write, repeated START, read), writes and reads
+that span two chunks, a NACK and its STOP, and the `i2cdetect` quick
+write.
+
 ## USB
 
 The block at `0xF0600000` is a Faraday FOTG200 dual-role controller. Its
@@ -466,4 +501,7 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   timestamps, more queues.
 - The FOTG200's device (gadget) side, and OTP contents other than blank
   (no trims, keys or secure boot).
-- The Novatek timer, PWM, I2C, crypto, and the HDAL media blocks.
+- I2C's DMA (VD-synchronised) transfers, and sensors other than the two
+  SmartSens IDs, with nothing behind their registers (no MIPI, ISP or
+  frames).
+- The Novatek timer, PWM, crypto, and the HDAL media blocks.

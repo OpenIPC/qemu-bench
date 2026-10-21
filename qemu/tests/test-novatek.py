@@ -44,6 +44,12 @@ plays the vendor drivers (docs/novatek.md):
     usb-storage stick, the OTG register's [23:22] speed (high), the glue
     registers and PHY as storage, a port reset enabling the port; with no
     device, no connect and speed 0;
+  - nvt-i2c, the way i2c-nvt.c drives it, against an SC401AI on I2C 0
+    (sensor=sc401ai): the chip ID ipcinfo reads (a register-address write,
+    then a repeated-START read), a write and a read that each span two
+    four-byte chunks, the DT / DR / BERR status and SPI 41, a NACK from an
+    empty address followed by the driver's lone STOP, an i2cdetect-style
+    quick write, and the empty second and third controllers;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -798,6 +804,102 @@ def test_sdio(qt, card):
           sd_cmd(qt, 8, 0x1AA, base=SDIO2), SD_CMD_SENT | SD_RSP_TIMEOUT)
 
 
+# ---- nvt-i2c -----------------------------------------------------------------
+
+I2C0, I2C1, I2C2 = 0xF0220000, 0xF0350000, 0xF03A0000
+SPI_I2C0 = 41
+I2C_DT, I2C_DR, I2C_BERR = 1 << 4, 1 << 5, 1 << 6
+I2C_INTR_ALL = 0x1473                       # i2c_nvtim_init()
+
+
+def i2c_chunk(qt, n, data=None, start=False, stop=False, nack=False,
+              base=I2C0):
+    """nvtim_set_data / nvtim_set_rxconfig: one chunk of n bytes."""
+    cfg = n << 16
+    if start:
+        cfg |= 1 << 8
+    if stop:
+        cfg |= 1 << (12 + n - 1)
+    if nack:
+        cfg |= 1 << (4 + n - 1)
+    qt.writel(base + 0x04, 0xFFFFFFFF)              # clear status
+    qt.writel(base + 0x08, cfg)
+    if data is not None:
+        qt.writel(base + 0x10, data)
+    qt.writel(base + 0x00, qt.readl(base + 0x00) | (1 << 3))
+    return qt.readl(base + 0x04)
+
+
+def i2c_write(qt, addr, payload, stop=True):
+    """i2c_nvtim_xfer_msg() for a write: the address, then four-byte
+    chunks; returns the last chunk's status."""
+    stream = bytes([addr << 1]) + bytes(payload)
+    for i in range(0, len(stream), 4):
+        part = stream[i:i + 4]
+        last = i + 4 >= len(stream)
+        sts = i2c_chunk(qt, len(part), int.from_bytes(part, 'little'),
+                        start=(i == 0), stop=last and stop)
+        if sts & I2C_BERR:
+            return sts
+    return sts
+
+
+def i2c_read(qt, addr, length):
+    """The read side: the first chunk carries the address byte."""
+    out = b''
+    remain = length + 1
+    first = True
+    while remain:
+        n = min(remain, 4)
+        remain -= n
+        sts = i2c_chunk(qt, n, (addr << 1 | 1) if first else None,
+                        start=first, stop=not remain, nack=not remain)
+        if sts & I2C_BERR:
+            return sts, None
+        data = qt.readl(I2C0 + 0x10).to_bytes(4, 'little')
+        out += data[1 if first else 0:n]
+        first = False
+    return sts, out
+
+
+def test_i2c(qt):
+    print('nvt-i2c (sensor=sc401ai)')
+    gic_enable(qt, SPI_I2C0)
+    qt.writel(I2C0 + 0x00, 2)                       # I2C_CTRL_REG_DEFAULT
+    check('idle: BUSFREE set, BUSBUSY clear',
+          qt.readl(I2C0 + 0x04) & ((1 << 28) | (1 << 3)), 1 << 28)
+    qt.writel(I2C0 + 0x00, I2C_INTR_ALL)
+    sts = i2c_write(qt, 0x30, [0x31, 0x07], stop=False)
+    check('register address 0x3107: DT', sts & (I2C_DT | I2C_DR | I2C_BERR),
+          I2C_DT)
+    check('and SPI 41', gic_pending(qt, SPI_I2C0), True)
+    sts, data = i2c_read(qt, 0x30, 2)
+    check('repeated START, read two: DR', sts & (I2C_DR | I2C_BERR), I2C_DR)
+    check('chip ID 0xCD2E, what ipcinfo calls SC401AI', data, b'\xcd\x2e')
+
+    i2c_write(qt, 0x30, [0x30, 0x00, 0x11, 0x22, 0x33, 0x44])
+    i2c_write(qt, 0x30, [0x30, 0x00], stop=False)
+    sts, data = i2c_read(qt, 0x30, 4)
+    check('six bytes written and four read, two chunks each', data,
+          b'\x11\x22\x33\x44')
+
+    sts = i2c_write(qt, 0x31, [0x00])
+    check('an empty address NACKs: BERR', sts & I2C_BERR, I2C_BERR)
+    # i2c_nvtim_handle_nack(): a lone STOP
+    sts = i2c_chunk(qt, 1, stop=True)
+    check('the STOP after it completes cleanly', sts & I2C_BERR, 0)
+    # i2cdetect's quick write: address, a 0 byte, STOP after it
+    sts = i2c_chunk(qt, 2, 0x30 << 1, start=True, stop=True)
+    check('i2cdetect quick write finds 0x30', sts & (I2C_DT | I2C_BERR),
+          I2C_DT)
+    qt.writel(I2C0 + 0x04, 0xFFFFFFFF)
+    check('status write-back drops SPI 41', gic_pending(qt, SPI_I2C0), False)
+
+    for base, name in ((I2C1, 'I2C 1'), (I2C2, 'I2C 2')):
+        sts = i2c_chunk(qt, 1, 0x30 << 1, start=True, stop=True, base=base)
+        check('%s is empty' % name, sts & I2C_BERR, I2C_BERR)
+
+
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
 
 USB = 0xF0600000
@@ -1267,6 +1369,9 @@ def test_fdt(qemu, tmp):
     check('chip-ID node for nvt_get_chip_id()', b'nvt,nvt_top' in data, True)
     check('the USB host and OTP nodes ehci-na51089.c needs',
           b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
+    check('three I2C nodes under the names i2c-nvt.c clocks by',
+          find_nodes(data, ['i2c@f0220000', 'i2c2@f0350000',
+                            'i2c3@f03a0000']).count(-1), 0)
     check('the NOR under spinor.c', b'nvt,nvt_spinor\0' in data and
           b'spi_nor.0\0' in data, True)
 
@@ -1295,8 +1400,8 @@ def hmp(qemu, args, cmds):
 
 def test_migration(qemu, tmp):
     print('migration')
-    for m in ('nt98562', 'nt98566'):
-        mig = os.path.join(tmp, m + '.mig')
+    for m in ('nt98562', 'nt98566', 'nt98566,sensor=sc401ai'):
+        mig = os.path.join(tmp, m.replace(',', '_') + '.mig')
         out = hmp(qemu, ['-M', m, '-S'],
                   ['migrate file:' + mig, 'info migrate'])
         check('%s: state saved' % m, 'completed' in out and
@@ -1385,6 +1490,12 @@ def run(args, tmp):
                ['-drive', 'if=sd,index=0,format=raw,file=' + card])
     try:
         test_sdio(qt, card)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566,sensor=sc401ai')
+    try:
+        test_i2c(qt)
     finally:
         qt.close()
 

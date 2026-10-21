@@ -34,6 +34,7 @@
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
@@ -133,12 +134,28 @@ static const Property hisi_smartsens_props[] = {
     DEFINE_PROP_UINT8("disc",    HisiSmartSensState, disc,    0x00),
 };
 
+/* What the guest programmed: the register file and the address pointer. */
+static const VMStateDescription vmstate_hisi_smartsens = {
+    .name = TYPE_HISI_SMARTSENS,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, HisiSmartSensState),
+        VMSTATE_UINT8_ARRAY(reg_buf, HisiSmartSensState, 2),
+        VMSTATE_UINT8(reg_ptr, HisiSmartSensState),
+        VMSTATE_UINT16(cur_reg, HisiSmartSensState),
+        VMSTATE_UINT8_ARRAY(regs, HisiSmartSensState, SS_REG_COUNT),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void hisi_smartsens_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, hisi_smartsens_reset);
+    dc->vmsd = &vmstate_hisi_smartsens;
     device_class_set_props(dc, hisi_smartsens_props);
     k->event = hisi_smartsens_event;
     k->recv  = hisi_smartsens_recv;
