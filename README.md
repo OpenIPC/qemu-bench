@@ -252,7 +252,10 @@ vendor EHCI driver; no shipped kernel enables it, so
 too, which nothing shipped builds either). The three I2C
 controllers work under the vendor driver, and `sensor=sc401ai` (or
 `sc501ai`) puts a SmartSens chip on I2C 0, which OpenIPC's `ipcinfo` and
-`load_novatek` detect and load the driver for. The Novatek timer block
+`load_novatek` detect and load the driver for. The crypto engines
+(AES/DES/3DES with GCM, SHA/HMAC, RSA) pass the kernel's self-tests under
+the vendor drivers in that test kernel, and the vendor U-Boot's
+`nvt_encrypt` runs on them. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
 U-Boot's boot-time stamps and the HDAL read it. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
@@ -396,6 +399,9 @@ qemu/
 ├── hw/misc/nvt-cg.c             # Clock generator: PLL ratios, gates, resets
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
 ├── hw/misc/nvt-otp.c            # OTP / eFuse controller, blank array
+├── hw/misc/nvt-crypto.c         # Crypto engine: AES/DES/3DES, ECB..CTR, GCM, descriptor DMA
+├── hw/misc/nvt-hash.c           # Hash engine: SHA-1/256 and HMAC, chunked DMA
+├── hw/misc/nvt-rsa.c            # RSA engine: modular exponentiation to 2048 bits
 ├── hw/misc/nvt-pwm.c            # PWM: enable/disable, cycle-count runs, stop interrupts
 ├── hw/timer/nvt-timer.c         # Novatek timers: one-shot / free run, timer 0 at 1 MHz
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
@@ -428,9 +434,10 @@ qemu-boot/
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
-├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM, for the USB and PWM tests
+├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM/crypto, for the tests below
 ├── test-novatek-usb.sh          # NT9856x USB stick under the vendor EHCI driver
 ├── test-novatek-pwm.sh          # NT9856x PWM through /sys/class/pwm (pwm-na51055.c)
+├── test-novatek-crypto.sh       # NT9856x crypto engines: testmgr self-tests of the vendor drivers
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern

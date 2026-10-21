@@ -1,11 +1,12 @@
 #!/bin/bash
 # Build the OpenIPC nt9856x kernel with the drivers it leaves out, for
-# exercising the emulated USB controller (nvt-usb) and PWM (nvt-pwm) with
-# the vendor's own drivers.
+# exercising the emulated USB controller (nvt-usb), PWM (nvt-pwm) and
+# crypto engines (nvt-crypto, nvt-hash, nvt-rsa) with the vendor's own
+# drivers.
 #
 # Neither the OpenIPC release nor the vendor SDK firmware for NT9856x
-# builds a USB host controller driver or a PWM driver (CONFIG_PWM is off
-# in both), so nothing shipped can test them.
+# builds a USB host controller driver, a PWM driver (CONFIG_PWM is off
+# in both) or the crypto drivers, so nothing shipped can test them.
 # This builds what OpenIPC builds -- openipc/linux branch novatek-nt9856x,
 # OpenIPC's nt98566.generic.config, its toolchain, in-tree like Buildroot
 # does (the OTP driver links a shipped object that an out-of-tree build
@@ -14,12 +15,16 @@
 #   CONFIG_USB_EHCI_HCD=y      with it USB_EHCI_HCD_NVTIVOT: ehci-na51089.c
 #   CONFIG_USB_STORAGE=y, CONFIG_SCSI=y, CONFIG_BLK_DEV_SD=y
 #   CONFIG_PWM=y, CONFIG_PWM_NA51055=y, CONFIG_PWM_SYSFS=y: pwm-na51055.c
+#   CONFIG_CRYPTO_DEV_NVT_IVOT_NA51089_{CRYPTO,HASH,RSA}=y: na51089_*.c,
+#   with the crypto self-tests on (CRYPTO_MANAGER_DISABLE_TESTS off), so
+#   each algorithm they register is checked against the kernel's vectors,
+#   and GCM, CCM and DES built in for the tests' reference
 #
 #   bash qemu-boot/build-novatek-test-kernel.sh [--out DIR] [--ref REF]
 #       [--cross PREFIX]     (default: download OpenIPC's toolchain)
 #
-# The result is DIR/uImage.nt9856x-test, for qemu-boot/test-novatek-usb.sh
-# and qemu-boot/test-novatek-pwm.sh.
+# The result is DIR/uImage.nt9856x-test, for qemu-boot/test-novatek-usb.sh,
+# qemu-boot/test-novatek-pwm.sh and qemu-boot/test-novatek-crypto.sh.
 # Downloads about 300 MB and needs about 2 GB of disk in DIR.
 set -euo pipefail
 
@@ -78,11 +83,19 @@ CONFIG_USB_ANNOUNCE_NEW_DEVICES=y
 CONFIG_PWM=y
 CONFIG_PWM_NA51055=y
 CONFIG_PWM_SYSFS=y
+CONFIG_CRYPTO_DEV_NVT_IVOT_NA51089_CRYPTO=y
+CONFIG_CRYPTO_DEV_NVT_IVOT_NA51089_HASH=y
+CONFIG_CRYPTO_DEV_NVT_IVOT_NA51089_RSA=y
+# CONFIG_CRYPTO_MANAGER_DISABLE_TESTS is not set
+CONFIG_CRYPTO_GCM=y
+CONFIG_CRYPTO_CCM=y
+CONFIG_CRYPTO_DES=y
 EOF
 
 make -C linux ARCH=arm CROSS_COMPILE="$CROSS" olddefconfig >/dev/null
 for sym in USB_EHCI_HCD USB_EHCI_HCD_NVTIVOT USB_STORAGE BLK_DEV_SD \
-           PWM PWM_NA51055 PWM_SYSFS; do
+           PWM PWM_NA51055 PWM_SYSFS CRYPTO_DEV_NVT_IVOT_NA51089_CRYPTO \
+           CRYPTO_DEV_NVT_IVOT_NA51089_HASH CRYPTO_DEV_NVT_IVOT_NA51089_RSA; do
     grep -q "^CONFIG_$sym=y" linux/.config ||
         { echo "CONFIG_$sym did not stick" >&2; exit 1; }
 done

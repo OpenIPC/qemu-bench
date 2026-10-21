@@ -64,6 +64,16 @@ plays the vendor drivers (docs/novatek.md):
     drift, a switch to one shot mid-period, RELOAD,
     a disabled timer holding its count, STS without INT raising nothing,
     and a machine reset restoring timer 0;
+  - nvt-crypto, the way na51089_crypto.c and U-Boot drive it: a PIO
+    AES block (FIPS-197), and by descriptor DMA AES-CBC and CTR
+    (SP 800-38A; CV written back, a partial last block), GCM (the McGrew
+    and Viega cases; the tag from S0 and GHASH), DES and 3DES, the OTP
+    key manager's (blank, zero) key and "get S0", with SPI 38;
+  - nvt-hash: SHA-1 / SHA-256 padded by the engine, a message in two
+    chunks chained through the IV registers, HMAC-SHA-1 / -256 (RFC 2202,
+    4231), SPI 28;
+  - nvt-rsa: 256, 512 and 2048-bit modular exponentiation through the
+    SRAM ports, against Python's pow(), SPI 20;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -91,6 +101,7 @@ plays the vendor drivers (docs/novatek.md):
     python3 qemu/tests/test-novatek.py [--qemu PATH]
 """
 import argparse
+import hashlib
 import os
 import random
 import re
@@ -1110,6 +1121,206 @@ def test_timer(qt):
           (qt.readl(tmr(0, 0)), qt.readl(tmr(9, 0))), (3, 0))
 
 
+# ---- nvt-crypto, nvt-hash, nvt-rsa -------------------------------------------
+
+CRYPTO = 0xF0620000
+HASH = 0xF0670000
+RSA = 0xF06A0000
+SPI_CRYPTO, SPI_HASH, SPI_RSA = 38, 28, 20
+DESC, SRC, DST = 0x01000000, 0x01001000, 0x01002000
+
+
+def crypto_dma(qt, cipher, op, data, key, iv=b'', decrypt=False, aad=None,
+               get_s0=False, step=True, keymgr=False):
+    """One na51089_crypto_start() request; returns the output, CV, S0
+    and GHASH."""
+    hdr = (int(decrypt) | cipher << 4 | op << 8 | int(keymgr) << 12 |
+           int(get_s0) << 16)
+    desc = bytearray(0x80 + 32 * 16)
+    desc[0:len(key)] = key
+    desc[0x20:0x20 + len(iv)] = iv
+    if op == 4 and step:                    # CTR: counter step 1
+        struct.pack_into('<I', desc, 0x3C if cipher >= 2 else 0x34, 1)
+    struct.pack_into('<I', desc, 0x40, hdr)
+    blk = 0
+    if op == 5:                             # GCM: the AAD group first
+        a = aad or b''
+        qt.write(SRC + 0x800, a or b'\0')
+        struct.pack_into('<IIII', desc, 0x80, SRC + 0x800, 0, len(a), 1)
+        blk = 1
+    qt.write(SRC, data)
+    struct.pack_into('<IIII', desc, 0x80 + 16 * blk, SRC, DST, len(data), 1)
+    qt.write(DESC, bytes(desc))
+    qt.writel(CRYPTO + 0x00, 0x2)
+    qt.writel(CRYPTO + 0x08, 0x10)
+    qt.writel(CRYPTO + 0x0C, 0x10)
+    qt.writel(CRYPTO + 0x50, DESC)
+    qt.writel(CRYPTO + 0x04, 0x10)
+    out = qt.read(DST, len(data))
+    return (out, qt.read(DESC + 0x50, 16), qt.read(DESC + 0x60, 16),
+            qt.read(DESC + 0x70, 16))
+
+
+def test_crypto(qt):
+    print('nvt-crypto')
+    gic_enable(qt, SPI_CRYPTO)
+    # PIO: FIPS-197 C.1, AES-128 of 00112233..ff
+    key = bytes(range(16))
+    pt = bytes.fromhex('00112233445566778899aabbccddeeff')
+    for i in range(4):
+        qt.writel(CRYPTO + 0x10 + 4 * i, struct.unpack_from('<I', key, 4 * i)[0])
+        qt.writel(CRYPTO + 0x30 + 4 * i, struct.unpack_from('<I', pt, 4 * i)[0])
+    qt.writel(CRYPTO + 0x00, 0x2 | 2 << 4)
+    qt.writel(CRYPTO + 0x04, 1)
+    out = b''.join(struct.pack('<I', qt.readl(CRYPTO + 0x40 + 4 * i))
+                   for i in range(4))
+    check('PIO AES-128 (FIPS-197 C.1)', out.hex(),
+          '69c4e0d86a7b0430d8cdb78070b4c55a')
+    check('PIO done in INT_STS bit 0, CTRL idle',
+          (qt.readl(CRYPTO + 0x0C) & 1, qt.readl(CRYPTO + 0x04) & 1), (1, 0))
+    qt.writel(CRYPTO + 0x0C, 1)
+
+    k = bytes.fromhex('2b7e151628aed2a6abf7158809cf4f3c')
+    p = bytes.fromhex('6bc1bee22e409f96e93d7e117393172a'
+                      'ae2d8a571e03ac9c9eb76fac45af8e51')
+    out, cv, _, _ = crypto_dma(qt, 2, 1, p, k, bytes(range(16)))
+    check('DMA AES-128-CBC (SP 800-38A F.2.1)', out.hex(),
+          '7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2')
+    check('CV: the last cipher block, the next request\'s IV', cv, out[16:])
+    check('DMA channel 0 done: INT_STS bit 4 and SPI 38',
+          (qt.readl(CRYPTO + 0x0C) & 0x10, gic_pending(qt, SPI_CRYPTO)),
+          (0x10, True))
+    qt.writel(CRYPTO + 0x0C, 0x10)
+    check('the write-back drops SPI 38', gic_pending(qt, SPI_CRYPTO), False)
+    back, _, _, _ = crypto_dma(qt, 2, 1, out, k, bytes(range(16)), True)
+    check('and decrypted back', back, p)
+
+    ctr = bytes.fromhex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff')
+    out, cv, _, _ = crypto_dma(qt, 2, 4, p[:16] + p[16:21], k, ctr)
+    check('AES-128-CTR (F.5.1), 21 bytes: a partial last block',
+          out.hex(), '874d6191b620e3261bef6864990db6ce9806f66b79')
+    check('CV: the counter after both blocks, carried across bytes',
+          cv.hex(), 'f0f1f2f3f4f5f6f7f8f9fafbfcfdff01')
+
+    # GCM test case 2 (McGrew & Viega): K, IV, P all zero
+    out, _, s0, gh = crypto_dma(qt, 2, 5, bytes(16), bytes(16), bytes(12))
+    check('AES-GCM: the ciphertext', out.hex(),
+          '0388dace60b6a392f328c2b971b2fe78')
+    check('tag = S0 ^ GHASH, as the driver forms it',
+          bytes(a ^ b for a, b in zip(s0, gh)).hex(),
+          'ab6e47d42cec13bdf53a67b21257bddf')
+    # test case 4: a partial last block and associated data
+    k4 = bytes.fromhex('feffe9928665731c6d6a8f9467308308')
+    iv4 = bytes.fromhex('cafebabefacedbaddecaf888')
+    p4 = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da'
+                       '2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525'
+                       'b16aedf5aa0de657ba637b39')
+    a4 = bytes.fromhex('feedfacedeadbeeffeedfacedeadbeefabaddad2')
+    out, _, s0, gh = crypto_dma(qt, 2, 5, p4, k4, iv4, aad=a4)
+    check('AES-GCM test case 4: 60 bytes, 20 of AAD',
+          (out[:8].hex(), bytes(a ^ b for a, b in zip(s0, gh)).hex()),
+          ('42831ec2217774244b7221b784d0d49c'[:16],
+           '5bc94fbc3221a5db94fae95ae7121a47'))
+    back, _, s0, gh = crypto_dma(qt, 2, 5, out, k4, iv4, True, aad=a4)
+    check('decrypting it: the plaintext and the same tag (GHASH over the input)',
+          (back == p4, bytes(a ^ b for a, b in zip(s0, gh)).hex()),
+          (True, '5bc94fbc3221a5db94fae95ae7121a47'))
+
+    out, _, _, _ = crypto_dma(qt, 0, 0, bytes.fromhex('0123456789abcdef'),
+                              bytes.fromhex('133457799bbcdff1'))
+    check('DES-ECB (the textbook example)', out.hex(), '85e813540f0ab405')
+    k3 = bytes.fromhex('0123456789abcdef23456789abcdef01456789abcdef0123')
+    out, _, _, _ = crypto_dma(qt, 1, 0, b'The quic', k3)
+    # openssl enc -des-ede3 -K <k3> -nopad
+    check('3DES-EDE-ECB, three keys', out.hex(), '1ccf23869d09333e')
+    # The key from the OTP key manager, not the descriptor: blank, so zero
+    out, _, s0, _ = crypto_dma(qt, 2, 4, bytes(16), b'\x55' * 16, bytes(16),
+                               get_s0=True, keymgr=True)
+    check('key manager key (zero); "get S0": S0 = E(K, IV), the text '
+          'from the next counter',
+          (s0.hex(), out.hex()),
+          ('66e94bd4ef8a2c3b884cfa59ca342b2e',
+           '58e2fccefa7e3061367f1d57a4e7455a'))
+
+
+def hash_run(qt, mode, data, cfg_extra, padlen=None, key=None):
+    if key is not None:
+        k = key.ljust(64, b'\0')
+        for i in range(16):
+            qt.writel(HASH + 0x10 + 4 * i, struct.unpack_from('<I', k, 4 * i)[0])
+    qt.write(SRC, data or b'\0')
+    qt.writel(HASH + 0x04, len(data) if padlen is None else padlen)
+    qt.writel(HASH + 0x94, SRC)
+    qt.writel(HASH + 0x9C, len(data))
+    qt.writel(HASH + 0x0C, 1)
+    qt.writel(HASH + 0x08, 1)
+    qt.writel(HASH + 0x00, 0x2 | mode << 4 | 1 << 12 | cfg_extra)
+    return b''.join(struct.pack('<I', qt.readl(HASH + 0x70 + 4 * i))
+                    for i in range(8))
+
+
+def test_hash(qt):
+    print('nvt-hash')
+    gic_enable(qt, SPI_HASH)
+    d = hash_run(qt, 1, b'abc', 1 << 13)
+    check('SHA-256("abc"), padded by the engine', d.hex(),
+          'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+    check('done: INT_STS bit 0 and SPI 28',
+          (qt.readl(HASH + 0x0C) & 1, gic_pending(qt, SPI_HASH)), (1, True))
+    qt.writel(HASH + 0x0C, 1)
+    d = hash_run(qt, 0, b'abc', 1 << 13)
+    check('SHA-1("abc")', d[:20].hex(),
+          'a9993e364706816aba3e25717850c26c9cd0d89d')
+    # two chunks: a whole block, then the rest from the IV registers
+    msg = b'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq' * 2
+    mid = hash_run(qt, 1, msg[:64], 0)
+    for i in range(8):
+        qt.writel(HASH + 0x50 + 4 * i, struct.unpack_from('<I', mid, 4 * i)[0])
+    d = hash_run(qt, 1, msg[64:], 1 << 8 | 1 << 13, padlen=len(msg))
+    check('SHA-256 in two chunks, chained through the IV registers', d.hex(),
+          hashlib.sha256(msg).hexdigest())
+    d = hash_run(qt, 2, b'Hi There', 1 << 13 | 1 << 21 | 1 << 22,
+                 key=b'\x0b' * 20)
+    check('HMAC-SHA-1 (RFC 2202 case 1): ipad and opad by the engine',
+          d[:20].hex(), 'b617318655057264e28bc0b6fb378c8ef146be00')
+    d = hash_run(qt, 3, b'what do ya want for nothing?',
+                 1 << 13 | 1 << 21 | 1 << 22, key=b'Jefe')
+    check('HMAC-SHA-256 (RFC 4231 case 2)', d.hex(),
+          '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
+
+
+def rsa_load(qt, port, value, words):
+    qt.writel(RSA + port + 4, 0)
+    for i in range(words):
+        qt.writel(RSA + port, (value >> (32 * i)) & 0xFFFFFFFF)
+
+
+def test_rsa(qt):
+    print('nvt-rsa')
+    gic_enable(qt, SPI_RSA)
+    rng = random.Random(5)
+    for width, bits in ((0, 256), (1, 512), (3, 2048)):
+        n = rng.getrandbits(bits) | 1 << (bits - 1) | 1
+        e = 65537 if bits < 2048 else rng.getrandbits(bits) % n
+        m = rng.getrandbits(bits) % n
+        words = 64                                  # what the driver writes
+        rsa_load(qt, 0x20, m, words)
+        rsa_load(qt, 0x10, n, words)
+        rsa_load(qt, 0x18, e, words)
+        qt.writel(RSA + 0x00, width << 1)
+        qt.writel(RSA + 0x0C, 1)
+        qt.writel(RSA + 0x08, 1)
+        qt.writel(RSA + 0x04, 1)
+        qt.writel(RSA + 0x24, 0)
+        got = sum(qt.readl(RSA + 0x20) << (32 * i) for i in range(bits // 32))
+        check('%d-bit m^e mod n through the SRAM ports' % bits, got == pow(m, e, n),
+              True)
+    check('done: INT_STS bit 0 and SPI 20',
+          (qt.readl(RSA + 0x0C) & 1, gic_pending(qt, SPI_RSA)), (1, True))
+    qt.writel(RSA + 0x0C, 1)
+    check('the write-back drops SPI 20', gic_pending(qt, SPI_RSA), False)
+
+
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
 
 USB = 0xF0600000
@@ -1580,6 +1791,11 @@ def test_fdt(qemu, tmp):
     check('the USB host and OTP nodes ehci-na51089.c needs',
           b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
     check('the PWM node pwm-na51055.c binds', b'nvt,nvt_pwm\0' in data, True)
+    check('the crypto, hash and RSA nodes the na51089 drivers bind',
+          find_nodes(data, ['crypto@f0620000', 'hash@f0670000',
+                            'rsa@f06a0000']).count(-1) == 0 and
+          all(b'nvt,nvt_%s\0' % n in data for n in (b'crypto', b'hash', b'rsa')),
+          True)
     check('the timer node kdrv_comm.ko binds: timer@f0040000, nvt,nvt_timer',
           find_nodes(data, ['timer@f0040000'])[0] > 0 and
           b'nvt,nvt_timer\0' in data, True)
@@ -1734,6 +1950,14 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98562')
     try:
         test_timer(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_crypto(qt)
+        test_hash(qt)
+        test_rsa(qt)
     finally:
         qt.close()
 

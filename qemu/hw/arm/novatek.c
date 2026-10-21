@@ -68,6 +68,18 @@
 
 #define NVT_NUM_IRQ         256     /* irqs.h: SPIs 32..255 */
 
+/* The security blocks: cipher, hash, RSA (nvt-peri.dtsi). */
+static const struct {
+    const char *type;
+    const char *node;
+    hwaddr base;
+    int irq;
+} nvt_crypto_blocks[] = {
+    { "nvt-crypto", "crypto", 0xF0620000, 38 },
+    { "nvt-hash",   "hash",   0xF0670000, 28 },
+    { "nvt-rsa",    "rsa",    0xF06A0000, 20 },
+};
+
 static const struct {
     hwaddr base;
     int irq;
@@ -439,6 +451,25 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         g_free(upath);
     }
 
+    /*
+     * The drivers bind these, and take "mclk" (1: 320 MHz) for the clock
+     * they parent the block on.
+     */
+    for (n = 0; n < ARRAY_SIZE(nvt_crypto_blocks); n++) {
+        g_autofree char *cpath = g_strdup_printf("/%s@%" HWADDR_PRIx,
+                                                 nvt_crypto_blocks[n].node,
+                                                 nvt_crypto_blocks[n].base);
+        g_autofree char *compat = g_strdup_printf("nvt,nvt_%s",
+                                                  nvt_crypto_blocks[n].node);
+
+        qemu_fdt_add_subnode(fdt, cpath);
+        qemu_fdt_setprop_string(fdt, cpath, "compatible", compat);
+        qemu_fdt_setprop_cells(fdt, cpath, "reg", nvt_crypto_blocks[n].base,
+                               0x100);
+        nvt_fdt_irq(fdt, cpath, nvt_crypto_blocks[n].irq);
+        qemu_fdt_setprop_cell(fdt, cpath, "mclk", 1);
+    }
+
     /* The OTP / eFuse block: drivers (the USB PHY trim among them) call
      * efuse_readParamOps(), which needs this driver bound. */
     qemu_fdt_add_subnode(fdt, "/nvt_otp@f0660000");
@@ -764,6 +795,11 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
 
     sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
     sysbus_create_simple("nvt-timer", NVT_TIMER_BASE, pic[NVT_IRQ_TIMER]);
+    for (n = 0; n < ARRAY_SIZE(nvt_crypto_blocks); n++) {
+        sysbus_create_simple(nvt_crypto_blocks[n].type,
+                             nvt_crypto_blocks[n].base,
+                             pic[nvt_crypto_blocks[n].irq]);
+    }
 
     /* Named, so qtest and a board can watch its "out" lines. */
     dev = qdev_new("nvt-pwm");
