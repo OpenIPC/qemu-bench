@@ -50,6 +50,7 @@
 #define NVT_ETH_BASE        0xF02B0000
 #define NVT_USB_BASE        0xF0600000
 #define NVT_OTP_BASE        0xF0660000
+#define NVT_PWM_BASE        0xF0210000
 #define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */
 #define NVT_MPCORE_BASE     0xFFD00000
 #define NVT_L2_BASE         0xFFE00000
@@ -57,6 +58,7 @@
 /* GIC SPI numbers (nvt-peri.dtsi) */
 #define NVT_IRQ_GPIO        24
 #define NVT_IRQ_USB         27
+#define NVT_IRQ_PWM         26
 #define NVT_IRQ_FLASH       29
 #define NVT_IRQ_ETH         34
 #define NVT_IRQ_RTC         56
@@ -402,6 +404,14 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         g_free(upath);
     }
 
+    /* Bound by the HDAL's kdrv_comm.ko (/proc/pwm) on the OpenIPC
+     * release, or the kernel's pwm-na51055.c where it is built. */
+    qemu_fdt_add_subnode(fdt, "/pwm@f0210000");
+    qemu_fdt_setprop_string(fdt, "/pwm@f0210000", "compatible",
+                            "nvt,nvt_pwm");
+    qemu_fdt_setprop_cells(fdt, "/pwm@f0210000", "reg", NVT_PWM_BASE, 0x2000);
+    nvt_fdt_irq(fdt, "/pwm@f0210000", NVT_IRQ_PWM);
+
     for (n = ARRAY_SIZE(nvt_i2c) - 1; n >= 0; n--) {
         upath = g_strdup_printf("/%s@%" HWADDR_PRIx, nvt_i2c[n].node,
                                 nvt_i2c[n].base);
@@ -740,6 +750,13 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0, pic[NVT_IRQ_GPIO]);
 
     sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
+
+    /* Named, so qtest and a board can watch its "out" lines. */
+    dev = qdev_new("nvt-pwm");
+    object_property_add_child(OBJECT(machine), "nvt-pwm", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NVT_PWM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_PWM]);
 
     for (n = 0; n < ARRAY_SIZE(nvt_i2c); n++) {
         dev = sysbus_create_simple("nvt-i2c", nvt_i2c[n].base,

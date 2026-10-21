@@ -1,6 +1,6 @@
 #!/bin/bash
 # USB on emulated NT9856x: a kernel with the vendor EHCI driver
-# (qemu-boot/build-novatek-usb-kernel.sh) boots to a PID-1 script with a
+# (qemu-boot/build-novatek-test-kernel.sh) boots to a PID-1 script with a
 # QEMU usb-storage stick on the FOTG200 host port, and checks that:
 #
 #   - ehci-na51089.c ("ehci-nvtivot") binds, at 0xFF600000 where it looks
@@ -16,7 +16,7 @@
 # The busybox comes from the OpenIPC release rootfs, as in
 # test-novatek-boot.sh.
 #
-#   bash qemu-boot/test-novatek-usb.sh --kernel uImage.nt9856x-usb \
+#   bash qemu-boot/test-novatek-usb.sh --kernel uImage.nt9856x-test \
 #       [--soc nt98566] [--machine nt98566] [--dir qemu-boot] \
 #       [--qemu ./qemu-src/build/qemu-system-arm]
 set -euo pipefail
@@ -40,7 +40,7 @@ MACHINE=${MACHINE:-$SOC}
 ROOTFS=$DIR/rootfs.squashfs.$SOC
 if [ ! -f "$KERNEL" ]; then
     echo "need --kernel: a kernel with USB host support" \
-         "(qemu-boot/build-novatek-usb-kernel.sh)" >&2
+         "(qemu-boot/build-novatek-test-kernel.sh)" >&2
     exit 2
 fi
 if [ ! -f "$ROOTFS" ]; then

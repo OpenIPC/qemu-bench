@@ -56,6 +56,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | Ethernet (DWC EQoS) + PHY | `0xF02B0000`, `0xF02B3800` | 34 | `nvt-eqos` |
 | SPI NOR / NAND controller | `0xF0400000` | 29 | `nvt-flash` (NOR, or a W25N SPI NAND) |
 | SDIO 1 / 2 | `0xF0420000` / `0xF0500000` | 30 / 31 | `nvt-sdio`, an SD card from `-drive if=sd,index=0` / `1` |
+| PWM | `0xF0210000` | 26 | `nvt-pwm` |
 | I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF03A0000` | 41 / 42 / 60 | `nvt-i2c` (`/dev/i2c-0..2`); `sensor=` puts a sensor on the first |
 | USB 2.0 (FOTG200) | `0xF0600000`, alias `0xFF600000` | 27 | `nvt-usb`, host side; devices from `-device usb-*` |
 | OTP / eFuse | `0xF0660000` | | `nvt-otp`, blank |
@@ -346,6 +347,48 @@ the chip-ID read (address write, repeated START, read), writes and reads
 that span two chunks, a NACK and its STOP, and the `i2cdetect` quick
 write.
 
+## PWM
+
+`nvt-pwm` is the controller at `0xF0210000`, laid out as the kernel's
+`pwm-na51055.c` and the HDAL's `pwm_reg.h` describe it:
+
+- **Per channel:** CTRL (+8n, a cycle count in [15:0]) and PERIOD (+8n+4:
+  rise, fall and base period, one byte each, and invert in bit 28). For
+  channels 0–7 the high bytes of rise, fall and base period are at
+  0x230+4n.
+- **ENABLE (0x100):** writing a 1 starts a channel, and the register reads
+  back the running set. The driver polls it.
+- **DISABLE (0x104):** stops the channel and raises its bit in INT_STS
+  (0xF0) and SPI 26. `nvt_pwm_disable()` waits for that interrupt.
+- **Cycle count:** with one set, the channel stops by itself after that
+  many periods, with the same interrupt. Enable waits for it, and the
+  model times it at a nominal 30 MHz (the 120 MHz source over the
+  drivers' default divider of 4).
+- **CLKDIV_LOAD (0x10C)** sets CLKDIV_LOAD_STS (0xFC).
+
+There is no output pin, but each channel drives the device's `out` GPIO
+line n: high while it runs with a nonzero duty.
+
+Nothing shipped for these SoCs drives the PWM. The OpenIPC and SDK
+kernels have `CONFIG_PWM` off. The HDAL's `kdrv_comm.ko` carries a PWM
+driver, but it binds only `nvt,nvt_kdrv_pwm` and refuses `nvt,nvt_pwm`,
+which is what the vendor device trees (and this machine's) have. So the
+test kernel from `build-novatek-test-kernel.sh` (see USB) also builds
+`pwm-na51055.c` with sysfs. `qemu-boot/test-novatek-pwm.sh --kernel
+testk/uImage.nt9856x-test` drives channel 0 through `/sys/class/pwm`
+and checks the registers with `devmem`:
+
+- a 1 ms period at 50 % gives base period 30000 and fall 15000
+  (PERIOD 0x00309800, extension 0x00753A00);
+- enable sets ENABLE, and disable returns on the stop interrupt and clears
+  it;
+- the vendor `cycle` attribute runs 20 periods, after which enable
+  returns with the channel stopped.
+
+All 7 checks pass. `test-novatek.py` checks the same in CI at register
+level, along with the `out` line, the 20 ms cycle-count timing and the
+divider-load status.
+
 ## USB
 
 The block at `0xF0600000` is a Faraday FOTG200 dual-role controller. Its
@@ -378,7 +421,7 @@ is not modelled.
 
 No shipped firmware for these SoCs has a USB host driver. The OpenIPC
 kernels are built without `CONFIG_USB_EHCI_HCD`, and the SDK's kernel and
-U-Boot leave USB off. `qemu-boot/build-novatek-usb-kernel.sh` builds the
+U-Boot leave USB off. `qemu-boot/build-novatek-test-kernel.sh` builds the
 same kernel OpenIPC builds, with EHCI and USB storage added, to test
 against:
 
@@ -390,8 +433,8 @@ against:
 Then:
 
 ```bash
-bash qemu-boot/build-novatek-usb-kernel.sh --out usbk
-bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel usbk/uImage.nt9856x-usb
+bash qemu-boot/build-novatek-test-kernel.sh --out testk
+bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel testk/uImage.nt9856x-test
 ```
 
 `--soc` names the OpenIPC release whose rootfs supplies busybox
@@ -470,8 +513,9 @@ SOC=nt98566 FLASH=nand.bin bash qemu-boot/run-nt98562.sh   # FW98566A.bin, NAND
 bash qemu-boot/test-novatek-uboot.sh --flash nor.bin       # vendor U-Boot: net, SD
 bash qemu-boot/test-novatek-nand.sh --flash nand.bin       # NAND: U-Boot, UBIFS
 bash qemu-boot/test-novatek-boot.sh --soc nt98562
-bash qemu-boot/build-novatek-usb-kernel.sh --out usbk      # see USB
-bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel usbk/uImage.nt9856x-usb
+bash qemu-boot/build-novatek-test-kernel.sh --out testk    # see USB, PWM
+bash qemu-boot/test-novatek-usb.sh --soc nt98562 --kernel testk/uImage.nt9856x-test
+bash qemu-boot/test-novatek-pwm.sh --soc nt98562 --kernel testk/uImage.nt9856x-test
 python3 qemu/tests/test-novatek.py
 ```
 
@@ -504,4 +548,6 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
 - I2C's DMA (VD-synchronised) transfers, and sensors other than the two
   SmartSens IDs, with nothing behind their registers (no MIPI, ISP or
   frames).
-- The Novatek timer, PWM, crypto, and the HDAL media blocks.
+- PWM micro-step (motor) mode, the cycle counters (CCNT), and the clock
+  generator's real PWM dividers (cycle runs are timed at a nominal 30 MHz).
+- The Novatek timer, crypto, and the HDAL media blocks.
