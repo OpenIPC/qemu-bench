@@ -48,7 +48,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | TOP (pinmux, chip ID) | `0xF0010000` | | `nvt-top` |
 | CG (clocks, PLLs, resets) | `0xF0020000` | | `nvt-cg` |
 | PAD | `0xF0030000` | | storage |
-| Novatek timer | `0xF0040000` | 0 | storage (vendor modules only) |
+| Novatek timer | `0xF0040000` | 0 | `nvt-timer` |
 | WDT | `0xF0050000` | 57 | `nvt-wdt` |
 | RTC + power button | `0xF0060000` | 56 | `nvt-rtc` |
 | GPIO | `0xF0070000` | 24 | `nvt-gpio` |
@@ -109,6 +109,47 @@ The kernel's clocksource and clockevents are the A9 global timer and TWD, at
 a9mpcore runs both timers at a fixed 100 MHz, so `nvt-cg` resets PLL8 to
 ratio `0x855555` (800 MHz) instead of the silicon's 960 MHz (`0xA00000`).
 With the real ratio, every delay and jiffy would run 20% slow.
+
+The Novatek timer block at `0xF0040000` (`nvt-timer`, SPI 0) is not
+Linux's clock. U-Boot and the HDAL use it. It has twenty up-counting
+timers, laid out as the HDAL's `timer_reg.h` gives them:
+
+- **Global registers:** STS (`0x10`, write 1 to clear), INT (`0x20`, the
+  enables for this core) and CLKDIV (`0x30`).
+- **Per timer n at `0x100 + 0x10n`:** CTRL (enable, free run, clock from
+  divider 1), TARGET, COUNTER and RELOAD.
+- **Clocks:** divider 0 runs at a fixed 1 MHz. Divider 1 runs at
+  `3 MHz / ([15:8] + 1)`, which is 1 MHz at reset.
+- **Counting:** a timer counts from 0 to TARGET, then sets its STS bit.
+  A one-shot timer then stops, with its enable bit reading clear. A
+  free-running timer wraps to 0 and goes on.
+
+`timer_cfg()` polls CTRL after every enable and disable, so both take
+effect at once. When divider 1's rate changes under a running timer, it
+continues from its count at the new rate.
+
+Timer 0 is the system timer. The loader leaves it running free at
+1 MHz with the full 32-bit target, and the model resets it that way.
+Three things rely on it:
+
+- The vendor U-Boot reads COUNTER 0 (`0xF0040108`) as microseconds since
+  power-on, for its `boot time` stamps and `timer2_delay()`.
+- `nvt_get_cpu_freq` also reads it.
+- The HDAL's `timer_open_sys_timer()` reads it too. Before the model, it
+  printed `TIMER_0 is not configured` on the vendor NAND firmware, and
+  U-Boot printed `boot time: 0(us)`.
+
+The machine's device tree has the vendor node (`timer@f0040000`,
+`nvt,nvt_timer`), which the release's `kdrv_comm.ko` binds. That build has
+`CONFIG_NVT_SMALL_HDAL`, so it has no `/proc/nvt_timer_module`.
+
+Three tests cover the timer:
+
+- `test-novatek-boot.sh` checks that timer 0 counts about a million
+  across a one-second sleep, and that the driver binds.
+- `test-novatek-uboot.sh` checks that the vendor U-Boot's stamps count up.
+- `test-novatek.py` checks it at register level: the one-shot and
+  free-running timers with SPI 0, divider 1, RELOAD, and reset.
 
 ## Device notes
 
@@ -575,4 +616,6 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   frames).
 - PWM micro-step (motor) mode, the cycle counters (CCNT), and the clock
   generator's real PWM dividers (cycle runs are timed at a nominal 30 MHz).
-- The Novatek timer, crypto, and the HDAL media blocks.
+- The Novatek timer's other cores (its DST routing and their status
+  words are storage, and every interrupt goes to SPI 0).
+- Crypto, and the HDAL media blocks.

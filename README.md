@@ -252,7 +252,9 @@ vendor EHCI driver; no shipped kernel enables it, so
 too, which nothing shipped builds either). The three I2C
 controllers work under the vendor driver, and `sensor=sc401ai` (or
 `sc501ai`) puts a SmartSens chip on I2C 0, which OpenIPC's `ipcinfo` and
-`load_novatek` detect and load the driver for. `reboot` works the
+`load_novatek` detect and load the driver for. The Novatek timer block
+runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
+U-Boot's boot-time stamps and the HDAL read it. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
@@ -395,6 +397,7 @@ qemu/
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
 ├── hw/misc/nvt-otp.c            # OTP / eFuse controller, blank array
 ├── hw/misc/nvt-pwm.c            # PWM: enable/disable, cycle-count runs, stop interrupts
+├── hw/timer/nvt-timer.c         # Novatek timers: one-shot / free run, timer 0 at 1 MHz
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
 ├── hw/gpio/nvt-gpio.c           # GPIO, 40 interrupt-capable pins
 ├── hw/ssi/nvt-flash.c           # SPI NOR controller (operation sequencer, flash-file)

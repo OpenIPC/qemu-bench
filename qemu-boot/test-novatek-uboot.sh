@@ -1,11 +1,11 @@
 #!/bin/bash
-# The vendor U-Boot on emulated NT9856x, networking and SD card: stop
-# autoboot, then take a DHCP lease and TFTP 1 MiB from the user network,
-# ping its gateway, and compare U-Boot's crc32 of what landed with the
-# host's; find the SD card (nvt_ivot_mmc.c over nvt-sdio, plain DMA), read
-# its partition table, read 256 KiB the host put on it with a matching
-# crc32, and write them back elsewhere on the card, where the host finds
-# them.
+# The vendor U-Boot on emulated NT9856x, timer, networking and SD card:
+# its "boot time" stamps read timer 0 counting; stop autoboot, then take
+# a DHCP lease and TFTP 1 MiB from the user network, ping its gateway,
+# and compare U-Boot's crc32 of what landed with the host's; find the SD
+# card (nvt_ivot_mmc.c over nvt-sdio, plain DMA), read its partition
+# table, read 256 KiB the host put on it with a matching crc32, and write
+# them back elsewhere on the card, where the host finds them.
 #
 # The vendor U-Boot (eth_na51089.c over nvt-eqos) comes from a whole flash
 # image -- the SDK's FW98562A.bin through qemu-boot/nvtpack2flash.py, or a
@@ -146,6 +146,13 @@ try:
     ser.sendall(b'\r')
     results.append(('autoboot stopped at the U-Boot prompt',
                     prompt(10) and b'Starting kernel' not in log))
+    # misc_init_r() and friends print timer 0 (nvt-timer, 0xF0040108) as
+    # microseconds since power-on: it runs, so the stamps are not 0.
+    stamps = [int(t) for t in re.findall(rb'boot time: (\d+)\(us\)', log)]
+    results.append(('"boot time" stamps from timer 0 count up (%s us)' %
+                    ', '.join(map(str, stamps)),
+                    len(stamps) > 1 and stamps[0] > 0 and
+                    stamps == sorted(stamps) and stamps[-1] > stamps[0]))
     # dhcp first: the built-in ipaddr (192.168.1.99) is not on SLIRP's net
     ser.sendall(b'dhcp 0x1000000 blob.bin\r')
     results.append(('DHCP lease', until(b'DHCP client bound', 20)))

@@ -31,6 +31,10 @@
 #   - Ethernet (nvt-eqos under the vendor DWC_ETH_QOS driver): a DHCP
 #     lease from QEMU's user network, then a 1 MiB file fetched over HTTP
 #     from the host (guestfwd), checksummed against the original;
+#   - the Novatek timer (nvt-timer): timer 0, free-running as the loader
+#     leaves it, counts about a million across a one-second sleep, and the
+#     release's HDAL kdrv_comm.ko (after kwrap, nvtmem and kdrv_builtin)
+#     binds its timer driver to the node;
 #   - "reboot -f": the kernel's reboot notifier arms the RTC power-on
 #     alarm and powers off, which resets the machine, and -no-reboot turns
 #     that into a clean exit.
@@ -150,6 +154,12 @@ for ko in mmc_core mmc_block mmc_na51055; do
     f=$(cd "$WORK/rootfs" && find lib/modules -name "$ko.ko" | head -1)
     [ -n "$f" ] && cp "$WORK/rootfs/$f" "$WORK/initramfs/lib/"
 done
+# And the HDAL common driver whose timer half binds the Novatek timer,
+# with the modules it needs first.
+for ko in kwrap nvtmem kdrv_builtin kdrv_comm; do
+    f=$(cd "$WORK/rootfs" && find lib/modules -name "$ko.ko" | head -1)
+    [ -n "$f" ] && cp "$WORK/rootfs/$f" "$WORK/initramfs/lib/"
+done
 mkdir -p "$WORK/initramfs/mnt"
 ln -s busybox "$WORK/initramfs/bin/sh"
 cat > "$WORK/initramfs/init" <<'INIT'
@@ -191,6 +201,11 @@ $bb ifconfig lo up
 $bb ifconfig eth0 up
 $bb udhcpc -i eth0 -n -q -t 5 -s /udhcpc.sh >/dev/null 2>&1 && echo "NVT-DHCP: ok"
 echo "NVT-HTTP-MD5: $($bb wget -q -O - http://10.0.2.100:@PORT@/blob.bin | $bb md5sum)"
+t0=$($bb devmem 0xF0040108)
+$bb sleep 1
+echo "NVT-TIMER0-1S: $(( $($bb devmem 0xF0040108) - t0 ))"
+for ko in kwrap nvtmem kdrv_builtin kdrv_comm; do $bb insmod /lib/$ko.ko; done
+[ -e /sys/bus/platform/drivers/nvt_timer/f0040000.timer ] && echo "NVT-TIMER: ok"
 echo "NVT-BOOT-OK"
 $bb reboot -f
 INIT
@@ -275,6 +290,13 @@ fi
 expect "NVT-SD-VFAT-MD5: $PAYLOAD_MD5" 'vfat made on the card keeps a file across a remount'
 expect 'NVT-DHCP: ok' 'DHCP lease over nvt-eqos'
 expect "NVT-HTTP-MD5: $BLOB_MD5" '1 MiB over HTTP, intact'
+if grep -q 'NVT-TIMER0-1S: 1[0-9][0-9][0-9][0-9][0-9][0-9]' "$WORK/console.log"; then
+    echo "PASS: timer 0 counts about 1000000 across a 1 s sleep (1 MHz)"
+else
+    echo "FAIL: timer 0 does not count at 1 MHz"
+    fail=1
+fi
+expect 'NVT-TIMER: ok' 'kdrv_comm.ko binds the timer at f0040000'
 expect 'NVT-BOOT-OK' 'PID 1 ran to the end'
 expect 'restarting\.\.\.\.\.' 'reboot reached the vendor notifier'
 if [ $rc -ne 0 ]; then
