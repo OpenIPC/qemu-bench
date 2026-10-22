@@ -293,7 +293,13 @@ vendor U-Boot loads the kernel from the squashfs, which runs the vendor NVR
 application. Its GUI shows on the QEMU display through the LCD300 model and
 takes a USB mouse; the two SATA ports take disks (`-drive if=ide`), the
 audio interfaces and the HDAL engines complete their jobs, Ethernet works
-and the web UI answers: `FLASH=nor.bin qemu-boot/run-nt98332.sh`. Notes in
+and the web UI answers: `FLASH=nor.bin qemu-boot/run-nt98332.sh`. With an
+emulated XM530 camera on the same QEMU network
+(`qemu-boot/run-xm530-camera.sh`), the NVR decodes its H.264 (libavcodec
+behind the vendor decoder driver) and shows it in its preview window and its
+single-channel view, records it and plays it back. With
+`qemu-boot/fake-ipcam.py` serving H.265 files (`LAN=fake`) both views show
+H.265 too. Notes in
 [docs/novatek.md](docs/novatek.md#nt98332-na51103).
 
 ² A Xiongmai NBD80N36RA-KL NVR dump (not distributable, so not in CI).
@@ -434,6 +440,7 @@ qemu/
 ├── hw/misc/nvt-engine.c         # HDAL media engines: link lists, job done
 ├── hw/misc/nvt-hdmi.c           # NA51103 HDMI TX status (clock stable, mute)
 ├── hw/display/nvt-lcd300.c      # NA51103 LCD300: vsync, channel scan-out
+├── hw/misc/nvt-h26xdec.c        # NA51103 H.26x decoder: link lists, libavcodec
 ├── hw/misc/nvt-top.c            # TOP: pinmux storage, chip ID
 ├── hw/misc/nvt-cg.c             # Clock generator: PLL ratios, gates, resets
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
@@ -479,6 +486,7 @@ qemu-boot/
 ├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
 ├── run-nt98332.sh               # Novatek NT98332: NVR NOR image, GUI, mouse, SATA
+├── run-xm530-camera.sh          # XM530 + OpenIPC as a camera on the NT98332's QEMU LAN
 ├── uboot-env.py                 # Write a U-Boot env (defaults + settings) into a flash image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
@@ -490,7 +498,7 @@ qemu-boot/
 ├── build-novatek-hdal-samples.sh # the SDK's HDAL samples, uClibc-built, for test-novatek-hdal.sh
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
-├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
+├── fake-ipcam.py                # RTSP/ONVIF camera: synthetic H.264 pattern, or H.264/H.265 files
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map
 ├── test-sysupgrade.sh           # sysupgrade --archive on emulated NOR
 ├── test-firstboot.sh            # firstboot wipes the overlay, camera boots

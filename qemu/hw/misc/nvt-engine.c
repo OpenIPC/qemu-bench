@@ -26,6 +26,36 @@
  *   hi[31:28] = 2   continue at hi[15:0]:lo[31:8], lo[3:0] the job id
  *   hi[31:28] = 0   end of the list, lo[3:0] the job id
  *
+ * trace=on logs every list command (hi, lo), for working out an engine's
+ * registers from a running firmware.
+ *
+ * scaler=on makes a job also do the VPE's pixel work, crop-free scaling of
+ * one NV12 picture into a window of another, as the NVR's preview uses it
+ * (kdrv_vpe's lists):
+ *
+ *   0x010  source size, [27:16] height, [11:0] width
+ *   0x01C  the part of it shown, [31:16] width, [15:0] height (a 1080-line
+ *          picture in a 1088-line buffer); ignored unless inside 0x010,
+ *          since the preview's jobs leave it as an earlier job set it
+ *   0x308  source Y; 0x30C its UV, or right after Y when 0
+ *   0x800  source stride, [15:0]
+ *   0x360  destination frame's Y; 0x364 its UV, or right after Y when 0
+ *          (the NVR leaves it 0)
+ *   0x50C  destination frame, [27:16] height, [11:0] width (the stride)
+ *   0x550  window width, 0x508 window height
+ *   0x554  [15:0] the window's x, 0x510 [15:0] its y (a preview tile's
+ *          place in the grid; the playback window is 24 rows down)
+ *   0x008  any of bits 12:10 set: scale the source (0xC00 for the
+ *          preview's reduced copies, 0x1000 for a full picture); clear:
+ *          fill the window with the background colour 0x260 ([7:0] Y,
+ *          [15:8] U, [23:16] V), the NVR's "clear window" jobs, which keep
+ *          empty tiles black
+ *
+ * The NVR's preview windows read the decoder's reduced copies, and its
+ * single-channel view the decoder's full pictures (nvt-h26xdec); both
+ * have their UV right after Y.  The destinations are the LCD300's video
+ * frames.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -63,6 +93,9 @@ struct NvtEngineState {
     uint32_t delay_us;
     uint32_t ll_reg;
     uint32_t ll_fire_mask;
+    bool trace;
+    bool scaler;
+    uint32_t jobs;
 };
 
 #define LL_OP_END           0x0
@@ -108,6 +141,10 @@ static void nvt_engine_run_ll(NvtEngineState *s)
         }
         cmd[0] = le32_to_cpu(cmd[0]);
         cmd[1] = le32_to_cpu(cmd[1]);
+        if (s->trace) {
+            qemu_log("%s: job %u ll %08x %08x\n", s->name, s->jobs, cmd[1],
+                     cmd[0]);
+        }
         switch (cmd[1] >> 28) {
         case LL_OP_WRITE:
             off = cmd[1] & 0x1FFC;
@@ -125,6 +162,83 @@ static void nvt_engine_run_ll(NvtEngineState *s)
                           s->name, cmd[1], cmd[0]);
             break;
         }
+    }
+}
+
+static void nvt_engine_scale(NvtEngineState *s)
+{
+    uint32_t sw = *reg(s, 0x010) & 0xFFF, sh = (*reg(s, 0x010) >> 16) & 0xFFF;
+    uint32_t cw = *reg(s, 0x01C) >> 16, ch = *reg(s, 0x01C) & 0xFFFF;
+    uint32_t ss = *reg(s, 0x800) & 0xFFFF;
+    uint32_t fw = *reg(s, 0x50C) & 0xFFF, fh = (*reg(s, 0x50C) >> 16) & 0xFFF;
+    uint32_t dw = *reg(s, 0x550) & 0xFFF, dh = *reg(s, 0x508) & 0xFFF;
+    hwaddr sy = *reg(s, 0x308), suv = *reg(s, 0x30C);
+    uint32_t wx = *reg(s, 0x554) & 0xFFFF, wy = *reg(s, 0x510) & 0xFFFF;
+    hwaddr dy = *reg(s, 0x360), duv = *reg(s, 0x364);
+    g_autofree uint8_t *src = NULL, *line = NULL;
+    uint32_t r, x;
+
+    ss = ss ? ss : sw;
+    wx &= ~1;                           /* on a chroma pair */
+    if (!dw || !dh || !fw || !fh || !dy || wx + dw > fw || wy + dh > fh) {
+        return;
+    }
+    duv = (duv ? duv : dy + (hwaddr)fw * fh) + (hwaddr)(wy / 2) * fw + wx;
+    dy += (hwaddr)wy * fw + wx;
+    if (!(*reg(s, 0x008) & 0x1C00)) {
+        uint32_t bg = *reg(s, 0x260);
+
+        line = g_malloc(dw + 1);
+        memset(line, bg & 0xFF, dw);
+        for (r = 0; r < dh; r++) {
+            address_space_write(&address_space_memory, dy + (hwaddr)r * fw,
+                                MEMTXATTRS_UNSPECIFIED, line, dw);
+        }
+        for (x = 0; x + 1 < dw; x += 2) {
+            line[x] = (bg >> 8) & 0xFF;
+            line[x + 1] = (bg >> 16) & 0xFF;
+        }
+        for (r = 0; r < dh / 2; r++) {
+            address_space_write(&address_space_memory, duv + (hwaddr)r * fw,
+                                MEMTXATTRS_UNSPECIFIED, line, dw & ~1);
+        }
+        return;
+    }
+    if (!sw || !sh || !sy || ss < sw) {
+        return;
+    }
+    suv = suv ? suv : sy + (hwaddr)ss * sh;
+    if (cw && ch && cw <= sw && ch <= sh) {
+        sw = cw;
+        sh = ch & ~1;
+    }
+    src = g_malloc((size_t)ss * sh);
+    line = g_malloc(dw + 1);
+
+    address_space_read(&address_space_memory, sy, MEMTXATTRS_UNSPECIFIED,
+                       src, (size_t)ss * sh);
+    for (r = 0; r < dh; r++) {
+        const uint8_t *row = src + (size_t)(r * sh / dh) * ss;
+
+        for (x = 0; x < dw; x++) {
+            line[x] = row[x * sw / dw];
+        }
+        address_space_write(&address_space_memory, dy + (hwaddr)r * fw,
+                            MEMTXATTRS_UNSPECIFIED, line, dw);
+    }
+    address_space_read(&address_space_memory, suv, MEMTXATTRS_UNSPECIFIED,
+                       src, (size_t)ss * (sh / 2));
+    for (r = 0; r < dh / 2; r++) {
+        const uint8_t *row = src + (size_t)(r * (sh / 2) / (dh / 2)) * ss;
+
+        for (x = 0; x < dw / 2; x++) {
+            uint32_t sx = (x * (sw / 2) / (dw / 2)) * 2;
+
+            line[2 * x] = row[sx];
+            line[2 * x + 1] = row[sx + 1];
+        }
+        address_space_write(&address_space_memory, duv + (hwaddr)r * fw,
+                            MEMTXATTRS_UNSPECIFIED, line, dw & ~1);
     }
 }
 
@@ -152,6 +266,10 @@ static void nvt_engine_write(void *opaque, hwaddr offset, uint64_t value,
         if (s->ll_reg && (val & s->ll_fire_mask)) {
             nvt_engine_run_ll(s);
         }
+        if (s->scaler) {
+            nvt_engine_scale(s);
+        }
+        s->jobs++;
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   (int64_t)s->delay_us * SCALE_US);
     } else if (offset == s->en_reg) {
@@ -214,6 +332,8 @@ static const Property nvt_engine_properties[] = {
     DEFINE_PROP_UINT32("delay-us", NvtEngineState, delay_us, 1000),
     DEFINE_PROP_UINT32("ll-reg", NvtEngineState, ll_reg, 0),
     DEFINE_PROP_UINT32("ll-fire-mask", NvtEngineState, ll_fire_mask, 0),
+    DEFINE_PROP_BOOL("trace", NvtEngineState, trace, false),
+    DEFINE_PROP_BOOL("scaler", NvtEngineState, scaler, false),
 };
 
 static const VMStateDescription vmstate_nvt_engine = {

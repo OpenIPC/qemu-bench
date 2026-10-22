@@ -1457,11 +1457,12 @@ static const struct {
     int irq;
     uint32_t fire_reg, fire_mask, sts_reg, en_reg, done_bits;
     uint32_t ll_reg, ll_fire_mask;
+    bool scaler;
 } na51103_engines[] = {
     /* kdrv_vpe: CTRL bit 31 fires the link list at 0x300, bit 30 a single
      * job; 0x400/0x404 status/enable, bit 0 frame end, bit 2 list end. */
     { "nvt-vpe", NA51103_IO(0x00410000), 0x1040, 3,
-      0x000, 0xC0000000, 0x400, 0x404, 0x5, 0x300, 0x80000000 },
+      0x000, 0xC0000000, 0x400, 0x404, 0x5, 0x300, 0x80000000, true },
 };
 
 static const struct {
@@ -1704,6 +1705,7 @@ static void novatek_a64_init(MachineState *machine, const NvtSoCConfig *c)
         qdev_prop_set_uint32(dev, "ll-reg", na51103_engines[n].ll_reg);
         qdev_prop_set_uint32(dev, "ll-fire-mask",
                              na51103_engines[n].ll_fire_mask);
+        qdev_prop_set_bit(dev, "scaler", na51103_engines[n].scaler);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0,
                                 na51103_engines[n].base, 1);
@@ -1713,6 +1715,7 @@ static void novatek_a64_init(MachineState *machine, const NvtSoCConfig *c)
 
     dev = sysbus_create_simple("nvt-lcd300", NA51103_IO(0x00800000), pic[18]);
     sysbus_create_simple("nvt-hdmi", NA51103_IO(0x00880000), pic[52]);
+    sysbus_create_simple("nvt-h26xdec", NA51103_IO(0x00600000), pic[9]);
 
     for (n = 0; n < ARRAY_SIZE(na51103_usb); n++) {
         dev = qdev_new("nvt-usb");

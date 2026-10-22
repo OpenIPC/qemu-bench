@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 A fake IP camera for emulated NVRs: ONVIF (Profile S subset) + RTSP with
-RTP interleaved over TCP, serving a synthetic H.264 test pattern.
+RTP interleaved over TCP, serving a synthetic H.264 test pattern, or
+H.264 / H.265 files.
 
 The H.264 stream needs no encoder library.  Every picture is lossless:
 the IDR codes each macroblock as I_PCM, and the P pictures that follow
@@ -23,6 +24,10 @@ connection would share; the cmd: form starts one --relay process (stdio to
 the local port) per guest connection.
 
     python3 qemu-boot/fake-ipcam.py --write out.h264 --frames 50
+
+--file / --sub-file loop raw Annex B files instead, H.265 when they end
+in .hevc / .h265 (e.g. from kvazaar; see docs/novatek.md for what the
+NT98332 needs of them).
 
 Copyright (c) 2026 OpenIPC.
 SPDX-License-Identifier: GPL-2.0-or-later
@@ -428,6 +433,58 @@ class H264File:
         return b"".join(b"\x00\x00\x00\x01" + x for x in au), idr
 
 
+class H265File(H264File):
+    """Replay a raw H.265 stream (Annex B), looping, starting at an IRAP."""
+
+    hevc = True
+
+    def __init__(self, path, width, height, fps):
+        data = open(path, "rb").read()
+        self.w, self.h, self.fps, self.gop = width, height, fps, 0
+        self.aus = []
+        self.ps = {}
+        au, vcl = [], False
+        for n in split_nals(data):
+            if len(n) < 3:
+                continue
+            t = (n[0] >> 1) & 0x3F
+            first = t < 32 and n[2] & 0x80
+            # a new access unit: a VPS/SPS/PPS/AUD/prefix SEI, or a
+            # picture's first slice, after the previous picture's slices
+            if vcl and (t in (32, 33, 34, 35, 39) or first):
+                self.aus.append(au)
+                au, vcl = [], False
+            if t in (32, 33, 34):
+                self.ps.setdefault(t, n)
+            au.append(n)
+            vcl |= t < 32
+        if vcl:
+            self.aus.append(au)
+        iraps = [i for i, a in enumerate(self.aus) if self.irap(a)]
+        if not iraps or len(self.ps) < 3:
+            raise SystemExit("%s: no VPS/SPS/PPS/IRAP in it" % path)
+        self.aus = self.aus[iraps[0]:]
+        self.n = 0
+
+    @staticmethod
+    def irap(au):
+        return any(16 <= (x[0] >> 1) & 0x3F <= 23 for x in au)
+
+    def vps(self):
+        return b"\x00\x00\x00\x01" + self.ps[32]
+
+    def sps(self):
+        return b"\x00\x00\x00\x01" + self.ps[33]
+
+    def pps(self):
+        return b"\x00\x00\x00\x01" + self.ps[34]
+
+    def picture(self):
+        au = self.aus[self.n % len(self.aus)]
+        self.n += 1
+        return b"".join(b"\x00\x00\x00\x01" + x for x in au), self.irap(au)
+
+
 class Stream:
     """One shared encoder; clients read the latest access units."""
 
@@ -438,6 +495,8 @@ class Stream:
         self.seq = 0
         self.sps, self.pps = split_nals(pattern.sps())[0], \
             split_nals(pattern.pps())[0]
+        self.hevc = getattr(pattern, "hevc", False)
+        self.vps = split_nals(pattern.vps())[0] if self.hevc else None
         threading.Thread(target=self.run, daemon=True).start()
 
     def run(self):
@@ -459,21 +518,26 @@ class Stream:
             return self.au
 
 
-def rtp_packets(nalu, seq, ts, ssrc, marker_last, mtu=1400):
+def rtp_packets(nalu, seq, ts, ssrc, marker_last, mtu=1400, hevc=False):
     hdr = lambda m, s: struct.pack(">BBHII", 0x80, (m << 7) | 96, s & 0xFFFF,
                                    ts & 0xFFFFFFFF, ssrc)
     if len(nalu) <= mtu:
         return [hdr(marker_last, seq) + nalu], seq + 1
     out = []
-    ind = (nalu[0] & 0xE0) | 28
-    typ = nalu[0] & 0x1F
-    body = nalu[1:]
+    if hevc:                        # RFC 7798 fragmentation unit, type 49
+        ind = bytes([(nalu[0] & 0x81) | (49 << 1), nalu[1]])
+        typ = (nalu[0] >> 1) & 0x3F
+        body = nalu[2:]
+    else:
+        ind = bytes([(nalu[0] & 0xE0) | 28])
+        typ = nalu[0] & 0x1F
+        body = nalu[1:]
     first = True
     while body:
         chunk, body = body[:mtu], body[mtu:]
         fu = typ | (0x80 if first else 0) | (0x40 if not body else 0)
         m = marker_last if not body else 0
-        out.append(hdr(m, seq) + bytes([ind, fu]) + chunk)
+        out.append(hdr(m, seq) + ind + bytes([fu]) + chunk)
         seq += 1
         first = False
     return out, seq
@@ -519,24 +583,29 @@ class RTSPHandler(socketserver.StreamRequestHandler):
         """The sub stream for URLs that ask for it, as cameras name it."""
         path = url.lower()
         sub = any(k in path for k in ("sub", "stream2", "subtype=1",
-                                      "channel=2", "/102", "/12"))
+                                      "channel=2", "/102", "/12",
+                                      "stream=1"))
         self.stream = self.server.streams["sub" if sub else "main"]
 
     def sdp(self):
         st = self.stream
-        sprop = "%s,%s" % (base64.b64encode(st.sps).decode(),
-                           base64.b64encode(st.pps).decode())
-        plid = st.sps[1:4].hex()
+        b64 = lambda n: base64.b64encode(n).decode()
+        if st.hevc:
+            fmt = ("a=rtpmap:96 H265/90000\r\n"
+                   "a=fmtp:96 sprop-vps=%s;sprop-sps=%s;sprop-pps=%s\r\n"
+                   % (b64(st.vps), b64(st.sps), b64(st.pps)))
+        else:
+            fmt = ("a=rtpmap:96 H264/90000\r\n"
+                   "a=fmtp:96 packetization-mode=1;profile-level-id=%s;"
+                   "sprop-parameter-sets=%s,%s\r\n"
+                   % (st.sps[1:4].hex(), b64(st.sps), b64(st.pps)))
         ip = self.server.advertise
         return ("v=0\r\no=- 0 0 IN IP4 %s\r\ns=fake-ipcam\r\n"
                 "c=IN IP4 0.0.0.0\r\nt=0 0\r\na=control:*\r\n"
                 "a=range:npt=0-\r\n"
-                "m=video 0 RTP/AVP 96\r\na=recvonly\r\n"
-                "a=rtpmap:96 H264/90000\r\n"
-                "a=fmtp:96 packetization-mode=1;profile-level-id=%s;"
-                "sprop-parameter-sets=%s\r\n"
+                "m=video 0 RTP/AVP 96\r\na=recvonly\r\n%s"
                 "a=framerate:%d\r\na=control:track1\r\n"
-                % (ip, plid, sprop, st.pat.fps)).encode()
+                % (ip, fmt, st.pat.fps)).encode()
 
     def handle(self):
         while True:
@@ -645,7 +714,8 @@ class RTSPHandler(socketserver.StreamRequestHandler):
                 nals = split_nals(au)
                 for i, n in enumerate(nals):
                     pkts, seq = rtp_packets(n, seq, ts, ssrc,
-                                            i == len(nals) - 1)
+                                            i == len(nals) - 1,
+                                            hevc=st.hevc)
                     for p in pkts:
                         packets += 1
                         octets += len(p) - 12
@@ -910,7 +980,10 @@ def main():
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--gop", type=int, default=20)
     ap.add_argument("--file", help="stream this raw H.264 file (looped) "
-                    "instead of the pattern; --size/--fps describe it")
+                    "instead of the pattern, H.265 if it ends in .hevc or "
+                    ".h265; --size/--fps describe it")
+    ap.add_argument("--sub-file", help="the sub stream's file, with "
+                    "--file; --sub-size describes it")
     ap.add_argument("--write", help="write an Annex B file and exit")
     ap.add_argument("--frames", type=int, default=50)
     ap.add_argument("--relay", type=int, metavar="PORT",
@@ -922,8 +995,13 @@ def main():
         relay(ARGS.bind, ARGS.relay)
         return
     w, h = (int(x) for x in ARGS.size.split("x"))
+
+    def from_file(path, w, h):
+        hevc = path.lower().endswith((".hevc", ".h265", ".265"))
+        return (H265File if hevc else H264File)(path, w, h, ARGS.fps)
+
     if ARGS.file:
-        pat = H264File(ARGS.file, w, h, ARGS.fps)
+        pat = from_file(ARGS.file, w, h)
     else:
         pat = H264Pattern(w, h, ARGS.fps, ARGS.gop)
 
@@ -934,7 +1012,10 @@ def main():
         return
 
     streams = {"main": Stream(pat)}
-    if ARGS.sub_size == ARGS.size or ARGS.file:
+    if ARGS.file and ARGS.sub_file:
+        sw, sh = (int(x) for x in ARGS.sub_size.split("x"))
+        streams["sub"] = Stream(from_file(ARGS.sub_file, sw, sh))
+    elif ARGS.sub_size == ARGS.size or ARGS.file:
         streams["sub"] = streams["main"]
     else:
         sw, sh = (int(x) for x in ARGS.sub_size.split("x"))
