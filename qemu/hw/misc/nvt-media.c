@@ -2,16 +2,17 @@
  * Novatek NA51089 HDAL media engines: the register blocks the HDAL's
  * kdrv_* modules drive -- video capture (SIE, TGE, CSI, LVDS, sensor PHY),
  * the IPP chain (IFE, DCE, IPE, IME), 2D graphics and ISE, the H.26x and
- * JPEG codecs, audio (EAC, DAI), the serial interface SIF and the DDR
- * arbiter's protection window.
+ * JPEG codecs, the serial interface SIF and the DDR arbiter's protection
+ * window.  Audio (EAC, DAI) is nvt-audio.
  *
  * One device type serves them all: an "engine" property picks the
  * engine's entry in the table below, which says how its registers behave
  * beyond plain storage -- reset bits that clear themselves, status the
  * driver polls, the start bit whose work is done at once and raises the
- * engine's interrupt.  No pixels, samples or bitstreams move: the engines
- * accept their setup and report each job finished, which is what the
- * drivers and the HDAL flows wait for (docs/novatek.md).
+ * engine's interrupt.  The engines that compute -- SIE, IME, graphics,
+ * ISE, H.26x, JPEG -- do so in nvt-pixel.c, nvt-gfx.c and nvt-h26x.c; the
+ * rest accept their setup and report each job finished, which is what
+ * the drivers and the HDAL flows wait for (docs/novatek.md).
  *
  * "trace" logs every access, for working out what an engine's driver
  * expects: -global nvt-media.trace=on, or per instance.
@@ -31,6 +32,7 @@
 #include "qom/object.h"
 #include "system/dma.h"
 #include "hw/misc/nvt-gfx.h"
+#include "hw/misc/nvt-h26x.h"
 #include "hw/misc/nvt-pixel.h"
 
 #define TYPE_NVT_MEDIA "nvt-media"
@@ -57,6 +59,12 @@ struct NvtMediaState {
     NvtMediaState *ipp_src;     /* IME: the IFE whose input it finishes */
     uint8_t jpg_q[128];         /* JPEG: luma / chroma quantisation, zig-zag */
     uint32_t jpg_lut;           /* JPEG: the LUT port's select / address */
+    /*
+     * H.26x: its streams' encoders, host state that is not migrated --
+     * after a migration each stream codes filler slices until its next
+     * IDR, when a new encoder takes over.
+     */
+    NvtH26x *h26x;
 };
 
 /*
@@ -480,6 +488,7 @@ static void ipp_job_done(NvtMediaState *s)
 #define H26X_CTRL_START     (1u << 8)
 #define H26X_CTRL_DMA_DIS   (1u << 27)
 #define H26X_INT_FINISH     (1u << 0)
+#define H26X_INT_BSOUT_FULL (1u << 12)
 #define H26X_INT_SWRST      (1u << 28)
 #define H26X_INT_DMA_DIS    (1u << 30)
 
@@ -511,51 +520,36 @@ static uint64_t h26x_write(NvtMediaState *s, hwaddr off, uint64_t val)
     return val;
 }
 
-#define H26X_NAL_LEN_ADDR   0x068
-#define H26X_BSOUT_ADDR     0x070
-#define H26X_BSOUT_SIZE     0x07C
 #define H26X_REPORT         0x250   /* CHK_REPORT[], H26XREPORT order */
 #define H26X_RPT_BS_LEN     6
 #define H26X_RPT_RRC_BITS   10
-#define H26X_FILLER_LEN     64
+#define H26X_RPT_QP_SUM     19
 
 /*
- * A picture "encoded": a filler NAL unit (H.265 FD_NUT, which decoders
- * skip) stands for the slice, its length in the report and the NAL
- * length list.
+ * A picture (nvt-h26x.c): coded for real when an encoder can match the
+ * driver's stream, in a worker thread, else a filler slice at once.  The
+ * report gives its length and QP; a picture the bitstream buffer cannot
+ * take raises buffer full instead of finish.
  */
+static void h26x_finish(void *opaque, const NvtH26xResult *r)
+{
+    NvtMediaState *s = opaque;
+
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_BS_LEN) = r->len;
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_RRC_BITS) = r->len * 8;
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_QP_SUM) = r->qp_sum;
+    *reg(s, H26X_INT_FLAG) |= r->full ? H26X_INT_BSOUT_FULL : H26X_INT_FINISH;
+    h26x_update_irq(s);
+}
+
 static void h26x_done(NvtMediaState *s)
 {
-    uint8_t nal[H26X_FILLER_LEN];
-    uint32_t len = MIN(H26X_FILLER_LEN, *reg(s, H26X_BSOUT_SIZE));
-    uint32_t le;
+    nvt_h26x_encode(s->h26x, s->regs, h26x_finish, s);
+}
 
-    if (len < 8) {
-        qemu_log_mask(LOG_GUEST_ERROR, "nvt-media h26x: a %u-byte "
-                      "bitstream buffer\n", *reg(s, H26X_BSOUT_SIZE));
-        len = 0;
-    } else {
-        memset(nal, 0xFF, sizeof(nal));
-        nal[0] = 0;
-        nal[1] = 0;
-        nal[2] = 0;
-        nal[3] = 1;
-        nal[4] = 38 << 1;           /* FD_NUT */
-        nal[5] = 1;
-        nal[len - 1] = 0x80;        /* rbsp trailing bits */
-        le = cpu_to_le32(len);
-        dma_memory_write(&address_space_memory, *reg(s, H26X_BSOUT_ADDR),
-                         nal, len, MEMTXATTRS_UNSPECIFIED);
-        if (*reg(s, H26X_NAL_LEN_ADDR)) {
-            dma_memory_write(&address_space_memory,
-                             *reg(s, H26X_NAL_LEN_ADDR), &le, 4,
-                             MEMTXATTRS_UNSPECIFIED);
-        }
-    }
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_BS_LEN) = len;
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_RRC_BITS) = len * 8;
-    *reg(s, H26X_INT_FLAG) |= H26X_INT_FINISH;
-    h26x_update_irq(s);
+static void h26x_reset(NvtMediaState *s)
+{
+    nvt_h26x_reset(s->h26x);
 }
 
 /*
@@ -723,141 +717,6 @@ static void jpg_done(NvtMediaState *s)
     jpg_update_irq(s);
 }
 
-/*
- * EAC, the embedded audio codec (kdrv_builtin/audio/eac/include/
- * eac_reg.h): two strobes the driver waits on to clear -- CTRL1 bit 0,
- * LOAD (the settings take effect), and EADC_CTRL0 bit 13,
- * ADC_DCCAN_INIT_LOAD (the DC cancellation's initial value is loaded).
- */
-#define EAC_CTRL1           0x04
-#define EAC_CTRL1_LOAD      (1u << 0)
-#define EAC_EADC_CTRL0      0x10
-#define EAC_DCCAN_INIT_LOAD (1u << 13)
-
-static uint64_t eac_write(NvtMediaState *s, hwaddr off, uint64_t val)
-{
-    switch (off) {
-    case EAC_CTRL1:
-        return val & ~EAC_CTRL1_LOAD;
-    case EAC_EADC_CTRL0:
-        return val & ~EAC_DCCAN_INIT_LOAD;
-    }
-    return val;
-}
-
-/*
- * DAI, the audio interface's DMA (kdrv_builtin/audio/dai/include/
- * dai_reg.h): CTRL at 0x00 -- bit 0 DAIEN, bit 4 / 6 TX1 / RX DMA enable;
- * INTEN / INTSTATUS at 0x20 / 0x28 (write 1 to clear), TXLB's at 0x24 /
- * 0x2C; RX1 buffer address / size at 0x48 / 0x68, TX1's at 0x30 / 0x50.
- * The DMA is double-buffered: enabling it latches the buffer address
- * (DMALOAD: TX1 bit 4, RX bit 6), the driver queues the next, and each
- * buffer done raises buffer-full (TX1 bit 0, RX1 bit 2) and the next
- * load; disabling it raises stop (TX1 bit 8, RX bit 10).  Buffers last
- * as long as 16-bit mono at 16 kHz takes; capture fills them with
- * silence.
- */
-#define DAI_CTRL            0x00
-#define DAI_INTEN           0x20
-#define DAI_INTEN2          0x24
-#define DAI_INTSTS          0x28
-#define DAI_INTSTS2         0x2C
-#define DAI_TX1_ADDR        0x30
-#define DAI_RX1_ADDR        0x48
-#define DAI_TX1_SIZE        0x50
-#define DAI_RX1_SIZE        0x68
-#define DAI_CTRL_TX1_DMA    (1u << 4)
-#define DAI_CTRL_RX_DMA     (1u << 6)
-#define DAI_INT_TX1_BFI     (1u << 0)
-#define DAI_INT_RX1_BFI     (1u << 2)
-#define DAI_INT_TX1_LOAD    (1u << 4)
-#define DAI_INT_RX_LOAD     (1u << 6)
-#define DAI_INT_TX1_STOP    (1u << 8)
-#define DAI_INT_RX_STOP     (1u << 10)
-#define DAI_BYTES_PER_SEC   32000
-
-static void dai_update_irq(NvtMediaState *s)
-{
-    qemu_set_irq(s->irq[0],
-                 (*reg(s, DAI_INTSTS) & *reg(s, DAI_INTEN)) ||
-                 (*reg(s, DAI_INTSTS2) & *reg(s, DAI_INTEN2)));
-}
-
-/* A buffer's length in bytes: the size registers count words. */
-static uint32_t dai_buf_bytes(NvtMediaState *s, hwaddr size_reg)
-{
-    return MAX((*reg(s, size_reg) & 0x7FFFF) * 4, 4);
-}
-
-static void dai_schedule(NvtMediaState *s)
-{
-    uint32_t ctrl = *reg(s, DAI_CTRL), bytes = UINT32_MAX;
-
-    if (ctrl & DAI_CTRL_RX_DMA) {
-        bytes = dai_buf_bytes(s, DAI_RX1_SIZE);
-    }
-    if (ctrl & DAI_CTRL_TX1_DMA) {
-        bytes = MIN(bytes, dai_buf_bytes(s, DAI_TX1_SIZE));
-    }
-    if (bytes == UINT32_MAX) {
-        timer_del(s->timer);
-        return;
-    }
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              muldiv64(bytes, NANOSECONDS_PER_SECOND, DAI_BYTES_PER_SEC));
-}
-
-static uint64_t dai_write(NvtMediaState *s, hwaddr off, uint64_t val)
-{
-    uint32_t old = *reg(s, off), on, off_bits;
-
-    switch (off) {
-    case DAI_CTRL:
-        on = val & ~old;
-        off_bits = old & ~val;
-        if (on & DAI_CTRL_RX_DMA) {
-            *reg(s, DAI_INTSTS) |= DAI_INT_RX_LOAD;
-        }
-        if (on & DAI_CTRL_TX1_DMA) {
-            *reg(s, DAI_INTSTS) |= DAI_INT_TX1_LOAD;
-        }
-        if (off_bits & DAI_CTRL_RX_DMA) {
-            *reg(s, DAI_INTSTS) |= DAI_INT_RX_STOP;
-        }
-        if (off_bits & DAI_CTRL_TX1_DMA) {
-            *reg(s, DAI_INTSTS) |= DAI_INT_TX1_STOP;
-        }
-        *reg(s, off) = val;
-        if ((on | off_bits) & (DAI_CTRL_RX_DMA | DAI_CTRL_TX1_DMA)) {
-            dai_schedule(s);
-        }
-        return val;
-    case DAI_INTSTS:
-    case DAI_INTSTS2:
-        return old & ~val;
-    }
-    return val;
-}
-
-static void dai_period(NvtMediaState *s)
-{
-    uint32_t ctrl = *reg(s, DAI_CTRL);
-
-    if (ctrl & DAI_CTRL_RX_DMA) {
-        uint32_t n = dai_buf_bytes(s, DAI_RX1_SIZE);
-        g_autofree uint8_t *silence = g_malloc0(n);
-
-        dma_memory_write(&address_space_memory, *reg(s, DAI_RX1_ADDR),
-                         silence, n, MEMTXATTRS_UNSPECIFIED);
-        *reg(s, DAI_INTSTS) |= DAI_INT_RX1_BFI | DAI_INT_RX_LOAD;
-    }
-    if (ctrl & DAI_CTRL_TX1_DMA) {
-        *reg(s, DAI_INTSTS) |= DAI_INT_TX1_BFI | DAI_INT_TX1_LOAD;
-    }
-    dai_update_irq(s);
-    dai_schedule(s);
-}
-
 static const NvtMediaEngine nvt_media_engines[] = {
     { "generic" },
     { "sie", sie_write, sie_read, NULL, sie_frame, sie_update_irq },
@@ -867,9 +726,7 @@ static const NvtMediaEngine nvt_media_engines[] = {
     { "dce", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_dce },
     { "ipe", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ipe },
     { "ime", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ime },
-    { "h26x", h26x_write, NULL, NULL, h26x_done, h26x_update_irq },
-    { "eac", eac_write },
-    { "dai", dai_write, NULL, NULL, dai_period, dai_update_irq },
+    { "h26x", h26x_write, NULL, h26x_reset, h26x_done, h26x_update_irq },
     { "jpg", jpg_write, jpg_read, NULL, jpg_done, jpg_update_irq },
     { "ise", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ise },
     { "graphic", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq,
@@ -961,6 +818,9 @@ static void nvt_media_realize(DeviceState *dev, Error **errp)
         }
     }
     s->regs = g_malloc0(s->size);
+    if (s->engine->timer == h26x_done) {
+        s->h26x = nvt_h26x_new();
+    }
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nvt_media_timer, s);
     memory_region_init_io(&s->iomem, OBJECT(dev), &nvt_media_ops, s,
                           TYPE_NVT_MEDIA, s->size);
@@ -968,6 +828,16 @@ static void nvt_media_realize(DeviceState *dev, Error **errp)
     for (i = 0; i < NVT_MEDIA_MAX_IRQS; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
     }
+}
+
+static void nvt_media_unrealize(DeviceState *dev)
+{
+    NvtMediaState *s = NVT_MEDIA(dev);
+
+    nvt_h26x_free(s->h26x);
+    s->h26x = NULL;
+    timer_free(s->timer);
+    g_free(s->regs);
 }
 
 static const Property nvt_media_properties[] = {
@@ -999,6 +869,7 @@ static void nvt_media_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = nvt_media_realize;
+    dc->unrealize = nvt_media_unrealize;
     device_class_set_legacy_reset(dc, nvt_media_reset);
     device_class_set_props(dc, nvt_media_properties);
     dc->vmsd = &vmstate_nvt_media;

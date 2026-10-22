@@ -251,7 +251,20 @@ Its HDAL media engines (`hw/misc/nvt-media.c`) are one table-driven
 device that does each engine's handshakes. Pixels are real from the SIE's
 test pattern through IME's YUV to JPEG (`hw/misc/nvt-pixel.c`), and the
 graphics and ISE engines compute each job from their register file
-(`hw/misc/nvt-gfx.c`); H.26x and audio content are not. The
+(`hw/misc/nvt-gfx.c`). The H.26x driver writes every parameter set
+and slice header itself; with x264 / x265 found by pkg-config at build
+time (CI has neither) `hw/misc/nvt-h26x.c` codes slices that fit them,
+and otherwise writes filler slices. Audio is `hw/misc/nvt-audio.c` (DAI +
+EAC). No register in either holds the sample rate; it comes from CG (PLL7
+and the 0x38 dividers, 256 x fs). The address / size registers queue the
+next buffer, and STOP follows the channel enable (CTRL bits 12..15),
+which the driver blocks on. Capture is a test tone, and playback goes to
+the machine's `audiodev`. Its display engine is
+`hw/display/nvt-ide.c`. The driver sets CTRL bit 28 (load) and waits for
+frame end with no timeout, and its handler wakes the waiter only if load
+already reads 0. So a frame clears load before raising frame end. The
+release has no display modules; OpenIPC's toolchain tarball has them
+(`sdk/kmod/hdal`, `test-novatek-hdal.sh --display-kos`). The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

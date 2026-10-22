@@ -77,7 +77,8 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | IFE / DCE / IPE / IME | `0xF0C70000` / `0xF0C20000` / `0xF0C30000` / `0xF0C40000` | 8 / 7 / 5 / 6 | `nvt-media` |
 | ISE / 2D graphics (2 engines) | `0xF0C90000` / `0xF0C80000`, `0xF0D10000` | 21 / 18, 19 | `nvt-media` |
 | H.26x / JPEG codec | `0xF0A10000` / `0xF0A00000` | 16 / 17 | `nvt-media` |
-| EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-media` |
+| EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-audio` |
+| IDE (display engine) | `0xF0800000` | 48 | `nvt-ide`, on QEMU's console |
 | CSI, LVDS, sensor PHY, TGE, SIF, AI | | | `nvt-media`, storage |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
@@ -641,7 +642,9 @@ Every engine is an `nvt-media` block (`hw/misc/nvt-media.c`): register
 storage, plus the handshakes its driver waits on. Video pixels are real
 from the sensor to JPEG (`hw/misc/nvt-pixel.c`), and the 2D graphics
 engines and the ISE scaler compute their jobs (`hw/misc/nvt-gfx.c`). The
-H.26x bitstream and audio samples are still placeholders.
+H.26x encoder codes real H.264 / H.265 when QEMU is built with x264 /
+x265 (`hw/misc/nvt-h26x.c`). Audio is its own device, `nvt-audio`
+(below).
 
 - **SIE (sensor capture).** While `ACT_EN` is set, a frame comes every
   1/30 s, in three steps the way the sensor's lines would arrive:
@@ -725,8 +728,76 @@ H.26x bitstream and audio samples are still placeholders.
   the release ships no `kdrv_affine.ko`.
 - **H.26x.** `INT_FLAG` is write-1-to-clear, and software reset and DMA
   disable set their finish flags. A picture finishes with:
-  - a filler NAL unit (H.265 FD_NUT) in the bitstream buffer;
-  - its length in `BS_LEN` (report slot 6) and the NAL length list.
+  - the picture in the bitstream buffer;
+  - its length in `BS_LEN` (report slot 6) and the NAL length list;
+  - the slice QP times the macroblocks or CTBs in `QP_SUM` (slot 19).
+
+  A picture the buffer cannot take raises buffer full (bit 12) instead.
+
+  The driver writes every parameter set and slice header in software,
+  and the engine only codes slice data. The headers reach the engine
+  through the BSDMA list at `0x06C`:
+  - a count, then an address and length for each slice;
+  - the length's top nibble is the bits used in the last byte;
+  - H.265 adds a 1-byte entry after the last slice.
+
+  On an IDR the first entry starts with the sequence header (SPS / PPS,
+  plus VPS for H.265). HDAL skips those bytes in the buffer and takes
+  them from its own copy. So a decoder always sees the driver's
+  parameter sets, and real slices must fit them.
+
+  When pkg-config finds x264 / x265 at build time, each stream (keyed by
+  its BSDMA list) gets an encoder set up to match the driver's parameter
+  sets in everything the slice data depends on. The encoder's own headers
+  are parsed and checked against the driver's before it is used.
+  - **H.264:** the driver's slice header goes out unchanged. x264 is made
+    to code at its slice QP and deblocking. In CRF mode the forced QP is
+    exact; in CQP mode x264 would clamp it.
+  - **H.265:** the slice header is built from two sources.
+    - From the driver's: NAL type, POC and reference set.
+    - From x265's: slice type, QP, SAO, deblocking and merge candidates.
+    - x265 signals `cu_qp_delta` only with adaptive quantisation, so it
+      runs in CRF with a small AQ strength, the picture QP still forced.
+
+  The source is NV12 at `0x024` / `0x028`, with the line offsets in words
+  at `0x084`, padded to the coded size.
+
+  **Tiled H.265.** At 2880x1620 the driver codes H.265 in tile columns:
+  - one row of two columns, 1472 and 1408 pixels;
+  - one slice per column, the second starting at that column's first CTB;
+  - no loop filter across tiles or slices.
+
+  So each column decodes like a picture of its own. Intra prediction,
+  CABAC, deblocking and SAO all stop at its edges, as at a picture's
+  edges. Each column gets its own x265 at that width, which codes it as
+  an intra picture.
+
+  Its slice goes out as an I slice under the driver's slice: same
+  address, NAL type, POC and reference set, and no temporal MV
+  prediction. Inter coding could not be stitched this way: a motion
+  vector near a column edge reaches into the next column, which the
+  column's encoder never sees. Tiled streams are therefore all intra.
+
+  Encoding runs in a worker thread (QEMU's thread pool), so a 5 MP
+  picture does not hold the main loop:
+  - the main loop reads the driver's headers and the source;
+  - the worker sets the encoders up and codes;
+  - the main loop then writes the bitstream and raises the interrupt.
+
+  A reset while a picture is coding drops it.
+
+  Without the libraries, every slice is a filler NAL unit, which decoders
+  skip; on an IDR the sequence header still goes in front. The same
+  happens for a stream the encoders cannot match:
+  - several slices without tiles, or tiles in rows or not one slice per
+    column, or filtered across;
+  - a compressed or direct-from-IME source;
+  - a reference that is not the previous picture.
+
+  Such a stream stays filler until its next IDR. So does every stream
+  after a migration, since the encoders are host state. A real picture
+  too big for the buffer raises buffer full, and its stream waits for an
+  IDR as well.
 - **JPEG.** A baseline encoder (float DCT, the standard Annex K Huffman
   tables) reads the 4:2:0 picture:
   - Y and UV at `0x54` and `0x58`, line offsets at `0x60` and `0x64`;
@@ -740,14 +811,41 @@ H.26x bitstream and audio samples are still placeholders.
 
   With no picture to read, every block is coded flat grey ("DC difference
   0, end of block").
-- **EAC.** Its two strobes clear themselves: `LOAD`, and the DC-cancel
-  initial load.
-- **DAI.** The audio DMA is double-buffered:
-  - enabling a direction latches its buffer (DMA load);
-  - each buffer then finishes at 16-bit mono 16 kHz pace, raising buffer
-    full and the next load;
-  - capture fills the buffers with silence;
-  - disabling a direction raises stop.
+- **Audio: the DAI and the EAC** are one device, `nvt-audio`
+  (`hw/misc/nvt-audio.c`), from `dai_reg.h` / `eac_reg.h` as the closed
+  `dai.o` and `Audio.o` drive them.
+
+  The DAI's five DMAs are TX1, TX2, RX1, RX2 and TXLB:
+  - buffer addresses at `0x40`..`0x50`, sizes in words at `0x60`..`0x70`,
+    and where each is now at `0x80`..`0x90`;
+  - formats at `0x10` / `0x14` / `0x18`: mode, sample size, mono in DRAM.
+
+  The address and size registers queue the next buffer:
+  - enabling a DMA takes them (DMA loaded);
+  - each buffer's end raises buffer done and takes them again, so the
+    driver re-arms the queue from its interrupt;
+  - a channel enable (`CTRL` bits 12..15) falling raises stopped, which
+    the driver waits on.
+
+  The driver spins on the current-address registers when it stops, so
+  they advance with time.
+
+  Neither block holds the sample rate. The clock tree gives the DAI 256
+  times it: PLL7 through the eacdac and DAI dividers at CG `0x38`. The
+  kernel's clock setup leaves 48 kHz. The DMAs run at that rate on the
+  virtual clock, and buffer ends land on time.
+  - **RX** captures a test tone: 1 kHz left, 1.5 kHz right, half scale
+    (`-global nvt-audio.tone-hz=`, 0 for silence). With
+    `rx-source=audiodev` it captures the host's input instead.
+  - **TX1** plays to the machine's audiodev (`-M ...,audiodev=` or
+    `-audio`), if one is given, through the EAC's DAC path:
+    - its enable;
+    - L/R averaging, which the driver sets;
+    - its digital gain, 0.5 dB steps from 0xFF.
+
+  The ADC enable and digital gain mute the capture. TX2 and TXLB move
+  their buffers but are not heard. The host's audio is a sink and a
+  source; it never paces the DMA.
 - **CSI, LVDS, the sensor PHY, TGE, SIF, the DDR arbiter.** Storage.
 
 `-global nvt-media.trace=on` logs every access to the media blocks; the
@@ -762,9 +860,15 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 64 things:
+builds them from the vendor SDK (not in CI). The run checks 75 things
+(88 with `--display-kos`, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
-  `hd_video_encode_only` write their bitstreams;
+  `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
+  their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
+  - `hd_video_record`'s tiled stream decodes without an error to the
+    sensor's picture: the bars, the ramp, the box moving;
+  - both of `hd_video_encode_only`'s streams decode without an error to
+    the input's frames in order, each within 30 dB PSNR;
 - both of `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
 - `hd_video_capture_only` runs;
 - eleven `hd_gfx_only` operations run cleanly, with these results:
@@ -775,7 +879,16 @@ builds them from the vendor SDK (not in CI). The run checks 64 things:
   - scaling up and down from patterned inputs;
   - the 1 MiB DMA copy and 16-bit subtraction pass the sample's own
     comparisons;
-- `hd_audio_capture_only` captures PCM.
+- the audio samples, run with the machine's audiodev a wav file:
+  - `hd_audio_capture_only` captures the test tone, 1 kHz left and
+    1.5 kHz right;
+  - `hd_audio_output_only` (playing that capture) and
+    `hd_audio_livesound` (capture looped to playback) leave both tones
+    in the wav;
+  - `hd_audio_record`'s AAC decodes (ffmpeg) to them.
+- with the display modules, `hd_video_output_only` (colour bars from a
+  file) and `hd_video_liveview` (the sensor) put their pictures on the
+  panel: QEMU's screendump of each, taken half way, shows the bars.
 
 None of them reports an HDAL error.
 
@@ -792,9 +905,65 @@ driver offers.
 
 With Python PIL, the run also checks the snapshots' content: the eight
 colour bars, the ramp from dark to light, and the box moving between the
-two snapshots. That makes 51 checks.
+two snapshots.
 
 `test-novatek.py` checks each engine's handshake at register level, in CI.
+
+## Display
+
+The display path is the IDE (`hw/display/nvt-ide.c`) at `0xF0800000`,
+SPI 48, scanned out to QEMU's graphic console. It drives LCD panels or
+MIPI DSI; the chip has no TV or HDMI output. The EVB's panel is a 3.5"
+HX8238D on 8-bit serial RGB, 320x240 at about 61 Hz. Each line is 960
+clocks, one colour each, and the IDE's windows are 960 wide too. Out of
+a serial-RGB device the console therefore shows every third column, at
+320x240.
+
+**Modules.** The OpenIPC release leaves the display modules out, but its
+toolchain (`toolchain.novatek-nt9856x.tgz`, `sdk/kmod/hdal`) carries
+them, built for the release kernel. The SDK's init script loads them in
+this order:
+1. `nvt_ide`;
+2. `kdrv_videoout`;
+3. `kflow_videoout`;
+4. `nvt_dispdev_panel`;
+5. the panel, `disp_if8b_lcd1_pw35p00`.
+
+The generated device tree has their nodes, from the EVB's dtsi files:
+- `ide@f0800000`, whose name the clock driver finds its clocks by;
+- `dispobj` and `dispdev`;
+- `/display`, the panel's GPIO wiring (`lcd_ctrl` 1: its registers are
+  bit-banged on D_GPIO 3 / 4 / 5).
+
+**The IDE** (`ide_reg.h`, as the closed `ide2.o` / `ide_idec.o` drive
+it; the vendor U-Boot has the same driver as source):
+- CTRL `0x000`: layer enables, the device type [10:7], on (bit 27) and
+  load (bit 28). DMA idle (bit 2) reads 1 while the DMA is disabled or
+  the engine is off.
+- Most registers take effect at the next frame. The driver sets load,
+  then waits with no timeout for frame end (INT `0x0FC` bit 23, enable
+  bit 7, write 1 to clear). Its handler wakes the waiter only if load
+  reads 0 by then. So each frame latches the registers, clears load,
+  and only then raises frame end.
+- Frames run at 60 Hz while the engine is on. With it off, the driver
+  sleeps a frame instead of waiting.
+
+Scanout composes the background (`0x0BC`, YCbCr) and then the layers:
+video 1, video 2, OSD 1. Each layer's buffer is scaled into its window,
+nearest neighbour, with mirroring. The formats:
+- video: 9 and 10, YUV 4:2:2 and 4:2:0 with interleaved CbCr;
+- OSD 1: the 8-bit palette (256 entries of Y, Cb, Cr and alpha at
+  `0x200`), ARGB8888, ARGB4444 and ARGB1555.
+
+OSD 1 blends by its alpha select: opaque, global alpha, or the pixel's.
+Its colour key is honoured. Other formats log as unimplemented.
+
+`test-novatek-hdal.sh --display-kos DIR` loads the modules and checks
+that the IDE, dispobj and dispdev bind and the panel driver comes up.
+CI runs this, with the kmods extracted from the toolchain. With
+`--samples`, `hd_video_output_only` and `hd_video_liveview` run too, and
+the screendumps are checked. `test-novatek.py` checks the frame
+handshake and a screendump of a video and an OSD layer.
 
 ## Ethernet
 
@@ -902,14 +1071,20 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   words are storage, and every interrupt goes to SPI 0).
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
-- The H.26x bitstream and audio samples: placeholders (see HDAL media).
-  The IPP applies no DCE / IPE corrections and only IME output path 1,
+- The EAC's analog gains, ALC and filters (the capture is the tone or
+  the host's input as is), and TX2 / TXLB output. H.26x pictures are real
+  only with x264 / x265 built in, and tiled streams are intra only. The
+  IPP applies no DCE / IPE corrections and only IME output path 1,
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
-  ignores the sensor's real timing (fixed 30 fps), and the DAI paces audio
-  at a nominal rate. AI/CNN, MD, DIS, VPE, IVE and the display path are
-  not wired.
+  ignores the sensor's real timing (fixed 30 fps). AI/CNN, MD, DIS, VPE and IVE
+  are not wired.
+- Display: MIPI DSI (only the `ifdsi` panels use it, and its driver
+  waits on interrupts the model does not raise), the IDE's 1/2/4-bit
+  palettes and ARGB8565 / 4565, its colour pipeline (gamma, CST), face
+  boxes and lines, and `/dev/fb0`. The release kernel has no
+  `CONFIG_FB`, so `nvt_fb.ko` does not load.
 
 ## NT98332 (NA51103)
 

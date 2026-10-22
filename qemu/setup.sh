@@ -101,13 +101,18 @@ cp qemu/hw/misc/nvt-rsa.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-media.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-pixel.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-gfx.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-audio.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-h26x.c          "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/nvt-pixel.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/nvt-gfx.h   "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/nvt-cg.h    "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/nvt-h26x.h  "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/nvt-dai.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-engine.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-hdmi.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-h26xdec.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/display/nvt-lcd300.c     "$QEMU_DIR/hw/display/"
+cp qemu/hw/display/nvt-ide.c        "$QEMU_DIR/hw/display/"
 cp qemu/hw/timer/nvt-timer.c        "$QEMU_DIR/hw/timer/"
 cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/rtc/nvt-rtc.c            "$QEMU_DIR/hw/rtc/"
@@ -501,13 +506,31 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-pixel misc/nvt-gfx misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-pixel misc/nvt-gfx misc/nvt-audio misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 display/nvt-ide timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
         echo "  hw/${f%/*}/meson.build: added ${f#*/}.c"
     fi
 done
+# The H.26x engine codes its pictures with x264 / x265 when pkg-config
+# finds them, and writes filler slices when it does not (nvt-h26x.c).
+# (The defines reach every system_ss file; only nvt-h26x.c looks.)
+if ! grep -q "'nvt-h26x.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'MESON'
+nvt_x264 = dependency('x264', required: false)
+nvt_x265 = dependency('x265', required: false)
+nvt_h26x = [files('nvt-h26x.c')]
+if nvt_x264.found()
+  nvt_h26x += [nvt_x264, declare_dependency(compile_args: '-DNVT_H26X_X264')]
+endif
+if nvt_x265.found()
+  nvt_h26x += [nvt_x265, declare_dependency(compile_args: '-DNVT_H26X_X265')]
+endif
+system_ss.add(when: 'CONFIG_NOVATEK', if_true: nvt_h26x)
+MESON
+    echo "  hw/misc/meson.build: added nvt-h26x.c"
+fi
 if ! grep -q "'novatek.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('novatek.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
