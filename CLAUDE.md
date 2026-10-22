@@ -293,6 +293,15 @@ a key queued before the CPU runs: start QEMU with `-S` and the serial line
 on a socket (`qemu-boot/test-novatek-uboot.sh`). Keyboard input to any
 16550 that a guest resets before reading relies on
 `qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch`.
+`nt98533` (NS02501, `docs/novatek.md#nt98533-ns02501`) is NA51089's
+peripherals at the same addresses around two Cortex-A32s (a Cortex-A7
+here), a GIC-400 at `0xFFF01000` and the generic timer, with its own init
+(`novatek_ns02501_init`). Everything runs in secure SVC; the A7 keeps EL2
+only because U-Boot clears CNTVOFF from monitor mode. The second core is
+off until something writes `0xF0090100` (the loader's core-2 release
+register, the kernel's `cpu-release-addr`). No DT is built: `-kernel`
+needs the SDK board tree; `qemu-boot/build-ns02501-sdk.sh` builds it, the
+SDK U-Boot and kernel, and `test-nt98533.sh` runs them.
 The aarch64 `nt98332` (NA51103, `docs/novatek.md#nt98332-na51103`) shares
 `novatek.c` but has its own init: blocks at `0x2_F0000000`, a GIC-400 that
 must have its security extensions (the vendor U-Boot regroups every IRQ

@@ -2397,6 +2397,48 @@ def test_boot_rom(qemu, tmp):
     os.unlink(nand)
 
 
+# ---- nt98533: NS02501 ----------------------------------------------------
+
+def test_nt98533(qemu, tmp):
+    """NA51089's blocks at NA51089's addresses around a GIC-400, and the
+    SDK NOR layout's flash boot (FDT at 0x10000, plain U-Boot)."""
+    print('nt98533 (NS02501)')
+    path = os.path.join(tmp, 'ns02501.bin')
+    payload, dtb = make_boot_image(path, bcl=b'')
+    img = bytearray(open(path, 'rb').read())
+    rng = random.Random(533)
+    payload = bytes(rng.randrange(256) for _ in range(4096))
+    img[0x50000:0x50000 + len(payload)] = payload
+    open(path, 'wb').write(img)
+    qt = QTest(qemu, 'nt98533,flash-file=' + path)
+    try:
+        check('chip ID 0x5521 (CHIP_NS02501) in TOP_VERSION[31:16]',
+              qt.readl(TOP + 0xF0) >> 16, 0x5521)
+        typer = qt.readl(0xFFF01004)
+        check('GIC-400 distributor at 0xFFF01000: 128 SPIs, two CPUs',
+              (typer & 0x1F, (typer >> 5) & 7), (4, 1))
+        qt.writel(0xF0090104, 0x12345678)
+        check('core communicator command buffer keeps its value',
+              qt.readl(0xF0090104), 0x12345678)
+        check('UART 0 at 0xF0290000 (16550 LSR: THR empty)',
+              qt.readl(0xF0290014) & 0x60, 0x60)
+        check('plain U-Boot copied to /nvt_memory_cfg/uboot',
+              qt.read(0x3900000, len(payload)), payload)
+        check('SHMINFO at /nvt_memory_cfg/shmem says LD_NVT',
+              qt.read(0x200000, 6), b'LD_NVT')
+        check('a branch to U-Boot at 0',
+              (qt.readl(0), qt.readl(4)) == (0xE51FF004, 0x3900000), True)
+    finally:
+        qt.close()
+    out = subprocess.run([qemu, '-M', 'nt98533', '-display', 'none',
+                          '-nodefaults', '-kernel', path],
+                         capture_output=True, text=True, timeout=30)
+    check('-kernel without a board tree is refused',
+          out.returncode == 1 and 'needs a board device tree' in out.stderr,
+          True)
+    os.unlink(path)
+
+
 # ---- nt98332: the NA51103 flash boot ----------------------------------
 
 NA51103_UBOOT = 0x1E000000
@@ -3108,6 +3150,8 @@ def run(args, tmp):
     finally:
         qt.close()
     os.unlink(locks)
+
+    test_nt98533(args.qemu, tmp)
 
     if os.path.exists(args.qemu_aarch64):
         test_nt98332_boot(args.qemu_aarch64, tmp)
