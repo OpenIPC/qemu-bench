@@ -1609,6 +1609,129 @@ def test_media(qt):
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
 
 
+GRPH2 = 0xF0D10000
+GA, GB, GC = 0x01500000, 0x01510000, 0x01520000
+
+
+def gfx_job(qt, base, regs, lladdr=0xD0):
+    """One job through the engine's linked list; regs {offset: value}."""
+    qt.write(LL, b''.join(ll_upd(o, v) for o, v in regs.items()) +
+             struct.pack('<Q', 0))
+    qt.writel(base + lladdr, LL)
+    qt.writel(base + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    qt.writel(base + 0x0C, 0xFFFFFFFF)
+
+
+def grph(qt, cfg, w, h, a=GA, alofs=0, b=GB, blofs=0, c=GC, clofs=0,
+         const=(0, 0), base=GRPH):
+    gfx_job(qt, base, {0x04: cfg, 0x20: 0, 0x24: 0, 0x28: 0,
+                       0x60: const[0], 0x64: const[1],
+                       0x70: a, 0x74: alofs or w, 0x80: b, 0x84: blofs or w,
+                       0x90: c, 0x94: clofs or w, 0x78: h, 0x7C: w})
+
+
+def test_gfx(qt):
+    print('nvt-media graphics and ISE')
+    # A_COPY, 8-bit: 16 bytes x 2 lines between line offsets 32 and 16
+    src = bytes(range(64))
+    qt.write(GA, src)
+    grph(qt, 0x00000011, 16, 2, alofs=32, clofs=16)
+    check('A_COPY: two lines of 16 bytes, line offset 32 to 16',
+          qt.read(GC, 32).hex(), (src[:16] + src[32:48]).hex())
+    # MINUS_SHF, 16-bit, as hd_gfx_arithmetic: (6000 + i) - i
+    qt.write(GA, struct.pack('<8H', *[6000 + i for i in range(8)]))
+    qt.write(GB, struct.pack('<8H', *range(8)))
+    grph(qt, 0x02000021, 16, 1)
+    check('MINUS_SHF 16-bit: (6000 + i) - i',
+          struct.unpack('<8H', qt.read(GC, 16)), (6000,) * 8)
+    qt.write(GA, struct.pack('<2H', 5, 9))
+    qt.write(GB, struct.pack('<2H', 9, 5))
+    grph(qt, 0x02000021, 4, 1, const=(1 << 31, 0))
+    check('and its magnitude (CONST1 bit 31): |5 - 9|, |9 - 5|',
+          struct.unpack('<2H', qt.read(GC, 4)), (4, 4))
+    qt.write(GA, bytes([200, 10]))
+    qt.write(GB, bytes([100, 20]))
+    grph(qt, 0x01000011, 2, 1)
+    check('PLUS_SHF 8-bit saturates: 200 + 100, 10 + 20',
+          list(qt.read(GC, 2)), [255, 30])
+    # TEXT_COPY, 8-bit: an NV12 green U / V pair laid over the words
+    grph(qt, 0x08000011, 6, 2, c=GC + 2, clofs=8, const=(0x142A142A, 0))
+    check('TEXT_COPY 8-bit: U V pairs from an address 2 mod 4, two lines',
+          (qt.read(GC + 2, 6).hex(), qt.read(GC + 10, 6).hex()),
+          ('2a142a142a14', '2a142a142a14'))
+    # PACKING: U and V planes into pairs
+    qt.write(GA, bytes([1, 2, 3, 4]))
+    qt.write(GB, bytes([5, 6, 7, 8]))
+    grph(qt, 0x10000011, 8, 1)
+    check('PACKING: U from A, V from B, interleaved',
+          list(qt.read(GC, 8)), [1, 5, 2, 6, 3, 7, 4, 8])
+    # RGBYUV_BLEND, ARGB4444 over NV12: two opaque green pixels, two
+    # transparent ones, two lines
+    qt.write(GA, struct.pack('<8H', *([0xF0F0] * 2 + [0x0F00] * 2) * 2))
+    qt.write(GB, bytes([0x10]) * 8)
+    qt.write(GC, bytes([0x80]) * 4)
+    grph(qt, 0x18000421, 8, 2, blofs=4, clofs=4, const=(0x21, 0))
+    check('RGBYUV_BLEND ARGB4444: opaque green over Y, transparent leaves it',
+          (qt.read(GB, 4).hex(), qt.read(GB + 4, 4).hex()),
+          ('93931010', '93931010'))
+    check('and over the 4:2:0 U / V pairs', qt.read(GC, 4).hex(), '2a148080')
+    # with mixed alpha in a 2x2 block the colour is alpha-weighted: an
+    # opaque green beside transparent red pixels stays green
+    qt.write(GA, struct.pack('<4H', 0xF0F0, 0x0F00, 0x0F00, 0x0F00))
+    qt.write(GB, bytes([0x10]) * 4)
+    qt.write(GC, bytes([0x80]) * 2)
+    grph(qt, 0x18000421, 4, 2, alofs=4, blofs=2, clofs=2, const=(0x21, 0))
+    check('RGBYUV_BLEND: transparent pixels add none of their colour '
+          '(U / V of a quarter green over grey)', qt.read(GC, 2).hex(),
+          '6b65')
+    # 16-bit fill of an odd width: the last byte is left as it was
+    qt.write(GC, bytes([0xEE]) * 4)
+    grph(qt, 0x08000021, 3, 1, const=(0x1234, 0))
+    check('TEXT_COPY 16-bit, odd width: whole pixels filled, the odd byte '
+          'kept', qt.read(GC, 4).hex(), '3412eeee')
+    # a broken list: no work, list error (status bit 2)
+    qt.write(GC, bytes([0x55]) * 4)
+    qt.write(LL, ll_upd(0x04, 0x08000011) + ll_upd(0x90, GC) +
+             struct.pack('<Q', 7 << 61))
+    qt.writel(GRPH + 0xD0, LL)
+    qt.writel(GRPH + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    check('a malformed list: list error, no fill done',
+          (qt.readl(GRPH + 0x0C), qt.read(GC, 4).hex()), (0x4, '55555555'))
+    qt.writel(GRPH + 0x0C, 0xFFFFFFFF)
+    # GOP on engine 2: a vertical flip (C at the last line), then a
+    # horizontal one at 16 bits
+    qt.write(GA, bytes([1, 1, 2, 2, 3, 3]))
+    grph(qt, 0x00040010, 2, 3, c=GC + 4, base=GRPH2)
+    check('VTC_FLIP: line y of A lands y lines above C',
+          list(qt.read(GC, 6)), [3, 3, 2, 2, 1, 1])
+    qt.write(GA, struct.pack('<4H', 1, 2, 3, 4))
+    grph(qt, 0x00030020, 8, 1, base=GRPH2)
+    check('HRZ_FLIP 16-bit: a line reversed in 16-bit units',
+          struct.unpack('<4H', qt.read(GC, 8)), (4, 3, 2, 1))
+
+    # ISE: a 4x4 Y8 ramp (10 x) up to 7x7, bilinear; and down to 2x2,
+    # integration; U / V pairs, nearest
+    qt.write(GA, bytes(10 * x + y for y in range(4) for x in range(4)))
+    def ise(ctrl, iw, ih, ow, oh, ilofs, olofs):
+        gfx_job(qt, ISE, {0x04: ctrl, 0x10: ih << 16 | iw, 0x18: ilofs,
+                          0x20: GA, 0x38: oh << 16 | ow, 0x90: olofs,
+                          0x98: GC}, lladdr=0x2C)
+    ise(0x100, 4, 4, 7, 7, 4, 8)
+    check('ISE bilinear 4x4 to 7x7: corners kept, half steps between',
+          (list(qt.read(GC, 7)), qt.read(GC + 6 * 8 + 6, 1)[0]),
+          ([0, 5, 10, 15, 20, 25, 30], 33))
+    ise(0x300, 4, 4, 2, 2, 4, 4)
+    check('ISE integration 4x4 to 2x2: each output the average it covers',
+          (list(qt.read(GC, 2)), list(qt.read(GC + 4, 2))),
+          ([6, 26], [8, 28]))
+    qt.write(GA, bytes([10, 20, 30, 40, 50, 60, 70, 80]))
+    ise(0x203, 4, 1, 2, 1, 8, 4)
+    check('ISE nearest, U / V pairs: every other pair',
+          list(qt.read(GC, 4)), [10, 20, 50, 60])
+
+
 def test_pixels(qt):
     print('nvt-media pixels')
     # SIE: the test pattern, RGGB, 12-bit packed, at DRAM output 0
@@ -2467,6 +2590,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_pixels(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_gfx(qt)
     finally:
         qt.close()
 
