@@ -11,8 +11,9 @@
  *                  9 parallel, 0xD MIPI DSI), 22 RGBD, 26 through, 27 the
  *                  engine on, 28 load
  *   0x0BC          background Y [7:0], Cb [15:8], Cr [23:16]
- *   0x0D0 / 0x0D8  horizontal / (odd field) vertical active start [11:0]
- *                  and end [28:12]
+ *   0x0D0 / 0x0D8  horizontal active start [11:0] / (odd field) vertical
+ *                  active start [10:0] (ide_reg.h: 11 bits), and end
+ *                  [28:12]
  *   0x0FC INT      enables [15:0], status [31:16] (write 1 to clear):
  *                  bit 7 / 23 frame end
  *   layers V1 / V2 / OSD1:
