@@ -90,9 +90,9 @@ build() {           # build <sample> [sensor]: sensor samples get SC501AI
         perl -0pi -e 's{(\n\s*// stop video_record modules \(main\)\n)}{\n\n\t// destroy feed yuv thread, before the stop: it may be pushing\n\tpthread_join(stream[0].yuv_thread_id, NULL);\n$1};
             s{\n\s*// destroy feed yuv thread\n\s*pthread_join\(stream\[0\]\.yuv_thread_id, NULL\);\n}{\n}' \
             "$src/"*.c
-        if [ "$(grep -c 'pthread_join(stream\[0\].yuv_thread_id' "$src/"*.c)" != 1 ] ||
-                ! grep -A4 'pthread_join(stream\[0\].yuv_thread_id' "$src/"*.c |
-                grep -q 'hd_videoenc_stop'; then
+        if [ "$(cat "$src/"*.c | grep -c 'pthread_join(stream\[0\].yuv_thread_id')" != 1 ] ||
+                ! cat "$src/"*.c | grep -A4 'pthread_join(stream\[0\].yuv_thread_id' |
+                grep -c 'hd_videoenc_stop' >/dev/null; then
             echo "hd_video_encode_only: its shutdown is not the SDK's as known" >&2
             exit 1
         fi
