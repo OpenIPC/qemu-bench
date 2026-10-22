@@ -1599,7 +1599,7 @@ static const struct {
 static const NvtSoCConfig nt98332_soc = {
     .desc               = "Novatek NT98332 (2x Cortex-A53, NA51103, 1 GB)",
     .model              = "Novatek NA51103",
-    .chip_id            = 0x0000,   /* not known yet */
+    .chip_id            = 0x8B20,   /* U-Boot arch-nvt-na51103: CHIP_NA51103 */
     .ram_size_default   = 1 * GiB,
     .linux_mem          = 0x09600000,
 };

@@ -1184,7 +1184,24 @@ an aarch64 kernel, a GIC-400, the ARMv8 generic timer at 12 MHz, and 1 GB of
 DDR. Novatek's blocks sit above 4 GiB, from `0x2_F0000000`; most keep
 NA51089's register layout at new offsets, the same offsets as NA51090's
 (OpenIPC `u-boot-nt9856x`, `arch-nvt-na51090_a64/IOAddress.h`). The
-NT9832x SDK is NA51068, a different die, and does not describe it.
+NT9832x SDK is NA51068, a different die, and does not describe it. The
+NT9856x v1.01.007 U-Boot does (`arch-nvt-na51103_a64`). Its chip ID,
+`CHIP_NA51103` = `0x8B20`, is TOP's version word here. Its
+`IOAddress.h` agrees with the dump's tree on these blocks: TOP, CG, PAD,
+GPIO, WDT, the timer, the flash controller, the UARTs, Ethernet, USB,
+RTC, OTP, the GIC and the LCD300 (`IDE`). It also lists blocks the NVR's
+tree does not use, which are not modelled:
+
+- SDIO 1 / 2 at `0x2_F0190000` / `0x2_F01A0000` (U-Boot's EVB tree has
+  `mmc@2,f0190000`);
+- a second Ethernet at `0x2_F0450000`;
+- I2C 1–4 at `0x2_F01C0000`–`0x2_F01F0000`;
+- PWM at `0x2_F0120000`;
+- the system counter at `0x2_FFE50000` / `0x2_FFE60000`.
+
+Much of the header is a template copy of NA51089's. Its media and display
+lines contradict the dump's tree (HDMI at `0x820000`, the DAI at
+`0x630000` on top of the OTP, CSI on the first UART), and the tree wins.
 
 It was brought up on a Xiongmai NBD80N36RA-KL NVR (FW98332A loader,
 U-Boot 2019.04, kernel 4.19.148, HDAL 3.03), from a 16 MiB SPI NOR dump.
