@@ -1477,6 +1477,14 @@ def test_media(qt):
           (qt.readl(H26X + 0x268), nal[:6].hex(), nal[63]),
           (64, '000000014c01', 0x80))
     qt.writel(H26X + 0x004, 0xFFFFFFFF)
+    qt.write(DST, b'\x55' * 8)
+    qt.writel(H26X + 0x07C, 0)
+    qt.writel(H26X + 0x000, 0x100)
+    qt.step(1000 * 1000)
+    check('no bitstream buffer: finishes with BS_LEN 0, writes nothing',
+          (qt.readl(H26X + 0x004) & 1, qt.readl(H26X + 0x268),
+           qt.read(DST, 8)), (1, 0, b'\x55' * 8))
+    qt.writel(H26X + 0x004, 0xFFFFFFFF)
 
     # JPEG: reset, DMA idle, a grey 4-MCU picture
     gic_enable(qt, 17)
@@ -2013,6 +2021,19 @@ def test_fdt(qemu, tmp):
                             'i2c3@f03a0000']).count(-1), 0)
     check('the NOR under spinor.c', b'nvt,nvt_spinor\0' in data and
           b'spi_nor.0\0' in data, True)
+
+    subprocess.run([qemu, '-M', 'nt98562', '-m', '64M',
+                    '-machine', 'dumpdtb=' + dtb, '-kernel', kernel,
+                    '-display', 'none', '-nodefaults'],
+                   capture_output=True, timeout=30)
+    small = open(dtb, 'rb').read()
+    check('-m 64: the SDK split, Linux 30 MB, the media pool the rest',
+          (find_nodes(small, ['hdal-memory'])[0] > 0,
+           cells(0, 0x01E00000) in small,
+           cells(0x01E00000, 0x02200000) in small), (True, True, True))
+    check('224 MB: Linux 128 MB, the pool 96 MB after it',
+          (cells(0, 0x08000000) in data, cells(0x08000000, 0x06000000) in data),
+          (True, True))
 
     nand = os.path.join(tmp, 'fdt-nand.bin')
     with open(nand, 'wb') as f:

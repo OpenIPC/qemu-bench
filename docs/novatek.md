@@ -35,8 +35,10 @@ The SDK's memory tables (`nvt-mem-tbl.dtsi`) give Linux 30 or 32 MiB and
 the HDAL media pool the rest. That is too little to run the HDAL samples
 and their files beside the media modules, so both machines get 224 MiB by
 default, more than the packages hold: Linux the first 128 MiB, and the
-96 MiB media pool (`/hdal-memory`) after it. `-m` resizes the pool. The
-vendor firmware boots with its own device tree and its own split.
+96 MiB media pool (`/hdal-memory`) after it. A larger `-m` grows the
+pool. With less (`-m 64M` or `128M`, the packages' sizes) the machines fall
+back to the SDK's split. The vendor firmware boots with its own device
+tree and its own split.
 
 The CPU is QEMU's Cortex-A9 with its MIDR set to r4p1. QEMU's default is
 r0p0, and Linux's `arm_global_timer` refuses anything before r2p0 (a
@@ -687,12 +689,12 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 47 things:
+builds them from the vendor SDK (not in CI). The run checks 48 things:
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` write their bitstreams;
-- `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
+- both of `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
 - `hd_video_capture_only` runs;
-- nine `hd_gfx_only` operations write their results;
+- nine `hd_gfx_only` operations exit cleanly and write their results;
 - `hd_audio_capture_only` captures PCM.
 
 None of them reports an HDAL error.

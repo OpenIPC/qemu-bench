@@ -14,12 +14,12 @@
 #   - hd_video_record: sensor -> SIE -> IFE / DCE / IPE / IME -> H.265,
 #     the bitstream file written, no HDAL error;
 #   - hd_video_snapshot: two JPEG snapshots, each a whole JPEG (SOI ...
-#     EOI) that a decoder reads as a 2880x1620 picture;
+#     EOI) that a decoder (Python PIL) reads as a 2880x1620 picture;
 #   - hd_video_capture_only, hd_video_encode_only (H.264 / H.265 from a
 #     file of frames): no HDAL error;
 #   - hd_gfx_only: copy, scale (ISE), rotation, colour transform, lines,
-#     rectangles, job lists, YUV420 3P -> 2P and 3P scaling each report
-#     their result file;
+#     rectangles, job lists, YUV420 3P -> 2P and 3P scaling each exit
+#     without an error and leave their result file;
 #   - hd_audio_capture_only: PCM captured through EAC and the DAI DMA.
 #
 # The engines move no pixels: frames, bitstreams and samples are
@@ -118,7 +118,9 @@ run() {         # run <sample> [keys]: the keys 4 s apart, then q
     shift
     ( sleep 6; for k in "$@"; do echo "$k"; sleep 4; done; echo q ) |
         timeout 60 ./$n > /tmp/$n.out 2>&1
-    echo "NVT-HDAL-RUN: $n rc=$? errors=$(grep -c -i 'err\|fail' /tmp/$n.out)"
+    RC=$?
+    ERRS=$(grep -c -i 'err\|fail' /tmp/$n.out)
+    echo "NVT-HDAL-RUN: $n rc=$RC errors=$ERRS"
 }
 size() {
     [ -f "$1" ] && wc -c < "$1" || echo 0
@@ -129,9 +131,11 @@ run hd_video_snapshot s s
 for j in /mnt/sd/dump_bs_snap0.jpg /mnt/sd/dump_bs_snap1.jpg; do
     echo "NVT-HDAL-JPEG: ${j##*/} $(head -c 2 $j | hexdump -e '2/1 "%02x"') $(tail -c 2 $j | hexdump -e '2/1 "%02x"') $(size $j)"
 done
-echo "NVT-HDAL-JPEG-B64-BEGIN"
-base64 /mnt/sd/dump_bs_snap0.jpg
-echo "NVT-HDAL-JPEG-B64-END"
+for n in 0 1; do
+    echo "NVT-HDAL-JPEG-B64-BEGIN $n"
+    base64 /mnt/sd/dump_bs_snap$n.jpg
+    echo "NVT-HDAL-JPEG-B64-END $n"
+done
 rm -f /mnt/sd/*
 run hd_video_capture_only
 dd if=/dev/zero of=/mnt/sd/video_frm_352_288_30_yuv420.dat bs=1k count=4455 2>/dev/null
@@ -143,7 +147,8 @@ dd if=/dev/zero of=/mnt/sd/video_frm_1920_1080_1_yuv420.dat bs=3110400 count=1 2
 dd if=/dev/zero of=/mnt/sd/video_frm_1920_1080_1_yuv4203P.dat bs=1M count=4 2>/dev/null
 for k in c s o t l r j p d; do
     run hd_gfx_only $k
-    echo "NVT-HDAL-GFX: $k $(grep -c '^result is' /tmp/hd_gfx_only.out)"
+    f=$(sed -n 's/^result is //p' /tmp/hd_gfx_only.out | head -1)
+    echo "NVT-HDAL-GFX: $k rc=$RC errors=$ERRS bytes=$(size "$f")"
     rm -f /mnt/sd/hd_gfx* /mnt/sd/affine*
 done
 rm -f /mnt/sd/*
@@ -207,21 +212,25 @@ if [ -n "$SAMPLES" ]; then
         expect "NVT-HDAL-JPEG: dump_bs_snap$n.jpg ffd8 ffd9 [1-9]" \
             "snapshot $n: SOI .. EOI"
     done
-    sed -n '/NVT-HDAL-JPEG-B64-BEGIN/,/NVT-HDAL-JPEG-B64-END/p' "$WORK/console.log" |
-        grep -a -v 'NVT-HDAL' | tr -d '\r' | base64 -d > "$WORK/snap0.jpg" 2>/dev/null || true
-    dim=$(python3 -c "
+    for n in 0 1; do
+        sed -n "/NVT-HDAL-JPEG-B64-BEGIN $n/,/NVT-HDAL-JPEG-B64-END $n/p" \
+            "$WORK/console.log" | grep -a -v 'NVT-HDAL' | tr -d '\r' |
+            base64 -d > "$WORK/snap$n.jpg" 2>/dev/null || true
+        dim=$(python3 -c "
 from PIL import Image
-im = Image.open('$WORK/snap0.jpg'); im.load(); print('%dx%d' % im.size)
+im = Image.open('$WORK/snap$n.jpg'); im.load(); print('%dx%d' % im.size)
 " 2>/dev/null || true)
-    if [ "$dim" = 2880x1620 ]; then
-        pass "snapshot 0 decodes: a 2880x1620 JPEG"
-    elif [ -z "$dim" ] && ! python3 -c 'import PIL' 2>/dev/null; then
-        echo "SKIP: snapshot decode (no Python PIL)"
-    else
-        bad "snapshot 0 decodes: a 2880x1620 JPEG (got '$dim')"
-    fi
+        if [ "$dim" = 2880x1620 ]; then
+            pass "snapshot $n decodes: a 2880x1620 JPEG"
+        elif [ -z "$dim" ] && ! python3 -c 'import PIL' 2>/dev/null; then
+            echo "SKIP: snapshot $n decode (no Python PIL)"
+        else
+            bad "snapshot $n decodes: a 2880x1620 JPEG (got '$dim')"
+        fi
+    done
     for k in c s o t l r j p d; do
-        expect "NVT-HDAL-GFX: $k 1" "hd_gfx_only '$k' writes its result"
+        expect "NVT-HDAL-GFX: $k rc=0 errors=0 bytes=[1-9]" \
+            "hd_gfx_only '$k': no error, its result file written"
     done
     if grep -a -q 'NVT-HDAL-AUDIO-BYTES: [1-9]' "$WORK/console.log"; then
         pass "hd_audio_capture_only captures PCM"

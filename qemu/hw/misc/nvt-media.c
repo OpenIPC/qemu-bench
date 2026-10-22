@@ -394,17 +394,22 @@ static void h26x_done(NvtMediaState *s)
 {
     uint8_t nal[H26X_FILLER_LEN];
     uint32_t len = MIN(H26X_FILLER_LEN, *reg(s, H26X_BSOUT_SIZE));
-    uint32_t le = cpu_to_le32(len);
+    uint32_t le;
 
-    memset(nal, 0xFF, sizeof(nal));
-    nal[0] = 0;
-    nal[1] = 0;
-    nal[2] = 0;
-    nal[3] = 1;
-    nal[4] = 38 << 1;               /* FD_NUT */
-    nal[5] = 1;
-    nal[len - 1] = 0x80;            /* rbsp trailing bits */
-    if (len >= 8) {
+    if (len < 8) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-media h26x: a %u-byte "
+                      "bitstream buffer\n", *reg(s, H26X_BSOUT_SIZE));
+        len = 0;
+    } else {
+        memset(nal, 0xFF, sizeof(nal));
+        nal[0] = 0;
+        nal[1] = 0;
+        nal[2] = 0;
+        nal[3] = 1;
+        nal[4] = 38 << 1;           /* FD_NUT */
+        nal[5] = 1;
+        nal[len - 1] = 0x80;        /* rbsp trailing bits */
+        le = cpu_to_le32(len);
         dma_memory_write(&address_space_memory, *reg(s, H26X_BSOUT_ADDR),
                          nal, len, MEMTXATTRS_UNSPECIFIED);
         if (*reg(s, H26X_NAL_LEN_ADDR)) {

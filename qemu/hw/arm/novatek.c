@@ -247,8 +247,9 @@ static const struct {
  * the HDAL samples and their files beside the media modules, so the
  * machines are given more than the package holds: Linux the first
  * 128 MB, the media pool (/hdal-memory) the 96 MB after it -- the
- * NT98566 board's pool.  -m sizes the pool; the vendor firmware's own
- * device tree keeps its own split.
+ * NT98566 board's pool.  -m sizes the pool.  With less RAM than that
+ * (-m 64 / 128, the packages' sizes) the machine falls back to the SDK's
+ * split.  The vendor firmware's own device tree keeps its own.
  */
 #define NVT_LINUX_MEM       (128 * MiB)
 #define NVT_RAM_DEFAULT     (NVT_LINUX_MEM + 96 * MiB)
@@ -259,6 +260,7 @@ static const NvtSoCConfig nt98562_soc = {
     .chip_id            = 0x7021,
     .ram_size_default   = NVT_RAM_DEFAULT,
     .linux_mem          = NVT_LINUX_MEM,
+    .sdk_linux_mem      = 0x01E00000,       /* cfg_562_IPCAM1_NOR_EVB */
 };
 
 static const NvtSoCConfig nt98566_soc = {
@@ -267,6 +269,7 @@ static const NvtSoCConfig nt98566_soc = {
     .chip_id            = 0x7021,
     .ram_size_default   = NVT_RAM_DEFAULT,
     .linux_mem          = NVT_LINUX_MEM,
+    .sdk_linux_mem      = 0x02000000,       /* FW98566A.bin, IPCAM1_EVB */
 };
 
 /* "nvt,ca9" is what mach-nvt-ivot/board-dt.c matches. */
@@ -903,7 +906,8 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     int n;
 
     nvt_config = c;
-    nvt_linux_mem = MIN(c->linux_mem, machine->ram_size);
+    nvt_linux_mem = machine->ram_size >= NVT_RAM_DEFAULT ? c->linux_mem :
+                    MIN(c->sdk_linux_mem, machine->ram_size);
 
     cpuobj = object_new(machine->cpu_type);
     /* Entered in SVC by the loader and U-Boot; there is no TEE here. */
