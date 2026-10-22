@@ -88,6 +88,10 @@ plays the vendor drivers (docs/novatek.md):
   - nvt-dsi: escape and ULPS triggers clearing themselves with their
     done bits, manual TX dropping with TX done, automatic mode's frame
     ends until TX goes off, write 1 to clear, SPI 50;
+  - the AI engines: idle bits; NUE fully connected (dot products, shifts,
+    offset, s32) with frame end and SPI 14; NUE2 NV12 to RGB, scaled,
+    less a DC mean; a CNN list of two jobs fired by bit-60 updates, with
+    a bit-59 update adding the list base;
   - nvt-audio: the EAC strobes; capture DMA latching its buffer and the
     queued next, the test tone in it (1 kHz left, 1.5 kHz right), the
     current-address register, stop on the channel enable, the ADC enable
@@ -1850,6 +1854,85 @@ def test_dsi(qt):
     check('and no more frames', qt.readl(DSI + 0x84) >> 1 & 1, 0)
 
 
+NUE, NUE2, CNN = 0xF0C60000, 0xF0D50000, 0xF0CB0000
+AI_IN, AI_W, AI_OUT, AI_LL = 0x01800000, 0x01810000, 0x01820000, 0x01830000
+
+
+def test_ai(qt):
+    print('AI engines (NUE / NUE2 / CNN)')
+    gic_enable(qt, 14)
+    check('idle (bit 15) on all three',
+          [qt.readl(b + o) >> 15 & 1 for b, o in
+           ((NUE, 0x1AC), (NUE2, 0x098), (CNN, 0x1FC))], [1, 1, 1])
+    # NUE, fully connected: 8 inputs (s8), 3 rows of weights, s32 out
+    x = [3, -2, 5, 0, 7, -8, 1, 4]
+    w = [[1, 2, 3, 4, 5, 6, 7, 8], [-1, 0, 1, 0, -1, 0, 1, 0],
+         [2, 2, 2, 2, -3, -3, -3, -3]]
+    qt.write(AI_IN, bytes(v & 0xFF for v in x))
+    qt.write(AI_W, bytes(v & 0xFF for r in w for v in r))
+    qt.writel(NUE + 0x004, 0x110)                   # SVM, signed s8
+    qt.writel(NUE + 0x008, 0x350)                   # dot, path 3 (s32)
+    qt.writel(NUE + 0x00C, AI_IN)
+    qt.writel(NUE + 0x014, AI_W)
+    qt.writel(NUE + 0x02C, AI_OUT)
+    qt.writel(NUE + 0x040, 3 << 16 | 8)
+    qt.writel(NUE + 0x044, 8 << 16 | 1)
+    qt.writel(NUE + 0x048, 1 << 16 | 1)
+    qt.writel(NUE + 0x04C, 3 << 16 | 1)             # gain 1, >> 3
+    qt.writel(NUE + 0x050, 5 << 24 | 7)             # each product >> 5, + 7
+    qt.writel(NUE + 0x038, 1)
+    qt.writel(NUE + 0x000, 2)
+    qt.step(2 * 1000 * 1000)
+    want = [(sum((a * 256 * b) >> 5 for a, b in zip(x, r)) >> 3) + 7
+            for r in w]
+    check('NUE FC: frame end and SPI 14, START dropped',
+          (qt.readl(NUE + 0x03C) & 1, gic_pending(qt, 14),
+           qt.readl(NUE) & 2), (1, True, 0))
+    check('NUE FC: each row\'s dot product, shifted, offset (s32)',
+          list(struct.unpack('<3i', qt.read(AI_OUT, 12))), want)
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+    check('status is write 1 to clear', gic_pending(qt, 14), False)
+    # NUE2: 4x2 NV12 grey / white to RGB, scaled to 2x2, DC mean 16
+    qt.write(AI_IN, bytes([128, 128, 255, 255, 128, 128, 255, 255]))
+    qt.write(AI_IN + 0x100, bytes([128, 128, 128, 128]))
+    qt.writel(NUE2 + 0x004, 0x3)                    # YUV to RGB, DC mean
+    qt.writel(NUE2 + 0x008, AI_IN)
+    qt.writel(NUE2 + 0x00C, AI_IN + 0x100)
+    for c in range(3):
+        qt.writel(NUE2 + 0x018 + 4 * c, AI_OUT + 0x100 * c)
+        qt.writel(NUE2 + 0x030 + 4 * c, 2)
+    qt.writel(NUE2 + 0x024, 4)
+    qt.writel(NUE2 + 0x028, 4)
+    qt.writel(NUE2 + 0x044, 2 << 16 | 4)
+    qt.writel(NUE2 + 0x058, 2 << 16 | 2)
+    qt.writel(NUE2 + 0x060, 0x101010)
+    qt.writel(NUE2 + 0x07C, 1 << 12)                # mean scale 1, shift 0
+    qt.writel(NUE2 + 0x000, 2)
+    qt.step(2 * 1000 * 1000)
+    check('NUE2: grey and white, scaled 4 to 2 columns (corners), less 16',
+          [list(qt.read(AI_OUT + 0x100 * c, 2)) for c in range(3)],
+          [[112, 239]] * 3)
+    check('NUE2: frame end', qt.readl(NUE2 + 0x040) & 1, 1)
+    qt.writel(NUE2 + 0x040, 0xFFFFFFFF)
+    # CNN: a list of two jobs, each ending in a firing update (bit 60);
+    # a bit-59 update adds the list base
+    def upd(off, val, flags=0):
+        return struct.pack('<Q', 8 << 60 | flags | 0xF << 44 | off << 32 | val)
+    qt.writel(CNN + 0x204, 0x10000000)              # list base
+    qt.write(AI_LL, upd(0x010, 0x1234, 1 << 59) + upd(0x0C0, 0, 1 << 60) +
+             upd(0x014, 0x5678) + upd(0x0C0, 0, 1 << 60) +
+             struct.pack('<Q', 0))
+    qt.writel(CNN + 0x040, AI_LL)
+    qt.writel(CNN + 0x008, 0x500)
+    qt.writel(CNN + 0x000, 1 << 28)
+    qt.step(5 * 1000 * 1000)
+    check('CNN list: both jobs, job end (bit 10) and list end (bit 8)',
+          (qt.readl(CNN + 0x00C) & 0x500, qt.readl(CNN + 0x014)),
+          (0x500, 0x5678))
+    check('a bit-59 update adds the list base', qt.readl(CNN + 0x010),
+          0x10001234)
+
+
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
 
 
@@ -2848,6 +2931,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_dsi(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_ai(qt)
     finally:
         qt.close()
 
