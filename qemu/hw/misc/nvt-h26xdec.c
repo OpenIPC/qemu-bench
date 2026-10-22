@@ -28,9 +28,21 @@
  *           0x16 errors; write 1 to clear), 0x1040 / 0x1044 the picture's
  *           Y / UV, 0x1080 checksum, 0x10C4 concealed macroblocks
  *   0x1814  the BIN (CABAC) stage's control, the same three bits
+ *   0x2000  the H.265 AD stage's control, 0x2800 its BIN stage's, the same
+ *           three bits; the list starts AD (0xE), then BIN (6), and
+ *           doEngineIsr() takes bit 16 of both as done, writing it back.
+ *           0x20DC (and 0x28DC) enable the job's interrupt, which the
+ *           handler turns off rather than acknowledging 0x1848.  0x211C
+ *           is an error register (check_hw_error()): it must read 0.
+ *           0x2094 the bitstream block, 0x2804 the size ([31:16] height),
+ *           0x28B8 / 0x28BC the picture's Y / UV (packed), 0x29D0 / 0x29D4
+ *           the reduced copy as 0x1894 / 0x1898.  0x1800 is 2 for H.264
+ *           jobs and 0 for H.265.
  *
  * A decode reads the job's bitstream -- a whole Annex-B access unit, from
- * the {count, address, length} block 0x102C points at -- and, built with
+ * the {count, address, length} block 0x102C points at (for H.265, 0x2094's
+ * block points at the first slice and gives the buffer's size; see
+ * nvt_hevc_prefix()) -- and, built with
  * libavcodec, decodes it and writes the picture to 0x1040 (Y) and 0x1044
  * (UV interleaved), at the strides in 0x1008 ([15:0] Y, [31:16] UV).  With
  * 0x1894 bit 0 set it also writes the reduced copy the preview windows
@@ -95,6 +107,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtH26xDecState, NVT_H26XDEC)
 #define H264_OUT_UV         0x1044
 #define SUB_CTRL            0x1894
 #define SUB_Y               0x1898
+
+#define HEVC_AD_CTRL        0x2000
+#define HEVC_BS_DESC        0x2094
+#define HEVC_INT_EN         0x20DC
+#define HEVC_BIN_CTRL       0x2800
+#define HEVC_SIZE           0x2804
+#define HEVC_OUT_Y          0x28B8
+#define HEVC_OUT_UV         0x28BC
+#define HEVC_SUB_CTRL       0x29D0
+#define HEVC_SUB_Y          0x29D4
+#define HEVC_PS_MAX         4096
 #define BS_MAX              (4 * MiB)
 #define DEC_CTXS            4
 
@@ -109,9 +132,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtH26xDecState, NVT_H26XDEC)
 #define LL_MAX_CMDS         65536
 
 #ifdef NVT_H26XDEC_LIBAVCODEC
+/* Where each codec's job keeps what the model reads. */
+typedef struct NvtDecRegs {
+    uint32_t bs_desc, size, stride, out_y, out_uv, sub_ctrl, sub_y;
+    bool hevc;
+} NvtDecRegs;
+
+static const NvtDecRegs nvt_h264_regs = {
+    H264_BS_DESC, H264_SIZE, H264_STRIDE, H264_OUT_Y, H264_OUT_UV,
+    SUB_CTRL, SUB_Y, false,
+};
+
+/* H.265 has no stride register the model knows: its planes are packed. */
+static const NvtDecRegs nvt_hevc_regs = {
+    HEVC_BS_DESC, HEVC_SIZE, 0, HEVC_OUT_Y, HEVC_OUT_UV,
+    HEVC_SUB_CTRL, HEVC_SUB_Y, true,
+};
+
 typedef struct NvtDecCtx {
     AVCodecContext *ctx;
-    uint32_t key;                       /* the job's 0x1004 */
+    uint32_t key;                       /* the job's 0x1004 or 0x2804 */
+    bool hevc;
     uint32_t used;
 } NvtDecCtx;
 #endif
@@ -131,6 +172,8 @@ struct NvtH26xDecState {
     QEMUTimer *done;
     uint32_t regs[DEC_SIZE / 4];
     uint32_t jobs;
+    bool hevc_job;                      /* the list in flight is H.265's */
+    bool hevc_irq;                      /* its done, not yet taken */
     bool trace;
 };
 
@@ -143,8 +186,9 @@ static void nvt_h26xdec_update_irq(NvtH26xDecState *s)
 {
     bool aux = (*reg(s, AUX_INT_STS) & 1) != 0;
     bool core = (*reg(s, CORE_INT_STS) & *reg(s, CORE_INT_MASK) & 0x707) != 0;
+    bool hevc = s->hevc_irq && *reg(s, HEVC_INT_EN);
 
-    qemu_set_irq(s->irq, aux || core);
+    qemu_set_irq(s->irq, aux || core || hevc);
 }
 
 static void nvt_h26xdec_dump(NvtH26xDecState *s, const char *what, hwaddr a)
@@ -164,14 +208,16 @@ static void nvt_h26xdec_dump(NvtH26xDecState *s, const char *what, hwaddr a)
 
 #ifdef NVT_H26XDEC_LIBAVCODEC
 /* The decoder for this stream: one per 0x1004, the least used recycled. */
-static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key)
+static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key,
+                                       bool hevc)
 {
     NvtDecCtx *d = NULL;
     const AVCodec *codec;
     int i;
 
     for (i = 0; i < DEC_CTXS; i++) {
-        if (s->dec[i].ctx && s->dec[i].key == key) {
+        if (s->dec[i].ctx && s->dec[i].key == key &&
+            s->dec[i].hevc == hevc) {
             d = &s->dec[i];
             break;
         }
@@ -180,11 +226,11 @@ static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key)
         }
     }
     d->used = ++s->tick;
-    if (d->ctx && d->key == key) {
+    if (d->ctx && d->key == key && d->hevc == hevc) {
         return d->ctx;
     }
     avcodec_free_context(&d->ctx);
-    codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    codec = avcodec_find_decoder(hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
     if (!codec) {
         return NULL;
     }
@@ -196,15 +242,17 @@ static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key)
         return NULL;
     }
     d->key = key;
+    d->hevc = hevc;
     return d->ctx;
 }
 
 /* The picture to the job's buffers: Y, then U and V interleaved. */
-static void nvt_h26xdec_put_picture(NvtH26xDecState *s, AVFrame *f)
+static void nvt_h26xdec_put_picture(NvtH26xDecState *s,
+                                    const NvtDecRegs *rs, AVFrame *f)
 {
-    uint32_t stride = *reg(s, H264_STRIDE);
+    uint32_t stride = rs->stride ? *reg(s, rs->stride) : 0;
     uint32_t ys = stride & 0xFFFF, cs = stride >> 16;
-    hwaddr y = *reg(s, H264_OUT_Y), uv = *reg(s, H264_OUT_UV);
+    hwaddr y = *reg(s, rs->out_y), uv = *reg(s, rs->out_uv);
     g_autofree uint8_t *line = NULL;
     int r, x, w = f->width, h = f->height;
 
@@ -236,12 +284,13 @@ static void nvt_h26xdec_put_picture(NvtH26xDecState *s, AVFrame *f)
 }
 
 /* The reduced copy: nearest neighbour, Y then UV interleaved. */
-static void nvt_h26xdec_put_sub(NvtH26xDecState *s, AVFrame *f)
+static void nvt_h26xdec_put_sub(NvtH26xDecState *s, const NvtDecRegs *rs,
+                                AVFrame *f)
 {
-    uint32_t ctrl = *reg(s, SUB_CTRL);
+    uint32_t ctrl = *reg(s, rs->sub_ctrl);
     int sw = f->width >> ((ctrl >> 8) & 0xF);
     int sh = f->height >> ((ctrl >> 12) & 0xF);
-    hwaddr y = *reg(s, SUB_Y), uv = y + (hwaddr)sw * sh;
+    hwaddr y = *reg(s, rs->sub_y), uv = y + (hwaddr)sw * sh;
     g_autofree uint8_t *line = NULL;
     int r, x;
 
@@ -272,31 +321,110 @@ static void nvt_h26xdec_put_sub(NvtH26xDecState *s, AVFrame *f)
     }
 }
 
-static void nvt_h26xdec_decode(NvtH26xDecState *s)
+/* The NAL unit type of the unit whose header starts at p. */
+static int nvt_hevc_nal_type(const uint8_t *p)
+{
+    return (p[0] >> 1) & 0x3F;
+}
+
+/*
+ * The H.265 job points at the picture's first slice, past the parameter
+ * sets the driver has parsed, and gives its buffer's size rather than the
+ * picture's.  The access unit is stored whole, so the units just before
+ * the slice -- up to the previous picture's slice -- are this picture's
+ * VPS, SPS, PPS and SEI.  Returns where they start, at most
+ * HEVC_PS_MAX bytes back; the slice itself when there are none.
+ */
+static hwaddr nvt_hevc_prefix(hwaddr slice)
+{
+    uint8_t buf[HEVC_PS_MAX];
+    size_t n = MIN(slice, (hwaddr)HEVC_PS_MAX);
+    hwaddr start = slice;
+    size_t end = n;
+    ssize_t i;
+
+    if (!n) {
+        return slice;
+    }
+    address_space_read(&address_space_memory, slice - n,
+                       MEMTXATTRS_UNSPECIFIED, buf, n);
+    for (i = (ssize_t)n - 4; i >= 0; i--) {
+        int t;
+
+        if (buf[i] || buf[i + 1] || buf[i + 2] != 1 || i + 4 >= end) {
+            continue;
+        }
+        t = nvt_hevc_nal_type(buf + i + 3);
+        if (t < 32 || t > 40) {
+            break;                      /* the previous picture, or junk */
+        }
+        start = slice - n + i;
+        end = i;
+    }
+    return start;
+}
+
+/*
+ * How much of the buffer at p is the picture: its first slice and any
+ * further slices of the same picture, up to the next unit that is not.
+ */
+static size_t nvt_hevc_au_len(const uint8_t *p, size_t len)
+{
+    size_t i;
+
+    for (i = 3; i + 5 < len; i++) {
+        int t;
+
+        if (p[i] || p[i + 1] || p[i + 2] != 1) {
+            continue;
+        }
+        t = nvt_hevc_nal_type(p + i + 3);
+        if (t >= 32 || (p[i + 5] & 0x80)) {
+            return i;                   /* first_slice_segment_in_pic_flag */
+        }
+    }
+    return len;
+}
+
+static void nvt_h26xdec_decode(NvtH26xDecState *s, const NvtDecRegs *rs)
 {
     uint32_t bs[3];
     AVCodecContext *ctx;
+    hwaddr start;
+    size_t len;
 
-    address_space_read(&address_space_memory, *reg(s, H264_BS_DESC),
+    address_space_read(&address_space_memory, *reg(s, rs->bs_desc),
                        MEMTXATTRS_UNSPECIFIED, bs, sizeof(bs));
     bs[1] = le32_to_cpu(bs[1]);
     bs[2] = le32_to_cpu(bs[2]);
     if (!bs[2] || bs[2] > BS_MAX) {
         return;
     }
-    ctx = nvt_h26xdec_ctx(s, *reg(s, H264_SIZE));
+    ctx = nvt_h26xdec_ctx(s, *reg(s, rs->size), rs->hevc);
     if (!ctx) {
         return;
     }
-    if (av_new_packet(s->pkt, bs[2]) < 0) {
+    start = rs->hevc ? nvt_hevc_prefix(bs[1]) : bs[1];
+    len = bs[2] + (bs[1] - start);
+    if (av_new_packet(s->pkt, len) < 0) {
         return;
     }
-    address_space_read(&address_space_memory, bs[1], MEMTXATTRS_UNSPECIFIED,
-                       s->pkt->data, bs[2]);
+    address_space_read(&address_space_memory, start, MEMTXATTRS_UNSPECIFIED,
+                       s->pkt->data, len);
+    if (rs->hevc) {
+        size_t pre = bs[1] - start;
+
+        len = pre + nvt_hevc_au_len(s->pkt->data + pre, len - pre);
+        av_shrink_packet(s->pkt, len);
+    }
+    if (s->trace) {
+        qemu_log("nvt-h26xdec: job %u %s %u bytes at %08" HWADDR_PRIx "\n",
+                 s->jobs, rs->hevc ? "H.265" : "H.264", (unsigned)len, start);
+    }
     if (avcodec_send_packet(ctx, s->pkt) >= 0) {
         while (avcodec_receive_frame(ctx, s->frame) >= 0) {
-            nvt_h26xdec_put_picture(s, s->frame);
-            nvt_h26xdec_put_sub(s, s->frame);
+            nvt_h26xdec_put_picture(s, rs, s->frame);
+            nvt_h26xdec_put_sub(s, rs, s->frame);
             av_frame_unref(s->frame);
         }
     }
@@ -315,7 +443,8 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
         *reg(s, off) &= ~val;               /* write 1 to clear, here too */
         return;
     }
-    if (off == H264_CTRL || off == BIN_CTRL) {
+    if (off == H264_CTRL || off == BIN_CTRL || off == HEVC_AD_CTRL ||
+        off == HEVC_BIN_CTRL) {
         /*
          * A reset finishes at once and leaves the block idle; it wins over
          * the start bit VPU_ResetHW()'s read-modify-write carries along.
@@ -323,6 +452,11 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
         if (val & CTRL_RESET) {
             *reg(s, off) = 0;
             return;
+        }
+        /* doEngineIsr() writes the status bits back to take them */
+        if (off == HEVC_AD_CTRL && (val & CTRL_DONE)) {
+            s->hevc_irq = false;
+            nvt_h26xdec_update_irq(s);
         }
     }
     *reg(s, off) = val;
@@ -348,9 +482,16 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
             nvt_h26xdec_dump(s, "bs", bs[1]);
         }
 #ifdef NVT_H26XDEC_LIBAVCODEC
-        nvt_h26xdec_decode(s);
+        nvt_h26xdec_decode(s, &nvt_h264_regs);
 #endif
         *reg(s, H264_INT_FLG) |= H264_INT_DONE;
+    }
+    /* BIN is the last stage the H.265 list starts, its registers all set */
+    if (off == HEVC_BIN_CTRL && (val & CTRL_START)) {
+        s->hevc_job = true;
+#ifdef NVT_H26XDEC_LIBAVCODEC
+        nvt_h26xdec_decode(s, &nvt_hevc_regs);
+#endif
     }
 }
 
@@ -400,7 +541,11 @@ static void nvt_h26xdec_done(void *opaque)
     NvtH26xDecState *s = opaque;
 
     *reg(s, LL_LAST_VAL) = LL_FINAL;
-    *reg(s, AUX_INT_STS) |= 1;
+    if (s->hevc_job) {
+        s->hevc_irq = true;
+    } else {
+        *reg(s, AUX_INT_STS) |= 1;
+    }
     nvt_h26xdec_update_irq(s);
 }
 
@@ -410,8 +555,13 @@ static uint64_t nvt_h26xdec_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t val = *reg(s, offset & ~3);
 
     /* Resets and decodes finish at once: the control words read done. */
-    if ((offset & ~3) == H264_CTRL || (offset & ~3) == BIN_CTRL) {
+    switch (offset & ~3) {
+    case H264_CTRL:
+    case BIN_CTRL:
+    case HEVC_AD_CTRL:
+    case HEVC_BIN_CTRL:
         val |= CTRL_DONE;
+        break;
     }
 
     if (s->trace) {
@@ -439,6 +589,8 @@ static void nvt_h26xdec_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     case H264_CTRL:
     case BIN_CTRL:
+    case HEVC_AD_CTRL:
+    case HEVC_BIN_CTRL:
         nvt_h26xdec_ll_write(s, offset, val);
         return;
     case LL_CTRL:
@@ -449,6 +601,8 @@ static void nvt_h26xdec_write(void *opaque, hwaddr offset, uint64_t value,
             *reg(s, LL_RESET_STS) &= ~LL_RESET_DONE;
         }
         if (val & LL_CTRL_FIRE) {
+            s->hevc_job = false;
+            s->hevc_irq = false;
             nvt_h26xdec_run_ll(s);
             s->jobs++;
             timer_mod(s->done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -464,7 +618,7 @@ static void nvt_h26xdec_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     *reg(s, offset) = val;
-    if (offset == CORE_INT_MASK) {
+    if (offset == CORE_INT_MASK || offset == HEVC_INT_EN) {
         nvt_h26xdec_update_irq(s);
     }
 }
@@ -486,6 +640,8 @@ static void nvt_h26xdec_reset(DeviceState *dev)
     timer_del(s->done);
     memset(s->regs, 0, sizeof(s->regs));
     s->jobs = 0;
+    s->hevc_job = false;
+    s->hevc_irq = false;
     qemu_irq_lower(s->irq);
 }
 
@@ -515,6 +671,8 @@ static const VMStateDescription vmstate_nvt_h26xdec = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtH26xDecState, DEC_SIZE / 4),
         VMSTATE_UINT32(jobs, NvtH26xDecState),
+        VMSTATE_BOOL(hevc_job, NvtH26xDecState),
+        VMSTATE_BOOL(hevc_irq, NvtH26xDecState),
         VMSTATE_TIMER_PTR(done, NvtH26xDecState),
         VMSTATE_END_OF_LIST()
     },

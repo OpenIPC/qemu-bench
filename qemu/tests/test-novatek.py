@@ -2211,6 +2211,36 @@ def test_nt98332_dec(qt):
     check('acknowledged at 0x1848', qt.readl(NA51103_DEC + 0x184C) & 1, 0)
     check('and the line drops', na51103_pending(qt, 9), False)
 
+    # H.265: AD (0x2000) and BIN (0x2800), done taken by writing bit 16
+    # back, the interrupt behind 0x20DC; 0x211C is an error register
+    lst = (cmd(0xC, 0, ll + 8) +
+           cmd(0, 0x1800, 0) +                   # H.265
+           cmd(0, 0x20DC, 0x41) +                # interrupt enable
+           cmd(0, 0x28B8, 0x02000000) +          # picture Y
+           cmd(0, 0x2000, 0xE) +                 # AD
+           cmd(0, 0x2800, 6) +                   # BIN
+           cmd(0xC, 0, 0xFFFFFFF0))
+    qt.write(ll, lst)
+    qt.writel(NA51103_DEC + 0x2000, 1)
+    check('an H.265 AD reset clears itself',
+          qt.readl(NA51103_DEC + 0x2000) & 1, 0)
+    qt.writel(NA51103_DEC + 0x3000, 2)
+    qt.step(5 * 1000 * 1000)
+    check('H.265: the list ran to its end', qt.readl(NA51103_DEC + 0x301C),
+          0xFFFFFFF0)
+    check('AD and BIN read done',
+          (qt.readl(NA51103_DEC + 0x2000) >> 16 & 1,
+           qt.readl(NA51103_DEC + 0x2800) >> 16 & 1), (1, 1))
+    check('no error in 0x211C', qt.readl(NA51103_DEC + 0x211C), 0)
+    check('nothing at 0x184C', qt.readl(NA51103_DEC + 0x184C) & 1, 0)
+    check('SPI 9 raised', na51103_pending(qt, 9), True)
+    qt.writel(NA51103_DEC + 0x2000, 0x10000)
+    check('taken by writing done back to AD', na51103_pending(qt, 9), False)
+    qt.writel(NA51103_DEC + 0x3000, 2)
+    qt.step(5 * 1000 * 1000)
+    qt.writel(NA51103_DEC + 0x20DC, 0)
+    check('or by turning its enable off', na51103_pending(qt, 9), False)
+
 
 def test_nt98332_vpe(qt):
     """The VPE's fill and scale jobs, nvt-engine with scaler=on."""
