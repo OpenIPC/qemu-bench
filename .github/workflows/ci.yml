@@ -867,11 +867,19 @@ jobs:
       # H.264 ffmpeg decodes: VI, the ISP's frame interrupts and the
       # encoder model together.  Judged from the dumped jobs, since the
       # camera stays unclaimed.
+      # ffmpeg on its own step: the Ubuntu mirror can take minutes over its
+      # dependencies, which ate the stream test's own 6-minute budget.
+      - name: "majestic H.264 end to end: ffmpeg"
+        if: matrix.stream_test
+        timeout-minutes: 20
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=5 -o Acquire::http::Timeout=30 ffmpeg
+
       - name: "majestic H.264 end to end"
         if: matrix.stream_test
         timeout-minutes: 6
         run: |
-          sudo apt-get install -y --no-install-recommends ffmpeg
           bash qemu-boot/test-xm-stream.sh \
             --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
             --qemu ./qemu-src/build/qemu-system-arm \
