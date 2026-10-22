@@ -1191,6 +1191,10 @@ jobs:
       - name: HDAL media engines bound by load_novatek, and the display path
         run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }} ${{ steps.kmod.outputs.args }}
 
+      - name: The display path on a MIPI DSI panel
+        if: matrix.soc == 'nt98566' && steps.kmod.outputs.args != ''
+        run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }} ${{ steps.kmod.outputs.args }} --panel nt35510
+
   boot-hi3516cv610:
     name: Boot hi3516cv610
     needs: build

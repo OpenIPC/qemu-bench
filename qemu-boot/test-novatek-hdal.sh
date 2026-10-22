@@ -45,9 +45,12 @@
 # checks that it binds the IDE.  With --samples as well it runs
 # hd_video_output_only (colour bars from a file) and hd_video_liveview
 # (the sensor), and checks QEMU's screendump of the display mid-run.
+# --panel picks the panel: pw35p00 (the EVB's, serial RGB, 320x240) or a
+# MIPI DSI one -- nt35510 (480x800), tb093 (320x1280) or ili9488
+# (320x480) -- for which nvt_dsi loads first.
 #
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
-#       [--samples DIR] [--display-kos DIR] [--dir qemu-boot] \
+#       [--samples DIR] [--display-kos DIR] [--panel pw35p00] [--dir qemu-boot] \
 #       [--qemu ./qemu-src/build/qemu-system-arm]
 set -euo pipefail
 
@@ -55,6 +58,7 @@ SOC=nt98566
 MACHINE=
 SAMPLES=
 DISPLAY_KOS=
+PANEL=pw35p00
 QEMU=./qemu-src/build/qemu-system-arm
 DIR=qemu-boot
 SENSOR=sc501ai
@@ -64,6 +68,7 @@ while [ $# -gt 0 ]; do
         --machine) MACHINE=$2; shift 2 ;;
         --samples) SAMPLES=$2; shift 2 ;;
         --display-kos) DISPLAY_KOS=$2; shift 2 ;;
+        --panel) PANEL=$2; shift 2 ;;
         --qemu) QEMU=$2; shift 2 ;;
         --dir) DIR=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
@@ -105,12 +110,27 @@ cp "$WORK/rootfs/bin/busybox" "$WORK/initramfs/bin/"
 cp -a "$WORK/rootfs/lib/libc.so" "$WORK/rootfs/lib/ld-musl-armhf.so.1" \
     "$WORK/initramfs/lib/"
 ln -s busybox "$WORK/initramfs/bin/sh"
+# the panel: its module (display_panel/<dir>/<module>.ko), its size on
+# QEMU's console, and whether it is on MIPI DSI
+case $PANEL in
+    pw35p00) PANEL_KO=disp_if8b_lcd1_pw35p00_hx8238d/disp_if8b_lcd1_pw35p00
+             PANEL_SIZE=320x240 PANEL_DSI= ;;
+    nt35510) PANEL_KO=disp_ifdsi_lcd1_nt35510/disp_ifdsi_lcd1_nt35510
+             PANEL_SIZE=480x800 PANEL_DSI=nvt_dsi ;;
+    tb093) PANEL_KO=disp_ifdsi_lcd1_tb093/disp_ifdsi_lcd1_tb093
+           PANEL_SIZE=320x1280 PANEL_DSI=nvt_dsi ;;
+    ili9488) PANEL_KO=disp_ifdsi_lcd1_ut35067a0_ili9488/disp_ifdsi_lcd1_ut35067a0_ili9488
+             PANEL_SIZE=320x480 PANEL_DSI=nvt_dsi ;;
+    *) echo "--panel: pw35p00, nt35510, tb093 or ili9488" >&2; exit 2 ;;
+esac
+PANEL_MOD=${PANEL_KO##*/}
 mkdir -p "$WORK/initramfs/dispin"
 if [ -n "$DISPLAY_KOS" ]; then
     mkdir -p "$WORK/initramfs/dko"
-    for k in kdrv_videoout/ide/nvt_ide kdrv_videoout/display_obj/kdrv_videoout \
+    for k in kdrv_videoout/ide/nvt_ide kdrv_videoout/dsi/nvt_dsi \
+             kdrv_videoout/display_obj/kdrv_videoout \
              kflow_videoout/unit/kflow_videoout display_panel/nvt_dispdev_panel \
-             display_panel/disp_if8b_lcd1_pw35p00_hx8238d/disp_if8b_lcd1_pw35p00; do
+             display_panel/$PANEL_KO; do
         cp "$DISPLAY_KOS/$k.ko" "$WORK/initramfs/dko/"
     done
     # hd_video_output_only's 3 frames of 320x240 YUV 4:2:2, Y then CbCr
@@ -191,7 +211,7 @@ echo "NVT-HDAL-MODULES: \$(\$bb lsmod | \$bb wc -l)"
 if [ -d /dko ]; then
     \$bb cp -a /dko /mnt/tmp/
     for m in nvt_ide kdrv_videoout kflow_videoout nvt_dispdev_panel \\
-             disp_if8b_lcd1_pw35p00; do
+             $PANEL_DSI $PANEL_MOD; do
         \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/\$m.ko" >/dev/null 2>&1
         echo "NVT-DISP-INSMOD: \$m rc=\$?"
     done
@@ -385,14 +405,14 @@ done
 expect 'NVT-HDAL-OK' 'PID 1 ran to the end'
 if [ -n "$DISPLAY_KOS" ]; then
     for m in nvt_ide kdrv_videoout kflow_videoout nvt_dispdev_panel \
-             disp_if8b_lcd1_pw35p00; do
+             $PANEL_DSI $PANEL_MOD; do
         expect "NVT-DISP-INSMOD: $m rc=0" "display: $m loads"
     done
     for b in "f0800000.ide nvt_ide" "dispobj nvt_dispobj" \
-             "dispdev nvt_dispdev"; do
+             "dispdev nvt_dispdev" ${PANEL_DSI:+"f0840000.dsi nvt_dsi"}; do
         expect "NVT-HDAL-BOUND: $b[[:space:]]*\$" "display: ${b% *} bound by ${b#* }"
     done
-    expect "NVT-DISP-PANEL: Hello, panel: PW35P00" "display: the EVB's panel driver is up"
+    expect "NVT-DISP-PANEL: Hello, panel:" "display: the $PANEL panel driver is up"
 fi
 
 if [ -n "$SAMPLES" ]; then
@@ -614,9 +634,9 @@ PY
         if [ -z "$look" ] && ! python3 -c 'import PIL' 2>/dev/null; then
             echo "SKIP: display screendump checks (no Python PIL)"
         else
-            case "$look" in *bars=320x240:1*) pass "the panel shows hd_video_output_only's colour bars (320x240)";;
+            case "$look" in *bars=$PANEL_SIZE:1*) pass "the panel shows hd_video_output_only's colour bars ($PANEL_SIZE)";;
                 *) bad "the panel shows hd_video_output_only's colour bars ($look)";; esac
-            case "$look" in *live=320x240:1*) pass "the panel shows the sensor's picture through hd_video_liveview";;
+            case "$look" in *live=$PANEL_SIZE:1*) pass "the panel shows the sensor's picture through hd_video_liveview";;
                 *) bad "the panel shows the sensor's picture through hd_video_liveview ($look)";; esac
         fi
     fi
