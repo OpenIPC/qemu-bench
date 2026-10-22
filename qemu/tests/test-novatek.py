@@ -85,6 +85,9 @@ plays the vendor drivers (docs/novatek.md):
   - nvt-ide: DMA idle with the engine off; load pending to the frame, then
     frame end and SPI 48, write 1 to clear; a screendump of an NV12 video
     layer and an ARGB4444 OSD box blended over it;
+  - nvt-dsi: escape and ULPS triggers clearing themselves with their
+    done bits, manual TX dropping with TX done, automatic mode's frame
+    ends until TX goes off, write 1 to clear, SPI 50;
   - nvt-audio: the EAC strobes; capture DMA latching its buffer and the
     queued next, the test tone in it (1 kHz left, 1.5 kHz right), the
     current-address register, stop on the channel enable, the ADC enable
@@ -1803,6 +1806,50 @@ def test_display(qt, mon):
           (True, True, True))
 
 
+DSI = 0xF0840000
+
+
+def test_dsi(qt):
+    print('nvt-dsi')
+    gic_enable(qt, 50)
+    qt.writel(DSI + 0x80, 0x1F0FFFF3)               # the driver's enables
+    # an LP data byte on lane 0: the trigger clears, escape done (25)
+    qt.writel(DSI + 0x28, 0x05)
+    qt.writel(DSI + 0x00, 1 << 1 | 1 << 4)
+    check('escape trigger: done at once', qt.readl(DSI) & 1 << 4, 0)
+    qt.step(10 * 1000)
+    check('lane 0 escape done (bit 25), SPI 50',
+          (qt.readl(DSI + 0x84) >> 25 & 1, gic_pending(qt, 50)), (1, True))
+    qt.writel(DSI + 0x84, 1 << 25)
+    check('status is write 1 to clear', (qt.readl(DSI + 0x84),
+                                         gic_pending(qt, 50)), (0, False))
+    # clock lane ULPS
+    qt.writel(DSI + 0x00, 1 << 1 | 1 << 9)
+    qt.step(10 * 1000)
+    check('ULPS trigger: clears, ULPS done (bit 24)',
+          (qt.readl(DSI) >> 9 & 1, qt.readl(DSI + 0x84) >> 24 & 1), (0, 1))
+    qt.writel(DSI + 0x84, 0xFFFFFFFF)
+    # manual mode: TX sends the commands and drops
+    qt.writel(DSI + 0x04, 0)
+    qt.writel(DSI + 0x00, 1 << 1 | 1)
+    qt.step(10 * 1000)
+    check('manual TX: TX on clears, TX done (bit 0)',
+          (qt.readl(DSI) & 1, qt.readl(DSI + 0x84) & 1), (0, 1))
+    qt.writel(DSI + 0x84, 0xFFFFFFFF)
+    # automatic mode 2: frames until TX goes off
+    qt.writel(DSI + 0x04, 2)
+    qt.writel(DSI + 0x00, 1 << 1 | 1)
+    qt.step(20 * 1000 * 1000)
+    check('auto mode: TX stays on, frame end (bit 1) each frame',
+          (qt.readl(DSI) & 1, qt.readl(DSI + 0x84) >> 1 & 1), (1, 1))
+    qt.writel(DSI + 0x84, 0xFFFFFFFF)
+    qt.writel(DSI + 0x00, 1 << 1)
+    qt.step(10 * 1000)
+    check('TX off: TX done', qt.readl(DSI + 0x84) & 1, 1)
+    qt.step(40 * 1000 * 1000)
+    check('and no more frames', qt.readl(DSI + 0x84) >> 1 & 1, 0)
+
+
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
 
 
@@ -2942,6 +2989,12 @@ def run(args, tmp):
                ['-monitor', 'unix:%s,server=on,wait=off' % mon])
     try:
         test_display(qt, mon)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_dsi(qt)
     finally:
         qt.close()
 

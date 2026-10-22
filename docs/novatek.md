@@ -79,6 +79,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | H.26x / JPEG codec | `0xF0A10000` / `0xF0A00000` | 16 / 17 | `nvt-media` |
 | EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-audio` |
 | IDE (display engine) | `0xF0800000` | 48 | `nvt-ide`, on QEMU's console |
+| MIPI DSI | `0xF0840000` | 50 | `nvt-dsi` |
 | CSI, LVDS, sensor PHY, TGE, SIF, AI | | | `nvt-media`, storage |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
@@ -958,12 +959,44 @@ nearest neighbour, with mirroring. The formats:
 OSD 1 blends by its alpha select: opaque, global alpha, or the pixel's.
 Its colour key is honoured. Other formats log as unimplemented.
 
+**MIPI DSI** (`hw/display/nvt-dsi.c`, `0xF0840000`, SPI 50) is for the
+DSI panels. The toolchain has three:
+
+| panel | lanes | mode | size |
+|---|---|---|---|
+| nt35510 | 2 | command | 480x800 |
+| tb093 | 4 | video | 320x1280 |
+| ut35067a0 / ili9488 | 1 | command | 320x480 |
+
+`nvt_dsi.ko` loads before the panel's module; nothing else changes. The
+driver is the vendor U-Boot's `nvt-na51055/dsi` (source), closed in the
+kernel. Every wait in it is on an interrupt with no timeout: INTSTS
+`0x84` with enables at `0x80`, write 1 to clear.
+
+The panels send their set-up commands as low-power data, one byte and
+one escape-done interrupt at a time. The host then goes automatic and
+streams the IDE's frames until the driver closes, which waits for a
+frame end. So the model does this:
+- escape triggers (`EN` bits 4..7) and the clock ULPS trigger (bit 9)
+  clear themselves and raise their done bits (25..28, 24);
+- in manual mode, TX on (bit 0) sends `CMD0..`, clears itself and raises
+  TX done (bit 0). A read gets no bytes back; no panel reads;
+- in an automatic mode, TX on raises frame end (bit 1) at 60 Hz until
+  TX goes off, which raises TX done.
+
+The picture is still the IDE's, which with device 0xD (DSI) is scanned
+out 1:1, at the panel's size. `-global nvt-dsi.trace=on` logs the
+panel's low-power packets.
+
 `test-novatek-hdal.sh --display-kos DIR` loads the modules and checks
 that the IDE, dispobj and dispdev bind and the panel driver comes up.
 CI runs this, with the kmods extracted from the toolchain. With
 `--samples`, `hd_video_output_only` and `hd_video_liveview` run too, and
-the screendumps are checked. `test-novatek.py` checks the frame
-handshake and a screendump of a video and an OSD layer.
+the screendumps are checked. `--panel nt35510 | tb093 | ili9488` uses a
+DSI panel instead, with `nvt_dsi` loaded before it, and expects its size.
+`test-novatek.py` checks the frame
+handshake and a screendump of a video and an OSD layer, and the DSI's
+escape, ULPS, manual and automatic transfers.
 
 ## Ethernet
 
@@ -1080,8 +1113,7 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   is no affine engine. The SIE
   ignores the sensor's real timing (fixed 30 fps). AI/CNN, MD, DIS, VPE and IVE
   are not wired.
-- Display: MIPI DSI (only the `ifdsi` panels use it, and its driver
-  waits on interrupts the model does not raise), the IDE's 1/2/4-bit
+- Display: DSI reads (bus turnaround returns no bytes), the IDE's 1/2/4-bit
   palettes and ARGB8565 / 4565, its colour pipeline (gamma, CST), face
   boxes and lines, and `/dev/fb0`. The release kernel has no
   `CONFIG_FB`, so `nvt_fb.ko` does not load.

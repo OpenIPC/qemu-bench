@@ -266,7 +266,8 @@ H.264 / H.265 under the driver's own headers. Audio capture records a
 test tone (or the host's input), and playback goes to `-audiodev` /
 `-audio`, at the rate the clock tree sets. The display engine (IDE) shows the
 panel's picture on QEMU's console, with the display modules from
-OpenIPC's toolchain loaded.
+OpenIPC's toolchain loaded. The EVB's serial-RGB LCD and the MIPI DSI
+panels both work.
 The machines give Linux 128 MB and the HDAL pool 96 MB, more than the
 packages hold. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
@@ -450,6 +451,7 @@ qemu/
 ├── hw/misc/nvt-media.c          # HDAL media engines: SIE frames, IPP / gfx linked lists, codecs
 ├── hw/misc/nvt-audio.c          # DAI + EAC: audio DMA at the CG's rate, test tone, audiodev in / out
 ├── hw/display/nvt-ide.c         # IDE display engine: layers scanned out to QEMU's console (LCD panel)
+├── hw/display/nvt-dsi.c         # MIPI DSI host: LP command bytes, frames to the DSI panels
 ├── hw/misc/nvt-pixel.c          # their pixels: test pattern, RAW packing, Bayer to YUV, JPEG encoder
 ├── hw/misc/nvt-gfx.c            # 2D graphics ops (copy, arithmetic, fill, pack, ARGB blend, flips), ISE scaling
 ├── hw/misc/nvt-h26x.c           # H.26x pictures: x264 / x265 slices under the driver's headers, else filler
