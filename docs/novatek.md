@@ -334,6 +334,13 @@ Both algorithms the loader knows are unpacked here:
   with `format=lzma.FORMAT_ALONE` writes it, with the size field left
   unknown.
 
+A plain U-Boot is copied by its own length: the loader reads `HEADINFO`
+at image `+0x300` (`BIN_INFO_OFFSET_UBOOT`, U-Boot's `nvt_headinfo.c`)
+and copies `BinLength` (`+0x368`) bytes. The SDK's build writes that
+field and the checksum after linking (`encrypt_bin SUM u-boot.bin 0x350`);
+a raw `u-boot.bin` has `0xFFFFFFFF` there. The stand-in copies the whole
+partition instead, so it does not show a missing length.
+
 The loader's normal boot does not check the BCL1 checksum (only its
 update path does). It reads the compressed U-Boot from flash as
 `ALIGN_CEIL(compressed size, block size)` bytes from the partition's
