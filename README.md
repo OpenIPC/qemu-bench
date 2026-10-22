@@ -260,7 +260,8 @@ release's `load_novatek` binds all of them, and the SDK's HDAL samples run
 capture, ISP, H.26x / JPEG encoding, 2D graphics and audio capture to
 completion (`qemu-boot/test-novatek-hdal.sh`). The SIE captures a moving
 test pattern, which the IPP turns into YUV and the JPEG engine into real
-snapshots; H.264/H.265, graphics results and audio are still placeholders.
+snapshots, and the 2D graphics and ISE engines compute their jobs;
+H.264/H.265 and audio are still placeholders.
 The machines give Linux 128 MB and the HDAL pool 96 MB, more than the
 packages hold. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
@@ -436,6 +437,7 @@ qemu/
 ├── hw/misc/nvt-rsa.c            # RSA engine: modular exponentiation to 2048 bits
 ├── hw/misc/nvt-media.c          # HDAL media engines: SIE frames, IPP / gfx linked lists, codec, audio DMA
 ├── hw/misc/nvt-pixel.c          # their pixels: test pattern, RAW packing, Bayer to YUV, JPEG encoder
+├── hw/misc/nvt-gfx.c            # 2D graphics ops (copy, arithmetic, fill, pack, ARGB blend, flips), ISE scaling
 ├── hw/misc/nvt-pwm.c            # PWM: enable/disable, cycle-count runs, stop interrupts
 ├── hw/timer/nvt-timer.c         # Novatek timers: one-shot / free run, timer 0 at 1 MHz
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot

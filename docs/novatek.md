@@ -639,8 +639,9 @@ They bind by device tree, so the machine generates the vendor nodes
 
 Every engine is an `nvt-media` block (`hw/misc/nvt-media.c`): register
 storage, plus the handshakes its driver waits on. Video pixels are real
-from the sensor to JPEG (`hw/misc/nvt-pixel.c`). The H.26x bitstream, the
-graphics engines' results and audio samples are still placeholders.
+from the sensor to JPEG (`hw/misc/nvt-pixel.c`), and the 2D graphics
+engines and the ISE scaler compute their jobs (`hw/misc/nvt-gfx.c`). The
+H.26x bitstream and audio samples are still placeholders.
 
 - **SIE (sensor capture).** While `ACT_EN` is set, a frame comes every
   1/30 s, in three steps the way the sensor's lines would arrive:
@@ -679,6 +680,49 @@ graphics engines' results and audio samples are still placeholders.
 
   The machine links IME to IFE (`ipp-input`). DCE's and IPE's corrections
   are not applied.
+
+  The graphics engines and ISE do each job's work when it completes,
+  from the register file as the list left it. The driver re-sends only the
+  registers that changed, so the state carries over from job to job.
+
+  The graphics engine's CONFIG (`0x04`) holds:
+  - bit 0: AOP (pixel arithmetic) or GOP (geometry);
+  - the precision, [6:4];
+  - the 16-bit format, [10:8];
+  - the GOP, [19:16], and the AOP, [28:24].
+
+  Images A, B and C are at `0x70`, `0x80` and `0x90`, with their line
+  offsets in the next word. They share the line count (`0x78`) and the
+  bytes a line (`0x7C`). Modelled:
+  - **A_COPY.** hd_gfx_memcpy is this engine, not a DMA block.
+  - **PLUS / MINUS / MULTIPLY.**
+    - At 8 bits, B's shift is its IN2 operator, results saturate, and
+      OUT operator 4 takes the magnitude.
+    - At 16 bits, the shift is CONST1 [3:0], bit 31 asks for the
+      magnitude, and sums wrap.
+  - **TEXT_COPY**, the fills the line and rectangle drawing becomes. At
+    8 bits, byte k of CONST1 lands where the address is k mod 4.
+  - **PACKING**: U and V planes into pairs, W counted in output bytes.
+  - **RGBYUV_BLEND**: ARGB4444 / 1555 / 8888 or RGB565 onto NV12.
+    - Colours convert with the formula of the vendor's own
+      `argb_to_ycbcr`, so engine blends match the driver's fills.
+    - Blending is per-pixel alpha.
+    - With CONST1 bit 0, U / V are 4:2:0; bit 5 averages each 2x2 block.
+  - **GOP flips and the half turn.** For a vertical flip the driver points
+    C at the last line.
+
+  The quarter turns and the remaining AOPs log as unimplemented.
+
+  ISE scales Y8, U / V pairs or ARGB8888 from `0x10` / `0x18` / `0x20`
+  (size, line offset, address) to `0x38` / `0x90` / `0x98`. It uses the
+  method in `0x04` [9:8]:
+  - bilinear, corner to corner;
+  - nearest;
+  - integration, as a box average.
+
+  The blend rounding and the integration filter are this model's choices;
+  the driver does not pin them down. The affine engine is not modelled:
+  the release ships no `kdrv_affine.ko`.
 - **H.26x.** `INT_FLAG` is write-1-to-clear, and software reset and DMA
   disable set their finish flags. A picture finishes with:
   - a filler NAL unit (H.265 FD_NUT) in the bitstream buffer;
@@ -718,12 +762,19 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 48 things:
+builds them from the vendor SDK (not in CI). The run checks 64 things:
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` write their bitstreams;
 - both of `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
 - `hd_video_capture_only` runs;
-- nine `hd_gfx_only` operations exit cleanly and write their results;
+- eleven `hd_gfx_only` operations run cleanly, with these results:
+  - copy, colour transform, lines, rectangles and a job list: the
+    expected green, red, blue and white;
+  - rotation flips the picture;
+  - 3-plane to 2-plane;
+  - scaling up and down from patterned inputs;
+  - the 1 MiB DMA copy and 16-bit subtraction pass the sample's own
+    comparisons;
 - `hd_audio_capture_only` captures PCM.
 
 None of them reports an HDAL error.
@@ -851,10 +902,11 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   words are storage, and every interrupt goes to SPI 0).
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
-- The H.26x bitstream, the graphics engines' results and audio samples:
-  placeholders (see HDAL media). The IPP applies no DCE / IPE corrections
-  and only IME output path 1, and the sensor is a test pattern. The graphics
-  samples that check their output (DMA copy, arithmetic) fail. The SIE
+- The H.26x bitstream and audio samples: placeholders (see HDAL media).
+  The IPP applies no DCE / IPE corrections and only IME output path 1,
+  and the sensor is a test pattern. The graphics engine has no quarter
+  turns, palettes, colour keys, blending of two images or LUTs, and there
+  is no affine engine. The SIE
   ignores the sensor's real timing (fixed 30 fps), and the DAI paces audio
   at a nominal rate. AI/CNN, MD, DIS, VPE, IVE and the display path are
   not wired.

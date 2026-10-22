@@ -30,6 +30,7 @@
 #include "qapi/error.h"
 #include "qom/object.h"
 #include "system/dma.h"
+#include "hw/misc/nvt-gfx.h"
 #include "hw/misc/nvt-pixel.h"
 
 #define TYPE_NVT_MEDIA "nvt-media"
@@ -217,8 +218,10 @@ static void sie_frame(NvtMediaState *s)
  * The updates go through the engine's own registers -- they include its
  * interrupt enables.  Each job is a frame: some 1 ms after the fire (and
  * after each job) the engine has run it and raises frame and job end,
- * and list end with the last.  No pixels move.  Status is write 1 to
- * clear; the interrupt is status & enable.
+ * and list end with the last.  IME, the graphics engine and ISE do the
+ * job's work as it completes (ime_write_yuv, nvt-gfx.c); the others move
+ * no pixels.  Status is write 1 to clear; the interrupt is status &
+ * enable.
  */
 typedef struct {
     hwaddr inte;
@@ -412,6 +415,18 @@ static void ime_write_yuv(NvtMediaState *s)
     }
 }
 
+/* A job is set up: the engines that compute do its work. */
+static void ipp_job_work(NvtMediaState *s)
+{
+    if (s->engine->opaque == &ipp_ime) {
+        ime_write_yuv(s);
+    } else if (s->engine->opaque == &ipp_grph) {
+        nvt_gfx_grph_run(s->regs);
+    } else if (s->engine->opaque == &ipp_ise) {
+        nvt_gfx_ise_run(s->regs);
+    }
+}
+
 static void ipp_job_done(NvtMediaState *s)
 {
     const NvtIppParams *p = s->engine->opaque;
@@ -419,15 +434,14 @@ static void ipp_job_done(NvtMediaState *s)
 
     if (s->phase) {
         /* a single job: its trigger bit drops when it is done */
+        ipp_job_work(s);
         *reg(s, IPP_CTRL) &= ~p->trig;
         *reg(s, p->ints) |= p->trig_end;
         ipp_update_irq(s);
         return;
     }
     more = ipp_run_job(s);
-    if (s->engine->opaque == &ipp_ime) {
-        ime_write_yuv(s);
-    }
+    ipp_job_work(s);
 
     *reg(s, p->ints) |= p->job_end | (more ? 0 : p->ll_end);
     ipp_update_irq(s);

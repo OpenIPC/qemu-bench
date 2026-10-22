@@ -18,15 +18,16 @@
 #   - hd_video_capture_only, hd_video_encode_only (H.264 / H.265 from a
 #     file of frames): no HDAL error;
 #   - hd_gfx_only: copy, scale (ISE), rotation, colour transform, lines,
-#     rectangles, job lists, YUV420 3P -> 2P and 3P scaling each exit
-#     without an error and leave their result file;
+#     rectangles, job lists, YUV420 3P -> 2P and 3P scaling, from inputs
+#     patterned here, leave the pixels the engines should compute; the DMA
+#     copy and 16-bit arithmetic pass the sample's own comparisons;
 #   - hd_audio_capture_only: PCM captured through EAC and the DAI DMA.
 #
 # The SIE captures a moving test pattern; the IPP turns its RAW into YUV and
 # the JPEG codec encodes it, so the snapshots show colour bars, a grey ramp
 # and a white box that moves between them (checked with Python PIL).  H.26x
-# output, graphics results and audio are still placeholders
-# (docs/novatek.md).  Sample keys go in on stdin.
+# output and audio are still placeholders (docs/novatek.md).  Sample keys
+# go in on stdin.
 #
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
 #       [--samples DIR] [--dir qemu-boot] [--qemu ./qemu-src/build/qemu-system-arm]
@@ -86,6 +87,36 @@ cp -a "$WORK/rootfs/lib/libc.so" "$WORK/rootfs/lib/ld-musl-armhf.so.1" \
 ln -s busybox "$WORK/initramfs/bin/sh"
 if [ -n "$SAMPLES" ]; then
     cp -a "$SAMPLES/smp" "$SAMPLES/uc" "$WORK/initramfs/"
+    # hd_gfx_only's inputs, patterned so its results can be checked: Y is
+    # (x + y) / 16, U / V ramps over the pair index, the ARGB4444 logo is
+    # opaque green
+    mkdir -p "$WORK/initramfs/gfxin"
+    python3 - "$WORK/initramfs/gfxin" <<'PY'
+import sys
+out = sys.argv[1]
+w, h = 1920, 1080
+y = bytes((x + r) // 16 for r in range(h) for x in range(w))
+def uv(c):
+    return bytes((64 + (i + r) // 8) if c == 'u' else (192 - (i + r) // 8)
+                 for r in range(h // 2) for i in range(w // 2))
+u, v = uv('u'), uv('v')
+nv12 = bytearray(y)
+for r in range(h // 2):
+    row = bytearray(w)
+    row[0::2] = u[r * 960:(r + 1) * 960]
+    row[1::2] = v[r * 960:(r + 1) * 960]
+    nv12 += row
+open(out + '/video_frm_1920_1080_1_yuv420.dat', 'wb').write(nv12)
+pad = bytes(w // 2)
+p3 = bytearray(y)
+for plane in (u, v):
+    for r in range(h // 2):
+        p3 += plane[r * 960:(r + 1) * 960] + pad
+p3 += bytes((4 << 20) - len(p3))
+open(out + '/video_frm_1920_1080_1_yuv4203P.dat', 'wb').write(p3)
+open(out + '/video_frm_1000_200_1_argb4444.dat', 'wb').write(
+    b'\xf0' * 400000)
+PY
 fi
 
 cat > "$WORK/initramfs/init" <<INIT
@@ -102,7 +133,7 @@ echo "NVT-HDAL-MODULES: \$(\$bb lsmod | \$bb wc -l)"
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
 done
-[ -d /smp ] && \$bb cp -a /smp /uc /samples.sh /mnt/tmp/ && \$bb chroot /mnt /bin/sh /tmp/samples.sh
+[ -d /smp ] && \$bb cp -a /smp /uc /gfxin /samples.sh /mnt/tmp/ && \$bb chroot /mnt /bin/sh /tmp/samples.sh
 echo "NVT-HDAL-OK"
 \$bb reboot -f
 INIT
@@ -145,14 +176,38 @@ dd if=/dev/zero of=/mnt/sd/video_frm_352_288_30_yuv420.dat bs=1k count=4455 2>/d
 run hd_video_encode_only
 echo "NVT-HDAL-ENCODE-BYTES: $(size /mnt/sd/dump_bs_main.dat)"
 rm -f /mnt/sd/*
-dd if=/dev/zero of=/mnt/sd/video_frm_1000_200_1_argb4444.dat bs=1k count=391 2>/dev/null
-dd if=/dev/zero of=/mnt/sd/video_frm_1920_1080_1_yuv420.dat bs=3110400 count=1 2>/dev/null
-dd if=/dev/zero of=/mnt/sd/video_frm_1920_1080_1_yuv4203P.dat bs=1M count=4 2>/dev/null
+cp /tmp/gfxin/* /mnt/sd/
+px() {          # px <file> <offset> <bytes>: those bytes in hex
+    hexdump -s $2 -n $3 -e '/1 "%02x"' "$1"
+}
 for k in c s o t l r j p d; do
     run hd_gfx_only $k
     f=$(sed -n 's/^result is //p' /tmp/hd_gfx_only.out | head -1)
     echo "NVT-HDAL-GFX: $k rc=$RC errors=$ERRS bytes=$(size "$f")"
+    # the result's pixels at points of the picture (offsets for 1920x1080
+    # NV12 unless noted)
+    case $k in
+    c) at="979510 1 979490 1 2563510 2" ;;      # logo, background, logo UV
+    t) at="0 1 200000 2" ;;                     # 1000x200
+    l) at="960510 1 960400 1 2554110 2" ;;
+    r) at="1153200 1 2650800 2" ;;
+    j) at="193200 1 577200 1 1153200 1 1537200 1 1844400 1" ;;
+    o) at="0 1 2071680 1 2073600 2" ;;
+    p) at="384100 1 2112020 2" ;;
+    s) at="0 1 8294399 1 8294400 2 12441598 2" ;;   # 3840x2160
+    d) at="4810 1 48100 1 134410 1 199210 1" ;;     # 480x270, 3 planes
+    esac
+    set -- $at
+    v=
+    while [ $# -gt 1 ]; do v="$v $(px "$f" $1 $2)"; shift 2; done
+    echo "NVT-HDAL-GFX-PX: $k$v"
     rm -f /mnt/sd/hd_gfx* /mnt/sd/affine*
+done
+# the two with checks of their own: the DMA copy and 16-bit arithmetic
+for k in m a; do
+    run hd_gfx_only $k
+    echo "NVT-HDAL-GFX: $k rc=$RC errors=$ERRS"
+    grep -a "dma manages\|operation of two" /tmp/hd_gfx_only.out
 done
 rm -f /mnt/sd/*
 run hd_audio_capture_only
@@ -268,6 +323,25 @@ PY
         expect "NVT-HDAL-GFX: $k rc=0 errors=0 bytes=[1-9]" \
             "hd_gfx_only '$k': no error, its result file written"
     done
+    # what the engines computed: green is Y 93, U / V 2a 14 (the vendor's
+    # argb_to_ycbcr), the background (x + y) / 16
+    for e in "c 93 32 2a14:copy blends the opaque green logo over the picture" \
+             "t 93 2a14:colour transform turns the logo into green NV12" \
+             "l 93 38 2a14:a green line drawn, the picture beside it kept" \
+             "r 93 2a14:a green rectangle drawn" \
+             "j 93 4e 1c ff 87:a job list draws green, red, blue, white" \
+             "o 43 00 837d:rotate flips the picture top to bottom" \
+             "p 12 43bd:3-plane to 2-plane keeps Y and interleaves U / V" \
+             "s 00 bb 40c0 fb05:scaling to 3840x2160 keeps the corners" \
+             "d 05 32 4a b6:scaling to 480x270 averages 4x4 blocks"; do
+        expect "NVT-HDAL-GFX-PX: ${e%%:*}[[:space:]]*\$" "hd_gfx_only '${e%% *}': ${e#*:}"
+    done
+    expect "NVT-HDAL-GFX: m rc=0 errors=0" "hd_gfx_only 'm' runs without an error"
+    expect "dma manages to copy 1048576 bytes" \
+        "hd_gfx_only 'm': the DMA copy of 1 MiB compares equal"
+    expect "NVT-HDAL-GFX: a rc=0 errors=0" "hd_gfx_only 'a' runs without an error"
+    expect "minus operation of two 16bits arrays ok" \
+        "hd_gfx_only 'a': 16-bit subtraction gives the sample's answer"
     if grep -a -q 'NVT-HDAL-AUDIO-BYTES: [1-9]' "$WORK/console.log"; then
         pass "hd_audio_capture_only captures PCM"
     else
