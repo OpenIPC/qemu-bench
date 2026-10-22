@@ -4,8 +4,8 @@
 # The samples (code/hdal/samples in na51089_linux_sdk_*_v1.01.002) drive
 # the media engines through the HDAL: capture -> video process -> encode
 # (hd_video_record), JPEG snapshots, capture alone, encoding frames from
-# a file, the 2D graphics engine, audio capture, playback, live loopback
-# and AAC recording.  They are vendor code, as
+# a file, the 2D graphics engine, the display (a file, and the sensor
+# live), audio capture, playback, live loopback and AAC recording.  They are vendor code, as
 # is the SDK, so neither is in the repository or in CI.
 #
 # They run against the OpenIPC release's own libhdal.so, the library
@@ -88,6 +88,8 @@ build hd_video_snapshot sensor
 build hd_video_capture_only sensor
 build hd_video_encode_only
 build hd_gfx_only
+build hd_video_output_only
+build hd_video_liveview sensor
 build hd_audio_capture_only
 build hd_audio_output_only
 build hd_audio_livesound

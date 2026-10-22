@@ -78,6 +78,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | ISE / 2D graphics (2 engines) | `0xF0C90000` / `0xF0C80000`, `0xF0D10000` | 21 / 18, 19 | `nvt-media` |
 | H.26x / JPEG codec | `0xF0A10000` / `0xF0A00000` | 16 / 17 | `nvt-media` |
 | EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-audio` |
+| IDE (display engine) | `0xF0800000` | 48 | `nvt-ide`, on QEMU's console |
 | CSI, LVDS, sensor PHY, TGE, SIF, AI | | | `nvt-media`, storage |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
@@ -859,7 +860,8 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 75 things:
+builds them from the vendor SDK (not in CI). The run checks 75 things
+(88 with `--display-kos`, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -884,6 +886,9 @@ builds them from the vendor SDK (not in CI). The run checks 75 things:
     `hd_audio_livesound` (capture looped to playback) leave both tones
     in the wav;
   - `hd_audio_record`'s AAC decodes (ffmpeg) to them.
+- with the display modules, `hd_video_output_only` (colour bars from a
+  file) and `hd_video_liveview` (the sensor) put their pictures on the
+  panel: QEMU's screendump of each, taken half way, shows the bars.
 
 None of them reports an HDAL error.
 
@@ -900,9 +905,65 @@ driver offers.
 
 With Python PIL, the run also checks the snapshots' content: the eight
 colour bars, the ramp from dark to light, and the box moving between the
-two snapshots. That makes 51 checks.
+two snapshots.
 
 `test-novatek.py` checks each engine's handshake at register level, in CI.
+
+## Display
+
+The display path is the IDE (`hw/display/nvt-ide.c`) at `0xF0800000`,
+SPI 48, scanned out to QEMU's graphic console. It drives LCD panels or
+MIPI DSI; the chip has no TV or HDMI output. The EVB's panel is a 3.5"
+HX8238D on 8-bit serial RGB, 320x240 at about 61 Hz. Each line is 960
+clocks, one colour each, and the IDE's windows are 960 wide too. Out of
+a serial-RGB device the console therefore shows every third column, at
+320x240.
+
+**Modules.** The OpenIPC release leaves the display modules out, but its
+toolchain (`toolchain.novatek-nt9856x.tgz`, `sdk/kmod/hdal`) carries
+them, built for the release kernel. The SDK's init script loads them in
+this order:
+1. `nvt_ide`;
+2. `kdrv_videoout`;
+3. `kflow_videoout`;
+4. `nvt_dispdev_panel`;
+5. the panel, `disp_if8b_lcd1_pw35p00`.
+
+The generated device tree has their nodes, from the EVB's dtsi files:
+- `ide@f0800000`, whose name the clock driver finds its clocks by;
+- `dispobj` and `dispdev`;
+- `/display`, the panel's GPIO wiring (`lcd_ctrl` 1: its registers are
+  bit-banged on D_GPIO 3 / 4 / 5).
+
+**The IDE** (`ide_reg.h`, as the closed `ide2.o` / `ide_idec.o` drive
+it; the vendor U-Boot has the same driver as source):
+- CTRL `0x000`: layer enables, the device type [10:7], on (bit 27) and
+  load (bit 28). DMA idle (bit 2) reads 1 while the DMA is disabled or
+  the engine is off.
+- Most registers take effect at the next frame. The driver sets load,
+  then waits with no timeout for frame end (INT `0x0FC` bit 23, enable
+  bit 7, write 1 to clear). Its handler wakes the waiter only if load
+  reads 0 by then. So each frame latches the registers, clears load,
+  and only then raises frame end.
+- Frames run at 60 Hz while the engine is on. With it off, the driver
+  sleeps a frame instead of waiting.
+
+Scanout composes the background (`0x0BC`, YCbCr) and then the layers:
+video 1, video 2, OSD 1. Each layer's buffer is scaled into its window,
+nearest neighbour, with mirroring. The formats:
+- video: 9 and 10, YUV 4:2:2 and 4:2:0 with interleaved CbCr;
+- OSD 1: the 8-bit palette (256 entries of Y, Cb, Cr and alpha at
+  `0x200`), ARGB8888, ARGB4444 and ARGB1555.
+
+OSD 1 blends by its alpha select: opaque, global alpha, or the pixel's.
+Its colour key is honoured. Other formats log as unimplemented.
+
+`test-novatek-hdal.sh --display-kos DIR` loads the modules and checks
+that the IDE, dispobj and dispdev bind and the panel driver comes up.
+CI runs this, with the kmods extracted from the toolchain. With
+`--samples`, `hd_video_output_only` and `hd_video_liveview` run too, and
+the screendumps are checked. `test-novatek.py` checks the frame
+handshake and a screendump of a video and an OSD layer.
 
 ## Ethernet
 
@@ -1017,8 +1078,13 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
-  ignores the sensor's real timing (fixed 30 fps). AI/CNN, MD, DIS, VPE, IVE and the display path are
-  not wired.
+  ignores the sensor's real timing (fixed 30 fps). AI/CNN, MD, DIS, VPE and IVE
+  are not wired.
+- Display: MIPI DSI (only the `ifdsi` panels use it, and its driver
+  waits on interrupts the model does not raise), the IDE's 1/2/4-bit
+  palettes and ARGB8565 / 4565, its colour pipeline (gamma, CST), face
+  boxes and lines, and `/dev/fb0`. The release kernel has no
+  `CONFIG_FB`, so `nvt_fb.ko` does not load.
 
 ## NT98332 (NA51103)
 

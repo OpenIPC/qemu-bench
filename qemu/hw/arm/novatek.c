@@ -59,6 +59,7 @@
 #define NVT_OTP_BASE        0xF0660000
 #define NVT_PWM_BASE        0xF0210000
 #define NVT_DAI_BASE        0xF0630000
+#define NVT_IDE_BASE        0xF0800000
 #define NVT_EAC_BASE        0xF0640000
 #define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */
 #define NVT_MPCORE_BASE     0xFFD00000
@@ -70,6 +71,8 @@
 #define NVT_IRQ_PWM         26
 #define NVT_IRQ_TIMER       0
 #define NVT_IRQ_DAI         15
+#define NVT_IRQ_IDE         48
+#define NVT_D_GPIO(n)       (0x80 + (n))    /* nvt-gpio.h D_GPIO() */
 #define NVT_IRQ_ARB         33
 #define NVT_ARB2_BASE       0xF0FE0000
 #define NVT_IRQ_FLASH       29
@@ -694,6 +697,32 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
                            NVT_WDT_BASE, 0x10000);
     nvt_fdt_irq(fdt, "/wdt@f0050000", NVT_IRQ_WDT);
 
+    /*
+     * The display path (nvt-peri.dtsi, nvt-media.dtsi, nvt-display.dtsi):
+     * the IDE, which nvt_ide.ko binds and finds its clocks by
+     * ("f0800000.ide"), the HDAL's display object and device units, and
+     * the EVB's LCD -- an HX8238D on 8-bit serial RGB whose panel driver
+     * bit-bangs its registers on D_GPIO 3 / 4 / 5 (lcd_ctrl 1).  The
+     * modules are not in the OpenIPC release (docs/novatek.md).
+     */
+    qemu_fdt_add_subnode(fdt, "/ide@f0800000");
+    qemu_fdt_setprop_string(fdt, "/ide@f0800000", "compatible",
+                            "nvt,nvt_ide");
+    qemu_fdt_setprop_cells(fdt, "/ide@f0800000", "reg", NVT_IDE_BASE,
+                           0x1000);
+    nvt_fdt_irq(fdt, "/ide@f0800000", NVT_IRQ_IDE);
+    qemu_fdt_add_subnode(fdt, "/dispobj");
+    qemu_fdt_setprop_string(fdt, "/dispobj", "compatible", "nvt,nvt_dispobj");
+    qemu_fdt_add_subnode(fdt, "/dispdev");
+    qemu_fdt_setprop_string(fdt, "/dispdev", "compatible", "nvt,nvt_dispdev");
+    qemu_fdt_add_subnode(fdt, "/display");
+    qemu_fdt_setprop_string(fdt, "/display", "type", "lcd");
+    qemu_fdt_setprop_cell(fdt, "/display", "lcd_ctrl", 1);
+    qemu_fdt_setprop_cell(fdt, "/display", "sif_channel", 2);
+    qemu_fdt_setprop_cell(fdt, "/display", "gpio_cs", NVT_D_GPIO(3));
+    qemu_fdt_setprop_cell(fdt, "/display", "gpio_clk", NVT_D_GPIO(4));
+    qemu_fdt_setprop_cell(fdt, "/display", "gpio_data", NVT_D_GPIO(5));
+
     return fdt;
 }
 
@@ -1100,6 +1129,9 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NVT_DAI_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, NVT_EAC_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_DAI]);
+
+    /* the display engine, shown on QEMU's console */
+    sysbus_create_simple("nvt-ide", NVT_IDE_BASE, pic[NVT_IRQ_IDE]);
 
     dev = qdev_new("nvt-media");
     qdev_prop_set_string(dev, "engine", "arb2");

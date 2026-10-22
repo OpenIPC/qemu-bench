@@ -38,13 +38,23 @@
 # is a test tone or the host's (docs/novatek.md).  Sample keys go in on
 # stdin.
 #
+# With --display-kos DIR (the HDAL modules of OpenIPC's novatek-nt9856x
+# toolchain, toolchain/sdk/kmod/hdal, which the release leaves out) it
+# also loads the display path the SDK's way -- nvt_ide, kdrv_videoout,
+# kflow_videoout, nvt_dispdev_panel and the EVB's HX8238D panel -- and
+# checks that it binds the IDE.  With --samples as well it runs
+# hd_video_output_only (colour bars from a file) and hd_video_liveview
+# (the sensor), and checks QEMU's screendump of the display mid-run.
+#
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
-#       [--samples DIR] [--dir qemu-boot] [--qemu ./qemu-src/build/qemu-system-arm]
+#       [--samples DIR] [--display-kos DIR] [--dir qemu-boot] \
+#       [--qemu ./qemu-src/build/qemu-system-arm]
 set -euo pipefail
 
 SOC=nt98566
 MACHINE=
 SAMPLES=
+DISPLAY_KOS=
 QEMU=./qemu-src/build/qemu-system-arm
 DIR=qemu-boot
 SENSOR=sc501ai
@@ -53,6 +63,7 @@ while [ $# -gt 0 ]; do
         --soc) SOC=$2; shift 2 ;;
         --machine) MACHINE=$2; shift 2 ;;
         --samples) SAMPLES=$2; shift 2 ;;
+        --display-kos) DISPLAY_KOS=$2; shift 2 ;;
         --qemu) QEMU=$2; shift 2 ;;
         --dir) DIR=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
@@ -94,6 +105,27 @@ cp "$WORK/rootfs/bin/busybox" "$WORK/initramfs/bin/"
 cp -a "$WORK/rootfs/lib/libc.so" "$WORK/rootfs/lib/ld-musl-armhf.so.1" \
     "$WORK/initramfs/lib/"
 ln -s busybox "$WORK/initramfs/bin/sh"
+mkdir -p "$WORK/initramfs/dispin"
+if [ -n "$DISPLAY_KOS" ]; then
+    mkdir -p "$WORK/initramfs/dko"
+    for k in kdrv_videoout/ide/nvt_ide kdrv_videoout/display_obj/kdrv_videoout \
+             kflow_videoout/unit/kflow_videoout display_panel/nvt_dispdev_panel \
+             display_panel/disp_if8b_lcd1_pw35p00_hx8238d/disp_if8b_lcd1_pw35p00; do
+        cp "$DISPLAY_KOS/$k.ko" "$WORK/initramfs/dko/"
+    done
+    # hd_video_output_only's 3 frames of 320x240 YUV 4:2:2, Y then CbCr
+    # interleaved: the eight 75 % colour bars (BT.601)
+    python3 - "$WORK/initramfs/dispin/video_frm_320_240_3_yuv422.dat" <<'PY'
+import sys
+w, h = 320, 240
+bars = [(180, 128, 128), (162, 44, 142), (131, 156, 44), (112, 72, 58),
+        (84, 184, 198), (65, 100, 212), (35, 212, 114), (16, 128, 128)]
+y = bytes(bars[x * 8 // w][0] for r in range(h) for x in range(w))
+uv = bytes(v for r in range(h) for x in range(0, w, 2)
+           for v in bars[x * 8 // w][1:])
+open(sys.argv[1], 'wb').write((y + uv) * 3)
+PY
+fi
 if [ -n "$SAMPLES" ]; then
     cp -a "$SAMPLES/smp" "$SAMPLES/uc" "$WORK/initramfs/"
     # hd_gfx_only's inputs, patterned so its results can be checked: Y is
@@ -155,10 +187,20 @@ for fs in proc sys dev; do \$bb mount --bind /\$fs /mnt/\$fs; done
 \$bb mount -t tmpfs tmp /mnt/tmp
 \$bb chroot /mnt /bin/sh -c "SENSOR=$SENSOR /usr/bin/load_novatek" >/dev/null 2>&1
 echo "NVT-HDAL-MODULES: \$(\$bb lsmod | \$bb wc -l)"
+# the display path, in the SDK's order (S10_SysInit2, IPCAM1 EVB)
+if [ -d /dko ]; then
+    \$bb cp -a /dko /mnt/tmp/
+    for m in nvt_ide kdrv_videoout kflow_videoout nvt_dispdev_panel \\
+             disp_if8b_lcd1_pw35p00; do
+        \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/\$m.ko" >/dev/null 2>&1
+        echo "NVT-DISP-INSMOD: \$m rc=\$?"
+    done
+    \$bb dmesg | \$bb grep -a "Hello, panel" | \$bb sed 's/^.*Hello/NVT-DISP-PANEL: Hello/'
+fi
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
 done
-[ -d /smp ] && \$bb cp -a /smp /uc /gfxin /encin /samples.sh /mnt/tmp/ && \$bb chroot /mnt /bin/sh /tmp/samples.sh
+[ -d /smp ] && \$bb cp -a /smp /uc /gfxin /encin /dispin /samples.sh /mnt/tmp/ && \$bb chroot /mnt /bin/sh /tmp/samples.sh
 echo "NVT-HDAL-OK"
 \$bb reboot -f
 INIT
@@ -244,6 +286,23 @@ for k in m a; do
     echo "NVT-HDAL-GFX: $k rc=$RC errors=$ERRS"
     grep -a "dma manages\|operation of two" /tmp/hd_gfx_only.out
 done
+# the display: colour bars from a file, then the sensor, each with a
+# screendump of the panel half way
+if [ -e /dev/nvt_ide0 ] && [ -x ./hd_video_output_only ]; then
+    cp /tmp/dispin/video_frm_320_240_3_yuv422.dat /mnt/sd/
+    snaprun() {     # snaprun <snapshot> <sample> [args]
+        nm=$1 n=$2
+        shift 2
+        ( sleep 10; echo "NVT-DISP-SNAP $nm" > /dev/console; sleep 5; echo q ) |
+            timeout 60 ./$n "$@" > /tmp/$n.out 2>&1
+        RC=$?
+        ERRS=$(grep -c -i 'err\|fail' /tmp/$n.out)
+        echo "NVT-HDAL-RUN: $n${*:+ $*} rc=$RC errors=$ERRS"
+        grep -i 'err\|fail' /tmp/$n.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
+    }
+    snaprun bars hd_video_output_only 1
+    snaprun live hd_video_liveview
+fi
 rm -f /mnt/sd/*
 run hd_audio_capture_only
 echo "NVT-HDAL-AUDIO-BYTES: $(size /mnt/sd/audio_bs_16_2_48000_pcm.dat)"
@@ -264,15 +323,41 @@ SMP
 (cd "$WORK/initramfs" && find . | cpio -o -H newc 2>/dev/null) > "$WORK/initramfs.cpio"
 
 echo "Booting $KERNEL on -M $MACHINE,sensor=$SENSOR${SAMPLES:+, with the HDAL samples}"
+# Screendumps: the guest prints NVT-DISP-SNAP <name> while a picture is
+# up, and this takes QEMU's console as $WORK/<name>.ppm.
+(
+    seen=
+    while sleep 1; do
+        [ -S "$WORK/mon.sock" ] || continue
+        for n in $(grep -a -o 'NVT-DISP-SNAP [a-z0-9_]*' "$WORK/console.log" \
+                   2>/dev/null | cut -d' ' -f2); do
+            case " $seen " in *" $n "*) continue;; esac
+            seen="$seen $n"
+            python3 - "$WORK/mon.sock" "screendump $WORK/$n.ppm" <<'PY' || true
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.settimeout(5)
+time.sleep(0.2)
+s.sendall(sys.argv[2].encode() + b'\n')
+time.sleep(1)
+s.close()
+PY
+        done
+    done
+) &
+snapper=$!
 set +e
 timeout 900 "$QEMU" -M "$MACHINE,sensor=$SENSOR,flash-file=$WORK/nor.bin,audiodev=snd0" \
     -audiodev "wav,id=snd0,path=$WORK/out.wav" \
     -kernel "$KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
     -drive "if=sd,index=0,format=raw,file=$WORK/sd.img" \
-    -nographic -monitor none -serial stdio -nic none -no-reboot \
+    -nographic -monitor "unix:$WORK/mon.sock,server=on,wait=off" \
+    -serial stdio -nic none -no-reboot \
     > "$WORK/console.log" 2>&1
 rc=$?
+kill $snapper 2>/dev/null || true
 set -e
 grep -a -v '^[A-Za-z0-9+/=]*$' "$WORK/console.log" || true
 
@@ -298,6 +383,17 @@ for b in "f0c00000.sie drv_sie" "f0cc0000.tge kdrv_tge" \
     expect "NVT-HDAL-BOUND: $b[[:space:]]*\$" "${b% *} bound by ${b#* }"
 done
 expect 'NVT-HDAL-OK' 'PID 1 ran to the end'
+if [ -n "$DISPLAY_KOS" ]; then
+    for m in nvt_ide kdrv_videoout kflow_videoout nvt_dispdev_panel \
+             disp_if8b_lcd1_pw35p00; do
+        expect "NVT-DISP-INSMOD: $m rc=0" "display: $m loads"
+    done
+    for b in "f0800000.ide nvt_ide" "dispobj nvt_dispobj" \
+             "dispdev nvt_dispdev"; do
+        expect "NVT-HDAL-BOUND: $b[[:space:]]*\$" "display: ${b% *} bound by ${b#* }"
+    done
+    expect "NVT-DISP-PANEL: Hello, panel: PW35P00" "display: the EVB's panel driver is up"
+fi
 
 if [ -n "$SAMPLES" ]; then
     for s in hd_video_record hd_video_snapshot hd_video_capture_only \
@@ -493,6 +589,36 @@ PY
         pass "hd_audio_capture_only captures PCM"
     else
         bad "hd_audio_capture_only captures PCM"
+    fi
+    # The display: the bars hd_video_output_only shows from its file, and
+    # the sensor's picture through hd_video_liveview
+    if [ -n "$DISPLAY_KOS" ]; then
+        for s in "hd_video_output_only 1" hd_video_liveview; do
+            expect "NVT-HDAL-RUN: $s rc=0 errors=0" "$s runs without an HDAL error"
+        done
+        look=$(python3 - "$WORK/bars.ppm" "$WORK/live.ppm" <<'PY' 2>/dev/null || true
+import sys
+from PIL import Image
+want = [(1, 1, 1), (1, 1, 0), (0, 1, 1), (0, 1, 0), (1, 0, 1), (1, 0, 0),
+        (0, 0, 1), (0, 0, 0)]
+def bars(path):
+    im = Image.open(path).convert('RGB')
+    w, h = im.size
+    ok = all(tuple(int(c > 96) for c in im.getpixel((w * (2 * i + 1) // 16,
+                                                     h // 6))) == want[i]
+             for i in range(8))
+    return '%dx%d:%d' % (w, h, ok)
+print('bars=%s live=%s' % (bars(sys.argv[1]), bars(sys.argv[2])))
+PY
+)
+        if [ -z "$look" ] && ! python3 -c 'import PIL' 2>/dev/null; then
+            echo "SKIP: display screendump checks (no Python PIL)"
+        else
+            case "$look" in *bars=320x240:1*) pass "the panel shows hd_video_output_only's colour bars (320x240)";;
+                *) bad "the panel shows hd_video_output_only's colour bars ($look)";; esac
+            case "$look" in *live=320x240:1*) pass "the panel shows the sensor's picture through hd_video_liveview";;
+                *) bad "the panel shows the sensor's picture through hd_video_liveview ($look)";; esac
+        fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what
     # output_only and livesound played to the wav audiodev, and the AAC
