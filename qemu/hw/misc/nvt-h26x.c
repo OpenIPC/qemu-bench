@@ -81,6 +81,7 @@
 #define FUNC_SRC_DIRECT     (3u << 20)
 
 #define H26X_STREAMS        4
+#define H26X_REGS           64      /* what a picture reads: 0x000..0x0FC */
 #define H26X_MAX_HDR        4096
 #define H26X_FILLER_LEN     64
 
@@ -870,6 +871,7 @@ struct NvtH26x {
     bool busy;                  /* a job is with the worker */
     bool reset_pending;         /* drop the streams when it is back */
     bool dying;                 /* free everything when it is back */
+    struct H26xWork *queued;    /* a picture started meanwhile */
 };
 
 static void stream_close(H26xStream *st)
@@ -923,9 +925,15 @@ static void drop_streams(NvtH26x *h)
     }
 }
 
+static void work_free(struct H26xWork *wk);
+
 void nvt_h26x_reset(NvtH26x *h)
 {
     h->gen++;
+    if (h->queued) {
+        work_free(h->queued);
+        h->queued = NULL;
+    }
     if (h->busy) {
         h->reset_pending = true;        /* the worker has a stream */
     } else {
@@ -937,6 +945,10 @@ void nvt_h26x_free(NvtH26x *h)
 {
     if (!h) {
         return;
+    }
+    if (h->queued) {
+        work_free(h->queued);
+        h->queued = NULL;
     }
     if (h->busy) {
         h->gen++;
@@ -1521,6 +1533,26 @@ static bool hevc_tiles_fit(H26xStream *st, const H26xJob *job)
     return x == wctbs;
 }
 
+/* each of a tiled picture's slices starts at its own column */
+static bool hevc_tiles_addressed(const H26xStream *st, const H26xJob *job)
+{
+    unsigned ctb = 1u << st->hsps.log2_ctb, i;
+    g_autoptr(GByteArray) drv = NULL;
+    HevcSlice sl;
+
+    if (job->n != st->nenc) {
+        return false;
+    }
+    for (i = 0; i < job->n; i++) {
+        if (!job_hevc_slice(st, job, i, &sl, &drv) ||
+            sl.address != st->col_x[i] / ctb) {
+            return false;
+        }
+        g_byte_array_free(g_steal_pointer(&drv), true);
+    }
+    return true;
+}
+
 /*
  * Set the stream's encoders up at an IDR, in the worker; false if they
  * cannot match the driver's stream.
@@ -1831,10 +1863,11 @@ static void encode_filler(bool h264, const H26xJob *job, GByteArray *out)
 
 /* ---- the work: set up in the main loop, coded in a worker ---- */
 
-typedef struct {
+typedef struct H26xWork {
     NvtH26x *h;
     H26xStream *st;
     unsigned gen;
+    uint32_t regs[H26X_REGS];   /* as they were when the picture started */
     H26xJob job;
     bool h264;
     bool open;                  /* the worker sets the encoders up first */
@@ -1847,7 +1880,7 @@ typedef struct {
     void *opaque;
 } H26xWork;
 
-static void work_free(H26xWork *wk)
+static void work_free(struct H26xWork *wk)
 {
     unsigned i;
 
@@ -1983,6 +2016,8 @@ static void work_finish(H26xWork *wk)
     wk->done(wk->opaque, &r);
 }
 
+static void work_start(H26xWork *wk);
+
 static void work_done(void *opaque, int ret)
 {
     H26xWork *wk = opaque;
@@ -2003,14 +2038,20 @@ static void work_done(void *opaque, int ret)
         drop_streams(h);
     }
     work_free(wk);
+    if (h->queued) {
+        wk = h->queued;
+        h->queued = NULL;
+        work_start(wk);
+    }
 }
 
 /*
  * The main loop's part: the driver's headers, the stream, the source.
  * True if the picture goes to the worker.
  */
-static bool work_setup(H26xWork *wk, const uint32_t *regs)
+static bool work_setup(H26xWork *wk)
 {
+    const uint32_t *regs = wk->regs;
     NvtH26x *h = wk->h;
     H26xStream *st;
     unsigned i;
@@ -2064,8 +2105,8 @@ static bool work_setup(H26xWork *wk, const uint32_t *regs)
         }
         wk->open = true;
     } else if (st->broken || !st->nenc ||
-               wk->job.n != (st->tiled ? st->nenc : 1) ||
-               (!st->tiled && R(H26X_REF_Y) != st->last_rec)) {
+               (st->tiled ? !hevc_tiles_addressed(st, &wk->job) :
+                wk->job.n != 1 || R(H26X_REF_Y) != st->last_rec)) {
         /* the decoder's reference is not the encoder's */
         st->broken = true;
         return false;
@@ -2088,11 +2129,27 @@ static bool work_setup(H26xWork *wk, const uint32_t *regs)
     return true;
 }
 
+/* to the worker if it can be coded, else the placeholder at once */
+static void work_start(H26xWork *wk)
+{
+    NvtH26x *h = wk->h;
+
+    if (work_setup(wk)) {
+        h->busy = true;
+        thread_pool_submit_aio(work_encode, wk, work_done, wk);
+        return;
+    }
+    work_finish(wk);
+    work_free(wk);
+}
+
 void nvt_h26x_encode(NvtH26x *h, const uint32_t *regs, NvtH26xDone *done,
                      void *opaque)
 {
     H26xWork *wk = g_new0(H26xWork, 1);
 
+    memcpy(wk->regs, regs, sizeof(wk->regs));
+    regs = wk->regs;
     wk->h = h;
     wk->gen = h->gen;
     wk->h264 = R(H26X_FUNC_CFG) & FUNC_H264;
@@ -2103,15 +2160,15 @@ void nvt_h26x_encode(NvtH26x *h, const uint32_t *regs, NvtH26xDone *done,
     wk->qp[0] = R(0x0B8) & 0x3F;
     wk->done = done;
     wk->opaque = opaque;
-    if (!h->busy && work_setup(wk, regs)) {
-        h->busy = true;
-        thread_pool_submit_aio(work_encode, wk, work_done, wk);
+    if (h->busy) {
+        /* after the one coding (a reset voids that one, not this) */
+        if (h->queued) {
+            qemu_log_mask(LOG_GUEST_ERROR, "nvt-h26x: a picture started "
+                          "while two are pending; the older is dropped\n");
+            work_free(h->queued);
+        }
+        h->queued = wk;
         return;
     }
-    if (h->busy) {
-        qemu_log_mask(LOG_GUEST_ERROR, "nvt-h26x: a picture started while "
-                      "one is coding\n");
-    }
-    work_finish(wk);
-    work_free(wk);
+    work_start(wk);
 }

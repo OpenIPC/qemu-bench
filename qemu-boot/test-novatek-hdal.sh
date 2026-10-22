@@ -324,8 +324,9 @@ ramp = [ims[0].getpixel((x, h * 5 // 6))[1] for x in (8, w // 2, w - 8)]
 def box(im):
     xs = [x for x in range(0, w, 4) if min(im.getpixel((x, h // 3))) > 220]
     return xs[0] if xs else -1
+b0, b1 = box(ims[0]), box(ims[1])
 print('size=%dx%d bars=%d ramp=%d moved=%d' % (w, h, bars,
-      ramp[0] < ramp[1] < ramp[2], box(ims[0]) != box(ims[1])))
+      ramp[0] < ramp[1] < ramp[2], b0 >= 0 and b1 >= 0 and b0 != b1))
 PY
 )
         if [ ! -s "$WORK/rec.log" ] && [ "$look" = "size=2880x1620 bars=1 ramp=1 moved=1" ]; then
