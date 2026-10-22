@@ -586,12 +586,12 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         }
     }
     for (n = 0; n < ARRAY_SIZE(nvt_hdal_units); n++) {
-        g_autofree char *upath = g_strdup_printf("/%s", nvt_hdal_units[n]);
+        g_autofree char *unit = g_strdup_printf("/%s", nvt_hdal_units[n]);
         g_autofree char *compat = g_strdup_printf("nvt,%s",
                                                   nvt_hdal_units[n]);
 
-        qemu_fdt_add_subnode(fdt, upath);
-        qemu_fdt_setprop_string(fdt, upath, "compatible", compat);
+        qemu_fdt_add_subnode(fdt, unit);
+        qemu_fdt_setprop_string(fdt, unit, "compatible", compat);
     }
     qemu_fdt_add_subnode(fdt, "/audio");
     qemu_fdt_setprop_string(fdt, "/audio", "compatible", "nvt,nvt_audio");
