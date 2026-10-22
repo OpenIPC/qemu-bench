@@ -611,10 +611,14 @@ def bars(path):
 print('bars=%s live=%s' % (bars(sys.argv[1]), bars(sys.argv[2])))
 PY
 )
-        case "$look" in *bars=320x240:1*) pass "the panel shows hd_video_output_only's colour bars (320x240)";;
-            *) bad "the panel shows hd_video_output_only's colour bars ($look)";; esac
-        case "$look" in *live=320x240:1*) pass "the panel shows the sensor's picture through hd_video_liveview";;
-            *) bad "the panel shows the sensor's picture through hd_video_liveview ($look)";; esac
+        if [ -z "$look" ] && ! python3 -c 'import PIL' 2>/dev/null; then
+            echo "SKIP: display screendump checks (no Python PIL)"
+        else
+            case "$look" in *bars=320x240:1*) pass "the panel shows hd_video_output_only's colour bars (320x240)";;
+                *) bad "the panel shows hd_video_output_only's colour bars ($look)";; esac
+            case "$look" in *live=320x240:1*) pass "the panel shows the sensor's picture through hd_video_liveview";;
+                *) bad "the panel shows the sensor's picture through hd_video_liveview ($look)";; esac
+        fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what
     # output_only and livesound played to the wav audiodev, and the AAC
