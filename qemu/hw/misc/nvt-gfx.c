@@ -41,10 +41,16 @@
 
 #define R(off)      (regs[(off) / 4])
 
-static void rd(hwaddr a, void *buf, size_t n)
+/* Read guest memory; a failed read ends the job, as a bus error would. */
+static bool rd(hwaddr a, void *buf, size_t n)
 {
-    dma_memory_read(&address_space_memory, a, buf, n,
-                    MEMTXATTRS_UNSPECIFIED);
+    if (dma_memory_read(&address_space_memory, a, buf, n,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-gfx: cannot read 0x%" HWADDR_PRIx
+                      "\n", a);
+        return false;
+    }
+    return true;
 }
 
 static void wr(hwaddr a, const void *buf, size_t n)
@@ -79,6 +85,9 @@ enum {
     GOP_ROT_180 = 2, GOP_HRZ_FLIP = 3, GOP_VTC_FLIP = 4,
 };
 
+/* jobs are done at once, in the device's timer: bound them */
+#define GRPH_MAX_JOB    (64 * MiB)
+
 typedef struct {
     hwaddr a, b, c;
     uint32_t alofs, blofs, clofs;
@@ -107,8 +116,12 @@ static void grph_arith(const uint32_t *regs, const GrphJob *j, unsigned aop,
     uint32_t max = wide ? 0xFFFF : 0xFF, n = wide ? j->w / 2 : j->w, y, i;
 
     for (y = 0; y < j->h; y++) {
-        rd(j->a + (hwaddr)y * j->alofs, a, j->w);
-        rd(j->b + (hwaddr)y * j->blofs, b, j->w);
+        if (!rd(j->a + (hwaddr)y * j->alofs, a, j->w)) {
+            return;
+        }
+        if (!rd(j->b + (hwaddr)y * j->blofs, b, j->w)) {
+            return;
+        }
         for (i = 0; i < n; i++) {
             int64_t x = wide ? lduw_le_p(a + 2 * i) : a[i];
             int64_t z = wide ? lduw_le_p(b + 2 * i) : b[i];
@@ -155,7 +168,10 @@ static void grph_fill(const uint32_t *regs, const GrphJob *j, uint32_t cfg,
                 row[i] = c1 >> (8 * ((at + i) & 3));
             }
         } else if (fmt == 1) {
-            rd(at, row, j->w);
+            /* an odd last byte, and the half a U / V-only fill skips, stay */
+            if (!rd(at, row, j->w)) {
+                return;
+            }
             for (i = 0; i + 1 < j->w; i += 2) {
                 if (only != 2) {
                     row[i] = c1;
@@ -165,6 +181,9 @@ static void grph_fill(const uint32_t *regs, const GrphJob *j, uint32_t cfg,
                 }
             }
         } else {
+            if ((j->w & 1) && !rd(at + j->w - 1, row + j->w - 1, 1)) {
+                return;
+            }
             for (i = 0; i + 1 < j->w; i += 2) {
                 stw_le_p(row + i, c1);
             }
@@ -181,8 +200,12 @@ static void grph_pack(const GrphJob *j)
     g_autofree uint8_t *c = g_malloc(j->w);
 
     for (y = 0; y < j->h; y++) {
-        rd(j->a + (hwaddr)y * j->alofs, u, half);
-        rd(j->b + (hwaddr)y * j->blofs, v, half);
+        if (!rd(j->a + (hwaddr)y * j->alofs, u, half)) {
+            return;
+        }
+        if (!rd(j->b + (hwaddr)y * j->blofs, v, half)) {
+            return;
+        }
         for (i = 0; i < half; i++) {
             c[2 * i] = u[i];
             c[2 * i + 1] = v[i];
@@ -255,7 +278,8 @@ static uint8_t blend(int s, int d, int a)
  * RGBYUV_BLEND: ARGB image A over the YUV picture whose Y plane is B and
  * whose U / V pairs are C.  CONST1 bit 0: the pairs are 4:2:0, one for
  * each 2x2 pixels (otherwise one for each two of a line); bit 5: a pair
- * takes the pixels' average (otherwise the top left one's).
+ * takes the pixels' average (otherwise the top left one's), their colours
+ * weighted by alpha, so a transparent pixel adds none of its colour.
  */
 static void grph_rgbyuv_blend(const uint32_t *regs, const GrphJob *j,
                               uint32_t cfg)
@@ -274,8 +298,12 @@ static void grph_rgbyuv_blend(const uint32_t *regs, const GrphJob *j,
         for (k = 0; k < got; k++) {
             hwaddr yat = j->b + (hwaddr)(y + k) * j->blofs;
 
-            rd(j->a + (hwaddr)(y + k) * j->alofs, src, j->w);
-            rd(yat, yl, n);
+            if (!rd(j->a + (hwaddr)(y + k) * j->alofs, src, j->w)) {
+                return;
+            }
+            if (!rd(yat, yl, n)) {
+                return;
+            }
             for (x = 0; x < n; x++) {
                 px[k * n + x] = argb_pixel(src + x * bpp, cfg, c1);
                 yl[x] = blend(px[k * n + x].y, yl[x], px[k * n + x].a);
@@ -283,9 +311,11 @@ static void grph_rgbyuv_blend(const uint32_t *regs, const GrphJob *j,
             wr(yat, yl, n);
         }
         /* the U / V pairs under these lines */
-        rd(j->c + (hwaddr)(y / rows) * j->clofs, uv, n & ~1u);
+        if (!rd(j->c + (hwaddr)(y / rows) * j->clofs, uv, n & ~1u)) {
+            return;
+        }
         for (x = 0; x + 1 < n; x += 2) {
-            int su = 0, sv = 0, sa = 0, cnt = 0;
+            int su = 0, sv = 0, sa = 0, cnt = 0, a;
 
             for (k = 0; k < (avg ? got : 1); k++) {
                 uint32_t i;
@@ -293,14 +323,17 @@ static void grph_rgbyuv_blend(const uint32_t *regs, const GrphJob *j,
                 for (i = 0; i < (avg ? 2 : 1); i++) {
                     Yuva *p = &px[k * n + x + i];
 
-                    su += p->u;
-                    sv += p->v;
+                    su += p->u * p->a;
+                    sv += p->v * p->a;
                     sa += p->a;
                     cnt++;
                 }
             }
-            uv[x] = blend(su / cnt, uv[x], sa / cnt);
-            uv[x + 1] = blend(sv / cnt, uv[x + 1], sa / cnt);
+            if (sa) {
+                a = sa / cnt;
+                uv[x] = blend(su / sa, uv[x], a);
+                uv[x + 1] = blend(sv / sa, uv[x + 1], a);
+            }
         }
         wr(j->c + (hwaddr)(y / rows) * j->clofs, uv, n & ~1u);
     }
@@ -318,7 +351,9 @@ static void grph_flip(const GrphJob *j, unsigned gop, unsigned unit)
     uint32_t y, i, n = j->w / unit;
 
     for (y = 0; y < j->h; y++) {
-        rd(j->a + (hwaddr)y * j->alofs, a, j->w);
+        if (!rd(j->a + (hwaddr)y * j->alofs, a, j->w)) {
+            return;
+        }
         if (rev) {
             for (i = 0; i < n; i++) {
                 memcpy(c + i * unit, a + (n - 1 - i) * unit, unit);
@@ -346,6 +381,11 @@ void nvt_gfx_grph_run(const uint32_t *regs)
     if (!j.w || !j.h) {
         return;
     }
+    if ((uint64_t)j.w * j.h > GRPH_MAX_JOB) {
+        qemu_log_mask(LOG_UNIMP, "nvt-gfx: graphics job of %u x %u bytes\n",
+                      j.w, j.h);
+        return;
+    }
     if (!(cfg & 1)) {
         unsigned gop = (cfg >> 16) & 0xF;
 
@@ -365,7 +405,9 @@ void nvt_gfx_grph_run(const uint32_t *regs)
             uint32_t y;
 
             for (y = 0; y < j.h; y++) {
-                rd(j.a + (hwaddr)y * j.alofs, row, j.w);
+                if (!rd(j.a + (hwaddr)y * j.alofs, row, j.w)) {
+                    return;
+                }
                 wr(j.c + (hwaddr)y * j.clofs, row, j.w);
             }
         }
@@ -409,6 +451,7 @@ void nvt_gfx_grph_run(const uint32_t *regs)
 #define ISE_OUT_ADDR    0x98
 
 #define ISE_MAX_INPUT   (64 * MiB)
+#define ISE_MAX_OUTPUT  (64 * MiB)
 
 /*
  * Scale the input to the output size, each byte of a pixel a channel
@@ -437,7 +480,8 @@ void nvt_gfx_ise_run(const uint32_t *regs)
         qemu_log_mask(LOG_UNIMP, "nvt-gfx: ISE format %u\n", fmt);
         return;
     }
-    if ((uint64_t)iw * nch * ih > ISE_MAX_INPUT || ow > 16384 ||
+    if ((uint64_t)iw * nch * ih > ISE_MAX_INPUT ||
+        (uint64_t)ow * nch * oh > ISE_MAX_OUTPUT ||
         ilofs < iw * nch || olofs < ow * nch) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-gfx: ISE %ux%u -> %ux%u, line "
                       "offsets %u / %u\n", iw, ih, ow, oh, ilofs, olofs);
@@ -445,7 +489,9 @@ void nvt_gfx_ise_run(const uint32_t *regs)
     }
     src = g_malloc((size_t)iw * nch * ih);
     for (y = 0; y < ih; y++) {
-        rd(in + (hwaddr)y * ilofs, src + (size_t)y * iw * nch, iw * nch);
+        if (!rd(in + (hwaddr)y * ilofs, src + (size_t)y * iw * nch, iw * nch)) {
+            return;
+        }
     }
     row = g_malloc((size_t)ow * nch);
     xstep = ow > 1 ? ((uint64_t)(iw - 1) << 16) / (ow - 1) : 0;

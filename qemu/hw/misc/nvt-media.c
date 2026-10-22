@@ -232,6 +232,7 @@ typedef struct {
     uint32_t self_clear;        /* control bits done as soon as written */
     uint32_t trig;              /* control bit of a single, list-less job */
     uint32_t trig_end;          /* and its status */
+    uint32_t ll_err;            /* status of a broken list, 0: list end */
 } NvtIppParams;
 
 #define IPP_CTRL            0x00
@@ -255,7 +256,7 @@ static const NvtIppParams ipp_ime = { 0x18, 0x1C, 0x14, 0xA0000008, 0x1 };
  * end bit 31; control bit 1 runs a single job.
  */
 static const NvtIppParams ipp_ise = {
-    0x08, 0x0C, 0x2C, 1u << 31, 0x1, 0, 1u << 1, 1u << 31,
+    0x08, 0x0C, 0x2C, 1u << 31, 0x1, 0, 1u << 1, 1u << 31, 1u << 1,
 };
 
 /*
@@ -268,6 +269,7 @@ static const NvtIppParams ipp_ise = {
  */
 static const NvtIppParams ipp_grph = {
     0x08, 0x0C, 0xD0, 0x00, 0x02, (1u << 1) | (1u << 29), 1u << 0, 0x01,
+    1u << 2,
 };
 
 static void ipp_update_irq(NvtMediaState *s)
@@ -303,8 +305,14 @@ static uint64_t ipp_write(NvtMediaState *s, hwaddr off, uint64_t val)
 static void nvt_media_write(void *opaque, hwaddr off, uint64_t val,
                             unsigned size);
 
-/* Apply one list's updates up to the end of its job; false at its end. */
-static bool ipp_run_job(NvtMediaState *s)
+typedef enum {
+    IPP_LL_NEXT,                /* a job set up, another follows */
+    IPP_LL_LAST,                /* the last job set up */
+    IPP_LL_BROKEN,              /* unreadable, malformed or endless */
+} IppLlResult;
+
+/* Apply one list's updates up to the end of its job. */
+static IppLlResult ipp_run_job(NvtMediaState *s)
 {
     hwaddr addr = s->ll_addr;
     uint64_t cmd;
@@ -317,7 +325,7 @@ static bool ipp_run_job(NvtMediaState *s)
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-media %s: linked list at "
                           "0x%" HWADDR_PRIx " unreadable\n",
                           s->engine_name, addr);
-            return false;
+            return IPP_LL_BROKEN;
         }
         cmd = le64_to_cpu(cmd);
         switch (cmd >> 61) {
@@ -339,18 +347,18 @@ static bool ipp_run_job(NvtMediaState *s)
             break;
         case IPP_CMD_NXTLL:
             s->ll_addr = (cmd >> 8) & 0xFFFFFFFF;
-            return true;
+            return IPP_LL_NEXT;
         case IPP_CMD_NULL:
-            return false;
+            return IPP_LL_LAST;
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-media %s: linked list "
                           "command 0x%016" PRIx64 "\n", s->engine_name, cmd);
-            return false;
+            return IPP_LL_BROKEN;
         }
     }
     qemu_log_mask(LOG_GUEST_ERROR, "nvt-media %s: linked list without an "
                   "end\n", s->engine_name);
-    return false;
+    return IPP_LL_BROKEN;
 }
 
 /*
@@ -430,7 +438,7 @@ static void ipp_job_work(NvtMediaState *s)
 static void ipp_job_done(NvtMediaState *s)
 {
     const NvtIppParams *p = s->engine->opaque;
-    bool more;
+    IppLlResult res;
 
     if (s->phase) {
         /* a single job: its trigger bit drops when it is done */
@@ -440,12 +448,18 @@ static void ipp_job_done(NvtMediaState *s)
         ipp_update_irq(s);
         return;
     }
-    more = ipp_run_job(s);
+    res = ipp_run_job(s);
+    if (res == IPP_LL_BROKEN) {
+        /* no work done; the list error, where the engine has one */
+        *reg(s, p->ints) |= p->ll_err ? p->ll_err : p->job_end | p->ll_end;
+        ipp_update_irq(s);
+        return;
+    }
     ipp_job_work(s);
 
-    *reg(s, p->ints) |= p->job_end | (more ? 0 : p->ll_end);
+    *reg(s, p->ints) |= p->job_end | (res == IPP_LL_NEXT ? 0 : p->ll_end);
     ipp_update_irq(s);
-    if (more) {
+    if (res == IPP_LL_NEXT) {
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   IPP_JOB_NS);
     }

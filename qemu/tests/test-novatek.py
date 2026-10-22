@@ -1676,6 +1676,30 @@ def test_gfx(qt):
           (qt.read(GB, 4).hex(), qt.read(GB + 4, 4).hex()),
           ('93931010', '93931010'))
     check('and over the 4:2:0 U / V pairs', qt.read(GC, 4).hex(), '2a148080')
+    # with mixed alpha in a 2x2 block the colour is alpha-weighted: an
+    # opaque green beside transparent red pixels stays green
+    qt.write(GA, struct.pack('<4H', 0xF0F0, 0x0F00, 0x0F00, 0x0F00))
+    qt.write(GB, bytes([0x10]) * 4)
+    qt.write(GC, bytes([0x80]) * 2)
+    grph(qt, 0x18000421, 4, 2, alofs=4, blofs=2, clofs=2, const=(0x21, 0))
+    check('RGBYUV_BLEND: transparent pixels add none of their colour '
+          '(U / V of a quarter green over grey)', qt.read(GC, 2).hex(),
+          '6b65')
+    # 16-bit fill of an odd width: the last byte is left as it was
+    qt.write(GC, bytes([0xEE]) * 4)
+    grph(qt, 0x08000021, 3, 1, const=(0x1234, 0))
+    check('TEXT_COPY 16-bit, odd width: whole pixels filled, the odd byte '
+          'kept', qt.read(GC, 4).hex(), '3412eeee')
+    # a broken list: no work, list error (status bit 2)
+    qt.write(GC, bytes([0x55]) * 4)
+    qt.write(LL, ll_upd(0x04, 0x08000011) + ll_upd(0x90, GC) +
+             struct.pack('<Q', 7 << 61))
+    qt.writel(GRPH + 0xD0, LL)
+    qt.writel(GRPH + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    check('a malformed list: list error, no fill done',
+          (qt.readl(GRPH + 0x0C), qt.read(GC, 4).hex()), (0x4, '55555555'))
+    qt.writel(GRPH + 0x0C, 0xFFFFFFFF)
     # GOP on engine 2: a vertical flip (C at the last line), then a
     # horizontal one at 16 bits
     qt.write(GA, bytes([1, 1, 2, 2, 3, 3]))
