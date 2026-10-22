@@ -6,9 +6,9 @@ and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
 - `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9)
-- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55)
+- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (66 total)
+## Supported Machines (67 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -269,6 +269,26 @@ device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 ¹ Ethernet works from the kernel (DHCP, a file over HTTP) and from the
 vendor U-Boot (`ping`, `dhcp`, `tftp`).
 
+### Novatek NT98332 (`qemu-system-aarch64`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98332` | 2x Cortex-A53, 1 GB | GIC-400 | 4.19.148 vendor (its own DT) | yes² |
+
+Novatek's NA51103 NVR die (NT98331/NT98332/NT98631/NT98632), also in
+`hw/arm/novatek.c`: Novatek's blocks above 4 GiB at `0x2_F0000000`, most of
+them NA51089's at new offsets. A whole 16 MiB SPI NOR image boots the way
+the board does: the machine stands in for the loader (the device tree and
+U-Boot are LZMA-packed in flash, `hw/arm/nvt-lzma.c` unpacks them), and the
+vendor U-Boot loads the kernel from the squashfs, which runs the vendor NVR
+application. Its GUI shows on the QEMU display through the LCD300 model and
+takes a USB mouse; the two SATA ports take disks (`-drive if=ide`), the
+audio interfaces and the HDAL engines complete their jobs, Ethernet works
+and the web UI answers: `FLASH=nor.bin qemu-boot/run-nt98332.sh`. Notes in
+[docs/novatek.md](docs/novatek.md#nt98332-na51103).
+
+² A Xiongmai NBD80N36RA-KL NVR dump (not distributable, so not in CI).
+
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
 | Machine | Generation | CPU | IRQ | Boot tested |
@@ -399,7 +419,12 @@ qemu/
 ├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
 ├── hw/display/mstar-ge.c        # GE 2D engine (ported)
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
-├── hw/arm/novatek.c             # Novatek NT9856x machines, generated device tree
+├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98332
+├── hw/arm/nvt-lzma.c            # LZMA decoder for the NA51103 boot stand-in
+├── hw/misc/nvt-dai.c            # NA51103 audio interfaces (I2S DMA, silence)
+├── hw/misc/nvt-engine.c         # HDAL media engines: link lists, job done
+├── hw/misc/nvt-hdmi.c           # NA51103 HDMI TX status (clock stable, mute)
+├── hw/display/nvt-lcd300.c      # NA51103 LCD300: vsync, channel scan-out
 ├── hw/misc/nvt-top.c            # TOP: pinmux storage, chip ID
 ├── hw/misc/nvt-cg.c             # Clock generator: PLL ratios, gates, resets
 ├── hw/misc/nvt-wdt.c            # Keyed watchdog, manual reset
@@ -438,6 +463,8 @@ qemu-boot/
 ├── run-ssr621q.sh               # SigmaStar SSR621Q NVR: flash dump to the GUI
 ├── run-nt98562.sh               # Novatek NT98562/NT98566: OpenIPC on NOR, or FLASH= image
 ├── nvtpack2flash.py             # Novatek NVTPACK (FW9856xA.bin) -> raw NOR / NAND image
+├── run-nt98332.sh               # Novatek NT98332: NVR NOR image, GUI, mouse, SATA
+├── uboot-env.py                 # Write a U-Boot env (defaults + settings) into a flash image
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
 ├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM/crypto, for the tests below

@@ -111,6 +111,7 @@ plays the vendor drivers (docs/novatek.md):
 """
 import argparse
 import hashlib
+import lzma
 import os
 import random
 import re
@@ -537,6 +538,80 @@ def test_flash(qt, path):
     qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
     qt.writel(FLASH + 0x14, 0)
     check('FAST_READ after four dummy clocks', got, img[0x60000:0x60010])
+
+
+def nor_cmd(qt, cmd, row=None, read=0, data=None):
+    """One SPI NOR command under manual CS: cmd [address] [data | read]."""
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 1 << 1)
+    if row is None:
+        flash_op(qt, OP_CMD, cmd)
+    else:
+        flash_op(qt, OP_CMD_ADDR, cmd, row=row)
+    got = None
+    if data is not None:
+        flash_op(qt, OP_WRITE_N, cmd, length=1, write=True)
+        qt.writel(FLASH + 0x100, data)
+    elif read:
+        flash_op(qt, OP_READ_N, cmd, length=read)
+        got = qt.readl(FLASH + 0x100) & 0xFF
+    qt.writel(FLASH + 0x14, (1 << 1) | (1 << 4))
+    qt.writel(FLASH + 0x14, 0)
+    return got
+
+
+def test_flash_locks(qt, path):
+    """W25Q per-block protection, as the NT98332 (Xiongmai) kernel uses it:
+    SR3's WPS on, lock bits powering up set, 0x39 to unlock what it writes."""
+    print('nvt-flash: W25Q block locks')
+    qt.writel(FLASH + 0x00, 2 << 2)             # 3 row-address bytes
+
+    def erase(row):
+        flash_op(qt, OP_CMD, 0x06)
+        qt.writel(FLASH + 0xBC, (1 << 8) | 0)
+        flash_op(qt, OP_BLK_ERSE, 0xD8 | (0x05 << 8), row=row)
+
+    def erased(row):
+        return open(path, 'rb').read()[row:row + 0x10000] == \
+            b'\xff' * 0x10000
+
+    def locked(row):
+        return nor_cmd(qt, 0x3D, row=row, read=1) & 1
+
+    check('SR3 out of reset: 0x60, WPS clear', nor_cmd(qt, 0x15, read=1),
+          0x60)
+    erase(0x30000)
+    check('WPS clear: the locks do not apply', erased(0x30000), True)
+
+    flash_op(qt, OP_CMD, 0x06)
+    nor_cmd(qt, 0x11, data=0x64)
+    check('WRSR3 sets WPS', nor_cmd(qt, 0x15, read=1), 0x64)
+    check('the lock bits power up set', locked(0x40000), 1)
+    erase(0x40000)
+    check('an erase of a locked block is dropped', erased(0x40000), False)
+
+    flash_op(qt, OP_CMD, 0x06)
+    nor_cmd(qt, 0x39, row=0x40000)
+    check('0x39 unlocks the block', locked(0x40000), 0)
+    check('all of its 64 KiB', locked(0x4F000), 0)
+    check('and no more', locked(0x50000), 1)
+    erase(0x40000)
+    check('then the erase lands', erased(0x40000), True)
+
+    flash_op(qt, OP_CMD, 0x06)
+    nor_cmd(qt, 0x39, row=0x7F0000)
+    check('the top block unlocks per 4 KiB sector', locked(0x7F0000), 0)
+    check('its next sector stays locked', locked(0x7F1000), 1)
+
+    flash_op(qt, OP_CMD, 0x06)
+    nor_cmd(qt, 0x36, row=0x40000)
+    check('0x36 locks it again', locked(0x40000), 1)
+    nor_cmd(qt, 0x39, row=0x50000)
+    check('an unlock without WREN is ignored', locked(0x50000), 1)
+    flash_op(qt, OP_CMD, 0x06)
+    nor_cmd(qt, 0x98)
+    check('0x98 unlocks everything', (locked(0x50000), locked(0x7F1000)),
+          (0, 0))
 
 
 # ---- nvt-flash, SPI NAND --------------------------------------------------
@@ -1763,6 +1838,75 @@ def test_boot_rom(qemu, tmp):
     os.unlink(nand)
 
 
+# ---- nt98332: the NA51103 flash boot ----------------------------------
+
+NA51103_UBOOT = 0x1E000000
+
+
+def make_nt98332_image(path, uboot_part):
+    """A 16 MiB NOR laid out as Xiongmai's NA51103 images are: the device
+    tree LZMA-packed behind "XMFDT32G" at 0x10000, U-Boot in
+    partition_boot at 0x20000."""
+    tree = {
+        '#address-cells': cells(2), '#size-cells': cells(2),
+        'nvt_memory_cfg': {
+            '#address-cells': cells(1), '#size-cells': cells(1),
+            'fdt': {'reg': cells(0x100000, 0x100000)},
+            'shmem': {'reg': cells(0xA00000, 0x100000)},
+            'uboot': {'reg': cells(NA51103_UBOOT, 0x2000000)},
+        },
+        'nor@2,f0180000': {
+            'compatible': b'nvt,nvt_spinor\0',
+            '#address-cells': cells(2), '#size-cells': cells(2),
+            'partition_boot': {'reg': cells(0, 0x20000, 0, 0x40000)},
+        },
+    }
+    dtb = fdt_blob(tree)
+    packed = lzma.compress(dtb, format=lzma.FORMAT_ALONE)
+    img = bytearray(b'\xff' * (16 << 20))
+    img[0x10000:0x10008] = b'XMFDT32G'
+    img[0x10008:0x10008 + len(packed)] = packed
+    img[0x20000:0x20000 + len(uboot_part)] = uboot_part
+    open(path, 'wb').write(img)
+    return dtb
+
+
+def test_nt98332_boot(qemu, tmp):
+    print('nt98332 flash boot')
+    path = os.path.join(tmp, 'nt98332.bin')
+    rng = random.Random(11)
+    # an AArch64 U-Boot's head: b reset, nop, then _TEXT_BASE as a quad
+    head = struct.pack('<IIQ', 0x1400000A, 0xD503201F, NA51103_UBOOT)
+    payload = head + bytes(rng.randrange(256) for _ in range(4096)) * 4
+
+    def boot(part, what, want):
+        dtb = make_nt98332_image(path, part)
+        qt = QTest(qemu, 'nt98332,flash-file=' + path)
+        try:
+            check(what, qt.read(NA51103_UBOOT, len(want)), want)
+            check('  the device tree unpacked to /nvt_memory_cfg/fdt',
+                  qt.read(0x100000, len(dtb)), dtb)
+            check('  SHMINFO says LD_NVT', qt.read(0xA00000, 6), b'LD_NVT')
+            check('  an AArch64 branch to U-Boot at 0',
+                  struct.unpack('<IIQ', qt.read(0, 16)),
+                  (0x58000041, 0xD61F0020, NA51103_UBOOT))
+        finally:
+            qt.close()
+
+    boot(lzma.compress(payload, format=lzma.FORMAT_ALONE),
+         'U-Boot unpacked from LZMA (end marker, size unknown)', payload)
+    boot(lzma.compress(payload, format=lzma.FORMAT_ALONE,
+                       filters=[{'id': lzma.FILTER_LZMA1,
+                                 'dict_size': 3 << 20}]),
+         'LZMA with a 3 MiB dictionary', payload)
+    boot(payload, 'a plain AArch64 U-Boot is not taken for LZMA', payload)
+    bad = bytearray(lzma.compress(payload, format=lzma.FORMAT_ALONE))
+    bad[64:96] = bytes(32)
+    boot(bytes(bad), 'LZMA that does not unpack falls back to plain',
+         bytes(bad[:4096]))
+    os.unlink(path)
+
+
 # ---- nvt-eqos ----------------------------------------------------------
 
 def mdio_read(qt, phy, reg):
@@ -2075,6 +2219,8 @@ def test_migration(qemu, tmp):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default='./qemu-src/build/qemu-system-arm')
+    ap.add_argument('--qemu-aarch64',
+                    default='./qemu-src/build/qemu-system-aarch64')
     args = ap.parse_args()
     # Images up to 128 MiB go here, under /tmp: always remove them.
     with tempfile.TemporaryDirectory() as tmp:
@@ -2213,6 +2359,20 @@ def run(args, tmp):
         check('no card: C_GPIO 9 high', qt.readl(GPIO + 0x00) >> 9 & 1, 1)
     finally:
         qt.close()
+
+    locks = os.path.join(tmp, 'locks.bin')
+    open(locks, 'wb').write(random.Random(13).randbytes(8 << 20))
+    qt = QTest(args.qemu, 'nt98562,flash-file=' + locks, ['-kernel', stub])
+    try:
+        test_flash_locks(qt, locks)
+    finally:
+        qt.close()
+    os.unlink(locks)
+
+    if os.path.exists(args.qemu_aarch64):
+        test_nt98332_boot(args.qemu_aarch64, tmp)
+    else:
+        print('nt98332: %s not built, skipped' % args.qemu_aarch64)
 
     test_uart_rx_after_fifo_reset(args.qemu, tmp)
     test_fdt(args.qemu, tmp)

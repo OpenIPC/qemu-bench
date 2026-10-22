@@ -270,6 +270,16 @@ a key queued before the CPU runs: start QEMU with `-S` and the serial line
 on a socket (`qemu-boot/test-novatek-uboot.sh`). Keyboard input to any
 16550 that a guest resets before reading relies on
 `qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch`.
+The aarch64 `nt98332` (NA51103, `docs/novatek.md#nt98332-na51103`) shares
+`novatek.c` but has its own init: blocks at `0x2_F0000000`, a GIC-400 that
+must have its security extensions (the vendor U-Boot regroups every IRQ
+otherwise), and only a flash boot or `-kernel` with the firmware's `-dtb`.
+Its flash keeps the FDT (`XMFDT32G`) and U-Boot LZMA-packed (`nvt-lzma.c`).
+Do not edit the vendor device tree from machine code; board settings go in
+the U-Boot environment in the image (`qemu-boot/uboot-env.py`). Its media
+blocks are `nvt-engine` instances (fire, run the link list, report done; no
+pixels), `nvt-dai`, `nvt-lcd300` (CTRL bit 31 is an update request the
+frame clears; the driver writes nothing while it is set) and `nvt-hdmi`.
 
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB

@@ -8,3 +8,4 @@ qemu-boot/nor-*.bin
 qemu-boot/ipctool
 qemu-boot/qemu-*.log
 u-boot-hi3516cv200-universal.bin
+qemu-boot/sata-*.img

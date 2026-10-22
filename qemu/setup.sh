@@ -87,7 +87,9 @@ cp qemu/hw/display/mstar-disp.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
 cp qemu/hw/misc/sstar-vpu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
+cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/novatek.h    "$QEMU_DIR/include/hw/arm/"
+cp qemu/include/hw/arm/nvt-lzma.h   "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/nvt-top.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-cg.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-wdt.c           "$QEMU_DIR/hw/misc/"
@@ -97,6 +99,10 @@ cp qemu/hw/misc/nvt-crypto.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-hash.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-rsa.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-media.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-dai.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-engine.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-hdmi.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/display/nvt-lcd300.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/timer/nvt-timer.c        "$QEMU_DIR/hw/timer/"
 cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/rtc/nvt-rtc.c            "$QEMU_DIR/hw/rtc/"
@@ -468,6 +474,7 @@ config NOVATEK
     default y
     depends on TCG && ARM
     select A9MPCORE
+    select ARM_GIC
     select PL310
     select PTIMER
     select SERIAL_MM
@@ -476,10 +483,11 @@ config NOVATEK
     select SD
     select USB_EHCI_SYSBUS
     select HISI_I2C
+    select AHCI_SYSBUS
 KCONFIG
     echo "  hw/arm/Kconfig: added NOVATEK"
 else
-    for sym in A9MPCORE PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C; do
+    for sym in A9MPCORE ARM_GIC PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C AHCI_SYSBUS; do
         if ! sed -n '/^config NOVATEK$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config NOVATEK\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -488,7 +496,7 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
@@ -499,6 +507,11 @@ if ! grep -q "'novatek.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('novatek.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added novatek.c"
+fi
+if ! grep -q "'nvt-lzma.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-lzma.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added nvt-lzma.c"
 fi
 
 # hw/misc/Kconfig

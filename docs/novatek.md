@@ -1,4 +1,4 @@
-# Novatek NT9856x (`nt98562`, `nt98566`)
+# Novatek NT9856x (`nt98562`, `nt98566`) and NT98332 (`nt98332`)
 
 Novatek's NT9856x IP-camera SoCs (internal name NA51089): one Cortex-A9
 with DDR in the package and Novatek's own peripheral blocks from
@@ -824,3 +824,166 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   ignores the sensor's real timing (fixed 30 fps), and the DAI paces audio
   at a nominal rate. AI/CNN, MD, DIS, VPE, IVE and the display path are
   not wired.
+
+## NT98332 (NA51103)
+
+`nt98332` (`qemu-system-aarch64`) is Novatek's NA51103 NVR die, which the
+kernel names NT98331 / NT98332 / NT98631 / NT98632: two Cortex-A53s running
+an aarch64 kernel, a GIC-400, the ARMv8 generic timer at 12 MHz, and 1 GB of
+DDR. Novatek's blocks sit above 4 GiB, from `0x2_F0000000`; most keep
+NA51089's register layout at new offsets, the same offsets as NA51090's
+(OpenIPC `u-boot-nt9856x`, `arch-nvt-na51090_a64/IOAddress.h`). The
+NT9832x SDK is NA51068, a different die, and does not describe it.
+
+It was brought up on a Xiongmai NBD80N36RA-KL NVR (FW98332A loader,
+U-Boot 2019.04, kernel 4.19.148, HDAL 3.03), from a 16 MiB SPI NOR dump.
+The map is that firmware's own device tree; the machine builds none.
+
+### Memory map
+
+| Block | Base | IRQ | Model |
+|---|---|---|---|
+| DDR | `0x0` | | RAM, 1 GB |
+| TOP / CG / PAD / GPIO | `0x2_F0010000` / `…20000` / `…30000` / `…40000` | 24 | `nvt-top`, `nvt-cg`, storage, `nvt-gpio` |
+| WDT | `0x2_F0060000` | 57 | `nvt-wdt` |
+| Novatek timer | `0x2_F0100000` | 0 | `nvt-timer` |
+| SPI NOR controller | `0x2_F0180000` | 29 | `nvt-flash` |
+| UART 0..3 | `0x2_F0280000` / `…290000` / `…2A0000` / `…2B0000` | 43 / 44 / 45 / 38 | 16550, reg-shift 2, 48 MHz |
+| VPE (scaler) | `0x2_F0410000` | 3 | `nvt-engine` |
+| Ethernet (DWC EQoS) | `0x2_F0440000` | 12 | `nvt-eqos` |
+| USB 2.0 host ×2 | `0x2_F0480000` / `…490000` (PHY `…4E0000` / `…4F0000`) | 27 / 78 | `nvt-usb`, PHY storage |
+| RTC | `0x2_F0620000` | 56 | `nvt-rtc` |
+| OTP | `0x2_F0630000` | | `nvt-otp` |
+| SATA (AHCI) ×2 | `0x2_F0680000` / `…690000` (glue `…6C0000` / `…6D0000`, PHY `…6E0000` / `…6F0000`) | 13 / 14 | `sysbus-ahci`, storage |
+| LCD300 | `0x2_F0800000` | 18 | `nvt-lcd300` |
+| LCD200 (CVBS) | `0x2_F0820000` | | storage |
+| HDMI TX | `0x2_F0880000` | 52 | `nvt-hdmi` |
+| DAI (audio) ×5 | `0x2_F0850000`, `…860000`, `…220000`, `…230000`, `…870000` | 15, 34..37 | `nvt-dai` |
+| GIC-400 | `0x2_FFF01000` (dist), `0x2_FFF02000` (CPU) | | `arm_gic`, security extensions |
+
+The rest of `0x2_F0000000`–`0x2_FFFFFFFF` reads zero, logged under
+`-d unimp`.
+
+### Boot
+
+The flash has the loader (`FW98332A.BIN`, with the DDR training and BL31)
+at 0, the device tree at `0x10000` behind an 8-byte `XMFDT32G` tag, LZMA,
+and U-Boot LZMA-packed as the whole of `partition_boot` (`0x20000`, Xiongmai's
+name for the SDK's `partition_uboot`). With `flash-file` and no `-kernel`
+the machine does the loader's part: it unpacks both with
+`hw/arm/nvt-lzma.c` (a plain decoder after the public-domain LzmaSpec; QEMU
+links no LZMA library), fills the `LD_NVT` SHMINFO as on NA51089, and starts
+U-Boot at its link address `0x1E000000` from an AArch64 stub at 0. U-Boot
+runs at EL1; QEMU answers PSCI over SMC in place of BL31. U-Boot then does
+everything the board does: reads its environment, fills `xm_bootargs`,
+reads `boot/uImage` from the romfs squashfs and boots it.
+
+The GIC needs its security extensions. The vendor U-Boot programs every
+`IGROUPR` to group 1 (and `GICD_CTLR` = 3). On silicon it runs non-secure
+after BL31, so those writes are ignored; on a GIC without the extensions
+they land, Linux enables only its own group, and CPU 0 never sees an IPI or
+its timer again: the kernel stops right after `CPU1: Booted secondary
+processor`. So the GIC has them, the CPUs are non-secure, and the groups
+start the way BL31 leaves them (`irq_reset_nonsecure`).
+
+`-kernel Image -dtb fdt.dtb` boots a kernel directly, with the firmware's
+device tree (required; it is not built here).
+
+### U-Boot environment
+
+The environment is 64 KiB at flash `0x50000` (CRC32 + `key=value`). A
+dump may carry it zeroed; U-Boot then runs on its built-in defaults, which
+have `bootcmd`. A valid environment without `bootcmd` does not autoboot
+but drops to a password prompt. Xiongmai's `xmuart` turns the console off
+unless it is 0; `qemu-boot/uboot-env.py nor.bin xmuart=0` writes U-Boot's
+defaults plus that. The settings belong in the environment, not in the
+device tree: U-Boot builds `xm_bootargs` (`XmUart=…,XmAuto=…`) from it.
+
+On its first boot the NVR application rewrites `osmem` and reboots once.
+
+### SPI NOR block locks
+
+The Xiongmai kernel turns on the W25Q's per-block protection (SR3's WPS)
+and unlocks only what it writes: 256 blocks plus 2 × 15 boundary sectors,
+286 lock units on 16 MiB. `nvt-flash` models SR3 (`0x15`/`0x11`, reset
+`0x60`) and the individual block lock commands (`0x36`/`0x39`/`0x3D`,
+global `0x7E`/`0x98`), lock bits powering up set. Without them SR3 read
+`0xFF`, every block read locked, and the services rebooted in a loop
+trying to save the environment.
+
+### Audio (`nvt-dai`)
+
+Five DAIs, from the HDAL's `kdrv_audioio/nvt_audio.ko` (not stripped).
+After enabling a DMA the record and playback paths poll the "load done"
+status (`+0xC4` [19:0]) for a second; when it timed out, the HDAL's own
+watchdog (`gs`) took the media stack down. The model takes the queued
+buffers on a DMA enable and completes them on a timer at a nominal 8 kHz
+16-bit, RX buffers filled with silence. Registers are in the file header.
+
+### HDAL engines (`nvt-engine`)
+
+The HDAL's engines are fired the same way: a job, often a link list of
+register writes in DDR, a fire bit, a done interrupt. `nvt-engine` is a
+register file that runs the link list (`hi[31:28]` 8 write, 2 next, 0 end)
+and reports the job done; it does no pixel work. The list carries the
+engine's interrupt enable, so it has to be run. VPE: CTRL bit 31 fires the
+list at `+0x300`, status `+0x400`, enable `+0x404`. Without a completion the
+job manager's `em_putjob` timed out ("Scaler putjob not response!") and the
+HDAL panicked.
+
+### Display (`nvt-lcd300`) and HDMI (`nvt-hdmi`)
+
+The GUI is ARGB1555 in a framebuffer (`/dev/fb0`, `disp0_fb`) that the
+LCD300 scans out with the video. Two things the vendor driver depends on:
+
+- **CTRL bit 31 is a register-update request**, not an enable: software
+  sets it after a change, the controller clears it at the next frame. The
+  driver's tasklet programs nothing while it reads high
+  (`dev_check_regupdate_high()`), so a model that keeps it set shows only
+  U-Boot's logo setup forever.
+- **The frame interrupt** (status `+0x1A4` bit 5, enable `+0x1A8`, clear
+  `+0x1AC`): `flcd300-pip` writes a channel's framebuffer address only from
+  its handler.
+
+Three input channels, `0x28` apart from `+0x10`: video (YUV 4:2:0, chroma
+plane at `+0x04`), the GUI (ARGB1555, alpha bit opaque) and a 64×64 cursor;
+control at `+0x24` (bit 31 enable, [3:0] format), sizes at `+0x08`/`+0x1C`.
+The output size is `+0x04`; the application picks 1280×1024. The model
+composes the enabled channels on the QEMU console;
+`-global nvt-lcd300.trace=on` logs the register writes.
+
+`nvt-hdmi` gives the TX what it polls: "clock stable" (`+0x00` bit 12) and
+the mute handshake (`+0x88` bit 10 follows `+0x1B0` bit 4). Hotplug reads
+0, so the drivers skip EDID; the output shows regardless.
+
+### USB and SATA
+
+Both USB hosts are `nvt-usb`; `-device usb-mouse` drives the GUI.
+
+The SATA hosts are QEMU's one-port AHCI. The Novatek driver
+(`nvt_ahci_save_initial_config()`) sets GHC to AE | IE and later writes it
+0; on QEMU's AHCI that drops the interrupt enable and every command times
+out ("qc timeout (cmd 0xec)"), while the board runs on it. A 4-byte overlay
+on GHC keeps AE and IE set. The PHY and glue are storage. The disk is
+`-drive if=ide,index=0` (`index=1` for the second port).
+
+### Running
+
+```bash
+cp dump.bin nor.bin                       # the image is written to
+python3 qemu-boot/uboot-env.py nor.bin xmuart=0
+FLASH=nor.bin bash qemu-boot/run-nt98332.sh
+```
+
+The GUI comes up about a minute after power-on; the web UI is at
+`http://127.0.0.1:8080/`. The board's address is a static 192.168.1.10,
+so the run script puts user networking on that subnet.
+
+### Not modelled on NT98332
+
+- Pixel work in the engines: the VPE scaler, OSG, the H.26x decoder and
+  encoder, JPEG and the 2D engines complete jobs without touching memory,
+  so camera video is not shown (the video channel stays black).
+- Audio content (RX is silence, TX is dropped), HDMI hotplug / EDID, the
+  CVBS output (LCD200, TVE100), the LCD300's cursor and colour pipeline.
+- The real loader and BL31 (DDR training, secure world).
