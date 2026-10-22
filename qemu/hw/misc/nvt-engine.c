@@ -39,10 +39,12 @@
  *          since the preview's jobs leave it as an earlier job set it
  *   0x308  source Y; 0x30C its UV, or right after Y when 0
  *   0x800  source stride, [15:0]
- *   0x360  destination Y, where the window starts; 0x364 its UV, or one
- *          frame below the window when 0 (exact for a window on the top row)
+ *   0x360  destination frame's Y; 0x364 its UV, or right after Y when 0
+ *          (the NVR leaves it 0)
  *   0x50C  destination frame, [27:16] height, [11:0] width (the stride)
  *   0x550  window width, 0x508 window height
+ *   0x554  [15:0] the window's x, 0x510 [15:0] its y (a preview tile's
+ *          place in the grid; the playback window is 24 rows down)
  *   0x008  any of bits 12:10 set: scale the source (0xC00 for the
  *          preview's reduced copies, 0x1000 for a full picture); clear:
  *          fill the window with the background colour 0x260 ([7:0] Y,
@@ -171,15 +173,18 @@ static void nvt_engine_scale(NvtEngineState *s)
     uint32_t fw = *reg(s, 0x50C) & 0xFFF, fh = (*reg(s, 0x50C) >> 16) & 0xFFF;
     uint32_t dw = *reg(s, 0x550) & 0xFFF, dh = *reg(s, 0x508) & 0xFFF;
     hwaddr sy = *reg(s, 0x308), suv = *reg(s, 0x30C);
+    uint32_t wx = *reg(s, 0x554) & 0xFFFF, wy = *reg(s, 0x510) & 0xFFFF;
     hwaddr dy = *reg(s, 0x360), duv = *reg(s, 0x364);
     g_autofree uint8_t *src = NULL, *line = NULL;
     uint32_t r, x;
 
     ss = ss ? ss : sw;
-    if (!dw || !dh || !fw || !fh || !dy || dw > fw || dh > fh) {
+    wx &= ~1;                           /* on a chroma pair */
+    if (!dw || !dh || !fw || !fh || !dy || wx + dw > fw || wy + dh > fh) {
         return;
     }
-    duv = duv ? duv : dy + (hwaddr)fw * fh;
+    duv = (duv ? duv : dy + (hwaddr)fw * fh) + (hwaddr)(wy / 2) * fw + wx;
+    dy += (hwaddr)wy * fw + wx;
     if (!(*reg(s, 0x008) & 0x1C00)) {
         uint32_t bg = *reg(s, 0x260);
 

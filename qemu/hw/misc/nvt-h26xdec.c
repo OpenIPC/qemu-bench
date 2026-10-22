@@ -119,7 +119,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtH26xDecState, NVT_H26XDEC)
 #define HEVC_SUB_Y          0x29D4
 #define HEVC_PS_MAX         4096
 #define BS_MAX              (4 * MiB)
-#define DEC_CTXS            4
+#define DEC_CTXS            16
 
 #define LL_OP_WRITE         0x0
 #define LL_OP_WAIT          0x8
@@ -152,6 +152,7 @@ static const NvtDecRegs nvt_hevc_regs = {
 typedef struct NvtDecCtx {
     AVCodecContext *ctx;
     uint32_t key;                       /* the job's 0x1004 or 0x2804 */
+    uint32_t chan;                      /* and its bitstream block */
     bool hevc;
     uint32_t used;
 } NvtDecCtx;
@@ -174,6 +175,7 @@ struct NvtH26xDecState {
     uint32_t jobs;
     bool hevc_job;                      /* the list in flight is H.265's */
     bool hevc_irq;                      /* its done, not yet taken */
+    bool ll_ok;                         /* the list ran to its end */
     bool trace;
 };
 
@@ -207,9 +209,13 @@ static void nvt_h26xdec_dump(NvtH26xDecState *s, const char *what, hwaddr a)
 }
 
 #ifdef NVT_H26XDEC_LIBAVCODEC
-/* The decoder for this stream: one per 0x1004, the least used recycled. */
+/*
+ * The decoder for this stream, the least used recycled.  A stream is a
+ * channel's: the driver keeps a bitstream block per channel (0x102C /
+ * 0x2094 point at it), so two cameras of one size get a decoder each.
+ */
 static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key,
-                                       bool hevc)
+                                       uint32_t chan, bool hevc)
 {
     NvtDecCtx *d = NULL;
     const AVCodec *codec;
@@ -217,7 +223,7 @@ static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key,
 
     for (i = 0; i < DEC_CTXS; i++) {
         if (s->dec[i].ctx && s->dec[i].key == key &&
-            s->dec[i].hevc == hevc) {
+            s->dec[i].chan == chan && s->dec[i].hevc == hevc) {
             d = &s->dec[i];
             break;
         }
@@ -226,7 +232,7 @@ static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key,
         }
     }
     d->used = ++s->tick;
-    if (d->ctx && d->key == key && d->hevc == hevc) {
+    if (d->ctx && d->key == key && d->chan == chan && d->hevc == hevc) {
         return d->ctx;
     }
     avcodec_free_context(&d->ctx);
@@ -242,6 +248,7 @@ static AVCodecContext *nvt_h26xdec_ctx(NvtH26xDecState *s, uint32_t key,
         return NULL;
     }
     d->key = key;
+    d->chan = chan;
     d->hevc = hevc;
     return d->ctx;
 }
@@ -256,9 +263,6 @@ static void nvt_h26xdec_put_picture(NvtH26xDecState *s,
     g_autofree uint8_t *line = NULL;
     int r, x, w = f->width, h = f->height;
 
-    if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
-        return;
-    }
     ys = ys ? ys : w;
     cs = cs ? cs : ys;
     if (s->trace) {
@@ -400,7 +404,8 @@ static void nvt_h26xdec_decode(NvtH26xDecState *s, const NvtDecRegs *rs)
     if (!bs[2] || bs[2] > BS_MAX) {
         return;
     }
-    ctx = nvt_h26xdec_ctx(s, *reg(s, rs->size), rs->hevc);
+    ctx = nvt_h26xdec_ctx(s, *reg(s, rs->size), *reg(s, rs->bs_desc),
+                          rs->hevc);
     if (!ctx) {
         return;
     }
@@ -423,8 +428,12 @@ static void nvt_h26xdec_decode(NvtH26xDecState *s, const NvtDecRegs *rs)
     }
     if (avcodec_send_packet(ctx, s->pkt) >= 0) {
         while (avcodec_receive_frame(ctx, s->frame) >= 0) {
-            nvt_h26xdec_put_picture(s, rs, s->frame);
-            nvt_h26xdec_put_sub(s, rs, s->frame);
+            /* both writers take 8-bit planar 4:2:0, as the NVR's streams */
+            if (s->frame->format == AV_PIX_FMT_YUV420P ||
+                s->frame->format == AV_PIX_FMT_YUVJ420P) {
+                nvt_h26xdec_put_picture(s, rs, s->frame);
+                nvt_h26xdec_put_sub(s, rs, s->frame);
+            }
             av_frame_unref(s->frame);
         }
     }
@@ -495,7 +504,8 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
     }
 }
 
-static void nvt_h26xdec_run_ll(NvtH26xDecState *s)
+/* Run the list; whether it reached its end. */
+static bool nvt_h26xdec_run_ll(NvtH26xDecState *s)
 {
     hwaddr addr = *reg(s, LL_ADDR);
     uint32_t cmd[2];
@@ -506,7 +516,7 @@ static void nvt_h26xdec_run_ll(NvtH26xDecState *s)
                                MEMTXATTRS_UNSPECIFIED, cmd, sizeof(cmd))) {
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-h26xdec: list at 0x%"
                           HWADDR_PRIx " unreadable\n", addr);
-            return;
+            return false;
         }
         cmd[0] = le32_to_cpu(cmd[0]);
         cmd[1] = le32_to_cpu(cmd[1]);
@@ -524,7 +534,7 @@ static void nvt_h26xdec_run_ll(NvtH26xDecState *s)
             break;                          /* everything is done at once */
         case LL_OP_LINK:
             if (cmd[1] == LL_FINAL) {
-                return;
+                return true;
             }
             addr = (hwaddr)cmd[1] - 8;
             break;
@@ -534,13 +544,21 @@ static void nvt_h26xdec_run_ll(NvtH26xDecState *s)
             break;
         }
     }
+    qemu_log_mask(LOG_GUEST_ERROR, "nvt-h26xdec: list without an end\n");
+    return false;
 }
 
 static void nvt_h26xdec_done(void *opaque)
 {
     NvtH26xDecState *s = opaque;
 
-    *reg(s, LL_LAST_VAL) = LL_FINAL;
+    /*
+     * A list that faulted or never ended keeps its last command in
+     * 0x18 / 0x1C, which IMVQ_VDEC_LLCheckFinalJob() reports as failed.
+     */
+    if (s->ll_ok) {
+        *reg(s, LL_LAST_VAL) = LL_FINAL;
+    }
     if (s->hevc_job) {
         s->hevc_irq = true;
     } else {
@@ -603,7 +621,7 @@ static void nvt_h26xdec_write(void *opaque, hwaddr offset, uint64_t value,
         if (val & LL_CTRL_FIRE) {
             s->hevc_job = false;
             s->hevc_irq = false;
-            nvt_h26xdec_run_ll(s);
+            s->ll_ok = nvt_h26xdec_run_ll(s);
             s->jobs++;
             timer_mod(s->done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       2 * SCALE_MS);
@@ -642,6 +660,7 @@ static void nvt_h26xdec_reset(DeviceState *dev)
     s->jobs = 0;
     s->hevc_job = false;
     s->hevc_irq = false;
+    s->ll_ok = false;
     qemu_irq_lower(s->irq);
 }
 
@@ -664,6 +683,11 @@ static const Property nvt_h26xdec_properties[] = {
     DEFINE_PROP_BOOL("trace", NvtH26xDecState, trace, false),
 };
 
+/*
+ * The libavcodec decoders are host state and are not migrated: after a
+ * migration each stream's pictures resume at its next I picture, as on a
+ * stream joined midway.
+ */
 static const VMStateDescription vmstate_nvt_h26xdec = {
     .name = TYPE_NVT_H26XDEC,
     .version_id = 1,
@@ -673,6 +697,7 @@ static const VMStateDescription vmstate_nvt_h26xdec = {
         VMSTATE_UINT32(jobs, NvtH26xDecState),
         VMSTATE_BOOL(hevc_job, NvtH26xDecState),
         VMSTATE_BOOL(hevc_irq, NvtH26xDecState),
+        VMSTATE_BOOL(ll_ok, NvtH26xDecState),
         VMSTATE_TIMER_PTR(done, NvtH26xDecState),
         VMSTATE_END_OF_LIST()
     },

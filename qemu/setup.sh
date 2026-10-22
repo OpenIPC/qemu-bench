@@ -516,8 +516,18 @@ fi
 # The NA51103 decoder writes pictures when libavcodec is there (pkg-config),
 # as sstar-vpu does, and completes its jobs without them when it is not.
 # A tree that listed it plainly is upgraded.
-if grep -q "if_true: files('nvt-h26xdec.c'))" "$QEMU_DIR/hw/misc/meson.build"; then
-    sed -i "/if_true: files('nvt-h26xdec.c'))/d" "$QEMU_DIR/hw/misc/meson.build"
+if grep -q "^system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-h26xdec.c'))$" \
+        "$QEMU_DIR/hw/misc/meson.build"; then
+    sed -i "/^system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-h26xdec.c'))$/d" \
+        "$QEMU_DIR/hw/misc/meson.build"
+fi
+# An earlier version of the step above also deleted the fallback below.
+if grep -q "^nvt_avcodec = " "$QEMU_DIR/hw/misc/meson.build" &&
+   ! grep -q "^  system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-h26xdec.c'))$" \
+        "$QEMU_DIR/hw/misc/meson.build"; then
+    sed -i "/^if nvt_avcodec.found()/,/^endif$/ s/^else$/else\n  system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-h26xdec.c'))/" \
+        "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: restored nvt-h26xdec.c without libavcodec"
 fi
 if ! grep -q "'nvt-h26xdec.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     cat >> "$QEMU_DIR/hw/misc/meson.build" <<'MESON'

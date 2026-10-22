@@ -2294,6 +2294,20 @@ def test_nt98332_vpe(qt):
     check('its UV follows the whole buffer', qt.read(dst + fw * fh, 4),
           b'\x33\x44\x33\x44')
 
+    # a window placed at (8, 4) in the frame: Y 4 rows and 8 columns in,
+    # UV 2 rows and 8 columns into the frame's UV
+    job(frame + [(0x0008, 0), (0x0260, 0x00804010),
+                 (0x0550, fw), (0x0508, fh)])
+    job(frame + [(0x0008, 0), (0x0260, 0x00AABB20), (0x0554, 8),
+                 (0x0510, 4), (0x0550, 4), (0x0508, 2)])
+    check('a placed window starts at its x / y, Y',
+          qt.read(dst + 4 * fw + 6, 6), b'\x10\x10\x20\x20\x20\x20')
+    check('and not at the frame origin', qt.read(dst, 2), b'\x10\x10')
+    check('its UV at half the rows', qt.read(dst + fw * fh + 2 * fw + 8, 4),
+          b'\xbb\xaa\xbb\xaa')
+    check('the row above it untouched', qt.read(dst + fw * fh + fw + 8, 2),
+          b'\x40\x80')
+
 
 # ---- nvt-eqos ----------------------------------------------------------
 
