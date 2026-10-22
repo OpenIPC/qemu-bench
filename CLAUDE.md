@@ -248,7 +248,9 @@ check `nvt-crypto`, `nvt-hash` and `nvt-rsa` against known-answer vectors
 ciphers themselves (AES from QEMU's `crypto/aes.c`), because QEMU 10.2 has
 no built-in cipher backend and CI may build without one.
 Its HDAL media engines (`hw/misc/nvt-media.c`) are one table-driven
-device that does each engine's handshakes, not its pixels. The
+device that does each engine's handshakes. Pixels are real from the SIE's
+test pattern through IME's YUV to JPEG (`hw/misc/nvt-pixel.c`); H.26x,
+graphics and audio content are not. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

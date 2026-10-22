@@ -22,8 +22,11 @@
 #     without an error and leave their result file;
 #   - hd_audio_capture_only: PCM captured through EAC and the DAI DMA.
 #
-# The engines move no pixels: frames, bitstreams and samples are
-# placeholders (docs/novatek.md).  Sample keys go in on stdin.
+# The SIE captures a moving test pattern; the IPP turns its RAW into YUV and
+# the JPEG codec encodes it, so the snapshots show colour bars, a grey ramp
+# and a white box that moves between them (checked with Python PIL).  H.26x
+# output, graphics results and audio are still placeholders
+# (docs/novatek.md).  Sample keys go in on stdin.
 #
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
 #       [--samples DIR] [--dir qemu-boot] [--qemu ./qemu-src/build/qemu-system-arm]
@@ -228,6 +231,39 @@ im = Image.open('$WORK/snap$n.jpg'); im.load(); print('%dx%d' % im.size)
             bad "snapshot $n decodes: a 2880x1620 JPEG (got '$dim')"
         fi
     done
+    # The sensor's test pattern through SIE, IPP and the JPEG encoder:
+    # colour bars over a grey ramp, a white box that moves frame to frame.
+    look=$(python3 - "$WORK/snap0.jpg" "$WORK/snap1.jpg" <<'PY' 2>/dev/null || true
+import sys
+from PIL import Image
+ims = [Image.open(f).convert('RGB') for f in sys.argv[1:]]
+w, h = ims[0].size
+want = [(1, 1, 1), (1, 1, 0), (0, 1, 1), (0, 1, 0), (1, 0, 1), (1, 0, 0),
+        (0, 0, 1), (0, 0, 0)]
+bars = all(tuple(int(c > 96) for c in ims[0].getpixel((w * (2 * i + 1) // 16,
+                                                         h // 6))) == want[i]
+           for i in range(8))
+ramp = [ims[0].getpixel((x, h * 5 // 6))[1] for x in (8, w // 2, w - 8)]
+def box(im):
+    xs = [x for x in range(0, w, 4) if min(im.getpixel((x, h // 3))) > 220]
+    return xs[0] if xs else -1
+print('bars=%d ramp=%d moved=%d' % (bars, ramp[0] < ramp[1] < ramp[2],
+                                     box(ims[0]) >= 0 and box(ims[1]) >= 0 and
+                                     box(ims[0]) != box(ims[1])))
+PY
+)
+    if [ -z "$look" ] && ! python3 -c 'import PIL' 2>/dev/null; then
+        echo "SKIP: snapshot content checks (no Python PIL)"
+    elif [ -z "$look" ]; then
+        bad "snapshot content: the check did not run"
+    else
+        case "$look" in *bars=1*) pass "snapshot: the eight colour bars";;
+            *) bad "snapshot: the eight colour bars ($look)";; esac
+        case "$look" in *ramp=1*) pass "snapshot: the grey ramp, dark to light";;
+            *) bad "snapshot: the grey ramp ($look)";; esac
+        case "$look" in *moved=1*) pass "the white box moves between the snapshots";;
+            *) bad "the white box moves between the snapshots ($look)";; esac
+    fi
     for k in c s o t l r j p d; do
         expect "NVT-HDAL-GFX: $k rc=0 errors=0 bytes=[1-9]" \
             "hd_gfx_only '$k': no error, its result file written"

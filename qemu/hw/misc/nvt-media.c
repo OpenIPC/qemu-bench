@@ -30,6 +30,7 @@
 #include "qapi/error.h"
 #include "qom/object.h"
 #include "system/dma.h"
+#include "hw/misc/nvt-pixel.h"
 
 #define TYPE_NVT_MEDIA "nvt-media"
 OBJECT_DECLARE_SIMPLE_TYPE(NvtMediaState, NVT_MEDIA)
@@ -51,6 +52,10 @@ struct NvtMediaState {
     QEMUTimer *timer;           /* frame / job timing, for engines that run */
     uint32_t phase;             /* where in its frame or job the engine is */
     uint32_t ll_addr;           /* IPP: the linked list being worked through */
+    uint32_t frames;            /* SIE: frames captured, for the pattern */
+    NvtMediaState *ipp_src;     /* IME: the IFE whose input it finishes */
+    uint8_t jpg_q[128];         /* JPEG: luma / chroma quantisation, zig-zag */
+    uint32_t jpg_lut;           /* JPEG: the LUT port's select / address */
 };
 
 /*
@@ -96,6 +101,9 @@ static void nvt_media_update_irq(NvtMediaState *s)
 #define SIE_CTRL            0x00
 #define SIE_INTE            0x08
 #define SIE_INTS            0x0C
+#define SIE_CROP_SIZE       0x2C
+#define SIE_OUT0_ADDR       0x5C
+#define SIE_OUT0_CFG        0x60
 #define SIE_DRAM            0xA4
 #define SIE_DRAM_SINGLE     (7u << 28)
 #define SIE_CTRL_RST        (1u << 0)
@@ -145,6 +153,37 @@ static bool sie_read(NvtMediaState *s, hwaddr off, uint64_t *val)
     return false;
 }
 
+static const unsigned raw_bits[4] = { 8, 10, 12, 16 };
+
+/*
+ * The sensor's frame, as the SIE writes it to DRAM output 0: the test
+ * pattern (nvt-pixel.c) at the crop size, packed as OUT0_CFG [17:16]
+ * says (8 / 10 / 12 / 16 bits), OUT0_CFG [15:2] bytes a line apart.
+ */
+static void sie_write_raw(NvtMediaState *s)
+{
+    uint32_t size = *reg(s, SIE_CROP_SIZE), cfg = *reg(s, SIE_OUT0_CFG);
+    uint32_t w = size & 0xFFFF, h = size >> 16, lofs = cfg & 0xFFFC;
+    unsigned bits = raw_bits[(cfg >> 16) & 3];
+    hwaddr addr = *reg(s, SIE_OUT0_ADDR) & ~3u;
+    size_t line = nvt_pixel_packed_size(w, bits);
+    g_autofree uint16_t *px = NULL;
+    g_autofree uint8_t *packed = NULL;
+    uint32_t y;
+
+    if (!addr || !w || !h || w > 8192 || h > 8192 || lofs < line) {
+        return;
+    }
+    px = g_new(uint16_t, w);
+    packed = g_malloc(line);
+    for (y = 0; y < h; y++) {
+        nvt_pixel_pattern_line(px, w, h, y, s->frames);
+        nvt_pixel_pack(packed, px, w, bits);
+        dma_memory_write(&address_space_memory, addr + (hwaddr)y * lofs,
+                         packed, line, MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void sie_frame(NvtMediaState *s)
 {
     static const uint32_t step[3] = {
@@ -152,6 +191,8 @@ static void sie_frame(NvtMediaState *s)
     };
 
     if (s->phase == 2) {
+        sie_write_raw(s);
+        s->frames++;
         *reg(s, SIE_DRAM) &= ~SIE_DRAM_SINGLE;
     }
     *reg(s, SIE_INTS) |= step[s->phase];
@@ -309,6 +350,68 @@ static bool ipp_run_job(NvtMediaState *s)
     return false;
 }
 
+/*
+ * The IPP chain's pixels, done when IME finishes a job: the RAW frame the
+ * IFE was pointed at (input address 0x30, line offset 0x34, size 0x20,
+ * sample depth CTRL1 [6:5]) becomes YUV 4:2:0 semi-planar at IME output
+ * path 1 (enable 0x04 bit 2; size 0x84, Y / UV addresses 0x94 / 0x98,
+ * line offsets 0x8C / 0x90): demosaiced 2x2, BT.601, scaled to the
+ * output size.  DCE's and IPE's corrections are not applied.
+ */
+static void ime_write_yuv(NvtMediaState *s)
+{
+    NvtMediaState *ife = s->ipp_src;
+    uint32_t isz, osz, iw, ih, ow, oh, cw, ilofs, ylofs, uvlofs, y;
+    unsigned bits;
+    hwaddr in, ya, uva;
+    g_autofree uint16_t *bayer = NULL;
+    g_autofree uint8_t *packed = NULL, *yp = NULL, *uvp = NULL;
+    size_t line;
+
+    if (!ife || !(*reg(s, 0x04) & (1u << 2))) {
+        return;
+    }
+    isz = *reg(ife, 0x20);
+    osz = *reg(s, 0x84);
+    iw = isz & 0xFFFF;
+    ih = isz >> 16;
+    ow = osz & 0xFFFF;
+    oh = osz >> 16;
+    ilofs = *reg(ife, 0x34) & 0xFFFC;
+    ylofs = *reg(s, 0x8C) & 0xFFFC;
+    uvlofs = *reg(s, 0x90) & 0xFFFC;
+    bits = raw_bits[(*reg(ife, 0x04) >> 5) & 3];
+    in = *reg(ife, 0x30) & ~3u;
+    ya = *reg(s, 0x94) & ~3u;
+    uva = *reg(s, 0x98) & ~3u;
+    line = nvt_pixel_packed_size(iw, bits);
+    if (!in || !ya || !uva || iw < 2 || ih < 2 || iw > 8192 || ih > 8192 ||
+        ow < 2 || oh < 2 || ow > 8192 || oh > 8192 || ilofs < line ||
+        ylofs < ow || uvlofs < ow) {
+        return;
+    }
+    bayer = g_new(uint16_t, (size_t)iw * ih);
+    packed = g_malloc(line);
+    for (y = 0; y < ih; y++) {
+        dma_memory_read(&address_space_memory, in + (hwaddr)y * ilofs,
+                        packed, line, MEMTXATTRS_UNSPECIFIED);
+        nvt_pixel_unpack(bayer + (size_t)y * iw, packed, iw, bits);
+    }
+    /* chroma for odd sizes rounds up; only the guest's extent goes back */
+    cw = (ow + 1) & ~1u;
+    yp = g_malloc0((size_t)ow * oh);
+    uvp = g_malloc0((size_t)cw * ((oh + 1) / 2));
+    nvt_pixel_bayer_to_nv12(bayer, iw, iw, ih, yp, ow, uvp, cw, ow, oh);
+    for (y = 0; y < oh; y++) {
+        dma_memory_write(&address_space_memory, ya + (hwaddr)y * ylofs,
+                         yp + (size_t)y * ow, ow, MEMTXATTRS_UNSPECIFIED);
+    }
+    for (y = 0; y < oh / 2; y++) {
+        dma_memory_write(&address_space_memory, uva + (hwaddr)y * uvlofs,
+                         uvp + (size_t)y * cw, ow, MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void ipp_job_done(NvtMediaState *s)
 {
     const NvtIppParams *p = s->engine->opaque;
@@ -322,6 +425,9 @@ static void ipp_job_done(NvtMediaState *s)
         return;
     }
     more = ipp_run_job(s);
+    if (s->engine->opaque == &ipp_ime) {
+        ime_write_yuv(s);
+    }
 
     *reg(s, p->ints) |= p->job_end | (more ? 0 : p->ll_end);
     ipp_update_irq(s);
@@ -438,7 +544,14 @@ static void h26x_done(NvtMediaState *s)
 #define JPG_CTRL            0x00
 #define JPG_INT_EN          0x18
 #define JPG_INT_STA         0x1C
+#define JPG_LUT             0x10
+#define JPG_LUT_DATA        0x14
+#define JPG_DATA_SIZE       0x28
 #define JPG_MCU             0x2C
+#define JPG_Y_ADDR          0x54
+#define JPG_UV_ADDR         0x58
+#define JPG_Y_LOFS          0x60
+#define JPG_UV_LOFS         0x64
 #define JPG_BS_STADR        0x40
 #define JPG_BS_BUFLEN       0x44
 #define JPG_BS_CURADR       0x48
@@ -471,6 +584,18 @@ static uint64_t jpg_write(NvtMediaState *s, hwaddr off, uint64_t val)
         return val & ~(JPG_CTRL_SRST | JPG_CTRL_ABORT);
     case JPG_INT_STA:
         return *reg(s, off) & ~val;
+    case JPG_LUT:
+        s->jpg_lut = val;
+        return val;
+    case JPG_LUT_DATA:
+        /* table 1: the quantisation, luma then chroma, 4 bytes a word */
+        if (((s->jpg_lut >> 12) & 0xF) == 1 && (s->jpg_lut & 0x3FF) < 32) {
+            stl_le_p(s->jpg_q + 4 * (s->jpg_lut & 0x3FF), val);
+        }
+        if (s->jpg_lut & (1u << 16)) {      /* auto-increment */
+            s->jpg_lut = (s->jpg_lut & ~0x3FFu) | ((s->jpg_lut + 1) & 0x3FF);
+        }
+        return val;
     }
     return val;
 }
@@ -484,27 +609,82 @@ static bool jpg_read(NvtMediaState *s, hwaddr off, uint64_t *val)
     return false;
 }
 
+/*
+ * A frame: MCU columns / rows in DATA_SIZE [12:0] / [28:16] and the MCU
+ * count, each stored minus one; the 4:2:0 picture at Y / UV (line
+ * offsets minus one).  It is encoded with the quantisation the driver
+ * loaded and the standard Huffman tables; with no picture to read, every
+ * block is coded flat grey ("DC difference 0, end of block": 4 bytes an
+ * MCU).  Either way the scan ends in EOI after the software's header.
+ */
+static size_t jpg_encode(NvtMediaState *s, uint8_t *buf, size_t room)
+{
+    uint32_t sz = *reg(s, JPG_DATA_SIZE);
+    uint32_t mw = (sz & 0x1FFF) + 1, mh = ((sz >> 16) & 0x1FFF) + 1;
+    uint32_t ylofs = (*reg(s, JPG_Y_LOFS) & 0xFFFF) + 1;
+    uint32_t uvlofs = (*reg(s, JPG_UV_LOFS) & 0xFFFF) + 1;
+    hwaddr ya = *reg(s, JPG_Y_ADDR), uva = *reg(s, JPG_UV_ADDR);
+    uint32_t w = mw * 16, h = mh * 16, r;
+    g_autofree uint8_t *yp = NULL, *uvp = NULL;
+
+    if (!ya || !uva || mw > 512 || mh > 512 || ylofs < w || uvlofs < w) {
+        static const uint8_t grey[4] = { 0x28, 0xA2, 0x8A, 0x00 };
+        uint32_t mcus = (*reg(s, JPG_MCU) & 0x3FFFFFF) + 1, i;
+
+        if ((uint64_t)mcus * 4 + 2 > room) {
+            return 0;
+        }
+        for (i = 0; i < mcus; i++) {
+            memcpy(buf + 4 * i, grey, 4);
+        }
+        buf[4 * mcus] = 0xFF;
+        buf[4 * mcus + 1] = 0xD9;
+        return 4 * mcus + 2;
+    }
+    yp = g_malloc((size_t)w * h);
+    uvp = g_malloc((size_t)w * h / 2);
+    for (r = 0; r < h; r++) {
+        dma_memory_read(&address_space_memory, ya + (hwaddr)r * ylofs,
+                        yp + (size_t)r * w, w, MEMTXATTRS_UNSPECIFIED);
+    }
+    for (r = 0; r < h / 2; r++) {
+        dma_memory_read(&address_space_memory, uva + (hwaddr)r * uvlofs,
+                        uvp + (size_t)r * w, w, MEMTXATTRS_UNSPECIFIED);
+    }
+    return nvt_pixel_jpeg_scan(buf, room, yp, w, uvp, w, mw, mh,
+                               s->jpg_q, s->jpg_q + 64);
+}
+
+static uint64_t jpg_bound(NvtMediaState *s)
+{
+    uint32_t sz = *reg(s, JPG_DATA_SIZE);
+    uint64_t mcus = (uint64_t)((sz & 0x1FFF) + 1) *
+                    (((sz >> 16) & 0x1FFF) + 1);
+
+    mcus = MAX(mcus, (uint64_t)(*reg(s, JPG_MCU) & 0x3FFFFFF) + 1);
+    return mcus * 6 * 512 + 2;
+}
+
 static void jpg_done(NvtMediaState *s)
 {
-    /* "00 1010" x 4 luma, "00 00" x 2 chroma: 32 bits, 0x28A28A00 */
-    static const uint8_t mcu[4] = { 0x28, 0xA2, 0x8A, 0x00 };
-    uint32_t mcus = *reg(s, JPG_MCU) & 0x3FFFFFF;
     uint32_t room = *reg(s, JPG_BS_BUFLEN) & 0x1FFFFFF;
     hwaddr bs = *reg(s, JPG_BS_STADR) & 0x7FFFFFFF;
     g_autofree uint8_t *buf = NULL;
-    uint32_t len = mcus * 4 + 2, i;
+    size_t len;
 
-    if (len > room) {
-        qemu_log_mask(LOG_GUEST_ERROR, "nvt-media jpg: %u bytes do not fit "
-                      "the %u-byte buffer\n", len, room);
-        len = 0;
+    /*
+     * No more than the frame can take: a block codes in at most 27 + 63 x
+     * 26 bits (DC, then 63 AC codes of up to 16 bits plus a 10-bit
+     * value), some 205 bytes, which 0xFF stuffing at most doubles.
+     */
+    room = MIN((uint64_t)room, jpg_bound(s));
+    buf = g_malloc(MAX(room, 1u));
+    len = jpg_encode(s, buf, room);
+
+    if (!len) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-media jpg: the frame does not "
+                      "fit the %u-byte buffer\n", room);
     } else {
-        buf = g_malloc(len);
-        for (i = 0; i < mcus; i++) {
-            memcpy(buf + 4 * i, mcu, 4);
-        }
-        buf[len - 2] = 0xFF;
-        buf[len - 1] = 0xD9;        /* EOI */
         dma_memory_write(&address_space_memory, bs, buf, len,
                          MEMTXATTRS_UNSPECIFIED);
     }
@@ -725,6 +905,9 @@ static void nvt_media_reset(DeviceState *dev)
 
     timer_del(s->timer);
     memset(s->regs, 0, s->size);
+    s->frames = 0;
+    s->jpg_lut = 0;
+    memset(s->jpg_q, 0, sizeof(s->jpg_q));
     if (s->engine->reset) {
         s->engine->reset(s);
     }
@@ -763,6 +946,8 @@ static const Property nvt_media_properties[] = {
     DEFINE_PROP_STRING("engine", NvtMediaState, engine_name),
     DEFINE_PROP_UINT32("size", NvtMediaState, size, 0x1000),
     DEFINE_PROP_BOOL("trace", NvtMediaState, trace, false),
+    DEFINE_PROP_LINK("ipp-input", NvtMediaState, ipp_src, TYPE_NVT_MEDIA,
+                     NvtMediaState *),
 };
 
 static const VMStateDescription vmstate_nvt_media = {
@@ -774,6 +959,9 @@ static const VMStateDescription vmstate_nvt_media = {
         VMSTATE_TIMER_PTR(timer, NvtMediaState),
         VMSTATE_UINT32(phase, NvtMediaState),
         VMSTATE_UINT32(ll_addr, NvtMediaState),
+        VMSTATE_UINT32(frames, NvtMediaState),
+        VMSTATE_UINT8_ARRAY(jpg_q, NvtMediaState, 128),
+        VMSTATE_UINT32(jpg_lut, NvtMediaState),
         VMSTATE_END_OF_LIST()
     }
 };
