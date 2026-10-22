@@ -10,7 +10,7 @@
 # qemu-boot/nor-xm530-camera.bin, keeps the camera's settings between runs.
 # Once, on the console (see docs/novatek.md, "Camera video"):
 #   - log in as root, accept the EULA and set a password (RTSP uses it);
-#   - cli -s .video0.codec h264; cli -s .video0.size 1280x720
+#   - cli -s .video0.codec h264; cli -s .video0.size 1920x1080
 #     cli -s .video1.enabled true; cli -s .video1.codec h264
 #     cli -s .video1.size 704x576; /etc/init.d/S95majestic restart
 #   - a static 192.168.1.20 in /etc/network/interfaces.d/eth0.

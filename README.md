@@ -290,7 +290,10 @@ audio interfaces and the HDAL engines complete their jobs, Ethernet works
 and the web UI answers: `FLASH=nor.bin qemu-boot/run-nt98332.sh`. With an
 emulated XM530 camera on the same QEMU network
 (`qemu-boot/run-xm530-camera.sh`), the NVR decodes its H.264 (libavcodec
-behind the vendor decoder driver) and shows it in its preview window. Notes in
+behind the vendor decoder driver) and shows it in its preview window and its
+single-channel view, records it and plays it back. With
+`qemu-boot/fake-ipcam.py` serving H.265 files (`LAN=fake`) both views show
+H.265 too. Notes in
 [docs/novatek.md](docs/novatek.md#nt98332-na51103).
 
 ² A Xiongmai NBD80N36RA-KL NVR dump (not distributable, so not in CI).
@@ -485,7 +488,7 @@ qemu-boot/
 ├── build-novatek-hdal-samples.sh # the SDK's HDAL samples, uClibc-built, for test-novatek-hdal.sh
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
-├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
+├── fake-ipcam.py                # RTSP/ONVIF camera: synthetic H.264 pattern, or H.264/H.265 files
 ├── gk710x-halmap.py             # Run the GK710x HAL under Unicorn, print its map
 ├── test-sysupgrade.sh           # sysupgrade --archive on emulated NOR
 ├── test-firstboot.sh            # firstboot wipes the overlay, camera boots

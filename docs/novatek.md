@@ -1100,6 +1100,34 @@ itself and hands each picture over as a link list of register writes:
   1 / 2^[15:12] of the height (half each way here), at `+0x1898`. The
   preview windows read that copy.
 
+H.265 jobs use their own banks, the list writing `+0x1800` = 0 where
+H.264's write 2:
+
+- `+0x2000` (AD) and `+0x2800` (BIN) are the control words, with
+  H.264's three bits. The list starts AD (`0xE`), then BIN (6).
+  `doEngineIsr()` takes bit 16 of both as done and writes it back.
+- The interrupt is enabled by `+0x20DC` (and `+0x28DC`), `0x41`. The
+  handler turns that off rather than acknowledging `+0x1848`, so an
+  interrupt that `+0x1848` gates stays up and the handler Oopses as
+  above.
+- `+0x211C` is an error register: `check_hw_error()` fails the job
+  ("AD has error", `DEC_ERR_ISR`) on anything but 0. `+0x20E4`, which
+  the list clears with an op-6 command, is only printed with it.
+- `+0x2094` points at the `{count, address, size}` block, but the address
+  is the picture's first slice, past the parameter sets the driver has
+  parsed, and the size is the buffer's. The access unit is stored whole,
+  so the model takes the VPS, SPS, PPS and SEI from just before the slice
+  and ends the picture at the next unit that does not belong to it.
+- The picture goes to `+0x28B8` (Y) and `+0x28BC` (UV), packed; the
+  reduced copy is `+0x29D0` / `+0x29D4`, as `+0x1894` / `+0x1898`. The
+  size is `+0x2804` (`[31:16]` height).
+
+The driver's own parser rejects a stream whose VPS declares two temporal
+sub-layers once it has parsed one: every later VPS misreads
+(`vps_max_layer_id(0x1c)` in the HDAL log) and the channel stops at the
+next I frame. Cameras send one sub-layer; the test encoder below has to
+be told to.
+
 Built with libavcodec (pkg-config, as `sstar-vpu`), the model decodes each
 access unit and writes the picture and the reduced copy, one decoder per
 stream size. Without it, jobs complete with nothing written.
@@ -1131,7 +1159,7 @@ Setting the camera up, once:
 1. On the camera's console: log in as root, accept the EULA and set a
    password, which its RTSP uses. Then:
    ```sh
-   cli -s .video0.codec h264; cli -s .video0.size 1280x720
+   cli -s .video0.codec h264; cli -s .video0.size 1920x1080
    cli -s .video1.enabled true; cli -s .video1.codec h264; cli -s .video1.size 704x576
    /etc/init.d/S95majestic restart
    printf 'auto eth0\niface eth0 inet static\n    address 192.168.1.20\n    netmask 255.255.255.0\n' \
@@ -1149,13 +1177,33 @@ Setting the camera up, once:
 
 The camera's tile then shows its live picture.
 
+The XM530 cannot send H.265 (its encoder for that, the Mali VE, is not
+modelled), so H.265 is tested with `qemu-boot/fake-ipcam.py` on the host,
+looping H.265 files, and QEMU's user networking relaying the camera's
+address to it (one `--relay` process per connection). The NVR's channel stays as above:
+
+```sh
+python3 qemu-boot/fake-ipcam.py --rtsp 18554 --advertise 192.168.1.20 --fps 25 \
+    --file main.hevc --size 1920x1080 --sub-file sub.hevc --sub-size 704x576 &
+FLASH=nor.bin LAN=fake bash qemu-boot/run-nt98332.sh
+```
+
+The files come from [kvazaar](https://github.com/ultravideo/kvazaar) with
+`--gop 0 --period 25 --vps-period 1`. kvazaar writes
+`vps_max_sub_layers_minus1` and `sps_max_sub_layers_minus1` as 1, which
+the driver does not survive (above): set both to 0 in
+`src/encoder_state-bitstream.c` and drop the sub-layer flags and
+`reserved_zero_2bits` that `encoder_state_write_bitstream_PTL()` writes
+for them.
+
 ### Not modelled on NT98332
 
-- Pixel work in the other engines (OSG, the H.26x encoder, JPEG, the 2D
-  engines): they complete jobs without touching memory. The VPE does only
-  the fill and the plain scale the preview uses.
-- H.265, and the decoder's own picture formats beyond what is described
-  above.
+- The other media engines: OSG, SSCA, JPEG, AGE, the H.26x encoder, the
+  DEI, hwcopy and VCAP have no model and read as zero. Their drivers only
+  set them up at boot; live view, the single-channel view, recording and
+  playback use none of them. The VPE does only the fill and the plain
+  scale the NVR uses.
+- The decoder's own picture formats beyond what is described above.
 - Audio content (RX is silence, TX is dropped), HDMI hotplug / EDID, the
   CVBS output (LCD200, TVE100), the LCD300's cursor and colour pipeline.
 - The real loader and BL31 (DDR training, secure world).
