@@ -122,6 +122,8 @@
 
 #define SR1_WIP         (1u << 0)
 #define SR1_WEL         (1u << 1)
+#define SR3_WPS         (1u << 2)
+#define SR3_RESET       0x60        /* W25Q128FV: DRV 11, WPS 0 */
 
 #define NAND_FEAT_LOCK  0
 #define NAND_FEAT_CFG   1
@@ -333,6 +335,46 @@ static uint8_t nand_xfer(NvtFlashState *s, uint32_t pos, uint8_t tx)
     }
 }
 
+/*
+ * W25Q individual block protection, which SR3's WPS turns on in place of
+ * SR1's BP bits.  The lock bits are volatile and power up set; the top and
+ * bottom 64 KiB blocks lock per 4 KiB sector, the rest per 64 KiB block.
+ * The Xiongmai kernel's spinor.c sets WPS and unlocks only what it writes
+ * (XmSpiNor_BlkLockMgr: 256 + 2 * 15 = 286 lock units on a 16 MiB part).
+ */
+static void nor_lock_range(NvtFlashState *s, uint32_t addr, bool lock)
+{
+    uint32_t a = addr & (s->size - 1), n = 1, i;
+
+    if (a >= 64 * KiB && a < s->size - 64 * KiB) {
+        a &= ~(64 * KiB - 1);
+        n = 16;
+    }
+    for (i = a / (4 * KiB); i < a / (4 * KiB) + n; i++) {
+        if (lock) {
+            s->lock[i / 8] |= 1 << (i % 8);
+        } else {
+            s->lock[i / 8] &= ~(1 << (i % 8));
+        }
+    }
+}
+
+static bool nor_locked(NvtFlashState *s, uint32_t addr, uint32_t len)
+{
+    uint32_t i;
+
+    if (!(s->sr3 & SR3_WPS)) {
+        return false;
+    }
+    addr &= s->size - 1;
+    for (i = addr / (4 * KiB); i <= (addr + len - 1) / (4 * KiB); i++) {
+        if (s->lock[i / 8] & (1 << (i % 8))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Address bytes an opcode takes (the 0x1x / 0x2x / 0xDC forms are the
  * explicit 4-byte ones). */
 static int nor_addr_len(NvtFlashState *s, uint8_t cmd)
@@ -371,9 +413,24 @@ static void spi_deselect(NvtFlashState *s)
     case 0x06:                              /* WREN */
         s->wel = true;
         break;
+    case 0x50:                              /* volatile SR write enable */
+        s->wel = true;
+        break;
     case 0x04:                              /* WRDI */
     case 0x02: case 0x12: case 0x32: case 0x34:    /* PP, 4PP */
-    case 0x01: case 0x31:                   /* WRSR, WRSR2 */
+    case 0x01: case 0x31: case 0x11:        /* WRSR, WRSR2, WRSR3 */
+        s->wel = false;
+        break;
+    case 0x36: case 0x39:                   /* individual block lock/unlock */
+        if (s->wel && s->pos > nor_addr_len(s, s->cmd)) {
+            nor_lock_range(s, s->addr, s->cmd == 0x36);
+        }
+        s->wel = false;
+        break;
+    case 0x7E: case 0x98:                   /* global block lock/unlock */
+        if (s->wel) {
+            memset(s->lock, s->cmd == 0x7E ? 0xFF : 0, sizeof(s->lock));
+        }
         s->wel = false;
         break;
     case 0xB7:                              /* EN4B */
@@ -386,14 +443,17 @@ static void spi_deselect(NvtFlashState *s)
     case 0x52:                              /* BE, 32 KiB */
     case 0xD8: case 0xDC:                   /* BE, 64 KiB */
         if (s->wel && s->pos > nor_addr_len(s, s->cmd)) {
-            nvt_flash_erase(s, s->addr,
-                            (s->cmd & ~1) == 0x20 ? 4 * KiB :
-                            s->cmd == 0x52 ? 32 * KiB : 64 * KiB);
+            uint32_t len = (s->cmd & ~1) == 0x20 ? 4 * KiB :
+                           s->cmd == 0x52 ? 32 * KiB : 64 * KiB;
+
+            if (!nor_locked(s, s->addr & ~(len - 1), len)) {
+                nvt_flash_erase(s, s->addr, len);
+            }
         }
         s->wel = false;
         break;
     case 0xC7: case 0x60:                   /* CE */
-        if (s->wel) {
+        if (s->wel && !nor_locked(s, 0, s->size)) {
             nvt_flash_erase(s, 0, s->size);
         }
         s->wel = false;
@@ -432,7 +492,7 @@ static uint8_t spi_xfer(NvtFlashState *s, uint8_t tx)
     case 0x32: case 0x34:                   /* quad PP */
         if (pos <= alen) {
             s->addr = (s->addr << 8) | tx;
-        } else if (s->wel) {
+        } else if (s->wel && !nor_locked(s, s->addr, 1)) {
             uint32_t a = s->addr & (s->size - 1);
 
             s->array[a] &= tx;
@@ -474,6 +534,30 @@ static uint8_t spi_xfer(NvtFlashState *s, uint8_t tx)
         if (s->wel && pos == 1) {
             s->sr[1] = tx;
         }
+        break;
+    case 0x15:                              /* RDSR3 */
+        rx = s->sr3;
+        break;
+    case 0x11:                              /* WRSR3 */
+        if (s->wel && pos == 1) {
+            s->sr3 = tx;
+        }
+        break;
+    case 0x36: case 0x39:                   /* block lock / unlock */
+        if (pos <= alen) {
+            s->addr = (s->addr << 8) | tx;
+        }
+        break;
+    case 0x3D:                              /* read block lock */
+        if (pos <= alen) {
+            s->addr = (s->addr << 8) | tx;
+        } else {
+            uint32_t i = (s->addr & (s->size - 1)) / (4 * KiB);
+
+            rx = (s->lock[i / 8] >> (i % 8)) & 1;
+        }
+        break;
+    case 0x7E: case 0x98: case 0x50:
         break;
     case 0x5A:                              /* SFDP: none */
         break;
@@ -981,6 +1065,7 @@ static void nvt_flash_reset(DeviceState *dev)
     s->wel = false;
     s->addr4 = false;
     s->pos = 0;
+    memset(s->lock, 0xFF, sizeof(s->lock));
     s->feat[NAND_FEAT_LOCK] = 0;
     s->feat[NAND_FEAT_CFG] = NAND_CFG_ECCEN | NAND_CFG_BUF;
     s->feat[NAND_FEAT_STS] = 0;
@@ -1029,6 +1114,7 @@ static void nvt_flash_realize(DeviceState *dev, Error **errp)
     s->fd = -1;
     s->dirty_lo = UINT32_MAX;
     s->dirty_hi = 0;
+    s->sr3 = SR3_RESET;     /* non-volatile, so not reset */
     if (s->flash_file && *s->flash_file) {
         s->fd = open(s->flash_file, O_RDWR);
         if (s->fd < 0) {
@@ -1099,7 +1185,7 @@ fail:
 
 static const VMStateDescription vmstate_nvt_flash = {
     .name = TYPE_NVT_FLASH,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,        /* a NOR's v1 state still loads */
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtFlashState, NVT_FLASH_REGS_SIZE / 4),
@@ -1121,6 +1207,8 @@ static const VMStateDescription vmstate_nvt_flash = {
         VMSTATE_UINT8_ARRAY_V(cache, NvtFlashState, NVT_NAND_RAW, 2),
         VMSTATE_UINT8_ARRAY_V(feat, NvtFlashState, 3, 2),
         VMSTATE_UINT8_ARRAY_V(spare, NvtFlashState, NVT_SPARE_SIZE, 2),
+        VMSTATE_UINT8_V(sr3, NvtFlashState, 3),
+        VMSTATE_UINT8_ARRAY_V(lock, NvtFlashState, NVT_NOR_LOCK_BYTES, 3),
         VMSTATE_END_OF_LIST()
     }
 };
