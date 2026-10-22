@@ -1143,8 +1143,9 @@ list's registers:
 - the source at `0x308` (size `0x010`, stride `0x800`, its UV right
   after Y), of which `0x01C` is the part shown: 1920×1080 of the
   decoder's 1088-line buffer;
-- the destination window at `0x360` in a frame of `0x50C`, window size
-  `0x550` × `0x508`;
+- the destination frame at `0x360` (`0x50C` its size, its UV after its
+  Y), and the window in it: `0x550` × `0x508` at x `0x554` `[15:0]`, y
+  `0x510` `[15:0]`;
 - `0x008` says which: `0xC00` scales a reduced copy into a preview
   window, `0x1000` a full picture into the single-channel view (a
   double-click on a tile, which switches the channel to the main
