@@ -106,6 +106,7 @@ cp qemu/include/hw/misc/nvt-gfx.h   "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/nvt-dai.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-engine.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-hdmi.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-h26xdec.c       "$QEMU_DIR/hw/misc/"
 cp qemu/hw/display/nvt-lcd300.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/timer/nvt-timer.c        "$QEMU_DIR/hw/timer/"
 cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
@@ -511,6 +512,26 @@ if ! grep -q "'novatek.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('novatek.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added novatek.c"
+fi
+# The NA51103 decoder writes pictures when libavcodec is there (pkg-config),
+# as sstar-vpu does, and completes its jobs without them when it is not.
+# A tree that listed it plainly is upgraded.
+if grep -q "if_true: files('nvt-h26xdec.c'))" "$QEMU_DIR/hw/misc/meson.build"; then
+    sed -i "/if_true: files('nvt-h26xdec.c'))/d" "$QEMU_DIR/hw/misc/meson.build"
+fi
+if ! grep -q "'nvt-h26xdec.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'MESON'
+nvt_avcodec = dependency('libavcodec', version: '>=58', required: false)
+nvt_avutil = dependency('libavutil', version: '>=56', required: false)
+if nvt_avcodec.found() and nvt_avutil.found()
+  system_ss.add(when: 'CONFIG_NOVATEK', if_true: [files('nvt-h26xdec.c'),
+    nvt_avcodec, nvt_avutil,
+    declare_dependency(compile_args: '-DNVT_H26XDEC_LIBAVCODEC')])
+else
+  system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-h26xdec.c'))
+endif
+MESON
+    echo "  hw/misc/meson.build: added nvt-h26xdec.c"
 fi
 if ! grep -q "'nvt-lzma.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-lzma.c'))" \

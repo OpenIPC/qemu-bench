@@ -2162,6 +2162,96 @@ def test_nt98332_boot(qemu, tmp):
     os.unlink(path)
 
 
+# ---- nt98332: decoder and VPE link lists ------------------------------
+
+NA51103_DEC = 0x2F0600000
+NA51103_VPE = 0x2F0410000
+NA51103_GICD = 0x2FFF01000
+
+
+def na51103_pending(qt, spi):
+    n = 32 + spi
+    return bool(qt.readl(NA51103_GICD + 0x200 + (n // 32) * 4) &
+                (1 << (n % 32)))
+
+
+def test_nt98332_dec(qt):
+    """The H.26x decoder's link-list protocol, as h26xdec.ko drives it."""
+    print('nt98332: H.26x decoder link list')
+    ll = 0x01000000
+
+    def cmd(op, off, val):
+        return struct.pack('<II', (op << 28) | off, val)
+    lst = (cmd(0xC, 0, ll + 8) +                 # link to the next entry
+           cmd(0, 0x1814, 1) +                   # BIN reset
+           cmd(8, 0x1814, 0x10000) +             # wait for it
+           cmd(0, 0x103C, 0xFF) +                # clear the flags
+           cmd(0, 0x1040, 0x02000000) +          # picture Y
+           cmd(0, 0x1000, 2) +                   # decode
+           cmd(8, 0x1000, 0x10000) +             # wait for done
+           cmd(0xC, 0, 0xFFFFFFF0))              # end of the job
+    qt.write(ll, lst)
+    qt.writel(NA51103_DEC + 0x1000, 0x10003)
+    check('a reset clears itself (and wins over the start bit)',
+          qt.readl(NA51103_DEC + 0x1000) & 3, 0)
+    check('the control word reads done', qt.readl(NA51103_DEC + 0x1000) >> 16
+          & 1, 1)
+    qt.writel(NA51103_DEC + 0x3004, ll)
+    qt.writel(NA51103_DEC + 0x3000, 2)
+    qt.step(5 * 1000 * 1000)
+    check('the list ran to its end', qt.readl(NA51103_DEC + 0x301C),
+          0xFFFFFFF0)
+    check('the register writes landed', qt.readl(NA51103_DEC + 0x1040),
+          0x02000000)
+    check('decode done in 0x103C (errors 0x16 clear)',
+          qt.readl(NA51103_DEC + 0x103C), 1)
+    check('job interrupt status', qt.readl(NA51103_DEC + 0x184C) & 1, 1)
+    check('SPI 9 raised', na51103_pending(qt, 9), True)
+    qt.writel(NA51103_DEC + 0x1848, 1)
+    check('acknowledged at 0x1848', qt.readl(NA51103_DEC + 0x184C) & 1, 0)
+    check('and the line drops', na51103_pending(qt, 9), False)
+
+
+def test_nt98332_vpe(qt):
+    """The VPE's fill and scale jobs, nvt-engine with scaler=on."""
+    print('nt98332: VPE fill and scale')
+    ll, src, dst = 0x01100000, 0x01200000, 0x01400000
+    fw, fh = 64, 32
+
+    def job(regs):
+        lst = b''.join(struct.pack('<II', v, 0x8F000000 | off)
+                       for off, v in regs)
+        lst += struct.pack('<II', 0, 0)
+        qt.write(ll, lst)
+        qt.writel(NA51103_VPE + 0x300, ll)
+        qt.writel(NA51103_VPE + 0x000, 0x80000000)
+        qt.step(5 * 1000 * 1000)
+
+    frame = [(0x050C, fh << 16 | fw), (0x0360, dst)]
+    job(frame + [(0x0008, 0), (0x0260, 0x00804010),
+                 (0x0550, fw), (0x0508, fh)])
+    check('a fill job paints the background colour, Y',
+          qt.read(dst, 8), b'\x10' * 8)
+    check('and UV', qt.read(dst + fw * fh, 4), b'\x40\x80\x40\x80')
+    check('it reports done (frame end, list end)',
+          qt.readl(NA51103_VPE + 0x400) & 5, 5)
+    qt.writel(NA51103_VPE + 0x400, 5)
+
+    # an 8x4 source: Y counts across, UV a fixed pair
+    qt.write(src, bytes(range(32)))
+    qt.write(src + 32, b'\x11\x22' * 8)
+    job(frame + [(0x0008, 0xC00), (0x0010, 4 << 16 | 8), (0x0308, src),
+                 (0x0800, 8), (0x0550, 4), (0x0508, 2)])
+    check('a scale job halves the source into the window, Y',
+          qt.read(dst, 4), bytes([0, 2, 4, 6]))
+    check('the next window row', qt.read(dst + fw, 4),
+          bytes([16, 18, 20, 22]))
+    check('outside the window stays filled', qt.read(dst + 4, 2),
+          b'\x10\x10')
+    check('UV, one row of pairs', qt.read(dst + fw * fh, 4),
+          b'\x11\x22\x11\x22')
+
+
 # ---- nvt-eqos ----------------------------------------------------------
 
 def mdio_read(qt, phy, reg):
@@ -2638,6 +2728,12 @@ def run(args, tmp):
 
     if os.path.exists(args.qemu_aarch64):
         test_nt98332_boot(args.qemu_aarch64, tmp)
+        qt = QTest(args.qemu_aarch64, 'nt98332')
+        try:
+            test_nt98332_dec(qt)
+            test_nt98332_vpe(qt)
+        finally:
+            qt.close()
     else:
         print('nt98332: %s not built, skipped' % args.qemu_aarch64)
 

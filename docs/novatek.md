@@ -1065,11 +1065,92 @@ The GUI comes up about a minute after power-on; the web UI is at
 `http://127.0.0.1:8080/`. The board's address is a static 192.168.1.10,
 so the run script puts user networking on that subnet.
 
+### Camera video
+
+The NVR shows an IP camera's video: an emulated XM530
+(`qemu-boot/run-xm530-camera.sh`, the OpenIPC release with majestic) on a
+QEMU socket network with the NVR (`LAN=mcast qemu-boot/run-nt98332.sh`).
+The camera's stream is H.264 from the H1 model (`docs/xiongmai.md`): intra
+pictures only, DC coefficients only, so the picture is the test pattern at
+4x4-block resolution.
+
+The decoder (`nvt-h26xdec`, `0x2_F0600000`, SPI 9) is driven by the
+HDAL's `h26xdec.ko`, which parses the parameter sets and slice headers
+itself and hands each picture over as a link list of register writes:
+
+- Commands are two words: `(op << 28) | (job << 20) | offset`, then a
+  value. Op 0 writes, op 8 waits for the value's bits in the register,
+  op 0xC links to the list at the value, or ends the job at -16.
+- The wrapper at `+0x3000`: the list's address at `+0x04`, 2 to `+0x00`
+  fires it, `+0x18` / `+0x1C` the last command run.
+  `IMVQ_VDEC_LLCheckFinalJob()` wants `+0x1C` = -16.
+- The job interrupt: `+0x184C` bit 0, acknowledged by writing 1 to
+  `+0x1848` (`VPU_ClearInterrupt()`). A line that stays up runs the
+  handler again with no list in flight, and it writes through garbage
+  indices: a kernel Oops in `update_ll_finish_table()`.
+- `+0x1000` (the H.264 core) and `+0x1814` (its CABAC stage): bit 0 is a
+  reset that clears itself (`VPU_ResetHW()` polls for that, and its
+  read-modify-write carries the start bit along, so a reset wins), bit 1
+  starts, bit 16 is done (what the list's waits check). `+0x103C` holds
+  the flags (bit 0 done; any of `0x16` is a "BIN error").
+- The bitstream is a whole Annex-B access unit, at the `{count, address,
+  length}` block `+0x102C` points at. The picture goes to `+0x1040` (Y) and
+  `+0x1044` (UV interleaved) at the strides in `+0x1008`. With `+0x1894`
+  bit 0 set, a reduced copy follows: 1 / 2^[11:8] of the width and
+  1 / 2^[15:12] of the height (half each way here), at `+0x1898`. The
+  preview windows read that copy.
+
+Built with libavcodec (pkg-config, as `sstar-vpu`), the model decodes each
+access unit and writes the picture and the reduced copy, one decoder per
+stream size. Without it, jobs complete with nothing written.
+
+The reduced copy's layout is this model's choice: its stride is its width
+and its UV follows its Y. The driver's UV offset (`+0x189C`) is too short
+for a half-size copy at that stride. Only the VPE model reads the copy, so
+the two agree.
+
+The VPE (`nvt-engine` with `scaler=on`) does the window work from its
+list's registers:
+
+- the source at `0x308` (size `0x010`, stride `0x800`);
+- the destination window at `0x360` in a frame of `0x50C`, window size
+  `0x550` × `0x508`;
+- with `0x008` bits 11:10 clear, the job fills the window with the
+  background colour `0x260` instead. That is how the NVR clears empty
+  tiles to black; without it the frames read as all-zero YUV, i.e. green.
+
+The destinations are the LCD300's triple-buffered 1280×1024 video frames.
+
+Setting the camera up, once:
+
+1. On the camera's console: log in as root, accept the EULA and set a
+   password, which its RTSP uses. Then:
+   ```sh
+   cli -s .video0.codec h264; cli -s .video0.size 1280x720
+   cli -s .video1.enabled true; cli -s .video1.codec h264; cli -s .video1.size 704x576
+   /etc/init.d/S95majestic restart
+   printf 'auto eth0\niface eth0 inet static\n    address 192.168.1.20\n    netmask 255.255.255.0\n' \
+       > /etc/network/interfaces.d/eth0
+   ```
+   The sub stream matters: the preview windows decode it. With only a
+   main stream larger than the NVR's per-window limit (1280×768), the
+   application never feeds the decoder.
+2. In the NVR's first-boot wizard, at the channel page: edit channel 1 to
+   protocol RTSP, template Custom1, user root, the password, main
+   `rtsp://192.168.1.20:554/stream=0`, sub `…/stream=1`. Then finish the
+   wizard; until it is finished it runs again on every boot and re-adds
+   the camera over ONVIF. The NVR's ONVIF client fails `GetStreamUris`
+   against majestic, so RTSP is the way.
+
+The camera's tile then shows its live picture.
+
 ### Not modelled on NT98332
 
-- Pixel work in the engines: the VPE scaler, OSG, the H.26x decoder and
-  encoder, JPEG and the 2D engines complete jobs without touching memory,
-  so camera video is not shown (the video channel stays black).
+- Pixel work in the other engines (OSG, the H.26x encoder, JPEG, the 2D
+  engines): they complete jobs without touching memory. The VPE does only
+  the fill and the plain scale the preview uses.
+- H.265, and the decoder's own picture formats beyond what is described
+  above; the single-channel full view (main stream) is not checked.
 - Audio content (RX is silence, TX is dropped), HDMI hotplug / EDID, the
   CVBS output (LCD200, TVE100), the LCD300's cursor and colour pipeline.
 - The real loader and BL31 (DDR training, secure world).

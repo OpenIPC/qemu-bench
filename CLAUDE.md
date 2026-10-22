@@ -283,6 +283,11 @@ the U-Boot environment in the image (`qemu-boot/uboot-env.py`). Its media
 blocks are `nvt-engine` instances (fire, run the link list, report done; no
 pixels), `nvt-dai`, `nvt-lcd300` (CTRL bit 31 is an update request the
 frame clears; the driver writes nothing while it is set) and `nvt-hdmi`.
+Its decoder (`nvt-h26xdec`) runs h26xdec.ko's link lists and decodes with
+libavcodec when pkg-config finds it; the VPE instance of `nvt-engine` has
+`scaler=on` and copies the decoder's reduced pictures into the preview
+windows. An XM530 camera on a `-netdev socket,mcast=` LAN is the video
+source (`docs/novatek.md`, "Camera video").
 
 Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
 + PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB
