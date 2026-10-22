@@ -24,6 +24,12 @@
 # offers; the SDK's hd_video_snapshot and hd_video_capture_only name an
 # IMX290, and the record sample's 1920x1080 buffers are too small for it.
 #
+# hd_video_encode_only stops the encoder on "q" while its feed thread may
+# still be between its exit check and hd_videoenc_push_in_buf(), whose
+# push into the stopped path then fails ("push_in error !!", -19 / -26,
+# with enc_exit already set).  The race is the sample's, on silicon as
+# here; the build joins the feed thread before the encoder stops.
+#
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
 #       [--cross /opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-]
@@ -78,6 +84,18 @@ build() {           # build <sample> [sensor]: sensor samples get SC501AI
         sed -i -E 's/nvt_sen_imx290/nvt_sen_sc501ai/;
             s/^(#define VDO_SIZE_W[[:space:]]+)1920/\12880/;
             s/^(#define VDO_SIZE_H[[:space:]]+)1080/\11620/' "$src/"*.c
+    fi
+    if [ "$smp" = hd_video_encode_only ]; then
+        # the feed thread first, then the encoder's stop (see the top)
+        perl -0pi -e 's{(\n\s*// stop video_record modules \(main\)\n)}{\n\n\t// destroy feed yuv thread, before the stop: it may be pushing\n\tpthread_join(stream[0].yuv_thread_id, NULL);\n$1};
+            s{\n\s*// destroy feed yuv thread\n\s*pthread_join\(stream\[0\]\.yuv_thread_id, NULL\);\n}{\n}' \
+            "$src/"*.c
+        if [ "$(cat "$src/"*.c | grep -c 'pthread_join(stream\[0\].yuv_thread_id')" != 1 ] ||
+                ! cat "$src/"*.c | grep -A4 'pthread_join(stream\[0\].yuv_thread_id' |
+                grep -c 'hd_videoenc_stop' >/dev/null; then
+            echo "hd_video_encode_only: its shutdown is not the SDK's as known" >&2
+            exit 1
+        fi
     fi
     "${CROSS}gcc" -O2 -D__LINUX -I"$CODE/hdal/include" -I"$CODE/vos/include" \
         -I"$CODE/hdal/vendor/media/include" -o "$OUT/smp/$smp" "$src/"*.c \

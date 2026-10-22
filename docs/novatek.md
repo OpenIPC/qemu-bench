@@ -907,6 +907,11 @@ The SDK's sensor samples name an IMX290 or use 1920x1080 buffers; the
 builder sets them to the SC501AI's 2880x1620 mode, the only one its
 driver offers.
 
+`hd_video_encode_only` stops its encoder on `q` while its feed thread may
+be about to push one more frame. That push then fails (`push_in error`,
+-19 or -26), about once in ten runs here, and on silicon too. The
+builder therefore joins the feed thread before the encoder stops.
+
 With Python PIL, the run also checks the snapshots' content: the eight
 colour bars, the ramp from dark to light, and the box moving between the
 two snapshots.
