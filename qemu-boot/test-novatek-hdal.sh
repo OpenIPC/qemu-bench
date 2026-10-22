@@ -252,7 +252,11 @@ print('bars=%d ramp=%d moved=%d' % (bars, ramp[0] < ramp[1] < ramp[2],
                                      box(ims[0]) != box(ims[1])))
 PY
 )
-    if [ -n "$look" ]; then
+    if [ -z "$look" ] && ! python3 -c 'import PIL' 2>/dev/null; then
+        echo "SKIP: snapshot content checks (no Python PIL)"
+    elif [ -z "$look" ]; then
+        bad "snapshot content: the check did not run"
+    else
         case "$look" in *bars=1*) pass "snapshot: the eight colour bars";;
             *) bad "snapshot: the eight colour bars ($look)";; esac
         case "$look" in *ramp=1*) pass "snapshot: the grey ramp, dark to light";;

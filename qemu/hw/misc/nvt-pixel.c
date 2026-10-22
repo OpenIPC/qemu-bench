@@ -52,7 +52,22 @@ void nvt_pixel_pattern_line(uint16_t *out, uint32_t width, uint32_t height,
     }
 }
 
-/* ---- RAW packing: samples of 'bits' bits, little-endian bit stream ---- */
+/*
+ * ---- RAW packing: samples of 'bits' bits, little-endian bit stream ----
+ * The samples here are 12-bit; narrower depths drop low bits, 16 bits
+ * shifts them up to fill the range.
+ */
+
+static uint32_t to_depth(uint16_t v, unsigned bits)
+{
+    return (bits >= 12 ? (uint32_t)v << (bits - 12) : v >> (12 - bits)) &
+           ((1u << bits) - 1);
+}
+
+static uint16_t from_depth(uint32_t v, unsigned bits)
+{
+    return bits >= 12 ? v >> (bits - 12) : v << (12 - bits);
+}
 
 size_t nvt_pixel_packed_size(uint32_t n, unsigned bits)
 {
@@ -66,8 +81,7 @@ void nvt_pixel_pack(uint8_t *dst, const uint16_t *src, uint32_t n,
     unsigned have = 0;
 
     for (i = 0; i < n; i++) {
-        acc |= (uint32_t)(src[i] >> (12 - MIN(bits, 12u)) &
-                          ((1u << bits) - 1)) << have;
+        acc |= to_depth(src[i], bits) << have;
         have += bits;
         while (have >= 8) {
             *dst++ = acc;
@@ -91,7 +105,7 @@ void nvt_pixel_unpack(uint16_t *dst, const uint8_t *src, uint32_t n,
             acc |= (uint32_t)*src++ << have;
             have += 8;
         }
-        dst[i] = (acc & ((1u << bits) - 1)) << (12 - MIN(bits, 12u));
+        dst[i] = from_depth(acc & ((1u << bits) - 1), bits);
         acc >>= bits;
         have -= bits;
     }
@@ -104,22 +118,25 @@ static uint8_t clamp8(int v)
     return v < 0 ? 0 : v > 255 ? 255 : v;
 }
 
-void nvt_pixel_bayer_to_nv12(const uint16_t *bayer, uint32_t in_w,
-                             uint32_t in_h, uint8_t *y, uint32_t y_stride,
+void nvt_pixel_bayer_to_nv12(const uint16_t *bayer, uint32_t in_stride,
+                             uint32_t in_w, uint32_t in_h,
+                             uint8_t *y, uint32_t y_stride,
                              uint8_t *uv, uint32_t uv_stride,
                              uint32_t out_w, uint32_t out_h)
 {
     uint32_t ox, oy;
 
+    in_w &= ~1u;
+    in_h &= ~1u;
     for (oy = 0; oy < out_h; oy++) {
         uint32_t qy = MIN((uint64_t)oy * in_h / out_h, in_h - 1) & ~1u;
 
         for (ox = 0; ox < out_w; ox++) {
             uint32_t qx = MIN((uint64_t)ox * in_w / out_w, in_w - 1) & ~1u;
-            const uint16_t *p = bayer + (size_t)qy * in_w + qx;
+            const uint16_t *p = bayer + (size_t)qy * in_stride + qx;
             int r = p[0] >> 4;
-            int g = ((p[1] + p[in_w]) / 2) >> 4;
-            int b = p[in_w + 1] >> 4;
+            int g = ((p[1] + p[in_stride]) / 2) >> 4;
+            int b = p[in_stride + 1] >> 4;
 
             /* BT.601, limited range */
             y[(size_t)oy * y_stride + ox] =
@@ -264,6 +281,7 @@ static void encode_block(BitWriter *w, const int16_t blk[64],
 {
     static double cosv[8][8];
     static bool init;
+    double tmp[8][8];
     int coef[64], u, v, x, y, i, run, n;
 
     if (!init) {
@@ -275,14 +293,23 @@ static void encode_block(BitWriter *w, const int16_t blk[64],
         }
         init = true;
     }
+    /* separable: rows, then columns */
+    for (y = 0; y < 8; y++) {
+        for (u = 0; u < 8; u++) {
+            double sum = 0;
+
+            for (x = 0; x < 8; x++) {
+                sum += (blk[y * 8 + x] - 128) * cosv[u][x];
+            }
+            tmp[y][u] = sum;
+        }
+    }
     for (v = 0; v < 8; v++) {
         for (u = 0; u < 8; u++) {
             double sum = 0;
 
             for (y = 0; y < 8; y++) {
-                for (x = 0; x < 8; x++) {
-                    sum += (blk[y * 8 + x] - 128) * cosv[u][x] * cosv[v][y];
-                }
+                sum += tmp[y][u] * cosv[v][y];
             }
             coef[v * 8 + u] = (int)lround(sum);
         }

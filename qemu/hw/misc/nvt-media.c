@@ -361,7 +361,7 @@ static bool ipp_run_job(NvtMediaState *s)
 static void ime_write_yuv(NvtMediaState *s)
 {
     NvtMediaState *ife = s->ipp_src;
-    uint32_t isz, osz, iw, ih, ow, oh, ilofs, ylofs, uvlofs, y;
+    uint32_t isz, osz, iw, ih, ow, oh, cw, ilofs, ylofs, uvlofs, y;
     unsigned bits;
     hwaddr in, ya, uva;
     g_autofree uint16_t *bayer = NULL;
@@ -397,17 +397,18 @@ static void ime_write_yuv(NvtMediaState *s)
                         packed, line, MEMTXATTRS_UNSPECIFIED);
         nvt_pixel_unpack(bayer + (size_t)y * iw, packed, iw, bits);
     }
-    yp = g_malloc((size_t)ow * oh);
-    uvp = g_malloc((size_t)ow * (oh / 2));
-    nvt_pixel_bayer_to_nv12(bayer, iw & ~1u, ih & ~1u, yp, ow, uvp, ow,
-                            ow & ~1u, oh & ~1u);
+    /* chroma for odd sizes rounds up; only the guest's extent goes back */
+    cw = (ow + 1) & ~1u;
+    yp = g_malloc0((size_t)ow * oh);
+    uvp = g_malloc0((size_t)cw * ((oh + 1) / 2));
+    nvt_pixel_bayer_to_nv12(bayer, iw, iw, ih, yp, ow, uvp, cw, ow, oh);
     for (y = 0; y < oh; y++) {
         dma_memory_write(&address_space_memory, ya + (hwaddr)y * ylofs,
                          yp + (size_t)y * ow, ow, MEMTXATTRS_UNSPECIFIED);
     }
     for (y = 0; y < oh / 2; y++) {
         dma_memory_write(&address_space_memory, uva + (hwaddr)y * uvlofs,
-                         uvp + (size_t)y * ow, ow, MEMTXATTRS_UNSPECIFIED);
+                         uvp + (size_t)y * cw, ow, MEMTXATTRS_UNSPECIFIED);
     }
 }
 
@@ -654,12 +655,31 @@ static size_t jpg_encode(NvtMediaState *s, uint8_t *buf, size_t room)
                                s->jpg_q, s->jpg_q + 64);
 }
 
+static uint64_t jpg_bound(NvtMediaState *s)
+{
+    uint32_t sz = *reg(s, JPG_DATA_SIZE);
+    uint64_t mcus = (uint64_t)((sz & 0x1FFF) + 1) *
+                    (((sz >> 16) & 0x1FFF) + 1);
+
+    mcus = MAX(mcus, (uint64_t)(*reg(s, JPG_MCU) & 0x3FFFFFF) + 1);
+    return mcus * 6 * 512 + 2;
+}
+
 static void jpg_done(NvtMediaState *s)
 {
     uint32_t room = *reg(s, JPG_BS_BUFLEN) & 0x1FFFFFF;
     hwaddr bs = *reg(s, JPG_BS_STADR) & 0x7FFFFFFF;
-    g_autofree uint8_t *buf = g_malloc(MAX(room, 1u));
-    size_t len = jpg_encode(s, buf, room);
+    g_autofree uint8_t *buf = NULL;
+    size_t len;
+
+    /*
+     * No more than the frame can take: a block codes in at most 27 + 63 x
+     * 26 bits (DC, then 63 AC codes of up to 16 bits plus a 10-bit
+     * value), some 205 bytes, which 0xFF stuffing at most doubles.
+     */
+    room = MIN((uint64_t)room, jpg_bound(s));
+    buf = g_malloc(MAX(room, 1u));
+    len = jpg_encode(s, buf, room);
 
     if (!len) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-media jpg: the frame does not "
@@ -885,6 +905,9 @@ static void nvt_media_reset(DeviceState *dev)
 
     timer_del(s->timer);
     memset(s->regs, 0, s->size);
+    s->frames = 0;
+    s->jpg_lut = 0;
+    memset(s->jpg_q, 0, sizeof(s->jpg_q));
     if (s->engine->reset) {
         s->engine->reset(s);
     }

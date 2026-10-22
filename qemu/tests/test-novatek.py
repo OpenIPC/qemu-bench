@@ -1653,6 +1653,32 @@ def test_pixels(qt):
     check('UV of the white bar neutral, of the blue bar blue-shifted',
           (uv[0], uv[1], uv[24] > 200), (128, 128, True))
     qt.writel(IME + 0x1C, 0xFFFFFFFF)
+    # 16-bit RAW spans the whole range, and IME reads it back as 12-bit;
+    # an odd output size (31x23) still writes every byte of its extent
+    qt.writel(SIE + 0x60, 3 << 16 | 128)            # 16 bits, 128 bytes a line
+    qt.writel(SIE + 0x00, 0x4)
+    qt.step(FRAME_NS + 1000)
+    qt.writel(SIE + 0x00, 0)
+    line = qt.read(PX_RAW, 128)
+    check('SIE writes 16-bit RAW scaled to the range: white bar 3071 << 4',
+          struct.unpack('<2H', line[:4]), (3071 << 4, 3071 << 4))
+    qt.write(PX_YUV, bytes([0xAA]) * 0x2000)
+    qt.writel(0xF0C70000 + 0x34, 128)
+    qt.writel(0xF0C70000 + 0x04, 3 << 5)            # 16 bits
+    qt.writel(IME + 0x84, 23 << 16 | 31)
+    qt.write(LL, struct.pack('<Q', 0))
+    qt.writel(IME + 0x14, LL)
+    qt.writel(IME + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    y = qt.read(PX_YUV, 32 * 23)
+    uv = qt.read(PX_YUV + 0x1000, 32 * 11)
+    check('IME from 16-bit RAW: the same Y of the bars',
+          [y[2], y[6], y[29]], [180, 161, 16])
+    check('odd output: the last column and row written, the stride gap not',
+          (y[30] != 0xAA, y[22 * 32 + 30] != 0xAA, y[31], uv[30] != 0xAA,
+           uv[31]),
+          (True, True, 0xAA, True, 0xAA))
+    qt.writel(IME + 0x1C, 0xFFFFFFFF)
     # JPEG: a 16x16 picture, the driver's quantisation via the LUT port
     pic = bytes((x * 16) & 0xFF for yy in range(16) for x in range(16))
     qt.write(PX_YUV, pic)
