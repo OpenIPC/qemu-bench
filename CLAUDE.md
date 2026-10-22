@@ -224,8 +224,11 @@ leaves it. Reboot goes through the RTC (power-on alarm, then
 power off), so the RTC node is required. The kernel has no RAM disk driver,
 so boot tests use an initramfs (`qemu-boot/test-novatek-boot.sh`), not the
 boot matrix. A `flash-file` without `-kernel` boots through a stand-in for
-the closed loader: FDT from flash 0x10000, a BCL1/LZ-packed U-Boot unpacked
+the closed loader: FDT from flash 0x10000, a BCL1 (LZ or LZMA) U-Boot unpacked
 to `nvt_memory_cfg/uboot`, and the `LD_NVT` SHMINFO U-Boot hangs without.
+Xiongmai NOR images keep the FDT inside the loader (`XMFDT562`) and U-Boot
+LZMA-packed in `partition_boot` (`lzma` property); `qemu-boot/xmimg2flash.py`
+lays out their upgrade `*.img` files.
 SDK `FW*.bin` packages become flash images with `qemu-boot/nvtpack2flash.py`.
 A 128/256 MiB `flash-file` is a W25N SPI NAND instead of a NOR (FDT then at
 0x40000). The controller's NAND mode (MODULE0 bit 19) sends status reads as

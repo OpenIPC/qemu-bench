@@ -301,11 +301,69 @@ address at 0 for the CPU to start on. The SHMINFO is what U-Boot's
 +44 (`arch/arm/include/asm/nvt-common/shm_info.h`). `boot.LdStorage` at +42
 says 3 (SPI NOR) or 2 (SPI NAND).
 
-BCL1 is Novatek's container: the FourCC, then the algorithm and the
-big-endian uncompressed and compressed sizes, then the data. Algorithm 9 is
-an LZ77 with a marker byte and 7-bit variable-length lengths and offsets
-(U-Boot's `lz_uncompress`), and it is unpacked here. Algorithm 11 is LZMA
-through a mask-ROM routine and is refused.
+BCL1 is Novatek's container, as the SDK's `build/nvt-tools/bfc` writes
+it: 16 bytes of header, then the data.
+
+| Offset | Field |
+|---|---|
+| 0 | `"BCL1"` |
+| 4 | checksum, little-endian 16-bit: makes the sum over the container's little-endian 16-bit words, each plus its index, 0 mod 65536 (`nvtpack_calc_nvt_sum`; a last odd byte is not counted) |
+| 6 | algorithm, big-endian 16-bit |
+| 8 | uncompressed size, big-endian |
+| 12 | compressed size (the data after the header), big-endian |
+
+Both algorithms the loader knows are unpacked here:
+
+- **9 (`bfc c lz`).** An LZ77 with a marker byte and 7-bit variable-length
+  lengths and offsets (U-Boot's `lz_uncompress`).
+- **11 (`bfc c lzma`).** An LZMA "alone" stream: the properties byte
+  (`0x5D`), the 32-bit dictionary size and the 64-bit unpacked size, all
+  little-endian, then the range-coded data. `bfc` fills in the size; an
+  unknown size (all ones) with an end marker unpacks too. The loader
+  passes the data after the BCL1 header, with both sizes from the header,
+  to the mask ROM's decoder (its address is the word at `0x7FD0`,
+  `rom_lzma_inflate`). U-Boot's `lzmaBuffToBuffDecompress()` takes the
+  same stream for the SDK's LZMA RTOS images. `python3 -c 'import lzma'`
+  with `format=lzma.FORMAT_ALONE` writes it, with the size field left
+  unknown.
+
+The loader's normal boot does not check the BCL1 checksum (only its
+update path does). It reads the compressed U-Boot from flash as
+`ALIGN_CEIL(compressed size, block size)` bytes from the partition's
+start, which does not count the 16-byte header: an image whose last 16
+bytes fall past that boundary loses them on silicon. The stand-in reads
+the whole partition, so it does not show that.
+
+### Xiongmai's layout
+
+Xiongmai's NT98562 / NT98566 cameras (the boards OpenIPC supports) have
+no `fdt` partition. Their loader (`loader.bin.img`, flash 0–`0x10000`)
+carries the board's device tree itself, plain, behind an `"XMFDT562"` tag
+at loader `+0x8000`. U-Boot follows the loader at `0x10000` as
+`partition_boot`, whose node has an `lzma` property: the partition is an
+LZMA "alone" stream, size unknown, with an end marker. The environment
+is at `0x30000`. With no tree at flash `0x10000` the machine looks for
+one in the loader (the first FDT there with `/nvt_memory_cfg`), takes
+`partition_boot` when there is no `partition_uboot`, and unpacks it as
+LZMA when the node says `lzma` (refusing it if it does not unpack).
+
+A Xiongmai upgrade's `*.img` files are uImages whose load address and
+entry point are the region's start and end in the flash.
+`qemu-boot/xmimg2flash.py` lays them out, optionally with raw files at
+given offsets (`FILE@OFFSET`):
+
+```bash
+python3 qemu-boot/xmimg2flash.py -o xm.bin u/loader.bin.img \
+    u/u-boot.bin.img u/u-boot.env.img u/romfs-x.squashfs.img \
+    u/user-x.squashfs.img u/web-x.squashfs.img u/custom-x.squashfs.img
+FLASH=xm.bin bash qemu-boot/run-nt98562.sh
+```
+
+With the 80N40 board's firmware (`IPC_NT98562_80N40_S38`, U-Boot 2019.04
+of December 2021) Xiongmai's U-Boot comes up, probes the W25Q64, reads
+its environment, loads `boot/uImage` from the romfs and starts it. Its
+kernel then prints nothing, and within two minutes the board resets;
+that part is not investigated.
 
 The SDK ships NVTPACK update packages, not flash dumps.
 `qemu-boot/nvtpack2flash.py FW98562A.bin nor.bin` lays one out the way the

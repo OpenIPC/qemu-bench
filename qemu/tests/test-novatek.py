@@ -2322,6 +2322,66 @@ def test_boot_rom(qemu, tmp):
     open(bad, 'wb').write(b'\xff' * (100 << 20))
     refused(bad, 'a 100 MiB image, neither NOR nor NAND, is refused')
 
+    # BCL1 algorithm 11, as "bfc c lzma" writes it: an LZMA "alone"
+    # stream with the unpacked size filled in.
+    lz = os.path.join(tmp, 'boot-lzma.bin')
+    rng = random.Random(11)
+    payload = bytes(rng.randrange(256) for _ in range(5000)) * 3
+    alone = bytearray(lzma.compress(payload, format=lzma.FORMAT_ALONE))
+    alone[5:13] = struct.pack('<Q', len(payload))
+    make_boot_image(lz, bcl=b'BCL1' + struct.pack('>III', 11, len(payload),
+                                                  len(alone)) + alone)
+    qt = QTest(qemu, 'nt98562,flash-file=' + lz)
+    try:
+        check('U-Boot unpacked from BCL1 algorithm 11 (LZMA)',
+              qt.read(0x3900000, len(payload)), payload)
+    finally:
+        qt.close()
+    alone[-200:] = bytes(200)
+    make_boot_image(bad, bcl=b'BCL1' + struct.pack('>III', 11, len(payload),
+                                                   len(alone)) + alone)
+    refused(bad, 'a BCL1 LZMA U-Boot that does not unpack is refused')
+    os.unlink(lz)
+
+    # Xiongmai's NA51089 layout: no fdt partition, the tree inside the
+    # loader behind "XMFDT562", U-Boot LZMA-packed in partition_boot.
+    xm = os.path.join(tmp, 'boot-xm.bin')
+    payload = bytes(rng.randrange(256) for _ in range(3000)) * 2
+    dtb = fdt_blob({
+        'nvt_memory_cfg': {
+            '#address-cells': cells(1), '#size-cells': cells(1),
+            'fdt': {'reg': cells(0x100000, 0x100000)},
+            'shmem': {'reg': cells(0x200000, 0x100000)},
+            'uboot': {'reg': cells(0x3900000, 0x6C0000)},
+        },
+        'nor@f0400000': {
+            'compatible': b'nvt,nvt_spinor\0',
+            '#address-cells': cells(2), '#size-cells': cells(2),
+            'partition_loader': {'reg': cells(0, 0, 0, 0x10000)},
+            'partition_boot': {'reg': cells(0, 0x10000, 0, 0x30000),
+                               'lzma': b''},
+        },
+    })
+    img = bytearray(b'\xff' * (8 << 20))
+    img[0:0x100] = bytes(rng.randrange(256) for _ in range(0x100))
+    img[0x8000:0x8008] = b'XMFDT562'
+    img[0x8008:0x8008 + len(dtb)] = dtb
+    packed = lzma.compress(payload, format=lzma.FORMAT_ALONE)
+    img[0x10000:0x10000 + len(packed)] = packed
+    open(xm, 'wb').write(img)
+    qt = QTest(qemu, 'nt98562,flash-file=' + xm)
+    try:
+        check('Xiongmai: the device tree found in the loader',
+              qt.read(0x100000, len(dtb)), dtb)
+        check('and the LZMA partition_boot unpacked as U-Boot',
+              qt.read(0x3900000, len(payload)), payload)
+    finally:
+        qt.close()
+    img[0x10000:0x10000 + len(packed)] = payload[:len(packed)]
+    open(bad, 'wb').write(img)
+    refused(bad, 'a partition marked lzma that is not LZMA is refused')
+    os.unlink(xm)
+
     nand = os.path.join(tmp, 'boot-nand.bin')
     payload, dtb = make_boot_image(nand, nand=True)
     qt = QTest(qemu, 'nt98566,flash-file=' + nand)

@@ -862,10 +862,7 @@ static uint8_t *nvt_flash_fdt(NvtFlashState *flash, uint32_t off,
         return fdt;
     }
     if (ldl_be_p(hdr) != FDT_MAGIC) {
-        error_report("novatek: no device tree at flash 0x%x: not a Novatek "
-                     "flash image (qemu-boot/nvtpack2flash.py makes one from "
-                     "an FW*.bin)", off);
-        exit(1);
+        return NULL;
     }
     *len = ldl_be_p(hdr + 4);
     if (*len < sizeof(hdr) || *len > NVT_FDT_MAX) {
@@ -875,6 +872,36 @@ static uint8_t *nvt_flash_fdt(NvtFlashState *flash, uint32_t off,
     fdt = g_malloc(*len);
     nvt_flash_read(flash, off, fdt, *len);
     return fdt;
+}
+
+/*
+ * Xiongmai's NA51089 cameras have no fdt partition: their loader carries
+ * the board's device tree itself, plain, behind an "XMFDT562" tag (at
+ * loader +0x8000 in the 80N40 / 80N50 boards' loaders), and U-Boot follows
+ * the loader at 0x10000.  So with no tree at the SDK's offset, look for one
+ * in the loader: the first FDT there with an nvt_memory_cfg node.
+ */
+static uint8_t *nvt_loader_fdt(NvtFlashState *flash, uint32_t end,
+                               uint32_t *len)
+{
+    g_autofree uint8_t *ldr = g_malloc(end);
+    uint32_t off, size;
+
+    nvt_flash_read(flash, 0, ldr, end);
+    for (off = 0; off + 0x40 <= end; off += 4) {
+        if (ldl_be_p(ldr + off) != FDT_MAGIC) {
+            continue;
+        }
+        size = ldl_be_p(ldr + off + 4);
+        if (size < 0x40 || size > end - off ||
+            fdt_check_header(ldr + off) ||
+            fdt_path_offset(ldr + off, "/nvt_memory_cfg") < 0) {
+            continue;
+        }
+        *len = size;
+        return g_memdup2(ldr + off, size);
+    }
+    return NULL;
 }
 
 static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
@@ -892,6 +919,16 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
     int nor;
 
     fdt = nvt_flash_fdt(flash, fdt_off, &fdt_len);
+    if (!fdt && !flash->nand) {
+        fdt = nvt_loader_fdt(flash, MIN(fdt_off, flash->size), &fdt_len);
+    }
+    if (!fdt) {
+        error_report("novatek: no device tree at flash 0x%x%s: not a Novatek "
+                     "flash image (qemu-boot/nvtpack2flash.py makes one from "
+                     "an FW*.bin)", fdt_off,
+                     flash->nand ? "" : " or in the loader before it");
+        exit(1);
+    }
     nor = fdt_node_offset_by_compatible(fdt, -1, flash->nand ?
                                         "nvt,nvt_spinand" : "nvt,nvt_spinor");
     if (fdt_check_header(fdt) ||
@@ -932,10 +969,9 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
         raw = ldl_be_p(part + 8);
         comp = ldl_be_p(part + 12);
 
-        if (alg != 9) {
+        if (alg != 9 && alg != 11) {
             error_report("novatek: U-Boot is BCL1 algorithm %u; only LZ (9) "
-                         "is unpacked here (11, LZMA, needs the mask ROM)",
-                         alg);
+                         "and LZMA (11) are unpacked here", alg);
             exit(1);
         }
         if (comp > ub_size - NVT_BCL1_HDR || raw > ub_max ||
@@ -945,15 +981,26 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
             exit(1);
         }
         uboot = g_malloc(raw);
-        if (!nvt_lz_uncompress(part + NVT_BCL1_HDR, comp, uboot, raw)) {
-            error_report("novatek: BCL1 U-Boot does not unpack");
+        /*
+         * Algorithm 11 is what the SDK's "bfc c lzma" writes: an LZMA
+         * "alone" stream (5 bytes of properties, the 64-bit unpacked size,
+         * then the range-coded data), which the loader hands to the mask
+         * ROM's decoder with the header's sizes.
+         */
+        if (alg == 11 ?
+            nvt_lzma_decode(part + NVT_BCL1_HDR, comp, uboot, raw) != raw :
+            !nvt_lz_uncompress(part + NVT_BCL1_HDR, comp, uboot, raw)) {
+            error_report("novatek: BCL1 U-Boot (algorithm %u) does not "
+                         "unpack to 0x%x bytes", alg, raw);
             exit(1);
         }
         ub_len = raw;
     } else {
         /*
-         * Xiongmai's NA51103 U-Boot is LZMA; anything that does not unpack
-         * as such is taken as a plain image, as before.
+         * Xiongmai's U-Boot is LZMA ("alone" format, its size often left
+         * unknown), and their NA51089 trees say so with an "lzma" property
+         * on the partition, which the loader honours.  Without it, anything
+         * that does not unpack as LZMA is taken as a plain image.
          */
         if (nvt_lzma_probe(part, ub_size)) {
             ssize_t raw;
@@ -966,6 +1013,12 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
             } else {
                 g_clear_pointer(&uboot, g_free);
             }
+        }
+        if (!uboot && fdt_getprop(fdt, fdt_path_offset(fdt, path), "lzma",
+                                  NULL)) {
+            error_report("novatek: %s is marked lzma but does not unpack "
+                         "as LZMA", path);
+            exit(1);
         }
         if (!uboot) {
             uboot = g_steal_pointer(&part);
