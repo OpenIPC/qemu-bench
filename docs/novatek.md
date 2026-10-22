@@ -77,7 +77,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | IFE / DCE / IPE / IME | `0xF0C70000` / `0xF0C20000` / `0xF0C30000` / `0xF0C40000` | 8 / 7 / 5 / 6 | `nvt-media` |
 | ISE / 2D graphics (2 engines) | `0xF0C90000` / `0xF0C80000`, `0xF0D10000` | 21 / 18, 19 | `nvt-media` |
 | H.26x / JPEG codec | `0xF0A10000` / `0xF0A00000` | 16 / 17 | `nvt-media` |
-| EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-media` |
+| EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-audio` |
 | CSI, LVDS, sensor PHY, TGE, SIF, AI | | | `nvt-media`, storage |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
@@ -642,7 +642,8 @@ storage, plus the handshakes its driver waits on. Video pixels are real
 from the sensor to JPEG (`hw/misc/nvt-pixel.c`), and the 2D graphics
 engines and the ISE scaler compute their jobs (`hw/misc/nvt-gfx.c`). The
 H.26x encoder codes real H.264 / H.265 when QEMU is built with x264 /
-x265 (`hw/misc/nvt-h26x.c`). Audio samples are still placeholders.
+x265 (`hw/misc/nvt-h26x.c`). Audio is its own device, `nvt-audio`
+(below).
 
 - **SIE (sensor capture).** While `ACT_EN` is set, a frame comes every
   1/30 s, in three steps the way the sensor's lines would arrive:
@@ -809,14 +810,41 @@ x265 (`hw/misc/nvt-h26x.c`). Audio samples are still placeholders.
 
   With no picture to read, every block is coded flat grey ("DC difference
   0, end of block").
-- **EAC.** Its two strobes clear themselves: `LOAD`, and the DC-cancel
-  initial load.
-- **DAI.** The audio DMA is double-buffered:
-  - enabling a direction latches its buffer (DMA load);
-  - each buffer then finishes at 16-bit mono 16 kHz pace, raising buffer
-    full and the next load;
-  - capture fills the buffers with silence;
-  - disabling a direction raises stop.
+- **Audio: the DAI and the EAC** are one device, `nvt-audio`
+  (`hw/misc/nvt-audio.c`), from `dai_reg.h` / `eac_reg.h` as the closed
+  `dai.o` and `Audio.o` drive them.
+
+  The DAI's five DMAs are TX1, TX2, RX1, RX2 and TXLB:
+  - buffer addresses at `0x40`..`0x50`, sizes in words at `0x60`..`0x70`,
+    and where each is now at `0x80`..`0x90`;
+  - formats at `0x10` / `0x14` / `0x18`: mode, sample size, mono in DRAM.
+
+  The address and size registers queue the next buffer:
+  - enabling a DMA takes them (DMA loaded);
+  - each buffer's end raises buffer done and takes them again, so the
+    driver re-arms the queue from its interrupt;
+  - a channel enable (`CTRL` bits 12..15) falling raises stopped, which
+    the driver waits on.
+
+  The driver spins on the current-address registers when it stops, so
+  they advance with time.
+
+  Neither block holds the sample rate. The clock tree gives the DAI 256
+  times it: PLL7 through the eacdac and DAI dividers at CG `0x38`. The
+  kernel's clock setup leaves 48 kHz. The DMAs run at that rate on the
+  virtual clock, and buffer ends land on time.
+  - **RX** captures a test tone: 1 kHz left, 1.5 kHz right, half scale
+    (`-global nvt-audio.tone-hz=`, 0 for silence). With
+    `rx-source=audiodev` it captures the host's input instead.
+  - **TX1** plays to the machine's audiodev (`-M ...,audiodev=` or
+    `-audio`), if one is given, through the EAC's DAC path:
+    - its enable;
+    - L/R averaging, which the driver sets;
+    - its digital gain, 0.5 dB steps from 0xFF.
+
+  The ADC enable and digital gain mute the capture. TX2 and TXLB move
+  their buffers but are not heard. The host's audio is a sink and a
+  source; it never paces the DMA.
 - **CSI, LVDS, the sensor PHY, TGE, SIF, the DDR arbiter.** Storage.
 
 `-global nvt-media.trace=on` logs every access to the media blocks; the
@@ -831,7 +859,7 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 69 things:
+builds them from the vendor SDK (not in CI). The run checks 75 things:
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -849,7 +877,13 @@ builds them from the vendor SDK (not in CI). The run checks 69 things:
   - scaling up and down from patterned inputs;
   - the 1 MiB DMA copy and 16-bit subtraction pass the sample's own
     comparisons;
-- `hd_audio_capture_only` captures PCM.
+- the audio samples, run with the machine's audiodev a wav file:
+  - `hd_audio_capture_only` captures the test tone, 1 kHz left and
+    1.5 kHz right;
+  - `hd_audio_output_only` (playing that capture) and
+    `hd_audio_livesound` (capture looped to playback) leave both tones
+    in the wav;
+  - `hd_audio_record`'s AAC decodes (ffmpeg) to them.
 
 None of them reports an HDAL error.
 
@@ -976,14 +1010,14 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   words are storage, and every interrupt goes to SPI 0).
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
-- Audio samples: placeholders (see HDAL media). H.26x pictures are real
+- The EAC's analog gains, ALC and filters (the capture is the tone or
+  the host's input as is), and TX2 / TXLB output. H.26x pictures are real
   only with x264 / x265 built in, and tiled streams are intra only. The
   IPP applies no DCE / IPE corrections and only IME output path 1,
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
-  ignores the sensor's real timing (fixed 30 fps), and the DAI paces audio
-  at a nominal rate. AI/CNN, MD, DIS, VPE, IVE and the display path are
+  ignores the sensor's real timing (fixed 30 fps). AI/CNN, MD, DIS, VPE, IVE and the display path are
   not wired.
 
 ## NT98332 (NA51103)

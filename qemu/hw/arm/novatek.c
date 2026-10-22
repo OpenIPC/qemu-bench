@@ -58,6 +58,8 @@
 #define NVT_USB_BASE        0xF0600000
 #define NVT_OTP_BASE        0xF0660000
 #define NVT_PWM_BASE        0xF0210000
+#define NVT_DAI_BASE        0xF0630000
+#define NVT_EAC_BASE        0xF0640000
 #define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */
 #define NVT_MPCORE_BASE     0xFFD00000
 #define NVT_L2_BASE         0xFFE00000
@@ -67,6 +69,7 @@
 #define NVT_IRQ_USB         27
 #define NVT_IRQ_PWM         26
 #define NVT_IRQ_TIMER       0
+#define NVT_IRQ_DAI         15
 #define NVT_IRQ_ARB         33
 #define NVT_ARB2_BASE       0xF0FE0000
 #define NVT_IRQ_FLASH       29
@@ -1061,6 +1064,9 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
                 g_free(engine);
                 engine = e;
             }
+            if (!strcmp(engine, "eac") || !strcmp(engine, "dai")) {
+                continue;               /* nvt-audio, below */
+            }
             dev = qdev_new("nvt-media");
             qdev_prop_set_string(dev, "engine", engine);
             qdev_prop_set_uint32(dev, "size", nvt_media[n].win[w].size);
@@ -1079,6 +1085,22 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
             }
         }
     }
+    /*
+     * Audio: the DAI and the EAC, one device; its rate comes from the CG,
+     * and with -audiodev / -audio (the machine's audiodev) it plays and,
+     * if asked to, captures through the host.
+     */
+    dev = qdev_new("nvt-audio");
+    object_property_set_link(OBJECT(dev), "cg", OBJECT(cg), &error_fatal);
+    if (machine->audiodev) {
+        qdev_prop_set_string(dev, "audiodev", machine->audiodev);
+    }
+    object_property_add_child(OBJECT(machine), "audio", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NVT_DAI_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, NVT_EAC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_DAI]);
+
     dev = qdev_new("nvt-media");
     qdev_prop_set_string(dev, "engine", "arb2");
     qdev_prop_set_uint32(dev, "size", 0x300);
@@ -1284,6 +1306,7 @@ static void nvt_machine_class_init(ObjectClass *oc, const void *data)
         nvt_machine_get_sensor, nvt_machine_set_sensor);
     object_class_property_set_description(oc, "sensor",
         "Image sensor on I2C 0 (none, sc401ai, sc501ai); default none");
+    machine_add_audiodev_property(mc);
 }
 
 static const TypeInfo nvt_machine_info = {

@@ -25,12 +25,18 @@
 #     rectangles, job lists, YUV420 3P -> 2P and 3P scaling, from inputs
 #     patterned here, leave the pixels the engines should compute; the DMA
 #     copy and 16-bit arithmetic pass the sample's own comparisons;
-#   - hd_audio_capture_only: PCM captured through EAC and the DAI DMA.
+#   - hd_audio_capture_only: the test tone captured through the EAC and
+#     the DAI DMA, 1 kHz left and 1.5 kHz right (checked on the host);
+#   - hd_audio_output_only and hd_audio_livesound: the capture played
+#     back, to the machine's audiodev, a wav file here, where both tones
+#     must be;
+#   - hd_audio_record: AAC of the tone, which ffmpeg decodes to it.
 #
 # The SIE captures a moving test pattern; the IPP turns its RAW into YUV and
 # the JPEG codec encodes it, so the snapshots show colour bars, a grey ramp
 # and a white box that moves between them (checked with Python PIL).  Audio
-# is still a placeholder (docs/novatek.md).  Sample keys go in on stdin.
+# is a test tone or the host's (docs/novatek.md).  Sample keys go in on
+# stdin.
 #
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
 #       [--samples DIR] [--dir qemu-boot] [--qemu ./qemu-src/build/qemu-system-arm]
@@ -174,6 +180,7 @@ run() {         # run <sample> [keys]: the keys 4 s apart, then q ($ARGS)
     RC=$?
     ERRS=$(grep -c -i 'err\|fail' /tmp/$n.out)
     echo "NVT-HDAL-RUN: $n${ARGS:+ $ARGS} rc=$RC errors=$ERRS"
+    grep -i 'err\|fail' /tmp/$n.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
 }
 size() {
     [ -f "$1" ] && wc -c < "$1" || echo 0
@@ -240,13 +247,26 @@ done
 rm -f /mnt/sd/*
 run hd_audio_capture_only
 echo "NVT-HDAL-AUDIO-BYTES: $(size /mnt/sd/audio_bs_16_2_48000_pcm.dat)"
+echo "NVT-HDAL-PCM-B64-BEGIN"
+head -c 384000 /mnt/sd/audio_bs_16_2_48000_pcm.dat | base64
+echo "NVT-HDAL-PCM-B64-END"
+# capture_only's file, played to the machine's audiodev (a wav file here)
+run hd_audio_output_only
+run hd_audio_livesound
+rm -f /mnt/sd/*
+run hd_audio_record             # AAC
+echo "NVT-HDAL-AAC-BYTES: $(size /mnt/sd/dump_bs_16_2_48000_aac.dat)"
+echo "NVT-HDAL-AAC-B64-BEGIN"
+head -c 200000 /mnt/sd/dump_bs_16_2_48000_aac.dat | base64
+echo "NVT-HDAL-AAC-B64-END"
 SMP
 
 (cd "$WORK/initramfs" && find . | cpio -o -H newc 2>/dev/null) > "$WORK/initramfs.cpio"
 
 echo "Booting $KERNEL on -M $MACHINE,sensor=$SENSOR${SAMPLES:+, with the HDAL samples}"
 set +e
-timeout 900 "$QEMU" -M "$MACHINE,sensor=$SENSOR,flash-file=$WORK/nor.bin" \
+timeout 900 "$QEMU" -M "$MACHINE,sensor=$SENSOR,flash-file=$WORK/nor.bin,audiodev=snd0" \
+    -audiodev "wav,id=snd0,path=$WORK/out.wav" \
     -kernel "$KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
     -drive "if=sd,index=0,format=raw,file=$WORK/sd.img" \
@@ -282,7 +302,8 @@ expect 'NVT-HDAL-OK' 'PID 1 ran to the end'
 if [ -n "$SAMPLES" ]; then
     for s in hd_video_record hd_video_snapshot hd_video_capture_only \
              "hd_video_encode_only 0" "hd_video_encode_only 1" \
-             hd_audio_capture_only; do
+             hd_audio_capture_only hd_audio_output_only hd_audio_livesound \
+             hd_audio_record; do
         expect "NVT-HDAL-RUN: $s rc=0 errors=0" "$s runs without an HDAL error"
     done
     if grep -a -q 'NVT-HDAL-RECORD-BYTES: [1-9]' "$WORK/console.log"; then
@@ -472,6 +493,68 @@ PY
         pass "hd_audio_capture_only captures PCM"
     else
         bad "hd_audio_capture_only captures PCM"
+    fi
+    # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what
+    # output_only and livesound played to the wav audiodev, and the AAC
+    # record encoded from it, each measured on the host
+    for b in PCM AAC; do
+        sed -n "/NVT-HDAL-$b-B64-BEGIN/,/NVT-HDAL-$b-B64-END/p" \
+            "$WORK/console.log" | grep -a -v 'NVT-HDAL' | tr -d '\r' |
+            base64 -d > "$WORK/audio.$b" 2>/dev/null || true
+    done
+    if command -v ffmpeg >/dev/null; then
+        ffmpeg -v error -f aac -i "$WORK/audio.AAC" -f s16le -ac 2 \
+            -ar 48000 "$WORK/aac.pcm" > /dev/null 2>&1 || true
+    fi
+    tones=$(python3 - "$WORK" <<'PY' 2>/dev/null || true
+import math, os, struct, sys
+w = sys.argv[1]
+def pcm(path, skip=0):
+    try:
+        d = open(path, 'rb').read()[skip:]
+    except OSError:
+        return [], []
+    v = struct.unpack('<%dh' % (len(d) // 4 * 2), d[:len(d) // 4 * 4])
+    return v[0::2], v[1::2]
+def power(x, f, rate):          # Goertzel
+    c = 2 * math.cos(2 * math.pi * f / rate)
+    s1 = s2 = 0.0
+    for v in x:
+        s1, s2 = v + c * s1 - s2, s1
+    return s1 * s1 + s2 * s2 - c * s1 * s2
+def tone(x, f, rate=48000):     # f dominant in the loudest 0.1 s
+    x = list(x)
+    n = rate // 10
+    if len(x) < 2 * n:
+        return 0
+    best = max(range(0, len(x) - n, n // 2),
+               key=lambda i: sum(abs(v) for v in x[i:i + n:8]))
+    x = x[best:best + n]
+    p = power(x, f, rate)
+    others = [power(x, g, rate) for g in (300, 700, 2500, 4000)]
+    return int(p > 100 * max(others) and max(abs(v) for v in x) > 300)
+l, r = pcm(w + '/audio.PCM')
+cap = tone(l, 1000) and tone(r, 1500) and max(l) > 15000
+o, _ = pcm(w + '/out.wav', 44)
+try:                            # the backend's rate, not the guest's
+    wr = struct.unpack('<I', open(w + '/out.wav', 'rb').read()[24:28])[0]
+except (OSError, struct.error):
+    wr = 48000
+out = tone(o, 1000, wr) and tone(o, 1500, wr)
+a, b = pcm(w + '/aac.pcm')
+aac = tone(a, 1000) and tone(b, 1500)
+print('capture=%d played=%d aac=%d' % (cap, out, aac))
+PY
+)
+    case "$tones" in *capture=1*) pass "hd_audio_capture_only captures the test tone: 1 kHz left, 1.5 kHz right";;
+        *) bad "hd_audio_capture_only captures the test tone ($tones)";; esac
+    case "$tones" in *played=1*) pass "output_only / livesound play it to the audiodev (wav)";;
+        *) bad "output_only / livesound play it to the audiodev ($tones)";; esac
+    if command -v ffmpeg >/dev/null; then
+        case "$tones" in *aac=1*) pass "hd_audio_record's AAC decodes to the tone";;
+            *) bad "hd_audio_record's AAC decodes to the tone ($tones)";; esac
+    else
+        echo "SKIP: decoding hd_audio_record's AAC (no ffmpeg)"
     fi
 fi
 if [ $rc -ne 0 ]; then
