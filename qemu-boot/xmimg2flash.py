@@ -43,6 +43,9 @@ def piece(arg):
         sys.exit(f"{arg}: not a uImage; give raw files as FILE@OFFSET")
     size, load, ep = struct.unpack(">III", blob[12:24])
     name = blob[32:64].split(b"\0")[0].decode(errors="replace")
+    if len(blob) < 64 + size:
+        sys.exit(f"{arg}: truncated: the header says {size:#x} bytes, "
+                 f"the file holds {len(blob) - 64:#x}")
     data = blob[64:64 + size]
     if ep and ep > load and len(data) > ep - load:
         sys.exit(f"{arg}: {len(data):#x} bytes do not fit "
