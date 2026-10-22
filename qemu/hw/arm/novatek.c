@@ -172,10 +172,11 @@ static const struct {
       { { 0xF0C00000, 0x900, 1 }, { 0xF0D20000, 0x900, 2 },
         { 0xF0D30000, 0x900, 3 } } },
     { "tge@f0cc0000",     "nvt,kdrv_tge",  { { 0xF0CC0000, 0x150, 22 } } },
-    { "ime@f0c40000",     "nvt,kdrv_ime",  { { 0xF0C40000, 0x1000, 6 } } },
     { "ise@f0c90000",     "nvt,kdrv_ise",  { { 0xF0C90000, 0x100, 21 } } },
     { "ipe@f0c30000",     "nvt,kdrv_ipe",  { { 0xF0C30000, 0x900, 5 } } },
+    /* IFE before IME: IME finishes the frames IFE is pointed at */
     { "ife@f0c70000",     "nvt,kdrv_ife",  { { 0xF0C70000, 0x800, 8 } } },
+    { "ime@f0c40000",     "nvt,kdrv_ime",  { { 0xF0C40000, 0x1000, 6 } } },
     { "dce@f0c20000",     "nvt,kdrv_dce",  { { 0xF0C20000, 0x650, 7 } } },
     { "ai@f0c60000",      "nvt,kdrv_ai",
       { { 0xF0C60000, 0x23C, 14 }, { 0xF0D50000, 0x114, 13 },
@@ -969,7 +970,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     static struct arm_boot_info binfo;
     MemoryRegion *sysmem = get_system_memory();
     qemu_irq pic[NVT_NUM_IRQ - 32];
-    DeviceState *mp, *dev, *flash, *cg, *gpio;
+    DeviceState *mp, *dev, *flash, *cg, *gpio, *ife = NULL;
     I2CBus *i2c0 = NULL;
     SysBusDevice *mpbus;
     Object *cpuobj;
@@ -1063,6 +1064,12 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
             dev = qdev_new("nvt-media");
             qdev_prop_set_string(dev, "engine", engine);
             qdev_prop_set_uint32(dev, "size", nvt_media[n].win[w].size);
+            if (!strcmp(engine, "ife")) {
+                ife = dev;
+            } else if (!strcmp(engine, "ime")) {
+                object_property_set_link(OBJECT(dev), "ipp-input",
+                                         OBJECT(ife), &error_fatal);
+            }
             object_property_add_child(OBJECT(machine), engine, OBJECT(dev));
             sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvt_media[n].win[w].base);

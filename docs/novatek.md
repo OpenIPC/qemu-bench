@@ -638,9 +638,9 @@ They bind by device tree, so the machine generates the vendor nodes
   open with "cannot find pll for MCLK".
 
 Every engine is an `nvt-media` block (`hw/misc/nvt-media.c`): register
-storage, plus the handshakes its driver waits on. No pixels, samples or
-bitstreams move: the engines accept their setup and report each job
-done, and their outputs are placeholders.
+storage, plus the handshakes its driver waits on. Video pixels are real
+from the sensor to JPEG (`hw/misc/nvt-pixel.c`). The H.26x bitstream, the
+graphics engines' results and audio samples are still placeholders.
 
 - **SIE (sensor capture).** While `ACT_EN` is set, a frame comes every
   1/30 s, in three steps the way the sensor's lines would arrive:
@@ -651,6 +651,14 @@ done, and their outputs are placeholders.
   An output in single mode clears its enable (`0xA4` bits 28..30) once
   its frame is written. That is how `ctl_sie` knows a buffer is complete
   and hands it on.
+
+  At each frame end the SIE writes the sensor's picture to DRAM output 0
+  (address `0x5C`, line offset `0x60` [15:2]), at the crop size (`0x2C`),
+  packed as `0x60` [17:16] says (8, 10, 12 or 16 bits, a little-endian
+  bit stream). The picture is a test pattern, as RGGB Bayer:
+  - 75 % colour bars over the top two thirds;
+  - a grey ramp below;
+  - a white box that moves 24 pixels a frame.
 - **IFE, DCE, IPE, IME, ISE, 2D graphics.** `kdrv_ipp` and the graphics
   driver work in linked-list mode: a list of 64-bit commands in DRAM
   (`kdrv_ipp_int_util.h`, `grph_ll.h`). The engine applies each UPD
@@ -659,14 +667,35 @@ done, and their outputs are placeholders.
   job is done: some 1 ms later it raises frame and job end, plus list end
   after the last. The graphics engine raises list end only. `graph_isr`
   reports DMA idle as an abort.
+
+  When IME finishes a job, the RAW frame the IFE was pointed at becomes
+  YUV 4:2:0 semi-planar at IME output path 1:
+  - IFE input: address `0x30`, line offset `0x34`, size `0x20`, depth
+    CTRL1 [6:5];
+  - IME path 1: enable `0x04` bit 2, size `0x84`, Y and UV at `0x94` and
+    `0x98`, line offsets `0x8C` and `0x90`;
+  - the conversion: 2x2 demosaic, BT.601 limited range, nearest-neighbour
+    scaling to the output size.
+
+  The machine links IME to IFE (`ipp-input`). DCE's and IPE's corrections
+  are not applied.
 - **H.26x.** `INT_FLAG` is write-1-to-clear, and software reset and DMA
   disable set their finish flags. A picture finishes with:
   - a filler NAL unit (H.265 FD_NUT) in the bitstream buffer;
   - its length in `BS_LEN` (report slot 6) and the NAL length list.
-- **JPEG.** A frame "encodes" as a flat grey picture of the right size:
-  every block is "DC difference 0, end of block" in the standard Annex K
-  Huffman codes, four bytes per 4:2:0 MCU, then EOI. With the driver's
-  header that is a valid JPEG.
+- **JPEG.** A baseline encoder (float DCT, the standard Annex K Huffman
+  tables) reads the 4:2:0 picture:
+  - Y and UV at `0x54` and `0x58`, line offsets at `0x60` and `0x64`;
+  - MCU columns and rows at `0x28`;
+  - each of these is stored minus one.
+
+  It quantises with the tables the driver loads through the LUT port:
+  table 1 holds the luma then the chroma table, zig-zag order, four bytes
+  per word. The Huffman tables match the DHT in the driver's own header
+  byte for byte. The scan ends in EOI after the software's header.
+
+  With no picture to read, every block is coded flat grey ("DC difference
+  0, end of block").
 - **EAC.** Its two strobes clear themselves: `LOAD`, and the DC-cancel
   initial load.
 - **DAI.** The audio DMA is double-buffered:
@@ -709,6 +738,10 @@ and run under its runtime, which the builder bundles.
 The SDK's sensor samples name an IMX290 or use 1920x1080 buffers; the
 builder sets them to the SC501AI's 2880x1620 mode, the only one its
 driver offers.
+
+With Python PIL, the run also checks the snapshots' content: the eight
+colour bars, the ramp from dark to light, and the box moving between the
+two snapshots. That makes 51 checks.
 
 `test-novatek.py` checks each engine's handshake at register level, in CI.
 
@@ -818,8 +851,9 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   words are storage, and every interrupt goes to SPI 0).
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
-- The HDAL engines' pixel, sample and bitstream work: frames, encoded
-  pictures and audio are placeholders (see HDAL media). The graphics
+- The H.26x bitstream, the graphics engines' results and audio samples:
+  placeholders (see HDAL media). The IPP applies no DCE / IPE corrections
+  and only IME output path 1, and the sensor is a test pattern. The graphics
   samples that check their output (DMA copy, arithmetic) fail. The SIE
   ignores the sensor's real timing (fixed 30 fps), and the DAI paces audio
   at a nominal rate. AI/CNN, MD, DIS, VPE, IVE and the display path are

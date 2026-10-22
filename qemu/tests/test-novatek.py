@@ -1566,7 +1566,7 @@ def test_media(qt):
     qt.writel(JPG + 0x00, 0x8)
     check('JPEG: reset clears itself, DMA idle reads set',
           qt.readl(JPG + 0x00), 0x20)
-    qt.writel(JPG + 0x2C, 4)
+    qt.writel(JPG + 0x2C, 3)                        # four MCUs, minus one
     qt.writel(JPG + 0x40, DST)
     qt.writel(JPG + 0x44, 0x1000)
     qt.writel(JPG + 0x18, 1)
@@ -1575,7 +1575,8 @@ def test_media(qt):
     check('frame end, SPI 17, act dropped',
           (qt.readl(JPG + 0x1C), gic_pending(qt, 17),
            qt.readl(JPG + 0x00) & 1), (1, True, 0))
-    check('the scan: DC 0 / EOB per block, 4 bytes per MCU, then EOI',
+    check('no picture to read: flat grey, DC 0 / EOB per block, 4 bytes '
+          'per MCU, then EOI',
           (qt.readl(JPG + 0x4C), qt.read(DST, 18).hex()),
           (18, '28a28a00' * 4 + 'ffd9'))
     qt.writel(JPG + 0x1C, 1)
@@ -1603,6 +1604,111 @@ def test_media(qt):
     qt.writel(DAI + 0x28, 0xFFFFFFFF)
     qt.writel(DAI + 0x00, 0x1)
     check('RX DMA off: stop', qt.readl(DAI + 0x28), 0x400)
+
+
+PX_RAW, PX_YUV = 0x01200000, 0x01400000
+
+
+def test_pixels(qt):
+    print('nvt-media pixels')
+    # SIE: the test pattern, RGGB, 12-bit packed, at DRAM output 0
+    w, h = 64, 48
+    qt.writel(SIE + 0x2C, h << 16 | w)
+    qt.writel(SIE + 0x5C, PX_RAW)
+    qt.writel(SIE + 0x60, 2 << 16 | 96)             # 12 bits, 96 bytes a line
+    qt.writel(SIE + 0x00, 0x4)
+    qt.step(FRAME_NS + 1000)
+    qt.writel(SIE + 0x00, 0)
+    def raw12(line, x):
+        b = 3 * (x // 2)
+        v = line[b] | line[b + 1] << 8 | line[b + 2] << 16
+        return v >> (12 * (x & 1)) & 0xFFF
+
+    line = qt.read(PX_RAW, 96)
+    check('SIE writes packed 12-bit RAW: the white bar, R G R G',
+          [raw12(line, x) for x in range(4)], [3071] * 4)
+    line = qt.read(PX_RAW + 96, 96)
+    check('line 1 is G B: G in the white bar, B in the blue bar (x 49), '
+          'none in the red (x 41)',
+          (raw12(line, 0), raw12(line, 49), raw12(line, 41)), (3071, 3071, 0))
+    # IME: that RAW through IFE / IME to YUV 4:2:0, 32x24 (scaled by half)
+    qt.writel(0xF0C70000 + 0x20, h << 16 | w)       # IFE input
+    qt.writel(0xF0C70000 + 0x30, PX_RAW)
+    qt.writel(0xF0C70000 + 0x34, 96)
+    qt.writel(0xF0C70000 + 0x04, 2 << 5)            # 12 bits
+    qt.writel(IME + 0x04, 1 << 2)                   # path 1
+    qt.writel(IME + 0x84, 24 << 16 | 32)
+    qt.writel(IME + 0x94, PX_YUV)
+    qt.writel(IME + 0x98, PX_YUV + 0x1000)
+    qt.writel(IME + 0x8C, 32)
+    qt.writel(IME + 0x90, 32)
+    qt.write(LL, struct.pack('<Q', 0))
+    qt.writel(IME + 0x14, LL)
+    qt.writel(IME + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    y = qt.read(PX_YUV, 32)
+    uv = qt.read(PX_YUV + 0x1000, 32)
+    check('IME path 1: Y of the bars, white to black (BT.601, limited)',
+          [y[2], y[6], y[30]], [180, 161, 16])
+    check('UV of the white bar neutral, of the blue bar blue-shifted',
+          (uv[0], uv[1], uv[24] > 200), (128, 128, True))
+    qt.writel(IME + 0x1C, 0xFFFFFFFF)
+    # JPEG: a 16x16 picture, the driver's quantisation via the LUT port
+    pic = bytes((x * 16) & 0xFF for yy in range(16) for x in range(16))
+    qt.write(PX_YUV, pic)
+    qt.write(PX_YUV + 0x1000, bytes([128]) * 128)
+    qt.writel(JPG + 0x10, 1 << 12 | 1 << 16)        # table 1, auto-increment
+    for i in range(32):
+        qt.writel(JPG + 0x14, 0x01010101)           # all ones: lossless-ish
+    qt.writel(JPG + 0x28, 0)                        # one MCU
+    qt.writel(JPG + 0x54, PX_YUV)
+    qt.writel(JPG + 0x58, PX_YUV + 0x1000)
+    qt.writel(JPG + 0x60, 15)
+    qt.writel(JPG + 0x64, 15)
+    qt.writel(JPG + 0x40, DST)
+    qt.writel(JPG + 0x44, 0x1000)
+    qt.writel(JPG + 0x00, 1)
+    qt.step(1000 * 1000)
+    n = qt.readl(JPG + 0x4C)
+    scan = qt.read(DST, n)
+    check('JPEG of a real picture: a scan ending in EOI', scan[-2:].hex(),
+          'ffd9')
+    try:
+        from PIL import Image
+        import io
+        hdr = bytearray(b'\xff\xd8')
+        hdr += b'\xff\xdb\x00\x84\x00' + bytes([1] * 64) + b'\x01' + \
+            bytes([1] * 64)
+        hdr += b'\xff\xc0\x00\x11\x08\x00\x10\x00\x10\x03' + \
+            b'\x01\x22\x00\x02\x11\x01\x03\x11\x01'
+        hdr += jpeg_std_dht()
+        hdr += b'\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00'
+        im = Image.open(io.BytesIO(bytes(hdr) + scan)).convert('L')
+        got = [im.getpixel((x, 8)) for x in (0, 7, 15)]
+        check('decodes (PIL) to the picture: the ramp, within 2',
+              all(abs(g - e) <= 2 for g, e in zip(got, (0, 112, 240))), True)
+    except ImportError:
+        print('  SKIP: decoding the JPEG (no Python PIL)')
+    qt.writel(JPG + 0x1C, 1)
+
+
+def jpeg_std_dht():
+    """The Annex K Huffman tables, as the driver's JPEG header has them."""
+    return bytes.fromhex(
+        'ffc401a20000010501010101010100000000000000000102030405060708090a'
+        '0b100002010303020403050504040000017d0102030004110512213141061351'
+        '6107227114328191a1082342b1c11552d1f02433627282090a161718191a2526'
+        '2728292a3435363738393a434445464748494a535455565758595a6364656667'
+        '68696a737475767778797a838485868788898a92939495969798999aa2a3a4a5'
+        'a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9da'
+        'e1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa010003010101010101010101'
+        '0000000000000102030405060708090a0b110002010204040304070504040001'
+        '0277000102031104052131061241510761711322328108144291a1b1c1092333'
+        '52f0156272d10a162434e125f11718191a262728292a35363738393a43444546'
+        '4748494a535455565758595a636465666768696a737475767778797a82838485'
+        '868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9ba'
+        'c2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6'
+        'f7f8f9fa')
 
 
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
@@ -2329,6 +2435,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_media(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_pixels(qt)
     finally:
         qt.close()
 
