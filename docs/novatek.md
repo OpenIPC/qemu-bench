@@ -80,7 +80,8 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-audio` |
 | IDE (display engine) | `0xF0800000` | 48 | `nvt-ide`, on QEMU's console |
 | MIPI DSI | `0xF0840000` | 50 | `nvt-dsi` |
-| CSI, LVDS, sensor PHY, TGE, SIF, AI | | | `nvt-media`, storage |
+| AI: NUE / NUE2 / CNN | `0xF0C60000` / `0xF0D50000` / `0xF0CB0000` | 14 / 13 / 11 | `nvt-media`, `nvt-ai` |
+| CSI, LVDS, sensor PHY, TGE, SIF | | | `nvt-media`, storage |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
 | PL310 | `0xFFE00000` | 96 | `l2x0` |
@@ -862,7 +863,7 @@ and units bound.
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
 builds them from the vendor SDK (not in CI). The run checks 75 things
-(88 with `--display-kos`, below):
+(106 with `--kmods`, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -890,6 +891,8 @@ builds them from the vendor SDK (not in CI). The run checks 75 things
 - with the display modules, `hd_video_output_only` (colour bars from a
   file) and `hd_video_liveview` (the sensor) put their pictures on the
   panel: QEMU's screendump of each, taken half way, shows the bars.
+- with the AI modules, `ai_op`'s five operators give the results
+  [AI engines](#ai-engines) lists.
 
 None of them reports an HDAL error.
 
@@ -909,6 +912,121 @@ colour bars, the ramp from dark to light, and the box moving between the
 two snapshots.
 
 `test-novatek.py` checks each engine's handshake at register level, in CI.
+
+## AI engines
+
+`kdrv_ai` drives three engines, named by the `ai@f0c60000` node's three
+windows in this order:
+
+| engine | window | SPI | does |
+|---|---|---|---|
+| NUE | `0xF0C60000` | 14 | vector layers: fully connected, SVM, ROI pooling, softmax |
+| NUE2 | `0xF0D50000` | 13 | preprocessing: YUV to RGB, scaling, mean subtraction |
+| CNN | `0xF0CB0000` | 11 | convolution, batch norm, activation, pooling, element-wise |
+
+Their registers are in `cnn_reg.h`, `nue_reg.h` and `nue2_reg.h`. The
+SDK's rtos tree has `kdrv_ai` as C source, and the Linux tree has it as
+objects. Its `clock-frequency` has one cell an engine, 600, 480 and
+600 MHz. The tree's CNN window is `0x22C` long, one register short of
+the checksum counter at `0x22C` that the driver reads, so the generated
+one is `0x230`.
+
+All three are `nvt-media` IPP-style engines:
+- CTRL bit 0 resets.
+- Bit 1 runs a job set up in the registers. Its done is status bit 0.
+- Bit 28 fires a DRAM linked list. Its status bits are job end 10, list
+  end 8 and broken list 9.
+- Interrupt enables and status are NUE `0x38`/`0x3C`, NUE2 `0x3C`/`0x40`
+  and CNN `0x08`/`0x0C`, write 1 to clear.
+- Lists start at NUE `0x024`, NUE2 `0x014` and CNN `0x040`.
+- The DMA-disable registers (`0x1AC`, `0x098`, `0x1FC`) read idle in
+  bit 15, which the driver polls.
+
+The AI lists add two bits to the IPP's update command:
+- **Bit 59** adds the list base register (NUE `0x1CC`, NUE2 `0x09C`,
+  CNN `0x204`) to the update's value. A list's addresses are relative to
+  it, so the same list can run on another buffer.
+- **Bit 60** marks the job's last update. The engine runs the job, then
+  carries on with the next command, so one list holds a whole network,
+  a layer a job. There is no job-end command between them.
+
+`hw/misc/nvt-ai.c` does the work of a job:
+
+- **NUE, fully connected** (`kdrv_ai_tran_nue_fc_parm`): mode 0 (SVM)
+  with kernel 1 in dot mode, output path 1 or 3. The inputs (`0x00C`)
+  and weight rows (`0x014`) are 8 or 16 bits, signed or not. The weight
+  row length is at `0x040` [13:0], the rows [28:16], the input vectors at
+  `0x048`. Each output is an s32 at `0x02C`:
+
+      out[o][j] = ((sum_k ((x[o][k] * 256 * w[j][k]) >> fshift)) * gain
+                   >> gshift) + offset
+
+  where gain and its shift are at `0x04C`, and the offset (21 bits,
+  signed) and fshift, the SDK's weight shift, at `0x050`. fshift
+  applies to each product before the sum. The x 256 is the 8 fraction bits 8-bit
+  data carries through the datapath. `vendor_ai_op` asks for a total
+  shift 8 more than the fractions add up to, and `kdrv_ai_fc_done`
+  shifts 8-bit results by 8 more than 16-bit ones. 16-bit data has no
+  x 256.
+- **NUE2, preprocessing** (the 528 register layout NA51089 uses). FUNC
+  `0x004` bit 0 turns on YUV to RGB, bit 1 the mean subtraction, bits
+  [13:12] pick the input (0 NV12, 3 RGB planes), and bit 14 makes the
+  output signed. The pipeline is:
+  1. YUV to RGB, full-range BT.601 with chroma replicated;
+  2. bilinear scaling from `0x044` to `0x058`, corners to corners. The
+     step `kdrv` programs is (in − 1) / (out − 1);
+  3. the mean subtraction: a DC mean a channel (`0x060`), or planar
+     (`0x010`, R G B bytes a pixel, its size at `0x05C`, replicated by
+     `0x060` [25:24]);
+  4. the scale-shift at `0x07C`;
+  5. a clamp to the output's range.
+
+  The outputs go to `0x018..` with line offsets at `0x030..`.
+
+Nothing in the SDK fixes NUE2's colour matrix or its rounding, or the
+NUE's rounding (a floor here). The other NUE modes and kernels (bias,
+ReLU, RBF, ROI pooling, softmax) and NUE2's pad, HSV and rotation log as
+unimplemented. The CNN completes its jobs and lists but computes
+nothing.
+
+**Modules.** As with the display, the OpenIPC release leaves the AI
+modules out and its toolchain has them (`sdk/kmod/hdal`). The SDK's init
+loads them in this order:
+1. `kdrv_ai ai_net_supported_num=2`;
+2. `kflow_cnn`, `kflow_nue` and `kflow_nue2`;
+3. `kflow_cpu` and `kflow_dsp`;
+4. `kflow_ai_net`.
+
+**Samples.** `ai_op` (`samples/ai_op`) runs single operators through
+`vendor_ai`:
+- operator 0 is a fully connected layer on the NUE;
+- operators 1..4 are NUE2's preprocessing of a 512x376 NV12 picture,
+  which the builder copies from the SDK's `ai_pattern`.
+
+**Networks.** `ai_net` and the other network samples do not run, on
+QEMU or on silicon: no model in the SDK is built for this chip. Every
+model has chip id 1 (`NN_CHIP_CNN25_A`, the NT98520 / NA51055; see
+`nn_verinfo.h`). The release's `kflow_ai_net` accepts only id 4 on chip
+`0x7021`, and refuses the model before it touches an engine:
+
+    nvt_ai_chk_vers() chip(0x00007021) not support id(0x00000001)
+
+**Tests.** `test-novatek-hdal.sh --kmods DIR` loads the AI modules and
+checks that they load and `kdrv_ai` binds the engines. CI runs this.
+With `--samples` too, it runs `ai_op`'s five operators and checks them:
+- operator 0's 10240 outputs are each 4480, which is
+  sum_k (k & 7)² over the sample's inputs and weights;
+- operator 2 is 384x282 R, G and B planes;
+- operators 3 and 4 equal operator 1's 512x376 planes less the planar
+  mean (128) and the DC means (128, 127, 126);
+- operator 1's channels are the test picture's colours.
+
+`test-novatek.py` checks, at register level:
+- the idle bits;
+- a fully connected job;
+- an NV12 picture scaled and mean-subtracted;
+- a CNN list of two jobs fired by bit-60 updates, one value based by
+  bit 59, whose list end runs neither job again.
 
 ## Display
 
@@ -988,7 +1106,7 @@ The picture is still the IDE's, which with device 0xD (DSI) is scanned
 out 1:1, at the panel's size. `-global nvt-dsi.trace=on` logs the
 panel's low-power packets.
 
-`test-novatek-hdal.sh --display-kos DIR` loads the modules and checks
+`test-novatek-hdal.sh --kmods DIR` loads the modules and checks
 that the IDE, dispobj and dispdev bind and the panel driver comes up.
 CI runs this, with the kmods extracted from the toolchain. With
 `--samples`, `hd_video_output_only` and `hd_video_liveview` run too, and
@@ -1111,8 +1229,13 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
-  ignores the sensor's real timing (fixed 30 fps). AI/CNN, MD, DIS, VPE and IVE
+  ignores the sensor's real timing (fixed 30 fps). MD, DIS, VPE and IVE
   are not wired.
+- AI: the CNN engine's layers (it completes its jobs and lists but
+  computes nothing), NUE modes other than fully connected (bias, ReLU,
+  RBF and the other kernels, ROI pooling, softmax), and NUE2's pad, HSV
+  and rotation. The SDK's models are built for the NT98520 and do not
+  load on this chip, so no network runs end to end.
 - Display: DSI reads (bus turnaround returns no bytes), the IDE's 1/2/4-bit
   palettes and ARGB8565 / 4565, its colour pipeline (gamma, CST), face
   boxes and lines, and `/dev/fb0`. The release kernel has no

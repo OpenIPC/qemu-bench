@@ -5,7 +5,8 @@
 # the media engines through the HDAL: capture -> video process -> encode
 # (hd_video_record), JPEG snapshots, capture alone, encoding frames from
 # a file, the 2D graphics engine, the display (a file, and the sensor
-# live), audio capture, playback, live loopback and AAC recording.  They are vendor code, as
+# live), audio capture, playback, live loopback and AAC recording, and the
+# AI engines' operators (ai_op).  They are vendor code, as
 # is the SDK, so neither is in the repository or in CI.
 #
 # They run against the OpenIPC release's own libhdal.so, the library
@@ -61,8 +62,9 @@ mkdir -p "$OUT/smp" "$OUT/uc"
 
 # The runtime: uClibc from the toolchain, libhdal from the release.
 SYSROOT=$("${CROSS}gcc" -print-sysroot)
-for lib in ld-uClibc.so.0 libc.so.0 libgcc_s.so.1; do
-    cp -L "$SYSROOT/lib/$lib" "$OUT/uc/"
+for lib in lib/ld-uClibc.so.0 lib/libc.so.0 lib/libgcc_s.so.1 \
+           usr/lib/libstdc++.so.6; do
+    cp -L "$SYSROOT/$lib" "$OUT/uc/"
 done
 unsquashfs -q -d "$WORK/rootfs" "$ROOTFS" usr/lib/libhdal.so >/dev/null
 cp "$WORK/rootfs/usr/lib/libhdal.so" "$OUT/uc/"
@@ -94,5 +96,43 @@ build hd_audio_capture_only
 build hd_audio_output_only
 build hd_audio_livesound
 build hd_audio_record
-"${CROSS}strip" "$OUT/smp/"*
+
+# The AI samples link the SDK's vendor AI libraries (libvendor_ai2 and its
+# open part source_pub, built here, with libvendor_media, libprebuilt_ai
+# and libvos) statically; ai_op reads its NV12 test picture from
+# jpg/ beside it.
+H=$CODE/hdal
+AIINC="-I$H/include -I$H/source -I$H/drivers/k_flow/include \
+    -I$H/drivers/k_driver/include -I$H/drivers/k_driver/source/include \
+    -I$H/vendor/include -I$H/vendor/ai2/include -I$H/vendor/ai2/source_pub/include \
+    -I$H/vendor/ai2/source_pub/vendor_ai_cpu -I$H/vendor/ai2/source_pub/vendor_ai_dsp \
+    -I$H/vendor/ai2/source/prebuilt/include -I$H/vendor/ai/drivers/k_driver/include \
+    -I$H/vendor/ai2/drivers/k_flow/include \
+    -I$H/vendor/ai2/drivers/k_flow/source/kflow_ai_net -I$H/vendor/cv/include \
+    -I$H/vendor/isp/include -I$H/vendor/dsp/include -I$H/vendor/ai2/source/include \
+    -I$H/vendor/ai2/source/vendor_ai_net -I$H/vendor/media/include \
+    -I$CODE/vos/drivers/include -I$CODE/vos/include"
+mkdir -p "$WORK/aipub"
+(
+    cd "$H/vendor/ai2/source_pub"
+    for f in vendor_ai_util.c vendor_ai_cpu/*.c vendor_ai_cpu/*.cpp vendor_ai_dsp/*.c; do
+        "${CROSS}gcc" -c $AIINC -I. -D ARM_ASM -D__LINUX -O2 -fPIC -mfpu=neon-fp16 \
+            -Wno-aggressive-loop-optimizations \
+            -o "$WORK/aipub/$(echo "$f" | tr / _).o" "$f"
+    done
+)
+"${CROSS}ar" rcs "$WORK/libvendor_ai2_pub.a" "$WORK/aipub/"*.o
+build_ai() {        # build_ai <sample>
+    "${CROSS}gcc" -O2 -D__LINUX $AIINC -o "$OUT/smp/$1" "$H/samples/$1/"*.c \
+        -L"$OUT/uc" -lhdal -Wl,--start-group "$H/vendor/ai2/source/libvendor_ai2.a" \
+        "$WORK/libvendor_ai2_pub.a" "$H/vendor/media/source/libvendor_media.a" \
+        "$H/vendor/ai/source/prebuilt/lib/uclibc/libprebuilt_ai.a" \
+        "$CODE/vos/output/libvos.a" -Wl,--end-group -lpthread -lm -lstdc++ \
+        -Wl,--dynamic-linker=/tmp/uc/ld-uClibc.so.0 -Wl,-rpath=/tmp/uc
+    echo "built $1"
+}
+build_ai ai_op
+mkdir -p "$OUT/smp/jpg"
+cp "$H/samples/ai_pattern/jpg/YUV420_SP_W512H376.bin" "$OUT/smp/jpg/"
+find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +
 echo "Samples and their runtime in $OUT"

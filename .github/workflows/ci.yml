@@ -1175,13 +1175,13 @@ jobs:
       # toolchain tarball (a moving release asset): cached, and used only
       # if they still carry the release kernel's vermagic, so a
       # republished toolchain skips the display checks instead of failing.
-      - name: Cache the display modules
+      - name: Cache the HDAL modules
         uses: actions/cache@v4
         with:
           path: nvt-kmod
           key: nvt9856x-hdal-kmod-4.19.91-v1
 
-      - name: Display modules (OpenIPC toolchain's HDAL kmods)
+      - name: HDAL modules (OpenIPC toolchain's display and AI kmods)
         id: kmod
         run: |
           if [ ! -d nvt-kmod/sdk/kmod/hdal ]; then
@@ -1191,12 +1191,12 @@ jobs:
           fi
           ko=nvt-kmod/sdk/kmod/hdal/kdrv_videoout/ide/nvt_ide.ko
           if [ -f "$ko" ] && strings "$ko" | grep -q 'vermagic=4.19.91 preempt mod_unload ARMv7'; then
-            echo "args=--display-kos $PWD/nvt-kmod/sdk/kmod/hdal" >> "$GITHUB_OUTPUT"
+            echo "args=--kmods $PWD/nvt-kmod/sdk/kmod/hdal" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::no display modules for the release kernel; display checks skipped"
+            echo "::warning::no HDAL modules for the release kernel; display and AI checks skipped"
           fi
 
-      - name: HDAL media engines bound by load_novatek, and the display path
+      - name: HDAL media engines bound by load_novatek, the display path and the AI engines
         run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }} ${{ steps.kmod.outputs.args }}
 
       - name: The display path on a MIPI DSI panel
