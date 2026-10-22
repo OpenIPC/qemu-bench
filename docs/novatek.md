@@ -641,7 +641,8 @@ Every engine is an `nvt-media` block (`hw/misc/nvt-media.c`): register
 storage, plus the handshakes its driver waits on. Video pixels are real
 from the sensor to JPEG (`hw/misc/nvt-pixel.c`), and the 2D graphics
 engines and the ISE scaler compute their jobs (`hw/misc/nvt-gfx.c`). The
-H.26x bitstream and audio samples are still placeholders.
+H.26x encoder codes real H.264 / H.265 when QEMU is built with x264 /
+x265 (`hw/misc/nvt-h26x.c`). Audio samples are still placeholders.
 
 - **SIE (sensor capture).** While `ACT_EN` is set, a frame comes every
   1/30 s, in three steps the way the sensor's lines would arrive:
@@ -725,8 +726,51 @@ H.26x bitstream and audio samples are still placeholders.
   the release ships no `kdrv_affine.ko`.
 - **H.26x.** `INT_FLAG` is write-1-to-clear, and software reset and DMA
   disable set their finish flags. A picture finishes with:
-  - a filler NAL unit (H.265 FD_NUT) in the bitstream buffer;
-  - its length in `BS_LEN` (report slot 6) and the NAL length list.
+  - the picture in the bitstream buffer;
+  - its length in `BS_LEN` (report slot 6) and the NAL length list;
+  - the slice QP times the macroblocks or CTBs in `QP_SUM` (slot 19).
+
+  A picture the buffer cannot take raises buffer full (bit 12) instead.
+
+  The driver writes every parameter set and slice header in software,
+  and the engine only codes slice data. The headers reach the engine
+  through the BSDMA list at `0x06C`:
+  - a count, then an address and length for each slice;
+  - the length's top nibble is the bits used in the last byte;
+  - H.265 adds a 1-byte entry after the last slice.
+
+  On an IDR the first entry starts with the sequence header (SPS / PPS,
+  plus VPS for H.265). HDAL skips those bytes in the buffer and takes
+  them from its own copy. So a decoder always sees the driver's
+  parameter sets, and real slices must fit them.
+
+  When pkg-config finds x264 / x265 at build time, each stream (keyed by
+  its BSDMA list) gets an encoder set up to match the driver's parameter
+  sets in everything the slice data depends on. The encoder's own headers
+  are parsed and checked against the driver's before it is used.
+  - **H.264:** the driver's slice header goes out unchanged. x264 is made
+    to code at its slice QP and deblocking. In CRF mode the forced QP is
+    exact; in CQP mode x264 would clamp it.
+  - **H.265:** the slice header is built from two sources.
+    - From the driver's: NAL type, POC and reference set.
+    - From x265's: slice type, QP, SAO, deblocking and merge candidates.
+    - x265 signals `cu_qp_delta` only with adaptive quantisation, so it
+      runs in CRF with a small AQ strength, the picture QP still forced.
+
+  The source is NV12 at `0x024` / `0x028`, with the line offsets in words
+  at `0x084`, padded to the coded size.
+
+  Without the libraries, every slice is a filler NAL unit, which decoders
+  skip; on an IDR the sequence header still goes in front. The same
+  happens for a stream the encoders cannot match:
+  - tiles, or several slices (the 2880x1620 record stream is tiled);
+  - a compressed or direct-from-IME source;
+  - a reference that is not the previous picture.
+
+  Such a stream stays filler until its next IDR. So does every stream
+  after a migration, since the encoders are host state. A real picture
+  too big for the buffer raises buffer full, and its stream waits for an
+  IDR as well.
 - **JPEG.** A baseline encoder (float DCT, the standard Annex K Huffman
   tables) reads the 4:2:0 picture:
   - Y and UV at `0x54` and `0x58`, line offsets at `0x60` and `0x64`;
@@ -762,9 +806,12 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 64 things:
+builds them from the vendor SDK (not in CI). The run checks 68 things:
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
-  `hd_video_encode_only` write their bitstreams;
+  `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
+  their bitstreams. With x264 / x265 built in, and ffmpeg on the host,
+  both of `hd_video_encode_only`'s streams decode without an error to
+  pictures within 30 dB PSNR of its input;
 - both of `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
 - `hd_video_capture_only` runs;
 - eleven `hd_gfx_only` operations run cleanly, with these results:
@@ -902,8 +949,10 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   words are storage, and every interrupt goes to SPI 0).
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
-- The H.26x bitstream and audio samples: placeholders (see HDAL media).
-  The IPP applies no DCE / IPE corrections and only IME output path 1,
+- Audio samples: placeholders (see HDAL media). H.26x pictures are real
+  only with x264 / x265 built in, and not for tiled or multi-slice streams.
+  They are encoded in the device's timer, holding the main loop for the
+  picture. The IPP applies no DCE / IPE corrections and only IME output path 1,
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE

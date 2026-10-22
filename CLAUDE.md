@@ -251,7 +251,10 @@ Its HDAL media engines (`hw/misc/nvt-media.c`) are one table-driven
 device that does each engine's handshakes. Pixels are real from the SIE's
 test pattern through IME's YUV to JPEG (`hw/misc/nvt-pixel.c`), and the
 graphics and ISE engines compute each job from their register file
-(`hw/misc/nvt-gfx.c`); H.26x and audio content are not. The
+(`hw/misc/nvt-gfx.c`). The H.26x driver writes every parameter set
+and slice header itself; with x264 / x265 found by pkg-config at build
+time (CI has neither) `hw/misc/nvt-h26x.c` codes slices that fit them,
+and otherwise writes filler slices. Audio content is not modelled. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands
