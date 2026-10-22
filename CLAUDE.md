@@ -259,7 +259,12 @@ EAC). No register in either holds the sample rate; it comes from CG (PLL7
 and the 0x38 dividers, 256 x fs). The address / size registers queue the
 next buffer, and STOP follows the channel enable (CTRL bits 12..15),
 which the driver blocks on. Capture is a test tone, and playback goes to
-the machine's `audiodev`. The
+the machine's `audiodev`. Its display engine is
+`hw/display/nvt-ide.c`. The driver sets CTRL bit 28 (load) and waits for
+frame end with no timeout, and its handler wakes the waiter only if load
+already reads 0. So a frame clears load before raising frame end. The
+release has no display modules; OpenIPC's toolchain tarball has them
+(`sdk/kmod/hdal`, `test-novatek-hdal.sh --display-kos`). The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

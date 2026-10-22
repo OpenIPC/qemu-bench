@@ -1163,8 +1163,14 @@ jobs:
       - name: Boot to PID 1 and reboot
         run: bash qemu-boot/test-novatek-boot.sh --soc ${{ matrix.soc }}
 
-      - name: HDAL media engines bound by load_novatek
-        run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }}
+      - name: Display modules (OpenIPC toolchain's HDAL kmods)
+        run: |
+          mkdir -p /tmp/nvt-kmod
+          curl -fsSL https://github.com/OpenIPC/firmware/releases/download/toolchain/toolchain.novatek-nt9856x.tgz |
+            tar xz -C /tmp/nvt-kmod --strip-components=1 --wildcards '*/sdk/kmod/hdal/*'
+
+      - name: HDAL media engines bound by load_novatek, and the display path
+        run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }} --display-kos /tmp/nvt-kmod/sdk/kmod/hdal
 
   boot-hi3516cv610:
     name: Boot hi3516cv610

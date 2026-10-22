@@ -82,6 +82,9 @@ plays the vendor drivers (docs/novatek.md):
     frame / job / list end and SPI 6; the graphics engine's list end (no
     DMA idle), single job and reset; ISE's list; H.26x flags, reset and a
     picture (BS_LEN, a filler NAL); a JPEG of four grey MCUs;
+  - nvt-ide: DMA idle with the engine off; load pending to the frame, then
+    frame end and SPI 48, write 1 to clear; a screendump of an NV12 video
+    layer and an ARGB4444 OSD box blended over it;
   - nvt-audio: the EAC strobes; capture DMA latching its buffer and the
     queued next, the test tone in it (1 kHz left, 1.5 kHz right), the
     current-address register, stop on the channel enable, the ADC enable
@@ -1732,6 +1735,74 @@ def test_audio(qt, wav):
            950 < hz < 1050), (True, True))
 
 
+IDE = 0xF0800000
+DISP_Y, DISP_UV, DISP_OSD = 0x01700000, 0x01720000, 0x01740000
+
+
+def test_display(qt, mon):
+    print('nvt-ide')
+    gic_enable(qt, 48)
+    check('DMA idle while the engine is off', qt.readl(IDE) & 4, 4)
+    # 320x240 out of a parallel panel (device 9): no serial-RGB squeeze
+    qt.writel(IDE + 0x0D0, 319 << 12)
+    qt.writel(IDE + 0x0D8, 239 << 12)
+    qt.writel(IDE + 0x0BC, 0x808010)                # background black
+    # video 1: NV12 320x240, the left half red, the right half blue
+    red, blue = (81, 90, 240), (41, 240, 110)
+    qt.write(DISP_Y, bytes((red if x < 160 else blue)[0]
+                           for y in range(240) for x in range(320)))
+    qt.write(DISP_UV, bytes(v for y in range(120) for x in range(0, 320, 2)
+                            for v in (red if x < 160 else blue)[1:]))
+    qt.writel(IDE + 0xD00, DISP_Y)
+    qt.writel(IDE + 0xD10, DISP_UV)
+    qt.writel(IDE + 0x028, 240 << 16 | 320)
+    qt.writel(IDE + 0x02C, 80)                      # words
+    qt.writel(IDE + 0x0A8, 10 << 28 | 239 << 16 | 319)
+    qt.writel(IDE + 0x0AC, 0)
+    # OSD 1: a 32x32 ARGB4444 white box at (100, 100), global alpha 0x80
+    qt.write(DISP_OSD, struct.pack('<H', 0xFFFF) * 32 * 32)
+    qt.writel(IDE + 0x05C, DISP_OSD)
+    qt.writel(IDE + 0x060, 32 << 16 | 32)
+    qt.writel(IDE + 0x064, 16)
+    qt.writel(IDE + 0x090, 12 << 28 | 31 << 16 | 31)
+    qt.writel(IDE + 0x094, 100 << 16 | 100)
+    qt.writel(IDE + 0x1B4, 0x80 << 24 | 1 << 4)
+    qt.writel(IDE + 0x000, 9 << 7 | 1 << 27 | 1 << 3 | 1 << 1)
+    check('the engine on: DMA busy', qt.readl(IDE) & 4, 0)
+    qt.writel(IDE + 0x0FC, 0x80)                    # frame end enabled
+    qt.writel(IDE + 0x000, qt.readl(IDE) | 1 << 28) # load
+    check('load pending until the frame', qt.readl(IDE) >> 28 & 1, 1)
+    qt.step(20 * 1000 * 1000)
+    check('at the frame: load clear, frame end (bit 23), SPI 48',
+          (qt.readl(IDE) >> 28 & 1, qt.readl(IDE + 0x0FC) >> 23 & 1,
+           gic_pending(qt, 48)), (0, 1, True))
+    qt.writel(IDE + 0x0FC, 0x80 | 1 << 23)
+    check('frame end is write 1 to clear', (qt.readl(IDE + 0x0FC) >> 23 & 1,
+          gic_pending(qt, 48)), (0, False))
+    ppm = os.path.join(os.path.dirname(mon), 'ide.ppm')
+    c = socket.socket(socket.AF_UNIX)
+    c.connect(mon)
+    c.sendall(('screendump %s\n' % ppm).encode())
+    for i in range(50):
+        if os.path.exists(ppm) and os.path.getsize(ppm) >= 320 * 240 * 3:
+            break
+        time.sleep(0.1)
+    c.close()
+    data = open(ppm, 'rb').read()
+    hdr = data.split(b'\n', 3)
+    px = hdr[3]
+    def pixel(x, y):
+        return tuple(px[(y * 320 + x) * 3:(y * 320 + x) * 3 + 3])
+    check('screendump: 320x240', hdr[1], b'320 240')
+    left, right, box = pixel(40, 40), pixel(280, 40), pixel(110, 110)
+    check('video 1 scanned out: red left, blue right',
+          (left[0] > 200 and left[2] < 60, right[2] > 200 and right[0] < 60),
+          (True, True))
+    check('OSD 1 over it at half alpha: a light red box',
+          (180 < box[0], 100 < box[1] < 160, 100 < box[2] < 160),
+          (True, True, True))
+
+
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
 
 
@@ -2716,6 +2787,14 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_pixels(qt)
+    finally:
+        qt.close()
+
+    mon = os.path.join(tmp, 'mon.sock')
+    qt = QTest(args.qemu, 'nt98566',
+               ['-monitor', 'unix:%s,server=on,wait=off' % mon])
+    try:
+        test_display(qt, mon)
     finally:
         qt.close()
 
