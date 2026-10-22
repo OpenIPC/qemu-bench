@@ -1155,7 +1155,7 @@ The camera's tile then shows its live picture.
   engines): they complete jobs without touching memory. The VPE does only
   the fill and the plain scale the preview uses.
 - H.265, and the decoder's own picture formats beyond what is described
-  above; the single-channel full view (main stream) is not checked.
+  above.
 - Audio content (RX is silence, TX is dropped), HDMI hotplug / EDID, the
   CVBS output (LCD200, TVE100), the LCD300's cursor and colour pipeline.
 - The real loader and BL31 (DDR training, secure world).
