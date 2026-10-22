@@ -60,6 +60,7 @@
 #define NVT_PWM_BASE        0xF0210000
 #define NVT_DAI_BASE        0xF0630000
 #define NVT_IDE_BASE        0xF0800000
+#define NVT_DSI_BASE        0xF0840000
 #define NVT_EAC_BASE        0xF0640000
 #define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */
 #define NVT_MPCORE_BASE     0xFFD00000
@@ -72,6 +73,7 @@
 #define NVT_IRQ_TIMER       0
 #define NVT_IRQ_DAI         15
 #define NVT_IRQ_IDE         48
+#define NVT_IRQ_DSI         50
 #define NVT_D_GPIO(n)       (0x80 + (n))    /* nvt-gpio.h D_GPIO() */
 #define NVT_IRQ_ARB         33
 #define NVT_ARB2_BASE       0xF0FE0000
@@ -711,6 +713,13 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
     qemu_fdt_setprop_cells(fdt, "/ide@f0800000", "reg", NVT_IDE_BASE,
                            0x1000);
     nvt_fdt_irq(fdt, "/ide@f0800000", NVT_IRQ_IDE);
+    /* the MIPI DSI host, for the DSI panels (nvt_dsi.ko) */
+    qemu_fdt_add_subnode(fdt, "/dsi@f0840000");
+    qemu_fdt_setprop_string(fdt, "/dsi@f0840000", "compatible",
+                            "nvt,nvt_dsi");
+    qemu_fdt_setprop_cells(fdt, "/dsi@f0840000", "reg", NVT_DSI_BASE,
+                           0x1000);
+    nvt_fdt_irq(fdt, "/dsi@f0840000", NVT_IRQ_DSI);
     qemu_fdt_add_subnode(fdt, "/dispobj");
     qemu_fdt_setprop_string(fdt, "/dispobj", "compatible", "nvt,nvt_dispobj");
     qemu_fdt_add_subnode(fdt, "/dispdev");
@@ -1132,6 +1141,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
 
     /* the display engine, shown on QEMU's console */
     sysbus_create_simple("nvt-ide", NVT_IDE_BASE, pic[NVT_IRQ_IDE]);
+    sysbus_create_simple("nvt-dsi", NVT_DSI_BASE, pic[NVT_IRQ_DSI]);
 
     dev = qdev_new("nvt-media");
     qdev_prop_set_string(dev, "engine", "arb2");
