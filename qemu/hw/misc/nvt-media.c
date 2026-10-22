@@ -526,20 +526,24 @@ static uint64_t h26x_write(NvtMediaState *s, hwaddr off, uint64_t val)
 
 /*
  * A picture (nvt-h26x.c): coded for real when an encoder can match the
- * driver's stream, else a filler slice.  The report gives its length and
- * QP; a picture the bitstream buffer cannot take raises buffer full
- * instead of finish.
+ * driver's stream, in a worker thread, else a filler slice at once.  The
+ * report gives its length and QP; a picture the bitstream buffer cannot
+ * take raises buffer full instead of finish.
  */
+static void h26x_finish(void *opaque, const NvtH26xResult *r)
+{
+    NvtMediaState *s = opaque;
+
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_BS_LEN) = r->len;
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_RRC_BITS) = r->len * 8;
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_QP_SUM) = r->qp_sum;
+    *reg(s, H26X_INT_FLAG) |= r->full ? H26X_INT_BSOUT_FULL : H26X_INT_FINISH;
+    h26x_update_irq(s);
+}
+
 static void h26x_done(NvtMediaState *s)
 {
-    NvtH26xResult r;
-
-    nvt_h26x_encode(s->h26x, s->regs, &r);
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_BS_LEN) = r.len;
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_RRC_BITS) = r.len * 8;
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_QP_SUM) = r.qp_sum;
-    *reg(s, H26X_INT_FLAG) |= r.full ? H26X_INT_BSOUT_FULL : H26X_INT_FINISH;
-    h26x_update_irq(s);
+    nvt_h26x_encode(s->h26x, s->regs, h26x_finish, s);
 }
 
 static void h26x_reset(NvtMediaState *s)
