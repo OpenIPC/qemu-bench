@@ -67,6 +67,8 @@
 #define NVT_IRQ_USB         27
 #define NVT_IRQ_PWM         26
 #define NVT_IRQ_TIMER       0
+#define NVT_IRQ_ARB         33
+#define NVT_ARB2_BASE       0xF0FE0000
 #define NVT_IRQ_FLASH       29
 #define NVT_IRQ_ETH         34
 #define NVT_IRQ_RTC         56
@@ -147,6 +149,91 @@ static const struct {
 };
 
 /*
+ * The HDAL's media engines (cfg_566_IPCAM1_EVB nvt-peri.dtsi), those the
+ * OpenIPC release's kdrv_* / kflow_* modules bind by compatible: each
+ * register window becomes an nvt-media block named for the engine
+ * ("sie", "sie2", ...), its interrupt the node's interrupt of the same
+ * index.  An interrupt two nodes share (CSI and LVDS, RHE and AI) is
+ * driven by the first only.  irq -1: none.
+ */
+#define NVT_MEDIA_REGS  3
+
+static const struct {
+    const char *node;
+    const char *compat;
+    struct {
+        hwaddr base;
+        uint32_t size;
+        int irq;
+    } win[NVT_MEDIA_REGS];
+    uint32_t clock;             /* "clock-frequency", 0: none */
+} nvt_media[] = {
+    { "sie@f0c00000",     "nvt,drv_sie",
+      { { 0xF0C00000, 0x900, 1 }, { 0xF0D20000, 0x900, 2 },
+        { 0xF0D30000, 0x900, 3 } } },
+    { "tge@f0cc0000",     "nvt,kdrv_tge",  { { 0xF0CC0000, 0x150, 22 } } },
+    { "ime@f0c40000",     "nvt,kdrv_ime",  { { 0xF0C40000, 0x1000, 6 } } },
+    { "ise@f0c90000",     "nvt,kdrv_ise",  { { 0xF0C90000, 0x100, 21 } } },
+    { "ipe@f0c30000",     "nvt,kdrv_ipe",  { { 0xF0C30000, 0x900, 5 } } },
+    { "ife@f0c70000",     "nvt,kdrv_ife",  { { 0xF0C70000, 0x800, 8 } } },
+    { "dce@f0c20000",     "nvt,kdrv_dce",  { { 0xF0C20000, 0x650, 7 } } },
+    { "ai@f0c60000",      "nvt,kdrv_ai",
+      { { 0xF0C60000, 0x23C, 14 }, { 0xF0D50000, 0x114, 13 },
+        { 0xF0CB0000, 0x22C, 11 } }, 600000000 },
+    { "csi@f0280000",     "nvt,nvt_csi",
+      { { 0xF0280000, 0x100, 54 }, { 0xF0330000, 0x100, 55 } } },
+    { "lvds@f0270000",    "nvt,nvt_lvds",
+      { { 0xF0270000, 0x200, -1 }, { 0xF0370000, 0x200, -1 } } },
+    { "senphy@f06b0000",  "nvt,nvt_senphy", { { 0xF06B0000, 0x100, -1 } } },
+    { "sif@f0240000",     "nvt,nvt_sif",   { { 0xF0240000, 0x200, 40 } },
+      1000000 },
+    { "graphic@f0c80000", "nvt,nvt_graphic",
+      { { 0xF0C80000, 0x300, 18 }, { 0xF0D10000, 0x100, 19 } } },
+    { "h26x@f0a10000",    "nvt,nvt_h26x",  { { 0xF0A10000, 0xA00, 16 } } },
+    { "jpg@f0a00000",     "nvt,nvt_jpg",   { { 0xF0A00000, 0x100, 17 } } },
+    /* the drivers reach past the tree's reg sizes: EAC 0x200, DAI 0xD0 */
+    { "eac@f0640000",     "nvt,nvt_eac",   { { 0xF0640000, 0x300, -1 } } },
+    { "dai@f0630000",     "nvt,nvt_dai",   { { 0xF0630000, 0x100, 15 } } },
+};
+
+/* The HDAL's software units (nvt-media.dtsi): nodes with only a name. */
+static const char *const nvt_hdal_units[] = {
+    "nvtmpp", "isf_stream", "isf_flow", "isf_vdocap", "isf_vdoprc",
+    "isf_dummy", "isf_vdoenc", "isf_vdodec", "isf_vdoout", "isf_audenc",
+    "isf_auddec", "isf_audcap", "isf_audout",
+};
+
+/* cfg_566_IPCAM1_EVB nvt-peri.dtsi pll_preset@0: <pll rate enable> */
+static const uint32_t nvt_pll_preset[][3] = {
+    { 3, 0, 0 }, { 4, 0, 0 }, { 5, 297000000, 1 }, { 6, 0, 0 },
+    { 7, 0, 0 }, { 8, 0, 0 }, { 9, 0, 0 }, { 11, 0, 0 }, { 12, 0, 1 },
+};
+
+static const struct {
+    const char *prop;
+    int n;
+    uint32_t v[8];
+} nvt_hdal_limits[] = {
+    { "vdocap_active_list", 8, { 1, 1, 1, 0, 0, 0, 0, 0 } },
+    { "vdoprc_maxdevice", 1, { 2 } },
+    { "vdoenc_maxpath", 1, { 8 } },
+    { "vdodec_maxpath", 1, { 2 } },
+    { "vdoout_maxdevice", 1, { 1 } },
+    { "adocap_maxdevice", 1, { 1 } },
+    { "adoout_maxdevice", 1, { 1 } },
+    { "adoenc_maxpath", 1, { 1 } },
+    { "adodec_maxpath", 1, { 1 } },
+    { "gfx_maxjob", 1, { 2 } },
+    { "stamp_maximg", 1, { 16 } },
+    { "vdoprc_maxstamp", 2, { 4, 16 } },
+    { "vdoprc_maxmask", 2, { 8, 64 } },
+    { "vdoenc_maxstamp", 2, { 32, 16 } },
+    { "vdoenc_maxmask", 2, { 0, 64 } },
+    { "vdoout_maxstamp", 2, { 0, 16 } },
+    { "vdoout_maxmask", 2, { 0, 64 } },
+};
+
+/*
  * Blocks with no model yet: plain storage, so drivers' read-modify-writes
  * keep what they wrote.  Everything else in the peripheral window reads 0
  * and is logged under -d unimp.
@@ -161,27 +248,35 @@ static const struct {
 };
 
 /*
- * NT98562: 64 MB DDR2 in the package.  cfg_562_IPCAM1_NOR_EVB's
- * nvt-mem-tbl.dtsi gives Linux the first 30 MB and the HDAL media pool
- * (vendor modules) the rest.
+ * NT98562 has 64 MB of DDR2 in the package, NT98566 128 MB of DDR3; the
+ * SDK's memory tables (nvt-mem-tbl.dtsi) give Linux the first 30 / 32 MB
+ * and the HDAL media pool the rest.  That leaves Linux too little to run
+ * the HDAL samples and their files beside the media modules, so the
+ * machines are given more than the package holds: Linux the first
+ * 128 MB, the media pool (/hdal-memory) the 96 MB after it -- the
+ * NT98566 board's pool.  -m sizes the pool.  With less RAM than that
+ * (-m 64 / 128, the packages' sizes) the machine falls back to the SDK's
+ * split.  The vendor firmware's own device tree keeps its own.
  */
+#define NVT_LINUX_MEM       (128 * MiB)
+#define NVT_RAM_DEFAULT     (NVT_LINUX_MEM + 96 * MiB)
+
 static const NvtSoCConfig nt98562_soc = {
     .desc               = "Novatek NT98562 (Cortex-A9, NA51089, 64 MB)",
     .model              = "Novatek NA51089",
     .chip_id            = 0x7021,
-    .ram_size_default   = 64 * MiB,
-    .linux_mem          = 0x01E00000,
+    .ram_size_default   = NVT_RAM_DEFAULT,
+    .linux_mem          = NVT_LINUX_MEM,
+    .sdk_linux_mem      = 0x01E00000,       /* cfg_562_IPCAM1_NOR_EVB */
 };
 
-/* NT98566: the same die with 128 MB DDR3.  The SDK's IPCAM1_EVB image
- * (FW98566A.bin, v1.00.000) keeps Linux to 32 MB and gives the HDAL media
- * pool the other 96. */
 static const NvtSoCConfig nt98566_soc = {
     .desc               = "Novatek NT98566 (Cortex-A9, NA51089, 128 MB)",
     .model              = "Novatek NA51089",
     .chip_id            = 0x7021,
-    .ram_size_default   = 128 * MiB,
-    .linux_mem          = 0x02000000,
+    .ram_size_default   = NVT_RAM_DEFAULT,
+    .linux_mem          = NVT_LINUX_MEM,
+    .sdk_linux_mem      = 0x02000000,       /* FW98566A.bin, IPCAM1_EVB */
 };
 
 /* "nvt,ca9" is what mach-nvt-ivot/board-dt.c matches. */
@@ -457,6 +552,91 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         qemu_fdt_setprop_cell(fdt, upath, "#size-cells", 0);
         g_free(upath);
     }
+
+    /* The media engines, and the HDAL units and limits. */
+    for (n = 0; n < ARRAY_SIZE(nvt_media); n++) {
+        g_autofree char *mpath = g_strdup_printf("/%s", nvt_media[n].node);
+        uint32_t regs[2 * NVT_MEDIA_REGS], irqs[3 * NVT_MEDIA_REGS];
+        int nr = 0, ni = 0, w;
+
+        qemu_fdt_add_subnode(fdt, mpath);
+        qemu_fdt_setprop_string(fdt, mpath, "compatible",
+                                nvt_media[n].compat);
+        for (w = 0; w < NVT_MEDIA_REGS && nvt_media[n].win[w].size; w++) {
+            regs[nr++] = cpu_to_be32(nvt_media[n].win[w].base);
+            regs[nr++] = cpu_to_be32(nvt_media[n].win[w].size);
+            if (nvt_media[n].win[w].irq >= 0 || !strcmp(nvt_media[n].compat,
+                                                        "nvt,nvt_lvds")) {
+                /* LVDS names CSI's interrupts, 54 and 55 */
+                int spi = nvt_media[n].win[w].irq >= 0 ?
+                          nvt_media[n].win[w].irq : 54 + w;
+
+                irqs[ni++] = cpu_to_be32(0);
+                irqs[ni++] = cpu_to_be32(spi);
+                irqs[ni++] = cpu_to_be32(4);
+            }
+        }
+        qemu_fdt_setprop(fdt, mpath, "reg", regs, nr * 4);
+        if (ni) {
+            qemu_fdt_setprop(fdt, mpath, "interrupts", irqs, ni * 4);
+        }
+        if (nvt_media[n].clock) {
+            qemu_fdt_setprop_cell(fdt, mpath, "clock-frequency",
+                                  nvt_media[n].clock);
+        }
+    }
+    for (n = 0; n < ARRAY_SIZE(nvt_hdal_units); n++) {
+        g_autofree char *unit = g_strdup_printf("/%s", nvt_hdal_units[n]);
+        g_autofree char *compat = g_strdup_printf("nvt,%s",
+                                                  nvt_hdal_units[n]);
+
+        qemu_fdt_add_subnode(fdt, unit);
+        qemu_fdt_setprop_string(fdt, unit, "compatible", compat);
+    }
+    qemu_fdt_add_subnode(fdt, "/audio");
+    qemu_fdt_setprop_string(fdt, "/audio", "compatible", "nvt,nvt_audio");
+    /* the embedded codec on I2S controller 4, as the EVB has it */
+    qemu_fdt_add_subnode(fdt, "/audio@1");
+    qemu_fdt_setprop_string(fdt, "/audio@1", "type", "none");
+    qemu_fdt_add_subnode(fdt, "/audio@2");
+    qemu_fdt_setprop_string(fdt, "/audio@2", "type", "embedded");
+    qemu_fdt_setprop_cell(fdt, "/audio@2", "i2s_ctrl", 4);
+    /* the HDAL units' path limits (nvt-mem-tbl.dtsi), which they size by */
+    qemu_fdt_add_subnode(fdt, "/hdal-maxpath-cfg");
+    for (n = 0; n < ARRAY_SIZE(nvt_hdal_limits); n++) {
+        uint32_t v[8];
+        int i;
+
+        for (i = 0; i < nvt_hdal_limits[n].n; i++) {
+            v[i] = cpu_to_be32(nvt_hdal_limits[n].v[i]);
+        }
+        qemu_fdt_setprop(fdt, "/hdal-maxpath-cfg", nvt_hdal_limits[n].prop,
+                         v, nvt_hdal_limits[n].n * 4);
+    }
+    /*
+     * nvt_preset_pll() (plat-na51089/pll_preset.c) sets each PLL's rate
+     * from here at boot: PLL5 to 297 MHz, which the sensor master clock
+     * divides to 27 MHz (ctl_sen fails "cannot find pll for MCLK"
+     * without it).  <pll rate enable>, as the vendor tree has them.
+     */
+    qemu_fdt_add_subnode(fdt, "/pll_preset@0");
+    for (n = 0; n < ARRAY_SIZE(nvt_pll_preset); n++) {
+        g_autofree char *ppath = g_strdup_printf("/pll_preset@0/pll%d",
+                                                 nvt_pll_preset[n][0]);
+
+        qemu_fdt_add_subnode(fdt, ppath);
+        qemu_fdt_setprop_cells(fdt, ppath, "pll_config", nvt_pll_preset[n][0],
+                               nvt_pll_preset[n][1], nvt_pll_preset[n][2]);
+    }
+    qemu_fdt_add_subnode(fdt, "/kdrv_ipp");
+    qemu_fdt_setprop_cell(fdt, "/kdrv_ipp", "clock-frequency", 240000000);
+    /* the DDR arbiter: its protection window, past the DDRC registers */
+    qemu_fdt_add_subnode(fdt, "/nvt_arb@f0000000");
+    qemu_fdt_setprop_string(fdt, "/nvt_arb@f0000000", "compatible",
+                            "nvt,nvt_arb");
+    qemu_fdt_setprop_cells(fdt, "/nvt_arb@f0000000", "reg",
+                           0xF0000000, 0xA000, NVT_ARB2_BASE, 0x300);
+    nvt_fdt_irq(fdt, "/nvt_arb@f0000000", NVT_IRQ_ARB);
 
     /*
      * The drivers bind these, and take "mclk" (1: 320 MHz) for the clock
@@ -797,7 +977,8 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     int n;
 
     nvt_config = c;
-    nvt_linux_mem = MIN(c->linux_mem, machine->ram_size);
+    nvt_linux_mem = machine->ram_size >= NVT_RAM_DEFAULT ? c->linux_mem :
+                    MIN(c->sdk_linux_mem, machine->ram_size);
 
     cpuobj = object_new(machine->cpu_type);
     /* Entered in SVC by the loader and U-Boot; there is no TEE here. */
@@ -866,6 +1047,37 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
 
     sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
     sysbus_create_simple("nvt-timer", NVT_TIMER_BASE, pic[NVT_IRQ_TIMER]);
+    for (n = 0; n < ARRAY_SIZE(nvt_media); n++) {
+        int w;
+
+        for (w = 0; w < NVT_MEDIA_REGS && nvt_media[n].win[w].size; w++) {
+            g_autofree char *engine = g_strndup(nvt_media[n].node,
+                                strcspn(nvt_media[n].node, "@"));
+
+            if (w) {
+                char *e = g_strdup_printf("%s%d", engine, w + 1);
+
+                g_free(engine);
+                engine = e;
+            }
+            dev = qdev_new("nvt-media");
+            qdev_prop_set_string(dev, "engine", engine);
+            qdev_prop_set_uint32(dev, "size", nvt_media[n].win[w].size);
+            object_property_add_child(OBJECT(machine), engine, OBJECT(dev));
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvt_media[n].win[w].base);
+            if (nvt_media[n].win[w].irq >= 0) {
+                sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                                   pic[nvt_media[n].win[w].irq]);
+            }
+        }
+    }
+    dev = qdev_new("nvt-media");
+    qdev_prop_set_string(dev, "engine", "arb2");
+    qdev_prop_set_uint32(dev, "size", 0x300);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NVT_ARB2_BASE);
+
     for (n = 0; n < ARRAY_SIZE(nvt_crypto_blocks); n++) {
         sysbus_create_simple(nvt_crypto_blocks[n].type,
                              nvt_crypto_blocks[n].base,

@@ -247,6 +247,15 @@ check `nvt-crypto`, `nvt-hash` and `nvt-rsa` against known-answer vectors
 (`qemu-boot/test-novatek-crypto.sh`). Those models implement their
 ciphers themselves (AES from QEMU's `crypto/aes.c`), because QEMU 10.2 has
 no built-in cipher backend and CI may build without one.
+Its HDAL media engines (`hw/misc/nvt-media.c`) are one table-driven
+device that does each engine's handshakes, not its pixels. The
+IPP and graphics engines execute the drivers' DRAM linked lists, whose
+updates set their own interrupt enables. The SIE's single-mode outputs
+clear their enables when a frame is written, which is how `ctl_sie` hands
+buffers on. The OpenIPC `libhdal.so` is a uClibc build that musl's 64-bit
+`off_t` `mmap()` breaks, so SDK samples need the SDK's uClibc runtime
+(`qemu-boot/build-novatek-hdal-samples.sh`). `-global nvt-media.trace=on`
+logs at gigabytes a minute when an engine is polled: cap it.
 Its SD hosts (`hw/sd/nvt-sdio.c`) DMA through a descriptor table under
 Linux but a plain address under U-Boot (`0x1FC` = 1). Linux relies on the
 clock framework's CG reset pulse to undo that, so `nvt-cg` drives

@@ -1163,6 +1163,9 @@ jobs:
       - name: Boot to PID 1 and reboot
         run: bash qemu-boot/test-novatek-boot.sh --soc ${{ matrix.soc }}
 
+      - name: HDAL media engines bound by load_novatek
+        run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }}
+
   boot-hi3516cv610:
     name: Boot hi3516cv610
     needs: build

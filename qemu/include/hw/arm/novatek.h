@@ -28,6 +28,7 @@ typedef struct NvtSoCConfig {
     uint32_t    chip_id;        /* TOP_VERSION_REG [31:16] */
     uint64_t    ram_size_default;
     uint64_t    linux_mem;      /* the DT memory node; the rest is HDAL's */
+    uint64_t    sdk_linux_mem;  /* the SDK's share, when RAM is smaller */
 } NvtSoCConfig;
 
 #endif /* HW_ARM_NOVATEK_H */

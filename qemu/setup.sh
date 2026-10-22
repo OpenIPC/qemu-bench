@@ -98,6 +98,7 @@ cp qemu/hw/misc/nvt-pwm.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-crypto.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-hash.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-rsa.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-media.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-dai.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-engine.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-hdmi.c          "$QEMU_DIR/hw/misc/"
@@ -495,7 +496,7 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
