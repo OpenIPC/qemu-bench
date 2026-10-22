@@ -12,7 +12,9 @@
 # files on an emulated SD card, and checks what they leave there:
 #
 #   - hd_video_record: sensor -> SIE -> IFE / DCE / IPE / IME -> H.265,
-#     the bitstream file written, no HDAL error;
+#     the bitstream file written, no HDAL error; with x265 built into QEMU
+#     and ffmpeg on the host, the tiled stream decodes without an error
+#     to the sensor's moving picture;
 #   - hd_video_snapshot: two JPEG snapshots, each a whole JPEG (SOI ...
 #     EOI) that a decoder (Python PIL) reads as a 2880x1620 picture;
 #   - hd_video_capture_only, hd_video_encode_only (H.265 and H.264 from a
@@ -178,6 +180,9 @@ size() {
 }
 run hd_video_record
 echo "NVT-HDAL-RECORD-BYTES: $(size /mnt/sd/dump_bs_main.dat)"
+echo "NVT-HDAL-REC-B64-BEGIN"
+head -c 6000000 /mnt/sd/dump_bs_main.dat | base64
+echo "NVT-HDAL-REC-B64-END"
 run hd_video_snapshot s s
 for j in /mnt/sd/dump_bs_snap0.jpg /mnt/sd/dump_bs_snap1.jpg; do
     echo "NVT-HDAL-JPEG: ${j##*/} $(head -c 2 $j | hexdump -e '2/1 "%02x"') $(tail -c 2 $j | hexdump -e '2/1 "%02x"') $(size $j)"
@@ -289,6 +294,48 @@ if [ -n "$SAMPLES" ]; then
         expect "NVT-HDAL-ENCODE-BYTES: ${t% *} [1-9]" \
             "hd_video_encode_only writes its ${t#* } bitstream"
     done
+    # The record stream is H.265 in two tile columns: with x265 each is
+    # an intra slice, and the stream decodes to the sensor's picture
+    if strings "$QEMU" | grep -c x265_encoder_open >/dev/null &&
+            command -v ffmpeg >/dev/null && python3 -c 'import PIL' 2>/dev/null; then
+        sed -n "/NVT-HDAL-REC-B64-BEGIN/,/NVT-HDAL-REC-B64-END/p" \
+            "$WORK/console.log" | grep -a -v 'NVT-HDAL' | tr -d '\r' |
+            base64 -d > "$WORK/rec.bin" 2>/dev/null || true
+        python3 - "$WORK/rec.bin" <<'PY'
+import sys
+d = open(sys.argv[1], 'rb').read()
+cut = d.rfind(b'\x00\x00\x00\x01')
+open(sys.argv[1], 'wb').write(d[:cut] if len(d) >= 6000000 and cut > 0 else d)
+PY
+        ffmpeg -v error -xerror -f hevc -i "$WORK/rec.bin" -vf \
+            "select=eq(n\,0)+eq(n\,4)" -vsync 0 "$WORK/rec%d.png" \
+            > "$WORK/rec.log" 2>&1 || true
+        look=$(python3 - "$WORK/rec1.png" "$WORK/rec2.png" <<'PY' 2>/dev/null || true
+import sys
+from PIL import Image
+ims = [Image.open(f).convert('RGB') for f in sys.argv[1:]]
+w, h = ims[0].size
+want = [(1, 1, 1), (1, 1, 0), (0, 1, 1), (0, 1, 0), (1, 0, 1), (1, 0, 0),
+        (0, 0, 1), (0, 0, 0)]
+bars = all(tuple(int(c > 96) for c in ims[0].getpixel((w * (2 * i + 1) // 16,
+                                                         h // 6))) == want[i]
+           for i in range(8))
+ramp = [ims[0].getpixel((x, h * 5 // 6))[1] for x in (8, w // 2, w - 8)]
+def box(im):
+    xs = [x for x in range(0, w, 4) if min(im.getpixel((x, h // 3))) > 220]
+    return xs[0] if xs else -1
+print('size=%dx%d bars=%d ramp=%d moved=%d' % (w, h, bars,
+      ramp[0] < ramp[1] < ramp[2], box(ims[0]) != box(ims[1])))
+PY
+)
+        if [ ! -s "$WORK/rec.log" ] && [ "$look" = "size=2880x1620 bars=1 ramp=1 moved=1" ]; then
+            pass "hd_video_record's tiled H.265 decodes to the sensor's moving picture ($look)"
+        else
+            bad "hd_video_record's tiled H.265 decodes to the sensor's moving picture ($look; $(head -c 200 "$WORK/rec.log"))"
+        fi
+    else
+        echo "SKIP: decoding the record stream (QEMU without x265, or no ffmpeg / PIL)"
+    fi
     # With x264 / x265 in QEMU the bitstreams are real: they decode
     # (ffmpeg, stopping at any error) to the input's pictures, in order
     for t in "0 hevc H.265 x265" "1 h264 H.264 x264"; do

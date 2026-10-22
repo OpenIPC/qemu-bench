@@ -760,10 +760,35 @@ x265 (`hw/misc/nvt-h26x.c`). Audio samples are still placeholders.
   The source is NV12 at `0x024` / `0x028`, with the line offsets in words
   at `0x084`, padded to the coded size.
 
+  **Tiled H.265.** At 2880x1620 the driver codes H.265 in tile columns:
+  - one row of two columns, 1472 and 1408 pixels;
+  - one slice per column, the second starting at that column's first CTB;
+  - no loop filter across tiles or slices.
+
+  So each column decodes like a picture of its own. Intra prediction,
+  CABAC, deblocking and SAO all stop at its edges, as at a picture's
+  edges. Each column gets its own x265 at that width, which codes it as
+  an intra picture.
+
+  Its slice goes out as an I slice under the driver's slice: same
+  address, NAL type, POC and reference set, and no temporal MV
+  prediction. Inter coding could not be stitched this way: a motion
+  vector near a column edge reaches into the next column, which the
+  column's encoder never sees. Tiled streams are therefore all intra.
+
+  Encoding runs in a worker thread (QEMU's thread pool), so a 5 MP
+  picture does not hold the main loop:
+  - the main loop reads the driver's headers and the source;
+  - the worker sets the encoders up and codes;
+  - the main loop then writes the bitstream and raises the interrupt.
+
+  A reset while a picture is coding drops it.
+
   Without the libraries, every slice is a filler NAL unit, which decoders
   skip; on an IDR the sequence header still goes in front. The same
   happens for a stream the encoders cannot match:
-  - tiles, or several slices (the 2880x1620 record stream is tiled);
+  - several slices without tiles, or tiles in rows or not one slice per
+    column, or filtered across;
   - a compressed or direct-from-IME source;
   - a reference that is not the previous picture.
 
@@ -806,12 +831,14 @@ and units bound.
 
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
-builds them from the vendor SDK (not in CI). The run checks 68 things:
+builds them from the vendor SDK (not in CI). The run checks 69 things:
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
-  their bitstreams. With x264 / x265 built in, and ffmpeg on the host,
-  both of `hd_video_encode_only`'s streams decode without an error to
-  pictures within 30 dB PSNR of its input;
+  their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
+  - `hd_video_record`'s tiled stream decodes without an error to the
+    sensor's picture: the bars, the ramp, the box moving;
+  - both of `hd_video_encode_only`'s streams decode without an error to
+    the input's frames in order, each within 30 dB PSNR;
 - both of `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
 - `hd_video_capture_only` runs;
 - eleven `hd_gfx_only` operations run cleanly, with these results:
@@ -950,9 +977,8 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
 - Audio samples: placeholders (see HDAL media). H.26x pictures are real
-  only with x264 / x265 built in, and not for tiled or multi-slice streams.
-  They are encoded in the device's timer, holding the main loop for the
-  picture. The IPP applies no DCE / IPE corrections and only IME output path 1,
+  only with x264 / x265 built in, and tiled streams are intra only. The
+  IPP applies no DCE / IPE corrections and only IME output path 1,
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
