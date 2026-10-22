@@ -2251,6 +2251,19 @@ def test_nt98332_vpe(qt):
     check('UV, one row of pairs', qt.read(dst + fw * fh, 4),
           b'\x11\x22\x11\x22')
 
+    # a full picture (0x1000), of which 0x01C shows the top 8x2: two rows
+    # of padding below it, then UV
+    qt.write(src, bytes(range(32)))
+    qt.write(src + 32, b'\x33\x44' * 8)
+    job(frame + [(0x0008, 0x1000), (0x0010, 4 << 16 | 8), (0x001C, 8 << 16 | 2),
+                 (0x0308, src), (0x0800, 8), (0x0550, 4), (0x0508, 2)])
+    check('a full-picture job scales the part shown, Y',
+          qt.read(dst, 4), bytes([0, 2, 4, 6]))
+    check('and leaves out the padding rows', qt.read(dst + fw, 4),
+          bytes([8, 10, 12, 14]))
+    check('its UV follows the whole buffer', qt.read(dst + fw * fh, 4),
+          b'\x33\x44\x33\x44')
+
 
 # ---- nvt-eqos ----------------------------------------------------------
 

@@ -1112,10 +1112,15 @@ the two agree.
 The VPE (`nvt-engine` with `scaler=on`) does the window work from its
 list's registers:
 
-- the source at `0x308` (size `0x010`, stride `0x800`);
+- the source at `0x308` (size `0x010`, stride `0x800`, its UV right
+  after Y), of which `0x01C` is the part shown: 1920×1080 of the
+  decoder's 1088-line buffer;
 - the destination window at `0x360` in a frame of `0x50C`, window size
   `0x550` × `0x508`;
-- with `0x008` bits 11:10 clear, the job fills the window with the
+- `0x008` says which: `0xC00` scales a reduced copy into a preview
+  window, `0x1000` a full picture into the single-channel view (a
+  double-click on a tile, which switches the channel to the main
+  stream). With bits 12:10 clear, the job fills the window with the
   background colour `0x260` instead. That is how the NVR clears empty
   tiles to black; without it the frames read as all-zero YUV, i.e. green.
 
