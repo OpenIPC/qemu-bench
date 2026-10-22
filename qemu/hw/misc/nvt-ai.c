@@ -20,8 +20,11 @@
  *   0x04C          gain [11:0], its shift [19:16]
  *   0x050          offset [20:0] (signed), per-product shift [27:24]
  *
- *   out[o][j] = ((sum_k (x[o][k] * 256 * w[j][k]) >> fshift) * gain
+ *   out[o][j] = ((sum_k ((x[o][k] * 256 * w[j][k]) >> fshift)) * gain
  *                >> gshift) + offset
+ *
+ * fshift is the SDK's weight shift, applied to each product before the
+ * sum, as the field's place among the weight parameters has it.
  *
  * The rows are packed, a row a weight-row length apart; the outputs s32,
  * a vector's rows together.  8-bit data carries 8 fraction bits through
@@ -77,8 +80,11 @@ static bool rd(hwaddr a, void *buf, size_t n)
 
 static void wr(hwaddr a, const void *buf, size_t n)
 {
-    dma_memory_write(&address_space_memory, a, buf, n,
-                     MEMTXATTRS_UNSPECIFIED);
+    if (dma_memory_write(&address_space_memory, a, buf, n,
+                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: cannot write 0x%"
+                      HWADDR_PRIx "\n", a);
+    }
 }
 
 /* ---- NUE ---- */
@@ -96,6 +102,11 @@ static void wr(hwaddr a, const void *buf, size_t n)
 #define NUE_MAX_SVW         9216
 #define NUE_MAX_SVH         4096
 #define NUE_MAX_OBJ         64
+/*
+ * The products a job may take, done at once on the vCPU: the drivers
+ * split layers into jobs of 256 rows, far below this.
+ */
+#define NUE_MAX_MACS        (1u << 26)
 
 static int64_t nue_elem(const uint8_t *p, size_t i, bool wide, bool sign)
 {
@@ -132,6 +143,11 @@ void nvt_ai_nue_run(const uint32_t *regs)
         obj > NUE_MAX_OBJ) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: NUE %u rows of %u, %u "
                       "vectors\n", svh, svw, obj);
+        return;
+    }
+    if ((uint64_t)svw * svh * obj > NUE_MAX_MACS) {
+        qemu_log_mask(LOG_UNIMP, "nvt-ai: NUE job of %u rows of %u, %u "
+                      "vectors, too big to run at once\n", svh, svw, obj);
         return;
     }
     x = g_malloc((size_t)obj * svw * esz);
@@ -212,7 +228,7 @@ void nvt_ai_nue2_run(const uint32_t *regs)
         return;
     }
     if (!iw || !ih || !ow || !oh || iw > NUE2_MAX || ih > NUE2_MAX ||
-        ow > NUE2_MAX || oh > NUE2_MAX || (iw & 1) || ((ih & 1) && !fmt)) {
+        ow > NUE2_MAX || oh > NUE2_MAX || (((iw | ih) & 1) && !fmt)) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: NUE2 %ux%u to %ux%u\n", iw,
                       ih, ow, oh);
         return;
@@ -310,7 +326,7 @@ void nvt_ai_nue2_run(const uint32_t *regs)
                         v -= (sub >> (8 * c)) & 0xFF;
                     }
                     v *= mscale;
-                    v = ms & 1 ? v << mshift : v >> mshift;
+                    v = ms & 1 ? v * ((int64_t)1 << mshift) : v >> mshift;
                 }
                 outl[x] = sign ? (uint8_t)MIN(MAX(v, -128), 127)
                                : clamp8(v);

@@ -354,6 +354,7 @@ static void nvt_media_write(void *opaque, hwaddr off, uint64_t val,
 typedef enum {
     IPP_LL_NEXT,                /* a job set up, another follows */
     IPP_LL_LAST,                /* the last job set up */
+    IPP_LL_END,                 /* the list ends with no job left */
     IPP_LL_BROKEN,              /* unreadable, malformed or endless */
 } IppLlResult;
 
@@ -364,6 +365,7 @@ static IppLlResult ipp_run_job(NvtMediaState *s)
     hwaddr addr = s->ll_addr;
     uint64_t cmd;
     uint32_t off, mask, i, val;
+    bool upd = false;
     int n;
 
     for (n = 0; n < IPP_LL_MAX_CMDS; n++, addr += 8) {
@@ -391,6 +393,7 @@ static IppLlResult ipp_run_job(NvtMediaState *s)
                 val += *reg(s, p->ll_base);
             }
             nvt_media_write(s, off, (*reg(s, off) & ~mask) | (val & mask), 4);
+            upd = true;
             if ((cmd & IPP_UPD_FIRE) && p->ll_base) {
                 s->ll_addr = addr + 8;  /* the job's last: run it, go on */
                 return IPP_LL_NEXT;
@@ -403,7 +406,8 @@ static IppLlResult ipp_run_job(NvtMediaState *s)
             s->ll_addr = (cmd >> 8) & 0xFFFFFFFF;
             return IPP_LL_NEXT;
         case IPP_CMD_NULL:
-            return IPP_LL_LAST;
+            /* an AI list's jobs end in fired updates: none may be left */
+            return upd || !p->ll_base ? IPP_LL_LAST : IPP_LL_END;
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-media %s: linked list "
                           "command 0x%016" PRIx64 "\n", s->engine_name, cmd);
@@ -510,6 +514,11 @@ static void ipp_job_done(NvtMediaState *s)
     if (res == IPP_LL_BROKEN) {
         /* no work done; the list error, where the engine has one */
         *reg(s, p->ints) |= p->ll_err ? p->ll_err : p->job_end | p->ll_end;
+        ipp_update_irq(s);
+        return;
+    }
+    if (res == IPP_LL_END) {
+        *reg(s, p->ints) |= p->ll_end;
         ipp_update_irq(s);
         return;
     }

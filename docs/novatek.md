@@ -958,11 +958,12 @@ The AI lists add two bits to the IPP's update command:
   row length is at `0x040` [13:0], the rows [28:16], the input vectors at
   `0x048`. Each output is an s32 at `0x02C`:
 
-      out[o][j] = ((sum_k x[o][k] * 256 * w[j][k] >> fshift) * gain
+      out[o][j] = ((sum_k ((x[o][k] * 256 * w[j][k]) >> fshift)) * gain
                    >> gshift) + offset
 
   where gain and its shift are at `0x04C`, and the offset (21 bits,
-  signed) and fshift at `0x050`. The x 256 is the 8 fraction bits 8-bit
+  signed) and fshift, the SDK's weight shift, at `0x050`. fshift
+  applies to each product before the sum. The x 256 is the 8 fraction bits 8-bit
   data carries through the datapath. `vendor_ai_op` asks for a total
   shift 8 more than the fractions add up to, and `kdrv_ai_fc_done`
   shifts 8-bit results by 8 more than 16-bit ones. 16-bit data has no
@@ -1025,7 +1026,7 @@ With `--samples` too, it runs `ai_op`'s five operators and checks them:
 - a fully connected job;
 - an NV12 picture scaled and mean-subtracted;
 - a CNN list of two jobs fired by bit-60 updates, one value based by
-  bit 59.
+  bit 59, whose list end runs neither job again.
 
 ## Display
 

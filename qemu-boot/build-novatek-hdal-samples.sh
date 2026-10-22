@@ -134,5 +134,5 @@ build_ai() {        # build_ai <sample>
 build_ai ai_op
 mkdir -p "$OUT/smp/jpg"
 cp "$H/samples/ai_pattern/jpg/YUV420_SP_W512H376.bin" "$OUT/smp/jpg/"
-"${CROSS}strip" "$OUT/smp/"*
+find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +
 echo "Samples and their runtime in $OUT"

@@ -1892,6 +1892,19 @@ def test_ai(qt):
           list(struct.unpack('<3i', qt.read(AI_OUT, 12))), want)
     qt.writel(NUE + 0x03C, 0xFFFFFFFF)
     check('status is write 1 to clear', gic_pending(qt, 14), False)
+    # the same job from a list, fired by its last update and writing over
+    # its own input: run twice, it would compute from its own results
+    def upd(off, val, flags=0):
+        return struct.pack('<Q', 8 << 60 | flags | 0xF << 44 | off << 32 | val)
+    qt.write(AI_LL, upd(0x02C, AI_IN, 1 << 60) + struct.pack('<Q', 0))
+    qt.writel(NUE + 0x024, AI_LL)
+    qt.writel(NUE + 0x038, 0x500)
+    qt.writel(NUE + 0x000, 1 << 28)
+    qt.step(5 * 1000 * 1000)
+    check('NUE list: the fired job runs once, then the list ends',
+          (list(struct.unpack('<3i', qt.read(AI_IN, 12))),
+           qt.readl(NUE + 0x03C) & 0x500), (want, 0x500))
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
     # NUE2: 4x2 NV12 grey / white to RGB, scaled to 2x2, DC mean 16
     qt.write(AI_IN, bytes([128, 128, 255, 255, 128, 128, 255, 255]))
     qt.write(AI_IN + 0x100, bytes([128, 128, 128, 128]))
@@ -1916,8 +1929,6 @@ def test_ai(qt):
     qt.writel(NUE2 + 0x040, 0xFFFFFFFF)
     # CNN: a list of two jobs, each ending in a firing update (bit 60);
     # a bit-59 update adds the list base
-    def upd(off, val, flags=0):
-        return struct.pack('<Q', 8 << 60 | flags | 0xF << 44 | off << 32 | val)
     qt.writel(CNN + 0x204, 0x10000000)              # list base
     qt.write(AI_LL, upd(0x010, 0x1234, 1 << 59) + upd(0x0C0, 0, 1 << 60) +
              upd(0x014, 0x5678) + upd(0x0C0, 0, 1 << 60) +
