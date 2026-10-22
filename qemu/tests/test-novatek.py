@@ -76,6 +76,13 @@ plays the vendor drivers (docs/novatek.md):
   - nvt-rsa: 256, 512 and 2048-bit modular exponentiation through the
     SRAM ports, against Python's pow(), SPI 20; a CRC32 key check never
     reporting done;
+  - nvt-media, the HDAL engines' handshakes: SIE frames in three steps
+    (VD, break points, ends) with single-mode outputs completing; an IME
+    linked list of two jobs, its updates applied with their byte enables,
+    frame / job / list end and SPI 6; the graphics engine's list end (no
+    DMA idle), single job and reset; ISE's list; H.26x flags, reset and a
+    picture (BS_LEN, a filler NAL); a JPEG of four grey MCUs; the EAC
+    strobes; the DAI's capture DMA (load, buffer full with silence, stop);
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -1351,6 +1358,170 @@ def test_rsa(qt):
           qt.readl(RSA + 0x0C) & 1, 0)
 
 
+# ---- nvt-media: the HDAL engines ---------------------------------------------
+
+SIE = 0xF0C00000
+IME = 0xF0C40000
+GRPH = 0xF0C80000
+ISE = 0xF0C90000
+H26X = 0xF0A10000
+JPG = 0xF0A00000
+EAC = 0xF0640000
+DAI = 0xF0630000
+LL = 0x01100000
+FRAME_NS = 1000 * 1000 * 1000 // 30
+
+
+def ll_upd(off, val, byte_en=0xF):
+    return struct.pack('<Q', 4 << 61 | byte_en << 44 | off << 32 | val)
+
+
+def ll_nxtll(addr):
+    return struct.pack('<Q', 1 << 61 | addr << 8)
+
+
+def test_media(qt):
+    print('nvt-media')
+    # SIE: a frame in three steps, single-mode outputs complete
+    gic_enable(qt, 1)
+    qt.writel(SIE + 0x08, 0x2008F)                  # VD, BP3, OUT0 end, CRPEND
+    qt.writel(SIE + 0xA4, 0x70000000)               # three outputs, single
+    qt.writel(SIE + 0x00, 0x6)                      # ACT_EN | LOAD
+    check('SIE: LOAD clears itself, DMA idle reads set',
+          qt.readl(SIE + 0x00) & 0x02000006, 0x02000004)
+    qt.step(FRAME_NS // 3 + 1000)
+    check('SIE frame start: VD and the window starts, SPI 1',
+          (qt.readl(SIE + 0x0C), gic_pending(qt, 1)), (0x31, True))
+    qt.writel(SIE + 0x0C, 0xFFFFFFFF)
+    qt.step(FRAME_NS // 3)
+    check('half way: the line break points', qt.readl(SIE + 0x0C), 0xE)
+    qt.writel(SIE + 0x0C, 0xFFFFFFFF)
+    qt.step(FRAME_NS // 3)
+    check('frame end: the window ends and the DRAM outputs\' ends',
+          qt.readl(SIE + 0x0C), 0x31F80)
+    check('a single-mode output clears its enable once written',
+          qt.readl(SIE + 0xA4), 0)
+    qt.writel(SIE + 0x00, 0)
+    qt.writel(SIE + 0x0C, 0xFFFFFFFF)
+    qt.step(FRAME_NS)
+    check('stopped: no more frames', qt.readl(SIE + 0x0C), 0)
+
+    # IME: a linked list of two jobs; its updates set the enables
+    gic_enable(qt, 6)
+    second = LL + 0x100
+    qt.write(LL, ll_upd(0x018, 0xA0000009) + ll_upd(0x100, 0xBEEF1234, 0x3) +
+             ll_nxtll(second))
+    qt.write(second, ll_upd(0x104, 0x5A5A5A5A) + struct.pack('<Q', 0))
+    qt.writel(IME + 0x100, 0xFFFF0000)
+    qt.writel(IME + 0x14, LL)
+    qt.writel(IME + 0x00, 1 << 28)
+    check('IME: the fire bit does not stay', qt.readl(IME + 0x00), 0)
+    qt.step(1000 * 1000)
+    check('job 1: its updates applied, bytes as enabled',
+          (qt.readl(IME + 0x18), qt.readl(IME + 0x100)),
+          (0xA0000009, 0xFFFF1234))
+    check('frame start / end and job end in status, SPI 6',
+          (qt.readl(IME + 0x1C), gic_pending(qt, 6)), (0xA0000008, True))
+    qt.writel(IME + 0x1C, 0xFFFFFFFF)
+    check('status written back: SPI 6 drops', gic_pending(qt, 6), False)
+    qt.step(1000 * 1000)
+    check('job 2, the last: list end too',
+          (qt.readl(IME + 0x104), qt.readl(IME + 0x1C)),
+          (0x5A5A5A5A, 0xA0000009))
+    qt.writel(IME + 0x1C, 0xFFFFFFFF)
+
+    # 2D graphics: list end without DMA idle (an abort's); single jobs
+    gic_enable(qt, 18)
+    qt.write(LL, ll_upd(0x008, 0x16) + struct.pack('<Q', 0))
+    qt.writel(GRPH + 0xD0, LL)
+    qt.writel(GRPH + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    check('graphics list: list end only, SPI 18',
+          (qt.readl(GRPH + 0x0C), gic_pending(qt, 18)), (0x2, True))
+    qt.writel(GRPH + 0x0C, 0xFF)
+    qt.writel(GRPH + 0x00, 0x2)
+    check('software reset takes effect at once', qt.readl(GRPH + 0x00), 0)
+    qt.writel(GRPH + 0x08, 0x1)
+    qt.writel(GRPH + 0x00, 0x1)
+    qt.step(1000 * 1000)
+    check('a single job: done in status bit 0, its trigger dropped',
+          (qt.readl(GRPH + 0x0C), qt.readl(GRPH + 0x00)), (0x1, 0))
+    qt.writel(GRPH + 0x0C, 0xFF)
+
+    # ISE: list end and frame end
+    qt.write(LL, struct.pack('<Q', 0))
+    qt.writel(ISE + 0x2C, LL)
+    qt.writel(ISE + 0x00, 1 << 28)
+    qt.step(1000 * 1000)
+    check('ISE list: frame end and list end', qt.readl(ISE + 0x0C),
+          0x80000001)
+
+    # H.26x: INT_FLAG write 1 to clear, reset, a picture
+    gic_enable(qt, 16)
+    qt.writel(H26X + 0x004, 0x01101711)
+    check('H.26x: INT_FLAG clears by writing ones', qt.readl(H26X + 0x004), 0)
+    qt.writel(H26X + 0x000, 0x10)
+    check('software reset: its finish flag', qt.readl(H26X + 0x004),
+          0x10000000)
+    qt.writel(H26X + 0x004, 0xFFFFFFFF)
+    qt.writel(H26X + 0x070, DST)
+    qt.writel(H26X + 0x07C, 0x10000)
+    qt.writel(H26X + 0x01C, 0x1)
+    qt.writel(H26X + 0x000, 0x100)
+    qt.step(1000 * 1000)
+    check('a picture: finish flag and SPI 16, start dropped',
+          (qt.readl(H26X + 0x004), gic_pending(qt, 16),
+           qt.readl(H26X + 0x000)), (1, True, 0))
+    nal = qt.read(DST, 64)
+    check('BS_LEN 64, a filler NAL unit in the buffer',
+          (qt.readl(H26X + 0x268), nal[:6].hex(), nal[63]),
+          (64, '000000014c01', 0x80))
+    qt.writel(H26X + 0x004, 0xFFFFFFFF)
+
+    # JPEG: reset, DMA idle, a grey 4-MCU picture
+    gic_enable(qt, 17)
+    qt.writel(JPG + 0x00, 0x8)
+    check('JPEG: reset clears itself, DMA idle reads set',
+          qt.readl(JPG + 0x00), 0x20)
+    qt.writel(JPG + 0x2C, 4)
+    qt.writel(JPG + 0x40, DST)
+    qt.writel(JPG + 0x44, 0x1000)
+    qt.writel(JPG + 0x18, 1)
+    qt.writel(JPG + 0x00, 1)
+    qt.step(1000 * 1000)
+    check('frame end, SPI 17, act dropped',
+          (qt.readl(JPG + 0x1C), gic_pending(qt, 17),
+           qt.readl(JPG + 0x00) & 1), (1, True, 0))
+    check('the scan: DC 0 / EOB per block, 4 bytes per MCU, then EOI',
+          (qt.readl(JPG + 0x4C), qt.read(DST, 18).hex()),
+          (18, '28a28a00' * 4 + 'ffd9'))
+    qt.writel(JPG + 0x1C, 1)
+
+    # EAC: strobes the driver waits on
+    qt.writel(EAC + 0x04, 1)
+    qt.writel(EAC + 0x10, 0x17000)
+    check('EAC: LOAD and the DC-cancel load clear themselves',
+          (qt.readl(EAC + 0x04), qt.readl(EAC + 0x10)), (0, 0x15000))
+
+    # DAI: capture DMA, double-buffered
+    gic_enable(qt, 15)
+    qt.write(DST, b'\xAA' * 1024)
+    qt.writel(DAI + 0x48, DST)
+    qt.writel(DAI + 0x68, 256)                      # words: 1 KiB
+    qt.writel(DAI + 0x20, 0x444)                    # RX load, BFI, stop
+    qt.writel(DAI + 0x00, 0x41)
+    check('DAI: RX DMA on latches the buffer (DMALOAD), SPI 15',
+          (qt.readl(DAI + 0x28), gic_pending(qt, 15)), (0x40, True))
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.step(32 * 1000 * 1000)
+    check('1 KiB at 32 KB/s later: buffer full and the next load',
+          qt.readl(DAI + 0x28), 0x44)
+    check('the buffer holds silence', qt.read(DST, 1024), bytes(1024))
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.writel(DAI + 0x00, 0x1)
+    check('RX DMA off: stop', qt.readl(DAI + 0x28), 0x400)
+
+
 # ---- nvt-usb, nvt-otp -------------------------------------------------------
 
 USB = 0xF0600000
@@ -1821,6 +1992,11 @@ def test_fdt(qemu, tmp):
     check('the USB host and OTP nodes ehci-na51089.c needs',
           b'nvt,ehci-nvtivot\0' in data and b'nvt,nvt_otp\0' in data, True)
     check('the PWM node pwm-na51055.c binds', b'nvt,nvt_pwm\0' in data, True)
+    check('the HDAL media nodes, units and limits',
+          find_nodes(data, ['sie@f0c00000', 'ime@f0c40000', 'h26x@f0a10000',
+                            'jpg@f0a00000', 'dai@f0630000', 'nvtmpp',
+                            'isf_vdoenc', 'hdal-maxpath-cfg', 'hdal-memory',
+                            'pll_preset@0']).count(-1), 0)
     check('the crypto, hash and RSA nodes the na51089 drivers bind',
           find_nodes(data, ['crypto@f0620000', 'hash@f0670000',
                             'rsa@f06a0000']).count(-1) == 0 and
@@ -1980,6 +2156,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98562')
     try:
         test_timer(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566')
+    try:
+        test_media(qt)
     finally:
         qt.close()
 

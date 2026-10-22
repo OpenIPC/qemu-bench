@@ -26,10 +26,17 @@ v1.01.002 SDK kernel. NA51023 and NA51055 use NA51089's register offsets
 
 ## Machines
 
-| Machine | Chip ID (TOP +0xF0 [31:16]) | DDR | Linux / HDAL split |
+| Machine | Chip ID (TOP +0xF0 [31:16]) | DDR in the package | Emulated: Linux / HDAL |
 |---|---|---|---|
-| `nt98562` | `0x7021` | 64 MiB DDR2 | 30 / 34 MiB (`cfg_562_IPCAM1_NOR_EVB`) |
-| `nt98566` | `0x7021` | 128 MiB DDR3 | 32 / 96 MiB (`FW98566A.bin`, IPCAM1_EVB) |
+| `nt98562` | `0x7021` | 64 MiB DDR2 (SDK: 30 / 34 MiB) | 128 / 96 MiB |
+| `nt98566` | `0x7021` | 128 MiB DDR3 (SDK: 32 / 96 MiB) | 128 / 96 MiB |
+
+The SDK's memory tables (`nvt-mem-tbl.dtsi`) give Linux 30 or 32 MiB and
+the HDAL media pool the rest. That is too little to run the HDAL samples
+and their files beside the media modules, so both machines get 224 MiB by
+default, more than the packages hold: Linux the first 128 MiB, and the
+96 MiB media pool (`/hdal-memory`) after it. `-m` resizes the pool. The
+vendor firmware boots with its own device tree and its own split.
 
 The CPU is QEMU's Cortex-A9 with its MIDR set to r4p1. QEMU's default is
 r0p0, and Linux's `arm_global_timer` refuses anything before r2p0 (a
@@ -64,6 +71,12 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | Crypto (AES, DES, 3DES) | `0xF0620000` | 38 | `nvt-crypto` |
 | Hash (SHA-1/256, HMAC) | `0xF0670000` | 28 | `nvt-hash` |
 | RSA | `0xF06A0000` | 20 | `nvt-rsa` |
+| SIE 1 / 2 / 3 (sensor capture) | `0xF0C00000` / `0xF0D20000` / `0xF0D30000` | 1 / 2 / 3 | `nvt-media` |
+| IFE / DCE / IPE / IME | `0xF0C70000` / `0xF0C20000` / `0xF0C30000` / `0xF0C40000` | 8 / 7 / 5 / 6 | `nvt-media` |
+| ISE / 2D graphics (2 engines) | `0xF0C90000` / `0xF0C80000`, `0xF0D10000` | 21 / 18, 19 | `nvt-media` |
+| H.26x / JPEG codec | `0xF0A10000` / `0xF0A00000` | 16 / 17 | `nvt-media` |
+| EAC / DAI (audio) | `0xF0640000` / `0xF0630000` | — / 15 | `nvt-media` |
+| CSI, LVDS, sensor PHY, TGE, SIF, AI | | | `nvt-media`, storage |
 | On-chip SRAM | `0xF07C0000` | | — |
 | A9 MPCore (SCU, GIC, timers) | `0xFFD00000` | PPI 11 / 13 | `a9mpcore_priv` |
 | PL310 | `0xFFE00000` | 96 | `l2x0` |
@@ -601,6 +614,102 @@ The ciphertext must be `fb ee 76 ee ...`, AES-128 under a zero key.
 - **RSA:** 256, 512 and 2048-bit exponentiation, checked against Python's
   `pow()`.
 
+## HDAL media
+
+OpenIPC's `load_novatek` loads the vendor's HDAL kernel modules:
+- kwrap, nvtmem and kdrv_builtin;
+- kdrv_comm;
+- the video capture, process, codec and gfx drivers and their kflow units;
+- audio;
+- the ISP, AE, AWB and IQ;
+- the sensor driver.
+
+They bind by device tree, so the machine generates the vendor nodes
+(`nvt-peri.dtsi`, `nvt-media.dtsi`, `nvt-mem-tbl.dtsi`):
+- every engine, with its windows and interrupts;
+- the HDAL's software units (`nvtmpp`, `isf_flow`, `isf_vdocap`, ...);
+- `/hdal-memory`;
+- `/hdal-maxpath-cfg`, the path limits the units size by (`isf_vdoenc`
+  fails its probe without it);
+- `/pll_preset@0`. `nvt_preset_pll()` sets PLL5 to 297 MHz from it, which
+  the sensor master clock divides to 27 MHz. Without it `ctl_sen` fails the
+  open with "cannot find pll for MCLK".
+
+Every engine is an `nvt-media` block (`hw/misc/nvt-media.c`): register
+storage, plus the handshakes its driver waits on. No pixels, samples or
+bitstreams move: the engines accept their setup and report each job
+done, and their outputs are placeholders.
+
+- **SIE (sensor capture).** While `ACT_EN` is set, a frame comes every
+  1/30 s, in three steps the way the sensor's lines would arrive:
+  1. VD and the window starts;
+  2. the line break points, half way;
+  3. the window ends and the DRAM outputs' ends.
+
+  An output in single mode clears its enable (`0xA4` bits 28..30) once
+  its frame is written. That is how `ctl_sie` knows a buffer is complete
+  and hands it on.
+- **IFE, DCE, IPE, IME, ISE, 2D graphics.** `kdrv_ipp` and the graphics
+  driver work in linked-list mode: a list of 64-bit commands in DRAM
+  (`kdrv_ipp_int_util.h`, `grph_ll.h`). The engine applies each UPD
+  (a register write with byte enables) through its own registers, which
+  include its interrupt enables, and follows NXTUPD. At NXTLL or NULL a
+  job is done: some 1 ms later it raises frame and job end, plus list end
+  after the last. The graphics engine raises list end only. `graph_isr`
+  reports DMA idle as an abort.
+- **H.26x.** `INT_FLAG` is write-1-to-clear, and software reset and DMA
+  disable set their finish flags. A picture finishes with:
+  - a filler NAL unit (H.265 FD_NUT) in the bitstream buffer;
+  - its length in `BS_LEN` (report slot 6) and the NAL length list.
+- **JPEG.** A frame "encodes" as a flat grey picture of the right size:
+  every block is "DC difference 0, end of block" in the standard Annex K
+  Huffman codes, four bytes per 4:2:0 MCU, then EOI. With the driver's
+  header that is a valid JPEG.
+- **EAC.** Its two strobes clear themselves: `LOAD`, and the DC-cancel
+  initial load.
+- **DAI.** The audio DMA is double-buffered:
+  - enabling a direction latches its buffer (DMA load);
+  - each buffer then finishes at 16-bit mono 16 kHz pace, raising buffer
+    full and the next load;
+  - capture fills the buffers with silence;
+  - disabling a direction raises stop.
+- **CSI, LVDS, the sensor PHY, TGE, SIF, the DDR arbiter.** Storage.
+
+`-global nvt-media.trace=on` logs every access to the media blocks; the
+access logs are how the handshakes above were worked out. A run under
+`-d unimp` with trace on can grow by gigabytes a minute, so write it to
+`/mnt/data` or cap it (`ulimit -f`).
+
+`qemu-boot/test-novatek-hdal.sh` (CI, both machines) boots the OpenIPC
+release with `sensor=sc501ai`. It runs the release's own `load_novatek`
+in a chroot of its SquashFS root, and checks that all 26 media drivers
+and units bound.
+
+With `--samples DIR` it also runs the SDK's HDAL sample programs, with
+their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
+builds them from the vendor SDK (not in CI). The run checks 47 things:
+- `hd_video_record` (sensor, SIE, the IPP, H.265) and
+  `hd_video_encode_only` write their bitstreams;
+- `hd_video_snapshot`'s JPEGs decode as 2880x1620 pictures;
+- `hd_video_capture_only` runs;
+- nine `hd_gfx_only` operations write their results;
+- `hd_audio_capture_only` captures PCM.
+
+None of them reports an HDAL error.
+
+The samples run against the release's own `libhdal.so`. That library is
+a uClibc build, and the OpenIPC rootfs answers its `libc.so.0` with musl,
+whose `mmap()` takes a 64-bit offset where uClibc's code passes 32 bits.
+libhdal's first mmap, of `/dev/log_vg`, then fails, and it writes through
+`MAP_FAILED`. So the samples are built with the SDK's uClibc toolchain
+and run under its runtime, which the builder bundles.
+
+The SDK's sensor samples name an IMX290 or use 1920x1080 buffers; the
+builder sets them to the SC501AI's 2880x1620 mode, the only one its
+driver offers.
+
+`test-novatek.py` checks each engine's handshake at register level, in CI.
+
 ## Ethernet
 
 `nvt-eqos` is the 16 KiB block at `0xF02B0000`: a Synopsys DWC Ethernet QoS
@@ -707,4 +816,9 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   words are storage, and every interrupt goes to SPI 0).
 - The RSA engine's CRC32 key checks, the hash engine's PIO mode, and
   OTP key sets other than blank (the key manager hands out zeros).
-- The HDAL media blocks.
+- The HDAL engines' pixel, sample and bitstream work: frames, encoded
+  pictures and audio are placeholders (see HDAL media). The graphics
+  samples that check their output (DMA copy, arithmetic) fail. The SIE
+  ignores the sensor's real timing (fixed 30 fps), and the DAI paces audio
+  at a nominal rate. AI/CNN, MD, DIS, VPE, IVE and the display path are
+  not wired.

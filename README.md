@@ -255,7 +255,12 @@ controllers work under the vendor driver, and `sensor=sc401ai` (or
 `load_novatek` detect and load the driver for. The crypto engines
 (AES/DES/3DES with GCM, SHA/HMAC, RSA) pass the kernel's self-tests under
 the vendor drivers in that test kernel, and the vendor U-Boot's
-`nvt_encrypt` runs on them. The Novatek timer block
+`nvt_encrypt` runs on them. The HDAL media engines are there too: the
+release's `load_novatek` binds all of them, and the SDK's HDAL samples run
+capture, ISP, H.26x / JPEG encoding, 2D graphics and audio capture to
+completion. The engines move no pixels (`qemu-boot/test-novatek-hdal.sh`).
+The machines give Linux 128 MB and the HDAL pool 96 MB, more than the
+packages hold. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
 U-Boot's boot-time stamps and the HDAL read it. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
@@ -402,6 +407,7 @@ qemu/
 ├── hw/misc/nvt-crypto.c         # Crypto engine: AES/DES/3DES, ECB..CTR, GCM, descriptor DMA
 ├── hw/misc/nvt-hash.c           # Hash engine: SHA-1/256 and HMAC, chunked DMA
 ├── hw/misc/nvt-rsa.c            # RSA engine: modular exponentiation to 2048 bits
+├── hw/misc/nvt-media.c          # HDAL media engines: SIE frames, IPP / gfx linked lists, codec, audio DMA
 ├── hw/misc/nvt-pwm.c            # PWM: enable/disable, cycle-count runs, stop interrupts
 ├── hw/timer/nvt-timer.c         # Novatek timers: one-shot / free run, timer 0 at 1 MHz
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot
@@ -438,6 +444,8 @@ qemu-boot/
 ├── test-novatek-usb.sh          # NT9856x USB stick under the vendor EHCI driver
 ├── test-novatek-pwm.sh          # NT9856x PWM through /sys/class/pwm (pwm-na51055.c)
 ├── test-novatek-crypto.sh       # NT9856x crypto engines: testmgr self-tests of the vendor drivers
+├── test-novatek-hdal.sh         # NT9856x HDAL: load_novatek binds the media engines; SDK samples run
+├── build-novatek-hdal-samples.sh # the SDK's HDAL samples, uClibc-built, for test-novatek-hdal.sh
 ├── test-novatek-nand.sh         # NT98566 SPI NAND: vendor U-Boot nand r/w, UBIFS across a reboot
 ├── sstar-env.py                 # Set U-Boot env vars in a SigmaStar flash image
 ├── fake-ipcam.py                # RTSP/ONVIF camera with a synthetic H.264 pattern
