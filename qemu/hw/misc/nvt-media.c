@@ -31,6 +31,7 @@
 #include "qom/object.h"
 #include "system/dma.h"
 #include "hw/misc/nvt-gfx.h"
+#include "hw/misc/nvt-h26x.h"
 #include "hw/misc/nvt-pixel.h"
 
 #define TYPE_NVT_MEDIA "nvt-media"
@@ -57,6 +58,7 @@ struct NvtMediaState {
     NvtMediaState *ipp_src;     /* IME: the IFE whose input it finishes */
     uint8_t jpg_q[128];         /* JPEG: luma / chroma quantisation, zig-zag */
     uint32_t jpg_lut;           /* JPEG: the LUT port's select / address */
+    NvtH26x *h26x;              /* H.26x: its streams' encoders */
 };
 
 /*
@@ -480,6 +482,7 @@ static void ipp_job_done(NvtMediaState *s)
 #define H26X_CTRL_START     (1u << 8)
 #define H26X_CTRL_DMA_DIS   (1u << 27)
 #define H26X_INT_FINISH     (1u << 0)
+#define H26X_INT_BSOUT_FULL (1u << 12)
 #define H26X_INT_SWRST      (1u << 28)
 #define H26X_INT_DMA_DIS    (1u << 30)
 
@@ -511,51 +514,32 @@ static uint64_t h26x_write(NvtMediaState *s, hwaddr off, uint64_t val)
     return val;
 }
 
-#define H26X_NAL_LEN_ADDR   0x068
-#define H26X_BSOUT_ADDR     0x070
-#define H26X_BSOUT_SIZE     0x07C
 #define H26X_REPORT         0x250   /* CHK_REPORT[], H26XREPORT order */
 #define H26X_RPT_BS_LEN     6
 #define H26X_RPT_RRC_BITS   10
-#define H26X_FILLER_LEN     64
+#define H26X_RPT_QP_SUM     19
 
 /*
- * A picture "encoded": a filler NAL unit (H.265 FD_NUT, which decoders
- * skip) stands for the slice, its length in the report and the NAL
- * length list.
+ * A picture (nvt-h26x.c): coded for real when an encoder can match the
+ * driver's stream, else a filler slice.  The report gives its length and
+ * QP; a picture the bitstream buffer cannot take raises buffer full
+ * instead of finish.
  */
 static void h26x_done(NvtMediaState *s)
 {
-    uint8_t nal[H26X_FILLER_LEN];
-    uint32_t len = MIN(H26X_FILLER_LEN, *reg(s, H26X_BSOUT_SIZE));
-    uint32_t le;
+    NvtH26xResult r;
 
-    if (len < 8) {
-        qemu_log_mask(LOG_GUEST_ERROR, "nvt-media h26x: a %u-byte "
-                      "bitstream buffer\n", *reg(s, H26X_BSOUT_SIZE));
-        len = 0;
-    } else {
-        memset(nal, 0xFF, sizeof(nal));
-        nal[0] = 0;
-        nal[1] = 0;
-        nal[2] = 0;
-        nal[3] = 1;
-        nal[4] = 38 << 1;           /* FD_NUT */
-        nal[5] = 1;
-        nal[len - 1] = 0x80;        /* rbsp trailing bits */
-        le = cpu_to_le32(len);
-        dma_memory_write(&address_space_memory, *reg(s, H26X_BSOUT_ADDR),
-                         nal, len, MEMTXATTRS_UNSPECIFIED);
-        if (*reg(s, H26X_NAL_LEN_ADDR)) {
-            dma_memory_write(&address_space_memory,
-                             *reg(s, H26X_NAL_LEN_ADDR), &le, 4,
-                             MEMTXATTRS_UNSPECIFIED);
-        }
-    }
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_BS_LEN) = len;
-    *reg(s, H26X_REPORT + 4 * H26X_RPT_RRC_BITS) = len * 8;
-    *reg(s, H26X_INT_FLAG) |= H26X_INT_FINISH;
+    nvt_h26x_encode(s->h26x, s->regs, &r);
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_BS_LEN) = r.len;
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_RRC_BITS) = r.len * 8;
+    *reg(s, H26X_REPORT + 4 * H26X_RPT_QP_SUM) = r.qp_sum;
+    *reg(s, H26X_INT_FLAG) |= r.full ? H26X_INT_BSOUT_FULL : H26X_INT_FINISH;
     h26x_update_irq(s);
+}
+
+static void h26x_reset(NvtMediaState *s)
+{
+    nvt_h26x_reset(s->h26x);
 }
 
 /*
@@ -867,7 +851,7 @@ static const NvtMediaEngine nvt_media_engines[] = {
     { "dce", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_dce },
     { "ipe", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ipe },
     { "ime", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ime },
-    { "h26x", h26x_write, NULL, NULL, h26x_done, h26x_update_irq },
+    { "h26x", h26x_write, NULL, h26x_reset, h26x_done, h26x_update_irq },
     { "eac", eac_write },
     { "dai", dai_write, NULL, NULL, dai_period, dai_update_irq },
     { "jpg", jpg_write, jpg_read, NULL, jpg_done, jpg_update_irq },
@@ -961,6 +945,9 @@ static void nvt_media_realize(DeviceState *dev, Error **errp)
         }
     }
     s->regs = g_malloc0(s->size);
+    if (s->engine->timer == h26x_done) {
+        s->h26x = nvt_h26x_new();
+    }
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nvt_media_timer, s);
     memory_region_init_io(&s->iomem, OBJECT(dev), &nvt_media_ops, s,
                           TYPE_NVT_MEDIA, s->size);

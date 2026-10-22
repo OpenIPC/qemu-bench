@@ -101,8 +101,10 @@ cp qemu/hw/misc/nvt-rsa.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-media.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-pixel.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-gfx.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-h26x.c          "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/nvt-pixel.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/nvt-gfx.h   "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/nvt-h26x.h  "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/nvt-dai.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-engine.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/nvt-hdmi.c          "$QEMU_DIR/hw/misc/"
@@ -507,6 +509,24 @@ for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nv
         echo "  hw/${f%/*}/meson.build: added ${f#*/}.c"
     fi
 done
+# The H.26x engine codes its pictures with x264 / x265 when pkg-config
+# finds them, and writes filler slices when it does not (nvt-h26x.c).
+# (The defines reach every system_ss file; only nvt-h26x.c looks.)
+if ! grep -q "'nvt-h26x.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'MESON'
+nvt_x264 = dependency('x264', required: false)
+nvt_x265 = dependency('x265', required: false)
+nvt_h26x = [files('nvt-h26x.c')]
+if nvt_x264.found()
+  nvt_h26x += [nvt_x264, declare_dependency(compile_args: '-DNVT_H26X_X264')]
+endif
+if nvt_x265.found()
+  nvt_h26x += [nvt_x265, declare_dependency(compile_args: '-DNVT_H26X_X265')]
+endif
+system_ss.add(when: 'CONFIG_NOVATEK', if_true: nvt_h26x)
+MESON
+    echo "  hw/misc/meson.build: added nvt-h26x.c"
+fi
 if ! grep -q "'novatek.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('novatek.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"

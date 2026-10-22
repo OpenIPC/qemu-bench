@@ -1556,9 +1556,10 @@ def test_media(qt):
     qt.writel(H26X + 0x07C, 0)
     qt.writel(H26X + 0x000, 0x100)
     qt.step(1000 * 1000)
-    check('no bitstream buffer: finishes with BS_LEN 0, writes nothing',
-          (qt.readl(H26X + 0x004) & 1, qt.readl(H26X + 0x268),
-           qt.read(DST, 8)), (1, 0, b'\x55' * 8))
+    check('no bitstream buffer: buffer full (bit 12), not finish; BS_LEN 0, '
+          'nothing written',
+          (qt.readl(H26X + 0x004) & 0x1001, qt.readl(H26X + 0x268),
+           qt.read(DST, 8)), (0x1000, 0, b'\x55' * 8))
     qt.writel(H26X + 0x004, 0xFFFFFFFF)
 
     # JPEG: reset, DMA idle, a grey 4-MCU picture

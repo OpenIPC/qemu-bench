@@ -15,8 +15,10 @@
 #     the bitstream file written, no HDAL error;
 #   - hd_video_snapshot: two JPEG snapshots, each a whole JPEG (SOI ...
 #     EOI) that a decoder (Python PIL) reads as a 2880x1620 picture;
-#   - hd_video_capture_only, hd_video_encode_only (H.264 / H.265 from a
-#     file of frames): no HDAL error;
+#   - hd_video_capture_only, hd_video_encode_only (H.265 and H.264 from a
+#     patterned file of frames): no HDAL error; with x264 / x265 built
+#     into QEMU and ffmpeg on the host, both bitstreams decode without an
+#     error to pictures of the input (PSNR 30 dB or better);
 #   - hd_gfx_only: copy, scale (ISE), rotation, colour transform, lines,
 #     rectangles, job lists, YUV420 3P -> 2P and 3P scaling, from inputs
 #     patterned here, leave the pixels the engines should compute; the DMA
@@ -25,9 +27,8 @@
 #
 # The SIE captures a moving test pattern; the IPP turns its RAW into YUV and
 # the JPEG codec encodes it, so the snapshots show colour bars, a grey ramp
-# and a white box that moves between them (checked with Python PIL).  H.26x
-# output and audio are still placeholders (docs/novatek.md).  Sample keys
-# go in on stdin.
+# and a white box that moves between them (checked with Python PIL).  Audio
+# is still a placeholder (docs/novatek.md).  Sample keys go in on stdin.
 #
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
 #       [--samples DIR] [--dir qemu-boot] [--qemu ./qemu-src/build/qemu-system-arm]
@@ -90,6 +91,22 @@ if [ -n "$SAMPLES" ]; then
     # hd_gfx_only's inputs, patterned so its results can be checked: Y is
     # (x + y) / 16, U / V ramps over the pair index, the ARGB4444 logo is
     # opaque green
+    # hd_video_encode_only's 30 frames of 352x288 NV12: a ramp scrolling
+    # 4 pixels a frame, chroma ramps (the host compares the decoded
+    # bitstreams with them)
+    mkdir -p "$WORK/initramfs/encin"
+    python3 - "$WORK/initramfs/encin/video_frm_352_288_30_yuv420.dat" <<'PY'
+import sys
+w, h = 352, 288
+out = bytearray()
+for f in range(30):
+    out += bytes(16 + ((x + 4 * f) % w) * 200 // w
+                 for y in range(h) for x in range(w))
+    out += bytes(v for y in range(h // 2) for x in range(w // 2)
+                 for v in (98 + y * 60 // 144,
+                           98 + ((x + 2 * f) % (w // 2)) * 60 // (w // 2)))
+open(sys.argv[1], 'wb').write(out)
+PY
     mkdir -p "$WORK/initramfs/gfxin"
     python3 - "$WORK/initramfs/gfxin" <<'PY'
 import sys
@@ -133,7 +150,7 @@ echo "NVT-HDAL-MODULES: \$(\$bb lsmod | \$bb wc -l)"
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
 done
-[ -d /smp ] && \$bb cp -a /smp /uc /gfxin /samples.sh /mnt/tmp/ && \$bb chroot /mnt /bin/sh /tmp/samples.sh
+[ -d /smp ] && \$bb cp -a /smp /uc /gfxin /encin /samples.sh /mnt/tmp/ && \$bb chroot /mnt /bin/sh /tmp/samples.sh
 echo "NVT-HDAL-OK"
 \$bb reboot -f
 INIT
@@ -147,14 +164,14 @@ for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0 ] && break; sleep 1; done
 mount -t tmpfs -o size=1m sd /mnt && mkdir /mnt/sd
 mkfs.vfat /dev/mmcblk0 >/dev/null && mount -t vfat /dev/mmcblk0 /mnt/sd
 cd /tmp/smp
-run() {         # run <sample> [keys]: the keys 4 s apart, then q
+run() {         # run <sample> [keys]: the keys 4 s apart, then q ($ARGS)
     n=$1
     shift
     ( sleep 6; for k in "$@"; do echo "$k"; sleep 4; done; echo q ) |
-        timeout 60 ./$n > /tmp/$n.out 2>&1
+        timeout 60 ./$n $ARGS > /tmp/$n.out 2>&1
     RC=$?
     ERRS=$(grep -c -i 'err\|fail' /tmp/$n.out)
-    echo "NVT-HDAL-RUN: $n rc=$RC errors=$ERRS"
+    echo "NVT-HDAL-RUN: $n${ARGS:+ $ARGS} rc=$RC errors=$ERRS"
 }
 size() {
     [ -f "$1" ] && wc -c < "$1" || echo 0
@@ -172,9 +189,15 @@ for n in 0 1; do
 done
 rm -f /mnt/sd/*
 run hd_video_capture_only
-dd if=/dev/zero of=/mnt/sd/video_frm_352_288_30_yuv420.dat bs=1k count=4455 2>/dev/null
-run hd_video_encode_only
-echo "NVT-HDAL-ENCODE-BYTES: $(size /mnt/sd/dump_bs_main.dat)"
+cp /tmp/encin/video_frm_352_288_30_yuv420.dat /mnt/sd/
+for t in 0 1; do                # H.265, H.264
+    ARGS=$t run hd_video_encode_only
+    echo "NVT-HDAL-ENCODE-BYTES: $t $(size /mnt/sd/dump_bs_main.dat)"
+    echo "NVT-HDAL-ENC-B64-BEGIN $t"
+    head -c 4000000 /mnt/sd/dump_bs_main.dat | base64
+    echo "NVT-HDAL-ENC-B64-END $t"
+    rm -f /mnt/sd/dump_bs_main.dat
+done
 rm -f /mnt/sd/*
 cp /tmp/gfxin/* /mnt/sd/
 px() {          # px <file> <offset> <bytes>: those bytes in hex
@@ -253,7 +276,8 @@ expect 'NVT-HDAL-OK' 'PID 1 ran to the end'
 
 if [ -n "$SAMPLES" ]; then
     for s in hd_video_record hd_video_snapshot hd_video_capture_only \
-             hd_video_encode_only hd_audio_capture_only; do
+             "hd_video_encode_only 0" "hd_video_encode_only 1" \
+             hd_audio_capture_only; do
         expect "NVT-HDAL-RUN: $s rc=0 errors=0" "$s runs without an HDAL error"
     done
     if grep -a -q 'NVT-HDAL-RECORD-BYTES: [1-9]' "$WORK/console.log"; then
@@ -261,10 +285,55 @@ if [ -n "$SAMPLES" ]; then
     else
         bad "hd_video_record writes its bitstream"
     fi
-    if grep -a -q 'NVT-HDAL-ENCODE-BYTES: [1-9]' "$WORK/console.log"; then
-        pass "hd_video_encode_only writes its bitstream"
+    for t in "0 H.265" "1 H.264"; do
+        expect "NVT-HDAL-ENCODE-BYTES: ${t% *} [1-9]" \
+            "hd_video_encode_only writes its ${t#* } bitstream"
+    done
+    # With x264 / x265 in QEMU the bitstreams are real: they decode
+    # (ffmpeg, stopping at any error) to pictures of the input
+    if strings "$QEMU" | grep -c 'x264_encoder_open\|x265_encoder_open' >/dev/null &&
+            command -v ffmpeg >/dev/null; then
+        for t in "0 hevc H.265" "1 h264 H.264"; do
+            set -- $t
+            sed -n "/NVT-HDAL-ENC-B64-BEGIN $1/,/NVT-HDAL-ENC-B64-END $1/p" \
+                "$WORK/console.log" | grep -a -v 'NVT-HDAL' | tr -d '\r' |
+                base64 -d > "$WORK/enc$1.bin" 2>/dev/null || true
+            # the last NAL may be cut short by the transfer: drop it
+            python3 - "$WORK/enc$1.bin" <<'PY'
+import sys
+d = open(sys.argv[1], 'rb').read()
+cut = d.rfind(b'\x00\x00\x00\x01')
+open(sys.argv[1], 'wb').write(d[:cut] if len(d) >= 4000000 and cut > 0 else d)
+PY
+            ffmpeg -v error -xerror -f $2 -i "$WORK/enc$1.bin" \
+                -f rawvideo -pix_fmt nv12 "$WORK/dec$1.yuv" \
+                > "$WORK/dec$1.log" 2>&1 || true
+            look=$(python3 - "$WORK/initramfs/encin/video_frm_352_288_30_yuv420.dat" \
+                "$WORK/dec$1.yuv" <<'PY' 2>/dev/null || true
+import math, sys
+fs = 352 * 288 * 3 // 2
+src = open(sys.argv[1], 'rb').read()
+dec = open(sys.argv[2], 'rb').read()
+ins = [src[i:i + fs] for i in range(0, len(src), fs)]
+outs = [dec[i:i + fs] for i in range(0, len(dec) - fs + 1, fs)]
+def psnr(a, b):
+    se = sum((x - y) ** 2 for x, y in zip(a[::7], b[::7]))
+    return 99.0 if not se else 10 * math.log10(255 ** 2 * len(a[::7]) / se)
+worst = min((max(psnr(o, i) for i in ins) for o in outs[:40]), default=0)
+print('frames=%d psnr=%.1f' % (len(outs), worst))
+PY
+)
+            frames=$(echo "$look" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')
+            psnr=$(echo "$look" | sed -n 's/.*psnr=\([0-9]*\).*/\1/p')
+            if [ -s "$WORK/dec$1.log" ] || [ "${frames:-0}" -lt 5 ] ||
+                    [ "${psnr:-0}" -lt 30 ]; then
+                bad "$3 from hd_video_encode_only decodes to the input ($look; $(head -c 200 "$WORK/dec$1.log"))"
+            else
+                pass "$3 from hd_video_encode_only decodes to the input ($look)"
+            fi
+        done
     else
-        bad "hd_video_encode_only writes its bitstream"
+        echo "SKIP: decoding the H.26x bitstreams (QEMU without x264 / x265, or no ffmpeg)"
     fi
     for n in 0 1; do
         expect "NVT-HDAL-JPEG: dump_bs_snap$n.jpg ffd8 ffd9 [1-9]" \
