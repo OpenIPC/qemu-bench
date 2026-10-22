@@ -70,6 +70,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtAudioState, NVT_AUDIO)
 #define EAC_SIZE            0x300
 
 #define DAI_CTRL            0x00
+#define DAI_CTRL_EN         (1u << 0)
 #define DAI_FMT_TX          0x10
 #define DAI_FMT_RX          0x14
 #define DAI_FMT_TXLB        0x18
@@ -221,7 +222,8 @@ static bool ch_running(NvtAudioState *s, int c)
     if (c == CH_RX2 && !rx_dual_mono(s)) {
         return false;
     }
-    return s->ch[c].loaded && (ctrl & ch_en[c]) && (ctrl & ch_dma[c]);
+    return s->ch[c].loaded && (ctrl & DAI_CTRL_EN) && (ctrl & ch_en[c]) &&
+           (ctrl & ch_dma[c]);
 }
 
 /* take the queued buffer */
@@ -435,7 +437,9 @@ static void nvt_audio_schedule(NvtAudioState *s)
     int c;
 
     for (c = 0; c < CH_NUM; c++) {
-        if (ch_running(s, c)) {
+        /* a buffer too small for a frame never ends: nothing to time */
+        if (ch_running(s, c) &&
+            s->ch[c].bytes >= ch_frame_bytes(s, c)) {
             unsigned fb = ch_frame_bytes(s, c);
             uint64_t left = s->ch[c].bytes > s->ch[c].pos ?
                             (s->ch[c].bytes - s->ch[c].pos) / fb : 1;
@@ -453,11 +457,29 @@ static void nvt_audio_schedule(NvtAudioState *s)
     }
 }
 
+static void nvt_audio_voices(NvtAudioState *s);
+
+/*
+ * The clock tree changed under a running stream: the samples so far went
+ * at the old rate, the rest go at the new one.
+ */
+static void nvt_audio_rate(NvtAudioState *s)
+{
+    unsigned rate = s->cg ? nvt_cg_audio_rate(s->cg) : 48000;
+
+    if (rate != s->rate) {
+        s->rate = rate;
+        s->frac = 0;
+        nvt_audio_voices(s);
+    }
+}
+
 static void nvt_audio_tick(void *opaque)
 {
     NvtAudioState *s = opaque;
 
     nvt_audio_advance(s);
+    nvt_audio_rate(s);
     nvt_audio_schedule(s);
 }
 
@@ -533,12 +555,10 @@ static void nvt_audio_voices(NvtAudioState *s)
     if (rx && !s->vin) {
         s->vin = AUD_open_in(s->audio_be, NULL, "nvt-audio.in", s,
                              nvt_audio_in_cb, &as);
-        s->in.head = s->in.len = 0;
     }
     if (tx && !s->vout) {
         s->vout = AUD_open_out(s->audio_be, NULL, "nvt-audio.out", s,
                                nvt_audio_out_cb, &as);
-        s->out.head = s->out.len = 0;
     }
     if (s->vin) {
         AUD_set_active_in(s->vin, rx);
@@ -581,8 +601,15 @@ static void nvt_dai_write(void *opaque, hwaddr off, uint64_t val,
         if (on & ch_en[CH_RX1]) {
             s->tone_n = 0;
         }
+        /* a stream's queued samples go with it */
+        if ((gone | on) & ch_en[CH_RX1]) {
+            s->in.head = s->in.len = 0;
+        }
+        if ((gone | on) & ch_en[CH_TX1]) {
+            s->out.head = s->out.len = 0;
+        }
         if (on & (ch_en[CH_TX1] | ch_en[CH_TX2] | ch_en[CH_RX1] |
-                  ch_en[CH_TXLB])) {
+                  ch_en[CH_TXLB] | DAI_CTRL_EN)) {
             s->rate = s->cg ? nvt_cg_audio_rate(s->cg) : 48000;
             s->frac = 0;
         }
@@ -733,6 +760,18 @@ static const VMStateDescription vmstate_nvt_dai_chan = {
     }
 };
 
+static const VMStateDescription vmstate_nvt_audio_ring = {
+    .name = "nvt-audio-ring",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(data, NvtAudioRing, RING_BYTES),
+        VMSTATE_UINT32(head, NvtAudioRing),
+        VMSTATE_UINT32(len, NvtAudioRing),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_nvt_audio = {
     .name = TYPE_NVT_AUDIO,
     .version_id = 1,
@@ -748,6 +787,10 @@ static const VMStateDescription vmstate_nvt_audio = {
         VMSTATE_UINT64(frac, NvtAudioState),
         VMSTATE_UINT64(tone_n, NvtAudioState),
         VMSTATE_UINT32(rate, NvtAudioState),
+        VMSTATE_STRUCT(in, NvtAudioState, 1, vmstate_nvt_audio_ring,
+                       NvtAudioRing),
+        VMSTATE_STRUCT(out, NvtAudioState, 1, vmstate_nvt_audio_ring,
+                       NvtAudioRing),
         VMSTATE_END_OF_LIST()
     }
 };

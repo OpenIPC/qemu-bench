@@ -85,7 +85,8 @@ plays the vendor drivers (docs/novatek.md):
   - nvt-audio: the EAC strobes; capture DMA latching its buffer and the
     queued next, the test tone in it (1 kHz left, 1.5 kHz right), the
     current-address register, stop on the channel enable, the ADC enable
-    muting it, the rate from the CG; playback DMA stopping on its channel
+    muting it, the global enable gating it, the rate from the CG, also
+    when it changes mid-stream; playback DMA stopping on its channel
     enable, and playing to a wav audiodev;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
@@ -1668,6 +1669,29 @@ def test_audio(qt, wav):
     qt.writel(DAI + 0x00, 0x1)
     qt.writel(DAI + 0x28, 0xFFFFFFFF)
     qt.writel(CG + 0x38, 0x1B000100)                # 48 kHz again
+
+    # the DAI's global enable gates the DMAs too
+    qt.writel(DAI + 0x48, AUD_A)
+    qt.writel(DAI + 0x00, 0x4040)                   # DAIEN off
+    qt.step(10 * 1000 * 1000)
+    check('with DAIEN clear nothing moves', qt.readl(DAI + 0x28) & 4, 0)
+    qt.writel(DAI + 0x00, 0x0)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+
+    # a rate change under a running stream takes effect within a tick
+    qt.writel(DAI + 0x48, AUD_A)
+    qt.writel(DAI + 0x00, 0x4041)                   # 48 kHz: 5.3 ms a buffer
+    qt.writel(CG + 0x38, 0x14030000)                # now 16 kHz: 16 ms
+    qt.step(6 * 1000 * 1000)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)               # the first buffer, at 48k
+    qt.step(10 * 1000 * 1000)
+    early = qt.readl(DAI + 0x28) & 4
+    qt.step(8 * 1000 * 1000)
+    check('the CG dividers changing mid-stream change its rate',
+          (early, qt.readl(DAI + 0x28) & 4), (0, 4))
+    qt.writel(DAI + 0x00, 0x1)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.writel(CG + 0x38, 0x1B000100)
 
     # playback: 1 kHz, 16-bit stereo, to the wav audiodev
     tone = b''.join(struct.pack('<2h', *(
