@@ -114,20 +114,20 @@ ln -s busybox "$WORK/initramfs/bin/sh"
 # QEMU's console, and whether it is on MIPI DSI
 case $PANEL in
     pw35p00) PANEL_KO=disp_if8b_lcd1_pw35p00_hx8238d/disp_if8b_lcd1_pw35p00
-             PANEL_SIZE=320x240 PANEL_DSI= ;;
+             PANEL_SIZE=320x240 PANEL_DSI= PANEL_HELLO=PW35P00 ;;
     nt35510) PANEL_KO=disp_ifdsi_lcd1_nt35510/disp_ifdsi_lcd1_nt35510
-             PANEL_SIZE=480x800 PANEL_DSI=nvt_dsi ;;
+             PANEL_SIZE=480x800 PANEL_DSI=nvt_dsi PANEL_HELLO=NT35510 ;;
     tb093) PANEL_KO=disp_ifdsi_lcd1_tb093/disp_ifdsi_lcd1_tb093
-           PANEL_SIZE=320x1280 PANEL_DSI=nvt_dsi ;;
+           PANEL_SIZE=320x1280 PANEL_DSI=nvt_dsi PANEL_HELLO=tb093 ;;
     ili9488) PANEL_KO=disp_ifdsi_lcd1_ut35067a0_ili9488/disp_ifdsi_lcd1_ut35067a0_ili9488
-             PANEL_SIZE=320x480 PANEL_DSI=nvt_dsi ;;
+             PANEL_SIZE=320x480 PANEL_DSI=nvt_dsi PANEL_HELLO=UT35067A0 ;;
     *) echo "--panel: pw35p00, nt35510, tb093 or ili9488" >&2; exit 2 ;;
 esac
 PANEL_MOD=${PANEL_KO##*/}
 mkdir -p "$WORK/initramfs/dispin"
 if [ -n "$DISPLAY_KOS" ]; then
     mkdir -p "$WORK/initramfs/dko"
-    for k in kdrv_videoout/ide/nvt_ide kdrv_videoout/dsi/nvt_dsi \
+    for k in kdrv_videoout/ide/nvt_ide ${PANEL_DSI:+kdrv_videoout/dsi/nvt_dsi} \
              kdrv_videoout/display_obj/kdrv_videoout \
              kflow_videoout/unit/kflow_videoout display_panel/nvt_dispdev_panel \
              display_panel/$PANEL_KO; do
@@ -412,7 +412,7 @@ if [ -n "$DISPLAY_KOS" ]; then
              "dispdev nvt_dispdev" ${PANEL_DSI:+"f0840000.dsi nvt_dsi"}; do
         expect "NVT-HDAL-BOUND: $b[[:space:]]*\$" "display: ${b% *} bound by ${b#* }"
     done
-    expect "NVT-DISP-PANEL: Hello, panel:" "display: the $PANEL panel driver is up"
+    expect "NVT-DISP-PANEL: Hello, panel: $PANEL_HELLO" "display: the $PANEL panel driver is up"
 fi
 
 if [ -n "$SAMPLES" ]; then

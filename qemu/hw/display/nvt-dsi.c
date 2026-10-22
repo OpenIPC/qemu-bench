@@ -277,10 +277,17 @@ static const Property nvt_dsi_properties[] = {
     DEFINE_PROP_BOOL("trace", NvtDsiState, trace, false),
 };
 
+static int nvt_dsi_post_load(void *opaque, int version_id)
+{
+    nvt_dsi_update_irq(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_nvt_dsi = {
     .name = TYPE_NVT_DSI,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = nvt_dsi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtDsiState, DSI_REGS / 4),
         VMSTATE_UINT32(pending, NvtDsiState),
