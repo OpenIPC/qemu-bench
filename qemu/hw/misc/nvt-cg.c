@@ -32,6 +32,7 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include "hw/misc/nvt-cg.h"
 
 #define TYPE_NVT_CG "nvt-cg"
 OBJECT_DECLARE_SIMPLE_TYPE(NvtCgState, NVT_CG)
@@ -71,6 +72,37 @@ static const struct {
     { 0x4580, 0x280000 },   /* PLL12: sensor 2, 240 MHz */
     { 0x45C0, 0x395810 },   /* PLL7: audio, 344.064 MHz */
 };
+
+/*
+ * Audio: PLL7 (ratio at 0x45E0 / E4 / E8) divided by the eacdac divider
+ * (0x38 [31:24]) and the DAI's (0x38 [23:16]) is the DAI clock, 256 x fs
+ * (na51089-clk.c; Audio.o aud_set_codec_samplerate).  The kernel's clock
+ * setup leaves 0x1B000100: 12.288 MHz, 48 kHz.
+ */
+#define CG_AUDIO_DIV        0x38
+#define CG_PLL7_RATIO       0x45E0
+
+unsigned nvt_cg_audio_rate(DeviceState *dev)
+{
+    static const unsigned rates[] = {
+        8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
+    };
+    NvtCgState *s = NVT_CG(dev);
+    uint64_t ratio = (s->regs[CG_PLL7_RATIO / 4] & 0xFF) |
+                     (s->regs[CG_PLL7_RATIO / 4 + 1] & 0xFF) << 8 |
+                     (s->regs[CG_PLL7_RATIO / 4 + 2] & 0xFF) << 16;
+    uint32_t div = s->regs[CG_AUDIO_DIV / 4];
+    uint64_t fs = 12000000 * ratio / 131072 / (((div >> 24) & 0xFF) + 1) /
+                  (((div >> 16) & 0xFF) + 1) / 256;
+    unsigned best = 48000, i;
+
+    for (i = 0; i < ARRAY_SIZE(rates); i++) {
+        if (llabs((int64_t)fs - rates[i]) < llabs((int64_t)fs - best)) {
+            best = rates[i];
+        }
+    }
+    return best;
+}
 
 static uint64_t nvt_cg_read(void *opaque, hwaddr offset, unsigned size)
 {

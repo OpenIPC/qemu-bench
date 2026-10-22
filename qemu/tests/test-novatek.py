@@ -81,8 +81,12 @@ plays the vendor drivers (docs/novatek.md):
     linked list of two jobs, its updates applied with their byte enables,
     frame / job / list end and SPI 6; the graphics engine's list end (no
     DMA idle), single job and reset; ISE's list; H.26x flags, reset and a
-    picture (BS_LEN, a filler NAL); a JPEG of four grey MCUs; the EAC
-    strobes; the DAI's capture DMA (load, buffer full with silence, stop);
+    picture (BS_LEN, a filler NAL); a JPEG of four grey MCUs;
+  - nvt-audio: the EAC strobes; capture DMA latching its buffer and the
+    queued next, the test tone in it (1 kHz left, 1.5 kHz right), the
+    current-address register, stop on the channel enable, the ADC enable
+    muting it, the rate from the CG; playback DMA stopping on its channel
+    enable, and playing to a wav audiodev;
   - nvt-otp: power-up and ready, a read starting, finishing and reading a
     blank word, the done bit cleared by writing it back;
   - the flash boot ROM: a synthetic NVT image (device tree at 0x10000,
@@ -117,6 +121,7 @@ import random
 import re
 import shutil
 import socket
+import math
 import struct
 import subprocess
 import sys
@@ -189,8 +194,15 @@ class QTest:
     def pin(self, n, level):
         self.cmd('set_irq_in /machine/nvt-gpio in %d %d' % (n, level))
 
-    def close(self):
-        self.proc.kill()
+    def close(self, graceful=False):
+        if graceful:                    # let QEMU clean up (audio files)
+            self.proc.terminate()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        else:
+            self.proc.kill()
         self.proc.wait()
         self.sock.close()
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -1582,29 +1594,118 @@ def test_media(qt):
           (18, '28a28a00' * 4 + 'ffd9'))
     qt.writel(JPG + 0x1C, 1)
 
+
+
+AUD_A, AUD_B = 0x01600000, 0x01601000
+
+
+def test_audio(qt, wav):
+    print('nvt-audio')
     # EAC: strobes the driver waits on
     qt.writel(EAC + 0x04, 1)
     qt.writel(EAC + 0x10, 0x17000)
     check('EAC: LOAD and the DC-cancel load clear themselves',
           (qt.readl(EAC + 0x04), qt.readl(EAC + 0x10)), (0, 0x15000))
+    qt.writel(EAC + 0x00, 3)                        # ADC and DAC on
+    qt.writel(EAC + 0x20, 0x73730E0E)               # ADC gains 0 dB
+    qt.writel(EAC + 0xAC, 0xFFFF)                   # DAC gain 0 dB
 
-    # DAI: capture DMA, double-buffered
+    # capture: 16-bit stereo, 1 KiB buffers, 48 kHz (192000 B/s)
     gic_enable(qt, 15)
-    qt.write(DST, b'\xAA' * 1024)
-    qt.writel(DAI + 0x48, DST)
-    qt.writel(DAI + 0x68, 256)                      # words: 1 KiB
-    qt.writel(DAI + 0x20, 0x444)                    # RX load, BFI, stop
+    qt.write(AUD_A, b'\xAA' * 1024)
+    qt.write(AUD_B, b'\xAA' * 1024)
+    qt.writel(DAI + 0x14, 0x0101)
+    qt.writel(DAI + 0x48, AUD_A)
+    qt.writel(DAI + 0x68, 256)                      # words
+    qt.writel(DAI + 0x20, 0x40)
     qt.writel(DAI + 0x00, 0x41)
-    check('DAI: RX DMA on latches the buffer (DMALOAD), SPI 15',
+    check('RX DMA on takes the buffer (DMA loaded), SPI 15',
           (qt.readl(DAI + 0x28), gic_pending(qt, 15)), (0x40, True))
     qt.writel(DAI + 0x28, 0xFFFFFFFF)
-    qt.step(32 * 1000 * 1000)
-    check('1 KiB at 32 KB/s later: buffer full and the next load',
-          qt.readl(DAI + 0x28), 0x44)
-    check('the buffer holds silence', qt.read(DST, 1024), bytes(1024))
+    qt.writel(DAI + 0x48, AUD_B)                    # queue the next
+    qt.writel(DAI + 0x20, 0x10C00C)
+    qt.writel(DAI + 0x00, 0x4041)
+    qt.step(3 * 1000 * 1000)
+    cur = qt.readl(DAI + 0x88)
+    check('3 ms in: the current address moves through the first buffer',
+          (AUD_A < cur < AUD_A + 1024, qt.readl(DAI + 0x28) & 4), (True, 0))
+    qt.step(3 * 1000 * 1000)
+    check('1 KiB at 192000 B/s: buffer done, into the queued one',
+          (qt.readl(DAI + 0x28) & 4, AUD_B <= qt.readl(DAI + 0x88) <
+           AUD_B + 1024), (4, True))
+    fr = struct.unpack('<8h', qt.read(AUD_A, 16))
+    want = [round(16384 * math.sin(2 * math.pi * f * n / 48000))
+            for n in range(4) for f in (1000, 1500)]
+    check('the first buffer holds the tone: 1 kHz left, 1.5 kHz right',
+          all(abs(a - b) <= 1 for a, b in zip(fr, want)), True)
     qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.writel(DAI + 0x00, 0x41)
+    check('RX channel off: stopped', qt.readl(DAI + 0x28) & 0x400, 0x400)
     qt.writel(DAI + 0x00, 0x1)
-    check('RX DMA off: stop', qt.readl(DAI + 0x28), 0x400)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+
+    # the ADC off: silence
+    qt.writel(EAC + 0x00, 2)
+    qt.write(AUD_A, b'\xAA' * 1024)
+    qt.writel(DAI + 0x48, AUD_A)
+    qt.writel(DAI + 0x00, 0x4041)
+    qt.step(6 * 1000 * 1000)
+    check('with the ADC disabled the capture is silence',
+          qt.read(AUD_A, 1024), bytes(1024))
+    qt.writel(DAI + 0x00, 0x1)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.writel(EAC + 0x00, 3)
+
+    # the rate is the CG's: 16 kHz is eacdac / 21, DAI / 4
+    qt.writel(CG + 0x38, 0x14030000)
+    qt.writel(DAI + 0x48, AUD_A)
+    qt.writel(DAI + 0x00, 0x4041)
+    qt.step(10 * 1000 * 1000)
+    early = qt.readl(DAI + 0x28) & 4
+    qt.step(7 * 1000 * 1000)
+    check('at 16 kHz a 1 KiB buffer takes 16 ms, not 5.3',
+          (early, qt.readl(DAI + 0x28) & 4), (0, 4))
+    qt.writel(DAI + 0x00, 0x1)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.writel(CG + 0x38, 0x1B000100)                # 48 kHz again
+
+    # playback: 1 kHz, 16-bit stereo, to the wav audiodev
+    tone = b''.join(struct.pack('<2h', *(
+        [round(16384 * math.sin(2 * math.pi * 1000 * n / 48000))] * 2))
+        for n in range(256))
+    qt.write(AUD_A, tone)
+    qt.writel(DAI + 0x10, 0x0101)
+    qt.writel(DAI + 0x40, AUD_A)
+    qt.writel(DAI + 0x60, 256)
+    qt.writel(DAI + 0x20, 0x10)
+    qt.writel(DAI + 0x00, 0x11)
+    check('TX1 DMA on: loaded, from 0x40 / 0x60',
+          qt.readl(DAI + 0x28) & 0x10, 0x10)
+    qt.writel(DAI + 0x28, 0xFFFFFFFF)
+    qt.writel(DAI + 0x20, 0x1001)
+    qt.writel(DAI + 0x00, 0x1011)
+    for i in range(40):                             # 200 ms, the buffer looping
+        qt.step(5 * 1000 * 1000)
+    check('TX1 buffers complete', qt.readl(DAI + 0x28) & 1, 1)
+    qt.writel(DAI + 0x20, 0x1101)
+    qt.writel(DAI + 0x00, 0x11)
+    check('TX1 channel off: stopped (what the driver waits on)',
+          qt.readl(DAI + 0x28) & 0x100, 0x100)
+    qt.writel(DAI + 0x00, 0x1)
+    qt.close(graceful=True)
+    data = open(wav, 'rb').read()[44:]
+    pcm = struct.unpack('<%dh' % (len(data) // 4 * 2),
+                        data[:len(data) // 4 * 4])
+    left = pcm[0::2]
+    loud = [i for i, v in enumerate(left) if abs(v) > 4000]
+    hz = 0
+    if loud:
+        part = left[loud[0]:loud[-1]]
+        cross = sum(1 for a, b in zip(part, part[1:]) if a < 0 <= b)
+        hz = cross * 48000 / max(len(part), 1)
+    check('the wav audiodev plays the 1 kHz tone at full level',
+          (max((abs(v) for v in left), default=0) > 15000,
+           950 < hz < 1050), (True, True))
 
 
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
@@ -2591,6 +2692,14 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_pixels(qt)
+    finally:
+        qt.close()
+
+    wav = os.path.join(tmp, 'audio.wav')
+    qt = QTest(args.qemu, 'nt98566,audiodev=snd0',
+               ['-audiodev', 'wav,id=snd0,path=' + wav])
+    try:
+        test_audio(qt, wav)
     finally:
         qt.close()
 

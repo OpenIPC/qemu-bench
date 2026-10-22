@@ -254,7 +254,12 @@ graphics and ISE engines compute each job from their register file
 (`hw/misc/nvt-gfx.c`). The H.26x driver writes every parameter set
 and slice header itself; with x264 / x265 found by pkg-config at build
 time (CI has neither) `hw/misc/nvt-h26x.c` codes slices that fit them,
-and otherwise writes filler slices. Audio content is not modelled. The
+and otherwise writes filler slices. Audio is `hw/misc/nvt-audio.c` (DAI +
+EAC). No register in either holds the sample rate; it comes from CG (PLL7
+and the 0x38 dividers, 256 x fs). The address / size registers queue the
+next buffer, and STOP follows the channel enable (CTRL bits 12..15),
+which the driver blocks on. Capture is a test tone, and playback goes to
+the machine's `audiodev`. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands
