@@ -290,51 +290,60 @@ if [ -n "$SAMPLES" ]; then
             "hd_video_encode_only writes its ${t#* } bitstream"
     done
     # With x264 / x265 in QEMU the bitstreams are real: they decode
-    # (ffmpeg, stopping at any error) to pictures of the input
-    if strings "$QEMU" | grep -c 'x264_encoder_open\|x265_encoder_open' >/dev/null &&
-            command -v ffmpeg >/dev/null; then
-        for t in "0 hevc H.265" "1 h264 H.264"; do
-            set -- $t
-            sed -n "/NVT-HDAL-ENC-B64-BEGIN $1/,/NVT-HDAL-ENC-B64-END $1/p" \
-                "$WORK/console.log" | grep -a -v 'NVT-HDAL' | tr -d '\r' |
-                base64 -d > "$WORK/enc$1.bin" 2>/dev/null || true
-            # the last NAL may be cut short by the transfer: drop it
-            python3 - "$WORK/enc$1.bin" <<'PY'
+    # (ffmpeg, stopping at any error) to the input's pictures, in order
+    for t in "0 hevc H.265 x265" "1 h264 H.264 x264"; do
+        set -- $t
+        if ! strings "$QEMU" | grep -c "$4_encoder_open" >/dev/null ||
+                ! command -v ffmpeg >/dev/null; then
+            echo "SKIP: decoding the $3 bitstream (QEMU without $4, or no ffmpeg)"
+            continue
+        fi
+        sed -n "/NVT-HDAL-ENC-B64-BEGIN $1/,/NVT-HDAL-ENC-B64-END $1/p" \
+            "$WORK/console.log" | grep -a -v 'NVT-HDAL' | tr -d '\r' |
+            base64 -d > "$WORK/enc$1.bin" 2>/dev/null || true
+        # the last NAL may be cut short by the transfer: drop it
+        python3 - "$WORK/enc$1.bin" <<'PY'
 import sys
 d = open(sys.argv[1], 'rb').read()
 cut = d.rfind(b'\x00\x00\x00\x01')
 open(sys.argv[1], 'wb').write(d[:cut] if len(d) >= 4000000 and cut > 0 else d)
 PY
-            ffmpeg -v error -xerror -f $2 -i "$WORK/enc$1.bin" \
-                -f rawvideo -pix_fmt nv12 "$WORK/dec$1.yuv" \
-                > "$WORK/dec$1.log" 2>&1 || true
-            look=$(python3 - "$WORK/initramfs/encin/video_frm_352_288_30_yuv420.dat" \
-                "$WORK/dec$1.yuv" <<'PY' 2>/dev/null || true
+        ffmpeg -v error -xerror -f $2 -i "$WORK/enc$1.bin" \
+            -f rawvideo -pix_fmt nv12 "$WORK/dec$1.yuv" \
+            > "$WORK/dec$1.log" 2>&1 || true
+        # the sample feeds the file's 30 frames round and round: find
+        # where the stream starts in it, then every decoded picture must
+        # be the next frame (PSNR), and the pictures must move
+        look=$(python3 - "$WORK/initramfs/encin/video_frm_352_288_30_yuv420.dat" \
+            "$WORK/dec$1.yuv" <<'PY' 2>/dev/null || true
 import math, sys
 fs = 352 * 288 * 3 // 2
 src = open(sys.argv[1], 'rb').read()
 dec = open(sys.argv[2], 'rb').read()
 ins = [src[i:i + fs] for i in range(0, len(src), fs)]
-outs = [dec[i:i + fs] for i in range(0, len(dec) - fs + 1, fs)]
+outs = [dec[i:i + fs] for i in range(0, len(dec) - fs + 1, fs)][:60]
 def psnr(a, b):
     se = sum((x - y) ** 2 for x, y in zip(a[::7], b[::7]))
     return 99.0 if not se else 10 * math.log10(255 ** 2 * len(a[::7]) / se)
-worst = min((max(psnr(o, i) for i in ins) for o in outs[:40]), default=0)
-print('frames=%d psnr=%.1f' % (len(outs), worst))
+if not outs:
+    print('frames=0 psnr=0 moving=0')
+    sys.exit()
+k = max(range(len(ins)), key=lambda i: psnr(outs[0], ins[i]))
+worst = min(psnr(o, ins[(k + i) % len(ins)]) for i, o in enumerate(outs))
+moving = sum(a != b for a, b in zip(outs, outs[1:]))
+print('frames=%d psnr=%.1f moving=%d' % (len(dec) // fs, worst, moving))
 PY
 )
-            frames=$(echo "$look" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')
-            psnr=$(echo "$look" | sed -n 's/.*psnr=\([0-9]*\).*/\1/p')
-            if [ -s "$WORK/dec$1.log" ] || [ "${frames:-0}" -lt 5 ] ||
-                    [ "${psnr:-0}" -lt 30 ]; then
-                bad "$3 from hd_video_encode_only decodes to the input ($look; $(head -c 200 "$WORK/dec$1.log"))"
-            else
-                pass "$3 from hd_video_encode_only decodes to the input ($look)"
-            fi
-        done
-    else
-        echo "SKIP: decoding the H.26x bitstreams (QEMU without x264 / x265, or no ffmpeg)"
-    fi
+        frames=$(echo "$look" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')
+        psnr=$(echo "$look" | sed -n 's/.*psnr=\([0-9]*\).*/\1/p')
+        moving=$(echo "$look" | sed -n 's/.*moving=\([0-9]*\).*/\1/p')
+        if [ -s "$WORK/dec$1.log" ] || [ "${frames:-0}" -lt 5 ] ||
+                [ "${psnr:-0}" -lt 30 ] || [ "${moving:-0}" -lt 4 ]; then
+            bad "$3 from hd_video_encode_only decodes to the input, in order ($look; $(head -c 200 "$WORK/dec$1.log"))"
+        else
+            pass "$3 from hd_video_encode_only decodes to the input, in order ($look)"
+        fi
+    done
     for n in 0 1; do
         expect "NVT-HDAL-JPEG: dump_bs_snap$n.jpg ffd8 ffd9 [1-9]" \
             "snapshot $n: SOI .. EOI"

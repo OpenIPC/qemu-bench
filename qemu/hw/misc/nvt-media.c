@@ -58,7 +58,12 @@ struct NvtMediaState {
     NvtMediaState *ipp_src;     /* IME: the IFE whose input it finishes */
     uint8_t jpg_q[128];         /* JPEG: luma / chroma quantisation, zig-zag */
     uint32_t jpg_lut;           /* JPEG: the LUT port's select / address */
-    NvtH26x *h26x;              /* H.26x: its streams' encoders */
+    /*
+     * H.26x: its streams' encoders, host state that is not migrated --
+     * after a migration each stream codes filler slices until its next
+     * IDR, when a new encoder takes over.
+     */
+    NvtH26x *h26x;
 };
 
 /*
@@ -957,6 +962,16 @@ static void nvt_media_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static void nvt_media_unrealize(DeviceState *dev)
+{
+    NvtMediaState *s = NVT_MEDIA(dev);
+
+    nvt_h26x_free(s->h26x);
+    s->h26x = NULL;
+    timer_free(s->timer);
+    g_free(s->regs);
+}
+
 static const Property nvt_media_properties[] = {
     DEFINE_PROP_STRING("engine", NvtMediaState, engine_name),
     DEFINE_PROP_UINT32("size", NvtMediaState, size, 0x1000),
@@ -986,6 +1001,7 @@ static void nvt_media_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = nvt_media_realize;
+    dc->unrealize = nvt_media_unrealize;
     device_class_set_legacy_reset(dc, nvt_media_reset);
     device_class_set_props(dc, nvt_media_properties);
     dc->vmsd = &vmstate_nvt_media;

@@ -767,7 +767,10 @@ x265 (`hw/misc/nvt-h26x.c`). Audio samples are still placeholders.
   - a compressed or direct-from-IME source;
   - a reference that is not the previous picture.
 
-  Such a stream stays filler until its next IDR.
+  Such a stream stays filler until its next IDR. So does every stream
+  after a migration, since the encoders are host state. A real picture
+  too big for the buffer raises buffer full, and its stream waits for an
+  IDR as well.
 - **JPEG.** A baseline encoder (float DCT, the standard Annex K Huffman
   tables) reads the 4:2:0 picture:
   - Y and UV at `0x54` and `0x58`, line offsets at `0x60` and `0x64`;

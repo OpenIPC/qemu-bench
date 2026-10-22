@@ -491,12 +491,12 @@ typedef struct {
     bool weighted_pred, weighted_bipred, transquant_bypass, tiles;
     bool entropy_sync, lf_across_slices, deblocking_override;
     bool deblocking_disabled, scaling, lists_mod, slice_ext;
-    unsigned extra_bits, num_ref_l0, cu_qp_delta_depth, log2_merge_level;
+    unsigned id, extra_bits, num_ref_l0, cu_qp_delta_depth, log2_merge_level;
     int init_qp, cb_qp_offset, cr_qp_offset, beta, tc;
 } HevcPps;
 
 typedef struct {
-    unsigned nal_type, tid, slice_type, poc_lsb, rps_idx, num_ref;
+    unsigned nal_type, tid, pps_id, slice_type, poc_lsb, rps_idx, num_ref;
     unsigned max_merge;
     bool no_output_prior, rps_from_sps, tmvp, sao_luma, sao_chroma;
     bool cabac_init, deblocking_disabled;
@@ -642,7 +642,7 @@ static bool hevc_pps_parse(HevcPps *s, const uint8_t *p, size_t len)
 
     br_init(&b, p, len);
     memset(s, 0, sizeof(*s));
-    br_ue(&b);
+    s->id = br_ue(&b);
     br_ue(&b);
     s->dependent_slices = br_u(&b, 1);
     s->output_flag = br_u(&b, 1);
@@ -710,7 +710,10 @@ static bool hevc_slice_parse(HevcSlice *sl, const HevcSps *sps,
     if (nal_type >= 16 && nal_type <= 23) {
         sl->no_output_prior = br_u(&b, 1);
     }
-    br_ue(&b);
+    sl->pps_id = br_ue(&b);
+    if (sl->pps_id != pps->id) {
+        return false;                   /* not the PPS we hold */
+    }
     br_skip(&b, pps->extra_bits);
     sl->slice_type = br_ue(&b);
     if (sl->slice_type != HEVC_P && sl->slice_type != HEVC_I) {
@@ -1261,7 +1264,6 @@ static GByteArray *encoder_picture(H26xStream *st, const H26xPicture *pic)
 typedef struct {
     GByteArray *seq;            /* the sequence header, IDR only */
     GByteArray *slice;          /* the slice NAL's header, no start code */
-    size_t hdr_bits;            /* its bits after the NAL header */
     unsigned nal_hdr_len;
     bool idr;
 } H26xJob;
@@ -1272,7 +1274,7 @@ typedef struct {
  */
 static bool job_read(const uint32_t *regs, bool h264, H26xJob *job)
 {
-    uint32_t list = R(H26X_BSDMA), addr, len, used;
+    uint32_t list = R(H26X_BSDMA), addr, len;
     g_autofree uint8_t *hdr = NULL;
     size_t pos = 0, s, e, last = 0;
     unsigned type;
@@ -1284,7 +1286,6 @@ static bool job_read(const uint32_t *regs, bool h264, H26xJob *job)
     }
     addr = ldl_le_phys(&address_space_memory, list + 4);
     len = ldl_le_phys(&address_space_memory, list + 8);
-    used = len >> 28;
     len &= 0x0FFFFFFF;
     if (!addr || len < 6 || len > H26X_MAX_HDR) {
         return false;
@@ -1315,8 +1316,6 @@ static bool job_read(const uint32_t *regs, bool h264, H26xJob *job)
     }
     job->slice = g_byte_array_new();
     g_byte_array_append(job->slice, hdr + last, len - last);
-    job->hdr_bits = (len - last - job->nal_hdr_len) * 8 -
-                    (used && used < 8 ? 8 - used : 0);
     return true;
 }
 
@@ -1373,7 +1372,7 @@ static bool read_source(const uint32_t *regs, unsigned w, unsigned h,
     unsigned ylofs = (lofs & 0xFFFF) * 4, clofs = (lofs >> 16) * 4, r, x;
     bool swap = R(H26X_FUNC_CFG) & FUNC_SRC_CBCR_SWAP;
 
-    if (!dw || !dh || ylofs < dw || clofs < dw) {
+    if (dw < 2 || dh < 2 || ylofs < dw || clofs < dw) {
         return false;
     }
     for (r = 0; r < h; r++) {
@@ -1469,7 +1468,8 @@ static bool splice_avc(H26xStream *st, const H26xJob *job,
     if (stop < es.data_bit) {
         goto fail;
     }
-    bw_copy(&w, drv->data, 0, job->hdr_bits);
+    /* the driver's header up to where it ends, alignment ones included */
+    bw_copy(&w, drv->data, 0, ds.data_bit);
     bw_copy(&w, er->data, es.data_bit, stop);
     bw_trailing(&w);
     nal_put(out, &nh, 1, w.a->data, w.a->len);
@@ -1515,7 +1515,7 @@ static bool splice_hevc(H26xStream *st, const H26xJob *job,
     if (ds.nal_type >= 16 && ds.nal_type <= 23) {
         bw_u(&w, ds.no_output_prior, 1);
     }
-    bw_ue(&w, 0);
+    bw_ue(&w, ds.pps_id);
     bw_u(&w, 0, pps->extra_bits);
     bw_ue(&w, es.slice_type);
     if (pps->output_flag) {
@@ -1675,9 +1675,12 @@ static bool stream_open(H26xStream *st, const H26xJob *job)
 
 /* a picture coded for real into out; false to fall back */
 static bool encode_real(NvtH26x *h, const uint32_t *regs, bool h264,
-                        const H26xJob *job, GByteArray *out, int *qp)
+                        const H26xJob *job, GByteArray *out, int *qp,
+                        H26xStream **stp)
 {
     H26xStream *st = stream_get(h, R(H26X_BSDMA), h264);
+
+    *stp = st;
     g_autofree uint8_t *y = NULL, *uv = NULL;
     g_autoptr(GByteArray) enc = NULL;
     H26xPicture pic;
@@ -1782,6 +1785,7 @@ void nvt_h26x_encode(NvtH26x *h, const uint32_t *regs, NvtH26xResult *r)
     uint32_t room = R(H26X_BSOUT_SIZE), size = R(H26X_SEQ_CFG);
     unsigned units;
     g_autoptr(GByteArray) out = g_byte_array_new();
+    H26xStream *st = NULL;
     H26xJob job;
     int qp = R(0x0B8) & 0x3F;
     uint32_t le;
@@ -1789,13 +1793,14 @@ void nvt_h26x_encode(NvtH26x *h, const uint32_t *regs, NvtH26xResult *r)
     memset(r, 0, sizeof(*r));
     if (!job_read(regs, h264, &job)) {
         unimp_once("a picture of several slices, or no header list");
-    } else if (encode_real(h, regs, h264, &job, out, &qp) &&
-               out->len <= room) {
-        goto write;
+        encode_filler(h264, &job, out);
+    } else if (!encode_real(h, regs, h264, &job, out, &qp, &st)) {
+        g_byte_array_set_size(out, 0);
+        encode_filler(h264, &job, out);
+    } else if (out->len > room) {
+        /* the decoder will not have this picture to refer to */
+        st->broken = true;
     }
-    g_byte_array_set_size(out, 0);
-    encode_filler(h264, &job, out);
-write:
     job_free(&job);
     if (out->len > room) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-h26x: a %u-byte picture for a "
