@@ -24,6 +24,7 @@
 #include "hw/arm/sigmastar.h"
 #include "hw/boards.h"
 #include "hw/cpu/a15mpcore.h"
+#include "hw/i2c/i2c.h"
 #include "hw/ide/ahci.h"
 #include "hw/ide/ahci-sysbus.h"
 #include "hw/irq.h"
@@ -96,6 +97,18 @@
 #define SS_SPI_UHC2         63
 #define SS_SPI_UHC1         65
 #define SS_SPI_UHC0         87
+#define SS_SPI_VENC         53          /* Ifado; the VPU's on infinity2m */
+#define SS_SPI_ISP          57          /* Ifado */
+#define SS_SPI_VIF          89          /* Ifado: the DTS vif's first */
+#define SS_SPI_CMDQ         49          /* Ifado: cmdq0-3 */
+#define SS_SPI_JPE          61          /* Ifado: the DTS "jpe-irq0" */
+#define SS_SPI_AUDIO        74          /* Ifado: the DTS "sstar,audio" */
+#define SS_SPI_MIIC0        68          /* Ifado */
+#define SS_SPI_MIIC1        69
+#define SS_SPI_MIIC2        92
+#define SS_SPI_FURDMA       80          /* Ifado */
+#define SS_SPI_URDMA0       93          /* Ifado; BDMA2 on infinity2m */
+#define SS_SPI_URDMA1       94          /* Ifado; BDMA3 on infinity2m */
 #define SS_SPI_TIMER0       96
 #define SS_SPI_TIMER1       97
 #define SS_SPI_WDT          98
@@ -202,6 +215,72 @@ static const SsSoCConfig ssd201_soc = {
     .flash_jedec        = 0xEF4018,
 };
 
+/*
+ * SSC375 (die "Ifado", Linux "sstar,ifado"): one Cortex-A7 at 1 GHz with
+ * DDR in a QFN88, the infinity map with a later FSP-QSPI.  Sources: the
+ * kernel DTB and boot chain in a Dahua IPC-HDW1433V-A-IL2 NOR (model
+ * "IFADO SSC032B-S01A", Linux 4.9.84, U-Boot 2021.10).  Its IPL picks
+ * the DRAM profile by the bond strap, 0x10-0x19 (QFN88 WB512M/ESMT512M/
+ * ETRON512M DDR2, NTC1G/WB1G/PM1G DDR3); 0x15, WB1G DDR3, gives the
+ * board's mem=128M.  It runs from IMI past 64 KiB (stack 0xA00155E0).
+ */
+static const SstarRegDefault ss_ifado_defaults[] = {
+    /*
+     * PM clkgen +0x7C [14:10], the boot device strap: U-Boot's flash
+     * driver loads the CIS's NRI records only when (x & 0x19) is 0x18
+     * or 0x19, SPI NOR.  The infinity2m value, 0x1800, reads as none.
+     */
+    { 0x1F001C7C, 0x7800 },
+    /*
+     * CPU PLL (bank 0x1032): the current LPF word, regs 0x60 and 0x61
+     * [7:0], which the clock driver reads while no frequency has been set
+     * (ms_cpuclk_recalc_rate in the Maruko SDK's infinity6c clock driver;
+     * zero makes the kernel divide by it), and post divider - 1 in reg 0x19.
+     * 432 MHz * 2^19 * 16 / 0x374BC6 is the 1 GHz the IPL reports.
+     */
+    { 0x1F206464, 0x0001 },
+    { 0x1F206580, 0x4BC6 }, { 0x1F206584, 0x0037 },
+    /*
+     * IPU PLL (bank 0x1035): what the kernel's hal_clk_ipupll_init writes
+     * when reg 0x11 bit 8 says the PLL is off.  The clock framework works
+     * out its rate from the LPF word in regs 0x60/0x61 before that, and
+     * divides by it.
+     */
+    { 0x1F206A44, 0x0180 }, { 0x1F206A48, 0x1088 }, { 0x1F206A64, 0x0001 },
+    { 0x1F206B80, 0x6666 }, { 0x1F206B84, 0x0026 }, { 0x1F206B88, 0x0001 },
+    { 0 }
+};
+
+static const SsSoCConfig ssc375_soc = {
+    .desc               = "SigmaStar SSC375 (ifado, 1x Cortex-A7)",
+    .num_cpus           = 1,
+    .ram_size_default   = 128 * MiB,
+    .chip_id            = 0xF0,
+    .bond               = 0x15,
+    .flash_jedec        = 0xEF4018,         /* W25Q128 */
+    .imi_size           = 128 * KiB,
+    .fsp_sw_cs          = true,
+    .smf_ack            = true,
+    .defaults           = ss_ifado_defaults,
+    .urdma              = true,
+    .miic               = true,
+    .default_sensor     = "sc431hai",
+    .ipc                = true,
+    .gpio_bank          = 0x103E,
+};
+
+/*
+ * Image sensors for sensor=, on MIIC1 at 0x30 (the DTB's sensorif:
+ * snr0_mipi_i2c = <1>).  SmartSens: the ID in 0x3107/0x3108, as the
+ * board's sc431hai_mipi.ko compares it.
+ */
+static const struct {
+    const char *name;
+    uint8_t id_high, id_low;
+} ss_sensors[] = {
+    { "sc431hai", 0xCD, 0x6B },
+};
+
 #define TYPE_SS_MACHINE MACHINE_TYPE_NAME("sigmastar")
 OBJECT_DECLARE_SIMPLE_TYPE(SsMachineState, SS_MACHINE)
 
@@ -210,6 +289,8 @@ struct SsMachineState {
 
     char *flash_file;
     uint32_t flash_jedec;
+    char *sensor;
+    uint64_t uuid;
     ARMCPU *cpus[SS_MAX_CPUS];
     MemoryRegion smpctrl;
     uint16_t smpctrl_regs[0x80];
@@ -236,6 +317,20 @@ static void ss_machine_set_flash_file(Object *obj, const char *value,
     s->flash_file = g_strdup(value);
 }
 
+static char *ss_machine_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(SS_MACHINE(obj)->sensor);
+}
+
+static void ss_machine_set_sensor(Object *obj, const char *value,
+                                  Error **errp)
+{
+    SsMachineState *s = SS_MACHINE(obj);
+
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
+}
+
 static void ss_machine_get_flash_jedec(Object *obj, Visitor *v,
                                       const char *name, void *opaque,
                                       Error **errp)
@@ -248,6 +343,18 @@ static void ss_machine_set_flash_jedec(Object *obj, Visitor *v,
                                       Error **errp)
 {
     visit_type_uint32(v, name, &SS_MACHINE(obj)->flash_jedec, errp);
+}
+
+static void ss_machine_get_uuid(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    visit_type_uint64(v, name, &SS_MACHINE(obj)->uuid, errp);
+}
+
+static void ss_machine_set_uuid(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    visit_type_uint64(v, name, &SS_MACHINE(obj)->uuid, errp);
 }
 
 static uint64_t ss_smpctrl_read(void *opaque, hwaddr off, unsigned size)
@@ -480,7 +587,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         memory_region_add_subregion(sysmem, SS_DRAM_BASE + off, alias);
     }
 
-    memory_region_init_ram(imi, NULL, "sigmastar.imi", SS_IMI_SIZE,
+    memory_region_init_ram(imi, NULL, "sigmastar.imi",
+                           c->imi_size ? c->imi_size : SS_IMI_SIZE,
                            &error_fatal);
     memory_region_add_subregion(sysmem, SS_IMI_BASE, imi);
     memory_region_init_rom(bootrom, NULL, "sigmastar.bootrom",
@@ -511,7 +619,13 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     /* Storage under every RIU bank, and the boot chain's status bits. */
     riu = qdev_new(TYPE_SSTAR_RIU);
     qdev_prop_set_uint16(riu, "bond", c->bond);
+    qdev_prop_set_bit(riu, "smf-ack", c->smf_ack);
+    qdev_prop_set_uint16(riu, "gpio-bank", c->gpio_bank);
+    qdev_prop_set_uint64(riu, "uuid", sms->uuid);
     sstar_riu_add_defaults(SSTAR_RIU(riu), ss_i2m_defaults);
+    if (c->defaults) {
+        sstar_riu_add_defaults(SSTAR_RIU(riu), c->defaults);
+    }
     /* chipver +0x00: the chip ID byte U-Boot and the kernel identify by */
     chip_id[0].addr = SSTAR_RIU_ADDR(0x001E, 0x00);
     chip_id[0].val = c->chip_id;
@@ -547,12 +661,27 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         static const int spi[4] = {
             SS_SPI_UART0, SS_SPI_UART1, SS_SPI_FUART, SS_SPI_UART2,
         };
+        /* Ifado DTS: each UART's URDMA block and line; UART2 has none */
+        static const hwaddr ur_base[3] = {
+            0x1F220C00, 0x1F220E00, 0x1F220600,
+        };
+        static const int ur_spi[3] = {
+            SS_SPI_URDMA0, SS_SPI_URDMA1, SS_SPI_FURDMA,
+        };
+        bool ur = c->urdma && n < 3;
 
         dev = qdev_new("sstar-uart");
         qdev_prop_set_chr(dev, "chardev", serial_hd(n));
+        qdev_prop_set_bit(dev, "urdma", ur);
+        qdev_prop_set_bit(dev, "urdma-tx-v2", ur);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ss_spi(gic, intc, spi[n]));
+        if (ur) {
+            sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, ur_base[n]);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                               ss_spi(gic, intc, ur_spi[n]));
+        }
     }
 
     fsp = qdev_new(TYPE_SSTAR_FSP);
@@ -561,12 +690,18 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     }
     qdev_prop_set_uint32(fsp, "jedec", sms->flash_jedec ? sms->flash_jedec
                                                         : c->flash_jedec);
+    qdev_prop_set_bit(fsp, "sw-cs", c->fsp_sw_cs);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(fsp), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 0, SS_ISP_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 1, SS_FSP_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 2, SS_QSPI_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 3, SS_XIU_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(fsp), 0, ss_spi(gic, intc, SS_SPI_FSP));
+
+    /* SHA and RSA (and the AES DMA's registers), bank 0x1122 */
+    dev = qdev_new("sstar-crypto");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1122, 0));
 
     dev = qdev_new("sstar-bdma");
     object_property_set_link(OBJECT(dev), "fsp", OBJECT(fsp), &error_fatal);
@@ -577,10 +712,105 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             SS_SPI_BDMA0, SS_SPI_BDMA1, SS_SPI_BDMA2, SS_SPI_BDMA3,
         };
 
-        for (n = 0; n < 4; n++) {
+        /* On Ifado SPIs 93/94 are URDMA's; its DTS gives BDMA 72/73 */
+        for (n = 0; n < (c->urdma ? 2 : 4); n++) {
             sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
                                ss_spi(gic, intc, spi[n]));
         }
+    }
+
+    /*
+     * Ifado's video encoder, at its firmware interface: the RISC control
+     * block at 0x1F34C800 and the encoder's at 0x1F34CC00 (sstar_mi.ko's
+     * HalVencIos*; the DTS "venc" node, "mhe-irq").
+     */
+    if (c->ipc) {
+        dev = qdev_new("sstar-venc");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F34C800);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_VENC));
+
+        /* the ISP0 top, bank 0x1302: its interrupts and the frame clock */
+        dev = qdev_new("sstar-isp");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1302, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_ISP));
+
+        /* VIF channels 0-3, bank 0x1308: their frame interrupts */
+        dev = qdev_new("sstar-vif");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1308, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_VIF));
+
+        /* the JPEG encoder, bank 0x1237 (the DTS "sstar,cedric-jpe") */
+        dev = qdev_new("sstar-jpe");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1237, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_JPE));
+
+        /* the audio DMAs, BACH bank 0x1502: the microphone's capture */
+        dev = qdev_new("sstar-bach");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1502, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_AUDIO));
+
+        /* the four CMDQ engines (sstar_mi.ko g_halRegCmdCtlBase) */
+        dev = qdev_new("sstar-cmdq");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        {
+            static const uint32_t bank[4] = { 0x1120, 0x1123, 0x1124, 0x1125 };
+
+            for (n = 0; n < 4; n++) {
+                sysbus_mmio_map(SYS_BUS_DEVICE(dev), n,
+                                SSTAR_RIU_ADDR(bank[n], 0));
+            }
+        }
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_CMDQ));
+    }
+
+    /* MIIC0-2 (Ifado DTS i2c@1f223000, @1f223200, @1f222e00) */
+    if (c->miic) {
+        static const hwaddr base[3] = { 0x1F223000, 0x1F223200, 0x1F222E00 };
+        static const int spi[3] = {
+            SS_SPI_MIIC0, SS_SPI_MIIC1, SS_SPI_MIIC2,
+        };
+        const char *sensor = sms->sensor ? sms->sensor : c->default_sensor;
+        I2CBus *bus[3];
+
+        for (n = 0; n < 3; n++) {
+            dev = qdev_new("sstar-i2c");
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                               ss_spi(gic, intc, spi[n]));
+            bus[n] = I2C_BUS(qdev_get_child_bus(dev, "i2c"));
+        }
+        if (sensor && strcmp(sensor, "none")) {
+            for (n = 0; n < ARRAY_SIZE(ss_sensors); n++) {
+                if (!strcmp(sensor, ss_sensors[n].name)) {
+                    break;
+                }
+            }
+            if (n == ARRAY_SIZE(ss_sensors)) {
+                error_report("sigmastar: unknown sensor '%s' (none, "
+                             "sc431hai)", sensor);
+                exit(1);
+            }
+            dev = DEVICE(i2c_slave_new("hisi-smartsens", 0x30));
+            qdev_prop_set_uint8(dev, "id_high", ss_sensors[n].id_high);
+            qdev_prop_set_uint8(dev, "id_low", ss_sensors[n].id_low);
+            i2c_slave_realize_and_unref(I2C_SLAVE(dev), bus[1],
+                                        &error_fatal);
+        }
+    } else if (sms->sensor && strcmp(sms->sensor, "none")) {
+        error_report("sigmastar: this machine has no sensor bus");
+        exit(1);
     }
 
     /*
@@ -619,24 +849,68 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     address_space_init(&sms->miu_as, &sms->miu_root, "sigmastar.miu");
 
     /*
-     * SATA: a one-port AHCI at 0x1F345000 (HBA, port 0 at +0x100), its
-     * PHY and misc banks (0x1525-0x1527) RIU storage.  The vendor driver
-     * hands it MIU bus addresses.  The disk is -drive if=ide,index=0.
+     * The NVR die's SATA, display, video decoder and GE.  An IPC die has
+     * other blocks at those addresses (Ifado's video encoder is at
+     * 0x1F34D000, inside the VPU's window), so it gets none of them.
      */
-    dev = qdev_new(TYPE_SYSBUS_AHCI);
-    qdev_prop_set_uint32(dev, "num-ports", 1);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    SYSBUS_AHCI(dev)->ahci.as = &sms->miu_as;
-    memory_region_init_alias(&sms->sata_win, OBJECT(sms), "sigmastar.sata",
-                             sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0),
-                             0, 0x200);
-    memory_region_add_subregion(sysmem, SSTAR_RIU_ADDR(0x1A28, 0),
-                                &sms->sata_win);
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ss_spi(gic, intc, SS_SPI_SATA));
-    {
-        DriveInfo *hd[1] = { drive_get(IF_IDE, 0, 0) };
+    if (!c->ipc) {
+        /*
+         * SATA: a one-port AHCI at 0x1F345000 (HBA, port 0 at +0x100), its
+         * PHY and misc banks (0x1525-0x1527) RIU storage.  The vendor driver
+         * hands it MIU bus addresses.  The disk is -drive if=ide,index=0.
+         */
+        dev = qdev_new(TYPE_SYSBUS_AHCI);
+        qdev_prop_set_uint32(dev, "num-ports", 1);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        SYSBUS_AHCI(dev)->ahci.as = &sms->miu_as;
+        memory_region_init_alias(&sms->sata_win, OBJECT(sms), "sigmastar.sata",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0),
+                                 0, 0x200);
+        memory_region_add_subregion(sysmem, SSTAR_RIU_ADDR(0x1A28, 0),
+                                    &sms->sata_win);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_SATA));
+        {
+            DriveInfo *hd[1] = { drive_get(IF_IDE, 0, 0) };
 
-        ahci_ide_create_devs(&SYSBUS_AHCI(dev)->ahci, hd);
+            ahci_ide_create_devs(&SYSBUS_AHCI(dev)->ahci, hd);
+        }
+
+        /*
+         * The display: GOP 1 (banks 0x1234/0x1235, the plane fbdev uses), the
+         * display top (frame timing, vsync) and the MOP video plane, scanned
+         * out to a graphic console.
+         */
+        dev = qdev_new("mstar-disp");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1234, 0));
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, SSTAR_RIU_ADDR(0x1128, 0));
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, SSTAR_RIU_ADDR(0x1405, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_DISP_TOP));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                           ss_spi(gic, intc, SS_SPI_GOP_VSYNC));
+
+        /*
+         * The video decoder, a Chips&Media WAVE5 VPU (mi_vdec: ioremap of
+         * 0x1F344000, registers from +0x800).  The vendor driver reaches WAVE5
+         * offsets up to the backbone at 0xFE00, through the kernel's static
+         * map of the RIU, so the window spans 64 KiB: under every other model,
+         * over the RIU's storage.
+         */
+        dev = qdev_new("sstar-vpu");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, 0x1F344800, -1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_VPU));
+
+        /* GE 2D engine: MI_GFX composites the GUI through it */
+        dev = qdev_new("mstar-ge");
+        qdev_prop_set_uint32(dev, "dram-base", SS_DRAM_BASE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1409, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_GE));
     }
 
     /*
@@ -653,40 +927,6 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(bank[n], 0));
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ss_spi(gic, intc, spi[n]));
     }
-
-    /*
-     * The display: GOP 1 (banks 0x1234/0x1235, the plane fbdev uses), the
-     * display top (frame timing, vsync) and the MOP video plane, scanned
-     * out to a graphic console.
-     */
-    dev = qdev_new("mstar-disp");
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1234, 0));
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, SSTAR_RIU_ADDR(0x1128, 0));
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, SSTAR_RIU_ADDR(0x1405, 0));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                       ss_spi(gic, intc, SS_SPI_DISP_TOP));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
-                       ss_spi(gic, intc, SS_SPI_GOP_VSYNC));
-
-    /*
-     * The video decoder, a Chips&Media WAVE5 VPU (mi_vdec: ioremap of
-     * 0x1F344000, registers from +0x800).  The vendor driver reaches WAVE5
-     * offsets up to the backbone at 0xFE00, through the kernel's static
-     * map of the RIU, so the window spans 64 KiB: under every other model,
-     * over the RIU's storage.
-     */
-    dev = qdev_new("sstar-vpu");
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, 0x1F344800, -1);
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ss_spi(gic, intc, SS_SPI_VPU));
-
-    /* GE 2D engine: MI_GFX composites the GUI through it */
-    dev = qdev_new("mstar-ge");
-    qdev_prop_set_uint32(dev, "dram-base", SS_DRAM_BASE);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1409, 0));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ss_spi(gic, intc, SS_SPI_GE));
 
     memory_region_init_io(&sms->smpctrl, OBJECT(sms), &ss_smpctrl_ops, sms,
                           "sigmastar.smpctrl", 0x200);
@@ -744,6 +984,16 @@ static void ss_machine_class_init(ObjectClass *oc, const void *data)
         ss_machine_get_flash_jedec, ss_machine_set_flash_jedec, NULL, NULL);
     object_class_property_set_description(oc, "flash-jedec",
         "JEDEC ID the SPI NOR answers with (e.g. 0xEF4018)");
+    object_class_property_add_str(oc, "sensor",
+        ss_machine_get_sensor, ss_machine_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "Image sensor on the sensor I2C bus (ssc375: sc431hai, the "
+        "default, or none)");
+    object_class_property_add(oc, "uuid", "uint64",
+        ss_machine_get_uuid, ss_machine_set_uuid, NULL, NULL);
+    object_class_property_set_description(oc, "uuid",
+        "The die's unique ID in OTP2 (msys_read_uuid), as read from the "
+        "board; vendor licences are bound to it");
 }
 
 static const TypeInfo ss_machine_info = {
@@ -780,5 +1030,6 @@ type_init(ss_machine_register_types)
                             arm_machine_interfaces)
 
 DEFINE_SS_MACHINE("ssr621q", ssr621q, ssr621q_soc)
+DEFINE_SS_MACHINE("ssc375", ssc375, ssc375_soc)
 DEFINE_SS_MACHINE("ssd202d", ssd202d, ssd202d_soc)
 DEFINE_SS_MACHINE("ssd201", ssd201, ssd201_soc)

@@ -1,4 +1,4 @@
-# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`)
+# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`, `ssc375`)
 
 SigmaStar's (formerly MStar's) Cortex-A7 SoCs share one memory map whatever
 the family: DRAM (the MIU0 window) at `0x20000000`, the SPI NOR read window at
@@ -25,6 +25,11 @@ from there too.
 | `ssr621q` | infinity2m | 2× Cortex-A7 | 256 MiB | `0x1E` | `0xF0` | yes: IPL → U-Boot → kernel → Sofia GUI |
 | `ssd202d` | infinity2m | 2× Cortex-A7 | 128 MiB | `0x1E` | `0xF0` | — |
 | `ssd201` | infinity2m | 2× Cortex-A7 | 64 MiB | `0x1D` | `0xF0` | — |
+| `ssc375` | Ifado | 1× Cortex-A7 | 128 MiB | `0x15` | `0xF0`¹ | IPL → U-Boot → DHBoot → kernel → rootfs |
+
+¹ Not checked against silicon: the boot chain to userspace does not look
+at it. The SoC is named by the firmware itself (`CHIP=SSC375` in the Dahua
+rootfs; kernel compatible `sstar,ifado`).
 
 The SSR621Q is the infinity2m die in Xiongmai's 4/8/16-channel NVRs, with
 SATA, HDMI and the video decoder bonded out. Its IPL reads the bond strap to
@@ -227,12 +232,159 @@ after boot: `/proc/mi_modules/mi_vdec/mi_vdec0` then shows the channel
 started but `SendCnt` 0, the cell keeps its "H.265+" placeholder, and
 another boot is the cure.
 
+## SSC375 (Ifado)
+
+Source: the 16 MiB NOR of a Dahua IPC-HDW1433V-A-IL2 (kernel DTB model
+`IFADO SSC032B-S01A`, Linux 4.9.84, U-Boot 2021.10, Dahua DHBoot 2.0),
+read against the newer vendor FSP-QSPI driver in the Iford/Pcupid kernel
+(linux-chenxing-vendor-slop, `drivers/sstar/fsp_qspi/hal/iford`), the
+infinity2m SDK's AESDMA HAL, and the Maruko (SSC37X / infinity6c) SDK
+`Maruko-ILS00_TINY_V1.4.0`, whose I2C and clock drivers are the same
+generation. One Cortex-A7, the infinity memory map, and:
+
+```
+qemu-system-arm -M ssc375,flash-file=cam.bin -serial mon:stdio \
+    -nic user,restrict=on
+```
+
+`sensor=` picks the image sensor on MIIC1 at `0x30` (the DTB's sensorif
+`snr0_mipi_i2c = <1>`): `sc431hai`, the board's and the default (ID
+`0xCD6B` in `0x3107`/`0x3108`, as its `sc431hai_mipi.ko` reads it), or
+`none`. It is the generic `hisi-smartsens` model.
+
+`uuid=` is the die's unique ID, which the kernel's `msys_read_uuid` reads
+from OTP2 (bank `0x0022`, regs `0x7C`-`0x7F` at `0x1F0045F0`, low word
+first). The Ifliegen SDK's Ifado header puts OTP2 at bank `0x101F`, but
+the shipped kernel does not read it there. Unset, the ID reads as zero,
+and sonia logs `sigmastar SSC378Q id is all zero!`. Dahua's analytics
+licence (`/mnt/mtd/forever/License.dat`) is signed for the camera's own
+ID, so it loads only when given that camera's value, e.g.
+`-M ssc375,flash-file=cam.bin,uuid=0x0123456789ABCDEF`.
+
+- **IPL.** It runs from IMI past 64 KiB (stack `0xA00155E0`), so IMI is
+  128 KiB here. It picks the DRAM profile from the bond strap, `0x10`-`0x19`
+  (QFN88 WB512M/ESMT512M/ETRON512M DDR2, NTC1G/WB1G/PM1G DDR3); `0x15`, WB1G
+  DDR3, gives the board's 128 MiB. Its SMF stub sets bank `0x1121` reg
+  `0x37` bit 2 and waits for reg `0x38` to read 3 (`smf-ack`).
+- **NOR.** The boot chain rewrites the active NRI record at flash `0x8000`
+  to match the JEDEC ID it reads (W25Q128 by default), with Quad Page
+  Program (`0x32`) and the extended address register (`0xC5`/`0xC8`), and
+  resets the flash (`0x66`/`0x99`) before reading its status. The FSP-QSPI
+  has a software chip select (QSPI `0x0A`): the opcode and address go in one
+  fire and the 256 data bytes from BDMA, through the outside buffer, in the
+  next, the sequencer waiting for them (`sstar-fsp` `sw-cs`). U-Boot loads
+  the NRI records only when the boot strap at PM clkgen `0x1F001C7C` [14:10]
+  says SPI NOR (`0x7800` here).
+- **DHBoot** checks the kernel and the device tree with SHA-256 and a
+  2048-bit RSA public key through the engines at bank `0x1122`
+  (`sstar-crypto`); the signatures verify, so the images are the board's.
+- **Kernel.** cpufreq waits for the CPU PLL's LPF glide (bank `0x1032` reg
+  `0x5D` bit 0; `0x1032BA` in the Maruko `cpu_dvfs()`), and the clock
+  driver divides by the PLLs' LPF words while nothing has set them: the CPU
+  PLL's current word (regs `0x60`/`0x61`) resets to `0x374BC6`, 1 GHz, and
+  the IPU PLL (bank `0x1035`) to what the kernel's `hal_clk_ipupll_init`
+  programs. The NVR's SATA, display, video decoder and GE are not there:
+  Ifado's video encoder sits inside the VPU's window at `0x1F34D000`.
+- **I2C.** `sstar-i2c` is the MIIC master at `0x1F223000`, `0x1F223200` and
+  `0x1F222E00` (SPIs 68, 69, 92), from the Maruko `hal_iic_reg.h`: byte mode
+  (START, data, read trigger, STOP, the write-1-to-clear flag at `0x04`)
+  and the DMA mode the `dma-enable` nodes use (command bytes, then the
+  buffer in DRAM, done flag `0x24`, count `0x2C`). Before each transfer the
+  driver reads the SCL/SDA pads through GPIO (PADTOP bank `0x103E`, one
+  register per pad, bit 0 the level); pads in their function mode read high
+  (`gpio-bank`). The consoles are `dma-enable`: UART0/1 and the FUART move
+  bytes through URDMA rings (`sstar-uart` `urdma`, SPIs 93, 94 and 80; on
+  this die 93/94 are not BDMA's). The TX interrupt bits differ from
+  infinity2m: enable/clear/status are bits 10/11/14 of URDMA `0x0D`.
+- **Media.** No source exists for the media drivers, but the camera's
+  `sstar_mi.ko` keeps its symbols; the models follow it. `sstar-vif` (bank
+  `0x1308`: channel interrupts at regs `0x60`/`0x6A`/`0x70`, SPI 89) and
+  `sstar-isp` (bank `0x1302`: seven groups of mask/force/clear/status
+  from reg `0x28`, SPI 57) are the frame clock: each frame the VIF raises
+  channel 0's events, which hand the ISP its input
+  (`MI_ISP_PASS_OnEnqueueInputTask` → `COMMON_ISP_Open`, after which the
+  "early CameraOpen" refusals stop), and the ISP raises frame start, frame
+  end and the statistics events `HalIspIsr` maps. `sstar-cmdq` runs the
+  four command queues (banks `0x1120`, `0x1123`-`0x1125`, SPI 49): 8-byte
+  commands, pointers in 16-byte MIU units; a write pointer at the ring's
+  end means its start, or the queue replays the whole ring. The scaler's
+  tasks complete on its CMDQ fence, so it needs no model of its own.
+  `sstar-venc` answers the encoder's RISC-V firmware
+  (`0x1F34C800`/`0x1F34CC00`, SPI 53): the boot, the job mailbox, the
+  status block whose recon, side-plane and bitstream end pointers
+  `HalVencDpbDoneFrame` range-checks, the stop/reboot the driver does to
+  switch a stream to H.265, and the output buffer the driver hands over
+  after each frame (`HalVencIosAddOutBuffer`, ctrl `0x204`-`0x20C`).
+  Frame done is enc `0x60` bit 0, which the ISR turns into MI's
+  `FRM_DONE`; bits 5, 6 and 1 are a buffer ready, a slice done and a
+  ring drop (the names are in the Ifliegen SDK's debug information), and
+  none of them hands the stream to `MI_VENC_GetStream`. The ISR clears
+  the status before it reads the shared registers and writes the next
+  output buffer, so the model reports the next done 2 ms later; each job
+  completes 10 ms after it is fired. Built with libavcodec
+  and its libx264/libx265 encoders, it encodes a test pattern (colour
+  bars, a moving box, the frame number in binary) at each job's size and
+  codec (program registers `0xA0`, `0x1080` bit 1, `0xBC` bit 8 for an I
+  frame) as the job is fired, with the virtual clock stopped: libx265
+  takes tens of milliseconds a frame, and a guest left running meanwhile
+  queues the channel's next frame onto the ring-pool record of the one
+  in flight. `-global
+  sstar-venc.dump=PREFIX` appends each stream to `PREFIX-ctxN.h264` or
+  `.h265` on the host. Without libavcodec a frame is an access unit
+  delimiter. `sstar-jpe` (bank `0x1237`, SPI 61) is the JPEG engine.
+  The driver writes the whole JFIF header (SOI to SOS, regs `0x1D`/`0x1E`,
+  size in `0x1C` [14:8]) to DRAM. The model parses its quantisation
+  and Huffman tables and frame size, codes a baseline scan of a test
+  picture (bars and a frame counter) after it into the output window
+  (`0x51`..`0x54`), and reports the result in `0x63`..`0x6C`. Frame done
+  is interrupt bit 0 (`E_JPE_HAL_IRQ_FRAME_DONE`). Bit 1 is
+  `BSPOBUF_FULL`, which the driver reports as "output buff is too
+  small". The register names come from the Ifliegen SDK, whose
+  `sgs_mi.ko` carries debug information (`hal_jpe_ios.c`). That SDK's
+  kernel also holds Ifado's own GPIO, IRQ, I2C and watchdog HALs
+  (`drivers/sgs_common/*/hal/ifado`).
+- **Audio input.** `sstar-bach` (bank `0x1502`, SPI 74) is the BACH
+  capture DMA, DMA 0 to the driver. `HalBachReadReg` bank index 0 is RIU
+  bank `0x1502`, 1 is `0x1503`, 2 is `0x1504` and 3 is `0x1034`. `0x92`
+  holds address [14:3], latch (bit 12), read trigger (a change of bit 13)
+  and run (bit 15). `0x94` is address [29:15], `0x96` the size, `0x98`
+  the bytes read, `0x9A` the threshold and `0x9E` the latched level, all
+  in 8-byte units. The ring fills with a 1 kHz tone at 16 kHz.
+  `_AudDmaIrq` acts only on a flag (`0x90`) whose enable (`0x80`) is set:
+  bit 5 (level at or above the threshold) with bit 11, or bit 1 (overrun)
+  with bit 14. Any other condition leaves the interrupt unmasked, and it
+  storms the CPU: an RCU stall at about 43 s in `sstar_urdma_task`.
+- **Reset button.** The camera's reset key is `PAD_SAR_GPIO0` (gpio 81,
+  `pdc` prints it in hex: `keyScanGpio : 51`). Its level is bit 8 of PM SAR
+  register `0x12`, which reads high as an input (`sstar-riu`, with
+  `gpio-bank`); read low, the button is held, and sonia does a factory
+  reset and reboots.
+- **Status.** The rootfs mounts and Dahua's userspace starts (`CHIP=SSC375`);
+  `sonia` finds the sensor, the 3A thread runs on the statistics events, and
+  the network services come up: the RTSP server on 554 answers `OPTIONS`
+  through a `hostfwd`. Frames flow VIF → ISP → scaler → encoder with no
+  stalls for minutes: both streams in H.264 and then the H.265 the app
+  switches to, and the JPEG snapshots. The encoded streams decode on the
+  host (the `dump` files), and sonia takes them from the encoder
+  (`MediaApp` stops reporting `bitrate:0` for streams 0 and 1), for its
+  RTSP server on port 554; `MI_AI_Read` returns microphone frames. A
+  300 s boot encodes about 7500 frames with no `MI ERR`. sonia takes
+  JPEG snapshots only on demand, so the snapshot channel times out
+  ("process data exceed timeout") after the first frames. Open: the
+  on-device analytics, which fail their licence check (`invalidLicense`)
+  and leave their YUV queue full. The CMDQ read pointer must equal the
+  write pointer when caught up, the ring's end included, or
+  `MHal_cmdq_CheckBufferAvailTimeout` sees a full ring. U-Boot starts
+  the watchdog with 60 s, so a boot that stalls before Linux services
+  it resets.
+
 ## Not modelled
 
 - HDMI TX: no EDID, so the NVR falls back to its default output mode.
 - The DIVP/DIP scalers (the VPU's own scaler serves the live view) and the
   remaining GOPs (GOP 0 is programmed but not scanned out).
-- I2C controllers, SAR ADC, RTC (the kernel warns that RTCPWC has no power),
-  the MMU block (`HAL_MMU_Reset timeout`), audio.
+- SAR ADC, RTC (the kernel warns that RTCPWC has no power),
+  the MMU block (`HAL_MMU_Reset timeout`), audio output and the
+  infinity2m's audio.
 - infinity3 (MSC313E), infinity6 and mercury5 parts. Daniel Palmer's
   `mstar-miyoo-working` branch has the infinity3 and mercury5 maps.

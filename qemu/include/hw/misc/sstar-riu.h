@@ -38,6 +38,9 @@ struct SstarRiuState {
     uint32_t poll_idx;
     uint32_t poll_count;
     uint16_t bond;
+    bool smf_ack;               /* Ifado: bank 0x1121 handshake */
+    uint16_t gpio_bank;         /* Ifado PADTOP GPIO: input levels */
+    uint64_t uuid;              /* OTP2 0x7C-0x7F, the die's unique ID */
     /* tables of reset values, each ended by a zero address */
     const SstarRegDefault *defaults[SSTAR_RIU_MAX_DEFAULTS];
     uint32_t num_defaults;

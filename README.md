@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (68 total)
+## Supported Machines (69 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -206,6 +206,7 @@ was at hand.
 | `ssr621q` | Cortex-A7 ×2, 256 MB in package | GIC + main-intc | 4.9.84 vendor | yes |
 | `ssd202d` | Cortex-A7 ×2, 128 MB in package | GIC + main-intc | — | —¹ |
 | `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
+| `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
 
 SigmaStar's (formerly MStar's) infinity2m dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
@@ -224,6 +225,16 @@ devices and the Xiongmai `xmuart` console switch are in
 [docs/sigmastar.md](docs/sigmastar.md).
 
 ¹ Same die and models as `ssr621q`; no image was at hand.
+
+² The SSC375 (die "Ifado") in a Dahua IPC-HDW1433V-A-IL2: its NOR boots
+IPL, U-Boot 2021.10 and Dahua's DHBoot, whose RSA checks of the kernel and
+device tree pass on the SHA/RSA engine model, to the vendor rootfs. The
+camera application finds its SC431HAI on the modelled I2C bus, its 3A
+runs on the VIF/ISP frame clock, and frames flow VIF → ISP → scaler →
+encoder to its RTSP server: H.264/H.265 from libx264/libx265 and baseline
+JPEG snapshots, of a test pattern (the ISP does not process pixels), and
+microphone capture. `uuid=` gives the die ID its analytics licence is
+bound to.
 
 ### Novatek NT9856x family (`qemu-system-arm`)
 
