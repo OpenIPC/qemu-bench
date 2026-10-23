@@ -81,12 +81,14 @@ bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info ta
 Full-boot tests need firmware, in one of two shapes.
 
 **Split kernel + rootfs** (`-kernel`/`-initrd`, what the `run-*.sh` scripts and
-the CI boot matrix use) — from the GitHub release:
+the CI boot matrix use) — from the GitHub release. The release publishes
+it as `openipc.<soc>-nor-lite.tgz` (the two files) or, for SoCs moved since
+OpenIPC/firmware#2638, `openipc.<soc>-nor-lite-split.tgz` (one
+`firmware.bin.<soc>`: uImage, then SquashFS); `fetch-openipc-lite.sh` takes
+either and leaves `uImage.<soc>` + `rootfs.squashfs.<soc>`:
 
 ```bash
-cd qemu-boot && curl -sLO \
-  https://github.com/OpenIPC/firmware/releases/download/latest/openipc.hi3516ev300-nor-lite.tgz \
-  && tar xzf openipc.hi3516ev300-nor-lite.tgz && cd ..
+bash qemu-boot/fetch-openipc-lite.sh hi3516ev300 qemu-boot
 bash qemu-boot/run-ev300.sh              # one run-*.sh per boot-tested platform
 ```
 
