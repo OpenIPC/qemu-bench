@@ -935,7 +935,7 @@ and units bound.
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
 builds them from the vendor SDK (not in CI). The run checks 75 things
-(108 with `--kmods` and an `ai_net` model, 116 with the detectors, below):
+(108 with `--kmods` and an `ai_net` model, 118 with the detectors, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -1048,6 +1048,8 @@ with kernel 1 in dot mode.
 - 8-bit operands enter the 12-bit multiplier top-aligned, so each one
   counts x 16. `ai_op`'s 8-bit inputs and weights therefore come out
   x 256, and the classifier's u8 inputs against 12-bit weights x 16.
+  16-bit operands (the face network's embedding layer) enter by their
+  top 12 bits.
 - The weight row length is at `0x040` [13:0], the rows at [28:16], and
   the input vectors at `0x048`.
 
@@ -1128,21 +1130,21 @@ registers.
   4. element-wise (bit 11);
   5. `0x0B0`;
   6. a clamp to 16 bits and the activation (bit 9; a ReLU with a leaky
-     slope at `0x090` / `0x094`).
+     slope at `0x090` / `0x094`, whose bit 16 negates the input first).
 
   A job without a convolution but with BN or element-wise starts at
   `0x0AC` with its input as it is.
 - **Bias.** Without BN the record at `0x038` is 2 bytes a set: a signed
   12-bit bias in the low bits, `<< CONV_SHIFT_B` (`0x06C` [12:8]). It is
-  added after `0x0AC` for an 8-bit out0, and before it for a 16-bit
-  out0 (the detectors' heads).
+  added after `0x0AC`, whatever the output's width.
 - **Element-wise.** The second map is at `0x03C` (pitches `0x028` /
   `0x02C`, type `0x084` [1:0]) and goes through `0x0A8`. The result is
   `((a * coef0) >> shift0) + ((b * coef1) >> shift1)`, or the larger of
   the two terms (MODE [3:2] = 2), then `>> outshf`. The coefficients are
   `0x088`, the shifts `0x084` [8:4], [16:12] and [24:20].
 - **BN.** The record at `0x038` is 8 bytes an output channel: alpha
-  [23:0] unsigned, mean [35:24] and beta [47:36], both signed 12-bit.
+  [23:0] signed 24-bit, mean [35:24] and beta [47:36], both signed
+  12-bit.
   The stage is
 
       y = ((x - (mean << m)) * alpha >> a) + (beta << b)
@@ -1155,7 +1157,8 @@ registers.
     (bit 10), its shift (`0x09C` [6:4]), then `0x0BC`.
 
   The datapath carries 8.8 fixed point, which out0 drops at its end and
-  out1's scale already folds in. A job without convolution feeds its
+  out1's scale already folds in. A 16-bit output keeps 8 fraction bits
+  more than an 8-bit one on either path. A job without convolution feeds its
   input straight to the outputs: a pooling layer.
 - **Pooling.**
   - Local pooling is max or average (`0x098` bit 0), 2x2..5x5
@@ -1177,6 +1180,11 @@ registers.
   that overlap and recompute. A depthwise layer runs as a job a channel,
   one input and one output channel each, often in image mode. Each job
   is self-contained, so neither needs anything of its own.
+- **PReLU.** The compiler builds it from three jobs. ReLU(−x) is an
+  activation with ACT bit 16 set; ReLU(x) is another activation; an
+  element-wise job adds them, its BN scaling the first by the negated
+  slopes (negative alphas). In a depthwise layer, a job a channel, it is
+  instead that job's leaky slope.
 
 Most of this is the register map. The weight, BN and bias layouts, the
 8.8 datapath and where the scales sit are not in the SDK. They were
@@ -1185,11 +1193,13 @@ fitted to the SDK's networks:
   in that order only.
 - **Ranges.** With these choices every job of the classifier keeps its
   int8 output in range, and the classifier names its test picture.
-- **Bias.** Its placement is fitted, not read from the SDK. For 8-bit
-  outputs the bias must go after `0x0AC`: before it, the person and face
-  detectors find nothing. For 16-bit outputs it must go before:
-  after it, the person / vehicle detector finds no people, while the
-  person and face detectors change little either way.
+- **Bias.** Its placement is fitted, not read from the SDK. It goes after
+  `0x0AC`: before it, the person and face detectors find nothing, and
+  the face recognition network's embeddings stop telling people apart.
+  An earlier width-dependent rule (before `0x0AC` for 16-bit outputs) had
+  been fitted while BN alpha was read unsigned. With alpha signed, the
+  person / vehicle detector finds all three vehicles in the dashcam
+  frame, not one, with the bias after `0x0AC` everywhere.
 
 `-global nvt-media.ai-dump=DIR` writes each AI job's registers to
 `DIR/jobs.bin`, and snapshots RAM at the first CNN and NUE jobs and at
@@ -1267,6 +1277,7 @@ v1.01.007's samples and detector libraries with v1.01.002's
 | `alg_pvdcnn_sample` | `pvdcnn/nvt_model_prune37`, `public` | about 300 | people (class 1), vehicles (2) |
 | `alg_fdcnn_ai2_sample` | `fdcnn_method2_light` | about 600 | faces, five landmarks each |
 | `cddcnn_sample` (ours) | `cddcnn` (pets), `public` | about 3000 | cats and dogs (category 1) |
+| `frcnn_sample` (ours) | `frcnn` (face recognition) | about 3600 a face | a 128-value embedding |
 
 `cddcnn` has a library (`cddcnn_ai2`) but no sample, so
 `qemu-boot/novatek-cddcnn-sample.c` is one. It follows the turnkey
@@ -1276,19 +1287,30 @@ scaled to the network's 1024x576, `cddcnn_process`, then
 both: the network's proposals to `cdd_raw_results.txt`, those limit_fdet
 keeps to `cdd_test_results.txt`. `cddcnn_version_check` needs each
 model buffer 32-byte aligned, or it rejects the model (`fmt_main 0`).
-`frcnn` is used by no sample.
+
+`frcnn` has neither library nor sample, in any SDK release: the turnkey
+ships the model alone. The model's own tensor descriptors say what it is:
+input `data`, 112x112x3; output `BatchNormalization_fc1_Y`, 1x1x128,
+s16 with 13 fraction bits. That is the InsightFace / ArcFace layout of a
+face embedding (a MobileFaceNet: depthwise layers, PReLU, a global
+pooling, a fully connected layer and BN).
+`qemu-boot/novatek-frcnn-sample.c` runs it through `vendor_ai_net`
+alone, on 112x112 NV12 faces aligned to the ArcFace template by their
+five landmarks. It writes each face's 128
+values. The turnkey's models start with 32 bytes of their own; the
+detector libraries step past them, and the sample does too, or
+`kflow_ai_net` reads chip id 0 and refuses the model.
 `alg_fdcnn_ai2_sample` asks for a second DDR (`NN_USE_DRAM2`), which the
 NT9856x does not have; on silicon it fails as here. The builder turns it
 off.
 
 On their pictures under QEMU:
 - **pdcnn** finds the two large people in a composite of OpenCV's
-  `messi5` and `basketball1`, and the facing person in `basketball1`. It
-  misses the one turned away, and a third person in the composite only
-  70 pixels tall (found at 0.95 with the bias after `0x0AC` in the heads
-  too).
-- **pvdcnn** finds the same three people, and the white car in the
-  SDK's dashcam frame.
+  `messi5` and `basketball1`, both again at the smaller size, and the
+  facing person in `basketball1`. It misses the one turned away.
+- **pvdcnn** finds the large Messi and the facing man (0.95), and in the
+  SDK's dashcam frame the truck, the white car ahead and the small car on
+  the left (0.97..0.99).
 - **fdcnn** finds the astronaut's face, its landmarks on the eyes, nose
   and mouth corners, and the facing man's face in `basketball1`.
 - **cddcnn** proposes scikit-image's `chelsea` (a cat, 0.98) and the dog
@@ -1298,6 +1320,12 @@ On their pictures under QEMU:
   cat in class 5 (0.46) and the dog in class 5 (0.81), not class 1 at
   0.7. That classifier confirms pvdcnn's people as class 0 at 0.93..0.98,
   so the rejections are taken as the model's, not the emulation's.
+- **frcnn**, on faces from the `face_recognition` project's example
+  photos (three of Obama, two of Biden, one each of two other men), gives
+  cosine similarities of 0.68..0.76 between Obama's photos and 0.82
+  between Biden's; between different people they are −0.05..0.18, and a
+  grey square scores below zero against every face. A mirrored photo
+  scores 0.96 against its original.
 
 A picture takes 4..11 s of host CPU. The job runs on the vendor's own
 code end to end: the graphics engine scales the picture, NUE2 and the
@@ -1317,16 +1345,21 @@ With `--samples` too, it runs `ai_op`'s five operators and checks them:
 When the samples carry the v1.01.007 model
 (`build-novatek-hdal-samples.sh --ai-model`), it also runs `ai_net`.
 Its top class must be the sea snake, at 0.3 or more. With the detectors
-(`--sdk7` and `--turnkey`), it runs the four samples on their pictures.
-Their 27 MB of models and pictures is too large for the initramfs, so
+(`--sdk7` and `--turnkey`), it runs the five samples on their pictures.
+Their 30 MB of models and pictures is too large for the initramfs, so
 the test packs it as a SquashFS on a second SD card (`-drive
 if=sd,index=1`), and the guest copies it to the vfat card the samples
 read. It checks that each finds, near where they are:
 - **pdcnn**: the three people;
-- **pvdcnn**: the three people and the car;
+- **pvdcnn**: the two people and the three vehicles;
 - **fdcnn**: both faces, with the astronaut's eyes within 12 pixels;
 - **cddcnn**: the cat and the dog among the network's proposals, as
-  category 1 at 0.8 or more, and no proposal in the dashcam frame.
+  category 1 at 0.8 or more, and no proposal in the dashcam frame;
+- **frcnn**: all nine faces embedded, under 1% of the values at ±4. Each
+  photo of Obama and Biden is nearest another of the same man; the
+  mirrored Obama is nearest its original; and every pair of one man
+  scores above every pair of two. The grey square scores below every
+  pair of one man.
 
 `test-novatek.py` checks, at register level:
 - the idle bits;
@@ -1344,7 +1377,9 @@ read. It checks that each finds, near where they are:
   - scales at their largest saturating;
   - for the detectors: a convolution with a plain bias, deconvolution,
     scale-up, the element-wise add of two s16 maps, and NUE's permute
-    and softmax.
+    and softmax;
+  - for face recognition: ACT bit 16, BN with negative alphas, a global
+    average into a 16-bit out1, and NUE FC on 16-bit inputs.
 
 ## Display
 

@@ -15,9 +15,10 @@
  *               >> gshift) + offset
  *
  * The weights are 12-bit, an LSB-first bit stream (8-bit with MODE1's
- * quantisation bit).  8-bit operands enter the 12-bit multiplier
- * top-aligned, x 16 each: vendor_ai_op's 8-bit inputs and weights come
- * out x 256, the classifier's u8 inputs by 12-bit weights x 16.  Output
+ * quantisation bit).  Operands enter the 12-bit multiplier top-aligned:
+ * 8-bit ones x 16 -- vendor_ai_op's 8-bit inputs and weights come out
+ * x 256, the classifier's u8 inputs by 12-bit weights x 16 -- and 16-bit
+ * ones (the face network's embedding layer) by their top 12 bits.  Output
  * paths 1 / 3 write k1 as s32; path 0 (result less rho) writes
  * (k1 >> rho_fmt) - rho[j], a 12-bit rho a row, through the ReLU and its
  * shift, as 16 or 8 bits.  Permute (mode 4) turns a planar map into each
@@ -34,17 +35,20 @@
  * takes 12-bit weights, an LSB-first stream ordered [set][channel][ky][kx],
  * with zero padding of half the kernel on the sides the job pads.  Then
  * come a scale-shift; without BN the bias (12 bits, << CONV_SHIFT_B), with
- * it BN from an 8-byte record a channel -- alpha [23:0], mean [35:24],
- * beta [47:36]; the element-wise add or max of a second map; another
- * scale-shift, a clamp to 16 bits and the activation.  out0 takes act0
- * through its scale-shift and, if 8-bit, drops the 8.8 datapath's fraction
- * bits; out1 takes act1 through its scale-shift, the pooling (local or
- * global) and the pooling's shifts.  Deconvolution spreads a map out with
+ * it BN from an 8-byte record a channel -- alpha [23:0] (signed), mean
+ * [35:24], beta [47:36]; the element-wise add or max of a second map;
+ * another scale-shift, a clamp to 16 bits and the activation (ReLU or
+ * leaky, of the input negated by ACT bit 16 -- PReLU is three jobs).
+ * out0 takes act0 through its scale-shift and, if 8-bit, drops the 8.8
+ * datapath's fraction bits; out1 takes act1 through its scale-shift, the
+ * pooling (local or global) and the pooling's shifts, and if 16-bit keeps
+ * 8 fraction bits more.  Deconvolution spreads a map out with
  * holes (its convolution is jobs of its own), scale-up repeats pixels.
  * Depthwise layers are a job a channel.  The layouts, the 8.8 datapath and
  * where the bias goes are not in the SDK: they were fitted to the SDK's
- * ImageNet classifier and the AI turnkey's detectors, which then name
- * and find what their pictures hold.
+ * ImageNet classifier, the AI turnkey's detectors and its face
+ * recognition network, which then name, find and tell apart what their
+ * pictures hold.
  *
  * Nothing in the SDK fixes the rounding (half up here), NUE2's colour
  * matrix (full-range BT.601, chroma replicated) or its output channel
@@ -393,10 +397,13 @@ void nvt_ai_nue_run(const uint32_t *regs, NvtAiWrites *wl)
     if (!rd(in, x, (size_t)obj * svw * esz)) {
         return;
     }
-    /* 8-bit operands enter the 12-bit multiplier top-aligned, x 16 */
+    /*
+     * Operands enter the 12-bit multiplier top-aligned: 8-bit ones x 16,
+     * 16-bit ones their top 12 bits
+     */
     for (k = 0; k < obj * svw; k++) {
         xs[k] = wide ? (sign ? (int16_t)lduw_le_p(x + 2 * k)
-                             : lduw_le_p(x + 2 * k))
+                             : lduw_le_p(x + 2 * k)) >> 4
                      : (sign ? (int8_t)x[k] : x[k]) * 16;
     }
     if (path == 0 && !(mode1 & NUE_M1_RHO_REG)) {
@@ -639,6 +646,7 @@ void nvt_ai_nue2_run(const uint32_t *regs, NvtAiWrites *wl)
 #define CNN_ELT1            0x088
 #define CNN_ACT0            0x090
 #define CNN_ACT1            0x094
+#define CNN_ACT_NEG         (1u << 16)
 #define CNN_POOL0           0x098
 #define CNN_POOL1           0x09C
 #define CNN_DECONV          0x0A0
@@ -893,7 +901,7 @@ static bool cnn_bn(const uint32_t *regs, CnnMap *m)
     }
     for (c = 0; c < m->c; c++) {
         uint64_t r = le64_to_cpu(rec[c]);
-        int64_t alpha = extract64(r, 0, 24);
+        int64_t alpha = sextract64(r, 0, 24);     /* PReLU's are negative */
         int64_t mean = cnn_shl(sextract64(r, 24, 12), shm);
         int64_t beta = cnn_shl(sextract64(r, 36, 12), shb);
         int64_t *v = m->v + (size_t)c * n;
@@ -908,9 +916,16 @@ static bool cnn_bn(const uint32_t *regs, CnnMap *m)
     return true;
 }
 
-/* ReLU, leaky by an 11-bit slope >> (7 + [15:12]) */
+/*
+ * ReLU, leaky by an 11-bit slope >> (7 + [15:12]); bit 16 negates the
+ * input first.  PReLU compiles to ReLU(-x) by bit 16 and ReLU(x), joined
+ * by an element-wise job whose BN scales the first by the slopes.
+ */
 static int64_t cnn_act(int64_t v, uint32_t reg)
 {
+    if (reg & CNN_ACT_NEG) {
+        v = -v;
+    }
     if (v >= 0) {
         return v;
     }
@@ -1012,11 +1027,10 @@ static void cnn_pool(const uint32_t *regs, CnnMap *m)
 
 /*
  * Without BN, a convolution's bias: 12 bits in a 16-bit slot a set,
- * << CONV_SHIFT_B.  Where it goes is fitted to the AI turnkey's detectors:
- * after the convolution's scale-shift (0x0AC) for an 8-bit out0 -- before
- * it, the person and face detectors find nothing -- and before it for a
- * 16-bit out0 (the detectors' heads) -- after it, the person / vehicle
- * detector finds no people.
+ * << CONV_SHIFT_B, after the convolution's scale-shift (0x0AC) whatever
+ * the output.  Before it, the person and face detectors find nothing,
+ * and the face recognition network's embeddings no longer tell people
+ * apart.
  */
 static bool cnn_bias(const uint32_t *regs, CnnMap *m)
 {
@@ -1136,8 +1150,7 @@ void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
     bool bias;
 
     if ((mode & CNN_M_UNSUPPORTED) || (mode & 3) == 3 ||
-        (io & CNN_IO_UNSUPPORTED) || extract32(R(CNN_INSIZE1), 12, 7) > 1 ||
-        (R(CNN_ACT0) & (1u << 16)) || (R(CNN_ACT1) & (1u << 16))) {
+        (io & CNN_IO_UNSUPPORTED) || extract32(R(CNN_INSIZE1), 12, 7) > 1) {
         qemu_log_mask(LOG_UNIMP, "nvt-ai: CNN mode 0x%x io 0x%x\n", mode, io);
         return;
     }
@@ -1189,13 +1202,10 @@ void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
     }
     n = (size_t)v.c * v.h * v.w;
     bias = (mode & CNN_M_CONV) && !(mode & CNN_M_BN);
-    if (bias && (io & CNN_IO_OUT0_WIDE) && !cnn_bias(regs, &v)) {
-        goto out;
-    }
     for (i = 0; i < n; i++) {
         v.v[i] = cnn_ss(v.v[i], R(CNN_SS_CONV));
     }
-    if (bias && !(io & CNN_IO_OUT0_WIDE) && !cnn_bias(regs, &v)) {
+    if (bias && !cnn_bias(regs, &v)) {
         goto out;
     }
     if ((mode & CNN_M_BN) && !cnn_bn(regs, &v)) {
@@ -1215,12 +1225,18 @@ stages_done:
         }
     }
     if (io & CNN_IO_OUT1_EN) {
-        /* act1, its scale, the pooling, its scale: to 8 or 16 bits */
+        /*
+         * act1, its scale, the pooling, its scale: to 8 or 16 bits, a
+         * 16-bit out1 with 8 fraction bits more, as out0's are
+         */
         a1 = v;
         a1.v = g_new(int64_t, n);
         for (i = 0; i < n; i++) {
             a1.v[i] = cnn_ss(mode & CNN_M_ACT ? cnn_act(v.v[i], R(CNN_ACT1))
                                               : v.v[i], R(CNN_SS_ACT1));
+            if (io & CNN_IO_OUT1_WIDE) {
+                a1.v[i] = cnn_shl(a1.v[i], 8);
+            }
         }
         if (mode & CNN_M_POOL) {
             cnn_pool(regs, &a1);

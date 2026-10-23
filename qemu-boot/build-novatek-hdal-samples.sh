@@ -41,15 +41,19 @@
 # builds the turnkey's detectors -- ai2_pdcnn_sample (people),
 # alg_pvdcnn_sample (people and vehicles), alg_fdcnn_ai2_sample (faces)
 # and cddcnn_sample (pets; v1.01.007 has the library but no sample, so
-# this is qemu-boot/novatek-cddcnn-sample.c) -- from v1.01.007's sources and prebuilt detector libraries, but against
+# this is qemu-boot/novatek-cddcnn-sample.c) -- from v1.01.007's sources
+# and prebuilt detector libraries, and frcnn_sample (face recognition; the
+# turnkey has only the model, so qemu-boot/novatek-frcnn-sample.c runs it
+# through vendor_ai_net) -- but against
 # v1.01.002's vendor_ai2: v1.01.007's checks for a kernel driver version
 # the release modules do not have.  alg_fdcnn_ai2_sample wants a second
 # DDR (NN_USE_DRAM2), which these chips do not have; the build turns it
 # off.  sd/ then holds what they read: the models, and pictures -- the
 # SDK's dashcam frame (YUV420_SP_Huang), scikit-image's astronaut and
 # OpenCV's messi5 / basketball1 test pictures, scikit-image's chelsea
-# (a cat) and darknet's dog (downloaded), and a composite of messi5 and
-# basketball1 -- as the samples' NV12 files and BMPs.
+# (a cat), darknet's dog and face_recognition's photos of Obama, Biden,
+# Alex Lacamoire and Lin-Manuel Miranda (downloaded), and a composite of
+# messi5 and basketball1 -- as the samples' NV12 files and BMPs.
 #
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
@@ -199,7 +203,8 @@ fi
 # The turnkey's detectors and the pictures they read (python3 with numpy
 # and PIL makes the pictures); without them, none from an earlier build
 rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
-    "$OUT/smp/alg_fdcnn_ai2_sample" "$OUT/smp/cddcnn_sample"
+    "$OUT/smp/alg_fdcnn_ai2_sample" "$OUT/smp/cddcnn_sample" \
+    "$OUT/smp/frcnn_sample"
 if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
         ! python3 -c 'import numpy, PIL' 2>/dev/null; then
     echo "the detectors' pictures need python3 with numpy and PIL:" \
@@ -213,12 +218,14 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
         -I$T7/limit_fdet/include -I$T7/motion_detection/include \
         -I$H7/vendor/cv/include -I$H7/vendor/cv/include/libmd"
     for smp in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample \
-            cddcnn_sample; do
+            cddcnn_sample frcnn_sample; do
         src=$WORK/$smp
         rm -rf "$src"
         mkdir -p "$src"
         if [ $smp = cddcnn_sample ]; then
             cp "$(dirname "$0")/novatek-cddcnn-sample.c" "$src/"
+        elif [ $smp = frcnn_sample ]; then
+            cp "$(dirname "$0")/novatek-frcnn-sample.c" "$src/"
         else
             cp "$H7/samples/$smp/"*.c "$src/"
         fi
@@ -242,11 +249,11 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
     done
     SD=$OUT/sd
     rm -rf "$SD"
-    mkdir -p "$SD/CNNLib/para" "$SD/jpg/PD" "$SD/jpg/PVD" "$SD/jpg/CDD" "$SD/FDCNN/faces_y" \
-        "$SD/FDCNN/faces_uv" "$WORK/img"
+    mkdir -p "$SD/CNNLib/para" "$SD/jpg/PD" "$SD/jpg/PVD" "$SD/jpg/CDD" \
+        "$SD/jpg/FR" "$SD/FDCNN/faces_y" "$SD/FDCNN/faces_uv" "$WORK/img"
     cp -a "$TURNKEY/CNNLib/para/pdcnn" "$TURNKEY/CNNLib/para/public" \
         "$TURNKEY/CNNLib/para/pvdcnn" "$TURNKEY/CNNLib/para/fdcnn_method2_light" \
-        "$TURNKEY/CNNLib/para/cddcnn" \
+        "$TURNKEY/CNNLib/para/cddcnn" "$TURNKEY/CNNLib/para/frcnn" \
         "$SD/CNNLib/para/"
     rm -f "$SD/CNNLib/para/pvdcnn/nvt_model_origin.bin"     # prune37 is used
     cp "$H7/samples/ai_pattern/jpg/YUV420_SP_Huang_W1920H1080.bin" "$SD/jpg/PVD/huang.yuv"
@@ -261,12 +268,19 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
         curl -fsSL --retry 3 -o "$WORK/img/$f" \
             https://raw.githubusercontent.com/opencv/opencv/4.10.0/samples/data/$f
     done
+    for f in obama.jpg obama2.jpg biden.jpg two_people.jpg alex-lacamoire.png \
+            lin-manuel-miranda.png; do
+        curl -fsSL --retry 3 -o "$WORK/img/$f" \
+            https://raw.githubusercontent.com/ageitgey/face_recognition/9f3061aaeed9a8756d2c970f5dfe066617a8281d/examples/$f
+    done
     python3 - "$WORK/img" "$SD" <<'PY'
 # The pictures: a composite of messi5 and basketball1 at two sizes, and
 # basketball1 alone, as 1920x1080 NV12 (people, vehicles); chelsea and the
 # dog from darknet's picture, cropped to it (in the whole picture
 # the detector proposes nothing), as 1920x1080 NV12 (pets); astronaut
-# and basketball1 as Y / UV BMPs (faces).  BT.601 full range.
+# and basketball1 as Y / UV BMPs (faces); the faces in face_recognition's
+# photos, aligned to the ArcFace template as 112x112 NV12, with one
+# mirrored and a grey square (face recognition).  BT.601 full range.
 import sys
 import numpy as np
 from PIL import Image
@@ -314,11 +328,54 @@ for i, f in enumerate(('astronaut.png', 'basketball1.png')):
     y, uv = planes(Image.open(img + '/' + f))
     Image.fromarray(y, 'L').save('%s/FDCNN/faces_y/%06d.bmp' % (sd, i))
     Image.fromarray(uv, 'L').save('%s/FDCNN/faces_uv/%06d.bmp' % (sd, i))
+
+# Each face's five landmarks (eyes, nose, mouth corners), from
+# alg_fdcnn_ai2_sample under QEMU on the photo scaled by the factor given,
+# taken by a similarity transform to ArcFace's 112x112 template
+TEMPLATE = np.array([[38.2946, 51.6963], [73.5318, 51.5014],
+                     [56.0252, 71.7366], [41.5493, 92.3655],
+                     [70.7299, 92.2041]])
+FACES = (
+    ('obama1', 'obama.jpg', 0.633245,
+     (292, 137, 336, 135, 316, 171, 292, 211, 337, 207)),
+    ('obama2', 'obama2.jpg', 0.6,
+     (165, 228, 195, 239, 177, 271, 163, 325, 190, 335)),
+    ('obama3', 'two_people.jpg', 1,
+     (290, 94, 356, 100, 328, 125, 292, 163, 349, 169)),
+    ('biden1', 'biden.jpg', 0.8,
+     (438, 260, 503, 272, 478, 317, 425, 347, 494, 356)),
+    ('biden2', 'two_people.jpg', 1,
+     (844, 125, 905, 137, 876, 170, 837, 196, 887, 207)),
+    ('alex', 'alex-lacamoire.png', 1,
+     (240, 197, 285, 189, 267, 228, 244, 254, 290, 247)),
+    ('lin', 'lin-manuel-miranda.png', 1,
+     (374, 270, 456, 270, 422, 349, 376, 385, 453, 386)),
+)
+
+def align(im, lm):
+    # the least-squares similarity from the template to the photo
+    a, b = [], []
+    for (x, y), (u, v) in zip(TEMPLATE, lm):
+        a += [[x, -y, 1, 0], [y, x, 0, 1]]
+        b += [u, v]
+    p, q, tx, ty = np.linalg.lstsq(np.array(a), np.array(b), rcond=None)[0]
+    return im.transform((112, 112), Image.AFFINE, (p, -q, tx, q, p, ty),
+                        Image.BILINEAR)
+
+for name, f, s, lm in FACES:
+    face = align(Image.open(img + '/' + f).convert('RGB'),
+                 np.array(lm, float).reshape(5, 2) / s)
+    nv12(face, '%s/jpg/FR/%s.yuv' % (sd, name))
+    if name == 'obama1':
+        nv12(face.transpose(Image.FLIP_LEFT_RIGHT),
+             sd + '/jpg/FR/obama1flip.yuv')
+nv12(Image.new('RGB', (112, 112), (128, 128, 128)), sd + '/jpg/FR/grey.yuv')
 PY
     printf 'comp.yuv 1920 1080\nbball.yuv 1920 1080\n' > "$SD/jpg/pd_image_list.txt"
     printf 'huang.yuv 1920 1080\ncomp.yuv 1920 1080\n' > "$SD/jpg/pvdlist.txt"
     printf 'cat.yuv 1920 1080\ndog.yuv 1920 1080\nhuang.yuv 1920 1080\n' \
         > "$SD/jpg/cdd_image_list.txt"
+    ls "$SD/jpg/FR" > "$SD/jpg/fr_image_list.txt"
 fi
 
 find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +

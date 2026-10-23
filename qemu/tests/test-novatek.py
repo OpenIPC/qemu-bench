@@ -2096,6 +2096,72 @@ def test_ai_compute(qt):
 
 
 
+def test_ai_face(qt):
+    print('AI engines: the face recognition network\'s layers')
+    rnd = random.Random(98563)
+    W, H, C = 4, 4, 2
+    x = [rnd.randint(-120, 120) for _ in range(W * H * C)]
+    qt.write(AI_IN, bytes(v & 0xFF for v in x))
+    # activation alone, ACT bit 16: ReLU of the input negated (PReLU's
+    # negative half), u8 out0 (x 256 by its scale-shift, the 8.8 drop)
+    cnn_job(qt, {0x004: 0x200, 0x010: AI_IN, 0x020: W, 0x024: W * H,
+                 0x044: AI_OUT, 0x04C: W, 0x050: W * H,
+                 0x05C: W | H << 12, 0x060: C, 0x064: 0x110,
+                 0x090: 1 << 16, 0x094: 1 << 16, 0x0B4: 1 << 12 | 8 << 4 | 1})
+    check('CNN act bit 16: ReLU(-x)', list(qt.read(AI_OUT, W * H * C)),
+          [max(-v, 0) for v in x])
+    # BN alone with negative alphas (PReLU's slopes are), s8 out0
+    bn = [(-300, 10, 5), (-77, -20, -3)]                # alpha, mean, beta
+    qt.write(AI_W, b''.join(
+        struct.pack('<Q', (a & 0xFFFFFF) | (m & 0xFFF) << 24 |
+                    (b & 0xFFF) << 36) for a, m, b in bn))
+    cnn_job(qt, {0x004: 0x100, 0x010: AI_IN, 0x020: W, 0x024: W * H,
+                 0x038: AI_W, 0x044: AI_OUT, 0x04C: W, 0x050: W * H,
+                 0x05C: W | H << 12, 0x060: C, 0x064: 0x150,
+                 0x078: 10 << 21, 0x0AC: 1 << 12, 0x0B0: 1 << 12,
+                 0x0B4: 1 << 12 | 8 << 4 | 1})
+    want = []
+    for c, (a, m, b) in enumerate(bn):
+        for v in x[c * W * H:(c + 1) * W * H]:
+            want.append(max(min(rshr((v - m) * a, 10) + b, 127), -128))
+    check('CNN BN: alpha is signed',
+          list(struct.unpack('<%db' % (W * H * C), qt.read(AI_OUT, W * H * C))),
+          want)
+    # global average into a 16-bit out1: 8 fraction bits more than an
+    # 8-bit one
+    px = [rnd.randint(0, 120) for _ in range(48)]
+    qt.write(AI_IN, bytes(px))
+    cnn_job(qt, {0x004: 0x420, 0x010: AI_IN, 0x020: 4, 0x024: 16,
+                 0x048: AI_OUT, 0x054: 2, 0x058: 2, 0x05C: 4 | 4 << 12,
+                 0x060: 3, 0x064: 0x3080, 0x098: 1, 0x09C: 64 << 8,
+                 0x0B8: 1 << 12, 0x0BC: 1 << 12})
+    check('CNN global average into a 16-bit out1 keeps 8 fraction bits',
+          list(struct.unpack('<3h', qt.read(AI_OUT, 6))),
+          [rshr(sum(px[16 * c:16 * c + 16]) * 256 * 64, 10)
+           for c in range(3)])
+    # NUE FC on s16 inputs: their top 12 bits enter the multiplier
+    xv = [rnd.randint(-32768, 32767) for _ in range(4)]
+    wv = [[rnd.randint(-2048, 2047) for _ in range(4)] for _ in range(3)]
+    rho = [rnd.randint(-500, 500) for _ in range(3)]
+    qt.write(AI_IN, struct.pack('<4h', *xv))
+    qt.write(AI_W, pack12([v for r in wv for v in r]))
+    qt.write(AI_W + 0x100, pack12(rho))
+    for off, val in {0x004: 0x00011110, 0x008: 0x50, 0x00C: AI_IN,
+                     0x014: AI_W, 0x01C: AI_W + 0x100, 0x02C: AI_OUT,
+                     0x040: 4 | 3 << 16, 0x048: 1, 0x04C: 3 | 2 << 16,
+                     0x050: 8 << 24, 0x054: 0, 0x058: 3 << 16,
+                     0x038: 1}.items():
+        qt.writel(NUE + off, val)
+    qt.writel(NUE + 0x000, 2)
+    ai_settle(qt, NUE + 0x03C, 1)
+    want = [max(min(((sum(((xv[k] >> 4) * wv[j][k]) >> 8 for k in range(4))
+                      * 3 >> 2) >> 6) - rho[j], 32767), -32768)
+            for j in range(3)]
+    check('NUE FC: 16-bit inputs by their top 12 bits',
+          list(struct.unpack('<3h', qt.read(AI_OUT, 6))), want)
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+
+
 def cnn_job(qt, regs, done=1):
     """Run one CNN job set up in regs (offset: value) and wait for it."""
     for off in range(0x004, 0x0C0, 4):
@@ -2139,8 +2205,8 @@ def test_ai_detect(qt):
                 want.append(min(rshr(v * 255, 7 + 8), 255))
     check('CNN conv with a plain bias, after its scale-shift (u8 out)',
           list(qt.read(AI_OUT, S * H * W)), want)
-    # the same into a 16-bit out0 (a detector's head): the bias goes in
-    # before the scale-shift, and out0 keeps the fraction bits
+    # the same into a 16-bit out0 (a detector's head): the bias still
+    # after the scale-shift, and out0 keeps the fraction bits
     cnn_job(qt, {0x004: 0x1000, 0x010: AI_IN, 0x020: W, 0x024: W * H,
                  0x030: AI_W, 0x038: AI_W + 0x1000, 0x044: AI_OUT,
                  0x04C: 2 * W, 0x050: 2 * W * H, 0x05C: W | H << 12,
@@ -2155,9 +2221,9 @@ def test_ai_detect(qt):
                           for c in range(C) for ky in range(3)
                           for kx in range(3)
                           if 0 <= oy + ky - 1 < H and 0 <= ox + kx - 1 < W)
-                v = rshr(rshr((acc + (bias[st] << 3)) * 5, 6), 4)
+                v = rshr(rshr(acc * 5, 6) + (bias[st] << 3), 4)
                 want.append(max(min(v, 32767), -32768))
-    check('CNN conv into a 16-bit out0: the bias before the scale-shift',
+    check('CNN conv into a 16-bit out0: the bias after the scale-shift',
           list(struct.unpack('<%dh' % (S * H * W), qt.read(AI_OUT, 2 * S * H * W))),
           want)
     # deconvolution: 3x2 x 2 channels spread out by 2, a pad row and
@@ -3491,6 +3557,7 @@ def run(args, tmp):
         test_ai(qt)
         test_ai_compute(qt)
         test_ai_detect(qt)
+        test_ai_face(qt)
     finally:
         qt.close()
 

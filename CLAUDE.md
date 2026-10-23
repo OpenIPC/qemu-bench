@@ -290,10 +290,16 @@ against v1.01.002's `vendor_ai2`, because v1.01.007's checks for a
 `kdrv_ai` version the release modules lack. The pet detector `cddcnn`
 has a library but no SDK sample; `qemu-boot/novatek-cddcnn-sample.c` is
 ours. Its test checks the network's raw proposals, because limit_fdet's
-classifier rejects the test pets (as the model's own call). A conv bias without BN goes
-after the conv's scale-shift (0x0AC) for an 8-bit out0 and before it for
-a 16-bit one, fitted to the detectors (the wrong side loses people or
-faces). The
+classifier rejects the test pets (as the model's own call). The face
+recognition network `frcnn` ships as a model only;
+`qemu-boot/novatek-frcnn-sample.c` runs it through `vendor_ai_net`,
+skipping the 32-byte prefix the turnkey's models carry. It fixed
+four rules the detectors had hidden: BN alpha is signed, ACT bit 16
+negates (PReLU is ReLU(-x), ReLU(x) and an element-wise BN), a 16-bit
+out1 keeps 8 fraction bits, and the NUE takes 16-bit operands by their
+top 12 bits. A conv bias without BN goes after the conv's scale-shift
+(0x0AC) at any output width; the old 16-bit "before" rule had
+compensated for the unsigned alpha. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands
