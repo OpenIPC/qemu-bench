@@ -24,8 +24,9 @@
  *
  * The model's microphone hears a 1 kHz tone: while the DMA runs the
  * ring fills at "rate" bytes a second of 16-bit samples ("sample-rate"
- * Hz), the level count growing until the buffer is full, which latches
- * the overrun.  _AudDmaIrq acts only on a flag whose enable is set (bit 5
+ * Hz), the level count growing until the buffer is full; samples
+ * that arrive then are dropped, which latches the overrun until 0x80
+ * bit 9 clears it.  _AudDmaIrq acts only on a flag whose enable is set (bit 5
  * with bit 11, bit 1 with bit 14) and masks it, so the interrupt is the
  * OR of exactly those pairs; a line raised on any other condition is
  * never masked and storms the CPU.  Everything else in the banks is
@@ -110,7 +111,7 @@ static void bach_update(SstarBachState *s)
     bool on = s->regs[AI_ADDR_LO] & AI_RUN;
 
     if (s->level >= bach_size(s) && bach_size(s)) {
-        f |= FLAG_FULL | FLAG_OVERRUN;
+        f |= FLAG_FULL;
     }
     if (thresh && s->level >= thresh) {
         f |= FLAG_HIGH;
@@ -161,18 +162,20 @@ static void bach_tick(void *opaque)
         return;
     }
     if (s->last) {
-        uint64_t n = (uint64_t)(now - s->last) * s->rate /
-                     NANOSECONDS_PER_SECOND;
+        uint64_t want = (uint64_t)(now - s->last) * s->rate /
+                        NANOSECONDS_PER_SECOND;
+        uint64_t n = MIN(want, (uint64_t)(size - s->level)) & ~7ull;
 
-        n = MIN(n, (uint64_t)(size - s->level)) & ~7ull;
         if (n) {
             bach_fill(s, n);
             s->level += n;
             s->last += (int64_t)(n * NANOSECONDS_PER_SECOND /
                                  MAX(s->rate, 1));
         }
-        if (s->level >= size) {
-            s->last = now;          /* full: the microphone drops samples */
+        if (s->level >= size && want > n) {
+            /* full: the microphone drops samples, which is the overrun */
+            s->regs[AI_FLAGS] |= FLAG_OVERRUN;
+            s->last = now;
         }
     } else {
         s->last = now;

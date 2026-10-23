@@ -188,6 +188,11 @@ typedef struct SstarVencWork {
     size_t len;
 } SstarVencWork;
 
+typedef struct SstarVencReport {
+    uint8_t n;
+    uint32_t irq;
+} SstarVencReport;
+
 struct SstarVencState {
     SysBusDevice parent_obj;
 
@@ -198,11 +203,8 @@ struct SstarVencState {
     bool halted;
     uint8_t pending;            /* slots taken, not yet done */
     uint8_t done;               /* slots with reports outstanding */
-    struct {                    /* the reports, in order */
-        uint8_t n;
-        uint32_t irq;
-    } rq[2 * SLOTS];
-    unsigned rq_head, rq_len;
+    SstarVencReport rq[2 * SLOTS];  /* the reports, in order */
+    uint32_t rq_head, rq_len;
     uint32_t out_base[CONTEXTS];    /* each context's output buffer */
     uint32_t out_units[CONTEXTS];
     uint64_t out_valid;
@@ -409,9 +411,10 @@ static void venc_pattern(AVFrame *f, int64_t frame)
         { 35, 212, 114 }, { 16, 128, 128 },
     };
     int w = f->width, h = f->height, x, y, bit;
-    int box = MAX(h / 6, 16);
-    int bx = (int)((frame * 8) % MAX(w - box, 1)), by = h / 2 - box / 2;
-    int cell = MAX(w / 40, 8);
+    /* both clipped to the frame, which may be as small as 16x16 */
+    int box = MIN(MAX(h / 6, 16), MIN(w, h));
+    int bx = (int)((frame * 8) % (w - box + 1)), by = h / 2 - box / 2;
+    int cell = MIN(MAX(w / 40, 8), h);
 
     av_frame_make_writable(f);
     for (y = 0; y < h; y++) {
@@ -425,8 +428,12 @@ static void venc_pattern(AVFrame *f, int64_t frame)
         }
         if (y < cell) {
             for (bit = 0; bit < 16; bit++) {
-                memset(py + (15 - bit) * cell, (frame >> bit) & 1 ? 235 : 16,
-                       cell - 2);
+                int cx = (15 - bit) * cell;
+
+                if (cx < w) {
+                    memset(py + cx, (frame >> bit) & 1 ? 235 : 16,
+                           MIN(cell - 2, w - cx));
+                }
             }
         }
     }
@@ -616,7 +623,11 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
  * ring-pool record of one still in flight (the driver keeps one per
  * channel), whose tail reservation then fails ([550] in the ISR).
  */
-static void venc_submit(SstarVencState *s, int n, uint32_t w0)
+/*
+ * Encode slot n's job, with the virtual clock held unless the VM is
+ * already stopped (a migration's load).
+ */
+static void venc_submit(SstarVencState *s, int n, uint32_t w0, bool hold)
 {
     hwaddr prog = venc_dram(s->regs[(CTRL + n * SLOT_STRIDE + 8) >> 2]);
     uint32_t size = venc_prog_reg(prog, PROG_SIZE);
@@ -629,9 +640,13 @@ static void venc_submit(SstarVencState *s, int n, uint32_t w0)
     w->width = size & 0xFFFF;
     w->height = size >> 16;
     w->prog = prog;
-    cpu_disable_ticks();
+    if (hold) {
+        cpu_disable_ticks();
+    }
     venc_encode(s, w);
-    cpu_enable_ticks();
+    if (hold) {
+        cpu_enable_ticks();
+    }
     if (s->ready[n]) {
         g_free(s->ready[n]->out);
         g_free(s->ready[n]);
@@ -680,7 +695,6 @@ static void sstar_venc_job(void *opaque)
 {
     SstarVencState *s = opaque;
     int n;
-
 
     for (n = 0; n < SLOTS; n++) {
         uint32_t *w0 = &s->regs[(CTRL + n * SLOT_STRIDE) >> 2];
@@ -789,7 +803,7 @@ static void sstar_venc_reg_write(SstarVencState *s, hwaddr off, uint32_t v)
     if (off < CTRL + SLOTS * SLOT_STRIDE && off % SLOT_STRIDE == 0 &&
         (v & SLOT_BUSY) && s->running) {
 #ifdef SSTAR_VENC_LIBAVCODEC
-        venc_submit(s, off / SLOT_STRIDE, v);
+        venc_submit(s, off / SLOT_STRIDE, v, true);
 #endif
         s->pending |= 1u << (off / SLOT_STRIDE);
         s->due[off / SLOT_STRIDE] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -895,10 +909,42 @@ static const Property sstar_venc_props[] = {
     DEFINE_PROP_BOOL("trace", SstarVencState, trace, false),
 };
 
-static const VMStateDescription vmstate_sstar_venc = {
-    .name = TYPE_SSTAR_VENC,
+static const VMStateDescription vmstate_sstar_venc_report = {
+    .name = TYPE_SSTAR_VENC "/report",
     .version_id = 1,
     .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(n, SstarVencReport),
+        VMSTATE_UINT32(irq, SstarVencReport),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/*
+ * The encoded frames of fired jobs are host memory, not state: they are
+ * encoded again from the guest's program once loaded.
+ */
+static int sstar_venc_post_load(void *opaque, int version_id)
+{
+#ifdef SSTAR_VENC_LIBAVCODEC
+    SstarVencState *s = opaque;
+    int n;
+
+    venc_drop_ready(s);
+    for (n = 0; n < SLOTS; n++) {
+        if (s->pending & (1u << n)) {
+            venc_submit(s, n, s->regs[(CTRL + n * SLOT_STRIDE) >> 2], false);
+        }
+    }
+#endif
+    return 0;
+}
+
+static const VMStateDescription vmstate_sstar_venc = {
+    .name = TYPE_SSTAR_VENC,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = sstar_venc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, SstarVencState, VENC_SIZE / 4),
         VMSTATE_BOOL(running, SstarVencState),
@@ -908,6 +954,16 @@ static const VMStateDescription vmstate_sstar_venc = {
         VMSTATE_UINT32_ARRAY(bs, SstarVencState, SLOTS),
         VMSTATE_UINT8_ARRAY(ctx, SstarVencState, SLOTS),
         VMSTATE_TIMER_PTR(job, SstarVencState),
+        VMSTATE_STRUCT_ARRAY(rq, SstarVencState, 2 * SLOTS, 1,
+                             vmstate_sstar_venc_report, SstarVencReport),
+        VMSTATE_UINT32(rq_head, SstarVencState),
+        VMSTATE_UINT32(rq_len, SstarVencState),
+        VMSTATE_UINT32_ARRAY(out_base, SstarVencState, CONTEXTS),
+        VMSTATE_UINT32_ARRAY(out_units, SstarVencState, CONTEXTS),
+        VMSTATE_UINT64(out_valid, SstarVencState),
+        VMSTATE_UINT32_ARRAY(bytes, SstarVencState, SLOTS),
+        VMSTATE_INT64_ARRAY(due, SstarVencState, SLOTS),
+        VMSTATE_TIMER_PTR(next, SstarVencState),
         VMSTATE_END_OF_LIST()
     }
 };

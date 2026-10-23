@@ -32,6 +32,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -56,6 +57,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarCryptoState, SSTAR_CRYPTO)
 #define SHA_CTRL_FIRE       (1u << 0)
 #define SHA_CTRL_RST        (1u << 7)
 #define SHA_CTRL_SHA256     (1u << 9)
+#define SHA_LEN_MAX         (256 * MiB)    /* the largest DRAM */
 #define SHA_STATUS_READY    (1u << 0)
 
 #define RSA_IND32_START     0x20
@@ -218,11 +220,21 @@ static void sstar_sha_run(SstarCryptoState *s)
     if (addr < SS_DRAM_BASE) {
         addr += SS_DRAM_BASE;
     }
+    /*
+     * A source beyond DRAM, or one that does not read, gives a zero
+     * digest (which no signature matches) rather than one of whatever
+     * the buffer held.
+     */
+    if (len > SHA_LEN_MAX) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-crypto: SHA length %u\n", len);
+        goto done;
+    }
     buf = g_malloc(len ? len : 1);
     if (dma_memory_read(&address_space_memory, addr, buf, len,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "sstar-crypto: SHA source 0x%08x+%u "
                       "unreadable\n", addr, len);
+        goto done;
     }
     if (qcrypto_hash_bytes(sha256 ? QCRYPTO_HASH_ALGO_SHA256
                                   : QCRYPTO_HASH_ALGO_SHA1,
@@ -236,6 +248,7 @@ static void sstar_sha_run(SstarCryptoState *s)
             out[sizeof(out) - 1 - i] = digest[i];
         }
     }
+done:
     for (i = 0; i < 16; i++) {
         s->regs[SHA_OUT + i] = out[2 * i] | (out[2 * i + 1] << 8);
     }

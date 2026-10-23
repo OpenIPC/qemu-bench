@@ -185,6 +185,18 @@ static void spi_deselect(SstarFspState *s)
     sstar_fsp_persist(s);
 }
 
+/*
+ * One of a command's three address bytes; the extended address register
+ * (WREAR) is address bits [31:24], which reach past 16 MiB.
+ */
+static void spi_addr_byte(SstarFspState *s, uint32_t pos, uint8_t tx)
+{
+    s->addr = (s->addr << 8) | tx;
+    if (pos == 3) {
+        s->addr = (s->addr & 0xFFFFFF) | (uint32_t)s->ear << 24;
+    }
+}
+
 static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
 {
     uint32_t pos = s->pos++;
@@ -199,7 +211,7 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
     case 0x0B:                              /* FAST_READ, one dummy byte */
     case 0x3B: case 0x6B:                   /* dual / quad output read */
         if (pos <= 3) {
-            s->addr = (s->addr << 8) | tx;
+            spi_addr_byte(s, pos, tx);
         } else if (s->cmd == 0x03 || pos > 4) {
             rx = s->array[s->addr & (s->size - 1)];
             s->addr++;
@@ -207,7 +219,7 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
         break;
     case 0x02: case 0x32:                   /* PP, quad PP */
         if (pos <= 3) {
-            s->addr = (s->addr << 8) | tx;
+            spi_addr_byte(s, pos, tx);
         } else if (s->wel) {
             uint32_t a = s->addr & (s->size - 1);
 
@@ -219,7 +231,7 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
         break;
     case 0x20: case 0x52: case 0xD8:
         if (pos <= 3) {
-            s->addr = (s->addr << 8) | tx;
+            spi_addr_byte(s, pos, tx);
         }
         break;
     case 0x9F:                              /* RDID */
@@ -264,8 +276,8 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
             s->sr[2] = tx;
         }
         break;
-    case 0xC5:                              /* WREAR */
-        if (pos == 1) {
+    case 0xC5:                              /* WREAR, after WREN */
+        if (s->wel && pos == 1) {
             s->ear = tx;
         }
         break;

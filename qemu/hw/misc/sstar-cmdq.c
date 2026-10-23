@@ -235,46 +235,53 @@ static void sstar_cmdq_exec(SstarCmdqState *s, int n, uint32_t lo,
     }
 }
 
-/* Run the queue from the read pointer up to the write pointer. */
+/*
+ * Run the queue from the read pointer up to the write pointer.  A
+ * program may fill the ring to its end, so the read pointer may rest at
+ * the end itself, and moves to the start only for a command there: that
+ * keeps a ring filled from start to end distinct from an empty one.
+ */
 static void sstar_cmdq_run(SstarCmdqState *s, int n)
 {
     SstarCmdqEngine *e = &s->eng[n];
     uint32_t start = eng32(e, R_START_LO) << 4, end = eng32(e, R_END_LO) << 4;
     uint32_t wptr = eng32(e, R_WPTR_LO) << 4;
-    uint32_t shown;
     int count = 0;
 
     if (!(e->regs[R_CTRL_HI] & 1) || end <= start ||
         wptr < start || wptr > end) {
         return;
     }
-    if (e->rptr < start || e->rptr >= end) {
+    if (e->rptr < start || e->rptr > end) {
         e->rptr = start;
-    }
-    if (wptr == end) {
-        wptr = start;       /* a program that fills the ring to its end */
     }
     while (e->rptr != wptr && count++ < CMDQ_MAX_RUN) {
         uint32_t cmd[2];
 
-        dma_memory_read(&address_space_memory, cmdq_dram(e->rptr), cmd,
-                        sizeof(cmd), MEMTXATTRS_UNSPECIFIED);
+        if (e->rptr == end) {
+            e->rptr = start;
+            if (wptr == start) {
+                break;
+            }
+        }
+        if (dma_memory_read(&address_space_memory, cmdq_dram(e->rptr), cmd,
+                            sizeof(cmd), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "sstar-cmdq%d: command at "
+                          "0x%08x unreadable\n", n, e->rptr);
+            break;
+        }
         sstar_cmdq_exec(s, n, le32_to_cpu(cmd[0]), le32_to_cpu(cmd[1]));
         e->rptr += 8;
-        if (e->rptr >= end) {
-            e->rptr = start;
-        }
     }
     /*
      * Caught up, the read pointer is the write pointer as the driver
      * wrote it, the ring's end included: read == write is an empty ring
      * to MHal_cmdq_CheckBufferAvailTimeout, and its start a full one.
      */
-    shown = e->rptr == wptr ? eng32(e, R_WPTR_LO) << 4 : e->rptr;
-    e->regs[R_RPTR_LO] = (shown >> 4) & 0xFFFF;
-    e->regs[R_RPTR_HI] = shown >> 20;
-    e->regs[R_BRPTR_LO] = (shown >> 4) & 0xFFFF;
-    e->regs[R_BRPTR_HI] = shown >> 20;
+    e->regs[R_RPTR_LO] = (e->rptr >> 4) & 0xFFFF;
+    e->regs[R_RPTR_HI] = e->rptr >> 20;
+    e->regs[R_BRPTR_LO] = (e->rptr >> 4) & 0xFFFF;
+    e->regs[R_BRPTR_HI] = e->rptr >> 20;
     sstar_cmdq_update_irq(s);
 }
 

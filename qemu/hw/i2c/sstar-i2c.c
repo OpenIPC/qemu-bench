@@ -177,11 +177,13 @@ static void sstar_i2c_dma(SstarI2cState *s)
     uint8_t slave = s->regs[R_SLAVE] & 0x7F;
     int cmd_len = s->regs[R_CMD_LEN] & 0xF;
     bool read = s->regs[R_DMA_CTRL] & DMACTRL_READ;
+    bool ten = s->regs[R_SLAVE] & (1u << 10);
     g_autofree uint8_t *buf = NULL;
     uint32_t done = 0;
     int i;
 
-    if (s->regs[R_SLAVE] & (1u << 10)) {
+    if (ten) {
+        /* not modelled: no slave answers, as a NACK of the address */
         qemu_log_mask(LOG_UNIMP, "sstar-i2c: 10-bit addressing\n");
     }
     if (addr < SS_DRAM_BASE) {
@@ -191,7 +193,7 @@ static void sstar_i2c_dma(SstarI2cState *s)
     buf = g_malloc0(len ? len : 1);
 
     /* address and command bytes, written; then the data either way */
-    if (sstar_i2c_start(s, slave, read && !cmd_len)) {
+    if (!ten && sstar_i2c_start(s, slave, read && !cmd_len)) {
         bool ok = true;
 
         if (cmd_len) {
@@ -341,6 +343,9 @@ static void sstar_i2c_reset(DeviceState *dev)
 {
     SstarI2cState *s = SSTAR_I2C(dev);
 
+    if (s->in_xfer) {
+        i2c_end_transfer(s->bus);
+    }
     memset(s->regs, 0, sizeof(s->regs));
     s->want_addr = s->in_xfer = s->recv = false;
     sstar_i2c_update_irq(s);

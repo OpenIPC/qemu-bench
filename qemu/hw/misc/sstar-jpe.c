@@ -31,6 +31,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -69,6 +70,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarJpeState, SSTAR_JPE)
 #define R_WR_END_LO         0x53
 #define R_WR_END_HI         0x54
 #define HDR_MAX             2048
+#define OUT_MAX             (8 * MiB)   /* a scan larger is not coded */
+#define DIM_MAX             8192
 #define SS_DRAM_BASE        0x20000000
 
 struct SstarJpeState {
@@ -141,22 +144,35 @@ static bool jpe_parse(const uint8_t *b, size_t n, JpeTables *t, size_t *hdr)
                 memcpy(t->q[d[k] & 3], d + k + 1, 64);
             }
         } else if (m == 0xC0) {         /* SOF0 */
+            if (dl < 6 || d[5] != 3 || dl < 6 + 3 * 3) {
+                return false;
+            }
             t->h = d[1] << 8 | d[2];
             t->w = d[3] << 8 | d[4];
-            t->ncomp = MIN(d[5], 3);
+            t->ncomp = 3;
             for (c = 0; c < t->ncomp; c++) {
                 t->hs[c] = d[7 + c * 3] >> 4;
                 t->vs[c] = d[7 + c * 3] & 15;
                 t->tq[c] = d[8 + c * 3] & 3;
+                if (t->hs[c] < 1 || t->hs[c] > 4 ||
+                    t->vs[c] < 1 || t->vs[c] > 4) {
+                    return false;
+                }
+            }
+            if (t->w > DIM_MAX || t->h > DIM_MAX) {
+                return false;
             }
         } else if (m == 0xC4) {         /* DHT */
             size_t o = 0;
 
             while (o + 17 <= dl) {
-                int tc = d[o] >> 4, th = d[o] & 3, tab = tc * 4 + th;
+                int tc = d[o] >> 4, th = d[o] & 15, tab = tc * 4 + th;
                 const uint8_t *cnt = d + o + 1, *val = d + o + 17;
                 int code = 0, v = 0, bits;
 
+                if (tc > 1 || th > 3) {     /* baseline: DC/AC, 0-3 */
+                    return false;
+                }
                 for (bits = 1; bits <= 16; bits++) {
                     for (k = 0; k < cnt[bits - 1]; k++) {
                         if (o + 17 + v >= dl) {
@@ -171,9 +187,15 @@ static bool jpe_parse(const uint8_t *b, size_t n, JpeTables *t, size_t *hdr)
                 o += 17 + v;
             }
         } else if (m == 0xDA) {         /* SOS: the header ends here */
-            for (c = 0; c < MIN(d[0], 3); c++) {
+            if (dl < 1 || d[0] != 3 || dl < 1 + 3 * 2) {
+                return false;
+            }
+            for (c = 0; c < 3; c++) {
                 t->td[c] = d[2 + c * 2] >> 4;
                 t->ta[c] = d[2 + c * 2] & 15;
+                if (t->td[c] > 3 || t->ta[c] > 3) {
+                    return false;
+                }
             }
             *hdr = i + 2 + l;
             return t->w > 0 && t->h > 0 && t->ncomp == 3;
@@ -388,15 +410,17 @@ static void sstar_jpe_frame_done(void *opaque)
 
     /*
      * The driver's header (SOI .. SOS) is copied in front of the scan
-     * (reg_header_copy_enable); a frame that cannot be coded, or does not
-     * fit the output buffer, is the end-of-image marker alone.
+     * (reg_header_copy_enable); a frame that cannot be coded (a header
+     * that is not 3-component baseline up to 8192x8192), or does not fit
+     * the output buffer or OUT_MAX, is the end-of-image marker alone.
      */
+    cap = MIN(cap, OUT_MAX);
     if (out && cap > HDR_MAX && (s->regs[R_HDR_CTRL] & 1) && ha &&
         hlen <= HDR_MAX) {
         buf = g_malloc(cap);
-        dma_memory_read(&address_space_memory, jpe_dram(ha), buf, hlen,
-                        MEMTXATTRS_UNSPECIFIED);
-        if (jpe_parse(buf, hlen, &t, &hdr) && hdr <= hlen) {
+        if (dma_memory_read(&address_space_memory, jpe_dram(ha), buf, hlen,
+                            MEMTXATTRS_UNSPECIFIED) == MEMTX_OK &&
+            jpe_parse(buf, hlen, &t, &hdr) && hdr <= hlen) {
             size_t n = jpe_encode(&t, s->frames, buf + hlen, cap - hlen);
 
             len = n ? hlen + n : 0;
