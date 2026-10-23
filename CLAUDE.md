@@ -81,12 +81,14 @@ bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info ta
 Full-boot tests need firmware, in one of two shapes.
 
 **Split kernel + rootfs** (`-kernel`/`-initrd`, what the `run-*.sh` scripts and
-the CI boot matrix use) — from the GitHub release:
+the CI boot matrix use) — from the GitHub release. The release publishes
+it as `openipc.<soc>-nor-lite.tgz` (the two files) or, for SoCs moved since
+OpenIPC/firmware#2638, `openipc.<soc>-nor-lite-split.tgz` (one
+`firmware.bin.<soc>`: uImage, then SquashFS); `fetch-openipc-lite.sh` takes
+either and leaves `uImage.<soc>` + `rootfs.squashfs.<soc>`:
 
 ```bash
-cd qemu-boot && curl -sLO \
-  https://github.com/OpenIPC/firmware/releases/download/latest/openipc.hi3516ev300-nor-lite.tgz \
-  && tar xzf openipc.hi3516ev300-nor-lite.tgz && cd ..
+bash qemu-boot/fetch-openipc-lite.sh hi3516ev300 qemu-boot
 bash qemu-boot/run-ev300.sh              # one run-*.sh per boot-tested platform
 ```
 
@@ -282,7 +284,13 @@ to the SDK's classifier with `-global nvt-media.ai-dump=DIR` (job
 registers and RAM). SDK v1.01.002's models are for chip id 1 (NT98520),
 which `kflow_ai_net` refuses on 0x7021; v1.01.007's `ai_pattern` model is
 the same network for chip id 4, and under QEMU it names the test
-picture (a sea snake). The
+picture (a sea snake). The v1.01.007 AI turnkey's detectors (people,
+vehicles, faces) run too, built from v1.01.007's samples and libraries
+against v1.01.002's `vendor_ai2`, because v1.01.007's checks for a
+`kdrv_ai` version the release modules lack. A conv bias without BN goes
+after the conv's scale-shift (0x0AC) for an 8-bit out0 and before it for
+a 16-bit one, fitted to the detectors (the wrong side loses people or
+faces). The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

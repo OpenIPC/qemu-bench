@@ -36,15 +36,31 @@
 # ships the same network built for it (chip id 4).  --ai-model gives
 # that one; a model with another chip id is left out, and ai_net with it.
 #
+# With --sdk7 (the v1.01.007 uClibc release, the directory above code/)
+# and --turnkey (its AI turnkey package's sd/, which holds CNNLib) it also
+# builds the turnkey's detectors -- ai2_pdcnn_sample (people),
+# alg_pvdcnn_sample (people and vehicles), alg_fdcnn_ai2_sample (faces)
+# -- from v1.01.007's sources and prebuilt detector libraries, but against
+# v1.01.002's vendor_ai2: v1.01.007's checks for a kernel driver version
+# the release modules do not have.  alg_fdcnn_ai2_sample wants a second
+# DDR (NN_USE_DRAM2), which these chips do not have; the build turns it
+# off.  sd/ then holds what they read: the models, and pictures -- the
+# SDK's dashcam frame (YUV420_SP_Huang), scikit-image's astronaut and
+# OpenCV's messi5 / basketball1 test pictures (downloaded), and a
+# composite of the last two -- as the samples' NV12 files and BMPs.
+#
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
 #       [--ai-model <v1.01.007 SDK>/code/hdal/samples/ai_pattern/para/nvt_model.bin] \
+#       [--sdk7 <v1.01.007 SDK> --turnkey <ai_turnkey>/sd] \
 #       [--cross /opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-]
 set -euo pipefail
 
 SDK=
 ROOTFS=
 AIMODEL=
+SDK7=
+TURNKEY=
 OUT=$PWD/novatek-hdal-samples
 CROSS=/opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-
 while [ $# -gt 0 ]; do
@@ -52,6 +68,8 @@ while [ $# -gt 0 ]; do
         --sdk) SDK=$2; shift 2 ;;
         --rootfs) ROOTFS=$2; shift 2 ;;
         --ai-model) AIMODEL=$2; shift 2 ;;
+        --sdk7) SDK7=$2; shift 2 ;;
+        --turnkey) TURNKEY=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         --cross) CROSS=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
@@ -164,6 +182,9 @@ mkdir -p "$OUT/smp/jpg" "$OUT/smp/para" "$OUT/smp/accuracy"
 cp "$H/samples/ai_pattern/jpg/YUV420_SP_W512H376.bin" "$OUT/smp/jpg/"
 cp "$H/samples/ai_pattern/accuracy/labels.txt" "$OUT/smp/accuracy/"
 # the model's chip id: its first 16 bits (4 is this chip, 1 the NT98520)
+if [ -z "$AIMODEL" ] && [ -n "$SDK7" ]; then
+    AIMODEL=$SDK7/code/hdal/samples/ai_pattern/para/nvt_model.bin
+fi
 AIMODEL=${AIMODEL:-$H/samples/ai_pattern/para/nvt_model.bin}
 if [ "$(od -An -tu2 -N2 "$AIMODEL" | tr -d ' ')" = 4 ]; then
     cp "$AIMODEL" "$OUT/smp/para/nvt_model.bin"
@@ -172,5 +193,110 @@ else
     echo "$AIMODEL is not built for this chip (chip id 4): no ai_net model" \
          "(--ai-model, from SDK v1.01.007)" >&2
 fi
+
+# The turnkey's detectors and the pictures they read (python3 with numpy
+# and PIL makes the pictures); without them, none from an earlier build
+rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
+    "$OUT/smp/alg_fdcnn_ai2_sample"
+if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
+        ! python3 -c 'import numpy, PIL' 2>/dev/null; then
+    echo "the detectors' pictures need python3 with numpy and PIL:" \
+         "no detectors built" >&2
+elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
+    H7=$SDK7/code/hdal
+    T7=$H7/vendor/third_party
+    DETINC="$AIINC -I$H/vendor/ai2/source/prebuilt/include/nvtnn \
+        -I$T7/pdcnn_ai2/include -I$T7/pvdcnn/include -I$T7/fdcnn_ai2/include \
+        -I$T7/limit_fdet/include -I$T7/motion_detection/include \
+        -I$H7/vendor/cv/include -I$H7/vendor/cv/include/libmd"
+    for smp in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample; do
+        src=$WORK/$smp
+        mkdir -p "$src"
+        cp "$H7/samples/$smp/"*.c "$src/"
+        sed -i 's/^#define NN_USE_DRAM2 .*ENABLE/#define NN_USE_DRAM2 DISABLE/' "$src/"*.c
+        "${CROSS}gcc" -O2 -D__LINUX $DETINC -o "$OUT/smp/$smp" "$src/"*.c \
+            -L"$OUT/uc" -lhdal -Wl,--start-group "$H/vendor/ai2/source/libvendor_ai2.a" \
+            "$WORK/libvendor_ai2_pub.a" "$H/vendor/media/source/libvendor_media.a" \
+            "$H/vendor/ai/source/prebuilt/lib/uclibc/libprebuilt_ai.a" \
+            "$T7/pdcnn_ai2/prebuilt/uclibc/libprebuilt_pdcnn_ai2.a" \
+            "$T7/pvdcnn/prebuilt/uclibc/libprebuilt_pvdcnn.a" \
+            "$T7/fdcnn_ai2/prebuilt/uclibc/libprebuilt_fdcnn_ai2.a" \
+            "$T7/limit_fdet/prebuilt/uclibc/libprebuilt_limit_fdet.a" \
+            "$T7/motion_detection/prebuilt/uclibc/libprebuilt_md.a" \
+            "$H7/vendor/cv/source/libvendor_cv.a" \
+            "$H7/vendor/cv/source/prebuilt/uclibc/libprebuilt_cv.a" \
+            "$H/vendor/isp/source/libvendor_isp.a" \
+            "$CODE/vos/output/libvos.a" -Wl,--end-group -lpthread -lm -lstdc++ \
+            -Wl,--dynamic-linker=/tmp/uc/ld-uClibc.so.0 -Wl,-rpath=/tmp/uc
+        echo "built $smp"
+    done
+    SD=$OUT/sd
+    rm -rf "$SD"
+    mkdir -p "$SD/CNNLib/para" "$SD/jpg/PD" "$SD/jpg/PVD" "$SD/FDCNN/faces_y" \
+        "$SD/FDCNN/faces_uv" "$WORK/img"
+    cp -a "$TURNKEY/CNNLib/para/pdcnn" "$TURNKEY/CNNLib/para/public" \
+        "$TURNKEY/CNNLib/para/pvdcnn" "$TURNKEY/CNNLib/para/fdcnn_method2_light" \
+        "$SD/CNNLib/para/"
+    rm -f "$SD/CNNLib/para/pvdcnn/nvt_model_origin.bin"     # prune37 is used
+    cp "$H7/samples/ai_pattern/jpg/YUV420_SP_Huang_W1920H1080.bin" "$SD/jpg/PVD/huang.yuv"
+    curl -fsSL --retry 3 -o "$WORK/img/astronaut.png" \
+        https://raw.githubusercontent.com/scikit-image/scikit-image/v0.19.3/skimage/data/astronaut.png
+    for f in messi5.jpg basketball1.png; do
+        curl -fsSL --retry 3 -o "$WORK/img/$f" \
+            https://raw.githubusercontent.com/opencv/opencv/4.10.0/samples/data/$f
+    done
+    python3 - "$WORK/img" "$SD" <<'PY'
+# The pictures: a composite of messi5 and basketball1 at two sizes, and
+# basketball1 alone, as 1920x1080 NV12 (people, vehicles); astronaut and
+# basketball1 as Y / UV BMPs (faces).  BT.601 full range.
+import sys
+import numpy as np
+from PIL import Image
+img, sd = sys.argv[1:]
+
+def planes(im):
+    im = im.convert('RGB')
+    w, h = im.size[0] // 4 * 4, im.size[1] // 2 * 2
+    a = np.asarray(im.crop((0, 0, w, h))).astype(float)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    u = -0.168736 * r - 0.331264 * g + 0.5 * b + 128
+    v = 0.5 * r - 0.418688 * g - 0.081312 * b + 128
+    uv = np.stack([u, v], -1).reshape(h // 2, 2, w // 2, 2, 2).mean(axis=(1, 3))
+    return (y.clip(0, 255).round().astype(np.uint8),
+            uv.reshape(h // 2, w).clip(0, 255).round().astype(np.uint8))
+
+def nv12(im, path):
+    y, uv = planes(im)
+    with open(path, 'wb') as f:
+        f.write(y.tobytes() + uv.tobytes())
+
+def fit(im, w=1920, h=1080):
+    s = min(w / im.size[0], h / im.size[1])
+    im = im.convert('RGB').resize((int(im.size[0] * s) // 2 * 2,
+                                   int(im.size[1] * s) // 2 * 2), Image.BILINEAR)
+    can = Image.new('RGB', (w, h), (128, 128, 128))
+    can.paste(im, ((w - im.size[0]) // 4 * 2, (h - im.size[1]) // 4 * 2))
+    return can
+
+messi = Image.open(img + '/messi5.jpg').convert('RGB')
+bball = Image.open(img + '/basketball1.png').convert('RGB')
+comp = Image.new('RGB', (1920, 1080), (110, 120, 110))
+for im, hh, x, y in ((messi, 420, 40, 80), (bball, 420, 760, 80),
+                     (messi, 240, 300, 640), (bball, 240, 1300, 640)):
+    comp.paste(im.resize((int(im.size[0] * hh / im.size[1]), hh),
+                         Image.BILINEAR), (x, y))
+for d in ('PD', 'PVD'):
+    nv12(comp, '%s/jpg/%s/comp.yuv' % (sd, d))
+nv12(fit(bball), sd + '/jpg/PD/bball.yuv')
+for i, f in enumerate(('astronaut.png', 'basketball1.png')):
+    y, uv = planes(Image.open(img + '/' + f))
+    Image.fromarray(y, 'L').save('%s/FDCNN/faces_y/%06d.bmp' % (sd, i))
+    Image.fromarray(uv, 'L').save('%s/FDCNN/faces_uv/%06d.bmp' % (sd, i))
+PY
+    printf 'comp.yuv 1920 1080\nbball.yuv 1920 1080\n' > "$SD/jpg/pd_image_list.txt"
+    printf 'huang.yuv 1920 1080\ncomp.yuv 1920 1080\n' > "$SD/jpg/pvdlist.txt"
+fi
+
 find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +
 echo "Samples and their runtime in $OUT"
