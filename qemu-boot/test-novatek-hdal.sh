@@ -857,8 +857,10 @@ emb = {r[1][:-4]: [float(v) for v in r[2:]]
        for r in det if r[0] == "fr_features.txt" and len(r) == 130}
 
 def cos(a, b):
-    return (sum(x * y for x, y in zip(a, b)) /
-            (sum(x * x for x in a) * sum(y * y for y in b)) ** 0.5)
+    # an all-zero embedding (a regression) is unlike everything, not an
+    # exception that would blank every detector check
+    d = (sum(x * x for x in a) * sum(y * y for y in b)) ** 0.5
+    return sum(x * y for x, y in zip(a, b)) / d if d else 0.0
 
 faces = [n for n in emb if n not in ("grey", "obama1flip")]
 who = lambda n: n.rstrip("0123456789")
