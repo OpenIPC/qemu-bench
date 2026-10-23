@@ -77,7 +77,11 @@
  * test pattern of its own (colour bars, a moving box and the frame number
  * in binary) at the job's size and codec, an IDR where the driver asks
  * for an I frame.  Each frame is encoded on a host thread of its own from
- * the moment the job is fired, while the guest runs.  A frame that is not
+ * the moment the job is fired, while the guest runs, at a lower priority
+ * than the vCPU (with the x265 pool it opens), so that a host the
+ * encoders saturate slows the streams rather than the guest: a starved
+ * vCPU, the guest clock running on, met the 60 s boot watchdog U-Boot
+ * arms on a 2.4 GHz Xeon.  A frame that is not
  * ready at its deadline is waited for with the virtual clock held: a
  * guest that ran on past it would queue the channel's next frame onto
  * the ring-pool record of the one in flight.  libx265 takes 20-35 ms for
@@ -113,6 +117,9 @@
 #ifdef SSTAR_VENC_LIBAVCODEC
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#ifdef CONFIG_LINUX
+#include <sys/resource.h>
+#endif
 #endif
 
 #define TYPE_SSTAR_VENC "sstar-venc"
@@ -199,7 +206,7 @@ typedef struct SstarVencWork {
     QemuThread thread;
     bool started;               /* the thread is to be joined */
     bool trace;
-    int64_t open_us;
+    const char *dump;
 } SstarVencWork;
 
 typedef struct SstarVencReport {
@@ -364,12 +371,17 @@ static void venc_encoder_close(struct SstarVencEncoder *e)
     e->ctx = -1;
 }
 
-/* The encoder of a stream, (re)opened for its codec and size, or NULL. */
+/*
+ * The encoder of a stream, for its codec and size: a slot of the table,
+ * closed when it was another stream's or another codec or size.  The
+ * frame's thread opens it (venc_encoder_open), so the vCPU never does.
+ * Only the main thread picks and closes, and closing waits for the slot's
+ * frame.
+ */
 static struct SstarVencEncoder *venc_encoder(SstarVencState *s, int ctx,
                                              bool h265, int w, int h)
 {
     struct SstarVencEncoder *e = NULL;
-    const AVCodec *codec;
     int i;
 
     for (i = 0; i < ENCODERS; i++) {
@@ -397,19 +409,34 @@ static struct SstarVencEncoder *venc_encoder(SstarVencState *s, int ctx,
         }
     }
     e->used = ++s->uses;
-    if (e->c) {
-        return e;
+    if (e->ctx != ctx) {
+        e->ctx = ctx;
+        e->h265 = h265;
+        e->width = w;
+        e->height = h;
+        e->frames = 0;
     }
-    codec = avcodec_find_encoder_by_name(h265 ? "libx265" : "libx264");
+    return e;
+}
+
+/*
+ * Open a slot's encoder, on the frame's thread; false if it cannot be.
+ * A slot that failed stays closed, and its next frame tries again.
+ */
+static bool venc_encoder_open(struct SstarVencEncoder *e, const char *dump)
+{
+    const AVCodec *codec;
+    int w = e->width, h = e->height;
+
+    codec = avcodec_find_encoder_by_name(e->h265 ? "libx265" : "libx264");
     if (!codec || w < 16 || h < 16 || w > 8192 || h > 8192) {
-        return NULL;
+        return false;
     }
     e->c = avcodec_alloc_context3(codec);
     e->pic = av_frame_alloc();
     e->pkt = av_packet_alloc();
     if (!e->c || !e->pic || !e->pkt) {
-        venc_encoder_close(e);
-        return NULL;
+        goto fail;
     }
     e->c->width = w;
     e->c->height = h;
@@ -423,32 +450,31 @@ static struct SstarVencEncoder *venc_encoder(SstarVencState *s, int ctx,
     av_opt_set(e->c->priv_data, "tune", "zerolatency", 0);
     av_opt_set(e->c->priv_data, "crf", "30", 0);
     av_opt_set(e->c->priv_data, "forced-idr", "1", 0);
-    av_opt_set(e->c->priv_data, h265 ? "x265-params" : "x264-params",
-               h265 ? "repeat-headers=1:log-level=error"
-                    : "repeat-headers=1", 0);
+    av_opt_set(e->c->priv_data, e->h265 ? "x265-params" : "x264-params",
+               e->h265 ? "repeat-headers=1:log-level=error"
+                       : "repeat-headers=1", 0);
     if (avcodec_open2(e->c, codec, NULL) < 0) {
-        venc_encoder_close(e);
-        return NULL;
+        goto fail;
     }
     e->pic->format = AV_PIX_FMT_YUV420P;
     e->pic->width = w;
     e->pic->height = h;
     if (av_frame_get_buffer(e->pic, 0) < 0) {
-        venc_encoder_close(e);
-        return NULL;
+        goto fail;
     }
-    e->ctx = ctx;
-    e->h265 = h265;
-    e->width = w;
-    e->height = h;
-    e->frames = 0;
-    if (s->dump && *s->dump) {
-        g_autofree char *name = g_strdup_printf("%s-ctx%d.%s", s->dump, ctx,
-                                                h265 ? "h265" : "h264");
+    if (dump && *dump && !e->dump) {
+        g_autofree char *name = g_strdup_printf("%s-ctx%d.%s", dump, e->ctx,
+                                                e->h265 ? "h265" : "h264");
 
         e->dump = fopen(name, "ab");
     }
-    return e;
+    return true;
+
+fail:
+    avcodec_free_context(&e->c);
+    av_frame_free(&e->pic);
+    av_packet_free(&e->pkt);
+    return false;
 }
 
 /* Colour bars, a box moving across them, the frame number in binary. */
@@ -506,9 +532,22 @@ static void *venc_encode_thread(void *opaque)
 {
     SstarVencWork *w = opaque;
     struct SstarVencEncoder *e = w->enc;
-    int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), t1;
     GByteArray *au;
 
+#ifdef CONFIG_LINUX
+    /*
+     * Below the vCPU, and so are the pool threads x265 starts when this
+     * thread opens it.  On a host the encoders could saturate, a starved
+     * vCPU lets the guest clock run past the boot watchdog (60 s, armed
+     * by U-Boot); a frame that is late instead holds the clock.
+     */
+    setpriority(PRIO_PROCESS, qemu_get_thread_id(), 10);
+#endif
+    if (!e->c && !venc_encoder_open(e, w->dump)) {
+        return NULL;
+    }
+    t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     venc_pattern(e->pic, e->frames);
     e->pic->pts = e->frames++;
     e->pic->pict_type = w->intra ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
@@ -532,7 +571,7 @@ static void *venc_encode_thread(void *opaque)
         qemu_log("sstar-venc: ctx %d %s %dx%d%s: %zu bytes, open %" PRId64
                  " us, encode %" PRId64 " us\n", w->ctx,
                  w->h265 ? "H.265" : "H.264", w->width, w->height,
-                 w->intra ? " I" : "", w->len, w->open_us,
+                 w->intra ? " I" : "", w->len, t1 - t0,
                  qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t1);
     }
     return NULL;
@@ -544,17 +583,13 @@ static void *venc_encode_thread(void *opaque)
  */
 static void venc_encode(SstarVencState *s, SstarVencWork *w)
 {
-    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     struct SstarVencEncoder *e;
 
     e = venc_encoder(s, w->ctx, w->h265, w->width, w->height);
-    w->open_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
-    if (!e) {
-        return;
-    }
     venc_wait(e->busy);
     w->enc = e;
     w->trace = s->trace;
+    w->dump = s->dump;
     e->busy = w;
     qemu_thread_create(&w->thread, "sstar-venc", venc_encode_thread, w,
                        QEMU_THREAD_JOINABLE);
