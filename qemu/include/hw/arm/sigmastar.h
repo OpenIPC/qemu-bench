@@ -19,6 +19,8 @@
 #ifndef HW_ARM_SIGMASTAR_H
 #define HW_ARM_SIGMASTAR_H
 
+#include "hw/misc/sstar-riu.h"
+
 typedef struct SsSoCConfig {
     const char *desc;
     uint32_t    num_cpus;
@@ -26,6 +28,15 @@ typedef struct SsSoCConfig {
     uint16_t    chip_id;        /* chipver bank 0x001E reg 0x00 */
     uint16_t    bond;           /* chiptop bank 0x101E reg 0x48 */
     uint32_t    flash_jedec;    /* the board's SPI NOR */
+    uint32_t    imi_size;       /* IMI SRAM; 0 = 64 KiB */
+    bool        fsp_sw_cs;      /* FSP-QSPI with the software chip select */
+    bool        smf_ack;        /* the IPL's SMF stub handshake (bank 0x1121) */
+    bool        urdma;          /* UART DMA, Ifado layout; SPIs 93/94 its */
+    bool        miic;           /* the three MIIC I2C masters */
+    const char *default_sensor; /* sensor= when not given; NULL = none */
+    bool        ipc;            /* a camera die: no SATA/display/VPU/GE */
+    uint16_t    gpio_bank;      /* PADTOP GPIO bank, Ifado layout; 0 none */
+    const SstarRegDefault *defaults;    /* over the infinity2m ones */
 } SsSoCConfig;
 
 #endif /* HW_ARM_SIGMASTAR_H */

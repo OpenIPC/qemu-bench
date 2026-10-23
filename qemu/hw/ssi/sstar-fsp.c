@@ -18,13 +18,26 @@
  *         0x79 bit 12 set, write-buffer byte (0x79 & 0xFF) is replaced by
  *         0x78 bytes that BDMA has delivered -- U-Boot programs pages so
  *         (HAL_FSP_Write_BDMA: WREN; PP a2 a1 a0 <256 bytes>; RDSR).
- *   QSPI  RIU bank 0x0017 (0x1F002E00)  XIU read mode and timing; kept.
+ *   QSPI  RIU bank 0x0017 (0x1F002E00)  XIU read mode and timing; kept,
+ *         but for 0x0A, the software chip select (below).
  *   XIU   0x14000000                    the flash mapped for reading,
  *         how the IPL and kernel read it besides the FSP.
  *
+ * The later FSP-QSPI of the Ifado/Iford generation (the vendor
+ * drivers/sstar/fsp_qspi/hal/iford/hal_fsp_qspi.c; "sw-cs" here) adds a
+ * second write buffer at 0x70-0x72 (bytes 10-14), takes the outside size
+ * as the byte count plus one, and has a software chip select: QSPI 0x0A
+ * bit 0 enables it and bit 1 drives CS high.  While it is enabled the
+ * sequencer leaves CS alone, so one transfer spans several fires; the
+ * driver sends a quad page program's opcode and address in one fire and
+ * its 256 data bytes from the outside buffer, with no write buffer, in
+ * the next.
+ *
  * The flash itself is a generic 3-byte-address SPI NOR answering with
  * the JEDEC ID "jedec"; erases and page programs complete at once and are
- * written through to flash-file, so the image is the flash.
+ * written through to flash-file, so the image is the flash.  The extended
+ * address register (0xC5/0xC8) only reads back: 16 MiB needs no fourth
+ * address byte.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -64,6 +77,7 @@
 #define FSP_TRIGGER         0x6D
 #define FSP_DONE_FLAG       0x6E
 #define FSP_DONE_CLR        0x6F
+#define FSP_WBF2            0x70        /* sw-cs: write buffer bytes 10-14 */
 #define FSP_WBF_SIZE_OUT    0x78
 #define FSP_WBF_OUTSIDE     0x79
 
@@ -71,6 +85,11 @@
 #define FSP_CTRL_3RD        (1u << 14)
 #define FSP_CTRL_2ND        (1u << 15)
 #define FSP_OUT_ENABLE      (1u << 12)
+
+/* QSPI registers */
+#define QSPI_SW_MODE        0x0A
+#define QSPI_SW_CS_EN       (1u << 0)
+#define QSPI_SW_CS_HIGH     (1u << 1)
 
 #define SR1_WIP             (1u << 0)
 #define SR1_WEL             (1u << 1)
@@ -141,8 +160,10 @@ static void spi_deselect(SstarFspState *s)
     case 0x04:                              /* WRDI */
         s->wel = false;
         break;
-    case 0x02:                              /* PP */
+    case 0x02: case 0x32:                   /* PP, quad PP */
     case 0x01: case 0x31: case 0x11:        /* WRSR, WRSR2, WRSR3 */
+    case 0xC5:                              /* WREAR */
+    case 0x99:                              /* RST, after RSTEN (0x66) */
         s->wel = false;
         break;
     case 0x20:                              /* SE, 4 KiB */
@@ -164,6 +185,18 @@ static void spi_deselect(SstarFspState *s)
     sstar_fsp_persist(s);
 }
 
+/*
+ * One of a command's three address bytes; the extended address register
+ * (WREAR) is address bits [31:24], which reach past 16 MiB.
+ */
+static void spi_addr_byte(SstarFspState *s, uint32_t pos, uint8_t tx)
+{
+    s->addr = (s->addr << 8) | tx;
+    if (pos == 3) {
+        s->addr = (s->addr & 0xFFFFFF) | (uint32_t)s->ear << 24;
+    }
+}
+
 static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
 {
     uint32_t pos = s->pos++;
@@ -178,15 +211,15 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
     case 0x0B:                              /* FAST_READ, one dummy byte */
     case 0x3B: case 0x6B:                   /* dual / quad output read */
         if (pos <= 3) {
-            s->addr = (s->addr << 8) | tx;
+            spi_addr_byte(s, pos, tx);
         } else if (s->cmd == 0x03 || pos > 4) {
             rx = s->array[s->addr & (s->size - 1)];
             s->addr++;
         }
         break;
-    case 0x02:                              /* PP */
+    case 0x02: case 0x32:                   /* PP, quad PP */
         if (pos <= 3) {
-            s->addr = (s->addr << 8) | tx;
+            spi_addr_byte(s, pos, tx);
         } else if (s->wel) {
             uint32_t a = s->addr & (s->size - 1);
 
@@ -198,7 +231,7 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
         break;
     case 0x20: case 0x52: case 0xD8:
         if (pos <= 3) {
-            s->addr = (s->addr << 8) | tx;
+            spi_addr_byte(s, pos, tx);
         }
         break;
     case 0x9F:                              /* RDID */
@@ -243,6 +276,14 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
             s->sr[2] = tx;
         }
         break;
+    case 0xC5:                              /* WREAR, after WREN */
+        if (s->wel && pos == 1) {
+            s->ear = tx;
+        }
+        break;
+    case 0xC8:                              /* RDEAR */
+        rx = s->ear;
+        break;
     case 0x5A:                              /* SFDP: none */
         break;
     default:
@@ -263,19 +304,32 @@ void sstar_fsp_read_flash(SstarFspState *s, uint32_t off, uint8_t *buf,
     }
 }
 
+static void fsp_fire(SstarFspState *s);
+static uint32_t fsp_outside_len(SstarFspState *s);
+
 void sstar_fsp_push_outside(SstarFspState *s, const uint8_t *buf,
                             uint32_t len)
 {
     len = MIN(len, SSTAR_FSP_OUTSIDE_MAX - s->outside_len);
     memcpy(s->outside + s->outside_len, buf, len);
     s->outside_len += len;
+    if (s->fire_wait && s->outside_len >= fsp_outside_len(s)) {
+        fsp_fire(s);
+    }
 }
 
 /* ---- FSP ------------------------------------------------------------ */
 
 static uint8_t fsp_wbf(SstarFspState *s, int i)
 {
-    uint16_t w = s->fsp[FSP_WBF + i / 2];
+    uint16_t w;
+
+    if (i >= 10) {
+        i -= 10;
+        w = s->fsp[FSP_WBF2 + i / 2];
+        return i & 1 ? w >> 8 : w & 0xFF;
+    }
+    w = s->fsp[FSP_WBF + i / 2];
 
     return i & 1 ? w >> 8 : w & 0xFF;
 }
@@ -285,13 +339,53 @@ static void fsp_update_irq(SstarFspState *s)
     qemu_set_irq(s->irq, s->done && (s->fsp[FSP_CTRL] & FSP_CTRL_INT));
 }
 
+/* With the software chip select on, CS follows QSPI 0x0A, not the fires. */
+static bool fsp_sw_cs(SstarFspState *s)
+{
+    return s->sw_cs && (s->qspi[QSPI_SW_MODE] & QSPI_SW_CS_EN);
+}
+
+/* How many bytes the outside buffer holds: sw-cs counts one more. */
+static uint32_t fsp_outside_len(SstarFspState *s)
+{
+    uint32_t out_len = s->fsp[FSP_WBF_SIZE_OUT];
+
+    return s->sw_cs && out_len ? out_len - 1 : out_len;
+}
+
+/* The bytes BDMA queued, in place of write buffer byte (0x79 & 0xFF). */
+static void fsp_send_outside(SstarFspState *s)
+{
+    uint32_t out_len = fsp_outside_len(s);
+    uint32_t k;
+    if (s->outside_len < out_len) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-fsp: outside buffer has %u "
+                      "of %u bytes\n", s->outside_len, out_len);
+    }
+    for (k = 0; k < out_len; k++) {
+        spi_xfer(s, k < s->outside_len ? s->outside[k] : 0xFF);
+    }
+    s->outside_len = 0;
+}
+
 static void fsp_fire(SstarFspState *s)
 {
     uint16_t ctrl = s->fsp[FSP_CTRL];
     uint16_t out = s->fsp[FSP_WBF_OUTSIDE];
-    uint32_t out_len = s->fsp[FSP_WBF_SIZE_OUT];
+    bool out_pending = out & FSP_OUT_ENABLE;
+    bool sw_cs = fsp_sw_cs(s);
     int wpos = 0, rpos = 0, n, j;
 
+    /*
+     * The Ifado/Iford driver fires first and starts BDMA after; the
+     * sequencer waits for the bytes.  So does this, until
+     * sstar_fsp_push_outside() has them.
+     */
+    s->fire_wait = false;
+    if (out_pending && s->outside_len < fsp_outside_len(s)) {
+        s->fire_wait = true;
+        return;
+    }
     memset(s->rbf, 0, sizeof(s->rbf));
     for (n = 0; n < 3; n++) {
         int wsz = (s->fsp[FSP_WBF_SIZE] >> (4 * n)) & 0xF;
@@ -301,23 +395,25 @@ static void fsp_fire(SstarFspState *s)
             (n == 2 && !(ctrl & FSP_CTRL_3RD))) {
             continue;
         }
-        spi_select(s);
+        if (!sw_cs) {
+            spi_select(s);
+        } else if (!s->selected) {
+            qemu_log_mask(LOG_GUEST_ERROR, "sstar-fsp: fire with the "
+                          "software chip select high\n");
+            break;
+        }
         for (j = 0; j < wsz; j++, wpos++) {
-            if ((out & FSP_OUT_ENABLE) && wpos == (out & 0xFF)) {
-                uint32_t k;
-
-                if (s->outside_len < out_len) {
-                    qemu_log_mask(LOG_GUEST_ERROR, "sstar-fsp: outside "
-                                  "buffer has %u of %u bytes\n",
-                                  s->outside_len, out_len);
-                }
-                for (k = 0; k < out_len; k++) {
-                    spi_xfer(s, k < s->outside_len ? s->outside[k] : 0xFF);
-                }
-                s->outside_len = 0;
+            if (out_pending && wpos == (out & 0xFF)) {
+                fsp_send_outside(s);
+                out_pending = false;
                 continue;
             }
-            spi_xfer(s, wpos < 10 ? fsp_wbf(s, wpos) : 0xFF);
+            spi_xfer(s, wpos < 15 ? fsp_wbf(s, wpos) : 0xFF);
+        }
+        /* An outside buffer past the write buffer, as with no write buffer */
+        if (out_pending && wpos == (out & 0xFF)) {
+            fsp_send_outside(s);
+            out_pending = false;
         }
         for (j = 0; j < rsz; j++, rpos++) {
             uint8_t b = spi_xfer(s, 0);
@@ -326,10 +422,27 @@ static void fsp_fire(SstarFspState *s)
                 s->rbf[rpos] = b;
             }
         }
-        spi_deselect(s);
+        if (!sw_cs) {
+            spi_deselect(s);
+        }
     }
     s->done = true;
     fsp_update_irq(s);
+}
+
+static void qspi_reg_write(SstarFspState *s, int reg, uint16_t v)
+{
+    s->qspi[reg] = v;
+    if (reg != QSPI_SW_MODE || !s->sw_cs) {
+        return;
+    }
+    if ((v & QSPI_SW_CS_EN) && !(v & QSPI_SW_CS_HIGH)) {
+        if (!s->selected) {
+            spi_select(s);
+        }
+    } else {
+        spi_deselect(s);
+    }
 }
 
 static uint16_t fsp_reg_read(SstarFspState *s, int reg)
@@ -438,7 +551,7 @@ static void bank_write(SstarFspState *s, FspBank b, int reg, uint16_t v)
         fsp_reg_write(s, reg, v);
         break;
     default:
-        s->qspi[reg] = v;
+        qspi_reg_write(s, reg, v);
         break;
     }
 }
@@ -533,6 +646,8 @@ static void sstar_fsp_reset(DeviceState *dev)
     memset(s->qspi, 0, sizeof(s->qspi));
     memset(s->rbf, 0, sizeof(s->rbf));
     memset(s->sr, 0, sizeof(s->sr));
+    s->ear = 0;
+    s->fire_wait = false;
     s->done = false;
     s->wel = false;
     s->selected = false;
@@ -633,6 +748,8 @@ static const Property sstar_fsp_props[] = {
     /* Macronix MX25L12835F, a common 16 MiB part on these boards. */
     DEFINE_PROP_UINT32("jedec", SstarFspState, jedec, 0xC22018),
     DEFINE_PROP_UINT32("size", SstarFspState, size, 16 * MiB),
+    /* the Ifado/Iford-generation FSP-QSPI: software chip select */
+    DEFINE_PROP_BOOL("sw-cs", SstarFspState, sw_cs, false),
 };
 
 /*
@@ -641,8 +758,8 @@ static const Property sstar_fsp_props[] = {
  */
 static const VMStateDescription vmstate_sstar_fsp = {
     .name = TYPE_SSTAR_FSP,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(isp, SstarFspState, 0x80),
         VMSTATE_UINT16_ARRAY(fsp, SstarFspState, 0x80),
@@ -658,6 +775,8 @@ static const VMStateDescription vmstate_sstar_fsp = {
         VMSTATE_UINT8(isp_rdata, SstarFspState),
         VMSTATE_UINT8_ARRAY(outside, SstarFspState, SSTAR_FSP_OUTSIDE_MAX),
         VMSTATE_UINT32(outside_len, SstarFspState),
+        VMSTATE_UINT8(ear, SstarFspState),
+        VMSTATE_BOOL(fire_wait, SstarFspState),
         VMSTATE_END_OF_LIST()
     }
 };

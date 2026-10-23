@@ -92,6 +92,15 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
             v |= 0x8000;    /* BIST control: done, no error */
         }
         break;
+    case 0x1032:            /* CPU PLL: reg 0x5D bit 0 = LPF glide done */
+        /*
+         * The cpufreq driver moves the ARM PLL by its low-pass filter:
+         * the target into regs 0x50-0x55, then it waits for this bit.
+         */
+        if (reg == 0x5D) {
+            v |= 0x0001;
+        }
+        break;
     case 0x1022:            /* l3bridge: reg 0x10 bit 12 = flush done */
         if (reg == 0x10) {
             v |= 0x1000;
@@ -128,11 +137,58 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
             break;
         }
         break;
+    case 0x1121:
+        /*
+         * Ifado: the IPL's SMF stub (the secure-world shim it enters
+         * before IPL_CUST) sets reg 0x37 bit 2, spins until reg 0x38
+         * reads 3, then trades bit 2 for bit 1.  What the block is the
+         * stub does not say; the answer is all it needs.
+         */
+        if (s->smf_ack && reg == 0x38 && (s->regs[(bank << 7) | 0x37] & 4)) {
+            v = 3;
+        }
+        break;
     case 0x101E:            /* chiptop: reg 0x48 is the package bond strap */
         if (reg == 0x48) {
             v = s->bond;
         }
         break;
+    case 0x0022:
+        /*
+         * OTP2: regs 0x7C-0x7F hold the die's unique ID, low word first.
+         * The SSC375 kernel's msys_read_uuid reads them here (0x1F0045F0),
+         * not at the 0x101F bank of the Ifliegen SDK's Ifado header.
+         * Vendor licences are signed for it, so it is the board's own,
+         * given as uuid=; unset, the fuses read as stored, zero.
+         */
+        if (s->uuid && reg >= 0x7C) {
+            v = s->uuid >> ((reg - 0x7C) * 16);
+        }
+        break;
+    }
+    /*
+     * Ifado PADTOP GPIO, one register per pad (pad 58 at reg 0x41, the
+     * kernel's gpio table): bit 0 the level read, bit 1 the level driven,
+     * bit 2 output disabled, bit 3 the pad in its function mode (the I2C
+     * pads' "mask0x8").  An input or a function pad reads high, as the
+     * board's pull-ups hold the I2C lines the MIIC driver checks before
+     * each transfer; a GPIO output reads what it drives.
+     */
+    if (s->gpio_bank && bank == s->gpio_bank) {
+        v &= ~1;
+        v |= (v & 0xC) ? 1 : (v >> 1) & 1;
+    }
+    /*
+     * The SAR pads as GPIOs (gpio 81.., PAD_SAR_GPIO0..), in the PM SAR
+     * bank: reg 0x11 [15:8] output disabled, reg 0x12 [7:0] the level
+     * driven, [15:8] the level read.  An input reads high: the camera's
+     * reset button on SAR_GPIO0 is pulled up, and reading it low is a
+     * held button, a factory reset and a reboot.
+     */
+    if (s->gpio_bank && bank == 0x0014 && reg == 0x12) {
+        uint16_t oen = s->regs[(bank << 7) | 0x11] >> 8;
+
+        v = (v & 0xFF) | (uint16_t)((oen | (v & ~oen)) & 0xFF) << 8;
     }
     return v;
 }
@@ -282,6 +338,9 @@ static void sstar_riu_realize(DeviceState *dev, Error **errp)
 
 static const Property sstar_riu_props[] = {
     DEFINE_PROP_UINT16("bond", SstarRiuState, bond, 0),
+    DEFINE_PROP_BOOL("smf-ack", SstarRiuState, smf_ack, false),
+    DEFINE_PROP_UINT16("gpio-bank", SstarRiuState, gpio_bank, 0),
+    DEFINE_PROP_UINT64("uuid", SstarRiuState, uuid, 0),
     DEFINE_PROP_STRING("trace", SstarRiuState, trace),
 };
 
