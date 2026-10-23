@@ -2162,6 +2162,64 @@ def test_ai_face(qt):
     qt.writel(NUE + 0x03C, 0xFFFFFFFF)
 
 
+MD = 0xF0C10000
+MD_MODEL, MD_VAR1 = 0x01900000, 0x01A00000     # 40 and 6 bytes a pixel
+
+
+def md_frame(qt, y, w, h, mode, morph=0):
+    """One MDBC trigger on the w x h luma y (grey chroma); the bitmap."""
+    qt.write(AI_IN, bytes(y))
+    qt.write(AI_IN + w * h, bytes([128]) * (w * h // 2))
+    for off, val in {0x004: mode, 0x010: AI_IN, 0x014: AI_IN + w * h,
+                     0x018: w, 0x01C: w, 0x024: MD_MODEL, 0x028: MD_VAR1,
+                     0x034: AI_LL, 0x038: MD_MODEL, 0x03C: MD_VAR1,
+                     0x048: w | h << 12,
+                     0x04C: 10 << 8 | 30 << 16 | 4 << 24 | 8 << 28,
+                     0x050: 8, 0x054: 2, 0x058: 20, 0x064: morph,
+                     0x068: 4 | 64 << 8 | 128 << 16,
+                     0x078: 1 << 15 | 0x1234, 0x008: 0x31}.items():
+        qt.writel(MD + off, val)
+    qt.writel(MD + 0x000, 2)
+    ai_settle(qt, MD + 0x00C, 1)
+    bits = qt.read(AI_LL, (w * h + 7) // 8)
+    qt.writel(MD + 0x00C, 0xFFFFFFFF)
+    return [bits[p >> 3] >> (p & 7) & 1 for p in range(w * h)]
+
+
+def test_md(qt):
+    print('MDBC: motion detection')
+    w, h = 64, 48
+    bg = [60 + x // 2 + 20 * ((x // 8 + y // 8) % 2)
+          for y in range(h) for x in range(w)]
+    gic_enable(qt, 46)
+    check('MDBC: idle (bit 15)', qt.readl(MD + 0x110) >> 15 & 1, 1)
+    fg = md_frame(qt, bg, w, h, 0)
+    check('MDBC INIT: no motion, frame end and SPI 46',
+          (sum(fg), qt.readl(MD + 0x000) & 2), (0, 0))
+    check('MDBC: the still scene matches its model',
+          sum(md_frame(qt, bg, w, h, 1)), 0)
+    blk = list(bg)
+    for y in range(12, 36):
+        for x in range(16, 48):
+            blk[y * w + x] = 230
+    fg = md_frame(qt, blk, w, h, 1)
+    inside = all(fg[y * w + x] for y in range(12, 36) for x in range(16, 48))
+    far = any(fg[y * w + x] for y in range(h) for x in range(w)
+              if not (10 <= y < 38 and 14 <= x < 50))
+    check('MDBC: a bright block is foreground, nothing 3 pixels off it',
+          (inside, far), (True, False))
+    check('MDBC: the frame counter counts triggers',
+          qt.readl(MD + 0x074) >> 12 & 0xFF, 3)
+    # the same frame through one erosion stage (select 0, threshold 8):
+    # the last bitmap's pixels with all 8 neighbours set
+    want = [fg[y * w + x] and all(
+                0 <= y + dy < h and 0 <= x + dx < w and fg[(y + dy) * w + x + dx]
+                for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+            for y in range(h) for x in range(w)]
+    check('MDBC morphology: an erosion stage',
+          md_frame(qt, blk, w, h, 1, morph=8), [int(v) for v in want])
+
+
 def cnn_job(qt, regs, done=1):
     """Run one CNN job set up in regs (offset: value) and wait for it."""
     for off in range(0x004, 0x0C0, 4):
@@ -3558,6 +3616,7 @@ def run(args, tmp):
         test_ai_compute(qt)
         test_ai_detect(qt)
         test_ai_face(qt)
+        test_md(qt)
     finally:
         qt.close()
 

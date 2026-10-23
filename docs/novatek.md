@@ -935,7 +935,8 @@ and units bound.
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
 builds them from the vendor SDK (not in CI). The run checks 75 things
-(108 with `--kmods` and an `ai_net` model, 118 with the detectors, below):
+(108 with `--kmods` and an `ai_net` model, 122 with the detectors and
+motion detection, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -1381,6 +1382,63 @@ read. It checks that each finds, near where they are:
   - for face recognition: ACT bit 16, BN with negative alphas, a global
     average into a 16-bit out1, and NUE FC on 16-bit inputs.
 
+## Motion detection
+
+The MDBC (`hw/misc/nvt-md.c`, an `nvt-media` engine) is at `0xF0C10000`,
+SPI 46, under `kdrv_md.ko` (`mdbc_reg.h`). Like the display and AI
+modules, the release leaves it out and OpenIPC's toolchain has it. Its
+node must be named `md@f0c10000`: probe looks its clock up by the
+device's name.
+
+A trigger (control bit 1) takes a frame:
+- 8-bit Y and NV12 CbCr, 60x60 to 960x1022;
+- the background model, in three DRAM buffers that only the engine
+  reads. Software passes them back in place, and the emulation lays them
+  out its own way.
+
+It writes the foreground as one bit a pixel, row-major, LSB first, 1 for
+motion. Then it raises frame end (status bit 0, write 1 to clear).
+`kdrv_md` waits for that with no timeout, so a missing interrupt hangs
+the process.
+
+The SDK does not describe the algorithm. The parameters are named after
+SuBSENSE (LBSP descriptors, a sample model, minimum matches, update
+rates, neighbour diffusion, ghost removal). The emulation is a reduced,
+deterministic version of it:
+- INIT seeds each pixel's samples with its own value.
+- Otherwise a pixel is foreground when fewer than `BC_MIN_MATCH` samples
+  are within `D_COLOUR` in Y, `D_LBSP` in descriptor Hamming distance and
+  `UV_THRES` in chroma. Each ROI has its own thresholds.
+- Background pixels refresh a random sample at a rate of 1 / `BC_MIN_T`,
+  and with neighbour updates on, a neighbour's sample too.
+- With ghost removal on, a pixel that stays foreground for more than
+  `BC_MAX_FG_FRM` frames updates as if background.
+- The foreground then goes through the four 3x3 stages. A stage's select
+  bit adds pixels that have enough neighbours set; a clear bit keeps only
+  those. A threshold of 0 skips the stage.
+
+The random numbers are a 15-bit LFSR kept in the RND register, so a run
+always gives the same bitmaps.
+
+The SDK's `alg_md_sample` runs the engine and then `lib_md`'s alarms:
+- a global alarm when over half the picture moves;
+- a sub-region alarm over rows 0..89.
+
+It reads 160x120 frames from `MDBCP/DI/pic_NNNN`, and the SDK ships none.
+`build-novatek-hdal-samples.sh` writes 11 of them: a still textured
+scene, with a bright 120x100 block moving through frames 4..7. With
+`--kmods` and `--samples`, `test-novatek-hdal.sh` loads `kdrv_md` and
+checks that it binds. It then checks that both alarms come in frames
+4..7, and in no other frame.
+
+`test-novatek.py` checks at register level:
+- INIT reports no motion and raises frame end;
+- the still scene then matches its model;
+- a bright block is foreground, and nothing 3 pixels off it is;
+- the frame counter counts;
+- an erosion stage gives exactly the previous bitmap's pixels with all 8
+  neighbours set.
+
 ## Display
 
 The display path is the IDE (`hw/display/nvt-ide.c`) at `0xF0800000`,
@@ -1582,8 +1640,10 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
-  ignores the sensor's real timing (fixed 30 fps). MD, DIS, VPE and IVE
-  are not wired.
+  ignores the sensor's real timing (fixed 30 fps). DIS, VPE and IVE
+  are not wired. MD's linked lists run as the other engines' do but are
+  untested; its checksums read 0, and its background model is not the
+  silicon's (below).
 - AI: the CNN's tanh / sigmoid, pre-activation, FCD compression,
   channel stripes and batches; NUE's ROI pooling, reorg, anchors and
   other SVM kernels; NUE2's pad, HSV and rotation. Rounding, NUE2's
