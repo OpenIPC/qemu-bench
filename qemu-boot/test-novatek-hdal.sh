@@ -398,7 +398,8 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
         rm -f /mnt/sd/*
         cp -a /mnt/det/. /mnt/sd/
         mkdir -p /mnt/sd/det_results /mnt/sd/FDCNN/result/fd /mnt/sd/save_bmp
-        for d in ai2_pdcnn_sample alg_pvdcnn_sample "alg_fdcnn_ai2_sample faces 0 1"; do
+        for d in ai2_pdcnn_sample alg_pvdcnn_sample "alg_fdcnn_ai2_sample faces 0 1" \
+                cddcnn_sample; do
             ( sleep 3; echo q ) | timeout 600 ./$d > /tmp/det.out 2>&1
             echo "NVT-HDAL-RUN: ${d%% *} rc=$?"
             grep -i 'err\|fail' /tmp/det.out | head -5 | sed 's/^/NVT-HDAL-ERR: /'
@@ -790,7 +791,8 @@ PY
         fi
         # the turnkey detectors: each must find what the pictures hold
         if [ -d "$SAMPLES/sd" ]; then
-            for d in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample; do
+            for d in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample \
+                    cddcnn_sample; do
                 expect "NVT-HDAL-RUN: $d rc=0" "$d runs to its end"
             done
             look=$(grep -a '^NVT-AI-DET: ' "$WORK/console.log" | tr -d '\r' |
@@ -832,8 +834,18 @@ eyes = any(f[4] >= 14000 and abs(f[5] - 207) <= 12 and abs(f[6] - 96) <= 12
            for f in faces.get("000000.txt", []))
 bface = any(near(centre(f[0], f[1], f[0] + f[2], f[1] + f[3]), (86, 115), 15)
             for f in faces.get("000001.txt", []))
-print("pd=%d/3 pvd=%d/3 car=%d eyes=%d bface=%d"
-      % (pdok, pvok, car, eyes, bface))
+# cddcnn: picture category score x1 y1 x2 y2 (1920x1080), what the
+# network proposes (cdd_raw_results.txt) -- category 1, the pets -- and
+# what limit_fdet confirms (cdd_test_results.txt, not checked: its
+# classifier puts these pets below its threshold)
+cdd = [(r[1], int(r[2]), float(r[3]), centre(*map(float, r[4:8])))
+       for r in det if r[0] == "cdd_raw_results.txt" and len(r) >= 8]
+pets = sum(any(n == want_n and k == 1 and s >= 0.8 and near(c, want, 200)
+               for n, k, s, c in cdd)
+           for want_n, want in (("cat.yuv", (636, 540)), ("dog.yuv", (958, 563))))
+nopet = not any(n == "huang.yuv" for n, k, s, c in cdd)
+print("pd=%d/3 pvd=%d/3 car=%d eyes=%d bface=%d pets=%d/2 nopet=%d"
+      % (pdok, pvok, car, eyes, bface, pets, nopet))
 ' 2>/dev/null || true)
             case "$look" in *pd=3/3*) pass "ai2_pdcnn_sample: the three people ($look)";;
                 *) bad "ai2_pdcnn_sample: the three people (${look:-no result})";; esac
@@ -841,6 +853,8 @@ print("pd=%d/3 pvd=%d/3 car=%d eyes=%d bface=%d"
                 *) bad "alg_pvdcnn_sample: three people and the car (${look:-no result})";; esac
             case "$look" in *eyes=1*bface=1*) pass "alg_fdcnn_ai2_sample: both faces, the astronaut's eyes in place ($look)";;
                 *) bad "alg_fdcnn_ai2_sample: both faces (${look:-no result})";; esac
+            case "$look" in *pets=2/2*nopet=1*) pass "cddcnn_sample: the cat and the dog, no pet in the street ($look)";;
+                *) bad "cddcnn_sample: the cat and the dog (${look:-no result})";; esac
         fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what
