@@ -72,13 +72,13 @@ struct NvtMediaState {
      */
     NvtH26x *h26x;
     /*
-     * AI: the job on a worker thread, a generation a reset bumps to void
-     * it, and -- migrated, so the destination runs it again -- whether a
-     * job is running and the list position it reached.
+     * AI: the job on a worker thread, and -- migrated, so the destination
+     * runs it again -- whether one is running, the registers it started
+     * with and the list position it reached.
      */
     NvtAiWork *ai_work;
-    uint32_t ai_gen;
     uint32_t ai_pending;
+    uint32_t *ai_regs;
     uint32_t ai_res;
 };
 
@@ -575,18 +575,22 @@ static void ipp_job_finish(NvtMediaState *s, bool single, IppLlResult res)
 /*
  * The AI engines' jobs take up to a few hundred milliseconds of host time
  * (a CNN layer), so they run on a worker thread with a copy of the
- * registers; the job is done when the work comes back.
+ * registers.  The work logs its writes; the job is done, and its writes
+ * land, when the work comes back to the main loop.  A reset or a load
+ * detaches the work, which then comes back to nothing.
  */
+typedef void NvtAiRun(const uint32_t *regs, NvtAiWrites *w);
+
 struct NvtAiWork {
-    NvtMediaState *s;           /* NULL once the device is gone */
-    void (*run)(const uint32_t *regs);
-    uint32_t gen;
+    NvtMediaState *s;           /* NULL once detached */
+    NvtAiRun *run;
+    NvtAiWrites *wl;
     bool single;
     IppLlResult res;
     uint32_t regs[];
 };
 
-static void (*ai_engine_run(NvtMediaState *s))(const uint32_t *regs)
+static NvtAiRun *ai_engine_run(NvtMediaState *s)
 {
     if (s->engine->opaque == &ipp_nue) {
         return nvt_ai_nue_run;
@@ -602,7 +606,7 @@ static int ai_work_run(void *opaque)
 {
     NvtAiWork *wk = opaque;
 
-    wk->run(wk->regs);
+    wk->run(wk->regs, wk->wl);
     return 0;
 }
 
@@ -613,14 +617,23 @@ static void ai_work_done(void *opaque, int ret)
 
     if (s) {
         s->ai_work = NULL;
-        if (wk->gen == s->ai_gen) {
-            s->ai_pending = 0;
-            ipp_job_finish(s, wk->single, wk->res);
-        }
+        s->ai_pending = 0;
+        nvt_ai_writes_commit(wk->wl);
+        ipp_job_finish(s, wk->single, wk->res);
     }
+    nvt_ai_writes_free(wk->wl);
     g_free(wk);
 }
 
+static void ai_job_detach(NvtMediaState *s)
+{
+    if (s->ai_work) {
+        s->ai_work->s = NULL;
+        s->ai_work = NULL;
+    }
+}
+
+/* the job the registers in ai_regs describe */
 static void ai_job_start(NvtMediaState *s, bool single, IppLlResult res)
 {
     NvtAiWork *wk = g_malloc0(sizeof(*wk) + s->size);
@@ -631,10 +644,10 @@ static void ai_job_start(NvtMediaState *s, bool single, IppLlResult res)
     }
     wk->s = s;
     wk->run = ai_engine_run(s);
-    wk->gen = s->ai_gen;
+    wk->wl = nvt_ai_writes_new();
     wk->single = single;
     wk->res = res;
-    memcpy(wk->regs, s->regs, s->size);
+    memcpy(wk->regs, s->ai_regs, s->size);
     s->ai_work = wk;
     s->ai_pending = 1;
     s->ai_res = res;
@@ -648,7 +661,7 @@ static void ipp_job_done(NvtMediaState *s)
     IppLlResult res;
 
     if (ai && s->ai_work) {
-        /* a voided job still on the worker: start once it is back */
+        /* started again while a job is on the worker: once it is back */
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   IPP_JOB_NS);
         return;
@@ -656,6 +669,7 @@ static void ipp_job_done(NvtMediaState *s)
     if (s->phase) {
         /* a single job: its trigger bit drops when it is done */
         if (ai) {
+            memcpy(s->ai_regs, s->regs, s->size);
             ai_job_start(s, true, IPP_LL_LAST);
             return;
         }
@@ -676,6 +690,7 @@ static void ipp_job_done(NvtMediaState *s)
         return;
     }
     if (ai) {
+        memcpy(s->ai_regs, s->regs, s->size);
         ai_job_start(s, false, res);
         return;
     }
@@ -1006,7 +1021,7 @@ static void nvt_media_reset(DeviceState *dev)
 
     timer_del(s->timer);
     memset(s->regs, 0, s->size);
-    s->ai_gen++;                /* a job on the worker comes back void */
+    ai_job_detach(s);           /* a job on the worker comes back void */
     s->ai_pending = 0;
     s->frames = 0;
     s->jpg_lut = 0;
@@ -1036,6 +1051,7 @@ static void nvt_media_realize(DeviceState *dev, Error **errp)
         }
     }
     s->regs = g_malloc0(s->size);
+    s->ai_regs = g_malloc0(s->size);
     if (s->engine->timer == h26x_done) {
         s->h26x = nvt_h26x_new();
     }
@@ -1054,11 +1070,10 @@ static void nvt_media_unrealize(DeviceState *dev)
 
     nvt_h26x_free(s->h26x);
     s->h26x = NULL;
-    if (s->ai_work) {
-        s->ai_work->s = NULL;
-    }
+    ai_job_detach(s);
     timer_free(s->timer);
     g_free(s->regs);
+    g_free(s->ai_regs);
 }
 
 static const Property nvt_media_properties[] = {
@@ -1076,7 +1091,8 @@ static int nvt_media_post_load(void *opaque, int version_id)
 {
     NvtMediaState *s = opaque;
 
-    if (s->ai_pending && ai_engine_run(s) && !s->ai_work) {
+    ai_job_detach(s);           /* a loadvm over a running job */
+    if (s->ai_pending && ai_engine_run(s)) {
         ai_job_start(s, s->phase, s->ai_res);
     }
     return 0;
@@ -1097,6 +1113,7 @@ static const VMStateDescription vmstate_nvt_media = {
         VMSTATE_UINT32(jpg_lut, NvtMediaState),
         VMSTATE_UINT32_V(ai_pending, NvtMediaState, 2),
         VMSTATE_UINT32_V(ai_res, NvtMediaState, 2),
+        VMSTATE_VBUFFER_UINT32(ai_regs, NvtMediaState, 2, NULL, size),
         VMSTATE_END_OF_LIST()
     }
 };

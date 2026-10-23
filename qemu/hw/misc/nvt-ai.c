@@ -66,12 +66,57 @@ static bool rd(hwaddr a, void *buf, size_t n)
     return true;
 }
 
-static void wr(hwaddr a, const void *buf, size_t n)
+/*
+ * A job's writes, kept until the main loop commits them: a job a reset or
+ * a load voids leaves guest memory as it was, and device windows are
+ * written on the main thread only.
+ */
+struct NvtAiWrites {
+    GByteArray *log;            /* address (8), length (4), data, ... */
+};
+
+NvtAiWrites *nvt_ai_writes_new(void)
 {
-    if (dma_memory_write(&address_space_memory, a, buf, n,
-                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-        qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: cannot write 0x%"
-                      HWADDR_PRIx "\n", a);
+    NvtAiWrites *w = g_new(NvtAiWrites, 1);
+
+    w->log = g_byte_array_new();
+    return w;
+}
+
+static void wr(NvtAiWrites *w, hwaddr a, const void *buf, size_t n)
+{
+    uint64_t a64 = a;
+    uint32_t n32 = n;
+
+    g_byte_array_append(w->log, (const uint8_t *)&a64, 8);
+    g_byte_array_append(w->log, (const uint8_t *)&n32, 4);
+    g_byte_array_append(w->log, buf, n);
+}
+
+void nvt_ai_writes_commit(NvtAiWrites *w)
+{
+    size_t at = 0;
+
+    while (at + 12 <= w->log->len) {
+        uint64_t a;
+        uint32_t n;
+
+        memcpy(&a, w->log->data + at, 8);
+        memcpy(&n, w->log->data + at + 8, 4);
+        if (dma_memory_write(&address_space_memory, a, w->log->data + at + 12,
+                             n, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: cannot write 0x%"
+                          PRIx64 "\n", a);
+        }
+        at += 12 + n;
+    }
+}
+
+void nvt_ai_writes_free(NvtAiWrites *w)
+{
+    if (w) {
+        g_byte_array_free(w->log, true);
+        g_free(w);
     }
 }
 
@@ -110,16 +155,20 @@ static void wr(hwaddr a, const void *buf, size_t n)
  */
 #define NUE_MAX_MACS        (1u << 26)
 
-/* the 12-bit signed elements of an LSB-first bit stream */
-static int16_t w12(const uint8_t *p, size_t i)
+/* a 12-bit signed element of an LSB-first bit stream, at a bit */
+static int16_t w12_at(const uint8_t *p, size_t bit)
 {
-    size_t bit = i * 12;
     uint32_t v = p[bit / 8] | (p[bit / 8 + 1] << 8);
 
     return sextract32(v >> (bit % 8), 0, 12);
 }
 
-void nvt_ai_nue_run(const uint32_t *regs)
+static int16_t w12(const uint8_t *p, size_t i)
+{
+    return w12_at(p, i * 12);
+}
+
+void nvt_ai_nue_run(const uint32_t *regs, NvtAiWrites *wl)
 {
     uint32_t mode0 = R(NUE_MODE0), mode1 = R(NUE_MODE1);
     uint32_t svw = R(NUE_SIZE0) & 0x3FFF, svh = (R(NUE_SIZE0) >> 16) & 0x1FFF;
@@ -135,7 +184,7 @@ void nvt_ai_nue_run(const uint32_t *regs)
     unsigned esz = wide ? 2 : 1, osz = path ? 4 : (out16 ? 2 : 1);
     hwaddr in = R(NUE_IN_ADDR), sv = R(NUE_SV_ADDR) & ~3u;
     hwaddr out = R(NUE_OUT_ADDR);
-    size_t wrow = w8 ? svw : (size_t)svw * 12 / 8;
+    size_t wrow = w8 ? svw : (size_t)svw * 12 / 8 + 2;
     g_autofree uint8_t *x = NULL, *w = NULL, *rho = NULL, *res = NULL;
     g_autofree int64_t *xs = NULL;
     uint32_t o, j, k;
@@ -149,7 +198,7 @@ void nvt_ai_nue_run(const uint32_t *regs)
         return;
     }
     if (!svw || !svh || !obj || svw > NUE_MAX_SVW || svh > NUE_MAX_SVH ||
-        obj > NUE_MAX_OBJ || (!w8 && svw % 2)) {
+        obj > NUE_MAX_OBJ) {
         qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: NUE %u rows of %u, %u "
                       "vectors\n", svh, svw, obj);
         return;
@@ -179,7 +228,11 @@ void nvt_ai_nue_run(const uint32_t *regs)
         }
     }
     for (j = 0; j < svh; j++) {
-        if (!rd(sv + (hwaddr)j * wrow, w, wrow)) {
+        /* 12-bit rows follow on bit by bit: one may start mid-byte */
+        size_t bit = w8 ? 0 : (size_t)j * svw * 12 % 8;
+
+        if (!rd(sv + (w8 ? (hwaddr)j * svw : (hwaddr)j * svw * 12 / 8), w,
+                w8 ? svw : (bit + (size_t)svw * 12 + 7) / 8)) {
             return;
         }
         for (o = 0; o < obj; o++) {
@@ -188,7 +241,8 @@ void nvt_ai_nue_run(const uint32_t *regs)
             int64_t acc = 0, r;
 
             for (k = 0; k < svw; k++) {
-                int64_t wk = w8 ? (int8_t)w[k] * 16 : w12(w, k);
+                int64_t wk = w8 ? (int8_t)w[k] * 16
+                                : w12_at(w, bit + 12 * k);
 
                 acc += (xo[k] * wk) >> fshift;
             }
@@ -200,6 +254,7 @@ void nvt_ai_nue_run(const uint32_t *regs)
             /* less rho, the activation and its shift, 8 or 16 bits */
             r = (r >> rho_fmt) - (rho ? w12(rho, j)
                                       : sextract32(R(NUE_RHO), 0, 12));
+            r = MIN(MAX(r, -(1ll << 40)), 1ll << 40);
             if ((mode1 & NUE_M1_RELU) && r < 0) {
                 r = (r * sextract32(relu, 0, 11)) >>
                     (7 + extract32(relu, 12, 4));
@@ -217,7 +272,7 @@ void nvt_ai_nue_run(const uint32_t *regs)
             }
         }
     }
-    wr(out, res, (size_t)obj * svh * osz);
+    wr(wl, out, res, (size_t)obj * svh * osz);
 }
 
 /* ---- NUE2 ---- */
@@ -246,7 +301,7 @@ static uint8_t clamp8(int v)
     return v < 0 ? 0 : v > 255 ? 255 : v;
 }
 
-void nvt_ai_nue2_run(const uint32_t *regs)
+void nvt_ai_nue2_run(const uint32_t *regs, NvtAiWrites *wl)
 {
     uint32_t func = R(NUE2_FUNC), fmt = (func >> 12) & 3;
     uint32_t iw = R(NUE2_IN_SIZE) & 0x7FF, ih = (R(NUE2_IN_SIZE) >> 16) & 0xFFF;
@@ -374,7 +429,7 @@ void nvt_ai_nue2_run(const uint32_t *regs)
                 outl[x] = sign ? (uint8_t)MIN(MAX(v, -128), 127)
                                : clamp8(v);
             }
-            wr(oa + (hwaddr)y * lofs, outl, ow);
+            wr(wl, oa + (hwaddr)y * lofs, outl, ow);
         }
     }
 }
@@ -430,9 +485,12 @@ void nvt_ai_nue2_run(const uint32_t *regs)
 #define CNN_IO_UNSUPPORTED  ((1u << 3) | (3u << 10) | (7u << 16) | \
                              (7u << 20))
 
-/* the largest feature map and job a job may have, done at once */
-#define CNN_MAX_ELEMS       (16 * MiB)
+/* the largest feature map, weight set and job a job may have */
+#define CNN_MAX_ELEMS       (4 * MiB)
+#define CNN_MAX_WEIGHTS     (16 * MiB)
 #define CNN_MAX_MACS        (1ull << 32)
+/* intermediate values saturate here, well inside 64-bit arithmetic */
+#define CNN_LIM             (1ll << 40)
 
 typedef struct {
     unsigned c, h, w;
@@ -444,13 +502,28 @@ static int64_t cnn_shr(int64_t v, unsigned s)
     return s ? (v + (1ll << (s - 1))) >> s : v;
 }
 
+static int64_t cnn_clamp(int64_t v)
+{
+    return MIN(MAX(v, -CNN_LIM), CNN_LIM);
+}
+
+/* v << s, saturating at CNN_LIM */
+static int64_t cnn_shl(int64_t v, unsigned s)
+{
+    v = cnn_clamp(v);
+    if (v && (s > 40 || (v < 0 ? -v : v) > CNN_LIM >> s)) {
+        return v < 0 ? -CNN_LIM : CNN_LIM;
+    }
+    return v * ((int64_t)1 << s);
+}
+
 /* a scale-shift stage: [27:12] scale, [8:4] shift, bit 0 left */
 static int64_t cnn_ss(int64_t v, uint32_t reg)
 {
     unsigned s = extract32(reg, 4, 5);
 
-    v *= extract32(reg, 12, 16);
-    return reg & 1 ? v * ((int64_t)1 << s) : cnn_shr(v, s);
+    v = cnn_clamp(v) * extract32(reg, 12, 16);
+    return reg & 1 ? cnn_shl(v, s) : cnn_clamp(cnn_shr(v, s));
 }
 
 static int64_t cnn_sat(int64_t v, bool sign, bool wide)
@@ -485,8 +558,8 @@ static bool cnn_read(hwaddr a, uint32_t lofs, uint32_t cofs, bool sign,
     return true;
 }
 
-static void cnn_write(hwaddr a, uint32_t lofs, uint32_t cofs, bool sign,
-                      bool wide, const CnnMap *m)
+static void cnn_write(NvtAiWrites *wl, hwaddr a, uint32_t lofs,
+                      uint32_t cofs, bool sign, bool wide, const CnnMap *m)
 {
     unsigned es = wide ? 2 : 1, c, y, x;
     g_autofree uint8_t *line = g_malloc((size_t)m->w * es);
@@ -504,7 +577,7 @@ static void cnn_write(hwaddr a, uint32_t lofs, uint32_t cofs, bool sign,
                     line[x] = v;
                 }
             }
-            wr(a + (hwaddr)c * cofs + (hwaddr)y * lofs, line,
+            wr(wl, a + (hwaddr)c * cofs + (hwaddr)y * lofs, line,
                (size_t)m->w * es);
         }
     }
@@ -558,7 +631,7 @@ static bool cnn_conv(const uint32_t *regs, const CnnMap *in, CnnMap *out)
     out->h = (in->h + pt + pb - kh) / st + 1;
     out->w = (in->w + pl + pr - kw) / st + 1;
     nw = (size_t)sets * in->c * kh * kw;
-    if ((uint64_t)nw * out->h * out->w > CNN_MAX_MACS ||
+    if (nw > CNN_MAX_WEIGHTS || (uint64_t)nw * out->h * out->w > CNN_MAX_MACS ||
         (size_t)out->c * out->h * out->w > CNN_MAX_ELEMS) {
         qemu_log_mask(LOG_UNIMP, "nvt-ai: CNN job too big to run at once\n");
         return false;
@@ -633,12 +706,15 @@ static bool cnn_bn(const uint32_t *regs, CnnMap *m)
     for (c = 0; c < m->c; c++) {
         uint64_t r = le64_to_cpu(rec[c]);
         int64_t alpha = extract64(r, 0, 24);
-        int64_t mean = sextract64(r, 24, 12) * ((int64_t)1 << shm);
-        int64_t beta = sextract64(r, 36, 12) * ((int64_t)1 << shb);
+        int64_t mean = cnn_shl(sextract64(r, 24, 12), shm);
+        int64_t beta = cnn_shl(sextract64(r, 36, 12), shb);
         int64_t *v = m->v + (size_t)c * n;
 
         for (i = 0; i < n; i++) {
-            v[i] = cnn_shr((v[i] - mean) * alpha, sha) + beta;
+            /* x alpha (24 bits) of a difference within 2^38 */
+            int64_t d = MIN(MAX(v[i] - mean, -(1ll << 38)), 1ll << 38);
+
+            v[i] = cnn_clamp(cnn_shr(d * alpha, sha) + beta);
         }
     }
     return true;
@@ -672,7 +748,7 @@ static void cnn_pool(const uint32_t *regs, CnnMap *m)
                 for (r = 0, i = 0; i < n; i++) {
                     r += v[i];
                 }
-                r = cnn_shr(r * mul, sh);
+                r = cnn_shr(MIN(MAX(r, -(1ll << 48)), 1ll << 48) * mul, sh);
             } else {
                 for (i = 1; i < n; i++) {
                     r = MAX(r, v[i]);
@@ -737,7 +813,7 @@ static void cnn_pool(const uint32_t *regs, CnnMap *m)
     }
     if (p1 & 1) {
         for (n = 0; n < (size_t)m->c * m->h * m->w; n++) {
-            m->v[n] *= (int64_t)1 << extract32(p1, 4, 3);
+            m->v[n] = cnn_shl(m->v[n], extract32(p1, 4, 3));
         }
     } else {
         for (n = 0; n < (size_t)m->c * m->h * m->w; n++) {
@@ -746,7 +822,7 @@ static void cnn_pool(const uint32_t *regs, CnnMap *m)
     }
 }
 
-void nvt_ai_cnn_run(const uint32_t *regs)
+void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
 {
     uint32_t mode = R(CNN_MODE), io = R(CNN_IO);
     bool wide = io & CNN_IO_WIDE;
@@ -821,7 +897,7 @@ void nvt_ai_cnn_run(const uint32_t *regs)
                 a1.v[i] = cnn_ss(a1.v[i], R(CNN_SS_POOL));
             }
         }
-        cnn_write(R(CNN_OUT1_ADDR), R(CNN_OUT1_LOFS) ? R(CNN_OUT1_LOFS) :
+        cnn_write(wl, R(CNN_OUT1_ADDR), R(CNN_OUT1_LOFS) ? R(CNN_OUT1_LOFS) :
                   a1.w * (io & CNN_IO_OUT1_WIDE ? 2 : 1),
                   R(CNN_OUT1_COFS) ? R(CNN_OUT1_COFS) :
                   a1.w * a1.h * (io & CNN_IO_OUT1_WIDE ? 2 : 1),
@@ -835,7 +911,7 @@ void nvt_ai_cnn_run(const uint32_t *regs)
                                     cnn_act(v.v[i], R(CNN_ACT0)) : v.v[i],
                                     R(CNN_SS_OUT0)), 8);
         }
-        cnn_write(R(CNN_OUT0_ADDR), R(CNN_OUT0_LOFS) ? R(CNN_OUT0_LOFS) :
+        cnn_write(wl, R(CNN_OUT0_ADDR), R(CNN_OUT0_LOFS) ? R(CNN_OUT0_LOFS) :
                   v.w * (io & CNN_IO_OUT0_WIDE ? 2 : 1),
                   R(CNN_OUT0_COFS) ? R(CNN_OUT0_COFS) :
                   v.w * v.h * (io & CNN_IO_OUT0_WIDE ? 2 : 1),

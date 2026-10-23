@@ -958,9 +958,15 @@ The AI lists add two bits to the IPP's update command:
 
 `hw/misc/nvt-ai.c` does the work of a job. The jobs run on a worker
 thread with a copy of the registers, because a CNN layer can take
-200 ms of host time. The job's done interrupt follows when the work
-comes back. A reset voids a job in flight. A job running at a migration
-runs again on the destination.
+200 ms of host time.
+- The work logs its writes. They land in guest memory with the job's
+  done interrupt, when the work comes back to the main loop.
+- A reset or a loadvm detaches a job in flight, which then leaves
+  memory untouched.
+- A job running at a migration runs again on the destination, from the
+  registers it started with.
+- Intermediate values saturate rather than wrap, and a job too large to
+  run at once logs as unimplemented.
 
 **NUE, fully connected** (`kdrv_ai_tran_nue_fc_parm`) is mode 0 (SVM)
 with kernel 1 in dot mode.

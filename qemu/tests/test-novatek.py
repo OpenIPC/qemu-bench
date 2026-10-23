@@ -2013,6 +2013,16 @@ def test_ai_compute(qt):
                               qt.read(AI_OUT, S * H * W))),
            qt.readl(CNN + 0x00C) & 1), (want, 1))
     qt.writel(CNN + 0x00C, 0xFFFFFFFF)
+    # the same layer with every scale at its largest, shifted left 31:
+    # the stages saturate (positive out, ReLU's zeros stay)
+    for off in (0x0AC, 0x0B0, 0x0B4):
+        qt.writel(CNN + off, 0xFFFF << 12 | 31 << 4 | 1)
+    qt.writel(CNN + 0x000, 2)
+    ai_settle(qt, CNN + 0x00C, 1)
+    got = list(struct.unpack('<%db' % (S * H * W), qt.read(AI_OUT, S * H * W)))
+    check('CNN scales at their largest saturate, not wrap',
+          sorted(set(got)) in ([0, 127], [127], [0]), True)
+    qt.writel(CNN + 0x00C, 0xFFFFFFFF)
     # pooling alone: 3x3 max, stride 2, ceil, of a 5x5 u8 map (out1)
     px = [rnd.randint(0, 255) for _ in range(25)]
     qt.write(AI_IN, bytes(px))
@@ -2060,6 +2070,18 @@ def test_ai_compute(qt):
                       * 3 >> 2) >> 6) - rho[j], 32767), -32768)
             for j in range(3)]
     check('NUE FC path 0: 12-bit weights, rho, s16 out',
+          list(struct.unpack('<3h', qt.read(AI_OUT, 6))), want)
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+    # rows of an odd length: the next row starts mid-byte
+    wv = [[rnd.randint(-2048, 2047) for _ in range(3)] for _ in range(3)]
+    qt.write(AI_W, pack12([v for r in wv for v in r]))
+    qt.writel(NUE + 0x040, 3 | 3 << 16)
+    qt.writel(NUE + 0x000, 2)
+    ai_settle(qt, NUE + 0x03C, 1)
+    want = [max(min(((sum((16 * xv[k] * wv[j][k]) >> 8 for k in range(3))
+                      * 3 >> 2) >> 6) - rho[j], 32767), -32768)
+            for j in range(3)]
+    check('NUE FC: 12-bit rows of 3, the second from mid-byte',
           list(struct.unpack('<3h', qt.read(AI_OUT, 6))), want)
     qt.writel(NUE + 0x03C, 0xFFFFFFFF)
     # NUE2: mean scale 0 is no scale-shift, not a scale of nought
