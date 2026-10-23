@@ -28,15 +28,18 @@ struct SstarFspState {
     uint16_t qspi[0x80];
     uint8_t rbf[16];
     bool done;
+    bool fire_wait;             /* fired; the outside bytes are to come */
 
     /* the SPI NOR */
     uint8_t *array;
     uint32_t size;
     uint32_t jedec;
+    bool sw_cs;                 /* Ifado/Iford FSP-QSPI */
     char *flash_file;
     int fd;
     Error *migration_blocker;
     uint8_t sr[3];
+    uint8_t ear;                /* extended address register, read back */
     bool wel;
     uint8_t cmd;
     uint32_t addr;

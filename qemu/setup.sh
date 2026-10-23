@@ -86,6 +86,14 @@ cp qemu/hw/display/mstar-ge.c       "$QEMU_DIR/hw/display/"
 cp qemu/hw/display/mstar-disp.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
 cp qemu/hw/misc/sstar-vpu.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-crypto.c      "$QEMU_DIR/hw/misc/"
+cp qemu/hw/i2c/sstar-i2c.c          "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/misc/sstar-venc.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-isp.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-vif.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-jpe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-bach.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-cmdq.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
 cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/novatek.h    "$QEMU_DIR/include/hw/arm/"
@@ -426,10 +434,12 @@ config SIGMASTAR
     select UNIMP
     select USB_EHCI_SYSBUS
     select AHCI_SYSBUS
+    select I2C
+    select HISI_I2C
 KCONFIG
     echo "  hw/arm/Kconfig: added SIGMASTAR"
 else
-    for sym in A15MPCORE ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS; do
+    for sym in A15MPCORE ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C; do
         if ! sed -n '/^config SIGMASTAR$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config SIGMASTAR\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -438,7 +448,7 @@ else
         fi
     done
 fi
-for f in misc/sstar-riu intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+for f in misc/sstar-riu misc/sstar-crypto misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
@@ -469,6 +479,27 @@ if grep -q "dependency('libavcodec', required: false)" \
     sed -i "s/dependency('libavcodec', required: false)/dependency('libavcodec', version: '>=58', required: false)/; s/dependency('libavutil', required: false)/dependency('libavutil', version: '>=56', required: false)/" \
         "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: FFmpeg 4.0 floor for sstar-vpu"
+fi
+# The encoder model encodes with libavcodec's libx264 and libx265 when
+# they are there, and writes placeholder frames when they are not.  It
+# comes after the VPU block, whose dependencies it shares.  A tree that
+# built it unconditionally loses that line first.
+if grep -q "^system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-venc.c'))$" \
+        "$QEMU_DIR/hw/misc/meson.build"; then
+    sed -i "/^system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-venc.c'))\$/d" \
+        "$QEMU_DIR/hw/misc/meson.build"
+fi
+if ! grep -q "'sstar-venc.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'MESON'
+if sstar_avcodec.found() and sstar_avutil.found()
+  system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: [files('sstar-venc.c'),
+    sstar_avcodec, sstar_avutil,
+    declare_dependency(compile_args: '-DSSTAR_VENC_LIBAVCODEC')])
+else
+  system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-venc.c'))
+endif
+MESON
+    echo "  hw/misc/meson.build: added sstar-venc.c"
 fi
 if ! grep -q "'sigmastar.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sigmastar.c'))" \
