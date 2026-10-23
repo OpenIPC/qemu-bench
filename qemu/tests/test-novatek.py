@@ -2166,7 +2166,7 @@ MD = 0xF0C10000
 MD_MODEL, MD_VAR1 = 0x01900000, 0x01A00000     # 40 and 6 bytes a pixel
 
 
-def md_frame(qt, y, w, h, mode, morph=0):
+def md_frame(qt, y, w, h, mode, morph=0, regs=None):
     """One MDBC trigger on the w x h luma y (grey chroma); the bitmap."""
     qt.write(AI_IN, bytes(y))
     qt.write(AI_IN + w * h, bytes([128]) * (w * h // 2))
@@ -2177,7 +2177,8 @@ def md_frame(qt, y, w, h, mode, morph=0):
                      0x04C: 10 << 8 | 30 << 16 | 4 << 24 | 8 << 28,
                      0x050: 8, 0x054: 2, 0x058: 20, 0x064: morph,
                      0x068: 4 | 64 << 8 | 128 << 16,
-                     0x078: 1 << 15 | 0x1234, 0x008: 0x31}.items():
+                     0x078: 1 << 15 | 0x1234, 0x008: 0x31,
+                     **(regs or {})}.items():
         qt.writel(MD + off, val)
     qt.writel(MD + 0x000, 2)
     ai_settle(qt, MD + 0x00C, 1)
@@ -2218,6 +2219,28 @@ def test_md(qt):
             for y in range(h) for x in range(w)]
     check('MDBC morphology: an erosion stage',
           md_frame(qt, blk, w, h, 1, morph=8), [int(v) for v in want])
+    # a scene change that stays: with ghost removal (foreground for more
+    # than 2 frames updates anyway), updates every frame and 4 matches
+    # needed, the block joins the background.  The random state runs
+    # free (DBG_RND would draw the same numbers every frame).
+    mode = 1 | 1 << 4 | 1 << 8
+    regs = {0x054: 4, 0x068: 1 | 64 << 8 | 2 << 16, 0x078: 0}
+    md_frame(qt, bg, w, h, 0, regs=regs)
+    first = sum(md_frame(qt, blk, w, h, mode, regs=regs))
+    for _ in range(40):
+        last = sum(md_frame(qt, blk, w, h, mode, regs=regs))
+    # (neighbour diffusion every frame keeps a few pixels flickering where
+    # it copies values across the pattern's edges)
+    check('MDBC: ghost removal absorbs a lasting change',
+          (first > 700, last < first // 50), (True, True))
+    # a reset straight after a start: no frame end, no status
+    qt.writel(MD + 0x000, 2)
+    qt.writel(MD + 0x000, 1)
+    qt.writel(MD + 0x000, 0)
+    qt.step(10 * 1000 * 1000)
+    check('MDBC reset: the job and its status go, the enables stay',
+          (qt.readl(MD + 0x00C), qt.readl(MD + 0x008),
+           gic_pending(qt, 46)), (0, 0x31, False))
 
 
 def cnn_job(qt, regs, done=1):

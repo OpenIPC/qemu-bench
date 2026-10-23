@@ -1417,8 +1417,13 @@ deterministic version of it:
   bit adds pixels that have enough neighbours set; a clear bit keeps only
   those. A threshold of 0 skips the stage.
 
-The random numbers are a 15-bit LFSR kept in the RND register, so a run
-always gives the same bitmaps.
+The random numbers are a 15-bit LFSR whose state is kept in the RND
+register, hashed for each draw (its successive states are only shifts of
+each other). A run therefore always gives the same bitmaps. With
+`DBG_RND_EN` every frame starts from the same seed. RND, the frame
+counter and the luminance difference are read-only. Control bit 0 resets
+the engine: a running job and the status go, and the interrupt enables
+(written before it) stay.
 
 The SDK's `alg_md_sample` runs the engine and then `lib_md`'s alarms:
 - a global alarm when over half the picture moves;
@@ -1437,7 +1442,9 @@ checks that it binds. It then checks that both alarms come in frames
 - a bright block is foreground, and nothing 3 pixels off it is;
 - the frame counter counts;
 - an erosion stage gives exactly the previous bitmap's pixels with all 8
-  neighbours set.
+  neighbours set;
+- with ghost removal, a lasting change is absorbed (BC_MIN_MATCH 4);
+- a reset straight after a start leaves no frame end and no status.
 
 ## Display
 

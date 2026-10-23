@@ -100,17 +100,24 @@ static bool md_rd(hwaddr a, void *buf, size_t n)
 
 static void md_wr(hwaddr a, const void *buf, size_t n)
 {
-    dma_memory_write(&address_space_memory, a, buf, n,
-                     MEMTXATTRS_UNSPECIFIED);
+    if (dma_memory_write(&address_space_memory, a, buf, n,
+                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-md: cannot write 0x%"
+                      HWADDR_PRIx "\n", a);
+    }
 }
 
-/* the 15-bit LFSR, x^15 + x^14 + 1 */
+/*
+ * The 15-bit LFSR, x^15 + x^14 + 1, a step a draw, its state hashed: the
+ * state itself only shifts along, so a draw that passed "% rate" would
+ * leave the next one 0 or 1 modulo 8.
+ */
 static unsigned md_rand(uint32_t *lfsr)
 {
     uint32_t bit = ((*lfsr >> 14) ^ (*lfsr >> 13)) & 1;
 
     *lfsr = ((*lfsr << 1) | bit) & 0x7FFF;
-    return *lfsr;
+    return (*lfsr * 0x9E3779B1u) >> 17;
 }
 
 /*
@@ -142,40 +149,48 @@ static uint16_t md_lbsp(const uint8_t *y, int w, int h, int px, int py,
     return d;
 }
 
-/* the thresholds at (x, y): the first enabled ROI holding it, else global */
-static MdThr md_thr(const uint32_t *regs, int x, int y)
+/*
+ * The thresholds: thr[0] the global ones, thr[1 + i] ROI i's; and each
+ * pixel's, the first enabled ROI holding it, else the global ones.
+ */
+static void md_regions(const uint32_t *regs, int w, int h, MdThr *thr,
+                       uint8_t *map)
 {
     uint32_t m0 = R(MD_MATCH0);
-    MdThr t = {
+    int i, x, y;
+
+    thr[0] = (MdThr) {
         .colour = extract32(m0, 8, 8), .lbsp = extract32(m0, 24, 4),
         .uv = extract32(R(MD_MATCH3), 0, 8),
         .min_t = extract32(R(MD_UPDATE0), 0, 8), .morph = true,
     };
-    int i;
-
-    for (i = 0; i < MD_ROIS; i++) {
+    memset(map, 0, (size_t)w * h);
+    for (i = MD_ROIS - 1; i >= 0; i--) {
         uint32_t r0 = R(MD_ROI(i)), r1 = R(MD_ROI(i) + 4);
         uint32_t r2 = R(MD_ROI(i) + 8), r3 = R(MD_ROI(i) + 12);
         int rx = extract32(r0, 0, 10), ry = extract32(r0, 12, 10);
+        int rw = extract32(r1, 0, 10), rh = extract32(r1, 12, 10);
 
-        if (!(R(MD_MODE0) & (1u << (12 + i))) || x < rx || y < ry ||
-            x >= rx + (int)extract32(r1, 0, 10) ||
-            y >= ry + (int)extract32(r1, 12, 10)) {
+        thr[1 + i] = (MdThr) {
+            .colour = extract32(r2, 8, 8), .lbsp = extract32(r2, 24, 4),
+            .uv = extract32(r1, 24, 8), .min_t = extract32(r3, 4, 8),
+            .morph = r3 & 1,
+        };
+        if (!(R(MD_MODE0) & (1u << (12 + i)))) {
             continue;
         }
-        t.colour = extract32(r2, 8, 8);
-        t.lbsp = extract32(r2, 24, 4);
-        t.uv = extract32(r1, 24, 8);
-        t.min_t = extract32(r3, 4, 8);
-        t.morph = r3 & 1;
-        break;
+        /* the lowest-numbered ROI is painted last, so it wins */
+        for (y = ry; y < MIN(ry + rh, h); y++) {
+            for (x = rx; x < MIN(rx + rw, w); x++) {
+                map[y * w + x] = 1 + i;
+            }
+        }
     }
-    return t;
 }
 
 /* one 3x3 stage: add (or keep only) pixels with th or more neighbours */
-static void md_morph(const uint32_t *regs, uint8_t *fg, int w, int h,
-                     unsigned th, bool add)
+static void md_morph(const MdThr *thr, const uint8_t *map, uint8_t *fg,
+                     int w, int h, unsigned th, bool add)
 {
     g_autofree uint8_t *in = g_memdup2(fg, (size_t)w * h);
     int x, y, dx, dy;
@@ -184,7 +199,7 @@ static void md_morph(const uint32_t *regs, uint8_t *fg, int w, int h,
         for (x = 0; x < w; x++) {
             unsigned n = 0;
 
-            if (!md_thr(regs, x, y).morph) {
+            if (!thr[map[y * w + x]].morph) {
                 continue;
             }
             for (dy = -1; dy <= 1; dy++) {
@@ -213,8 +228,9 @@ void nvt_md_run(uint32_t *regs)
     uint32_t lofs_y = R(MD_OFSI_Y) & 0xFFFFC, lofs_uv = R(MD_OFSI_UV) & 0xFFFFC;
     size_t n = (size_t)w * h, msz = n * models * MD_SAMPLE;
     g_autofree uint8_t *y = NULL, *uv = NULL, *model = NULL, *var1 = NULL;
-    g_autofree uint8_t *fg = NULL, *bits = NULL;
+    g_autofree uint8_t *fg = NULL, *bits = NULL, *map = NULL;
     g_autofree uint16_t *lbsp = NULL;
+    MdThr thr[1 + MD_ROIS];
     uint32_t lfsr = u4 & (1u << 15) ? extract32(u4, 0, 15) :
                                       extract32(u4, 16, 15);
     uint64_t lum = 0;
@@ -247,6 +263,8 @@ void nvt_md_run(uint32_t *regs)
             lbsp[yy * w + x] = md_lbsp(y, w, h, x, yy, lbsp_th);
         }
     }
+    map = g_malloc(n);
+    md_regions(regs, w, h, thr, map);
     model = g_malloc(msz);
     var1 = g_malloc0(n * MD_VAR1);
     fg = g_malloc0(n);
@@ -277,7 +295,7 @@ void nvt_md_run(uint32_t *regs)
         for (yy = 0; yy < h; yy++) {
             for (x = 0; x < w; x++) {
                 size_t p = (size_t)yy * w + x;
-                MdThr t = md_thr(regs, x, yy);
+                const MdThr t = thr[map[p]];
                 int u = uv[(yy / 2) * w + (x & ~1)];
                 int v = uv[(yy / 2) * w + (x & ~1) + 1];
                 unsigned match = 0;
@@ -308,7 +326,7 @@ void nvt_md_run(uint32_t *regs)
         for (yy = 0; yy < h; yy++) {
             for (x = 0; x < w; x++) {
                 size_t p = (size_t)yy * w + x;
-                unsigned rate = MAX(md_thr(regs, x, yy).min_t, 1);
+                unsigned rate = MAX(thr[map[p]].min_t, 1);
                 uint8_t cur[MD_SAMPLE];
 
                 if (!upd[p]) {
@@ -342,11 +360,11 @@ void nvt_md_run(uint32_t *regs)
             unsigned th = extract32(morph, 4 * i, 4);
 
             if (th) {
-                md_morph(regs, fg, w, h, th, morph & (1u << (20 + i)));
+                md_morph(thr, map, fg, w, h, th, morph & (1u << (20 + i)));
             }
         }
         if (extract32(morph, 16, 4)) {
-            md_morph(regs, fg, w, h, extract32(morph, 16, 4), true);
+            md_morph(thr, map, fg, w, h, extract32(morph, 16, 4), true);
         }
     }
 

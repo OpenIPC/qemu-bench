@@ -323,8 +323,9 @@ static const NvtIppParams ipp_cnn = {
 };
 
 /*
- * MDBC, motion detection (kdrv_md: mdbc_reg.h): control bit 0 resets
- * (interrupt enables kept), bit 1 runs a frame (done: status bit 0, which
+ * MDBC, motion detection (kdrv_md: mdbc_reg.h): control bit 0 resets --
+ * a running job and the status go, the interrupt enables (written before
+ * it) stay -- bit 1 runs a frame (done: status bit 0, which
  * kdrv_md waits for with no timeout), bit 28 fires a list (job end bit 7,
  * list end bit 4, a broken list bit 5); status is write 1 to clear.  The
  * work is nvt-md.c's.  Bit 15 of the DMA-disable register reads idle.
@@ -356,6 +357,19 @@ static uint64_t ipp_write(NvtMediaState *s, hwaddr off, uint64_t val)
 {
     const NvtIppParams *p = s->engine->opaque;
 
+    if (p == &ipp_md && (off == 0x060 || off == 0x074 || off == 0x078)) {
+        /* read-only: LUM_DIFF, FRM_ID [19:12], RND [30:16] */
+        uint32_t ro = off == 0x060 ? 0x0FFFFFFF :
+                      off == 0x074 ? 0x000FF000 : 0x7FFF0000;
+
+        return (val & ~ro) | (*reg(s, off) & ro);
+    }
+    if (off == IPP_CTRL && p == &ipp_md && (val & 1)) {
+        /* MDBC reset: the job and its status go, the enables stay */
+        timer_del(s->timer);
+        *reg(s, p->ints) = 0;
+        return val & ~(1u | p->trig | IPP_LL_FIRE);
+    }
     if (off == IPP_CTRL) {
         if (val & IPP_LL_FIRE) {
             s->ll_addr = *reg(s, p->ll_addr);
