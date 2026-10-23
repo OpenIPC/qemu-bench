@@ -53,7 +53,10 @@
 # when the samples carry a model built for this chip
 # (build-novatek-hdal-samples.sh --ai-model), ai_net, the SDK's ImageNet
 # classifier (NUE2, 93 CNN jobs, NUE's FC), which must call ai_pattern's
-# picture a sea snake.
+# picture a sea snake.  With the AI turnkey's detectors in the samples
+# (--sdk7 / --turnkey) it runs them on their pictures -- people, people
+# and vehicles, faces -- from a SquashFS on a second SD card, and checks
+# what they find.
 # --panel picks the panel: pw35p00 (the EVB's, serial RGB, 320x240) or a
 # MIPI DSI one -- nt35510 (480x800), tb093 (320x1280) or ili9488
 # (320x480) -- for which nvt_dsi loads first.
@@ -161,6 +164,16 @@ PY
 fi
 if [ -n "$SAMPLES" ]; then
     cp -a "$SAMPLES/smp" "$SAMPLES/uc" "$WORK/initramfs/"
+    # the turnkey detectors' models and pictures (--sdk7 / --turnkey):
+    # too large for the initramfs, so a SquashFS on a second SD card,
+    # its size a power of two as QEMU's SD cards want
+    if [ -d "$SAMPLES/sd" ]; then
+        mksquashfs "$SAMPLES/sd" "$WORK/det.img" -noappend -quiet >/dev/null
+        n=$(stat -c %s "$WORK/det.img"); p=1048576
+        while [ $p -lt "$n" ]; do p=$((p * 2)); done
+        truncate -s $p "$WORK/det.img"
+        DETDRIVE="-drive if=sd,index=1,format=raw,file=$WORK/det.img"
+    fi
     # hd_gfx_only's inputs, patterned so its results can be checked: Y is
     # (x + y) / 16, U / V ramps over the pair index, the ARGB4444 logo is
     # opaque green
@@ -230,7 +243,7 @@ if [ -d /dko ]; then
     done
     \$bb dmesg | \$bb grep -a "Hello, panel" | \$bb sed 's/^.*Hello/NVT-DISP-PANEL: Hello/'
     # the AI engines (S10_SysInit2's order; ai_op runs a second process)
-    for m in "kdrv_ai ai_net_supported_num=2" kflow_cnn kflow_nue kflow_nue2 \\
+    for m in "kdrv_ai ai_net_supported_num=5" kflow_cnn kflow_nue kflow_nue2 \\
              kflow_cpu kflow_dsp kflow_ai_net; do
         \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/\${m%% *}.ko \$(echo \$m | \$bb cut -s -d' ' -f2-)" >/dev/null 2>&1
         echo "NVT-AI-INSMOD: \${m%% *} rc=\$?"
@@ -250,8 +263,17 @@ cat > "$WORK/initramfs/samples.sh" <<'SMP'
 M=/lib/modules/4.19.91/kernel/drivers/mmc
 for ko in core/mmc_core core/mmc_block host/mmc_na51055; do insmod $M/$ko.ko; done
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0 ] && break; sleep 1; done
-mount -t tmpfs -o size=1m sd /mnt && mkdir /mnt/sd
-mkfs.vfat /dev/mmcblk0 >/dev/null && mount -t vfat /dev/mmcblk0 /mnt/sd
+mount -t tmpfs -o size=1m sd /mnt && mkdir /mnt/sd /mnt/det
+# a second card with the detectors' SquashFS: which mmcblk is which
+SDCARD=/dev/mmcblk0
+for i in 1 2 3 4 5; do [ -b /dev/mmcblk1 ] && break; sleep 1; done
+for b in /dev/mmcblk0 /dev/mmcblk1; do
+    if [ -b $b ] && [ "$(head -c 4 $b)" = hsqs ]; then
+        mount -t squashfs -o ro $b /mnt/det
+        [ $b = /dev/mmcblk0 ] && SDCARD=/dev/mmcblk1
+    fi
+done
+mkfs.vfat $SDCARD >/dev/null && mount -t vfat $SDCARD /mnt/sd
 cd /tmp/smp
 run() {         # run <sample> [keys]: the keys 4 s apart, then q ($ARGS)
     n=$1
@@ -368,6 +390,22 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
         grep -i 'err\|fail' /tmp/ai_net.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
         grep '^[1-5]\. no=' /tmp/ai_net.out | sed 's/^/NVT-AI-NET: /'
     fi
+    # the turnkey's detectors on their pictures, from the SD card
+    if [ -d /mnt/det/CNNLib ] && [ -x ./ai2_pdcnn_sample ]; then
+        rm -f /mnt/sd/*
+        cp -a /mnt/det/. /mnt/sd/
+        mkdir -p /mnt/sd/det_results /mnt/sd/FDCNN/result/fd /mnt/sd/save_bmp
+        for d in ai2_pdcnn_sample alg_pvdcnn_sample "alg_fdcnn_ai2_sample faces 0 1"; do
+            ( sleep 3; echo q ) | timeout 600 ./$d > /tmp/det.out 2>&1
+            echo "NVT-HDAL-RUN: ${d%% *} rc=$?"
+            grep -i 'err\|fail' /tmp/det.out | head -5 | sed 's/^/NVT-HDAL-ERR: /'
+        done
+        for f in /mnt/sd/det_results/*.txt /mnt/sd/FDCNN/result/fd/*.txt; do
+            [ -f "$f" ] && tr -d '\r' < "$f" | sed "s|^|NVT-AI-DET: ${f##*/} |"
+        done
+        rm -rf /mnt/sd/CNNLib /mnt/sd/jpg /mnt/sd/FDCNN /mnt/sd/det_results \
+            /mnt/sd/save_bmp
+    fi
 fi
 rm -f /mnt/sd/*
 run hd_audio_capture_only
@@ -414,11 +452,11 @@ PY
 ) &
 snapper=$!
 set +e
-timeout 900 "$QEMU" -M "$MACHINE,sensor=$SENSOR,flash-file=$WORK/nor.bin,audiodev=snd0" \
+timeout 1500 "$QEMU" -M "$MACHINE,sensor=$SENSOR,flash-file=$WORK/nor.bin,audiodev=snd0" \
     -audiodev "wav,id=snd0,path=$WORK/out.wav" \
     -kernel "$KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=ttyS0,115200 rdinit=/init mtdparts=$MTDPARTS" \
-    -drive "if=sd,index=0,format=raw,file=$WORK/sd.img" \
+    -drive "if=sd,index=0,format=raw,file=$WORK/sd.img" ${DETDRIVE:-} \
     -nographic -monitor "unix:$WORK/mon.sock,server=on,wait=off" \
     -serial stdio -nic none -no-reboot \
     > "$WORK/console.log" 2>&1
@@ -746,6 +784,60 @@ PY
             esac
         else
             echo "SKIP: ai_net (the samples carry no model for this chip)"
+        fi
+        # the turnkey detectors: each must find what the pictures hold
+        if [ -d "$SAMPLES/sd" ]; then
+            for d in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample; do
+                expect "NVT-HDAL-RUN: $d rc=0" "$d runs to its end"
+            done
+            look=$(grep -a '^NVT-AI-DET: ' "$WORK/console.log" | tr -d '\r' |
+                   python3 -c '
+import sys
+# NVT-AI-DET: <result file> <its line>
+det = [l.split()[1:] for l in sys.stdin]
+
+def near(c, want, tol):
+    return abs(c[0] - want[0]) <= tol and abs(c[1] - want[1]) <= tol
+
+def centre(x0, y0, x1, y1):
+    return ((x0 + x1) / 2, (y0 + y1) / 2)
+
+# pdcnn: picture score x y w h (1920x1080); the people in its pictures
+pd = [(r[1], float(r[2]), centre(float(r[3]), float(r[4]),
+                                 float(r[3]) + float(r[5]),
+                                 float(r[4]) + float(r[6])))
+      for r in det if r[0].startswith("pd_") and len(r) >= 7]
+people = [("comp.yuv", (383, 320)), ("comp.yuv", (848, 332)),
+          ("bball.yuv", (453, 615))]
+pdok = sum(any(n == want_n and s >= 0.8 and near(c, want, 90)
+               for n, s, c in pd) for want_n, want in people)
+# pvdcnn: picture class score x0 y0 x1 y1; class 1 people, 2 vehicles
+pv = [(r[1], int(r[2]), float(r[3]), centre(*map(float, r[4:8])))
+      for r in det if r[0].startswith("PVD") and len(r) >= 8]
+pvok = sum(any(n == "comp.yuv" and k == 1 and s >= 0.8 and near(c, want, 90)
+               for n, k, s, c in pv)
+           for want in ((459, 345), (1233, 298), (498, 768)))
+car = any(n == "huang.yuv" and k == 2 and s >= 0.8 and near(c, (110, 466), 60)
+          for n, k, s, c in pv)
+# fdcnn, a file a frame: x y w h score, then five landmarks, eyes first
+faces = {}
+for r in det:
+    if r[0][0].isdigit() and len(r) > 6:
+        faces.setdefault(r[0], []).append([int(v) for v in r[1:]])
+eyes = any(f[4] >= 14000 and abs(f[5] - 207) <= 12 and abs(f[6] - 96) <= 12
+           and abs(f[7] - 243) <= 12 and abs(f[8] - 100) <= 12
+           for f in faces.get("000000.txt", []))
+bface = any(near(centre(f[0], f[1], f[0] + f[2], f[1] + f[3]), (86, 115), 15)
+            for f in faces.get("000001.txt", []))
+print("pd=%d/3 pvd=%d/3 car=%d eyes=%d bface=%d"
+      % (pdok, pvok, car, eyes, bface))
+' 2>/dev/null || true)
+            case "$look" in *pd=3/3*) pass "ai2_pdcnn_sample: the three people ($look)";;
+                *) bad "ai2_pdcnn_sample: the three people (${look:-no result})";; esac
+            case "$look" in *pvd=3/3*car=1*) pass "alg_pvdcnn_sample: three people and the car ($look)";;
+                *) bad "alg_pvdcnn_sample: three people and the car (${look:-no result})";; esac
+            case "$look" in *eyes=1*bface=1*) pass "alg_fdcnn_ai2_sample: both faces, the astronaut's eyes in place ($look)";;
+                *) bad "alg_fdcnn_ai2_sample: both faces (${look:-no result})";; esac
         fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what

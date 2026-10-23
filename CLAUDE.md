@@ -282,7 +282,13 @@ to the SDK's classifier with `-global nvt-media.ai-dump=DIR` (job
 registers and RAM). SDK v1.01.002's models are for chip id 1 (NT98520),
 which `kflow_ai_net` refuses on 0x7021; v1.01.007's `ai_pattern` model is
 the same network for chip id 4, and under QEMU it names the test
-picture (a sea snake). The
+picture (a sea snake). The v1.01.007 AI turnkey's detectors (people,
+vehicles, faces) run too, built from v1.01.007's samples and libraries
+against v1.01.002's `vendor_ai2`, because v1.01.007's checks for a
+`kdrv_ai` version the release modules lack. A conv bias without BN goes
+after the conv's scale-shift (0x0AC) for an 8-bit out0 and before it for
+a 16-bit one, fitted to the detectors (the wrong side loses people or
+faces). The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

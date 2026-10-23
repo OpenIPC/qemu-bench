@@ -2095,6 +2095,147 @@ def test_ai_compute(qt):
           [[112, 239]] * 3)
 
 
+
+def cnn_job(qt, regs, done=1):
+    """Run one CNN job set up in regs (offset: value) and wait for it."""
+    for off in range(0x004, 0x0C0, 4):
+        qt.writel(CNN + off, regs.get(off, 0))
+    qt.writel(CNN + 0x008, 1)
+    qt.writel(CNN + 0x000, 2)
+    ai_settle(qt, CNN + 0x00C, done)
+    qt.writel(CNN + 0x00C, 0xFFFFFFFF)
+
+
+def test_ai_detect(qt):
+    print('AI engines: the detectors\' layers')
+    rnd = random.Random(98562)
+    # conv with a plain bias (no BN): 3x3 over 4x4x2 u8, 2 sets; the bias,
+    # 12 bits in 16, << CONV_SHIFT_B 3, comes after the conv's scale-shift
+    W, H, C, S = 4, 4, 2, 2
+    x = [[[rnd.randint(0, 200) for _ in range(W)] for _ in range(H)]
+         for _ in range(C)]
+    w = [[[[rnd.randint(-200, 200) for _ in range(3)] for _ in range(3)]
+          for _ in range(C)] for _ in range(S)]
+    bias = [-37, 52]
+    qt.write(AI_IN, bytes(v for c in x for r in c for v in r))
+    qt.write(AI_W, pack12([v for st in w for c in st for r in c for v in r]))
+    qt.write(AI_W + 0x1000, struct.pack('<2H', *(b & 0xFFF for b in bias)))
+    cnn_job(qt, {0x004: 0x1200, 0x010: AI_IN, 0x020: W, 0x024: W * H,
+                 0x030: AI_W, 0x038: AI_W + 0x1000, 0x044: AI_OUT,
+                 0x04C: W, 0x050: W * H, 0x05C: W | H << 12, 0x060: C,
+                 0x064: 0x100, 0x068: 3 | S << 8, 0x06C: 0xF | 3 << 8,
+                 0x0AC: 5 << 12 | 6 << 4, 0x0B0: 1 << 12,
+                 0x0B4: 255 << 12 | 7 << 4})
+    want = []
+    for st in range(S):
+        for oy in range(H):
+            for ox in range(W):
+                acc = sum(w[st][c][ky][kx] * x[c][oy + ky - 1][ox + kx - 1]
+                          for c in range(C) for ky in range(3)
+                          for kx in range(3)
+                          if 0 <= oy + ky - 1 < H and 0 <= ox + kx - 1 < W)
+                v = rshr(acc * 5, 6) + (bias[st] << 3)
+                v = max(min(v, 32767), 0)
+                want.append(min(rshr(v * 255, 7 + 8), 255))
+    check('CNN conv with a plain bias, after its scale-shift (u8 out)',
+          list(qt.read(AI_OUT, S * H * W)), want)
+    # the same into a 16-bit out0 (a detector's head): the bias goes in
+    # before the scale-shift, and out0 keeps the fraction bits
+    cnn_job(qt, {0x004: 0x1000, 0x010: AI_IN, 0x020: W, 0x024: W * H,
+                 0x030: AI_W, 0x038: AI_W + 0x1000, 0x044: AI_OUT,
+                 0x04C: 2 * W, 0x050: 2 * W * H, 0x05C: W | H << 12,
+                 0x060: C, 0x064: 0x340, 0x068: 3 | S << 8,
+                 0x06C: 0xF | 3 << 8, 0x0AC: 5 << 12 | 6 << 4,
+                 0x0B0: 1 << 12 | 4 << 4, 0x0B4: 1 << 12})
+    want = []
+    for st in range(S):
+        for oy in range(H):
+            for ox in range(W):
+                acc = sum(w[st][c][ky][kx] * x[c][oy + ky - 1][ox + kx - 1]
+                          for c in range(C) for ky in range(3)
+                          for kx in range(3)
+                          if 0 <= oy + ky - 1 < H and 0 <= ox + kx - 1 < W)
+                v = rshr(rshr((acc + (bias[st] << 3)) * 5, 6), 4)
+                want.append(max(min(v, 32767), -32768))
+    check('CNN conv into a 16-bit out0: the bias before the scale-shift',
+          list(struct.unpack('<%dh' % (S * H * W), qt.read(AI_OUT, 2 * S * H * W))),
+          want)
+    # deconvolution: 3x2 x 2 channels spread out by 2, a pad row and
+    # column after, the holes 0 (out0 raw, no 8.8 drop)
+    px = [rnd.randint(1, 255) for _ in range(12)]
+    qt.write(AI_IN, bytes(px))
+    cnn_job(qt, {0x004: 1, 0x010: AI_IN, 0x020: 3, 0x024: 6,
+                 0x044: AI_OUT, 0x04C: 6, 0x050: 24, 0x05C: 3 | 2 << 12,
+                 0x060: 2, 0x064: 0x100, 0x0A0: 1 << 24 | 1 << 2 | 1 << 6,
+                 0x0B4: 1 << 12})
+    want = [0] * 48
+    for c in range(2):
+        for y in range(2):
+            for xx in range(3):
+                want[c * 24 + 2 * y * 6 + 2 * xx] = px[c * 6 + y * 3 + xx]
+    check('CNN deconvolution: stride 2, holes and pads 0', list(qt.read(AI_OUT, 48)),
+          want)
+    # scale-up x 2: each pixel 2x2 times
+    cnn_job(qt, {0x004: 2, 0x010: AI_IN, 0x020: 3, 0x024: 6,
+                 0x044: AI_OUT, 0x04C: 6, 0x050: 24, 0x05C: 3 | 2 << 12,
+                 0x060: 2, 0x064: 0x100, 0x0A4: 1, 0x0B4: 1 << 12})
+    want = [px[c * 6 + (y // 2) * 3 + xx // 2] for c in range(2)
+            for y in range(4) for xx in range(6)]
+    check('CNN scale-up x 2 (nearest)', list(qt.read(AI_OUT, 48)), want)
+    # element-wise alone: s16 a + s16 b, ((a * 527) >> 9) + ((b * 1) >> 0)
+    # >> 9, then x 256 >> 8 into s8
+    a = [rnd.randint(-20000, 20000) for _ in range(8)]
+    b = [rnd.randint(-20000, 20000) for _ in range(8)]
+    qt.write(AI_IN, struct.pack('<8h', *a))
+    qt.write(AI_W, struct.pack('<8h', *b))
+    cnn_job(qt, {0x004: 0x800, 0x010: AI_IN, 0x020: 8, 0x024: 16,
+                 0x028: 8, 0x02C: 16, 0x03C: AI_W, 0x044: AI_OUT,
+                 0x04C: 4, 0x050: 8, 0x05C: 4 | 2 << 12, 0x060: 1,
+                 0x064: 0x170, 0x084: 3 | 9 << 4 | 9 << 20,
+                 0x088: 527 | 1 << 16, 0x0A8: 1 << 12, 0x0AC: 1 << 12,
+                 0x0B0: 1 << 12, 0x0B4: 1 << 12 | 8 << 4 | 1})
+    want = [max(min(rshr(rshr(a[i] * 527, 9) + b[i], 9), 127), -128)
+            for i in range(8)]
+    check('CNN element-wise add of two s16 maps (s8 out)',
+          list(struct.unpack('<8b', qt.read(AI_OUT, 8))), want)
+    # NUE permute: a planar 3 x 2 x 2 s16 map to each pixel's 3 channels
+    # together, pixels 8 bytes apart
+    pm = [rnd.randint(-30000, 30000) for _ in range(12)]
+    qt.write(AI_IN, struct.pack('<12h', *pm))
+    qt.write(AI_OUT, b'\xee' * 32)
+    for off, val in {0x004: 0x11114, 0x008: 0, 0x00C: AI_IN, 0x02C: AI_OUT,
+                     0x034: 8, 0x040: 2 | 2 << 16, 0x044: 3 << 16,
+                     0x0F0: 1 << 12, 0x1C4: 0, 0x038: 1}.items():
+        qt.writel(NUE + off, val)
+    qt.writel(NUE + 0x000, 2)
+    ai_settle(qt, NUE + 0x03C, 1)
+    got = qt.read(AI_OUT, 32)
+    check('NUE permute: CHW to each pixel\'s channels, 8 bytes a pixel',
+          [list(struct.unpack('<3h', got[8 * p:8 * p + 6])) for p in range(4)],
+          [[pm[c * 4 + p] for c in range(3)] for p in range(4)])
+    check('and the gap after each pixel kept', got[6:8], b'\xee\xee')
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+    # NUE softmax: 2 classes at 3 pixels, Q.12 logits >> 4 to Q.8, Q.15 out,
+    # each pixel's classes together
+    lg = [rnd.randint(-12000, 12000) for _ in range(6)]
+    qt.write(AI_IN, struct.pack('<6h', *lg))
+    for off, val in {0x004: 0x11116, 0x00C: AI_IN, 0x02C: AI_OUT,
+                     0x040: 3 | 1 << 16, 0x044: 2 << 16,
+                     0x0EC: 4 << 4 | 2 << 16 | 1 << 24}.items():
+        qt.writel(NUE + off, val)
+    qt.writel(NUE + 0x000, 2)
+    ai_settle(qt, NUE + 0x03C, 1)
+    want = []
+    for p in range(3):
+        q = [max(min(lg[c * 3 + p] >> 4, 2047), -2048) / 256 for c in range(2)]
+        e = [math.exp(v - max(q)) for v in q]
+        want += [min(round(v / sum(e) * 32768), 32767) for v in e]
+    got = list(struct.unpack('<6h', qt.read(AI_OUT, 12)))
+    check('NUE softmax: Q.15 per pixel, classes together (within 1)',
+          all(abs(g - v) <= 1 for g, v in zip(got, want)), True)
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+
+
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
 
 
@@ -3349,6 +3490,7 @@ def run(args, tmp):
     try:
         test_ai(qt)
         test_ai_compute(qt)
+        test_ai_detect(qt)
     finally:
         qt.close()
 

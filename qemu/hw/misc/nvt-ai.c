@@ -20,7 +20,10 @@
  * out x 256, the classifier's u8 inputs by 12-bit weights x 16.  Output
  * paths 1 / 3 write k1 as s32; path 0 (result less rho) writes
  * (k1 >> rho_fmt) - rho[j], a 12-bit rho a row, through the ReLU and its
- * shift, as 16 or 8 bits.
+ * shift, as 16 or 8 bits.  Permute (mode 4) turns a planar map into each
+ * pixel's channels together, a pixel OFSO bytes apart; softmax (mode 6)
+ * takes Q.8 logits to Q.15 probabilities over each pixel's channels, and
+ * writes them the same way.
  *
  * NUE2, preprocessing (nue2_reg.h, the 528 layout NA51089 uses): YUV to
  * RGB, bilinear scaling corners to corners (the step kdrv programs is
@@ -30,14 +33,18 @@
  * CNN (cnn_reg.h): a layer, or a stripe of one, a job.  The convolution
  * takes 12-bit weights, an LSB-first stream ordered [set][channel][ky][kx],
  * with zero padding of half the kernel on the sides the job pads.  Then
- * come a scale-shift, BN from an 8-byte record a channel -- alpha [23:0],
- * mean [35:24], beta [47:36] -- another scale-shift, a clamp to 16 bits
- * and the activation.  out0 takes act0 through its scale-shift and drops
- * the 8.8 datapath's fraction bits; out1 takes act1 through its
- * scale-shift, the pooling (local or global) and the pooling's shifts.
- * The weight and BN layouts and the 8.8 datapath are not in the SDK: they
- * were fitted to its ImageNet classifier, which then names its test
- * picture.
+ * come a scale-shift; without BN the bias (12 bits, << CONV_SHIFT_B), with
+ * it BN from an 8-byte record a channel -- alpha [23:0], mean [35:24],
+ * beta [47:36]; the element-wise add or max of a second map; another
+ * scale-shift, a clamp to 16 bits and the activation.  out0 takes act0
+ * through its scale-shift and, if 8-bit, drops the 8.8 datapath's fraction
+ * bits; out1 takes act1 through its scale-shift, the pooling (local or
+ * global) and the pooling's shifts.  Deconvolution spreads a map out with
+ * holes (its convolution is jobs of its own), scale-up repeats pixels.
+ * Depthwise layers are a job a channel.  The layouts, the 8.8 datapath and
+ * where the bias goes are not in the SDK: they were fitted to the SDK's
+ * ImageNet classifier and the AI turnkey's detectors, which then name
+ * and find what their pictures hold.
  *
  * Nothing in the SDK fixes the rounding (half up here), NUE2's colour
  * matrix (full-range BT.601, chroma replicated) or its output channel
@@ -47,6 +54,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
@@ -168,6 +176,169 @@ static int16_t w12(const uint8_t *p, size_t i)
     return w12_at(p, i * 12);
 }
 
+#define NUE_MODE_PERMUTE    4
+#define NUE_MODE_SOFTMAX    6
+#define NUE_OFSO            0x034
+#define NUE_SIZE1           0x044
+#define NUE_SOFTMAX         0x0EC
+#define NUE_IN_SS           0x0F0
+#define NUE_PERMUTE         0x1C4
+#define NUE_MAX_MAP         (4 * MiB)
+
+/* the input scale-shift (0x0F0): [27:12] scale (0: none), [8:4] shift */
+static int64_t nue_in_ss(const uint32_t *regs, int64_t v)
+{
+    uint32_t r = R(NUE_IN_SS);
+    unsigned s = extract32(r, 4, 5);
+
+    if (!extract32(r, 12, 16)) {
+        return v;
+    }
+    v *= extract32(r, 12, 16);
+    return r & 1 ? v * ((int64_t)1 << s) : v >> s;
+}
+
+static int64_t nue_sat(int64_t v, bool sign, bool wide)
+{
+    int64_t lo = sign ? (wide ? INT16_MIN : INT8_MIN) : 0;
+    int64_t hi = sign ? (wide ? INT16_MAX : INT8_MAX) : (wide ? 65535 : 255);
+
+    return MIN(MAX(v, lo), hi);
+}
+
+static void nue_put(uint8_t *p, int64_t v, bool wide)
+{
+    if (wide) {
+        stw_le_p(p, v);
+    } else {
+        *p = v;
+    }
+}
+
+/*
+ * A planar C x H x W map, read whole: W [13:0] and H [28:16] at 0x040,
+ * C [27:16] at 0x044, the elements' type from MODE0 bits 4 / 12.
+ */
+static int64_t *nue_read_map(const uint32_t *regs, unsigned *w, unsigned *h,
+                             unsigned *c)
+{
+    uint32_t mode0 = R(NUE_MODE0);
+    bool sign = mode0 & (1u << 4), wide = mode0 & (1u << 12);
+    unsigned es = wide ? 2 : 1;
+    size_t i, n;
+    g_autofree uint8_t *buf = NULL;
+    int64_t *v;
+
+    *w = extract32(R(NUE_SIZE0), 0, 14);
+    *h = extract32(R(NUE_SIZE0), 16, 13);
+    *c = extract32(R(NUE_SIZE1), 16, 12);
+    n = (size_t)*w * *h * *c;
+    if (!n || n > NUE_MAX_MAP) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-ai: NUE map %ux%ux%u\n", *w, *h,
+                      *c);
+        return NULL;
+    }
+    buf = g_malloc(n * es);
+    if (!rd(R(NUE_IN_ADDR), buf, n * es)) {
+        return NULL;
+    }
+    v = g_new(int64_t, n);
+    for (i = 0; i < n; i++) {
+        v[i] = nue_in_ss(regs, wide ? (sign ? (int16_t)lduw_le_p(buf + 2 * i)
+                                            : lduw_le_p(buf + 2 * i))
+                                    : (sign ? (int8_t)buf[i] : buf[i]));
+    }
+    return v;
+}
+
+/*
+ * Permute, channel first (MODE1 bit 3 clear): planar C x H x W in, each
+ * pixel's C elements together out, pixels OFSO (0x034) bytes apart (the
+ * converter stripes wide maps by channels), through the shift at 0x1C4.
+ */
+static void nue_permute(const uint32_t *regs, NvtAiWrites *wl)
+{
+    uint32_t mode0 = R(NUE_MODE0), ps = R(NUE_PERMUTE);
+    bool sign = mode0 & (1u << 8), wide = mode0 & (1u << 16);
+    unsigned es = wide ? 2 : 1, w, h, c, x, k;
+    unsigned sh = extract32(ps, 4, 3);
+    g_autofree int64_t *v = NULL;
+    g_autofree uint8_t *px = NULL;
+    uint32_t ofso;
+
+    if (R(NUE_MODE1) & (1u << 3)) {
+        qemu_log_mask(LOG_UNIMP, "nvt-ai: NUE permute, height first\n");
+        return;
+    }
+    v = nue_read_map(regs, &w, &h, &c);
+    if (!v) {
+        return;
+    }
+    ofso = extract32(R(NUE_OFSO), 0, 20);
+    ofso = ofso ? ofso : c * es;
+    px = g_malloc((size_t)c * es);
+    for (x = 0; x < w * h; x++) {
+        for (k = 0; k < c; k++) {
+            int64_t e = v[(size_t)k * w * h + x];
+
+            e = ps & 1 ? e * ((int64_t)1 << sh) : e >> sh;
+            nue_put(px + k * es, nue_sat(e, sign, wide), wide);
+        }
+        wr(wl, R(NUE_OUT_ADDR) + (hwaddr)x * ofso, px, (size_t)c * es);
+    }
+}
+
+/*
+ * Softmax over each pixel's channels, in groups of OBJECT_NUM (0x0EC
+ * [23:16]): the logits brought to Q.8 by the input shift ([7:4], bit 0
+ * left), at most 12 bits; the probabilities in Q.15 through the output
+ * shift ([15:12], bit 8 left); written each pixel's channels together.
+ */
+static void nue_softmax(const uint32_t *regs, NvtAiWrites *wl)
+{
+    uint32_t mode0 = R(NUE_MODE0), sf = R(NUE_SOFTMAX);
+    bool sign = mode0 & (1u << 8), wide = mode0 & (1u << 16);
+    unsigned es = wide ? 2 : 1, w, h, c, x, k, g, grp;
+    unsigned ish = extract32(sf, 4, 4), osh = extract32(sf, 12, 4);
+    g_autofree int64_t *v = NULL;
+    g_autofree uint8_t *out = NULL;
+    g_autofree double *e = NULL;
+
+    v = nue_read_map(regs, &w, &h, &c);
+    if (!v) {
+        return;
+    }
+    grp = extract32(sf, 16, 8);
+    grp = grp && grp <= c ? grp : c;
+    out = g_malloc0((size_t)w * h * c * es);
+    e = g_new(double, grp);
+    for (x = 0; x < w * h; x++) {
+        for (g = 0; g + grp <= c; g += grp) {
+            double sum = 0, top = -1e300;
+
+            for (k = 0; k < grp; k++) {
+                int64_t l = v[(size_t)(g + k) * w * h + x];
+
+                l = sf & 1 ? l * ((int64_t)1 << ish) : l >> ish;
+                e[k] = MIN(MAX(l, -2048), 2047) / 256.0;
+                top = MAX(top, e[k]);
+            }
+            for (k = 0; k < grp; k++) {
+                e[k] = exp(e[k] - top);
+                sum += e[k];
+            }
+            for (k = 0; k < grp; k++) {
+                int64_t o = llround(e[k] / sum * 32768.0);
+
+                o = sf & (1u << 8) ? o * ((int64_t)1 << osh) : o >> osh;
+                nue_put(out + ((size_t)x * c + g + k) * es,
+                        nue_sat(o, sign, wide), wide);
+            }
+        }
+    }
+    wr(wl, R(NUE_OUT_ADDR), out, (size_t)w * h * c * es);
+}
+
 void nvt_ai_nue_run(const uint32_t *regs, NvtAiWrites *wl)
 {
     uint32_t mode0 = R(NUE_MODE0), mode1 = R(NUE_MODE1);
@@ -189,6 +360,13 @@ void nvt_ai_nue_run(const uint32_t *regs, NvtAiWrites *wl)
     g_autofree int64_t *xs = NULL;
     uint32_t o, j, k;
 
+    if ((mode0 & 7) == NUE_MODE_PERMUTE) {
+        nue_permute(regs, wl);
+        return;
+    } else if ((mode0 & 7) == NUE_MODE_SOFTMAX) {
+        nue_softmax(regs, wl);
+        return;
+    }
     /* path 0: the result less rho (result mode 1); 1 / 3: the kernel's */
     if ((mode0 & 7) || (mode1 & 3) || path == 2 ||
         (!path && extract32(mode1, 4, 2) != 1) ||
@@ -440,8 +618,11 @@ void nvt_ai_nue2_run(const uint32_t *regs, NvtAiWrites *wl)
 #define CNN_IN_ADDR         0x010
 #define CNN_IN_LOFS         0x020
 #define CNN_IN_COFS         0x024
+#define CNN_ELT_LOFS        0x028
+#define CNN_ELT_COFS        0x02C
 #define CNN_W_ADDR          0x030
 #define CNN_BN_ADDR         0x038
+#define CNN_ELT_ADDR        0x03C
 #define CNN_OUT0_ADDR       0x044
 #define CNN_OUT1_ADDR       0x048
 #define CNN_OUT0_LOFS       0x04C
@@ -454,22 +635,29 @@ void nvt_ai_nue2_run(const uint32_t *regs, NvtAiWrites *wl)
 #define CNN_CONV0           0x068
 #define CNN_CONV1           0x06C
 #define CNN_BN              0x078
+#define CNN_ELT0            0x084
+#define CNN_ELT1            0x088
 #define CNN_ACT0            0x090
 #define CNN_ACT1            0x094
 #define CNN_POOL0           0x098
 #define CNN_POOL1           0x09C
+#define CNN_DECONV          0x0A0
+#define CNN_SCALEUP         0x0A4
+#define CNN_SS_ELT_IN       0x0A8
 #define CNN_SS_CONV         0x0AC
 #define CNN_SS_BN           0x0B0
 #define CNN_SS_OUT0         0x0B4
 #define CNN_SS_ACT1         0x0B8
 #define CNN_SS_POOL         0x0BC
 
+#define CNN_M_ELT_MAX       (2u << 2)
 #define CNN_M_BN            (1u << 8)
 #define CNN_M_ACT           (1u << 9)
 #define CNN_M_POOL          (1u << 10)
+#define CNN_M_ELT           (1u << 11)
 #define CNN_M_CONV          (1u << 12)
-/* deconv / scale-up, eltwise, tanh / LUT, pre-act, FCD */
-#define CNN_M_UNSUPPORTED   (3u | (1u << 4) | (1u << 11) | (1u << 13) | \
+/* eltwise multiply, tanh / LUT, pre-act, FCD */
+#define CNN_M_UNSUPPORTED   ((1u << 2) | (1u << 4) | (1u << 13) | \
                              (0x1Fu << 16))
 
 #define CNN_IO_SIGNED       (1u << 4)
@@ -609,7 +797,7 @@ static bool cnn_conv(const uint32_t *regs, const CnnMap *in, CnnMap *out)
     g_autofree int32_t *xp = NULL;
 
     if (sel >= ARRAY_SIZE(cnn_ker) || st > 4 || !sets ||
-        extract32(conv0, 20, 3) || extract32(pads, 8, 5)) {
+        extract32(conv0, 20, 3)) {
         qemu_log_mask(LOG_UNIMP, "nvt-ai: CNN conv 0x%x / 0x%x\n", conv0,
                       pads);
         return false;
@@ -822,6 +1010,116 @@ static void cnn_pool(const uint32_t *regs, CnnMap *m)
     }
 }
 
+/*
+ * Without BN, a convolution's bias: 12 bits in a 16-bit slot a set,
+ * << CONV_SHIFT_B.  Where it goes is fitted to the AI turnkey's detectors:
+ * after the convolution's scale-shift (0x0AC) for an 8-bit out0 -- before
+ * it, the person and face detectors find nothing -- and before it for a
+ * 16-bit out0 (the detectors' heads) -- after it, the person / vehicle
+ * detector finds no people.
+ */
+static bool cnn_bias(const uint32_t *regs, CnnMap *m)
+{
+    g_autofree uint16_t *bias = g_new(uint16_t, m->c);
+    unsigned bs = extract32(R(CNN_CONV1), 8, 5), c;
+    size_t i, n = (size_t)m->h * m->w;
+
+    if (!rd(R(CNN_BN_ADDR) & ~3u, bias, (size_t)m->c * 2)) {
+        return false;
+    }
+    for (c = 0; c < m->c; c++) {
+        int64_t b = cnn_shl(sextract32(le16_to_cpu(bias[c]), 0, 12), bs);
+        int64_t *v = m->v + (size_t)c * n;
+
+        for (i = 0; i < n; i++) {
+            v[i] = cnn_clamp(v[i] + b);
+        }
+    }
+    return true;
+}
+
+/*
+ * Deconvolution (MODE 1) spreads the input out, stride - 1 holes between
+ * pixels, with pad rows / columns (counts 0..3) -- the convolution after
+ * it is a job of its own; scale-up (MODE 2) repeats each pixel rate x rate
+ * times.  Holes and pads take the pad value.
+ */
+static bool cnn_upsample(const uint32_t *regs, const CnnMap *in, CnnMap *out)
+{
+    bool deconv = (R(CNN_MODE) & 3) == 1;
+    uint32_t r = R(deconv ? CNN_DECONV : CNN_SCALEUP);
+    unsigned k = 1u << extract32(r, deconv ? 24 : 0, 2);
+    unsigned sh = deconv ? 0 : 2;
+    unsigned pt = extract32(r, sh, 2), pb = extract32(r, sh + 2, 2);
+    unsigned pl = extract32(r, sh + 4, 2), pr = extract32(r, sh + 6, 2);
+    int64_t padv = deconv ? sextract32(r, 8, 16) : sextract32(r, 12, 16);
+    unsigned c, y, x;
+    size_t i, n;
+
+    out->c = in->c;
+    out->w = (deconv ? (in->w - 1) * k + 1 : in->w * k) + pl + pr;
+    out->h = (deconv ? (in->h - 1) * k + 1 : in->h * k) + pt + pb;
+    n = (size_t)out->c * out->h * out->w;
+    if (n > CNN_MAX_ELEMS) {
+        qemu_log_mask(LOG_UNIMP, "nvt-ai: CNN job too big to run at once\n");
+        return false;
+    }
+    out->v = g_new(int64_t, n);
+    for (i = 0; i < n; i++) {
+        out->v[i] = padv;
+    }
+    for (c = 0; c < out->c; c++) {
+        for (y = 0; y < out->h - pt - pb; y++) {
+            for (x = 0; x < out->w - pl - pr; x++) {
+                int64_t *o = out->v + ((size_t)c * out->h + y + pt) * out->w +
+                             x + pl;
+
+                if (!deconv) {
+                    *o = in->v[((size_t)c * in->h + y / k) * in->w + x / k];
+                } else if (!(y % k) && !(x % k)) {
+                    *o = in->v[((size_t)c * in->h + y / k) * in->w + x / k];
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/*
+ * Element-wise (MODE bit 11), after BN: the second input from SAI7 (its
+ * type ELT0 [1:0]) through its scale-shift 0x0A8, then
+ * ((a * coef0) >> shift0) + ((b * coef1) >> shift1) -- or the larger of
+ * the two (MODE [3:2] = 2) -- >> the out shift.
+ */
+static bool cnn_eltwise(const uint32_t *regs, CnnMap *m)
+{
+    uint32_t e0 = R(CNN_ELT0), e1 = R(CNN_ELT1);
+    bool wide = e0 & 2;
+    unsigned es = wide ? 2 : 1;
+    int64_t c0 = (int16_t)extract32(e1, 0, 16);
+    int64_t c1 = (int16_t)extract32(e1, 16, 16);
+    unsigned s0 = extract32(e0, 4, 5), s1 = extract32(e0, 12, 5);
+    unsigned so = extract32(e0, 20, 5);
+    CnnMap b = { .c = m->c, .h = m->h, .w = m->w };
+    uint32_t lofs = R(CNN_ELT_LOFS) ? R(CNN_ELT_LOFS) : m->w * es;
+    uint32_t cofs = R(CNN_ELT_COFS) ? R(CNN_ELT_COFS) : lofs * m->h;
+    size_t i, n = (size_t)m->c * m->h * m->w;
+    bool ok;
+
+    b.v = g_new(int64_t, n);
+    ok = cnn_read(R(CNN_ELT_ADDR), lofs, cofs, e0 & 1, wide, &b);
+    for (i = 0; ok && i < n; i++) {
+        int64_t va = cnn_clamp(cnn_shr(cnn_clamp(m->v[i]) * c0, s0));
+        int64_t vb = cnn_clamp(cnn_shr(cnn_ss(b.v[i], R(CNN_SS_ELT_IN)) * c1,
+                                       s1));
+
+        m->v[i] = cnn_shr(R(CNN_MODE) & CNN_M_ELT_MAX ? MAX(va, vb) : va + vb,
+                          so);
+    }
+    g_free(b.v);
+    return ok;
+}
+
 void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
 {
     uint32_t mode = R(CNN_MODE), io = R(CNN_IO);
@@ -835,9 +1133,10 @@ void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
     CnnMap v = { 0 }, a1 = { 0 };
     uint32_t lofs, cofs;
     size_t i, n;
+    bool bias;
 
-    if ((mode & CNN_M_UNSUPPORTED) || (io & CNN_IO_UNSUPPORTED) ||
-        extract32(R(CNN_INSIZE1), 12, 7) > 1 ||
+    if ((mode & CNN_M_UNSUPPORTED) || (mode & 3) == 3 ||
+        (io & CNN_IO_UNSUPPORTED) || extract32(R(CNN_INSIZE1), 12, 7) > 1 ||
         (R(CNN_ACT0) & (1u << 16)) || (R(CNN_ACT1) & (1u << 16))) {
         qemu_log_mask(LOG_UNIMP, "nvt-ai: CNN mode 0x%x io 0x%x\n", mode, io);
         return;
@@ -854,6 +1153,21 @@ void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
     if (!cnn_read(R(CNN_IN_ADDR), lofs, cofs, io & CNN_IO_SIGNED, wide, &in)) {
         goto out;
     }
+    if (mode & 3) {
+        /* deconvolution or scale-up alone: out0 through its scale-shift */
+        if (!(io & CNN_IO_OUT0_EN) || !cnn_upsample(regs, &in, &v)) {
+            goto out;
+        }
+        for (i = 0; i < (size_t)v.c * v.h * v.w; i++) {
+            v.v[i] = cnn_ss(v.v[i], R(CNN_SS_OUT0));
+        }
+        cnn_write(wl, R(CNN_OUT0_ADDR), R(CNN_OUT0_LOFS) ? R(CNN_OUT0_LOFS) :
+                  v.w * (io & CNN_IO_OUT0_WIDE ? 2 : 1),
+                  R(CNN_OUT0_COFS) ? R(CNN_OUT0_COFS) :
+                  v.w * v.h * (io & CNN_IO_OUT0_WIDE ? 2 : 1),
+                  io & CNN_IO_OUT0_SIGNED, io & CNN_IO_OUT0_WIDE, &v);
+        goto out;
+    }
     if (mode & CNN_M_CONV) {
         if (wide) {             /* 16-bit features lose 8 bits first */
             for (i = 0; i < (size_t)in.c * in.h * in.w; i++) {
@@ -863,20 +1177,37 @@ void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
         if (!cnn_conv(regs, &in, &v)) {
             goto out;
         }
-        n = (size_t)v.c * v.h * v.w;
-        for (i = 0; i < n; i++) {
-            v.v[i] = cnn_ss(v.v[i], R(CNN_SS_CONV));
-        }
-        if ((mode & CNN_M_BN) && !cnn_bn(regs, &v)) {
-            goto out;
-        }
-        for (i = 0; i < n; i++) {
-            v.v[i] = cnn_ss(v.v[i], R(CNN_SS_BN));
-        }
-    } else {
+    } else if (mode & (CNN_M_BN | CNN_M_ELT)) {
+        /* BN or element-wise without a convolution: the input as it is */
         v = in;
         in.v = NULL;
+    } else {
+        /* pooling or activation alone: no scale-shift before them */
+        v = in;
+        in.v = NULL;
+        goto stages_done;
     }
+    n = (size_t)v.c * v.h * v.w;
+    bias = (mode & CNN_M_CONV) && !(mode & CNN_M_BN);
+    if (bias && (io & CNN_IO_OUT0_WIDE) && !cnn_bias(regs, &v)) {
+        goto out;
+    }
+    for (i = 0; i < n; i++) {
+        v.v[i] = cnn_ss(v.v[i], R(CNN_SS_CONV));
+    }
+    if (bias && !(io & CNN_IO_OUT0_WIDE) && !cnn_bias(regs, &v)) {
+        goto out;
+    }
+    if ((mode & CNN_M_BN) && !cnn_bn(regs, &v)) {
+        goto out;
+    }
+    if ((mode & CNN_M_ELT) && !cnn_eltwise(regs, &v)) {
+        goto out;
+    }
+    for (i = 0; i < n; i++) {
+        v.v[i] = cnn_ss(v.v[i], R(CNN_SS_BN));
+    }
+stages_done:
     n = (size_t)v.c * v.h * v.w;
     if (mode & CNN_M_ACT) {
         for (i = 0; i < n; i++) {
@@ -905,11 +1236,15 @@ void nvt_ai_cnn_run(const uint32_t *regs, NvtAiWrites *wl)
                   io & CNN_IO_OUT1_WIDE, &a1);
     }
     if (io & CNN_IO_OUT0_EN) {
-        /* act0 and its scale, from 8.8 fixed point */
+        /*
+         * act0 and its scale; 8-bit outputs drop the 8.8 datapath's
+         * fraction bits, 16-bit ones keep them
+         */
         for (i = 0; i < n; i++) {
             v.v[i] = cnn_shr(cnn_ss(mode & CNN_M_ACT ?
                                     cnn_act(v.v[i], R(CNN_ACT0)) : v.v[i],
-                                    R(CNN_SS_OUT0)), 8);
+                                    R(CNN_SS_OUT0)),
+                             io & CNN_IO_OUT0_WIDE ? 0 : 8);
         }
         cnn_write(wl, R(CNN_OUT0_ADDR), R(CNN_OUT0_LOFS) ? R(CNN_OUT0_LOFS) :
                   v.w * (io & CNN_IO_OUT0_WIDE ? 2 : 1),
