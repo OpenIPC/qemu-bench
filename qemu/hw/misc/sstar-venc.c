@@ -71,18 +71,22 @@
  * registers (the done's end, the next output buffer), so the next done
  * is reported a little later.
  *
- * Here a job completes "done-us" (by default 10 ms) after it is fired,
- * each on its own deadline.  Built with libavcodec (and its
- * libx264 and libx265 encoders), the model encodes a test pattern of its
- * own (colour bars, a moving box and the frame number in binary) at the
- * job's size and codec, an IDR where the driver asks for an I frame.
- * The frame is encoded when the job is fired, with the virtual clock
- * stopped: libx265 takes tens of milliseconds a frame, and a guest that
- * ran on meanwhile would queue the channel's next frame onto the ring-pool
- * record of the one in flight.  "dump" names a host file prefix that
- * each stream's elementary stream is appended to (PREFIX-ctxN.h264 or
- * .h265).  Without libavcodec, or
- * when the encoder fails, the frame is an access unit delimiter.
+ * Here a job completes "done-us" (by default 30 ms, under a 25 fps
+ * frame) after it is fired, each on its own deadline.  Built with
+ * libavcodec (and its libx264 and libx265 encoders), the model encodes a
+ * test pattern of its own (colour bars, a moving box and the frame number
+ * in binary) at the job's size and codec, an IDR where the driver asks
+ * for an I frame.  Each frame is encoded on a host thread of its own from
+ * the moment the job is fired, while the guest runs.  A frame that is not
+ * ready at its deadline is waited for with the virtual clock held: a
+ * guest that ran on past it would queue the channel's next frame onto
+ * the ring-pool record of the one in flight.  libx265 takes 20-35 ms for
+ * a 2560x1440 frame on its thread pool; encoded with the clock held
+ * throughout, as before, the guest ran at half the wall clock's speed,
+ * too slow for its RTSP and web clients.  "dump" names a host file prefix
+ * that each stream's elementary stream is appended to (PREFIX-ctxN.h264
+ * or .h265).  Without libavcodec, or when the encoder fails, the frame is
+ * an access unit delimiter.
  *
  * "trace" logs every access.
  *
@@ -94,10 +98,12 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "system/cpu-timers.h"
 #include "system/dma.h"
+#include "system/runstate.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
@@ -177,7 +183,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarVencState, SSTAR_VENC)
 #define FW_STATE_HALTED     8
 #define ENC_HALT            (ENC + 0x248)   /* 1: stop the firmware */
 
-/* A fired job's frame, encoded, waiting for its completion. */
+/*
+ * A fired job's frame, encoded on a host thread of its own while the
+ * guest runs, waited for at its completion.
+ */
 typedef struct SstarVencWork {
     int n;                      /* its slot */
     int ctx;
@@ -186,6 +195,11 @@ typedef struct SstarVencWork {
     hwaddr prog;
     uint8_t *out;
     size_t len;
+    struct SstarVencEncoder *enc;   /* NULL: nothing to encode with */
+    QemuThread thread;
+    bool started;               /* the thread is to be joined */
+    bool trace;
+    int64_t open_us;
 } SstarVencWork;
 
 typedef struct SstarVencReport {
@@ -225,6 +239,7 @@ struct SstarVencState {
         AVFrame *pic;
         AVPacket *pkt;
         FILE *dump;
+        SstarVencWork *busy;    /* the frame its thread is encoding */
     } enc[ENCODERS];
     uint64_t uses;
     SstarVencWork *ready[SLOTS];    /* each submitted slot's frame */
@@ -304,8 +319,41 @@ static void venc_queue_report(SstarVencState *s, int n, uint32_t irq)
 }
 
 #ifdef SSTAR_VENC_LIBAVCODEC
+/*
+ * Wait for a frame's thread.  A running guest has its virtual clock held
+ * meanwhile, so the frame is never late in guest time; a stopped one
+ * (a load, a reset) has nothing to hold.
+ */
+static void venc_wait(SstarVencWork *w)
+{
+    int64_t t0;
+    bool hold;
+
+    if (!w || !w->started) {
+        return;
+    }
+    hold = runstate_is_running();
+    if (hold) {
+        cpu_disable_ticks();
+    }
+    t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    qemu_thread_join(&w->thread);
+    if (hold) {
+        cpu_enable_ticks();
+    }
+    if (w->trace) {
+        qemu_log("sstar-venc: ctx %d waited %" PRId64 " us\n", w->ctx,
+                 qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
+    }
+    w->started = false;
+    if (w->enc && w->enc->busy == w) {
+        w->enc->busy = NULL;
+    }
+}
+
 static void venc_encoder_close(struct SstarVencEncoder *e)
 {
+    venc_wait(e->busy);
     avcodec_free_context(&e->c);
     av_frame_free(&e->pic);
     av_packet_free(&e->pkt);
@@ -370,6 +418,7 @@ static struct SstarVencEncoder *venc_encoder(SstarVencState *s, int ctx,
     e->c->framerate = (AVRational){ 25, 1 };
     e->c->gop_size = 1000;      /* the driver asks for the I frames */
     e->c->max_b_frames = 0;
+    e->c->thread_count = 0;     /* x264's sliced threads; x265 pools anyway */
     av_opt_set(e->c->priv_data, "preset", "ultrafast", 0);
     av_opt_set(e->c->priv_data, "tune", "zerolatency", 0);
     av_opt_set(e->c->priv_data, "crf", "30", 0);
@@ -452,23 +501,19 @@ static void venc_pattern(AVFrame *f, int64_t frame)
     }
 }
 
-/* Encode a job's frame into w->out. */
-static void venc_encode(SstarVencState *s, SstarVencWork *w)
+/* The frame's thread: encode it into w->out. */
+static void *venc_encode_thread(void *opaque)
 {
-    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), t1;
-    struct SstarVencEncoder *e;
+    SstarVencWork *w = opaque;
+    struct SstarVencEncoder *e = w->enc;
+    int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     GByteArray *au;
 
-    e = venc_encoder(s, w->ctx, w->h265, w->width, w->height);
-    t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (!e) {
-        return;
-    }
     venc_pattern(e->pic, e->frames);
     e->pic->pts = e->frames++;
     e->pic->pict_type = w->intra ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     if (avcodec_send_frame(e->c, e->pic) < 0) {
-        return;
+        return NULL;
     }
     au = g_byte_array_new();
     while (avcodec_receive_packet(e->c, e->pkt) == 0) {
@@ -483,13 +528,37 @@ static void venc_encode(SstarVencState *s, SstarVencWork *w)
     }
     w->len = au->len;
     w->out = g_byte_array_free(au, false);
-    if (s->trace) {
+    if (w->trace) {
         qemu_log("sstar-venc: ctx %d %s %dx%d%s: %zu bytes, open %" PRId64
                  " us, encode %" PRId64 " us\n", w->ctx,
                  w->h265 ? "H.265" : "H.264", w->width, w->height,
-                 w->intra ? " I" : "", w->len, t1 - t0,
+                 w->intra ? " I" : "", w->len, w->open_us,
                  qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t1);
     }
+    return NULL;
+}
+
+/*
+ * Start a job's frame: its stream's encoder, once that has finished the
+ * stream's previous frame, then a thread for the encode itself.
+ */
+static void venc_encode(SstarVencState *s, SstarVencWork *w)
+{
+    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    struct SstarVencEncoder *e;
+
+    e = venc_encoder(s, w->ctx, w->h265, w->width, w->height);
+    w->open_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
+    if (!e) {
+        return;
+    }
+    venc_wait(e->busy);
+    w->enc = e;
+    w->trace = s->trace;
+    e->busy = w;
+    qemu_thread_create(&w->thread, "sstar-venc", venc_encode_thread, w,
+                       QEMU_THREAD_JOINABLE);
+    w->started = true;
 }
 
 #endif
@@ -623,11 +692,8 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
  * ring-pool record of one still in flight (the driver keeps one per
  * channel), whose tail reservation then fails ([550] in the ISR).
  */
-/*
- * Encode slot n's job, with the virtual clock held unless the VM is
- * already stopped (a migration's load).
- */
-static void venc_submit(SstarVencState *s, int n, uint32_t w0, bool hold)
+/* Start encoding slot n's job. */
+static void venc_submit(SstarVencState *s, int n, uint32_t w0)
 {
     hwaddr prog = venc_dram(s->regs[(CTRL + n * SLOT_STRIDE + 8) >> 2]);
     uint32_t size = venc_prog_reg(prog, PROG_SIZE);
@@ -640,17 +706,12 @@ static void venc_submit(SstarVencState *s, int n, uint32_t w0, bool hold)
     w->width = size & 0xFFFF;
     w->height = size >> 16;
     w->prog = prog;
-    if (hold) {
-        cpu_disable_ticks();
-    }
-    venc_encode(s, w);
-    if (hold) {
-        cpu_enable_ticks();
-    }
     if (s->ready[n]) {
+        venc_wait(s->ready[n]);
         g_free(s->ready[n]->out);
         g_free(s->ready[n]);
     }
+    venc_encode(s, w);
     s->ready[n] = w;
 }
 
@@ -660,6 +721,7 @@ static void venc_drop_ready(SstarVencState *s)
 
     for (n = 0; n < SLOTS; n++) {
         if (s->ready[n]) {
+            venc_wait(s->ready[n]);
             g_free(s->ready[n]->out);
             g_free(s->ready[n]);
             s->ready[n] = NULL;
@@ -711,6 +773,7 @@ static void sstar_venc_job(void *opaque)
         if (s->ready[n]) {
             SstarVencWork *w = s->ready[n];
 
+            venc_wait(w);
             s->ready[n] = NULL;
             venc_finish(s, n, w->prog, w->out, w->len);
             g_free(w->out);
@@ -803,7 +866,7 @@ static void sstar_venc_reg_write(SstarVencState *s, hwaddr off, uint32_t v)
     if (off < CTRL + SLOTS * SLOT_STRIDE && off % SLOT_STRIDE == 0 &&
         (v & SLOT_BUSY) && s->running) {
 #ifdef SSTAR_VENC_LIBAVCODEC
-        venc_submit(s, off / SLOT_STRIDE, v, true);
+        venc_submit(s, off / SLOT_STRIDE, v);
 #endif
         s->pending |= 1u << (off / SLOT_STRIDE);
         s->due[off / SLOT_STRIDE] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -904,7 +967,7 @@ static void sstar_venc_init(Object *obj)
 }
 
 static const Property sstar_venc_props[] = {
-    DEFINE_PROP_UINT32("done-us", SstarVencState, done_us, 10000),
+    DEFINE_PROP_UINT32("done-us", SstarVencState, done_us, 30000),
     DEFINE_PROP_STRING("dump", SstarVencState, dump),
     DEFINE_PROP_BOOL("trace", SstarVencState, trace, false),
 };
@@ -933,7 +996,7 @@ static int sstar_venc_post_load(void *opaque, int version_id)
     venc_drop_ready(s);
     for (n = 0; n < SLOTS; n++) {
         if (s->pending & (1u << n)) {
-            venc_submit(s, n, s->regs[(CTRL + n * SLOT_STRIDE) >> 2], false);
+            venc_submit(s, n, s->regs[(CTRL + n * SLOT_STRIDE) >> 2]);
         }
     }
 #endif
