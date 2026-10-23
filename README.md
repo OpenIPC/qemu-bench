@@ -267,10 +267,11 @@ test tone (or the host's input), and playback goes to `-audiodev` /
 `-audio`, at the rate the clock tree sets. The display engine (IDE) shows the
 panel's picture on QEMU's console, with the display modules from
 OpenIPC's toolchain loaded. The EVB's serial-RGB LCD and the MIPI DSI
-panels both work. Of the AI engines, the NUE computes fully connected
-layers and NUE2 the preprocessing (YUV to RGB, scaling, mean
-subtraction) for the SDK's `ai_op`; the CNN completes its lists without
-computing.
+panels both work. The AI engines run neural networks: the SDK's
+ImageNet classifier (BN-Inception, built for this chip in SDK v1.01.007)
+names its test picture under QEMU, through NUE2's preprocessing, the CNN's
+convolution / batch norm / ReLU / pooling layers and the NUE's fully
+connected one.
 The machines give Linux 128 MB and the HDAL pool 96 MB, more than the
 packages hold. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
@@ -477,7 +478,7 @@ qemu/
 ├── hw/misc/nvt-pixel.c          # their pixels: test pattern, RAW packing, Bayer to YUV, JPEG encoder
 ├── hw/misc/nvt-gfx.c            # 2D graphics ops (copy, arithmetic, fill, pack, ARGB blend, flips), ISE scaling
 ├── hw/misc/nvt-h26x.c           # H.26x pictures: x264 / x265 slices under the driver's headers, else filler
-├── hw/misc/nvt-ai.c             # AI engines: NUE fully connected layers, NUE2 preprocessing
+├── hw/misc/nvt-ai.c             # AI engines: CNN layers, NUE fully connected, NUE2 preprocessing
 ├── hw/misc/nvt-pwm.c            # PWM: enable/disable, cycle-count runs, stop interrupts
 ├── hw/timer/nvt-timer.c         # Novatek timers: one-shot / free run, timer 0 at 1 MHz
 ├── hw/rtc/nvt-rtc.c             # RTC (CSET handshake) + power button, reboot

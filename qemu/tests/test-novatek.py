@@ -1858,6 +1858,16 @@ NUE, NUE2, CNN = 0xF0C60000, 0xF0D50000, 0xF0CB0000
 AI_IN, AI_W, AI_OUT, AI_LL = 0x01800000, 0x01810000, 0x01820000, 0x01830000
 
 
+def ai_settle(qt, addr, mask, tries=500):
+    """Step the clock until an AI engine's status has a bit of mask: the
+    engines compute on a worker thread, done when the work comes back."""
+    for _ in range(tries):
+        qt.step(1000 * 1000)
+        if qt.readl(addr) & mask:
+            return
+        time.sleep(0.005)
+
+
 def test_ai(qt):
     print('AI engines (NUE / NUE2 / CNN)')
     gic_enable(qt, 14)
@@ -1871,7 +1881,7 @@ def test_ai(qt):
     qt.write(AI_IN, bytes(v & 0xFF for v in x))
     qt.write(AI_W, bytes(v & 0xFF for r in w for v in r))
     qt.writel(NUE + 0x004, 0x110)                   # SVM, signed s8
-    qt.writel(NUE + 0x008, 0x350)                   # dot, path 3 (s32)
+    qt.writel(NUE + 0x008, 0x200350)                # dot, path 3 (s32), 8-bit w
     qt.writel(NUE + 0x00C, AI_IN)
     qt.writel(NUE + 0x014, AI_W)
     qt.writel(NUE + 0x02C, AI_OUT)
@@ -1882,7 +1892,7 @@ def test_ai(qt):
     qt.writel(NUE + 0x050, 5 << 24 | 7)             # each product >> 5, + 7
     qt.writel(NUE + 0x038, 1)
     qt.writel(NUE + 0x000, 2)
-    qt.step(2 * 1000 * 1000)
+    ai_settle(qt, NUE + 0x03C, 1)
     want = [(sum((a * 256 * b) >> 5 for a, b in zip(x, r)) >> 3) + 7
             for r in w]
     check('NUE FC: frame end and SPI 14, START dropped',
@@ -1900,7 +1910,7 @@ def test_ai(qt):
     qt.writel(NUE + 0x024, AI_LL)
     qt.writel(NUE + 0x038, 0x500)
     qt.writel(NUE + 0x000, 1 << 28)
-    qt.step(5 * 1000 * 1000)
+    ai_settle(qt, NUE + 0x03C, 0x100)
     check('NUE list: the fired job runs once, then the list ends',
           (list(struct.unpack('<3i', qt.read(AI_IN, 12))),
            qt.readl(NUE + 0x03C) & 0x500), (want, 0x500))
@@ -1921,7 +1931,7 @@ def test_ai(qt):
     qt.writel(NUE2 + 0x060, 0x101010)
     qt.writel(NUE2 + 0x07C, 1 << 12)                # mean scale 1, shift 0
     qt.writel(NUE2 + 0x000, 2)
-    qt.step(2 * 1000 * 1000)
+    ai_settle(qt, NUE2 + 0x040, 1)
     check('NUE2: grey and white, scaled 4 to 2 columns (corners), less 16',
           [list(qt.read(AI_OUT + 0x100 * c, 2)) for c in range(3)],
           [[112, 239]] * 3)
@@ -1936,12 +1946,153 @@ def test_ai(qt):
     qt.writel(CNN + 0x040, AI_LL)
     qt.writel(CNN + 0x008, 0x500)
     qt.writel(CNN + 0x000, 1 << 28)
-    qt.step(5 * 1000 * 1000)
+    ai_settle(qt, CNN + 0x00C, 0x100)
     check('CNN list: both jobs, job end (bit 10) and list end (bit 8)',
           (qt.readl(CNN + 0x00C) & 0x500, qt.readl(CNN + 0x014)),
           (0x500, 0x5678))
     check('a bit-59 update adds the list base', qt.readl(CNN + 0x010),
           0x10001234)
+
+
+
+def pack12(vals):
+    """12-bit two's-complement values as an LSB-first bit stream."""
+    bits = 0
+    for i, v in enumerate(vals):
+        bits |= (v & 0xFFF) << (12 * i)
+    return bits.to_bytes((12 * len(vals) + 7) // 8 + 1, 'little')
+
+
+def rshr(v, sh):
+    """The engines' right shift, rounding half up."""
+    return (v + (1 << (sh - 1))) >> sh if sh else v
+
+
+def test_ai_compute(qt):
+    print('AI engines: a CNN layer, pooling, NUE FC with rho')
+    rnd = random.Random(98566)
+    # CNN: a 3x3 conv of a 5x4x2 s8 map into 2 sets, all sides padded,
+    # then BN, ReLU and out0 (s8)
+    W, H, C, S = 5, 4, 2, 2
+    x = [[[rnd.randint(-100, 100) for _ in range(W)] for _ in range(H)]
+         for _ in range(C)]
+    w = [[[[rnd.randint(-300, 300) for _ in range(3)] for _ in range(3)]
+          for _ in range(C)] for _ in range(S)]
+    bn = [(600, -20, 30), (400, 15, -40)]              # alpha, mean, beta
+    qt.write(AI_IN, bytes(v & 0xFF for c in x for r in c for v in r))
+    qt.write(AI_W, pack12([v for st in w for c in st for r in c for v in r]))
+    qt.write(AI_W + 0x1000, b''.join(
+        struct.pack('<Q', a | (m & 0xFFF) << 24 | (b & 0xFFF) << 36)
+        for a, m, b in bn))
+    regs = {0x004: 0x1300, 0x010: AI_IN, 0x020: W, 0x024: W * H,
+            0x030: AI_W, 0x038: AI_W + 0x1000, 0x044: AI_OUT,
+            0x04C: W, 0x050: W * H, 0x05C: W | H << 12, 0x060: C,
+            0x064: 0x150, 0x068: 3 | S << 8, 0x06C: 0xF,
+            0x078: 1 | 2 << 8 | 10 << 21,                  # mean <<1, beta <<2
+            0x0AC: 3 << 12 | 4 << 4, 0x0B0: 1 << 12,       # x3 >>4, x1
+            0x0B4: 255 << 12 | 7 << 4, 0x008: 1}
+    for off, val in regs.items():
+        qt.writel(CNN + off, val)
+    qt.writel(CNN + 0x000, 2)
+    ai_settle(qt, CNN + 0x00C, 1)
+    want = []
+    for st in range(S):
+        a, m, b = bn[st]
+        for oy in range(H):
+            for ox in range(W):
+                acc = sum(w[st][c][ky][kx] * x[c][oy + ky - 1][ox + kx - 1]
+                          for c in range(C) for ky in range(3)
+                          for kx in range(3)
+                          if 0 <= oy + ky - 1 < H and 0 <= ox + kx - 1 < W)
+                v = rshr(acc * 3, 4)
+                v = rshr((v - (m << 1)) * a, 10) + (b << 2)
+                v = max(min(v, 32767), 0)                  # 16 bits, ReLU
+                want.append(max(min(rshr(v * 255, 7 + 8), 127), -128))
+    check('CNN 3x3 conv, BN, ReLU: out0 (s8), and frame end',
+          (list(struct.unpack('<%db' % (S * H * W),
+                              qt.read(AI_OUT, S * H * W))),
+           qt.readl(CNN + 0x00C) & 1), (want, 1))
+    qt.writel(CNN + 0x00C, 0xFFFFFFFF)
+    # the same layer with every scale at its largest, shifted left 31:
+    # the stages saturate (positive out, ReLU's zeros stay)
+    for off in (0x0AC, 0x0B0, 0x0B4):
+        qt.writel(CNN + off, 0xFFFF << 12 | 31 << 4 | 1)
+    qt.writel(CNN + 0x000, 2)
+    ai_settle(qt, CNN + 0x00C, 1)
+    got = list(struct.unpack('<%db' % (S * H * W), qt.read(AI_OUT, S * H * W)))
+    check('CNN scales at their largest saturate, not wrap',
+          sorted(set(got)) in ([0, 127], [127], [0]), True)
+    qt.writel(CNN + 0x00C, 0xFFFFFFFF)
+    # pooling alone: 3x3 max, stride 2, ceil, of a 5x5 u8 map (out1)
+    px = [rnd.randint(0, 255) for _ in range(25)]
+    qt.write(AI_IN, bytes(px))
+    for off, val in {0x004: 0x400, 0x020: 5, 0x024: 25, 0x048: AI_OUT,
+                     0x054: 2, 0x058: 4, 0x05C: 5 | 5 << 12, 0x060: 1,
+                     0x064: 0x2000, 0x098: 0x110, 0x09C: 0,
+                     0x0B8: 1 << 12, 0x0BC: 1 << 12}.items():
+        qt.writel(CNN + off, val)
+    qt.writel(CNN + 0x000, 2)
+    ai_settle(qt, CNN + 0x00C, 1)
+    want = [max(px[(y + dy) * 5 + x + dx] for dy in range(3)
+                for dx in range(3)) for y in (0, 2) for x in (0, 2)]
+    check('CNN 3x3/2 max pooling (out1, u8)', list(qt.read(AI_OUT, 4)), want)
+    qt.writel(CNN + 0x00C, 0xFFFFFFFF)
+    # global average of three 4x4 maps: sum * 64 >> 10
+    px = [rnd.randint(0, 255) for _ in range(48)]
+    qt.write(AI_IN, bytes(px))
+    for off, val in {0x004: 0x420, 0x05C: 4 | 4 << 12, 0x060: 3,
+                     0x020: 4, 0x024: 16, 0x054: 1, 0x058: 1,
+                     0x098: 1, 0x09C: 64 << 8}.items():
+        qt.writel(CNN + off, val)
+    qt.writel(CNN + 0x000, 2)
+    ai_settle(qt, CNN + 0x00C, 1)
+    check('CNN global average pooling',
+          list(qt.read(AI_OUT, 3)),
+          [rshr(sum(px[16 * c:16 * c + 16]) * 64, 10) for c in range(3)])
+    qt.writel(CNN + 0x00C, 0xFFFFFFFF)
+    # NUE, output path 0: u8 inputs (x 16) by 12-bit weights, per-product
+    # >> 8, x 3 >> 2, >> rho_fmt 6, less a 12-bit rho per row, s16 out
+    xv = [rnd.randint(0, 255) for _ in range(4)]
+    wv = [[rnd.randint(-2048, 2047) for _ in range(4)] for _ in range(3)]
+    rho = [rnd.randint(-500, 500) for _ in range(3)]
+    qt.write(AI_IN, bytes(xv))
+    qt.write(AI_W, pack12([v for r in wv for v in r]))
+    qt.write(AI_W + 0x100, pack12(rho))
+    for off, val in {0x004: 0x00010100, 0x008: 0x50, 0x00C: AI_IN,
+                     0x014: AI_W, 0x01C: AI_W + 0x100, 0x02C: AI_OUT,
+                     0x040: 4 | 3 << 16, 0x048: 1, 0x04C: 3 | 2 << 16,
+                     0x050: 8 << 24, 0x054: 0, 0x058: 3 << 16,
+                     0x038: 1}.items():
+        qt.writel(NUE + off, val)
+    qt.writel(NUE + 0x000, 2)
+    ai_settle(qt, NUE + 0x03C, 1)
+    want = [max(min(((sum((16 * xv[k] * wv[j][k]) >> 8 for k in range(4))
+                      * 3 >> 2) >> 6) - rho[j], 32767), -32768)
+            for j in range(3)]
+    check('NUE FC path 0: 12-bit weights, rho, s16 out',
+          list(struct.unpack('<3h', qt.read(AI_OUT, 6))), want)
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+    # rows of an odd length: the next row starts mid-byte
+    wv = [[rnd.randint(-2048, 2047) for _ in range(3)] for _ in range(3)]
+    qt.write(AI_W, pack12([v for r in wv for v in r]))
+    qt.writel(NUE + 0x040, 3 | 3 << 16)
+    qt.writel(NUE + 0x000, 2)
+    ai_settle(qt, NUE + 0x03C, 1)
+    want = [max(min(((sum((16 * xv[k] * wv[j][k]) >> 8 for k in range(3))
+                      * 3 >> 2) >> 6) - rho[j], 32767), -32768)
+            for j in range(3)]
+    check('NUE FC: 12-bit rows of 3, the second from mid-byte',
+          list(struct.unpack('<3h', qt.read(AI_OUT, 6))), want)
+    qt.writel(NUE + 0x03C, 0xFFFFFFFF)
+    # NUE2: mean scale 0 is no scale-shift, not a scale of nought
+    qt.write(AI_IN, bytes([128, 128, 255, 255, 128, 128, 255, 255]))
+    qt.write(AI_IN + 0x100, bytes([128, 128, 128, 128]))
+    qt.writel(NUE2 + 0x07C, 0)
+    qt.writel(NUE2 + 0x000, 2)
+    ai_settle(qt, NUE2 + 0x040, 1)
+    check('NUE2: mean scale 0 leaves the difference as it is',
+          [list(qt.read(AI_OUT + 0x100 * c, 2)) for c in range(3)],
+          [[112, 239]] * 3)
 
 
 PX_RAW, PX_YUV = 0x01200000, 0x01400000
@@ -3197,6 +3348,7 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566')
     try:
         test_ai(qt)
+        test_ai_compute(qt)
     finally:
         qt.close()
 
