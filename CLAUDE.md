@@ -4,10 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Out-of-tree QEMU machine + device models for the HiSilicon (and Goke-rebranded)
-surveillance/STB SoC lineup, targeting **QEMU v10.2.0**. It boots unmodified
-OpenIPC and vendor-SDK firmware to a Linux shell. There is no code here except
-QEMU C sources, boot/test shell scripts, and docs.
+**qemu-bench** (formerly `qemu-hisilicon`): out-of-tree QEMU machine + device
+models for IP-camera, DVR/NVR and STB SoCs, targeting **QEMU v10.2.0**. It
+boots unmodified OpenIPC and vendor-SDK firmware to a Linux shell. The core is
+the table-driven HiSilicon lineup (and its Goke rebrands); next to it sit
+Xiongmai, Goke GK710x, Anyka, SigmaStar and Novatek families, each with its
+own machine file. There is no code here except QEMU C sources, boot/test
+scripts, and docs.
 
 ## Build model — `qemu/` is source of truth, `qemu-src/` is a copy
 
@@ -76,6 +79,8 @@ bash qemu/tests/test-hisi-wdt.sh        # SP805 watchdog
 bash qemu/tests/test-hisi-rtc.sh
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
+python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
+                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py
 ```
 
 Full-boot tests need firmware, in one of two shapes.
@@ -158,18 +163,27 @@ Boot-test gotchas that will otherwise waste a session:
 
 ### Table-driven machines
 
-Everything lives in `qemu/hw/arm/hisilicon.c` (~5.8k lines) and
-`qemu/include/hw/arm/hisilicon.h`. Each SoC is one `static const HisiSoCConfig
-<soc>_soc = {...}` — bases, IRQs, peripheral counts, boot quirks — and one
-`DEFINE_HISI_MACHINE("name", tag, name_soc)` line at the bottom of the file (45
-machines today). A single `hisilicon_common_init()` instantiates every device
-from that struct; there is no per-machine init function to write.
+Every HiSilicon (and Goke-rebrand) machine lives in `qemu/hw/arm/hisilicon.c`
+(~6.4k lines) and `qemu/include/hw/arm/hisilicon.h`. Each SoC is one
+`static const HisiSoCConfig <soc>_soc = {...}` — bases, IRQs, peripheral
+counts, boot quirks — and one `DEFINE_HISI_MACHINE("name", tag, name_soc)` line
+at the bottom of the file (48 of the 69 machines today). A single
+`hisilicon_common_init()` instantiates every device from that struct; there is
+no per-machine init function to write.
 
 Family commonalities are C macros (`HISI_V4_COMMON_PERIPH`, …) expanded at the
 top of a config struct, with per-die deltas written **after** the macro —
 designated initialisers make last-writer-wins. Caveat: array members such as
 `.regbanks` / `.uart_bases` cannot be partially overridden; re-list the whole
 array when a die differs.
+
+HiSilicon memory-map generations (the axis most differences fall on):
+V1/V2 `0x20xxxxxx` with a PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`,
+and the DVR/NVR + STB outliers. `hardware_reference.md` (CV300/EV300, from SDK DTS) and
+`qemu/HISILICON-QEMU-ARCHITECTURE.md` (whole-family map, SDK/U-Boot/kernel
+versions, Goke↔HiSilicon equivalences) are the reference tables — new configs
+should be justified against a vendor DTS, and the commit message should say
+which one.
 
 Non-HiSilicon families have their own table and init instead of
 `HisiSoCConfig` slots: Xiongmai XM510/XM530/XM550 (`hw/arm/xiongmai.c`,
@@ -353,14 +367,6 @@ windows, and its full ones into the single-channel view. An XM530 camera
 on a `-netdev socket,mcast=` LAN is the video source (`docs/novatek.md`,
 "Camera video").
 
-Memory-map generations (the axis most differences fall on): V1/V2 `0x20xxxxxx`
-+ PL190 VIC, V3/V3A/V4 `0x12xxxxxx`, V5 `0x11xxxxxx`, and the DVR/NVR + STB
-outliers. `hardware_reference.md` (CV300/EV300, from SDK DTS) and
-`qemu/HISILICON-QEMU-ARCHITECTURE.md` (whole-family map, SDK/U-Boot/kernel
-versions, Goke↔HiSilicon equivalences) are the reference tables — new configs
-should be justified against a vendor DTS, and the commit message should say
-which one.
-
 ### Boot paths
 
 `hisilicon_common_init()` dispatches on four mutually exclusive modes, tested
@@ -415,7 +421,8 @@ in this order:
 
 ## Adding a SoC or a device
 
-New machine: add the `HisiSoCConfig` + one `DEFINE_HISI_MACHINE` line, rebuild,
+New machine: add the `HisiSoCConfig` + one `DEFINE_HISI_MACHINE` line (or the
+family's own config + `DEFINE_XM_/GK_/AK_/SS_/NVT_MACHINE` line), rebuild,
 smoke-test, then add it to the README machine table and to the CI matrix if it
 can boot real firmware. `-machine help` on the built binary is the
 authoritative list — keep the README tables *and* their totals (the "N total"
@@ -448,20 +455,24 @@ these files are meant to read as in-tree QEMU.
 ## CI
 
 `.github/workflows/ci.yml` gates every PR: `build` (also asserts ≥21 `hi35*`/
-`gk7*` arm machines register and that the aarch64 V5 machines exist) →
+`gk7*` arm machines register, that the aarch64 V5 machines and the Xiongmai,
+GK710x and SigmaStar machines exist, and runs the `qemu/tests/*.py`
+register tests of the non-HiSilicon families) →
 `ive-test` (19 IVE ops, register-level, initramfs PID 1) → `sofia-isp`
 (hi3516ev200 + sc2315e) → `maskrom-av300` (builds `re.elf` from the
 `openhisilicon` repo) → a `boot` matrix that downloads OpenIPC releases and
-boots ~11 SoCs to a login prompt, plus dedicated `boot-hi3516cv610` and
+boots ~14 SoCs (HiSilicon, Goke, Xiongmai) to a login prompt, plus dedicated
+`boot-novatek` (nt98562/nt98566), `boot-hi3516cv610` and
 `boot-hi3516ev300-nand` jobs. Boot-matrix rows optionally add the U-Boot ping,
 Linux ping+curl, and SPI-NOR erase/program steps. Everything runs under TCG on
 GitHub runners, so a boot iteration is minutes — smoke-test locally first.
 
 ## Conventions
 
-Commit subjects are `<area>: <imperative summary> (#PR)` where area is
-`hisilicon`, a device (`hisi-fmc`, `hisi-gmac`), a machine (`hi3516cv610`), or
-`ci`. Bodies are substantial: what the vendor DTS/SDK says, why the old value
+Commit subjects are `<area>: <imperative summary> (#PR)` where area is a
+family (`hisilicon`, `xiongmai`, `goke`, `anyka`, `sigmastar`, `novatek`), a
+device (`hisi-fmc`, `hisi-gmac`), a machine (`hi3516cv610`, `nt98332`), `ci` or
+`docs`. Bodies are substantial: what the vendor DTS/SDK says, why the old value
 was wrong, what boots now that did not, and issue references
 (`openhisilicon#104`, `widgetii#115`). Match that depth — the commit log is the
 project's design record for register-level decisions.

@@ -8,7 +8,7 @@
 # fonts + isp-profile from a small HTTP server running on the host
 # (no NFS dependency).
 #
-# Required fixtures (bundled in the qemu-hisilicon GitHub release
+# Required fixtures (bundled in the qemu-bench GitHub release
 # under tag $FIXTURES_TAG, default "sofia-fixtures-v1"):
 #   sofia_full.tar.gz  — Sofia binary + libs
 #   Font.bin.web       — vendor font for /mnt/web/Fonts/Font.bin
@@ -28,7 +28,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 QEMU="${QEMU:-$REPO_ROOT/qemu-src/build/qemu-system-arm}"
 
 FIXTURES_TAG="${FIXTURES_TAG:-sofia-fixtures-v1}"
-FIXTURES_REPO="${FIXTURES_REPO:-widgetii/qemu-hisilicon}"
+FIXTURES_REPO="${FIXTURES_REPO:-OpenIPC/qemu-bench}"
 FIXTURES_BASE_URL="${FIXTURES_BASE_URL:-https://github.com/${FIXTURES_REPO}/releases/download/${FIXTURES_TAG}}"
 
 ISP_READY_TIMEOUT="${ISP_READY_TIMEOUT:-30}"
