@@ -299,7 +299,11 @@ negates (PReLU is ReLU(-x), ReLU(x) and an element-wise BN), a 16-bit
 out1 keeps 8 fraction bits, and the NUE takes 16-bit operands by their
 top 12 bits. A conv bias without BN goes after the conv's scale-shift
 (0x0AC) at any output width; the old 16-bit "before" rule had
-compensated for the unsigned alpha. The
+compensated for the unsigned alpha. Motion detection is the MDBC
+(`hw/misc/nvt-md.c`, node `md@f0c10000` -- probe takes the clock by that
+name). `kdrv_md` waits for frame end with no timeout. The algorithm is
+undocumented, so the background model is a deterministic reduced
+SuBSENSE in buffers only the engine reads. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

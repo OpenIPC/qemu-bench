@@ -44,7 +44,8 @@
 # this is qemu-boot/novatek-cddcnn-sample.c) -- from v1.01.007's sources
 # and prebuilt detector libraries, and frcnn_sample (face recognition; the
 # turnkey has only the model, so qemu-boot/novatek-frcnn-sample.c runs it
-# through vendor_ai_net) -- but against
+# through vendor_ai_net) -- with alg_md_sample (the MDBC motion detection
+# engine and lib_md's alarms) -- but against
 # v1.01.002's vendor_ai2: v1.01.007's checks for a kernel driver version
 # the release modules do not have.  alg_fdcnn_ai2_sample wants a second
 # DDR (NN_USE_DRAM2), which these chips do not have; the build turns it
@@ -53,7 +54,8 @@
 # OpenCV's messi5 / basketball1 test pictures, scikit-image's chelsea
 # (a cat), darknet's dog and face_recognition's photos of Obama, Biden,
 # Alex Lacamoire and Lin-Manuel Miranda (downloaded), and a composite of
-# messi5 and basketball1 -- as the samples' NV12 files and BMPs.
+# messi5 and basketball1 -- as the samples' NV12 files and BMPs -- and a
+# generated 160x120 sequence for alg_md_sample.
 #
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
@@ -204,7 +206,7 @@ fi
 # and PIL makes the pictures); without them, none from an earlier build
 rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
     "$OUT/smp/alg_fdcnn_ai2_sample" "$OUT/smp/cddcnn_sample" \
-    "$OUT/smp/frcnn_sample"
+    "$OUT/smp/frcnn_sample" "$OUT/smp/alg_md_sample"
 if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
         ! python3 -c 'import numpy, PIL' 2>/dev/null; then
     echo "the detectors' pictures need python3 with numpy and PIL:" \
@@ -218,7 +220,7 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
         -I$T7/limit_fdet/include -I$T7/motion_detection/include \
         -I$H7/vendor/cv/include -I$H7/vendor/cv/include/libmd"
     for smp in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample \
-            cddcnn_sample frcnn_sample; do
+            cddcnn_sample frcnn_sample alg_md_sample; do
         src=$WORK/$smp
         rm -rf "$src"
         mkdir -p "$src"
@@ -370,6 +372,24 @@ for name, f, s, lm in FACES:
         nv12(face.transpose(Image.FLIP_LEFT_RIGHT),
              sd + '/jpg/FR/obama1flip.yuv')
 nv12(Image.new('RGB', (112, 112), (128, 128, 128)), sd + '/jpg/FR/grey.yuv')
+
+# alg_md_sample's 160x120 frames 0..10 (MDBCP/DI/pic_NNNN, Y and NV12 CbCr):
+# a still textured scene; a bright 120x100 block moving right 4 pixels a
+# frame in frames 4..7 (62% of the picture, 80 rows of the sub-region
+# 0..159 x 0..89), gone again in 8..10
+import os
+for f in range(11):
+    yy, xx = np.mgrid[0:120, 0:160]
+    y = (60 + xx // 2 + 20 * ((xx // 8 + yy // 8) % 2)).astype(np.uint8)
+    uv = np.tile(np.array([118, 136], np.uint8), (60, 80))
+    if 4 <= f <= 7:
+        x0 = 20 + 4 * (f - 4)
+        y[10:110, x0:x0 + 120] = 230
+        uv[5:55, x0:x0 + 120] = 128
+    d = '%s/MDBCP/DI/pic_%04d' % (sd, f)
+    os.makedirs(d)
+    y.tofile(d + '/dram_in_y.bin')
+    uv.tofile(d + '/dram_in_uv.bin')
 PY
     printf 'comp.yuv 1920 1080\nbball.yuv 1920 1080\n' > "$SD/jpg/pd_image_list.txt"
     printf 'huang.yuv 1920 1080\ncomp.yuv 1920 1080\n' > "$SD/jpg/pvdlist.txt"

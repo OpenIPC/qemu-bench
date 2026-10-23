@@ -146,7 +146,7 @@ if [ -n "$DISPLAY_KOS" ]; then
         cp "$DISPLAY_KOS/$k.ko" "$WORK/initramfs/dko/"
     done
     for k in kdrv_ai kflow_cnn kflow_nue kflow_nue2 kflow_cpu kflow_dsp \
-             kflow_ai_net; do
+             kflow_ai_net kdrv_md; do
         cp "$DISPLAY_KOS/$k/$k.ko" "$WORK/initramfs/dko/"
     done
     # hd_video_output_only's 3 frames of 320x240 YUV 4:2:2, Y then CbCr
@@ -249,6 +249,9 @@ if [ -d /dko ]; then
         \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/\${m%% *}.ko \$(echo \$m | \$bb cut -s -d' ' -f2-)" >/dev/null 2>&1
         echo "NVT-AI-INSMOD: \${m%% *} rc=\$?"
     done
+    # the MDBC motion detection engine
+    \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/kdrv_md.ko" >/dev/null 2>&1
+    echo "NVT-MD-INSMOD: kdrv_md rc=\$?"
 fi
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
@@ -407,8 +410,15 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
         for f in /mnt/sd/det_results/*.txt /mnt/sd/FDCNN/result/fd/*.txt; do
             [ -f "$f" ] && tr -d '\r' < "$f" | sed "s|^|NVT-AI-DET: ${f##*/} |"
         done
+        # motion detection on its generated sequence (frames 0..10)
+        if [ -e /dev/kdrv_md0 ] && [ -x ./alg_md_sample ]; then
+            timeout 300 ./alg_md_sample > /tmp/md.out 2>&1
+            echo "NVT-HDAL-RUN: alg_md_sample rc=$?"
+            tr -d '\r' < /tmp/md.out | grep 'frmidx\|WRN\|ERR\|fail' |
+                sed 's/^/NVT-MD: /'
+        fi
         rm -rf /mnt/sd/CNNLib /mnt/sd/jpg /mnt/sd/FDCNN /mnt/sd/det_results \
-            /mnt/sd/save_bmp
+            /mnt/sd/save_bmp /mnt/sd/MDBCP
     fi
 fi
 rm -f /mnt/sd/*
@@ -506,6 +516,8 @@ if [ -n "$DISPLAY_KOS" ]; then
         expect "NVT-AI-INSMOD: $m rc=0" "AI: $m loads"
     done
     expect "NVT-HDAL-BOUND: f0c60000.ai kdrv_ai[[:space:]]*\$" "AI: the engines bound by kdrv_ai"
+    expect "NVT-MD-INSMOD: kdrv_md rc=0" "MD: kdrv_md loads"
+    expect "NVT-HDAL-BOUND: f0c10000.md kdrv_md[[:space:]]*\$" "MD: the MDBC bound by kdrv_md"
 fi
 
 if [ -n "$SAMPLES" ]; then
@@ -891,6 +903,23 @@ print("pd=%d/3 pvd=%d/2 cars=%d/3 eyes=%d bface=%d pets=%d/2 nopet=%d %s"
                 *) bad "cddcnn_sample: the cat and the dog (${look:-no result})";; esac
             case "$look" in *fr=5/5\ margin=+*flip=obama1\ grey=ok*) pass "frcnn_sample: Obama and Biden told apart, the mirror and the grey square in place ($look)";;
                 *) bad "frcnn_sample: Obama and Biden told apart (${look:-no result})";; esac
+            # motion detection: both alarms in frames 4..7 (the block),
+            # none in 1..3 and 8..10 (lib_md does not run on frame 0)
+            if [ -n "$DISPLAY_KOS" ]; then
+                expect "NVT-HDAL-RUN: alg_md_sample rc=0" "alg_md_sample runs to its end"
+                md=$(grep -a '^NVT-MD: ' "$WORK/console.log" | tr -d '\r' |
+                     awk '/frmidx =/ { n++; f = $0; sub(/.*frmidx = /, "", f); f += 0 }
+                          /global motion alarm/ { g[f] = 1 }
+                          /sub_region\[0\] motion alarm/ { r[f] = 1 }
+                          /ERR|fail/ { err++ }
+                          END { for (i = 1; i <= 10; i++) {
+                                    want = (i >= 4 && i <= 7)
+                                    if (g[i] != want || r[i] != want) bad = bad " " i
+                                }
+                                printf "frames=%d err=%d wrong:%s", n, err, (bad ? bad : " none") }')
+                case "$md" in "frames=11 err=0 wrong: none") pass "alg_md_sample: alarms in the moving block's frames only ($md)";;
+                    *) bad "alg_md_sample: alarms in the moving block's frames only (${md:-no result})";; esac
+            fi
         fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what

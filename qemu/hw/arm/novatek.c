@@ -191,6 +191,9 @@ static const struct {
      * NUE, NUE2, CNN, in kdrv_ai's order.  The tree's CNN size, 0x22C,
      * stops one register short of the checksum counter the driver reads.
      */
+    /* MDBC; probe takes the clock by the device name, so the node name */
+    { "md@f0c10000",      "nvt,kdrv_md",   { { 0xF0C10000, 0x150, 46 } },
+      240000000 },
     { "ai@f0c60000",      "nvt,kdrv_ai",
       { { 0xF0C60000, 0x23C, 14 }, { 0xF0D50000, 0x114, 13 },
         { 0xF0CB0000, 0x230, 11 } }, 600000000 },

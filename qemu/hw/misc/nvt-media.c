@@ -35,6 +35,7 @@
 #include "system/dma.h"
 #include "hw/misc/nvt-ai.h"
 #include "hw/misc/nvt-gfx.h"
+#include "hw/misc/nvt-md.h"
 #include "hw/misc/nvt-h26x.h"
 #include "hw/misc/nvt-pixel.h"
 
@@ -321,6 +322,19 @@ static const NvtIppParams ipp_cnn = {
     1u << 9, 0x204, 0x1FC,
 };
 
+/*
+ * MDBC, motion detection (kdrv_md: mdbc_reg.h): control bit 0 resets --
+ * a running job and the status go, the interrupt enables (written before
+ * it) stay -- bit 1 runs a frame (done: status bit 0, which
+ * kdrv_md waits for with no timeout), bit 28 fires a list (job end bit 7,
+ * list end bit 4, a broken list bit 5); status is write 1 to clear.  The
+ * work is nvt-md.c's.  Bit 15 of the DMA-disable register reads idle.
+ */
+static const NvtIppParams ipp_md = {
+    0x008, 0x00C, 0x030, 1u << 0 | 1u << 7, 1u << 4, 1u << 0, 1u << 1,
+    1u << 0, 1u << 5, 0, 0x110,
+};
+
 static bool ai_read(NvtMediaState *s, hwaddr off, uint64_t *val)
 {
     const NvtIppParams *p = s->engine->opaque;
@@ -343,6 +357,19 @@ static uint64_t ipp_write(NvtMediaState *s, hwaddr off, uint64_t val)
 {
     const NvtIppParams *p = s->engine->opaque;
 
+    if (p == &ipp_md && (off == 0x060 || off == 0x074 || off == 0x078)) {
+        /* read-only: LUM_DIFF, FRM_ID [19:12], RND [30:16] */
+        uint32_t ro = off == 0x060 ? 0x0FFFFFFF :
+                      off == 0x074 ? 0x000FF000 : 0x7FFF0000;
+
+        return (val & ~ro) | (*reg(s, off) & ro);
+    }
+    if (off == IPP_CTRL && p == &ipp_md && (val & 1)) {
+        /* MDBC reset: the job and its status go, the enables stay */
+        timer_del(s->timer);
+        *reg(s, p->ints) = 0;
+        return val & ~(1u | p->trig | IPP_LL_FIRE);
+    }
     if (off == IPP_CTRL) {
         if (val & IPP_LL_FIRE) {
             s->ll_addr = *reg(s, p->ll_addr);
@@ -555,6 +582,8 @@ static void ipp_job_work(NvtMediaState *s)
         nvt_gfx_grph_run(s->regs);
     } else if (s->engine->opaque == &ipp_ise) {
         nvt_gfx_ise_run(s->regs);
+    } else if (s->engine->opaque == &ipp_md) {
+        nvt_md_run(s->regs);
     }
 }
 
@@ -969,6 +998,7 @@ static const NvtMediaEngine nvt_media_engines[] = {
       &ipp_nue2 },
     { "ai3", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
       &ipp_cnn },
+    { "md", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq, &ipp_md },
 };
 
 static uint64_t nvt_media_read(void *opaque, hwaddr off, unsigned size)
