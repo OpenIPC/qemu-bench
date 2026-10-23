@@ -243,9 +243,22 @@ infinity2m SDK's AESDMA HAL, and the Maruko (SSC37X / infinity6c) SDK
 generation. One Cortex-A7, the infinity memory map, and:
 
 ```
-qemu-system-arm -M ssc375,flash-file=cam.bin -serial mon:stdio \
-    -nic user,restrict=on
+qemu-system-arm -M ssc375,flash-file=cam.bin -icount shift=0,sleep=on \
+    -serial mon:stdio -nic user,restrict=on
 ```
+
+`-icount shift=0,sleep=on` is needed on anything but a fast, idle host.
+Without it the guest clock follows the host's. Linux re-arms U-Boot's
+60 s watchdog at 8 s of uptime, and sonia takes it over (120 s, fed
+every 6 s) only once its media pipeline is up: at 22 s on an i9-13900,
+much later on a slower or busy host, so the camera boot-loops. A fixed
+shift ties guest time to the instructions run. shift=0 is a 1 GHz guest,
+as the SSC375 is, and sleep=on lets an idle guest's time pass in real
+time. Under a host load of about 90, the camera then booted with no
+reset and served its web UI within 2 minutes; without it, it booted 5
+times in 4 minutes and never started its web server. shift=auto does not help, because it stretches guest
+time to keep pace with the host. The machine warns at start when the
+shift is not fixed.
 
 `sensor=` picks the image sensor on MIIC1 at `0x30` (the DTB's sensorif
 `snr0_mipi_i2c = <1>`): `sc431hai`, the board's and the default (ID

@@ -35,6 +35,7 @@
 #include "hw/ssi/sstar-fsp.h"
 #include "hw/sysbus.h"
 #include "net/net.h"
+#include "exec/icount.h"
 #include "system/address-spaces.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
@@ -725,6 +726,22 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
      * HalVencIos*; the DTS "venc" node, "mhe-irq").
      */
     if (c->ipc) {
+        /*
+         * Without icount the guest clock follows the host's, so a slow or
+         * busy host runs the camera's firmware past its boot watchdog:
+         * Linux re-arms U-Boot's 60 s timeout at 8 s of uptime, and sonia
+         * takes it over only once its media pipeline is up (22 s on a
+         * fast host).  A fixed shift ties guest time to the instructions
+         * run (shift=0: a 1 GHz guest, as the SSC375 is), and sleep=on
+         * lets an idle guest's time pass in real time.  shift=auto does
+         * not help: it stretches guest time to keep up with the host's.
+         */
+        if (icount_enabled() != ICOUNT_PRECISE) {
+            warn_report("%s: without -icount shift=0,sleep=on a slow or busy "
+                        "host can run the firmware past its 60 s boot "
+                        "watchdog (a boot loop)",
+                        MACHINE_GET_CLASS(machine)->name);
+        }
         dev = qdev_new("sstar-venc");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F34C800);
