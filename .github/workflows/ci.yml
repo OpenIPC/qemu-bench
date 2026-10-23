@@ -235,7 +235,7 @@ jobs:
       - name: Run Sofia ISP regression test
         timeout-minutes: 5
         env:
-          # Tag of the qemu-hisilicon GitHub release that holds the
+          # Tag of the qemu-bench GitHub release that holds the
           # Sofia binary, fonts, and isp-profile fixtures.  Bump when
           # republishing.
           FIXTURES_TAG: sofia-fixtures-v1
