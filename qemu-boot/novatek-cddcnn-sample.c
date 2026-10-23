@@ -42,6 +42,8 @@
 
 static VENDOR_AIS_FLOW_MEM_PARM pool;
 static HD_COMMON_MEM_VB_BLK pool_blk;
+/* every picture went through the network and limit_fdet */
+static BOOL detect_ok;
 
 static INT32 file_size(const CHAR *name)
 {
@@ -199,6 +201,7 @@ static HD_RESULT limit_preset(LIMIT_FDET_MEM *mem,
 
 static VOID *detect(VOID *arg)
 {
+    UINT32 failures = 0;
     VENDOR_AIS_FLOW_MEM_PARM buf = pool;
     VENDOR_AIS_FLOW_MEM_PARM scale;
     PROPOSAL_PARAM prop = { 0 };
@@ -255,11 +258,13 @@ static VOID *detect(VOID *arg)
         INT32 n;
 
         if (sscanf(line, "%127s %u %u", name, &w, &h) != 3) {
+            failures++;
             continue;
         }
         snprintf(path, sizeof(path), "%s/%s", IMG_DIR, name);
         n = load(path, mem.input_mem.va, mem.input_mem.size);
         if (n < 0) {
+            failures++;
             continue;
         }
         hd_common_mem_flush_cache((VOID *)mem.input_mem.va, n);
@@ -287,6 +292,7 @@ static VOID *detect(VOID *arg)
         ret = ai_crop_img(&gfx, &src, HD_GFX_SCALE_QUALITY_NULL, &roi);
         if (ret != HD_OK) {
             printf("ERR: ai_crop_img fail (%d)\n", (int)ret);
+            failures++;
             continue;
         }
         cdd_gfx_img_to_vendor(&img, &gfx, scale.va);
@@ -294,6 +300,7 @@ static VOID *detect(VOID *arg)
         ret = cddcnn_process(&prop, &mem, &limit, backbone, &img, 0);
         if (ret != HD_OK) {
             printf("ERR: cddcnn_process fail (%d)\n", (int)ret);
+            failures++;
             continue;
         }
         r = (CDDCNN_RESULT *)mem.out_result.va;
@@ -315,6 +322,7 @@ static VOID *detect(VOID *arg)
         ret = limit_fdet_process(&lf, &lf_mem, &img);
         if (ret != HD_OK) {
             printf("ERR: limit_fdet_process fail (%d)\n", (int)ret);
+            failures++;
             continue;
         }
         mem.out_num = lf.proc_num;
@@ -329,6 +337,7 @@ static VOID *detect(VOID *arg)
                     r[i].y2 * sy);
         }
     }
+    detect_ok = failures == 0;
     vendor_ai_net_stop(LIMIT_RUN_ID);
     vendor_ai_net_close(LIMIT_RUN_ID);
 stop:
@@ -353,6 +362,7 @@ int main(int argc, char *argv[])
     HD_COMMON_MEM_INIT_CONFIG cfg = { 0 };
     UINT32 schd = VENDOR_AI_PROC_SCHD_FAIR;
     pthread_t t;
+    int rc = 1;
 
     if (hd_common_init(0) != HD_OK) {
         printf("hd_common_init fail\n");
@@ -394,6 +404,7 @@ int main(int argc, char *argv[])
     if (pthread_create(&t, NULL, detect, NULL) == 0) {
         pthread_join(t, NULL);
     }
+    rc = detect_ok ? 0 : 1;
     vendor_ai_uninit();
 unmap:
     hd_common_mem_munmap((VOID *)pool.va, POOL_SIZE);
@@ -405,5 +416,5 @@ gfx:
     hd_gfx_uninit();
 uninit:
     hd_common_uninit();
-    return 0;
+    return rc;
 }

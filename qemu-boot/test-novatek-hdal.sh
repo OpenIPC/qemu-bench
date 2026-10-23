@@ -837,7 +837,9 @@ bface = any(near(centre(f[0], f[1], f[0] + f[2], f[1] + f[3]), (86, 115), 15)
 # cddcnn: picture category score x1 y1 x2 y2 (1920x1080), what the
 # network proposes (cdd_raw_results.txt) -- category 1, the pets -- and
 # what limit_fdet confirms (cdd_test_results.txt, not checked: its
-# classifier puts these pets below its threshold)
+# classifier puts these pets below its threshold). The sample exits 0
+# only if every picture went through both, so with "rc=0" no row for
+# the dashcam frame means no proposal there.
 cdd = [(r[1], int(r[2]), float(r[3]), centre(*map(float, r[4:8])))
        for r in det if r[0] == "cdd_raw_results.txt" and len(r) >= 8]
 pets = sum(any(n == want_n and k == 1 and s >= 0.8 and near(c, want, 200)
