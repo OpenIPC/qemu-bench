@@ -935,7 +935,7 @@ and units bound.
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
 builds them from the vendor SDK (not in CI). The run checks 75 things
-(108 with `--kmods` and an `ai_net` model, 114 with the detectors, below):
+(108 with `--kmods` and an `ai_net` model, 116 with the detectors, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -1266,8 +1266,17 @@ v1.01.007's samples and detector libraries with v1.01.002's
 | `ai2_pdcnn_sample` | `pdcnn` (people), `public` (7 classes, to reject boxes) | 1752 a picture | people |
 | `alg_pvdcnn_sample` | `pvdcnn/nvt_model_prune37`, `public` | about 300 | people (class 1), vehicles (2) |
 | `alg_fdcnn_ai2_sample` | `fdcnn_method2_light` | about 600 | faces, five landmarks each |
+| `cddcnn_sample` (ours) | `cddcnn` (pets), `public` | about 3000 | cats and dogs (category 1) |
 
-`cddcnn` has a library but no sample, and `frcnn` is used by neither.
+`cddcnn` has a library (`cddcnn_ai2`) but no sample, so
+`qemu-boot/novatek-cddcnn-sample.c` is one. It follows the turnkey
+guide's flow (2.1.3, 2.2.3) and the other samples' API use: the picture
+scaled to the network's 1024x576, `cddcnn_process`, then
+`limit_fdet_process` with the `public` network and class 1. It writes
+both: the network's proposals to `cdd_raw_results.txt`, those limit_fdet
+keeps to `cdd_test_results.txt`. `cddcnn_version_check` needs each
+model buffer 32-byte aligned, or it rejects the model (`fmt_main 0`).
+`frcnn` is used by no sample.
 `alg_fdcnn_ai2_sample` asks for a second DDR (`NN_USE_DRAM2`), which the
 NT9856x does not have; on silicon it fails as here. The builder turns it
 off.
@@ -1282,6 +1291,13 @@ On their pictures under QEMU:
   SDK's dashcam frame.
 - **fdcnn** finds the astronaut's face, its landmarks on the eyes, nose
   and mouth corners, and the facing man's face in `basketball1`.
+- **cddcnn** proposes scikit-image's `chelsea` (a cat, 0.98) and the dog
+  cropped from darknet's `dog.jpg` (0.92), and nothing in the dashcam
+  frame. In the whole `dog.jpg` (dog, bicycle and truck) it proposes
+  nothing. limit_fdet then rejects both pets: its classifier puts the
+  cat in class 5 (0.46) and the dog in class 5 (0.81), not class 1 at
+  0.7. That classifier confirms pvdcnn's people as class 0 at 0.93..0.98,
+  so the rejections are taken as the model's, not the emulation's.
 
 A picture takes 4..11 s of host CPU. The job runs on the vendor's own
 code end to end: the graphics engine scales the picture, NUE2 and the
@@ -1301,14 +1317,16 @@ With `--samples` too, it runs `ai_op`'s five operators and checks them:
 When the samples carry the v1.01.007 model
 (`build-novatek-hdal-samples.sh --ai-model`), it also runs `ai_net`.
 Its top class must be the sea snake, at 0.3 or more. With the detectors
-(`--sdk7` and `--turnkey`), it runs the three samples on their pictures.
-Their 17 MB of models and pictures is too large for the initramfs, so
+(`--sdk7` and `--turnkey`), it runs the four samples on their pictures.
+Their 27 MB of models and pictures is too large for the initramfs, so
 the test packs it as a SquashFS on a second SD card (`-drive
 if=sd,index=1`), and the guest copies it to the vfat card the samples
 read. It checks that each finds, near where they are:
 - **pdcnn**: the three people;
 - **pvdcnn**: the three people and the car;
-- **fdcnn**: both faces, with the astronaut's eyes within 12 pixels.
+- **fdcnn**: both faces, with the astronaut's eyes within 12 pixels;
+- **cddcnn**: the cat and the dog among the network's proposals, as
+  category 1 at 0.8 or more, and no proposal in the dashcam frame.
 
 `test-novatek.py` checks, at register level:
 - the idle bits;

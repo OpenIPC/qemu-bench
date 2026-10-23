@@ -287,7 +287,10 @@ the same network for chip id 4, and under QEMU it names the test
 picture (a sea snake). The v1.01.007 AI turnkey's detectors (people,
 vehicles, faces) run too, built from v1.01.007's samples and libraries
 against v1.01.002's `vendor_ai2`, because v1.01.007's checks for a
-`kdrv_ai` version the release modules lack. A conv bias without BN goes
+`kdrv_ai` version the release modules lack. The pet detector `cddcnn`
+has a library but no SDK sample; `qemu-boot/novatek-cddcnn-sample.c` is
+ours. Its test checks the network's raw proposals, because limit_fdet's
+classifier rejects the test pets (as the model's own call). A conv bias without BN goes
 after the conv's scale-shift (0x0AC) for an 8-bit out0 and before it for
 a 16-bit one, fitted to the detectors (the wrong side loses people or
 faces). The

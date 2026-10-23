@@ -40,14 +40,16 @@
 # and --turnkey (its AI turnkey package's sd/, which holds CNNLib) it also
 # builds the turnkey's detectors -- ai2_pdcnn_sample (people),
 # alg_pvdcnn_sample (people and vehicles), alg_fdcnn_ai2_sample (faces)
-# -- from v1.01.007's sources and prebuilt detector libraries, but against
+# and cddcnn_sample (pets; v1.01.007 has the library but no sample, so
+# this is qemu-boot/novatek-cddcnn-sample.c) -- from v1.01.007's sources and prebuilt detector libraries, but against
 # v1.01.002's vendor_ai2: v1.01.007's checks for a kernel driver version
 # the release modules do not have.  alg_fdcnn_ai2_sample wants a second
 # DDR (NN_USE_DRAM2), which these chips do not have; the build turns it
 # off.  sd/ then holds what they read: the models, and pictures -- the
 # SDK's dashcam frame (YUV420_SP_Huang), scikit-image's astronaut and
-# OpenCV's messi5 / basketball1 test pictures (downloaded), and a
-# composite of the last two -- as the samples' NV12 files and BMPs.
+# OpenCV's messi5 / basketball1 test pictures, scikit-image's chelsea
+# (a cat) and darknet's dog (downloaded), and a composite of messi5 and
+# basketball1 -- as the samples' NV12 files and BMPs.
 #
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
@@ -197,7 +199,7 @@ fi
 # The turnkey's detectors and the pictures they read (python3 with numpy
 # and PIL makes the pictures); without them, none from an earlier build
 rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
-    "$OUT/smp/alg_fdcnn_ai2_sample"
+    "$OUT/smp/alg_fdcnn_ai2_sample" "$OUT/smp/cddcnn_sample"
 if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
         ! python3 -c 'import numpy, PIL' 2>/dev/null; then
     echo "the detectors' pictures need python3 with numpy and PIL:" \
@@ -207,12 +209,19 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
     T7=$H7/vendor/third_party
     DETINC="$AIINC -I$H/vendor/ai2/source/prebuilt/include/nvtnn \
         -I$T7/pdcnn_ai2/include -I$T7/pvdcnn/include -I$T7/fdcnn_ai2/include \
+        -I$T7/cddcnn_ai2/include \
         -I$T7/limit_fdet/include -I$T7/motion_detection/include \
         -I$H7/vendor/cv/include -I$H7/vendor/cv/include/libmd"
-    for smp in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample; do
+    for smp in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample \
+            cddcnn_sample; do
         src=$WORK/$smp
+        rm -rf "$src"
         mkdir -p "$src"
-        cp "$H7/samples/$smp/"*.c "$src/"
+        if [ $smp = cddcnn_sample ]; then
+            cp "$(dirname "$0")/novatek-cddcnn-sample.c" "$src/"
+        else
+            cp "$H7/samples/$smp/"*.c "$src/"
+        fi
         sed -i 's/^#define NN_USE_DRAM2 .*ENABLE/#define NN_USE_DRAM2 DISABLE/' "$src/"*.c
         "${CROSS}gcc" -O2 -D__LINUX $DETINC -o "$OUT/smp/$smp" "$src/"*.c \
             -L"$OUT/uc" -lhdal -Wl,--start-group "$H/vendor/ai2/source/libvendor_ai2.a" \
@@ -221,6 +230,7 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
             "$T7/pdcnn_ai2/prebuilt/uclibc/libprebuilt_pdcnn_ai2.a" \
             "$T7/pvdcnn/prebuilt/uclibc/libprebuilt_pvdcnn.a" \
             "$T7/fdcnn_ai2/prebuilt/uclibc/libprebuilt_fdcnn_ai2.a" \
+            "$T7/cddcnn_ai2/prebuilt/uclibc/libprebuilt_cddcnn_ai2.a" \
             "$T7/limit_fdet/prebuilt/uclibc/libprebuilt_limit_fdet.a" \
             "$T7/motion_detection/prebuilt/uclibc/libprebuilt_md.a" \
             "$H7/vendor/cv/source/libvendor_cv.a" \
@@ -232,23 +242,31 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
     done
     SD=$OUT/sd
     rm -rf "$SD"
-    mkdir -p "$SD/CNNLib/para" "$SD/jpg/PD" "$SD/jpg/PVD" "$SD/FDCNN/faces_y" \
+    mkdir -p "$SD/CNNLib/para" "$SD/jpg/PD" "$SD/jpg/PVD" "$SD/jpg/CDD" "$SD/FDCNN/faces_y" \
         "$SD/FDCNN/faces_uv" "$WORK/img"
     cp -a "$TURNKEY/CNNLib/para/pdcnn" "$TURNKEY/CNNLib/para/public" \
         "$TURNKEY/CNNLib/para/pvdcnn" "$TURNKEY/CNNLib/para/fdcnn_method2_light" \
+        "$TURNKEY/CNNLib/para/cddcnn" \
         "$SD/CNNLib/para/"
     rm -f "$SD/CNNLib/para/pvdcnn/nvt_model_origin.bin"     # prune37 is used
     cp "$H7/samples/ai_pattern/jpg/YUV420_SP_Huang_W1920H1080.bin" "$SD/jpg/PVD/huang.yuv"
-    curl -fsSL --retry 3 -o "$WORK/img/astronaut.png" \
-        https://raw.githubusercontent.com/scikit-image/scikit-image/v0.19.3/skimage/data/astronaut.png
+    cp "$SD/jpg/PVD/huang.yuv" "$SD/jpg/CDD/huang.yuv"
+    for f in astronaut.png chelsea.png; do
+        curl -fsSL --retry 3 -o "$WORK/img/$f" \
+            https://raw.githubusercontent.com/scikit-image/scikit-image/v0.19.3/skimage/data/$f
+    done
+    curl -fsSL --retry 3 -o "$WORK/img/dog.jpg" \
+        https://raw.githubusercontent.com/pjreddie/darknet/f6afaabcdf85f77e7aff2ec55c020c0e297c77f9/data/dog.jpg
     for f in messi5.jpg basketball1.png; do
         curl -fsSL --retry 3 -o "$WORK/img/$f" \
             https://raw.githubusercontent.com/opencv/opencv/4.10.0/samples/data/$f
     done
     python3 - "$WORK/img" "$SD" <<'PY'
 # The pictures: a composite of messi5 and basketball1 at two sizes, and
-# basketball1 alone, as 1920x1080 NV12 (people, vehicles); astronaut and
-# basketball1 as Y / UV BMPs (faces).  BT.601 full range.
+# basketball1 alone, as 1920x1080 NV12 (people, vehicles); chelsea and the
+# dog from darknet's picture, cropped to it (in the whole picture
+# the detector proposes nothing), as 1920x1080 NV12 (pets); astronaut
+# and basketball1 as Y / UV BMPs (faces).  BT.601 full range.
 import sys
 import numpy as np
 from PIL import Image
@@ -289,6 +307,9 @@ for im, hh, x, y in ((messi, 420, 40, 80), (bball, 420, 760, 80),
 for d in ('PD', 'PVD'):
     nv12(comp, '%s/jpg/%s/comp.yuv' % (sd, d))
 nv12(fit(bball), sd + '/jpg/PD/bball.yuv')
+nv12(fit(Image.open(img + '/chelsea.png')), sd + '/jpg/CDD/cat.yuv')
+nv12(fit(Image.open(img + '/dog.jpg').crop((100, 180, 360, 560))),
+     sd + '/jpg/CDD/dog.yuv')
 for i, f in enumerate(('astronaut.png', 'basketball1.png')):
     y, uv = planes(Image.open(img + '/' + f))
     Image.fromarray(y, 'L').save('%s/FDCNN/faces_y/%06d.bmp' % (sd, i))
@@ -296,6 +317,8 @@ for i, f in enumerate(('astronaut.png', 'basketball1.png')):
 PY
     printf 'comp.yuv 1920 1080\nbball.yuv 1920 1080\n' > "$SD/jpg/pd_image_list.txt"
     printf 'huang.yuv 1920 1080\ncomp.yuv 1920 1080\n' > "$SD/jpg/pvdlist.txt"
+    printf 'cat.yuv 1920 1080\ndog.yuv 1920 1080\nhuang.yuv 1920 1080\n' \
+        > "$SD/jpg/cdd_image_list.txt"
 fi
 
 find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +
