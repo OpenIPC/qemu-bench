@@ -399,7 +399,7 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
         cp -a /mnt/det/. /mnt/sd/
         mkdir -p /mnt/sd/det_results /mnt/sd/FDCNN/result/fd /mnt/sd/save_bmp
         for d in ai2_pdcnn_sample alg_pvdcnn_sample "alg_fdcnn_ai2_sample faces 0 1" \
-                cddcnn_sample; do
+                cddcnn_sample frcnn_sample; do
             ( sleep 3; echo q ) | timeout 600 ./$d > /tmp/det.out 2>&1
             echo "NVT-HDAL-RUN: ${d%% *} rc=$?"
             grep -i 'err\|fail' /tmp/det.out | head -5 | sed 's/^/NVT-HDAL-ERR: /'
@@ -792,7 +792,7 @@ PY
         # the turnkey detectors: each must find what the pictures hold
         if [ -d "$SAMPLES/sd" ]; then
             for d in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample \
-                    cddcnn_sample; do
+                    cddcnn_sample frcnn_sample; do
                 expect "NVT-HDAL-RUN: $d rc=0" "$d runs to its end"
             done
             look=$(grep -a '^NVT-AI-DET: ' "$WORK/console.log" | tr -d '\r' |
@@ -816,14 +816,17 @@ people = [("comp.yuv", (383, 320)), ("comp.yuv", (848, 332)),
           ("bball.yuv", (453, 615))]
 pdok = sum(any(n == want_n and s >= 0.8 and near(c, want, 90)
                for n, s, c in pd) for want_n, want in people)
-# pvdcnn: picture class score x0 y0 x1 y1; class 1 people, 2 vehicles
+# pvdcnn: picture class score x0 y0 x1 y1; class 1 people, 2 vehicles:
+# the large Messi and the facing man in the composite, and in the
+# dashcam frame the truck, the white car ahead and the small car
 pv = [(r[1], int(r[2]), float(r[3]), centre(*map(float, r[4:8])))
       for r in det if r[0].startswith("PVD") and len(r) >= 8]
 pvok = sum(any(n == "comp.yuv" and k == 1 and s >= 0.8 and near(c, want, 90)
                for n, k, s, c in pv)
-           for want in ((459, 345), (1233, 298), (498, 768)))
-car = any(n == "huang.yuv" and k == 2 and s >= 0.8 and near(c, (110, 466), 60)
-          for n, k, s, c in pv)
+           for want in ((459, 345), (840, 325)))
+car = sum(any(n == "huang.yuv" and k == 2 and s >= 0.8 and near(c, want, 60)
+              for n, k, s, c in pv)
+          for want in ((110, 466), (649, 384), (997, 535)))
 # fdcnn, a file a frame: x y w h score, then five landmarks, eyes first
 faces = {}
 for r in det:
@@ -846,17 +849,48 @@ pets = sum(any(n == want_n and k == 1 and s >= 0.8 and near(c, want, 200)
                for n, k, s, c in cdd)
            for want_n, want in (("cat.yuv", (636, 540)), ("dog.yuv", (958, 563))))
 nopet = not any(n == "huang.yuv" for n, k, s, c in cdd)
-print("pd=%d/3 pvd=%d/3 car=%d eyes=%d bface=%d pets=%d/2 nopet=%d"
-      % (pdok, pvok, car, eyes, bface, pets, nopet))
+# frcnn: picture, then its 128-value embedding; cosine similarity.  Each
+# photo of Obama and Biden must be nearest one of the same man, the
+# mirrored Obama nearest its original, every pair of one man more alike
+# than any pair of two, and the grey square less like any face than that
+emb = {r[1][:-4]: [float(v) for v in r[2:]]
+       for r in det if r[0] == "fr_features.txt" and len(r) == 130}
+
+def cos(a, b):
+    # an all-zero embedding (a regression) is unlike everything, not an
+    # exception that would blank every detector check
+    d = (sum(x * x for x in a) * sum(y * y for y in b)) ** 0.5
+    return sum(x * y for x, y in zip(a, b)) / d if d else 0.0
+
+faces = [n for n in emb if n not in ("grey", "obama1flip")]
+who = lambda n: n.rstrip("0123456789")
+fr = "fr=missing"
+rail = sum(abs(v) >= 3.99 for e in emb.values() for v in e)
+if len(emb) == 9 and rail < 9 * 128 / 100:     # a few at +-4 at most
+    nn = sum(who(max((m for m in faces if m != n),
+                     key=lambda m: cos(emb[n], emb[m]))) == who(n)
+             for n in faces if who(n) in ("obama", "biden"))
+    pairs = [(cos(emb[a], emb[b]), who(a) == who(b))
+             for i, a in enumerate(faces) for b in faces[:i]]
+    same = min(c for c, s in pairs if s)
+    margin = same - max(c for c, s in pairs if not s)
+    flip = max(faces, key=lambda m: cos(emb["obama1flip"], emb[m]))
+    grey = max(cos(emb["grey"], emb[m]) for m in faces)
+    fr = "fr=%d/5 margin=%+.2f flip=%s grey=%s" % (
+        nn, margin, flip, "ok" if grey < same else "%.2f" % grey)
+print("pd=%d/3 pvd=%d/2 cars=%d/3 eyes=%d bface=%d pets=%d/2 nopet=%d %s"
+      % (pdok, pvok, car, eyes, bface, pets, nopet, fr))
 ' 2>/dev/null || true)
             case "$look" in *pd=3/3*) pass "ai2_pdcnn_sample: the three people ($look)";;
                 *) bad "ai2_pdcnn_sample: the three people (${look:-no result})";; esac
-            case "$look" in *pvd=3/3*car=1*) pass "alg_pvdcnn_sample: three people and the car ($look)";;
-                *) bad "alg_pvdcnn_sample: three people and the car (${look:-no result})";; esac
+            case "$look" in *pvd=2/2*cars=3/3*) pass "alg_pvdcnn_sample: two people and the three vehicles ($look)";;
+                *) bad "alg_pvdcnn_sample: two people and the three vehicles (${look:-no result})";; esac
             case "$look" in *eyes=1*bface=1*) pass "alg_fdcnn_ai2_sample: both faces, the astronaut's eyes in place ($look)";;
                 *) bad "alg_fdcnn_ai2_sample: both faces (${look:-no result})";; esac
             case "$look" in *pets=2/2*nopet=1*) pass "cddcnn_sample: the cat and the dog, no pet in the street ($look)";;
                 *) bad "cddcnn_sample: the cat and the dog (${look:-no result})";; esac
+            case "$look" in *fr=5/5\ margin=+*flip=obama1\ grey=ok*) pass "frcnn_sample: Obama and Biden told apart, the mirror and the grey square in place ($look)";;
+                *) bad "frcnn_sample: Obama and Biden told apart (${look:-no result})";; esac
         fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what

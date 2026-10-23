@@ -283,8 +283,9 @@ ImageNet classifier (BN-Inception, built for this chip in SDK v1.01.007)
 names its test picture under QEMU, through NUE2's preprocessing, the CNN's
 convolution / batch norm / ReLU / pooling layers and the NUE's fully
 connected one; the AI turnkey's detectors find the people, vehicles and
-faces in their pictures, and its pet detector (a sample of ours, as the
-SDK has none) the cat and the dog.
+faces in their pictures, its pet detector (a sample of ours, as the SDK
+has none) the cat and the dog, and its face recognition network (the
+model alone in the package; the sample is ours) tells Obama from Biden.
 The machines give Linux 128 MB and the HDAL pool 96 MB, more than the
 packages hold. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
