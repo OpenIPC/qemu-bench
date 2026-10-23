@@ -54,6 +54,7 @@ jobs:
           # Novatek NT9856x (hw/arm/novatek.c)
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98562 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98566 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98533 '
           ./qemu-src/build/qemu-system-aarch64 -machine help | grep -E '^nt98332 '
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)

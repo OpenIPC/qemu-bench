@@ -1,4 +1,4 @@
-# Novatek NT9856x (`nt98562`, `nt98566`) and NT98332 (`nt98332`)
+# Novatek NT9856x (`nt98562`, `nt98566`), NT98533 (`nt98533`) and NT98332 (`nt98332`)
 
 Novatek's NT9856x IP-camera SoCs (internal name NA51089): one Cortex-A9
 with DDR in the package and Novatek's own peripheral blocks from
@@ -8,14 +8,21 @@ kernel with its root on the emulated SPI NOR, Ethernet up and an SD card,
 and boots a
 whole flash image through the vendor U-Boot, on SPI NOR or (the 566 boards)
 SPI NAND with a UBIFS root. What is left is in
-[Not modelled](#not-modelled).
+[Not modelled](#not-modelled). [NT98533](#nt98533-ns02501) (NS02501) is
+the same peripherals around two Cortex-A32s; [NT98332](#nt98332-na51103)
+(NA51103) is an aarch64 NVR die.
 
 ## What the SDKs support
 
 | Archive | Chip | What it has |
 |---|---|---|
 | `NT9856x-…-002.zip` → `na51089_linux_sdk_glibc_v1.01.002` | NA51089 (NT98560/561/562/566) | Kernel 4.19.91 and U-Boot 2019.04 source, board configs `configs/Linux/cfg_56*/nvt-*.dtsi`, loader control flow |
-| `nt9856x_linux_sdk_v1.01.007.rar` | NA51089 | Newer loaders (≥ v1.01.003 for the newer in-package DDR), `NT98560_DataSheet_Register_Map.pdf`; no kernel source |
+| `nt9856x_linux_sdk_v1.01.007.rar` | NA51089 | Newer loaders (≥ v1.01.003 for the newer in-package DDR), `NT98560_DataSheet_Register_Map.pdf`, the toolchains (`arm-ca9-linux-{gnueabihf,uclibcgnueabihf}` 8.4, a Linaro 6.4 `arm-eabi` for the loader), and the three tarballs below |
+| → `nt9856x_linux_sdk_release_{uclibc,glibc}_v1.01.007` | NA51089, NA51103 | Kernel 4.19.91 and U-Boot 2019.04 source, as in v1.01.002. The U-Boot also carries NA51103: `arch-nvt-na51103_{a32,a64}` headers, `board/novatek/nvt-na51103{,-a64}`, `nvt-na51103_a32_*` defconfigs, and drivers (`eth_na51103.c`, SPI NOR / NAND, SDIO). The kernel has no NA51103 platform |
+| → `nt9856x_loader_release_v1.01.007` | NA51089 | The loader's source (`bl_func.c`: FDT, U-Boot and SHMINFO), the DDR tables (`Tools/ConfigRam/560/*.ini`) and `bfc`; the DDR training is a closed library |
+| `ns02501_linux_sdk_release_uclibc_v3.07.101` | NS02501 (NT98532 / NT98533) | Kernel 5.10.168 (`mach-nvt-ivot`, `CONFIG_NVT_IVOT_PLAT_NS02501`), U-Boot 2021.10 (`arch-nvt-ns02501_a32`, `nvt-ns02501_a32_{nor,nand,emmc}_defconfig`), board configs `cfg_53{2,3}_*`, HDAL. No toolchain: the SDK names `arm-ca32-linux-gnueabihf-10.4.0` |
+| `ns02501_loader_v3.07.101` | NS02501 | The loader's source, as NA51089's (`bl_func.c`, `bl_lowlevel_init.c`) |
+| `NT98533.zip` | NS02501 | `NT98533_DataSheet_Register_Map.pdf`, Boot ROM, boot loader and U-Boot guides, pinmux sheets |
 | `NT9856x-…-000/001.zip` | NA51089 | Prebuilt NVTPACK images `FW9856{2,6}A.bin` (562 NOR, 562 NAND, 566 NAND) and loaders |
 | `NT9832x_SDK_release_v1.02.0{13,24}` | NA51068 (NT98321/323/621/623) | A dual-A9 DVR part with Faraday IP at `0xFExx0000`; a different family, not modelled |
 | `NA51023_BSP` | NT96672 | MIPS 24KEc running uITRON/eCos; not Linux, out of scope |
@@ -302,11 +309,76 @@ address at 0 for the CPU to start on. The SHMINFO is what U-Boot's
 +44 (`arch/arm/include/asm/nvt-common/shm_info.h`). `boot.LdStorage` at +42
 says 3 (SPI NOR) or 2 (SPI NAND).
 
-BCL1 is Novatek's container: the FourCC, then the algorithm and the
-big-endian uncompressed and compressed sizes, then the data. Algorithm 9 is
-an LZ77 with a marker byte and 7-bit variable-length lengths and offsets
-(U-Boot's `lz_uncompress`), and it is unpacked here. Algorithm 11 is LZMA
-through a mask-ROM routine and is refused.
+BCL1 is Novatek's container, as the SDK's `build/nvt-tools/bfc` writes
+it: 16 bytes of header, then the data.
+
+| Offset | Field |
+|---|---|
+| 0 | `"BCL1"` |
+| 4 | checksum, little-endian 16-bit: makes the sum over the container's little-endian 16-bit words, each plus its index, 0 mod 65536 (`nvtpack_calc_nvt_sum`; a last odd byte is not counted) |
+| 6 | algorithm, big-endian 16-bit |
+| 8 | uncompressed size, big-endian |
+| 12 | compressed size (the data after the header), big-endian |
+
+Both algorithms the loader knows are unpacked here:
+
+- **9 (`bfc c lz`).** An LZ77 with a marker byte and 7-bit variable-length
+  lengths and offsets (U-Boot's `lz_uncompress`).
+- **11 (`bfc c lzma`).** An LZMA "alone" stream: the properties byte
+  (`0x5D`), the 32-bit dictionary size and the 64-bit unpacked size, all
+  little-endian, then the range-coded data. `bfc` fills in the size; an
+  unknown size (all ones) with an end marker unpacks too. The loader
+  passes the data after the BCL1 header, with both sizes from the header,
+  to the mask ROM's decoder (its address is the word at `0x7FD0`,
+  `rom_lzma_inflate`). U-Boot's `lzmaBuffToBuffDecompress()` takes the
+  same stream for the SDK's LZMA RTOS images. `python3 -c 'import lzma'`
+  with `format=lzma.FORMAT_ALONE` writes it, with the size field left
+  unknown.
+
+A plain U-Boot is copied by its own length: the loader reads `HEADINFO`
+at image `+0x300` (`BIN_INFO_OFFSET_UBOOT`, U-Boot's `nvt_headinfo.c`)
+and copies `BinLength` (`+0x368`) bytes. The SDK's build writes that
+field and the checksum after linking (`encrypt_bin SUM u-boot.bin 0x350`);
+a raw `u-boot.bin` has `0xFFFFFFFF` there. The stand-in copies the whole
+partition instead, so it does not show a missing length.
+
+The loader's normal boot does not check the BCL1 checksum (only its
+update path does). It reads the compressed U-Boot from flash as
+`ALIGN_CEIL(compressed size, block size)` bytes from the partition's
+start, which does not count the 16-byte header: an image whose last 16
+bytes fall past that boundary loses them on silicon. The stand-in reads
+the whole partition, so it does not show that.
+
+### Xiongmai's layout
+
+Xiongmai's NT98562 / NT98566 cameras (the boards OpenIPC supports) have
+no `fdt` partition. Their loader (`loader.bin.img`, flash 0–`0x10000`)
+carries the board's device tree itself, plain, behind an `"XMFDT562"` tag
+at loader `+0x8000`. U-Boot follows the loader at `0x10000` as
+`partition_boot`, whose node has an `lzma` property: the partition is an
+LZMA "alone" stream, size unknown, with an end marker. The environment
+is at `0x30000`. With no tree at flash `0x10000` the machine looks for
+one in the loader (the first FDT there with `/nvt_memory_cfg`), takes
+`partition_boot` when there is no `partition_uboot`, and unpacks it as
+LZMA when the node says `lzma` (refusing it if it does not unpack).
+
+A Xiongmai upgrade's `*.img` files are uImages whose load address and
+entry point are the region's start and end in the flash.
+`qemu-boot/xmimg2flash.py` lays them out, optionally with raw files at
+given offsets (`FILE@OFFSET`):
+
+```bash
+python3 qemu-boot/xmimg2flash.py -o xm.bin u/loader.bin.img \
+    u/u-boot.bin.img u/u-boot.env.img u/romfs-x.squashfs.img \
+    u/user-x.squashfs.img u/web-x.squashfs.img u/custom-x.squashfs.img
+FLASH=xm.bin bash qemu-boot/run-nt98562.sh
+```
+
+With the 80N40 board's firmware (`IPC_NT98562_80N40_S38`, U-Boot 2019.04
+of December 2021) Xiongmai's U-Boot comes up, probes the W25Q64, reads
+its environment, loads `boot/uImage` from the romfs and starts it. Its
+kernel then prints nothing, and within two minutes the board resets;
+that part is not investigated.
 
 The SDK ships NVTPACK update packages, not flash dumps.
 `qemu-boot/nvtpack2flash.py FW98562A.bin nor.bin` lays one out the way the
@@ -1369,6 +1441,110 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   boxes and lines, and `/dev/fb0`. The release kernel has no
   `CONFIG_FB`, so `nvt_fb.ko` does not load.
 
+## NT98533 (NS02501)
+
+`nt98533` (`qemu-system-arm`) is Novatek's NS02501 camera die, sold as
+NT98532 and NT98533: two Cortex-A32s (ARMv8 cores that run only AArch32,
+with a 32-bit ARMv7 kernel), a GIC-400, the ARMv8 generic timer, and
+256 MB of DDR on the EVBs. Its peripherals are NA51089's, at NA51089's
+addresses: U-Boot's `arch-nvt-ns02501_a32/IOAddress.h`, the SDK's
+`cfg_53x` board trees and the datasheet agree. So the NT9856x models
+serve it unchanged. QEMU has no Cortex-A32; the machine uses a Cortex-A7,
+which runs the same code. The chip ID is `0x5521` (`CHIP_NS02501`).
+
+### Memory map
+
+Where it differs from NA51089's (`cfg_532_IPC_NOR_SQUASHFS_BD_EVB`):
+
+| Block | Base | IRQ | Model |
+|---|---|---|---|
+| GIC-400 | `0xFFF01000` (dist), `0xFFF02000` (CPU) | | `arm_gic` |
+| Generic timer | | PPI 13 secure, 14, 11, 10 | the A7's, 12 MHz |
+| Core communicator | `0xF0090000` | 59 | storage; `+0x100` releases the second core |
+| WDT | `0xF0050000` | 75 | `nvt-wdt` |
+| RTC | `0xF0060000` | 76 | `nvt-rtc` |
+| I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF0360000` | 10 / 41 / 42 | `nvt-i2c` |
+| USB 2.0 | `0xFF600000` | 27 | `nvt-usb` (the tree's own address) |
+| UART 1 / 2 / 3 | as NA51089 | 43 / 44 / 45 | 16550, all 48 MHz |
+
+The timer, GPIO, SPI NOR / NAND controller, SDIO 1–3, Ethernet, PWM,
+crypto, hash, RSA and OTP are NA51089's, at the same addresses and
+interrupts. The Novatek timer's dividers run from 3 MHz, as on NA51089:
+both read 1 MHz at reset. The media engines, display, audio and the
+HR timers (`0xF00C0000`, `0xF0150000`–`0xF01E0000`) are not instantiated
+and read as zero.
+
+### Boot
+
+The flash boot is NA51089's stand-in. The SHMINFO layout and the
+`nvt_memory_cfg` regions are the same (`ns02501_ldr`), and U-Boot is at
+`/nvt_memory_cfg/uboot` = `0x0F940000`. The SDK's NOR layout puts the FDT
+at `0x10000` and U-Boot at `0x50000`, plain.
+
+- **Secure SVC.** Everything runs there, the kernel included: the CPUs
+  have EL3, and `-kernel` enters the kernel in secure SVC as U-Boot
+  does. U-Boot's `lowlevel_init` goes to monitor mode, sets `SCR.NS` and
+  clears CNTVOFF, which QEMU allows only with EL2 present. So the A7
+  keeps its virtualization extensions. The A32 has no EL2, and on
+  silicon that write is fine.
+- **GIC.** It has no security extensions here; with everything secure,
+  they would change nothing the software sees.
+- **The second core.** On silicon it waits in the loader until
+  `CC_CPU2_CPU1_CMDBUF_REG1` (`0xF0090100`) is non-zero, then jumps there
+  (`bl_lowlevel_core2_jump()`). The kernel's `cpu-release-addr` is that
+  register; the kernel writes `nvt_secondary_startup` into it, then
+  releases the core from its own pen. Here the core stays off until that
+  write, which starts it at the address. That serves `-kernel` too.
+- **CNTFRQ.** The tree's timer says 12 MHz, which the kernel uses, and
+  the model's counter runs at 12 MHz. The loader writes CNTFRQ = 3 MHz
+  (`CPU_TIMER_FREQ`) before it jumps to U-Boot, and U-Boot's
+  `CONFIG_SYS_ARCH_TIMER` delays read CNTFRQ. On silicon one of the two
+  is off by four. The direct Linux boot path (`bl_linux.c`) writes 12 MHz.
+  The stand-in leaves CNTFRQ at 12 MHz.
+- **BCL1 LZMA.** The loader finds its LZMA decoder at mask ROM `0xBFD0`
+  here (`0x7FD0` on NA51089); the format is the same (see Flash boot).
+
+`qemu-boot/build-ns02501-sdk.sh --sdk … --toolchain …` builds the SDK's
+U-Boot (`nvt-ns02501_a32_nor_defconfig`), kernel
+(`ns02501_ipc_a32_evb_defconfig_nor_release`, with its modules) and the
+board tree, and lays them out as a 16 MiB NOR. The NT9856x SDK's
+`arm-ca9-linux-gnueabihf-8.4` builds all three; the kernel's version
+header needs bash. The SDK ships a `ModelConfig.mk` only for a NAND
+board, so the script writes a NOR one. Then:
+
+```bash
+SOC=nt98533 FLASH=ns02501/nor.bin bash qemu-boot/run-nt98562.sh
+bash qemu-boot/test-nt98533.sh --dir ns02501 --rootfs qemu-boot/rootfs.squashfs.nt98562
+```
+
+What runs:
+
+- **Flash boot.** U-Boot 2021.10 comes up and takes its device tree from
+  the SHMINFO. It reports 256 MiB, probes the W25Q128, then `nvt_boot`
+  loads the uImage from the kernel partition and starts it. Linux 5.10.168
+  brings up both cores and the generic timer at 12 MHz, and mounts a
+  squashfs root from NOR.
+- **`-kernel zImage -dtb nvt-evb.dtb`.** The kernel finds the pinctrl,
+  GPIO, I2C and the SPI NOR, which reads, erases and programs correctly.
+  The SDK's `nvt-mmc.ko` reads and writes an SD card, and `ntkimethmac.ko`
+  takes a DHCP lease and fetches a file over HTTP. Timer 0 counts at
+  1 MHz.
+
+`test-nt98533.sh` checks all of it (27 checks, about 30 s).
+`test-novatek.py` covers the map and the flash boot in CI.
+
+The SDK kernel reads NOR through `mtdblock` 512 bytes at a time. Each
+read is three controller operations, each with its interrupt and DMA
+cache maintenance across both cores. That is slow under TCG: about
+1.5 MB/s, about 4x better with `-smp 1`. A squashfs root therefore boots
+slowly. The OpenIPC nt98562 root used above is a 4.19 userland: it
+reaches its init scripts, but its modules do not match this kernel.
+
+Not modelled on NT98533: the media, display and audio engines (the
+SDK's HDAL is not set up), the HR timers, the thermal sensor, ADC and
+DSP. RTC and watchdog drivers are not in the SDK kernel config, so they
+are untested here.
+
 ## NT98332 (NA51103)
 
 `nt98332` (`qemu-system-aarch64`) is Novatek's NA51103 NVR die, which the
@@ -1377,7 +1553,24 @@ an aarch64 kernel, a GIC-400, the ARMv8 generic timer at 12 MHz, and 1 GB of
 DDR. Novatek's blocks sit above 4 GiB, from `0x2_F0000000`; most keep
 NA51089's register layout at new offsets, the same offsets as NA51090's
 (OpenIPC `u-boot-nt9856x`, `arch-nvt-na51090_a64/IOAddress.h`). The
-NT9832x SDK is NA51068, a different die, and does not describe it.
+NT9832x SDK is NA51068, a different die, and does not describe it. The
+NT9856x v1.01.007 U-Boot does (`arch-nvt-na51103_a64`). Its chip ID,
+`CHIP_NA51103` = `0x8B20`, is TOP's version word here. Its
+`IOAddress.h` agrees with the dump's tree on these blocks: TOP, CG, PAD,
+GPIO, WDT, the timer, the flash controller, the UARTs, Ethernet, USB,
+RTC, OTP, the GIC and the LCD300 (`IDE`). It also lists blocks the NVR's
+tree does not use, which are not modelled:
+
+- SDIO 1 / 2 at `0x2_F0190000` / `0x2_F01A0000` (U-Boot's EVB tree has
+  `mmc@2,f0190000`);
+- a second Ethernet at `0x2_F0450000`;
+- I2C 1–4 at `0x2_F01C0000`–`0x2_F01F0000`;
+- PWM at `0x2_F0120000`;
+- the system counter at `0x2_FFE50000` / `0x2_FFE60000`.
+
+Much of the header is a template copy of NA51089's. Its media and display
+lines contradict the dump's tree (HDMI at `0x820000`, the DAI at
+`0x630000` on top of the OTP, CSI on the first UART), and the tree wins.
 
 It was brought up on a Xiongmai NBD80N36RA-KL NVR (FW98332A loader,
 U-Boot 2019.04, kernel 4.19.148, HDAL 3.03), from a 16 MiB SPI NOR dump.

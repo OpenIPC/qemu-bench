@@ -40,6 +40,7 @@
 #include "system/device_tree.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
+#include "target/arm/arm-powerctl.h"
 #include "target/arm/gtimer.h"
 #include <libfdt.h>
 
@@ -870,10 +871,7 @@ static uint8_t *nvt_flash_fdt(NvtFlashState *flash, uint32_t off,
         return fdt;
     }
     if (ldl_be_p(hdr) != FDT_MAGIC) {
-        error_report("novatek: no device tree at flash 0x%x: not a Novatek "
-                     "flash image (qemu-boot/nvtpack2flash.py makes one from "
-                     "an FW*.bin)", off);
-        exit(1);
+        return NULL;
     }
     *len = ldl_be_p(hdr + 4);
     if (*len < sizeof(hdr) || *len > NVT_FDT_MAX) {
@@ -883,6 +881,36 @@ static uint8_t *nvt_flash_fdt(NvtFlashState *flash, uint32_t off,
     fdt = g_malloc(*len);
     nvt_flash_read(flash, off, fdt, *len);
     return fdt;
+}
+
+/*
+ * Xiongmai's NA51089 cameras have no fdt partition: their loader carries
+ * the board's device tree itself, plain, behind an "XMFDT562" tag (at
+ * loader +0x8000 in the 80N40 / 80N50 boards' loaders), and U-Boot follows
+ * the loader at 0x10000.  So with no tree at the SDK's offset, look for one
+ * in the loader: the first FDT there with an nvt_memory_cfg node.
+ */
+static uint8_t *nvt_loader_fdt(NvtFlashState *flash, uint32_t end,
+                               uint32_t *len)
+{
+    g_autofree uint8_t *ldr = g_malloc(end);
+    uint32_t off, size;
+
+    nvt_flash_read(flash, 0, ldr, end);
+    for (off = 0; off + 0x40 <= end; off += 4) {
+        if (ldl_be_p(ldr + off) != FDT_MAGIC) {
+            continue;
+        }
+        size = ldl_be_p(ldr + off + 4);
+        if (size < 0x40 || size > end - off ||
+            fdt_check_header(ldr + off) ||
+            fdt_path_offset(ldr + off, "/nvt_memory_cfg") < 0) {
+            continue;
+        }
+        *len = size;
+        return g_memdup2(ldr + off, size);
+    }
+    return NULL;
 }
 
 static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
@@ -900,6 +928,16 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
     int nor;
 
     fdt = nvt_flash_fdt(flash, fdt_off, &fdt_len);
+    if (!fdt && !flash->nand) {
+        fdt = nvt_loader_fdt(flash, MIN(fdt_off, flash->size), &fdt_len);
+    }
+    if (!fdt) {
+        error_report("novatek: no device tree at flash 0x%x%s: not a Novatek "
+                     "flash image (qemu-boot/nvtpack2flash.py makes one from "
+                     "an FW*.bin)", fdt_off,
+                     flash->nand ? "" : " or in the loader before it");
+        exit(1);
+    }
     nor = fdt_node_offset_by_compatible(fdt, -1, flash->nand ?
                                         "nvt,nvt_spinand" : "nvt,nvt_spinor");
     if (fdt_check_header(fdt) ||
@@ -940,10 +978,9 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
         raw = ldl_be_p(part + 8);
         comp = ldl_be_p(part + 12);
 
-        if (alg != 9) {
+        if (alg != 9 && alg != 11) {
             error_report("novatek: U-Boot is BCL1 algorithm %u; only LZ (9) "
-                         "is unpacked here (11, LZMA, needs the mask ROM)",
-                         alg);
+                         "and LZMA (11) are unpacked here", alg);
             exit(1);
         }
         if (comp > ub_size - NVT_BCL1_HDR || raw > ub_max ||
@@ -953,15 +990,26 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
             exit(1);
         }
         uboot = g_malloc(raw);
-        if (!nvt_lz_uncompress(part + NVT_BCL1_HDR, comp, uboot, raw)) {
-            error_report("novatek: BCL1 U-Boot does not unpack");
+        /*
+         * Algorithm 11 is what the SDK's "bfc c lzma" writes: an LZMA
+         * "alone" stream (5 bytes of properties, the 64-bit unpacked size,
+         * then the range-coded data), which the loader hands to the mask
+         * ROM's decoder with the header's sizes.
+         */
+        if (alg == 11 ?
+            nvt_lzma_decode(part + NVT_BCL1_HDR, comp, uboot, raw) != raw :
+            !nvt_lz_uncompress(part + NVT_BCL1_HDR, comp, uboot, raw)) {
+            error_report("novatek: BCL1 U-Boot (algorithm %u) does not "
+                         "unpack to 0x%x bytes", alg, raw);
             exit(1);
         }
         ub_len = raw;
     } else {
         /*
-         * Xiongmai's NA51103 U-Boot is LZMA; anything that does not unpack
-         * as such is taken as a plain image, as before.
+         * Xiongmai's U-Boot is LZMA ("alone" format, its size often left
+         * unknown), and their NA51089 trees say so with an "lzma" property
+         * on the partition, which the loader honours.  Without it, anything
+         * that does not unpack as LZMA is taken as a plain image.
          */
         if (nvt_lzma_probe(part, ub_size)) {
             ssize_t raw;
@@ -974,6 +1022,12 @@ static void nvt_flash_boot(NvtFlashState *flash, uint64_t ram_size, bool a64)
             } else {
                 g_clear_pointer(&uboot, g_free);
             }
+        }
+        if (!uboot && fdt_getprop(fdt, fdt_path_offset(fdt, path), "lzma",
+                                  NULL)) {
+            error_report("novatek: %s is marked lzma but does not unpack "
+                         "as LZMA", path);
+            exit(1);
         }
         if (!uboot) {
             uboot = g_steal_pointer(&part);
@@ -1394,6 +1448,330 @@ DEFINE_NVT_MACHINE("nt98562", nt98562, nt98562_soc)
 DEFINE_NVT_MACHINE("nt98566", nt98566, nt98566_soc)
 
 /*
+ * NT98532 / NT98533 (NS02501): NA51089's peripherals at NA51089's
+ * addresses (U-Boot arch-nvt-ns02501_a32/IOAddress.h, the SDK's
+ * cfg_53x board trees, NT98533_DataSheet_Register_Map.pdf), around two
+ * Cortex-A32s -- ARMv8 cores running a 32-bit ARMv7 kernel -- with a
+ * GIC-400 at 0xFFF01000 and the ARMv8 generic timer, at 12 MHz per the
+ * tree.  QEMU has no A32; a Cortex-A7 runs the same code.
+ *
+ * Source: the ns02501 Linux SDK (U-Boot 2021.10, kernel 5.10.168) and
+ * the ns02501 loader source.  The interrupts that moved from NA51089:
+ * WDT 75, RTC 76, I2C 1 SPI 10, I2C 3 at 0xF0360000 SPI 42 (I2C 2 41).
+ */
+#define NS02501_GICD_BASE       0xFFF01000
+#define NS02501_GICC_BASE       0xFFF02000
+#define NS02501_CC_BASE         0xF0090000
+#define NS02501_CC_SIZE         0x300
+#define NS02501_CC_RELEASE      0x100   /* CC_CPU2_CPU1_CMDBUF_REG1 */
+#define NS02501_CNTFRQ          12000000
+#define NS02501_NUM_SPI         128
+#define NS02501_IRQ_WDT         75
+#define NS02501_IRQ_RTC         76
+#define NS02501_IRQ_CC          59
+
+static const struct {
+    hwaddr base;
+    int irq;
+} ns02501_i2c[] = {
+    { 0xF0220000, 10 },
+    { 0xF0350000, 41 },
+    { 0xF0360000, 42 },
+};
+
+/*
+ * The core communicator's command buffers.  The second core waits in the
+ * loader until CMDBUF_REG1 (+0x100) is non-zero and jumps there, in
+ * secure SVC (ns02501_ldr bl_lowlevel_core2_jump()); the kernel's
+ * cpu-release-addr is that register (mach-nvt-ivot/platsmp.c).  Here the
+ * second core stays off until the write, which starts it at the address.
+ */
+typedef struct {
+    uint32_t regs[NS02501_CC_SIZE / 4];
+} NvtCCState;
+
+static uint64_t ns02501_cc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NvtCCState *s = opaque;
+
+    return s->regs[addr / 4];
+}
+
+static void ns02501_cc_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    NvtCCState *s = opaque;
+    CPUState *cs = qemu_get_cpu(1);
+
+    s->regs[addr / 4] = val;
+    if (addr == NS02501_CC_RELEASE && val && cs &&
+        ARM_CPU(cs)->power_state == PSCI_OFF) {
+        arm_set_cpu_on(ARM_CPU(cs)->mp_affinity, (uint32_t)val, 0, 3, false);
+    }
+}
+
+static const MemoryRegionOps ns02501_cc_ops = {
+    .read = ns02501_cc_read,
+    .write = ns02501_cc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+/* -kernel: no boot stub for the second core, which waits for the kernel's
+ * write to CMDBUF_REG1 as above. */
+static void ns02501_write_secondary(ARMCPU *cpu,
+                                    const struct arm_boot_info *info)
+{
+}
+
+static void ns02501_reset_secondary(ARMCPU *cpu,
+                                    const struct arm_boot_info *info)
+{
+}
+
+/*
+ * 256 MB in the package on the EVBs (nvt_memory_cfg/dram); the SDK's
+ * tables give Linux the first 36 MB and the HDAL the rest.
+ */
+static const NvtSoCConfig nt98533_soc = {
+    .desc               = "Novatek NT98533 (2x Cortex-A32, NS02501, 256 MB)",
+    .model              = "Novatek NS02501",
+    .chip_id            = 0x5521,
+    .ram_size_default   = 256 * MiB,
+    .linux_mem          = 0x02400000,
+};
+
+static void novatek_ns02501_init(MachineState *machine,
+                                 const NvtSoCConfig *c)
+{
+    NvtMachineState *nms = NVT_MACHINE(machine);
+    static struct arm_boot_info binfo;
+    MemoryRegion *sysmem = get_system_memory();
+    unsigned int smp_cpus = machine->smp.cpus;
+    qemu_irq pic[NS02501_NUM_SPI];
+    DeviceState *gic, *dev, *cg, *gpio;
+    SysBusDevice *gicbus;
+    MemoryRegion *cc = g_new(MemoryRegion, 1);
+    ARMCPU *cpu[2];
+    int n, i;
+
+    for (n = 0; n < smp_cpus; n++) {
+        Object *cpuobj = object_new(machine->cpu_type);
+
+        /*
+         * The loader and U-Boot run in secure SVC, and so does the kernel
+         * they start.  U-Boot's lowlevel_init goes to monitor mode, sets
+         * SCR.NS and clears CNTVOFF, which QEMU allows only with EL2
+         * there: the A7's virtualization extensions stay.  The second core
+         * is started by its release register, below.
+         */
+        object_property_set_bool(cpuobj, "has_el3", true, &error_fatal);
+        if (n > 0) {
+            object_property_set_bool(cpuobj, "start-powered-off", true,
+                                     &error_fatal);
+        }
+        object_property_set_uint(cpuobj, "cntfrq", NS02501_CNTFRQ,
+                                 &error_fatal);
+        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+        cpu[n] = ARM_CPU(cpuobj);
+    }
+
+    memory_region_add_subregion(sysmem, 0, machine->ram);
+    create_unimplemented_device("nvt-periph", NVT_PERIPH_BASE,
+                                NVT_PERIPH_SIZE);
+
+    /*
+     * GIC-400 ("arm,cortex-a7-gic"): everything runs secure, so its
+     * security extensions would change nothing the software sees.
+     */
+    gic = qdev_new(gic_class_name());
+    qdev_prop_set_uint32(gic, "revision", 2);
+    qdev_prop_set_uint32(gic, "num-cpu", smp_cpus);
+    qdev_prop_set_uint32(gic, "num-irq", NS02501_NUM_SPI + GIC_INTERNAL);
+    gicbus = SYS_BUS_DEVICE(gic);
+    sysbus_realize_and_unref(gicbus, &error_fatal);
+    sysbus_mmio_map(gicbus, 0, NS02501_GICD_BASE);
+    sysbus_mmio_map(gicbus, 1, NS02501_GICC_BASE);
+
+    for (n = 0; n < smp_cpus; n++) {
+        DeviceState *cpudev = DEVICE(cpu[n]);
+        int ppibase = NS02501_NUM_SPI + n * GIC_INTERNAL + GIC_NR_SGIS;
+        /* nvt-basic.dtsi: 13 secure, 14 non-secure, 11 virtual, 10 hyp */
+        static const int timer_ppi[] = {
+            [GTIMER_PHYS] = 14,
+            [GTIMER_VIRT] = 11,
+            [GTIMER_HYP]  = 10,
+            [GTIMER_SEC]  = 13,
+        };
+
+        for (i = 0; i < ARRAY_SIZE(timer_ppi); i++) {
+            qdev_connect_gpio_out(cpudev, i,
+                                  qdev_get_gpio_in(gic, ppibase +
+                                                   timer_ppi[i]));
+        }
+        sysbus_connect_irq(gicbus, n,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        sysbus_connect_irq(gicbus, n + smp_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+        sysbus_connect_irq(gicbus, n + 2 * smp_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+        sysbus_connect_irq(gicbus, n + 3 * smp_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+    }
+    for (n = 0; n < NS02501_NUM_SPI; n++) {
+        pic[n] = qdev_get_gpio_in(gic, n);
+    }
+
+    memory_region_init_io(cc, OBJECT(machine), &ns02501_cc_ops,
+                          g_new0(NvtCCState, 1), "nvt-cc", NS02501_CC_SIZE);
+    memory_region_add_subregion_overlap(sysmem, NS02501_CC_BASE, cc, 1);
+
+    dev = qdev_new("nvt-top");
+    qdev_prop_set_uint32(dev, "chip-id", c->chip_id);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_TOP_BASE, 1);
+
+    cg = qdev_new("nvt-cg");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(cg), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(cg), 0, NVT_CG_BASE, 1);
+
+    dev = qdev_new("nvt-wdt");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_WDT_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NS02501_IRQ_WDT]);
+
+    dev = qdev_new("nvt-rtc");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_RTC_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NS02501_IRQ_RTC]);
+
+    gpio = qdev_new("nvt-gpio");
+    object_property_add_child(OBJECT(machine), "nvt-gpio", OBJECT(gpio));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(gpio), 0, NVT_GPIO_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0, pic[NVT_IRQ_GPIO]);
+
+    sysbus_create_simple("nvt-otp", NVT_OTP_BASE, NULL);
+    /* 3 MHz over CLKDIV0 / CLKDIV1 + 1, both 1 MHz at reset: as NA51089's */
+    sysbus_create_simple("nvt-timer", NVT_TIMER_BASE, pic[NVT_IRQ_TIMER]);
+
+    for (n = 0; n < ARRAY_SIZE(nvt_crypto_blocks); n++) {
+        sysbus_create_simple(nvt_crypto_blocks[n].type,
+                             nvt_crypto_blocks[n].base,
+                             pic[nvt_crypto_blocks[n].irq]);
+    }
+
+    dev = qdev_new("nvt-pwm");
+    object_property_add_child(OBJECT(machine), "nvt-pwm", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NVT_PWM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_PWM]);
+
+    for (n = 0; n < ARRAY_SIZE(ns02501_i2c); n++) {
+        sysbus_create_simple("nvt-i2c", ns02501_i2c[n].base,
+                             pic[ns02501_i2c[n].irq]);
+    }
+
+    /* USB 2.0: the tree puts the controller at 0xFF600000 itself. */
+    dev = qdev_new("nvt-usb");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 1, NVT_USB_ALIAS, 1);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_USB_ALIAS, 2);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_USB]);
+
+    dev = qdev_new("nvt-eqos");
+    qemu_configure_nic_device(dev, true, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_ETH_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_ETH]);
+
+    /* SDIO1 / 2 / 3 as on NA51089, reset by the same CG bits. */
+    for (n = 0; n < ARRAY_SIZE(nvt_sdio); n++) {
+        DriveInfo *di = drive_get(IF_SD, 0, n);
+
+        dev = qdev_new("nvt-sdio");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, nvt_sdio[n].base, 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[nvt_sdio[n].irq]);
+        qdev_connect_gpio_out_named(cg, "sys-reset", nvt_sdio[n].reset,
+                                    qdev_get_gpio_in_named(dev, "reset", 0));
+        if (di) {
+            DeviceState *card = qdev_new(nvt_sdio[n].emmc ? TYPE_EMMC
+                                                           : TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                   &error_fatal);
+        }
+    }
+
+    dev = qdev_new(TYPE_NVT_FLASH);
+    if (nms->flash_file) {
+        qdev_prop_set_string(dev, "flash-file", nms->flash_file);
+    }
+    qdev_prop_set_uint32(dev, "jedec", nms->flash_jedec);
+    object_property_add_child(OBJECT(machine), "nvt-flash", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    nms->flash = NVT_FLASH(dev);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_FLASH_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_FLASH]);
+
+    /* 16550s, reg-shift 2, all at 48 MHz (nvt-peri.dtsi) */
+    for (n = 0; n < ARRAY_SIZE(nvt_uarts); n++) {
+        serial_mm_init(sysmem, nvt_uarts[n].base, 2, pic[nvt_uarts[n].irq],
+                       48000000 / 16, serial_hd(n), DEVICE_LITTLE_ENDIAN);
+    }
+
+    for (n = 0; n < ARRAY_SIZE(nvt_regbanks); n++) {
+        dev = qdev_new("hisi-regbank");
+        qdev_prop_set_uint32(dev, "size", nvt_regbanks[n].size);
+        qdev_prop_set_string(dev, "name", nvt_regbanks[n].name);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0,
+                                nvt_regbanks[n].base, 1);
+    }
+
+    if (machine->kernel_filename && !machine->dtb) {
+        error_report("novatek: %s needs a board device tree (-dtb), such "
+                     "as the SDK's cfg_53x nvt-evb.dts built",
+                     MACHINE_GET_CLASS(machine)->name);
+        exit(1);
+    }
+    binfo.ram_size = MIN(c->linux_mem, machine->ram_size);
+    binfo.loader_start = 0;
+    binfo.secure_boot = true;
+    binfo.write_secondary_boot = ns02501_write_secondary;
+    binfo.secondary_cpu_reset_hook = ns02501_reset_secondary;
+    arm_load_kernel(cpu[0], machine, &binfo);
+
+    if (!machine->kernel_filename && nms->flash_file) {
+        nvt_flash_boot(nms->flash, machine->ram_size, false);
+    }
+}
+
+#define DEFINE_NVT_NS_MACHINE(namestr, tag, config)                  \
+    static void tag##_init(MachineState *machine)                    \
+    {                                                                \
+        novatek_ns02501_init(machine, &config);                      \
+    }                                                                \
+    static void tag##_class_init(MachineClass *mc)                   \
+    {                                                                \
+        mc->desc = config.desc;                                      \
+        mc->init = tag##_init;                                       \
+        mc->default_ram_size = config.ram_size_default;              \
+        mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");       \
+        mc->max_cpus = 2;                                            \
+        mc->default_cpus = 2;                                        \
+    }                                                                \
+    DEFINE_MACHINE_EXTENDED(namestr, NVT_MACHINE, NvtMachineState,   \
+                            tag##_class_init, false,                  \
+                            arm_machine_interfaces)
+
+DEFINE_NVT_NS_MACHINE("nt98533", nt98533, nt98533_soc)
+
+/*
  * NT98331 / NT98332 / NT98631 / NT98632 (NA51103): two Cortex-A53s running
  * an aarch64 kernel, a GIC-400 and the ARMv8 generic timer, with the
  * Novatek blocks moved above 4 GiB at 0x2_F0000000.  Most of them keep
@@ -1554,7 +1932,7 @@ static const struct {
 static const NvtSoCConfig nt98332_soc = {
     .desc               = "Novatek NT98332 (2x Cortex-A53, NA51103, 1 GB)",
     .model              = "Novatek NA51103",
-    .chip_id            = 0x0000,   /* not known yet */
+    .chip_id            = 0x8B20,   /* U-Boot arch-nvt-na51103: CHIP_NA51103 */
     .ram_size_default   = 1 * GiB,
     .linux_mem          = 0x09600000,
 };
