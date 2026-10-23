@@ -507,11 +507,12 @@ static void ime_write_yuv(NvtMediaState *s)
  */
 static void ai_dump_job(NvtMediaState *s, uint32_t engine)
 {
-    static uint32_t seq;
+    static uint32_t next_seq;
     static bool ram_done[3];
+    uint32_t seq = next_seq++;
     g_autofree char *path = g_build_filename(s->ai_dump, "jobs.bin", NULL);
     uint32_t hdr[4] = {
-        cpu_to_le32(0x424a4941), cpu_to_le32(engine), cpu_to_le32(seq++),
+        cpu_to_le32(0x424a4941), cpu_to_le32(engine), cpu_to_le32(seq),
         cpu_to_le32(s->size / 4),
     };
     FILE *f;

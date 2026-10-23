@@ -173,6 +173,7 @@ if [ -n "$SAMPLES" ]; then
         while [ $p -lt "$n" ]; do p=$((p * 2)); done
         truncate -s $p "$WORK/det.img"
         DETDRIVE="-drive if=sd,index=1,format=raw,file=$WORK/det.img"
+        touch "$WORK/initramfs/smp/.detcard"     # samples.sh waits for it
     fi
     # hd_gfx_only's inputs, patterned so its results can be checked: Y is
     # (x + y) / 16, U / V ramps over the pair index, the ARGB4444 logo is
@@ -266,7 +267,9 @@ for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0 ] && break; sleep 1; done
 mount -t tmpfs -o size=1m sd /mnt && mkdir /mnt/sd /mnt/det
 # a second card with the detectors' SquashFS: which mmcblk is which
 SDCARD=/dev/mmcblk0
-for i in 1 2 3 4 5; do [ -b /dev/mmcblk1 ] && break; sleep 1; done
+if [ -f /tmp/smp/.detcard ]; then
+    for i in 1 2 3 4 5; do [ -b /dev/mmcblk1 ] && break; sleep 1; done
+fi
 for b in /dev/mmcblk0 /dev/mmcblk1; do
     if [ -b $b ] && [ "$(head -c 4 $b)" = hsqs ]; then
         mount -t squashfs -o ro $b /mnt/det

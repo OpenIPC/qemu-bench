@@ -194,8 +194,15 @@ else
          "(--ai-model, from SDK v1.01.007)" >&2
 fi
 
-# The turnkey's detectors and the pictures they read
-if [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
+# The turnkey's detectors and the pictures they read (python3 with numpy
+# and PIL makes the pictures); without them, none from an earlier build
+rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
+    "$OUT/smp/alg_fdcnn_ai2_sample"
+if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
+        ! python3 -c 'import numpy, PIL' 2>/dev/null; then
+    echo "the detectors' pictures need python3 with numpy and PIL:" \
+         "no detectors built" >&2
+elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
     H7=$SDK7/code/hdal
     T7=$H7/vendor/third_party
     DETINC="$AIINC -I$H/vendor/ai2/source/prebuilt/include/nvtnn \
