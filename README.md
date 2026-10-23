@@ -5,10 +5,10 @@ targeting QEMU v10.2.0. Boots unmodified [OpenIPC](https://openipc.org/) firmwar
 and vendor SDK kernels to a full Linux userspace on all supported platforms.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 3 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (67 total)
+## Supported Machines (68 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -281,6 +281,25 @@ device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 ¹ Ethernet works from the kernel (DHCP, a file over HTTP) and from the
 vendor U-Boot (`ping`, `dhcp`, `tftp`).
 
+### Novatek NT98533 (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98533` | 2x Cortex-A32 (as A7), 256 MB | GIC-400 | 5.10.168 vendor (SDK DT) | yes³ |
+
+Novatek's NS02501 camera die (NT98532 / NT98533), also in
+`hw/arm/novatek.c`: NA51089's peripherals at NA51089's addresses around two
+ARMv8-AArch32 cores, a GIC-400 and the generic timer, so the NT9856x
+models serve it. The machine stands in for the loader as on NT9856x, and
+the SDK's own U-Boot 2021.10 and kernel 5.10 boot from SPI NOR on both
+cores. The SD card and Ethernet work under the SDK's modules.
+`qemu-boot/build-ns02501-sdk.sh` builds everything from the SDK, and
+`qemu-boot/test-nt98533.sh` checks it. Notes in
+[docs/novatek.md](docs/novatek.md#nt98533-ns02501).
+
+³ Built from the vendor SDK (not distributable, so not in CI beyond
+`test-novatek.py`).
+
 ### Novatek NT98332 (`qemu-system-aarch64`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |
@@ -437,7 +456,7 @@ qemu/
 ├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
 ├── hw/display/mstar-ge.c        # GE 2D engine (ported)
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
-├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98332
+├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98533, NT98332
 ├── hw/arm/nvt-lzma.c            # LZMA decoder for the NA51103 boot stand-in
 ├── hw/misc/nvt-dai.c            # NA51103 audio interfaces (I2S DMA, silence)
 ├── hw/misc/nvt-engine.c         # HDAL media engines: link lists, job done

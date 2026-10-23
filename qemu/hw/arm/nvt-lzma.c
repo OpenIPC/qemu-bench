@@ -197,13 +197,20 @@ ssize_t nvt_lzma_decode(const uint8_t *in, size_t inlen,
 {
     g_autofree Lzma *z = g_new0(Lzma, 1);
     g_autofree Prob *lit = NULL;
-    uint64_t unpack = ldq_le_p(in + 5);
-    bool sized = unpack != UINT64_MAX;
+    uint64_t unpack;
+    bool sized;
     uint32_t rep0 = 0, rep1 = 0, rep2 = 0, rep3 = 0;
-    unsigned state = 0, d = in[0];
+    unsigned state = 0, d;
     size_t opos = 0, nlit;
 
-    if (!nvt_lzma_probe(in, inlen) || (sized && unpack > outmax)) {
+    /* The header is read only once the input is known to hold it */
+    if (!nvt_lzma_probe(in, inlen)) {
+        return -1;
+    }
+    unpack = ldq_le_p(in + 5);
+    sized = unpack != UINT64_MAX;
+    d = in[0];
+    if (sized && unpack > outmax) {
         return -1;
     }
     z->lc = d % 9;
