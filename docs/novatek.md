@@ -935,7 +935,7 @@ and units bound.
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
 builds them from the vendor SDK (not in CI). The run checks 75 things
-(108 with `--kmods` and an `ai_net` model, below):
+(108 with `--kmods` and an `ai_net` model, 114 with the detectors, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -1000,7 +1000,7 @@ windows in this order:
 |---|---|---|---|
 | NUE | `0xF0C60000` | 14 | vector layers: fully connected, SVM, ROI pooling, softmax |
 | NUE2 | `0xF0D50000` | 13 | preprocessing: YUV to RGB, scaling, mean subtraction |
-| CNN | `0xF0CB0000` | 11 | convolution, batch norm, activation, pooling |
+| CNN | `0xF0CB0000` | 11 | convolution, batch norm, element-wise, activation, pooling, deconvolution |
 
 Their registers are in `cnn_reg.h`, `nue_reg.h` and `nue2_reg.h`. The
 SDK's rtos tree has `kdrv_ai` as C source, and the Linux tree has it as
@@ -1072,6 +1072,21 @@ write `k1` as s32. Path 0, with result mode 1 (MODE1 [5:4],
 - The output is 16-bit (MODE0 bit 16) or 8-bit (r >> 8), signed by
   MODE0 bit 8, one a row, a vector's rows together.
 
+The detectors' heads use two more NUE modes. Both read a planar map: W
+and H at `0x040` [13:0] / [28:16], C at `0x044` [27:16], the element
+type from MODE0 bits 4 / 12. The input scale-shift at `0x0F0` is
+identity in every model.
+- **Permute** (mode 4, channel first) writes each pixel's C elements
+  together, the pixels `0x034` bytes apart. The converter stripes wide
+  maps by channel, so the gap between pixels belongs to other jobs and
+  is left alone. The shift after it is `0x1C4`.
+- **Softmax** (mode 6) works on each pixel's channels, in groups of
+  `0x0EC` [23:16]. The input shift ([7:4], bit 0 left) brings the
+  logits to Q.8, at most 12 bits. The probabilities come out in Q.15
+  through the output shift ([15:12], bit 8 left), and are written the
+  same way as permute: each pixel's channels together. The two permutes
+  that follow it in every model only undo that layout.
+
 **NUE2, preprocessing** (the 528 register layout NA51089 uses). FUNC
 `0x004` bit 0 turns on YUV to RGB, bit 1 the mean subtraction, bits
 [13:12] pick the input (0 NV12, 3 RGB planes), and bit 14 makes the
@@ -1106,9 +1121,26 @@ registers.
 - **Scale-shift stages.** Six stages (`0x0A8..0x0BC`), each
   `(x * scale) >> shift`, or `<<` with bit 0. The scale is [27:12], the
   shift [8:4].
-- **The chain.** conv, then `0x0AC`, then BN (MODE bit 8), then
-  `0x0B0`, then a clamp to 16 bits and the activation (bit 9; a ReLU
-  with a leaky slope at `0x090` / `0x094`).
+- **The chain.**
+  1. conv;
+  2. `0x0AC`;
+  3. BN (MODE bit 8), or without BN the bias;
+  4. element-wise (bit 11);
+  5. `0x0B0`;
+  6. a clamp to 16 bits and the activation (bit 9; a ReLU with a leaky
+     slope at `0x090` / `0x094`).
+
+  A job without a convolution but with BN or element-wise starts at
+  `0x0AC` with its input as it is.
+- **Bias.** Without BN the record at `0x038` is 2 bytes a set: a signed
+  12-bit bias in the low bits, `<< CONV_SHIFT_B` (`0x06C` [12:8]). It is
+  added after `0x0AC` for an 8-bit out0, and before it for a 16-bit
+  out0 (the detectors' heads).
+- **Element-wise.** The second map is at `0x03C` (pitches `0x028` /
+  `0x02C`, type `0x084` [1:0]) and goes through `0x0A8`. The result is
+  `((a * coef0) >> shift0) + ((b * coef1) >> shift1)`, or the larger of
+  the two terms (MODE [3:2] = 2), then `>> outshf`. The coefficients are
+  `0x088`, the shifts `0x084` [8:4], [16:12] and [24:20].
 - **BN.** The record at `0x038` is 8 bytes an output channel: alpha
   [23:0] unsigned, mean [35:24] and beta [47:36], both signed 12-bit.
   The stage is
@@ -1117,7 +1149,8 @@ registers.
 
   with m, b and a in `0x078` [4:0], [12:8] and [25:21].
 - **Two outputs.**
-  - out0 (`0x044`, IO bit 8) is act0, then `0x0B4`, then >> 8.
+  - out0 (`0x044`, IO bit 8) is act0, then `0x0B4`, then >> 8 if it is
+    8-bit (a 16-bit out0 keeps the fraction bits).
   - out1 (`0x048`, bit 13) is act1, then `0x0B8`, then the pooling
     (bit 10), its shift (`0x09C` [6:4]), then `0x0BC`.
 
@@ -1133,39 +1166,57 @@ registers.
 - **Output layout.** Outputs are clamped to 8 or 16 bits (IO bits 9 /
   12), signed by IO bits 6 / 7 / 14. They land planar, with the pitches
   at `0x04C..0x058`.
-- **Stripes.** A tall layer runs as row stripes that overlap and
-  recompute. Each job is self-contained, so stripes need nothing of
-  their own.
+- **Deconvolution and scale-up** (MODE [1:0] 1 / 2) run alone, into
+  out0 through `0x0B4`, with no 8.8 drop.
+  - Deconvolution spreads the map out with stride − 1 holes between
+    pixels and adds pad rows and columns (counts 0..3, `0x0A0`). The
+    holes and pads take the pad value. The convolution that completes it
+    is jobs of its own.
+  - Scale-up repeats each pixel `rate` times each way (`0x0A4`).
+- **Stripes and depthwise layers.** A tall layer runs as row stripes
+  that overlap and recompute. A depthwise layer runs as a job a channel,
+  one input and one output channel each, often in image mode. Each job
+  is self-contained, so neither needs anything of its own.
 
-Most of this is the register map. The weight and BN layouts, the 8.8
-datapath and where the scales sit are not in the SDK. They were fitted
-to the SDK's classifier:
-- the 12-bit weights correlate between neighbouring taps in that order
-  only;
-- with these choices every one of its 93 jobs keeps its int8 output in
-  range;
-- the network then names the test picture.
+Most of this is the register map. The weight, BN and bias layouts, the
+8.8 datapath and where the scales sit are not in the SDK. They were
+fitted to the SDK's networks:
+- **Weights.** The 12-bit weights correlate between neighbouring taps
+  in that order only.
+- **Ranges.** With these choices every job of the classifier keeps its
+  int8 output in range, and the classifier names its test picture.
+- **Bias.** Its placement is fitted, not read from the SDK. For 8-bit
+  outputs the bias must go after `0x0AC`: before it, the person and face
+  detectors find nothing. For 16-bit outputs it must go before:
+  after it, the person / vehicle detector finds no people, while the
+  person and face detectors change little either way.
 
 `-global nvt-media.ai-dump=DIR` writes each AI job's registers to
-`DIR/jobs.bin`, and snapshots RAM at the first CNN and NUE jobs. The
+`DIR/jobs.bin`, and snapshots RAM at the first CNN and NUE jobs and at
+each softmax (a detector head's logits). The
 fitting was done offline against those dumps, and the C model matches
 that reference bit for bit.
 
 Not modelled, and logged as unimplemented:
-- on the CNN: deconvolution and scale-up, element-wise, pre-activation,
-  tanh and sigmoid, FCD weight compression, channel stripes, out0's
+- on the CNN: element-wise multiply, pre-activation, tanh and sigmoid,
+  FCD weight compression, CONV_SHIFT_ACC, channel stripes, out0's
   intermediate mode and row offset, batches;
-- on the NUE: its other modes and kernels;
+- on the NUE: ROI pooling, reorg, anchors, permute height first, the
+  other SVM kernels;
 - on NUE2: pad, HSV and rotation.
 
-Rounding is half up at each right shift. That, the YUV to RGB matrix,
-and NUE2's output channel order (R first) are guesses that the
-classification does not pin down.
+Some details are guesses that the networks do not pin down:
+- rounding, which is half up at each right shift;
+- the YUV to RGB matrix;
+- NUE2's output channel order (R first);
+- the element-wise main input's scale;
+- the softmax's exact exp.
 
 **Modules.** As with the display, the OpenIPC release leaves the AI
 modules out and its toolchain has them (`sdk/kmod/hdal`). The SDK's init
 loads them in this order:
-1. `kdrv_ai ai_net_supported_num=2`;
+1. `kdrv_ai ai_net_supported_num=5` (the AI turnkey's `ai_ko.sh`; the
+   face detector runs as process 2, which the SDK's 2 refuses);
 2. `kflow_cnn`, `kflow_nue` and `kflow_nue2`;
 3. `kflow_cpu` and `kflow_dsp`;
 4. `kflow_ai_net`.
@@ -1202,6 +1253,41 @@ it is:
 
 A run takes about 2.5 s of host CPU.
 
+**Detectors.** The v1.01.007 AI turnkey package has id-4 detector models
+(`CNNLib/para`). SDK v1.01.007 has their samples and their closed
+post-processing libraries (`vendor/third_party`), whose anchors and NMS
+run on the CPU. Its user-space `vendor_ai2` checks for a `kdrv_ai`
+version the release modules do not report. So the builder links
+v1.01.007's samples and detector libraries with v1.01.002's
+`vendor_ai2`, which works.
+
+| sample | model | jobs | finds |
+|---|---|---|---|
+| `ai2_pdcnn_sample` | `pdcnn` (people), `public` (7 classes, to reject boxes) | 1752 a picture | people |
+| `alg_pvdcnn_sample` | `pvdcnn/nvt_model_prune37`, `public` | about 300 | people (class 1), vehicles (2) |
+| `alg_fdcnn_ai2_sample` | `fdcnn_method2_light` | about 600 | faces, five landmarks each |
+
+`cddcnn` has a library but no sample, and `frcnn` is used by neither.
+`alg_fdcnn_ai2_sample` asks for a second DDR (`NN_USE_DRAM2`), which the
+NT9856x does not have; on silicon it fails as here. The builder turns it
+off.
+
+On their pictures under QEMU:
+- **pdcnn** finds the two large people in a composite of OpenCV's
+  `messi5` and `basketball1`, and the facing person in `basketball1`. It
+  misses the one turned away, and a third person in the composite only
+  70 pixels tall (found at 0.95 with the bias after `0x0AC` in the heads
+  too).
+- **pvdcnn** finds the same three people, and the white car in the
+  SDK's dashcam frame.
+- **fdcnn** finds the astronaut's face, its landmarks on the eyes, nose
+  and mouth corners, and the facing man's face in `basketball1`.
+
+A picture takes 4..11 s of host CPU. The job runs on the vendor's own
+code end to end: the graphics engine scales the picture, NUE2 and the
+CNN and NUE run the network, and the vendor's library post-processes on
+the CPU.
+
 **Tests.** `test-novatek-hdal.sh --kmods DIR` loads the AI modules and
 checks that they load and `kdrv_ai` binds the engines. CI runs this.
 With `--samples` too, it runs `ai_op`'s five operators and checks them:
@@ -1214,7 +1300,15 @@ With `--samples` too, it runs `ai_op`'s five operators and checks them:
 
 When the samples carry the v1.01.007 model
 (`build-novatek-hdal-samples.sh --ai-model`), it also runs `ai_net`.
-Its top class must be the sea snake, at 0.3 or more.
+Its top class must be the sea snake, at 0.3 or more. With the detectors
+(`--sdk7` and `--turnkey`), it runs the three samples on their pictures.
+Their 17 MB of models and pictures is too large for the initramfs, so
+the test packs it as a SquashFS on a second SD card (`-drive
+if=sd,index=1`), and the guest copies it to the vfat card the samples
+read. It checks that each finds, near where they are:
+- **pdcnn**: the three people;
+- **pvdcnn**: the three people and the car;
+- **fdcnn**: both faces, with the astronaut's eyes within 12 pixels.
 
 `test-novatek.py` checks, at register level:
 - the idle bits;
@@ -1226,8 +1320,13 @@ Its top class must be the sea snake, at 0.3 or more.
   - a CNN 3x3 layer (12-bit weights, BN, ReLU, out0);
   - 3x3/2 max pooling;
   - global average pooling;
-  - NUE output path 0 (rho, 16 bits);
-  - NUE2's scale 0.
+  - NUE output path 0 (rho, 16 bits), with 12-bit rows of an odd
+    length;
+  - NUE2's scale 0;
+  - scales at their largest saturating;
+  - for the detectors: a convolution with a plain bias, deconvolution,
+    scale-up, the element-wise add of two s16 maps, and NUE's permute
+    and softmax.
 
 ## Display
 
@@ -1432,10 +1531,10 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   is no affine engine. The SIE
   ignores the sensor's real timing (fixed 30 fps). MD, DIS, VPE and IVE
   are not wired.
-- AI: the CNN's deconvolution, element-wise, tanh / sigmoid, FCD
-  compression, channel stripes and batches; NUE modes other than fully
-  connected (RBF and the other kernels, ROI pooling, softmax); NUE2's
-  pad, HSV and rotation. Rounding and NUE2's colour matrix are guesses.
+- AI: the CNN's tanh / sigmoid, pre-activation, FCD compression,
+  channel stripes and batches; NUE's ROI pooling, reorg, anchors and
+  other SVM kernels; NUE2's pad, HSV and rotation. Rounding, NUE2's
+  colour matrix and the element-wise main input's scale are guesses.
 - Display: DSI reads (bus turnaround returns no bytes), the IDE's 1/2/4-bit
   palettes and ARGB8565 / 4565, its colour pipeline (gamma, CST), face
   boxes and lines, and `/dev/fb0`. The release kernel has no

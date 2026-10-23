@@ -174,11 +174,7 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-arm
 
       - name: Download EV300 kernel
-        run: |
-          cd qemu-boot
-          curl -sL "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.hi3516ev300-nor-lite.tgz" \
-              -o openipc.hi3516ev300-nor-lite.tgz
-          tar xzf openipc.hi3516ev300-nor-lite.tgz
+        run: bash qemu-boot/fetch-openipc-lite.sh hi3516ev300 qemu-boot
 
       - name: Run IVE register-level tests
         timeout-minutes: 2
@@ -234,11 +230,7 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-arm
 
       - name: Download EV200 firmware
-        run: |
-          cd qemu-boot
-          curl -sL "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.hi3516ev200-nor-lite.tgz" \
-              -o openipc.hi3516ev200-nor-lite.tgz
-          tar xzf openipc.hi3516ev200-nor-lite.tgz
+        run: bash qemu-boot/fetch-openipc-lite.sh hi3516ev200 qemu-boot
 
       - name: Run Sofia ISP regression test
         timeout-minutes: 5
@@ -716,11 +708,7 @@ jobs:
           sudo touch /tmp/dnsmasq-ci.log && sudo chmod 0644 /tmp/dnsmasq-ci.log
 
       - name: Download firmware
-        run: |
-          cd qemu-boot
-          curl -sL "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.${{ matrix.soc }}-nor-lite.tgz" \
-              -o "openipc.${{ matrix.soc }}-nor-lite.tgz"
-          tar xzf "openipc.${{ matrix.soc }}-nor-lite.tgz"
+        run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
 
       - name: "OpenIPC kernel + rootfs boot"
         timeout-minutes: 3
@@ -1182,11 +1170,7 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-arm
 
       - name: Download OpenIPC firmware
-        run: |
-          cd qemu-boot
-          curl -sfL -o fw.tgz \
-            "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.${{ matrix.soc }}-nor-lite.tgz"
-          tar xzf fw.tgz
+        run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
 
       - name: Boot to PID 1 and reboot
         run: bash qemu-boot/test-novatek-boot.sh --soc ${{ matrix.soc }}

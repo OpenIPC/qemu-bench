@@ -501,24 +501,29 @@ static void ime_write_yuv(NvtMediaState *s)
  * each job's registers, in the order the jobs run, appended to DIR/jobs.bin
  * as records of "AIJB", the engine (0 NUE, 1 NUE2, 2 CNN), a sequence
  * number and the register count, then the registers, all 32-bit LE; and
- * snapshots of the guest's RAM at the first CNN job, DIR/ram.bin, and at
- * the first NUE job, DIR/ram-nue.bin.
+ * snapshots of the guest's RAM at the first CNN job, DIR/ram.bin, at the
+ * first NUE job, DIR/ram-nue.bin, and at each NUE softmax, DIR/ram-smN.bin
+ * (N its sequence number).
  */
 static void ai_dump_job(NvtMediaState *s, uint32_t engine)
 {
-    static uint32_t seq;
+    static uint32_t next_seq;
     static bool ram_done[3];
+    uint32_t seq = next_seq++;
     g_autofree char *path = g_build_filename(s->ai_dump, "jobs.bin", NULL);
     uint32_t hdr[4] = {
-        cpu_to_le32(0x424a4941), cpu_to_le32(engine), cpu_to_le32(seq++),
+        cpu_to_le32(0x424a4941), cpu_to_le32(engine), cpu_to_le32(seq),
         cpu_to_le32(s->size / 4),
     };
     FILE *f;
     uint32_t i, v;
 
-    if (engine != 1 && !ram_done[engine]) {
-        g_autofree char *rp = g_build_filename(s->ai_dump, engine ? "ram.bin" :
-                                               "ram-nue.bin", NULL);
+    bool softmax = engine == 0 && (s->regs[1] & 7) == 6;
+
+    if ((engine != 1 && !ram_done[engine]) || softmax) {
+        g_autofree char *name = softmax ? g_strdup_printf("ram-sm%u.bin", seq) :
+                                g_strdup(engine ? "ram.bin" : "ram-nue.bin");
+        g_autofree char *rp = g_build_filename(s->ai_dump, name, NULL);
         g_autofree uint8_t *ram = g_malloc(s->ai_dump_ram);
 
         ram_done[engine] = true;
