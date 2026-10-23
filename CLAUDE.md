@@ -267,11 +267,16 @@ the machine's `audiodev`. Its display engine is
 frame end with no timeout, and its handler wakes the waiter only if load
 already reads 0. So a frame clears load before raising frame end. The
 release has no display modules; OpenIPC's toolchain tarball has them
-(`sdk/kmod/hdal`, `test-novatek-hdal.sh --display-kos`). MIPI DSI
+(`sdk/kmod/hdal`, `test-novatek-hdal.sh --kmods`). MIPI DSI
 (`hw/display/nvt-dsi.c`) is interrupt-driven with untimed waits. Its
 escape triggers must clear themselves and raise escape done, and
 automatic mode raises frame end, which the driver waits for when it
-closes. The
+closes. The AI engines (NUE, NUE2, CNN) are IPP-style
+engines whose list updates have two more bits: 59 adds the list base
+register, 60 ends a job and fires it, so one list holds a network.
+`hw/misc/nvt-ai.c` computes NUE fully connected and NUE2 preprocessing;
+the SDK's models are for chip id 1 (NT98520), which `kflow_ai_net`
+refuses on 0x7021, so no network runs. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

@@ -187,9 +187,13 @@ static const struct {
     { "ife@f0c70000",     "nvt,kdrv_ife",  { { 0xF0C70000, 0x800, 8 } } },
     { "ime@f0c40000",     "nvt,kdrv_ime",  { { 0xF0C40000, 0x1000, 6 } } },
     { "dce@f0c20000",     "nvt,kdrv_dce",  { { 0xF0C20000, 0x650, 7 } } },
+    /*
+     * NUE, NUE2, CNN, in kdrv_ai's order.  The tree's CNN size, 0x22C,
+     * stops one register short of the checksum counter the driver reads.
+     */
     { "ai@f0c60000",      "nvt,kdrv_ai",
       { { 0xF0C60000, 0x23C, 14 }, { 0xF0D50000, 0x114, 13 },
-        { 0xF0CB0000, 0x22C, 11 } }, 600000000 },
+        { 0xF0CB0000, 0x230, 11 } }, 600000000 },
     { "csi@f0280000",     "nvt,nvt_csi",
       { { 0xF0280000, 0x100, 54 }, { 0xF0330000, 0x100, 55 } } },
     { "lvds@f0270000",    "nvt,nvt_lvds",
@@ -590,7 +594,11 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
         if (ni) {
             qemu_fdt_setprop(fdt, mpath, "interrupts", irqs, ni * 4);
         }
-        if (nvt_media[n].clock) {
+        if (!strcmp(nvt_media[n].compat, "nvt,kdrv_ai")) {
+            /* one rate an engine, as kdrv_ai reads it: NUE, NUE2, CNN */
+            qemu_fdt_setprop_cells(fdt, mpath, "clock-frequency",
+                                   600000000, 480000000, 600000000);
+        } else if (nvt_media[n].clock) {
             qemu_fdt_setprop_cell(fdt, mpath, "clock-frequency",
                                   nvt_media[n].clock);
         }

@@ -38,19 +38,24 @@
 # is a test tone or the host's (docs/novatek.md).  Sample keys go in on
 # stdin.
 #
-# With --display-kos DIR (the HDAL modules of OpenIPC's novatek-nt9856x
-# toolchain, toolchain/sdk/kmod/hdal, which the release leaves out) it
-# also loads the display path the SDK's way -- nvt_ide, kdrv_videoout,
+# With --kmods DIR (the HDAL modules of OpenIPC's novatek-nt9856x
+# toolchain, toolchain/sdk/kmod/hdal, which the release leaves out;
+# --display-kos is the old name) it also loads the AI engines' modules
+# (kdrv_ai and the kflow units) and checks they bind, and the display
+# path the SDK's way -- nvt_ide, kdrv_videoout,
 # kflow_videoout, nvt_dispdev_panel and the EVB's HX8238D panel -- and
 # checks that it binds the IDE.  With --samples as well it runs
 # hd_video_output_only (colour bars from a file) and hd_video_liveview
-# (the sensor), and checks QEMU's screendump of the display mid-run.
+# (the sensor), and checks QEMU's screendump of the display mid-run, and
+# ai_op's five operators: NUE's fully connected layer against the result
+# host arithmetic gives, NUE2's preprocessing (YUV to RGB, scaling, mean
+# subtraction) for its sizes and for the subtractions' consistency.
 # --panel picks the panel: pw35p00 (the EVB's, serial RGB, 320x240) or a
 # MIPI DSI one -- nt35510 (480x800), tb093 (320x1280) or ili9488
 # (320x480) -- for which nvt_dsi loads first.
 #
 #   bash qemu-boot/test-novatek-hdal.sh [--soc nt98566] [--machine nt98566] \
-#       [--samples DIR] [--display-kos DIR] [--panel pw35p00] [--dir qemu-boot] \
+#       [--samples DIR] [--kmods DIR] [--panel pw35p00] [--dir qemu-boot] \
 #       [--qemu ./qemu-src/build/qemu-system-arm]
 set -euo pipefail
 
@@ -67,7 +72,7 @@ while [ $# -gt 0 ]; do
         --soc) SOC=$2; shift 2 ;;
         --machine) MACHINE=$2; shift 2 ;;
         --samples) SAMPLES=$2; shift 2 ;;
-        --display-kos) DISPLAY_KOS=$2; shift 2 ;;
+        --kmods|--display-kos) DISPLAY_KOS=$2; shift 2 ;;
         --panel) PANEL=$2; shift 2 ;;
         --qemu) QEMU=$2; shift 2 ;;
         --dir) DIR=$2; shift 2 ;;
@@ -132,6 +137,10 @@ if [ -n "$DISPLAY_KOS" ]; then
              kflow_videoout/unit/kflow_videoout display_panel/nvt_dispdev_panel \
              display_panel/$PANEL_KO; do
         cp "$DISPLAY_KOS/$k.ko" "$WORK/initramfs/dko/"
+    done
+    for k in kdrv_ai kflow_cnn kflow_nue kflow_nue2 kflow_cpu kflow_dsp \
+             kflow_ai_net; do
+        cp "$DISPLAY_KOS/$k/$k.ko" "$WORK/initramfs/dko/"
     done
     # hd_video_output_only's 3 frames of 320x240 YUV 4:2:2, Y then CbCr
     # interleaved: the eight 75 % colour bars (BT.601)
@@ -216,6 +225,12 @@ if [ -d /dko ]; then
         echo "NVT-DISP-INSMOD: \$m rc=\$?"
     done
     \$bb dmesg | \$bb grep -a "Hello, panel" | \$bb sed 's/^.*Hello/NVT-DISP-PANEL: Hello/'
+    # the AI engines (S10_SysInit2's order; ai_op runs a second process)
+    for m in "kdrv_ai ai_net_supported_num=2" kflow_cnn kflow_nue kflow_nue2 \\
+             kflow_cpu kflow_dsp kflow_ai_net; do
+        \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/\${m%% *}.ko \$(echo \$m | \$bb cut -s -d' ' -f2-)" >/dev/null 2>&1
+        echo "NVT-AI-INSMOD: \${m%% *} rc=\$?"
+    done
 fi
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
@@ -323,6 +338,24 @@ if [ -e /dev/nvt_ide0 ] && [ -x ./hd_video_output_only ]; then
     snaprun bars hd_video_output_only 1
     snaprun live hd_video_liveview
 fi
+# the AI engines: ai_op's operators -- 0 a fully connected layer on NUE,
+# 1..4 NUE2 preprocessing -- each run with "r", its result dumped
+if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
+    for op in 0 1 2 3 4; do
+        rm -f op_user_out.bin
+        ( sleep 6; echo r; sleep 14; echo q ) | timeout 60 ./ai_op $op > /tmp/ai_op.out 2>&1
+        RC=$?
+        ERRS=$(grep -c -i 'err\|fail' /tmp/ai_op.out)
+        echo "NVT-HDAL-RUN: ai_op $op rc=$RC errors=$ERRS"
+        grep -i 'err\|fail' /tmp/ai_op.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
+        echo "NVT-AI-OUT: $op $(size op_user_out.bin) $(md5sum < op_user_out.bin | cut -c1-32)"
+        case $op in 1|3|4)
+            echo "NVT-AI-B64-BEGIN $op"
+            base64 op_user_out.bin
+            echo "NVT-AI-B64-END $op";;
+        esac
+    done
+fi
 rm -f /mnt/sd/*
 run hd_audio_capture_only
 echo "NVT-HDAL-AUDIO-BYTES: $(size /mnt/sd/audio_bs_16_2_48000_pcm.dat)"
@@ -413,6 +446,11 @@ if [ -n "$DISPLAY_KOS" ]; then
         expect "NVT-HDAL-BOUND: $b[[:space:]]*\$" "display: ${b% *} bound by ${b#* }"
     done
     expect "NVT-DISP-PANEL: Hello, panel: $PANEL_HELLO" "display: the $PANEL panel driver is up"
+    for m in kdrv_ai kflow_cnn kflow_nue kflow_nue2 kflow_cpu kflow_dsp \
+             kflow_ai_net; do
+        expect "NVT-AI-INSMOD: $m rc=0" "AI: $m loads"
+    done
+    expect "NVT-HDAL-BOUND: f0c60000.ai kdrv_ai[[:space:]]*\$" "AI: the engines bound by kdrv_ai"
 fi
 
 if [ -n "$SAMPLES" ]; then
@@ -639,6 +677,45 @@ PY
             case "$look" in *live=$PANEL_SIZE:1*) pass "the panel shows the sensor's picture through hd_video_liveview";;
                 *) bad "the panel shows the sensor's picture through hd_video_liveview ($look)";; esac
         fi
+    fi
+    # The AI engines: ai_op 0 fills inputs and weights with i & 7, so all
+    # 10240 outputs are sum((k & 7)^2) = 4480; ops 1..4 are the test
+    # picture in RGB planes -- 512x376, scaled to 384x282, less a planar
+    # mean of 128, less DC means 128 / 127 / 126 -- which must agree.
+    if [ -n "$DISPLAY_KOS" ]; then
+        for op in 0 1 2 3 4; do
+            expect "NVT-HDAL-RUN: ai_op $op rc=0 errors=0" "ai_op $op runs without an error"
+        done
+        expect "NVT-AI-OUT: 0 40960 $(python3 -c "
+import hashlib, struct
+print(hashlib.md5(struct.pack('<i', 4480) * 10240).hexdigest())")" \
+            "ai_op 0: NUE's fully connected layer gives the host's 10240 x 4480"
+        expect "NVT-AI-OUT: 2 324864 " "ai_op 2: NUE2 scales to 384x282 (R, G, B planes)"
+        for op in 1 3 4; do
+            sed -n "/NVT-AI-B64-BEGIN $op/,/NVT-AI-B64-END $op/p" "$WORK/console.log" |
+                grep -a -v 'NVT-AI' | tr -d '\r' | base64 -d > "$WORK/ai$op.bin" 2>/dev/null || true
+        done
+        look=$(python3 - "$WORK" <<'PY' 2>/dev/null || true
+import sys
+w = sys.argv[1]
+a1, a3, a4 = (open('%s/ai%d.bin' % (w, n), 'rb').read() for n in (1, 3, 4))
+n = 512 * 376
+ok = len(a1) == len(a3) == len(a4) == 3 * n
+planar = ok and all(a3[i] == max(a1[i] - 128, 0) for i in range(0, 3 * n, 7))
+dc = ok and all(a4[i] == max(a1[i] - (128, 127, 126)[i // n], 0)
+                for i in range(0, 3 * n, 7))
+means = [sum(a1[c * n:(c + 1) * n:13]) / len(a1[c * n:(c + 1) * n:13])
+         for c in range(3)] if ok else []
+print('sizes=%d planar=%d dc=%d picture=%d' % (ok, planar, dc,
+      ok and all(120 < m < 240 for m in means)))
+PY
+)
+        case "$look" in *sizes=1*) pass "ai_op 1 / 3 / 4: NUE2's 512x376 RGB planes";;
+            *) bad "ai_op 1 / 3 / 4: NUE2's 512x376 RGB planes ($look)";; esac
+        case "$look" in *planar=1*dc=1*) pass "ai_op 3 / 4: the planar and DC mean subtractions agree with op 1's picture";;
+            *) bad "ai_op 3 / 4: the mean subtractions agree with op 1's picture ($look)";; esac
+        case "$look" in *picture=1*) pass "ai_op 1: the test picture's colours (a sunlit scene)";;
+            *) bad "ai_op 1: the test picture's colours ($look)";; esac
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what
     # output_only and livesound played to the wav audiodev, and the AAC

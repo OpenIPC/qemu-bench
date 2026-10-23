@@ -31,6 +31,7 @@
 #include "qapi/error.h"
 #include "qom/object.h"
 #include "system/dma.h"
+#include "hw/misc/nvt-ai.h"
 #include "hw/misc/nvt-gfx.h"
 #include "hw/misc/nvt-h26x.h"
 #include "hw/misc/nvt-pixel.h"
@@ -241,6 +242,8 @@ typedef struct {
     uint32_t trig;              /* control bit of a single, list-less job */
     uint32_t trig_end;          /* and its status */
     uint32_t ll_err;            /* status of a broken list, 0: list end */
+    hwaddr ll_base;             /* the base bit-59 updates add, 0: none */
+    hwaddr idle;                /* reads with bit 15 set (engine idle) */
 } NvtIppParams;
 
 #define IPP_CTRL            0x00
@@ -249,6 +252,8 @@ typedef struct {
 
 #define IPP_LL_MAX_CMDS     4096
 #define IPP_CMD_UPD         4
+#define IPP_UPD_BASE        (1ull << 59)    /* AI: value + list base */
+#define IPP_UPD_FIRE        (1ull << 60)    /* AI: the job's last update */
 #define IPP_CMD_NXTUPD      2
 #define IPP_CMD_NXTLL       1
 #define IPP_CMD_NULL        0
@@ -279,6 +284,39 @@ static const NvtIppParams ipp_grph = {
     0x08, 0x0C, 0xD0, 0x00, 0x02, (1u << 1) | (1u << 29), 1u << 0, 0x01,
     1u << 2,
 };
+
+/*
+ * The AI engines (kdrv_ai: cnn_reg.h, nue_reg.h, nue2_reg.h), in the
+ * "ai" node's order NUE, NUE2, CNN.  Control bit 0 resets, bit 1 runs a
+ * job set up in the registers (done: status bit 0), bit 28 fires a list
+ * (job end bit 10, list end bit 8, a broken list bit 9).  Lists start at
+ * the address register; an update with bit 59 adds the list base
+ * register to its value, one with bit 60 is the job's last and fires it.
+ * Bit 15 of the DMA-disable register reads idle.
+ */
+static const NvtIppParams ipp_nue = {
+    0x038, 0x03C, 0x024, 1u << 10, 1u << 8, 1u << 0, 1u << 1, 1u << 0,
+    1u << 9, 0x1CC, 0x1AC,
+};
+static const NvtIppParams ipp_nue2 = {
+    0x03C, 0x040, 0x014, 1u << 10, 1u << 8, 1u << 0, 1u << 1, 1u << 0,
+    1u << 9, 0x09C, 0x098,
+};
+static const NvtIppParams ipp_cnn = {
+    0x008, 0x00C, 0x040, 1u << 10, 1u << 8, 1u << 0, 1u << 1, 1u << 0,
+    1u << 9, 0x204, 0x1FC,
+};
+
+static bool ai_read(NvtMediaState *s, hwaddr off, uint64_t *val)
+{
+    const NvtIppParams *p = s->engine->opaque;
+
+    if (off == p->idle) {
+        *val |= 1u << 15;
+        return true;
+    }
+    return false;
+}
 
 static void ipp_update_irq(NvtMediaState *s)
 {
@@ -316,15 +354,18 @@ static void nvt_media_write(void *opaque, hwaddr off, uint64_t val,
 typedef enum {
     IPP_LL_NEXT,                /* a job set up, another follows */
     IPP_LL_LAST,                /* the last job set up */
+    IPP_LL_END,                 /* the list ends with no job left */
     IPP_LL_BROKEN,              /* unreadable, malformed or endless */
 } IppLlResult;
 
 /* Apply one list's updates up to the end of its job. */
 static IppLlResult ipp_run_job(NvtMediaState *s)
 {
+    const NvtIppParams *p = s->engine->opaque;
     hwaddr addr = s->ll_addr;
     uint64_t cmd;
-    uint32_t off, mask, i;
+    uint32_t off, mask, i, val;
+    bool upd = false;
     int n;
 
     for (n = 0; n < IPP_LL_MAX_CMDS; n++, addr += 8) {
@@ -347,8 +388,16 @@ static IppLlResult ipp_run_job(NvtMediaState *s)
                     mask |= 0xFFu << (8 * i);
                 }
             }
-            nvt_media_write(s, off, (*reg(s, off) & ~mask) |
-                            ((uint32_t)cmd & mask), 4);
+            val = cmd;
+            if ((cmd & IPP_UPD_BASE) && p->ll_base) {
+                val += *reg(s, p->ll_base);
+            }
+            nvt_media_write(s, off, (*reg(s, off) & ~mask) | (val & mask), 4);
+            upd = true;
+            if ((cmd & IPP_UPD_FIRE) && p->ll_base) {
+                s->ll_addr = addr + 8;  /* the job's last: run it, go on */
+                return IPP_LL_NEXT;
+            }
             break;
         case IPP_CMD_NXTUPD:
             addr = ((cmd >> 8) & 0xFFFFFFFF) - 8;
@@ -357,7 +406,8 @@ static IppLlResult ipp_run_job(NvtMediaState *s)
             s->ll_addr = (cmd >> 8) & 0xFFFFFFFF;
             return IPP_LL_NEXT;
         case IPP_CMD_NULL:
-            return IPP_LL_LAST;
+            /* an AI list's jobs end in fired updates: none may be left */
+            return upd || !p->ll_base ? IPP_LL_LAST : IPP_LL_END;
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "nvt-media %s: linked list "
                           "command 0x%016" PRIx64 "\n", s->engine_name, cmd);
@@ -440,6 +490,10 @@ static void ipp_job_work(NvtMediaState *s)
         nvt_gfx_grph_run(s->regs);
     } else if (s->engine->opaque == &ipp_ise) {
         nvt_gfx_ise_run(s->regs);
+    } else if (s->engine->opaque == &ipp_nue) {
+        nvt_ai_nue_run(s->regs);
+    } else if (s->engine->opaque == &ipp_nue2) {
+        nvt_ai_nue2_run(s->regs);
     }
 }
 
@@ -460,6 +514,11 @@ static void ipp_job_done(NvtMediaState *s)
     if (res == IPP_LL_BROKEN) {
         /* no work done; the list error, where the engine has one */
         *reg(s, p->ints) |= p->ll_err ? p->ll_err : p->job_end | p->ll_end;
+        ipp_update_irq(s);
+        return;
+    }
+    if (res == IPP_LL_END) {
+        *reg(s, p->ints) |= p->ll_end;
         ipp_update_irq(s);
         return;
     }
@@ -733,6 +792,12 @@ static const NvtMediaEngine nvt_media_engines[] = {
       &ipp_grph },
     { "graphic2", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq,
       &ipp_grph },
+    { "ai", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
+      &ipp_nue },
+    { "ai2", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
+      &ipp_nue2 },
+    { "ai3", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
+      &ipp_cnn },
 };
 
 static uint64_t nvt_media_read(void *opaque, hwaddr off, unsigned size)
