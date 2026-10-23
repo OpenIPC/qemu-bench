@@ -6,8 +6,8 @@
 # (hd_video_record), JPEG snapshots, capture alone, encoding frames from
 # a file, the 2D graphics engine, the display (a file, and the sensor
 # live), audio capture, playback, live loopback and AAC recording, and the
-# AI engines' operators (ai_op).  They are vendor code, as
-# is the SDK, so neither is in the repository or in CI.
+# AI engines' operators (ai_op) and a network (ai_net).  They are vendor
+# code, as is the SDK, so neither is in the repository or in CI.
 #
 # They run against the OpenIPC release's own libhdal.so, the library
 # OpenIPC's kernel modules match.  That library is a uClibc build
@@ -30,19 +30,28 @@
 # with enc_exit already set).  The race is the sample's, on silicon as
 # here; the build joins the feed thread before the encoder stops.
 #
+# ai_net classifies ai_pattern's picture with an ImageNet network.  The
+# SDK v1.01.002's ai_pattern/para/nvt_model.bin is built for the NT98520
+# (model chip id 1), which kflow_ai_net refuses on this chip; v1.01.007
+# ships the same network built for it (chip id 4).  --ai-model gives
+# that one; a model with another chip id is left out, and ai_net with it.
+#
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
+#       [--ai-model <v1.01.007 SDK>/code/hdal/samples/ai_pattern/para/nvt_model.bin] \
 #       [--cross /opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-]
 set -euo pipefail
 
 SDK=
 ROOTFS=
+AIMODEL=
 OUT=$PWD/novatek-hdal-samples
 CROSS=/opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-
 while [ $# -gt 0 ]; do
     case "$1" in
         --sdk) SDK=$2; shift 2 ;;
         --rootfs) ROOTFS=$2; shift 2 ;;
+        --ai-model) AIMODEL=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         --cross) CROSS=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
@@ -150,7 +159,18 @@ build_ai() {        # build_ai <sample>
     echo "built $1"
 }
 build_ai ai_op
-mkdir -p "$OUT/smp/jpg"
+build_ai ai_net
+mkdir -p "$OUT/smp/jpg" "$OUT/smp/para" "$OUT/smp/accuracy"
 cp "$H/samples/ai_pattern/jpg/YUV420_SP_W512H376.bin" "$OUT/smp/jpg/"
+cp "$H/samples/ai_pattern/accuracy/labels.txt" "$OUT/smp/accuracy/"
+# the model's chip id: its first 16 bits (4 is this chip, 1 the NT98520)
+AIMODEL=${AIMODEL:-$H/samples/ai_pattern/para/nvt_model.bin}
+if [ "$(od -An -tu2 -N2 "$AIMODEL" | tr -d ' ')" = 4 ]; then
+    cp "$AIMODEL" "$OUT/smp/para/nvt_model.bin"
+else
+    rm -f "$OUT/smp/para/nvt_model.bin"
+    echo "$AIMODEL is not built for this chip (chip id 4): no ai_net model" \
+         "(--ai-model, from SDK v1.01.007)" >&2
+fi
 find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +
 echo "Samples and their runtime in $OUT"

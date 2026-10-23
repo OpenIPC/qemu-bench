@@ -14,5 +14,6 @@
  */
 void nvt_ai_nue_run(const uint32_t *regs);
 void nvt_ai_nue2_run(const uint32_t *regs);
+void nvt_ai_cnn_run(const uint32_t *regs);
 
 #endif

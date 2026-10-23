@@ -271,9 +271,15 @@ automatic mode raises frame end, which the driver waits for when it
 closes. The AI engines (NUE, NUE2, CNN) are IPP-style
 engines whose list updates have two more bits: 59 adds the list base
 register, 60 ends a job and fires it, so one list holds a network.
-`hw/misc/nvt-ai.c` computes NUE fully connected and NUE2 preprocessing;
-the SDK's models are for chip id 1 (NT98520), which `kflow_ai_net`
-refuses on 0x7021, so no network runs. The
+`hw/misc/nvt-ai.c` computes the CNN's layers, NUE's fully connected and
+NUE2's preprocessing, on a worker thread (a layer can take 200 ms). The
+weights are 12-bit LSB-first streams, 8-bit operands count x 16 in the
+multiplier, and the CNN datapath is 8.8 fixed point. These were fitted
+to the SDK's classifier with `-global nvt-media.ai-dump=DIR` (job
+registers and RAM). SDK v1.01.002's models are for chip id 1 (NT98520),
+which `kflow_ai_net` refuses on 0x7021; v1.01.007's `ai_pattern` model is
+the same network for chip id 4, and under QEMU it names the test
+picture (a sea snake). The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands

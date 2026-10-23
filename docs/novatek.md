@@ -863,7 +863,7 @@ and units bound.
 With `--samples DIR` it also runs the SDK's HDAL sample programs, with
 their files on an emulated SD card. `qemu-boot/build-novatek-hdal-samples.sh`
 builds them from the vendor SDK (not in CI). The run checks 75 things
-(106 with `--kmods`, below):
+(108 with `--kmods` and an `ai_net` model, below):
 - `hd_video_record` (sensor, SIE, the IPP, H.265) and
   `hd_video_encode_only` (H.265 and H.264, from a patterned file) write
   their bitstreams. With x264 / x265 built in, and ffmpeg on the host:
@@ -892,7 +892,8 @@ builds them from the vendor SDK (not in CI). The run checks 75 things
   file) and `hd_video_liveview` (the sensor) put their pictures on the
   panel: QEMU's screendump of each, taken half way, shows the bars.
 - with the AI modules, `ai_op`'s five operators give the results
-  [AI engines](#ai-engines) lists.
+  [AI engines](#ai-engines) lists, and `ai_net`'s ImageNet classifier
+  calls the test picture a sea snake.
 
 None of them reports an HDAL error.
 
@@ -927,7 +928,7 @@ windows in this order:
 |---|---|---|---|
 | NUE | `0xF0C60000` | 14 | vector layers: fully connected, SVM, ROI pooling, softmax |
 | NUE2 | `0xF0D50000` | 13 | preprocessing: YUV to RGB, scaling, mean subtraction |
-| CNN | `0xF0CB0000` | 11 | convolution, batch norm, activation, pooling, element-wise |
+| CNN | `0xF0CB0000` | 11 | convolution, batch norm, activation, pooling |
 
 Their registers are in `cnn_reg.h`, `nue_reg.h` and `nue2_reg.h`. The
 SDK's rtos tree has `kdrv_ai` as C source, and the Linux tree has it as
@@ -955,44 +956,133 @@ The AI lists add two bits to the IPP's update command:
   carries on with the next command, so one list holds a whole network,
   a layer a job. There is no job-end command between them.
 
-`hw/misc/nvt-ai.c` does the work of a job:
+`hw/misc/nvt-ai.c` does the work of a job. The jobs run on a worker
+thread with a copy of the registers, because a CNN layer can take
+200 ms of host time. The job's done interrupt follows when the work
+comes back. A reset voids a job in flight. A job running at a migration
+runs again on the destination.
 
-- **NUE, fully connected** (`kdrv_ai_tran_nue_fc_parm`): mode 0 (SVM)
-  with kernel 1 in dot mode, output path 1 or 3. The inputs (`0x00C`)
-  and weight rows (`0x014`) are 8 or 16 bits, signed or not. The weight
-  row length is at `0x040` [13:0], the rows [28:16], the input vectors at
-  `0x048`. Each output is an s32 at `0x02C`:
+**NUE, fully connected** (`kdrv_ai_tran_nue_fc_parm`) is mode 0 (SVM)
+with kernel 1 in dot mode.
+- The inputs (`0x00C`) are 8 or 16 bits, MODE0 bit 12, signed by bit 4.
+- The weight rows (`0x014`) are 12-bit, an LSB-first bit stream. With
+  MODE1 bit 21 (quantised) they are 8-bit.
+- 8-bit operands enter the 12-bit multiplier top-aligned, so each one
+  counts x 16. `ai_op`'s 8-bit inputs and weights therefore come out
+  x 256, and the classifier's u8 inputs against 12-bit weights x 16.
+- The weight row length is at `0x040` [13:0], the rows at [28:16], and
+  the input vectors at `0x048`.
 
-      out[o][j] = ((sum_k ((x[o][k] * 256 * w[j][k]) >> fshift)) * gain
-                   >> gshift) + offset
+The kernel's result is
 
-  where gain and its shift are at `0x04C`, and the offset (21 bits,
-  signed) and fshift, the SDK's weight shift, at `0x050`. fshift
-  applies to each product before the sum. The x 256 is the 8 fraction bits 8-bit
-  data carries through the datapath. `vendor_ai_op` asks for a total
-  shift 8 more than the fractions add up to, and `kdrv_ai_fc_done`
-  shifts 8-bit results by 8 more than 16-bit ones. 16-bit data has no
-  x 256.
-- **NUE2, preprocessing** (the 528 register layout NA51089 uses). FUNC
-  `0x004` bit 0 turns on YUV to RGB, bit 1 the mean subtraction, bits
-  [13:12] pick the input (0 NV12, 3 RGB planes), and bit 14 makes the
-  output signed. The pipeline is:
-  1. YUV to RGB, full-range BT.601 with chroma replicated;
-  2. bilinear scaling from `0x044` to `0x058`, corners to corners. The
-     step `kdrv` programs is (in − 1) / (out − 1);
-  3. the mean subtraction: a DC mean a channel (`0x060`), or planar
-     (`0x010`, R G B bytes a pixel, its size at `0x05C`, replicated by
-     `0x060` [25:24]);
-  4. the scale-shift at `0x07C`;
-  5. a clamp to the output's range.
+    k1[o][j] = ((sum_k ((x'[o][k] * w'[j][k]) >> fshift)) * gain
+                >> gshift) + offset
 
-  The outputs go to `0x018..` with line offsets at `0x030..`.
+where gain and its shift are at `0x04C`, and the offset (21 bits,
+signed) and fshift, the SDK's weight shift, at `0x050`. fshift applies
+to each product before the sum. Output paths 1 and 3 (MODE1 [9:8])
+write `k1` as s32. Path 0, with result mode 1 (MODE1 [5:4],
+`SUB_RHO`), is the classifier's:
 
-Nothing in the SDK fixes NUE2's colour matrix or its rounding, or the
-NUE's rounding (a floor here). The other NUE modes and kernels (bias,
-ReLU, RBF, ROI pooling, softmax) and NUE2's pad, HSV and rotation log as
-unimplemented. The CNN completes its jobs and lists but computes
-nothing.
+    r = (k1 >> rho_fmt) - rho[j]
+
+- `rho_fmt` is `0x058` [19:16] + 3.
+- `rho` is a 12-bit value a row, from the same kind of stream at
+  `0x01C`. With MODE1 bit 11 it is the constant at `0x058` [11:0].
+- Then comes the ReLU (MODE1 bit 25, its slope at `0x054`), and its
+  shift, `0x054` [23:20] (bit 16 makes it a left shift).
+- The output is 16-bit (MODE0 bit 16) or 8-bit (r >> 8), signed by
+  MODE0 bit 8, one a row, a vector's rows together.
+
+**NUE2, preprocessing** (the 528 register layout NA51089 uses). FUNC
+`0x004` bit 0 turns on YUV to RGB, bit 1 the mean subtraction, bits
+[13:12] pick the input (0 NV12, 3 RGB planes), and bit 14 makes the
+output signed. The pipeline is:
+1. YUV to RGB, full-range BT.601 with chroma replicated;
+2. bilinear scaling from `0x044` to `0x058`, corners to corners. The
+   step `kdrv` programs is (in − 1) / (out − 1);
+3. the mean subtraction: a DC mean a channel (`0x060`), or planar
+   (`0x010`, R G B bytes a pixel, its size at `0x05C`, replicated by
+   `0x060` [25:24]);
+4. the scale-shift at `0x07C`. A scale of 0 means no scale-shift: the
+   classifier uses it, and wants plain pixel less mean;
+5. a clamp to the output's range.
+
+The outputs go to `0x018..` with line offsets at `0x030..`.
+
+**CNN** (`cnn_reg.h`; the driver's mapping is `kdrv_ai_tran_cnn_parm`).
+A job is one layer, or one stripe of a layer, described entirely by its
+registers.
+- **Input.** `0x010`, with its line and channel pitch at `0x020` /
+  `0x024`. It is W x H x C at `0x05C` / `0x060`, 8 or 16 bits (IO
+  `0x064` bit 5), signed by bit 4. Bit 0 is image mode, which the 7x7
+  stem uses.
+- **Convolution** (MODE `0x004` bit 12).
+  - The kernel comes from `0x068` [3:0] (11x11, 7x7, 5x5, 3x3, 1x1, the
+    1-D shapes, 9x9), the stride from [5:4], the output channels
+    ("sets") from [19:8].
+  - Each padded side (`0x06C` [3:0]) pads half the kernel with zeros.
+  - The weights at `0x030` are 12-bit signed, an LSB-first bit stream
+    ordered [set][channel][ky][kx]. `0x0D4` holds their length in bits.
+  - The accumulator is wide, and 16-bit inputs lose 8 bits first.
+- **Scale-shift stages.** Six stages (`0x0A8..0x0BC`), each
+  `(x * scale) >> shift`, or `<<` with bit 0. The scale is [27:12], the
+  shift [8:4].
+- **The chain.** conv, then `0x0AC`, then BN (MODE bit 8), then
+  `0x0B0`, then a clamp to 16 bits and the activation (bit 9; a ReLU
+  with a leaky slope at `0x090` / `0x094`).
+- **BN.** The record at `0x038` is 8 bytes an output channel: alpha
+  [23:0] unsigned, mean [35:24] and beta [47:36], both signed 12-bit.
+  The stage is
+
+      y = ((x - (mean << m)) * alpha >> a) + (beta << b)
+
+  with m, b and a in `0x078` [4:0], [12:8] and [25:21].
+- **Two outputs.**
+  - out0 (`0x044`, IO bit 8) is act0, then `0x0B4`, then >> 8.
+  - out1 (`0x048`, bit 13) is act1, then `0x0B8`, then the pooling
+    (bit 10), its shift (`0x09C` [6:4]), then `0x0BC`.
+
+  The datapath carries 8.8 fixed point, which out0 drops at its end and
+  out1's scale already folds in. A job without convolution feeds its
+  input straight to the outputs: a pooling layer.
+- **Pooling.**
+  - Local pooling is max or average (`0x098` bit 0), 2x2..5x5
+    ([9:8]), stride 1 or 2 (bit 4), pads of half the kernel, ceil or
+    floor (bit 1).
+  - Global pooling (MODE bit 5) is `sum * mul >> (shift + 10)` (`0x09C`
+    [18:8], [24:20]).
+- **Output layout.** Outputs are clamped to 8 or 16 bits (IO bits 9 /
+  12), signed by IO bits 6 / 7 / 14. They land planar, with the pitches
+  at `0x04C..0x058`.
+- **Stripes.** A tall layer runs as row stripes that overlap and
+  recompute. Each job is self-contained, so stripes need nothing of
+  their own.
+
+Most of this is the register map. The weight and BN layouts, the 8.8
+datapath and where the scales sit are not in the SDK. They were fitted
+to the SDK's classifier:
+- the 12-bit weights correlate between neighbouring taps in that order
+  only;
+- with these choices every one of its 93 jobs keeps its int8 output in
+  range;
+- the network then names the test picture.
+
+`-global nvt-media.ai-dump=DIR` writes each AI job's registers to
+`DIR/jobs.bin`, and snapshots RAM at the first CNN and NUE jobs. The
+fitting was done offline against those dumps, and the C model matches
+that reference bit for bit.
+
+Not modelled, and logged as unimplemented:
+- on the CNN: deconvolution and scale-up, element-wise, pre-activation,
+  tanh and sigmoid, FCD weight compression, channel stripes, out0's
+  intermediate mode and row offset, batches;
+- on the NUE: its other modes and kernels;
+- on NUE2: pad, HSV and rotation.
+
+Rounding is half up at each right shift. That, the YUV to RGB matrix,
+and NUE2's output channel order (R first) are guesses that the
+classification does not pin down.
 
 **Modules.** As with the display, the OpenIPC release leaves the AI
 modules out and its toolchain has them (`sdk/kmod/hdal`). The SDK's init
@@ -1008,13 +1098,31 @@ loads them in this order:
 - operators 1..4 are NUE2's preprocessing of a 512x376 NV12 picture,
   which the builder copies from the SDK's `ai_pattern`.
 
-**Networks.** `ai_net` and the other network samples do not run, on
-QEMU or on silicon: no model in the SDK is built for this chip. Every
-model has chip id 1 (`NN_CHIP_CNN25_A`, the NT98520 / NA51055; see
-`nn_verinfo.h`). The release's `kflow_ai_net` accepts only id 4 on chip
-`0x7021`, and refuses the model before it touches an engine:
+**Networks.** `ai_net` runs a model through `kflow_ai_net` as one
+linked list per engine. A model carries its chip id (`nn_verinfo.h`),
+and the release's `kflow_ai_net` accepts only id 4 on chip `0x7021`.
+The SDK v1.01.002's `ai_pattern/para/nvt_model.bin` has id 1
+(`NN_CHIP_CNN25_A`, the NT98520), so on this chip it is refused:
 
     nvt_ai_chk_vers() chip(0x00007021) not support id(0x00000001)
+
+SDK v1.01.007 ships the same network built for this chip (id 4). It is
+BN-Inception, ImageNet's 1000 classes, 17 MB, and runs as:
+- NUE2's preprocessing to 224x224;
+- 93 CNN jobs;
+- four NUE FC jobs;
+- softmax on the CPU.
+
+The v1.01.007 AI turnkey package has id-4 detectors as well (`pdcnn`,
+`cddcnn`, `pvdcnn`, `frcnn`). Under QEMU, with the release's modules and
+the v1.01.002 `ai_net`, the classifier calls `ai_pattern`'s picture what
+it is:
+
+    1. no=65, label=sea snake, score=0.514828
+    2. no=58, label=water snake, score=0.286910
+    3. no=67, label=diamondback, diamondback rattlesnake, ..., score=0.064323
+
+A run takes about 2.5 s of host CPU.
 
 **Tests.** `test-novatek-hdal.sh --kmods DIR` loads the AI modules and
 checks that they load and `kdrv_ai` binds the engines. CI runs this.
@@ -1026,12 +1134,22 @@ With `--samples` too, it runs `ai_op`'s five operators and checks them:
   mean (128) and the DC means (128, 127, 126);
 - operator 1's channels are the test picture's colours.
 
+When the samples carry the v1.01.007 model
+(`build-novatek-hdal-samples.sh --ai-model`), it also runs `ai_net`.
+Its top class must be the sea snake, at 0.3 or more.
+
 `test-novatek.py` checks, at register level:
 - the idle bits;
 - a fully connected job;
 - an NV12 picture scaled and mean-subtracted;
 - a CNN list of two jobs fired by bit-60 updates, one value based by
-  bit 59, whose list end runs neither job again.
+  bit 59, whose list end runs neither job again;
+- the compute against its own arithmetic:
+  - a CNN 3x3 layer (12-bit weights, BN, ReLU, out0);
+  - 3x3/2 max pooling;
+  - global average pooling;
+  - NUE output path 0 (rho, 16 bits);
+  - NUE2's scale 0.
 
 ## Display
 
@@ -1236,11 +1354,10 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   is no affine engine. The SIE
   ignores the sensor's real timing (fixed 30 fps). MD, DIS, VPE and IVE
   are not wired.
-- AI: the CNN engine's layers (it completes its jobs and lists but
-  computes nothing), NUE modes other than fully connected (bias, ReLU,
-  RBF and the other kernels, ROI pooling, softmax), and NUE2's pad, HSV
-  and rotation. The SDK's models are built for the NT98520 and do not
-  load on this chip, so no network runs end to end.
+- AI: the CNN's deconvolution, element-wise, tanh / sigmoid, FCD
+  compression, channel stripes and batches; NUE modes other than fully
+  connected (RBF and the other kernels, ROI pooling, softmax); NUE2's
+  pad, HSV and rotation. Rounding and NUE2's colour matrix are guesses.
 - Display: DSI reads (bus turnaround returns no bytes), the IDE's 1/2/4-bit
   palettes and ARGB8565 / 4565, its colour pipeline (gamma, CST), face
   boxes and lines, and `/dev/fb0`. The release kernel has no

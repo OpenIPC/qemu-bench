@@ -49,7 +49,11 @@
 # (the sensor), and checks QEMU's screendump of the display mid-run, and
 # ai_op's five operators: NUE's fully connected layer against the result
 # host arithmetic gives, NUE2's preprocessing (YUV to RGB, scaling, mean
-# subtraction) for its sizes and for the subtractions' consistency.
+# subtraction) for its sizes and for the subtractions' consistency; and,
+# when the samples carry a model built for this chip
+# (build-novatek-hdal-samples.sh --ai-model), ai_net, the SDK's ImageNet
+# classifier (NUE2, 93 CNN jobs, NUE's FC), which must call ai_pattern's
+# picture a sea snake.
 # --panel picks the panel: pw35p00 (the EVB's, serial RGB, 320x240) or a
 # MIPI DSI one -- nt35510 (480x800), tb093 (320x1280) or ili9488
 # (320x480) -- for which nvt_dsi loads first.
@@ -355,6 +359,15 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
             echo "NVT-AI-B64-END $op";;
         esac
     done
+    # a network: the SDK's ImageNet classifier on ai_pattern's picture
+    if [ -f para/nvt_model.bin ] && [ -x ./ai_net ]; then
+        ( sleep 8; echo r; sleep 40; echo q ) | timeout 120 ./ai_net 0 -1 0 > /tmp/ai_net.out 2>&1
+        RC=$?
+        ERRS=$(grep -c -i 'err\|fail' /tmp/ai_net.out)
+        echo "NVT-HDAL-RUN: ai_net rc=$RC errors=$ERRS"
+        grep -i 'err\|fail' /tmp/ai_net.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
+        grep '^[1-5]\. no=' /tmp/ai_net.out | sed 's/^/NVT-AI-NET: /'
+    fi
 fi
 rm -f /mnt/sd/*
 run hd_audio_capture_only
@@ -716,6 +729,24 @@ PY
             *) bad "ai_op 3 / 4: the mean subtractions agree with op 1's picture ($look)";; esac
         case "$look" in *picture=1*) pass "ai_op 1: the test picture's colours (a sunlit scene)";;
             *) bad "ai_op 1: the test picture's colours ($look)";; esac
+        # ai_net, when the samples carry a model for this chip: NUE2, the
+        # CNN's 93 jobs and NUE's FC must make it a sea snake (ImageNet 65)
+        if [ -f "$SAMPLES/smp/para/nvt_model.bin" ]; then
+            expect "NVT-HDAL-RUN: ai_net rc=0 errors=0" "ai_net runs without an error"
+            top=$(grep -a -m1 'NVT-AI-NET: 1\. no=' "$WORK/console.log" | tr -d '\r' || true)
+            score=$(echo "$top" | sed -n 's/.*score=\([0-9.]*\).*/\1/p')
+            case "$top" in
+            *"no=65, label=sea snake"*)
+                if awk "BEGIN { exit !(${score:-0} >= 0.3) }"; then
+                    pass "ai_net: the picture is a sea snake ($score)"
+                else
+                    bad "ai_net: a sea snake, but only at $score"
+                fi;;
+            *) bad "ai_net: the picture is a sea snake (${top:-no result})";;
+            esac
+        else
+            echo "SKIP: ai_net (the samples carry no model for this chip)"
+        fi
     fi
     # The audio: the captured test tone (1 kHz left, 1.5 kHz right), what
     # output_only and livesound played to the wav audiodev, and the AAC

@@ -24,11 +24,13 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "block/thread-pool.h"
 #include "qom/object.h"
 #include "system/dma.h"
 #include "hw/misc/nvt-ai.h"
@@ -42,6 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtMediaState, NVT_MEDIA)
 #define NVT_MEDIA_MAX_IRQS  3
 
 typedef struct NvtMediaEngine NvtMediaEngine;
+typedef struct NvtAiWork NvtAiWork;
 
 struct NvtMediaState {
     SysBusDevice parent_obj;
@@ -52,6 +55,8 @@ struct NvtMediaState {
     char *engine_name;
     uint32_t size;
     bool trace;
+    char *ai_dump;              /* AI: a directory to dump jobs and RAM to */
+    uint32_t ai_dump_ram;       /* AI: the RAM the dump snapshots */
     const NvtMediaEngine *engine;
     QEMUTimer *timer;           /* frame / job timing, for engines that run */
     uint32_t phase;             /* where in its frame or job the engine is */
@@ -66,6 +71,15 @@ struct NvtMediaState {
      * IDR, when a new encoder takes over.
      */
     NvtH26x *h26x;
+    /*
+     * AI: the job on a worker thread, a generation a reset bumps to void
+     * it, and -- migrated, so the destination runs it again -- whether a
+     * job is running and the list position it reached.
+     */
+    NvtAiWork *ai_work;
+    uint32_t ai_gen;
+    uint32_t ai_pending;
+    uint32_t ai_res;
 };
 
 /*
@@ -482,6 +496,52 @@ static void ime_write_yuv(NvtMediaState *s)
 }
 
 /* A job is set up: the engines that compute do its work. */
+/*
+ * A debugging aid for the AI engines (-global nvt-media.ai-dump=DIR):
+ * each job's registers, in the order the jobs run, appended to DIR/jobs.bin
+ * as records of "AIJB", the engine (0 NUE, 1 NUE2, 2 CNN), a sequence
+ * number and the register count, then the registers, all 32-bit LE; and
+ * snapshots of the guest's RAM at the first CNN job, DIR/ram.bin, and at
+ * the first NUE job, DIR/ram-nue.bin.
+ */
+static void ai_dump_job(NvtMediaState *s, uint32_t engine)
+{
+    static uint32_t seq;
+    static bool ram_done[3];
+    g_autofree char *path = g_build_filename(s->ai_dump, "jobs.bin", NULL);
+    uint32_t hdr[4] = {
+        cpu_to_le32(0x424a4941), cpu_to_le32(engine), cpu_to_le32(seq++),
+        cpu_to_le32(s->size / 4),
+    };
+    FILE *f;
+    uint32_t i, v;
+
+    if (engine != 1 && !ram_done[engine]) {
+        g_autofree char *rp = g_build_filename(s->ai_dump, engine ? "ram.bin" :
+                                               "ram-nue.bin", NULL);
+        g_autofree uint8_t *ram = g_malloc(s->ai_dump_ram);
+
+        ram_done[engine] = true;
+        dma_memory_read(&address_space_memory, 0, ram, s->ai_dump_ram,
+                        MEMTXATTRS_UNSPECIFIED);
+        if (!g_file_set_contents(rp, (const char *)ram, s->ai_dump_ram,
+                                 NULL)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "nvt-media: cannot write %s\n", rp);
+        }
+    }
+    f = fopen(path, "ab");
+    if (!f) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-media: cannot write %s\n", path);
+        return;
+    }
+    fwrite(hdr, sizeof(hdr), 1, f);
+    for (i = 0; i < s->size / 4; i++) {
+        v = cpu_to_le32(s->regs[i]);
+        fwrite(&v, 4, 1, f);
+    }
+    fclose(f);
+}
+
 static void ipp_job_work(NvtMediaState *s)
 {
     if (s->engine->opaque == &ipp_ime) {
@@ -490,24 +550,117 @@ static void ipp_job_work(NvtMediaState *s)
         nvt_gfx_grph_run(s->regs);
     } else if (s->engine->opaque == &ipp_ise) {
         nvt_gfx_ise_run(s->regs);
-    } else if (s->engine->opaque == &ipp_nue) {
-        nvt_ai_nue_run(s->regs);
-    } else if (s->engine->opaque == &ipp_nue2) {
-        nvt_ai_nue2_run(s->regs);
     }
+}
+
+/* a job's done: a single job's trigger bit drops, a list goes on */
+static void ipp_job_finish(NvtMediaState *s, bool single, IppLlResult res)
+{
+    const NvtIppParams *p = s->engine->opaque;
+
+    if (single) {
+        *reg(s, IPP_CTRL) &= ~p->trig;
+        *reg(s, p->ints) |= p->trig_end;
+        ipp_update_irq(s);
+        return;
+    }
+    *reg(s, p->ints) |= p->job_end | (res == IPP_LL_NEXT ? 0 : p->ll_end);
+    ipp_update_irq(s);
+    if (res == IPP_LL_NEXT) {
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  IPP_JOB_NS);
+    }
+}
+
+/*
+ * The AI engines' jobs take up to a few hundred milliseconds of host time
+ * (a CNN layer), so they run on a worker thread with a copy of the
+ * registers; the job is done when the work comes back.
+ */
+struct NvtAiWork {
+    NvtMediaState *s;           /* NULL once the device is gone */
+    void (*run)(const uint32_t *regs);
+    uint32_t gen;
+    bool single;
+    IppLlResult res;
+    uint32_t regs[];
+};
+
+static void (*ai_engine_run(NvtMediaState *s))(const uint32_t *regs)
+{
+    if (s->engine->opaque == &ipp_nue) {
+        return nvt_ai_nue_run;
+    } else if (s->engine->opaque == &ipp_nue2) {
+        return nvt_ai_nue2_run;
+    } else if (s->engine->opaque == &ipp_cnn) {
+        return nvt_ai_cnn_run;
+    }
+    return NULL;
+}
+
+static int ai_work_run(void *opaque)
+{
+    NvtAiWork *wk = opaque;
+
+    wk->run(wk->regs);
+    return 0;
+}
+
+static void ai_work_done(void *opaque, int ret)
+{
+    NvtAiWork *wk = opaque;
+    NvtMediaState *s = wk->s;
+
+    if (s) {
+        s->ai_work = NULL;
+        if (wk->gen == s->ai_gen) {
+            s->ai_pending = 0;
+            ipp_job_finish(s, wk->single, wk->res);
+        }
+    }
+    g_free(wk);
+}
+
+static void ai_job_start(NvtMediaState *s, bool single, IppLlResult res)
+{
+    NvtAiWork *wk = g_malloc0(sizeof(*wk) + s->size);
+
+    if (s->ai_dump) {
+        ai_dump_job(s, s->engine->opaque == &ipp_nue ? 0 :
+                       s->engine->opaque == &ipp_nue2 ? 1 : 2);
+    }
+    wk->s = s;
+    wk->run = ai_engine_run(s);
+    wk->gen = s->ai_gen;
+    wk->single = single;
+    wk->res = res;
+    memcpy(wk->regs, s->regs, s->size);
+    s->ai_work = wk;
+    s->ai_pending = 1;
+    s->ai_res = res;
+    thread_pool_submit_aio(ai_work_run, wk, ai_work_done, wk);
 }
 
 static void ipp_job_done(NvtMediaState *s)
 {
     const NvtIppParams *p = s->engine->opaque;
+    bool ai = ai_engine_run(s);
     IppLlResult res;
 
+    if (ai && s->ai_work) {
+        /* a voided job still on the worker: start once it is back */
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  IPP_JOB_NS);
+        return;
+    }
     if (s->phase) {
         /* a single job: its trigger bit drops when it is done */
+        if (ai) {
+            ai_job_start(s, true, IPP_LL_LAST);
+            return;
+        }
         ipp_job_work(s);
-        *reg(s, IPP_CTRL) &= ~p->trig;
-        *reg(s, p->ints) |= p->trig_end;
-        ipp_update_irq(s);
+        ipp_job_finish(s, true, IPP_LL_LAST);
         return;
     }
     res = ipp_run_job(s);
@@ -522,14 +675,12 @@ static void ipp_job_done(NvtMediaState *s)
         ipp_update_irq(s);
         return;
     }
-    ipp_job_work(s);
-
-    *reg(s, p->ints) |= p->job_end | (res == IPP_LL_NEXT ? 0 : p->ll_end);
-    ipp_update_irq(s);
-    if (res == IPP_LL_NEXT) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  IPP_JOB_NS);
+    if (ai) {
+        ai_job_start(s, false, res);
+        return;
     }
+    ipp_job_work(s);
+    ipp_job_finish(s, false, res);
 }
 
 /*
@@ -855,6 +1006,8 @@ static void nvt_media_reset(DeviceState *dev)
 
     timer_del(s->timer);
     memset(s->regs, 0, s->size);
+    s->ai_gen++;                /* a job on the worker comes back void */
+    s->ai_pending = 0;
     s->frames = 0;
     s->jpg_lut = 0;
     memset(s->jpg_q, 0, sizeof(s->jpg_q));
@@ -901,6 +1054,9 @@ static void nvt_media_unrealize(DeviceState *dev)
 
     nvt_h26x_free(s->h26x);
     s->h26x = NULL;
+    if (s->ai_work) {
+        s->ai_work->s = NULL;
+    }
     timer_free(s->timer);
     g_free(s->regs);
 }
@@ -909,14 +1065,28 @@ static const Property nvt_media_properties[] = {
     DEFINE_PROP_STRING("engine", NvtMediaState, engine_name),
     DEFINE_PROP_UINT32("size", NvtMediaState, size, 0x1000),
     DEFINE_PROP_BOOL("trace", NvtMediaState, trace, false),
+    DEFINE_PROP_STRING("ai-dump", NvtMediaState, ai_dump),
+    DEFINE_PROP_UINT32("ai-dump-ram", NvtMediaState, ai_dump_ram, 128 * MiB),
     DEFINE_PROP_LINK("ipp-input", NvtMediaState, ipp_src, TYPE_NVT_MEDIA,
                      NvtMediaState *),
 };
 
+/* an AI job that was on the source's worker runs again here */
+static int nvt_media_post_load(void *opaque, int version_id)
+{
+    NvtMediaState *s = opaque;
+
+    if (s->ai_pending && ai_engine_run(s) && !s->ai_work) {
+        ai_job_start(s, s->phase, s->ai_res);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_nvt_media = {
     .name = TYPE_NVT_MEDIA,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = nvt_media_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_VBUFFER_UINT32(regs, NvtMediaState, 1, NULL, size),
         VMSTATE_TIMER_PTR(timer, NvtMediaState),
@@ -925,6 +1095,8 @@ static const VMStateDescription vmstate_nvt_media = {
         VMSTATE_UINT32(frames, NvtMediaState),
         VMSTATE_UINT8_ARRAY(jpg_q, NvtMediaState, 128),
         VMSTATE_UINT32(jpg_lut, NvtMediaState),
+        VMSTATE_UINT32_V(ai_pending, NvtMediaState, 2),
+        VMSTATE_UINT32_V(ai_res, NvtMediaState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
