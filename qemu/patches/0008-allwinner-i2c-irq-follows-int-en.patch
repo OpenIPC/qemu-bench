@@ -1,0 +1,25 @@
+allwinner-i2c: the interrupt line follows INT_EN
+
+The model raised the line when INT_FLAG was set with INT_EN on, and
+lowered it only when INT_FLAG was cleared.  A handler that first turns
+INT_EN off and clears the flag later -- the sun8iw19 (V831) vendor
+Linux 4.9 i2c-sunxi.c does, writing the address byte from its
+interrupt handler -- was entered again and again on the still-high
+level and the CPU never left it.  The line is now INT_FLAG && INT_EN
+after every CNTR write.
+
+---
+diff --git a/hw/i2c/allwinner-i2c.c b/hw/i2c/allwinner-i2c.c
+index 1aa5493..d4e91ee 100644
+--- a/hw/i2c/allwinner-i2c.c
++++ b/hw/i2c/allwinner-i2c.c
+@@ -382,6 +382,9 @@ static void allwinner_i2c_write(void *opaque, hwaddr offset,
+             }
+             allwinner_i2c_raise_interrupt(s);
+ 
++            /* The line is INT_FLAG gated by INT_EN, both as just written. */
++            qemu_set_irq(s->irq, (s->cntr & TWI_CNTR_INT_FLAG) &&
++                                 allwinner_i2c_interrupt_is_enabled(s));
+         }
+         break;
+     case TWI_CCR_REG:

@@ -1,0 +1,40 @@
+allwinner-i2c: master transfers do not need BUS_EN
+
+The model set INT_FLAG, and took the address or data byte written to
+DATA, only with CNTR.BUS_EN set.  BUS_EN lets the
+controller respond as a slave; in master mode the TWI runs and flags
+each step without it, and the Allwinner vendor Linux 4.9 i2c-sunxi.c
+(sun8iw19 V831) never sets it: it starts with CNTR = INT_EN | M_STA and
+waits for the interrupt, which the model never raised.  Mainline's
+mv64xxx driver sets BUS_EN, so it sees no difference.
+
+---
+diff --git a/hw/i2c/allwinner-i2c.c b/hw/i2c/allwinner-i2c.c
+index 4de6057..1aa5493 100644
+--- a/hw/i2c/allwinner-i2c.c
++++ b/hw/i2c/allwinner-i2c.c
+@@ -193,9 +193,11 @@ static inline void allwinner_i2c_raise_interrupt(AWI2CState *s)
+ {
+     /*
+      * Raise an interrupt if the device is not reset and it is configured
+-     * to generate some interrupts.
++     * to generate some interrupts.  BUS_EN is not needed: it lets the
++     * controller answer as a slave, and master transfers run without it
++     * (the Allwinner vendor Linux 4.9 driver never sets it).
+      */
+-    if (!allwinner_i2c_is_reset(s) && allwinner_i2c_bus_is_enabled(s)) {
++    if (!allwinner_i2c_is_reset(s)) {
+         if (STAT_TO_STA(s->stat) != STAT_IDLE) {
+             s->cntr |= TWI_CNTR_INT_FLAG;
+             if (allwinner_i2c_interrupt_is_enabled(s)) {
+@@ -293,8 +295,8 @@ static void allwinner_i2c_write(void *opaque, hwaddr offset,
+         s->xaddr = (uint8_t)value;
+         break;
+     case TWI_DATA_REG:
+-        /* If the device is in reset or not enabled, nothing to do */
+-        if (allwinner_i2c_is_reset(s) || (!allwinner_i2c_bus_is_enabled(s))) {
++        /* If the device is in reset, nothing to do (BUS_EN: see above) */
++        if (allwinner_i2c_is_reset(s)) {
+             break;
+         }
+ 

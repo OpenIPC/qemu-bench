@@ -1,0 +1,40 @@
+allwinner-sun8i-emac: absent PHYs read 0xffff, five-bit MDIO fields
+
+An MDIO read of an address with no PHY left the previous value in
+MII_DATA, so a bus scan found a copy of the PHY at every address, and
+the PHY address and register fields were four bits wide, so addresses
+16..31 and registers 16..31 aliased the low half.  The Allwinner vendor
+Linux 4.9 sunxi-gmac driver (sun8iw19 V831), which scans all 32
+addresses and keeps the last PHY it finds, attached to address 31 and
+failed to open the interface.  The fields are bits 16:12 and 8:4
+(mainline dwmac-sun8i's MDIO_CMD_MII_PHY_ADDR / _REG masks), and a read
+of an absent PHY returns the bus pull-up, 0xffff.
+
+---
+diff --git a/hw/net/allwinner-sun8i-emac.c b/hw/net/allwinner-sun8i-emac.c
+index 30a8157..09650d1 100644
+--- a/hw/net/allwinner-sun8i-emac.c
++++ b/hw/net/allwinner-sun8i-emac.c
+@@ -125,9 +125,9 @@ enum {
+ 
+ enum {
+     MII_CMD_PHY_ADDR_SHIFT = (12),
+-    MII_CMD_PHY_ADDR_MASK  = (0xf000),
++    MII_CMD_PHY_ADDR_MASK  = (0x1f000),
+     MII_CMD_PHY_REG_SHIFT  = (4),
+-    MII_CMD_PHY_REG_MASK   = (0xf0),
++    MII_CMD_PHY_REG_MASK   = (0x1f0),
+     MII_CMD_PHY_RW         = (1 << 1),
+     MII_CMD_PHY_BUSY       = (1 << 0),
+ };
+@@ -272,6 +272,10 @@ static void allwinner_sun8i_emac_mii_cmd(AwSun8iEmacState *s)
+     reg = (s->mii_cmd & MII_CMD_PHY_REG_MASK) >> MII_CMD_PHY_REG_SHIFT;
+ 
+     if (addr != s->mii_phy_addr) {
++        /* Nothing drives MDIO for an absent PHY: reads see the pull-up. */
++        if (!(s->mii_cmd & MII_CMD_PHY_RW)) {
++            s->mii_data = 0xffff;
++        }
+         return;
+     }
+ 

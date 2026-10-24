@@ -58,6 +58,10 @@ cp qemu/hw/misc/gk-ephy.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-remap.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-dma.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/gk-idc.c             "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/arm/allwinner-v83x.c     "$QEMU_DIR/hw/arm/"
+for f in $(cd qemu && find hw include -name 'aw-*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
 cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
@@ -786,6 +790,53 @@ if ! grep -q hisi-spi "$QEMU_DIR/hw/ssi/meson.build"; then
     echo "  patched hw/ssi/meson.build"
 else
     echo "  hw/ssi/meson.build already patched"
+fi
+
+# Allwinner V831/V833 (sun8iw19): Cortex-A7 camera SoCs
+# (hw/arm/allwinner-v83x.c).  Same guarded appends as Anyka.  Its own
+# devices are the hw/*/aw-*.c files, each built under ALLWINNER_V83X.
+if ! grep -q "^config ALLWINNER_V83X$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config ALLWINNER_V83X
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_GIC
+    select SERIAL_MM
+    select UNIMP
+    select HISI_MISC
+    select SSI
+    select ALLWINNER_A10_PIT
+    select I2C
+    select ALLWINNER_I2C
+    select OR_IRQ
+    select ALLWINNER_SUN8I_EMAC
+    select HISI_I2C
+KCONFIG
+    echo "  hw/arm/Kconfig: added ALLWINNER_V83X"
+else
+    for sym in ALLWINNER_A10_PIT I2C ALLWINNER_I2C OR_IRQ ALLWINNER_SUN8I_EMAC HISI_I2C; do
+        if ! sed -n '/^config ALLWINNER_V83X$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config ALLWINNER_V83X\$/,/^\$/{/select SSI\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: ALLWINNER_V83X now selects $sym"
+        fi
+    done
+fi
+for f in $(cd qemu && find hw -name 'aw-*.c' 2>/dev/null); do
+    d=$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ALLWINNER_V83X', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: added $b"
+    fi
+done
+if ! grep -q "'allwinner-v83x.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_ALLWINNER_V83X', if_true: files('allwinner-v83x.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added allwinner-v83x.c"
 fi
 
 # ── 4. Patch QEMU SD card model to accept 1.8V ─────────────────────────
