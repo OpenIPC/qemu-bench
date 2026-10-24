@@ -364,14 +364,12 @@ static void axera_map_regbanks(void)
     sysbus_create_simple(TYPE_AXERA_DDR_PHY, 0x00120000, NULL);
 
     /*
-     * AX_DMAPER @ 0x048a0000 (boot/bl1/driver/dmaper/dmaper.h): real
-     * BL1 stages a flash read into scratch RAM then uses this LLI-
-     * descriptor DMA engine (axi_dma_xfer_start()/
-     * axi_dma_wait_xfer_done()) to copy it into the image's final
-     * destination -- see hw/misc/axera-dmaper.c's own comment for why
-     * this needs a real memory-to-memory copy, not just a ready bit.
+     * AX_DMAPER @ 0x048a0000: created down in axera_a64_init() instead
+     * of here, since it needs its real IRQ (GIC SPI 0x70) wired at
+     * creation time via pic[], which doesn't exist yet this early --
+     * this function runs before the GIC is even set up. See that call
+     * site's own comment for AX_DMAPER's own real purpose.
      */
-    sysbus_create_simple(TYPE_AXERA_DMAPER, 0x048a0000, NULL);
 
     /*
      * DMADIM (hardware word-checksum DMA) @ 0x10460000 (boot/bl1/
@@ -653,24 +651,35 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     sysbus_create_simple(TYPE_AXERA_VCMD, 0x04020000, pic[92]);
 
     /*
+     * AX_DMAPER @ 0x048a0000 (boot/bl1/driver/dmaper/dmaper.h), GIC
+     * SPI 0x70: real BL1 stages a flash read into scratch RAM then
+     * uses this LLI-descriptor DMA engine (axi_dma_xfer_start()/
+     * axi_dma_wait_xfer_done()) to copy it into the image's final
+     * destination. Also the real target of the real kernel's own
+     * spi@1A00000 "dmas = <0x09 0x01 0x09 0x00>;" property (confirmed
+     * by checking phandle 0x09's own definition in the decompiled
+     * dtb, not just its proximity to the spi node in the source) --
+     * BL1's own real axi_dma_wait_xfer_done() never waits on an
+     * interrupt at all, just spins polling a status register
+     * directly, so this device genuinely needed no IRQ line for that
+     * consumer alone; but the real kernel's own dmaengine framework
+     * needs a genuine interrupt to wake its wait_for_completion()
+     * (confirmed live: the real DMAPER_START write does happen, the
+     * transfer itself genuinely completes, but nothing ever signals
+     * the sleeping kernel thread, so "DMA transaction timed out" fires
+     * regardless) -- see hw/misc/axera-dmaper.c's own comment for the
+     * full story and why raising this is harmless for BL1.
+     */
+    sysbus_create_simple(TYPE_AXERA_DMAPER, 0x048a0000, pic[0x70]);
+
+    /*
      * dw_dmac@48b0000, "axera,axi-dma-1.01a", GIC SPI 0x71: a real
      * Synopsys DesignWare AXI DMA Controller, a separate physical IP
-     * from AX_DMAPER (hw/misc/axera-dmaper.c @ 0x048a0000) -- added
-     * while chasing the kernel's own SPI-NOR driver timing out, but
-     * turned out NOT to be what gates that: the real devicetree's own
-     * "dmas = <0x09 0x01 0x09 0x00>;" on spi@1A00000 resolves (via its
-     * own phandle) to dma_per@48a0000 (AX_DMAPER) instead, confirmed
-     * by checking the phandle definition directly, not just
-     * proximity in the decompiled dts. AX_DMAPER itself never sees
-     * any register writes at all during that attempt despite the SPI
-     * driver clearly committing to DMA mode first (DMACR=1) --
-     * root cause not yet found (the real kernel driver for "axera,
-     * dma-per" isn't in any available source tree, same situation as
-     * the closed-source Xiongmai SPI wrapper elsewhere in this
-     * project). Modelled here anyway since it's a real IP block this
-     * SoC genuinely has and some other, not yet identified consumer
-     * may legitimately need; not yet proven to fix anything on its
-     * own.
+     * from AX_DMAPER above -- kept modelled since it's a real IP
+     * block this SoC genuinely has (some other, not yet identified
+     * consumer may legitimately need it), even though it turned out
+     * NOT to be what the kernel's SPI-NOR driver actually uses -- see
+     * hw/misc/axera-axi-dmac.c's own comment for that story.
      */
     sysbus_create_simple(TYPE_AXERA_AXI_DMAC, 0x048b0000, pic[0x71]);
 

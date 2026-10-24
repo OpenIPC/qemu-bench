@@ -30,6 +30,22 @@
  * flash state machine timing -- there is no real program/erase
  * latency worth modelling for a read-only boot path.
  *
+ * The real kernel's own spi-dw-core.c (dw_spi_write_then_read(), used
+ * by its generic spi_mem exec_op()) does NOT match U-Boot's 2-phase
+ * shape: it sends opcode, 3-byte address and the READ_FAST dummy byte
+ * as three SEPARATE TX-only (TMOD_TO) sub-phases -- each its own
+ * SSIENR 0->1->0 cycle, CTRL0 unchanged between them -- before the
+ * one real RX (TMOD_RO) phase. Confirmed live via register tracing:
+ * resetting cmd_len on every TMOD_TO entry (matching only U-Boot's
+ * single-phase shape) let the trailing dummy byte overwrite the real
+ * opcode+address right before the RX phase needed them, latching
+ * opcode=0xff/addr=0 every time ("spi_master spi4: Rx hanged up").
+ * axera_spi_nor_ssienr_write() now only resets cmd_len after an RO
+ * phase actually consumes it, so consecutive TO sub-phases accumulate
+ * into the same cmd_buf -- naturally capped at sizeof(cmd_buf)==4 by
+ * the DW_SPI_DR write handler, which is "ignore the dummy byte" for
+ * free.
+ *
  * Confirmed real partition layout for this flash (AX620E's own real
  * deployed camera firmware, General_IPC_AX620E_A6...dump, via its own
  * saved U-Boot env): mtdparts=spi_nor.0:0x10000(spl),0x50000(boot),
@@ -62,8 +78,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define DW_SPI_TXFLR            0x20
 #define DW_SPI_RXFLR            0x24
 #define DW_SPI_SR               0x28
+#define DW_SPI_DMACR            0x4c
 #define DW_SPI_DR               0x60
 #define DW_SPI_SIZE             0x100
+
+#define SPI_DMA_RDMAE           BIT(0)
 
 /*
  * Real DW_apb_ssi FIFO depth for this instance (32, the common
@@ -241,6 +260,17 @@ static void rxq_push(AxeraSpiNorState *s, uint8_t byte)
  * Harmless whenever the real path already works (BL1's own reads,
  * which never exhibit this bug): the destination the real CPU-side
  * loop ends up using is then just written with the same bytes twice.
+ *
+ * Only ever correct for U-Boot's own CPU-polled drain, though: the
+ * real kernel's spi-dw-dma.c drives this same transfer over AX_DMAPER
+ * instead (confirmed: DW_SPI_DMACR's RDMAE bit set first, exactly
+ * what dw_spi_dma_setup() writes before it), and at that point x19 is
+ * whatever the kernel's own code happens to hold there -- not
+ * designware_spi.c's struct at all. Callers gate on RDMAE being
+ * clear before calling this so a genuine DMA-mode transfer (which
+ * axera-dmaper.c's own do_transfer() already copies to the real `dar`
+ * correctly) never gets this stray second write to a bogus address
+ * derived from an unrelated register.
  */
 static void axera_spi_nor_fixup_first_chunk_dest_buf(AxeraSpiNorState *s,
                                                      const uint8_t *src,
@@ -355,14 +385,18 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
             for (i = 0; i < total; i++) {
                 rxq_push(s, env[off + i]);
             }
-            axera_spi_nor_fixup_first_chunk_dest_buf(s, env + off, total);
+            if (!(s->mem[DW_SPI_DMACR / 4] & SPI_DMA_RDMAE)) {
+                axera_spi_nor_fixup_first_chunk_dest_buf(s, env + off, total);
+            }
         } else {
             for (i = 0; i < total; i++) {
                 uint32_t addr = s->latched_addr + i;
 
                 rxq_push(s, addr < s->flash_size ? s->flash[addr] : 0xff);
             }
-            axera_spi_nor_fixup_first_chunk_dest(s, total);
+            if (!(s->mem[DW_SPI_DMACR / 4] & SPI_DMA_RDMAE)) {
+                axera_spi_nor_fixup_first_chunk_dest(s, total);
+            }
         }
         break;
     case SPINOR_OP_RDSR:
@@ -411,16 +445,47 @@ static void axera_spi_nor_ssienr_write(AxeraSpiNorState *s, uint32_t value)
                         SPI_TMOD_OFFSET;
 
         if (tmod == SPI_TMOD_TO) {
+            /*
+             * Real driver behaviour varies: BL1/U-Boot's own dw_spi_xfer()
+             * sends opcode+3-byte address as ONE TMOD_TO phase (4 bytes in
+             * a single SSIENR 0->1->0 cycle), but the real kernel's
+             * dw_spi_write_then_read() sends opcode, address and the
+             * READ_FAST dummy byte as THREE SEPARATE TMOD_TO sub-phases,
+             * each its own SSIENR cycle, with TMOD staying SPI_TMOD_TO the
+             * whole time -- confirmed live via register tracing (CTRL0
+             * never changes between them). Resetting cmd_len here on
+             * every entry wiped the real opcode+address with the trailing
+             * dummy byte right before the data phase needed to read it
+             * back, latching opcode=0xff/addr=0 every time. Not resetting
+             * here (only after a real RO phase below actually consumes
+             * it) lets consecutive TO sub-phases accumulate into the same
+             * cmd_buf -- capped at sizeof(cmd_buf)==4 by the DW_SPI_DR
+             * write handler already, which is exactly "stop once opcode
+             * +address are in, ignore the dummy byte" for free.
+             */
             s->in_cmd_phase = true;
-            s->cmd_len = 0;
-        } else if (tmod == SPI_TMOD_RO) {
+        } else if (tmod == SPI_TMOD_RO && s->cmd_len > 0) {
+            /*
+             * dw_spi_stop_mem_op() (spi-dw-core.c) re-toggles SSIENR
+             * 0->1 right after a real mem op finishes, purely to reset
+             * native chip-select behaviour -- CTRL0 is never
+             * reprogrammed first, so this lands here with TMOD still
+             * SPI_TMOD_RO from the real transfer, but with nothing new
+             * latched. Treating that as a second, fresh data phase
+             * reset the already-correctly-drained rxq to a bogus
+             * opcode=0 512-byte queue that nothing ever drains again
+             * ("Rx hanged up" right after a transfer this model had
+             * already served correctly). Requiring cmd_len > 0 -- a
+             * real TO phase actually ran first -- tells the two apart.
+             */
             s->in_cmd_phase = false;
-            s->latched_opcode = s->cmd_len > 0 ? s->cmd_buf[0] : 0;
+            s->latched_opcode = s->cmd_buf[0];
             s->latched_addr = 0;
             if (s->cmd_len >= 4) {
                 s->latched_addr = (s->cmd_buf[1] << 16) |
                                   (s->cmd_buf[2] << 8) | s->cmd_buf[3];
             }
+            s->cmd_len = 0;
             axera_spi_nor_start_data_phase(s);
         }
     }

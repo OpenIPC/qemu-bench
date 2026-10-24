@@ -16,16 +16,12 @@
  * 0x00>;" pointed at this block's phandle -- it doesn't: checking
  * phandle 0x09's own definition in the decompiled dtb (not just
  * proximity to the spi node) shows it actually resolves to
- * dma_per@48a0000 (AX_DMAPER) instead, which never sees any register
- * writes at all during that same attempt despite the SPI driver
- * clearly committing to DMA mode first (its own DMACR=1 write) --
- * root cause not yet found; the real kernel driver for "axera,
- * dma-per" isn't in any available source tree (openipc-linux-ax620e
- * doesn't have one), the same situation as the closed-source Xiongmai
- * SPI wrapper elsewhere in this project. Kept and wired up anyway
- * since it's a real IP block this SoC genuinely has (some other, not
- * yet identified consumer may legitimately need it) -- NOT currently
- * proven to fix the squashfs-mount timeout on its own.
+ * dma_per@48a0000 (AX_DMAPER) instead -- the real fix (AX_DMAPER
+ * needed a real IRQ for the kernel's own dmaengine wait to ever wake
+ * up, not a missing register write at all) landed on that device
+ * instead, see hw/misc/axera-dmaper.c's own comment. Kept and wired
+ * up anyway since it's a real IP block this SoC genuinely has (some
+ * other, not yet identified consumer may legitimately need it).
  *
  * Models a single CH_SAR/CH_DAR/CH_BLOCK_TS/CH_CTL-described block
  * transfer per channel, completed synchronously the instant
