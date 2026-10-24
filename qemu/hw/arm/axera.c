@@ -43,6 +43,7 @@
 #include "hw/intc/arm_gic_common.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
+#include "hw/misc/axera-axi-dmac.h"
 #include "hw/misc/axera-bl1-timer.h"
 #include "hw/misc/axera-ddr-phy.h"
 #include "hw/misc/axera-ddr-pll.h"
@@ -650,6 +651,28 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     sysbus_create_simple(TYPE_AXERA_VCMD, 0x04010000, pic[93]);
     sysbus_create_simple(TYPE_AXERA_VCMD, 0x04000000, pic[91]);
     sysbus_create_simple(TYPE_AXERA_VCMD, 0x04020000, pic[92]);
+
+    /*
+     * dw_dmac@48b0000, "axera,axi-dma-1.01a", GIC SPI 0x71: a real
+     * Synopsys DesignWare AXI DMA Controller, a separate physical IP
+     * from AX_DMAPER (hw/misc/axera-dmaper.c @ 0x048a0000) -- added
+     * while chasing the kernel's own SPI-NOR driver timing out, but
+     * turned out NOT to be what gates that: the real devicetree's own
+     * "dmas = <0x09 0x01 0x09 0x00>;" on spi@1A00000 resolves (via its
+     * own phandle) to dma_per@48a0000 (AX_DMAPER) instead, confirmed
+     * by checking the phandle definition directly, not just
+     * proximity in the decompiled dts. AX_DMAPER itself never sees
+     * any register writes at all during that attempt despite the SPI
+     * driver clearly committing to DMA mode first (DMACR=1) --
+     * root cause not yet found (the real kernel driver for "axera,
+     * dma-per" isn't in any available source tree, same situation as
+     * the closed-source Xiongmai SPI wrapper elsewhere in this
+     * project). Modelled here anyway since it's a real IP block this
+     * SoC genuinely has and some other, not yet identified consumer
+     * may legitimately need; not yet proven to fix anything on its
+     * own.
+     */
+    sysbus_create_simple(TYPE_AXERA_AXI_DMAC, 0x048b0000, pic[0x71]);
 
     /*
      * emmc@1b40000/sd@104e0000/sdio@104d0000, "axera,sdhc","cdns,sd4hc":

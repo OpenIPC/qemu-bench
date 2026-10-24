@@ -199,6 +199,8 @@ cp qemu/hw/misc/axera-dma-checksum.c "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-dma-checksum.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-gzipd.c       "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-gzipd.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-axi-dmac.c    "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-axi-dmac.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -729,6 +731,11 @@ if ! grep -q "'axera-gzipd.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-gzipd.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-gzipd.c"
+fi
+if ! grep -q "'axera-axi-dmac.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-axi-dmac.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-axi-dmac.c"
 fi
 
 # hw/misc/Kconfig
