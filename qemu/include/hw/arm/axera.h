@@ -41,4 +41,12 @@ typedef struct AxeraSoCConfig {
                                   */
 } AxeraSoCConfig;
 
+/*
+ * Defined in hw/arm/axera.c (ARM-specific code, free to see into
+ * target/arm/cpu.h); declared here so plain "common" devices like
+ * hw/misc/axera-spi-nor.c -- which cannot include that header without
+ * breaking the multi-target build -- can still call it.
+ */
+uint64_t axera_cpu_get_xreg(unsigned int n);
+
 #endif /* HW_ARM_AXERA_H */

@@ -133,6 +133,30 @@ struct AxeraMachineState {
 #define AXERA_VDET_RO0_ADDR     0x023090a0ULL
 #define AXERA_VDET_3V3_BIT      (1U << 12)
 
+/*
+ * Lets hw/misc/axera-spi-nor.c (plain system_ss "common" code, which
+ * cannot itself include target/arm/cpu.h without breaking the
+ * multi-target build) peek at CPU0's current x-registers. Needed to
+ * work around a real bug in real U-Boot's own generic MTD SPI driver
+ * (designware_spi.c/spi-mem.c's __UBOOT__ fallback): every multi-chunk
+ * "sf read"/env-load transfer's first chunk never actually gets
+ * written to its own destination buffer at all (confirmed: a
+ * full-RAM-scan plus a full-boot write-watchpoint on that exact
+ * address both show it is simply never touched) -- see
+ * axera_spi_nor_fixup_first_chunk_dest()'s own comment for the full
+ * story and why this reads the live x19/[x19+120] destination pointer
+ * directly off the CPU instead.
+ */
+uint64_t axera_cpu_get_xreg(unsigned int n)
+{
+    ARMCPU *cpu = ARM_CPU(first_cpu);
+
+    if (n >= ARRAY_SIZE(cpu->env.xregs)) {
+        return 0;
+    }
+    return cpu->env.xregs[n];
+}
+
 static void axera_bl1_chipmode_reset(void *opaque)
 {
     bool flash_is_nor = (uintptr_t)opaque;

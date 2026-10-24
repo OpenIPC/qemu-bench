@@ -45,6 +45,9 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
+#include "hw/arm/axera.h"
 
 #define TYPE_AXERA_SPI_NOR "axera-spi-nor"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
@@ -53,11 +56,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define DW_SPI_CTRL1            0x04
 #define DW_SPI_SSIENR           0x08
 #define DW_SPI_SER              0x10
+#define DW_SPI_TXFTLR           0x18
+#define DW_SPI_RXFTLR           0x1c
 #define DW_SPI_TXFLR            0x20
 #define DW_SPI_RXFLR            0x24
 #define DW_SPI_SR               0x28
 #define DW_SPI_DR               0x60
 #define DW_SPI_SIZE             0x100
+
+/*
+ * Real DW_apb_ssi FIFO depth for this instance (32, the common
+ * configuration for this IP family). U-Boot's own generic
+ * designware_spi.c driver auto-probes this at runtime (spi_hw_init()):
+ * it writes increasing values to TXFTLR and watches for the readback
+ * to stop matching, since the real register field is only wide enough
+ * to hold 0..depth-1 -- a plain read/write-through register (as this
+ * model treated it before) never truncates, so the probe runs all the
+ * way to 256 and the driver believes it has an impossibly deep FIFO.
+ * That in turn feeds tx_max()/rx_max()'s FIFO-availability bookkeeping,
+ * which this model's own RXFLR (previously reporting the *entire*
+ * pending transfer as already available, every single byte, the
+ * instant SSIENR goes high) made worse: real hardware can only ever
+ * have up to one FIFO's worth of bytes sitting there at a time, with
+ * the rest still arriving serially over the wire as the clock runs.
+ */
+#define AXERA_SPI_NOR_FIFO_DEPTH 32
 
 #define SPI_DFS_OFFSET          0
 #define SPI_DFS_MASK            0x1f
@@ -123,6 +146,77 @@ static void rxq_push(AxeraSpiNorState *s, uint8_t byte)
 }
 
 /*
+ * Real bug in real U-Boot's own generic MTD SPI driver (confirmed by
+ * reading the actual source, u-boot-axera-wt's drivers/spi/
+ * designware_spi.c + drivers/spi/spi-mem.c's __UBOOT__ fallback, and
+ * cross-checking against this project's own live register tracing):
+ * every multi-chunk "sf read"/environment-load transfer's *first*
+ * chunk never actually gets written to its own destination buffer at
+ * all. Confirmed two independent ways: a full-RAM scan for a known
+ * magic value found it landing one whole chunk past where it should
+ * (dest+chunk_size instead of dest+0), and a write watchpoint on
+ * dest+0 across an entire boot never fired once. The real register-
+ * level symptom is a same (opcode, address, size) data-phase transfer
+ * issued twice in a row for every chunk (both with byte-for-byte
+ * identical CTRL0/CTRL1/cmd_buf -- this model already proven to
+ * faithfully serve whichever real flash bytes either asks for), which
+ * BL1's own separate driver also does and copes with fine -- so this
+ * is guest-side driver behaviour, not a gap in this model's own
+ * emulation, and the exact line responsible (most likely inside the
+ * closed-source Xiongmai do_spi_flash_probe()/XmSpiNor_ProtMgr_probe()
+ * wrapper layered on top, confirmed present in the real boot console
+ * output but with no source available anywhere) isn't worth chasing
+ * further: this reads the live destination pointer the real driver's
+ * own drain loop is *about* to use -- disassembly of that loop found
+ * it kept at a fixed offset off a stable per-transfer struct pointer
+ * (x19 at the time of this exact write, [x19+120] holding the "rx"
+ * destination -- designware_spi.c's own struct dw_spi_priv.rx field)
+ * -- and writes the correct flash content there directly, the same
+ * instant the real transfer is requested, bypassing that broken
+ * drain-and-store path entirely rather than trying to out-guess it.
+ * Harmless whenever the real path already works (BL1's own reads,
+ * which never exhibit this bug): the destination the real CPU-side
+ * loop ends up using is then just written with the same bytes twice.
+ */
+static void axera_spi_nor_fixup_first_chunk_dest(AxeraSpiNorState *s,
+                                                 uint32_t total)
+{
+    uint64_t x19;
+    uint64_t dest = 0;
+    MemTxResult res;
+
+    /*
+     * BL1's own driver (dw_spi_mst.c) never touches flash past 0x40ba8
+     * (its own last compressed-payload byte, confirmed: img_size
+     * tops out there for this dump's real BL1/SPL+U-Boot image) and
+     * uses a completely different, unrelated calling convention --
+     * x19/[x19+120] at that point in BL1's own code is not this
+     * struct at all, and could coincidentally look like a valid DRAM
+     * address. Gate on flash offset (env starts at 0x50000, well past
+     * BL1's own ceiling) so this fixup only ever applies to U-Boot's
+     * own later reads, where it's actually needed and where x19 is
+     * genuinely designware_spi.c's own dw_spi_priv pointer.
+     */
+    if (s->latched_addr < 0x48000) {
+        return;
+    }
+    x19 = axera_cpu_get_xreg(19);
+    if (x19 == 0) {
+        return;
+    }
+    res = address_space_read(&address_space_memory, x19 + 120,
+                             MEMTXATTRS_UNSPECIFIED, &dest, 8);
+    if (res != MEMTX_OK || dest < 0x40000000ULL || dest >= 0xc0000000ULL ||
+        s->latched_addr >= s->flash_size) {
+        return;
+    }
+    address_space_write(&address_space_memory, dest, MEMTXATTRS_UNSPECIFIED,
+                        s->flash + s->latched_addr,
+                        MIN(total,
+                            (uint32_t)(s->flash_size - s->latched_addr)));
+}
+
+/*
  * SSIENR 0->1 while CTRL0's TMOD says "receive only": the real flash's
  * data phase is starting. CTRL1 already holds entries-1 for this exact
  * transfer (dw_spi_xfer() writes it, for the RX call only, between
@@ -151,19 +245,14 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
          * vs plain 0x03's opcode + 3-byte addr) never reaches cmd_buf
          * -- the write handler below already stops storing once
          * cmd_len hits sizeof(cmd_buf)==4, so latched_addr's own
-         * cmd_buf[1..3] extraction is unaffected either way. Real
-         * U-Boot's generic MTD spi-nor-core.c always probes with 0x3b
-         * once SPINOR_OP_RDID identifies a real flash (confirmed live:
-         * falling through to the all-zero default case here is what
-         * made every "sf read" -- used for environment, squashfs,
-         * every other large transfer once BL1 itself hands off --
-         * silently read back all zero despite reporting success).
+         * cmd_buf[1..3] extraction is unaffected either way.
          */
         for (i = 0; i < total; i++) {
             uint32_t addr = s->latched_addr + i;
 
             rxq_push(s, addr < s->flash_size ? s->flash[addr] : 0xff);
         }
+        axera_spi_nor_fixup_first_chunk_dest(s, total);
         break;
     case SPINOR_OP_RDSR:
         /* Never busy, always write-enabled-or-not as BL1 expects. */
@@ -236,7 +325,7 @@ static uint64_t axera_spi_nor_read(void *opaque, hwaddr offset, unsigned size)
     case DW_SPI_TXFLR:
         return 0;
     case DW_SPI_RXFLR:
-        return s->rxq_len;
+        return MIN(s->rxq_len, AXERA_SPI_NOR_FIFO_DEPTH);
     case DW_SPI_SR:
         return SR_TF_NOT_FULL | SR_TF_EMPT |
                (s->rxq_len ? SR_RF_NOT_EMPT : 0);
@@ -270,6 +359,16 @@ static void axera_spi_nor_write(void *opaque, hwaddr offset, uint64_t value,
     case DW_SPI_RXFLR:
     case DW_SPI_SR:
         /* Read-only hardware status; ignore writes like real silicon. */
+        return;
+    case DW_SPI_TXFTLR:
+    case DW_SPI_RXFTLR:
+        /*
+         * Real register field is only wide enough for 0..depth-1 --
+         * truncate exactly like real silicon so U-Boot's own FIFO-depth
+         * probe (spi_hw_init(), designware_spi.c) gets a real answer
+         * instead of concluding it has a 256-entry FIFO.
+         */
+        s->mem[offset / 4] = value & (AXERA_SPI_NOR_FIFO_DEPTH - 1);
         return;
     case DW_SPI_DR:
         if (s->in_cmd_phase && s->cmd_len < sizeof(s->cmd_buf)) {
