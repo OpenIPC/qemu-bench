@@ -42,6 +42,7 @@
 #include "hw/intc/arm_gic_common.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
+#include "hw/misc/axera-bl1-timer.h"
 #include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
 #include "hw/misc/axera-pllc.h"
@@ -49,10 +50,12 @@
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/cadence_sdhci.h"
+#include "hw/sd/sd.h"
 #include "hw/sysbus.h"
 #include "hw/usb/hcd-dwc3.h"
 #include "qapi/visitor.h"
 #include "system/address-spaces.h"
+#include "system/blockdev.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
@@ -153,16 +156,6 @@ static const struct {
     { "axera-clk-flash",    0x10030000, 0x10000 },
     { "axera-clk-periph",   0x04870000, 0x10000 },
     { "axera-dispc-reset",  0x04600000, 0x100 },
-    /*
-     * Not in any Linux-visible devicetree node -- found by tracing BL1's
-     * own flash-boot execution (qemu -d unimp): BL1 writes 0xffffffff
-     * here then polls/kicks +8 before anything else, the classic
-     * "disable/kick the watchdog at reset" shape. Likely a secure-
-     * world-only early watchdog distinct from the wdt0 Linux sees at
-     * 0x04840000 (0x10000 away) -- not confirmed against vendor source,
-     * just the observed access pattern.
-     */
-    { "axera-bl1-wdt",      0x04830000, 0x100 },
     { "axera-clk-vpu",      0x04030000, 0x10000 },
     { "axera-clk-mm",       0x04430000, 0x10000 },
     { "axera-pinctrl",      0x02300000, 0xb000 },
@@ -223,6 +216,15 @@ static void axera_map_regbanks(void)
      * silently right after console init. */
     sysbus_create_simple(TYPE_AXERA_DW_SPI, 0x06072000, NULL);
 
+    /* TIMER_BASE @ 0x04830000 (boot/bl1/driver/include/timer.h): BL1's
+     * delay()/mdelay()/udelay() -- and a timer-ratio helper called from
+     * a tight retry loop very early in boot -- read this free-running
+     * down-counter twice and spin until it's advanced, with no timeout
+     * of their own (see hw/misc/axera-bl1-timer.c). A passive regbank
+     * can never satisfy that: two reads of inert storage are always
+     * equal, so BL1 spins here forever before anything else runs. */
+    sysbus_create_simple(TYPE_AXERA_BL1_TIMER, 0x04830000, NULL);
+
     for (n = 0; n < ARRAY_SIZE(ax620e_regbanks); n++) {
         DeviceState *dev = qdev_new("hisi-regbank");
 
@@ -236,6 +238,34 @@ static void axera_map_regbanks(void)
         create_unimplemented_device(ax620e_unimp[n].name,
                                     ax620e_unimp[n].base,
                                     ax620e_unimp[n].size);
+    }
+}
+
+/*
+ * emmc@1b40000/sd@104e0000/sdio@104d0000: create a cadence.sdhci
+ * controller and, if the user passed a matching "-drive if=sd,index=N"
+ * (or legacy "-sd"), plug a real SD card onto it so U-Boot's MMC probe
+ * (env load/save, FAT/ext4 kernel+rootfs load) sees real media instead
+ * of "Card did not respond to voltage select!". index 0 is the eMMC
+ * ("mmc@1B40000: 0" per U-Boot's own device numbering at boot).
+ */
+static void axera_attach_sdhci(hwaddr base, qemu_irq irq, int unit,
+                               bool emmc)
+{
+    DeviceState *dev = qdev_new(TYPE_CADENCE_SDHCI);
+    DriveInfo *di = drive_get(IF_SD, 0, unit);
+
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, irq);
+
+    if (di) {
+        CadenceSDHCIState *sdhci = CADENCE_SDHCI(dev);
+        DeviceState *card = qdev_new(emmc ? TYPE_EMMC : TYPE_SD_CARD);
+
+        qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
+                                &error_fatal);
+        qdev_realize_and_unref(card, sdhci->bus, &error_fatal);
     }
 }
 
@@ -392,11 +422,12 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
      * emmc@1b40000/sd@104e0000/sdio@104d0000, "axera,sdhc","cdns,sd4hc":
      * QEMU's own generic cadence.sdhci model, a real off-the-shelf
      * device (not Axera-specific) that already implements this exact
-     * compatible string's register set.
+     * compatible string's register set. See axera_attach_sdhci() for
+     * the real-media wiring ("-drive if=sd,index=0" is the eMMC).
      */
-    sysbus_create_simple(TYPE_CADENCE_SDHCI, 0x01b40000, pic[9]);
-    sysbus_create_simple(TYPE_CADENCE_SDHCI, 0x104e0000, pic[74]);
-    sysbus_create_simple(TYPE_CADENCE_SDHCI, 0x104d0000, pic[73]);
+    axera_attach_sdhci(0x01b40000, pic[9], 0, true);
+    axera_attach_sdhci(0x104e0000, pic[74], 1, false);
+    axera_attach_sdhci(0x104d0000, pic[73], 2, false);
 
     /*
      * usb2@8000000, "snps,dwc3": QEMU's generic usb_dwc3 model (also

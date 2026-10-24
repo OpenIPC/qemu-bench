@@ -183,6 +183,8 @@ cp qemu/hw/misc/axera-vcmd.c        "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-vcmd.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-dw-spi.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-dw-spi.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-bl1-timer.c   "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-bl1-timer.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -672,6 +674,11 @@ if ! grep -q "'axera-dw-spi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-dw-spi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-dw-spi.c"
+fi
+if ! grep -q "'axera-bl1-timer.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-bl1-timer.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-bl1-timer.c"
 fi
 
 # hw/misc/Kconfig
