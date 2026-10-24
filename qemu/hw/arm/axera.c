@@ -56,6 +56,7 @@
 #include "hw/misc/axera-spi-nand.h"
 #include "hw/misc/axera-spi-nor.h"
 #include "hw/misc/axera-vcmd.h"
+#include "hw/misc/axera-wdt.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/cadence_sdhci.h"
@@ -312,7 +313,6 @@ static const struct {
 } ax620e_unimp[] = {
     { "axera-i2c0",         0x04850000, 0x400 },
     { "axera-i2c7",         0x04857000, 0x400 },
-    { "axera-wdt0",         0x04840000, 0x400 },
     { "axera-eth0",         0x104c0000, 0x10000 },
     { "axera-npu",          0x03800000, 0xb0000 },
 };
@@ -682,6 +682,19 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
      * hw/misc/axera-axi-dmac.c's own comment for that story.
      */
     sysbus_create_simple(TYPE_AXERA_AXI_DMAC, 0x048b0000, pic[0x71]);
+
+    /*
+     * watchdog@4840000, "axera,ax-wdt", GIC SPI 0x95: a real Synopsys
+     * DW_APB_WDT, confirmed (via its own IRQ-less reset-mode kick
+     * sequence, no PSCI/syscon-reboot node anywhere in the real
+     * devicetree, and a live trace showing zero PSCI SMC calls across
+     * an entire boot+reboot cycle) to be the real reboot mechanism on
+     * this SoC -- see hw/misc/axera-wdt.c's own comment for the full
+     * story and why a passive regbank here left reboot(RB_AUTOBOOT)
+     * hanging forever in the kernel's own generic machine_restart()
+     * fallback loop.
+     */
+    sysbus_create_simple(TYPE_AXERA_WDT, 0x04840000, pic[0x95]);
 
     /*
      * emmc@1b40000/sd@104e0000/sdio@104d0000, "axera,sdhc","cdns,sd4hc":
