@@ -418,19 +418,35 @@ static void axera_map_regbanks(void)
  * (env load/save, FAT/ext4 kernel+rootfs load) sees real media instead
  * of "Card did not respond to voltage select!". index 0 is the eMMC
  * ("mmc@1B40000: 0" per U-Boot's own device numbering at boot).
+ *
+ * The real "cdns,sd4hc" IP is UHS-I capable, and the real kernel's
+ * generic sdhci_start_signal_voltage_switch() (drivers/mmc/host/
+ * sdhci.c) gates its own SDHCI_HOST_CONTROL2 write on exactly that
+ * (reading V18_ENA back afterward to confirm "the 1.8V regulator
+ * output became stable" before returning success). QEMU's own
+ * generic hw/sd/sdhci.c model gates writing that same register field
+ * on its own "uhs" property, which defaults to UHS_NOT_SUPPORTED and
+ * was never set here -- so every switch attempt's write was silently
+ * dropped, the readback the kernel checks always came back 0, and
+ * drivers/mmc/host/sdhci.c's own "did not become stable" retry fired
+ * forever (confirmed live: a real, no-card-inserted slot otherwise
+ * boots and idles fine -- U-Boot's own "mmc@104E0000: 1" probe never
+ * needed this at all, since it never requests UHS speeds).
  */
 static void axera_attach_sdhci(hwaddr base, qemu_irq irq, int unit,
                                bool emmc)
 {
     DeviceState *dev = qdev_new(TYPE_CADENCE_SDHCI);
+    CadenceSDHCIState *sdhci = CADENCE_SDHCI(dev);
     DriveInfo *di = drive_get(IF_SD, 0, unit);
+
+    qdev_prop_set_uint8(DEVICE(&sdhci->sdhci), "uhs", UHS_I);
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, irq);
 
     if (di) {
-        CadenceSDHCIState *sdhci = CADENCE_SDHCI(dev);
         DeviceState *card = qdev_new(emmc ? TYPE_EMMC : TYPE_SD_CARD);
 
         qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
