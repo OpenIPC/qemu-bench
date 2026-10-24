@@ -41,14 +41,19 @@
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/irq.h"
+#include "hw/loader.h"
+#include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
+#include "hw/misc/axera-pllc.h"
 #include "hw/misc/axera-vcmd.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/cadence_sdhci.h"
 #include "hw/sysbus.h"
 #include "hw/usb/hcd-dwc3.h"
+#include "qapi/visitor.h"
 #include "system/address-spaces.h"
+#include "system/reset.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
 #include "target/arm/gtimer.h"
@@ -58,7 +63,36 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraMachineState, AXERA_MACHINE)
 
 struct AxeraMachineState {
     MachineState parent_obj;
+    char *flash_file;
+    char *uboot_file;
 };
+
+/* CONFIG_SYS_TEXT_BASE from the vendor U-Boot's own AX630C defconfig --
+ * within the normal DRAM window, no separate RAM carve-out needed. */
+#define AXERA_UBOOT_BASE        0x5c000400ULL
+
+/*
+ * BL1/SPL's real link address, read directly from the vendor SDK's own
+ * linker script (boot/bl1/board/arch/arm64/bl1.lds): a 1 MiB internal
+ * ROM/SRAM window, not DDR -- ENTRY(_start), MEMORY { iRom (rx) :
+ * ORIGIN = 0x03000400, LENGTH = 0x100000 }.
+ */
+#define AXERA_BL1_BASE          0x03000400ULL
+#define AXERA_BL1_SIZE          (1 * MiB)
+
+typedef struct {
+    ARMCPU *cpu;
+    uint64_t entry;
+} AxeraBootromReset;
+
+static void axera_bootrom_cpu_reset(void *opaque)
+{
+    AxeraBootromReset *info = opaque;
+    CPUState *cs = CPU(info->cpu);
+
+    cpu_reset(cs);
+    cpu_set_pc(cs, info->entry);
+}
 
 /* GICC includes DIR at +0x1000 past the CPU interface, as the dtsi notes. */
 #define AXERA_GIC_DIST          0x01851000
@@ -75,15 +109,25 @@ struct AxeraMachineState {
 #define AXERA_CNTFRQ            24000000
 
 /*
- * Everything from the GIC up through the eMMC/SD/USB window, so an
- * unmodelled block reads 0 / ignores writes instead of hanging the bus.
- * Real blocks below map over pieces of this with mmio_map_overlap-style
- * priority; for now nothing does, so it is one plain unimplemented region.
- * AX620Q's own block set is smaller (no VENC/ISP/crypto in its dtsi), but
- * mapping the wider AX630C/AX620E range there too is harmless.
+ * Everything from physical address 0 up through the eMMC/SD/USB window,
+ * so an unmodelled block reads 0 / ignores writes instead of hanging the
+ * bus. Real blocks below map over pieces of this with mmio_map_overlap-
+ * style priority; for now nothing does, so it is one plain unimplemented
+ * region. AX620Q's own block set is smaller (no VENC/ISP/crypto in its
+ * dtsi), but mapping the wider AX630C/AX620E range there too is harmless.
+ *
+ * Starts at 0, not the GIC's 0x01800000ish window: real U-Boot's
+ * chip_init() (store_chip_type(), via arch/arm/mach-axera/ax620e/
+ * chip_config.c) unconditionally reads a vendor misc-info struct at the
+ * real SoC's iRAM0 address 0x740, before console is up -- with nothing
+ * mapped that low, QEMU raises a synchronous external abort there
+ * (EC=0x25 data abort, DFSC=0x10) which U-Boot's own exception handler
+ * turns into a silent panic()->hang(), with no UART output at all since
+ * gd->have_console is still 0. A passive catch-all there is enough: the
+ * driver only reads a handful of fields and tolerates them reading 0.
  */
-#define AXERA_PERIPH_BASE       0x01800000ULL
-#define AXERA_PERIPH_SIZE       0x0f300000ULL
+#define AXERA_PERIPH_BASE       0x0ULL
+#define AXERA_PERIPH_SIZE       0x10b00000ULL
 
 #define AXERA_RAM_BASE          0x40000000ULL
 
@@ -103,13 +147,22 @@ static const struct {
 } ax620e_regbanks[] = {
     { "axera-tsensor",      0x02000000, 0x1000 },
     { "axera-clk-cpu",      0x01900000, 0x10000 },
-    { "axera-clk-pllc",     0x02210000, 0x10000 },
     { "axera-clk-common",   0x02340000, 0x10000 },
     { "axera-dphytx",       0x023f1000, 0x1000 },
     { "axera-isp-syscon",   0x02500000, 0x10000 },
     { "axera-clk-flash",    0x10030000, 0x10000 },
     { "axera-clk-periph",   0x04870000, 0x10000 },
     { "axera-dispc-reset",  0x04600000, 0x100 },
+    /*
+     * Not in any Linux-visible devicetree node -- found by tracing BL1's
+     * own flash-boot execution (qemu -d unimp): BL1 writes 0xffffffff
+     * here then polls/kicks +8 before anything else, the classic
+     * "disable/kick the watchdog at reset" shape. Likely a secure-
+     * world-only early watchdog distinct from the wdt0 Linux sees at
+     * 0x04840000 (0x10000 away) -- not confirmed against vendor source,
+     * just the observed access pattern.
+     */
+    { "axera-bl1-wdt",      0x04830000, 0x100 },
     { "axera-clk-vpu",      0x04030000, 0x10000 },
     { "axera-clk-mm",       0x04430000, 0x10000 },
     { "axera-pinctrl",      0x02300000, 0xb000 },
@@ -148,7 +201,6 @@ static const struct {
 } ax620e_unimp[] = {
     { "axera-i2c0",         0x04850000, 0x400 },
     { "axera-i2c7",         0x04857000, 0x400 },
-    { "axera-spi2",         0x06072000, 0x400 },
     { "axera-wdt0",         0x04840000, 0x400 },
     { "axera-eth0",         0x104c0000, 0x10000 },
     { "axera-npu",          0x03800000, 0xb0000 },
@@ -158,6 +210,18 @@ static const struct {
 static void axera_map_regbanks(void)
 {
     int n;
+
+    /* clk_pllc @ 0x02210000: BL1 enables the CPU PLL and VPLL0 here and
+     * spins waiting for their ready bits (see hw/misc/axera-pllc.c) --
+     * a real device, not a passive regbank, is required for BL1's
+     * flash-boot path to get past PLL bring-up at all. */
+    sysbus_create_simple(TYPE_AXERA_PLLC, 0x02210000, NULL);
+
+    /* spi2 @ 0x06072000, the SPI-attached display panel's bus: U-Boot's
+     * poll_transfer() loops on the RX FIFO level with no timeout (see
+     * hw/misc/axera-dw-spi.c) -- a passive regbank hangs the boot dead
+     * silently right after console init. */
+    sysbus_create_simple(TYPE_AXERA_DW_SPI, 0x06072000, NULL);
 
     for (n = 0; n < ARRAY_SIZE(ax620e_regbanks); n++) {
         DeviceState *dev = qdev_new("hisi-regbank");
@@ -177,7 +241,17 @@ static void axera_map_regbanks(void)
 
 static const AxeraSoCConfig ax630c_soc = {
     .desc              = "Axera AX630C (2x Cortex-A53, AX620E family)",
-    .ram_size_default  = 1 * GiB,
+    /*
+     * The real Sipeed NanoKVM-Pro/MaixCam board this machine targets has
+     * 2 GiB DRAM: U-Boot's own board/axera/ax620e_emmc/ax620e_emmc.c
+     * dram_init() hardcodes gd->ram_size = 0x7FFFF000 regardless of what
+     * QEMU actually backs, and board_f.c carves malloc/board-info/stack
+     * down from that computed top -- with only 1 GiB of real RAM behind
+     * it, those late reservations land past the end of backed memory and
+     * U-Boot dies with a silent synchronous external abort in memset()
+     * (called from reserve_board()) right after relocation.
+     */
+    .ram_size_default  = 2 * GiB,
     .uart0_base        = AXERA_UART0_BASE,
     .uart0_irq         = AXERA_UART0_IRQ,
 };
@@ -340,6 +414,91 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(dwc3), 0, 0x08000000);
     }
 
+    {
+        AxeraMachineState *ams = AXERA_MACHINE(machine);
+
+        if (ams->uboot_file && ams->uboot_file[0] && !machine->kernel_filename) {
+            /*
+             * Start straight at U-Boot instead of replaying BL1/SPL's
+             * own raw PLL/DDR bring-up: that sequence is real silicon
+             * register bit-banging (see hw/misc/axera-pllc.c's own
+             * comment) with more stages than the one PLL handshake
+             * already modelled, and QEMU's RAM is "trained" by
+             * construction -- there is nothing for a DDR controller
+             * model to do here that isn't already done. This is the
+             * same trade-off this tree's own HiSilicon V5 aarch64 path
+             * already makes (locating u-boot-z.bin inside the image and
+             * starting CPU0 there, not replaying the real boot ROM).
+             * CONFIG_SYS_TEXT_BASE is within the normal DRAM window
+             * mapped above, so no separate RAM region is needed here.
+             */
+            char *uboot_data = NULL;
+            gsize uboot_len = 0;
+
+            if (!g_file_get_contents(ams->uboot_file, &uboot_data,
+                                     &uboot_len, NULL)) {
+                error_report("axera: %s: could not read uboot-file '%s'",
+                              MACHINE_GET_CLASS(machine)->name,
+                              ams->uboot_file);
+                exit(1);
+            }
+
+            rom_add_blob_fixed("axera.uboot", uboot_data, uboot_len,
+                               AXERA_UBOOT_BASE);
+            g_free(uboot_data);
+
+            AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
+            info->cpu = cpu[0];
+            info->entry = AXERA_UBOOT_BASE;
+            qemu_register_reset(axera_bootrom_cpu_reset, info);
+            return;
+        }
+
+        if (ams->flash_file && ams->flash_file[0] && !machine->kernel_filename) {
+            /*
+             * Flash boot: BL1/SPL occupies offset 0 of a real dumped
+             * flash/NAND image (confirmed: a leaked debug-info path
+             * string "AX620E_SDK/boot/bl1/spl" and board/start.S sit
+             * right at the start of a real Xiongmai-built AX620E
+             * firmware dump). Inject it verbatim at its real link
+             * address and start CPU0 there -- same technique this tree
+             * already uses for HiSilicon's V1/V5 boot-ROM paths
+             * (hisilicon_maskrom_cpu_reset), just a different address.
+             * A small RAM region backs 0x03000400 (inside the broader
+             * axera-periph unimplemented catch-all) so the injected
+             * code is actually executable, at normal priority so it
+             * wins over that -1000-priority catch-all underneath.
+             */
+            MemoryRegion *bl1_ram = g_new(MemoryRegion, 1);
+            char *bl1_data = NULL;
+            gsize bl1_len = 0;
+
+            if (!g_file_get_contents(ams->flash_file, &bl1_data, &bl1_len,
+                                     NULL)) {
+                error_report("axera: %s: could not read flash-file '%s'",
+                              MACHINE_GET_CLASS(machine)->name,
+                              ams->flash_file);
+                exit(1);
+            }
+
+            memory_region_init_ram(bl1_ram, NULL, "axera.bl1ram",
+                                   AXERA_BL1_SIZE, &error_fatal);
+            memory_region_add_subregion(sysmem, AXERA_BL1_BASE, bl1_ram);
+
+            rom_add_blob_fixed("axera.bl1",
+                               bl1_data,
+                               MIN(bl1_len, (gsize)AXERA_BL1_SIZE),
+                               AXERA_BL1_BASE);
+            g_free(bl1_data);
+
+            AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
+            info->cpu = cpu[0];
+            info->entry = AXERA_BL1_BASE;
+            qemu_register_reset(axera_bootrom_cpu_reset, info);
+            return;
+        }
+    }
+
     if (machine->kernel_filename && !machine->dtb) {
         error_report("axera: %s needs the kernel's device tree (-dtb)",
                       MACHINE_GET_CLASS(machine)->name);
@@ -366,6 +525,34 @@ static void axera_machine_register_types(void)
 
 type_init(axera_machine_register_types)
 
+static char *axera_machine_get_flash_file(Object *obj, Error **errp)
+{
+    return g_strdup(AXERA_MACHINE(obj)->flash_file);
+}
+
+static void axera_machine_set_flash_file(Object *obj, const char *value,
+                                         Error **errp)
+{
+    AxeraMachineState *s = AXERA_MACHINE(obj);
+
+    g_free(s->flash_file);
+    s->flash_file = g_strdup(value);
+}
+
+static char *axera_machine_get_uboot_file(Object *obj, Error **errp)
+{
+    return g_strdup(AXERA_MACHINE(obj)->uboot_file);
+}
+
+static void axera_machine_set_uboot_file(Object *obj, const char *value,
+                                         Error **errp)
+{
+    AxeraMachineState *s = AXERA_MACHINE(obj);
+
+    g_free(s->uboot_file);
+    s->uboot_file = g_strdup(value);
+}
+
 #define DEFINE_AXERA_A64_MACHINE(namestr, tag, config)                \
     static void tag##_init(MachineState *machine)                     \
     {                                                                 \
@@ -373,6 +560,7 @@ type_init(axera_machine_register_types)
     }                                                                 \
     static void tag##_class_init(MachineClass *mc)                    \
     {                                                                 \
+        ObjectClass *oc = OBJECT_CLASS(mc);                           \
         mc->desc = config.desc;                                       \
         mc->init = tag##_init;                                        \
         mc->default_ram_size = config.ram_size_default;                \
@@ -380,6 +568,20 @@ type_init(axera_machine_register_types)
         mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a53");        \
         mc->max_cpus = 2;                                              \
         mc->default_cpus = 2;                                         \
+        object_class_property_add_str(oc, "flash-file",               \
+            axera_machine_get_flash_file,                             \
+            axera_machine_set_flash_file);                            \
+        object_class_property_set_description(oc, "flash-file",       \
+            "Raw flash/NAND dump; BL1/SPL at offset 0 is injected at " \
+            "its real link address (0x03000400) and CPU0 starts "     \
+            "there, with no -kernel.");                                \
+        object_class_property_add_str(oc, "uboot-file",                \
+            axera_machine_get_uboot_file,                              \
+            axera_machine_set_uboot_file);                             \
+        object_class_property_set_description(oc, "uboot-file",       \
+            "A real U-Boot binary (CONFIG_SYS_TEXT_BASE link layout), "\
+            "injected at 0x5c000400 with CPU0 starting there -- skips "\
+            "BL1/SPL's own DDR/PLL bring-up, with no -kernel.");       \
     }                                                                 \
     DEFINE_MACHINE_EXTENDED(namestr, AXERA_MACHINE, AxeraMachineState, \
                             tag##_class_init, false,                    \

@@ -177,8 +177,12 @@ cp qemu/hw/arm/axera.c              "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/axera.h      "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/axera-eip130.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-eip130.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-pllc.c        "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-pllc.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-vcmd.c        "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-vcmd.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-dw-spi.c      "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-dw-spi.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -658,6 +662,16 @@ if ! grep -q "'axera-vcmd.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-vcmd.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-vcmd.c"
+fi
+if ! grep -q "'axera-pllc.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-pllc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-pllc.c"
+fi
+if ! grep -q "'axera-dw-spi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-dw-spi.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-dw-spi.c"
 fi
 
 # hw/misc/Kconfig
