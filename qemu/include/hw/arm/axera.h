@@ -29,6 +29,16 @@ typedef struct AxeraSoCConfig {
     hwaddr      smp_bootreg_addr; /* 0 if this SoC's secondary-boot-reg isn't
                                     * modelled (AX620Q: register not
                                     * confirmed; only CPU0 boots there) */
+    bool        flash_is_nor;   /* flash-file='s real dump's own flash type
+                                  * (board.c's get_boot_mode() chip_mode
+                                  * strap, which BL1 itself reads to decide
+                                  * spinor_init() vs emmc_init() -- real
+                                  * hardware's boot ROM sets this from strap
+                                  * pins before BL1 runs, so flash-file=
+                                  * must preseed the same value): true for
+                                  * AX620E's real SPI NOR camera dump, false
+                                  * (eMMC) for AX630C's real dev-board dump.
+                                  */
 } AxeraSoCConfig;
 
 #endif /* HW_ARM_AXERA_H */

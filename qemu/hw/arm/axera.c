@@ -44,7 +44,10 @@
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/misc/axera-bl1-timer.h"
+#include "hw/misc/axera-ddr-phy.h"
 #include "hw/misc/axera-ddr-pll.h"
+#include "hw/misc/axera-dma-checksum.h"
+#include "hw/misc/axera-dmaper.h"
 #include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
 #include "hw/misc/axera-pllc.h"
@@ -95,12 +98,21 @@ struct AxeraMachineState {
 
 /*
  * TOP_CHIPMODE_GLB_SW (TOP_CHIPMODE_GLB + 0xC, see the axera-chipmode
- * regbank comment above) and the flash_type=1 ("EMMC BOOT
- * 8BIT_50M_768K") encoding board.c's get_boot_mode() expects in bits
- * [3:1] to make BL1 run its real card-init sequence.
+ * regbank comment above): the flash_type board.c's get_boot_mode()
+ * decodes from bits [3:1] (chip_mode & 0xe) >> 1, so BL1 runs the real
+ * driver matching the real dump's own flash -- "EMMC BOOT 8BIT_50M_768K"
+ * (flash_type=1, chip_mode=0x2) for AX630C's real eMMC dev-board dump,
+ * "NOR" (flash_type=7, chip_mode=0xe) for AX620E's real SPI NOR camera
+ * dump. Confirmed from a real deployed AX620E NOR dump getting stuck
+ * forever with the SPI NOR controller's own registers completely
+ * untouched (SSIENR etc all still 0) while this was unconditionally
+ * preseeding the eMMC value regardless of which real flash the dump
+ * actually used -- BL1 was dutifully calling emmc_init()/trying to read
+ * U-Boot's image off a storage type that was never there.
  */
 #define AXERA_CHIPMODE_SW_ADDR  0x0239000cULL
 #define AXERA_CHIPMODE_EMMC_BOOT_8BIT 0x2U
+#define AXERA_CHIPMODE_NOR      0xeU
 
 /*
  * PIN_MUX_G11_VDET_RO0 (board.c's get_emmc_voltage(), bit 12: 1=3.3V,
@@ -122,9 +134,14 @@ struct AxeraMachineState {
 
 static void axera_bl1_chipmode_reset(void *opaque)
 {
+    bool flash_is_nor = (uintptr_t)opaque;
+
     address_space_stl_le(&address_space_memory, AXERA_CHIPMODE_SW_ADDR,
-                         AXERA_CHIPMODE_EMMC_BOOT_8BIT,
+                         flash_is_nor ? AXERA_CHIPMODE_NOR
+                                      : AXERA_CHIPMODE_EMMC_BOOT_8BIT,
                          MEMTXATTRS_UNSPECIFIED, NULL);
+    /* The 3.3V-probe strap only matters for the eMMC OCR dance below;
+     * harmless to leave set either way, but only meaningful for eMMC. */
     address_space_stl_le(&address_space_memory, AXERA_VDET_RO0_ADDR,
                          AXERA_VDET_3V3_BIT,
                          MEMTXATTRS_UNSPECIFIED, NULL);
@@ -243,6 +260,16 @@ static const struct {
     { "axera-mipi-csi",     0x02600000, 0x4000 },
     { "axera-mipi-dphy",    0x023f0000, 0x1000 },
     { "axera-tdp",          0x04405000, 0x1000 },
+    /*
+     * DDRMC @ 0x00100000 (boot/bl1/driver/ddr/ddr/ddrmc_reg_addr_def.h,
+     * D_DDRMC_*): ddr_init.c/ddr_scan.c read back plenty of these
+     * mid-training (port config, retrain/eye-scan registers at the
+     * +0xc00 sub-block) the same write-then-read way everything else
+     * in this table needs a real readback for. No dynamic bit of its
+     * own is known to matter yet, unlike the DDR PHY blocks below --
+     * add one here if a future training stage needs it.
+     */
+    { "axera-ddrmc",        0x00100000, 0x10000 },
 };
 
 /*
@@ -296,6 +323,39 @@ static void axera_map_regbanks(void)
      * polls before DDR training can even start (see
      * hw/misc/axera-ddr-pll.c). */
     sysbus_create_simple(TYPE_AXERA_DDR_PLL, 0x00265000, NULL);
+
+    /*
+     * DDRPHY channel A @ 0x00110000, channel B @ 0x00120000 (A + the
+     * real DDR_PHY_OFFSET of 0x10000, per ddrphy_reg_addr_def.h). Real
+     * BL1's ddrphy_zqc_seq() (ddr_init.c) spins here forever (12M+
+     * accesses traced on the real dump) in a bounded SAR calibration
+     * search whose comparator bits a passive regbank can't supply --
+     * see hw/misc/axera-ddr-phy.c's own comment for why this needs a
+     * dynamic comparator rather than the plain readback the rest of
+     * this training stage gets below.
+     */
+    sysbus_create_simple(TYPE_AXERA_DDR_PHY, 0x00110000, NULL);
+    sysbus_create_simple(TYPE_AXERA_DDR_PHY, 0x00120000, NULL);
+
+    /*
+     * AX_DMAPER @ 0x048a0000 (boot/bl1/driver/dmaper/dmaper.h): real
+     * BL1 stages a flash read into scratch RAM then uses this LLI-
+     * descriptor DMA engine (axi_dma_xfer_start()/
+     * axi_dma_wait_xfer_done()) to copy it into the image's final
+     * destination -- see hw/misc/axera-dmaper.c's own comment for why
+     * this needs a real memory-to-memory copy, not just a ready bit.
+     */
+    sysbus_create_simple(TYPE_AXERA_DMAPER, 0x048a0000, NULL);
+
+    /*
+     * DMADIM (hardware word-checksum DMA) @ 0x10460000 (boot/bl1/
+     * driver/axdma/axdma_checksum.c): boot.c's calc_word_chksum() tries
+     * this first before falling back to a plain CPU loop, and the
+     * fallback only triggers on a reported hardware failure, not a
+     * poll that never finishes -- see hw/misc/axera-dma-checksum.c's
+     * own comment.
+     */
+    sysbus_create_simple(TYPE_AXERA_DMA_CHECKSUM, 0x10460000, NULL);
 
     for (n = 0; n < ARRAY_SIZE(ax620e_regbanks); n++) {
         DeviceState *dev = qdev_new("hisi-regbank");
@@ -370,6 +430,7 @@ static const AxeraSoCConfig ax630c_soc = {
 static const AxeraSoCConfig ax620e_soc = {
     .desc              = "Axera AX620E (2x Cortex-A53, IP-camera profile)",
     .ram_size_default  = 1 * GiB,
+    .flash_is_nor      = true,
     .uart0_base        = AXERA_UART0_BASE,
     .uart0_irq         = AXERA_UART0_IRQ,
 };
@@ -667,7 +728,8 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
             info->cpu = cpu[0];
             info->entry = AXERA_BL1_BASE;
             qemu_register_reset(axera_bootrom_cpu_reset, info);
-            qemu_register_reset(axera_bl1_chipmode_reset, NULL);
+            qemu_register_reset(axera_bl1_chipmode_reset,
+                                (void *)(uintptr_t)c->flash_is_nor);
             return;
         }
     }

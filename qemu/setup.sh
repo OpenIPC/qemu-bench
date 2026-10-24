@@ -191,6 +191,12 @@ cp qemu/hw/misc/axera-ddr-pll.c   "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-ddr-pll.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-spi-nand.c    "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-spi-nand.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-ddr-phy.c    "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-ddr-phy.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-dmaper.c     "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-dmaper.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-dma-checksum.c "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-dma-checksum.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -701,6 +707,21 @@ if ! grep -q "'axera-spi-nand.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-spi-nand.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-spi-nand.c"
+fi
+if ! grep -q "'axera-ddr-phy.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ddr-phy.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-ddr-phy.c"
+fi
+if ! grep -q "'axera-dmaper.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-dmaper.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-dmaper.c"
+fi
+if ! grep -q "'axera-dma-checksum.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-dma-checksum.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-dma-checksum.c"
 fi
 
 # hw/misc/Kconfig
