@@ -657,10 +657,11 @@ config AXERA
     select CADENCE_SDHCI
     select USB_DWC3
     select SSI_M25P80
+    select HISI_I2C
 KCONFIG
     echo "  hw/arm/Kconfig: added AXERA"
 else
-    for sym in ARM_GIC SERIAL_MM UNIMP HISI_MISC CADENCE_SDHCI USB_DWC3 SSI_M25P80; do
+    for sym in ARM_GIC SERIAL_MM UNIMP HISI_MISC CADENCE_SDHCI USB_DWC3 SSI_M25P80 HISI_I2C; do
         if ! sed -n '/^config AXERA$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config AXERA\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym

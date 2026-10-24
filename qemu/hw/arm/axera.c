@@ -39,6 +39,7 @@
 #include "hw/arm/axera.h"
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
+#include "hw/i2c/i2c.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/irq.h"
@@ -722,6 +723,44 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     axera_attach_sdhci(0x01b40000, pic[9], 0, true);
     axera_attach_sdhci(0x104e0000, pic[74], 1, false);
     axera_attach_sdhci(0x104d0000, pic[73], 2, false);
+
+    /*
+     * i2c@4852000 (i2c2) and i2c@4856000 (i2c6), "snps,designware-i2c",
+     * GIC SPI 0x89/0x8d: of this SoC's eight i2c0-i2c7 controller
+     * instances, the real devicetree has only these two actually
+     * enabled (every other one is "status = disabled", confirmed by
+     * reading each node directly) -- and both already printed
+     * "Unknown Synopsys component type: 0x00000000" during normal
+     * boot before this (a completely unmapped MMIO region reads back
+     * all-zero, including the real driver's own IP-identification
+     * register it checks). i2c6 specifically is what this dump's own
+     * vendor userspace camera/ISP pipeline opens directly as
+     * /dev/i2c-6 to talk to the real image sensor -- confirmed by
+     * this same boot's own "Load_AX620E -i imx307" invocation (the
+     * real devicetree has no sensor child node at all under this
+     * i2c bus; the vendor's own userspace ISP library owns the
+     * sensor probe/config entirely, not the kernel). With no device
+     * node for /dev/i2c-6 ever created (this controller never having
+     * probed successfully at all), the real vendor binary's own
+     * open() failure cascaded into a guest-side SIGBUS ("Bus error")
+     * in its video pipeline shortly after. hisi-i2c-dw (a real,
+     * already-used-elsewhere generic DesignWare I2C controller model)
+     * and hisi-imx307 (a real IMX307 stub already written for this
+     * exact Xiongmai probe sequence -- see its own comment) are both
+     * pre-existing, complete device models in this tree; this is
+     * their first use on AX620E. The sensor's own I2C address, 0x1a,
+     * is the industry-standard Sony STARVIS address (confirmed
+     * already assumed correct elsewhere in this project, for the
+     * same sensor family, on a different Xiongmai-derived SoC).
+     */
+    sysbus_create_simple("hisi-i2c-dw", 0x04852000, pic[0x89]);
+    {
+        DeviceState *i2c6 = sysbus_create_simple("hisi-i2c-dw", 0x04856000,
+                                                 pic[0x8d]);
+
+        i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c6, "i2c")),
+                                "hisi-imx307", 0x1a);
+    }
 
     /*
      * usb2@8000000, "snps,dwc3": QEMU's generic usb_dwc3 model (also
