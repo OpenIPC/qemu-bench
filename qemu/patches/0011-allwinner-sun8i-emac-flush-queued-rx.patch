@@ -1,0 +1,35 @@
+allwinner-sun8i-emac: flush queued frames whenever the receiver is ready
+
+A frame that arrives while the receiver cannot take it (RX not enabled
+yet, or no free descriptor) is queued, and the backend (tap, socket)
+stops reading until the queue is flushed.  The model flushed only on
+writes to BASIC_CTL1 and RX_CTL1, but Linux drivers enable reception
+through RX_CTL0 after RX_CTL1: on a bridged tap, where the host sends
+traffic (IPv6, mDNS, STP) before the interface is up, the first such
+frame stalled reception for good -- the guest's ARP requests went out,
+the replies never came in.  User-mode networking sends nothing unasked,
+which hid it.  Flush after every register write that leaves the
+receiver ready.
+
+---
+diff --git a/hw/net/allwinner-sun8i-emac.c b/hw/net/allwinner-sun8i-emac.c
+--- a/hw/net/allwinner-sun8i-emac.c
++++ b/hw/net/allwinner-sun8i-emac.c
+@@ -775,6 +775,17 @@
+                                  "EMAC register 0x" HWADDR_FMT_plx "\n",
+                                   offset);
+     }
++
++    /*
++     * A frame that arrived while the receiver could not take it was queued,
++     * and the backend stopped reading until the queue is flushed.  The
++     * receiver can become ready through several registers (RX_CTL0 enable,
++     * descriptors handed back before an interrupt is acknowledged), so
++     * check after every write.
++     */
++    if (allwinner_sun8i_emac_can_receive(nc)) {
++        qemu_flush_queued_packets(nc);
++    }
+ }
+ 
+ static void allwinner_sun8i_emac_set_link(NetClientState *nc)

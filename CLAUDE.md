@@ -206,6 +206,30 @@ script must land after device reset, which a reset handler does not -- and
 the boot NOR is `ak-spinor`, not m25p80, because the vendor drivers send
 fast-read dummies as ordinary TX bytes.
 
+Allwinner V831/V833 (`hw/arm/allwinner-v83x.c`,
+`docs/allwinner-v83x.md`) boots a camera's whole NOR image through boot0,
+OP-TEE, U-Boot and Linux. Its own blocks are the `aw-*` files (CCU, DRAM
+controller, SPI, DMA, watchdog, TWI engine), built under ALLWINNER_V83X.
+Timers, SD, legacy TWI and the EMAC are upstream's Allwinner models;
+patches 0004 to 0009 fix what the vendor drivers rely on (self-clearing
+resets, NACK interrupts, no BUS_EN in master mode, absent MDIO PHYs
+reading 0xffff). The GIC needs more than 179 lines,
+or OP-TEE leaves every interrupt secure and Linux hangs after the timer.
+`qemu-boot/test-v831-boot.sh --flash dump.bin` checks each stage up to a
+shell. Video input: `aw-vinc` paints test frames into buffers behind
+`aw-iommu` (the media masters use IOMMU addresses); `aw-ve` answers the
+VE ID CedarC's compiled-in table and its LBC check accept (0xE0/0xE4 =
+0x21110/0x21210); the sensor is `hisi-gc2053` on TWI1; `aw-pio` reads
+inputs high (stored zeros were the YI reset button held down).
+`qemu-boot/yi-v831-prepare.sh` makes a YI image that runs as if paired.
+`aw-ve` encodes H.264: CedarC puts the headers through the bitstream
+writer and the model appends a CABAC slice coding the input picture
+(I_16x16 DC coefficients / P_Skip + I_PCM), read from the video input's
+LBC buffer in a private stand-in format (`aw-qlbc.h`); `-global
+aw-ve.dump=DIR` saves the streams for checking with a decoder. `aw-g2d`
+runs the 2D engine's register queue (scale + convert, for the app's
+motion detection). `aw-audio` captures silence so the AAC encoder and recorder run.
+
 SigmaStar/MStar infinity2m (`hw/arm/sigmastar.c`, `docs/sigmastar.md`) is a
 fourth: Cortex-A7 parts whose blocks sit in 16-bit RIU register banks at
 `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte

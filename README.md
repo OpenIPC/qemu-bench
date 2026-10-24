@@ -13,15 +13,16 @@ desk. Vendor families covered:
 - **Anyka** AK39xx
 - **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375)
 - **Novatek** NT9856x, NT98533 and NT98332
+- **Allwinner** V831 / V833
 
 The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (69 total)
+## Supported Machines (71 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -248,6 +249,31 @@ encoder to its RTSP server: H.264/H.265 from libx264/libx265 and baseline
 JPEG snapshots, of a test pattern (the ISP does not process pixels), and
 microphone capture. `uuid=` gives the die ID its analytics licence is
 bound to.
+
+### Allwinner V831 / V833 family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `v831` | Cortex-A7, 64 MB DDR2 in package | GIC-400 | 4.9.118 vendor (DT) | yes |
+| `v833` | Cortex-A7, 128 MB DDR3 in package | GIC-400 | — | —¹ |
+
+Allwinner's sun8iw19 camera dies, in `hw/arm/allwinner-v83x.c`: the H6's
+"ncat" map with one Cortex-A7 and TrustZone. A camera's SPI NOR dump boots
+as on silicon: boot0 trains DRAM and loads the boot package over SPI,
+OP-TEE drops to U-Boot in the normal world, and U-Boot reads its
+environment and GPT over SPI with DMA, the SD card, and the kernel, which
+mounts its SquashFS root from the NOR:
+`-M v831,flash-file=dump.bin -drive if=sd,...`. Flash writes go back to the
+file. The EMAC works with the vendor driver (`-nic user`), even on
+cameras that ship with Wi-Fi only. The vendor media stack runs on a
+modelled sensor, video input and IOMMU, and its H.264 encoder produces
+valid streams of a test picture (the OpenIPC logo) through the modelled video engine. A YI camera (V831) runs to a root shell and the vendor application in
+a few seconds (`qemu-boot/test-v831-boot.sh`). Its U-Boot silences the
+kernel console unless the SD card holds `/debug_tty`. Map, boot chain and
+what the firmware depends on are in
+[docs/allwinner-v83x.md](docs/allwinner-v83x.md).
+
+¹ Same die and models as `v831`; no image was at hand.
 
 ### Novatek NT9856x family (`qemu-system-arm`)
 
