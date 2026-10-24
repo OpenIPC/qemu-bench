@@ -75,8 +75,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define SPINOR_OP_READID        0x90
 #define SPINOR_OP_READ          0x03
 
-#define AXERA_SPI_NOR_RXQ_MAX   4096
-
 struct AxeraSpiNorState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -92,23 +90,34 @@ struct AxeraSpiNorState {
     uint8_t latched_opcode;
     uint32_t latched_addr;
 
-    uint8_t rxq[AXERA_SPI_NOR_RXQ_MAX];
+    uint8_t *rxq;
+    unsigned int rxq_cap;
     unsigned int rxq_head;
     unsigned int rxq_len;
 };
 
-static void rxq_reset(AxeraSpiNorState *s)
+/*
+ * BL1's own dw_spi_mst.c reads flash in up to 32768-byte chunks (CTRL1's
+ * entries-1 field is 16 bits wide on the real DesignWare APB SSI IP, so
+ * a single RX phase can legitimately ask for far more than any small
+ * fixed-size buffer could hold) -- size the queue to the exact transfer
+ * instead of capping it, matching what the real FIFO-plus-shift-register
+ * behaves as from software's point of view.
+ */
+static void rxq_reset(AxeraSpiNorState *s, unsigned int needed)
 {
+    if (needed > s->rxq_cap) {
+        s->rxq = g_realloc(s->rxq, needed);
+        s->rxq_cap = needed;
+    }
     s->rxq_head = 0;
     s->rxq_len = 0;
 }
 
 static void rxq_push(AxeraSpiNorState *s, uint8_t byte)
 {
-    if (s->rxq_len < AXERA_SPI_NOR_RXQ_MAX) {
-        s->rxq[(s->rxq_head + s->rxq_len) % AXERA_SPI_NOR_RXQ_MAX] = byte;
-        s->rxq_len++;
-    }
+    s->rxq[(s->rxq_head + s->rxq_len) % s->rxq_cap] = byte;
+    s->rxq_len++;
 }
 
 /*
@@ -130,7 +139,7 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
     uint32_t total = entries * frame_bytes;
     uint32_t i;
 
-    rxq_reset(s);
+    rxq_reset(s, total);
 
     switch (s->latched_opcode) {
     case SPINOR_OP_READ:
@@ -212,7 +221,7 @@ static uint64_t axera_spi_nor_read(void *opaque, hwaddr offset, unsigned size)
             return 0;
         }
         val = s->rxq[s->rxq_head];
-        s->rxq_head = (s->rxq_head + 1) % AXERA_SPI_NOR_RXQ_MAX;
+        s->rxq_head = (s->rxq_head + 1) % s->rxq_cap;
         s->rxq_len--;
         return val;
     default:

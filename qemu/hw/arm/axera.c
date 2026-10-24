@@ -48,6 +48,7 @@
 #include "hw/misc/axera-ddr-pll.h"
 #include "hw/misc/axera-dma-checksum.h"
 #include "hw/misc/axera-dmaper.h"
+#include "hw/misc/axera-gzipd.h"
 #include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
 #include "hw/misc/axera-pllc.h"
@@ -357,6 +358,20 @@ static void axera_map_regbanks(void)
      */
     sysbus_create_simple(TYPE_AXERA_DMA_CHECKSUM, 0x10460000, NULL);
 
+    /*
+     * GZIPD @ 0x10410000 (boot/bl1/driver/gzipd/ax_gzipd_reg.h): BL1
+     * routes every non-DDRINIT flash image through this engine to
+     * decode Axera's own proprietary "AXGZIP" container format -- the
+     * real AX620E NOR dump's own U-Boot image genuinely needs this
+     * (confirmed: starts with the real container magic, and the
+     * decoded output's own embedded link-address field matches this
+     * project's real UBOOT_IMG_HEADER_BASE exactly) -- see
+     * hw/misc/axera-gzipd.c's own comment for the full format and how
+     * it was reverse-engineered (no source for the algorithm exists
+     * anywhere, only a compiled host-side tool used as an oracle).
+     */
+    sysbus_create_simple(TYPE_AXERA_GZIPD, 0x10410000, NULL);
+
     for (n = 0; n < ARRAY_SIZE(ax620e_regbanks); n++) {
         DeviceState *dev = qdev_new("hisi-regbank");
 
@@ -478,7 +493,14 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
          * firmware's spin-table-less boot.
          */
         object_property_set_bool(cpuobj, "has_el3", want_el3, &error_fatal);
-        object_property_set_bool(cpuobj, "has_el2", false, &error_fatal);
+        /*
+         * The real BL1 also does its own genuine EL3->EL2 drop as part
+         * of bring-up (confirmed live: its second instruction at EL2,
+         * "mrs x0, cnthctl_el2", traps as undefined the moment EL2 is
+         * disabled) before continuing on to DDR/flash init -- needs a
+         * real EL2 for the same want_el3 cases that need a real EL3.
+         */
+        object_property_set_bool(cpuobj, "has_el2", want_el3, &error_fatal);
         if (!want_el3) {
             object_property_set_int(cpuobj, "psci-conduit",
                                      QEMU_PSCI_CONDUIT_SMC, &error_fatal);
