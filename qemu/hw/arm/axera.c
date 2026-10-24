@@ -74,6 +74,12 @@ struct AxeraMachineState {
  * within the normal DRAM window, no separate RAM carve-out needed. */
 #define AXERA_UBOOT_BASE        0x5c000400ULL
 
+/* CONFIG_SYS_TEXT_BASE from the vendor U-Boot's own AX620Q eMMC defconfig
+ * (a lower address than AX630C's -- AX620Q's real DRAM window is 256 MiB,
+ * not 2 GiB). No real AX620U U-Boot source exists in the vendor dump, so
+ * only AX620Q gets a uboot-file= entry point for now. */
+#define AXERA_AX620Q_UBOOT_BASE 0x44000400ULL
+
 /*
  * BL1/SPL's real link address, read directly from the vendor SDK's own
  * linker script (boot/bl1/board/arch/arm64/bl1.lds): a 1 MiB internal
@@ -685,6 +691,16 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0,
                                     ax620q_regbanks[r].base, 1);
         }
+
+        /*
+         * spi2 @ 0x06072000 (same address as AX630C/AX620E's, confirmed
+         * from arch/arm/dts/ax620e.dtsi's shared spi2 node): AX620Q's own
+         * boot logo also drives a SPI-attached panel through this same
+         * poll_transfer() loop with no timeout (see hw/misc/axera-dw-spi.c)
+         * -- a passive regbank hangs the boot dead right after relocation,
+         * same shape as the aarch64 family's panel hang.
+         */
+        sysbus_create_simple(TYPE_AXERA_DW_SPI, 0x06072000, NULL);
     } else {
         /*
          * AX620U's real devicetree (from a deployed camera firmware,
@@ -740,6 +756,58 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
                    AXERA_UART0_FREQ / 16, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
 
+    /*
+     * AX620Q's own real vendor U-Boot (CONFIG_CONS_INDEX=4,
+     * CONFIG_SYS_NS16550_COM4 in include/configs/ax620e_common.h) puts
+     * its console on a fourth, separate NS16550 instance at 0x06080000,
+     * not on uart0_base -- confirmed by GDB-tracing a silent boot straight
+     * into eserial4_init()/NS16550_init(com_port=0x6080000). Not in
+     * AX620Q's own documented dtsi blocks (board bring-up only, no IRQ
+     * confirmed from any real devicetree), so no interrupt line.
+     */
+    if (!c->is_ax620x) {
+        serial_mm_init(sysmem, 0x06080000, 2, NULL,
+                       AXERA_UART0_FREQ / 16, serial_hd(0),
+                       DEVICE_LITTLE_ENDIAN);
+    }
+
+    {
+        AxeraMachineState *ams = AXERA_MACHINE(machine);
+
+        if (ams->uboot_file && ams->uboot_file[0] && !machine->kernel_filename) {
+            char *uboot_data = NULL;
+            gsize uboot_len = 0;
+            hwaddr uboot_base;
+
+            if (c->is_ax620x) {
+                error_report("axera: %s: uboot-file= is not supported yet "
+                             "(no real AX620U U-Boot source available to "
+                             "confirm its link address)",
+                              MACHINE_GET_CLASS(machine)->name);
+                exit(1);
+            }
+            uboot_base = AXERA_AX620Q_UBOOT_BASE;
+
+            if (!g_file_get_contents(ams->uboot_file, &uboot_data,
+                                     &uboot_len, NULL)) {
+                error_report("axera: %s: could not read uboot-file '%s'",
+                              MACHINE_GET_CLASS(machine)->name,
+                              ams->uboot_file);
+                exit(1);
+            }
+
+            rom_add_blob_fixed("axera.uboot", uboot_data, uboot_len,
+                               uboot_base);
+            g_free(uboot_data);
+
+            AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
+            info->cpu = cpu0;
+            info->entry = uboot_base;
+            qemu_register_reset(axera_bootrom_cpu_reset, info);
+            return;
+        }
+    }
+
     if (machine->kernel_filename && !machine->dtb) {
         error_report("axera: %s needs the kernel's device tree (-dtb)",
                       MACHINE_GET_CLASS(machine)->name);
@@ -757,13 +825,22 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     }                                                                 \
     static void tag##_class_init(MachineClass *mc)                    \
     {                                                                 \
+        ObjectClass *oc = OBJECT_CLASS(mc);                           \
         mc->desc = config.desc;                                       \
         mc->init = tag##_init;                                        \
         mc->default_ram_size = config.ram_size_default;                \
         mc->default_ram_id = "axera.ram";                              \
         mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");         \
-        mc->max_cpus = 1;                                              \
-        mc->default_cpus = 1;                                         \
+        mc->max_cpus = config.max_cpus ? config.max_cpus : 1;          \
+        mc->default_cpus = mc->max_cpus;                               \
+        object_class_property_add_str(oc, "uboot-file",                \
+            axera_machine_get_uboot_file,                              \
+            axera_machine_set_uboot_file);                             \
+        object_class_property_set_description(oc, "uboot-file",       \
+            "A real U-Boot binary (CONFIG_SYS_TEXT_BASE link layout), "\
+            "injected at its real link address with CPU0 starting "   \
+            "there, with no -kernel. AX620Q only -- no real AX620U "  \
+            "U-Boot source exists to confirm its link address.");     \
     }                                                                 \
     DEFINE_MACHINE_EXTENDED(namestr, AXERA_MACHINE, AxeraMachineState, \
                             tag##_class_init, false,                    \
