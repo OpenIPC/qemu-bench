@@ -48,6 +48,7 @@
 #include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
 #include "hw/misc/axera-pllc.h"
+#include "hw/misc/axera-spi-nand.h"
 #include "hw/misc/axera-spi-nor.h"
 #include "hw/misc/axera-vcmd.h"
 #include "hw/misc/unimp.h"
@@ -555,6 +556,23 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     {
         AxeraMachineState *ams = AXERA_MACHINE(machine);
 
+        /*
+         * Back the real SPI NOR boot flash whenever a real dump is
+         * given, whether or not BL1 itself is also being replayed:
+         * uboot-file= + flash-file= together means "skip straight to
+         * this real U-Boot binary (same trade-off as the uboot-file=
+         * -only case below), but let it read the REST of this real
+         * flash dump (kernel, rootfs) via its own real spinor_read()",
+         * instead of needing BL1's own DDR training to run at all.
+         */
+        if (ams->flash_file && ams->flash_file[0] && !machine->kernel_filename) {
+            DeviceState *spi_nor = qdev_new(TYPE_AXERA_SPI_NOR);
+
+            qdev_prop_set_string(spi_nor, "file", ams->flash_file);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(spi_nor), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(spi_nor), 0, 0x01a00000);
+        }
+
         if (ams->uboot_file && ams->uboot_file[0] && !machine->kernel_filename) {
             /*
              * Start straight at U-Boot instead of replaying BL1/SPL's
@@ -632,26 +650,17 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                 bl1_off = 1024;
             }
 
+            /*
+             * spi0@0x01a00000 (BL1's own drivers/spi/dw_spi_mst.c reads
+             * the rest of this same NOR flash through, real opcode 0x03
+             * reads) is already backed by this same file -- see the
+             * shared block above, which runs whether or not uboot-file=
+             * is also given.
+             */
             rom_add_blob_fixed("axera.bl1",
                                bl1_data + bl1_off,
                                MIN(bl1_len - bl1_off, (gsize)AXERA_BL1_SIZE),
                                AXERA_BL1_BASE);
-
-            /*
-             * spi0@0x01a00000, the DW SPI controller BL1's own
-             * drivers/spi/dw_spi_mst.c reads the rest of this same NOR
-             * flash through (spinor_read(), real opcode 0x03 reads) --
-             * back it with the same file so BL1's own flash_read()
-             * calls, not just this direct injection, see real content.
-             */
-            {
-                DeviceState *spi_nor = qdev_new(TYPE_AXERA_SPI_NOR);
-
-                qdev_prop_set_string(spi_nor, "file", ams->flash_file);
-                sysbus_realize_and_unref(SYS_BUS_DEVICE(spi_nor),
-                                         &error_fatal);
-                sysbus_mmio_map(SYS_BUS_DEVICE(spi_nor), 0, 0x01a00000);
-            }
             g_free(bl1_data);
 
             AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
@@ -780,6 +789,27 @@ static const AxeraSoCConfig ax620q_soc = {
 #define AXERA_AX620U_SMP_BOOT_ADDR 0x10c00000ULL
 #define AXERA_AX620U_SMP_BOOT_SIZE 0x1000
 
+/*
+ * AX620U's flash-file= BL1-equivalent (no real BL1 source exists for
+ * this SoC -- see axera-spi-nand.c's own comment): a real deployed
+ * AX620U camera's own SPI NAND dump has the same sec_boot RSA
+ * image_header magic (0x55543322 at +4) AX620E's does, but
+ * *duplicated* -- a second identical header copy at +1024, then real
+ * code starting at file offset 0x800. Disassembling that code (real
+ * ARM32, not assumed) shows an 8-entry exception vector table loaded
+ * 1:1 at this same address (confirmed from its own `ldr pc, [pc, #..]`
+ * literal pool targets, all small absolute addresses like 0x820/0x8a8,
+ * not high-SRAM-relative), followed by code that copies those 8
+ * vectors down to real address 0x0 and then branches on MPIDR to a
+ * secondary-CPU spin loop against 0x02220300 -- the exact same
+ * smp_bootreg_addr already wired below from the real devicetree. So
+ * this stage runs in place at its own file offset with no relocation:
+ * load it at 0x800 and start CPU0 there, same technique as AX620E's
+ * BL1_BASE below.
+ */
+#define AXERA_AX620U_BL1_BASE   0x00000800ULL
+#define AXERA_AX620U_BL1_SIZE   (128 * KiB)
+
 static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -895,6 +925,34 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(smpreg), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(smpreg), 0,
                                 c->smp_bootreg_addr & ~0xfffULL, 1);
+
+        /*
+         * axera-ax620u-clk @ 0x049a0000, 0x20000: no real devicetree
+         * confirms this address (unlike smp_bootreg_addr above) -- it's
+         * reverse-engineered from a real deployed AX620U camera's own
+         * flash-file= boot replay (see axera_32_init()'s own BL1
+         * injection below): disassembling the real BL1-equivalent and
+         * tracing its actual register accesses (every one previously
+         * landing on the create_unimplemented_device catch-all, logged
+         * via '-d unimp') showed a clock-gate enable sequence
+         * (0x049a0008 bit0 clear/write-full-config-at-+0x000/set, the
+         * same disable-reconfigure-enable shape already modelled for
+         * axera-pllc.c and axera-ddr-pll.c) plus several sibling
+         * register clusters at 0x049a2xxx/0x049a8xxx/0x049ba000/
+         * 0x049bc6xx all read-modify-written the same way. A passive
+         * readback bank (not a bespoke ready-bit device, unlike the PLL
+         * cases) was enough to get the real BL1 code past this stage --
+         * confirmed empirically: the exact same real dump that spun
+         * here forever (12M+ unimplemented-device accesses in a 20s
+         * run) against the catch-all makes real forward progress once
+         * writes here read back instead of discarding.
+         */
+        DeviceState *clk = qdev_new("hisi-regbank");
+
+        qdev_prop_set_uint32(clk, "size", 0x20000);
+        qdev_prop_set_string(clk, "name", "axera-ax620u-clk");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(clk), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(clk), 0, 0x049a0000, 1);
     }
 
     gic = qdev_new(gic_class_name());
@@ -960,6 +1018,29 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     {
         AxeraMachineState *ams = AXERA_MACHINE(machine);
 
+        if (!c->is_ax620x && ams->flash_file && ams->flash_file[0]) {
+            error_report("axera: %s: flash-file= is not supported yet "
+                         "(no BL1 replay path for AX620Q)",
+                          MACHINE_GET_CLASS(machine)->name);
+            exit(1);
+        }
+
+        /*
+         * spi_nand@0x08000000 (real AX620U devicetree: spi-master
+         * compatible "snps,dw-ssi", a child spi_nand@0 node -- see
+         * hw/misc/axera-spi-nand.c's own comment): back it whenever a
+         * real dump is given, same shared-block trade-off as AX620E's
+         * SPI NOR above.
+         */
+        if (c->is_ax620x && ams->flash_file && ams->flash_file[0] &&
+            !machine->kernel_filename) {
+            DeviceState *spi_nand = qdev_new(TYPE_AXERA_SPI_NAND);
+
+            qdev_prop_set_string(spi_nand, "file", ams->flash_file);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(spi_nand), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(spi_nand), 0, 0x08000000);
+        }
+
         if (ams->uboot_file && ams->uboot_file[0] && !machine->kernel_filename) {
             char *uboot_data = NULL;
             gsize uboot_len = 0;
@@ -989,6 +1070,62 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
             info->cpu = cpu[0];
             info->entry = uboot_base;
+            qemu_register_reset(axera_bootrom_cpu_reset, info);
+            return;
+        }
+
+        if (c->is_ax620x && ams->flash_file && ams->flash_file[0] &&
+            !machine->kernel_filename) {
+            /*
+             * See AXERA_AX620U_BL1_BASE's own comment above for how
+             * this address and the double-header skip below were
+             * derived from the real dump. The 0x0-0x20000 range this
+             * stage actually runs in (vector table at 0x0 once it
+             * relocates itself, a stack somewhere under the ~0x18000
+             * high-water mark its own literal pool showed) isn't real
+             * DRAM -- it's a small on-chip boot SRAM, same real-SoC
+             * shape as AX620E's axera-npu-sram carve-out, just with no
+             * confirmed real base/size for AX620U's version, so this
+             * is sized generously (128 KiB) rather than to a confirmed
+             * real figure.
+             */
+            MemoryRegion *boot_sram = g_new(MemoryRegion, 1);
+
+            memory_region_init_ram(boot_sram, NULL, "axera.ax620u-boot-sram",
+                                   AXERA_AX620U_BL1_SIZE, &error_fatal);
+            memory_region_add_subregion(sysmem, 0, boot_sram);
+
+            char *bl1_data = NULL;
+            gsize bl1_len = 0;
+            gsize bl1_off = 0;
+
+            if (!g_file_get_contents(ams->flash_file, &bl1_data, &bl1_len,
+                                     NULL)) {
+                error_report("axera: %s: could not read flash-file '%s'",
+                              MACHINE_GET_CLASS(machine)->name,
+                              ams->flash_file);
+                exit(1);
+            }
+
+            if (bl1_len >= 1024 &&
+                ldl_le_p(bl1_data + 4) == 0x55543322) {
+                bl1_off = 1024;
+                if (bl1_len >= 2048 &&
+                    ldl_le_p(bl1_data + 1024 + 4) == 0x55543322) {
+                    bl1_off = 2048;
+                }
+            }
+
+            rom_add_blob_fixed("axera.ax620u-bl1",
+                               bl1_data + bl1_off,
+                               MIN(bl1_len - bl1_off,
+                                   (gsize)AXERA_AX620U_BL1_SIZE),
+                               AXERA_AX620U_BL1_BASE);
+            g_free(bl1_data);
+
+            AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
+            info->cpu = cpu[0];
+            info->entry = AXERA_AX620U_BL1_BASE;
             qemu_register_reset(axera_bootrom_cpu_reset, info);
             return;
         }
@@ -1032,6 +1169,14 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             "injected at its real link address with CPU0 starting "   \
             "there, with no -kernel. AX620Q only -- no real AX620U "  \
             "U-Boot source exists to confirm its link address.");     \
+        object_class_property_add_str(oc, "flash-file",                \
+            axera_machine_get_flash_file,                              \
+            axera_machine_set_flash_file);                             \
+        object_class_property_set_description(oc, "flash-file",       \
+            "A real dumped SPI NAND image. Backs spi_nand@0x08000000 "\
+            "and injects its own BL1-equivalent at its real on-dump " \
+            "link address, with no -kernel. AX620U only -- AX620Q "   \
+            "has no BL1 replay path yet.");                             \
     }                                                                 \
     DEFINE_MACHINE_EXTENDED(namestr, AXERA_MACHINE, AxeraMachineState, \
                             tag##_class_init, false,                    \

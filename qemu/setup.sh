@@ -189,6 +189,8 @@ cp qemu/hw/misc/axera-bl1-timer.c   "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-bl1-timer.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-ddr-pll.c   "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-ddr-pll.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-spi-nand.c    "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-spi-nand.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -694,6 +696,11 @@ if ! grep -q "'axera-ddr-pll.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ddr-pll.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-ddr-pll.c"
+fi
+if ! grep -q "'axera-spi-nand.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-spi-nand.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-spi-nand.c"
 fi
 
 # hw/misc/Kconfig
