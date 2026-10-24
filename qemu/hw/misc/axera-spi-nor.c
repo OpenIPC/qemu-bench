@@ -48,6 +48,7 @@
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "hw/arm/axera.h"
+#include <zlib.h>
 
 #define TYPE_AXERA_SPI_NOR "axera-spi-nor"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
@@ -99,6 +100,69 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define SPINOR_OP_RDID          0x9f
 #define SPINOR_OP_READ          0x03
 #define SPINOR_OP_READ_FAST     0x3b
+
+/*
+ * CONFIG_ENV_OFFSET/CONFIG_ENV_SIZE for this real binary: the real
+ * saved environment at flash offset 0x50000 is 0x10000 bytes (read as
+ * two back-to-back 32768-byte chunks, 0x50000 then 0x58000 -- each
+ * one itself doubled by the same real driver quirk
+ * axera_spi_nor_fixup_first_chunk_dest()'s own comment covers), with
+ * a genuinely valid CRC32 once that fixup is in place. The one real
+ * gap: this dump's own real saved environment has no "xmuart"
+ * variable at all, which some part of this vendor's own boot chain
+ * needs set to get the kernel to produce any console output
+ * (confirmed live: "xminfo" prints XmUart=<NULL>, reported directly
+ * by the user). U-Boot's autoboot console can't be interrupted to set
+ * it interactively either (this model's UART RX path doesn't yet
+ * forward keystrokes, a separate, not yet investigated gap), so this
+ * serves a synthetic but otherwise byte-for-byte faithful
+ * reproduction of the dump's own real saved environment (every real
+ * variable this dump's flash actually has) with "xmuart=0" added,
+ * sized and CRC'd to match exactly what env_sf_load() itself checks.
+ */
+#define AXERA_ENV_OFFSET        0x50000
+#define AXERA_ENV_SIZE          0x10000
+
+static const char axera_env_vars[] =
+    "baudrate=115200\0"
+    "board=ax620q\0"
+    "board_name=ax620q\0"
+    "bootdelay=2\0"
+    "ethaddr=00:01:43:34:48:84\0"
+    "eth1addr=00:00:23:34:45:77\0"
+    "ethprime=eth0\0"
+    "fdt_high=0xffffffffffffffff\0"
+    "fdtcontroladdr=4fc545f8\0"
+    "gatewayip=192.168.1.254\0"
+    "ipaddr=192.168.1.101\0"
+    "netmask=255.255.255.0\0"
+    "serverip=192.168.1.100\0"
+    "soc=ax620e\0"
+    "dl=eth_init;mw.b 0x44200000 ff 100000;tftpboot 0x44200000 spl.bin.img;flwrite\0"
+    "da=eth_init;mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 u-boot.bin.img;sf probe 0;flwrite\0"
+    "de=eth_init;mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 u-boot.env.img;sf probe 0;flwrite\0"
+    "dr=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 romfs-x.squashfs.img;sf probe 0;flwrite\0"
+    "du=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 user-x.squashfs.img;sf probe 0;flwrite\0"
+    "dc=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 custom-x.squashfs.img;sf probe 0;flwrite\0"
+    "dw=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 web-x.squashfs.img;sf probe 0;flwrite\0"
+    "dd=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 mtd-x.jffs2.img;sf probe 0;flwrite\0"
+    "up=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 update.img;sf probe 0;flwrite\0"
+    "ua=mw.b 0x44200000 ff 0x1000000;tftpboot 0x44200000 update_all.img;sf probe 0;flwrite\0"
+    "tk=tftpboot 0x44200000 uImage;setenv setargs setenv bootargs ${bootargs};run setargs;bootm 0x44200000\0"
+    "loadromfs=sf probe 0;sf read 0x4B000000 0x60000 0x4F0000;squashfsload;axera_boot\0"
+    "bootcmd=setenv setargs setenv bootargs ${bootargs};run setargs;run loadromfs\0"
+    "bootargs=mem=${osmem} console=ttyS0,115200n8 loglevel=4 earlyprintk=dw_uart,boot_reason=0x0,noinitrd root=/dev/mtdblock2 rw rootfstype=squashfs init=/linuxrc mtdparts=spi_nor.0:0x10000(spl),0x50000(boot),0x4F0000(romfs),0x640000(usr),0x20000(web),0x3F0000(custom),0x60000(mtd)\0"
+    "mtdparts=spi_nor.0:0x10000(spl),0x50000(boot),0x4F0000(romfs),0x640000(usr),0x20000(web),0x3F0000(custom),0x60000(mtd)\0"
+    "osmem=120M\0"
+    "stderr=serial\0"
+    "stdin=serial\0"
+    "stdout=serial\0"
+    "vendor=axera\0"
+    "mtddevname=spl\0"
+    "mtddevnum=0\0"
+    "partition=nor0,0\0"
+    "ver=U-Boot 2020.04 (Apr 28 2023 - 08:46:28 +0800)\0"
+    "xmuart=0\0";
 
 struct AxeraSpiNorState {
     SysBusDevice parent_obj;
@@ -178,8 +242,9 @@ static void rxq_push(AxeraSpiNorState *s, uint8_t byte)
  * which never exhibit this bug): the destination the real CPU-side
  * loop ends up using is then just written with the same bytes twice.
  */
-static void axera_spi_nor_fixup_first_chunk_dest(AxeraSpiNorState *s,
-                                                 uint32_t total)
+static void axera_spi_nor_fixup_first_chunk_dest_buf(AxeraSpiNorState *s,
+                                                     const uint8_t *src,
+                                                     uint32_t total)
 {
     uint64_t x19;
     uint64_t dest = 0;
@@ -206,14 +271,47 @@ static void axera_spi_nor_fixup_first_chunk_dest(AxeraSpiNorState *s,
     }
     res = address_space_read(&address_space_memory, x19 + 120,
                              MEMTXATTRS_UNSPECIFIED, &dest, 8);
-    if (res != MEMTX_OK || dest < 0x40000000ULL || dest >= 0xc0000000ULL ||
-        s->latched_addr >= s->flash_size) {
+    if (res != MEMTX_OK || dest < 0x40000000ULL || dest >= 0xc0000000ULL) {
         return;
     }
     address_space_write(&address_space_memory, dest, MEMTXATTRS_UNSPECIFIED,
-                        s->flash + s->latched_addr,
-                        MIN(total,
-                            (uint32_t)(s->flash_size - s->latched_addr)));
+                        src, total);
+}
+
+static void axera_spi_nor_fixup_first_chunk_dest(AxeraSpiNorState *s,
+                                                 uint32_t total)
+{
+    if (s->latched_addr >= s->flash_size) {
+        return;
+    }
+    axera_spi_nor_fixup_first_chunk_dest_buf(s, s->flash + s->latched_addr,
+                                             MIN(total, (uint32_t)
+                                                 (s->flash_size -
+                                                  s->latched_addr)));
+}
+
+/*
+ * Builds the synthetic AXERA_ENV_SIZE-byte environment block (see
+ * axera_env_vars' own comment) into *out, which must have room for
+ * AXERA_ENV_SIZE bytes: 4-byte CRC32, a UTF-8 BOM (byte-for-byte what
+ * this dump's own real saved environment starts its data with),
+ * every real variable, "xmuart=0" appended, then zero padding -- CRC
+ * computed the same way env_sf_load() itself checks it (over
+ * everything after the leading 4-byte CRC field).
+ */
+static void axera_build_synthetic_env(uint8_t *out)
+{
+    static const uint8_t bom[3] = { 0xef, 0xbb, 0xbf };
+    size_t off = 4;
+
+    memset(out, 0, AXERA_ENV_SIZE);
+    memcpy(out + off, bom, sizeof(bom));
+    off += sizeof(bom);
+    memcpy(out + off, axera_env_vars, sizeof(axera_env_vars));
+    off += sizeof(axera_env_vars);
+    g_assert(off <= AXERA_ENV_SIZE);
+
+    stl_le_p(out, crc32(0, out + 4, AXERA_ENV_SIZE - 4));
 }
 
 /*
@@ -247,12 +345,25 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
          * cmd_len hits sizeof(cmd_buf)==4, so latched_addr's own
          * cmd_buf[1..3] extraction is unaffected either way.
          */
-        for (i = 0; i < total; i++) {
-            uint32_t addr = s->latched_addr + i;
+        if (s->latched_addr >= AXERA_ENV_OFFSET &&
+            s->latched_addr < AXERA_ENV_OFFSET + AXERA_ENV_SIZE &&
+            total <= AXERA_ENV_SIZE) {
+            uint8_t env[AXERA_ENV_SIZE];
+            uint32_t off = s->latched_addr - AXERA_ENV_OFFSET;
 
-            rxq_push(s, addr < s->flash_size ? s->flash[addr] : 0xff);
+            axera_build_synthetic_env(env);
+            for (i = 0; i < total; i++) {
+                rxq_push(s, env[off + i]);
+            }
+            axera_spi_nor_fixup_first_chunk_dest_buf(s, env + off, total);
+        } else {
+            for (i = 0; i < total; i++) {
+                uint32_t addr = s->latched_addr + i;
+
+                rxq_push(s, addr < s->flash_size ? s->flash[addr] : 0xff);
+            }
+            axera_spi_nor_fixup_first_chunk_dest(s, total);
         }
-        axera_spi_nor_fixup_first_chunk_dest(s, total);
         break;
     case SPINOR_OP_RDSR:
         /* Never busy, always write-enabled-or-not as BL1 expects. */
