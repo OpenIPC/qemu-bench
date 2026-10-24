@@ -173,6 +173,12 @@ cp qemu/hw/i2c/hisi-i2c-v1.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-dw.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/ssi/hisi-spi.c          "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/ssi/hisi-imx122.c       "$QEMU_DIR/hw/ssi/"
+cp qemu/hw/arm/axera.c              "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/axera.h      "$QEMU_DIR/include/hw/arm/"
+cp qemu/hw/misc/axera-eip130.c      "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-eip130.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-vcmd.c        "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-vcmd.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -606,6 +612,52 @@ if ! grep -q "'nvt-lzma.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-lzma.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added nvt-lzma.c"
+fi
+
+# Axera AX620E family (AX630C/AX620Q): Cortex-A53 SoCs (hw/arm/axera.c).
+# Ordinary ARM infrastructure (GIC-400, ARMv8 generic timer, a DW-APB
+# UART) unlike the RIU/HAL-indirected families above; no satellite device
+# files yet. Same guarded appends as SigmaStar/Novatek, for a fresh tree
+# and an existing one alike.
+if ! grep -q "^config AXERA$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config AXERA
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_GIC
+    select SERIAL_MM
+    select UNIMP
+    select HISI_MISC
+    select CADENCE_SDHCI
+    select USB_DWC3
+KCONFIG
+    echo "  hw/arm/Kconfig: added AXERA"
+else
+    for sym in ARM_GIC SERIAL_MM UNIMP HISI_MISC CADENCE_SDHCI USB_DWC3; do
+        if ! sed -n '/^config AXERA$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config AXERA\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: AXERA now selects $sym"
+        fi
+    done
+fi
+if ! grep -q "'axera.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_AXERA', if_true: files('axera.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added axera.c"
+fi
+if ! grep -q "'axera-eip130.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-eip130.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-eip130.c"
+fi
+if ! grep -q "'axera-vcmd.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-vcmd.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-vcmd.c"
 fi
 
 # hw/misc/Kconfig

@@ -18,10 +18,10 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32)
-- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 
-## Supported Machines (69 total)
+## Supported Machines (73 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -356,6 +356,40 @@ H.265 too. Notes in
 
 ² A Xiongmai NBD80N36RA-KL NVR dump (not distributable, so not in CI).
 
+### Axera camera-SoC family (`qemu-system-aarch64` and `qemu-system-arm`)
+
+| Machine | CPU | IRQ | UART0 | Kernel | Boot tested |
+|---------|-----|-----|-------|--------|-------------|
+| `ax630c` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | — | — |
+| `ax620e` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | 5.15.73 (real firmware)² | — |
+| `ax620q` | Cortex-A7 (AArch32), 256 MB, CPU1 not modelled | GIC-400 | `0x04880000` | — | — |
+| `ax620u` | Cortex-A7 x4 (AArch32), 1 GB, CPU1-3 not modelled | GIC-400 | `0x04990000` | 4.19.125 (real firmware)² | — |
+
+Axera's camera/KVM-capture SoCs, in `hw/arm/axera.c`: a plain GIC-400 at
+`0x01850000` (same address on all four) and the ARM generic timer at
+24 MHz, so unlike the RIU/HAL-indirected families above they needed no
+device model of their own, just the map from the vendor DT. Only the GIC,
+CPU wiring and a DesignWare 8250-compatible UART0 are modelled per SoC;
+everything else sits behind `create_unimplemented_device` pending real
+register work. AX620Q and AX620U each bring extra cores up through their
+own vendor spin-table (not PSCI), which is not modelled -- only CPU0
+boots. There is no machine-built device tree yet: `-kernel` needs `-dtb`
+from the firmware's own tree, as novatek's nt98332 does.
+
+Sources: the [onekvm/linux-6.18-ax620e](https://github.com/onekvm/linux-6.18-ax620e)
+fork's devicetrees (AX630C/AX620Q), the AXERA-TECH/Sipeed vendor SDKs
+(kernel 4.19.125, no public source newer than that), and -- for AX620E
+and AX620U specifically -- the devicetree extracted directly from real
+deployed camera firmware (a Xiongmai IVG-A6 for AX620E; `dumpimage`/`dtc` on the FIT image
+inside each dump's `boot/uImage`), which also independently confirmed the
+GIC/timer/UART addresses already modelled here. Notes in
+[docs/axera.md](docs/axera.md).
+
+² Confirmed from a real firmware dump's own kernel modules (`vermagic=`)
+and FIT-image kernel banner, not the public vendor SDK; AX620E and AX620U
+do not share a kernel baseline or architecture with each other despite
+being in the same chip family.
+
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
 | Machine | Generation | CPU | IRQ | Boot tested |
@@ -378,7 +412,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 69 machines build and register. Every machine marked "yes" above boots
+All 73 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -521,6 +555,8 @@ qemu/
 ├── hw/i2c/nvt-i2c.c             # Novatek I2C controllers (PIO chunks)
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
+├── hw/arm/axera.c               # Axera AX630C machine: GIC-400, generic timer, DW-APB UART0
+├── include/hw/arm/axera.h       # AxeraSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
 qemu-boot/
 ├── run-cv100.sh                 # Run scripts for each boot-tested platform
