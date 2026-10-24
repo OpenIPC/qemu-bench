@@ -89,6 +89,43 @@ struct AxeraMachineState {
 #define AXERA_BL1_BASE          0x03000400ULL
 #define AXERA_BL1_SIZE          (1 * MiB)
 
+/*
+ * TOP_CHIPMODE_GLB_SW (TOP_CHIPMODE_GLB + 0xC, see the axera-chipmode
+ * regbank comment above) and the flash_type=1 ("EMMC BOOT
+ * 8BIT_50M_768K") encoding board.c's get_boot_mode() expects in bits
+ * [3:1] to make BL1 run its real card-init sequence.
+ */
+#define AXERA_CHIPMODE_SW_ADDR  0x0239000cULL
+#define AXERA_CHIPMODE_EMMC_BOOT_8BIT 0x2U
+
+/*
+ * PIN_MUX_G11_VDET_RO0 (board.c's get_emmc_voltage(), bit 12: 1=3.3V,
+ * 0=1.8V). With this left at its catch-all/regbank default of 0, BL1
+ * sends CMD1 (SEND_OP_COND) with EMMC_IO_1V8 (bit 7) as its OCR probe
+ * argument -- bit 7 isn't covered by either the VDD_VOLTAGE_WIN_HI
+ * field (bits 8-23) or ACCEPT_SWITCH_1V8 (bit 24) that QEMU's generic
+ * eMMC model advertises in sd_set_ocr(), so sd_cmd_SEND_OP_COND()'s
+ * `sd->ocr & req.arg` is always 0 and the card never leaves
+ * sd_idle_state -- CMD2 (ALL_SEND_CID) right after then fails with
+ * "invalid state for cmd", surfacing to BL1 as a plain CMD_RESP
+ * error indistinguishable from a real timeout. Forcing bit 12 here
+ * makes BL1 pick the 3.3V probe argument (EMMC_IO_3V3, bits 15-22),
+ * which the same advertised OCR does cover -- real eMMC on real
+ * boards is overwhelmingly 3.3V-strapped anyway, not 1.8V UHS-style.
+ */
+#define AXERA_VDET_RO0_ADDR     0x023090a0ULL
+#define AXERA_VDET_3V3_BIT      (1U << 12)
+
+static void axera_bl1_chipmode_reset(void *opaque)
+{
+    address_space_stl_le(&address_space_memory, AXERA_CHIPMODE_SW_ADDR,
+                         AXERA_CHIPMODE_EMMC_BOOT_8BIT,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, AXERA_VDET_RO0_ADDR,
+                         AXERA_VDET_3V3_BIT,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
 typedef struct {
     ARMCPU *cpu;
     uint64_t entry;
@@ -154,6 +191,24 @@ static const struct {
     hwaddr base;
     uint32_t size;
 } ax620e_regbanks[] = {
+    /*
+     * TOP_CHIPMODE_GLB (boot/bl1/common/include/chip_reg.h): BL1's own
+     * main() reads the SW register here as a hardware boot-mode strap
+     * (chip_mode) and feeds it straight into get_boot_mode() (board.c),
+     * which maps chip_mode bits [3:1] to a flash_type enum -- 0 means
+     * "EMMC UDA", the "already initialized" fast-boot profile BL1
+     * assumes a real boot ROM already brought the card up for (true on
+     * real silicon, since the boot ROM itself read BL1 off the card
+     * before BL1 ever ran; false under flash-file= direct injection,
+     * which skips that boot ROM step entirely). A plain zeroed regbank
+     * here is indistinguishable from strap pins wired to 0, so BL1
+     * takes that shortcut, finds the card still in idle state, and its
+     * CMD6/SWITCH (bus-width select) fails over and over with no
+     * timeout. See the flash-file= reset hook below, which preseeds
+     * this to flash_type=1 ("EMMC BOOT 8BIT_50M_768K") so BL1 runs its
+     * real emmc_init_card() sequence instead.
+     */
+    { "axera-chipmode",     0x02390000, 0x1000 },
     { "axera-tsensor",      0x02000000, 0x1000 },
     { "axera-clk-cpu",      0x01900000, 0x10000 },
     { "axera-clk-common",   0x02340000, 0x10000 },
@@ -532,6 +587,7 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
             info->cpu = cpu[0];
             info->entry = AXERA_BL1_BASE;
             qemu_register_reset(axera_bootrom_cpu_reset, info);
+            qemu_register_reset(axera_bl1_chipmode_reset, NULL);
             return;
         }
     }
