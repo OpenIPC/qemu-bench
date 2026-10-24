@@ -53,6 +53,17 @@
  * 0x60000(mtd) -- SPL and the second signed image (DDRINIT, not ATF/
  * OPTEE -- this NOR profile has neither) are RSA-signed, U-Boot itself
  * is plain/unsigned.
+ *
+ * Reaching real userspace (the vendor's own xmservice init) surfaced
+ * the next real gap: it erases/rewrites its own flash-backed config
+ * area and verifies the result, something no boot-only reader ever
+ * needed. WREN/WRDI, Page Program (0x02), Sector/Block Erase (0x20/
+ * 0x52/0xd8) and Chip Erase (0xc7) are now modelled too -- see
+ * axera_spi_nor_cmd_byte()'s own comment for how they ride the same
+ * TMOD_TO multi-session shape the kernel's reads already established,
+ * and env_overridden's own comment for why the synthetic env override
+ * above has to stop permanently once real erase/program activity
+ * touches that region.
  */
 
 #include "qemu/osdep.h"
@@ -110,11 +121,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define SPI_TMOD_RO             0x2     /* recv only: data phase */
 
 #define SR_BUSY                 BIT(0)
+#define SR_WEL                  BIT(1)
 #define SR_TF_NOT_FULL          BIT(1)
 #define SR_TF_EMPT              BIT(2)
 #define SR_RF_NOT_EMPT          BIT(3)
 
+#define SPINOR_OP_WRDI          0x04
 #define SPINOR_OP_RDSR          0x05
+#define SPINOR_OP_WREN          0x06
+#define SPINOR_OP_PP            0x02
+#define SPINOR_OP_SE            0x20    /* 4KiB sector erase */
+#define SPINOR_OP_BE_32K        0x52    /* 32KiB block erase */
+#define SPINOR_OP_BE_64K        0xd8    /* 64KiB block erase */
+#define SPINOR_OP_CHIP_ERASE    0xc7
 #define SPINOR_OP_READID        0x90
 #define SPINOR_OP_RDID          0x9f
 #define SPINOR_OP_READ          0x03
@@ -195,6 +214,9 @@ struct AxeraSpiNorState {
     bool in_cmd_phase;
     uint8_t cmd_buf[4];
     unsigned int cmd_len;
+    unsigned int session_start_cmd_len;
+    bool write_enable_latch;
+    bool env_overridden;
     uint8_t latched_opcode;
     uint32_t latched_addr;
 
@@ -321,6 +343,117 @@ static void axera_spi_nor_fixup_first_chunk_dest(AxeraSpiNorState *s,
 }
 
 /*
+ * Any real write/erase landing inside [AXERA_ENV_OFFSET,
+ * AXERA_ENV_OFFSET+AXERA_ENV_SIZE) means this flash region is no
+ * longer "whatever this model used to synthesize for U-Boot's own
+ * env load" -- see env_overridden's own use in
+ * axera_spi_nor_start_data_phase() for why that override has to stop
+ * permanently once this happens (confirmed live: userspace's own
+ * flash-erase verification reads back address 0x50000 -- exactly
+ * this boundary -- and fails forever otherwise, since the override
+ * doesn't know erase/program ever touched real flash underneath it).
+ */
+static void axera_spi_nor_mark_env_overridden(AxeraSpiNorState *s,
+                                              uint32_t addr, uint32_t len)
+{
+    if (addr < AXERA_ENV_OFFSET + AXERA_ENV_SIZE &&
+        addr + len > AXERA_ENV_OFFSET) {
+        s->env_overridden = true;
+    }
+}
+
+/*
+ * One incoming TX byte of a (possibly multi-session, see
+ * axera_spi_nor_ssienr_write()'s own comment) write-side command.
+ * WREN/WRDI are single-byte opcodes acted on the instant they land;
+ * SE/BE_32K/BE_64K erase their region the instant the (opcode + 3-
+ * byte address) command completes; CHIP_ERASE needs just the opcode.
+ * Page Program has no advance knowledge of its own length (bounded
+ * in practice by the real flash's page size, which nothing this
+ * model has seen write ever exceeds in one command) -- each data
+ * byte is written straight to flash as it arrives rather than
+ * buffered, with the real NOR physical behaviour of only ever being
+ * able to clear bits (an erased byte is already all-1s) rather than
+ * a plain overwrite. Read-type opcodes (RDSR, READID/RDID, READ/
+ * READ_FAST) are untouched here -- they still just sit at cmd_len==1
+ * (or 4, with the dummy byte ignored past that) until the real RX
+ * phase in axera_spi_nor_start_data_phase() serves them.
+ */
+static void axera_spi_nor_cmd_byte(AxeraSpiNorState *s, uint8_t byte)
+{
+    if (s->cmd_len == 0) {
+        s->cmd_buf[0] = byte;
+        s->cmd_len = 1;
+        switch (byte) {
+        case SPINOR_OP_WREN:
+            s->write_enable_latch = true;
+            s->cmd_len = 0;
+            break;
+        case SPINOR_OP_WRDI:
+            s->write_enable_latch = false;
+            s->cmd_len = 0;
+            break;
+        case SPINOR_OP_CHIP_ERASE:
+            if (s->write_enable_latch) {
+                memset(s->flash, 0xff, s->flash_size);
+                s->env_overridden = true;
+            }
+            s->write_enable_latch = false;
+            s->cmd_len = 0;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    if (s->cmd_len < 4) {
+        s->cmd_buf[s->cmd_len++] = byte;
+        if (s->cmd_len == 4) {
+            uint32_t addr = (s->cmd_buf[1] << 16) | (s->cmd_buf[2] << 8) |
+                            s->cmd_buf[3];
+            uint32_t erase_size = 0;
+
+            switch (s->cmd_buf[0]) {
+            case SPINOR_OP_SE:
+                erase_size = 0x1000;
+                break;
+            case SPINOR_OP_BE_32K:
+                erase_size = 0x8000;
+                break;
+            case SPINOR_OP_BE_64K:
+                erase_size = 0x10000;
+                break;
+            default:
+                break;
+            }
+            if (erase_size) {
+                if (s->write_enable_latch && addr < s->flash_size) {
+                    uint32_t len = MIN(erase_size, s->flash_size - addr);
+
+                    memset(s->flash + addr, 0xff, len);
+                    axera_spi_nor_mark_env_overridden(s, addr, len);
+                }
+                s->write_enable_latch = false;
+                s->cmd_len = 0;
+            }
+        }
+        return;
+    }
+
+    if (s->cmd_buf[0] == SPINOR_OP_PP) {
+        uint32_t addr = ((s->cmd_buf[1] << 16) | (s->cmd_buf[2] << 8) |
+                         s->cmd_buf[3]) + (s->cmd_len - 4);
+
+        if (s->write_enable_latch && addr < s->flash_size) {
+            s->flash[addr] &= byte;
+            axera_spi_nor_mark_env_overridden(s, addr, 1);
+        }
+        s->cmd_len++;
+    }
+}
+
+/*
  * Builds the synthetic AXERA_ENV_SIZE-byte environment block (see
  * axera_env_vars' own comment) into *out, which must have room for
  * AXERA_ENV_SIZE bytes: 4-byte CRC32, a UTF-8 BOM (byte-for-byte what
@@ -375,7 +508,8 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
          * cmd_len hits sizeof(cmd_buf)==4, so latched_addr's own
          * cmd_buf[1..3] extraction is unaffected either way.
          */
-        if (s->latched_addr >= AXERA_ENV_OFFSET &&
+        if (!s->env_overridden &&
+            s->latched_addr >= AXERA_ENV_OFFSET &&
             s->latched_addr < AXERA_ENV_OFFSET + AXERA_ENV_SIZE &&
             total <= AXERA_ENV_SIZE) {
             uint8_t env[AXERA_ENV_SIZE];
@@ -400,9 +534,17 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
         }
         break;
     case SPINOR_OP_RDSR:
-        /* Never busy, always write-enabled-or-not as BL1 expects. */
+        /*
+         * Never busy (WIP=0): every program/erase this model does
+         * completes synchronously the instant the command's last
+         * byte lands, so a real driver's wait_till_ready() poll
+         * loop always sees "done" on its first check. WEL (bit 1)
+         * does need to reflect real state though -- spi_nor_write_
+         * enable() reads this back to confirm its own WREN actually
+         * took effect before trusting the write/erase that follows.
+         */
         for (i = 0; i < total; i++) {
-            rxq_push(s, 0x00);
+            rxq_push(s, s->write_enable_latch ? SR_WEL : 0x00);
         }
         break;
     case SPINOR_OP_READID:
@@ -462,7 +604,18 @@ static void axera_spi_nor_ssienr_write(AxeraSpiNorState *s, uint32_t value)
              * cmd_buf -- capped at sizeof(cmd_buf)==4 by the DW_SPI_DR
              * write handler already, which is exactly "stop once opcode
              * +address are in, ignore the dummy byte" for free.
+             *
+             * Page Program's own data bytes arrive the same multi-
+             * session way, but open-ended (any length up to the page
+             * size) -- axera_spi_nor_cmd_byte() writes those straight
+             * to flash as they arrive rather than buffering them, so
+             * this snapshot (taken before this session's own bytes
+             * land) is what the falling-edge check below needs to
+             * tell "this session is the address phase landing on 4"
+             * apart from "this session is a pure data continuation
+             * that started already at 4".
              */
+            s->session_start_cmd_len = s->cmd_len;
             s->in_cmd_phase = true;
         } else if (tmod == SPI_TMOD_RO && s->cmd_len > 0) {
             /*
@@ -488,6 +641,23 @@ static void axera_spi_nor_ssienr_write(AxeraSpiNorState *s, uint32_t value)
             s->cmd_len = 0;
             axera_spi_nor_start_data_phase(s);
         }
+    } else if (!enable && s->ssienr && s->in_cmd_phase &&
+              s->session_start_cmd_len >= 4 && s->cmd_len >= 4 &&
+              s->cmd_buf[0] == SPINOR_OP_PP) {
+        /*
+         * Page Program has no RX phase at all to use as a "the whole
+         * multi-session command is done" signal the way reads do --
+         * but a session that *started* with a full opcode+address
+         * already latched (session_start_cmd_len >= 4) can only be
+         * the data phase (the address phase's own session always
+         * starts at cmd_len==1), so its falling edge unambiguously
+         * marks the end of this PP op. Reset cmd_len here so the
+         * next command's opcode byte is recognised as byte 0, not
+         * byte N of this one.
+         */
+        s->cmd_len = 0;
+        s->in_cmd_phase = false;
+        s->write_enable_latch = false;
     }
     s->ssienr = enable;
 }
@@ -547,8 +717,8 @@ static void axera_spi_nor_write(void *opaque, hwaddr offset, uint64_t value,
         s->mem[offset / 4] = value & (AXERA_SPI_NOR_FIFO_DEPTH - 1);
         return;
     case DW_SPI_DR:
-        if (s->in_cmd_phase && s->cmd_len < sizeof(s->cmd_buf)) {
-            s->cmd_buf[s->cmd_len++] = value & 0xff;
+        if (s->in_cmd_phase) {
+            axera_spi_nor_cmd_byte(s, value & 0xff);
         }
         return;
     default:
