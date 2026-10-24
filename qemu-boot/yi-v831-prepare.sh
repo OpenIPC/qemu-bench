@@ -102,6 +102,8 @@ C
 arm-linux-gnueabihf-gcc -static -Os -s -o "$WORK/home/app/localbin/ifrename" \
     "$WORK/ifrename.c"
 
+# the SSID inside single quotes in the stand-in: ' becomes '\''
+SSID_Q=${SSID//\'/\'\\\'\'}
 cat > "$WORK/home/base/tools/wpa_cli" <<SH
 #!/bin/sh
 # Stand-in for wpa_cli under QEMU (qemu-boot/yi-v831-prepare.sh): wlan0 is
@@ -121,7 +123,7 @@ status)
     mac=\`ifconfig \$iface 2>/dev/null | grep HWaddr | awk '{print \$5}'\`
     echo "bssid=52:54:00:12:35:02"
     echo "freq=2412"
-    echo "ssid=$SSID"
+    echo 'ssid=$SSID_Q'
     echo "id=0"
     echo "mode=station"
     echo "pairwise_cipher=CCMP"
@@ -136,7 +138,7 @@ mib)
     ;;
 scan_results)
     echo "bssid / frequency / signal level / flags / ssid"
-    echo "52:54:00:12:35:02	2412	-40	[WPA2-PSK-CCMP][ESS]	$SSID"
+    echo '52:54:00:12:35:02	2412	-40	[WPA2-PSK-CCMP][ESS]	$SSID_Q'
     ;;
 add_network)
     echo 0

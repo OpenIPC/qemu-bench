@@ -208,6 +208,9 @@ static void aw_vinc_paint(AwVincState *s, const AwVincPattern *p,
             s->line[x] = vu ? yuv[2] : yuv[1];
             s->line[x + 1] = vu ? yuv[1] : yuv[2];
         }
+        if (clen & 1) {
+            s->line[clen - 1] = 128;    /* half a pair: no colour */
+        }
         aw_iommu_dma_write(s->iommu, AW_IOMMU_MASTER_CSI, ca + y * clen,
                            s->line, clen);
     }

@@ -57,6 +57,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(AwG2dState, AW_G2D)
 #define G2D_RCQ_HEADER_HIGH 0x030
 #define G2D_RCQ_HEADER_LEN  0x034
 
+/* the driver queues one header per mixer block, 8 of them */
+#define G2D_RCQ_MAX_LEN     0x1000
+/* a plane the model will allocate */
+#define G2D_PLANE_MAX       (64u << 20)
+
 #define G2D_V0              0x0800
 #define G2D_WB              0x3000
 
@@ -101,6 +106,10 @@ static void aw_g2d_load_rcq(AwG2dState *s)
     uint32_t len = s->regs[G2D_RCQ_HEADER_LEN >> 2];
     uint32_t i;
 
+    if (len > G2D_RCQ_MAX_LEN) {
+        qemu_log_mask(LOG_GUEST_ERROR, "aw-g2d: RCQ length 0x%x\n", len);
+        return;
+    }
     for (i = 0; i + 16 <= len; i += 16) {
         uint32_t hd[4], n, k;
         g_autofree uint32_t *blk = NULL;
@@ -276,10 +285,17 @@ static uint32_t aw_g2d_plane_size(const AwG2dPic *p, int n)
     return p->pitch[n] * (c420 ? (p->h + 1) / 2 : p->h);
 }
 
-static void aw_g2d_pic(AwG2dState *s, AwG2dPic *p, uint32_t fmt,
+/*
+ * Read a picture's registers; false when its pitches do not hold its
+ * width (a chroma pair needs an even number of bytes) or a plane is too
+ * big to model.
+ */
+static bool aw_g2d_pic(AwG2dState *s, AwG2dPic *p, uint32_t fmt,
                        uint32_t size, uint32_t pitch_reg, uint32_t addr_reg,
                        uint32_t addr_step)
 {
+    bool planar = fmt == FMT_YUV422P || fmt == FMT_YUV420P;
+    uint32_t need[3];
     int n;
 
     p->fmt = fmt;
@@ -289,16 +305,29 @@ static void aw_g2d_pic(AwG2dState *s, AwG2dPic *p, uint32_t fmt,
         p->pitch[n] = aw_g2d_reg(s, pitch_reg + n * 4);
         p->addr[n] = aw_g2d_reg(s, addr_reg + n * addr_step);
     }
-    if (!p->pitch[0]) {
-        p->pitch[0] = p->w * MAX(aw_g2d_fmt_bpp(fmt), 1);
+    need[0] = p->w * MAX(aw_g2d_fmt_bpp(fmt), 1);
+    need[1] = need[2] = planar ? (p->w + 1) / 2 : ROUND_UP(p->w, 2);
+    if (fmt == FMT_Y8 || aw_g2d_fmt_bpp(fmt)) {
+        need[1] = need[2] = 0;          /* one plane */
     }
-    if (!p->pitch[1]) {
-        p->pitch[1] = (fmt == FMT_YUV422P || fmt == FMT_YUV420P) ?
-                      (p->pitch[0] + 1) / 2 : p->pitch[0];
+    for (n = 0; n < 3; n++) {
+        if (!p->pitch[n]) {
+            p->pitch[n] = need[n];
+        }
+        if (p->pitch[n] < need[n]) {
+            qemu_log_mask(LOG_GUEST_ERROR, "aw-g2d: pitch %u for width %u\n",
+                          p->pitch[n], p->w);
+            return false;
+        }
     }
-    if (!p->pitch[2]) {
-        p->pitch[2] = p->pitch[1];
+    for (n = 0; n < 3; n++) {
+        if ((uint64_t)p->pitch[n] * p->h > G2D_PLANE_MAX) {
+            qemu_log_mask(LOG_UNIMP, "aw-g2d: %ux%u pitch %u too big\n",
+                          p->w, p->h, p->pitch[n]);
+            return false;
+        }
     }
+    return true;
 }
 
 /* The video layer, scaled and converted into the write-back buffer. */
@@ -313,10 +342,13 @@ static void aw_g2d_task(AwG2dState *s)
     if (!(v0 & 1)) {
         return;
     }
-    aw_g2d_pic(s, &in, (v0 >> 8) & 0x3F, aw_g2d_reg(s, G2D_V0 + 0x04),
-               G2D_V0 + 0x0C, G2D_V0 + 0x18, 4);
-    aw_g2d_pic(s, &out, aw_g2d_reg(s, G2D_WB) & 0x3F,
-               aw_g2d_reg(s, G2D_WB + 0x04), G2D_WB + 0x08, G2D_WB + 0x14, 8);
+    if (!aw_g2d_pic(s, &in, (v0 >> 8) & 0x3F, aw_g2d_reg(s, G2D_V0 + 0x04),
+                    G2D_V0 + 0x0C, G2D_V0 + 0x18, 4) ||
+        !aw_g2d_pic(s, &out, aw_g2d_reg(s, G2D_WB) & 0x3F,
+                    aw_g2d_reg(s, G2D_WB + 0x04), G2D_WB + 0x08,
+                    G2D_WB + 0x14, 8)) {
+        return;
+    }
     if (!aw_g2d_fmt_ok(in.fmt) || !aw_g2d_fmt_ok(out.fmt)) {
         qemu_log_mask(LOG_UNIMP, "aw-g2d: format 0x%x -> 0x%x\n",
                       in.fmt, out.fmt);

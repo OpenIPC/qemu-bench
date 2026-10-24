@@ -180,6 +180,11 @@ static void aw_audio_reset_hold(Object *obj, ResetType type)
     timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 }
 
+static void aw_audio_reset_exit(Object *obj, ResetType type)
+{
+    aw_audio_update(AW_AUDIO(obj));
+}
+
 static void aw_audio_init(Object *obj)
 {
     AwAudioState *s = AW_AUDIO(obj);
@@ -202,6 +207,7 @@ static void aw_audio_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = aw_audio_reset_hold;
+    rc->phases.exit = aw_audio_reset_exit;
     device_class_set_props(dc, aw_audio_properties);
 }
 

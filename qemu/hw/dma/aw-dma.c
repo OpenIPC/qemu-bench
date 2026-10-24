@@ -93,7 +93,16 @@ struct AwDmaState {
     uint64_t drq[2];        /* DRQ levels, one bit per port: src, dst */
     bool running;
     bool rerun;
+    uint32_t budget;            /* bytes a run may still move */
 };
+
+/*
+ * A run (an MMIO write or a DRQ edge) moves at most this much, counting a
+ * descriptor as 64 bytes, then leaves the rest to a bottom half, so a
+ * huge transfer or a descriptor chain that loops does not hold the vCPU.
+ */
+#define AW_DMA_RUN_BUDGET   (4u << 20)
+#define AW_DMA_CHUNK        4096
 
 static void aw_dma_update_irq(AwDmaState *s)
 {
@@ -146,25 +155,32 @@ static bool aw_dma_step(AwDmaState *s, int n)
     uint8_t buf[8];
 
     if (!unit) {
-        /* SDRAM to SDRAM: all of it. */
-        g_autofree uint8_t *tmp = g_malloc(c->left);
+        /* SDRAM to SDRAM, a chunk at a time, within the run's budget */
+        uint8_t tmp[AW_DMA_CHUNK];
 
-        dma_memory_read(s->as, c->src, tmp, c->left,
-                        MEMTXATTRS_UNSPECIFIED);
-        dma_memory_write(s->as, c->dst, tmp, c->left,
-                         MEMTXATTRS_UNSPECIFIED);
-        c->src += c->left;
-        c->dst += c->left;
-        c->left = 0;
+        while (c->left) {
+            uint32_t u = MIN(c->left, AW_DMA_CHUNK);
+
+            if (s->budget < u) {
+                return false;
+            }
+            s->budget -= u;
+            dma_memory_read(s->as, c->src, tmp, u, MEMTXATTRS_UNSPECIFIED);
+            dma_memory_write(s->as, c->dst, tmp, u, MEMTXATTRS_UNSPECIFIED);
+            c->src += u;
+            c->dst += u;
+            c->left -= u;
+        }
         return true;
     }
     while (c->left) {
         unsigned u = MIN(unit, c->left);
 
         if ((sio && !(s->drq[0] & (1ull << sport))) ||
-            (dio && !(s->drq[1] & (1ull << dport)))) {
+            (dio && !(s->drq[1] & (1ull << dport))) || s->budget < u) {
             return false;
         }
+        s->budget -= u;
         address_space_read(s->as, c->src, MEMTXATTRS_UNSPECIFIED, buf, u);
         address_space_write(s->as, c->dst, MEMTXATTRS_UNSPECIFIED, buf, u);
         if (!sio) {
@@ -187,12 +203,17 @@ static void aw_dma_run(AwDmaState *s)
         return;
     }
     s->running = true;
+    s->budget = AW_DMA_RUN_BUDGET;
     do {
         s->rerun = false;
         for (n = 0; n < AW_DMA_CHANS; n++) {
             AwDmaChan *c = &s->ch[n];
 
             while (c->en && !c->pause) {
+                if (s->budget < 64) {
+                    break;
+                }
+                s->budget -= 64;
                 if (!c->active) {
                     if (c->desc == AW_DMA_LINK_END ||
                         !aw_dma_load(s, n, c->desc)) {
@@ -217,6 +238,9 @@ static void aw_dma_run(AwDmaState *s)
         }
     } while (s->rerun);
     s->running = false;
+    if (s->budget < 64 + AW_DMA_CHUNK) {
+        qemu_bh_schedule(s->bh);        /* out of budget: carry on later */
+    }
     aw_dma_update_irq(s);
 }
 
@@ -378,6 +402,11 @@ static void aw_dma_reset_hold(Object *obj, ResetType type)
     memset(s->ch, 0, sizeof(s->ch));
 }
 
+static void aw_dma_reset_exit(Object *obj, ResetType type)
+{
+    aw_dma_update_irq(AW_DMA(obj));
+}
+
 static void aw_dma_init(Object *obj)
 {
     AwDmaState *s = AW_DMA(obj);
@@ -400,6 +429,7 @@ static void aw_dma_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = aw_dma_reset_hold;
+    rc->phases.exit = aw_dma_reset_exit;
 }
 
 static const TypeInfo aw_dma_info = {

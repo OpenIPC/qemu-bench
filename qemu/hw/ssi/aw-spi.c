@@ -21,7 +21,9 @@
  * when they count dummies in bytes.  The exchange waits whenever the
  * FIFOs say so, as the clock does on silicon: for the driver (or DMA) to
  * refill the TX FIFO before MTC bytes have gone, and to drain the 64-byte
- * RX FIFO when it is full -- U-Boot reads 128 KiB in one exchange.
+ * RX FIFO when it is full (also while transmitting, unless DHB discards
+ * those bytes) -- U-Boot reads 128 KiB in one exchange.  An exchange
+ * starts only with the controller enabled (GCR.EN).
  *
  * Chip select: automatic (asserted for the exchange) or, with SS_OWNER,
  * the SS_LEVEL bit.
@@ -67,6 +69,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AwSpiState, AW_SPI)
 #define REG_TXD             0x200
 #define REG_RXD             0x300
 
+#define GCR_EN              (1u << 0)
 #define GCR_SRST            (1u << 31)
 #define TCR_SS_SEL(v)       (((v) >> 4) & 3)
 #define TCR_SS_OWNER        (1u << 6)
@@ -196,13 +199,16 @@ static void aw_spi_run(AwSpiState *s)
         uint8_t out = 0;
         uint8_t in;
 
+        /* what arrives is kept unless DHB discards it while transmitting */
+        if ((!tx_phase || !(s->tcr & TCR_DHB)) &&
+            s->rx_count == AW_SPI_FIFO) {
+            break;
+        }
         if (tx_phase) {
             if (fifo8_is_empty(&s->tx)) {
                 break;
             }
             out = fifo8_pop(&s->tx);
-        } else if (s->rx_count == AW_SPI_FIFO) {
-            break;
         }
         in = ssi_transfer(s->bus, out);
         if (!tx_phase && s->done >= mtc + dbc) {
@@ -307,7 +313,7 @@ static void aw_spi_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case REG_TCR:
         s->tcr = val & ~TCR_XCH;
-        if ((val & TCR_XCH) && !s->busy) {
+        if ((val & TCR_XCH) && !s->busy && (s->gcr & GCR_EN)) {
             s->tcr |= TCR_XCH;
             s->busy = true;
             s->done = 0;
@@ -386,6 +392,11 @@ static void aw_spi_reset_hold(Object *obj, ResetType type)
     aw_spi_soft_reset(AW_SPI(obj));
 }
 
+static void aw_spi_reset_exit(Object *obj, ResetType type)
+{
+    aw_spi_update(AW_SPI(obj));
+}
+
 static void aw_spi_init(Object *obj)
 {
     AwSpiState *s = AW_SPI(obj);
@@ -416,6 +427,7 @@ static void aw_spi_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = aw_spi_reset_hold;
+    rc->phases.exit = aw_spi_reset_exit;
 }
 
 static const TypeInfo aw_spi_info = {

@@ -21,6 +21,8 @@
  * SENDF, so the packet waits for its bytes.  A chip that does not answer
  * its address fails the transfer at once with the status code the driver
  * decodes (0x20 address + write, 0x48 address + read not acknowledged).
+ * A packet longer than the FIFOs stops when SENDF runs dry or RECVF fills
+ * and raises the TX or RX request for the driver to serve.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -62,6 +64,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AwTwiState, AW_TWI)
 #define SLV_RD              (1u << 8)
 #define INT_COM             (1u << 0)
 #define INT_ERR             (1u << 1)
+#define INT_TX_REQ          (1u << 2)
 #define INT_RX_REQ          (1u << 3)
 #define FIFOC_TX_CLR        (1u << 6)
 #define FIFOC_RX_CLR        (1u << 22)
@@ -144,7 +147,7 @@ static bool aw_twi_packet(AwTwiState *s)
 }
 
 /* Move the transfer on as far as the FIFOs let it. */
-static void aw_twi_run(AwTwiState *s)
+static void aw_twi_step(AwTwiState *s)
 {
     while (s->phase != PH_IDLE) {
         if (s->phase == PH_ADDR) {
@@ -194,6 +197,26 @@ static void aw_twi_run(AwTwiState *s)
         }
         s->left--;
     }
+}
+
+/*
+ * Run the transfer; when it stops for the FIFOs, ask the driver to refill
+ * SENDF (TX request) or drain RECVF (RX request).
+ */
+static void aw_twi_run(AwTwiState *s)
+{
+    aw_twi_step(s);
+    if (s->phase == PH_IDLE) {
+        return;
+    }
+    if (s->phase == PH_DATA && aw_twi_reading(s)) {
+        if (fifo8_is_full(&s->rx)) {
+            s->intc |= INT_RX_REQ;
+        }
+    } else if (fifo8_is_empty(&s->tx)) {
+        s->intc |= INT_TX_REQ;
+    }
+    aw_twi_update_irq(s);
 }
 
 static uint64_t aw_twi_read(void *opaque, hwaddr addr, unsigned size)
@@ -302,6 +325,9 @@ static void aw_twi_reset_hold(Object *obj, ResetType type)
 {
     AwTwiState *s = AW_TWI(obj);
 
+    if (s->phase != PH_IDLE) {
+        i2c_end_transfer(s->bus);
+    }
     s->ctrl = 0x00F80000;
     s->cfg = 0x10000001;
     s->slv = 0;
@@ -312,6 +338,11 @@ static void aw_twi_reset_hold(Object *obj, ResetType type)
     fifo8_reset(&s->tx);
     fifo8_reset(&s->rx);
     s->phase = PH_IDLE;
+}
+
+static void aw_twi_reset_exit(Object *obj, ResetType type)
+{
+    aw_twi_update_irq(AW_TWI(obj));
 }
 
 static void aw_twi_init(Object *obj)
@@ -332,6 +363,7 @@ static void aw_twi_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = aw_twi_reset_hold;
+    rc->phases.exit = aw_twi_reset_exit;
 }
 
 static const TypeInfo aw_twi_info = {

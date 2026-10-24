@@ -139,7 +139,7 @@ probes = [
      b'ping -c 2 10.0.2.2 && echo NET-$((6*7))',
      b'NET-42', 'Ethernet: DHCP lease and ping'),
 ]
-buf, t0, i, j, sent = b'', time.time(), 0, 0, None
+buf, t0, i, j, sent, at = b'', time.time(), 0, 0, None, 0
 while time.time() - t0 < limit:
     try:
         d = s.recv(4096)
@@ -148,7 +148,9 @@ while time.time() - t0 < limit:
         buf += d
     except socket.timeout:
         pass
-    while i < len(steps) and steps[i][0] in buf:
+    # each milestone counts only after the one before it
+    while i < len(steps) and buf.find(steps[i][0], at) >= 0:
+        at = buf.find(steps[i][0], at) + len(steps[i][0])
         print('ok   %-45s %6.1fs' % (steps[i][1], time.time() - t0))
         i += 1
     if i < len(steps):

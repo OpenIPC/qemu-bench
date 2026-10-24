@@ -90,6 +90,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AwVeState, AW_VE)
 #define AVC_INPUT_Y         0xA78
 
 #define AW_VE_STREAMS       4
+/* the largest picture coded, in macroblocks a side (4096 pixels) */
+#define AW_VE_MAX_MBS       256
 
 struct AwVeState {
     SysBusDevice parent_obj;
@@ -125,7 +127,9 @@ static void aw_ve_put_bits(AwVeState *s, uint32_t v, unsigned n)
         unsigned sh = 7 - (pos & 7);
 
         aw_iommu_dma_read(s->iommu, AW_IOMMU_MASTER_VE, byte, &b, 1);
-        b = (b & ~(1u << sh)) | (((v >> (n - 1 - i)) & 1) << sh);
+        /* counts above 32 put leading zeros */
+        b = (b & ~(1u << sh)) |
+            ((n - 1 - i < 32 ? (v >> (n - 1 - i)) & 1 : 0) << sh);
         aw_iommu_dma_write(s->iommu, AW_IOMMU_MASTER_VE, byte, &b, 1);
         pos++;
     }
@@ -1075,12 +1079,16 @@ static AwVeStream *aw_ve_stream(AwVeState *s, unsigned mbw, unsigned mbh)
         }
     }
     if (!st) {
+        /* a new stream: in a free slot, or in place of the oldest */
         i = s->next_stream++ % AW_VE_STREAMS;
         if (!s->streams[i]) {
             s->streams[i] = g_new0(AwVeStream, 1);
         }
         st = s->streams[i];
         st->vle_addr = addr;
+        aw_h264_pic_free(&st->recon);
+        aw_h264_pic_free(&st->prev);
+        st->recon.mbw = st->recon.mbh = 0;
     }
     if (st->recon.mbw != mbw || st->recon.mbh != mbh) {
         aw_h264_pic_free(&st->recon);
@@ -1123,7 +1131,8 @@ static void aw_ve_input(AwVeState *s, AwH264Pic *t)
     cw = le16_to_cpu(hd.cw);
     ch = le16_to_cpu(hd.ch);
     if (le32_to_cpu(hd.magic) != AW_QLBC_MAGIC || !bw || !bh || !cw || !ch ||
-        cw * 2 < bw || ch * 2 < bh) {
+        cw * 2 < bw || ch * 2 < bh ||
+        bw > AW_VE_MAX_MBS * 4 || bh > AW_VE_MAX_MBS * 4) {
         memset(t->y, 128, t->mbw * t->mbh * 16);
         memset(t->u, 128, t->mbw * t->mbh * 4);
         memset(t->v, 128, t->mbw * t->mbh * 4);
@@ -1139,6 +1148,38 @@ static void aw_ve_input(AwVeState *s, AwH264Pic *t)
     g_free(buf);
 }
 
+static void aw_h264_pic_copy(AwH264Pic *dst, const AwH264Pic *src)
+{
+    unsigned n = src->mbw * src->mbh;
+
+    aw_h264_pic_alloc(dst, src->mbw, src->mbh);
+    memcpy(dst->y, src->y, n * 16);
+    memcpy(dst->u, src->u, n * 4);
+    memcpy(dst->v, src->v, n * 4);
+}
+
+static void aw_h264_pic_move(AwH264Pic *dst, AwH264Pic *src)
+{
+    aw_h264_pic_free(dst);
+    *dst = *src;
+    src->y = src->u = src->v = NULL;
+}
+
+/* The bytes @data takes with emulation prevention, after @zeros zeros. */
+static uint32_t aw_ve_escaped_size(GByteArray *data, int zeros)
+{
+    uint32_t i, n = data->len;
+
+    for (i = 0; i < data->len; i++) {
+        if (zeros >= 2 && data->data[i] <= 3) {
+            n++;
+            zeros = 0;
+        }
+        zeros = data->data[i] ? 0 : zeros + 1;
+    }
+    return n;
+}
+
 static void aw_ve_encode(AwVeState *s)
 {
     uint32_t dim = s->regs[0xA00 >> 2];
@@ -1149,12 +1190,19 @@ static void aw_ve_encode(AwVeState *s)
     bool p_slice = s->regs[0xB04 >> 2] & 0x10;
     int idc = (s->regs[0xB04 >> 2] >> 10) & 3;
     int qp = s->regs[0xB08 >> 2] & 0x3F;
-    uint32_t pos, i;
+    uint32_t ring = (s->regs[AVC_VLE_END >> 2] + 1 -
+                     s->regs[AVC_VLE_ADDR >> 2]) << 8;
+    uint32_t pos, i, bytes;
     GByteArray *data;
     AwVeStream *st;
-    AwH264Pic in;
+    AwH264Pic in, ref = { 0 }, last = { 0 };
     uint8_t prev[2] = { 0xFF, 0xFF };
     int zeros;
+
+    if (!w || !h || w > AW_VE_MAX_MBS || h > AW_VE_MAX_MBS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "aw-ve: picture %ux%u MBs\n", w, h);
+        return;
+    }
 
     /* cabac_alignment_one_bit */
     while (s->regs[AVC_VLE_LENGTH >> 2] & 7) {
@@ -1172,9 +1220,37 @@ static void aw_ve_encode(AwVeState *s)
     st = aw_ve_stream(s, w, h);
     aw_h264_pic_alloc(&in, w, h);
     aw_ve_input(s, &in);
+    if (p_slice) {
+        aw_h264_pic_copy(&ref, &st->recon);
+        aw_h264_pic_copy(&last, &st->prev);
+    }
     data = aw_h264_slice_data(&in, &st->prev, &st->recon, p_slice, qp,
                               MIN(idc, 2));
+    bytes = aw_ve_escaped_size(data, zeros);
+    if (p_slice && ring &&
+        (pos >> 3) - (s->regs[AVC_VLE_OFFSET >> 2] >> 3) + bytes > ring) {
+        /*
+         * The frame would wrap over itself in the bitstream buffer: send
+         * it with every macroblock skipped instead, and the changes with
+         * a later frame.
+         */
+        g_byte_array_free(data, true);
+        aw_h264_pic_move(&st->recon, &ref);
+        aw_h264_pic_move(&st->prev, &last);
+        aw_h264_pic_copy(&ref, &st->prev);
+        data = aw_h264_slice_data(&ref, &st->prev, &st->recon, true, qp,
+                                  MIN(idc, 2));
+        aw_h264_pic_free(&ref);
+    } else if (p_slice) {
+        aw_h264_pic_free(&ref);
+        aw_h264_pic_free(&last);
+    }
     aw_h264_pic_free(&in);
+    if (ring && (pos >> 3) - (s->regs[AVC_VLE_OFFSET >> 2] >> 3) +
+        aw_ve_escaped_size(data, zeros) > ring) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "aw-ve: frame larger than the bitstream buffer\n");
+    }
     /* emulation prevention, continuing from the header's last bytes */
     for (i = 0; i < data->len; i++) {
         uint8_t b = data->data[i];

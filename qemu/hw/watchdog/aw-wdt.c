@@ -136,6 +136,13 @@ static void aw_wdt_reset_hold(Object *obj, ResetType type)
     s->mode = 0;
 }
 
+static void aw_wdt_reset_exit(Object *obj, ResetType type)
+{
+    AwWdtState *s = AW_WDT(obj);
+
+    qemu_set_irq(s->irq, !!(s->irq_sta & s->irq_en));
+}
+
 static void aw_wdt_init(Object *obj)
 {
     AwWdtState *s = AW_WDT(obj);
@@ -152,6 +159,7 @@ static void aw_wdt_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = aw_wdt_reset_hold;
+    rc->phases.exit = aw_wdt_reset_exit;
 }
 
 static const TypeInfo aw_wdt_info = {
