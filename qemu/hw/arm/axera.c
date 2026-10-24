@@ -640,6 +640,19 @@ static const AxeraSoCConfig ax620q_soc = {
     .uart0_irq         = AXERA_UART0_IRQ,
 };
 
+/*
+ * AX620U's secondary-CPU spin stub (hw/arm/boot.c's
+ * default_write_secondary()) needs its own small RAM window, the same
+ * way realview.c's SMP_BOOT_ADDR does -- it must not land inside the
+ * real DRAM region arm_load_kernel() places the Image/dtb/initrd in,
+ * and it must be real read/write RAM, not a create_unimplemented_device
+ * catch-all (an unimplemented region ignores writes, so the stub itself
+ * would never get written there). Placed just past the periph
+ * catch-all's end.
+ */
+#define AXERA_AX620U_SMP_BOOT_ADDR 0x10c00000ULL
+#define AXERA_AX620U_SMP_BOOT_SIZE 0x1000
+
 static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -647,16 +660,42 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     qemu_irq pic[AXERA_NUM_SPI];
     DeviceState *gic;
     SysBusDevice *gicbus;
-    ARMCPU *cpu0;
-    Object *cpuobj;
+    ARMCPU *cpu[4];
+    unsigned int smp_cpus = machine->smp.cpus;
     int n, i;
 
-    cpuobj = object_new(machine->cpu_type);
-    object_property_set_uint(cpuobj, "cntfrq", AXERA_CNTFRQ, &error_fatal);
-    qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
-    cpu0 = ARM_CPU(cpuobj);
+    if (smp_cpus > ARRAY_SIZE(cpu)) {
+        error_report("axera: at most %zu CPUs", ARRAY_SIZE(cpu));
+        exit(1);
+    }
+
+    for (n = 0; n < smp_cpus; n++) {
+        Object *cpuobj = object_new(machine->cpu_type);
+
+        /*
+         * No PSCI on AX620Q/AX620U -- real silicon's secondary cores
+         * come up through the vendor's own spin-table protocol (see
+         * ax620u_soc's comment), not CPU_ON. Leaving psci-conduit at
+         * its default (disabled) is what makes arm_load_kernel() below
+         * fall back to its generic secondary-CPU boot stub automatically
+         * once more than one CPU is realized.
+         */
+        object_property_set_uint(cpuobj, "cntfrq", AXERA_CNTFRQ,
+                                  &error_fatal);
+        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+        cpu[n] = ARM_CPU(cpuobj);
+    }
 
     memory_region_add_subregion(sysmem, AXERA_RAM_BASE, machine->ram);
+
+    if (c->smp_bootreg_addr) {
+        MemoryRegion *smpboot_ram = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(smpboot_ram, NULL, "axera.ax620u-smpboot",
+                               AXERA_AX620U_SMP_BOOT_SIZE, &error_fatal);
+        memory_region_add_subregion(sysmem, AXERA_AX620U_SMP_BOOT_ADDR,
+                                    smpboot_ram);
+    }
 
     create_unimplemented_device("axera-periph", AXERA_PERIPH_BASE,
                                  AXERA_PERIPH_SIZE);
@@ -713,11 +752,27 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         create_unimplemented_device("axera-vin", 0x02400000, 0x100000);
         create_unimplemented_device("axera-npu", 0x03800000, 0x7000);
         create_unimplemented_device("axera-npu-sram", 0x03000000, 0x500000);
+
+        /*
+         * secondary-boot-reg @ 0x02220300 (real devicetree value, see
+         * ax620u_soc's comment): the primary CPU's write of the
+         * secondary-CPU entry address has to actually stick so the
+         * spin stub's poll loop can read it back, unlike the
+         * create_unimplemented_device catch-all underneath, which
+         * always discards writes.
+         */
+        DeviceState *smpreg = qdev_new("hisi-regbank");
+
+        qdev_prop_set_uint32(smpreg, "size", 0x1000);
+        qdev_prop_set_string(smpreg, "name", "axera-ax620u-smp-bootreg");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(smpreg), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(smpreg), 0,
+                                c->smp_bootreg_addr & ~0xfffULL, 1);
     }
 
     gic = qdev_new(gic_class_name());
     qdev_prop_set_uint32(gic, "revision", 2);
-    qdev_prop_set_uint32(gic, "num-cpu", 1);
+    qdev_prop_set_uint32(gic, "num-cpu", smp_cpus);
     qdev_prop_set_uint32(gic, "num-irq", AXERA_NUM_SPI + GIC_INTERNAL);
     qdev_prop_set_bit(gic, "has-security-extensions", true);
     gicbus = SYS_BUS_DEVICE(gic);
@@ -728,9 +783,9 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     sysbus_mmio_map(gicbus, 0, AXERA_GIC_DIST);
     sysbus_mmio_map(gicbus, 1, AXERA_GIC_CPU);
 
-    {
-        DeviceState *cpudev = DEVICE(cpu0);
-        int ppibase = AXERA_NUM_SPI + GIC_NR_SGIS;
+    for (n = 0; n < smp_cpus; n++) {
+        DeviceState *cpudev = DEVICE(cpu[n]);
+        int ppibase = AXERA_NUM_SPI + n * GIC_INTERNAL + GIC_NR_SGIS;
         static const int timer_ppi[] = {
             [GTIMER_PHYS] = 14,
             [GTIMER_VIRT] = 11,
@@ -743,10 +798,14 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
                                    qdev_get_gpio_in(gic, ppibase +
                                                      timer_ppi[i]));
         }
-        sysbus_connect_irq(gicbus, 0, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
-        sysbus_connect_irq(gicbus, 1, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
-        sysbus_connect_irq(gicbus, 2, qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
-        sysbus_connect_irq(gicbus, 3, qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+        sysbus_connect_irq(gicbus, n,
+                            qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        sysbus_connect_irq(gicbus, n + smp_cpus,
+                            qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+        sysbus_connect_irq(gicbus, n + 2 * smp_cpus,
+                            qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+        sysbus_connect_irq(gicbus, n + 3 * smp_cpus,
+                            qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
     }
     for (n = 0; n < AXERA_NUM_SPI; n++) {
         pic[n] = qdev_get_gpio_in(gic, n);
@@ -801,7 +860,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             g_free(uboot_data);
 
             AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
-            info->cpu = cpu0;
+            info->cpu = cpu[0];
             info->entry = uboot_base;
             qemu_register_reset(axera_bootrom_cpu_reset, info);
             return;
@@ -815,7 +874,12 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     }
     binfo.ram_size = machine->ram_size;
     binfo.loader_start = AXERA_RAM_BASE;
-    arm_load_kernel(cpu0, machine, &binfo);
+    if (c->smp_bootreg_addr) {
+        binfo.smp_bootreg_addr = c->smp_bootreg_addr;
+        binfo.smp_loader_start = AXERA_AX620U_SMP_BOOT_ADDR;
+        binfo.gic_cpu_if_addr = AXERA_GIC_CPU;
+    }
+    arm_load_kernel(cpu[0], machine, &binfo);
 }
 
 #define DEFINE_AXERA_MACHINE(namestr, tag, config)                    \
@@ -857,15 +921,23 @@ DEFINE_AXERA_MACHINE("ax620q", ax620q, ax620q_soc)
  * AX620E/AX630C/AX620Q, "arm,armv7-timer" at the same 24 MHz with the
  * same PPI layout, but UART0 at 0x04990000 (not 0x04880000) and DRAM at
  * 0x40000000/~1 GiB. Its own vendor spin-table SMP ("axera,ax620x-smp",
- * secondary-boot-reg at 0x02220300) is a different register than
- * AX620Q's and is not modelled; only CPU0 boots, same stance as AX620Q.
+ * secondary-boot-reg at 0x02220300, a different register than
+ * AX620Q's) is modelled using QEMU's generic ARM secondary-CPU boot
+ * code (hw/arm/boot.c's default_write_secondary(): a small poll-and-
+ * branch stub written to smp_loader_start, woken by the primary CPU's
+ * write to smp_bootreg_addr then an SEV/IPI) -- the exact mechanism
+ * the real vendor platsmp.c's ax620x_smp_ops implements kernel-side,
+ * just with QEMU providing the boot-ROM-level spin stub real silicon
+ * would.
  */
 static const AxeraSoCConfig ax620u_soc = {
-    .desc              = "Axera AX620U (Cortex-A7 x4, AArch32, CPU1-3 not modelled)",
+    .desc              = "Axera AX620U (Cortex-A7 x4, AArch32)",
     .ram_size_default  = 1 * GiB,
     .uart0_base        = 0x04990000ULL,
     .uart0_irq         = 68,
     .is_ax620x         = true,
+    .max_cpus          = 4,
+    .smp_bootreg_addr  = 0x02220300ULL,
 };
 
 DEFINE_AXERA_MACHINE("ax620u", ax620u, ax620u_soc)

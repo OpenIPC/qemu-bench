@@ -24,6 +24,11 @@ typedef struct AxeraSoCConfig {
     hwaddr      uart0_base;     /* snps,dw-apb-uart (or axera,ax-apb-uart) */
     int         uart0_irq;      /* the DT's raw SPI number, not the INTID */
     bool        is_ax620x;      /* AX620U: "axera,ax620x", not "axera,ax620e" */
+    int         max_cpus;       /* 0 means 1 -- only AX620U's spin-table SMP
+                                  * is modelled (see smp_bootreg_addr below) */
+    hwaddr      smp_bootreg_addr; /* 0 if this SoC's secondary-boot-reg isn't
+                                    * modelled (AX620Q: register not
+                                    * confirmed; only CPU0 boots there) */
 } AxeraSoCConfig;
 
 #endif /* HW_ARM_AXERA_H */
