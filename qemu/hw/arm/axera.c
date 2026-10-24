@@ -258,7 +258,6 @@ static const struct {
     { "axera-wdt0",         0x04840000, 0x400 },
     { "axera-eth0",         0x104c0000, 0x10000 },
     { "axera-npu",          0x03800000, 0xb0000 },
-    { "axera-npu-sram",     0x03000000, 0x280000 },
 };
 
 static void axera_map_regbanks(void)
@@ -403,6 +402,27 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     }
 
     memory_region_add_subregion(sysmem, AXERA_RAM_BASE, machine->ram);
+
+    /*
+     * axera-npu-sram @ 0x03000000, 0x280000: real on-chip SRAM, not an
+     * NPU-only scratchpad -- BL1 itself both RUNS from inside this
+     * window (its own linker script: ORIGIN=0x03000400 within this
+     * exact range, see AXERA_BL1_BASE below) AND uses the rest of it
+     * as general early-boot scratch, e.g. DDRINIT_PARAM_HEADER_BASE=
+     * 0x03200000 for the DRAM-controller init parameters BL1 reads
+     * off flash before DRAM itself exists to hold them anywhere else.
+     * Modelling this as create_unimplemented_device (silently
+     * discarding writes) broke that: the eMMC block-read into
+     * 0x03200000 appeared to succeed but the destination stayed all
+     * zero, and verify_img_header() correctly rejected it as garbage.
+     * Real SRAM is real RAM; NPU compute itself using it is still
+     * unmodelled (future work), but passive storage is what every
+     * other consumer of this address range actually needs.
+     */
+    MemoryRegion *npu_sram = g_new(MemoryRegion, 1);
+    memory_region_init_ram(npu_sram, NULL, "axera.npu-sram",
+                           0x280000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x03000000ULL, npu_sram);
 
     create_unimplemented_device("axera-periph", AXERA_PERIPH_BASE,
                                  AXERA_PERIPH_SIZE);
@@ -556,12 +576,10 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
              * address and start CPU0 there -- same technique this tree
              * already uses for HiSilicon's V1/V5 boot-ROM paths
              * (hisilicon_maskrom_cpu_reset), just a different address.
-             * A small RAM region backs 0x03000400 (inside the broader
-             * axera-periph unimplemented catch-all) so the injected
-             * code is actually executable, at normal priority so it
-             * wins over that -1000-priority catch-all underneath.
+             * 0x03000400 is real RAM already -- it's inside the
+             * axera-npu-sram region added above, not a dedicated
+             * carve-out -- so this is just the blob write.
              */
-            MemoryRegion *bl1_ram = g_new(MemoryRegion, 1);
             char *bl1_data = NULL;
             gsize bl1_len = 0;
 
@@ -572,10 +590,6 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                               ams->flash_file);
                 exit(1);
             }
-
-            memory_region_init_ram(bl1_ram, NULL, "axera.bl1ram",
-                                   AXERA_BL1_SIZE, &error_fatal);
-            memory_region_add_subregion(sysmem, AXERA_BL1_BASE, bl1_ram);
 
             rom_add_blob_fixed("axera.bl1",
                                bl1_data,
