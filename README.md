@@ -267,7 +267,7 @@ mounts its SquashFS root from the NOR:
 file. The EMAC works with the vendor driver (`-nic user`), even on
 cameras that ship with Wi-Fi only. The vendor media stack runs on a
 modelled sensor, video input and IOMMU, and its H.264 encoder produces
-valid streams of the test pattern through the modelled video engine. A YI camera (V831) runs to a root shell and the vendor application in
+valid streams of a test picture (the OpenIPC logo) through the modelled video engine. A YI camera (V831) runs to a root shell and the vendor application in
 a few seconds (`qemu-boot/test-v831-boot.sh`). Its U-Boot silences the
 kernel console unless the SD card holds `/debug_tty`. Map, boot chain and
 what the firmware depends on are in

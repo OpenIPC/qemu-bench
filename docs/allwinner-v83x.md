@@ -159,8 +159,11 @@ starts, stays up, and with a configured camera opens its H.264 encoder.
 - **Sensor.** The repo's GC2053 (`hisi-gc2053`, ID 0x2053 at 0xF0/0xF1)
   sits at 0x37 on TWI1. The VIN driver registers its video nodes and the
   ISP library finds its `gc2053_mipi_1936_1096_20` tuning.
-- **Frames.** `aw-vinc` paints colour bars with a moving square into
-  each queued buffer at 20 fps and raises VSYNC and frame done. The
+- **Frames.** `aw-vinc` paints the OpenIPC logo (still, white on navy)
+  with a round dot sliding beneath it into each queued buffer at 20 fps
+  and raises VSYNC and frame done. The logo stays still because P frames
+  send changed macroblocks raw; the dot gives the motion detector
+  something to see. The
   scene is drawn in sensor coordinates and timed by the clock, so every
   channel shows the same picture. The firmware uses the single-address
   mode (0x20/0x28); the FIFO mode (`CONFIG_BUF_AUTO_UPDATE`) is modelled
@@ -216,7 +219,7 @@ VLE_OFFSET; it takes a frame's size as LENGTH - OFFSET.
 `-global aw-ve.dump=DIR` writes each frame as the driver takes it to
 `DIR/avc-<buffer>.h264`. With the stream's SPS and PPS in front, the
 YI streams decode with libavcodec with no errors and no concealment,
-and show the test pattern. The coder decodes pixel-exact against its
+and show the logo picture. The coder decodes pixel-exact against its
 tracked reconstruction over QP 0..51 (offline harness with libavcodec).
 
 ### The 2D engine
@@ -229,7 +232,7 @@ then starts it with 0x28 bit 0 and waits for the task-end interrupt.
 `aw-g2d` loads the blocks, scales the V0 layer into the write-back buffer
 (nearest sample; YUV 4:2:0 / 4:2:2, Y8 and packed RGB) and raises it.
 Without it every task failed (`G2D_CMD_MIXER_TASK failure!`); with it the
-application's motion detection fires on the moving square
+application's motion detection fires on the moving dot
 (`motion_detect=3`, `send start motion detect`).
 
 ### Audio and the recorder

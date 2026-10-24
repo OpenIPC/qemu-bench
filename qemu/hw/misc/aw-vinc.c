@@ -2,10 +2,10 @@
  * Allwinner CSIC DMA ("vinc", the video input's write-back) on the
  * V831/V833: four channels at 0x06609000 + 0x200 * n, the end of the
  * sensor -> CSI -> ISP -> scaler chain.  There is no sensor data: each
- * frame, at the sensor's rate, the channel paints a test pattern into the
- * buffer the driver queued, in the geometry the driver programmed, and
- * raises the interrupts the vendor vin driver (vin_core.c vin_isr) waits
- * for.  Buffer addresses are device addresses, behind the IOMMU ("iommu"
+ * frame, at the sensor's rate, the channel paints a test picture (the
+ * OpenIPC logo, with a moving dot) into the buffer the driver queued, in
+ * the geometry the driver programmed, and raises the interrupts the
+ * vendor vin driver (vin_core.c vin_isr) waits for.  Buffer addresses are device addresses, behind the IOMMU ("iommu"
  * link) as its CSI master.
  *
  *   0x000 EN       bit 0 top enable, 3 FBC, 4 DMA enable, 7 buffer-address
@@ -38,6 +38,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -48,6 +49,7 @@
 #include "system/dma.h"
 #include "hw/misc/aw-iommu.h"
 #include "hw/misc/aw-qlbc.h"
+#include "aw-vinc-logo.h"
 #include "qom/object.h"
 
 #define TYPE_AW_VINC "aw-vinc"
@@ -132,49 +134,110 @@ static uint32_t aw_vinc_fifo_pop(AwVincFifo *f)
 }
 
 /*
- * The test pattern: eight vertical colour bars, with a bright square that
- * moves a step a frame, so motion is visible downstream.  It is drawn in
- * the sensor's 1920x1080 and scaled to each channel's size, and its frame
+ * The test picture: the OpenIPC logo, white on a navy gradient, with a
+ * round dot that slides to and fro beneath it, so there is motion
+ * downstream (the YI application's motion detection, its recorder).  The
+ * logo stands still: the encoder sends changed macroblocks raw, and a
+ * moving logo would change hundreds of them a frame.  It is drawn in the
+ * sensor's 1920x1080 and scaled to each channel's size, and its frame
  * number comes from the clock, so the channels show the same scene.
  */
 #define PAT_W               1920
 #define PAT_H               1080
-#define PAT_SQ              (PAT_H / 8)
-
-static const uint8_t aw_vinc_bars[8][3] = {     /* Y, U, V */
-    { 235, 128, 128 }, { 210, 16, 146 }, { 170, 166, 16 },
-    { 145, 54, 34 }, { 106, 202, 222 }, { 81, 90, 240 },
-    { 41, 240, 110 }, { 16, 128, 128 },
-};
+#define PAT_LOGO_X          ((PAT_W - AW_VINC_LOGO_W) / 2)
+#define PAT_LOGO_Y          (PAT_H * 2 / 5 - AW_VINC_LOGO_H / 2)
+#define PAT_DOT_R           64
+#define PAT_DOT_Y           (PAT_H * 4 / 5)
+#define PAT_DOT_X0          (PAT_LOGO_X + PAT_DOT_R)
+#define PAT_DOT_RANGE       (AW_VINC_LOGO_W - 2 * PAT_DOT_R)
 
 typedef struct AwVincPattern {
     uint32_t w, h;
-    uint32_t sx, sy;            /* the square, sensor pixels */
+    uint32_t dot_x;             /* the dot's centre, sensor pixels */
 } AwVincPattern;
+
+/* the logo's coverage, 0..255, AW_VINC_LOGO_W x AW_VINC_LOGO_H */
+static uint8_t *aw_vinc_logo;
+
+static void aw_vinc_logo_init(void)
+{
+    const unsigned sc = AW_VINC_LOGO_SCALE;
+    const unsigned bw = AW_VINC_LOGO_W * sc;
+    gsize n, i = 0;
+    g_autofree guchar *runs = g_base64_decode(aw_vinc_logo_runs_b64, &n);
+    g_autofree uint8_t *count = g_malloc0(AW_VINC_LOGO_W * AW_VINC_LOGO_H);
+    uint64_t pos = 0, end = (uint64_t)bw * AW_VINC_LOGO_H * sc;
+    bool set = false;
+
+    while (i < n && pos < end) {
+        uint64_t run = 0;
+        unsigned shift = 0;
+
+        do {
+            run |= (uint64_t)(runs[i] & 0x7F) << shift;
+            shift += 7;
+        } while ((runs[i++] & 0x80) && i < n && shift < 35);
+        for (; set && run && pos < end; run--, pos++) {
+            count[(pos / bw / sc) * AW_VINC_LOGO_W + (pos % bw) / sc]++;
+        }
+        pos += run;
+        set = !set;
+    }
+    aw_vinc_logo = g_malloc(AW_VINC_LOGO_W * AW_VINC_LOGO_H);
+    for (i = 0; i < AW_VINC_LOGO_W * AW_VINC_LOGO_H; i++) {
+        aw_vinc_logo[i] = count[i] * 255 / (sc * sc);
+    }
+}
 
 static void aw_vinc_pattern(AwVincState *s, AwVincPattern *p,
                             uint32_t w, uint32_t h)
 {
     uint64_t frame = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                               MAX(s->fps, 1), NANOSECONDS_PER_SECOND);
+    uint32_t t = (frame * 8) % (2 * PAT_DOT_RANGE);
 
+    if (!aw_vinc_logo) {
+        aw_vinc_logo_init();
+    }
     p->w = w;
     p->h = h;
-    p->sx = (frame * 8) % (PAT_W - PAT_SQ);
-    p->sy = (frame * 4) % (PAT_H - PAT_SQ);
+    p->dot_x = PAT_DOT_X0 + (t < PAT_DOT_RANGE ? t : 2 * PAT_DOT_RANGE - t);
+}
+
+static uint8_t aw_vinc_blend(uint8_t bg, uint8_t fg, unsigned a)
+{
+    return bg + ((int)fg - bg) * (int)a / 255;
 }
 
 /* Y, U, V at (x, y) of the channel's picture */
 static void aw_vinc_pixel(const AwVincPattern *p, uint32_t x, uint32_t y,
                           uint8_t *yuv)
 {
-    uint32_t px = (uint64_t)x * PAT_W / p->w;
-    uint32_t py = (uint64_t)y * PAT_H / p->h;
+    int px = (uint64_t)x * PAT_W / p->w;
+    int py = (uint64_t)y * PAT_H / p->h;
+    int dx = px - (int)p->dot_x, dy = py - PAT_DOT_Y;
+    unsigned a = 0;
 
-    memcpy(yuv, aw_vinc_bars[(px * 8 / PAT_W) & 7], 3);
-    if (px >= p->sx && px < p->sx + PAT_SQ &&
-        py >= p->sy && py < p->sy + PAT_SQ) {
-        yuv[0] = 250;
+    /* navy, a little lighter at the top */
+    yuv[0] = 50 - 14 * py / PAT_H;
+    yuv[1] = 146;
+    yuv[2] = 122;
+    if (px >= PAT_LOGO_X && px < PAT_LOGO_X + AW_VINC_LOGO_W &&
+        py >= PAT_LOGO_Y && py < PAT_LOGO_Y + AW_VINC_LOGO_H) {
+        a = aw_vinc_logo[(py - PAT_LOGO_Y) * AW_VINC_LOGO_W +
+                         px - PAT_LOGO_X];
+    } else if (abs(dx) <= PAT_DOT_R + 1 && abs(dy) <= PAT_DOT_R + 1) {
+        /* the dot, its edge anti-aliased over a pixel */
+        int d = (int)(sqrt(dx * dx + dy * dy) * 256);
+
+        a = d <= PAT_DOT_R * 256 - 128 ? 255 :
+            d >= PAT_DOT_R * 256 + 128 ? 0 :
+            (PAT_DOT_R * 256 + 128 - d) * 255 / 256;
+    }
+    if (a) {
+        yuv[0] = aw_vinc_blend(yuv[0], 235, a);
+        yuv[1] = aw_vinc_blend(yuv[1], 128, a);
+        yuv[2] = aw_vinc_blend(yuv[2], 128, a);
     }
 }
 
