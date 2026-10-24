@@ -183,8 +183,12 @@ cp qemu/hw/misc/axera-vcmd.c        "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-vcmd.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-dw-spi.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-dw-spi.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-spi-nor.c      "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-spi-nor.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-bl1-timer.c   "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-bl1-timer.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-ddr-pll.c   "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-ddr-pll.h "$QEMU_DIR/include/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -638,10 +642,11 @@ config AXERA
     select HISI_MISC
     select CADENCE_SDHCI
     select USB_DWC3
+    select SSI_M25P80
 KCONFIG
     echo "  hw/arm/Kconfig: added AXERA"
 else
-    for sym in ARM_GIC SERIAL_MM UNIMP HISI_MISC CADENCE_SDHCI USB_DWC3; do
+    for sym in ARM_GIC SERIAL_MM UNIMP HISI_MISC CADENCE_SDHCI USB_DWC3 SSI_M25P80; do
         if ! sed -n '/^config AXERA$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config AXERA\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -675,10 +680,20 @@ if ! grep -q "'axera-dw-spi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-dw-spi.c"
 fi
+if ! grep -q "'axera-spi-nor.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-spi-nor.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-spi-nor.c"
+fi
 if ! grep -q "'axera-bl1-timer.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-bl1-timer.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-bl1-timer.c"
+fi
+if ! grep -q "'axera-ddr-pll.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ddr-pll.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-ddr-pll.c"
 fi
 
 # hw/misc/Kconfig

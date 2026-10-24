@@ -32,6 +32,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/units.h"
+#include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -43,9 +44,11 @@
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/misc/axera-bl1-timer.h"
+#include "hw/misc/axera-ddr-pll.h"
 #include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
 #include "hw/misc/axera-pllc.h"
+#include "hw/misc/axera-spi-nor.h"
 #include "hw/misc/axera-vcmd.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
@@ -285,6 +288,14 @@ static void axera_map_regbanks(void)
      * equal, so BL1 spins here forever before anything else runs. */
     sysbus_create_simple(TYPE_AXERA_BL1_TIMER, 0x04830000, NULL);
 
+    /* dpll_ctrl_glb @ 0x00265000, the DDR system DPLL (a separate PLL
+     * instance/register layout from clk_pllc above, confirmed from the
+     * real vendor source and a gdb trace of a silent flash-file= SPI
+     * NOR boot): BL1 enables it and spins on two separate ready-bit
+     * polls before DDR training can even start (see
+     * hw/misc/axera-ddr-pll.c). */
+    sysbus_create_simple(TYPE_AXERA_DDR_PLL, 0x00265000, NULL);
+
     for (n = 0; n < ARRAY_SIZE(ax620e_regbanks); n++) {
         DeviceState *dev = qdev_new("hisi-regbank");
 
@@ -378,6 +389,19 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
         exit(1);
     }
 
+    /*
+     * flash-file= boots the real BL1, which genuinely starts at EL3
+     * (its own reset code touches scr_el3 as its first instructions,
+     * confirmed from a real deployed camera's own SPI NOR dump) -- a
+     * real EL3 has to exist on the CPU model for that, unlike the
+     * uboot-file=/-kernel paths below, which deliberately disable it
+     * so QEMU's own internal PSCI-over-SMC emulation answers CPU_ON
+     * directly (no real ATF/BL31 modelled at all for those paths).
+     */
+    bool want_el3 = AXERA_MACHINE(machine)->flash_file &&
+                    AXERA_MACHINE(machine)->flash_file[0] &&
+                    !machine->kernel_filename;
+
     for (n = 0; n < smp_cpus; n++) {
         Object *cpuobj = object_new(machine->cpu_type);
 
@@ -391,10 +415,12 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
          * CPU_ON, per the comment above that node about the AX630C
          * firmware's spin-table-less boot.
          */
-        object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
+        object_property_set_bool(cpuobj, "has_el3", want_el3, &error_fatal);
         object_property_set_bool(cpuobj, "has_el2", false, &error_fatal);
-        object_property_set_int(cpuobj, "psci-conduit",
-                                 QEMU_PSCI_CONDUIT_SMC, &error_fatal);
+        if (!want_el3) {
+            object_property_set_int(cpuobj, "psci-conduit",
+                                     QEMU_PSCI_CONDUIT_SMC, &error_fatal);
+        }
         object_property_set_uint(cpuobj, "cntfrq", AXERA_CNTFRQ,
                                   &error_fatal);
         qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
@@ -579,9 +605,19 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
              * 0x03000400 is real RAM already -- it's inside the
              * axera-npu-sram region added above, not a dedicated
              * carve-out -- so this is just the blob write.
+             *
+             * Some real dumps (confirmed: a real deployed AX620E SPI
+             * NOR camera firmware) have the real vendor sec_boot RSA
+             * image_header (build/tools/imgsign/sec_boot_AX620E_sign.py)
+             * in front of BL1 at offset 0 -- magic 0x55543322 at +4,
+             * the real payload size at +0xc, a 1024-byte header. Detect
+             * and skip it so the CPU starts on real BL1 code, not
+             * header bytes; a dump with no such header (BL1 truly raw
+             * at offset 0) is unaffected, same as before.
              */
             char *bl1_data = NULL;
             gsize bl1_len = 0;
+            gsize bl1_off = 0;
 
             if (!g_file_get_contents(ams->flash_file, &bl1_data, &bl1_len,
                                      NULL)) {
@@ -591,10 +627,31 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                 exit(1);
             }
 
+            if (bl1_len >= 1024 &&
+                ldl_le_p(bl1_data + 4) == 0x55543322) {
+                bl1_off = 1024;
+            }
+
             rom_add_blob_fixed("axera.bl1",
-                               bl1_data,
-                               MIN(bl1_len, (gsize)AXERA_BL1_SIZE),
+                               bl1_data + bl1_off,
+                               MIN(bl1_len - bl1_off, (gsize)AXERA_BL1_SIZE),
                                AXERA_BL1_BASE);
+
+            /*
+             * spi0@0x01a00000, the DW SPI controller BL1's own
+             * drivers/spi/dw_spi_mst.c reads the rest of this same NOR
+             * flash through (spinor_read(), real opcode 0x03 reads) --
+             * back it with the same file so BL1's own flash_read()
+             * calls, not just this direct injection, see real content.
+             */
+            {
+                DeviceState *spi_nor = qdev_new(TYPE_AXERA_SPI_NOR);
+
+                qdev_prop_set_string(spi_nor, "file", ams->flash_file);
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(spi_nor),
+                                         &error_fatal);
+                sysbus_mmio_map(SYS_BUS_DEVICE(spi_nor), 0, 0x01a00000);
+            }
             g_free(bl1_data);
 
             AxeraBootromReset *info = g_new0(AxeraBootromReset, 1);
