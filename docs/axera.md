@@ -27,9 +27,12 @@ devicetree, not an assumption from the name.
 
 Modelled so far, for every machine: the CPUs (for AX630C/AX620E, PSCI
 over SMC as the vendor ATF answers it -- the dtsi's `psci` node is
-`method = "smc"`; for AX620Q/AX620U only CPU0 boots, see below), the
-GIC-400 (no virtualization frames yet), and UART0 (DesignWare-style,
-reg-shift 2).
+`method = "smc"`; for AX620U, the real vendor spin-table, all 4 CPUs
+come online; AX620Q still only boots CPU0, see below), the GIC-400 (no
+virtualization frames yet), and UART0 (DesignWare-style, reg-shift 2;
+AX620Q's real console is on a separate, fourth NS16550 instance at
+`0x06080000`, not UART0 -- confirmed from its own real vendor U-Boot
+config, not assumed).
 
 For AX630C/AX620E, the simple syscon-style blocks -- clock controllers
 (`clk_cpu`/`clk_pllc`/`clk_common`/`clk_flash`/`clk_periph`/`clk_vpu`/
@@ -41,6 +44,18 @@ HiSilicon family, not Axera-specific): a driver's write-then-read probe
 sees what it wrote, which the unimplemented catch-all underneath
 cannot give it. AX620Q's much smaller dtsi gets the three it actually
 has (`clk_cpu`/`clk_pllc`/`clk_common`).
+
+Three more blocks needed real device-model behaviour, not just storage,
+because real boot code polls them expecting a side effect a passive
+regbank can never produce: `clk_pllc`'s CPU-PLL/VPLL0 ready bits
+(`hw/misc/axera-pllc.c`, needed for BL1's own PLL bring-up), BL1's
+generic delay timer at `0x04830000` (`hw/misc/axera-bl1-timer.c`, a
+real free-running DesignWare APB down-counter BL1's `udelay()` polls
+for elapsed ticks against), and the SPI-attached boot-logo panel at
+`spi2@0x06072000` (`hw/misc/axera-dw-spi.c`, a real DesignWare APB SSI
+model -- U-Boot's `designware_spi.c` `poll_transfer()` has no timeout,
+so a passive regbank hangs the boot dead silently the moment it tries
+to draw the logo, on every machine that has this panel node).
 
 EIP-130 crypto (`hw/misc/axera-eip130.c`) is a real, functional model,
 not a stub: it implements the guest driver's actual token protocol
@@ -83,6 +98,14 @@ eMMC/SD/SDIO (`emmc@1b40000`/`sd@104e0000`/`sdio@104d0000`, all
 `"axera,sdhc","cdns,sd4hc"`) use QEMU's own generic `cadence.sdhci`
 model -- a real, already-upstream device (not Axera-specific) that
 implements this exact compatible string's register set, not a stub.
+Real media is wired too: `axera_attach_sdhci()` plugs a real `sd-card`
+or `emmc` device onto each controller from `-drive if=sd,index=N`
+(index 0 is the eMMC, matching U-Boot's own `mmc@1B40000: 0` device
+numbering); `hw/sd/sd.c` itself needed a small shared-core fix
+(`sd_cmd_APP_CMD` now rejects `ACMD41` for `emmc` devices and the
+eMMC's own OCR advertises 1.8V, matching how real eMMC silicon ignores
+the SD-specific op-cond handshake instead of answering it) for U-Boot's
+and BL1's MMC probes to actually reach `sd_ready_state`.
 USB2 (`usb2@8000000`, `"snps,dwc3"`) uses QEMU's generic `usb_dwc3`
 model the same way; note that upstream's own model does not expose its
 internal XHCI IRQ as a sysbus output at all (confirmed against its only
@@ -139,15 +162,39 @@ qemu-system-arm -M ax620q -m 256M -kernel zImage -dtb ax620q.dtb \
     -nographic -append 'console=ttyS0,115200n8'
 ```
 
+`uboot-file=` boots the real, signed vendor U-Boot binary directly at
+its own `CONFIG_SYS_TEXT_BASE` (skipping BL1/SPL/ATF/OP-TEE's own
+PLL/DDR bring-up, which real silicon already did and QEMU's RAM is
+"trained" by construction either way), verified end-to-end on real
+binaries for all three machines that have real vendor U-Boot source
+available (AX620U has none in the vendor dump):
+
+```
+qemu-system-aarch64 -M ax630c,uboot-file=u-boot.bin -m 2G -nographic
+qemu-system-arm -M ax620q,uboot-file=u-boot.bin -nographic
+```
+
+Both reach the real interactive `AXERA-UBOOT=>` shell prompt: full
+console banner, DRAM detection, relocation, MMC/net device probing.
+Add `-drive if=sd,index=0,format=raw,file=emmc.img` for real eMMC
+media. `flash-file=` (BL1 included, the real boot-ROM-readable path) is
+further along but not yet complete -- see "What is not here yet"
+below.
+
 ## What is not here yet, and why
 
-- **No flash boot.** The vendor boot chain is BootROM → BL1/SPL → ATF
-  (BL31, AX630C/AX620E) or a simpler 32-bit boot (AX620Q/AX620U) →
-  U-Boot → kernel, not a single flash image the way the
-  HiSilicon/SigmaStar/Novatek families boot under TCG. Future work, once
-  there is a flash dump to validate against (the two firmware dumps used
-  for AX620E/AX620U so far are NAND rootfs/kernel partitions pulled from
-  a running system, not a boot-ROM-readable flash image).
+- **Flash boot (`flash-file=`, BL1 included) is in progress, not yet
+  complete.** The vendor boot chain is BootROM → BL1/SPL → ATF (BL31,
+  AX630C/AX620E) or a simpler 32-bit boot (AX620Q/AX620U) → U-Boot →
+  kernel. BL1 itself now gets past its own PLL bring-up
+  (`hw/misc/axera-pllc.c`) and its generic delay timer
+  (`hw/misc/axera-bl1-timer.c`), reaching real application code
+  (`flash_init()`/`emmc_init()`), but stalls retrying CMD6/SWITCH in its
+  own low-level `sdhci_cdns.c` driver -- a Cadence SDHCI
+  command-completion/busy-signalling gap distinct from the `hw/sd/sd.c`
+  fix that unblocked U-Boot's higher-level MMC core, not yet
+  root-caused. `uboot-file=` (above) is the complete, verified
+  alternative that skips BL1 entirely.
 - **No ISP, VENC/VDEC, or NPU device model.** The onekvm kernel fork has
   open drivers for VIN/CSI2 capture, the VC8000E encoder and a Hantro
   decoder path for AX630C; the camera-sensor ISP 3A pipeline and the NPU
@@ -158,10 +205,15 @@ qemu-system-arm -M ax620q -m 256M -kernel zImage -dtb ax620q.dtb \
   `sipeed/maix_ax620e_sdk` issue #2). Emulating their registers usefully
   would need that source or a register-level trace against real
   silicon.
-- **No SMP release method for AX620Q/AX620U.** Both use a vendor
-  spin-table (`secondary-boot-reg`), not PSCI; modelling it is a small,
-  self-contained follow-up (watch a fixed MMIO word for the entry address
-  CPU0 writes, then release the held CPU), not attempted yet.
+- **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both
+  use a vendor spin-table (`secondary-boot-reg`), not PSCI. AX620U
+  reuses QEMU's own generic `default_write_secondary()`
+  (`hw/arm/boot.c`, the same mechanism `realview.c`/`vexpress.c` use):
+  `secondary-boot-reg` at `0x02220300` is a real regbank watched for the
+  entry address, confirmed against the real AX620U vendor kernel +
+  devicetree -- `-smp 4` brings all 4 CPUs online cleanly. AX620Q's own
+  `secondary-boot-reg` address is not yet confirmed from any real
+  source, so it still only boots CPU0.
 - **No sensor models.** AX630C's real board shape is HDMI-capture
   (NanoKVM Pro); AX620E/AX620U's real deployed boards are Bayer-sensor IP
   cameras (confirmed sensors: Smartsens SC450AI on the AX620E dump,
