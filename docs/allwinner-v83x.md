@@ -132,6 +132,12 @@ ifconfig eth0 10.0.2.15 netmask 255.255.255.0   # the lease is not applied
 ping -c 3 10.0.2.2
 ```
 
+A bridged tap (`-nic tap,...`) works too. Before patch 0011 it did not:
+traffic from the host before `ifconfig eth0 up` (IPv6, mDNS, STP) was
+queued while the receiver was off, and the upstream EMAC model never
+flushed that queue on the register Linux enables reception with, so the
+camera's ARP requests went out and nothing ever came back in.
+
 The YI application itself only configures `wlan0`. With the video input
 modelled (below) the media process stays up; the YI supervisor
 (`watch_process`) would otherwise reboot the camera when it dies.
