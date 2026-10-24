@@ -73,7 +73,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 
 #define SPINOR_OP_RDSR          0x05
 #define SPINOR_OP_READID        0x90
+#define SPINOR_OP_RDID          0x9f
 #define SPINOR_OP_READ          0x03
+#define SPINOR_OP_READ_FAST     0x3b
 
 struct AxeraSpiNorState {
     SysBusDevice parent_obj;
@@ -143,6 +145,20 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
 
     switch (s->latched_opcode) {
     case SPINOR_OP_READ:
+    case SPINOR_OP_READ_FAST:
+        /*
+         * 0x3b's one extra dummy byte (opcode + 3-byte addr + 1 dummy,
+         * vs plain 0x03's opcode + 3-byte addr) never reaches cmd_buf
+         * -- the write handler below already stops storing once
+         * cmd_len hits sizeof(cmd_buf)==4, so latched_addr's own
+         * cmd_buf[1..3] extraction is unaffected either way. Real
+         * U-Boot's generic MTD spi-nor-core.c always probes with 0x3b
+         * once SPINOR_OP_RDID identifies a real flash (confirmed live:
+         * falling through to the all-zero default case here is what
+         * made every "sf read" -- used for environment, squashfs,
+         * every other large transfer once BL1 itself hands off --
+         * silently read back all zero despite reporting success).
+         */
         for (i = 0; i < total; i++) {
             uint32_t addr = s->latched_addr + i;
 
@@ -156,13 +172,21 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
         }
         break;
     case SPINOR_OP_READID:
+    case SPINOR_OP_RDID:
         /*
-         * Manufacturer/device ID a 0x90 query would return; BL1's own
-         * spinor_init() only logs this rather than gating boot on a
-         * specific match, so any plausible non-zero ID is sufficient
-         * (GD25Q128, a common real fit already used as this project's
-         * own default assumption elsewhere -- see hw/arm/anyka.c's
-         * ak_flash_jedec() fallback).
+         * Manufacturer/device ID either query would return; BL1's own
+         * spinor_init() uses the vendor-specific 0x90 and only logs
+         * this rather than gating boot on a specific match, but real
+         * U-Boot's generic MTD spi-nor-core.c always probes with the
+         * standard JEDEC 0x9f (SPINOR_OP_RDID) first and refuses to
+         * attach the flash at all without a non-zero answer (confirmed
+         * live: falling through to the all-zero default case here is
+         * exactly what printed "unrecognized JEDEC id bytes: 00, 00,
+         * 00" and left U-Boot with no flash to load its environment
+         * from). Any plausible non-zero ID is sufficient for either
+         * caller (GD25Q128, a common real fit already used as this
+         * project's own default assumption elsewhere -- see
+         * hw/arm/anyka.c's ak_flash_jedec() fallback).
          */
         for (i = 0; i < total; i++) {
             static const uint8_t id[] = { 0xc8, 0x40, 0x18 };

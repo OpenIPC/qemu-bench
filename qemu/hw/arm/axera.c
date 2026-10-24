@@ -534,6 +534,24 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                            0x280000, &error_fatal);
     memory_region_add_subregion(sysmem, 0x03000000ULL, npu_sram);
 
+    /*
+     * axera-iram0 @ 0x0, 0x1000: a separate small on-chip SRAM from
+     * axera-npu-sram above (confirmed: boot/bl1/common/include/boot.h's
+     * BOOT_MODE_INFO_ADDR/MISC_INFO_ADDR/DDR_INFO_ADDR -- 0x700/0x740/
+     * 0x800 -- are literal absolute addresses the real SoC's own
+     * memory map keeps apart from SYS_OCM_BASE's 0x3000000). BL1's
+     * setup_boot_mode() (spl_main.c) writes a boot_mode_info_t handoff
+     * struct here (magic 0x12345678 + mode/channel/storage/type
+     * fields) that U-Boot's own get_dl_and_boot_info() (arch/arm/
+     * mach-axera/ax620e/ax620e.c) reads back by the same fixed address
+     * -- the exact same "create_unimplemented_device silently discards
+     * the write" trap npu_sram above already had to avoid, confirmed
+     * live by boot_mode->magic reading back 0 instead of 0x12345678.
+     */
+    MemoryRegion *iram0 = g_new(MemoryRegion, 1);
+    memory_region_init_ram(iram0, NULL, "axera.iram0", 0x1000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x0ULL, iram0);
+
     create_unimplemented_device("axera-periph", AXERA_PERIPH_BASE,
                                  AXERA_PERIPH_SIZE);
     axera_map_regbanks();
