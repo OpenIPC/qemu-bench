@@ -65,6 +65,10 @@ in its private header), then a `sunxi-package` at `0x10000` with OP-TEE
 `0x5C000` whose partitions are counted from there (boot, rootfs, ...).
 
 1. The stub ROM copies boot0 to `0x20000` and enters it in secure SVC.
+   Like the mask ROM it tries the SD card first: an eGON.BT0 at sector 16
+   of `-drive if=sd` wins over the flash. It writes the medium into the
+   header's `boot_media` word (`0x28`: 0 SD card, 3 SPI NOR), which
+   mainline U-Boot's SPL reads; boot0 ignores it.
 2. boot0 sets the PLLs (`aw-ccu` reports LOCK), probes for a PMU on
    R_TWI (none), trains DRAM (`aw-dramc` finishes every PIR step at
    once), reads the package over SPI0 and enters OP-TEE.
