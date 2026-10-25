@@ -13,7 +13,10 @@
  * The driver feeds a request in 2 KiB DMA transfers and loads the IV only
  * with the first, so the chaining value carries over between transfers.
  * CFB and OFB run on whole blocks (CFB-128 / CFB-64), CTR counts the whole
- * block big-endian -- the kernel's cfb(aes), ofb(aes), ctr(aes).  Keys the
+ * block big-endian -- the kernel's cfb(aes), ofb(aes), ctr(aes).  AES is
+ * QEMU's own implementation, always built; DES and 3DES need a crypto
+ * backend (gnutls, nettle or gcrypt) and are logged as unimplemented
+ * without one.  Keys the
  * eFuse would load (its "transfer key" path) are not modelled: the blank
  * fuses give zeros.
  *
@@ -26,6 +29,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "crypto/aes.h"
 #include "crypto/cipher.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -75,35 +79,69 @@ static void fh_aes_update_irq(FhAesState *s)
     qemu_set_irq(s->irq, s->regs[R_INTR_MASKED] != 0);
 }
 
-static QCryptoCipher *fh_aes_cipher(FhAesState *s, size_t *bs)
+/* The block cipher a transfer runs: QEMU's AES, or a backend's DES. */
+typedef struct FhAesCipher {
+    size_t bs;
+    AES_KEY ek, dk;
+    QCryptoCipher *des;
+} FhAesCipher;
+
+static bool fh_aes_cipher(FhAesState *s, FhAesCipher *c)
 {
     uint8_t key[32];
     QCryptoCipherAlgo algo;
-    QCryptoCipher *c;
     Error *err = NULL;
+    unsigned bits = 0;
     size_t klen;
     int i;
 
-    switch ((s->regs[R_CONTROL] >> 1) & 7) {
-    case 0: algo = QCRYPTO_CIPHER_ALGO_DES;     klen = 8;  *bs = 8;  break;
-    case 1: algo = QCRYPTO_CIPHER_ALGO_3DES;    klen = 24; *bs = 8;  break;
-    case 4: algo = QCRYPTO_CIPHER_ALGO_AES_128; klen = 16; *bs = 16; break;
-    case 5: algo = QCRYPTO_CIPHER_ALGO_AES_192; klen = 24; *bs = 16; break;
-    case 6: algo = QCRYPTO_CIPHER_ALGO_AES_256; klen = 32; *bs = 16; break;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR, "fh-aes: bad cipher in 0x%08x\n",
-                      s->regs[R_CONTROL]);
-        return NULL;
-    }
     for (i = 0; i < 8; i++) {
         stl_be_p(key + 4 * i, s->regs[R_KEY0 + i]);
     }
-    c = qcrypto_cipher_new(algo, QCRYPTO_CIPHER_MODE_ECB, key, klen, &err);
-    if (!c) {
+    switch ((s->regs[R_CONTROL] >> 1) & 7) {
+    case 0: algo = QCRYPTO_CIPHER_ALGO_DES;  klen = 8;  break;
+    case 1: algo = QCRYPTO_CIPHER_ALGO_3DES; klen = 24; break;
+    case 4: bits = 128; break;
+    case 5: bits = 192; break;
+    case 6: bits = 256; break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "fh-aes: bad cipher in 0x%08x\n",
+                      s->regs[R_CONTROL]);
+        return false;
+    }
+    if (bits) {
+        c->bs = AES_BLOCK_SIZE;
+        AES_set_encrypt_key(key, bits, &c->ek);
+        AES_set_decrypt_key(key, bits, &c->dk);
+        return true;
+    }
+    c->bs = 8;
+    c->des = qcrypto_cipher_new(algo, QCRYPTO_CIPHER_MODE_ECB, key, klen,
+                                &err);
+    if (!c->des) {
         qemu_log_mask(LOG_UNIMP, "fh-aes: %s\n", error_get_pretty(err));
         error_free(err);
+        return false;
     }
-    return c;
+    return true;
+}
+
+static void fh_aes_enc(FhAesCipher *c, const uint8_t *in, uint8_t *out)
+{
+    if (c->des) {
+        qcrypto_cipher_encrypt(c->des, in, out, c->bs, NULL);
+    } else {
+        AES_encrypt(in, out, &c->ek);
+    }
+}
+
+static void fh_aes_dec(FhAesCipher *c, const uint8_t *in, uint8_t *out)
+{
+    if (c->des) {
+        qcrypto_cipher_decrypt(c->des, in, out, c->bs, NULL);
+    } else {
+        AES_decrypt(in, out, &c->dk);
+    }
 }
 
 static void fh_aes_ctr_inc(uint8_t *ctr, size_t bs)
@@ -113,9 +151,10 @@ static void fh_aes_ctr_inc(uint8_t *ctr, size_t bs)
 }
 
 /* One block through the selected mode; in and out may not alias. */
-static void fh_aes_block(FhAesState *s, QCryptoCipher *c, size_t bs,
+static void fh_aes_block(FhAesState *s, FhAesCipher *c,
                          const uint8_t *in, uint8_t *out)
 {
+    size_t bs = c->bs;
     bool dec = s->regs[R_CONTROL] & CTL_DECRYPT;
     uint8_t t[16];
     size_t i;
@@ -123,14 +162,14 @@ static void fh_aes_block(FhAesState *s, QCryptoCipher *c, size_t bs,
     switch ((s->regs[R_CONTROL] >> 4) & 7) {
     case MODE_ECB:
         if (dec) {
-            qcrypto_cipher_decrypt(c, in, out, bs, NULL);
+            fh_aes_dec(c, in, out);
         } else {
-            qcrypto_cipher_encrypt(c, in, out, bs, NULL);
+            fh_aes_enc(c, in, out);
         }
         break;
     case MODE_CBC:
         if (dec) {
-            qcrypto_cipher_decrypt(c, in, t, bs, NULL);
+            fh_aes_dec(c, in, t);
             for (i = 0; i < bs; i++) {
                 out[i] = t[i] ^ s->chain[i];
             }
@@ -139,26 +178,26 @@ static void fh_aes_block(FhAesState *s, QCryptoCipher *c, size_t bs,
             for (i = 0; i < bs; i++) {
                 t[i] = in[i] ^ s->chain[i];
             }
-            qcrypto_cipher_encrypt(c, t, out, bs, NULL);
+            fh_aes_enc(c, t, out);
             memcpy(s->chain, out, bs);
         }
         break;
     case MODE_CTR:
-        qcrypto_cipher_encrypt(c, s->chain, t, bs, NULL);
+        fh_aes_enc(c, s->chain, t);
         for (i = 0; i < bs; i++) {
             out[i] = in[i] ^ t[i];
         }
         fh_aes_ctr_inc(s->chain, bs);
         break;
     case MODE_CFB:
-        qcrypto_cipher_encrypt(c, s->chain, t, bs, NULL);
+        fh_aes_enc(c, s->chain, t);
         for (i = 0; i < bs; i++) {
             out[i] = in[i] ^ t[i];
         }
         memcpy(s->chain, dec ? in : out, bs);
         break;
     case MODE_OFB:
-        qcrypto_cipher_encrypt(c, s->chain, t, bs, NULL);
+        fh_aes_enc(c, s->chain, t);
         memcpy(s->chain, t, bs);
         for (i = 0; i < bs; i++) {
             out[i] = in[i] ^ t[i];
@@ -176,20 +215,21 @@ static void fh_aes_run(FhAesState *s)
 {
     uint32_t len = s->regs[R_DMA_SIZE];
     dma_addr_t src = s->regs[R_DMA_SRC], dst = s->regs[R_DMA_DST];
-    g_autoptr(QCryptoCipher) c = NULL;
+    FhAesCipher c = { 0 };
     uint8_t in[FH_AES_CHUNK], out[FH_AES_CHUNK];
-    size_t bs, n, off;
+    bool ok;
+    size_t n, off;
     int i;
 
-    c = fh_aes_cipher(s, &bs);
+    ok = fh_aes_cipher(s, &c);
     if (s->regs[R_CONTROL] & CTL_LOAD_IV) {
         for (i = 0; i < 4; i++) {
             stl_be_p(s->chain + 4 * i, s->regs[R_IV0 + i]);
         }
     }
-    if (c) {
+    if (ok) {
         /* A chunk at a time: the length is the guest's, unbounded. */
-        len -= len % bs;
+        len -= len % c.bs;
         while (len) {
             n = MIN(len, FH_AES_CHUNK);
             if (dma_memory_read(&address_space_memory, src, in, n,
@@ -198,8 +238,8 @@ static void fh_aes_run(FhAesState *s)
                               HWADDR_PRIx "\n", (hwaddr)src);
                 break;
             }
-            for (off = 0; off < n; off += bs) {
-                fh_aes_block(s, c, bs, in + off, out + off);
+            for (off = 0; off < n; off += c.bs) {
+                fh_aes_block(s, &c, in + off, out + off);
             }
             dma_memory_write(&address_space_memory, dst, out, n,
                              MEMTXATTRS_UNSPECIFIED);
@@ -207,6 +247,9 @@ static void fh_aes_run(FhAesState *s)
             dst += n;
             len -= n;
         }
+    }
+    if (c.des) {
+        qcrypto_cipher_free(c.des);
     }
     for (i = 0; i < 4; i++) {
         s->regs[R_LAST_IV0 + i] = ldl_be_p(s->chain + 4 * i);
