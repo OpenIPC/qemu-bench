@@ -106,6 +106,12 @@
 
 #define AW_BOOT0_LOAD       0x00020000  /* SRAM A1, boot0.lds */
 #define AW_BOOT0_MAX        0x00018000
+/* where the boot ROM looks for eGON.BT0 on an SD card: sector 16 */
+#define AW_SD_BOOT0_OFFSET  0x2000
+/* eGON header: the boot ROM writes where it loaded the image from */
+#define AW_EGON_BOOT_MEDIA  0x28
+#define AW_BOOT_MEDIA_MMC0  0
+#define AW_BOOT_MEDIA_SPI   3
 
 /*
  * Blocks with no model yet: plain storage, so read-modify-writes keep
@@ -528,19 +534,47 @@ static void aw_v83x_common_init(MachineState *machine, const AwSoCConfig *c)
     binfo.loader_start = AW_DRAM_BASE;
     arm_load_kernel(cpu, machine, &binfo);
 
-    if (!machine->kernel_filename && img) {
+    if (!machine->kernel_filename) {
         /* ldr pc, [pc, #-4]; .word boot0 */
         uint32_t stub[2] = { cpu_to_le32(0xE51FF004),
                              cpu_to_le32(AW_BOOT0_LOAD) };
+        DriveInfo *sd = drive_get(IF_SD, 0, 0);
+        g_autofree uint8_t *sdimg = NULL;
+        uint8_t *boot0 = NULL;
+        uint8_t media = AW_BOOT_MEDIA_SPI;
         uint32_t plen;
 
-        if (!aw_boot0_ok(img, img_len, &plen)) {
-            error_report("allwinner: %s has no eGON.BT0 header at 0",
-                         ams->flash_file);
-            exit(1);
+        /*
+         * The boot ROM tries the SD card (SMHC0) before the SPI NOR: an
+         * eGON.BT0 at sector 16 of the card wins.  Like the ROM, record
+         * the medium in the header's boot_media word, which mainline
+         * U-Boot's SPL reads to know where to load U-Boot from.
+         */
+        if (sd) {
+            sdimg = g_malloc(AW_BOOT0_MAX);
+            if (blk_pread(blk_by_legacy_dinfo(sd), AW_SD_BOOT0_OFFSET,
+                          AW_BOOT0_MAX, sdimg, 0) >= 0 &&
+                aw_boot0_ok(sdimg, AW_BOOT0_MAX, &plen)) {
+                boot0 = sdimg;
+                media = AW_BOOT_MEDIA_MMC0;
+            }
         }
-        rom_add_blob_fixed("aw.brom-stub", stub, sizeof(stub), AW_BROM_BASE);
-        rom_add_blob_fixed("aw.boot0", img, plen, AW_BOOT0_LOAD);
+        if (!boot0 && img) {
+            if (!aw_boot0_ok(img, img_len, &plen)) {
+                error_report("allwinner: %s has no eGON.BT0 header at 0",
+                             ams->flash_file);
+                exit(1);
+            }
+            boot0 = g_memdup2(img, plen);
+            g_free(sdimg);
+            sdimg = boot0;
+        }
+        if (boot0) {
+            boot0[AW_EGON_BOOT_MEDIA] = media;
+            rom_add_blob_fixed("aw.brom-stub", stub, sizeof(stub),
+                               AW_BROM_BASE);
+            rom_add_blob_fixed("aw.boot0", boot0, plen, AW_BOOT0_LOAD);
+        }
     }
 }
 
