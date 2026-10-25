@@ -275,6 +275,16 @@ what the firmware depends on are in
 
 ¹ Same die and models as `v831`; no image was at hand.
 
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `v3s` | Cortex-A7, 64 MB DDR2 in package | GIC-400 | — | U-Boot |
+| `v851s` | Cortex-A7, 64 MB DDR2 in package | GIC-400 | 4.9.191 OpenIPC (appended DT) | yes |
+
+The V3s and the V851s, in `hw/arm/allwinner-cam.c`: the V831's devices at
+the H3's and the D1's addresses. OpenIPC's mainline U-Boot boots on both
+from the NOR or the SD card, and on the V851s OpenIPC's kernel mounts its
+SquashFS root from the NOR. See [docs/allwinner-cam.md](docs/allwinner-cam.md).
+
 ### Novatek NT9856x family (`qemu-system-arm`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |

@@ -59,6 +59,7 @@ cp qemu/hw/misc/gk-remap.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/gk-dma.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/gk-idc.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/arm/allwinner-v83x.c     "$QEMU_DIR/hw/arm/"
+cp qemu/hw/arm/allwinner-cam.c      "$QEMU_DIR/hw/arm/"
 for f in $(cd qemu && find hw include -name 'aw-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
@@ -837,6 +838,13 @@ if ! grep -q "'allwinner-v83x.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_ALLWINNER_V83X', if_true: files('allwinner-v83x.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added allwinner-v83x.c"
+fi
+# Allwinner V3s and V851s (hw/arm/allwinner-cam.c): the V831's devices at
+# their addresses, so under the same ALLWINNER_V83X
+if ! grep -q "'allwinner-cam.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_ALLWINNER_V83X', if_true: files('allwinner-cam.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added allwinner-cam.c"
 fi
 
 # ── 4. Patch QEMU SD card model to accept 1.8V ─────────────────────────
