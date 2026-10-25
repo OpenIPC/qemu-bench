@@ -124,7 +124,6 @@ static const struct {
 } aw_regbanks[] = {
     { "aw-sramc",       AW_SRAMC_BASE,      0x1000 },
     { "aw-sid",         AW_SID_BASE,        0x1000 },
-    { "aw-dram-com",    AW_DRAM_COM_BASE,   0x1000 },
     { "aw-dram-phy",    AW_DRAM_PHY_BASE,   0x1000 },
     { "aw-rtc",         AW_RTC_BASE,        0x0400 },
     { "aw-prcm",        AW_PRCM_BASE,       0x0400 },
@@ -138,18 +137,28 @@ static const struct {
 typedef struct AwSoCConfig {
     const char *desc;
     uint64_t ram_size_default;
+    /* the DDR part's geometry (aw-dramcom) */
+    uint32_t dram_row_bits, dram_bank_bits, dram_page;
 } AwSoCConfig;
 
 /* V831: 64 MiB DDR2 in the package (the boot0 header's dram_type 2). */
 static const AwSoCConfig v831_soc = {
     .desc               = "Allwinner V831 (Cortex-A7, 64 MB DDR2)",
     .ram_size_default   = 64 * MiB,
+    /* 512 Mbit x16 DDR2: 8K rows, 4 banks, 1K columns */
+    .dram_row_bits      = 13,
+    .dram_bank_bits     = 2,
+    .dram_page          = 2048,
 };
 
 /* V833: 128 MiB DDR3 in the package. */
 static const AwSoCConfig v833_soc = {
     .desc               = "Allwinner V833 (Cortex-A7, 128 MB DDR3)",
     .ram_size_default   = 128 * MiB,
+    /* 1 Gbit x16 DDR3: 8K rows, 8 banks, 1K columns */
+    .dram_row_bits      = 13,
+    .dram_bank_bits     = 3,
+    .dram_page          = 2048,
 };
 
 #define TYPE_AW_MACHINE MACHINE_TYPE_NAME("allwinner-v83x")
@@ -528,6 +537,14 @@ static void aw_v83x_common_init(MachineState *machine, const AwSoCConfig *c)
 
     sysbus_create_simple("aw-ccu", AW_CCU_BASE, NULL);
     sysbus_create_simple("aw-dramc", AW_DRAM_CTL_BASE, NULL);
+    dev = qdev_new("aw-dramcom");
+    object_property_set_link(OBJECT(dev), "ram", OBJECT(machine->ram),
+                             &error_fatal);
+    qdev_prop_set_uint32(dev, "row-bits", c->dram_row_bits);
+    qdev_prop_set_uint32(dev, "bank-bits", c->dram_bank_bits);
+    qdev_prop_set_uint32(dev, "page", c->dram_page);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AW_DRAM_COM_BASE);
     create_unimplemented_device("aw-periph", 0x01000000, 0x09000000);
 
     binfo.ram_size = machine->ram_size;

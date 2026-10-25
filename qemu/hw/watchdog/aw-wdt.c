@@ -111,8 +111,15 @@ static void aw_wdt_write(void *opaque, hwaddr addr, uint64_t val,
         s->cfg = val & 3;
         break;
     case REG_MODE:
-        s->mode = val & 0xF1;
-        aw_wdt_restart(s);
+        /*
+         * Only enabling it or a new interval reloads the counter, as on
+         * silicon: the drivers' restart loops keep rewriting MODE (the
+         * sun8iw21 kernel's does) and would never see it expire
+         */
+        if ((val & 0xF1) != s->mode) {
+            s->mode = val & 0xF1;
+            aw_wdt_restart(s);
+        }
         break;
     }
     qemu_set_irq(s->irq, !!(s->irq_sta & s->irq_en));
