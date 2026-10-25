@@ -43,11 +43,21 @@ struct AwCcuState {
  * peripheral PLL running (N = 100, 1200 MHz VCO), which boot0 and
  * U-Boot take as the SPI clock source without programming it.
  */
-static const struct {
+typedef struct {
     hwaddr off;
     uint32_t val;
-} aw_ccu_reset[] = {
+} AwCcuPreset;
+
+static const AwCcuPreset aw_ccu_reset[] = {
     { 0x020, 0xA0006300 },      /* PLL_PERI0 */
+};
+
+/*
+ * gen 1, the sun6i layout: 0x020 is PLL_DDR there, PLL_PERIPH0 is at
+ * 0x028 (the H3/V3s manual's 600 MHz default, enabled by the ROM)
+ */
+static const AwCcuPreset aw_ccu_reset_sun6i[] = {
+    { 0x028, 0x80041811 },      /* PLL_PERIPH0 */
 };
 
 static uint64_t aw_ccu_read(void *opaque, hwaddr addr, unsigned size)
@@ -92,11 +102,15 @@ static const MemoryRegionOps aw_ccu_ops = {
 static void aw_ccu_reset_hold(Object *obj, ResetType type)
 {
     AwCcuState *s = AW_CCU(obj);
+    const AwCcuPreset *preset = s->gen == 1 ? aw_ccu_reset_sun6i
+                                            : aw_ccu_reset;
+    int count = s->gen == 1 ? ARRAY_SIZE(aw_ccu_reset_sun6i)
+                            : ARRAY_SIZE(aw_ccu_reset);
     int i;
 
     memset(s->regs, 0, sizeof(s->regs));
-    for (i = 0; i < ARRAY_SIZE(aw_ccu_reset); i++) {
-        s->regs[aw_ccu_reset[i].off >> 2] = aw_ccu_reset[i].val;
+    for (i = 0; i < count; i++) {
+        s->regs[preset[i].off >> 2] = preset[i].val;
     }
 }
 

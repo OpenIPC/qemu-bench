@@ -56,6 +56,11 @@ jobs:
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98566 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98533 '
           ./qemu-src/build/qemu-system-aarch64 -machine help | grep -E '^nt98332 '
+          # Allwinner (hw/arm/allwinner-v83x.c, allwinner-cam.c)
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^v831 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^v833 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^v3s '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^v851s '
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -131,6 +136,16 @@ jobs:
       # power-off-with-alarm reboot, and the device tree the machine builds.
       - name: Novatek NT9856x devices (nvt-top, nvt-cg, nvt-rtc, ...)
         run: python3 qemu/tests/test-novatek.py
+
+      # The V3s and V851s machines and the Allwinner models they share with
+      # the V831 one, driven over qtest the way OpenIPC's U-Boot and the
+      # vendor kernels drive them: the boot ROM's SD-before-NOR choice and
+      # boot_media, the CCU's lock and update bits, single-rank DRAM
+      # training, the DRAM window's aliasing by the programmed geometry, and
+      # a watchdog that MODE rewrites do not hold off. Boot tests need the
+      # images OpenIPC/u-boot's build-allwinner.yml smoke-tests.
+      - name: Allwinner V3s/V851s machines (aw-ccu, aw-dramcom, aw-wdt, ...)
+        run: python3 qemu/tests/test-allwinner-cam.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4

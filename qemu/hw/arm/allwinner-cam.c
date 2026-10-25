@@ -492,6 +492,11 @@ static void awc_common_init(MachineState *machine, const AwcSoC *c)
     if (!boot0) {
         return;
     }
+    if (plen > c->sram_size) {
+        error_report("allwinner: the eGON.BT0 image is %u bytes, over the "
+                     "%u bytes of SRAM it is loaded into", plen, c->sram_size);
+        exit(1);
+    }
     boot0[AWC_EGON_BOOT_MEDIA] = media;
     rom_add_blob_fixed("awc.boot0", boot0, plen, c->sram_base);
     if (c->brom_at_0) {
