@@ -1,0 +1,358 @@
+dwc2: synthesis parameters as properties, host descriptor DMA
+
+The Fullhan 3.0.8 kernels' fh_otg (a dwc_otg fork) validates each of its
+module parameters against GHWCFG2-4 and HPTXFSIZ and fails the probe with
+-EINVAL unless the core could do them: an HNP/SRP OTG core with a UTMI
+PHY, wider transfer and packet counters, a 512-word periodic Tx FIFO,
+dedicated Tx FIFOs -- and descriptor DMA, which it always uses.
+
+Make GHWCFG2/3/4 and HPTXFSIZ overridable through properties ("ghwcfg2",
+"ghwcfg3", "ghwcfg4", "hptxfsiz"; 0 keeps the current values), and
+implement host-mode scatter/gather DMA for non-isochronous channels when
+HCFG.DescDMA is set: HCDMA holds the list base and the current
+descriptor, HCTSIZ the descriptor count; each descriptor moves its
+n_bytes (SETUP when SUP is set), is written back with what is left and
+Active cleared, and the channel halts with XferCompl at EOL, at the last
+descriptor or on a short IN packet, with BNA on an inactive descriptor
+and with the descriptor's status set to PKTERR on STALL / babble /
+transaction errors.  NAKs are retried silently, as the core does, and an
+interrupt channel runs only in frames whose FrameList entry (HFLBADDR)
+has its bit set -- otherwise a hub's status endpoint is polled flat out.
+Isochronous lists, whose descriptors have another layout, are refused
+(LOG_UNIMP, the channel halts with XactErr) rather than misread.
+
+---
+diff --git a/hw/usb/hcd-dwc2.c b/hw/usb/hcd-dwc2.c
+index 8386450..ef1d1e2 100644
+--- a/hw/usb/hcd-dwc2.c
++++ b/hw/usb/hcd-dwc2.c
+@@ -200,6 +200,46 @@ static USBDevice *dwc2_find_device(DWC2State *s, uint8_t addr)
+     return NULL;
+ }
+ 
++/* host mode DMA descriptor status word */
++#define DDMA_NBYTES         0x1ffffu
++#define DDMA_SUP            BIT(24)
++#define DDMA_IOC            BIT(25)
++#define DDMA_EOL            BIT(26)
++#define DDMA_STS_MASK       (3u << 28)
++#define DDMA_STS_PKTERR     (1u << 28)
++#define DDMA_ACTIVE         BIT(31)
++#define TSIZ_NTD_MASK       (0xff << 8)
++#define TSIZ_NTD_SHIFT      8
++
++static inline uint32_t hcdma_ctd(uint32_t hcdma)
++{
++    return (hcdma >> 3) & 0xff;
++}
++
++/*
++ * A periodic channel runs once in each frame whose FrameList entry (at
++ * HFLBADDR, 8 to 64 of them per HCFG.FrListEn) has the channel's bit set:
++ * the driver's way of polling at the endpoint's interval.
++ */
++static bool dwc2_ddma_frame_due(DWC2State *s, DWC2Packet *p, uint32_t chan)
++{
++    uint32_t frame = s->frame_number, entry;
++    uint32_t n = 8 << get_field(s->hcfg, HCFG_FRLISTEN);
++
++    if (s->usb_frame_time == NANOSECONDS_PER_SECOND / 8000) {
++        frame >>= 3;                    /* high speed: microframes */
++    }
++    if (frame == p->ddma_frame) {
++        return false;
++    }
++    if (ldl_le_dma(&s->dma_as, s->hflbaddr + (frame & (n - 1)) * 4, &entry,
++                   MEMTXATTRS_UNSPECIFIED) || !(entry & BIT(chan))) {
++        return false;
++    }
++    p->ddma_frame = frame;
++    return true;
++}
++
+ static const char *pstatus[] = {
+     "USB_RET_SUCCESS", "USB_RET_NODEV", "USB_RET_NAK", "USB_RET_STALL",
+     "USB_RET_BABBLE", "USB_RET_IOERROR", "USB_RET_ASYNC",
+@@ -229,7 +269,9 @@ static void dwc2_handle_packet(DWC2State *s, uint32_t devadr, USBDevice *dev,
+     uint32_t hcdma = s->hreg1[index + 5];
+     uint32_t chan, epnum, epdir, eptype, mps, pid, pcnt, len, tlen, intr = 0;
+     uint32_t tpcnt, stsidx, actual = 0;
+-    bool do_intr = false, done = false;
++    uint32_t d0 = 0, d1 = 0;
++    dma_addr_t desc = 0;
++    bool do_intr = false, done = false, ddma;
+ 
+     epnum = get_field(hcchar, HCCHAR_EPNUM);
+     epdir = get_bit(hcchar, HCCHAR_EPDIR);
+@@ -238,15 +280,61 @@ static void dwc2_handle_packet(DWC2State *s, uint32_t devadr, USBDevice *dev,
+     pid = get_field(hctsiz, TSIZ_SC_MC_PID);
+     pcnt = get_field(hctsiz, TSIZ_PKTCNT);
+     len = get_field(hctsiz, TSIZ_XFERSIZE);
+-    if (len > DWC2_MAX_XFER_SIZE) {
++
++    chan = index >> 3;
++    p = &s->packet[chan];
++
++    ddma = s->hcfg & HCFG_DESCDMA;
++    if (ddma && eptype == USB_ENDPOINT_XFER_ISOC) {
++        /* isochronous descriptor lists have another layout: not modelled */
++        qemu_log_mask(LOG_UNIMP, "%s: isochronous descriptor DMA\n",
++                      __func__);
++        intr = HCINTMSK_XACTERR | HCINTMSK_CHHLTD;
++        goto ddma_halt;
++    }
++    if (ddma) {
++        /*
++         * Descriptor DMA: HCDMA holds the list base (31:11) and the current
++         * descriptor (CTD, 10:3), HCTSIZ the PID and the descriptor count
++         * (NTD, 15:8).  Each descriptor is a status word -- bytes (16:0),
++         * SUP (24), IOC (25), EOL (26), status (29:28), Active (31) -- and
++         * the buffer address.  Non-isochronous lists only.
++         */
++        desc = (hcdma & ~0x7ffu) + (((hcdma >> 3) & 0xff) << 3);
++        if (ldl_le_dma(&s->dma_as, desc, &d0, MEMTXATTRS_UNSPECIFIED) ||
++            ldl_le_dma(&s->dma_as, desc + 4, &d1, MEMTXATTRS_UNSPECIFIED)) {
++            intr = HCINTMSK_AHBERR | HCINTMSK_CHHLTD;
++            goto ddma_halt;
++        }
++        if (send && eptype == USB_ENDPOINT_XFER_INT &&
++            !dwc2_ddma_frame_due(s, p, chan)) {
++            pid = epdir ? USB_TOKEN_IN : USB_TOKEN_OUT;
++            goto ddma_more_noclean;
++        }
++        if (send && !p->ddma_active) {
++            if (!(d0 & DDMA_ACTIVE)) {
++                intr = HCINTMSK_BNA | HCINTMSK_CHHLTD;
++                goto ddma_halt;
++            }
++            p->ddma_active = true;
++            p->ddma_buf = d1;
++            p->ddma_rem = d0 & DDMA_NBYTES;
++        }
++        if (d0 & DDMA_SUP) {
++            pid = TSIZ_SC_MC_PID_SETUP;
++        }
++        hcdma = p->ddma_buf;
++        len = p->ddma_rem;
++        if (len > DWC2_MAX_XFER_SIZE) {
++            len = DWC2_MAX_XFER_SIZE;
++        }
++        pcnt = len ? DIV_ROUND_UP(len, mps ? mps : 1) : 1;
++    } else if (len > DWC2_MAX_XFER_SIZE) {
+         qemu_log_mask(LOG_GUEST_ERROR,
+                       "%s: HCTSIZ transfer size too large\n", __func__);
+         return;
+     }
+ 
+-    chan = index >> 3;
+-    p = &s->packet[chan];
+-
+     trace_usb_dwc2_handle_packet(chan, dev, &p->packet, epnum, types[eptype],
+                                  dirs[epdir], mps, len, pcnt);
+ 
+@@ -343,6 +431,21 @@ babble:
+             }
+         }
+ 
++        if (ddma) {
++            if (pid == USB_TOKEN_IN && actual < tlen) {
++                done = true;            /* short packet */
++            }
++            p->ddma_buf += actual;
++            p->ddma_rem -= actual < p->ddma_rem ? actual : p->ddma_rem;
++            if (p->ddma_rem == 0 || actual == 0) {
++                done = true;
++            }
++            if (done) {
++                goto ddma_next;
++            }
++            goto ddma_more;
++        }
++
+         pcnt -= tpcnt < pcnt ? tpcnt : pcnt;
+         set_field(&hctsiz, pcnt, TSIZ_PKTCNT);
+         len -= actual < len ? actual : len;
+@@ -354,6 +457,20 @@ babble:
+         if (!pcnt || len == 0 || actual == 0) {
+             done = true;
+         }
++    } else if (ddma) {
++        if (p->packet.status == USB_RET_NAK) {
++            /* the core retries NAKed tokens itself, silently */
++            goto ddma_more;
++        }
++        intr = pintr[stsidx] | HCINTMSK_CHHLTD;
++        if (intr & HCINTMSK_XACTERR) {
++            intr = (intr & ~HCINTMSK_XACTERR) | HCINTMSK_XCS_XACT;
++        }
++        d0 = (d0 & ~(DDMA_STS_MASK | DDMA_ACTIVE)) | DDMA_STS_PKTERR;
++        d0 = (d0 & ~DDMA_NBYTES) | p->ddma_rem;
++        stl_le_dma(&s->dma_as, desc, d0, MEMTXATTRS_UNSPECIFIED);
++        usb_packet_cleanup(&p->packet);
++        goto ddma_halt;
+     } else {
+         intr |= pintr[stsidx];
+         if (p->packet.status == USB_RET_NAK &&
+@@ -401,6 +518,51 @@ babble:
+     if (do_intr) {
+         dwc2_update_hc_irq(s, index);
+     }
++    return;
++
++ddma_next:
++    /* Retire the descriptor: write back what is left, clear Active */
++    usb_packet_cleanup(&p->packet);
++    p->ddma_active = false;
++    d0 = (d0 & ~(DDMA_NBYTES | DDMA_ACTIVE | DDMA_STS_MASK)) | p->ddma_rem;
++    stl_le_dma(&s->dma_as, desc, d0, MEMTXATTRS_UNSPECIFIED);
++    if (epdir && p->ddma_rem) {
++        /* a short IN packet ends the transfer */
++        intr = HCINTMSK_XFERCOMPL | HCINTMSK_CHHLTD;
++    } else if ((d0 & DDMA_EOL) ||
++               ((hcdma_ctd(s->hreg1[index + 5]) + 1) & 0xff) >
++               get_field(hctsiz, TSIZ_NTD)) {
++        intr = HCINTMSK_XFERCOMPL | HCINTMSK_CHHLTD;
++    } else {
++        /* on to the next descriptor */
++        s->hreg1[index + 5] = (s->hreg1[index + 5] & ~0x7f8u) |
++                              (((hcdma_ctd(s->hreg1[index + 5]) + 1) & 0xff)
++                               << 3);
++        if (d0 & DDMA_IOC) {
++            s->hreg1[index + 2] |= HCINTMSK_XFERCOMPL;
++            dwc2_update_hc_irq(s, index);
++        }
++        goto ddma_more_noclean;
++    }
++
++ddma_halt:
++    p->ddma_active = false;
++    s->hreg1[index] &= ~HCCHAR_CHENA;
++    s->hreg1[index + 2] |= intr & ~HCINTMSK_RESERVED14_31;
++    p->needs_service = false;
++    dwc2_update_hc_irq(s, index);
++    return;
++
++ddma_more:
++    usb_packet_cleanup(&p->packet);
++ddma_more_noclean:
++    p->devadr = devadr;
++    p->epnum = epnum;
++    p->epdir = epdir;
++    p->mps = mps;
++    p->pid = pid;
++    p->index = index;
++    p->needs_service = true;
+ }
+ 
+ /* Attach or detach a device on root hub */
+@@ -649,11 +811,13 @@ static void dwc2_enable_chan(DWC2State *s,  uint32_t index)
+      * size, we take that as a hint that this might be a network transfer,
+      * and do the transfer packet-by-packet.
+      */
+-    if (len > 1536) {
++    if (len > 1536 || (s->hcfg & HCFG_DESCDMA)) {
+         p->small = false;
+     } else {
+         p->small = true;
+     }
++    p->ddma_active = false;
++    p->ddma_frame = UINT32_MAX;
+ 
+     dwc2_handle_packet(s, devadr, dev, ep, index, true);
+     qemu_bh_schedule(s->async_bh);
+@@ -1042,6 +1206,10 @@ static void dwc2_hreg1_write(void *ptr, hwaddr addr, int index, uint64_t val,
+     *mmio = val;
+ 
+     if (disflg) {
++        if (s->hcfg & HCFG_DESCDMA) {
++            s->packet[index >> 3].ddma_active = false;
++            s->packet[index >> 3].needs_service = false;
++        }
+         /* set ChHltd in HCINT */
+         s->hreg1[(index & ~7) + 2] |= HCINTMSK_CHHLTD;
+         iflg = 1;
+@@ -1278,6 +1446,15 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
+                  (4 << GHWCFG3_PACKET_SIZE_CNTR_WIDTH_SHIFT) |
+                  (4 << GHWCFG3_XFER_SIZE_CNTR_WIDTH_SHIFT);
+     s->ghwcfg4 = 0;
++    if (s->cfg_ghwcfg2) {
++        s->ghwcfg2 = s->cfg_ghwcfg2;
++    }
++    if (s->cfg_ghwcfg3) {
++        s->ghwcfg3 = s->cfg_ghwcfg3;
++    }
++    if (s->cfg_ghwcfg4) {
++        s->ghwcfg4 = s->cfg_ghwcfg4;
++    }
+     s->glpmcfg = 0;
+     s->gpwrdn = GPWRDN_PWRDNRSTN;
+     s->gdfifocfg = 0;
+@@ -1286,7 +1463,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
+     s->gintmsk2 = 0;
+     s->gintsts2 = 0;
+ 
+-    s->hptxfsiz = 500 << FIFOSIZE_DEPTH_SHIFT;
++    s->hptxfsiz = s->cfg_hptxfsiz ? s->cfg_hptxfsiz
++                                  : 500 << FIFOSIZE_DEPTH_SHIFT;
+ 
+     s->hcfg = 2 << HCFG_RESVALID_SHIFT;
+     s->hfir = 60000;
+@@ -1394,7 +1572,7 @@ static void dwc2_init(Object *obj)
+ 
+ static const VMStateDescription vmstate_dwc2_state_packet = {
+     .name = "dwc2/packet",
+-    .version_id = 1,
++    .version_id = 2,
+     .minimum_version_id = 1,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32(devadr, DWC2Packet),
+@@ -1408,6 +1586,10 @@ static const VMStateDescription vmstate_dwc2_state_packet = {
+         VMSTATE_INT32(async, DWC2Packet),
+         VMSTATE_BOOL(small, DWC2Packet),
+         VMSTATE_BOOL(needs_service, DWC2Packet),
++        VMSTATE_BOOL_V(ddma_active, DWC2Packet, 2),
++        VMSTATE_UINT32_V(ddma_buf, DWC2Packet, 2),
++        VMSTATE_UINT32_V(ddma_rem, DWC2Packet, 2),
++        VMSTATE_UINT32_V(ddma_frame, DWC2Packet, 2),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+@@ -1450,6 +1632,11 @@ const VMStateDescription vmstate_dwc2_state = {
+ 
+ static const Property dwc2_usb_properties[] = {
+     DEFINE_PROP_UINT32("usb_version", DWC2State, usb_version, 2),
++    /* Synthesis parameters, for a guest that checks them (0: default) */
++    DEFINE_PROP_UINT32("ghwcfg2", DWC2State, cfg_ghwcfg2, 0),
++    DEFINE_PROP_UINT32("ghwcfg3", DWC2State, cfg_ghwcfg3, 0),
++    DEFINE_PROP_UINT32("ghwcfg4", DWC2State, cfg_ghwcfg4, 0),
++    DEFINE_PROP_UINT32("hptxfsiz", DWC2State, cfg_hptxfsiz, 0),
+ };
+ 
+ static void dwc2_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/usb/hcd-dwc2.h b/hw/usb/hcd-dwc2.h
+index 2d5a569..9eb634c 100644
+--- a/hw/usb/hcd-dwc2.h
++++ b/hw/usb/hcd-dwc2.h
+@@ -55,6 +55,11 @@ struct DWC2Packet {
+     int32_t async;
+     bool small;
+     bool needs_service;
++    /* descriptor DMA: the descriptor being worked on */
++    bool ddma_active;
++    uint32_t ddma_buf;
++    uint32_t ddma_rem;
++    uint32_t ddma_frame;        /* last frame a periodic channel ran in */
+ };
+ 
+ struct DWC2State {
+@@ -163,6 +168,10 @@ struct DWC2State {
+     int64_t usb_frame_time;
+     int64_t usb_bit_time;
+     uint32_t usb_version;
++    uint32_t cfg_ghwcfg2;
++    uint32_t cfg_ghwcfg3;
++    uint32_t cfg_ghwcfg4;
++    uint32_t cfg_hptxfsiz;
+     uint16_t frame_number;
+     uint16_t fi;
+     uint16_t next_chan;

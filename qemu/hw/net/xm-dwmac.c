@@ -94,7 +94,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmDwmacState, XM_DWMAC)
 #define RDES0_FS        (1u << 9)
 #define RDES0_FL_SHIFT  16
 
-#define PHY_ADDR        1
 #define FRAME_MAX       1536
 /* FRAME_FLT bits, as xmmac's dwmac100.h names them (MAC_CONTROL_*) */
 #define FLT_PR          (1u << 0)       /* promiscuous */
@@ -121,6 +120,8 @@ struct XmDwmacState {
 
     uint16_t phy_bmcr;
     uint32_t regs_size;
+    uint32_t phy_id;
+    uint32_t phy_addr;
     bool rx_fcs;
 
     uint8_t frame[FRAME_MAX];
@@ -160,9 +161,9 @@ static uint16_t xm_dwmac_phy_read(XmDwmacState *s, int reg)
     case 1:  /* BMSR: 100/10 FD/HD, AN capable and complete, link up */
         return 0x7809 | 0x0020 | 0x0004;
     case 2:  /* PHYID1 */
-        return 0x0007;
+        return s->phy_id >> 16;
     case 3:  /* PHYID2 */
-        return 0xc0f1;
+        return s->phy_id & 0xffff;
     case 4:  /* ANAR */
         return 0x01e1;
     case 5:  /* ANLPAR: partner does the same, acknowledged */
@@ -181,13 +182,13 @@ static void xm_dwmac_mii(XmDwmacState *s, uint32_t val)
 
     s->mii_addr = val & ~MII_BUSY;   /* every transfer is done at once */
     if (val & MII_WRITE) {
-        if (phy == PHY_ADDR && reg == 0) {
+        if (phy == s->phy_addr && reg == 0) {
             /* Reset and restart-autoneg self-clear. */
             s->phy_bmcr = s->mii_data & ~(0x8000 | 0x0200);
         }
         return;
     }
-    s->mii_data = phy == PHY_ADDR ? xm_dwmac_phy_read(s, reg) : 0xffff;
+    s->mii_data = phy == s->phy_addr ? xm_dwmac_phy_read(s, reg) : 0xffff;
 }
 
 static void xm_dwmac_read_desc(hwaddr addr, XmDesc *d)
@@ -628,6 +629,12 @@ static const Property xm_dwmac_props[] = {
      * has only the MAC and DMA pages before its VIC2. */
     DEFINE_PROP_UINT32("regs-size", XmDwmacState, regs_size, REGS_SIZE),
     DEFINE_PROP_BOOL("rx-fcs", XmDwmacState, rx_fcs, false),
+    /* What the PHY's ID registers read: an SMSC LAN8710 by default;
+     * Fullhan's driver only takes the parts on its list (IP101G...). */
+    DEFINE_PROP_UINT32("phy-id", XmDwmacState, phy_id, 0x0007c0f1),
+    /* Its MDIO address: 1 on the Xiongmai boards; Fullhan's driver
+     * attaches to address 0 whatever it found. */
+    DEFINE_PROP_UINT32("phy-addr", XmDwmacState, phy_addr, 1),
 };
 
 static void xm_dwmac_class_init(ObjectClass *klass, const void *data)
