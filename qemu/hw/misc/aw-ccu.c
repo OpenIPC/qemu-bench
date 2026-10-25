@@ -8,6 +8,9 @@
  *   - the MBUS (0x540) and DRAM (0x800) clock registers: the update bit
  *     (bit 27) clears itself once the new divider is taken.
  *
+ * With gen=1, the older sun6i layout's (A31..H3, V3s) update bits clear
+ * themselves instead: DRAM_CFG (0x0F4) bit 16 and PLL_DDR (0x020) bit 20.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -15,6 +18,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "hw/qdev-properties.h"
 #include "qemu/module.h"
 #include "qom/object.h"
 
@@ -31,6 +35,7 @@ struct AwCcuState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     uint32_t regs[AW_CCU_SIZE / 4];
+    uint8_t gen;                /* 0: ncat (H6 layout), 1: sun6i */
 };
 
 /*
@@ -64,7 +69,13 @@ static void aw_ccu_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr < AW_CCU_PLL_END) {
         val &= ~AW_CCU_PLL_LOCK;
     }
-    if (addr == 0x540 || addr == 0x800) {
+    if (s->gen == 1) {
+        if (addr == 0x0f4) {
+            val &= ~(1u << 16);
+        } else if (addr == 0x020) {
+            val &= ~(1u << 20);
+        }
+    } else if (addr == 0x540 || addr == 0x800) {
         val &= ~AW_CCU_UPD;
     }
     s->regs[addr >> 2] = val;
@@ -98,8 +109,13 @@ static void aw_ccu_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
 }
 
+static const Property aw_ccu_properties[] = {
+    DEFINE_PROP_UINT8("gen", AwCcuState, gen, 0),
+};
+
 static void aw_ccu_class_init(ObjectClass *klass, const void *data)
 {
+    device_class_set_props(DEVICE_CLASS(klass), aw_ccu_properties);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = aw_ccu_reset_hold;
