@@ -19,6 +19,7 @@ vendor drivers (docs/fullhan.md):
     handshake 4;
   - fh-axi-dmac: the kernel's channel count probe, a memory-to-memory list;
   - fh-i2c: an absent target aborts with 7B_ADDR_NOACK, then STOP_DET;
+  - every machine: its chip / package IDs, then a migration round trip;
   - fh-aes: FIPS-197 / SP 800-38A vectors through the DMA engine (ECB,
     CBC chained across two transfers, CTR, CFB, OFB, DES), its interrupt;
   - fh-sadc: a v3 conversion's done bit and interrupt;
@@ -673,9 +674,39 @@ def hmp(qemu, args, cmds):
     return p.stdout + p.stderr
 
 
+# Every machine, with its PMU chip ID and the package register that tells
+# the die's siblings apart.
+MACHINES = (
+    ('fh8852v200', 0x19112201, 0x33C, 0x00000001),
+    ('fh8856v200', 0x19112201, 0x33C, 0x00100001),
+    ('fh8858v200', 0x19112201, 0x33C, 0x00410001),
+    ('fh8652', 0x20031601, 0x33C, 0xC),
+    ('fh8656', 0x20031601, 0x33C, 0x8),
+    ('fh8658', 0x20031601, 0x33C, 0x4),
+    ('fh8852v100', 0x17092901, 0x004, 0xC),
+    ('fh8856v100', 0x17092901, 0x004, 0xD),
+    ('fh8626v100', 0x18112301, None, None),
+    ('fh8632', 0x46488302, 0x054, 0x37),
+)
+
+
+def test_all_machines(qemu):
+    print('every machine comes up')
+    for m, chip, preg, pval in MACHINES:
+        qt = QTest(qemu, m)
+        try:
+            check('%s: chip ID' % m, qt.readl(PMU), chip)
+            if preg is not None:
+                check('%s: package register 0x%03x' % (m, preg),
+                      qt.readl(PMU + preg) & 0xFFFFFF, pval)
+            check('%s: NOR boot strap' % m, qt.readl(PMU + 0x330), 2)
+        finally:
+            qt.close()
+
+
 def test_migration(qemu, tmp):
     print('migration')
-    for m in ('fh8856v200', 'fh8652', 'fh8852v100', 'fh8626v100', 'fh8632'):
+    for m, _, _, _ in MACHINES:
         mig = os.path.join(tmp, m + '.mig')
         out = hmp(qemu, ['-M', m, '-S'],
                   ['migrate file:' + mig, 'info migrate'])
@@ -723,6 +754,7 @@ def main():
     test_fh8652(args.qemu)
     test_fh8626(args.qemu, path)
     test_fh8632(args.qemu)
+    test_all_machines(args.qemu)
     test_migration(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)

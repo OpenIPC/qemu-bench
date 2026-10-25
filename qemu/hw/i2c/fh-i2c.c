@@ -119,6 +119,7 @@ struct FhI2cState {
     uint32_t abrt_source;
     uint32_t enable;
     uint8_t xfer;
+    uint8_t xfer_addr;          /* the target of the transfer in progress */
 };
 
 static uint32_t fh_i2c_raw(FhI2cState *s)
@@ -168,12 +169,20 @@ static void fh_i2c_data_cmd(FhI2cState *s, uint32_t cmd)
         return;
     }
     if (s->xfer != want || (cmd & CMD_RESTART)) {
+        /*
+         * A repeated start: QEMU's bus keeps the addressed target across
+         * it, so one to another address must let go of the first.
+         */
+        if (s->xfer != XFER_IDLE && s->xfer_addr != addr) {
+            i2c_end_transfer(s->bus);
+        }
         s->raw |= INTR_START_DET | INTR_ACTIVITY;
         if (i2c_start_transfer(s->bus, addr, rd)) {
             fh_i2c_abort(s, ABRT_7B_ADDR_NOACK);
             return;
         }
         s->xfer = want;
+        s->xfer_addr = addr;
     }
     if (rd) {
         uint8_t b = i2c_recv(s->bus);
@@ -343,7 +352,7 @@ static void fh_i2c_init(Object *obj)
 
 static const VMStateDescription vmstate_fh_i2c = {
     .name = TYPE_FH_I2C,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, FhI2cState, FH_I2C_SIZE / 4),
@@ -351,6 +360,7 @@ static const VMStateDescription vmstate_fh_i2c = {
         VMSTATE_UINT32(abrt_source, FhI2cState),
         VMSTATE_UINT32(enable, FhI2cState),
         VMSTATE_UINT8(xfer, FhI2cState),
+        VMSTATE_UINT8_V(xfer_addr, FhI2cState, 2),
         VMSTATE_FIFO8(rx, FhI2cState),
         VMSTATE_END_OF_LIST()
     }

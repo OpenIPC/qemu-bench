@@ -18,10 +18,12 @@ and with the descriptor's status set to PKTERR on STALL / babble /
 transaction errors.  NAKs are retried silently, as the core does, and an
 interrupt channel runs only in frames whose FrameList entry (HFLBADDR)
 has its bit set -- otherwise a hub's status endpoint is polled flat out.
+Isochronous lists, whose descriptors have another layout, are refused
+(LOG_UNIMP, the channel halts with XactErr) rather than misread.
 
 ---
 diff --git a/hw/usb/hcd-dwc2.c b/hw/usb/hcd-dwc2.c
-index 8386450..70ca5dc 100644
+index 8386450..ef1d1e2 100644
 --- a/hw/usb/hcd-dwc2.c
 +++ b/hw/usb/hcd-dwc2.c
 @@ -200,6 +200,46 @@ static USBDevice *dwc2_find_device(DWC2State *s, uint8_t addr)
@@ -82,7 +84,7 @@ index 8386450..70ca5dc 100644
  
      epnum = get_field(hcchar, HCCHAR_EPNUM);
      epdir = get_bit(hcchar, HCCHAR_EPDIR);
-@@ -238,15 +280,54 @@ static void dwc2_handle_packet(DWC2State *s, uint32_t devadr, USBDevice *dev,
+@@ -238,15 +280,61 @@ static void dwc2_handle_packet(DWC2State *s, uint32_t devadr, USBDevice *dev,
      pid = get_field(hctsiz, TSIZ_SC_MC_PID);
      pcnt = get_field(hctsiz, TSIZ_PKTCNT);
      len = get_field(hctsiz, TSIZ_XFERSIZE);
@@ -92,6 +94,13 @@ index 8386450..70ca5dc 100644
 +    p = &s->packet[chan];
 +
 +    ddma = s->hcfg & HCFG_DESCDMA;
++    if (ddma && eptype == USB_ENDPOINT_XFER_ISOC) {
++        /* isochronous descriptor lists have another layout: not modelled */
++        qemu_log_mask(LOG_UNIMP, "%s: isochronous descriptor DMA\n",
++                      __func__);
++        intr = HCINTMSK_XACTERR | HCINTMSK_CHHLTD;
++        goto ddma_halt;
++    }
 +    if (ddma) {
 +        /*
 +         * Descriptor DMA: HCDMA holds the list base (31:11) and the current
@@ -141,7 +150,7 @@ index 8386450..70ca5dc 100644
      trace_usb_dwc2_handle_packet(chan, dev, &p->packet, epnum, types[eptype],
                                   dirs[epdir], mps, len, pcnt);
  
-@@ -343,6 +424,21 @@ babble:
+@@ -343,6 +431,21 @@ babble:
              }
          }
  
@@ -163,7 +172,7 @@ index 8386450..70ca5dc 100644
          pcnt -= tpcnt < pcnt ? tpcnt : pcnt;
          set_field(&hctsiz, pcnt, TSIZ_PKTCNT);
          len -= actual < len ? actual : len;
-@@ -354,6 +450,20 @@ babble:
+@@ -354,6 +457,20 @@ babble:
          if (!pcnt || len == 0 || actual == 0) {
              done = true;
          }
@@ -184,7 +193,7 @@ index 8386450..70ca5dc 100644
      } else {
          intr |= pintr[stsidx];
          if (p->packet.status == USB_RET_NAK &&
-@@ -401,6 +511,51 @@ babble:
+@@ -401,6 +518,51 @@ babble:
      if (do_intr) {
          dwc2_update_hc_irq(s, index);
      }
@@ -236,7 +245,7 @@ index 8386450..70ca5dc 100644
  }
  
  /* Attach or detach a device on root hub */
-@@ -649,11 +804,13 @@ static void dwc2_enable_chan(DWC2State *s,  uint32_t index)
+@@ -649,11 +811,13 @@ static void dwc2_enable_chan(DWC2State *s,  uint32_t index)
       * size, we take that as a hint that this might be a network transfer,
       * and do the transfer packet-by-packet.
       */
@@ -251,7 +260,7 @@ index 8386450..70ca5dc 100644
  
      dwc2_handle_packet(s, devadr, dev, ep, index, true);
      qemu_bh_schedule(s->async_bh);
-@@ -1042,6 +1199,10 @@ static void dwc2_hreg1_write(void *ptr, hwaddr addr, int index, uint64_t val,
+@@ -1042,6 +1206,10 @@ static void dwc2_hreg1_write(void *ptr, hwaddr addr, int index, uint64_t val,
      *mmio = val;
  
      if (disflg) {
@@ -262,7 +271,7 @@ index 8386450..70ca5dc 100644
          /* set ChHltd in HCINT */
          s->hreg1[(index & ~7) + 2] |= HCINTMSK_CHHLTD;
          iflg = 1;
-@@ -1278,6 +1439,15 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
+@@ -1278,6 +1446,15 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
                   (4 << GHWCFG3_PACKET_SIZE_CNTR_WIDTH_SHIFT) |
                   (4 << GHWCFG3_XFER_SIZE_CNTR_WIDTH_SHIFT);
      s->ghwcfg4 = 0;
@@ -278,7 +287,7 @@ index 8386450..70ca5dc 100644
      s->glpmcfg = 0;
      s->gpwrdn = GPWRDN_PWRDNRSTN;
      s->gdfifocfg = 0;
-@@ -1286,7 +1456,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
+@@ -1286,7 +1463,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
      s->gintmsk2 = 0;
      s->gintsts2 = 0;
  
@@ -288,7 +297,7 @@ index 8386450..70ca5dc 100644
  
      s->hcfg = 2 << HCFG_RESVALID_SHIFT;
      s->hfir = 60000;
-@@ -1394,7 +1565,7 @@ static void dwc2_init(Object *obj)
+@@ -1394,7 +1572,7 @@ static void dwc2_init(Object *obj)
  
  static const VMStateDescription vmstate_dwc2_state_packet = {
      .name = "dwc2/packet",
@@ -297,7 +306,7 @@ index 8386450..70ca5dc 100644
      .minimum_version_id = 1,
      .fields = (const VMStateField[]) {
          VMSTATE_UINT32(devadr, DWC2Packet),
-@@ -1408,6 +1579,10 @@ static const VMStateDescription vmstate_dwc2_state_packet = {
+@@ -1408,6 +1586,10 @@ static const VMStateDescription vmstate_dwc2_state_packet = {
          VMSTATE_INT32(async, DWC2Packet),
          VMSTATE_BOOL(small, DWC2Packet),
          VMSTATE_BOOL(needs_service, DWC2Packet),
@@ -308,7 +317,7 @@ index 8386450..70ca5dc 100644
          VMSTATE_END_OF_LIST()
      },
  };
-@@ -1450,6 +1625,11 @@ const VMStateDescription vmstate_dwc2_state = {
+@@ -1450,6 +1632,11 @@ const VMStateDescription vmstate_dwc2_state = {
  
  static const Property dwc2_usb_properties[] = {
      DEFINE_PROP_UINT32("usb_version", DWC2State, usb_version, 2),

@@ -55,6 +55,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -126,6 +127,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(FhSpiState, FH_SPI)
 #define CCFGR_SWAP          (1u << 12)
 #define CCFGR_32BIT         (1u << 16)
 
+/* about a 64-deep TX FIFO of bytes at a few MHz */
+#define FH_SPI_TX_DRAIN_NS  10000
+
 struct FhSpiState {
     SysBusDevice parent_obj;
 
@@ -159,6 +163,8 @@ struct FhSpiState {
     uint32_t rx_head;
     uint32_t rx_count;
     uint32_t rx_pending;        /* RX-only frames still to clock in */
+    bool eeprom_cmd;            /* EEPROM mode: still in the command phase */
+    QEMUTimer *eeprom_timer;    /* ... until the TX FIFO would have drained */
     bool cs_level;              /* the GPIO select, low = selected */
     uint32_t cmd_pos;           /* bytes since the select went low */
     uint8_t cmd;                /* their first: the flash command */
@@ -272,6 +278,24 @@ static void fh_spi_flush(FhSpiState *s)
     s->rx_head = 0;
     s->rx_count = 0;
     s->rx_pending = 0;
+    s->eeprom_cmd = false;
+    timer_del(s->eeprom_timer);
+}
+
+/* The command phase of an EEPROM read is over: clock the response in. */
+static void fh_spi_eeprom_rx(FhSpiState *s)
+{
+    if (s->eeprom_cmd) {
+        s->eeprom_cmd = false;
+        timer_del(s->eeprom_timer);
+        fh_spi_rx_fill(s);
+        fh_spi_update(s);
+    }
+}
+
+static void fh_spi_eeprom_timer(void *opaque)
+{
+    fh_spi_eeprom_rx(opaque);
 }
 
 static void fh_spi_dr_write(FhSpiState *s, uint32_t val)
@@ -294,13 +318,15 @@ static void fh_spi_dr_write(FhSpiState *s, uint32_t val)
         return;
     case TMOD_EEPROM:
         /*
-         * Command bytes out, then CTRLR1 + 1 frames in once the TX FIFO
-         * runs dry -- which, frames moving at once, is after every write;
-         * a further write of the same command phase restarts the count.
+         * Command frames out, then CTRLR1 + 1 frames in once the TX FIFO
+         * runs dry: when the guest next reads a register, or a moment after
+         * its last command frame -- not between the frames of a command.
          */
         fh_spi_xfer_frame(s, val);
         s->rx_pending = s->ctrlr1 + 1;
-        fh_spi_rx_fill(s);
+        s->eeprom_cmd = true;
+        timer_mod(s->eeprom_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  FH_SPI_TX_DRAIN_NS);
         return;
     default:
         rx = fh_spi_xfer_frame(s, val);
@@ -400,7 +426,10 @@ static uint64_t fh_spi_read(void *opaque, hwaddr off, unsigned size)
 {
     bool dr = (off >= R_DR && off <= R_DR_END + 3) ||
               (off >= FH_SPI_WINDOW && off < 2 * FH_SPI_WINDOW);
-    uint32_t v = fh_spi_read_reg(opaque, dr ? R_DR : off & ~3);
+    uint32_t v;
+
+    fh_spi_eeprom_rx(opaque);
+    v = fh_spi_read_reg(opaque, dr ? R_DR : off & ~3);
 
     /* A DMA source walking the window by its item size reads frames. */
     return extract32(v, dr ? 0 : (off & 3) * 8, size * 8);
@@ -416,6 +445,9 @@ static void fh_spi_write(void *opaque, hwaddr off, uint64_t val,
         fh_spi_dr_write(s, val);
         fh_spi_update(s);
         return;
+    }
+    if (off < R_DR || off > R_DR_END) {
+        fh_spi_eeprom_rx(s);
     }
     switch (off) {
     case R_CTRLR0:
@@ -561,6 +593,7 @@ static void fh_spi_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_out_named(dev, &s->dma_rx_req, "dma-rx-req", 1);
     qdev_init_gpio_out_named(dev, &s->dma_tx_req, "dma-tx-req", 1);
     qdev_init_gpio_in_named(dev, fh_spi_cs_gpio, "cs-gpio", 1);
+    s->eeprom_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, fh_spi_eeprom_timer, s);
     s->cs_level = true;
 }
 
@@ -571,7 +604,7 @@ static const Property fh_spi_props[] = {
 
 static const VMStateDescription vmstate_fh_spi = {
     .name = TYPE_FH_SPI,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrlr0, FhSpiState),
@@ -596,6 +629,8 @@ static const VMStateDescription vmstate_fh_spi = {
         VMSTATE_UINT32(rx_head, FhSpiState),
         VMSTATE_UINT32(rx_count, FhSpiState),
         VMSTATE_UINT32(rx_pending, FhSpiState),
+        VMSTATE_BOOL_V(eeprom_cmd, FhSpiState, 2),
+        VMSTATE_TIMER_PTR_V(eeprom_timer, FhSpiState, 2),
         VMSTATE_BOOL(cs_level, FhSpiState),
         VMSTATE_UINT32(cmd_pos, FhSpiState),
         VMSTATE_UINT8(cmd, FhSpiState),

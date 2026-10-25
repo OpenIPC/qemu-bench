@@ -39,6 +39,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(FhAesState, FH_AES)
 
 #define FH_AES_SIZE         0x4000
 #define FH_AES_NREGS        (0x90 / 4)
+#define FH_AES_CHUNK        4096    /* bytes moved per step; a block multiple */
 
 #define R_CONTROL           (0x00 / 4)
 #define R_KEY0              (0x10 / 4)
@@ -176,8 +177,8 @@ static void fh_aes_run(FhAesState *s)
     uint32_t len = s->regs[R_DMA_SIZE];
     dma_addr_t src = s->regs[R_DMA_SRC], dst = s->regs[R_DMA_DST];
     g_autoptr(QCryptoCipher) c = NULL;
-    g_autofree uint8_t *in = NULL, *out = NULL;
-    size_t bs, off;
+    uint8_t in[FH_AES_CHUNK], out[FH_AES_CHUNK];
+    size_t bs, n, off;
     int i;
 
     c = fh_aes_cipher(s, &bs);
@@ -186,17 +187,26 @@ static void fh_aes_run(FhAesState *s)
             stl_be_p(s->chain + 4 * i, s->regs[R_IV0 + i]);
         }
     }
-    if (c && len) {
+    if (c) {
+        /* A chunk at a time: the length is the guest's, unbounded. */
         len -= len % bs;
-        in = g_malloc(len);
-        out = g_malloc(len);
-        dma_memory_read(&address_space_memory, src, in, len,
-                        MEMTXATTRS_UNSPECIFIED);
-        for (off = 0; off < len; off += bs) {
-            fh_aes_block(s, c, bs, in + off, out + off);
+        while (len) {
+            n = MIN(len, FH_AES_CHUNK);
+            if (dma_memory_read(&address_space_memory, src, in, n,
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                qemu_log_mask(LOG_GUEST_ERROR, "fh-aes: bad source 0x%"
+                              HWADDR_PRIx "\n", (hwaddr)src);
+                break;
+            }
+            for (off = 0; off < n; off += bs) {
+                fh_aes_block(s, c, bs, in + off, out + off);
+            }
+            dma_memory_write(&address_space_memory, dst, out, n,
+                             MEMTXATTRS_UNSPECIFIED);
+            src += n;
+            dst += n;
+            len -= n;
         }
-        dma_memory_write(&address_space_memory, dst, out, len,
-                         MEMTXATTRS_UNSPECIFIED);
     }
     for (i = 0; i < 4; i++) {
         s->regs[R_LAST_IV0 + i] = ldl_be_p(s->chain + 4 * i);

@@ -80,6 +80,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(FhAhbDmacState, FH_AHB_DMAC)
 #define IRQ_KINDS           5   /* XFER, BLOCK, SRC_TRAN, DST_TRAN, ERR */
 #define K_XFER              0
 #define K_BLOCK             1
+#define K_ERR               4
 
 #define CTL_INT_EN          (1u << 0)
 #define CTL_LLP_D_EN        (1u << 27)
@@ -178,26 +179,33 @@ static void fh_ahb_step(uint32_t *addr, unsigned inc, unsigned w)
     }
 }
 
-static void fh_ahb_item(FhAhbDmacState *s, FhAhbChan *c)
+/* Move one source item; false on a bus error at either end. */
+static bool fh_ahb_item(FhAhbDmacState *s, FhAhbChan *c)
 {
     unsigned sw = MIN(1u << ((c->ctl_lo >> 4) & 7), 8);
     unsigned dw = MIN(1u << ((c->ctl_lo >> 1) & 7), 8);
     unsigned sinc = (c->ctl_lo >> 9) & 3, dinc = (c->ctl_lo >> 7) & 3;
     uint8_t buf[8] = { 0 };
+    MemTxResult r;
     unsigned off;
 
-    dma_memory_read(s->as, c->sar, buf, sw, MEMTXATTRS_UNSPECIFIED);
+    if (dma_memory_read(s->as, c->sar, buf, sw,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        return false;
+    }
     fh_ahb_step(&c->sar, sinc, sw);
     if (dinc == 0 || dinc == 1) {
         /* Memory: the bytes as they came. */
-        dma_memory_write(s->as, c->dar, buf, sw, MEMTXATTRS_UNSPECIFIED);
+        r = dma_memory_write(s->as, c->dar, buf, sw, MEMTXATTRS_UNSPECIFIED);
         fh_ahb_step(&c->dar, dinc, sw);
-        return;
+        return r == MEMTX_OK;
     }
+    r = MEMTX_OK;
     for (off = 0; off < sw; off += dw) {
-        dma_memory_write(s->as, c->dar, buf + off, MIN(dw, sw - off),
-                         MEMTXATTRS_UNSPECIFIED);
+        r |= dma_memory_write(s->as, c->dar, buf + off, MIN(dw, sw - off),
+                              MEMTXATTRS_UNSPECIFIED);
     }
+    return r == MEMTX_OK;
 }
 
 /* The block ended: report it, then chain on or finish. */
@@ -228,6 +236,7 @@ static void fh_ahb_run(FhAhbDmacState *s, int n)
     unsigned budget = 1 << 20;
 
     while (c->en && c->active && budget) {
+        budget--;               /* a chain of empty blocks spends it too */
         if (c->done >= (c->ctl_hi & 0xFFF)) {
             fh_ahb_block_done(s, c, n);
             continue;
@@ -235,9 +244,15 @@ static void fh_ahb_run(FhAhbDmacState *s, int n)
         if (!fh_ahb_req_ok(s, c)) {
             return;
         }
-        fh_ahb_item(s, c);
+        if (!fh_ahb_item(s, c)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "fh-ahb-dmac: ch%d bus error at "
+                          "0x%08x -> 0x%08x\n", n, c->sar, c->dar);
+            s->raw[K_ERR] |= 1u << n;
+            c->en = false;
+            c->active = false;
+            break;
+        }
         c->done++;
-        budget--;
     }
     if (!budget) {
         qemu_bh_schedule(s->bh);

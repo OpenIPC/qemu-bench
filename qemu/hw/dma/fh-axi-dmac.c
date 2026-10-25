@@ -90,6 +90,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(FhAxiDmacState, FH_AXI_DMAC)
 
 #define IRQ_BLOCK_TFR       (1u << 0)
 #define IRQ_DMA_TFR         (1u << 1)
+#define IRQ_SRC_DEC_ERR     (1u << 5)
+#define IRQ_DST_DEC_ERR     (1u << 6)
 #define IRQ_SUSPENDED       (1u << 29)
 #define IRQ_DISABLED        (1u << 30)
 
@@ -199,37 +201,44 @@ static bool fh_dmac_req_ok(FhAxiDmacState *s, FhAxiDmacChan *c)
     }
 }
 
-/* Move one source item to the destination. */
-static void fh_dmac_item(FhAxiDmacState *s, FhAxiDmacChan *c)
+/* Move one source item to the destination: the error to report, or 0. */
+static uint32_t fh_dmac_item(FhAxiDmacState *s, FhAxiDmacChan *c)
 {
     unsigned sw = 1u << ((c->ctl_lo >> 8) & 7);
     unsigned dw = 1u << ((c->ctl_lo >> 11) & 7);
     uint8_t buf[8] = { 0 };
+    MemTxResult r = MEMTX_OK;
     unsigned off;
 
     sw = MIN(sw, 8);
     dw = MIN(dw, 8);
-    dma_memory_read(s->as, c->sar, buf, sw, MEMTXATTRS_UNSPECIFIED);
+    if (dma_memory_read(s->as, c->sar, buf, sw,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        return IRQ_SRC_DEC_ERR;
+    }
     if (!(c->ctl_lo & CTL_SRC_FIX)) {
         c->sar += sw;
     }
     if (!(c->ctl_lo & CTL_DST_FIX)) {
-        dma_memory_write(s->as, c->dar, buf, sw, MEMTXATTRS_UNSPECIFIED);
+        r = dma_memory_write(s->as, c->dar, buf, sw, MEMTXATTRS_UNSPECIFIED);
         c->dar += sw;
-        return;
+    } else {
+        /* A peripheral register takes the bytes in its own access width. */
+        for (off = 0; off < sw; off += dw) {
+            r |= dma_memory_write(s->as, c->dar, buf + off,
+                                  MIN(dw, sw - off), MEMTXATTRS_UNSPECIFIED);
+        }
     }
-    /* A peripheral register takes the bytes in its own access width. */
-    for (off = 0; off < sw; off += dw) {
-        dma_memory_write(s->as, c->dar, buf + off, MIN(dw, sw - off),
-                         MEMTXATTRS_UNSPECIFIED);
-    }
+    return r == MEMTX_OK ? 0 : IRQ_DST_DEC_ERR;
 }
 
 static void fh_dmac_run(FhAxiDmacState *s, FhAxiDmacChan *c)
 {
     unsigned budget = 1 << 20;  /* items, before yielding to the guest */
+    uint32_t err;
 
     while (c->en && c->active && !c->susp && budget) {
+        budget--;               /* a chain of empty blocks spends it too */
         if (c->done > c->block_ts) {
             if (c->ctl_hi & CTLH_IOC_BLKTFR) {
                 fh_dmac_event(c, IRQ_BLOCK_TFR);
@@ -243,9 +252,15 @@ static void fh_dmac_run(FhAxiDmacState *s, FhAxiDmacChan *c)
         if (!fh_dmac_req_ok(s, c)) {
             return;
         }
-        fh_dmac_item(s, c);
+        err = fh_dmac_item(s, c);
+        if (err) {
+            qemu_log_mask(LOG_GUEST_ERROR, "fh-axi-dmac: bus error at "
+                          "0x%08x -> 0x%08x\n", c->sar, c->dar);
+            fh_dmac_event(c, err);
+            fh_dmac_stop(c);
+            break;
+        }
         c->done++;
-        budget--;
     }
     if (!budget) {
         qemu_bh_schedule(s->bh);
