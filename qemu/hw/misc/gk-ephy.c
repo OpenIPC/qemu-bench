@@ -40,14 +40,19 @@ static uint64_t gk_ephy_read(void *opaque, hwaddr offset, unsigned size)
     const unsigned n = offset / 4;
 
     switch (offset < MII_REGS * 4 ? n : MII_REGS) {
-    case 1:     /* BMSR: 100/10 FD/HD, AN able and complete, link up */
-        return 0x7809 | 0x0020 | 0x0004;
-    case 2:     /* PHYID1 / PHYID2: Goke's OUI-less ID, non-zero for phylib */
-        return 0x0007;
+    /*
+     * As a GK7101 reads with a 100 Mb/s full-duplex link up: BMSR has
+     * autoneg complete but never the link bit, and both ID registers read
+     * 0. The vendor kernel driver takes autoneg complete for link up; a
+     * driver that needs the ID or the link bit has to cope with this.
+     */
+    case 1:     /* BMSR: 100/10 FD/HD, preamble suppression, AN complete */
+        return 0x78E9;
+    case 2:     /* PHYID1 / PHYID2 */
     case 3:
-        return 0xC0F1;
-    case 5:     /* ANLPAR: the partner advertises the same */
-        return 0x45E1;
+        return 0;
+    case 5:     /* ANLPAR, as a switch advertised it to that GK7101 */
+        return 0xCDE1;
     default:
         return s->regs[n];
     }
