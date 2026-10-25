@@ -63,6 +63,10 @@ cp qemu/hw/arm/allwinner-cam.c      "$QEMU_DIR/hw/arm/"
 for f in $(cd qemu && find hw include -name 'aw-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
+cp qemu/hw/arm/fullhan.c            "$QEMU_DIR/hw/arm/"
+for f in $(cd qemu && find hw include -name 'fh-*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
 cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
@@ -174,6 +178,7 @@ cp qemu/hw/i2c/hisi-sp2305.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-mis2006.c      "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-nvp6124b.c     "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-smartsens.c    "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/galaxycore.c        "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-v1.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-dw.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/ssi/hisi-spi.c          "$QEMU_DIR/hw/ssi/"
@@ -845,6 +850,59 @@ if ! grep -q "'allwinner-cam.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_ALLWINNER_V83X', if_true: files('allwinner-cam.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added allwinner-cam.c"
+fi
+
+# Fullhan (hw/arm/fullhan.c): ARM1176 / Cortex-A7 camera SoCs with
+# DesignWare peripherals.  Its own devices are the hw/*/fh-*.c files, each
+# built under FULLHAN.
+if ! grep -q "^config FULLHAN$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config FULLHAN
+    bool
+    default y
+    depends on TCG && ARM
+    select PTIMER
+    select SERIAL_MM
+    select UNIMP
+    select SSI
+    select SSI_M25P80
+    select SD
+    select HISI_MISC
+    select I2C
+    select XM_DWMAC
+    select A15MPCORE
+    select USB_DWC2
+    select HISI_I2C
+KCONFIG
+    echo "  hw/arm/Kconfig: added FULLHAN"
+else
+    for sym in SD HISI_MISC I2C XM_DWMAC A15MPCORE USB_DWC2 HISI_I2C; do
+        if ! sed -n '/^config FULLHAN$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config FULLHAN\$/,/^\$/{/select SSI_M25P80\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: FULLHAN now selects $sym"
+        fi
+    done
+fi
+for f in $(cd qemu && find hw -name 'fh-*.c' 2>/dev/null); do
+    d=$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_FULLHAN', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: added $b"
+    fi
+done
+if ! grep -q "'galaxycore.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_FULLHAN', if_true: files('galaxycore.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added galaxycore.c"
+fi
+if ! grep -q "'fullhan.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_FULLHAN', if_true: files('fullhan.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added fullhan.c"
 fi
 
 # ── 4. Patch QEMU SD card model to accept 1.8V ─────────────────────────

@@ -14,15 +14,17 @@ desk. Vendor families covered:
 - **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375)
 - **Novatek** NT9856x, NT98533 and NT98332
 - **Allwinner** V831 / V833
+- **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
+  FH8626V100, FH8632
 
 The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (71 total)
+## Supported Machines (81 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -285,6 +287,37 @@ the H3's and the D1's addresses. OpenIPC's mainline U-Boot boots on both
 from the NOR or the SD card, and on the V851s OpenIPC's kernel mounts its
 SquashFS root from the NOR. See [docs/allwinner-cam.md](docs/allwinner-cam.md).
 
+### Fullhan family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `fh8852v200` | ARM1176JZF-S, 64 MB in package | DW ICTL | 4.9.129 vendor, OpenIPC | yes |
+| `fh8856v200` | ARM1176JZF-S, 128 MB in package | DW ICTL | 4.9.129 vendor | yes |
+| `fh8858v200` | ARM1176JZF-S, 128 MB in package | DW ICTL | — | —¹ |
+| `fh8652` | Cortex-A7, 64 MB in package | GIC-400 | 4.9.129 vendor | yes |
+| `fh8656` / `fh8658` | Cortex-A7, 128 MB in package | GIC-400 | — | —¹ |
+| `fh8852v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
+| `fh8856v100` | ARM1176JZF-S, 128 MB in package | DW ICTL | — | —¹ |
+| `fh8626v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor | yes |
+| `fh8632` | ARM1176JZF-S, 64 MB | DW ICTL | 3.0.8 vendor (SDK) | yes |
+
+Fullhan's camera SoCs, in `hw/arm/fullhan.c`: one memory map across five
+generations of mostly DesignWare blocks (ICTL, APB timers, UARTs, SSI with
+Fullhan's SPIC additions, AXI or AHB DMAC, I2C, GPIO, MMC, GMAC, DWC2 USB,
+watchdog) around Fullhan's PMU, RTC, AES engine and SADC, with an image sensor's ID on I2C0
+(`sensor=`, GalaxyCore / MIS2006 / JX-F37) for the vendor apps and ipcinfo. A camera's SPI NOR dump boots the way the
+mask ROM does -- U-Boot, FH8632's SPL, or past FH865x's DDR-sizing
+ramboot -- through the vendor U-Boot, which reads the flash by DMA, to the
+vendor kernel and application: `-M fh8856v200,flash-file=dump.bin -nic user`.
+Flash writes go back to the file. OpenIPC's `fh8852v200` and `fh8852v100`
+releases boot on the vendor U-Boot (`qemu-boot/fh-openipc-flash.sh`) or
+with `-kernel` (`qemu-boot/test-fullhan-boot.sh`) to a login prompt with a
+DHCP lease. The media pipeline (the ARC coprocessor, ISP, encoders) and
+audio (the ARC's) are not modelled. Map, boot chain and devices are in
+[docs/fullhan.md](docs/fullhan.md).
+
+¹ Same die and models as a tested sibling; no image was at hand.
+
 ### Novatek NT9856x family (`qemu-system-arm`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |
@@ -499,6 +532,20 @@ qemu/
 ├── hw/i2c/gk-idc.c              # Ambarella IDC I2C master
 ├── hw/misc/gk-remap.c           # GK710xS register layouts over the GK710x models
 ├── hw/misc/gk-dma.c             # GK710xS DMA controller (descriptor chains)
+├── hw/arm/fullhan.c             # Fullhan machines, synthetic mask ROM
+├── hw/misc/fh-pmu.c             # Fullhan PMU: chip IDs, resets, PLLs -> timer clock
+├── hw/intc/fh-intc.c            # DW APB ICTL interrupt controller
+├── hw/timer/fh-timer.c          # DW APB timers (clocked by the PMU)
+├── hw/timer/fh-pts.c            # FH8632 PTS counter (its clocksource)
+├── hw/char/fh-uart.c            # DW APB UART: 16550 + USR
+├── hw/gpio/fh-gpio.c            # DW APB GPIO (the flash's chip select)
+├── hw/ssi/fh-spi.c              # DW SSI + Fullhan SPIC (swap, data window)
+├── hw/dma/fh-axi-dmac.c         # DW AXI DMAC (FH885xV200 / FH865x)
+├── hw/dma/fh-ahb-dmac.c         # DW AHB DMAC (older dies)
+├── hw/i2c/fh-i2c.c              # DW I2C master
+├── hw/rtc/fh-rtc.c              # Fullhan RTC, command-based and v1 layouts
+├── hw/watchdog/fh-wdt.c         # DW watchdog
+├── hw/misc/fh-efuse.c           # eFuse controller
 ├── hw/arm/anyka.c               # Anyka AK39xx machines, synthetic mask ROM
 ├── hw/misc/ak-sysctrl.c         # AK39 SYSCTRL: chip ID, IRQ controller, timers, WDT, RTC
 ├── hw/misc/ak-l2.c              # L2 buffer SRAM + DMA (UART / SPI data path)
@@ -579,6 +626,9 @@ qemu-boot/
 ├── run-nt98332.sh               # Novatek NT98332: NVR NOR image, GUI, mouse, SATA
 ├── run-xm530-camera.sh          # XM530 + OpenIPC as a camera on the NT98332's QEMU LAN
 ├── uboot-env.py                 # Write a U-Boot env (defaults + settings) into a flash image
+├── run-fullhan.sh               # Fullhan: boot a NOR image (dump or OpenIPC) on any fh* machine
+├── fh-openipc-flash.sh          # Fullhan: OpenIPC release onto a dump's vendor U-Boot
+├── test-fullhan-boot.sh         # Fullhan OpenIPC kernel: login, DHCP, JFFS2 written back
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
 ├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM/crypto, for the tests below
@@ -613,6 +663,7 @@ docs/
 ├── xiongmai.md                  # XM510/XM530/XM550 memory map, with kernel sources
 ├── goke-gk710x.md               # GK7101/GK7102: the HAL, real memory map, boot
 ├── anyka.md                     # AK39xx: L2 buffer, mask ROM, boot NOR
+├── fullhan.md                   # Fullhan: generations, mask ROM, SPIC, DMACs
 ├── sigmastar.md                 # SigmaStar/MStar infinity2m: RIU banks, boot chain
 ├── novatek.md                   # NT9856x, NT98533, NT98332: DT, loader stand-in, media
 ├── ive-registers.md             # IVE register map (from live EV300 capture)

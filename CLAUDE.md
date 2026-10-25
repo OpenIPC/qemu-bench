@@ -230,6 +230,31 @@ aw-ve.dump=DIR` saves the streams for checking with a decoder. `aw-g2d`
 runs the 2D engine's register queue (scale + convert, for the app's
 motion detection). `aw-audio` captures silence so the AAC encoder and recorder run.
 
+Fullhan (`hw/arm/fullhan.c`, `docs/fullhan.md`) is one memory map of
+DesignWare blocks across five generations (FH885xV200, FH865x, FH885x V100,
+FH8626V100, FH8632), its own devices the `hw/*/fh-*.c` files under
+FULLHAN. The mask ROM stand-in loads the boot header's type-0x10 image (or
+U-Boot past FH865x's DDR-sizing ramboot). The U-Boots key their
+environment on PMU 0x330 (2 = NOR), else "bad CRC, using default
+environment". The 4.9 kernel's irq handler runs find_first_bit() on the
+ICTL's FINALSTATUS, which loads bytes: any MMIO a driver reads with byte
+loads must extract the byte itself -- with `.impl.min_access_size = 4`
+QEMU hands the handler the unaligned offset. Flash reads go through the
+SPIC in 16-bit byte-swapped frames, by DMA from a data window whose
+address the DMA walks, so window reads return the frame unshifted; QEMU's
+m25p80 counts fast-read dummies in cycles, so `fh-spi` clocks the drivers'
+one dummy byte as 8. The flash select is a GPIO, not SER. The timers'
+rate comes from the PMU's divider as a Clock (U-Boot 1 MHz, V100 / FH865x
+kernels 50 MHz, FH8626V100 10 MHz -- PLL1 with no /10, unlike FH8632).
+Patches 0012 (CCSIDR of a missing cache) and 0013 (m25p80 clears WEL) are
+for its U-Boot and 3.0.8 kernels; 0014 (dwc2 GHWCFG properties + host
+descriptor DMA) for those kernels' `fh_otg`, which refuses the probe unless
+GHWCFG2-4 allow its parameters and always uses DescDMA -- interrupt
+channels must follow the FrameList or a hub's status endpoint storms.
+OpenIPC has no Fullhan bootloader: `qemu-boot/fh-openipc-flash.sh` puts a
+release on a dump's vendor U-Boot; CI boots it with `-kernel`
+(`test-fullhan-boot.sh`).
+
 SigmaStar/MStar infinity2m (`hw/arm/sigmastar.c`, `docs/sigmastar.md`) is a
 fourth: Cortex-A7 parts whose blocks sit in 16-bit RIU register banks at
 `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
