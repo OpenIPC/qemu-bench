@@ -51,4 +51,17 @@ size_t nvt_pixel_jpeg_scan(uint8_t *out, size_t room,
                            uint32_t mcu_w, uint32_t mcu_h,
                            const uint8_t qy[64], const uint8_t qc[64]);
 
+/*
+ * The same with the chroma planes apart -- Cb and Cr samples c_step bytes
+ * apart along a row, rows c_stride apart (NV12: cr = cb + 1, step 2) --
+ * and, with restart non-zero, an RSTn marker every restart MCUs.
+ */
+size_t nvt_pixel_jpeg_scan_rst(uint8_t *out, size_t room,
+                               const uint8_t *y, uint32_t y_stride,
+                               const uint8_t *cb, const uint8_t *cr,
+                               uint32_t c_stride, uint32_t c_step,
+                               uint32_t mcu_w, uint32_t mcu_h,
+                               const uint8_t qy[64], const uint8_t qc[64],
+                               uint32_t restart);
+
 #endif

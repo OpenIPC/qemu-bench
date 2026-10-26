@@ -33,4 +33,37 @@ size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
                       const uint8_t *y, int ys, const uint8_t *uv, int cs,
                       uint8_t *out, size_t cap);
 
+/*
+ * Slice data only, for engines whose drivers write the headers: the
+ * macroblock layer of an mbw x mbh slice with its trailing bits, as RBSP.
+ * The CABAC ones return bytes (to follow cabac_alignment_one_bits); the
+ * CAVLC ones start bit_offset bits into out's first byte, where the
+ * stream is, and return the bits out holds, those unused ones included.  I slices code I_16x16 DC macroblocks from NV12, P
+ * slices skip every macroblock.
+ */
+size_t h264_slice_i16dc_cabac(int qp, int chroma_qp_offset, int mbw, int mbh,
+                              const uint8_t *y, int ys, const uint8_t *uv,
+                              int cs, uint8_t *out, size_t cap);
+size_t h264_slice_pskip_cabac(int qp, int cabac_init_idc, int nmb,
+                              uint8_t *out, size_t cap);
+size_t h264_slice_i16dc_cavlc(int qp, int chroma_qp_offset, int mbw, int mbh,
+                              const uint8_t *y, int ys, const uint8_t *uv,
+                              int cs, int bit_offset, uint8_t *out, size_t cap);
+size_t h264_slice_pskip_cavlc(int nmb, int bit_offset, uint8_t *out,
+                              size_t cap);
+
+/*
+ * P slices that follow the source: macroblocks that differ from ref (the
+ * decoder's picture for these rows, NV12 at stride mbw * 16, updated) as
+ * I_PCM, the rest skipped.  Return bits (CAVLC) or bytes (CABAC), as above.
+ */
+size_t h264_slice_ppcm_cavlc(int mbw, int mbh, const uint8_t *y, int ys,
+                             const uint8_t *uv, int cs, uint8_t *ry,
+                             uint8_t *ruv, int bit_offset, uint8_t *out,
+                             size_t cap);
+size_t h264_slice_ppcm_cabac(int qp, int cabac_init_idc, int mbw, int mbh,
+                             const uint8_t *y, int ys, const uint8_t *uv,
+                             int cs, uint8_t *ry, uint8_t *ruv, uint8_t *out,
+                             size_t cap);
+
 #endif

@@ -20,6 +20,12 @@
  * eFuse would load (its "transfer key" path) are not modelled: the blank
  * fuses give zeros.
  *
+ * The Grain Media SoCs carry the same FTAES020 (0x92700000 on the GM813x,
+ * its control encoding identical); there the DMA addresses advance past
+ * each transfer and the first-block flag is spent by it ("advance"): the
+ * vendor security.c sets the addresses, control and IV once per request
+ * and then only writes the size and starts each chunk.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -32,6 +38,7 @@
 #include "crypto/aes.h"
 #include "crypto/cipher.h"
 #include "hw/irq.h"
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "system/dma.h"
@@ -71,6 +78,7 @@ struct FhAesState {
     qemu_irq irq;
     uint32_t regs[FH_AES_NREGS];
     uint8_t chain[16];          /* IV / counter / feedback */
+    bool advance;               /* DMA addresses move on past the transfer */
 };
 
 static void fh_aes_update_irq(FhAesState *s)
@@ -254,6 +262,11 @@ static void fh_aes_run(FhAesState *s)
     for (i = 0; i < 4; i++) {
         s->regs[R_LAST_IV0 + i] = ldl_be_p(s->chain + 4 * i);
     }
+    if (s->advance) {
+        s->regs[R_DMA_SRC] = src;
+        s->regs[R_DMA_DST] = dst;
+        s->regs[R_CONTROL] &= ~CTL_LOAD_IV;
+    }
     s->regs[R_DMA_CONTROL] = 0;
     s->regs[R_INTR_SRC] |= INTR_DONE;
     fh_aes_update_irq(s);
@@ -344,10 +357,15 @@ static const VMStateDescription vmstate_fh_aes = {
     },
 };
 
+static const Property fh_aes_props[] = {
+    DEFINE_PROP_BOOL("advance", FhAesState, advance, false),
+};
+
 static void fh_aes_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, fh_aes_props);
     device_class_set_legacy_reset(dc, fh_aes_reset);
     dc->vmsd = &vmstate_fh_aes;
 }

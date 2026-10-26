@@ -67,6 +67,10 @@ cp qemu/hw/arm/fullhan.c            "$QEMU_DIR/hw/arm/"
 for f in $(cd qemu && find hw include -name 'fh-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
+cp qemu/hw/arm/grainmedia.c         "$QEMU_DIR/hw/arm/"
+for f in $(cd qemu && find hw include -name 'gm-*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
 cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
@@ -903,6 +907,67 @@ if ! grep -q "'fullhan.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_FULLHAN', if_true: files('fullhan.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added fullhan.c"
+fi
+
+# Grain Media (hw/arm/grainmedia.c): FA626TE camera SoCs with Faraday
+# peripherals.  Its own devices are the hw/*/gm-*.c files, each built
+# under GRAINMEDIA; the Ethernet is QEMU's FTGMAC100.
+if ! grep -q "^config GRAINMEDIA$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config GRAINMEDIA
+    bool
+    default y
+    depends on TCG && ARM
+    select PTIMER
+    select SERIAL_MM
+    select UNIMP
+    select SSI
+    select SSI_M25P80
+    select FTGMAC100
+    select SDHCI
+    select SD
+    select I2C
+    select USB_EHCI_SYSBUS
+KCONFIG
+    echo "  hw/arm/Kconfig: added GRAINMEDIA"
+else
+    for sym in SDHCI SD I2C USB_EHCI_SYSBUS; do
+        if ! sed -n '/^config GRAINMEDIA$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config GRAINMEDIA\$/,/^\$/{/select FTGMAC100\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: GRAINMEDIA now selects $sym"
+        fi
+    done
+fi
+for f in $(cd qemu && find hw -name 'gm-*.c' 2>/dev/null); do
+    d=$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: added $b"
+    fi
+done
+if ! grep -q "CONFIG_GRAINMEDIA', if_true: files('galaxycore.c')" \
+        "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('galaxycore.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added galaxycore.c for GRAINMEDIA"
+fi
+# shared models: the H.264 slice coder, the FTAES020, the JPEG scan coder
+for b in hantro-h264.c fh-aes.c nvt-pixel.c; do
+    if ! grep -q "CONFIG_GRAINMEDIA', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for GRAINMEDIA"
+    fi
+done
+if ! grep -q "'grainmedia.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('grainmedia.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added grainmedia.c"
 fi
 
 # ── 4. Patch QEMU SD card model to accept 1.8V ─────────────────────────

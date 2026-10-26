@@ -66,6 +66,10 @@ jobs:
                    fh8852v100 fh8856v100 fh8626v100 fh8632; do
             ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
           done
+          # Grain Media (hw/arm/grainmedia.c)
+          for m in gm8135s gm8136 gm8136s; do
+            ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
+          done
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -161,6 +165,20 @@ jobs:
       # vendor firmware; the OpenIPC releases boot in boot-fullhan.
       - name: Fullhan devices (fh-spi, fh-axi-dmac, fh-ahb-dmac, fh-rtc, ...)
         run: python3 qemu/tests/test-fullhan.py
+
+      # The Grain Media models driven over qtest the way nsboot, the vendor
+      # U-Boot and the 3.3 kernel drive them: the mask ROM's nsboot
+      # staging, the PMU's chip ID and frequency change interrupt, the
+      # FTINTC030's CPU targets, FTTMR010 at PCLK, FTSPI020 reads by PIO
+      # and by the FTDMAC020 on request line 8, I2C to the sensor, the
+      # watchdog, the FOTG210 and SDHCI; then the video pipeline: the
+      # MCP280 H.264 encoder fed headers through its FIFO in CAVLC and
+      # CABAC (ffmpeg decodes both, macroblock means match the source),
+      # VCAP300 link lists on the sync timer, 3DNR and scaler jobs.
+      # Booting the camera dumps needs vendor firmware; the OpenIPC
+      # releases boot in boot-grainmedia.
+      - name: Grain Media devices (gm-spi020, gm-dmac, gm-intc, gm-timer, ...)
+        run: python3 qemu/tests/test-grainmedia.py
 
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
@@ -1269,6 +1287,39 @@ jobs:
       - name: Boot to login, DHCP over the GMAC, JFFS2 on the NOR
         timeout-minutes: 5
         run: bash qemu-boot/test-fullhan-boot.sh --soc ${{ matrix.soc }}
+
+  boot-grainmedia:
+    name: Boot ${{ matrix.soc }}
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [gm8136, gm8135]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      - name: Download OpenIPC firmware
+        run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
+
+      - name: Boot to login, DHCP over the FTGMAC100, JFFS2 on the NOR
+        timeout-minutes: 6
+        run: bash qemu-boot/test-grainmedia-boot.sh --soc ${{ matrix.soc }}
 
   boot-hi3516cv610:
     name: Boot hi3516cv610

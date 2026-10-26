@@ -16,15 +16,16 @@ desk. Vendor families covered:
 - **Allwinner** V831 / V833
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
   FH8626V100, FH8632
+- **Grain Media** GM8135S, GM8136, GM8136S
 
 The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (81 total)
+## Supported Machines (84 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -318,6 +319,40 @@ audio (the ARC's) are not modelled. Map, boot chain and devices are in
 
 ¹ Same die and models as a tested sibling; no image was at hand.
 
+### Grain Media GM813x family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `gm8135s` | FA626TE (ARMv5TE), 64 MB in package | FTINTC030 | 3.3.0 OpenIPC | yes |
+| `gm8136` | FA626TE (ARMv5TE), 128 MB | FTINTC030 | 3.3.0 vendor (H.264 over RTSP), OpenIPC | yes |
+| `gm8136s` | FA626TE (ARMv5TE), 128 MB in package | FTINTC030 | — | —¹ |
+
+Grain Media's camera SoCs, in `hw/arm/grainmedia.c`: a Faraday FA626TE
+(QEMU's ARM926 with the FA626TE's ID) among Faraday peripherals -- FTINTC030,
+FTTMR010, FTWDT010, FTGPIO010, FTI2C010, the command-based FTSPI020 flash
+controller paced by the FTDMAC020, FTGMAC100 Ethernet, FTSDC021 SD hosts
+and the FOTG210 USB host -- with the PMU's chip ID, boot strap and PLLs
+(the timers' PCLK), and an OmniVision sensor's ID on the I2C bus
+(`sensor=ov2715`). A camera's SPI NOR dump boots the way the mask ROM
+does: nsboot from flash 0x1000 in SRAM brings up DDR and the CPU clock,
+then the vendor U-Boot runs the vendor 3.3 kernel and the camera's
+application: `-M gm8136,flash-file=dump.bin -nic user`. Flash writes go
+back to the file. The video pipeline the vendor graph runs is modelled --
+VCAP300 capture painting the OpenIPC logo, the 3DNR, the scaler, the MCP280
+H.264 encoder producing real slices behind the driver's own headers, the
+LCD's frame clock -- so a camera dump streams decodable 1080p and D1 H.264
+(I frames and motion-following P frames) from its own RTSP server
+(`qemu-boot/test-grainmedia-rtsp.sh`). The ISP328 runs frames and feeds
+AE / AWB / AF statistics through its DMA tables, the GM2D draws OSD,
+masks and LCD blits, the MCP100 encodes MJPEG through its firmware's
+mailbox, and the FTSSP010 / ADDA308 capture a 1 kHz tone into the RTSP
+stream's audio track (or play to `-audiodev`); the SAR ADC, RTC, PWM, IR
+receiver (keys from `qom-set`), FTAES020 and pMonitor are modelled too.
+OpenIPC's `gm8136` and `gm8135` releases boot with `-kernel`
+(`qemu-boot/test-grainmedia-boot.sh`) to a login prompt with a DHCP lease
+and the JFFS2 overlay on the NOR. Map, boot chain and devices are in
+[docs/grainmedia.md](docs/grainmedia.md).
+
 ### Novatek NT9856x family (`qemu-system-arm`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |
@@ -546,6 +581,24 @@ qemu/
 ├── hw/rtc/fh-rtc.c              # Fullhan RTC, command-based and v1 layouts
 ├── hw/watchdog/fh-wdt.c         # DW watchdog
 ├── hw/misc/fh-efuse.c           # eFuse controller
+├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
+├── hw/misc/gm-pmu.c             # FTPMU010: chip ID, strap, PLLs -> PCLK, FCS interrupt
+├── hw/misc/gm-ddrc.c            # FTDDRC010: init done, DRAM size code
+├── hw/intc/gm-intc.c            # FTINTC030 interrupt controller (per-CPU targets)
+├── hw/timer/gm-timer.c          # FTTMR010 timers (clocked by the PMU)
+├── hw/watchdog/gm-wdt.c         # FTWDT010 watchdog (the reboot path)
+├── hw/gpio/gm-gpio.c            # FTGPIO010
+├── hw/i2c/gm-i2c.c              # FTI2C010 byte-at-a-time I2C master
+├── hw/ssi/gm-spi020.c           # FTSPI020 command-based flash controller, RX FIFO, DMA requests
+├── hw/dma/gm-dmac.c             # FTDMAC020 AHB DMA, linked lists, handshake lines
+├── hw/usb/gm-otg.c              # FOTG210: FUSBH200 EHCI + OTG glue
+├── hw/misc/gm-vcap.c            # VCAP300 capture: link lists, OpenIPC logo picture, sync timer
+├── hw/misc/gm-3dnr.c            # FT3DNR200: command lists, frame copy
+├── hw/misc/gm-scaler.c          # scaler300: link lists, UYVY scaling / fills
+├── hw/misc/gm-h264e.c           # MCP280 H.264: header FIFO + slice data (hantro-h264.c)
+├── hw/misc/gm-mcp100.c          # MCP100 codec control (embedded CPU handshake)
+├── hw/display/gm-lcd.c          # LCD200 vertical interrupt (the video graph's clock)
+├── hw/display/gm-2d.c           # GM2D 2D engine: magic, job completion
 ├── hw/arm/anyka.c               # Anyka AK39xx machines, synthetic mask ROM
 ├── hw/misc/ak-sysctrl.c         # AK39 SYSCTRL: chip ID, IRQ controller, timers, WDT, RTC
 ├── hw/misc/ak-l2.c              # L2 buffer SRAM + DMA (UART / SPI data path)
@@ -629,6 +682,8 @@ qemu-boot/
 ├── run-fullhan.sh               # Fullhan: boot a NOR image (dump or OpenIPC) on any fh* machine
 ├── fh-openipc-flash.sh          # Fullhan: OpenIPC release onto a dump's vendor U-Boot
 ├── test-fullhan-boot.sh         # Fullhan OpenIPC kernel: login, DHCP, JFFS2 written back
+├── test-grainmedia-boot.sh      # Grain Media OpenIPC kernel: login, DHCP, JFFS2 written back
+├── test-grainmedia-rtsp.sh      # Grain Media camera dump from flash: its RTSP H.264 decodes
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
 ├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM/crypto, for the tests below
@@ -664,6 +719,7 @@ docs/
 ├── goke-gk710x.md               # GK7101/GK7102: the HAL, real memory map, boot
 ├── anyka.md                     # AK39xx: L2 buffer, mask ROM, boot NOR
 ├── fullhan.md                   # Fullhan: generations, mask ROM, SPIC, DMACs
+├── grainmedia.md                # Grain Media GM813x: map, nsboot boot chain, video, audio, MJPEG
 ├── sigmastar.md                 # SigmaStar/MStar infinity2m: RIU banks, boot chain
 ├── novatek.md                   # NT9856x, NT98533, NT98332: DT, loader stand-in, media
 ├── ive-registers.md             # IVE register map (from live EV300 capture)
