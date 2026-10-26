@@ -563,6 +563,52 @@ static uint8_t src_c(Frame *f, int comp, int x, int y)
     return f->suv[y * f->scs + 2 * x + comp];
 }
 
+/* reconstruct an I_16x16 DC macroblock exactly as a decoder (8.5.10-11) */
+static void recon_mb(Frame *f, int mx, int my, int pred, const int lev[16],
+                     int qp, int cpred[2][4], int clev[2][4], int qpc)
+{
+    int i, bx, by, x, y, comp;
+    int f16[16];
+    for (i = 0; i < 16; i++) {
+        f16[i] = lev[i];
+    }
+    hadamard4(f16);
+    const int ls = 16 * v00[qp % 6];
+    for (by = 0; by < 4; by++) {
+        for (bx = 0; bx < 4; bx++) {
+            const int fv = f16[by * 4 + bx];
+            const int d = qp >= 36 ? (fv * ls) << (qp / 6 - 6)
+                                   : (fv * ls + (1 << (5 - qp / 6))) >>
+                                     (6 - qp / 6);
+            const int r = (d + 32) >> 6;
+            for (y = 0; y < 4; y++) {
+                for (x = 0; x < 4; x++) {
+                    f->y[(my * 16 + by * 4 + y) * f->w + mx * 16 + bx * 4 + x] =
+                        clip1(pred + r);
+                }
+            }
+        }
+    }
+    const int lsc = 16 * v00[qpc % 6];
+    for (comp = 0; comp < 2; comp++) {
+        uint8_t *rp = comp ? f->cr : f->cb;
+        const int *l = clev[comp];
+        const int fc[4] = { l[0] + l[1] + l[2] + l[3], l[0] - l[1] + l[2] - l[3],
+                            l[0] + l[1] - l[2] - l[3], l[0] - l[1] - l[2] + l[3] };
+        for (i = 0; i < 4; i++) {
+            const int d = ((fc[i] * lsc) << (qpc / 6)) >> 5;
+            const int r = (d + 32) >> 6;
+            const int xo = (i & 1) * 4, yo = (i >> 1) * 4;
+            for (y = 0; y < 4; y++) {
+                for (x = 0; x < 4; x++) {
+                    rp[(my * 8 + yo + y) * (f->w / 2) + mx * 8 + xo + x] =
+                        clip1(cpred[comp][i] + r);
+                }
+            }
+        }
+    }
+}
+
 static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
                       int qp, int qpc)
 {
@@ -673,46 +719,7 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
         memset(clev, 0, sizeof(clev));
     }
 
-    /* reconstruct, exactly as a decoder (8.5.10, 8.5.11) */
-    int f16[16];
-    for (i = 0; i < 16; i++) {
-        f16[i] = lev[i];
-    }
-    hadamard4(f16);
-    const int ls = 16 * v00[qp % 6];
-    for (by = 0; by < 4; by++) {
-        for (bx = 0; bx < 4; bx++) {
-            const int fv = f16[by * 4 + bx];
-            const int d = qp >= 36 ? (fv * ls) << (qp / 6 - 6)
-                                   : (fv * ls + (1 << (5 - qp / 6))) >>
-                                     (6 - qp / 6);
-            const int r = (d + 32) >> 6;
-            for (y = 0; y < 4; y++) {
-                for (x = 0; x < 4; x++) {
-                    f->y[(my * 16 + by * 4 + y) * f->w + mx * 16 + bx * 4 + x] =
-                        clip1(pred + r);
-                }
-            }
-        }
-    }
-    const int lsc = 16 * v00[qpc % 6];
-    for (comp = 0; comp < 2; comp++) {
-        uint8_t *rp = comp ? f->cr : f->cb;
-        const int *l = clev[comp];
-        const int fc[4] = { l[0] + l[1] + l[2] + l[3], l[0] - l[1] + l[2] - l[3],
-                            l[0] + l[1] - l[2] - l[3], l[0] - l[1] - l[2] + l[3] };
-        for (i = 0; i < 4; i++) {
-            const int d = ((fc[i] * lsc) << (qpc / 6)) >> 5;
-            const int r = (d + 32) >> 6;
-            const int xo = (i & 1) * 4, yo = (i >> 1) * 4;
-            for (y = 0; y < 4; y++) {
-                for (x = 0; x < 4; x++) {
-                    rp[(my * 8 + yo + y) * (f->w / 2) + mx * 8 + xo + x] =
-                        clip1(cpred[comp][i] + r);
-                }
-            }
-        }
-    }
+    recon_mb(f, mx, my, pred, lev, qp, cpred, clev, qpc);
 }
 
 static size_t nal_wrap(uint8_t *out, size_t cap, int ref_idc, int type,
@@ -816,4 +823,372 @@ size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
 
     return nal_wrap(out, cap, idr ? 3 : 2, idr ? 5 : 1, rbsp,
                     c.p - rbsp);
+}
+
+/* ---- slice data for engines whose drivers write the headers ------------ */
+
+/*
+ * Some engines (Grain Media's MCP280) have their driver pack the SPS, PPS
+ * and slice header through the hardware's bit writer and leave the slice
+ * data to the hardware.  These produce just that: the macroblock layer of
+ * one slice covering mbw x mbh macroblocks, ending with the slice's
+ * trailing bits, as the RBSP (no emulation prevention).  The slice is a
+ * picture of its own for intra prediction, as slices are.
+ */
+
+static void frame_setup(Frame *f, int mbw, int mbh, const uint8_t *y, int ys,
+                        const uint8_t *uv, int cs)
+{
+    *f = (Frame) { .mbw = mbw, .mbh = mbh, .w = mbw * 16, .h = mbh * 16,
+                   .sy = y, .suv = uv, .sys = ys, .scs = cs };
+    f->y = g_malloc(f->w * f->h);
+    f->cb = g_malloc(f->w * f->h / 4);
+    f->cr = g_malloc(f->w * f->h / 4);
+}
+
+static void frame_free(Frame *f)
+{
+    g_free(f->y);
+    g_free(f->cb);
+    g_free(f->cr);
+}
+
+size_t h264_slice_i16dc_cabac(int qp, int chroma_qp_offset, int mbw, int mbh,
+                              const uint8_t *y, int ys, const uint8_t *uv,
+                              int cs, uint8_t *out, size_t cap)
+{
+    g_autofree MbInfo *info = g_new0(MbInfo, mbw * mbh);
+    Frame f;
+    Cabac c;
+    int mx, my;
+
+    qp = MIN(MAX(qp, 0), 51);
+    frame_setup(&f, mbw, mbh, y, ys, uv, cs);
+    cabac_init(&c, qp, out, out + cap);
+    const int qpc = chroma_qp(qp, chroma_qp_offset);
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            encode_mb(&f, &c, info, mx, my, qp, qpc);
+            if (mx == mbw - 1 && my == mbh - 1) {
+                cabac_flush(&c);            /* with the stop bit */
+            } else {
+                cabac_terminate0(&c);
+            }
+        }
+    }
+    frame_free(&f);
+    return c.p - out;
+}
+
+/*
+ * A P slice of nmb P_Skip macroblocks.  Only mb_skip_flag's first context
+ * (11; both neighbours skipped or absent) is used, initialised for the
+ * slice's cabac_init_idc (Table 9-13).
+ */
+size_t h264_slice_pskip_cabac(int qp, int cabac_init_idc, int nmb,
+                              uint8_t *out, size_t cap)
+{
+    static const int8_t skip_init[3][2] = { { 23, 33 }, { 22, 25 },
+                                            { 29, 16 } };
+    const int8_t *mn = skip_init[MIN(MAX(cabac_init_idc, 0), 2)];
+    Cabac c;
+    int i, st;
+
+    qp = MIN(MAX(qp, 0), 51);
+    cabac_init(&c, qp, out, out + cap);
+    st = MIN(MAX(((mn[0] * qp) >> 4) + mn[1], 1), 126);
+    c.state[11] = (MIN(st, 127 - st) << 1) | (st >> 6);
+    for (i = 0; i < nmb; i++) {
+        cabac_decision(&c, 11, 1);
+        if (i == nmb - 1) {
+            cabac_flush(&c);
+        } else {
+            cabac_terminate0(&c);
+        }
+    }
+    return c.p - out;
+}
+
+/*
+ * CAVLC residual of a block with at most one coefficient, at scan
+ * position 0: what the DC-of-DC coding below sends.  nc is 0 (luma DC of
+ * an I_16x16 neighbourhood with no AC) or -1 (chroma DC).
+ */
+static void cavlc_dc1(BitWriter *w, int level, bool chroma_dc)
+{
+    int code;
+
+    if (!level) {
+        bw_bits(w, chroma_dc ? 1 : 1, chroma_dc ? 2 : 1);  /* 01 / 1 */
+        return;
+    }
+    if (abs(level) == 1) {                      /* a trailing one */
+        if (chroma_dc) {
+            bw_bits(w, 1, 1);                   /* coeff_token "1" */
+        } else {
+            bw_bits(w, 1, 2);                   /* coeff_token "01" */
+        }
+        bw_bits(w, level < 0, 1);
+    } else {
+        if (chroma_dc) {
+            bw_bits(w, 7, 6);                   /* "000111" */
+        } else {
+            bw_bits(w, 5, 6);                   /* "000101" */
+        }
+        /* first level after < 3 trailing ones: levelCode - 2, suffixLen 0 */
+        code = (level > 0 ? 2 * level - 2 : -2 * level - 1) - 2;
+        if (code < 14) {
+            bw_bits(w, 1, code + 1);
+        } else if (code < 30) {
+            bw_bits(w, 1, 15);
+            bw_bits(w, code - 14, 4);
+        } else {
+            bw_bits(w, 1, 16);
+            bw_bits(w, code - 30, 12);
+        }
+    }
+    bw_bits(w, 1, 1);                           /* total_zeros = 0 */
+}
+
+/*
+ * An I slice in CAVLC: every macroblock I_16x16 with DC prediction, its
+ * luma and chroma DC sent as their first (DC-of-DC) coefficient only, so
+ * each macroblock comes out as its mean.  The slice data starts
+ * bit_offset bits into a byte of the stream (byte alignment -- PCM's,
+ * the trailing bits' -- is the stream's): out's first byte holds that
+ * many unused bits, then the data, rbsp_slice_trailing_bits included, and
+ * the return is the bits out holds, the unused ones counted.
+ */
+size_t h264_slice_i16dc_cavlc(int qp, int chroma_qp_offset, int mbw, int mbh,
+                              const uint8_t *y, int ys, const uint8_t *uv,
+                              int cs, int bit_offset, uint8_t *out, size_t cap)
+{
+    BitWriter w = { .p = out, .cap = cap, .bits = bit_offset & 7 };
+    Frame f;
+    int mx, my, i, bx, by, x, yy, comp;
+
+    qp = MIN(MAX(qp, 0), 51);
+    frame_setup(&f, mbw, mbh, y, ys, uv, cs);
+    const int qpc = chroma_qp(qp, chroma_qp_offset);
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            int dc[16], lev[16] = { 0 }, cpred[2][4], clev[2][4] = { { 0 } };
+            const int pred = pred16_dc(&f, mx, my);
+
+            for (by = 0; by < 4; by++) {
+                for (bx = 0; bx < 4; bx++) {
+                    int s = 0;
+                    for (yy = 0; yy < 4; yy++) {
+                        for (x = 0; x < 4; x++) {
+                            s += src_y(&f, mx * 16 + bx * 4 + x,
+                                       my * 16 + by * 4 + yy) - pred;
+                        }
+                    }
+                    dc[by * 4 + bx] = s;
+                }
+            }
+            hadamard4(dc);
+            lev[0] = quant(dc[0] / 2, qp, 1);
+            lev[0] = MIN(MAX(lev[0], -2047), 2047);
+
+            for (comp = 0; comp < 2; comp++) {
+                uint8_t *rp = comp ? f.cr : f.cb;
+                int s = 0;
+                for (i = 0; i < 4; i++) {
+                    const int xo = (i & 1) * 4, yo = (i >> 1) * 4;
+                    cpred[comp][i] = predc_dc(rp, f.w / 2, mx, my, xo, yo);
+                    for (yy = 0; yy < 4; yy++) {
+                        for (x = 0; x < 4; x++) {
+                            s += src_c(&f, comp, mx * 8 + xo + x,
+                                       my * 8 + yo + yy) - cpred[comp][i];
+                        }
+                    }
+                }
+                clev[comp][0] = quant(s, qpc, 1);
+                clev[comp][0] = MIN(MAX(clev[comp][0], -2047), 2047);
+            }
+            const int cbpc = clev[0][0] || clev[1][0];
+
+            bw_ue(&w, 3 + 4 * cbpc);            /* I_16x16_2_cbpc_0 */
+            bw_ue(&w, 0);                       /* chroma pred: DC */
+            bw_se(&w, 0);                       /* mb_qp_delta */
+            cavlc_dc1(&w, lev[0], false);
+            if (cbpc) {
+                cavlc_dc1(&w, clev[0][0], true);
+                cavlc_dc1(&w, clev[1][0], true);
+            }
+            recon_mb(&f, mx, my, pred, lev, qp, cpred, clev, qpc);
+        }
+    }
+    frame_free(&f);
+    bw_bits(&w, 1, 1);                          /* rbsp_stop_one_bit */
+    while (w.bits) {
+        bw_bits(&w, 0, 1);
+    }
+    return w.n * 8;
+}
+
+/* A P slice of nmb P_Skip macroblocks in CAVLC; returns bits, as above. */
+size_t h264_slice_pskip_cavlc(int nmb, int bit_offset, uint8_t *out,
+                              size_t cap)
+{
+    BitWriter w = { .p = out, .cap = cap, .bits = bit_offset & 7 };
+
+    bw_ue(&w, nmb);                             /* mb_skip_run */
+    bw_bits(&w, 1, 1);
+    while (w.bits) {
+        bw_bits(&w, 0, 1);
+    }
+    return w.n * 8;
+}
+
+/*
+ * P slices that follow the picture: every macroblock that differs from
+ * the reference is sent as I_PCM, the rest as P_Skip.  PCM needs no
+ * prediction, so the decoder's picture is exactly the source wherever
+ * something changed -- and with nothing coded, edges between PCM and
+ * skipped macroblocks are not deblocked while the slice QP stays below
+ * 31 (their average QP picks a zero alpha).  ref is the picture the
+ * decoder holds for this slice's rows, as NV12 at stride w, and is
+ * updated to what it holds afterwards.
+ */
+static bool mb_differs(int mx, int my, int w, const uint8_t *y, int ys,
+                       const uint8_t *uv, int cs, const uint8_t *ry,
+                       const uint8_t *ruv)
+{
+    int r;
+
+    for (r = 0; r < 16; r++) {
+        if (memcmp(y + (my * 16 + r) * ys + mx * 16,
+                   ry + (my * 16 + r) * w + mx * 16, 16)) {
+            return true;
+        }
+    }
+    for (r = 0; r < 8; r++) {
+        if (memcmp(uv + (my * 8 + r) * cs + mx * 16,
+                   ruv + (my * 8 + r) * w + mx * 16, 16)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* the macroblock's PCM samples (Y, Cb, Cr), copied into ref as well */
+static void mb_pcm(int mx, int my, int w, const uint8_t *y, int ys,
+                   const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
+                   uint8_t pcm[384])
+{
+    int r, x;
+
+    for (r = 0; r < 16; r++) {
+        memcpy(pcm + r * 16, y + (my * 16 + r) * ys + mx * 16, 16);
+        memcpy(ry + (my * 16 + r) * w + mx * 16, pcm + r * 16, 16);
+    }
+    for (r = 0; r < 8; r++) {
+        const uint8_t *s = uv + (my * 8 + r) * cs + mx * 16;
+
+        for (x = 0; x < 8; x++) {
+            pcm[256 + r * 8 + x] = s[2 * x];
+            pcm[320 + r * 8 + x] = s[2 * x + 1];
+        }
+        memcpy(ruv + (my * 8 + r) * w + mx * 16, s, 16);
+    }
+}
+
+size_t h264_slice_ppcm_cavlc(int mbw, int mbh, const uint8_t *y, int ys,
+                             const uint8_t *uv, int cs, uint8_t *ry,
+                             uint8_t *ruv, int bit_offset, uint8_t *out,
+                             size_t cap)
+{
+    BitWriter w = { .p = out, .cap = cap, .bits = bit_offset & 7 };
+    uint8_t pcm[384];
+    int mx, my, i, run = 0;
+
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            if (!mb_differs(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv)) {
+                run++;
+                continue;
+            }
+            bw_ue(&w, run);                     /* mb_skip_run */
+            run = 0;
+            bw_ue(&w, 5 + 25);                  /* I_PCM in a P slice */
+            while (w.bits) {
+                bw_bits(&w, 0, 1);              /* pcm_alignment_zero_bit */
+            }
+            mb_pcm(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv, pcm);
+            for (i = 0; i < 384; i++) {
+                bw_bits(&w, pcm[i], 8);
+            }
+        }
+    }
+    if (run) {
+        bw_ue(&w, run);
+    }
+    bw_bits(&w, 1, 1);
+    while (w.bits) {
+        bw_bits(&w, 0, 1);
+    }
+    return w.n * 8;
+}
+
+/* (m, n) of contexts 11-14 and 17 for P slices, by cabac_init_idc */
+static const int8_t p_ctx_init[3][5][2] = {
+    { { 23, 33 }, { 23, 2 }, { 21, 0 }, { 1, 9 }, { 5, 57 } },
+    { { 22, 25 }, { 34, 0 }, { 16, 0 }, { -2, 9 }, { 2, 65 } },
+    { { 29, 16 }, { 25, 0 }, { 14, 0 }, { -10, 51 }, { 26, 16 } },
+};
+
+size_t h264_slice_ppcm_cabac(int qp, int cabac_init_idc, int mbw, int mbh,
+                             const uint8_t *y, int ys, const uint8_t *uv,
+                             int cs, uint8_t *ry, uint8_t *ruv, uint8_t *out,
+                             size_t cap)
+{
+    static const int ctx_of[5] = { 11, 12, 13, 14, 17 };
+    const int8_t (*mn)[2] = p_ctx_init[MIN(MAX(cabac_init_idc, 0), 2)];
+    g_autofree bool *skipped = g_new0(bool, mbw * mbh);
+    uint8_t pcm[384];
+    Cabac c;
+    int mx, my, i;
+
+    qp = MIN(MAX(qp, 0), 51);
+    cabac_init(&c, qp, out, out + cap);
+    for (i = 0; i < 5; i++) {
+        const int st = MIN(MAX(((mn[i][0] * qp) >> 4) + mn[i][1], 1), 126);
+
+        c.state[ctx_of[i]] = (MIN(st, 127 - st) << 1) | (st >> 6);
+    }
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            const bool last = mx == mbw - 1 && my == mbh - 1;
+            /* mb_skip_flag: one per neighbour present and not skipped */
+            const int inc = (mx && !skipped[my * mbw + mx - 1]) +
+                            (my && !skipped[(my - 1) * mbw + mx]);
+
+            if (!mb_differs(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv)) {
+                skipped[my * mbw + mx] = true;
+                cabac_decision(&c, 11 + inc, 1);
+            } else {
+                cabac_decision(&c, 11 + inc, 0);
+                cabac_decision(&c, 14, 1);      /* prefix: intra */
+                cabac_decision(&c, 17, 1);      /* not I_NxN */
+                cabac_flush(&c);                /* terminate 1: I_PCM */
+                mb_pcm(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv, pcm);
+                for (i = 0; i < 384; i++) {
+                    cabac_put(&c, pcm[i]);
+                }
+                c.low = 0;                      /* the engine restarts */
+                c.range = 0x1fe;
+                c.queue = -9;
+                c.outstanding = 0;
+                c.start = c.p;
+            }
+            if (last) {
+                cabac_flush(&c);
+            } else {
+                cabac_terminate0(&c);
+            }
+        }
+    }
+    return c.p - out;
 }

@@ -255,6 +255,46 @@ OpenIPC has no Fullhan bootloader: `qemu-boot/fh-openipc-flash.sh` puts a
 release on a dump's vendor U-Boot; CI boots it with `-kernel`
 (`test-fullhan-boot.sh`).
 
+Grain Media GM8135S/GM8136/GM8136S (`hw/arm/grainmedia.c`,
+`docs/grainmedia.md`) put an FA626TE -- QEMU's arm926 with MIDR
+0x66056261, which the kernel's proc-fa626te matches -- among Faraday
+blocks, its own devices the `hw/*/gm-*.c` files under GRAINMEDIA (the
+Ethernet is QEMU's FTGMAC100, the SD hosts generic-sdhci, the USB host
+QEMU's FUSBH200 EHCI inside `gm-otg`). A NOR dump boots through the vendor
+nsboot (flash 0x1000, run in SRAM), whose frequency change waits in WFI
+for the PMU's interrupt 8, then U-Boot and the 3.3 kernel, machine 758 with
+ATAGs. The FTINTC030 masks through the CPU 0 target registers (0x45C), not
+ENABLE. FTSPI020 reads fill an RX FIFO and complete when the last byte is
+in it: U-Boot waits for completion before draining. The kernel moves flash
+data with the FTDMAC020 on request line 8, run from a bottom half because
+the request rises inside the SPI controller's own register write. U-Boot
+picks bootargs by the DDRC 0x10 size code; the kernel's fmem hangs without
+`mem=` (the machine appends it), and the adda308 audio driver panics unless
+PLL1 is a rate in its table (the PMU resets to nsboot's 860 MHz). The SDK
+uImages are XIP-style (load = header address), loaded 64 bytes up.
+The vendor video graph declares a job lost ("damnit", GS panic) unless
+every engine it waits on calls back, so capture (`gm-vcap`, link lists
+and a 60 Hz sync-timer interrupt that the driver links jobs from), 3DNR,
+scaler, LCD (its vertical interrupt is the graph's clock), GM2D and the
+MCP280 H.264 encoder (`gm-h264e`) are modelled. The encoder's driver packs
+SPS / PPS / slice headers through a FIFO and the model appends real slice
+data (I_16x16 DC from `hantro-h264.c`; P: changed macroblocks I_PCM, the
+rest P_Skip, against the reference kept NV12 in the driver's REC buffer),
+so a Longse dump streams decodable H.264 over RTSP
+(`qemu-boot/test-grainmedia-rtsp.sh`, admin / admin, /ch0). ffmpeg's
+`gray` output rescales limited-range luma: compare against `yuv420p`
+planes. The ISP328 (`gm-isp`) must keep frame start / end running even
+while disabled (the driver waits on both around stop and resize) and
+synthesises statistics that its output DMA table copies to the
+algorithms' buffers. MJPEG (`gm-mcp100`) goes through the embedded CPU's
+mailbox at SRAM 0x8000 (an MMIO overlay; command byte 8 starts, 0x80
+done); the host itself packs the JPEG headers through BADR / BALR, and the
+scan comes from `nvt_pixel_jpeg_scan_rst()`. Audio (`gm-ssp`) must never
+raise FIFO overrun / underrun -- the driver tears the stream down -- so the
+FIFOs keep samples behind the 16 they report; the Longse app captures
+only with sysenv.cfg byte 0x98C set. The FTAES020 is `fh-aes` with
+`advance=on` (addresses move on between chunks).
+
 SigmaStar/MStar infinity2m (`hw/arm/sigmastar.c`, `docs/sigmastar.md`) is a
 fourth: Cortex-A7 parts whose blocks sit in 16-bit RIU register banks at
 `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
@@ -519,7 +559,8 @@ GitHub runners, so a boot iteration is minutes — smoke-test locally first.
 ## Conventions
 
 Commit subjects are `<area>: <imperative summary> (#PR)` where area is a
-family (`hisilicon`, `xiongmai`, `goke`, `anyka`, `sigmastar`, `novatek`), a
+family (`hisilicon`, `xiongmai`, `goke`, `anyka`, `sigmastar`, `novatek`,
+`grainmedia`), a
 device (`hisi-fmc`, `hisi-gmac`), a machine (`hi3516cv610`, `nt98332`), `ci` or
 `docs`. Bodies are substantial: what the vendor DTS/SDK says, why the old value
 was wrong, what boots now that did not, and issue references

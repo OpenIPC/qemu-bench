@@ -346,18 +346,38 @@ static void encode_block(BitWriter *w, const int16_t blk[64],
     }
 }
 
+/* Byte-align with one bits, as before a marker. */
+static void pad_ones(BitWriter *w)
+{
+    if (w->have) {
+        put_bits(w, 0x7F, 8 - w->have);
+    }
+}
+
 size_t nvt_pixel_jpeg_scan(uint8_t *out, size_t room,
                            const uint8_t *y, uint32_t y_stride,
                            const uint8_t *uv, uint32_t uv_stride,
                            uint32_t mcu_w, uint32_t mcu_h,
                            const uint8_t qy[64], const uint8_t qc[64])
 {
+    return nvt_pixel_jpeg_scan_rst(out, room, y, y_stride, uv, uv + 1,
+                                   uv_stride, 2, mcu_w, mcu_h, qy, qc, 0);
+}
+
+size_t nvt_pixel_jpeg_scan_rst(uint8_t *out, size_t room,
+                               const uint8_t *y, uint32_t y_stride,
+                               const uint8_t *cb, const uint8_t *cr,
+                               uint32_t c_stride, uint32_t c_step,
+                               uint32_t mcu_w, uint32_t mcu_h,
+                               const uint8_t qy[64], const uint8_t qc[64],
+                               uint32_t restart)
+{
     static HuffTable dcl, dcc, acl, acc;
     static bool init;
     BitWriter w = { .out = out, .room = room };
     int dc_y = 0, dc_u = 0, dc_v = 0;
     int16_t blk[64];
-    uint32_t mx, my, bx, by, px, py;
+    uint32_t mx, my, bx, by, px, py, mcus = 0, rst = 0;
 
     if (!init) {
         huff_build(&dcl, dc_l_bits, dc_vals);
@@ -368,6 +388,18 @@ size_t nvt_pixel_jpeg_scan(uint8_t *out, size_t room,
     }
     for (my = 0; my < mcu_h && !w.full; my++) {
         for (mx = 0; mx < mcu_w && !w.full; mx++) {
+            if (restart && mcus && mcus % restart == 0) {
+                pad_ones(&w);
+                w.acc = 0;
+                if (w.n + 2 > w.room) {
+                    w.full = true;
+                    break;
+                }
+                w.out[w.n++] = 0xFF;                /* RSTn, unstuffed */
+                w.out[w.n++] = 0xD0 + (rst++ & 7);
+                dc_y = dc_u = dc_v = 0;
+            }
+            mcus++;
             for (by = 0; by < 2; by++) {
                 for (bx = 0; bx < 2; bx++) {
                     for (py = 0; py < 8; py++) {
@@ -383,18 +415,16 @@ size_t nvt_pixel_jpeg_scan(uint8_t *out, size_t room,
             for (bx = 0; bx < 2; bx++) {            /* Cb, then Cr */
                 for (py = 0; py < 8; py++) {
                     for (px = 0; px < 8; px++) {
-                        blk[py * 8 + px] =
-                            uv[(size_t)(my * 8 + py) * uv_stride +
-                               (mx * 8 + px) * 2 + bx];
+                        blk[py * 8 + px] = (bx ? cr : cb)
+                            [(size_t)(my * 8 + py) * c_stride +
+                             (mx * 8 + px) * c_step];
                     }
                 }
                 encode_block(&w, blk, qc, bx ? &dc_v : &dc_u, &dcc, &acc);
             }
         }
     }
-    if (w.have) {
-        put_bits(&w, 0x7F, 8 - w.have);             /* pad with ones */
-    }
+    pad_ones(&w);
     if (w.full || w.n + 2 > room) {
         return 0;
     }
