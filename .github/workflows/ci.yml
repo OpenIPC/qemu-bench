@@ -119,6 +119,12 @@ jobs:
       - name: Goke GK710xS devices (gk-remap, gk-dma)
         run: python3 qemu/tests/test-gk710xs.py
 
+      # SDHCI write-protect polarity per kernel driver: the sdhci-hisi,
+      # -goke, -xmedia and -lotus drivers invert it, nebula does not.
+      # Wrong, and every SD card in the guest mounts read-only (#209).
+      - name: HiSilicon/Goke SDHCI write-protect polarity
+        run: bash qemu/tests/test-hisi-sdhci-wp.sh
+
       # The Anyka AK39xx models driven over qtest the way the vendor drivers
       # drive them: mask-ROM staging of the boot header, timer into the
       # two-level interrupt controller, UART and SPI through L2 memory

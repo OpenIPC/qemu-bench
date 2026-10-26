@@ -77,6 +77,7 @@ Device register tests (self-contained, need a built QEMU):
 ```bash
 bash qemu/tests/test-hisi-wdt.sh        # SP805 watchdog
 bash qemu/tests/test-hisi-rtc.sh
+bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
