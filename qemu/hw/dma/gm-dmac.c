@@ -48,6 +48,7 @@
 #define TYPE_GM_DMAC "gm-dmac"
 OBJECT_DECLARE_SIMPLE_TYPE(GmDmacState, GM_DMAC)
 
+#define GM_DMAC_MAX_DESCS   256     /* per channel per bottom half */
 #define GM_DMAC_CHANS       8
 #define GM_DMAC_REQS        16
 #define GM_DMAC_SIZE        0x1000
@@ -264,6 +265,7 @@ static bool gm_dmac_next_desc(GmDmacState *s, GmDmacChan *c)
 static void gm_dmac_run_chan(GmDmacState *s, int n)
 {
     GmDmacChan *c = &s->ch[n];
+    int descs = 0;
 
     while (c->ccr & CCR_ENABLE) {
         int sw = gm_dmac_width(extract32(c->ccr, 11, 3));
@@ -318,6 +320,11 @@ static void gm_dmac_run_chan(GmDmacState *s, int n)
         }
         if (!gm_dmac_next_desc(s, c)) {
             gm_dmac_finish(s, n, true);
+            return;
+        }
+        /* a looping chain: let the main loop run, go on from the bottom half */
+        if (++descs >= GM_DMAC_MAX_DESCS) {
+            qemu_bh_schedule(s->bh);
             return;
         }
     }

@@ -425,13 +425,18 @@ static void gm_2d_draw(Gm2dState *s, uint32_t cmd)
         g_autofree Rgba *span = NULL;
         int y, n, i;
 
-        x0 = MAX(MIN(x0, x1), t.x0);
-        x1 = MIN(MAX(x0, x1), t.x1);
+        if (x0 > x1) {
+            int tmp = x0;
+            x0 = x1;
+            x1 = tmp;
+        }
         if (y0 > y1) {
             int tmp = y0;
             y0 = y1;
             y1 = tmp;
         }
+        x0 = MAX(x0, t.x0);
+        x1 = MIN(x1, t.x1);
         y0 = MAX(y0, t.y0);
         y1 = MIN(y1, t.y1);
         if (x0 > x1 || y0 > y1) {
@@ -509,7 +514,7 @@ static void gm_2d_blit(Gm2dState *s, uint32_t cmd)
         ow = swap ? sh : sw;
         oh = swap ? sw : sh;
     }
-    src = g_malloc((size_t)sstride * sh);
+    src = g_malloc0((size_t)sstride * sh + 4);  /* an odd UYVY width */
     dma_memory_read(&address_space_memory, saddr, src, (size_t)sstride * sh,
                     MEMTXATTRS_UNSPECIFIED);
     span = g_new(Rgba, ow);

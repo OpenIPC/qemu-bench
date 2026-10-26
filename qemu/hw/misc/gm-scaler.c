@@ -167,7 +167,7 @@ static uint32_t gm_scaler_job(GmScalerState *s)
     int i;
 
     if (!fill && sw && sh && sstride * sh <= 64 * MiB) {
-        src = g_malloc(sstride * sh);
+        src = g_malloc0(sstride * sh + 4);  /* an odd width's last pair */
         dma_memory_read(&address_space_memory, s->regs[R_SRC / 4], src,
                         sstride * sh, MEMTXATTRS_UNSPECIFIED);
     }

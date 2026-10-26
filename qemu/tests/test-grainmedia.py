@@ -779,6 +779,11 @@ def test_2d(qt):
     inside = [px[y * 8 + x] for y in (1, 2) for x in range(2, 6)]
     check('rectangle filled 0xFFE0', tuple(inside), (0xFFE0,) * 8)
     check('outside untouched', sum(px) - sum(inside), 0)
+    qt.write(dst, bytes(8 * 4 * 2))
+    gm2d_list(qt, [0x24, 3 << 16 | 5, 0x28, 3 << 16 | 2, 0x80000020, 2])
+    px = struct.unpack('<32H', qt.read(dst, 64))
+    check('reversed corners fill the same span', px[24:32],
+          (0, 0, 0xFFE0, 0xFFE0, 0xFFE0, 0xFFE0, 0, 0))
     # the OSD: an RGB565 bitmap, keyed on 0x0020, onto a UYVY frame
     osd = SCRATCH + 0x3B0000
     qt.write(osd, struct.pack('<4H', 0xFFFF, 0x0020, 0xF800, 0x0000))

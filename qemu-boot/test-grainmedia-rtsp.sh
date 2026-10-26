@@ -54,8 +54,9 @@ if [ -z "$FLASH" ]; then
     exit 2
 fi
 
+QPID=
 WORK=$(mktemp -d)
-trap 'kill $QPID 2>/dev/null || true; rm -rf "$WORK"' EXIT
+trap '[ -n "$QPID" ] && kill "$QPID" 2>/dev/null; rm -rf "$WORK"' EXIT
 cp "$FLASH" "$WORK/flash.bin"
 LOG=$WORK/serial.log
 URL="rtsp://$USER_PW@127.0.0.1:$PORT$URL_PATH"

@@ -98,15 +98,20 @@ static void gm_gpio_update(GmGpioState *s)
     qemu_set_irq(s->irq, (s->int_raw & s->int_en & ~s->int_mask) != 0);
 }
 
-static void gm_gpio_drive(GmGpioState *s, uint32_t old_pins)
+/*
+ * Update the output lines: an output pin drives its level, a pin that is
+ * (or turned) an input drives low.
+ */
+static void gm_gpio_drive(GmGpioState *s, uint32_t old_pins, uint32_t old_dir)
 {
-    uint32_t pins = gm_gpio_pins(s);
-    uint32_t changed = (old_pins ^ pins) & s->dir;
+    const uint32_t was = old_pins & old_dir;
+    const uint32_t now = gm_gpio_pins(s) & s->dir;
+    const uint32_t changed = (was ^ now) | (old_dir ^ s->dir);
     int i;
 
     for (i = 0; i < GM_GPIO_PINS; i++) {
         if (changed & (1u << i)) {
-            qemu_set_irq(s->out[i], !!(pins & (1u << i)));
+            qemu_set_irq(s->out[i], !!(now & (1u << i)));
         }
     }
 }
@@ -180,7 +185,7 @@ static void gm_gpio_write(void *opaque, hwaddr off, uint64_t val,
                           unsigned size)
 {
     GmGpioState *s = opaque;
-    uint32_t old = gm_gpio_pins(s);
+    uint32_t old = gm_gpio_pins(s), old_dir = s->dir;
 
     switch (off) {
     case R_DATA_OUT:
@@ -233,7 +238,7 @@ static void gm_gpio_write(void *opaque, hwaddr off, uint64_t val,
                       __func__, off);
         return;
     }
-    gm_gpio_drive(s, old);
+    gm_gpio_drive(s, old, old_dir);
     gm_gpio_update(s);
 }
 
@@ -248,6 +253,7 @@ static const MemoryRegionOps gm_gpio_ops = {
 static void gm_gpio_reset(DeviceState *dev)
 {
     GmGpioState *s = GM_GPIO(dev);
+    const uint32_t old = gm_gpio_pins(s), old_dir = s->dir;
 
     s->dout = 0;
     s->dir = 0;
@@ -263,6 +269,7 @@ static void gm_gpio_reset(DeviceState *dev)
     s->bounce_en = 0;
     s->bounce_pre = 0;
     s->input = s->input_default;
+    gm_gpio_drive(s, old, old_dir);         /* every line released */
     gm_gpio_update(s);
 }
 

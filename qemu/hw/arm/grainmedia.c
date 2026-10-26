@@ -75,6 +75,7 @@
 #include "qobject/qdict.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
+#include "qemu/host-utils.h"
 #include "qemu/bswap.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -444,8 +445,10 @@ static void grainmedia_common_init(MachineState *machine,
     Object *cpuobj;
     int n;
 
-    if (machine->ram_size > 512 * MiB) {
-        error_report("grainmedia: at most 512 MiB of DDR");
+    /* what the DDR controller's size codes describe */
+    if (machine->ram_size < 64 * MiB || machine->ram_size > 512 * MiB ||
+        !is_power_of_2(machine->ram_size)) {
+        error_report("grainmedia: DDR must be 64, 128, 256 or 512 MiB");
         exit(1);
     }
     if (gms->flash_file) {

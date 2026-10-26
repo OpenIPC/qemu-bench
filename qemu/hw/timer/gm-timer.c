@@ -269,10 +269,15 @@ static void gm_timer_write(void *opaque, hwaddr off, uint64_t val,
     case 0x4:
         /* a running channel takes the new value at its next reload */
         c->load = val;
-        if ((s->cr & CR_EN(c->id)) && gm_timer_to_reg(c, val)) {
+        if (s->cr & CR_EN(c->id)) {
             ptimer_transaction_begin(c->pt);
-            ptimer_set_limit(c->pt, gm_timer_to_reg(c, val), 0);
-            ptimer_run(c->pt, 0);
+            if (gm_timer_to_reg(c, val)) {
+                ptimer_set_limit(c->pt, gm_timer_to_reg(c, val), 0);
+                ptimer_run(c->pt, 0);
+            } else {                        /* LOAD 0: one-shot */
+                ptimer_set_limit(c->pt, 0xFFFFFFFF, 0);
+                ptimer_run(c->pt, 1);
+            }
             ptimer_transaction_commit(c->pt);
         }
         break;

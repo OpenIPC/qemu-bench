@@ -311,6 +311,11 @@ static void gm_h264e_encode_slice(GmH264eState *s)
     if (!nmb) {
         return;
     }
+    if (stride < w * 2) {
+        qemu_log_mask(LOG_GUEST_ERROR, "gm-h264e: source stride %d below "
+                      "the picture's %d bytes\n", stride, w * 2);
+        return;
+    }
     src = g_malloc((size_t)stride * h);
     y = g_malloc((size_t)w * h);
     uv = g_malloc((size_t)w * h / 2);
@@ -368,6 +373,8 @@ static void gm_h264e_encode_slice(GmH264eState *s)
         }
     } else {                                /* B: nothing changes */
         if (cabac) {
+            /* B's skip flags have contexts of their own: not modelled */
+            qemu_log_mask(LOG_UNIMP, "gm-h264e: CABAC B slice\n");
             n = h264_slice_pskip_cabac(qp, idc, nmb, out, cap);
         } else {
             n = h264_slice_pskip_cavlc(nmb, off, out, cap);
@@ -379,7 +386,10 @@ static void gm_h264e_encode_slice(GmH264eState *s)
         from = off;                         /* past the header's bits */
     }
     gm_h264e_emit(s, out, from, n, cap);
-    /* the reconstruction buffer, unless the picture is not a reference */
+    /*
+     * the reconstruction buffer, unless the picture is not a reference;
+     * the driver gives REC at the slice's first row, ME_REF at the picture
+     */
     if (ry && rec_y && rec_y != GM_H264E_NO_REC) {
         dma_memory_write(&address_space_memory, rec_y, ry, (size_t)w * h,
                          MEMTXATTRS_UNSPECIFIED);
