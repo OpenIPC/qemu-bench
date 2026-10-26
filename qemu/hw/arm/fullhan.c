@@ -624,6 +624,15 @@ static DeviceState *fh_create_flash(FhMachineState *fms, BusState *bus,
         qdev_prop_set_drive_err(dev, "drive", blk, &error_fatal);
     }
     qdev_realize_and_unref(dev, bus, &error_fatal);
+    if (fms->flash_file) {
+        /*
+         * The drive property names blk's node, and the device gets a
+         * BlockBackend of its own on it.  Ours, writable and attached to
+         * no device, would stay a parent of the node, and migration could
+         * never inactivate it ("bdrv_inactivate_all() failed").
+         */
+        blk_unref(blk);
+    }
     return dev;
 }
 
