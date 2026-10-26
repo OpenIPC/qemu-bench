@@ -1680,6 +1680,8 @@ static const HisiSoCConfig hi3516ev300_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -1792,6 +1794,8 @@ static const HisiSoCConfig hi3516ev200_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -1881,6 +1885,8 @@ static const HisiSoCConfig hi3518ev300_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -1967,6 +1973,8 @@ static const HisiSoCConfig hi3516dv200_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -2089,6 +2097,10 @@ static const HisiSoCConfig hi3516dv200_soc = {
     .num_sdhci          = 2,                                \
     .sdhci_bases        = { 0x10010000, 0x10020000 },       \
     .sdhci_irqs         = { 30, 31 },                       \
+    /* sdhci-goke.c (gk7205v200 kernel), sdhci-xmedia-common.c       \
+     * (gk7205v500) and sdhci-lotus-common.c (gk7206v100) all set     \
+     * SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */                         \
+    .sdhci_wp_inverted  = true,                                     \
     .num_i2c            = 3,                                \
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 }, \
     .vedu_base          = 0x11410000,                       \
@@ -5776,6 +5788,7 @@ static void hisilicon_common_init(MachineState *machine,
         qdev_prop_set_uint8(sdhci, "sd-spec-version", 3);
         qdev_prop_set_uint8(sdhci, "uhs", UHS_I);
         qdev_prop_set_uint64(sdhci, "capareg", 0x017834b4);
+        qdev_prop_set_bit(sdhci, "wp-inverted", c->sdhci_wp_inverted);
         SysBusDevice *busdev = SYS_BUS_DEVICE(sdhci);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->sdhci_bases[n]);

@@ -234,6 +234,10 @@ typedef struct HisiSoCConfig {
     int             num_sdhci;
     hwaddr          sdhci_bases[HISI_MAX_SDHCI];
     int             sdhci_irqs[HISI_MAX_SDHCI];
+    /* PRNSTS bit 19 the other way round from the SDHCI spec, set when the
+     * kernel's driver carries SDHCI_QUIRK_INVERTED_WRITE_PROTECT: without it
+     * a writable card reads back as write-protected and mounts read-only. */
+    bool            sdhci_wp_inverted;
 
     /* I2C (HiBVT for V2+, register-poll "hisi-i2c-v1" for CV100 family) */
     int             num_i2c;
