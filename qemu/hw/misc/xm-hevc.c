@@ -120,6 +120,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmHevcState, XM_HEVC)
 
 #define ST_DONE         3
 
+/* the widest source line a job may name: twice the widest picture */
+#define XM_HEVC_MAX_STRIDE  16384
+
 /* decoded pictures kept for P jobs: one a stream is enough (D2: six) */
 #define XM_HEVC_REFS    8
 
@@ -365,6 +368,7 @@ static void xm_hevc_encode(XmHevcState *s, int w, int h, int sw, int sh,
 {
     if (w < 8 || h < 8 || w > 8192 || h > 8192 || (w & 7) || (h & 7) ||
         sw < 2 || sh < 2 || sw > 8192 || sh > 8192 || ys < sw || cs < sw ||
+        ys > XM_HEVC_MAX_STRIDE || cs > XM_HEVC_MAX_STRIDE ||
         !y_pa || !uv_pa || !out_pa || !cap) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-hevc: job %dx%d from %dx%d "
                       "(strides %d/%d) to 0x%x+%u not done\n", w, h, sw, sh,
@@ -390,6 +394,9 @@ static void xm_hevc_encode(XmHevcState *s, int w, int h, int sw, int sh,
                       .len_reg = len_reg };
     j->y = g_malloc((size_t)ys * sh);
     j->uv = g_malloc((size_t)cs * (sh / 2));
+    /* no more than the slice data can take: the guest's free count can be
+     * anything */
+    j->cap = cap = MIN(cap, (uint32_t)((w / 8) * (h / 8) * 80 + 4096));
     j->out = g_malloc(cap);
     dma_memory_read(&address_space_memory, y_pa, j->y, (size_t)ys * sh,
                     MEMTXATTRS_UNSPECIFIED);

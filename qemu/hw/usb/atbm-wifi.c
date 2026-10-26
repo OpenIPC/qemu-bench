@@ -69,6 +69,7 @@ struct AtbmState {
     USBDevice dev;
     GHashTable *mem;            /* page number -> PAGE_SIZE_ bytes */
     QSIMPLEQ_HEAD(, AtbmMsg) rxq;
+    unsigned rxq_len;           /* messages queued: at most RXQ_MAX */
     QEMUTimer *start_timer;
     bool fw_running;
     uint8_t rx_seq;             /* WSM sequence of device -> host messages */
@@ -144,9 +145,19 @@ static uint32_t atbm_reg(AtbmState *s, uint32_t addr)
 /* ---- device -> host ---------------------------------------------------- */
 
 /* queue one WSM message: id with the next sequence number in bits 13..15 */
+/* what the device holds for a guest that stops reading bulk IN */
+#define RXQ_MAX     256
+
 static void atbm_send(AtbmState *s, uint16_t id, const void *body, size_t n)
 {
-    AtbmMsg *m = g_malloc0(sizeof(*m) + 4 + n);
+    AtbmMsg *m;
+
+    if (s->rxq_len >= RXQ_MAX) {
+        qemu_log_mask(LOG_GUEST_ERROR, "atbm: bulk IN not read, 0x%04x "
+                      "dropped\n", id);
+        return;
+    }
+    m = g_malloc0(sizeof(*m) + 4 + n);
 
     m->len = 4 + n;
     stw_le_p(m->data, 4 + n);
@@ -157,6 +168,7 @@ static void atbm_send(AtbmState *s, uint16_t id, const void *body, size_t n)
         qemu_log("atbm: -> 0x%04x len %zu\n", id, m->len);
     }
     QSIMPLEQ_INSERT_TAIL(&s->rxq, m, next);
+    s->rxq_len++;
 }
 
 #define WSM_STARTUP_IND     0x0801
@@ -407,14 +419,18 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
                             size_t size)
 {
     AtbmState *s = qemu_get_nic_opaque(nc);
-    uint8_t f[24 + 6 + 2048];
+    /* the 802.11 header, LLC/SNAP, then the frame from its type on */
+    uint8_t f[24 + 6 + 2 + 2048];
 
+    if (size < 14) {
+        return size;
+    }
     if (s->trace) {
         qemu_log("atbm: net rx %zu to %02x:%02x:%02x:%02x:%02x:%02x type "
                  "%02x%02x%s\n", size, buf[0], buf[1], buf[2], buf[3], buf[4],
                  buf[5], buf[12], buf[13], s->associated ? "" : " (dropped)");
     }
-    if (!s->associated || size < 14 || size - 14 > 2048 ||
+    if (!s->associated || 30 + size - 12 > sizeof(f) ||
         (!(buf[0] & 1) && memcmp(buf, s->sta, 6))) {
         return size;
     }
@@ -617,6 +633,7 @@ static void atbm_handle_data(USBDevice *dev, USBPacket *p)
             AtbmMsg *m = QSIMPLEQ_FIRST(&s->rxq);
 
             QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
+            s->rxq_len--;
             usb_packet_copy(p, m->data, MIN(m->len, p->iov.size));
             g_free(m);
             return;
@@ -648,6 +665,7 @@ static void atbm_flush(AtbmState *s)
         QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
         g_free(m);
     }
+    s->rxq_len = 0;
 }
 
 static void atbm_handle_reset(USBDevice *dev)

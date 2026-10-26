@@ -553,7 +553,10 @@ static void xm_isp2_vpss_inline(XmIsp2State *s)
 static void xm_isp2_vpss_job(XmIsp2State *s)
 {
     const uint32_t *r = s->vpss;
-    const int ys = r[VPSS_IN_YS / 4] * 16, cs = r[VPSS_IN_CS / 4] * 16;
+    /* strides in 16 bytes; anything past 16 KiB is no job (and must not
+     * size a buffer) */
+    const int ys = MIN(r[VPSS_IN_YS / 4], 1025u) * 16;
+    const int cs = MIN(r[VPSS_IN_CS / 4], 1025u) * 16;
     /* +0x1000C is the width the job scales from; boards that sell a 2MP
      * sensor as "3M" set it above the input's (2304 on a 1920 stride) */
     const int w = MIN((int)r[VPSS_IN_W / 4], ys), h = r[VPSS_IN_H / 4];
@@ -561,7 +564,7 @@ static void xm_isp2_vpss_job(XmIsp2State *s)
     const hwaddr ca = 0x80000000ULL + (hwaddr)r[VPSS_IN_C / 4] * 16;
 
     if (w > 0 && h > 1 && w <= 4096 && h <= 4096 && ys >= w && cs >= w &&
-        r[VPSS_IN_Y / 4] && r[VPSS_IN_C / 4]) {
+        ys <= 16384 && cs <= 16384 && r[VPSS_IN_Y / 4] && r[VPSS_IN_C / 4]) {
         g_autofree uint8_t *iy = g_malloc((size_t)ys * h);
         g_autofree uint8_t *ic = g_malloc((size_t)cs * (h / 2));
 
@@ -758,6 +761,10 @@ static void xm_isp2_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "xm-isp2: unknown layout '%s'", s->layout);
         return;
     }
+    if (!s->fps) {
+        error_setg(errp, "xm-isp2: fps must not be 0");
+        return;
+    }
     s->store = s->l->store_in_vi ? s->vi : s->vpss;
 }
 
@@ -772,11 +779,13 @@ static void xm_isp2_reset(DeviceState *dev)
     s->bpu_started = false;
     s->vpss_pending = 0;
     timer_del(s->vpss_timer);
+    timer_del(s->bpu_timer);
     s->frames = 0;
     s->end_phase = false;
     s->bpu_offline = false;
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / s->fps);
+    xm_isp2_update(s);
 }
 
 static void xm_isp2_init(Object *obj)

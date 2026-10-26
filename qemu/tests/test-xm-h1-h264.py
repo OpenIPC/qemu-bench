@@ -17,6 +17,9 @@ from importlib import import_module
 jt = import_module('test-xm-h1-jpeg')
 
 H1 = jt.H1
+# the second generation's H1 (XM533, XM535) sits where XM530V200 has its
+# JPEG engine
+H1_BASE = {'xm533': 0x21100000, 'xm535': 0x21100000}
 REG = dict(jt.REG, ENC_CTRL0=0x040, HDR_REM_MSB=0x058, HDR_REM_LSB=0x05c,
            RLC_CTRL=0x094)
 ENC_EN, MODE_H264, PIC_INTRA = 1, 3 << 1, 1 << 3
@@ -44,7 +47,8 @@ def main():
     ap.add_argument('--baseline', action='store_true',
                     help="Sofia's Baseline (CAVLC) SPS/PPS instead of majestic's")
     a = ap.parse_args()
-    global HEADERS, REMAINDER
+    global HEADERS, REMAINDER, H1
+    H1 = H1_BASE.get(a.machine, H1)
     w, h, qp = 704, 576, 28           # the SPS's size
     if a.baseline:
         HEADERS, REMAINDER = HEADERS_BASELINE, REMAINDER_BASELINE

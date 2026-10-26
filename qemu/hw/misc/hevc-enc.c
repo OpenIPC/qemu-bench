@@ -455,15 +455,16 @@ static int dc_level(int target, int qp, int log2n)
     static int16_t table[52][4][511];
     static bool filled[52][4];
     static QemuMutex lock;
-    static bool lock_init;
+    static gsize lock_init;
 
     if (target < -255 || target > 255 || log2n < 2 || log2n > 5) {
         return dc_level_search(target, qp, log2n);
     }
     if (!qatomic_load_acquire(&filled[qp][log2n - 2])) {
-        if (!lock_init) {
+        /* the engines' workers (one an instance) may race here */
+        if (g_once_init_enter(&lock_init)) {
             qemu_mutex_init(&lock);
-            lock_init = true;
+            g_once_init_leave(&lock_init, 1);
         }
         qemu_mutex_lock(&lock);
         if (!filled[qp][log2n - 2]) {

@@ -247,9 +247,12 @@ static void xm_audio_reset(DeviceState *dev)
     XmAudioState *s = XM_AUDIO(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->play_rd = s->play_wr = s->rec_rd = s->rec_wr = 0;
+    s->phase = 0;
     for (int n = 0; n < 2; n++) {
         timer_del(s->blk[n].timer);
         s->blk[n].rx_pos = s->blk[n].rx_len = 0;
+        s->blk[n].tx_len = 0;
         xm_audio_update(s, &s->blk[n]);
     }
 }
@@ -280,11 +283,14 @@ static void xm_audio_out_cb(void *opaque, int avail)
         const int n = MIN(avail / 2, ARRAY_SIZE(buf));
         size_t done;
 
+        unsigned rd = s->play_rd;
+
         for (int i = 0; i < n; i++) {
-            buf[i] = s->play_rd != s->play_wr ? s->play[s->play_rd++ % RING]
-                                              : 0;
+            buf[i] = rd != s->play_wr ? s->play[rd++ % RING] : 0;
         }
         done = AUD_write(s->out, buf, n * 2);
+        /* only what the backend took leaves the ring */
+        s->play_rd += MIN(done / 2, s->play_wr - s->play_rd);
         if (done < n * 2) {
             break;
         }

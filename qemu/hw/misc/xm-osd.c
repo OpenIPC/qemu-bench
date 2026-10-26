@@ -74,8 +74,10 @@ static void xm_osd_region(XmOsdState *s, int n)
     const int bh = (h + sy2) >> sy2;
     uint32_t pal[4];
 
+    /* bitmap pixels a row: rounded up when doubled across */
     if (!r[0] || r[0x04 / 4] != 4 || w <= 0 || h <= 0 || w > 4096 ||
-        h > 4096 || stride < w || bstride * 4 < (w >> sx2) || !r[0x40 / 4]) {
+        h > 4096 || stride < w || stride > 16384 || bstride > 4096 ||
+        bstride * 4 < ((w + sx2) >> sx2) || !r[0x40 / 4]) {
         return;
     }
     for (int i = 0; i < 4; i++) {

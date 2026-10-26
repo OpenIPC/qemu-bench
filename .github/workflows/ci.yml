@@ -98,7 +98,7 @@ jobs:
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)
-        run: python3 qemu/tests/test-xm-h1-h264.py --baseline
+        run: python3 qemu/tests/test-xm-h1-h264.py --baseline --machine xm535
 
       # The second generation's HEVC engines (XM535, XM533, XM530V200
       # layouts): slice data under the library's headers, P pictures that

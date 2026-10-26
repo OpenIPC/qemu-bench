@@ -96,20 +96,23 @@ static void xm_jpeg_quant(XmJpegState *s, int t, uint32_t val)
 static void xm_jpeg_job(XmJpegState *s)
 {
     const int w = R(s, J_SIZE) & 0xffff, h = R(s, J_SIZE) >> 16;
-    const int ys = R(s, J_STRIDE) ? R(s, J_STRIDE) : w;
+    const int ys = R(s, J_STRIDE) ? MIN(R(s, J_STRIDE), 16385u) : w;
+    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
     const uint32_t out = R(s, J_OUT);
-    const uint32_t cap = R(s, J_OUT_END) > out ? R(s, J_OUT_END) - out : 0;
+    /* a baseline scan of w x h never needs more than this, whatever room
+     * the guest gives */
+    const uint32_t cap = MIN(R(s, J_OUT_END) > out ? R(s, J_OUT_END) - out : 0,
+                             (uint64_t)w * h * 4 + 4096);
     bool overflow;
 
     R(s, J_LEN) = 0;
-    if (w < 8 || h < 8 || w > 4096 || h > 4096 || ys < w || !out || !cap ||
-        !R(s, J_SRC_Y) || !R(s, J_SRC_C)) {
+    if (w < 8 || h < 8 || w > 4096 || h > 4096 || ys < 2 * cw ||
+        ys > 16384 || !out || !cap || !R(s, J_SRC_Y) || !R(s, J_SRC_C)) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-jpeg: job %dx%d stride %d to "
                       "0x%x+%u not done\n", w, h, ys, out, cap);
         R(s, J_ERR) = ERR_BUF_FULL;
         return;
     }
-    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
     g_autofree uint8_t *y = g_malloc((size_t)ys * h);
     g_autofree uint8_t *uv = g_malloc((size_t)ys * ch);
     g_autofree uint8_t *cb = g_malloc((size_t)cw * ch);
