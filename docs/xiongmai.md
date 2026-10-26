@@ -158,6 +158,259 @@ source:
      which is how U-Boot sets QE. Treated as a page program, it had been
      ANDing two bytes into flash offset 0.
 
+## XM530V200 / XM533 / XM535
+
+The second generation (#154), each with its own machine. Dumps of XM530V200
+(its U-Boot says `XM550V200WX2`), XM533W1, XM535D1, XM535D2 and XM535W1
+cameras boot their vendor U-Boot 2014.04 (2023–2025 builds), 3.10.103
+kernel and Sofia:
+
+```sh
+qemu-system-arm -M xm530v200,flash-file=dump.bin -nographic
+qemu-system-arm -M xm533,flash-file=dump.bin -nographic
+qemu-system-arm -M xm535,flash-file=dump.bin -nographic
+```
+
+The kernel console stays off unless the saved environment (64 KiB at
+0x30000) has `xmuart=0`. The kernels name their machines `xm530v200`,
+`qiandaohu` (XM533; its modules say `xm530v300`) and `xm535`. They share
+the XM530's static I/O map (0x10000000, 0x20000000). Only the XM530V200
+kernel is SMP. Six things differ from the XM530, each read from those
+U-Boots and kernels:
+  1. **EL3.** `start.S` writes NSACR to open the FPU. That is UNDEF on a
+     core without the Security Extensions, so a flash boot keeps EL3 (the
+     A5 has it; `-kernel` still runs without). Without it the exception
+     goes to the unrelocated vectors at 0x60000004, and the serial port
+     never prints a byte.
+  2. **Link address 0x60000000,** the xmsfc window itself, not the
+     0x08000000 alias. Started at the alias, U-Boot returns from
+     `relocate_code` into `here + reloc_off` computed from the alias, below
+     DDR. These machines start CPU0 at the window (`flash_entry`) and have
+     no text alias.
+  3. **DDR is a DesignWare uMCTL2** at 0x20050000, with its PHY at +0x8000
+     and +0xC000 (`xm-umctl2`); there is no uPCTL at 0x100B0000. U-Boot polls STAT (operating mode normal),
+     DFISTAT `dfi_init_complete` and SWSTAT `sw_done_ack`. It polls PHY
+     +0x174 for exact values (0x403 after a training request, 0x30000 after
+     a bit-4 step), and PHY +0x158 for 1 or 0xC0 after the +0xA4 / +0xB0
+     requests (XM530V200 and XM535D2 only). It also waits on SYS +0xDC
+     reading back what it wrote (1, then 5).
+  4. **A latching SP804.** The XM530V200 kernel's clocksource writes
+     TimerControl with bit 8 set and waits for it to clear, then reads a
+     snapshot of TimerValue at +0x1C and inverts it. A stock SP804 has
+     neither. Without the latch the kernel's clock never advances and
+     printk stalls before the banner. A latch request that leaves the
+     control bits unchanged must not reach the stock model, which reloads
+     the counter on every control write.
+  5. **CPU1 in CPU0's security state.** U-Boot leaves CPU0 secure, and
+     `arm_set_cpu_on()` at EL1 would release CPU1 non-secure. Their banked
+     GIC groups then disagree, the IPIs between them are lost, and the
+     kernel stalls right after `Brought up 2 CPUs`. The XM535 kernels are
+     uniprocessor, so only XM530V200 shows it.
+  6. **The second SD slot became USB.** XM530's SDIO SDHCI at 0x50100000
+     moved to 0x50200000 (SPI 42) on XM533, its card slot (the SSV6158 SDIO
+     Wi-Fi is on 0x50000000). On XM530V200 and XM535, 0x50300000 (SPI 44) is the DWC2 USB OTG
+     core that `xm_usb0.ko` registers as the `dwc2` platform device (IRQ
+     76), for their USB Wi-Fi dongles. With an SDHCI there, `dwc2.ko` fails
+     (`AHB Idle timeout`, -16). Unmapped, the arasan driver spins with IRQs
+     off on the clock-stable bit, which has no timeout.
+
+  **SD card.** `-drive if=sd,index=0,file=card.img,format=raw` puts a card
+  in the board's slot. A blank image is fine: Sofia finds `mmcblk0`, formats
+  it with its own WFS filesystem (an `XM`-signed MBR, not FAT), and records
+  from then on. The recordings are XM's stream format: `00 00 01 FC` (I
+  frame, 16-byte header, length at +12), `FD` (P frame, length at +4), `FA`
+  (audio) and `F9` (info), both with a 16-bit length at +6, then the
+  HEVC/H.264 NAL units. Which controller has the slot comes from
+  `rootfs/usr/etc/loadpublic`, whose `sdioN_sd.ko` registers the arasan
+  platform device:
+  - XM530V200, XM535D1, XM535D2: `sdio0_sd.ko`, 0x50000000 (SPI 41).
+  - XM533: `sdio1_sd.ko`, 0x50200000 (SPI 42); its SSV6158 Wi-Fi uses
+    0x50000000. `sd_slot` maps drive index 0 there. A card on the Wi-Fi
+    controller probes but gets that device's platform data. Platform data
+    +0x18, "auto CMD12", is 0, so the driver sets transfer mode 0x33 and
+    never sends CMD12 after a multi-block read; the card stays in the data
+    state (`timed out sending r/w cmd command`).
+  - XM535W1 (X2W-WNG): no slot. Its `loadpublic` comments `sdio1_sd.ko`
+    out.
+
+  Sofia comes up, finds no sensor or Wi-Fi card, and after a while reboots
+  the camera itself (`xmsfc_shutdown`, `Restarting system.`). The machine
+  reset brings it back through U-Boot. XM210, XM212 and XM232 dumps from the
+  same issue are RISC-V parts (`auipc gp` / `csrw mtvec` at flash offset 0)
+  and are out of scope for `qemu-system-arm`.
+
+### Video (xm-isp2, xm-hevc, xm-osd, xm-nn)
+
+Sofia captures, encodes and serves RTSP (`rtsp://IP:554/user=admin&password=&channel=1&stream=0.sdp?real_stream`,
+`stream=1` the sub stream, `channel=N` per camera on XM535D2). The sensor
+is not modelled; the capture blocks produce a test picture, the OpenIPC
+logo with a moving dot, as the Allwinner models do:
+  - **xm-isp2**: the VICUs (capture, a frame interrupt block per VICU), the
+    BPU (Bayer processing, online or offline as isp.ko asks), the VPSS
+    (XM530V200's vpss.ko runs memory-to-memory jobs; newer XM535 isp.ko
+    runs it inline behind each BPU job) and XM533's VI store. The picture
+    is drawn where the frame lands. Multi-lens boards draw each lens with
+    the dot at its own phase: XM530V200 X6C and XM535D1 splice two lenses
+    into one stream, XM535D2 serves three cameras.
+  - **xm-hevc**: the HEVC engines (layouts `xm535`, `xm533`, `xm530v200`).
+    The vendor library writes the parameter sets and slice header; the
+    model writes the slice data (`hevc-enc.c`) under them, so its CABAC
+    must follow the library's choices: CTB 16 without SAO (XM535, XM533)
+    or CTB 32 with SAO (XM530V200), deblocking with beta offset +5.
+    Every CU is 8x8 with a DC-only intra block, or, in a P picture,
+    skipped: zero motion into the previous picture, the only one the
+    library's RPS names. A CU is skipped where copying the reference costs
+    no more than coding it again (squared error plus lambda times the
+    intra CU's bits). The encoder runs the decoder's deblocking filter so
+    its reconstruction is the decoder's bit for bit, and keeps each
+    decoded picture on the host under the reconstruction address the job
+    programs (+0x0B0 on XM535, +0x1F0 on the others); a P job's reference
+    address (+0x0A8 / +0x1E8) names it. P pictures of the test picture
+    are about 1 KB. `cu_qp_delta` caps the QP at 22 whatever the slice
+    QP: the rate control raises that to 44 within a GOP, and DC-only
+    blocks need the finer steps. `-global xm-hevc.dump-dir=DIR` keeps
+    every job as a whole access unit.
+  - **xm-osd**: the OSD engine (rgn.ko) blends the clock and title into
+    the frame in place (2 bits a pixel, two regions a job). XM535's main
+    streams use the HEVC engine's own overlay regions instead.
+  - **xm-nn**: nn.ko's accelerator completes its jobs (nothing is
+    computed). Without it Sofia times out (`cnn wait for timeout`) and,
+    on XM530V200, crashes.
+
+Some boards need flags: XM535W1 `sensor-id=da4d` and
+`-global xm-isp2.vicus=1 -global xm-isp2.sensor-width=1280 -global xm-isp2.sensor-lines=728`,
+XM533 `-global xm-isp2.vicus=1 -global xm-isp2.sensor-width=1920 -global xm-isp2.sensor-lines=1088`,
+XM535D1/D2 `-global xm-isp2.vicus=2` (D2 also `-m 128M`).
+
+With `-smp 2` the XM530V200 pipeline stalls after a while: isp.ko stops
+starting BPU jobs (both ISP buffers end up off its free and BPU lists).
+Run it uniprocessor.
+
+### Audio (xm-audio)
+
+`i2s.ko` moves 16-bit mono samples by programmed I/O through two I2S
+blocks in the 0x10060000 window; `acodec.ko` programs the codec at +0x8000,
+which only has to read back. Per block, AI at +0x6000 (Linux IRQ 48, SPI 16)
+and AO at +0x7000 (IRQ 49, SPI 17):
+
+| Offset | Register |
+|---|---|
+| +0x00 | control: bit 0 on, bit 1 transmit (`ao_open` sets 3), bit 2 receive (`ai_open` sets 0x25) |
+| +0x10 | transmit status: bit 2 wants a chunk, bit 1 almost empty, bit 0 underrun |
+| +0x20 | receive status: bit 4 a chunk is in, bit 3 full, bit 0 overrun |
+| +0x38 | FIFO, 16-bit accesses |
+
+The handler moves one chunk per interrupt, 256 samples on XM530V200 and
+160 (20 ms at 8 kHz) on XM535 and XM533, then writes the status words back.
+The model raises a chunk every chunk / rate of virtual time while a
+direction is on. Capture is a 1 kHz sine (`-global xm-audio.tone=N`), so
+the RTSP audio track (PCMA, payload type 8) carries a tone; playback is
+dropped, or played to an audiodev:
+
+```sh
+-audiodev wav,id=a0,path=out.wav -global xm-audio.audiodev=a0
+```
+
+With `-global xm-audio.mic=on` capture comes from that audiodev too. Sofia's
+prompts (`welcome.pcm`) land in the wav. The tone arrives about 22 dB down,
+which is Sofia's own input gain. On a busy guest Sofia's encoder falls
+behind: a uniprocessor XM530V200 streaming its main stream sends about 0.3 s
+of audio per second.
+
+### JPEG snapshots (xm-jpeg)
+
+XM530V200 has no `hx280enc`: 0x21100000 (SPI 46) is the JPEG engine that
+`jpeg.ko` drives for Sofia's snapshots (VENC channel 4, 640x360). With an
+SD card in, Sofia snapshots while it records. Without the engine every
+snapshot waits out `jpeg.ko`'s one-second timeout (`wl_jpeg_wait_ready error
+status=0x80`, `GetJPEGTimeout`), and the live streams starve: 13 frames in
+120 s of RTSP.
+
+`jpeg.ko` writes the library's register list and sleeps until +0x3C reads 3
+(or +0x40 has an error bit). The registers the library programs:
+
+| Offset | Register |
+|---|---|
+| +0x000 | 1: start; the interrupt handler writes 0 |
+| +0x00C | height << 16 \| width |
+| +0x014 | source stride |
+| +0x060 / +0x064 | luma / chroma quantisers, a write each: `1 << 24 \| (0x40 + i) << 16 \| 65536 / q`, natural order |
+| +0x088 / +0x08C | where the scan goes / the buffer's end |
+| +0x090 / +0x094 | source luma / chroma (NV12) |
+| +0x03C | 3: done |
+| +0x044 | bytes of scan written |
+
+The library writes SOI, DQT, SOF0, DHT (Annex K) and SOS up to +0x088
+itself, and EOI after the scan. The model writes only the entropy-coded
+scan, with the encoder shared with `xm-h1` (`jpeg-enc.c`).
+`-global xm-jpeg.dump-dir=DIR` keeps each job as a whole JPEG. XM535 and
+XM533 have no `jpeg.ko`: their snapshots go through the H1 at the same
+address.
+
+### USB and Wi-Fi
+
+XM530V200 and XM535 get QEMU's `dwc2-usb` (raspi's model) at 0x50300000.
+Its root port takes any QEMU USB device; give `bus=usb-bus.0,port=1` to
+plug one in directly instead of behind QEMU's automatic hub.
+
+Their Wi-Fi is an AltoBeam ATBM60xx USB dongle (`atbm-wifi`):
+
+```sh
+# X2-WQ2 (XM530V200, xm713g.ko, 007a:8888, ARES_B)
+-netdev user,id=w,net=192.168.50.0/24 \
+-device atbm-wifi,bus=usb-bus.0,port=1,netdev=w
+# XM535W1 / D1 (6012B_x.ko, 007a:888b, AresLite)
+-device atbm-wifi,bus=usb-bus.0,port=1,netdev=w,pid=0x888b,chip-version=0x4a
+```
+
+The chip runs an LMAC firmware that speaks ST-Ericsson's CW1200 WSM to the
+driver (`hal_apollo`, source in OpenIPC's `atbm_60xx`). The model answers
+WSM itself:
+  - EP0 vendor requests 0/1 and 4/5 read and write chip memory (wValue /
+    wIndex the address halves). The firmware download lands in it.
+  - The chip version is at 0x0acc017c. Clearing bit 8 of 0x16101000
+    releases the CPU; that sends the startup indication, with
+    CAPABILITIES_NO_CONFIRM, which the CONFIG_TX_NO_CONFIRM drivers
+    insist on.
+  - Bulk OUT carries `wsm_hdr_tx` built with USB_BUS_BUG: flag, usb_len
+    and id, len and id. Bulk IN carries `wsm_hdr` plus the body. The
+    sequence number is in bits 13..15, the interface in bits 6..9.
+  - Commands get a confirm with status 0. Configuration carries the MAC,
+    read-MIB a zeroed MIB, and join the power levels.
+  - TX requests (the old rate policy: the 802.11 frame at +32) get a TX
+    confirm only when htTxParameters asks for one (bit 8). The
+    others are freed by the driver itself; 0x0420 must not be sent, as
+    xm713g.ko's confirm table traps on it.
+  - The model is an open access point (`ssid`, default `OpenIPC`;
+    `channel`, default 6):
+    - a scan gets a probe response, a beacon and the scan-complete
+      indication;
+    - it answers authentication and (re)association;
+    - 802.11 data frames with LLC/SNAP are bridged to and from the
+      netdev, as Ethernet.
+  - RX indications are status, channel, rate, RSSI, flags and
+    channel_type (the driver is built with 40 MHz support), then the
+    frame.
+  - Bulk IN NAKs while there is nothing to send. Completing it later
+    (USB_RET_ASYNC) would be cheaper, but the driver kills its IN URBs on
+    recovery, and the DWC2 model does not cancel a halted channel's
+    in-flight packet.
+
+The driver binds, wlan comes up as `eth3`, and wpa_supplicant associates
+(`key_mgmt=NONE`). The netdev's DHCP leases an address and RTSP runs
+over it. Two limits:
+  - **Sofia's own Wi-Fi setup.** With no saved Wi-Fi config, wlandaemon
+    hops channels in monitor mode waiting for provisioning (QR code /
+    smart link). Sofia also strips any address set on `eth3` by hand. A
+    test therefore stops wlandaemon, runs wpa_supplicant and `udhcpc -s
+    /usr/sbin/udhcpc.script`, and holds the address.
+  - **Cost.** The channel hopping costs guest CPU: on XM530V200 the main
+    stream's frame rate over Ethernet about halves with the dongle
+    plugged in.
+
+WPA (the 4-way handshake), XM535D2's `6132cu.ko`, and XM533's SDIO
+SSV6158 are not modelled.
+
 ## XM530 media pipeline (in progress)
 
 What majestic's vendor SDK talks to on XM530. Everything here was read from
@@ -431,4 +684,5 @@ Interrupt blocks follow XM530's shape, enable at +0 and status at +0xC:
   mux 0/1/5/7 = `0x3000`/`0x300500`/`0xf`/`0x1`, and port 8 driving pin 1
   (line 65) high.
 - **Regbanks:** blocks with no model yet are RAM-backed `hisi-regbank` stubs,
-  so drivers and vendor modules can map them: PL330, RTC and I2S.
+  so drivers and vendor modules can map them: PL330, RTC and (first
+  generation) I2S.

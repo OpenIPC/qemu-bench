@@ -5,7 +5,10 @@
  *
  *   +0x00 CTRL    bit 6 pulses a TX FIFO reset, bit 7 an RX FIFO reset;
  *                 0x0B starts a write of WCNT bytes from the TX FIFO,
- *                 0x803 a read of RCNT bytes into the RX FIFO
+ *                 0x803 a read of RCNT bytes into the RX FIFO,
+ *                 0x903 both in one transaction: WCNT bytes out, a
+ *                 repeated start, RCNT bytes in (the XM530V200 / XM533 /
+ *                 XM535 i2c.ko reads registers this way)
  *   +0x0C ADDR    7-bit slave address (ipctool passes 0x34 >> 1 for Sony)
  *   +0x10 TXDATA  one byte per write: register address MSB first, then data
  *   +0x14 RXDATA  one byte per read, in bus order
@@ -51,6 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmI2cState, XM_I2C)
 #define CTRL_RX_RESET   (1u << 7)
 #define CTRL_START_WR   0x00B
 #define CTRL_START_RD   0x803
+#define CTRL_START_WRRD 0x903
 #define CTRL_START_MASK 0x003
 #define ST_WR_DONE      (1u << 4)
 #define ST_RD_DONE      (1u << 5)
@@ -117,6 +121,40 @@ static void xm_i2c_read_xfer(XmI2cState *s)
     s->st |= ST_RD_DONE;
 }
 
+/* 0x903: the register address out, a repeated start, the data in.  Only
+ * read-done is set, which is all the driver waits for. */
+static void xm_i2c_write_read_xfer(XmI2cState *s)
+{
+    uint32_t n = s->wcnt;
+    bool ok;
+
+    fifo8_reset(&s->rx);
+    if (n > fifo8_num_used(&s->tx) || s->rcnt > XM_I2C_FIFO) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-i2c: write-read of %u+%u bytes "
+                      "with %u queued\n", n, s->rcnt, fifo8_num_used(&s->tx));
+        fifo8_reset(&s->tx);
+        return;
+    }
+    ok = !i2c_start_send(s->bus, s->addr & 0x7f);
+    while (ok && n--) {
+        ok = !i2c_send(s->bus, fifo8_pop(&s->tx));
+    }
+    fifo8_reset(&s->tx);
+    if (ok) {
+        ok = !i2c_start_recv(s->bus, s->addr & 0x7f);
+    }
+    if (ok) {
+        for (n = s->rcnt; n; n--) {
+            fifo8_push(&s->rx, i2c_recv(s->bus));
+        }
+        i2c_nack(s->bus);
+    }
+    i2c_end_transfer(s->bus);
+    if (ok) {
+        s->st |= ST_RD_DONE;
+    }
+}
+
 static uint64_t xm_i2c_read(void *opaque, hwaddr off, unsigned size)
 {
     XmI2cState *s = XM_I2C(opaque);
@@ -157,6 +195,8 @@ static void xm_i2c_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             xm_i2c_write_xfer(s);
         } else if (val == CTRL_START_RD) {
             xm_i2c_read_xfer(s);
+        } else if (val == CTRL_START_WRRD) {
+            xm_i2c_write_read_xfer(s);
         }
         /* The start bits clear when the transfer ends: the driver pulses
          * the FIFO resets as "old | bit" then "old", and old would
