@@ -38,7 +38,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(XmGpioState, XM_GPIO)
 
 #define XM_GPIO_SIZE        0x10000
-#define XM_GPIO_MAX_PADS    128
+#define XM_GPIO_MAX_PADS    256
 
 #define PAD_OUT_EN          (1u << 10)
 #define PAD_OUT_HIGH        (1u << 11)
@@ -50,6 +50,7 @@ struct XmGpioState {
     MemoryRegion iomem;
     uint32_t regs[XM_GPIO_SIZE / 4];
     uint32_t pads;
+    uint32_t adc_off;           /* 0, or the ADC data word: reads full scale */
     bool in_level[XM_GPIO_MAX_PADS];
     qemu_irq out[XM_GPIO_MAX_PADS];
 };
@@ -66,6 +67,12 @@ static uint64_t xm_gpio_read(void *opaque, hwaddr off, unsigned size)
     const uint32_t pad = off / 4;
     uint32_t v = s->regs[pad];
 
+    /* The ADC the vendor adc.ko reads (XM533 / XM535: select +0xCC0, data
+     * +0xCC4) is where Sofia's ADC keys sit -- the reset key among them,
+     * pressed at 0.  Nothing pulls it down here: full scale, released. */
+    if (s->adc_off && off == s->adc_off) {
+        return 0x3ff;
+    }
     if (pad < s->pads) {
         const int driven = xm_gpio_driven(v);
         const bool level = driven >= 0 ? driven : s->in_level[pad];
@@ -150,6 +157,7 @@ static void xm_gpio_realize(DeviceState *dev, Error **errp)
 
 static const Property xm_gpio_props[] = {
     DEFINE_PROP_UINT32("pads", XmGpioState, pads, 100),
+    DEFINE_PROP_UINT32("adc-offset", XmGpioState, adc_off, 0),
 };
 
 static void xm_gpio_class_init(ObjectClass *klass, const void *data)

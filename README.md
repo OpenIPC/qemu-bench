@@ -8,7 +8,7 @@ desk. Vendor families covered:
 
 - **HiSilicon** V1–V5 IPC, DVR/NVR and STB SoCs, plus their Goke/XMedia
   rebrands (GK7205, GK7206, …) — the table-driven core
-- **Xiongmai** XM510 / XM530 / XM550
+- **Xiongmai** XM510 / XM530 / XM550, and XM530V200 / XM533 / XM535
 - **Goke** GK7101 / GK7102 and the GK710xS die
 - **Anyka** AK39xx
 - **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375)
@@ -22,10 +22,10 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (84 total)
+## Supported Machines (87 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -113,6 +113,17 @@ modelled yet.
 | `xm510` | Cortex-A5 (A9 stand-in) | PL190 VIC | 3.0.101 vendor | yes |
 | `xm530` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes |
 | `xm550` | Cortex-A5 ×2 (A9 stand-in), 128 MB | GIC | 3.10.103 vendor | yes |
+| `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+
+³ Flash boot of a camera dump only: vendor U-Boot, kernel and Sofia, no
+OpenIPC release yet. These are the second-generation parts (#154): DDR
+behind a uMCTL2, U-Boot entered at the flash window, a latching SP804, and
+the SDIO controller moved. Sofia streams H.265 over RTSP from a test
+picture (capture, ISP, VPSS, HEVC and JPEG engines, OSD), with audio, SD
+recording, USB and an AltoBeam USB Wi-Fi dongle; multi-lens boards (spliced
+and three-camera) included. See [docs/xiongmai.md](docs/xiongmai.md).
 
 Not HiSilicon parts, although their BSP kernels started from HiSilicon
 templates: the memory map and the flash controller (xmsfc) are Xiongmai's own,
@@ -138,7 +149,10 @@ CI covers:
 `xm530` and `xm550` boot the `xm530_lite` release with `-smp 2`: CPU1 is
 released through `REG_SC_REMAP` and `REG_CPU1_SOFT_RST` as on silicon.
 An XM550 camera's full flash dump boots through its own U-Boot to `login:`
-with `-M xm550,flash-file=dump.bin -smp 2`.
+with `-M xm550,flash-file=dump.bin -smp 2`. Dumps of XM530V200, XM533 and
+XM535 cameras boot the same way on `xm530v200` (`-smp 2`), `xm533` and
+`xm535`, through their vendor U-Boot and kernel to Sofia. Their kernels
+print only with `xmuart=0` in the saved U-Boot environment.
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,

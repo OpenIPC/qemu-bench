@@ -17,6 +17,9 @@ from importlib import import_module
 jt = import_module('test-xm-h1-jpeg')
 
 H1 = jt.H1
+# the second generation's H1 (XM533, XM535) sits where XM530V200 has its
+# JPEG engine
+H1_BASE = {'xm533': 0x21100000, 'xm535': 0x21100000}
 REG = dict(jt.REG, ENC_CTRL0=0x040, HDR_REM_MSB=0x058, HDR_REM_LSB=0x05c,
            RLC_CTRL=0x094)
 ENC_EN, MODE_H264, PIC_INTRA = 1, 3 << 1, 1 << 3
@@ -26,6 +29,11 @@ INT_ERROR, INT_BUF_FULL = 1 << 3, 1 << 5    # Hantro's ASIC_STATUS_ERROR / _BUFF
 HEADERS = bytes.fromhex('00000001274d001f8d6a0b012684000003000400000300ca10'
                         '0000000128ee0b')
 REMAINDER = 0xc8
+# --baseline: what Sofia's library writes on the second-generation XM535
+# (its 800x448 substream): Baseline profile, so CAVLC, and POC type 2
+HEADERS_BASELINE = bytes.fromhex('000000012742001f8d6a0c839a1000000300100000'
+                                 '030108400000000128ce3c')
+REMAINDER_BASELINE = 0x80
 IN_ADDR, BUF_ADDR, BUF_SIZE = 0x81000000, 0x82000000, 0x100000
 
 
@@ -36,8 +44,15 @@ def main():
     ap.add_argument('--machine', default='xm530')
     ap.add_argument('--keep')
     ap.add_argument('--frames', type=int, default=4)
+    ap.add_argument('--baseline', action='store_true',
+                    help="Sofia's Baseline (CAVLC) SPS/PPS instead of majestic's")
     a = ap.parse_args()
+    global HEADERS, REMAINDER, H1
+    H1 = H1_BASE.get(a.machine, H1)
     w, h, qp = 704, 576, 28           # the SPS's size
+    if a.baseline:
+        HEADERS, REMAINDER = HEADERS_BASELINE, REMAINDER_BASELINE
+        w, h = 800, 448
     fails = 0
 
     def check(ok, what):

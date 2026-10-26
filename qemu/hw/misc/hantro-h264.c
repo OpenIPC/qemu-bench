@@ -19,8 +19,13 @@
  * Entropy coding is CABAC when the PPS asks for it, which majestic's
  * Main-profile setting does.  The arithmetic coder and the residual block
  * coding follow x264 (encoder/cabac.c, common/cabac.c; x264 project,
- * GPL-2.0-or-later); the tables are in hantro-h264-tables.h.  CAVLC PPSs
- * are not supported yet.
+ * GPL-2.0-or-later); the tables are in hantro-h264-tables.h.
+ *
+ * Otherwise CAVLC (ITU-T H.264 9.2), which a Baseline PPS needs (Sofia's,
+ * on the second-generation XM53x).  Only two residual blocks ever occur:
+ * Intra16x16DCLevel, whose nC is always 0 -- its neighbours' 4x4 blocks
+ * carry no AC coefficients, cbp luma being 0 -- and ChromaDCLevel (nC -1).
+ * The VLC tables are the standard's (Tables 9-5, 9-7, 9-8, 9-9, 9-10).
  *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
@@ -232,6 +237,167 @@ typedef struct Cabac {
     int low, range, queue, outstanding;
     uint8_t *p, *start, *end;
 } Cabac;
+
+/* ---- CAVLC (9.2) ------------------------------------------------------- */
+
+/* coeff_token, 0 <= nC < 2 (Table 9-5), [TotalCoeff][TrailingOnes] */
+static const uint8_t ct_len0[17][4] = {
+    { 1 }, { 6, 2 }, { 8, 6, 3 }, { 9, 8, 7, 5 }, { 10, 9, 8, 6 },
+    { 11, 10, 9, 7 }, { 13, 11, 10, 8 }, { 13, 13, 11, 9 },
+    { 13, 13, 13, 10 }, { 14, 14, 13, 11 }, { 14, 14, 14, 13 },
+    { 15, 15, 14, 14 }, { 15, 15, 15, 14 }, { 16, 15, 15, 15 },
+    { 16, 16, 16, 15 }, { 16, 16, 16, 16 }, { 16, 16, 16, 16 },
+};
+static const uint8_t ct_bits0[17][4] = {
+    { 1 }, { 5, 1 }, { 7, 4, 1 }, { 7, 6, 5, 3 }, { 7, 6, 5, 3 },
+    { 7, 6, 5, 4 }, { 15, 6, 5, 4 }, { 11, 14, 5, 4 }, { 8, 10, 13, 4 },
+    { 15, 14, 9, 4 }, { 11, 10, 13, 12 }, { 15, 14, 9, 12 },
+    { 11, 10, 13, 8 }, { 15, 1, 9, 12 }, { 11, 14, 13, 8 },
+    { 7, 10, 9, 12 }, { 4, 6, 5, 8 },
+};
+/* coeff_token, nC == -1: chroma DC 4:2:0 */
+static const uint8_t ct_len_cdc[5][4] = {
+    { 2 }, { 6, 1 }, { 6, 6, 3 }, { 6, 7, 7, 6 }, { 6, 8, 8, 7 },
+};
+static const uint8_t ct_bits_cdc[5][4] = {
+    { 1 }, { 7, 1 }, { 4, 6, 1 }, { 3, 3, 2, 5 }, { 2, 3, 2, 0 },
+};
+/* total_zeros, 4x4 blocks (Tables 9-7, 9-8): [TotalCoeff - 1][total_zeros] */
+static const uint8_t tz_len[15][16] = {
+    { 1, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 9 },
+    { 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 6, 6, 6, 6 },
+    { 4, 3, 3, 3, 4, 4, 3, 3, 4, 5, 5, 6, 5, 6 },
+    { 5, 3, 4, 4, 3, 3, 3, 4, 3, 4, 5, 5, 5 },
+    { 4, 4, 4, 3, 3, 3, 3, 3, 4, 5, 4, 5 },
+    { 6, 5, 3, 3, 3, 3, 3, 3, 4, 3, 6 },
+    { 6, 5, 3, 3, 3, 2, 3, 4, 3, 6 },
+    { 6, 4, 5, 3, 2, 2, 3, 3, 6 },
+    { 6, 6, 4, 2, 2, 3, 2, 5 },
+    { 5, 5, 3, 2, 2, 2, 4 },
+    { 4, 4, 3, 3, 1, 3 },
+    { 4, 4, 2, 1, 3 },
+    { 3, 3, 1, 2 },
+    { 2, 2, 1 },
+    { 1, 1 },
+};
+static const uint8_t tz_bits[15][16] = {
+    { 1, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 1 },
+    { 7, 6, 5, 4, 3, 5, 4, 3, 2, 3, 2, 3, 2, 1, 0 },
+    { 5, 7, 6, 5, 4, 3, 4, 3, 2, 3, 2, 1, 1, 0 },
+    { 3, 7, 5, 4, 6, 5, 4, 3, 3, 2, 2, 1, 0 },
+    { 5, 4, 3, 7, 6, 5, 4, 3, 2, 1, 1, 0 },
+    { 1, 1, 7, 6, 5, 4, 3, 2, 1, 1, 0 },
+    { 1, 1, 5, 4, 3, 3, 2, 1, 1, 0 },
+    { 1, 1, 1, 3, 3, 2, 2, 1, 0 },
+    { 1, 0, 1, 3, 2, 1, 1, 1 },
+    { 1, 0, 1, 3, 2, 1, 1 },
+    { 0, 1, 1, 2, 1, 3 },
+    { 0, 1, 1, 1, 1 },
+    { 0, 1, 1, 1 },
+    { 0, 1, 1 },
+    { 0, 1 },
+};
+/* total_zeros, chroma DC 4:2:0 (Table 9-9a) */
+static const uint8_t tz_len_cdc[3][4] = {
+    { 1, 2, 3, 3 }, { 1, 2, 2 }, { 1, 1 },
+};
+static const uint8_t tz_bits_cdc[3][4] = {
+    { 1, 1, 1, 0 }, { 1, 1, 0 }, { 1, 0 },
+};
+/* run_before (Table 9-10): [min(zerosLeft, 7) - 1][run_before] */
+static const uint8_t rb_len[7][15] = {
+    { 1, 1 }, { 1, 2, 2 }, { 2, 2, 2, 2 }, { 2, 2, 2, 3, 3 },
+    { 2, 2, 3, 3, 3, 3 }, { 2, 3, 3, 3, 3, 3, 3 },
+    { 3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
+};
+static const uint8_t rb_bits[7][15] = {
+    { 1, 0 }, { 1, 1, 0 }, { 3, 2, 1, 0 }, { 3, 2, 1, 1, 0 },
+    { 3, 2, 3, 2, 1, 0 }, { 3, 0, 1, 3, 2, 5, 4 },
+    { 7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+};
+
+/* residual_block_cavlc() for coefficients in scan order; chroma_dc picks
+ * the nC == -1 tables, otherwise nC is 0 (see the file comment). */
+static void cavlc_residual(BitWriter *w, const int *c, int max, bool chroma_dc)
+{
+    int total = 0, t1 = 0, last = -1, i, n;
+    int lev[16], run[16];               /* nonzero coefficients, high first */
+
+    for (i = max - 1; i >= 0; i--) {
+        if (c[i]) {
+            if (last < 0) {
+                last = i;
+            }
+            lev[total] = c[i];
+            run[total] = 0;
+            total++;
+        } else if (total) {
+            run[total - 1]++;           /* zeros below that coefficient */
+        }
+    }
+    for (i = 0; i < total && i < 3 && abs(lev[i]) == 1; i++) {
+        t1++;
+    }
+    if (chroma_dc) {
+        bw_bits(w, ct_bits_cdc[total][t1], ct_len_cdc[total][t1]);
+    } else {
+        bw_bits(w, ct_bits0[total][t1], ct_len0[total][t1]);
+    }
+    if (!total) {
+        return;
+    }
+    for (i = 0; i < t1; i++) {
+        bw_bits(w, lev[i] < 0, 1);
+    }
+    int suffix_len = total > 10 && t1 < 3;
+    for (i = t1; i < total; i++) {
+        int code = lev[i] > 0 ? 2 * lev[i] - 2 : -2 * lev[i] - 1;
+
+        if (i == t1 && t1 < 3) {
+            code -= 2;
+        }
+        if (suffix_len == 0) {
+            if (code < 14) {
+                bw_bits(w, 1, code + 1);
+            } else if (code < 30) {
+                bw_bits(w, 1, 15);
+                bw_bits(w, code - 14, 4);
+            } else {
+                bw_bits(w, 1, 16);
+                bw_bits(w, MIN(code - 30, 4095), 12);
+            }
+        } else if (code < (15 << suffix_len)) {
+            bw_bits(w, 1, (code >> suffix_len) + 1);
+            bw_bits(w, code & ((1 << suffix_len) - 1), suffix_len);
+        } else {
+            bw_bits(w, 1, 16);
+            bw_bits(w, MIN(code - (15 << suffix_len), 4095), 12);
+        }
+        if (suffix_len == 0) {
+            suffix_len = 1;
+        }
+        if (abs(lev[i]) > (3 << (suffix_len - 1)) && suffix_len < 6) {
+            suffix_len++;
+        }
+    }
+    if (total < max) {
+        int tz = 0;
+        for (i = 0; i < last; i++) {
+            tz += c[i] == 0;
+        }
+        if (chroma_dc) {
+            bw_bits(w, tz_bits_cdc[total - 1][tz], tz_len_cdc[total - 1][tz]);
+        } else {
+            bw_bits(w, tz_bits[total - 1][tz], tz_len[total - 1][tz]);
+        }
+        int left = tz;
+        for (n = 0; n < total - 1 && left > 0; n++) {
+            const int t = MIN(left, 7) - 1;
+            bw_bits(w, rb_bits[t][run[n]], rb_len[t][run[n]]);
+            left -= run[n];
+        }
+    }
+}
 
 static void cabac_init(Cabac *c, int qp, uint8_t *p, uint8_t *end)
 {
@@ -609,8 +775,9 @@ static void recon_mb(Frame *f, int mx, int my, int pred, const int lev[16],
     }
 }
 
-static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
-                      int qp, int qpc)
+/* cw: write the macroblock with CAVLC there instead of CABAC to c */
+static void encode_mb(Frame *f, Cabac *c, BitWriter *cw, MbInfo *info,
+                      int mx, int my, int qp, int qpc)
 {
     MbInfo *me = &info[my * f->mbw + mx];
     const MbInfo *ma = mx ? &info[my * f->mbw + mx - 1] : NULL;
@@ -666,6 +833,26 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
     }
     const int cbp_chroma = chroma_nz ? 1 : 0;
 
+    int scan[16], nz = 0;
+    for (i = 0; i < 16; i++) {
+        scan[i] = lev[zigzag4x4[i]];
+        nz |= scan[i] != 0;
+    }
+    if (cw) {
+        /* mb_type I_16x16_2_<cbp chroma>_0 (Table 7-11): 1 + 2 + 4 * cbpc */
+        bw_ue(cw, 3 + 4 * cbp_chroma);
+        bw_ue(cw, 0);                                   /* chroma pred: DC */
+        bw_se(cw, 0);                                   /* mb_qp_delta */
+        cavlc_residual(cw, scan, 16, false);
+        for (comp = 0; comp < 2 && cbp_chroma; comp++) {
+            cavlc_residual(cw, clev[comp], 4, true);
+        }
+        if (!cbp_chroma) {
+            memset(clev, 0, sizeof(clev));
+        }
+        goto reconstruct;
+    }
+
     /* mb_type: I_16x16, pred DC (2), cbp luma 0, cbp chroma 0/1 */
     const int ctx0 = 3 + (ma != NULL) + (mb != NULL);
     cabac_decision(c, ctx0, 1);                         /* not I_NxN */
@@ -683,11 +870,6 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
     cabac_decision(c, 60, 0);                           /* mb_qp_delta = 0 */
 
     /* Intra16x16DCLevel, ctxBlockCat 0 */
-    int scan[16], nz = 0;
-    for (i = 0; i < 16; i++) {
-        scan[i] = lev[zigzag4x4[i]];
-        nz |= scan[i] != 0;
-    }
     const int cbf_a = ma ? ma->luma_dc_cbf : 1, cbf_b = mb ? mb->luma_dc_cbf : 1;
     cabac_decision(c, 85 + cbf_a + 2 * cbf_b, nz != 0);
     if (nz) {
@@ -719,6 +901,8 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
         memset(clev, 0, sizeof(clev));
     }
 
+reconstruct:
+    /* reconstruct, exactly as a decoder (8.5.10, 8.5.11) */
     recon_mb(f, mx, my, pred, lev, qp, cpred, clev, qpc);
 }
 
@@ -755,7 +939,7 @@ size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
     Cabac c;
     int mx, my;
 
-    if (!e->have_sps || !e->have_pps || !e->cabac || e->unsupported) {
+    if (!e->have_sps || !e->have_pps || e->unsupported) {
         return 0;
     }
     qp = MIN(MAX(qp, 0), 51);
@@ -798,31 +982,44 @@ size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
         bw_se(&w, 0);
         bw_se(&w, 0);
     }
-    while (w.bits) {                                    /* cabac_alignment */
-        bw_bits(&w, 1, 1);
-    }
-
     f.y = g_malloc(f.w * f.h);
     f.cb = g_malloc(f.w * f.h / 4);
     f.cr = g_malloc(f.w * f.h / 4);
-    cabac_init(&c, qp, rbsp + w.n, rbsp + rbsp_cap);
     const int qpc = chroma_qp(qp, e->chroma_qp_offset);
-    for (my = 0; my < mbh; my++) {
-        for (mx = 0; mx < mbw; mx++) {
-            encode_mb(&f, &c, info, mx, my, qp, qpc);
-            if (mx == mbw - 1 && my == mbh - 1) {
-                cabac_flush(&c);
-            } else {
-                cabac_terminate0(&c);
+    size_t len;
+    if (e->cabac) {
+        while (w.bits) {                                /* cabac_alignment */
+            bw_bits(&w, 1, 1);
+        }
+        cabac_init(&c, qp, rbsp + w.n, rbsp + rbsp_cap);
+        for (my = 0; my < mbh; my++) {
+            for (mx = 0; mx < mbw; mx++) {
+                encode_mb(&f, &c, NULL, info, mx, my, qp, qpc);
+                if (mx == mbw - 1 && my == mbh - 1) {
+                    cabac_flush(&c);
+                } else {
+                    cabac_terminate0(&c);
+                }
             }
         }
+        len = c.p - rbsp;
+    } else {
+        for (my = 0; my < mbh; my++) {
+            for (mx = 0; mx < mbw; mx++) {
+                encode_mb(&f, NULL, &w, info, mx, my, qp, qpc);
+            }
+        }
+        bw_bits(&w, 1, 1);                              /* rbsp_stop_one_bit */
+        while (w.bits) {
+            bw_bits(&w, 0, 1);
+        }
+        len = MIN(w.n, rbsp_cap);
     }
     g_free(f.y);
     g_free(f.cb);
     g_free(f.cr);
 
-    return nal_wrap(out, cap, idr ? 3 : 2, idr ? 5 : 1, rbsp,
-                    c.p - rbsp);
+    return nal_wrap(out, cap, idr ? 3 : 2, idr ? 5 : 1, rbsp, len);
 }
 
 /* ---- slice data for engines whose drivers write the headers ------------ */
@@ -868,7 +1065,7 @@ size_t h264_slice_i16dc_cabac(int qp, int chroma_qp_offset, int mbw, int mbh,
     const int qpc = chroma_qp(qp, chroma_qp_offset);
     for (my = 0; my < mbh; my++) {
         for (mx = 0; mx < mbw; mx++) {
-            encode_mb(&f, &c, info, mx, my, qp, qpc);
+            encode_mb(&f, &c, NULL, info, mx, my, qp, qpc);
             if (mx == mbw - 1 && my == mbh - 1) {
                 cabac_flush(&c);            /* with the stop bit */
             } else {
@@ -916,38 +1113,9 @@ size_t h264_slice_pskip_cabac(int qp, int cabac_init_idc, int nmb,
  */
 static void cavlc_dc1(BitWriter *w, int level, bool chroma_dc)
 {
-    int code;
+    const int c[16] = { level };
 
-    if (!level) {
-        bw_bits(w, chroma_dc ? 1 : 1, chroma_dc ? 2 : 1);  /* 01 / 1 */
-        return;
-    }
-    if (abs(level) == 1) {                      /* a trailing one */
-        if (chroma_dc) {
-            bw_bits(w, 1, 1);                   /* coeff_token "1" */
-        } else {
-            bw_bits(w, 1, 2);                   /* coeff_token "01" */
-        }
-        bw_bits(w, level < 0, 1);
-    } else {
-        if (chroma_dc) {
-            bw_bits(w, 7, 6);                   /* "000111" */
-        } else {
-            bw_bits(w, 5, 6);                   /* "000101" */
-        }
-        /* first level after < 3 trailing ones: levelCode - 2, suffixLen 0 */
-        code = (level > 0 ? 2 * level - 2 : -2 * level - 1) - 2;
-        if (code < 14) {
-            bw_bits(w, 1, code + 1);
-        } else if (code < 30) {
-            bw_bits(w, 1, 15);
-            bw_bits(w, code - 14, 4);
-        } else {
-            bw_bits(w, 1, 16);
-            bw_bits(w, code - 30, 12);
-        }
-    }
-    bw_bits(w, 1, 1);                           /* total_zeros = 0 */
+    cavlc_residual(w, c, chroma_dc ? 4 : 16, chroma_dc);
 }
 
 /*

@@ -19,7 +19,7 @@
 #include "exec/hwaddr.h"
 
 #define XM_MAX_UART     3
-#define XM_MAX_TIMER    2
+#define XM_MAX_TIMER    4
 #define XM_MAX_REGBANK  16
 #define XM_MAX_SDHCI    2
 #define XM_MAX_SYS_INIT 4
@@ -64,6 +64,8 @@ typedef struct XmSoCConfig {
     uint32_t    ddrc_done[4];   /* xm-ddrc done-offsets */
     hwaddr      ddrc_mirror;    /* xm-ddrc: reads of this offset ... */
     hwaddr      ddrc_mirror_of; /* ... return this one; 0 = none */
+    /* Second generation: a uMCTL2 + PHY (xm-umctl2) instead; 0 = none. */
+    hwaddr      umctl2_base;
 
     /* Interrupt controller: a PL190-layout VIC (XM510), or the A5 MPCore
      * private region (A9 layout: SCU +0, GIC CPU +0x100, TWD +0x600, GIC
@@ -83,6 +85,7 @@ typedef struct XmSoCConfig {
     hwaddr      timer_bases[XM_MAX_TIMER];
     int         timer_irqs[XM_MAX_TIMER];
     uint32_t    timer_freq;
+    bool        timer_latch;    /* bit 8 snapshots the count to +0x1C */
 
     /* xmsfc SPI-NOR controller and the window its flash reads through.
      * When the window is not at 0, address 0 aliases it until the guest
@@ -94,6 +97,9 @@ typedef struct XmSoCConfig {
      * (CONFIG_SYS_TEXT_BASE): it reads its own tables there before it
      * relocates.  0 = none. */
     hwaddr      sfc_text_alias;
+    /* Where a flash boot starts CPU0 when U-Boot is linked at the window
+     * itself (the second-generation parts); 0 = the text alias. */
+    hwaddr      flash_entry;
 
     /* Synopsys DWMAC (10/100 core on XM510). */
     hwaddr      mac_base;
@@ -104,17 +110,44 @@ typedef struct XmSoCConfig {
     int         num_sdhci;
     hwaddr      sdhci_bases[XM_MAX_SDHCI];
     int         sdhci_irqs[XM_MAX_SDHCI];
+    int         sd_slot;        /* the SDHCI with the card slot: -drive if=sd,index=0 */
 
     /* XM I2C controller (xm-i2c) and the sensor on it: a qdev type of an
      * I2C slave (the hisi-* sensor models) at a 7-bit address. */
     hwaddr      i2c_base;
+    hwaddr      i2c2_base;      /* a second xm-i2c with the sensors; 0 = none */
     const char *sensor_type;
     uint8_t     sensor_addr;
+    uint8_t     sensor_addr2;   /* a second sensor of the same part; 0 = none */
+    uint16_t    sensor_id;      /* hisi-smartsens: chip ID (0x3107/0x3108) */
 
     /* Video input (xm-vi) in vi_layout's register layout: vi_irqs lines
      * from vi_irq (XM530: one per channel; XM510: one for all) and the
      * ISP's isp_irqs frame interrupts from isp_irq. */
     hwaddr      vi_base;
+    bool        isp2;           /* second generation: xm-isp2 instead */
+    const char *isp2_layout;    /* xm-isp2 layout; NULL = xm535 */
+    bool        isp2_store_lines_by_event;  /* store IRQs per event */
+#define XM_ISP2_IRQS 9
+    int         isp2_irqs[XM_ISP2_IRQS];    /* SPI per output, -1 = none */
+    hwaddr      osd_base;       /* xm-osd; 0 = none */
+    hwaddr      hevc_base;      /* xm-hevc; 0 = none */
+    int         hevc_irq;
+    const char *hevc_layout;    /* xm-hevc "layout"; NULL = its default */
+    hwaddr      nn_base;        /* xm-nn; 0 = none */
+    hwaddr      usb_base;       /* DWC2 OTG core in host mode; 0 = none */
+    int         usb_irq;
+    int         nn_irq;
+    hwaddr      jpeg_base;      /* xm-jpeg (jpeg.ko's engine); 0 = none */
+    int         jpeg_irq;
+    hwaddr      audio_base;     /* xm-audio (I2S, codec); 0 = none */
+    int         audio_irqs[2];  /* AI, AO */
+    uint32_t    audio_chunk;    /* xm-audio "chunk"; 0 = its default */
+    int         osd_irq;
+    int         num_gpio_high;  /* pads whose input reads high (pull-ups) */
+    uint32_t    gpio_pads;      /* 0 = the model's 100 */
+    uint32_t    gpio_adc_off;   /* xm-gpio adc-offset; 0 = none */
+    int         gpio_high[4];
     const char *vi_layout;
     int         vi_irq, vi_irqs;
     int         isp_irq, isp_irqs;
@@ -127,6 +160,7 @@ typedef struct XmSoCConfig {
 
     hwaddr      h1_base;
     int         h1_irq;
+    uint32_t    h1_max_width;   /* swreg63 max width; 0 = the model's 1920 */
 
     /* SP805 watchdog (xm_wdt.ko unlocks it with 0x1ACCE551 at +0xC00). */
     hwaddr      wdt_base;
