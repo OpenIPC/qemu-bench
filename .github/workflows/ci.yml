@@ -44,6 +44,9 @@ jobs:
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm510 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm530 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm550 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm530v200 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm533 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm535 '
           # Goke GK7101/GK7102 (hw/arm/goke.c), Goke's own Ambarella-IP design
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7101 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7102 '
@@ -91,6 +94,18 @@ jobs:
       # decode every frame.
       - name: Hantro H1 H.264 encode (xm-h1)
         run: python3 qemu/tests/test-xm-h1-h264.py
+
+      # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
+      # the second-generation XM535's H.264 substream.
+      - name: Hantro H1 H.264 encode, Baseline (xm-h1)
+        run: python3 qemu/tests/test-xm-h1-h264.py --baseline
+
+      # The second generation's HEVC engines (XM535, XM533, XM530V200
+      # layouts): slice data under the library's headers, P pictures that
+      # skip blocks against the previous job's reconstruction; ffmpeg
+      # decodes the dump-dir stream.
+      - name: HEVC engines (xm-hevc)
+        run: python3 qemu/tests/test-xm-hevc.py
 
       # The XM530 pad controller as the gpio-xm530 kernel driver and the
       # vendor ISP drive it: output levels, input lines, mux bits kept.

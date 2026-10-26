@@ -39,6 +39,16 @@ cp qemu/include/hw/arm/xiongmai.h   "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/xm-sfc.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-ddrc.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-umctl2.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-isp2.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-osd.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-nn.c             "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-jpeg.c qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h \
+                                    "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-audio.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/usb/atbm-wifi.c          "$QEMU_DIR/hw/usb/"
+cp qemu/hw/misc/xm-hevc.c qemu/hw/misc/hevc-enc.c qemu/hw/misc/hevc-enc.h \
+                                    "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-h1.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h264-tables.h \
                                     "$QEMU_DIR/hw/misc/"
@@ -276,6 +286,7 @@ config XIONGMAI
     select I2C
     select HISI_I2C
     select XM_DWMAC
+    select USB_DWC2
 KCONFIG
     echo "  hw/arm/Kconfig: added XIONGMAI"
 fi
@@ -288,6 +299,12 @@ if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q XM_
     sed -i '/^config XIONGMAI$/,/^$/ s/^    select HISI_I2C$/    select HISI_I2C\n    select XM_DWMAC/' \
         "$QEMU_DIR/hw/arm/Kconfig"
     echo "  hw/arm/Kconfig: XIONGMAI selects XM_DWMAC"
+fi
+# The second generation's DWC2 USB host (the upstream model, as raspi's).
+if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q USB_DWC2; then
+    sed -i '/^config XIONGMAI$/,/^$/ s/^    select XM_DWMAC$/    select XM_DWMAC\n    select USB_DWC2/' \
+        "$QEMU_DIR/hw/arm/Kconfig"
+    echo "  hw/arm/Kconfig: XIONGMAI selects USB_DWC2"
 fi
 if ! grep -q xm-sfc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sfc.c'))" \
@@ -303,6 +320,51 @@ if ! grep -q xm-ddrc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-ddrc.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-ddrc.c"
+fi
+if ! grep -q xm-umctl2 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-umctl2.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-umctl2.c"
+fi
+if ! grep -q xm-isp2 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-isp2.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-isp2.c"
+fi
+if ! grep -q xm-osd "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-osd.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-osd.c"
+fi
+if ! grep -q atbm-wifi "$QEMU_DIR/hw/usb/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('atbm-wifi.c'))" \
+        >> "$QEMU_DIR/hw/usb/meson.build"
+    echo "  hw/usb/meson.build: added atbm-wifi.c"
+fi
+if ! grep -q jpeg-enc "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('jpeg-enc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added jpeg-enc.c"
+fi
+if ! grep -q xm-jpeg "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-jpeg.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-jpeg.c"
+fi
+if ! grep -q xm-nn "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-nn.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-nn.c"
+fi
+if ! grep -q xm-audio "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-audio.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-audio.c"
+fi
+if ! grep -q xm-hevc "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-hevc.c', 'hevc-enc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-hevc.c, hevc-enc.c"
 fi
 if ! grep -q xm-h1 "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-h1.c'))" \
