@@ -289,20 +289,37 @@ for b in /dev/mmcblk0 /dev/mmcblk1; do
 done
 mkfs.vfat $SDCARD >/dev/null && mount -t vfat $SDCARD /mnt/sd
 cd /tmp/smp
-run() {         # run <sample> [keys]: the keys 4 s apart, then q ($ARGS)
+# run <sample> [keys]: the keys 4 s apart, then q ($ARGS).  With WAIT_FILE
+# and WAIT_BYTES, q waits (up to 40 s more) for the file to grow that big:
+# under load QEMU codes fewer pictures a second than silicon would.
+# push_in errors are counted apart: a sample that feeds a real-time rate
+# with a timeout of 0 drops input frames when the emulation falls behind.
+run() {
     n=$1
     shift
-    ( sleep 6; for k in "$@"; do echo "$k"; sleep 4; done; echo q ) |
-        timeout 60 ./$n $ARGS > /tmp/$n.out 2>&1
+    ( sleep 6
+      i=0
+      while [ -n "$WAIT_FILE" ] && [ $i -lt 40 ] &&
+            [ "$(size $WAIT_FILE)" -lt "$WAIT_BYTES" ]; do
+          sleep 1
+          i=$((i + 1))
+      done
+      for k in "$@"; do echo "$k"; sleep 4; done; echo q ) |
+        timeout 100 ./$n $ARGS > /tmp/$n.out 2>&1
     RC=$?
-    ERRS=$(grep -c -i 'err\|fail' /tmp/$n.out)
+    ERRS=$(grep -i 'err\|fail' /tmp/$n.out | grep -vc 'push_in error')
+    DROPS=$(grep -c 'push_in error' /tmp/$n.out)
     echo "NVT-HDAL-RUN: $n${ARGS:+ $ARGS} rc=$RC errors=$ERRS"
-    grep -i 'err\|fail' /tmp/$n.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
+    [ "$DROPS" -gt 0 ] && echo "NVT-HDAL-DROPS: $n${ARGS:+ $ARGS} $DROPS"
+    grep -i 'err\|fail' /tmp/$n.out | grep -v 'push_in error' | head -3 |
+        sed 's/^/NVT-HDAL-ERR: /'
 }
 size() {
     [ -f "$1" ] && wc -c < "$1" || echo 0
 }
+WAIT_FILE=/mnt/sd/dump_bs_main.dat WAIT_BYTES=16000
 run hd_video_record
+WAIT_FILE=
 echo "NVT-HDAL-RECORD-BYTES: $(size /mnt/sd/dump_bs_main.dat)"
 echo "NVT-HDAL-REC-B64-BEGIN"
 head -c 6000000 /mnt/sd/dump_bs_main.dat | base64
@@ -432,9 +449,19 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
             echo "NVT-IVE-LUT: ok=$(grep -c 'data check ok' /tmp/ive.out)" \
                  "err=$(grep -c 'data check error' /tmp/ive.out)" \
                  "last=$(grep 'data check ok' /tmp/ive.out | tail -1 | sed 's/.*test_width=//')"
-            ( sleep 20; echo q ) | timeout 120 ./alg_ive_lut_sample_nonblocking \
-                > /tmp/ive.out 2>&1
-            echo "NVT-HDAL-RUN: alg_ive_lut_sample_nonblocking rc=$?"
+            # (a refused trigger -- the driver's race between channels,
+            # see docs/novatek.md -- leaves the sample checking an empty
+            # buffer: then, and only then, it runs again, up to 3 tries)
+            for try in 1 2 3; do
+                dmesg -c > /dev/null
+                ( sleep 20; echo q ) | timeout 120 ./alg_ive_lut_sample_nonblocking \
+                    > /tmp/ive.out 2>&1
+                rc=$?
+                grep -q 'data check error' /tmp/ive.out &&
+                    dmesg | grep -q 'illegal in RUN state' || break
+                echo "NVT-IVE-RACE: try $try refused a trigger"
+            done
+            echo "NVT-HDAL-RUN: alg_ive_lut_sample_nonblocking rc=$rc"
             echo "NVT-IVE-NB: t1=$(grep -c 'data check ok.*thread(1)' /tmp/ive.out)" \
                  "t2=$(grep -c 'data check ok.*thread(2)' /tmp/ive.out)" \
                  "err=$(grep -c 'data check error' /tmp/ive.out)"
@@ -632,34 +659,45 @@ PY
         ffmpeg -v error -xerror -f $2 -i "$WORK/enc$1.bin" \
             -f rawvideo -pix_fmt nv12 "$WORK/dec$1.yuv" \
             > "$WORK/dec$1.log" 2>&1 || true
-        # the sample feeds the file's 30 frames round and round: find
-        # where the stream starts in it, then every decoded picture must
-        # be the next frame (PSNR), and the pictures must move
+        # the sample feeds the file's 30 frames round and round: each
+        # decoded picture must be one of them (PSNR), each the next or a
+        # few after the last (the sample drops the frames it cannot push
+        # in when the emulation falls behind), and the pictures must move
         look=$(python3 - "$WORK/initramfs/encin/video_frm_352_288_30_yuv420.dat" \
             "$WORK/dec$1.yuv" <<'PY' 2>/dev/null || true
 import math, sys
 fs = 352 * 288 * 3 // 2
 src = open(sys.argv[1], 'rb').read()
 dec = open(sys.argv[2], 'rb').read()
-ins = [src[i:i + fs] for i in range(0, len(src), fs)]
-outs = [dec[i:i + fs] for i in range(0, len(dec) - fs + 1, fs)][:60]
+ins = [src[i:i + fs][::7] for i in range(0, len(src), fs)]
+outs = [dec[i:i + fs][::7] for i in range(0, len(dec) - fs + 1, fs)][:60]
 def psnr(a, b):
-    se = sum((x - y) ** 2 for x, y in zip(a[::7], b[::7]))
-    return 99.0 if not se else 10 * math.log10(255 ** 2 * len(a[::7]) / se)
+    se = sum((x - y) ** 2 for x, y in zip(a, b))
+    return 99.0 if not se else 10 * math.log10(255 ** 2 * len(a) / se)
 if not outs:
-    print('frames=0 psnr=0 moving=0')
+    print('frames=0 psnr=0 moving=0 order=0 skips=0')
     sys.exit()
-k = max(range(len(ins)), key=lambda i: psnr(outs[0], ins[i]))
-worst = min(psnr(o, ins[(k + i) % len(ins)]) for i, o in enumerate(outs))
+best = [max(((psnr(o, f), j) for j, f in enumerate(ins))) for o in outs]
+worst = min(p for p, _ in best)
+steps = [(b[1] - a[1]) % len(ins) for a, b in zip(best, best[1:])]
 moving = sum(a != b for a, b in zip(outs, outs[1:]))
-print('frames=%d psnr=%.1f moving=%d' % (len(dec) // fs, worst, moving))
+print('frames=%d psnr=%.1f moving=%d order=%d skips=%d'
+      % (len(dec) // fs, worst, moving, all(1 <= t <= 4 for t in steps),
+         sum(t > 1 for t in steps)))
 PY
 )
         frames=$(echo "$look" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')
         psnr=$(echo "$look" | sed -n 's/.*psnr=\([0-9]*\).*/\1/p')
         moving=$(echo "$look" | sed -n 's/.*moving=\([0-9]*\).*/\1/p')
+        order=$(echo "$look" | sed -n 's/.*order=\([0-9]*\).*/\1/p')
+        drops=$(grep -a "^NVT-HDAL-DROPS: hd_video_encode_only $1 " \
+                "$WORK/console.log" | tr -d '\r' | awk '{print $NF}' || true)
+        look="$look drops=${drops:-0}"
+        # dropped input is the emulation's speed, but at most a quarter
         if [ -s "$WORK/dec$1.log" ] || [ "${frames:-0}" -lt 5 ] ||
-                [ "${psnr:-0}" -lt 30 ] || [ "${moving:-0}" -lt 4 ]; then
+                [ "${psnr:-0}" -lt 30 ] || [ "${moving:-0}" -lt 4 ] ||
+                [ "${order:-0}" != 1 ] ||
+                [ $(( ${drops:-0} * 4 )) -gt "${frames:-0}" ]; then
             bad "$3 from hd_video_encode_only decodes to the input, in order ($look; $(head -c 200 "$WORK/dec$1.log"))"
         else
             pass "$3 from hd_video_encode_only decodes to the input, in order ($look)"

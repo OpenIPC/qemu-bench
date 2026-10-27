@@ -1492,10 +1492,27 @@ The rest is a guess:
   replaces a pixel with its window's most frequent valid 6-bit value when
   THR_S and THR_H pass.
 
-A job completes as its start is written. The driver clears its flags
-first, and the non-blocking sample polls with a timeout of 0. START
-clears itself, since the driver never does, and bit 31 of 0x68 reads
-idle.
+A job runs as its START is written, with the registers it started with,
+and raises frame end some 1 ms later, as a silicon job would. A second
+job started in that time runs at its own START and gets its own frame
+end, 1 ms after the first: no job is lost to the next one's registers.
+The non-blocking sample's poll with a timeout of 0 retries a job whose
+frame end has not come yet. START clears itself, since the driver never
+does, and bit 31 of 0x68 reads idle.
+
+The non-blocking sample can lose a job to a race in the vendor driver:
+- `kdrv_ive_trigger_nonblock` → `trigger_internal` runs `setMode` and
+  `ive_start` (state machine to RUN) under a semaphore;
+- it releases the semaphore and returns;
+- only then does `kdrv_ive_trigger_nonblock` call `ive_pause` (out of
+  RUN).
+A second channel's thread waiting on the semaphore can run in that gap.
+Its `setMode` is refused ("Operation 2 illegal in RUN state"), and the
+sample, which ignores the refused trigger, checks an empty buffer. On
+silicon `setMode` takes microseconds and the threads rarely meet. Under
+emulation on a loaded host they meet often. The test reruns the sample,
+up to three tries, when it fails after such a refusal, and fails on any
+other error.
 
 With `--kmods` and samples built with `--kernel`, `test-novatek-hdal.sh`
 loads the rebuilt module and checks that it binds. It then runs three
