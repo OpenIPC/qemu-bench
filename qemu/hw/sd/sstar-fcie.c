@@ -203,13 +203,61 @@ static void fcie_cifd_fill(SstarFcieState *s)
     sdbus_read_data(&s->sdbus, s->cifd[0], n);
     s->r2n_left -= n;
     s->regs[R_CIFD_EVENT] |= CIFD_WBUF_FULL;
+    /* The card has sent it all: the last buffer is the driver's to take */
+    if (!s->r2n_left) {
+        s->regs[R_MIE_EVENT] |= MIE_DATA_END;
+    }
+}
+
+/*
+ * A DMA job, a chunk at a time: the guest sets up to 0xFFFF blocks of
+ * 0xFFFF bytes. It ends in a timeout, as the host's would, when the card
+ * stops sending or taking data before the job's length, or when the DMA
+ * finds nothing at the address.
+ */
+static void fcie_dma(SstarFcieState *s, uint32_t len, bool write)
+{
+    uint8_t buf[4096];
+    hwaddr addr = fcie_dma_addr(s);
+    uint32_t n;
+    MemTxResult r;
+
+    for (; len; len -= n, addr += n) {
+        n = MIN(len, sizeof(buf));
+        if (write) {
+            r = dma_memory_read(&address_space_memory, addr, buf, n,
+                                MEMTXATTRS_UNSPECIFIED);
+            if (r != MEMTX_OK || !sdbus_receive_ready(&s->sdbus)) {
+                break;
+            }
+            sdbus_write_data(&s->sdbus, buf, n);
+        } else {
+            if (!sdbus_data_ready(&s->sdbus)) {
+                break;
+            }
+            sdbus_read_data(&s->sdbus, buf, n);
+            r = dma_memory_write(&address_space_memory, addr, buf, n,
+                                 MEMTXATTRS_UNSPECIFIED);
+            if (r != MEMTX_OK) {
+                break;
+            }
+        }
+    }
+    if (len) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-fcie: %s job stopped with "
+                      "0x%x bytes left at 0x%" HWADDR_PRIx "\n",
+                      write ? "write" : "read", len, addr);
+        s->regs[R_SD_STS] |= write ? STS_WR_TOUT : STS_RD_TOUT;
+        s->regs[R_MIE_EVENT] |= MIE_ERR_STS;
+        return;
+    }
+    s->regs[R_MIE_EVENT] |= MIE_DATA_END;
 }
 
 static void fcie_data(SstarFcieState *s, uint16_t ctl)
 {
     uint32_t len = fcie_job_len(s);
     bool write = ctl & CTL_JOB_DIR;
-    g_autofree uint8_t *buf = NULL;
 
     if (ctl & CTL_ADMA_EN) {
         qemu_log_mask(LOG_UNIMP, "sstar-fcie: ADMA job not modelled\n");
@@ -236,17 +284,7 @@ static void fcie_data(SstarFcieState *s, uint16_t ctl)
         }
         return;
     }
-    buf = g_malloc(len);
-    if (write) {
-        dma_memory_read(&address_space_memory, fcie_dma_addr(s), buf, len,
-                        MEMTXATTRS_UNSPECIFIED);
-        sdbus_write_data(&s->sdbus, buf, len);
-    } else {
-        sdbus_read_data(&s->sdbus, buf, len);
-        dma_memory_write(&address_space_memory, fcie_dma_addr(s), buf, len,
-                         MEMTXATTRS_UNSPECIFIED);
-    }
-    s->regs[R_MIE_EVENT] |= MIE_DATA_END;
+    fcie_dma(s, len, write);
 }
 
 static void fcie_job(SstarFcieState *s, uint16_t ctl)

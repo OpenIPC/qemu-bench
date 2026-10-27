@@ -598,6 +598,159 @@ BACH1 = riu(0x1502, 0)
 BACH2 = riu(0x1503, 0)
 
 
+SDIO0 = riu(0x1410, 0)
+SDIO0_CIFD = riu(0x1411, 0)
+SD_BLOCKS = 8192                                # a 4 MiB card
+
+
+def sd_pattern(block):
+    return bytes((block * 7 + i) & 0xFF for i in range(512))
+
+
+def sd_cmd(qt, idx, arg, rsp=5, data=0, mode=0):
+    """One FCIE5 job as hal_sdmmc_v5.c runs it; (MIE_EVENT, SD_STS, rsp bytes)"""
+    r = lambda n: SDIO0 + n * 4
+    qt.writew(r(0x20), (arg >> 24 & 0xFF) << 8 | 0x40 | idx)
+    qt.writew(r(0x21), (arg >> 8 & 0xFF) << 8 | (arg >> 16 & 0xFF))
+    qt.writew(r(0x22), arg & 0xFF)
+    qt.writew(r(0x0A), 5 << 8 | rsp)
+    qt.writew(r(0x07), 0x04)                    # SDIO_MODE
+    qt.writew(r(0x0B), 0x03 | mode)             # CLK_EN, 4-bit
+    qt.writew(r(0x0D), 0x3F)                    # SD_STS clear
+    qt.writew(r(0x00), 0x3F)                    # MIE_EVENT clear
+    ctl = (3 if rsp == 16 else 2 if rsp else 0) | data
+    qt.writew(r(0x0C), ctl)
+    qt.writew(r(0x0C), ctl | 0x04 | 0x40)       # CMD_EN, JOB_START
+    ev, sts = qt.readw(r(0x00)), qt.readw(r(0x0D)) & 0x3F
+    out = []
+    for i in range(rsp):
+        w = qt.readw(r(0x20 + i // 2))
+        out.append(w >> 8 if i & 1 else w & 0xFF)
+    return ev, sts, out
+
+
+def sd_job(qt, blocks, size, addr):
+    r = lambda n: SDIO0 + n * 4
+    qt.writew(r(0x09), size)
+    qt.writew(r(0x08), blocks)
+    qt.writew(r(0x05), blocks * size & 0xFFFF)
+    qt.writew(r(0x06), blocks * size >> 16 & 0xFFFF)
+    qt.writew(r(0x03), addr & 0xFFFF)
+    qt.writew(r(0x04), addr >> 16 & 0xFFFF)
+
+
+def sd_card_init(qt):
+    sd_cmd(qt, 0, 0, rsp=0)
+    ev, sts, rsp = sd_cmd(qt, 8, 0x1AA)
+    check('SD: CMD8 echoes its check pattern', rsp[4] if rsp else None, 0xAA)
+    for _ in range(20):
+        sd_cmd(qt, 55, 0)
+        ev, sts, rsp = sd_cmd(qt, 41, 0x00300000)
+        if rsp[1] & 0x80:
+            break
+        qt.step(10 ** 8)
+    check('SD: ACMD41 reports the card powered up', rsp[1] >> 7 & 1, 1)
+    ev, sts, rsp = sd_cmd(qt, 2, 0, rsp=16)
+    check('SD: CMD2 (R2) returns 0x3F, then the CID', rsp[0], 0x3F)
+    ev, sts, rsp = sd_cmd(qt, 3, 0)
+    rca = rsp[1] << 8 | rsp[2]
+    sd_cmd(qt, 7, rca << 16)
+    sd_cmd(qt, 16, 512)
+    return rca
+
+
+def test_msc313e_sd(qemu, tmp):
+    print('msc313e SD card on SDIO0 (hal_sdmmc_v5.c, hal_card_platform_iNF3.c)')
+    path = os.path.join(tmp, 'i3.bin')
+    make_i3_image(path)
+    card = os.path.join(tmp, 'sd.img')
+    with open(card, 'wb') as f:
+        for b in range(SD_BLOCKS):
+            f.write(sd_pattern(b))
+    r = lambda n: SDIO0 + n * 4
+
+    qt = QTest(qemu, 'msc313e,flash-file=' + path, ['-rtc', 'clock=vm'])
+    try:
+        check('SD: no card -> PM_SD_CDZ reads high',
+              qt.readw(riu(0x000F, 0x47)) >> 2 & 1, 1)
+        ev, sts, rsp = sd_cmd(qt, 8, 0x1AA)
+        check('SD: no card -> CMD_END with CMD_NORSP', (ev & 2, sts & 8), (2, 8))
+    finally:
+        qt.close()
+
+    qt = QTest(qemu, 'msc313e,flash-file=' + path,
+               ['-rtc', 'clock=vm', '-drive', 'if=sd,format=raw,file=' + card])
+    try:
+        check('SD: card in -> PM_SD_CDZ reads low',
+              qt.readw(riu(0x000F, 0x47)) >> 2 & 1, 0)
+        qt.writew(r(0x3F), 0)
+        qt.writew(r(0x3F), 1)
+        sd_card_init(qt)
+
+        sd_job(qt, 2, 512, 0x100000)            # DMA read, blocks 5-6
+        ev, sts, _ = sd_cmd(qt, 18, 5 * 512, data=0x08)
+        got = bytes(qt.readb(DRAM + 0x100000 + i) for i in (0, 1, 511, 512, 1023))
+        want = sd_pattern(5)[0:2] + sd_pattern(5)[511:512] + \
+            sd_pattern(6)[0:1] + sd_pattern(6)[511:512]
+        check('SD: DMA read of two blocks ends with DATA_END', (ev & 3, sts), (3, 0))
+        check('SD: and lands in DDR', got, want)
+        sd_cmd(qt, 12, 0)
+
+        for i in range(0, 512, 4):              # DMA write, block 9
+            qt.writel(DRAM + 0x200000 + i, 0xA5A50000 | i)
+        sd_job(qt, 1, 512, 0x200000)
+        ev, sts, _ = sd_cmd(qt, 24, 9 * 512, data=0x10)
+        qt.writew(r(0x00), 0x3F)
+        qt.writew(r(0x0C), 0x10 | 0x08 | 0x40)  # JOB_DIR, DTRX_EN, JOB_START
+        check('SD: DMA write ends with DATA_END', qt.readw(r(0x00)) & 1, 1)
+        sd_job(qt, 1, 512, 0x300000)
+        sd_cmd(qt, 17, 9 * 512, data=0x08)
+        check('SD: and reads back', qt.readl(DRAM + 0x300000 + 0x40), 0xA5A50040)
+
+        # A buffered (CIFD, DEST_R2N) read that fits one 64-byte buffer
+        sd_cmd(qt, 16, 64)
+        sd_job(qt, 1, 64, 0)
+        ev, sts, _ = sd_cmd(qt, 17, 3 * 512, data=0x08, mode=0x10)
+        check('SD: CIFD read fills the buffer', qt.readw(r(0x30)) & 1, 1)
+        check('SD: its first bytes', qt.readw(SDIO0_CIFD), (3 * 7 + 1) << 8 | 3 * 7)
+        qt.writew(r(0x30), 0x01)                # WBUF_FULL done
+        qt.writew(r(0x30), 0x02)                # WBUF_EMPTY_TRIG
+        check('SD: a one-buffer CIFD read ends with DATA_END', qt.readw(r(0x00)) & 1, 1)
+        sd_cmd(qt, 16, 512)
+
+        # A single-block read with a job of 0xFFFF blocks of 0xFFFF bytes:
+        # the card sends one block, then nothing
+        sd_job(qt, 0xFFFF, 0xFFFF, 0x100000)
+        ev, sts, _ = sd_cmd(qt, 17, 1 * 512, data=0x08)
+        check('SD: a ~4 GiB job on a one-block read ends in RD_TOUT, no DATA_END',
+              (ev & 1, sts & 0x20), (0, 0x20))
+        sd_job(qt, 1, 512, 0x100000)
+        ev, sts, _ = sd_cmd(qt, 17, 2 * 512, data=0x08)
+        check('SD: and the host still reads after it', (ev & 1, qt.readb(DRAM + 0x100001)),
+              (1, (2 * 7 + 1) & 0xFF))
+
+        # DMA to and from an address with nothing behind it (MIU 0x50000000)
+        sd_job(qt, 1, 512, 0x50000000)
+        ev, sts, _ = sd_cmd(qt, 17, 4 * 512, data=0x08)
+        check('SD: DMA read to nowhere: an error, no DATA_END',
+              (ev & 5, sts & 0x20), (4, 0x20))
+        sd_job(qt, 1, 512, 0x50000000)
+        ev, sts, _ = sd_cmd(qt, 24, 10 * 512, data=0x10)
+        qt.writew(r(0x00), 0x3F)
+        qt.writew(r(0x0C), 0x10 | 0x08 | 0x40)
+        check('SD: DMA write from nowhere: an error, no DATA_END',
+              (qt.readw(r(0x00)) & 5, qt.readw(r(0x0D)) & 0x04), (4, 0x04))
+        qt.writew(r(0x3F), 0)
+        qt.writew(r(0x3F), 1)
+        sd_cmd(qt, 12, 0)
+        sd_job(qt, 1, 512, 0x300000)
+        sd_cmd(qt, 17, 10 * 512, data=0x08)
+        check('SD: and block 10 kept its data', qt.readb(DRAM + 0x300000 + 3),
+              (10 * 7 + 3) & 0xFF)
+    finally:
+        qt.close()
+
+
 def intc_raw(qt, n):
     """The main intc's raw MS_IRQ input n (the GIC SPI 32 + n)."""
     return qt.readw(riu(0x1009, 0x5C + n // 16)) >> (n % 16) & 1
@@ -1241,6 +1394,7 @@ def main():
         qt.close()
     test_migration(args.qemu, tmp, path)
     test_msc313e(args.qemu, tmp)
+    test_msc313e_sd(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 
