@@ -11,7 +11,7 @@ desk. Vendor families covered:
 - **Xiongmai** XM510 / XM530 / XM550, and XM530V200 / XM533 / XM535
 - **Goke** GK7101 / GK7102 and the GK710xS die
 - **Anyka** AK39xx
-- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375)
+- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375) and infinity3 (MSC313E)
 - **Novatek** NT9856x, NT98533 and NT98332
 - **Allwinner** V831 / V833
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
@@ -22,10 +22,10 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
 
-## Supported Machines (87 total)
+## Supported Machines (88 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -238,8 +238,9 @@ was at hand.
 | `ssd202d` | Cortex-A7 ×2, 128 MB in package | GIC + main-intc | — | —¹ |
 | `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
 | `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
+| `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
 
-SigmaStar's (formerly MStar's) infinity2m dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m and infinity3 dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
@@ -266,6 +267,16 @@ encoder to its RTSP server: H.264/H.265 from libx264/libx265 and baseline
 JPEG snapshots, of a test pattern (the ISP does not process pixels), and
 microphone capture. `uuid=` gives the die ID its analytics licence is
 bound to.
+
+³ The MStar MSC313E (die "infinity3"): an unmodified 8 MiB W25Q64 dump of
+a retail camera (JX-F22 sensor) boots from NOR through the IPL at
+`0x4000`, `IPL_CUST`, U-Boot 2015.01 and Linux 3.18.30, and its own
+application runs the whole media pipeline: the sensor over I2C, an ISP
+that makes the picture (the OpenIPC logo scene) from the sensor's
+exposure and gain, with the vendor AE/AWB converging on its statistics,
+the scaler and CMDQ, and the H.264 (CAVLC/CABAC), H.265 and JPEG
+encoders, with audio, GPIO/IR-cut and the RTC; it serves HTTP and a
+decodable 1280x720 H.264 RTSP stream.
 
 ### Allwinner V831 / V833 family (`qemu-system-arm`)
 
@@ -625,7 +636,7 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
-├── hw/arm/sigmastar.c           # SigmaStar infinity2m machines, synthetic mask ROM
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3 machines, synthetic mask ROM
 ├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
 ├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
 ├── hw/timer/sstar-timer.c       # PIU timers + watchdog
@@ -637,6 +648,15 @@ qemu/
 ├── hw/misc/sstar-vpu.c          # WAVE5 video decoder, firmware interface + libavcodec
 ├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
 ├── hw/display/mstar-ge.c        # GE 2D engine (ported)
+├── hw/rtc/sstar-rtc.c           # infinity/infinity3 PM RTC (seconds counter, alarm)
+├── hw/misc/sstar-vip-gamma.c    # infinity3 scaler gamma SRAM ports (YUV, RGB)
+├── hw/misc/sstar-i3-isp.c       # infinity3 ISP/CSI: sensor scene, pixel pipeline, AE/AWB stats
+├── hw/misc/sstar-i3-scl.c       # infinity3 scaler interrupts and DMA clients
+├── hw/misc/sstar-mfe.c          # infinity3 MFE H.264 encoder (CAVLC, CABAC)
+├── hw/misc/sstar-vhe.c          # infinity3 VHE (Hantro H2v3) H.265 encoder
+├── hw/misc/sstar-i3-jpe.c       # infinity3 JPEG encoder
+├── hw/misc/sstar-i3-bach.c      # infinity3 audio DMA (playback, capture)
+├── hw/gpio/sstar-i3-gpio.c      # infinity3 GPIO, SAR ADC, PM-sleep irqchip, day/night
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
 ├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98533, NT98332
 ├── hw/arm/nvt-lzma.c            # LZMA decoder for the NA51103 boot stand-in
@@ -734,7 +754,7 @@ docs/
 ├── anyka.md                     # AK39xx: L2 buffer, mask ROM, boot NOR
 ├── fullhan.md                   # Fullhan: generations, mask ROM, SPIC, DMACs
 ├── grainmedia.md                # Grain Media GM813x: map, nsboot boot chain, video, audio, MJPEG
-├── sigmastar.md                 # SigmaStar/MStar infinity2m: RIU banks, boot chain
+├── sigmastar.md                 # SigmaStar/MStar infinity2m/infinity3: RIU banks, boot chain
 ├── novatek.md                   # NT9856x, NT98533, NT98332: DT, loader stand-in, media
 ├── ive-registers.md             # IVE register map (from live EV300 capture)
 ├── ive-applications.md          # IVE-based video analytics for OpenIPC

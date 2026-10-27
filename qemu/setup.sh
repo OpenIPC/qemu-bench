@@ -110,12 +110,25 @@ cp qemu/hw/display/mstar-disp.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
 cp qemu/hw/misc/sstar-vpu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-crypto.c      "$QEMU_DIR/hw/misc/"
+cp qemu/hw/rtc/sstar-rtc.c          "$QEMU_DIR/hw/rtc/"
+cp qemu/hw/misc/sstar-vip-gamma.c   "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-i3-isp.c      "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/sstar-i3-isp.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/sstar-i3-scl.c      "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/sstar-pattern.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/sstar-mfe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-i3-jpe.c      "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-vhe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/sstar-jpeg.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/sstar-cabac.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/i2c/sstar-i2c.c          "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/misc/sstar-venc.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-isp.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-vif.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-jpe.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-bach.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-i3-bach.c     "$QEMU_DIR/hw/misc/"
+cp qemu/hw/gpio/sstar-i3-gpio.c     "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/misc/sstar-cmdq.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
 cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
@@ -187,6 +200,7 @@ cp qemu/hw/i2c/hisi-imx291.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-imx415.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-imx385.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-f37.c          "$QEMU_DIR/hw/i2c/"
+cp qemu/include/hw/i2c/hisi-soi.h   "$QEMU_DIR/include/hw/i2c/"
 cp qemu/hw/i2c/hisi-gc2053.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-sp2305.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-mis2006.c      "$QEMU_DIR/hw/i2c/"
@@ -526,7 +540,7 @@ else
         fi
     done
 fi
-for f in misc/sstar-riu misc/sstar-crypto misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+for f in misc/sstar-riu misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

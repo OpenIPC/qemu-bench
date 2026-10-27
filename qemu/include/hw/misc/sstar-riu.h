@@ -39,6 +39,7 @@ struct SstarRiuState {
     uint32_t poll_count;
     uint16_t bond;
     bool smf_ack;               /* Ifado: bank 0x1121 handshake */
+    bool infinity3;             /* infinity3 status bits (FCIE, HVSP) */
     uint16_t gpio_bank;         /* Ifado PADTOP GPIO: input levels */
     uint64_t uuid;              /* OTP2 0x7C-0x7F, the die's unique ID */
     /* tables of reset values, each ended by a zero address */

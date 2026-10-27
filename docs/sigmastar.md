@@ -1,11 +1,11 @@
-# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`, `ssc375`)
+# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`, `ssc375`, `msc313e`)
 
 SigmaStar's (formerly MStar's) Cortex-A7 SoCs share one memory map whatever
 the family: DRAM (the MIU0 window) at `0x20000000`, the SPI NOR read window at
 `0x14000000`, the A7 private region with the GIC at `0x16000000`, IMI SRAM at
 `0xA0000000` and every peripheral behind the RIU at `0x1F000000`. One machine
-file (`hw/arm/sigmastar.c`) covers them with a table entry per SoC; so far the
-entries are the infinity2m dies.
+file (`hw/arm/sigmastar.c`) covers them with a table entry per SoC: the
+infinity2m dies, Ifado and infinity3.
 
 Sources: the vendor infinity2m SDK (`boot_621_release_20200522`: U-Boot
 2015.01; `kernel_621_release_20200522`: Linux 4.9.84), the device tree built
@@ -26,6 +26,7 @@ from there too.
 | `ssd202d` | infinity2m | 2× Cortex-A7 | 128 MiB | `0x1E` | `0xF0` | — |
 | `ssd201` | infinity2m | 2× Cortex-A7 | 64 MiB | `0x1D` | `0xF0` | — |
 | `ssc375` | Ifado | 1× Cortex-A7 | 128 MiB | `0x15` | `0xF0`¹ | IPL → U-Boot → DHBoot → kernel → rootfs |
+| `msc313e` | infinity3 | 1× Cortex-A7 | 64 MiB | — | `0xC2` | IPL → U-Boot → kernel → shell |
 
 ¹ Not checked against silicon: the boot chain to userspace does not look
 at it. The SoC is named by the firmware itself (`CHIP=SSC375` in the Dahua
@@ -322,8 +323,8 @@ ID, so it loads only when given that camera's value, e.g.
   the status before it reads the shared registers and writes the next
   output buffer, so the model reports the next done 2 ms later; each job
   completes 10 ms after it is fired. Built with libavcodec
-  and its libx264/libx265 encoders, it encodes a test pattern (colour
-  bars, a moving box, the frame number in binary) at each job's size and
+  and its libx264/libx265 encoders, it encodes the test pattern of the
+  other targets (the OpenIPC logo on navy, a sliding dot) at each job's size and
   codec (program registers `0xA0`, `0x1080` bit 1, `0xBC` bit 8 for an I
   frame) as the job is fired, with the virtual clock stopped: libx265
   takes tens of milliseconds a frame, and a guest left running meanwhile
@@ -335,7 +336,7 @@ ID, so it loads only when given that camera's value, e.g.
   The driver writes the whole JFIF header (SOI to SOS, regs `0x1D`/`0x1E`,
   size in `0x1C` [14:8]) to DRAM. The model parses its quantisation
   and Huffman tables and frame size, codes a baseline scan of a test
-  picture (bars and a frame counter) after it into the output window
+  picture (the same logo pattern) after it into the output window
   (`0x51`..`0x54`), and reports the result in `0x63`..`0x6C`. Frame done
   is interrupt bit 0 (`E_JPE_HAL_IRQ_FRAME_DONE`). Bit 1 is
   `BSPOBUF_FULL`, which the driver reports as "output buff is too
@@ -378,6 +379,231 @@ ID, so it loads only when given that camera's value, e.g.
   the watchdog with 60 s, so a boot that stalls before Linux services
   it resets.
 
+## MSC313E (infinity3)
+
+Sources: the vendor I3 SDK `MSC3XX_SDK_V_1711291828-I3` (U-Boot 2015.01,
+Linux 3.18.30, whose `infinity3.dtsi` and `drivers/mstar` give the map,
+and its prebuilt `image_QFN64M-MSC313E` flash image), the MSC313E
+datasheet, linux-chenxing.org's infinity3 and boot ROM pages, and an
+8 MiB W25Q64 dump of a retail MSC313E camera (JX-F22 sensor, U-Boot
+2015.01-svn129, a Linux 3.18.30 built two months after the SDK's).
+
+```
+qemu-system-arm -M msc313e,flash-file=cam.bin -serial mon:stdio \
+    -nic user,restrict=on,net=192.168.1.0/24,host=192.168.1.1,hostfwd=tcp::8554-192.168.1.32:554
+```
+
+The SPI NOR's JEDEC ID follows the image's size (W25Q128's maker and
+type with the capacity byte of the file: an 8 MiB dump is a W25Q64,
+`0xEF4017`); `flash-jedec=` overrides it.
+
+The infinity3 keeps the infinity map: the same GIC SPI numbers
+(`drivers/mstar/include/infinity3/irqs.h`: UART0 66, EMAC 58, FSP 37,
+timers 96/97/108, watchdog 98), UARTs, FSP, BDMA, EMAC and timers, so
+those models serve it unchanged. What differs:
+
+- **Boot.** The mask ROM looks for the IPL at NOR `0x4000`, not 0
+  (`ipl_offset`); the first 16 KiB are blank on both images. The IPL
+  sizes DRAM by the wrap (`64MB`) and does not read the bond strap. The
+  MXP partition table follows it (`0x20000` in the SDK image, `0x3000` in
+  the camera's), and `IPL_CUST` finds U-Boot through it.
+- **SD host reset.** `Hal_SDMMC_Reset` and the IPL ("[HSD] IP Reset
+  Switch", its table at IPL `0x7670`) clear reg `0x3F` bit 0 of the FCIE
+  banks `0x1410` and `0x1402` and wait for bits [3:1] (the MIU, MIE and MCU
+  reset states) to read `0b111`, then set it and wait for them to clear
+  (`sstar-riu` `infinity3`). Unanswered, each step times out after about
+  1.2 s with "Low Fail" / "High Fail" and the boot goes on.
+- **RTC** (`sstar-rtc`, bank `0x0012` at `0x1F002400`, SPI 76): the
+  infinity PM RTC of `drivers/mstar/rtc/ms_rtc.c`, a seconds counter with
+  load and latch requests the hardware clears (the driver spins on them
+  with no timeout: the boot hung there) and a match alarm. It starts at
+  the host's time. infinity2m and later have the RTCPWC instead.
+- **Scaler gamma SRAMs** (`sstar-vip-gamma`, `sstar-rgb-gamma`). The SCL
+  driver loads the VIP's YUV gamma curves through an indirect port at
+  bank `0x1226` regs `0x40`-`0x4F` and the RGB ones through two ports at
+  bank `0x1211` regs `0x7A`-`0x7F` (`Hal_VIP_SRAMDumpGammaYUV` /
+  `...GammaRGB` in `scl/infinity3/src/mxlib/hal/vip/halvip.c`). Outside
+  CMDQ mode it reads each entry back, and on a mismatch waits up to 2 s
+  for a scaler frame end, ten times per entry. The camera's kernel loads
+  them that way at probe: without the SRAMs its boot sits in the SCL
+  probe for hours. The SDK kernel's boot gets past the probe without them.
+- **Image sensor** (`sensor=jxf22`, the default, or `none`): a JX-F22 at
+  `0x40` on MIIC1 (`0x1F223200`, SPI 69; MIIC0 at `0x1F223000`, SPI 68 is
+  the other bus; the MIIC is Ifado's `sstar-i2c`). The camera's
+  `libdrv_ms_cus_JXF22.so` checks `Sensor_id_table`, `0x0A` = `0x0F` and
+  `0x0B` = `0x22` (`hisi-jxf22`, the SOI model of `hisi-f37.c`). The ISP
+  reads its exposure from the registers that driver writes: rows in
+  `0x02`/`0x01` (29.63 us each, at most the frame length `0x23`/`0x22`
+  less 4), gain in `0x00` (2^[6:4] x (1 + [3:0]/16), 1x-15.5x), the
+  window in `0x24`-`0x26` (1920x1080).
+- **ISP and CSI** (`sstar-i3-isp`, `/machine/isp`: ISP0 top bank
+  `0x1302`, SPI 57; the menuload bank `0x1306`; the CSI MAC bank `0x1204`,
+  SPI 65), from `drivers/mstar/isp/infinity3` and its `infinity3e_reg_isp*`
+  field maps. Three interrupt groups (1: `0x28` mask, `0x29` force,
+  `0x2A` clear, `0x2B` final, `0x2C` raw; 2: packed in `0x2D`-`0x2F`; 3:
+  `0x4A`-`0x4E`), mask 1 = masked. While group 1's vsync is unmasked,
+  each frame (30 a second) raises ISPIF_VSYNC (group 1 bit 14); at 60 %
+  it makes the picture and the statistics and raises AE/AWB done and the
+  AE block row; at 90 % the frame end (group 3 bits 4, 5 and 8), the
+  frame-done count in `0x7A` [14:8] (which the scaler driver reads too)
+  and the CSI's VC0 report bit. It drives the scaler's frame start and
+  end.
+
+  The picture is made from the sensor's. The sensor sees a fixed scene
+  (the test pattern of the other targets, the OpenIPC logo and its sliding
+  dot in an 80 % white on a navy gradient, as linear reflectances) under
+  tungsten light (its R and B 0.82 and 0.40 of G), and
+  puts out 10-bit Bayer, black at 64, from its exposure rows and gain.
+  The ISP runs the stages the camera application turns on (found by
+  tracing its register writes): OBC (ISP1 `0x67`-`0x6D`), the AE digital
+  gain (`0x6E`/`0x6F`), the white-balance gains (WBG1, ISP6 bank `0x1308`
+  `0x48`-`0x4F`, which the 3A drives; WBG0 is off), the 12-to-10 Bayer
+  gamma and the 10-to-10 RGB gamma from the tables the menuload copies
+  from DRAM (SRAMs 3-5 and 10-12; `0x07` bit 0 queues a table, bit 1
+  starts, `0x00` bit 11 is done), a 2x2 demosaic (one RGB pixel a quad:
+  960x540 out of 1920x1080), and the RGB-to-YCbCr matrix in ISP0
+  `0x3C`-`0x45`, into which the 3A folds its colour correction. LSC,
+  defect and noise filters, false colour and the HSV tables are passed
+  through (off, or nothing to do on a noise-free scene). The statistics
+  come from the data after OBC, before white balance: per block the mean
+  R, G, B (and Y for AE) as 8 bits, in the block grid and at the DMA
+  bases userspace sets in ISP3 (bank `0x1305`): 128x80 AE blocks of 4
+  bytes and 128x90 AWB blocks of 3. The vendor AE and AWB converge on
+  them: on the camera dump the exposure settles at 1686 rows (gain
+  1.125x), the white logo at full scale over the dark navy, and
+  the WB gains at R 1.21, B 2.53, which make the white neutral (1/0.82,
+  1/0.40). `qom-set /machine/isp light|light-r|light-b`
+  changes the light while running (level in 1/1000 LSB a row; R and B
+  per mille of G): less light brings more exposure and gain, daylight
+  (530, 680) moves the gains to R 2.00, B 1.48.
+  `pixels=off` (`-global sstar-i3-isp.pixels=off`) skips the picture,
+  `trace=on` logs the register writes and a line a frame (exposure,
+  gains, mean Y/Cb/Cr). Without a sensor, or with the ISP off, the
+  statistics read mid grey and there is no picture. A quad row equal to
+  the one above is copied, not recomputed: 1080p costs ~0.75 ms a frame
+  on the scene (10.6 ms worked out in full).
+- **CMDQ** (`sstar-cmdq` `infinity3`, bank `0x1120`, SPI 49). The scaler
+  driver queues its register changes while streaming (a size change:
+  the camera application rescales the main picture to 1280x720 for the
+  encoder) and starts the engine at the next frame end (`0x03` bit 1);
+  done is status `0x44` bit 2, on which the driver signals
+  CHANGESIZEDONE. Without it the resize ioctl times out every 100 ms while
+  the VSRC component holds its port mutex, and the main picture never
+  reaches the encoder: the application reboots after 40 s without a
+  frame.
+- **H.264 encoder** (`sstar-mfe`, banks `0x1324`/`0x1325` at
+  `0x1F264800`, SPI 60): `mfev5/mfe6`. The driver writes SPS, PPS and the
+  whole slice header itself and pushes the bits through the FDC packer
+  (`0x46`-`0x48`); the model appends the slice data, CAVLC or CABAC as
+  `0x03` bit 13 says (the camera app streams Main profile, CABAC). Slice
+  QP, deblocking control and chroma QP offset come from the registers
+  the driver fills from the same values; `cabac_init_idc` is always 0.
+  I frames are Intra16x16 without residual where a V, H or DC prediction
+  is exact, I_PCM elsewhere; P frames are P_Skip where the picture is
+  within 2 of the reference in every sample (`skip-tolerance`), I_PCM
+  elsewhere, up to an eighth of the picture a frame (the rest stay
+  P_Skip, and the next frame carries on where this one stopped): without
+  that, an exposure or white-balance step of the ISP's 3A changes every
+  macroblock and makes a P frame of over 1 MiB, which overflows the
+  driver's buffer (`mfe-enc buffer full`) and breaks the RTSP stream. A
+  P_Skip macroblock decodes to the reference's samples, and so does the
+  model's picture. The model deblocks as a decoder does
+  and writes that to the reconstruction buffer, the next P frame's
+  reference, so FFmpeg decodes to it bit for bit; `sstar-mfe.dump=DIR`
+  appends the frames to `DIR/mfe-<w>x<h>.h264`, a file per size. The CABAC
+  coder is `sstar-cabac.h`, shared with `sstar-vhe`.
+- **JPEG encoder** (`sstar-i3-jpe`, bank `0x1320` at `0x1F264000`,
+  SPI 61): jpe2's `_EncFire()` (`hal_jpe_ios.c`). The Q tables go in
+  through a table port that the driver reads back entry by entry,
+  transposed (entry `i` is raster `[(i & 7) * 8 + (i >> 3)]`). The first
+  `frame_start` of each fire comes before the soft reset, with the last
+  picture's settings, so the model encodes on a timer that the reset
+  cancels. The engine writes the scan only, ending in `FF D9`; the
+  application writes the headers with the Annex K tables, and the model
+  codes with those. It reads the size back as the write pointer minus the
+  start address, which `0x3B` bit 13 swaps into the same registers. The
+  driver waits for the interrupt with no timeout, so every start raises
+  one.
+- **H.265 encoder** (`sstar-vhe`, a Hantro H2 v3, conf bank `0x1328` at
+  `0x1F265000`, swregs from `0x1F265200`, SPI 53): `vhe/h2v3`. Each
+  32-bit swreg is two RIU words, at `8 * i` and `8 * i + 4`. The driver
+  puts VPS/SPS/PPS in front itself and points `BASE_OUTBS_ADDR` past them;
+  the core writes the slice NALs, the size goes to swreg9 and swreg1 to
+  `IRQ | FRAME_RDY`. The slice header follows the parameter sets
+  `h265_enc.c` writes, and the registers give the rest. The slice data
+  comes from a small CABAC encoder in the model: DC intra CUs with a
+  coded residual in I frames, and in P frames skip or zero-vector merge
+  CUs with a residual. It reconstructs as a decoder does, deblocking
+  included (SAO is off in every slice), and writes the result to the
+  reconstruction buffer, which the next P frame reads as its reference.
+  FFmpeg decodes the streams to the model's reconstruction bit for bit.
+- **Audio** (`sstar-i3-bach`, banks `0x1502`/`0x1503`, SPI 74), the
+  playback reader and capture writer DMAs of the ALSA driver
+  (`drivers/mstar/sound/infinity.c`, `infinity_pcm.c`). Levels,
+  thresholds and sizes are 8-byte units; the CPU reports what it wrote or
+  read by inverting TRIG (`0x82`/`0x92` bit 13) with the amount in
+  `0x88`/`0x98`. The interrupt is level and the ISR works by masking:
+  playback's period tick is the live underrun (level under buffer -
+  period), capture's the live overrun (over one period), re-armed by the
+  writer underrun (under 256 bytes); the reader's EMPTY and the writer's
+  FULL latch until their clear and are the XRUNs. Time is the virtual
+  clock at the programmed rate (`0x02`: reader 8-48 kHz, writer 8/16/32/48
+  kHz; `0xEE` mono). Capture is a 1 kHz tone, delivered a period at a
+  time (the driver only re-arms its period interrupt once the level has
+  dropped under 256 bytes); its level includes the 64-byte local buffer
+  the driver takes off. Playback goes to the machine's `audiodev`
+  (`-audiodev pa,id=snd0 -M msc313e,audiodev=snd0`), if any. A raw-ioctl
+  `aplay`/`arecord` stand-in on the camera's kernel runs 16 kHz mono and
+  48 kHz stereo streams with no XRUN and one (playback) or two
+  (capture) interrupts a period.
+- **GPIO, SAR, PM-sleep interrupts** (`sstar-i3-gpio`): PADGPIO bank
+  `0x103C` (in bit 0, out bit 4, output disabled bit 5), PM GPIO bank
+  `0x000F` (in bit 2, out bit 1, output disabled bit 0) and the SAR pads
+  (bank `0x0014` regs `0x11`/`0x12`), per `gpio/infinity3/mhal_gpio.c`.
+  Outputs read back what they drive; inputs read high (pull-ups), so
+  `PM_SD_CDZ` says "no card" (`-global sstar-i3-gpio.sd-card=on` puts one
+  in). The PM-sleep controller (PMSLEEP bank `0x000E` regs `0x00`-`0x0F`,
+  cascaded into MS_IRQ 2, GIC SPI 34; `irqchip/infinity3/irqchip.c`)
+  latches PM pad edges at their polarity (pad register bit 7), masks (bit
+  4) and clears (bit 6) them, and is high only while a final status bit
+  in `0x04`/`0x05`/`0x0E` is set: the vendor handler `BUG()`s otherwise.
+  The SAR ADC converts at once.
+- **Day and night** (`-M msc313e,daynight=day|night`, default day;
+  `qom-set /machine daynight night` while running). `PAD_PM_IRIN` (gpio
+  78, the DTS `ircut` UIO device's input, PM-sleep hwirq 22) reads high by
+  day and low by night, and its edges raise the interrupt the driver
+  flips between rising and falling. The camera application decides from
+  the SAR instead: `jco_server`'s `encode_infrared` reads `/dev/sar`
+  channel 2 (register `0x42`) and calls night below `dwTurnOnLux` (50,
+  hysteresis 3), so that channel reads `0x3FF` by day and `0x008` by
+  night. On the camera dump it logs `eDayOrNight:0 change to night:1` and
+  back as the property changes, and drives the IR-cut motor on gpio
+  98/99.
+- **Not there**: SATA, the display, the VPU and GE are infinity2m NVR
+  blocks, and Ifado's own media models sit at other banks. The IVE is not
+  modelled, nor the scaler's own crop, filters and VIP stages (the camera
+  application leaves its VIP gammas off and its CCM at the identity).
+
+**The camera dump.** Its U-Boot environment has `bootcmd` set and
+bootargs with `init=/bin/sh`, so the board, as dumped, boots to a bare
+`sh-4.0#`; U-Boot arms the watchdog with 60 s and the kernel's driver
+re-arms it, so with nothing feeding `/dev/watchdog` it resets every minute,
+as the real one would. `exec /init` at that prompt runs the firmware's own
+init (`init.rc`, `rcS`, `/ipc/etc/auto_run.sh`), which starts the camera
+application `jco_server`: it finds the sensor, runs its ISP and 3A,
+scales and encodes the main picture to 1280x720 H.264, feeds the
+watchdog, takes its address from its saved configuration (`192.168.1.32`)
+and serves HTTP (thttpd, port 80) and RTSP (live555, port 554,
+`stream1`, `stream2`). Use `restrict=on`: without it the application
+reaches out to its vendor's cloud servers through SLIRP's NAT. Its EMAC
+driver prints `probe of emac failed with error -1` after `register_netdev`
+(the board's LED GPIOs); `eth0` works.
+
+The vendor SDK's own `one.bin` (`project/I3/image/image_QFN64M-MSC313E`)
+is not a full flash image: the SDK's flashing script writes it and then
+saves the U-Boot environment, so on its own it stops at the `MStar #`
+prompt, on a board as under QEMU.
+
 ## Not modelled
 
 - HDMI TX: no EDID, so the NVR falls back to its default output mode.
@@ -386,5 +612,8 @@ ID, so it loads only when given that camera's value, e.g.
 - SAR ADC, RTC (the kernel warns that RTCPWC has no power),
   the MMU block (`HAL_MMU_Reset timeout`), audio output and the
   infinity2m's audio.
-- infinity3 (MSC313E), infinity6 and mercury5 parts. Daniel Palmer's
-  `mstar-miyoo-working` branch has the infinity3 and mercury5 maps.
+- infinity (MSC313, MSC316 without E), infinity6 and mercury5 parts.
+  The I3 SDK's kernel also has `infinity.dtsi`; Daniel Palmer's
+  `mstar-miyoo-working` branch has the mercury5 map.
+- On infinity3, the media blocks (MFE, IVE, audio),
+  SD (FCIE/SDIO), the SAR ADC and the FUART's URDMA.

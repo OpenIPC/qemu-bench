@@ -8,8 +8,21 @@
  *               sensor on XM510 boards.  ipcinfo identifies it the same way.
  *   hisi-jxh42  JX-H42, ID 0xA042, at 0x30 as well: Goke GK7102 boards
  *               ("rb jxh42" U-Boot and kernel builds).
+ *   hisi-jxf22  JX-F22, ID 0x0F22, at 0x80 (8-bit) = 0x40: MStar MSC313E
+ *               cameras, whose libdrv_ms_cus_JXF22.so checks Sensor_id_table
+ *               {0x0A, 0x0F}, {0x0B, 0x22}.
  *
  * Everything else is RAM: the sensor tables the ISP writes read back.
+ * hisi_soi_exposure() decodes the registers an ISP model renders the
+ * picture from (the SOI map the JX-F22 driver, libdrv_ms_cus_JXF22.so,
+ * programs; the other JX parts share it):
+ *
+ *   0x00     gain: 2^[6:4] x (1 + [3:0] / 16), 1x to 15.5x (pCus_SetAEGain)
+ *   0x01/02  exposure in rows, low / high (pCus_SetAEUSecs: one row is
+ *            29.63 us at 1125 rows a frame, capped at the frame - 4)
+ *   0x22/23  frame length in rows (VTS), low / high (pCus_SetFPS)
+ *   0x24-26  output window: width / 2 in 0x26[3:0]:0x24, height in
+ *            0x26[7:4]:0x25 (0x3C0 and 0x438: 1920x1080)
  *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
@@ -19,10 +32,10 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/hisi-soi.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
-#define TYPE_HISI_F37 "hisi-f37"
 #define TYPE_HISI_JXH62 "hisi-jxh62"
 #define TYPE_HISI_JXH42 "hisi-jxh42"
 OBJECT_DECLARE_TYPE(HisiF37State, HisiSoiClass, HISI_F37)
@@ -82,6 +95,24 @@ static uint8_t hisi_f37_recv(I2CSlave *i2c)
     return val;
 }
 
+bool hisi_soi_exposure(Object *sensor, HisiSoiExposure *e)
+{
+    HisiF37State *s = (HisiF37State *)object_dynamic_cast(sensor,
+                                                          TYPE_HISI_F37);
+    uint8_t g;
+
+    if (!s) {
+        return false;
+    }
+    g = s->regs[0x00];
+    e->lines = s->regs[0x02] << 8 | s->regs[0x01];
+    e->vts = s->regs[0x23] << 8 | s->regs[0x22];
+    e->gain = (16 + (g & 0xF)) << (6 + ((g >> 4) & 7));
+    e->width = ((s->regs[0x26] & 0xF) << 8 | s->regs[0x24]) * 2;
+    e->height = (s->regs[0x26] >> 4) << 8 | s->regs[0x25];
+    return true;
+}
+
 static void hisi_f37_reset(DeviceState *dev)
 {
     HisiF37State *s = HISI_F37(dev);
@@ -113,6 +144,11 @@ static void hisi_jxh42_class_init(ObjectClass *klass, const void *data)
     HISI_F37_CLASS(klass)->id = 0xA042;
 }
 
+static void hisi_jxf22_class_init(ObjectClass *klass, const void *data)
+{
+    HISI_F37_CLASS(klass)->id = 0x0F22;
+}
+
 static void hisi_f37_register_types(void)
 {
     static const TypeInfo types[] = {
@@ -130,6 +166,10 @@ static void hisi_f37_register_types(void)
             .name          = TYPE_HISI_JXH42,
             .parent        = TYPE_HISI_F37,
             .class_init    = hisi_jxh42_class_init,
+        }, {
+            .name          = TYPE_HISI_JXF22,
+            .parent        = TYPE_HISI_F37,
+            .class_init    = hisi_jxf22_class_init,
         },
     };
     int i;

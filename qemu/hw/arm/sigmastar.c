@@ -102,13 +102,22 @@
 #define SS_SPI_VIF          89          /* Ifado: the DTS vif's first */
 #define SS_SPI_CMDQ         49          /* Ifado: cmdq0-3 */
 #define SS_SPI_JPE          61          /* Ifado: the DTS "jpe-irq0" */
-#define SS_SPI_AUDIO        74          /* Ifado: the DTS "sstar,audio" */
+#define SS_SPI_AUDIO        74          /* Ifado sstar,audio; I3 BACH */
+#define SS_SPI_PM_SLEEP     34          /* infinity3: INT_IRQ_PM_SLEEP */
 #define SS_SPI_MIIC0        68          /* Ifado */
 #define SS_SPI_MIIC1        69
 #define SS_SPI_MIIC2        92
 #define SS_SPI_FURDMA       80          /* Ifado */
 #define SS_SPI_URDMA0       93          /* Ifado; BDMA2 on infinity2m */
 #define SS_SPI_URDMA1       94          /* Ifado; BDMA3 on infinity2m */
+#define SS_SPI_RTC          76          /* infinity3: INT_IRQ_RTC */
+#define SS_SPI_I3_SCL       52          /* infinity3: INT_IRQ_SC_TOP */
+#define SS_SPI_I3_ISP       57          /* infinity3: INT_IRQ_ISP */
+#define SS_SPI_I3_CSI       65          /* infinity3: INT_IRQ_MIPI_CSI2 */
+#define SS_SPI_I3_MFE       60          /* infinity3: INT_IRQ_MFE */
+#define SS_SPI_I3_CMDQ      49          /* infinity3: INT_IRQ_CMDQ */
+#define SS_SPI_I3_JPE       61          /* infinity3: INT_IRQ_JPE */
+#define SS_SPI_I3_VHE       53          /* infinity3: INT_IRQ_VHE */
 #define SS_SPI_TIMER0       96
 #define SS_SPI_TIMER1       97
 #define SS_SPI_WDT          98
@@ -253,6 +262,7 @@ static const SstarRegDefault ss_ifado_defaults[] = {
 
 static const SsSoCConfig ssc375_soc = {
     .desc               = "SigmaStar SSC375 (ifado, 1x Cortex-A7)",
+    .die                = SS_DIE_IFADO,
     .num_cpus           = 1,
     .ram_size_default   = 128 * MiB,
     .chip_id            = 0xF0,
@@ -263,22 +273,55 @@ static const SsSoCConfig ssc375_soc = {
     .smf_ack            = true,
     .defaults           = ss_ifado_defaults,
     .urdma              = true,
-    .miic               = true,
+    .miic               = 3,
+    .miic_sensor_bus    = 1,
     .default_sensor     = "sc431hai",
     .ipc                = true,
     .gpio_bank          = 0x103E,
 };
 
 /*
- * Image sensors for sensor=, on MIIC1 at 0x30 (the DTB's sensorif:
- * snr0_mipi_i2c = <1>).  SmartSens: the ID in 0x3107/0x3108, as the
- * board's sc431hai_mipi.ko compares it.
+ * MSC313E (die "infinity3", Linux "mstar,infinity3"): one Cortex-A7 with
+ * 64 MiB DDR2 in a QFN.  Sources: the vendor I3 SDK
+ * (MSC3XX_SDK_V_1711291828-I3: U-Boot 2015.01, Linux 3.18.30, the
+ * prebuilt image_QFN64M-MSC313E flash image) and the MSC313E datasheet.
+ * Its mask ROM looks for the IPL at NOR 0x4000 (linux-chenxing.org
+ * blobs/bootrom.md); the chip ID is 0xC2.  The IPL sizes DRAM by the wrap
+ * and reads no bond strap.  Also booted: the 8 MiB W25Q64 (0xEF4017) NOR
+ * of a retail camera with the same chain.
+ */
+static const SsSoCConfig msc313e_soc = {
+    .desc               = "MStar MSC313E (infinity3, 1x Cortex-A7)",
+    .die                = SS_DIE_INFINITY3,
+    .num_cpus           = 1,
+    .ram_size_default   = 64 * MiB,
+    .chip_id            = 0xC2,
+    .flash_jedec        = 0xEF4018,         /* W25Q128 */
+    .ipl_offset         = 0x4000,
+    .ipc                = true,
+    /*
+     * MIIC0/1 only (DTS i2c0@0, i2c1@1); the F22 on MIIC1, the bus the
+     * camera's U-Boot sets ("Setting bus to 1").
+     */
+    .miic               = 2,
+    .miic_sensor_bus    = 1,
+    .default_sensor     = "jxf22",
+};
+
+/*
+ * Image sensors for sensor=, at their address on the die's sensor bus
+ * (miic_sensor_bus).  SmartSens parts are hisi-smartsens with the ID in
+ * 0x3107/0x3108 (ssc375: the DTB's sensorif snr0_mipi_i2c = <1>, as the
+ * board's sc431hai_mipi.ko compares it); SOI parts have their own types.
  */
 static const struct {
     const char *name;
+    const char *type;
+    uint8_t addr;
     uint8_t id_high, id_low;
 } ss_sensors[] = {
-    { "sc431hai", 0xCD, 0x6B },
+    { "sc431hai", "hisi-smartsens", 0x30, 0xCD, 0x6B },
+    { "jxf22", "hisi-jxf22", 0x40 },
 };
 
 #define TYPE_SS_MACHINE MACHINE_TYPE_NAME("sigmastar")
@@ -291,6 +334,8 @@ struct SsMachineState {
     uint32_t flash_jedec;
     char *sensor;
     uint64_t uuid;
+    bool night;
+    DeviceState *i3_gpio;
     ARMCPU *cpus[SS_MAX_CPUS];
     MemoryRegion smpctrl;
     uint16_t smpctrl_regs[0x80];
@@ -355,6 +400,28 @@ static void ss_machine_set_uuid(Object *obj, Visitor *v, const char *name,
                                 void *opaque, Error **errp)
 {
     visit_type_uint64(v, name, &SS_MACHINE(obj)->uuid, errp);
+}
+
+static char *ss_machine_get_daynight(Object *obj, Error **errp)
+{
+    return g_strdup(SS_MACHINE(obj)->night ? "night" : "day");
+}
+
+/* Before init it is the board's start; afterwards, a change of light. */
+static void ss_machine_set_daynight(Object *obj, const char *value,
+                                    Error **errp)
+{
+    SsMachineState *s = SS_MACHINE(obj);
+
+    if (strcmp(value, "day") && strcmp(value, "night")) {
+        error_setg(errp, "daynight is day or night");
+        return;
+    }
+    s->night = !strcmp(value, "night");
+    if (s->i3_gpio) {
+        object_property_set_bool(OBJECT(s->i3_gpio), "night", s->night,
+                                 errp);
+    }
 }
 
 static uint64_t ss_smpctrl_read(void *opaque, hwaddr off, unsigned size)
@@ -457,16 +524,24 @@ static const uint32_t ss_bootrom_script[] = {
     0x1F203D4C, 0x3210,                         /* UART pad mux */
 };
 
-static bool ss_boot_rom_setup(const uint8_t *img, gsize len, const char *path)
+static bool ss_boot_rom_setup(const uint8_t *img, gsize len, const char *path,
+                              uint32_t ipl_offset)
 {
     GArray *rom = g_array_new(false, false, sizeof(uint32_t));
     const uint32_t end[3] = { 0, 0, SS_IMI_BASE };
     uint32_t size;
     guint i;
 
-    if (len < 0x10 || ldl_le_p(img + 4) != SS_IPL_MAGIC) {
-        error_report("sigmastar: %s has no IPL header (\"IPL_\" at 4)",
-                     path);
+    if (len < ipl_offset + 0x10) {
+        error_report("sigmastar: %s is too short for an IPL at 0x%x",
+                     path, ipl_offset);
+        return false;
+    }
+    img += ipl_offset;
+    len -= ipl_offset;
+    if (ldl_le_p(img + 4) != SS_IPL_MAGIC) {
+        error_report("sigmastar: %s has no IPL header (\"IPL_\" at 0x%x)",
+                     path, ipl_offset + 4);
         return false;
     }
     size = lduw_le_p(img + 8);
@@ -527,7 +602,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     MemoryRegion *bootrom = g_new(MemoryRegion, 1);
     g_autofree uint8_t *img = NULL;
     gsize img_len = 0;
-    DeviceState *gic, *intc, *riu, *fsp, *dev;
+    DeviceState *gic, *intc, *riu, *fsp, *dev, *i3_isp = NULL;
     const int ncpus = MIN(machine->smp.cpus, c->num_cpus);
 
     assert(c->num_cpus <= SS_MAX_CPUS);
@@ -620,6 +695,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     riu = qdev_new(TYPE_SSTAR_RIU);
     qdev_prop_set_uint16(riu, "bond", c->bond);
     qdev_prop_set_bit(riu, "smf-ack", c->smf_ack);
+    qdev_prop_set_bit(riu, "infinity3", c->die == SS_DIE_INFINITY3);
     qdev_prop_set_uint16(riu, "gpio-bank", c->gpio_bank);
     qdev_prop_set_uint64(riu, "uuid", sms->uuid);
     sstar_riu_add_defaults(SSTAR_RIU(riu), ss_i2m_defaults);
@@ -688,8 +764,21 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     if (sms->flash_file) {
         qdev_prop_set_string(fsp, "flash-file", sms->flash_file);
     }
-    qdev_prop_set_uint32(fsp, "jedec", sms->flash_jedec ? sms->flash_jedec
-                                                        : c->flash_jedec);
+    {
+        /*
+         * Without flash-jedec=, the board's part in the size of the image:
+         * the same maker and type, the capacity byte log2 of the size
+         * (W25Q128 0xEF4018 dumped as 8 MiB is a W25Q64, 0xEF4017).
+         */
+        uint32_t jedec = c->flash_jedec;
+
+        if (sms->flash_jedec) {
+            jedec = sms->flash_jedec;
+        } else if (img_len && is_power_of_2(img_len)) {
+            jedec = (jedec & ~0xFFu) | ctz64(img_len);
+        }
+        qdev_prop_set_uint32(fsp, "jedec", jedec);
+    }
     qdev_prop_set_bit(fsp, "sw-cs", c->fsp_sw_cs);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(fsp), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 0, SS_ISP_BASE);
@@ -697,6 +786,139 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 2, SS_QSPI_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(fsp), 3, SS_XIU_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(fsp), 0, ss_spi(gic, intc, SS_SPI_FSP));
+
+    /*
+     * The infinity/infinity3 PM RTC, bank 0x0012 (DTS "mstar,infinity-rtc"
+     * at 0x1F002400).  infinity2m and later have the RTCPWC instead.
+     */
+    if (c->die == SS_DIE_INFINITY3) {
+        dev = qdev_new("sstar-rtc");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x0012, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_RTC));
+
+        /* the scaler VIP's YUV gamma SRAM port, SCNR bank regs 0x40-0x4F */
+        dev = qdev_new("sstar-vip-gamma");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1226, 0x40));
+        /* and its RGB gamma SRAM ports, HVSP1 bank regs 0x7A-0x7F */
+        dev = qdev_new("sstar-rgb-gamma");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1211, 0x7A));
+
+        /*
+         * The video input: the ISP top (bank 0x1302), its menuload (0x1306)
+         * and the CSI MAC (0x1204) are the frame clock, which drives the
+         * scaler's frame interrupts and DMA clients (SCL0 bank 0x1218),
+         * and the pixel pipeline, which renders the sensor's picture (the
+         * "sensor" link, set below) and hands it to the scaler.
+         */
+        {
+            DeviceState *isp = qdev_new("sstar-i3-isp");
+
+            i3_isp = isp;
+            object_property_add_child(OBJECT(machine), "isp", OBJECT(isp));
+            object_property_set_link(OBJECT(isp), "riu", OBJECT(riu),
+                                     &error_fatal);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(isp), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(isp), 0,
+                            SSTAR_RIU_ADDR(0x1302, 0));
+            sysbus_mmio_map(SYS_BUS_DEVICE(isp), 1,
+                            SSTAR_RIU_ADDR(0x1306, 0));
+            sysbus_mmio_map(SYS_BUS_DEVICE(isp), 2,
+                            SSTAR_RIU_ADDR(0x1204, 0));
+            sysbus_connect_irq(SYS_BUS_DEVICE(isp), 0,
+                               ss_spi(gic, intc, SS_SPI_I3_ISP));
+            sysbus_connect_irq(SYS_BUS_DEVICE(isp), 1,
+                               ss_spi(gic, intc, SS_SPI_I3_CSI));
+
+            dev = qdev_new("sstar-i3-scl");
+            object_property_set_link(OBJECT(dev), "riu", OBJECT(riu),
+                                     &error_fatal);
+            object_property_set_link(OBJECT(dev), "isp", OBJECT(isp),
+                                     &error_fatal);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0,
+                            SSTAR_RIU_ADDR(0x1218, 0));
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                               ss_spi(gic, intc, SS_SPI_I3_SCL));
+            qdev_connect_gpio_out(isp, 0, qdev_get_gpio_in(dev, 0));
+            qdev_connect_gpio_out(isp, 1, qdev_get_gpio_in(dev, 1));
+        }
+
+        /*
+         * The GPIO pads (PADGPIO 0x103C, PM GPIO 0x000F), the SAR ADC
+         * (0x0014) and the PM-sleep interrupt controller (PMSLEEP 0x000E
+         * regs 0x00-0x0F), cascaded into the main controller's MS_IRQ 2.
+         */
+        dev = qdev_new("sstar-i3-gpio");
+        object_property_set_bool(OBJECT(dev), "night", sms->night,
+                                 &error_fatal);
+        object_property_add_child(OBJECT(machine), "gpio", OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x000E, 0));
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, SSTAR_RIU_ADDR(0x000F, 0));
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2, SSTAR_RIU_ADDR(0x103C, 0));
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 3, SSTAR_RIU_ADDR(0x0014, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_PM_SLEEP));
+        sms->i3_gpio = dev;
+
+        /*
+         * Audio: BACH's DMAs (bank 0x1502) and its interrupt enable (bank
+         * 0x1503); playback to the machine's audiodev, if it has one.
+         */
+        dev = qdev_new("sstar-i3-bach");
+        if (machine->audiodev) {
+            qdev_prop_set_string(dev, "audiodev", machine->audiodev);
+        }
+        object_property_add_child(OBJECT(machine), "audio", OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1502, 0));
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, SSTAR_RIU_ADDR(0x1503, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_AUDIO));
+
+        /*
+         * The scaler's command queue, one engine at bank 0x1120: it
+         * applies scaling changes at a frame end while streaming.
+         */
+        dev = qdev_new("sstar-cmdq");
+        qdev_prop_set_bit(dev, "infinity3", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1120, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_I3_CMDQ));
+
+        /* the H.264 encoder, banks 0x1324-0x1325 */
+        dev = qdev_new("sstar-mfe");
+        qdev_prop_set_uint64(dev, "dram-size", machine->ram_size);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F264800);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_I3_MFE));
+
+        /* the JPEG encoder, bank 0x1320 */
+        dev = qdev_new("sstar-i3-jpe");
+        qdev_prop_set_uint64(dev, "dram-size", machine->ram_size);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F264000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_I3_JPE));
+
+        /*
+         * The H.265 encoder (Hantro H2 v3): its conf bank 0x1328 and the
+         * Hantro registers, two RIU words each, in banks 0x1329-0x132B.
+         */
+        dev = qdev_new("sstar-vhe");
+        qdev_prop_set_uint64(dev, "dram-size", machine->ram_size);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F265000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, 0x1F265200);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_I3_VHE));
+    }
 
     /* SHA and RSA (and the AES DMA's registers), bank 0x1122 */
     dev = qdev_new("sstar-crypto");
@@ -724,7 +946,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
      * block at 0x1F34C800 and the encoder's at 0x1F34CC00 (sstar_mi.ko's
      * HalVencIos*; the DTS "venc" node, "mhe-irq").
      */
-    if (c->ipc) {
+    if (c->die == SS_DIE_IFADO) {
         dev = qdev_new("sstar-venc");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F34C800);
@@ -774,7 +996,10 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                            ss_spi(gic, intc, SS_SPI_CMDQ));
     }
 
-    /* MIIC0-2 (Ifado DTS i2c@1f223000, @1f223200, @1f222e00) */
+    /*
+     * MIIC0-2 (Ifado DTS i2c@1f223000, @1f223200, @1f222e00); infinity3
+     * has the first two, at the same addresses and SPIs.
+     */
     if (c->miic) {
         static const hwaddr base[3] = { 0x1F223000, 0x1F223200, 0x1F222E00 };
         static const int spi[3] = {
@@ -783,7 +1008,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         const char *sensor = sms->sensor ? sms->sensor : c->default_sensor;
         I2CBus *bus[3];
 
-        for (n = 0; n < 3; n++) {
+        assert(c->miic <= 3 && c->miic_sensor_bus < c->miic);
+        for (n = 0; n < c->miic; n++) {
             dev = qdev_new("sstar-i2c");
             sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
@@ -799,14 +1025,23 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             }
             if (n == ARRAY_SIZE(ss_sensors)) {
                 error_report("sigmastar: unknown sensor '%s' (none, "
-                             "sc431hai)", sensor);
+                             "sc431hai, jxf22)", sensor);
                 exit(1);
             }
-            dev = DEVICE(i2c_slave_new("hisi-smartsens", 0x30));
-            qdev_prop_set_uint8(dev, "id_high", ss_sensors[n].id_high);
-            qdev_prop_set_uint8(dev, "id_low", ss_sensors[n].id_low);
-            i2c_slave_realize_and_unref(I2C_SLAVE(dev), bus[1],
+            dev = DEVICE(i2c_slave_new(ss_sensors[n].type,
+                                       ss_sensors[n].addr));
+            if (ss_sensors[n].id_high || ss_sensors[n].id_low) {
+                qdev_prop_set_uint8(dev, "id_high", ss_sensors[n].id_high);
+                qdev_prop_set_uint8(dev, "id_low", ss_sensors[n].id_low);
+            }
+            i2c_slave_realize_and_unref(I2C_SLAVE(dev),
+                                        bus[c->miic_sensor_bus],
                                         &error_fatal);
+            /* the infinity3 ISP renders its picture from the sensor's */
+            if (i3_isp) {
+                object_property_set_link(OBJECT(i3_isp), "sensor",
+                                         OBJECT(dev), &error_fatal);
+            }
         }
     } else if (sms->sensor && strcmp(sms->sensor, "none")) {
         error_report("sigmastar: this machine has no sensor bus");
@@ -954,7 +1189,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             error_report("sigmastar: cannot load ROM %s", machine->firmware);
             exit(1);
         }
-    } else if (img && !ss_boot_rom_setup(img, img_len, sms->flash_file)) {
+    } else if (img && !ss_boot_rom_setup(img, img_len, sms->flash_file,
+                                         c->ipl_offset)) {
         exit(1);
     }
 }
@@ -978,17 +1214,25 @@ static void ss_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "flash-file",
         ss_machine_get_flash_file, ss_machine_set_flash_file);
     object_class_property_set_description(oc, "flash-file",
-        "SPI NOR image as dumped from the board (IPL at 0); erases and "
-        "programs are written back to it");
+        "SPI NOR image as dumped from the board (IPL at 0, at 0x4000 on "
+        "infinity3); erases and programs are written back to it");
     object_class_property_add(oc, "flash-jedec", "uint32",
         ss_machine_get_flash_jedec, ss_machine_set_flash_jedec, NULL, NULL);
     object_class_property_set_description(oc, "flash-jedec",
-        "JEDEC ID the SPI NOR answers with (e.g. 0xEF4018)");
+        "JEDEC ID the SPI NOR answers with (e.g. 0xEF4018); by default "
+        "the board's part, its capacity byte taken from the image size");
     object_class_property_add_str(oc, "sensor",
         ss_machine_get_sensor, ss_machine_set_sensor);
     object_class_property_set_description(oc, "sensor",
         "Image sensor on the sensor I2C bus (ssc375: sc431hai, the "
-        "default, or none)");
+        "default; msc313e: jxf22, the default; or none)");
+    object_class_property_add_str(oc, "daynight",
+        ss_machine_get_daynight, ss_machine_set_daynight);
+    object_class_property_set_description(oc, "daynight",
+        "msc313e: the light the camera sees, day (the default) or night: "
+        "PM_IRIN's level and the light sensor on SAR channel 2; "
+        "qom-set /machine daynight changes it while running");
+    machine_add_audiodev_property(mc);
     object_class_property_add(oc, "uuid", "uint64",
         ss_machine_get_uuid, ss_machine_set_uuid, NULL, NULL);
     object_class_property_set_description(oc, "uuid",
@@ -1033,3 +1277,4 @@ DEFINE_SS_MACHINE("ssr621q", ssr621q, ssr621q_soc)
 DEFINE_SS_MACHINE("ssc375", ssc375, ssc375_soc)
 DEFINE_SS_MACHINE("ssd202d", ssd202d, ssd202d_soc)
 DEFINE_SS_MACHINE("ssd201", ssd201, ssd201_soc)
+DEFINE_SS_MACHINE("msc313e", msc313e, msc313e_soc)

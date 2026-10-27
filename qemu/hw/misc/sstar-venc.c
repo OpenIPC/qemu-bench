@@ -73,9 +73,9 @@
  *
  * Here a job completes "done-us" (by default 10 ms) after it is fired,
  * each on its own deadline.  Built with libavcodec (and its
- * libx264 and libx265 encoders), the model encodes a test pattern of its
- * own (colour bars, a moving box and the frame number in binary) at the
- * job's size and codec, an IDR where the driver asks for an I frame.
+ * libx264 and libx265 encoders), the model encodes the test pattern of
+ * sstar-pattern.h (the OpenIPC logo on navy, a dot sliding beneath it) at
+ * the job's size and codec, an IDR where the driver asks for an I frame.
  * The frame is encoded when the job is fired, with the virtual clock
  * stopped: libx265 takes tens of milliseconds a frame, and a guest that
  * ran on meanwhile would queue the channel's next frame onto the ring-pool
@@ -107,6 +107,8 @@
 #ifdef SSTAR_VENC_LIBAVCODEC
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#include "aw-vinc-logo.h"
+#include "hw/misc/sstar-pattern.h"
 #endif
 
 #define TYPE_SSTAR_VENC "sstar-venc"
@@ -402,52 +404,25 @@ static struct SstarVencEncoder *venc_encoder(SstarVencState *s, int ctx,
     return e;
 }
 
-/* Colour bars, a box moving across them, the frame number in binary. */
+/* The test pattern of sstar-pattern.h, the other targets' picture. */
 static void venc_pattern(AVFrame *f, int64_t frame)
 {
-    static const uint8_t bars[8][3] = {     /* 75% bars, BT.601 Y Cb Cr */
-        { 180, 128, 128 }, { 162, 44, 142 }, { 131, 156, 44 },
-        { 112, 72, 58 }, { 84, 184, 198 }, { 65, 100, 212 },
-        { 35, 212, 114 }, { 16, 128, 128 },
-    };
-    int w = f->width, h = f->height, x, y, bit;
-    /* both clipped to the frame, which may be as small as 16x16 */
-    int box = MIN(MAX(h / 6, 16), MIN(w, h));
-    int bx = (int)((frame * 8) % (w - box + 1)), by = h / 2 - box / 2;
-    int cell = MIN(MAX(w / 40, 8), h);
+    int w = f->width, h = f->height, x, y;
+    uint8_t yuv[3];
 
     av_frame_make_writable(f);
     for (y = 0; y < h; y++) {
         uint8_t *py = f->data[0] + y * f->linesize[0];
+        uint8_t *pu = f->data[1] + y / 2 * f->linesize[1];
+        uint8_t *pv = f->data[2] + y / 2 * f->linesize[2];
 
         for (x = 0; x < w; x++) {
-            py[x] = bars[x * 8 / w][0];
-        }
-        if (y >= by && y < by + box) {
-            memset(py + bx, 235, box);
-        }
-        if (y < cell) {
-            for (bit = 0; bit < 16; bit++) {
-                int cx = (15 - bit) * cell;
-
-                if (cx < w) {
-                    memset(py + cx, (frame >> bit) & 1 ? 235 : 16,
-                           MIN(cell - 2, w - cx));
-                }
+            sstar_pattern_pixel(frame, w, h, x, y, yuv);
+            py[x] = yuv[0];
+            if (!((x | y) & 1)) {
+                pu[x / 2] = yuv[1];
+                pv[x / 2] = yuv[2];
             }
-        }
-    }
-    for (y = 0; y < h / 2; y++) {
-        uint8_t *pu = f->data[1] + y * f->linesize[1];
-        uint8_t *pv = f->data[2] + y * f->linesize[2];
-
-        for (x = 0; x < w / 2; x++) {
-            int b = x * 16 / w;
-            bool white = (y * 2 >= by && y * 2 < by + box &&
-                          x * 2 >= bx && x * 2 < bx + box) || y * 2 < cell;
-
-            pu[x] = white ? 128 : bars[b][1];
-            pv[x] = white ? 128 : bars[b][2];
         }
     }
 }

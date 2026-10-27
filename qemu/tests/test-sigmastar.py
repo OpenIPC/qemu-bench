@@ -24,9 +24,25 @@ IPL, U-Boot and kernel drivers (docs/sigmastar.md):
   - outside qtest: machine state migrates to a file and back, and a
     file-backed flash blocks migration.
 
+and then the msc313e (infinity3) machine: the ROM stages the IPL from NOR
+0x4000, the chip ID, the IPL's "[HSD] IP Reset Switch" acknowledge,
+sstar-rtc (latch, load, count, alarm), the VIP gamma SRAM ports, the JPEG
+encoder (Q table port, the stale start the reset cancels, a scan into DRAM
+ending in EOI with its size and interrupt), the H.265 encoder (a frame
+from its trigger to swreg1 = IRQ | FRAME_RDY, the size in swreg9, the
+interrupt and its mask, IDR then TRAIL_R NALs in DRAM), sstar-i3-gpio (pad
+levels in and out, the SAR ADC, PM-sleep edges cascaded into MS_IRQ 2 with
+mask and ack, daynight= through qom-set), sstar-i3-bach (capture and
+playback levels, TRIG, the period and XRUN interrupts on MS_IRQ 42 rising
+and falling as the ISR masks them) and the ISP pipeline (a JX-F22 exposure
+set over MIIC1 into AE/AWB block statistics that scale with it, WB gains
+that neutralise the logo's white in the scaler's NV12 output, a gamma table
+through the menuload, the test pattern with the ISP off).
+
     python3 qemu/tests/test-sigmastar.py [--qemu PATH]
 """
 import argparse
+import base64
 import atexit
 import os
 import shutil
@@ -126,7 +142,7 @@ def shown(v):
     if isinstance(v, bytes):
         return v[:8].hex() + ('...' if len(v) > 8 else '')
     if isinstance(v, (list, tuple)):
-        return ' '.join(hex(x) for x in v)
+        return ' '.join(str(shown(x)) for x in v)
     return hex(v)
 
 
@@ -480,6 +496,670 @@ def vpu_decode(qt, bs):
           0x8080)
 
 
+def make_i3_image(path):
+    """8 MiB, blank but for an IPL at 0x4000, where the I3 ROM looks."""
+    img = bytearray(b'\xFF' * (8 << 20))
+    struct.pack_into('<IIHHI', img, 0x4000, 0xEA000002, 0x5F4C5049,
+                     IPL_SIZE, 0, 0x12345678)
+    for i in range(0x10, IPL_SIZE):
+        img[0x4000 + i] = i & 0xFF
+    open(path, 'wb').write(img)
+
+
+def test_msc313e(qemu, tmp):
+    print('msc313e (infinity3)')
+    path = os.path.join(tmp, 'i3.bin')
+    make_i3_image(path)
+    qt = QTest(qemu, 'msc313e,flash-file=' + path, ['-rtc', 'clock=vm'])
+    try:
+        check('IPL from NOR 0x4000 in IMI', qt.readl(IMI + 4), 0x5F4C5049)
+        check('its body', qt.readl(IMI + 0x1FC), 0xFFFEFDFC)
+        check('chip ID', qt.readw(riu(0x001E, 0x00)), 0xC2)
+        for bank in (0x1410, 0x1402):
+            a = riu(bank, 0x3F)
+            qt.writew(a, 0)
+            check('bank 0x%x: IP reset switch low acknowledged' % bank,
+                  qt.readw(a) & 0xE, 0xE)
+            qt.writew(a, 1)
+            check('bank 0x%x: and high' % bank, qt.readw(a) & 0xE, 0)
+
+        rtc = riu(0x0012, 0)
+        qt.writew(rtc + 0x0C, 0x5678)               # LOAD_VAL
+        qt.writew(rtc + 0x10, 0x1234)
+        qt.writew(rtc, 0x0B | 0x20)                 # RSTZ CNT_EN LOAD_EN
+        check('RTC: LOAD_EN clears itself', qt.readw(rtc) & 0x08, 0)
+        qt.writew(rtc, 0x13 | 0x20)                 # READ_EN
+        check('RTC: READ_EN clears itself', qt.readw(rtc) & 0x10, 0)
+        check('RTC: the loaded count latched',
+              qt.readw(rtc + 0x20) | qt.readw(rtc + 0x24) << 16, 0x12345678)
+        qt.step(3 * 10 ** 9)
+        qt.writew(rtc, 0x13 | 0x20)
+        check('RTC: three seconds later',
+              qt.readw(rtc + 0x20) | qt.readw(rtc + 0x24) << 16, 0x1234567B)
+        qt.writew(rtc + 0x14, 0x567D)               # MATCH_VAL = now + 2
+        qt.writew(rtc + 0x18, 0x1234)
+        qt.writew(riu(0x1009, 0x54 + 2), 0)         # unmask MS_IRQ 32-47
+        qt.writew(rtc, 0x03)                        # INT_MASK clear
+        qt.step(3 * 10 ** 9)
+        check('RTC: the alarm reaches GIC SPI 76 (intc IRQ 44)',
+              qt.readw(riu(0x1009, 0x5C + 2)) >> 12 & 1, 1)
+        qt.writew(rtc, 0x83)                        # INT_CLEAR
+        check('RTC: INT_CLEAR drops it',
+              qt.readw(riu(0x1009, 0x5C + 2)) >> 12 & 1, 0)
+
+        g = riu(0x1226, 0x40)                       # YUV gamma port
+        qt.writew(g + 0x10, 0x0505)                 # V address 5
+        qt.writew(g + 0x24, 0x0ABC)                 # V even, odd data
+        qt.writew(g + 0x28, 0x0DEF)
+        qt.writew(g + 0x04, 0x30)                   # V write enables
+        qt.writew(g, (4 << 3) | 4)                  # read V even
+        check('YUV gamma SRAM: V even entry reads back',
+              qt.readw(g + 0x3C), 0xABC)
+        qt.writew(g, (5 << 3) | 4)
+        check('and V odd', qt.readw(g + 0x3C), 0xDEF)
+        qt.writew(g, (0 << 3) | 4)
+        check('Y untouched', qt.readw(g + 0x3C), 0)
+
+        r = riu(0x1211, 0x7D)                       # GM12to10 port
+        qt.writew(r + 4, 0x0123)
+        qt.writew(r, 0x07 | 3 << 8 | 1 << 11)       # entry 7 of table 3
+        qt.writew(r, 0x07 | 3 << 8 | 1 << 12)
+        check('RGB gamma SRAM: entry reads back', qt.readw(r + 8), 0x123)
+        qt.writew(riu(0x1211, 0x7A), 0x07 | 3 << 8 | 1 << 12)
+        check('the other port has its own SRAM', qt.readw(riu(0x1211, 0x7C)),
+              0)
+        test_i3_gpio(qt)
+        test_i3_pmsleep(qt)
+        test_i3_bach_capture(qt)
+        test_i3_bach_playback(qt)
+        test_i3_jpe(qt)
+        test_i3_vhe(qt)
+        test_i3_mfe(qt)
+        test_i3_isp(qt)
+    finally:
+        qt.close()
+    out = hmp(qemu, ['-M', 'msc313e', '-S'],
+              ['xp /1hx 0x%x' % riu(0x0014, 0x42),
+               'qom-set /machine daynight night',
+               'xp /1hx 0x%x' % riu(0x0014, 0x42),
+               'xp /1hx 0x%x' % riu(0x000F, 0x14)])
+    vals = [int(l.split(':')[1], 16) for l in out.splitlines()
+            if l.startswith('00000000%08x' % riu(0x0014, 0x42)) or
+            l.startswith('00000000%08x' % riu(0x000F, 0x14))]
+    check('daynight: the light sensor bright, then dark after qom-set, '
+          'PM_IRIN low', vals, [0x3FF, 0x8, 0x11])
+
+
+PMGPIO = riu(0x000F, 0)
+PADGPIO = riu(0x103C, 0)
+SAR = riu(0x0014, 0)
+PMSLEEP = riu(0x000E, 0)
+BACH1 = riu(0x1502, 0)
+BACH2 = riu(0x1503, 0)
+
+
+def intc_raw(qt, n):
+    """The main intc's raw MS_IRQ input n (the GIC SPI 32 + n)."""
+    return qt.readw(riu(0x1009, 0x5C + n // 16)) >> (n % 16) & 1
+
+
+def test_i3_gpio(qt):
+    print('msc313e GPIO pads and SAR (mhal_gpio.c, mdrv_sar.c)')
+    check('PM_SD_CDZ input, high: no SD card',
+          qt.readb(PMGPIO + 0x47 * 4) & 5, 5)
+    check('PM_IRIN by day: input, high', qt.readb(PMGPIO + 0x14 * 4) & 5, 5)
+    a = PMGPIO + 0x01 * 4                       # PM_GPIO1, the amp enable
+    qt.writeb(a, qt.readb(a) & ~1 | 2)          # Set_High: OEN off, OUT on
+    check('PM_GPIO1 driven high reads high', qt.readb(a) & 4, 4)
+    qt.writeb(a, qt.readb(a) & ~2)
+    check('and driven low reads low', qt.readb(a) & 4, 0)
+    qt.writeb(a, qt.readb(a) | 1)               # Pad_Odn: an input again
+    check('released, its pull-up', qt.readb(a) & 4, 4)
+    a = PADGPIO + 0x05 * 4                      # GPIO5
+    check('PADGPIO GPIO5 input reads high', qt.readb(a) & 0x31, 0x21)
+    qt.writeb(a, qt.readb(a) & ~0x20 & ~0x10)
+    check('driven low reads low', qt.readb(a) & 1, 0)
+    qt.writeb(a, qt.readb(a) | 0x10)
+    check('driven high reads high', qt.readb(a) & 1, 1)
+    check('a register that is no pad is storage',
+          (qt.writew(PADGPIO + 0x12 * 4, 0x1234),
+           qt.readw(PADGPIO + 0x12 * 4))[1], 0x1234)
+    check('SAR_GPIO0-3 inputs read high', qt.readb(SAR + 0x12 * 4 + 1), 0x0F)
+    qt.writeb(SAR + 0x11 * 4 + 1, 0x0C)         # SAR_GPIO0/1 outputs
+    qt.writeb(SAR + 0x12 * 4, 0x02)             # 0 low, 1 high
+    check('SAR_GPIO0/1 (the IR-cut motor) read what they drive',
+          qt.readb(SAR + 0x12 * 4 + 1), 0x0E)
+    qt.writew(SAR, 0x0A20 | 0x4000)             # ms_sar_get: start
+    check('SAR conversion done at once', qt.readw(SAR) & 0x4000, 0)
+    check('SAR channel 2, the light sensor, by day', qt.readw(SAR + 0x42 * 4),
+          0x3FF)
+
+
+def test_i3_pmsleep(qt):
+    print('msc313e PM-sleep interrupts (irqchip.c, ms_ircut.c)')
+    irin = PMGPIO + 0x14 * 4                    # hwirq 22
+    qt.writew(riu(0x1009, 0x54), 0xFFFB)        # unmask MS_IRQ 2
+    check('nothing pending: the cascade low', intc_raw(qt, 2), 0)
+    qt.writew(irin, qt.readw(irin) | 0x80)      # falling edge
+    qt.writew(irin, qt.readw(irin) & ~0x10)     # unmask
+    check('unmasked with no edge: still low', intc_raw(qt, 2), 0)
+    qt.cmd('set_irq_in /machine/gpio pm-pad 20 0')  # night falls
+    check('PM_IRIN reads low', qt.readw(irin) & 4, 0)
+    check('the falling edge in the final status (bit 22)',
+          qt.readw(PMSLEEP + 4 * 4) | qt.readw(PMSLEEP + 5 * 4) << 16,
+          1 << 22)
+    check('and on MS_IRQ 2, GIC SPI 34', intc_raw(qt, 2), 1)
+    qt.writew(irin, qt.readw(irin) | 0x10)      # mask
+    check('masked: final status clear', qt.readw(PMSLEEP + 5 * 4), 0)
+    check('and the cascade low', intc_raw(qt, 2), 0)
+    qt.writew(irin, qt.readw(irin) & ~0x10)
+    check('unmasked: the edge is still latched', intc_raw(qt, 2), 1)
+    qt.writew(irin, qt.readw(irin) | 0x40)      # ack (SETREG16 BIT6)
+    check('ack clears it', (qt.readw(PMSLEEP + 5 * 4), intc_raw(qt, 2)),
+          (0, 0))
+    check('and the clear bit reads 0', qt.readw(irin) & 0x40, 0)
+    qt.cmd('set_irq_in /machine/gpio pm-pad 20 1')  # day: a rising edge
+    check('a rising edge with the falling polarity: nothing',
+          intc_raw(qt, 2), 0)
+    qt.writew(irin, qt.readw(irin) & ~0x80)     # the handler: rising next
+    qt.cmd('set_irq_in /machine/gpio pm-pad 20 0')
+    qt.cmd('set_irq_in /machine/gpio pm-pad 20 1')
+    check('the next rising edge raises it', intc_raw(qt, 2), 1)
+    qt.writew(irin, qt.readw(irin) | 0x40 | 0x10)
+    check('acked and masked: low', intc_raw(qt, 2), 0)
+    qt.cmd('set_irq_in /machine/gpio pm-irq 1 1')   # SAR, hwirq 79
+    check('a PM IRQ-group input while masked: low', intc_raw(qt, 2), 0)
+    qt.writeb(PMSLEEP + 8 * 4, 0xFD)            # unmask hwirq 79
+    check('unmasked: in 0x0E and on the cascade',
+          (qt.readw(PMSLEEP + 0x0E * 4), intc_raw(qt, 2)), (2, 1))
+    qt.cmd('set_irq_in /machine/gpio pm-irq 1 0')
+    check('and gone with its level', intc_raw(qt, 2), 0)
+    qt.writeb(PMSLEEP + 8 * 4, 0xFF)
+
+
+def test_i3_bach_capture(qt):
+    print('msc313e BACH capture (infinity.c, infinity_pcm.c)')
+    buf = DRAM + 0x01000000                     # MIU 0x01000000
+    ctl0, wr, flags = BACH1 + 0x40 * 4, BACH1 + 0x49 * 4, BACH1 + 0x48 * 4
+
+    def level():
+        qt.writew(wr, qt.readw(wr) | 0x1000)    # latch
+        v = qt.readw(BACH1 + 0x4F * 4)
+        qt.writew(wr, qt.readw(wr) & ~0x1000)
+        return v
+
+    qt.writew(BACH2 + 0x07 * 4, 0x0002)         # REG_DMA_INT_EN
+    qt.writew(BACH1 + 0x01 * 4, 1 << 8 | 1 << 10)   # writer 16 kHz
+    qt.writew(BACH1 + 0x77 * 4, 0x4000)         # WR_MONO
+    qt.writew(wr, 0x000)                        # address (8-byte units)
+    qt.writew(BACH1 + 0x4A * 4, 0x200)
+    qt.writew(BACH1 + 0x4B * 4, 4096 // 8)      # 4 KiB buffer
+    qt.writew(BACH1 + 0x4D * 4, 1024 // 8)      # overrun: the period
+    qt.writew(BACH1 + 0x4E * 4, 256 // 8)       # underrun: 256 bytes
+    qt.writew(ctl0, 0x0200)                     # WR_FULL clear pulse
+    qt.writew(ctl0, 0x0000)
+    qt.writew(ctl0, 0x4800)                     # FULL, OVERRUN enables
+    qt.writew(wr, 0x8000)                       # WR_ENABLE
+    qt.step(20 * 10 ** 6)
+    check('20 ms into a 32 ms period: nothing yet', (level(),
+          intc_raw(qt, 42)), (0, 0))
+    qt.step(15 * 10 ** 6)
+    check('a period in, plus the local buffer', level(), 128 + 8)
+    check('WR_OVERRUN raises GIC SPI 74 (MS_IRQ 42)',
+          (qt.readw(flags) & 0x23, intc_raw(qt, 42)), (0x02, 1))
+    check('the tone in DRAM', qt.readw(buf + 4), 5656)
+    qt.writew(BACH2 + 0x07 * 4, 0)
+    check('BANK2 0x0E bit 1 gates it', intc_raw(qt, 42), 0)
+    qt.writew(BACH2 + 0x07 * 4, 0x0002)
+    qt.writew(ctl0, 0x8800)                     # ISR: OVERRUN off, UNDER on
+    check('the ISR masks the overrun: low', intc_raw(qt, 42), 0)
+    qt.writew(BACH1 + 0x4C * 4, 128)            # WR_SIZE: a period read
+    qt.writew(wr, qt.readw(wr) ^ 0x2000)        # TRIG toggles
+    check('TRIG takes WR_SIZE off the level', level(), 8)
+    check('WR_UNDERRUN re-arms', (qt.readw(flags) & 1, intc_raw(qt, 42)),
+          (1, 1))
+    qt.writew(ctl0, 0x4800)                     # ISR: back to OVERRUN
+    check('swapped back: low', intc_raw(qt, 42), 0)
+    qt.step(200 * 10 ** 6)
+    check('nobody reads: WR_FULL latches (an XRUN)',
+          (qt.readw(flags) & 0x20, intc_raw(qt, 42)), (0x20, 1))
+    qt.writew(ctl0, 0)                          # stop: enables off
+    qt.writew(wr, qt.readw(wr) & ~0x8000)
+    qt.writew(wr, qt.readw(wr) | 0x4000)        # INIT pulse
+    qt.writew(wr, qt.readw(wr) & ~0x4000)
+    qt.writew(ctl0, 0x0200)
+    qt.writew(ctl0, 0x0000)
+    check('stopped and INIT: level 0, FULL cleared, low',
+          (level(), qt.readw(flags) & 0x20, intc_raw(qt, 42)), (0, 0, 0))
+
+
+def test_i3_bach_playback(qt):
+    print('msc313e BACH playback')
+    ctl0, rd, flags = BACH1 + 0x40 * 4, BACH1 + 0x41 * 4, BACH1 + 0x48 * 4
+
+    def level():
+        qt.writew(rd, qt.readw(rd) | 0x1000)
+        v = qt.readw(BACH1 + 0x47 * 4)
+        qt.writew(rd, qt.readw(rd) & ~0x1000)
+        return v
+
+    def trig(units):
+        qt.writew(BACH1 + 0x44 * 4, units)      # RD_SIZE
+        qt.writew(rd, qt.readw(rd) ^ 0x2000)
+
+    qt.writew(BACH1 + 0x01 * 4, 0 << 4)         # reader 8 kHz
+    qt.writew(BACH1 + 0x77 * 4, 0xA000)         # RD_MONO | MONO_COPY
+    qt.writew(rd, 0x000)
+    qt.writew(BACH1 + 0x42 * 4, 0x220)          # MIU 0x01100000
+    qt.writew(BACH1 + 0x43 * 4, 2048 // 8)
+    qt.writew(BACH1 + 0x45 * 4, (2048 + 1024) // 8)
+    qt.writew(BACH1 + 0x46 * 4, (2048 - 512) // 8)
+    trig(2048 // 8)                             # the prefill
+    check('TRIG adds RD_SIZE to the level', level(), 256)
+    qt.writew(ctl0, 0x0100)                     # RD_EMPTY clear pulse
+    qt.writew(ctl0, 0x0000)
+    qt.writew(ctl0, 0x2400 | 0x0002)            # EMPTY, UNDERRUN; prefetch
+    qt.writew(rd, qt.readw(rd) | 0x8000)        # RD_ENABLE
+    qt.step(20 * 10 ** 6)
+    check('20 ms at 16000 bytes/s played', level(), 256 - 40)
+    check('above buffer - period: low', intc_raw(qt, 42), 0)
+    qt.step(20 * 10 ** 6)
+    check('a period played: RD_UNDERRUN raises it',
+          (qt.readw(flags) & 0x1C, intc_raw(qt, 42)), (0x04, 1))
+    qt.writew(ctl0, qt.readw(ctl0) & ~0x2000)   # ISR masks the underrun
+    check('masked: low', intc_raw(qt, 42), 0)
+    trig(512 // 8)                              # the copy refills a period
+    qt.writew(ctl0, qt.readw(ctl0) | 0x2000)
+    check('refilled and unmasked: low', (qt.readw(flags) & 0x04,
+          intc_raw(qt, 42)), (0, 0))
+    qt.step(300 * 10 ** 6)
+    check('run dry: RD_EMPTY latches', qt.readw(flags) & 0x10, 0x10)
+    qt.writew(ctl0, 0x0000)
+    qt.writew(rd, qt.readw(rd) & ~0x8000)
+    qt.writew(rd, qt.readw(rd) | 0x4000)
+    qt.writew(rd, qt.readw(rd) & ~0x4000)
+    check('stopped: low', intc_raw(qt, 42), 0)
+
+
+I3_JPE = 0x1F264000
+I3_VHE_CONF = 0x1F265000
+I3_VHE_SW = 0x1F265200
+I3_MFE = 0x1F264800                     # banks 0x1324-0x1325
+
+
+def b64write(qt, a, data):
+    qt.cmd('b64write 0x%x 0x%x %s' % (a, len(data),
+                                       base64.b64encode(data).decode()))
+
+
+def b64read(qt, a, n):
+    return base64.b64decode(qt.cmd('b64read 0x%x 0x%x' % (a, n)).split()[1])
+
+
+def test_i3_jpe(qt):
+    def r(i):
+        return I3_JPE + 4 * i
+
+    def irq():                                  # GIC SPI 61, intc IRQ 29
+        return qt.readw(riu(0x1009, 0x5C + 1)) >> 13 & 1
+
+    w, h, src, out = 64, 32, 0x00100000, 0x00200000
+    qt.writew(riu(0x1009, 0x54 + 1), 0)         # unmask MS_IRQ 16-31
+    b64write(qt, DRAM + src,
+             bytes([200] * (w * h)) + bytes([128] * (w * h // 2)))
+    b64write(qt, DRAM + out, bytes(256))
+    qt.writew(r(0x1C), 0)
+    qt.writew(r(0x00), 0x03)                    # the stale start of _EncFire
+    qt.writew(r(0x00), 0x00)                    # soft_rstz low
+    qt.writew(r(0x00), 0x02)
+    for i, (a, v) in enumerate(((out, 0), (out + 0xFFF, 1))):
+        qt.writew(r(0x3C), a >> 2 & 0xFFFF)
+        qt.writew(r(0x3D), a >> 18 | v << 14)
+        qt.writew(r(0x3E), 1)
+    qt.writew(r(0x3B), 1)                       # set_adr
+    qt.writew(r(0x1D), 0x1FF)
+    check('JPE: irq clear reads back 0', qt.readw(r(0x1D)), 0)
+    qt.writew(r(0x01), w)
+    qt.writew(r(0x02), h)
+    qt.writew(r(0x5E), (w >> 4) * 0x101)
+    qt.writew(r(0x03), 0)                       # tbc_mode: software
+    for i in range(128):
+        qt.writew(r(0x4A), 1 + (i & 7))
+        qt.writew(r(0x49), 1 | i << 8)          # write entry i
+        qt.writew(r(0x48), 1 << 12)
+    check('JPE: table write done', qt.readw(r(0x49)) & 4, 4)
+    qt.writew(r(0x49), qt.readw(r(0x49)) | 2)
+    check('JPE: done_clr clears it', qt.readw(r(0x49)) & 4, 0)
+    qt.writew(r(0x49), 77 << 8)                 # read entry 77 back
+    qt.writew(r(0x48), 1 << 12)
+    check('JPE: Q table entry reads back', (qt.readw(r(0x49)) & 4,
+                                            qt.readw(r(0x4B))), (4, 6))
+    qt.writew(r(0x03), 1 << 6)
+    qt.writew(r(0x06), src >> 8 & 0xFFFF)
+    qt.writew(r(0x07), src >> 24)
+    qt.writew(r(0x0A), (src + w * h) >> 8 & 0xFFFF)
+    qt.writew(r(0x0B), (src + w * h) >> 24)
+    qt.step(10 ** 7)
+    check('JPE: the stale start was cancelled by the reset',
+          (qt.readw(r(0x1E)), irq()), (0, 0))
+    qt.writew(r(0x00), 0x03)                    # frame_start
+    check('JPE: frame_start reads back 0', qt.readw(r(0x00)) & 1, 0)
+    qt.step(10 ** 7)
+    check('JPE: frame done, GIC SPI 61 (intc IRQ 29)',
+          (qt.readw(r(0x1E)), irq()), (1, 1))
+    qt.writew(r(0x3B), 1 << 13)                 # rchk_en: s0 instead
+    s0 = (qt.readw(r(0x44)) | qt.readw(r(0x45)) << 16) << 2
+    qt.writew(r(0x3B), 0)
+    wptr = (qt.readw(r(0x44)) | qt.readw(r(0x45)) << 16) << 2
+    size = wptr - s0 + (qt.readw(r(0x42)) & 3) + 1
+    check('JPE: rchk_en reads the start back', s0, out)
+    scan = b64read(qt, DRAM + out, size + 4)
+    check('JPE: a scan of more than the EOI', size > 16, True)
+    check('JPE: it ends in EOI at the reported size',
+          scan[size - 2:size + 1], b'\xff\xd9\x00')
+    qt.writew(r(0x1D), 1)
+    check('JPE: clearing frame done drops the line',
+          (qt.readw(r(0x1E)), irq()), (0, 0))
+
+
+def test_i3_vhe(qt):
+    def sw(i, v):
+        qt.writel(I3_VHE_SW + 8 * i, v & 0xFFFF)
+        qt.writel(I3_VHE_SW + 8 * i + 4, v >> 16)
+
+    def swr(i):
+        return (qt.readl(I3_VHE_SW + 8 * i) & 0xFFFF |
+                (qt.readl(I3_VHE_SW + 8 * i + 4) & 0xFFFF) << 16)
+
+    def irq():                                  # GIC SPI 53, intc IRQ 21
+        return qt.readw(riu(0x1009, 0x5C + 1)) >> 5 & 1
+
+    w, h, src, out, nals = 64, 64, 0x00300000, 0x00400000, 0x00500000
+    rec = (0x00600000, 0x00700000)
+    pic = bytes((x * 4 if y < 32 else 255 - x * 4) & 0xFF
+                for y in range(h) for x in range(w))
+    b64write(qt, DRAM + src, pic + bytes([128] * (w * h // 2)))
+    check('VHE: swreg0, the H2 product ID', swr(0) >> 16, 0x4832)
+    for f in range(2):
+        qt.writew(I3_VHE_CONF + 4 * 0x01, 0)    # _sw_rst
+        qt.writew(I3_VHE_CONF + 4 * 0x01, 1)
+        qt.writew(I3_VHE_CONF + 4 * 0x04, 0xF00)
+        qt.writew(I3_VHE_CONF + 4 * 0x48, 0)
+        if not f:
+            check('VHE: conf irq clear reads back 0',
+                  qt.readw(I3_VHE_CONF + 4 * 0x04), 0)
+        regs = {
+            4: 1 << 29 | 3 << 23 | 2 << 19 | 1 << 6 | 2 << 3 | 4,
+            5: (w // 8) << 22 | (h // 8) << 11 | (0 if f else 1) << 1,
+            6: 2 << 20 | 0xE << 11 | 5 << 7 | 1 << 1,
+            7: 30 << 26 | 30 << 8,
+            8: out + 100, 9: 0x10000, 10: nals, 11: f,
+            12: src, 13: src + w * h,
+            15: rec[f], 16: rec[f] + w * h,
+            17: 1 << 6, 18: rec[0], 19: rec[0] + w * h,
+            38: 1 << 28 | w << 6,
+            164: (1 if f else 19) << 26,
+        }
+        for i in range(1, 165):
+            sw(i, regs.get(i, 0))
+        sw(5, regs[5] | 1)                      # ENC_E
+        qt.step(2 * 10 ** 7)
+        size = swr(9)
+        data = b64read(qt, DRAM + out + 100, size)
+        what = 'VHE: %s frame: ' % ('P' if f else 'I')
+        check(what + 'swreg1 = IRQ | FRAME_RDY, ENC_E cleared',
+              (swr(1), swr(5) & 1), (5, 0))
+        check(what + 'interrupt on GIC SPI 53 (intc IRQ 21)', irq(), 1)
+        check(what + 'NAL at BASE_OUTBS_ADDR (start code, type)',
+              data[:6], bytes.fromhex('00000001' + ('0201' if f else '2601')))
+        check(what + 'swreg9 bytes, ending in the trailing bits',
+              size > 8 and data[-1] != 0, True)
+        check(what + 'the NAL size table', struct.unpack(
+            '<II', b64read(qt, DRAM + nals, 8)), (size, 0))
+        qt.writew(I3_VHE_CONF + 4 * 0x48, 0xF)
+        check(what + 'conf 0x48 masks the line', irq(), 0)
+        sw(1, 0)                                # what _isr_func() does
+        qt.writew(I3_VHE_CONF + 4 * 0x48, 0)
+        check(what + 'swreg1 = 0 drops it', irq(), 0)
+    check('VHE: the reconstruction is in DRAM for the next frame',
+          b64read(qt, DRAM + rec[0], 4) != bytes(4), True)
+
+
+# The header bits h264_enc.c writes for a 32x32 stream at QP 26: SPS, PPS
+# and the IDR slice header, Main profile with CABAC (ending in the
+# cabac_alignment_one_bits), then a P slice header (cabac_init_idc 0); and
+# Baseline with CAVLC, 225 bits.
+MFE_CABAC_IDR = bytes.fromhex('00000001674d401e95a25a6c040000000168ee388000'
+                              '00000165b804ff')
+MFE_CABAC_P = bytes.fromhex('0000000141e023')
+MFE_CAVLC_IDR = bytes.fromhex('000000016742401e95a25a6c040000000168ce388000'
+                              '00000165b80480')
+MFE_W, MFE_H, MFE_SRC, MFE_OUT = 32, 32, 0x00800000, 0x00900000
+MFE_REC = (0x00A00000, 0x00B00000)
+
+
+def mfe_frame(qt, f, pic, hdr, nbits, cabac=True):
+    """One frame as mfe6_ios.c _enc_fire() runs it; returns the output."""
+    def r(i):
+        return I3_MFE + 4 * i
+
+    w, h, src, rec = MFE_W, MFE_H, MFE_SRC, MFE_REC
+    b64write(qt, DRAM + src, pic)
+    b64write(qt, DRAM + rec[f & 1], bytes(w * h * 3 // 2))
+    qt.writew(r(0x1C), 0)
+    qt.writew(r(0x03), cabac << 13 | 1 << 6)
+    reg00 = 2 << 2 | (1 if f else 0) << 4 | 26 << 8     # H.264, P, qscale
+    qt.writew(r(0x00), reg00)                   # soft_rstz low, then high
+    qt.writew(r(0x00), reg00 | 2)
+    qt.writew(r(0x01), w)
+    qt.writew(r(0x02), h)
+    qt.writew(r(0x90), w)
+    for reg, a in ((0x06, src), (0x08, src + w * h),
+                   (0x0A, rec[~f & 1]), (0x0E, rec[~f & 1] + w * h),
+                   (0x12, rec[f & 1]), (0x14, rec[f & 1] + w * h)):
+        qt.writew(r(reg), a >> 8 & 0xFFFF)
+        qt.writew(r(reg + 1), a >> 24)
+    for a, i in ((MFE_OUT, 0), (MFE_OUT + 0xFFFF, 1)):  # set_outbs_addr
+        qt.writew(r(0x3E), 0)
+        qt.writew(r(0x3C), a >> 3 & 0xFFFF)
+        qt.writew(r(0x3D), a >> 19 | i << 14)
+        qt.writew(r(0x3E), 1)
+    qt.writew(r(0x1D), 0xFF)
+    qt.writew(r(0x00), reg00 | 3)               # frame start
+    words = (nbits + 15) // 16
+    qt.writew(r(0x47), (words - 1) << 5)
+    for i in range(words):                      # put_coded_bits()
+        n = min(16, nbits - 16 * i)
+        qt.writew(r(0x46), hdr[2 * i] << 8 | (hdr[2 * i + 1] if n > 8 else 0))
+        qt.writew(r(0x47), (words - 1) << 5 | (n if i == words - 1 else 15))
+        qt.writew(r(0x48), 1 << 11)
+    qt.step(2 * 10 ** 7)
+    bits = qt.readw(r(0x42)) | (qt.readw(r(0x43)) & 0xFF) << 16
+    return bits, b64read(qt, DRAM + MFE_OUT, bits // 8)
+
+
+def test_i3_mfe(qt):
+    def irq():                                  # GIC SPI 60, intc IRQ 28
+        return qt.readw(riu(0x1009, 0x5C + 1)) >> 12 & 1
+
+    w, h = MFE_W, MFE_H
+    size = w * h * 3 // 2
+    # luma 100, chroma 128: MB 0 has no neighbours to predict 100 from
+    # (I_PCM), the others are Intra16x16 with H or V prediction
+    flat = bytes([100] * (w * h)) + bytes([128] * (w * h // 2))
+    moved = bytearray(flat)
+    for y in range(16, 32):                     # MB 3 changes: I_PCM
+        moved[y * w + 16:y * w + 32] = bytes(range(y, y + 16))
+    moved = bytes(moved)
+
+    hdr = MFE_CABAC_IDR
+    bits, data = mfe_frame(qt, 0, flat, hdr, 8 * len(hdr))
+    what = 'MFE: CABAC IDR frame: '
+    check(what + 'frame done, GIC SPI 60 (intc IRQ 28)',
+          (qt.readw(I3_MFE + 4 * 0x1E) & 0xFF, irq()), (1, 1))
+    check(what + 'the FDC header bits lead the output', data[:len(hdr)], hdr)
+    pcm = data.find(bytes([100] * 256))
+    check(what + 'I_PCM samples from a byte boundary after the flush, '
+          'whole bytes, the trailing bits', (bits % 8, pcm, data[-1] != 0),
+          (0, len(hdr) + 2, True))
+    # what ffmpeg -err_detect explode decodes to the picture (the I_PCM
+    # bin and flush before the samples, the Intra16x16 mb_types, chroma
+    # modes, mb_qp_delta, coded_block_flags and end_of_slice after them)
+    check(what + 'the slice data', (data[len(hdr):pcm].hex(),
+                                    data[pcm + 384:].hex()),
+          ('fef8', 'fac9242e0e'))
+    check(what + 'the reconstruction', b64read(qt, DRAM + MFE_REC[0], size),
+          flat)
+    qt.writew(I3_MFE + 4 * 0x1D, 1)
+    check('MFE: clearing frame done drops the line',
+          (qt.readw(I3_MFE + 4 * 0x1E), irq()), (0, 0))
+
+    hdr = MFE_CABAC_P
+    bits, data = mfe_frame(qt, 1, flat, hdr, 8 * len(hdr))
+    check('MFE: CABAC P frame, nothing moved: P_Skip, end_of_slice_flag',
+          (qt.readw(I3_MFE + 4 * 0x1E) & 0xFF, data[:len(hdr)],
+           data[len(hdr):].hex()), (1, hdr, '2fa0'))
+    bits, data = mfe_frame(qt, 2, moved, hdr, 8 * len(hdr))
+    pcm = data.find(moved[16 * w + 16:16 * w + 32])
+    check('MFE: CABAC P frame, one MB moved: three P_Skip and an I_PCM',
+          (data[len(hdr):pcm].hex(), data[pcm + 384:].hex()),
+          ('45ec40', 'fe80'))
+    check('MFE: the reconstruction, the reference of the next frame',
+          b64read(qt, DRAM + MFE_REC[0], size), moved)
+
+    hdr = MFE_CAVLC_IDR
+    bits, data = mfe_frame(qt, 0, flat, hdr, 225, cabac=False)
+    check('MFE: CAVLC IDR frame: its header, then the slice data',
+          (qt.readw(I3_MFE + 4 * 0x1E) & 0xFF, data[:len(hdr) - 1],
+           data.find(bytes([100] * 256)) > 0), (1, hdr[:-1], True))
+
+
+I3_ISP0 = riu(0x1302, 0)
+I3_MIIC1 = 0x1F223200
+ISP_W, ISP_H = 320, 240
+ISP_AE = 0x02000000                             # MIU addresses
+ISP_AWB = 0x02002000
+ISP_ML = 0x02004000
+ISP_Y = 0x02010000
+ISP_C = 0x02020000
+
+
+def i3_sensor(qt, reg, val):
+    """One JX-F22 register over MIIC1 in byte mode (START, 0x80, reg, val)."""
+    for r, v in ((0x01, 1), (0x02, 0x80), (0x02, reg), (0x02, val),
+                 (0x01, 0x100)):
+        qt.writew(I3_MIIC1 + 4 * r, v)
+
+
+def i3_isp_frames(qt, n):
+    qt.step(n * 10 ** 9 // 30 + 1)
+
+
+def i3_isp_block(qt, base, i, bpb):
+    return list(b64read(qt, DRAM + base + i * bpb, bpb))
+
+
+def test_i3_isp(qt):
+    print('msc313e ISP pipeline and statistics, scaler output')
+    w, h = ISP_W, ISP_H
+    # the sensor: 1x gain, 300 rows of 1125, a 320x240 window
+    for reg, val in ((0x00, 0), (0x01, 300 & 0xFF), (0x02, 300 >> 8),
+                     (0x22, 0x65), (0x23, 0x04), (0x24, w // 2),
+                     (0x25, h), (0x26, 0)):
+        i3_sensor(qt, reg, val)
+    # ISP on with OBC and WBG1, BGGR, the crop; the app's BT.601 matrix
+    # (rows Cr, Y, Cb) with Cb/Cr + 128; both gammas off
+    qt.writew(I3_ISP0 + 4 * 0x00, 0x17)
+    qt.writew(I3_ISP0 + 4 * 0x11, 2)
+    qt.writew(I3_ISP0 + 4 * 0x14, w - 1)
+    qt.writew(I3_ISP0 + 4 * 0x15, h - 1)
+    for i, v in enumerate((0x200, 0x1E53, 0x1FAD, 0x132, 0x259, 0x75,
+                           0x1F53, 0x1EAD, 0x200)):
+        qt.writew(I3_ISP0 + 4 * (0x3D + i), v)
+    qt.writew(I3_ISP0 + 4 * 0x3C, 0x181)
+    qt.writew(riu(0x1303, 0x67), 0x4040)        # black 0x40 (10-bit)
+    qt.writew(riu(0x1303, 0x69), 0x4040)
+    for reg in range(0x6A, 0x6E):               # OBC gains 1.0
+        qt.writew(riu(0x1303, reg), 0x400)
+    for reg in (0x48, 0x4A, 0x4C, 0x4E):        # WBG1 gains 1.0
+        qt.writew(riu(0x1308, reg), 0x400)
+    # 8x8 AE and AWB blocks of 40x30, and where they go
+    for reg, v in ((0x01, w // 8 - 1), (0x02, h // 8 - 1), (0x03, 0x0707),
+                   (0x51, w // 8 - 1), (0x52, h // 8 - 1), (0x53, 0x0707)):
+        qt.writew(riu(0x1305, reg), v)
+    for reg, a in ((0x06, ISP_AE), (0x10, ISP_AE + 0x1000),
+                   (0x08, ISP_AWB), (0x12, ISP_AWB + 0x1000)):
+        qt.writew(riu(0x1305, reg), a >> 4 & 0xFFFF)
+        qt.writew(riu(0x1305, reg + 1), a >> 20)
+    # SC1 FRM, one 64x48 NV12 buffer
+    dma = 0x1213
+    for reg, v in ((0x08, ISP_Y >> 3 & 0xFFFF), (0x09, ISP_Y >> 19),
+                   (0x10, ISP_C >> 3 & 0xFFFF), (0x11, ISP_C >> 19),
+                   (0x18, 0), (0x1A, 64), (0x1B, 48), (0x1E, 0x8),
+                   (0x01, 0x8000)):
+        qt.writew(riu(dma, reg), v)
+    qt.writew(I3_ISP0 + 4 * 0x28, 0xBFFF)       # unmask VSYNC: streaming
+    i3_isp_frames(qt, 2)
+
+    # block (2, 3), the middle of the logo: its 80 % white under the
+    # tungsten light (R 0.82, B 0.40 of G) over the navy, less black 0 by
+    # OBC, as 12 bits >> 4
+    logo = i3_isp_block(qt, ISP_AE, 26, 4)
+    check('ISP AE block: R, G, B, Y of the logo under tungsten', logo,
+          [36, 45, 19, 39])
+    check('ISP AWB block: R, G, B', i3_isp_block(qt, ISP_AWB, 26, 3),
+          [36, 45, 19])
+    i3_sensor(qt, 0x01, 600 & 0xFF)             # twice the exposure
+    i3_sensor(qt, 0x02, 600 >> 8)
+    i3_isp_frames(qt, 1)
+    check('ISP AE block: twice the exposure, twice the statistics',
+          i3_isp_block(qt, ISP_AE, 26, 4), [73, 91, 39, 79])
+    i3_sensor(qt, 0x00, 0x10)                   # and 2x gain: B doubles,
+    i3_isp_frames(qt, 1)                        # R and G clip in the white
+    check('ISP AE block: and 2x analog gain',
+          i3_isp_block(qt, ISP_AE, 26, 4)[2], 79)
+    i3_sensor(qt, 0x00, 0)
+    i3_sensor(qt, 0x01, 300 & 0xFF)
+    i3_sensor(qt, 0x02, 300 >> 8)
+    i3_isp_frames(qt, 1)
+
+    def nv12(x, y):
+        yy = b64read(qt, DRAM + ISP_Y + y * 64 + x, 1)[0]
+        c = b64read(qt, DRAM + ISP_C + y // 2 * 64 + (x & ~1), 2)
+        return [yy, c[0], c[1]]
+
+    # a stroke of the logo, linear (no gamma): yellow-green before WB
+    check('scaler: the ISP picture, the logo yellow-green before WB',
+          nv12(17, 19), [90, 101, 124])
+    qt.writew(riu(0x1308, 0x48), 1249)          # WBG1 R 1/0.82
+    qt.writew(riu(0x1308, 0x4C), 2560)          # WBG1 B 1/0.40
+    i3_isp_frames(qt, 1)
+    check('scaler: WB gains make it neutral', nv12(17, 19), [102, 128, 128])
+    check('ISP statistics stay before WB', i3_isp_block(qt, ISP_AE, 26, 4),
+          logo)
+
+    # a 10-to-10 gamma through the menuload (SRAMs 10-12): all to 512
+    qt.cmd('b64write 0x%x 0x200 %s' % (DRAM + ISP_ML, base64.b64encode(
+        struct.pack('<256H', *[512] * 256)).decode()))
+    for sram in (10, 11, 12):
+        for reg, v in ((0x00, 0x9100 | sram), (0x03, ISP_ML >> 4 & 0xFFFF),
+                       (0x04, ISP_ML >> 20), (0x01, 255), (0x02, 0),
+                       (0x07, 1)):
+            qt.writew(riu(0x1306, reg), v)
+    qt.writew(riu(0x1306, 0x07), 2)
+    qt.writew(I3_ISP0 + 4 * 0x46, 0xFFF)        # on, the top at 0x3FF
+    i3_isp_frames(qt, 1)
+    check('ISP gamma from the menuload: a flat curve, a flat picture',
+          [nv12(4, 44), nv12(36, 20)], [[128, 128, 128]] * 2)
+    qt.writew(I3_ISP0 + 4 * 0x46, 0)
+    qt.writew(I3_ISP0 + 4 * 0x00, 0)            # ISP off: the test pattern
+    i3_isp_frames(qt, 1)
+    check('scaler: the test pattern with the ISP off: navy, the logo',
+          [nv12(0, 0), nv12(14, 18)[0]], [[50, 146, 122], 235])
+    qt.writew(I3_ISP0 + 4 * 0x28, 0xFFFF)
+    qt.writew(riu(dma, 0x01), 0)
+
+
 def hmp(qemu, args, cmds):
     """Run QEMU with an HMP monitor on stdio; return what it printed."""
     p = subprocess.run([qemu] + args + ['-display', 'none', '-nodefaults',
@@ -541,6 +1221,7 @@ def main():
     finally:
         qt.close()
     test_migration(args.qemu, tmp, path)
+    test_msc313e(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 
