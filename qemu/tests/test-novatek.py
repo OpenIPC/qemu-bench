@@ -2243,6 +2243,113 @@ def test_md(qt):
            gic_pending(qt, 46)), (0, 0x31, False))
 
 
+IVE = 0xF0D70000
+
+
+def ive_job(qt, w, h, func, img, out_lofs, regs=None):
+    """One IVE job on the w x h 8-bit img; returns the output rows."""
+    in_lofs = (w + 3) & ~3
+    qt.write(AI_IN, b''.join(bytes(img[y * w:(y + 1) * w]) +
+                             bytes(in_lofs - w) for y in range(h)))
+    qt.write(AI_OUT, bytes(out_lofs * h))
+    for off, val in {0x010: func, 0x014: AI_IN, 0x018: in_lofs,
+                     0x01C: AI_OUT, 0x020: out_lofs, 0x024: w | h << 16,
+                     **(regs or {})}.items():
+        qt.writel(IVE + off, val)
+    qt.writel(IVE + 0x008, 0x701)
+    qt.writel(IVE + 0x004, 0x301)
+    qt.writel(IVE + 0x000, qt.readl(IVE + 0x000) | 2)
+    return qt.read(AI_OUT, out_lofs * h)
+
+
+def ive_bits(out, w, h, lofs, bits):
+    return [out[y * lofs + (x * bits) // 8] >> ((x * bits) % 8) &
+            ((1 << bits) - 1) for y in range(h) for x in range(w)]
+
+
+def clamp_px(img, w, h, x, y):
+    return img[min(max(y, 0), h - 1) * w + min(max(x, 0), w - 1)]
+
+
+def test_ive(qt):
+    print('IVE: the intelligent video engine')
+    rnd = random.Random(98564)
+    w, h = 13, 9
+    img = [rnd.randint(0, 255) for _ in range(w * h)]
+    gic_enable(qt, 53)
+    check('IVE: idle (0x68 bit 31)', qt.readl(IVE + 0x068) >> 31, 1)
+    # the threshold LUT, 1 bit: over Th0, LSB first
+    out = ive_job(qt, w, h, 1 << 13, img, 4, {0x03C: 100})
+    check('IVE LUT 1-bit: over Th0, done in the start write',
+          (ive_bits(out, w, h, 4, 1), qt.readl(IVE + 0x008) & 1,
+           qt.readl(IVE + 0x000) & 2, gic_pending(qt, 53)),
+          ([int(v > 100) for v in img], 1, 0, True))
+    qt.writel(IVE + 0x008, 0x701)
+    check('IVE: status is write 1 to clear', gic_pending(qt, 53), False)
+    # 4 bits: the count of thresholds a pixel is over
+    th = sorted(rnd.sample(range(1, 255), 15))
+    lut = {0x03C + 4 * (i // 4): 0 for i in range(15)}
+    for i, t in enumerate(th):
+        lut[0x03C + 4 * (i // 4)] |= t << (8 * (i % 4))
+    out = ive_job(qt, w, h, 1 << 13 | 1 << 17, img, 8, lut)
+    check('IVE LUT 4-bit: the thresholds a pixel is over',
+          ive_bits(out, w, h, 8, 4), [sum(v > t for t in th) for v in img])
+    # the general filter: the guide's 7x7 map, normalised by the sum
+    c = [15, 12, 9, 5, 4, 2, 0, 0, 0, 0]
+    gmap = [[10, 9, 8, 7, 8, 9, 10], [9, 6, 5, 4, 5, 6, 9],
+            [8, 5, 3, 2, 3, 5, 8], [7, 4, 2, 1, 2, 4, 7],
+            [8, 5, 3, 2, 3, 5, 8], [9, 6, 5, 4, 5, 6, 9],
+            [10, 9, 8, 7, 8, 9, 10]]
+    tot = sum(c[gmap[dy][dx] - 1] for dy in range(7) for dx in range(7))
+    want = [(sum(c[gmap[dy][dx] - 1] *
+                 clamp_px(img, w, h, x + dx - 3, y + dy - 3)
+                 for dy in range(7) for dx in range(7)) + tot // 2) // tot
+            for y in range(h) for x in range(w)]
+    coef = sum(v << (4 * i) for i, v in enumerate(c))
+    out = ive_job(qt, w, h, 1 | 2 << 17, img, 16,
+                  {0x028: coef & 0xFFFFFFFF, 0x02C: coef >> 32})
+    check('IVE general filter: 7x7, normalised (sum %d)' % tot,
+          ive_bits(out, w, h, 16, 8), want)
+    # the median's modes: median, max, min
+    for mode, name, f in ((0, 'median', lambda v: sorted(v)[4]),
+                          (1, 'max', max), (2, 'min', min)):
+        out = ive_job(qt, w, h, 2 | mode << 2 | 2 << 17, img, 16)
+        check('IVE 3x3 %s' % name, ive_bits(out, w, h, 16, 8),
+              [f([clamp_px(img, w, h, x + dx, y + dy) for dy in (-1, 0, 1)
+                  for dx in (-1, 0, 1)]) for y in range(h) for x in range(w)])
+    # LUT then erosion over the cross of 4 neighbours (bits 7, 11, 12, 16)
+    nb = 1 << 7 | 1 << 11 | 1 << 12 | 1 << 16
+    lut1 = [int(v > 100) for v in img]
+    want = [min([lut1[y * w + x]] +
+                [lut1[(y + dy) * w + x + dx]
+                 for dx, dy in ((0, -1), (-1, 0), (1, 0), (0, 1))
+                 if 0 <= x + dx < w and 0 <= y + dy < h])
+            for y in range(h) for x in range(w)]
+    out = ive_job(qt, w, h, 1 << 13 | 1 << 14 | 1 << 15, img, 4,
+                  {0x03C: 100, 0x04C: nb})
+    check('IVE morphology: erosion of the LUT result',
+          ive_bits(out, w, h, 4, 1), want)
+    # the integral image, u32, inclusive
+    want = [sum(img[j * w + i] for j in range(y + 1) for i in range(x + 1))
+            for y in range(h) for x in range(w)]
+    out = ive_job(qt, w, h, 1 << 16 | 6 << 17, img, 4 * w)
+    check('IVE integral image',
+          list(struct.unpack('<%dI' % (w * h), out)), want)
+    # IRV on a 6-bit map with an invalid pixel: the window's mode wins
+    flat = [20] * (w * h)
+    flat[4 * w + 6] = 0
+    out = ive_job(qt, w, h, 1 << 20 | 1 << 21 | 2 << 17, flat, 16,
+                  {0x050: 32 << 4 | 32 << 12})
+    check('IVE IRV: the invalid pixel takes its window\'s value',
+          (ive_bits(out, w, h, 16, 8)[4 * w + 6], qt.readl(IVE + 0x054)),
+          (20, w * h))
+    # a reset clears the status, keeps the enables
+    qt.writel(IVE + 0x000, 1)
+    qt.writel(IVE + 0x000, 0)
+    check('IVE reset: status cleared, enables kept',
+          (qt.readl(IVE + 0x008), qt.readl(IVE + 0x004)), (0, 0x301))
+
+
 def cnn_job(qt, regs, done=1):
     """Run one CNN job set up in regs (offset: value) and wait for it."""
     for off in range(0x004, 0x0C0, 4):
@@ -3640,6 +3747,7 @@ def run(args, tmp):
         test_ai_detect(qt)
         test_ai_face(qt)
         test_md(qt)
+        test_ive(qt)
     finally:
         qt.close()
 

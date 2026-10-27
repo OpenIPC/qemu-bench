@@ -36,6 +36,7 @@
 #include "hw/misc/nvt-ai.h"
 #include "hw/misc/nvt-gfx.h"
 #include "hw/misc/nvt-md.h"
+#include "hw/misc/nvt-ive.h"
 #include "hw/misc/nvt-h26x.h"
 #include "hw/misc/nvt-pixel.h"
 
@@ -335,6 +336,30 @@ static const NvtIppParams ipp_md = {
     1u << 0, 1u << 5, 0, 0x110,
 };
 
+/*
+ * IVE, the intelligent video engine (kdrv_ive: ive_reg.h): control bit 0
+ * resets, bit 1 runs a job, bit 28 fires a list (job end bit 10, list
+ * end bit 8, a broken list bit 9); frame end is status bit 0, which every
+ * sample waits for with no timeout.  kdrv_ive sets bit 1 and never clears
+ * it, so a job clears it.  The work is nvt-ive.c's, done as the start is
+ * written: the driver clears its flags before it starts, and the
+ * non-blocking sample polls with a timeout of 0.  Bit 31 of 0x68 reads
+ * idle.
+ */
+static const NvtIppParams ipp_ive = {
+    0x004, 0x008, 0x060, 1u << 0 | 1u << 10, 1u << 8, 1u << 0, 1u << 1,
+    1u << 0, 1u << 9, 0, 0x068,
+};
+
+static bool ive_read(NvtMediaState *s, hwaddr off, uint64_t *val)
+{
+    if (off == 0x068) {
+        *val |= 1u << 31;
+        return true;
+    }
+    return false;
+}
+
 static bool ai_read(NvtMediaState *s, hwaddr off, uint64_t *val)
 {
     const NvtIppParams *p = s->engine->opaque;
@@ -363,6 +388,22 @@ static uint64_t ipp_write(NvtMediaState *s, hwaddr off, uint64_t val)
                       off == 0x074 ? 0x000FF000 : 0x7FFF0000;
 
         return (val & ~ro) | (*reg(s, off) & ro);
+    }
+    if (off == IPP_CTRL && p == &ipp_ive) {
+        if (val & 1) {
+            /* reset: a running list and the status go */
+            timer_del(s->timer);
+            *reg(s, p->ints) = 0;
+            return val & ~(1u | p->trig | IPP_LL_FIRE);
+        }
+        if (val & p->trig) {
+            nvt_ive_run(s->regs);
+            *reg(s, p->ints) |= p->trig_end;
+            val &= ~p->trig;
+        }
+    }
+    if (p == &ipp_ive && (off == 0x054 || off == 0x058)) {
+        return *reg(s, off);                /* the IRV counters */
     }
     if (off == IPP_CTRL && p == &ipp_md && (val & 1)) {
         /* MDBC reset: the job and its status go, the enables stay */
@@ -584,6 +625,8 @@ static void ipp_job_work(NvtMediaState *s)
         nvt_gfx_ise_run(s->regs);
     } else if (s->engine->opaque == &ipp_md) {
         nvt_md_run(s->regs);
+    } else if (s->engine->opaque == &ipp_ive) {
+        nvt_ive_run(s->regs);
     }
 }
 
@@ -999,6 +1042,8 @@ static const NvtMediaEngine nvt_media_engines[] = {
     { "ai3", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
       &ipp_cnn },
     { "md", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq, &ipp_md },
+    { "ive", ipp_write, ive_read, NULL, ipp_job_done, ipp_update_irq,
+      &ipp_ive },
 };
 
 static uint64_t nvt_media_read(void *opaque, hwaddr off, unsigned size)
