@@ -220,7 +220,9 @@ fi
 # and PIL makes the pictures); without them, none from an earlier build
 rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
     "$OUT/smp/alg_fdcnn_ai2_sample" "$OUT/smp/cddcnn_sample" \
-    "$OUT/smp/frcnn_sample" "$OUT/smp/alg_md_sample"
+    "$OUT/smp/frcnn_sample" "$OUT/smp/alg_md_sample" \
+    "$OUT/smp/alg_ive_lut_sample" "$OUT/smp/alg_ive_lut_sample_nonblocking" \
+    "$OUT/smp/alg_ive_irv_sample"
 if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
         ! python3 -c 'import numpy, PIL' 2>/dev/null; then
     echo "the detectors' pictures need python3 with numpy and PIL:" \

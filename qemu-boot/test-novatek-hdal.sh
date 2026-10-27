@@ -953,7 +953,8 @@ print("pd=%d/3 pvd=%d/2 cars=%d/3 eyes=%d bface=%d pets=%d/2 nopet=%d %s"
             fi
             # the IVE: every width of the LUT sample checks out (4..639),
             # both non-blocking threads check jobs, IRV writes its 6400 bytes
-            if [ -f "$SAMPLES/ko/kdrv_ive.ko" ]; then
+            if [ -f "$SAMPLES/ko/kdrv_ive.ko" ] &&
+               [ -f "$SAMPLES/smp/alg_ive_lut_sample" ]; then
                 for smp in alg_ive_lut_sample alg_ive_lut_sample_nonblocking \
                            alg_ive_irv_sample; do
                     expect "NVT-HDAL-RUN: $smp rc=0" "$smp runs to its end"

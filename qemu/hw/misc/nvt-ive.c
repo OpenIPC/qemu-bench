@@ -415,6 +415,7 @@ void nvt_ive_run(uint32_t *regs)
     g_autofree uint32_t *integ = NULL;
     g_autofree uint8_t *row = NULL;
     int32_t *med = NULL, *res;
+    const int32_t *magv = NULL, *nmsv = NULL;   /* edge / NMS taps */
     int x, y;
 
     if (R(IVE_DMA) & IVE_DMA_DISABLE) {
@@ -426,9 +427,12 @@ void nvt_ive_run(uint32_t *regs)
                       "offsets %u / %u\n", s.w, s.h, sel, in_lofs, out_lofs);
         return;
     }
-    a = g_new(int32_t, n);
-    b = g_new(int32_t, n);
-    row = g_malloc(MAX(rowb, (size_t)s.w));
+    a = g_try_new(int32_t, n);
+    b = g_try_new(int32_t, n);
+    row = g_try_malloc(MAX(rowb, (size_t)s.w));
+    if (!a || !b || !row) {
+        goto nomem;
+    }
 
     /* the input: 8-bit, or the morphology's packed 4- / 1-bit image */
     {
@@ -475,31 +479,44 @@ void nvt_ive_run(uint32_t *regs)
     med = a;
 
     if (f & IVE_F_INTEGRAL) {
-        integ = g_new(uint32_t, n);
+        integ = g_try_new(uint32_t, n);
+        if (!integ) {
+            goto nomem;
+        }
         ive_integral(regs, med, integ, s);
     }
 
-    /* edge, suppression */
-    mag = g_new(int32_t, n);
-    gx = g_new0(int32_t, n);
-    gy = g_new0(int32_t, n);
-    theta = g_new0(int32_t, n);
-    if (f & IVE_F_EDGE) {
-        ive_edge(regs, med, mag, gx, gy, theta, s);
-    } else {
-        memcpy(mag, med, n * sizeof(*mag));
+    /* edge, suppression: their planes only for a job that uses them */
+    magv = med;
+    if ((f & (IVE_F_EDGE | IVE_F_NMS)) || sel == 4 || sel == 5) {
+        mag = g_try_new0(int32_t, n);
+        gx = g_try_new0(int32_t, n);
+        gy = g_try_new0(int32_t, n);
+        theta = g_try_new0(int32_t, n);
+        if (!mag || !gx || !gy || !theta) {
+            goto nomem;
+        }
+        if (f & IVE_F_EDGE) {
+            ive_edge(regs, med, mag, gx, gy, theta, s);
+        } else {
+            memcpy(mag, med, n * sizeof(*mag));
+        }
+        magv = mag;
     }
-    nms = g_new(int32_t, n);
+    nmsv = magv;
     if (f & IVE_F_NMS) {
-        ive_nms(regs, mag, theta, nms, s);
-    } else {
-        memcpy(nms, mag, n * sizeof(*nms));
+        nms = g_try_new(int32_t, n);
+        if (!nms) {
+            goto nomem;
+        }
+        ive_nms(regs, magv, theta, nms, s);
+        nmsv = nms;
     }
 
     /* the LUT's 1- or 4-bit result, then the morphology */
     res = b;
     for (x = 0; x < (int)n; x++) {
-        int v = nms[x];
+        int v = nmsv[x];
 
         if (f & IVE_F_LUT) {
             if (sel == 0) {
@@ -540,7 +557,7 @@ pack:
                 v = med ? med[p] : 0;
                 break;
             case 3:
-                v = nms ? nms[p] : 0;
+                v = nmsv ? nmsv[p] : 0;
                 break;
             case 4:
                 v = mag ? mag[p] | theta[p] << 8 : 0;
@@ -556,4 +573,9 @@ pack:
         }
         ive_wr((R(IVE_OUT_ADDR) & ~3u) + (hwaddr)y * out_lofs, row, rowb);
     }
+    return;
+
+nomem:
+    qemu_log_mask(LOG_GUEST_ERROR, "nvt-ive: no memory for a %dx%d job\n",
+                  s.w, s.h);
 }
