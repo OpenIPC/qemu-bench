@@ -80,6 +80,7 @@ struct NvtMediaState {
      */
     NvtAiWork *ai_work;
     uint32_t ai_pending;
+    uint32_t ive_done;          /* IVE: jobs run, frame ends still to raise */
     uint32_t *ai_regs;
     uint32_t ai_res;
 };
@@ -341,9 +342,11 @@ static const NvtIppParams ipp_md = {
  * resets, bit 1 runs a job, bit 28 fires a list (job end bit 10, list
  * end bit 8, a broken list bit 9); frame end is status bit 0, which every
  * sample waits for with no timeout.  kdrv_ive sets bit 1 and never clears
- * it, so a job clears it.  The work is nvt-ive.c's, done some 1 ms after
- * the start, as the other engines' are (a silicon job takes about that).
- * Bit 31 of 0x68 reads idle.
+ * it, so a job clears it.  The work is nvt-ive.c's, done as START is
+ * written, with the registers the job started with; its frame end comes
+ * some 1 ms later, as a silicon job's would, and a second job started
+ * meanwhile gets its own, 1 ms after the first.  Bit 31 of 0x68 reads
+ * idle.
  */
 static const NvtIppParams ipp_ive = {
     0x004, 0x008, 0x060, 1u << 0 | 1u << 10, 1u << 8, 1u << 0, 1u << 1,
@@ -389,10 +392,19 @@ static uint64_t ipp_write(NvtMediaState *s, hwaddr off, uint64_t val)
         return (val & ~ro) | (*reg(s, off) & ro);
     }
     if (off == IPP_CTRL && p == &ipp_ive && (val & 1)) {
-        /* reset: a running job and the status go */
+        /* reset: the jobs' frame ends still to come and the status go */
         timer_del(s->timer);
+        s->ive_done = 0;
         *reg(s, p->ints) = 0;
         return val & ~(1u | p->trig | IPP_LL_FIRE);
+    }
+    if (off == IPP_CTRL && p == &ipp_ive && (val & p->trig)) {
+        nvt_ive_run(s->regs);
+        if (!s->ive_done++) {
+            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      IPP_JOB_NS);
+        }
+        return val & ~p->trig;
     }
     if (p == &ipp_ive && (off == 0x054 || off == 0x058)) {
         return *reg(s, off);                /* the IRV counters */
@@ -728,6 +740,17 @@ static void ipp_job_done(NvtMediaState *s)
     const NvtIppParams *p = s->engine->opaque;
     bool ai = ai_engine_run(s);
     IppLlResult res;
+
+    if (p == &ipp_ive && s->ive_done) {
+        /* a job already run: its frame end, then the next one's */
+        *reg(s, p->ints) |= p->trig_end;
+        ipp_update_irq(s);
+        if (--s->ive_done) {
+            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      IPP_JOB_NS);
+        }
+        return;
+    }
 
     if (ai && s->ai_work) {
         /* started again while a job is on the worker: once it is back */
@@ -1095,6 +1118,7 @@ static void nvt_media_reset(DeviceState *dev)
     memset(s->regs, 0, s->size);
     ai_job_detach(s);           /* a job on the worker comes back void */
     s->ai_pending = 0;
+    s->ive_done = 0;
     s->frames = 0;
     s->jpg_lut = 0;
     memset(s->jpg_q, 0, sizeof(s->jpg_q));
@@ -1172,7 +1196,7 @@ static int nvt_media_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_nvt_media = {
     .name = TYPE_NVT_MEDIA,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = nvt_media_post_load,
     .fields = (const VMStateField[]) {
@@ -1186,6 +1210,7 @@ static const VMStateDescription vmstate_nvt_media = {
         VMSTATE_UINT32_V(ai_pending, NvtMediaState, 2),
         VMSTATE_UINT32_V(ai_res, NvtMediaState, 2),
         VMSTATE_VBUFFER_UINT32(ai_regs, NvtMediaState, 2, NULL, size),
+        VMSTATE_UINT32_V(ive_done, NvtMediaState, 3),
         VMSTATE_END_OF_LIST()
     }
 };

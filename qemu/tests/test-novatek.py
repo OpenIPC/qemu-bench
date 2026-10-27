@@ -2344,6 +2344,31 @@ def test_ive(qt):
     check('IVE IRV: the invalid pixel takes its window\'s value',
           (ive_bits(out, w, h, 16, 8)[4 * w + 6], qt.readl(IVE + 0x054)),
           (20, w * h))
+    # two jobs started within a job's time (the non-blocking sample's two
+    # channels): each runs with its own registers and raises its own
+    # frame end, 1 ms after the one before
+    qt.write(AI_IN, b''.join(bytes(img[y * w:(y + 1) * w]) +
+                             bytes(((w + 3) & ~3) - w) for y in range(h)))
+    qt.write(AI_OUT, bytes(8 * h))
+    qt.writel(IVE + 0x008, 0x701)
+    for off, val in {0x010: 1 << 13, 0x014: AI_IN, 0x018: (w + 3) & ~3,
+                     0x020: 4, 0x024: w | h << 16}.items():
+        qt.writel(IVE + off, val)
+    for out, th in ((AI_OUT, 100), (AI_OUT + 4 * h, 200)):
+        qt.writel(IVE + 0x01C, out)
+        qt.writel(IVE + 0x03C, th)
+        qt.writel(IVE + 0x000, qt.readl(IVE + 0x000) | 2)
+    first = qt.readl(IVE + 0x008) & 1
+    ai_settle(qt, IVE + 0x008, 1)
+    qt.writel(IVE + 0x008, 1)
+    ai_settle(qt, IVE + 0x008, 1)
+    second = qt.readl(IVE + 0x008) & 1
+    qt.writel(IVE + 0x008, 1)
+    outs = qt.read(AI_OUT, 8 * h)
+    check('IVE: two jobs started at once each run and each end',
+          (first, second, ive_bits(outs, w, h, 4, 1),
+           ive_bits(outs[4 * h:], w, h, 4, 1)),
+          (0, 1, [int(v > 100) for v in img], [int(v > 200) for v in img]))
     # a reset clears the status, keeps the enables
     qt.writel(IVE + 0x000, 1)
     qt.writel(IVE + 0x000, 0)

@@ -1492,9 +1492,12 @@ The rest is a guess:
   replaces a pixel with its window's most frequent valid 6-bit value when
   THR_S and THR_H pass.
 
-A job completes some 1 ms after its start, as the other engines' do
-(the non-blocking sample's poll with a timeout of 0 then retries a job
-that is not done yet). START clears itself, since the driver never
+A job runs as its START is written, with the registers it started with,
+and raises frame end some 1 ms later, as a silicon job would. A second
+job started in that time runs at its own START and gets its own frame
+end, 1 ms after the first: no job is lost to the next one's registers.
+The non-blocking sample's poll with a timeout of 0 retries a job whose
+frame end has not come yet. START clears itself, since the driver never
 does, and bit 31 of 0x68 reads idle.
 
 The non-blocking sample can lose a job to a race in the vendor driver:
