@@ -129,6 +129,7 @@ cp qemu/hw/misc/sstar-jpe.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-bach.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-i3-bach.c     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/gpio/sstar-i3-gpio.c     "$QEMU_DIR/hw/gpio/"
+cp qemu/hw/sd/sstar-fcie.c          "$QEMU_DIR/hw/sd/"
 cp qemu/hw/misc/sstar-cmdq.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
 cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
@@ -528,10 +529,11 @@ config SIGMASTAR
     select AHCI_SYSBUS
     select I2C
     select HISI_I2C
+    select SD
 KCONFIG
     echo "  hw/arm/Kconfig: added SIGMASTAR"
 else
-    for sym in A15MPCORE ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C; do
+    for sym in A15MPCORE ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C SD; do
         if ! sed -n '/^config SIGMASTAR$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config SIGMASTAR\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -540,7 +542,7 @@ else
         fi
     done
 fi
-for f in misc/sstar-riu misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+for f in misc/sstar-riu misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

@@ -32,10 +32,12 @@
 #include "hw/misc/sstar-riu.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
+#include "hw/sd/sd.h"
 #include "hw/ssi/sstar-fsp.h"
 #include "hw/sysbus.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -118,6 +120,7 @@
 #define SS_SPI_I3_CMDQ      49          /* infinity3: INT_IRQ_CMDQ */
 #define SS_SPI_I3_JPE       61          /* infinity3: INT_IRQ_JPE */
 #define SS_SPI_I3_VHE       53          /* infinity3: INT_IRQ_VHE */
+#define SS_SPI_I3_SDIO      51          /* infinity3: INT_IRQ_SDIO */
 #define SS_SPI_TIMER0       96
 #define SS_SPI_TIMER1       97
 #define SS_SPI_WDT          98
@@ -855,6 +858,10 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         dev = qdev_new("sstar-i3-gpio");
         object_property_set_bool(OBJECT(dev), "night", sms->night,
                                  &error_fatal);
+        /* PM_SD_CDZ reads "card in" when -drive if=sd gives one */
+        object_property_set_bool(OBJECT(dev), "sd-card",
+                                 drive_get(IF_SD, 0, 0) != NULL,
+                                 &error_fatal);
         object_property_add_child(OBJECT(machine), "gpio", OBJECT(dev));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x000E, 0));
@@ -864,6 +871,26 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            ss_spi(gic, intc, SS_SPI_PM_SLEEP));
         sms->i3_gpio = dev;
+
+        /*
+         * The SD slot: SDIO0 (banks 0x1410-0x1411), an FCIE5 on its SDIO
+         * port, with the card from -drive if=sd
+         */
+        {
+            DriveInfo *di = drive_get(IF_SD, 0, 0);
+
+            dev = sysbus_create_simple("sstar-fcie", SSTAR_RIU_ADDR(0x1410, 0),
+                                       ss_spi(gic, intc, SS_SPI_I3_SDIO));
+            if (di) {
+                DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+                qdev_prop_set_drive_err(card, "drive",
+                                        blk_by_legacy_dinfo(di), &error_fatal);
+                qdev_realize_and_unref(card,
+                                       qdev_get_child_bus(dev, "sd-bus"),
+                                       &error_fatal);
+            }
+        }
 
         /*
          * Audio: BACH's DMAs (bank 0x1502) and its interrupt enable (bank

@@ -411,8 +411,24 @@ those models serve it unchanged. What differs:
   Switch", its table at IPL `0x7670`) clear reg `0x3F` bit 0 of the FCIE
   banks `0x1410` and `0x1402` and wait for bits [3:1] (the MIU, MIE and MCU
   reset states) to read `0b111`, then set it and wait for them to clear
-  (`sstar-riu` `infinity3`). Unanswered, each step times out after about
-  1.2 s with "Low Fail" / "High Fail" and the boot goes on.
+  (`sstar-riu` `infinity3`; `sstar-fcie` for `0x1410`). Unanswered, each
+  step times out after about 1.2 s with "Low Fail" / "High Fail" and the
+  boot goes on.
+- **SD card** (`sstar-fcie`, banks `0x1410`-`0x1411` at `0x1F282000`, SPI
+  51): SDIO0, the FCIE5 on its SDIO port that the vendor U-Boot and kernel
+  use for the slot (`drivers/mstar/sdmmc`, `hal_sdmmc_v5.c`). A job runs on
+  the `SD_CTL` write with `JOB_START`: the command from the CMD FIFO (reg
+  `0x20`, `0x40 | index` then the argument MSB first) to the card, its
+  response back into the FIFO (the index or `0x3F` first), `CMD_END`, or
+  `CMD_NORSP` with no answer; the data by DMA between the card and DDR
+  (`DMA_ADDR`, MIU addresses) or, with `DEST_R2N`, 64 bytes at a time
+  through the CIFD (bank `0x1411`); `DATA_END`. DAT0-3 read high: the card
+  is never busy. ADMA is not modelled. The card is `-drive
+  if=sd,format=raw,file=sd.img`; PM_SD_CDZ (PM GPIO `0x47` bit 2, active
+  low) reads "card in" then, else the drivers report no card at once.
+  The vendor U-Boot's `mmc info`, `fatls`, `fatload` and `mmc write`/`read`
+  work against it (its FAT wants a partition table: an MBR with one FAT
+  partition).
 - **RTC** (`sstar-rtc`, bank `0x0012` at `0x1F002400`, SPI 76): the
   infinity PM RTC of `drivers/mstar/rtc/ms_rtc.c`, a seconds counter with
   load and latch requests the hardware clears (the driver spins on them
@@ -615,5 +631,6 @@ prompt, on a board as under QEMU.
 - infinity (MSC313, MSC316 without E), infinity6 and mercury5 parts.
   The I3 SDK's kernel also has `infinity.dtsi`; Daniel Palmer's
   `mstar-miyoo-working` branch has the mercury5 map.
-- On infinity3, the media blocks (MFE, IVE, audio),
-  SD (FCIE/SDIO), the SAR ADC and the FUART's URDMA.
+- On infinity3, the media blocks (MFE, IVE, audio), the second SD host
+  (FCIE, bank `0x1402`, the NAND pads), ADMA, the SAR ADC and the FUART's
+  URDMA.
