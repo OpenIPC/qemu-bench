@@ -50,10 +50,11 @@ jobs:
           # Goke GK7101/GK7102 (hw/arm/goke.c), Goke's own Ambarella-IP design
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7101 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7102 '
-          # SigmaStar infinity2m (hw/arm/sigmastar.c)
+          # SigmaStar infinity2m and infinity3 (hw/arm/sigmastar.c)
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssr621q '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd202d '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd201 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^msc313e '
           # Novatek NT9856x (hw/arm/novatek.c)
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98562 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^nt98566 '

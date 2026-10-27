@@ -148,6 +148,27 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
             v = 3;
         }
         break;
+    case 0x1402:
+    case 0x1410:
+        /*
+         * infinity3 FCIE (SD host) soft reset, reg 0x3F: bit 0 is the reset
+         * (active low) and [3:1] the MIU, MIE and MCU reset states, which
+         * follow it inverted.  Hal_SDMMC_Reset waits for them, and so does
+         * the IPL ("[HSD] IP Reset Switch", its table at IPL 0x7670 names
+         * FCIE1 and FCIE2).
+         */
+        if (s->infinity3 && reg == 0x3F) {
+            v = (v & ~0x000E) | ((v & 1) ? 0 : 0x000E);
+        }
+        break;
+    case 0x1210:
+    case 0x1211:
+    case 0x1212:
+        /* infinity3 HVSP0-2: reg 0x41 bit 8, filter SRAM load busy */
+        if (s->infinity3 && reg == 0x41) {
+            v &= ~0x0100;
+        }
+        break;
     case 0x101E:            /* chiptop: reg 0x48 is the package bond strap */
         if (reg == 0x48) {
             v = s->bond;
@@ -339,6 +360,7 @@ static void sstar_riu_realize(DeviceState *dev, Error **errp)
 static const Property sstar_riu_props[] = {
     DEFINE_PROP_UINT16("bond", SstarRiuState, bond, 0),
     DEFINE_PROP_BOOL("smf-ack", SstarRiuState, smf_ack, false),
+    DEFINE_PROP_BOOL("infinity3", SstarRiuState, infinity3, false),
     DEFINE_PROP_UINT16("gpio-bank", SstarRiuState, gpio_bank, 0),
     DEFINE_PROP_UINT64("uuid", SstarRiuState, uuid, 0),
     DEFINE_PROP_STRING("trace", SstarRiuState, trace),

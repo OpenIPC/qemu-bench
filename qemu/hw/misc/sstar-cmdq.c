@@ -27,6 +27,17 @@
  * and data, 0 nothing.  A moved write pointer runs the commands up to it
  * at once; waits and polls do not block.  "trace" logs each command.
  *
+ * "infinity3" is the MSC313E's CMDQ (one engine, bank 0x1120, GIC SPI 49,
+ * the scaler driver's drivers/mstar/scl/infinity3/src/mxlib/hal/cmdq): the
+ * same registers and commands, but the driver only moves the write
+ * pointer when it queues commands (_Drv_CMDQ_Fire: the low half first),
+ * and starts the engine at the scaler's next frame end with reg 0x03 bit 1
+ * (Drv_CMDQ_BeTrigger), which runs the queue up to the write pointer.
+ * Its interrupt bits are 0x44 bit 0, the engine triggered, and bit 2,
+ * done (drvCMDQ.h CMDQ_IRQ_STATE_*): on done the scaler driver applies a
+ * size change (CHANGESIZEDONE) that a VSRC port's reconfiguration waits
+ * for.  The mask is reg 0x47 (Hal_CMDQ_SetISRMSK).
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -65,10 +76,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarCmdqState, SSTAR_CMDQ)
 #define R_STATUS_LO         0x44
 #define R_STATUS_HI         0x45
 #define R_MASK_LO           0x46
+#define R_MASK_I3           0x47
 #define R_CLEAR_LO          0x48
 
 #define STATUS_HI_IDLE      (3u << 11)  /* bits 27, 28 of the word */
 #define SW_INT(n)           (1u << (n))     /* a guess; see the ISR */
+#define I3_STATE_TRIG       (1u << 0)
+#define I3_STATE_DONE       (1u << 2)
+#define I3_START            (1u << 1)
 
 #define SS_RIU_BASE         0x1F000000
 #define SS_DRAM_BASE        0x20000000
@@ -93,6 +108,7 @@ struct SstarCmdqState {
     qemu_irq irq;
     SstarCmdqEngine eng[CMDQ_ENGINES];
     bool trace;
+    bool infinity3;
 };
 
 static uint32_t eng32(SstarCmdqEngine *e, int lo)
@@ -113,7 +129,8 @@ static void sstar_cmdq_update_irq(SstarCmdqState *s)
     for (n = 0; n < CMDQ_ENGINES; n++) {
         SstarCmdqEngine *e = &s->eng[n];
 
-        level |= !!(e->regs[R_STATUS_LO] & ~e->regs[R_MASK_LO]);
+        level |= !!(e->regs[R_STATUS_LO] &
+                    ~e->regs[s->infinity3 ? R_MASK_I3 : R_MASK_LO]);
     }
     qemu_set_irq(s->irq, level);
 }
@@ -341,6 +358,23 @@ static void sstar_cmdq_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     e->regs[reg] = (e->regs[reg] & ~mask) | (v & mask);
+    if (s->infinity3) {
+        switch (reg) {
+        case R_TRIG_HI:
+            if (e->regs[reg] & I3_START) {
+                e->regs[reg] &= ~I3_START;
+                e->regs[R_STATUS_LO] |= I3_STATE_TRIG;
+                sstar_cmdq_run(s, b->n);
+                e->regs[R_STATUS_LO] |= I3_STATE_DONE;
+            }
+            sstar_cmdq_update_irq(s);
+            break;
+        case R_MASK_I3:
+            sstar_cmdq_update_irq(s);
+            break;
+        }
+        return;
+    }
     switch (reg) {
     case R_WPTR_LO:
     case R_CTRL_HI:
@@ -394,6 +428,7 @@ static void sstar_cmdq_init(Object *obj)
 
 static const Property sstar_cmdq_props[] = {
     DEFINE_PROP_BOOL("trace", SstarCmdqState, trace, false),
+    DEFINE_PROP_BOOL("infinity3", SstarCmdqState, infinity3, false),
 };
 
 static const VMStateDescription vmstate_sstar_cmdq_engine = {

@@ -296,9 +296,9 @@ FIFOs keep samples behind the 16 they report; the Longse app captures
 only with sysenv.cfg byte 0x98C set. The FTAES020 is `fh-aes` with
 `advance=on` (addresses move on between chunks).
 
-SigmaStar/MStar infinity2m (`hw/arm/sigmastar.c`, `docs/sigmastar.md`) is a
-fourth: Cortex-A7 parts whose blocks sit in 16-bit RIU register banks at
-`0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
+SigmaStar/MStar infinity2m, Ifado and infinity3 (`hw/arm/sigmastar.c`,
+`docs/sigmastar.md`) are a fourth: Cortex-A7 parts whose blocks sit in
+16-bit RIU register banks at `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
 at +1). `sstar-riu` is mapped under every model as storage plus the status
 bits the boot chain polls; `-d unimp` reports hot polls and
 `-global sstar-riu.trace=<banks>` logs a bank. The machine sets
@@ -306,7 +306,12 @@ bits the boot chain polls; `-d unimp` reports hot polls and
 starts inside one 1 KiB page and covers the next is registered with a
 misaligned offset, and its first access dies in `iotlb_to_section`. Any
 machine with 512-byte-aligned MMIO blocks larger than 1 KiB is exposed to
-the same assertion. Its video decoder (`hw/misc/sstar-vpu.c`) is a WAVE5
+the same assertion. The dies differ by `SsDie`: the infinity3 (`msc313e`)
+ROM takes its IPL from NOR `0x4000` (`ipl_offset`), and its scaler driver
+reads its gamma SRAMs back entry by entry, waiting 2 s on each mismatch
+(`sstar-vip-gamma`). A boot that goes quiet with the CPU idle is often
+such a slow poll, which the hot-poll detector does not see;
+`-trace 'memory_region_ops_*'` does. Its video decoder (`hw/misc/sstar-vpu.c`) is a WAVE5
 modelled at the firmware's mailbox, decoding with libavcodec when pkg-config
 finds it at build time (CI builds without it); queued commands complete
 from a timer, because the vendor driver arms its wait for the interrupt
