@@ -341,10 +341,9 @@ static const NvtIppParams ipp_md = {
  * resets, bit 1 runs a job, bit 28 fires a list (job end bit 10, list
  * end bit 8, a broken list bit 9); frame end is status bit 0, which every
  * sample waits for with no timeout.  kdrv_ive sets bit 1 and never clears
- * it, so a job clears it.  The work is nvt-ive.c's, done as the start is
- * written: the driver clears its flags before it starts, and the
- * non-blocking sample polls with a timeout of 0.  Bit 31 of 0x68 reads
- * idle.
+ * it, so a job clears it.  The work is nvt-ive.c's, done some 1 ms after
+ * the start, as the other engines' are (a silicon job takes about that).
+ * Bit 31 of 0x68 reads idle.
  */
 static const NvtIppParams ipp_ive = {
     0x004, 0x008, 0x060, 1u << 0 | 1u << 10, 1u << 8, 1u << 0, 1u << 1,
@@ -389,18 +388,11 @@ static uint64_t ipp_write(NvtMediaState *s, hwaddr off, uint64_t val)
 
         return (val & ~ro) | (*reg(s, off) & ro);
     }
-    if (off == IPP_CTRL && p == &ipp_ive) {
-        if (val & 1) {
-            /* reset: a running list and the status go */
-            timer_del(s->timer);
-            *reg(s, p->ints) = 0;
-            return val & ~(1u | p->trig | IPP_LL_FIRE);
-        }
-        if (val & p->trig) {
-            nvt_ive_run(s->regs);
-            *reg(s, p->ints) |= p->trig_end;
-            val &= ~p->trig;
-        }
+    if (off == IPP_CTRL && p == &ipp_ive && (val & 1)) {
+        /* reset: a running job and the status go */
+        timer_del(s->timer);
+        *reg(s, p->ints) = 0;
+        return val & ~(1u | p->trig | IPP_LL_FIRE);
     }
     if (p == &ipp_ive && (off == 0x054 || off == 0x058)) {
         return *reg(s, off);                /* the IRV counters */

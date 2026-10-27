@@ -413,7 +413,11 @@ compensated for the unsigned alpha. Motion detection is the MDBC
 name). `kdrv_md` waits for frame end with no timeout. The algorithm is
 undocumented, so the background model is a deterministic reduced
 SuBSENSE in buffers only the engine reads. The IVE (`hw/misc/nvt-ive.c`,
-node `ive@f0d70000`) completes a job in its START write. OpenIPC's
+node `ive@f0d70000`) completes a job ~1 ms after START. The driver's
+nonblocking trigger releases its lock before it leaves RUN, so on a slow
+host the other channel's trigger can be refused ("illegal in RUN state")
+and the SDK sample then checks an empty buffer: the test reruns it on
+that refusal. OpenIPC's
 `kdrv_ive.ko` cannot load (it needs `kdrv_ive_waitdone_nonblock`), so
 `build-novatek-hdal-samples.sh --kernel` rebuilds it from v1.01.007's
 objects. The

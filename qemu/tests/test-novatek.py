@@ -2259,6 +2259,7 @@ def ive_job(qt, w, h, func, img, out_lofs, regs=None):
     qt.writel(IVE + 0x008, 0x701)
     qt.writel(IVE + 0x004, 0x301)
     qt.writel(IVE + 0x000, qt.readl(IVE + 0x000) | 2)
+    ai_settle(qt, IVE + 0x008, 1)
     return qt.read(AI_OUT, out_lofs * h)
 
 
@@ -2280,7 +2281,7 @@ def test_ive(qt):
     check('IVE: idle (0x68 bit 31)', qt.readl(IVE + 0x068) >> 31, 1)
     # the threshold LUT, 1 bit: over Th0, LSB first
     out = ive_job(qt, w, h, 1 << 13, img, 4, {0x03C: 100})
-    check('IVE LUT 1-bit: over Th0, done in the start write',
+    check('IVE LUT 1-bit: over Th0, then frame end, START cleared',
           (ive_bits(out, w, h, 4, 1), qt.readl(IVE + 0x008) & 1,
            qt.readl(IVE + 0x000) & 2, gic_pending(qt, 53)),
           ([int(v > 100) for v in img], 1, 0, True))
