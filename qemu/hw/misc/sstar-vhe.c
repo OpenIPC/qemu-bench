@@ -1432,6 +1432,7 @@ static void vhe_load_source(SstarVheState *s, VheEnc *e)
     if (!pitch) {
         pitch = w;
     }
+    pitch = MAX(pitch, 2);              /* a chroma pair at least */
     bpl = yuyv ? 2 * pitch : pitch;
     if (fmt != 1 && fmt != 2) {
         qemu_log_mask(LOG_UNIMP, "sstar-vhe: input format %d read as NV12\n",
@@ -1596,7 +1597,7 @@ static void vhe_encode(void *opaque)
     SstarVheState *s = opaque;
     g_autofree VheEnc *e = g_new0(VheEnc, 1);
     g_autoptr(GByteArray) out = g_byte_array_new();
-    uint32_t sizes[256], nsizes = 0, limit = s->sw[SW_OUTBS_LIMIT];
+    uint32_t sizes[DIM_MAX / 16 + 1], nsizes = 0, limit = s->sw[SW_OUTBS_LIMIT];
     uint32_t len = 0, status = STATUS_IRQ | STATUS_FRAME_RDY;
     hwaddr pa;
     int rows, ctb, i;

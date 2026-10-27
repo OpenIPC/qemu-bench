@@ -219,6 +219,7 @@ static void pm_edge(SstarI3GpioState *s, int r, bool was)
     bool now = pm_level(s, r);
     bool falling = s->pmgpio[r] & PM_INT_FALLING;
 
+    /* the final status, 0x04/0x05, has bits for hwirq 0-31 only */
     if (r < 30 && is_pm_pad(r) && was != now && now != falling) {
         s->raw |= 1u << (r + 2);
     }

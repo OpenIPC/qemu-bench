@@ -923,6 +923,15 @@ def test_i3_vhe(qt):
         check(what + 'swreg1 = 0 drops it', irq(), 0)
     check('VHE: the reconstruction is in DRAM for the next frame',
           b64read(qt, DRAM + rec[0], 4) != bytes(4), True)
+    # a row length of 1, YUYV then NV12: chroma read inside the row
+    for fmt in (2, 1):
+        sw(38, fmt << 28 | 1 << 6)
+        sw(9, 0x10000)                          # swreg9 holds the last size
+        sw(5, regs[5] | 1)
+        qt.step(2 * 10 ** 7)
+        check('VHE: a row length of 1 (%s) still codes a frame' %
+              ('YUYV' if fmt == 2 else 'NV12'), (swr(1), swr(5) & 1), (5, 0))
+        sw(1, 0)
 
 
 # The header bits h264_enc.c writes for a 32x32 stream at QP 26: SPS, PPS
@@ -938,7 +947,7 @@ MFE_W, MFE_H, MFE_SRC, MFE_OUT = 32, 32, 0x00800000, 0x00900000
 MFE_REC = (0x00A00000, 0x00B00000)
 
 
-def mfe_frame(qt, f, pic, hdr, nbits, cabac=True):
+def mfe_frame(qt, f, pic, hdr, nbits, cabac=True, pitch=MFE_W, yuyv=False):
     """One frame as mfe6_ios.c _enc_fire() runs it; returns the output."""
     def r(i):
         return I3_MFE + 4 * i
@@ -953,7 +962,8 @@ def mfe_frame(qt, f, pic, hdr, nbits, cabac=True):
     qt.writew(r(0x00), reg00 | 2)
     qt.writew(r(0x01), w)
     qt.writew(r(0x02), h)
-    qt.writew(r(0x90), w)
+    qt.writew(r(0x90), pitch)
+    qt.writew(r(0xF3), int(yuyv))
     for reg, a in ((0x06, src), (0x08, src + w * h),
                    (0x0A, rec[~f & 1]), (0x0E, rec[~f & 1] + w * h),
                    (0x12, rec[f & 1]), (0x14, rec[f & 1] + w * h)):
@@ -1032,6 +1042,15 @@ def test_i3_mfe(qt):
     check('MFE: CAVLC IDR frame: its header, then the slice data',
           (qt.readw(I3_MFE + 4 * 0x1E) & 0xFF, data[:len(hdr) - 1],
            data.find(bytes([100] * 256)) > 0), (1, hdr[:-1], True))
+    # a YUYV source with a pitch shorter than its row: what lies past the
+    # pitch reads as 0, nothing past the model's row buffer
+    qt.writew(I3_MFE + 4 * 0x1D, 1)
+    bits, data = mfe_frame(qt, 0, flat, hdr, 225, cabac=False, pitch=1,
+                           yuyv=True)
+    check('MFE: a YUYV pitch of 1 still codes a frame',
+          (qt.readw(I3_MFE + 4 * 0x1E) & 0xFF, data[:len(hdr) - 1]),
+          (1, hdr[:-1]))
+    qt.writew(I3_MFE + 4 * 0xF3, 0)
 
 
 I3_ISP0 = riu(0x1302, 0)

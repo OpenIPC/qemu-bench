@@ -211,6 +211,10 @@ static void mfe_load_source(SstarMfeState *s, MfePic *p)
 
     if (!pitch) {
         pitch = yuyv ? 2 * p->w : p->w;
+    } else if (pitch < (yuyv ? 2u : 1u) * p->w) {
+        /* a row shorter than the picture: what lies past it reads 0 */
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-mfe: pitch %u for %d pixels\n",
+                      pitch, p->w);
     }
     if (!mfe_in_dram(s, ya, (size_t)pitch * p->h)) {
         /* fed through IMI by the scaler: the picture it would carry */
@@ -228,7 +232,7 @@ static void mfe_load_source(SstarMfeState *s, MfePic *p)
         }
         return;
     }
-    line = g_malloc(pitch);
+    line = g_malloc0(MAX(pitch, 2u * p->w));
     for (y = 0; y < p->h; y++) {
         address_space_read(&address_space_memory,
                            DRAM_BASE + ya + (hwaddr)pitch * y,
@@ -1002,7 +1006,7 @@ static void mfe_encode(void *opaque)
     int pcm;
 
     s->started = false;
-    if (!w || !h || w * h / 256 > MAX_MBS) {
+    if (!w || !h || (uint64_t)w * h / 256 > MAX_MBS) {
         qemu_log_mask(LOG_GUEST_ERROR, "sstar-mfe: picture %dx%d\n", w, h);
         g_byte_array_unref(b.buf);
         return;
