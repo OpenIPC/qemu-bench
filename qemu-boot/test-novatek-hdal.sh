@@ -149,6 +149,10 @@ if [ -n "$DISPLAY_KOS" ]; then
              kflow_ai_net kdrv_md; do
         cp "$DISPLAY_KOS/$k/$k.ko" "$WORK/initramfs/dko/"
     done
+    # kdrv_ive as the samples' build makes it (the toolchain's cannot load)
+    if [ -f "${SAMPLES:-/nonexistent}/ko/kdrv_ive.ko" ]; then
+        cp "$SAMPLES/ko/kdrv_ive.ko" "$WORK/initramfs/dko/"
+    fi
     # hd_video_output_only's 3 frames of 320x240 YUV 4:2:2, Y then CbCr
     # interleaved: the eight 75 % colour bars (BT.601)
     python3 - "$WORK/initramfs/dispin/video_frm_320_240_3_yuv422.dat" <<'PY'
@@ -252,6 +256,10 @@ if [ -d /dko ]; then
     # the MDBC motion detection engine
     \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/kdrv_md.ko" >/dev/null 2>&1
     echo "NVT-MD-INSMOD: kdrv_md rc=\$?"
+    if [ -f /dko/kdrv_ive.ko ]; then
+        \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/kdrv_ive.ko" >/dev/null 2>&1
+        echo "NVT-IVE-INSMOD: kdrv_ive rc=\$?"
+    fi
 fi
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
@@ -417,8 +425,27 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
             tr -d '\r' < /tmp/md.out | grep 'frmidx\|WRN\|ERR\|fail' |
                 sed 's/^/NVT-MD: /'
         fi
+        # the IVE: the LUT samples check themselves; IRV writes its result
+        if grep -q '^kdrv_ive ' /proc/modules && [ -x ./alg_ive_lut_sample ]; then
+            timeout 600 ./alg_ive_lut_sample > /tmp/ive.out 2>&1
+            echo "NVT-HDAL-RUN: alg_ive_lut_sample rc=$?"
+            echo "NVT-IVE-LUT: ok=$(grep -c 'data check ok' /tmp/ive.out)" \
+                 "err=$(grep -c 'data check error' /tmp/ive.out)" \
+                 "last=$(grep 'data check ok' /tmp/ive.out | tail -1 | sed 's/.*test_width=//')"
+            ( sleep 20; echo q ) | timeout 120 ./alg_ive_lut_sample_nonblocking \
+                > /tmp/ive.out 2>&1
+            echo "NVT-HDAL-RUN: alg_ive_lut_sample_nonblocking rc=$?"
+            echo "NVT-IVE-NB: t1=$(grep -c 'data check ok.*thread(1)' /tmp/ive.out)" \
+                 "t2=$(grep -c 'data check ok.*thread(2)' /tmp/ive.out)" \
+                 "err=$(grep -c 'data check error' /tmp/ive.out)"
+            timeout 120 ./alg_ive_irv_sample > /tmp/ive.out 2>&1
+            echo "NVT-HDAL-RUN: alg_ive_irv_sample rc=$?"
+            f=/mnt/sd/IVEP/1_All/05_DO/ive11246.bin
+            echo "NVT-IVE-IRV: size=$(size $f)" \
+                 "kinds=$(od -An -v -tu1 $f | tr -s ' ' '\n' | sort -u | grep -c .)"
+        fi
         rm -rf /mnt/sd/CNNLib /mnt/sd/jpg /mnt/sd/FDCNN /mnt/sd/det_results \
-            /mnt/sd/save_bmp /mnt/sd/MDBCP
+            /mnt/sd/save_bmp /mnt/sd/MDBCP /mnt/sd/IVEP
     fi
 fi
 rm -f /mnt/sd/*
@@ -518,6 +545,10 @@ if [ -n "$DISPLAY_KOS" ]; then
     expect "NVT-HDAL-BOUND: f0c60000.ai kdrv_ai[[:space:]]*\$" "AI: the engines bound by kdrv_ai"
     expect "NVT-MD-INSMOD: kdrv_md rc=0" "MD: kdrv_md loads"
     expect "NVT-HDAL-BOUND: f0c10000.md kdrv_md[[:space:]]*\$" "MD: the MDBC bound by kdrv_md"
+    if [ -f "${SAMPLES:-/nonexistent}/ko/kdrv_ive.ko" ]; then
+        expect "NVT-IVE-INSMOD: kdrv_ive rc=0" "IVE: the rebuilt kdrv_ive loads"
+        expect "NVT-HDAL-BOUND: f0d70000.ive kdrv_ive[[:space:]]*\$" "IVE: the engine bound by kdrv_ive"
+    fi
 fi
 
 if [ -n "$SAMPLES" ]; then
@@ -919,6 +950,26 @@ print("pd=%d/3 pvd=%d/2 cars=%d/3 eyes=%d bface=%d pets=%d/2 nopet=%d %s"
                                 printf "frames=%d err=%d wrong:%s", n, err, (bad ? bad : " none") }')
                 case "$md" in "frames=11 err=0 wrong: none") pass "alg_md_sample: alarms in the moving block's frames only ($md)";;
                     *) bad "alg_md_sample: alarms in the moving block's frames only (${md:-no result})";; esac
+            fi
+            # the IVE: every width of the LUT sample checks out (4..639),
+            # both non-blocking threads check jobs, IRV writes its 6400 bytes
+            if [ -f "$SAMPLES/ko/kdrv_ive.ko" ] &&
+               [ -f "$SAMPLES/smp/alg_ive_lut_sample" ]; then
+                for smp in alg_ive_lut_sample alg_ive_lut_sample_nonblocking \
+                           alg_ive_irv_sample; do
+                    expect "NVT-HDAL-RUN: $smp rc=0" "$smp runs to its end"
+                done
+                expect "NVT-IVE-LUT: ok=636 err=0 last=639" "alg_ive_lut_sample: all 636 widths check out"
+                nb=$(grep -a '^NVT-IVE-NB: ' "$WORK/console.log" | tr -d '\r' | head -1)
+                case "$nb" in *"t1=0 "*|*"t2=0 "*|"") bad "alg_ive_lut_sample_nonblocking: both threads check out (${nb:-no result})";;
+                    *err=0) pass "alg_ive_lut_sample_nonblocking: both threads check out (${nb#NVT-IVE-NB: })";;
+                    *) bad "alg_ive_lut_sample_nonblocking: both threads check out ($nb)";; esac
+                # (the plumbing: nothing describes IRV or the edge
+                # arithmetic, so the bits themselves are not checked)
+                irv=$(grep -a '^NVT-IVE-IRV: ' "$WORK/console.log" | tr -d '\r' | head -1)
+                case "$irv" in *"size=6400 kinds=1") bad "alg_ive_irv_sample: a 6400-byte result, not uniform ($irv)";;
+                    *"size=6400 kinds="[0-9]*) pass "alg_ive_irv_sample: a 6400-byte result, not uniform (${irv#NVT-IVE-IRV: })";;
+                    *) bad "alg_ive_irv_sample: a 6400-byte result, not uniform (${irv:-no result})";; esac
             fi
         fi
     fi

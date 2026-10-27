@@ -1446,6 +1446,84 @@ checks that it binds. It then checks that both alarms come in frames
 - with ghost removal, a lasting change is absorbed (BC_MIN_MATCH 4);
 - a reset straight after a start leaves no frame end and no status.
 
+## IVE
+
+The IVE (`hw/misc/nvt-ive.c`, an `nvt-media` engine) is at `0xF0D70000`,
+SPI 53, under `kdrv_ive.ko` (`ive_reg.h`). Its node must be named
+`ive@f0d70000`: probe looks its clock up by the device's name. The tree
+gives the window as 0x6C, but the driver writes 0x6C on every job, so
+the machine maps 0x100.
+
+OpenIPC's toolchain has a `kdrv_ive.ko`, but it cannot load. It calls
+`kdrv_ive_waitdone_nonblock`, which the v1.01.002 objects it was linked
+from lack. `build-novatek-hdal-samples.sh --kernel DIR` rebuilds the
+module from v1.01.007's sources and closed objects against a configured
+4.19.91 tree. The release kernel has no MODVERSIONS, so the vermagic is
+all the module has to match.
+
+A job is an 8-bit image down a pipeline. FUNC_EN turns each stage on,
+and a stage that is off passes its input on:
+- the general filter (7x7) or IRV;
+- the 3x3 median (median, max, min, or the median over a threshold);
+- the 3x3 edge filter and non-maximum suppression;
+- the threshold LUT;
+- the 5x5 morphology.
+
+The integral image comes off after the median. OUT_DATA_SEL picks the
+output: a 1- or 4-bit result packed LSB first, the median's or the
+suppression's 8 bits, the edge's magnitude and direction or x and y, or
+the u32 integral. The morphology can instead take a 1- or 4-bit image
+from DRAM.
+
+The user guide documents:
+- the general filter's weight map and its normalisation by the weights'
+  sum;
+- the median's modes (the headers' max / min order);
+- the LUT (a 4-bit level counts the thresholds a pixel is over; a 1-bit
+  output is "over Th0");
+- the morphology's neighbourhood.
+
+The rest is a guess:
+- borders replicate the edge pixel;
+- the edge taps are 5-bit two's complement, the magnitude is
+  (|gx| + |gy|) >> shift, and the direction is one of 16 sectors;
+- suppression compares against the two neighbours across the edge;
+- IRV is a stereo-disparity filter that nothing describes. The emulation
+  replaces a pixel with its window's most frequent valid 6-bit value when
+  THR_S and THR_H pass.
+
+A job completes as its start is written. The driver clears its flags
+first, and the non-blocking sample polls with a timeout of 0. START
+clears itself, since the driver never does, and bit 31 of 0x68 reads
+idle.
+
+With `--kmods` and samples built with `--kernel`, `test-novatek-hdal.sh`
+loads the rebuilt module and checks that it binds. It then runs three
+samples:
+- `alg_ive_lut_sample` checks itself: the LUT's 1-bit output at every
+  width from 4 to 639, all 636 of which must check out;
+- `alg_ive_lut_sample_nonblocking` runs the same check on two threads
+  for 20 s, and both must check jobs with no error;
+- `alg_ive_irv_sample` reads a 256x200 picture the SDK does not ship
+  (the builder writes one). It must write its 6400-byte result, and the
+  result must not be uniform.
+
+The IRV sample's parameters look like a random test vector from
+Novatek's regression set: random 5-bit taps and a random sorted LUT.
+Nothing describes IRV's result, so the run checks only the plumbing.
+Its input must use the 8-bit range. The sample shifts the edge sums
+right by 9 and its taps total 100, so a picture under 64 can never get
+an edge over the LUT's first threshold, 12, and comes out all zeros.
+One open question would change results: how the 5-bit edge taps encode
+negatives. The driver writes the caller's low 5 bits with no
+conversion. That makes two's complement natural (a C caller's −1
+becomes code 31), and the model uses it. But the headers define an
+unused −15..15 limit, which would suit sign-magnitude.
+`test-novatek.py` checks each stage at register level against its own
+arithmetic: the 1- and 4-bit LUT, the general filter, the median's
+modes, an erosion, the integral image, IRV, completion within the start,
+and reset.
+
 ## Display
 
 The display path is the IDE (`hw/display/nvt-ide.c`) at `0xF0800000`,
@@ -1647,8 +1725,8 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   and the sensor is a test pattern. The graphics engine has no quarter
   turns, palettes, colour keys, blending of two images or LUTs, and there
   is no affine engine. The SIE
-  ignores the sensor's real timing (fixed 30 fps). DIS, VPE and IVE
-  are not wired. MD's linked lists run as the other engines' do but are
+  ignores the sensor's real timing (fixed 30 fps). DIS and VPE are
+  not wired. MD's linked lists run as the other engines' do but are
   untested; its checksums read 0, and its background model is not the
   silicon's (below).
 - AI: the CNN's tanh / sigmoid, pre-activation, FCD compression,

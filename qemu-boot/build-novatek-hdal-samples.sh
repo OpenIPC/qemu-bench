@@ -57,10 +57,20 @@
 # messi5 and basketball1 -- as the samples' NV12 files and BMPs -- and a
 # generated 160x120 sequence for alg_md_sample.
 #
+# The IVE samples (alg_ive_lut_sample, its non-blocking twin and
+# alg_ive_irv_sample) come with them, with a generated 256x200 input for
+# the IRV one.  OpenIPC's kdrv_ive.ko cannot load: it calls
+# kdrv_ive_waitdone_nonblock, which the v1.01.002 objects it was linked
+# from lack.  With --kernel (a configured 4.19.91 tree with OpenIPC's
+# nt98566 config, such as build-novatek-test-kernel.sh's) the build makes
+# one from v1.01.007's sources and objects, into ko/ (the release kernel
+# has no MODVERSIONS, so the tree's vermagic is all it has to match).
+#
 #   bash qemu-boot/build-novatek-hdal-samples.sh --sdk <na51089 SDK> \
 #       --rootfs qemu-boot/rootfs.squashfs.nt98566 [--out DIR] \
 #       [--ai-model <v1.01.007 SDK>/code/hdal/samples/ai_pattern/para/nvt_model.bin] \
 #       [--sdk7 <v1.01.007 SDK> --turnkey <ai_turnkey>/sd] \
+#       [--kernel <4.19.91 tree> [--kernel-cross PREFIX]] \
 #       [--cross /opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-]
 set -euo pipefail
 
@@ -69,6 +79,8 @@ ROOTFS=
 AIMODEL=
 SDK7=
 TURNKEY=
+KERNEL=
+KCROSS=
 OUT=$PWD/novatek-hdal-samples
 CROSS=/opt/arm-ca9-linux-uclibcgnueabihf-8.4.01/bin/arm-ca9-linux-uclibcgnueabihf-
 while [ $# -gt 0 ]; do
@@ -78,6 +90,8 @@ while [ $# -gt 0 ]; do
         --ai-model) AIMODEL=$2; shift 2 ;;
         --sdk7) SDK7=$2; shift 2 ;;
         --turnkey) TURNKEY=$2; shift 2 ;;
+        --kernel) KERNEL=$2; shift 2 ;;
+        --kernel-cross) KCROSS=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         --cross) CROSS=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
@@ -206,7 +220,9 @@ fi
 # and PIL makes the pictures); without them, none from an earlier build
 rm -rf "$OUT/sd" "$OUT/smp/ai2_pdcnn_sample" "$OUT/smp/alg_pvdcnn_sample" \
     "$OUT/smp/alg_fdcnn_ai2_sample" "$OUT/smp/cddcnn_sample" \
-    "$OUT/smp/frcnn_sample" "$OUT/smp/alg_md_sample"
+    "$OUT/smp/frcnn_sample" "$OUT/smp/alg_md_sample" \
+    "$OUT/smp/alg_ive_lut_sample" "$OUT/smp/alg_ive_lut_sample_nonblocking" \
+    "$OUT/smp/alg_ive_irv_sample"
 if [ -n "$SDK7" ] && [ -n "$TURNKEY" ] &&
         ! python3 -c 'import numpy, PIL' 2>/dev/null; then
     echo "the detectors' pictures need python3 with numpy and PIL:" \
@@ -220,7 +236,8 @@ elif [ -n "$SDK7" ] && [ -n "$TURNKEY" ]; then
         -I$T7/limit_fdet/include -I$T7/motion_detection/include \
         -I$H7/vendor/cv/include -I$H7/vendor/cv/include/libmd"
     for smp in ai2_pdcnn_sample alg_pvdcnn_sample alg_fdcnn_ai2_sample \
-            cddcnn_sample frcnn_sample alg_md_sample; do
+            cddcnn_sample frcnn_sample alg_md_sample alg_ive_lut_sample \
+            alg_ive_lut_sample_nonblocking alg_ive_irv_sample; do
         src=$WORK/$smp
         rm -rf "$src"
         mkdir -p "$src"
@@ -390,12 +407,57 @@ for f in range(11):
     os.makedirs(d)
     y.tofile(d + '/dram_in_y.bin')
     uv.tofile(d + '/dram_in_uv.bin')
+
+# alg_ive_irv_sample's input (IVEP/1_All/02_di/ive11246.bin, one of
+# Novatek's numbered test vectors, which no SDK ships): a 256x200 8-bit
+# scene -- three planes, a slanted edge, a little texture, some 0 pixels --
+# and its output directory.  It must use the 8-bit range: the sample
+# shifts its edge sums right by 9, and its taps total 100, so no picture
+# under 64 can get an edge over the LUT's first threshold, 12.
+yy, xx = np.mgrid[0:200, 0:256]
+d = np.where(xx + yy // 2 < 120, 40, np.where(yy < 100, 200, 110))
+d = (d + (xx // 32) % 3 * 8 + (xx * 3 + yy * 5) % 7).astype(np.uint8)
+d[(xx * 7 + yy * 13) % 29 == 0] = 0
+os.makedirs(sd + '/IVEP/1_All/02_di')
+os.makedirs(sd + '/IVEP/1_All/05_DO')
+d.tofile(sd + '/IVEP/1_All/02_di/ive11246.bin')
 PY
     printf 'comp.yuv 1920 1080\nbball.yuv 1920 1080\n' > "$SD/jpg/pd_image_list.txt"
     printf 'huang.yuv 1920 1080\ncomp.yuv 1920 1080\n' > "$SD/jpg/pvdlist.txt"
     printf 'cat.yuv 1920 1080\ndog.yuv 1920 1080\nhuang.yuv 1920 1080\n' \
         > "$SD/jpg/cdd_image_list.txt"
     ls "$SD/jpg/FR" > "$SD/jpg/fr_image_list.txt"
+fi
+
+# kdrv_ive.ko from v1.01.007's sources and objects, against --kernel
+rm -rf "$OUT/ko"
+if [ -n "$KERNEL" ] && [ -n "$SDK7" ]; then
+    KCROSS=${KCROSS:-$(dirname "$KERNEL")/toolchain/bin/arm-openipc-linux-musleabihf-}
+    C7=$SDK7/code
+    KD=$WORK/kdrv_ive
+    mkdir -p "$KD" "$OUT/ko"
+    cp "$C7/hdal/vendor/cv/drivers/source/kdrv_ive/"*.[ch] \
+       "$C7/hdal/vendor/cv/drivers/source/kdrv_ive/"*_no_tracer.o "$KD/"
+    for n in ive_main ive_proc ive_drv ive_api ive_platform; do
+        ln -sf $n.c "$KD/${n}_no_tracer.c"
+    done
+    cat > "$KD/Kbuild" <<KBUILD
+obj-m += kdrv_ive.o
+kdrv_ive-objs := \$(addsuffix _no_tracer.o,ive_lib ive_int ive_main ive_proc \
+    ive_drv ive_api kdrv_ive_config kdrv_ive_api ive_platform ive_ll_cmd \
+    ive_sys_vfy)
+ccflags-y += -D__LINUX -DDEBUG -Wno-date-time -I$C7/vos/drivers/include \
+    -I$C7/hdal/drivers/k_driver/include \
+    -I$C7/hdal/drivers/k_driver/source/include \
+    -I$C7/hdal/drivers/k_flow/include \
+    -I$C7/hdal/vendor/cv/drivers/include/kdrv_ive -I$C7/hdal/include \
+    -I$C7/hdal/drivers/k_driver/include/comm \
+    -I$C7/hdal/drivers/k_driver/include/rtos_na51089
+KBUILD
+    make -s -C "$KERNEL" M="$KD" ARCH=arm CROSS_COMPILE="$KCROSS" modules \
+        2>&1 | grep -v 'WARNING: "v[ok]s\?_.*undefined' || true
+    cp "$KD/kdrv_ive.ko" "$OUT/ko/"
+    echo "built kdrv_ive.ko"
 fi
 
 find "$OUT/smp" -maxdepth 1 -type f -exec "${CROSS}strip" {} +

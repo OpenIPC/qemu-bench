@@ -412,7 +412,11 @@ compensated for the unsigned alpha. Motion detection is the MDBC
 (`hw/misc/nvt-md.c`, node `md@f0c10000` -- probe takes the clock by that
 name). `kdrv_md` waits for frame end with no timeout. The algorithm is
 undocumented, so the background model is a deterministic reduced
-SuBSENSE in buffers only the engine reads. The
+SuBSENSE in buffers only the engine reads. The IVE (`hw/misc/nvt-ive.c`,
+node `ive@f0d70000`) completes a job in its START write. OpenIPC's
+`kdrv_ive.ko` cannot load (it needs `kdrv_ive_waitdone_nonblock`), so
+`build-novatek-hdal-samples.sh --kernel` rebuilds it from v1.01.007's
+objects. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands
