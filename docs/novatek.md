@@ -1504,14 +1504,21 @@ samples:
   width from 4 to 639, all 636 of which must check out;
 - `alg_ive_lut_sample_nonblocking` runs the same check on two threads
   for 20 s, and both must check jobs with no error;
-- `alg_ive_irv_sample` reads a 256x200 map the SDK does not ship (the
-  builder writes one) and must write its 6400-byte result.
+- `alg_ive_irv_sample` reads a 256x200 picture the SDK does not ship
+  (the builder writes one). It must write its 6400-byte result, and the
+  result must not be uniform.
 
-Nothing describes IRV's result, so that run checks only the plumbing.
-Under the model's guesses its result is all zeros: the sample shifts the
-edge sum right by 9, its taps total about 51, and IRV's output is
-6-bit. So no magnitude gets over the LUT's first threshold, 12. One of
-those guesses is likely wrong, but nothing says which.
+The IRV sample's parameters look like a random test vector from
+Novatek's regression set: random 5-bit taps and a random sorted LUT.
+Nothing describes IRV's result, so the run checks only the plumbing.
+Its input must use the 8-bit range. The sample shifts the edge sums
+right by 9 and its taps total 100, so a picture under 64 can never get
+an edge over the LUT's first threshold, 12, and comes out all zeros.
+One open question would change results: how the 5-bit edge taps encode
+negatives. The driver writes the caller's low 5 bits with no
+conversion. That makes two's complement natural (a C caller's −1
+becomes code 31), and the model uses it. But the headers define an
+unused −15..15 limit, which would suit sign-magnitude.
 `test-novatek.py` checks each stage at register level against its own
 arithmetic: the 1- and 4-bit LUT, the general filter, the median's
 modes, an erosion, the integral image, IRV, completion within the start,

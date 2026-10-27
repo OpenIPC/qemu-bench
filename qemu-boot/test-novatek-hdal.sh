@@ -963,13 +963,12 @@ print("pd=%d/3 pvd=%d/2 cars=%d/3 eyes=%d bface=%d pets=%d/2 nopet=%d %s"
                 case "$nb" in *"t1=0 "*|*"t2=0 "*|"") bad "alg_ive_lut_sample_nonblocking: both threads check out (${nb:-no result})";;
                     *err=0) pass "alg_ive_lut_sample_nonblocking: both threads check out (${nb#NVT-IVE-NB: })";;
                     *) bad "alg_ive_lut_sample_nonblocking: both threads check out ($nb)";; esac
-                # (only the plumbing: nothing describes IRV or the edge
-                # arithmetic, and under the model's guesses this pipeline
-                # -- edge sum >> 9 over IRV's 6-bit output, then "over 12"
-                # and an erosion -- leaves every bit 0)
+                # (the plumbing: nothing describes IRV or the edge
+                # arithmetic, so the bits themselves are not checked)
                 irv=$(grep -a '^NVT-IVE-IRV: ' "$WORK/console.log" | tr -d '\r' | head -1)
-                case "$irv" in *"size=6400 "*) pass "alg_ive_irv_sample: writes its 6400-byte result (${irv#NVT-IVE-IRV: })";;
-                    *) bad "alg_ive_irv_sample: writes its 6400-byte result (${irv:-no result})";; esac
+                case "$irv" in *"size=6400 kinds=1") bad "alg_ive_irv_sample: a 6400-byte result, not uniform ($irv)";;
+                    *"size=6400 kinds="[0-9]*) pass "alg_ive_irv_sample: a 6400-byte result, not uniform (${irv#NVT-IVE-IRV: })";;
+                    *) bad "alg_ive_irv_sample: a 6400-byte result, not uniform (${irv:-no result})";; esac
             fi
         fi
     fi

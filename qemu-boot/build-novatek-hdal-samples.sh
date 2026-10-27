@@ -406,12 +406,15 @@ for f in range(11):
     y.tofile(d + '/dram_in_y.bin')
     uv.tofile(d + '/dram_in_uv.bin')
 
-# alg_ive_irv_sample's input (IVEP/1_All/02_di/ive11246.bin): a 256x200
-# disparity-like map -- 6-bit planes at three depths, a slanted edge, some
-# invalid (0) pixels -- and its output directory
+# alg_ive_irv_sample's input (IVEP/1_All/02_di/ive11246.bin, one of
+# Novatek's numbered test vectors, which no SDK ships): a 256x200 8-bit
+# scene -- three planes, a slanted edge, a little texture, some 0 pixels --
+# and its output directory.  It must use the 8-bit range: the sample
+# shifts its edge sums right by 9, and its taps total 100, so no picture
+# under 64 can get an edge over the LUT's first threshold, 12.
 yy, xx = np.mgrid[0:200, 0:256]
-d = np.where(xx + yy // 2 < 120, 12, np.where(yy < 100, 40, 25))
-d = (d + (xx // 32) % 3).astype(np.uint8)
+d = np.where(xx + yy // 2 < 120, 40, np.where(yy < 100, 200, 110))
+d = (d + (xx // 32) % 3 * 8 + (xx * 3 + yy * 5) % 7).astype(np.uint8)
 d[(xx * 7 + yy * 13) % 29 == 0] = 0
 os.makedirs(sd + '/IVEP/1_All/02_di')
 os.makedirs(sd + '/IVEP/1_All/05_DO')
