@@ -32,6 +32,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -93,6 +94,7 @@ static int hisi_smartsens_send(I2CSlave *i2c, uint8_t data)
         s->reg_buf[s->reg_ptr++] = data;
     } else {
         uint16_t addr = ((uint16_t)s->reg_buf[0] << 8) | s->reg_buf[1];
+        xm_regtrace("sensor", ((uint32_t)i2c->address << 16) | addr, data);
         if (addr >= SS_REG_BASE &&
             addr < SS_REG_BASE + SS_REG_COUNT) {
             s->regs[addr - SS_REG_BASE] = data;

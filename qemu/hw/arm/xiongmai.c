@@ -25,6 +25,7 @@
 #include "hw/sd/sd.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/sysbus.h"
 #include "qobject/qlist.h"
 #include "target/arm/arm-powerctl.h"
@@ -433,6 +434,14 @@ static void xm_machine_set_sensor_id(Object *obj, const char *value,
     XM_MACHINE(obj)->sensor_id = v;
 }
 
+
+char xm_regtrace_mode(void)
+{
+    if (!current_cpu) {
+        return '-';
+    }
+    return (ARM_CPU(current_cpu)->env.uncached_cpsr & 0x1f) == 0x10 ? 'U' : 'K';
+}
 
 /* the board's sensor (and its identical twin, if any) on an I2C bus */
 static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,

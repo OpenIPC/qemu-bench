@@ -32,6 +32,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include <math.h>
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -194,6 +195,7 @@ struct XmIsp2State {
     uint32_t sns_w, sns_h;      /* the sensor's active output */
     uint64_t frames;
     bool end_phase;
+    uint32_t phase;             /* quarter frames, see xm_isp2_frame */
     uint32_t store_lines;       /* 0: one line per event, not per channel */
     char *layout;
     const XmIsp2Layout *l;
@@ -201,6 +203,7 @@ struct XmIsp2State {
     uint32_t store_frame[STORE_CHANNELS];
     bool bpu_offline;           /* seen a BPU_START: jobs, not a timing gen */
     bool bpu_started;           /* a BPU_START not yet followed by RDMA_KICK */
+    uint32_t bpu_pending;       /* offline BPU starts not yet completed */
     bool trace;
 };
 
@@ -249,10 +252,21 @@ static void xm_isp2_frame(void *opaque)
     XmIsp2State *s = XM_ISP2(opaque);
 
     const uint32_t *vicu = s->l->vicu;
+    /* Two sensors are not phase-locked: their frame starts and ends come a
+     * quarter frame apart (phases 0..3: VICU0 start, VICU1 start, VICU0
+     * end, VICU1 end). isp.ko's frame-end handler sets the BPU's
+     * new-parameters mask to its own channel alone, so ends arriving
+     * together leave one channel's parameters never taken. */
+    const bool two = s->vicus > 1 && vicu[1];
+    const int only = two ? (s->phase & 1) : -1;
     uint32_t v;
 
+    s->end_phase = s->phase >= 2;
     /* only what vicu_run enabled: +0x40 frame end, +0x50 frame start */
     for (v = 0; v < s->vicus && v < 2 && vicu[v]; v++) {
+        if (only >= 0 && v != (uint32_t)only) {
+            continue;
+        }
         if (s->end_phase) {
             s->vi[(vicu[v] + VICU_LINE(s)) / 4] = s->sns_h;
         }
@@ -264,6 +278,9 @@ static void xm_isp2_frame(void *opaque)
             s->vi[(vicu[v] + VICU_DONE(s)) / 4] = 1;
             s->vi[(vicu[v] + VICU_ST(s)) / 4] = 1;
         }
+    }
+    if (only > 0) {
+        goto next;
     }
     if (s->l->vicu_int && s->end_phase &&
         s->vi[(s->l->vicu_int + 0x40) / 4]) {
@@ -310,10 +327,11 @@ static void xm_isp2_frame(void *opaque)
             s->store[(b + 0x5C) / 4] = 1;
         }
     }
-    s->end_phase = !s->end_phase;
+next:
+    s->phase = (s->phase + (two ? 1 : 2)) & 3;
     xm_isp2_update(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / s->fps / 2);
+              NANOSECONDS_PER_SECOND / s->fps / (two ? 4 : 2));
 }
 
 /*
@@ -687,6 +705,7 @@ static void name##_write(void *opaque, hwaddr off, uint64_t val,            \
 {                                                                           \
     XmIsp2State *s = XM_ISP2(opaque);                                       \
     XM_ISP2_TRACE(s, #arr, off, val);                                       \
+    xm_regtrace("isp2." #arr, off, val);                                    \
     s->arr[off / 4] = val;                                                  \
     if (s->arr == s->vpss) {                                                \
         xm_isp2_vpss_written(s, off, val);                                  \
@@ -713,6 +732,12 @@ static void xm_isp2_bpu_done(void *opaque)
         xm_isp2_vpss_inline(s);
     }
     s->bpu[BPU_ST / 4] = 1;
+    /* isp.ko may start the next channel's job before this one is done
+     * (two sensors' frames arriving together): one completion per start */
+    if (s->bpu_pending && --s->bpu_pending) {
+        timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  2 * SCALE_MS);
+    }
     xm_isp2_update(s);
 }
 
@@ -727,12 +752,15 @@ static void xm_isp2_bpu_write(void *opaque, hwaddr off, uint64_t val,
     XmIsp2State *s = XM_ISP2(opaque);
 
     XM_ISP2_TRACE(s, "bpu", off, val);
+    xm_regtrace("isp2.bpu", off, val);
     s->bpu[off / 4] = val;
     if (off == BPU_START && val) {
         s->bpu_started = true;
         s->bpu_offline = true;
-        timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  2 * SCALE_MS);
+        if (!s->bpu_pending++) {
+            timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      2 * SCALE_MS);
+        }
     }
     xm_isp2_update(s);
 }
@@ -780,8 +808,10 @@ static void xm_isp2_reset(DeviceState *dev)
     s->vpss_pending = 0;
     timer_del(s->vpss_timer);
     timer_del(s->bpu_timer);
+    s->bpu_pending = 0;
     s->frames = 0;
     s->end_phase = false;
+    s->phase = 0;
     s->bpu_offline = false;
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / s->fps);

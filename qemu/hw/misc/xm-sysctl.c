@@ -37,6 +37,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -86,6 +87,7 @@ static void xm_sysctl_write(void *opaque, hwaddr offset, uint64_t val,
 {
     XmSysctlState *s = XM_SYSCTL(opaque);
 
+    xm_regtrace("sysctl", offset, val);
     const bool unlocked = s->regs[s->rsten_offset / 4] & 1;
 
     if (offset == s->rst_offset && val == XM_SOFT_RST_MAGIC && unlocked) {

@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "qemu/timer.h"
@@ -142,6 +143,7 @@ static void xm_osd_write(void *opaque, hwaddr off, uint64_t val,
 {
     XmOsdState *s = XM_OSD(opaque);
 
+    xm_regtrace("osd", off, val);
     if (s->trace) {
         qemu_log("xm-osd: +0x%03" HWADDR_PRIx " = 0x%08" PRIx64 "\n", off, val);
     }
