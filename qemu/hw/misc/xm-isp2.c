@@ -247,6 +247,36 @@ static void xm_isp2_update(XmIsp2State *s)
 
 static void xm_isp2_store_pattern(XmIsp2State *s, int c);
 
+/*
+ * The time from the last event to the one of s->phase. A frame's end comes
+ * its active time after its start; the rest of the period is blanking. The
+ * XM535 isp.ko queues a frame of a sensor sharing its VICU for the BPU at
+ * the next frame start, and drops it when that comes over 40 ms (the
+ * channel's tThr1) after its end, as half of a 12 fps period would. Two
+ * VICUs start a quarter period apart.
+ */
+#define XM_ISP2_BLANK_NS (30 * SCALE_MS)
+
+static int64_t xm_isp2_phase_ns(XmIsp2State *s, bool two)
+{
+    int64_t period = NANOSECONDS_PER_SECOND / s->fps;
+    int64_t blank = MIN(XM_ISP2_BLANK_NS, period / 2);
+
+    if (!two) {
+        return s->phase >= 2 ? period - blank : blank;
+    }
+    blank = MAX(blank, period / 4 + SCALE_MS);
+    switch (s->phase) {
+    case 1:                     /* VICU1 start */
+    case 3:                     /* VICU1 end */
+        return period / 4;
+    case 2:                     /* VICU0 end */
+        return period - blank - period / 4;
+    default:                    /* VICU0 start */
+        return blank - period / 4;
+    }
+}
+
 static void xm_isp2_frame(void *opaque)
 {
     XmIsp2State *s = XM_ISP2(opaque);
@@ -331,7 +361,7 @@ next:
     s->phase = (s->phase + (two ? 1 : 2)) & 3;
     xm_isp2_update(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / s->fps / (two ? 4 : 2));
+              xm_isp2_phase_ns(s, two));
 }
 
 /*

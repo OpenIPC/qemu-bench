@@ -452,7 +452,7 @@ char xm_regtrace_mode(void)
 
 /* the board's sensor (and its identical twin, if any) on an I2C bus */
 static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
-                              I2CBus *bus)
+                              I2CBus *bus, uint8_t busno)
 {
     uint16_t id = ms->sensor_id ? ms->sensor_id : c->sensor_id;
     const uint8_t addrs[2] = { c->sensor_addr, c->sensor_addr2 };
@@ -469,6 +469,9 @@ static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
             if (ms->sensor_id && ms->sensor_ext <= 0xff) {
                 qdev_prop_set_uint8(DEVICE(sns), "reg_801e", ms->sensor_ext);
             }
+        }
+        if (!strcmp(c->sensor_type, "hisi-smartsens")) {
+            qdev_prop_set_uint8(DEVICE(sns), "bus", busno);
         }
         i2c_slave_realize_and_unref(sns, bus, &error_fatal);
     }
@@ -896,7 +899,7 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         DeviceState *i2c = sysbus_create_simple("xm-i2c", c->i2c_base, NULL);
 
         xm_attach_sensors(c, XM_MACHINE(machine),
-                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")), 0);
     }
     if (c->i2c2_base) {
         /* over the bus-1.. placeholder regbank */
@@ -905,7 +908,8 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2c), 0, c->i2c2_base, 1);
         xm_attach_sensors(c, XM_MACHINE(machine),
-                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")),
+                          (c->i2c2_base >> 12) & 0xf);
     }
 
     if (c->audio_base) {
