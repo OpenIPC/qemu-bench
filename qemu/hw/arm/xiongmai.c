@@ -400,6 +400,7 @@ typedef struct XmMachineState {
     MachineState parent_obj;
     char *flash_file;
     uint32_t sensor_id;         /* 0: the SoC config's */
+    uint32_t sensor_ext;        /* 0x801e, 0x1ff: the model's default */
 } XmMachineState;
 
 #define XM_MACHINE(obj) ((XmMachineState *)(obj))
@@ -425,13 +426,19 @@ static char *xm_machine_get_sensor_id(Object *obj, Error **errp)
 static void xm_machine_set_sensor_id(Object *obj, const char *value,
                                      Error **errp)
 {
-    uint64_t v;
+    uint64_t v, ext = 0x1ff;
+    const char *end;
 
-    if (qemu_strtou64(value, NULL, 16, &v) || v > 0xffff) {
-        error_setg(errp, "sensor-id: a 16-bit hex chip ID, e.g. cb3a");
+    /* "cb3a", or "9b3a/00": the chip ID and the value of 0x801e, which
+     * tells SmartSens variants apart (SC2336P / SC2337P) */
+    if (qemu_strtou64(value, &end, 16, &v) || v > 0xffff ||
+        (*end == '/' && (qemu_strtou64(end + 1, NULL, 16, &ext) || ext > 0xff)) ||
+        (*end && *end != '/')) {
+        error_setg(errp, "sensor-id: a 16-bit hex chip ID, e.g. cb3a or 9b3a/00");
         return;
     }
     XM_MACHINE(obj)->sensor_id = v;
+    XM_MACHINE(obj)->sensor_ext = ext;
 }
 
 
@@ -459,6 +466,9 @@ static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
         if (id) {               /* hisi-smartsens: which SC part */
             qdev_prop_set_uint8(DEVICE(sns), "id_high", id >> 8);
             qdev_prop_set_uint8(DEVICE(sns), "id_low", id & 0xff);
+            if (ms->sensor_id && ms->sensor_ext <= 0xff) {
+                qdev_prop_set_uint8(DEVICE(sns), "reg_801e", ms->sensor_ext);
+            }
         }
         i2c_slave_realize_and_unref(sns, bus, &error_fatal);
     }

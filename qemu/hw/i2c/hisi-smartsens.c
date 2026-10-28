@@ -52,6 +52,7 @@ struct HisiSmartSensState {
     uint8_t  id_high;
     uint8_t  id_low;
     uint8_t  disc;
+    uint8_t reg_801e;  /* SC2336P/SC2337P variant register */
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -112,7 +113,9 @@ static uint8_t hisi_smartsens_recv(I2CSlave *i2c)
     HisiSmartSensState *s = HISI_SMARTSENS(i2c);
     uint8_t val = 0xFF;
 
-    if (s->cur_reg >= SS_REG_BASE &&
+    if (s->cur_reg == 0x801e) {
+        val = s->reg_801e;
+    } else if (s->cur_reg >= SS_REG_BASE &&
         s->cur_reg < SS_REG_BASE + SS_REG_COUNT) {
         val = s->regs[s->cur_reg - SS_REG_BASE];
     }
@@ -134,6 +137,7 @@ static const Property hisi_smartsens_props[] = {
     DEFINE_PROP_UINT8("id_high", HisiSmartSensState, id_high, 0x00),
     DEFINE_PROP_UINT8("id_low",  HisiSmartSensState, id_low,  0x00),
     DEFINE_PROP_UINT8("disc",    HisiSmartSensState, disc,    0x00),
+    DEFINE_PROP_UINT8("reg_801e", HisiSmartSensState, reg_801e, 0xff),
 };
 
 /* What the guest programmed: the register file and the address pointer. */
