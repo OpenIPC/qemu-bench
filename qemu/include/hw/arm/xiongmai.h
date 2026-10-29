@@ -135,6 +135,8 @@ typedef struct XmSoCConfig {
     int         hevc_irq;
     const char *hevc_layout;    /* xm-hevc "layout"; NULL = its default */
     hwaddr      nn_base;        /* xm-nn; 0 = none */
+    hwaddr      fft_base;       /* xm-fft (XM533 ive.ko); 0 = none */
+    int         fft_irq;
     hwaddr      usb_base;       /* DWC2 OTG core in host mode; 0 = none */
     int         usb_irq;
     int         nn_irq;

@@ -390,6 +390,9 @@ static const XmSoCConfig *xm533_config(void)
          * XM535's */
         c.nn_base = 0x21500000;
         c.nn_irq = 43;
+        /* ive.ko's FFT engine: 0x21300000, IRQ 95 (SPI 63) */
+        c.fft_base = 0x21300000;
+        c.fft_irq = 63;
         {
             static const int irqs[XM_ISP2_IRQS] = { 25, -1, -1, -1, 27, 28, -1, -1, -1 };
             memcpy(c.isp2_irqs, irqs, sizeof(irqs));
@@ -928,6 +931,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     }
     if (c->nn_base) {
         sysbus_create_simple("xm-nn", c->nn_base, pic[c->nn_irq]);
+    }
+    if (c->fft_base) {
+        sysbus_create_simple("xm-fft", c->fft_base, pic[c->fft_irq]);
     }
     if (c->jpeg_base) {
         sysbus_create_simple("xm-jpeg", c->jpeg_base, pic[c->jpeg_irq]);
