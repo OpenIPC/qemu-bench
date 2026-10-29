@@ -325,6 +325,9 @@ static const XmSoCConfig *xm530v200_config(void)
         c.hevc_layout = "xm530v200";
         /* rgn.ko's OSD engine at 0x21300000 (osd_int SPI 62 as XM535) */
         c.osd_base = 0x21300000;
+        /* vo.ko's video output: 0x31000000, IRQ 59 (SPI 27) */
+        c.vo_base = 0x31000000;
+        c.vo_irq = 27;
         /* The boards' reset keys (Sofia's Device json Key: 80 on X2-WQ2,
          * 74 on X6C-WEQ), active low: low makes Sofia restore defaults and
          * reboot (type 10). */
@@ -931,6 +934,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     }
     if (c->nn_base) {
         sysbus_create_simple("xm-nn", c->nn_base, pic[c->nn_irq]);
+    }
+    if (c->vo_base) {
+        sysbus_create_simple("xm-vo", c->vo_base, pic[c->vo_irq]);
     }
     if (c->fft_base) {
         sysbus_create_simple("xm-fft", c->fft_base, pic[c->fft_irq]);
