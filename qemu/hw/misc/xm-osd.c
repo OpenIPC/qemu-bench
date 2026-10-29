@@ -8,7 +8,8 @@
  * place, NV12; region n's words at +0x100 * n (read from Sofia's clock and
  * title jobs):
  *   +0x00  enable              +0x04  4: 2 bits a pixel
- *   +0x10..+0x1C  the four colours, A Y U V from the top byte (0 clear)
+ *   +0x10..+0x1C  the four colours, A Y U V from the top byte (0 clear);
+ *                 on the XM535 (swap12) colour 2 at +0x14 and 1 at +0x18
  *   +0x24 / +0x28  1: doubled across / down
  *   +0x2C  the frame's stride  +0x30  the bitmap's stride, bytes
  *   +0x34  output height - 1   +0x4C  output width
@@ -51,6 +52,7 @@ struct XmOsdState {
     QEMUTimer *timer;
     uint32_t regs[XM_OSD_SIZE / 4];
     bool trace;
+    bool swap12;
 };
 
 static void xm_osd_update(XmOsdState *s)
@@ -83,6 +85,12 @@ static void xm_osd_region(XmOsdState *s, int n)
     }
     for (int i = 0; i < 4; i++) {
         pal[i] = r[(0x10 + 4 * i) / 4];
+    }
+    if (s->swap12) {
+        const uint32_t c1 = pal[1];
+
+        pal[1] = pal[2];
+        pal[2] = c1;
     }
     g_autofree uint8_t *bmp = g_malloc((size_t)bstride * bh);
     g_autofree uint8_t *line = g_malloc(w);
@@ -204,6 +212,7 @@ static void xm_osd_init(Object *obj)
 
 static const Property xm_osd_props[] = {
     DEFINE_PROP_BOOL("trace", XmOsdState, trace, false),
+    DEFINE_PROP_BOOL("swap12", XmOsdState, swap12, false),
 };
 
 static void xm_osd_class_init(ObjectClass *klass, const void *data)

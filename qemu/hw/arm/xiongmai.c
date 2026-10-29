@@ -362,6 +362,8 @@ static const XmSoCConfig *xm535_config(void)
         /* nn.ko's NN accelerator (xm-nn) */
         c.nn_base = 0x21500000;
         c.nn_irq = 43;
+        /* rgn.ko writes 2-bit colours 1 and 2 the other way round */
+        c.osd_swap12 = true;
     }
     return &c;
 }
@@ -943,7 +945,12 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(hevc), 0, pic[c->hevc_irq]);
     }
     if (c->osd_base) {
-        sysbus_create_simple("xm-osd", c->osd_base, pic[c->osd_irq]);
+        DeviceState *osd = qdev_new("xm-osd");
+
+        qdev_prop_set_bit(osd, "swap12", c->osd_swap12);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(osd), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(osd), 0, c->osd_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(osd), 0, pic[c->osd_irq]);
     }
     if (c->isp2) {
         DeviceState *isp = qdev_new("xm-isp2");

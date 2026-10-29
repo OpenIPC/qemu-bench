@@ -144,6 +144,7 @@ typedef struct XmSoCConfig {
     int         audio_irqs[2];  /* AI, AO */
     uint32_t    audio_chunk;    /* xm-audio "chunk"; 0 = its default */
     int         osd_irq;
+    bool        osd_swap12;     /* xm-osd: the XM535's colour order */
     int         num_gpio_high;  /* pads whose input reads high (pull-ups) */
     uint32_t    gpio_pads;      /* 0 = the model's 100 */
     uint32_t    gpio_adc_off;   /* xm-gpio adc-offset; 0 = none */
