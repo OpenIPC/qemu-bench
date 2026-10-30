@@ -1422,6 +1422,59 @@ def test_asdmic(qt):
     check('the DMA stops with the DMIC', qt.readl(AS + 0x18 * 5), dba)
 
 
+def test_dmic_trigger(qt):
+    """The voice trigger, as the voice-wakeup firmware arms it"""
+    print('ingenic-dmic voice trigger')
+    fired = lambda: ((qt.readl(DMIC + 0x0C) & 1),
+                     (qt.readl(DMIC + 0x38) >> 18) & 1)
+    line = lambda: (qt.readl(INTC + 0x00) >> 12) & 1
+    qt.writel(DMIC + 0x00, 1 << 31)                     # empty the FIFO
+    qt.writel(DMIC + 0x34, 32)
+    qt.writel(DMIC + 0x0C, 0x3f)
+    qt.writel(DMIC + 0x08, 0x3f)
+    # DEEP_SLEEP: 16 kHz prefetch, data path off (SR 3), threshold 5000
+    qt.writel(DMIC + 0x18, 5000)
+    qt.writel(DMIC + 0x10, (1 << 3) | (2 << 1))          # mode 0
+    qt.qom_set('/machine/dmic', 'tone-amp', 4000)
+    qt.writel(DMIC + 0x00, (3 << 6) | (1 << 8) | (1 << 12) | 3)
+    qt.writel(DMIC + 0x08, 0x3f & ~((1 << 0) | (1 << 4)))
+    qt.step(20 * 1000 * 1000)
+    check('below THRL (peak 4000 vs 5000): no trigger', fired(), (0, 0))
+    check('...and the data path off: nothing in the FIFO',
+          qt.readl(DMIC + 0x38) & 0x7f, 0)
+    qt.qom_set('/machine/dmic', 'tone-amp', 8192)
+    qt.step(2 * 1000 * 1000)
+    check('over THRL: TRIFLG and FSR TRIGS', fired(), (1, 1))
+    check('the trigger interrupts (INTC 12)', line(), 1)
+    qt.writel(DMIC + 0x0C, 0x3f)
+    check('INTCR write-1-clear drops the line but TRIGS stays latched',
+          (fired(), line()), ((0, 1), 0))
+    qt.step(5 * 1000 * 1000)
+    check('latched: no new flag until rearmed', fired(), (0, 1))
+    # mode 2: more than TRINMAX samples over THRL
+    qt.writel(DMIC + 0x10, (2 << 16) | (1 << 3) | (2 << 1) | 1)  # TRI_CLR
+    check('TRI_CLR rearms (and reads back clear)',
+          (fired(), qt.readl(DMIC + 0x10) & 1), ((0, 0), 0))
+    qt.writel(DMIC + 0x20, 1000)
+    qt.step(int(500e6 / 16000))                         # 500 samples
+    check('mode 2: fewer than TRINMAX samples over THRL, no trigger',
+          fired(), (0, 0))
+    qt.step(200 * 1000 * 1000)
+    check('mode 2: past TRINMAX, the trigger fires', fired(), (1, 1))
+    qt.writel(DMIC + 0x00, (3 << 6) | (1 << 30) | 3)     # RESET_TRI
+    check('RESET_TRI rearms and clears itself',
+          ((qt.readl(DMIC + 0x38) >> 18) & 1,
+           (qt.readl(DMIC + 0x00) >> 30) & 1), (0, 0))
+    qt.qom_set('/machine/dmic', 'tone-amp', 0)
+    qt.writel(DMIC + 0x0C, 0x3f)
+    qt.step(20 * 1000 * 1000)
+    check('silence: no trigger', fired(), (0, 0))
+    qt.writel(DMIC + 0x00, 0)
+    qt.writel(DMIC + 0x08, 0x3f)
+    qt.writel(DMIC + 0x0C, 0x3f)
+    qt.qom_set('/machine/dmic', 'tone-amp', 8192)
+
+
 def test_dmic(qt):
     print('ingenic-dmic')
     qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
@@ -2512,6 +2565,7 @@ def main():
         test_sadc(qt)
         test_sound(qt)
         test_dmic(qt)
+        test_dmic_trigger(qt)
         test_codec_gain(qt)
         test_tcu_pwm(qt)
         test_dtrng(qt)

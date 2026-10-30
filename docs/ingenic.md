@@ -772,7 +772,9 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   kernel enables the driver. The SSI slave (0x10040000) is not
   modelled: the 3.10 kernel has its Kconfig entries (`JZ_SPI_SLAVE`) and
   T31's platform device, but no tree here carries the driver, so there
-  is no register contract to follow.
+  is no register contract to follow. Also searched: every 3.10 and 4.4
+  kernel and U-Boot tree in the SDKs, the SDK samples, and the 51 vendor
+  PDFs (the T40 data sheets list only its pins, SSI_SLV_CLK/CE0/DT/DR).
 - Security blocks, as the SDKs' `sample_aes`, `sample_hash`, `sample_rsa`,
   `sample_dtrng` and `sample_des` and the 4.4 kernel's crypto and
   hw_random drivers use them; everything completes at once:
@@ -785,8 +787,12 @@ loads `tx-isp-t41.ko` without `direct_mode`.
     runs until HSCR bit 4 reloads it; HSDO gives the digest four bytes at
     a time as little-endian words (what the 4.4 driver hands its
     self-tests). HSDI (CPU mode) is not modelled: no driver or sample in
-    any tree here feeds it, so how many words make a round and what then
-    signals is not known.
+    any tree here feeds it (the 4.4 driver defines HASH_FLAGS_CPU and
+    never uses it; `sample_hash` only prints HSDI; no U-Boot uses
+    HASH_BASE; none of the 51 vendor PDFs describes the block), so how a
+    written word's bytes enter the block (HSCR bits 8:7 pick a byte order
+    whose meaning for HSDI is not documented), how many words make a
+    round and what then signals is not known.
   - `ingenic-rsa`: M^E mod N, 1024 or 2048 bits (RSAC bit 7); operands
     written most significant word first, the result read least
     significant first -- the order the sample's own `test_rsa.h` vectors
@@ -878,8 +884,22 @@ reach the analogue gains.
   entry, the earlier in bits 15:0); a 64-entry FIFO read at DR; FTHR's
   RDMS raises request 13 while it holds an entry; FSR's level and
   FULL/EMPTY, INTCR's flags under IMR (the drivers mask them all). Every
-  microphone hears a sine of `-global ingenic-dmic.tone-hz=N` (1 kHz).
+  microphone hears a sine of `-global ingenic-dmic.tone-hz=N` (1 kHz)
+  at the peak `tone-amp` (8192; settable at run time,
+  `qom-set /machine/dmic tone-amp N`, 0 for silence).
   The other parts' builds drive none but T41's.
+  The voice trigger (the data sheet's "low power voice trigger", with
+  pre-fetch while the data interface is off) follows the voice-wakeup
+  firmware of the same block (`drivers/char/voice_wakeup`; no T-series
+  audio driver sets TRI_EN): with CR0's EN and TRI_EN each sample is
+  compared with THRL; TRICR mode 0 fires on the first sample over it,
+  mode 2 once more than TRINMAX have been (other modes are not described
+  anywhere here and act as mode 0). Firing sets INTCR's TRIFLG (bit 0,
+  interrupting unless IMR bit 0) and FSR's TRIGS (bit 18) and holds until
+  TRICR's TRI_CLR or CR0's RESET_TRI (self-clearing) rearms it. SR 3,
+  the firmware's "data path off", still clocks the trigger at 16 kHz and
+  fills no FIFO. THRH and TRIMMAX are storage. T41's audio-system DMIC
+  defines its TCR but no field of it, and is not given a trigger.
 - `ingenic-asdmic` (T41): T41's audio system at 0x134D0000 (core INTC
   33), which the T41 SDK's `audio.ko` registers as its own platform
   devices and drives with `dmic_enable=1` (oss3 `host/T41/dmic`; the
@@ -1384,8 +1404,8 @@ channel 3, its AE banks, its counter 500000 ahead), and
 on T20 and T10 the Apical slots, a DMA writer's bank and a dropped frame;
 and sound: a PDMA memory copy with its interrupt, a cyclic record ring
 filled with the tone at 16 kHz and a play ring drained at that rate,
-the DMIC's packed samples on request 13 and its FIFO filling without
-DMA, the AIC playing at the CPM's 48 kHz speaker clock over the codec's
+the DMIC's packed samples on request 13, its FIFO filling without
+DMA and its voice trigger (modes 0 and 2, rearm, silence), the AIC playing at the CPM's 48 kHz speaker clock over the codec's
 16 kHz, and the T31 codec's record gain and switches; the SSI (READ ID from a
 `w25q80` by PIO, the underrun interrupt, 300 frames looped back through
 the PDMA), AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib
@@ -1402,9 +1422,10 @@ T40/T41 AWB pixel filter (above), T40/T41's AF, ADR, defog, WDR, LCE,
 GSM and TMO statistics (T41 bits 6, 9, 10, 11, 8, 7, 17 of 0x40028, AF
 index 0x1A0E0, formats other than T31's: AF packs zones in fours with
 23-bit fields), the Apical AF and the zone statistics beyond AE and AWB,
-the DMIC's voice trigger, PDMA transfers for peripherals other than the
-AIC, the SSI and the DES, the SSI slave and the HASH engine's CPU mode
-(no driver in any tree here, so no contract; above)
+PDMA transfers for peripherals other than the AIC, the SSI and the DES,
+the SSI slave and the HASH engine's CPU mode (no driver, sample or
+document in any tree here, so no contract; above), the trigger of T41's
+audio-system DMIC and the DMIC trigger modes other than 0 and 2
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
