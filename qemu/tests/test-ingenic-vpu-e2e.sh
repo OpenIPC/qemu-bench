@@ -155,17 +155,19 @@ for off, tag, name in ((0, b'H264', 'out.h264'), (8 << 20, b'JPEG', 'snap.jpg'))
     print('%s: %d bytes' % (name, n))
 PY
 fail=0
+# the streams go to ffmpeg on stdin and come back on stdout: a docker
+# ffmpeg need not see this host's files
 for f in out.h264 snap.jpg; do
-    if r=$($FFMPEG -v error -err_detect explode -i "$OUT/$f" -f null - 2>&1 | grep -v "^docker:"); [ -z "$r" ]; then
+    if r=$($FFMPEG -v error -err_detect explode -i - -f null - < "$OUT/$f" 2>&1 | grep -v "^docker:"); [ -z "$r" ]; then
         echo "ok   ffmpeg decodes $f cleanly"
     else
         echo "FAIL ffmpeg on $f: $r"; fail=1
     fi
 done
-n=$($FFMPEG -v error -i "$OUT/out.h264" -f framecrc - 2>/dev/null | grep -c "^0,")
+n=$($FFMPEG -v error -i - -f framecrc - < "$OUT/out.h264" 2>/dev/null | grep -c "^0,")
 echo "$([ "$n" -eq "$FRAMES" ] && echo ok || echo FAIL)   $n of $FRAMES H.264 frames"
 [ "$n" -eq "$FRAMES" ] || fail=1
-$FFMPEG -v error -y -i "$OUT/out.h264" -vf "select='eq(n\,0)+eq(n\,$((FRAMES - 1)))',tile=1x2" \
-    -frames:v 1 -update 1 "$OUT/out.png" 2>/dev/null || true
-$FFMPEG -v error -y -i "$OUT/snap.jpg" -update 1 "$OUT/snap.png" 2>/dev/null || true
+$FFMPEG -v error -i - -vf "select='eq(n\,0)+eq(n\,$((FRAMES - 1)))',tile=1x2" \
+    -frames:v 1 -f image2pipe -vcodec png - < "$OUT/out.h264" > "$OUT/out.png" 2>/dev/null || true
+$FFMPEG -v error -i - -f image2pipe -vcodec png - < "$OUT/snap.jpg" > "$OUT/snap.png" 2>/dev/null || true
 [ "$fail" = 0 ] && echo PASS || { echo FAIL; exit 1; }
