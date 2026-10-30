@@ -211,33 +211,124 @@ static void vpu_update_irq(IngenicVpuState *s)
 
 /* ---- memory -------------------------------------------------------------- */
 
-static void vpu_read_mem(hwaddr a, void *buf, size_t n)
+/*
+ * The engines' TLB: with a page table base set and a unit's enable on,
+ * that unit's addresses are virtual, translated through the kernel's
+ * DMMU table (libdmmu.c): a 4 KiB page directory indexed by bits 31:22,
+ * each entry the physical address of a page table with bit 0 valid; a
+ * page table of 1024 entries indexed by bits 21:12, each the physical
+ * page with bit 0 valid (bits 11:1 the kernel's map count).  HELIX / VPU:
+ * the base at SCH_TLBA (0x30), the enables in GLBC -- per unit bits 26..21
+ * (JPGC, DBLK, SDE, EFE, VDMA, MCE) or bit 30 for all; RADIX: CFGC
+ * TLB_TBA (0x10) and TLBE (0x1C) bits 16..21 (EFE, VDMA, ODMA, DBLK,
+ * MCE, SDE).  An unmapped page is a TLB error: logged, its bytes read as
+ * zero and writes dropped, and on HELIX / VPU SCH_STAT bit 10 set.
+ */
+enum { VPU_U_EFE, VPU_U_SDE, VPU_U_JPGC, VPU_U_VDMA };
+
+#define R_SCH_TLBA          0x00030
+#define R_RX_TLB_TBA        0x00010
+#define R_RX_TLBE           0x0001C
+#define  STAT_TLBERR        (1u << 10)
+
+static bool vpu_tlb_on(IngenicVpuState *s, int unit)
 {
-    dma_memory_read(&address_space_memory, a, buf, n, MEMTXATTRS_UNSPECIFIED);
+    static const uint8_t helix[] = { 23, 24, 26, 22 };
+    static const uint8_t radix[] = { 16, 21, 0, 17 };
+    uint32_t g;
+
+    if (s->kind == VPU_KIND_RADIX) {
+        return radix[unit] && vpu_reg(s, R_RX_TLB_TBA) &&
+               (vpu_reg(s, R_RX_TLBE) & (1u << radix[unit]));
+    }
+    g = vpu_reg(s, R_SCH_GLBC);
+    return vpu_reg(s, R_SCH_TLBA) &&
+           (g & ((1u << helix[unit]) | (1u << 30)));
 }
 
-static void vpu_write_mem(hwaddr a, const void *buf, size_t n)
+static bool vpu_xlate(IngenicVpuState *s, uint32_t va, hwaddr *pa)
 {
-    dma_memory_write(&address_space_memory, a, buf, n,
-                     MEMTXATTRS_UNSPECIFIED);
+    uint32_t base = vpu_reg(s, s->kind == VPU_KIND_RADIX ? R_RX_TLB_TBA :
+                                                            R_SCH_TLBA);
+    uint32_t pgd, pte;
+
+    pgd = ldl_le_phys(&address_space_memory, (base & ~0xfffu) + 4 * (va >> 22));
+    if (pgd & 1) {
+        pte = ldl_le_phys(&address_space_memory, (pgd & ~0xfffu) +
+                          4 * ((va >> 12) & 0x3ff));
+        if (pte & 1) {
+            *pa = (pte & ~0xfffu) | (va & 0xfff);
+            return true;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "ingenic-vpu: TLB error at 0x%08x\n", va);
+    if (s->kind != VPU_KIND_RADIX) {
+        vpu_set(s, R_SCH_STAT, vpu_reg(s, R_SCH_STAT) | STAT_TLBERR);
+    }
+    return false;
+}
+
+/* a unit's access, a page at a time when its TLB is on */
+static void vpu_mem(IngenicVpuState *s, int unit, uint32_t a, void *buf,
+                    size_t n, bool write)
+{
+    uint8_t *p = buf;
+
+    while (n) {
+        size_t k = n;
+        hwaddr pa = a;
+        bool ok = true;
+
+        if (vpu_tlb_on(s, unit)) {
+            k = MIN(n, 0x1000 - (a & 0xfff));
+            ok = vpu_xlate(s, a, &pa);
+        }
+        if (write && ok) {
+            dma_memory_write(&address_space_memory, pa, p, k,
+                             MEMTXATTRS_UNSPECIFIED);
+        } else if (!write) {
+            if (ok) {
+                dma_memory_read(&address_space_memory, pa, p, k,
+                                MEMTXATTRS_UNSPECIFIED);
+            } else {
+                memset(p, 0, k);
+            }
+        }
+        a += k;
+        p += k;
+        n -= k;
+    }
+}
+
+static void vpu_read_mem(IngenicVpuState *s, int unit, uint32_t a, void *buf,
+                         size_t n)
+{
+    vpu_mem(s, unit, a, buf, n, false);
+}
+
+static void vpu_write_mem(IngenicVpuState *s, int unit, uint32_t a,
+                          const void *buf, size_t n)
+{
+    vpu_mem(s, unit, a, (void *)buf, n, true);
 }
 
 /*
  * The picture's planes, packed: Y at w, CbCr (interleaved, NV12) at w.
  * NV21 is turned into NV12.
  */
-static void vpu_fetch_nv12(hwaddr ya, hwaddr ca, int ys, int cs, int w,
-                           int h, bool nv21, uint8_t *y, uint8_t *uv)
+static void vpu_fetch_nv12(IngenicVpuState *s, uint32_t ya, uint32_t ca,
+                           int ys, int cs, int w, int h, bool nv21,
+                           uint8_t *y, uint8_t *uv)
 {
     int r, x;
 
     for (r = 0; r < h; r++) {
-        vpu_read_mem(ya + (hwaddr)r * ys, y + r * w, w);
+        vpu_read_mem(s, VPU_U_EFE, ya + r * ys, y + r * w, w);
     }
     for (r = 0; r < h / 2; r++) {
         uint8_t *p = uv + r * w;
 
-        vpu_read_mem(ca + (hwaddr)r * cs, p, w);
+        vpu_read_mem(s, VPU_U_EFE, ca + r * cs, p, w);
         if (nv21) {
             for (x = 0; x < w; x += 2) {
                 uint8_t t = p[x];
@@ -312,8 +403,8 @@ static void vpu_h264(IngenicVpuState *s)
     }
     y = g_malloc((size_t)w * h);
     uv = g_malloc((size_t)w * h / 2);
-    vpu_fetch_nv12(vpu_reg(s, R_EFE_RAWY) + (hwaddr)fst * 16 * ys,
-                   vpu_reg(s, R_EFE_RAWC) + (hwaddr)fst * 8 * cs,
+    vpu_fetch_nv12(s, vpu_reg(s, R_EFE_RAWY) + fst * 16 * ys,
+                   vpu_reg(s, R_EFE_RAWC) + fst * 8 * cs,
                    ys, cs, w, h, EFE_PLANE(ctrl) == 3, y, uv);
     out = g_malloc(cap);
     ref = vpu_ref(s, w, h, &fresh);
@@ -331,7 +422,7 @@ static void vpu_h264(IngenicVpuState *s)
                       "(%zu > %u)\n", n, cap);
         n = cap;
     }
-    vpu_write_mem(bs, out, n);
+    vpu_write_mem(s, VPU_U_SDE, bs, out, n);
     vpu_set(s, R_SDE_BSLEN, n);
     /* a cost for the rate control: the source's activity, never 0 */
     vpu_set(s, R_EFE_SSAD, mbw * mbh * 256 + 1);
@@ -403,7 +494,7 @@ static void vpu_jpeg(IngenicVpuState *s)
     uv = g_malloc((size_t)w * h / 2);
     cb = g_malloc((size_t)w * h / 4);
     cr = g_malloc((size_t)w * h / 4);
-    vpu_fetch_nv12(vpu_reg(s, R_EFE_RAWY), vpu_reg(s, R_EFE_RAWC), ys, cs,
+    vpu_fetch_nv12(s, vpu_reg(s, R_EFE_RAWY), vpu_reg(s, R_EFE_RAWC), ys, cs,
                    w, h, EFE_PLANE(vpu_reg(s, R_EFE_CTRL)) == 3, y, uv);
     for (i = 0; i < w * h / 4; i++) {
         cb[i] = uv[2 * i];
@@ -413,7 +504,7 @@ static void vpu_jpeg(IngenicVpuState *s)
     out = g_malloc(cap);
     n = jpeg_enc_scan(y, w, cb, cr, w / 2, w, h, ql, qc, false, out, cap,
                       &overflow);
-    vpu_write_mem(bs, out, n);
+    vpu_write_mem(s, VPU_U_JPGC, bs, out, n);
     vpu_set(s, R_JPGC_STAT, JPGC_STAT_ENDF | (n & 0xFFFFFF));
     if (s->debug) {
         qemu_log("ingenic-vpu: JPEG %dx%d q0 %d/%d -> %08" HWADDR_PRIx
@@ -466,7 +557,7 @@ static void vpu_h265(IngenicVpuState *s)
     }
     y = g_malloc((size_t)w * h);
     uv = g_malloc((size_t)w * h / 2);
-    vpu_fetch_nv12(vpu_reg(s, R_RX_EFE_RAWY), vpu_reg(s, R_RX_EFE_RAWC), ys,
+    vpu_fetch_nv12(s, vpu_reg(s, R_RX_EFE_RAWY), vpu_reg(s, R_RX_EFE_RAWC), ys,
                    cs, w, h, false, y, uv);
     out = g_malloc(cap);
     n = hevc_enc_slice_data(&s->hevc_prm, ew, eh, qp, p_slice,
@@ -484,7 +575,7 @@ static void vpu_h265(IngenicVpuState *s)
         s->hevc_ref = s->hevc_recon;
         s->hevc_recon = t;
     }
-    vpu_write_mem(bs, out, n);
+    vpu_write_mem(s, VPU_U_SDE, bs, out, n);
     vpu_set(s, R_RX_SDE_SLBL, n);
     if (s->debug) {
         qemu_log("ingenic-vpu: H.265 %c slice %dx%d qp %d src %08x/%08x "
@@ -506,7 +597,7 @@ static void vpu_run_chain(IngenicVpuState *s, uint32_t addr)
 
     s->efe_run = s->jpgc_run = false;
     for (i = 0; i < VPU_CHAIN_MAX; i++) {
-        vpu_read_mem(addr + 8 * i, w, 8);
+        vpu_read_mem(s, VPU_U_VDMA, addr + 8 * i, w, 8);
         w[0] = le32_to_cpu(w[0]);
         w[1] = le32_to_cpu(w[1]);
         if (s->debug) {

@@ -97,6 +97,9 @@ if old not in s:
 s = s.replace(old, """# qemu: the DRAWBOX / I2D test instead of the application
 /usr/bin/xb2blocks-test %s
 echo XB2TEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 """ % phys, 1)
 open(p, 'w').write(s)

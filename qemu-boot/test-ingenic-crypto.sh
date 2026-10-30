@@ -1,12 +1,14 @@
 #!/bin/bash
-# The Ingenic security blocks (AES, HASH, RSA, DTRNG) end to end on T31:
-# the kernel and rootfs of an OpenIPC release, the T31 SDK's sample
-# drivers (sample_aes, sample_hash, sample_rsa, sample_dtrng) built
-# against that kernel, and a client (qemu-boot/ingenic-crypto-test.c)
-# that runs known-answer vectors through /dev/aes, /dev/hash, /dev/rsa
-# and reads /dev/dtrng.  The host checks the answers: FIPS-197 and
-# SP 800-38A for AES, Python's hashlib for the digests, pow() and the
-# sample's own test_rsa.h vectors for RSA.
+# The Ingenic security blocks (AES, HASH, RSA, DTRNG, DES) end to end on
+# T31: the kernel and rootfs of an OpenIPC release, the T31 SDK's sample
+# drivers (sample_aes, sample_hash, sample_rsa, sample_dtrng, sample_des)
+# built against that kernel, and a client (qemu-boot/ingenic-crypto-
+# test.c) that runs known-answer vectors through /dev/aes, /dev/hash,
+# /dev/rsa and /dev/des and reads /dev/dtrng.  The host checks the
+# answers: FIPS-197 and SP 800-38A for AES, Python's hashlib for the
+# digests, pow() and the sample's own test_rsa.h vectors for RSA, FIPS
+# 46's worked example for DES (by the CPU, and by the PDMA as triple DES
+# with three equal keys) and a triple-DES CBC round trip.
 #
 #   bash qemu-boot/test-ingenic-crypto.sh [--fw DIR] [--kdir DIR]
 #        [--sdk DIR] [--qemu PATH] [--out DIR] [--timeout S]
@@ -50,11 +52,11 @@ mkdir -p "$OUT"
 
 echo "== the sample drivers and the client"
 mkdir "$WORK/mod"
-for m in aes hash rsa dtrng; do
+for m in aes hash rsa dtrng des; do
     cp "$SDK/sample_$m/jz-$m.c" "$SDK/sample_$m/jz-$m.h" "$WORK/mod/"
 done
 # T31's soc/base.h has no RSA_IOBASE
-printf 'obj-m := jz-aes.o jz-hash.o jz-rsa.o jz-dtrng.o\nccflags-y += -DRSA_IOBASE=0x134C0000\n' \
+printf 'obj-m := jz-aes.o jz-hash.o jz-rsa.o jz-dtrng.o jz-des.o\nccflags-y += -DRSA_IOBASE=0x134C0000\n' \
     > "$WORK/mod/Kbuild"
 PATH=$TC:$PATH make -s -C "$KDIR" M="$WORK/mod" ARCH=mips \
     CROSS_COMPILE=$CROSS modules >/dev/null
@@ -98,11 +100,17 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t tmpfs tmp /tmp
 mount -t devtmpfs dev /dev 2>/dev/null
-for m in aes hash rsa dtrng; do insmod $KO/jz-\$m.ko; done
-echo "CRYPTOTEST devs: \$(ls /dev/aes /dev/hash /dev/rsa /dev/dtrng 2>&1 | tr '\n' ' ')"
+for m in aes hash rsa dtrng des; do insmod $KO/jz-\$m.ko; done
+echo "CRYPTOTEST devs: \$(ls /dev/aes /dev/hash /dev/rsa /dev/dtrng /dev/des 2>&1 | tr '\n' ' ')"
+# the kernel's messages would interleave with the client's lines on the
+# paced console; they are read back from dmesg below
+echo 1 > /proc/sys/kernel/printk
 crypto-test /etc/rsa-vectors
-dmesg | grep -i -E "aes|hash|rsa|dtrng" | grep -v "^.*random:" | tail -12 | sed 's/^/CRYPTOTEST dmesg: /'
+dmesg | grep -i -E "aes|hash|rsa|dtrng|des" | grep -v "^.*random:" | tail -12 | sed 's/^/CRYPTOTEST dmesg: /'
 echo CRYPTOTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 EOF
 chmod +x "$WORK/rfs/usr/bin/crypto-init"
@@ -181,6 +189,15 @@ check('DTRNG: 4 words by polling, all different',
       len(cpu) == 4 and len(set(cpu)) == 4, ' '.join(cpu))
 check('DTRNG: 2 words by interrupt', len(irq) == 2 and len(set(irq)) == 2,
       ' '.join(irq))
+fips = '85e813540f0ab405'
+d = got('DES cpu ')
+check('DES ECB through /dev/des by the CPU (FIPS 46)', d == [fips],
+      d[0] if d else 'none')
+d = got('DES dma ')
+check('triple DES (three equal keys) ECB by the PDMA, 64 bytes',
+      d == [fips * 8], d[0][:32] if d else 'none')
+check('triple DES CBC, 4 KiB by the PDMA, and back',
+      got('DES cbc roundtrip ') == ['ok, ciphered'])
 print('PASS' if not fail else 'FAIL')
 sys.exit(fail)
 PY

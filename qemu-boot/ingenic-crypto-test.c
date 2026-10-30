@@ -28,8 +28,17 @@
 #define IOCTL_AES_START_DE  _IOW('A', 112, unsigned int)
 #define IOCTL_HASH_MD5      _IOW('H', 111, unsigned int)
 #define IOCTL_RSA_ENC_DEC   _IOW('R', 110, unsigned int)
+#define IOCTL_DES_START_EN  _IOW('D', 111, unsigned int)
+#define IOCTL_DES_START_DE  _IOW('D', 112, unsigned int)
 #define IOCTL_DTRNG_DMA     _IO('D', 110)
 #define IOCTL_DTRNG_CPU     _IO('D', 111)
+
+struct des_para {
+    unsigned int status, enworkmode, algorithms, desiv[2], deskeys[6];
+    unsigned int datalen;
+    unsigned char *src, *dst;
+    unsigned int donelen;
+};
 
 struct aes_para {
     unsigned int status, enworkmode;
@@ -142,6 +151,68 @@ static int aes(void)
         printf("AES %s roundtrip %s\n", vec[v][0],
                memcmp(back, in, n) ? "bad" : "ok");
     }
+    close(fd);
+    return 0;
+}
+
+/*
+ * DES through /dev/des: FIPS 46's worked example (key 133457799BBCDFF1)
+ * by the CPU (8 bytes) and, eight times over, as triple DES with three
+ * equal keys by DMA (64 bytes); a 4 KiB triple-DES CBC round trip.  The
+ * driver runs the engine little endian: the buffer's bytes are the block.
+ */
+static int des(void)
+{
+    static const unsigned char plain[8] = {
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    static unsigned char in[4096], out[4096], back[4096];
+    struct des_para p;
+    int fd = open("/dev/des", O_RDWR), i;
+
+    if (fd < 0) {
+        printf("DES no /dev/des\n");
+        return 1;
+    }
+    memset(&p, 0, sizeof(p));
+    for (i = 0; i < 6; i += 2) {
+        p.deskeys[i] = 0x13345779;
+        p.deskeys[i + 1] = 0x9bbcdff1;
+    }
+    p.src = (unsigned char *)plain;
+    p.dst = out;
+    p.datalen = 8;
+    if (ioctl(fd, IOCTL_DES_START_EN, &p) < 0) {
+        printf("DES ioctl failed\n");
+        close(fd);
+        return 1;
+    }
+    hex("DES cpu", out, 8);
+    for (i = 0; i < 64; i++) {
+        in[i] = plain[i % 8];
+    }
+    p.algorithms = 1;                   /* triple DES */
+    p.src = in;
+    p.datalen = 64;
+    ioctl(fd, IOCTL_DES_START_EN, &p);
+    hex("DES dma", out, 64);
+    for (i = 0; i < 4096; i++) {
+        in[i] = rand();
+    }
+    for (i = 0; i < 6; i++) {
+        p.deskeys[i] = 0x01020304 * (i + 1);
+    }
+    p.enworkmode = 1;                   /* CBC */
+    p.desiv[0] = 0x12345678;
+    p.desiv[1] = 0x9abcdef0;
+    p.src = in;
+    p.dst = out;
+    p.datalen = 4096;
+    ioctl(fd, IOCTL_DES_START_EN, &p);
+    p.src = out;
+    p.dst = back;
+    ioctl(fd, IOCTL_DES_START_DE, &p);
+    printf("DES cbc roundtrip %s, %s\n", memcmp(back, in, 4096) ? "bad" : "ok",
+           memcmp(out, in, 4096) ? "ciphered" : "unchanged");
     close(fd);
     return 0;
 }
@@ -278,6 +349,7 @@ int main(int argc, char **argv)
     r |= hash();
     r |= rsa(argc > 1 ? argv[1] : "/etc/rsa-vectors");
     r |= dtrng();
+    r |= des();
     printf("CRYPTOTEST %s\n", r ? "INCOMPLETE" : "DONE");
     return 0;
 }

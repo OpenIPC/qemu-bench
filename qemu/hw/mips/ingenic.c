@@ -142,6 +142,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_AIC         1
 #define IRQ_PDMA        10
 #define DMIC_BASE       0x10034000  /* T31, T40 */
+#define ASDMIC_BASE     0x134D0000  /* T41's audio system: DMA, DMIC */
+#define IRQ_ASDMIC      33
 #define IRQ_DMIC        12
 #define GMAC_BASE       0x134B0000
 #define OST_BASE        0x12000000
@@ -183,6 +185,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define SADC_BASE       0x10070000
 #define IRQ_SADC        18
 #define USBPHY_BASE     0x10060000  /* the OTG PHY's own registers */
+#define DES_BASE        0x10061000
 #define DTRNG_BASE      0x10072000
 #define AES_BASE        0x13430000
 #define HASH_BASE       0x13480000
@@ -1068,14 +1071,30 @@ static void ingenic_init(MachineState *ms)
 
     /*
      * UARTs.  The console is UART1 on every board, so it takes the first
-     * -serial; UART0 the second, then UART2 and up.
+     * -serial; UART0 the second, then UART2 and up.  They transmit at the
+     * line rate ("paced"): the 4.4 kernels' ingenic_uart.c stops its
+     * transmitter from the interrupt without the port lock, racing the
+     * other core's start, and an interrupt after every instant burst
+     * leaves heavy console output stalled with data queued.
      */
     for (i = 0; i < info->num_uarts; i++) {
         int hd = i == 1 ? 0 : (i == 0 ? 1 : i);
 
-        serial_mm_init(sysmem, UART_BASE + i * 0x1000, 2,
-                       ingenic_irq(ims, IRQ_UART0 - i), 115200,
-                       serial_hd(hd), DEVICE_LITTLE_ENDIAN);
+        dev = qdev_new(TYPE_SERIAL_MM);
+        qdev_prop_set_uint8(dev, "regshift", 2);
+        /* EXTAL / 16: the divisor the drivers program is for 24 MHz */
+        qdev_prop_set_uint32(dev, "baudbase", 24000000 / 16);
+        qdev_prop_set_chr(dev, "chardev", serial_hd(hd));
+        qdev_prop_set_bit(dev, "paced", true);
+        qdev_prop_set_uint32(dev, "tx-fifo", 64);   /* ingenic_uart.c's */
+        qdev_set_legacy_instance_id(dev, UART_BASE + i * 0x1000, 2);
+        qdev_prop_set_uint8(dev, "endianness", DEVICE_LITTLE_ENDIAN);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ingenic_irq(ims, IRQ_UART0 - i));
+        memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000,
+                                    sysbus_mmio_get_region(SYS_BUS_DEVICE(dev),
+                                                           0));
     }
 
     /* I2C, the sensor's bus on I2C0 */
@@ -1219,6 +1238,12 @@ static void ingenic_init(MachineState *ms)
     case INGENIC_T23: case INGENIC_T31:
         qdev_prop_set_string(dev, "codec", "t31");
         break;
+    case INGENIC_T40:
+        qdev_prop_set_string(dev, "codec", "t40");
+        break;
+    case INGENIC_T41:
+        qdev_prop_set_string(dev, "codec", "t41");
+        break;
     default:
         break;
     }
@@ -1260,6 +1285,16 @@ static void ingenic_init(MachineState *ms)
         qdev_connect_gpio_out_named(dev, "drq-rx", 0,
                                     qdev_get_gpio_in_named(pdma, "drq",
                                                            0x17 + 2 * i));
+    }
+
+    /* T41's digital microphones: its audio system's own DMA, not the PDMA */
+    if (info->soc == INGENIC_T41) {
+        dev = qdev_new("ingenic-asdmic");
+        object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, ASDMIC_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_ASDMIC));
     }
 
     /* the digital microphones of T31 and T40, on request line 13 */
@@ -1341,10 +1376,16 @@ static void ingenic_init(MachineState *ms)
     }
 
     /*
-     * The security blocks: AES on every part; HASH and the DTRNG from
-     * T21 on; RSA (polled) on T23, T31, T40 and T41.
+     * The security blocks: AES and DES (on PDMA lines 0x2E / 0x2F) on
+     * every part; HASH and the DTRNG from T21 on; RSA (polled) on T23,
+     * T31, T40 and T41.
      */
     sysbus_create_simple("ingenic-aes", AES_BASE, ingenic_irq(ims, IRQ_AES));
+    dev = sysbus_create_simple("ingenic-des", DES_BASE, NULL);
+    qdev_connect_gpio_out_named(dev, "drq-tx", 0,
+                                qdev_get_gpio_in_named(pdma, "drq", 0x2E));
+    qdev_connect_gpio_out_named(dev, "drq-rx", 0,
+                                qdev_get_gpio_in_named(pdma, "drq", 0x2F));
     if (info->soc != INGENIC_T10 && info->soc != INGENIC_T20 &&
         info->soc != INGENIC_T30) {
         sysbus_create_simple("ingenic-hash", HASH_BASE,

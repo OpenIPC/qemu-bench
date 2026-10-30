@@ -1166,6 +1166,81 @@ def test_ssi(qt, intc=INTC):
     qt.writel(SSI1 + 0x04, 0)
 
 
+def test_des(qt):
+    print('ingenic-des')
+    DES = 0x10061000
+
+    def run(cr2, keys, words, iv=(0, 0)):
+        qt.writel(DES + 0x00, 0)
+        qt.writel(DES + 0x04, cr2)
+        for i, k in enumerate(keys):
+            qt.writel(DES + 0x10 + 4 * i, k)
+        qt.writel(DES + 0x28, iv[0])
+        qt.writel(DES + 0x2C, iv[1])
+        qt.writel(DES + 0x00, 1)                        # work
+        for w in words:
+            qt.writel(DES + 0x30, w)
+        out = []
+        for _ in words:
+            if qt.readl(DES + 0x08) & 1:
+                break
+            out.append(qt.readl(DES + 0x34))
+        return tuple(out)
+
+    k = (0x13345779, 0x9BBCDFF1)
+    # FIPS 46's worked example
+    check('DES ECB: 0123456789ABCDEF -> 85E813540F0AB405',
+          run(0, k, (0x01234567, 0x89ABCDEF)), (0x85E81354, 0x0F0AB405))
+    check('and back (decrypt)', run(1 << 3, k, (0x85E81354, 0x0F0AB405)),
+          (0x01234567, 0x89ABCDEF))
+    check('triple DES with K1 = K2 = K3 is DES',
+          run(1 << 1, k * 3, (0x01234567, 0x89ABCDEF)), (0x85E81354, 0x0F0AB405))
+    two = (0x01234567, 0x89ABCDEF, 0x01234567, 0x89ABCDEF)
+    cbc = run(1 << 2, k, two, (0x12345678, 0x9ABCDEF0))
+    check('CBC: equal blocks cipher differently', cbc[:2] != cbc[2:], True)
+    check('CBC and back', run((1 << 2) | (1 << 3), k, cbc,
+                              (0x12345678, 0x9ABCDEF0)), two)
+    check('the output FIFO empty again', qt.readl(DES + 0x08) & 1, 1)
+    # the PDMA: 64 bytes in, little endian, triple DES ECB, out
+    src, dst = SCRATCH + 0xC000, SCRATCH + 0xD000
+    data = bytes(range(64))
+    qt.write(src, data)
+    qt.write(dst, bytes(64))
+    tk = (0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324,
+          0x25262728)
+    qt.writel(DES + 0x00, 0)
+    qt.writel(DES + 0x04, (1 << 4) | (1 << 1) | 1)      # LE, TDES, DMA
+    for i, w in enumerate(tk):
+        qt.writel(DES + 0x10 + 4 * i, w)
+    qt.writel(DES + 0x00, 1)
+    qt.writel(PDMA + 0x1000, 1)
+    rxc, txc = PDMA + 0x20 * 8, PDMA + 0x20 * 9
+    qt.writel(rxc + 0x00, DES + 0x34)
+    qt.writel(rxc + 0x04, dst)
+    qt.writel(rxc + 0x08, 16)
+    qt.writel(rxc + 0x0C, 0x2F)
+    qt.writel(rxc + 0x14, 1 << 22)                      # 32-bit, DAI
+    qt.writel(rxc + 0x10, (1 << 31) | 1)
+    qt.writel(txc + 0x00, src)
+    qt.writel(txc + 0x04, DES + 0x30)
+    qt.writel(txc + 0x08, 16)
+    qt.writel(txc + 0x0C, 0x2E)
+    qt.writel(txc + 0x14, 1 << 23)                      # 32-bit, SAI
+    qt.writel(txc + 0x10, (1 << 31) | 1)
+    enc = qt.read(dst, 64)
+    check('both channels done', (qt.readl(txc + 0x10) & 8,
+                                 qt.readl(rxc + 0x10) & 8), (8, 8))
+    check('the DMA output is ciphered', enc != data and enc != bytes(64), True)
+    words = struct.unpack('<16I', enc)
+    qt.writel(txc + 0x10, 0)
+    qt.writel(rxc + 0x10, 0)
+    qt.writel(PDMA + 0x1004, 0)
+    back = run((1 << 4) | (1 << 3) | (1 << 1), tk, words)
+    check('decrypted by the CPU, the input again', struct.pack('<16I', *back),
+          data)
+    qt.writel(DES + 0x00, 0)
+
+
 # --- sound: PDMA, AIC, codec ----------------------------------------------
 
 def pdma_ring(qt, ch, desc, buf, period, nper, drt, dcm, port=AIC + 0x34,
@@ -1211,8 +1286,10 @@ def test_sound(qt, intc=INTC):
     # the codec at 16 kHz, its registers bytes read back
     qt.writel(CODEC + 0x110, 0x5)
     check('codec CSRR reads back', qt.readl(CODEC + 0x110), 5)
-    # the microphone path on, ALC on (T31's codec_set_buildin_mic)
+    # the microphone path on, ALC on (T31's codec_set_buildin_mic); on
+    # T41 the ADC on and the gain the driver leaves (0x1F, its unity)
     qt.writel(CODEC + 0x8C, 0x90)
+    qt.writel(CODEC + 0x98, 0x1f)
     # record: 16-bit, right channel only, DMA, as i2s_dma_enable does
     ring, desc, period = SCRATCH + 0x2000, SCRATCH + 0x3000, 64
     qt.write(ring, bytes(4 * period))
@@ -1276,6 +1353,73 @@ def test_codec_gain(qt):
     check('ALC off, gain 0x0C: -6 dB', peak(0x80, 0x0C), 4106)
     check('the ADC off: silence', peak(0x10, 0x10), 0)
     qt.writel(AIC + 0x04, 0)
+
+
+def test_codec_gain_t41(qt):
+    """T41's codec: record gain, ALC, digital volume, ADC switch, by PIO"""
+    print('ingenic-aic codec gains (T41 layout)')
+
+    def peak(cmiccr, calcgr, cgainr=0, clavr=0xC3):
+        qt.writel(AIC + 0x04, 0)
+        qt.writel(AIC + 0x00, 1 | (1 << 3))             # empty the FIFOs
+        qt.writel(CODEC + 0x110, 0x5)
+        qt.writel(CODEC + 0x8C, cmiccr)
+        qt.writel(CODEC + 0x98, calcgr)
+        qt.writel(CODEC + 0x28, cgainr)
+        qt.writel(CODEC + 0x20, clavr)
+        qt.writel(AIC + 0x04, (1 << 16) | (1 << 12) | 1)  # EREC, mono
+        qt.step(1500 * 1000)                            # 24 frames
+        v = [qt.readl(AIC + 0x34) & 0xffff for _ in range(24)]
+        return max(abs(x - 65536 if x >= 32768 else x) for x in v)
+
+    check('the digital volumes come out of reset at 0 dB',
+          (qt.readl(CODEC + 0x18), qt.readl(CODEC + 0x20)), (0xF1, 0xC3))
+    check('gain 0x1F (the driver\'s): unity', peak(0x80, 0x1f), 8192)
+    check('gain 0x1B: -6 dB', peak(0x80, 0x1b), 4106)
+    check('ALC (CGAINR bit 4) holds the level', peak(0x80, 0x1b, 0x10), 8192)
+    check('CLAVR 0xCF: +6 dB digital', peak(0x80, 0x1f, 0, 0xCF), 16345)
+    check('CLAVR 0: muted', peak(0x80, 0x1f, 0, 0), 0)
+    check('the ADC off: silence', peak(0x00, 0x1f), 0)
+    qt.writel(AIC + 0x04, 0)
+
+
+def test_asdmic(qt):
+    """T41's audio system: DMIC to FIFO 5 to DMA channel 5, as as-dma.c"""
+    print('ingenic-asdmic (T41)')
+    AS = 0x134D0000
+    ring, descs, frag = SCRATCH + 0xA000, SCRATCH + 0xB000, 320
+    qt.write(ring, bytes(2 * frag))
+    for i in range(2):                  # two linked descriptors, no TIE
+        d0 = (1 << 2) | (1 << 4) | (1 << 8)     # LINK, TSZ 1 (4 words), BAI
+        qt.write(descs + 16 * i, struct.pack('<4I', d0, ring + i * frag,
+                                             descs + 16 * ((i + 1) % 2),
+                                             frag // 16))
+    qt.writel(AS + 0xA000, 1 << 31)                     # set_dmic_reset
+    check('CR0 RESET self-clears', qt.readl(AS + 0xA000) >> 31, 0)
+    qt.writel(AS + 0xA000, (1 << 6))                    # 16 kHz, 1 mic, 16-bit
+    qt.writel(AS + 0x0C + 0x18 * 5, 0x3c)               # ingenic_dmic_dma_start
+    qt.writel(AS + 0x14 + 0x18 * 5, descs)
+    qt.writel(AS + 0x08 + 0x18 * 5, 1)
+    qt.writel(AS + 0x1004 + 0x10 * 5, 1)
+    qt.writel(AS + 0xA000, (1 << 6) | 1)                # EN
+    qt.step(10 * 1000 * 1000)
+    dba = qt.readl(AS + 0x18 * 5)
+    check('10 ms at 16 kHz: 160 samples into the ring of 2 x 160',
+          dba, ring + 320)
+    got = struct.unpack('<160h', qt.read(ring, 320))
+    want = [round(8192 * math.sin(2 * math.pi * 1000 * k / 16000))
+            for k in range(160)]
+    check('the samples are the 1 kHz tone, two to a word',
+          got[:24], tuple(want[:24]))
+    qt.step(15 * 1000 * 1000)
+    check('the ring wraps through the link (25 ms: 400 samples)',
+          qt.readl(AS + 0x18 * 5), ring + 160)
+    check('no interrupt without TIE', qt.readl(AS + 0x110), 0)
+    qt.writel(AS + 0xA000, 1 << 6)                      # stop
+    qt.writel(AS + 0x08 + 0x18 * 5, 0)
+    dba = qt.readl(AS + 0x18 * 5)
+    qt.step(10 * 1000 * 1000)
+    check('the DMA stops with the DMIC', qt.readl(AS + 0x18 * 5), dba)
 
 
 def test_dmic(qt):
@@ -2285,6 +2429,8 @@ def main():
         qt = QTest(a.qemu, 't41')
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
+        test_codec_gain_t41(qt)
+        test_asdmic(qt)
         test_pwm(qt)
         test_drawbox(qt)
         test_i2d(qt)
@@ -2294,6 +2440,7 @@ def main():
         test_aes(qt, CORE_INTC)
         test_hash(qt, CORE_INTC)
         test_rsa(qt)
+        test_des(qt)
         qt.close()
         qt = QTest(a.qemu, 't40')
         test_drawbox(qt)
