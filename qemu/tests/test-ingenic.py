@@ -46,6 +46,7 @@ the SPL, U-Boot and the kernel drivers (docs/ingenic.md):
     python3 qemu/tests/test-ingenic.py [--qemu PATH]
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -461,6 +462,219 @@ def test_pwm(qt):
     check('ENC clears EN', qt.readl(PWM + 0x18), 0)
     check('a disabled pin sits at LVL', chan(2), '1')
     check('other channels untouched', chan(0), '0')
+
+
+# --- TCU channels as PWM ----------------------------------------------------
+
+def test_tcu_pwm(qt):
+    print('ingenic-tcu PWM pins')
+    pwm = lambda n: qt.qom_get('/machine/tcu', 'pwm%d' % n)
+    ch = TCU + 0x40 + 0x10 * 2
+    check('a pin the TCU does not drive', pwm(2), 'off')
+    # jz_tcu_config_chn: initial level high, EXTAL, PWM output on; period
+    # 1000, duty 250 (sample_pwm's polarity normal)
+    qt.writel(ch + 0xC, (1 << 8) | 4 | (1 << 7))
+    qt.writel(ch + 0x0, 1000)
+    qt.writel(ch + 0x4, 250)
+    check('enabled, not counting: the initial level', pwm(2), '1')
+    qt.writel(TCU + 0x3C, 1 << 2)           # TSCR: clock on
+    qt.writel(TCU + 0x14, 1 << 2)           # TESR: count
+    check('counting: high for TDHR of TDFR', pwm(2), '250/1000')
+    qt.writel(ch + 0xC, 4 | (1 << 7))
+    check('initial level low: high for the rest', pwm(2), '750/1000')
+    qt.writel(ch + 0x4, 0)
+    check('half at 0: flipped all the time', pwm(2), '1')
+    qt.writel(ch + 0x4, 1000)
+    check('half at full: the initial level all the time', pwm(2), '0')
+    qt.writel(TCU + 0x18, 1 << 2)           # TECR
+    qt.writel(ch + 0xC, 4)
+    check('PWM output off', pwm(2), 'off')
+
+
+# --- security blocks: DTRNG, AES, HASH, RSA ---------------------------------
+
+DTRNG = 0x10072000
+AES = 0x13430000
+HASH = 0x13480000
+RSA = 0x134C0000
+
+
+def test_dtrng(qt, intc=INTC):
+    print('ingenic-dtrng')
+    check('nothing ready while off', qt.readl(DTRNG + 0x08), 0)
+    # sample_dtrng's CPU mode: divider 8, interrupt masked, enable
+    qt.writel(DTRNG, (8 << 1) | (1 << 11) | 1)
+    check('not ready at once', qt.readl(DTRNG + 0x08), 0)
+    qt.step(100000)
+    check('ready after a while', qt.readl(DTRNG + 0x08), 1)
+    a, b = qt.readl(DTRNG + 0x04), qt.readl(DTRNG + 0x04)
+    check('two reads, two numbers', a != b, True)
+    check('masked: no interrupt', (qt.readl(intc + 0x20) >> 2) & 1, 0)
+    qt.writel(DTRNG, (8 << 1) | 1)
+    check('unmasked: source 34 raised', (qt.readl(intc + 0x20) >> 2) & 1, 1)
+    # the interrupt handler: clear ready, disable, mask, release the clear
+    qt.writel(DTRNG, (8 << 1) | 1 | (1 << 12))
+    qt.writel(DTRNG, (8 << 1) | (1 << 12))
+    qt.writel(DTRNG, (8 << 1) | (1 << 11) | (1 << 12))
+    qt.writel(DTRNG, (8 << 1) | (1 << 11))
+    check('cleared: not ready, line low',
+          (qt.readl(DTRNG + 0x08), (qt.readl(intc + 0x20) >> 2) & 1), (0, 0))
+
+
+def be_words(data):
+    """the AES DMA's memory format: each word's top byte comes first"""
+    return b''.join(data[i:i + 4][::-1] for i in range(0, len(data), 4))
+
+
+def aes_dma(qt, key, data, mode, iv=None, dec=False):
+    """jz-aes.c's sequence, in DMA mode"""
+    src, dst = SCRATCH, SCRATCH + 0x1000
+    qt.writel(AES + 0x04, qt.readl(AES + 0x04))
+    qt.writel(AES + 0x08, 0x5)
+    qt.writel(AES + 0x00, 3 << 28 | 1 << 10 | 1)
+    ascr = 3 << 28 | 1 << 8 | 1 | (dec << 4) | ((mode == 'cbc') << 5)
+    qt.writel(AES + 0x00, ascr)
+    if mode == 'cbc':
+        for i in range(4):
+            qt.writel(AES + 0x24, struct.unpack('>I', iv[4 * i:4 * i + 4])[0])
+        qt.writel(AES + 0x00, qt.readl(AES + 0x00) | 1 << 1)
+    qt.writel(AES + 0x14, len(data) // 16)
+    for i in range(4):
+        qt.writel(AES + 0x20, struct.unpack('>I', key[4 * i:4 * i + 4])[0])
+    qt.writel(AES + 0x00, qt.readl(AES + 0x00) | 1 << 2)
+    keyd = qt.readl(AES + 0x04) & 1
+    qt.write(src, be_words(data))
+    qt.writel(AES + 0x0C, src)
+    qt.writel(AES + 0x10, dst)
+    qt.writel(AES + 0x00, qt.readl(AES + 0x00) | 1 << 9)
+    return keyd, qt.readl(AES + 0x04), be_words(qt.read(dst, len(data)))
+
+
+def test_aes(qt, intc=INTC):
+    print('ingenic-aes')
+    # FIPS-197 C.1 and SP 800-38A F.2.1
+    k1 = bytes(range(16))
+    p1 = bytes.fromhex('00112233445566778899aabbccddeeff')
+    c1 = bytes.fromhex('69c4e0d86a7b0430d8cdb78070b4c55a')
+    keyd, st, out = aes_dma(qt, k1, p1, 'ecb')
+    check('key done', keyd, 1)
+    check('ECB encrypt: FIPS-197', out, c1)
+    check('DMA done and the INTC line', (st & 4, (qt.readl(intc) >> 23) & 1),
+          (4, 1))
+    qt.writel(AES + 0x04, 7)
+    check('ASSR write 1 clears the line', (qt.readl(intc) >> 23) & 1, 0)
+    _, _, out = aes_dma(qt, k1, c1, 'ecb', dec=True)
+    check('ECB decrypt', out, p1)
+    k2 = bytes.fromhex('2b7e151628aed2a6abf7158809cf4f3c')
+    iv = bytes(range(16))
+    p2 = bytes.fromhex('6bc1bee22e409f96e93d7e117393172a'
+                       'ae2d8a571e03ac9c9eb76fac45af8e51')
+    c2 = bytes.fromhex('7649abac8119b246cee98e9b12e9197d'
+                       '5086cb9b507219ee95db113a917678b2')
+    _, _, out = aes_dma(qt, k2, p2, 'cbc', iv)
+    check('CBC encrypt, two blocks: SP 800-38A', out, c2)
+    _, _, out = aes_dma(qt, k2, c2, 'cbc', iv, dec=True)
+    check('CBC decrypt', out, p2)
+    # one block through ASDI / ASDO
+    qt.writel(AES + 0x00, 3 << 28 | 1 << 10 | 1)
+    qt.writel(AES + 0x00, 3 << 28 | 1)
+    for i in range(4):
+        qt.writel(AES + 0x20, struct.unpack('>I', k1[4 * i:4 * i + 4])[0])
+    qt.writel(AES + 0x00, qt.readl(AES + 0x00) | 1 << 2)
+    for i in range(4):
+        qt.writel(AES + 0x18, struct.unpack('>I', p1[4 * i:4 * i + 4])[0])
+    qt.writel(AES + 0x00, qt.readl(AES + 0x00) | 1 << 3)
+    out = b''.join(struct.pack('>I', qt.readl(AES + 0x1C)) for i in range(4))
+    check('one block by the CPU', (qt.readl(AES + 0x04) & 2, out), (2, c1))
+
+
+def md_pad(msg, alg):
+    """the padding sample_hash's test does in user space"""
+    bs, lb = (128, 16) if alg in ('sha384', 'sha512') else (64, 8)
+    n = len(msg) * 8
+    p = msg + b'\x80'
+    p += b'\0' * ((-len(p) - lb) % bs)
+    return p + (n.to_bytes(lb, 'little' if alg == 'md5' else 'big'))
+
+
+def test_hash(qt, intc=INTC):
+    print('ingenic-hash')
+    algs = ('md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512')
+    msg = b'The quick brown fox jumps over the lazy dog, ' * 3
+    for code, alg in enumerate(algs):
+        data = md_pad(msg, alg)
+        qt.write(SCRATCH, data)
+        # jz-hash.c: defaults, the algorithm, enable, byte order, initial
+        # state; then each run: clear, unmask, DMA enable, length, source,
+        # start
+        qt.writel(HASH + 0x00, 0x30000000)
+        qt.writel(HASH + 0x04, 3)
+        qt.writel(HASH + 0x1C, 1)
+        qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | code << 1)
+        qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | 1)
+        qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) |
+                  (1 << 8 if alg == 'md5' else 1 << 7))
+        qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | 1 << 4)
+        # in two runs, to carry the state over
+        half = (len(data) // 2) & ~127 or len(data)
+        for off, n in ((0, half), (half, len(data) - half)):
+            if not n:
+                continue
+            qt.writel(HASH + 0x04, 3)
+            qt.writel(HASH + 0x08, 3)
+            qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | 1 << 5)
+            qt.writel(HASH + 0x10, n // 64)
+            qt.writel(HASH + 0x0C, SCRATCH + off)
+            qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | 1 << 6)
+        want = hashlib.new(alg, msg).digest()
+        got = b''.join(struct.pack('<I', qt.readl(HASH + 0x18))
+                       for i in range(len(want) // 4))
+        check('%s of %d bytes' % (alg, len(msg)), got, want)
+    check('all rounds done and the INTC line',
+          (qt.readl(HASH + 0x04) & 3, (qt.readl(intc) >> 22) & 1), (3, 1))
+    qt.writel(HASH + 0x04, 3)
+    check('HSSR write 1 clears the line', (qt.readl(intc) >> 22) & 1, 0)
+
+
+def test_rsa(qt):
+    print('ingenic-rsa')
+    import random
+    rng = random.Random(31)
+    for bits in (1024, 2048):
+        k = bits // 32
+        n = rng.getrandbits(bits) | 1 << (bits - 1) | 1
+        e = rng.getrandbits(bits)
+        m = rng.getrandbits(bits) % n
+        words = lambda v: [(v >> (32 * (k - 1 - i))) & 0xffffffff
+                           for i in range(k)]
+        # jz-rsa.c: clear, mode, E, N, M (most significant word first),
+        # pre-process, main run, the result least significant word first
+        qt.writel(RSA, qt.readl(RSA) & ~1)
+        qt.writel(RSA, qt.readl(RSA) | 1)
+        qt.writel(RSA, (qt.readl(RSA) | 1 << 7) if bits == 2048 else
+                  (qt.readl(RSA) & ~(1 << 7)))
+        for reg, v in ((0x04, e), (0x08, n), (0x0C, m)):
+            for w in words(v):
+                qt.writel(RSA + reg, w)
+        qt.writel(RSA, qt.readl(RSA) | 1 << 1)
+        pre = qt.readl(RSA) & 1 << 2
+        qt.writel(RSA, qt.readl(RSA) | 1 << 4)
+        main = qt.readl(RSA) & 1 << 5
+        r = 0
+        for i in range(k):
+            r |= qt.readl(RSA + 0x10) << (32 * i)
+        check('RSA-%d: both stages done' % bits, (pre, main), (4, 32))
+        check('RSA-%d: M^E mod N' % bits, r == pow(m, e, n), True)
+        qt.writel(RSA, 1 << 2 | 1 << 3 | 1 << 5 | 1 << 6)
+        check('RSA-%d: flags clear' % bits, qt.readl(RSA) & 0x6c, 0)
+
+
+def test_usbphy(qt):
+    print('OTG PHY registers')
+    qt.cmd('writeb 0x10060078 0x20')
+    qt.cmd('writeb 0x10060070 0x00')
+    check('cpm_usb.c tuning bits read back',
+          int(qt.cmd('readb 0x10060078').split()[1], 16), 0x20)
 
 
 # --- sound: PDMA, AIC, codec ----------------------------------------------
@@ -1260,11 +1474,25 @@ def main():
         test_rtc_efuse(qt)
         test_sadc(qt)
         test_sound(qt)
+        test_tcu_pwm(qt)
+        test_dtrng(qt)
+        test_aes(qt)
+        test_hash(qt)
+        test_rsa(qt)
+        test_usbphy(qt)
         qt.close()
         qt = QTest(a.qemu, 't41')
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
         test_pwm(qt)
+        test_dtrng(qt, CORE_INTC)
+        test_aes(qt, CORE_INTC)
+        test_hash(qt, CORE_INTC)
+        test_rsa(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't20')
+        test_aes(qt)
+        test_tcu_pwm(qt)
         qt.close()
 
         qt = QTest(a.qemu, 't31,sensor=gc2053')

@@ -21,6 +21,13 @@
  * common/reset.c: TDR = 2 at RTC/64, then a spin).  The kernels use
  * channels only for PWM: they count and flag here, without interrupts.
  *
+ * A channel's PWM pin (TCSR bit 7 enables it, bit 8 is the initial level,
+ * bit 9 shuts it down; OpenIPC's jz_tcu.c and the SDKs' sample_pwm) starts
+ * each period at the initial level and flips when the counter passes
+ * TDHR, until TDFR.  The read-only "pwmN" properties report the pin as
+ * "high/period" in counter ticks while the channel counts, "0" / "1" for
+ * a level that does not change, or "off" while the TCU does not drive it.
+ *
  * XBurst2 (T40, T41; property xburst2): TSR bit 16 does not stop the
  * watchdog, and TCSR bit 10 zeroes its counter (it reads back 0).  The
  * 4.4 kernels' watchdog driver stops "channel 16" through TSSR when it
@@ -35,6 +42,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -228,6 +237,31 @@ static void tcu_update_irq(IngenicTcuState *s)
     qemu_set_irq(s->irq[0], (p & 0x00010001) != 0);
     qemu_set_irq(s->irq[1], (p & 0x00020002) != 0);
     qemu_set_irq(s->irq[2], (p & 0x00fc00fc) != 0);
+}
+
+static void tcu_get_pwm(Object *obj, Visitor *v, const char *name,
+                        void *opaque, Error **errp)
+{
+    IngenicTcuState *s = INGENIC_TCU(obj);
+    int n = (uintptr_t)opaque;
+    TcuChannel *c = &s->ch[n];
+    bool initl = c->tcsr & (1u << 8);
+    bool counting = (s->ter & (1u << n)) && !(s->tsr & (1u << n));
+    uint32_t high;
+    g_autofree char *str = NULL;
+
+    if (!(c->tcsr & (1u << 7))) {
+        str = g_strdup("off");
+    } else if (!counting || (c->tcsr & (1u << 9)) || c->tdhr >= c->tdfr) {
+        /* stopped, shut down, or never reaching half: the initial level */
+        str = g_strdup(initl ? "1" : "0");
+    } else if (!c->tdhr) {
+        str = g_strdup(initl ? "0" : "1");  /* flipped from the start */
+    } else {
+        high = initl ? c->tdhr : c->tdfr - c->tdhr;
+        str = g_strdup_printf("%u/%u", high, c->tdfr);
+    }
+    visit_type_str(v, name, &str, errp);
 }
 
 /* --- OST ---------------------------------------------------------------- */
@@ -469,6 +503,12 @@ static void ingenic_tcu_init(Object *obj)
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
     }
     s->wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_timer_cb, s);
+    for (i = 0; i < NCH; i++) {
+        g_autofree char *name = g_strdup_printf("pwm%d", i);
+
+        object_property_add(obj, name, "str", tcu_get_pwm, NULL, NULL,
+                            (void *)(uintptr_t)i);
+    }
 }
 
 static const Property ingenic_tcu_props[] = {

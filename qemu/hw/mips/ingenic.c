@@ -176,6 +176,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IPU_BASE        0x13080000
 #define SADC_BASE       0x10070000
 #define IRQ_SADC        18
+#define USBPHY_BASE     0x10060000  /* the OTG PHY's own registers */
+#define DTRNG_BASE      0x10072000
+#define AES_BASE        0x13430000
+#define HASH_BASE       0x13480000
+#define RSA_BASE        0x134C0000
+#define IRQ_HASH        22
+#define IRQ_AES         23
+#define IRQ_DTRNG       34
 #define PWM_BASE        0x13460000  /* T41; the others use TCU channels */
 #define IRQ_IPU         6       /* Linux 14, "ipu" */
 
@@ -862,6 +870,7 @@ static void ingenic_init(MachineState *ms)
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *rom = g_new(MemoryRegion, 1);
     MemoryRegion *car = g_new(MemoryRegion, 1);
+    MemoryRegion *usbphy;
     const IngenicVariant *var;
     CPUMIPSState *env;
     DeviceState *dev, *gpio, *cpm, *pdma;
@@ -987,6 +996,7 @@ static void ingenic_init(MachineState *ms)
     /* TCU + watchdog */
     dev = qdev_new("ingenic-tcu");
     qdev_prop_set_bit(dev, "xburst2", ingenic_is_xburst2(info->soc));
+    object_property_add_child(OBJECT(ims), "tcu", OBJECT(dev));
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, TCU_BASE);
@@ -1152,6 +1162,31 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, PWM_BASE);
     }
+
+    /*
+     * The security blocks: AES on every part; HASH and the DTRNG from
+     * T21 on; RSA (polled) on T23, T31, T40 and T41.
+     */
+    sysbus_create_simple("ingenic-aes", AES_BASE, ingenic_irq(ims, IRQ_AES));
+    if (info->soc != INGENIC_T10 && info->soc != INGENIC_T20 &&
+        info->soc != INGENIC_T30) {
+        sysbus_create_simple("ingenic-hash", HASH_BASE,
+                             ingenic_irq(ims, IRQ_HASH));
+        sysbus_create_simple("ingenic-dtrng", DTRNG_BASE,
+                             ingenic_irq(ims, IRQ_DTRNG));
+        if (info->soc != INGENIC_T21) {
+            sysbus_create_simple("ingenic-rsa", RSA_BASE, NULL);
+        }
+    }
+
+    /*
+     * The OTG PHY's registers (byte-wide tuning bits the kernels set:
+     * cpm_usb.c, phy-ingenic-inno.c); nothing is polled, so storage.
+     */
+    usbphy = g_new(MemoryRegion, 1);
+    memory_region_init_ram(usbphy, NULL, "ingenic.usbphy", 0x1000,
+                           &error_fatal);
+    memory_region_add_subregion(sysmem, USBPHY_BASE, usbphy);
 
     dev = qdev_new("ingenic-efuse");
     qdev_prop_set_uint32(dev, ingenic_is_xburst2(info->soc) ?
