@@ -117,6 +117,9 @@ if old not in s:
 s = s.replace(old, """# qemu: the BSCALER test instead of the application
 /usr/bin/bscaler-test %s
 echo BSCTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 """ % phys, 1)
 open(p, 'w').write(s)

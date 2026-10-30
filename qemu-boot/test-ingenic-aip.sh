@@ -104,6 +104,9 @@ if old not in s:
 s = s.replace(old, """# qemu: the AIP test instead of the application
 /usr/bin/aip-test %s
 echo AIPTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 """ % phys, 1)
 open(p, 'w').write(s)

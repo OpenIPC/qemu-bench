@@ -299,8 +299,8 @@ int main(void)
     outx("checks=", checks);
     outx("fails =", fails);
     out(fails? "MXU3-RESULT: FAIL\n" : "MXU3-RESULT: PASS\n");
-    /* give the serial time to flush, then halt the machine */
-    for(volatile long k=0;k<2000000;k++){}
+    /* the UART sends at the line rate: let it drain, then halt */
+    sleep(2);
     reboot(0x4321fedc); /* RB_POWER_OFF */
     for(;;) pause();
     return 0;
