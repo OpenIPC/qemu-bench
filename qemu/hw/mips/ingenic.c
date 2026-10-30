@@ -137,6 +137,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define PDMA_BASE       0x13420000
 #define IRQ_AIC         1
 #define IRQ_PDMA        10
+#define DMIC_BASE       0x10034000  /* T31, T40 */
+#define IRQ_DMIC        12
 #define GMAC_BASE       0x134B0000
 #define OST_BASE        0x12000000
 #define DDR_PHY_BASE    0x13010000
@@ -1138,6 +1140,18 @@ static void ingenic_init(MachineState *ms)
                                 qdev_get_gpio_in_named(pdma, "drq", 7));
     qdev_connect_gpio_out_named(dev, "drq-loop", 0,
                                 qdev_get_gpio_in_named(pdma, "drq", 5));
+
+    /* the digital microphones of T31 and T40, on request line 13 */
+    if (info->soc == INGENIC_T31 || info->soc == INGENIC_T40) {
+        dev = qdev_new("ingenic-dmic");
+        object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, DMIC_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_DMIC));
+        qdev_connect_gpio_out_named(dev, "drq", 0,
+                                    qdev_get_gpio_in_named(pdma, "drq", 13));
+    }
 
     /* the auxiliary ADC (jz_adc_v13 / ingenic_adc_v13): /machine/sadc */
     dev = qdev_new("ingenic-sadc");
