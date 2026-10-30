@@ -274,8 +274,9 @@ fi
 for try in 1 2 3; do
     echo "== boot ($SOC, sensor=$SENSOR)${try#1}"
     rm -f "$OUT/console.log"
+    # shellcheck disable=SC2086  # QEMU_EXTRA: extra options, word-split
     "$QEMU" -M $SOC,sensor=$SENSOR$VARIANT,flash-file="$WORK/nor.bin" -m $RAM \
-        -display none -serial file:"$OUT/console.log" \
+        $QEMU_EXTRA -display none -serial file:"$OUT/console.log" \
         -monitor unix:"$WORK/mon.sock",server,nowait \
         -nic user,restrict=on -kernel "$KERNEL" \
         -drive if=sd,index=0,file="$WORK/sd.img",format=raw \

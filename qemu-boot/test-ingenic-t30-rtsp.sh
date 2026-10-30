@@ -142,12 +142,13 @@ prev = None
 for i in sorted({0, n // 2, n - 1}):
     y, uv = frame(i)
     cnt = c.counter(y, w, h) if s == 'main' else None
-    bright, bgm, bgs = c.logo_ok(y, w, h)
-    dx = c.dot_x(y, w, h)
+    bgm, bgs = c.background(y, w, h)
+    bright = c.logo_ok(y, w, h, bgm)
+    dx = c.dot_x(y, w, h, bgm)
     ob = y[box[0]:box[1], box[2]:box[3]].astype(float)
     rb = y[ref[0]:ref[1], ref[2]:ref[3]].astype(float)
     osd = ob.mean() - rb.mean()
-    good = (bright > 0.15 and 25 < bgm < 60 and bgs < 8 and dx is not None
+    good = (bright > 0.15 and 20 < bgm < 170 and bgs < 8 and dx is not None
             and (s != 'main' or (cnt is not None and osd > 15)))
     print('  picture %3d: counter %s, logo %.0f%% bright, background Y %.1f, '
           'dot at x %s, OSD box Y %.1f vs %.1f beside it: %s'

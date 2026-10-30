@@ -1122,6 +1122,81 @@ def test_isp_stats(qt):
           isp_bits(z1, 0, 21) > isp_bits(z0, 0, 21), True)
 
 
+def test_isp_stats_t21(qt):
+    """T21's statistics: AE 0x700, AWB 0x800, no enable bits (tisp_init)."""
+    print('ingenic-isp 3A statistics (t21, sensor=jxf37)')
+    AE, AWB, vic = ISP + 0x700, ISP + 0x800, 0x13310000
+    zb, hb, ab = 0x00600000, 0x00604000, 0x00610000
+    for blk in (AE, AWB):
+        qt.writel(blk + 0x04, 0xF001F001)
+        for i in range(4):
+            qt.writel(blk + 0x08 + 4 * i, 0x40404040)
+            qt.writel(blk + 0x18 + 4 * i, 0x24242424)
+    qt.writel(AE + 0x28, 0x0011991E)
+    for i in range(4):
+        qt.writel(AE + 0x2C + 4 * i, zb + 0x1000 * i)
+        qt.writel(AE + 0x3C + 4 * i, hb + 0x800 * i)
+        qt.writel(AWB + 0x3C + 4 * i, ab + 0x1000 * i)
+    qt.writel(AE + 0x4C, 0x33)
+    qt.writel(AWB + 0x4C, 3)
+    qt.writel(vic + 0x00, 1)
+    qt.writel(ISP + 0x80, 0xFFFFFFFF)
+    qt.step(41 * 1000 * 1000)
+    check('AE static, AE histogram and AWB: int_sta bits 16, 17, 18',
+          qt.readl(ISP + 0x84) & (7 << 16), 7 << 16)
+    idx = qt.readl(AE + 0x50)
+    zones = qt.read(zb + 0x1000 * ((idx >> 4) & 3), 225 * 16)
+    hist = qt.read(hb + 0x800 * (idx & 3), 0x400)
+    awb = qt.read(ab + 0x1000 * qt.readl(AWB + 0x50), 16)
+    check('histogram counts in 20 bits',
+          max(struct.unpack('<256I', hist)) <= 0xFFFFF, True)
+    z = zones[:16]
+    m = sum(isp_bits(z, b, 21) for b in (0, 21, 42)) / (64 * 36)
+    check('top left zone: the navy at a quarter scale (~1 of 255)',
+          0 < m < 2.5, True)
+    check('AWB zone: the count at bit 63, no IR field',
+          isp_bits(awb, 63, 13), 64 * 36)
+
+
+def test_isp_stats_apical(qt):
+    """The Apical AE histogram and AWB zones (T20, sensor=jxf22)."""
+    print('ingenic-isp-apical 3A statistics (t20)')
+    core, vic, irqb = 0x13380000, 0x13300000, 0x13320000
+    # slot 3 on event 11 (AE statistics), slot 4 on event 9 (AWB)
+    qt.writel(core + 0x84, 11 << 16)
+    qt.writel(core + 0x88, 9)
+    w, h, wr = 1920, 1080, core + 0xB00
+    qt.writel(wr + 0x04, w | h << 16)
+    qt.writel(wr + 0x08, 0x00400000)
+    qt.writel(wr + 0x88, 0x00400000 + w * h)
+    qt.writel(wr + 0x20, w)
+    qt.writel(wr + 0xA0, w)
+    qt.writel(wr + 0x80, 0x200 | 0x4D)
+    qt.writel(wr + 0x00, 0x200 | 0xD)
+    qt.writel(irqb + 0x14, 0x1FFFF)
+    qt.writel(vic, 1)
+    qt.step(61 * 1000 * 1000)
+    check('AE and AWB statistics: slots 3 and 4',
+          qt.readl(core + 0xA0) & (3 << 3), 3 << 3)
+
+    def bin_count(v):
+        e, m = (v >> 12) & 0xF, v & 0xFFF
+        return m if not e else (m | 0x1000) << (e - 1)
+    total = sum(bin_count(qt.readl(core + 0x10000 + 4 * i))
+                for i in range(256))
+    check('histogram: every pixel counted once',
+          abs(total - w * h) < w * h // 50, True)
+    z0 = qt.readl(core + 0x8740)
+    check('AWB zone 0: navy under daylight raw, B/G > R/G',
+          (z0 >> 16) & 0xFFF > z0 & 0xFFF, True)
+    check('AWB zone 0: its weight', qt.readl(core + 0x8744),
+          (w // 15) * (h // 15) & 0xFFFF)
+    qt.qom_set('/machine/isp', 'light-r', 1100)
+    qt.step(40 * 1000 * 1000)
+    check('a redder light: a higher R/G in zone 0',
+          qt.readl(core + 0x8740) & 0xFFF > z0 & 0xFFF, True)
+
+
 ISP_LAYOUTS = {
     # en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
     # vic status, vic clear
@@ -1269,6 +1344,34 @@ def test_ipu(qt, soc):
         check('IRQ_EN off drops it', (qt.readl(INTC + 0x00) >> 6) & 1, 0)
     qt.writel(ipu + 0x74, 1 << 3)
     check('reset clears the channel', qt.readl(ipu + 0x11C), 0)
+    # CSC to HSV (D_FMT 0x4, ipu_csc_nv12_to_hsv): a grey pixel pair and a
+    # pure red pair (Y 81 Cb 90 Cr 240 is BT.601 red)
+    w, h, out = 4, 2, 0x00420000
+    qt.write(bg, bytes([128, 128, 81, 81] * 2) + bytes([128, 128, 90, 240]))
+    qt.writel(ipu + 0x74, 1 << 3)
+    qt.writel(ipu + 0x18, w << 16 | h)
+    qt.writel(ipu + 0x0C, bg)
+    qt.writel(ipu + 0x10, bg + w * h)
+    qt.writel(ipu + 0x1C, w)
+    qt.writel(ipu + 0x20, w << 16 | w)
+    qt.writel(ipu + 0x08, 0x4)
+    qt.writel(ipu + 0x24, out + 2 * w * h)             # S
+    qt.writel(ipu + 0x2C, w)
+    qt.writel(ipu + 0xB4, out)                         # H
+    qt.writel(ipu + 0xB8, 2 * w)
+    qt.writel(ipu + 0x30, out + 3 * w * h)             # V
+    qt.writel(ipu + 0x34, w)
+    qt.writel(ipu + 0x12C, 1 << 20)
+    qt.writel(ipu + 0x74, 1)
+    qt.step(200 * 1000)
+    hp = struct.unpack('<4H', qt.read(out, 8))
+    sp = tuple(qt.read(out + 2 * w * h, 4))
+    vp = tuple(qt.read(out + 3 * w * h, 4))
+    check('HSV: grey has no saturation', (sp[0], sp[1]), (0, 0))
+    check('HSV: grey V is its level', vp[0], 130)
+    check('HSV: red hue about 0', min(hp[2], 360 - hp[2]) <= 3, True)
+    check('HSV: red saturated and bright', (sp[2] > 240, vp[2] > 240),
+          (True, True))
 
 
 def test_rtc_efuse(qt, rtc=RTC):
@@ -1377,6 +1480,12 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp_stats(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't21,sensor=jxf37')
+        test_isp_stats_t21(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't20,sensor=jxf22')
+        test_isp_stats_apical(qt)
         qt.close()
         for soc in ISP_LAYOUTS:
             qt = QTest(a.qemu, soc)

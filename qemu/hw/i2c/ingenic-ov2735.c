@@ -8,6 +8,9 @@
  * takes 0x05 as an OV2735 and 0x06 or 0x07 as an OV2735B (the "rev"
  * property, default 0x07).  Everything else is RAM, so the drivers' init
  * tables run; the ID registers keep their values whatever is written.
+ * ov2735_exposure() decodes the exposure sensor_ov2735b_t30.ko writes:
+ * page 1, rows in 0x03:0x04, analogue gain x16 in 0x24 (its again LUT:
+ * 0x10 = 1x .. 0xF8 = 15.5x), each latched by 0x01 = 1.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -16,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/ingenic-sensor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -53,6 +57,20 @@ static uint8_t ov_read(IngenicOv2735State *s, uint8_t r)
         }
     }
     return s->regs[s->page % OV_PAGES][r];
+}
+
+bool ov2735_exposure(Object *sensor, IngenicSensorExposure *e)
+{
+    IngenicOv2735State *s = (IngenicOv2735State *)
+        object_dynamic_cast(sensor, TYPE_INGENIC_OV2735);
+
+    if (!s) {
+        return false;
+    }
+    e->lines = s->regs[1][0x03] << 8 | s->regs[1][0x04];
+    e->gain = s->regs[1][0x24] * 64;
+    e->gain = e->gain ? e->gain : 1024;
+    return true;
 }
 
 static int ov_event(I2CSlave *i2c, enum i2c_event event)
