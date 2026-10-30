@@ -71,6 +71,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
+| 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12 (`/machine/dmic`) | `ingenic-dmic` |
 | 0x13460000 | T41: PWM controller, 8 channels (`/machine/pwm`) | `ingenic-pwm` |
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
 | 0x12660000 | XBurst2 on-chip RAM (64 KiB) | RAM |
@@ -79,7 +80,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 
 Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
 unimplemented device, logged with `-d unimp`). Interrupt numbers are the
-same on every part: AIC 1, SFC 7, PDMA 10, GPIO A 17 (B 16, C 15, D 14), OTG 21,
+same on every part: AIC 1, SFC 7, PDMA 10, DMIC 12, GPIO A 17 (B 16, C 15, D 14), OTG 21,
 SADC 18, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
 ISP 29, VIC 30, AVPU 62 (Linux numbers are these + 8: the ISP's 37 and
 38, the AVPU's 70).
@@ -603,12 +604,13 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   `qom-get /machine/pwm chan2` reads a pin as `high/period` cycles or a
   fixed `0`/`1`. The other parts' PWM is the TCU's channels.
 
-### Sound: `ingenic-aic` and `ingenic-pdma`
+### Sound: `ingenic-aic`, `ingenic-dmic` and `ingenic-pdma`
 
 The vendor `audio.ko` (SDK `drivers/audio/oss2` on T10..T31,
-`oss3` on T23, T40 and T41; `/dev/dsp`, which libimp's IMP_AI and IMP_AO
-drive) plays and records through the AIC, its FIFOs moved by the PDMA in
-cyclic transfers.
+`oss3` on T23, T40 and T41; `/dev/dsp`, which libimp's IMP_AI, IMP_AO
+and IMP_DMIC drive) plays and records through the AIC, and on T40 also
+records through the DMIC, their FIFOs moved by the PDMA in cyclic
+transfers.
 
 - `ingenic-pdma`: the channels of `jz_dma.c` (3.10) and `ingenic_dma.c`
   (4.4) at 0x20 n: DSA, DTA, DTC, DRT, DCS (NDES, DES8, CDOA, AR, TT, HLT,
@@ -620,13 +622,21 @@ cyclic transfers.
   rings never end -- and one without sets TT and, with TIE, DIRQP. Request
   type 8 (AUTO) is a memory copy done at once; the others wait on the
   peripheral's request line for every access to it: the AIC's 6 (play),
-  7 (record) and 5 (loop record, the echo canceller's reference).
+  7 (record) and 5 (loop record, the echo canceller's reference), the
+  DMIC's 13.
 - `ingenic-aic`: AICFR (ENB, RST), AICCR (EREC/ERPL, the flushes, M2S,
   MONOCTR, TDMS/RDMS, ISS/OSS, TLDMS/ETFL, CHANNEL, PACK16), AICSR (levels,
   TUR/ROR), AICDR and AICLR over the hardware's FIFOs (64 to play, 32 to
   record and loop), and the codec at 0x10021000: bytes, one per word, read
-  back as written; its CSRR (0x110 bits 2:0) is the sample rate, 8 kHz
-  to 96 kHz. While ENB is set, frames move at that rate in virtual time:
+  back as written. The sample rates: on T23, T31, T40 and T41 the AIC is
+  the I2S master, and the drivers set the CPM's speaker clock
+  (I2SSPKCDR / I2STCDR 0x70) to 256 times the play rate and its
+  microphone clock (0x84) to 256 times the record rate, each when that
+  side starts; the AIC paces each side by its own clock (parent PLL x M /
+  N, a rate within 3 % of a standard one taken as that). On T10..T30, or
+  with that clock gated, the codec clocks the AIC and its CSRR (0x110
+  bits 2:0, 8 kHz to 96 kHz) is the rate. While ENB is set, frames move at
+  those rates in virtual time:
   played samples (one per frame with M2S, CHANNEL + 1 otherwise) leave the
   TX FIFO for the machine's audiodev as 16-bit stereo; the RX FIFO gets
   one sample per frame with MONOCTR (T21, T31: the right channel) or two:
@@ -636,10 +646,28 @@ cyclic transfers.
   FIFO gets what is played. Requests: TX while TDMS and the TX FIFO has
   room, RX while RDMS and it holds a sample, loop while TLDMS and it does.
 
+- `ingenic-dmic` (T31, T40): `audio_dmic.c` (oss3, T40's `audio.ko` with
+  `dmic_enable=1`) and `devices/dmic` (oss2, T31, behind
+  `CONFIG_JZ_TS_DMIC`, off in the shipped kernels). CR0's enable, rate (8,
+  16, 48 kHz), microphone count and PACK_EN (two 16-bit samples to a FIFO
+  entry, the earlier in bits 15:0); a 64-entry FIFO read at DR; FTHR's
+  RDMS raises request 13 while it holds an entry; FSR's level and
+  FULL/EMPTY, INTCR's flags under IMR (the drivers mask them all). Every
+  microphone hears a sine of `-global ingenic-dmic.tone-hz=N` (1 kHz).
+  T41's DMIC (0x134D0000, another block) is disabled in its device tree;
+  the other parts' builds drive none.
+
 `-audiodev wav,id=snd,path=out.wav -M t31,audiodev=snd` records what the
-guest plays. DMIC (0x134D0000) is not modelled: the OpenIPC T10..T31
-builds of `audio.ko` have only its stubs, T40's drives one only with
-`dmic_enable=1`, and T41's device tree disables it.
+guest plays.
+
+On T41 (4.4, `ingenic_uart.c`), heavy console output from a program
+while another core writes to the console too can stop the console for
+good: the driver's interrupt handler sends and stops the transmitter
+without the port lock, racing `start_tx` on the other core, which then
+leaves bytes queued with the THR interrupt off. The UART model is idle
+and correct (THRE set, the interrupt armed on IER's 0 -> 1 edge); with
+`maxcpus=1` the same output goes through. `test-ingenic-audio.sh` writes
+its recording to a file and dumps it from the shell for that reason.
 
 ### The image pipeline: `sensor=` and `ingenic-isp`
 
@@ -925,7 +953,8 @@ teardown, so the verdict comes first.
 | OpenIPC `t30` + the T30 SDK's `tx-isp-t30.ko`, `sensor=ov2735b` | `t30` | `-kernel` + NOR root | 1920x1080 and 640x360 (`test-ingenic-isp.sh --soc t30 --isp-ko ...`) |
 | T30X SDK 1.0.5 full image (8 MiB), `sensor=jxf22` | `t30,variant=t30x -m 128M` | flash, user net | vendor kernel and modules, sample-RTSPServer: /main 1920x1080 and /second 640x360 H.265 over RTSP/TCP, 200 pictures each decoded without errors, the scene and the IPU's timestamp OSD (`test-ingenic-t30-rtsp.sh`) |
 | OpenIPC `t20`, `t21`, `t23`, `t30` libimp | own | `-kernel`, `test-ingenic-vpu-feed.py` | libimp's H.264 (fixed QP; CBR on T21/T23/T30) and JPEG encoders, T30's H.265: streams ffmpeg decodes with `-err_detect explode`, PSNR against the source picture |
-| OpenIPC `t31` (its `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | `t31` / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh [--soc t41]` | IMP_AI records 16 kHz mono: the 1 kHz tone (FFT peak 1000.0 Hz, rms 5793); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz) |
+| OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` (their `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | own / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh --soc <soc>` | IMP_AI records 16 kHz mono: the 1 kHz tone on all eight (FFT peak 1000.0 Hz; rms 5793, 11585 on T10, T20, T30); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz), 1.08 s on T21: the DMA plays at 16 kHz, but its driver disables the stream right after the last write and its flush discards the ~0.8 s still queued (T20, built from the same source, waits first; why is open); `--rate 8000 --play-rate 16000` (two clocks): 440.0 Hz on T10, T23, T31, T40 |
+| OpenIPC `t40`, `audio.ko dmic_enable=1` + T40 SDK `libimp.a` | `t40` | `test-ingenic-audio.sh --soc t40 --dmic` | IMP_DMIC records 16 kHz: the DMIC's 1.5 kHz tone (peak 1500.0 Hz, rms 5793), 4 runs of 4 |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
@@ -935,7 +964,10 @@ poll, the MSCA FIFOs and a frame painted into a queued buffer under
 `clock_step`, on T31 and through the T21, T23, T40 and T41 layouts, and
 on T20 and T10 the Apical slots, a DMA writer's bank and a dropped frame;
 and sound: a PDMA memory copy with its interrupt, a cyclic record ring
-filled with the tone at 16 kHz and a play ring drained at that rate.
+filled with the tone at 16 kHz and a play ring drained at that rate, the
+DMIC's packed samples on request 13 and its FIFO filling without DMA,
+and the AIC playing at the CPM's 48 kHz speaker clock over the codec's
+16 kHz.
 
 ## Not modelled
 
@@ -944,7 +976,8 @@ its Apical base; above), T40's second pipe and VIC1/VIC2, the 3A
 statistics of T21 and the Apical parts, AE1, AF, ADR, defog and WDR
 statistics, the VPU's TLB (libimp addresses the engine
 physically), the T30 NCU/PP,
-the IPU's HSV output, the AIP, DMIC, the codec's analogue side (gains,
+the IPU's HSV output, the AIP, T41's DMIC, the DMIC's voice trigger, the
+codec's analogue side (gains,
 mutes: storage), PDMA transfers for peripherals other than the AIC, SSI,
 the TCU channels' PWM output
 and the RISC-V cores of T40/T41 read as zero or as storage.
