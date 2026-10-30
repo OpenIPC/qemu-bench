@@ -1050,6 +1050,74 @@ if ! grep -q "'grainmedia.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "  hw/arm/meson.build: added grainmedia.c"
 fi
 
+# Ingenic T-series: little-endian XBurst MIPS camera SoCs (hw/mips/ingenic.c),
+# the one non-ARM family.  It shares the LZMA decoder with Novatek.  Same
+# guarded appends as the ARM families, for a fresh tree and an existing one.
+mkdir -p "$QEMU_DIR/include/hw/mips"
+for f in $(cd qemu && find hw include -name 'ingenic*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
+cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/nvt-lzma.h   "$QEMU_DIR/include/hw/arm/"
+if ! grep -q "^config INGENIC$" "$QEMU_DIR/hw/mips/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/mips/Kconfig" <<'KCONFIG'
+
+config INGENIC
+    bool
+    default y
+    depends on MIPS && !MIPS64 && TCG
+    select SERIAL_MM
+    select UNIMP
+    select SSI
+    select SSI_M25P80
+    select SD
+    select I2C
+    select USB_DWC2
+    select SDHCI
+    select BITBANG_I2C
+KCONFIG
+    echo "  hw/mips/Kconfig: added INGENIC"
+fi
+for sym in USB_DWC2 SDHCI BITBANG_I2C; do
+    if ! sed -n '/^config INGENIC$/,/^$/p' "$QEMU_DIR/hw/mips/Kconfig" | \
+            grep -q "select $sym\$"; then
+        sed -i "/^config INGENIC\$/,/^\$/{/select I2C\$/a\\    select $sym
+}" "$QEMU_DIR/hw/mips/Kconfig"
+        echo "  hw/mips/Kconfig: INGENIC now selects $sym"
+    fi
+done
+for f in $(cd qemu && find hw -name 'ingenic*.c' ! -path 'hw/mips/*' 2>/dev/null); do
+    d=$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: added $b"
+    fi
+done
+# the image sensors sensor= attaches (models shared with the ARM families)
+for b in galaxycore.c hisi-smartsens.c hisi-f37.c; do
+    if ! grep -q "CONFIG_INGENIC', if_true: files('$b')" \
+            "$QEMU_DIR/hw/i2c/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/i2c/meson.build"
+        echo "  hw/i2c/meson.build: added $b for INGENIC"
+    fi
+done
+# shared coders for the VPU (ingenic-vpu.c): H.264 slices, H.265 slices, JPEG
+for b in hantro-h264.c hevc-enc.c jpeg-enc.c; do
+    if ! grep -q "CONFIG_INGENIC', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for INGENIC"
+    fi
+done
+if ! grep -q "'ingenic.c'" "$QEMU_DIR/hw/mips/meson.build"; then
+    echo "mips_ss.add(when: 'CONFIG_INGENIC', if_true: files('ingenic.c', '../arm/nvt-lzma.c'))" \
+        >> "$QEMU_DIR/hw/mips/meson.build"
+    echo "  hw/mips/meson.build: added ingenic.c"
+fi
+
 # ── 4. Patch QEMU SD card model to accept 1.8V ─────────────────────────
 # The EV300 kernel DT forces UHS-I / HS200 1.8V signaling.  QEMU's SD
 # card model rejects 1.8V by default.  Patch it to accept 1.8V and
@@ -1067,15 +1135,16 @@ fi
 # ── 5. Build ────────────────────────────────────────────────────────────
 # arm-softmmu covers V1–V5 IPC and DVR/NVR (32-bit ARMv7-a / ARM926).
 # aarch64-softmmu adds Hi3798CV200 STB (Cortex-A53, ARMv8-a, 64-bit).
-echo "Building QEMU (arm + aarch64 targets)..."
+# mipsel-softmmu adds the Ingenic T-series (XBurst, little-endian MIPS32).
+echo "Building QEMU (arm + aarch64 + mipsel targets)..."
 cd "$QEMU_DIR"
 mkdir -p build && cd build
 # Reconfigure if the existing build was scoped to arm-softmmu only.
-if [ -f build.ninja ] && ! grep -q "aarch64-softmmu" config-host.mak 2>/dev/null; then
+if [ -f build.ninja ] && ! grep -q "mipsel-softmmu" config-host.mak 2>/dev/null; then
     rm -f config-host.mak
 fi
 if [ ! -f config-host.mak ]; then
-    ../configure --target-list=arm-softmmu,aarch64-softmmu --disable-docs
+    ../configure --target-list=arm-softmmu,aarch64-softmmu,mipsel-softmmu --disable-docs
 fi
 ninja -j$(nproc)
 
@@ -1083,3 +1152,4 @@ echo ""
 echo "Done! Verify:"
 echo "  ./qemu-src/build/qemu-system-arm     -machine help | grep hi3516"
 echo "  ./qemu-src/build/qemu-system-aarch64 -machine help | grep hi3798"
+echo "  ./qemu-src/build/qemu-system-mipsel  -machine help | grep ingenic"

@@ -74,6 +74,10 @@ jobs:
           for m in gm8135s gm8136 gm8136s; do
             ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
           done
+          # Ingenic T-series (hw/mips/ingenic.c), the mipsel target
+          for m in t10 t20 t21 t23 t30 t31 t40 t41; do
+            ./qemu-src/build/qemu-system-mipsel -machine help | grep -E "^$m "
+          done
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
@@ -202,11 +206,27 @@ jobs:
       - name: Grain Media devices (gm-spi020, gm-dmac, gm-intc, gm-timer, ...)
         run: python3 qemu/tests/test-grainmedia.py
 
+      # Ingenic: the mask ROM stand-in and cache-as-RAM, CPM PLL/divider
+      # handshakes in each SoC's encoding, the DDR init polls, the TCU's
+      # boot loader OST and watchdog, the system OST and the XBurst2
+      # global/core OSTs and CCU, the SFC v1 (PIO, DMA, erase/program) and
+      # v2 command table through a descriptor, GPIO, I2C, RTC, EFUSE,
+      # and migration of t31 and t41.
+      - name: Ingenic devices (ingenic-cpm, ingenic-sfc, ingenic-ost, ...)
+        run: python3 qemu/tests/test-ingenic.py
+
       - name: Upload QEMU binary
         uses: actions/upload-artifact@v4
         with:
           name: qemu-arm
           path: qemu-src/build/qemu-system-arm
+          retention-days: 1
+
+      - name: Upload QEMU binary (mipsel)
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-mipsel
+          path: qemu-src/build/qemu-system-mipsel
           retention-days: 1
 
       - name: Upload IVE test initramfs
@@ -1342,6 +1362,44 @@ jobs:
       - name: Boot to login, DHCP over the FTGMAC100, JFFS2 on the NOR
         timeout-minutes: 6
         run: bash qemu-boot/test-grainmedia-boot.sh --soc ${{ matrix.soc }}
+
+  boot-ingenic:
+    name: Boot ${{ matrix.soc }} (${{ matrix.mode }})
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [t10, t20, t21, t23, t30, t31, t40]
+        mode: [kernel, flash]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0 curl
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-mipsel
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-mipsel
+
+      - name: Download OpenIPC firmware
+        run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
+
+      # flash: the release's SPL and U-Boot from the NOR, U-Boot's
+      # saveenv, then the kernel; kernel: -kernel with its root on the NOR
+      - name: Boot to login, DHCP over the GMAC, JFFS2 on the NOR
+        timeout-minutes: 8
+        run: >-
+          bash qemu-boot/test-ingenic-boot.sh --soc ${{ matrix.soc }}
+          --mode ${{ matrix.mode }} --net
 
   boot-hi3516cv610:
     name: Boot hi3516cv610

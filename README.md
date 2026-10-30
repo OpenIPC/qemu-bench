@@ -17,15 +17,18 @@ desk. Vendor families covered:
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
   FH8626V100, FH8632
 - **Grain Media** GM8135S, GM8136, GM8136S
+- **Ingenic** T10, T20, T21, T23, T30, T31 (XBurst1) and T40, T41 (XBurst2) —
+  the one MIPS family
 
 The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
-Builds two QEMU targets:
+Builds three QEMU targets:
 - `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
+- `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (88 total)
+## Supported Machines (96 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -378,6 +381,40 @@ OpenIPC's `gm8136` and `gm8135` releases boot with `-kernel`
 and the JFFS2 overlay on the NOR. Map, boot chain and devices are in
 [docs/grainmedia.md](docs/grainmedia.md).
 
+### Ingenic T-series (`qemu-system-mipsel`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `t10` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (camera dump) | yes |
+| `t20` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (camera dump) | yes |
+| `t21` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (two camera dumps) | yes |
+| `t23` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC | yes |
+| `t30` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC | yes |
+| `t31` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (three camera dumps, Wyze Cam v3) | yes |
+| `t40` | 2 × XBurst2, 128 MB | core INTC + CCU | 4.4.94 OpenIPC, vendor (T40XP camera dump) | yes |
+| `t41` | 2 × XBurst2, 128 MB | core INTC + CCU | 4.4.94 vendor SDK image | yes |
+
+Ingenic's camera SoCs, in `hw/mips/ingenic.c`: little-endian MIPS32
+XBurst cores (two CPU models of our own, `qemu/patches/0015`) with the
+CPM's PLLs and dividers in each SoC's encoding, the INTC (XBurst1) or the
+per-core INTC, OSTs and CCU that start the second core (XBurst2), the TCU
+with its watchdog and the boot loaders' OST, the SFC v1/v2 flash
+controller (PIO, DMA, the v2 command table and descriptors), jzmmc SD
+hosts (SDHCI on XBurst2), the Synopsys GMAC, DW I2C, DWC2 USB, GPIO, RTC
+and EFUSE. A NOR image boots the way the mask ROM does -- the SPL in a
+cache-as-RAM window (`qemu/patches/0016`), then the SPL's own PLL and DDR
+init, U-Boot from flash 0x6800 and the kernel:
+`-M t31,flash-file=dump.bin -nic user`. Flash writes go back to the
+file. `-kernel` takes a uImage the way `bootm` passes it (argc/argv, and
+the `mem=` the kernels size memory by). All seven OpenIPC releases boot
+both ways (`qemu-boot/test-ingenic-boot.sh --mode kernel|flash`) to a
+login prompt with a DHCP lease, U-Boot's environment and the JFFS2
+overlay written to the NOR; so do the camera dumps and the T41 SDK
+image. Sound runs too: the AIC and codec with the PDMA's cyclic
+transfers, recording a test tone and playing to `-audiodev`
+(`qemu-boot/test-ingenic-audio.sh`). Map, boot chain and devices are in
+[docs/ingenic.md](docs/ingenic.md).
+
 ### Novatek NT9856x family (`qemu-system-arm`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |
@@ -608,6 +645,22 @@ qemu/
 ├── hw/watchdog/fh-wdt.c         # DW watchdog
 ├── hw/misc/fh-efuse.c           # eFuse controller
 ├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
+├── hw/mips/ingenic.c            # Ingenic T10..T41 machines, mask ROM stand-in, bootm
+├── hw/misc/ingenic-cpm.c        # CPM: PLL lock, divider busy, per-SoC PLL encodings
+├── hw/intc/ingenic-intc.c       # XBurst1 INTC
+├── hw/intc/ingenic-ccu.c        # XBurst2 CCU + per-core INTC, second core start
+├── hw/timer/ingenic-ost.c       # System OST; XBurst2 global and core OSTs
+├── hw/timer/ingenic-tcu.c       # TCU, watchdog (reboot), the boot loaders' OST
+├── hw/ssi/ingenic-sfc.c         # SFC v1/v2: phases, PIO, DMA, command table
+├── hw/sd/ingenic-msc.c          # jzmmc SD host, SDMA descriptors, card detect GPIO
+├── hw/net/ingenic-gmac.c        # Synopsys GMAC 3.x, 8-word descriptors, IP101G PHY
+├── hw/i2c/ingenic-i2c.c         # DW_apb_i2c master
+├── hw/gpio/ingenic-gpio.c       # GPIO with the shadow port
+├── hw/misc/ingenic-ddr.c        # DDRC/PHY: the DDR init polls
+├── hw/rtc/ingenic-rtc.c         # RTC / hibernation (power-off)
+├── hw/misc/ingenic-efuse.c      # EFUSE, blank
+├── hw/audio/ingenic-aic.c       # AIC (I2S) FIFOs + internal codec: tone in, audiodev out
+├── hw/dma/ingenic-pdma.c        # PDMA: descriptor rings, AUTO copies, request lines
 ├── hw/misc/gm-pmu.c             # FTPMU010: chip ID, strap, PLLs -> PCLK, FCS interrupt
 ├── hw/misc/gm-ddrc.c            # FTDDRC010: init done, DRAM size code
 ├── hw/intc/gm-intc.c            # FTINTC030 interrupt controller (per-CPU targets)
@@ -719,6 +772,7 @@ qemu-boot/
 ├── test-fullhan-boot.sh         # Fullhan OpenIPC kernel: login, DHCP, JFFS2 written back
 ├── test-grainmedia-boot.sh      # Grain Media OpenIPC kernel: login, DHCP, JFFS2 written back
 ├── test-grainmedia-rtsp.sh      # Grain Media camera dump from flash: its RTSP H.264 decodes
+├── test-ingenic-boot.sh         # Ingenic OpenIPC: -kernel or SPL+U-Boot from flash; login, DHCP, JFFS2
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
 ├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM/crypto, for the tests below
@@ -755,6 +809,7 @@ docs/
 ├── anyka.md                     # AK39xx: L2 buffer, mask ROM, boot NOR
 ├── fullhan.md                   # Fullhan: generations, mask ROM, SPIC, DMACs
 ├── grainmedia.md                # Grain Media GM813x: map, nsboot boot chain, video, audio, MJPEG
+├── ingenic.md                   # Ingenic T-series: map, CPUs, mask ROM and cache-as-RAM, devices
 ├── sigmastar.md                 # SigmaStar/MStar infinity2m/infinity3: RIU banks, boot chain
 ├── novatek.md                   # NT9856x, NT98533, NT98332: DT, loader stand-in, media
 ├── ive-registers.md             # IVE register map (from live EV300 capture)

@@ -96,12 +96,15 @@ enum {
     CTX_SAO_MERGE = 84,
     CTX_SAO_TYPE = 85,
     CTX_MERGE_IDX = 86,         /* P slices */
-    CTX_NUM = 87
+    CTX_SPLIT_TRAFO = 87,       /* 3 */
+    CTX_TRANSFORM_SKIP = 90,    /* 2: luma, chroma */
+    CTX_NUM = 92
 };
 
-/* initValue, in the order above: initType 0 (I slices) and 1 (P slices
- * with cabac_init_flag 0, which is what the library's P slice headers say) */
-static const uint8_t hevc_init[2][CTX_NUM] = { {
+/* initValue, in the order above: initType 0 (I slices), 1 (P slices
+ * with cabac_init_flag 0, which is what the XM libraries' P slice headers
+ * say) and 2 (P slices with cabac_init_flag 1: Ingenic's libimp) */
+static const uint8_t hevc_init[3][CTX_NUM] = { {
     139, 141, 157,                                      /* split_cu_flag */
     184,                                                /* part_mode */
     184,                                                /* prev_intra_luma */
@@ -121,6 +124,8 @@ static const uint8_t hevc_init[2][CTX_NUM] = { {
     153,                                                /* sao_merge */
     200,                                                /* sao_type_idx */
     154,                                                /* (merge_idx) */
+    153, 138, 138,                                      /* split_transform */
+    139, 139,                                           /* transform_skip */
 }, {
     107, 139, 126,
     154,
@@ -141,6 +146,30 @@ static const uint8_t hevc_init[2][CTX_NUM] = { {
     153,
     185,
     122,
+    124, 138, 94,
+    139, 139,
+}, {
+    107, 139, 126,
+    154,
+    183,
+    152,
+    153, 111,
+    149, 92, 167, 154,
+    125, 110, 124, 110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111,
+    79, 108, 123, 93,
+    125, 110, 124, 110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111,
+    79, 108, 123, 93,
+    154, 196, 167, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136,
+    122, 169, 208, 166, 167, 154, 152, 167, 182,
+    107, 167, 91, 107, 107, 167,
+    154, 154,
+    197, 185, 201,
+    134,
+    153,
+    160,
+    137,
+    224, 167, 122,
+    139, 139,
 } };
 
 typedef struct Cabac {
@@ -276,11 +305,16 @@ static void cabac_egk(Cabac *c, uint32_t v, int k)
 
 /* residual_coding() of a TB whose only non-zero coefficient is DC: last
  * position (0, 0), one level */
-static void residual_dc(Cabac *c, int level, int log2, bool chroma)
+static void residual_dc(Cabac *c, int level, int log2, bool chroma,
+                        bool transform_skip)
 {
     const int a = abs(level);
     int last_ctx;
 
+    if (transform_skip && log2 == 2) {
+        /* transform_skip_enabled_flag: 4x4 TBs say they are transformed */
+        cabac_decision(c, CTX_TRANSFORM_SKIP + chroma, 0);
+    }
     if (chroma) {
         last_ctx = 15;
     } else {
@@ -322,12 +356,16 @@ typedef struct Pic {
     int *cxmap, *cymap;             /* chroma likewise (source pairs) */
     bool qp_delta_coded;            /* in the current quantization group */
     int qp;                         /* the QP the CUs are quantized with */
-    int qp_prev;                    /* qPY_PREV: the last group's QpY */
+    int qp_prev;                    /* QpY of the last CU decoded */
+    int qg_pred;                    /* qPY_PRED of the current group */
+    int log2_ctb, log2_qg;          /* CTB and quantization group sizes */
+    int cqp_offset;                 /* pps_cb_qp_offset = pps_cr_qp_offset */
     const HevcEncRef *ref;          /* a P slice's reference, or NULL */
     uint8_t *cy, *ccb, *ccr;        /* the source scaled to w x h */
     uint8_t *skip;                  /* per 8x8 CU: skipped (else intra) */
     uint8_t *cuqp;                  /* per 8x8 CU: its QpY */
     int skip_thr;                   /* skip_threshold() at qp */
+    const HevcEncParams *prm;
 } Pic;
 
 static void hevc_enc_ref_clear(HevcEncRef *r);
@@ -589,7 +627,7 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
     const int r_y = dc_residual(lev_y, qp, 3);
 
     /* chroma, 4x4 at (x0/2, y0/2) */
-    const int qpc = chroma_qp(qp);
+    const int qpc = chroma_qp(MIN(MAX(qp + p->cqp_offset, 0), 57));
     for (comp = 0; comp < 2; comp++) {
         const uint8_t *plane = comp ? p->cr : p->cb;
         const uint8_t *src = comp ? p->ccr : p->ccb;
@@ -655,7 +693,8 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
                 memcpy(&p->cr[o], &p->ref->cr[o], 4);
             }
             p->skip[cu] = 1;
-            p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qp_prev;
+            p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
+            p->qp_prev = p->cuqp[cu];
             p->done[cu] = 1;
             return;
         }
@@ -672,22 +711,26 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
     cabac_bypass(c, 0);
     cabac_decision(c, CTX_CHROMA_MODE, 0);              /* DM */
 
-    /* transform_tree: no split; cbf_cb, cbf_cr, cbf_luma */
+    /* transform_tree: no split (said when the SPS allows one: ctxInc
+     * 5 - log2TrafoSize); cbf_cb, cbf_cr, cbf_luma */
+    if (p->prm->trafo_depth_intra > 0) {
+        cabac_decision(c, CTX_SPLIT_TRAFO + 5 - 3, 0);
+    }
     cabac_decision(c, CTX_CBF_CHROMA + 0, lev_c[0] != 0);
     cabac_decision(c, CTX_CBF_CHROMA + 0, lev_c[1] != 0);
     cabac_decision(c, CTX_CBF_LUMA + 1, lev_y != 0);
-    /* cu_qp_delta, once per quantization group (the CTB): from the last
-     * group's QP (the slice's at first) to ours */
+    /* cu_qp_delta, once per quantization group: from the group's
+     * predicted QP (8.6.1) to ours */
     if ((lev_y || lev_c[0] || lev_c[1]) && !p->qp_delta_coded) {
-        cu_qp_delta(c, p->qp - p->qp_prev);
+        cu_qp_delta(c, p->qp - p->qg_pred);
         p->qp_delta_coded = true;
     }
     if (lev_y) {
-        residual_dc(c, lev_y, 3, false);
+        residual_dc(c, lev_y, 3, false, p->prm->transform_skip);
     }
     for (comp = 0; comp < 2; comp++) {
         if (lev_c[comp]) {
-            residual_dc(c, lev_c[comp], 2, true);
+            residual_dc(c, lev_c[comp], 2, true, p->prm->transform_skip);
         }
     }
 
@@ -706,7 +749,8 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
             }
         }
     }
-    p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qp_prev;
+    p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
+    p->qp_prev = p->cuqp[cu];
     p->done[cu] = 1;
 }
 
@@ -896,7 +940,7 @@ static void deblock(Pic *p, const HevcEncParams *prm)
                 if ((dir ? by : bx) & 1) {
                     continue;
                 }
-                const int qpc = chroma_qp(qpl);
+                const int qpc = chroma_qp(qpl + prm->chroma_qp_offset);
                 const int tcc = tc_table[MIN(MAX(qpc + 2 +
                                           2 * prm->tc_offset_div2, 0), 53)];
                 const int o = by * 4 * cs + bx * 4;
@@ -912,6 +956,21 @@ static void deblock(Pic *p, const HevcEncParams *prm)
 static void quadtree(Pic *p, Cabac *c, int x0, int y0, int log2, int qp,
                      bool p_slice)
 {
+    if (log2 == MAX(p->log2_qg, 3)) {
+        /*
+         * A quantization group starts (8.6.1): qPY_PRED from the QpY left
+         * of and above it where those are in this CTB, qPY_PREV (the last
+         * CU's QpY, the slice QP at first) elsewhere.
+         */
+        const int cw = p->w >> 3, m = (1 << p->log2_ctb) - 1;
+        const int a = (x0 & m) ? p->cuqp[(y0 >> 3) * cw + (x0 >> 3) - 1]
+                               : p->qp_prev;
+        const int b = (y0 & m) ? p->cuqp[((y0 >> 3) - 1) * cw + (x0 >> 3)]
+                               : p->qp_prev;
+
+        p->qg_pred = (a + b + 1) >> 1;
+        p->qp_delta_coded = false;
+    }
     if (log2 == 3) {
         encode_cu(p, c, x0, y0, qp, p_slice);
         return;
@@ -951,7 +1010,10 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
     int x, yy;
     Pic p = { .w = w, .h = h, .sy = y, .suv = uv, .sw = sw, .sh = sh,
               .sys = ys, .scs = cs, .qp = MIN(qp, HEVC_QP_MAX),
-              .qp_prev = qp };
+              .qp_prev = qp, .log2_ctb = prm->log2_ctb,
+              .cqp_offset = prm->chroma_qp_offset,
+              .log2_qg = prm->log2_qg ? prm->log2_qg : prm->log2_ctb,
+              .prm = prm };
     g_autofree uint8_t *ry = g_malloc0((size_t)w * h);
     g_autofree uint8_t *rcb = g_malloc0((size_t)w * h / 4);
     g_autofree uint8_t *rcr = g_malloc0((size_t)w * h / 4);
@@ -988,7 +1050,8 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
     p.skip_thr = skip_threshold(p.qp);
 
     Cabac c;
-    cabac_init(&c, qp, p_slice ? 1 : 0, rbsp, rbsp + cap);
+    cabac_init(&c, qp, p_slice ? (prm->cabac_init_flag ? 2 : 1) : 0, rbsp,
+               rbsp + cap);
     const int ctbw = (w + ctb - 1) / ctb, ctbh = (h + ctb - 1) / ctb;
     for (yy = 0; yy < ctbh; yy++) {
         for (x = 0; x < ctbw; x++) {
@@ -1001,13 +1064,11 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
                     cabac_decision(&c, CTX_SAO_MERGE, 0);
                 }
                 cabac_decision(&c, CTX_SAO_TYPE, 0);
-                cabac_decision(&c, CTX_SAO_TYPE, 0);
+                if (!prm->sao_luma_only) {
+                    cabac_decision(&c, CTX_SAO_TYPE, 0);
+                }
             }
-            p.qp_delta_coded = false;
             quadtree(&p, &c, x * ctb, yy * ctb, prm->log2_ctb, qp, p_slice);
-            if (p.qp_delta_coded) {
-                p.qp_prev = p.qp;
-            }
             if (x == ctbw - 1 && yy == ctbh - 1) {
                 cabac_flush(&c);
             } else {
@@ -1160,9 +1221,9 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
     bw_ue(&b, 0);
     bw_ue(&b, 0);
     bw_ue(&b, 0);                           /* min CB 8 */
-    bw_ue(&b, prm->log2_ctb - 3);           /* CTB 16 or 32 */
+    bw_ue(&b, prm->log2_ctb - 3);           /* CTB 16, 32 or 64 */
     bw_ue(&b, 0);                           /* min TB 4 */
-    bw_ue(&b, prm->log2_ctb - 2);           /* max TB: the CTB */
+    bw_ue(&b, MIN(prm->log2_ctb, 5) - 2);   /* max TB: the CTB, 32 at most */
     bw_ue(&b, 0);                           /* hierarchy depth inter */
     bw_ue(&b, 0);                           /* hierarchy depth intra */
     bw_bits(&b, 0, 1);                      /* scaling lists */
@@ -1206,9 +1267,9 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
     bw_bits(&b, 0, 1);                      /* constrained intra */
     bw_bits(&b, 0, 1);                      /* transform skip */
     bw_bits(&b, 1, 1);                      /* cu_qp_delta, */
-    bw_ue(&b, 0);                           /*   per CTB */
-    bw_se(&b, 0);
-    bw_se(&b, 0);
+    bw_ue(&b, prm->log2_qg ? prm->log2_ctb - prm->log2_qg : 0); /* QG */
+    bw_se(&b, prm->chroma_qp_offset);       /* pps_cb_qp_offset */
+    bw_se(&b, prm->chroma_qp_offset);       /* pps_cr_qp_offset */
     bw_bits(&b, 0, 1);                      /* slice chroma qp offsets */
     bw_bits(&b, 0, 1);                      /* weighted pred */
     bw_bits(&b, 0, 1);                      /* weighted bipred */
@@ -1244,7 +1305,7 @@ slice:
         bw_bits(&b, 1, 1);                  /* the SPS's RPS */
     }
     if (prm->sao) {
-        bw_bits(&b, 3, 2);                  /* slice_sao_luma / chroma */
+        bw_bits(&b, prm->sao_luma_only ? 2 : 3, 2); /* slice_sao_luma/chroma */
     }
     if (p_slice) {
         bw_bits(&b, 0, 1);                  /* num_ref_idx_active_override */

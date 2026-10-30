@@ -10,15 +10,28 @@
 
 /*
  * What the vendor library's parameter sets choose, which the slice data
- * has to follow: the CTB size (TBs up to it, CUs always 8x8), SAO (coded
- * off in every CTB), the deblocking tc offset and VUI timing.
+ * has to follow: the CTB size (TBs up to it, CUs always 8x8), the
+ * cu_qp_delta group size, SAO (coded off in every CTB, for luma alone if
+ * the slices say so), the chroma QP offset, the deblocking offsets and
+ * VUI timing.
  */
 typedef struct HevcEncParams {
-    int log2_ctb;               /* 4 or 5 */
+    int log2_ctb;               /* 4, 5 or 6 */
+    int log2_qg;                /* the quantization group; 0: the CTB */
     bool sao;
+    bool sao_luma_only;         /* slice_sao_chroma_flag 0 */
+    int chroma_qp_offset;       /* pps_cb_qp_offset, the same for Cr */
     int beta_offset_div2;
     int tc_offset_div2;
     bool vui;
+    /* slice data only (hevc_enc_slice_data), what other libraries' SPS,
+     * PPS and slice headers say: max_transform_hierarchy_depth_intra (a
+     * split_transform_flag of 0 is coded when it is not 0),
+     * transform_skip_enabled_flag (4x4 TBs code transform_skip_flag 0),
+     * a P slice's cabac_init_flag (initType 2) */
+    int trafo_depth_intra;
+    bool transform_skip;
+    bool cabac_init_flag;
 } HevcEncParams;
 
 /* XM535 / XM533's library: CTB 16, no SAO; XM530V200's: CTB 32, SAO */
