@@ -202,12 +202,23 @@ static void *af_watch(void *arg)
     int i;
 
     for (i = 0; i < 12; i++) {
+#ifdef SNAP_T40
+        IMPISPAFMetricsInfo info;
+
+        usleep(500 * 1000);
+        memset(&info, 0, sizeof(info));
+        if (IMP_ISP_Tuning_GetAFMetricesInfo(IMPVI_MAIN, &info) == 0) {
+            printf("isp-snap: af metric %u alt %u\n", info.af_metrics,
+                   info.af_metrics_alt);
+        }
+#else
         unsigned int metric = 0;
 
         usleep(500 * 1000);
         if (IMP_ISP_Tuning_GetAFMetrices(&metric) == 0) {
             printf("isp-snap: af metric %u\n", metric);
         }
+#endif
     }
     return NULL;
 }

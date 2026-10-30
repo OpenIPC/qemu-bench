@@ -139,7 +139,8 @@ typedef struct IngenicIspLayout {
                                    Q10), for the trace; 0: none */
     uint8_t xstat;              /* the other Tiziano statistics (AE1, AF,
                                    ADR, defog; ingenic_isp_xstats()): 1
-                                   T31's, with WDR; 2 T23's, without */
+                                   T31's, with WDR; 2 T23's, without;
+                                   3 T40/T41's formats */
     /*
      * T40's second pipe (pipes 2): its channels 3..5, their enable and
      * FIFOs at pipe_ch past pipe 0's, its interrupt enable / clear /
@@ -151,6 +152,11 @@ typedef struct IngenicIspLayout {
     hwaddr pipe_ch, pipe_int, pipe_stat;
     uint8_t ivdc_bit;           /* T41's IVDC: frame start of a channel
                                    writing to the IVDC, in int_sta; 0: none */
+    /*
+     * a daylight white's raw R and B, per mille of G, where the tuning's
+     * AWB looks for it: the default light colour; 0: 550 / 600
+     */
+    uint16_t day_r, day_b;
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
@@ -254,7 +260,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         /* pipe 0's 3A as on T41 (tisp_ae_main_interrupt_static & co.) */
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
-        .wb = 0x4004,
+        .wb = 0x4004, .day_r = 460, .day_b = 550, .xstat = 3,
         /*
          * pipe 1 (the second sensor, IMPVI_SEC: tisp_sec_init,
          * tisp_channel_sec_*, tisp_ae_sec_*): ISR 0x72f10 reads its
@@ -296,7 +302,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          */
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
-        .wb = 0x4004,
+        .wb = 0x4004, .day_r = 460, .day_b = 550, .xstat = 3,
         /*
          * direct_mode: channel 0 is queued IVDC_Y / IVDC_UV; the ISR sends
          * the frame source its "buffer done" on int_sta bit 20 (the
@@ -353,6 +359,13 @@ struct IngenicIspState {
     IngenicIspChan ch[NUM_CH * MAX_PIPES];  /* pipe p's channel n: 3 p + n */
 
     IngenicIspPainter paint;
+    /*
+     * T40/T41's statistics RAMs read through ports (GSM, LCE): what
+     * this frame left in each, and where the next read of its data
+     * register is
+     */
+    uint32_t ram_gsm[2][256], ram_lce[1440], ram_lce_mean[45];
+    uint32_t port_pos[6];
 };
 
 /* --- FIFOs -------------------------------------------------------------- */
@@ -579,7 +592,8 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 
 typedef struct IspZone {
     uint64_t sum[3], cnt[3];    /* AE: dark, middle, bright */
-    uint64_t rgb[3], n;         /* AWB */
+    uint64_t rgb[3], n;         /* AWB, the quads the filter passes */
+    uint64_t urgb[3], un;       /* AWB, every quad (T40/T41's first record) */
 } IspZone;
 
 static void isp_bits(uint8_t *z, int bit, int len, uint64_t v)
@@ -659,12 +673,21 @@ static void awb_filter_load(IngenicIspState *s, hwaddr blk, AwbFilter *f)
     uint32_t r30 = ISP_REG(blk + 0x30), r34 = ISP_REG(blk + 0x34);
     uint32_t r38 = ISP_REG(blk + 0x38);
 
-    f->on = s->l->stat_gen != 2 && (r28 | r2c | r34 | r38);
+    f->on = r28 | r2c | r34 | r38;
     f->rg_min = r28 & 0xFFFF, f->rg_max = r28 >> 16;
     f->bg_min = r2c & 0xFFFF, f->bg_max = r2c >> 16;
     f->k_lo = r30 & 0xFFFF, f->b_lo = r30 >> 16;
     f->k_hi = r34 & 0xFFFF, f->b_hi = r34 >> 16;
-    f->y_lo = r38 & 0xFF, f->y_hi = (r38 >> 8) & 0xFF;
+    if (s->l->stat_gen == 2) {
+        /*
+         * tisp_awb_set_lum_th_freq: three luma thresholds in bytes 0..2
+         * (interpolated by EV), a frequency in byte 3; the window is the
+         * outer two
+         */
+        f->y_lo = r38 & 0xFF, f->y_hi = (r38 >> 16) & 0xFF;
+    } else {
+        f->y_lo = r38 & 0xFF, f->y_hi = (r38 >> 8) & 0xFF;
+    }
 }
 
 static bool awb_quad_valid(const AwbFilter *f, const int *q)
@@ -690,11 +713,17 @@ static bool awb_quad_valid(const AwbFilter *f, const int *q)
 /*
  * AE1 (T31, T23: the short exposure's AE, tisp_ae1_get_statistics /
  * ae1_interrupt_static / _hist on int_sta bits 28 and 29): AE0's block
- * again at AE0 + 0x800 (0xA800; system_reg_write_ae(2) latches it), its
- * banks set by tisp_init after AE0's, the same zone and histogram
- * formats.  In a linear (not WDR) mode it sees the frame AE0 does.
+ * again at AE0 + 0x800 (0xA800; system_reg_write_ae(2) writes its bit 0
+ * after every AE1 update -- a latch, not an enable), its banks set by
+ * tisp_init after AE0's, the same zone and histogram formats.  It is
+ * the WDR short frame's: like the WDR statistics it runs only while
+ * 0x0C bit 0 is clear (tisp_init's linear mode sets it).  Raised in a
+ * linear mode, ae1_interrupt_hist stores its histogram over the AE's
+ * static data and pushes the AE1 process, and AE0 and the AWB stop
+ * where they are.
  */
 #define T31_AE1         0xA800
+#define T31_TOP         0x0C        /* module bypasses */
 
 static void ingenic_isp_ae1(IngenicIspState *s, const uint8_t *zones,
                             size_t zlen, const uint32_t *hist, size_t hlen,
@@ -705,7 +734,7 @@ static void ingenic_isp_ae1(IngenicIspState *s, const uint8_t *zones,
     int zb = (((idx >> 4) & 3) + 1) % (((cnt >> 4) & 3) + 1);
     int hb = ((idx & 3) + 1) % ((cnt & 3) + 1);
 
-    if (!(ISP_REG(T31_AE1) & 1) || !ISP_REG(T31_AE1 + 0x2C) ||
+    if ((ISP_REG(T31_TOP) & 1) || !ISP_REG(T31_AE1 + 0x2C) ||
         !isp_grid(s, T31_AE1, &c1, &r1, xs, ys) || c1 != cols || r1 != rows) {
         return;
     }
@@ -780,7 +809,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                     double k = gain / 256.0, yn, cb, cr, rgb[3];
                     int y, ch, q[3];
 
-                    sstar_pattern_pixel(frame, w, h, 2 * qx, 2 * qy, yuv);
+                    ingenic_scene_pixel(frame, w, h, 2 * qx, 2 * qy, yuv);
                     /* the sensor's linear light, 8 bits */
                     y = lround(MIN(isp_lin(yuv[0]) * k, 1) * 255);
                     c = y < lo ? 0 : y > hi ? 2 : 1;
@@ -797,12 +826,12 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                     for (ch = 0; ch < 3; ch++) {
                         double lc = ch == 0 ? s->light_r / 1000.0 :
                                     ch == 2 ? s->light_b / 1000.0 : 1;
-                        double v = l->stat_gen == 2 ?
-                                   pow(MIN(MAX(rgb[ch] * lc, 0), 1), 2.2) * k :
-                                   pow(MIN(MAX(rgb[ch], 0), 1), 2.2) * k * lc;
+                        double v = pow(MIN(MAX(rgb[ch], 0), 1), 2.2) * k * lc;
 
                         q[ch] = lround(MIN(v, 1) * 255);
+                        z->urgb[ch] += q[ch];
                     }
+                    z->un++;
                     if (awb_quad_valid(&flt, q)) {
                         for (ch = 0; ch < 3; ch++) {
                             z->rgb[ch] += q[ch];
@@ -816,8 +845,10 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                 z->sum[c] = z->sum[c] * quads / (STAT_SX * STAT_SY);
                 z->cnt[c] = z->cnt[c] * quads / (STAT_SX * STAT_SY);
                 z->rgb[c] = z->rgb[c] * quads / (STAT_SX * STAT_SY);
+                z->urgb[c] = z->urgb[c] * quads / (STAT_SX * STAT_SY);
             }
             z->n = z->n * quads / (STAT_SX * STAT_SY);
+            z->un = z->un * quads / (STAT_SX * STAT_SY);
         }
     }
     if (ae) {
@@ -863,7 +894,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                          MEMTXATTRS_UNSPECIFIED);
         ISP_REG(ae_blk + 0x50) = zb << 4 | hb;
         ISP_REG(int_sta) |= 1u << l->ae_static_bit | 1u << l->ae_hist_bit;
-        if (l->xstat && pipe == 0) {
+        if ((l->xstat == 1 || l->xstat == 2) && pipe == 0) {
             ingenic_isp_ae1(s, buf, 16 * rows * cols, hw, sizeof(hw), cols,
                             rows);
         }
@@ -891,11 +922,14 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                 }
                 z = &zone[ey][ex];
                 if (l->stat_gen == 2) {
+                    /* a pair: every quad, then the filtered ones */
                     for (i = 0; i < 8; i++) {
-                        isp_bits(o + 16 * i, 0, 22, z->rgb[0]);
-                        isp_bits(o + 16 * i, 22, 22, z->rgb[1]);
-                        isp_bits(o + 16 * i, 44, 22, z->rgb[2]);
-                        isp_bits(o + 16 * i, 88, 14, z->n);
+                        const uint64_t *c = i & 1 ? z->rgb : z->urgb;
+
+                        isp_bits(o + 16 * i, 0, 22, c[0]);
+                        isp_bits(o + 16 * i, 22, 22, c[1]);
+                        isp_bits(o + 16 * i, 44, 22, c[2]);
+                        isp_bits(o + 16 * i, 88, 14, i & 1 ? z->n : z->un);
                     }
                 } else {
                     isp_bits(o, 0, 21, z->rgb[0]);
@@ -976,10 +1010,43 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
  *   the two exposures see the same frame.
  *
  * Counts and sums are of the 2 x 2 quads, as AE0's are.
+ *
+ * T40 and T41 (xstat 3; tx-isp-t40.ko / -t41.ko, their symbols): AF is
+ * T31's block at 0x1A000 (tisp_af_set_hardware_param writes the same
+ * grid word at 0x1A004, the zone widths as halfwords from 0x1A008 and
+ * the heights as bytes from 0x1A028), on int_sta bit 6
+ * (tisp_af_interrupt_static, T40's tisp_af_main_interrupt_static), four
+ * 4 KiB banks at 0x1A0CC.. (tisp_af_malloc_cfg), their count at 0x1A0DC
+ * and the last one's number at 0x1A0E0.  tisp_af_get_statistics unpacks
+ * zones of 136 bits end to end -- four to 68 bytes -- each FIR 0, FIR 1,
+ * IIR 0, IIR 1 in 23 bits, the luma sum in 24 and the bright count in
+ * 16, a row of them every 2 * {3,5,7,9,11,13,15,17,20,22,24,26,28,30,32}
+ * [columns - 1] words.
+ * ADR (tiziano_adr_interrupt_static, bit 9; T40 the same, _main_): four
+ *   4 KiB banks at 0x9514.., count 0x9510, the last one's address at
+ *   0x9540.  tiziano_adr_read_data reads 4 rows of 6 blocks, 56 bytes
+ *   each: two 29-bit words (here the block's luma sum and its quads),
+ *   twenty 18-bit counts from +8 (here a 20-bin histogram of the block's
+ *   luma) and two 12-bit fields in the word at +52, bits 8 and 20 (here
+ *   its darkest and brightest luma, 12 bits); then from +0x548 the
+ *   frame's 512-bin luma histogram as on T31.  The meaning of each field
+ *   is the model's reading of the reader's widths, not the module's
+ *   names.
+ * Defog (tisp_defog_interrupt_static, bit 10): four 2 KiB banks at
+ *   0xC290.., count 0xC28C, the last one's address at 0xC2B4; from +8,
+ *   180 blocks of 8 bytes (tisp_defog_get_data), three 21-bit sums --
+ *   T31's B, G, R order, narrower -- without T31's "hist info".
  */
-#define T31_TOP         0x0C
 #define T31_AF          0xB800
 #define T31_AF_BIT      31
+#define T41_AF          0x1A000
+#define T41_AF_BIT      6
+#define T41_ADR_CNT     0x9510
+#define T41_ADR_LAST    0x9540
+#define T41_ADR_BIT     9
+#define T41_DEFOG_CNT   0xC28C
+#define T41_DEFOG_LAST  0xC2B4
+#define T41_DEFOG_BIT   10
 #define T31_ADR_CNT     0x4490
 #define T31_ADR_LAST    0x44B0
 #define T31_ADR_BIT     18
@@ -1012,7 +1079,7 @@ static double isp_stat_y(uint32_t frame, int w, int h, int x, int y,
 {
     uint8_t yuv[3];
 
-    sstar_pattern_pixel(frame, w, h, MIN(x, w - 1), MIN(y, h - 1), yuv);
+    ingenic_scene_pixel(frame, w, h, MIN(x, w - 1), MIN(y, h - 1), yuv);
     return MIN(isp_lin_lut(yuv[0]) * k, 1);
 }
 
@@ -1024,7 +1091,7 @@ static void isp_stat_rgb(IngenicIspState *s, uint32_t frame, int w, int h,
     double yn, cb, cr, c[3];
     int ch;
 
-    sstar_pattern_pixel(frame, w, h, x, y, yuv);
+    ingenic_scene_pixel(frame, w, h, x, y, yuv);
     yn = (yuv[0] - 16) / 219.0;
     cb = (yuv[1] - 128) / 224.0;
     cr = (yuv[2] - 128) / 224.0;
@@ -1053,34 +1120,49 @@ static int isp_next_bank(IngenicIspState *s, hwaddr bank0, int n,
     return 0;
 }
 
+static const uint8_t t41_af_row[15] = {
+    3, 5, 7, 9, 11, 13, 15, 17, 20, 22, 24, 26, 28, 30, 32
+};
+
 static void ingenic_isp_af(IngenicIspState *s, uint32_t frame, int w, int h,
                            double k)
 {
-    uint32_t grid = ISP_REG(T31_AF + 0x04);
+    bool x2 = s->l->xstat == 3;
+    hwaddr af = x2 ? T41_AF : T31_AF;
+    hwaddr banks = af + (x2 ? 0xCC : 0xA8);
+    uint32_t grid = ISP_REG(af + 0x04);
     int cols = MIN(grid >> 28, STAT_ZONES), rows = MIN((grid >> 12) & 0xF,
                                                        STAT_ZONES);
     int x0 = (grid >> 16) & 0xFFF, y0 = grid & 0xFFF;
-    uint32_t cnt = ISP_REG(T31_AF + 0xB8), idx = ISP_REG(T31_AF + 0xBC);
+    uint32_t cnt = ISP_REG(af + (x2 ? 0xDC : 0xB8));
+    uint32_t idx = ISP_REG(af + (x2 ? 0xE0 : 0xBC));
     int bank = (idx + 1) % ((cnt & 3) + 1);
-    static uint8_t buf[STAT_ZONES * STAT_ZONES * 16];
+    /* T31: 16 bytes a zone; T40/T41: 136 bits, rows of 8-byte units */
+    int row = x2 && cols ? 8 * t41_af_row[cols - 1] : 16 * cols;
+    static uint8_t buf[STAT_ZONES * 256];
     int zx, zy, i, j, y = y0;
 
-    if (!(ISP_REG(T31_AF) & 1) || !cols || !rows ||
-        !ISP_REG(T31_AF + 0xA8 + 4 * bank)) {
+    if ((!x2 && !(ISP_REG(af) & 1)) || !cols || !rows ||
+        !ISP_REG(banks + 4 * bank)) {
         return;
     }
-    memset(buf, 0, 16 * cols * rows);
+    memset(buf, 0, row * rows);
     for (zy = 0; zy < rows; zy++) {
-        int zh = extract32(ISP_REG(T31_AF + 0x18 + (zy & ~3)), 8 * (zy & 3),
-                           8);
+        int zh = x2 ? extract32(ISP_REG(af + 0x28 + (zy & ~3)), 8 * (zy & 3),
+                                8)
+                    : extract32(ISP_REG(af + 0x18 + (zy & ~3)), 8 * (zy & 3),
+                                8);
         int x = x0;
 
         for (zx = 0; zx < cols; zx++) {
-            int zw = extract32(ISP_REG(T31_AF + 0x08 + (zx & ~3)),
-                               8 * (zx & 3), 8);
+            int zw = x2 ? extract32(ISP_REG(af + 0x08 + 4 * (zx / 2)),
+                                    16 * (zx & 1), 16)
+                        : extract32(ISP_REG(af + 0x08 + (zx & ~3)),
+                                    8 * (zx & 3), 8);
             uint64_t f0 = 0, f1 = 0, i0 = 0, i1 = 0, ys = 0, hi = 0;
             uint64_t px = (uint64_t)zw * zh;
-            uint8_t *o = buf + 16 * (zy * cols + zx);
+            uint8_t *o = buf + row * zy;
+            int b = x2 ? 136 * zx : 128 * zx;
             enum { NX = 16, NY = 8 };
 
             for (j = 0; j < NY && zh; j++) {
@@ -1105,21 +1187,29 @@ static void ingenic_isp_af(IngenicIspState *s, uint32_t frame, int w, int h,
                     hi += v >= 230;
                 }
             }
-            isp_bits(o, 0, 22, f0 * px / (NX * NY));
-            isp_bits(o, 22, 22, f1 * px / (NX * NY));
-            isp_bits(o, 44, 22, i0 * px / (NX * NY));
-            isp_bits(o, 66, 22, i1 * px / (NX * NY));
-            isp_bits(o, 88, 23, ys * px / (NX * NY));
-            isp_bits(o, 111, 15, hi * px / (NX * NY));
+            if (x2) {
+                isp_bits(o, b, 23, f0 * px / (NX * NY));
+                isp_bits(o, b + 23, 23, f1 * px / (NX * NY));
+                isp_bits(o, b + 46, 23, i0 * px / (NX * NY));
+                isp_bits(o, b + 69, 23, i1 * px / (NX * NY));
+                isp_bits(o, b + 92, 24, ys * px / (NX * NY));
+                isp_bits(o, b + 116, 16, hi * px / (NX * NY));
+            } else {
+                isp_bits(o, b, 22, f0 * px / (NX * NY));
+                isp_bits(o, b + 22, 22, f1 * px / (NX * NY));
+                isp_bits(o, b + 44, 22, i0 * px / (NX * NY));
+                isp_bits(o, b + 66, 22, i1 * px / (NX * NY));
+                isp_bits(o, b + 88, 23, ys * px / (NX * NY));
+                isp_bits(o, b + 111, 15, hi * px / (NX * NY));
+            }
             x += zw;
         }
         y += zh;
     }
-    dma_memory_write(&address_space_memory,
-                     ISP_REG(T31_AF + 0xA8 + 4 * bank), buf, 16 * cols * rows,
-                     MEMTXATTRS_UNSPECIFIED);
-    ISP_REG(T31_AF + 0xBC) = bank;
-    ISP_REG(s->l->int_sta) |= 1u << T31_AF_BIT;
+    dma_memory_write(&address_space_memory, ISP_REG(banks + 4 * bank), buf,
+                     row * rows, MEMTXATTRS_UNSPECIFIED);
+    ISP_REG(af + (x2 ? 0xE0 : 0xBC)) = bank;
+    ISP_REG(s->l->int_sta) |= 1u << (x2 ? T41_AF_BIT : T31_AF_BIT);
 }
 
 static void ingenic_isp_adr(IngenicIspState *s, uint32_t frame, int w, int h,
@@ -1127,33 +1217,52 @@ static void ingenic_isp_adr(IngenicIspState *s, uint32_t frame, int w, int h,
 {
     static uint8_t buf[0x1000];
     uint64_t hist[512] = { 0 };
-    int n = (ISP_REG(T31_ADR_CNT) & 3) + 1;
-    int bank = isp_next_bank(s, T31_ADR_CNT + 4, n, ISP_REG(T31_ADR_LAST));
-    hwaddr dst = ISP_REG(T31_ADR_CNT + 4 + 4 * bank);
-    uint64_t quads = (uint64_t)w * h / 4 / 48;
-    enum { BX = 8, BY = 6, NX = 8, NY = 6 };
+    bool x2 = s->l->xstat == 3;
+    hwaddr cnt = x2 ? T41_ADR_CNT : T31_ADR_CNT;
+    hwaddr last = x2 ? T41_ADR_LAST : T31_ADR_LAST;
+    int n = (ISP_REG(cnt) & 3) + 1;
+    int bank = isp_next_bank(s, cnt + 4, n, ISP_REG(last));
+    hwaddr dst = ISP_REG(cnt + 4 + 4 * bank);
+    /* T31: 8 x 6 blocks; T40/T41: 6 x 4 */
+    int nbx = x2 ? 6 : 8, nby = x2 ? 4 : 6;
+    uint64_t quads = (uint64_t)w * h / 4 / (nbx * nby);
+    enum { NX = 8, NY = 6 };
     int bx, by, i, j;
 
-    if ((ISP_REG(T31_TOP) & (1u << 7)) || !dst) {
+    if ((!x2 && (ISP_REG(T31_TOP) & (1u << 7))) || !dst) {
         return;
     }
     memset(buf, 0, sizeof(buf));
-    for (by = 0; by < BY; by++) {
-        for (bx = 0; bx < BX; bx++) {
-            uint64_t sum = 0, bin[5] = { 0 };
-            uint8_t *o = buf + 128 * by + 16 * bx;
+    for (by = 0; by < nby; by++) {
+        for (bx = 0; bx < nbx; bx++) {
+            uint64_t sum = 0, bin[20] = { 0 };
+            int lo = 255, hi = 0;
+            uint8_t *o = x2 ? buf + 56 * (by * nbx + bx)
+                            : buf + 128 * by + 16 * bx;
 
             for (j = 0; j < NY; j++) {
                 for (i = 0; i < NX; i++) {
-                    int x = (bx * NX + i) * w / (BX * NX) + w / (2 * BX * NX);
-                    int y = (by * NY + j) * h / (BY * NY) + h / (2 * BY * NY);
+                    int x = (bx * NX + i) * w / (nbx * NX) + w / (2 * nbx * NX);
+                    int y = (by * NY + j) * h / (nby * NY) + h / (2 * nby * NY);
                     double l = isp_stat_y(frame, w, h, x, y, k);
                     int v = lround(l * 255);
 
                     sum += v;
-                    bin[MIN(v * 5 / 256, 4)]++;
+                    bin[x2 ? MIN(v * 20 / 256, 19) : MIN(v * 5 / 256, 4)]++;
+                    lo = MIN(lo, v);
+                    hi = MAX(hi, v);
                     hist[lround(l * 511)] += quads;
                 }
+            }
+            if (x2) {
+                isp_bits(o, 0, 29, sum * quads / (NX * NY));
+                isp_bits(o, 32, 29, quads);
+                for (i = 0; i < 20; i++) {
+                    isp_bits(o, 64 + 18 * i, 18, bin[i] * quads / (NX * NY));
+                }
+                isp_bits(o, 52 * 8 + 8, 12, lo * 16);
+                isp_bits(o, 52 * 8 + 20, 12, hi * 16);
+                continue;
             }
             isp_bits(o, 0, 28, sum * quads / (NX * NY));
             for (i = 0; i < 4; i++) {
@@ -1165,28 +1274,30 @@ static void ingenic_isp_adr(IngenicIspState *s, uint32_t frame, int w, int h,
         }
     }
     for (i = 0; i < 512; i++) {
-        isp_bits(buf + 0x308 + 8 * (i / 3), 21 * (i % 3), 21,
+        isp_bits(buf + (x2 ? 0x548 : 0x308) + 8 * (i / 3), 21 * (i % 3), 21,
                  hist[i] / (NX * NY));
     }
     dma_memory_write(&address_space_memory, dst, buf, sizeof(buf),
                      MEMTXATTRS_UNSPECIFIED);
-    ISP_REG(T31_ADR_LAST) = dst;
-    ISP_REG(s->l->int_sta) |= 1u << T31_ADR_BIT;
+    ISP_REG(last) = dst;
+    ISP_REG(s->l->int_sta) |= 1u << (x2 ? T41_ADR_BIT : T31_ADR_BIT);
 }
 
 static void ingenic_isp_defog(IngenicIspState *s, uint32_t frame, int w,
                               int h, double k)
 {
     static uint8_t buf[0x1000];
-    int n = (ISP_REG(T31_DEFOG_CNT) & 3) + 1;
-    int bank = isp_next_bank(s, T31_DEFOG_CNT + 4, n,
-                             ISP_REG(T31_DEFOG_LAST));
-    hwaddr dst = ISP_REG(T31_DEFOG_CNT + 4 + 4 * bank);
+    bool x2 = s->l->xstat == 3;
+    hwaddr cnt = x2 ? T41_DEFOG_CNT : T31_DEFOG_CNT;
+    hwaddr last = x2 ? T41_DEFOG_LAST : T31_DEFOG_LAST;
+    int n = (ISP_REG(cnt) & 3) + 1;
+    int bank = isp_next_bank(s, cnt + 4, n, ISP_REG(last));
+    hwaddr dst = ISP_REG(cnt + 4 + 4 * bank);
     uint64_t quads = (uint64_t)w * h / 4 / 180;
     enum { BX = 15, BY = 12, NX = 6, NY = 4 };
     int bx, by, i, j, ch;
 
-    if ((ISP_REG(T31_TOP) & (1u << 11)) || !dst) {
+    if ((!x2 && (ISP_REG(T31_TOP) & (1u << 11))) || !dst) {
         return;
     }
     memset(buf, 0, sizeof(buf));
@@ -1194,7 +1305,7 @@ static void ingenic_isp_defog(IngenicIspState *s, uint32_t frame, int w,
         for (bx = 0; bx < BX; bx++) {
             uint64_t sum[3] = { 0 }, ysum = 0;
             int dark = 255, ymax = 0;
-            uint8_t *o = buf + 8 + 16 * (by * BX + bx);
+            uint8_t *o = buf + 8 + (x2 ? 8 : 16) * (by * BX + bx);
 
             for (j = 0; j < NY; j++) {
                 for (i = 0; i < NX; i++) {
@@ -1214,6 +1325,12 @@ static void ingenic_isp_defog(IngenicIspState *s, uint32_t frame, int w,
                     ymax = MAX(ymax, l);
                 }
             }
+            if (x2) {
+                isp_bits(o, 0, 21, sum[2] * quads / (NX * NY));
+                isp_bits(o, 21, 21, sum[1] * quads / (NX * NY));
+                isp_bits(o, 42, 21, sum[0] * quads / (NX * NY));
+                continue;
+            }
             isp_bits(o, 0, 24, sum[2] * quads / (NX * NY));
             isp_bits(o, 24, 24, sum[1] * quads / (NX * NY));
             sum[0] = MIN(sum[0] * quads / (NX * NY), 0xFFFFFF);
@@ -1224,10 +1341,154 @@ static void ingenic_isp_defog(IngenicIspState *s, uint32_t frame, int w,
             stw_le_p(o + 12, ysum / (NX * NY));
         }
     }
-    dma_memory_write(&address_space_memory, dst, buf, sizeof(buf),
+    dma_memory_write(&address_space_memory, dst, buf, x2 ? 0x800 : sizeof(buf),
                      MEMTXATTRS_UNSPECIFIED);
-    ISP_REG(T31_DEFOG_LAST) = dst;
-    ISP_REG(s->l->int_sta) |= 1u << T31_DEFOG_BIT;
+    ISP_REG(last) = dst;
+    ISP_REG(s->l->int_sta) |= 1u << (x2 ? T41_DEFOG_BIT : T31_DEFOG_BIT);
+}
+
+/*
+ * T40 and T41's other statistics (xstat 3), each on its int_sta bit:
+ *
+ * GSM (tisp_gsm_interrupt_hist, bit 7): when 0x1B004 and 0x1B044 both
+ *   read 1 the handler reads two 256-entry RAMs of 22-bit counts
+ *   (tisp_gsm_read_ram): writing 0x201 to 0x501A0 / 0x501B0 opens a RAM,
+ *   each read of 0x501A8 / 0x501B8 gives its next entry, and the driver
+ *   writes 0xFF0202 back and 1 to 0x1B000 / 0x1B040 (done).
+ *   tisp_gsm_process adds the two bin by bin and reports "hist error"
+ *   unless the total is the sensor's width x height (tisp_gsm_init):
+ *   here the frame's 256-bin luma histogram of exactly as many pixels
+ *   as 0x80 (width << 16 | height) says, each bin split between them.
+ * LCE (tisp_lce_interrupt_static, bit 8): 0x0E014 bit 0 says a frame is
+ *   ready and bit 8 which of its two RAM sets to read; tisp_lce_get_data
+ *   reads 45 x 32 words through 0x501C8 (set 0; 0x501D8 set 1, opened by
+ *   0x501C0 / 0x501D0) and 45 more through 0x50208 (0x50218; 0x50200 /
+ *   0x50210), then the handler writes 0x0E010 to acknowledge.  Here
+ *   those are 45 blocks (9 x 5) of a 32-bin luma histogram of quads,
+ *   then the blocks' mean luma; both sets alike.  lce_std_hist_transform
+ *   scales each block's bins to sum to 2^20 and reports "LCE Hist Data
+ *   Standard Error" when they come to more: a block counts no more
+ *   quads than it has.
+ * TMO (tisp_tmo_interrupt_static, bit 17): two 16 KiB banks at 0x1E010
+ *   and 0x1E014 (0x1E020 = 1, tisp_tmo_init), 0x1E028 the one written;
+ *   tisp_tmo_get_data reads 3750 pairs of halfwords -- here a 75 x 50
+ *   grid of each block's mean and brightest luma, 12 bits.
+ * The field meanings are the model's reading of the readers; the
+ *   modules' names do not settle them.  These three are T41's: T40's
+ *   module reads its GSM and LCE through other paths and has no TMO.
+ */
+#define T41_GSM_FLAG0   0x1B004
+#define T41_GSM_FLAG1   0x1B044
+#define T41_GSM_BIT     7
+#define T41_LCE_STA     0x0E014
+#define T41_LCE_BIT     8
+#define T41_TMO_BANK    0x1E010
+#define T41_TMO_IDX     0x1E028
+#define T41_TMO_BIT     17
+
+/* the ports: control, data, the RAM, its length */
+static const struct {
+    hwaddr ctl, data;
+    int ram, len;
+} t41_ports[6] = {
+    { 0x501A0, 0x501A8, 0, 256 },       /* GSM 0 */
+    { 0x501B0, 0x501B8, 1, 256 },       /* GSM 1 */
+    { 0x501C0, 0x501C8, 2, 1440 },      /* LCE set 0 */
+    { 0x501D0, 0x501D8, 2, 1440 },      /* LCE set 1 */
+    { 0x50200, 0x50208, 3, 45 },        /* LCE means, set 0 */
+    { 0x50210, 0x50218, 3, 45 },        /* LCE means, set 1 */
+};
+
+static uint32_t *t41_port_ram(IngenicIspState *s, int ram)
+{
+    return ram < 2 ? s->ram_gsm[ram] : ram == 2 ? s->ram_lce : s->ram_lce_mean;
+}
+
+static void ingenic_isp_xstats2(IngenicIspState *s, uint32_t frame, int w,
+                                int h, double k)
+{
+    static uint8_t tmo[3750 * 4];
+    uint64_t hist[256] = { 0 };
+    int i, j, bx, by;
+
+    /* GSM: the frame's luma histogram, sampled 64 x 36 */
+    for (j = 0; j < 36; j++) {
+        for (i = 0; i < 64; i++) {
+            int x = (2 * i + 1) * w / 128, y = (2 * j + 1) * h / 72;
+
+            hist[lround(isp_stat_y(frame, w, h, x, y, k) * 255)]++;
+        }
+    }
+    {
+        /*
+         * tisp_gsm_process adds the two RAMs bin by bin and wants the
+         * total to be the sensor's width x height (tisp_gsm_init): the
+         * input size (0x80, width << 16 | height) spread over the bins,
+         * each bin's count split between the RAMs
+         */
+        uint64_t total = (uint64_t)(ISP_REG(0x80) >> 16) *
+                         (ISP_REG(0x80) & 0xFFFF), left = total;
+
+        for (i = 0; i < 256; i++) {
+            uint64_t c = i == 255 ? left : hist[i] * total / (64 * 36);
+
+            c = MIN(c, left);
+            left -= c;
+            s->ram_gsm[0][i] = MIN(c / 2, 0x3FFFFF);
+            s->ram_gsm[1][i] = MIN(c - c / 2, 0x3FFFFF);
+        }
+    }
+    ISP_REG(T41_GSM_FLAG0) = ISP_REG(T41_GSM_FLAG1) = 1;
+    ISP_REG(s->l->int_sta) |= 1u << T41_GSM_BIT;
+
+    /* LCE: 9 x 5 blocks, 32 bins each, then their means */
+    for (by = 0; by < 5; by++) {
+        for (bx = 0; bx < 9; bx++) {
+            uint32_t *bin = &s->ram_lce[32 * (by * 9 + bx)];
+            /* in 2 x 2 quads, as every statistics block counts */
+            uint64_t sum = 0, px = (uint64_t)w * h / 4 / 45 / 64;
+
+            memset(bin, 0, 32 * sizeof(*bin));
+            for (j = 0; j < 8; j++) {
+                for (i = 0; i < 8; i++) {
+                    int x = (bx * 8 + i) * w / 72 + w / 144;
+                    int y = (by * 8 + j) * h / 40 + h / 80;
+                    int v = lround(isp_stat_y(frame, w, h, x, y, k) * 255);
+
+                    bin[v >> 3] += px;
+                    sum += v;
+                }
+            }
+            s->ram_lce_mean[by * 9 + bx] = sum / 64;
+        }
+    }
+    ISP_REG(T41_LCE_STA) = 1;
+    ISP_REG(s->l->int_sta) |= 1u << T41_LCE_BIT;
+
+    /* TMO: the next bank, a 75 x 50 grid */
+    if (ISP_REG(T41_TMO_BANK)) {
+        int b = (ISP_REG(T41_TMO_IDX) + 1) & 1;
+        hwaddr dst = ISP_REG(T41_TMO_BANK + 4 * b);
+
+        if (dst) {
+            for (by = 0; by < 50; by++) {
+                for (bx = 0; bx < 75; bx++) {
+                    int x = (2 * bx + 1) * w / 150, y = (2 * by + 1) * h / 100;
+                    double l0 = isp_stat_y(frame, w, h, x, y, k);
+                    double l1 = isp_stat_y(frame, w, h, x + w / 300, y, k);
+
+                    stw_le_p(tmo + 4 * (by * 75 + bx),
+                             lround((l0 + l1) / 2 * 4095));
+                    stw_le_p(tmo + 4 * (by * 75 + bx) + 2,
+                             lround(MAX(l0, l1) * 4095));
+                }
+            }
+            dma_memory_write(&address_space_memory, dst, tmo, sizeof(tmo),
+                             MEMTXATTRS_UNSPECIFIED);
+            ISP_REG(T41_TMO_IDX) = b;
+            ISP_REG(s->l->int_sta) |= 1u << T41_TMO_BIT;
+        }
+    }
 }
 
 static void ingenic_isp_wdr(IngenicIspState *s, uint32_t frame, int w,
@@ -1305,6 +1566,13 @@ static void ingenic_isp_xstats(IngenicIspState *s, uint32_t gain,
     ingenic_isp_af(s, frame, w, h, k);
     ingenic_isp_adr(s, frame, w, h, k);
     ingenic_isp_defog(s, frame, w, h, k);
+    if (s->l->xstat == 3) {
+        /* T40 reads GSM and LCE otherwise and has no TMO */
+        if (!strcmp(s->l->name, "t41")) {
+            ingenic_isp_xstats2(s, frame, w, h, k);
+        }
+        return;
+    }
     if (s->l->xstat == 1) {
         ingenic_isp_wdr(s, frame, w, h, k);
     }
@@ -1459,6 +1727,18 @@ static uint64_t ingenic_isp_read(void *opaque, hwaddr off, unsigned size)
     if (l->ack && off == l->ack) {
         return (s->isp[off >> 2] & ~1u) | (ISP_REG(l->req) & 1);
     }
+    if (l->xstat == 3 && l->msca_win && (off & ~0xFFF) == 0x50000) {
+        int pt;
+
+        for (pt = 0; pt < ARRAY_SIZE(t41_ports); pt++) {
+            if (off == t41_ports[pt].data) {
+                int i = s->port_pos[pt]++;
+
+                return i < t41_ports[pt].len ?
+                       t41_port_ram(s, t41_ports[pt].ram)[i] : 0;
+            }
+        }
+    }
     if (n < 0) {
         return s->isp[off >> 2];
     }
@@ -1501,6 +1781,15 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
                      (off & ~0xff) == 0x4000)) {
         qemu_log("ingenic-isp: [0x%04x] = 0x%08x\n", (unsigned)off,
                  (uint32_t)val);
+    }
+    if (l->xstat == 3 && (off & ~0xFFF) == 0x50000) {
+        int pt;
+
+        for (pt = 0; pt < ARRAY_SIZE(t41_ports); pt++) {
+            if (off == t41_ports[pt].ctl) {
+                s->port_pos[pt] = 0;
+            }
+        }
     }
     if (ingenic_isp_pipe_reg(s, off, l->int_sta) >= 0) {
         return;
@@ -1703,6 +1992,12 @@ static void ingenic_isp_realize(DeviceState *dev, Error **errp)
     for (i = 0; i < ARRAY_SIZE(ingenic_isp_layouts); i++) {
         if (!strcmp(s->soc ? s->soc : "t31", ingenic_isp_layouts[i].name)) {
             s->l = &ingenic_isp_layouts[i];
+            if (!s->light_r) {
+                s->light_r = s->l->day_r ? s->l->day_r : 550;
+            }
+            if (!s->light_b) {
+                s->light_b = s->l->day_b ? s->l->day_b : 600;
+            }
         }
     }
     if (!s->l) {
@@ -1755,9 +2050,9 @@ static void ingenic_isp_init(Object *obj)
     s->light = 100;
     object_property_add_uint32_ptr(obj, "light", &s->light,
                                    OBJ_PROP_FLAG_READWRITE);
-    /* and its colour, for the AWB statistics */
-    s->light_r = 550;
-    s->light_b = 600;
+    /* and its colour, for the AWB statistics; 0: the layout's daylight */
+    s->light_r = 0;
+    s->light_b = 0;
     object_property_add_uint32_ptr(obj, "light-r", &s->light_r,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(obj, "light-b", &s->light_b,

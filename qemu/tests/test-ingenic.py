@@ -2000,13 +2000,10 @@ def test_isp_xstats(qt):
     qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
     qt.step(40 * 1000 * 1000)
     sta = qt.readl(ISP + 0xB4)
-    check('AE1 (28, 29), AF (31), ADR (18), defog (20) raised',
-          sta & 0xB0140000, 0xB0140000)
-    check('no WDR statistics in a linear mode (0x0C bit 0)', sta & 0x800, 0)
-    idx, idx1 = qt.readl(AE + 0x50), qt.readl(AE1 + 0x50)
-    check('AE1 zones: the AE0 ones, in its own bank',
-          qt.read(z1 + 0x1000 * ((idx1 >> 4) & 3), 225 * 16),
-          qt.read(zb + 0x1000 * ((idx >> 4) & 3), 225 * 16))
+    check('AF (31), ADR (18), defog (20) raised',
+          sta & 0x80140000, 0x80140000)
+    check('no AE1 (28, 29) or WDR (11) statistics in a linear mode '
+          '(0x0C bit 0)', sta & 0x30000800, 0)
     af = qt.read(afb + 0x1000 * qt.readl(AF + 0xBC), 64 * 16)
 
     def af_zone(n):
@@ -2037,8 +2034,12 @@ def test_isp_xstats(qt):
     qt.writel(ISP + 0x0C, 0xB5742248)     # a WDR mode: bit 0 clear
     qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
     qt.step(40 * 1000 * 1000)
-    check('WDR statistics in a WDR mode (bit 11)', qt.readl(ISP + 0xB4) & 0x800,
-          0x800)
+    check('WDR (11) and AE1 (28, 29) statistics in a WDR mode',
+          qt.readl(ISP + 0xB4) & 0x30000800, 0x30000800)
+    idx, idx1 = qt.readl(AE + 0x50), qt.readl(AE1 + 0x50)
+    check('AE1 zones: the AE0 ones, in its own bank',
+          qt.read(z1 + 0x1000 * ((idx1 >> 4) & 3), 225 * 16),
+          qt.read(zb + 0x1000 * ((idx >> 4) & 3), 225 * 16))
     w = qt.read(qt.readl(ISP + 0x2680), 0x2000)
     logical = b''.join(w[1024 * i:1024 * i + 516] for i in range(8))
     gsum = sum(isp_bits(logical[16 * i:], 21, 21) for i in range(256))
@@ -2048,6 +2049,78 @@ def test_isp_xstats(qt):
           all(logical[16 * i:16 * i + 8] == logical[16 * i + 8:16 * i + 16]
               for i in range(256)), True)
 
+
+
+def test_isp_xstats_t41(qt):
+    """T41's other statistics: AF, ADR, defog, GSM, LCE, TMO."""
+    print('ingenic-isp AF / ADR / defog / GSM / LCE / TMO statistics (t41)')
+    AE, AF, vic = ISP + 0x19000, ISP + 0x1A000, 0x13380000
+    afb, adrb, dfb, tmob = 0x00640000, 0x00650000, 0x00660000, 0x00670000
+    w, h = 480, 270
+    # the AE grid gives the scene's size: 15 x 15 zones of 16 x 9 quads
+    qt.writel(AE + 0x04, 0xF001F001)
+    for i in range(4):
+        qt.writel(AE + 0x08 + 4 * i, 0x10101010)
+        qt.writel(AE + 0x18 + 4 * i, 0x09090909)
+    qt.writel(ISP + 0x80, w << 16 | h)
+    # tisp_af_set_hardware_param's form: 15 x 15, widths as halfwords
+    qt.writel(AF + 0x04, 0xF001F003)
+    for i in range(8):
+        qt.writel(AF + 0x08 + 4 * i, 0x00200020)
+    for i in range(4):
+        qt.writel(AF + 0x28 + 4 * i, 0x12121212)
+    for i in range(4):
+        qt.writel(AF + 0xCC + 4 * i, afb + 0x1000 * i)
+        qt.writel(ISP + 0x9514 + 4 * i, adrb + 0x1000 * i)
+        qt.writel(ISP + 0xC290 + 4 * i, dfb + 0x800 * i)
+    for reg in (AF + 0xDC, ISP + 0x9510, ISP + 0xC28C):
+        qt.writel(reg, 3)
+    qt.writel(ISP + 0x1E010, tmob)
+    qt.writel(ISP + 0x1E014, tmob + 0x4000)
+    qt.writel(vic + 0x00, 1)
+    qt.writel(ISP + 0x40020, 0xFFFFFFFF)
+    qt.step(41 * 1000 * 1000)
+    sta = qt.readl(ISP + 0x40028)
+    check('AF (6), GSM (7), LCE (8), ADR (9), defog (10), TMO (17) raised',
+          sta & 0x207C0, 0x207C0)
+    af = qt.read(afb + 0x1000 * qt.readl(AF + 0xE0), 15 * 256)
+
+    def af_zone(row, col):
+        z = af[256 * row:]                      # 2 * 32 words a row
+        return [isp_bits(z, 136 * col + o, n)
+                for o, n in ((0, 23), (23, 23), (92, 24))]
+    corner, logo = af_zone(0, 0), af_zone(5, 7)
+    check('AF: 136-bit zones, a luma sum in each', (corner[2] > 0,
+                                                     logo[2] > 0), (True, True))
+    check('AF: the logo zone answers the edge filters, the navy corner '
+          'hardly', logo[0] > 20 * max(corner[0], 1), True)
+    adr = qt.read(qt.readl(ISP + 0x9540), 0x1000)
+    total = sum(isp_bits(adr[0x548 + 8 * (i // 3):], 21 * (i % 3), 21)
+                for i in range(512))
+    check('ADR: the 512-bin histogram from +0x548 counts every quad',
+          abs(total - w * h // 4) < w * h // 4 // 50, True)
+    check('ADR: 6 x 4 blocks of 56 bytes, a luma sum in the last',
+          isp_bits(adr[56 * 23:], 0, 29) > 0, True)
+    df = qt.read(qt.readl(ISP + 0xC2B4), 0x800)
+    check('defog: 8-byte blocks, the navy one sums more B than R',
+          isp_bits(df[8:], 0, 21) > isp_bits(df[8:], 42, 21), True)
+    check('GSM: both flags up', (qt.readl(ISP + 0x1B004),
+                                 qt.readl(ISP + 0x1B044)), (1, 1))
+    gsm = []
+    for ctl, data in ((0x501A0, 0x501A8), (0x501B0, 0x501B8)):
+        qt.writel(ISP + ctl, 0x201)
+        gsm.append([qt.readl(ISP + data) for _ in range(256)])
+    check('GSM: the two RAMs add up to width x height',
+          sum(gsm[0]) + sum(gsm[1]), w * h)
+    qt.writel(ISP + 0x501C0, 0x201)
+    lce = [qt.readl(ISP + 0x501C8) for _ in range(32)]
+    check('LCE: a block\'s 32 bins count its quads, no more',
+          0 < sum(lce) <= w * h // 4 // 45, True)
+    tmo = qt.read(tmob + 0x4000 * qt.readl(ISP + 0x1E028), 3750 * 4)
+    check('TMO: a 75 x 50 grid of halfword pairs, the mean at most the max',
+          all(struct.unpack_from('<H', tmo, 4 * i)[0] <=
+              struct.unpack_from('<H', tmo, 4 * i + 2)[0]
+              for i in range(0, 3750, 50)), True)
 
 def test_isp_stats_t21(qt):
     """T21's statistics: AE 0x700, AWB 0x800, no enable bits (tisp_init)."""
@@ -2101,9 +2174,11 @@ def test_isp_stats_t21(qt):
         return [isp_bits(z, b, 21) for b in (0, 21, 42)] + [isp_bits(z, 63, 13)]
 
     check('filtered: the navy zone counts no quad', zone(0)[3], 0)
-    best = max(range(225), key=lambda i: zone(i)[3])
+    # the darkest zone the filter passes: a grey patch that does not clip
+    best = min((i for i in range(225) if zone(i)[3] > 0),
+               key=lambda i: zone(i)[1] / zone(i)[3], default=0)
     r, g, b, n = zone(best)
-    check('filtered: the whitest zone counts some quads', n > 0, True)
+    check('filtered: a grey zone counts some quads', n > 0, True)
     check('its R/G and B/G inside the windows',
           (100 <= 256 * r // g <= 300, 70 <= 256 * b // g <= 250), (True, True))
     # a redder light: the same zone's R/G follows it
@@ -2564,6 +2639,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp_xstats(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't41,sensor=gc4663')
+        test_isp_xstats_t41(qt)
         qt.close()
         qt = QTest(a.qemu, 't21,sensor=jxf37')
         test_isp_stats_t21(qt)

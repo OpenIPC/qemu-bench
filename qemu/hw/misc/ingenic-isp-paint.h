@@ -9,6 +9,13 @@
  * the light make of it, in linear light (isp_lin(); the counter stays
  * white).
  *
+ * Below the dot, at the bottom left, a grey step wedge (six neutral
+ * patches, painted luma 60 to 210): the mid-tone neutrals a real test
+ * chart has.  The navy, the logo and the dot alone leave an AWB nothing
+ * to go by once the AE exposes for the navy and the white saturates;
+ * at any exposure some of these patches are neutral and unclipped.
+ * Every model's statistics see the scene through ingenic_scene_pixel().
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -25,6 +32,44 @@ typedef struct IngenicIspPainter {
     uint8_t *line;              /* one row, as wide as the widest stride */
     uint32_t size;
 } IngenicIspPainter;
+
+/* the grey wedge, in sstar-pattern.h's 1920 x 1080 coordinates */
+#define ISP_WEDGE_N     6
+#define ISP_WEDGE_X     32
+#define ISP_WEDGE_PITCH 112
+#define ISP_WEDGE_W     96
+#define ISP_WEDGE_Y     956
+#define ISP_WEDGE_H     80
+
+static inline bool isp_wedge_row(int h, int y)
+{
+    int py = (int64_t)y * SSTAR_PAT_H / MAX(h, 1);
+
+    return py >= ISP_WEDGE_Y && py < ISP_WEDGE_Y + ISP_WEDGE_H;
+}
+
+/* the patch at (x, y) of a row isp_wedge_row() takes, -1: none */
+static inline int isp_wedge_patch(int w, int x)
+{
+    int px = (int64_t)x * SSTAR_PAT_W / MAX(w, 1) - ISP_WEDGE_X;
+    int i = px / ISP_WEDGE_PITCH;
+
+    return px >= 0 && i < ISP_WEDGE_N && px % ISP_WEDGE_PITCH < ISP_WEDGE_W ?
+           i : -1;
+}
+
+/* The scene's YCbCr at (x, y) of a @w x @h picture: the pattern, the wedge */
+static inline void ingenic_scene_pixel(uint32_t frame, int w, int h, int x,
+                                       int y, uint8_t *yuv)
+{
+    int i;
+
+    sstar_pattern_pixel(frame, w, h, x, y, yuv);
+    if (isp_wedge_row(h, y) && (i = isp_wedge_patch(w, x)) >= 0) {
+        yuv[0] = 60 + 30 * i;
+        yuv[1] = yuv[2] = 128;
+    }
+}
 
 /* 3x5 digits, rows top down, bit 2 the left column */
 static const uint8_t isp_digits[10][5] = {
@@ -142,9 +187,17 @@ static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
                       py < SSTAR_PAT_LOGO_Y + AW_VINC_LOGO_H) ||
                      abs(py - SSTAR_PAT_DOT_Y) <= SSTAR_PAT_DOT_R + 1;
         bool count = y < (uint32_t)cell * 8;
+        bool wedge = isp_wedge_row(h, y);
 
         sstar_pattern_pixel(frame, w, h, 0, y, yuv);
         memset(l, lit[yuv[0]], w);
+        for (x = 0; wedge && x < w; x++) {
+            int i = isp_wedge_patch(w, x);
+
+            if (i >= 0) {
+                l[x] = lit[60 + 30 * i];
+            }
+        }
         for (x = 0; (scene || count) && x < w; x++) {
             if (scene) {
                 unsigned a = sstar_pattern_cover(dot_x, w, h, x, y);
@@ -164,12 +217,13 @@ static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
                       py < SSTAR_PAT_LOGO_Y + AW_VINC_LOGO_H) ||
                      abs(py - SSTAR_PAT_DOT_Y) <= SSTAR_PAT_DOT_R + 2;
         bool count = 2 * y < (uint32_t)cell * 8;
+        bool wedge = isp_wedge_row(h, 2 * y);
         uint8_t bg[3];
 
         sstar_pattern_pixel(frame, w, h, 0, 2 * y, bg);
         for (x = 0; x + 1 < w; x += 2) {
-            if (scene) {
-                sstar_pattern_pixel(frame, w, h, x, 2 * y, yuv);
+            if (scene || wedge) {
+                ingenic_scene_pixel(frame, w, h, x, 2 * y, yuv);
             } else {
                 memcpy(yuv, bg, sizeof(yuv));
             }
