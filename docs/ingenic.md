@@ -46,7 +46,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
 | 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
-| 0x10030000 + 0x1000 n | UART0..3, 16550 with a 4-byte stride, paced at the line rate, 64-byte TX FIFO | QEMU `serial-mm` (patch 0021) |
+| 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride, paced at the line rate, 64-byte TX FIFO | QEMU `serial-mm` (patch 0021) |
 | 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c) | `ingenic-i2c` |
 | 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
 | 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
@@ -68,6 +68,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13200000 | video encoder: VPU (T10/T20), HELIX (T21/T30; T23: 0x13100000), IRQ 70 (T23: 48) | `ingenic-vpu` |
 | 0x13600000 | RADIX, T30's H.265 encoder, IRQ 53 | `ingenic-vpu` kind 1 |
 | 0x13080000 | IPU, libimp's OSD blender (every part), IRQ 14 | `ingenic-ipu` |
+| 0x13280000 | T41: the JPEG engine (HELIX's JPEG half, units renumbered), core INTC 0 (`/machine/jpeg`) | `ingenic-vpu` layout 1 |
 | 0x130B0000 | T40, T41: I2D, rotate / mirror / flip (frame channel rotation), IRQ 45 | `ingenic-i2d` |
 | 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
 | 0x130C0000 | T41: VO, NV12 out over BT.656 / BT.1120, shown on the display, IRQ 43 (`/machine/vo`) | `ingenic-vo` |
@@ -541,6 +542,21 @@ encoders (`i264e_*`, `i265e_*`, `ijpege_*`; `qemu/tests/ingenic-vpu-feed.c`)
 from a picture in memory on the OpenIPC kernel and rootfs of each SoC; `qemu/tests/test-ingenic-vpu-e2e.sh` runs the
 SDK samples' FrameSource -> `IMP_Encoder` path on T21 with the ISP model
 and its sensor.
+
+T41 keeps HELIX's JPEG half as its own engine at 0x13280000
+(`ingenic,t41-jpeg`, the 4.4 kernel's `drivers/video/ingenic_vpu/helix`,
+`/dev/soc_vpu`, core INTC source 0): libimp encodes a JPEG channel on it,
+with its own `ijpege_*`, when the channel's `encVputype` is
+`IMP_ENC_TPYE_IVPU` (the default, AVPU, takes core 1 of the AVPU). The
+units are renumbered -- SCH 0, VDMA 1, EFE 2, JPGC 3 at 64 KiB each,
+the rest folded on 7 (`helix.h`'s HID_*) -- and the chain sets bit 19 of
+every address; the model (`layout` 1) maps them back onto HELIX's
+offsets, so the kernel's JPGC_STAT read at +0x30008 and the chain's
+EFE/JPGC words land where the JPEG coder reads them. The reset is SRBC
+28 (stop 27, acknowledge 26). `test-ingenic-avpu.sh --soc t41 --ivpu`
+encodes both channels this way through libimp and the kernel driver
+(2560x1440 and 640x360, decoded by ffmpeg, the scene checked);
+`test-ingenic-vpu.py` has a register-level T41 case.
 
 ### `ingenic-avpu`
 
@@ -1433,6 +1449,7 @@ teardown, so the verdict comes first.
 | T41NQ SDK image, its kernel's `ingenic_aip` + magik-toolkit `libaip.a` | `t41` | flash, `test-ingenic-aip.sh --image` | the library's own bs_* calls: NV12 640x360 -> 320x180 within 0.8 of the ramps sampled at half-pixel positions, a two-box chain, NV12 -> BGRA / RGBA / ARGB matching BT.601 exactly, affine and perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T40N SDK image, its kernel's `ingenic_bscaler` + magik-toolkit nna1 `libvenus.a` (its BSCALER objects) | `t40` | flash, `test-ingenic-bscaler.sh --image` | the library's own bs_* calls: BGRA 64x32 -> 32x16 and a many-tile 32x16 -> 160x80 within 0.7 of the ramps at half-pixel positions, NV12 256x128 -> 128x64 (both planes) within 0.7, NV12 -> BGRA / RGBA / ARGB resizes and the T unit's NV12 -> BGRA / RGBA matching BT.601 exactly, affine and projective perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
+| T41NQ SDK image + SDK `libimp.a`, `--ivpu` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --codecs jpeg --ivpu` | JPEG channels with `IMP_ENC_TPYE_IVPU` on the HELIX JPEG engine through `/dev/soc_vpu`: 2560x1440 and 640x360 pictures decode cleanly and show the scene |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 

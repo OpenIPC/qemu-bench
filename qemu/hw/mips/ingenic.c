@@ -174,6 +174,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_TCU1        26
 #define IRQ_TCU2        25
 #define IRQ_UART0       51
+#define IRQ_UART4       57      /* T41 */
+#define T41_JPEG_BASE   0x13280000
 #define IRQ_I2C0        60
 #define IRQ_OTG         21
 #define IRQ_GMAC        55
@@ -380,6 +382,33 @@ static void ingenic_vpu_one(IngenicMachineState *ims, DeviceState *cpm,
                                 qdev_get_gpio_in_named(dev, "reset", 0));
 }
 
+/*
+ * T41's JPEG engine ("ingenic,t41-jpeg", the 4.4 kernel's
+ * ingenic_vpu/helix): HELIX's JPEG half with its units renumbered (layout
+ * 1), its chain at 0x84, reset through SRBC bit 28 (stop 27, ack 26),
+ * core INTC source 0; libimp encodes a JPEG channel on it when the
+ * channel asks for IMP_ENC_TPYE_IVPU (/dev/soc_vpu).
+ */
+static void ingenic_jpeg_t41(IngenicMachineState *ims, DeviceState *cpm)
+{
+    DeviceState *dev = qdev_new("ingenic-vpu");
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    MemoryRegion *win = g_new(MemoryRegion, 1);
+
+    qdev_prop_set_uint32(dev, "kind", 0);
+    qdev_prop_set_uint32(dev, "taskrg", 0x84);
+    qdev_prop_set_uint32(dev, "layout", 1);
+    object_property_add_child(OBJECT(ims), "jpeg", OBJECT(dev));
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    /* the device tree's 256 KiB: SCH, VDMA, EFE, JPGC */
+    memory_region_init_alias(win, OBJECT(dev), "ingenic.jpeg",
+                             sysbus_mmio_get_region(sbd, 0), 0, 0x40000);
+    memory_region_add_subregion(get_system_memory(), T41_JPEG_BASE, win);
+    sysbus_connect_irq(sbd, 0, ingenic_irq(ims, 0));
+    qdev_connect_gpio_out_named(cpm, "srbc", 28,
+                                qdev_get_gpio_in_named(dev, "reset", 0));
+}
+
 static void ingenic_vpu_create(IngenicMachineState *ims, DeviceState *cpm,
                                IngenicSoc soc)
 {
@@ -398,8 +427,11 @@ static void ingenic_vpu_create(IngenicMachineState *ims, DeviceState *cpm,
         ingenic_vpu_one(ims, cpm, 0x13200000, 62, 0, 0x10008, 31);
         ingenic_vpu_one(ims, cpm, 0x13600000, 45, 1, 0, 28);
         break;
+    case INGENIC_T41:
+        ingenic_jpeg_t41(ims, cpm);
+        break;
     default:
-        break;                      /* T31 and later: the AVPU */
+        break;                      /* T31, T40: the AVPU does JPEG too */
     }
 }
 
@@ -1092,8 +1124,10 @@ static void ingenic_init(MachineState *ms)
         qdev_set_legacy_instance_id(dev, UART_BASE + i * 0x1000, 2);
         qdev_prop_set_uint8(dev, "endianness", DEVICE_LITTLE_ENDIAN);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        /* UART0..3 on 51..48; T41's UART4 / UART5 on 57 / 56 */
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                           ingenic_irq(ims, IRQ_UART0 - i));
+                           ingenic_irq(ims, i < 4 ? IRQ_UART0 - i
+                                                  : IRQ_UART4 + 4 - i));
         memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000,
                                     sysbus_mmio_get_region(SYS_BUS_DEVICE(dev),
                                                            0));
@@ -1762,7 +1796,7 @@ static const IngenicSocInfo ingenic_socs[] = {
     }, {
         .name = "t41", .desc = "Ingenic T41 (XBurst2, 2 cores)",
         .soc = INGENIC_T41, .cpu = MIPS_CPU_TYPE_NAME("XBurst2"),
-        .ram_default = 128 * MiB, .num_uarts = 4,
+        .ram_default = 128 * MiB, .num_uarts = 6,
         .gpio_ports = 4, .gpio_stride = 0x1000, .gpio_shadow = 0x7000,
         .sfc_version = 2, .mtd_id = "sfc0_nor",
         .nand_mtd_id = "sfc0_nand", .has_sfc1 = true,

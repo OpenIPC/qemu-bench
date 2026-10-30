@@ -402,6 +402,23 @@ def test_core_intc(qt):
     qt.writel(CCU + 0x1000 + 4, 0)
 
 
+# --- T41's UART4 / UART5 ---------------------------------------------------
+
+def test_uart45(qt):
+    print("T41's UART4 / UART5")
+    for n, base, src in ((4, 0x10034000, 57), (5, 0x10035000, 56)):
+        qt.writel(base + 0x1C, 0x5A)                    # SCR
+        check('UART%d: SCR reads back' % n, qt.readl(base + 0x1C) & 0xff, 0x5A)
+        check('UART%d: LSR, transmitter empty' % n,
+              qt.readl(base + 0x14) & 0x60, 0x60)
+        qt.writel(base + 0x04, 0x02)                    # IER: THRE
+        check('UART%d: THRE interrupt on core INTC %d' % (n, src),
+              (qt.readl(CORE_INTC + 0x20) >> (src - 32)) & 1, 1)
+        qt.writel(base + 0x04, 0)
+        check('UART%d: the line drops with IER clear' % n,
+              (qt.readl(CORE_INTC + 0x20) >> (src - 32)) & 1, 0)
+
+
 # --- SADC ------------------------------------------------------------------
 
 def test_sadc(qt, intc=INTC):
@@ -2659,6 +2676,7 @@ def main():
         test_ssi(qt, CORE_INTC)
         qt.close()
         qt = QTest(a.qemu, 't41')
+        test_uart45(qt)
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
         test_codec_gain_t41(qt)

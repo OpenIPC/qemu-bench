@@ -349,6 +349,11 @@ int main(int argc, char **argv)
                                         attr(ch).picHeight, 25, 1,
                                         jpeg ? 0 : 10, 2, jpeg ? 25 : 30,
                                         0) < 0 ||
+#ifdef ENC_IVPU
+            /* T41: JPEG on the HELIX JPEG engine (/dev/soc_vpu) */
+            ((jpeg && getenv("AVPU_IVPU") &&
+              (ea.encAttr.encVputype = IMP_ENC_TPYE_IVPU)), 0) ||
+#endif
             IMP_Encoder_CreateChn(ENC(ch), &ea) < 0 ||
             IMP_Encoder_RegisterChn(ch, ENC(ch)) < 0) {
             printf("enc%d: setup failed\n", ch);

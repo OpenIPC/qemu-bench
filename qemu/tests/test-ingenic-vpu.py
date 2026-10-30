@@ -546,6 +546,58 @@ def main():
                 p = psnr_y(raw[f * fs:(f + 1) * fs], fw, fh, f)
                 check(p >= need, '%s picture %d: Y PSNR %.1f dB (>= %d)'
                       % (name, f, p, need))
+    # T41's JPEG engine: HELIX's JPEG half with its units renumbered (SCH
+    # 0, VDMA 1, EFE 2, JPGC 3; the chain sets bit 19), reset through SRBC
+    # 28/27/26, core INTC source 0
+    print('== t41: JPEG (the HELIX JPEG engine)')
+    base, core_isr = 0x13280000, 0x12300000
+
+    def t41(r):
+        unit = {0x4: 2, 0xE: 3}[r >> 16]
+        return 0x80000 | (unit << 16) | (r & 0xFFFF)
+    q = QTest(a.qemu, 't41')
+    try:
+        ql, qc = qscale(QL, 80), qscale(QC, 80)
+        y, uv = picture(w, h, 0)
+        q.write(SRC, y)
+        q.write(SRC + w * h, uv)
+        regs = [(0xE1400 + 4 * i, qmem_word(ql[ZIGZAG[i]])) for i in range(64)]
+        regs += [(0xE1500 + 4 * i, qmem_word(qc[ZIGZAG[i]])) for i in range(64)]
+        regs += [(0xE0008, 0), (0xE000C, BS),
+                 (0x40004, ((mbh - 1) << 16) | (mbw - 1)), (0x40010, SRC),
+                 (0x40014, SRC + w * h), (0x40038, (w << 16) | w),
+                 (0x40000, 0x400b)]
+        chain(q, [(t41(r), v) for r, v in regs])
+        q.writel(CPM_SRBC, 1 << 27)
+        check(q.readl(CPM_SRBC) & (1 << 26), 'SRBC acknowledges the stop')
+        q.writel(CPM_SRBC, (1 << 27) | (1 << 28))
+        q.writel(CPM_SRBC, 0)
+        q.writel(base + 0x00, (1 << 9) | (1 << 29) | (1 << 20) | (1 << 17) |
+                 (1 << 16))
+        q.writel(base + 0x84, CHAIN | 1)
+        check(not q.readl(base + 0x34) & 1 and not q.readl(core_isr) & 1,
+              'nothing done at the start')
+        q.step(2000000)
+        jst = q.readl(base + 0x30008)
+        check(q.readl(base + 0x34) & 0x11 == 0x11 and q.readl(core_isr) & 1,
+              'done: SCH_STAT end and JPGEND, core INTC source 0 up')
+        check(jst & (1 << 31) and 0 < jst & 0xffffff < 0x100000,
+              'JPGC_STAT at +0x30008: end, %d bytes' % (jst & 0xffffff))
+        jpeg41 = jpeg_header(w, h, ql, qc) + q.read(BS, jst & 0xffffff) + \
+            b'\xff\xd9'
+        q.writel(base + 0x00, 1 << 9)
+        check(not q.readl(core_isr) & 1, 'interrupt down after the ISR')
+    finally:
+        q.close()
+    path = os.path.join(out, 't41.jpg')
+    open(path, 'wb').write(jpeg41)
+    if ffmpeg:
+        raw, err = decode(ffmpeg, path, 'yuvj420p')
+        check(not err and len(raw) == w * h * 3 // 2,
+              'ffmpeg decodes t41.jpg cleanly')
+        if len(raw) == w * h * 3 // 2:
+            p = psnr_y(raw, w, h, 0)
+            check(p >= 35, 't41.jpg: Y PSNR %.1f dB (>= 35)' % p)
     if not a.keep:
         shutil.rmtree(out, ignore_errors=True)
     print('PASS' if not fails else 'FAIL (%d)' % fails)

@@ -105,6 +105,16 @@ enum {
 #define ACFG_TERM           (1u << 30)
 #define ACFG_IDX(c)         ((c) & 0xFFFFC)
 
+/*
+ * T41's JPEG engine is HELIX's JPEG half with its units renumbered: SCH 0,
+ * VDMA 1, EFE 2, JPGC 3 at 64 KiB each (the 4.4 kernel's helix.h, HID_*),
+ * the rest (AUX, SDE, ...) folded on 7; its chains set bit 19 of every
+ * address.  Registers are kept at HELIX's offsets (EFE 0x40000, JPGC
+ * 0xE0000).
+ */
+#define VPU_LAYOUT_HELIX    0
+#define VPU_LAYOUT_T41_JPEG 1
+
 /* HELIX / VPU */
 #define R_SCH_GLBC          0x00000
 #define  GLBC_INTE_ENDF     (1u << 16)
@@ -170,6 +180,7 @@ struct IngenicVpuState {
 
     uint32_t kind;
     uint32_t taskrg;            /* where the chain address goes */
+    uint32_t layout;            /* VPU_LAYOUT_*: the units' addresses */
     bool debug;
 
     uint32_t regs[VPU_NREGS];
@@ -184,6 +195,18 @@ struct IngenicVpuState {
     HevcEncParams hevc_prm;
     HevcEncRef *hevc_ref, *hevc_recon;
 };
+
+static uint32_t vpu_map(IngenicVpuState *s, uint32_t off)
+{
+    static const uint8_t t41_unit[8] = { 0x0, 0x1, 0x4, 0xE, 0xF, 0xF, 0xF,
+                                         0xF };
+
+    if (s->layout != VPU_LAYOUT_T41_JPEG) {
+        return off;
+    }
+    off &= 0x7FFFF;
+    return (t41_unit[off >> 16] << 16) | (off & 0xFFFF);
+}
 
 static uint32_t vpu_reg(IngenicVpuState *s, uint32_t off)
 {
@@ -606,7 +629,7 @@ static void vpu_run_chain(IngenicVpuState *s, uint32_t addr)
                      (w[1] & ACFG_TERM) ? " TERM" : "");
         }
         if (w[1] & ACFG_VLD) {
-            vpu_reg_write(s, ACFG_IDX(w[1]), w[0], true);
+            vpu_reg_write(s, vpu_map(s, ACFG_IDX(w[1])), w[0], true);
         }
         if (w[1] & ACFG_TERM) {
             return;
@@ -699,6 +722,7 @@ static uint64_t vpu_read(void *opaque, hwaddr off, unsigned size)
 {
     IngenicVpuState *s = opaque;
 
+    off = vpu_map(s, off);
     if (s->debug) {
         qemu_log("ingenic-vpu: read  %05" HWADDR_PRIx " = %08x\n", off,
                  vpu_reg(s, off));
@@ -710,6 +734,7 @@ static void vpu_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     IngenicVpuState *s = opaque;
 
+    off = vpu_map(s, off);
     if (s->debug) {
         qemu_log("ingenic-vpu: write %05" HWADDR_PRIx " = %08" PRIx64 "\n",
                  off, val);
@@ -807,6 +832,7 @@ static void vpu_finalize(Object *obj)
 static const Property vpu_props[] = {
     DEFINE_PROP_UINT32("kind", IngenicVpuState, kind, VPU_KIND_HELIX),
     DEFINE_PROP_UINT32("taskrg", IngenicVpuState, taskrg, R_VDMA_TASKRG),
+    DEFINE_PROP_UINT32("layout", IngenicVpuState, layout, VPU_LAYOUT_HELIX),
     DEFINE_PROP_BOOL("debug", IngenicVpuState, debug, false),
 };
 
