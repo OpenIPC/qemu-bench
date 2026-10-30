@@ -412,7 +412,9 @@ login prompt with a DHCP lease, U-Boot's environment and the JFFS2
 overlay written to the NOR; so do the camera dumps and the T41 SDK
 image. Sound runs too: the AIC and codec with the PDMA's cyclic
 transfers, recording a test tone and playing to `-audiodev`
-(`qemu-boot/test-ingenic-audio.sh`). Map, boot chain and devices are in
+(`qemu-boot/test-ingenic-audio.sh`), and the AES, HASH, RSA and DTRNG
+blocks answer the SDK's sample drivers with standard results
+(`qemu-boot/test-ingenic-crypto.sh`). Map, boot chain and devices are in
 [docs/ingenic.md](docs/ingenic.md).
 
 ### Novatek NT9856x family (`qemu-system-arm`)
@@ -661,6 +663,11 @@ qemu/
 ├── hw/misc/ingenic-efuse.c      # EFUSE, blank
 ├── hw/audio/ingenic-aic.c       # AIC (I2S) FIFOs + internal codec: tone in, audiodev out
 ├── hw/dma/ingenic-pdma.c        # PDMA: descriptor rings, AUTO copies, request lines
+├── hw/ssi/ingenic-ssi.c         # SSI SPI masters, chip selects, PDMA requests
+├── hw/misc/ingenic-aes.c        # AES ECB/CBC by DMA or by block
+├── hw/misc/ingenic-hash.c       # MD5 / SHA-1 / SHA-2 by DMA
+├── hw/misc/ingenic-rsa.c        # RSA-1024/2048 modular exponentiation
+├── hw/misc/ingenic-dtrng.c      # true random number generator
 ├── hw/misc/gm-pmu.c             # FTPMU010: chip ID, strap, PLLs -> PCLK, FCS interrupt
 ├── hw/misc/gm-ddrc.c            # FTDDRC010: init done, DRAM size code
 ├── hw/intc/gm-intc.c            # FTINTC030 interrupt controller (per-CPU targets)
