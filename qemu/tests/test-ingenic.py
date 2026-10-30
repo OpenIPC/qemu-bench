@@ -1731,6 +1731,23 @@ def test_isp_layout(qt, soc):
         check('IVDC: nothing to dequeue', qt.readl(ch0 + empty) & 1, 1)
         check('IVDC: painted into its store',
               36 <= qt.read(0x80000000 + 12 * w, 1)[0] <= 50, True)
+        # the IVDC's registers (0x13200000, core INTC 13): its reset
+        # self-clears, and each picture into the store is an ISP frame
+        # start and frame done, under ivdc_core_ops_init's enable mask
+        IVDC = 0x13200000
+        qt.writel(IVDC + 0x00, 1)
+        check('IVDC: the reset bit reads back 0', qt.readl(IVDC + 0x00), 0)
+        check('IVDC: ISP frame start and done (bits 17, 16)',
+              qt.readl(IVDC + 0x44) & 0x30000, 0x30000)
+        check('IVDC: masked, no interrupt',
+              (qt.readl(CORE_INTC + 0x00) >> 13) & 1, 0)
+        qt.writel(IVDC + 0x40, 0x244FC0FF)
+        check('IVDC: enabled, core INTC 13 pending',
+              (qt.readl(CORE_INTC + 0x00) >> 13) & 1, 1)
+        qt.writel(IVDC + 0x54, qt.readl(IVDC + 0x44))
+        check('IVDC: status cleared through 0x54, the line drops',
+              (qt.readl(IVDC + 0x44), (qt.readl(CORE_INTC + 0x00) >> 13) & 1),
+              (0, 0))
 
 
 def test_isp_apical(qt, soc='t20'):

@@ -323,6 +323,7 @@ struct IngenicIspState {
     MemoryRegion isp_mr, vic_mr, csi_mr, phy_mr, msca_mr;
     MemoryRegion vic1_mr, vic2_mr;
     qemu_irq isp_irq, vic_irq, vic1_irq, vic2_irq;
+    qemu_irq ivdc_frame;        /* T41: a picture into the IVDC's store */
     QEMUTimer *timer;
 
     uint32_t fps;
@@ -923,6 +924,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         if (ivdc) {
             /* into the IVDC's store (RAM at IVDC_Y), nothing to dequeue */
             ISP_REG(l->int_sta) |= 1u << l->ivdc_bit;
+            qemu_irq_pulse(s->ivdc_frame);
         } else {
             fifo_push(&c->done_y, ya, c->frames);
             fifo_push(&c->done_uv, uva, c->frames);
@@ -1309,6 +1311,7 @@ static void ingenic_isp_init(Object *obj)
     sysbus_init_irq(sbd, &s->vic_irq);
     sysbus_init_irq(sbd, &s->vic1_irq);
     sysbus_init_irq(sbd, &s->vic2_irq);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->ivdc_frame, "ivdc-frame", 1);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ingenic_isp_frame, s);
     object_property_add_link(obj, "sensor", TYPE_DEVICE, &s->sensor,
                              object_property_allow_set_link,
