@@ -87,6 +87,7 @@ struct FhRtcState {
     int64_t offset;             /* RTC seconds - host seconds */
     uint32_t v1_regs[9];
     bool v1;
+    bool no_core;               /* a board without the 32.768 kHz crystal */
 };
 
 #define V1_COUNTER          0x00
@@ -116,6 +117,15 @@ static int64_t fh_rtc_host_secs(void)
 static void fh_rtc_command(FhRtcState *s, uint32_t cmd)
 {
     unsigned reg = (cmd >> 4) & (CORE_REGS - 1);
+
+    /*
+     * The core lives in its own domain, clocked by an external 32.768 kHz
+     * crystal; boards built without it (most cheap cameras) never answer,
+     * so CORE_IDLE, once the driver clears it for a command, stays clear.
+     */
+    if (s->no_core) {
+        return;
+    }
 
     switch (cmd & 0xF) {
     case CMD_READ:
@@ -236,6 +246,7 @@ static void fh_rtc_reset(DeviceState *dev)
 }
 
 static const Property fh_rtc_props[] = {
+    DEFINE_PROP_BOOL("no-core", FhRtcState, no_core, false),
     DEFINE_PROP_BOOL("v1", FhRtcState, v1, false),
 };
 
