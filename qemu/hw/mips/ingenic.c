@@ -142,6 +142,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_AIC         1
 #define IRQ_PDMA        10
 #define DMIC_BASE       0x10034000  /* T31, T40 */
+#define ASDMIC_BASE     0x134D0000  /* T41's audio system: DMA, DMIC */
+#define IRQ_ASDMIC      33
 #define IRQ_DMIC        12
 #define GMAC_BASE       0x134B0000
 #define OST_BASE        0x12000000
@@ -1254,6 +1256,16 @@ static void ingenic_init(MachineState *ms)
         qdev_connect_gpio_out_named(dev, "drq-rx", 0,
                                     qdev_get_gpio_in_named(pdma, "drq",
                                                            0x17 + 2 * i));
+    }
+
+    /* T41's digital microphones: its audio system's own DMA, not the PDMA */
+    if (info->soc == INGENIC_T41) {
+        dev = qdev_new("ingenic-asdmic");
+        object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, ASDMIC_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_ASDMIC));
     }
 
     /* the digital microphones of T31 and T40, on request line 13 */

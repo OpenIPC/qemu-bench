@@ -992,6 +992,45 @@ def test_codec_gain_t41(qt):
     qt.writel(AIC + 0x04, 0)
 
 
+def test_asdmic(qt):
+    """T41's audio system: DMIC to FIFO 5 to DMA channel 5, as as-dma.c"""
+    print('ingenic-asdmic (T41)')
+    AS = 0x134D0000
+    ring, descs, frag = SCRATCH + 0xA000, SCRATCH + 0xB000, 320
+    qt.write(ring, bytes(2 * frag))
+    for i in range(2):                  # two linked descriptors, no TIE
+        d0 = (1 << 2) | (1 << 4) | (1 << 8)     # LINK, TSZ 1 (4 words), BAI
+        qt.write(descs + 16 * i, struct.pack('<4I', d0, ring + i * frag,
+                                             descs + 16 * ((i + 1) % 2),
+                                             frag // 16))
+    qt.writel(AS + 0xA000, 1 << 31)                     # set_dmic_reset
+    check('CR0 RESET self-clears', qt.readl(AS + 0xA000) >> 31, 0)
+    qt.writel(AS + 0xA000, (1 << 6))                    # 16 kHz, 1 mic, 16-bit
+    qt.writel(AS + 0x0C + 0x18 * 5, 0x3c)               # ingenic_dmic_dma_start
+    qt.writel(AS + 0x14 + 0x18 * 5, descs)
+    qt.writel(AS + 0x08 + 0x18 * 5, 1)
+    qt.writel(AS + 0x1004 + 0x10 * 5, 1)
+    qt.writel(AS + 0xA000, (1 << 6) | 1)                # EN
+    qt.step(10 * 1000 * 1000)
+    dba = qt.readl(AS + 0x18 * 5)
+    check('10 ms at 16 kHz: 160 samples into the ring of 2 x 160',
+          dba, ring + 320)
+    got = struct.unpack('<160h', qt.read(ring, 320))
+    want = [round(8192 * math.sin(2 * math.pi * 1000 * k / 16000))
+            for k in range(160)]
+    check('the samples are the 1 kHz tone, two to a word',
+          got[:24], tuple(want[:24]))
+    qt.step(15 * 1000 * 1000)
+    check('the ring wraps through the link (25 ms: 400 samples)',
+          qt.readl(AS + 0x18 * 5), ring + 160)
+    check('no interrupt without TIE', qt.readl(AS + 0x110), 0)
+    qt.writel(AS + 0xA000, 1 << 6)                      # stop
+    qt.writel(AS + 0x08 + 0x18 * 5, 0)
+    dba = qt.readl(AS + 0x18 * 5)
+    qt.step(10 * 1000 * 1000)
+    check('the DMA stops with the DMIC', qt.readl(AS + 0x18 * 5), dba)
+
+
 def test_dmic(qt):
     print('ingenic-dmic')
     qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
@@ -2000,6 +2039,7 @@ def main():
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
         test_codec_gain_t41(qt)
+        test_asdmic(qt)
         test_pwm(qt)
         test_drawbox(qt)
         test_i2d(qt)

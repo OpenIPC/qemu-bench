@@ -74,6 +74,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
 | 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12 (`/machine/dmic`) | `ingenic-dmic` |
+| 0x134D0000 | T41: the audio system's DMA, FIFOs, data bus and DMIC, core INTC 33 (`/machine/dmic`) | `ingenic-asdmic` |
 | 0x13460000 | T41: PWM controller, 8 channels (`/machine/pwm`) | `ingenic-pwm` |
 | 0x10043000 / 0x10044000 | SSI0 / SSI1 SPI masters (SSI1: T21, T30, T31, T40, T41), IRQ 9 / 8, buses `ssi0` / `ssi1` | `ingenic-ssi` |
 | 0x10060000 | OTG PHY registers (bytes) | RAM |
@@ -751,8 +752,19 @@ reach the analogue gains.
   RDMS raises request 13 while it holds an entry; FSR's level and
   FULL/EMPTY, INTCR's flags under IMR (the drivers mask them all). Every
   microphone hears a sine of `-global ingenic-dmic.tone-hz=N` (1 kHz).
-  T41's DMIC (0x134D0000, another block) is disabled in its device tree;
-  the other parts' builds drive none.
+  The other parts' builds drive none but T41's.
+- `ingenic-asdmic` (T41): T41's audio system at 0x134D0000 (core INTC
+  33), which the T41 SDK's `audio.ko` registers as its own platform
+  devices and drives with `dmic_enable=1` (oss3 `host/T41/dmic`; the
+  device tree's `ingenic,dmic` node stays disabled): the DMIC at +0xA000
+  (CR0 enable, rate 8/16/48/96 kHz, microphones, 16/24-bit; GCR gain,
+  storage), routed over the data bus (+0x4000) and the format converter
+  (+0x2000, storage) to FIFO 5 (+0x1000) and DMA channel 5 (+0x0):
+  a closed ring of 4-word descriptors (flags, DBA, the next descriptor's
+  bus address, DTC in bursts), which DBA follows as the samples land --
+  the driver's work queue polls it; no interrupt unless a descriptor asks
+  (TIE / LTIE, AIPR). Every microphone hears `-global
+  ingenic-asdmic.tone-hz=N` (1 kHz).
 
 `-audiodev wav,id=snd,path=out.wav -M t31,audiodev=snd` records what the
 guest plays.
@@ -1170,6 +1182,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` (their `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | own / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh --soc <soc>` | IMP_AI records 16 kHz mono: the 1 kHz tone on all eight (FFT peak 1000.0 Hz; rms 5793, 11585 on T10, T20, T30); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz), 1.08 s on T21: the DMA plays at 16 kHz, but its driver disables the stream right after the last write and its flush discards the ~0.8 s still queued (T20, built from the same source, waits first; why is open); `--rate 8000 --play-rate 16000` (two clocks): 440.0 Hz on T10, T23, T31, T40 |
 | OpenIPC `t40` / T41NQ SDK image, `--gains AI:AO` (IMP_AI_SetGain, IMP_AO_SetGain) | `t40` / `t41,variant=t41nq` | `test-ingenic-audio.sh --soc t40 --gains 12:20`, `--soc t41 --gains 27:28` | the codec's analogue gains: T40 records the tone at -6.0 dB (rms 2903 of 5793) and plays at -6.0 dB (4242 of 8464); T41 records at -6.0 dB (2903) and plays at +6.0 dB (16889 of 8464) |
 | OpenIPC `t40`, `audio.ko dmic_enable=1` + T40 SDK `libimp.a` | `t40` | `test-ingenic-audio.sh --soc t40 --dmic` | IMP_DMIC records 16 kHz: the DMIC's 1.5 kHz tone (peak 1500.0 Hz, rms 5793); with QEMU's TLB shadow entries on, 5 of 12 runs failed (see CPUs), without them 24 consecutive runs pass |
+| T41NQ SDK image, `audio.ko dmic_enable=1` + T41 SDK `libimp.a` | `t41,variant=t41nq` | `test-ingenic-audio.sh --soc t41 --dmic` | IMP_DMIC records 16 kHz through T41's own audio system DMA: the 1.5 kHz tone (peak 1500.0 Hz, rms 5793) |
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt |
@@ -1199,7 +1212,7 @@ its Apical base; above), T40's third sensor (VIC2) and the dual mode's
 raw caching through VIC MDMA, the T40/T41 AWB records' split (their
 pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
 AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
-addresses the engine physically), T41's DMIC, the DMIC's voice
+addresses the engine physically), the DMIC's voice
 trigger, PDMA
 transfers for peripherals other than the AIC and the SSI, the SSI slave,
 the DES engine, the HASH engine's CPU mode

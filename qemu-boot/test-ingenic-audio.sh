@@ -3,9 +3,9 @@
 # end: the kernel, rootfs and vendor audio.ko of an OpenIPC release (T10,
 # T20, T21, T23, T30, T31, T40) or of the T41 SDK's flash image, and a
 # libimp client (qemu-boot/ingenic-audio-test.c) that records through
-# IMP_AI -- the AIC's 1 kHz tone -- or with --dmic through IMP_DMIC (T40,
-# audio.ko dmic_enable=1; the DMIC's 1.5 kHz tone), and plays a 440 Hz
-# sine through IMP_AO into a wav audiodev.  On the host the recording's
+# IMP_AI -- the AIC's 1 kHz tone -- or with --dmic through IMP_DMIC (T40
+# and T41, audio.ko dmic_enable=1; the DMIC's 1.5 kHz tone), and plays a
+# 440 Hz sine through IMP_AO into a wav audiodev.  On the host the recording's
 # and the wav's frequencies are measured (an FFT peak) and checked.
 #
 #   bash qemu-boot/test-ingenic-audio.sh [--soc t10|t20|t21|t23|t30|t31|t40|t41]
@@ -94,8 +94,8 @@ t10|t20|t21|t30|t31)
      NEED="$FW/uImage.$SOC $FW/rootfs.squashfs.$SOC" ;;
 *) echo "no audio test for $SOC" >&2; exit 2 ;;
 esac
-if [ -n "$DMIC" ] && [ $SOC != t40 ]; then
-    echo "--dmic: T40 only (the other parts' audio.ko builds drive no DMIC)" >&2
+if [ -n "$DMIC" ] && [ $SOC != t40 ] && [ $SOC != t41 ]; then
+    echo "--dmic: T40 and T41 only (the other parts' audio.ko builds drive no DMIC)" >&2
     exit 2
 fi
 # the tone the recording must carry; with --dmic the AIC's is silenced
@@ -125,7 +125,7 @@ open(sys.argv[2] + '/uImage', 'wb').write(d[0x40000:0x40000 + 64 + n])
 open(sys.argv[2] + '/root.sq', 'wb').write(d[0x2C0000:0x4C0000])
 PY
     unsquashfs -q -d "$WORK/rfs" "$WORK/root.sq" >/dev/null
-    $CC -O2 -Wall -I"$SDK41/include" -static -s \
+    $CC -O2 -Wall -I"$SDK41/include" ${DMIC:+-DAUDIO_DMIC} -static -s \
         -o "$WORK/rfs/usr/bin/audio-test" "$SRC" \
         "$SDK41/lib/uclibc/libimp.a" "$SDK41/lib/uclibc/libalog.a" \
         "$SDK41/lib/uclibc/libsysutils.a" -lpthread -lm -lrt -ldl -lstdc++ \
@@ -136,7 +136,7 @@ PY
     "$TC/${CROSS}strip" --strip-unneeded "$WORK"/rfs/lib/lib*.so* 2>/dev/null || true
     # the SDK image's start.sh, without its application
     LOADER='mount -t jffs2 /dev/mtdblock3 /system
-insmod /system/lib/modules/audio.ko'
+insmod /system/lib/modules/audio.ko'"${DMIC:+ dmic_enable=1}"
     KERNEL=$WORK/uImage
     ROOTDEV=/dev/mtdblock4
     MTDPARTS="sfc0_nor:256k(boot),2560k(kernel),2048k(root),9472k(appfs),-(test)"
@@ -200,6 +200,7 @@ rm -f "$OUT/console.log" "$OUT/play.wav"
     -display none -serial file:"$OUT/console.log" -nic none \
     -kernel "$KERNEL" -global ingenic-aic.tone-hz=$ATONE \
     ${DMIC:+-global ingenic-dmic.tone-hz=$DTONE} \
+    ${DMIC:+-global ingenic-asdmic.tone-hz=$DTONE} \
     -append "console=ttyS1,115200n8 root=$ROOTDEV rootfstype=squashfs init=/usr/bin/audio-init mtdparts=$MTDPARTS $MEM" &
 QPID=$!
 for i in $(seq "$TIMEOUT"); do
