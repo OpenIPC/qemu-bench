@@ -185,6 +185,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define SADC_BASE       0x10070000
 #define IRQ_SADC        18
 #define USBPHY_BASE     0x10060000  /* the OTG PHY's own registers */
+#define DES_BASE        0x10061000
 #define DTRNG_BASE      0x10072000
 #define AES_BASE        0x13430000
 #define HASH_BASE       0x13480000
@@ -1296,10 +1297,16 @@ static void ingenic_init(MachineState *ms)
     }
 
     /*
-     * The security blocks: AES on every part; HASH and the DTRNG from
-     * T21 on; RSA (polled) on T23, T31, T40 and T41.
+     * The security blocks: AES and DES (on PDMA lines 0x2E / 0x2F) on
+     * every part; HASH and the DTRNG from T21 on; RSA (polled) on T23,
+     * T31, T40 and T41.
      */
     sysbus_create_simple("ingenic-aes", AES_BASE, ingenic_irq(ims, IRQ_AES));
+    dev = sysbus_create_simple("ingenic-des", DES_BASE, NULL);
+    qdev_connect_gpio_out_named(dev, "drq-tx", 0,
+                                qdev_get_gpio_in_named(pdma, "drq", 0x2E));
+    qdev_connect_gpio_out_named(dev, "drq-rx", 0,
+                                qdev_get_gpio_in_named(pdma, "drq", 0x2F));
     if (info->soc != INGENIC_T10 && info->soc != INGENIC_T20 &&
         info->soc != INGENIC_T30) {
         sysbus_create_simple("ingenic-hash", HASH_BASE,

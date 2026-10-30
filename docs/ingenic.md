@@ -80,6 +80,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10060000 | OTG PHY registers (bytes) | RAM |
 | 0x10072000 | DTRNG, IRQ 34 (T21, T23, T31, T40, T41) | `ingenic-dtrng` |
 | 0x13430000 | AES engine, IRQ 23 (every part) | `ingenic-aes` |
+| 0x10061000 | DES / triple-DES engine, PDMA 0x2E / 0x2F (every part) | `ingenic-des` |
 | 0x13480000 | HASH engine (MD5, SHA-1/2), IRQ 22 (T21, T23, T31, T40, T41) | `ingenic-hash` |
 | 0x134C0000 | RSA engine, 1024/2048 bits, polled (T23, T31, T40, T41) | `ingenic-rsa` |
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
@@ -657,11 +658,13 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   CE2 (CR0 FSEL) are the chip selects of the bus's peripherals with cs 0 /
   1: `-device w25q80,bus=ssi0` puts a flash on SSI0. The PDMA serves it on
   request types 0x16 / 0x17 (SSI0) and 0x18 / 0x19 (SSI1). No shipped
-  kernel enables the driver; the SSI slave (0x10040000) has none at all
-  and is not modelled.
-- Security blocks, as the SDKs' `sample_aes`, `sample_hash`, `sample_rsa`
-  and `sample_dtrng` and the 4.4 kernel's crypto and hw_random drivers
-  use them; everything completes at once:
+  kernel enables the driver. The SSI slave (0x10040000) is not
+  modelled: the 3.10 kernel has its Kconfig entries (`JZ_SPI_SLAVE`) and
+  T31's platform device, but no tree here carries the driver, so there
+  is no register contract to follow.
+- Security blocks, as the SDKs' `sample_aes`, `sample_hash`, `sample_rsa`,
+  `sample_dtrng` and `sample_des` and the 4.4 kernel's crypto and
+  hw_random drivers use them; everything completes at once:
   - `ingenic-aes`: ECB / CBC with 128/192/256-bit keys, by DMA (ASSA,
     ASDA, ASTC in 16-byte blocks) or one block through ASDI/ASDO; key,
     IV and data words are big-endian (the 4.4 driver byte-swaps every
@@ -670,13 +673,26 @@ loads `tx-isp-t41.ko` without `direct_mode`.
     padded, by DMA (HSTC in 64-byte units), the state carried across
     runs until HSCR bit 4 reloads it; HSDO gives the digest four bytes at
     a time as little-endian words (what the 4.4 driver hands its
-    self-tests). HSDI (CPU mode) is not modelled; no driver uses it.
+    self-tests). HSDI (CPU mode) is not modelled: no driver or sample in
+    any tree here feeds it, so how many words make a round and what then
+    signals is not known.
   - `ingenic-rsa`: M^E mod N, 1024 or 2048 bits (RSAC bit 7); operands
     written most significant word first, the result read least
     significant first -- the order the sample's own `test_rsa.h` vectors
     decrypt with. Polled: its interrupt is not wired.
   - `ingenic-dtrng`: a number ready 10 us after CFG bit 0, from the
     host's entropy; CFG bit 12 clears ready, bit 11 masks the interrupt.
+  - `ingenic-des` (0x10061000, every part): DES and triple DES (EDE with
+    K1, K2, K3), ECB or CBC (DESCR2 bits 2, 1; bit 3 decrypts). Setting
+    DESCR1's work bit empties the FIFOs and loads the CBC chain from the
+    IV; every second DESDIN word completes a block, ciphered into a
+    16-word output FIFO that DESSR bit 0 reports empty. With DESCR2 bit 0
+    the PDMA moves it: request 0x2E feeds DESDIN while the output has
+    room for a block, 0x2F drains DESDOUT. Keys and IV are taken as
+    written (L the high word); data words are byte-swapped with DESCR2
+    bit 4 (the driver's "little endian"), so that a buffer's bytes form
+    the block -- the order under which FIPS 46's worked example comes out
+    of `sample_des`; nothing else pins it down.
 - The OTG PHY's byte registers at 0x10060000 (`cpm_usb.c`, the 4.4 inno
   PHY driver): storage, nothing is polled.
 
@@ -1185,7 +1201,7 @@ teardown, so the verdict comes first.
 | T41NQ SDK image, `audio.ko dmic_enable=1` + T41 SDK `libimp.a` | `t41,variant=t41nq` | `test-ingenic-audio.sh --soc t41 --dmic` | IMP_DMIC records 16 kHz through T41's own audio system DMA: the 1.5 kHz tone (peak 1500.0 Hz, rms 5793) |
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
-| OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt |
+| OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
@@ -1214,8 +1230,9 @@ pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
 AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
 addresses the engine physically), the DMIC's voice
 trigger, PDMA
-transfers for peripherals other than the AIC and the SSI, the SSI slave,
-the DES engine, the HASH engine's CPU mode
+transfers for peripherals other than the AIC, the SSI and the DES, the
+SSI slave and the HASH engine's CPU mode (no driver in any tree here, so
+no contract; above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
