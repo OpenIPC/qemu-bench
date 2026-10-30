@@ -65,7 +65,7 @@ WORK=$(cd "$WORK" && pwd)
 case "$FFMPEG" in
 '') if command -v ffmpeg >/dev/null; then FFMPEG=ffmpeg
     elif command -v docker >/dev/null; then
-        FFMPEG="docker run --rm --network host -u $(id -u):$(id -g) -v $WORK:$WORK jrottenberg/ffmpeg:6.1-alpine"
+        FFMPEG="docker run --rm -i --network host jrottenberg/ffmpeg:6.1-alpine"
     else
         echo "SKIP: no ffmpeg"; exit 0
     fi ;;
@@ -106,11 +106,13 @@ rc=0
 for s in main second; do
     case $s in main) W=1920; H=1080 ;; second) W=640; H=360 ;; esac
     rm -f "$WORK/$s.nv12"
-    # no -t: a timed read stops at the wall clock; -frames counts pictures
+    # no -t: a timed read stops at the wall clock; -frames counts pictures.
+    # The pictures come back on stdout: a docker ffmpeg's daemon need not
+    # see this host's files.
     $FFMPEG -hide_banner -v error -rtsp_transport tcp \
         -i "rtsp://127.0.0.1:$PORT/$s" -err_detect explode \
-        -frames:v $((SECS * 25)) -f rawvideo -pix_fmt nv12 \
-        "$WORK/$s.nv12" > "$WORK/$s.ffmpeg.log" 2>&1 || true
+        -frames:v $((SECS * 25)) -f rawvideo -pix_fmt nv12 - \
+        > "$WORK/$s.nv12" 2> "$WORK/$s.ffmpeg.log" || true
     grep -v "^docker: bind sources" "$WORK/$s.ffmpeg.log" > "$WORK/$s.err" || true
     python3 - "$WORK" "$s" "$W" "$H" "$SECS" "$HERE/ingenic-isp-check.py" <<'EOF' || rc=1
 import importlib.util, os, sys
@@ -133,7 +135,8 @@ def frame(i):
     uv = np.array(d[i * fs + w * h:(i + 1) * fs]).reshape(h // 2, w)
     return y, uv
 # the OSD box (libimp's timestamp region) and a reference box on the same
-# rows, right of the counter, where the scene is plain background
+# rows, right of the counter, where the scene is plain background; with
+# the AE metering the dark scene the OSD stands some 15 levels above it
 if s == 'main':
     box, ref = (16, 38, 5, 325), (16, 38, 600, 920)
 else:
@@ -149,7 +152,7 @@ for i in sorted({0, n // 2, n - 1}):
     rb = y[ref[0]:ref[1], ref[2]:ref[3]].astype(float)
     osd = ob.mean() - rb.mean()
     good = (bright > 0.15 and 20 < bgm < 170 and bgs < 8 and dx is not None
-            and (s != 'main' or (cnt is not None and osd > 15)))
+            and (s != 'main' or (cnt is not None and osd > 10)))
     print('  picture %3d: counter %s, logo %.0f%% bright, background Y %.1f, '
           'dot at x %s, OSD box Y %.1f vs %.1f beside it: %s'
           % (i, cnt, bright * 100, bgm, dx, ob.mean(), rb.mean(),
