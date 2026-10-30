@@ -1122,6 +1122,7 @@ static void ingenic_init(MachineState *ms)
     sysbus_mmio_map(sbd, 0, PDMA_BASE);
     sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_PDMA));
     dev = qdev_new("ingenic-aic");
+    object_property_set_link(OBJECT(dev), "cpm", OBJECT(cpm), &error_fatal);
     if (ms->audiodev) {
         qdev_prop_set_string(dev, "audiodev", ms->audiodev);
     }
