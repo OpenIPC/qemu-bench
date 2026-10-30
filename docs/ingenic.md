@@ -856,11 +856,21 @@ and +0x2C a B/G window (Q8, min in [15:0], max in [31:16]), +0x30 and
 in [31:16]), +0x38 a luma window ([7:0] low, [15:8] high; luma taken
 as (R + 2 G + B) / 4) -- the driver's all-pass values (R/G 1..4095,
 bounds 0 and 65535) read so -- and a zone's count is of the quads that
-passed. T40 and T41 program windows of the same form at 0x18028 but
-their eight records a zone are not decoded: their quads are not
-filtered and the light's colour is applied before the 2.2 gamma there
-(a white then reads 0.27 R, 0.33 B), the calibration under which their
-AWB follows the light.
+passed. T40 and T41 program the same form at 0x18028 (on the T41 SDK
+image R/G 60..245, B/G 30..200, k 256 with bounds 170 and 320, and the
+luma window in +0x38's bytes 0 and 2, 10..230). Their 128-byte zones
+are four pairs of 16-byte records (`tisp_awb_get_statistics`), a pair
+per statistics position; the tuning picks the pair read (its block's
+bytes 3274 / 3276; with 3274 set only that pair is stored, 32 bytes a
+zone). Of a pair the AWB's gains follow the second record alone:
+filling the first filtered or not never moved them (eight runs, three
+light colours, two light levels). Filtered as above in linear light,
+the second record leaves T41's AWB no white candidate in this scene --
+its AE exposes for the navy, the logo clips past the luma window -- and
+the AWB holds its start gains (2212 / 1856), the T23 case below. So
+T40 and T41 fill all eight records unfiltered, with the light's colour
+applied before the 2.2 gamma (a white then reads 0.27 R, 0.33 B), the
+calibration under which their AWB follows the light.
 `light`, `light-r` and `light-b` can change while running
 (`qom-set /machine/isp light 30`). The kernel's AE starts high and
 settles over a second or two -- on T31 a light of 30 % and of 100 % give
@@ -882,7 +892,34 @@ it would on a camera. T23 follows the light while its AE settles
 (frame 8: R 1784 / B 1484 daylight, R 1148 / B 2388 warm, R 1984 / B
 1500 cool) and then, its AE exposing this dark scene until the white
 logo and counter clip past its luma ceiling (240) and nothing neutral
-is left inside the filter, holds its defaults (R 1728 / B 1920).
+is left inside the filter, holds its defaults (R 1728 / B 1920). That
+is not the model clipping too hard: a white of the painted scene is a
+full-scale reflector, the navy behind it 1.2 %, and an AE that brings
+the navy up to its target puts the white some twelve times past full
+scale; saturated pixels fail the luma window on silicon too.
+
+T31 and T23 also produce their other statistics
+(`ingenic_isp_xstats()`), each into the banks `tisp_init` gives it:
+
+| | block, banks | status bit | layout |
+|---|---|---|---|
+| AE1 | 0xA800, AE0's form | 28, 29 | AE0's zones and histogram (the same frame in a linear mode) |
+| AF | grid 0xB804 (pixels; 8 x 8 zones of 238 x 134 at 1080p), banks 0xB8A8, last bank number 0xB8BC | 31 | 16 bytes a zone: FIR 0 / 1, IIR 0 / 1 (22 bits each), luma sum (23), bright count (15) |
+| ADR | banks 0x4494, last bank's address 0x44B0; 0x0C bit 7 bypasses | 18 | 6 x 8 blocks of luma sum and a five-bin histogram, then a 512-bin luma histogram (three 21-bit counts per 8 bytes) |
+| defog | banks 0x5B84, last bank's address 0x5BA4; 0x0C bit 11 bypasses | 20 | from +8, 180 blocks of B, G, R sums (24 bits) and three halfwords (here the dark channel, brightest and mean luma) |
+| WDR (T31) | banks of 8 KiB at 0x2010, last address 0x2680; only with 0x0C bit 0 clear | 11 | long and short exposure R, G, B histograms (256 x 21 bits), luma counts and sums, in eight 516-byte rows 1 KiB apart |
+
+The AF filters are the luma's differences to the next pixel and the
+one after, along the row (FIR) and down the column (IIR), summed over
+the zone. With them `IMP_ISP_Tuning_GetAFMetrices` on T31 reads about
+1.6 million, and 0 without; when the light quadruples and turns warm it
+drops to about 0.9 million as the logo clips. With ADR and defog fed,
+their algorithms run every frame and write their outputs (ADR
+0x4270..0x43A4, defog's per-block transmission and air light from
+0x58000) where without statistics only their init values are written
+once; on the static scene those outputs settle and stay, also across a
+change of light, and which of defog's three halfwords means what is a
+guess.
 
 The tests that check pictures take them once the AE has
 settled (`test-ingenic-isp.sh` the last frames of 40, the encoder client
@@ -1191,9 +1228,14 @@ and pow(), and the TCU's PWM pins.
 ## Not modelled
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
-its Apical base; above), T40's third sensor (VIC2) and the dual mode's
-raw caching through VIC MDMA, the T40/T41 AWB records' split (their
-pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
+its Apical base; above), T40's third sensor (VIC2: `tx-isp-t40.ko`
+supports one, "The third sensor init", in a joint mode where sensors
+share a pipe through VIC MDMA raw caching) and that raw caching (VIC
++0x300.., `vic_mdma_enable`, also the `snapraw` debug command), the
+T40/T41 AWB pixel filter (above), T40/T41's AF, ADR, defog, WDR, LCE,
+GSM and TMO statistics (T41 bits 6, 9, 10, 11, 8, 7, 17 of 0x40028, AF
+index 0x1A0E0, formats other than T31's: AF packs zones in fours with
+23-bit fields), the Apical
 AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
 addresses the engine physically), T41's DMIC, the DMIC's voice
 trigger, T40/T41's codec gains, PDMA
