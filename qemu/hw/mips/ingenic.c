@@ -200,6 +200,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_AIP_T       40
 #define IRQ_AIP_F       39
 #define IRQ_AIP_P       38
+#define MONITOR_BASE    0x130A0000  /* T40, T41 */
+#define IRQ_MONITOR     53
 #define IRQ_IPU         6       /* Linux 14, "ipu" */
 #define I2D_BASE        0x130B0000  /* T40, T41 */
 #define DRAWBOX_BASE    0x130D0000  /* T40, T41 */
@@ -1280,6 +1282,16 @@ static void ingenic_init(MachineState *ms)
         object_property_add_child(OBJECT(ims), "pwm", OBJECT(dev));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, PWM_BASE);
+    }
+
+    /* T40's and T41's bus monitor: /machine/monitor */
+    if (ingenic_is_xburst2(info->soc)) {
+        dev = qdev_new("ingenic-monitor");
+        object_property_add_child(OBJECT(ims), "monitor", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, MONITOR_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_MONITOR));
     }
 
     /*

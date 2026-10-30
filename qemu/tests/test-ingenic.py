@@ -78,6 +78,7 @@ BOOTROM = 0x1FC00000
 SCRATCH = 0x00800000
 AIP = 0x12B00000
 AIP_ALIAS = 0x13090000
+MONITOR = 0x130A0000
 ISP = 0x13300000
 SADC = 0x10070000
 I2D = 0x130B0000
@@ -603,6 +604,41 @@ def test_aip(qt, intc=CORE_INTC):
     check('P: shifted by the matrix, the pad value outside', out, want)
     check('P: the AIP2 line', (qt.readl(intc + 0x20) >> 6) & 1, 1)
     qt.writel(P + 0x04, 1)
+
+
+def test_monitor(qt, intc=CORE_INTC):
+    print('ingenic-monitor (T40/T41)')
+    ch = 2 * 0x100                                  # the sample's channel 2
+    ctrl = lambda: qt.readl(MONITOR + ch)
+    # bus_monitor.c monitor_start, monitor mode (2), a short window
+    qt.writel(MONITOR + ch, 0x0000ff00)
+    qt.writel(MONITOR + ch, ctrl() | (1 << 30))     # soft reset
+    qt.writel(MONITOR + ch, ctrl() & ~(1 << 30))
+    qt.writel(MONITOR + ch, ctrl() | (1 << 17))     # monitor mode
+    qt.writel(MONITOR + ch, ctrl() | 0x80000000)    # clock
+    qt.writel(MONITOR + ch + 0x04, 3000)            # 3000 cycles: 10 us
+    qt.writel(MONITOR + ch + 0x0C, 0xffffffff)
+    qt.writel(MONITOR + ch + 0x74, 0)               # unmask
+    check('idle: no cycles counted', qt.readl(MONITOR + ch + 0x10), 0)
+    qt.writel(MONITOR + ch, ctrl() | (1 << 29))     # enable
+    qt.step(5000)
+    cyc = qt.readl(MONITOR + ch + 0x10)
+    check('5 us at 300 MHz: 1500 cycles', cyc, 1500)
+    check('no slot interrupt yet', qt.readl(MONITOR + ch + 0x70), 0)
+    qt.writel(MONITOR + ch, ctrl() | 1 | 4)         # lock, capture
+    qt.step(1000)
+    check('lock holds the captured count', qt.readl(MONITOR + ch + 0x2C), 1500)
+    qt.step(10000)
+    check('the window ends: TIME_SLOT_REACH', qt.readl(MONITOR + ch + 0x70)
+          & 0x10, 0x10)
+    check('the MONITOR line (53) pending', (qt.readl(intc + 0x20) >> 21) & 1, 1)
+    qt.writel(MONITOR + ch + 0x78, 0x10)
+    check('INT_CLR drops it', (qt.readl(MONITOR + ch + 0x70),
+          (qt.readl(intc + 0x20) >> 21) & 1), (0, 0))
+    qt.writel(MONITOR + ch, ctrl() | (1 << 30))
+    check('soft reset stops counting', qt.readl(MONITOR + ch + 0x10), 0)
+    qt.writel(MONITOR + 0x500 + 0x74, 3)
+    check('the AHB channel at 0x500', qt.readl(MONITOR + 0x574), 3)
 
 
 def test_i2d(qt, intc=CORE_INTC):
@@ -2097,6 +2133,7 @@ def main():
         qt = QTest(a.qemu, 't40')
         test_drawbox(qt)
         test_i2d(qt)
+        test_monitor(qt)
         qt.close()
         qt = QTest(a.qemu, 't20')
         test_aes(qt)

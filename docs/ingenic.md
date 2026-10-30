@@ -70,6 +70,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13080000 | IPU, libimp's OSD blender (every part), IRQ 14 | `ingenic-ipu` |
 | 0x130B0000 | T40, T41: I2D, rotate / mirror / flip (frame channel rotation), IRQ 45 | `ingenic-i2d` |
 | 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
+| 0x130A0000 | T40, T41: bus MONITOR (AXI/AHB bandwidth and address watch), IRQ 53 | `ingenic-monitor` |
 | 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
@@ -92,7 +93,7 @@ Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
 unimplemented device, logged with `-d unimp`). Interrupt numbers are the
 same on every part: AIC 1, SSI1 8, SSI0 9, SFC 7, PDMA 10, DMIC 12, GPIO A 17 (B 16, C 15, D 14), OTG 21,
 SADC 18, HASH 22, AES 23, DTRNG 34, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
-ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, on T40/T41 DRAWBOX 42 and I2D 45, and T41's AIP 40 (T), 39 (F), 38 (P) (Linux
+ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, on T40/T41 DRAWBOX 42 and I2D 45, T41's AIP 40 (T), 39 (F), 38 (P), and the MONITOR 53 (Linux
 numbers are these + 8: the ISP's 37 and 38, the AVPU's 70).
 
 ## CPUs
@@ -648,6 +649,14 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   the CbCr pairs moved as units at half size) to DST with its strides and
   sets frame done (IRQ_STATE bit 0, cleared through IRQ_CLEAR) 100 us
   later.
+- `ingenic-monitor` (T40, T41; the SDKs' `sample_bus_monitor`): six AXI
+  channels (0..4, 6; 0x100 each) and the AHB one (5, at 0x500), each with
+  CTRL, a counting window, read / write counters, a watch range and
+  INT_STA / INT_MASK / INT_CLR. In monitor mode the cycle counters follow
+  virtual time at `clock-hz` (300 MHz) and the window's end raises
+  TIME_SLOT_REACH; capture / lock / clear latch and zero them. QEMU's
+  accesses pass no bus here, so the traffic counters stay 0 and a watched
+  range never matches.
 - `ingenic-aip` (T41; `drivers/video/ingenic_aip`, `/dev/jzaip_t`, `_f`,
   `_p`): the NNA's image pre-processor. The kernel driver only maps it,
   hands out a chain buffer per unit and waits for the interrupt; the
@@ -1232,9 +1241,8 @@ T40/T41 SDK kernels, drivers and libimp):
 
 - T40's BSCALER (0x13090000): as T41's AIP, the kernel driver only maps
   it; its programming is libvenus's (magik-toolkit nna1) bscaler HAL.
-- VO (T41 0x130C0000, `ingenic_vo.c`) and MONITOR (0x130A0000, a bus
-  bandwidth monitor, `sample_bus_monitor` only): no consumer in libimp or
-  the images (`sample-LCD` draws on `/dev/fb0`, the DPU).
+- VO (T41 0x130C0000, `ingenic_vo.c`): no consumer in libimp or the
+  images (`sample-LCD` draws on `/dev/fb0`, the DPU).
 - T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
   the VPU when libimp asks for it; the VPU raises the completion, so
   storage passes the picture through un-denoised.
