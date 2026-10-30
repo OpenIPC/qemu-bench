@@ -274,9 +274,22 @@ static void avpu_update(IngenicAvpuState *s)
 
 /* ---- guest memory ------------------------------------------------------- */
 
+/*
+ * T41's direct_mode hands the encoder its source as 0x80000000 /
+ * 0x81000000: the IVDC's store (RAM there, hw/mips/ingenic.c), not DRAM
+ */
+#define AVPU_IVDC_BASE      0x80000000u
+#define AVPU_IVDC_SIZE      0x02000000u
+
+static hwaddr avpu_addr(hwaddr a)
+{
+    a &= 0xffffffff;
+    return a - AVPU_IVDC_BASE < AVPU_IVDC_SIZE ? a : a & AVPU_DMA_MASK;
+}
+
 static void avpu_read(hwaddr a, void *buf, size_t n)
 {
-    dma_memory_read(&address_space_memory, a & AVPU_DMA_MASK, buf, n,
+    dma_memory_read(&address_space_memory, avpu_addr(a), buf, n,
                     MEMTXATTRS_UNSPECIFIED);
 }
 

@@ -82,6 +82,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x134C0000 | RSA engine, 1024/2048 bits, polled (T23, T31, T40, T41) | `ingenic-rsa` |
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
 | 0x12660000 | XBurst2 on-chip RAM (64 KiB) | RAM |
+| 0x80000000 | T41: the IVDC's frame store as `direct_mode` addresses it (32 MiB; registers at 0x13200000 read as zero) | RAM |
 | 0x1F000000 | cache-as-RAM window (32 KiB) | RAM |
 | 0x1FC00000 | boot ROM (the reset vector, 0xBFC00000) | ROM |
 
@@ -326,7 +327,7 @@ live555 RTSP server (`rtsp://<address>:8554/main`, `/second`). Root has
 no password. `qemu-boot/test-ingenic-sdk-boot.sh --image <img>` takes
 the grade, RAM and sensor from the image, rebuilds the root so that rcS
 runs `app_init.sh` at the test's address (and, with a sensor, without
-IVDC's `direct_mode`), puts QEMU's user network on that /24 with host
+IVDC's `direct_mode` unless `--direct-mode`), puts QEMU's user network on that /24 with host
 forwards for telnet and RTSP, logs in over telnet
 (`qemu-boot/ingenic-telnet.py`), pulls and decodes the stream, and
 reboots the camera over telnet once.
@@ -916,9 +917,23 @@ no T41 release, so its test boots the SDK's own T41NQ 16 MiB flash image
 partition, with the vendor modules from the image's JFFS2 and the client
 linked statically against the SDK's `libimp.a`. The T41 `start_param`
 loads the ISP with `direct_mode=1` and the application with `--dm 1`:
-IVDC, the ISP-to-encoder path at 0x13200000, is not modelled, so the
-tests that run the vendor application turn it off (frames go through
-memory, as on every other part). The core's 0x204 bit 0 follows 0x200
+IVDC, the ISP-to-encoder path ("T41 IVDC Module Application Guide";
+its driver is part of `tx-isp-t41.ko`). In that mode tx-isp queues
+channel 0 the pair 0x80000000 / 0x81000000 instead of DRAM buffers
+(pitch 4096), the scaler writes the picture into the IVDC's 288 KiB
+store (spilling to DRAM lines it configures at IVDC +0x34 / +0x38), and
+the encoder is handed the same pair as its source. The ISR sends the
+frame source its "buffer done" on int_sta bit 20, the MSCA's first line
+(bit 13, the vertical blank, with `ivdc_vb_type` 1), and on bit 0 queues
+the pair again instead of reading the done FIFO. Here 32 MiB of RAM at
+0x80000000 stands in for the store: the scaler paints a frame queued
+the pair into it and raises bit 20 without touching the done FIFO, and
+the AVPU reads 0x80000000-0x81FFFFFF unmasked. The IVDC's registers at
+0x13200000 (sizes, the DRAM spill lines, its status at +0x44, cleared
+through +0x54) read as zero: its interrupt only counts overflows.
+`test-ingenic-sdk-boot.sh` strips `direct_mode` by default; with
+`--direct-mode` it keeps it, and the stream decodes with the scene as
+without. The core's 0x204 bit 0 follows 0x200
 bit 0: `ispcore_video_s_stream` and `ispcore_suspend_module` set the one
 and spin on the other without a timeout.
 
