@@ -1249,8 +1249,21 @@ and the blocks below read as zero or as storage.
 What the remaining video and compute blocks would need (survey of the
 T40/T41 SDK kernels, drivers and libimp):
 
-- T40's BSCALER (0x13090000): as T41's AIP, the kernel driver only maps
-  it; its programming is libvenus's (magik-toolkit nna1) bscaler HAL.
+- T40's BSCALER (0x13090000, IRQ 40 / 39): as T41's AIP, the kernel
+  driver only maps it and nothing shipped here programs it; libvenus
+  (magik-toolkit nna1, `libvenus.a`: bscaler_api, bscaler_hal,
+  bscaler_segmentation, bscaler_wrap) does. What its HAL shows: two
+  units, frame compute (resize / affine / perspective, 0x00..0x7C: size
+  0x04, Y 0x0C, per-plane addresses pushed through 0x18, strides, the
+  9-word matrix at 0x44..0x64, ORAM line buffers at 0x12620000, soft
+  reset bit 16 of 0x30) and frame transform (NV12 -> BGR, 0x88..0xA4 with
+  flags in 0xE4, reset bit 16 of 0xB0), coefficients shared at
+  0xC0..0xDC; libvenus splits each box into lines in software and chains
+  one hardware job per line as (value, register | last << 31) pairs
+  (`write_chain`). Modelling it means decoding those per-line jobs' fields
+  -- the same host harness as the AIP's (libvenus's bscaler objects
+  linked with logging `bscaler_write_reg` / `read_reg` and stub memory
+  helpers) would do it.
 - T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
   the VPU when libimp asks for it; the VPU raises the completion, so
   storage passes the picture through un-denoised.
