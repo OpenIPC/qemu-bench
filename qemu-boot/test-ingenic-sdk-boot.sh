@@ -52,6 +52,7 @@ FFMPEG=
 TIMEOUT=600
 REBOOT=1
 RTSP=1
+DIRECT=
 OUT=
 GUEST_IP=193.169.4.151
 
@@ -67,6 +68,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT=$2; shift ;;
     --no-reboot) REBOOT= ;;
     --no-rtsp) RTSP= ;;
+    --direct-mode) DIRECT=1 ;;
     --out) OUT=$2; shift ;;
     --guest-ip) GUEST_IP=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -179,7 +181,7 @@ if command -v unsquashfs >/dev/null && command -v mksquashfs >/dev/null &&
         count=$((ROOTSIZE >> 16)) status=none
     unsquashfs -q -d "$WORK/rfs" "$WORK/root.sq" >/dev/null 2>&1
     IVDC=
-    [ -n "$RTSP" ] && [ "$SENSOR" != none ] && IVDC=1
+    [ -n "$RTSP" ] && [ "$SENSOR" != none ] && [ -z "$DIRECT" ] && IVDC=1
     python3 - "$WORK/rfs/etc/init.d/rcS" "$GUEST_IP" "$NET.1" "$IVDC" <<'PY'
 import sys
 p, ip, gw, ivdc = sys.argv[1:5]
@@ -230,8 +232,9 @@ print(*[s.getsockname()[1] for s in ss])')"
 NIC="user,net=$NET.0/24,host=$NET.1"
 NIC="$NIC,hostfwd=tcp:127.0.0.1:$PTEL-$GUEST_IP:23"
 NIC="$NIC,hostfwd=tcp:127.0.0.1:$PRTSP-$GUEST_IP:8554"
+# shellcheck disable=SC2086  # QEMU_EXTRA: extra options, word-split
 "$QEMU" -M "$SOC,variant=$VARIANT$SENSOROPT,flash-file=$IMG" -m "$RAM" \
-    -display none -monitor none -serial "file:$LOG" -nic "$NIC" \
+    ${QEMU_EXTRA:-} -display none -monitor none -serial "file:$LOG" -nic "$NIC" \
     > "$OUT/qemu.err" 2>&1 &
 QPID=$!
 

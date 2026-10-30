@@ -120,6 +120,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define CAR_BASE        0x1F000000  /* the cache lines the ROM locks */
 #define CAR_SIZE        0x8000
 #define ORAM_BASE       0x12660000  /* XBurst2 on-chip RAM */
+#define IVDC_STORE_BASE 0x80000000  /* T41 direct_mode: the IVDC's frame */
+#define IVDC_STORE_SIZE 0x02000000
 #define ORAM_SIZE       0x10000
 #define IO_BASE         0x10000000
 #define IO_SIZE         0x04000000
@@ -955,6 +957,18 @@ static void ingenic_init(MachineState *ms)
         memory_region_init_ram(oram, NULL, "ingenic.oram", ORAM_SIZE,
                                &error_fatal);
         memory_region_add_subregion(sysmem, ORAM_BASE, oram);
+    }
+    if (info->soc == INGENIC_T41) {
+        /*
+         * IVDC (direct_mode): tx-isp queues channel 0 the pair 0x80000000 /
+         * 0x81000000, which the scaler writes into the IVDC and the encoder
+         * reads back; RAM there stands in for its store
+         */
+        MemoryRegion *ivdc = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(ivdc, NULL, "ingenic.ivdc", IVDC_STORE_SIZE,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, IVDC_STORE_BASE, ivdc);
     }
     /* CPM */
     dev = cpm = qdev_new("ingenic-cpm");

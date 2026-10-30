@@ -97,6 +97,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicIspState, INGENIC_ISP)
 #define MAX_PIPES       2
 #define NUM_VIC         3
 #define FIFO_DEPTH      16
+#define IVDC_Y          0x80000000u   /* T41 direct_mode's channel-0 pair */
 
 /*
  * What differs between the SoCs.  Every block keeps the T31 meaning of
@@ -145,6 +146,8 @@ typedef struct IngenicIspLayout {
      */
     uint8_t pipes;
     hwaddr pipe_ch, pipe_int, pipe_stat;
+    uint8_t ivdc_bit;           /* T41's IVDC: frame start of a channel
+                                   writing to the IVDC, in int_sta; 0: none */
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
@@ -289,6 +292,14 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
         .wb = 0x4004,
+        /*
+         * direct_mode: channel 0 is queued IVDC_Y / IVDC_UV; the ISR sends
+         * the frame source its "buffer done" on int_sta bit 20 (the
+         * MSCA's first line; bit 13, the vertical blank, with ivdc_vb_type
+         * 1) and on bit 0 queues the pair again instead of reading the
+         * done FIFO (ispcore_interrupt_service_routine 0x6d4f4, 0x6d66c)
+         */
+        .ivdc_bit = 20,
     },
 };
 
@@ -821,6 +832,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
                         r[l->osize >> 2];
         uint32_t w = size >> 16, h = size & 0xFFFF;
         uint32_t ya, uva;
+        bool ivdc;
 
         if (!(en & (1u << n)) || !c->y.count || !c->uv.count ||
             !w || !h || c->done_y.count == FIFO_DEPTH) {
@@ -828,10 +840,16 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         }
         ya = fifo_pop(&c->y, NULL);
         uva = fifo_pop(&c->uv, NULL);
+        ivdc = l->ivdc_bit && ya == IVDC_Y;
         ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
                           r[l->uvstride >> 2], ya, uva, false, gain);
-        fifo_push(&c->done_y, ya, c->frames);
-        fifo_push(&c->done_uv, uva, c->frames);
+        if (ivdc) {
+            /* into the IVDC's store (RAM at IVDC_Y), nothing to dequeue */
+            ISP_REG(l->int_sta) |= 1u << l->ivdc_bit;
+        } else {
+            fifo_push(&c->done_y, ya, c->frames);
+            fifo_push(&c->done_uv, uva, c->frames);
+        }
         c->frames++;
         ISP_REG(int_sta) |= 1u << n;
         if (s->trace) {

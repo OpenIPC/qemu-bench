@@ -1688,6 +1688,17 @@ def test_isp_layout(qt, soc):
         check('0x204 bit 0 follows 0x200 bit 0', qt.readl(ISP + 0x204) & 1, 1)
         qt.writel(ISP + 0x200, 0)
         check('and drops with it', qt.readl(ISP + 0x204) & 1, 0)
+        # direct_mode: channel 0 queued the IVDC pair (0x80000000 /
+        # 0x81000000) writes into the IVDC's store, raises bit 20 for the
+        # frame source and leaves the done FIFO empty
+        qt.writel(ch0 + push_y, 0x80000000)
+        qt.writel(ch0 + push_uv, 0x81000000)
+        qt.step(41 * 1000 * 1000)
+        check('IVDC: bit 20 and channel 0 done',
+              qt.readl(ISP + sta) & (1 << 20 | 1), 1 << 20 | 1)
+        check('IVDC: nothing to dequeue', qt.readl(ch0 + empty) & 1, 1)
+        check('IVDC: painted into its store',
+              36 <= qt.read(0x80000000 + 12 * w, 1)[0] <= 50, True)
 
 
 def test_isp_apical(qt, soc='t20'):
