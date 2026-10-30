@@ -74,6 +74,12 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
 | 0x13460000 | T41: PWM controller, 8 channels (`/machine/pwm`) | `ingenic-pwm` |
+| 0x10043000 / 0x10044000 | SSI0 / SSI1 SPI masters (SSI1: T21, T30, T31, T40, T41), IRQ 9 / 8, buses `ssi0` / `ssi1` | `ingenic-ssi` |
+| 0x10060000 | OTG PHY registers (bytes) | RAM |
+| 0x10072000 | DTRNG, IRQ 34 (T21, T23, T31, T40, T41) | `ingenic-dtrng` |
+| 0x13430000 | AES engine, IRQ 23 (every part) | `ingenic-aes` |
+| 0x13480000 | HASH engine (MD5, SHA-1/2), IRQ 22 (T21, T23, T31, T40, T41) | `ingenic-hash` |
+| 0x134C0000 | RSA engine, 1024/2048 bits, polled (T23, T31, T40, T41) | `ingenic-rsa` |
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
 | 0x12660000 | XBurst2 on-chip RAM (64 KiB) | RAM |
 | 0x1F000000 | cache-as-RAM window (32 KiB) | RAM |
@@ -81,8 +87,8 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 
 Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
 unimplemented device, logged with `-d unimp`). Interrupt numbers are the
-same on every part: AIC 1, SFC 7, PDMA 10, GPIO A 17 (B 16, C 15, D 14), OTG 21,
-SADC 18, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
+same on every part: AIC 1, SSI1 8, SSI0 9, SFC 7, PDMA 10, GPIO A 17 (B 16, C 15, D 14), OTG 21,
+SADC 18, HASH 22, AES 23, DTRNG 34, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
 ISP 29, VIC 30, AVPU 62, and on T40/T41 DRAWBOX 42 and I2D 45 (Linux
 numbers are these + 8: the ISP's 37 and 38, the AVPU's 70).
 
@@ -372,7 +378,12 @@ empty). On XBurst2 TSR bit 16 does not stop the watchdog and TCSR bit 10
 zeroes its counter: the 4.4 kernels' watchdog driver sets the stop bit at
 probe and nothing clears it, and their restart writes TCSR bit 10, TDR,
 the clock and TCER and spins ("check wdt."). The PWM channels count and
-flag without interrupts.
+flag without interrupts. Each channel's PWM pin (TCSR bit 7 output on,
+bit 8 initial level, bit 9 shut down; OpenIPC's `jz_tcu.c` and the SDKs'
+`sample_pwm`) starts a period at the initial level and flips at TDHR,
+until TDFR: `qom-get /machine/tcu pwm2` reads it as `high/period` counter
+ticks while the channel counts, `0` / `1` for a level that stays, or
+`off` while the TCU does not drive the pin.
 
 ### `ingenic-intc`, `ingenic-ccu`
 
@@ -622,6 +633,37 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   the CbCr pairs moved as units at half size) to DST with its strides and
   sets frame done (IRQ_STATE bit 0, cleared through IRQ_CLEAR) 100 us
   later.
+- `ingenic-ssi`: the SPI master of `jz_spi.c` (3.10) and `ingenic_spi.c`
+  (4.4). A queued frame (CR1 FLEN + 2 bits, MSB first) goes out on the
+  bus at once; the reply, or the frame itself with CR0 LOOP, lands in the
+  128-entry RX FIFO unless DISREV. The TX FIFO running dry with CR1 UNFIN
+  set raises UNDR -- the driver's PIO transfers end on that interrupt --
+  and with UNFIN clear the transfer ends (END) and CE is released. CE /
+  CE2 (CR0 FSEL) are the chip selects of the bus's peripherals with cs 0 /
+  1: `-device w25q80,bus=ssi0` puts a flash on SSI0. The PDMA serves it on
+  request types 0x16 / 0x17 (SSI0) and 0x18 / 0x19 (SSI1). No shipped
+  kernel enables the driver; the SSI slave (0x10040000) has none at all
+  and is not modelled.
+- Security blocks, as the SDKs' `sample_aes`, `sample_hash`, `sample_rsa`
+  and `sample_dtrng` and the 4.4 kernel's crypto and hw_random drivers
+  use them; everything completes at once:
+  - `ingenic-aes`: ECB / CBC with 128/192/256-bit keys, by DMA (ASSA,
+    ASDA, ASTC in 16-byte blocks) or one block through ASDI/ASDO; key,
+    IV and data words are big-endian (the 4.4 driver byte-swaps every
+    data word before and after); KEYD/AESD/DMAD under ASINTM.
+  - `ingenic-hash`: MD5, SHA-1/224/256/384/512 over blocks the driver has
+    padded, by DMA (HSTC in 64-byte units), the state carried across
+    runs until HSCR bit 4 reloads it; HSDO gives the digest four bytes at
+    a time as little-endian words (what the 4.4 driver hands its
+    self-tests). HSDI (CPU mode) is not modelled; no driver uses it.
+  - `ingenic-rsa`: M^E mod N, 1024 or 2048 bits (RSAC bit 7); operands
+    written most significant word first, the result read least
+    significant first -- the order the sample's own `test_rsa.h` vectors
+    decrypt with. Polled: its interrupt is not wired.
+  - `ingenic-dtrng`: a number ready 10 us after CFG bit 0, from the
+    host's entropy; CFG bit 12 clears ready, bit 11 masks the interrupt.
+- The OTG PHY's byte registers at 0x10060000 (`cpm_usb.c`, the 4.4 inno
+  PHY driver): storage, nothing is polled.
 
 ### Sound: `ingenic-aic` and `ingenic-pdma`
 
@@ -655,6 +697,17 @@ cyclic transfers.
   `-global ingenic-aic.rx-source=audiodev`, the host's input; the loop
   FIFO gets what is played. Requests: TX while TDMS and the TX FIFO has
   room, RX while RDMS and it holds a sample, loop while TLDMS and it does.
+
+The codec's analogue paths follow the SDKs' codec drivers
+(`jz_t10_codec.c`, `inner_codecs/T23/codec.c`): on T10, T20, T21 and T30
+the playback gain is CHCR (0x9C) bits 4:0 with the output on while CAR
+(0x94) bits 3:0 are, the record gain CACR2 (0x8C) bits 4:0 with the ADC
+on by CAMPCR (0x90) bit 7; on T23 and T31 playback is CHR (0xA0) bits 4:0
+with the headphone output on by CHR bit 7, record CALCGR (0x94) bits 4:0
+with the ADC on by CMICCR (0x8C) bit 7, and CMICCR bit 4 (ALC) holds the
+level whatever the gain. 1.5 dB a step, unity at the drivers' defaults
+(0x18 to play, 0x10 to record); a path that is off is silent. T40 and
+T41 (no codec source at hand) are not scaled.
 
 `-audiodev wav,id=snd,path=out.wav -M t31,audiodev=snd` records what the
 guest plays. DMIC (0x134D0000) is not modelled: the OpenIPC T10..T31
@@ -998,6 +1051,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t31` (its `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | `t31` / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh [--soc t41]` | IMP_AI records 16 kHz mono: the 1 kHz tone (FFT peak 1000.0 Hz, rms 5793); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz) |
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
+| OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
@@ -1007,7 +1061,11 @@ poll, the MSCA FIFOs and a frame painted into a queued buffer under
 `clock_step`, on T31 and through the T21, T23, T40 and T41 layouts, and
 on T20 and T10 the Apical slots, a DMA writer's bank and a dropped frame;
 and sound: a PDMA memory copy with its interrupt, a cyclic record ring
-filled with the tone at 16 kHz and a play ring drained at that rate.
+filled with the tone at 16 kHz and a play ring drained at that rate, and
+the T31 codec's record gain and switches; the SSI (READ ID from a
+`w25q80` by PIO, the underrun interrupt, 300 frames looped back through
+the PDMA), AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib
+and pow(), and the TCU's PWM pins.
 
 ## Not modelled
 
@@ -1015,14 +1073,10 @@ T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), T40's second pipe and VIC1/VIC2, T21's AWB
 response (above), AE1, AF, ADR, defog and WDR statistics, the Apical
 AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
-addresses the engine physically), DMIC, the codec's analogue side (gains,
-mutes: storage), PDMA transfers for peripherals other than the AIC, SSI,
-the TCU channels' PWM output
+addresses the engine physically), DMIC, T40/T41's codec gains, PDMA
+transfers for peripherals other than the AIC and the SSI, the SSI slave,
+the DES engine, the HASH engine's CPU mode
 and the blocks below read as zero or as storage.
-
-Also storage or zero, and untouched by every boot tested here: the OTG
-PHY registers (0x10060070/78; USB host works without them), the HASH,
-AES and RSA engines, and T40/T41's DTRNG.
 
 What the remaining video and compute blocks would need (survey of the
 T40/T41 SDK kernels, drivers and libimp):

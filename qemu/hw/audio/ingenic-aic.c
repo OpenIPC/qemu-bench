@@ -26,6 +26,20 @@
  * sample rate both ways -- the codec clocks the AIC.  The rest hold what
  * is written: the drivers read back each one they write.
  *
+ * The analogue side, by the "codec" property (the SDKs' codec drivers,
+ * oss2 jz_t10_codec.c and oss3 inner_codecs/T23/codec.c):
+ *   "t10" (T10, T20, T21, T30): playback gain CHCR (0x9C) bits 4:0, the
+ *         output on while CAR (0x94) bits 3:0 are; record gain CACR2
+ *         (0x8C) bits 4:0, the ADC on with CAMPCR (0x90) bit 7
+ *   "t31" (T23, T31): playback gain CHR (0xA0) bits 4:0, the headphone
+ *         output on with CHR bit 7; record gain CALCGR (0x94) bits 4:0,
+ *         the ADC on with CMICCR (0x8C) bit 7; with CMICCR bit 4 the ALC
+ *         holds the level whatever the gain
+ * Both gains are 1.5 dB a step, unity at the drivers' defaults (0x18 to
+ * play, 0x10 to record); an output or ADC that is off is silent.  With
+ * no "codec" (T40, T41, whose codec sources are not at hand) nothing is
+ * scaled.
+ *
  * Frames move at that rate while ENB is set: with ERPL one frame's
  * samples leave the TX FIFO (1 with M2S, CHANNEL + 1 otherwise; the last
  * sample again on underrun) for the machine's audiodev (16-bit stereo),
@@ -139,6 +153,7 @@ struct IngenicAicState {
 
     uint32_t tone_hz;
     char *rx_source;
+    char *codec_kind;
 };
 
 static uint32_t *aic_reg(IngenicAicState *s, hwaddr off)
@@ -225,6 +240,61 @@ static int16_t aic_from_width(uint32_t e, uint32_t code)
     return b >= 16 ? x >> (b - 16) : x << 8;
 }
 
+/* ---- the codec's analogue side ---------------------------------------- */
+
+#define CDC(off)        ((off) >> 2)
+
+static bool codec_is(IngenicAicState *s, const char *kind)
+{
+    return s->codec_kind && !strcmp(s->codec_kind, kind);
+}
+
+static int16_t codec_scale(int v, int steps)
+{
+    double x = v * pow(10.0, steps * 1.5 / 20);
+
+    return x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)lrint(x);
+}
+
+/* a recorded sample, through the microphone path */
+static int16_t codec_record(IngenicAicState *s, int16_t v)
+{
+    if (codec_is(s, "t31")) {
+        if (!(s->codec[CDC(0x8C)] & 0x80)) {
+            return 0;
+        }
+        if (s->codec[CDC(0x8C)] & 0x10) {
+            return v;                   /* the ALC holds the level */
+        }
+        return codec_scale(v, (s->codec[CDC(0x94)] & 0x1f) - 0x10);
+    }
+    if (codec_is(s, "t10")) {
+        if (!(s->codec[CDC(0x90)] & 0x80)) {
+            return 0;
+        }
+        return codec_scale(v, (s->codec[CDC(0x8C)] & 0x1f) - 0x10);
+    }
+    return v;
+}
+
+/* a played sample, through the headphone / speaker path */
+static int16_t codec_play(IngenicAicState *s, int16_t v)
+{
+    if (codec_is(s, "t31")) {
+        if (!(s->codec[CDC(0xA0)] & 0x80)) {
+            return 0;
+        }
+        return codec_scale(v, (s->codec[CDC(0xA0)] & 0x1f) - 0x18);
+    }
+    if (codec_is(s, "t10")) {
+        if (!(s->codec[CDC(0x94)] & 0x0f)) {
+            return 0;
+        }
+        return codec_scale(v, (s->codec[CDC(0x9C)] & 0x1f) - 0x18);
+    }
+    return v;
+}
+
 static int16_t aic_capture(IngenicAicState *s)
 {
     int16_t v = 0;
@@ -240,7 +310,7 @@ static int16_t aic_capture(IngenicAicState *s)
 
         v = (int16_t)lrint(8192 * sin(2 * M_PI * s->tone_hz * t));
     }
-    return v;
+    return codec_record(s, v);
 }
 
 static void aic_frame(IngenicAicState *s)
@@ -262,8 +332,8 @@ static void aic_frame(IngenicAicState *s)
             int16_t r = n > 1 ? aic_from_width(s->last_tx[1], oss) : l;
             uint32_t at = (s->out_head + s->out_count) % OUT_RING;
 
-            s->out[at] = l;
-            s->out[(at + 1) % OUT_RING] = r;
+            s->out[at] = codec_play(s, l);
+            s->out[(at + 1) % OUT_RING] = codec_play(s, r);
             s->out_count += 2;
         }
     }
@@ -617,6 +687,7 @@ static const Property ingenic_aic_props[] = {
     DEFINE_AUDIO_PROPERTIES(IngenicAicState, audio_be),
     DEFINE_PROP_UINT32("tone-hz", IngenicAicState, tone_hz, 1000),
     DEFINE_PROP_STRING("rx-source", IngenicAicState, rx_source),
+    DEFINE_PROP_STRING("codec", IngenicAicState, codec_kind),
 };
 
 static const VMStateDescription vmstate_aic_fifo = {
