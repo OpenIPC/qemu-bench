@@ -68,6 +68,8 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13200000 | video encoder: VPU (T10/T20), HELIX (T21/T30; T23: 0x13100000), IRQ 70 (T23: 48) | `ingenic-vpu` |
 | 0x13600000 | RADIX, T30's H.265 encoder, IRQ 53 | `ingenic-vpu` kind 1 |
 | 0x13080000 | IPU, libimp's OSD blender (every part), IRQ 14 | `ingenic-ipu` |
+| 0x130B0000 | T40, T41: I2D, rotate / mirror / flip (frame channel rotation), IRQ 45 | `ingenic-i2d` |
+| 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
@@ -81,8 +83,8 @@ Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
 unimplemented device, logged with `-d unimp`). Interrupt numbers are the
 same on every part: AIC 1, SFC 7, PDMA 10, GPIO A 17 (B 16, C 15, D 14), OTG 21,
 SADC 18, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
-ISP 29, VIC 30, AVPU 62 (Linux numbers are these + 8: the ISP's 37 and
-38, the AVPU's 70).
+ISP 29, VIC 30, AVPU 62, and on T40/T41 DRAWBOX 42 and I2D 45 (Linux
+numbers are these + 8: the ISP's 37 and 38, the AVPU's 70).
 
 ## CPUs
 
@@ -602,6 +604,24 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   WCFG taken on UPDATE, BUSYR clear, LVL and OEN; DMA mode is storage.
   `qom-get /machine/pwm chan2` reads a pin as `high/period` cycles or a
   fixed `0`/`1`. The other parts' PWM is the TCU's channels.
+- `ingenic-drawbox` (T40, T41; `ingenic_drawbox.c`, `/dev/dbox`): libimp
+  draws its OSD rectangles, corner marks and lines with it
+  (`OSD_Draw_Layer_Cover_Pic_RectLine` -> `dbox_osd`). The driver loads a
+  four-entry YUV palette (COLOR_Y/U/V, a byte each), the NV12 picture
+  (YB, CB, STRIDE, IMG_WH) and two RAM words per box -- x, y, w, h, colour,
+  mode (rectangle, corners, horizontal or vertical line), line width,
+  corner length -- and sets START; the boxes are drawn into the picture
+  in place (luma only with COLOR_MASK; BGRA pictures too) and the done
+  bit (CTRL bit 4) interrupts 50 us later unless IRQ_MASK. RESET clears
+  itself and empties the RAM. A line's length is its box width or
+  height, a corner arm the length field: inferred from the driver.
+- `ingenic-i2d` (T40, T41; `ingenic_i2d.c`, `/dev/i2d`): libimp rotates a
+  frame channel with it (`IMP_FrameSource_SetI2dAttr`). IMG_MODE picks
+  NV12, RAW8, RGB565 or ARGB8888, a rotation of 0/90/180/270 degrees
+  clockwise, mirror and flip; START writes the transformed picture (NV12:
+  the CbCr pairs moved as units at half size) to DST with its strides and
+  sets frame done (IRQ_STATE bit 0, cleared through IRQ_CLEAR) 100 us
+  later.
 
 ### Sound: `ingenic-aic` and `ingenic-pdma`
 
@@ -926,6 +946,8 @@ teardown, so the verdict comes first.
 | T30X SDK 1.0.5 full image (8 MiB), `sensor=jxf22` | `t30,variant=t30x -m 128M` | flash, user net | vendor kernel and modules, sample-RTSPServer: /main 1920x1080 and /second 640x360 H.265 over RTSP/TCP, 200 pictures each decoded without errors, the scene and the IPU's timestamp OSD (`test-ingenic-t30-rtsp.sh`) |
 | OpenIPC `t20`, `t21`, `t23`, `t30` libimp | own | `-kernel`, `test-ingenic-vpu-feed.py` | libimp's H.264 (fixed QP; CBR on T21/T23/T30) and JPEG encoders, T30's H.265: streams ffmpeg decodes with `-err_detect explode`, PSNR against the source picture |
 | OpenIPC `t31` (its `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | `t31` / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh [--soc t41]` | IMP_AI records 16 kHz mono: the 1 kHz tone (FFT peak 1000.0 Hz, rms 5793); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz) |
+| T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
+| T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
@@ -943,13 +965,30 @@ T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), T40's second pipe and VIC1/VIC2, the 3A
 statistics of T21 and the Apical parts, AE1, AF, ADR, defog and WDR
 statistics, the VPU's TLB (libimp addresses the engine
-physically), the T30 NCU/PP,
-the IPU's HSV output, the AIP, DMIC, the codec's analogue side (gains,
+physically),
+the IPU's HSV output, DMIC, the codec's analogue side (gains,
 mutes: storage), PDMA transfers for peripherals other than the AIC, SSI,
 the TCU channels' PWM output
-and the RISC-V cores of T40/T41 read as zero or as storage.
+and the blocks below read as zero or as storage.
 
 Also storage or zero, and untouched by every boot tested here: the OTG
 PHY registers (0x10060070/78; USB host works without them), the HASH,
-AES and RSA engines, T40/T41's DTRNG, and T40/T41's BSCALER, I2D,
-MONITOR, DRAWBOX and VO blocks.
+AES and RSA engines, and T40/T41's DTRNG.
+
+What the remaining video and compute blocks would need (survey of the
+T40/T41 SDK kernels, drivers and libimp):
+
+- AIP (T41 0x12B00000, T31) and T40's BSCALER (0x13090000): the kernel
+  drivers only map the registers, allocate and wait for the interrupt;
+  the AI library (Magik, a separate SDK) programs them, so their register
+  contract is not in these sources, and nothing shipped here uses them.
+- VO (T41 0x130C0000, `ingenic_vo.c`) and MONITOR (0x130A0000, a bus
+  bandwidth monitor, `sample_bus_monitor` only): no consumer in libimp or
+  the images (`sample-LCD` draws on `/dev/fb0`, the DPU).
+- T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
+  the VPU when libimp asks for it; the VPU raises the completion, so
+  storage passes the picture through un-denoised.
+- The RISC-V core of T40/T41 (the "LEP": T40 OST/CCU at
+  0x12600000/0x12700000, T41 CCU at 0x12A00000, NNDMA 0x12500000): no
+  driver, firmware or library here starts it; it would need a RISC-V CPU
+  beside the MIPS ones and firmware these SDKs do not ship.
