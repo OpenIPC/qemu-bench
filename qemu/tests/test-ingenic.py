@@ -895,8 +895,10 @@ def test_sound(qt, intc=INTC):
     # the codec at 16 kHz, its registers bytes read back
     qt.writel(CODEC + 0x110, 0x5)
     check('codec CSRR reads back', qt.readl(CODEC + 0x110), 5)
-    # the microphone path on, ALC on (T31's codec_set_buildin_mic)
+    # the microphone path on, ALC on (T31's codec_set_buildin_mic); on
+    # T41 the ADC on and the gain the driver leaves (0x1F, its unity)
     qt.writel(CODEC + 0x8C, 0x90)
+    qt.writel(CODEC + 0x98, 0x1f)
     # record: 16-bit, right channel only, DMA, as i2s_dma_enable does
     ring, desc, period = SCRATCH + 0x2000, SCRATCH + 0x3000, 64
     qt.write(ring, bytes(4 * period))
@@ -959,6 +961,34 @@ def test_codec_gain(qt):
     check('ALC off, gain 0x14: +6 dB', peak(0x80, 0x14), 16345)
     check('ALC off, gain 0x0C: -6 dB', peak(0x80, 0x0C), 4106)
     check('the ADC off: silence', peak(0x10, 0x10), 0)
+    qt.writel(AIC + 0x04, 0)
+
+
+def test_codec_gain_t41(qt):
+    """T41's codec: record gain, ALC, digital volume, ADC switch, by PIO"""
+    print('ingenic-aic codec gains (T41 layout)')
+
+    def peak(cmiccr, calcgr, cgainr=0, clavr=0xC3):
+        qt.writel(AIC + 0x04, 0)
+        qt.writel(AIC + 0x00, 1 | (1 << 3))             # empty the FIFOs
+        qt.writel(CODEC + 0x110, 0x5)
+        qt.writel(CODEC + 0x8C, cmiccr)
+        qt.writel(CODEC + 0x98, calcgr)
+        qt.writel(CODEC + 0x28, cgainr)
+        qt.writel(CODEC + 0x20, clavr)
+        qt.writel(AIC + 0x04, (1 << 16) | (1 << 12) | 1)  # EREC, mono
+        qt.step(1500 * 1000)                            # 24 frames
+        v = [qt.readl(AIC + 0x34) & 0xffff for _ in range(24)]
+        return max(abs(x - 65536 if x >= 32768 else x) for x in v)
+
+    check('the digital volumes come out of reset at 0 dB',
+          (qt.readl(CODEC + 0x18), qt.readl(CODEC + 0x20)), (0xF1, 0xC3))
+    check('gain 0x1F (the driver\'s): unity', peak(0x80, 0x1f), 8192)
+    check('gain 0x1B: -6 dB', peak(0x80, 0x1b), 4106)
+    check('ALC (CGAINR bit 4) holds the level', peak(0x80, 0x1b, 0x10), 8192)
+    check('CLAVR 0xCF: +6 dB digital', peak(0x80, 0x1f, 0, 0xCF), 16345)
+    check('CLAVR 0: muted', peak(0x80, 0x1f, 0, 0), 0)
+    check('the ADC off: silence', peak(0x00, 0x1f), 0)
     qt.writel(AIC + 0x04, 0)
 
 
@@ -1969,6 +1999,7 @@ def main():
         qt = QTest(a.qemu, 't41')
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
+        test_codec_gain_t41(qt)
         test_pwm(qt)
         test_drawbox(qt)
         test_i2d(qt)

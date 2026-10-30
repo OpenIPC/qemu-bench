@@ -97,6 +97,9 @@ static int record(int rate, int ms, const char *path)
     TRY(IMP_AI_SetChnParam(1, 0, &chn));
     TRY(IMP_AI_EnableChn(1, 0));
     TRY(IMP_AI_SetVol(1, 0, 60));
+    if (getenv("AUDIO_AIGAIN")) {           /* the codec's analogue gain */
+        TRY(IMP_AI_SetGain(1, 0, atoi(getenv("AUDIO_AIGAIN"))));
+    }
     while (got < want + skip) {
         IMPAudioFrame frm;
 
@@ -175,6 +178,9 @@ static int play(int rate, int hz, int ms)
     TRY(IMP_AO_Enable(0));
     TRY(IMP_AO_EnableChn(0, 0));
     TRY(IMP_AO_SetVol(0, 0, 60));
+    if (getenv("AUDIO_AOGAIN")) {
+        TRY(IMP_AO_SetGain(0, 0, atoi(getenv("AUDIO_AOGAIN"))));
+    }
     for (k = 0; k < n; k += per) {
         IMPAudioFrame frm;
 

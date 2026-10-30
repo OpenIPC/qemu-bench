@@ -33,7 +33,7 @@
  * 44.1, 1 48, 0 96) is the rate both ways.
  *
  * The analogue side, by the "codec" property (the SDKs' codec drivers,
- * oss2 jz_t10_codec.c and oss3 inner_codecs/T23/codec.c):
+ * oss2 jz_t10_codec.c and oss3 inner_codecs/T23, t40 and T41/codec.c):
  *   "t10" (T10, T20, T21, T30): playback gain CHCR (0x9C) bits 4:0, the
  *         output on while CAR (0x94) bits 3:0 are; record gain CACR2
  *         (0x8C) bits 4:0, the ADC on with CAMPCR (0x90) bit 7
@@ -41,10 +41,20 @@
  *         output on with CHR bit 7; record gain CALCGR (0x94) bits 4:0,
  *         the ADC on with CMICCR (0x8C) bit 7; with CMICCR bit 4 the ALC
  *         holds the level whatever the gain
- * Both gains are 1.5 dB a step, unity at the drivers' defaults (0x18 to
- * play, 0x10 to record); an output or ADC that is off is silent.  With
- * no "codec" (T40, T41, whose codec sources are not at hand) nothing is
- * scaled.
+ *   "t40", "t41": playback gain CHR_2b / CHPOUTLGR (0xAC) bits 4:0, the
+ *         driver's output on with CHR (0xA8) bit 6; record gain CANACR_26
+ *         (T40) / CALCGR (T41) at 0x98 bits 4:0, the ADC on with CMICCR
+ *         (0x8C) bit 7, the ALC holding the level with CGAINR (0x28) bit
+ *         5 (T40) / 4 (T41); and the digital volumes, 0.5 dB a step:
+ *         play CDGSR (0x18; 0xF1 0 dB, 0 mute), record CLAVR (0x20; 0xC3
+ *         0 dB, 0 mute).  T40's driver records mono through the right ADC
+ *         (CMICCR 0x0E: bit 7 clear, bit 3 on), whose gain is CANACR2_27
+ *         (0x9C), ALC bit 4 and digital volume 0x24.  No driver writes the digital volumes (libimp's
+ *         IMP_AI/AO_SetVol scale in software), so they come out of reset
+ *         at 0 dB -- an assumption: the reset values are not documented.
+ * The analogue gains are 1.5 dB a step, unity at the drivers' defaults
+ * (to play 0x18; to record 0x10, T41 0x1F); an output or ADC that is off
+ * is silent.
  *
  * Frames move at those rates while ENB is set: with ERPL one frame's
  * samples leave the TX FIFO (1 with M2S, CHANNEL + 1 otherwise; the last
@@ -271,16 +281,41 @@ static bool codec_is(IngenicAicState *s, const char *kind)
     return s->codec_kind && !strcmp(s->codec_kind, kind);
 }
 
-static int16_t codec_scale(int v, int steps)
+static int16_t codec_scale_db(int v, double db)
 {
-    double x = v * pow(10.0, steps * 1.5 / 20);
+    double x = v * pow(10.0, db / 20);
 
     return x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)lrint(x);
+}
+
+static int16_t codec_scale(int v, int steps)
+{
+    return codec_scale_db(v, steps * 1.5);
+}
+
+static bool codec_is_xb2(IngenicAicState *s)
+{
+    return codec_is(s, "t40") || codec_is(s, "t41");
 }
 
 /* a recorded sample, through the microphone path */
 static int16_t codec_record(IngenicAicState *s, int16_t v)
 {
+    if (codec_is_xb2(s)) {
+        bool t41 = codec_is(s, "t41");
+        /* T40's right ADC, which its driver records mono through */
+        bool right = !t41 && !(s->codec[CDC(0x8C)] & 0x80);
+        uint8_t dvol = s->codec[CDC(right ? 0x24 : 0x20)];
+
+        if (!(s->codec[CDC(0x8C)] & (right ? 0x08 : 0x80)) || !dvol) {
+            return 0;
+        }
+        if (!(s->codec[CDC(0x28)] & (t41 || right ? 0x10 : 0x20))) {
+            v = codec_scale(v, (s->codec[CDC(right ? 0x9C : 0x98)] & 0x1f) -
+                               (t41 ? 0x1f : 0x10));
+        }
+        return codec_scale_db(v, (dvol - 0xC3) * 0.5);
+    }
     if (codec_is(s, "t31")) {
         if (!(s->codec[CDC(0x8C)] & 0x80)) {
             return 0;
@@ -302,6 +337,15 @@ static int16_t codec_record(IngenicAicState *s, int16_t v)
 /* a played sample, through the headphone / speaker path */
 static int16_t codec_play(IngenicAicState *s, int16_t v)
 {
+    if (codec_is_xb2(s)) {
+        uint8_t dvol = s->codec[CDC(0x18)];
+
+        if (!(s->codec[CDC(0xA8)] & 0x40) || !dvol) {
+            return 0;
+        }
+        v = codec_scale(v, (s->codec[CDC(0xAC)] & 0x1f) - 0x18);
+        return codec_scale_db(v, (dvol - 0xF1) * 0.5);
+    }
     if (codec_is(s, "t31")) {
         if (!(s->codec[CDC(0xA0)] & 0x80)) {
             return 0;
@@ -681,6 +725,11 @@ static void ingenic_aic_reset(DeviceState *dev)
     timer_del(s->timer);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->codec, 0, sizeof(s->codec));
+    if (codec_is_xb2(s)) {
+        s->codec[CDC(0x18)] = 0xF1;     /* the digital volumes at 0 dB */
+        s->codec[CDC(0x20)] = 0xC3;
+        s->codec[CDC(0x24)] = 0xC3;     /* T40's right ADC */
+    }
     memset(s->last_tx, 0, sizeof(s->last_tx));
     s->tx.head = s->tx.count = 0;
     s->rx.head = s->rx.count = 0;

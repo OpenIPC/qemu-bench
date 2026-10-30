@@ -1207,6 +1207,12 @@ static void ingenic_init(MachineState *ms)
     case INGENIC_T23: case INGENIC_T31:
         qdev_prop_set_string(dev, "codec", "t31");
         break;
+    case INGENIC_T40:
+        qdev_prop_set_string(dev, "codec", "t40");
+        break;
+    case INGENIC_T41:
+        qdev_prop_set_string(dev, "codec", "t41");
+        break;
     default:
         break;
     }

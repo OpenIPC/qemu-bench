@@ -10,7 +10,7 @@
 #
 #   bash qemu-boot/test-ingenic-audio.sh [--soc t10|t20|t21|t23|t30|t31|t40|t41]
 #        [--fw DIR] [--image T41_IMG] [--rate 16000] [--play-rate RATE]
-#        [--dmic] [--qemu PATH] [--out DIR] [--timeout S]
+#        [--dmic] [--gains AI:AO] [--qemu PATH] [--out DIR] [--timeout S]
 #
 # --fw holds uImage.<soc> and rootfs.squashfs.<soc> (an OpenIPC "lite"
 # release, fetch-openipc-lite.sh).  The client is built with the Ingenic
@@ -18,7 +18,10 @@
 # libimp.a: T31 SDK 1.1.5's on T10..T31 (their audio.ko is the same oss2
 # driver), T23 SDK 1.1.0's on T23, T40 SDK 1.2.0's on T40 (with T41's
 # libalog), T41 SDK 1.2.0's on T41.  --play-rate plays at another rate
-# than the recording's (the AIC's two I2S clocks).
+# than the recording's (the AIC's two I2S clocks).  --gains sets the
+# codec's analogue gains through IMP_AI_SetGain / IMP_AO_SetGain (either
+# may be empty), and the check then wants the levels they give, 1.5 dB a
+# step from the driver's defaults (--ai-default/--ao-default: 16, 24).
 #
 # Run alone: a starved guest falls behind the DMA, and the vendor driver
 # then skips ahead, so a loaded host can cut the played sound short (the
@@ -51,6 +54,7 @@ OUT=
 TIMEOUT=600
 DMIC=
 PRATE=
+GAINS=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -63,6 +67,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT=$2; shift ;;
     --dmic) DMIC=1 ;;
     --play-rate) PRATE=$2; shift ;;
+    --gains) GAINS=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -96,6 +101,10 @@ fi
 # the tone the recording must carry; with --dmic the AIC's is silenced
 RTONE=$TONE ATONE=$TONE MIC=amic
 [ -n "$DMIC" ] && RTONE=$DTONE ATONE=0 MIC=dmic
+AIGAIN=${GAINS%%:*} AOGAIN=${GAINS#*:}
+[ "$GAINS" = "${GAINS#*:}" ] && AOGAIN=
+case $SOC in t41) AIDEF=31 ;; *) AIDEF=16 ;; esac
+AODEF=24
 for f in $NEED "$QEMU" "$TC/${CROSS}gcc"; do
     [ -e "$f" ] || { echo "missing $f" >&2; exit 2; }
 done
@@ -152,7 +161,7 @@ mkdir -p /dev/shm && mount -t tmpfs shm /dev/shm
 mkdir -p /var/lock
 $LOADER
 echo "AUDIOTEST dsp: \$(ls /dev/dsp 2>&1)"
-audio-test $RATE 500 $PLAY 2000 /tmp/rec.raw $MIC ${PRATE:-$RATE}
+${AIGAIN:+AUDIO_AIGAIN=$AIGAIN }${AOGAIN:+AUDIO_AOGAIN=$AOGAIN }audio-test $RATE 500 $PLAY 2000 /tmp/rec.raw $MIC ${PRATE:-$RATE}
 echo "AUDIOREC BEGIN $RATE"
 hexdump -v -e '16/2 "%04x " "\\n"' /tmp/rec.raw
 echo "AUDIOREC END"
@@ -204,12 +213,27 @@ wait $QPID 2>/dev/null || true
 grep -a "AUDIOTEST" -A21 "$OUT/console.log" | grep -av "^[0-9a-f]\{4\} " || true
 
 echo "== host"
-python3 - "$OUT/console.log" "$OUT/play.wav" $RTONE $PLAY <<'PY'
+python3 - "$OUT/console.log" "$OUT/play.wav" $RTONE $PLAY \
+    "${AIGAIN:+$((AIGAIN - AIDEF))}" "${AOGAIN:+$((AOGAIN - AODEF))}" <<'PY'
 import struct, sys, wave
 import numpy as np
 
 log, wav, tone, play = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+aistep, aostep = sys.argv[5], sys.argv[6]
 fail = 0
+
+# the levels at the drivers' default gains: the tone at a quarter of full
+# scale, the client's sine after libimp's volume 60
+REC_RMS, PLAY_RMS = 8192 / 2 ** 0.5, 8464
+
+def level(what, rms, base, step):
+    if step == '':
+        return
+    want = base * 10 ** (int(step) * 1.5 / 20)
+    if want > 0.6 * 32767:
+        return                          # clipped: no level to compare
+    check('%s at %+.1f dB' % (what, int(step) * 1.5), abs(rms / want - 1) < 0.1,
+          'rms %.0f, want %.0f' % (rms, want))
 
 def peak(x, rate):
     x = np.asarray(x, dtype=float)
@@ -234,6 +258,7 @@ try:
           len(s) >= rate // 4, '%d' % len(s))
     check('the recording is the %d Hz tone' % tone, abs(f - tone) < 10 and
           rms > 100, 'peak %.1f Hz, rms %.0f' % (f, rms))
+    level('the recording', rms, REC_RMS, aistep)
 except StopIteration:
     check('a recording on the console', False, 'none')
 check('the client ran through', 'AUDIOTEST PASS' in lines, '')
@@ -248,6 +273,7 @@ try:
           len(seg) > rate, '%d frames of %d' % (len(seg), n))
     check('the played sine is %d Hz' % play, abs(f - play) < 10,
           'peak %.1f Hz, rms %.0f' % (f, rms))
+    level('the played sine', rms, PLAY_RMS, aostep)
 except (FileNotFoundError, wave.Error, EOFError) as e:
     check('a wav from the audiodev', False, str(e))
 print('PASS' if not fail else 'FAIL')

@@ -730,7 +730,18 @@ with the headphone output on by CHR bit 7, record CALCGR (0x94) bits 4:0
 with the ADC on by CMICCR (0x8C) bit 7, and CMICCR bit 4 (ALC) holds the
 level whatever the gain. 1.5 dB a step, unity at the drivers' defaults
 (0x18 to play, 0x10 to record); a path that is off is silent. T40 and
-T41 (no codec source at hand) are not scaled.
+T41 (`inner_codecs/t40` and `T41/codec.c` of their SDKs) share the
+offsets: playback CHR_2b / CHPOUTLGR (0xAC) bits 4:0 (unity 0x18) with
+the driver's output on by CHR (0xA8) bit 6; record CANACR_26 / CALCGR
+(0x98) bits 4:0 (unity at the drivers' 0x10 on T40, 0x1F on T41) with
+the ADC on by CMICCR (0x8C) bit 7, the ALC holding the level with CGAINR
+(0x28) bit 5 / 4; T40 records mono through its right ADC (CMICCR 0x0E:
+bit 3, gain 0x9C, ALC bit 4). Their digital volumes, 0.5 dB a step, play
+CDGSR (0x18; 0xF1 is 0 dB, 0 mutes) and record CLAVR (0x20, T40's right
+0x24; 0xC3 is 0 dB): no driver writes them -- libimp's IMP_AI/AO_SetVol
+scale in software -- so they come out of reset at 0 dB, an assumption
+(the reset values are not documented). IMP_AI_SetGain / IMP_AO_SetGain
+reach the analogue gains.
 
 - `ingenic-dmic` (T31, T40): `audio_dmic.c` (oss3, T40's `audio.ko` with
   `dmic_enable=1`) and `devices/dmic` (oss2, T31, behind
@@ -1157,6 +1168,7 @@ teardown, so the verdict comes first.
 | T30X SDK 1.0.5 full image (8 MiB), `sensor=jxf22` | `t30,variant=t30x -m 128M` | flash, user net | vendor kernel and modules, sample-RTSPServer: /main 1920x1080 and /second 640x360 H.265 over RTSP/TCP, 200 pictures each decoded without errors, the scene and the IPU's timestamp OSD (`test-ingenic-t30-rtsp.sh`) |
 | OpenIPC `t20`, `t21`, `t23`, `t30` libimp | own | `-kernel`, `test-ingenic-vpu-feed.py` | libimp's H.264 (fixed QP; CBR on T21/T23/T30) and JPEG encoders, T30's H.265: streams ffmpeg decodes with `-err_detect explode`, PSNR against the source picture |
 | OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` (their `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | own / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh --soc <soc>` | IMP_AI records 16 kHz mono: the 1 kHz tone on all eight (FFT peak 1000.0 Hz; rms 5793, 11585 on T10, T20, T30); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz), 1.08 s on T21: the DMA plays at 16 kHz, but its driver disables the stream right after the last write and its flush discards the ~0.8 s still queued (T20, built from the same source, waits first; why is open); `--rate 8000 --play-rate 16000` (two clocks): 440.0 Hz on T10, T23, T31, T40 |
+| OpenIPC `t40` / T41NQ SDK image, `--gains AI:AO` (IMP_AI_SetGain, IMP_AO_SetGain) | `t40` / `t41,variant=t41nq` | `test-ingenic-audio.sh --soc t40 --gains 12:20`, `--soc t41 --gains 27:28` | the codec's analogue gains: T40 records the tone at -6.0 dB (rms 2903 of 5793) and plays at -6.0 dB (4242 of 8464); T41 records at -6.0 dB (2903) and plays at +6.0 dB (16889 of 8464) |
 | OpenIPC `t40`, `audio.ko dmic_enable=1` + T40 SDK `libimp.a` | `t40` | `test-ingenic-audio.sh --soc t40 --dmic` | IMP_DMIC records 16 kHz: the DMIC's 1.5 kHz tone (peak 1500.0 Hz, rms 5793); with QEMU's TLB shadow entries on, 5 of 12 runs failed (see CPUs), without them 24 consecutive runs pass |
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
@@ -1188,7 +1200,7 @@ raw caching through VIC MDMA, the T40/T41 AWB records' split (their
 pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
 AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
 addresses the engine physically), T41's DMIC, the DMIC's voice
-trigger, T40/T41's codec gains, PDMA
+trigger, PDMA
 transfers for peripherals other than the AIC and the SSI, the SSI slave,
 the DES engine, the HASH engine's CPU mode
 and the blocks below read as zero or as storage.
