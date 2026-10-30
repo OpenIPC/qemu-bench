@@ -272,7 +272,7 @@ fi
 case "$FFMPEG" in
 '') if command -v ffmpeg >/dev/null; then FFMPEG=ffmpeg
     elif docker image inspect jrottenberg/ffmpeg:6.1-alpine >/dev/null 2>&1; then
-        FFMPEG="docker run --rm -v $WORK:$WORK jrottenberg/ffmpeg:6.1-alpine"
+        FFMPEG="docker run --rm -i -v $WORK:$WORK jrottenberg/ffmpeg:6.1-alpine"
     fi ;;
 esac
 fails=0
@@ -335,10 +335,11 @@ for slot in 0 1; do
     python3 -c "import struct,sys; d=open(sys.argv[1],'rb').read(); n=struct.unpack('<I',d[:4])[0]; open(sys.argv[2],'wb').write(d[4:4+n])" "$WORK/pmem$slot.bin" "$f"
     if [ $slot = 0 ]; then sz=${W}x$H; else sz=640x360; fi
     if [ -z "$FFMPEG" ]; then echo "SKIP: no ffmpeg for $f"; continue; fi
-    cp "$f" "$WORK/in.$EXT"
     rm -f "$WORK/dec.nv12"
-    $FFMPEG -v error -err_detect explode -i "$WORK/in.$EXT" -f rawvideo \
-        -pix_fmt nv12 -y "$WORK/dec.nv12" > "$WORK/ff.log" 2>&1 || true
+    # through pipes: a docker ffmpeg's daemon may not see this host's files
+    case $EXT in jpg) IF=mjpeg ;; h265) IF=hevc ;; *) IF=h264 ;; esac
+    $FFMPEG -v error -err_detect explode -f $IF -i - -f rawvideo \
+        -pix_fmt nv12 - < "$f" > "$WORK/dec.nv12" 2> "$WORK/ff.log" || true
     errs=$(grep -v -c '^docker:' "$WORK/ff.log" || true)
     fs=$(( ${sz%x*} * ${sz#*x} * 3 / 2 ))
     got=$(( $(stat -c %s "$WORK/dec.nv12" 2>/dev/null || echo 0) / fs ))
