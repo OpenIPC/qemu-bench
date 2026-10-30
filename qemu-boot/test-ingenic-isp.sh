@@ -11,6 +11,7 @@
 # logo and the moving dot, and checks that both channels advance.
 #
 #   bash qemu-boot/test-ingenic-isp.sh [--soc t31|t21|t23|t20|t10|t30|t40|t41] [--sensor NAME]
+#        [--sensor1 NAME (t40: a second sensor, the second pipe)]
 #        [--fw DIR] [--qemu PATH] [--toolchain BINDIR] [--sdk DIR]
 #        [--libimp rootfs|sdk] [--frames N] [--out DIR] [--png]
 #        [--isp-ko FILE]
@@ -63,6 +64,7 @@ VARIANT=
 LIBIMP=rootfs
 SOC=t31
 SENSOR=
+SENSOR1=
 FRAMES=40
 OUT=
 PNG=
@@ -72,6 +74,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --soc) SOC=$2; shift ;;
     --sensor) SENSOR=$2; shift ;;
+    --sensor1) SENSOR1=$2; shift ;;
     --fw) FW=$2; shift ;;
     --image) IMAGE=$2; shift ;;
     --isp-ko) ISP_KO=$2; shift ;;
@@ -96,7 +99,7 @@ t23) SENSOR=${SENSOR:-gc2053}; INC=${INC:-$INC23} ;;
 t20) SENSOR=${SENSOR:-jxf22} ;;
 t10) SENSOR=${SENSOR:-jxh62} ;;     # T10's ISP takes at most 1280x960
 t30) SENSOR=${SENSOR:-ov2735b} ;;
-t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}; DEFS=-DSNAP_T40
+t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}; DEFS="-DSNAP_T40 -DSNAP_DUAL"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64 ;;
 t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41
@@ -116,6 +119,18 @@ ov2735b|ov2735) ADDR=0x3c ;;
 gc4653|gc4663) ADDR=0x29 ;;
 *) echo "unknown sensor $SENSOR" >&2; exit 2 ;;
 esac
+# T40's second sensor (--sensor1): the SDK's "s1" driver, I2C3, CSI1
+KO1=
+if [ -n "$SENSOR1" ]; then
+    [ $SOC = t40 ] || { echo "--sensor1 is for t40" >&2; exit 2; }
+    KO1=/home/ai/dimerr/tmp-scratch/isp-re-t40/drv/drivers/sensors-t40/$SENSOR1/sensor_${SENSOR1}s1_t40.ko
+    [ -e "$KO1" ] || { echo "missing $KO1" >&2; exit 2; }
+    ADDR1=$ADDR
+    # two 2560x1440 pipes' buffers: rmem's 64 MiB is not enough for both
+    # and the frames parked at its top
+    RAM=256M; MEM="mem=64M rmem=192M@0x4000000"; SLOT_MB=224
+fi
+SLOT_MB=${SLOT_MB:-$((RMEM_MB + 32))}
 if [ $SOC = t41 ]; then
     NEED="$IMAGE $SDK41/lib/uclibc/libimp.a"
 else
@@ -141,6 +156,9 @@ open(sys.argv[2] + '/uImage', 'wb').write(d[0x40000:0x40000 + 64 + n])
 open(sys.argv[2] + '/root.sq', 'wb').write(d[0x2C0000:0x4C0000])
 PY
     unsquashfs -q -d "$WORK/rfs" "$WORK/root.sq" >/dev/null
+    # room for the static client in the 2 MiB the root gets: nothing here
+    # links Fortran
+    rm -f "$WORK"/rfs/lib/libgfortran.so*
     W=2560; H=1440
 else
     unsquashfs -q -d "$WORK/rfs" "$FW/rootfs.squashfs.$SOC" >/dev/null
@@ -197,6 +215,15 @@ else
     LOADER='echo "ISPTEST sinfo: $(modprobe sinfo; echo 1 > /proc/jz/sinfo/info; cat /proc/jz/sinfo/info)"
 load_ingenic -i'
 fi
+if [ -n "$SENSOR1" ]; then
+    # tisp_sec_init: the second pipe's tuning, by the s1 driver's name
+    cp "$WORK/rfs/etc/sensor/$SENSOR-$SOC.bin" \
+        "$WORK/rfs/etc/sensor/${SENSOR1}s1-$SOC.bin"
+    cp "$KO1" "$(dirname "$(find "$WORK/rfs/lib/modules" -name "tx-isp-$SOC.ko" | head -1)")/"
+    LOADER="$LOADER
+insmod /lib/modules/*/ingenic/sensor_${SENSOR1}s1_t40.ko
+export SNAP_SENSOR1=${SENSOR1}s1:$ADDR1"
+fi
 cat > "$WORK/rfs/usr/bin/isp-test" <<EOF
 #!/bin/sh
 mount -t proc proc /proc
@@ -212,7 +239,7 @@ touch /tmp/closesimd
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/mmcblk0 ] && break; sleep 1; done
 OUTDEV=/dev/mmcblk0
 [ -b \$OUTDEV ] || OUTDEV=/tmp
-[ "\$OUTDEV" = /tmp ] && export SNAP_DEVMEM=$(( (RMEM_MB + 32) << 20 ))
+[ "\$OUTDEV" = /tmp ] && export SNAP_DEVMEM=$(( SLOT_MB << 20 ))
 isp-snap $FRAMES \$OUTDEV $SENSOR $ADDR $W $H &
 SNAP=\$!
 # wait for the frames, not for the teardown (T40's can hang)
@@ -226,6 +253,7 @@ if [ "\$OUTDEV" = /tmp ]; then
 fi
 echo "ISPTEST rc=\$(grep -q PASS /tmp/isp-snap.done 2>/dev/null && echo 0 || echo 1)"
 echo "ISPTEST vic: \$(head -1 /proc/jz/isp/isp-w02 2>/dev/null || cat /proc/jz/vic/isp_vic_frd)"
+grep -i "isp\|vic" /proc/interrupts | sed 's/^/ISPTEST irq: /'
 sync
 echo ISPTEST-END
 poweroff -f
@@ -275,7 +303,7 @@ for try in 1 2 3; do
     echo "== boot ($SOC, sensor=$SENSOR)${try#1}"
     rm -f "$OUT/console.log"
     # shellcheck disable=SC2086  # QEMU_EXTRA: extra options, word-split
-    "$QEMU" -M $SOC,sensor=$SENSOR$VARIANT,flash-file="$WORK/nor.bin" -m $RAM \
+    "$QEMU" -M $SOC,sensor=$SENSOR${SENSOR1:+,sensor1=$SENSOR1}$VARIANT,flash-file="$WORK/nor.bin" -m $RAM \
         $QEMU_EXTRA -display none -serial file:"$OUT/console.log" \
         -monitor unix:"$WORK/mon.sock",server,nowait \
         -nic user,restrict=on -kernel "$KERNEL" \
@@ -289,13 +317,13 @@ for try in 1 2 3; do
         if [ -z "$saved" ] && grep -q ISPTEST-PMEM "$OUT/console.log"; then
             saved=1
             # the frames in rmem, 8 MiB apart
-            python3 - "$WORK/mon.sock" "$WORK" $RMEM_MB <<'PY'
+            python3 - "$WORK/mon.sock" "$WORK" $SLOT_MB <<'PY'
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 for slot in range(4):
     s.sendall(b'pmemsave %d %d "%s/pmem%d.nv12"\n' %
-              ((int(sys.argv[3]) + 32 + 8 * slot) << 20, 8 << 20,
+              ((int(sys.argv[3]) + 8 * slot) << 20, 8 << 20,
                sys.argv[2].encode(), slot))
     time.sleep(1)
 s.close()
@@ -329,6 +357,18 @@ mv "$OUT/slot0.nv12" "$OUT/ch0-$first.nv12"
 mv "$OUT/slot1.nv12" "$OUT/ch0-$last.nv12"
 mv "$OUT/slot2.nv12" "$OUT/ch1-$first.nv12"
 mv "$OUT/slot3.nv12" "$OUT/ch1-$last.nv12"
+if [ -n "$SENSOR1" ]; then
+    # channel 3, the second pipe, where channel 1 would be: each pipe's
+    # frames advance, pipe 1's counter 500000 ahead of pipe 0's
+    mv "$OUT/ch1-$first.nv12" "$OUT/ch3-$first.nv12"
+    mv "$OUT/ch1-$last.nv12" "$OUT/ch3-$last.nv12"
+    python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
+        ${W}x$H:"$OUT/ch0-$first.nv12@0" ${W}x$H:"$OUT/ch0-$last.nv12@0" &&
+    python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
+        ${W}x$H:"$OUT/ch3-$first.nv12@500000" \
+        ${W}x$H:"$OUT/ch3-$last.nv12@500000"
+    exit $?
+fi
 python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
     ${W}x$H:"$OUT/ch0-$first.nv12" ${W}x$H:"$OUT/ch0-$last.nv12" \
     640x360:"$OUT/ch1-$first.nv12" 640x360:"$OUT/ch1-$last.nv12"

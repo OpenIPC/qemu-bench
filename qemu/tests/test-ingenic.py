@@ -1592,6 +1592,68 @@ ISP_LAYOUTS = {
 }
 
 
+def test_isp_t40_pipe1(qt):
+    """T40's second pipe: VIC1, channels 3..5, its interrupts and 3A"""
+    print('ingenic-isp (T40 second pipe)')
+    vic0, vic1 = 0x13380000, 0x13390000
+    w, h = 216, 108                     # a counter cell of 2 pixels
+    buf = [0x00400000, 0x00500000]      # pipe 0's, pipe 1's
+    for p, (ch, en) in enumerate(((0x16100, 0x16008), (0x17100, 0x17008))):
+        qt.writel(ISP + ch + 0x2C, w << 16 | h)
+        qt.writel(ISP + ch + 0x6C, buf[p])
+        qt.writel(ISP + ch + 0x84, buf[p] + w * h)
+        qt.writel(ISP + en, 1)
+    # pipe 1 alone: VIC1 started, its interrupts on
+    qt.writel(vic1 + 0x00, 1)
+    qt.writel(ISP + 0x40030, 0xFFFFFFFF)
+    # its AE block: one zone of 8 x 4 quads, a zone and a histogram bank
+    qt.writel(ISP + 0x19200, 1)
+    qt.writel(ISP + 0x19204, 0x10001000)
+    qt.writel(ISP + 0x19208, 8)
+    qt.writel(ISP + 0x19218, 4)
+    qt.writel(ISP + 0x1922C, 0x00600000)
+    qt.writel(ISP + 0x1923C, 0x00601000)
+    qt.write(0x00600000, bytes(16))
+    qt.step(41 * 1000 * 1000)
+    check('pipe 1: channel 3 done in 0x40038', qt.readl(ISP + 0x40038) & 1, 1)
+    check('pipe 0 idle: nothing in 0x40028', qt.readl(ISP + 0x40028), 0)
+    check('VIC1 frame done and start', qt.readl(vic1 + 0x1E0) & 0x11, 0x11)
+    check('VIC1 interrupts on INTC 29, VIC0 quiet',
+          ((qt.readl(CORE_INTC) >> 29) & 1, (qt.readl(CORE_INTC) >> 30) & 1),
+          (1, 0))
+    check('pipe 1 AE statistics: bits 4 and 5 of 0x40038',
+          qt.readl(ISP + 0x40038) & 0x30, 0x30)
+    check('its zone bank written', qt.read(0x00600000, 16) != bytes(16), True)
+    check('pop channel 3: the queued buffer',
+          (qt.readl(ISP + 0x17174), qt.readl(ISP + 0x1717C) & 1),
+          (buf[1], 1))
+    qt.writel(ISP + 0x40034, qt.readl(ISP + 0x40038))
+    qt.writel(vic1 + 0x1F0, qt.readl(vic1 + 0x1E0))
+    check('pipe 1 status cleared through 0x40034, VIC1 through 0x1F0',
+          (qt.readl(ISP + 0x40038), qt.readl(vic1 + 0x1E0) & 0x11), (0, 0))
+    # both pipes, the same frame: pipe 1's counter is 500000 ahead
+    qt.writel(ISP + 0x16100 + 0x6C, buf[0])
+    qt.writel(ISP + 0x16100 + 0x84, buf[0] + w * h)
+    qt.writel(ISP + 0x17100 + 0x6C, buf[1])
+    qt.writel(ISP + 0x17100 + 0x84, buf[1] + w * h)
+    qt.writel(vic0 + 0x00, 1)
+    qt.writel(ISP + 0x40020, 0xFFFFFFFF)
+    qt.step(41 * 1000 * 1000)
+    check('both pipes done', (qt.readl(ISP + 0x40028) & 1,
+                              qt.readl(ISP + 0x40038) & 1), (1, 1))
+    # the counter's second cell row (cells of 2 px from (4, 4)): the
+    # leading digit is 0 on pipe 0 and 5 on pipe 1 -- 101 and 100 there
+    row0 = qt.read(buf[0] + 6 * w, 64)
+    row1 = qt.read(buf[1] + 6 * w, 64)
+    check('pipe 0 lights the 0\'s right cell, pipe 1 the 5\'s does not',
+          (row0[8] > 128, row1[8] > 128), (True, False))
+    check('the two pictures differ in the counter', row0 != row1, True)
+    check('and match in the scene below it',
+          qt.read(buf[0] + 60 * w, w) == qt.read(buf[1] + 60 * w, w), True)
+    qt.writel(vic0 + 0x00, 0)
+    qt.writel(vic1 + 0x00, 0)
+
+
 def test_isp_layout(qt, soc):
     print('ingenic-isp (%s layout)' % soc)
     (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
@@ -1892,6 +1954,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't20,sensor=jxf22')
         test_isp_stats_apical(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't40,sensor=gc4653,sensor1=gc4653')
+        test_isp_t40_pipe1(qt)
         qt.close()
         for soc in ISP_LAYOUTS:
             qt = QTest(a.qemu, soc)

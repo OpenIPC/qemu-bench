@@ -234,6 +234,7 @@ typedef struct IngenicSocInfo {
     hwaddr scaler_base;     /* T30's MSCA scaler (ingenic-isp "t30") */
     int irq_isp, irq_vic;   /* INTC sources, 0: IRQ_ISP / IRQ_VIC */
     int sensor_bus;         /* the I2C bus sinfo / tx-isp probe */
+    int sensor1_bus;        /* > 0: sensor1= (a second sensor) is here */
     int sensor_gpio_sda;    /* > 0: the sensor bus is bit-banged on GPIOs
                                sda / sda + 1 (T10's i2c-gpio) */
 } IngenicSocInfo;
@@ -312,6 +313,8 @@ struct IngenicMachineState {
     char *variant;
     char *sensor;
     DeviceState *sensor_dev;        /* the sensor= model, for the ISP */
+    char *sensor1;
+    DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
     const IngenicSocInfo *info;
     MIPSCPU *cpu[2];
     Clock *cpuclk;
@@ -831,18 +834,18 @@ static const struct {
     { "ov2735", "ingenic-ov2735", 0x3C, false, 0, 0x05 },
 };
 
-static void ingenic_create_sensor(IngenicMachineState *ims, I2CBus *bus)
+static DeviceState *ingenic_create_sensor(const char *name, I2CBus *bus)
 {
     DeviceState *dev;
     int n;
 
     for (n = 0; n < ARRAY_SIZE(ingenic_sensors); n++) {
-        if (!strcmp(ims->sensor, ingenic_sensors[n].name)) {
+        if (!strcmp(name, ingenic_sensors[n].name)) {
             break;
         }
     }
     if (n == ARRAY_SIZE(ingenic_sensors)) {
-        error_report("ingenic: unknown sensor '%s'; one of: none", ims->sensor);
+        error_report("ingenic: unknown sensor '%s'; one of: none", name);
         for (n = 0; n < ARRAY_SIZE(ingenic_sensors); n++) {
             error_printf("  %s\n", ingenic_sensors[n].name);
         }
@@ -865,7 +868,7 @@ static void ingenic_create_sensor(IngenicMachineState *ims, I2CBus *bus)
         }
     }
     i2c_slave_realize_and_unref(I2C_SLAVE(dev), bus, &error_fatal);
-    ims->sensor_dev = dev;
+    return dev;
 }
 
 /* --- machine ------------------------------------------------------------ */
@@ -1049,8 +1052,14 @@ static void ingenic_init(MachineState *ms)
                                    ingenic_irq(ims, IRQ_I2C0 - i));
         if (i == info->sensor_bus && !info->sensor_gpio_sda && ims->sensor &&
             strcmp(ims->sensor, "none")) {
-            ingenic_create_sensor(ims, I2C_BUS(qdev_get_child_bus(dev,
-                                                                  "i2c")));
+            ims->sensor_dev = ingenic_create_sensor(ims->sensor,
+                I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+        }
+        /* T40's second sensor, on I2C3 through CSI1 (the SDK's samples) */
+        if (info->sensor1_bus && i == info->sensor1_bus && ims->sensor1 &&
+            strcmp(ims->sensor1, "none")) {
+            ims->sensor1_dev = ingenic_create_sensor(ims->sensor1,
+                I2C_BUS(qdev_get_child_bus(dev, "i2c")));
         }
     }
 
@@ -1068,7 +1077,8 @@ static void ingenic_init(MachineState *ms)
         qdev_connect_gpio_out_named(gpio, "drive", sda + 1,
                                     qdev_get_gpio_in(dev, 1));
         qdev_connect_gpio_out(dev, 0, qdev_get_gpio_in(gpio, sda));
-        ingenic_create_sensor(ims, I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+        ims->sensor_dev = ingenic_create_sensor(ims->sensor,
+            I2C_BUS(qdev_get_child_bus(dev, "i2c")));
     }
 
     /* the image pipeline: ISP core, VIC, MIPI CSI host and D-PHY */
@@ -1119,6 +1129,11 @@ static void ingenic_init(MachineState *ms)
             object_property_set_link(OBJECT(dev), "sensor",
                                      OBJECT(ims->sensor_dev), &error_abort);
         }
+        if (ims->sensor1_dev) {
+            /* T40's second pipe: its own sensor and exposure */
+            object_property_set_link(OBJECT(dev), "sensor1",
+                                     OBJECT(ims->sensor1_dev), &error_abort);
+        }
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, info->isp_base);
@@ -1130,6 +1145,13 @@ static void ingenic_init(MachineState *ms)
         if (info->soc == INGENIC_T41) {
             /* T41's scaler sits past the VIC, at core + 0xF0000 */
             sysbus_mmio_map(sbd, 4, info->isp_base + 0xF0000);
+        }
+        if (info->soc == INGENIC_T40) {
+            /* VIC1 and VIC2, 64 KiB apart past VIC0, INTC 29 and 28 */
+            sysbus_mmio_map(sbd, 5, info->vic_base + 0x10000);
+            sysbus_mmio_map(sbd, 6, info->vic_base + 0x20000);
+            sysbus_connect_irq(sbd, 2, ingenic_irq(ims, info->irq_vic - 1));
+            sysbus_connect_irq(sbd, 3, ingenic_irq(ims, info->irq_vic - 2));
         }
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, info->irq_isp ?
                                                info->irq_isp : IRQ_ISP));
@@ -1453,6 +1475,19 @@ static void ingenic_set_sensor(Object *obj, const char *value, Error **errp)
     ims->sensor = g_strdup(value);
 }
 
+static char *ingenic_get_sensor1(Object *obj, Error **errp)
+{
+    return g_strdup(INGENIC_MACHINE(obj)->sensor1);
+}
+
+static void ingenic_set_sensor1(Object *obj, const char *value, Error **errp)
+{
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    g_free(ims->sensor1);
+    ims->sensor1 = g_strdup(value);
+}
+
 static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1483,6 +1518,11 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sensor",
         "image sensor on the sensor I2C bus: none (default), gc2053, "
         "gc2083, gc4653, gc4663, sc2336, sc2335, jxf37, jxf22, ov2735b, ov2735");
+    object_class_property_add_str(oc, "sensor1",
+        ingenic_get_sensor1, ingenic_set_sensor1);
+    object_class_property_set_description(oc, "sensor1",
+        "T40: a second image sensor, on I2C3 (CSI1, the second pipe); the "
+        "same names as sensor=");
 }
 
 static void ingenic_soc_class_init(ObjectClass *oc, const void *data)
@@ -1570,7 +1610,7 @@ static const IngenicSocInfo ingenic_socs[] = {
         .sfc_version = 2, .mtd_id = "jz_sfc", .nand_mtd_id = "sfc_nand",
         .rtc_base = 0x132A0000, .max_cpus = 2, .num_i2c = 4,
         .soc_id = 0x10040003, .prid = 0, .l1_kib = 0,
-        .sensor_bus = 1,
+        .sensor_bus = 1, .sensor1_bus = 3,
         /* VIC0 of three; CSI0 (the one a single sensor uses) */
         .isp = "t40", .isp_base = ISP_BASE, .vic_base = 0x13380000,
         .csi_base = 0x10054000, .dphy_base = DPHY_BASE,

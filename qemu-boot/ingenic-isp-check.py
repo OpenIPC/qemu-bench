@@ -102,14 +102,26 @@ def main():
     ap.add_argument('--png', help='write each frame as a PNG here')
     ap.add_argument('--advance', action='store_true',
                     help='counters and the dot must move file to file')
-    ap.add_argument('frames', nargs='+', help='WxH:file.nv12')
+    ap.add_argument('frames', nargs='+',
+                    help='WxH:file.nv12[@N]: with @N the counter must be in '
+                    '[N, N + 500000) -- T40\'s second pipe paints its '
+                    'counter 500000 ahead')
     args = ap.parse_args()
 
     ok = True
     prev = None
     for spec in args.frames:
+        base = None
+        if '@' in spec:
+            spec, base = spec.rsplit('@', 1)
+            base = int(base)
         path, w, h, y, uv = load(spec)
         n = counter(y, w, h)
+        if base is not None and n is not None and \
+                not base <= n < base + 500000:
+            print('%s: counter %d, not from %d: the wrong pipe' %
+                  (path, n, base))
+            ok = False
         bgm, bgs = background(y, w, h)
         bright = logo_ok(y, w, h, bgm)
         dx = dot_x(y, w, h, bgm)

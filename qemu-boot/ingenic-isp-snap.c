@@ -18,6 +18,13 @@
  * frames in slots 0 and 1, channel 1's in 2 and 3.  Exits 0 when every
  * channel got all of its frames.
  *
+ * T40 (built with SNAP_DUAL) with SNAP_SENSOR1=<name>:<i2c-addr> in the
+ * environment: two sensors
+ * (SDK sample-common.c, IMPISP_TOTAL_TWO in the all-cached dual mode), the
+ * second on I2C3 through CSI1, and the two channels are 0 (the first
+ * sensor's main stream) and 3 (the second's), both at the sensor size;
+ * channel 3's frames go where channel 1's would.
+ *
  * Built two ways (test-ingenic-isp.sh does both):
  *   - static, against the SDK's uClibc libimp.a (IMP 1.1.5);
  *   - with -DSNAP_MUSL, dynamically against the rootfs's own libimp.so
@@ -141,6 +148,7 @@ void __pthread_unwind_next(__pthread_unwind_buf_t *buf)
 static int nframes = 10;
 static const char *outdir = "/tmp";
 static int chn_ok[2];
+static int chn_id[2] = { 0, 1 };    /* the FrameSource channel of each */
 
 /*
  * The IMP 1.1.6 IMPFSChnAttr (the rootfs's libimp) ends with a front crop
@@ -186,11 +194,11 @@ static int save(int ch, int fd, const unsigned char *p, unsigned size)
 
 static void *grab(void *arg)
 {
-    int ch = (int)(long)arg, i;
+    int k = (int)(long)arg, ch = chn_id[k], i;
     IMPFrameInfo *f;
     char path[128];
 
-    if (IMP_FrameSource_SetFrameDepth(ch, attr(ch).nrVBs * 2) < 0) {
+    if (IMP_FrameSource_SetFrameDepth(ch, attr(k).nrVBs * 2) < 0) {
         printf("ch%d: SetFrameDepth failed\n", ch);
         return NULL;
     }
@@ -221,7 +229,7 @@ static void *grab(void *arg)
                  * write() refuses memory past mem=, its mmap() does not.
                  */
                 unsigned long base = strtoul(getenv("SNAP_DEVMEM"), NULL, 0);
-                int slot = 2 * ch + (i == nframes - 1);
+                int slot = 2 * k + (i == nframes - 1);
                 int mfd = open("/dev/mem", O_RDWR | O_SYNC);
                 void *dst = mfd < 0 ? MAP_FAILED :
                             mmap(NULL, 8 << 20, PROT_READ | PROT_WRITE,
@@ -239,7 +247,7 @@ static void *grab(void *arg)
                 }
                 fd = -2;
             } else if (!strncmp(outdir, "/dev/", 5)) {
-                unsigned long long pos = (2 * ch + (i == nframes - 1)) << 23;
+                unsigned long long pos = (2 * k + (i == nframes - 1)) << 23;
                 unsigned long long res;
 
                 snprintf(path, sizeof(path), "%s", outdir);
@@ -261,7 +269,7 @@ static void *grab(void *arg)
             if (fd == -2) {
                 /* written to memory above */
             } else if (fd < 0 ||
-                       save(ch, fd, (void *)f->virAddr, f->size) < 0) {
+                       save(k, fd, (void *)f->virAddr, f->size) < 0) {
                 printf("ch%d: cannot write %s\n", ch, path);
             }
             if (fd >= 0) {
@@ -271,13 +279,17 @@ static void *grab(void *arg)
         IMP_FrameSource_ReleaseFrame(ch, f);
     }
     IMP_FrameSource_SetFrameDepth(ch, 0);
-    chn_ok[ch] = 1;
+    chn_ok[k] = 1;
     return NULL;
 }
 
 int main(int argc, char **argv)
 {
     IMPSensorInfo sensor;
+#ifdef SNAP_DUAL
+    IMPSensorInfo sensor1;
+    const char *s1 = getenv("SNAP_SENSOR1");
+#endif
     const char *name = "gc2053";
     pthread_t tid[2];
     int ch;
@@ -315,6 +327,42 @@ int main(int argc, char **argv)
     sensor.power_gpio = -1;
     sensor.video_interface = IMPISP_SENSOR_VI_MIPI_CSI0;
     sensor.mclk = SNAP_MCLK;
+#ifdef SNAP_DUAL
+    if (s1) {
+        /* sample-common.c: the second sensor, its input mode, channel 3 */
+        IMPISPCameraInputMode mode = {
+            .sensor_num = IMPISP_TOTAL_TWO,
+            .dual_mode = IMPISP_DUALSENSOR_DUAL_ALLCACHED_MODE,
+            .joint_mode = IMPISP_NOT_JOINT,
+        };
+        const char *colon = strchr(s1, ':');
+        size_t len = colon ? (size_t)(colon - s1) : strlen(s1);
+
+        memcpy(&sensor1, &sensor, sizeof(sensor1));
+        memset(sensor1.name, 0, sizeof(sensor1.name));
+        memset(sensor1.i2c.type, 0, sizeof(sensor1.i2c.type));
+        memcpy(sensor1.name, s1, len < sizeof(sensor1.name) ?
+               len : sizeof(sensor1.name) - 1);
+        memcpy(sensor1.i2c.type, sensor1.name, sizeof(sensor1.i2c.type) - 1);
+        sensor1.i2c.addr = colon ? strtol(colon + 1, NULL, 0) : sensor.i2c.addr;
+        sensor1.i2c.i2c_adapter_id = 3;
+        sensor1.video_interface = IMPISP_SENSOR_VI_MIPI_CSI1;
+        sensor1.mclk = IMPISP_SENSOR_MCLK2;
+        sensor1.sensor_id = 1;
+        chn_id[1] = 3;
+        attr(1) = attr(0);
+        if (IMP_ISP_Open() < 0 || IMP_ISP_SetCameraInputMode(&mode) < 0 ||
+            IMP_ISP_AddSensor(IMPVI_MAIN, &sensor) < 0 ||
+            IMP_ISP_AddSensor(IMPVI_SEC, &sensor1) < 0 ||
+            IMP_ISP_EnableSensor(IMPVI_MAIN, &sensor) < 0 ||
+            IMP_ISP_EnableSensor(IMPVI_SEC, &sensor1) < 0) {
+            printf("ISP / dual sensor setup failed\n");
+            return 1;
+        }
+        printf("isp-snap: two sensors, %s and %s\n", sensor.name,
+               sensor1.name);
+    } else
+#endif
     if (IMP_ISP_Open() < 0 || IMP_ISP_AddSensor(IMPVI_MAIN, &sensor) < 0 ||
         IMP_ISP_EnableSensor(IMPVI_MAIN, &sensor) < 0) {
 #else
@@ -336,15 +384,15 @@ int main(int argc, char **argv)
     IMP_ISP_Tuning_SetISPRunningMode(IMPISP_RUNNING_MODE_DAY);
 #endif
     for (ch = 0; ch < 2; ch++) {
-        if (IMP_FrameSource_CreateChn(ch, &attr(ch)) < 0 ||
-            IMP_FrameSource_SetChnAttr(ch, &attr(ch)) < 0) {
-            printf("ch%d: CreateChn failed\n", ch);
+        if (IMP_FrameSource_CreateChn(chn_id[ch], &attr(ch)) < 0 ||
+            IMP_FrameSource_SetChnAttr(chn_id[ch], &attr(ch)) < 0) {
+            printf("ch%d: CreateChn failed\n", chn_id[ch]);
             return 1;
         }
     }
     for (ch = 0; ch < 2; ch++) {
-        if (IMP_FrameSource_EnableChn(ch) < 0) {
-            printf("ch%d: EnableChn failed\n", ch);
+        if (IMP_FrameSource_EnableChn(chn_id[ch]) < 0) {
+            printf("ch%d: EnableChn failed\n", chn_id[ch]);
             return 1;
         }
     }
@@ -370,17 +418,30 @@ int main(int argc, char **argv)
         }
     }
     for (ch = 0; ch < 2; ch++) {
-        IMP_FrameSource_DisableChn(ch);
+        IMP_FrameSource_DisableChn(chn_id[ch]);
     }
     for (ch = 0; ch < 2; ch++) {
-        IMP_FrameSource_DestroyChn(ch);
+        IMP_FrameSource_DestroyChn(chn_id[ch]);
     }
+#ifdef SNAP_T40
+    /* sample-common.c's order: the sensors, then tuning */
+    IMP_System_Exit();
+    IMP_ISP_DisableSensor(IMPVI_MAIN);
+#ifdef SNAP_DUAL
+    if (s1) {
+        IMP_ISP_DisableSensor(IMPVI_SEC);
+    }
+#endif
+    IMP_ISP_DelSensor(IMPVI_MAIN, &sensor);
+#ifdef SNAP_DUAL
+    if (s1) {
+        IMP_ISP_DelSensor(IMPVI_SEC, &sensor1);
+    }
+#endif
+    IMP_ISP_DisableTuning();
+#else
     IMP_ISP_DisableTuning();
     IMP_System_Exit();
-#ifdef SNAP_T40
-    IMP_ISP_DisableSensor(IMPVI_MAIN);
-    IMP_ISP_DelSensor(IMPVI_MAIN, &sensor);
-#else
     IMP_ISP_DisableSensor();
     IMP_ISP_DelSensor(&sensor);
 #endif

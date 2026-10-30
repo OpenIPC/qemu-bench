@@ -39,6 +39,8 @@
  *                    status bit is unmasked
  *     0x1F0 / 0x1F4  write 1 to clear
  *   (T41: the MSCA channels in their own window, 0x133F0000, mmio 4)
+ *   (T40: a second pipe, VIC1 / VIC2 at 0x13390000 / 0x133A0000, mmio 5
+ *   and 6, IRQs 2 and 3 -- ingenic_isp_layouts[]'s pipe_* fields)
  *   CSI host  0x10023000 and D-PHY 0x10022000, 4 KiB each: storage (the
  *             driver only writes them, and reads ERR1/ERR2 as 0); T21,
  *             DVP only, has neither
@@ -91,7 +93,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicIspState, INGENIC_ISP)
 
 #define VIC_CTRL        0x000
 
-#define NUM_CH          3
+#define NUM_CH          3           /* a pipe's */
+#define MAX_PIPES       2
+#define NUM_VIC         3
 #define FIFO_DEPTH      16
 
 /*
@@ -132,6 +136,15 @@ typedef struct IngenicIspLayout {
                                    3: T21's */
     hwaddr wb;                  /* the AWB's R and B gains (G << 16 | gain,
                                    Q10), for the trace; 0: none */
+    /*
+     * T40's second pipe (pipes 2): its channels 3..5, their enable and
+     * FIFOs at pipe_ch past pipe 0's, its interrupt enable / clear /
+     * status at pipe_int past pipe 0's, its AE and AWB blocks at pipe_stat
+     * past pipe 0's; fed by VIC1 (mmio 5, its own IRQ), VIC2 (mmio 6)
+     * storage with an IRQ of its own
+     */
+    uint8_t pipes;
+    hwaddr pipe_ch, pipe_int, pipe_stat;
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
@@ -234,6 +247,16 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
         .wb = 0x4004,
+        /*
+         * pipe 1 (the second sensor, IMPVI_SEC: tisp_sec_init,
+         * tisp_channel_sec_*, tisp_ae_sec_*): ISR 0x72f10 reads its
+         * status at 0x40038 and clears it through 0x40034, the T31 bits
+         * again (channels 3..5 on bits 0..2, 3A on 3..5); its MSCA
+         * channels at 0x17100 + 0x100 n, enable 0x17008; AE 0x19200, AWB
+         * 0x18200 (banks from tisp_sec_init).  VIC1 is VIC0 again at
+         * +0x10000, its frame start queueing sec_fs_work (VIC ISR 0x4708)
+         */
+        .pipes = 2, .pipe_ch = 0x1000, .pipe_int = 0x10, .pipe_stat = 0x200,
     }, {
         /*
          * tx-isp-t41.ko H20230630a (T41 SDK 1.2.0): T40's core interrupts
@@ -286,25 +309,31 @@ struct IngenicIspState {
     SysBusDevice parent_obj;
 
     MemoryRegion isp_mr, vic_mr, csi_mr, phy_mr, msca_mr;
-    qemu_irq isp_irq, vic_irq;
+    MemoryRegion vic1_mr, vic2_mr;
+    qemu_irq isp_irq, vic_irq, vic1_irq, vic2_irq;
     QEMUTimer *timer;
 
     uint32_t fps;
     char *soc;
     bool trace;
+    bool trace_regs;            /* log every register write */
     uint32_t light;             /* the scene's light, percent */
     uint32_t light_r, light_b;  /* its colour: the raw R and B of a white
                                    over its G, per mille */
     Object *sensor;             /* the image sensor, for its exposure */
+    Object *sensor1;            /* T40: the second pipe's sensor */
     const IngenicIspLayout *l;
 
     uint32_t isp[ISP_SIZE / 4];
     uint32_t vic[VIC_SIZE / 4];
+    uint32_t vic1[VIC_SIZE / 4];    /* T40's second and third VICs */
+    uint32_t vic2[VIC_SIZE / 4];
     uint32_t csi[CSI_SIZE / 4];
     uint32_t phy[PHY_SIZE / 4];
     bool vic_running;
+    bool vic1_running;
     uint32_t frame;
-    IngenicIspChan ch[NUM_CH];
+    IngenicIspChan ch[NUM_CH * MAX_PIPES];  /* pipe p's channel n: 3 p + n */
 
     IngenicIspPainter paint;
 };
@@ -354,17 +383,54 @@ static void chan_clear(IngenicIspChan *c)
 #define ISP_REG(o)      s->isp[(o) >> 2]
 #define VIC_REG(o)      s->vic[(o) >> 2]
 
+/* pipe @p's copy of a pipe 0 register: channels, interrupts, 3A */
+#define PIPE_CH(p, o)   ((o) + (p) * s->l->pipe_ch)
+#define PIPE_INT(p, o)  ((o) + (p) * s->l->pipe_int)
+#define PIPE_STAT(p, o) ((o) + (p) * s->l->pipe_stat)
+
+static int ingenic_isp_pipes(IngenicIspState *s)
+{
+    return MAX(s->l->pipes, 1);
+}
+
+/* VIC @v's registers (T40: three VICs, 64 KiB apart) */
+static uint32_t *ingenic_vic_regs(IngenicIspState *s, int v)
+{
+    return v == 0 ? s->vic : v == 1 ? s->vic1 : s->vic2;
+}
+
+static bool ingenic_vic_pending(IngenicIspState *s, int v)
+{
+    const IngenicIspLayout *l = s->l;
+    uint32_t *r = ingenic_vic_regs(s, v);
+    uint32_t vic = r[l->vic_sta >> 2] & ~r[l->vic_mask >> 2];
+
+    if (l->vic_sta2) {
+        vic |= r[(l->vic_sta + 4) >> 2] & ~r[(l->vic_mask + 4) >> 2];
+    }
+    return !l->no_vic && vic;
+}
+
 static void ingenic_isp_update(IngenicIspState *s)
 {
     const IngenicIspLayout *l = s->l;
-    uint32_t vic = VIC_REG(l->vic_sta) & ~VIC_REG(l->vic_mask);
-    uint32_t en = l->int_mask ? ~ISP_REG(l->int_en) : ISP_REG(l->int_en);
+    bool isp = false;
+    int p;
 
-    if (l->vic_sta2) {
-        vic |= VIC_REG(l->vic_sta + 4) & ~VIC_REG(l->vic_mask + 4);
+    for (p = 0; p < ingenic_isp_pipes(s); p++) {
+        uint32_t en = ISP_REG(PIPE_INT(p, l->int_en));
+
+        if (l->int_mask) {
+            en = ~en;
+        }
+        isp |= !!(ISP_REG(PIPE_INT(p, l->int_sta)) & en);
     }
-    qemu_set_irq(s->isp_irq, !!(ISP_REG(l->int_sta) & en));
-    qemu_set_irq(s->vic_irq, !l->no_vic && vic);
+    qemu_set_irq(s->isp_irq, isp);
+    qemu_set_irq(s->vic_irq, ingenic_vic_pending(s, 0));
+    if (l->pipes > 1) {
+        qemu_set_irq(s->vic1_irq, ingenic_vic_pending(s, 1));
+        qemu_set_irq(s->vic2_irq, ingenic_vic_pending(s, 2));
+    }
 }
 
 static int64_t ingenic_isp_period(IngenicIspState *s)
@@ -372,10 +438,26 @@ static int64_t ingenic_isp_period(IngenicIspState *s)
     return NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
 }
 
+/* Does pipe @p take frames: its VIC started, its interrupts enabled? */
+static bool ingenic_isp_pipe_running(IngenicIspState *s, int p)
+{
+    const IngenicIspLayout *l = s->l;
+
+    if (l->no_vic) {
+        return !p && (ISP_REG(l->ch_en) & 7);
+    }
+    return (p ? s->vic1_running : s->vic_running) &&
+           ISP_REG(PIPE_INT(p, l->int_en));
+}
+
 static void ingenic_isp_schedule(IngenicIspState *s)
 {
-    bool run = s->l->no_vic ? ISP_REG(s->l->ch_en) & 7 :
-               s->vic_running && ISP_REG(s->l->int_en);
+    bool run = false;
+    int p;
+
+    for (p = 0; p < ingenic_isp_pipes(s); p++) {
+        run |= ingenic_isp_pipe_running(s, p);
+    }
 
     if (run && !timer_pending(s->timer)) {
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -387,20 +469,20 @@ static void ingenic_isp_schedule(IngenicIspState *s)
 
 /* --- the scene's light, 3A statistics ------------------------------------- */
 
-/* The sensor's exposure, rows x gain (1.0 = 1024); 0 if there is none */
-static uint64_t ingenic_isp_sensor_level(IngenicIspState *s)
+/* @sensor's exposure, rows x gain (1.0 = 1024); 0 if there is none */
+static uint64_t ingenic_isp_sensor_level(Object *sensor)
 {
     IngenicSensorExposure e;
     HisiSoiExposure soi;
 
-    if (!s->sensor) {
+    if (!sensor) {
         return 0;
     }
-    if (galaxycore_exposure(s->sensor, &e) ||
-        smartsens_exposure(s->sensor, &e)) {
+    if (galaxycore_exposure(sensor, &e) ||
+        smartsens_exposure(sensor, &e)) {
         return (uint64_t)e.lines * e.gain;
     }
-    if (hisi_soi_exposure(s->sensor, &soi)) {
+    if (hisi_soi_exposure(sensor, &soi)) {
         return (uint64_t)soi.lines * soi.gain;
     }
     return 0;
@@ -415,10 +497,11 @@ static uint64_t ingenic_isp_sensor_level(IngenicIspState *s)
  */
 #define EXPOSURE_1X     (1000ull * 1024)
 
-static uint32_t ingenic_isp_gain(IngenicIspState *s)
+static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 {
     uint64_t g = (uint64_t)s->light * 256 / 100;
-    uint64_t level = s->l->ae ? ingenic_isp_sensor_level(s) : 0;
+    uint64_t level = s->l->ae ?
+        ingenic_isp_sensor_level(pipe ? s->sensor1 : s->sensor) : 0;
 
     if (level) {
         g = g * level / EXPOSURE_1X;
@@ -512,30 +595,33 @@ static bool isp_grid(IngenicIspState *s, hwaddr blk, int *cols, int *rows,
     return xs[*cols] && ys[*rows];
 }
 
-static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
+static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
+                              uint32_t frame)
 {
     const IngenicIspLayout *l = s->l;
+    hwaddr ae_blk = PIPE_STAT(pipe, l->ae), awb_blk = PIPE_STAT(pipe, l->awb);
+    hwaddr int_sta = PIPE_INT(pipe, l->int_sta);
     static IspZone zone[STAT_ZONES][STAT_ZONES];
     uint64_t hist[256];
     uint8_t buf[STAT_ZONES * STAT_ZONES * 16];
     static uint8_t abuf[STAT_ZONES * STAT_ZONES * 128];
     int cols, rows, xs[STAT_ZONES + 1], ys[STAT_ZONES + 1];
     int acols, arows, axs[STAT_ZONES + 1], ays[STAT_ZONES + 1];
-    uint32_t thr = ISP_REG(l->ae + 0x28);
+    uint32_t thr = ISP_REG(ae_blk + 0x28);
     int lo = thr & 0xFF, hi = (thr >> 8) & 0xFF;
     /* T21 has no enable bits: a block runs once it has its banks */
     bool en_bits = l->stat_gen != 3;
-    bool ae = (!en_bits || (ISP_REG(l->ae) & 1)) && ISP_REG(l->ae + 0x2C);
-    bool awb = (!en_bits || (ISP_REG(l->awb) & 1)) && ISP_REG(l->awb + 0x3C);
+    bool ae = (!en_bits || (ISP_REG(ae_blk) & 1)) && ISP_REG(ae_blk + 0x2C);
+    bool awb = (!en_bits || (ISP_REG(awb_blk) & 1)) && ISP_REG(awb_blk + 0x3C);
     int zx, zy, i, j, w, h;
 
     if (!ae && !awb) {
         return;
     }
-    if (!isp_grid(s, l->ae, &cols, &rows, xs, ys)) {
+    if (!isp_grid(s, ae_blk, &cols, &rows, xs, ys)) {
         ae = false;
     }
-    if (!isp_grid(s, l->awb, &acols, &arows, axs, ays)) {
+    if (!isp_grid(s, awb_blk, &acols, &arows, axs, ays)) {
         awb = false;
     }
     if (!ae && !awb) {
@@ -568,7 +654,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
                     double k = gain / 256.0, yn, cb, cr, rgb[3];
                     int y, ch;
 
-                    sstar_pattern_pixel(s->frame, w, h, 2 * qx, 2 * qy, yuv);
+                    sstar_pattern_pixel(frame, w, h, 2 * qx, 2 * qy, yuv);
                     /* the sensor's linear light, 8 bits */
                     y = lround(MIN(isp_lin(yuv[0]) * k, 1) * 255);
                     c = y < lo ? 0 : y > hi ? 2 : 1;
@@ -600,7 +686,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
         }
     }
     if (ae) {
-        uint32_t cnt = ISP_REG(l->ae + 0x4C), idx = ISP_REG(l->ae + 0x50);
+        uint32_t cnt = ISP_REG(ae_blk + 0x4C), idx = ISP_REG(ae_blk + 0x50);
         int zb = (((idx >> 4) & 3) + 1) % (((cnt >> 4) & 3) + 1);
         int hb = ((idx & 3) + 1) % ((cnt & 3) + 1);
         uint32_t hw[512];
@@ -629,7 +715,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
             }
         }
         dma_memory_write(&address_space_memory,
-                         ISP_REG(l->ae + 0x2C + 4 * zb), buf,
+                         ISP_REG(ae_blk + 0x2C + 4 * zb), buf,
                          16 * rows * cols, MEMTXATTRS_UNSPECIFIED);
         for (i = 0; i < 256; i++) {
             hw[i] = hw[256 + i] = cpu_to_le32(MIN(hist[i] / (STAT_SX *
@@ -638,13 +724,13 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
                                                   0xFFFFF : 0x1FFFFF));
         }
         dma_memory_write(&address_space_memory,
-                         ISP_REG(l->ae + 0x3C + 4 * hb), hw, sizeof(hw),
+                         ISP_REG(ae_blk + 0x3C + 4 * hb), hw, sizeof(hw),
                          MEMTXATTRS_UNSPECIFIED);
-        ISP_REG(l->ae + 0x50) = zb << 4 | hb;
-        ISP_REG(l->int_sta) |= 1u << l->ae_static_bit | 1u << l->ae_hist_bit;
+        ISP_REG(ae_blk + 0x50) = zb << 4 | hb;
+        ISP_REG(int_sta) |= 1u << l->ae_static_bit | 1u << l->ae_hist_bit;
     }
     if (awb) {
-        uint32_t cnt = ISP_REG(l->awb + 0x4C), idx = ISP_REG(l->awb + 0x50);
+        uint32_t cnt = ISP_REG(awb_blk + 0x4C), idx = ISP_REG(awb_blk + 0x50);
         int ab = ((idx & 3) + 1) % ((cnt & 3) + 1);
         int zs = l->stat_gen == 2 ? 128 : 16;
 
@@ -681,10 +767,10 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
             }
         }
         dma_memory_write(&address_space_memory,
-                         ISP_REG(l->awb + 0x3C + 4 * ab), abuf,
+                         ISP_REG(awb_blk + 0x3C + 4 * ab), abuf,
                          zs * arows * acols, MEMTXATTRS_UNSPECIFIED);
-        ISP_REG(l->awb + 0x50) = ab;
-        ISP_REG(l->int_sta) |= 1u << l->awb_bit;
+        ISP_REG(awb_blk + 0x50) = ab;
+        ISP_REG(int_sta) |= 1u << l->awb_bit;
     }
     if (s->trace) {
         uint64_t sum = 0, n = 0;
@@ -697,30 +783,40 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
                 }
             }
         }
-        qemu_log("ingenic-isp: frame %u stats gain %u/256 mean Y %u%s%s"
+        qemu_log("ingenic-isp: pipe %d frame %u stats gain %u/256 mean Y %u%s%s"
                  " wb R %u B %u /1024\n",
-                 s->frame, gain, n ? (unsigned)(sum / n) : 0,
+                 pipe, frame, gain, n ? (unsigned)(sum / n) : 0,
                  ae ? " ae" : "", awb ? " awb" : "",
                  l->wb ? ISP_REG(l->wb) & 0xFFF : 0,
                  l->wb ? ISP_REG(l->wb + 4) & 0xFFF : 0);
     }
 }
 
-static void ingenic_isp_frame(void *opaque)
+/*
+ * The frame of pipe @p: frame start, the picture into each enabled
+ * channel with a queued buffer, the 3A statistics, VIC frame done.  Pipe
+ * 1 paints the scene with its counter 500000 ahead, so that its pictures
+ * tell themselves from pipe 0's.
+ */
+#define PIPE1_FRAME     500000
+
+static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
 {
-    IngenicIspState *s = opaque;
     const IngenicIspLayout *l = s->l;
-    uint32_t en = ISP_REG(l->ch_en);
-    uint32_t gain = ingenic_isp_gain(s);
+    uint32_t en = ISP_REG(PIPE_CH(p, l->ch_en));
+    uint32_t gain = ingenic_isp_gain(s, p);
+    uint32_t frame = s->frame + (p ? PIPE1_FRAME : 0);
+    hwaddr int_sta = PIPE_INT(p, l->int_sta);
+    uint32_t *vic = ingenic_vic_regs(s, p);
     int n;
 
-    ISP_REG(l->int_sta) |= l->fs_bit;
+    ISP_REG(int_sta) |= l->fs_bit;
     if (!l->no_vic) {
-        VIC_REG(l->vic_sta) |= l->vic_fs_bit;
+        vic[l->vic_sta >> 2] |= l->vic_fs_bit;
     }
     for (n = 0; n < NUM_CH; n++) {
-        IngenicIspChan *c = &s->ch[n];
-        uint32_t *r = &s->isp[MSCA_CH(n) >> 2];
+        IngenicIspChan *c = &s->ch[p * NUM_CH + n];
+        uint32_t *r = &s->isp[PIPE_CH(p, MSCA_CH(n)) >> 2];
         uint32_t size = r[l->csize >> 2] ? r[l->csize >> 2] :
                         r[l->osize >> 2];
         uint32_t w = size >> 16, h = size & 0xFFFF;
@@ -732,22 +828,35 @@ static void ingenic_isp_frame(void *opaque)
         }
         ya = fifo_pop(&c->y, NULL);
         uva = fifo_pop(&c->uv, NULL);
-        ingenic_isp_paint(&s->paint, s->frame, w, h, r[l->ystride >> 2],
+        ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
                           r[l->uvstride >> 2], ya, uva, false, gain);
         fifo_push(&c->done_y, ya, c->frames);
         fifo_push(&c->done_uv, uva, c->frames);
         c->frames++;
-        ISP_REG(l->int_sta) |= 1u << n;
+        ISP_REG(int_sta) |= 1u << n;
         if (s->trace) {
-            qemu_log("ingenic-isp: frame %u ch%d %ux%u -> 0x%08x/0x%08x\n",
-                     s->frame, n, w, h, ya, uva);
+            qemu_log("ingenic-isp: pipe %d frame %u ch%d %ux%u -> "
+                     "0x%08x/0x%08x\n", p, s->frame, p * NUM_CH + n, w, h,
+                     ya, uva);
         }
     }
     if (l->ae) {
-        ingenic_isp_stats(s, gain);
+        ingenic_isp_stats(s, gain, p, frame);
     }
     if (!l->no_vic) {
-        VIC_REG(l->vic_sta) |= 1;
+        vic[l->vic_sta >> 2] |= 1;
+    }
+}
+
+static void ingenic_isp_frame(void *opaque)
+{
+    IngenicIspState *s = opaque;
+    int p;
+
+    for (p = 0; p < ingenic_isp_pipes(s); p++) {
+        if (ingenic_isp_pipe_running(s, p)) {
+            ingenic_isp_pipe_frame(s, p);
+        }
     }
     s->frame++;
     ingenic_isp_update(s);
@@ -757,12 +866,36 @@ static void ingenic_isp_frame(void *opaque)
 
 /* --- ISP core ------------------------------------------------------------ */
 
+/* The channel (3 pipe + n) whose registers @off is in; -1: none */
 static int ingenic_isp_chan(IngenicIspState *s, hwaddr off)
 {
-    if (off < MSCA_CH(0) || off >= MSCA_CH(NUM_CH)) {
-        return -1;
+    int p;
+
+    for (p = 0; p < ingenic_isp_pipes(s); p++) {
+        if (off >= PIPE_CH(p, MSCA_CH(0)) && off < PIPE_CH(p, MSCA_CH(NUM_CH))) {
+            return p * NUM_CH + ((off - PIPE_CH(p, MSCA_CH(0))) >> 8);
+        }
     }
-    return (off - s->l->ch_base) >> 8;
+    return -1;
+}
+
+/* channel @n's register block */
+static hwaddr ingenic_isp_chan_base(IngenicIspState *s, int n)
+{
+    return PIPE_CH(n / NUM_CH, MSCA_CH(n % NUM_CH));
+}
+
+/* the pipe whose interrupt register @off is (one of @reg's copies); -1 */
+static int ingenic_isp_pipe_reg(IngenicIspState *s, hwaddr off, hwaddr reg)
+{
+    int p;
+
+    for (p = 0; p < ingenic_isp_pipes(s); p++) {
+        if (off == PIPE_INT(p, reg)) {
+            return p;
+        }
+    }
+    return -1;
 }
 
 static bool ingenic_isp_is_clear(const IngenicIspLayout *l, hwaddr r)
@@ -801,7 +934,7 @@ static uint64_t ingenic_isp_read(void *opaque, hwaddr off, unsigned size)
         return s->isp[off >> 2];
     }
     c = &s->ch[n];
-    r = off - MSCA_CH(n);
+    r = off - ingenic_isp_chan_base(s, n);
     if (r == l->pop_y) {
         c->pop_uv = fifo_pop(&c->done_uv, NULL);
         return fifo_pop(&c->done_y, &c->pop_num);
@@ -823,11 +956,16 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
     IngenicIspState *s = opaque;
     const IngenicIspLayout *l = s->l;
     int n = ingenic_isp_chan(s, off);
+    int p;
 
     if (off >= ISP_SIZE) {
         return;
     }
-    if (s->trace && ((off >= MSCA_CH(0) && off < MSCA_CH(NUM_CH)) ||
+    if (s->trace_regs) {
+        qemu_log("ingenic-isp: core [0x%05x] = 0x%08x\n", (unsigned)off,
+                 (uint32_t)val);
+    }
+    if (s->trace && (n >= 0 ||
                      off == l->ch_en || (off & ~0x7ff) == 0xA000 ||
                      (off & ~0x7ff) == 0xB000 || (off & ~0xff) == 0x1800 ||
                      (off & ~0xff) == 0x18000 || (off & ~0xff) == 0x19000 ||
@@ -835,18 +973,19 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
         qemu_log("ingenic-isp: [0x%04x] = 0x%08x\n", (unsigned)off,
                  (uint32_t)val);
     }
-    if (off == l->int_sta) {
+    if (ingenic_isp_pipe_reg(s, off, l->int_sta) >= 0) {
         return;
     }
-    if (off == l->int_clr) {
-        ISP_REG(l->int_sta) &= ~val;
+    p = ingenic_isp_pipe_reg(s, off, l->int_clr);
+    if (p >= 0) {
+        ISP_REG(PIPE_INT(p, l->int_sta)) &= ~val;
         s->isp[off >> 2] = val;
         ingenic_isp_update(s);
         return;
     }
     if (n >= 0) {
         IngenicIspChan *c = &s->ch[n];
-        hwaddr r = off - MSCA_CH(n);
+        hwaddr r = off - ingenic_isp_chan_base(s, n);
 
         if (r == l->push_y) {
             if (!fifo_push(&c->y, val, 0)) {
@@ -867,32 +1006,40 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
         }
     }
     s->isp[off >> 2] = val;
-    if (off == l->int_en || off == l->ch_en) {
-        ingenic_isp_update(s);
-        ingenic_isp_schedule(s);
+    for (p = 0; p < ingenic_isp_pipes(s); p++) {
+        if (off == PIPE_INT(p, l->int_en) || off == PIPE_CH(p, l->ch_en)) {
+            ingenic_isp_update(s);
+            ingenic_isp_schedule(s);
+        }
     }
 }
 
 /* --- VIC ------------------------------------------------------------------ */
 
-static uint64_t ingenic_vic_read(void *opaque, hwaddr off, unsigned size)
+static uint64_t ingenic_vic_rd(IngenicIspState *s, int v, hwaddr off)
 {
-    IngenicIspState *s = opaque;
-
-    return s->vic[off >> 2];
+    return ingenic_vic_regs(s, v)[off >> 2];
 }
 
-static void ingenic_vic_write(void *opaque, hwaddr off, uint64_t val,
-                              unsigned size)
+static void ingenic_vic_wr(IngenicIspState *s, int v, hwaddr off,
+                           uint64_t val)
 {
-    IngenicIspState *s = opaque;
     const IngenicIspLayout *l = s->l;
+    uint32_t *r = ingenic_vic_regs(s, v);
     int two = l->vic_sta2 ? 4 : 0;
 
+    if (s->trace_regs) {
+        qemu_log("ingenic-isp: vic%d [0x%04x] = 0x%08x\n", v, (unsigned)off,
+                 (uint32_t)val);
+    }
     if (off == VIC_CTRL) {
         /* 2, 4: reset and configure, done at once; 1: start */
-        s->vic_running = val == 1;
-        s->vic[0] = 0;
+        if (v == 0) {
+            s->vic_running = val == 1;
+        } else if (v == 1) {
+            s->vic1_running = val == 1;
+        }
+        r[0] = 0;
         ingenic_isp_schedule(s);
         return;
     }
@@ -900,10 +1047,43 @@ static void ingenic_vic_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     if (off == l->vic_clr || off == l->vic_clr + two) {
-        VIC_REG(l->vic_sta + off - l->vic_clr) &= ~val;
+        r[(l->vic_sta + off - l->vic_clr) >> 2] &= ~val;
     }
-    s->vic[off >> 2] = val;
+    r[off >> 2] = val;
     ingenic_isp_update(s);
+}
+
+static uint64_t ingenic_vic_read(void *opaque, hwaddr off, unsigned size)
+{
+    return ingenic_vic_rd(opaque, 0, off);
+}
+
+static void ingenic_vic_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    ingenic_vic_wr(opaque, 0, off, val);
+}
+
+static uint64_t ingenic_vic1_read(void *opaque, hwaddr off, unsigned size)
+{
+    return ingenic_vic_rd(opaque, 1, off);
+}
+
+static void ingenic_vic1_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size)
+{
+    ingenic_vic_wr(opaque, 1, off, val);
+}
+
+static uint64_t ingenic_vic2_read(void *opaque, hwaddr off, unsigned size)
+{
+    return ingenic_vic_rd(opaque, 2, off);
+}
+
+static void ingenic_vic2_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size)
+{
+    ingenic_vic_wr(opaque, 2, off, val);
 }
 
 /* --- CSI host, D-PHY: storage --------------------------------------------- */
@@ -953,6 +1133,10 @@ static const MemoryRegionOps ingenic_isp_ops =
     INGENIC_ISP_OPS(ingenic_isp_read, ingenic_isp_write);
 static const MemoryRegionOps ingenic_vic_ops =
     INGENIC_ISP_OPS(ingenic_vic_read, ingenic_vic_write);
+static const MemoryRegionOps ingenic_vic1_ops =
+    INGENIC_ISP_OPS(ingenic_vic1_read, ingenic_vic1_write);
+static const MemoryRegionOps ingenic_vic2_ops =
+    INGENIC_ISP_OPS(ingenic_vic2_read, ingenic_vic2_write);
 static const MemoryRegionOps ingenic_msca_ops =
     INGENIC_ISP_OPS(ingenic_msca_read, ingenic_msca_write);
 static const MemoryRegionOps ingenic_csi_ops =
@@ -968,11 +1152,14 @@ static void ingenic_isp_reset(DeviceState *dev)
     timer_del(s->timer);
     memset(s->isp, 0, sizeof(s->isp));
     memset(s->vic, 0, sizeof(s->vic));
+    memset(s->vic1, 0, sizeof(s->vic1));
+    memset(s->vic2, 0, sizeof(s->vic2));
     memset(s->csi, 0, sizeof(s->csi));
     memset(s->phy, 0, sizeof(s->phy));
     s->vic_running = false;
+    s->vic1_running = false;
     s->frame = 0;
-    for (n = 0; n < NUM_CH; n++) {
+    for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
         chan_clear(&s->ch[n]);
         s->ch[n].pop_uv = s->ch[n].pop_num = s->ch[n].frames = 0;
     }
@@ -1016,10 +1203,22 @@ static void ingenic_isp_init(Object *obj)
     memory_region_init_io(&s->msca_mr, obj, &ingenic_msca_ops, s,
                           "ingenic-isp.msca", MSCA_WIN_SIZE);
     sysbus_init_mmio(sbd, &s->msca_mr);
+    /* T40: VIC1 and VIC2 (mmio 5, 6; IRQs 2, 3) */
+    memory_region_init_io(&s->vic1_mr, obj, &ingenic_vic1_ops, s,
+                          "ingenic-isp.vic1", VIC_SIZE);
+    memory_region_init_io(&s->vic2_mr, obj, &ingenic_vic2_ops, s,
+                          "ingenic-isp.vic2", VIC_SIZE);
+    sysbus_init_mmio(sbd, &s->vic1_mr);
+    sysbus_init_mmio(sbd, &s->vic2_mr);
     sysbus_init_irq(sbd, &s->isp_irq);
     sysbus_init_irq(sbd, &s->vic_irq);
+    sysbus_init_irq(sbd, &s->vic1_irq);
+    sysbus_init_irq(sbd, &s->vic2_irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ingenic_isp_frame, s);
     object_property_add_link(obj, "sensor", TYPE_DEVICE, &s->sensor,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "sensor1", TYPE_DEVICE, &s->sensor1,
                              object_property_allow_set_link,
                              OBJ_PROP_LINK_STRONG);
     /* the scene's light, percent; qom-set while running */
@@ -1040,7 +1239,7 @@ static int ingenic_isp_post_load(void *opaque, int version_id)
     IngenicIspState *s = opaque;
     int n;
 
-    for (n = 0; n < NUM_CH; n++) {
+    for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
         IngenicIspChan *c = &s->ch[n];
 
         if (c->y.head >= FIFO_DEPTH || c->y.count > FIFO_DEPTH ||
@@ -1089,7 +1288,7 @@ static const VMStateDescription vmstate_ingenic_isp_chan = {
 
 static const VMStateDescription vmstate_ingenic_isp = {
     .name = TYPE_INGENIC_ISP,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = ingenic_isp_post_load,
     .fields = (const VMStateField[]) {
@@ -1102,8 +1301,13 @@ static const VMStateDescription vmstate_ingenic_isp = {
         VMSTATE_UINT32_V(light, IngenicIspState, 2),
         VMSTATE_UINT32_V(light_r, IngenicIspState, 2),
         VMSTATE_UINT32_V(light_b, IngenicIspState, 2),
-        VMSTATE_STRUCT_ARRAY(ch, IngenicIspState, NUM_CH, 1,
-                             vmstate_ingenic_isp_chan, IngenicIspChan),
+        VMSTATE_STRUCT_SUB_ARRAY(ch, IngenicIspState, 0, NUM_CH, 1,
+                                 vmstate_ingenic_isp_chan, IngenicIspChan),
+        VMSTATE_STRUCT_SUB_ARRAY(ch, IngenicIspState, NUM_CH, NUM_CH, 3,
+                                 vmstate_ingenic_isp_chan, IngenicIspChan),
+        VMSTATE_UINT32_ARRAY_V(vic1, IngenicIspState, VIC_SIZE / 4, 3),
+        VMSTATE_UINT32_ARRAY_V(vic2, IngenicIspState, VIC_SIZE / 4, 3),
+        VMSTATE_BOOL_V(vic1_running, IngenicIspState, 3),
         VMSTATE_TIMER_PTR(timer, IngenicIspState),
         VMSTATE_END_OF_LIST()
     },
@@ -1113,6 +1317,7 @@ static const Property ingenic_isp_properties[] = {
     DEFINE_PROP_UINT32("fps", IngenicIspState, fps, 25),
     DEFINE_PROP_STRING("soc", IngenicIspState, soc),
     DEFINE_PROP_BOOL("trace", IngenicIspState, trace, false),
+    DEFINE_PROP_BOOL("trace-regs", IngenicIspState, trace_regs, false),
 };
 
 static void ingenic_isp_class_init(ObjectClass *oc, const void *data)
