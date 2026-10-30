@@ -128,7 +128,10 @@ typedef struct IngenicIspLayout {
     /* the Tiziano 3A statistics blocks (AE0, AWB); 0: none */
     hwaddr ae, awb;
     uint8_t ae_static_bit, ae_hist_bit, awb_bit;    /* in int_sta */
-    uint8_t stat_gen;           /* 1: T31's bank formats; 2: T40/T41's */
+    uint8_t stat_gen;           /* 1: T31's bank formats; 2: T40/T41's;
+                                   3: T21's */
+    hwaddr wb;                  /* the AWB's R and B gains (G << 16 | gain,
+                                   Q10), for the trace; 0: none */
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
@@ -146,6 +149,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         /* ae0_interrupt_static / _hist, awb_interrupt_static (SDK .ko) */
         .ae = 0xA000, .awb = 0xB000,
         .ae_static_bit = 26, .ae_hist_bit = 27, .awb_bit = 30, .stat_gen = 1,
+        .wb = 0x1804,
     }, {
         /*
          * tx-isp-t21.ko H20200509a: the T31 MSCA at 0x2300 (QBUF 0x32650,
@@ -160,6 +164,15 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         .pop_y = 0x74, .pop_uv = 0x8C, .pop_num = { 0x78, 0x90 },
         .empty = 0x7C, .ystride = 0x80, .uvstride = 0x98,
         .vic_sta = 0x100, .vic_mask = 0x104, .vic_clr = 0x108,
+        /*
+         * the T31 3A blocks at 0x700 (AE0) and 0x800 (AWB), banks set by
+         * tisp_init 0xe2ec; ae_interrupt_static / _hist and
+         * awb_interrupt_static on int_sta bits 16, 17 and 18
+         * (tiziano_ae_init 0x2d298, tiziano_awb_init 0x10a24)
+         */
+        .ae = 0x700, .awb = 0x800,
+        .ae_static_bit = 16, .ae_hist_bit = 17, .awb_bit = 18, .stat_gen = 3,
+        .wb = 0x604,                    /* JZ_Isp_Awb_Awbg2reg */
     }, {
         /*
          * tx-isp-t23.ko (SDK 1.1.0 build H20230720a with its symbols,
@@ -220,6 +233,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         /* pipe 0's 3A as on T41 (tisp_ae_main_interrupt_static & co.) */
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
+        .wb = 0x4004,
     }, {
         /*
          * tx-isp-t41.ko H20230630a (T41 SDK 1.2.0): T40's core interrupts
@@ -251,6 +265,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          */
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
+        .wb = 0x4004,
     },
 };
 
@@ -443,7 +458,10 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s)
  * widen the AE sums to 22 bits and the counts to 14, and give an AWB zone
  * 128 bytes: eight records of 22-bit R, G, B, IR and a 14-bit count,
  * which the kernel takes as four groups of two -- all eight get the
- * zone's sums here.
+ * zone's sums here.  T21 (stat_gen 3, blocks at 0x700 / 0x800) keeps
+ * T31's AE zones but counts its histogram in 20 bits, and its AWB zone
+ * has no IR sum: R, G, B and a 13-bit count at [20:0], [41:21], [62:42],
+ * [75:63] (tisp_ae_get_hist, JZ_Isp_Get_Awb_Statistics).
  *
  * The quads are sampled 8 x 6 a zone from the scene under the frame's
  * light, in the sensor's linear raw light (isp_lin()) and colour: a
@@ -505,8 +523,10 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
     int acols, arows, axs[STAT_ZONES + 1], ays[STAT_ZONES + 1];
     uint32_t thr = ISP_REG(l->ae + 0x28);
     int lo = thr & 0xFF, hi = (thr >> 8) & 0xFF;
-    bool ae = (ISP_REG(l->ae) & 1) && ISP_REG(l->ae + 0x2C);
-    bool awb = (ISP_REG(l->awb) & 1) && ISP_REG(l->awb + 0x3C);
+    /* T21 has no enable bits: a block runs once it has its banks */
+    bool en_bits = l->stat_gen != 3;
+    bool ae = (!en_bits || (ISP_REG(l->ae) & 1)) && ISP_REG(l->ae + 0x2C);
+    bool awb = (!en_bits || (ISP_REG(l->awb) & 1)) && ISP_REG(l->awb + 0x3C);
     int zx, zy, i, j, w, h;
 
     if (!ae && !awb) {
@@ -593,9 +613,17 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
                 IspZone *z = &zone[zy][zx];
                 uint8_t *o = buf + 16 * (zy * cols + zx);
 
-                isp_bits(o, 0, sb, z->sum[0]);
-                isp_bits(o, sb, sb, z->sum[1]);
-                isp_bits(o, 2 * sb, sb, z->sum[2]);
+                /*
+                 * T21's AE settles at a quarter of the zone means T31's
+                 * does with the same scene and exposure: a calibration,
+                 * not read off the module (its AE target is a table in
+                 * the sensor's tuning file)
+                 */
+                int dv = l->stat_gen == 3 ? 4 : 1;
+
+                isp_bits(o, 0, sb, z->sum[0] / dv);
+                isp_bits(o, sb, sb, z->sum[1] / dv);
+                isp_bits(o, 2 * sb, sb, z->sum[2] / dv);
                 isp_bits(o, 3 * sb, cb, z->cnt[0]);
                 isp_bits(o, 3 * sb + cb, cb, z->cnt[2]);
             }
@@ -606,7 +634,8 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
         for (i = 0; i < 256; i++) {
             hw[i] = hw[256 + i] = cpu_to_le32(MIN(hist[i] / (STAT_SX *
                                                              STAT_SY),
-                                                  0x1FFFFF));
+                                                  l->stat_gen == 3 ?
+                                                  0xFFFFF : 0x1FFFFF));
         }
         dma_memory_write(&address_space_memory,
                          ISP_REG(l->ae + 0x3C + 4 * hb), hw, sizeof(hw),
@@ -647,7 +676,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
                     isp_bits(o, 0, 21, z->rgb[0]);
                     isp_bits(o, 21, 21, z->rgb[1]);
                     isp_bits(o, 42, 21, z->rgb[2]);
-                    isp_bits(o, 84, 13, z->n);
+                    isp_bits(o, l->stat_gen == 3 ? 63 : 84, 13, z->n);
                 }
             }
         }
@@ -668,9 +697,12 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain)
                 }
             }
         }
-        qemu_log("ingenic-isp: frame %u stats gain %u/256 mean Y %u%s%s\n",
+        qemu_log("ingenic-isp: frame %u stats gain %u/256 mean Y %u%s%s"
+                 " wb R %u B %u /1024\n",
                  s->frame, gain, n ? (unsigned)(sum / n) : 0,
-                 ae ? " ae" : "", awb ? " awb" : "");
+                 ae ? " ae" : "", awb ? " awb" : "",
+                 l->wb ? ISP_REG(l->wb) & 0xFFF : 0,
+                 l->wb ? ISP_REG(l->wb + 4) & 0xFFF : 0);
     }
 }
 
