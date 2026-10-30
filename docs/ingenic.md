@@ -744,11 +744,25 @@ settled (`test-ingenic-isp.sh` the last frames of 40, the encoder client
 after four seconds), and `ingenic-isp-check.py` judges the logo and the
 dot against the background's level, and the dot's place by the frame
 counter, which is drawn on a black box so that it reads at any
-exposure. T21 (an older Tiziano,
-its statistics at 0x700 / 0x800 in another zone format) and the Apical
-parts get no statistics: their picture does not follow the exposure.
+exposure.
+
+T21 (`tx-isp-t21.ko` H20200509a, with symbols) has the same blocks at
+0x700 (AE0) and 0x800 (AWB), banks set by `tisp_init`, its callbacks on
+bits 16 (AE zones), 17 (AE histogram) and 18 (AWB) of 0x84, and no
+enable bits: a block runs once it has its banks. Its AE zones are T31's;
+its histogram counts in 20 bits, and its AWB zone has no IR sum (R, G,
+B, then the count at bit 63). Its sensor, JX-F37, is decoded as the
+other SOI parts (rows in 0x01/0x02, gain in 0x00). With T31's scale its
+AE settled at a linear mean of 2 of 255 -- too dark to see the scene --
+whatever the light; its target is a table in the sensor's tuning file,
+so the zone sums are given at a quarter scale, a calibration rather than
+something read off the module, and the AE settles at 7 (T31: 10) with
+the light at 10 %, 100 % or 1000 %. Its AWB reads the zones but keeps
+the gains it starts with (R 2.28 / B 1.16, register 0x604 / 0x608) under
+any light colour; why is not known.
+
 `-global ingenic-isp.trace=on` logs the MSCA and 3A register writes and
-each frame with its light and mean luma; `-global
+each frame with its light, mean luma and white-balance gains; `-global
 galaxycore-sensor.trace=on` the sensor's register writes.
 
 T20 and T10 are the older design, an Apical ISP core, and have their own
@@ -776,6 +790,28 @@ is the same software, and differs only in its VIC, whose control is at
   slots in 15:0, VIC frame done in 16), ack 0x04, enable 0x14, mask
   0x1C. CSI at 0x10040000, whose PHY_STATE (0x14) reads 0x630, the stop
   state the init polls for.
+- 3A statistics (the same in `tx-isp-t10.ko`, `-t20.ko` and the T30
+  SDK's `-t30.ko`, all with symbols): `apical_fw_interrupts_init` puts
+  the AE statistics on event 11 and the AWB statistics on event 9, and
+  their handlers read them straight from the core. The AE takes a
+  256-bin histogram at 0x10000 + 4 b (`ae_read_full_histogram_data`:
+  a 12-bit mantissa and a 4-bit exponent, m for e = 0, else (m | 0x1000)
+  << (e - 1)); the AWB 15 x 15 zones at 0x8740 + 8 z
+  (`awb_read_statistics`, 225 zones from `AWB_fsm_clear`): R/G in
+  [11:0] and B/G in [27:16], 1.0 = 256, before the white balance, and
+  the zone's weight at +4. At each frame end the model fills both from
+  the scene at the first enabled writer's size, lit as on the later
+  parts (the sensor link, `light`, `light-r`, `light-b` at
+  `/machine/isp`; OV2735B decoded from page 1, rows 0x03:0x04 and gain
+  x16 in 0x24), and raises the two events. The firmware's AE starts
+  from the sensor's init exposure -- a nearly black frame -- and climbs
+  to the scene over two or three seconds (T20 and T30: still rising at
+  frame 75; T10 settles at frame 67); with three times the light T20
+  reaches the same picture on a third of the exposure. The AWB's gains,
+  which it writes to 0x300 (B on the BGGR JX-F22) and 0x30C (R), go
+  from B 1.00 / R 2.75 in daylight to B 1.16 / R 2.24 under a warm
+  light. `-global ingenic-isp-apical.trace-core=on` logs every core
+  register the firmware changes.
 
 T40 (`tx-isp-t40.ko` H20220606a, read off the T40 SDK 1.2.0 build with
 symbols) is the T31 design again, rearranged: the core at 0x13300000 is
@@ -851,7 +887,11 @@ libimp uses for its timestamp), NV12 or NV21, at POS (x << 16 | y),
 GS (width in bytes << 16 | height), alpha per pixel, global ([10:3]) or
 both ([2:1]), RGB through the channel's CSC matrix at 0x148 + 0x18 n;
 OUT_END and the interrupt follow a virtual 100 us later. The conversion
-mode (NV12 to NV21 or BGRA) is there too; HSV output is not.
+mode is there too: NV12 to NV21, to BGRA, or to HSV (D_FMT 0x4, what
+libimp's frame source gives a `PIX_FMT_HSV` channel): H in degrees, 16
+bits a pixel, at NV_OUT_ADDR; S and V a byte each at OUT_ADDR and
+OUT_V_ADDR (the planes as the kernel driver and the T23 SDK's EXTFS
+sample lay them out; the value scales are the usual ones, unconfirmed).
 `-global ingenic-ipu.debug=on` logs each operation.
 
 `qemu-boot/test-ingenic-t30-rtsp.sh [IMAGE]` boots the T30 SDK 1.0.5's
@@ -940,11 +980,10 @@ filled with the tone at 16 kHz and a play ring drained at that rate.
 ## Not modelled
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
-its Apical base; above), T40's second pipe and VIC1/VIC2, the 3A
-statistics of T21 and the Apical parts, AE1, AF, ADR, defog and WDR
-statistics, the VPU's TLB (libimp addresses the engine
-physically), the T30 NCU/PP,
-the IPU's HSV output, the AIP, DMIC, the codec's analogue side (gains,
+its Apical base; above), T40's second pipe and VIC1/VIC2, T21's AWB
+response (above), AE1, AF, ADR, defog and WDR statistics, the Apical
+AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
+addresses the engine physically), the T30 NCU/PP, the AIP, DMIC, the codec's analogue side (gains,
 mutes: storage), PDMA transfers for peripherals other than the AIC, SSI,
 the TCU channels' PWM output
 and the RISC-V cores of T40/T41 read as zero or as storage.
