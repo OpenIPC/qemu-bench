@@ -965,13 +965,30 @@ T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), T40's second pipe and VIC1/VIC2, the 3A
 statistics of T21 and the Apical parts, AE1, AF, ADR, defog and WDR
 statistics, the VPU's TLB (libimp addresses the engine
-physically), the T30 NCU/PP,
-the IPU's HSV output, the AIP, DMIC, the codec's analogue side (gains,
+physically),
+the IPU's HSV output, DMIC, the codec's analogue side (gains,
 mutes: storage), PDMA transfers for peripherals other than the AIC, SSI,
 the TCU channels' PWM output
-and the RISC-V cores of T40/T41 read as zero or as storage.
+and the blocks below read as zero or as storage.
 
 Also storage or zero, and untouched by every boot tested here: the OTG
 PHY registers (0x10060070/78; USB host works without them), the HASH,
-AES and RSA engines, T40/T41's DTRNG, and T40/T41's BSCALER, MONITOR
-and VO blocks.
+AES and RSA engines, and T40/T41's DTRNG.
+
+What the remaining video and compute blocks would need (survey of the
+T40/T41 SDK kernels, drivers and libimp):
+
+- AIP (T41 0x12B00000, T31) and T40's BSCALER (0x13090000): the kernel
+  drivers only map the registers, allocate and wait for the interrupt;
+  the AI library (Magik, a separate SDK) programs them, so their register
+  contract is not in these sources, and nothing shipped here uses them.
+- VO (T41 0x130C0000, `ingenic_vo.c`) and MONITOR (0x130A0000, a bus
+  bandwidth monitor, `sample_bus_monitor` only): no consumer in libimp or
+  the images (`sample-LCD` draws on `/dev/fb0`, the DPU).
+- T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
+  the VPU when libimp asks for it; the VPU raises the completion, so
+  storage passes the picture through un-denoised.
+- The RISC-V core of T40/T41 (the "LEP": T40 OST/CCU at
+  0x12600000/0x12700000, T41 CCU at 0x12A00000, NNDMA 0x12500000): no
+  driver, firmware or library here starts it; it would need a RISC-V CPU
+  beside the MIPS ones and firmware these SDKs do not ship.
