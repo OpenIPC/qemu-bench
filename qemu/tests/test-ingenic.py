@@ -677,6 +677,79 @@ def test_usbphy(qt):
           int(qt.cmd('readb 0x10060078').split()[1], 16), 0x20)
 
 
+# --- SSI (SPI masters) -------------------------------------------------------
+
+SSI0 = 0x10043000
+SSI1 = 0x10044000
+
+
+def ssi_setup(qt, base, cr0_extra=0):
+    """jz_spi.c: 8-bit frames, SPI format, triggers, enable"""
+    qt.writel(base + 0x04, 0)
+    qt.writel(base + 0x08, (6 << 3) | (1 << 16) | (14 << 8))
+    qt.writel(base + 0x04, (1 << 15) | (1 << 7) | 0x6 | cr0_extra)
+
+
+def test_ssi(qt, intc=INTC):
+    print('ingenic-ssi')
+    sr = lambda b: qt.readl(b + 0x0C)
+    check('idle: END, RX empty', sr(SSI0) & 0x90, 0x90)
+    # READ ID from the w25q80 on SSI0's CE, CE held by UNFIN
+    ssi_setup(qt, SSI0)
+    qt.writel(SSI0 + 0x08, qt.readl(SSI0 + 0x08) | 1 << 23)
+    for b in (0x9F, 0, 0, 0):
+        qt.writel(SSI0, b)
+    check('4 frames received', (sr(SSI0) >> 8) & 0xff, 4)
+    check('underrun with UNFIN, no END', sr(SSI0) & 0x82, 0x02)
+    rx = [qt.readl(SSI0) for _ in range(4)]
+    check('READ ID: QEMU\'s w25q80 (ef 50 14)', rx[1:], [0xEF, 0x50, 0x14])
+    qt.writel(SSI0 + 0x08, qt.readl(SSI0 + 0x08) & ~(1 << 23))
+    check('UNFIN cleared: END, CE released', sr(SSI0) & 0x80, 0x80)
+    # the underrun interrupt the PIO transfers end on
+    qt.writel(SSI0 + 0x08, qt.readl(SSI0 + 0x08) | 1 << 23)
+    qt.writel(SSI0 + 0x04, qt.readl(SSI0 + 0x04) | 1 << 12)   # TEIE
+    qt.writel(SSI0, 0x05)                                     # RDSR
+    qt.writel(SSI0, 0x00)
+    check('TEIE + UNDR: source 9 raised', (qt.readl(intc) >> 9) & 1, 1)
+    qt.writel(SSI0 + 0x0C, sr(SSI0) & ~3)                     # clear_errors
+    check('clear_errors drops it', (qt.readl(intc) >> 9) & 1, 0)
+    qt.writel(SSI0 + 0x04, qt.readl(SSI0 + 0x04) | 0x2)       # RFLUSH
+    check('RFLUSH empties RX', (sr(SSI0) >> 8) & 0xff, 0)
+    qt.writel(SSI0 + 0x08, qt.readl(SSI0 + 0x08) & ~(1 << 23))
+    qt.writel(SSI0 + 0x04, 0)
+    # SSI1 in loopback, 16-bit frames, by DMA: 300 frames, past the FIFO
+    n = 300
+    data = struct.pack('<%dH' % n, *[(i * 257) & 0xffff for i in range(n)])
+    src, dst = SCRATCH, SCRATCH + 0x1000
+    qt.write(src, data)
+    qt.write(dst, bytes(len(data)))
+    qt.writel(SSI1 + 0x04, 0)
+    qt.writel(SSI1 + 0x08, (14 << 3) | (1 << 23))
+    qt.writel(SSI1 + 0x04, (1 << 15) | (1 << 10) | 0x6)       # SSIE, LOOP
+    qt.writel(PDMA + 0x1000, 1)
+    dcm16 = (2 << 14) | (2 << 12) | (1 << 8)                  # 16-bit, bytes
+    rxc, txc = PDMA + 0x20 * 6, PDMA + 0x20 * 7
+    qt.writel(rxc + 0x00, SSI1)                               # DR -> memory
+    qt.writel(rxc + 0x04, dst)
+    qt.writel(rxc + 0x08, len(data))
+    qt.writel(rxc + 0x0C, 0x19)
+    qt.writel(rxc + 0x14, dcm16 | (1 << 22) | 2)
+    qt.writel(rxc + 0x10, (1 << 31) | 1)
+    qt.writel(txc + 0x00, src)                                # memory -> DR
+    qt.writel(txc + 0x04, SSI1)
+    qt.writel(txc + 0x08, len(data))
+    qt.writel(txc + 0x0C, 0x18)
+    qt.writel(txc + 0x14, dcm16 | (1 << 23))
+    qt.writel(txc + 0x10, (1 << 31) | 1)
+    check('loopback by DMA: 300 frames back', qt.read(dst, len(data)), data)
+    check('both channels done', (qt.readl(txc + 0x10) & 8,
+                                 qt.readl(rxc + 0x10) & 8), (8, 8))
+    qt.writel(txc + 0x10, 0)
+    qt.writel(rxc + 0x10, 0)
+    qt.writel(PDMA + 0x1004, 0)
+    qt.writel(SSI1 + 0x04, 0)
+
+
 # --- sound: PDMA, AIC, codec ----------------------------------------------
 
 def pdma_ring(qt, ch, desc, buf, period, nper, drt, dcm):
@@ -1507,6 +1580,12 @@ def main():
         test_hash(qt)
         test_rsa(qt)
         test_usbphy(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31', ['-device', 'w25q80,bus=ssi0,cs=0'])
+        test_ssi(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't41', ['-device', 'w25q80,bus=ssi0,cs=0'])
+        test_ssi(qt, CORE_INTC)
         qt.close()
         qt = QTest(a.qemu, 't41')
         test_sadc(qt, CORE_INTC)

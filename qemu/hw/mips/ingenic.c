@@ -181,6 +181,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define AES_BASE        0x13430000
 #define HASH_BASE       0x13480000
 #define RSA_BASE        0x134C0000
+#define SSI0_BASE       0x10043000
+#define SSI1_BASE       0x10044000
+#define IRQ_SSI0        9
+#define IRQ_SSI1        8
 #define IRQ_HASH        22
 #define IRQ_AES         23
 #define IRQ_DTRNG       34
@@ -1157,6 +1161,29 @@ static void ingenic_init(MachineState *ms)
                                 qdev_get_gpio_in_named(pdma, "drq", 7));
     qdev_connect_gpio_out_named(dev, "drq-loop", 0,
                                 qdev_get_gpio_in_named(pdma, "drq", 5));
+
+    /*
+     * The SPI masters, on PDMA lines 0x16 / 0x17 (SSI0) and 0x18 / 0x19
+     * (SSI1); their buses "ssi0" / "ssi1" take -device SPI peripherals.
+     */
+    for (i = 0; i < 2; i++) {
+        if (i && (info->soc == INGENIC_T10 || info->soc == INGENIC_T20 ||
+                  info->soc == INGENIC_T23)) {
+            break;
+        }
+        dev = qdev_new("ingenic-ssi");
+        qdev_prop_set_string(dev, "bus-name", i ? "ssi1" : "ssi0");
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, i ? SSI1_BASE : SSI0_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, i ? IRQ_SSI1 : IRQ_SSI0));
+        qdev_connect_gpio_out_named(dev, "drq-tx", 0,
+                                    qdev_get_gpio_in_named(pdma, "drq",
+                                                           0x16 + 2 * i));
+        qdev_connect_gpio_out_named(dev, "drq-rx", 0,
+                                    qdev_get_gpio_in_named(pdma, "drq",
+                                                           0x17 + 2 * i));
+    }
 
     /* the auxiliary ADC (jz_adc_v13 / ingenic_adc_v13): /machine/sadc */
     dev = qdev_new("ingenic-sadc");
