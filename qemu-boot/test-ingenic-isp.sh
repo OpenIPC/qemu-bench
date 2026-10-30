@@ -103,7 +103,7 @@ t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}; DEFS="-DSNAP_T40 -DSNAP_DUAL"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64 ;;
 t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41
-     DEFS="-DSNAP_T40 -DSNAP_I2C_ADAPTER=0 -DSNAP_MCLK=IMPISP_SENSOR_MCLK0"
+     DEFS="-DSNAP_T40 -DSNAP_I2C_ADAPTER=0 -DSNAP_MCLK=IMPISP_SENSOR_MCLK0 -DSNAP_AF"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      IMAGE=${IMAGE:-$IMAGE41}
      RAM=128M; MEM="mem=48M@0x0 rmem=64M@0x3000000 nmem=16M@0x7000000"

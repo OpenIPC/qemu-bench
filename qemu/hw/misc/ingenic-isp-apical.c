@@ -331,7 +331,7 @@ static void apical_stats(IngenicIspApicalState *s, uint32_t w, uint32_t h,
                     double yn, cb, cr, c[3];
                     int l, ch;
 
-                    sstar_pattern_pixel(s->frame, w, h, x, y, yuv);
+                    ingenic_scene_pixel(s->frame, w, h, x, y, yuv);
                     l = lround(MIN(isp_lin(yuv[0]) * k, 1) * 255);
                     hist[l] += pix;
                     sum += l;

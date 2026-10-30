@@ -1017,7 +1017,7 @@ writes the AE and AWB statistics of that picture by DMA into the banks
 | AE0 block, AWB block | 0xA000, 0xB000 | 0x19000, 0x18000 |
 | status bits (AE zones, AE histogram, AWB) | 26, 27, 30 of 0xB4 | 4, 5, 3 of 0x40028 |
 | AE zone, 16 bytes | dark, middle, bright luma sums (21 bits), dark and bright counts (13) | the same, 22 and 14 bits |
-| AWB zone | 16 bytes: R, G, B, IR sums (21 bits), count (13) | 128 bytes: 8 records of R, G, B, IR (22), count (14), all filled alike |
+| AWB zone | 16 bytes: R, G, B, IR sums (21 bits), count (13) | 128 bytes: 4 pairs of records of R, G, B, IR (22), count (14): every quad, then the filtered ones |
 
 In both blocks +0x04 is the zone grid (columns [31:28], rows [15:12]:
 15 x 15), +0x08-0x14 and +0x18-0x24 the zone widths and heights a byte
@@ -1029,8 +1029,10 @@ twice); AWB +0x3C-0x48 four zone banks. The kernel's `ae0_weight_mean2`
 takes a zone's three sums over its width x height as its mean. Zones are
 sampled 8 x 6 from the scene, in linear light (8 bits), as a sensor's
 statistics are; the light's colour scales the linear R and B, so that
-a white reads R `light-r` and B `light-b` per mille of G (550, 600: a
-daylight raw white). The AWB block sums only the quads inside the pixel
+a white reads R `light-r` and B `light-b` per mille of G -- by default
+the SoC's daylight raw white, where its tuning's AWB looks for one (T21,
+T23, T31: 550, 600; T40, T41: 460, 550, the white their start gains
+2212 / 1856 make neutral). The AWB block sums only the quads inside the pixel
 filter `tiziano_awb_set_hardware_param` programs after the zone sizes
 (T21 0x828-0x838, T31 and T23 0xB028-0xB038): +0x28 a raw R/G window
 and +0x2C a B/G window (Q8, min in [15:0], max in [31:16]), +0x30 and
@@ -1038,21 +1040,26 @@ and +0x2C a B/G window (Q8, min in [15:0], max in [31:16]), +0x30 and
 in [31:16]), +0x38 a luma window ([7:0] low, [15:8] high; luma taken
 as (R + 2 G + B) / 4) -- the driver's all-pass values (R/G 1..4095,
 bounds 0 and 65535) read so -- and a zone's count is of the quads that
-passed. T40 and T41 program the same form at 0x18028 (on the T41 SDK
-image R/G 60..245, B/G 30..200, k 256 with bounds 170 and 320, and the
-luma window in +0x38's bytes 0 and 2, 10..230). Their 128-byte zones
-are four pairs of 16-byte records (`tisp_awb_get_statistics`), a pair
-per statistics position; the tuning picks the pair read (its block's
-bytes 3274 / 3276; with 3274 set only that pair is stored, 32 bytes a
-zone). Of a pair the AWB's gains follow the second record alone:
-filling the first filtered or not never moved them (eight runs, three
-light colours, two light levels). Filtered as above in linear light,
-the second record leaves T41's AWB no white candidate in this scene --
-its AE exposes for the navy, the logo clips past the luma window -- and
-the AWB holds its start gains (2212 / 1856), the T23 case below. So
-T40 and T41 fill all eight records unfiltered, with the light's colour
-applied before the 2.2 gamma (a white then reads 0.27 R, 0.33 B), the
-calibration under which their AWB follows the light.
+passed. T40 and T41 program the same form at 0x18028
+(`tisp_awb_set_regional_threshold`, bounds interpolated by EV: on the
+T41 SDK image R/G 60..245, B/G 30..200, k 256 with bounds 170 and 320;
+T40's wider, R/G 53..284, B/G 29..304, bounds 167 and 394), but +0x38
+holds three luma thresholds in bytes 0..2 and a frequency in byte 3
+(`tisp_awb_set_lum_th_freq`): the window is bytes 0 and 2 (T41 10..230,
+T40 0..230). Their 128-byte zones are four pairs of 16-byte records
+(`tisp_awb_get_statistics`: R, G, B and a fourth sum in 22 bits from
+bits 0, 22, 44, 66, the count in 14 from bit 88), a pair per
+statistics position; the tuning picks the pair read (its block's bytes
+3274 / 3276). Of a pair the AWB's gains follow the second record
+alone; the model fills the first with every quad and the second with
+the filtered ones.
+
+The scene has a grey step wedge for the AWB to find a white in
+(`ingenic-isp-paint.h`: six neutral patches below the dot, bottom
+left): with only the navy, the logo and the dot, an AE that exposes for
+the navy -- T40's and T41's do -- leaves the white saturated, past the
+luma window and the R/G limit, and no zone inside the filter, as on a
+camera pointed at such a scene; the AWB then holds its start gains.
 `light`, `light-r` and `light-b` can change while running
 (`qom-set /machine/isp light 30`). The kernel's AE starts high and
 settles over a second or two -- on T31 a light of 30 % and of 100 % give
@@ -1063,33 +1070,68 @@ once settled; warm R 0.9 / B 0.35, cool R 0.45 / B 0.75):
 
 | | daylight | warm | cool |
 |---|---|---|---|
-| T21 | R 1872 / B 1700 | R 1140 / B 2740 | R 2300 / B 1372 |
-| T31 | R 1856 / B 1696 | R 1136 / B 2900 | R 2256 / B 1356 |
-| T40 | R 3276 / B 1408 | R 2284 / B 1872 | |
-| T41 | R 3332 / B 1456 | R 2416 / B 1828 | |
+| T21 | R 1860 / B 1712 | R 1140 / B 2740 | R 2272 / B 1360 |
+| T31 | R 1860 / B 1704 | R 1136 / B 2916 | R 2280 / B 1364 |
+| T23 | R 1856 / B 1704 | | |
+
+T40 and T41 settle on the gains that make the light's white neutral,
+1024 / R and 1024 / B to within 1-3 % (daylight 460 / 550; a white of
+500 / 430, warm 700 / 280, cool 380 / 600, all inside both SoCs'
+windows):
+
+| | daylight | 500 / 430 | warm | cool |
+|---|---|---|---|---|
+| T40 | R 2220 / B 1864 | R 2048 / B 2380 | R 1468 / B 3636 | R 2688 / B 1712 |
+| T41 | R 2228 / B 1856 | R 2056 / B 2388 | R 1468 / B 3704 | R 2716 / B 1704 |
 
 A light outside a tuning's windows (R 0.35 / B 0.9 is below both
-R/G minima) leaves no quad to sum, and the AWB keeps its defaults, as
-it would on a camera. T23 follows the light while its AE settles
-(frame 8: R 1784 / B 1484 daylight, R 1148 / B 2388 warm, R 1984 / B
-1500 cool) and then, its AE exposing this dark scene until the white
-logo and counter clip past its luma ceiling (240) and nothing neutral
-is left inside the filter, holds its defaults (R 1728 / B 1920). That
-is not the model clipping too hard: a white of the painted scene is a
-full-scale reflector, the navy behind it 1.2 %, and an AE that brings
-the navy up to its target puts the white some twelve times past full
-scale; saturated pixels fail the luma window on silicon too.
+R/G minima; on T40/T41 a light whose R/G + B/G falls under the lower
+bound) leaves no quad to sum, and the AWB keeps its defaults, as it
+would on a camera. The white logo itself saturates once the AE brings
+the navy up -- a full-scale reflector against a 1.2 % one, some twelve
+times past full scale -- and fails the luma window on silicon too; the
+wedge's darker patches are what the AWBs settle on (T23, which held its
+defaults before, now settles at daylight's 1856 / 1704).
 
 T31 and T23 also produce their other statistics
 (`ingenic_isp_xstats()`), each into the banks `tisp_init` gives it:
 
 | | block, banks | status bit | layout |
 |---|---|---|---|
-| AE1 | 0xA800, AE0's form | 28, 29 | AE0's zones and histogram (the same frame in a linear mode) |
+| AE1 | 0xA800, AE0's form; only with 0x0C bit 0 clear (a WDR mode) | 28, 29 | AE0's zones and histogram |
 | AF | grid 0xB804 (pixels; 8 x 8 zones of 238 x 134 at 1080p), banks 0xB8A8, last bank number 0xB8BC | 31 | 16 bytes a zone: FIR 0 / 1, IIR 0 / 1 (22 bits each), luma sum (23), bright count (15) |
 | ADR | banks 0x4494, last bank's address 0x44B0; 0x0C bit 7 bypasses | 18 | 6 x 8 blocks of luma sum and a five-bin histogram, then a 512-bin luma histogram (three 21-bit counts per 8 bytes) |
 | defog | banks 0x5B84, last bank's address 0x5BA4; 0x0C bit 11 bypasses | 20 | from +8, 180 blocks of B, G, R sums (24 bits) and three halfwords (here the dark channel, brightest and mean luma) |
 | WDR (T31) | banks of 8 KiB at 0x2010, last address 0x2680; only with 0x0C bit 0 clear | 11 | long and short exposure R, G, B histograms (256 x 21 bits), luma counts and sums, in eight 516-byte rows 1 KiB apart |
+
+AE1 is the WDR short frame's AE. Its block's bit 0 is a latch
+(`system_reg_write_ae(2)` sets it after every AE1 update), not an
+enable; raised in a linear mode, `ae1_interrupt_hist` stores its
+histogram over the AE's static data and pushes the AE1 process, and
+T31's AE and AWB stop where they are (the gains frozen from frame 10),
+so like WDR it runs only while 0x0C bit 0 is clear.
+
+T40 and T41 produce theirs too (`xstat` 3; their symbols):
+
+| | block, banks | status bit | layout |
+|---|---|---|---|
+| AF | grid 0x1A004 (T31's word), widths as halfwords from 0x1A008, heights as bytes from 0x1A028; banks 0x1A0CC, count 0x1A0DC, last bank number 0x1A0E0 | 6 | zones of 136 bits end to end: FIR 0 / 1, IIR 0 / 1 (23 bits each), luma sum (24), bright count (16); a row every 2 x {3, 5, 7, 9, 11, 13, 15, 17, 20, 22, 24, 26, 28, 30, 32}[columns - 1] words |
+| ADR | banks 0x9514, count 0x9510, last bank's address 0x9540 | 9 | 4 x 6 blocks of 56 bytes (two 29-bit words, twenty 18-bit counts, two 12-bit fields: here luma sum, quads, a 20-bin histogram, darkest and brightest luma), then the 512-bin histogram from +0x548 |
+| defog | banks 0xC290 (2 KiB), count 0xC28C, last bank's address 0xC2B4 | 10 | from +8, 180 blocks of 8 bytes: B, G, R sums (21 bits) |
+| GSM (T41) | RAMs read through ports: 0x201 to 0x501A0 / 0x501B0, then 256 reads of 0x501A8 / 0x501B8; flags 0x1B004 / 0x1B044 | 7 | two 256-bin luma histograms that add up to exactly width x height (0x80; `tisp_gsm_process` checks the total) |
+| LCE (T41) | ports 0x501C0 / 0x501C8 (45 x 32 words) and 0x50200 / 0x50208 (45), the second set at +0x10; 0x0E014 bit 0 ready, bit 8 the set | 8 | 9 x 5 blocks of a 32-bin luma histogram of quads (`lce_std_hist_transform` rejects a block that counts more than it has), then the blocks' means |
+| TMO (T41) | banks 0x1E010 / 0x1E014 (16 KiB), last bank 0x1E028 | 17 | 3750 halfword pairs: here a 75 x 50 grid of mean and brightest luma (12 bits) |
+
+T41's `IMP_ISP_Tuning_GetAFMetricesInfo` reads about 3.4 million (the
+alternate about 1.8 million), 0 without; ADR rewrites its outputs
+(0x50024..0x5040C) about three times as often and defog its (0xC0xx)
+half again as often as with no statistics. Which reader field means
+what (ADR's, defog's order, TMO's pair) is the model's reading of their
+widths. T40 reads its GSM and LCE through other paths and has no TMO;
+those are T41's only. T40's `tisp_af_get_metric`, asked for the AF
+metric from a single-sensor run once AF statistics arrive, faults on a
+pointer of its own (a TLB load in module space); the tests do not ask
+it there.
 
 The AF filters are the luma's differences to the next pixel and the
 one after, along the row (FIR) and down the column (IIR), summed over
@@ -1417,15 +1459,14 @@ T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), T40's third sensor (VIC2: `tx-isp-t40.ko`
 supports one, "The third sensor init", in a joint mode where sensors
 share a pipe through VIC MDMA raw caching) and that raw caching (VIC
-+0x300.., `vic_mdma_enable`, also the `snapraw` debug command), the
-T40/T41 AWB pixel filter (above), T40/T41's AF, ADR, defog, WDR, LCE,
-GSM and TMO statistics (T41 bits 6, 9, 10, 11, 8, 7, 17 of 0x40028, AF
-index 0x1A0E0, formats other than T31's: AF packs zones in fours with
-23-bit fields), the Apical AF and the zone statistics beyond AE and AWB,
-PDMA transfers for peripherals other than the AIC, the SSI and the DES,
-the SSI slave and the HASH engine's CPU mode (no driver, sample or
-document in any tree here, so no contract; above), the trigger of T41's
-audio-system DMIC and the DMIC trigger modes other than 0 and 2
++0x300.., `vic_mdma_enable`, also the `snapraw` debug command),
+T40/T41's WDR statistics (bit 11, a WDR mode's), T40's GSM and LCE
+(read otherwise than T41's), the Apical AF and the zone statistics
+beyond AE and AWB, PDMA transfers for peripherals other than the AIC,
+the SSI and the DES, the SSI slave and the HASH engine's CPU mode (no
+driver, sample or document in any tree here, so no contract; above),
+the trigger of T41's audio-system DMIC and the DMIC trigger modes other
+than 0 and 2
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
