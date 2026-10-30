@@ -73,6 +73,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x130C0000 | T41: VO, NV12 out over BT.656 / BT.1120, shown on the display, IRQ 43 (`/machine/vo`) | `ingenic-vo` |
 | 0x130A0000 | T40, T41: bus MONITOR (AXI/AHB bandwidth and address watch), IRQ 53 | `ingenic-monitor` |
 | 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
+| 0x13090000 | T40: BSCALER, the NNA's image engine (resize / affine / perspective, NV12 to colour), IRQ 40 (T) / 39 (C) (`/machine/bscaler`) | `ingenic-bscaler` |
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
@@ -94,7 +95,7 @@ Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
 unimplemented device, logged with `-d unimp`). Interrupt numbers are the
 same on every part: AIC 1, SSI1 8, SSI0 9, SFC 7, PDMA 10, DMIC 12, GPIO A 17 (B 16, C 15, D 14), OTG 21,
 SADC 18, HASH 22, AES 23, DTRNG 34, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
-ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, on T40/T41 DRAWBOX 42 and I2D 45, T41's AIP 40 (T), 39 (F), 38 (P) and VO 43, and the MONITOR 53 (Linux
+ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, on T40/T41 DRAWBOX 42 and I2D 45, T41's AIP 40 (T), 39 (F), 38 (P) and VO 43, T40's BSCALER 40 (T), 39 (C), and the MONITOR 53 (Linux
 numbers are these + 8: the ISP's 37 and 38, the AVPU's 70).
 
 ## CPUs
@@ -699,6 +700,48 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   its address runs the node's job. Jobs complete at once and signal 50 us
   later. Alpha is written 0 and the source order bits of CFG (bit 0 swaps
   T's Cb/Cr) are inferred, not checked against silicon.
+- `ingenic-bscaler` (T40; `drivers/video/ingenic_bscaler`, `/dev/bscaler0`):
+  the NNA's image engine. The kernel driver only enables its clocks, waits
+  for its two interrupts and clears their status bits; the programming is
+  in libvenus (magik-toolkit InferenceKit/nna1: bscaler_api, bscaler_hal,
+  bscaler_segmentation, under its `warp_*`, `crop_*` and
+  `warp_covert_nv2bgr`), which maps the registers through `/dev/mem`. The
+  contract is read from that library -- its register writes and chains
+  logged while it ran on the host under a user-mode MIPS QEMU, with the
+  register access and memory helpers stood in for -- and its code. Two
+  units in one 256-byte window:
+  - C (0x00..0x7F, IRQ 39): warps -- resize, affine, perspective -- of NV12
+    or 4-byte pixels, NV12 coming out as colour on the way. The library
+    splits each box into tiles of at most 64x64 output pixels and chains
+    one job per tile: source Y / CbCr, tile size and stride, the
+    destination planes pushed through 0x18 (Y, then CbCr), its size and
+    stride, the tile's source and destination origins (0x40 / 0x44, in
+    whole-picture coordinates), and the destination -> source 3x3
+    matrix (0x48..0x68, signed Q16: for a resize the scale and the
+    half-pixel phase, for warps the inverse of the caller's forward
+    matrix, with the perspective divide); 0x04 bit 0 / 3 say 4-byte
+    source / destination and [15:8] is the value outside the source;
+    0x00 = 0x201 runs a job. The chain -- (value, register) word pairs,
+    bit 31 marking a job's last -- runs from 0x34 for 0x38 bytes on 0x30
+    bit 0; at its end 0x30 bit 4 and 0x00 bit 8 are set and the
+    interrupt raised. Tiles that map wholly outside the source get no
+    job from the library, so the hardware leaves them untouched.
+  - T (0x80..0xFF, IRQ 40): NV12 to colour by lines: source Y / CbCr,
+    size, strides, destination, 0xAC's 4-byte bits, 0x84 = lines << 16 |
+    1 converts the next lines and sets 0x84 bit 2; 0x80 bit 0 stays set
+    while the frame is in progress (the library holds its lock until it
+    reads it clear) and drops, with bit 8 set, at the last line.
+  - Shared: the YUV->colour matrix at 0xC0..0xE0 (signed Q20, rows B, G,
+    R, G's U and V terms subtracted -- libvenus's defaults are all
+    positive) and 0xE4 with the CbCr and Y offsets and C's / T's output
+    orders, coded as the AIP's.
+
+  Sampling is bilinear with the edges repeated; a source position more
+  than a pixel outside the tile takes the pad value (128 for CbCr). Jobs
+  complete at once and signal 50 us later. Stored, not acted on: the
+  per-column byte table at 0x28 / 0x2C, 0x04 bits 1, 2 and 16..18, T's
+  0xA0 / 0xA8 / 0xF0 / 0xF4, and the chain-in-ORAM bit (0x30 bit 1);
+  alpha is written 0.
 - `ingenic-ssi`: the SPI master of `jz_spi.c` (3.10) and `ingenic_spi.c`
   (4.4). A queued frame (CR1 FLEN + 2 bits, MSB first) goes out on the
   bus at once; the reply, or the frame itself with CR0 LOOP, lands in the
@@ -1212,6 +1255,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t40`, `audio.ko dmic_enable=1` + T40 SDK `libimp.a` | `t40` | `test-ingenic-audio.sh --soc t40 --dmic` | IMP_DMIC records 16 kHz: the DMIC's 1.5 kHz tone (peak 1500.0 Hz, rms 5793); with QEMU's TLB shadow entries on, 5 of 12 runs failed (see CPUs), without them 24 consecutive runs pass |
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
 | T41NQ SDK image, its kernel's `ingenic_aip` + magik-toolkit `libaip.a` | `t41` | flash, `test-ingenic-aip.sh --image` | the library's own bs_* calls: NV12 640x360 -> 320x180 within 0.8 of the ramps sampled at half-pixel positions, a two-box chain, NV12 -> BGRA / RGBA / ARGB matching BT.601 exactly, affine and perspective warps moving a square where the forward matrix sends it with the pad value outside |
+| T40N SDK image, its kernel's `ingenic_bscaler` + magik-toolkit nna1 `libvenus.a` (its BSCALER objects) | `t40` | flash, `test-ingenic-bscaler.sh --image` | the library's own bs_* calls: BGRA 64x32 -> 32x16 and a many-tile 32x16 -> 160x80 within 0.7 of the ramps at half-pixel positions, NV12 256x128 -> 128x64 (both planes) within 0.7, NV12 -> BGRA / RGBA / ARGB resizes and the T unit's NV12 -> BGRA / RGBA matching BT.601 exactly, affine and projective perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
@@ -1249,21 +1293,6 @@ and the blocks below read as zero or as storage.
 What the remaining video and compute blocks would need (survey of the
 T40/T41 SDK kernels, drivers and libimp):
 
-- T40's BSCALER (0x13090000, IRQ 40 / 39): as T41's AIP, the kernel
-  driver only maps it and nothing shipped here programs it; libvenus
-  (magik-toolkit nna1, `libvenus.a`: bscaler_api, bscaler_hal,
-  bscaler_segmentation, bscaler_wrap) does. What its HAL shows: two
-  units, frame compute (resize / affine / perspective, 0x00..0x7C: size
-  0x04, Y 0x0C, per-plane addresses pushed through 0x18, strides, the
-  9-word matrix at 0x44..0x64, ORAM line buffers at 0x12620000, soft
-  reset bit 16 of 0x30) and frame transform (NV12 -> BGR, 0x88..0xA4 with
-  flags in 0xE4, reset bit 16 of 0xB0), coefficients shared at
-  0xC0..0xDC; libvenus splits each box into lines in software and chains
-  one hardware job per line as (value, register | last << 31) pairs
-  (`write_chain`). Modelling it means decoding those per-line jobs' fields
-  -- the same host harness as the AIP's (libvenus's bscaler objects
-  linked with logging `bscaler_write_reg` / `read_reg` and stub memory
-  helpers) would do it.
 - T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
   the VPU when libimp asks for it; the VPU raises the completion, so
   storage passes the picture through un-denoised.

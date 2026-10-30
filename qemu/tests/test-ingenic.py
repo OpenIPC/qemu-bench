@@ -79,6 +79,7 @@ SCRATCH = 0x00800000
 AIP = 0x12B00000
 AIP_ALIAS = 0x13090000
 MONITOR = 0x130A0000
+BSCALER = 0x13090000
 VO = 0x130C0000
 ISP = 0x13300000
 SADC = 0x10070000
@@ -605,6 +606,117 @@ def test_aip(qt, intc=CORE_INTC):
     check('P: shifted by the matrix, the pad value outside', out, want)
     check('P: the AIP2 line', (qt.readl(intc + 0x20) >> 6) & 1, 1)
     qt.writel(P + 0x04, 1)
+
+
+def test_bscaler(qt, intc=CORE_INTC):
+    print('ingenic-bscaler (T40)')
+    src, dst, chain = SCRATCH, SCRATCH + 0x10000, SCRATCH + 0x20000
+    W, H = 8, 4
+    # libvenus's default YUV -> colour matrix: rows B, G, R, all positive
+    coef = [1220542, 2116026, 0, 1220542, 409993, 852492, 1220542, 0,
+            1673527]
+    for i, c in enumerate(coef):
+        qt.writel(BSCALER + 0xC0 + 4 * i, c)
+    qt.writel(BSCALER + 0xE4, (128 << 24) | (16 << 16))
+
+    def run_chain(regs):
+        # (value, register) pairs as bscaler_hal writes them, 0x00 last
+        words = []
+        for r, v in regs:
+            words += [v, r]
+        words += [0x201, 0x80000000]
+        qt.write(chain, struct.pack('<%dI' % len(words), *words))
+        qt.writel(BSCALER + 0x3C, 0xffffffff)
+        qt.writel(BSCALER + 0x34, chain)
+        qt.writel(BSCALER + 0x38, len(words) * 4)
+        qt.writel(BSCALER + 0x30, 0x21)
+
+    def tile(fmt, sy, suv, ss, sw, sh, planes, ds, dw, dh, m):
+        r = [(0x08, sy), (0x0C, suv)]
+        r += [(0x18, p) for p in planes]
+        r += [(0x04, fmt), (0x10, (sh << 16) | sw), (0x14, ss),
+              (0x1C, (dh << 16) | dw), (0x20, ds), (0x40, 0), (0x44, 0)]
+        r += [(0x48 + 4 * i, v & 0xffffffff) for i, v in enumerate(m)]
+        return r
+
+    # a 2:1 resize of BGRA: scale 2, half-pixel phase 0.5 -> the 2x2 means
+    pic = bytes((x * 20 + y * 7 + c * 50) & 0xff for y in range(H)
+                for x in range(W) for c in range(4))
+    qt.write(src, pic)
+    qt.writel(BSCALER + 0x30, 1 << 16)
+    check('C soft reset clears itself', qt.readl(BSCALER + 0x30) >> 16, 0)
+    run_chain(tile(0x0f, src, 0, W * 4, W, H, [dst], W * 2, W // 2, H // 2,
+                   [0x20000, 0, 0x8000, 0, 0x20000, 0x8000, 0, 0, 0x10000]))
+    check('C: no status before the chain ends',
+          qt.readl(BSCALER + 0x30) & 0x10, 0)
+    qt.step(100000)
+    check('C: chain done (0x30 bit 4, 0x00 bit 8)',
+          (qt.readl(BSCALER + 0x30) & 0x10, qt.readl(BSCALER) & 0x100),
+          (0x10, 0x100))
+    check('C: the BSCALER1 line (39) pending',
+          (qt.readl(intc + 0x20) >> 7) & 1, 1)
+    want = bytes((pic[((2 * y) * W + 2 * x) * 4 + c] +
+                  pic[((2 * y) * W + 2 * x + 1) * 4 + c] +
+                  pic[((2 * y + 1) * W + 2 * x) * 4 + c] +
+                  pic[((2 * y + 1) * W + 2 * x + 1) * 4 + c] + 2) // 4
+                 for y in range(H // 2) for x in range(W // 2)
+                 for c in range(4))
+    check('C: 8x4 BGRA -> 4x2 is the 2x2 means', qt.read(dst, 32), want)
+    qt.writel(BSCALER, qt.readl(BSCALER) & ~0x100)
+    qt.writel(BSCALER + 0x30, qt.readl(BSCALER + 0x30) & ~0x50)
+    check('C: the driver\'s clears drop the line',
+          (qt.readl(intc + 0x20) >> 7) & 1, 0)
+
+    # NV12 -> RGBA (order 5) at the same size: BT.601 by the matrix
+    Y, U, V = 81, 90, 240
+    qt.write(src, bytes([Y] * 16 + [U, V] * 4))
+    qt.writel(BSCALER + 0xE4, (128 << 24) | (16 << 16) | (5 << 4))
+    run_chain(tile(0x0e, src, src + 16, 4, 4, 4, [dst], 16, 4, 4,
+                   [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x10000]))
+    qt.step(100000)
+    yy, u, v = Y - 16, U - 128, V - 128
+    r = round((1220542 * yy + 1673527 * v) / (1 << 20))
+    g = round((1220542 * yy - 409993 * u - 852492 * v) / (1 << 20))
+    b = round((1220542 * yy + 2116026 * u) / (1 << 20))
+    rgb = bytes(max(0, min(255, c)) for c in (r, g, b))
+    check('C: NV12 -> RGBA, BT.601', qt.read(dst + 20, 4), rgb + b'\0')
+    qt.writel(BSCALER + 0x30, qt.readl(BSCALER + 0x30) & ~0x50)
+
+    # a translation off the source: the pad value from 0x04 [15:8]
+    qt.write(src, pic)
+    run_chain(tile(0x0f | (77 << 8), src, 0, W * 4, W, H, [dst], W * 4, W,
+                   H, [0x10000, 0, 6 << 16, 0, 0x10000, 0, 0, 0, 0x10000]))
+    qt.step(100000)
+    out = qt.read(dst, W * 4)
+    check('C: x + 6 brings in source column 6, then the pad',
+          (out[0:4], out[4 * 4:4 * 4 + 4]), (pic[6 * 4:7 * 4], bytes([77] * 4)))
+    qt.writel(BSCALER + 0x30, qt.readl(BSCALER + 0x30) & ~0x50)
+
+    # T: NV12 -> BGRA by lines (bs_covert_cfg / bs_covert_step_start)
+    qt.write(src, bytes([Y] * 16 + [U, V] * 4))
+    qt.write(dst, bytes(64))
+    qt.writel(BSCALER + 0xE4, (128 << 24) | (16 << 16))
+    for r_, v_ in ((0x88, src), (0x8C, src + 16), (0x90, (4 << 16) | 4),
+                   (0x94, 4), (0x98, dst), (0xA4, 16), (0xAC, 4),
+                   (0xBC, 0xffffffff), (0x80, 0x201)):
+        qt.writel(BSCALER + r_, v_)
+    qt.writel(BSCALER + 0x84, (2 << 16) | 1)
+    qt.step(100000)
+    check('T: step done (0x84 bit 2), the BSCALER0 line (40)',
+          (qt.readl(BSCALER + 0x84) & 4, (qt.readl(intc + 0x20) >> 8) & 1),
+          (4, 1))
+    check('T: two lines of BGRA, the rest untouched',
+          (qt.read(dst + 16, 4), qt.read(dst + 32, 4)),
+          (bytes([rgb[2], rgb[1], rgb[0], 0]), bytes(4)))
+    qt.writel(BSCALER + 0x84, qt.readl(BSCALER + 0x84) & ~4)
+    qt.writel(BSCALER + 0x98, dst + 32)
+    qt.writel(BSCALER + 0x84, (2 << 16) | 1)
+    qt.step(100000)
+    check('T: the next step carries on at line 2',
+          qt.read(dst + 32, 4), bytes([rgb[2], rgb[1], rgb[0], 0]))
+    check('T: the frame through: 0x80 bit 0 drops, bit 8 set',
+          qt.readl(BSCALER + 0x80) & 0x101, 0x100)
+    qt.writel(BSCALER + 0x84, qt.readl(BSCALER + 0x84) & ~4)
 
 
 def test_monitor(qt, intc=CORE_INTC):
@@ -2187,6 +2299,7 @@ def main():
         test_drawbox(qt)
         test_i2d(qt)
         test_monitor(qt)
+        test_bscaler(qt)
         qt.close()
         qt = QTest(a.qemu, 't20')
         test_aes(qt)

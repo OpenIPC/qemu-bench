@@ -201,6 +201,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_AIP_F       39
 #define IRQ_AIP_P       38
 #define MONITOR_BASE    0x130A0000  /* T40, T41 */
+#define BSCALER_BASE    0x13090000  /* T40 */
+#define IRQ_BSCALER_T   40
+#define IRQ_BSCALER_C   39
 #define VO_BASE         0x130C0000  /* T41 */
 #define IRQ_VO          43
 #define IRQ_MONITOR     53
@@ -1304,6 +1307,17 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, VO_BASE);
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_VO));
+    }
+
+    /* T40's BSCALER, the NNA's image engine: /machine/bscaler */
+    if (info->soc == INGENIC_T40) {
+        dev = qdev_new("ingenic-bscaler");
+        object_property_add_child(OBJECT(ims), "bscaler", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, BSCALER_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_BSCALER_T));
+        sysbus_connect_irq(sbd, 1, ingenic_irq(ims, IRQ_BSCALER_C));
     }
 
     /*
