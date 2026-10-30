@@ -3,12 +3,14 @@
  * qemu-boot/test-ingenic-audio.sh: the vendor audio.ko, the AIC and the
  * PDMA end to end.
  *
- *   audio-test RATE RECORD_MS PLAY_HZ PLAY_MS FILE
+ *   audio-test RATE RECORD_MS PLAY_HZ PLAY_MS FILE [dmic|amic [PLAY_RATE]]
  *
  * Records RECORD_MS of 16-bit mono at RATE from AI device 1 (the
- * analogue microphone) into FILE, raw little-endian (after the first
- * 200 ms, which the vendor driver's start-up leaves partly zero), then
- * plays a sine of PLAY_HZ for PLAY_MS on AO device 0, and prints
+ * analogue microphone) -- or, with "dmic" (built with -DAUDIO_DMIC, the
+ * T40 SDK's IMP_DMIC), from DMIC device 0 -- into FILE, raw
+ * little-endian (after the first 200 ms, which the vendor driver's
+ * start-up leaves partly zero), then plays a sine of PLAY_HZ for PLAY_MS
+ * on AO device 0 (at PLAY_RATE, RATE by default), and prints
  * "AUDIOTEST PASS" if every call succeeded.
  *
  * With -DAUDIO_NO_DL (a static uClibc link, whose libdl does not link)
@@ -24,8 +26,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 
 #include <imp/imp_audio.h>
+#ifdef AUDIO_DMIC
+#include <imp/imp_dmic.h>
+#endif
 
 #ifdef AUDIO_NO_DL
 void *dlopen(const char *file, int mode)
@@ -58,6 +64,17 @@ int dlclose(void *handle)
         } \
     } while (0)
 
+static int save_raw(const char *path, int16_t *buf, int want)
+{
+    FILE *f = fopen(path, "wb");
+
+    if (!f || fwrite(buf, 2, want, f) != (size_t)want || fclose(f)) {
+        printf("AUDIOTEST FAIL writing %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
 static int record(int rate, int ms, const char *path)
 {
     IMPAudioIOAttr attr;
@@ -65,7 +82,6 @@ static int record(int rate, int ms, const char *path)
     int per = rate / 50;                /* 20 ms frames */
     int want = (int)((long long)rate * ms / 1000), skip = rate / 5, got = 0;
     int16_t *buf = malloc((want + skip + per) * 2);
-    FILE *f;
 
     memset(&attr, 0, sizeof(attr));
     attr.samplerate = rate;
@@ -92,14 +108,55 @@ static int record(int rate, int ms, const char *path)
     }
     TRY(IMP_AI_DisableChn(1, 0));
     TRY(IMP_AI_Disable(1));
-    f = fopen(path, "wb");
-    if (!f || fwrite(buf + skip, 2, want, f) != (size_t)want || fclose(f)) {
-        printf("AUDIOTEST FAIL writing %s\n", path);
-        return 1;
-    }
+    TRY(save_raw(path, buf + skip, want));
     free(buf);
     return 0;
 }
+
+#ifdef AUDIO_DMIC
+static int record_dmic(int rate, int ms, const char *path)
+{
+    IMPDmicAttr attr;
+    IMPDmicChnParam chn;
+    IMPDmicChnFrame frm;
+    int per = rate / 25;                /* 40 ms frames */
+    int want = (int)((long long)rate * ms / 1000), skip = rate / 5, got = 0;
+    int16_t *buf = malloc((want + skip + per) * 2);
+
+    TRY(IMP_DMIC_SetUserInfo(0, 1, 0));
+    memset(&attr, 0, sizeof(attr));
+    attr.samplerate = rate;
+    attr.bitwidth = DMIC_BIT_WIDTH_16;
+    attr.soundmode = DMIC_SOUND_MODE_MONO;
+    attr.chnCnt = 1;
+    attr.frmNum = 40;
+    attr.numPerFrm = per;
+    TRY(IMP_DMIC_SetPubAttr(0, &attr));
+    TRY(IMP_DMIC_Enable(0));
+    memset(&chn, 0, sizeof(chn));
+    chn.usrFrmDepth = 40;
+    TRY(IMP_DMIC_SetChnParam(0, 0, &chn));
+    TRY(IMP_DMIC_EnableChn(0, 0));
+    TRY(IMP_DMIC_SetVol(0, 0, 60));
+    /* as the SDK's sample-dmic.c: libimp's gain is otherwise unset */
+    TRY(IMP_DMIC_SetGain(0, 0, 22));
+    while (got < want + skip) {
+        int n;
+
+        TRY(IMP_DMIC_PollingFrame(0, 0, 2000));
+        TRY(IMP_DMIC_GetFrame(0, 0, &frm, BLOCK));
+        n = MIN(frm.rawFrame.len / 2, want + skip - got);
+        memcpy(buf + got, frm.rawFrame.virAddr, n * 2);
+        got += n;
+        TRY(IMP_DMIC_ReleaseFrame(0, 0, &frm));
+    }
+    TRY(IMP_DMIC_DisableChn(0, 0));
+    TRY(IMP_DMIC_Disable(0));
+    TRY(save_raw(path, buf + skip, want));
+    free(buf);
+    return 0;
+}
+#endif
 
 static int play(int rate, int hz, int ms)
 {
@@ -144,13 +201,25 @@ int main(int argc, char **argv)
     int hz = argc > 3 ? atoi(argv[3]) : 440;
     int play_ms = argc > 4 ? atoi(argv[4]) : 2000;
     const char *path = argc > 5 ? argv[5] : "/tmp/rec.raw";
+    int dmic = argc > 6 && !strcmp(argv[6], "dmic");
+    int play_rate = argc > 7 ? atoi(argv[7]) : rate;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (rec_ms > 0 && record(rate, rec_ms, path)) {
+#ifdef AUDIO_DMIC
+    if (dmic && rec_ms > 0 && record_dmic(rate, rec_ms, path)) {
+        return 1;
+    }
+#else
+    if (dmic) {
+        printf("AUDIOTEST FAIL built without IMP_DMIC\n");
+        return 1;
+    }
+#endif
+    if (!dmic && rec_ms > 0 && record(rate, rec_ms, path)) {
         return 1;
     }
     printf("AUDIOTEST recorded\n");
-    if (play_ms > 0 && play(rate, hz, play_ms)) {
+    if (play_ms > 0 && play(play_rate, hz, play_ms)) {
         return 1;
     }
     printf("AUDIOTEST PASS\n");

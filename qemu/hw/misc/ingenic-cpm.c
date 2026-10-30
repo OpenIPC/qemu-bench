@@ -204,6 +204,95 @@ static uint32_t cpm_cdr_busy(IngenicCpmState *s, hwaddr off)
     return CDR_BUSY;
 }
 
+/* A PLL's output in Hz, in this SoC's encoding (above); 0 while it is off */
+static uint64_t cpm_pll_hz(IngenicCpmState *s, hwaddr off)
+{
+    uint32_t v = s->regs[off >> 2];
+    uint64_t m, n, od0, od1;
+
+    if (!(v & PLL_ON)) {
+        return 0;
+    }
+    switch (s->soc) {
+    case INGENIC_T21:
+    case INGENIC_T30:
+        m = extract32(v, 20, 9);
+        n = extract32(v, 14, 6);
+        return 24000000ULL * 2 * (m + 1) / (n + 1) >> extract32(v, 11, 3);
+    case INGENIC_T41:
+        m = extract32(v, 20, 9);
+        n = extract32(v, 14, 6);
+        od0 = extract32(v, 11, 3);
+        od1 = extract32(v, 7, 4);
+        return 24000000ULL * 2 * (m + 1) / (n + 1) / (1u << od0) / (od1 + 1);
+    default:
+        m = extract32(v, 20, 12);
+        n = extract32(v, 14, 6);
+        od1 = extract32(v, 11, 3);
+        od0 = extract32(v, 8, 3);
+        return n && od1 && od0 ? 24000000ULL * m / n / od1 / od0 : 0;
+    }
+}
+
+/*
+ * The I2S speaker (tx) or microphone clock of T23/T31/T40/T41, the
+ * AIC's master clock (256 fs: the audio drivers set it to rate * 256):
+ * I2SSPKCDR / I2STCDR 0x70 and I2SMICCDR / I2SRCDR 0x84, CE bit 29,
+ * F = parent * M[28:20] / N[19:0], parent bits 31:30 SCLKA, MPLL, VPLL,
+ * EPLL (T40).  T23's and T31's microphone mux is read only; their
+ * kernels take the speaker's (clk_cgu.c cgu_get_parent).  0 when off,
+ * or on a part whose AIC is clocked by its codec.
+ */
+uint64_t ingenic_cpm_i2s_hz(DeviceState *dev, bool tx)
+{
+    IngenicCpmState *s = INGENIC_CPM(dev);
+    uint32_t v = s->regs[(tx ? 0x70 : 0x84) >> 2];
+    uint32_t sel = s->regs[0x70 >> 2] >> 30, m, n;
+    uint64_t parent;
+
+    switch (s->soc) {
+    case INGENIC_T40:
+    case INGENIC_T41:
+        sel = v >> 30;
+        break;
+    case INGENIC_T23:
+    case INGENIC_T31:
+        break;
+    default:
+        return 0;
+    }
+    m = extract32(v, 20, 9);
+    n = extract32(v, 0, 20);
+    if (!(v & CDR_CE) || !m || !n) {
+        return 0;
+    }
+    switch (sel) {
+    case 0:                                         /* SCLKA */
+        switch (s->regs[R_CPCCR >> 2] >> 30) {
+        case 1:
+            parent = 24000000;
+            break;
+        case 2:
+            parent = cpm_pll_hz(s, R_CPAPCR);
+            break;
+        default:
+            parent = 0;
+            break;
+        }
+        break;
+    case 1:
+        parent = cpm_pll_hz(s, R_CPMPCR);
+        break;
+    case 2:
+        parent = cpm_pll_hz(s, R_CPVPCR);
+        break;
+    default:
+        parent = s->soc == INGENIC_T40 ? cpm_pll_hz(s, R_CPEPCR) : 0;
+        break;
+    }
+    return parent * m / n;
+}
+
 static uint64_t ingenic_cpm_read(void *opaque, hwaddr off, unsigned size)
 {
     IngenicCpmState *s = opaque;

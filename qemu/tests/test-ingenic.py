@@ -82,6 +82,7 @@ I2D = 0x130B0000
 DBOX = 0x130D0000
 PDMA = 0x13420000
 AIC = 0x10020000
+DMIC = 0x10034000
 CODEC = 0x10021000
 VIC = 0x133E0000
 
@@ -851,14 +852,16 @@ def test_ssi(qt, intc=INTC):
 
 # --- sound: PDMA, AIC, codec ----------------------------------------------
 
-def pdma_ring(qt, ch, desc, buf, period, nper, drt, dcm):
+def pdma_ring(qt, ch, desc, buf, period, nper, drt, dcm, port=AIC + 0x34,
+              unit=2):
     """jz_dma.c's cyclic transfer: a ring of 8-word linked descriptors"""
     for i in range(nper):
         nxt = desc + 32 * ((i + 1) % nper)
-        dsa, dta = (AIC + 0x34, buf + i * period) if drt in (5, 7) else \
-            (buf + i * period, AIC + 0x34)
+        dsa, dta = (port, buf + i * period) if drt in (5, 7, 13) else \
+            (buf + i * period, port)
         qt.write(desc + 32 * i, struct.pack('<8I', dcm, dsa, dta,
-                 (((nxt >> 4) & 0xff) << 24) | (period // 2), 0, drt, 0, 0))
+                 (((nxt >> 4) & 0xff) << 24) | (period // unit), 0, drt, 0,
+                 0))
     c = PDMA + 0x20 * ch
     qt.writel(c + 0x10, 1 << 30)                # DES8
     qt.writel(c + 0x18, desc)                   # DDA
@@ -957,6 +960,71 @@ def test_codec_gain(qt):
     check('ALC off, gain 0x0C: -6 dB', peak(0x80, 0x0C), 4106)
     check('the ADC off: silence', peak(0x10, 0x10), 0)
     qt.writel(AIC + 0x04, 0)
+
+
+def test_dmic(qt):
+    print('ingenic-dmic')
+    qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
+    check('every interrupt masked out of reset', qt.readl(DMIC + 0x08), 0x3f)
+    # audio_dmic.c: 16 kHz, one microphone, packed, DMA on request 13
+    ring, desc, period = SCRATCH + 0x6000, SCRATCH + 0x7000, 128
+    qt.write(ring, bytes(4 * period))
+    dcm32 = (0 << 14) | (0 << 12) | (0 << 8) | 3    # 32-bit ports and units
+    pdma_ring(qt, 6, desc, ring, period, 4, 13, dcm32 | (1 << 22),
+              port=DMIC + 0x30, unit=4)
+    qt.writel(DMIC + 0x34, (1 << 31) | 32)              # RDMS, threshold
+    qt.writel(DMIC + 0x00, (1 << 31) | (1 << 8) | (1 << 6) | 1)
+    check('RESET self-clears', qt.readl(DMIC + 0x00) >> 30, 0)
+    qt.step(10 * 1000 * 1000)
+    dta = qt.readl(PDMA + 0x20 * 6 + 0x04)
+    got = struct.unpack('<160h', qt.read(ring, 320))
+    want = [round(8192 * math.sin(2 * math.pi * 1000 * k / 16000))
+            for k in range(160)]
+    check('10 ms at 16 kHz: 160 samples, two to an entry', dta - ring, 320)
+    check('the samples are the 1 kHz tone, the earlier in bits 15:0',
+          got[:24], tuple(want[:24]))
+    check('the FIFO drained, EMPTY', qt.readl(DMIC + 0x38) & 0x1007f,
+          1 << 16)
+    qt.writel(DMIC + 0x34, 32)                          # RDMS off
+    qt.step(10 * 1000 * 1000)
+    check('without DMA the FIFO fills: FULL, level 64',
+          qt.readl(DMIC + 0x38) & 0x8007f, (1 << 19) | 64)
+    check('a DR read takes an entry', (qt.readl(DMIC + 0x30) != 0,
+          qt.readl(DMIC + 0x38) & 0x7f), (True, 63))
+    qt.writel(DMIC + 0x00, 0)
+    qt.writel(PDMA + 0x20 * 6 + 0x10, 0)
+
+
+def test_i2s_clock(qt):
+    print('the AIC at the CPM\'s I2S clocks (T31)')
+    qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
+    qt.writel(CODEC + 0x110, 0x5)                       # the codec: 16 kHz
+    # the speaker clock: VPLL 1200 MHz * 256 / 25000 = 12.288 MHz, 48 kHz
+    qt.writel(CPM + 0x70, (2 << 30) | (1 << 29) | (256 << 20) | 25000)
+    play, desc, period = SCRATCH + 0x8000, SCRATCH + 0x9000, 1024
+    qt.write(play, bytes(4 * period))
+    dcm16 = (2 << 14) | (2 << 12) | (2 << 8) | 3
+    pdma_ring(qt, 5, desc, play, period, 4, 6, dcm16 | (1 << 23))
+    qt.writel(AIC + 0x00, 1)
+    qt.writel(AIC + 0x04, (1 << 19) | (1 << 14) | (1 << 11) | 2)
+    dsa0 = qt.readl(PDMA + 0x20 * 5)
+    qt.step(10 * 1000 * 1000)
+    dsa1 = qt.readl(PDMA + 0x20 * 5)
+    check('10 ms played at 48 kHz, not the codec\'s 16: 480 samples',
+          (dsa1 - dsa0) // 2, 480)
+    qt.writel(AIC + 0x04, 0)
+    qt.writel(PDMA + 0x20 * 5 + 0x10, 0)
+    # the speaker clock off: the codec's rate again
+    qt.writel(CPM + 0x70, (2 << 30) | (256 << 20) | 25000)
+    pdma_ring(qt, 5, desc, play, period, 4, 6, dcm16 | (1 << 23))
+    qt.writel(AIC + 0x04, (1 << 19) | (1 << 14) | (1 << 11) | 2)
+    dsa0 = qt.readl(PDMA + 0x20 * 5)
+    qt.step(10 * 1000 * 1000)
+    dsa1 = qt.readl(PDMA + 0x20 * 5)
+    check('with the clock gated, the codec\'s 16 kHz: 160 samples',
+          (dsa1 - dsa0) // 2, 160)
+    qt.writel(AIC + 0x04, 0)
+    qt.writel(PDMA + 0x20 * 5 + 0x10, 0)
 
 
 # --- SFC + NOR -------------------------------------------------------------
@@ -1775,6 +1843,7 @@ def main():
         test_rtc_efuse(qt)
         test_sadc(qt)
         test_sound(qt)
+        test_dmic(qt)
         test_codec_gain(qt)
         test_tcu_pwm(qt)
         test_dtrng(qt)
@@ -1782,6 +1851,9 @@ def main():
         test_hash(qt)
         test_rsa(qt)
         test_usbphy(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31')
+        test_i2s_clock(qt)
         qt.close()
         qt = QTest(a.qemu, 't31', ['-device', 'w25q80,bus=ssi0,cs=0'])
         test_ssi(qt)

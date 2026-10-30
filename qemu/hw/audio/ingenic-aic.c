@@ -21,10 +21,16 @@
  *   0x38 AICLR   the loop FIFO: what was played, for echo cancelling
  *   others       storage (AICCR1/2, I2SCR, I2SDIV, CKCFG, ...)
  *
- * The codec's registers are bytes, one per word; their CSRR (0x110, bits
- * 2:0: 7 8 kHz, 6 12, 5 16, 4 24, 3 32, 2 44.1, 1 48, 0 96) is the
- * sample rate both ways -- the codec clocks the AIC.  The rest hold what
- * is written: the drivers read back each one they write.
+ * The codec's registers are bytes, one per word; the rest hold what is
+ * written: the drivers read back each one they write.
+ *
+ * The sample rates: on T23, T31, T40 and T41 the AIC is the I2S master,
+ * clocked by the CPM's speaker clock to play and its microphone clock to
+ * record, which the drivers set to 256 fs for each direction ("cpm" link,
+ * ingenic_cpm_i2s_hz; a rate within 3 % of a standard one is taken as
+ * that).  On T10..T30, or while that clock is off, the codec clocks the
+ * AIC: its CSRR (0x110, bits 2:0: 7 8 kHz, 6 12, 5 16, 4 24, 3 32, 2
+ * 44.1, 1 48, 0 96) is the rate both ways.
  *
  * The analogue side, by the "codec" property (the SDKs' codec drivers,
  * oss2 jz_t10_codec.c and oss3 inner_codecs/T23/codec.c):
@@ -40,7 +46,7 @@
  * no "codec" (T40, T41, whose codec sources are not at hand) nothing is
  * scaled.
  *
- * Frames move at that rate while ENB is set: with ERPL one frame's
+ * Frames move at those rates while ENB is set: with ERPL one frame's
  * samples leave the TX FIFO (1 with M2S, CHANNEL + 1 otherwise; the last
  * sample again on underrun) for the machine's audiodev (16-bit stereo),
  * with ETFL the loop FIFO gets the frame's first sample, and with EREC
@@ -69,6 +75,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/sysbus.h"
+#include "hw/mips/ingenic.h"
 #include "migration/vmstate.h"
 #include "qemu/audio.h"
 #include "qom/object.h"
@@ -136,14 +143,16 @@ struct IngenicAicState {
     AudioBackend *audio_be;
     SWVoiceOut *vout;
     SWVoiceIn *vin;
-    uint32_t voice_rate;
+    uint32_t voice_rate, voice_rate_in;
+    DeviceState *cpm;
 
     uint32_t regs[AIC_REGS / 4];
     uint8_t codec[CODEC_REGS];
     AicFifo tx, rx, loop;
     uint32_t last_tx[8];        /* the frame last played */
     int64_t last_ns;
-    uint64_t frac;              /* ns * rate carried over */
+    uint64_t frac;              /* ns * rate carried over: play */
+    uint64_t frac_rx;           /* record */
     uint64_t phase;             /* tone frames made */
 
     int16_t out[OUT_RING];
@@ -166,13 +175,26 @@ static bool aic_rx_audiodev(IngenicAicState *s)
     return s->rx_source && !strcmp(s->rx_source, "audiodev");
 }
 
-static uint32_t aic_rate(IngenicAicState *s)
-{
-    static const uint32_t rates[8] = {
-        96000, 48000, 44100, 32000, 24000, 16000, 12000, 8000
-    };
+static const uint32_t aic_rates[8] = {
+    96000, 48000, 44100, 32000, 24000, 16000, 12000, 8000
+};
 
-    return rates[s->codec[CODEC_CSRR] & 7];
+/* the play (tx) or record sample rate */
+static uint32_t aic_rate(IngenicAicState *s, bool tx)
+{
+    uint64_t hz = s->cpm ? ingenic_cpm_i2s_hz(s->cpm, tx) : 0;
+    uint32_t fs = (hz + 128) / 256;
+    int i;
+
+    if (fs < 4000 || fs > 192000) {
+        return aic_rates[s->codec[CODEC_CSRR] & 7];
+    }
+    for (i = 0; i < 8; i++) {
+        if (fs * 100 >= aic_rates[i] * 97 && fs * 100 <= aic_rates[i] * 103) {
+            return aic_rates[i];
+        }
+    }
+    return fs;
 }
 
 /* ---- FIFOs and request lines ----------------------------------------- */
@@ -306,18 +328,19 @@ static int16_t aic_capture(IngenicAicState *s)
             s->in_count--;
         }
     } else if (s->tone_hz) {
-        double t = (double)s->phase / aic_rate(s);
+        double t = (double)s->phase / aic_rate(s, false);
 
         v = (int16_t)lrint(8192 * sin(2 * M_PI * s->tone_hz * t));
     }
     return codec_record(s, v);
 }
 
-static void aic_frame(IngenicAicState *s)
+/* one frame played: the TX FIFO to the host, and the loop FIFO */
+static void aic_play_frame(IngenicAicState *s)
 {
     uint32_t cr = *aic_reg(s, R_AICCR);
     uint32_t *sr = aic_reg(s, R_AICSR);
-    uint32_t oss = extract32(cr, 19, 3), iss = extract32(cr, 16, 3);
+    uint32_t oss = extract32(cr, 19, 3);
     int i, n;
 
     if (cr & CR_ERPL) {
@@ -340,6 +363,17 @@ static void aic_frame(IngenicAicState *s)
     if (cr & CR_ETFL) {
         fifo_push(&s->loop, (cr & CR_ERPL) ? s->last_tx[0] : 0, RX_DEPTH);
     }
+    aic_update(s);              /* the PDMA moves what it can now */
+}
+
+/* one frame recorded into the RX FIFO */
+static void aic_rec_frame(IngenicAicState *s)
+{
+    uint32_t cr = *aic_reg(s, R_AICCR);
+    uint32_t *sr = aic_reg(s, R_AICSR);
+    uint32_t iss = extract32(cr, 16, 3);
+    int i, n;
+
     if (cr & CR_EREC) {
         uint32_t v = aic_to_width(aic_capture(s), iss);
 
@@ -360,21 +394,43 @@ static bool aic_running(IngenicAicState *s)
            (*aic_reg(s, R_AICCR) & (CR_EREC | CR_ERPL | CR_ETFL));
 }
 
+/* the frames due in dt ns at rate, the remainder kept in *frac */
+static uint64_t aic_frames(uint64_t *frac, int64_t dt, uint32_t rate)
+{
+    uint64_t n;
+
+    *frac += (uint64_t)dt * rate;
+    n = *frac / NANOSECONDS_PER_SECOND;
+    *frac %= NANOSECONDS_PER_SECOND;
+    return n;
+}
+
 static void aic_advance(IngenicAicState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t dt = MIN(now - s->last_ns, 100 * TICK_NS);
-    uint64_t n;
+    uint32_t cr = *aic_reg(s, R_AICCR);
+    uint64_t ntx = 0, nrx = 0;
 
     s->last_ns = now;
     if (dt <= 0 || !aic_running(s)) {
         return;
     }
-    s->frac += (uint64_t)dt * aic_rate(s);
-    n = s->frac / NANOSECONDS_PER_SECOND;
-    s->frac %= NANOSECONDS_PER_SECOND;
-    while (n--) {
-        aic_frame(s);
+    if (cr & (CR_ERPL | CR_ETFL)) {
+        ntx = aic_frames(&s->frac, dt, aic_rate(s, true));
+    }
+    if (cr & CR_EREC) {
+        nrx = aic_frames(&s->frac_rx, dt, aic_rate(s, false));
+    }
+    /* the two sides interleaved, so that neither runs a tick ahead */
+    while (ntx || nrx) {
+        if (ntx && (!nrx || ntx >= nrx)) {
+            aic_play_frame(s);
+            ntx--;
+        } else {
+            aic_rec_frame(s);
+            nrx--;
+        }
     }
 }
 
@@ -436,22 +492,21 @@ static void aic_voices(IngenicAicState *s)
 {
     uint32_t cr = *aic_reg(s, R_AICCR);
     bool on = *aic_reg(s, R_AICFR) & FR_ENB;
-    uint32_t rate = aic_rate(s);
+    uint32_t rate = aic_rate(s, true), rate_in = aic_rate(s, false);
 
     if (!s->audio_be) {
         return;
     }
-    if (s->voice_rate != rate) {
-        if (s->vout) {
-            AUD_close_out(s->audio_be, s->vout);
-            s->vout = NULL;
-        }
-        if (s->vin) {
-            AUD_close_in(s->audio_be, s->vin);
-            s->vin = NULL;
-        }
-        s->voice_rate = rate;
+    if (s->voice_rate != rate && s->vout) {
+        AUD_close_out(s->audio_be, s->vout);
+        s->vout = NULL;
     }
+    if (s->voice_rate_in != rate_in && s->vin) {
+        AUD_close_in(s->audio_be, s->vin);
+        s->vin = NULL;
+    }
+    s->voice_rate = rate;
+    s->voice_rate_in = rate_in;
     if (!s->vout) {
         struct audsettings as = {
             .freq = rate, .nchannels = 2, .fmt = AUDIO_FORMAT_S16,
@@ -462,7 +517,7 @@ static void aic_voices(IngenicAicState *s)
     }
     if (!s->vin && aic_rx_audiodev(s)) {
         struct audsettings as = {
-            .freq = rate, .nchannels = 1, .fmt = AUDIO_FORMAT_S16,
+            .freq = rate_in, .nchannels = 1, .fmt = AUDIO_FORMAT_S16,
         };
 
         s->vin = AUD_open_in(s->audio_be, NULL, "ingenic-aic.in", s,
@@ -481,6 +536,10 @@ static void aic_tick(void *opaque)
     IngenicAicState *s = opaque;
 
     aic_advance(s);
+    if (s->voice_rate != aic_rate(s, true) ||
+        s->voice_rate_in != aic_rate(s, false)) {
+        aic_voices(s);          /* the CPM's clocks changed */
+    }
     aic_schedule(s);
 }
 
@@ -627,7 +686,7 @@ static void ingenic_aic_reset(DeviceState *dev)
     s->rx.head = s->rx.count = 0;
     s->loop.head = s->loop.count = 0;
     s->out_head = s->out_count = s->in_head = s->in_count = 0;
-    s->frac = s->phase = 0;
+    s->frac = s->frac_rx = s->phase = 0;
     s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     aic_voices(s);
     aic_update(s);
@@ -677,7 +736,7 @@ static int ingenic_aic_post_load(void *opaque, int version_id)
     IngenicAicState *s = opaque;
 
     s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->voice_rate = 0;
+    s->voice_rate = s->voice_rate_in = 0;
     aic_voices(s);
     aic_schedule(s);
     return 0;
@@ -688,6 +747,7 @@ static const Property ingenic_aic_props[] = {
     DEFINE_PROP_UINT32("tone-hz", IngenicAicState, tone_hz, 1000),
     DEFINE_PROP_STRING("rx-source", IngenicAicState, rx_source),
     DEFINE_PROP_STRING("codec", IngenicAicState, codec_kind),
+    DEFINE_PROP_LINK("cpm", IngenicAicState, cpm, TYPE_DEVICE, DeviceState *),
 };
 
 static const VMStateDescription vmstate_aic_fifo = {
@@ -704,7 +764,7 @@ static const VMStateDescription vmstate_aic_fifo = {
 
 static const VMStateDescription vmstate_ingenic_aic = {
     .name = TYPE_INGENIC_AIC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = ingenic_aic_post_load,
     .fields = (const VMStateField[]) {
@@ -716,6 +776,7 @@ static const VMStateDescription vmstate_ingenic_aic = {
         VMSTATE_UINT32_ARRAY(last_tx, IngenicAicState, 8),
         VMSTATE_UINT64(frac, IngenicAicState),
         VMSTATE_UINT64(phase, IngenicAicState),
+        VMSTATE_UINT64_V(frac_rx, IngenicAicState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
