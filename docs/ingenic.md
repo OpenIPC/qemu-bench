@@ -821,7 +821,17 @@ with T31's offsets and their enable at 0x16008; VIC0 at 0x13380000 (IRQ
 38) is T31's but for its frame start, bit 4 of 0x1E0, which starts the
 sensor / AE work; the single sensor's CSI host is the one at 0x10054000.
 Nothing is polled. The second pipe, VIC1/VIC2 (0x13390000, 0x133A0000)
-and the second CSI (0x10023000) are not modelled.
+and the second CSI (0x10023000) are not modelled. What a model would
+start from: the module's `tx_isp_vic_resource` maps only 0x13380000
+(64 KiB) but lists three interrupts, Linux 38 / 37 / 36 (INTC 30 / 29 /
+28: VIC0, VIC1, VIC2), and `tx_isp_csi_resource` both CSI hosts
+(0x10054000 CSI0, 0x10023000 CSI1); the scaler state has a second set
+(`mscaler_s1`) and the 3A callbacks are indexed per pipe
+(`irq_func_cb[pipe * 42 + n]`). The SDK samples drive two sensors with
+`SENSOR_NUM` = `IMPISP_TOTAL_TWO` and a `DUALSENSOR_MODE`, the second on
+I2C 3 through CSI1, and the SDK's driver sources build a second-sensor
+module (`sensor_gc4653s1_t40.ko`). The dual-sensor scheduling itself is
+in the closed `libt40-firmware.a`.
 
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
