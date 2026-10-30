@@ -102,6 +102,9 @@ mount -t tmpfs tmp /tmp
 mount -t devtmpfs dev /dev 2>/dev/null
 for m in aes hash rsa dtrng des; do insmod $KO/jz-\$m.ko; done
 echo "CRYPTOTEST devs: \$(ls /dev/aes /dev/hash /dev/rsa /dev/dtrng /dev/des 2>&1 | tr '\n' ' ')"
+# the kernel's messages would interleave with the client's lines on the
+# paced console; they are read back from dmesg below
+echo 1 > /proc/sys/kernel/printk
 crypto-test /etc/rsa-vectors
 dmesg | grep -i -E "aes|hash|rsa|dtrng|des" | grep -v "^.*random:" | tail -12 | sed 's/^/CRYPTOTEST dmesg: /'
 echo CRYPTOTEST-END
