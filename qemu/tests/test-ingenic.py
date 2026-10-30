@@ -79,6 +79,7 @@ SCRATCH = 0x00800000
 AIP = 0x12B00000
 AIP_ALIAS = 0x13090000
 MONITOR = 0x130A0000
+VO = 0x130C0000
 ISP = 0x13300000
 SADC = 0x10070000
 I2D = 0x130B0000
@@ -639,6 +640,57 @@ def test_monitor(qt, intc=CORE_INTC):
     check('soft reset stops counting', qt.readl(MONITOR + ch + 0x10), 0)
     qt.writel(MONITOR + 0x500 + 0x74, 3)
     check('the AHB channel at 0x500', qt.readl(MONITOR + 0x574), 3)
+
+
+def test_vo(qt, intc=CORE_INTC):
+    print('ingenic-vo (T41)')
+    W, H = 64, 32
+    ya, uva = SCRATCH, SCRATCH + 0x10000
+    # left half red (Y 81, Cb 90, Cr 240), right half blue (41, 240, 110)
+    qt.write(ya, b''.join(bytes([81] * (W // 2) + [41] * (W // 2))
+                          for _ in range(H)))
+    qt.write(uva, b''.join(bytes([90, 240] * (W // 4) + [240, 110] * (W // 4))
+                           for _ in range(H // 2)))
+    # ingenic_vo.c soft_reset_vo, work_init_vo, vo_reg_set
+    qt.writel(VO + 0x004, qt.readl(VO + 0x004) | 1)
+    check('DMA reset not acknowledged at once', qt.readl(VO + 0x008) & 1, 0)
+    qt.step(20000)
+    check('then acknowledged (TOP_STATUS bit 0)', qt.readl(VO + 0x008) & 1, 1)
+    qt.writel(VO + 0x004, qt.readl(VO + 0x004) | 2)
+    qt.writel(VO + 0x004, qt.readl(VO + 0x004) & ~2)
+    qt.writel(VO + 0x004, qt.readl(VO + 0x004) & ~1)
+    qt.writel(VO + 0x100, (H << 16) | W)
+    qt.writel(VO + 0x104, (W << 16) | W)
+    qt.writel(VO + 0x114, (64 << 16) | (1 << 12) | 0)
+    qt.writel(VO + 0x118, (4 << 16) | 4)
+    qt.writel(VO + 0x11C, 8)
+    qt.writel(VO + 0x00C, (1 << 12) | (1 << 8) | 1)
+    qt.writel(VO + 0x120, 1)
+    check('no frame queued', qt.readl(VO + 0x128) & 8, 0)
+    qt.writel(VO + 0x008, 1)
+    qt.writel(VO + 0x108, ya)
+    qt.writel(VO + 0x10C, uva)
+    check('the frame queued (ADDR_INFO bit 3)', qt.readl(VO + 0x128) & 8, 8)
+    qt.step(40 * 1000 * 1000)
+    check('frame done after a frame time', qt.readl(VO + 0x010) & 1, 1)
+    check('the VO line (43) pending', (qt.readl(intc + 0x20) >> 11) & 1, 1)
+    check('the queue empty again', qt.readl(VO + 0x128) & 8, 0)
+    check('one frame out', qt.qom_get('/machine/vo', 'frames'), 1)
+    ppm = os.path.join(qt.dir, 'vo.ppm')
+    qt.qmp('screendump', filename=ppm)
+    with open(ppm, 'rb') as f:
+        data = f.read()
+    hdr = data.split(b'\n', 3)
+    px = hdr[3]
+    left = px[(H // 2 * W + 8) * 3:(H // 2 * W + 8) * 3 + 3]
+    right = px[(H // 2 * W + W - 8) * 3:(H // 2 * W + W - 8) * 3 + 3]
+    check('the display shows it: %s, red left, blue right' % hdr[1].decode(),
+          (hdr[1], left[0] > 200 and left[2] < 60, right[2] > 200 and
+           right[0] < 60), (b'%d %d' % (W, H), True, True))
+    qt.writel(VO + 0x014, qt.readl(VO + 0x014) | 1)
+    qt.writel(VO + 0x014, qt.readl(VO + 0x014) & ~1)
+    check('INT_CLC clears it', (qt.readl(VO + 0x010) & 1,
+          (qt.readl(intc + 0x20) >> 11) & 1), (0, 0))
 
 
 def test_i2d(qt, intc=CORE_INTC):
@@ -2125,6 +2177,7 @@ def main():
         test_drawbox(qt)
         test_i2d(qt)
         test_aip(qt)
+        test_vo(qt)
         test_dtrng(qt, CORE_INTC)
         test_aes(qt, CORE_INTC)
         test_hash(qt, CORE_INTC)

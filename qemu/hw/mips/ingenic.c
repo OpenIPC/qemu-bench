@@ -201,6 +201,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_AIP_F       39
 #define IRQ_AIP_P       38
 #define MONITOR_BASE    0x130A0000  /* T40, T41 */
+#define VO_BASE         0x130C0000  /* T41 */
+#define IRQ_VO          43
 #define IRQ_MONITOR     53
 #define IRQ_IPU         6       /* Linux 14, "ipu" */
 #define I2D_BASE        0x130B0000  /* T40, T41 */
@@ -1292,6 +1294,16 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, MONITOR_BASE);
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_MONITOR));
+    }
+
+    /* T41's video output (BT.656 / BT.1120): /machine/vo, the display */
+    if (info->soc == INGENIC_T41) {
+        dev = qdev_new("ingenic-vo");
+        object_property_add_child(OBJECT(ims), "vo", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, VO_BASE);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_VO));
     }
 
     /*
