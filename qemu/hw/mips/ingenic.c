@@ -1132,6 +1132,16 @@ static void ingenic_init(MachineState *ms)
     sysbus_mmio_map(sbd, 0, PDMA_BASE);
     sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_PDMA));
     dev = qdev_new("ingenic-aic");
+    switch (info->soc) {
+    case INGENIC_T10: case INGENIC_T20: case INGENIC_T21: case INGENIC_T30:
+        qdev_prop_set_string(dev, "codec", "t10");
+        break;
+    case INGENIC_T23: case INGENIC_T31:
+        qdev_prop_set_string(dev, "codec", "t31");
+        break;
+    default:
+        break;
+    }
     if (ms->audiodev) {
         qdev_prop_set_string(dev, "audiodev", ms->audiodev);
     }

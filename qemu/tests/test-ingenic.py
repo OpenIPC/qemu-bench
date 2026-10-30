@@ -720,6 +720,8 @@ def test_sound(qt, intc=INTC):
     # the codec at 16 kHz, its registers bytes read back
     qt.writel(CODEC + 0x110, 0x5)
     check('codec CSRR reads back', qt.readl(CODEC + 0x110), 5)
+    # the microphone path on, ALC on (T31's codec_set_buildin_mic)
+    qt.writel(CODEC + 0x8C, 0x90)
     # record: 16-bit, right channel only, DMA, as i2s_dma_enable does
     ring, desc, period = SCRATCH + 0x2000, SCRATCH + 0x3000, 64
     qt.write(ring, bytes(4 * period))
@@ -759,6 +761,30 @@ def test_sound(qt, intc=INTC):
     check('RST empties the FIFOs and self-clears',
           (qt.readl(AIC + 0x00) & 8, (qt.readl(AIC + 0x14) >> 8) & 0x3f),
           (0, 0))
+
+
+def test_codec_gain(qt):
+    """T31's codec: the record gain and the ADC switch, by PIO"""
+    print('ingenic-aic codec gains (T31 layout)')
+
+    def peak(cmiccr, calcgr):
+        qt.writel(AIC + 0x04, 0)
+        qt.writel(AIC + 0x00, 1 | (1 << 3))             # empty the FIFOs
+        qt.writel(CODEC + 0x110, 0x5)
+        qt.writel(CODEC + 0x8C, cmiccr)
+        qt.writel(CODEC + 0x94, calcgr)
+        qt.writel(AIC + 0x04, (1 << 16) | (1 << 12) | 1)  # EREC, mono
+        qt.step(1500 * 1000)                            # 24 frames
+        v = [qt.readl(AIC + 0x34) & 0xffff for _ in range(24)]
+        return max(abs(x - 65536 if x >= 32768 else x) for x in v)
+
+    check('ALC on: a quarter of full scale whatever the gain',
+          peak(0x90, 0x1f), 8192)
+    check('ALC off, gain 0x10: unity', peak(0x80, 0x10), 8192)
+    check('ALC off, gain 0x14: +6 dB', peak(0x80, 0x14), 16345)
+    check('ALC off, gain 0x0C: -6 dB', peak(0x80, 0x0C), 4106)
+    check('the ADC off: silence', peak(0x10, 0x10), 0)
+    qt.writel(AIC + 0x04, 0)
 
 
 # --- SFC + NOR -------------------------------------------------------------
@@ -1474,6 +1500,7 @@ def main():
         test_rtc_efuse(qt)
         test_sadc(qt)
         test_sound(qt)
+        test_codec_gain(qt)
         test_tcu_pwm(qt)
         test_dtrng(qt)
         test_aes(qt)
