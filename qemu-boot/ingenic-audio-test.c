@@ -138,6 +138,8 @@ static int record_dmic(int rate, int ms, const char *path)
     TRY(IMP_DMIC_SetChnParam(0, 0, &chn));
     TRY(IMP_DMIC_EnableChn(0, 0));
     TRY(IMP_DMIC_SetVol(0, 0, 60));
+    /* as the SDK's sample-dmic.c: libimp's gain is otherwise unset */
+    TRY(IMP_DMIC_SetGain(0, 0, 22));
     while (got < want + skip) {
         int n;
 
