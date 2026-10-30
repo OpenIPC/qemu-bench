@@ -89,7 +89,8 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x134C0000 | RSA engine, 1024/2048 bits, polled (T23, T31, T40, T41) | `ingenic-rsa` |
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
 | 0x12660000 | XBurst2 on-chip RAM (64 KiB) | RAM |
-| 0x80000000 | T41: the IVDC's frame store as `direct_mode` addresses it (32 MiB; registers at 0x13200000 read as zero) | RAM |
+| 0x80000000 | T41: the IVDC's frame store as `direct_mode` addresses it (32 MiB) | RAM |
+| 0x13200000 | T41: the IVDC's registers, core INTC 13 | `ingenic-ivdc` |
 | 0x1F000000 | cache-as-RAM window (32 KiB) | RAM |
 | 0x1FC00000 | boot ROM (the reset vector, 0xBFC00000) | ROM |
 
@@ -345,8 +346,8 @@ sensor modules for the sensor sinfo finds and starts `carrier-server`, a
 live555 RTSP server (`rtsp://<address>:8554/main`, `/second`). Root has
 no password. `qemu-boot/test-ingenic-sdk-boot.sh --image <img>` takes
 the grade, RAM and sensor from the image, rebuilds the root so that rcS
-runs `app_init.sh` at the test's address (and, with a sensor, without
-IVDC's `direct_mode` unless `--direct-mode`), puts QEMU's user network on that /24 with host
+runs `app_init.sh` at the test's address (and, with a sensor and
+`--no-direct-mode`, without IVDC's `direct_mode`), puts QEMU's user network on that /24 with host
 forwards for telnet and RTSP, logs in over telnet
 (`qemu-boot/ingenic-telnet.py`), pulls and decodes the stream, and
 reboots the camera over telnet once.
@@ -1017,11 +1018,21 @@ and +0x2C a B/G window (Q8, min in [15:0], max in [31:16]), +0x30 and
 in [31:16]), +0x38 a luma window ([7:0] low, [15:8] high; luma taken
 as (R + 2 G + B) / 4) -- the driver's all-pass values (R/G 1..4095,
 bounds 0 and 65535) read so -- and a zone's count is of the quads that
-passed. T40 and T41 program windows of the same form at 0x18028 but
-their eight records a zone are not decoded: their quads are not
-filtered and the light's colour is applied before the 2.2 gamma there
-(a white then reads 0.27 R, 0.33 B), the calibration under which their
-AWB follows the light.
+passed. T40 and T41 program the same form at 0x18028 (on the T41 SDK
+image R/G 60..245, B/G 30..200, k 256 with bounds 170 and 320, and the
+luma window in +0x38's bytes 0 and 2, 10..230). Their 128-byte zones
+are four pairs of 16-byte records (`tisp_awb_get_statistics`), a pair
+per statistics position; the tuning picks the pair read (its block's
+bytes 3274 / 3276; with 3274 set only that pair is stored, 32 bytes a
+zone). Of a pair the AWB's gains follow the second record alone:
+filling the first filtered or not never moved them (eight runs, three
+light colours, two light levels). Filtered as above in linear light,
+the second record leaves T41's AWB no white candidate in this scene --
+its AE exposes for the navy, the logo clips past the luma window -- and
+the AWB holds its start gains (2212 / 1856), the T23 case below. So
+T40 and T41 fill all eight records unfiltered, with the light's colour
+applied before the 2.2 gamma (a white then reads 0.27 R, 0.33 B), the
+calibration under which their AWB follows the light.
 `light`, `light-r` and `light-b` can change while running
 (`qom-set /machine/isp light 30`). The kernel's AE starts high and
 settles over a second or two -- on T31 a light of 30 % and of 100 % give
@@ -1043,7 +1054,34 @@ it would on a camera. T23 follows the light while its AE settles
 (frame 8: R 1784 / B 1484 daylight, R 1148 / B 2388 warm, R 1984 / B
 1500 cool) and then, its AE exposing this dark scene until the white
 logo and counter clip past its luma ceiling (240) and nothing neutral
-is left inside the filter, holds its defaults (R 1728 / B 1920).
+is left inside the filter, holds its defaults (R 1728 / B 1920). That
+is not the model clipping too hard: a white of the painted scene is a
+full-scale reflector, the navy behind it 1.2 %, and an AE that brings
+the navy up to its target puts the white some twelve times past full
+scale; saturated pixels fail the luma window on silicon too.
+
+T31 and T23 also produce their other statistics
+(`ingenic_isp_xstats()`), each into the banks `tisp_init` gives it:
+
+| | block, banks | status bit | layout |
+|---|---|---|---|
+| AE1 | 0xA800, AE0's form | 28, 29 | AE0's zones and histogram (the same frame in a linear mode) |
+| AF | grid 0xB804 (pixels; 8 x 8 zones of 238 x 134 at 1080p), banks 0xB8A8, last bank number 0xB8BC | 31 | 16 bytes a zone: FIR 0 / 1, IIR 0 / 1 (22 bits each), luma sum (23), bright count (15) |
+| ADR | banks 0x4494, last bank's address 0x44B0; 0x0C bit 7 bypasses | 18 | 6 x 8 blocks of luma sum and a five-bin histogram, then a 512-bin luma histogram (three 21-bit counts per 8 bytes) |
+| defog | banks 0x5B84, last bank's address 0x5BA4; 0x0C bit 11 bypasses | 20 | from +8, 180 blocks of B, G, R sums (24 bits) and three halfwords (here the dark channel, brightest and mean luma) |
+| WDR (T31) | banks of 8 KiB at 0x2010, last address 0x2680; only with 0x0C bit 0 clear | 11 | long and short exposure R, G, B histograms (256 x 21 bits), luma counts and sums, in eight 516-byte rows 1 KiB apart |
+
+The AF filters are the luma's differences to the next pixel and the
+one after, along the row (FIR) and down the column (IIR), summed over
+the zone. With them `IMP_ISP_Tuning_GetAFMetrices` on T31 reads about
+1.6 million, and 0 without; when the light quadruples and turns warm it
+drops to about 0.9 million as the logo clips. With ADR and defog fed,
+their algorithms run every frame and write their outputs (ADR
+0x4270..0x43A4, defog's per-block transmission and air light from
+0x58000) where without statistics only their init values are written
+once; on the static scene those outputs settle and stay, also across a
+change of light, and which of defog's three halfwords means what is a
+guess.
 
 The tests that check pictures take them once the AE has
 settled (`test-ingenic-isp.sh` the last frames of 40, the encoder client
@@ -1182,12 +1220,19 @@ frame source its "buffer done" on int_sta bit 20, the MSCA's first line
 the pair again instead of reading the done FIFO. Here 32 MiB of RAM at
 0x80000000 stands in for the store: the scaler paints a frame queued
 the pair into it and raises bit 20 without touching the done FIFO, and
-the AVPU reads 0x80000000-0x81FFFFFF unmasked. The IVDC's registers at
-0x13200000 (sizes, the DRAM spill lines, its status at +0x44, cleared
-through +0x54) read as zero: its interrupt only counts overflows.
-`test-ingenic-sdk-boot.sh` strips `direct_mode` by default; with
-`--direct-mode` it keeps it, and the stream decodes with the scene as
-without. The core's 0x204 bit 0 follows 0x200
+the AVPU reads 0x80000000-0x81FFFFFF unmasked. The IVDC's own registers
+(`ingenic-ivdc`, 0x13200000) hold the sizes and DRAM spill lines the
+driver writes; 0x00 bit 0 is a reset that reads back 0 at once (the
+driver spins on it); the status at +0x44, cleared through +0x54, gets
+ISP frame start and frame done (bits 17 and 16) for each picture the
+scaler writes into the store, and interrupts on core INTC source 13
+(tx-isp's `isp-ivdc`; the device tree's node names 0, `jpeg0`'s line)
+under the enable mask at +0x40 (0x244FC0FF from `ivdc_core_ops_init`).
+The driver counts them in `/proc/jz/isp/isp-ivdc`, and at frame done
+moves its state to running. `test-ingenic-sdk-boot.sh` keeps the
+image's `direct_mode` (`--no-direct-mode` strips it): the stream
+decodes with the scene, and the IVDC counters read 102 ISP frame starts
+and dones and no errors by the time of the check. The core's 0x204 bit 0 follows 0x200
 bit 0: `ispcore_video_s_stream` and `ispcore_suspend_module` set the one
 and spin on the other without a timeout.
 
@@ -1349,14 +1394,17 @@ and pow(), and the TCU's PWM pins.
 ## Not modelled
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
-its Apical base; above), T40's third sensor (VIC2) and the dual mode's
-raw caching through VIC MDMA, the T40/T41 AWB records' split (their
-pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
-AF and the zone statistics beyond AE and AWB, the DMIC's voice
-trigger, PDMA
-transfers for peripherals other than the AIC, the SSI and the DES, the
-SSI slave and the HASH engine's CPU mode (no driver in any tree here, so
-no contract; above)
+its Apical base; above), T40's third sensor (VIC2: `tx-isp-t40.ko`
+supports one, "The third sensor init", in a joint mode where sensors
+share a pipe through VIC MDMA raw caching) and that raw caching (VIC
++0x300.., `vic_mdma_enable`, also the `snapraw` debug command), the
+T40/T41 AWB pixel filter (above), T40/T41's AF, ADR, defog, WDR, LCE,
+GSM and TMO statistics (T41 bits 6, 9, 10, 11, 8, 7, 17 of 0x40028, AF
+index 0x1A0E0, formats other than T31's: AF packs zones in fours with
+23-bit fields), the Apical AF and the zone statistics beyond AE and AWB,
+the DMIC's voice trigger, PDMA transfers for peripherals other than the
+AIC, the SSI and the DES, the SSI slave and the HASH engine's CPU mode
+(no driver in any tree here, so no contract; above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the

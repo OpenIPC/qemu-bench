@@ -122,6 +122,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define ORAM_BASE       0x12660000  /* XBurst2 on-chip RAM */
 #define IVDC_STORE_BASE 0x80000000  /* T41 direct_mode: the IVDC's frame */
 #define IVDC_STORE_SIZE 0x02000000
+#define IVDC_BASE       0x13200000  /* T41: the IVDC's registers */
+#define IRQ_IVDC_T41    13          /* core INTC; "isp-ivdc" in tx-isp */
 #define ORAM_SIZE       0x10000
 #define IO_BASE         0x10000000
 #define IO_SIZE         0x04000000
@@ -1208,6 +1210,24 @@ static void ingenic_init(MachineState *ms)
                                                info->irq_isp : IRQ_ISP));
         sysbus_connect_irq(sbd, 1, ingenic_irq(ims, info->irq_vic ?
                                                info->irq_vic : IRQ_VIC));
+        if (info->soc == INGENIC_T41) {
+            /*
+             * the IVDC's registers (its store is RAM, above), core INTC
+             * source 13 (IRQ_IVDC: tx-isp's "isp-ivdc"; the device tree's
+             * node names 0, which is jpeg0's); the ISP tells it of each
+             * picture it writes into the store
+             */
+            DeviceState *ivdc = qdev_new("ingenic-ivdc");
+
+            object_property_add_child(OBJECT(ims), "ivdc", OBJECT(ivdc));
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(ivdc), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(ivdc), 0, IVDC_BASE);
+            sysbus_connect_irq(SYS_BUS_DEVICE(ivdc), 0,
+                               ingenic_irq(ims, IRQ_IVDC_T41));
+            qdev_connect_gpio_out_named(dev, "ivdc-frame", 0,
+                                        qdev_get_gpio_in_named(ivdc,
+                                                               "frame", 0));
+        }
     }
 
     /* the IPU: libimp's OSD blender, the same block on every part */

@@ -93,9 +93,9 @@ while [ $# -gt 0 ]; do
 done
 
 case $SOC in
-t31) SENSOR=${SENSOR:-gc2053} ;;
+t31) SENSOR=${SENSOR:-gc2053}; DEFS=-DSNAP_AF ;;
 t21) SENSOR=${SENSOR:-jxf37} ;;
-t23) SENSOR=${SENSOR:-gc2053}; INC=${INC:-$INC23} ;;
+t23) SENSOR=${SENSOR:-gc2053}; INC=${INC:-$INC23}; DEFS=-DSNAP_AF ;;
 t20) SENSOR=${SENSOR:-jxf22} ;;
 t10) SENSOR=${SENSOR:-jxh62} ;;     # T10's ISP takes at most 1280x960
 t30) SENSOR=${SENSOR:-ov2735b} ;;

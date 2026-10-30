@@ -1963,6 +1963,92 @@ def test_isp_stats(qt):
           isp_bits(z1, 0, 21) > isp_bits(z0, 0, 21), True)
 
 
+def test_isp_xstats(qt):
+    """T31's other statistics: AE1, AF, ADR, defog, WDR (tisp_init's banks)."""
+    print('ingenic-isp AE1 / AF / ADR / defog / WDR statistics (t31)')
+    AE, AE1, AF = ISP + 0xA000, ISP + 0xA800, ISP + 0xB800
+    zb, hb, z1, h1 = 0x00600000, 0x00604000, 0x00620000, 0x00624000
+    afb, adrb, dfb, wdrb = 0x00640000, 0x00650000, 0x00660000, 0x00680000
+    for blk in (AE, AE1):
+        qt.writel(blk + 0x04, 0xF001F001)
+        for i in range(4):
+            qt.writel(blk + 0x08 + 4 * i, 0x40404040)
+            qt.writel(blk + 0x18 + 4 * i, 0x24242424)
+        qt.writel(blk + 0x28, 0x0011991E)
+        qt.writel(blk + 0x4C, 0x33)
+        qt.writel(blk, 1)
+    for i in range(4):
+        qt.writel(AE + 0x2C + 4 * i, zb + 0x1000 * i)
+        qt.writel(AE + 0x3C + 4 * i, hb + 0x800 * i)
+        qt.writel(AE1 + 0x2C + 4 * i, z1 + 0x1000 * i)
+        qt.writel(AE1 + 0x3C + 4 * i, h1 + 0x800 * i)
+        qt.writel(AF + 0xA8 + 4 * i, afb + 0x1000 * i)
+        qt.writel(ISP + 0x4494 + 4 * i, adrb + 0x1000 * i)
+        qt.writel(ISP + 0x5B84 + 4 * i, dfb + 0x1000 * i)
+        qt.writel(ISP + 0x2010 + 4 * i, wdrb + 0x2000 * i)
+    # tiziano_af_set_hardware_param for 1920 x 1080: 8 x 8 zones
+    qt.writel(AF + 0x04, 0x80018003)
+    for i in range(4):
+        qt.writel(AF + 0x08 + 4 * i, 0xEEEEEEEE)
+        qt.writel(AF + 0x18 + 4 * i, 0x86868686)
+    for reg in (AF + 0xB8, ISP + 0x4490, ISP + 0x5B80, ISP + 0x2024):
+        qt.writel(reg, 3)
+    qt.writel(AF, 1)
+    qt.writel(ISP + 0x0C, 0xB5742249)     # tisp_init's linear-mode bypasses
+    qt.writel(VIC + 0x00, 1)
+    qt.writel(ISP + 0xB0, 0xFFFFFFFF)
+    qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    qt.step(40 * 1000 * 1000)
+    sta = qt.readl(ISP + 0xB4)
+    check('AE1 (28, 29), AF (31), ADR (18), defog (20) raised',
+          sta & 0xB0140000, 0xB0140000)
+    check('no WDR statistics in a linear mode (0x0C bit 0)', sta & 0x800, 0)
+    idx, idx1 = qt.readl(AE + 0x50), qt.readl(AE1 + 0x50)
+    check('AE1 zones: the AE0 ones, in its own bank',
+          qt.read(z1 + 0x1000 * ((idx1 >> 4) & 3), 225 * 16),
+          qt.read(zb + 0x1000 * ((idx >> 4) & 3), 225 * 16))
+    af = qt.read(afb + 0x1000 * qt.readl(AF + 0xBC), 64 * 16)
+
+    def af_zone(n):
+        z = af[16 * n:16 * n + 16]
+        return [isp_bits(z, 0, 22), isp_bits(z, 22, 22), isp_bits(z, 44, 22),
+                isp_bits(z, 66, 22), isp_bits(z, 88, 23)]
+    corner, logo = af_zone(0), af_zone(3 * 8 + 3)
+    check('AF: a luma sum in every zone', corner[4] > 0 and logo[4] > 0, True)
+    check('AF: the logo zone answers the edge filters, the navy corner '
+          'hardly', logo[0] > 20 * max(corner[0], 1), True)
+    check('AF: the two-pixel filters answer more than the one-pixel ones',
+          logo[1] >= logo[0] and logo[3] >= logo[2], True)
+    adr_last = qt.readl(ISP + 0x44B0)
+    check('ADR: 0x44B0 holds the bank written',
+          adr_last in [adrb + 0x1000 * i for i in range(4)], True)
+    adr = qt.read(adr_last, 0x1000)
+    total = sum(isp_bits(adr[0x308 + 8 * (i // 3):], 21 * (i % 3), 21)
+                for i in range(512))
+    check('ADR: the 512-bin histogram counts every quad of 960 x 540',
+          abs(total - 960 * 540) < 960 * 540 // 50, True)
+    check('ADR: a block luma sum', isp_bits(adr, 0, 28) > 0, True)
+    df_last = qt.readl(ISP + 0x5BA4)
+    df = qt.read(df_last, 0x1000)
+    b0 = df[8:24]
+    check('defog: the navy block sums more B than R',
+          isp_bits(b0, 0, 24) > (isp_bits(b0, 48, 12) |
+                                 isp_bits(b0, 112, 12) << 12), True)
+    qt.writel(ISP + 0x0C, 0xB5742248)     # a WDR mode: bit 0 clear
+    qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    qt.step(40 * 1000 * 1000)
+    check('WDR statistics in a WDR mode (bit 11)', qt.readl(ISP + 0xB4) & 0x800,
+          0x800)
+    w = qt.read(qt.readl(ISP + 0x2680), 0x2000)
+    logical = b''.join(w[1024 * i:1024 * i + 516] for i in range(8))
+    gsum = sum(isp_bits(logical[16 * i:], 21, 21) for i in range(256))
+    check('WDR: the G histogram, packed in 516-byte rows, counts every quad',
+          abs(gsum - 960 * 540) < 960 * 540 // 50, True)
+    check('WDR: the short exposure the same as the long in a linear frame',
+          all(logical[16 * i:16 * i + 8] == logical[16 * i + 8:16 * i + 16]
+              for i in range(256)), True)
+
+
 def test_isp_stats_t21(qt):
     """T21's statistics: AE 0x700, AWB 0x800, no enable bits (tisp_init)."""
     print('ingenic-isp 3A statistics (t21, sensor=jxf37)')
@@ -2191,6 +2277,23 @@ def test_isp_layout(qt, soc):
         check('IVDC: nothing to dequeue', qt.readl(ch0 + empty) & 1, 1)
         check('IVDC: painted into its store',
               36 <= qt.read(0x80000000 + 12 * w, 1)[0] <= 50, True)
+        # the IVDC's registers (0x13200000, core INTC 13): its reset
+        # self-clears, and each picture into the store is an ISP frame
+        # start and frame done, under ivdc_core_ops_init's enable mask
+        IVDC = 0x13200000
+        qt.writel(IVDC + 0x00, 1)
+        check('IVDC: the reset bit reads back 0', qt.readl(IVDC + 0x00), 0)
+        check('IVDC: ISP frame start and done (bits 17, 16)',
+              qt.readl(IVDC + 0x44) & 0x30000, 0x30000)
+        check('IVDC: masked, no interrupt',
+              (qt.readl(CORE_INTC + 0x00) >> 13) & 1, 0)
+        qt.writel(IVDC + 0x40, 0x244FC0FF)
+        check('IVDC: enabled, core INTC 13 pending',
+              (qt.readl(CORE_INTC + 0x00) >> 13) & 1, 1)
+        qt.writel(IVDC + 0x54, qt.readl(IVDC + 0x44))
+        check('IVDC: status cleared through 0x54, the line drops',
+              (qt.readl(IVDC + 0x44), (qt.readl(CORE_INTC + 0x00) >> 13) & 1),
+              (0, 0))
 
 
 def test_isp_apical(qt, soc='t20'):
@@ -2458,6 +2561,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp_stats(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31,sensor=gc2053')
+        test_isp_xstats(qt)
         qt.close()
         qt = QTest(a.qemu, 't21,sensor=jxf37')
         test_isp_stats_t21(qt)

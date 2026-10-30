@@ -17,11 +17,13 @@
 #     and its RTSP stream (rtsp://<ip>:8554/main, live555) is pulled with
 #     ffmpeg through a hostfwd, decoded with -err_detect explode and its
 #     first and last pictures checked against the ISP model's scene
-#     (ingenic-isp-check.py).  IVDC, the ISP-to-encoder direct path the
-#     T41 start_param asks for, is not modelled: the test rebuilds the root
-#     with one line in rcS that writes /tmp/start_param (which start.sh
-#     prefers) without direct_mode, so the application takes its frames
-#     from memory;
+#     (ingenic-isp-check.py).  T41's start_param asks for IVDC, the
+#     ISP-to-encoder direct path, and gets it; with --no-direct-mode the
+#     test rebuilds the root with one line in rcS that writes
+#     /tmp/start_param (which start.sh prefers) without direct_mode, so
+#     the application takes its frames from memory instead.  In direct
+#     mode the IVDC's own counters (/proc/jz/isp/isp-ivdc) must show ISP
+#     frames;
 #   - a reboot cycle: "reboot" over telnet, the kernel resets through the
 #     TCU watchdog, and the SPL, U-Boot and the login prompt come back.
 #
@@ -52,7 +54,7 @@ FFMPEG=
 TIMEOUT=600
 REBOOT=1
 RTSP=1
-DIRECT=
+DIRECT=1
 OUT=
 GUEST_IP=193.169.4.151
 
@@ -69,6 +71,7 @@ while [ $# -gt 0 ]; do
     --no-reboot) REBOOT= ;;
     --no-rtsp) RTSP= ;;
     --direct-mode) DIRECT=1 ;;
+    --no-direct-mode) DIRECT= ;;
     --out) OUT=$2; shift ;;
     --guest-ip) GUEST_IP=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -159,8 +162,8 @@ echo "   bootargs: $BOOTARGS"
 # The images' app_init.sh set different static addresses (193.169.4.151,
 # 10.3.33.235) and live in the compressed JFFS2; rcS (in the SquashFS)
 # runs a copy with the ifconfig / route lines at the test's address.  With
-# a sensor it also writes /tmp/start_param (start.sh prefers it) without
-# direct_mode: IVDC is not modelled, frames go through memory.
+# a sensor and --no-direct-mode it also writes /tmp/start_param (start.sh
+# prefers it) without direct_mode, so that frames go through memory.
 read -r ROOTOFF ROOTSIZE <<< "$(python3 - "$BOOTARGS" <<'PY'
 import re, sys
 m = re.search(r'mtdparts=[^:]*:(\S+)', sys.argv[1])
@@ -194,7 +197,7 @@ sed -e 's/^ifconfig eth0 [0-9.]*/ifconfig eth0 %s/' \\
 chmod +x /tmp/app_init.sh
 """ % (ip, gw)
 if ivdc:
-    new += """# qemu: IVDC (direct_mode) is not modelled; frames go through memory
+    new += """# qemu: no IVDC (direct_mode); frames go through memory
 sed -e 's/ direct_mode=1//' -e 's/ ivdc_mem_line=[0-9]*//' \\
     -e 's/--dm 1/--dm 0/' /system/init/start_param > /tmp/start_param
 """
@@ -299,6 +302,16 @@ if telnet "grep -c ^processor /proc/cpuinfo" "ifconfig eth0 | grep 'inet addr'" 
     [ "$n" = "$CORES" ] && pass "$n CPU(s) in /proc/cpuinfo" || bad "CPUs in /proc/cpuinfo: $n, want $CORES"
     grep -q "inet addr:$GUEST_IP" "$OUT/telnet.log" && pass "eth0 is $GUEST_IP" || bad "eth0 address"
     echo "    sinfo: $(sed -n '/^### cat/{n;p}' "$OUT/telnet.log")"
+    if [ -n "$DIRECT" ] && [ -n "$APP" ] && [ "$SOC" = t41 ] &&
+            telnet "cat /proc/jz/isp/isp-ivdc" "grep -i 'ivdc\|jpeg\|isp' /proc/interrupts" \
+                > "$OUT/ivdc.log" 2>&1; then
+        fd=$(sed -n 's/.*ISP Frame Done *: *\([0-9]*\).*/\1/p' "$OUT/ivdc.log" | head -1)
+        fs=$(sed -n 's/.*ISP Frame Start *: *\([0-9]*\).*/\1/p' "$OUT/ivdc.log" | head -1)
+        er=$(sed -n 's/.*\(Overflow\|Err\) *: *\([0-9]*\).*/\2/p' "$OUT/ivdc.log" | awk '{s+=$1} END{print s+0}')
+        [ "${fd:-0}" -gt 0 ] && [ "$er" = 0 ] &&
+            pass "IVDC: $fs ISP frame starts, $fd frame dones, no errors" ||
+            bad "IVDC counters (frame done ${fd:-?}, errors $er)"
+    fi
 else
     bad "telnet login as root"; sed 's/^/    /' "$OUT/telnet.log"
 fi

@@ -192,6 +192,27 @@ static int save(int ch, int fd, const unsigned char *p, unsigned size)
     return 0;
 }
 
+#ifdef SNAP_AF
+/*
+ * The AF statistics' sharpness metric, sampled while the AE settles: the
+ * kernel's AF reads the zones the model fills from the scene
+ */
+static void *af_watch(void *arg)
+{
+    int i;
+
+    for (i = 0; i < 12; i++) {
+        unsigned int metric = 0;
+
+        usleep(500 * 1000);
+        if (IMP_ISP_Tuning_GetAFMetrices(&metric) == 0) {
+            printf("isp-snap: af metric %u\n", metric);
+        }
+    }
+    return NULL;
+}
+#endif
+
 static void *grab(void *arg)
 {
     int k = (int)(long)arg, ch = chn_id[k], i;
@@ -397,6 +418,14 @@ int main(int argc, char **argv)
         }
     }
     printf("streaming\n");
+#ifdef SNAP_AF
+    {
+        pthread_t af;
+
+        pthread_create(&af, NULL, af_watch, NULL);
+        pthread_detach(af);
+    }
+#endif
     for (ch = 0; ch < 2; ch++) {
         pthread_create(&tid[ch], NULL, grab, (void *)(long)ch);
     }
