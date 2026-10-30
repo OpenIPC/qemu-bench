@@ -1056,6 +1056,12 @@ static void ingenic_init(MachineState *ms)
         /* T10's VIC has its control at 0x20 */
         qdev_prop_set_uint32(dev, "vic-ctrl",
                              info->soc == INGENIC_T10 ? 0x20 : 0);
+        object_property_add_child(OBJECT(ims), "isp", OBJECT(dev));
+        if (ims->sensor_dev) {
+            /* the exposure the AE programs lights the picture */
+            object_property_set_link(OBJECT(dev), "sensor",
+                                     OBJECT(ims->sensor_dev), &error_abort);
+        }
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, info->isp_base);

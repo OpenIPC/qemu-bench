@@ -77,6 +77,8 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "ingenic-isp-paint.h"
+#include "hw/i2c/hisi-soi.h"
+#include "hw/i2c/ingenic-sensor.h"
 #include "qom/object.h"
 
 #define TYPE_INGENIC_ISP_APICAL "ingenic-isp-apical"
@@ -138,6 +140,10 @@ struct IngenicIspApicalState {
     uint32_t fps;
     uint32_t vic_ctrl;          /* the VIC's control register */
     bool trace;
+    bool trace_core;
+    uint32_t light;             /* the scene's light, percent */
+    uint32_t light_r, light_b;  /* its colour, per mille of G */
+    Object *sensor;             /* the image sensor, for its exposure */
 
     uint32_t core[CORE_SIZE / 4];
     uint32_t vic[VIC_SIZE / 4];
@@ -237,10 +243,146 @@ static void apical_frame_start(void *opaque)
               apical_period(s));
 }
 
+/* --- the scene's light, AE and AWB statistics ------------------------------ */
+
+/*
+ * The firmware's AE takes a 256-bin histogram of the frame and its AWB
+ * 15 x 15 zone averages, both read straight from core registers by the
+ * interrupt that announces them (the same in tx-isp-t10.ko, -t20.ko and
+ * the T30 SDK's -t30.ko, with symbols; apical_fw_interrupts_init has slot
+ * 3 on event 11 for apical_interrupt_ae_stats and slot 4 on event 9 for
+ * apical_interrupt_awb_stats):
+ *
+ *   0x10000 + 4 b   bin b, b = 0..255 (ae_read_full_histogram_data): a
+ *                   12-bit mantissa m in [11:0] and an exponent e in
+ *                   [15:12], the count m for e = 0, else (m | 0x1000) <<
+ *                   (e - 1)
+ *   0x8740 + 8 z    zone z, z = 0..224 row by row (awb_read_statistics,
+ *                   225 zones from AWB_fsm_clear): R/G in [11:0] and B/G
+ *                   in [27:16], 1.0 = 256, of the zone's raw pixels before
+ *                   the white balance; +4 the zone's weight (pixel count)
+ *
+ * The histogram counts the frame's pixels by their linear raw level,
+ * the scene lit as the sensor's exposure says (as ingenic-isp.c does it:
+ * rows x gain over 1000 rows at 1.0, times "light"); the zones' colour is
+ * the painted RGB under a light whose white reads R "light-r" and B
+ * "light-b" per mille of G.
+ */
+#define APICAL_HIST     0x10000
+#define APICAL_AWB      0x8740
+#define APICAL_ZONES    15
+#define EV_AE_STATS     11
+#define EV_AWB_STATS    9
+#define EXPOSURE_1X     (1000ull * 1024)
+
+static uint32_t apical_gain(IngenicIspApicalState *s)
+{
+    uint64_t g = (uint64_t)s->light * 256 / 100, level = 0;
+    IngenicSensorExposure e;
+    HisiSoiExposure soi;
+
+    if (s->sensor) {
+        if (ov2735_exposure(s->sensor, &e)) {
+            level = (uint64_t)e.lines * e.gain;
+        } else if (hisi_soi_exposure(s->sensor, &soi)) {
+            level = (uint64_t)soi.lines * soi.gain;
+        }
+    }
+    if (level) {
+        g = g * level / EXPOSURE_1X;
+    }
+    return MIN(MAX(g, 1), 256 * 64);
+}
+
+static uint32_t apical_hist_word(uint64_t v)
+{
+    int e = 0;
+
+    if (v < 0x1000) {
+        return v;
+    }
+    while ((v >> e) >= 0x2000 && e < 14) {
+        e++;
+    }
+    return (e + 1) << 12 | ((v >> e) & 0xFFF);
+}
+
+static void apical_stats(IngenicIspApicalState *s, uint32_t w, uint32_t h,
+                         uint32_t gain)
+{
+    uint64_t hist[256] = { 0 };
+    double k = gain / 256.0;
+    int zx, zy, i, j;
+    uint64_t sum = 0, n = 0;
+
+    for (zy = 0; zy < APICAL_ZONES; zy++) {
+        for (zx = 0; zx < APICAL_ZONES; zx++) {
+            double rgb[3] = { 0, 0, 0 };
+            uint64_t pix = (uint64_t)(w / APICAL_ZONES) * (h / APICAL_ZONES);
+            uint32_t rg, bg;
+
+            for (j = 0; j < 6; j++) {
+                for (i = 0; i < 8; i++) {
+                    int x = (zx * 8 + i) * w / (APICAL_ZONES * 8) +
+                            w / (APICAL_ZONES * 16);
+                    int y = (zy * 6 + j) * h / (APICAL_ZONES * 6) +
+                            h / (APICAL_ZONES * 12);
+                    uint8_t yuv[3];
+                    double yn, cb, cr, c[3];
+                    int l, ch;
+
+                    sstar_pattern_pixel(s->frame, w, h, x, y, yuv);
+                    l = lround(MIN(isp_lin(yuv[0]) * k, 1) * 255);
+                    hist[l] += pix;
+                    sum += l;
+                    n++;
+                    yn = (yuv[0] - 16) / 219.0;
+                    cb = (yuv[1] - 128) / 224.0;
+                    cr = (yuv[2] - 128) / 224.0;
+                    c[0] = (yn + 1.402 * cr) * s->light_r / 1000;
+                    c[1] = yn - 0.344 * cb - 0.714 * cr;
+                    c[2] = (yn + 1.772 * cb) * s->light_b / 1000;
+                    for (ch = 0; ch < 3; ch++) {
+                        rgb[ch] += MIN(pow(MIN(MAX(c[ch], 0), 1), 2.2) * k,
+                                       1);
+                    }
+                }
+            }
+            /* a zone with no green (black) reads neutral */
+            rg = rgb[1] > 1e-3 ? MIN(lround(256 * rgb[0] / rgb[1]), 0xFFF)
+                               : 256;
+            bg = rgb[1] > 1e-3 ? MIN(lround(256 * rgb[2] / rgb[1]), 0xFFF)
+                               : 256;
+            CORE(APICAL_AWB + 8 * (zy * APICAL_ZONES + zx)) = bg << 16 | rg;
+            CORE(APICAL_AWB + 8 * (zy * APICAL_ZONES + zx) + 4) =
+                MIN(pix, 0xFFFF);
+        }
+    }
+    for (i = 0; i < 256; i++) {
+        CORE(APICAL_HIST + 4 * i) = apical_hist_word(hist[i] / 48);
+    }
+    apical_event(s, EV_AE_STATS);
+    apical_event(s, EV_AWB_STATS);
+    if (s->trace) {
+        qemu_log("ingenic-isp-apical: frame %u stats gain %u/256 mean %u "
+                 "zone0 %08x\n", s->frame, gain,
+                 n ? (unsigned)(sum / n) : 0, CORE(APICAL_AWB));
+    }
+}
+
 static void apical_frame_end(void *opaque)
 {
     IngenicIspApicalState *s = opaque;
+    uint32_t gain = apical_gain(s);
+    uint32_t fr = 0;
     int n;
+
+    /* the statistics see the frame at the first enabled writer's size */
+    for (n = NUM_CH - 1; n >= 0; n--) {
+        if (CORE(WR(n) + WR_FMT) & WR_FMT_EN) {
+            fr = CORE(WR(n) + WR_SIZE);
+        }
+    }
 
     for (n = 0; n < NUM_CH; n++) {
         IngenicIspApicalWriter *w = &s->wr[n];
@@ -258,7 +400,7 @@ static void apical_frame_end(void *opaque)
         ingenic_isp_paint(&s->paint, s->frame, wd, ht,
                           (int32_t)CORE(WR(n) + WR_STRIDE),
                           (int32_t)CORE(WR(n) + WR_UV + WR_STRIDE), ya, uva,
-                          (fmt & 0xFF) == 0x8D, 256);
+                          (fmt & 0xFF) == 0x8D, gain);
         w->last = w->cur;
         w->active = false;
         apical_event(s, ch_done_event[n]);
@@ -267,6 +409,9 @@ static void apical_frame_end(void *opaque)
                      "0x%08x/0x%08x\n", s->frame, n, wd, ht, w->cur,
                      (uint32_t)ya, (uint32_t)uva);
         }
+    }
+    if ((fr & 0xFFFF) && (fr >> 16)) {
+        apical_stats(s, fr & 0xFFFF, fr >> 16, gain);
     }
     apical_event(s, EV_FRAME_END);
     apical_event(s, EV_DS1_END);
@@ -310,9 +455,10 @@ static void apical_core_write(void *opaque, hwaddr off, uint64_t val,
     hwaddr r;
     int n = apical_writer(off, &r);
 
-    if (s->trace && n >= 0) {
-        qemu_log("ingenic-isp-apical: [0x%04x] = 0x%08x\n", (unsigned)off,
-                 (uint32_t)val);
+    if ((s->trace && n >= 0) ||
+        (s->trace_core && s->core[off >> 2] != val)) {
+        qemu_log("ingenic-isp-apical: frame %u [0x%04x] = 0x%08x\n",
+                 s->frame, (unsigned)off, (uint32_t)val);
     }
     if (off == CORE_STA) {
         return;
@@ -473,6 +619,19 @@ static void apical_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     s->start_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apical_frame_start, s);
     s->end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apical_frame_end, s);
+    object_property_add_link(obj, "sensor", TYPE_DEVICE, &s->sensor,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    /* the scene's light, percent, and its colour; qom-set while running */
+    s->light = 100;
+    s->light_r = 550;
+    s->light_b = 600;
+    object_property_add_uint32_ptr(obj, "light", &s->light,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "light-r", &s->light_r,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "light-b", &s->light_b,
+                                   OBJ_PROP_FLAG_READWRITE);
 }
 
 static const VMStateDescription vmstate_apical_writer = {
@@ -513,6 +672,7 @@ static const Property apical_properties[] = {
     DEFINE_PROP_UINT32("fps", IngenicIspApicalState, fps, 25),
     DEFINE_PROP_UINT32("vic-ctrl", IngenicIspApicalState, vic_ctrl, 0),
     DEFINE_PROP_BOOL("trace", IngenicIspApicalState, trace, false),
+    DEFINE_PROP_BOOL("trace-core", IngenicIspApicalState, trace_core, false),
 };
 
 static void apical_class_init(ObjectClass *oc, const void *data)
