@@ -311,32 +311,79 @@ CPM_SRBC, INTC_ISR = 0x100000C4, 0x10001000
 CHAIN, SRC, BS = 0x01000000, 0x01100000, 0x01400000
 
 
-def chain(q, regs):
+def chain(q, regs, write=None):
     words = []
     for i, (r, v) in enumerate(regs):
         words += [v, VLD | (TERM if i == len(regs) - 1 else 0) | r]
-    q.write(CHAIN, b''.join(w.to_bytes(4, 'little') for w in words))
+    data = b''.join(w.to_bytes(4, 'little') for w in words)
+    if write:
+        write(VA, data)
+    else:
+        q.write(CHAIN, data)
+
+
+# The engines' TLB: a DMMU table (libdmmu.c) mapping NPAGES of virtual
+# space at VA onto pages of POOL in reverse order, so that nothing works
+# unless every access is translated page by page.
+PT, POOL, VA, NPAGES = 0x01800000, 0x01A00000, 0x40000000, 0x60
+VSRC, VBS = VA + 0x1000, VA + 0x30000
+
+
+def tlb_setup(q):
+    pgd = bytearray(4096)
+    pgd[4 * (VA >> 22):4 * (VA >> 22) + 4] = (PT + 0x1000 | 1).to_bytes(4,
+                                                                       'little')
+    pte = bytearray(4096)
+    for i in range(NPAGES):
+        pte[4 * i:4 * i + 4] = (POOL + (NPAGES - 1 - i) * 0x1000 |
+                                1).to_bytes(4, 'little')
+    q.write(PT, bytes(pgd))
+    q.write(PT + 0x1000, bytes(pte))
+
+    def phys(va):
+        return POOL + (NPAGES - 1 - ((va - VA) >> 12)) * 0x1000 + (va & 0xfff)
+
+    def write(va, data):
+        while data:
+            k = min(len(data), 0x1000 - (va & 0xfff))
+            q.write(phys(va), data[:k])
+            va, data = va + k, data[k:]
+
+    def read(va, n):
+        out = b''
+        while n:
+            k = min(n, 0x1000 - (va & 0xfff))
+            out += q.read(phys(va), k)
+            va, n = va + k, n - k
+        return out
+    return write, read
 
 
 def intc_level(q, src):
     return (q.readl(INTC_ISR + 0x20 * (src >> 5)) >> (src & 31)) & 1
 
 
-def run_task(q, base, src, taskrg, radix, check):
-    """the kernel's reset, start and wait; returns the byte count"""
+def run_task(q, base, src, taskrg, radix, check, tlb=0):
+    """the kernel's reset, start and wait; returns the byte count.  With
+    tlb, the TLB's enables (GLBC bits / RADIX TLBE) and the table at PT,
+    and the chain at VA"""
     stp, ack, sr = (27, 26, 28) if radix else (30, 29, 31)
     q.writel(CPM_SRBC, 1 << stp)
     check(q.readl(CPM_SRBC) & (1 << ack), 'SRBC acknowledges the stop request')
     q.writel(CPM_SRBC, (1 << stp) | (1 << sr))
     q.writel(CPM_SRBC, 0)
+    start = VA if tlb else CHAIN
     if radix:
+        q.writel(base + 0x10, PT if tlb else 0)    # TLB_TBA
+        q.writel(base + 0x1C, tlb)                 # TLBE
         q.writel(base + 0x00, 0xffff | 0x0f000000)  # GLB_CTRL: INTE
-        q.writel(base + 0x08, CHAIN | 1)            # ACM_CTRL: run
+        q.writel(base + 0x08, start | 1)            # ACM_CTRL: run
         stat, end = base + 0x40, 1 << 8
     else:
+        q.writel(base + 0x30, PT if tlb else 0)    # SCH_TLBA
         q.writel(base + 0x00, (1 << 9) | (1 << 29) | (1 << 20) | (1 << 17) |
-                 (1 << 16))                          # GLBC: HIAXI, INTE
-        q.writel(base + taskrg, CHAIN | 1)
+                 (1 << 16) | tlb)                    # GLBC: HIAXI, INTE
+        q.writel(base + taskrg, start | 1)
         stat, end = base + 0x34, 1
     check(not q.readl(stat) & end and not intc_level(q, src),
           'nothing done at the start')
@@ -355,9 +402,10 @@ def run_task(q, base, src, taskrg, radix, check):
 
 
 def decode(ffmpeg, path, pix='yuv420p'):
+    # the stream on stdin: a docker ffmpeg need not see this host's files
     r = subprocess.run([ffmpeg, '-v', 'error', '-err_detect', 'explode',
-                        '-i', path, '-f', 'rawvideo', '-pix_fmt', pix, '-'],
-                       capture_output=True)
+                        '-i', '-', '-f', 'rawvideo', '-pix_fmt', pix, '-'],
+                       input=open(path, 'rb').read(), capture_output=True)
     err = '\n'.join(l for l in r.stderr.decode(errors='replace').splitlines()
                     if not l.startswith('docker:'))
     return r.stdout, err
@@ -422,6 +470,26 @@ def main():
                   'JPEG done (JPGC_STAT end, SCH_STAT JPGEND)')
             jpeg = jpeg_header(w, h, ql, qc) + q.read(BS, jst & 0xffffff) + \
                 b'\xff\xd9'
+            # the same JPEG through the TLB: EFE, JPGC and VDMA translated
+            vwrite, vread = tlb_setup(q)
+            vwrite(VSRC, y + uv)
+            vregs = [r for r in regs[:-5]] + [
+                (0xE000C, VBS), (0x40004, ((mbh - 1) << 16) | (mbw - 1)),
+                (0x40010, VSRC), (0x40014, VSRC + w * h),
+                (0x40038, (w << 16) | w), (0x40000, 0x400b)]
+            chain(q, vregs, vwrite)
+            tlbe = (1 << 26) | (1 << 23) | (1 << 22)    # JPGC, EFE, VDMA
+            run_task(q, base, src, taskrg, False, lambda c, m: None, tlbe)
+            vn = q.readl(base + 0xE0008) & 0xffffff
+            check(vread(VBS, vn) == q.read(BS, jst & 0xffffff),
+                  'JPEG through the TLB (pages reversed): the same %d bytes'
+                  % vn)
+            check(not q.readl(base + 0x34) & (1 << 10), 'no TLB error')
+            # an unmapped page: a TLB error, nothing written
+            q.write(PT + 0x1000, bytes(4096))
+            run_task(q, base, src, taskrg, False, lambda c, m: None, tlbe)
+            check(q.readl(base + 0x34) & (1 << 10),
+                  'an unmapped chain: SCH_STAT TLB error')
             if soc == 't30':
                 print('== t30: H.265 (RADIX)')
                 hevc = HEVC_PS
@@ -441,7 +509,22 @@ def main():
                     n = run_task(q, RADIX, RADIX_SRC, 0, True,
                                  check if f == 0 else lambda c, m: None)
                     check(0 < n < 0x100000, 'H.265 frame %d: %d bytes' % (f, n))
+                    if f == 0:
+                        idr0, y0, uv0 = q.read(BS, n), y, uv
                     hevc += hevc_slice(idr, f, qp, q.read(BS, n))
+                # the IDR picture again through RADIX's TLB
+                vwrite, vread = tlb_setup(q)
+                vwrite(VSRC, y0 + uv0)
+                chain(q, [(0x20000, 0xc28), (0x20004, (360 << 16) | 640),
+                          (0x2000C, VSRC), (0x20010, VSRC + 640 * 360),
+                          (0x20014, (640 << 16) | 640),
+                          (0x20040, (37 << 24) | (12 << 16) | (27 << 8) | 0x40),
+                          (0x68000, (27 << 5) | 0x18),
+                          (0x68008, VBS), (0x08008, 0)], vwrite)
+                vn = run_task(q, RADIX, RADIX_SRC, 0, True, lambda c, m: None,
+                              (1 << 16) | (1 << 17) | (1 << 21))
+                check(vread(VBS, vn) == idr0,
+                      'H.265 IDR through RADIX\'s TLB: the same %d bytes' % vn)
         finally:
             q.close()
         files = [('%s.h264' % soc, stream, w, h, frames, 'yuv420p', 40),

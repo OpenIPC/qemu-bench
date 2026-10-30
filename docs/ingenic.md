@@ -514,9 +514,24 @@ slice headers agree with the slices. libimp's x264 port is CABAC-only
 (`i264e_init` refuses CAVLC). The ~40 statistics registers libimp reads
 back after a task read what its chain left there.
 
+The engines' TLB: libimp addresses the engines physically, but the
+driver can hand a process its DMMU table (`IOCTL_CHANNEL_PRIVATE_TLB`,
+`libdmmu.c`), and with a table base set and a unit's enable on, that
+unit's addresses are virtual: a 4 KiB page directory indexed by VA bits
+31:22 whose entries (bit 0 valid) point to 1024-entry page tables
+indexed by bits 21:12 (bit 0 valid, the physical page in 31:12). HELIX
+and the VPU take the base at SCH_TLBA (0x30) and the enables in GLBC
+(bits 26..21: JPGC, DBLK, SDE, EFE, VDMA, MCE; bit 30 all of them on the
+older layout); RADIX at CFGC 0x10 and 0x1C (bits 16..21: EFE, VDMA, ODMA,
+DBLK, MCE, SDE). The model translates the EFE's source reads, the SDE /
+JPGC bitstream writes and the VDMA chain a page at a time; an unmapped
+page logs a TLB error, reads as zero, drops writes and, on HELIX / the
+VPU, sets SCH_STAT bit 10.
+
 `qemu/tests/test-ingenic-vpu.py` plays the driver and libimp at register
 level on every SoC (H.264, JPEG, H.265 on T30) and decodes the result
-with ffmpeg; `qemu/tests/test-ingenic-vpu-feed.py` runs libimp's own
+with ffmpeg, and runs the JPEG (and T30's H.265 IDR picture) again
+through the TLB, over pages laid out in reverse, for the same bytes; `qemu/tests/test-ingenic-vpu-feed.py` runs libimp's own
 encoders (`i264e_*`, `i265e_*`, `ijpege_*`; `qemu/tests/ingenic-vpu-feed.c`)
 from a picture in memory on the OpenIPC kernel and rootfs of each SoC; `qemu/tests/test-ingenic-vpu-e2e.sh` runs the
 SDK samples' FrameSource -> `IMP_Encoder` path on T21 with the ISP model
@@ -1227,8 +1242,7 @@ T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), T40's third sensor (VIC2) and the dual mode's
 raw caching through VIC MDMA, the T40/T41 AWB records' split (their
 pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
-AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
-addresses the engine physically), the DMIC's voice
+AF and the zone statistics beyond AE and AWB, the DMIC's voice
 trigger, PDMA
 transfers for peripherals other than the AIC, the SSI and the DES, the
 SSI slave and the HASH engine's CPU mode (no driver in any tree here, so
