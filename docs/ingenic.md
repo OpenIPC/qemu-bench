@@ -831,9 +831,17 @@ AE settled at a linear mean of 2 of 255 -- too dark to see the scene --
 whatever the light; its target is a table in the sensor's tuning file,
 so the zone sums are given at a quarter scale, a calibration rather than
 something read off the module, and the AE settles at 7 (T31: 10) with
-the light at 10 %, 100 % or 1000 %. Its AWB reads the zones but keeps
-the gains it starts with (R 2.28 / B 1.16, register 0x604 / 0x608) under
-any light colour; why is not known.
+the light at 10 %, 100 % or 1000 %. Its AWB barely follows the light's
+colour (R 2204 / 2260 / 2336 per 1024 under a warm light, daylight and
+a cool one; B stays at 1192). What is known (`Tiziano_awb_fpga`, read
+in a running guest through QEMU's gdbstub): the AWB runs in its
+automatic mode (mode 0, not frozen) and reads the zones as written;
+it skips its update when the zone statistics change less than a
+threshold from the frame before (0xfa28-0xfa44), so with this static
+scene it only runs while the AE settles; and its colour-temperature
+detector (`Tiziano_Awb_Ct_Detect`) settles on a B/G of 193 (Q8) whatever
+the light, which the static gains in the tuning file (1526 / 1583)
+turn into the register values. That detector is not read off.
 
 `-global ingenic-isp.trace=on` logs the MSCA and 3A register writes and
 each frame with its light, mean luma and white-balance gains; `-global
