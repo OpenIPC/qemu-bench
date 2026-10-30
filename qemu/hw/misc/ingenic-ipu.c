@@ -30,7 +30,7 @@
  *       OFSET_PARA = Y offset | UV offset << 16.
  *   CSC (cmd IPU_CMD_CSC): the NV12 background converted to NV21
  *     (D_FMT [2:0] = 3) or to 32-bit RGB (D_FMT 0x40, BGRA bytes) at
- *     OUT_ADDR.  The HSV output is not modelled (left untouched).
+ *     OUT_ADDR, or to HSV (D_FMT 0x4: three planes, ipu_csc_hsv()).
  *
  * TRIGGER (0x74) bit 3 resets the unit: every register to 0 (the driver
  * resets before it programs an operation, and writes only the channels
@@ -76,6 +76,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicIpuState, INGENIC_IPU)
 #define R_OUT_ADDR      0x024
 #define R_OUT_STRIDE    0x02C
 #define R_OUT_V_ADDR    0x030
+#define R_OUT_V_STRIDE  0x034
 #define R_TRIGGER       0x074
 #define R_GLB_CTRL      0x07C
 #define R_NV_OUT_ADDR   0x0B4
@@ -428,6 +429,64 @@ static void ipu_osd(IngenicIpuState *s, int w, int h)
 }
 
 /* the conversion mode: NV12 -> NV21 or 32-bit BGRA */
+/*
+ * NV12 to HSV in three planes (the driver's _ipu_set_bg_buffer for
+ * HAL_PIXEL_FORMAT_HSV, libimp's ipu_csc_nv12_to_hsv, the T23 SDK's
+ * sample-EXTFS-Encoder-h264.c): H, 16 bits a pixel, at NV_OUT_ADDR
+ * (stride NV_OUT_STRIDE, 2 w); S at OUT_ADDR (OUT_STRIDE, w) and V at
+ * OUT_V_ADDR (OUT_V_STRIDE, w), a byte each.  H is in degrees, 0..359;
+ * S and V are 0..255 -- the usual scales, not confirmed on silicon.
+ */
+static void ipu_csc_hsv(IngenicIpuState *s, int w, int h, uint8_t *yl,
+                        uint8_t *uvl)
+{
+    hwaddr ya = R(s, R_Y_ADDR), uva = R(s, R_U_ADDR);
+    hwaddr ha = R(s, R_NV_OUT_ADDR), sa = R(s, R_OUT_ADDR);
+    hwaddr va = R(s, R_OUT_V_ADDR);
+    uint32_t ys = R(s, R_Y_STRIDE), uvs = R(s, R_UV_STRIDE) >> 16;
+    uint32_t hs = R(s, R_NV_OUT_STRIDE), ss = R(s, R_OUT_STRIDE);
+    uint32_t vs = R(s, R_OUT_V_STRIDE);
+    g_autofree uint16_t *hl = g_new(uint16_t, w);
+    g_autofree uint8_t *sl = g_malloc(w), *vl = g_malloc(w);
+    int x, y;
+
+    ys = ys ? ys : w;
+    uvs = uvs ? uvs : w;
+    hs = hs ? hs : 2 * w;
+    ss = ss ? ss : w;
+    vs = vs ? vs : w;
+    for (y = 0; y < h; y++) {
+        ipu_read(ya + (hwaddr)y * ys, yl, w);
+        ipu_read(uva + (hwaddr)(y / 2) * uvs, uvl, (w + 1) & ~1);
+        for (x = 0; x < w; x++) {
+            int c = (yl[x] - 16) * 1192;
+            int d = uvl[x & ~1] - 128, e = uvl[(x & ~1) + 1] - 128;
+            int r = clamp255((c + 1634 * e) >> 10);
+            int g = clamp255((c - 401 * d - 833 * e) >> 10);
+            int b = clamp255((c + 2066 * d) >> 10);
+            int mx = MAX(r, MAX(g, b)), mn = MIN(r, MIN(g, b));
+            int dl = mx - mn, hue = 0;
+
+            if (dl) {
+                if (mx == r) {
+                    hue = 60 * (g - b) / dl;
+                } else if (mx == g) {
+                    hue = 120 + 60 * (b - r) / dl;
+                } else {
+                    hue = 240 + 60 * (r - g) / dl;
+                }
+                hue = (hue + 360) % 360;
+            }
+            hl[x] = cpu_to_le16(hue);
+            sl[x] = mx ? 255 * dl / mx : 0;
+            vl[x] = mx;
+        }
+        ipu_write(ha + (hwaddr)y * hs, (uint8_t *)hl, 2 * w);
+        ipu_write(sa + (hwaddr)y * ss, sl, w);
+        ipu_write(va + (hwaddr)y * vs, vl, w);
+    }
+}
+
 static void ipu_csc(IngenicIpuState *s, int w, int h)
 {
     uint32_t dfmt = R(s, R_D_FMT);
@@ -468,7 +527,7 @@ static void ipu_csc(IngenicIpuState *s, int w, int h)
         return;
     }
     if (dfmt & 4) {
-        qemu_log_mask(LOG_UNIMP, "ingenic-ipu: HSV output\n");
+        ipu_csc_hsv(s, w, h, yl, uvl);
         return;
     }
     oys = oys ? oys : w * 4;
