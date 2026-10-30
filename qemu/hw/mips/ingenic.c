@@ -927,6 +927,12 @@ static void ingenic_init(MachineState *ms)
                                  &error_abort);
         object_property_set_uint(OBJECT(dev), "l1-kib", info->l1_kib,
                                  &error_abort);
+        /*
+         * No hidden tlbwr shadow entries: on two cores the T40/T41 4.4
+         * kernel otherwise leaves a user page translated to stale data
+         */
+        object_property_set_bool(OBJECT(dev), "tlb-shadow", false,
+                                 &error_abort);
         /* the CCU releases the second core */
         object_property_set_bool(OBJECT(dev), "start-powered-off", i > 0,
                                  &error_abort);
