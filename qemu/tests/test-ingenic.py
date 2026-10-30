@@ -1537,6 +1537,38 @@ def test_isp_stats_t21(qt):
           0 < m < 2.5, True)
     check('AWB zone: the count at bit 63, no IR field',
           isp_bits(awb, 63, 13), 64 * 36)
+    # the AWB's pixel filter, as tiziano_awb_set_hardware_param programs
+    # it from the JX-F37 tuning: R/G 100..300, B/G 70..250, R/G + B/G
+    # 220..450, luma 50..230; the navy (top left) passes none, a white
+    # under daylight (the logo's middle row) passes
+    qt.writel(AWB + 0x28, (300 << 16) | 100)
+    qt.writel(AWB + 0x2C, (250 << 16) | 70)
+    qt.writel(AWB + 0x30, (220 << 16) | 256)
+    qt.writel(AWB + 0x34, (450 << 16) | 256)
+    qt.writel(AWB + 0x38, (1 << 16) | (230 << 8) | 50)
+    qt.qom_set('/machine/isp', 'light', 400)
+    qt.step(81 * 1000 * 1000)
+    awb = qt.read(ab + 0x1000 * qt.readl(AWB + 0x50), 225 * 16)
+
+    def zone(i):
+        z = awb[16 * i:16 * i + 16]
+        return [isp_bits(z, b, 21) for b in (0, 21, 42)] + [isp_bits(z, 63, 13)]
+
+    check('filtered: the navy zone counts no quad', zone(0)[3], 0)
+    best = max(range(225), key=lambda i: zone(i)[3])
+    r, g, b, n = zone(best)
+    check('filtered: the whitest zone counts some quads', n > 0, True)
+    check('its R/G and B/G inside the windows',
+          (100 <= 256 * r // g <= 300, 70 <= 256 * b // g <= 250), (True, True))
+    # a redder light: the same zone's R/G follows it
+    qt.qom_set('/machine/isp', 'light-r', 650)
+    qt.step(81 * 1000 * 1000)
+    awb = qt.read(ab + 0x1000 * qt.readl(AWB + 0x50), 225 * 16)
+    r2, g2, b2, n2 = zone(best)
+    check('a light of R 0.65 for 0.55: that zone\'s R/G x 1.18',
+          n2 > 0 and abs((r2 / g2) / (r / g) - 650 / 550) < 0.03, True)
+    qt.qom_set('/machine/isp', 'light-r', 550)
+    qt.qom_set('/machine/isp', 'light', 100)
 
 
 def test_isp_stats_apical(qt):

@@ -833,16 +833,45 @@ bright thresholds ([7:0], [15:8]), +0x2C-0x38 four zone banks and
 twice); AWB +0x3C-0x48 four zone banks. The kernel's `ae0_weight_mean2`
 takes a zone's three sums over its width x height as its mean. Zones are
 sampled 8 x 6 from the scene, in linear light (8 bits), as a sensor's
-statistics are; the sensor's raw colour makes a white
-read R `light-r` and B `light-b` per mille of G (550, 600: daylight).
+statistics are; the light's colour scales the linear R and B, so that
+a white reads R `light-r` and B `light-b` per mille of G (550, 600: a
+daylight raw white). The AWB block sums only the quads inside the pixel
+filter `tiziano_awb_set_hardware_param` programs after the zone sizes
+(T21 0x828-0x838, T31 and T23 0xB028-0xB038): +0x28 a raw R/G window
+and +0x2C a B/G window (Q8, min in [15:0], max in [31:16]), +0x30 and
++0x34 lower and upper bounds on k R/G / 256 + B/G (k in [15:0], bound
+in [31:16]), +0x38 a luma window ([7:0] low, [15:8] high; luma taken
+as (R + 2 G + B) / 4) -- the driver's all-pass values (R/G 1..4095,
+bounds 0 and 65535) read so -- and a zone's count is of the quads that
+passed. T40 and T41 program windows of the same form at 0x18028 but
+their eight records a zone are not decoded: their quads are not
+filtered and the light's colour is applied before the 2.2 gamma there
+(a white then reads 0.27 R, 0.33 B), the calibration under which their
+AWB follows the light.
 `light`, `light-r` and `light-b` can change while running
 (`qom-set /machine/isp light 30`). The kernel's AE starts high and
 settles over a second or two -- on T31 a light of 30 % and of 100 % give
 the same picture by frame 40 (the navy at Y 39) -- and, metering linear
 light with this dark scene, exposes for the navy (Y ~90 on the T40 and
-T41 SDK images). The AWB gains follow the light's colour (T31, frame
-45: R 2.72 / B 1.27 in daylight, R 2.13 / B 1.75 under a warm light of
-R 0.9 / B 0.35). The tests that check pictures take them once the AE has
+T41 SDK images). The AWB gains follow the light's colour (per 1024,
+once settled; warm R 0.9 / B 0.35, cool R 0.45 / B 0.75):
+
+| | daylight | warm | cool |
+|---|---|---|---|
+| T21 | R 1872 / B 1700 | R 1140 / B 2740 | R 2300 / B 1372 |
+| T31 | R 1856 / B 1696 | R 1136 / B 2900 | R 2256 / B 1356 |
+| T40 | R 3276 / B 1408 | R 2284 / B 1872 | |
+| T41 | R 3332 / B 1456 | R 2416 / B 1828 | |
+
+A light outside a tuning's windows (R 0.35 / B 0.9 is below both
+R/G minima) leaves no quad to sum, and the AWB keeps its defaults, as
+it would on a camera. T23 follows the light while its AE settles
+(frame 8: R 1784 / B 1484 daylight, R 1148 / B 2388 warm, R 1984 / B
+1500 cool) and then, its AE exposing this dark scene until the white
+logo and counter clip past its luma ceiling (240) and nothing neutral
+is left inside the filter, holds its defaults (R 1728 / B 1920).
+
+The tests that check pictures take them once the AE has
 settled (`test-ingenic-isp.sh` the last frames of 40, the encoder client
 after four seconds), and `ingenic-isp-check.py` judges the logo and the
 dot against the background's level, and the dot's place by the frame
@@ -860,17 +889,21 @@ AE settled at a linear mean of 2 of 255 -- too dark to see the scene --
 whatever the light; its target is a table in the sensor's tuning file,
 so the zone sums are given at a quarter scale, a calibration rather than
 something read off the module, and the AE settles at 7 (T31: 10) with
-the light at 10 %, 100 % or 1000 %. Its AWB barely follows the light's
-colour (R 2204 / 2260 / 2336 per 1024 under a warm light, daylight and
-a cool one; B stays at 1192). What is known (`Tiziano_awb_fpga`, read
-in a running guest through QEMU's gdbstub): the AWB runs in its
-automatic mode (mode 0, not frozen) and reads the zones as written;
-it skips its update when the zone statistics change less than a
-threshold from the frame before (0xfa28-0xfa44), so with this static
-scene it only runs while the AE settles; and its colour-temperature
-detector (`Tiziano_Awb_Ct_Detect`) settles on a B/G of 193 (Q8) whatever
-the light, which the static gains in the tuning file (1526 / 1583)
-turn into the register values. That detector is not read off.
+the light at 10 %, 100 % or 1000 %. Its AWB (`Tiziano_awb_fpga`, run
+every frame -- `_AwbPointPos[1]`, the change it waits for, is 0 in the
+JX-F37 tuning) takes each zone's R/G and B/G times the tuning's static
+gains (1526 / 1583, Q10), drops the zones whose count is at most
+`_pixel_cnt_th` (25), and hands them to `Tiziano_Awb_Ct_Detect`, which
+returns the white point (Q8): a zone on the tuning's colour-temperature
+band, about R/G 180-400 against B/G 260-148, comes back as itself, one
+off it is pulled to the band's nearest end, and all zones weigh in. The
+navy background -- most of the scene, B/G over 5 -- outvoted the white
+of the logo and pinned the result at the band's blue end (R/G 167, B/G
+340) whatever the light, until the AWB block's own pixel filter (above)
+left it out, as the silicon's does: its quads fail the B/G window and
+the luma floor (50). Read off the module by running the detector on
+zones captured from a guest (gdbstub, the module's pages walked through
+`swapper_pg_dir`) in an emulator.
 
 `-global ingenic-isp.trace=on` logs the MSCA and 3A register writes and
 each frame with its light, mean luma and white-balance gains; `-global
@@ -1139,8 +1172,8 @@ and pow(), and the TCU's PWM pins.
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), T40's third sensor (VIC2) and the dual mode's
-raw caching through VIC MDMA, T21's AWB
-response (above), AE1, AF, ADR, defog and WDR statistics, the Apical
+raw caching through VIC MDMA, the T40/T41 AWB records' split (their
+pixel filter), AE1, AF, ADR, defog and WDR statistics, the Apical
 AF and the zone statistics beyond AE and AWB, the VPU's TLB (libimp
 addresses the engine physically), T41's DMIC, the DMIC's voice
 trigger, T40/T41's codec gains, PDMA

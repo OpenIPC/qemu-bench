@@ -210,6 +210,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         /* the T31 3A blocks and bits (system_irq_func_set callers) */
         .ae = 0xA000, .awb = 0xB000,
         .ae_static_bit = 26, .ae_hist_bit = 27, .awb_bit = 30, .stat_gen = 1,
+        .wb = 0x1804,                   /* Tiziano_awb_set_gain */
     }, {
         /*
          * T30's scaler (isp-m3, 0x130B0000, IRQ 27 = INTC 19): the T31
@@ -558,9 +559,13 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
  * [75:63] (tisp_ae_get_hist, JZ_Isp_Get_Awb_Statistics).
  *
  * The quads are sampled 8 x 6 a zone from the scene under the frame's
- * light, in the sensor's linear raw light (isp_lin()) and colour: a
- * white reads R "light-r" and B "light-b" per mille of G (0.55 and 0.6
- * by default, as under daylight).
+ * light, in the sensor's linear raw light (isp_lin()) and colour: the
+ * light's colour scales the linear R and B, so that a white reads R
+ * "light-r" and B "light-b" per mille of G (0.55 and 0.6 by default, a
+ * daylight raw white the T21 and T31 tunings' windows take).  T40 and
+ * T41 keep the earlier calibration, the colour applied before the 2.2
+ * gamma (a white then reads 0.55^2.2 = 0.27 R and 0.33 B), under which
+ * their AWB follows the light.
  * Each bank done raises its int_sta bit.
  */
 #define STAT_ZONES      15
@@ -606,6 +611,67 @@ static bool isp_grid(IngenicIspState *s, hwaddr blk, int *cols, int *rows,
     return xs[*cols] && ys[*rows];
 }
 
+/*
+ * The pixels the AWB block sums: tiziano_awb_set_hardware_param programs
+ * a filter after the zone sizes (T21 0x828.., T31 0xB028.., from the
+ * tuning's _awb_parameter), and only a quad inside it is summed and
+ * counted -- the count is of the quads that passed, and the AWB drops a
+ * zone whose count is at most its _pixel_cnt_th:
+ *   +0x28  raw R/G (Q8) window, [15:0] min, [31:16] max
+ *   +0x2C  raw B/G window, the same
+ *   +0x30  [15:0] k, [31:16] b: k R/G / 256 + B/G >= b
+ *   +0x34  [15:0] k, [31:16] b: k R/G / 256 + B/G <= b
+ *   +0x38  luma window, [7:0] low, [15:8] high
+ * (the driver's "everything" values -- R/G 1..4095, b 0 and 65535 --
+ * read so: its low-light and light-source cases write them).  T40 and
+ * T41 (0x18028.., tisp_awb_set_regional_threshold) program windows of
+ * the same form (R/G 60..245, B/G 30..200, sum 170..320 on the T41 SDK
+ * image; their +0x38 packs four bytes), but their zones are eight
+ * records each, whose split is not known: they are not filtered, and
+ * keep the earlier calibration of the light's colour (below).  The luma
+ * of a quad is taken as (R + 2 G + B) / 4 of its linear raw values, and
+ * a filter that is all zero (not yet programmed) passes everything.
+ */
+typedef struct AwbFilter {
+    bool on;
+    uint32_t rg_min, rg_max, bg_min, bg_max;
+    uint32_t k_lo, b_lo, k_hi, b_hi, y_lo, y_hi;
+} AwbFilter;
+
+static void awb_filter_load(IngenicIspState *s, hwaddr blk, AwbFilter *f)
+{
+    uint32_t r28 = ISP_REG(blk + 0x28), r2c = ISP_REG(blk + 0x2C);
+    uint32_t r30 = ISP_REG(blk + 0x30), r34 = ISP_REG(blk + 0x34);
+    uint32_t r38 = ISP_REG(blk + 0x38);
+
+    f->on = s->l->stat_gen != 2 && (r28 | r2c | r34 | r38);
+    f->rg_min = r28 & 0xFFFF, f->rg_max = r28 >> 16;
+    f->bg_min = r2c & 0xFFFF, f->bg_max = r2c >> 16;
+    f->k_lo = r30 & 0xFFFF, f->b_lo = r30 >> 16;
+    f->k_hi = r34 & 0xFFFF, f->b_hi = r34 >> 16;
+    f->y_lo = r38 & 0xFF, f->y_hi = (r38 >> 8) & 0xFF;
+}
+
+static bool awb_quad_valid(const AwbFilter *f, const int *q)
+{
+    uint32_t rg, bg, y;
+
+    if (!f->on) {
+        return true;
+    }
+    if (!q[1]) {
+        return false;
+    }
+    y = (q[0] + 2 * q[1] + q[2]) / 4;
+    rg = q[0] * 256 / q[1];
+    bg = q[2] * 256 / q[1];
+    return y >= f->y_lo && y <= f->y_hi &&
+           rg >= f->rg_min && rg <= f->rg_max &&
+           bg >= f->bg_min && bg <= f->bg_max &&
+           f->k_lo * rg / 256 + bg >= f->b_lo &&
+           f->k_hi * rg / 256 + bg <= f->b_hi;
+}
+
 static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                               uint32_t frame)
 {
@@ -625,6 +691,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
     bool ae = (!en_bits || (ISP_REG(ae_blk) & 1)) && ISP_REG(ae_blk + 0x2C);
     bool awb = (!en_bits || (ISP_REG(awb_blk) & 1)) && ISP_REG(awb_blk + 0x3C);
     int zx, zy, i, j, w, h;
+    AwbFilter flt;
 
     if (!ae && !awb) {
         return;
@@ -648,6 +715,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
     }
     memset(zone, 0, sizeof(zone));
     memset(hist, 0, sizeof(hist));
+    awb_filter_load(s, awb_blk, &flt);
     for (zy = 0; zy < rows; zy++) {
         for (zx = 0; zx < cols; zx++) {
             IspZone *z = &zone[zy][zx];
@@ -663,7 +731,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                              (2 * STAT_SY);
                     uint8_t yuv[3];
                     double k = gain / 256.0, yn, cb, cr, rgb[3];
-                    int y, ch;
+                    int y, ch, q[3];
 
                     sstar_pattern_pixel(frame, w, h, 2 * qx, 2 * qy, yuv);
                     /* the sensor's linear light, 8 bits */
@@ -676,15 +744,24 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                     yn = (yuv[0] - 16) / 219.0;
                     cb = (yuv[1] - 128) / 224.0;
                     cr = (yuv[2] - 128) / 224.0;
-                    rgb[0] = (yn + 1.402 * cr) * s->light_r / 1000;
+                    rgb[0] = yn + 1.402 * cr;
                     rgb[1] = yn - 0.344 * cb - 0.714 * cr;
-                    rgb[2] = (yn + 1.772 * cb) * s->light_b / 1000;
+                    rgb[2] = yn + 1.772 * cb;
                     for (ch = 0; ch < 3; ch++) {
-                        double v = pow(MIN(MAX(rgb[ch], 0), 1), 2.2) * k;
+                        double lc = ch == 0 ? s->light_r / 1000.0 :
+                                    ch == 2 ? s->light_b / 1000.0 : 1;
+                        double v = l->stat_gen == 2 ?
+                                   pow(MIN(MAX(rgb[ch] * lc, 0), 1), 2.2) * k :
+                                   pow(MIN(MAX(rgb[ch], 0), 1), 2.2) * k * lc;
 
-                        z->rgb[ch] += lround(MIN(v, 1) * 255);
+                        q[ch] = lround(MIN(v, 1) * 255);
                     }
-                    z->n++;
+                    if (awb_quad_valid(&flt, q)) {
+                        for (ch = 0; ch < 3; ch++) {
+                            z->rgb[ch] += q[ch];
+                        }
+                        z->n++;
+                    }
                 }
             }
             /* from the samples to the zone's quads */
@@ -693,7 +770,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                 z->cnt[c] = z->cnt[c] * quads / (STAT_SX * STAT_SY);
                 z->rgb[c] = z->rgb[c] * quads / (STAT_SX * STAT_SY);
             }
-            z->n = quads;
+            z->n = z->n * quads / (STAT_SX * STAT_SY);
         }
     }
     if (ae) {
