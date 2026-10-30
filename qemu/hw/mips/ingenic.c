@@ -35,6 +35,8 @@
  *              scaler at 0x130B0000, an ingenic-isp)
  *                                                hw/misc/ingenic-isp-apical.c
  *   0x13080000 IPU, interrupt 6: libimp's OSD    hw/misc/ingenic-ipu.c
+ *   0x130B0000 I2D, 45, rotation (T40, T41)     hw/misc/ingenic-i2d.c
+ *   0x130D0000 DRAWBOX, 42, OSD boxes (T40, T41) hw/misc/ingenic-drawbox.c
  *
  * XBurst2 moves the interrupt controller and timers next to the cores:
  * a global OST at 0x12000000 (the clock source), a per-core OST at
@@ -178,6 +180,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_SADC        18
 #define PWM_BASE        0x13460000  /* T41; the others use TCU channels */
 #define IRQ_IPU         6       /* Linux 14, "ipu" */
+#define I2D_BASE        0x130B0000  /* T40, T41 */
+#define DRAWBOX_BASE    0x130D0000  /* T40, T41 */
+#define IRQ_DRAWBOX     42
+#define IRQ_I2D         45
 
 /* the SPL's place in the boot ROM's world (U-Boot isvp_<soc>.h) */
 #define SPL_LOAD        0x80001000
@@ -1111,6 +1117,14 @@ static void ingenic_init(MachineState *ms)
 
     /* the IPU: libimp's OSD blender, the same block on every part */
     sysbus_create_simple("ingenic-ipu", IPU_BASE, ingenic_irq(ims, IRQ_IPU));
+
+    /* XBurst2's rotator (frame channel rotation) and OSD box drawer */
+    if (ingenic_is_xburst2(info->soc)) {
+        sysbus_create_simple("ingenic-i2d", I2D_BASE,
+                             ingenic_irq(ims, IRQ_I2D));
+        sysbus_create_simple("ingenic-drawbox", DRAWBOX_BASE,
+                             ingenic_irq(ims, IRQ_DRAWBOX));
+    }
 
     /*
      * Sound: the PDMA, and the AIC with the internal codec, which request

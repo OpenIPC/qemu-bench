@@ -18,6 +18,12 @@
  * address> also into 4 MiB slots of memory there for the host to read
  * with pmemsave: T40's SDHCI finds no card.
  *
+ * With -DENC_OSD (T41; T40 builds too) and AVPU_OSD=1 in the environment, channel 0
+ * goes through an OSD group with a red rectangle (6 pixels wide) and a
+ * green horizontal line near its bottom right corner -- drawn by the
+ * DRAWBOX through libimp's OSD -- and "osd: x y w h lx ly ll" reports
+ * where, for the host to check in the decoded pictures.
+ *
  * Built like ingenic-isp-snap.c: -DSNAP_MUSL against the rootfs's own
  * libimp.so and musl (the shims below are that file's), -DSNAP_T40 for
  * T40's IMP 1.2 sensor API; T41 adds -DSNAP_I2C_ADAPTER=0
@@ -44,6 +50,9 @@
 #include <imp/imp_isp.h>
 #include <imp/imp_framesource.h>
 #include <imp/imp_encoder.h>
+#ifdef ENC_OSD
+#include <imp/imp_osd.h>
+#endif
 
 #ifdef SNAP_MUSL
 int __libc_start_main(int (*m)(int, char **, char **), int argc, char **argv,
@@ -209,6 +218,60 @@ static void *pull(void *arg)
     return NULL;
 }
 
+#ifdef ENC_OSD
+/* OSD group 0 between FrameSource channel 0 and encoder group 0 */
+static int osd_setup(int w, int h)
+{
+    int x = w - 400, y = h - 320, lx = w - 400, ly = h - 120;
+    IMPOSDRgnAttr ra;
+    IMPOSDGrpRgnAttr ga;
+    IMPRgnHandle rect, line;
+
+    if (IMP_OSD_CreateGroup(0) < 0) {
+        return -1;
+    }
+    rect = IMP_OSD_CreateRgn(NULL);
+    line = IMP_OSD_CreateRgn(NULL);
+    if (rect < 0 || line < 0 || IMP_OSD_RegisterRgn(rect, 0, NULL) < 0 ||
+        IMP_OSD_RegisterRgn(line, 0, NULL) < 0) {
+        return -1;
+    }
+    memset(&ra, 0, sizeof(ra));
+    ra.type = OSD_REG_RECT;
+    ra.rect.p0.x = x;
+    ra.rect.p0.y = y;
+    ra.rect.p1.x = x + 256 - 1;
+    ra.rect.p1.y = y + 128 - 1;
+    ra.fmt = PIX_FMT_MONOWHITE;
+    ra.data.lineRectData.color = OSD_RED;
+    ra.data.lineRectData.linewidth = 6;
+    if (IMP_OSD_SetRgnAttr(rect, &ra) < 0) {
+        return -1;
+    }
+    memset(&ra, 0, sizeof(ra));
+    ra.type = OSD_REG_HORIZONTAL_LINE;
+    ra.line.p0.x = lx;
+    ra.line.p0.y = ly;
+    ra.data.lineRectData.color = OSD_GREEN;
+    ra.data.lineRectData.linewidth = 6;
+    ra.data.lineRectData.linelength = 256;
+    if (IMP_OSD_SetRgnAttr(line, &ra) < 0) {
+        return -1;
+    }
+    memset(&ga, 0, sizeof(ga));
+    ga.show = 1;
+    ga.layer = 1;
+    ga.scalex = 1;
+    ga.scaley = 1;
+    if (IMP_OSD_SetGrpRgnAttr(rect, 0, &ga) < 0 ||
+        IMP_OSD_SetGrpRgnAttr(line, 0, &ga) < 0 || IMP_OSD_Start(0) < 0) {
+        return -1;
+    }
+    printf("osd: %d %d 256 128 %d %d 256\n", x, y, lx, ly);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     IMPSensorInfo sensor;
@@ -271,6 +334,7 @@ int main(int argc, char **argv)
 #endif
     for (ch = 0; ch < NCHN; ch++) {
         IMPCell fs = { DEV_ID_FS, ch, 0 }, enc = { DEV_ID_ENC, ch, 0 };
+        int osd = 0;
 
         buf[ch] = malloc(CAP);
         if (IMP_FrameSource_CreateChn(ch, &attr(ch)) < 0 ||
@@ -286,9 +350,25 @@ int main(int argc, char **argv)
                                         jpeg ? 0 : 10, 2, jpeg ? 25 : 30,
                                         0) < 0 ||
             IMP_Encoder_CreateChn(ENC(ch), &ea) < 0 ||
-            IMP_Encoder_RegisterChn(ch, ENC(ch)) < 0 ||
-            IMP_System_Bind(&fs, &enc) < 0) {
+            IMP_Encoder_RegisterChn(ch, ENC(ch)) < 0) {
             printf("enc%d: setup failed\n", ch);
+            return 1;
+        }
+#ifdef ENC_OSD
+        if (ch == 0 && getenv("AVPU_OSD")) {
+            IMPCell oc = { DEV_ID_OSD, 0, 0 };
+
+            if (osd_setup(attr(0).picWidth, attr(0).picHeight) < 0 ||
+                IMP_System_Bind(&fs, &oc) < 0 ||
+                IMP_System_Bind(&oc, &enc) < 0) {
+                printf("osd: setup failed\n");
+                return 1;
+            }
+            osd = 1;
+        }
+#endif
+        if (!osd && IMP_System_Bind(&fs, &enc) < 0) {
+            printf("enc%d: bind failed\n", ch);
             return 1;
         }
     }

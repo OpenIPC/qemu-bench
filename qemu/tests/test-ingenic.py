@@ -77,6 +77,8 @@ BOOTROM = 0x1FC00000
 SCRATCH = 0x00800000
 ISP = 0x13300000
 SADC = 0x10070000
+I2D = 0x130B0000
+DBOX = 0x130D0000
 PDMA = 0x13420000
 AIC = 0x10020000
 CODEC = 0x10021000
@@ -435,6 +437,103 @@ def test_sadc(qt, intc=INTC):
     qt.cmd('writew 0x%x 0x1' % SADC)
     qt.step(100000)
     check('AUX0 reads the level qom-set on its pin', rw(SADC + 0x10), 0x123)
+
+
+def test_drawbox(qt, intc=CORE_INTC):
+    print('ingenic-drawbox (T40/T41)')
+    W, H = 64, 32
+    y_base, uv_base = SCRATCH, SCRATCH + W * H
+    qt.write(y_base, bytes([0x80]) * (W * H))
+    qt.write(uv_base, bytes([0x80]) * (W * H // 2))
+    # dbox_start: reset, the picture, the driver's palette, two boxes
+    qt.writel(DBOX + 0x00, 1 << 1)
+    check('RESET clears itself', qt.readl(DBOX + 0x00) & 2, 0)
+    qt.writel(DBOX + 0x10, W | (H << 16))
+    qt.writel(DBOX + 0x0C, W | (W << 16))
+    qt.writel(DBOX + 0x14, 0xe195004c)
+    qt.writel(DBOX + 0x18, 0x002b8054)
+    qt.writel(DBOX + 0x1C, 0x941580ff)
+    qt.writel(DBOX + 0x04, y_base)
+    qt.writel(DBOX + 0x08, uv_base)
+    def box(x, y, w, h, col, mode, lw, ll=0):
+        qt.writel(DBOX + 0x20, x | (y << 12) | ((w & 0xff) << 24))
+        qt.writel(DBOX + 0x20, (w >> 8) | (h << 4) | (col << 16) |
+                  (mode << 18) | (lw << 20) | (ll << 23))
+    box(8, 4, 24, 16, 0, 0, 2)          # a red rectangle, 2 pixels wide
+    box(40, 20, 16, 0, 3, 2, 1)         # a yellow horizontal line
+    check('two boxes in the RAM (write pointer)',
+          (qt.readl(DBOX + 0x00) >> 9) & 0xff, 2)
+    qt.writel(DBOX + 0x00, qt.readl(DBOX + 0x00) & ~(1 << 3))
+    qt.writel(DBOX + 0x00, qt.readl(DBOX + 0x00) | 1)
+    qt.step(200000)
+    check('done bit, START cleared', qt.readl(DBOX + 0x00) & 0x11, 0x10)
+    check('the DRAWBOX line pending', (qt.readl(intc + 0x20) >> 10) & 1, 1)
+    y = qt.read(y_base, W * H)
+    uv = qt.read(uv_base, W * H // 2)
+    check('rectangle edge: red luma', (y[4 * W + 8], y[5 * W + 20]),
+          (0x4c, 0x4c))
+    check('rectangle edge: red chroma', (uv[2 * W + 8], uv[2 * W + 9]),
+          (0x54, 0xff))
+    check('inside the rectangle untouched', y[10 * W + 16], 0x80)
+    check('right and bottom edges', (y[10 * W + 31], y[19 * W + 16]),
+          (0x4c, 0x4c))
+    check('outside untouched', (y[10 * W + 33], y[21 * W + 16]),
+          (0x80, 0x80))
+    check('yellow line, 1 pixel high', (y[20 * W + 40], y[20 * W + 55],
+                                        y[21 * W + 40]), (0xe1, 0xe1, 0x80))
+    # the handler clears the done bit by writing CTRL back without it
+    qt.writel(DBOX + 0x00, qt.readl(DBOX + 0x00) & ~(1 << 4))
+    check('done cleared, line low', (qt.readl(DBOX + 0x00) & 0x10,
+          (qt.readl(intc + 0x20) >> 10) & 1), (0, 0))
+
+
+def test_i2d(qt, intc=CORE_INTC):
+    print('ingenic-i2d (T40/T41)')
+    W, H = 8, 4
+    src, dst = SCRATCH, SCRATCH + 0x10000
+    pic = bytes(range(W * H))
+    uv = bytes(range(0x80, 0x80 + W * H // 2))
+    qt.write(src, pic)
+    qt.write(src + W * H, uv)
+    def run(mode, dst_stride):
+        qt.writel(I2D + 0x10, 1 << 4)                    # safe reset
+        qt.writel(I2D + 0x18, mode)
+        qt.writel(I2D + 0x14, (W << 16) | H)
+        qt.writel(I2D + 0x20, src)
+        qt.writel(I2D + 0x24, src + W * H)
+        qt.writel(I2D + 0x30, dst)
+        qt.writel(I2D + 0x34, dst + dst_stride * (W if mode & 4 else H))
+        qt.writel(I2D + 0x28, W)
+        qt.writel(I2D + 0x2C, W)
+        qt.writel(I2D + 0x38, dst_stride)
+        qt.writel(I2D + 0x3C, dst_stride)
+        qt.writel(I2D + 0x08, 0xffffffff)
+        qt.writel(I2D + 0x10, 1)
+        qt.step(200000)
+    run(1 << 2, H)                                       # NV12, 90
+    check('frame done', qt.readl(I2D + 0x80) & 1, 1)
+    check('the I2D line pending', (qt.readl(intc + 0x20) >> 13) & 1, 1)
+    out = qt.read(dst, W * H)
+    # 90 clockwise: destination (x, y) = source (row H-1-x, column y)
+    want = bytes(pic[(H - 1 - x) * W + y] for y in range(W) for x in range(H))
+    check('Y rotated 90 degrees clockwise', out, want)
+    ouv = qt.read(dst + H * W, W * H // 2)
+    # CbCr: 4x2 pairs -> 2x4 pairs
+    pairs = [uv[i:i + 2] for i in range(0, len(uv), 2)]
+    wuv = b''.join(pairs[(H // 2 - 1 - x) * (W // 2) + y]
+                   for y in range(W // 2) for x in range(H // 2))
+    check('CbCr pairs rotated with it', ouv, wuv)
+    qt.writel(I2D + 0x84, 1)
+    check('IRQ_CLEAR drops the line', (qt.readl(I2D + 0x80) & 1,
+          (qt.readl(intc + 0x20) >> 13) & 1), (0, 0))
+    run(1 << 1, W)                                       # mirror
+    out = qt.read(dst, W * H)
+    check('mirror', out, bytes(pic[r * W + W - 1 - c]
+                               for r in range(H) for c in range(W)))
+    run(1, W)                                            # flip
+    out = qt.read(dst, W * H)
+    check('flip', out, bytes(pic[(H - 1 - r) * W + c]
+                             for r in range(H) for c in range(W)))
 
 
 def test_pwm(qt):
@@ -1265,6 +1364,12 @@ def main():
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
         test_pwm(qt)
+        test_drawbox(qt)
+        test_i2d(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't40')
+        test_drawbox(qt)
+        test_i2d(qt)
         qt.close()
 
         qt = QTest(a.qemu, 't31,sensor=gc2053')

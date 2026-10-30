@@ -12,7 +12,13 @@
 #
 #   bash qemu-boot/test-ingenic-avpu.sh [--soc t40|t31|t41] [--sensor NAME]
 #        [--codecs "h264 h265 jpeg"] [--frames N] [--fw DIR] [--qemu PATH]
-#        [--image SDK.img] [--ffmpeg CMD] [--out DIR]
+#        [--image SDK.img] [--ffmpeg CMD] [--out DIR] [--osd]
+#
+# --osd (T41): channel 0 goes through a libimp OSD group with a red
+# rectangle and a green line, which libimp draws with the DRAWBOX
+# (hw/misc/ingenic-drawbox.c); the decoded pictures must show both.  Not
+# T40 here: OpenIPC's T40 kernel has no drawbox driver, so libimp draws
+# no boxes (test-ingenic-xb2blocks.sh covers the T40 SDK kernel's).
 #
 # The same machinery as test-ingenic-isp.sh (its options, sensors and
 # toolchains); T40 is the default here.  --ffmpeg defaults to ffmpeg on
@@ -58,6 +64,7 @@ FRAMES=10
 OUT=
 PNG=
 TIMEOUT=900
+OSD=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -73,6 +80,7 @@ while [ $# -gt 0 ]; do
     --frames) FRAMES=$2; shift ;;
     --out) OUT=$2; shift ;;
     --png) PNG=1 ;;
+    --osd) OSD=1 ;;
     --timeout) TIMEOUT=$2; shift ;;
     --codecs) CODECS=$2; shift ;;
     --ffmpeg) FFMPEG=$2; shift ;;
@@ -145,6 +153,11 @@ W=${W:-1920}
 H=${H:-1080}
 CC="$TC/${CROSS}gcc $CCFLAGS"
 SRC=$HERE/ingenic-avpu-enc.c
+if [ -n "$OSD" ]; then
+    case $SOC in t41) DEFS="$DEFS -DENC_OSD" ;;
+    *) echo "--osd is for T41 (OpenIPC's T40 kernel has no drawbox driver)" >&2
+       exit 2 ;; esac
+fi
 if [ "$LIBIMP" = sdk41 ]; then
     $CC -O2 -Wall -I"$INC" $DEFS -static -s -o "$WORK/rfs/usr/bin/avpu-enc" \
         "$SRC" "$SDK41/lib/uclibc/libimp.a" "$SDK41/lib/uclibc/libalog.a" \
@@ -198,13 +211,14 @@ CODEC=\$(sed -n 's/.*avpu_codec=\([a-z0-9]*\).*/\1/p' /proc/cmdline)
 $LOADER
 echo "AVPUTEST modules: \$(lsmod | sed -n 's/^\\(avpu[^ ]*\\|tx_isp[^ ]*\\|sensor_[^ ]*\\).*/\\1/p' | tr '\\n' ' ')"
 touch /tmp/closesimd
+${OSD:+export AVPU_OSD=1}
 # T40's SDHCI finds no card: the streams go to the top 8 MiB of RAM too,
 # above libimp's buffers, for the host's pmemsave
 [ -b /dev/mmcblk0 ] || export SNAP_DEVMEM=$(( (${RAM%M} - 8) << 20 ))
 avpu-enc \$CODEC $FRAMES /tmp $SENSOR $ADDR $W $H &
 ENC=\$!
 for i in \$(seq 900); do [ -e /tmp/avpu-enc.done ] && break; kill -0 \$ENC 2>/dev/null || break; sleep 1; done
-echo "AVPUTEST interrupts: \$(grep avpu /proc/interrupts)"
+echo "AVPUTEST interrupts: \$(grep -E "avpu|dbox|drawbox|i2d" /proc/interrupts | tr -s " " | tr "\\n" ";")"
 if [ -b /dev/mmcblk0 ]; then
     for n in 0 1; do dd if=/tmp/slot\$n.bin of=/dev/mmcblk0 bs=4M seek=\$n conv=sync 2>/dev/null; done
     sync
@@ -305,7 +319,7 @@ PY
     [ -n "$started" ] && break
     echo "   no init output in 90 s, retrying"
 done
-grep -a -E "AVPUTEST|^enc[01] picture|avpu-enc:" "$OUT/console-$CODEC.log" | grep -v PMEM || true
+grep -a -E "AVPUTEST|^enc[01] picture|avpu-enc:|^osd:" "$OUT/console-$CODEC.log" | grep -v PMEM || true
 if [ ! -e "$WORK/pmem1.bin" ]; then
     # the SD card's slots instead
     for slot in 0 1; do
@@ -339,6 +353,39 @@ d = open(sys.argv[1], 'rb').read(); fs = int(sys.argv[2]); n = int(sys.argv[3])
 open(sys.argv[4] + '/first.nv12', 'wb').write(d[:fs])
 open(sys.argv[4] + '/last.nv12', 'wb').write(d[(n - 1) * fs:n * fs])
 PY
+    if [ -n "$OSD" ] && [ $slot = 0 ]; then
+        # the OSD's boxes, in the middle of their 6-pixel lines
+        python3 - "$WORK/last.nv12" ${sz%x*} ${sz#*x} \
+            "$(grep -a -m1 '^osd: ' "$OUT/console-$CODEC.log" | tr -d '\r')" <<'PY' ||
+import sys
+d = open(sys.argv[1], 'rb').read()
+w, h = int(sys.argv[2]), int(sys.argv[3])
+f = sys.argv[4].split()
+if len(f) < 8:
+    print('    OSD: the client reported no boxes: FAIL')
+    sys.exit(1)
+x, y, bw, bh, lx, ly, ll = map(int, f[1:8])
+uv = w * h
+def at(px, py):
+    c = uv + (py // 2) * w + (px // 2) * 2
+    return d[py * w + px], d[c], d[c + 1]
+def avg(pts):
+    v = [at(px, py) for px, py in pts]
+    return tuple(sum(c[i] for c in v) / len(v) for i in range(3))
+edge = avg([(x + i, y + 3) for i in range(16, bw - 16, 8)] +
+           [(x + 3, y + j) for j in range(16, bh - 16, 8)])
+inside = avg([(x + bw // 2 + i, y + bh // 2) for i in range(-8, 9, 4)])
+line = avg([(lx + i, ly + 3) for i in range(16, ll - 16, 8)])
+red = edge[2] > 200 and edge[1] < 120
+green = line[1] < 80 and line[2] < 80
+untouched = inside[2] < 180
+print('    OSD rectangle edge YUV %.0f/%.0f/%.0f (red: %s), line %.0f/%.0f/%.0f '
+      '(green: %s), inside Cr %.0f: %s' % (edge + (red,) + line + (green,) +
+      (inside[2], 'PASS' if red and green and untouched else 'FAIL')))
+sys.exit(0 if red and green and untouched else 1)
+PY
+        fails=$((fails + 1))
+    fi
     if [ "$N" = 1 ]; then
         python3 "$HERE/ingenic-isp-check.py" ${PNG:+--png "$OUT/$CODEC-ch$slot"} \
             $sz:"$WORK/first.nv12" > "$WORK/chk.log" || true
