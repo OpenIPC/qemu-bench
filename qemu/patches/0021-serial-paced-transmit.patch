@@ -1,0 +1,169 @@
+From: OpenIPC
+Subject: [PATCH] serial: paced transmit at the line rate
+
+A "paced" property: a byte leaves the shift register a character time
+after it entered it, so THRE and its interrupt come when the FIFO
+really drains and TEMT a character time later, instead of the whole
+FIFO going out at once; and "tx-fifo", the transmit FIFO depth (16 by
+default).  Both off / unchanged by default.
+---
+--- a/include/hw/char/serial.h
++++ b/include/hw/char/serial.h
+@@ -72,6 +72,9 @@
+     int timeout_ipending;           /* timeout interrupt pending state */
+ 
+     uint64_t char_transmit_time;    /* time to transmit a char in ticks */
++    bool paced;                     /* transmit at the line rate */
++    uint32_t tx_fifo;               /* the transmit FIFO's depth */
++    QEMUTimer *xmit_timer;          /* paced: the shift register's byte */
+     int poll_msl;
+ 
+     QEMUTimer *modem_status_poll;
+--- a/hw/char/serial.c
++++ b/hw/char/serial.c
+@@ -229,8 +229,58 @@
+     return G_SOURCE_REMOVE;
+ }
+ 
++/*
++ * Paced transmit: a byte leaves the shift register a character time
++ * after it entered it, so THRE (and its interrupt) comes when the FIFO
++ * really runs dry and TEMT a character time later, as on silicon --
++ * rather than the whole FIFO going out at once.  Drivers whose transmit
++ * interrupt path races their start path (an interrupt after every
++ * burst opens the window wide) see the real rate.
++ */
++static void serial_xmit_paced(SerialState *s)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (timer_pending(s->xmit_timer)) {
++        return;                         /* the shift register is busy */
++    }
++    if (s->lsr & UART_LSR_THRE) {
++        s->lsr |= UART_LSR_TEMT;        /* the last byte is out */
++        s->last_xmit_ts = now;
++        return;
++    }
++    if (s->fcr & UART_FCR_FE) {
++        s->tsr = fifo8_pop(&s->xmit_fifo);
++        if (!s->xmit_fifo.num) {
++            s->lsr |= UART_LSR_THRE;
++        }
++    } else {
++        s->tsr = s->thr;
++        s->lsr |= UART_LSR_THRE;
++    }
++    if ((s->lsr & UART_LSR_THRE) && !s->thr_ipending) {
++        s->thr_ipending = 1;
++        serial_update_irq(s);
++    }
++    if (s->mcr & UART_MCR_LOOP) {
++        serial_receive1(s, &s->tsr, 1);
++    } else {
++        qemu_chr_fe_write_all(&s->chr, &s->tsr, 1);
++    }
++    timer_mod(s->xmit_timer, now + s->char_transmit_time);
++}
++
++static void serial_xmit_timer(void *opaque)
++{
++    serial_xmit_paced(opaque);
++}
++
+ static void serial_xmit(SerialState *s)
+ {
++    if (s->paced) {
++        serial_xmit_paced(s);
++        return;
++    }
+     do {
+         assert(!(s->lsr & UART_LSR_TEMT));
+         if (s->tsr_retry == 0) {
+@@ -355,7 +405,8 @@
+             s->lsr &= ~UART_LSR_THRE;
+             s->lsr &= ~UART_LSR_TEMT;
+             serial_update_irq(s);
+-            if (s->tsr_retry == 0) {
++            if (s->tsr_retry == 0 &&
++                !(s->paced && timer_pending(s->xmit_timer))) {
+                 serial_xmit(s);
+             }
+         }
+@@ -809,6 +860,24 @@
+     return s->poll_msl >= 0;
+ }
+ 
++static bool serial_xmit_timer_needed(void *opaque)
++{
++    SerialState *s = opaque;
++
++    return s->paced && timer_pending(s->xmit_timer);
++}
++
++static const VMStateDescription vmstate_serial_xmit_timer = {
++    .name = "serial/xmit_timer",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = serial_xmit_timer_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(xmit_timer, SerialState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static const VMStateDescription vmstate_serial_poll = {
+     .name = "serial/poll",
+     .version_id = 1,
+@@ -849,6 +918,7 @@
+         &vmstate_serial_fifo_timeout_timer,
+         &vmstate_serial_timeout_ipending,
+         &vmstate_serial_poll,
++        &vmstate_serial_xmit_timer,
+         NULL
+     }
+ };
+@@ -878,6 +948,7 @@
+ 
+     s->timeout_ipending = 0;
+     timer_del(s->fifo_timeout_timer);
++    timer_del(s->xmit_timer);
+     timer_del(s->modem_status_poll);
+ 
+     fifo8_reset(&s->recv_fifo);
+@@ -928,12 +999,17 @@
+     s->modem_status_poll = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) serial_update_msl, s);
+ 
+     s->fifo_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) fifo_timeout_int, s);
++    s->xmit_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, serial_xmit_timer, s);
+     qemu_register_reset(serial_reset, s);
+ 
+     qemu_chr_fe_set_handlers(&s->chr, serial_can_receive1, serial_receive1,
+                              serial_event, serial_be_change, s, NULL, true);
+     fifo8_create(&s->recv_fifo, UART_FIFO_LENGTH);
+-    fifo8_create(&s->xmit_fifo, UART_FIFO_LENGTH);
++    if (s->tx_fifo < UART_FIFO_LENGTH) {
++        error_setg(errp, "serial: tx-fifo below %d", UART_FIFO_LENGTH);
++        return;
++    }
++    fifo8_create(&s->xmit_fifo, s->tx_fifo);
+     serial_reset(s);
+ }
+ 
+@@ -946,6 +1022,7 @@
+     timer_free(s->modem_status_poll);
+ 
+     timer_free(s->fifo_timeout_timer);
++    timer_free(s->xmit_timer);
+ 
+     fifo8_destroy(&s->recv_fifo);
+     fifo8_destroy(&s->xmit_fifo);
+@@ -970,6 +1047,8 @@
+     DEFINE_PROP_CHR("chardev", SerialState, chr),
+     DEFINE_PROP_UINT32("baudbase", SerialState, baudbase, 115200),
+     DEFINE_PROP_BOOL("wakeup", SerialState, wakeup, false),
++    DEFINE_PROP_BOOL("paced", SerialState, paced, false),
++    DEFINE_PROP_UINT32("tx-fifo", SerialState, tx_fifo, UART_FIFO_LENGTH),
+ };
+ 
+ static void serial_class_init(ObjectClass *klass, const void *data)

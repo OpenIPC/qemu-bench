@@ -1059,14 +1059,30 @@ static void ingenic_init(MachineState *ms)
 
     /*
      * UARTs.  The console is UART1 on every board, so it takes the first
-     * -serial; UART0 the second, then UART2 and up.
+     * -serial; UART0 the second, then UART2 and up.  They transmit at the
+     * line rate ("paced"): the 4.4 kernels' ingenic_uart.c stops its
+     * transmitter from the interrupt without the port lock, racing the
+     * other core's start, and an interrupt after every instant burst
+     * leaves heavy console output stalled with data queued.
      */
     for (i = 0; i < info->num_uarts; i++) {
         int hd = i == 1 ? 0 : (i == 0 ? 1 : i);
 
-        serial_mm_init(sysmem, UART_BASE + i * 0x1000, 2,
-                       ingenic_irq(ims, IRQ_UART0 - i), 115200,
-                       serial_hd(hd), DEVICE_LITTLE_ENDIAN);
+        dev = qdev_new(TYPE_SERIAL_MM);
+        qdev_prop_set_uint8(dev, "regshift", 2);
+        /* EXTAL / 16: the divisor the drivers program is for 24 MHz */
+        qdev_prop_set_uint32(dev, "baudbase", 24000000 / 16);
+        qdev_prop_set_chr(dev, "chardev", serial_hd(hd));
+        qdev_prop_set_bit(dev, "paced", true);
+        qdev_prop_set_uint32(dev, "tx-fifo", 64);   /* ingenic_uart.c's */
+        qdev_set_legacy_instance_id(dev, UART_BASE + i * 0x1000, 2);
+        qdev_prop_set_uint8(dev, "endianness", DEVICE_LITTLE_ENDIAN);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ingenic_irq(ims, IRQ_UART0 - i));
+        memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000,
+                                    sysbus_mmio_get_region(SYS_BUS_DEVICE(dev),
+                                                           0));
     }
 
     /* I2C, the sensor's bus on I2C0 */

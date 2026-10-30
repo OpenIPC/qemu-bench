@@ -10,7 +10,8 @@
 #
 #   bash qemu-boot/test-ingenic-audio.sh [--soc t10|t20|t21|t23|t30|t31|t40|t41]
 #        [--fw DIR] [--image T41_IMG] [--rate 16000] [--play-rate RATE]
-#        [--dmic] [--gains AI:AO] [--qemu PATH] [--out DIR] [--timeout S]
+#        [--dmic] [--gains AI:AO] [--console-load] [--qemu PATH] [--out DIR]
+#        [--timeout S]
 #
 # --fw holds uImage.<soc> and rootfs.squashfs.<soc> (an OpenIPC "lite"
 # release, fetch-openipc-lite.sh).  The client is built with the Ingenic
@@ -21,7 +22,9 @@
 # than the recording's (the AIC's two I2S clocks).  --gains sets the
 # codec's analogue gains through IMP_AI_SetGain / IMP_AO_SetGain (either
 # may be empty), and the check then wants the levels they give, 1.5 dB a
-# step from the driver's defaults (--ai-default/--ao-default: 16, 24).
+# step from the driver's defaults (16 to record, T41 31; 24 to play).
+# --console-load has the client print the recording as hex from a thread
+# while it plays (the client then has to run through and say so).
 #
 # Run alone: a starved guest falls behind the DMA, and the vendor driver
 # then skips ahead, so a loaded host can cut the played sound short (the
@@ -68,6 +71,7 @@ while [ $# -gt 0 ]; do
     --dmic) DMIC=1 ;;
     --play-rate) PRATE=$2; shift ;;
     --gains) GAINS=$2; shift ;;
+    --console-load) HEXCON=1 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -161,13 +165,16 @@ mkdir -p /dev/shm && mount -t tmpfs shm /dev/shm
 mkdir -p /var/lock
 $LOADER
 echo "AUDIOTEST dsp: \$(ls /dev/dsp 2>&1)"
-${AIGAIN:+AUDIO_AIGAIN=$AIGAIN }${AOGAIN:+AUDIO_AOGAIN=$AOGAIN }audio-test $RATE 500 $PLAY 2000 /tmp/rec.raw $MIC ${PRATE:-$RATE}
+${AIGAIN:+AUDIO_AIGAIN=$AIGAIN }${AOGAIN:+AUDIO_AOGAIN=$AOGAIN }${HEXCON:+AUDIO_HEXDUMP=/tmp/rec.raw }audio-test $RATE 500 $PLAY 2000 /tmp/rec.raw $MIC ${PRATE:-$RATE}
 echo "AUDIOREC BEGIN $RATE"
 hexdump -v -e '16/2 "%04x " "\\n"' /tmp/rec.raw
 echo "AUDIOREC END"
 echo "AUDIOTEST dmesg:"
 dmesg | grep -i -E "audio|dma|aic|codec|i2s" | tail -20
 echo AUDIOTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 EOF
 chmod +x "$WORK/rfs/usr/bin/audio-init"
@@ -263,6 +270,10 @@ try:
 except StopIteration:
     check('a recording on the console', False, 'none')
 check('the client ran through', 'AUDIOTEST PASS' in lines, '')
+hx = [l for l in lines if l.startswith('AUDIOTEST hexdump ')]
+if hx:
+    check('the console took the client\'s hexdump', hx == ['AUDIOTEST hexdump 500 lines'],
+          hx[0][18:])
 try:
     w = wave.open(wav)
     rate, ch, n = w.getframerate(), w.getnchannels(), w.getnframes()

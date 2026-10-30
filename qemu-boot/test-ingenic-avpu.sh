@@ -228,6 +228,9 @@ else
 fi
 echo "AVPUTEST rc=\$([ -e /tmp/avpu-enc.done ] && echo 0 || echo 1)"
 echo AVPUTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 EOF
 chmod +x "$WORK/rfs/usr/bin/avpu-test"

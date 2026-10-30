@@ -256,6 +256,9 @@ echo "ISPTEST vic: \$(head -1 /proc/jz/isp/isp-w02 2>/dev/null || cat /proc/jz/v
 grep -i "isp\|vic" /proc/interrupts | sed 's/^/ISPTEST irq: /'
 sync
 echo ISPTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 EOF
 chmod +x "$WORK/rfs/usr/bin/isp-test"

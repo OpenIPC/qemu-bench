@@ -105,6 +105,9 @@ echo "CRYPTOTEST devs: \$(ls /dev/aes /dev/hash /dev/rsa /dev/dtrng /dev/des 2>&
 crypto-test /etc/rsa-vectors
 dmesg | grep -i -E "aes|hash|rsa|dtrng|des" | grep -v "^.*random:" | tail -12 | sed 's/^/CRYPTOTEST dmesg: /'
 echo CRYPTOTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 EOF
 chmod +x "$WORK/rfs/usr/bin/crypto-init"

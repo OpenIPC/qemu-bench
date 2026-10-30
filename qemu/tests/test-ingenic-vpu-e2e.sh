@@ -95,6 +95,9 @@ vpu-enc $FRAMES /dev/mmcblk0 $SENSOR $ADDR $W $H
 echo "VPUTEST rc=\$?"
 sync
 echo VPUTEST-END
+# the UART sends at the line rate: let the console drain (the host stops
+# QEMU at the end marker)
+sleep 60
 poweroff -f
 EOF
 chmod +x "$WORK/rfs/usr/bin/vpu-test"

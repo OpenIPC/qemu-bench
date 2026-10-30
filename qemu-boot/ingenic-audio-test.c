@@ -23,6 +23,7 @@
  */
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,6 +162,32 @@ static int record_dmic(int rate, int ms, const char *path)
 }
 #endif
 
+/*
+ * AUDIO_HEXDUMP=FILE: a thread prints FILE as hex lines on the console
+ * while the sine plays -- heavy console output from one core while the
+ * other runs the audio, the load under which the 4.4 kernel's UART driver
+ * races itself (docs/ingenic.md, the UARTs).
+ */
+static void *hexdump_thread(void *path)
+{
+    FILE *f = fopen(path, "rb");
+    unsigned short w[16];
+    int n, i, lines = 0;
+
+    if (!f) {
+        return NULL;
+    }
+    while ((n = fread(w, 2, 16, f)) > 0) {
+        for (i = 0; i < n; i++) {
+            printf("%04x%c", w[i], i == n - 1 ? '\n' : ' ');
+        }
+        lines++;
+    }
+    fclose(f);
+    printf("AUDIOTEST hexdump %d lines\n", lines);
+    return NULL;
+}
+
 static int play(int rate, int hz, int ms)
 {
     IMPAudioIOAttr attr;
@@ -225,7 +252,15 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("AUDIOTEST recorded\n");
-    if (play_ms > 0 && play(play_rate, hz, play_ms)) {
+    if (getenv("AUDIO_HEXDUMP")) {
+        pthread_t t;
+
+        pthread_create(&t, NULL, hexdump_thread, getenv("AUDIO_HEXDUMP"));
+        if (play_ms > 0 && play(play_rate, hz, play_ms)) {
+            return 1;
+        }
+        pthread_join(t, NULL);
+    } else if (play_ms > 0 && play(play_rate, hz, play_ms)) {
         return 1;
     }
     printf("AUDIOTEST PASS\n");

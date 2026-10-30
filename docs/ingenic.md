@@ -46,7 +46,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
 | 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
-| 0x10030000 + 0x1000 n | UART0..3, 16550 with a 4-byte stride | QEMU `serial-mm` |
+| 0x10030000 + 0x1000 n | UART0..3, 16550 with a 4-byte stride, paced at the line rate, 64-byte TX FIFO | QEMU `serial-mm` (patch 0021) |
 | 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c) | `ingenic-i2c` |
 | 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
 | 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
@@ -800,14 +800,27 @@ reach the analogue gains.
 `-audiodev wav,id=snd,path=out.wav -M t31,audiodev=snd` records what the
 guest plays.
 
-On T41 (4.4, `ingenic_uart.c`), heavy console output from a program
-while another core writes to the console too can stop the console for
-good: the driver's interrupt handler sends and stops the transmitter
-without the port lock, racing `start_tx` on the other core, which then
-leaves bytes queued with the THR interrupt off. The UART model is idle
-and correct (THRE set, the interrupt armed on IER's 0 -> 1 edge); with
-`maxcpus=1` the same output goes through. `test-ingenic-audio.sh` writes
-its recording to a file and dumps it from the shell for that reason.
+The UARTs transmit at the line rate. On T40/T41 (4.4, `ingenic_uart.c`)
+the driver's interrupt handler sends and stops the transmitter without
+the port lock, racing `start_tx` on the other core, and a lost race
+leaves bytes queued with the THR interrupt off -- the console stops for
+good. QEMU's 16550 sends a whole burst at once, so THRE (and the
+interrupt) came back after every write and the race was lost within a
+few hundred lines of heavy output: with a client printing 500 lines of
+hex from a thread while IMP_AO plays (`test-ingenic-audio.sh --soc t41
+--console-load`), the console stopped after 26, 101 and 279 lines in 3
+of 3 runs. Patch 0021 adds a `paced` mode to QEMU's serial -- a byte
+leaves the shift register a character time after it entered it, THRE
+comes when the FIFO really drains, TEMT a character later -- and a
+`tx-fifo` depth; the machine sets both (64 bytes, the driver's
+`fifosize`, which loads half of it per interrupt) with a baud base of
+EXTAL / 16 (1.5 MHz: the drivers program the divisor for 24 MHz, 13 for
+115200). The same test then prints all 500 lines in 3 of 3 runs. It
+narrows the window to silicon's rather than closing it: 10 of 11 OpenIPC
+T40 boots passed paced, one went quiet after its application started.
+The cost is the real rate, some 11.5 KB a second: an OpenIPC boot takes
+about 2 s longer, a 420 KB console flood 41 s instead of 6, and the test
+harnesses wait for the console to drain before they power off.
 
 ### The image pipeline: `sensor=` and `ingenic-isp`
 
