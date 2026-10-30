@@ -552,6 +552,42 @@ registers 0x0A/0x0B at 0x30; 0xA062 is the H62.
 - `hisi-jxh62` is `hisi-f37` with that ID. Both are RAM behind the ID.
 - With no sensor on the bus, majestic stopped at "Not Support This Sensor!".
 
+**Other sensors.** On every Xiongmai machine `sensor=` replaces the
+board's sensor (and its twin, where a board has two) with one of any I2C
+device type, or with `none`, and `sensor-addr=` sets its 7-bit address
+(1-0x7f: 0 is the general call). `sensor-id=` still picks the part of the
+board's own SmartSens model. Boards with a second I2C bus get the sensor on
+both, as they get their own. `xm-sensor` is a generic one: a register file with 8- or
+16-bit register addresses (`addr-bytes`) and power-on values from `regs`,
+which logs every access to `log` (a log that can't be written is reported
+once and dropped). With 1-byte addresses `regs` takes registers up to 0xff:
+
+```sh
+qemu-system-arm -M xm510,flash-file=dump.bin,sensor=xm-sensor,sensor-addr=0x30 \
+    -global xm-sensor.addr-bytes=2 \
+    -global xm-sensor.regs=0x3107:0x22,0x3108:0x35 \
+    -global xm-sensor.log=sensor.log ...
+```
+
+With it the XM510 vendor `isp` daemon, which majestic starts, can be shown any
+sensor it supports by that sensor's chip ID. It starts, and logs its init,
+with each of these:
+
+| Sensor | Address | Registers | ID |
+|---|---|---|---|
+| SOI JX-H62, JX-H42, JX-H65 | 0x30 | 8-bit, `0x0a`/`0x0b` | `a0 62`, `a0 42`, `0a 65` |
+| SmartSens SC1235, SC1245, SC2235 | 0x30 | 16-bit, `0x3107`/`0x3108` | `12 35`, `12 45`, `22 35` |
+| onsemi AR0130 | 0x10 | 16-bit, `0x3000` (16-bit data) | `24 02` |
+
+With `sensor=none` it probes, in order: 0x30 (8-bit `0x0a`/`0x0b`), 0x30
+(16-bit `0x3107`/`0x3108`, then `0x3008` and `0x3005`), 0x36 (16-bit
+`0x300a`/`0x300b`), 0x10 (`0x3000`), 0x32 (8-bit, `0x00`/`0x01` after
+`0xf0`/`0x1c` writes), 0x36 (`0x300b`/`0x300c`), 0x34 (8-bit,
+`0x04`/`0x05` after `0xfe`/`0xfd` writes) and 0x30 (`0x30`, `0x2f`), then
+gives up. The model stores what the guest writes, so it doesn't reset like
+a real sensor, and registers the daemon reads back for values it measures
+read 0. `qemu/tests/test-xm-sensor.py` checks the properties and the model.
+
 **VI.** It's the XM530 design at other offsets, with up to three buffers and
 a single back-end interrupt for every channel. `load_xiongmai` sets
 `VI_BUFF=3` for an 18M kernel and 2 otherwise. For channel `c`, in `W = 0x81000 +
