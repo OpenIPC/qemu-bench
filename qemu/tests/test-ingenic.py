@@ -76,6 +76,8 @@ EFUSE = 0x13540000
 CAR = 0x1F000000
 BOOTROM = 0x1FC00000
 SCRATCH = 0x00800000
+AIP = 0x12B00000
+AIP_ALIAS = 0x13090000
 ISP = 0x13300000
 SADC = 0x10070000
 I2D = 0x130B0000
@@ -487,6 +489,120 @@ def test_drawbox(qt, intc=CORE_INTC):
     qt.writel(DBOX + 0x00, qt.readl(DBOX + 0x00) & ~(1 << 4))
     check('done cleared, line low', (qt.readl(DBOX + 0x00) & 0x10,
           (qt.readl(intc + 0x20) >> 10) & 1), (0, 0))
+
+
+def test_aip(qt, intc=CORE_INTC):
+    print('ingenic-aip (T41)')
+    T, F, P = AIP, AIP + 0x200, AIP + 0x300
+    src, dst, dst2, chain = (SCRATCH, SCRATCH + 0x10000, SCRATCH + 0x18000,
+                             SCRATCH + 0x20000)
+    W, H = 8, 4
+    pic = bytes((x * 16 + y * 3) & 0xff for y in range(H) for x in range(W))
+    qt.write(src, pic)
+
+    def f_regs(d, sx, phase):
+        return {0x10: sx, 0x14: sx, 0x18: phase, 0x1C: phase, 0x20: src,
+                0x28: d, 0x30: (H << 16) | W,
+                0x34: ((H * 0x10000 // sx) << 16) | (W * 0x10000 // sx),
+                0x38: ((W * 0x10000 // sx) << 16) | W}
+
+    def halve(p, w, h):
+        # bilinear at the half-pixel phase of a 2:1 scale: the 2x2 mean
+        return bytes((p[(2 * y) * w + 2 * x] + p[(2 * y) * w + 2 * x + 1] +
+                      p[(2 * y + 1) * w + 2 * x] +
+                      p[(2 * y + 1) * w + 2 * x + 1] + 2) // 4
+                     for y in range(h // 2) for x in range(w // 2))
+
+    qt.writel(F, 2)
+    check('reset clears itself', qt.readl(F), 0)
+    qt.writel(F + 0x08, 0x14)                       # one byte a pixel
+    qt.writel(F + 0x0C, 0xffffffff)
+    for r, v in f_regs(dst, 0x20000, 0x8010).items():
+        qt.writel(F + r, v)
+    qt.writel(F, 1)
+    check('no status before the job ends', qt.readl(F + 0x04), 0)
+    qt.step(100000)
+    check('F: job done', qt.readl(F + 0x04) & 1, 1)
+    check('F: the AIP1 line pending', (qt.readl(intc + 0x20) >> 7) & 1, 1)
+    check('F: 8x4 -> 4x2 is the 2x2 means', qt.read(dst, 8), halve(pic, W, H))
+    qt.writel(F + 0x04, 1)
+    check('F: status write-1-clear drops the line',
+          (qt.readl(F + 0x04), (qt.readl(intc + 0x20) >> 7) & 1), (0, 0))
+    check('the units also at 0x13090000', qt.readl(AIP_ALIAS + 0x208), 0x14)
+
+    # a chain of two nodes through the 0x1309xxxx addresses
+    words = []
+    for d in (dst, dst2):
+        for r, v in f_regs(d, 0x20000, 0x8010).items():
+            words += [v, 0x13090200 + r]
+        words += [1, 0x93090200]
+    qt.write(chain, struct.pack('<%dI' % len(words), *words))
+    qt.write(dst, bytes(8))
+    qt.writel(F + 0x3C, chain)
+    qt.writel(F + 0x40, len(words) * 4)
+    qt.writel(F, 4)
+    qt.step(100000)
+    check('F: chain done', qt.readl(F + 0x04) & 2, 2)
+    check('F: both chain nodes ran', (qt.read(dst, 8), qt.read(dst2, 8)),
+          (halve(pic, W, H), halve(pic, W, H)))
+    qt.writel(F + 0x04, 3)
+
+    # T: NV12 2x2 -> BGRA, BT.601 in Q20, the G terms negated
+    coef = [1220542, 0, 1673527, 1220542, -409993, -852492, 1220542,
+            2116026, 0]
+    Y, U, V = 81, 90, 240
+    qt.write(src, bytes([Y, Y, Y, Y, U, V]))
+    qt.writel(T + 0x08, 0x1c)
+    qt.writel(T + 0x0C, 0xffffffff)
+    qt.writel(T + 0x14, src)
+    qt.writel(T + 0x18, src + 4)
+    qt.writel(T + 0x1C, dst)
+    qt.writel(T + 0x20, (8 << 16) | 2)
+    qt.writel(T + 0x24, (2 << 16) | 2)
+    for i, c in enumerate(coef):
+        qt.writel(T + 0x28 + 4 * i, c & 0xffffffff)
+    def rgb():
+        cl = lambda a: max(0, min(255, (a + (1 << 19)) >> 20))
+        return [cl(coef[3 * i] * (Y - 16) + coef[3 * i + 1] * (U - 128) +
+                   coef[3 * i + 2] * (V - 128)) for i in range(3)]
+    r, g, b = rgb()
+    for order, want in ((0, bytes([b, g, r, 0])), (5, bytes([r, g, b, 0])),
+                        (13, bytes([0, r, g, b]))):
+        qt.writel(T + 0x4C, (order << 24) | (128 << 8) | 16)
+        qt.writel(T, 1)
+        qt.step(100000)
+        check('T: NV12 -> order %d' % order, qt.read(dst, 4), want)
+        qt.writel(T + 0x04, 1)
+    check('T: the AIP0 line low again', (qt.readl(intc + 0x20) >> 8) & 1, 0)
+
+    # P: a 4-byte picture shifted by (1, 2), the pad value outside
+    pic4 = bytes(range(4 * 4 * 4))
+    qt.write(src, pic4)
+    qt.writel(P + 0x08, 0x14)
+    qt.writel(P + 0x0C, 0xffffffff)
+    regs = {0x10: 3, 0x14: src, 0x1C: 16, 0x20: dst, 0x24: 16,
+            0x28: (4 << 16) | 4, 0x2C: (4 << 16) | 4, 0x30: 0x55}
+    # dst -> src: x' = x + 1, y' = y - 2 (Q16; 48 / 48 / 59-bit terms)
+    m = [1, 0, 1, 0, 1, -2, 0, 0, 1]
+    for row in range(3):
+        a, b2, c = (v * 65536 & ((1 << 64) - 1) for v in m[3 * row:3 * row + 3])
+        base = 0x34 + row * 0x14
+        regs[base] = a & 0xffffffff
+        regs[base + 4] = ((a >> 32) & 0xffff) | ((b2 & 0xffff) << 16)
+        regs[base + 8] = (b2 >> 16) & 0xffffffff
+        regs[base + 12] = c & 0xffffffff
+        regs[base + 16] = (c >> 32) & 0x7ffffff
+    for r, v in regs.items():
+        qt.writel(P + r, v)
+    qt.writel(P, 1)
+    qt.step(100000)
+    out = qt.read(dst, 64)
+    want = b''.join(pic4[((y - 2) * 4 + x + 1) * 4:((y - 2) * 4 + x + 2) * 4]
+                    if 0 <= y - 2 < 4 and x + 1 < 4 else b'\x55' * 4
+                    for y in range(4) for x in range(4))
+    check('P: shifted by the matrix, the pad value outside', out, want)
+    check('P: the AIP2 line', (qt.readl(intc + 0x20) >> 6) & 1, 1)
+    qt.writel(P + 0x04, 1)
 
 
 def test_i2d(qt, intc=CORE_INTC):
@@ -1972,6 +2088,7 @@ def main():
         test_pwm(qt)
         test_drawbox(qt)
         test_i2d(qt)
+        test_aip(qt)
         test_dtrng(qt, CORE_INTC)
         test_aes(qt, CORE_INTC)
         test_hash(qt, CORE_INTC)

@@ -195,6 +195,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_AES         23
 #define IRQ_DTRNG       34
 #define PWM_BASE        0x13460000  /* T41; the others use TCU channels */
+#define AIP_BASE        0x12B00000  /* T41: T, F, P at +0, +0x200, +0x300 */
+#define AIP_ALIAS       0x13090000  /* the same units, as libaip maps them */
+#define IRQ_AIP_T       40
+#define IRQ_AIP_F       39
+#define IRQ_AIP_P       38
 #define IRQ_IPU         6       /* Linux 14, "ipu" */
 #define I2D_BASE        0x130B0000  /* T40, T41 */
 #define DRAWBOX_BASE    0x130D0000  /* T40, T41 */
@@ -1275,6 +1280,26 @@ static void ingenic_init(MachineState *ms)
         object_property_add_child(OBJECT(ims), "pwm", OBJECT(dev));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, PWM_BASE);
+    }
+
+    /*
+     * T41's AIP, the NNA's image pre-processor: the kernel driver maps it
+     * at 0x12B00000, libaip and its chains at 0x13090000
+     */
+    if (info->soc == INGENIC_T41) {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+
+        dev = qdev_new("ingenic-aip");
+        object_property_add_child(OBJECT(ims), "aip", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, AIP_BASE);
+        memory_region_init_alias(mr, OBJECT(dev), "ingenic-aip.alias",
+                                 sysbus_mmio_get_region(sbd, 0), 0, 0x1000);
+        memory_region_add_subregion(sysmem, AIP_ALIAS, mr);
+        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_AIP_T));
+        sysbus_connect_irq(sbd, 1, ingenic_irq(ims, IRQ_AIP_F));
+        sysbus_connect_irq(sbd, 2, ingenic_irq(ims, IRQ_AIP_P));
     }
 
     /*

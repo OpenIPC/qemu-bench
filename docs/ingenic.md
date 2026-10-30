@@ -70,6 +70,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13080000 | IPU, libimp's OSD blender (every part), IRQ 14 | `ingenic-ipu` |
 | 0x130B0000 | T40, T41: I2D, rotate / mirror / flip (frame channel rotation), IRQ 45 | `ingenic-i2d` |
 | 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
+| 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
@@ -91,7 +92,7 @@ Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
 unimplemented device, logged with `-d unimp`). Interrupt numbers are the
 same on every part: AIC 1, SSI1 8, SSI0 9, SFC 7, PDMA 10, DMIC 12, GPIO A 17 (B 16, C 15, D 14), OTG 21,
 SADC 18, HASH 22, AES 23, DTRNG 34, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
-ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, and on T40/T41 DRAWBOX 42 and I2D 45 (Linux
+ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, on T40/T41 DRAWBOX 42 and I2D 45, and T41's AIP 40 (T), 39 (F), 38 (P) (Linux
 numbers are these + 8: the ISP's 37 and 38, the AVPU's 70).
 
 ## CPUs
@@ -647,6 +648,38 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   the CbCr pairs moved as units at half size) to DST with its strides and
   sets frame done (IRQ_STATE bit 0, cleared through IRQ_CLEAR) 100 us
   later.
+- `ingenic-aip` (T41; `drivers/video/ingenic_aip`, `/dev/jzaip_t`, `_f`,
+  `_p`): the NNA's image pre-processor. The kernel driver only maps it,
+  hands out a chain buffer per unit and waits for the interrupt; the
+  programming is Ingenic's libaip (magik-toolkit InferenceKit/nna2, under
+  libvenus's `warp_*`, `crop_*`, `img_format_convert`), which maps the
+  same units at 0x13090000 through `/dev/mem` and writes its chains with
+  those addresses, so the machine maps them there too. The contract is
+  read from that library. Three units, each with CTRL (bit 0 one job
+  from the registers, 1 reset, 2 the chain, T's 4 a step), status (0
+  job done, 1 chain done; write 1 to clear), CFG and an interrupt
+  enable at 0x00..0x0C:
+  - T (+0): NV12 to 4-byte colour: Y, CbCr, destination, strides, size,
+    a signed Q20 3x3 YUV->RGB matrix (libvenus's default is BT.601:
+    1.164, 1.596, 0.391, 0.813, 2.018) and offsets (16, 128) with the
+    byte order.
+  - F (+0x200): bilinear resize of a box: Q16 steps and half-pixel start
+    phases, source / destination planes, box and output sizes, strides;
+    CFG [9:7] the format -- 8-bit tensors of 1, 4, 8, 16 or 32 bytes a
+    pixel, or NV12 (both planes); the output keeps it. Chains of nodes
+    (one per box) run from its chain address and length.
+  - P (+0x300): affine and perspective warps: the dst->src 3x3 matrix
+    (libaip inverts the caller's forward one) in fixed point split over
+    15 words, perspective divide, the box's pad value outside it; NV12
+    comes out as 4-byte colour by the same matrix as T, 1-, 2- and
+    4-byte pixels as they are.
+
+  The 4-byte orders: bits [2:0] the order of B, G, R, lexicographic (0
+  BGR .. 5 RGB), bit 3 alpha first -- libvenus's BGRA is 0, RGBA 5, ARGB
+  13. A chain is (value, register) word pairs; a pair marked by bit 31 of
+  its address runs the node's job. Jobs complete at once and signal 50 us
+  later. Alpha is written 0 and the source order bits of CFG (bit 0 swaps
+  T's Cb/Cr) are inferred, not checked against silicon.
 - `ingenic-ssi`: the SPI master of `jz_spi.c` (3.10) and `ingenic_spi.c`
   (4.4). A queued frame (CR1 FLEN + 2 bits, MSB first) goes out on the
   bus at once; the reply, or the frame itself with CR0 LOOP, lands in the
@@ -1159,6 +1192,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` (their `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | own / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh --soc <soc>` | IMP_AI records 16 kHz mono: the 1 kHz tone on all eight (FFT peak 1000.0 Hz; rms 5793, 11585 on T10, T20, T30); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz), 1.08 s on T21: the DMA plays at 16 kHz, but its driver disables the stream right after the last write and its flush discards the ~0.8 s still queued (T20, built from the same source, waits first; why is open); `--rate 8000 --play-rate 16000` (two clocks): 440.0 Hz on T10, T23, T31, T40 |
 | OpenIPC `t40`, `audio.ko dmic_enable=1` + T40 SDK `libimp.a` | `t40` | `test-ingenic-audio.sh --soc t40 --dmic` | IMP_DMIC records 16 kHz: the DMIC's 1.5 kHz tone (peak 1500.0 Hz, rms 5793); with QEMU's TLB shadow entries on, 5 of 12 runs failed (see CPUs), without them 24 consecutive runs pass |
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
+| T41NQ SDK image, its kernel's `ingenic_aip` + magik-toolkit `libaip.a` | `t41` | flash, `test-ingenic-aip.sh --image` | the library's own bs_* calls: NV12 640x360 -> 320x180 within 0.8 of the ramps sampled at half-pixel positions, a two-box chain, NV12 -> BGRA / RGBA / ARGB matching BT.601 exactly, affine and perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
@@ -1196,10 +1230,8 @@ and the blocks below read as zero or as storage.
 What the remaining video and compute blocks would need (survey of the
 T40/T41 SDK kernels, drivers and libimp):
 
-- AIP (T41 0x12B00000, T31) and T40's BSCALER (0x13090000): the kernel
-  drivers only map the registers, allocate and wait for the interrupt;
-  the AI library (Magik, a separate SDK) programs them, so their register
-  contract is not in these sources, and nothing shipped here uses them.
+- T40's BSCALER (0x13090000): as T41's AIP, the kernel driver only maps
+  it; its programming is libvenus's (magik-toolkit nna1) bscaler HAL.
 - VO (T41 0x130C0000, `ingenic_vo.c`) and MONITOR (0x130A0000, a bus
   bandwidth monitor, `sample_bus_monitor` only): no consumer in libimp or
   the images (`sample-LCD` draws on `/dev/fb0`, the DPU).
