@@ -72,7 +72,8 @@
  * I slices as I_16x16 DC macroblocks and P slices inter coded (P_Skip,
  * P_L0_16x16 at quarter-pel with a residual, intra where nothing matches),
  * a picture's slices on one reconstruction (h264_pic_*) filtered when the
- * last is done; B slices all P_Skip-like (nothing changes).  The rate
+ * last is done; B slices B_L0 / B_L1 / B_Bi_16x16 or intra (never
+ * B_Skip / B_Direct) from RefA (WA0, L0) and RefB (WA8, L1).  The rate
  * control's estimate of a P slice still counts I_PCM macroblocks
  * (pcm-budget).  The reference is the picture each P picture leaves the decoder
  * with, kept by reconstruction address (W90) and looked up by the
@@ -208,6 +209,7 @@ typedef struct AvpuFrame {
     int depth_intra;                    /* W0 [6:4] */
     uint32_t w10;                       /* deblocking */
     uint32_t ref_key, rec_key;
+    uint32_t ref1_key;                  /* B: the second reference (WA8) */
     uint8_t *y, *uv;                    /* NV12 at stride w, edges replicated */
     int nslices;
     AvpuSlice slices[AVPU_MAX_SLICES];
@@ -1054,12 +1056,11 @@ static uint32_t avpu_estimate(IngenicAvpuState *s, AvpuFrame *f,
                                       out, cap) / 8 + 1;
     }
     ref = avpu_ref_find(s, f->ref_key, f->w, f->h);
-    if (f->type == 1 && ref && ref->y) {
+    if (ref && ref->y) {
         return MIN(avpu_changed_mbs(f, r0, rows, ref->y, ref->uv),
                    avpu_pcm_mbs(s, 0)) * 385 + sl->nlcu / 8 + 2;
     }
-    return f->type == 1 ? MIN(sl->nlcu, avpu_pcm_mbs(s, 0)) * 385 + 2
-                        : sl->nlcu / 8 + 2;
+    return MIN(sl->nlcu, avpu_pcm_mbs(s, 0)) * 385 + 2;
 }
 
 /* the made-up encoding statistics of one slice */
@@ -1137,6 +1138,9 @@ static void avpu_enc1(IngenicAvpuState *s, hwaddr list)
             f->w10 = e[4];
             f->rec_key = e[0x90 / 4] & AVPU_DMA_MASK;
             f->ref_key = e[0xA0 / 4] & AVPU_DMA_MASK;
+            /* RefB: the slice buffers' second reference, after RefA's
+             * luma / chroma (libimp ChannelMngr.c encode1) */
+            f->ref1_key = e[0xA8 / 4] & AVPU_DMA_MASK;
             if (pitch < pw) {
                 pitch = ROUND_UP(pw, 16);
             }
@@ -1422,13 +1426,17 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                 avpu_wr_bits(&w, 1, 1);     /* cabac_alignment_one_bit */
             }
         }
-        if (f->type != 0) {
+        {
             /*
-             * I and P slices with real coding, CABAC or CAVLC: the
+             * I, P and B slices with real coding, CABAC or CAVLC: the
              * picture's slices on one reconstruction (h264_pic_*), filtered
              * when the last is done and kept as the next picture's
-             * reference.  The bytes have to fit the stream buffer's room
-             * (the coder raises the QP).
+             * reference.  B slices: L0 from RefA (WA0), L1 from RefB (WA8),
+             * one reference in each list -- what a slice header with
+             * num_ref_idx_active 1 / 1 and no weighted prediction says;
+             * libimp sends none (its GOP has no B pictures).  The bytes
+             * have to fit the stream buffer's room (the coder raises the
+             * QP).
              */
             size_t capb = (size_t)nmb * 800 + 4096;
             H264PStats pst;
@@ -1437,28 +1445,42 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                 capb = MIN(capb, room > 512 ? room - 256 : room / 2);
             }
             if (!f->pic) {
-                AvpuRef *ref = f->type == 1 ?
+                AvpuRef *ref = f->type != 2 ?
                     avpu_ref_find(s, f->ref_key, f->w, f->h) : NULL;
 
                 if (ref && !ref->y) {
                     ref = NULL;
                 }
-                f->p_ref_missing = f->type == 1 && !ref;
+                f->p_ref_missing = f->type != 2 && !ref;
                 f->pic = h264_pic_new(mbw, f->h / 16, f->y, f->w, f->uv, f->w,
                                       ref ? ref->y : NULL,
                                       ref ? ref->uv : NULL, cqp,
                                       st->h264_t8x8);
+                if (f->type == 0) {
+                    AvpuRef *ref1 = avpu_ref_find(s, f->ref1_key, f->w, f->h);
+
+                    if (ref1 && ref1->y) {
+                        h264_pic_set_ref_l1(f->pic, ref1->y, ref1->uv,
+                                            f->ref1_key == f->ref_key);
+                    }
+                }
             }
             out = g_malloc0(capb);
             if (cabac) {
-                bits = h264_pic_slice_cabac(f->pic, f->type == 1, r0, rows,
-                                            f->qp, idc, out, capb, &pst) * 8;
+                bits = (f->type == 0 ?
+                        h264_pic_slice_b_cabac(f->pic, r0, rows, f->qp, idc,
+                                               out, capb, &pst) :
+                        h264_pic_slice_cabac(f->pic, f->type == 1, r0, rows,
+                                             f->qp, idc, out, capb, &pst)) * 8;
                 from = 0;
             } else {
                 /* from the slice header's last bit in its byte */
                 from = w.nbits;
-                bits = h264_pic_slice_cavlc(f->pic, f->type == 1, r0, rows,
-                                            f->qp, from, out, capb, &pst);
+                bits = f->type == 0 ?
+                    h264_pic_slice_b_cavlc(f->pic, r0, rows, f->qp, from, out,
+                                           capb, &pst) :
+                    h264_pic_slice_cavlc(f->pic, f->type == 1, r0, rows,
+                                         f->qp, from, out, capb, &pst);
             }
             avpu_wr_buf_bits(&w, out, from, MIN(bits, capb * 8));
             sl->coded = true;
@@ -1483,19 +1505,6 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                 f->pic = NULL;
                 avpu_dump_rec(s, f, rec->y, NULL, NULL, rec->uv);
             }
-        } else {
-            /* B: nothing changes (CABAC B skip contexts not modelled) */
-            cap = (size_t)nmb + 64;
-            out = g_malloc0(cap);
-            if (cabac) {
-                qemu_log_mask(LOG_UNIMP, "ingenic-avpu: CABAC B slice\n");
-                bits = h264_slice_pskip_cabac(f->qp, idc, nmb, out, cap) * 8;
-            } else {
-                from = w.nbits;
-                bits = h264_slice_pskip_cavlc(nmb, from, out, cap);
-            }
-            avpu_wr_buf_bits(&w, out, from, MIN(bits, cap * 8));
-            sl->coded = true;
         }
     }
     while (w.nbits) {                           /* aligned already */

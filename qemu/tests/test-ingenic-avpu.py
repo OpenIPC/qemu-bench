@@ -670,6 +670,146 @@ def test_h264_slices(qemu, ff, tmp):
               (k, psnr), psnr >= 30, True)
 
 
+def test_h264_b(qemu, ff, tmp):
+    """B pictures (libimp sends none; the command words as its slice buffers
+    would carry them: RefA at WA0, RefB at WA8): a pan coded I0 P2 B1 P4 B3,
+    two slices a picture, CABAC, each B from the pictures either side.  The
+    decoded pictures, in display order, must be the model's own
+    reconstructions sample for sample, and the B pictures near the source
+    and well under the I picture."""
+    print('H.264 B pictures, a pan (CABAC, Enc1 codes, RefA / RefB)')
+    dump = os.path.join(tmp, 'b-dump')
+    os.makedirs(dump, exist_ok=True)
+    qt = QTest(qemu, 't31', ['-global', 'ingenic-avpu.dump=%s' % dump])
+    mbw, mbh, qp, idc = W // 16, H // 16, 30, 0
+    a = RAM
+    cl1, bs, bs_size = a + 0x48000, a + 0x50000, 0x80000
+    recs = {t: a + 0x20000 + 0x10000 * t for t in range(5)}
+    order = [(0, 2, None, None), (2, 1, 0, None), (1, 0, 0, 2),
+             (4, 1, 2, None), (3, 0, 2, 4)]     # t, type (2 I 1 P 0 B), refs
+    sizes = {}
+    stream = b''
+
+    def sps2():
+        b = Bits()
+        b.u(77, 8); b.u(0, 8); b.u(30, 8); b.ue(0); b.ue(0); b.ue(0)
+        b.ue(0); b.ue(2); b.u(0, 1)             # two references
+        b.ue(mbw - 1); b.ue(mbh - 1)
+        b.u(1, 1); b.u(1, 1); b.u(0, 1); b.u(0, 1)
+        b.trailing()
+        return nal(0x67, b.bytes())
+
+    try:
+        qt.writel(AVPU + 0x14, 5)
+        frame_num = 0
+        for t, typ, r0, r1 in order:
+            y, uv = shifted(2 * t, t)
+            src = a + 0x10000 * (t & 1)
+            qt.write(src, y)
+            qt.write(src + PITCH * H, uv)
+            entries, regions = [], []
+            for sl in range(2):
+                region = 0x20000 * sl
+                hdr = Bits()
+                hdr.ue(sl * 3 * mbw)
+                hdr.ue({2: 7, 1: 5, 0: 6}[typ]); hdr.ue(0)
+                hdr.u(frame_num & 15, 4)
+                if typ == 2:
+                    hdr.ue(0)
+                hdr.u((2 * t) & 15, 4)
+                if typ == 0:
+                    hdr.u(1, 1)                 # direct_spatial_mv_pred
+                if typ != 2:
+                    hdr.u(0, 1)                 # override: the PPS's 1 / 1
+                    hdr.u(0, 1)                 # ref_pic_list_modification
+                    if typ == 0:
+                        hdr.u(0, 1)
+                if typ == 2:
+                    hdr.u(0, 1); hdr.u(0, 1)
+                elif typ == 1:
+                    hdr.u(0, 1)                 # B is not a reference
+                if typ != 2:
+                    hdr.ue(idc)
+                hdr.se(qp - 26); hdr.ue(0); hdr.se(0); hdr.se(0)
+                while len(hdr.b) % 8:
+                    hdr.u(1, 1)
+                start = b''
+                if typ == 2 and sl == 0:
+                    start = sps2() + pps(True, 2)
+                nalh = start + b'\x00\x00\x00\x01' + \
+                    bytes([{2: 0x65, 1: 0x41, 0: 0x01}[typ]])
+                before = nalh + escape(hdr.bytes())
+                qt.write(bs + region, before)
+                regions.append((region, len(before)))
+                e = [0] * 128
+                e[0] = (1 << 31) if sl == 1 else 0
+                e[1] = (W // 8 - 1) | ((H // 8 - 1) << 12)
+                e[2] = (idc << 8) | (1 << 10) | (1 << 11)
+                e[3] = (2 & 31) | ((2 & 31) << 8) | (qp << 16) | (typ << 28)
+                e[5] = (sl * 3) << 12
+                e[0x88 // 4] = PITCH
+                e[0x80 // 4], e[0x84 // 4] = src, src + PITCH * H
+                e[0x90 // 4], e[0x94 // 4] = recs[t], recs[t] + W * H
+                if r0 is not None:
+                    e[0xA0 // 4], e[0xA4 // 4] = recs[r0], recs[r0] + W * H
+                if r1 is not None:
+                    e[0xA8 // 4], e[0xAC // 4] = recs[r1], recs[r1] + W * H
+                e[0x70 // 4] = (idc << 8) | (qp << 16) | (typ << 28)
+                e[0x78 // 4] = 3 * mbw - 1
+                e[0xC0 // 4], e[0xC4 // 4] = bs, bs_size
+                e[0xC8 // 4] = region + len(before)
+                e[0xCC // 4] = 0x10000
+                entries.append(e)
+            qt.write(cl1, b''.join(v.to_bytes(4, 'little')
+                                   for e in entries for v in e))
+            qt.writel(AVPU + 0x3E0, cl1)
+            qt.writel(AVPU + 0x3E4, 2)
+            qt.step(1000000)
+            st = qt.readl(AVPU + 0x18)
+            qt.writel(AVPU + 0x18, st)
+            n = 0
+            for sl, (region, hlen) in enumerate(regions):
+                count = qt.readl(cl1 + 0x200 * sl + 0x104) & 0x3FFFFFFF
+                stream += qt.read(bs + region, hlen + count)
+                n += count
+            sizes[t] = n
+            check('B test: %s%d done' % ('IPB'[2 - typ] if typ else 'B', t),
+                  st & 1, 1)
+            if typ != 0:
+                frame_num += 1
+    finally:
+        qt.close()
+    path = os.path.join(tmp, 'b.h264')
+    open(path, 'wb').write(stream)
+    print('  slice bytes: %s' % ', '.join('%s%d %d' % (
+        'IPB'[2 - typ] if typ else 'B', t, sizes[t])
+        for t, typ, _, _ in order))
+    check('B pictures inter coded: each well under the I picture',
+          max(sizes[1], sizes[3]) * 2 < sizes[0], True)
+    if not ff:
+        print('  SKIP: no ffmpeg')
+        return
+    rc, raw, errs = decode(ff, path, 'nv12')
+    fs = W * H * 3 // 2
+    check('B test: five pictures decode without errors',
+          (rc, len(raw), errs), (0, 5 * fs, []))
+    rec = open(os.path.join(dump, 'avpu-%dx%d.h264.rec' % (W, H)),
+               'rb').read()
+    coded = [t for t, _, _, _ in order]
+    ok = len(rec) >= 5 * fs and all(
+        raw[t * fs:(t + 1) * fs] == rec[i * fs:(i + 1) * fs]
+        for i, t in enumerate(coded))
+    check('B test: every picture (display order) is the model\'s '
+          'reconstruction', ok, True)
+    for t in (1, 3):
+        ref = luma(shifted(2 * t, t)[0])
+        p = raw[t * fs:t * fs + W * H]
+        e = sum((p[i] - ref[i]) ** 2 for i in range(W * H)) / (W * H)
+        psnr = 10 * math.log10(255 * 255 / max(e, 1e-9))
+        check('B%d: luma PSNR %.1f dB against the source (>= 30)' %
+              (t, psnr), psnr >= 30, True)
+
+
 # ---- HEVC: the parameter sets and slice header hevc-enc's coder follows ----
 
 def hnal(t, rbsp):
@@ -989,6 +1129,7 @@ def main():
             qt.close()
         test_cavlc_change(args.qemu, ff, tmp)
         test_h264_slices(args.qemu, ff, tmp)
+        test_h264_b(args.qemu, ff, tmp)
         test_rebased(args.qemu)
         test_t41(args.qemu, ff, tmp)
     finally:
