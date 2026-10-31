@@ -133,6 +133,12 @@ cp qemu/hw/sd/sstar-fcie.c          "$QEMU_DIR/hw/sd/"
 cp qemu/hw/misc/sstar-cmdq.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
 cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
+cp qemu/hw/net/atbm-sdio.c          "$QEMU_DIR/hw/net/"
+if ! grep -q "atbm-sdio" "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('atbm-sdio.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  hw/net/meson.build: added atbm-sdio.c"
+fi
 cp qemu/include/hw/arm/novatek.h    "$QEMU_DIR/include/hw/arm/"
 cp qemu/include/hw/arm/nvt-lzma.h   "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/nvt-top.c           "$QEMU_DIR/hw/misc/"

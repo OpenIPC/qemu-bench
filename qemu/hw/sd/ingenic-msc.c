@@ -151,6 +151,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMscState, INGENIC_MSC)
 #define IFLG_CRC_WRITE_ERR  (1u << 10)
 #define IFLG_TIMEOUT_RES    (1u << 9)
 #define IFLG_TIMEOUT_READ   (1u << 8)
+#define IFLG_SDIO           (1u << 7)
 #define IFLG_TXFIFO_WR_REQ  (1u << 6)
 #define IFLG_RXFIFO_RD_REQ  (1u << 5)
 #define IFLG_END_CMD_RES    (1u << 2)
@@ -179,6 +180,7 @@ struct IngenicMscState {
     uint32_t dmac, dmanda, dmada, dmalen, dmacmd;
     uint32_t ctrl2, rtcnt, debug;
     bool clk_en;
+    bool sdio_int;          /* an SDIO card is asserting its interrupt */
 
     uint16_t res[RES_HALFWORDS];
     uint32_t res_len, res_pos;
@@ -213,6 +215,9 @@ static uint32_t msc_iflg(IngenicMscState *s)
         } else if (s->data_dir == DATA_WRITE) {
             v |= IFLG_TXFIFO_WR_REQ;
         }
+    }
+    if (s->sdio_int) {
+        v |= IFLG_SDIO;
     }
     return v;
 }
@@ -666,6 +671,14 @@ static const MemoryRegionOps ingenic_msc_ops = {
     .impl.max_access_size = 4,
 };
 
+static void msc_set_sdio_irq(DeviceState *dev, bool level)
+{
+    IngenicMscState *s = INGENIC_MSC(dev);
+
+    s->sdio_int = level;
+    msc_update_irq(s);
+}
+
 static void msc_set_inserted(DeviceState *dev, bool inserted)
 {
     IngenicMscState *s = INGENIC_MSC(dev);
@@ -763,6 +776,7 @@ static void ingenic_msc_bus_class_init(ObjectClass *klass, const void *data)
     SDBusClass *sbc = SD_BUS_CLASS(klass);
 
     sbc->set_inserted = msc_set_inserted;
+    sbc->set_sdio_irq = msc_set_sdio_irq;
 }
 
 static const TypeInfo ingenic_msc_types[] = {
