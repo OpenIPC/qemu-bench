@@ -14,7 +14,7 @@
  *   0x08 HSINTM bit n enables HSSR bit n's interrupt
  *   0x0C HSSA   DMA source (physical)
  *   0x10 HSTC   DMA length in 64-byte units
- *   0x14 HSDI   data by the CPU (no driver uses it; ignored)
+ *   0x14 HSDI   data by the CPU (below)
  *   0x18 HSDO   the state, a word per read
  *   0x1C HSCG   clock gate, storage
  *
@@ -24,6 +24,19 @@
  * endian word: the 4.4 driver stores the words as they come and hands
  * the bytes to the crypto API, whose self-tests compare them with the
  * standard digests.
+ *
+ * CPU mode (HSDI) is inferred: no driver, sample or document here feeds
+ * HSDI (the 4.4 driver defines HASH_FLAGS_CPU and never uses it).  It
+ * is modelled as the DMA path fed by the CPU: with HSCR enabled and DMA
+ * off, each HSDI word is four message bytes in memory order (what a
+ * load from the DMA's buffer gives), and every 64 bytes (128 for SHA-384
+ * and SHA-512) run a block: HSSR bit 0 a round done, and after HSTC
+ * blocks (when HSTC is non-zero) bit 1 all rounds done, as at the end of
+ * a DMA run.  Loading the state (HSCR bit 4) empties a part-filled
+ * block.  HSCR bits 8:7 (byte order) are not acted on in either mode:
+ * the 4.4 driver sets 3 for SHA and 0 for MD5, sample_hash sets 1 (bit
+ * 7) for SHA and 2 (bit 8) for MD5, and both expect the standard digest,
+ * so their meaning cannot be told from these sources.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -74,6 +87,8 @@ struct IngenicHashState {
     uint64_t h[8];                  /* the state (32-bit words in h[0..7]
                                        for MD5 / SHA-1 / SHA-256) */
     uint32_t nout;
+    uint8_t cpu_blk[128];           /* CPU mode: the block being filled */
+    uint32_t cpu_fill, cpu_blocks;
 };
 
 /* --- the block functions ------------------------------------------------- */
@@ -351,6 +366,51 @@ static void hash_init_state(IngenicHashState *s)
         }
     }
     s->nout = 0;
+    s->cpu_fill = s->cpu_blocks = 0;
+}
+
+static void hash_block(IngenicHashState *s, const uint8_t *blk)
+{
+    switch (hash_alg(s)) {
+    case ALG_MD5:
+        md5_block(s->h, blk);
+        break;
+    case ALG_SHA1:
+        sha1_block(s->h, blk);
+        break;
+    case ALG_SHA224:
+    case ALG_SHA256:
+        sha256_block(s->h, blk);
+        break;
+    default:
+        sha512_block(s->h, blk);
+        break;
+    }
+}
+
+/* CPU mode (inferred, see the top): one word of the message by HSDI */
+static void hash_cpu_word(IngenicHashState *s, uint32_t val)
+{
+    int bs = hash_alg(s) >= ALG_SHA384 ? 128 : 64;
+
+    if ((s->hscr & (HSCR_EN | HSCR_DMAE)) != HSCR_EN) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-hash: HSDI with the engine "
+                      "off or in DMA mode\n");
+        return;
+    }
+    stl_le_p(s->cpu_blk + s->cpu_fill, val);
+    s->cpu_fill += 4;
+    if (s->cpu_fill < bs) {
+        return;
+    }
+    hash_block(s, s->cpu_blk);
+    s->cpu_fill = 0;
+    s->nout = 0;
+    s->hssr |= HSSR_ORD;
+    if (s->hstc && ++s->cpu_blocks * (bs / 64) >= s->hstc) {
+        s->hssr |= HSSR_MRD;
+        s->cpu_blocks = 0;
+    }
 }
 
 static void hash_dma(IngenicHashState *s)
@@ -366,21 +426,7 @@ static void hash_dma(IngenicHashState *s)
                           s->hssa + off);
             break;
         }
-        switch (alg) {
-        case ALG_MD5:
-            md5_block(s->h, blk);
-            break;
-        case ALG_SHA1:
-            sha1_block(s->h, blk);
-            break;
-        case ALG_SHA224:
-        case ALG_SHA256:
-            sha256_block(s->h, blk);
-            break;
-        default:
-            sha512_block(s->h, blk);
-            break;
-        }
+        hash_block(s, blk);
     }
     s->nout = 0;
     s->hssr |= HSSR_ORD | HSSR_MRD;
@@ -457,9 +503,10 @@ static void ingenic_hash_write(void *opaque, hwaddr off, uint64_t val,
         break;
     case R_HSTC:
         s->hstc = val;
+        s->cpu_blocks = 0;
         break;
     case R_HSDI:
-        qemu_log_mask(LOG_UNIMP, "ingenic-hash: HSDI (CPU mode)\n");
+        hash_cpu_word(s, val);
         break;
     case R_HSCG:
         s->hscg = val;
@@ -483,6 +530,7 @@ static void ingenic_hash_reset(DeviceState *dev)
     s->hscr = s->hssr = s->hsintm = s->hssa = s->hstc = s->hscg = 0;
     memset(s->h, 0, sizeof(s->h));
     s->nout = 0;
+    s->cpu_fill = s->cpu_blocks = 0;
     hash_update(s);
 }
 
@@ -498,8 +546,8 @@ static void ingenic_hash_init(Object *obj)
 
 static const VMStateDescription vmstate_ingenic_hash = {
     .name = TYPE_INGENIC_HASH,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(hscr, IngenicHashState),
         VMSTATE_UINT32(hssr, IngenicHashState),
@@ -509,6 +557,9 @@ static const VMStateDescription vmstate_ingenic_hash = {
         VMSTATE_UINT32(hscg, IngenicHashState),
         VMSTATE_UINT64_ARRAY(h, IngenicHashState, 8),
         VMSTATE_UINT32(nout, IngenicHashState),
+        VMSTATE_UINT8_ARRAY(cpu_blk, IngenicHashState, 128),
+        VMSTATE_UINT32(cpu_fill, IngenicHashState),
+        VMSTATE_UINT32(cpu_blocks, IngenicHashState),
         VMSTATE_END_OF_LIST()
     }
 };
