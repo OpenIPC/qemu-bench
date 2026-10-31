@@ -11,9 +11,10 @@
  *    0 where the SPS allows a split);
  *  - or intra DC, as the I slices' CUs, where nothing in the reference
  *    comes close.
- * Motion is full-pel at even luma positions (vectors are multiples of 8
- * quarter-samples), so that chroma is full-pel too and prediction is a copy
- * of the reference (8.5.3.3.3: integer positions, clipped to the picture);
+ * Motion is searched at whole samples (the candidates, a grid, a diamond),
+ * then refined to half and quarter samples; prediction interpolates the
+ * reference as the decoder does (8.5.3.3.3: the luma 8-tap and chroma
+ * 4-tap filters, samples outside the picture its edge's);
  * one reference, refIdx 0.  The merge list (8.5.3.2.2-5: A1, B1, B0, A0, B2
  * with their comparisons, the temporal candidate, zero candidates up to
  * MaxNumMergeCand) and the AMVP list (8.5.3.2.6-8) are built as the decoder
@@ -553,57 +554,147 @@ static void amvp_list(const Pic *p, int x0, int y0, Mv *list)
     }
 }
 
-/* the prediction of the CU at (x0, y0) by mv: a copy of the reference,
- * clipped to it (vectors are even luma samples) */
-static void mc_cu(const Pic *p, int x0, int y0, Mv mv, uint8_t py[64],
-                  uint8_t pc[2][16])
-{
-    const HevcEncRef *r = p->ref;
-    const int dx = mv.x >> 2, dy = mv.y >> 2, cw = p->w / 2, ch = p->h / 2;
-    int x, y, comp;
+/*
+ * Fractional sample interpolation (8.5.3.3.3), 8-bit samples: the luma
+ * 8-tap filters at quarter positions, the chroma 4-tap ones at eighth
+ * positions; reference samples outside the picture are its edge's.  One
+ * direction filtered: the sum (shift1 0); both: the horizontal sums of the
+ * rows around, then the vertical filter of those >> 6 (shift2); an integer
+ * position: the sample << 6 (shift3).  The uni-directional default
+ * weighting then rounds >> 6.
+ */
+static const int8_t fl_luma[4][8] = {
+    { 0, 0, 0, 64, 0, 0, 0, 0 },
+    { -1, 4, -10, 58, 17, -5, 1, 0 },
+    { -1, 4, -11, 40, 40, -11, 4, -1 },
+    { 0, 1, -5, 17, 58, -10, 4, -1 },
+};
+static const int8_t fl_chroma[8][4] = {
+    { 0, 64, 0, 0 }, { -2, 58, 10, -2 }, { -4, 54, 16, -2 },
+    { -6, 46, 28, -4 }, { -4, 36, 36, -4 }, { -4, 28, 46, -6 },
+    { -2, 16, 54, -4 }, { -2, 10, 58, -2 },
+};
 
-    for (y = 0; y < 8; y++) {
-        const int ry = MIN(MAX(y0 + y + dy, 0), p->h - 1);
-        for (x = 0; x < 8; x++) {
-            py[y * 8 + x] = r->y[ry * p->w + MIN(MAX(x0 + x + dx, 0),
-                                                p->w - 1)];
+static inline int ref_at(const uint8_t *pl, int w, int h, int x, int y)
+{
+    return pl[MIN(MAX(y, 0), h - 1) * w + MIN(MAX(x, 0), w - 1)];
+}
+
+/* bw x bh samples of plane pl (w x h) at integer (xi, yi), fraction
+ * (fx, fy) of taps-tap filter f (rows of 8 or 4) */
+static void interp(const uint8_t *pl, int w, int h, int xi, int yi,
+                   int fx, int fy, int bw, int bh, int taps,
+                   const int8_t *f, uint8_t *out)
+{
+    const int half = taps / 2 - 1;
+    const int8_t *hx = f + fx * taps, *hy = f + fy * taps;
+    int tmp[(8 + 7) * 8];
+    int x, y, k;
+
+    if (!fx && !fy) {
+        for (y = 0; y < bh; y++) {
+            for (x = 0; x < bw; x++) {
+                out[y * bw + x] = ref_at(pl, w, h, xi + x, yi + y);
+            }
+        }
+        return;
+    }
+    if (!fy) {
+        for (y = 0; y < bh; y++) {
+            for (x = 0; x < bw; x++) {
+                int v = 0;
+                for (k = 0; k < taps; k++) {
+                    v += hx[k] * ref_at(pl, w, h, xi + x + k - half, yi + y);
+                }
+                out[y * bw + x] = clip1((v + 32) >> 6);
+            }
+        }
+        return;
+    }
+    if (!fx) {
+        for (y = 0; y < bh; y++) {
+            for (x = 0; x < bw; x++) {
+                int v = 0;
+                for (k = 0; k < taps; k++) {
+                    v += hy[k] * ref_at(pl, w, h, xi + x, yi + y + k - half);
+                }
+                out[y * bw + x] = clip1((v + 32) >> 6);
+            }
+        }
+        return;
+    }
+    for (y = 0; y < bh + taps - 1; y++) {
+        for (x = 0; x < bw; x++) {
+            int v = 0;
+            for (k = 0; k < taps; k++) {
+                v += hx[k] * ref_at(pl, w, h, xi + x + k - half,
+                                    yi + y - half);
+            }
+            tmp[y * bw + x] = v;
         }
     }
-    for (comp = 0; comp < 2; comp++) {
-        const uint8_t *pl = comp ? r->cr : r->cb;
-        for (y = 0; y < 4; y++) {
-            const int ry = MIN(MAX(y0 / 2 + y + dy / 2, 0), ch - 1);
-            for (x = 0; x < 4; x++) {
-                pc[comp][y * 4 + x] =
-                    pl[ry * cw + MIN(MAX(x0 / 2 + x + dx / 2, 0), cw - 1)];
+    for (y = 0; y < bh; y++) {
+        for (x = 0; x < bw; x++) {
+            int v = 0;
+            for (k = 0; k < taps; k++) {
+                v += hy[k] * tmp[(y + k) * bw + x];
             }
+            out[y * bw + x] = clip1(((v >> 6) + 32) >> 6);
         }
     }
 }
 
+/* the prediction of the CU at (x0, y0) by mv (quarter luma samples; the
+ * same value is eighth chroma samples in 4:2:0) */
+static void mc_cu(const Pic *p, int x0, int y0, Mv mv, uint8_t py[64],
+                  uint8_t pc[2][16])
+{
+    const HevcEncRef *r = p->ref;
+    const int cw = p->w / 2, ch = p->h / 2;
+
+    interp(r->y, p->w, p->h, x0 + (mv.x >> 2), y0 + (mv.y >> 2),
+           mv.x & 3, mv.y & 3, 8, 8, 8, &fl_luma[0][0], py);
+    interp(r->cb, cw, ch, x0 / 2 + (mv.x >> 3), y0 / 2 + (mv.y >> 3),
+           mv.x & 7, mv.y & 7, 4, 4, 4, &fl_chroma[0][0], pc[0]);
+    interp(r->cr, cw, ch, x0 / 2 + (mv.x >> 3), y0 / 2 + (mv.y >> 3),
+           mv.x & 7, mv.y & 7, 4, 4, 4, &fl_chroma[0][0], pc[1]);
+}
+
+/* the luma SAD of the prediction by mv (the search's measure) */
 static int sad_cu(const Pic *p, int x0, int y0, Mv mv, int best)
 {
-    const int dx = mv.x >> 2, dy = mv.y >> 2;
+    uint8_t py[64];
     int x, y, s = 0;
 
+    if (!(mv.x & 3) && !(mv.y & 3)) {
+        const int dx = mv.x >> 2, dy = mv.y >> 2;
+        for (y = 0; y < 8; y++) {
+            const uint8_t *src = p->cy + (y0 + y) * p->w + x0;
+            for (x = 0; x < 8; x++) {
+                s += abs(src[x] - ref_at(p->ref->y, p->w, p->h,
+                                         x0 + x + dx, y0 + y + dy));
+            }
+            if (s >= best) {
+                return s;
+            }
+        }
+        return s;
+    }
+    interp(p->ref->y, p->w, p->h, x0 + (mv.x >> 2), y0 + (mv.y >> 2),
+           mv.x & 3, mv.y & 3, 8, 8, 8, &fl_luma[0][0], py);
     for (y = 0; y < 8; y++) {
-        const int ry = MIN(MAX(y0 + y + dy, 0), p->h - 1);
         const uint8_t *src = p->cy + (y0 + y) * p->w + x0;
         for (x = 0; x < 8; x++) {
-            s += abs(src[x] - p->ref->y[ry * p->w + MIN(MAX(x0 + x + dx, 0),
-                                                        p->w - 1)]);
-        }
-        if (s >= best) {
-            return s;
+            s += abs(src[x] - py[y * 8 + x]);
         }
     }
     return s;
 }
 
-/* bits of one mvd component, roughly: for the search's cost */
+/* bits of one mvd component (quarter samples), roughly: for the search */
 static int mvd_bits(int d)
 {
-    int a = abs(d) >> 3, b = 1;
+    int a = abs(d), b = 1;
 
     while (a) {
         b += 2;
@@ -866,9 +957,6 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
     for (i = 0; i < nm; i++) {
         int e;
 
-        if ((merge[i].x & 7) || (merge[i].y & 7)) {
-            continue;                       /* not full-pel chroma */
-        }
         mc_cu(p, x0, y0, merge[i], py, pc);
         inter_residual(p, x0, y0, py, pc, &r);
         if (r.cy || r.ccb || r.ccr) {
@@ -906,8 +994,8 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
             cand[nc++] = merge[i];
         }
         for (i = 0; i < nc; i++) {
-            const Mv m = { (int16_t)(((cand[i].x + 4) >> 3) << 3),
-                           (int16_t)(((cand[i].y + 4) >> 3) << 3) };
+            const Mv m = { (int16_t)(((cand[i].x + 2) >> 2) << 2),
+                           (int16_t)(((cand[i].y + 2) >> 2) << 2) };
             const int cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
                 (mvd_bits(m.x - amvp[0].x) + mvd_bits(m.y - amvp[0].y));
             if (cost < best_cost) {
@@ -933,7 +1021,7 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
         }
         for (it = 0; it < 16 && best_cost; it++) {
             static const int8_t dia[4][2] = {
-                { -8, 0 }, { 8, 0 }, { 0, -8 }, { 0, 8 },
+                { -4, 0 }, { 4, 0 }, { 0, -4 }, { 0, 4 },
             };
             Mv nb = best;
 
@@ -954,6 +1042,30 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
             }
             if (mv_eq(nb, best)) {
                 break;
+            }
+            best = nb;
+        }
+        /* then half and quarter samples around the full-sample best */
+        for (int step = 2; step >= 1 && best_cost; step >>= 1) {
+            Mv nb = best;
+
+            for (int dy = -step; dy <= step; dy += step) {
+                for (int dx = -step; dx <= step; dx += step) {
+                    const Mv m = { (int16_t)(best.x + dx),
+                                   (int16_t)(best.y + dy) };
+                    int cost;
+
+                    if ((!dx && !dy) || abs(m.x) > 256 || abs(m.y) > 256) {
+                        continue;
+                    }
+                    cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
+                        (mvd_bits(m.x - amvp[0].x) +
+                         mvd_bits(m.y - amvp[0].y));
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        nb = m;
+                    }
+                }
             }
             best = nb;
         }
