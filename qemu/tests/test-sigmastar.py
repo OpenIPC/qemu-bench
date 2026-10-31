@@ -1173,6 +1173,14 @@ def test_i3_mfe(qt):
           ('fef8', 'fac9242e0e'))
     check(what + 'the reconstruction', b64read(qt, DRAM + MFE_REC[0], size),
           flat)
+    check('MFE: the sum of the qsteps of all MBs but the first (msb2)',
+          qt.readw(I3_MFE + 4 * 0xF5) | qt.readw(I3_MFE + 4 * 0xF6) << 16, 0)
+    qt.writew(I3_MFE + 4 * 0x27, 650)           # qp2qs(26)
+    bits, data = mfe_frame(qt, 0, flat, hdr, 8 * len(hdr))
+    check('MFE: ... with the frame qstep set, 3 x it',
+          qt.readw(I3_MFE + 4 * 0xF5) | qt.readw(I3_MFE + 4 * 0xF6) << 16,
+          3 * 650)
+    qt.writew(I3_MFE + 4 * 0x27, 0)
     qt.writew(I3_MFE + 4 * 0x1D, 1)
     check('MFE: clearing frame done drops the line',
           (qt.readw(I3_MFE + 4 * 0x1E), irq()), (0, 0))
@@ -1212,6 +1220,7 @@ ISP_W, ISP_H = 320, 240
 ISP_AE = 0x02000000                             # MIU addresses
 ISP_AWB = 0x02002000
 ISP_ML = 0x02004000
+ISP_HIS = 0x02006000
 ISP_Y = 0x02010000
 ISP_C = 0x02020000
 
@@ -1259,8 +1268,15 @@ def test_i3_isp(qt):
     for reg, v in ((0x01, w // 8 - 1), (0x02, h // 8 - 1), (0x03, 0x0707),
                    (0x51, w // 8 - 1), (0x52, h // 8 - 1), (0x53, 0x0707)):
         qt.writew(riu(0x1305, reg), v)
+    # the histogram on the same 8x8 grid: window 0 all of it, window 1
+    # the 2x2 blocks from (2, 2)
+    for reg, v in ((0x61, w // 8 - 1), (0x62, h // 8 - 1), (0x63, 0x0707),
+                   (0x70, 0x0700), (0x71, 0x0700), (0x72, 0x0102),
+                   (0x73, 0x0102), (0x60, 0x0C)):
+        qt.writew(riu(0x1305, reg), v)
     for reg, a in ((0x06, ISP_AE), (0x10, ISP_AE + 0x1000),
-                   (0x08, ISP_AWB), (0x12, ISP_AWB + 0x1000)):
+                   (0x08, ISP_AWB), (0x12, ISP_AWB + 0x1000),
+                   (0x0A, ISP_HIS), (0x14, ISP_HIS + 0x2F0)):
         qt.writew(riu(0x1305, reg), a >> 4 & 0xFFFF)
         qt.writew(riu(0x1305, reg + 1), a >> 20)
     # SC1 FRM, one 64x48 NV12 buffer
@@ -1270,6 +1286,9 @@ def test_i3_isp(qt):
                    (0x18, 0), (0x1A, 64), (0x1B, 48), (0x1E, 0x8),
                    (0x01, 0x8000)):
         qt.writew(riu(dma, reg), v)
+    # the R, G, B histograms in front of the luma windows are not the
+    # model's to write: mark them and see the mark survive the frames
+    b64write(qt, DRAM + ISP_HIS, b'\x5a' * 240)
     qt.writew(I3_ISP0 + 4 * 0x28, 0xBFFF)       # unmask VSYNC: streaming
     i3_isp_frames(qt, 2)
 
@@ -1281,6 +1300,12 @@ def test_i3_isp(qt):
           [36, 45, 19, 39])
     check('ISP AWB block: R, G, B', i3_isp_block(qt, ISP_AWB, 26, 3),
           [36, 45, 19])
+    his = struct.unpack('<256H', b64read(qt, DRAM + ISP_HIS + 240, 512))
+    check('ISP histogram: window 0 counts its 64 blocks by Y / 2, the '
+          'logo block among them; window 1 its 4',
+          (sum(his[:128]), his[39 >> 1] >= 1, sum(his[128:])), (64, True, 4))
+    check('ISP histogram: the R, G, B parts before the windows untouched',
+          b64read(qt, DRAM + ISP_HIS, 240), b'\x5a' * 240)
     i3_sensor(qt, 0x01, 600 & 0xFF)             # twice the exposure
     i3_sensor(qt, 0x02, 600 >> 8)
     i3_isp_frames(qt, 1)

@@ -484,8 +484,15 @@ those models serve it unchanged. What differs:
   come from the data after OBC, before white balance: per block the mean
   R, G, B (and Y for AE) as 8 bits, in the block grid and at the DMA
   bases userspace sets in ISP3 (bank `0x1305`): 128x80 AE blocks of 4
-  bytes and 128x90 AWB blocks of 3. The vendor AE and AWB converge on
-  them: on the camera dump the exposure settles at 1686 rows (gain
+  bytes and 128x90 AWB blocks of 3, and two luma histograms (ISP3
+  `0x60`-`0x74`: each window counts its blocks by Y / 2 into 128 16-bit
+  bins, at the histogram base + 240 and + 496). The histograms are not
+  optional: libCamAlgo's AE scans window 0's bins down for the top
+  non-empty one with an 8-bit index that wraps, so with all of them
+  empty `ISP_workqueue` spins there at 100 % CPU for good and the
+  pipeline never starts (an OpenIPC image's majestic did; the camera
+  dump's application streamed without them). The vendor AE and AWB
+  converge on them: on the camera dump the exposure settles at 1686 rows (gain
   1.125x), the white logo at full scale over the dark navy, and
   the WB gains at R 1.21, B 2.53, which make the white neutral (1/0.82,
   1/0.40). `qom-set /machine/isp light|light-r|light-b`
@@ -514,6 +521,10 @@ those models serve it unchanged. What differs:
   `0x03` bit 13 says (the camera app streams Main profile, CABAC). Slice
   QP, deblocking control and chroma QP offset come from the registers
   the driver fills from the same values; `cabac_init_idc` is always 0.
+  `0xF5`/`0xF6` report the sum of the macroblocks' qsteps (all at the
+  frame's, `0x27`), which the `msb2` rate control averages with when its
+  MB rate control is on: read as 0, the next I frame's `msb2_enc_conf`
+  divides by zero.
   I frames are Intra16x16 without residual where a V, H or DC prediction
   is exact, I_PCM elsewhere; P frames are P_Skip where the picture is
   within 2 of the reference in every sample (`skip-tolerance`), I_PCM

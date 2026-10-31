@@ -35,8 +35,9 @@
  *
  * Each frame, while group 1's VSYNC is unmasked (HalISPEnableInt at the
  * end of probe): VSYNC; at 60 % of the frame the picture and statistics
- * (below), then AE row, AE window 0, AE and AWB done; at 90 % the frame
- * end, the output end, line count 3, the done count and CSI's VC0.  GPIO
+ * (below), then AE row, AE window 0, histogram row (group 3 bit 12), AE
+ * and AWB done; at 90 % the frame end, the output end, line count 3, the
+ * done count and CSI's VC0.  GPIO
  * out 0 pulses at the frame start and 1 at the frame end, for the
  * scaler, which takes the picture through sstar_i3_isp_frame().
  *
@@ -79,11 +80,12 @@
  * Passed through: LSC and ALSC (off), DPC, spike, Bayer and YUV noise
  * reduction, false-colour suppression and the demosaic's own filters (a
  * synthetic noise-free scene has nothing for them), FPN (off), HSV and
- * saturation tables (off), RGB-IR, HDR and the other statistics (AF,
- * histograms: not written).  The VIP's YUV gamma (bank 0x1226 0x40) and
- * the scaler's RGB gammas and CCM (bank 0x1211 0x62, 0x76, 0x77) sit in
- * the scaler; the application leaves its gammas off and its CCM at the
- * identity, so the picture leaves the ISP as it goes into the encoder.
+ * saturation tables (off), RGB-IR, HDR and the other statistics (AF and
+ * the R, G, B histograms: not written).  The VIP's YUV gamma (bank 0x1226
+ * 0x40) and the scaler's RGB gammas and CCM (bank 0x1211 0x62, 0x76,
+ * 0x77) sit in the scaler; the application leaves its gammas off and its
+ * CCM at the identity, so the picture leaves the ISP as it goes into the
+ * encoder.
  *
  * The statistics: per block the mean R, G and B (and for AE a Y, 0.30 R +
  * 0.59 G + 0.11 B) of the OBC'd data as 8 bits (12-bit >> 4).  AE blocks
@@ -94,6 +96,15 @@
  * then the rest; the maximum is exclusive.  The camera's 3A asks for
  * 128x80 AE blocks of 15x13 and 128x90 AWB blocks of 15x12, and runs its
  * exposure (sensor rows and gain, over I2C) and its WBG1 gains from them.
+ * The luma histograms: ISP3 0x0A/0x0B the base, 0x14/0x15 the max, a
+ * block grid of their own (0x61/0x62 size - 1, 0x63 blocks - 1, 0x64/0x65
+ * offset), and two windows in blocks (0x70/0x71, 0x72/0x73: [6:0]
+ * offset, [14:8] blocks - 1), enabled by 0x60 bits 2 and 3.  Each counts
+ * its blocks by their Y (as AE's) / 2 into 128 16-bit bins, window 0 at
+ * the base + 240, window 1 at + 496, behind R, G, B histograms of 80
+ * bytes each (drv_isp.c's ISP_STATIS_MEM).  The 3A needs them: its AE
+ * (libCamAlgo.so) looks down window 0's bins for the top non-empty one
+ * and never stops when all are empty.
  * With no sensor, the ISP off (ISP0 0x00 bit 0) or "pixels" off, every
  * block reads mid grey and there is no picture.
  *
@@ -166,6 +177,7 @@
 #define G3_IN_DONE          (1u << 4)
 #define G3_OUT_DONE         (1u << 5)
 #define G3_HIT_LINE3        (1u << 8)
+#define G3_HISTO_ROW        (1u << 12)
 
 /* ISP4 */
 #define ML_CTRL             0x00
@@ -197,6 +209,22 @@
 #define STS_AWB_SIZE        0x51
 #define STS_AWB_NUM         0x53
 #define STS_AWB_OFFSET      0x54
+#define STS_HIS_BASE        0x0A
+#define STS_HIS_MAX         0x14
+#define STS_HIS_EN          0x60        /* bit 2 window 0, bit 3 window 1 */
+#define STS_HIS_SIZE        0x61
+#define STS_HIS_NUM         0x63
+#define STS_HIS_OFFSET      0x64
+#define STS_HIS_SHIFT       0x6E        /* [3:0] the counts' right shift */
+#define STS_HIS_WIN         0x70        /* x then y a window: [6:0] block */
+                                        /* offset, [14:8] blocks - 1 */
+/*
+ * The histogram buffer (drv_isp.c's ISP_STATIS_MEM.histo): R, G and B
+ * parts of 80 bytes (not written), then windows 0 and 1, 128 16-bit bins
+ * each, which libCamAlgo's AE copies from +240 as its pHist128.
+ */
+#define HIS_WIN0            240
+#define HIS_BINS            128
 /* ISP6 */
 #define WBG1_GAIN           0x48
 
@@ -279,7 +307,7 @@ struct SstarI3IspState {
     uint16_t *raw;                  /* 10-bit Bayer at the crop size */
     uint8_t *yuv;                   /* Y, Cb, Cr planes at half that */
     uint8_t *idx;                   /* a scene row, the last odd, even */
-    uint32_t *ae, *awb;             /* block sums: R, G, B, count */
+    uint32_t *ae, *awb, *his;       /* block sums: R, G, B, count */
     int out_w, out_h;
     bool have_frame;
 };
@@ -338,17 +366,25 @@ static hwaddr i3_isp_miu(SstarI3IspState *s, int reg)
     return (hwaddr)v << 4;
 }
 
-static void i3_isp_dma(SstarI3IspState *s, int base_reg, int max_reg,
-                       const uint8_t *buf, uint32_t len)
+/* @len bytes at @off into the buffer ISP3 @base_reg / @max_reg give. */
+static void i3_isp_dma_at(SstarI3IspState *s, int base_reg, int max_reg,
+                          uint32_t off, const uint8_t *buf, uint32_t len)
 {
     hwaddr base = i3_isp_miu(s, base_reg);
     hwaddr max = i3_isp_miu(s, max_reg);
 
-    if (!base || max <= base) {
+    if (!base || max <= base + off) {
         return;
     }
-    address_space_write(&address_space_memory, DRAM_BASE + base,
-                        MEMTXATTRS_UNSPECIFIED, buf, MIN(len, max - base));
+    address_space_write(&address_space_memory, DRAM_BASE + base + off,
+                        MEMTXATTRS_UNSPECIFIED, buf,
+                        MIN(len, max - base - off));
+}
+
+static void i3_isp_dma(SstarI3IspState *s, int base_reg, int max_reg,
+                       const uint8_t *buf, uint32_t len)
+{
+    i3_isp_dma_at(s, base_reg, max_reg, 0, buf, len);
 }
 
 static uint32_t i3_isp_blocks(SstarI3IspState *s, int num_reg)
@@ -356,6 +392,49 @@ static uint32_t i3_isp_blocks(SstarI3IspState *s, int num_reg)
     uint16_t n = sstar_riu_get(s->riu, BANK_ISP3, num_reg);
 
     return ((n & 0x7F) + 1) * (((n >> 8) & 0x7F) + 1);
+}
+
+/*
+ * The luma histograms: each enabled window counts its blocks (ISP3
+ * 0x61-0x65, the grid) by their mean Y, 8 bits, into 128 bins.  The AE
+ * scans pHist128 down from the top bin for the first one that is not
+ * empty, with an 8-bit index that wraps: all-zero bins hang ISP_workqueue
+ * in that loop for good, a CPU at 100 % and the pipeline stalled.  @y
+ * is a Y a block, or NULL for all mid grey.
+ */
+static void i3_isp_write_histo(SstarI3IspState *s, const uint8_t *y)
+{
+    uint16_t en = sstar_riu_get(s->riu, BANK_ISP3, STS_HIS_EN);
+    uint16_t n = sstar_riu_get(s->riu, BANK_ISP3, STS_HIS_NUM);
+    int shift = sstar_riu_get(s->riu, BANK_ISP3, STS_HIS_SHIFT) & 0xF;
+    int nx = (n & 0x7F) + 1, ny = ((n >> 8) & 0x7F) + 1;
+    uint8_t buf[HIS_BINS * 2];
+    int w, bx, by, i;
+
+    for (w = 0; w < 2; w++) {
+        uint16_t wx = sstar_riu_get(s->riu, BANK_ISP3, STS_HIS_WIN + 2 * w);
+        uint16_t wy = sstar_riu_get(s->riu, BANK_ISP3,
+                                    STS_HIS_WIN + 2 * w + 1);
+        int x0 = wx & 0x7F, x1 = MIN(x0 + ((wx >> 8) & 0x7F) + 1, nx);
+        int y0 = wy & 0x7F, y1 = MIN(y0 + ((wy >> 8) & 0x7F) + 1, ny);
+        uint32_t cnt[HIS_BINS] = { 0 };
+
+        if (!(en & (4u << w))) {
+            continue;
+        }
+        for (by = y0; by < y1; by++) {
+            for (bx = x0; bx < x1; bx++) {
+                cnt[(y ? y[by * nx + bx] : 0x80) >> 1]++;
+            }
+        }
+        for (i = 0; i < HIS_BINS; i++) {
+            stw_le_p(buf + i * 2, MIN(cnt[i] >> shift, 0xFFFF));
+        }
+        /* The window's own bins only: the R, G, B parts before them and a
+         * window that is off are not the ISP's to write. */
+        i3_isp_dma_at(s, STS_HIS_BASE, STS_HIS_MAX,
+                      HIS_WIN0 + w * HIS_BINS * 2, buf, sizeof(buf));
+    }
 }
 
 /* Without a picture: every block mid grey. */
@@ -368,6 +447,7 @@ static void i3_isp_grey_stats(SstarI3IspState *s)
     memset(buf, 0x80, MAX(ae, awb));
     i3_isp_dma(s, STS_AE_BASE, STS_AE_MAX, buf, ae);
     i3_isp_dma(s, STS_AWB_BASE, STS_AWB_MAX, buf, awb);
+    i3_isp_write_histo(s, NULL);
 }
 
 static uint16_t i3_isp1(SstarI3IspState *s, int reg)
@@ -558,10 +638,13 @@ static void i3_isp_block_map(SstarI3IspState *s, int size_reg, int num_reg,
     }
 }
 
-static void i3_isp_write_stats(SstarI3IspState *s, const uint32_t *sum,
-                               int n, int bpb, int base_reg, int max_reg)
+/*
+ * Per block the mean R, G, B in @bpb bytes (the AE's 4 add Y), or with
+ * @bpb 0 only the Y, the histogram's, in @buf.
+ */
+static void i3_isp_block_means(SstarI3IspState *s, const uint32_t *sum,
+                               int n, int bpb, uint8_t *buf)
 {
-    g_autofree uint8_t *buf = g_malloc0(n * bpb);
     int i, c;
 
     for (i = 0; i < n; i++, sum += 4) {
@@ -576,12 +659,23 @@ static void i3_isp_write_stats(SstarI3IspState *s, const uint32_t *sum,
             uint32_t m = (uint32_t)(((uint64_t)sum[c] * 4 + d / 2) / d);
 
             v[c] = i3_isp_obc(s, c == 2 ? C_B : c, m) >> 4;
-            buf[i * bpb + c] = v[c];
+            if (bpb) {
+                buf[i * bpb + c] = v[c];
+            }
         }
-        if (bpb == 4) {
-            buf[i * bpb + 3] = (77 * v[0] + 150 * v[1] + 29 * v[2]) >> 8;
+        if (bpb != 3) {
+            buf[bpb ? i * bpb + 3 : i] =
+                (77 * v[0] + 150 * v[1] + 29 * v[2]) >> 8;
         }
     }
+}
+
+static void i3_isp_write_stats(SstarI3IspState *s, const uint32_t *sum,
+                               int n, int bpb, int base_reg, int max_reg)
+{
+    g_autofree uint8_t *buf = g_malloc0(n * bpb);
+
+    i3_isp_block_means(s, sum, n, bpb, buf);
     i3_isp_dma(s, base_reg, max_reg, buf, n * bpb);
 }
 
@@ -603,8 +697,11 @@ static void i3_isp_process(SstarI3IspState *s)
     g_autofree uint16_t *lut = g_new(uint16_t, 4 * 1024 + 3 * 1024);
     uint16_t *glut = lut + 4 * 1024;
     int16_t aex[MAX_W / 2], aey[MAX_H / 2], awx[MAX_W / 2], awy[MAX_H / 2];
-    int anx, any, wnx, wny, ow = w / 2, oh = h / 2;
+    int16_t hx[MAX_W / 2], hy[MAX_H / 2];
+    int anx, any, wnx, wny, hnx, hny, ow = w / 2, oh = h / 2;
     uint32_t rae[MAX_BLK * 4], rawb[MAX_BLK * 4];  /* one quad row's */
+    uint32_t rhis[MAX_BLK * 4];
+    g_autofree uint8_t *hisy = NULL;
     int32_t m[9], pre[3], post[3];
     uint8_t col[4], *yp, *up, *vp;
     int c, i, x, y;
@@ -681,8 +778,11 @@ static void i3_isp_process(SstarI3IspState *s)
                      aex, aey, &anx, &any);
     i3_isp_block_map(s, STS_AWB_SIZE, STS_AWB_NUM, STS_AWB_OFFSET, w, h,
                      awx, awy, &wnx, &wny);
+    i3_isp_block_map(s, STS_HIS_SIZE, STS_HIS_NUM, STS_HIS_OFFSET, w, h,
+                     hx, hy, &hnx, &hny);
     memset(s->ae, 0, MAX_BLK * MAX_BLK * 4 * sizeof(uint32_t));
     memset(s->awb, 0, MAX_BLK * MAX_BLK * 4 * sizeof(uint32_t));
+    memset(s->his, 0, MAX_BLK * MAX_BLK * 4 * sizeof(uint32_t));
 
     for (i = 0; i < 4; i++) {
         /* where in the quad each colour sits */
@@ -702,6 +802,7 @@ static void i3_isp_process(SstarI3IspState *s)
         } else {
             memset(rae, 0, anx * 4 * sizeof(*rae));
             memset(rawb, 0, wnx * 4 * sizeof(*rawb));
+            memset(rhis, 0, hnx * 4 * sizeof(*rhis));
             for (x = 0; x < ow; x++) {
                 uint16_t q[4] = { q0[2 * x], q0[2 * x + 1], q1[2 * x],
                                   q1[2 * x + 1] };
@@ -719,6 +820,13 @@ static void i3_isp_process(SstarI3IspState *s)
                 }
                 if (awx[x] >= 0) {
                     a = rawb + awx[x] * 4;
+                    a[0] += r;
+                    a[1] += gr + gb;
+                    a[2] += b;
+                    a[3]++;
+                }
+                if (hx[x] >= 0) {
+                    a = rhis + hx[x] * 4;
                     a[0] += r;
                     a[1] += gr + gb;
                     a[2] += b;
@@ -754,9 +862,19 @@ static void i3_isp_process(SstarI3IspState *s)
                 a[i] += rawb[i];
             }
         }
+        if (hy[y] >= 0) {
+            uint32_t *a = s->his + hy[y] * hnx * 4;
+
+            for (i = 0; i < hnx * 4; i++) {
+                a[i] += rhis[i];
+            }
+        }
     }
     i3_isp_write_stats(s, s->ae, anx * any, 4, STS_AE_BASE, STS_AE_MAX);
     i3_isp_write_stats(s, s->awb, wnx * wny, 3, STS_AWB_BASE, STS_AWB_MAX);
+    hisy = g_malloc0(hnx * hny);
+    i3_isp_block_means(s, s->his, hnx * hny, 0, hisy);
+    i3_isp_write_histo(s, hisy);
     s->have_frame = true;
     if (s->trace) {
         HisiSoiExposure e;
@@ -813,7 +931,7 @@ static void i3_isp_tick(void *opaque)
     case PHASE_STATS:
         i3_isp_process(s);
         s->raw1 |= G1_AE_DONE | G1_AWB_DONE;
-        s->raw3 |= G3_AE_ROW | G3_AE_WIN0;
+        s->raw3 |= G3_AE_ROW | G3_AE_WIN0 | G3_HISTO_ROW;
         s->phase = PHASE_END;
         break;
     case PHASE_END:
@@ -1087,6 +1205,7 @@ static void sstar_i3_isp_realize(DeviceState *dev, Error **errp)
     s->idx = g_malloc(3 * (MAX_W + 1));
     s->ae = g_new(uint32_t, MAX_BLK * MAX_BLK * 4);
     s->awb = g_new(uint32_t, MAX_BLK * MAX_BLK * 4);
+    s->his = g_new(uint32_t, MAX_BLK * MAX_BLK * 4);
 }
 
 static void sstar_i3_isp_init(Object *obj)
