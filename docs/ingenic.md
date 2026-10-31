@@ -44,7 +44,8 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10000000 | CPM: PLLs, dividers, gates, resets | `ingenic-cpm` |
 | 0x10001000 | INTC, 64 sources → IP2 (XBurst1) | `ingenic-intc` |
 | 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
-| 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
+| 0x10003000 | RTC / hibernation (T40: 0x132A0000), IRQ 32 (T41: 3) | `ingenic-rtc` |
+| 0x10004000 | T41: always-on RTC memory, 4 KiB | RAM |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
 | 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride (+0x20 ISR, UMR, UACR: storage), paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
 | 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c), PDMA requests 0x24 + 2 n / 0x25 + 2 n | `ingenic-i2c` |
@@ -79,7 +80,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18, PDMA request 9 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
-| 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12 (`/machine/dmic`) | `ingenic-dmic` |
+| 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12, PDMA 13 (T10/T20: 0x10022000, IRQ 0; T30: 0x10023000, IRQ 40; both PDMA 0x21) (`/machine/dmic`) | `ingenic-dmic` |
 | 0x134D0000 | T41: the audio system's DMA, FIFOs, data bus and DMIC, core INTC 33 (`/machine/dmic`) | `ingenic-asdmic` |
 | 0x13460000 | T41: PWM controller, 8 channels (`/machine/pwm`) | `ingenic-pwm` |
 | 0x10043000 / 0x10044000 | SSI0 / SSI1 SPI masters (SSI1: T21, T30, T31, T40, T41), IRQ 9 / 8, buses `ssi0` / `ssi1` | `ingenic-ssi` |
@@ -384,7 +385,10 @@ divider's mux reads 3 or DDRCDR's reads 0:
 | M[28:20] N[19:14] OD0[13:11] OD1[10:7] RG[6:4] | T41 | 24 MHz × 2(M+1) / (N+1) / 2^OD0 / (OD1+1) |
 
 CPPSR/CPSPPR keep what is written: the reboot code writes a signature,
-and "reboot recovery" waits to read it back.
+and "reboot recovery" waits to read it back. LCR's power domains answer
+at once -- bit 24 + m reports what bit 28 + m asks -- the handshake the
+3.10 suspend path (`soc-t31/common/pm.c` DISABLE/ENABLE_LCR_MODULES) spins
+on before the sleep and after the wake; no shipped kernel enables PM.
 
 ### Timers: `ingenic-ost` and `ingenic-tcu`
 
@@ -682,7 +686,13 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   DMA, so this is checked by qtest only.
 - `ingenic-rtc`: WRDY always set, WEN after the 0xA55A unlock (the
   power-off path waits for both without a timeout), seconds from the
-  host's clock, HCR.PD powers off.
+  host's clock, HCR.PD powers off. Each second RTCCR.1HZ sets and, with
+  AE, RTCSR reaching RTCSAR sets AF; the line (INTC 32 on T10..T31, 3 on
+  T41, none named on T40) is up while AF and AIE or 1HZ and 1HZIE
+  (`rtc-jz.h`); an alarm with HWCR.EALM latches HWRSR.ALM and wakes a
+  suspended machine. No shipped kernel builds the RTC driver; the SDKs'
+  `sample-alarm` drives it. T41's always-on RTC memory (4 KiB at
+  0x10004000, where `pm_fastboot.c` keeps its resume code) is RAM.
 - `ingenic-efuse`: blank fuses with every read and program done at once
   (the vendor kernels poll both and CTRL's enable). Blank keeps the
   binary-only MXU licence check in the 3.10 kernels permissive. The chip

@@ -1065,6 +1065,17 @@ static void ingenic_init(MachineState *ms)
     }
     if (info->soc == INGENIC_T41) {
         /*
+         * T41's always-on RTC memory (RTC_FTBT_IOBASE): pm_fastboot.c keeps
+         * the resume code and the saved DDR settings there across a sleep
+         */
+        MemoryRegion *rtcmem = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(rtcmem, NULL, "ingenic.rtc-mem", 0x1000,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, 0x10004000, rtcmem);
+    }
+    if (info->soc == INGENIC_T41) {
+        /*
          * IVDC (direct_mode): tx-isp queues channel 0 the pair 0x80000000 /
          * 0x81000000, which the scaler writes into the IVDC and the encoder
          * reads back; RAM there stands in for its store
@@ -1139,7 +1150,12 @@ static void ingenic_init(MachineState *ms)
     sysbus_connect_irq(sbd, 2, ingenic_irq(ims, IRQ_TCU2));
 
     /* RTC */
-    sysbus_create_simple("ingenic-rtc", info->rtc_base, NULL);
+    /* the RTC: INTC 32 on T10..T31, 3 on T41; T40 names no line */
+    sysbus_create_simple("ingenic-rtc", info->rtc_base,
+                         !ingenic_is_xburst2(info->soc) ?
+                         ingenic_irq(ims, 32) :
+                         info->soc == INGENIC_T41 ? ingenic_irq(ims, 3) :
+                         NULL);
 
     /* GPIO */
     dev = gpio = qdev_new("ingenic-gpio");
@@ -1447,16 +1463,41 @@ static void ingenic_init(MachineState *ms)
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_ASDMIC));
     }
 
-    /* the digital microphones of T31 and T40, on request line 13 */
-    if (info->soc == INGENIC_T31 || info->soc == INGENIC_T40) {
-        dev = qdev_new("ingenic-dmic");
-        object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
-        sbd = SYS_BUS_DEVICE(dev);
-        sysbus_realize_and_unref(sbd, &error_fatal);
-        sysbus_mmio_map(sbd, 0, DMIC_BASE);
-        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_DMIC));
-        qdev_connect_gpio_out_named(dev, "drq", 0,
-                                    qdev_get_gpio_in_named(pdma, "drq", 13));
+    /*
+     * The digital microphones: T31 and T40 at 0x10034000, INTC 12, request
+     * line 13; T10/T20 at 0x10022000, INTC 0, and T30 at 0x10023000, INTC
+     * 40, both on request line 0x21 (the T30 kernel's JZDMA_REQ_DMIC_RX,
+     * the slot T10/T20's lists call PCM0) -- the same block (the T30 SDK's
+     * oss2 dmic_hal.h), its driver behind CONFIG_JZ_TS_DMIC on all of them
+     */
+    {
+        hwaddr base = 0;
+        int irq = 0, drq = 0;
+
+        switch (info->soc) {
+        case INGENIC_T31: case INGENIC_T40:
+            base = DMIC_BASE, irq = IRQ_DMIC, drq = 13;
+            break;
+        case INGENIC_T10: case INGENIC_T20:
+            base = 0x10022000, irq = 0, drq = 0x21;
+            break;
+        case INGENIC_T30:
+            base = 0x10023000, irq = 40, drq = 0x21;
+            break;
+        default:
+            break;
+        }
+        if (base) {
+            dev = qdev_new("ingenic-dmic");
+            object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
+            sbd = SYS_BUS_DEVICE(dev);
+            sysbus_realize_and_unref(sbd, &error_fatal);
+            sysbus_mmio_map(sbd, 0, base);
+            sysbus_connect_irq(sbd, 0, ingenic_irq(ims, irq));
+            qdev_connect_gpio_out_named(dev, "drq", 0,
+                                        qdev_get_gpio_in_named(pdma, "drq",
+                                                               drq));
+        }
     }
 
     /* the auxiliary ADC (jz_adc_v13 / ingenic_adc_v13): /machine/sadc */

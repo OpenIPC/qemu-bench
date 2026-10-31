@@ -1521,7 +1521,7 @@ def pdma_ring(qt, ch, desc, buf, period, nper, drt, dcm, port=AIC + 0x34,
     """jz_dma.c's cyclic transfer: a ring of 8-word linked descriptors"""
     for i in range(nper):
         nxt = desc + 32 * ((i + 1) % nper)
-        dsa, dta = (port, buf + i * period) if drt in (5, 7, 13) else \
+        dsa, dta = (port, buf + i * period) if drt in (5, 7, 13, 0x21) else \
             (buf + i * period, port)
         qt.write(desc + 32 * i, struct.pack('<8I', dcm, dsa, dta,
                  (((nxt >> 4) & 0xff) << 24) | (period // unit), 0, drt, 0,
@@ -1748,15 +1748,15 @@ def test_dmic_trigger(qt):
     qt.qom_set('/machine/dmic', 'tone-amp', 8192)
 
 
-def test_dmic(qt):
-    print('ingenic-dmic')
+def test_dmic(qt, DMIC=DMIC, drq=13, name='T31'):
+    print('ingenic-dmic (%s)' % name)
     qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
     check('every interrupt masked out of reset', qt.readl(DMIC + 0x08), 0x3f)
     # audio_dmic.c: 16 kHz, one microphone, packed, DMA on request 13
     ring, desc, period = SCRATCH + 0x6000, SCRATCH + 0x7000, 128
     qt.write(ring, bytes(4 * period))
     dcm32 = (0 << 14) | (0 << 12) | (0 << 8) | 3    # 32-bit ports and units
-    pdma_ring(qt, 6, desc, ring, period, 4, 13, dcm32 | (1 << 22),
+    pdma_ring(qt, 6, desc, ring, period, 4, drq, dcm32 | (1 << 22),
               port=DMIC + 0x30, unit=4)
     qt.writel(DMIC + 0x34, (1 << 31) | 32)              # RDMS, threshold
     qt.writel(DMIC + 0x00, (1 << 31) | (1 << 8) | (1 << 6) | 1)
@@ -3189,6 +3189,36 @@ def test_rtc_efuse(qt, rtc=RTC):
           (16, 0x1A5))
 
 
+def test_rtc_alarm(qt):
+    """The RTC's alarm and 1 Hz tick on INTC 32 (T31), as rtc-jz.c sets
+    them, the wake latch, and the CPM's power-domain handshake that the
+    3.10 suspend path spins on."""
+    print('ingenic-rtc alarm, CPM LCR')
+    line = lambda: qt.readl(INTC + 0x20) & 1             # source 32
+    now = qt.readl(RTC + 0x04)
+    qt.writel(RTC + 0x08, now + 3)                       # RTCSAR
+    qt.writel(RTC + 0x2C, 1)                             # HWCR.EALM
+    qt.writel(RTC + 0x00, 1 | (1 << 2) | (1 << 3))       # RTCE AE AIE
+    qt.step(1500 * 1000 * 1000)
+    check('no alarm before RTCSAR', (qt.readl(RTC + 0x00) >> 4) & 1, 0)
+    qt.step(2500 * 1000 * 1000)
+    check('alarm: AF and the line',
+          ((qt.readl(RTC + 0x00) >> 4) & 1, line()), (1, 1))
+    check('HWRSR.ALM latched for the wake', qt.readl(RTC + 0x30) & 1, 1)
+    qt.writel(RTC + 0x00, 1 | (1 << 2) | (1 << 3))       # AF written 0
+    check('AF cleared, the line drops', line(), 0)
+    qt.writel(RTC + 0x00, 1 | (1 << 5))                  # 1HZIE
+    qt.step(1100 * 1000 * 1000)
+    check('the 1 Hz tick interrupts', ((qt.readl(RTC + 0x00) >> 6) & 1, line()),
+          (1, 1))
+    qt.writel(RTC + 0x00, 1)
+    lcr = CPM + 0x04
+    qt.writel(lcr, qt.readl(lcr) | (0xF << 28))
+    check('LCR: domains off report off', (qt.readl(lcr) >> 24) & 0xF, 0xF)
+    qt.writel(lcr, qt.readl(lcr) & ~(0xF << 28))
+    check('and on again', (qt.readl(lcr) >> 24) & 0xF, 0)
+
+
 def test_ids(qemu):
     print('SoC identification (HARB0 0x2C, CPPSR, EFUSE grade words)')
     want = {'t10': 0x10005003, 't20': 0x12000002, 't21': 0x10021003,
@@ -3319,6 +3349,16 @@ def main():
         qt = QTest(a.qemu, 't20')
         test_aes(qt)
         test_tcu_pwm(qt)
+        qt.close()
+
+        qt = QTest(a.qemu, 't31', ['-rtc', 'clock=vm'])
+        test_rtc_alarm(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't30')
+        test_dmic(qt, 0x10023000, 0x21, 'T30')
+        qt.close()
+        qt = QTest(a.qemu, 't20')
+        test_dmic(qt, 0x10022000, 0x21, 'T20')
         qt.close()
 
         qt = QTest(a.qemu, 't31,sensor=gc2053')
