@@ -427,16 +427,21 @@ static int cu_at(const Pic *p, int x, int y)
 
 /* 6.4.2: the PU at (x, y) available for motion prediction: in the picture,
  * decoded before (z-scan), not intra; its vector */
-static bool pu_avail(const Pic *p, int x, int y, Mv *mv)
+static bool pu_avail_l(const Pic *p, int x, int y, int list, Mv *mv)
 {
     const int cu = cu_at(p, x, y);
 
     if (cu < 0 || !p->done[cu] || p->intra[cu]) {
         return false;
     }
-    mv->x = p->mvx[cu];
-    mv->y = p->mvy[cu];
+    mv->x = list ? p->mvx1[cu] : p->mvx[cu];
+    mv->y = list ? p->mvy1[cu] : p->mvy[cu];
     return true;
+}
+
+static bool pu_avail(const Pic *p, int x, int y, Mv *mv)
+{
+    return pu_avail_l(p, x, y, 0, mv);
 }
 
 /* 8.5.3.2.8: the collocated vector, from the reference picture's motion */
@@ -525,17 +530,23 @@ static int merge_list(const Pic *p, int x0, int y0, Mv *list)
  * intra neighbour counting as absent) A takes B's vector, and the list
  * keeps one of the two; then the temporal one, then zeros.
  */
-static void amvp_list(const Pic *p, int x0, int y0, Mv *list)
+/*
+ * In a B slice every inter CU is bi-predicted, so a neighbour's vector in
+ * list X refers to the current CU's list X picture and none is scaled
+ * either; B slices have no temporal candidate (the model has no POCs:
+ * slice_temporal_mvp_enabled_flag 0 is assumed for them).
+ */
+static void amvp_list_l(const Pic *p, int x0, int y0, int l, Mv *list)
 {
     Mv mva = { 0, 0 }, mvb = { 0, 0 }, col;
     bool fa, fb;
     int n = 0;
 
-    fa = pu_avail(p, x0 - 1, y0 + 8, &mva) ||
-         pu_avail(p, x0 - 1, y0 + 7, &mva);
-    fb = pu_avail(p, x0 + 8, y0 - 1, &mvb) ||
-         pu_avail(p, x0 + 7, y0 - 1, &mvb) ||
-         pu_avail(p, x0 - 1, y0 - 1, &mvb);
+    fa = pu_avail_l(p, x0 - 1, y0 + 8, l, &mva) ||
+         pu_avail_l(p, x0 - 1, y0 + 7, l, &mva);
+    fb = pu_avail_l(p, x0 + 8, y0 - 1, l, &mvb) ||
+         pu_avail_l(p, x0 + 7, y0 - 1, l, &mvb) ||
+         pu_avail_l(p, x0 - 1, y0 - 1, l, &mvb);
     if (!fa && fb) {
         mva = mvb;
         fa = true;
@@ -546,12 +557,17 @@ static void amvp_list(const Pic *p, int x0, int y0, Mv *list)
     if (fb && !mv_eq(mva, mvb)) {
         list[n++] = mvb;
     }
-    if (n < 2 && col_mv(p, x0, y0, &col)) {
+    if (n < 2 && !p->bslice && col_mv(p, x0, y0, &col)) {
         list[n++] = col;
     }
     while (n < 2) {
         list[n++] = (Mv) { 0, 0 };
     }
+}
+
+static void amvp_list(const Pic *p, int x0, int y0, Mv *list)
+{
+    amvp_list_l(p, x0, y0, 0, list);
 }
 
 /*
@@ -658,6 +674,92 @@ static void mc_cu(const Pic *p, int x0, int y0, Mv mv, uint8_t py[64],
            mv.x & 7, mv.y & 7, 4, 4, 4, &fl_chroma[0][0], pc[0]);
     interp(r->cr, cw, ch, x0 / 2 + (mv.x >> 3), y0 / 2 + (mv.y >> 3),
            mv.x & 7, mv.y & 7, 4, 4, 4, &fl_chroma[0][0], pc[1]);
+}
+
+/*
+ * interp() before the uni-directional weighting's rounding: the 14-bit
+ * intermediate the bi-directional default weighting averages (8.5.3.3.4.2:
+ * (a + b + 64) >> 7)
+ */
+static void interp16(const uint8_t *pl, int w, int h, int xi, int yi,
+                     int fx, int fy, int bw, int bh, int taps,
+                     const int8_t *f, int *out)
+{
+    const int half = taps / 2 - 1;
+    const int8_t *hx = f + fx * taps, *hy = f + fy * taps;
+    int tmp[(8 + 7) * 8];
+    int x, y, k;
+
+    for (y = 0; y < bh; y++) {
+        for (x = 0; x < bw; x++) {
+            int v = 0;
+
+            if (!fx && !fy) {
+                v = ref_at(pl, w, h, xi + x, yi + y) << 6;
+            } else if (!fy) {
+                for (k = 0; k < taps; k++) {
+                    v += hx[k] * ref_at(pl, w, h, xi + x + k - half, yi + y);
+                }
+            } else if (!fx) {
+                for (k = 0; k < taps; k++) {
+                    v += hy[k] * ref_at(pl, w, h, xi + x, yi + y + k - half);
+                }
+            } else {
+                continue;
+            }
+            out[y * bw + x] = v;
+        }
+    }
+    if (!fx || !fy) {
+        return;
+    }
+    for (y = 0; y < bh + taps - 1; y++) {
+        for (x = 0; x < bw; x++) {
+            int v = 0;
+            for (k = 0; k < taps; k++) {
+                v += hx[k] * ref_at(pl, w, h, xi + x + k - half,
+                                    yi + y - half);
+            }
+            tmp[y * bw + x] = v;
+        }
+    }
+    for (y = 0; y < bh; y++) {
+        for (x = 0; x < bw; x++) {
+            int v = 0;
+            for (k = 0; k < taps; k++) {
+                v += hy[k] * tmp[(y + k) * bw + x];
+            }
+            out[y * bw + x] = v >> 6;
+        }
+    }
+}
+
+/* a B CU's bi-prediction: L0 by mv0 from p->ref, L1 by mv1 from p->ref1 */
+static void mc_cu_bi(const Pic *p, int x0, int y0, Mv mv0, Mv mv1,
+                     uint8_t py[64], uint8_t pc[2][16])
+{
+    const int cw = p->w / 2, ch = p->h / 2;
+    int a[64], b[64], i, comp;
+
+    interp16(p->ref->y, p->w, p->h, x0 + (mv0.x >> 2), y0 + (mv0.y >> 2),
+             mv0.x & 3, mv0.y & 3, 8, 8, 8, &fl_luma[0][0], a);
+    interp16(p->ref1->y, p->w, p->h, x0 + (mv1.x >> 2), y0 + (mv1.y >> 2),
+             mv1.x & 3, mv1.y & 3, 8, 8, 8, &fl_luma[0][0], b);
+    for (i = 0; i < 64; i++) {
+        py[i] = clip1((a[i] + b[i] + 64) >> 7);
+    }
+    for (comp = 0; comp < 2; comp++) {
+        const uint8_t *r0 = comp ? p->ref->cr : p->ref->cb;
+        const uint8_t *r1 = comp ? p->ref1->cr : p->ref1->cb;
+
+        interp16(r0, cw, ch, x0 / 2 + (mv0.x >> 3), y0 / 2 + (mv0.y >> 3),
+                 mv0.x & 7, mv0.y & 7, 4, 4, 4, &fl_chroma[0][0], a);
+        interp16(r1, cw, ch, x0 / 2 + (mv1.x >> 3), y0 / 2 + (mv1.y >> 3),
+                 mv1.x & 7, mv1.y & 7, 4, 4, 4, &fl_chroma[0][0], b);
+        for (i = 0; i < 16; i++) {
+            pc[comp][i] = clip1((a[i] + b[i] + 64) >> 7);
+        }
+    }
 }
 
 /* the luma SAD of the prediction by mv (the search's measure) */
@@ -915,6 +1017,102 @@ static void cu_motion(Pic *p, int cu, bool intra, Mv mv, bool skip)
     p->skip[cu] = skip;
 }
 
+/*
+ * The motion search of the CU at (x0, y0) on p->ref: zero, the AMVP
+ * predictors and nextra more candidates, a grid when still far off, a
+ * diamond of 2 samples, then half and quarter samples; the cost counts
+ * the vector difference from amvp[0].
+ */
+static Mv search_cu(const Pic *p, int x0, int y0, const Mv amvp[2],
+                    const Mv *extra, int nextra, int lambda)
+{
+    Mv best = { 0, 0 }, cand[8];
+    int best_cost = INT_MAX, nc = 0, it, i;
+
+    cand[nc++] = (Mv) { 0, 0 };
+    cand[nc++] = amvp[0];
+    cand[nc++] = amvp[1];
+    for (i = 0; i < nextra && nc < 8; i++) {
+        cand[nc++] = extra[i];
+    }
+    for (i = 0; i < nc; i++) {
+        const Mv m = { (int16_t)(((cand[i].x + 2) >> 2) << 2),
+                       (int16_t)(((cand[i].y + 2) >> 2) << 2) };
+        const int cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
+            (mvd_bits(m.x - amvp[0].x) + mvd_bits(m.y - amvp[0].y));
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = m;
+        }
+    }
+    if (best_cost > 256) {
+        Mv cb = best;
+        for (int gy = -16; gy <= 16; gy += 4) {
+            for (int gx = -16; gx <= 16; gx += 4) {
+                const Mv m = { (int16_t)(gx * 4), (int16_t)(gy * 4) };
+                const int cost = sad_cu(p, x0, y0, m, best_cost) +
+                    lambda * (mvd_bits(m.x - amvp[0].x) +
+                              mvd_bits(m.y - amvp[0].y));
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    cb = m;
+                }
+            }
+        }
+        best = cb;
+    }
+    for (it = 0; it < 16 && best_cost; it++) {
+        static const int8_t dia[4][2] = {
+            { -4, 0 }, { 4, 0 }, { 0, -4 }, { 0, 4 },
+        };
+        Mv nb = best;
+
+        for (i = 0; i < 4; i++) {
+            const Mv m = { (int16_t)(best.x + dia[i][0]),
+                           (int16_t)(best.y + dia[i][1]) };
+            int cost;
+
+            if (abs(m.x) > 256 || abs(m.y) > 256) {
+                continue;
+            }
+            cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
+                (mvd_bits(m.x - amvp[0].x) + mvd_bits(m.y - amvp[0].y));
+            if (cost < best_cost) {
+                best_cost = cost;
+                nb = m;
+            }
+        }
+        if (mv_eq(nb, best)) {
+            break;
+        }
+        best = nb;
+    }
+    /* then half and quarter samples around the full-sample best */
+    for (int step = 2; step >= 1 && best_cost; step >>= 1) {
+        Mv nb = best;
+
+        for (int dy = -step; dy <= step; dy += step) {
+            for (int dx = -step; dx <= step; dx += step) {
+                const Mv m = { (int16_t)(best.x + dx),
+                               (int16_t)(best.y + dy) };
+                int cost;
+
+                if ((!dx && !dy) || abs(m.x) > 256 || abs(m.y) > 256) {
+                    continue;
+                }
+                cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
+                    (mvd_bits(m.x - amvp[0].x) + mvd_bits(m.y - amvp[0].y));
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    nb = m;
+                }
+            }
+        }
+        best = nb;
+    }
+    return best;
+}
+
 /* one 8x8 CU of a P slice, inter coding */
 static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
 {
@@ -983,93 +1181,7 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
     }
 
     /* motion search: the candidates, a grid, then a diamond (2 samples) */
-    {
-        Mv cand[8];
-        int nc = 0, it;
-
-        cand[nc++] = (Mv) { 0, 0 };
-        cand[nc++] = amvp[0];
-        cand[nc++] = amvp[1];
-        for (i = 0; i < nm && nc < 8; i++) {
-            cand[nc++] = merge[i];
-        }
-        for (i = 0; i < nc; i++) {
-            const Mv m = { (int16_t)(((cand[i].x + 2) >> 2) << 2),
-                           (int16_t)(((cand[i].y + 2) >> 2) << 2) };
-            const int cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
-                (mvd_bits(m.x - amvp[0].x) + mvd_bits(m.y - amvp[0].y));
-            if (cost < best_cost) {
-                best_cost = cost;
-                best = m;
-            }
-        }
-        if (best_cost > 256) {
-            Mv cb = best;
-            for (int gy = -16; gy <= 16; gy += 4) {
-                for (int gx = -16; gx <= 16; gx += 4) {
-                    const Mv m = { (int16_t)(gx * 4), (int16_t)(gy * 4) };
-                    const int cost = sad_cu(p, x0, y0, m, best_cost) +
-                        lambda * (mvd_bits(m.x - amvp[0].x) +
-                                  mvd_bits(m.y - amvp[0].y));
-                    if (cost < best_cost) {
-                        best_cost = cost;
-                        cb = m;
-                    }
-                }
-            }
-            best = cb;
-        }
-        for (it = 0; it < 16 && best_cost; it++) {
-            static const int8_t dia[4][2] = {
-                { -4, 0 }, { 4, 0 }, { 0, -4 }, { 0, 4 },
-            };
-            Mv nb = best;
-
-            for (i = 0; i < 4; i++) {
-                const Mv m = { (int16_t)(best.x + dia[i][0]),
-                               (int16_t)(best.y + dia[i][1]) };
-                int cost;
-
-                if (abs(m.x) > 256 || abs(m.y) > 256) {
-                    continue;
-                }
-                cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
-                    (mvd_bits(m.x - amvp[0].x) + mvd_bits(m.y - amvp[0].y));
-                if (cost < best_cost) {
-                    best_cost = cost;
-                    nb = m;
-                }
-            }
-            if (mv_eq(nb, best)) {
-                break;
-            }
-            best = nb;
-        }
-        /* then half and quarter samples around the full-sample best */
-        for (int step = 2; step >= 1 && best_cost; step >>= 1) {
-            Mv nb = best;
-
-            for (int dy = -step; dy <= step; dy += step) {
-                for (int dx = -step; dx <= step; dx += step) {
-                    const Mv m = { (int16_t)(best.x + dx),
-                                   (int16_t)(best.y + dy) };
-                    int cost;
-
-                    if ((!dx && !dy) || abs(m.x) > 256 || abs(m.y) > 256) {
-                        continue;
-                    }
-                    cost = sad_cu(p, x0, y0, m, best_cost) + lambda *
-                        (mvd_bits(m.x - amvp[0].x) +
-                         mvd_bits(m.y - amvp[0].y));
-                    if (cost < best_cost) {
-                        best_cost = cost;
-                        nb = m;
-                    }
-                }
-            }
-            best = nb;
-        }
-    }
+    best = search_cu(p, x0, y0, amvp, merge, nm, lambda);
 
     mc_cu(p, x0, y0, best, py, pc);
     inter_residual(p, x0, y0, py, pc, &r);
@@ -1169,7 +1281,125 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
     }
 }
 
+/*
+ * One 8x8 CU of a B slice: bi-predicted (AMVP in each list, one
+ * reference each, so no ref_idx; mvd_l1_zero_flag 0) or intra DC where
+ * nothing matches; never skipped or merged, so that every inter
+ * neighbour has both vectors and nothing needs scaling by POC.  With the
+ * stream buffer's room all but gone (all_skip), the predictors with no
+ * residual.
+ */
+static void encode_cu_inter_b(Pic *p, Cabac *c, int x0, int y0)
+{
+    const int cw = p->w >> 3, cu = (y0 >> 3) * cw + (x0 >> 3);
+    const int ctx = (x0 > 0 && p->skip[cu - 1]) + (y0 > 0 && p->skip[cu - cw]);
+    const int lambda = 1 << MAX(0, (p->qp - 12) / 6);
+    const int ctdepth = MIN(MAX(p->log2_ctb - 3, 0), 3);
+    const HevcEncRef *r0 = p->ref;
+    Mv amvp0[2], amvp1[2], mv0, mv1;
+    uint8_t py[64], pc[2][16];
+    InterRes r;
+    int a0 = 0, a1 = 0;
+    bool any;
+
+    if (!p->ref || !p->ref1) {
+        p->force_intra = true;
+        encode_cu(p, c, x0, y0, p->qp, true);
+        p->force_intra = false;
+        cu_motion(p, cu, true, (Mv) { 0, 0 }, false);
+        p->mvx1[cu] = p->mvy1[cu] = 0;
+        p->cbfy[cu] = 1;
+        return;
+    }
+    amvp_list_l(p, x0, y0, 0, amvp0);
+    amvp_list_l(p, x0, y0, 1, amvp1);
+    if (p->prm->all_skip) {
+        mv0 = amvp0[0];
+        mv1 = amvp1[0];
+        mc_cu_bi(p, x0, y0, mv0, mv1, py, pc);
+        memset(&r, 0, sizeof(r));
+    } else {
+        mv0 = search_cu(p, x0, y0, amvp0, NULL, 0, lambda);
+        p->ref = p->ref1;
+        mv1 = search_cu(p, x0, y0, amvp1, NULL, 0, lambda);
+        p->ref = r0;
+        mc_cu_bi(p, x0, y0, mv0, mv1, py, pc);
+        inter_residual(p, x0, y0, py, pc, &r);
+        if (inter_recon_sad(p, x0, y0, py, &r) >
+            2 * intra_dc_err(p, x0, y0) + 512) {
+            p->force_intra = true;
+            encode_cu(p, c, x0, y0, p->qp, true);
+            p->force_intra = false;
+            cu_motion(p, cu, true, (Mv) { 0, 0 }, false);
+            p->mvx1[cu] = p->mvy1[cu] = 0;
+            p->cbfy[cu] = 1;
+            return;
+        }
+    }
+    any = r.cy || r.ccb || r.ccr;
+    if (!mv_eq(amvp0[0], mv0) &&
+        (mv_eq(amvp0[1], mv0) ||
+         mvd_bits(mv0.x - amvp0[1].x) + mvd_bits(mv0.y - amvp0[1].y) <
+         mvd_bits(mv0.x - amvp0[0].x) + mvd_bits(mv0.y - amvp0[0].y))) {
+        a0 = 1;
+    }
+    if (!mv_eq(amvp1[0], mv1) &&
+        (mv_eq(amvp1[1], mv1) ||
+         mvd_bits(mv1.x - amvp1[1].x) + mvd_bits(mv1.y - amvp1[1].y) <
+         mvd_bits(mv1.x - amvp1[0].x) + mvd_bits(mv1.y - amvp1[0].y))) {
+        a1 = 1;
+    }
+    cabac_decision(c, CTX_SKIP + ctx, 0);
+    cabac_decision(c, CTX_PRED_MODE, 0);                /* inter */
+    cabac_decision(c, CTX_PART_MODE, 1);                /* 2Nx2N */
+    cabac_decision(c, CTX_MERGE_FLAG, 0);
+    cabac_decision(c, CTX_INTER_PRED + ctdepth, 1);     /* PRED_BI */
+    put_mvd(c, mv0.x - amvp0[a0].x, mv0.y - amvp0[a0].y);
+    cabac_decision(c, CTX_MVP, a0);
+    put_mvd(c, mv1.x - amvp1[a1].x, mv1.y - amvp1[a1].y);
+    cabac_decision(c, CTX_MVP, a1);
+    cabac_decision(c, CTX_ROOT_CBF, any);
+    if (any) {
+        if (p->prm->trafo_depth_inter > 0) {
+            cabac_decision(c, CTX_SPLIT_TRAFO + 5 - 3, 0);
+        }
+        cabac_decision(c, CTX_CBF_CHROMA + 0, r.ccb);
+        cabac_decision(c, CTX_CBF_CHROMA + 0, r.ccr);
+        if (r.ccb || r.ccr) {
+            cabac_decision(c, CTX_CBF_LUMA + 1, r.cy);
+        } else {
+            r.cy = true;
+        }
+        if (!p->qp_delta_coded) {
+            cu_qp_delta(c, p->qp - p->qg_pred);
+            p->qp_delta_coded = true;
+        }
+        if (r.cy) {
+            residual_full(p, c, r.ly, 3, 0);
+        }
+        if (r.ccb) {
+            residual_full(p, c, r.lcb, 2, 1);
+        }
+        if (r.ccr) {
+            residual_full(p, c, r.lcr, 2, 2);
+        }
+    }
+    inter_recon(p, x0, y0, py, pc, &r);
+    cu_motion(p, cu, false, mv0, false);
+    p->mvx1[cu] = mv1.x;
+    p->mvy1[cu] = mv1.y;
+    p->cbfy[cu] = r.cy;
+    p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
+    p->qp_prev = p->cuqp[cu];
+    p->done[cu] = 1;
+}
+
 /* ---- deblocking with inter CUs (8.7.2) ----------------------------------- */
+
+static bool mvdiff4(int ax, int ay, int bx, int by)
+{
+    return abs(ax - bx) >= 4 || abs(ay - by) >= 4;
+}
 
 static int bs_inter(const Pic *p, int q, int pp)
 {
@@ -1178,6 +1408,19 @@ static int bs_inter(const Pic *p, int q, int pp)
     }
     if (p->cbfy[q] || p->cbfy[pp]) {
         return 1;
+    }
+    if (p->bslice) {
+        /* both bi-predicted from the same two pictures (8.7.2.4) */
+        const bool d00 = mvdiff4(p->mvx[q], p->mvy[q], p->mvx[pp], p->mvy[pp]);
+        const bool d11 = mvdiff4(p->mvx1[q], p->mvy1[q], p->mvx1[pp],
+                                 p->mvy1[pp]);
+
+        if (!p->ref1_same) {
+            return d00 || d11;
+        }
+        return (d00 || d11) &&
+               (mvdiff4(p->mvx[q], p->mvy[q], p->mvx1[pp], p->mvy1[pp]) ||
+                mvdiff4(p->mvx1[q], p->mvy1[q], p->mvx[pp], p->mvy[pp]));
     }
     if (abs(p->mvx[q] - p->mvx[pp]) >= 4 || abs(p->mvy[q] - p->mvy[pp]) >= 4) {
         return 1;

@@ -109,7 +109,8 @@ enum {
     CTX_ROOT_CBF = 96,          /* rqt_root_cbf */
     CTX_CSBF = 97,              /* coded_sub_block_flag: 4 */
     CTX_SIG = 101,              /* sig_coeff_flag: 42 */
-    CTX_NUM = 143
+    CTX_INTER_PRED = 143,       /* inter_pred_idc: 5, B slices */
+    CTX_NUM = 148
 };
 
 /* initValue, in the order above: initType 0 (I slices), 1 (P slices
@@ -146,6 +147,7 @@ static const uint8_t hevc_init[3][CTX_NUM] = { {
     125, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140,
     139, 182, 182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111,
                                                         /* sig_coeff_flag */
+    154, 154, 154, 154, 154,                            /* (inter_pred) */
 }, {
     107, 139, 126,
     154,
@@ -176,6 +178,7 @@ static const uint8_t hevc_init[3][CTX_NUM] = { {
     155, 154, 139, 153, 139, 123, 123, 63, 153, 166, 183, 140, 136, 153,
     154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170,
     153, 123, 123, 107, 121, 107, 121, 167, 151, 183, 140, 151, 183, 140,
+    95, 79, 63, 31, 31,                                 /* inter_pred_idc */
 }, {
     107, 139, 126,
     154,
@@ -206,7 +209,9 @@ static const uint8_t hevc_init[3][CTX_NUM] = { {
     170, 154, 139, 153, 139, 123, 123, 63, 124, 166, 183, 140, 136, 153,
     154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170,
     153, 138, 138, 122, 121, 122, 121, 167, 151, 183, 140, 151, 183, 140,
-} };
+    95, 79, 63, 31, 31,
+}
+};
 
 typedef struct Cabac {
     uint8_t state[CTX_NUM];
@@ -397,6 +402,10 @@ typedef struct Pic {
     int log2_ctb, log2_qg;          /* CTB and quantization group sizes */
     int cqp_offset;                 /* pps_cb_qp_offset = pps_cr_qp_offset */
     const HevcEncRef *ref;          /* a P slice's reference, or NULL */
+    const HevcEncRef *ref1;         /* a B slice's L1 reference */
+    bool bslice;                    /* B: every inter CU bi-predicted */
+    bool ref1_same;                 /* the L1 reference is the L0 picture */
+    int16_t *mvx1, *mvy1;           /* B: each CU's L1 vector */
     uint8_t *cy, *ccb, *ccr;        /* the source scaled to w x h */
     uint8_t *skip;                  /* per 8x8 CU: skipped (else intra) */
     uint8_t *cuqp;                  /* per 8x8 CU: its QpY */
@@ -1019,7 +1028,9 @@ static void quadtree(Pic *p, Cabac *c, int x0, int y0, int log2, int qp,
         p->qp_delta_coded = false;
     }
     if (log2 == 3) {
-        if (p_slice && p->prm->inter) {
+        if (p_slice && p->prm->inter && p->bslice) {
+            encode_cu_inter_b(p, c, x0, y0);
+        } else if (p_slice && p->prm->inter) {
             encode_cu_inter(p, c, x0, y0);
         } else {
             encode_cu(p, c, x0, y0, qp, p_slice);
@@ -1053,6 +1064,7 @@ static void quadtree(Pic *p, Cabac *c, int x0, int y0, int log2, int qp,
 /* slice_segment_data() of a picture: CABAC from its first byte */
 static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
                          bool p_slice, const HevcEncRef *ref,
+                         const HevcEncRef *ref1, bool bslice, bool ref1_same,
                          HevcEncRef *recon, const uint8_t *y, int sw, int sh,
                          int ys, const uint8_t *uv, int cs, uint8_t *rbsp,
                          size_t cap)
@@ -1089,6 +1101,10 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
     g_autofree int16_t *mvx = g_new0(int16_t, ncu);
     g_autofree int16_t *mvy = g_new0(int16_t, ncu);
     g_autofree uint8_t *cbfy = g_malloc0(ncu);
+    g_autofree int16_t *mvx1 = g_new0(int16_t, ncu);
+    g_autofree int16_t *mvy1 = g_new0(int16_t, ncu);
+    p.mvx1 = mvx1;
+    p.mvy1 = mvy1;
     p.intra = intra;
     p.mvx = mvx;
     p.mvy = mvy;
@@ -1117,11 +1133,23 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
     if (p_slice && ref && ref->w == w && ref->h == h) {
         p.ref = ref;
     }
+    if (bslice) {
+        /* B: a missing reference is taken as the other's picture */
+        p.bslice = true;
+        p.ref1 = ref1 && ref1->w == w && ref1->h == h && ref1->y ? ref1
+                                                                 : p.ref;
+        if (!p.ref) {
+            p.ref = p.ref1;
+        }
+        p.ref1_same = ref1_same || p.ref == p.ref1;
+    }
     p.skip_thr = skip_threshold(p.qp);
 
     Cabac c;
-    cabac_init(&c, qp, p_slice ? (prm->cabac_init_flag ? 2 : 1) : 0, rbsp,
-               rbsp + cap);
+    /* initType: P 1 (2 with cabac_init_flag), B 2 (1 with the flag) */
+    cabac_init(&c, qp, !p_slice ? 0 : bslice ? (prm->cabac_init_flag ? 1 : 2)
+                                       : (prm->cabac_init_flag ? 2 : 1),
+               rbsp, rbsp + cap);
     const int ctbw = (w + ctb - 1) / ctb, ctbh = (h + ctb - 1) / ctb;
     for (yy = 0; yy < ctbh; yy++) {
         for (x = 0; x < ctbw; x++) {
@@ -1245,8 +1273,26 @@ size_t hevc_enc_slice_data(const HevcEncParams *prm,
                             (prm->inter ? 320 : 48) + 256;
     g_autofree uint8_t *rbsp = g_malloc0(rbsp_cap);
     const size_t n = slice_data(prm, w, h, MIN(MAX(qp, 0), 51), p_slice,
-                                ref, recon, y, sw, sh, ys, uv, cs, rbsp,
-                                rbsp_cap);
+                                ref, NULL, false, false, recon, y, sw, sh,
+                                ys, uv, cs, rbsp, rbsp_cap);
+    return escape(out, cap, rbsp, n);
+}
+
+size_t hevc_enc_slice_data_b(const HevcEncParams *prm, int w, int h, int qp,
+                             const HevcEncRef *ref0, const HevcEncRef *ref1,
+                             bool ref1_same, HevcEncRef *recon,
+                             const uint8_t *y, int sw, int sh, int ys,
+                             const uint8_t *uv, int cs,
+                             uint8_t *out, size_t cap)
+{
+    if (!size_ok(w, h) || !prm->inter) {
+        return 0;
+    }
+    const size_t rbsp_cap = (size_t)(w / 8) * (h / 8) * 400 + 256;
+    g_autofree uint8_t *rbsp = g_malloc0(rbsp_cap);
+    const size_t n = slice_data(prm, w, h, MIN(MAX(qp, 0), 51), true,
+                                ref0, ref1, true, ref1_same, recon, y, sw,
+                                sh, ys, uv, cs, rbsp, rbsp_cap);
     return escape(out, cap, rbsp, n);
 }
 

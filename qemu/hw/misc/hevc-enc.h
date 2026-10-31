@@ -88,6 +88,22 @@ size_t hevc_enc_slice_data(const HevcEncParams *prm,
                            uint8_t *out, size_t cap);
 
 /*
+ * A B slice's data (prm->inter only): every inter CU bi-predicted, L0 from
+ * ref0 and L1 from ref1 (ref1_same: the same picture), by AMVP with one
+ * reference in each list -- no merge, no skip, so no candidate needs POC
+ * scaling -- or intra DC.  What the slice header has to say:
+ * num_ref_idx_active 1 / 1, mvd_l1_zero_flag 0 and
+ * slice_temporal_mvp_enabled_flag 0 (the model has no POCs); with
+ * cabac_init_flag initType 1, else 2.
+ */
+size_t hevc_enc_slice_data_b(const HevcEncParams *prm, int w, int h, int qp,
+                             const HevcEncRef *ref0, const HevcEncRef *ref1,
+                             bool ref1_same, HevcEncRef *recon,
+                             const uint8_t *y, int sw, int sh, int ys,
+                             const uint8_t *uv, int cs,
+                             uint8_t *out, size_t cap);
+
+/*
  * A whole access unit the way the library assembles one: for an I picture
  * VPS, SPS, PPS and an IDR slice, for a P picture a TRAIL_R slice, each
  * with the library's own header fields.  For tests and dumps.
