@@ -848,8 +848,22 @@ past the UID) is the part's -- libimp's encoder library checks it
   Baseline PPS; libimp does not send one) codes the same macroblocks the
   same way: `mb_skip_run`, Exp-Golomb `mb_type`, `mvd` and the inter
   `coded_block_pattern` (Table 9-4), `residual_block_cavlc` with nC from
-  the neighbouring blocks' TotalCoeff (all four coeff_token tables). B
-  slices (libimp sends none) code every macroblock skipped. The rate
+  the neighbouring blocks' TotalCoeff (all four coeff_token tables).
+  B slices (W3 [29:28] 0): L0 from RefA (WA0), L1 from RefB (WA8) --
+  the slice buffers' second reference, which libimp's encode1
+  (ChannelMngr.c) copies to the words after RefA's luma / chroma, in the
+  order of Allegro's TSliceBuffersEnc (RefA, RefB, Rec) -- every
+  macroblock B_L0_16x16, B_L1_16x16 or B_Bi_16x16 (each list's vector
+  searched on its reference, the cheapest of the two and their rounded
+  average) or I_16x16 DC; never B_Skip or B_Direct_16x16, so neither
+  direct mode's derivation is needed. What the slice data follows: one
+  reference in each list (`num_ref_idx_active` 1 / 1), no weighted
+  prediction. libimp sends no B pictures in normal use
+  (IMPEncoderGopAttr's uNumB is commented out); with uGopCtrlMode
+  PYRAMIDAL it forces uNumB to 3 and, on T31 with 64 MiB of rmem,
+  creates the channels, but its own `Codec_Encode_SetGopParam` then
+  fails and no stream starts (not traced further), so B is checked at
+  register level. The rate
   control's estimate of a P slice still counts I_PCM macroblocks
   (`pcm-budget`).
 - HEVC: libimp's CTB 32, intra transform depth 1, transform skip (T31,
@@ -870,7 +884,15 @@ past the UID) is the part's -- libimp's encoder library checks it
   `residual_coding()` with its context sets (sign hiding when the PPS
   has it: libimp's does not); deblocking with the inter boundary
   strengths. The decoded pictures equal the model's reference, sample
-  for sample. Every CU is coded at QP 22 at most (cu_qp_delta), P
+  for sample. B slices (`hevc_enc_slice_data_b`): L0 from RefA, L1 from
+  RefB (WA8), every inter CU bi-predicted by AMVP in each list (14-bit
+  intermediate interpolation, the default bi weighting) or intra DC --
+  never skipped or merged, so that every inter neighbour carries both
+  vectors and no candidate needs scaling by POC (the model has no POCs);
+  what the slice header must say: one reference in each list,
+  `mvd_l1_zero_flag` 0, `slice_temporal_mvp_enabled_flag` 0, initType 2
+  (1 with cabac_init_flag). Correct, dearer than skip and merge would
+  be. Every CU is coded at QP 22 at most (cu_qp_delta), P
   pictures' too: libimp's rate control runs the slice QP up to the 40s,
   where the residuals of fine detail (the counter's 6-sample cells)
   quantise away; a picture that would not fit the stream buffer's room is
@@ -924,7 +946,11 @@ command-list sequence under qtest (I + P in CAVLC, CABAC, Enc1-only and
 Enc2 forms, HEVC, JPEG, a CAVLC sequence changing every macroblock, the
 T40/T41 bases, and a
 picture of two slices panning over three pictures, which must decode to
-the model's own reconstruction, sample for sample, at 42 dB) and decodes
+the model's own reconstruction, sample for sample, at 42 dB, and B
+pictures in H.264 -- I0 P2 B1 P4 B3, two slices a picture -- and HEVC
+-- the same order, libimp's parameter sets, an RPS in each slice header
+-- each decoding, in its order, to the model's reconstruction sample for
+sample, the B pictures at 41-43 dB) and decodes
 the output with ffmpeg (or the `jrottenberg/ffmpeg` docker image).
 `bash qemu-boot/test-ingenic-avpu.sh [--soc t40|t31|t41]` runs it end to
 end: OpenIPC's kernel and rootfs, `load_ingenic` (avpu.ko among the
