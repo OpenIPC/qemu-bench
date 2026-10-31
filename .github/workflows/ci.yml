@@ -122,6 +122,10 @@ jobs:
       - name: XM SP805 watchdog (arm-sp805)
         run: python3 qemu/tests/test-xm-sp805.py
 
+      # sensor=/sensor-addr= and the generic xm-sensor, through xm-i2c.
+      - name: XM sensor selection (xm-sensor)
+        run: python3 qemu/tests/test-xm-sensor.py
+
       # The GK710x models driven over qtest at the silicon addresses the
       # vendor HAL drives: boot-ROM header, SPI-NOR byte order and
       # write-back, timer edge into the VIC, I2C to a sensor, watchdog.
