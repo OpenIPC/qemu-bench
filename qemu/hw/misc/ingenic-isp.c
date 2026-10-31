@@ -345,6 +345,7 @@ struct IngenicIspState {
                                    over its G, per mille */
     Object *sensor;             /* the image sensor, for its exposure */
     Object *sensor1;            /* T40: the second pipe's sensor */
+    Object *sensor2;            /* T40: the third sensor, on VIC2 */
     const IngenicIspLayout *l;
 
     uint32_t isp[ISP_SIZE / 4];
@@ -355,6 +356,8 @@ struct IngenicIspState {
     uint32_t phy[PHY_SIZE / 4];
     bool vic_running;
     bool vic1_running;
+    bool vic2_running;          /* T40: VIC2 (the third sensor) started */
+    uint8_t mdma_slot[3];       /* each VIC's next MDMA buffer slot */
     uint32_t frame;
     IngenicIspChan ch[NUM_CH * MAX_PIPES];  /* pipe p's channel n: 3 p + n */
 
@@ -1579,6 +1582,70 @@ static void ingenic_isp_xstats(IngenicIspState *s, uint32_t gain,
 }
 
 /*
+ * The VIC's MDMA (T40, vic_mdma_enable for the "snapraw" debug command):
+ * raw frames of the VIC's sensor into DDR, 16 bits a pixel.
+ *
+ *   0x300  bit 31 on, 19:16 frames still to store (the driver tops it up
+ *          from its own count, 8 at most), bit 5 set with it
+ *   0x304  width << 16 | height   0x308  1: reset
+ *   0x310 / 0x314  line strides of channel 0 / 1
+ *   0x318 + 4 k    channel 0's buffer k, k = 0..4 in turn (the driver
+ *                  moves each slot on as its frame lands)
+ *   0x340 + 4 k    channel 1's (two-sensor captures; not stored here)
+ *   0x380          the buffer last written
+ *
+ * Each stored frame raises the second status word's bit 0 (0x1E4, ack
+ * 0x1F4), which vic_mdma_irq_function0 serves.  The raw is the scene in
+ * an RGGB mosaic, 10 bits right-aligned (the bit depth and alignment are
+ * not documented; the driver only copies the bytes to /tmp/snapN.raw).
+ */
+#define VIC_MDMA_CTRL   0x300
+#define VIC_MDMA_SIZE   0x304
+#define VIC_MDMA_STRIDE 0x310
+#define VIC_MDMA_BUF0   0x318
+#define VIC_MDMA_DONE   0x380
+
+static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
+{
+    uint32_t *r = ingenic_vic_regs(s, v);
+    uint32_t ctrl = r[VIC_MDMA_CTRL >> 2];
+    uint32_t left = extract32(ctrl, 16, 4);
+    uint32_t w = r[VIC_MDMA_SIZE >> 2] >> 16, h = r[VIC_MDMA_SIZE >> 2] & 0xFFFF;
+    uint32_t stride = r[VIC_MDMA_STRIDE >> 2];
+    uint32_t dst = r[(VIC_MDMA_BUF0 >> 2) + s->mdma_slot[v]];
+    g_autofree uint16_t *line = NULL;
+    uint32_t x, y;
+
+    if (!(ctrl & (1u << 31)) || !left || !w || !h || w > 8192) {
+        return;
+    }
+    line = g_new(uint16_t, w);
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t yuv[3];
+            int Y, U, V, c;
+
+            ingenic_scene_pixel(frame, w, h, x, y, yuv);
+            Y = yuv[0];
+            U = yuv[1] - 128;
+            V = yuv[2] - 128;
+            /* R G / G B */
+            c = (y & 1) == 0 && (x & 1) == 0 ? Y + (1436 * V >> 10) :
+                (y & 1) && (x & 1) ? Y + (1815 * U >> 10) :
+                Y - ((352 * U + 731 * V) >> 10);
+            line[x] = cpu_to_le16(MIN(MAX(c, 0), 255) << 2);
+        }
+        dma_memory_write(&address_space_memory, dst + y * stride, line,
+                         2 * w, MEMTXATTRS_UNSPECIFIED);
+    }
+    r[VIC_MDMA_DONE >> 2] = dst;
+    s->mdma_slot[v] = (s->mdma_slot[v] + 1) % 5;
+    left--;
+    r[VIC_MDMA_CTRL >> 2] = deposit32(ctrl, 16, 4, left);
+    r[(s->l->vic_sta + 4) >> 2] |= 1;
+}
+
+/*
  * The frame of pipe @p: frame start, the picture into each enabled
  * channel with a queued buffer, the 3A statistics, VIC frame done.  Pipe
  * 1 paints the scene with its counter 500000 ahead, so that its pictures
@@ -1642,6 +1709,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     }
     if (!l->no_vic) {
         vic[l->vic_sta >> 2] |= 1;
+        ingenic_vic_mdma(s, p, frame);
     }
 }
 
@@ -1654,6 +1722,15 @@ static void ingenic_isp_frame(void *opaque)
         if (ingenic_isp_pipe_running(s, p)) {
             ingenic_isp_pipe_frame(s, p);
         }
+    }
+    if (s->l->pipes > 1 && s->vic2_running) {
+        /*
+         * T40's VIC2: the third sensor feeds no pipe (the driver's VIC2
+         * frame start has no work to queue); its frames end, and its MDMA
+         * can store them raw
+         */
+        s->vic2[s->l->vic_sta >> 2] |= 1;
+        ingenic_vic_mdma(s, 2, s->frame + 2 * PIPE1_FRAME);
     }
     s->frame++;
     ingenic_isp_update(s);
@@ -1856,6 +1933,8 @@ static void ingenic_vic_wr(IngenicIspState *s, int v, hwaddr off,
             s->vic_running = val == 1;
         } else if (v == 1) {
             s->vic1_running = val == 1;
+        } else {
+            s->vic2_running = val == 1;
         }
         r[0] = 0;
         ingenic_isp_schedule(s);
@@ -1866,6 +1945,10 @@ static void ingenic_vic_wr(IngenicIspState *s, int v, hwaddr off,
     }
     if (off == l->vic_clr || off == l->vic_clr + two) {
         r[(l->vic_sta + off - l->vic_clr) >> 2] &= ~val;
+    }
+    if (off == VIC_MDMA_CTRL && (val & (1u << 31)) &&
+        !(r[off >> 2] & (1u << 31))) {
+        s->mdma_slot[v] = 0;            /* a capture starts at buffer 0 */
     }
     r[off >> 2] = val;
     ingenic_isp_update(s);
@@ -1976,6 +2059,8 @@ static void ingenic_isp_reset(DeviceState *dev)
     memset(s->phy, 0, sizeof(s->phy));
     s->vic_running = false;
     s->vic1_running = false;
+    s->vic2_running = false;
+    memset(s->mdma_slot, 0, sizeof(s->mdma_slot));
     s->frame = 0;
     for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
         chan_clear(&s->ch[n]);
@@ -2041,6 +2126,9 @@ static void ingenic_isp_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), &s->ivdc_frame, "ivdc-frame", 1);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ingenic_isp_frame, s);
     object_property_add_link(obj, "sensor", TYPE_DEVICE, &s->sensor,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "sensor2", TYPE_DEVICE, &s->sensor2,
                              object_property_allow_set_link,
                              OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "sensor1", TYPE_DEVICE, &s->sensor1,
@@ -2113,7 +2201,7 @@ static const VMStateDescription vmstate_ingenic_isp_chan = {
 
 static const VMStateDescription vmstate_ingenic_isp = {
     .name = TYPE_INGENIC_ISP,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = ingenic_isp_post_load,
     .fields = (const VMStateField[]) {
@@ -2133,6 +2221,8 @@ static const VMStateDescription vmstate_ingenic_isp = {
         VMSTATE_UINT32_ARRAY_V(vic1, IngenicIspState, VIC_SIZE / 4, 3),
         VMSTATE_UINT32_ARRAY_V(vic2, IngenicIspState, VIC_SIZE / 4, 3),
         VMSTATE_BOOL_V(vic1_running, IngenicIspState, 3),
+        VMSTATE_BOOL_V(vic2_running, IngenicIspState, 4),
+        VMSTATE_UINT8_ARRAY_V(mdma_slot, IngenicIspState, 3, 4),
         VMSTATE_TIMER_PTR(timer, IngenicIspState),
         VMSTATE_END_OF_LIST()
     },

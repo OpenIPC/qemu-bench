@@ -949,7 +949,8 @@ the address and with the ID that OpenIPC's `sinfo.ko` table probes:
 0x04 telling the two apart), `gc4653` (0x29, 16-bit registers; T40, on
 I2C1), `gc4663` (T41, the same ID), `jxh62` (0x30, `hisi-jxh62`; T10).
 The default is none. On T40 `sensor1=<name>` (the same names) adds a
-second sensor on I2C3, the second pipe's (below). T10's kernel bit-bangs the sensor bus (`i2c-gpio`,
+second sensor on I2C3, the second pipe's, and `sensor2=<name>` a third
+on I2C0, VIC2's (below). T10's kernel bit-bangs the sensor bus (`i2c-gpio`,
 SDA PA12, SCL PA13), so there the sensor hangs off QEMU's `gpio_i2c`,
 wired open-drain to those pins through `ingenic-gpio`'s new "drive"
 outputs (a pin's level as the SoC drives it: low for a GPIO output at
@@ -1261,6 +1262,44 @@ pipe 1 by the second sensor's exposure, and paints it with the frame
 counter 500000 ahead so that its pictures tell themselves apart. The
 interrupt status 0x40068 and 0x400A8 the ISR also reads stay 0.
 
+A third sensor (`sensor2=`, I2C0: the T40 kernel registers I2C0, 1 and
+3 only) is libimp's `IMPVI_THR` with `IMPISP_TOTAL_THR`: the driver
+takes it on VIC2 through the DVP port (`csi_phy_start` refuses a third
+MIPI sensor, "Can not support more than 2(3) mipi sensor"), prints "The
+third sensor init" and gives it no tuning (only indices 0 and 1 get
+`tisp_init` / `tisp_sec_init`) and no pipe: `/proc/jz/isp/isp-w02` shows
+"vic index: 0, 1, 2". The model runs VIC2 once started -- frame done,
+INTC 28; no frame start, for which the driver's VIC ISR has no work and
+only prints -- and a three-sensor libimp client still gets both pipes'
+frames. The SDK ships no driver for a third sensor; the test renames the
+gc4653 "s1" module to "s2" (the two differ only in their names).
+
+The VIC's MDMA stores raw frames in DDR. Only the `snapraw` debug
+command uses it ("echo snapraw S N > /proc/jz/isp/isp-w02", saved as
+`/tmp/snapK.raw`): `vic_mdma_enable` writes 0x304 = width << 16 |
+height, 0x308 = 1, the strides 0x310 / 0x314 (2 bytes a pixel), five
+buffers per channel at 0x318 + 4 k (channel 0) and 0x340 + 4 k (channel
+1), and 0x300 = bit 31 | frames << 16 | 0x20 (at most 8; the driver tops
+it up). The VIC ISR reads a second status, 0x1E4 under 0x1EC, acked at
+0x1F4: bit 0 is channel 0's frame, bit 1 channel 1's; on each,
+`vic_mdma_irq_function0` moves the next buffer slot on and completes the
+command when its count is out. The model stores each of its frames
+in the next slot as an RGGB mosaic of the scene, 10 bits in 16
+(undocumented: the driver only copies the bytes), sets 0x380 to the
+buffer written, counts 0x300's frames down and raises bit 0. The same
+raw path behind a VIC frame channel (`ispvic_frame_channel_qbuf`, the
+module's `isp-w02` raw dequeue) is not driven by anything here.
+
+libimp's joint mode (`IMPISPDualSensorSplitJoint`) is taken only for the
+vertical joins with two 2560x1440 sensors -- left and right make 5120
+wide, past the scaler's limit ("Image width cannot exceed 3840!"). Then
+both pipes run and are given the same channel buffers (pipe 1's channel
+3 and pipe 0's channel 0 get the same Y / UV addresses, sizes and
+steps) and libimp serves only channel 0 (channel 3's GetFrame fails);
+where the hardware puts each pipe's picture in the shared buffer is in
+no register the driver writes, so the model paints both pipes whole into
+it, the later on top.
+
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
 moved to core + 0xF0000: 0x133F0000, past the VIC, so `ingenic-isp`
@@ -1414,6 +1453,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t20` + vendor modules, `sensor=jxf22` | `t20` | `-kernel` + NOR root | the same, through the Apical core's DMA writers (`test-ingenic-isp.sh --soc t20`) |
 | OpenIPC `t40` + vendor modules, `sensor=gc4653` | `t40 -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t40`) |
 | OpenIPC `t40` + vendor modules + the SDK's `sensor_gc4653s1_t40.ko`, two sensors | `t40,sensor=gc4653,sensor1=gc4653 -m 256M` | `-kernel` + NOR root | libimp in the all-cached dual mode: channel 0 (pipe 0) and channel 3 (pipe 1) at 2560x1440, 40 frames each, both pipes' AE converging on their own sensors, the scene and counter checked per pipe (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`) |
+| OpenIPC `t40` + vendor modules + the gc4653 "s1" module twice (as `s1` and `s2`), three sensors | `t40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653 -m 256M` | `-kernel` + NOR root | libimp with `IMPISP_TOTAL_THR`, the third on VIC2 / DVP: both pipes' frames as above, VIC2 interrupting; the `snapraw` command while streaming saves `/tmp/snap0.raw` (2560x1440 x 2 bytes, an RGGB mosaic of the navy scene: R 186, G 216, B 335 on average) through the VIC MDMA (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --sensor2 gc4653 --snap-env SNAP_SNAPRAW=0_1`) |
 | T41NQ SDK 1.2.0 image + its modules, `sensor=gc4663` | `t41,variant=t41nq -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t41`) |
 | OpenIPC `t10` + vendor modules, `sensor=jxh62` | `t10` | `-kernel` + NOR root | 1280x720 and 640x360, the sensor on bit-banged I2C (`test-ingenic-isp.sh --soc t10`) |
 | T40XP camera | `t40 -m 256M` | flash | login, the vendor application starts |
@@ -1437,12 +1477,14 @@ teardown, so the verdict comes first.
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
-level under qtest (no guest), including a migration round trip of `t31`
-and `t41`, and the image pipeline: the GC2053's ID on I2C0, the VIC
+level under qtest (no guest), including a migration round trip of `t31`,
+`t41` and a three-sensor `t40`, and the image pipeline: the GC2053's ID on I2C0, the VIC
 poll, the MSCA FIFOs and a frame painted into a queued buffer under
 `clock_step`, on T31 and through the T21, T23, T40 and T41 layouts,
 T40's second pipe on its own and beside the first (VIC1 on INTC 29,
-channel 3, its AE banks, its counter 500000 ahead), and
+channel 3, its AE banks, its counter 500000 ahead), its VIC MDMA (two
+raw frames into buffers 0 and 1, 0x380, the count, status2 bit 0, the
+RGGB mosaic) and VIC2 (frame done on INTC 28), and
 on T20 and T10 the Apical slots, a DMA writer's bank and a dropped frame;
 and sound: a PDMA memory copy with its interrupt, a cyclic record ring
 filled with the tone at 16 kHz and a play ring drained at that rate,
@@ -1456,13 +1498,11 @@ and pow(), and the TCU's PWM pins.
 ## Not modelled
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
-its Apical base; above), T40's third sensor (VIC2: `tx-isp-t40.ko`
-supports one, "The third sensor init", in a joint mode where sensors
-share a pipe through VIC MDMA raw caching) and that raw caching (VIC
-+0x300.., `vic_mdma_enable`, also the `snapraw` debug command),
-T40/T41's WDR statistics (bit 11, a WDR mode's), T40's GSM and LCE
-(read otherwise than T41's), the Apical AF and the zone statistics
-beyond AE and AWB, PDMA transfers for peripherals other than the AIC,
+its Apical base; above), the placement of the two pictures in T40's
+joint mode and the VIC raw frame channel (above), T40/T41's WDR
+statistics (bit 11, a WDR mode's), T40's GSM and LCE (read otherwise
+than T41's), the Apical AF and the zone statistics beyond AE and AWB,
+PDMA transfers for peripherals other than the AIC,
 the SSI and the DES, the SSI slave and the HASH engine's CPU mode (no
 driver, sample or document in any tree here, so no contract; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other

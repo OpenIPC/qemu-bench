@@ -2360,6 +2360,51 @@ def test_isp_t40_pipe1(qt):
     qt.writel(vic1 + 0x00, 0)
 
 
+def test_isp_t40_mdma(qt):
+    """T40's VIC MDMA (snapraw) and VIC2, the third sensor's"""
+    print('ingenic-isp (T40 VIC MDMA, VIC2)')
+    vic0, vic2 = 0x13380000, 0x133A0000
+    w, h = 64, 32
+    raw = 0x00700000
+    # vic_mdma_enable: size, strides, five buffers, 2 frames, on
+    qt.writel(vic0 + 0x308, 1)
+    qt.writel(vic0 + 0x304, w << 16 | h)
+    qt.writel(vic0 + 0x310, 2 * w)
+    qt.writel(vic0 + 0x314, 2 * w)
+    for k in range(5):
+        qt.writel(vic0 + 0x318 + 4 * k, raw + k * 2 * w * h)
+    qt.write(raw, bytes(4 * w * h))
+    qt.writel(vic0 + 0x300, 0x80000020 | 2 << 16)
+    qt.writel(vic0 + 0x00, 1)
+    qt.writel(ISP + 0x40020, 0xFFFFFFFF)
+    qt.step(41 * 1000 * 1000)
+    check('an MDMA frame: status2 bit 0 (0x1E4)',
+          qt.readl(vic0 + 0x1E4) & 1, 1)
+    check('0x380 names the buffer written', qt.readl(vic0 + 0x380), raw)
+    check('the frame count counts down', (qt.readl(vic0 + 0x300) >> 16) & 15, 1)
+    px = struct.unpack('<%dH' % (2 * w), qt.read(raw + 16 * 2 * w, 4 * w))
+    # row 16 R G R G.., row 17 G B G B..: the navy background, 10 bits
+    r, g, b = px[0], px[1], px[w + 1]
+    check('a raw16 RGGB mosaic of the navy scene: B > G > R, 10 bits',
+          (b > g > r, max(px) < 1024), (True, True))
+    qt.writel(vic0 + 0x1F4, 1)
+    qt.step(41 * 1000 * 1000)
+    check('the second frame into buffer 1, then the count is out',
+          (qt.readl(vic0 + 0x380), (qt.readl(vic0 + 0x300) >> 16) & 15),
+          (raw + 2 * w * h, 0))
+    qt.writel(vic0 + 0x1F4, 1)
+    qt.step(41 * 1000 * 1000)
+    check('no third frame', qt.readl(vic0 + 0x1E4) & 1, 0)
+    # VIC2: started, its frames end (no frame start: no pipe to feed)
+    qt.writel(vic2 + 0x00, 1)
+    qt.step(41 * 1000 * 1000)
+    check('VIC2 frame done, no frame start',
+          qt.readl(vic2 + 0x1E0) & 0x11, 1)
+    check('VIC2 interrupts on INTC 28', (qt.readl(CORE_INTC) >> 28) & 1, 1)
+    qt.writel(vic0 + 0x00, 0)
+    qt.writel(vic2 + 0x00, 0)
+
+
 def test_isp_layout(qt, soc):
     print('ingenic-isp (%s layout)' % soc)
     (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
@@ -2706,6 +2751,9 @@ def main():
         qt = QTest(a.qemu, 't40,sensor=gc4653,sensor1=gc4653')
         test_isp_t40_pipe1(qt)
         qt.close()
+        qt = QTest(a.qemu, 't40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653')
+        test_isp_t40_mdma(qt)
+        qt.close()
         for soc in ISP_LAYOUTS:
             qt = QTest(a.qemu, soc)
             test_isp_layout(qt, soc)
@@ -2769,6 +2817,8 @@ def main():
         test_migration(a.qemu, 't31', tmp)
         test_migration(a.qemu, 't31,sensor=gc2053', tmp)
         test_migration(a.qemu, 't41', tmp)
+        test_migration(a.qemu, 't40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653',
+                       tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('%d failure(s)' % failures)

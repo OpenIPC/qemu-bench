@@ -254,6 +254,7 @@ typedef struct IngenicSocInfo {
     int irq_isp, irq_vic;   /* INTC sources, 0: IRQ_ISP / IRQ_VIC */
     int sensor_bus;         /* the I2C bus sinfo / tx-isp probe */
     int sensor1_bus;        /* > 0: sensor1= (a second sensor) is here */
+    int sensor2_bus;        /* > 0: sensor2= (a third sensor) is on bus - 1 */
     int sensor_gpio_sda;    /* > 0: the sensor bus is bit-banged on GPIOs
                                sda / sda + 1 (T10's i2c-gpio) */
 } IngenicSocInfo;
@@ -334,6 +335,8 @@ struct IngenicMachineState {
     DeviceState *sensor_dev;        /* the sensor= model, for the ISP */
     char *sensor1;
     DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
+    char *sensor2;
+    DeviceState *sensor2_dev;       /* sensor2=, T40's third sensor (VIC2) */
     const IngenicSocInfo *info;
     MIPSCPU *cpu[2];
     Clock *cpuclk;
@@ -1114,6 +1117,12 @@ static void ingenic_init(MachineState *ms)
             ims->sensor1_dev = ingenic_create_sensor(ims->sensor1,
                 I2C_BUS(qdev_get_child_bus(dev, "i2c")));
         }
+        /* and its third, on I2C0 through VIC2 (the kernel has I2C2 off) */
+        if (info->sensor2_bus && i == info->sensor2_bus - 1 && ims->sensor2 &&
+            strcmp(ims->sensor2, "none")) {
+            ims->sensor2_dev = ingenic_create_sensor(ims->sensor2,
+                I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+        }
     }
 
     /*
@@ -1186,6 +1195,10 @@ static void ingenic_init(MachineState *ms)
             /* T40's second pipe: its own sensor and exposure */
             object_property_set_link(OBJECT(dev), "sensor1",
                                      OBJECT(ims->sensor1_dev), &error_abort);
+        }
+        if (ims->sensor2_dev) {
+            object_property_set_link(OBJECT(dev), "sensor2",
+                                     OBJECT(ims->sensor2_dev), &error_abort);
         }
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
@@ -1632,6 +1645,19 @@ static void ingenic_set_sensor1(Object *obj, const char *value, Error **errp)
     ims->sensor1 = g_strdup(value);
 }
 
+static char *ingenic_get_sensor2(Object *obj, Error **errp)
+{
+    return g_strdup(INGENIC_MACHINE(obj)->sensor2);
+}
+
+static void ingenic_set_sensor2(Object *obj, const char *value, Error **errp)
+{
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    g_free(ims->sensor2);
+    ims->sensor2 = g_strdup(value);
+}
+
 static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1667,6 +1693,11 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sensor1",
         "T40: a second image sensor, on I2C3 (CSI1, the second pipe); the "
         "same names as sensor=");
+    object_class_property_add_str(oc, "sensor2",
+        ingenic_get_sensor2, ingenic_set_sensor2);
+    object_class_property_set_description(oc, "sensor2",
+        "T40: a third image sensor, on I2C0 (VIC2); the same names as "
+        "sensor=");
 }
 
 static void ingenic_soc_class_init(ObjectClass *oc, const void *data)
@@ -1754,7 +1785,7 @@ static const IngenicSocInfo ingenic_socs[] = {
         .sfc_version = 2, .mtd_id = "jz_sfc", .nand_mtd_id = "sfc_nand",
         .rtc_base = 0x132A0000, .max_cpus = 2, .num_i2c = 4,
         .soc_id = 0x10040003, .prid = 0, .l1_kib = 0,
-        .sensor_bus = 1, .sensor1_bus = 3,
+        .sensor_bus = 1, .sensor1_bus = 3, .sensor2_bus = 1,
         /* VIC0 of three; CSI0 (the one a single sensor uses) */
         .isp = "t40", .isp_base = ISP_BASE, .vic_base = 0x13380000,
         .csi_base = 0x10054000, .dphy_base = DPHY_BASE,
