@@ -162,6 +162,13 @@ QEMU's own Ingenic models are not what these kernels need, so
 The T21 and T23 have 16 KiB L1 caches where the others have 32 KiB; the
 machine sets that, and the T20's PRId, through the CPU's `l1-kib` and
 `prid` properties (`qemu/patches/0017-mips-prid-l1-size-properties.patch`).
+T40 and T41 report their L2 in Config2 (`config2`, patch 0025): 128 KiB
+(the T40 product briefs), 8 ways of 64-byte lines (U-Boot's
+`isvp_t40.h`), so the 4.4 kernels print "Unified secondary cache 128kB
+8-way, linesize 64 bytes" and do its maintenance; CCU 0x60 bits 12:10
+read 1, the size U-Boot reads. T41's L2 is taken to be T40's. The
+XBurst1 parts' L2 (the 3.10 kernels build `JZ_CPU_SCACHE`) is not
+described: nothing here states its geometry.
 
 The second XBurst2 core starts powered off. The kernel's
 `boot_secondary()` writes the entry to CCU RER and clears the core's CSRR
@@ -589,7 +596,10 @@ on the CPU (`CoreManager.c`, `EncSliceParam.c`, `SliceHdrWriter.c` in
 the SDK's `libimp.a`; contract: `tmp/media-contract.md` section 3). The
 `reg-base` property puts the 4 KiB register file at +0x8000 of the 1 MiB
 block (T31, T40) or at +0 (T41). Core c's registers are at +0x200 c:
-libimp encodes video on core 0 and JPEG on core 1.
+libimp encodes video on core 0 and JPEG on core 1. The HW ID word (0x8004
+past the UID) is the part's -- libimp's encoder library checks it
+("Board ID mismatch: ... instead of 72000460"): 0x72000460 on T31,
+0x72000760 on T40, 0x71000260 on T41 (`hw-id`).
 
 - 0x14 / 0x18: interrupt mask / W1C status, bit 4c+0 Enc1 or JPEG done,
   4c+2 Enc2 done; 0x30 a ticking 800 MHz counter (libimp spins until it is

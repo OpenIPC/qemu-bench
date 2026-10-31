@@ -245,6 +245,7 @@ struct IngenicAvpuState {
 
     uint32_t reg_base;
     uint8_t gen;                        /* 1: T31, T40; 2: T41 */
+    uint32_t hw_id;                     /* ID1: the part's encoder HW ID */
     uint32_t regs[AVPU_NREGS];
     uint32_t irq_status;
     int64_t timer_latch;
@@ -1769,7 +1770,12 @@ static void avpu_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     /* board UID, HW ID, revision, date (Board.c ShowBoardInformation) */
     s->regs[R_ID0 / 4] = 0x414c4c45;            /* "ELLA" */
-    s->regs[R_ID1 / 4] = 0x00005e20;
+    /*
+     * the HW ID libimp's encoder library checks against the part's
+     * ("Board ID mismatch: 5E20 instead of 72000460" on T31, 72000760 on
+     * T40, 71000260 on T41): "hw-id"
+     */
+    s->regs[R_ID1 / 4] = s->hw_id;
     s->regs[R_ID2 / 4] = 0x00010000;
     s->regs[R_ID3 / 4] = 0x20220825;
     s->irq_status = 0;
@@ -1812,6 +1818,7 @@ static void avpu_realize(DeviceState *dev, Error **errp)
 static const Property avpu_props[] = {
     DEFINE_PROP_UINT32("reg-base", IngenicAvpuState, reg_base, 0x8000),
     DEFINE_PROP_UINT8("gen", IngenicAvpuState, gen, 1),
+    DEFINE_PROP_UINT32("hw-id", IngenicAvpuState, hw_id, 0x72000460),
     DEFINE_PROP_STRING("dump", IngenicAvpuState, dump),
     DEFINE_PROP_UINT8("trace", IngenicAvpuState, trace, 0),
     DEFINE_PROP_UINT32("pcm-budget", IngenicAvpuState, pcm_budget, 256 * 1024),

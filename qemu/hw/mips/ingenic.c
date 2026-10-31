@@ -1017,6 +1017,15 @@ static void ingenic_init(MachineState *ms)
                                  &error_abort);
         object_property_set_uint(OBJECT(dev), "l1-kib", info->l1_kib,
                                  &error_abort);
+        if (ingenic_is_xburst2(info->soc)) {
+            /*
+             * The L2: 128 KiB (the T40 product briefs), 8 ways of 64-byte
+             * lines (U-Boot's isvp_t40.h), so 256 sets -- Config2 SS 2,
+             * SL 5, SA 7; T41's core is taken to be the same
+             */
+            object_property_set_uint(OBJECT(dev), "config2",
+                                     (2 << 8) | (5 << 4) | 7, &error_abort);
+        }
         /*
          * No hidden tlbwr shadow entries: on two cores the T40/T41 4.4
          * kernel otherwise leaves a user page translated to stale data
@@ -1638,6 +1647,9 @@ static void ingenic_init(MachineState *ms)
         qdev_prop_set_uint32(dev, "reg-base", t41 ? 0 : 0x8000);
         /* T41's core is the next generation: core pages, 4 KiB entries */
         qdev_prop_set_uint8(dev, "gen", t41 ? 2 : 1);
+        qdev_prop_set_uint32(dev, "hw-id", t41 ? 0x71000260 :
+                             info->soc == INGENIC_T40 ? 0x72000760 :
+                             0x72000460);
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, t41 ? AVPU_BASE_T41 : AVPU_BASE);
