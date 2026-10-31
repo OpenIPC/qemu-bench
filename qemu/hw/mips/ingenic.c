@@ -119,12 +119,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define BOOTROM_SIZE    0x10000
 #define CAR_BASE        0x1F000000  /* the cache lines the ROM locks */
 #define CAR_SIZE        0x8000
-#define ORAM_BASE       0x12660000  /* XBurst2 on-chip RAM */
+#define ORAM_BASE       0x12600000  /* XBurst2 ORAM: the NNA's, 1 MiB */
 #define IVDC_STORE_BASE 0x80000000  /* T41 direct_mode: the IVDC's frame */
 #define IVDC_STORE_SIZE 0x02000000
 #define IVDC_BASE       0x13200000  /* T41: the IVDC's registers */
 #define IRQ_IVDC_T41    13          /* core INTC; "isp-ivdc" in tx-isp */
-#define ORAM_SIZE       0x10000
+#define ORAM_SIZE       0x100000
+#define NNDMA_BASE      0x12500000  /* T40, T41: the NNA's DMA */
 #define IO_BASE         0x10000000
 #define IO_SIZE         0x04000000
 
@@ -980,6 +981,15 @@ static void ingenic_init(MachineState *ms)
         memory_region_init_ram(oram, NULL, "ingenic.oram", ORAM_SIZE,
                                &error_fatal);
         memory_region_add_subregion(sysmem, ORAM_BASE, oram);
+
+        /*
+         * The NNA's DMA between DDR and that ORAM, as libvenus drives it
+         * from user space; its waits are CPU hardware registers.
+         */
+        dev = qdev_new("ingenic-nndma");
+        object_property_add_child(OBJECT(ims), "nndma", OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NNDMA_BASE);
     }
     if (info->soc == INGENIC_T41) {
         /*

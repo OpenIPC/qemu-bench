@@ -608,6 +608,41 @@ def test_aip(qt, intc=CORE_INTC):
     qt.writel(P + 0x04, 1)
 
 
+def nndma_desc(ddr, oram_off, nbytes, more):
+    """libvenus's descriptor (dma_func.cc w_d2o_orasetrun)"""
+    n = (nbytes >> 6) - 1
+    w0 = ddr | (((n >> 12) & 0x1f) << 1) | (1 if more else 0)
+    w1 = ((n & 0xfff) << 20) | (oram_off >> 6)
+    return struct.pack('<II', w0, w1)
+
+
+def test_nndma(qt):
+    print('ingenic-nndma (T40/T41 NNA DMA)')
+    NNDMA, ORAMP = 0x12500000, 0x12600000
+    src = bytes((i * 7 + 3) & 0xff for i in range(12288))
+    qt.write(SCRATCH, src)
+    # a chain of two: 8 KiB to ORAM +0x20000, 4 KiB to ORAM +0x40000
+    qt.write(NNDMA + 8 * 5, nndma_desc(SCRATCH, 0x20000, 8192, True) +
+             nndma_desc(SCRATCH + 8192, 0x40000, 4096, False))
+    qt.writel(NNDMA + 0x8004, (1 << 31) | 5)            # read channel 1
+    check('the chain reached ORAM, both descriptors',
+          (qt.read(ORAMP + 0x20000, 8192) == src[:8192],
+           qt.read(ORAMP + 0x40000, 4096) == src[8192:]), (True, True))
+    check('the channel reads back done', qt.readl(NNDMA + 0x8004) >> 31, 0)
+    # back to DDR through write channel 0, with a byte limit of 4 KiB
+    qt.write(ORAMP + 0x20000, bytes(range(256)) * 32)
+    qt.write(NNDMA + 8 * 9, nndma_desc(SCRATCH + 0x10000, 0x20000, 4096, True)
+             + nndma_desc(SCRATCH + 0x11000, 0x21000, 4096, False))
+    qt.write(SCRATCH + 0x11000, b'\xaa' * 64)
+    qt.writel(NNDMA + 0x8010, (1 << 31) | ((4096 >> 6) << 12) | 9)
+    check('write channel: ORAM to DDR', qt.read(SCRATCH + 0x10000, 4096),
+          bytes(range(256)) * 16)
+    check('the byte limit stops the chain', qt.read(SCRATCH + 0x11000, 64),
+          b'\xaa' * 64)
+    check('the 1 MiB ORAM: its last word', (qt.writel(ORAMP + 0xFFFFC, 0x5a5a),
+          qt.readl(ORAMP + 0xFFFFC))[1], 0x5a5a)
+
+
 def test_bscaler(qt, intc=CORE_INTC):
     print('ingenic-bscaler (T40)')
     src, dst, chain = SCRATCH, SCRATCH + 0x10000, SCRATCH + 0x20000
@@ -2668,6 +2703,7 @@ def main():
         test_i2d(qt)
         test_aip(qt)
         test_vo(qt)
+        test_nndma(qt)
         test_dtrng(qt, CORE_INTC)
         test_aes(qt, CORE_INTC)
         test_hash(qt, CORE_INTC)
@@ -2679,6 +2715,7 @@ def main():
         test_i2d(qt)
         test_monitor(qt)
         test_bscaler(qt)
+        test_nndma(qt)
         qt.close()
         qt = QTest(a.qemu, 't20')
         test_aes(qt)
