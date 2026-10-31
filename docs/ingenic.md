@@ -46,7 +46,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
 | 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
-| 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride, paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
+| 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride (+0x20 ISR, UMR, UACR: storage), paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
 | 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c), PDMA requests 0x24 + 2 n / 0x25 + 2 n | `ingenic-i2c` |
 | 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
 | 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
@@ -665,6 +665,11 @@ loads `tx-isp-t41.ko` without `direct_mode`.
 - `ingenic-gpio`: S/C aliases on every register, the shadow port's
   collected set/clear masks applied by GID2LD, outputs reading back their
   level and undriven inputs reading high; one interrupt line per port.
+  Each port's external levels are a property at `/machine/gpio` ("pa"
+  .. "pf"), settable while the guest runs -- a key, a PIR sensor, a
+  limit switch: `qom-set /machine/gpio pc 0xfffffffe` pulls PC0 low, and
+  the edge or level interrupt it is set up for fires
+  (`test-ingenic-gpio.sh`: a sysfs GPIO sees both edges on T31).
 - `ingenic-i2c`: a DW_apb_i2c master moving each command at once; an
   address no device answers aborts with TXABRT bit 0, and ENSTA follows
   ENB (both drivers wait for it). The image sensor (`sensor=`) is on
@@ -680,7 +685,11 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   host's clock, HCR.PD powers off.
 - `ingenic-efuse`: blank fuses with every read and program done at once
   (the vendor kernels poll both and CTRL's enable). Blank keeps the
-  binary-only MXU licence check in the 3.10 kernels permissive.
+  binary-only MXU licence check in the 3.10 kernels permissive. The chip
+  ID (fuse offset 0, 96 bits: `SU_Base_GetDevID`, the SDKs'
+  `sample-chipid`, `/proc/jz/efuse/efuse_chip_id`) is the SoC ID then
+  "OpenIPC!" unless `-global ingenic-efuse.chipid0..2=` says otherwise;
+  a die's own is unique.
 - `ingenic-sadc`: the AUX ADC of `jz_adc_v13.c` (3.10) and
   `ingenic_adc_v13.c` (4.4). ENA bit 15 powers it down; setting bit n
   converts AUX n 20 us later, clears the bit and raises STATUS bit n

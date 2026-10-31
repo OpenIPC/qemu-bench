@@ -10,10 +10,17 @@
  * code wait for STATE bit 0 after every read and bit 1 after every
  * program, with no timeout, so both read as done; the vendor kernels also
  * wait for CTRL's enable bit to drop before the next read.  The fuses read zero:
- * the chip ID, the MAC's PHY clock selection on T41 (0x22C, 0x250), and
+ * the MAC's PHY clock selection on T41 (0x22C, 0x250), and
  * the hash word (0x23C) that the binary-only MXU check in the 3.10
  * kernels (arch/mips/xburst/core/mxu-v2-ex.obj) compares only when it is
  * not zero.  Programming is accepted and changes nothing.
+ *
+ * The chip ID -- the 96-bit segment at fuse offset 0 (0x200..0x208,
+ * jz_efuse_v13.c's CHIP_ID; libsysutils' SU_Base_GetDevID, the SDKs'
+ * sample-chipid, /proc/jz/efuse/efuse_chip_id) -- is the "chipid0..2"
+ * properties: unique per die on silicon, a fixed value per machine here
+ * (the SoC ID, then "OpenIPC!"), -global ingenic-efuse.chipidN=... to
+ * set another.
  *
  * Two words are not blank: the grade codes that tell a T31N from a T31X
  * or a T40XP from a T40A (ipctool src/hal/ingenic.c) -- SUBSOCTYPE1 at
@@ -41,6 +48,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicEfuseState, INGENIC_EFUSE)
 #define R_STATE     0x08
 #define R_DATA      0x0C
 #define R_FUSES     0x200
+#define R_CHIPID    0x200       /* three words */
 #define R_SUBSOCTYPE1   0x238
 #define R_SUBSOCTYPE2   0x250
 
@@ -55,11 +63,14 @@ struct IngenicEfuseState {
     MemoryRegion iomem;
     uint32_t ctrl, cfg;
     uint32_t subsoctype1, subsoctype2;
+    uint32_t chipid[3];
 };
 
 static uint32_t efuse_word(IngenicEfuseState *s, hwaddr off)
 {
     switch (off & ~3) {
+    case R_CHIPID ... R_CHIPID + 8:
+        return s->chipid[((off & ~3) - R_CHIPID) >> 2];
     case R_SUBSOCTYPE1:
         return s->subsoctype1;
     case R_SUBSOCTYPE2:
@@ -141,6 +152,9 @@ static const VMStateDescription vmstate_ingenic_efuse = {
 static const Property ingenic_efuse_props[] = {
     DEFINE_PROP_UINT32("subsoctype1", IngenicEfuseState, subsoctype1, 0),
     DEFINE_PROP_UINT32("subsoctype2", IngenicEfuseState, subsoctype2, 0),
+    DEFINE_PROP_UINT32("chipid0", IngenicEfuseState, chipid[0], 0),
+    DEFINE_PROP_UINT32("chipid1", IngenicEfuseState, chipid[1], 0x6e65704f),
+    DEFINE_PROP_UINT32("chipid2", IngenicEfuseState, chipid[2], 0x21435049),
 };
 
 static void ingenic_efuse_class_init(ObjectClass *klass, const void *data)

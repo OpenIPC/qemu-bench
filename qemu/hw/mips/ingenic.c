@@ -347,6 +347,7 @@ struct IngenicMachineState {
     Clock *cpuclk;
     DeviceState *intc, *sfc, *sfc1;
     DeviceState *nand;      /* the boot flash is a SPI NAND */
+    uint32_t uart_ext[6][8];        /* each UART's registers past the 16550 */
 };
 
 typedef struct IngenicMachineClass {
@@ -356,6 +357,39 @@ typedef struct IngenicMachineClass {
 
 DECLARE_CLASS_CHECKERS(IngenicMachineClass, INGENIC_MACHINE,
                        TYPE_INGENIC_MACHINE)
+
+/* --- the UARTs' registers past the 16550's eight --------------------------- */
+
+/*
+ * 0x20 ISR (IrDA select), 0x24 UMR (the baud M divisor), 0x28 UACR (its
+ * fine adjust), ...: the boot loaders and the kernels' jz_uart / 8250
+ * set them for each baud rate; the 16550 model times by its divisor
+ * alone, so these hold what is written.
+ */
+static uint64_t ingenic_uart_ext_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t *r = opaque;
+
+    return r[off >> 2];
+}
+
+static void ingenic_uart_ext_write(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size)
+{
+    uint32_t *r = opaque;
+
+    r[off >> 2] = val;
+}
+
+static const MemoryRegionOps ingenic_uart_ext_ops = {
+    .read = ingenic_uart_ext_read,
+    .write = ingenic_uart_ext_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
 
 /* --- interrupt lines ---------------------------------------------------- */
 
@@ -1109,6 +1143,7 @@ static void ingenic_init(MachineState *ms)
 
     /* GPIO */
     dev = gpio = qdev_new("ingenic-gpio");
+    object_property_add_child(OBJECT(ims), "gpio", OBJECT(dev));
     qdev_prop_set_uint32(dev, "num-ports", info->gpio_ports);
     qdev_prop_set_uint32(dev, "stride", info->gpio_stride);
     qdev_prop_set_uint32(dev, "shadow", info->gpio_shadow);
@@ -1156,6 +1191,14 @@ static void ingenic_init(MachineState *ms)
         memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000,
                                     sysbus_mmio_get_region(SYS_BUS_DEVICE(dev),
                                                            0));
+        {
+            MemoryRegion *ext = g_new(MemoryRegion, 1);
+
+            memory_region_init_io(ext, OBJECT(ims), &ingenic_uart_ext_ops,
+                                  ims->uart_ext[i], "ingenic.uart-ext", 0x20);
+            memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000 + 0x20,
+                                        ext);
+        }
     }
 
     /* I2C, the sensor's bus on I2C0 */
@@ -1526,6 +1569,10 @@ static void ingenic_init(MachineState *ms)
     memory_region_add_subregion(sysmem, USBPHY_BASE, usbphy);
 
     dev = qdev_new("ingenic-efuse");
+    /* the chip ID's first word: the SoC ID, unless -global set one */
+    if (!object_property_get_uint(OBJECT(dev), "chipid0", NULL)) {
+        qdev_prop_set_uint32(dev, "chipid0", info->soc_id);
+    }
     qdev_prop_set_uint32(dev, ingenic_is_xburst2(info->soc) ?
                          "subsoctype2" : "subsoctype1",
                          (uint32_t)var->code << 16);

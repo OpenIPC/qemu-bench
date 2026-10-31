@@ -2106,6 +2106,23 @@ def test_gpio(qt):
     check('PB3 reads 0', qt.readl(pb + 0x00) & 8, 0)
     qt.writel(pb + 0x44, 1 << 3)
     check('PAT0S drives it high', qt.readl(pb + 0x00) & 8, 8)
+    # PC0 a falling-edge interrupt, driven through /machine/gpio pc
+    pc = GPIO + 0x2000
+    qt.writel(pc + 0x14, 1)                     # INTS
+    qt.writel(pc + 0x34, 1)                     # PAT1S: edge
+    qt.writel(pc + 0x48, 1)                     # PAT0C: falling
+    qt.writel(pc + 0x28, 1)                     # MSKC
+    qt.writel(pc + 0x58, 0xFFFFFFFF)            # FLGC
+    line = lambda: (qt.readl(INTC + 0x00) >> 15) & 1
+    check('no interrupt while PC0 stays high', line(), 0)
+    qt.qom_set('/machine/gpio', 'pc', 0xFFFFFFFE)
+    check('pulling PC0 low reads 0 and flags it',
+          (qt.readl(pc + 0x00) & 1, qt.readl(pc + 0x50) & 1, line()), (0, 1, 1))
+    qt.writel(pc + 0x58, 1)
+    qt.qom_set('/machine/gpio', 'pc', 0xFFFFFFFF)
+    check('a rising edge does not', (qt.readl(pc + 0x50) & 1, line()), (0, 0))
+    check('qom-get reads the levels back',
+          qt.qom_get('/machine/gpio', 'pc'), 0xFFFFFFFF)
 
 
 def test_i2c(qt):
@@ -3160,6 +3177,16 @@ def test_rtc_efuse(qt, rtc=RTC):
     qt.writel(EFUSE + 0x00, (3 << 21) | 1)
     check('EFUSE enable self-clears', qt.readl(EFUSE + 0x00) & 1, 0)
     check('blank fuses', qt.readl(EFUSE + 0x23C), 0)
+    check('the chip ID: the SoC ID, then "OpenIPC!"',
+          tuple(qt.readl(EFUSE + 0x200 + 4 * i) for i in range(3)),
+          (qt.readl(0x1300002C), 0x6E65704F, 0x21435049))
+    qt.writel(EFUSE + 0x00, (1 << 21) | 1)      # through CTRL / DATA
+    check('chip ID word 1 through DATA', qt.readl(EFUSE + 0x0C), 0x6E65704F)
+    # the UARTs' registers past the 16550: UMR, UACR hold what is written
+    qt.writel(0x10031024, 16)
+    qt.writel(0x10031028, 0x1A5)
+    check('UART1 UMR / UACR', (qt.readl(0x10031024), qt.readl(0x10031028)),
+          (16, 0x1A5))
 
 
 def test_ids(qemu):
