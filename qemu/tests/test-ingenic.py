@@ -3518,6 +3518,15 @@ def main():
         qt = QTest(a.qemu, 't31,wifi=atbm', ['-nic', 'user'])
         test_sdio(qt)
         qt.close()
+        qt = QTest(a.qemu, 't31,wifi=atbm,wifi-ssid=IEEE,wifi-psk=password',
+                   ['-nic', 'user'])
+        print('atbm-sdio WPA2-PSK authenticator')
+        check('PBKDF2 PSK, PRF and AES key wrap known answers',
+              qt.qom_get('/machine/atbm', 'selftest'), True)
+        check('the access point takes the passphrase and SSID',
+              (qt.qom_get('/machine/atbm', 'psk'),
+               qt.qom_get('/machine/atbm', 'ssid')), ('password', 'IEEE'))
+        qt.close()
         qt = QTest(a.qemu, 't40,wifi=atbm', ['-nic', 'user'])
         test_sdio_sdhci(qt)
         qt.close()

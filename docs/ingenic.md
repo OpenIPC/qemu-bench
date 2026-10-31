@@ -520,8 +520,33 @@ data ports with their base-address latch.  It accepts the firmware the
 driver downloads into chip memory, releases the "CPU" when CONFIG's reset
 bit clears, and then answers the WSM protocol itself, emulating an access
 point and bridging data frames to the netdev (the WSM/AP engine it shares
-with `hw/usb/atbm-wifi.c`): a scan reports an SSID (`ssid=`, default
-OpenIPC), and an open-network join associates.
+with `hw/usb/atbm-wifi.c`): a scan reports an SSID (`wifi-ssid=` on the
+machine, the card's `ssid=`; default OpenIPC), and a join associates --
+to an open network, or with `wifi-psk=` (8..63 characters) a WPA2-PSK
+one.  The card is `/machine/atbm`.
+
+WPA2-PSK: beacons and probe responses set the privacy bit and carry an
+RSN IE (CCMP group, one CCMP pairwise, one PSK AKM), and after the
+association the access point runs the authenticator's 4-way handshake
+and group key (IEEE 802.11-2016 12.7), from the spec: PMK =
+PBKDF2-HMAC-SHA1(passphrase, SSID, 4096, 256 bits), PTK = PRF-384(PMK,
+"Pairwise key expansion", the two addresses and nonces, low first),
+EAPOL-Key descriptor version 2 (HMAC-SHA1-128 MICs under the KCK; the
+GTK, key ID 1, wrapped in message 3 with AES key wrap under the KEK).  A
+message 2 or 4 whose MIC fails -- a wrong passphrase -- is dropped;
+messages 1 and 3 are resent once a second, and after four the station
+is deauthenticated (reason 15).  Until message 4 only EAPOL passes.
+The atbm driver does CCMP in the chip, not in software (its mac80211's
+software CCMP is compiled out): it installs the PTK and GTK with
+WSM_ADD_KEY -- the model checks they are the handshake's TK and GTK --
+and its protected frames leave room for the CCMP header (8 bytes) and
+MIC (8) around a plaintext body, which the model strips.  Frames to the
+station go Protected with a CCMP header (ExtIV, key 0 / group key 1, a
+rising PN for mac80211's replay check) and 8 bytes of MIC, flagged
+AES-decrypted (and group-key for group frames) in the RX indication,
+which is what the chip's decryption hands the driver.  The `selftest`
+property runs the PBKDF2 (802.11 J.4.2), PRF (J.3) and AES key wrap
+(RFC 3394 4.1) known-answer tests.
 
 Over SDIO each WSM message the driver queues carries a 28-byte prefix
 (an 8-byte bus header and a 20-byte cipher header) ahead of its
@@ -536,7 +561,11 @@ and DCCM, by DMA CMD53 writes), the startup indication brings up `wlan0`,
 `wpa_supplicant` scans, sees the emulated SSID and associates to the open
 network, `udhcpc` gets 10.0.2.15 from slirp and `ping 10.0.2.2` answers.
 The guest NIC is `-nic user,model=atbm-sdio` (the machine binds it to the
-card).
+card).  `--psk PASSPHRASE` does the same over WPA2-PSK (`wpa_supplicant`
+with `key_mgmt=WPA-PSK`, CCMP): the handshake completes, the driver's
+installed keys match the TK and GTK, and DHCP and ping run over protected
+frames; `--wrong-psk` passes only if the station stays off (message 2's
+MIC rejected).
 
 XBurst2 (T40/T41) puts the same card on MSC1, an SDHCI host: patch 0027
 makes an SDIO card's interrupt the SDHCI Normal Interrupt Status "Card
@@ -551,7 +580,8 @@ the driver's private tx-power ioctls assume, so that build needs those
 three helpers stubbed; the driver's own `cfg80211.ko` (from its
 `wireless/`) goes with it, not the rootfs's.
 
-Qtests: `test_sdio` drives the enumeration on the T31 MSC1,
+Qtests: the WPA2 known answers (`selftest`) and the machine's
+`wifi-ssid` / `wifi-psk`; `test_sdio` drives the enumeration on the T31 MSC1,
 `test_sdio_sdhci` on the T40 SDHCI MSC1 plus the card interrupt (raised
 by the startup indication after a CMD53 releases the chip's CPU, level,
 reaching the core INTC).  The guest test skips
@@ -1906,6 +1936,7 @@ teardown, so the verdict comes first.
 | OpenIPC T31 kernel with `CONFIG_SERIAL_JZ47XX_UART0_DMA` + the release's root | `t31`, UART0 on a socket | `-kernel` + NOR root, `test-ingenic-uart-dma.sh --kernel` | 32 KiB of random bytes in on ttyS0 by the PDMA (32 full 1 KiB buffers, 3 of 3 runs) and back out by it, both intact |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 | OpenIPC `t23` / `t30` + the T23 / T30 SDK's libimp.a (`IMP_Decoder`) | `t23` / `t30` | NOR root, `test-ingenic-jpegd.sh --soc t23\|t30 [--jpeg FILE]` | 640x480 and 1280x720 JPEGs from ffmpeg and the snapshot libimp encoded on T21 (`test-ingenic-vpu-e2e.sh`, 640x360): Y 80.8, 81.6 and 70.5 dB against ffmpeg's decode (the snapshot above its partial last macroblock row) |
+| OpenIPC T31 / T40 kernel (MSC1 enabled) + the vendor `atbm_wlan` driver, `wpa_supplicant` | `t31,wifi=atbm` / `t40,wifi=atbm`, `wifi-psk=` | `test-ingenic-wifi.sh [--soc t40] [--psk P [--wrong-psk]]` | SDIO enumeration, firmware download, `wlan0`, association to the open or WPA2-PSK access point (4-way handshake, installed keys equal to the TK and GTK), DHCP 10.0.2.15, ping; a wrong passphrase is refused at message 2 |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
 level under qtest (no guest), including a migration round trip of `t31`,
@@ -1930,9 +1961,11 @@ and the TCU's PWM pins.
 
 ## Not modelled
 
-The SDIO Wi-Fi chip (`atbm-sdio`): only open networks (no WPA/WPA2
-handshake), no power save or the chip's BLE side; `wifi=atbm` puts it on
-MSC1 of every machine, tested end to end on T31 (jzmmc) and T40 (SDHCI).
+The SDIO Wi-Fi chip (`atbm-sdio`): open and WPA2-PSK (CCMP) networks
+only -- no WPA1/TKIP, WPA3/SAE, 802.1X, PMF or group rekeying -- no power
+save or the chip's BLE side; `wifi=atbm` puts it on MSC1 of every
+machine, tested end to end on T31 (jzmmc) and T40 (SDHCI).  The USB
+`atbm-wifi` of the Xiongmai machines stays open-network only.
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode
