@@ -52,6 +52,20 @@
  *    bytes, lexicographic (0 BGR .. 5 RGB), bit 3 alpha first -- BGRA 0,
  *    RGBA 5, ARGB 13.  Alpha is written 0.
  *
+ *  LZMA mode (drivers/lzma/lzma.c of the 4.4 kernel, CONFIG_LZMADEVICE,
+ *    jz_lzma_decompress, which squashfs's hardware_lzma.c would call): a
+ *    write of 0x00 with bit 31 turns the window's first eight words into
+ *    the decompressor's -- 0x00 CTRL (bit 31 the mode, sticky; bit 2
+ *    reset and bit 1 RAM init, both clearing themselves; bit 0 starts and
+ *    reads 1 until done; bit 3 masks the interrupt), 0x04 BS_BASE, 0x08
+ *    BS_SIZE, 0x0C DST_BASE, 0x10 ICRC / 0x14 OCRC / 0x18 TIMEOUT
+ *    (storage), 0x1C FINAL, the bytes written.  The stream is taken to
+ *    be a whole .lzma file (13-byte header), the format the driver's
+ *    caller passes; the driver allocates 16 MiB for the output, the most
+ *    written here.  The C unit's soft reset (0x30 bit 16) ends the mode.
+ *    Inferred from the driver alone: no shipped kernel calls it (T40's
+ *    squashfs is XZ).
+ *
  * Sampling is bilinear, the edge pixels repeated; a source position more
  * than a pixel outside the tile takes the 0x04 value (128 for CbCr).
  * Jobs complete at once; status and interrupt follow DONE_NS later.
@@ -64,6 +78,7 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "qemu/log.h"
+#include "qemu/units.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
@@ -71,6 +86,7 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "hw/arm/nvt-lzma.h"
 #include "qom/object.h"
 
 #define TYPE_INGENIC_BSCALER "ingenic-bscaler"
@@ -119,6 +135,18 @@ enum { BS_T, BS_C, BS_UNITS };          /* sysbus IRQ 0 / 1 */
 #define STAT_DONE       (1u << 8)
 #define STEP_DONE       (1u << 2)
 
+#define LZ_CTRL         0x00
+#define LZ_BS_BASE      0x04
+#define LZ_BS_SIZE      0x08
+#define LZ_DST_BASE     0x0C
+#define LZ_FINAL        0x1C
+#define LZ_MODE         (1u << 31)
+#define LZ_START        (1u << 0)
+#define LZ_INIT         (1u << 1)
+#define LZ_RESET        (1u << 2)
+#define LZ_MAX_OUT      (16 * MiB)
+#define LZ_MAX_IN       (8 * MiB)
+
 #define DONE_NS         (50 * SCALE_US)
 #define MAX_DIM         4096
 #define MAX_CHAIN       (1 << 20)
@@ -135,6 +163,8 @@ struct IngenicBscalerState {
     uint32_t t_row;                 /* T: the next line to convert */
     uint32_t t_frame_done;          /* T: the last step finished the frame */
     uint32_t pending[BS_UNITS];     /* the timer is to set them */
+    uint32_t lzma;                  /* LZMA mode: 0x00..0x1C decompress */
+    uint32_t lz_regs[8];
 };
 
 #define REG(s, off)     ((s)->regs[(off) >> 2])
@@ -354,7 +384,9 @@ static void bs_c_write(IngenicBscalerState *s, hwaddr off, uint32_t val)
         REG(s, off) = val;
         break;
     case C_STAT:
-        REG(s, off) = val & ~CTRL_START;
+        /* bits 1 and 2 (RAM init, reset) clear themselves, as the LZMA
+         * driver's first reset, before it selects the mode, expects */
+        REG(s, off) = val & ~(CTRL_START | LZ_INIT | LZ_RESET);
         if (val & CTRL_START) {
             bs_run_c_job(s);
             s->nplanes = 0;
@@ -473,10 +505,50 @@ static void bs_kick(IngenicBscalerState *s, int u)
     timer_mod(s->timer[u], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + DONE_NS);
 }
 
+/* LZMA mode: decompress BS_SIZE bytes at BS_BASE into DST_BASE */
+static void bs_lzma_run(IngenicBscalerState *s)
+{
+    uint32_t inlen = MIN(s->lz_regs[LZ_BS_SIZE >> 2], LZ_MAX_IN);
+    g_autofree uint8_t *in = g_malloc(inlen);
+    g_autofree uint8_t *out = g_malloc(LZ_MAX_OUT);
+    ssize_t n;
+
+    dma_memory_read(&address_space_memory, s->lz_regs[LZ_BS_BASE >> 2], in,
+                    inlen, MEMTXATTRS_UNSPECIFIED);
+    n = nvt_lzma_decode(in, inlen, out, LZ_MAX_OUT);
+    if (n < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-bscaler: LZMA stream at "
+                      "0x%08x is not a .lzma file, or too large\n",
+                      s->lz_regs[LZ_BS_BASE >> 2]);
+        n = 0;
+    }
+    dma_memory_write(&address_space_memory, s->lz_regs[LZ_DST_BASE >> 2], out,
+                     n, MEMTXATTRS_UNSPECIFIED);
+    s->lz_regs[LZ_FINAL >> 2] = n;
+}
+
+static void bs_lzma_write(IngenicBscalerState *s, hwaddr off, uint32_t val)
+{
+    if (off != LZ_CTRL) {
+        if (off != LZ_FINAL) {
+            s->lz_regs[off >> 2] = val;
+        }
+        return;
+    }
+    /* reset, RAM init and the run itself complete at once */
+    s->lz_regs[0] = LZ_MODE | (val & ~(LZ_START | LZ_INIT | LZ_RESET));
+    if (val & LZ_START) {
+        bs_lzma_run(s);
+    }
+}
+
 static uint64_t ingenic_bscaler_read(void *opaque, hwaddr off, unsigned size)
 {
     IngenicBscalerState *s = opaque;
 
+    if (s->lzma && off <= LZ_FINAL) {
+        return s->lz_regs[off >> 2];
+    }
     return off < BS_REGS ? REG(s, off) : 0;
 }
 
@@ -488,8 +560,18 @@ static void ingenic_bscaler_write(void *opaque, hwaddr off, uint64_t val,
     if (off >= BS_REGS) {
         return;
     }
+    if (off == C_STAT && (val & LZ_MODE)) {
+        s->lzma = 1;
+    }
+    if (s->lzma && off <= LZ_FINAL) {
+        bs_lzma_write(s, off, val);
+        return;
+    }
     switch (off) {
     case C_CTRL:
+        if (val & CTRL_RESET) {
+            s->lzma = 0;
+        }
         REG(s, off) = val & ~(CTRL_START | CTRL_RESET);
         if (val & CTRL_RESET) {
             s->nplanes = 0;
@@ -556,6 +638,8 @@ static void ingenic_bscaler_reset(DeviceState *dev)
     s->nplanes = 0;
     s->t_row = 0;
     s->t_frame_done = 0;
+    s->lzma = 0;
+    memset(s->lz_regs, 0, sizeof(s->lz_regs));
     bs_update(s);
 }
 
@@ -574,8 +658,8 @@ static void ingenic_bscaler_init(Object *obj)
 
 static const VMStateDescription vmstate_ingenic_bscaler = {
     .name = TYPE_INGENIC_BSCALER,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IngenicBscalerState, BS_REGS / 4),
         VMSTATE_UINT32_ARRAY(planes, IngenicBscalerState, 2),
@@ -584,6 +668,8 @@ static const VMStateDescription vmstate_ingenic_bscaler = {
         VMSTATE_UINT32(t_frame_done, IngenicBscalerState),
         VMSTATE_UINT32_ARRAY(pending, IngenicBscalerState, BS_UNITS),
         VMSTATE_TIMER_PTR_ARRAY(timer, IngenicBscalerState, BS_UNITS),
+        VMSTATE_UINT32(lzma, IngenicBscalerState),
+        VMSTATE_UINT32_ARRAY(lz_regs, IngenicBscalerState, 8),
         VMSTATE_END_OF_LIST()
     }
 };

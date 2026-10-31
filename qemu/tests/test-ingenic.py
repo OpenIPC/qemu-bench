@@ -829,6 +829,40 @@ def test_nndma(qt):
           qt.readl(ORAMP + 0xFFFFC))[1], 0x5a5a)
 
 
+def test_bscaler_lzma(qt):
+    print('ingenic-bscaler LZMA mode (T40)')
+    import lzma
+    plain = (b'OpenIPC on Ingenic T40, decompressed by the BSCALER window. '
+             * 300) + bytes(range(256))
+    packed = lzma.compress(plain, format=lzma.FORMAT_ALONE)
+    src, dst = SCRATCH + 0x100000, SCRATCH + 0x200000
+    qt.write(src, packed)
+    qt.write(dst, b'\xff' * 64)
+    # jz_lzma_decompress: reset, select LZMA mode, reset, init RAM
+    qt.writel(BSCALER + 0x00, 1 << 2)
+    check('reset clears itself before the mode is set',
+          qt.readl(BSCALER + 0x00) & 4, 0)
+    qt.writel(BSCALER + 0x00, qt.readl(BSCALER + 0x00) | (1 << 31))
+    check('bit 31 selects LZMA mode', qt.readl(BSCALER + 0x00) >> 31, 1)
+    qt.writel(BSCALER + 0x00, 1 << 2)
+    qt.writel(BSCALER + 0x00, 1 << 1)
+    check('reset and RAM init clear themselves, the mode stays',
+          qt.readl(BSCALER + 0x00), 1 << 31)
+    qt.writel(BSCALER + 0x04, src)
+    qt.writel(BSCALER + 0x08, len(packed))
+    qt.writel(BSCALER + 0x0C, dst)
+    qt.writel(BSCALER + 0x00, (1 << 0) | (1 << 3))
+    check('the run ends: bit 0 clear', qt.readl(BSCALER + 0x00) & 1, 0)
+    check('FINAL is the unpacked length', qt.readl(BSCALER + 0x1C),
+          len(plain))
+    check('the output is the original',
+          hashlib.md5(qt.read(dst, len(plain))).hexdigest(),
+          hashlib.md5(plain).hexdigest())
+    # the C unit's soft reset gives the window back to the scaler
+    qt.writel(BSCALER + 0x30, 1 << 16)
+    check('soft reset leaves LZMA mode', qt.readl(BSCALER + 0x00) >> 31, 0)
+
+
 def test_bscaler(qt, intc=CORE_INTC):
     print('ingenic-bscaler (T40)')
     src, dst, chain = SCRATCH, SCRATCH + 0x10000, SCRATCH + 0x20000
@@ -3564,11 +3598,16 @@ def main():
         test_i2d(qt)
         test_monitor(qt)
         test_bscaler(qt)
+        test_bscaler_lzma(qt)
         test_nndma(qt)
         qt.close()
         qt = QTest(a.qemu, 't20')
         test_aes(qt)
         test_tcu_pwm(qt)
+        print('T20 NCU (jz_nvpu)')
+        qt.writel(0x13090000 + 0x10, 0x12345678)
+        check('the NCU holds what jz_nvpu writes',
+              qt.readl(0x13090000 + 0x10), 0x12345678)
         qt.close()
 
         qt = QTest(a.qemu, 't31', ['-rtc', 'clock=vm'])

@@ -1396,6 +1396,20 @@ static void ingenic_init(MachineState *ms)
         }
     }
 
+    /*
+     * T10's and T20's NCU (noise reduction before the VPU, 0x13090000):
+     * jz_nvpu writes its registers and starts it with the VPU, polling
+     * nothing (jz_ncu.h) -- storage, the picture passing un-denoised, as
+     * on T30
+     */
+    if (info->soc == INGENIC_T10 || info->soc == INGENIC_T20) {
+        MemoryRegion *ncu = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(ncu, NULL, "ingenic.ncu", 0x10000,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, 0x13090000, ncu);
+    }
+
     /* the IPU: libimp's OSD blender, the same block on every part */
     sysbus_create_simple("ingenic-ipu", IPU_BASE, ingenic_irq(ims, IRQ_IPU));
 

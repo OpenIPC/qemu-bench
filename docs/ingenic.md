@@ -1073,6 +1073,21 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   per-column byte table at 0x28 / 0x2C, 0x04 bits 1, 2 and 16..18, T's
   0xA0 / 0xA8 / 0xF0 / 0xF4, and the chain-in-ORAM bit (0x30 bit 1);
   alpha is written 0.
+  - LZMA mode: the 4.4 kernel's `drivers/lzma/lzma.c` (`CONFIG_LZMADEVICE`,
+    built into T40's kernels; `jz_lzma_decompress`, which squashfs's
+    `hardware_lzma.c` would call) drives a decompressor through this same
+    window. A write of 0x00 with bit 31 selects it (sticky); then 0x00
+    is CTRL -- bit 2 reset and bit 1 RAM init clear themselves, bit 0
+    starts and reads 1 until the run ends, bit 3 masks the interrupt --
+    0x04 / 0x08 the stream's address and size, 0x0C the destination, 0x1C
+    FINAL the bytes written (0x10 / 0x14 CRCs and 0x18 a timeout:
+    storage). The stream is taken to be a whole `.lzma` file (13-byte
+    header), decoded by the repo's LZMA decoder, at most 16 MiB out (the
+    driver's buffer). The C unit's soft reset (0x30 bit 16) gives the
+    window back to the scaler. Inferred from the driver alone: no shipped
+    kernel calls it (T40's squashfs is XZ). T41's own LZMA nodes
+    (`ingenic,t41-lzma`, 0x13C00000 / 0x13D00000) are disabled and nothing
+    addresses them.
 - `ingenic-nndma` (T40, T41): the NNA's DMA between DDR and its ORAM
   (0x12600000). Ingenic's libvenus (magik-toolkit, `dma_func.cc`:
   `w_d2o_orasetrun`, `aie_run_nndma_rdchn` / `wrchn`, mapped by
@@ -2057,9 +2072,13 @@ T40/T41 SDK kernels, drivers and libimp):
   ships, so the block has no driver and no register offsets. The ISP's
   own HLDC (above) is modelled.
 
-- T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
-  the VPU when libimp asks for it; the VPU raises the completion, so
-  storage passes the picture through un-denoised.
+- The NCU of T10, T20 and T30 (0x13090000): the denoise front end
+  `jz_nvpu` programs with the VPU when libimp asks for it, polling
+  nothing (`jz_ncu.h`); the VPU raises the completion, so storage passes
+  the picture through un-denoised. (T31's base.h keeps a MONITOR_IOBASE
+  at 0x130F0000 marked "T31 delete"; the T31 SDK's `sample_bus_monitor`
+  is T40's driver, `t40-irq.h` and all, so no T31 bus monitor is
+  mapped.)
 - The NNA's compute of T40/T41: libvenus runs a network on the CPU, with
   MXU3 vector instructions and Ingenic's own coprocessor-2 instructions
   that feed the multiply-accumulate array from ORAM. The NNA DMA, the ORAM
