@@ -37,6 +37,9 @@
  *   JPEG: the entropy-coded scan, byte-stuffed, at JPGC_BSA; libimp writes
  *     SOI..SOS and EOI around it.  The quantisers are QMEM's (luma then
  *     chroma, zigzag, as reciprocals), the source the EFE's registers.
+ *   JPEG decoding (T23, T30: libimp's IMP_Decoder): a chain that starts
+ *     the JPGC alone (JPGC_TRIG = 7) decodes a baseline scan; see
+ *     vpu_jpeg_decode() for the contract.
  * Coding: I slices are I_16x16 DC macroblocks; H.264 P slices send each
  * macroblock whose source changed since the last picture of that size as
  * I_PCM and skip the rest (hw/misc/hantro-h264.c), so the stream decodes
@@ -68,6 +71,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
@@ -146,8 +150,21 @@ enum {
 #define R_JPGC_TRIG         0xE0000
 #define R_JPGC_STAT         0xE0008
 #define  JPGC_STAT_ENDF     (1u << 31)
+#define R_JPGC_GLBI         0xE0004
+#define  GLBI_RSTER         (1u << 2)
+#define  GLBI_NCOMP(v)      (extract32(v, 4, 2) + 1)
 #define R_JPGC_BSA          0xE000C
+#define R_JPGC_P0A          0xE0010         /* decoded luma, 16x16 tiles */
+#define R_JPGC_P1A          0xE0014         /* decoded chroma, 16x8 tiles */
+#define R_JPGC_NMCU         0xE0028
+#define R_JPGC_NRSM         0xE002C
+#define R_JPGC_P0C          0xE0030
+#define R_JPGC_MCUS         0xE0064         /* MCUs decoded */
+#define R_JPGC_HUFB         0xE1200
+#define R_JPGC_HUFM         0xE1300
 #define R_JPGC_QMEM         0xE1400
+#define R_JPGC_HUFS         0xE1800
+#define JPGC_HUFS_WORDS     336
 
 /* RADIX */
 #define R_RX_GLB_CTRL       0x00000
@@ -535,6 +552,296 @@ static void vpu_jpeg(IngenicVpuState *s)
     }
 }
 
+/*
+ * JPEG decoding: the JPGC alone, started by a chain that ends with
+ * JPGC_TRIG = 7 (libimp's T20_JPEGD_SliceInit, T23 and T30; libimp parses
+ * the headers itself, ijpegd_decode_header).  What the chain programs:
+ *   BSA      the scan as it is in the file: byte-stuffed (FF 00), with
+ *            its restart markers (FF Dn) and the EOI behind it
+ *   GLBI     [5:4] components - 1, [2] restart markers every NRSM + 1 MCUs
+ *   NMCU     MCUs - 1; libimp counts 16x16 macroblocks (4:2:0's MCU)
+ *   P0C..P3C per component: [7:4] blocks per MCU - 1, [3:2] quantiser
+ *            table, [1] AC table, [0] DC table
+ *   QMEM     four tables of 64 words, the quantisers in zigzag order
+ *   HUFM     per Huffman table (16 words: AC0, DC0, AC1, DC1) the
+ *            canonical first code of each length L, its low min(L, 8)
+ *            bits: lengths 1..8 packed from the top of a 36-bit field
+ *            (words 2-3), 9..12 and 13..16 a byte each (words 1 and 0)
+ *   HUFB     per table and length, 9 bits: where the length's symbols
+ *            start in HUFS minus its first code (modulo 512)
+ *   HUFS     the symbols, one a word: AC0 from 0, AC1 from 174, both DC
+ *            tables in the nibbles of the words from 162 (table 0 low)
+ *   P0A/P1A  the picture, tiled ("T420", libimp's c_copy_frame_t420_to_
+ *            nv12): macroblock k's 16x16 luma at P0A + 256 k, its chroma
+ *            at P1A + 128 k, eight rows of 8 Cb then 8 Cr bytes
+ * The JPGC does not know the picture's width, so its MCUs go out one after
+ * the other in macroblock order -- exact for 4:2:0, libimp's own encoder's
+ * format.  Other layouts (an MCU of 1 or 2 luma blocks) put an MCU's blocks
+ * in its macroblock's quadrants in order: that is an inference.
+ * Completion: JPGC_STAT ENDF and SCH_STAT bit 4, as for encoding, and
+ * MCUS the number of MCUs decoded -- the kernel's helix.c takes it as the
+ * task's output length and fails a decode that leaves it 0.
+ */
+typedef struct VpuHuff {
+    int mins[17], cnt[17], base[17];
+    bool nibble, high;
+} VpuHuff;
+
+typedef struct VpuBits {
+    const uint8_t *p, *end;
+    uint32_t acc;
+    int n;
+} VpuBits;
+
+static int vpu_bit(VpuBits *b)
+{
+    if (!b->n) {
+        /* FF 00 is a data byte FF; a marker ends the data (zeros) */
+        if (b->p + 1 < b->end && b->p[0] == 0xFF && b->p[1]) {
+            b->acc = 0;
+        } else {
+            b->acc = b->p < b->end ? *b->p++ : 0;
+            if (b->acc == 0xFF && b->p < b->end) {
+                b->p++;
+            }
+        }
+        b->n = 8;
+    }
+    b->n--;
+    return (b->acc >> b->n) & 1;
+}
+
+static int vpu_bits(VpuBits *b, int n)
+{
+    int v = 0;
+
+    while (n--) {
+        v = (v << 1) | vpu_bit(b);
+    }
+    return v;
+}
+
+/* HUFM/HUFB of table @g back into the canonical code's ranges */
+static void vpu_huff_load(IngenicVpuState *s, int g, VpuHuff *h)
+{
+    uint32_t w[4];
+    uint64_t lo;
+    int a[16], l, m;
+
+    for (l = 0; l < 4; l++) {
+        w[l] = vpu_reg(s, R_JPGC_HUFM + 4 * (4 * g + l));
+    }
+    lo = ((uint64_t)(w[3] & 0xF) << 32) | w[2];
+    for (l = 0, m = 36; l < 8; l++) {
+        m -= l + 1;
+        a[l] = (lo >> m) & ((1u << (l + 1)) - 1);
+    }
+    for (l = 0; l < 4; l++) {
+        a[8 + l] = (w[1] >> (24 - 8 * l)) & 0xFF;
+        a[12 + l] = (w[0] >> (24 - 8 * l)) & 0xFF;
+    }
+    /* first codes: exact up to 8 bits, then continued from the counts */
+    m = 0;
+    for (l = 0; l < 16; l++) {
+        int c = 0, wd;
+
+        h->mins[l + 1] = l < 8 ? a[l] : m;
+        h->base[l + 1] = vpu_reg(s, R_JPGC_HUFB + 4 * (16 * g + l)) & 0x1FF;
+        if (l == 15) {
+            h->cnt[16] = 0x10000 - h->mins[16];     /* the rest */
+            break;
+        }
+        wd = MIN(l + 2, 8);
+        while ((((h->mins[l + 1] + c) << 1) & ((1u << wd) - 1)) !=
+               (uint32_t)a[l + 1] && c < 256) {
+            c++;
+        }
+        h->cnt[l + 1] = c;
+        m = (h->mins[l + 1] + c) << 1;
+    }
+    h->nibble = g & 1;              /* DC tables share the nibbles */
+    h->high = g == 3;
+}
+
+static int vpu_huff_sym(IngenicVpuState *s, const VpuHuff *h, VpuBits *b)
+{
+    int code = 0, l;
+
+    for (l = 1; l <= 16; l++) {
+        code = (code << 1) | vpu_bit(b);
+        if (code - h->mins[l] >= 0 && code - h->mins[l] < h->cnt[l]) {
+            uint32_t v = vpu_reg(s, R_JPGC_HUFS +
+                                 4 * (((code + h->base[l]) & 0x1FF) %
+                                      JPGC_HUFS_WORDS));
+
+            if (h->nibble) {
+                v = h->high ? v >> 4 : v;
+            }
+            return v & (h->nibble ? 0xF : 0xFF);
+        }
+    }
+    return -1;
+}
+
+static int vpu_extend(int v, int n)
+{
+    return n && v < (1 << (n - 1)) ? v - (1 << n) + 1 : v;
+}
+
+/* the inverse DCT of a dequantised block, row-major, to 8-bit samples */
+static void vpu_idct(const int *c, uint8_t *out, int stride)
+{
+    static double cs[8][8];
+    static bool init;
+    double t[64];
+    int x, y, u;
+
+    if (!init) {
+        for (x = 0; x < 8; x++) {
+            for (u = 0; u < 8; u++) {
+                cs[x][u] = (u ? 1.0 : M_SQRT1_2) *
+                           cos((2 * x + 1) * u * M_PI / 16) / 2;
+            }
+        }
+        init = true;
+    }
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) {
+            double a = 0;
+
+            for (u = 0; u < 8; u++) {
+                a += cs[x][u] * c[y * 8 + u];
+            }
+            t[y * 8 + x] = a;
+        }
+    }
+    for (x = 0; x < 8; x++) {
+        for (y = 0; y < 8; y++) {
+            double a = 0;
+            int v;
+
+            for (u = 0; u < 8; u++) {
+                a += cs[y][u] * t[u * 8 + x];
+            }
+            v = (int)lrint(a) + 128;
+            out[y * stride + x] = MIN(MAX(v, 0), 255);
+        }
+    }
+}
+
+static void vpu_jpeg_decode(IngenicVpuState *s)
+{
+    const uint32_t glbi = vpu_reg(s, R_JPGC_GLBI);
+    const int ncomp = GLBI_NCOMP(glbi);
+    const int nmcu = vpu_reg(s, R_JPGC_NMCU) + 1;
+    const int rst = (glbi & GLBI_RSTER) ? vpu_reg(s, R_JPGC_NRSM) + 1 : 0;
+    const uint32_t bsa = vpu_reg(s, R_JPGC_BSA);
+    const uint32_t p0a = vpu_reg(s, R_JPGC_P0A), p1a = vpu_reg(s, R_JPGC_P1A);
+    const size_t cap = 4 * MiB;
+    g_autofree uint8_t *bs = g_malloc(cap);
+    uint8_t mby[256], mbc[128], blk[64];
+    VpuHuff huff[4];
+    VpuBits b = { .p = bs, .end = bs + cap };
+    int pred[4] = { 0 }, cfg[4], i, k, c, n;
+
+    if (nmcu > (VPU_MAX_DIM / 16) * (VPU_MAX_DIM / 16)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-vpu: JPEG decode of %d "
+                      "MCUs\n", nmcu);
+        return;
+    }
+    vpu_read_mem(s, VPU_U_JPGC, bsa, bs, cap);
+    for (i = 0; i < 4; i++) {
+        vpu_huff_load(s, i, &huff[i]);
+        cfg[i] = vpu_reg(s, R_JPGC_P0C + 4 * i);
+    }
+    if (ncomp == 3 && (extract32(cfg[0], 4, 4) != 3 ||
+                       extract32(cfg[1], 4, 4) || extract32(cfg[2], 4, 4))) {
+        qemu_log_mask(LOG_UNIMP, "ingenic-vpu: JPEG decode of a layout "
+                      "other than 4:2:0 (%02x %02x %02x)\n", cfg[0], cfg[1],
+                      cfg[2]);
+    }
+    for (k = 0; k < nmcu; k++) {
+        if (rst && k && !(k % rst)) {
+            /* byte-align and step over FF Dn; the predictors start over */
+            b.n = 0;
+            if (b.p + 1 < b.end && b.p[0] == 0xFF &&
+                (b.p[1] & 0xF8) == 0xD0) {
+                b.p += 2;
+            }
+            memset(pred, 0, sizeof(pred));
+        }
+        memset(mby, 0, sizeof(mby));
+        memset(mbc, 0x80, sizeof(mbc));
+        for (c = 0; c < ncomp && c < 4; c++) {
+            const int nblk = extract32(cfg[c], 4, 4) + 1;
+            const VpuHuff *dc = &huff[extract32(cfg[c], 0, 1) ? 3 : 1];
+            const VpuHuff *ac = &huff[extract32(cfg[c], 1, 1) ? 2 : 0];
+            const int qt = extract32(cfg[c], 2, 2);
+
+            for (n = 0; n < nblk; n++) {
+                int coef[64] = { 0 }, t, z;
+
+                t = vpu_huff_sym(s, dc, &b);
+                if (t < 0) {
+                    goto bad;
+                }
+                pred[c] += vpu_extend(vpu_bits(&b, t), t);
+                coef[0] = pred[c] * (int)vpu_reg(s, R_JPGC_QMEM + 4 * 64 * qt);
+                for (z = 1; z < 64; z++) {
+                    int rs = vpu_huff_sym(s, ac, &b), r, sz;
+
+                    if (rs < 0) {
+                        goto bad;
+                    }
+                    r = rs >> 4;
+                    sz = rs & 15;
+                    if (!sz) {
+                        if (r != 15) {
+                            break;              /* end of block */
+                        }
+                        z += 15;
+                        continue;
+                    }
+                    z += r;
+                    if (z > 63) {
+                        break;
+                    }
+                    coef[vpu_zigzag[z]] = vpu_extend(vpu_bits(&b, sz), sz) *
+                        (int)vpu_reg(s, R_JPGC_QMEM + 4 * (64 * qt + z));
+                }
+                vpu_idct(coef, blk, 8);
+                if (c == 0) {
+                    /* the n-th luma block: quadrant n of the macroblock */
+                    uint8_t *q = mby + (n & 2 ? 128 : 0) + (n & 1 ? 8 : 0);
+                    int r;
+
+                    for (r = 0; r < 8 && n < 4; r++) {
+                        memcpy(q + 16 * r, blk + 8 * r, 8);
+                    }
+                } else if (c < 3 && n == 0) {
+                    int r;
+
+                    for (r = 0; r < 8; r++) {
+                        memcpy(mbc + 16 * r + (c == 2 ? 8 : 0), blk + 8 * r, 8);
+                    }
+                }
+            }
+        }
+        vpu_write_mem(s, VPU_U_JPGC, p0a + 256 * k, mby, sizeof(mby));
+        vpu_write_mem(s, VPU_U_JPGC, p1a + 128 * k, mbc, sizeof(mbc));
+    }
+    vpu_set(s, R_JPGC_MCUS, k);
+    if (s->debug) {
+        qemu_log("ingenic-vpu: JPEG decode %d MCUs, %d components, restart "
+                 "%d -> %08x/%08x\n", nmcu, ncomp, rst, p0a, p1a);
+    }
+    return;
+bad:
+    qemu_log_mask(LOG_GUEST_ERROR, "ingenic-vpu: JPEG decode: bad Huffman "
+                  "code in MCU %d of %d\n", k, nmcu);
+    vpu_set(s, R_JPGC_MCUS, k);
+}
+
 /* ---- H.265 (RADIX) ------------------------------------------------------- */
 
 /* hevc-enc escapes its slice data; RADIX leaves that to libimp */
@@ -655,9 +962,8 @@ static void vpu_done(void *opaque)
             vpu_jpeg(s);
             st |= STAT_JPGEND;
         } else if (s->jpgc_run && !s->efe_run) {
-            /* libimp always feeds the JPGC through the EFE */
-            qemu_log_mask(LOG_UNIMP, "ingenic-vpu: JPGC fed by its own "
-                          "DMA\n");
+            /* the JPGC on its own: a decode */
+            vpu_jpeg_decode(s);
             vpu_set(s, R_JPGC_STAT, JPGC_STAT_ENDF);
             st |= STAT_JPGEND;
         } else if (s->efe_run) {
@@ -689,6 +995,7 @@ static void vpu_start(IngenicVpuState *s, uint32_t addr)
         vpu_set(s, R_VDMA_TASKST, TASKST_BUSY);
         vpu_set(s, R_SDE_BSLEN, 0);
         vpu_set(s, R_JPGC_STAT, 0);
+        vpu_set(s, R_JPGC_MCUS, 0);
     }
     vpu_update_irq(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VPU_JOB_NS);
@@ -772,6 +1079,7 @@ static void vpu_srbc_reset(void *opaque, int n, int level)
         vpu_set(s, R_SDE_STAT, 0);
         vpu_set(s, R_DBLK_GSTA, 0);
         vpu_set(s, R_JPGC_STAT, 0);
+        vpu_set(s, R_JPGC_MCUS, 0);
     }
     vpu_update_irq(s);
 }
