@@ -133,6 +133,21 @@ size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
 size_t h264_pic_slice_cavlc(H264Pic *pic, bool p_slice, int r0, int rows,
                             int qp, int bit_offset, uint8_t *out, size_t cap,
                             H264PStats *st);
+/*
+ * B slices: the L1 reference (NV12 at stride mbw * 16, copied; same_as_l0
+ * when it is the L0 picture, which the deblocking compares by), then each
+ * slice B_L0 / B_L1 / B_Bi_16x16 or intra -- never B_Skip / B_Direct --
+ * one reference in each list (num_ref_idx_active 1 / 1, no weighted
+ * prediction).  The picture is filtered by h264_pic_finish as the others.
+ */
+void h264_pic_set_ref_l1(H264Pic *pic, const uint8_t *ry, const uint8_t *ruv,
+                         bool same_as_l0);
+size_t h264_pic_slice_b_cabac(H264Pic *pic, int r0, int rows, int qp,
+                              int cabac_init_idc, uint8_t *out, size_t cap,
+                              H264PStats *st);
+size_t h264_pic_slice_b_cavlc(H264Pic *pic, int r0, int rows, int qp,
+                              int bit_offset, uint8_t *out, size_t cap,
+                              H264PStats *st);
 void h264_pic_finish(H264Pic *pic, const H264Deblock *db, uint8_t *ry,
                      uint8_t *ruv);
 void h264_pic_free(H264Pic *pic);

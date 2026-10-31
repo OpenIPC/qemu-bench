@@ -88,8 +88,10 @@ enum { PMB_SKIP, PMB_INTER, PMB_INTRA };
 typedef struct PMb {
     uint8_t type;
     uint8_t qp;                 /* QP_Y */
-    int16_t mv[2];              /* quarter-pel (skip: the skip vector) */
+    uint8_t pred;               /* the lists it predicts from: L0 1, L1 2 */
+    int16_t mv[2];              /* quarter-pel, L0 (skip: the skip vector) */
     int16_t mvd[2];
+    int16_t mv1[2], mvd1[2];    /* L1, B slices */
     uint8_t cbp_luma, cbp_chroma;
     uint16_t nz;                /* luma 4x4 blocks with coefficients */
     uint8_t cdc;                /* chroma DC coded_block_flag: Cb 1, Cr 2 */
@@ -104,6 +106,8 @@ typedef struct PMb {
 typedef struct PPic {
     Frame f;                    /* reconstruction (y, cb, cr) and source */
     const uint8_t *ry, *rcb, *rcr;  /* reference, deblocked */
+    const uint8_t *ry1, *rcb1, *rcr1;   /* B slices: the L1 reference */
+    bool bslice;
     int ry0, rh;                /* the reference rows of f's row 0, and the
                                  * reference's height (a slice of a picture
                                  * is a window: f and mb from its first row) */
@@ -318,16 +322,21 @@ static PMb *pmb_at(PPic *p, int mx, int my)
     return &p->mb[my * p->f.mbw + mx];
 }
 
-/* refIdx (0 or -1) and vector of a neighbouring 16x16 partition */
-static int nb_ref(const PMb *n, int16_t mv[2])
+/* refIdxLX (0 or -1) and vector of a neighbouring 16x16 partition */
+static int nb_ref_l(const PMb *n, int list, int16_t mv[2])
 {
-    if (!n || n->type == PMB_INTRA) {
+    if (!n || n->type == PMB_INTRA || !(n->pred & (1 << list))) {
         mv[0] = mv[1] = 0;
         return -1;
     }
-    mv[0] = n->mv[0];
-    mv[1] = n->mv[1];
+    mv[0] = list ? n->mv1[0] : n->mv[0];
+    mv[1] = list ? n->mv1[1] : n->mv[1];
     return 0;
+}
+
+static int nb_ref(const PMb *n, int16_t mv[2])
+{
+    return nb_ref_l(n, 0, mv);
 }
 
 static int median3(int a, int b, int c)
@@ -335,8 +344,8 @@ static int median3(int a, int b, int c)
     return MAX(MIN(a, b), MIN(MAX(a, b), c));
 }
 
-/* 8.4.1.3: the predicted vector of a 16x16 partition with refIdx 0 */
-static void mv_pred(PPic *p, int mx, int my, int16_t mvp[2])
+/* 8.4.1.3: the predicted vector of a 16x16 partition with refIdxLX 0 */
+static void mv_pred_l(PPic *p, int mx, int my, int list, int16_t mvp[2])
 {
     PMb *a = pmb_at(p, mx - 1, my), *b = pmb_at(p, mx, my - 1);
     PMb *c = pmb_at(p, mx + 1, my - 1);
@@ -346,9 +355,9 @@ static void mv_pred(PPic *p, int mx, int my, int16_t mvp[2])
     if (!c) {
         c = pmb_at(p, mx - 1, my - 1);          /* D for C */
     }
-    ra = nb_ref(a, va);
-    rb = nb_ref(b, vb);
-    rc = nb_ref(c, vc);
+    ra = nb_ref_l(a, list, va);
+    rb = nb_ref_l(b, list, vb);
+    rc = nb_ref_l(c, list, vc);
     if (!b && !c && a) {
         vb[0] = vc[0] = va[0];
         vb[1] = vc[1] = va[1];
@@ -363,6 +372,11 @@ static void mv_pred(PPic *p, int mx, int my, int16_t mvp[2])
     }
     mvp[0] = median3(va[0], vb[0], vc[0]);
     mvp[1] = median3(va[1], vb[1], vc[1]);
+}
+
+static void mv_pred(PPic *p, int mx, int my, int16_t mvp[2])
+{
+    mv_pred_l(p, mx, my, 0, mvp);
 }
 
 /* 8.4.1.1: P_Skip's vector */
@@ -833,7 +847,7 @@ static int count_nz(const int *c, int n)
 static void put_skip_flag(PPic *p, Cabac *c, int inc, bool skip)
 {
     if (!p->cw) {
-        cabac_decision(c, 11 + inc, skip);
+        cabac_decision(c, (p->bslice ? 24 : 11) + inc, skip);
     } else if (skip) {
         p->skip_run++;
     } else {
@@ -978,6 +992,135 @@ static void put_inter(PPic *p, Cabac *c, int mx, int my, PMb *me,
     put_chroma(p, c, mx, my, me, r, false);
 }
 
+/*
+ * B_L0_16x16, B_L1_16x16 or B_Bi_16x16 (me->pred 1, 2, 3; one reference
+ * in each list, so no ref_idx): mb_type, mvd_l0, mvd_l1, then the
+ * residual as a P macroblock's.  CABAC mb_type bins (Table 9-37): 1 0 0,
+ * 1 0 1, 1 1 0 0 0 0 with ctxIdxOffset 27 -- bin 0 by the neighbours'
+ * availability (none is B_Skip / B_Direct here), bin 1 inc 3, bin 2 inc
+ * 4 after a 1 else 5, the rest 5.
+ */
+static void put_inter_b(PPic *p, Cabac *c, int mx, int my, PMb *me,
+                        const PRes *r)
+{
+    const PMb *a = pmb_at(p, mx - 1, my), *b = pmb_at(p, mx, my - 1);
+    int comp, b8, k, i, list;
+
+    if (p->cw) {
+        BitWriter *w = p->cw;
+
+        bw_ue(w, me->pred);                     /* 1 L0, 2 L1, 3 Bi */
+        for (list = 0; list < 2; list++) {
+            if (me->pred & (1 << list)) {
+                bw_se(w, list ? me->mvd1[0] : me->mvd[0]);
+                bw_se(w, list ? me->mvd1[1] : me->mvd[1]);
+            }
+        }
+        bw_ue(w, cbp_inter_code[r->cbp_luma | r->cbp_chroma << 4]);
+        if (r->cbp_luma && p->t8x8) {
+            bw_bits(w, 0, 1);                   /* transform_size_8x8 */
+        }
+        if (r->cbp_luma || r->cbp_chroma) {
+            const int delta = p->qp_target - p->qp_cur;
+
+            bw_se(w, delta);
+            p->qp_cur = p->qp_target;
+            me->qp_delta_nz = delta != 0;
+        }
+        me->qp = p->qp_cur;
+        me->nz = 0;
+        memset(me->tc, 0, sizeof(me->tc));
+        for (b8 = 0; b8 < 4; b8++) {
+            if (!((r->cbp_luma >> b8) & 1)) {
+                continue;
+            }
+            for (k = 0; k < 4; k++) {
+                const int bx = (b8 & 1) * 2 + (k & 1);
+                const int by = (b8 >> 1) * 2 + (k >> 1);
+                const int blk = by * 4 + bx;
+                int scan[16];
+
+                for (i = 0; i < 16; i++) {
+                    scan[i] = r->luma[blk][zigzag4x4[i]];
+                }
+                cavlc_residual_nc(w, scan, 16, nc_luma(p, mx, my, me, bx, by));
+                me->tc[blk] = count_nz(scan, 16);
+                if (me->tc[blk]) {
+                    me->nz |= 1 << blk;
+                }
+            }
+        }
+        put_chroma_cavlc(p, mx, my, me, r->cdc, r->cac, r->cbp_chroma);
+        return;
+    }
+    cabac_decision(c, 27 + (a != NULL) + (b != NULL), 1);
+    if (me->pred == 3) {
+        cabac_decision(c, 27 + 3, 1);
+        cabac_decision(c, 27 + 4, 0);           /* 1 1 0 0 0 0 */
+        for (i = 0; i < 3; i++) {
+            cabac_decision(c, 27 + 5, 0);
+        }
+    } else {
+        cabac_decision(c, 27 + 3, 0);
+        cabac_decision(c, 27 + 5, me->pred == 2);
+    }
+    for (list = 0; list < 2; list++) {
+        if (!(me->pred & (1 << list))) {
+            continue;
+        }
+        for (comp = 0; comp < 2; comp++) {
+            const int16_t *ma = a && a->type == PMB_INTER &&
+                                (a->pred & (1 << list)) ?
+                                (list ? a->mvd1 : a->mvd) : NULL;
+            const int16_t *mb = b && b->type == PMB_INTER &&
+                                (b->pred & (1 << list)) ?
+                                (list ? b->mvd1 : b->mvd) : NULL;
+            const int sum = (ma ? abs(ma[comp]) : 0) + (mb ? abs(mb[comp]) : 0);
+
+            cabac_mvd(c, comp ? 47 : 40, sum,
+                      list ? me->mvd1[comp] : me->mvd[comp]);
+        }
+    }
+    put_cbp(p, c, mx, my, r->cbp_luma, r->cbp_chroma);
+    if (r->cbp_luma && p->t8x8) {
+        cabac_decision(c, 399, 0);              /* transform_size_8x8 */
+    }
+    if (r->cbp_luma || r->cbp_chroma) {
+        const int delta = p->qp_target - p->qp_cur;
+
+        cabac_qp_delta(p, c, delta);
+        p->qp_cur = p->qp_target;
+        me->qp_delta_nz = delta != 0;
+    }
+    me->qp = p->qp_cur;
+    me->nz = 0;
+    for (b8 = 0; b8 < 4; b8++) {
+        if (!((r->cbp_luma >> b8) & 1)) {
+            continue;
+        }
+        for (k = 0; k < 4; k++) {
+            const int bx = (b8 & 1) * 2 + (k & 1);
+            const int by = (b8 >> 1) * 2 + (k >> 1);
+            const int blk = by * 4 + bx;
+            int scan[16], nz = 0;
+
+            for (i = 0; i < 16; i++) {
+                scan[i] = r->luma[blk][zigzag4x4[i]];
+                nz |= scan[i];
+            }
+            cabac_decision(c, 85 + 8 +
+                           cbf_luma_nb(p, mx, my, me, bx, by, -1, 0) +
+                           2 * cbf_luma_nb(p, mx, my, me, bx, by, 0, -1),
+                           nz != 0);
+            if (nz) {
+                cabac_residual(c, 105 + 29, 166 + 29, 227 + 20, scan, 16);
+                me->nz |= 1 << blk;
+            }
+        }
+    }
+    put_chroma(p, c, mx, my, me, r, false);
+}
+
 /* ---- intra DC macroblocks in a P slice ------------------------------------- */
 
 static int intra_dc_error(PPic *p, int mx, int my)
@@ -1068,7 +1211,8 @@ static void put_intra(PPic *p, Cabac *c, int mx, int my, PMb *me)
         static const int cac0[2][4][16];
         int scan[16];
 
-        bw_ue(p->cw, 8 + 4 * chroma_nz);
+        /* P: 5 + 3 + 4 c; B: I_16x16_2_c_0 is mb_type 23 + 3 + 4 c */
+        bw_ue(p->cw, (p->bslice ? 26 : 8) + 4 * chroma_nz);
         bw_ue(p->cw, 0);                        /* intra_chroma_pred: DC */
         bw_se(p->cw, qp - p->qp_cur);
         me->qp_delta_nz = qp != p->qp_cur;
@@ -1091,16 +1235,30 @@ static void put_intra(PPic *p, Cabac *c, int mx, int my, PMb *me)
         recon_mb(f, mx, my, pred, lev, qp, cpred, clev, qpc);
         return;
     }
-    cabac_decision(c, 14, 1);                   /* prefix: intra */
-    cabac_decision(c, 17, 1);                   /* not I_NxN */
-    cabac_terminate0(c);                        /* not I_PCM */
-    cabac_decision(c, 17 + 1, 0);               /* cbp luma 0 */
-    cabac_decision(c, 17 + 2, chroma_nz);
-    if (chroma_nz) {
-        cabac_decision(c, 17 + 2, 0);           /* cbp chroma 1 */
+    if (p->bslice) {
+        /* B prefix "1 1 1 1 0 1" (Table 9-37): ctxIdxOffset 27 */
+        cabac_decision(c, 27 + (na != NULL) + (nb != NULL), 1);
+        cabac_decision(c, 27 + 3, 1);
+        cabac_decision(c, 27 + 4, 1);           /* bin 2 after a 1: inc 4 */
+        cabac_decision(c, 27 + 5, 1);
+        cabac_decision(c, 27 + 5, 0);
+        cabac_decision(c, 27 + 5, 1);
+    } else {
+        cabac_decision(c, 14, 1);               /* prefix: intra */
     }
-    cabac_decision(c, 17 + 3, 1);               /* pred mode 2: 1 0 */
-    cabac_decision(c, 17 + 3, 0);
+    {
+        const int sb = p->bslice ? 32 : 17;     /* the suffix's offset */
+
+        cabac_decision(c, sb, 1);               /* not I_NxN */
+        cabac_terminate0(c);                    /* not I_PCM */
+        cabac_decision(c, sb + 1, 0);           /* cbp luma 0 */
+        cabac_decision(c, sb + 2, chroma_nz);
+        if (chroma_nz) {
+            cabac_decision(c, sb + 2, 0);       /* cbp chroma 1 */
+        }
+        cabac_decision(c, sb + 3, 1);           /* pred mode 2: 1 0 */
+        cabac_decision(c, sb + 3, 0);
+    }
     cabac_decision(c, 64, 0);                   /* chroma pred: DC */
     {
         const int delta = qp - p->qp_cur;
@@ -1148,24 +1306,55 @@ static void put_intra(PPic *p, Cabac *c, int mx, int my, PMb *me)
 
 /* ---- the deblocking filter (8.7) ------------------------------------------- */
 
+/*
+ * What the filter needs of a macroblock.  pred: the lists it predicts
+ * from (L0 1, L1 2; 0 is taken as L0 -- P slices), ref1: the picture its
+ * L1 reference is (0: the L0 one), so the vectors compare per picture.
+ */
 typedef struct DbMb {
     uint8_t intra, qp;
     int16_t mv[2];
     uint16_t nz;
+    uint8_t pred, ref1;
+    int16_t mv1[2];
 } DbMb;
+
+static bool db_mvdiff(const int16_t *a, const int16_t *b)
+{
+    return abs(a[0] - b[0]) >= 4 || abs(a[1] - b[1]) >= 4;
+}
 
 static int db_bs(const DbMb *pm, int pb, const DbMb *qm, int qb, bool mb_edge)
 {
+    const int ppred = pm->pred ? pm->pred : 1, qpred = qm->pred ? qm->pred : 1;
+
     if (pm->intra || qm->intra) {
         return mb_edge ? 4 : 3;
     }
     if (((pm->nz >> pb) & 1) || ((qm->nz >> qb) & 1)) {
         return 2;
     }
-    if (abs(pm->mv[0] - qm->mv[0]) >= 4 || abs(pm->mv[1] - qm->mv[1]) >= 4) {
-        return 1;
+    if (ppred != 3 && qpred != 3) {
+        /* one vector each (8.7.2.1): the same picture, then the vectors */
+        const int pr = ppred == 2 ? pm->ref1 : 0, qr = qpred == 2 ? qm->ref1 : 0;
+        const int16_t *pv = ppred == 2 ? pm->mv1 : pm->mv;
+        const int16_t *qv = qpred == 2 ? qm->mv1 : qm->mv;
+
+        return pr != qr || db_mvdiff(pv, qv);
     }
-    return 0;
+    if (ppred != qpred) {
+        return 1;                       /* a different number of vectors */
+    }
+    if (pm->ref1 != qm->ref1) {
+        return 1;                       /* different reference pictures */
+    }
+    if (pm->ref1) {
+        /* two different pictures: the vectors for the same picture */
+        return db_mvdiff(pm->mv, qm->mv) || db_mvdiff(pm->mv1, qm->mv1);
+    }
+    /* both vectors from the same picture: either pairing may match */
+    return (db_mvdiff(pm->mv, qm->mv) || db_mvdiff(pm->mv1, qm->mv1)) &&
+           (db_mvdiff(pm->mv, qm->mv1) || db_mvdiff(pm->mv1, qm->mv));
 }
 
 /* one line of samples across an edge: p[-k * step] and q[k * step] */
@@ -1384,6 +1573,116 @@ size_t h264_slice_i16dc_cabac_ref(int qp, int chroma_qp_offset,
     return c.p - out;
 }
 
+/*
+ * The motion search of a 16x16 partition on p's reference: candidates (the
+ * predicted, skip, zero and neighbours' vectors in that list), a coarse
+ * grid if still far off, a diamond, then half and quarter samples.
+ * Returns the vector in mv.
+ */
+static void motion_search(const PPic *p, int mx, int my, const int16_t mvp[2],
+                          const int16_t mvs[2], const int16_t na[2],
+                          const int16_t nbv[2], int lambda, int16_t mv[2])
+{
+    const int16_t cand[5][2] = {
+        { 0, 0 }, { mvp[0], mvp[1] }, { mvs[0], mvs[1] },
+        { na[0], na[1] }, { nbv[0], nbv[1] },
+    };
+    int bx = 0, by = 0, best = INT_MAX, it, i;
+
+    for (i = 0; i < 5; i++) {
+        const int cx = clampi((cand[i][0] + 2) >> 2, -64, 64);
+        const int cy = clampi((cand[i][1] + 2) >> 2, -64, 64);
+        const int cost = sad_mb(p, mx, my, cx, cy, best) +
+            lambda * (abs(cx * 4 - mvp[0]) + abs(cy * 4 - mvp[1])) / 4;
+
+        if (cost < best) {
+            best = cost;
+            bx = cx;
+            by = cy;
+        }
+    }
+    /* still far off: a coarse grid over +-16 pixels first */
+    if (best > 512) {
+        int gx, gy, cbx = bx, cby = by;
+
+        for (gy = -16; gy <= 16; gy += 4) {
+            for (gx = -16; gx <= 16; gx += 4) {
+                const int cost = sad_mb(p, mx, my, gx, gy, best) +
+                    lambda * (abs(gx * 4 - mvp[0]) + abs(gy * 4 - mvp[1])) / 4;
+
+                if (cost < best) {
+                    best = cost;
+                    cbx = gx;
+                    cby = gy;
+                }
+            }
+        }
+        bx = cbx;
+        by = cby;
+    }
+    for (it = 0; it < 16 && best; it++) {
+        static const int8_t dia[4][2] = {
+            { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 },
+        };
+        int nbx = bx, nby = by;
+
+        for (i = 0; i < 4; i++) {
+            const int cx = bx + dia[i][0], cy = by + dia[i][1];
+            int cost;
+
+            if (abs(cx) > 64 || abs(cy) > 64) {
+                continue;
+            }
+            cost = sad_mb(p, mx, my, cx, cy, best) +
+                lambda * (abs(cx * 4 - mvp[0]) + abs(cy * 4 - mvp[1])) / 4;
+            if (cost < best) {
+                best = cost;
+                nbx = cx;
+                nby = cy;
+            }
+        }
+        if (nbx == bx && nby == by) {
+            break;
+        }
+        bx = nbx;
+        by = nby;
+    }
+    mv[0] = bx * 4;
+    mv[1] = by * 4;
+    /* then half and quarter samples around it */
+    {
+        int step, dx, dy;
+
+        best = sad_mb_q(p, mx, my, mv) +
+            lambda * (abs(mv[0] - mvp[0]) + abs(mv[1] - mvp[1])) / 4;
+        for (step = 2; step >= 1; step >>= 1) {
+            int16_t nb[2] = { mv[0], mv[1] };
+
+            for (dy = -step; dy <= step; dy += step) {
+                for (dx = -step; dx <= step; dx += step) {
+                    const int16_t m[2] = {
+                        (int16_t)(mv[0] + dx), (int16_t)(mv[1] + dy),
+                    };
+                    int cost;
+
+                    if ((!dx && !dy) || abs(m[0]) > 256 || abs(m[1]) > 256) {
+                        continue;
+                    }
+                    cost = sad_mb_q(p, mx, my, m) +
+                        lambda * (abs(m[0] - mvp[0]) + abs(m[1] - mvp[1])) / 4;
+                    if (cost < best) {
+                        best = cost;
+                        nb[0] = m[0];
+                        nb[1] = m[1];
+                    }
+                }
+            }
+            mv[0] = nb[0];
+            mv[1] = nb[1];
+        }
+    }
+}
+
 /* a P_Skip macroblock: its prediction is the picture */
 static void put_skip(PPic *p, int mx, int my, PMb *me, const int16_t mvs[2],
                      const uint8_t py[256], const uint8_t pc[2][64])
@@ -1391,6 +1690,7 @@ static void put_skip(PPic *p, int mx, int my, PMb *me, const int16_t mvs[2],
     int i;
 
     me->type = PMB_SKIP;
+    me->pred = 1;
     me->mv[0] = mvs[0];
     me->mv[1] = mvs[1];
     me->qp = p->qp_cur;
@@ -1468,114 +1768,16 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
 
             /* motion search: candidates, then a diamond around the best */
             {
-                const int16_t cand[5][2] = {
-                    { 0, 0 }, { mvp[0], mvp[1] }, { mvs[0], mvs[1] },
-                    { a && a->type != PMB_INTRA ? a->mv[0] : 0,
-                      a && a->type != PMB_INTRA ? a->mv[1] : 0 },
-                    { b && b->type != PMB_INTRA ? b->mv[0] : 0,
-                      b && b->type != PMB_INTRA ? b->mv[1] : 0 },
+                const int16_t na[2] = {
+                    a && a->type != PMB_INTRA ? a->mv[0] : 0,
+                    a && a->type != PMB_INTRA ? a->mv[1] : 0,
                 };
-                int bx = 0, by = 0, best = INT_MAX, it;
+                const int16_t nbv[2] = {
+                    b && b->type != PMB_INTRA ? b->mv[0] : 0,
+                    b && b->type != PMB_INTRA ? b->mv[1] : 0,
+                };
 
-                for (i = 0; i < 5; i++) {
-                    const int cx = clampi((cand[i][0] + 2) >> 2, -64, 64);
-                    const int cy = clampi((cand[i][1] + 2) >> 2, -64, 64);
-                    const int cost = sad_mb(p, mx, my, cx, cy, best) +
-                        lambda * (abs(cx * 4 - mvp[0]) + abs(cy * 4 - mvp[1]))
-                        / 4;
-
-                    if (cost < best) {
-                        best = cost;
-                        bx = cx;
-                        by = cy;
-                    }
-                }
-                /* still far off: a coarse grid over +-16 pixels first */
-                if (best > 512) {
-                    int gx, gy, cbx = bx, cby = by;
-
-                    for (gy = -16; gy <= 16; gy += 4) {
-                        for (gx = -16; gx <= 16; gx += 4) {
-                            const int cost = sad_mb(p, mx, my, gx, gy, best) +
-                                lambda * (abs(gx * 4 - mvp[0]) +
-                                          abs(gy * 4 - mvp[1])) / 4;
-
-                            if (cost < best) {
-                                best = cost;
-                                cbx = gx;
-                                cby = gy;
-                            }
-                        }
-                    }
-                    bx = cbx;
-                    by = cby;
-                }
-                for (it = 0; it < 16 && best; it++) {
-                    static const int8_t dia[4][2] = {
-                        { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 },
-                    };
-                    int nbx = bx, nby = by;
-
-                    for (i = 0; i < 4; i++) {
-                        const int cx = bx + dia[i][0], cy = by + dia[i][1];
-                        int cost;
-
-                        if (abs(cx) > 64 || abs(cy) > 64) {
-                            continue;
-                        }
-                        cost = sad_mb(p, mx, my, cx, cy, best) +
-                            lambda * (abs(cx * 4 - mvp[0]) +
-                                      abs(cy * 4 - mvp[1])) / 4;
-                        if (cost < best) {
-                            best = cost;
-                            nbx = cx;
-                            nby = cy;
-                        }
-                    }
-                    if (nbx == bx && nby == by) {
-                        break;
-                    }
-                    bx = nbx;
-                    by = nby;
-                }
-                mv[0] = bx * 4;
-                mv[1] = by * 4;
-                /* then half and quarter samples around it */
-                {
-                    int step, dx, dy;
-
-                    best = sad_mb_q(p, mx, my, mv) +
-                        lambda * (abs(mv[0] - mvp[0]) + abs(mv[1] - mvp[1]))
-                        / 4;
-                    for (step = 2; step >= 1; step >>= 1) {
-                        int16_t nb[2] = { mv[0], mv[1] };
-
-                        for (dy = -step; dy <= step; dy += step) {
-                            for (dx = -step; dx <= step; dx += step) {
-                                const int16_t m[2] = {
-                                    (int16_t)(mv[0] + dx),
-                                    (int16_t)(mv[1] + dy),
-                                };
-                                int cost;
-
-                                if ((!dx && !dy) || abs(m[0]) > 256 ||
-                                    abs(m[1]) > 256) {
-                                    continue;
-                                }
-                                cost = sad_mb_q(p, mx, my, m) +
-                                    lambda * (abs(m[0] - mvp[0]) +
-                                              abs(m[1] - mvp[1])) / 4;
-                                if (cost < best) {
-                                    best = cost;
-                                    nb[0] = m[0];
-                                    nb[1] = m[1];
-                                }
-                            }
-                        }
-                        mv[0] = nb[0];
-                        mv[1] = nb[1];
-                    }
-                }
+                motion_search(p, mx, my, mvp, mvs, na, nbv, lambda, mv);
 
                 /* nothing near: the scene changed, code it intra */
                 mc_mb(p, mx, my, mv, py, pc);
@@ -1600,6 +1802,7 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
             }
             put_skip_flag(p, &c, skip_inc, false);
             me->type = PMB_INTER;
+            me->pred = 1;
             me->mv[0] = mv[0];
             me->mv[1] = mv[1];
             me->mvd[0] = mv[0] - mvp[0];
@@ -1626,6 +1829,170 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
         if (p->skip_run) {
             bw_ue(p->cw, p->skip_run);
         }
+        bw_bits(p->cw, 1, 1);                       /* rbsp_stop_one_bit */
+        while (p->cw->bits) {
+            bw_bits(p->cw, 0, 1);
+        }
+        return p->cw->n;
+    }
+    return c.p - out;
+}
+
+/* p with its L1 reference in place of its L0 one */
+static PPic ppic_l1(const PPic *p)
+{
+    PPic q = *p;
+
+    q.ry = p->ry1;
+    q.rcb = p->rcb1;
+    q.rcr = p->rcr1;
+    return q;
+}
+
+static int sad_pred(const PPic *p, int mx, int my, const uint8_t py[256])
+{
+    int x, y, s = 0;
+
+    for (y = 0; y < 16; y++) {
+        const uint8_t *src = p->f.sy + (my * 16 + y) * p->f.sys + mx * 16;
+
+        for (x = 0; x < 16; x++) {
+            s += abs(src[x] - py[y * 16 + x]);
+        }
+    }
+    return s;
+}
+
+/*
+ * A B slice: every macroblock B_L0_16x16, B_L1_16x16 or B_Bi_16x16 (each
+ * list's vector searched on its reference, the cheapest prediction --
+ * Bi the rounded average of the two, 8.4.2.3.1's default weights) or
+ * I_16x16 DC where nothing matches; never B_Skip or B_Direct_16x16, so
+ * neither direct mode's derivation is needed (a correct stream, a little
+ * dearer than one that skips).  With no room left (force_skip) every
+ * macroblock is B_L0_16x16 at its predicted vector without residual.
+ */
+static size_t b_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
+                          size_t cap, H264PStats *st)
+{
+    const int mbw = p->f.mbw, mbh = p->f.mbh;
+    const int8_t (*mn)[2] = h264_cabac_init_P[MIN(MAX(cabac_init_idc, 0), 2)];
+    const int lambda = 1 << MAX(0, (p->qp_target - 12) / 6);
+    const PPic q1 = ppic_l1(p);
+    Cabac c;
+    int mx, my, i;
+
+    cabac_init(&c, p->qp_slice, out, out + cap);
+    for (i = 0; i < 460; i++) {
+        const int s = MIN(MAX(((mn[i][0] * p->qp_slice) >> 4) + mn[i][1], 1),
+                          126);
+        c.state[i] = (MIN(s, 127 - s) << 1) | (s >> 6);
+    }
+    p->skip_run = 0;
+    p->qp_cur = p->qp_slice;
+    p->last_qp_delta_nz = 0;
+    memset(st, 0, sizeof(*st));
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            PMb *me = pmb_at(p, mx, my);
+            const PMb *a = pmb_at(p, mx - 1, my), *b = pmb_at(p, mx, my - 1);
+            const int skip_inc = (a != NULL) + (b != NULL);
+            uint8_t py[3][256], pc[3][2][64];
+            int16_t mvp[2][2], mv[2][2];
+            int cost[3], pick, list;
+            PRes r;
+
+            memset(me, 0, sizeof(*me));
+            put_skip_flag(p, &c, skip_inc, false);
+            if (p->force_intra) {
+                me->type = PMB_INTRA;
+                put_intra(p, &c, mx, my, me);
+                p->last_qp_delta_nz = me->qp_delta_nz;
+                st->intra++;
+                goto next;
+            }
+            mv_pred_l(p, mx, my, 0, mvp[0]);
+            mv_pred_l(p, mx, my, 1, mvp[1]);
+            if (p->force_skip) {
+                mv[0][0] = mvp[0][0];
+                mv[0][1] = mvp[0][1];
+                mc_mb(p, mx, my, mv[0], py[0], pc[0]);
+                memset(&r, 0, sizeof(r));
+                pick = 0;
+                goto code;
+            }
+            for (list = 0; list < 2; list++) {
+                const PPic *q = list ? &q1 : p;
+                int16_t na[2], nbv[2];
+
+                nb_ref_l(a, list, na);
+                nb_ref_l(b, list, nbv);
+                motion_search(q, mx, my, mvp[list], mvp[list], na, nbv,
+                              lambda, mv[list]);
+                mc_mb(q, mx, my, mv[list], py[list], pc[list]);
+                cost[list] = sad_pred(p, mx, my, py[list]) +
+                    lambda * (abs(mv[list][0] - mvp[list][0]) +
+                              abs(mv[list][1] - mvp[list][1])) / 4;
+            }
+            for (i = 0; i < 256; i++) {
+                py[2][i] = (py[0][i] + py[1][i] + 1) >> 1;
+            }
+            for (i = 0; i < 64; i++) {
+                pc[2][0][i] = (pc[0][0][i] + pc[1][0][i] + 1) >> 1;
+                pc[2][1][i] = (pc[0][1][i] + pc[1][1][i] + 1) >> 1;
+            }
+            cost[2] = sad_pred(p, mx, my, py[2]) +
+                lambda * (abs(mv[0][0] - mvp[0][0]) + abs(mv[0][1] - mvp[0][1]) +
+                          abs(mv[1][0] - mvp[1][0]) +
+                          abs(mv[1][1] - mvp[1][1])) / 4;
+            pick = cost[0] <= cost[1] ? 0 : 1;
+            if (cost[2] < cost[pick]) {
+                pick = 2;
+            }
+            /* nothing near: the scene changed, code it intra */
+            if (mrsad_mb(p, mx, my, py[pick]) >
+                2 * intra_dc_error(p, mx, my) + 1024) {
+                me->type = PMB_INTRA;
+                put_intra(p, &c, mx, my, me);
+                p->last_qp_delta_nz = me->qp_delta_nz;
+                st->intra++;
+                goto next;
+            }
+            residual_mb(p, mx, my, py[pick], pc[pick], p->qp_target, &r);
+        code:
+            me->type = PMB_INTER;
+            me->pred = pick + 1;
+            if (me->pred & 1) {
+                me->mv[0] = mv[0][0];
+                me->mv[1] = mv[0][1];
+                me->mvd[0] = mv[0][0] - mvp[0][0];
+                me->mvd[1] = mv[0][1] - mvp[0][1];
+            }
+            if (me->pred & 2) {
+                me->mv1[0] = mv[1][0];
+                me->mv1[1] = mv[1][1];
+                me->mvd1[0] = mv[1][0] - mvp[1][0];
+                me->mvd1[1] = mv[1][1] - mvp[1][1];
+            }
+            me->cbp_luma = r.cbp_luma;
+            me->cbp_chroma = r.cbp_chroma;
+            put_inter_b(p, &c, mx, my, me, &r);
+            recon_inter(p, mx, my, py[pick], pc[pick], me->qp, &r);
+            p->last_qp_delta_nz = (r.cbp_luma || r.cbp_chroma) &&
+                                  me->qp_delta_nz;
+            st->inter++;
+        next:
+            if (p->cw) {
+                continue;
+            }
+            if (mx == mbw - 1 && my == mbh - 1) {
+                cabac_flush(&c);
+            } else {
+                cabac_terminate0(&c);
+            }
+        }
+    }
+    if (p->cw) {
         bw_bits(p->cw, 1, 1);                       /* rbsp_stop_one_bit */
         while (p->cw->bits) {
             bw_bits(p->cw, 0, 1);
@@ -1757,6 +2124,8 @@ struct H264Pic {
     const uint8_t *sy, *suv;
     int sys, scs;
     uint8_t *ry, *rcb, *rcr;        /* the reference, NULL: none */
+    uint8_t *ry1, *rcb1, *rcr1;     /* B: the L1 reference, NULL: none */
+    bool ref1_same;                 /* the L1 reference is the L0 picture */
     PMb *mb;
     MbInfo *info;
     DbMb *db;
@@ -1817,8 +2186,8 @@ static void pic_window(const H264Pic *pic, Frame *f, int r0, int rows)
 }
 
 /* a slice of the picture, CABAC (cw NULL) or CAVLC into cw */
-static size_t pic_slice(H264Pic *pic, bool p_slice, int r0, int rows,
-                        int qp, int cabac_init_idc, BitWriter *cw,
+static size_t pic_slice(H264Pic *pic, bool p_slice, bool b_slice, int r0,
+                        int rows, int qp, int cabac_init_idc, BitWriter *cw,
                         int bit_offset, uint8_t *out, size_t cap,
                         H264PStats *st)
 {
@@ -1839,7 +2208,7 @@ static size_t pic_slice(H264Pic *pic, bool p_slice, int r0, int rows,
     }
     pic->nslices++;
 
-    if (!p_slice) {
+    if (!p_slice && !b_slice) {
         Frame f;
         Cabac c;
         MbInfo *info = pic->info + (size_t)r0 * mbw;
@@ -1886,13 +2255,29 @@ static size_t pic_slice(H264Pic *pic, bool p_slice, int r0, int rows,
                .mb = pic->mb + (size_t)r0 * mbw, .qp_slice = qp,
                .qp_target = qp, .cqp = pic->cqp, .t8x8 = pic->t8x8,
                .cw = cw };
+    bool ref1_same = pic->ref1_same;
 
+    if (b_slice) {
+        /* a missing reference is taken as the other's picture */
+        p.bslice = true;
+        p.ry1 = pic->ry1 ? pic->ry1 : pic->ry;
+        p.rcb1 = pic->ry1 ? pic->rcb1 : pic->rcb;
+        p.rcr1 = pic->ry1 ? pic->rcr1 : pic->rcr;
+        if (!p.ry) {
+            p.ry = p.ry1;
+            p.rcb = p.rcb1;
+            p.rcr = p.rcr1;
+        }
+        ref1_same = ref1_same || !pic->ry || !pic->ry1;
+        p.force_intra = !p.ry;
+    }
     pic_window(pic, &p.f, r0, rows);
     for (;;) {
         if (cw) {
             *cw = (BitWriter) { .p = out, .cap = cap, .bits = bit_offset & 7 };
         }
-        len = p_slice_try(&p, cabac_init_idc, out, cap, st);
+        len = b_slice ? b_slice_try(&p, cabac_init_idc, out, cap, st)
+                      : p_slice_try(&p, cabac_init_idc, out, cap, st);
         if (len + 64 <= cap || p.force_skip || p.force_intra) {
             break;
         }
@@ -1908,10 +2293,13 @@ static size_t pic_slice(H264Pic *pic, bool p_slice, int r0, int rows,
         const PMb *m = &pic->mb[i];
 
         pic->db[i] = (DbMb) { .intra = m->type == PMB_INTRA, .qp = m->qp,
-                              .nz = m->nz };
+                              .nz = m->nz, .pred = m->pred,
+                              .ref1 = b_slice && !ref1_same };
         if (m->type != PMB_INTRA) {
             pic->db[i].mv[0] = m->mv[0];
             pic->db[i].mv[1] = m->mv[1];
+            pic->db[i].mv1[0] = m->mv1[0];
+            pic->db[i].mv1[1] = m->mv1[1];
         }
     }
     return cw ? len * 8 : len;
@@ -1921,8 +2309,8 @@ size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
                             int qp, int cabac_init_idc, uint8_t *out,
                             size_t cap, H264PStats *st)
 {
-    return pic_slice(pic, p_slice, r0, rows, qp, cabac_init_idc, NULL, 0,
-                     out, cap, st);
+    return pic_slice(pic, p_slice, false, r0, rows, qp, cabac_init_idc, NULL,
+                     0, out, cap, st);
 }
 
 size_t h264_pic_slice_cavlc(H264Pic *pic, bool p_slice, int r0, int rows,
@@ -1931,7 +2319,48 @@ size_t h264_pic_slice_cavlc(H264Pic *pic, bool p_slice, int r0, int rows,
 {
     BitWriter bw;
 
-    return pic_slice(pic, p_slice, r0, rows, qp, 0, &bw, bit_offset, out,
+    return pic_slice(pic, p_slice, false, r0, rows, qp, 0, &bw, bit_offset,
+                     out, cap, st);
+}
+
+void h264_pic_set_ref_l1(H264Pic *pic, const uint8_t *ry, const uint8_t *ruv,
+                         bool same_as_l0)
+{
+    const size_t n = (size_t)pic->mbw * pic->mbh * 64;
+    size_t i;
+
+    g_free(pic->ry1);
+    g_free(pic->rcb1);
+    g_free(pic->rcr1);
+    pic->ry1 = pic->rcb1 = pic->rcr1 = NULL;
+    pic->ref1_same = same_as_l0;
+    if (!ry || !ruv) {
+        return;
+    }
+    pic->ry1 = g_memdup2(ry, (size_t)pic->mbw * pic->mbh * 256);
+    pic->rcb1 = g_malloc(n);
+    pic->rcr1 = g_malloc(n);
+    for (i = 0; i < n; i++) {
+        pic->rcb1[i] = ruv[2 * i];
+        pic->rcr1[i] = ruv[2 * i + 1];
+    }
+}
+
+size_t h264_pic_slice_b_cabac(H264Pic *pic, int r0, int rows, int qp,
+                              int cabac_init_idc, uint8_t *out, size_t cap,
+                              H264PStats *st)
+{
+    return pic_slice(pic, false, true, r0, rows, qp, cabac_init_idc, NULL, 0,
+                     out, cap, st);
+}
+
+size_t h264_pic_slice_b_cavlc(H264Pic *pic, int r0, int rows, int qp,
+                              int bit_offset, uint8_t *out, size_t cap,
+                              H264PStats *st)
+{
+    BitWriter bw;
+
+    return pic_slice(pic, false, true, r0, rows, qp, 0, &bw, bit_offset, out,
                      cap, st);
 }
 
@@ -1968,6 +2397,9 @@ void h264_pic_free(H264Pic *pic)
     g_free(pic->ry);
     g_free(pic->rcb);
     g_free(pic->rcr);
+    g_free(pic->ry1);
+    g_free(pic->rcb1);
+    g_free(pic->rcr1);
     g_free(pic->mb);
     g_free(pic->info);
     g_free(pic->db);
