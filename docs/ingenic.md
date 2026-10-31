@@ -1373,6 +1373,16 @@ times `light` (percent, 100) -- read the way each part's SDK sensor
 driver writes them: GC2053 page 0 0x03/0x04 and 0xB8/0xB9, GC2083
 0x0D03/0x0D04, GC4653/GC4663 0x0202/0x0203 and 0x02B8/0x02B9, SC2336
 0x3E00-0x3E02 and 0x3E07/0x3E09 (`include/hw/i2c/ingenic-sensor.h`).
+On T23 and T31 the light also takes the AE's ISP digital gain: the
+part of its gain the sensor's coarse analogue steps cannot make, which
+`tisp_ae0_process_impl` hands `JZ_Isp_Ae_Dg2reg` to write to 0x1030 /
+0x1034 (four 16-bit lanes, G in 0x1030's top half, 0x400 = 1.0). Without
+it the T23 AE hunted: with the GC2053's steps some 1.18x apart it ran
+analogue 2272/256 with digital 1.21x, saw the picture too dark, stepped
+to 2683/256 with 1.0x, saw it too bright, and flipped between the two
+every 5 frames; with it, it settles (2283/256 held for 153 frames of a
+200-frame run). T21 writes its digital gain to 0x408 / 0x40C (not
+applied); T40 and T41 apply theirs elsewhere and converge as they are.
 The painted scene counts as display light (gamma 2.2): the exposure
 scales its linear light, white clips, and the picture is gamma-encoded
 again, so a longer exposure lifts the navy while the logo stays white.

@@ -158,12 +158,13 @@ typedef struct IngenicIspLayout {
      */
     uint16_t day_r, day_b;
     bool hldc;                  /* T40/T41: the HLDC lens correction stage */
+    hwaddr dgain;               /* the AE's ISP digital gain, Q10 (0: none) */
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
     {
         /* tx-isp-t31.ko H20221206a (tmp/media-contract.md section 2) */
-        .name = "t31", .isp_size = 0x90000,
+        .name = "t31", .dgain = 0x1030, .isp_size = 0x90000,
         .int_en = 0xB0, .int_sta = 0xB4, .int_clr = 0xB8, .fs_bit = 0x1000,
         .ch_base = 0x9900, .ch_en = 0x9804,
         .osize = 0x00, .csize = 0x2C, .push_y = 0x6C, .push_uv = 0x84,
@@ -208,7 +209,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * tisp_msca_init_chx_cfg 0x16f2c).  The pop's UV word carries a
          * tag in bits 2:0, 0 here.
          */
-        .name = "t23", .isp_size = 0x10000,
+        .name = "t23", .isp_size = 0x10000, .dgain = 0x1030,
         .int_en = 0xB0, .int_sta = 0xB4, .int_clr = 0xB8, .fs_bit = 0x1000,
         .ch_base = 0xD100, .ch_en = 0xD040,
         .osize = 0x04, .csize = 0x0C, .push_y = 0x30, .push_uv = 0x50,
@@ -550,6 +551,24 @@ static uint64_t ingenic_isp_sensor_short(Object *sensor)
  */
 #define EXPOSURE_1X     (1000ull * 1024)
 
+/*
+ * The AE's ISP digital gain (T23, T31): tisp_ae0_process_impl hands the
+ * part of its gain the sensor's coarse analogue steps cannot make to
+ * JZ_Isp_Ae_Dg2reg, which writes it to 0x1030 / 0x1034 -- four 16-bit
+ * lanes, G in 0x1030's top half, 0x400 = 1.0.  With the GC2053's steps
+ * some 1.18 x apart the AE runs e.g. analogue 8.9 x with digital 1.21 x;
+ * a model that left the digital part out showed it the step below as too
+ * dark and the step above as too bright, and it flipped between them
+ * every few frames.  Folded into the scene's light, so the statistics
+ * and the picture see it.
+ */
+static uint32_t ingenic_isp_dgain(IngenicIspState *s)
+{
+    uint32_t dg = s->l->dgain ? ISP_REG(s->l->dgain) >> 16 : 0;
+
+    return dg ? dg : 0x400;
+}
+
 static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 {
     uint64_t g = (uint64_t)s->light * 256 / 100;
@@ -558,6 +577,9 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 
     if (level) {
         g = g * level / EXPOSURE_1X;
+    }
+    if (!pipe) {
+        g = g * ingenic_isp_dgain(s) / 0x400;
     }
     return MIN(MAX(g, 1), 256 * 64);
 }
