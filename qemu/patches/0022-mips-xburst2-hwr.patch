@@ -1,0 +1,95 @@
+mips: Ingenic XBurst2 hardware registers 4 and 8..12
+
+XBurst2 (Ingenic T40/T41) answers rdhwr for registers the MIPS spec
+leaves undefined, and its software uses them once HWREna enables them
+(the soc-nna driver writes HWREna = ~0):
+
+  $4       the physical address the last LL touched; the vendor kernels
+           turn user addresses into physical ones with "ll; rdhwr $4"
+  $8..$10  wait for the NNA DMA's read channels 0..2
+  $11/$12  wait for its write channels 0..1 (Ingenic's libvenus,
+           aie_wait_nndma_rdchn / wrchn)
+
+On a CPU with ASE_MXU3 (XBurst2) HWREna keeps bits 4 and 8..12,
+rdhwr $4 returns CP0_LLAddr and $8..$12 return 0 at once: the machine's NNA DMA model completes each
+transfer when it is started.  Elsewhere they keep raising RI.
+
+diff -ru a/target/mips/helper.h b/target/mips/helper.h
+--- a/target/mips/helper.h	2026-10-30 23:46:11.255726246 +0000
++++ b/target/mips/helper.h	2026-10-30 23:46:23.689003182 +0000
+@@ -195,6 +195,7 @@
+ DEF_HELPER_1(rdhwr_ccres, tl, env)
+ DEF_HELPER_1(rdhwr_performance, tl, env)
+ DEF_HELPER_1(rdhwr_xnp, tl, env)
++DEF_HELPER_2(rdhwr_xburst2, tl, env, i32)
+ DEF_HELPER_2(pmon, void, env, int)
+ DEF_HELPER_1(wait, void, env)
+ 
+diff -ru a/target/mips/tcg/op_helper.c b/target/mips/tcg/op_helper.c
+--- a/target/mips/tcg/op_helper.c	2026-10-30 23:46:11.256781843 +0000
++++ b/target/mips/tcg/op_helper.c	2026-10-30 23:46:23.690099313 +0000
+@@ -255,6 +255,18 @@
+     return (env->CP0_Config5 >> CP0C5_XNP) & 1;
+ }
+ 
++/*
++ * Ingenic XBurst2 hardware registers: 4 is the physical address the last
++ * LL touched (the vendor kernels translate user addresses with LL + rdhwr
++ * $4); 8..12 wait for the NNA DMA's read channels 0..2 and write channels
++ * 0..1 (ingenic-nndma), which complete when started.
++ */
++target_ulong helper_rdhwr_xburst2(CPUMIPSState *env, uint32_t reg)
++{
++    check_hwrena(env, reg, GETPC());
++    return reg == 4 ? env->CP0_LLAddr : 0;
++}
++
+ void helper_pmon(CPUMIPSState *env, int function)
+ {
+     function /= 2;
+diff -ru a/target/mips/tcg/system/cp0_helper.c b/target/mips/tcg/system/cp0_helper.c
+--- a/target/mips/tcg/system/cp0_helper.c	2026-10-30 23:52:23.587567443 +0000
++++ b/target/mips/tcg/system/cp0_helper.c	2026-10-30 23:52:23.601544549 +0000
+@@ -1047,6 +1047,10 @@
+     if (env->insn_flags & ISA_MIPS_R6) {
+         mask |= (1 << 5);
+     }
++    if (env->insn_flags & ASE_MXU3) {
++        /* XBurst2: the LL address and the NNA DMA waits */
++        mask |= (1 << 4) | (0x1f << 8);
++    }
+     if (env->CP0_Config3 & (1 << CP0C3_ULRI)) {
+         mask |= (1 << 29);
+ 
+diff -ru a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
+--- a/target/mips/tcg/translate.c	2026-10-30 23:46:11.256830653 +0000
++++ b/target/mips/tcg/translate.c	2026-10-30 23:46:23.690154420 +0000
+@@ -10887,6 +10887,12 @@
+         gen_store_gpr(t0, rt);
+         break;
+     case 4:
++        if (ctx->insn_flags & ASE_MXU3) {
++            /* XBurst2: the physical address of the last LL */
++            gen_helper_rdhwr_xburst2(t0, tcg_env, tcg_constant_i32(rd));
++            gen_store_gpr(t0, rt);
++            break;
++        }
+         check_insn(ctx, ISA_MIPS_R6);
+         if (sel != 0) {
+             /*
+@@ -10903,6 +10909,15 @@
+         gen_helper_rdhwr_xnp(t0, tcg_env);
+         gen_store_gpr(t0, rt);
+         break;
++    case 8 ... 12:
++        if (ctx->insn_flags & ASE_MXU3) {
++            /* XBurst2: wait for an NNA DMA channel */
++            gen_helper_rdhwr_xburst2(t0, tcg_env, tcg_constant_i32(rd));
++            gen_store_gpr(t0, rt);
++            break;
++        }
++        generate_exception(ctx, EXCP_RI);
++        break;
+     case 29:
+ #if defined(CONFIG_USER_ONLY)
+         tcg_gen_ld_tl(t0, tcg_env,

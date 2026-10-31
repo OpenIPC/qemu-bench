@@ -15,6 +15,10 @@
  * the driver releases the CPU (0x16101000 bit 8 cleared, or request 3)
  * sends the startup indication.
  *
+ * With "psk" the access point is WPA2-PSK (atbm-wpa.c, shared with the
+ * SDIO chip): the driver installs the CCMP keys in the chip with
+ * WSM_ADD_KEY, so frames between it and the "firmware" stay plaintext.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -30,6 +34,7 @@
 #include "desc.h"
 #include "qom/object.h"
 #include "net/net.h"
+#include "../net/atbm-wpa.h"
 
 #define TYPE_ATBM_WIFI "atbm-wifi"
 OBJECT_DECLARE_SIMPLE_TYPE(AtbmState, ATBM_WIFI)
@@ -76,6 +81,10 @@ struct AtbmState {
     NICConf conf;
     NICState *nic;
     char *ssid;
+    char *psk;                  /* WPA passphrase; unset: open */
+    AtbmWpaOpts wpa_opts;
+    AtbmWpa wpa;
+    uint8_t sta_if;             /* the driver interface the STA joined on */
     uint8_t channel;
     QEMUTimer *scan_timer;
     uint8_t scan_if;
@@ -241,6 +250,7 @@ static void atbm_cpu_release(AtbmState *s)
 #define FC_DISASSOC         0xa0
 #define FC_AUTH             0xb0
 #define FC_DEAUTH           0xc0
+#define FC_ACTION           0xd0
 #define FC_DATA             0x08
 #define FC_QOS_DATA         0x88
 
@@ -284,6 +294,30 @@ static size_t ap_rates(uint8_t *f)
     return sizeof(r);
 }
 
+static uint16_t ap_capability(AtbmState *s)
+{
+    return 0x0401 | atbm_wpa_capability(&s->wpa);  /* ESS, short slot */
+}
+
+/* WPA2-PSK (atbm-wpa.c): the authenticator's frames to the station */
+static void wpa_rx(void *opaque, const uint8_t *f, size_t n, uint32_t flags)
+{
+    AtbmState *s = opaque;
+
+    atbm_rx(s, f, n, flags, s->sta_if);
+}
+
+static void wpa_deauth(void *opaque, uint16_t reason)
+{
+    AtbmState *s = opaque;
+    uint8_t f[32];
+    size_t n = ap_hdr(s, f, FC_DEAUTH, s->sta);
+
+    stw_le_p(f + n, reason);
+    atbm_rx(s, f, n + 2, 0, s->sta_if);
+    s->associated = false;
+}
+
 /* a beacon, or a probe response to da */
 static void ap_beacon(AtbmState *s, const uint8_t *da, uint8_t if_id)
 {
@@ -293,7 +327,7 @@ static void ap_beacon(AtbmState *s, const uint8_t *da, uint8_t if_id)
 
     stq_le_p(f + n, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL));
     stw_le_p(f + n + 8, 100);           /* beacon interval, TU */
-    stw_le_p(f + n + 10, 0x0401);       /* ESS, short slot time */
+    stw_le_p(f + n + 10, ap_capability(s));     /* ESS, short slot, privacy */
     n += 12;
     f[n++] = 0;                         /* SSID */
     f[n++] = len;
@@ -306,6 +340,7 @@ static void ap_beacon(AtbmState *s, const uint8_t *da, uint8_t if_id)
     f[n++] = 0x2a;                      /* ERP */
     f[n++] = 1;
     f[n++] = 0;
+    n += atbm_wpa_ie(&s->wpa, f + n);
     if (!da) {
         static const uint8_t tim[] = { 5, 4, 0, 1, 0, 0 };
 
@@ -331,18 +366,20 @@ static void ap_assoc(AtbmState *s, const uint8_t *sta, bool re, uint8_t if_id)
     uint8_t f[64];
     size_t n = ap_hdr(s, f, re ? FC_REASSOC_RESP : FC_ASSOC_RESP, sta);
 
-    stw_le_p(f + n, 0x0401);            /* capabilities */
+    stw_le_p(f + n, ap_capability(s));  /* capabilities */
     stw_le_p(f + n + 2, 0);             /* success */
     stw_le_p(f + n + 4, 0xc001);        /* AID 1 */
     n += 6;
     n += ap_rates(f + n);
     memcpy(s->sta, sta, 6);
     s->associated = true;
+    s->sta_if = if_id;
     if (s->trace) {
         qemu_log("atbm: %02x:%02x:%02x:%02x:%02x:%02x associated\n",
                  sta[0], sta[1], sta[2], sta[3], sta[4], sta[5]);
     }
     atbm_rx(s, f, n, 0, if_id);
+    atbm_wpa_associated(&s->wpa, s->bssid, sta);
 }
 
 /* the end of a scan: the AP heard on its channel, then the indication */
@@ -357,20 +394,26 @@ static void atbm_scan_done(void *opaque)
     atbm_send(s, WSM_SCAN_DONE_IND | s->scan_if << 6, b, sizeof(b));
 }
 
-/* a data frame to the distribution system: out of the netdev */
+/*
+ * a data frame to the distribution system: out of the netdev (with WPA2,
+ * EAPOL goes to the authenticator and nothing else passes before the
+ * handshake ends)
+ */
 static void ap_data_from_sta(AtbmState *s, const uint8_t *f, size_t n)
 {
     const size_t hl = (f[0] == FC_QOS_DATA) ? 26 : 24;
     uint8_t eth[2048];
+    size_t p, end;
 
-    if (!s->associated || n < hl + 8 || memcmp(f + hl, llc_snap, 6) ||
-        !(f[1] & 1) || (f[1] & 0x40) || n - hl - 6 + 12 > sizeof(eth)) {
-        return;                         /* not ToDS, protected, or no SNAP */
+    if (!s->associated || n < hl || !(f[1] & 1) ||
+        atbm_wpa_from_sta(&s->wpa, f, n, hl, &p, &end) != ATBM_WPA_PASS ||
+        end - p - 6 + 12 > sizeof(eth)) {
+        return;                         /* not ToDS, closed, or no SNAP */
     }
     memcpy(eth, f + 16, 6);             /* DA: addr3 */
     memcpy(eth + 6, f + 10, 6);         /* SA: addr2 */
-    memcpy(eth + 12, f + hl + 6, n - hl - 6);
-    qemu_send_packet(qemu_get_queue(s->nic), eth, 12 + n - hl - 6);
+    memcpy(eth + 12, f + p + 6, end - p - 6);
+    qemu_send_packet(qemu_get_queue(s->nic), eth, 12 + end - p - 6);
 }
 
 /* a frame the driver transmits */
@@ -399,6 +442,10 @@ static void ap_tx(AtbmState *s, const uint8_t *f, size_t n, uint8_t if_id)
     case FC_DEAUTH:
     case FC_DISASSOC:
         s->associated = false;
+        atbm_wpa_reset(&s->wpa);
+        break;
+    case FC_ACTION:
+        atbm_wpa_action_from_sta(&s->wpa, f, n);
         break;
     case FC_DATA:
     case FC_QOS_DATA:
@@ -419,8 +466,12 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
                             size_t size)
 {
     AtbmState *s = qemu_get_nic_opaque(nc);
-    /* the 802.11 header, LLC/SNAP, then the frame from its type on */
-    uint8_t f[24 + 6 + 2 + 2048];
+    /* the 802.11 header, the CCMP header, LLC/SNAP, then the frame from
+     * its type on, then the MIC room */
+    uint8_t f[24 + 8 + 6 + 2 + 2048 + ATBM_WPA_TRAILER_MAX];
+    const bool group = buf[0] & 1;
+    uint32_t flags = group ? 1u << 9 : 0;
+    size_t n = 24, mic;
 
     if (size < 14) {
         return size;
@@ -430,8 +481,8 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
                  "%02x%02x%s\n", size, buf[0], buf[1], buf[2], buf[3], buf[4],
                  buf[5], buf[12], buf[13], s->associated ? "" : " (dropped)");
     }
-    if (!s->associated || 30 + size - 12 > sizeof(f) ||
-        (!(buf[0] & 1) && memcmp(buf, s->sta, 6))) {
+    if (!s->associated || 24 + 8 + 8 + size - 12 + ATBM_WPA_TRAILER_MAX > sizeof(f) ||
+        (!group && memcmp(buf, s->sta, 6)) || !atbm_wpa_port_open(&s->wpa)) {
         return size;
     }
     memset(f, 0, 24);
@@ -441,9 +492,19 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
     memcpy(f + 10, s->bssid, 6);
     memcpy(f + 16, buf + 6, 6);         /* SA */
     stw_le_p(f + 22, s->ap_seq++ << 4);
-    memcpy(f + 24, llc_snap, 6);
-    memcpy(f + 30, buf + 12, size - 12);
-    atbm_rx(s, f, 30 + size - 12, (buf[0] & 1) ? 1u << 9 : 0, 0);
+    mic = atbm_wpa_to_sta(&s->wpa, group, f + n, &flags);
+    if (mic) {
+        f[1] |= 0x40;                   /* Protected */
+        n += mic;
+    }
+    memcpy(f + n, llc_snap, 6);
+    memcpy(f + n + 6, buf + 12, size - 12);
+    n += 6 + size - 12;
+    if (mic) {
+        n += atbm_wpa_trailer(&s->wpa, group, f + 4, f + 16,
+                              f + n - (6 + size - 12), 6 + size - 12, f + n);
+    }
+    atbm_rx(s, f, n, flags, 0);
     return size;
 }
 
@@ -510,6 +571,23 @@ static void atbm_wsm_out(AtbmState *s, const uint8_t *d, size_t n)
             }
         }
         break;
+    case WSM_ADD_KEY:
+        atbm_wpa_add_key(&s->wpa, d, len);
+        atbm_confirm(s, cmd, NULL, 0);
+        break;
+    case WSM_SET_PM: {
+        /* the chip is always awake here; confirm, then report the mode
+         * switched -- the driver holds its operation lock until then */
+        uint8_t b[8] = { 0 };
+
+        atbm_confirm(s, cmd, NULL, 0);
+        b[4] = len >= 1 ? d[0] : 0;
+        if (s->trace) {
+            qemu_log("atbm: power mode %d\n", b[4]);
+        }
+        atbm_send(s, WSM_SET_PM_IND | ((id >> 6) & 0xf) << 6, b, sizeof(b));
+        break;
+    }
     case WSM_START_SCAN:
         s->scan_if = (id >> 6) & 0xf;
         atbm_confirm(s, cmd, NULL, 0);
@@ -676,6 +754,7 @@ static void atbm_handle_reset(USBDevice *dev)
     timer_del(s->scan_timer);
     atbm_flush(s);
     s->associated = false;
+    atbm_wpa_reset(&s->wpa);
     g_hash_table_remove_all(s->mem);
     s->fw_running = false;
     s->rx_seq = 0;
@@ -767,6 +846,11 @@ static void atbm_realize(USBDevice *dev, Error **errp)
     memcpy(s->bssid, s->conf.macaddr.a, 6);
     s->bssid[0] = 0x02;
     s->bssid[5] ^= 0x80;
+    if (!atbm_wpa_init(&s->wpa, s->psk, s->ssid, &s->wpa_opts, "atbm",
+                       s->trace, s,
+                       wpa_rx, wpa_deauth, &s->ap_seq, errp)) {
+        return;
+    }
     s->nic = qemu_new_nic(&atbm_net_info, &s->conf,
                           object_get_typename(OBJECT(s)),
                           DEVICE(s)->id, &DEVICE(s)->mem_reentrancy_guard, s);
@@ -778,6 +862,7 @@ static void atbm_unrealize(USBDevice *dev)
 
     timer_free(s->start_timer);
     timer_free(s->scan_timer);
+    atbm_wpa_free(&s->wpa);
     qemu_del_nic(s->nic);
     atbm_flush(s);
     g_hash_table_destroy(s->mem);
@@ -786,6 +871,9 @@ static void atbm_unrealize(USBDevice *dev)
 static const Property atbm_props[] = {
     DEFINE_NIC_PROPERTIES(AtbmState, conf),
     DEFINE_PROP_STRING("ssid", AtbmState, ssid),
+    /* a WPA2-PSK passphrase (8..63 characters); unset, the network is open */
+    DEFINE_PROP_STRING("psk", AtbmState, psk),
+    DEFINE_ATBM_WPA_PROPERTIES(AtbmState, wpa_opts),
     /* 0x8888: xm713g.ko (XM530V200) and 6132cu.ko (XM535D2);
      * 0x888b with chip-version 0x4a: 6012B_x.ko (XM535W1 / D1) */
     DEFINE_PROP_UINT16("pid", AtbmState, pid, ATBM_PID),
@@ -793,6 +881,11 @@ static const Property atbm_props[] = {
     DEFINE_PROP_UINT8("channel", AtbmState, channel, 6),
     DEFINE_PROP_BOOL("trace", AtbmState, trace, false),
 };
+
+static bool atbm_get_selftest(Object *obj, Error **errp)
+{
+    return atbm_wpa_selftest();
+}
 
 static void atbm_class_init(ObjectClass *klass, const void *data)
 {
@@ -809,6 +902,8 @@ static void atbm_class_init(ObjectClass *klass, const void *data)
     uc->handle_data    = atbm_handle_data;
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     device_class_set_props(dc, atbm_props);
+    object_class_property_add_bool(klass, "selftest", atbm_get_selftest,
+                                   NULL);
 }
 
 static const TypeInfo atbm_info = {
