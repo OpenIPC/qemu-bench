@@ -109,7 +109,10 @@ static uint8_t gc_recv(I2CSlave *i2c)
  * 0x0202:0x0203 (GC4653; T41's GC4663 the same); the gain the analog
  * gain table's last stage, 0xB8:0xB9 (0x02B8:0x02B9 on the GC4653), in
  * 1/64 -- the tables' coarse steps sit in other registers, but these
- * track the total.
+ * track the total.  In the two-exposure (DOL) WDR mode of the GC4653 /
+ * GC4663 drivers (gc*_set_integration_time_short) the short frame's rows
+ * are 0x0200[5:0]:0x0201, the gain shared by both frames; the model
+ * reports them only once a driver has written them (0 otherwise).
  */
 bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
 {
@@ -129,6 +132,7 @@ bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
         e->lines = s->regs[0x0D03] << 8 | s->regs[0x0D04];
     } else {
         e->lines = s->regs[0x0202] << 8 | s->regs[0x0203];
+        e->short_lines = (s->regs[0x0200] & 0x3F) << 8 | s->regs[0x0201];
         g = 0x02B8;
     }
     e->gain = (s->regs[g] << 6 | (s->regs[g + 1] & 0x3F)) * 16;

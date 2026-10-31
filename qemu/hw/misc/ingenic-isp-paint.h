@@ -7,7 +7,11 @@
  * that reads the same whatever the exposure.  Written NV12 (or NV21) by DMA.
  * The scene is lit by @gain (1.0 = 256): what the sensor's exposure and
  * the light make of it, in linear light (isp_lin(); the counter stays
- * white).
+ * white).  In a two-exposure WDR mode @sgain is the short frame's (0 in
+ * a linear mode): the long frame where it does not clip, the short one
+ * scaled by the exposure ratio where it does, and a tone curve that
+ * brings the ratio's range back into the output's (isp_wdr_tone()).
+ * A white the long frame clips keeps its shading.
  *
  * Below the dot, at the bottom left, a grey step wedge (six neutral
  * patches, painted luma 60 to 210): the mid-tone neutrals a real test
@@ -121,15 +125,47 @@ static inline int isp_disp(double l)
 }
 
 /*
- * Luma @y[v] for painted luma v under @gain (1.0 = 256), and the factor
- * (1.0 = 256) that pixel's chroma scales by
+ * The WDR fusion's tone curve: an extended Reinhard curve whose white is
+ * the exposure ratio @w, the brightest light the short frame still holds
+ * (x = w maps to 1)
  */
-static inline void isp_light_table(uint32_t gain, uint8_t *y, uint16_t *cs)
+static inline double isp_wdr_tone(double x, double w)
+{
+    return x * (1 + x / (w * w)) / (1 + x);
+}
+
+/*
+ * The linear light of painted luma @v under the long frame's @gain and
+ * the short frame's @sgain (1.0 = 256; @sgain 0: a linear mode), after
+ * the WDR fusion and its tone curve
+ */
+static inline double isp_wdr_light(int v, uint32_t gain, uint32_t sgain)
+{
+    double l = isp_lin(v), x = l * gain / 256, w;
+
+    if (!sgain || sgain >= gain) {
+        return MIN(x, 1);
+    }
+    w = (double)gain / sgain;
+    if (x > 1) {
+        /* where the long frame clips, the short one, scaled */
+        x = MIN(l * sgain / 256, 1) * w;
+    }
+    return isp_wdr_tone(x, w);
+}
+
+/*
+ * Luma @y[v] for painted luma v under @gain (1.0 = 256; @sgain the WDR
+ * short frame's, 0 in a linear mode), and the factor (1.0 = 256) that
+ * pixel's chroma scales by
+ */
+static inline void isp_light_table(uint32_t gain, uint32_t sgain, uint8_t *y,
+                                   uint16_t *cs)
 {
     int v;
 
     for (v = 0; v < 256; v++) {
-        y[v] = isp_disp(isp_lin(v) * gain / 256);
+        y[v] = isp_disp(isp_wdr_light(v, gain, sgain));
         cs[v] = v > 16 ? (y[v] - 16) * 256 / (v - 16) : 256;
     }
 }
@@ -167,7 +203,7 @@ static inline uint8_t *isp_line(IngenicIspPainter *p, uint32_t n)
 static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
                                      uint32_t w, uint32_t h, int32_t ys,
                                      int32_t uvs, hwaddr ya, hwaddr uva,
-                                     bool vu, uint32_t gain)
+                                     bool vu, uint32_t gain, uint32_t sgain)
 {
     int dot_x = sstar_pattern_dot_x(frame);
     int cell = MAX(h / 54, 1);
@@ -177,7 +213,7 @@ static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
     uint8_t lit[256];
     uint16_t cs[256];
 
-    isp_light_table(gain, lit, cs);
+    isp_light_table(gain, sgain, lit, cs);
     ys = ys ? ys : (int32_t)w;
     uvs = uvs ? uvs : (int32_t)w;
     l = isp_line(p, w + 2);
@@ -229,7 +265,7 @@ static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
             }
             if (count && isp_counter_box(w, h, x, 2 * y)) {
                 yuv[1] = yuv[2] = 128;
-            } else if (gain != 256) {
+            } else if (gain != 256 || sgain) {
                 yuv[1] = isp_chroma(yuv[1], cs[yuv[0]]);
                 yuv[2] = isp_chroma(yuv[2], cs[yuv[0]]);
             }

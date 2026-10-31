@@ -278,7 +278,7 @@ static void apical_frame_start(void *opaque)
 static uint32_t apical_gain(IngenicIspApicalState *s)
 {
     uint64_t g = (uint64_t)s->light * 256 / 100, level = 0;
-    IngenicSensorExposure e;
+    IngenicSensorExposure e = { 0 };
     HisiSoiExposure soi;
 
     if (s->sensor) {
@@ -400,7 +400,7 @@ static void apical_frame_end(void *opaque)
         ingenic_isp_paint(&s->paint, s->frame, wd, ht,
                           (int32_t)CORE(WR(n) + WR_STRIDE),
                           (int32_t)CORE(WR(n) + WR_UV + WR_STRIDE), ya, uva,
-                          (fmt & 0xFF) == 0x8D, gain);
+                          (fmt & 0xFF) == 0x8D, gain, 0);
         w->last = w->cur;
         w->active = false;
         apical_event(s, ch_done_event[n]);

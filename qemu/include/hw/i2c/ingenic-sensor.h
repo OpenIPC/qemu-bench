@@ -14,6 +14,7 @@
 typedef struct IngenicSensorExposure {
     uint32_t lines;         /* integration time, rows */
     uint32_t gain;          /* total gain, 1.0 = 1024 */
+    uint32_t short_lines;   /* a DOL WDR mode's short exposure, rows; 0: none */
 } IngenicSensorExposure;
 
 /* hw/i2c/galaxycore.c: GC2053, GC2083, GC4653 / GC4663 */

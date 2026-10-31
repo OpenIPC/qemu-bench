@@ -505,7 +505,7 @@ static void ingenic_isp_schedule(IngenicIspState *s)
 /* @sensor's exposure, rows x gain (1.0 = 1024); 0 if there is none */
 static uint64_t ingenic_isp_sensor_level(Object *sensor)
 {
-    IngenicSensorExposure e;
+    IngenicSensorExposure e = { 0 };
     HisiSoiExposure soi;
 
     if (!sensor) {
@@ -517,6 +517,17 @@ static uint64_t ingenic_isp_sensor_level(Object *sensor)
     }
     if (hisi_soi_exposure(sensor, &soi)) {
         return (uint64_t)soi.lines * soi.gain;
+    }
+    return 0;
+}
+
+/* The short exposure of a DOL WDR sensor, as the level above; 0: none */
+static uint64_t ingenic_isp_sensor_short(Object *sensor)
+{
+    IngenicSensorExposure e = { 0 };
+
+    if (sensor && galaxycore_exposure(sensor, &e)) {
+        return (uint64_t)e.short_lines * e.gain;
     }
     return 0;
 }
@@ -539,6 +550,42 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
     if (level) {
         g = g * level / EXPOSURE_1X;
     }
+    return MIN(MAX(g, 1), 256 * 64);
+}
+
+/*
+ * A two-exposure (DOL) WDR mode: tisp_init's linear setup ORs 0x34000009
+ * into the module bypasses at 0x0C, its WDR setup clears bit 0 (T31,
+ * T23); T40 and T41 keep theirs at 0x40, bit 0 again the WDR's bypass
+ * (0xffd00049 linear, 0xff9100e0 in WDR on the T41 SDK image).  The
+ * short frame's light, 1.0 = 256, as ingenic_isp_gain() from the
+ * sensor's short exposure; 0 outside a WDR mode or before the sensor has
+ * one.
+ */
+#define T31_TOP         0x0C        /* module bypasses */
+#define T41_TOP         0x40
+
+static bool ingenic_isp_wdr_mode(IngenicIspState *s)
+{
+    if (s->l->xstat == 1 || s->l->xstat == 2) {
+        return !(ISP_REG(T31_TOP) & 1);
+    }
+    /* T40 / T41: once tisp_init has set the bypasses at all */
+    return s->l->xstat == 3 && ISP_REG(T41_TOP) && !(ISP_REG(T41_TOP) & 1);
+}
+
+static uint32_t ingenic_isp_short_gain(IngenicIspState *s, int pipe)
+{
+    uint64_t level, g;
+
+    if (pipe || !ingenic_isp_wdr_mode(s)) {
+        return 0;
+    }
+    level = ingenic_isp_sensor_short(s->sensor);
+    if (!level) {
+        return 0;
+    }
+    g = (uint64_t)s->light * 256 / 100 * level / EXPOSURE_1X;
     return MIN(MAX(g, 1), 256 * 64);
 }
 
@@ -723,23 +770,96 @@ static bool awb_quad_valid(const AwbFilter *f, const int *q)
  * 0x0C bit 0 is clear (tisp_init's linear mode sets it).  Raised in a
  * linear mode, ae1_interrupt_hist stores its histogram over the AE's
  * static data and pushes the AE1 process, and AE0 and the AWB stop
- * where they are.
+ * where they are.  Its statistics are of the short frame, lit by the
+ * sensor's short exposure (0x0200:0x0201 on the GC4653) -- the long
+ * frame's until the sensor has one.  tisp_ae1_process hands their zone
+ * means and histogram to the WDR module; tisp_ae1_expt sets the short
+ * exposure from the long one's through the tuning's tables.
  */
 #define T31_AE1         0xA800
-#define T31_TOP         0x0C        /* module bypasses */
+
+/*
+ * AE zones (16 bytes each, row by row) and the 512-entry histogram bank
+ * of the scene lit by @gain, as ingenic_isp_stats() writes AE0's, for the
+ * AE block at @blk (its luma thresholds at +0x28): for a second
+ * exposure, the WDR short frame's
+ */
+static void isp_ae_fill(IngenicIspState *s, hwaddr blk, uint32_t frame,
+                        uint32_t gain, int cols, int rows, const int *xs,
+                        const int *ys, uint8_t *buf, uint32_t *hw)
+{
+    uint32_t thr = ISP_REG(blk + 0x28) ? ISP_REG(blk + 0x28) :
+                   ISP_REG(s->l->ae + 0x28);
+    int lo = thr & 0xFF, hi = (thr >> 8) & 0xFF;
+    int w = 2 * xs[cols], h = 2 * ys[rows];
+    uint64_t hist[256] = { 0 };
+    double k = gain / 256.0;
+    int zx, zy, i, j, c;
+
+    memset(buf, 0, 16 * rows * cols);
+    for (zy = 0; zy < rows; zy++) {
+        for (zx = 0; zx < cols; zx++) {
+            uint64_t quads = (uint64_t)(xs[zx + 1] - xs[zx]) *
+                             (ys[zy + 1] - ys[zy]);
+            uint64_t sum[3] = { 0 }, cnt[3] = { 0 };
+            uint8_t *o = buf + 16 * (zy * cols + zx);
+
+            for (j = 0; j < STAT_SY; j++) {
+                for (i = 0; i < STAT_SX; i++) {
+                    int qx = xs[zx] + (2 * i + 1) * (xs[zx + 1] - xs[zx]) /
+                             (2 * STAT_SX);
+                    int qy = ys[zy] + (2 * j + 1) * (ys[zy + 1] - ys[zy]) /
+                             (2 * STAT_SY);
+                    uint8_t yuv[3];
+                    int y;
+
+                    ingenic_scene_pixel(frame, w, h, 2 * qx, 2 * qy, yuv);
+                    y = lround(MIN(isp_lin(yuv[0]) * k, 1) * 255);
+                    c = y < lo ? 0 : y > hi ? 2 : 1;
+                    sum[c] += y;
+                    cnt[c]++;
+                    hist[y] += quads;
+                }
+            }
+            for (c = 0; c < 3; c++) {
+                sum[c] = sum[c] * quads / (STAT_SX * STAT_SY);
+                cnt[c] = cnt[c] * quads / (STAT_SX * STAT_SY);
+            }
+            isp_bits(o, 0, 21, sum[0]);
+            isp_bits(o, 21, 21, sum[1]);
+            isp_bits(o, 42, 21, sum[2]);
+            isp_bits(o, 63, 13, cnt[0]);
+            isp_bits(o, 76, 13, cnt[2]);
+        }
+    }
+    for (i = 0; i < 256; i++) {
+        hw[i] = hw[256 + i] = cpu_to_le32(MIN(hist[i] / (STAT_SX * STAT_SY),
+                                              0x1FFFFF));
+    }
+}
 
 static void ingenic_isp_ae1(IngenicIspState *s, const uint8_t *zones,
                             size_t zlen, const uint32_t *hist, size_t hlen,
-                            int cols, int rows)
+                            int cols, int rows, uint32_t frame,
+                            uint32_t sgain)
 {
     uint32_t cnt = ISP_REG(T31_AE1 + 0x4C), idx = ISP_REG(T31_AE1 + 0x50);
     int c1, r1, xs[STAT_ZONES + 1], ys[STAT_ZONES + 1];
     int zb = (((idx >> 4) & 3) + 1) % (((cnt >> 4) & 3) + 1);
     int hb = ((idx & 3) + 1) % ((cnt & 3) + 1);
+    static uint8_t sbuf[STAT_ZONES * STAT_ZONES * 16];
+    static uint32_t shw[512];
 
     if ((ISP_REG(T31_TOP) & 1) || !ISP_REG(T31_AE1 + 0x2C) ||
         !isp_grid(s, T31_AE1, &c1, &r1, xs, ys) || c1 != cols || r1 != rows) {
         return;
+    }
+    if (sgain) {
+        /* the short frame's own */
+        isp_ae_fill(s, T31_AE1, frame, sgain, cols, rows, xs, ys, sbuf,
+                    shw);
+        zones = sbuf, hist = shw;
+        zlen = 16 * rows * cols, hlen = sizeof(shw);
     }
     dma_memory_write(&address_space_memory,
                      ISP_REG(T31_AE1 + 0x2C + 4 * zb), zones, zlen,
@@ -899,7 +1019,7 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
         ISP_REG(int_sta) |= 1u << l->ae_static_bit | 1u << l->ae_hist_bit;
         if ((l->xstat == 1 || l->xstat == 2) && pipe == 0) {
             ingenic_isp_ae1(s, buf, 16 * rows * cols, hw, sizeof(hw), cols,
-                            rows);
+                            rows, frame, ingenic_isp_short_gain(s, pipe));
         }
     }
     if (awb) {
@@ -960,12 +1080,24 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
             }
         }
         qemu_log("ingenic-isp: pipe %d frame %u stats gain %u/256 mean Y %u%s%s"
-                 " wb R %u B %u /1024 light %u/%u\n",
+                 " wb R %u B %u /1024 light %u/%u top 0x%08x short %u%s\n",
                  pipe, frame, gain, n ? (unsigned)(sum / n) : 0,
                  ae ? " ae" : "", awb ? " awb" : "",
                  l->wb ? ISP_REG(l->wb) & 0xFFF : 0,
                  l->wb ? ISP_REG(l->wb + 4) & 0xFFF : 0,
-                 s->light_r, s->light_b);
+                 s->light_r, s->light_b,
+                 ISP_REG(l->xstat == 3 ? T41_TOP : T31_TOP),
+                 (unsigned)(ingenic_isp_sensor_short(pipe ? s->sensor1 :
+                                                     s->sensor) / 1024),
+                 ingenic_isp_wdr_mode(s) ? " wdr" : "");
+        if (s->sensor) {
+            IngenicSensorExposure e = { 0 };
+
+            if (galaxycore_exposure(s->sensor, &e)) {
+                qemu_log("ingenic-isp: exposure long %u rows short %u rows "
+                         "gain %u/1024\n", e.lines, e.short_lines, e.gain);
+            }
+        }
     }
 }
 
@@ -1495,10 +1627,11 @@ static void ingenic_isp_xstats2(IngenicIspState *s, uint32_t frame, int w,
 }
 
 static void ingenic_isp_wdr(IngenicIspState *s, uint32_t frame, int w,
-                            int h, double k)
+                            int h, double k, double ks)
 {
     static uint8_t logical[0x1020], buf[0x2000];
-    uint64_t hist[3][256] = { { 0 } }, num[3] = { 0 }, ysum = 0;
+    uint64_t hist[2][3][256] = { { { 0 } } }, num[2][3] = { { 0 } };
+    uint64_t ysum[2] = { 0 };
     int n = (ISP_REG(T31_WDR_CNT) & 3) + 1;
     int bank = isp_next_bank(s, T31_WDR_BANK, n, ISP_REG(T31_WDR_LAST));
     hwaddr dst = ISP_REG(T31_WDR_BANK + 4 * bank);
@@ -1513,18 +1646,20 @@ static void ingenic_isp_wdr(IngenicIspState *s, uint32_t frame, int w,
     }
     for (j = 0; j < NY; j++) {
         for (i = 0; i < NX; i++) {
-            double rgb[3];
-            int v[3], l;
+            for (e = 0; e < 2; e++) {
+                double rgb[3];
+                int v[3], l;
 
-            isp_stat_rgb(s, frame, w, h, (2 * i + 1) * w / (2 * NX),
-                         (2 * j + 1) * h / (2 * NY), k, rgb);
-            for (ch = 0; ch < 3; ch++) {
-                v[ch] = lround(rgb[ch] * 255);
-                hist[ch][v[ch]] += quads;
+                isp_stat_rgb(s, frame, w, h, (2 * i + 1) * w / (2 * NX),
+                             (2 * j + 1) * h / (2 * NY), e ? ks : k, rgb);
+                for (ch = 0; ch < 3; ch++) {
+                    v[ch] = lround(rgb[ch] * 255);
+                    hist[e][ch][v[ch]] += quads;
+                }
+                l = (v[0] + 2 * v[1] + v[2]) / 4;
+                num[e][l < lo ? 0 : l > hi ? 2 : 1] += quads;
+                ysum[e] += l * quads;
             }
-            l = (v[0] + 2 * v[1] + v[2]) / 4;
-            num[l < lo ? 0 : l > hi ? 2 : 1] += quads;
-            ysum += l * quads;
         }
     }
     memset(logical, 0, sizeof(logical));
@@ -1532,16 +1667,16 @@ static void ingenic_isp_wdr(IngenicIspState *s, uint32_t frame, int w,
         for (e = 0; e < 2; e++) {
             for (ch = 0; ch < 3; ch++) {
                 isp_bits(logical + 16 * i + 8 * e, 21 * ch, 21,
-                         hist[ch][i] / (NX * NY));
+                         hist[e][ch][i] / (NX * NY));
             }
         }
     }
     for (e = 0; e < 2; e++) {
         for (ch = 0; ch < 3; ch++) {
             isp_bits(logical + 0x1000 + 8 * e, 21 * ch, 21,
-                     num[ch] / (NX * NY));
+                     num[e][ch] / (NX * NY));
         }
-        stl_le_p(logical + 0x1010 + 8 * e, ysum / (NX * NY));
+        stl_le_p(logical + 0x1010 + 8 * e, ysum[e] / (NX * NY));
         stl_le_p(logical + 0x1014 + 8 * e, 1);
     }
     /* eight 516-byte rows, 1 KiB apart */
@@ -1553,6 +1688,99 @@ static void ingenic_isp_wdr(IngenicIspState *s, uint32_t frame, int w,
                      MEMTXATTRS_UNSPECIFIED);
     ISP_REG(T31_WDR_LAST) = dst;
     ISP_REG(s->l->int_sta) |= 1u << T31_WDR_BIT;
+}
+
+/*
+ * T40's and T41's WDR statistics (tisp_wdr_interrupt_static, T40's
+ * tisp_wdr_main_interrupt_static, int_sta bit 11 on both, while 0x40 bit
+ * 0 is clear): four 6 KiB banks at 0x6010.. (T41 tisp_wdr_init, T40
+ * tisp_main_init), 0x6030 the one last written.  tisp_wdr_get_data (the
+ * same offsets in both modules) reads, from the bank:
+ *   +0      456 values of 24 bits end to end, of which the first 450 are
+ *           15 rows of 15 long-frame blocks then 15 short-frame blocks
+ *           (here each block's luma sum over its quads)
+ *   +1352   four 12-bit values (two words, [11:0] and [27:16]) and at
+ *           +1360 two 23-bit ones (here the long and the short frame's
+ *           mean luma x 16, their bright and dark quad counts)
+ *   +1368   160 values to +1848 (left zero: not identified)
+ *   +1848   the long frame's histograms, 256 entries of 8 bytes, three
+ *           21-bit counts (R, G, B), and from +3896 the short frame's --
+ *           read when the tuning asks (its byte 1828)
+ */
+#define T41_WDR_BANK    0x6010
+#define T41_WDR_IDX     0x6030
+#define T41_WDR_BIT     11
+
+static void ingenic_isp_wdr_xb2(IngenicIspState *s, uint32_t frame, int w,
+                                int h, double k, double ks)
+{
+    static uint8_t buf[0x1800];
+    enum { NB = 15, SX = 6, SY = 4 };
+    uint64_t blk[2][NB][NB] = { { { 0 } } }, hist[2][3][256] = { { { 0 } } };
+    uint64_t ysum[2] = { 0 }, n[2] = { 0 }, bright[2] = { 0 }, dark[2] = { 0 };
+    uint32_t idx = (ISP_REG(T41_WDR_IDX) + 1) & 3;
+    hwaddr dst = ISP_REG(T41_WDR_BANK + 4 * idx);
+    uint64_t quads = (uint64_t)(w / NB) * (h / NB) / 4;
+    int bx, by, i, j, e, ch;
+
+    if (!dst || !ingenic_isp_wdr_mode(s)) {
+        return;
+    }
+    for (by = 0; by < NB; by++) {
+        for (bx = 0; bx < NB; bx++) {
+            for (j = 0; j < SY; j++) {
+                for (i = 0; i < SX; i++) {
+                    int x = (bx * SX + i) * w / (NB * SX) + w / (2 * NB * SX);
+                    int y = (by * SY + j) * h / (NB * SY) + h / (2 * NB * SY);
+
+                    for (e = 0; e < 2; e++) {
+                        double rgb[3];
+                        int v[3], l;
+
+                        isp_stat_rgb(s, frame, w, h, x, y, e ? ks : k, rgb);
+                        for (ch = 0; ch < 3; ch++) {
+                            v[ch] = lround(rgb[ch] * 255);
+                            hist[e][ch][v[ch]] += quads / (SX * SY);
+                        }
+                        l = (v[0] + 2 * v[1] + v[2]) / 4;
+                        blk[e][by][bx] += l;
+                        ysum[e] += l;
+                        n[e]++;
+                        bright[e] += l > 240;
+                        dark[e] += l < 16;
+                    }
+                }
+            }
+        }
+    }
+    memset(buf, 0, sizeof(buf));
+    for (by = 0; by < NB; by++) {
+        for (e = 0; e < 2; e++) {
+            for (bx = 0; bx < NB; bx++) {
+                int v = by * 2 * NB + e * NB + bx;
+
+                isp_bits(buf, 24 * v, 24, blk[e][by][bx] * quads / (SX * SY));
+            }
+        }
+    }
+    for (e = 0; e < 2; e++) {
+        isp_bits(buf + 1352 + 4 * e, 0, 12, n[e] ? ysum[e] * 16 / n[e] : 0);
+        isp_bits(buf + 1352 + 4 * e, 16, 12, n[e] ? bright[e] * 4095 / n[e] : 0);
+        isp_bits(buf + 1360 + 4 * e, 0, 23,
+                 dark[e] * (uint64_t)w * h / 4 / MAX(n[e], 1));
+    }
+    for (e = 0; e < 2; e++) {
+        for (i = 0; i < 256; i++) {
+            for (ch = 0; ch < 3; ch++) {
+                isp_bits(buf + 1848 + 2048 * e + 8 * i, 21 * ch, 21,
+                         hist[e][ch][i]);
+            }
+        }
+    }
+    dma_memory_write(&address_space_memory, dst, buf, sizeof(buf),
+                     MEMTXATTRS_UNSPECIFIED);
+    ISP_REG(T41_WDR_IDX) = idx;
+    ISP_REG(s->l->int_sta) |= 1u << T41_WDR_BIT;
 }
 
 static void ingenic_isp_xstats(IngenicIspState *s, uint32_t gain,
@@ -1570,14 +1798,19 @@ static void ingenic_isp_xstats(IngenicIspState *s, uint32_t gain,
     ingenic_isp_adr(s, frame, w, h, k);
     ingenic_isp_defog(s, frame, w, h, k);
     if (s->l->xstat == 3) {
+        uint32_t sg = ingenic_isp_short_gain(s, 0);
+
         /* T40 reads GSM and LCE otherwise and has no TMO */
         if (!strcmp(s->l->name, "t41")) {
             ingenic_isp_xstats2(s, frame, w, h, k);
         }
+        ingenic_isp_wdr_xb2(s, frame, w, h, k, sg ? sg / 256.0 : k);
         return;
     }
     if (s->l->xstat == 1) {
-        ingenic_isp_wdr(s, frame, w, h, k);
+        uint32_t sg = ingenic_isp_short_gain(s, 0);
+
+        ingenic_isp_wdr(s, frame, w, h, k, sg ? sg / 256.0 : k);
     }
 }
 
@@ -1658,6 +1891,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     const IngenicIspLayout *l = s->l;
     uint32_t en = ISP_REG(PIPE_CH(p, l->ch_en));
     uint32_t gain = ingenic_isp_gain(s, p);
+    uint32_t sgain = ingenic_isp_short_gain(s, p);
     uint32_t frame = s->frame + (p ? PIPE1_FRAME : 0);
     hwaddr int_sta = PIPE_INT(p, l->int_sta);
     uint32_t *vic = ingenic_vic_regs(s, p);
@@ -1684,7 +1918,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         uva = fifo_pop(&c->uv, NULL);
         ivdc = l->ivdc_bit && ya == IVDC_Y;
         ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
-                          r[l->uvstride >> 2], ya, uva, false, gain);
+                          r[l->uvstride >> 2], ya, uva, false, gain, sgain);
         if (ivdc) {
             /* into the IVDC's store (RAM at IVDC_Y), nothing to dequeue */
             ISP_REG(l->int_sta) |= 1u << l->ivdc_bit;
