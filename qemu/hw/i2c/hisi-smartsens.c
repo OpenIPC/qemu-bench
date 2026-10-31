@@ -129,15 +129,14 @@ bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
 {
     HisiSmartSensState *s = (HisiSmartSensState *)
         object_dynamic_cast(sensor, TYPE_HISI_SMARTSENS);
-    const uint8_t *r;
     uint32_t coarse;
 
     if (!s) {
         return false;
     }
-    r = s->regs - SS_REG_BASE;
-    e->lines = (r[0x3E00] & 0xF) << 12 | r[0x3E01] << 4 | r[0x3E02] >> 4;
-    switch (r[0x3E09]) {
+#define R(a) s->regs[(a) - SS_REG_BASE]
+    e->lines = (R(0x3E00) & 0xF) << 12 | R(0x3E01) << 4 | R(0x3E02) >> 4;
+    switch (R(0x3E09)) {
     case 0x08: coarse = 2; break;
     case 0x09: coarse = 4; break;
     case 0x0B: coarse = 8; break;
@@ -145,7 +144,8 @@ bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
     case 0x1F: coarse = 32; break;
     default:   coarse = 1; break;
     }
-    e->gain = coarse * (r[0x3E07] ? r[0x3E07] : 0x80) * 8;
+    e->gain = coarse * (R(0x3E07) ? R(0x3E07) : 0x80) * 8;
+#undef R
     return true;
 }
 

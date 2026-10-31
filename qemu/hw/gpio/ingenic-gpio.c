@@ -301,10 +301,30 @@ static const Property ingenic_gpio_props[] = {
     DEFINE_PROP_UINT32("shadow", IngenicGpioState, shadow, 0x7000),
 };
 
+/*
+ * drive[] caches what the outputs last sent; the devices on them migrate
+ * their own side, so it is recomputed from the restored registers
+ * without sending anything (a later change is then sent as a change)
+ */
+static int ingenic_gpio_post_load(void *opaque, int version_id)
+{
+    IngenicGpioState *s = opaque;
+    int p;
+
+    for (p = 0; p < MAX_PORTS; p++) {
+        uint32_t out = ~*gp_reg(s, p, R_INT) & *gp_reg(s, p, R_MSK) &
+                       ~*gp_reg(s, p, R_PAT1);
+
+        s->drive[p] = (out & *gp_reg(s, p, R_PAT0)) | ~out;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_ingenic_gpio = {
     .name = TYPE_INGENIC_GPIO,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ingenic_gpio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_2DARRAY(regs, IngenicGpioState, MAX_PORTS,
                                PORT_REGS / 4),

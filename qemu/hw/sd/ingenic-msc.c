@@ -31,7 +31,7 @@
  * nine for R2, which the drivers read as (a << 24 | b << 8 | c >> 8)
  * with a = the previous c.
  *
- * A DMA descriptor is { nda, da, len, dcmd } (dcmd 0 LINK, 1 ENDI);
+ * A DMA descriptor is { nda, da, len, dcmd } (dcmd bit 0 LINK, bit 1 ENDI);
  * the kernel (jzmmc_v12.c, CONFIG_JZMMC_V12_SDMA=y on every T10..T31
  * OpenIPC kernel) writes the data setup and START_OP first and DMANDA,
  * then DMAC = DMAEN, last, and never clears DMAEN between requests.  So
@@ -330,8 +330,18 @@ static void msc_run_dma(IngenicMscState *s)
         desc = le32_to_cpu(d[0]);
     }
     if (s->data_left) {
+        /*
+         * The chain (or a descriptor fetch) ended short of NOB * BLKLEN:
+         * silicon would wait for the rest and time out, so the transfer
+         * ends in its data error, not in success (the error bit taken is
+         * an inference: the read timeout, a write's missing CRC status)
+         */
         qemu_log_mask(LOG_GUEST_ERROR, "ingenic-msc: DMA chain ended %u "
                       "bytes short of NOB * BLKLEN\n", s->data_left);
+        msc_flag(s, write ? STAT_CRC_WRITE_NOSTS : STAT_TIME_OUT_READ,
+                 write ? IFLG_CRC_WRITE_ERR : IFLG_TIMEOUT_READ);
+        msc_data_abort(s);
+        return;
     }
     msc_data_done(s, true);
 }

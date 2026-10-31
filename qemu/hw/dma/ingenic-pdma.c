@@ -400,6 +400,7 @@ static void ingenic_pdma_write(void *opaque, hwaddr off, uint64_t val,
         break;
     case R_DDRS:
         *pdma_global(s, R_DDR) |= val;
+        pdma_run(s);            /* a doorbell rung after the enables */
         break;
     case R_DIC:
         *pdma_global(s, R_DIP) &= ~val;

@@ -217,6 +217,9 @@ static void sfc_dma_move(IngenicSfcState *s, hwaddr addr, uint32_t len,
     while (len) {
         uint32_t n = MIN(len, sizeof(buf)), i;
 
+        /* the bus is 29 bits: an access past its top wraps to 0 */
+        addr &= DMA_MASK;
+        n = MIN(n, DMA_MASK + 1 - addr);
         if (to_flash) {
             dma_memory_read(s->dma_as, addr, buf, n, MEMTXATTRS_UNSPECIFIED);
             for (i = 0; i < n; i++) {
@@ -533,14 +536,35 @@ static const Property ingenic_sfc_props[] = {
                      TYPE_MEMORY_REGION, MemoryRegion *),
 };
 
+static const VMStateDescription vmstate_sfc_phase = {
+    .name = TYPE_INGENIC_SFC "/phase",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(conf, SfcPhase),
+        VMSTATE_UINT64(addr, SfcPhase),
+        VMSTATE_UINT32(sta_exp, SfcPhase),
+        VMSTATE_UINT32(sta_msk, SfcPhase),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* version 2: the transfer in progress too (a PIO data stage on DR) */
 static const VMStateDescription vmstate_ingenic_sfc = {
     .name = TYPE_INGENIC_SFC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IngenicSfcState, REGS_SIZE / 4),
         VMSTATE_UINT32_ARRAY(cdt, IngenicSfcState, CDT_ENTRIES * 4),
         VMSTATE_UINT32(sr, IngenicSfcState),
+        VMSTATE_STRUCT_ARRAY(phase, IngenicSfcState, CDT_ENTRIES, 2,
+                             vmstate_sfc_phase, SfcPhase),
+        VMSTATE_INT32_V(nphase, IngenicSfcState, 2),
+        VMSTATE_INT32_V(cur, IngenicSfcState, 2),
+        VMSTATE_BOOL_V(data_pending, IngenicSfcState, 2),
+        VMSTATE_BOOL_V(data_write, IngenicSfcState, 2),
+        VMSTATE_UINT32_V(remaining, IngenicSfcState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

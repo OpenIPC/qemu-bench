@@ -6,7 +6,8 @@
  *   RTCSAR 0x08, RTCGR 0x0C
  *   HCR 0x20     0 PD: power down
  *   HWFCR 0x24, HRCR 0x28, HWCR 0x2C, HWRSR 0x30, HSPR 0x34
- *   WENR 0x3C    write 0xA55A, then bit 31 (WEN) unlocks one write
+ *   WENR 0x3C    write 0xA55A, then bit 31 (WEN) unlocks one write (a
+ *                write without it is dropped, and the write uses it up)
  *
  * Every register write waits for WRDY, and the unlock waits for WEN, both
  * without a timeout in the 3.10 kernels' power-off path (soc-t31/common/
@@ -26,6 +27,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
@@ -138,6 +140,15 @@ static void ingenic_rtc_write(void *opaque, hwaddr off, uint64_t val,
 
     if (off >= RTC_REGS) {
         return;
+    }
+    if (off != R_WENR) {
+        /* every other register takes one write per unlock */
+        if (!(s->regs[R_WENR >> 2] & WENR_WEN)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ingenic-rtc: write of 0x%"
+                          HWADDR_PRIx " without the WENR unlock\n", off);
+            return;
+        }
+        s->regs[R_WENR >> 2] &= ~WENR_WEN;
     }
     switch (off) {
     case R_RTCSR:

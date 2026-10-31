@@ -134,6 +134,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicAvpuState, INGENIC_AVPU)
 #define AVPU_NREGS          (AVPU_REGS_SIZE2 / 4)
 #define AVPU_JOB_NS         200000
 #define AVPU_DMA_MASK       0x1fffffff
+/* the largest picture coded: past the parts' 8K, a bound on host memory */
+#define AVPU_MAX_DIM        8192
 
 #define R_ID0               0x000
 #define R_ID1               0x004
@@ -238,6 +240,7 @@ typedef struct AvpuStream {
     uint64_t seq;
     bool hevc_sps, hevc_pps;            /* seen */
     HevcEncParams hevc;
+    int hevc_qg_depth;                  /* PPS diff_cu_qp_delta_depth */
     bool h264_pps;                      /* seen */
     bool h264_t8x8;                     /* PPS transform_8x8_mode_flag */
 } AvpuStream;
@@ -294,16 +297,42 @@ static hwaddr avpu_addr(hwaddr a)
     return a - AVPU_IVDC_BASE < AVPU_IVDC_SIZE ? a : a & AVPU_DMA_MASK;
 }
 
+/*
+ * A transfer through the 29-bit bus: an access that runs past its top
+ * wraps to 0, as the masked address would on silicon (the IVDC's store
+ * is not behind the mask and is taken as it is).
+ */
+static void avpu_dma(hwaddr a, void *buf, size_t n, bool write)
+{
+    hwaddr pa = avpu_addr(a);
+
+    while (n) {
+        size_t chunk = n;
+
+        if (pa <= AVPU_DMA_MASK && chunk > AVPU_DMA_MASK + 1 - pa) {
+            chunk = AVPU_DMA_MASK + 1 - pa;
+        }
+        if (write) {
+            dma_memory_write(&address_space_memory, pa, buf, chunk,
+                             MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dma_memory_read(&address_space_memory, pa, buf, chunk,
+                            MEMTXATTRS_UNSPECIFIED);
+        }
+        buf = (uint8_t *)buf + chunk;
+        n -= chunk;
+        pa = (pa + chunk) & AVPU_DMA_MASK;
+    }
+}
+
 static void avpu_read(hwaddr a, void *buf, size_t n)
 {
-    dma_memory_read(&address_space_memory, avpu_addr(a), buf, n,
-                    MEMTXATTRS_UNSPECIFIED);
+    avpu_dma(a, buf, n, false);
 }
 
 static void avpu_write_mem(hwaddr a, const void *buf, size_t n)
 {
-    dma_memory_write(&address_space_memory, a & AVPU_DMA_MASK, buf, n,
-                     MEMTXATTRS_UNSPECIFIED);
+    avpu_dma(a & AVPU_DMA_MASK, (void *)buf, n, true);
 }
 
 static void avpu_stl(hwaddr a, uint32_t v)
@@ -435,10 +464,13 @@ static void avpu_load_nv12(hwaddr ya, hwaddr ca, int pitch, int pw, int ph,
         int x;
 
         if (r < (ph + 1) / 2) {
-            avpu_read(ca + (hwaddr)r * pitch, l, pw & ~1);
-            for (x = pw & ~1; x < w; x += 2) {
-                l[x] = l[(pw & ~1) - 2];
-                l[x + 1] = l[(pw & ~1) - 1];
+            /* at least one Cb/Cr pair, so that one is there to replicate */
+            const int cw = MAX(pw & ~1, 2);
+
+            avpu_read(ca + (hwaddr)r * pitch, l, cw);
+            for (x = cw; x < w; x += 2) {
+                l[x] = l[cw - 2];
+                l[x + 1] = l[cw - 1];
             }
         } else {
             memcpy(l, uv + (size_t)((ph + 1) / 2 - 1) * w, w);
@@ -714,8 +746,9 @@ static bool avpu_hevc_pps(AvpuStream *st, const uint8_t *r, size_t n)
     avpu_se(&b);                            /* init_qp */
     avpu_bits(&b, 1);                       /* constrained intra */
     st->hevc.transform_skip = avpu_bits(&b, 1);
+    st->hevc_qg_depth = 0;
     if (avpu_bits(&b, 1)) {                 /* cu_qp_delta_enabled */
-        avpu_ue(&b);
+        st->hevc_qg_depth = avpu_ue(&b);    /* diff_cu_qp_delta_depth */
     }
     avpu_se(&b);                            /* cb / cr qp offsets */
     avpu_se(&b);
@@ -1117,8 +1150,10 @@ static void avpu_enc1(IngenicAvpuState *s, hwaddr list)
 
         if (!f) {
             const int log2 = extract32(e[0], 24, 3) + 4;
-            const int pw = (extract32(e[1], 0, 11) + 1) * 8;
-            const int ph = (extract32(e[1], 12, 11) + 1) * 8;
+            const int pw = MIN((extract32(e[1], 0, 11) + 1) * 8,
+                               AVPU_MAX_DIM);
+            const int ph = MIN((extract32(e[1], 12, 11) + 1) * 8,
+                               AVPU_MAX_DIM);
             int pitch = extract32(e[0x88 / 4], 0, 16);
 
             f = avpu_frame_new(s);
@@ -1359,6 +1394,10 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
             qemu_log_mask(LOG_UNIMP, "ingenic-avpu: HEVC CTB %d\n",
                           1 << prm.log2_ctb);
             prm.log2_ctb = MIN(MAX(prm.log2_ctb, 4), 6);
+        }
+        /* the PPS's quantization groups, as the decoder will take them */
+        if (st->hevc_pps && st->hevc_qg_depth > 0) {
+            prm.log2_qg = MAX(prm.log2_ctb - st->hevc_qg_depth, 3);
         }
         if (f->nslices > 1) {
             qemu_log_mask(LOG_UNIMP, "ingenic-avpu: HEVC picture of %d "
@@ -1673,6 +1712,12 @@ static void avpu_jpeg(IngenicAvpuState *s, int core)
     }
     h = extract32(r[1], 0, 16) + 1;
     w = extract32(r[1], 16, 16) + 1;
+    if (w > AVPU_MAX_DIM || h > AVPU_MAX_DIM) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-avpu: JPEG of %dx%d, coded "
+                      "at most %dx%d\n", w, h, AVPU_MAX_DIM, AVPU_MAX_DIM);
+        w = MIN(w, AVPU_MAX_DIM);
+        h = MIN(h, AVPU_MAX_DIM);
+    }
     base = r[7] & AVPU_DMA_MASK;
     size = r[8];
     off = r[9];

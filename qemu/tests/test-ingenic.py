@@ -3833,23 +3833,37 @@ def test_rtc_alarm(qt):
     3.10 suspend path spins on."""
     print('ingenic-rtc alarm, CPM LCR')
     line = lambda: qt.readl(INTC + 0x20) & 1             # source 32
+
+    def wr(off, val):                   # rtc_write_reg: unlock, then write
+        qt.writel(RTC + 0x3C, 0xA55A)
+        qt.writel(RTC + off, val)
+
     now = qt.readl(RTC + 0x04)
-    qt.writel(RTC + 0x08, now + 3)                       # RTCSAR
-    qt.writel(RTC + 0x2C, 1)                             # HWCR.EALM
-    qt.writel(RTC + 0x00, 1 | (1 << 2) | (1 << 3))       # RTCE AE AIE
+    qt.writel(RTC + 0x08, now + 99)                      # locked: dropped
+    check('a write without the unlock is dropped',
+          qt.readl(RTC + 0x08) != now + 99, True)
+    wr(0x08, now + 99)
+    check('one unlocked write lands, and uses WEN up',
+          (qt.readl(RTC + 0x08), qt.readl(RTC + 0x3C) >> 31), (now + 99, 0))
+    qt.writel(RTC + 0x08, 0)
+    check('the next locked write is dropped again',
+          qt.readl(RTC + 0x08), now + 99)
+    wr(0x08, now + 3)                       # RTCSAR
+    wr(0x2C, 1)                             # HWCR.EALM
+    wr(0x00, 1 | (1 << 2) | (1 << 3))       # RTCE AE AIE
     qt.step(1500 * 1000 * 1000)
     check('no alarm before RTCSAR', (qt.readl(RTC + 0x00) >> 4) & 1, 0)
     qt.step(2500 * 1000 * 1000)
     check('alarm: AF and the line',
           ((qt.readl(RTC + 0x00) >> 4) & 1, line()), (1, 1))
     check('HWRSR.ALM latched for the wake', qt.readl(RTC + 0x30) & 1, 1)
-    qt.writel(RTC + 0x00, 1 | (1 << 2) | (1 << 3))       # AF written 0
+    wr(0x00, 1 | (1 << 2) | (1 << 3))       # AF written 0
     check('AF cleared, the line drops', line(), 0)
-    qt.writel(RTC + 0x00, 1 | (1 << 5))                  # 1HZIE
+    wr(0x00, 1 | (1 << 5))                  # 1HZIE
     qt.step(1100 * 1000 * 1000)
     check('the 1 Hz tick interrupts', ((qt.readl(RTC + 0x00) >> 6) & 1, line()),
           (1, 1))
-    qt.writel(RTC + 0x00, 1)
+    wr(0x00, 1)
     lcr = CPM + 0x04
     qt.writel(lcr, qt.readl(lcr) | (0xF << 28))
     check('LCR: domains off report off', (qt.readl(lcr) >> 24) & 0xF, 0xF)

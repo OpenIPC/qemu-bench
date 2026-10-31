@@ -1142,6 +1142,30 @@ def test_jpeg(qt, ff, tmp):
     check('JPEG luma PSNR %.1f dB above 30' % psnr, psnr > 30, True)
 
 
+def test_jpeg_bounds(qt):
+    """Guest JPEG sizes the model must survive: a picture one pixel wide
+    (its chroma pair replicated without reading before the buffer) and
+    one of 65536 x 65536 (coded at the 8192 x 8192 the model allows,
+    not allocated at 16 GiB)."""
+    print('JPEG size bounds (core 1)')
+    core = AVPU + 0x200
+    a = RAM + 0xA00000
+    src, tables, bs, size, off = a, a + 0x20000, a + 0x30000, 0x40000, 0x40
+    for w, h, name in ((1, 16, 'one pixel wide'),
+                       (65536, 65536, '65536 x 65536')):
+        regs = [0, (h - 1) | ((w - 1) << 16), 0, 16, src, src + 16 * 16,
+                tables, bs, size, off, size - off]
+        for i, v in enumerate(regs):
+            qt.writel(core + 0x200 + 4 * i, v)
+        qt.writel(core + 0x3F0, 1)
+        qt.writel(core + 0x3E4, 1)
+        qt.step(1000000)
+        st = qt.readl(AVPU + 0x18)
+        check('JPEG %s: the job ends, QEMU still answers' % name,
+              st & 0x10, 0x10)
+        qt.writel(AVPU + 0x18, st)
+
+
 def test_t41(qemu, ff, tmp):
     """T41's core: H.264 through the gen 2 list layout, and JPEG."""
     base = 0x13100000
@@ -1247,6 +1271,7 @@ def main():
             test_hevc(qt, ff, tmp)
             test_hevc(qt, ff, tmp, libimp=True)
             test_jpeg(qt, ff, tmp)
+            test_jpeg_bounds(qt)
         finally:
             qt.close()
         test_cavlc_change(args.qemu, ff, tmp)

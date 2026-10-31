@@ -690,6 +690,12 @@ static void ingenic_nand_boot(IngenicMachineState *ims)
     stride = len == (gsize)pages * (page + oob) ? page + oob : page;
 
     /* the data area of the pages the SPL can fill */
+    if (len < (gsize)((SPL_MAX_NAND + page - 1) / page - 1) * stride +
+              MIN(page, SPL_MAX_NAND - (SPL_MAX_NAND - 1) / page * page)) {
+        error_report("ingenic: %s is shorter than the SPI NAND SPL area",
+                     ims->flash_file);
+        exit(1);
+    }
     spl = g_malloc(SPL_MAX_NAND);
     for (i = 0; i * page < SPL_MAX_NAND; i++) {
         memcpy(spl + i * page, img + (gsize)i * stride,
