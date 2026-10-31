@@ -1286,6 +1286,9 @@ def test_i3_isp(qt):
                    (0x18, 0), (0x1A, 64), (0x1B, 48), (0x1E, 0x8),
                    (0x01, 0x8000)):
         qt.writew(riu(dma, reg), v)
+    # the R, G, B histograms in front of the luma windows are not the
+    # model's to write: mark them and see the mark survive the frames
+    b64write(qt, DRAM + ISP_HIS, b'\x5a' * 240)
     qt.writew(I3_ISP0 + 4 * 0x28, 0xBFFF)       # unmask VSYNC: streaming
     i3_isp_frames(qt, 2)
 
@@ -1301,6 +1304,8 @@ def test_i3_isp(qt):
     check('ISP histogram: window 0 counts its 64 blocks by Y / 2, the '
           'logo block among them; window 1 its 4',
           (sum(his[:128]), his[39 >> 1] >= 1, sum(his[128:])), (64, True, 4))
+    check('ISP histogram: the R, G, B parts before the windows untouched',
+          b64read(qt, DRAM + ISP_HIS, 240), b'\x5a' * 240)
     i3_sensor(qt, 0x01, 600 & 0xFF)             # twice the exposure
     i3_sensor(qt, 0x02, 600 >> 8)
     i3_isp_frames(qt, 1)

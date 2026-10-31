@@ -225,7 +225,6 @@
  */
 #define HIS_WIN0            240
 #define HIS_BINS            128
-#define HIS_BYTES           (HIS_WIN0 + 2 * HIS_BINS * 2)
 /* ISP6 */
 #define WBG1_GAIN           0x48
 
@@ -367,17 +366,25 @@ static hwaddr i3_isp_miu(SstarI3IspState *s, int reg)
     return (hwaddr)v << 4;
 }
 
-static void i3_isp_dma(SstarI3IspState *s, int base_reg, int max_reg,
-                       const uint8_t *buf, uint32_t len)
+/* @len bytes at @off into the buffer ISP3 @base_reg / @max_reg give. */
+static void i3_isp_dma_at(SstarI3IspState *s, int base_reg, int max_reg,
+                          uint32_t off, const uint8_t *buf, uint32_t len)
 {
     hwaddr base = i3_isp_miu(s, base_reg);
     hwaddr max = i3_isp_miu(s, max_reg);
 
-    if (!base || max <= base) {
+    if (!base || max <= base + off) {
         return;
     }
-    address_space_write(&address_space_memory, DRAM_BASE + base,
-                        MEMTXATTRS_UNSPECIFIED, buf, MIN(len, max - base));
+    address_space_write(&address_space_memory, DRAM_BASE + base + off,
+                        MEMTXATTRS_UNSPECIFIED, buf,
+                        MIN(len, max - base - off));
+}
+
+static void i3_isp_dma(SstarI3IspState *s, int base_reg, int max_reg,
+                       const uint8_t *buf, uint32_t len)
+{
+    i3_isp_dma_at(s, base_reg, max_reg, 0, buf, len);
 }
 
 static uint32_t i3_isp_blocks(SstarI3IspState *s, int num_reg)
@@ -401,7 +408,7 @@ static void i3_isp_write_histo(SstarI3IspState *s, const uint8_t *y)
     uint16_t n = sstar_riu_get(s->riu, BANK_ISP3, STS_HIS_NUM);
     int shift = sstar_riu_get(s->riu, BANK_ISP3, STS_HIS_SHIFT) & 0xF;
     int nx = (n & 0x7F) + 1, ny = ((n >> 8) & 0x7F) + 1;
-    uint8_t buf[HIS_BYTES] = { 0 };
+    uint8_t buf[HIS_BINS * 2];
     int w, bx, by, i;
 
     for (w = 0; w < 2; w++) {
@@ -421,11 +428,13 @@ static void i3_isp_write_histo(SstarI3IspState *s, const uint8_t *y)
             }
         }
         for (i = 0; i < HIS_BINS; i++) {
-            stw_le_p(buf + HIS_WIN0 + (w * HIS_BINS + i) * 2,
-                     MIN(cnt[i] >> shift, 0xFFFF));
+            stw_le_p(buf + i * 2, MIN(cnt[i] >> shift, 0xFFFF));
         }
+        /* The window's own bins only: the R, G, B parts before them and a
+         * window that is off are not the ISP's to write. */
+        i3_isp_dma_at(s, STS_HIS_BASE, STS_HIS_MAX,
+                      HIS_WIN0 + w * HIS_BINS * 2, buf, sizeof(buf));
     }
-    i3_isp_dma(s, STS_HIS_BASE, STS_HIS_MAX, buf, sizeof(buf));
 }
 
 /* Without a picture: every block mid grey. */
