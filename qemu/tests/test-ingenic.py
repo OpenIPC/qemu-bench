@@ -462,6 +462,37 @@ def test_sadc(qt, intc=INTC):
     qt.step(100000)
     check('AUX0 reads the level qom-set on its pin', rw(SADC + 0x10), 0x123)
 
+def test_sadc_dma(qt):
+    """inferred DMA mode: ADCFG.DMA_EN, request 9, words at 0x10"""
+    print('ingenic-sadc DMA (inferred)')
+    qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
+    qt.cmd('writew 0x%x 0x0000' % SADC)
+    qt.cmd('writeb 0x%x 0xff' % (SADC + 0x08))
+    for n in range(4):
+        qt.qom_set('/machine/sadc', 'aux%d' % n, 0x100 * (n + 1) + n)
+    ring = SCRATCH + 0x4000
+    qt.write(ring, bytes(64))
+    # 32-bit fixed source, incrementing target, 4-byte units: 8 words
+    pdma_chan(qt, 5, SADC + 0x10, ring, 8, 9, (1 << 22) | (0 << 8))
+    qt.writel(SADC + 0x04, 1 << 15)             # DMA_EN
+    qt.cmd('writew 0x%x 0x000f' % SADC)         # AUX0..3, continuous
+    qt.step(200000)
+    words = struct.unpack('<8I', qt.read(ring, 32))
+    pair = lambda a, b: (0x100 * (b + 1) + b) << 16 | (0x100 * (a + 1) + a)
+    check('scans arrive as AUX1:AUX0, AUX3:AUX2 words',
+          words, (pair(0, 1), pair(2, 3)) * 4)
+    check('the channel moved its 8 words and stopped',
+          (qt.readl(PDMA + 0xA0 + 0x10) >> 3) & 1, 1)
+    rw = lambda a: int(qt.cmd('readw 0x%x' % a).split()[1], 16)
+    check('ENA keeps its bits in DMA mode', rw(SADC) & 0xff, 0xf)
+    qt.writel(SADC + 0x04, 0)
+    qt.cmd('writew 0x%x 0x0000' % SADC)
+    qt.step(100000)
+    check('DMA off: a conversion clears ENA again', rw(SADC) & 0xff, 0)
+    for n in range(4):
+        qt.qom_set('/machine/sadc', 'aux%d' % n, 0x800 + 0x10 * n)
+
+
 
 def test_drawbox(qt, intc=CORE_INTC):
     print('ingenic-drawbox (T40/T41)')
@@ -1163,6 +1194,50 @@ def test_hash(qt, intc=INTC):
           (qt.readl(HASH + 0x04) & 3, (qt.readl(intc) >> 22) & 1), (3, 1))
     qt.writel(HASH + 0x04, 3)
     check('HSSR write 1 clears the line', (qt.readl(intc) >> 22) & 1, 0)
+
+
+def test_hash_cpu(qt, intc=INTC):
+    """CPU mode, as modelled (inferred): HSDI words in memory order"""
+    print('ingenic-hash CPU mode (HSDI)')
+    algs = ('md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512')
+    for code, alg in enumerate(algs):
+        for msg in (b'abc', bytes(range(256)) + b'quick brown fox' * 3):
+            data = md_pad(msg, alg)
+            qt.writel(HASH + 0x00, 0x30000000 | code << 1 | 1 |
+                      (0 if alg == 'md5' else 3 << 7))
+            qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | 1 << 4)
+            qt.writel(HASH + 0x04, 3)
+            qt.writel(HASH + 0x08, 3)
+            qt.writel(HASH + 0x10, len(data) // 64)
+            for i in range(0, len(data), 4):
+                qt.writel(HASH + 0x14, struct.unpack_from('<I', data, i)[0])
+            want = hashlib.new(alg, msg).digest()
+            got = b''.join(struct.pack('<I', qt.readl(HASH + 0x18))
+                           for i in range(len(want) // 4))
+            check('%s of %d bytes, %d blocks' %
+                  (alg, len(msg), len(data) // (128 if code >= 4 else 64)),
+                  got, want)
+    check('all rounds done after HSTC blocks, the INTC line',
+          (qt.readl(HASH + 0x04) & 3, (qt.readl(intc) >> 22) & 1), (3, 1))
+    qt.writel(HASH + 0x04, 3)
+    # a block's round, then the state loaded again empties a part block
+    qt.writel(HASH + 0x00, 0x30000000 | 3 << 1 | 1 | 3 << 7 | 1 << 4)
+    qt.writel(HASH + 0x10, 0)
+    for i in range(16):
+        qt.writel(HASH + 0x14, 0)
+    check('one block: round done only (HSTC 0)', qt.readl(HASH + 0x04) & 3, 1)
+    qt.writel(HASH + 0x04, 3)
+    qt.writel(HASH + 0x14, 0x11111111)
+    qt.writel(HASH + 0x00, qt.readl(HASH + 0x00) | 1 << 4)
+    data = md_pad(b'', 'sha256')
+    for i in range(0, 64, 4):
+        qt.writel(HASH + 0x14, struct.unpack_from('<I', data, i)[0])
+    got = b''.join(struct.pack('<I', qt.readl(HASH + 0x18)) for i in range(8))
+    check('loading the state drops a part-filled block',
+          got, hashlib.sha256(b'').digest())
+    qt.writel(HASH + 0x00, 0)
+    qt.writel(HASH + 0x04, 3)
+    qt.writel(HASH + 0x08, 0)
 
 
 def test_rsa(qt):
@@ -2013,6 +2088,60 @@ def i2c_read_reg(qt, base, addr, reg, n=1):
         qt.writel(base + 0x10, (1 << 8) | (1 << 10 if i == 0 else 0) |
                   (1 << 9 if i == n - 1 else 0))
     return [qt.readl(base + 0x10) & 0xFF for i in range(qt.readl(base + 0x78))]
+
+
+def pdma_chan(qt, ch, dsa, dta, dtc, drt, dcm):
+    """a channel without descriptors (NDES), started at once"""
+    c = PDMA + 0x20 * ch
+    qt.writel(c + 0x10, 0)
+    qt.writel(c + 0x00, dsa)
+    qt.writel(c + 0x04, dta)
+    qt.writel(c + 0x08, dtc)
+    qt.writel(c + 0x0C, drt)
+    qt.writel(c + 0x14, dcm)
+    qt.writel(c + 0x10, (1 << 31) | 1)
+
+
+def test_i2c_dma(qt):
+    """DW_apb_i2c DMA handshake: GC2053 at 0x37 on I2C0, PDMA 0x24/0x25"""
+    print('ingenic-i2c DMA (PDMA requests 0x24 / 0x25)')
+    qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
+    qt.writel(I2C0 + 0x6C, 0)
+    qt.writel(I2C0 + 0x04, 0x37)
+    qt.writel(I2C0 + 0x8C, 0)                   # DMATDLR
+    qt.writel(I2C0 + 0x90, 0)                   # DMARDLR: a byte requests
+    qt.writel(I2C0 + 0x6C, 1)
+    qt.writel(I2C0 + 0x88, 3)                   # RDMAE | TDMAE
+    cmds, rx = SCRATCH + 0x3000, SCRATCH + 0x3100
+    qt.write(rx, bytes(4))
+    # the ID read: register 0xF0, then two reads (restart, then stop)
+    qt.write(cmds, struct.pack('<3H', 0xF0, 0x100 | 0x400, 0x100 | 0x200))
+    sp16 = (2 << 14) | (2 << 12) | (2 << 8)     # 16-bit ports and units
+    sp8 = (1 << 14) | (1 << 12) | (1 << 8)      # 8-bit
+    pdma_chan(qt, 4, I2C0 + 0x10, rx, 2, 0x25, (1 << 22) | sp8)
+    pdma_chan(qt, 3, cmds, I2C0 + 0x10, 3, 0x24, (1 << 23) | sp16)
+    check('three commands out, two bytes in, both channels done',
+          ((qt.readl(PDMA + 0x60 + 0x10) >> 3) & 1,
+           (qt.readl(PDMA + 0x80 + 0x10) >> 3) & 1), (1, 1))
+    check('the GC2053 ID by DMA', list(qt.read(rx, 2)), [0x20, 0x53])
+    check('the RX FIFO drained by the reads', qt.readl(I2C0 + 0x78), 0)
+    # a register written by DMA, read back by PIO
+    qt.write(cmds, struct.pack('<2H', 0x80, 0x5A | 0x200))
+    pdma_chan(qt, 3, cmds, I2C0 + 0x10, 2, 0x24, (1 << 23) | sp16)
+    check('a write by DMA lands', i2c_read_reg(qt, I2C0, 0x37, 0x80), [0x5A])
+    # RX requests wait for DMARDLR + 1 bytes
+    qt.writel(I2C0 + 0x88, 1)
+    qt.writel(I2C0 + 0x90, 1)
+    qt.write(rx, bytes(4))
+    pdma_chan(qt, 4, I2C0 + 0x10, rx, 2, 0x25, (1 << 22) | sp8)
+    qt.writel(I2C0 + 0x10, 0xF0)
+    qt.writel(I2C0 + 0x10, 0x100 | 0x400)
+    check('one byte under DMARDLR + 1: no request', list(qt.read(rx, 2)),
+          [0, 0])
+    qt.writel(I2C0 + 0x10, 0x100 | 0x200)
+    check('the second byte: both move', list(qt.read(rx, 2)), [0x20, 0x53])
+    qt.writel(I2C0 + 0x88, 0)
+    qt.writel(I2C0 + 0x6C, 0)
 
 
 def test_isp(qt):
@@ -2964,6 +3093,7 @@ def main():
         test_i2c(qt)
         test_rtc_efuse(qt)
         test_sadc(qt)
+        test_sadc_dma(qt)
         test_sound(qt)
         test_dmic(qt)
         test_dmic_trigger(qt)
@@ -2972,6 +3102,7 @@ def main():
         test_dtrng(qt)
         test_aes(qt)
         test_hash(qt)
+        test_hash_cpu(qt)
         test_rsa(qt)
         test_usbphy(qt)
         qt.close()
@@ -3003,6 +3134,7 @@ def main():
         test_dtrng(qt, CORE_INTC)
         test_aes(qt, CORE_INTC)
         test_hash(qt, CORE_INTC)
+        test_hash_cpu(qt, CORE_INTC)
         test_rsa(qt)
         test_des(qt)
         qt.close()
@@ -3020,6 +3152,7 @@ def main():
 
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp(qt)
+        test_i2c_dma(qt)
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp_stats(qt)

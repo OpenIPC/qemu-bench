@@ -47,7 +47,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
 | 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride, paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
-| 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c) | `ingenic-i2c` |
+| 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c), PDMA requests 0x24 + 2 n / 0x25 + 2 n | `ingenic-i2c` |
 | 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
 | 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
 | 0x12200000 | CCU: core reset/entry, mailboxes → IP3 (XBurst2) | `ingenic-ccu` |
@@ -76,7 +76,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x130A0000 | T40, T41: bus MONITOR (AXI/AHB bandwidth and address watch), IRQ 53 | `ingenic-monitor` |
 | 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
 | 0x13090000 | T40: BSCALER, the NNA's image engine (resize / affine / perspective, NV12 to colour), IRQ 40 (T) / 39 (C) (`/machine/bscaler`) | `ingenic-bscaler` |
-| 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18 (`/machine/sadc`) | `ingenic-sadc` |
+| 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18, PDMA request 9 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
 | 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12 (`/machine/dmic`) | `ingenic-dmic` |
@@ -660,7 +660,13 @@ loads `tx-isp-t41.ko` without `direct_mode`.
 - `ingenic-i2c`: a DW_apb_i2c master moving each command at once; an
   address no device answers aborts with TXABRT bit 0, and ENSTA follows
   ENB (both drivers wait for it). The image sensor (`sensor=`) is on
-  I2C0.
+  I2C0. DMA follows the DW_apb_i2c handshake on DMACR (0 RDMAE, 1 TDMAE),
+  DMATDLR and DMARDLR (0x88..0x90, named in both vendor drivers, which
+  only print them): the TX request is up while TDMAE is set (commands
+  leave at once, so the TX FIFO never passes DMATDLR); the RX request
+  rises once the RX FIFO holds more than DMARDLR bytes and stays up for a
+  burst of DMARDLR + 1 DATA_CMD reads. No driver here moves I2C data by
+  DMA, so this is checked by qtest only.
 - `ingenic-rtc`: WRDY always set, WEN after the 0xA55A unlock (the
   power-off path waits for both without a timeout), seconds from the
   host's clock, HCR.PD powers off.
@@ -673,6 +679,13 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   (write 1 to clear), interrupting unless CTRL masks it. Each pin's level
   is the `auxN` property (raw 0..4095, 1.8 V full scale; mid-scale by
   default), settable at run time: `qom-set /machine/sadc aux0 1234`.
+  DMA is inferred: `jz_adc.h` names ADCFG bit 15 DMA_EN and every request
+  table has SADC_RX (9), but no driver uses either. With DMA_EN the
+  enabled channels convert continuously (ENA keeps its bits, a scan every
+  20 us); each scan queues a word per channel pair with an enabled
+  channel (AUX1:AUX0, AUX3:AUX2, ... as the data registers hold them) at
+  the 0x10 port, read 32 bits at a time; request 9 is up while the queue
+  (8 words) holds one, and a full queue drops the scan.
 - `ingenic-pwm`: T41's PWM block (`pwm-ingenic.c`, 4.4): ENS/ENC over EN,
   WCFG taken on UPDATE, BUSYR clear, LVL and OEN; DMA mode is storage.
   `qom-get /machine/pwm chan2` reads a pin as `high/period` cycles or a
@@ -846,13 +859,18 @@ loads `tx-isp-t41.ko` without `direct_mode`.
     padded, by DMA (HSTC in 64-byte units), the state carried across
     runs until HSCR bit 4 reloads it; HSDO gives the digest four bytes at
     a time as little-endian words (what the 4.4 driver hands its
-    self-tests). HSDI (CPU mode) is not modelled: no driver or sample in
-    any tree here feeds it (the 4.4 driver defines HASH_FLAGS_CPU and
-    never uses it; `sample_hash` only prints HSDI; no U-Boot uses
-    HASH_BASE; none of the 51 vendor PDFs describes the block), so how a
-    written word's bytes enter the block (HSCR bits 8:7 pick a byte order
-    whose meaning for HSDI is not documented), how many words make a
-    round and what then signals is not known.
+    self-tests). HSDI (CPU mode) is inferred: no driver or sample in any
+    tree here feeds it (the 4.4 driver defines HASH_FLAGS_CPU and never
+    uses it; `sample_hash` only prints HSDI; no U-Boot uses HASH_BASE;
+    none of the 51 vendor PDFs describes the block). It is modelled as
+    the DMA path fed by the CPU: with the engine on and DMA off, each
+    HSDI word is four message bytes in memory order (a load from the
+    DMA's buffer), each 64 bytes (128 for SHA-384/512) run a block and
+    raise HSSR bit 0, and after HSTC 64-byte units bit 1, as a DMA run
+    ends; loading the state empties a part-filled block. HSCR bits 8:7
+    (byte order) are acted on in neither mode: the 4.4 driver sets 3 for
+    SHA and 0 for MD5, `sample_hash` 1 for SHA and 2 for MD5, and both
+    expect the standard digest.
   - `ingenic-rsa`: M^E mod N, 1024 or 2048 bits (RSAC bit 7); operands
     written most significant word first, the result read least
     significant first -- the order the sample's own `test_rsa.h` vectors
@@ -892,14 +910,17 @@ transfers.
   type 8 (AUTO) is a memory copy done at once; the others wait on the
   peripheral's request line for every access to it: the AIC's 6 (play),
   7 (record) and 5 (loop record, the echo canceller's reference), the
-  DMIC's 13, the UARTs' 0x14 - 2 n (TX) / 0x15 - 2 n (RX), the SSIs' and
-  the DES's (below). The bus decodes 29 address bits: an address 0x20000000
+  DMIC's 13, the UARTs' 0x14 - 2 n (TX) / 0x15 - 2 n (RX), the SADC's 9,
+  the I2Cs' 0x24 + 2 n (TX) / 0x25 + 2 n (RX), the SSIs' and the DES's
+  (below). The bus decodes 29 address bits: an address 0x20000000
   high still reaches DDR -- `jz_uart.c` maps its uncached (KSEG1) receive
   buffers through virt_to_phys, as T41's SFC driver does its descriptors.
   Of the request types the drivers' tables list, the MSC moves its data by
   its own descriptor DMA (`jzmmc_v12.c`'s SDMA, above), no driver gives
   the I2C (`i2c-v12-jz.c` only prints DMACR / DMATDLR / DMARDLR), the SADC
-  or the SSI slave a channel, and there is no PCM driver.
+  or the SSI slave a channel -- the I2C and SADC sides are modelled anyway
+  (above), the SSI slave has no register map -- and there is no PCM
+  driver.
 - `ingenic-aic`: AICFR (ENB, RST), AICCR (EREC/ERPL, the flushes, M2S,
   MONOCTR, TDMS/RDMS, ISS/OSS, TLDMS/ETFL, CHANNEL, PACK16), AICSR (levels,
   TUR/ROR), AICDR and AICLR over the hardware's FIFOs (64 to play, 32 to
@@ -1625,6 +1646,7 @@ teardown, so the verdict comes first.
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | T41NQ SDK image + SDK `libimp.a`, `--ivpu` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --codecs jpeg --ivpu` | JPEG channels with `IMP_ENC_TPYE_IVPU` on the HELIX JPEG engine through `/dev/soc_vpu`: 2560x1440 and 640x360 pictures decode cleanly and show the scene |
 | `t41` / `t40` qtest | `t41`, `t40` | `test-ingenic.py` `test_dpu` | the DPU composes an RGB565 background, a half-transparent ARGB8888 square and an NV12 layer scaled 2x onto the display (screendump pixels), raises CMP_START / layer ends / CMP_END / DISP_END on IRQ 20, stops on the descriptor's stop bit, loops a chain and ends it with a general stop |
+| `t31` / `t41` qtest | `t31`, `t41`, `t31,sensor=gc2053` | `test-ingenic.py` `test_hash_cpu`, `test_i2c_dma`, `test_sadc_dma` | the HASH engine fed by HSDI gives hashlib's MD5, SHA-1/224/256/384/512 for one- and multi-block messages, with round and all-rounds done; the GC2053's ID read and a register write by PDMA through I2C0 (requests 0x24 / 0x25), the RX request waiting for DMARDLR + 1 bytes; the SADC's continuous scans landing in a PDMA ring as AUX1:AUX0 / AUX3:AUX2 words (request 9) -- CPU mode and the SADC's DMA inferred, see above |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
 | OpenIPC T31 kernel with `CONFIG_SERIAL_JZ47XX_UART0_DMA` + the release's root | `t31`, UART0 on a socket | `-kernel` + NOR root, `test-ingenic-uart-dma.sh --kernel` | 32 KiB of random bytes in on ttyS0 by the PDMA (32 full 1 KiB buffers, 3 of 3 runs) and back out by it, both intact |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
@@ -1657,10 +1679,8 @@ its Apical base; above), the placement of the two pictures in T40's
 joint mode and the VIC raw frame channel (above), the 160 values of
 T40/T41's WDR statistics at +1368, a WDR mode on T23 (no modelled sensor
 has one there), T40's GSM and LCE (read otherwise
-than T41's), the Apical DIS's motion vectors (zero: no motion), DMA for the I2C,
-the SADC and the SSI slave (no driver programs it; above), the SSI
-slave and the HASH engine's CPU mode (no
-driver, sample or document in any tree here, so no contract; above),
+than T41's), the Apical DIS's motion vectors (zero: no motion), the
+SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
 T41's lens distortion correction (below)
