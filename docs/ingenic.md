@@ -1534,8 +1534,11 @@ it the T23 AE hunted: with the GC2053's steps some 1.18x apart it ran
 analogue 2272/256 with digital 1.21x, saw the picture too dark, stepped
 to 2683/256 with 1.0x, saw it too bright, and flipped between the two
 every 5 frames; with it, it settles (2283/256 held for 153 frames of a
-200-frame run). T21 writes its digital gain to 0x408 / 0x40C (not
-applied); T40 and T41 apply theirs elsewhere and converge as they are.
+200-frame run). T21's `tisp_ae_process_impl` packs its digital gain
+the same way and writes it to 0x408 / 0x40C (G in 0x408's top half),
+which the light takes too: its AE then holds 129/256 at a mean of 8
+from frame 65 on. T40 and T41 apply theirs elsewhere and converge as
+they are.
 The painted scene counts as display light (gamma 2.2): the exposure
 scales its linear light, white clips, and the picture is gamma-encoded
 again, so a longer exposure lifts the navy while the logo stays white.
@@ -1935,11 +1938,16 @@ saves more: the later frames match the earlier remapped on the host from
 the same registers (95 % of pixels identical, against 157 levels apart
 without the remap). T40's module writes the same registers through
 `tisp_hldc_con_par_cfg` -- the main pipe's at (0x2A0 << 7) = 0x15000, its
-second pipe's at 0x15080 (not applied: the model corrects the main pipe)
--- and the same bypass bit 20; `/dev/tisp` reaches it as module 20 (T41:
-21), the pipe in word 3 and the 16 halfwords from word 4 (T41: from
-word 3). `--ldc` on T40 passes the same way (100 % of the sampled pixels
-within 0 of the host's remap, against 111 levels without it).
+second pipe's at 0x15080 -- and the same bypass bit 20; `/dev/tisp`
+reaches it as module 20 (T41: 21), the pipe in word 3 and the 16
+halfwords from word 4 (T41: from word 3). `--ldc` on T40 passes the same
+way (100 % of the sampled pixels within 0 of the host's remap, against
+111 levels without it). The second pipe's stage is the main one's at
++0x80, with its module bypasses at 0x44 (`tisp_s_module_control`:
+(pipe + 16) << 2) and its sensor picture at 0x84 (`tisp_sec_init`), and
+corrects pipe 1's channels the same way: `--sensor1 gc4653 --ldc K1,K2`
+sets both pipes and checks channels 0 and 3 against the host's remap
+(95 % within 0 on both, against 111 levels without it).
 
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
@@ -2041,10 +2049,29 @@ instead of by picture size, which mixed the two sensors' P pictures.
 `test-ingenic-t23-enc.sh --sensor1 gc2053s1`: four H.264 streams (each
 sensor's 1080p and 640x360), every picture decoded with no decoder
 message, the first and last of each showing its sensor's scene (counter
-ranges 0.. and 500000..). The firmware's "double direct" mode
-(`direct_mode=2`, both main streams into the IVDC) does not stream: the
-second sensor's passes get no IVDC buffer on channel 0 and the ISR logs
-"vb is null, buf get:0x80000000 ... isp_index = 1". The firmware also
+ranges 0.. and 500000..). In the firmware's "double direct" mode
+(`direct_mode=2`, both main streams into the IVDC) the IVDC's ISR
+(`ivdc_core_interrupt_service_routine`, status bit 17) hands the
+picture in its store, the fixed pair 0x80000000 / 0x81000000, to
+framesource `vi_num` -- the pass's sensor until the core ISR's pass end
+moves `vi_num` on. The model raised both at once; the core's line
+(INTC 37) is taken before the IVDC's (46), so every IVDC picture went to
+the other sensor's framesource ("vb is null, buf get:0x80000000 ..."; the
+"isp_index" it prints is an unset field). A pass into the IVDC now
+pulses the IVDC's frame done first and raises the core's status bits
+and the pass end together 0.5 ms later; passes without the IVDC keep
+the channels' done and the pass end in one interrupt, which the
+firmware needs (apart, its ISR requeues the channel's buffer to the
+sensor before it switches). The first sensor's main stream then streams
+in double direct mode (`--sensor1 gc2053s1 --direct 2`: stream 0 decodes
+10 of 10 pictures, as do both sub-streams). The second sensor's
+(framesource 3) still does not: libimp never queues a buffer on it
+(`/proc/jz/isp/isp-fs`: queue count 0, every buf_qcnt 0) although it
+configures the channel for the IVDC (`enc_chn->index=1, direct_mode =
+2`) and the kernel's queue path (`ispcore_pad_event_handle`) rewrites
+both channel 0's and channel 3's buffers to the IVDC pair in this mode;
+where libimp's `IMP_FrameSource_EnableChn` skips the channel's fill was
+not found. The firmware also
 writes ISP offsets 0x20000-0x7FFFF (LUTs beyond the 64 KiB window,
 dropped).
 
@@ -2243,8 +2270,9 @@ has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's TLB retry / verification registers
-(storage), T40's second pipe's HLDC, T41's LDC block (below), T23's double firmware's double
-direct mode (`direct_mode=2`; above)
+(storage), T41's LDC block (below), the second sensor's main stream in
+T23's double direct mode (`direct_mode=2`: libimp queues it no buffer;
+above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the

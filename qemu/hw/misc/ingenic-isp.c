@@ -192,7 +192,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * channel-stop poll on 0x2308, the VIC's status/mask/ack at
          * 0x100/0x104/0x108 (ISR 0xe5c); DVP only, no CSI.
          */
-        .name = "t21", .isp_size = 0x10000,
+        .name = "t21", .isp_size = 0x10000, .dgain = 0x408,
         .int_en = 0x80, .int_sta = 0x84, .int_clr = 0x88,
         .ch_base = 0x2400, .ch_en = 0x2304, .ch_busy = 0x2308,
         .osize = 0x00, .csize = 0x2C, .push_y = 0x6C, .push_uv = 0x84,
@@ -359,6 +359,9 @@ struct IngenicIspState {
     Object *sensor1;            /* T40: the second pipe's sensor; T23:
                                    the double firmware's second one */
     uint8_t dual_src;           /* T23 double: the sensor of this pass */
+    uint8_t dual_pass_end;      /* T23 double: a pass ended, not yet told */
+    uint32_t dual_sta;          /* ... and its core status bits */
+    uint8_t dual_half;          /* T23 double: a pass's picture is out */
     Object *sensor2;            /* T40: the third sensor, on VIC2 */
     const IngenicIspLayout *l;
 
@@ -381,7 +384,7 @@ struct IngenicIspState {
         uint32_t key[8];
         int32_t *xy;            /* source x, y per pixel, 1/256 pixel */
         uint32_t n;
-    } hldc_map[2];
+    } hldc_map[2][2];           /* by pipe, then plane */
     uint8_t *hldc_buf;
     uint32_t hldc_buf_size;
     /*
@@ -1955,8 +1958,10 @@ static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
  * of tx-isp-t41.ko H20230630a; on while the module bypasses at 0x40 have
  * bit 20 -- IMPISPModuleCtl.bitBypassHLDC -- clear).  T40's module writes
  * the same registers through tisp_hldc_con_par_cfg, the main pipe's at
- * (0x2A0 << 7) = 0x15000 and its second pipe's at 0x15080 (not applied
- * here: the model corrects the main pipe only).  tisp_hldc_write_reg
+ * (0x2A0 << 7) = 0x15000 and its second pipe's at 0x15080; that pipe's
+ * module bypasses are at 0x44 ((pipe + 16) << 2, tisp_s_module_control)
+ * and its sensor picture at 0x84 (tisp_sec_init), so pipe p's stage is
+ * the same at +0x80 p, +4 p, +4 p.  tisp_hldc_write_reg
  * writes, from 16 halfwords p[] (the tuning's, or /dev/tisp's module 21):
  *
  *   0x15000  p1 << 16 | p0         (1, 1 from every tuning: stored)
@@ -1984,22 +1989,27 @@ static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
 #define HLDC_BASE       0x15000
 #define HLDC_BYPASS     (1u << 20)
 
-static bool ingenic_isp_hldc_on(IngenicIspState *s)
+#define HLDC_REG(p, o)  (HLDC_BASE + 0x80 * (p) + (o))
+#define HLDC_TOP(p)     (T41_TOP + 4 * (p))
+#define HLDC_SIZE(p)    (0x80 + 4 * (p))
+
+static bool ingenic_isp_hldc_on(IngenicIspState *s, int p)
 {
-    return s->l->hldc && ISP_REG(T41_TOP) && !(ISP_REG(T41_TOP) & HLDC_BYPASS) &&
-           (ISP_REG(HLDC_BASE + 4) || ISP_REG(HLDC_BASE + 8)) &&
-           ISP_REG(0x80);
+    return s->l->hldc && ISP_REG(HLDC_TOP(p)) &&
+           !(ISP_REG(HLDC_TOP(p)) & HLDC_BYPASS) &&
+           (ISP_REG(HLDC_REG(p, 4)) || ISP_REG(HLDC_REG(p, 8))) &&
+           ISP_REG(HLDC_SIZE(p));
 }
 
-/* The map of plane @uv (0 luma, 1 chroma) of a w x h channel */
-static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int uv,
+/* The map of pipe @p's plane @uv (0 luma, 1 chroma) of a w x h channel */
+static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int p, int uv,
                                            uint32_t w, uint32_t h)
 {
-    uint32_t sw = ISP_REG(0x80) >> 16, sh = ISP_REG(0x80) & 0xFFFF;
-    uint32_t k = ISP_REG(HLDC_BASE + 4 + 4 * uv);
-    uint32_t zoom = ISP_REG(HLDC_BASE + 0xC + 4 * uv);
-    uint32_t inv = ISP_REG(HLDC_BASE + 0x14 + 4 * uv);
-    uint32_t off = ISP_REG(HLDC_BASE + 0x1C + 4 * uv);
+    uint32_t sw = ISP_REG(HLDC_SIZE(p)) >> 16, sh = ISP_REG(HLDC_SIZE(p)) & 0xFFFF;
+    uint32_t k = ISP_REG(HLDC_REG(p, 4 + 4 * uv));
+    uint32_t zoom = ISP_REG(HLDC_REG(p, 0xC + 4 * uv));
+    uint32_t inv = ISP_REG(HLDC_REG(p, 0x14 + 4 * uv));
+    uint32_t off = ISP_REG(HLDC_REG(p, 0x1C + 4 * uv));
     uint32_t key[8] = { w, h, sw, sh, k, zoom, inv, off };
     double k1 = (int16_t)k, k2 = (int16_t)(k >> 16), z = zoom / 2048.0;
     /* the plane's sensor size: a chroma plane is half the picture */
@@ -2011,10 +2021,11 @@ static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int uv,
     uint32_t n = (uint32_t)cw * (uint32_t)ch, x, y;
     int32_t *m;
 
-    if (!memcmp(s->hldc_map[uv].key, key, sizeof(key)) && s->hldc_map[uv].xy) {
-        return s->hldc_map[uv].xy;
+    if (!memcmp(s->hldc_map[p][uv].key, key, sizeof(key)) &&
+        s->hldc_map[p][uv].xy) {
+        return s->hldc_map[p][uv].xy;
     }
-    m = g_renew(int32_t, s->hldc_map[uv].xy, 2 * n);
+    m = g_renew(int32_t, s->hldc_map[p][uv].xy, 2 * n);
     for (y = 0; y < (uint32_t)ch; y++) {
         for (x = 0; x < (uint32_t)cw; x++) {
             double dx = (x + 0.5) * sx - 0.5 - cx;
@@ -2028,22 +2039,23 @@ static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int uv,
             m[2 * (y * (uint32_t)cw + x) + 1] = lround(uy * 256);
         }
     }
-    memcpy(s->hldc_map[uv].key, key, sizeof(key));
-    s->hldc_map[uv].xy = m;
-    s->hldc_map[uv].n = n;
+    memcpy(s->hldc_map[p][uv].key, key, sizeof(key));
+    s->hldc_map[p][uv].xy = m;
+    s->hldc_map[p][uv].n = n;
     return m;
 }
 
 /*
- * Plane @uv of the w x h picture at @addr (stride @stride) through the
+ * Plane @uv of pipe @p's w x h picture at @addr (stride @stride) through the
  * HLDC: luma bytes, or chroma Cb/Cr pairs moved as units
  */
-static void ingenic_isp_hldc_plane(IngenicIspState *s, int uv, uint32_t w,
-                                   uint32_t h, int32_t stride, hwaddr addr)
+static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
+                                   uint32_t w, uint32_t h, int32_t stride,
+                                   hwaddr addr)
 {
     uint32_t cw = uv ? w / 2 : w, ch = uv ? h / 2 : h, bpp = uv ? 2 : 1;
     uint32_t row = cw * bpp, x, y, c;
-    const int32_t *m = ingenic_isp_hldc_map(s, uv, w, h);
+    const int32_t *m = ingenic_isp_hldc_map(s, p, uv, w, h);
     uint8_t *src, *dst;
 
     stride = stride ? stride : (int32_t)w;
@@ -2092,6 +2104,8 @@ static void ingenic_isp_hldc_plane(IngenicIspState *s, int uv, uint32_t w,
  * tell themselves from pipe 0's.
  */
 #define PIPE1_FRAME     500000
+/* T23 double: the pass end this long after its channels' done */
+#define DUAL_PASS_END_NS (500 * SCALE_US)
 
 static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
 {
@@ -2102,6 +2116,8 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
     hwaddr int_sta = PIPE_INT(p, l->int_sta);
     uint32_t *vic = ingenic_vic_regs(s, p);
+    uint32_t sta_before = ISP_REG(int_sta);
+    bool to_ivdc = false;
     int n;
 
     ISP_REG(int_sta) |= l->fs_bit;
@@ -2124,11 +2140,12 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         ya = fifo_pop(&c->y, NULL);
         uva = fifo_pop(&c->uv, NULL);
         ivdc = ya == IVDC_Y;
+        to_ivdc |= ivdc;
         ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
                           r[l->uvstride >> 2], ya, uva, false, gain, sgain);
-        if (p == 0 && ingenic_isp_hldc_on(s)) {
-            ingenic_isp_hldc_plane(s, 0, w, h, r[l->ystride >> 2], ya);
-            ingenic_isp_hldc_plane(s, 1, w, h, r[l->uvstride >> 2], uva);
+        if (ingenic_isp_hldc_on(s, p)) {
+            ingenic_isp_hldc_plane(s, p, 0, w, h, r[l->ystride >> 2], ya);
+            ingenic_isp_hldc_plane(s, p, 1, w, h, r[l->uvstride >> 2], uva);
         }
         if (ivdc) {
             /* a picture into the IVDC's store (RAM at IVDC_Y) */
@@ -2171,22 +2188,71 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
          * (tisp_rcfg_cfg_trig, vi_num = count & 1), queues that sensor's
          * buffers and enables its channels, and the next picture is the
          * other sensor's.  Which sensor a pass takes is in no register the
-         * driver writes: the two simply alternate, as its count does
+         * driver writes: the two simply alternate, as its count does.
+         *
+         * A pass into the IVDC (double direct mode) is told in two steps:
+         * the IVDC's frame done now, the core's status bits and the pass
+         * end a little later (ingenic_isp_frame).  The IVDC's ISR
+         * (ivdc_core_interrupt_service_routine) hands the frame in its
+         * store to framesource vi_num, which the core ISR's pass end then
+         * moves on to the next sensor: told at the same moment, the core's
+         * line (INTC 37) is taken first and every IVDC picture went to the
+         * other sensor's framesource.  Without the IVDC the channels' done
+         * and the pass end come together, as that firmware's ISR expects
+         * (it requeues a channel's buffer to the pass's sensor otherwise)
          */
-        ISP_REG(l->sta2) |= 1u << 15;
-        s->dual_src ^= 1;
+        if (to_ivdc) {
+            s->dual_sta = ISP_REG(int_sta) & ~sta_before;
+            ISP_REG(int_sta) = sta_before;
+            s->dual_pass_end = 1;
+        } else {
+            ISP_REG(l->sta2) |= 1u << 15;
+            s->dual_src ^= 1;
+        }
     }
 }
 
 static void ingenic_isp_frame(void *opaque)
 {
     IngenicIspState *s = opaque;
+    bool dual = ingenic_isp_dual(s) && ingenic_isp_pipe_running(s, 0);
     int p;
 
+    if (dual && s->dual_half) {
+        /*
+         * T23's double firmware: the pass end (sta2 bit 15) a little after
+         * the channels' done and the IVDC's.  The IVDC's ISR
+         * (ivdc_core_interrupt_service_routine) hands the frame in its
+         * store to framesource vi_num, which the core ISR's pass end then
+         * moves on to the next sensor: told at the same moment, the core's
+         * line (INTC 37) was taken first and in double direct mode every
+         * IVDC picture went to the other sensor's framesource
+         */
+        if (s->dual_pass_end) {
+            ISP_REG(s->l->int_sta) |= s->dual_sta;
+            ISP_REG(s->l->sta2) |= 1u << 15;
+            s->dual_src ^= 1;
+            s->dual_pass_end = 0;
+            s->dual_sta = 0;
+        }
+        s->dual_half = 0;
+        s->frame++;
+        ingenic_isp_update(s);
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  ingenic_isp_period(s) - DUAL_PASS_END_NS);
+        return;
+    }
     for (p = 0; p < ingenic_isp_pipes(s); p++) {
         if (ingenic_isp_pipe_running(s, p)) {
             ingenic_isp_pipe_frame(s, p);
         }
+    }
+    if (dual && s->dual_pass_end) {
+        s->dual_half = 1;
+        ingenic_isp_update(s);
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  DUAL_PASS_END_NS);
+        return;
     }
     if (s->l->pipes > 1 && s->vic2_running) {
         /*
@@ -2543,6 +2609,9 @@ static void ingenic_isp_reset(DeviceState *dev)
     s->vic1_running = false;
     s->vic2_running = false;
     s->dual_src = 0;
+    s->dual_half = 0;
+    s->dual_pass_end = 0;
+    s->dual_sta = 0;
     memset(s->mdma_slot, 0, sizeof(s->mdma_slot));
     s->frame = 0;
     for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
@@ -2684,7 +2753,7 @@ static const VMStateDescription vmstate_ingenic_isp_chan = {
 
 static const VMStateDescription vmstate_ingenic_isp = {
     .name = TYPE_INGENIC_ISP,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .post_load = ingenic_isp_post_load,
     .fields = (const VMStateField[]) {
@@ -2707,6 +2776,9 @@ static const VMStateDescription vmstate_ingenic_isp = {
         VMSTATE_BOOL_V(vic2_running, IngenicIspState, 4),
         VMSTATE_UINT8_ARRAY_V(mdma_slot, IngenicIspState, 3, 4),
         VMSTATE_UINT8_V(dual_src, IngenicIspState, 5),
+        VMSTATE_UINT8_V(dual_half, IngenicIspState, 6),
+        VMSTATE_UINT8_V(dual_pass_end, IngenicIspState, 6),
+        VMSTATE_UINT32_V(dual_sta, IngenicIspState, 6),
         VMSTATE_TIMER_PTR(timer, IngenicIspState),
         VMSTATE_END_OF_LIST()
     },

@@ -321,6 +321,18 @@ static int snap_ldc(int w, int h)
         printf("isp-snap: /dev/tisp LDC parameters failed\n");
         return -1;
     }
+#ifdef SNAP_TISP_T40
+    /* two sensors: the second pipe's stage (0x15080) the same way */
+    if (getenv("SNAP_SENSOR1")) {
+        par[3] = 1;
+        if (ioctl(fd, TISP_SET_PAR, par) < 0) {
+            printf("isp-snap: /dev/tisp LDC parameters (pipe 1) failed\n");
+            close(fd);
+            return -1;
+        }
+        printf("isp-snap: LDC parameters for pipe 1 too\n");
+    }
+#endif
     close(fd);
     printf("isp-snap: LDC k1 %d k2 %d: zoom %d / %d, inverse r2 %d / %d\n",
            k1, k2, y[1], uv[1], y[0], uv[0]);
@@ -332,21 +344,31 @@ static int snap_ldc(int w, int h)
  * The stage on (bitBypassHLDC clear) once the first frames are saved:
  * the host compares a picture without the correction with one through it
  */
-static void ldc_enable(void)
+static void ldc_enable_one(IMPVI_NUM vi)
 {
     IMPISPModuleCtl ctl;
 
-    ldc_pending = 0;
-    if (IMP_ISP_Tuning_GetModuleControl(IMPVI_MAIN, &ctl) < 0) {
-        printf("isp-snap: GetModuleControl failed\n");
+    if (IMP_ISP_Tuning_GetModuleControl(vi, &ctl) < 0) {
+        printf("isp-snap: GetModuleControl(%d) failed\n", (int)vi);
         return;
     }
     ctl.bitBypassHLDC = 0;
-    if (IMP_ISP_Tuning_SetModuleControl(IMPVI_MAIN, &ctl) < 0) {
-        printf("isp-snap: SetModuleControl failed\n");
+    if (IMP_ISP_Tuning_SetModuleControl(vi, &ctl) < 0) {
+        printf("isp-snap: SetModuleControl(%d) failed\n", (int)vi);
         return;
     }
-    printf("isp-snap: LDC on\n");
+    printf("isp-snap: LDC on (vi %d)\n", (int)vi);
+}
+
+static void ldc_enable(void)
+{
+    ldc_pending = 0;
+    ldc_enable_one(IMPVI_MAIN);
+#ifdef SNAP_TISP_T40
+    if (getenv("SNAP_SENSOR1")) {
+        ldc_enable_one(IMPVI_SEC);
+    }
+#endif
 }
 #else
 static int ldc_pending;

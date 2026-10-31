@@ -23,8 +23,9 @@
 # --sensor1 gc2053s1 loads the SDK's dual-sensor firmware: one ISP pipe
 # takes the two sensors' pictures in turn (docs/ingenic.md), four streams
 # (each sensor's 1080p and 640x360).  Its "double direct" mode (--direct
-# 2, both main streams through the IVDC) does not stream: the second
-# sensor's passes get no IVDC buffer on channel 0 (docs/ingenic.md).
+# 2, both main streams through the IVDC) streams the first sensor's main
+# stream and both sub-streams; the second sensor's main stream gets no
+# buffer from libimp (docs/ingenic.md), so that mode still fails.
 # The double firmware needs a 2.10 tuning file: OpenIPC's first T23
 # gc2053-t23.bin, fetched from its firmware repository (or BIN210=FILE).
 # QEMU_EXTRA in the environment adds QEMU options (its stderr goes to
@@ -250,7 +251,7 @@ grep -a -E "T23TEST|^stream[0-3] picture [0-9]*:|t23-enc:|failed" "$OUT/console.
 if ! grep -a "t23-enc: PASS" "$OUT/console.log" >/dev/null; then
     note=
     [ -n "$SENSOR1" ] && [ "$DIRECT" = 2 ] &&
-        note=" (the double firmware's double direct mode is not modelled)"
+        note=" (double direct: libimp queues the second sensor's main stream no buffer)"
     echo "FAIL: the client did not get its streams$note"
     exit 1
 fi
