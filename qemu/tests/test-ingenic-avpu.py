@@ -961,6 +961,128 @@ def test_hevc(qt, ff, tmp, libimp=False):
               (name, 'P' if k else 'I', worst), worst <= 4, True)
 
 
+def test_hevc_b(qemu, ff, tmp):
+    """HEVC B pictures (libimp's parameter sets; the command words as its
+    slice buffers would carry them, RefB at WA8): a pan coded I0 P2 B1 P4
+    B3, each slice header with its own RPS, slice_temporal_mvp_enabled_flag
+    0 in the B ones.  libimp's SPS has no reordering, so pictures come out
+    in decoding order: each must be the model's reconstruction sample for
+    sample, the B pictures near the source."""
+    print('HEVC B pictures, a pan (libimp\'s parameter sets, RefA / RefB)')
+    dump = os.path.join(tmp, 'hevc-b-dump')
+    os.makedirs(dump, exist_ok=True)
+    qt = QTest(qemu, 't31', ['-global', 'ingenic-avpu.dump=%s' % dump])
+    qp, beta, tc = 30, 5, -5
+    a = RAM + 0xC00000
+    recs = {t: a + 0x100000 + 0x10000 * t for t in range(5)}
+    interm, cl1, cl2 = a + 0x40000, a + 0x48000, a + 0x4C000
+    bs, bs_size = a + 0x200000, 0x80000
+    order = [(0, 2, None, None), (2, 1, 0, None), (1, 0, 0, 2),
+             (4, 1, 2, None), (3, 0, 2, 4)]
+    stream, off, sizes = b'', 0, {}
+    try:
+        qt.writel(AVPU + 0x14, 5)
+        for t, typ, r0, r1 in order:
+            y, uv = shifted(2 * t, t)
+            src = a + 0x10000 * (t & 1)
+            qt.write(src, y)
+            qt.write(src + PITCH * H, uv)
+            start = hevc_headers(W, H, beta, tc, True) if typ == 2 else b''
+            b = Bits()
+            b.u(1, 1)
+            if typ == 2:
+                b.u(0, 1)
+            b.ue(0); b.ue({2: 2, 1: 1, 0: 0}[typ])
+            if typ != 2:
+                b.u(t & 1023, 10)
+                b.u(0, 1); b.u(0, 1)            # an RPS of its own
+                if typ == 0:
+                    b.ue(1); b.ue(1)            # one before, one after
+                    b.ue(0); b.u(1, 1); b.ue(0); b.u(1, 1)
+                else:
+                    b.ue(1); b.ue(0); b.ue(1); b.u(1, 1)     # POC - 2
+                b.u(1 if typ == 1 else 0, 1)    # slice_temporal_mvp
+                b.u(0, 1)                       # num_ref_idx override
+                if typ == 0:
+                    b.u(0, 1)                   # mvd_l1_zero_flag
+                b.u(1, 1)                       # cabac_init_flag
+                b.ue(0)
+            b.se(qp - 26)
+            b.u(1, 1); b.u(0, 1); b.se(beta); b.se(tc); b.u(1, 1)
+            b.u(1, 1)
+            while len(b.b) % 8:
+                b.u(0, 1)
+            nalt = {2: 19, 1: 1, 0: 0}[typ]
+            before, n, tail = flush_header(
+                start + b'\x00\x00\x00\x01' + bytes([nalt << 1, 1]), b)
+            qt.write(bs + off, before)
+            hdr_off = off + len(before)
+            e1 = [0] * 128
+            e1[0] = (1 << 31) | (1 << 28) | (1 << 24) | (1 << 4)
+            e1[1] = (W // 8 - 1) | ((H // 8 - 1) << 12)
+            e1[2] = 1 << 8                      # cabac_init_flag
+            e1[4] = (beta & 31) | ((tc & 63) << 8)
+            e1[3] = (qp << 16) | (typ << 28)
+            e1[0x88 // 4] = PITCH
+            e1[0x80 // 4], e1[0x84 // 4] = src, src + PITCH * H
+            e1[0x90 // 4] = recs[t]
+            if r0 is not None:
+                e1[0xA0 // 4] = recs[r0]
+            if r1 is not None:
+                e1[0xA8 // 4] = recs[r1]
+            e1[0xCC // 4], e1[0xD0 // 4] = 0x8000, interm
+            qt.write(cl1, b''.join(v.to_bytes(4, 'little') for v in e1))
+            e2 = [0] * 128
+            e2[0] = 1 << 31
+            e2[0x70 // 4] = (qp << 16) | (typ << 28)
+            e2[0x78 // 4] = (5 * 3 - 1) | (n << 24)
+            e2[0x7C // 4] = tail
+            e2[0xE8 // 4] = interm
+            e2[0xF0 // 4], e2[0xF4 // 4], e2[0xF8 // 4] = bs, bs_size, hdr_off
+            e2[0xFC // 4] = ((bs_size - hdr_off) >> 5) << 5
+            qt.write(cl2, b''.join(v.to_bytes(4, 'little') for v in e2))
+            qt.writel(AVPU + 0x3E0, cl1)
+            qt.writel(AVPU + 0x3E4, 2)
+            qt.writel(AVPU + 0x3E0, cl2)
+            qt.writel(AVPU + 0x3E4, 8)
+            qt.step(1000000)
+            st = qt.readl(AVPU + 0x18)
+            check('hevc-b %s%d: Enc1 and Enc2 done' %
+                  ('IPB'[2 - typ] if typ else 'B', t), st & 5, 5)
+            qt.writel(AVPU + 0x18, st)
+            count = qt.readl(cl2 + 0x1E4) & 0x3FFFFFFF
+            sizes[t] = count
+            stream += qt.read(bs + off, hdr_off - off + count)
+            off = (hdr_off + count + 31) & ~31
+    finally:
+        qt.close()
+    print('  slice bytes: %s' % ', '.join('%s%d %d' % (
+        'IPB'[2 - typ] if typ else 'B', t, sizes[t])
+        for t, typ, _, _ in order))
+    path = os.path.join(tmp, 'hevc-b.h265')
+    open(path, 'wb').write(stream)
+    if not ff:
+        print('  SKIP: no ffmpeg')
+        return
+    rc, raw, errs = decode(ff, path, 'nv12')
+    fs = W * H * 3 // 2
+    check('hevc-b: five pictures decode without errors',
+          (rc, len(raw), errs), (0, 5 * fs, []))
+    rec = open(os.path.join(dump, 'avpu-%dx%d.h265.rec' % (W, H)),
+               'rb').read()
+    check('hevc-b: every picture is the model\'s reconstruction',
+          len(rec) >= 5 * fs and raw[:5 * fs] == rec[:5 * fs], True)
+    for i, (t, typ, _, _) in enumerate(order):
+        if typ:
+            continue
+        ref = luma(shifted(2 * t, t)[0])
+        p = raw[i * fs:i * fs + W * H]
+        e = sum((p[q] - ref[q]) ** 2 for q in range(W * H)) / (W * H)
+        psnr = 10 * math.log10(255 * 255 / max(e, 1e-9))
+        check('hevc-b B%d: luma PSNR %.1f dB against the source (>= 30)' %
+              (t, psnr), psnr >= 30, True)
+
+
 # the IJG luma / chroma tables at quality 75, natural order
 QL = [8, 6, 5, 8, 12, 20, 26, 31, 6, 6, 7, 10, 13, 29, 30, 28, 7, 7, 8, 12,
       20, 29, 35, 28, 7, 9, 11, 15, 26, 44, 40, 31, 9, 11, 19, 28, 34, 55,
@@ -1130,6 +1252,7 @@ def main():
         test_cavlc_change(args.qemu, ff, tmp)
         test_h264_slices(args.qemu, ff, tmp)
         test_h264_b(args.qemu, ff, tmp)
+        test_hevc_b(args.qemu, ff, tmp)
         test_rebased(args.qemu)
         test_t41(args.qemu, ff, tmp)
     finally:

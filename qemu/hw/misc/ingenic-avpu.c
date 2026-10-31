@@ -1367,17 +1367,39 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
         while (w.nbits) {
             avpu_wr_bits(&w, 0, 1);
         }
+        AvpuRef *ref1 = NULL;
+
         if (f->type != 2) {
             ref = avpu_ref_find(s, f->ref_key, f->w, f->h);
+        }
+        if (f->type == 0) {
+            /*
+             * B: L0 from RefA, L1 from RefB (WA8), every inter CU
+             * bi-predicted by AMVP -- what a slice header with one
+             * reference in each list, mvd_l1_zero_flag 0 and
+             * slice_temporal_mvp_enabled_flag 0 says (the model has no
+             * POCs to scale a temporal candidate by); libimp sends no B
+             */
+            ref1 = avpu_ref_find(s, f->ref1_key, f->w, f->h);
         }
         cap = (size_t)f->w * f->h * 2 + 1024;
         out = g_malloc(cap);
         /* the bytes must fit the room: again at a higher QP if not */
         for (;;) {
-            bits = hevc_enc_slice_data(&prm, f->w, f->h, f->qp, f->type != 2,
-                                       ref ? ref->hevc : NULL, recon,
-                                       f->y, f->w, f->h, f->w, f->uv,
-                                       f->w, out, cap);
+            if (f->type == 0) {
+                bits = hevc_enc_slice_data_b(&prm, f->w, f->h, f->qp,
+                                             ref ? ref->hevc : NULL,
+                                             ref1 ? ref1->hevc : NULL,
+                                             f->ref1_key == f->ref_key,
+                                             recon, f->y, f->w, f->h, f->w,
+                                             f->uv, f->w, out, cap);
+            } else {
+                bits = hevc_enc_slice_data(&prm, f->w, f->h, f->qp,
+                                           f->type != 2,
+                                           ref ? ref->hevc : NULL, recon,
+                                           f->y, f->w, f->h, f->w, f->uv,
+                                           f->w, out, cap);
+            }
             if (f->type == 2 || !room || bits + 256 <= room ||
                 prm.all_skip) {
                 break;
