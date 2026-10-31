@@ -102,7 +102,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicVpuState, INGENIC_VPU)
 #define VPU_JOB_NS          1000000
 #define VPU_CHAIN_MAX       65536
 #define VPU_MAX_DIM         4096
-#define VPU_NREFS           4
+#define VPU_NREFS           8
 
 /* the engine kinds */
 enum {
@@ -148,6 +148,8 @@ enum {
 #define R_EFE_SSAD          0x40108
 #define R_EFE_CQP_OFST      0x40120
 #define R_DBLK_GSTA         0x70070
+#define R_MCE_REF_Y         0x5006C         /* the reference MCE reads */
+#define R_DBLK_DST_Y        0x60008         /* where DBLK writes it */
 #define R_SDE_STAT          0x90000
 #define  SDE_STAT_BSEND     (1u << 1)
 #define R_SDE_BS_ADDR       0x90024         /* SDE_CFG4 */
@@ -191,6 +193,7 @@ enum {
 typedef struct VpuRef {
     int w, h;
     uint8_t *y, *uv;            /* the last source of this size, NV12 */
+    uint32_t addr;              /* where the chain had it reconstructed */
     uint64_t used;
 } VpuRef;
 
@@ -386,14 +389,34 @@ static void vpu_fetch_nv12(IngenicVpuState *s, uint32_t ya, uint32_t ca,
     }
 }
 
-static VpuRef *vpu_ref(IngenicVpuState *s, int w, int h, bool *fresh)
+/*
+ * The reference picture a job codes against, which then takes its
+ * reconstruction.  A stream's chain names the picture MCE reads (@ref,
+ * the reconstruction of its previous job) and where DBLK writes this
+ * job's (@recon): streams of the same size -- T23's double firmware
+ * encodes two 1080p and two 640x360 streams -- each keep their own
+ * reference by those addresses.  Without them (0) a picture is the
+ * last one of its size.
+ */
+static VpuRef *vpu_ref(IngenicVpuState *s, int w, int h, uint32_t ref,
+                       uint32_t recon, bool *fresh)
 {
     VpuRef *r, *lru = &s->refs[0];
     int i;
 
     for (i = 0; i < VPU_NREFS; i++) {
         r = &s->refs[i];
-        if (r->y && r->w == w && r->h == h) {
+        if (recon && r->y && r->w == w && r->h == h && ref &&
+            r->addr == ref) {
+            r->used = ++s->jobs;
+            r->addr = recon;
+            *fresh = false;
+            return r;
+        }
+    }
+    for (i = 0; i < VPU_NREFS; i++) {
+        r = &s->refs[i];
+        if (!recon && r->y && r->w == w && r->h == h) {
             r->used = ++s->jobs;
             *fresh = false;
             return r;
@@ -408,6 +431,7 @@ static VpuRef *vpu_ref(IngenicVpuState *s, int w, int h, bool *fresh)
     lru->h = h;
     lru->y = g_malloc0((size_t)w * h);
     lru->uv = g_malloc0((size_t)w * h / 2);
+    lru->addr = recon;
     lru->used = ++s->jobs;
     *fresh = true;
     return lru;
@@ -457,7 +481,9 @@ static void vpu_h264(IngenicVpuState *s)
                    vpu_reg(s, R_EFE_RAWC) + fst * 8 * cs,
                    ys, cs, w, h, EFE_PLANE(ctrl) == 3, y, uv);
     out = g_malloc(cap);
-    ref = vpu_ref(s, w, h, &fresh);
+    /* MCE's reference (0x5006C) and DBLK's destination (T23: 0x60008) */
+    ref = vpu_ref(s, w, h, p_slice ? vpu_reg(s, R_MCE_REF_Y) : 0,
+                  vpu_reg(s, R_DBLK_DST_Y), &fresh);
     if (p_slice && !fresh) {
         n = h264_slice_p_cabac(qp, cqp, 0, s->t8x8, &db, mbw, mbh, y, w, uv,
                                w, ref->y, ref->uv, out, cap, &st);
