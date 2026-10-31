@@ -882,6 +882,7 @@ static void vpu_h265(IngenicVpuState *s)
     const int ew = ROUND_UP(w, 8), eh = ROUND_UP(h, 8);
     const size_t cap = 4 * MiB;
     g_autofree uint8_t *y = NULL, *uv = NULL, *out = NULL;
+    HevcEncParams prm;
     size_t n;
 
     if (!w || !h || w > VPU_MAX_DIM || h > VPU_MAX_DIM || ys < w || cs < w) {
@@ -899,9 +900,25 @@ static void vpu_h265(IngenicVpuState *s)
     vpu_fetch_nv12(s, vpu_reg(s, R_RX_EFE_RAWY), vpu_reg(s, R_RX_EFE_RAWC), ys,
                    cs, w, h, false, y, uv);
     out = g_malloc(cap);
-    n = hevc_enc_slice_data(&s->hevc_prm, ew, eh, qp, p_slice,
-                            p_slice ? s->hevc_ref : NULL, s->hevc_recon,
-                            y, w, h, w, uv, w, out, cap);
+    /*
+     * A P picture that would take more than a byte a pixel (the room
+     * i265e leaves a picture is not in a register here) is coded again at
+     * a higher QP, at last with every CU skipped
+     */
+    prm = s->hevc_prm;
+    for (;;) {
+        n = hevc_enc_slice_data(&prm, ew, eh, qp, p_slice,
+                                p_slice ? s->hevc_ref : NULL, s->hevc_recon,
+                                y, w, h, w, uv, w, out, cap);
+        if (!p_slice || n <= (size_t)ew * eh || prm.all_skip) {
+            break;
+        }
+        if (prm.cu_qp >= 51) {
+            prm.all_skip = true;
+            continue;
+        }
+        prm.cu_qp = MIN((prm.cu_qp ? prm.cu_qp : qp) + 6, 51);
+    }
     if (n > cap) {
         qemu_log_mask(LOG_GUEST_ERROR, "ingenic-vpu: H.265 slice too big\n");
         n = cap;
@@ -1128,6 +1145,14 @@ static void vpu_realize(DeviceState *dev, Error **errp)
         .log2_ctb = 6, .log2_qg = 4, .sao = true, .sao_luma_only = true,
         .chroma_qp_offset = -3, .beta_offset_div2 = 0, .tc_offset_div2 = 0,
         .vui = true,
+        /*
+         * P pictures with real inter coding (hevc-enc-inter.c.inc), as
+         * i265e's SPS / PPS / slice headers say: no scaling lists, no
+         * temporal MVP, max_transform_hierarchy_depth_inter 0, no sign
+         * hiding, five_minus_max_num_merge_cand 3 (two merge candidates)
+         */
+        .inter = true, .scaling_list = false, .tmvp = false,
+        .trafo_depth_inter = 0, .max_merge_cand = 2, .sign_hiding = false,
     };
 }
 

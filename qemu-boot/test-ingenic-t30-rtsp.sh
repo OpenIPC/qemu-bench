@@ -109,10 +109,17 @@ for s in main second; do
     # no -t: a timed read stops at the wall clock; -frames counts pictures.
     # The pictures come back on stdout: a docker ffmpeg's daemon need not
     # see this host's files.
+    # The stream is copied first and decoded afterwards: decoding 1080p
+    # while pulling can fall behind, the server then drops packets, and a
+    # lost P picture breaks the ones that refer to it.
     $FFMPEG -hide_banner -v error -rtsp_transport tcp \
-        -i "rtsp://127.0.0.1:$PORT/$s" -err_detect explode \
-        -frames:v $((SECS * 25)) -f rawvideo -pix_fmt nv12 - \
+        -i "rtsp://127.0.0.1:$PORT/$s" -frames:v $((SECS * 25)) \
+        -c copy -f hevc - > "$WORK/$s.hevc" 2> "$WORK/$s.pull.log" || true
+    $FFMPEG -hide_banner -v error -err_detect explode -f hevc -i - \
+        -f rawvideo -pix_fmt nv12 - < "$WORK/$s.hevc" \
         > "$WORK/$s.nv12" 2> "$WORK/$s.ffmpeg.log" || true
+    # (the copy's own warnings -- non-monotonic DTS from the RTP
+    # timestamps -- stay in $s.pull.log)
     grep -v "^docker: bind sources" "$WORK/$s.ffmpeg.log" > "$WORK/$s.err" || true
     python3 - "$WORK" "$s" "$W" "$H" "$SECS" "$HERE/ingenic-isp-check.py" <<'EOF' || rc=1
 import importlib.util, os, sys
