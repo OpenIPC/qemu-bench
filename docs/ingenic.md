@@ -88,7 +88,8 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13480000 | HASH engine (MD5, SHA-1/2), IRQ 22 (T21, T23, T31, T40, T41) | `ingenic-hash` |
 | 0x134C0000 | RSA engine, 1024/2048 bits, polled (T23, T31, T40, T41) | `ingenic-rsa` |
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
-| 0x12660000 | XBurst2 on-chip RAM (64 KiB) | RAM |
+| 0x12600000 | XBurst2 ORAM, the NNA's memory (1 MiB; the T41 SPL's core-1 stub at 0x12660000) | RAM |
+| 0x12500000 | T40, T41: NNDMA, the NNA's DMA (descriptor RAM, channels at +0x8000) (`/machine/nndma`) | `ingenic-nndma` |
 | 0x80000000 | T41: the IVDC's frame store as `direct_mode` addresses it (32 MiB) | RAM |
 | 0x13200000 | T41: the IVDC's registers, core INTC 13 | `ingenic-ivdc` |
 | 0x1F000000 | cache-as-RAM window (32 KiB) | RAM |
@@ -174,6 +175,14 @@ through one of its pages for the rest of its life (a static T40 client's
 recordings were constant 0x7FFF or silence in about 40 % of runs) while
 the kernel read the right bytes for the same page. Without the shadows
 `tlbwr` drops the old entry as a real TLB does.
+
+XBurst2 answers `rdhwr` for hardware registers MIPS leaves undefined
+(`qemu/patches/0022-mips-xburst2-hwr.patch`, on CPUs with MXU3): `$4` is
+the physical address the last `ll` touched -- the vendor kernels turn user
+addresses into physical ones with `ll; rdhwr $4` -- and `$8`..`$10` /
+`$11`, `$12` wait for the NNA DMA's read / write channels, which Ingenic's
+libvenus does from user space. HWREna keeps bits 4 and 8..12 (the
+`soc-nna` driver's `open()` writes it all ones and sets Status.CU2).
 
 ## Identification
 
@@ -287,7 +296,7 @@ at 4 MiB with a UBIFS volume `rootfs`, `mtdparts=sfc0_nand:` on the
 command line (the 4.4 driver looks for the burner table at offset 0, per
 the DT, finds the SPL and falls back to `mtdparts=`); `--env` writes the
 environment. The T41 SPL's `epc_debug.c` copies a stub to the on-chip
-RAM at 0x12660000 and runs core 1 on it through the CCU, so that RAM is
+RAM at 0x12660000 (inside the NNA's ORAM) and runs core 1 on it through the CCU, so that RAM is
 modelled: without it core 1 ran off the I/O space into the boot ROM's
 exception vector and back into the SPL, and the SPL hung at random. A
 4.4 kernel built from the SDK tree (`isvp_tomcat_nand_defconfig`) storms
@@ -760,6 +769,23 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   per-column byte table at 0x28 / 0x2C, 0x04 bits 1, 2 and 16..18, T's
   0xA0 / 0xA8 / 0xF0 / 0xF4, and the chain-in-ORAM bit (0x30 bit 1);
   alpha is written 0.
+- `ingenic-nndma` (T40, T41): the NNA's DMA between DDR and its ORAM
+  (0x12600000). Ingenic's libvenus (magik-toolkit, `dma_func.cc`:
+  `w_d2o_orasetrun`, `aie_run_nndma_rdchn` / `wrchn`, mapped by
+  `__aie_mmap` through `/dev/mem`) drives it from user space; OpenIPC's
+  `soc-nna.ko` only answers its version ioctl, enables the hardware
+  registers and CU2. The descriptor RAM (0x0000..0x3FFF) holds 2048
+  descriptors of two words: word 0 the DDR address (bits 31:6), bit 0
+  set while another follows, bits 5:1 the length's bits 16:12; word 1 the
+  length's bits 11:0 in 31:20 and the ORAM offset from 0x12600000 in
+  64-byte units in 19:0 (length in 64-byte units, minus one). A write of
+  bit 31 | bytes / 64 << 12 | first descriptor to read channel n
+  (0x8000 + 4 n) moves DDR to ORAM, to write channel n (0x8010 + 4 n) ORAM
+  to DDR, following the chain (or the byte count when not 0); it
+  completes at once, so the library's `rdhwr` waits return. The kernel
+  driver's own RCFG / WCFG path (0x2000, a 64-bit descriptor format,
+  `CPU_SIMULATOR` in its source) lies inside the descriptor RAM and no
+  library uses it: storage.
 - `ingenic-ssi`: the SPI master of `jz_spi.c` (3.10) and `ingenic_spi.c`
   (4.4). A queued frame (CR1 FLEN + 2 bits, MSB first) goes out on the
   bus at once; the reply, or the frame itself with CR0 LOOP, lands in the
@@ -1432,6 +1458,7 @@ teardown, so the verdict comes first.
 | T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
 | T41NQ SDK image, its kernel's `ingenic_aip` + magik-toolkit `libaip.a` | `t41` | flash, `test-ingenic-aip.sh --image` | the library's own bs_* calls: NV12 640x360 -> 320x180 within 0.8 of the ramps sampled at half-pixel positions, a two-box chain, NV12 -> BGRA / RGBA / ARGB matching BT.601 exactly, affine and perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T40N SDK image, its kernel's `ingenic_bscaler` + magik-toolkit nna1 `libvenus.a` (its BSCALER objects) | `t40` | flash, `test-ingenic-bscaler.sh --image` | the library's own bs_* calls: BGRA 64x32 -> 32x16 and a many-tile 32x16 -> 160x80 within 0.7 of the ramps at half-pixel positions, NV12 256x128 -> 128x64 (both planes) within 0.7, NV12 -> BGRA / RGBA / ARGB resizes and the T unit's NV12 -> BGRA / RGBA matching BT.601 exactly, affine and projective perspective warps moving a square where the forward matrix sends it with the pad value outside |
+| OpenIPC `t40` + its `soc-nna.ko`, a client with magik-toolkit nna1 `libvenus.a`'s `dma_func` | `t40` | `-kernel` + NOR root, `test-ingenic-nna.sh` | the version ioctl; libvenus's `w_d2o_orasetrun` moves two blocks DDR -> ORAM (waited with `rdhwr $9`), write channel 0 moves them back (`rdhwr $11`), byte for byte; `rdhwr $4` after an `ll` gives its physical address |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
@@ -1475,7 +1502,15 @@ T40/T41 SDK kernels, drivers and libimp):
 - T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
   the VPU when libimp asks for it; the VPU raises the completion, so
   storage passes the picture through un-denoised.
-- The RISC-V core of T40/T41 (the "LEP": T40 OST/CCU at
-  0x12600000/0x12700000, T41 CCU at 0x12A00000, NNDMA 0x12500000): no
+- The NNA's compute of T40/T41: libvenus runs a network on the CPU, with
+  MXU3 vector instructions and Ingenic's own coprocessor-2 instructions
+  that feed the multiply-accumulate array from ORAM. The NNA DMA, the ORAM
+  and the hardware registers are modelled (above); those instructions
+  are not: the toolchain's libopcodes knows none of them and nothing
+  public here documents them -- 57 opcode classes (by the COP2 rs field
+  and function), 121881 instructions in the T40 build of libvenus and
+  48450 in the T41 one. Until they are, a network's first NNA instruction
+  raises Reserved Instruction (SIGILL).
+- The RISC-V core of T40/T41 (the "LEP"; T41 CCU at 0x12A00000): no
   driver, firmware or library here starts it; it would need a RISC-V CPU
   beside the MIPS ones and firmware these SDKs do not ship.
