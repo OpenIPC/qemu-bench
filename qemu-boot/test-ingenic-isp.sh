@@ -118,7 +118,7 @@ t20) SENSOR=${SENSOR:-jxf22} ;;
 t10) SENSOR=${SENSOR:-jxh62} ;;     # T10's ISP takes at most 1280x960
 t30) SENSOR=${SENSOR:-ov2735b} ;;
 t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}
-     DEFS="-DSNAP_T40 -DSNAP_DUAL -DSNAP_WDR_API -DSNAP_LDC"
+     DEFS="-DSNAP_T40 -DSNAP_DUAL -DSNAP_WDR_API -DSNAP_LDC -DSNAP_TISP_T40"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64 ;;
 t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41

@@ -255,8 +255,9 @@ static int ldc_pending;
 
 #define TISP_SET_PAR    0x20007401      /* _IO('t', 1), MIPS encoding */
 /* tisp_set_par_process's module number (its table index + 1) for the
- * HLDC: 21 in tx-isp-t41.ko, 20 in tx-isp-t40.ko, whose pipe is word 3 */
-#ifdef SNAP_T40
+ * HLDC: 21 in tx-isp-t41.ko, 20 in tx-isp-t40.ko, whose pipe is word 3
+ * (SNAP_TISP_T40: the T40 build; SNAP_T40 also covers T41's) */
+#ifdef SNAP_TISP_T40
 #define TISP_LDC        20
 #else
 #define TISP_LDC        21
@@ -285,7 +286,7 @@ static void hldc_calc(int k1, int k2, int w, int h, int cx, int cy,
 static int snap_ldc(int w, int h)
 {
     static uint32_t par[TISP_PAR_SIZE / 4];
-#ifdef SNAP_T40
+#ifdef SNAP_TISP_T40
     uint16_t *p = (uint16_t *)&par[4];      /* par[3]: the pipe, 0 */
 #else
     uint16_t *p = (uint16_t *)&par[3];
