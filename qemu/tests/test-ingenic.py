@@ -302,6 +302,40 @@ def test_tcu(qt):
     qt.writel(TCU + 0x04, 0)
 
 
+def test_tcu_irq(qt, intc=INTC):
+    """Channel 2 as the motor drivers run it: EXTAL/64, full at 375 ticks
+    (1 ms), its full interrupt unmasked -- TCU2 rises on time without
+    any register being read."""
+    print('ingenic-tcu channel interrupts')
+    line = lambda: (qt.readl(intc + 0x00) >> 25) & 1
+    qt.writel(TCU + 0x40 + 0x20 + 0x0C, 4 | (3 << 3))  # TCSR2: EXTAL / 64
+    qt.writel(TCU + 0x40 + 0x20 + 0x00, 375)           # TDFR2
+    qt.writel(TCU + 0x40 + 0x20 + 0x04, 375)           # TDHR2: no half
+    qt.writel(TCU + 0x40 + 0x20 + 0x08, 0)
+    qt.writel(TCU + 0x28, 0x00040004)                  # TFCR
+    qt.writel(TCU + 0x38, 1 << 2)                      # TMCR: full 2 on
+    qt.writel(TCU + 0x14, 1 << 2)                      # TESR: count
+    qt.step(900 * 1000)
+    check('no interrupt before the first full', line(), 0)
+    qt.step(200 * 1000)
+    check('TCU2 at 1 ms', line(), 1)
+    n = 0
+    for _ in range(10):
+        qt.writel(TCU + 0x28, 1 << 2)                  # ack
+        if line():
+            break
+        qt.step(1000 * 1000)
+        n += line()
+    check('one interrupt per millisecond for 10 ms', n, 10)
+    qt.writel(TCU + 0x34, 1 << 2)                      # TMSR: masked
+    qt.writel(TCU + 0x28, 1 << 2)
+    qt.step(3 * 1000 * 1000)
+    check('masked: the flag sets, the line stays low',
+          ((qt.readl(TCU + 0x20) >> 2) & 1, line()), (1, 0))
+    qt.writel(TCU + 0x18, 1 << 2)                      # TECR: stop
+    qt.writel(TCU + 0x28, 0x00ff00ff)
+
+
 def test_tcu_xburst2(qt):
     """T40/T41: the watchdog ignores TSR bit 16 and TCSR bit 10 zeroes the
     counter -- what the 4.4 kernels' restart and ping rely on."""
@@ -1827,6 +1861,16 @@ def test_sfc_v1(qt, img):
     sfc_v1(qt, 0x03, addr=0x110000, alen=3, length=16, dma=SCRATCH + 0x200)
     check('programmed after erase', qt.read(SCRATCH + 0x200, 16),
           b'OpenIPC!' + b'\xff' * 8)
+    # Block Erase 32KB (52h) at 1 MiB + 128 KiB: the block, not its
+    # neighbours
+    sfc_v1(qt, 0x06, data=False)
+    sfc_v1(qt, 0x52, addr=0x120000, alen=3, data=False)
+    for a, want in ((0x11FFF0, img[0x11FFF0:0x120000]),
+                    (0x120000, b'\xff' * 16), (0x127FF0, b'\xff' * 16),
+                    (0x128000, img[0x128000:0x128010])):
+        sfc_v1(qt, 0x03, addr=a, alen=3, length=16, dma=SCRATCH + 0x300)
+        check('32 KiB erase at 0x%x' % a, qt.read(SCRATCH + 0x300, 16),
+              bytes(want))
 
 
 def test_sfc_v2(qt, img, path):
@@ -3185,6 +3229,7 @@ def main():
         test_cpm(qt, 't31')
         test_ddr(qt, 't31')
         test_tcu(qt)
+        test_tcu_irq(qt)
         test_ost_v1(qt)
         test_intc(qt)
         test_sfc_v1(qt, img)

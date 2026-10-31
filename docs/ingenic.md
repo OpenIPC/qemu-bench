@@ -409,8 +409,14 @@ U-Boot and every kernel here reboot (the T40 kernel's own restart hook is
 empty). On XBurst2 TSR bit 16 does not stop the watchdog and TCSR bit 10
 zeroes its counter: the 4.4 kernels' watchdog driver sets the stop bit at
 probe and nothing clears it, and their restart writes TCSR bit 10, TDR,
-the clock and TCER and spins ("check wdt."). The PWM channels count and
-flag without interrupts. Each channel's PWM pin (TCSR bit 7 output on,
+the clock and TCER and spins ("check wdt."). Each channel counts at its
+TCSR clock from 0; reaching TDHR sets its half flag (TFR bit n + 16) and
+reaching TDFR its full flag (bit n), the counter starting again from 0,
+each on time (a timer per channel), and the flags interrupt unless TMR
+masks them: TCU0 for channel 0, TCU1 for 1, TCU2 for 2..7. The 3.10
+`jz_tcu` demuxes every channel off TCU2, and OpenIPC's `motor.ko` and
+the SDKs' `sample_motor` step on channel 2's full interrupt
+(`test-ingenic-motor.sh`). Each channel's PWM pin (TCSR bit 7 output on,
 bit 8 initial level, bit 9 shut down; OpenIPC's `jz_tcu.c` and the SDKs'
 `sample_pwm`) starts a period at the initial level and flips at TDHR,
 until TDFR: `qom-get /machine/tcu pwm2` reads it as `high/period` counter
@@ -451,7 +457,9 @@ keep the single-command path. Three details matter:
   controller `virt_to_phys()` of its uncached descriptor buffer --
   0x2xxxxxxx for RAM at 0x0xxxxxxx -- so the silicon evidently decodes
   29 bits.
-- The NOR is an m25p80 on the SSI bus. It counts fast-read dummies in
+- The NOR is an m25p80 on the SSI bus, with the 4 KiB (20h) and 32 KiB
+  (52h) erases the real parts have (patch 0024: W25Q64, W25Q256, and
+  the 0xC22018 ID that MX25L12805D/12835F/12845E share). It counts fast-read dummies in
   clocks, one transfer each, which is what DMYBITS holds; an address
   longer than the part's (the T41 SPL probes with 6 bytes) reads data,
   as on a real chip.
