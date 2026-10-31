@@ -72,6 +72,7 @@ DDRAPB = 0x13012000
 DDRC = 0x134F0000
 SFC = 0x13440000
 SFC1 = 0x13450000
+MSC1 = 0x13460000
 EFUSE = 0x13540000
 CAR = 0x1F000000
 BOOTROM = 0x1FC00000
@@ -454,6 +455,57 @@ def test_uart45(qt):
 
 
 # --- SADC ------------------------------------------------------------------
+
+def _msc_cmd(qt, cmd, arg, rtype):
+    """Run one MSC1 command, return its three RES halfwords."""
+    qt.writel(MSC1 + 0x2C, cmd)         # CMD
+    qt.writel(MSC1 + 0x30, arg)         # ARG
+    qt.writel(MSC1 + 0x0C, rtype)       # CMDAT: response format in bits 2:0
+    qt.writel(MSC1 + 0x00, 1 << 2)      # CTRL START_OP
+    return tuple(qt.readl(MSC1 + 0x34) & 0xffff for _ in range(3))
+
+
+def _sdio52(qt, fn, addr, data=None):
+    """CMD52 (IO_RW_DIRECT); data!=None writes.  Returns the data byte."""
+    arg = (fn << 28) | ((addr & 0x1ffff) << 9)
+    if data is not None:
+        arg |= (1 << 31) | (data & 0xff)
+    return _msc_cmd(qt, 52, arg, 5)[2] & 0xff
+
+
+def test_sdio(qt):
+    print('atbm-sdio (SDIO enumeration on MSC1)')
+    qt.writel(MSC1 + 0x00, 1 << 2 | 2)          # start the clock
+    # CMD5 IO_SEND_OP_COND: the inquiry (arg 0) is not ready; once a
+    # voltage is offered the card reports ready (R4 bit 31)
+    r0, _, _ = _msc_cmd(qt, 5, 0, 4)
+    check('CMD5 inquiry: not ready', r0 & 0x80, 0)
+    r0, _, _ = _msc_cmd(qt, 5, 0x300000, 4)
+    check('CMD5 with voltage: card ready', r0 & 0x80, 0x80)
+    # CMD3 SEND_RELATIVE_ADDR -> RCA 1
+    _, r1, _ = _msc_cmd(qt, 3, 0, 6)
+    rca = r1 >> 8
+    check('CMD3: RCA assigned', rca, 1)
+    # CMD7 select
+    _msc_cmd(qt, 7, rca << 16, 1)
+    # CCCR: revision 3.00, card capability
+    check('CCCR revision', _sdio52(qt, 0, 0x00), 0x43)
+    check('CCCR card capability', _sdio52(qt, 0, 0x08), 0xc2)
+    # the common CIS pointer, then the MANFID tuple it points at
+    ptr = (_sdio52(qt, 0, 0x09) | _sdio52(qt, 0, 0x0a) << 8 |
+           _sdio52(qt, 0, 0x0b) << 16)
+    check('common CIS pointer', ptr, 0x1000)
+    check('CIS tuple is MANFID', _sdio52(qt, 0, ptr), 0x20)
+    check('CIS MANFID length', _sdio52(qt, 0, ptr + 1), 4)
+    vid = _sdio52(qt, 0, ptr + 2) | _sdio52(qt, 0, ptr + 3) << 8
+    pid = _sdio52(qt, 0, ptr + 4) | _sdio52(qt, 0, ptr + 5) << 8
+    check('CIS vendor id', vid, 0x007a)
+    check('CIS product id', pid, 0x6011)
+    # function 1: enable it, read it back ready; FBR class
+    _sdio52(qt, 0, 0x02, 0x02)
+    check('function 1 enabled and ready', _sdio52(qt, 0, 0x03) & 2, 2)
+    check('FBR1 standard SDIO function', _sdio52(qt, 0, 0x100) & 0x0f, 0x0c)
+
 
 def test_sadc(qt, intc=INTC):
     print('ingenic-sadc')
@@ -3410,6 +3462,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't31')
         test_i2s_clock(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31,wifi=atbm', ['-nic', 'user'])
+        test_sdio(qt)
         qt.close()
         qt = QTest(a.qemu, 't31', ['-device', 'w25q80,bus=ssi0,cs=0'])
         test_ssi(qt)

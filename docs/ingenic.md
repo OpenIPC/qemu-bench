@@ -58,6 +58,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13440000 | SFC + SPI NOR or SPI NAND | `ingenic-sfc` + m25p80 / `ingenic-spinand` |
 | 0x13450000 | T41: SFC1, IRQ 19 (`-drive if=mtd,index=1`) | `ingenic-sfc` |
 | 0x13450000 / 0x13460000 | MSC0/1 (XBurst1) | `ingenic-msc` |
+| MSC1 SDIO | ATBM6031 Wi-Fi (`-M t31,wifi=atbm`) | `atbm-sdio` |
 | 0x13060000 / 0x13070000 | MSC0/1 (XBurst2): SDHCI 3.0 | QEMU `generic-sdhci` |
 | 0x134B0000 | Synopsys GMAC, IP101G PHY | `ingenic-gmac` |
 | 0x13500000 | DWC2 USB OTG, host | QEMU `dwc2-usb` |
@@ -504,6 +505,35 @@ which is what lets U-Boot get past `mmc` init. MSC0's card detect is a
 GPIO the host drives itself -- PB27, PB20 on T21 -- so monitor
 `eject`/`change` are hot-plug. An SD image for U-Boot's `fatls` needs a
 partition table. XBurst2 has SDHCI hosts instead.
+
+### `atbm-sdio`
+
+The AltoBeam ATBM6031/Apollo SDIO Wi-Fi the camera boards carry on MSC1,
+as the vendor `atbm_wlan` driver (`hal_apollo`, `PLATFORM_INGENICT31`)
+drives it; `-M t31,wifi=atbm` attaches it, with a `-nic`/`-netdev`.  It is
+an SDIO function-1 card: patch 0026 lets a non-SD/MMC card sit on the SD
+bus and raise its interrupt, and the MSC reflects that as IFLG bit 7.
+The card answers CMD5/CMD3/CMD7, the CCCR, the function-1 FBR and the CIS
+tuples (the ATBM vendor/product id), and function-1 CMD52/CMD53 to the
+eight HIF registers -- CONFIG, CONTROL, the in/out queue, the AHB/SRAM
+data ports with their base-address latch.  It accepts the firmware the
+driver downloads into chip memory, releases the "CPU" when CONFIG's reset
+bit clears, and then answers the WSM protocol itself, emulating an access
+point and bridging data frames to the netdev (the WSM/AP engine it shares
+with `hw/usb/atbm-wifi.c`): a scan reports an SSID (`ssid=`, default
+OpenIPC), and an open-network join associates.
+
+The driver enumerates the card, reads the CIS and brings the chip up over
+the HIF registers (verified: the guest's `mmc1` reports "new SDIO card",
+`atbm_wlan` probes and starts the firmware download).  Driving a full
+association end to end additionally needs the MSC to complete a CMD53
+data transfer as the asynchronous, multi-interrupt sequence
+`jzmmc_v12`'s state machine expects (the command response and the
+write/DMA completion as separate interrupts, ordered after the host
+enters its data-wait state); the MSC's present synchronous completion
+suffices for enumeration but not yet for the firmware download's bulk
+writes.  A qtest (`test_sdio`) drives the enumeration; the guest test is
+`test-ingenic-wifi.sh` (skips without the built driver).
 
 ### `ingenic-gmac`
 
@@ -1874,6 +1904,12 @@ AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib and pow(),
 and the TCU's PWM pins.
 
 ## Not modelled
+
+The SDIO Wi-Fi chip (`atbm-sdio`) enumerates and the vendor driver probes
+it and starts the firmware download, but a full `wlan0` association is not
+reached: it needs the MSC's CMD53 data phase modelled as the asynchronous
+multi-interrupt sequence the `jzmmc_v12` state machine expects (above).
+
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode

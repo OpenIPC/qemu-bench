@@ -342,6 +342,7 @@ struct IngenicMachineState {
     char *sensor1;
     DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
     char *sensor2;
+    char *wifi;         /* an SDIO Wi-Fi chip on MSC1: none or "atbm" */
     DeviceState *sensor2_dev;       /* sensor2=, T40's third sensor (VIC2) */
     const IngenicSocInfo *info;
     MIPSCPU *cpu[2];
@@ -1756,6 +1757,12 @@ static void ingenic_init(MachineState *ms)
                                         blk_by_legacy_dinfo(di), &error_fatal);
                 qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                        &error_fatal);
+            } else if (i == 1 && ims->wifi && !strcmp(ims->wifi, "atbm")) {
+                /* an SDIO Wi-Fi chip on MSC1 (the camera boards' slot) */
+                DeviceState *card = qdev_new("atbm-sdio");
+
+                qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                       &error_fatal);
             }
         }
     }
@@ -1853,6 +1860,19 @@ static void ingenic_set_sensor2(Object *obj, const char *value, Error **errp)
     ims->sensor2 = g_strdup(value);
 }
 
+static char *ingenic_get_wifi(Object *obj, Error **errp)
+{
+    return g_strdup(INGENIC_MACHINE(obj)->wifi);
+}
+
+static void ingenic_set_wifi(Object *obj, const char *value, Error **errp)
+{
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    g_free(ims->wifi);
+    ims->wifi = g_strdup(value);
+}
+
 static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1893,6 +1913,11 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sensor2",
         "T40: a third image sensor, on I2C0 (VIC2); the same names as "
         "sensor=");
+    object_class_property_add_str(oc, "wifi",
+        ingenic_get_wifi, ingenic_set_wifi);
+    object_class_property_set_description(oc, "wifi",
+        "an SDIO Wi-Fi chip on MSC1: none (default) or atbm (AltoBeam "
+        "ATBM6031); give it a -nic and the guest's driver brings up wlan0");
 }
 
 static void ingenic_soc_class_init(ObjectClass *oc, const void *data)
