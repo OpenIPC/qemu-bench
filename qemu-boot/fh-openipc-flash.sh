@@ -59,6 +59,7 @@ dd if="$ROOTFS" of="$OUT" bs=64k seek=37 conv=notrunc status=none
 # The MTD device's name: the 3.0.8 kernels' m25p80 platform data says
 # "spi_flash", the 4.9 ones take the SPI device's.
 case $SOC in
+    fh8626v100) MTDID=spi0.0 ;;        # 4.9.129, despite the suffix
     *v100) MTDID=spi_flash ;;
     *)     MTDID=spi0.0 ;;
 esac
