@@ -343,6 +343,7 @@ struct IngenicMachineState {
     DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
     char *sensor2;
     char *wifi;         /* an SDIO Wi-Fi chip on MSC1: none or "atbm" */
+    char *wifi_ssid, *wifi_psk;     /* its access point: SSID, WPA2 passphrase */
     DeviceState *sensor2_dev;       /* sensor2=, T40's third sensor (VIC2) */
     const IngenicSocInfo *info;
     MIPSCPU *cpu[2];
@@ -971,6 +972,23 @@ static DeviceState *ingenic_create_sensor(const char *name, I2CBus *bus)
 static void ingenic_cpu_reset(void *opaque)
 {
     cpu_reset(CPU(opaque));
+}
+
+/* the SDIO Wi-Fi chip on MSC1 (wifi=atbm): /machine/atbm */
+static void ingenic_wifi_card(IngenicMachineState *ims, DeviceState *host)
+{
+    DeviceState *card = qdev_new("atbm-sdio");
+
+    object_property_add_child(OBJECT(ims), "atbm", OBJECT(card));
+    if (ims->wifi_ssid) {
+        qdev_prop_set_string(card, "ssid", ims->wifi_ssid);
+    }
+    if (ims->wifi_psk) {
+        qdev_prop_set_string(card, "psk", ims->wifi_psk);
+    }
+    qemu_configure_nic_device(card, false, NULL);
+    qdev_realize_and_unref(card, qdev_get_child_bus(host, "sd-bus"),
+                           &error_fatal);
 }
 
 static void ingenic_init(MachineState *ms)
@@ -1732,11 +1750,7 @@ static void ingenic_init(MachineState *ms)
                                        &error_fatal);
             } else if (i == 1 && ims->wifi && !strcmp(ims->wifi, "atbm")) {
                 /* the SDIO Wi-Fi chip on MSC1, as on the XBurst1 parts */
-                DeviceState *card = qdev_new("atbm-sdio");
-
-                qemu_configure_nic_device(card, false, NULL);
-                qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
-                                       &error_fatal);
+                ingenic_wifi_card(ims, dev);
             }
         }
     } else {
@@ -1766,12 +1780,7 @@ static void ingenic_init(MachineState *ms)
                                        &error_fatal);
             } else if (i == 1 && ims->wifi && !strcmp(ims->wifi, "atbm")) {
                 /* an SDIO Wi-Fi chip on MSC1 (the camera boards' slot) */
-                DeviceState *card = qdev_new("atbm-sdio");
-
-                qemu_configure_nic_device(card, false, NULL);
-
-                qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
-                                       &error_fatal);
+                ingenic_wifi_card(ims, dev);
             }
         }
     }
@@ -1882,6 +1891,33 @@ static void ingenic_set_wifi(Object *obj, const char *value, Error **errp)
     ims->wifi = g_strdup(value);
 }
 
+static char *ingenic_get_wifi_ssid(Object *obj, Error **errp)
+{
+    return g_strdup(INGENIC_MACHINE(obj)->wifi_ssid);
+}
+
+static void ingenic_set_wifi_ssid(Object *obj, const char *value,
+                                  Error **errp)
+{
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    g_free(ims->wifi_ssid);
+    ims->wifi_ssid = g_strdup(value);
+}
+
+static char *ingenic_get_wifi_psk(Object *obj, Error **errp)
+{
+    return g_strdup(INGENIC_MACHINE(obj)->wifi_psk);
+}
+
+static void ingenic_set_wifi_psk(Object *obj, const char *value, Error **errp)
+{
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    g_free(ims->wifi_psk);
+    ims->wifi_psk = g_strdup(value);
+}
+
 static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1927,6 +1963,16 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "wifi",
         "an SDIO Wi-Fi chip on MSC1: none (default) or atbm (AltoBeam "
         "ATBM6031); give it a -nic and the guest's driver brings up wlan0");
+    object_class_property_add_str(oc, "wifi-ssid",
+        ingenic_get_wifi_ssid, ingenic_set_wifi_ssid);
+    object_class_property_set_description(oc, "wifi-ssid",
+        "the SSID the wifi= chip's emulated access point offers "
+        "(default OpenIPC)");
+    object_class_property_add_str(oc, "wifi-psk",
+        ingenic_get_wifi_psk, ingenic_set_wifi_psk);
+    object_class_property_set_description(oc, "wifi-psk",
+        "a WPA2-PSK passphrase (8..63 characters) for that access point; "
+        "without it the network is open");
 }
 
 static void ingenic_soc_class_init(ObjectClass *oc, const void *data)
