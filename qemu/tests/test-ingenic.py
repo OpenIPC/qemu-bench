@@ -3317,6 +3317,14 @@ def main():
             qt = QTest(a.qemu, soc)
             test_isp_layout(qt, soc)
             qt.close()
+        # T23's second sensor (the SDK's gc2053s1) beside the first on I2C0
+        qt = QTest(a.qemu, 't23,sensor=gc2053,sensor1=gc2053s1')
+        print('t23 sensor1=')
+        check('GC2053 ID at I2C0 0x37', i2c_read_reg(qt, I2C0, 0x37, 0xF0, 2),
+              [0x20, 0x53])
+        check('gc2053s1 ID at I2C0 0x3f', i2c_read_reg(qt, I2C0, 0x3F, 0xF0, 2),
+              [0x20, 0x53])
+        qt.close()
         qt = QTest(a.qemu, 't20,sensor=jxf22')
         test_isp_apical(qt)
         qt.close()

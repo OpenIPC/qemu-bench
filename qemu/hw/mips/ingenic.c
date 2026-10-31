@@ -259,7 +259,7 @@ typedef struct IngenicSocInfo {
     hwaddr scaler_base;     /* T30's MSCA scaler (ingenic-isp "t30") */
     int irq_isp, irq_vic;   /* INTC sources, 0: IRQ_ISP / IRQ_VIC */
     int sensor_bus;         /* the I2C bus sinfo / tx-isp probe */
-    int sensor1_bus;        /* > 0: sensor1= (a second sensor) is here */
+    int sensor1_bus;        /* > 0: sensor1= (a second sensor) is on bus - 1 */
     int sensor2_bus;        /* > 0: sensor2= (a third sensor) is on bus - 1 */
     int sensor_gpio_sda;    /* > 0: the sensor bus is bit-banged on GPIOs
                                sda / sda + 1 (T10's i2c-gpio) */
@@ -880,6 +880,8 @@ static const struct {
     uint16_t id_reg, id;        /* galaxycore / hisi-smartsens; ov2735 rev */
 } ingenic_sensors[] = {
     { "gc2053", NULL, 0x37, false, 0xF0, 0x2053 },
+    /* T23 SDK's second-sensor driver: a gc2053 at 0x3f (sensor1=) */
+    { "gc2053s1", NULL, 0x3F, false, 0xF0, 0x2053 },
     { "gc2083", NULL, 0x37, true, 0x03F0, 0x2083 },
     { "sc2336", "hisi-smartsens", 0x30, true, 0x3107, 0xCB3A },
     { "sc2335", "hisi-smartsens", 0x30, true, 0x3107, 0xCB14 },
@@ -1170,8 +1172,11 @@ static void ingenic_init(MachineState *ms)
             ims->sensor_dev = ingenic_create_sensor(ims->sensor,
                 I2C_BUS(qdev_get_child_bus(dev, "i2c")));
         }
-        /* T40's second sensor, on I2C3 through CSI1 (the SDK's samples) */
-        if (info->sensor1_bus && i == info->sensor1_bus && ims->sensor1 &&
+        /*
+         * the second sensor: T40's on I2C3 through CSI1, T23's (the SDK's
+         * gc2053s1, at 0x3f) on I2C0 beside the first (the SDK's samples)
+         */
+        if (info->sensor1_bus && i == info->sensor1_bus - 1 && ims->sensor1 &&
             strcmp(ims->sensor1, "none")) {
             ims->sensor1_dev = ingenic_create_sensor(ims->sensor1,
                 I2C_BUS(qdev_get_child_bus(dev, "i2c")));
@@ -1846,6 +1851,7 @@ static const IngenicSocInfo ingenic_socs[] = {
         .soc_id = 0x10023003, .prid = 0, .l1_kib = 16,
         .msc0_cd = 32 + 27, .isp = "t23", .isp_base = ISP_BASE,
         .vic_base = VIC_BASE, .csi_base = CSI_BASE, .dphy_base = DPHY_BASE,
+        .sensor1_bus = 1,
     }, {
         .name = "t30", .desc = "Ingenic T30 (XBurst1)",
         .soc = INGENIC_T30, .cpu = MIPS_CPU_TYPE_NAME("XBurst1"),
@@ -1875,7 +1881,7 @@ static const IngenicSocInfo ingenic_socs[] = {
         .sfc_version = 2, .mtd_id = "jz_sfc", .nand_mtd_id = "sfc_nand",
         .rtc_base = 0x132A0000, .max_cpus = 2, .num_i2c = 4,
         .soc_id = 0x10040003, .prid = 0, .l1_kib = 0,
-        .sensor_bus = 1, .sensor1_bus = 3, .sensor2_bus = 1,
+        .sensor_bus = 1, .sensor1_bus = 4, .sensor2_bus = 1,
         /* VIC0 of three; CSI0 (the one a single sensor uses) */
         .isp = "t40", .isp_base = ISP_BASE, .vic_base = 0x13380000,
         .csi_base = 0x10054000, .dphy_base = DPHY_BASE,

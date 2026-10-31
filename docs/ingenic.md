@@ -1565,6 +1565,32 @@ its own `tx-isp-t23.ko` H20240204a with `direct_mode=1` and its libimp):
 the main stream's encoder channel set `bEnableIvdc`, HELIX encodes from
 0x80000000 / 0x81000000, both streams decode with the scene, and
 `/proc/jz/isp/isp-ivdc` counts ISP frames done (about 100).
+`--sdk` runs the same with the T23 SDK's own `tx-isp-t23.ko`
+(H20230720a), sensor module and static `libimp.a`; that firmware reads
+tuning files of format 2.10 (OpenIPC's rootfs has 2.20 ones, on which it
+corrupts memory: a `kfree` BUG in `tiziano_load_parameters`), so the
+test fetches the 2.10 `gc2053-t23.bin` of OpenIPC's first T23 package.
+
+T23's second sensor (`sensor1=gc2053s1`: the SDK's `gc2053s1` driver, a
+GC2053 at I2C0 0x3f beside the first) is attached and probes, but T23's
+dual-sensor ISP (the SDK's `tx-isp-t23-double` firmware, H20230726b,
+linked into a module by `test-ingenic-t23-enc.sh --sensor1 gc2053s1`)
+does not stream here. It has one pipe and one VIC: in this mode the
+core sets the VIC's "raw pipe" (`tx_isp_subdev_pipo`: the VIC's qbuf,
+clearbuf and s_stream registered as the core's raw-frame ops, field 524
+of the core set) and skips the 0xB0 / 0xC0 interrupt enables in
+`ispcore_video_s_stream`; the core queues raw buffers to the VIC
+(`ispvic_frame_channel_qbuf`: VIC 0x318 + 4 n), the VIC's MDMA caches
+the sensors' raw frames into them (the 0x300-0x350 registers of T40's
+`snapraw`, `vic_mdma_enable` / `vic_pipo_mdma_enable`),
+`vic_framedone_irq_function` matches 0x380 against the queued buffers
+and sets the frame count in 0x300, and `vic_mdma_irq_function` hands the
+frames to the core (`vic_mdma_ch0_sub_get_num`, `..._set_buff_index`),
+which processes them from DDR in turn -- a path whose ISP-side input
+registers are not decoded. The firmware also writes ISP offsets
+0x20000-0x7FFFF (beyond T23's single-sensor 64 KiB window) and the VIC's
+0x200 (0x80010001) and 0x208 (200000); with the model as it is the VIC
+runs, the core is never enabled and no frame reaches a channel.
 
 T30 couples the same Apical core with a T31-style MSCA scaler of its own
 (0x130B0000, IRQ 27), which `ingenic-isp`'s "t30" layout models, and
@@ -1746,7 +1772,9 @@ than T41's), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
-T40's HLDC, T41's LDC block (below)
+T40's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
+SDK's double firmware: the VIC caching both sensors' raw frames for the
+one ISP to process from DDR; above), T23's IVDC DRAM spill lines
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the

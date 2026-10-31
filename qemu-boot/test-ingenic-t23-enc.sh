@@ -18,8 +18,14 @@
 #        [--ffmpeg CMD] [--out DIR] [--keep]
 #
 # --direct 1 asks the main stream's encoder channel for the IVDC (and
-# loads tx-isp-t23 with direct_mode=1); with two sensors --direct 2 is
-# the SDK's "double direct" mode, both main streams through the IVDC.
+# loads tx-isp-t23 with direct_mode=1).  --sdk uses the T23 SDK's own
+# tx-isp-t23.ko, sensor module and libimp.a instead of OpenIPC's.
+# --sensor1 gc2053s1 loads the SDK's dual-sensor firmware; its raw pipe
+# (the VIC caching both sensors' raw frames for one ISP) is not modelled,
+# so that run does not stream yet (docs/ingenic.md); with it --direct 2
+# would be the SDK's "double direct" mode.
+# The double firmware needs a 2.10 tuning file: OpenIPC's first T23
+# gc2053-t23.bin, fetched from its firmware repository (or BIN210=FILE).
 # QEMU_EXTRA in the environment adds QEMU options (its stderr goes to
 # <out>/qemu.err).  The SDK is not public: the test skips (exit 0)
 # without it.
@@ -35,6 +41,7 @@ FFMPEG=${FFMPEG:-}
 DIRECT=0
 SENSOR=gc2053
 SENSOR1=
+SDKSTACK=
 FRAMES=10
 OUT=
 KEEP=
@@ -44,6 +51,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --direct) DIRECT=$2; shift ;;
     --sensor1) SENSOR1=$2; shift ;;
+    --sdk) SDKSTACK=1 ;;
     --frames) FRAMES=$2; shift ;;
     --fw) FW=$2; shift ;;
     --qemu) QEMU=$2; shift ;;
@@ -60,7 +68,8 @@ ISP2=$DRV/isp-t23/tx-isp-t23-double
 SEN=$DRV/sensors-t23/gc2053
 SEN2=$DRV/sensors-t23/gc2053-double
 for f in "$SDK23/sdk/include/imp/imp_encoder.h" \
-         ${SENSOR1:+"$ISP2/libt23-firmware.a" "$ISP1/tx-isp-t23.mod.o" "$SDK23/sdk/lib/uclibc/libimp.a"}; do
+         ${SENSOR1:+"$ISP2/libt23-firmware.a"} \
+         ${SDKSTACK:+"$ISP1/tx-isp-t23.ko" "$ISP1/tx-isp-t23.mod.o" "$SDK23/sdk/lib/uclibc/libimp.a"}; do
     [ -e "$f" ] || { echo "SKIP: missing $f"; exit 0; }
 done
 for f in "$FW/uImage.t23" "$FW/rootfs.squashfs.t23" "$QEMU" \
@@ -83,20 +92,35 @@ unsquashfs -q -d "$WORK/rfs" "$FW/rootfs.squashfs.t23" >/dev/null
 MOD=$(dirname "$(find "$WORK/rfs/lib/modules" -name tx-isp-t23.ko | head -1)")
 mkdir -p "$WORK/rfs/lib/sdk"
 TCC="$TC/mips-linux-uclibc-gcc"
-if [ -n "$SENSOR1" ]; then
-    # Two sensors: the SDK's double firmware (OpenIPC builds none).
+[ -n "$SENSOR1" ] && SDKSTACK=1
+if [ -n "$SDKSTACK" ]; then
+    # Two sensors: the SDK's double firmware (OpenIPC builds none); one
+    # sensor with --sdk: the SDK's own tx-isp-t23.ko.
     # tx-isp-t23.o is the firmware object plus the SDK's tx-isp-debug.o /
     # tx-isp-module.o, the module its .mod.o (the same in both builds: no
     # symbol versions, the same name), with the SDK's sensor modules and
     # libimp.a
-    "$TC/mips-linux-uclibc-ld" -m elf32ltsmip -r -o "$WORK/dbl.o" \
-        "$ISP2/libt23-firmware.a" "$ISP1/tx-isp-debug.o" "$ISP1/tx-isp-module.o"
-    "$TC/mips-linux-uclibc-ld" -m elf32ltsmip -r \
-        -T "$SDK23/opensource/kernel/scripts/module-common.lds" --build-id \
-        -o "$WORK/rfs/lib/sdk/tx-isp-t23.ko" "$WORK/dbl.o" "$ISP1/tx-isp-t23.mod.o"
-    cp "$SEN2/sensor_gc2053_t23.ko" "$SEN2/sensor_gc2053s1_t23.ko" "$WORK/rfs/lib/sdk/"
-    # the second pipe's tuning, by the s1 driver's name
-    cp "$WORK/rfs/etc/sensor/gc2053-t23.bin" "$WORK/rfs/etc/sensor/gc2053s1-t23.bin"
+    if [ -n "$SENSOR1" ]; then
+        "$TC/mips-linux-uclibc-ld" -m elf32ltsmip -r -o "$WORK/dbl.o" \
+            "$ISP2/libt23-firmware.a" "$ISP1/tx-isp-debug.o" "$ISP1/tx-isp-module.o"
+        "$TC/mips-linux-uclibc-ld" -m elf32ltsmip -r \
+            -T "$SDK23/opensource/kernel/scripts/module-common.lds" --build-id \
+            -o "$WORK/rfs/lib/sdk/tx-isp-t23.ko" "$WORK/dbl.o" "$ISP1/tx-isp-t23.mod.o"
+        cp "$SEN2/sensor_gc2053_t23.ko" "$SEN2/sensor_gc2053s1_t23.ko" "$WORK/rfs/lib/sdk/"
+    else
+        cp "$ISP1/tx-isp-t23.ko" "$SEN/sensor_gc2053_t23.ko" "$WORK/rfs/lib/sdk/"
+    fi
+    # The SDK's firmware (H20230720a, H20230726b-double) reads tuning
+    # files of format 2.10 and fails on the rootfs's 2.20 ones ("The version of bin doesn't
+    # match with driver!", then a kfree BUG in tiziano_load_parameters):
+    # OpenIPC's first T23 package carried a 2.10 gc2053-t23.bin.  The
+    # second sensor's tuning goes by the s1 driver's name.
+    BIN210=${BIN210:-$WORK/gc2053-t23-2.10.bin}
+    [ -s "$BIN210" ] || curl -fsSL --retry 3 -o "$BIN210" \
+        "https://raw.githubusercontent.com/OpenIPC/firmware/006ba82bdd/general/package/ingenic-osdrv-t23/files/sensor/params/gc2053-t23.bin" ||
+        { echo "SKIP: no 2.10 gc2053-t23.bin"; exit 0; }
+    cp "$BIN210" "$WORK/rfs/etc/sensor/gc2053-t23.bin"
+    cp "$BIN210" "$WORK/rfs/etc/sensor/gc2053s1-t23.bin"
     rm -f "$MOD"/sensor_*_t23.ko     # room for the client in the 8 MiB root
     $TCC -O2 -Wall -I"$SDK23/sdk/include" -static -s -o "$WORK/rfs/usr/bin/t23-enc" \
         "$HERE/ingenic-t23-enc.c" "$SDK23/sdk/lib/uclibc/libimp.a" \
@@ -222,7 +246,10 @@ PY
     echo "   no init output in 90 s, retrying"
 done
 grep -a -E "T23TEST|^stream[0-3] picture [0-9]*:|t23-enc:|failed" "$OUT/console.log" | grep -v PMEM | tail -40 || true
-grep -a "t23-enc: PASS" "$OUT/console.log" >/dev/null || { echo "FAIL: the client did not get its streams"; exit 1; }
+if ! grep -a "t23-enc: PASS" "$OUT/console.log" >/dev/null; then
+    echo "FAIL: the client did not get its streams${SENSOR1:+ (T23's dual-sensor raw pipe is not modelled)}"
+    exit 1
+fi
 [ -n "$FFMPEG" ] || { echo "SKIP: no ffmpeg to decode with"; exit 0; }
 fails=0
 for slot in $(seq 0 $((NSTREAM - 1))); do
