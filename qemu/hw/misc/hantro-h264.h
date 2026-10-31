@@ -103,4 +103,25 @@ size_t h264_slice_p_cabac(int qp, int chroma_qp_offset, int cabac_init_idc,
                           const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
                           uint8_t *out, size_t cap, H264PStats *st);
 
+/*
+ * A picture split into slices of whole macroblock rows, coded one slice at
+ * a time (h264_pic_slice_cabac: I or P, CABAC, from row r0; returns bytes
+ * as the others), then filtered and kept as the next reference
+ * (h264_pic_finish, deblocking across the slices' edges for idc 0, not for
+ * idc 2).  ry / ruv given to h264_pic_new are the reference (NV12 at
+ * stride mbw * 16, copied), or NULL: P slices then code every macroblock
+ * intra.
+ */
+typedef struct H264Pic H264Pic;
+H264Pic *h264_pic_new(int mbw, int mbh, const uint8_t *y, int ys,
+                      const uint8_t *uv, int cs, const uint8_t *ry,
+                      const uint8_t *ruv, int chroma_qp_offset,
+                      bool transform_8x8_mode);
+size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
+                            int qp, int cabac_init_idc, uint8_t *out,
+                            size_t cap, H264PStats *st);
+void h264_pic_finish(H264Pic *pic, const H264Deblock *db, uint8_t *ry,
+                     uint8_t *ruv);
+void h264_pic_free(H264Pic *pic);
+
 #endif
