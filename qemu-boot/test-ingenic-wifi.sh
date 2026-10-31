@@ -1,32 +1,40 @@
 #!/bin/bash
-# SDIO Wi-Fi end to end on T31: the AltoBeam atbm_wlan driver on the
-# emulated ATBM6031 (hw/net/atbm-sdio.c, -M t31,wifi=atbm).  The driver
+# SDIO Wi-Fi end to end: the AltoBeam atbm_wlan driver on the emulated
+# ATBM6031 (hw/net/atbm-sdio.c, -M <soc>,wifi=atbm).  The driver
 # enumerates the SDIO card on MSC1, downloads its firmware, brings up the
 # chip and speaks WSM; the model answers as an access point on a QEMU user
 # network, so the guest associates to an open SSID, gets an address over
 # DHCP from slirp and reaches the host (10.0.2.2).
 #
-#   bash qemu-boot/test-ingenic-wifi.sh [--kernel uImage] [--driver DIR]
-#        [--fw DIR] [--ssid NAME] [--qemu PATH] [--out DIR] [--timeout S]
+#   bash qemu-boot/test-ingenic-wifi.sh [--soc t31|t40] [--kernel uImage]
+#        [--driver DIR] [--fw DIR] [--ssid NAME] [--qemu PATH] [--out DIR]
+#        [--timeout S]
 #
-# --kernel is an OpenIPC T31 kernel with CONFIG_JZMMC_V12_MMC1 (the SDIO
-# host) -- the one the UART-DMA test builds serves.  --driver holds
-# atbm_wifi.ko and cfg80211.ko built against it.  Without either (or the
-# rootfs) the test skips, exit 0.
+# t31 (the default): MSC1 is the jzmmc host; --kernel is an OpenIPC T31
+# kernel with CONFIG_JZMMC_V12_MMC1 (the SDIO host) -- the one the
+# UART-DMA test builds serves.  t40: MSC1 is an SDHCI host
+# (sdhci-ingenic); --kernel is OpenIPC's T40 kernel (t40.generic.config)
+# rebuilt with MSC1 enabled in its built-in device tree (status "okay",
+# ingenic,sdio_clk, no non-removable), which the stock one leaves off.
+# --driver holds atbm_wifi.ko (platform INGENICT31 / INGENICT41) and
+# cfg80211.ko built against that kernel.  Without either (or the rootfs)
+# the test skips, exit 0.
 set -e
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOP=$(dirname "$HERE")
 QEMU=$TOP/qemu-src/build/qemu-system-mipsel
-FW=/home/ai/dimerr/local/ingenic/fw/t31
-KERNEL=/home/ai/dimerr/tmp-scratch/pdma2/kbuild/arch/mips/boot/uImage
-DRIVER=/home/ai/dimerr/tmp-scratch/sdio/atbm/driver_install
+SOC=t31
+FW=
+KERNEL=
+DRIVER=
 SSID=OpenIPC
 OUT=
 TIMEOUT=300
 
 while [ $# -gt 0 ]; do
     case $1 in
+    --soc) SOC=$2; shift ;;
     --kernel) KERNEL=$2; shift ;;
     --driver) DRIVER=$2; shift ;;
     --fw) FW=$2; shift ;;
@@ -38,9 +46,19 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ -e "$KERNEL" ] || { echo "SKIP: no T31 kernel with MMC1 (--kernel)"; exit 0; }
+case $SOC in
+t31) KERNEL=${KERNEL:-/home/ai/dimerr/tmp-scratch/pdma2/kbuild/arch/mips/boot/uImage}
+     DRIVER=${DRIVER:-/home/ai/dimerr/tmp-scratch/sdio/atbm/driver_install}
+     MEM="mem=40M rmem=24M@0x2800000"; RAM=64M ;;
+t40) KERNEL=${KERNEL:-/home/ai/dimerr/tmp-scratch/sdio/kb40w/arch/mips/boot/uImage}
+     DRIVER=${DRIVER:-/home/ai/dimerr/tmp-scratch/sdio/atbm40/driver_install}
+     MEM="mem=64M rmem=64M@0x4000000"; RAM=128M ;;
+*) echo "unsupported --soc $SOC" >&2; exit 2 ;;
+esac
+FW=${FW:-/home/ai/dimerr/local/ingenic/fw/$SOC}
+[ -e "$KERNEL" ] || { echo "SKIP: no $SOC kernel with MSC1 (--kernel)"; exit 0; }
 [ -e "$DRIVER/atbm_wifi.ko" ] || { echo "SKIP: no atbm driver (--driver)"; exit 0; }
-for f in "$FW/rootfs.squashfs.t31" "$QEMU"; do
+for f in "$FW/rootfs.squashfs.$SOC" "$QEMU"; do
     [ -e "$f" ] || { echo "missing $f" >&2; exit 2; }
 done
 command -v mksquashfs >/dev/null || { echo "SKIP: no mksquashfs"; exit 0; }
@@ -50,7 +68,7 @@ trap 'kill $QPID 2>/dev/null || true; rm -rf "$WORK"' EXIT
 OUT=${OUT:-$WORK/out}
 mkdir -p "$OUT"
 
-unsquashfs -q -d "$WORK/rfs" "$FW/rootfs.squashfs.t31" >/dev/null
+unsquashfs -q -d "$WORK/rfs" "$FW/rootfs.squashfs.$SOC" >/dev/null
 mkdir -p "$WORK/rfs/root"
 cp "$DRIVER/cfg80211.ko" "$DRIVER/atbm_wifi.ko" "$WORK/rfs/root/"
 cat > "$WORK/rfs/root/open.conf" <<EOF
@@ -115,13 +133,13 @@ for path, off in ((sys.argv[2], 0x50000), (sys.argv[3], 0x250000)):
 open(sys.argv[1], 'wb').write(img)
 PY
 
-echo "== boot (t31, wifi=atbm, SSID $SSID)"
-"$QEMU" -M t31,wifi=atbm,flash-file="$WORK/nor.bin" -m 64M -display none \
+echo "== boot ($SOC, wifi=atbm, SSID $SSID)"
+"$QEMU" -M $SOC,wifi=atbm,flash-file="$WORK/nor.bin" -m $RAM -display none \
     -serial file:"$OUT/console.log" \
     -global atbm-sdio.trace=on \
     -nic user,model=atbm-sdio,net=10.0.2.0/24,host=10.0.2.2 \
     -kernel "$KERNEL" \
-    -append "console=ttyS1,115200n8 root=/dev/mtdblock3 rootfstype=squashfs init=/usr/bin/wifi-init mtdparts=jz_sfc:256k(boot),64k(env),2048k(kernel),8192k(rootfs),-(rootfs_data) mem=40M rmem=24M@0x2800000" \
+    -append "console=ttyS1,115200n8 root=/dev/mtdblock3 rootfstype=squashfs init=/usr/bin/wifi-init mtdparts=jz_sfc:256k(boot),64k(env),2048k(kernel),8192k(rootfs),-(rootfs_data) $MEM" \
     > "$OUT/qemu.err" 2>&1 &
 QPID=$!
 

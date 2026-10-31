@@ -507,6 +507,58 @@ def test_sdio(qt):
     check('FBR1 standard SDIO function', _sdio52(qt, 0, 0x100) & 0x0f, 0x0c)
 
 
+SDHCI1 = 0x13070000
+
+
+def _sdhci_cmd(qt, cmd, arg, resp=0x02, data=None):
+    """One SDHCI1 command (48-bit response by default); data: a write."""
+    rw = lambda a, v: qt.cmd('writew 0x%x 0x%x' % (a, v))
+    qt.writel(SDHCI1 + 0x30, 0xffffffff)            # clear NORINTSTS
+    flags = resp
+    if data is not None:
+        rw(SDHCI1 + 0x04, len(data))                # BLKSIZE
+        rw(SDHCI1 + 0x06, 1)                        # BLKCNT
+        flags |= 0x20                               # data present
+    qt.writel(SDHCI1 + 0x08, arg)
+    qt.writel(SDHCI1 + 0x0C, (cmd << 8 | flags) << 16)  # TRNMOD 0: write
+    if data is not None:
+        qt.writel(SDHCI1 + 0x20, struct.unpack('<I', data)[0])
+    return qt.readl(SDHCI1 + 0x10)
+
+
+def test_sdio_sdhci(qt):
+    print('atbm-sdio (SDIO on the XBurst2 SDHCI MSC1, card interrupt)')
+    qt.writel(SDHCI1 + 0x28, 0x0f << 8)             # bus power 3.3 V
+    qt.writel(SDHCI1 + 0x2C, 0x5)                   # internal + SD clock
+    qt.writel(SDHCI1 + 0x34, 0x01ff0000 | 0x00ff)   # status enables
+    r = _sdhci_cmd(qt, 5, 0)
+    check('CMD5 inquiry: not ready', r >> 31, 0)
+    r = _sdhci_cmd(qt, 5, 0x300000)
+    check('CMD5 with voltage: card ready', r >> 31, 1)
+    rca = _sdhci_cmd(qt, 3, 0) >> 16
+    check('CMD3: RCA assigned', rca, 1)
+    _sdhci_cmd(qt, 7, rca << 16, 0x1b)
+    check('CMD52 CCCR revision', _sdhci_cmd(qt, 52, 0x00) & 0xff, 0x43)
+    # function-1 CMD53 to the HIF CONFIG register: set, then clear the
+    # chip's CPU reset; its startup indication then holds the interrupt
+    cfg = lambda v: _sdhci_cmd(qt, 53, 1 << 31 | 1 << 28 | 1 << 26 | 4,
+                               data=struct.pack('<I', v))
+    cfg(1 << 14)
+    cfg(0)
+    nis = lambda: qt.readl(SDHCI1 + 0x30) & 0xffff
+    qt.step(50 * 1000 * 1000)
+    check('no card interrupt while it is disabled', nis() & 0x100, 0)
+    qt.writel(SDHCI1 + 0x34, 0x01ff0000 | 0x01ff)   # + card interrupt
+    check('card interrupt status once enabled', nis() & 0x100, 0x100)
+    qt.writel(SDHCI1 + 0x30, 0x100)
+    check('it is level: write-1-clear leaves it', nis() & 0x100, 0x100)
+    qt.writel(SDHCI1 + 0x38, 0x100)                 # signal enable
+    check('signalled: MSC1 pending in the INTC',
+          (qt.readl(CORE_INTC + 0x20) >> (36 - 32)) & 1, 1)
+    qt.writel(SDHCI1 + 0x34, 0x01ff0000 | 0x00ff)
+    check('status enable off drops it', nis() & 0x100, 0)
+
+
 def test_sadc(qt, intc=INTC):
     print('ingenic-sadc')
     rb = lambda a: int(qt.cmd('readb 0x%x' % a).split()[1], 16)
@@ -3465,6 +3517,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't31,wifi=atbm', ['-nic', 'user'])
         test_sdio(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't40,wifi=atbm', ['-nic', 'user'])
+        test_sdio_sdhci(qt)
         qt.close()
         qt = QTest(a.qemu, 't31', ['-device', 'w25q80,bus=ssi0,cs=0'])
         test_ssi(qt)

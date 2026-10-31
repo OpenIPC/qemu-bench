@@ -58,7 +58,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13440000 | SFC + SPI NOR or SPI NAND | `ingenic-sfc` + m25p80 / `ingenic-spinand` |
 | 0x13450000 | T41: SFC1, IRQ 19 (`-drive if=mtd,index=1`) | `ingenic-sfc` |
 | 0x13450000 / 0x13460000 | MSC0/1 (XBurst1) | `ingenic-msc` |
-| MSC1 SDIO | ATBM6031 Wi-Fi (`-M t31,wifi=atbm`) | `atbm-sdio` |
+| MSC1 SDIO | ATBM6031 Wi-Fi (`-M t31,wifi=atbm`; T40/T41 on the SDHCI MSC1) | `atbm-sdio` |
 | 0x13060000 / 0x13070000 | MSC0/1 (XBurst2): SDHCI 3.0 | QEMU `generic-sdhci` |
 | 0x134B0000 | Synopsys GMAC, IP101G PHY | `ingenic-gmac` |
 | 0x13500000 | DWC2 USB OTG, host | QEMU `dwc2-usb` |
@@ -536,7 +536,25 @@ and DCCM, by DMA CMD53 writes), the startup indication brings up `wlan0`,
 `wpa_supplicant` scans, sees the emulated SSID and associates to the open
 network, `udhcpc` gets 10.0.2.15 from slirp and `ping 10.0.2.2` answers.
 The guest NIC is `-nic user,model=atbm-sdio` (the machine binds it to the
-card).  A qtest (`test_sdio`) drives the enumeration; the guest test skips
+card).
+
+XBurst2 (T40/T41) puts the same card on MSC1, an SDHCI host: patch 0027
+makes an SDIO card's interrupt the SDHCI Normal Interrupt Status "Card
+Interrupt" bit, level-sensitive while enabled.  `test-ingenic-wifi.sh
+--soc t40` passes the same way with OpenIPC's T40 kernel
+(`t40.generic.config`) rebuilt with MSC1 enabled in its built-in device
+tree -- `status = "okay"`, `ingenic,sdio_clk` (which puts the host on
+`sdhci-ingenic`'s manual-detect list for `jzmmc_manual_detect()`) and no
+`non-removable`; the stock tree leaves MSC1 off -- and the driver built
+for `PLATFORM_INGENICT41`.  That kernel has no `CONFIG_WIRELESS_EXT`, which
+the driver's private tx-power ioctls assume, so that build needs those
+three helpers stubbed; the driver's own `cfg80211.ko` (from its
+`wireless/`) goes with it, not the rootfs's.
+
+Qtests: `test_sdio` drives the enumeration on the T31 MSC1,
+`test_sdio_sdhci` on the T40 SDHCI MSC1 plus the card interrupt (raised
+by the startup indication after a CMD53 releases the chip's CPU, level,
+reaching the core INTC).  The guest test skips
 without the built driver (`--driver`, the vendor tree built with
 `platform=PLATFORM_INGENICT31 ATBM_WIFI__EXT_CCFLAGS=-DATBM_WIFI_PLATFORM=24`;
 without the platform define its insert hook is a stub that never asks the
@@ -1914,8 +1932,7 @@ and the TCU's PWM pins.
 
 The SDIO Wi-Fi chip (`atbm-sdio`): only open networks (no WPA/WPA2
 handshake), no power save or the chip's BLE side; `wifi=atbm` puts it on
-MSC1 of any XBurst1 machine but only T31 is tested, and XBurst2's SDHCI
-hosts do not get it.
+MSC1 of every machine, tested end to end on T31 (jzmmc) and T40 (SDHCI).
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode

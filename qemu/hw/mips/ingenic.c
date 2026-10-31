@@ -1730,6 +1730,13 @@ static void ingenic_init(MachineState *ms)
                                         &error_fatal);
                 qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                        &error_fatal);
+            } else if (i == 1 && ims->wifi && !strcmp(ims->wifi, "atbm")) {
+                /* the SDIO Wi-Fi chip on MSC1, as on the XBurst1 parts */
+                DeviceState *card = qdev_new("atbm-sdio");
+
+                qemu_configure_nic_device(card, false, NULL);
+                qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                       &error_fatal);
             }
         }
     } else {
