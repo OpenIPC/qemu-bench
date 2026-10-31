@@ -2585,6 +2585,83 @@ def test_isp_xstats_t41(qt):
               struct.unpack_from('<H', tmo, 4 * i + 2)[0]
               for i in range(0, 3750, 50)), True)
 
+def hldc_calc(k1, k2, w, h):
+    """tisp_hldc_calc_para for a plane centred in its middle"""
+    cx, cy = w // 2, h // 2
+    dx = (cx - 1, w - cx - 1)
+    dy = max(cy - 1, h - cy - 1)
+    r2max = max(dx) ** 2 + dy ** 2
+    inv = 0x3fffffff // r2max
+    f = [((r * r) >> 30) * k2 + (256 << 32) - k1 * r
+         for r in (r2max * inv, min(dx) ** 2 * inv)]
+    return inv, (0x80000 << 32) // min(f) - 5
+
+
+def test_isp_hldc_t41(qt):
+    """T41's HLDC: tisp_hldc_write_reg's registers, 0x40 bit 20 bypass"""
+    print('ingenic-isp HLDC (T41)')
+    (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
+     vsta, vclr) = ISP_LAYOUTS['t41']
+    w, h, k1, k2 = 256, 144, 200, 40
+    ch0 += ISP
+    qt.writel(ISP + 0x80, w << 16 | h)          # the sensor's picture
+    qt.writel(ch0 + size, w << 16 | h)
+    qt.writel(ISP + ch_en, 1)
+    qt.writel(vic + 0x00, 1)
+    qt.writel(ISP + en, 0xFFFFFFFF)
+
+    def frame(addr):
+        qt.writel(ch0 + push_y, addr)
+        qt.writel(ch0 + push_uv, addr + w * h)
+        qt.step(41 * 1000 * 1000)
+        qt.writel(ISP + clr, qt.readl(ISP + sta))
+        qt.readl(ch0 + pop_y)
+        qt.readl(ch0 + pop_y + 0x18)
+        return qt.read(addr, w * h)
+
+    inv, zoom = hldc_calc(k1, k2, w, h)
+    uinv, uzoom = hldc_calc(k1, k2, w // 2, h // 2)
+    regs = {0x15000: 0x00010001, 0x15004: k2 << 16 | k1,
+            0x15008: k2 << 16 | k1, 0x1500C: zoom, 0x15010: uzoom,
+            0x15014: inv, 0x15018: uinv, 0x1501C: 0, 0x15020: 0,
+            0x15044: 3}
+    for r, v in regs.items():
+        qt.writel(ISP + r, v)
+    qt.writel(ISP + 0x40, 0xffd00049)           # linear, HLDC bypassed
+    a = frame(0x00400000)
+    qt.writel(ISP + 0x40, 0xffc00049)           # bitBypassHLDC clear
+    b = frame(0x00500000)
+    # the reading of the registers (docs): output d from the centre shows
+    # the picture at d * f(rho) / 256 * zoom / 2048, bilinear
+    cx, cy = w // 2, h // 2
+    near = far = 0
+    n = 0
+    for y in range(h // 4, h, 3):               # below the frame counter
+        for x in range(0, w, 3):
+            dx, dy = x - cx, y - cy
+            rho = (dx * dx + dy * dy) * inv / 2.0 ** 30
+            g = (256 - k1 * rho / 4 + k2 * rho * rho / 4) / 256 * zoom / 2048
+            ux, uy = cx + dx * g, cy + dy * g
+            x0, y0 = int(math.floor(ux)), int(math.floor(uy))
+            fx, fy = ux - x0, uy - y0
+            px = lambda yy, xx: a[min(max(yy, 0), h - 1) * w +
+                                  min(max(xx, 0), w - 1)]
+            ref = ((px(y0, x0) * (1 - fx) + px(y0, x0 + 1) * fx) * (1 - fy) +
+                   (px(y0 + 1, x0) * (1 - fx) + px(y0 + 1, x0 + 1) * fx) * fy)
+            near += abs(b[y * w + x] - ref) <= 2
+            far += abs(b[y * w + x] - a[y * w + x]) <= 2
+            n += 1
+    check('HLDC on: the picture remapped (%d%% within 2 of the reading)'
+          % (100 * near // n), near >= 0.95 * n, True)
+    check('and moved (%d%% unchanged)' % (100 * far // n), far < 0.92 * n,
+          True)
+    qt.writel(ISP + 0x40, 0xffd00049)
+    c = frame(0x00600000)
+    same = sum(abs(c[i] - a[i]) <= 2 for i in range(w * h // 4, w * h, 7))
+    check('bypassed again: the plain picture', same >= 0.95 * len(
+        range(w * h // 4, w * h, 7)), True)
+
+
 def test_isp_stats_t21(qt):
     """T21's statistics: AE 0x700, AWB 0x800, no enable bits (tisp_init)."""
     print('ingenic-isp 3A statistics (t21, sensor=jxf37)')
@@ -2766,6 +2843,28 @@ def test_isp_t40_pipe1(qt):
     check('the two pictures differ in the counter', row0 != row1, True)
     check('and match in the scene below it',
           qt.read(buf[0] + 60 * w, w) == qt.read(buf[1] + 60 * w, w), True)
+    # a joint picture, main above (ispcore_pad_event_handle, joint mode
+    # 3): channel 0's buffer to both pipes, the secondary's part h lines
+    # down, its CbCr h / 2 lines down the CbCr plane of the w x 2h picture
+    qt.writel(ISP + 0x40024, qt.readl(ISP + 0x40028))
+    qt.writel(ISP + 0x40034, qt.readl(ISP + 0x40038))
+    j = 0x00700000
+    qt.write(j, bytes(w * 2 * h * 3 // 2))
+    qt.writel(ISP + 0x16100 + 0x6C, j)
+    qt.writel(ISP + 0x16100 + 0x84, j + w * 2 * h)
+    qt.writel(ISP + 0x17100 + 0x6C, j + w * h)
+    qt.writel(ISP + 0x17100 + 0x84, j + w * 2 * h + w * h // 2)
+    # pipe 0 still holds buf[0] from the first setup: two frames
+    qt.step(82 * 1000 * 1000)
+    top = qt.read(j + 6 * w, 64)
+    bottom = qt.read(j + (h + 6) * w, 64)
+    check('joint: the main counter (0) in the top part, the secondary\'s '
+          '(5) in the bottom one', (top[8] > 128, bottom[8] > 128),
+          (True, False))
+    check('joint: both parts carry the scene, CbCr included',
+          (qt.read(j + 60 * w, w) == qt.read(j + (h + 60) * w, w),
+           qt.read(j + 2 * h * w + 30 * w, w) ==
+           qt.read(j + 2 * h * w + (h // 2 + 30) * w, w)), (True, True))
     qt.writel(vic0 + 0x00, 0)
     qt.writel(vic1 + 0x00, 0)
 
@@ -3162,6 +3261,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't41,sensor=gc4663')
         test_isp_xstats_t41(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't41')
+        test_isp_hldc_t41(qt)
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc4653')
         test_isp_wdr(qt)

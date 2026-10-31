@@ -16,6 +16,10 @@
 #        [--snap-env VAR=VALUE (exported to the client; repeatable)]
 #        [--wdr (the sensor's two-exposure WDR mode: t31, t40 gc4653,
 #               t41 gc4663)]
+#        [--joint MODE (t40 with --sensor1: libimp's joint picture,
+#               1 main left, 2 right, 3 above, 4 under)]
+#        [--ldc K1,K2 (t41: the ISP's lens distortion correction, HLDC,
+#               turned on between the first and the last frame saved)]
 #        [--fw DIR] [--qemu PATH] [--toolchain BINDIR] [--sdk DIR]
 #        [--libimp rootfs|sdk] [--frames N] [--out DIR] [--png]
 #        [--isp-ko FILE]
@@ -72,6 +76,8 @@ SENSOR1=
 SENSOR2=
 SNAP_ENV=
 WDR=
+LDC=
+JOINT=
 FRAMES=40
 OUT=
 PNG=
@@ -85,6 +91,8 @@ while [ $# -gt 0 ]; do
     --sensor2) SENSOR2=$2; shift ;;
     --snap-env) SNAP_ENV="$SNAP_ENV $2"; shift ;;
     --wdr) WDR=1 ;;
+    --ldc) LDC=$2; shift ;;
+    --joint) JOINT=$2; shift ;;
     --fw) FW=$2; shift ;;
     --image) IMAGE=$2; shift ;;
     --isp-ko) ISP_KO=$2; shift ;;
@@ -114,7 +122,7 @@ t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64 ;;
 t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41
-     DEFS="-DSNAP_T40 -DSNAP_I2C_ADAPTER=0 -DSNAP_MCLK=IMPISP_SENSOR_MCLK0 -DSNAP_AF -DSNAP_WDR_API"
+     DEFS="-DSNAP_T40 -DSNAP_I2C_ADAPTER=0 -DSNAP_MCLK=IMPISP_SENSOR_MCLK0 -DSNAP_AF -DSNAP_WDR_API -DSNAP_LDC"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      IMAGE=${IMAGE:-$IMAGE41}
      RAM=128M; MEM="mem=48M@0x0 rmem=64M@0x3000000 nmem=16M@0x7000000"
@@ -150,6 +158,18 @@ if [ -n "$WDR" ]; then
     if [ $SOC = t31 ]; then
         RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64
     fi
+fi
+SLOT_STEP=8
+if [ -n "$JOINT" ]; then
+    [ -n "$SENSOR1" ] || { echo "--joint needs --sensor1" >&2; exit 2; }
+    # a 2560x2880 joint picture is 11 MiB: 16 MiB slots at rmem's top
+    SNAP_ENV="$SNAP_ENV SNAP_JOINT=$JOINT SNAP_SLOT_MB=16"
+    SLOT_MB=192
+    SLOT_STEP=16
+fi
+if [ -n "$LDC" ]; then
+    [ $SOC = t41 ] || { echo "--ldc is for t41" >&2; exit 2; }
+    SNAP_ENV="$SNAP_ENV SNAP_LDC=$LDC"
 fi
 SLOT_MB=${SLOT_MB:-$((RMEM_MB + 32))}
 if [ $SOC = t41 ]; then
@@ -371,13 +391,14 @@ for try in 1 2 3; do
         if [ -z "$saved" ] && grep -q ISPTEST-PMEM "$OUT/console.log"; then
             saved=1
             # the frames in rmem, 8 MiB apart
-            python3 - "$WORK/mon.sock" "$WORK" $SLOT_MB <<'PY'
+            python3 - "$WORK/mon.sock" "$WORK" $SLOT_MB $SLOT_STEP <<'PY'
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
+step = int(sys.argv[4])
 for slot in range(4):
     s.sendall(b'pmemsave %d %d "%s/pmem%d.nv12"\n' %
-              ((int(sys.argv[3]) + 8 * slot) << 20, 8 << 20,
+              ((int(sys.argv[3]) + step * slot) << 20, step << 20,
                sys.argv[2].encode(), slot))
     time.sleep(1)
 s.close()
@@ -411,6 +432,43 @@ mv "$OUT/slot0.nv12" "$OUT/ch0-$first.nv12"
 mv "$OUT/slot1.nv12" "$OUT/ch0-$last.nv12"
 mv "$OUT/slot2.nv12" "$OUT/ch1-$first.nv12"
 mv "$OUT/slot3.nv12" "$OUT/ch1-$last.nv12"
+if [ -n "$JOINT" ]; then
+    # channel 0 the joint picture: each sensor's part (the secondary's at
+    # the offset ispcore_pad_event_handle gives it) with its own pipe's
+    # counter; channel 1 pipe 0's scaled stream
+    for n in $first $last; do
+        python3 - "$OUT/ch0-$n.nv12" $W $H $JOINT "$OUT" $n <<'PY' || exit 1
+import sys
+import numpy as np
+path, w, h, mode, out, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), \
+    int(sys.argv[4]), sys.argv[5], sys.argv[6]
+jw, jh = (2 * w, h) if mode <= 2 else (w, 2 * h)
+d = np.fromfile(path, np.uint8, jw * jh * 3 // 2)
+y = d[:jw * jh].reshape(jh, jw)
+uv = d[jw * jh:].reshape(jh // 2, jw)
+main = {1: 'left', 2: 'right', 3: 'top', 4: 'bottom'}[mode]
+for who, part in (('main', main), ('sec', {'left': 'right', 'right': 'left',
+                  'top': 'bottom', 'bottom': 'top'}[main])):
+    if part in ('left', 'right'):
+        x0 = 0 if part == 'left' else w
+        py, puv = y[:, x0:x0 + w], uv[:, x0:x0 + w]
+    else:
+        y0 = 0 if part == 'top' else h
+        py, puv = y[y0:y0 + h], uv[y0 // 2:y0 // 2 + h // 2]
+    open('%s/%s-%s.nv12' % (out, who, n), 'wb').write(
+        np.ascontiguousarray(py).tobytes() + np.ascontiguousarray(puv).tobytes())
+    print('  %s sensor: the %s part' % (who, part))
+PY
+    done
+    python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
+        ${W}x$H:"$OUT/main-$first.nv12@0" ${W}x$H:"$OUT/main-$last.nv12@0" &&
+    python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
+        ${W}x$H:"$OUT/sec-$first.nv12@500000" \
+        ${W}x$H:"$OUT/sec-$last.nv12@500000" &&
+    python3 "$HERE/ingenic-isp-check.py" --advance \
+        640x360:"$OUT/ch1-$first.nv12" 640x360:"$OUT/ch1-$last.nv12"
+    exit $?
+fi
 if [ -n "$SENSOR1" ]; then
     # channel 3, the second pipe, where channel 1 would be: each pipe's
     # frames advance, pipe 1's counter 500000 ahead of pipe 0's
@@ -421,6 +479,65 @@ if [ -n "$SENSOR1" ]; then
     python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
         ${W}x$H:"$OUT/ch3-$first.nv12@500000" \
         ${W}x$H:"$OUT/ch3-$last.nv12@500000"
+    exit $?
+fi
+if [ -n "$LDC" ]; then
+    # the first frames without the correction (the scene as ever), the
+    # last ones through it: the same picture remapped here from the
+    # registers' reading (docs/ingenic.md, "HLDC") matches the last
+    python3 "$HERE/ingenic-isp-check.py" ${PNG:+--png "$OUT"} \
+        ${W}x$H:"$OUT/ch0-$first.nv12" 640x360:"$OUT/ch1-$first.nv12" || exit 1
+    echo "== LDC"
+    python3 - "$OUT" $first $last $W $H ${LDC%,*} ${LDC#*,} <<'PY'
+import sys
+import numpy as np
+out, first, last, sw, sh, k1, k2 = sys.argv[1], sys.argv[2], sys.argv[3], \
+    *map(int, sys.argv[4:8])
+
+def calc(w, h, cx, cy):
+    """tisp_hldc_calc_para: 1 / r2max and the zoom"""
+    dx = (cx - 1, w - cx - 1)
+    dy = max(cy - 1, h - cy - 1)
+    r2max = max(dx) ** 2 + dy ** 2
+    inv = 0x3fffffff // r2max
+    f = [((r * r) >> 30) * k2 + (256 << 32) - k1 * r
+         for r in (r2max * inv, min(dx) ** 2 * inv)]
+    return inv, (0x80000 << 32) // min(f) - 5
+
+def remap(img):
+    h, w = img.shape
+    inv, zoom = calc(sw, sh, sw // 2, sh // 2)
+    sx, sy, cx, cy = sw / w, sh / h, sw // 2, sh // 2
+    yy, xx = np.mgrid[0:h, 0:w].astype(float)
+    dx, dy = (xx + .5) * sx - .5 - cx, (yy + .5) * sy - .5 - cy
+    rho = (dx * dx + dy * dy) * inv / 2.0 ** 30
+    g = (256 - k1 * rho / 4 + k2 * rho * rho / 4) / 256 * zoom / 2048
+    ux, uy = (cx + dx * g + .5) / sx - .5, (cy + dy * g + .5) / sy - .5
+    x0, y0 = np.floor(ux).astype(int), np.floor(uy).astype(int)
+    fx, fy = ux - x0, uy - y0
+    px = lambda y, x: img[np.clip(y, 0, h - 1), np.clip(x, 0, w - 1)]
+    return ((px(y0, x0) * (1 - fx) + px(y0, x0 + 1) * fx) * (1 - fy) +
+            (px(y0 + 1, x0) * (1 - fx) + px(y0 + 1, x0 + 1) * fx) * fy)
+
+ok = True
+for ch, (w, h) in ((0, (sw, sh)), (1, (640, 360))):
+    load = lambda n: np.fromfile('%s/ch%d-%s.nv12' % (out, ch, n), np.uint8,
+                                 w * h).reshape(h, w).astype(float)
+    a, b = load(first), load(last)
+    keep = np.ones((h, w), bool)
+    keep[:h // 6, :w // 3] = False          # the frame counter
+    ref = remap(a)
+    gain = np.median(b[keep]) / np.median(ref[keep])
+    plain = np.percentile(np.abs(b - a * gain)[keep], 95)
+    near = np.percentile(np.abs(b - ref * gain)[keep], 95)
+    good = near < 6 and plain > 4 * max(near, 1)
+    print('  ch%d %dx%d: 95%% of pixels within %.1f of the remapped picture '
+          '(%.1f without the remap): %s' % (ch, w, h, near, plain,
+                                            'ok' if good else 'BAD'))
+    ok &= good
+print('PASS' if ok else 'FAIL')
+sys.exit(0 if ok else 1)
+PY
     exit $?
 fi
 python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \

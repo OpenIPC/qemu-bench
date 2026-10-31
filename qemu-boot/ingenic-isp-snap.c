@@ -155,6 +155,7 @@ static int nframes = 10;
 static const char *outdir = "/tmp";
 static int chn_ok[2];
 static int chn_id[2] = { 0, 1 };    /* the FrameSource channel of each */
+static int joint;                   /* T40 joint mode: channel 3 on too */
 
 /*
  * The IMP 1.1.6 IMPFSChnAttr (the rootfs's libimp) ends with a front crop
@@ -178,6 +179,7 @@ static struct {
     } },
 };
 #define attr(n) (attrs[n].a)
+static IMPFSChnAttr joint_attr;     /* channel 3 in a joint mode */
 
 /* O_DIRECT wants aligned buffers: copy through one, 64 KiB at a time */
 static int save(int ch, int fd, const unsigned char *p, unsigned size)
@@ -228,6 +230,127 @@ static int snap_wdr(void)
     printf("isp-snap: WDR enabled\n");
     return 0;
 }
+
+#ifdef SNAP_LDC
+#include <stdint.h>
+#include <sys/ioctl.h>
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+/*
+ * SNAP_LDC=<k1>,<k2>: the ISP's lens distortion correction (HLDC) on.
+ * The stock tx-isp-t41.ko (H20230630a) builds IMP_ISP_LDC_*'s LDC block
+ * out (TX_ISP_LDC_ENABLE), and nothing in it calls tisp_hldc_set_attr;
+ * what reaches the HLDC registers (0x15000..0x15044) is the tuning
+ * device /dev/tisp: _IO('t', 1) with module 21 (LDC), sub-module 0 and
+ * the 16 halfwords tisp_hldc_write_reg writes.  They are computed here
+ * as tisp_hldc_set_attr / tisp_hldc_calc_para would (k1 / k2 of the
+ * radial model for luma and chroma, the zoom that keeps the picture
+ * filled, the inverse of the largest squared radius, the centre's
+ * offset); then IMP_ISP_Tuning_SetModuleControl clears bitBypassHLDC.
+ */
+static int ldc_pending;
+
+#define TISP_SET_PAR    0x20007401      /* _IO('t', 1), MIPS encoding */
+#define TISP_LDC        21
+#define TISP_PAR_SIZE   20492
+
+static void hldc_calc(int k1, int k2, int w, int h, int cx, int cy,
+                      int32_t *out)
+{
+    int dxa = cx - 1, dxb = w - cx - 1, dy = MAX(cy - 1, h - cy - 1);
+    int dxmax = MAX(dxa, dxb), dxmin = MIN(dxa, dxb);
+    int32_t maxr2 = dxmax * dxmax + dy * dy;
+    int32_t inv = 0x3fffffff / maxr2;
+    int64_t r = (int64_t)maxr2 * inv, r2 = (int64_t)dxmin * dxmin * inv;
+    int64_t f1 = ((r * r) >> 30) * k2 + (256LL << 32) - (int64_t)k1 * r;
+    int64_t f2 = ((r2 * r2) >> 30) * k2 + (256LL << 32) - (int64_t)k1 * r2;
+    int64_t f = MIN(f1, f2);
+    int32_t scale = (int32_t)((0x80000LL << 32) / f) - 5;
+
+    out[0] = inv;
+    out[1] = scale > 0 ? scale : 1;
+    out[2] = cx - w / 2;
+    out[3] = cy - h / 2;
+}
+
+static int snap_ldc(int w, int h)
+{
+    static uint32_t par[TISP_PAR_SIZE / 4];
+    uint16_t *p = (uint16_t *)&par[3];
+    int32_t y[4], uv[4];
+    int k1 = 0, k2 = 0, fd;
+
+    if (!getenv("SNAP_LDC")) {
+        return 0;
+    }
+    sscanf(getenv("SNAP_LDC"), "%d,%d", &k1, &k2);
+    hldc_calc(k1, k2, w, h, w / 2, h / 2, y);
+    hldc_calc(k1, k2, w / 2, h / 2, w / 4, h / 4, uv);
+    par[0] = TISP_LDC;
+    par[2] = 0;
+    p[0] = 1;                   /* the tuning's own (both 1) */
+    p[1] = 1;
+    p[2] = k1;
+    p[3] = k2;
+    p[4] = k1;
+    p[5] = k2;
+    p[6] = y[1];
+    p[7] = uv[1];
+    p[8] = y[0];
+    p[9] = uv[0];
+    p[10] = y[2];
+    p[11] = y[3];
+    p[12] = uv[2];
+    p[13] = uv[3];
+    fd = open("/dev/tisp", O_RDWR);
+    if (fd < 0 || ioctl(fd, TISP_SET_PAR, par) < 0) {
+        printf("isp-snap: /dev/tisp LDC parameters failed\n");
+        return -1;
+    }
+    close(fd);
+    printf("isp-snap: LDC k1 %d k2 %d: zoom %d / %d, inverse r2 %d / %d\n",
+           k1, k2, y[1], uv[1], y[0], uv[0]);
+    ldc_pending = 1;
+    return 0;
+}
+
+/*
+ * The stage on (bitBypassHLDC clear) once the first frames are saved:
+ * the host compares a picture without the correction with one through it
+ */
+static void ldc_enable(void)
+{
+    IMPISPModuleCtl ctl;
+
+    ldc_pending = 0;
+    if (IMP_ISP_Tuning_GetModuleControl(IMPVI_MAIN, &ctl) < 0) {
+        printf("isp-snap: GetModuleControl failed\n");
+        return;
+    }
+    ctl.bitBypassHLDC = 0;
+    if (IMP_ISP_Tuning_SetModuleControl(IMPVI_MAIN, &ctl) < 0) {
+        printf("isp-snap: SetModuleControl failed\n");
+        return;
+    }
+    printf("isp-snap: LDC on\n");
+}
+#else
+static int ldc_pending;
+
+static int snap_ldc(int w, int h)
+{
+    (void)w;
+    (void)h;
+    return getenv("SNAP_LDC") ? -1 : 0;
+}
+
+static void ldc_enable(void)
+{
+}
+#endif
 
 #ifdef SNAP_AF
 /*
@@ -299,17 +422,21 @@ static void *grab(void *arg)
                  */
                 unsigned long base = strtoul(getenv("SNAP_DEVMEM"), NULL, 0);
                 int slot = 2 * k + (i == nframes - 1);
+                /* SNAP_SLOT_MB: bigger slots for a joint picture */
+                unsigned mb = getenv("SNAP_SLOT_MB") ?
+                              atoi(getenv("SNAP_SLOT_MB")) : 8;
                 int mfd = open("/dev/mem", O_RDWR | O_SYNC);
                 void *dst = mfd < 0 ? MAP_FAILED :
-                            mmap(NULL, 8 << 20, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, mfd, base + (slot << 23));
+                            mmap(NULL, mb << 20, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, mfd,
+                                 base + ((unsigned long)slot * mb << 20));
 
                 if (dst == MAP_FAILED) {
                     printf("ch%d: cannot map slot %d\n", ch, slot);
                 } else {
                     memcpy(dst, (void *)f->virAddr,
-                           f->size < (8u << 20) ? f->size : 8u << 20);
-                    munmap(dst, 8 << 20);
+                           f->size < (mb << 20) ? f->size : mb << 20);
+                    munmap(dst, mb << 20);
                 }
                 if (mfd >= 0) {
                     close(mfd);
@@ -346,6 +473,10 @@ static void *grab(void *arg)
             }
         }
         IMP_FrameSource_ReleaseFrame(ch, f);
+        /* both channels' first frames are out by then */
+        if (k == 0 && i == nframes - 5 && ldc_pending) {
+            ldc_enable();
+        }
     }
     IMP_FrameSource_SetFrameDepth(ch, 0);
     chn_ok[k] = 1;
@@ -485,8 +616,25 @@ int main(int argc, char **argv)
         sensor1.video_interface = IMPISP_SENSOR_VI_MIPI_CSI1;
         sensor1.mclk = IMPISP_SENSOR_MCLK2;
         sensor1.sensor_id = 1;
-        chn_id[1] = 3;
-        attr(1) = attr(0);
+        if (mode.joint_mode) {
+            /*
+             * a joint picture on channel 0, twice the sensor's size
+             * across (main left / right) or down (above / under); the
+             * second stream is channel 1, pipe 0's scaled one
+             * (ispcore_pad_event_handle queues channel 0's buffer to
+             * both pipes, the secondary's part at its offset)
+             */
+            joint_attr = attr(0);
+            joint = 1;
+            if (mode.joint_mode <= IMPISP_MAIN_ON_THE_RIGHT) {
+                attr(0).picWidth *= 2;
+            } else {
+                attr(0).picHeight *= 2;
+            }
+        } else {
+            chn_id[1] = 3;
+            attr(1) = attr(0);
+        }
         if (s2) {
             /* the third sensor: VIC2 on the DVP port (two CSI hosts), I2C0 */
             colon = strchr(s2, ':');
@@ -541,6 +689,9 @@ int main(int argc, char **argv)
         printf("IMP_ISP_EnableTuning failed\n");
         return 1;
     }
+    if (snap_ldc(attr(0).picWidth, attr(0).picHeight) < 0) {
+        return 1;
+    }
 #ifndef SNAP_T40
     IMP_ISP_Tuning_SetISPRunningMode(IMPISP_RUNNING_MODE_DAY);
 #endif
@@ -551,11 +702,27 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    if (joint) {
+        /*
+         * the secondary pipe's channel, created and enabled as well (its
+         * scaler writes the secondary's part of channel 0's buffer); its
+         * frames come through channel 0
+         */
+        if (IMP_FrameSource_CreateChn(3, &joint_attr) < 0 ||
+            IMP_FrameSource_SetChnAttr(3, &joint_attr) < 0) {
+            printf("ch3: CreateChn failed\n");
+            return 1;
+        }
+    }
     for (ch = 0; ch < 2; ch++) {
         if (IMP_FrameSource_EnableChn(chn_id[ch]) < 0) {
             printf("ch%d: EnableChn failed\n", chn_id[ch]);
             return 1;
         }
+    }
+    if (joint && IMP_FrameSource_EnableChn(3) < 0) {
+        printf("ch3: EnableChn failed\n");
+        return 1;
     }
     printf("streaming\n");
 #ifdef SNAP_AF

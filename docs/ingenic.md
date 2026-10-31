@@ -1459,15 +1459,58 @@ buffer written, counts 0x300's frames down and raises bit 0. The same
 raw path behind a VIC frame channel (`ispvic_frame_channel_qbuf`, the
 module's `isp-w02` raw dequeue) is not driven by anything here.
 
-libimp's joint mode (`IMPISPDualSensorSplitJoint`) is taken only for the
-vertical joins with two 2560x1440 sensors -- left and right make 5120
-wide, past the scaler's limit ("Image width cannot exceed 3840!"). Then
-both pipes run and are given the same channel buffers (pipe 1's channel
-3 and pipe 0's channel 0 get the same Y / UV addresses, sizes and
-steps) and libimp serves only channel 0 (channel 3's GetFrame fails);
-where the hardware puts each pipe's picture in the shared buffer is in
-no register the driver writes, so the model paints both pipes whole into
-it, the later on top.
+libimp's joint mode (`IMPISPDualSensorSplitJoint`: 1 main left, 2 right,
+3 above, 4 under) puts both sensors in one picture on channel 0, twice
+the sensor's size across or down; the secondary pipe's channel 3 is
+created and enabled with the sensor's size, and its frames come through
+channel 0. `ispcore_pad_event_handle` (`tx-isp-t40.ko`) queues channel
+0's buffer to both pipes' scalers: one gets it as it is, the other at an
+offset -- across, the channel's width less the part's (main left) or the
+part's width (main right), in bytes for both planes; down, width x (the
+channel's height less the part's) (main above) or width x the part's
+height (main under) for luma and half that for the CbCr plane -- and the
+ISR pops both pipes' done FIFOs for the one "buffer done" it sends. The
+model paints each pipe at the address and size its scaler was given, so
+each sensor's scene, lit by its own sensor and 3A, lands in its part.
+Left and right joins of two 2560x1440 sensors are 5120 wide, past the
+scaler's limit ("Image width cannot exceed 3840!"), which the driver
+enforces; above and under are tested (`test-ingenic-isp.sh --sensor1
+gc4653 --joint 3|4`: the main part reads pipe 0's counter, the
+secondary's pipe 1's, 500000 ahead).
+
+T41's HLDC, the ISP's lens distortion correction (`tiziano-hldc.c` of
+`tx-isp-t41.ko`), runs while 0x40 bit 20 (`IMPISPModuleCtl.bitBypassHLDC`)
+is clear. `tisp_hldc_write_reg` writes its registers from 16 halfwords --
+the tuning's at init (1, 1 and zeros), or the tuning device `/dev/tisp`'s
+(`_IO('t', 1)` with module 21, sub-module 0; the stock module builds
+`IMP_ISP_LDC_*`'s LDC block out, `TX_ISP_LDC_ENABLE`, and calls no
+`tisp_hldc_set_attr`):
+
+| | |
+|---|---|
+| 0x15000 | p1 << 16 \| p0 (1, 1 from every tuning; stored) |
+| 0x15004 / 0x15008 | k2 << 16 \| k1, luma / chroma |
+| 0x1500C / 0x15010 | the zoom, luma / chroma |
+| 0x15014 / 0x15018 | 0x3fffffff / r2max, luma / chroma |
+| 0x1501C / 0x15020 | the centre's offset, offy << 16 \| offx, luma / chroma |
+| 0x15024 / 0x15028, 0x15044 | p14 / p15 (stored); 3 |
+
+`tisp_hldc_calc_para` gives their meaning for a plane of w x h: r2max is
+the squared distance from the centre to the farthest corner, rho = r^2 /
+r2max, the radial gain f(rho) = 256 - k1 rho / 4 + k2 rho^2 / 4 (Q8), the
+zoom 2^19 / min(f(1), f at the nearer side) - 5 (Q11); its 1 / r2max for
+2560x1440, 498, is the SDK's own `r2_rep` for that size. How the stage
+applies them is inferred: an output pixel at d from the centre shows the
+picture at d x f(rho) / 256 x zoom / 2048 -- a barrel correction for k1
+> 0 that keeps the corners and pulls the middle in -- sampled
+bilinearly, luma and chroma with their own registers, on the sensor's
+picture (0x80) before the scaler, each channel mapped by its scale.
+`test-ingenic-isp.sh --soc t41 --ldc K1,K2` writes the parameters
+through `/dev/tisp`, saves frames, clears the bypass through libimp and
+saves more: the later frames match the earlier remapped on the host from
+the same registers (95 % of pixels identical, against 157 levels apart
+without the remap). T40's HLDC (`tisp_hldc_con_par_cfg`) is not
+modelled.
 
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
@@ -1625,6 +1668,8 @@ teardown, so the verdict comes first.
 | OpenIPC `t40` + vendor modules + the SDK's `sensor_gc4653s1_t40.ko`, two sensors | `t40,sensor=gc4653,sensor1=gc4653 -m 256M` | `-kernel` + NOR root | libimp in the all-cached dual mode: channel 0 (pipe 0) and channel 3 (pipe 1) at 2560x1440, 40 frames each, both pipes' AE converging on their own sensors, the scene and counter checked per pipe (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`) |
 | OpenIPC `t40` + vendor modules + the gc4653 "s1" module twice (as `s1` and `s2`), three sensors | `t40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653 -m 256M` | `-kernel` + NOR root | libimp with `IMPISP_TOTAL_THR`, the third on VIC2 / DVP: both pipes' frames as above, VIC2 interrupting; the `snapraw` command while streaming saves `/tmp/snap0.raw` (2560x1440 x 2 bytes, an RGGB mosaic of the navy scene: R 186, G 216, B 335 on average) through the VIC MDMA (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --sensor2 gc4653 --snap-env SNAP_SNAPRAW=0_1`) |
 | T41NQ SDK 1.2.0 image + its modules, `sensor=gc4663` | `t41,variant=t41nq -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t41`) |
+| the same, HLDC parameters through `/dev/tisp`, the bypass cleared through libimp | `t41,variant=t41nq` | as above | the corrected frames match the uncorrected ones remapped on the host from the registers (`test-ingenic-isp.sh --soc t41 --ldc 200,40`) |
+| OpenIPC `t40` + vendor modules, two gc4653, libimp's joint mode | `t40,sensor=gc4653,sensor1=gc4653` | as above | 2560x2880 on channel 0, the main sensor's part with pipe 0's counter and the secondary's with pipe 1's, above and under (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --joint 3`, `4`) |
 | OpenIPC `t10` + vendor modules, `sensor=jxh62` | `t10` | `-kernel` + NOR root | 1280x720 and 640x360, the sensor on bit-banged I2C (`test-ingenic-isp.sh --soc t10`) |
 | T40XP camera | `t40 -m 256M` | flash | login, the vendor application starts |
 | U-Boot `isvp_t31_sfcnand` (+ patch), 3.10 with `MTD_JZ_SFC_NAND`, UBI, OpenIPC t31 rootfs | `t31` | SPI NAND (`w25n01gv`) | SPL, U-Boot saves its env, UBI, SquashFS root on ubiblock, UBIFS overlay, login; a file written persists (`test-ingenic-nand.sh`) |
@@ -1675,30 +1720,30 @@ and the TCU's PWM pins.
 ## Not modelled
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
-its Apical base; above), the placement of the two pictures in T40's
-joint mode and the VIC raw frame channel (above), the 160 values of
+its Apical base; above), the left / right joins of T40's joint mode
+(past the scaler's limit with these sensors) and the VIC raw frame
+channel (above), the 160 values of
 T40/T41's WDR statistics at +1368, a WDR mode on T23 (no modelled sensor
 has one there), T40's GSM and LCE (read otherwise
 than T41's), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
-T41's lens distortion correction (below)
+T40's HLDC, T41's LDC block (below)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
 T40/T41 SDK kernels, drivers and libimp):
 
-- T41's LDC (0x13040000, `ingenic,t41-ldc`, core INTC 35): `tx-isp-t41.ko`
-  registers it as a platform device (`tx-isp-ldc.c`: resource, clocks
-  `div_ldc` / `gate_ldc`, pads) but no code programs it; libimp's
-  `IMP_ISP_LDC_SetAttr` / `IMP_ISP_LDC_INIT` (`TISP_VIDIOC_SET_LDC_ENABLE`)
-  drive the ISP's own HLDC stage instead (`tiziano-hldc.c`:
-  `tisp_hldc_write_reg` writes ISP 0x15000..0x15028 and 0x15044 = 3, from
-  `tisp_hldc_calc_para`'s radial model -- an inverse r^2 scale, a
-  strength and the optical centre's offset from the picture's). Those
-  registers are the ISP model's storage: the picture is not remapped, as
-  what each field does to a pixel is not in these sources.
+- T41's LDC block (0x13040000, `ingenic,t41-ldc`, core INTC 35):
+  `tx-isp-t41.ko` (H20230630a) registers it as a platform device
+  (`tx-isp-ldc.c`: resource, clocks `div_ldc` / `gate_ldc`, pads) but no
+  code programs it; `IMP_ISP_LDC_INIT` / `IMP_ISP_LDC_SetAttr` and their
+  `IMPISPLDCParams` (`LDC_ADDR_RES_SIZE`, `X_CORF`, `BROCF`, `R2_REP`,
+  `LEN_COEF`, shift tables, per the SDK's `ldclut.h`) are for an
+  "LDC-Beta" ISP build (`sample-Encoder-ldc-video.c`) that no SDK here
+  ships, so the block has no driver and no register offsets. The ISP's
+  own HLDC (above) is modelled.
 
 - T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
   the VPU when libimp asks for it; the VPU raises the completion, so
