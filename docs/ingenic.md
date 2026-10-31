@@ -1517,8 +1517,10 @@ shading. T40 and T41 (`tisp_wdr_interrupt_static`, T40's
 `tisp_wdr_get_data` reads 456 24-bit values (the first 450: 15 rows of
 15 long-frame then 15 short-frame blocks -- here luma sums), four
 12-bit and two 23-bit values at +1352 / +1360 (here the frames' mean
-luma, bright and dark counts), 160 values from +1368 (left zero, not
-identified) and, when the tuning asks, the long and the short frame's
+luma, bright and dark counts), 160 values from +1368 (40 groups of
+four packed 24-bit values; `tisp_wdr_get_data` unpacks them into a
+640-byte buffer that no code in either module reads -- only init
+allocates it and deinit frees it -- so they are left zero) and, when the tuning asks, the long and the short frame's
 R, G, B histograms from +1848 and +3896 (256 entries of three 21-bit
 counts).
 
@@ -1809,7 +1811,10 @@ the pair again instead of reading the done FIFO. Here 32 MiB of RAM at
 the pair into it and raises bit 20 without touching the done FIFO, and
 the AVPU reads 0x80000000-0x81FFFFFF unmasked. The IVDC's own registers
 (`ingenic-ivdc`, 0x13200000) hold the sizes and DRAM spill lines the
-driver writes; 0x00 bit 0 is a reset that reads back 0 at once (the
+driver writes (the spill is the block's own: the encoder still reads the
+0x80000000 pair, and software sees it only as the maximum DRAM lines at
++0xEC / +0xF0 that the T23 and T41 drivers print in `/proc`; the model's
+store never fills, so they read 0, no line spilled); 0x00 bit 0 is a reset that reads back 0 at once (the
 driver spins on it); the status at +0x44, cleared through +0x54, gets
 ISP frame start and frame done (bits 17 and 16) for each picture the
 scaler writes into the store, and interrupts on core INTC source 13
@@ -2049,15 +2054,14 @@ access point's WPA2 code.
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode
 (past the scaler's limit with these sensors) and the VIC raw frame
-channel (above), the 160 values of
-T40/T41's WDR statistics at +1368, a WDR mode on T23 (no modelled sensor
+channel (above), a WDR mode on T23 (no modelled sensor
 has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
 T40's second pipe's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
 SDK's double firmware: the VIC caching both sensors' raw frames for the
-one ISP to process from DDR; above), T23's IVDC DRAM spill lines
+one ISP to process from DDR; above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
