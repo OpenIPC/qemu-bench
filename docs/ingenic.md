@@ -72,6 +72,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x130B0000 | T40, T41: I2D, rotate / mirror / flip (frame channel rotation), IRQ 45 | `ingenic-i2d` |
 | 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
 | 0x130C0000 | T41: VO, NV12 out over BT.656 / BT.1120, shown on the display, IRQ 43 (`/machine/vo`) | `ingenic-vo` |
+| 0x13050000 | T40, T41: DPU, the LCD controller (frame and layer descriptors, composed onto a display), IRQ 20 (`/machine/dpu`, display id `dpu`) | `ingenic-dpu` |
 | 0x130A0000 | T40, T41: bus MONITOR (AXI/AHB bandwidth and address watch), IRQ 53 | `ingenic-monitor` |
 | 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
 | 0x13090000 | T40: BSCALER, the NNA's image engine (resize / affine / perspective, NV12 to colour), IRQ 40 (T) / 39 (C) (`/machine/bscaler`) | `ingenic-bscaler` |
@@ -694,6 +695,23 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   frame goes out over a frame time (`fps`, 30) onto the machine's display
   -- a QEMU graphic console, so `screendump` captures it -- and raises
   INT_VAL bit 0 (cleared through INT_CLC); `frames` counts them.
+- `ingenic-dpu` (T40, T41; the 4.4 kernel's `fbdev/ingenic/fb_v12`, which
+  binds `ingenic,t40-dpu`; T41's device tree calls it `t41-dpu`; the
+  `/dev/fb0` of the SDK's `sample-LCD`). Neither SDK kernel builds the
+  driver, so it follows the driver's contract. START (FRM_CFG_CTRL bit 0)
+  takes the frame descriptor at FRM_CFG_ADDR -- next descriptor, size,
+  control (bit 0: stop after this frame), write-back (not modelled), four
+  layer descriptor addresses, the layer enables with each one's z order --
+  and every frame time (`fps`, 60) composes the enabled layers bottom to
+  top onto the display: RGB555 / ARGB1555 / RGB565, RGB888 and ARGB8888
+  in 32 bits (channel order 0 RGB from the top bits down .. 5 BGR, as
+  fb_v12's colour modes), NV12 / NV21 (BT.601), at their positions, a
+  layer with a scale target drawn at that size (nearest neighbour), ARGB
+  and global alpha blended. Then ST gets CMP_START, the layers' ends,
+  CMP_END and DISP_END, INT_FLAG = ST & INTC drives IRQ 20 (CLR_ST clears),
+  and the chain goes on unless the descriptor said stop; DC_CTRL's quick
+  stop ends it at once, its general stop after the frame with
+  STOP_DISP_ACK. `screendump device=dpu` captures it; `frames` counts.
 - `ingenic-monitor` (T40, T41; the SDKs' `sample_bus_monitor`): six AXI
   channels (0..4, 6; 0x100 each) and the AHB one (5, at 0x500), each with
   CTRL, a counting window, read / write counters, a watch range and
@@ -1450,6 +1468,7 @@ teardown, so the verdict comes first.
 | T40N SDK image, its kernel's `ingenic_bscaler` + magik-toolkit nna1 `libvenus.a` (its BSCALER objects) | `t40` | flash, `test-ingenic-bscaler.sh --image` | the library's own bs_* calls: BGRA 64x32 -> 32x16 and a many-tile 32x16 -> 160x80 within 0.7 of the ramps at half-pixel positions, NV12 256x128 -> 128x64 (both planes) within 0.7, NV12 -> BGRA / RGBA / ARGB resizes and the T unit's NV12 -> BGRA / RGBA matching BT.601 exactly, affine and projective perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | T41NQ SDK image + SDK `libimp.a`, `--ivpu` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --codecs jpeg --ivpu` | JPEG channels with `IMP_ENC_TPYE_IVPU` on the HELIX JPEG engine through `/dev/soc_vpu`: 2560x1440 and 640x360 pictures decode cleanly and show the scene |
+| `t41` / `t40` qtest | `t41`, `t40` | `test-ingenic.py` `test_dpu` | the DPU composes an RGB565 background, a half-transparent ARGB8888 square and an NV12 layer scaled 2x onto the display (screendump pixels), raises CMP_START / layer ends / CMP_END / DISP_END on IRQ 20, stops on the descriptor's stop bit, loops a chain and ends it with a general stop |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
@@ -1483,11 +1502,23 @@ beyond AE and AWB, PDMA transfers for peripherals other than the AIC,
 the SSI and the DES, the SSI slave and the HASH engine's CPU mode (no
 driver, sample or document in any tree here, so no contract; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
-than 0 and 2
+than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
+T41's lens distortion correction (below)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
 T40/T41 SDK kernels, drivers and libimp):
+
+- T41's LDC (0x13040000, `ingenic,t41-ldc`, core INTC 35): `tx-isp-t41.ko`
+  registers it as a platform device (`tx-isp-ldc.c`: resource, clocks
+  `div_ldc` / `gate_ldc`, pads) but no code programs it; libimp's
+  `IMP_ISP_LDC_SetAttr` / `IMP_ISP_LDC_INIT` (`TISP_VIDIOC_SET_LDC_ENABLE`)
+  drive the ISP's own HLDC stage instead (`tiziano-hldc.c`:
+  `tisp_hldc_write_reg` writes ISP 0x15000..0x15028 and 0x15044 = 3, from
+  `tisp_hldc_calc_para`'s radial model -- an inverse r^2 scale, a
+  strength and the optical centre's offset from the picture's). Those
+  registers are the ISP model's storage: the picture is not remapped, as
+  what each field does to a pixel is not in these sources.
 
 - T30's NCU (0x13090000): the denoise front end `jz_nvpu` programs with
   the VPU when libimp asks for it; the VPU raises the completion, so

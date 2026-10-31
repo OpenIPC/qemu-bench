@@ -176,6 +176,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IRQ_UART0       51
 #define IRQ_UART4       57      /* T41 */
 #define T41_JPEG_BASE   0x13280000
+#define DPU_BASE        0x13050000  /* T40, T41 */
+#define IRQ_LCD         20
 #define IRQ_I2C0        60
 #define IRQ_OTG         21
 #define IRQ_GMAC        55
@@ -1396,6 +1398,16 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, VO_BASE);
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_VO));
+    }
+
+    /* the LCD controller (fb_v12's DPU): /machine/dpu */
+    if (ingenic_is_xburst2(info->soc)) {
+        dev = qdev_new("ingenic-dpu");
+        dev->id = g_strdup("dpu");      /* screendump device=dpu */
+        object_property_add_child(OBJECT(ims), "dpu", OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, DPU_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ingenic_irq(ims, IRQ_LCD));
     }
 
     /* T40's BSCALER, the NNA's image engine: /machine/bscaler */
