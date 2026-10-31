@@ -296,6 +296,191 @@ def qmem_word(q):
         s += 1
     return (s << 11) | ((2048 << s) // q)
 
+# ---- JPEG decoding (T23, T30: libimp's IMP_Decoder) ----------------------
+#
+# libimp parses the file itself (ijpegd_decode_header) and hands the JPGC
+# its tables in its own format; jpgc_decode_regs() builds them the same way
+# (checked word for word against libimp's parser run on these files).
+
+def jpeg_segments(b):
+    i, segs = 2, {'dqt': {}, 'dht': {}, 'dri': 0}
+    while i < len(b):
+        m, n = b[i + 1], int.from_bytes(b[i + 2:i + 4], 'big')
+        d = b[i + 4:i + 2 + n]
+        if m == 0xDB:
+            for j in range(0, len(d), 65):
+                segs['dqt'][d[j] & 15] = list(d[j + 1:j + 65])
+        elif m == 0xC4:
+            j = 0
+            while j < len(d):
+                cnt = list(d[j + 1:j + 17])
+                segs['dht'][(d[j] >> 4, d[j] & 15)] = (
+                    cnt, list(d[j + 17:j + 17 + sum(cnt)]))
+                j += 17 + sum(cnt)
+        elif m == 0xC0:
+            segs['sof'] = d
+        elif m == 0xDD:
+            segs['dri'] = int.from_bytes(d[:2], 'big')
+        elif m == 0xDA:
+            segs['sos'], segs['scan'] = d, b[i + 2 + n:]
+            break
+        i += 2 + n
+    return segs
+
+
+def jpgc_decode_regs(segs, bsa, p0a, p1a):
+    """the registers libimp's T20_JPEGD_SliceInit chain writes"""
+    hufm, hufb, hufs, qmem = [0] * 16, [0] * 64, [0] * 336, [0] * 256
+    offs = {(1, 0): 0, (0, 0): 162, (1, 1): 174, (0, 1): 162}
+    for g, k in enumerate([(1, 0), (0, 0), (1, 1), (0, 1)]):
+        cnt, sym = segs['dht'].get(k, ([0] * 16, []))
+        code = idx = 0
+        a = []
+        for l in range(16):
+            a.append(code & ((1 << min(l + 1, 8)) - 1))
+            hufb[16 * g + l] = (idx - code + offs[k]) & 0x1ff
+            code, idx = (code + cnt[l]) << 1, idx + cnt[l]
+        top = 0
+        for l in range(8):
+            top = (top << (l + 1)) | a[l]
+        hufm[4 * g:4 * g + 4] = [a[12] << 24 | a[13] << 16 | a[14] << 8 |
+                                 a[15], a[8] << 24 | a[9] << 16 | a[10] << 8 |
+                                 a[11], top & 0xffffffff, top >> 32]
+        for i, v in enumerate(sym):
+            if k[0]:
+                hufs[offs[k] + i] = v
+            else:
+                hufs[offs[k] + i] |= v << 4 if k[1] else v
+    for t, q in segs['dqt'].items():
+        qmem[64 * t:64 * t + 64] = q
+    sof, sos = segs['sof'], segs['sos']
+    h, w, nc = int.from_bytes(sof[1:3], 'big'), int.from_bytes(sof[3:5],
+                                                                 'big'), sof[5]
+    sel = {sos[1 + 2 * k]: sos[2 + 2 * k] for k in range(sos[0])}
+    pc = [0xF0] * 4
+    for k in range(nc):
+        cid, hv, tq = sof[6 + 3 * k:9 + 3 * k]
+        t = sel.get(cid, 0)
+        pc[k] = ((((hv >> 4) * (hv & 15) - 1) << 4) & 0xff) | (tq << 2) | \
+            ((t & 1) << 1) | ((t >> 4) & 1)
+    mode = ((nc - 1) & 3) | (4 if segs['dri'] else 0)
+    regs = [(0xC0000, 0), (0xE0004, 1)]
+    regs += [(0xE1300 + 4 * i, v) for i, v in enumerate(hufm)]
+    regs += [(0xE1200 + 4 * i, v) for i, v in enumerate(hufb)]
+    regs += [(0xE1800 + 4 * i, v) for i, v in enumerate(hufs)]
+    regs += [(0xE1400 + 4 * i, v) for i, v in enumerate(qmem)]
+    regs += [(0xE0008, 0), (0xE000C, bsa), (0xE0010, p0a), (0xE0014, p1a),
+             (0xE0028, ((w + 15) // 16) * ((h + 15) // 16) - 1),
+             (0xE002C, segs['dri'] - 1 if segs['dri'] else 0)]
+    regs += [(0xE0030 + 4 * i, v) for i, v in enumerate(pc)]
+    regs += [(0xE0004, 0xA0009 | (mode & 4) | ((mode & 3) << 4)),
+             (0xE0000, 7)]
+    return w, h, regs
+
+
+def t420_to_nv12(ty, tc, w, h):
+    """libimp's c_copy_frame_t420_to_nv12: macroblock k's luma at 256 k,
+    its chroma at 128 k (eight rows of 8 Cb, 8 Cr)"""
+    mbw, mbh = (w + 15) // 16, (h + 15) // 16
+    y, uv = bytearray(w * h), bytearray(w * h // 2)
+    for k in range(mbw * mbh):
+        mx, my = (k % mbw) * 16, (k // mbw) * 16
+        for r in range(16):
+            if my + r < h:
+                n = min(16, w - mx)
+                y[(my + r) * w + mx:(my + r) * w + mx + n] = \
+                    ty[256 * k + 16 * r:256 * k + 16 * r + n]
+        for r in range(8):
+            if my // 2 + r < h // 2:
+                row = tc[128 * k + 16 * r:128 * k + 16 * r + 16]
+                for i in range(min(8, (w - mx) // 2)):
+                    o = (my // 2 + r) * w + mx + 2 * i
+                    uv[o], uv[o + 1] = row[i], row[8 + i]
+    return bytes(y), bytes(uv)
+
+
+def jpeg_decode_task(q, base, src, taskrg, jpeg):
+    """the JPEG through the JPGC; returns the NV12 picture"""
+    segs = jpeg_segments(jpeg)
+    w, h, regs = jpgc_decode_regs(segs, BS, DEC, DEC + 0x100000)
+    q.write(BS, segs['scan'])
+    chain(q, regs)
+    run_task(q, base, src, taskrg, False, lambda c, m: None)
+    mbs = ((w + 15) // 16) * ((h + 15) // 16)
+    return w, h, t420_to_nv12(q.read(DEC, 256 * mbs),
+                              q.read(DEC + 0x100000, 128 * mbs), w, h)
+
+
+# A 48x32 4:2:0 JPEG with optimised Huffman tables and a restart marker
+# every MCU, and the luma libjpeg decodes it to.
+DEC_JPEG = bytes.fromhex(
+    'ffd8ffe000104a46494600010100000100010000ffdb00430005030404040305'
+    '04040405050506070c08070707070f0b0b090c110f1212110f111113161c1713'
+    '141a1511111821181a1d1d1f1f1f13172224221e241c1e1f1effdb0043010505'
+    '050706070e08080e1e1411141e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e'
+    '1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1effc0'
+    '0011080020003003012200021101031101ffc400190000030101010000000000'
+    '000000000000040506070208ffc4002210000104020105010100000000000000'
+    '000400052231010203111321519152e1ffc40017010101010100000000000000'
+    '000000000006070405ffc4002411000104010303050000000000000000000100'
+    '020305310411210761711213415281ffdd00040001ffda000c03010002110311'
+    '003f00f2b88d3514e0469a8aa611a6a29b88d3515d08a2586bee71caffd0c184'
+    '69a8a70234d455308d3514dc469a8a431449657dce395fffd1cd4469a8a70234'
+    'd455308d3514dc469a8a65144acb5f738e57ffd29211a6a29c08d35154a234d4'
+    '53811a6a29145128d57dce395fffd3e8469a8a70234d455288d35144e351f87c'
+    '71ebdedfd6b5f522d6d868eb22f7b5720637bfcf81927b004a2d596ce7901abf'
+    'ffd4b111a6a289c6a3f0c78f5ef6feb5afa8ec0c413e3933d34fceb8e98fea3c'
+    '469a8a2b71d4e91fbc556cf48fbbb93f8dc0f277f0120aad601b1795ffd9')
+DEC_JPEG_Y = bytes.fromhex(
+    '0002030607080a0c0e1013141518191c1d1e2222242629292c2e303134343838'
+    '3a3d3f4042434648494c4e5050535457030508090b0d0f1013141619191b1e20'
+    '2023242627292c2e3032333637393b3d3f3f424445474a4c4e4e52535455595b'
+    '090a0c0e1011141518191c1d1e20222526282a2b2e2e32343537393b3c3e4143'
+    '4446484a4b4d4e50525457585a5b5e5f0e1012131416191b1c1e20232326282a'
+    '2b2d2f31333436383a3c3e3f41434548494a4d4e4f51545657595b5d5f606364'
+    '12151619191c1d1f22242527282b2c2f3032343536383a3c3e40434445474a4b'
+    '4e4f51525555595a5d5e606163656769181a1c1d1e21232526282b2c2e2f3233'
+    '3436393a3c3d4042444547494b4c4f51535356585a5b5e5e6162666669696c6e'
+    '1d1f21222425282a2c2d3032333537383a3c3f40424245464a4b4d4f51525556'
+    '58595c5d5f61636566686b6d6e6f717320222426282a2c2e3032333637393a3c'
+    '3d3f41444447484a4c4e5152535557595c5d6061626467696b6c6e7171747678'
+    '26292b2d2e3031333537383b3b3e4042444548494a4c4f5152535657595a5d5f'
+    '62636566696a6d6f6f72747677797a7d2a2b2e3032333637383a3c3e40424345'
+    '47494c4d4e5052555557595b5d5e62636467696b6c6e70727476777a7a7d7e81'
+    '3031333536393a3d3d4043444646494a4d4f51535555595a5c5e5f6162656668'
+    '6a6c6e7171747578787b7c7e808283863537383b3c3d3f42434548494b4b4e50'
+    '52545658595a5d5e60636566676a6c6e7071747576787b7d7e7f82848586898a'
+    '3a3a3e3f40414445474a4b4d4e51535557585b5c5d5f62636566696b6c6e7071'
+    '7375777a7b7c7f8183848688898a8d903e40434445464a4a4c4e515254565859'
+    '5c5d6061636467696a6c6d7071727576797b7c7f8082838587898b8d8f909294'
+    '434548494b4d4f5051545657595a5d5e6162656768696c6e6f71747577787b7c'
+    '7f8082848587898b8d8f90939496989a48494c4d4f50525455575a5b5c5e6163'
+    '6567696a6c6d7071727577797b7b7e7f818486878a8a8e8f91929597979a9b9e'
+    '4d4e5153545557595c5e5f62626467696a6b6e7070727477797a7d7e7f818385'
+    '878a8b8e8e9092949697989a9d9fa2a251535456575a5b5d5f62646567696a6d'
+    '6d7071737576787a7c7e8083838687898c8c909092939698999a9fa1a4a4a4a5'
+    '5658595c5c5f60626567686b6b6e6f72747578797b7b7f80838386888a8b8d8f'
+    '9093959797999c9da2a2a2a4a6aaadb05b5d5e6161646668696c6e6f70737477'
+    '797a7d7d8081838487888c8c8e8f92949698999c9c9fa1a2a4a5a8a9acadadad'
+    '5f60646467676b6d6e6f737476767a7b7d7f8083848688898b8e909192959799'
+    '999c9e9fa2a3a5a6a6a9b0b3b0a8a0996566686a6c6d6f71747577797b7c7f80'
+    '82848587888b8d8f90939497989a9b9d9ea1a4a5a6a7aaabb3b0ada8a49d9a97'
+    '696c6d7070737477797a7c7e7f82838687898c8d8e8f939396979a9b9e9fa2a2'
+    'a4a7a8aaabadb0b2b2aca29b999ba0a36d6f71747477787b7c7e818384858789'
+    '8b8d8f90919496989a9c9da0a1a2a5a6a9aaacaeafb1b4b59d9c9c9ea1a4a7aa'
+    '73747779797b7d7f81848688898a8d8e9092959697989c9c9fa0a1a2a4a8aaac'
+    'abadb1b3b5aea29a9fa0a3a5a6a8abab77797b7c7d7f82848687898b8c8e9193'
+    '9396979a9b9c9fa1a2a3a6a9abadadafb4b7b7b0a59f9ea1a3a4a6a9a9abaeaf'
+    '7c7d8081838487898a8d8e9092949698999a9e9ea1a1a5a6abaaabacaeb2b7b9'
+    'b2aea6a1a0a1a3a5a9a9acadafb1b3b680828487888a8b8d8f92949596989a9c'
+    '9e9fa3a3a5a7a9acacaeb1b2b4b5b5b6a4a09b9ea5aaacabadaeb1b2b5b5b9ba'
+    '8687898b8c8f90939596989b9c9ea0a2a3a5a6a9a9abaeb0afb2b8bbbab1a8a2'
+    '9fa5aaaaa9aaaeb4b1b4b6b7b9bbbdbf8b8c8f90919396989a9b9da0a0a2a5a6'
+    'a8aaacadafb0b2b4bab9b6b2ada7a29fa9abadadaeb0b4b5b7b9babcbec0c2c4'
+    '8f91939597989b9c9ea0a3a5a5a7a9abadaeb1b3b4b6b8b9b9b5aba5a2a5a8ac'
+    'b1adaaafb7bcbab7bdbec0c2c4c5c8c89396979a9a9c9ea1a2a4a7a8a9acadaf'
+    'b0b3b4b7b7b9bcbea5a5a5a6aaadb0b2afb3b8babababcbfc0c2c4c5c6c8cacc')
+
 # ---- the chains ---------------------------------------------------------
 
 VLD, TERM = 1 << 31, 1 << 30
@@ -309,6 +494,7 @@ SOCS = {
 RADIX, RADIX_SRC = 0x13600000, 45
 CPM_SRBC, INTC_ISR = 0x100000C4, 0x10001000
 CHAIN, SRC, BS = 0x01000000, 0x01100000, 0x01400000
+DEC = 0x01C00000
 
 
 def chain(q, regs, write=None):
@@ -429,6 +615,7 @@ def main():
         fails += not ok
 
     w, h, frames = 320, 176, 4
+    decoded = {}
     mbw, mbh = w // 16, h // 16
     for soc, (base, src, taskrg) in SOCS.items():
         print('== %s: H.264 (HELIX%s), JPEG' % (soc, '' if soc != 't20'
@@ -490,6 +677,29 @@ def main():
             run_task(q, base, src, taskrg, False, lambda c, m: None, tlbe)
             check(q.readl(base + 0x34) & (1 << 10),
                   'an unmapped chain: SCH_STAT TLB error')
+            if soc in ('t23', 't30'):
+                # the JPEG back through the JPGC, as IMP_Decoder does
+                q.write(PT + 0x1000, bytes(4096))
+                q.writel(base + 0x30, 0)
+                jpeg_d = jpeg_header(w, h, ql, qc) + \
+                    q.read(BS, jst & 0xffffff) + b'\xff\xd9'
+                dw, dh, (dy, duv) = jpeg_decode_task(q, base, src, taskrg,
+                                                     jpeg_d)
+                check(q.readl(base + 0xE0008) & (1 << 31) and
+                      q.readl(base + 0x34) & 0x10,
+                      'JPEG decode done (JPGC_STAT end, SCH_STAT JPGEND)')
+                decoded[soc] = (jpeg_d, dy + duv, dw, dh)
+                p = psnr_y(dy + duv, dw, dh, 0)
+                check(p >= 35, 'decoded JPEG against the source picture: Y '
+                      'PSNR %.1f dB (>= 35)' % p)
+                # optimised tables, restart markers
+                ew, eh, (ey, _) = jpeg_decode_task(q, base, src, taskrg,
+                                                   DEC_JPEG)
+                se = sum((a_ - b_) ** 2 for a_, b_ in zip(ey, DEC_JPEG_Y))
+                p = 99.0 if not se else 10 * math.log10(255 * 255 * len(ey) /
+                                                        se)
+                check(p >= 40, 'optimised Huffman tables, restart markers: '
+                      'Y PSNR %.1f dB against libjpeg (>= 40)' % p)
             if soc == 't30':
                 print('== t30: H.265 (RADIX)')
                 hevc = HEVC_PS
@@ -546,6 +756,16 @@ def main():
                 p = psnr_y(raw[f * fs:(f + 1) * fs], fw, fh, f)
                 check(p >= need, '%s picture %d: Y PSNR %.1f dB (>= %d)'
                       % (name, f, p, need))
+        if soc in decoded and ffmpeg:
+            jd, nv12, dw, dh = decoded[soc]
+            path = os.path.join(out, '%s-dec.jpg' % soc)
+            open(path, 'wb').write(jd)
+            raw, err = decode(ffmpeg, path, 'yuvj420p')
+            se = sum((a_ - b_) ** 2 for a_, b_ in zip(raw[:dw * dh],
+                                                      nv12[:dw * dh]))
+            p = 99.0 if not se else 10 * math.log10(255 * 255 * dw * dh / se)
+            check(not err and p >= 45, 'the JPGC\'s decode against '
+                  'ffmpeg\'s: Y PSNR %.1f dB (>= 45)' % p)
     # T41's JPEG engine: HELIX's JPEG half with its units renumbered (SCH
     # 0, VDMA 1, EFE 2, JPGC 3; the chain sets bit 19), reset through SRBC
     # 28/27/26, core INTC source 0

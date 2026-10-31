@@ -3031,6 +3031,77 @@ def test_isp_apical(qt, soc='t20'):
           qt.readl(core + 0xA0) & (1 << 5), 0)
 
 
+def test_jpgc_decode(qt, soc):
+    """HELIX's JPGC decoding a scan on its own (libimp's IMP_Decoder,
+    T20_JPEGD_SliceInit's chain): a 16x16 4:2:0 picture of DC-only blocks,
+    every table in libimp's format, the picture back as 16x16 tiles"""
+    print('ingenic-vpu JPEG decode (%s)' % soc)
+    base, irq = {'t23': (0x13100000, 40), 't30': (0x13200000, 62)}[soc]
+    taskrg = 0x84 if soc == 't23' else 0x10008
+    chain, scan, p0a, p1a = SCRATCH, SCRATCH + 0x10000, SCRATCH + 0x20000, \
+        SCRATCH + 0x30000
+    # Huffman tables: DC symbols 0 ('00') and 3 ('01'), AC only EOB ('0')
+    tabs = {(1, 0): ([1] + [0] * 15, [0]),
+            (0, 0): ([0, 2] + [0] * 14, [0, 3]),
+            (1, 1): ([1] + [0] * 15, [0]),
+            (0, 1): ([0, 2] + [0] * 14, [0, 3])}
+    offs = {(1, 0): 0, (0, 0): 162, (1, 1): 174, (0, 1): 162}
+    hufm, hufb, hufs = [0] * 16, [0] * 64, [0] * 336
+    for g, k in enumerate([(1, 0), (0, 0), (1, 1), (0, 1)]):
+        cnt, sym = tabs[k]
+        code = idx = top = 0
+        a = []
+        for l in range(16):
+            a.append(code & ((1 << min(l + 1, 8)) - 1))
+            hufb[16 * g + l] = (idx - code + offs[k]) & 0x1ff
+            code, idx = (code + cnt[l]) << 1, idx + cnt[l]
+        for l in range(8):
+            top = (top << (l + 1)) | a[l]
+        hufm[4 * g:4 * g + 4] = [a[12] << 24 | a[13] << 16 | a[14] << 8 |
+                                 a[15], a[8] << 24 | a[9] << 16 | a[10] << 8 |
+                                 a[11], top & 0xffffffff, top >> 32]
+        for i, v in enumerate(sym):
+            hufs[offs[k] + i] |= v if k[0] or not k[1] else v << 4
+    # the blocks' DC differences: luma +5, 0, -5, 0; Cb +6; Cr -6; each a
+    # DC code, its bits, EOB.  Quantiser 8 everywhere: a pixel is 128 + DC.
+    bits = ''
+    for d in (5, 0, -5, 0, 6, -6):
+        bits += ('01' + format(d if d > 0 else d + 7, '03b') if d else '00') \
+            + '0'
+    bits += '1' * (-len(bits) % 8)
+    data = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+    regs = [(0xE0004, 1)] + \
+        [(0xE1300 + 4 * i, v) for i, v in enumerate(hufm)] + \
+        [(0xE1200 + 4 * i, v) for i, v in enumerate(hufb)] + \
+        [(0xE1800 + 4 * i, v) for i, v in enumerate(hufs)] + \
+        [(0xE1400 + 4 * i, 8) for i in range(256)] + \
+        [(0xE0008, 0), (0xE000C, scan), (0xE0010, p0a), (0xE0014, p1a),
+         (0xE0028, 0), (0xE002C, 0), (0xE0030, 0x30), (0xE0034, 7),
+         (0xE0038, 7), (0xE003C, 0xF0), (0xE0004, 0xA0009 | (2 << 4)),
+         (0xE0000, 7)]
+    words = b''
+    for i, (r, v) in enumerate(regs):
+        words += struct.pack('<II', v, (1 << 31) | r |
+                             ((1 << 30) if i == len(regs) - 1 else 0))
+    qt.write(chain, words)
+    qt.write(scan, data + b'\xff\xd9')
+    qt.write(p0a, bytes(256))
+    qt.write(p1a, bytes(128))
+    qt.writel(base + 0x00, 1 << 16)                 # SCH_GLBC: INTE_ENDF
+    qt.writel(base + taskrg, chain | 1)
+    qt.step(2000000)
+    check('done: JPGC_STAT end, SCH_STAT end and JPGEND',
+          (qt.readl(base + 0xE0008) >> 31, qt.readl(base + 0x34) & 0x11),
+          (1, 0x11))
+    y, c = qt.read(p0a, 256), qt.read(p1a, 128)
+    check('luma blocks in the tile\'s quadrants: 133 133 / 128 128',
+          (y[0], y[8], y[128], y[255]), (133, 133, 128, 128))
+    check('a luma block is flat', len(set(y[:8])), 1)
+    check('chroma rows: 8 Cb (134) then 8 Cr (122)', (c[0], c[7], c[8],
+                                                      c[127]), (134, 134,
+                                                                122, 122))
+
+
 def test_ipu(qt, soc):
     print('ingenic-ipu (%s)' % soc)
     ipu, bg, osd = 0x13080000, 0x00400000, 0x00410000
@@ -3293,6 +3364,10 @@ def main():
         qt = QTest(a.qemu, 't10,sensor=jxh62')
         test_isp_apical(qt, 't10')
         qt.close()
+        for soc in ('t23', 't30'):
+            qt = QTest(a.qemu, soc)
+            test_jpgc_decode(qt, soc)
+            qt.close()
         for soc in ('t30', 't31', 't41'):
             qt = QTest(a.qemu, soc)
             test_ipu(qt, soc)

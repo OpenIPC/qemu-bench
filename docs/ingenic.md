@@ -553,6 +553,42 @@ from a picture in memory on the OpenIPC kernel and rootfs of each SoC; `qemu/tes
 SDK samples' FrameSource -> `IMP_Encoder` path on T21 with the ISP model
 and its sensor.
 
+JPEG decoding (`IMP_Decoder`, in T23's and T30's libimp only): libimp
+parses the file itself (`ijpegd_decode_header`) and gives the JPGC a
+chain of its own (`T20_JPEGD_SliceInit`) that ends with JPGC_TRIG = 7
+(core open, bitstream and picture triggers) and no EFE: the model decodes
+a baseline scan then. What the chain sets, derived from libimp's code and
+from its parser run on known files (user-mode QEMU):
+
+| | |
+|---|---|
+| BSA (0xE000C) | the scan as in the file, byte-stuffed, restart markers and EOI kept |
+| GLBI (0xE0004) | [5:4] components - 1, [2] restart markers every NRSM + 1 MCUs |
+| NMCU (0xE0028) | MCUs - 1; libimp counts 16x16 macroblocks |
+| P0C..P3C (0xE0030..) | [7:4] blocks per MCU - 1, [3:2] quantiser table, [1] AC, [0] DC table |
+| QMEM (0xE1400) | four tables of 64 quantisers, zigzag order |
+| HUFM (0xE1300) | per Huffman table (AC0, DC0, AC1, DC1; 4 words) the canonical first code of each length, its low min(L, 8) bits: lengths 1..8 packed from the top of a 36-bit field, 9..16 a byte each |
+| HUFB (0xE1200) | per table and length, where its symbols start in HUFS minus its first code, 9 bits |
+| HUFS (0xE1800) | the symbols, a word each: AC0 from 0, AC1 from 174, both DC tables in the nibbles from 162 (table 0 low) |
+| P0A / P1A (0xE0010/14) | the picture as 16x16 tiles ("T420"): macroblock k's luma at P0A + 256 k, its chroma at P1A + 128 k, rows of 8 Cb then 8 Cr |
+
+The JPGC never learns the picture's width, so it writes the macroblocks
+one after the other -- exact for 4:2:0, libimp's own encoder's layout;
+an MCU of another shape puts its luma blocks in its macroblock's
+quadrants (an inference). The end is JPGC_STAT's end bit and SCH_STAT bit
+4, as for encoding, and MCUS (0xE0064) the MCUs decoded: the kernel takes
+it as the task's output length and fails a decode that leaves it 0.
+libimp then turns the tiles into NV12 (`c_copy_frame_t420_to_nv12`); it
+leaves the rows of a partial last macroblock row zero (a height that is
+not a multiple of 16), whatever the tiles hold. `test-ingenic-vpu.py`
+decodes, at register level on T23 and T30, the JPEG the model encoded
+(68 dB against ffmpeg's decode) and a file with optimised Huffman tables
+and a restart marker every MCU (51 dB against libjpeg);
+`qemu-boot/test-ingenic-jpegd.sh --soc t23|t30` runs the SDK sample's
+`IMP_Decoder` sequence (`qemu-boot/ingenic-jpegd-test.c`, static against
+the SDK's libimp.a) on the OpenIPC kernel and saves each picture from
+guest memory.
+
 T41 keeps HELIX's JPEG half as its own engine at 0x13280000
 (`ingenic,t41-jpeg`, the 4.4 kernel's `drivers/video/ingenic_vpu/helix`,
 `/dev/soc_vpu`, core INTC source 0): libimp encodes a JPEG channel on it,
@@ -1695,6 +1731,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
 | OpenIPC T31 kernel with `CONFIG_SERIAL_JZ47XX_UART0_DMA` + the release's root | `t31`, UART0 on a socket | `-kernel` + NOR root, `test-ingenic-uart-dma.sh --kernel` | 32 KiB of random bytes in on ttyS0 by the PDMA (32 full 1 KiB buffers, 3 of 3 runs) and back out by it, both intact |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
+| OpenIPC `t23` / `t30` + the T23 / T30 SDK's libimp.a (`IMP_Decoder`) | `t23` / `t30` | NOR root, `test-ingenic-jpegd.sh --soc t23\|t30 [--jpeg FILE]` | 640x480 and 1280x720 JPEGs from ffmpeg and the snapshot libimp encoded on T21 (`test-ingenic-vpu-e2e.sh`, 640x360): Y 80.8, 81.6 and 70.5 dB against ffmpeg's decode (the snapshot above its partial last macroblock row) |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
 level under qtest (no guest), including a migration round trip of `t31`,
