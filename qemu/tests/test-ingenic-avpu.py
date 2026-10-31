@@ -204,7 +204,8 @@ def slice_header(idr, cabac, idc, qp, frame):
     if cabac and not idr:
         b.ue(idc)
     b.se(qp - 26)                   # slice_qp_delta
-    b.ue(1)                         # deblocking off
+    b.ue(0)                         # deblocking on (libimp's: idc 0)
+    b.se(0); b.se(0)                # alpha / beta offsets: W10's (0)
     return b
 
 
@@ -492,12 +493,27 @@ def test_h264(qt, ff, tmp):
                 worst = max(worst, d // 256)
         check('%s: I macroblock means within 3 of the source (worst %d)' %
               (name, worst), worst <= 3, True)
-        moved = {(r, x) for r in range(16, 32) for x in range(32, 48)}
-        check('%s: P: the changed macroblock exact (I_PCM)' % name,
-              all(p[r * W + x] == ref_p[r * W + x] for r, x in moved), True)
-        check('%s: P: the rest repeats the I picture (P_Skip)' % name,
-              all(p[q] == i[q] for q in range(W * H)
-                  if (q // W, q % W) not in moved), True)
+        if not cabac:
+            # CAVLC: the changed macroblock as I_PCM, the rest P_Skip
+            moved = {(r, x) for r in range(16, 32) for x in range(32, 48)}
+            check('%s: P: the changed macroblock exact (I_PCM)' % name,
+                  all(p[r * W + x] == ref_p[r * W + x] for r, x in moved),
+                  True)
+            check('%s: P: the rest repeats the I picture (P_Skip)' % name,
+                  all(p[q] == i[q] for q in range(W * H)
+                      if (q // W, q % W) not in moved), True)
+            continue
+        # CABAC: inter coded -- every macroblock near its source, the P
+        # picture (one macroblock changed) far smaller than the I one
+        worst = 0
+        for my in range(H // 16):
+            for mx in range(W // 16):
+                px = [(my * 16 + j) * W + mx * 16 + x
+                      for j in range(16) for x in range(16)]
+                d = abs(sum(ref_p[q] for q in px) - sum(p[q] for q in px))
+                worst = max(worst, d // 256)
+        check('%s: P macroblock means within 3 of the source (worst %d)' %
+              (name, worst), worst <= 3, True)
 
 
 def test_pcm_budget(qemu, ff, tmp):
@@ -535,6 +551,132 @@ def test_pcm_budget(qemu, ff, tmp):
                     for my in range(H // 16) for mx in range(W // 16))
         check('budget: P%d has %d macroblocks of the new source' %
               (k, min(25 * k, 60)), exact, min(25 * k, 60))
+
+
+def shifted(dx, dy):
+    """picture() moved by (dx, dy) samples, its edges repeated: a pan"""
+    y0, uv0 = picture()
+    y = bytearray(PITCH * H)
+    uv = bytearray(PITCH * H // 2)
+    for r in range(H):
+        sr = min(max(r - dy, 0), H - 1)
+        for x in range(W):
+            y[r * PITCH + x] = y0[sr * PITCH + min(max(x - dx, 0), W - 1)]
+    for r in range(H // 2):
+        sr = min(max(r - dy // 2, 0), H // 2 - 1)
+        for x in range(0, W, 2):
+            sx = min(max(x - (dx // 2) * 2, 0), W - 2)
+            uv[r * PITCH + x] = uv0[sr * PITCH + sx]
+            uv[r * PITCH + x + 1] = uv0[sr * PITCH + sx + 1]
+    return bytes(y), bytes(uv)
+
+
+def test_h264_slices(qemu, ff, tmp):
+    """A picture of two slices (three macroblock rows each), CABAC, coded
+    by Enc1 (W8 bit 11), the way libimp would split one: an IDR and two P
+    pictures of a pan.  Each slice's NAL goes to a region of its own in the
+    stream buffer (its header written in front of it beforehand).  The
+    decoded pictures must be the model's own reconstruction, sample for
+    sample (the dump property), and near the source."""
+    print('H.264 two slices a picture, a pan (CABAC, Enc1 codes)')
+    dump = os.path.join(tmp, 'slices-dump')
+    os.makedirs(dump, exist_ok=True)
+    qt = QTest(qemu, 't31', ['-global', 'ingenic-avpu.dump=%s' % dump])
+    mbw, mbh, qp, idc = W // 16, H // 16, 30, 1
+    a = RAM
+    cl1, bs, bs_size = a + 0x48000, a + 0x50000, 0x80000
+    pics = [picture(), shifted(4, 2), shifted(8, 4)]
+    stream = b''
+    try:
+        qt.writel(AVPU + 0x14, 5)
+        for k, (y, uv) in enumerate(pics):
+            src = a + 0x10000 * (k & 1)
+            rec = a + 0x20000 + 0x10000 * (k & 1)
+            prev = a + 0x20000 + 0x10000 * ((k - 1) & 1)
+            qt.write(src, y)
+            qt.write(src + PITCH * H, uv)
+            idr = k == 0
+            entries, regions = [], []
+            for sl in range(2):
+                region = 0x20000 * sl
+                hdr = Bits()
+                hdr.ue(sl * 3 * mbw)                    # first_mb_in_slice
+                hdr.ue(7 if idr else 5); hdr.ue(0); hdr.u(k & 15, 4)
+                if idr:
+                    hdr.ue(0)
+                hdr.u((2 * k) & 15, 4)
+                if not idr:
+                    hdr.u(0, 1); hdr.u(0, 1)
+                if idr:
+                    hdr.u(0, 1); hdr.u(0, 1)
+                else:
+                    hdr.u(0, 1)
+                if not idr:
+                    hdr.ue(idc)
+                hdr.se(qp - 26); hdr.ue(0); hdr.se(0); hdr.se(0)
+                while len(hdr.b) % 8:
+                    hdr.u(1, 1)                         # cabac alignment
+                start = b''
+                if idr and sl == 0:
+                    start = sps(True, mbw, mbh) + pps(True, 2)
+                nalh = start + b'\x00\x00\x00\x01' + \
+                    bytes([0x65 if idr else 0x41])
+                before = nalh + escape(hdr.bytes())
+                qt.write(bs + region, before)
+                regions.append((region, len(before)))
+                e = [0] * 128
+                e[0] = (1 << 31) if sl == 1 else 0
+                e[1] = (W // 8 - 1) | ((H // 8 - 1) << 12)
+                e[2] = (idc << 8) | (1 << 10) | (1 << 11)
+                e[3] = (2 & 31) | ((2 & 31) << 8) | (qp << 16) | \
+                    ((2 if idr else 1) << 28)
+                e[5] = (sl * 3) << 12                   # first LCU (0, y)
+                e[0x88 // 4] = PITCH
+                e[0x80 // 4], e[0x84 // 4] = src, src + PITCH * H
+                e[0x90 // 4], e[0x94 // 4] = rec, rec + W * H
+                if not idr:
+                    e[0xA0 // 4], e[0xA4 // 4] = prev, prev + W * H
+                e[0x70 // 4] = (idc << 8) | (qp << 16) | \
+                    ((2 if idr else 1) << 28)
+                e[0x78 // 4] = 3 * mbw - 1
+                e[0xC0 // 4], e[0xC4 // 4] = bs, bs_size
+                e[0xC8 // 4] = region + len(before)
+                e[0xCC // 4] = 0x10000
+                entries.append(e)
+            qt.write(cl1, b''.join(v.to_bytes(4, 'little')
+                                   for e in entries for v in e))
+            qt.writel(AVPU + 0x3E0, cl1)
+            qt.writel(AVPU + 0x3E4, 2)
+            qt.step(1000000)
+            st = qt.readl(AVPU + 0x18)
+            qt.writel(AVPU + 0x18, st)
+            for sl, (region, hlen) in enumerate(regions):
+                count = qt.readl(cl1 + 0x200 * sl + 0x104) & 0x3FFFFFFF
+                stream += qt.read(bs + region, hlen + count)
+            check('slices %s: Enc1 done' % ('IDR' if idr else 'P%d' % k),
+                  st & 1, 1)
+    finally:
+        qt.close()
+    path = os.path.join(tmp, 'slices.h264')
+    open(path, 'wb').write(stream)
+    if not ff:
+        print('  SKIP: no ffmpeg')
+        return
+    rc, raw, errs = decode(ff, path, 'nv12')
+    fs = W * H * 3 // 2
+    check('slices: three pictures decode without errors',
+          (rc, len(raw), errs), (0, 3 * fs, []))
+    rec = open(os.path.join(dump, 'avpu-%dx%d.h264.rec' % (W, H)),
+               'rb').read()
+    check('slices: every picture is the model\'s reconstruction',
+          raw[:3 * fs] == rec[:3 * fs], True)
+    for k in (1, 2):
+        ref = luma(pics[k][0])
+        p = raw[k * fs:k * fs + W * H]
+        e = sum((p[i] - ref[i]) ** 2 for i in range(W * H)) / (W * H)
+        psnr = 10 * math.log10(255 * 255 / max(e, 1e-9))
+        check('slices P%d: luma PSNR %.1f dB against the source (>= 30)' %
+              (k, psnr), psnr >= 30, True)
 
 
 # ---- HEVC: the parameter sets and slice header hevc-enc's coder follows ----
@@ -596,7 +738,8 @@ def hevc_slice_header(p_slice, qp, poc, beta, tc, libimp):
     if not libimp:
         b.u(3, 2)                               # SAO luma, chroma
     if p_slice:
-        b.u(0, 1); b.u(int(libimp), 1); b.ue(1)  # cabac_init_flag
+        b.u(0, 1); b.u(int(libimp), 1)          # cabac_init_flag
+        b.ue(0)                                 # MaxNumMergeCand 5
     b.se(qp - 26)
     b.u(1, 1); b.u(0, 1); b.se(beta); b.se(tc); b.u(1, 1)
     b.u(1, 1)                                   # byte_alignment()
@@ -770,10 +913,10 @@ def test_t41(qemu, ff, tmp):
             if len(raw) == 2 * fs:
                 ref_p = luma(picture(True)[0])
                 p = raw[fs:fs + W * H]
-                check('t41: P picture exact where the source changed',
-                      all(p[r * W + x] == ref_p[r * W + x]
-                          for r in range(16, 32) for x in range(32, 48)),
-                      True)
+                d = sum(p[r * W + x] for r in range(16, 32)
+                        for x in range(32, 48)) / 256
+                check('t41: P picture: the changed macroblock near the '
+                      'source (mean %.1f, 200)' % d, abs(d - 200) <= 3, True)
         else:
             print('  SKIP: no ffmpeg to decode the T41 stream')
         # JPEG on core 1's page
@@ -854,6 +997,7 @@ def main():
         finally:
             qt.close()
         test_pcm_budget(args.qemu, ff, tmp)
+        test_h264_slices(args.qemu, ff, tmp)
         test_rebased(args.qemu)
         test_t41(args.qemu, ff, tmp)
     finally:

@@ -325,18 +325,29 @@ if [ -n "$APP" ] && [ -n "$RTSP" ]; then
         URL="rtsp://127.0.0.1:$PRTSP/main"
         # live555 answers DESCRIBE without an SDP until the encoder has
         # produced its parameter sets: retry for a few minutes.  The
-        # stream is decoded straight from RTSP into raw NV12 in a NUT
-        # container on a pipe: copying the bitstream into a container
-        # trips over packets without timestamps (T40), and a docker
-        # ffmpeg may see the host's directories under other names
+        # bitstream is copied as it comes (the packets' payloads, Annex B,
+        # on a pipe: a container trips over packets without timestamps on
+        # T40, and a docker ffmpeg may see the host's directories under
+        # other names) and decoded afterwards: decoding 1080p while
+        # pulling falls behind the stream, and live555 then drops RTP
+        # packets on the TCP connection -- a lost P picture, which inter
+        # coding turns into a picture that drifts
         for try in 1 2 3 4 5 6 7 8; do
             timeout 240 $FFMPEG -hide_banner -rtsp_transport tcp \
-                -err_detect explode -i "$URL" -frames:v 20 -an \
-                -c:v rawvideo -pix_fmt nv12 -f nut - \
-                > "$OUT/main.nut" 2> "$OUT/ffmpeg.log"
-            [ -s "$OUT/main.nut" ] && { got=1; break; }
+                -i "$URL" -frames:v 20 -an -c:v copy -f rawvideo - \
+                > "$OUT/main.es" 2> "$OUT/ffmpeg.log"
+            [ -s "$OUT/main.es" ] && { got=1; break; }
             sleep 20
         done
+        if [ -n "$got" ]; then
+            case $(grep -m1 -o 'Video: [a-z0-9]*' "$OUT/ffmpeg.log") in
+            *hevc*) ESF=hevc ;; *) ESF=h264 ;;
+            esac
+            $FFMPEG -hide_banner -err_detect explode -f $ESF -i - -an \
+                -c:v rawvideo -pix_fmt nv12 -f nut - \
+                < "$OUT/main.es" > "$OUT/main.nut" 2> "$OUT/decode.log"
+            [ -s "$OUT/main.nut" ] || got=
+        fi
         if [ -z "$got" ]; then
             bad "pull rtsp://$GUEST_IP:8554/main"
             grep -v '^docker' "$OUT/ffmpeg.log" | tail -3
@@ -347,7 +358,8 @@ if [ -n "$APP" ] && [ -n "$RTSP" ]; then
             pass "pulled rtsp://$GUEST_IP:8554/main: $codec $sz"
             $FFMPEG -v error -i - -fps_mode passthrough -f rawvideo -pix_fmt nv12 - \
                 < "$OUT/main.nut" > "$OUT/main.nv12" 2> /dev/null
-            grep -iE 'error|invalid|corrupt|missing' "$OUT/ffmpeg.log" |
+            # the decoder's messages (the pull's are the muxer's)
+            grep -iE 'error|invalid|corrupt|missing|outside' "$OUT/decode.log" |
                 grep -v '^docker' > "$OUT/dec.log"
             errs=$(grep -v -c '^docker' "$OUT/dec.log")
             n=$(python3 - "$OUT" "$sz" <<'PY'
