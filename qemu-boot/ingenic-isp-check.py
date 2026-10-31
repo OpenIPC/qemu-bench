@@ -55,9 +55,16 @@ def counter(y, w, h):
                 if y[py, px] > 150:
                     bits |= 4 >> c
             rows.append(bits)
-        if tuple(rows) not in DIGITS:
+        if tuple(rows) in DIGITS:
+            value = value * 10 + DIGITS.index(tuple(rows))
+            continue
+        # an application's OSD (the T40 SDK app's timestamp, drawn above
+        # the counter) may cover the top row: rows 1-4 alone tell every
+        # digit apart
+        low = [d[1:] for d in DIGITS]
+        if tuple(rows[1:]) not in low:
             return None
-        value = value * 10 + DIGITS.index(tuple(rows))
+        value = value * 10 + low.index(tuple(rows[1:]))
     return value
 
 

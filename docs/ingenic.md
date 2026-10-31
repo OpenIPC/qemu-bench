@@ -664,11 +664,9 @@ A whole-frame change (T23's AE flipping the sensor gain on this scene
 every five frames) is a DC residual on the motion-compensated reference
 rather than a picture of I_PCM; libimp's CBR, which held the slice QP at
 51 with I_PCM pictures, now brings it down (31 to 25 over 20 pictures in
-`test-ingenic-vpu-e2e.sh`). The AVPU's H.264 P slices
-are still I_PCM where the source changed (`hantro-h264.c`'s older path:
-the AVPU cuts pictures into several slices, which deblocking across
-slice edges would have to see whole), and RADIX's H.265 P slices skip or
-code 8x8 intra DC units.
+`test-ingenic-vpu-e2e.sh`). The AVPU codes its P slices the same way
+(H.264 and H.265: below); RADIX's H.265 P slices skip or code 8x8 intra
+DC units.
 
 The engines' TLB: libimp addresses the engines physically, but the
 driver can hand a process its DMMU table (`IOCTL_CHANNEL_PRIVATE_TLB`,
@@ -774,17 +772,74 @@ past the UID) is the part's -- libimp's encoder library checks it
   headers after the picture is done. T31 libimp sets Enc1 W8 bit 11 (Enc1
   codes the slice; stream buffer in WC0-WCC, bytes in 0x104), offset
   0x220, tail n = 0; the separate Enc2 pass (WF0-WFC, 0x1E4) works too.
-- Slice data: H.264 from `hantro-h264.c` (CAVLC or CABAC by W8 bit 10;
-  I slices I_16x16 DC, P slices I_PCM where the source changed against
-  the model's own reference -- kept per reconstruction address, looked up
-  by the reference address -- and P_Skip elsewhere, at most `pcm-budget`
-  bytes of PCM a picture, 256 KiB); HEVC from `hevc-enc.c` with libimp's
-  CTB 32, intra transform depth 1, transform skip and cabac_init_flag;
-  JPEG from `jpeg-enc.c` (the whole file, quantisers de-zigzagged from
-  R6). Rate-control counters in the entries are made up and non-zero.
+- Slice data: H.264 from `hantro-h264.c`, HEVC from `hevc-enc.c`, both
+  with real inter coding in P slices (below); JPEG from `jpeg-enc.c`
+  (the whole file, quantisers de-zigzagged from R6). Rate-control
+  counters in the entries are made up and non-zero.
+- H.264, CABAC (what libimp uses on every part: Main profile,
+  `cabac_init_idc` 1): I slices I_16x16 DC, P slices inter coded by
+  `hantro-h264-inter.c.inc` (P_Skip, P_L0_16x16 with a full-pel motion
+  search and a 4x4-transform residual, I_16x16 DC where nothing comes
+  close), the PPS's `transform_8x8_mode_flag` followed. A picture's
+  slices (rows of macroblocks; libimp sends one a picture, the model
+  takes any number, by W14) are coded on one reconstruction, each on its
+  own window of it -- a slice's first row has no neighbour above for
+  intra or vector prediction or the CABAC contexts, as in a decoder --
+  while motion compensation reads the whole reference; the in-loop
+  filter runs on the picture when its last slice is done
+  (`disable_deblocking_filter_idc` 0 with W10's offsets, alpha [13:8],
+  beta [4:0]: what every slice header libimp writes says -- the command
+  words' bit that would turn the filter off is not known), and the
+  result is the reference of the channel's next P picture, kept per
+  reconstruction address (W90) and looked up by the reference address
+  (WA0): the decoder's picture, bit for bit. A slice that would not fit
+  the stream buffer's room is coded again at a higher QP. CAVLC and B
+  slices (libimp sends neither) keep the older path: I_PCM where the
+  source changed, P_Skip elsewhere, at most `pcm-budget` bytes of PCM a
+  picture.
+- HEVC: libimp's CTB 32, intra transform depth 1, transform skip (T31,
+  T40; not T41) and cabac_init_flag; P slices inter coded by
+  `hevc-enc-inter.c.inc` (`inter`, opt-in for the AVPU; the XM engines
+  keep the older skip / intra DC coding): each 8x8 CU is skipped (a
+  merge candidate's motion), merged with a residual, coded with a vector
+  (AMVP predictor and difference, `rqt_root_cbf`) or intra DC; vectors
+  full-pel at even luma positions, so chroma is full-pel and prediction a
+  copy of the reference; the merge list (A1, B1, B0, A0, B2, the temporal
+  candidate, zeros up to MaxNumMergeCand 5) and the AMVP list built as
+  the decoder builds them, the temporal candidates from the reference
+  picture's decoded vectors (libimp's SPS enables TMVP; every picture
+  refers to the one before it, so no vector is scaled); residuals through
+  the HEVC integer transforms with the default scaling lists libimp's SPS
+  turns on (8x8 inter / intra lists; 4x4 flat), coded as
+  `residual_coding()` with its context sets (sign hiding when the PPS
+  has it: libimp's does not); deblocking with the inter boundary
+  strengths. The decoded pictures equal the model's reference, sample
+  for sample. Every CU is coded at QP 22 at most (cu_qp_delta), P
+  pictures' too: libimp's rate control runs the slice QP up to the 40s,
+  where the residuals of fine detail (the counter's 6-sample cells)
+  quantise away; a picture that would not fit the stream buffer's room is
+  coded again at a higher QP, and as a last resort every CU (macroblock,
+  for H.264) skipped -- a slice cut short would set the overflow bit (30)
+  of its byte count.
+- The parameter sets the coders follow (HEVC SPS / PPS, H.264 PPS) are
+  read from the bytes in front of a slice's offset in its stream buffer:
+  libimp writes a picture's headers after the picture is done, so what is
+  there is an earlier picture's -- the sets an I picture carried, or
+  their remains under a P picture's header. An SPS and a PPS must follow
+  each other whole, the PPS parsed through its trailing bits, before they
+  are taken; the remains of one (on T40, alternate pictures'
+  buffers held a PPS reading `transform_skip_enabled_flag` 0) would code
+  slices the decoder parses otherwise.
+- On T31, 30 pictures of the ISP's scene (a moving dot and a counter,
+  no sensor noise): H.264 1080p I 8.9 KB, P 1.2 KB on average, luma
+  PSNR of the P pictures 47.4 dB; 640x360 I 2.6 KB, P 0.65 KB, 42.0 dB;
+  HEVC 1080p I 18.3 KB, P 2.6 KB, 43.6 dB; 640x360 I 3.2 KB, P 0.9 KB,
+  36.6 dB -- where I_PCM P pictures took 21 KB each at 1080p.
 - `-global ingenic-avpu.dump=DIR` writes every channel's stream and each
-  JPEG to DIR; `trace=1` logs every start and command entry (`-d unimp`),
-  `trace=2` every register write.
+  JPEG to DIR, and for each coded picture the reference the model kept
+  (`avpu-<w>x<h>.<ext>.rec`, NV12 at the picture's size: what a decoder
+  must output) and its source (`.src`); `trace=1` logs every start and
+  command entry (`-d unimp`), `trace=2` every register write.
 
 T41's core is the next Allegro generation (`gen=2`, libimp 1.2's
 `CoreManager.c`, `EncCmdRegs.c`, `EncSliceParam.c`): the common
@@ -810,7 +865,9 @@ page's 0x40-0x88 (R0 0x40, size 0x44, tables 0x58, stream 0x60 / 0x68 /
 
 `python3 qemu/tests/test-ingenic-avpu.py` plays libimp's register and
 command-list sequence under qtest (I + P in CAVLC, CABAC, Enc1-only and
-Enc2 forms, HEVC, JPEG, the PCM budget, the T40/T41 bases) and decodes
+Enc2 forms, HEVC, JPEG, the PCM budget, the T40/T41 bases, and a
+picture of two slices panning over three pictures, which must decode to
+the model's own reconstruction, sample for sample, at 42 dB) and decodes
 the output with ffmpeg (or the `jrottenberg/ffmpeg` docker image).
 `bash qemu-boot/test-ingenic-avpu.sh [--soc t40|t31|t41]` runs it end to
 end: OpenIPC's kernel and rootfs, `load_ingenic` (avpu.ko among the
@@ -821,8 +878,11 @@ JPEG, one boot each. The streams come back through the SD card (T31) or
 pmemsave of the top 8 MiB of RAM (T40, T41, whose SDHCI finds no card); every
 picture must decode under `ffmpeg -err_detect explode` and show the
 ISP's counter, logo and moving dot (`ingenic-isp-check.py`; at 640x360
-HEVC's 8x8 DC blocks are coarser than the counter, so there only the logo
-and the dot). The register block is 4 KiB from `reg-base`, not the MiB
+the HEVC I picture's 8x8 DC blocks are coarser than the counter, so
+there only the logo and the dot). With `dump`, every decoded picture of
+every stream on T31, T40 and T41 was the model's reference bit for bit
+(T40's libimp marks its HEVC streams full range, which a comparison must
+not convert, and sends them as I pictures). The register block is 4 KiB from `reg-base`, not the MiB
 avpu.ko claims: T40's RTC sits at 0x132A0000, inside it. T40's libimp
 faults on a JPEG encoder channel 0; the client uses channels 4 and 5, as
 the SDK samples do. T41 boots the SDK image the way the ISP test does
@@ -1895,7 +1955,7 @@ teardown, so the verdict comes first.
 |---|---|---|---|
 | OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` | own | `-kernel` + NOR root; flash (release SPL + U-Boot) | login, DHCP lease, U-Boot environment and JFFS2 overlay written back (`test-ingenic-boot.sh`) |
 | T41LQ / NQ / XQ SDK 1.2.0 full images (8 and 16 MiB) | `t41,variant=t41lq/nq/x`, 64 / 128 / 256 MiB | flash | SPL (DDR test in cache-as-RAM), U-Boot, kernel on two cores, `Ingenic-uc1_1 login:`, telnet over the GMAC, the vendor `carrier-server` with `sensor=gc4663` and its RTSP H.265 stream pulled and decoded, `reboot` through the watchdog back to login (`test-ingenic-sdk-boot.sh`) |
-| T40N / T40XP SDK 1.2.0 full images (glibc and uClibc, 8 and 16 MiB), T30X SDK 1.0.5 | `t40,variant=t40n/t40xp` (`sensor=gc2053`), `t30,variant=t30x` | flash | the same boot, telnet and reboot cycle; on T40 `carrier-server` streams 1080p H.265 over RTSP through the IPU and AVPU; 20 pulled frames show the ISP scene (`test-ingenic-sdk-boot.sh`) |
+| T40N / T40XP SDK 1.2.0 full images (glibc and uClibc, 8 and 16 MiB), T30X SDK 1.0.5 | `t40,variant=t40n/t40xp` (`sensor=gc2053`), `t30,variant=t30x` | flash | the same boot, telnet and reboot cycle; on T40 `carrier-server` streams 1080p H.265 over RTSP through the IPU and AVPU; 20 pulled frames show the ISP scene (`test-ingenic-sdk-boot.sh`: the bitstream is copied off RTSP and decoded afterwards -- decoding 1080p while pulling falls behind, and live555 then drops RTP packets, a lost P picture; the app's timestamp OSD covers the counter's top row, so the counter is read from its other four) |
 | T10 camera (APK-Link) | `t10` | flash | vendor U-Boot, kernel, login, the camera application |
 | T20 camera (Jabsco) | `t20` | flash | login |
 | T21 cameras (Jabsco, CamHi) | `t21` | flash | login, the application (whose watchdog then reboots it) |

@@ -98,6 +98,11 @@ typedef struct PMb {
 typedef struct PPic {
     Frame f;                    /* reconstruction (y, cb, cr) and source */
     const uint8_t *ry, *rcb, *rcr;  /* reference, deblocked */
+    int ry0, rh;                /* the reference rows of f's row 0, and the
+                                 * reference's height (a slice of a picture
+                                 * is a window: f and mb from its first row) */
+    bool force_intra;           /* no reference: every macroblock intra */
+    bool force_skip;            /* no room left: every macroblock P_Skip */
     PMb *mb;
     int qp_slice, qp_target, qp_cur, cqp;
     bool t8x8;                  /* transform_8x8_mode_flag */
@@ -111,7 +116,8 @@ static inline int clampi(int v, int lo, int hi)
 
 static inline uint8_t ref_y(const PPic *p, int x, int y)
 {
-    return p->ry[clampi(y, 0, p->f.h - 1) * p->f.w + clampi(x, 0, p->f.w - 1)];
+    return p->ry[clampi(y + p->ry0, 0, p->rh - 1) * p->f.w +
+                 clampi(x, 0, p->f.w - 1)];
 }
 
 /* motion-compensated luma (full-pel) and chroma (eighth-pel) prediction */
@@ -119,7 +125,7 @@ static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
                   uint8_t py[256], uint8_t pc[2][64])
 {
     const int dx = mv[0] >> 2, dy = mv[1] >> 2;
-    const int cw = p->f.w / 2, ch = p->f.h / 2;
+    const int cw = p->f.w / 2, ch = p->rh / 2;
     const int fx = mv[0] & 7, fy = mv[1] & 7;
     const int ix = mv[0] >> 3, iy = mv[1] >> 3;
     int x, y, comp;
@@ -134,7 +140,8 @@ static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
 
         for (y = 0; y < 8; y++) {
             for (x = 0; x < 8; x++) {
-                const int x0 = mx * 8 + x + ix, y0 = my * 8 + y + iy;
+                const int x0 = mx * 8 + x + ix;
+                const int y0 = my * 8 + y + iy + p->ry0 / 2;
                 const int xa = clampi(x0, 0, cw - 1);
                 const int xb = clampi(x0 + 1, 0, cw - 1);
                 const int ya = clampi(y0, 0, ch - 1);
@@ -933,7 +940,8 @@ static void db_line(uint8_t *q, int step, int bs, int alpha, int beta,
  * edges left to right, then horizontal ones top to bottom, then chroma the
  * same way, the chroma edges taking the bS of the luma ones they align with.
  */
-static void deblock(Frame *f, const DbMb *mbs, int cqp, int off_a, int off_b)
+static void deblock(Frame *f, const DbMb *mbs, int cqp, int off_a, int off_b,
+                    const uint16_t *slice)
 {
     const int cw = f->w / 2;
     int mx, my, e, k, dir, comp;
@@ -948,7 +956,13 @@ static void deblock(Frame *f, const DbMb *mbs, int cqp, int off_a, int off_b)
                     const DbMb *pm = q;
 
                     if (e == 0) {
-                        if (dir == 0 ? mx == 0 : my == 0) {
+                        const int pi = dir == 0 ? my * f->mbw + mx - 1
+                                                : (my - 1) * f->mbw + mx;
+
+                        /* the picture's edge; with slice (idc 2) a
+                         * neighbour in another slice too */
+                        if ((dir == 0 ? mx == 0 : my == 0) ||
+                            (slice && slice[pi] != slice[my * f->mbw + mx])) {
                             memset(bs[dir][e], 0, sizeof(bs[dir][e]));
                             continue;
                         }
@@ -1029,7 +1043,7 @@ static void frame_to_ref(Frame *f, const DbMb *db, int cqp, int deblock_idc,
     int i, n = f->w * f->h / 4;
 
     if (deblock_idc != 1) {
-        deblock(f, db, cqp, off_a, off_b);
+        deblock(f, db, cqp, off_a, off_b, NULL);
     }
     memcpy(ry, f->y, (size_t)f->w * f->h);
     for (i = 0; i < n; i++) {
@@ -1124,11 +1138,28 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
             PRes r;
 
             memset(me, 0, sizeof(*me));
+            if (p->force_intra) {
+                /* the decoder's reference unknown: nothing may refer to it */
+                cabac_decision(&c, 11 + (a && a->type != PMB_SKIP) +
+                               (b && b->type != PMB_SKIP), 0);
+                me->type = PMB_INTRA;
+                put_intra(p, &c, mx, my, me);
+                p->last_qp_delta_nz = me->qp_delta_nz;
+                st->intra++;
+                goto next;
+            }
             mv_skip(p, mx, my, mvs);
             mv_pred(p, mx, my, mvp);
 
             /* P_Skip if its prediction leaves nothing to code */
             mc_mb(p, mx, my, mvs, py, pc);
+            if (p->force_skip) {
+                cabac_decision(&c, 11 + (a && a->type != PMB_SKIP) +
+                               (b && b->type != PMB_SKIP), 1);
+                put_skip(p, mx, my, me, mvs, py, pc);
+                st->skip++;
+                goto next;
+            }
             residual_mb(p, mx, my, py, pc, p->qp_target, &r);
             const int skip_inc = (a && a->type != PMB_SKIP) +
                                  (b && b->type != PMB_SKIP);
@@ -1281,9 +1312,9 @@ size_t h264_slice_p_cabac(int qp, int chroma_qp_offset, int cabac_init_idc,
         rcb[i] = ruv[2 * i];
         rcr[i] = ruv[2 * i + 1];
     }
-    p = (PPic) { .ry = ry, .rcb = rcb, .rcr = rcr, .mb = mbs, .qp_slice = qp,
-                 .qp_target = qp, .cqp = chroma_qp_offset,
-                 .t8x8 = transform_8x8_mode };
+    p = (PPic) { .ry = ry, .rcb = rcb, .rcr = rcr, .ry0 = 0, .rh = h,
+                 .mb = mbs, .qp_slice = qp, .qp_target = qp,
+                 .cqp = chroma_qp_offset, .t8x8 = transform_8x8_mode };
     frame_setup(&p.f, mbw, mbh, y, ys, uv, cs);
     /* the buffer must hold the picture: if it does not, again at a higher
      * QP (mb_qp_delta on the first coded macroblock) */
@@ -1306,6 +1337,203 @@ size_t h264_slice_p_cabac(int qp, int chroma_qp_offset, int cabac_init_idc,
     frame_to_ref(&p.f, dbm, chroma_qp_offset, db->idc, db->alpha_off,
                  db->beta_off, ry, ruv);
     frame_free(&p.f);
-    (void)h;
     return len;
+}
+
+/* ---- a picture of several slices ------------------------------------------ */
+
+/*
+ * For engines that split a picture into slices of whole macroblock rows
+ * (the AVPU).  Each slice is coded on its own window of the picture's
+ * reconstruction and macroblock array: its first row has no neighbour
+ * above, as a slice's does not (intra prediction, vector prediction, the
+ * CABAC contexts), while motion compensation reads the whole reference.
+ * The in-loop filter runs once the picture is complete, across the slices'
+ * edges or not as disable_deblocking_filter_idc says (0 / 2).
+ */
+struct H264Pic {
+    int mbw, mbh;
+    uint8_t *y, *cb, *cr;           /* the reconstruction, not deblocked */
+    const uint8_t *sy, *suv;
+    int sys, scs;
+    uint8_t *ry, *rcb, *rcr;        /* the reference, NULL: none */
+    PMb *mb;
+    MbInfo *info;
+    DbMb *db;
+    uint16_t *slice;                /* each macroblock's slice */
+    int nslices;
+    int cqp;
+    bool t8x8;
+};
+
+H264Pic *h264_pic_new(int mbw, int mbh, const uint8_t *y, int ys,
+                      const uint8_t *uv, int cs, const uint8_t *ry,
+                      const uint8_t *ruv, int chroma_qp_offset,
+                      bool transform_8x8_mode)
+{
+    H264Pic *pic = g_new0(H264Pic, 1);
+    const size_t n = (size_t)mbw * mbh * 64;        /* chroma samples */
+    size_t i;
+
+    pic->mbw = mbw;
+    pic->mbh = mbh;
+    pic->y = g_malloc0((size_t)mbw * mbh * 256);
+    pic->cb = g_malloc0(n);
+    pic->cr = g_malloc0(n);
+    pic->sy = y;
+    pic->suv = uv;
+    pic->sys = ys;
+    pic->scs = cs;
+    pic->mb = g_new0(PMb, mbw * mbh);
+    pic->info = g_new0(MbInfo, mbw * mbh);
+    pic->db = g_new0(DbMb, mbw * mbh);
+    pic->slice = g_new0(uint16_t, mbw * mbh);
+    pic->cqp = chroma_qp_offset;
+    pic->t8x8 = transform_8x8_mode;
+    if (ry && ruv) {
+        pic->ry = g_memdup2(ry, (size_t)mbw * mbh * 256);
+        pic->rcb = g_malloc(n);
+        pic->rcr = g_malloc(n);
+        for (i = 0; i < n; i++) {
+            pic->rcb[i] = ruv[2 * i];
+            pic->rcr[i] = ruv[2 * i + 1];
+        }
+    }
+    return pic;
+}
+
+/* the window of rows [r0, r0 + rows) as a Frame of its own */
+static void pic_window(const H264Pic *pic, Frame *f, int r0, int rows)
+{
+    const int w = pic->mbw * 16;
+
+    *f = (Frame) { .mbw = pic->mbw, .mbh = rows, .w = w, .h = rows * 16,
+                   .y = pic->y + (size_t)r0 * 16 * w,
+                   .cb = pic->cb + (size_t)r0 * 8 * (w / 2),
+                   .cr = pic->cr + (size_t)r0 * 8 * (w / 2),
+                   .sy = pic->sy + (size_t)r0 * 16 * pic->sys,
+                   .suv = pic->suv + (size_t)r0 * 8 * pic->scs,
+                   .sys = pic->sys, .scs = pic->scs };
+}
+
+size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
+                            int qp, int cabac_init_idc, uint8_t *out,
+                            size_t cap, H264PStats *st)
+{
+    const int mbw = pic->mbw;
+    H264PStats dummy;
+    size_t len;
+    int i;
+
+    if (!st) {
+        st = &dummy;
+    }
+    memset(st, 0, sizeof(*st));
+    qp = MIN(MAX(qp, 0), 51);
+    r0 = MIN(MAX(r0, 0), pic->mbh - 1);
+    rows = MIN(MAX(rows, 1), pic->mbh - r0);
+    for (i = r0 * mbw; i < (r0 + rows) * mbw; i++) {
+        pic->slice[i] = pic->nslices;
+    }
+    pic->nslices++;
+
+    if (!p_slice) {
+        Frame f;
+        Cabac c;
+        MbInfo *info = pic->info + (size_t)r0 * mbw;
+        const int qpc = chroma_qp(qp, pic->cqp);
+        int mx, my;
+
+        pic_window(pic, &f, r0, rows);
+        memset(info, 0, sizeof(*info) * mbw * rows);
+        cabac_init(&c, qp, out, out + cap);
+        for (my = 0; my < rows; my++) {
+            for (mx = 0; mx < mbw; mx++) {
+                encode_mb(&f, &c, NULL, info, mx, my, qp, qpc);
+                if (mx == mbw - 1 && my == rows - 1) {
+                    cabac_flush(&c);
+                } else {
+                    cabac_terminate0(&c);
+                }
+            }
+        }
+        for (i = r0 * mbw; i < (r0 + rows) * mbw; i++) {
+            pic->db[i] = (DbMb) { .intra = 1, .qp = qp };
+        }
+        st->intra = mbw * rows;
+        st->qp = qp;
+        return c.p - out;
+    }
+
+    PPic p = { .ry = pic->ry, .rcb = pic->rcb, .rcr = pic->rcr,
+               .ry0 = r0 * 16, .rh = pic->mbh * 16,
+               .force_intra = !pic->ry,
+               .mb = pic->mb + (size_t)r0 * mbw, .qp_slice = qp,
+               .qp_target = qp, .cqp = pic->cqp, .t8x8 = pic->t8x8 };
+
+    pic_window(pic, &p.f, r0, rows);
+    for (;;) {
+        len = p_slice_try(&p, cabac_init_idc, out, cap, st);
+        if (len + 64 <= cap || p.force_skip || p.force_intra) {
+            break;
+        }
+        if (p.qp_target >= 51) {
+            /* not even at QP 51: every macroblock skipped */
+            p.force_skip = true;
+            continue;
+        }
+        p.qp_target = MIN(p.qp_target + 6, 51);
+    }
+    st->qp = p.qp_target;
+    for (i = r0 * mbw; i < (r0 + rows) * mbw; i++) {
+        const PMb *m = &pic->mb[i];
+
+        pic->db[i] = (DbMb) { .intra = m->type == PMB_INTRA, .qp = m->qp,
+                              .nz = m->nz };
+        if (m->type != PMB_INTRA) {
+            pic->db[i].mv[0] = m->mv[0];
+            pic->db[i].mv[1] = m->mv[1];
+        }
+    }
+    return len;
+}
+
+void h264_pic_finish(H264Pic *pic, const H264Deblock *db, uint8_t *ry,
+                     uint8_t *ruv)
+{
+    const int w = pic->mbw * 16;
+    Frame f = { .mbw = pic->mbw, .mbh = pic->mbh, .w = w, .h = pic->mbh * 16,
+                .y = pic->y, .cb = pic->cb, .cr = pic->cr };
+    const int n = w * f.h / 4;
+    int i;
+
+    if (db->idc != 1) {
+        deblock(&f, pic->db, pic->cqp, db->alpha_off, db->beta_off,
+                db->idc == 2 ? pic->slice : NULL);
+    }
+    if (ry && ruv) {
+        memcpy(ry, pic->y, (size_t)w * f.h);
+        for (i = 0; i < n; i++) {
+            ruv[2 * i] = pic->cb[i];
+            ruv[2 * i + 1] = pic->cr[i];
+        }
+    }
+}
+
+void h264_pic_free(H264Pic *pic)
+{
+    if (!pic) {
+        return;
+    }
+    g_free(pic->y);
+    g_free(pic->cb);
+    g_free(pic->cr);
+    g_free(pic->ry);
+    g_free(pic->rcb);
+    g_free(pic->rcr);
+    g_free(pic->mb);
+    g_free(pic->info);
+    g_free(pic->db);
+    g_free(pic->slice);
+    g_free(pic);
 }
