@@ -45,6 +45,7 @@ KERNEL=$DIR/uImage.$SOC
 ROOTFS=$DIR/rootfs.squashfs.$SOC
 
 case $SOC in
+    fh8626v100) MTDID=spi0.0 ;;        # 4.9.129, despite the suffix
     *v100) MTDID=spi_flash ;;          # the 3.0.8 m25p80 platform data's
     *)     MTDID=spi0.0 ;;
 esac
