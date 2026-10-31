@@ -12,13 +12,15 @@
 #
 #   bash qemu-boot/test-ingenic-avpu.sh [--soc t40|t31|t41] [--sensor NAME]
 #        [--codecs "h264 h265 jpeg"] [--frames N] [--fw DIR] [--qemu PATH]
-#        [--image SDK.img] [--ffmpeg CMD] [--out DIR] [--osd]
+#        [--image SDK.img] [--ffmpeg CMD] [--out DIR] [--osd] [--ivpu]
 #
 # --osd (T41): channel 0 goes through a libimp OSD group with a red
 # rectangle and a green line, which libimp draws with the DRAWBOX
 # (hw/misc/ingenic-drawbox.c); the decoded pictures must show both.  Not
 # T40 here: OpenIPC's T40 kernel has no drawbox driver, so libimp draws
 # no boxes (test-ingenic-xb2blocks.sh covers the T40 SDK kernel's).
+# --ivpu (T41): JPEG channels on the HELIX JPEG engine (encVputype
+# IMP_ENC_TPYE_IVPU, /dev/soc_vpu, hw/misc/ingenic-vpu.c) instead of the AVPU.
 #
 # The same machinery as test-ingenic-isp.sh (its options, sensors and
 # toolchains); T40 is the default here.  --ffmpeg defaults to ffmpeg on
@@ -65,6 +67,7 @@ OUT=
 PNG=
 TIMEOUT=900
 OSD=
+IVPU=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -81,6 +84,7 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift ;;
     --png) PNG=1 ;;
     --osd) OSD=1 ;;
+    --ivpu) IVPU=1 ;;
     --timeout) TIMEOUT=$2; shift ;;
     --codecs) CODECS=$2; shift ;;
     --ffmpeg) FFMPEG=$2; shift ;;
@@ -158,6 +162,10 @@ if [ -n "$OSD" ]; then
     *) echo "--osd is for T41 (OpenIPC's T40 kernel has no drawbox driver)" >&2
        exit 2 ;; esac
 fi
+if [ -n "$IVPU" ]; then
+    case $SOC in t41) DEFS="$DEFS -DENC_IVPU" ;;
+    *) echo "--ivpu is for T41 (its HELIX JPEG engine)" >&2; exit 2 ;; esac
+fi
 if [ "$LIBIMP" = sdk41 ]; then
     $CC -O2 -Wall -I"$INC" $DEFS -static -s -o "$WORK/rfs/usr/bin/avpu-enc" \
         "$SRC" "$SDK41/lib/uclibc/libimp.a" "$SDK41/lib/uclibc/libalog.a" \
@@ -212,6 +220,7 @@ $LOADER
 echo "AVPUTEST modules: \$(lsmod | sed -n 's/^\\(avpu[^ ]*\\|tx_isp[^ ]*\\|sensor_[^ ]*\\).*/\\1/p' | tr '\\n' ' ')"
 touch /tmp/closesimd
 ${OSD:+export AVPU_OSD=1}
+${IVPU:+export AVPU_IVPU=1}
 # T40's SDHCI finds no card: the streams go to the top 8 MiB of RAM too,
 # above libimp's buffers, for the host's pmemsave
 [ -b /dev/mmcblk0 ] || export SNAP_DEVMEM=$(( (${RAM%M} - 8) << 20 ))

@@ -402,6 +402,23 @@ def test_core_intc(qt):
     qt.writel(CCU + 0x1000 + 4, 0)
 
 
+# --- T41's UART4 / UART5 ---------------------------------------------------
+
+def test_uart45(qt):
+    print("T41's UART4 / UART5")
+    for n, base, src in ((4, 0x10034000, 57), (5, 0x10035000, 56)):
+        qt.writel(base + 0x1C, 0x5A)                    # SCR
+        check('UART%d: SCR reads back' % n, qt.readl(base + 0x1C) & 0xff, 0x5A)
+        check('UART%d: LSR, transmitter empty' % n,
+              qt.readl(base + 0x14) & 0x60, 0x60)
+        qt.writel(base + 0x04, 0x02)                    # IER: THRE
+        check('UART%d: THRE interrupt on core INTC %d' % (n, src),
+              (qt.readl(CORE_INTC + 0x20) >> (src - 32)) & 1, 1)
+        qt.writel(base + 0x04, 0)
+        check('UART%d: the line drops with IER clear' % n,
+              (qt.readl(CORE_INTC + 0x20) >> (src - 32)) & 1, 0)
+
+
 # --- SADC ------------------------------------------------------------------
 
 def test_sadc(qt, intc=INTC):
@@ -838,6 +855,67 @@ def test_vo(qt, intc=CORE_INTC):
     qt.writel(VO + 0x014, qt.readl(VO + 0x014) & ~1)
     check('INT_CLC clears it', (qt.readl(VO + 0x010) & 1,
           (qt.readl(intc + 0x20) >> 11) & 1), (0, 0))
+
+
+def test_dpu(qt, intc=CORE_INTC):
+    print('ingenic-dpu (T40/T41 LCD controller)')
+    DPU, W, H = 0x13050000, 160, 120
+    FD, LD, BUF = SCRATCH, SCRATCH + 0x1000, SCRATCH + 0x10000
+    le = lambda *w: b''.join(struct.pack('<I', v) for v in w)
+    # layer 0: RGB565 red, the whole frame; layer 1: ARGB8888 blue, half
+    # transparent, 40x40 at (100, 60); layer 2: NV12 white 32x32 at (8, 8)
+    # scaled to 64x64
+    l0, l1, l2 = BUF, BUF + 0x10000, BUF + 0x20000
+    qt.write(l0, struct.pack('<H', 0xF800) * (W * H))
+    qt.write(l1, struct.pack('<I', 0x800000FF) * (40 * 40))
+    qt.write(l2, bytes([235]) * (32 * 32) + bytes([128]) * (32 * 16))
+    size = lambda w, h: w | (h << 16)
+    qt.write(LD, le(size(W, H), 2 << 16, l0, 0, 0, 0, 0, 0, 0, W, 0, 0))
+    qt.write(LD + 0x40, le(size(40, 40), 5 << 16, l1, 0, 0, 0,
+                           size(100, 60), 0, 0, 40, 0, 0))
+    qt.write(LD + 0x80, le(size(32, 32), 8 << 16, l2, size(64, 64), 0, 0,
+                           size(8, 8), 0, 0, 32, l2 + 32 * 32, 32))
+    en = (7 << 4) | (0 << 8) | (1 << 10) | (2 << 12)
+    qt.write(FD, le(FD, size(W, H), 1, 0, 0, LD, LD + 0x40, LD + 0x80, 0,
+                    en, 0))
+    qt.writel(DPU + 0x200C, (1 << 17) | (1 << 14) | (1 << 6))   # INTC
+    qt.writel(DPU + 0x0000, FD)
+    qt.writel(DPU + 0x0004, 1)                                  # START
+    check('WORKING after START', qt.readl(DPU + 0x2004) & 1, 1)
+    qt.step(20 * 1000 * 1000)
+    st = qt.readl(DPU + 0x2004)
+    check('one frame: CMP_START, layer 0..2 ends, CMP_END, DISP_END; '
+          'stopped (the descriptor\'s stop bit)',
+          st & 0x27E01, (1 << 17) | (1 << 14) | (7 << 10) | (1 << 9))
+    check('INT_FLAG = ST & INTC, line 20 up',
+          (qt.readl(DPU + 0x2010), (qt.readl(intc) >> 20) & 1),
+          ((1 << 17) | (1 << 14), 1))
+    check('one frame shown', qt.qom_get('/machine/dpu', 'frames'), 1)
+    ppm = os.path.join(qt.dir, 'dpu.ppm')
+    qt.qmp('screendump', filename=ppm, device='dpu')
+    data = open(ppm, 'rb').read()
+    hdr = data.split(b'\n', 3)
+    px = lambda x, y: tuple(hdr[3][(y * W + x) * 3:(y * W + x) * 3 + 3])
+    check('the display is %s' % hdr[1].decode(), hdr[1], b'%d %d' % (W, H))
+    check('the RGB565 background is red', px(90, 20), (255, 0, 0))
+    check('the ARGB layer blends half blue over it',
+          px(120, 80), (127, 0, 128))
+    check('the NV12 layer, scaled 2x, is white to (71, 71)',
+          (px(10, 10), px(70, 70), px(74, 74)),
+          ((255, 255, 255), (255, 255, 255), (255, 0, 0)))
+    qt.writel(DPU + 0x2008, (1 << 17) | (1 << 14))
+    check('CLR_ST clears them, the line drops',
+          (qt.readl(DPU + 0x2010), (qt.readl(intc) >> 20) & 1), (0, 0))
+    # a looping chain: the next descriptor is itself, no stop bit
+    qt.write(FD + 8, le(0))
+    qt.writel(DPU + 0x0004, 1)
+    qt.step(60 * 1000 * 1000)
+    check('a looping chain keeps running', (qt.readl(DPU + 0x2004) & 1,
+          qt.qom_get('/machine/dpu', 'frames') >= 3), (1, True))
+    qt.writel(DPU + 0x2000, 1 << 3)                             # GEN_STP
+    qt.step(20 * 1000 * 1000)
+    check('a general stop ends after the frame, STOP_DISP_ACK',
+          qt.readl(DPU + 0x2004) & 0x41, 0x40)
 
 
 def test_i2d(qt, intc=CORE_INTC):
@@ -2694,6 +2772,7 @@ def main():
         test_ssi(qt, CORE_INTC)
         qt.close()
         qt = QTest(a.qemu, 't41')
+        test_uart45(qt)
         test_sadc(qt, CORE_INTC)
         test_sound(qt, CORE_INTC)
         test_codec_gain_t41(qt)
@@ -2704,6 +2783,7 @@ def main():
         test_aip(qt)
         test_vo(qt)
         test_nndma(qt)
+        test_dpu(qt)
         test_dtrng(qt, CORE_INTC)
         test_aes(qt, CORE_INTC)
         test_hash(qt, CORE_INTC)
