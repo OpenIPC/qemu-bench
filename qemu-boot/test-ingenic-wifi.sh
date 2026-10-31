@@ -54,6 +54,7 @@ unsquashfs -q -d "$WORK/rfs" "$FW/rootfs.squashfs.t31" >/dev/null
 mkdir -p "$WORK/rfs/root"
 cp "$DRIVER/cfg80211.ko" "$DRIVER/atbm_wifi.ko" "$WORK/rfs/root/"
 cat > "$WORK/rfs/root/open.conf" <<EOF
+ctrl_interface=/tmp/wpa
 network={
 	ssid="$SSID"
 	key_mgmt=NONE
@@ -85,10 +86,10 @@ ifconfig wlan0 up
 sleep 1
 wpa_supplicant -B -i wlan0 -c /root/open.conf -D nl80211,wext 2>/tmp/wpa.log
 for i in $(seq 1 20); do
-	wpa_cli -i wlan0 status 2>/dev/null | grep -q 'wpa_state=COMPLETED' && break
+	wpa_cli -p /tmp/wpa -i wlan0 status 2>/dev/null | grep -q 'wpa_state=COMPLETED' && break
 	sleep 1
 done
-echo "WIFI assoc: $(wpa_cli -i wlan0 status 2>/dev/null | grep wpa_state=)"
+echo "WIFI assoc: $(wpa_cli -p /tmp/wpa -i wlan0 status 2>/dev/null | grep wpa_state=)"
 udhcpc -i wlan0 -n -q -t 8 -T 2 2>/tmp/udhcpc.log
 IP=$(ifconfig wlan0 | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
 echo "WIFI addr: ${IP:-none}"
@@ -142,8 +143,8 @@ if grep_q 'WIFI assoc: wpa_state=COMPLETED'; then
     echo "  PASS: associated to $SSID"; else
     echo "  FAIL: not associated"; fail=1; fi
 a=$(sed -n 's/.*WIFI addr: //p' "$OUT/console.log" | tr -d '\r')
-if [ -n "$a" ] && [ "$a" != none ]; then echo "  PASS: DHCP address $a"; else
-    echo "  FAIL: no DHCP address"; fail=1; fi
+case $a in 10.0.2.*) echo "  PASS: DHCP address $a" ;; *)
+    echo "  FAIL: no DHCP address (${a:-none})"; fail=1 ;; esac
 if grep_q 'WIFI ping: ok'; then echo "  PASS: ping to the host"; else
     echo "  FAIL: no ping to the host"; fail=1; fi
 [ $fail = 0 ] && echo PASS || { echo FAIL; grep -a WIFI "$OUT/console.log"; }

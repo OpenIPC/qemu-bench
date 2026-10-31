@@ -46,9 +46,16 @@
  * (jz_mmc.c jz_mmc_send_cmd) ends and "mmc" init fails fast.  The data
  * phase finishes when the last FIFO word moves or within the DMAC write:
  * the auto CMD12 (STAT/IFLG AUTO_CMD12_DONE), then DATA_TRAN_DONE, and
- * DMAEND + DMA_DATA_DONE for a DMA read, PRG_DONE + WR_ALL_DONE for a
- * write.  A write does not raise DMA_DATA_DONE: the driver never clears
- * it on that path and a stale one would end the next read early.
+ * DMAEND + DMA_DATA_DONE for a DMA read, PRG_DONE (+ DMAEND and
+ * WR_ALL_DONE through DMA) for a write.  The two DMA-only flags stay off
+ * for PIO: the kernel clears neither after a PIO transfer and unmasks
+ * them before the next DMA one, so a stale WR_ALL_DONE would fire before
+ * the command went out and the tasklet would eat the real completion (a
+ * DMA write stuck in WAITING_DATA); likewise a write does not raise
+ * DMA_DATA_DONE, which would end the next read early.  The command
+ * response interrupt arrives ahead of the DMAC write that starts the
+ * data phase, so the driver's state machine always sees END_CMD_RES
+ * before the data completion.
  * START_OP clears the STAT completion and error bits, clearing an IFLG
  * bit clears its STAT twin.  The interrupt is level, IFLG & ~IMASK, with
  * TXFIFO_WR_REQ / RXFIFO_RD_REQ live while PIO data is pending.  Reset
@@ -60,7 +67,8 @@
  * 1 otherwise, for the machine to wire to that GPIO input.
  *
  * Not modelled: CRC errors, read-wait, stream mode, boot mode, CE-ATA,
- * auto CMD23, SDIO interrupts, timing (RESTO/RDTO/CLKRT are stored).
+ * auto CMD23, timing (RESTO/RDTO/CLKRT are stored).  An SDIO card's
+ * interrupt (sdbus_set_sdio_irq) is the level IFLG bit 7.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -271,7 +279,8 @@ static void msc_data_done(IngenicMscState *s, bool dma)
                  IFLG_DMAEND | (write ? 0 : IFLG_DMA_DATA_DONE));
     }
     if (write) {
-        msc_flag(s, STAT_PRG_DONE, IFLG_PRG_DONE | IFLG_WR_ALL_DONE);
+        msc_flag(s, STAT_PRG_DONE,
+                 IFLG_PRG_DONE | (dma ? IFLG_WR_ALL_DONE : 0));
     }
     msc_data_abort(s);
 }

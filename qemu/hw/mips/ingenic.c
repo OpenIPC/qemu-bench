@@ -1761,6 +1761,8 @@ static void ingenic_init(MachineState *ms)
                 /* an SDIO Wi-Fi chip on MSC1 (the camera boards' slot) */
                 DeviceState *card = qdev_new("atbm-sdio");
 
+                qemu_configure_nic_device(card, false, NULL);
+
                 qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                        &error_fatal);
             }

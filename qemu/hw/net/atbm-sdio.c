@@ -238,9 +238,10 @@ static void atbm_send(AtbmSdioState *s, uint16_t id, const void *body,
 #define WSM_SCAN_DONE_IND   0x0806
 #define WSM_NEED_TX_CONFIRM (1u << 8)
 
-#define TX_PACKET_ID        12
-#define TX_HT_PARAMS        28
-#define TX_FRAME            32
+/* wsm_tx offsets from the { len, id } header */
+#define TX_PACKET_ID        4
+#define TX_HT_PARAMS        24
+#define TX_FRAME            28
 #define CAP_NO_CONFIRM      (1u << 3)
 #define MIB_DOT11_STATION_ID    0x0000
 
@@ -485,7 +486,15 @@ static NetClientInfo atbm_net_info = {
 
 /* ---- WSM from the driver ---------------------------------------------- */
 
-#define TX_HDR_SDIO     16          /* wsm_hdr_tx up to len/id */
+/*
+ * Over SDIO every message goes out with a 28-byte prefix ahead of its
+ * { len, id } header -- an 8-byte bus header (total length, checksum
+ * mark, flags) and a 20-byte cipher header -- and len counts the prefix.
+ * The driver packs several messages into one queue write, each starting
+ * on a 256-byte (block) boundary.
+ */
+#define TX_PREFIX       28
+#define TX_ALIGN        256
 
 static void atbm_confirm(AtbmSdioState *s, uint16_t cmd, const void *body,
                          size_t n)
@@ -515,7 +524,6 @@ static void atbm_wsm_out(AtbmSdioState *s, const uint8_t *d, size_t n)
     case WSM_FIRMWARE_CHECK:
         break;
     case WSM_TX:
-        s->tx_consumed++;
         if (len > TX_FRAME) {
             ap_tx(s, d + TX_FRAME, len - TX_FRAME, (id >> 6) & 0xf);
             if (ldl_le_p(d + TX_HT_PARAMS) & WSM_NEED_TX_CONFIRM) {
@@ -651,9 +659,21 @@ static void atbm_fn1_write_end(AtbmSdioState *s)
         atbm_mem_write(s, s->sram_base, s->xfer, len);
         s->sram_base += len;
         break;
-    case HIF_QUEUE:
-        atbm_wsm_out(s, s->xfer, len);
+    case HIF_QUEUE: {
+        uint32_t off = 0;
+
+        while (off + TX_PREFIX + 4 <= len) {
+            uint32_t mlen = lduw_le_p(s->xfer + off + TX_PREFIX);
+
+            if (mlen < TX_PREFIX + 4 || off + mlen > len) {
+                break;
+            }
+            s->tx_consumed++;
+            atbm_wsm_out(s, s->xfer + off + TX_PREFIX, mlen - TX_PREFIX);
+            off += ROUND_UP(mlen, TX_ALIGN);
+        }
         break;
+    }
     }
 }
 
