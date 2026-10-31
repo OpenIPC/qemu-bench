@@ -1120,6 +1120,26 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   is no register contract to follow. Also searched: every 3.10 and 4.4
   kernel and U-Boot tree in the SDKs, the SDK samples, and the 51 vendor
   PDFs (the T40 data sheets list only its pins, SSI_SLV_CLK/CE0/DT/DR).
+- `motor=` puts one of the SDK samples' motor driver chips on the
+  machine, at `/machine/motor-chip` (register meanings inferred from the
+  values the samples write; verified by qtest -- no shipped kernel
+  enables the SPI driver sample_motor3 needs, or carries the samples):
+  - `ms41929` (`ingenic-ms41929`, sample_motor3's `ms419xx_spi_dev.c` /
+    `motor.c`) on SSI0's CE: frames of an address byte (bit 6 a read)
+    and a 16-bit value, low byte first, into 16-bit registers 0x20..0x2F
+    that read back; each falling edge of VD (the sample's VDFZ, PB25)
+    moves channels AB (0x24) and CD (0x29) by their PSUM (bits 7:0)
+    micro-steps, bit 8 the direction, bit 10 the channel on; PB26 low
+    resets it. `pos-ab` / `pos-cd` read the positions.
+  - `ms32006` (`ingenic-ms32006`, sample_motor_i2c) at 0x10 on I2C1:
+    byte registers written as register then value (a write following a
+    pointer-only one without a stop carries data); 0x00 bit 0 the chip
+    on, bits 2 / 1 pause A / B; 0x01..0x04 motor A's 14-bit speed (a step
+    every speed x 128 cycles of 24 MHz) and 12-bit step count with bit 15
+    the output on and bit 14 counter-clockwise, 0x05..0x08 motor B's;
+    0x09 bits 7 / 6 run A / B (cleared at the end of the run), bits 3:2
+    the IR-cut output. Runs count down in virtual time; `pos-a` /
+    `pos-b` and `ircut` read the state.
 - Security blocks, as the SDKs' `sample_aes`, `sample_hash`, `sample_rsa`,
   `sample_dtrng` and `sample_des` and the 4.4 kernel's crypto and
   hw_random drivers use them; everything completes at once:

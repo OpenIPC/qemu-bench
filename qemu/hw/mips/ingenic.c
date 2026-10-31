@@ -343,6 +343,7 @@ struct IngenicMachineState {
     DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
     char *sensor2;
     char *wifi;         /* an SDIO Wi-Fi chip on MSC1: none or "atbm" */
+    char *motor;        /* a motor driver chip: ms41929 (SSI0), ms32006 (I2C1) */
     char *wifi_ssid, *wifi_psk;     /* its access point: SSID, WPA2 passphrase */
     DeviceState *sensor2_dev;       /* sensor2=, T40's third sensor (VIC2) */
     const IngenicSocInfo *info;
@@ -1003,6 +1004,7 @@ static void ingenic_init(MachineState *ms)
     CPUMIPSState *env;
     DeviceState *dev, *gpio, *cpm, *pdma, *uart[6] = { NULL };
     DeviceState *i2c[5] = { NULL };
+    DeviceState *ssi[2] = { NULL };
     SysBusDevice *sbd;
     int i;
 
@@ -1490,7 +1492,7 @@ static void ingenic_init(MachineState *ms)
                   info->soc == INGENIC_T23)) {
             break;
         }
-        dev = qdev_new("ingenic-ssi");
+        dev = ssi[i] = qdev_new("ingenic-ssi");
         qdev_prop_set_string(dev, "bus-name", i ? "ssi1" : "ssi0");
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
@@ -1502,6 +1504,35 @@ static void ingenic_init(MachineState *ms)
         qdev_connect_gpio_out_named(dev, "drq-rx", 0,
                                     qdev_get_gpio_in_named(pdma, "drq",
                                                            0x17 + 2 * i));
+    }
+
+    /*
+     * motor=: the motor driver chips of the SDKs' samples -- ms41929 on
+     * SSI0's CE (sample_motor3: VD on PB25, reset on PB26), ms32006 at
+     * 0x10 on I2C1 (sample_motor_i2c); /machine/motor-chip
+     */
+    if (ims->motor && !strcmp(ims->motor, "ms41929") && ssi[0]) {
+        DeviceState *m = qdev_new("ingenic-ms41929");
+
+        object_property_add_child(OBJECT(ims), "motor-chip", OBJECT(m));
+        qdev_prop_set_uint8(m, "cs", 0);
+        qdev_realize_and_unref(m, qdev_get_child_bus(ssi[0], "ssi0"),
+                               &error_fatal);
+        qdev_connect_gpio_out_named(gpio, "drive", 32 + 25,
+                                    qdev_get_gpio_in_named(m, "vd", 0));
+        qdev_connect_gpio_out_named(gpio, "drive", 32 + 26,
+                                    qdev_get_gpio_in_named(m, "reset", 0));
+    } else if (ims->motor && !strcmp(ims->motor, "ms32006")) {
+        I2CSlave *m = i2c_slave_new("ingenic-ms32006", 0x10);
+
+        object_property_add_child(OBJECT(ims), "motor-chip", OBJECT(m));
+        i2c_slave_realize_and_unref(m, I2C_BUS(qdev_get_child_bus(
+                                    i2c[info->num_i2c > 1 ? 1 : 0], "i2c")),
+                                    &error_fatal);
+    } else if (ims->motor && strcmp(ims->motor, "none")) {
+        error_report("ingenic: motor=%s: ms41929, ms32006 or none",
+                     ims->motor);
+        exit(1);
     }
 
     /* T41's digital microphones: its audio system's own DMA, not the PDMA */
@@ -1892,6 +1923,19 @@ static void ingenic_set_sensor2(Object *obj, const char *value, Error **errp)
     ims->sensor2 = g_strdup(value);
 }
 
+static char *ingenic_get_motor(Object *obj, Error **errp)
+{
+    return g_strdup(INGENIC_MACHINE(obj)->motor);
+}
+
+static void ingenic_set_motor(Object *obj, const char *value, Error **errp)
+{
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    g_free(ims->motor);
+    ims->motor = g_strdup(value);
+}
+
 static char *ingenic_get_wifi(Object *obj, Error **errp)
 {
     return g_strdup(INGENIC_MACHINE(obj)->wifi);
@@ -1972,6 +2016,11 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sensor2",
         "T40: a third image sensor, on I2C0 (VIC2); the same names as "
         "sensor=");
+    object_class_property_add_str(oc, "motor",
+        ingenic_get_motor, ingenic_set_motor);
+    object_class_property_set_description(oc, "motor",
+        "A motor driver chip: ms41929 (SSI0, VD PB25, reset PB26), "
+        "ms32006 (I2C1 at 0x10) or none");
     object_class_property_add_str(oc, "wifi",
         ingenic_get_wifi, ingenic_set_wifi);
     object_class_property_set_description(oc, "wifi",

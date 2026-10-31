@@ -1466,6 +1466,99 @@ def ssi_setup(qt, base, cr0_extra=0):
     qt.writel(base + 0x04, (1 << 15) | (1 << 7) | 0x6 | cr0_extra)
 
 
+def test_motor_ms41929(qt):
+    print('ingenic-ms41929 (sample_motor3 on SSI0)')
+    pb = GPIO + 0x1000
+    vd, rst = 1 << 25, 1 << 26
+    # PB25 / PB26 as GPIO outputs, high
+    qt.writel(pb + 0x18, vd | rst)
+    qt.writel(pb + 0x24, vd | rst)
+    qt.writel(pb + 0x38, vd | rst)
+    qt.writel(pb + 0x44, vd | rst)
+    ssi_setup(qt, SSI0)
+
+    def frame(*b):
+        # jz_spi holds CE through a message with UNFIN, then lets it go
+        qt.writel(SSI0 + 0x08, qt.readl(SSI0 + 0x08) | 1 << 23)
+        for x in b:
+            qt.writel(SSI0, x)
+        qt.writel(SSI0 + 0x08, qt.readl(SSI0 + 0x08) & ~(1 << 23))
+        qt.writel(SSI0 + 0x0C, qt.readl(SSI0 + 0x0C) & ~3)
+        return [qt.readl(SSI0) & 0xff for _ in b]
+
+    def wr(a, v):
+        frame(a, v & 0xff, v >> 8)
+
+    def rd(a):
+        r = frame(a | 0x40, 0, 0)
+        return r[1] | (r[2] << 8)
+
+    pos = lambda c: qt.qom_get('/machine/motor-chip', 'pos-' + c)
+    wr(0x20, 0x1e01)
+    wr(0x23, 0xa0a0)
+    check('registers read back (0x20, 0x23)', (rd(0x20), rd(0x23)),
+          (0x1e01, 0xa0a0))
+
+    def vd_pulse():
+        qt.writel(pb + 0x48, vd)
+        qt.writel(pb + 0x44, vd)
+
+    wr(0x24, 0x3408)                    # AB forward, 8 micro-steps a VD
+    wr(0x29, 0x3000)                    # CD stopped
+    for _ in range(5):
+        vd_pulse()
+    check('5 VD pulses: AB +40, CD still', (pos('ab'), pos('cd')), (40, 0))
+    wr(0x24, 0x3000)
+    wr(0x29, 0x3508)                    # CD reverse
+    for _ in range(3):
+        vd_pulse()
+    check('AB stopped, CD -24', (pos('ab'), pos('cd')), (40, -24))
+    qt.writel(pb + 0x48, rst)
+    check('reset low clears the registers', rd(0x29), 0)
+    qt.writel(pb + 0x44, rst)
+    qt.writel(SSI0 + 0x04, 0)
+
+
+def test_motor_ms32006(qt):
+    print('ingenic-ms32006 (sample_motor_i2c on I2C1)')
+    i2c1 = I2C0 + 0x1000
+    qt.writel(i2c1 + 0x6C, 0)
+    qt.writel(i2c1 + 0x04, 0x10)
+    qt.writel(i2c1 + 0x6C, 1)
+
+    def wr(r, v):
+        # jz_i2cdev_write: the register, then (a restart) the value
+        qt.writel(i2c1 + 0x10, r)
+        qt.writel(i2c1 + 0x10, v | (1 << 10) | (1 << 9))
+
+    rd = lambda r: i2c_read_reg(qt, i2c1, 0x10, r)[0]
+    pos = lambda m: qt.qom_get('/machine/motor-chip', 'pos-' + m)
+    wr(0x00, 0x01)
+    # motor A: 100 pps (24 MHz / 100 / 128 = 1875), 50 steps clockwise
+    wr(0x01, 1875 & 0xff)
+    wr(0x02, (1875 >> 8) | 0x80)
+    wr(0x03, 50)
+    wr(0x04, 0x80)
+    check('a register reads back (speed low byte)', rd(0x01), 1875 & 0xff)
+    wr(0x09, 0x80)
+    check('motor A running', rd(0x09) & 0x80, 0x80)
+    qt.step(250 * 1000 * 1000)
+    check('after 250 ms at 100 pps: 25 steps', pos('a'), 25)
+    qt.step(500 * 1000 * 1000)
+    check('the run ends at 50, bit 7 clears', (pos('a'), rd(0x09) & 0x80),
+          (50, 0))
+    # motor B: 20 steps counter-clockwise
+    wr(0x05, 1875 & 0xff)
+    wr(0x06, 1875 >> 8)
+    wr(0x07, 20)
+    wr(0x08, 0xC0)
+    wr(0x09, 0x40 | 0x04)
+    qt.step(1000 * 1000 * 1000)
+    check('motor B -20, IR-cut one way', (pos('b'),
+          qt.qom_get('/machine/motor-chip', 'ircut')), (-20, 'cw'))
+    qt.writel(i2c1 + 0x6C, 0)
+
+
 def test_uart_dma(qt):
     """jz_uart.c's DMA mode: 32-byte bursts at the trigger level, the
     tail for the receive timeout (IER bit 4 alone), on UART2 looped back"""
@@ -3600,6 +3693,12 @@ def main():
         test_bscaler(qt)
         test_bscaler_lzma(qt)
         test_nndma(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31,motor=ms41929')
+        test_motor_ms41929(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't23,motor=ms32006')
+        test_motor_ms32006(qt)
         qt.close()
         qt = QTest(a.qemu, 't20')
         test_aes(qt)
