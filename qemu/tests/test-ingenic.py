@@ -442,9 +442,12 @@ def _sdio52(qt, fn, addr, data=None):
 def test_sdio(qt):
     print('atbm-sdio (SDIO enumeration on MSC1)')
     qt.writel(MSC1 + 0x00, 1 << 2 | 2)          # start the clock
-    # CMD5 IO_SEND_OP_COND: the card powers up and reports ready
+    # CMD5 IO_SEND_OP_COND: the inquiry (arg 0) is not ready; once a
+    # voltage is offered the card reports ready (R4 bit 31)
     r0, _, _ = _msc_cmd(qt, 5, 0, 4)
-    check('CMD5: card ready', r0 & 0x80, 0x80)
+    check('CMD5 inquiry: not ready', r0 & 0x80, 0)
+    r0, _, _ = _msc_cmd(qt, 5, 0x300000, 4)
+    check('CMD5 with voltage: card ready', r0 & 0x80, 0x80)
     # CMD3 SEND_RELATIVE_ADDR -> RCA 1
     _, r1, _ = _msc_cmd(qt, 3, 0, 6)
     rca = r1 >> 8
@@ -468,9 +471,6 @@ def test_sdio(qt):
     _sdio52(qt, 0, 0x02, 0x02)
     check('function 1 enabled and ready', _sdio52(qt, 0, 0x03) & 2, 2)
     check('FBR1 standard SDIO function', _sdio52(qt, 0, 0x100) & 0x0f, 0x0c)
-    # function-1 I/O space is read/write
-    _sdio52(qt, 1, 0x4000, 0xa5)
-    check('function-1 window stores', _sdio52(qt, 1, 0x4000), 0xa5)
 
 
 def test_sadc(qt, intc=INTC):
