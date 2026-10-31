@@ -1119,6 +1119,59 @@ def test_dpu(qt, intc=CORE_INTC):
     qt.step(20 * 1000 * 1000)
     check('a general stop ends after the frame, STOP_DISP_ACK',
           qt.readl(DPU + 0x2004) & 0x41, 0x40)
+    qt.writel(DPU + 0x2008, 0x8003FFC6)
+    # write-back: layer 0 only, RGB565 out; then hand over to the simple
+    # read channel (frame control bit 3), whose descriptor shows a green
+    # RGB888 buffer and comes back to the composer (chain config bit 1)
+    WB, SRB, SD = BUF + 0x30000, BUF + 0x40000, LD + 0x200
+    qt.write(SRB, struct.pack('<I', 0x0000FF00) * (W * H))
+    qt.write(SD, le(SD, SRB, W, (4 << 19) | (1 << 1), 0))
+    qt.writel(DPU + 0x1000, SD)
+    qt.write(FD, le(FD + 0x40, size(W, H), (1 << 16) | (1 << 3) | (1 << 1),
+                    WB, W, LD, 0, 0, 0, (1 << 4), 0))
+    qt.write(FD + 0x40, le(FD + 0x40, size(W, H), 1, 0, 0, LD, 0, 0, 0,
+                           (1 << 4), 0))
+    qt.writel(DPU + 0x0004, 1)
+    # where the composer resumes when RDMA hands back: the stopping frame
+    qt.writel(DPU + 0x0000, FD + 0x40)
+    qt.step(20 * 1000 * 1000)
+    check('write-back: WDMA_END, the frame in memory as RGB565',
+          (qt.readl(DPU + 0x2004) >> 15 & 1,
+           struct.unpack('<H', qt.read(WB + 2 * (W * 50 + 30), 2))[0]),
+          (1, 0xF800))
+    check('frame control bit 3: the simple-read channel takes over',
+          qt.readl(DPU + 0x2004) & 0x9, 0x8)
+    qt.step(20 * 1000 * 1000)
+    qt.qmp('screendump', filename=ppm, device='dpu')
+    data = open(ppm, 'rb').read()
+    hdr = data.split(b'\n', 3)
+    check('RDMA showed its RGB888 buffer: green, SRD_START / SRD_END',
+          (px(10, 10), qt.readl(DPU + 0x2004) & 0x6, qt.readl(DPU + 0x2114)),
+          ((0, 255, 0), 0x6, SD))
+    qt.step(20 * 1000 * 1000)
+    check('chain config bit 1: back to the composer, which stops there',
+          qt.readl(DPU + 0x2004) & 0x9, 0)
+    # the TLB: layer 0 read through a DMMU table mapping virtual page
+    # 0x40000000 to the red buffer's pages
+    PGD, PT, VA = BUF + 0x50000, BUF + 0x51000, 0x40000000
+    qt.write(PGD + 4 * (VA >> 22), le(PT | 1))
+    npages = (W * H * 2 + 0xfff) // 0x1000
+    qt.write(PT, le(*[(l0 + 0x1000 * i) | 1 for i in range(npages)]))
+    qt.write(BUF + 0x60000, le(size(W, H), 2 << 16, VA, 0, 0, 0, 0, 0, 0,
+                               W, 0, 0))
+    qt.write(FD, le(FD, size(W, H), 1, 0, 0, BUF + 0x60000, 0, 0, 0,
+                    (1 << 4), 0))
+    qt.writel(DPU + 0x3010, PGD)
+    qt.writel(DPU + 0x3000, 1)
+    qt.writel(DPU + 0x0000, FD)
+    qt.writel(DPU + 0x0004, 1)
+    qt.step(20 * 1000 * 1000)
+    qt.qmp('screendump', filename=ppm, device='dpu')
+    data = open(ppm, 'rb').read()
+    hdr = data.split(b'\n', 3)
+    check('a TLB-mapped layer reads through the table: red again',
+          px(90, 20), (255, 0, 0))
+    qt.writel(DPU + 0x3000, 0)
 
 
 def test_i2d(qt, intc=CORE_INTC):

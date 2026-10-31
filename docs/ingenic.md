@@ -979,8 +979,8 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   `/dev/fb0` of the SDK's `sample-LCD`). Neither SDK kernel builds the
   driver, so it follows the driver's contract. START (FRM_CFG_CTRL bit 0)
   takes the frame descriptor at FRM_CFG_ADDR -- next descriptor, size,
-  control (bit 0: stop after this frame), write-back (not modelled), four
-  layer descriptor addresses, the layer enables with each one's z order --
+  control (bit 0: stop after this frame), write-back address and stride,
+  four layer descriptor addresses, the layer enables with each one's z order --
   and every frame time (`fps`, 60) composes the enabled layers bottom to
   top onto the display: RGB555 / ARGB1555 / RGB565, RGB888 and ARGB8888
   in 32 bits (channel order 0 RGB from the top bits down .. 5 BGR, as
@@ -991,6 +991,20 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   and the chain goes on unless the descriptor said stop; DC_CTRL's quick
   stop ends it at once, its general stop after the frame with
   STOP_DISP_ACK. `screendump device=dpu` captures it; `frames` counts.
+  Write-back (control bit 1) also stores the composed frame at the
+  write-back address (stride in pixels) as ARGB8888 / RGB565 / RGB555 /
+  Y / RGB888-in-32 (control [18:16]: 0, 1, 2, 4, 6; YUV422 is not
+  converted), raising WDMA_END. Control bit 3 hands the display to the
+  simple-read channel (CONFIG_INGENIC_FB_SIMPLE_RDMA) after the frame:
+  its 5-word descriptors from RDMA_CHAIN_ADDR (0x1000; RDMA_CHAIN_CTRL bit
+  0 starts it directly) -- next, buffer, stride, chain config (bit 0 the
+  end, bit 1 back to the composer at FRM_CFG_ADDR, colour [18:16], format
+  [22:19]: RGB555 / RGB565 / RGB888-in-32), interrupt mask -- each show a
+  buffer whole at the display's current size (no size in the descriptor:
+  inferred), with SRD_START / SRD_END and SRD_WORKING; DC_CTRL bits 1 / 4
+  stop it at once / after the frame. The TLB (TLB_GLBC bits 3:0 per
+  layer, TLB_TLBA the DMMU page directory JZFB_USE_TLB passes) translates
+  layer reads as the VPU's walk does; a miss reads zero.
 - `ingenic-monitor` (T40, T41; the SDKs' `sample_bus_monitor`): six AXI
   channels (0..4, 6; 0x100 each) and the AHB one (5, at 0x500), each with
   CTRL, a counting window, read / write counters, a watch range and
@@ -2073,8 +2087,8 @@ has one there), T40's GSM and LCE (read otherwise
 than T41's), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
-than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
-T40's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
+than 0 and 2, the DPU's YUV422 write-back, dithering and TLB retry /
+verification registers (storage), T40's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
 SDK's double firmware: the VIC caching both sensors' raw frames for the
 one ISP to process from DDR; above), T23's IVDC DRAM spill lines
 and the blocks below read as zero or as storage.

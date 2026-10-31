@@ -18,8 +18,9 @@
  *   0x9008 / 0x900C TFT_HDE / VDE, and the rest: storage
  *
  * A frame descriptor is 11 words: next descriptor, size (width [11:0],
- * height [27:16]), control (bit 0: stop after this frame; write-back is
- * not modelled), write-back address and stride, layer 0..3 descriptor
+ * height [27:16]), control (bit 0 stop after this frame, bit 1 write
+ * back, bit 3 change to the simple-read channel after it, [18:16] the
+ * write-back format), write-back address and stride, layer 0..3 descriptor
  * addresses, layer enables (bits 4..7) with each layer's z order (2 bits
  * from bit 8, 3 on top), interrupt controls.  A layer descriptor is 12
  * words: size, config (format [19:16] -- 0 RGB555, 1 ARGB1555, 2 RGB565,
@@ -35,6 +36,31 @@
  * then CMP_START, the layers' ends, CMP_END and DISP_END are raised, and
  * the next descriptor follows unless this one said stop.  The "frames"
  * property counts the frames shown.
+ *
+ * Write-back (frame control bit 1): the composed frame also goes to the
+ * write-back address, its stride in pixels, as ARGB8888 (format 0),
+ * RGB565 (1), RGB555 (2), Y (4, mono) or RGB888 in 32 bits (6), raising
+ * WDMA_END (ST bit 15); YUV422 (3) is not converted (logged).
+ *
+ * The simple-read channel ("RDMA", CONFIG_INGENIC_FB_SIMPLE_RDMA):
+ * 0x1000 RDMA_CHAIN_ADDR the first descriptor, 0x1004 RDMA_CHAIN_CTRL
+ * bit 0 START.  A descriptor is 5 words -- next, buffer, stride in
+ * pixels, chain config (bit 0 the chain's end, bit 1 change to the
+ * composer after this frame, colour order [18:16], format [22:19]: 0
+ * RGB555, 2 RGB565, 4 RGB888 in 32 bits), interrupt mask -- and each
+ * frame period shows its buffer whole on the display at the display's
+ * current size (the last composed frame's, there being no size in the
+ * descriptor: inferred), raising SRD_START (bit 2) and SRD_END (bit 1),
+ * SRD_WORKING (bit 3) while it runs; 0x2114 RDMA_DES / 0x2204 the
+ * descriptor shown.  A composer frame with bit 3 hands over to it at
+ * RDMA_CHAIN_ADDR, an RDMA descriptor with bit 1 back to the composer at
+ * FRM_CFG_ADDR.  CTRL bit 1 stops it at once, bit 4 after the frame
+ * (STOP_DISP_ACK).
+ *
+ * The TLB: 0x3000 TLB_GLBC bits 3:0 turn on translation for layers 0..3,
+ * 0x3010 TLB_TLBA the table -- the DMMU page directory the driver gets
+ * through JZFB_USE_TLB, walked as the VPU's (bits 31:22, then 21:12,
+ * bit 0 valid); an unmapped page reads as zero, logged.
  *
  * Neither SDK kernel here builds the driver (both carry only the device
  * tree node), so the model follows fb_v12's contract and is checked by
@@ -71,6 +97,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicDpuState, INGENIC_DPU)
 #define R_INTC          0x200C
 #define R_INT_FLAG      0x2010
 #define R_FRM_DES       0x2100
+#define R_RDMA_ADDR     0x1000
+#define R_RDMA_CTRL     0x1004
+#define R_RDMA_DES      0x2114
+#define R_RDMA_SITE     0x2204
+#define R_TLB_GLBC      0x3000
+#define R_TLB_TLBA      0x3010
+
+#define CTRL_QCK_STP_RD (1u << 1)
+#define CTRL_GEN_STP_RD (1u << 4)
+#define ST_SRD_END      (1u << 1)
+#define ST_SRD_START    (1u << 2)
+#define ST_SRD_WORKING  (1u << 3)
+#define ST_WDMA_END     (1u << 15)
+#define FC_WB           (1u << 1)
+#define FC_TO_RDMA      (1u << 3)
+#define RC_END          (1u << 0)
+#define RC_TO_CMP       (1u << 1)
 
 #define FRM_START       (1u << 0)
 #define CTRL_QCK_STP    (1u << 0)
@@ -103,6 +146,9 @@ struct IngenicDpuState {
     bool stopping;                  /* a general stop: after this frame */
     uint32_t fps;
     uint32_t frames;
+    uint32_t rcur;                  /* RDMA: the descriptor to show next */
+    bool rdma;                      /* the simple-read channel is showing */
+    bool rstopping;
 };
 
 #define DREG(s, off)    ((s)->regs[(off) >> 2])
@@ -211,8 +257,43 @@ static int dpu_bpp(uint32_t fmt)
     return 0;
 }
 
-/* Layer descriptor @addr onto the frame @fb of @fw x @fh */
-static void dpu_layer(uint32_t addr, uint32_t *fb, int fw, int fh)
+/* Layer @n's read of @len bytes at @a, through the TLB if it is on */
+static void dpu_read(IngenicDpuState *s, int n, uint32_t a, void *buf,
+                     size_t len)
+{
+    uint8_t *p = buf;
+    uint32_t tlba = DREG(s, R_TLB_TLBA) & ~0xfffu;
+
+    if (n < 0 || !tlba || !(DREG(s, R_TLB_GLBC) & (1u << n))) {
+        dma_memory_read(&address_space_memory, a, buf, len,
+                        MEMTXATTRS_UNSPECIFIED);
+        return;
+    }
+    while (len) {
+        size_t k = MIN(len, 0x1000 - (a & 0xfff));
+        uint32_t pgd = ldl_le_phys(&address_space_memory, tlba + 4 * (a >> 22));
+        uint32_t pte = (pgd & 1) ?
+            ldl_le_phys(&address_space_memory,
+                        (pgd & ~0xfffu) + 4 * ((a >> 12) & 0x3ff)) : 0;
+
+        if (pte & 1) {
+            dma_memory_read(&address_space_memory,
+                            (pte & ~0xfffu) | (a & 0xfff), p, k,
+                            MEMTXATTRS_UNSPECIFIED);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR, "ingenic-dpu: layer %d TLB miss "
+                          "at 0x%08x\n", n, a);
+            memset(p, 0, k);
+        }
+        a += k;
+        p += k;
+        len -= k;
+    }
+}
+
+/* Layer @n's descriptor @addr onto the frame @fb of @fw x @fh */
+static void dpu_layer(IngenicDpuState *s, int n, uint32_t addr, uint32_t *fb,
+                      int fw, int fh)
 {
     uint32_t d[12];
     uint32_t sw, sh, tw, th, fmt, order, ga, stride, uvstride;
@@ -249,13 +330,10 @@ static void dpu_layer(uint32_t addr, uint32_t *fb, int fw, int fh)
         uint32_t sy = (uint64_t)y * sh / th;
         uint32_t *row = fb + (size_t)(py + y) * fw;
 
-        dma_memory_read(&address_space_memory,
-                        d[2] + (hwaddr)sy * stride * bpp, line,
-                        (size_t)sw * bpp, MEMTXATTRS_UNSPECIFIED);
+        dpu_read(s, n, d[2] + sy * stride * bpp, line, (size_t)sw * bpp);
         if (bpp == 1) {
-            dma_memory_read(&address_space_memory,
-                            d[10] + (hwaddr)(sy / 2) * uvstride, uvline,
-                            (sw + 1) & ~1, MEMTXATTRS_UNSPECIFIED);
+            dpu_read(s, n, d[10] + (sy / 2) * uvstride, uvline,
+                     (sw + 1) & ~1);
         }
         for (x = 0; x < (int)tw && px + x < fw; x++) {
             unsigned r, g, b, a, dr, dg, db;
@@ -277,13 +355,143 @@ static void dpu_layer(uint32_t addr, uint32_t *fb, int fw, int fh)
     }
 }
 
+/* The frame @fb (0x00RRGGBB) of @w x @h onto the display */
+static void dpu_show(IngenicDpuState *s, const uint32_t *fb, int w, int h)
+{
+    DisplaySurface *surf = qemu_console_surface(s->con);
+    int n;
+
+    if (!surf || surface_width(surf) != w || surface_height(surf) != h) {
+        qemu_console_resize(s->con, w, h);
+        surf = qemu_console_surface(s->con);
+    }
+    for (n = 0; n < h; n++) {
+        memcpy(surface_data(surf) + n * surface_stride(surf),
+               fb + (size_t)n * w, 4 * w);
+    }
+    dpy_gfx_update_full(s->con);
+}
+
+/* Write-back: the frame to @addr, @stride pixels a line, in @fmt */
+static void dpu_writeback(const uint32_t *fb, int w, int h, uint32_t addr,
+                          uint32_t stride, uint32_t fmt)
+{
+    int bpp = fmt == 0 || fmt == 6 ? 4 : fmt == 4 ? 1 : 2;
+    g_autofree uint8_t *line = g_malloc((size_t)w * 4);
+    int x, y;
+
+    if (fmt == 3 || fmt == 5 || fmt == 7) {
+        qemu_log_mask(LOG_UNIMP, "ingenic-dpu: write-back format %u\n", fmt);
+        return;
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint32_t v = fb[(size_t)y * w + x];
+            unsigned r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+
+            switch (fmt) {
+            case 0:
+                stl_le_p(line + 4 * x, 0xff000000u | v);
+                break;
+            case 6:
+                stl_le_p(line + 4 * x, v & 0xffffff);
+                break;
+            case 1:
+                stw_le_p(line + 2 * x, ((r >> 3) << 11) | ((g >> 2) << 5) |
+                         (b >> 3));
+                break;
+            case 2:
+                stw_le_p(line + 2 * x, ((r >> 3) << 10) | ((g >> 3) << 5) |
+                         (b >> 3));
+                break;
+            case 4:
+                line[x] = (66 * r + 129 * g + 25 * b + 128 + 4096) >> 8;
+                break;
+            }
+        }
+        dma_memory_write(&address_space_memory,
+                         addr + (hwaddr)y * stride * bpp, line,
+                         (size_t)w * bpp, MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
+static void dpu_next(IngenicDpuState *s)
+{
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / MAX(s->fps, 1));
+}
+
+/* The simple-read channel: show the current RDMA descriptor's buffer */
+static void dpu_rdma_frame(IngenicDpuState *s)
+{
+    uint32_t d[5], fmt, order, stride;
+    DisplaySurface *surf = qemu_console_surface(s->con);
+    int w = surf ? surface_width(surf) : 640;
+    int h = surf ? surface_height(surf) : 480;
+    int x, y, bpp;
+    g_autofree uint32_t *fb = g_new0(uint32_t, (size_t)w * h);
+    g_autofree uint8_t *line = NULL;
+
+    dpu_words(s->rcur, d, 5);
+    DREG(s, R_RDMA_DES) = DREG(s, R_RDMA_SITE) = s->rcur;
+    DREG(s, R_ST) |= ST_SRD_START;
+    fmt = (d[3] >> 19) & 15;
+    order = (d[3] >> 16) & 7;
+    stride = d[2] ? d[2] : w;
+    bpp = dpu_bpp(fmt == 4 ? FMT_RGB888 : fmt);
+    if (bpp >= 2) {
+        line = g_malloc((size_t)w * bpp);
+        for (y = 0; y < h; y++) {
+            dma_memory_read(&address_space_memory,
+                            d[1] + (hwaddr)y * stride * bpp, line,
+                            (size_t)w * bpp, MEMTXATTRS_UNSPECIFIED);
+            for (x = 0; x < w; x++) {
+                unsigned r, g, b, a;
+
+                dpu_pixel(fmt, order, line, NULL, x, &r, &g, &b, &a);
+                fb[(size_t)y * w + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+        dpu_show(s, fb, w, h);
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-dpu: RDMA format %u\n", fmt);
+    }
+    s->frames++;
+    DREG(s, R_ST) |= ST_SRD_END | ST_DISP_END;
+    if ((d[3] & RC_END) || s->rstopping) {
+        DREG(s, R_ST) &= ~ST_SRD_WORKING;
+        if (s->rstopping) {
+            DREG(s, R_ST) |= ST_STOP_ACK;
+        }
+        s->rstopping = false;
+        s->rdma = false;
+    } else if (d[3] & RC_TO_CMP) {
+        /* back to the composer, at its first descriptor */
+        DREG(s, R_ST) &= ~ST_SRD_WORKING;
+        s->rdma = false;
+        s->cur = DREG(s, R_FRM_CFG_ADDR);
+        DREG(s, R_ST) |= ST_WORKING;
+        dpu_next(s);
+    } else {
+        s->rcur = d[0];
+        dpu_next(s);
+    }
+}
+
 /* Show the current frame descriptor and move on */
 static void dpu_frame(void *opaque)
 {
     IngenicDpuState *s = opaque;
+
+    if (s->rdma) {
+        if (DREG(s, R_ST) & ST_SRD_WORKING) {
+            dpu_rdma_frame(s);
+            dpu_update(s);
+        }
+        return;
+    }
     uint32_t f[11];
     int w, h, z, n;
-    DisplaySurface *surf;
     g_autofree uint32_t *fb = NULL;
 
     if (!(DREG(s, R_ST) & ST_WORKING)) {
@@ -300,21 +508,17 @@ static void dpu_frame(void *opaque)
             for (n = 0; n < 4; n++) {
                 if ((f[9] & (1u << (4 + n))) &&
                     extract32(f[9], 8 + 2 * n, 2) == z) {
-                    dpu_layer(f[5 + n], fb, w, h);
+                    dpu_layer(s, n, f[5 + n], fb, w, h);
                     DREG(s, R_ST) |= ST_LAY_END(n);
                 }
             }
         }
-        surf = qemu_console_surface(s->con);
-        if (!surf || surface_width(surf) != w || surface_height(surf) != h) {
-            qemu_console_resize(s->con, w, h);
-            surf = qemu_console_surface(s->con);
+        dpu_show(s, fb, w, h);
+        if (f[2] & FC_WB) {
+            dpu_writeback(fb, w, h, f[3], f[4] ? f[4] : w,
+                          (f[2] >> 16) & 7);
+            DREG(s, R_ST) |= ST_WDMA_END;
         }
-        for (n = 0; n < h; n++) {
-            memcpy(surface_data(surf) + n * surface_stride(surf),
-                   fb + (size_t)n * w, 4 * w);
-        }
-        dpy_gfx_update_full(s->con);
     } else {
         qemu_log_mask(LOG_GUEST_ERROR, "ingenic-dpu: bad frame %dx%d\n", w, h);
     }
@@ -326,10 +530,17 @@ static void dpu_frame(void *opaque)
             DREG(s, R_ST) |= ST_STOP_ACK;
         }
         s->stopping = false;
+    } else if (f[2] & FC_TO_RDMA) {
+        /* hand over to the simple-read channel at its first descriptor */
+        DREG(s, R_ST) &= ~ST_WORKING;
+        s->rdma = true;
+        s->rcur = DREG(s, R_RDMA_ADDR);
+        DREG(s, R_ST) |= ST_SRD_WORKING;
+        s->cur = f[0];
+        dpu_next(s);
     } else {
         s->cur = f[0];
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND / MAX(s->fps, 1));
+        dpu_next(s);
     }
     dpu_update(s);
 }
@@ -357,8 +568,27 @@ static void ingenic_dpu_write(void *opaque, hwaddr off, uint64_t val,
                       NANOSECONDS_PER_SECOND / MAX(s->fps, 1));
         }
         break;
+    case R_RDMA_CTRL:
+        DREG(s, off) = val & ~1u;
+        if (val & 1) {
+            s->rcur = DREG(s, R_RDMA_ADDR);
+            s->rstopping = false;
+            s->rdma = true;
+            DREG(s, R_ST) |= ST_SRD_WORKING;
+            dpu_next(s);
+        }
+        break;
     case R_CTRL:
         DREG(s, off) = 0;
+        if (val & CTRL_QCK_STP_RD) {
+            DREG(s, R_ST) &= ~ST_SRD_WORKING;
+            if (s->rdma) {
+                timer_del(s->timer);
+                s->rdma = false;
+            }
+        } else if ((val & CTRL_GEN_STP_RD) && s->rdma) {
+            s->rstopping = true;
+        }
         if (val & CTRL_QCK_STP) {
             timer_del(s->timer);
             DREG(s, R_ST) &= ~ST_WORKING;
@@ -399,6 +629,8 @@ static void ingenic_dpu_reset(DeviceState *dev)
     s->cur = 0;
     s->stopping = false;
     s->frames = 0;
+    s->rcur = 0;
+    s->rdma = s->rstopping = false;
     dpu_update(s);
 }
 
@@ -429,14 +661,17 @@ static const Property ingenic_dpu_props[] = {
 
 static const VMStateDescription vmstate_ingenic_dpu = {
     .name = TYPE_INGENIC_DPU,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IngenicDpuState, DPU_SIZE / 4),
         VMSTATE_UINT32(cur, IngenicDpuState),
         VMSTATE_BOOL(stopping, IngenicDpuState),
         VMSTATE_UINT32(frames, IngenicDpuState),
         VMSTATE_TIMER_PTR(timer, IngenicDpuState),
+        VMSTATE_UINT32(rcur, IngenicDpuState),
+        VMSTATE_BOOL(rdma, IngenicDpuState),
+        VMSTATE_BOOL(rstopping, IngenicDpuState),
         VMSTATE_END_OF_LIST()
     }
 };
