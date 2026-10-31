@@ -1075,7 +1075,7 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NNDMA_BASE);
     }
-    if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
+    if (info->soc == INGENIC_T41) {
         /*
          * T41's always-on RTC memory (RTC_FTBT_IOBASE): pm_fastboot.c keeps
          * the resume code and the saved DDR settings there across a sleep
@@ -1086,7 +1086,7 @@ static void ingenic_init(MachineState *ms)
                                &error_fatal);
         memory_region_add_subregion(sysmem, 0x10004000, rtcmem);
     }
-    if (info->soc == INGENIC_T41) {
+    if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
         /*
          * IVDC (direct_mode): tx-isp queues channel 0 the pair 0x80000000 /
          * 0x81000000, which the scaler writes into the IVDC and the encoder
