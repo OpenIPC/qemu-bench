@@ -9,6 +9,7 @@
  *     CTXOF 0x4C, CRDREQ 0x50, CTXABRT 0x54, CRXDN 0x58, CACT 0x5C,
  *     CSTP 0x60, CSTT 0x64, CGC 0x68
  *   0x6C ENB  0x70 STA  0x74 TXFLR  0x78 RXFLR  0x80 TXABRT  0x9C ENSTA
+ *   0x88 DMACR (0 RDMAE, 1 TDMAE)  0x8C DMATDLR  0x90 DMARDLR
  *
  * Every DC write happens on the bus at once, so the TX FIFO is always
  * empty (STA TFE|TFNF, RAW TXEMP).  The first command after a stop sends
@@ -18,6 +19,17 @@
  * drivers see from an absent sensor.  Reads fill a 64-byte RX FIFO;
  * RXFL is raised while RXFLR > RXTL.  ENSTA follows ENB: both drivers
  * wait for it on every enable and disable.
+ *
+ * DMA follows the DW_apb_i2c handshake (the register names are in both
+ * vendor drivers, which only print them; no driver here moves data by
+ * DMA): "drq-tx" is high while TDMAE is set, the controller enabled and
+ * the TX FIFO holds no more than DMATDLR entries -- always, as commands
+ * leave at once -- so the PDMA writes DATA_CMD words as fast as it runs;
+ * "drq-rx" rises when RDMAE is set and the RX FIFO holds more than
+ * DMARDLR bytes, and stays up for a burst of DMARDLR + 1 DATA_CMD reads,
+ * each taking a byte.  The machine wires
+ * I2C n to PDMA requests 0x24 + 2 n (TX) and 0x25 + 2 n (RX), the
+ * numbers of every part's jzdma.h / ingenic-pdma.h.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -62,6 +74,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicI2cState, INGENIC_I2C)
 #define R_RXFLR     0x78
 #define R_TXABRT    0x80
 #define R_ENSTA     0x9C
+#define R_DMACR     0x88
+#define R_DMATDLR   0x8C
+#define R_DMARDLR   0x90
 #define I2C_REGS    0x100
 
 #define DC_READ     (1u << 8)
@@ -91,15 +106,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicI2cState, INGENIC_I2C)
 
 #define FIFO_LEN    64
 
+#define DMACR_RDMAE (1u << 0)
+#define DMACR_TDMAE (1u << 1)
+
 struct IngenicI2cState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     I2CBus *bus;
     qemu_irq irq;
+    qemu_irq drq_tx, drq_rx;
 
     uint32_t regs[I2C_REGS / 4];
     uint32_t raw, abrt;
+    uint32_t rx_burst;              /* DMA reads left in this burst */
     Fifo8 rx;
     bool active, reading, aborted;
 };
@@ -122,6 +142,17 @@ static void i2c_update(IngenicI2cState *s)
         s->raw &= ~INT_TXEMP;
     }
     qemu_set_irq(s->irq, (s->raw & *i2c_reg(s, R_INTM)) != 0);
+    if (!(*i2c_reg(s, R_ENB) & 1) || !(*i2c_reg(s, R_DMACR) & DMACR_RDMAE) ||
+        fifo8_is_empty(&s->rx)) {
+        s->rx_burst = 0;
+    } else if (!s->rx_burst &&
+               fifo8_num_used(&s->rx) > (*i2c_reg(s, R_DMARDLR) & 0x3f)) {
+        s->rx_burst = (*i2c_reg(s, R_DMARDLR) & 0x3f) + 1;
+    }
+    qemu_set_irq(s->drq_rx, s->rx_burst != 0);
+    /* the TX FIFO is always empty: level 0 <= DMATDLR */
+    qemu_set_irq(s->drq_tx, (*i2c_reg(s, R_ENB) & 1) &&
+                 (*i2c_reg(s, R_DMACR) & DMACR_TDMAE));
 }
 
 static void i2c_stop(IngenicI2cState *s)
@@ -222,6 +253,9 @@ static uint64_t ingenic_i2c_read(void *opaque, hwaddr off, unsigned size)
             v = 0;
         } else {
             v = fifo8_pop(&s->rx);
+            if (s->rx_burst) {
+                s->rx_burst--;
+            }
         }
         break;
     case R_INTST:
@@ -316,7 +350,7 @@ static void ingenic_i2c_reset(DeviceState *dev)
         i2c_end_transfer(s->bus);
     }
     memset(s->regs, 0, sizeof(s->regs));
-    s->raw = s->abrt = 0;
+    s->raw = s->abrt = s->rx_burst = 0;
     s->active = s->reading = s->aborted = false;
     fifo8_reset(&s->rx);
     i2c_update(s);
@@ -328,18 +362,23 @@ static void ingenic_i2c_init(Object *obj)
 
     memory_region_init_io(&s->iomem, obj, &ingenic_i2c_ops, s,
                           TYPE_INGENIC_I2C, 0x1000);
+    /* the PDMA, woken by a request line, reads and writes DATA_CMD */
+    s->iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->drq_tx, "drq-tx", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->drq_rx, "drq-rx", 1);
     s->bus = i2c_init_bus(DEVICE(obj), "i2c");
     fifo8_create(&s->rx, FIFO_LEN);
 }
 
 static const VMStateDescription vmstate_ingenic_i2c = {
     .name = TYPE_INGENIC_I2C,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IngenicI2cState, I2C_REGS / 4),
+        VMSTATE_UINT32(rx_burst, IngenicI2cState),
         VMSTATE_UINT32(raw, IngenicI2cState),
         VMSTATE_UINT32(abrt, IngenicI2cState),
         VMSTATE_FIFO8(rx, IngenicI2cState),

@@ -946,6 +946,7 @@ static void ingenic_init(MachineState *ms)
     const IngenicVariant *var;
     CPUMIPSState *env;
     DeviceState *dev, *gpio, *cpm, *pdma, *uart[6] = { NULL };
+    DeviceState *i2c[5] = { NULL };
     SysBusDevice *sbd;
     int i;
 
@@ -1159,8 +1160,9 @@ static void ingenic_init(MachineState *ms)
 
     /* I2C, the sensor's bus on I2C0 */
     for (i = 0; i < info->num_i2c; i++) {
-        dev = sysbus_create_simple("ingenic-i2c", I2C_BASE + i * 0x1000,
-                                   ingenic_irq(ims, IRQ_I2C0 - i));
+        dev = i2c[i] = sysbus_create_simple("ingenic-i2c",
+                                            I2C_BASE + i * 0x1000,
+                                            ingenic_irq(ims, IRQ_I2C0 - i));
         if (i == info->sensor_bus && !info->sensor_gpio_sda && ims->sensor &&
             strcmp(ims->sensor, "none")) {
             ims->sensor_dev = ingenic_create_sensor(ims->sensor,
@@ -1328,6 +1330,13 @@ static void ingenic_init(MachineState *ms)
         qdev_connect_gpio_out_named(ser, "drq-rx", 0,
             qdev_get_gpio_in_named(pdma, "drq", 0x15 - 2 * i));
     }
+    /* I2C n on lines 0x24 + 2n (TX) and 0x25 + 2n (RX) */
+    for (i = 0; i < info->num_i2c; i++) {
+        qdev_connect_gpio_out_named(i2c[i], "drq-tx", 0,
+            qdev_get_gpio_in_named(pdma, "drq", 0x24 + 2 * i));
+        qdev_connect_gpio_out_named(i2c[i], "drq-rx", 0,
+            qdev_get_gpio_in_named(pdma, "drq", 0x25 + 2 * i));
+    }
     dev = qdev_new("ingenic-aic");
     switch (info->soc) {
     case INGENIC_T10: case INGENIC_T20: case INGENIC_T21: case INGENIC_T30:
@@ -1413,6 +1422,8 @@ static void ingenic_init(MachineState *ms)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SADC_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ingenic_irq(ims, IRQ_SADC));
+    qdev_connect_gpio_out_named(dev, "drq", 0,
+                                qdev_get_gpio_in_named(pdma, "drq", 9));
 
     /* T41's PWM controller: /machine/pwm */
     if (info->soc == INGENIC_T41) {

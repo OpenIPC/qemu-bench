@@ -6,7 +6,7 @@
  *
  *   0x00 ENA     bit 15 power down (set out of reset); bit n starts a
  *                conversion of AUX n, cleared again when it is done
- *   0x04 CFG     storage
+ *   0x04 CFG     bit 15 DMA_EN (below); the rest storage
  *   0x08 CTRL    bit n masks AUX n's interrupt (byte access)
  *   0x0C STATUS  bit n: AUX n converted; write 1 to clear (byte access)
  *   0x10 + 2n    AUX n's result, 12 bits (16-bit or 32-bit reads: the
@@ -18,12 +18,23 @@
  * "auxN" properties (raw codes, 0..4095; VREF 1.8 V full scale), which
  * a test can change at run time with qom-set.
  *
+ * DMA is inferred: jz_adc.h names ADCFG bit 15 DMA_EN (the touch
+ * screen's on the older parts) and every jzdma.h / ingenic-pdma.h has the
+ * request SADC_RX (9), but no driver uses either.  With DMA_EN set the
+ * enabled channels convert continuously (ENA keeps their bits; a scan
+ * every CONV_NS), and each scan queues one word per channel pair with an
+ * enabled channel -- AUX1:AUX0, AUX3:AUX2, ... as the data registers
+ * hold them -- at the 0x10 port: "drq" (request 9) is high while the
+ * queue holds a word, and in DMA mode a read of 0x10 takes the next one.
+ * A scan that finds the queue full is dropped.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
@@ -42,6 +53,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicSadcState, INGENIC_SADC)
 #define R_STATUS        0x0C
 #define R_DATA          0x10
 #define R_CLKDIV        0x20
+#define R_CFG           0x04
+
+#define CFG_DMA_EN      (1u << 15)
+#define SCANQ           8           /* queued words, two scans of 8 */
 
 #define ENA_POWERDOWN   (1u << 15)
 #define CONV_NS         (20 * SCALE_US)
@@ -51,10 +66,12 @@ struct IngenicSadcState {
 
     MemoryRegion iomem;
     qemu_irq irq;
+    qemu_irq drq;
     QEMUTimer *timer;
 
     uint32_t regs[SADC_REGS / 4];
     uint32_t aux[NCHAN];
+    uint32_t scanq[SCANQ], scan_head, scan_count;
 };
 
 static uint32_t *sadc_reg(IngenicSadcState *s, hwaddr off)
@@ -62,10 +79,35 @@ static uint32_t *sadc_reg(IngenicSadcState *s, hwaddr off)
     return &s->regs[off >> 2];
 }
 
+static bool sadc_dma(IngenicSadcState *s)
+{
+    return *sadc_reg(s, R_CFG) & CFG_DMA_EN;
+}
+
 static void sadc_update(IngenicSadcState *s)
 {
     qemu_set_irq(s->irq, (*sadc_reg(s, R_STATUS) &
                           ~*sadc_reg(s, R_CTRL) & 0xff) != 0);
+    qemu_set_irq(s->drq, sadc_dma(s) && s->scan_count);
+}
+
+/* DMA mode (inferred): queue the words of the scan just done */
+static void sadc_queue_scan(IngenicSadcState *s, uint32_t done)
+{
+    int pair;
+
+    for (pair = 0; pair < NCHAN / 2; pair++) {
+        if (!(done & (3u << (2 * pair)))) {
+            continue;
+        }
+        if (s->scan_count == SCANQ) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ingenic-sadc: DMA queue full, "
+                          "a scan dropped\n");
+            return;
+        }
+        s->scanq[(s->scan_head + s->scan_count++) % SCANQ] =
+            *sadc_reg(s, R_DATA + 4 * pair);
+    }
 }
 
 static void sadc_start(IngenicSadcState *s)
@@ -94,7 +136,13 @@ static void sadc_convert(void *opaque)
             *sadc_reg(s, R_STATUS) |= 1u << n;
         }
     }
-    *ena &= ~0xffu;
+    if (sadc_dma(s)) {
+        /* continuous: the channels stay enabled and convert again */
+        sadc_queue_scan(s, *ena & 0xff);
+        sadc_start(s);
+    } else {
+        *ena &= ~0xffu;
+    }
     sadc_update(s);
 }
 
@@ -104,6 +152,14 @@ static uint64_t ingenic_sadc_read(void *opaque, hwaddr off, unsigned size)
 
     if (off + size > SADC_REGS) {
         return 0;
+    }
+    if (off == R_DATA && sadc_dma(s) && s->scan_count) {
+        uint32_t v = s->scanq[s->scan_head];
+
+        s->scan_head = (s->scan_head + 1) % SCANQ;
+        s->scan_count--;
+        sadc_update(s);
+        return extract64(v, 0, size * 8);
     }
     return extract64(*sadc_reg(s, off), (off & 3) * 8, size * 8);
 }
@@ -132,7 +188,10 @@ static void ingenic_sadc_write(void *opaque, hwaddr off, uint64_t val,
         *reg = (*reg & ~mask) | val;
         break;
     }
-    if (word == R_ENA) {
+    if (word == R_CFG && !sadc_dma(s)) {
+        s->scan_head = s->scan_count = 0;
+    }
+    if (word == R_ENA || word == R_CFG) {
         sadc_start(s);
     }
     sadc_update(s);
@@ -157,6 +216,7 @@ static void ingenic_sadc_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     *sadc_reg(s, R_ENA) = ENA_POWERDOWN;
     *sadc_reg(s, R_CTRL) = 0xff;
+    s->scan_head = s->scan_count = 0;
     sadc_update(s);
 }
 
@@ -169,6 +229,9 @@ static void ingenic_sadc_init(Object *obj)
                           TYPE_INGENIC_SADC, 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->drq, "drq", 1);
+    /* the PDMA, woken by "drq", reads the data port */
+    s->iomem.disable_reentrancy_guard = true;
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sadc_convert, s);
 
     /* mid-scale on every pin, a little apart so that channels can be told */
@@ -183,12 +246,15 @@ static void ingenic_sadc_init(Object *obj)
 
 static const VMStateDescription vmstate_ingenic_sadc = {
     .name = TYPE_INGENIC_SADC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, IngenicSadcState, SADC_REGS / 4),
         VMSTATE_UINT32_ARRAY(aux, IngenicSadcState, NCHAN),
         VMSTATE_TIMER_PTR(timer, IngenicSadcState),
+        VMSTATE_UINT32_ARRAY(scanq, IngenicSadcState, SCANQ),
+        VMSTATE_UINT32(scan_head, IngenicSadcState),
+        VMSTATE_UINT32(scan_count, IngenicSadcState),
         VMSTATE_END_OF_LIST()
     }
 };
