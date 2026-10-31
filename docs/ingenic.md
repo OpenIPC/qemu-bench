@@ -1231,6 +1231,17 @@ is the same software, and differs only in its VIC, whose control is at
   from B 1.00 / R 2.75 in daylight to B 1.16 / R 2.24 under a warm
   light. `-global ingenic-isp-apical.trace-core=on` logs every core
   register the firmware changes.
+- No other statistics are read. The Apical firmware has no autofocus:
+  `af_status` returns 2 with nothing measured and `af_mode`, `af_range_*`
+  and `af_roi` only keep values, in all three modules; event 14 (slot 5)
+  has no algorithm behind it. Iridix (the DRC) reads no statistics block:
+  `iridix_fsm_process_interrupt` runs on frame end from the exposure set
+  and core 0x2C0 bit 7, so its outputs follow the AE -- on T20 the
+  strength in 0x39C goes 0x1000 -> 0x800 and the gain in 0x3DC moves
+  every few frames as the exposure settles. The DIS (`dis_update_stats`,
+  event 15, the second DMA writer's done) reads motion vectors at 0x95C0
+  + 8 i for the 0x908 grid (8 x 4) only when the stabiliser is armed; the
+  core reads zero there, no motion, which is right for a fixed camera.
 
 T40 (`tx-isp-t40.ko` H20220606a, read off the T40 SDK 1.2.0 build with
 symbols) is the T31 design again, rearranged: the core at 0x13300000 is
@@ -1501,8 +1512,7 @@ T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the placement of the two pictures in T40's
 joint mode and the VIC raw frame channel (above), T40/T41's WDR
 statistics (bit 11, a WDR mode's), T40's GSM and LCE (read otherwise
-than T41's), the Apical AF and the zone statistics beyond AE and AWB,
-PDMA transfers for peripherals other than the AIC,
+than T41's), the Apical DIS's motion vectors (zero: no motion), PDMA transfers for peripherals other than the AIC,
 the SSI and the DES, the SSI slave and the HASH engine's CPU mode (no
 driver, sample or document in any tree here, so no contract; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
