@@ -124,6 +124,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IVDC_STORE_SIZE 0x02000000
 #define IVDC_BASE       0x13200000  /* T41: the IVDC's registers */
 #define IRQ_IVDC_T41    13          /* core INTC; "isp-ivdc" in tx-isp */
+#define IRQ_IVDC_T23    38          /* tx-isp-t23.ko's ivdc resource: 46 */
 #define ORAM_SIZE       0x100000
 #define NNDMA_BASE      0x12500000  /* T40, T41: the NNA's DMA */
 #define IO_BASE         0x10000000
@@ -258,7 +259,7 @@ typedef struct IngenicSocInfo {
     hwaddr scaler_base;     /* T30's MSCA scaler (ingenic-isp "t30") */
     int irq_isp, irq_vic;   /* INTC sources, 0: IRQ_ISP / IRQ_VIC */
     int sensor_bus;         /* the I2C bus sinfo / tx-isp probe */
-    int sensor1_bus;        /* > 0: sensor1= (a second sensor) is here */
+    int sensor1_bus;        /* > 0: sensor1= (a second sensor) is on bus - 1 */
     int sensor2_bus;        /* > 0: sensor2= (a third sensor) is on bus - 1 */
     int sensor_gpio_sda;    /* > 0: the sensor bus is bit-banged on GPIOs
                                sda / sda + 1 (T10's i2c-gpio) */
@@ -879,6 +880,8 @@ static const struct {
     uint16_t id_reg, id;        /* galaxycore / hisi-smartsens; ov2735 rev */
 } ingenic_sensors[] = {
     { "gc2053", NULL, 0x37, false, 0xF0, 0x2053 },
+    /* T23 SDK's second-sensor driver: a gc2053 at 0x3f (sensor1=) */
+    { "gc2053s1", NULL, 0x3F, false, 0xF0, 0x2053 },
     { "gc2083", NULL, 0x37, true, 0x03F0, 0x2083 },
     { "sc2336", "hisi-smartsens", 0x30, true, 0x3107, 0xCB3A },
     { "sc2335", "hisi-smartsens", 0x30, true, 0x3107, 0xCB14 },
@@ -1029,11 +1032,12 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NNDMA_BASE);
     }
-    if (info->soc == INGENIC_T41) {
+    if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
         /*
          * IVDC (direct_mode): tx-isp queues channel 0 the pair 0x80000000 /
          * 0x81000000, which the scaler writes into the IVDC and the encoder
-         * reads back; RAM there stands in for its store
+         * (T41's AVPU, T23's HELIX) reads back; RAM there stands in for its
+         * store
          */
         MemoryRegion *ivdc = g_new(MemoryRegion, 1);
 
@@ -1168,8 +1172,11 @@ static void ingenic_init(MachineState *ms)
             ims->sensor_dev = ingenic_create_sensor(ims->sensor,
                 I2C_BUS(qdev_get_child_bus(dev, "i2c")));
         }
-        /* T40's second sensor, on I2C3 through CSI1 (the SDK's samples) */
-        if (info->sensor1_bus && i == info->sensor1_bus && ims->sensor1 &&
+        /*
+         * the second sensor: T40's on I2C3 through CSI1, T23's (the SDK's
+         * gc2053s1, at 0x3f) on I2C0 beside the first (the SDK's samples)
+         */
+        if (info->sensor1_bus && i == info->sensor1_bus - 1 && ims->sensor1 &&
             strcmp(ims->sensor1, "none")) {
             ims->sensor1_dev = ingenic_create_sensor(ims->sensor1,
                 I2C_BUS(qdev_get_child_bus(dev, "i2c")));
@@ -1280,12 +1287,13 @@ static void ingenic_init(MachineState *ms)
                                                info->irq_isp : IRQ_ISP));
         sysbus_connect_irq(sbd, 1, ingenic_irq(ims, info->irq_vic ?
                                                info->irq_vic : IRQ_VIC));
-        if (info->soc == INGENIC_T41) {
+        if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
             /*
-             * the IVDC's registers (its store is RAM, above), core INTC
-             * source 13 (IRQ_IVDC: tx-isp's "isp-ivdc"; the device tree's
-             * node names 0, which is jpeg0's); the ISP tells it of each
-             * picture it writes into the store
+             * the IVDC's registers (its store is RAM, above): T41's core
+             * INTC source 13 (IRQ_IVDC: tx-isp's "isp-ivdc"; the device
+             * tree's node names 0, which is jpeg0's), T23's INTC 38
+             * (tx-isp-t23.ko's tx_isp_ivdc_resource: Linux IRQ 46); the ISP
+             * tells it of each picture it writes into the store
              */
             DeviceState *ivdc = qdev_new("ingenic-ivdc");
 
@@ -1293,7 +1301,8 @@ static void ingenic_init(MachineState *ms)
             sysbus_realize_and_unref(SYS_BUS_DEVICE(ivdc), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(ivdc), 0, IVDC_BASE);
             sysbus_connect_irq(SYS_BUS_DEVICE(ivdc), 0,
-                               ingenic_irq(ims, IRQ_IVDC_T41));
+                               ingenic_irq(ims, info->soc == INGENIC_T41 ?
+                                           IRQ_IVDC_T41 : IRQ_IVDC_T23));
             qdev_connect_gpio_out_named(dev, "ivdc-frame", 0,
                                         qdev_get_gpio_in_named(ivdc,
                                                                "frame", 0));
@@ -1842,6 +1851,7 @@ static const IngenicSocInfo ingenic_socs[] = {
         .soc_id = 0x10023003, .prid = 0, .l1_kib = 16,
         .msc0_cd = 32 + 27, .isp = "t23", .isp_base = ISP_BASE,
         .vic_base = VIC_BASE, .csi_base = CSI_BASE, .dphy_base = DPHY_BASE,
+        .sensor1_bus = 1,
     }, {
         .name = "t30", .desc = "Ingenic T30 (XBurst1)",
         .soc = INGENIC_T30, .cpu = MIPS_CPU_TYPE_NAME("XBurst1"),
@@ -1871,7 +1881,7 @@ static const IngenicSocInfo ingenic_socs[] = {
         .sfc_version = 2, .mtd_id = "jz_sfc", .nand_mtd_id = "sfc_nand",
         .rtc_base = 0x132A0000, .max_cpus = 2, .num_i2c = 4,
         .soc_id = 0x10040003, .prid = 0, .l1_kib = 0,
-        .sensor_bus = 1, .sensor1_bus = 3, .sensor2_bus = 1,
+        .sensor_bus = 1, .sensor1_bus = 4, .sensor2_bus = 1,
         /* VIC0 of three; CSI0 (the one a single sensor uses) */
         .isp = "t40", .isp_base = ISP_BASE, .vic_base = 0x13380000,
         .csi_base = 0x10054000, .dphy_base = DPHY_BASE,

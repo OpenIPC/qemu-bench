@@ -97,7 +97,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicIspState, INGENIC_ISP)
 #define MAX_PIPES       2
 #define NUM_VIC         3
 #define FIFO_DEPTH      16
-#define IVDC_Y          0x80000000u   /* T41 direct_mode's channel-0 pair */
+#define IVDC_Y          0x80000000u   /* direct_mode's channel-0 pair (T41, T23) */
 
 /*
  * What differs between the SoCs.  Every block keeps the T31 meaning of
@@ -334,7 +334,7 @@ struct IngenicIspState {
     MemoryRegion isp_mr, vic_mr, csi_mr, phy_mr, msca_mr;
     MemoryRegion vic1_mr, vic2_mr;
     qemu_irq isp_irq, vic_irq, vic1_irq, vic2_irq;
-    qemu_irq ivdc_frame;        /* T41: a picture into the IVDC's store */
+    qemu_irq ivdc_frame;        /* a picture into the IVDC's store */
     QEMUTimer *timer;
 
     uint32_t fps;
@@ -2058,7 +2058,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         }
         ya = fifo_pop(&c->y, NULL);
         uva = fifo_pop(&c->uv, NULL);
-        ivdc = l->ivdc_bit && ya == IVDC_Y;
+        ivdc = ya == IVDC_Y;
         ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
                           r[l->uvstride >> 2], ya, uva, false, gain, sgain);
         if (p == 0 && ingenic_isp_hldc_on(s)) {
@@ -2066,9 +2066,17 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
             ingenic_isp_hldc_plane(s, 1, w, h, r[l->uvstride >> 2], uva);
         }
         if (ivdc) {
-            /* into the IVDC's store (RAM at IVDC_Y), nothing to dequeue */
-            ISP_REG(l->int_sta) |= 1u << l->ivdc_bit;
+            /* a picture into the IVDC's store (RAM at IVDC_Y) */
             qemu_irq_pulse(s->ivdc_frame);
+        }
+        if (ivdc && l->ivdc_bit) {
+            /*
+             * T41: the ISR sends the pair to the frame source on ivdc_bit
+             * and queues it again itself: nothing to dequeue.  T23's sends
+             * it at frame start (fs_bit) and on channel 0's done bit pops
+             * the done FIFO only to push the same pair back.
+             */
+            ISP_REG(l->int_sta) |= 1u << l->ivdc_bit;
         } else {
             fifo_push(&c->done_y, ya, c->frames);
             fifo_push(&c->done_uv, uva, c->frames);

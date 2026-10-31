@@ -2977,6 +2977,36 @@ def test_isp_layout(qt, soc):
               (qt.readl(IVDC + 0x44), (qt.readl(CORE_INTC + 0x00) >> 13) & 1),
               (0, 0))
 
+    if soc == 't23':
+        # direct_mode: the IVDC pair queued to channel 0 is painted into
+        # the IVDC's store; T23's ISR sends the pair at frame start and on
+        # channel 0's done bit pops it to queue it again, so it comes back
+        # through the done FIFO (no T41 bit 20)
+        qt.writel(ch0 + push_y, 0x80000000)
+        qt.writel(ch0 + push_uv, 0x81000000)
+        qt.step(41 * 1000 * 1000)
+        check('IVDC: frame start and channel 0 done, no bit 20',
+              qt.readl(ISP + sta) & (1 << 20 | 0x1000 | 1), 0x1000 | 1)
+        check('IVDC: the pair comes back through the done FIFO',
+              (qt.readl(ch0 + empty) & 1, qt.readl(ch0 + pop_y)),
+              (0, 0x80000000))
+        check('IVDC: painted into its store',
+              36 <= qt.read(0x80000000 + 12 * w, 1)[0] <= 50, True)
+        # the IVDC's registers (0x13200000, INTC 38: tx-isp-t23.ko's
+        # resource, Linux IRQ 46)
+        IVDC = 0x13200000
+        qt.writel(IVDC + 0x00, 1)
+        check('IVDC: the reset bit reads back 0', qt.readl(IVDC + 0x00), 0)
+        check('IVDC: ISP frame start and done (bits 17, 16)',
+              qt.readl(IVDC + 0x44) & 0x30000, 0x30000)
+        qt.writel(IVDC + 0x40, 0x30000)
+        check('IVDC: enabled, INTC 38 pending',
+              (qt.readl(INTC + 0x20) >> 6) & 1, 1)
+        qt.writel(IVDC + 0x54, qt.readl(IVDC + 0x44))
+        check('IVDC: status cleared, the line drops',
+              (qt.readl(IVDC + 0x44), (qt.readl(INTC + 0x20) >> 6) & 1),
+              (0, 0))
+
 
 def test_isp_apical(qt, soc='t20'):
     print('ingenic-isp-apical (%s)' % soc)
@@ -3358,6 +3388,14 @@ def main():
             qt = QTest(a.qemu, soc)
             test_isp_layout(qt, soc)
             qt.close()
+        # T23's second sensor (the SDK's gc2053s1) beside the first on I2C0
+        qt = QTest(a.qemu, 't23,sensor=gc2053,sensor1=gc2053s1')
+        print('t23 sensor1=')
+        check('GC2053 ID at I2C0 0x37', i2c_read_reg(qt, I2C0, 0x37, 0xF0, 2),
+              [0x20, 0x53])
+        check('gc2053s1 ID at I2C0 0x3f', i2c_read_reg(qt, I2C0, 0x3F, 0xF0, 2),
+              [0x20, 0x53])
+        qt.close()
         qt = QTest(a.qemu, 't20,sensor=jxf22')
         test_isp_apical(qt)
         qt.close()
