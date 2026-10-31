@@ -37,8 +37,9 @@
  * Request type 8 (AUTO) runs at once: a memory to memory copy.  Any
  * other is paced by the peripheral: the "drq" GPIO input of that number
  * (0..63) is high while the peripheral wants service -- the AIC's 5
- * (loop record), 6 (play) and 7 (record) -- and every access to the
- * peripheral's side waits for it.  An access is the port width of that
+ * (loop record), 6 (play) and 7 (record), the DMIC's 13, UART n's
+ * 0x14 - 2 n (TX) and 0x15 - 2 n (RX), the SSIs' 0x16..0x19, the DES's
+ * 0x2E / 0x2F -- and every access to the peripheral's side waits for it.  An access is the port width of that
  * side (SP for a source without SAI, DP for a target without DAI).
  *
  * Copyright (c) 2026 OpenIPC.
@@ -100,6 +101,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicPdmaState, INGENIC_PDMA)
 
 #define DRT_AUTO        8
 
+/*
+ * The bus decodes 29 address bits: KSEG1 addresses run through
+ * virt_to_phys (jz_uart.c's DMA buffers, as the T41 SFC driver's) come
+ * out 0x20000000 high and still reach DDR
+ */
+#define PDMA_ADDR(a)    ((a) & 0x1fffffff)
+
 typedef struct IngenicPdmaChan {
     uint32_t dsa, dta, dtc, drt, dcs, dcm, dda, dsd;
     uint32_t unit_done;     /* bytes of the current unit moved */
@@ -154,7 +162,7 @@ static bool pdma_fetch(IngenicPdmaState *s, IngenicPdmaChan *c)
     uint32_t d[8] = { 0 };
     int n = (c->dcs & DCS_DES8) ? 8 : 4;
 
-    if (dma_memory_read(&address_space_memory, c->dda, d, n * 4,
+    if (dma_memory_read(&address_space_memory, PDMA_ADDR(c->dda), d, n * 4,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         c->dcs |= DCS_AR;
         return false;
@@ -252,9 +260,9 @@ static bool pdma_run_chan(IngenicPdmaState *s, int n)
             w = (sai && dai) ? sizeof(buf) : MIN(sw, dw);
         }
         w = MIN(w, left);
-        if (dma_memory_read(&address_space_memory, c->dsa, buf, w,
+        if (dma_memory_read(&address_space_memory, PDMA_ADDR(c->dsa), buf, w,
                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
-            dma_memory_write(&address_space_memory, c->dta, buf, w,
+            dma_memory_write(&address_space_memory, PDMA_ADDR(c->dta), buf, w,
                              MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             c->dcs |= DCS_AR;
             *pdma_global(s, R_DMAC) |= DMAC_AR;
