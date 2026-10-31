@@ -18,7 +18,8 @@ scripts, and docs.
 **copies** every `qemu/hw/**` and `qemu/include/**` file into it, appends the
 HiSilicon entries to upstream `Kconfig`/`meson.build` files, patches
 `hw/sd/sd.c` for 1.8 V signalling, applies `qemu/patches/*.patch`, then
-configures `--target-list=arm-softmmu,aarch64-softmmu` and runs ninja.
+configures `--target-list=arm-softmmu,aarch64-softmmu,mipsel-softmmu` and runs
+ninja (mipsel for the Ingenic family).
 
 ```bash
 bash qemu/setup.sh          # bootstrap AND incremental rebuild — re-run after every edit
@@ -39,8 +40,9 @@ for f in $(cd qemu && find hw include -name 'hisi*' -o -name 'hisilicon*'); do
 done
 ```
 
-Binaries land at `qemu-src/build/qemu-system-arm` and
-`qemu-src/build/qemu-system-aarch64`; every run/test script expects them there.
+Binaries land at `qemu-src/build/qemu-system-arm`,
+`qemu-src/build/qemu-system-aarch64` and `qemu-src/build/qemu-system-mipsel`;
+every run/test script expects them there.
 
 If the system has no `libfdt-dev`, meson falls back to QEMU's vendored
 `subprojects/dtc`, whose `fdt_overlay.c` fails `-Werror=discarded-qualifiers`
@@ -50,7 +52,7 @@ or reconfigure the build tree once without werror (`setup.sh` then keeps the
 existing config and just re-runs ninja):
 
 ```bash
-cd qemu-src/build && ../configure --target-list=arm-softmmu,aarch64-softmmu \
+cd qemu-src/build && ../configure --target-list=arm-softmmu,aarch64-softmmu,mipsel-softmmu \
     --disable-docs --disable-werror && ninja -j$(nproc)
 ```
 
@@ -70,7 +72,9 @@ message, not the status, is the pass signal. `aarch64 = true` configs need
 `qemu-system-aarch64`, and there the empty file is accepted and QEMU keeps
 running, so `timeout` kills it and reports its own **124**; that is also a
 pass. Either way what fails is a QOM property error, an assert, or a core
-dump — so assert on the output, not on the exit status.
+dump — so assert on the output, not on the exit status. The Ingenic
+machines (`qemu-system-mipsel -M t31` etc.) print `ingenic: /dev/null is
+neither an ELF nor a uImage` and exit 1 the same way.
 
 Device register tests (self-contained, need a built QEMU):
 
@@ -81,7 +85,8 @@ bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
-                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py
+                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py,
+                                           # test-ingenic.py (qemu-system-mipsel)
 ```
 
 Full-boot tests need firmware, in one of two shapes.
@@ -255,6 +260,31 @@ channels must follow the FrameList or a hub's status endpoint storms.
 OpenIPC has no Fullhan bootloader: `qemu-boot/fh-openipc-flash.sh` puts a
 release on a dump's vendor U-Boot; CI boots it with `-kernel`
 (`test-fullhan-boot.sh`).
+
+Ingenic T10/T20/T21/T23/T30/T31/T40/T41 (`hw/mips/ingenic.c`,
+`docs/ingenic.md`) are the one MIPS family, in `qemu-system-mipsel`, one
+table entry per SoC, devices `hw/*/ingenic-*.c` under INGENIC (Kconfig in
+`hw/mips`). QEMU's XBurstR1/R2 do not run these kernels: patch 0015 adds
+`XBurst1` (FPU, 32 TLB entries, Config7.WII because the kernel idles in
+`wait` with IE=0, R2 ISA for the SPL's `mfc0 $12,2`) and `XBurst2`
+(PRid company 0x13, Config4.IE=2 or `tlbinvf` is a no-op). A NOR image
+boots through a mask ROM stand-in: SPL header check, SPL into the
+cache-as-RAM window (patch 0016: KSEG0 0x80000000+32K goes to 0x1F000000
+until the first KSEG0 fetch outside it -- the T41 SPL tests DDR through
+KSEG1 underneath itself), sp = 0x80008000 (the SPL never sets it). The
+kernels size RAM from `mem=` only, and early printk uses the first UART
+with LCR != 0, so `-kernel` boots from a ROM stub that sets UART1's LCR
+and passes U-Boot's argc/argv. The SPL/U-Boot timer is the OST inside
+the TCU (+0xE0), not the kernel's OST at 0x12000000; reboot is the TCU
+watchdog. SFC END means "all data in the FIFO", not "drained" (vendor
+U-Boots wait for it after reading part of a word), and SFC DMA addresses
+are taken modulo 512 MiB (T41 passes virt_to_phys of a KSEG1 pointer).
+PLL encodings differ per SoC (`ingenic-cpm.c`); reset values are U-Boot's
+because the kernels oops before the console on a mux of 3. XBurst2's
+second core starts powered off and the CCU starts it at RER.
+OpenIPC publishes U-Boot and kernel/rootfs but no full image;
+`qemu-boot/test-ingenic-boot.sh --mode flash` lays them out and boots
+them, `--mode kernel` uses `-kernel` with the root on the NOR.
 
 Grain Media GM8135S/GM8136/GM8136S (`hw/arm/grainmedia.c`,
 `docs/grainmedia.md`) put an FA626TE -- QEMU's arm926 with MIDR

@@ -381,8 +381,8 @@ WSM itself:
     confirm only when htTxParameters asks for one (bit 8). The
     others are freed by the driver itself; 0x0420 must not be sent, as
     xm713g.ko's confirm table traps on it.
-  - The model is an open access point (`ssid`, default `OpenIPC`;
-    `channel`, default 6):
+  - The model is an access point (`ssid`, default `OpenIPC`; `channel`,
+    default 6), open unless `psk=` gives it a WPA2-PSK passphrase:
     - a scan gets a probe response, a beacon and the scan-complete
       indication;
     - it answers authentication and (re)association;
@@ -408,8 +408,52 @@ over it. Two limits:
     stream's frame rate over Ethernet about halves with the dongle
     plugged in.
 
-WPA (the 4-way handshake), XM535D2's `6132cu.ko`, and XM533's SDIO
-SSV6158 are not modelled.
+**WPA2-PSK.** With `psk=PASSPHRASE` (8..63 characters) the access point
+is WPA2-PSK with CCMP, using the authenticator Ingenic's SDIO chip model
+shares (`hw/net/atbm-wpa.c`, documented in `docs/ingenic.md`):
+  - beacons and probe responses carry the privacy bit and an RSN IE; after
+    association the access point runs the 4-way handshake and group key
+    (IEEE 802.11-2016 12.7: PBKDF2 PMK, PRF-384 PTK, HMAC-SHA1-128 MICs,
+    the GTK wrapped with AES key wrap). A message 2 whose MIC fails -- a
+    wrong passphrase -- is dropped; after four unanswered retries the
+    station is deauthenticated. Until message 4 only EAPOL passes;
+  - the driver does CCMP in the chip. hal_apollo's `atbm_set_key`
+    installs the PTK and GTK with `WSM_ADD_KEY` (the model checks they are
+    the handshake's), after which mac80211 only inserts the 8-byte CCMP
+    header and the driver leaves 8 bytes of MIC room (`txrx.c`) around a
+    plaintext body. The model strips both, and sends frames to the
+    station Protected with a CCMP header whose PN rises and MIC room,
+    flagged decrypted;
+  - the `selftest` property runs the PBKDF2, PRF and key-wrap known
+    answers.
+
+The dongle takes the same security options as the SDIO chip
+(`hw/net/atbm-wpa.c`, see `docs/ingenic.md`): `proto=wpa` (WPA1),
+`cipher=tkip`, `pmf=optional|required` and `rekey=N`, and it answers the
+driver's power-mode request with the set-PM-mode indication the driver
+waits for.
+
+`qemu-boot/test-xm-wifi.sh --image openipc-xm530v200-nor.bin [--psk P
+[--wrong-psk]] [--proto wpa] [--cipher tkip] [--pmf optional|required]
+[--rekey N]` boots an OpenIPC XM530V200 build with the atbm-wifi
+package (`atbm603x_comb_wifi_usb.ko`) with Ethernet unplugged: wlan0 comes
+up, `wpa_supplicant` completes (open, or `key_mgmt=WPA2-PSK`,
+`pairwise_cipher=CCMP`), udhcpc leases 10.0.2.15 over Wi-Fi and the host
+answers 3 of 3 pings, with the data frames going Protected (27 in a run,
+against 2 unprotected EAPOL frames). With `--wrong-psk` the access point
+rejects message 2's MIC, deauthenticates after four retries, and the
+station stays in `4WAY_HANDSHAKE`. `--proto wpa --cipher tkip --rekey 10`
+associates over WPA1 / TKIP (`key_mgmt=WPA-PSK`, `pairwise_cipher=TKIP`)
+and keeps pinging across four group rekeys; `--pmf required` installs the
+IGTK. Without an image it still checks the
+device: the self-test, `psk` reaching it, a short passphrase refused. The
+stock X6C-WEQ firmware's `6012B_x.ko` loads its firmware into a
+`psk=`-configured dongle and runs its WSM exchange as before; Sofia does
+not scan without provisioning (above).
+
+Not modelled: WPA3-SAE and 802.1X (the guests' `wpa_supplicant` has
+neither; see `docs/ingenic.md`); XM535D2's `6132cu.ko` and XM533's SDIO
+SSV6158.
 
 ## XM530 media pipeline (in progress)
 

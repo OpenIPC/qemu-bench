@@ -33,6 +33,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/ingenic-sensor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
@@ -116,6 +117,36 @@ static uint8_t hisi_smartsens_recv(I2CSlave *i2c)
     }
     s->cur_reg++;
     return val;
+}
+
+/*
+ * The exposure as the T31 SDK's sensor_sc2336 programs it (sc2336_set_expo):
+ * rows in 0x3E00[3:0]:0x3E01:0x3E02[7:4], the analog gain's coarse step in
+ * 0x3E09 (0x00 1x, 0x08 2x, 0x09 4x, 0x0B 8x, 0x0F 16x, 0x1F 32x) and its
+ * fine part in 0x3E07, 0x80 = 1.0.
+ */
+bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
+{
+    HisiSmartSensState *s = (HisiSmartSensState *)
+        object_dynamic_cast(sensor, TYPE_HISI_SMARTSENS);
+    uint32_t coarse;
+
+    if (!s) {
+        return false;
+    }
+#define R(a) s->regs[(a) - SS_REG_BASE]
+    e->lines = (R(0x3E00) & 0xF) << 12 | R(0x3E01) << 4 | R(0x3E02) >> 4;
+    switch (R(0x3E09)) {
+    case 0x08: coarse = 2; break;
+    case 0x09: coarse = 4; break;
+    case 0x0B: coarse = 8; break;
+    case 0x0F: coarse = 16; break;
+    case 0x1F: coarse = 32; break;
+    default:   coarse = 1; break;
+    }
+    e->gain = coarse * (R(0x3E07) ? R(0x3E07) : 0x80) * 8;
+#undef R
+    return true;
 }
 
 static void hisi_smartsens_reset(DeviceState *dev)
