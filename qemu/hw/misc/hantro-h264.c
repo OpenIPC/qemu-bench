@@ -255,6 +255,35 @@ static const uint8_t ct_bits0[17][4] = {
     { 11, 10, 13, 8 }, { 15, 1, 9, 12 }, { 11, 14, 13, 8 },
     { 7, 10, 9, 12 }, { 4, 6, 5, 8 },
 };
+/* coeff_token, 2 <= nC < 4 and 4 <= nC < 8 (Table 9-5) */
+static const uint8_t ct_len1[17][4] = {
+    { 2 }, { 6, 2 }, { 6, 5, 3 }, { 7, 6, 6, 4 }, { 8, 6, 6, 4 },
+    { 8, 7, 7, 5 }, { 9, 8, 8, 6 }, { 11, 9, 9, 6 }, { 11, 11, 11, 7 },
+    { 12, 11, 11, 9 }, { 12, 12, 12, 11 }, { 12, 12, 12, 11 },
+    { 13, 13, 13, 12 }, { 13, 13, 13, 13 }, { 13, 14, 13, 13 },
+    { 14, 14, 14, 13 }, { 14, 14, 14, 14 },
+};
+static const uint8_t ct_bits1[17][4] = {
+    { 3 }, { 11, 2 }, { 7, 7, 3 }, { 7, 10, 9, 5 }, { 7, 6, 5, 4 },
+    { 4, 6, 5, 6 }, { 7, 6, 5, 8 }, { 15, 6, 5, 4 }, { 11, 14, 13, 4 },
+    { 15, 10, 9, 4 }, { 11, 14, 13, 12 }, { 8, 10, 9, 8 },
+    { 15, 14, 13, 12 }, { 11, 10, 9, 12 }, { 7, 11, 6, 8 },
+    { 9, 8, 10, 1 }, { 7, 6, 5, 4 },
+};
+static const uint8_t ct_len2[17][4] = {
+    { 4 }, { 6, 4 }, { 6, 5, 4 }, { 6, 5, 5, 4 }, { 7, 5, 5, 4 },
+    { 7, 5, 5, 4 }, { 7, 6, 6, 4 }, { 7, 6, 6, 4 }, { 8, 7, 7, 5 },
+    { 8, 8, 7, 6 }, { 9, 8, 8, 7 }, { 9, 9, 8, 8 }, { 9, 9, 9, 8 },
+    { 10, 9, 9, 9 }, { 10, 10, 10, 10 }, { 10, 10, 10, 10 },
+    { 10, 10, 10, 10 },
+};
+static const uint8_t ct_bits2[17][4] = {
+    { 15 }, { 15, 14 }, { 11, 15, 13 }, { 8, 12, 14, 12 },
+    { 15, 10, 11, 11 }, { 11, 8, 9, 10 }, { 9, 14, 13, 9 },
+    { 8, 10, 9, 8 }, { 15, 14, 13, 13 }, { 11, 14, 10, 12 },
+    { 15, 10, 13, 12 }, { 11, 14, 9, 12 }, { 8, 10, 13, 8 },
+    { 13, 7, 9, 12 }, { 9, 12, 11, 10 }, { 5, 8, 7, 6 }, { 1, 4, 3, 2 },
+};
 /* coeff_token, nC == -1: chroma DC 4:2:0 */
 static const uint8_t ct_len_cdc[5][4] = {
     { 2 }, { 6, 1 }, { 6, 6, 3 }, { 6, 7, 7, 6 }, { 6, 8, 8, 7 },
@@ -316,10 +345,20 @@ static const uint8_t rb_bits[7][15] = {
     { 7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
 };
 
-/* residual_block_cavlc() for coefficients in scan order; chroma_dc picks
- * the nC == -1 tables, otherwise nC is 0 (see the file comment). */
+/* residual_block_cavlc() for coefficients in scan order, coeff_token by
+ * nC (9.2.1): -1 the chroma DC table, 0-1, 2-3, 4-7, 8 and more the
+ * fixed-length code */
+static void cavlc_residual_nc(BitWriter *w, const int *c, int max, int nc);
+
+/* the same with nC 0 (see the file comment), or -1 for chroma_dc */
 static void cavlc_residual(BitWriter *w, const int *c, int max, bool chroma_dc)
 {
+    cavlc_residual_nc(w, c, max, chroma_dc ? -1 : 0);
+}
+
+static void cavlc_residual_nc(BitWriter *w, const int *c, int max, int nc)
+{
+    const bool chroma_dc = nc < 0;
     int total = 0, t1 = 0, last = -1, i, n;
     int lev[16], run[16];               /* nonzero coefficients, high first */
 
@@ -340,8 +379,14 @@ static void cavlc_residual(BitWriter *w, const int *c, int max, bool chroma_dc)
     }
     if (chroma_dc) {
         bw_bits(w, ct_bits_cdc[total][t1], ct_len_cdc[total][t1]);
-    } else {
+    } else if (nc < 2) {
         bw_bits(w, ct_bits0[total][t1], ct_len0[total][t1]);
+    } else if (nc < 4) {
+        bw_bits(w, ct_bits1[total][t1], ct_len1[total][t1]);
+    } else if (nc < 8) {
+        bw_bits(w, ct_bits2[total][t1], ct_len2[total][t1]);
+    } else {
+        bw_bits(w, total ? ((total - 1) << 2) | t1 : 3, 6);
     }
     if (!total) {
         return;

@@ -27,8 +27,10 @@
  * prediction reads the picture before deblocking, and the picture kept as
  * the next reference is deblocked as the slice header asks (8.7; frame
  * macroblocks, 4x4 transforms, one slice per picture), so prediction never
- * drifts.  CABAC only: the contexts are initialised for the slice's
- * cabac_init_idc (h264_cabac_init_P).
+ * drifts.  CABAC (the contexts initialised for the slice's cabac_init_idc,
+ * h264_cabac_init_P) or CAVLC (mb_skip_run, Exp-Golomb mb_type, mvd and
+ * the inter coded_block_pattern, residual_block_cavlc with nC from the
+ * neighbours' TotalCoeff).
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -94,6 +96,9 @@ typedef struct PMb {
     uint8_t cac;                /* chroma AC: Cb blocks bits 0-3, Cr 4-7 */
     bool luma_dc_cbf;           /* I_16x16's Intra16x16DCLevel */
     bool qp_delta_nz;
+    /* CAVLC: TotalCoeff of each luma 4x4 block (raster) and chroma AC
+     * block, for the neighbours' nC (9.2.1) */
+    uint8_t tc[16], tcc[2][4];
 } PMb;
 
 typedef struct PPic {
@@ -108,6 +113,8 @@ typedef struct PPic {
     int qp_slice, qp_target, qp_cur, cqp;
     bool t8x8;                  /* transform_8x8_mode_flag */
     int last_qp_delta_nz;       /* the previous macroblock's, for ctx 60 */
+    BitWriter *cw;              /* CAVLC: the slice data goes here */
+    int skip_run;               /* CAVLC: P_Skip macroblocks not yet sent */
 } PPic;
 
 static inline int clampi(int v, int lo, int hi)
@@ -758,12 +765,170 @@ static void put_cbp(PPic *p, Cabac *c, int mx, int my, int luma, int chroma)
     }
 }
 
+/* ---- CAVLC syntax (9.2, 9.1.2) ---------------------------------------- */
+
+/* codeNum of an inter macroblock's coded_block_pattern (Table 9-4,
+ * ChromaArrayType 1 or 2), by luma | chroma << 4 */
+static const uint8_t cbp_inter_code[48] = {
+    0, 2, 3, 7, 4, 8, 17, 13, 5, 18, 9, 14, 10, 15, 16, 11,
+    1, 32, 33, 36, 34, 37, 44, 40, 35, 45, 38, 41, 39, 42, 43, 19,
+    6, 24, 25, 20, 26, 21, 46, 28, 27, 47, 22, 29, 23, 30, 31, 12,
+};
+
+/* nN of a neighbouring luma 4x4 block, -1 if not available (9.2.1) */
+static int tc_luma_nb(PPic *p, int mx, int my, const PMb *cur, int bx, int by,
+                      int dx, int dy)
+{
+    int x = bx + dx, y = by + dy;
+    const PMb *n = cur;
+
+    if (x < 0 || y < 0) {
+        n = pmb_at(p, mx + (x < 0 ? -1 : 0), my + (y < 0 ? -1 : 0));
+        if (!n) {
+            return -1;
+        }
+        x &= 3;
+        y &= 3;
+    }
+    return n->tc[y * 4 + x];
+}
+
+static int nc_of(int na, int nb)
+{
+    if (na >= 0 && nb >= 0) {
+        return (na + nb + 1) >> 1;
+    }
+    return na >= 0 ? na : nb >= 0 ? nb : 0;
+}
+
+static int nc_luma(PPic *p, int mx, int my, const PMb *cur, int bx, int by)
+{
+    return nc_of(tc_luma_nb(p, mx, my, cur, bx, by, -1, 0),
+                 tc_luma_nb(p, mx, my, cur, bx, by, 0, -1));
+}
+
+/* nC of chroma AC block blk (2x2 raster) of comp */
+static int nc_chroma(PPic *p, int mx, int my, const PMb *cur, int comp,
+                     int blk)
+{
+    const int bx = blk & 1, by = blk >> 1;
+    const PMb *l = bx ? cur : pmb_at(p, mx - 1, my);
+    const PMb *u = by ? cur : pmb_at(p, mx, my - 1);
+
+    return nc_of(l ? l->tcc[comp][by * 2 + (bx ^ 1)] : -1,
+                 u ? u->tcc[comp][(by ^ 1) * 2 + bx] : -1);
+}
+
+static int count_nz(const int *c, int n)
+{
+    int i, t = 0;
+
+    for (i = 0; i < n; i++) {
+        t += c[i] != 0;
+    }
+    return t;
+}
+
+/* the macroblock's skip decision: CABAC mb_skip_flag, or CAVLC's run */
+static void put_skip_flag(PPic *p, Cabac *c, int inc, bool skip)
+{
+    if (!p->cw) {
+        cabac_decision(c, 11 + inc, skip);
+    } else if (skip) {
+        p->skip_run++;
+    } else {
+        bw_ue(p->cw, p->skip_run);                  /* mb_skip_run */
+        p->skip_run = 0;
+    }
+}
+
+/* the chroma residual in CAVLC (residual_block for DC, then AC) */
+static void put_chroma_cavlc(PPic *p, int mx, int my, PMb *me, const int cdc[2][4],
+                             const int cac[2][4][16], int cbp_chroma)
+{
+    int comp, blk, i;
+
+    me->cdc = me->cac = 0;
+    memset(me->tcc, 0, sizeof(me->tcc));
+    for (comp = 0; comp < 2 && cbp_chroma; comp++) {
+        cavlc_residual_nc(p->cw, cdc[comp], 4, -1);
+        if (count_nz(cdc[comp], 4)) {
+            me->cdc |= 1 << comp;
+        }
+    }
+    for (comp = 0; comp < 2 && cbp_chroma == 2; comp++) {
+        for (blk = 0; blk < 4; blk++) {
+            int scan[15];
+
+            for (i = 0; i < 15; i++) {
+                scan[i] = cac[comp][blk][zigzag4x4[i + 1]];
+            }
+            cavlc_residual_nc(p->cw, scan, 15,
+                              nc_chroma(p, mx, my, me, comp, blk));
+            me->tcc[comp][blk] = count_nz(scan, 15);
+            if (me->tcc[comp][blk]) {
+                me->cac |= 1 << (comp * 4 + blk);
+            }
+        }
+    }
+}
+
+/* a P_L0_16x16 macroblock in CAVLC (7.3.5) */
+static void put_inter_cavlc(PPic *p, int mx, int my, PMb *me, const PRes *r)
+{
+    BitWriter *w = p->cw;
+    int b8, k, i;
+
+    bw_ue(w, 0);                                /* mb_type P_L0_16x16 */
+    bw_se(w, me->mvd[0]);
+    bw_se(w, me->mvd[1]);
+    bw_ue(w, cbp_inter_code[r->cbp_luma | r->cbp_chroma << 4]);
+    if (r->cbp_luma && p->t8x8) {
+        bw_bits(w, 0, 1);                       /* transform_size_8x8 */
+    }
+    if (r->cbp_luma || r->cbp_chroma) {
+        const int delta = p->qp_target - p->qp_cur;
+
+        bw_se(w, delta);
+        p->qp_cur = p->qp_target;
+        me->qp_delta_nz = delta != 0;
+    }
+    me->qp = p->qp_cur;
+    me->nz = 0;
+    memset(me->tc, 0, sizeof(me->tc));
+    for (b8 = 0; b8 < 4; b8++) {
+        if (!((r->cbp_luma >> b8) & 1)) {
+            continue;
+        }
+        for (k = 0; k < 4; k++) {
+            const int bx = (b8 & 1) * 2 + (k & 1);
+            const int by = (b8 >> 1) * 2 + (k >> 1);
+            const int blk = by * 4 + bx;
+            int scan[16];
+
+            for (i = 0; i < 16; i++) {
+                scan[i] = r->luma[blk][zigzag4x4[i]];
+            }
+            cavlc_residual_nc(w, scan, 16, nc_luma(p, mx, my, me, bx, by));
+            me->tc[blk] = count_nz(scan, 16);
+            if (me->tc[blk]) {
+                me->nz |= 1 << blk;
+            }
+        }
+    }
+    put_chroma_cavlc(p, mx, my, me, r->cdc, r->cac, r->cbp_chroma);
+}
+
 static void put_inter(PPic *p, Cabac *c, int mx, int my, PMb *me,
                       const PRes *r)
 {
     const PMb *a = pmb_at(p, mx - 1, my), *b = pmb_at(p, mx, my - 1);
     int comp, b8, k, i;
 
+    if (p->cw) {
+        put_inter_cavlc(p, mx, my, me, r);
+        return;
+    }
     cabac_decision(c, 14, 0);                   /* P_L0_16x16: 0 0 0 */
     cabac_decision(c, 15, 0);
     cabac_decision(c, 16, 0);
@@ -894,6 +1059,38 @@ static void put_intra(PPic *p, Cabac *c, int mx, int my, PMb *me)
         }
     }
 
+    if (p->cw) {
+        /* I_16x16_2_c_0 in a P slice: mb_type 5 + 1 + 2 + 4 c */
+        const int cdc0[2][4] = {
+            { clev[0][0], clev[0][1], clev[0][2], clev[0][3] },
+            { clev[1][0], clev[1][1], clev[1][2], clev[1][3] },
+        };
+        static const int cac0[2][4][16];
+        int scan[16];
+
+        bw_ue(p->cw, 8 + 4 * chroma_nz);
+        bw_ue(p->cw, 0);                        /* intra_chroma_pred: DC */
+        bw_se(p->cw, qp - p->qp_cur);
+        me->qp_delta_nz = qp != p->qp_cur;
+        p->qp_cur = qp;
+        me->qp = qp;
+        for (i = 0; i < 16; i++) {
+            scan[i] = lev[zigzag4x4[i]];
+        }
+        /* Intra16x16DCLevel: nC of luma block 0 */
+        cavlc_residual_nc(p->cw, scan, 16, nc_luma(p, mx, my, me, 0, 0));
+        me->luma_dc_cbf = count_nz(scan, 16) != 0;
+        me->cbp_luma = 0;
+        me->nz = 0;
+        memset(me->tc, 0, sizeof(me->tc));          /* no AC: TotalCoeff 0 */
+        me->cbp_chroma = chroma_nz;
+        put_chroma_cavlc(p, mx, my, me, cdc0, cac0, chroma_nz);
+        if (!chroma_nz) {
+            memset(clev, 0, sizeof(clev));
+        }
+        recon_mb(f, mx, my, pred, lev, qp, cpred, clev, qpc);
+        return;
+    }
     cabac_decision(c, 14, 1);                   /* prefix: intra */
     cabac_decision(c, 17, 1);                   /* not I_NxN */
     cabac_terminate0(c);                        /* not I_PCM */
@@ -1224,6 +1421,7 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
                           126);
         c.state[i] = (MIN(s, 127 - s) << 1) | (s >> 6);
     }
+    p->skip_run = 0;
     p->qp_cur = p->qp_slice;
     p->last_qp_delta_nz = 0;
     memset(st, 0, sizeof(*st));
@@ -1238,8 +1436,8 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
             memset(me, 0, sizeof(*me));
             if (p->force_intra) {
                 /* the decoder's reference unknown: nothing may refer to it */
-                cabac_decision(&c, 11 + (a && a->type != PMB_SKIP) +
-                               (b && b->type != PMB_SKIP), 0);
+                put_skip_flag(p, &c, (a && a->type != PMB_SKIP) +
+                              (b && b->type != PMB_SKIP), false);
                 me->type = PMB_INTRA;
                 put_intra(p, &c, mx, my, me);
                 p->last_qp_delta_nz = me->qp_delta_nz;
@@ -1252,8 +1450,8 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
             /* P_Skip if its prediction leaves nothing to code */
             mc_mb(p, mx, my, mvs, py, pc);
             if (p->force_skip) {
-                cabac_decision(&c, 11 + (a && a->type != PMB_SKIP) +
-                               (b && b->type != PMB_SKIP), 1);
+                put_skip_flag(p, &c, (a && a->type != PMB_SKIP) +
+                              (b && b->type != PMB_SKIP), true);
                 put_skip(p, mx, my, me, mvs, py, pc);
                 st->skip++;
                 goto next;
@@ -1262,7 +1460,7 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
             const int skip_inc = (a && a->type != PMB_SKIP) +
                                  (b && b->type != PMB_SKIP);
             if (!r.cbp_luma && !r.cbp_chroma) {
-                cabac_decision(&c, 11 + skip_inc, 1);
+                put_skip_flag(p, &c, skip_inc, true);
                 put_skip(p, mx, my, me, mvs, py, pc);
                 st->skip++;
                 goto next;
@@ -1383,7 +1581,7 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
                 mc_mb(p, mx, my, mv, py, pc);
                 if (mrsad_mb(p, mx, my, py) >
                     2 * intra_dc_error(p, mx, my) + 1024) {
-                    cabac_decision(&c, 11 + skip_inc, 0);
+                    put_skip_flag(p, &c, skip_inc, false);
                     me->type = PMB_INTRA;
                     put_intra(p, &c, mx, my, me);
                     p->last_qp_delta_nz = me->qp_delta_nz;
@@ -1395,12 +1593,12 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
             residual_mb(p, mx, my, py, pc, p->qp_target, &r);
             if (mv[0] == mvs[0] && mv[1] == mvs[1] && !r.cbp_luma &&
                 !r.cbp_chroma) {
-                cabac_decision(&c, 11 + skip_inc, 1);
+                put_skip_flag(p, &c, skip_inc, true);
                 put_skip(p, mx, my, me, mvs, py, pc);
                 st->skip++;
                 goto next;
             }
-            cabac_decision(&c, 11 + skip_inc, 0);
+            put_skip_flag(p, &c, skip_inc, false);
             me->type = PMB_INTER;
             me->mv[0] = mv[0];
             me->mv[1] = mv[1];
@@ -1414,12 +1612,25 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
                                   me->qp_delta_nz;
             st->inter++;
         next:
+            if (p->cw) {
+                continue;
+            }
             if (mx == mbw - 1 && my == mbh - 1) {
                 cabac_flush(&c);
             } else {
                 cabac_terminate0(&c);
             }
         }
+    }
+    if (p->cw) {
+        if (p->skip_run) {
+            bw_ue(p->cw, p->skip_run);
+        }
+        bw_bits(p->cw, 1, 1);                       /* rbsp_stop_one_bit */
+        while (p->cw->bits) {
+            bw_bits(p->cw, 0, 1);
+        }
+        return p->cw->n;
     }
     return c.p - out;
 }
@@ -1473,6 +1684,60 @@ size_t h264_slice_p_cabac(int qp, int chroma_qp_offset, int cabac_init_idc,
                  db->beta_off, ry, ruv);
     frame_free(&p.f);
     return len;
+}
+
+/* the same in CAVLC, from bit_offset bits into out; returns bits */
+size_t h264_slice_p_cavlc(int qp, int chroma_qp_offset,
+                          bool transform_8x8_mode, const H264Deblock *db,
+                          int mbw, int mbh, const uint8_t *y, int ys,
+                          const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
+                          int bit_offset, uint8_t *out, size_t cap,
+                          H264PStats *st)
+{
+    const int w = mbw * 16, h = mbh * 16, n = w * h / 4;
+    g_autofree PMb *mbs = g_new0(PMb, mbw * mbh);
+    g_autofree DbMb *dbm = g_new0(DbMb, mbw * mbh);
+    g_autofree uint8_t *rcb = g_malloc(n), *rcr = g_malloc(n);
+    H264PStats dummy;
+    BitWriter bw;
+    PPic p;
+    size_t len;
+    int i;
+
+    if (!st) {
+        st = &dummy;
+    }
+    qp = MIN(MAX(qp, 0), 51);
+    for (i = 0; i < n; i++) {
+        rcb[i] = ruv[2 * i];
+        rcr[i] = ruv[2 * i + 1];
+    }
+    p = (PPic) { .ry = ry, .rcb = rcb, .rcr = rcr, .ry0 = 0, .rh = h,
+                 .mb = mbs, .qp_slice = qp, .qp_target = qp,
+                 .cqp = chroma_qp_offset, .t8x8 = transform_8x8_mode,
+                 .cw = &bw };
+    frame_setup(&p.f, mbw, mbh, y, ys, uv, cs);
+    for (;;) {
+        bw = (BitWriter) { .p = out, .cap = cap, .bits = bit_offset & 7 };
+        len = p_slice_try(&p, 0, out, cap, st);
+        if (len + 64 <= cap || p.qp_target >= 51) {
+            break;
+        }
+        p.qp_target = MIN(p.qp_target + 6, 51);
+    }
+    st->qp = p.qp_target;
+    for (i = 0; i < mbw * mbh; i++) {
+        dbm[i] = (DbMb) { .intra = mbs[i].type == PMB_INTRA,
+                          .qp = mbs[i].qp, .nz = mbs[i].nz,
+                          .mv = { mbs[i].mv[0], mbs[i].mv[1] } };
+        if (mbs[i].type == PMB_INTRA) {
+            dbm[i].mv[0] = dbm[i].mv[1] = 0;
+        }
+    }
+    frame_to_ref(&p.f, dbm, chroma_qp_offset, db->idc, db->alpha_off,
+                 db->beta_off, ry, ruv);
+    frame_free(&p.f);
+    return len * 8;
 }
 
 /* ---- a picture of several slices ------------------------------------------ */
@@ -1551,9 +1816,11 @@ static void pic_window(const H264Pic *pic, Frame *f, int r0, int rows)
                    .sys = pic->sys, .scs = pic->scs };
 }
 
-size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
-                            int qp, int cabac_init_idc, uint8_t *out,
-                            size_t cap, H264PStats *st)
+/* a slice of the picture, CABAC (cw NULL) or CAVLC into cw */
+static size_t pic_slice(H264Pic *pic, bool p_slice, int r0, int rows,
+                        int qp, int cabac_init_idc, BitWriter *cw,
+                        int bit_offset, uint8_t *out, size_t cap,
+                        H264PStats *st)
 {
     const int mbw = pic->mbw;
     H264PStats dummy;
@@ -1582,9 +1849,15 @@ size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
         pic_window(pic, &f, r0, rows);
         memset(info, 0, sizeof(*info) * mbw * rows);
         cabac_init(&c, qp, out, out + cap);
+        if (cw) {
+            *cw = (BitWriter) { .p = out, .cap = cap, .bits = bit_offset & 7 };
+        }
         for (my = 0; my < rows; my++) {
             for (mx = 0; mx < mbw; mx++) {
-                encode_mb(&f, &c, NULL, info, mx, my, qp, qpc);
+                encode_mb(&f, &c, cw, info, mx, my, qp, qpc);
+                if (cw) {
+                    continue;
+                }
                 if (mx == mbw - 1 && my == rows - 1) {
                     cabac_flush(&c);
                 } else {
@@ -1597,6 +1870,13 @@ size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
         }
         st->intra = mbw * rows;
         st->qp = qp;
+        if (cw) {
+            bw_bits(cw, 1, 1);                      /* rbsp_stop_one_bit */
+            while (cw->bits) {
+                bw_bits(cw, 0, 1);
+            }
+            return cw->n * 8;
+        }
         return c.p - out;
     }
 
@@ -1604,10 +1884,14 @@ size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
                .ry0 = r0 * 16, .rh = pic->mbh * 16,
                .force_intra = !pic->ry,
                .mb = pic->mb + (size_t)r0 * mbw, .qp_slice = qp,
-               .qp_target = qp, .cqp = pic->cqp, .t8x8 = pic->t8x8 };
+               .qp_target = qp, .cqp = pic->cqp, .t8x8 = pic->t8x8,
+               .cw = cw };
 
     pic_window(pic, &p.f, r0, rows);
     for (;;) {
+        if (cw) {
+            *cw = (BitWriter) { .p = out, .cap = cap, .bits = bit_offset & 7 };
+        }
         len = p_slice_try(&p, cabac_init_idc, out, cap, st);
         if (len + 64 <= cap || p.force_skip || p.force_intra) {
             break;
@@ -1630,7 +1914,25 @@ size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
             pic->db[i].mv[1] = m->mv[1];
         }
     }
-    return len;
+    return cw ? len * 8 : len;
+}
+
+size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
+                            int qp, int cabac_init_idc, uint8_t *out,
+                            size_t cap, H264PStats *st)
+{
+    return pic_slice(pic, p_slice, r0, rows, qp, cabac_init_idc, NULL, 0,
+                     out, cap, st);
+}
+
+size_t h264_pic_slice_cavlc(H264Pic *pic, bool p_slice, int r0, int rows,
+                            int qp, int bit_offset, uint8_t *out, size_t cap,
+                            H264PStats *st)
+{
+    BitWriter bw;
+
+    return pic_slice(pic, p_slice, r0, rows, qp, 0, &bw, bit_offset, out,
+                     cap, st);
 }
 
 void h264_pic_finish(H264Pic *pic, const H264Deblock *db, uint8_t *ry,
