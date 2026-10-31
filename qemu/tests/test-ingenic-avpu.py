@@ -27,8 +27,8 @@ EncSliceParam.c, SliceHdrWriter.c, ChannelMngr.c) on a t31 machine:
 The streams are decoded with ffmpeg when there is one (--ffmpeg, or on
 PATH, or the jrottenberg/ffmpeg docker image): no decoder errors, the I
 picture's macroblock means within 3 of the source's, the P picture's
-changed macroblock exact and the rest repeated; the HEVC pictures'
-macroblock means within 4; the JPEG's luma PSNR
+too (inter coded, CAVLC and CABAC), a CAVLC sequence that changes every
+macroblock likewise; the HEVC pictures' macroblock means within 4; the JPEG's luma PSNR
 against the source above 30 dB.
 
     python3 qemu/tests/test-ingenic-avpu.py [--qemu PATH] [--ffmpeg CMD]
@@ -493,18 +493,8 @@ def test_h264(qt, ff, tmp):
                 worst = max(worst, d // 256)
         check('%s: I macroblock means within 3 of the source (worst %d)' %
               (name, worst), worst <= 3, True)
-        if not cabac:
-            # CAVLC: the changed macroblock as I_PCM, the rest P_Skip
-            moved = {(r, x) for r in range(16, 32) for x in range(32, 48)}
-            check('%s: P: the changed macroblock exact (I_PCM)' % name,
-                  all(p[r * W + x] == ref_p[r * W + x] for r, x in moved),
-                  True)
-            check('%s: P: the rest repeats the I picture (P_Skip)' % name,
-                  all(p[q] == i[q] for q in range(W * H)
-                      if (q // W, q % W) not in moved), True)
-            continue
-        # CABAC: inter coded -- every macroblock near its source, the P
-        # picture (one macroblock changed) far smaller than the I one
+        # inter coded, CABAC and CAVLC alike -- every macroblock near its
+        # source
         worst = 0
         for my in range(H // 16):
             for mx in range(W // 16):
@@ -516,41 +506,42 @@ def test_h264(qt, ff, tmp):
               (name, worst), worst <= 3, True)
 
 
-def test_pcm_budget(qemu, ff, tmp):
-    """Every macroblock changes, the budget is 25 I_PCM macroblocks a
-    picture: three P pictures bring the decoder to the new source, 25 MBs
-    at a time, and nothing breaks on the way."""
-    print('H.264 P budget (pcm-budget = 25 MBs)')
-    qt = QTest(qemu, 't31', ['-global', 'ingenic-avpu.pcm-budget=%d' %
-                             (25 * 390)])
+def test_cavlc_change(qemu, ff, tmp):
+    """Every macroblock changes in CAVLC: the P pictures are inter coded,
+    the first one already near the new source, and the stream decodes."""
+    print('H.264 CAVLC, every macroblock changed')
+    qt = QTest(qemu, 't31')
     try:
         qt.writel(AVPU + 0x14, 5)
         y, uv = picture()
         y2 = bytes((c ^ 0x55) for c in y)
-        stream = encode(qt, 'budget', False, 0, False, 0,
+        stream = encode(qt, 'change', False, 0, False, 0,
                         [(y, uv)] + [(y2, uv)] * 3)
     finally:
         qt.close()
-    path = os.path.join(tmp, 'budget.h264')
+    path = os.path.join(tmp, 'change.h264')
     open(path, 'wb').write(stream)
     if not ff:
         print('  SKIP: no ffmpeg')
         return
     rc, raw, errs = decode(ff, path)
     fs = W * H * 3 // 2
-    check('budget: four pictures decode without errors',
+    check('change: four pictures decode without errors',
           (rc, len(raw), errs), (0, 4 * fs, []))
     if len(raw) != 4 * fs:
         return
     ref = luma(y2)
     for k in (1, 2, 3):
         p = raw[k * fs:k * fs + W * H]
-        exact = sum(all(p[(my * 16 + j) * W + mx * 16 + x] ==
-                        ref[(my * 16 + j) * W + mx * 16 + x]
-                        for j in range(16) for x in range(16))
-                    for my in range(H // 16) for mx in range(W // 16))
-        check('budget: P%d has %d macroblocks of the new source' %
-              (k, min(25 * k, 60)), exact, min(25 * k, 60))
+        worst = 0
+        for my in range(H // 16):
+            for mx in range(W // 16):
+                px = [(my * 16 + j) * W + mx * 16 + x
+                      for j in range(16) for x in range(16)]
+                worst = max(worst, abs(sum(ref[q] for q in px) -
+                                       sum(p[q] for q in px)) // 256)
+        check('change: P%d macroblock means within 3 of the new source '
+              '(worst %d)' % (k, worst), worst <= 3, True)
 
 
 def shifted(dx, dy):
@@ -996,7 +987,7 @@ def main():
             test_jpeg(qt, ff, tmp)
         finally:
             qt.close()
-        test_pcm_budget(args.qemu, ff, tmp)
+        test_cavlc_change(args.qemu, ff, tmp)
         test_h264_slices(args.qemu, ff, tmp)
         test_rebased(args.qemu)
         test_t41(args.qemu, ff, tmp)

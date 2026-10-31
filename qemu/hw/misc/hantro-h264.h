@@ -103,6 +103,15 @@ size_t h264_slice_p_cabac(int qp, int chroma_qp_offset, int cabac_init_idc,
                           const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
                           uint8_t *out, size_t cap, H264PStats *st);
 
+/* the same in CAVLC (a Baseline PPS), from bit_offset bits into out's
+ * first byte; returns bits, as the other CAVLC ones */
+size_t h264_slice_p_cavlc(int qp, int chroma_qp_offset,
+                          bool transform_8x8_mode, const H264Deblock *db,
+                          int mbw, int mbh, const uint8_t *y, int ys,
+                          const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
+                          int bit_offset, uint8_t *out, size_t cap,
+                          H264PStats *st);
+
 /*
  * A picture split into slices of whole macroblock rows, coded one slice at
  * a time (h264_pic_slice_cabac: I or P, CABAC, from row r0; returns bytes
@@ -120,6 +129,10 @@ H264Pic *h264_pic_new(int mbw, int mbh, const uint8_t *y, int ys,
 size_t h264_pic_slice_cabac(H264Pic *pic, bool p_slice, int r0, int rows,
                             int qp, int cabac_init_idc, uint8_t *out,
                             size_t cap, H264PStats *st);
+/* a slice in CAVLC: from bit_offset bits into out, returns bits */
+size_t h264_pic_slice_cavlc(H264Pic *pic, bool p_slice, int r0, int rows,
+                            int qp, int bit_offset, uint8_t *out, size_t cap,
+                            H264PStats *st);
 void h264_pic_finish(H264Pic *pic, const H264Deblock *db, uint8_t *ry,
                      uint8_t *ruv);
 void h264_pic_free(H264Pic *pic);

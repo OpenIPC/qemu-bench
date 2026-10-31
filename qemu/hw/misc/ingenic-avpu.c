@@ -68,13 +68,13 @@
  *
  * Here Enc1 copies the source picture and Enc2 codes it, the two matched by
  * the intermediate buffer address (WD0 = WE8), else in order.  H.264 slices
- * come from hw/misc/hantro-h264.c: with CABAC (libimp's choice) I slices
- * as I_16x16 DC macroblocks and P slices inter coded (P_Skip, P_L0_16x16
- * with a residual, intra where nothing matches), a picture's slices on one
- * reconstruction (h264_pic_*) filtered when the last is done; CAVLC and B
- * slices the older way, I_PCM wherever the source differs from the model's
- * own reference and P_Skip elsewhere, at most pcm-budget bytes of I_PCM a
- * picture.  The reference is the picture each P picture leaves the decoder
+ * come from hw/misc/hantro-h264.c: in CABAC (libimp's choice) or CAVLC,
+ * I slices as I_16x16 DC macroblocks and P slices inter coded (P_Skip,
+ * P_L0_16x16 at quarter-pel with a residual, intra where nothing matches),
+ * a picture's slices on one reconstruction (h264_pic_*) filtered when the
+ * last is done; B slices all P_Skip-like (nothing changes).  The rate
+ * control's estimate of a P slice still counts I_PCM macroblocks
+ * (pcm-budget).  The reference is the picture each P picture leaves the decoder
  * with, kept by reconstruction address (W90) and looked up by the
  * reference address (WA0), so each channel follows its own.  HEVC slices
  * (W0 codec 1) come from hw/misc/hevc-enc.c, P slices inter coded too
@@ -1422,12 +1422,13 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                 avpu_wr_bits(&w, 1, 1);     /* cabac_alignment_one_bit */
             }
         }
-        if (cabac && f->type != 0) {
+        if (f->type != 0) {
             /*
-             * I and P slices with real coding: the picture's slices on one
-             * reconstruction (h264_pic_*), filtered when the last is done
-             * and kept as the next picture's reference.  The bytes have to
-             * fit the stream buffer's room (the coder raises the QP).
+             * I and P slices with real coding, CABAC or CAVLC: the
+             * picture's slices on one reconstruction (h264_pic_*), filtered
+             * when the last is done and kept as the next picture's
+             * reference.  The bytes have to fit the stream buffer's room
+             * (the coder raises the QP).
              */
             size_t capb = (size_t)nmb * 800 + 4096;
             H264PStats pst;
@@ -1449,9 +1450,17 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                                       st->h264_t8x8);
             }
             out = g_malloc0(capb);
-            bits = h264_pic_slice_cabac(f->pic, f->type == 1, r0, rows,
-                                        f->qp, idc, out, capb, &pst) * 8;
-            avpu_wr_buf_bits(&w, out, 0, MIN(bits, capb * 8));
+            if (cabac) {
+                bits = h264_pic_slice_cabac(f->pic, f->type == 1, r0, rows,
+                                            f->qp, idc, out, capb, &pst) * 8;
+                from = 0;
+            } else {
+                /* from the slice header's last bit in its byte */
+                from = w.nbits;
+                bits = h264_pic_slice_cavlc(f->pic, f->type == 1, r0, rows,
+                                            f->qp, from, out, capb, &pst);
+            }
+            avpu_wr_buf_bits(&w, out, from, MIN(bits, capb * 8));
             sl->coded = true;
             if (last_slice) {
                 /*
@@ -1475,121 +1484,18 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                 avpu_dump_rec(s, f, rec->y, NULL, NULL, rec->uv);
             }
         } else {
-            /* the reference this picture builds, at its first slice */
-            if (!f->ry) {
-                f->ry = g_malloc((size_t)f->w * f->h);
-                f->ruv = g_malloc((size_t)f->w * f->h / 2);
-                if (f->type == 2) {
-                    memcpy(f->ry, f->y, (size_t)f->w * f->h);
-                    memcpy(f->ruv, f->uv, (size_t)f->w * f->h / 2);
-                } else {
-                    AvpuRef *ref = avpu_ref_find(s, f->ref_key, f->w, f->h);
-
-                    if (ref && ref->y) {
-                        memcpy(f->ry, ref->y, (size_t)f->w * f->h);
-                        memcpy(f->ruv, ref->uv, (size_t)f->w * f->h / 2);
-                        f->cursor = ref->cursor;
-                    } else {
-                        /* the decoder's picture unknown: send all of it */
-                        size_t i;
-
-                        f->p_ref_missing = true;
-                        for (i = 0; i < (size_t)f->w * f->h; i++) {
-                            f->ry[i] = ~f->y[i];
-                        }
-                        for (i = 0; i < (size_t)f->w * f->h / 2; i++) {
-                            f->ruv[i] = ~f->uv[i];
-                        }
-                    }
-                }
-            }
-            uint8_t *ry = f->ry + (size_t)r0 * 16 * f->w;
-            uint8_t *ruv = f->ruv + (size_t)r0 * 8 * f->w;
-            g_autofree uint8_t *ly = NULL, *luv = NULL;
-
-            if (f->type == 1) {
-                /* over budget: send the changed MBs from the cursor on */
-                const int budget = avpu_pcm_mbs(s, room);
-                const int n0 = r0 * mbw, nall = rows * mbw;
-
-                if (avpu_changed_mbs(f, r0, rows, f->ry, f->ruv) > budget) {
-                    int i, sent = 0, start = f->cursor - n0;
-
-                    ly = g_memdup2(y, (size_t)rows * 16 * f->w);
-                    luv = g_memdup2(uv, (size_t)rows * 8 * f->w);
-                    if (start < 0 || start >= nall) {
-                        start = 0;
-                    }
-                    for (i = 0; i < nall; i++) {
-                        const int m = (start + i) % nall;
-                        const int mx = m % mbw, my = m / mbw + r0;
-                        int r;
-
-                        if (!avpu_mb_differs(f, mx, my, f->ry, f->ruv)) {
-                            continue;
-                        }
-                        if (sent < budget) {
-                            sent++;
-                            f->cursor = n0 + (m + 1) % nall;
-                            continue;
-                        }
-                        /* held back: looks unchanged to the coder */
-                        for (r = 0; r < 16; r++) {
-                            const size_t o = (size_t)((my - r0) * 16 + r) * f->w +
-                                             mx * 16;
-                            memcpy(ly + o, ry + o, 16);
-                        }
-                        for (r = 0; r < 8; r++) {
-                            const size_t o = (size_t)((my - r0) * 8 + r) * f->w +
-                                             mx * 16;
-                            memcpy(luv + o, ruv + o, 16);
-                        }
-                    }
-                    y = ly;
-                    uv = luv;
-                }
-            }
-
-            cap = (size_t)nmb * 400 + 64;
+            /* B: nothing changes (CABAC B skip contexts not modelled) */
+            cap = (size_t)nmb + 64;
             out = g_malloc0(cap);
-            if (f->type == 2) {
-                if (cabac) {
-                    bits = h264_slice_i16dc_cabac(f->qp, cqp, mbw, rows, y, f->w,
-                                                  uv, f->w, out, cap) * 8;
-                } else {
-                    bits = h264_slice_i16dc_cavlc(f->qp, cqp, mbw, rows, y, f->w,
-                                                  uv, f->w, w.nbits, out, cap);
-                }
-            } else if (f->type == 1) {
-                if (cabac) {
-                    bits = h264_slice_ppcm_cabac(f->qp, idc, mbw, rows, y, f->w,
-                                                 uv, f->w, ry, ruv, out, cap) * 8;
-                } else {
-                    bits = h264_slice_ppcm_cavlc(mbw, rows, y, f->w, uv, f->w,
-                                                 ry, ruv, w.nbits, out, cap);
-                }
+            if (cabac) {
+                qemu_log_mask(LOG_UNIMP, "ingenic-avpu: CABAC B slice\n");
+                bits = h264_slice_pskip_cabac(f->qp, idc, nmb, out, cap) * 8;
             } else {
-                /* B: nothing changes (CABAC B skip contexts not modelled) */
-                if (cabac) {
-                    qemu_log_mask(LOG_UNIMP, "ingenic-avpu: CABAC B slice\n");
-                    bits = h264_slice_pskip_cabac(f->qp, idc, nmb, out, cap) * 8;
-                } else {
-                    bits = h264_slice_pskip_cavlc(nmb, w.nbits, out, cap);
-                }
-            }
-            if (!cabac) {
                 from = w.nbits;
+                bits = h264_slice_pskip_cavlc(nmb, from, out, cap);
             }
             avpu_wr_buf_bits(&w, out, from, MIN(bits, cap * 8));
             sl->coded = true;
-            if (last_slice && f->type != 0) {
-                /* what the decoder now holds, for the P pictures after */
-                AvpuRef *rec = avpu_ref_new(s, f->rec_key, f->w, f->h);
-
-                rec->y = g_steal_pointer(&f->ry);
-                rec->uv = g_steal_pointer(&f->ruv);
-                rec->cursor = f->cursor;
-            }
         }
     }
     while (w.nbits) {                           /* aligned already */
