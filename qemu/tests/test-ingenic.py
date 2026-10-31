@@ -3303,11 +3303,32 @@ def test_isp_t23_dual(qt):
     check('single firmware (no 0xC0 bit 15): no pass end, sensor 0',
           (qt.readl(ISP + 0xC8), sensor_of(buf[0])), (0, 0))
     qt.writel(ISP + clr, qt.readl(ISP + sta))
-    # tisp_init's double setup enables the pass end
+    # tisp_init's double setup enables the pass end, which then comes
+    # 0.5 ms after each pass's picture
     qt.writel(ISP + 0xC0, 0x8000)
     got = []
     for i in range(4):
-        a = frame(buf[(i + 1) % 3])
+        if i == 0:
+            # a pass into the IVDC (double direct): the IVDC's frame done
+            # first, the core's done and pass end 0.5 ms behind it -- the
+            # IVDC's ISR hands its frame to framesource vi_num before the
+            # core's pass end moves vi_num on
+            IVDC = 0x13200000
+            qt.writel(IVDC + 0x54, qt.readl(IVDC + 0x44))
+            qt.writel(ch0 + push_y, 0x80000000)
+            qt.writel(ch0 + push_uv, 0x81000000)
+            qt.step(39200 * 1000)
+            check('into the IVDC: its frame done before the core\'s done '
+                  'and the pass end',
+                  (qt.readl(IVDC + 0x44) >> 16 & 1, qt.readl(ISP + sta) & 1,
+                   qt.readl(ISP + 0xC8) & 0x8000), (1, 0, 0))
+            qt.step(1800 * 1000)
+            check('then the core\'s done and the pass end together',
+                  (qt.readl(ISP + sta) & 1, qt.readl(ISP + 0xC8) & 0x8000),
+                  (1, 0x8000))
+            a = qt.readl(ch0 + pop_y)
+        else:
+            a = frame(buf[(i + 1) % 3])
         got.append(sensor_of(a))
         if i == 0:
             check('a pass ends: 0xC8 bit 15 on the core line (INTC 29)',

@@ -2018,10 +2018,29 @@ instead of by picture size, which mixed the two sensors' P pictures.
 `test-ingenic-t23-enc.sh --sensor1 gc2053s1`: four H.264 streams (each
 sensor's 1080p and 640x360), every picture decoded with no decoder
 message, the first and last of each showing its sensor's scene (counter
-ranges 0.. and 500000..). The firmware's "double direct" mode
-(`direct_mode=2`, both main streams into the IVDC) does not stream: the
-second sensor's passes get no IVDC buffer on channel 0 and the ISR logs
-"vb is null, buf get:0x80000000 ... isp_index = 1". The firmware also
+ranges 0.. and 500000..). In the firmware's "double direct" mode
+(`direct_mode=2`, both main streams into the IVDC) the IVDC's ISR
+(`ivdc_core_interrupt_service_routine`, status bit 17) hands the
+picture in its store, the fixed pair 0x80000000 / 0x81000000, to
+framesource `vi_num` -- the pass's sensor until the core ISR's pass end
+moves `vi_num` on. The model raised both at once; the core's line
+(INTC 37) is taken before the IVDC's (46), so every IVDC picture went to
+the other sensor's framesource ("vb is null, buf get:0x80000000 ..."; the
+"isp_index" it prints is an unset field). A pass into the IVDC now
+pulses the IVDC's frame done first and raises the core's status bits
+and the pass end together 0.5 ms later; passes without the IVDC keep
+the channels' done and the pass end in one interrupt, which the
+firmware needs (apart, its ISR requeues the channel's buffer to the
+sensor before it switches). The first sensor's main stream then streams
+in double direct mode (`--sensor1 gc2053s1 --direct 2`: stream 0 decodes
+10 of 10 pictures, as do both sub-streams). The second sensor's
+(framesource 3) still does not: libimp never queues a buffer on it
+(`/proc/jz/isp/isp-fs`: queue count 0, every buf_qcnt 0) although it
+configures the channel for the IVDC (`enc_chn->index=1, direct_mode =
+2`) and the kernel's queue path (`ispcore_pad_event_handle`) rewrites
+both channel 0's and channel 3's buffers to the IVDC pair in this mode;
+where libimp's `IMP_FrameSource_EnableChn` skips the channel's fill was
+not found. The firmware also
 writes ISP offsets 0x20000-0x7FFFF (LUTs beyond the 64 KiB window,
 dropped).
 
@@ -2220,8 +2239,9 @@ has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's YUV422 write-back, dithering and TLB retry /
-verification registers (storage), T41's LDC block (below), T23's double firmware's double
-direct mode (`direct_mode=2`; above)
+verification registers (storage), T41's LDC block (below), the second
+sensor's main stream in T23's double direct mode (`direct_mode=2`:
+libimp queues it no buffer; above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the

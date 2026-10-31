@@ -359,6 +359,9 @@ struct IngenicIspState {
     Object *sensor1;            /* T40: the second pipe's sensor; T23:
                                    the double firmware's second one */
     uint8_t dual_src;           /* T23 double: the sensor of this pass */
+    uint8_t dual_pass_end;      /* T23 double: a pass ended, not yet told */
+    uint32_t dual_sta;          /* ... and its core status bits */
+    uint8_t dual_half;          /* T23 double: a pass's picture is out */
     Object *sensor2;            /* T40: the third sensor, on VIC2 */
     const IngenicIspLayout *l;
 
@@ -2101,6 +2104,8 @@ static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
  * tell themselves from pipe 0's.
  */
 #define PIPE1_FRAME     500000
+/* T23 double: the pass end this long after its channels' done */
+#define DUAL_PASS_END_NS (500 * SCALE_US)
 
 static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
 {
@@ -2111,6 +2116,8 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
     hwaddr int_sta = PIPE_INT(p, l->int_sta);
     uint32_t *vic = ingenic_vic_regs(s, p);
+    uint32_t sta_before = ISP_REG(int_sta);
+    bool to_ivdc = false;
     int n;
 
     ISP_REG(int_sta) |= l->fs_bit;
@@ -2133,6 +2140,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         ya = fifo_pop(&c->y, NULL);
         uva = fifo_pop(&c->uv, NULL);
         ivdc = ya == IVDC_Y;
+        to_ivdc |= ivdc;
         ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
                           r[l->uvstride >> 2], ya, uva, false, gain, sgain);
         if (ingenic_isp_hldc_on(s, p)) {
@@ -2180,22 +2188,71 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
          * (tisp_rcfg_cfg_trig, vi_num = count & 1), queues that sensor's
          * buffers and enables its channels, and the next picture is the
          * other sensor's.  Which sensor a pass takes is in no register the
-         * driver writes: the two simply alternate, as its count does
+         * driver writes: the two simply alternate, as its count does.
+         *
+         * A pass into the IVDC (double direct mode) is told in two steps:
+         * the IVDC's frame done now, the core's status bits and the pass
+         * end a little later (ingenic_isp_frame).  The IVDC's ISR
+         * (ivdc_core_interrupt_service_routine) hands the frame in its
+         * store to framesource vi_num, which the core ISR's pass end then
+         * moves on to the next sensor: told at the same moment, the core's
+         * line (INTC 37) is taken first and every IVDC picture went to the
+         * other sensor's framesource.  Without the IVDC the channels' done
+         * and the pass end come together, as that firmware's ISR expects
+         * (it requeues a channel's buffer to the pass's sensor otherwise)
          */
-        ISP_REG(l->sta2) |= 1u << 15;
-        s->dual_src ^= 1;
+        if (to_ivdc) {
+            s->dual_sta = ISP_REG(int_sta) & ~sta_before;
+            ISP_REG(int_sta) = sta_before;
+            s->dual_pass_end = 1;
+        } else {
+            ISP_REG(l->sta2) |= 1u << 15;
+            s->dual_src ^= 1;
+        }
     }
 }
 
 static void ingenic_isp_frame(void *opaque)
 {
     IngenicIspState *s = opaque;
+    bool dual = ingenic_isp_dual(s) && ingenic_isp_pipe_running(s, 0);
     int p;
 
+    if (dual && s->dual_half) {
+        /*
+         * T23's double firmware: the pass end (sta2 bit 15) a little after
+         * the channels' done and the IVDC's.  The IVDC's ISR
+         * (ivdc_core_interrupt_service_routine) hands the frame in its
+         * store to framesource vi_num, which the core ISR's pass end then
+         * moves on to the next sensor: told at the same moment, the core's
+         * line (INTC 37) was taken first and in double direct mode every
+         * IVDC picture went to the other sensor's framesource
+         */
+        if (s->dual_pass_end) {
+            ISP_REG(s->l->int_sta) |= s->dual_sta;
+            ISP_REG(s->l->sta2) |= 1u << 15;
+            s->dual_src ^= 1;
+            s->dual_pass_end = 0;
+            s->dual_sta = 0;
+        }
+        s->dual_half = 0;
+        s->frame++;
+        ingenic_isp_update(s);
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  ingenic_isp_period(s) - DUAL_PASS_END_NS);
+        return;
+    }
     for (p = 0; p < ingenic_isp_pipes(s); p++) {
         if (ingenic_isp_pipe_running(s, p)) {
             ingenic_isp_pipe_frame(s, p);
         }
+    }
+    if (dual && s->dual_pass_end) {
+        s->dual_half = 1;
+        ingenic_isp_update(s);
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  DUAL_PASS_END_NS);
+        return;
     }
     if (s->l->pipes > 1 && s->vic2_running) {
         /*
@@ -2552,6 +2609,9 @@ static void ingenic_isp_reset(DeviceState *dev)
     s->vic1_running = false;
     s->vic2_running = false;
     s->dual_src = 0;
+    s->dual_half = 0;
+    s->dual_pass_end = 0;
+    s->dual_sta = 0;
     memset(s->mdma_slot, 0, sizeof(s->mdma_slot));
     s->frame = 0;
     for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
@@ -2693,7 +2753,7 @@ static const VMStateDescription vmstate_ingenic_isp_chan = {
 
 static const VMStateDescription vmstate_ingenic_isp = {
     .name = TYPE_INGENIC_ISP,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .post_load = ingenic_isp_post_load,
     .fields = (const VMStateField[]) {
@@ -2716,6 +2776,9 @@ static const VMStateDescription vmstate_ingenic_isp = {
         VMSTATE_BOOL_V(vic2_running, IngenicIspState, 4),
         VMSTATE_UINT8_ARRAY_V(mdma_slot, IngenicIspState, 3, 4),
         VMSTATE_UINT8_V(dual_src, IngenicIspState, 5),
+        VMSTATE_UINT8_V(dual_half, IngenicIspState, 6),
+        VMSTATE_UINT8_V(dual_pass_end, IngenicIspState, 6),
+        VMSTATE_UINT32_V(dual_sta, IngenicIspState, 6),
         VMSTATE_TIMER_PTR(timer, IngenicIspState),
         VMSTATE_END_OF_LIST()
     },
