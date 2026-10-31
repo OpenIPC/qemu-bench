@@ -3761,12 +3761,32 @@ def main():
         qt = QTest(a.qemu, 't31,wifi=atbm,wifi-ssid=IEEE,wifi-psk=password',
                    ['-nic', 'user'])
         print('atbm-sdio WPA2-PSK authenticator')
-        check('PBKDF2 PSK, PRF and AES key wrap known answers',
-              qt.qom_get('/machine/atbm', 'selftest'), True)
+        check('known answers: PBKDF2 PSK, PRF, AES key wrap, HMAC-MD5, RC4, '
+              'Michael', qt.qom_get('/machine/atbm', 'selftest'), True)
         check('the access point takes the passphrase and SSID',
               (qt.qom_get('/machine/atbm', 'psk'),
                qt.qom_get('/machine/atbm', 'ssid')), ('password', 'IEEE'))
         qt.close()
+        qt = QTest(a.qemu, 't31,wifi=atbm,wifi-psk=password', [
+            '-nic', 'user', '-global', 'atbm-sdio.proto=wpa',
+            '-global', 'atbm-sdio.cipher=tkip',
+            '-global', 'atbm-sdio.rekey=60'])
+        check('WPA1 / TKIP / rekey options reach the access point',
+              (qt.qom_get('/machine/atbm', 'proto'),
+               qt.qom_get('/machine/atbm', 'cipher'),
+               qt.qom_get('/machine/atbm', 'rekey')), ('wpa', 'tkip', 60))
+        qt.close()
+        for opts, want in ((['pmf=required', 'cipher=tkip'],
+                            'pmf needs proto=rsn and cipher=ccmp'),
+                           (['cipher=wep'], 'cipher must be ccmp or tkip'),
+                           (['pmf=yes'], 'pmf must be off, optional')):
+            r = subprocess.run(
+                [a.qemu, '-M', 't31,wifi=atbm,wifi-psk=password',
+                 '-machine', 'accel=qtest', '-display', 'none', '-nic', 'user',
+                 '-S'] + sum((['-global', 'atbm-sdio.' + o] for o in opts), []),
+                capture_output=True, text=True, timeout=30,
+                input='')
+            check('refused: %s' % ' '.join(opts), want in r.stderr, True)
         qt = QTest(a.qemu, 't40,wifi=atbm', ['-nic', 'user'])
         test_sdio_sdhci(qt)
         qt.close()

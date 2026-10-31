@@ -427,22 +427,33 @@ shares (`hw/net/atbm-wpa.c`, documented in `docs/ingenic.md`):
   - the `selftest` property runs the PBKDF2, PRF and key-wrap known
     answers.
 
+The dongle takes the same security options as the SDIO chip
+(`hw/net/atbm-wpa.c`, see `docs/ingenic.md`): `proto=wpa` (WPA1),
+`cipher=tkip`, `pmf=optional|required` and `rekey=N`, and it answers the
+driver's power-mode request with the set-PM-mode indication the driver
+waits for.
+
 `qemu-boot/test-xm-wifi.sh --image openipc-xm530v200-nor.bin [--psk P
-[--wrong-psk]]` boots an OpenIPC XM530V200 build with the atbm-wifi
+[--wrong-psk]] [--proto wpa] [--cipher tkip] [--pmf optional|required]
+[--rekey N]` boots an OpenIPC XM530V200 build with the atbm-wifi
 package (`atbm603x_comb_wifi_usb.ko`) with Ethernet unplugged: wlan0 comes
 up, `wpa_supplicant` completes (open, or `key_mgmt=WPA2-PSK`,
 `pairwise_cipher=CCMP`), udhcpc leases 10.0.2.15 over Wi-Fi and the host
 answers 3 of 3 pings, with the data frames going Protected (27 in a run,
 against 2 unprotected EAPOL frames). With `--wrong-psk` the access point
 rejects message 2's MIC, deauthenticates after four retries, and the
-station stays in `4WAY_HANDSHAKE`. Without an image it still checks the
+station stays in `4WAY_HANDSHAKE`. `--proto wpa --cipher tkip --rekey 10`
+associates over WPA1 / TKIP (`key_mgmt=WPA-PSK`, `pairwise_cipher=TKIP`)
+and keeps pinging across four group rekeys; `--pmf required` installs the
+IGTK. Without an image it still checks the
 device: the self-test, `psk` reaching it, a short passphrase refused. The
 stock X6C-WEQ firmware's `6012B_x.ko` loads its firmware into a
 `psk=`-configured dongle and runs its WSM exchange as before; Sofia does
 not scan without provisioning (above).
 
-Not modelled: WPA1/TKIP, WPA3/SAE, 802.1X, PMF, group rekeying, power
-save; XM535D2's `6132cu.ko` and XM533's SDIO SSV6158.
+Not modelled: WPA3-SAE and 802.1X (the guests' `wpa_supplicant` has
+neither; see `docs/ingenic.md`); XM535D2's `6132cu.ko` and XM533's SDIO
+SSV6158.
 
 ## XM530 media pipeline (in progress)
 
