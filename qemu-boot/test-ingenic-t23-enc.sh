@@ -247,7 +247,9 @@ PY
 done
 grep -a -E "T23TEST|^stream[0-3] picture [0-9]*:|t23-enc:|failed" "$OUT/console.log" | grep -v PMEM | tail -40 || true
 if ! grep -a "t23-enc: PASS" "$OUT/console.log" >/dev/null; then
-    echo "FAIL: the client did not get its streams${SENSOR1:+ (T23's dual-sensor raw pipe is not modelled)}"
+    note=
+    [ -n "$SENSOR1" ] && note=" (the T23 dual-sensor raw pipe is not modelled)"
+    echo "FAIL: the client did not get its streams$note"
     exit 1
 fi
 [ -n "$FFMPEG" ] || { echo "SKIP: no ffmpeg to decode with"; exit 0; }
