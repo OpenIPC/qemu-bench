@@ -2919,9 +2919,11 @@ def test_isp_wdr_t41(qt):
           % tuple(top), top[0] > 10 * max(top[1], 1), True)
 
 
-def test_isp_xstats_t41(qt):
-    """T41's other statistics: AF, ADR, defog, GSM, LCE, TMO."""
-    print('ingenic-isp AF / ADR / defog / GSM / LCE / TMO statistics (t41)')
+def test_isp_xstats_t41(qt, soc='t41'):
+    """T40/T41's other statistics: AF, ADR, defog, GSM, LCE (T41: TMO)."""
+    print('ingenic-isp AF / ADR / defog / GSM / LCE%s statistics (%s)'
+          % (' / TMO' if soc == 't41' else '', soc))
+    tmo_on = soc == 't41'
     AE, AF, vic = ISP + 0x19000, ISP + 0x1A000, 0x13380000
     afb, adrb, dfb, tmob = 0x00640000, 0x00650000, 0x00660000, 0x00670000
     w, h = 480, 270
@@ -2949,8 +2951,9 @@ def test_isp_xstats_t41(qt):
     qt.writel(ISP + 0x40020, 0xFFFFFFFF)
     qt.step(41 * 1000 * 1000)
     sta = qt.readl(ISP + 0x40028)
-    check('AF (6), GSM (7), LCE (8), ADR (9), defog (10), TMO (17) raised',
-          sta & 0x207C0, 0x207C0)
+    want = 0x207C0 if tmo_on else 0x7C0
+    check('AF (6), GSM (7), LCE (8), ADR (9), defog (10)%s raised'
+          % (', TMO (17)' if tmo_on else ''), sta & want, want)
     af = qt.read(afb + 0x1000 * qt.readl(AF + 0xE0), 15 * 256)
 
     def af_zone(row, col):
@@ -2984,6 +2987,9 @@ def test_isp_xstats_t41(qt):
     lce = [qt.readl(ISP + 0x501C8) for _ in range(32)]
     check('LCE: a block\'s 32 bins count its quads, no more',
           0 < sum(lce) <= w * h // 4 // 45, True)
+    if not tmo_on:
+        check('no TMO on %s' % soc, sta & (1 << 17), 0)
+        return
     tmo = qt.read(tmob + 0x4000 * qt.readl(ISP + 0x1E028), 3750 * 4)
     check('TMO: a 75 x 50 grid of halfword pairs, the mean at most the max',
           all(struct.unpack_from('<H', tmo, 4 * i)[0] <=
@@ -3002,11 +3008,11 @@ def hldc_calc(k1, k2, w, h):
     return inv, (0x80000 << 32) // min(f) - 5
 
 
-def test_isp_hldc_t41(qt):
-    """T41's HLDC: tisp_hldc_write_reg's registers, 0x40 bit 20 bypass"""
-    print('ingenic-isp HLDC (T41)')
+def test_isp_hldc_t41(qt, soc='t41'):
+    """T40/T41's HLDC: the 0x15000 registers, 0x40 bit 20 bypass"""
+    print('ingenic-isp HLDC (%s)' % soc.upper())
     (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
-     vsta, vclr) = ISP_LAYOUTS['t41']
+     vsta, vclr) = ISP_LAYOUTS[soc]
     w, h, k1, k2 = 256, 144, 200, 40
     ch0 += ISP
     qt.writel(ISP + 0x80, w << 16 | h)          # the sensor's picture
@@ -3871,8 +3877,14 @@ def main():
         qt = QTest(a.qemu, 't41,sensor=gc4663')
         test_isp_xstats_t41(qt)
         qt.close()
+        qt = QTest(a.qemu, 't40,sensor=gc2053')
+        test_isp_xstats_t41(qt, 't40')
+        qt.close()
         qt = QTest(a.qemu, 't41')
         test_isp_hldc_t41(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't40')
+        test_isp_hldc_t41(qt, 't40')
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc4653')
         test_isp_wdr(qt)

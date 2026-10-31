@@ -157,13 +157,14 @@ typedef struct IngenicIspLayout {
      * AWB looks for it: the default light colour; 0: 550 / 600
      */
     uint16_t day_r, day_b;
-    bool hldc;                  /* T41: the HLDC lens correction stage */
+    bool hldc;                  /* T40/T41: the HLDC lens correction stage */
+    hwaddr dgain;               /* the AE's ISP digital gain, Q10 (0: none) */
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
     {
         /* tx-isp-t31.ko H20221206a (tmp/media-contract.md section 2) */
-        .name = "t31", .isp_size = 0x90000,
+        .name = "t31", .dgain = 0x1030, .isp_size = 0x90000,
         .int_en = 0xB0, .int_sta = 0xB4, .int_clr = 0xB8, .fs_bit = 0x1000,
         .ch_base = 0x9900, .ch_en = 0x9804,
         .osize = 0x00, .csize = 0x2C, .push_y = 0x6C, .push_uv = 0x84,
@@ -208,7 +209,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * tisp_msca_init_chx_cfg 0x16f2c).  The pop's UV word carries a
          * tag in bits 2:0, 0 here.
          */
-        .name = "t23", .isp_size = 0x10000,
+        .name = "t23", .isp_size = 0x10000, .dgain = 0x1030,
         .int_en = 0xB0, .int_sta = 0xB4, .int_clr = 0xB8, .fs_bit = 0x1000,
         .ch_base = 0xD100, .ch_en = 0xD040,
         .osize = 0x04, .csize = 0x0C, .push_y = 0x30, .push_uv = 0x50,
@@ -249,7 +250,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * enable 0x16008; VIC0 the T31 one but for its frame start, bit 4
          * of 0x1E0 (main_fs_work, VIC ISR 0x3e2c); no polls.
          */
-        .name = "t40", .isp_size = 0x80000,
+        .name = "t40", .isp_size = 0x80000, .hldc = true,
         .int_en = 0x40020, .int_sta = 0x40028, .int_clr = 0x40024,
         .ch_base = 0x16100, .ch_en = 0x16008,
         .osize = 0x00, .csize = 0x2C, .push_y = 0x6C, .push_uv = 0x84,
@@ -550,6 +551,24 @@ static uint64_t ingenic_isp_sensor_short(Object *sensor)
  */
 #define EXPOSURE_1X     (1000ull * 1024)
 
+/*
+ * The AE's ISP digital gain (T23, T31): tisp_ae0_process_impl hands the
+ * part of its gain the sensor's coarse analogue steps cannot make to
+ * JZ_Isp_Ae_Dg2reg, which writes it to 0x1030 / 0x1034 -- four 16-bit
+ * lanes, G in 0x1030's top half, 0x400 = 1.0.  With the GC2053's steps
+ * some 1.18 x apart the AE runs e.g. analogue 8.9 x with digital 1.21 x;
+ * a model that left the digital part out showed it the step below as too
+ * dark and the step above as too bright, and it flipped between them
+ * every few frames.  Folded into the scene's light, so the statistics
+ * and the picture see it.
+ */
+static uint32_t ingenic_isp_dgain(IngenicIspState *s)
+{
+    uint32_t dg = s->l->dgain ? ISP_REG(s->l->dgain) >> 16 : 0;
+
+    return dg ? dg : 0x400;
+}
+
 static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 {
     uint64_t g = (uint64_t)s->light * 256 / 100;
@@ -558,6 +577,9 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 
     if (level) {
         g = g * level / EXPOSURE_1X;
+    }
+    if (!pipe) {
+        g = g * ingenic_isp_dgain(s) / 0x400;
     }
     return MIN(MAX(g, 1), 256 * 64);
 }
@@ -1518,8 +1540,9 @@ static void ingenic_isp_defog(IngenicIspState *s, uint32_t frame, int w,
  *   tisp_tmo_get_data reads 3750 pairs of halfwords -- here a 75 x 50
  *   grid of each block's mean and brightest luma, 12 bits.
  * The field meanings are the model's reading of the readers; the
- *   modules' names do not settle them.  These three are T41's: T40's
- *   module reads its GSM and LCE through other paths and has no TMO.
+ *   modules' names do not settle them.  T40's module (tx-isp-t40.ko:
+ *   tisp_gsm_single_get_hist, tisp_lce_get_data) reads GSM and LCE
+ *   through the same flags, ports and bits 7 / 8; it has no TMO.
  */
 #define T41_GSM_FLAG0   0x1B004
 #define T41_GSM_FLAG1   0x1B044
@@ -1549,7 +1572,7 @@ static uint32_t *t41_port_ram(IngenicIspState *s, int ram)
 }
 
 static void ingenic_isp_xstats2(IngenicIspState *s, uint32_t frame, int w,
-                                int h, double k)
+                                int h, double k, bool tmo_on)
 {
     static uint8_t tmo[3750 * 4];
     uint64_t hist[256] = { 0 };
@@ -1609,8 +1632,8 @@ static void ingenic_isp_xstats2(IngenicIspState *s, uint32_t frame, int w,
     ISP_REG(T41_LCE_STA) = 1;
     ISP_REG(s->l->int_sta) |= 1u << T41_LCE_BIT;
 
-    /* TMO: the next bank, a 75 x 50 grid */
-    if (ISP_REG(T41_TMO_BANK)) {
+    /* TMO (T41): the next bank, a 75 x 50 grid */
+    if (tmo_on && ISP_REG(T41_TMO_BANK)) {
         int b = (ISP_REG(T41_TMO_IDX) + 1) & 1;
         hwaddr dst = ISP_REG(T41_TMO_BANK + 4 * b);
 
@@ -1809,10 +1832,8 @@ static void ingenic_isp_xstats(IngenicIspState *s, uint32_t gain,
     if (s->l->xstat == 3) {
         uint32_t sg = ingenic_isp_short_gain(s, 0);
 
-        /* T40 reads GSM and LCE otherwise and has no TMO */
-        if (!strcmp(s->l->name, "t41")) {
-            ingenic_isp_xstats2(s, frame, w, h, k);
-        }
+        /* GSM and LCE on both; TMO is T41's */
+        ingenic_isp_xstats2(s, frame, w, h, k, !strcmp(s->l->name, "t41"));
         ingenic_isp_wdr_xb2(s, frame, w, h, k, sg ? sg / 256.0 : k);
         return;
     }
@@ -1889,9 +1910,12 @@ static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
 
 
 /*
- * T41's HLDC, the ISP's lens distortion correction (tiziano-hldc.c of
- * tx-isp-t41.ko H20230630a; on while the module bypasses at 0x40 have
- * bit 20 -- IMPISPModuleCtl.bitBypassHLDC -- clear).  tisp_hldc_write_reg
+ * T40 and T41's HLDC, the ISP's lens distortion correction (tiziano-hldc.c
+ * of tx-isp-t41.ko H20230630a; on while the module bypasses at 0x40 have
+ * bit 20 -- IMPISPModuleCtl.bitBypassHLDC -- clear).  T40's module writes
+ * the same registers through tisp_hldc_con_par_cfg, the main pipe's at
+ * (0x2A0 << 7) = 0x15000 and its second pipe's at 0x15080 (not applied
+ * here: the model corrects the main pipe only).  tisp_hldc_write_reg
  * writes, from 16 halfwords p[] (the tuning's, or /dev/tisp's module 21):
  *
  *   0x15000  p1 << 16 | p0         (1, 1 from every tuning: stored)
@@ -2192,7 +2216,7 @@ static uint64_t ingenic_isp_read(void *opaque, hwaddr off, unsigned size)
     if (l->ack && off == l->ack) {
         return (s->isp[off >> 2] & ~1u) | (ISP_REG(l->req) & 1);
     }
-    if (l->xstat == 3 && l->msca_win && (off & ~0xFFF) == 0x50000) {
+    if (l->xstat == 3 && (off & ~0xFFF) == 0x50000) {
         int pt;
 
         for (pt = 0; pt < ARRAY_SIZE(t41_ports); pt++) {

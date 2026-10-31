@@ -1495,6 +1495,16 @@ times `light` (percent, 100) -- read the way each part's SDK sensor
 driver writes them: GC2053 page 0 0x03/0x04 and 0xB8/0xB9, GC2083
 0x0D03/0x0D04, GC4653/GC4663 0x0202/0x0203 and 0x02B8/0x02B9, SC2336
 0x3E00-0x3E02 and 0x3E07/0x3E09 (`include/hw/i2c/ingenic-sensor.h`).
+On T23 and T31 the light also takes the AE's ISP digital gain: the
+part of its gain the sensor's coarse analogue steps cannot make, which
+`tisp_ae0_process_impl` hands `JZ_Isp_Ae_Dg2reg` to write to 0x1030 /
+0x1034 (four 16-bit lanes, G in 0x1030's top half, 0x400 = 1.0). Without
+it the T23 AE hunted: with the GC2053's steps some 1.18x apart it ran
+analogue 2272/256 with digital 1.21x, saw the picture too dark, stepped
+to 2683/256 with 1.0x, saw it too bright, and flipped between the two
+every 5 frames; with it, it settles (2283/256 held for 153 frames of a
+200-frame run). T21 writes its digital gain to 0x408 / 0x40C (not
+applied); T40 and T41 apply theirs elsewhere and converge as they are.
 The painted scene counts as display light (gamma 2.2): the exposure
 scales its linear light, white clips, and the picture is gamma-encoded
 again, so a longer exposure lifts the navy while the logo stays white.
@@ -1629,8 +1639,10 @@ shading. T40 and T41 (`tisp_wdr_interrupt_static`, T40's
 `tisp_wdr_get_data` reads 456 24-bit values (the first 450: 15 rows of
 15 long-frame then 15 short-frame blocks -- here luma sums), four
 12-bit and two 23-bit values at +1352 / +1360 (here the frames' mean
-luma, bright and dark counts), 160 values from +1368 (left zero, not
-identified) and, when the tuning asks, the long and the short frame's
+luma, bright and dark counts), 160 values from +1368 (40 groups of
+four packed 24-bit values; `tisp_wdr_get_data` unpacks them into a
+640-byte buffer that no code in either module reads -- only init
+allocates it and deinit frees it -- so they are left zero) and, when the tuning asks, the long and the short frame's
 R, G, B histograms from +1848 and +3896 (256 entries of three 21-bit
 counts).
 
@@ -1665,8 +1677,10 @@ alternate about 1.8 million), 0 without; ADR rewrites its outputs
 (0x50024..0x5040C) about three times as often and defog its (0xC0xx)
 half again as often as with no statistics. Which reader field means
 what (ADR's, defog's order, TMO's pair) is the model's reading of their
-widths. T40 reads its GSM and LCE through other paths and has no TMO;
-those are T41's only. T40's `tisp_af_get_metric`, asked for the AF
+widths. T40's module reads GSM and LCE the same way
+(`tisp_gsm_single_get_hist`, `tisp_lce_get_data`: the flags, the RAM
+ports and bits 7 and 8 above; it has no "hist error" check), so the
+model fills them on both; TMO is T41's only. T40's `tisp_af_get_metric`, asked for the AF
 metric from a single-sensor run once AF statistics arrive, faults on a
 pointer of its own (a TLB load in module space); the tests do not ask
 it there.
@@ -1888,8 +1902,13 @@ picture (0x80) before the scaler, each channel mapped by its scale.
 through `/dev/tisp`, saves frames, clears the bypass through libimp and
 saves more: the later frames match the earlier remapped on the host from
 the same registers (95 % of pixels identical, against 157 levels apart
-without the remap). T40's HLDC (`tisp_hldc_con_par_cfg`) is not
-modelled.
+without the remap). T40's module writes the same registers through
+`tisp_hldc_con_par_cfg` -- the main pipe's at (0x2A0 << 7) = 0x15000, its
+second pipe's at 0x15080 (not applied: the model corrects the main pipe)
+-- and the same bypass bit 20; `/dev/tisp` reaches it as module 20 (T41:
+21), the pipe in word 3 and the 16 halfwords from word 4 (T41: from
+word 3). `--ldc` on T40 passes the same way (100 % of the sampled pixels
+within 0 of the host's remap, against 111 levels without it).
 
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
@@ -1914,7 +1933,10 @@ the pair again instead of reading the done FIFO. Here 32 MiB of RAM at
 the pair into it and raises bit 20 without touching the done FIFO, and
 the AVPU reads 0x80000000-0x81FFFFFF unmasked. The IVDC's own registers
 (`ingenic-ivdc`, 0x13200000) hold the sizes and DRAM spill lines the
-driver writes; 0x00 bit 0 is a reset that reads back 0 at once (the
+driver writes (the spill is the block's own: the encoder still reads the
+0x80000000 pair, and software sees it only as the maximum DRAM lines at
++0xEC / +0xF0 that the T23 and T41 drivers print in `/proc`; the model's
+store never fills, so they read 0, no line spilled); 0x00 bit 0 is a reset that reads back 0 at once (the
 driver spins on it); the status at +0x44, cleared through +0x54, gets
 ISP frame start and frame done (bits 17 and 16) for each picture the
 scaler writes into the store, and interrupts on core INTC source 13
@@ -2091,7 +2113,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t40` + vendor modules + the SDK's `sensor_gc4653s1_t40.ko`, two sensors | `t40,sensor=gc4653,sensor1=gc4653 -m 256M` | `-kernel` + NOR root | libimp in the all-cached dual mode: channel 0 (pipe 0) and channel 3 (pipe 1) at 2560x1440, 40 frames each, both pipes' AE converging on their own sensors, the scene and counter checked per pipe (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`) |
 | OpenIPC `t40` + vendor modules + the gc4653 "s1" module twice (as `s1` and `s2`), three sensors | `t40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653 -m 256M` | `-kernel` + NOR root | libimp with `IMPISP_TOTAL_THR`, the third on VIC2 / DVP: both pipes' frames as above, VIC2 interrupting; the `snapraw` command while streaming saves `/tmp/snap0.raw` (2560x1440 x 2 bytes, an RGGB mosaic of the navy scene: R 186, G 216, B 335 on average) through the VIC MDMA (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --sensor2 gc4653 --snap-env SNAP_SNAPRAW=0_1`) |
 | T41NQ SDK 1.2.0 image + its modules, `sensor=gc4663` | `t41,variant=t41nq -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t41`) |
-| the same, HLDC parameters through `/dev/tisp`, the bypass cleared through libimp | `t41,variant=t41nq` | as above | the corrected frames match the uncorrected ones remapped on the host from the registers (`test-ingenic-isp.sh --soc t41 --ldc 200,40`) |
+| the same, HLDC parameters through `/dev/tisp`, the bypass cleared through libimp | `t41,variant=t41nq`; `t40` (`--soc t40 --ldc 200,40`) | as above | the corrected frames match the uncorrected ones remapped on the host from the registers (`test-ingenic-isp.sh --soc t41 --ldc 200,40`) |
 | OpenIPC `t40` + vendor modules, two gc4653, libimp's joint mode | `t40,sensor=gc4653,sensor1=gc4653` | as above | 2560x2880 on channel 0, the main sensor's part with pipe 0's counter and the secondary's with pipe 1's, above and under (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --joint 3`, `4`) |
 | OpenIPC `t10` + vendor modules, `sensor=jxh62` | `t10` | `-kernel` + NOR root | 1280x720 and 640x360, the sensor on bit-banged I2C (`test-ingenic-isp.sh --soc t10`) |
 | T40XP camera | `t40 -m 256M` | flash | login, the vendor application starts |
@@ -2161,16 +2183,14 @@ point's code and options.
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode
 (past the scaler's limit with these sensors) and the VIC raw frame
-channel (above), the 160 values of
-T40/T41's WDR statistics at +1368, a WDR mode on T23 (no modelled sensor
-has one there), T40's GSM and LCE (read otherwise
-than T41's), the Apical DIS's motion vectors (zero: no motion), the
+channel (above), a WDR mode on T23 (no modelled sensor
+has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's YUV422 write-back, dithering and TLB retry /
-verification registers (storage), T40's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
+verification registers (storage), T40's second pipe's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
 SDK's double firmware: the VIC caching both sensors' raw frames for the
-one ISP to process from DDR; above), T23's IVDC DRAM spill lines
+one ISP to process from DDR; above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the
