@@ -546,8 +546,45 @@ station go Protected with a CCMP header (ExtIV, key 0 / group key 1, a
 rising PN for mac80211's replay check) and 8 bytes of MIC, flagged
 AES-decrypted (and group-key for group frames) in the RX indication,
 which is what the chip's decryption hands the driver.  The `selftest`
-property runs the PBKDF2 (802.11 J.4.2), PRF (J.3) and AES key wrap
-(RFC 3394 4.1) known-answer tests.
+property runs the PBKDF2 (802.11 J.4.2), PRF (J.3), AES key wrap
+(RFC 3394 4.1), HMAC-MD5 (RFC 2202), RC4 and Michael (802.11i) known-
+answer tests.
+
+The card's properties (`-global atbm-sdio.X=`, the USB dongle's
+`-device atbm-wifi,X=`) choose the access point's security:
+
+- `proto=wpa`: WPA1 -- the WPA vendor IE (00:50:f2:1), EAPOL-Key
+  descriptor type 254, message 3 carrying only the IE in the clear, and
+  a group key handshake after message 4 (the GTK under the key index in
+  the key information); the port opens at its message 2.
+- `cipher=tkip`: TKIP pairwise and group, a 512-bit PTK, EAPOL-Key
+  descriptor version 1 (HMAC-MD5 MICs; key data RC4-encrypted under the
+  frame's Key IV and the KEK, 256 bytes of keystream dropped), a 32-byte
+  GTK.  The driver installs TKIP keys in the chip too (WSM key types 3
+  and 2, the MIC keys with them), and its mac80211 leaves 12 bytes of
+  room after a TKIP body (its `icv_len`: ICV and Michael MIC) which the
+  chip fills on the air; the model strips the 8-byte IV and that room.
+  Frames to the station carry a TKIP IV (TSC1, the WEP seed, TSC0, ExtIV
+  and the key ID, TSC2..5), a real Michael MIC under the authenticator's
+  Tx MIC key -- which the driver's mac80211 checks -- and 4 bytes of ICV
+  room, flagged TKIP-decrypted.
+- `pmf=optional|required`: 802.11w -- MFPC (and MFPR) in the RSN
+  capabilities, BIP-CMAC-128 as the group management cipher, the IGTK
+  (key ID 4) in message 3's key data, which the driver installs (WSM key
+  type 8; checked), and an answer to the station's SA Query requests.
+  The access point sends no group-addressed robust management frame, so
+  BIP itself never arises.  Needs RSN and CCMP.
+- `rekey=N`: every N seconds a group key handshake with a fresh GTK under
+  the other key ID (1 / 2), sent protected with the pairwise key; frames
+  to the station switch to the new key once the station answers.
+
+The driver's power-save mode needs only the chip's side: it sends
+WSM_SET_PM and holds its operation lock until the set-PM-mode indication
+(0x0809), which the model sends after the confirmation; the "chip" stays
+awake and delivers frames whatever the mode.  This driver build has no
+cfg80211 power-management hook (`CONFIG_ATBM_SMPS`), so `iwconfig power`
+fails; its private `iwpriv wlan0 common power_save,1` turns it on
+(mode 0x81).
 
 Over SDIO each WSM message the driver queues carries a 28-byte prefix
 (an 8-byte bus header and a 20-byte cipher header) ahead of its
@@ -566,7 +603,10 @@ card).  `--psk PASSPHRASE` does the same over WPA2-PSK (`wpa_supplicant`
 with `key_mgmt=WPA-PSK`, CCMP): the handshake completes, the driver's
 installed keys match the TK and GTK, and DHCP and ping run over protected
 frames; `--wrong-psk` passes only if the station stays off (message 2's
-MIC rejected).
+MIC rejected).  `--proto wpa`, `--cipher tkip`, `--pmf optional|required`
+and `--rekey N` (which waits for two rekeys and pings again) set the
+options above on both ends, and `--powersave` turns the driver's power
+save on before the ping.
 
 XBurst2 (T40/T41) puts the same card on MSC1, an SDHCI host: patch 0027
 makes an SDIO card's interrupt the SDHCI Normal Interrupt Status "Card
@@ -581,8 +621,9 @@ the driver's private tx-power ioctls assume, so that build needs those
 three helpers stubbed; the driver's own `cfg80211.ko` (from its
 `wireless/`) goes with it, not the rootfs's.
 
-Qtests: the WPA2 known answers (`selftest`) and the machine's
-`wifi-ssid` / `wifi-psk`; `test_sdio` drives the enumeration on the T31 MSC1,
+Qtests: the known answers (`selftest`), the machine's `wifi-ssid` /
+`wifi-psk`, the proto / cipher / rekey options reaching the card and bad
+combinations refused; `test_sdio` drives the enumeration on the T31 MSC1,
 `test_sdio_sdhci` on the T40 SDHCI MSC1 plus the card interrupt (raised
 by the startup indication after a CMD53 releases the chip's CPU, level,
 reaching the core INTC).  The guest test skips
@@ -1998,6 +2039,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 | OpenIPC `t23` / `t30` + the T23 / T30 SDK's libimp.a (`IMP_Decoder`) | `t23` / `t30` | NOR root, `test-ingenic-jpegd.sh --soc t23\|t30 [--jpeg FILE]` | 640x480 and 1280x720 JPEGs from ffmpeg and the snapshot libimp encoded on T21 (`test-ingenic-vpu-e2e.sh`, 640x360): Y 80.8, 81.6 and 70.5 dB against ffmpeg's decode (the snapshot above its partial last macroblock row) |
 | OpenIPC T31 / T40 kernel (MSC1 enabled) + the vendor `atbm_wlan` driver, `wpa_supplicant` | `t31,wifi=atbm` / `t40,wifi=atbm`, `wifi-psk=` | `test-ingenic-wifi.sh [--soc t40] [--psk P [--wrong-psk]]` | SDIO enumeration, firmware download, `wlan0`, association to the open or WPA2-PSK access point (4-way handshake, installed keys equal to the TK and GTK), DHCP 10.0.2.15, ping; a wrong passphrase is refused at message 2 |
+| the same, the access point's options | `-global atbm-sdio.proto= / cipher= / pmf= / rekey=` | `test-ingenic-wifi.sh --psk P --cipher tkip`, `--proto wpa --cipher tkip --rekey 10`, `--pmf required`, `--rekey 10`, `[--psk P] --powersave` | RSN/TKIP and WPA1/TKIP associate with the driver's TKIP keys matching, DHCP and ping (the station's Michael checks the model's); 3 rekeys with the GTK installed under alternating key IDs and the station still pinging; under PMF the IGTK installed and matching; power save: the driver sets the chip to mode 0x81 and traffic flows |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
 level under qtest (no guest), including a migration round trip of `t31`,
@@ -2022,12 +2064,18 @@ and the TCU's PWM pins.
 
 ## Not modelled
 
-The SDIO Wi-Fi chip (`atbm-sdio`): open and WPA2-PSK (CCMP) networks
-only -- no WPA1/TKIP, WPA3/SAE, 802.1X, PMF or group rekeying -- no power
-save or the chip's BLE side; `wifi=atbm` puts it on MSC1 of every
-machine, tested end to end on T31 (jzmmc) and T40 (SDHCI).  The same
-limits apply to the Xiongmai machines' USB `atbm-wifi`, which shares the
-access point's WPA2 code.
+The SDIO Wi-Fi chip (`atbm-sdio`): open, WPA2 and WPA1 with CCMP or TKIP,
+PMF and group rekeying are modelled; not WPA3-SAE (the guests'
+`wpa_supplicant` builds have no SAE code -- the `sae_*` options parse but
+nothing implements them -- so the access point side could not be
+exercised; no SAE test vectors are at hand to check one against), 802.1X /
+EAP (the same builds have no EAP methods, and an authentication server
+is out of scope), BIP (the access point sends no group-addressed robust
+management frame) or the chip's BLE side.  The SA Query answer is in but
+untested: no guest exercise makes the station send one.  `wifi=atbm`
+puts it on MSC1 of every machine, tested end to end on T31 (jzmmc) and
+T40 (SDHCI); the Xiongmai machines' USB `atbm-wifi` shares the access
+point's code and options.
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode

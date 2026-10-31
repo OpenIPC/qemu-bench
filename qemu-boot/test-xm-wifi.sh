@@ -5,14 +5,20 @@
 # a DHCP lease from the dongle's netdev and pings the host through it.
 #
 #   bash qemu-boot/test-xm-wifi.sh --image openipc-xm530v200-nor.bin
-#        [--psk PASSPHRASE [--wrong-psk]] [--qemu PATH] [--out DIR]
+#        [--psk PASSPHRASE [--wrong-psk]] [--proto rsn|wpa]
+#        [--cipher ccmp|tkip] [--pmf optional|required] [--rekey S]
+#        [--qemu PATH] [--out DIR]
 #
 # The image is an OpenIPC build for XM530V200 with the atbm-wifi package
 # (atbm603x_comb_wifi_usb.ko) and wpa_supplicant; it is booted from a copy.
 # The board's Ethernet is left unplugged, so the lease can only come over
 # Wi-Fi.  --wrong-psk gives wpa_supplicant a different passphrase than the
 # access point's: the access point must reject message 2's MIC and the
-# station must stay unassociated.  Without an image the test skips (exit 0).
+# station must stay unassociated.  --proto wpa, --cipher tkip, --pmf
+# optional|required and --rekey N set the access point's security (the
+# dongle's properties, shared with the SDIO model) and the station's to
+# match; --rekey waits for two group rekeys and pings again.  Without an
+# image the test skips (exit 0).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -20,6 +26,10 @@ QEMU=./qemu-src/build/qemu-system-arm
 IMAGE=
 PSK=
 WRONG=
+PROTO=
+CIPHER=
+PMF=
+REKEY=
 OUT=
 SSID=OpenIPC
 while [ $# -gt 0 ]; do
@@ -27,6 +37,10 @@ while [ $# -gt 0 ]; do
     --image) IMAGE=$2; shift ;;
     --psk) PSK=$2; shift ;;
     --wrong-psk) WRONG=1 ;;
+    --proto) PROTO=$2; shift ;;
+    --cipher) CIPHER=$2; shift ;;
+    --pmf) PMF=$2; shift ;;
+    --rekey) REKEY=$2; shift ;;
     --qemu) QEMU=$2; shift ;;
     --out) OUT=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -69,11 +83,19 @@ cp "$IMAGE" "$WORK/flash.bin"
 
 DEV="atbm-wifi,bus=usb-bus.0,port=1,netdev=w,ssid=$SSID,trace=on"
 [ -n "$PSK" ] && DEV="$DEV,psk=$PSK"
+[ -n "$PROTO" ] && DEV="$DEV,proto=$PROTO"
+[ -n "$CIPHER" ] && DEV="$DEV,cipher=$CIPHER"
+[ -n "$PMF" ] && DEV="$DEV,pmf=$PMF"
+[ -n "$REKEY" ] && DEV="$DEV,rekey=$REKEY"
+case $PROTO in wpa) WPROTO=WPA; KM=WPA-PSK ;; *) WPROTO=RSN; KM=WPA2-PSK ;; esac
+case $CIPHER in tkip) WCIPH=TKIP ;; *) WCIPH=CCMP ;; esac
+case $PMF in optional) WPMF='\n ieee80211w=1' ;; required) WPMF='\n ieee80211w=2' ;;
+    *) WPMF= ;; esac
 STAPSK=$PSK
 [ -n "$WRONG" ] && STAPSK="not-$PSK"
 if [ -n "$PSK" ]; then
-    NET="key_mgmt=WPA-PSK\n proto=RSN\n pairwise=CCMP\n group=CCMP\n psk=\\\"$STAPSK\\\""
-    echo "== XM530V200, atbm-wifi, WPA2-PSK${WRONG:+ (wrong passphrase on the station)}"
+    NET="key_mgmt=WPA-PSK\n proto=$WPROTO\n pairwise=$WCIPH\n group=$WCIPH\n psk=\\\"$STAPSK\\\"$WPMF"
+    echo "== XM530V200, atbm-wifi, $WPROTO $WCIPH${PMF:+ PMF $PMF}${REKEY:+ rekey ${REKEY}s}${WRONG:+ (wrong passphrase on the station)}"
 else
     NET="key_mgmt=NONE"
     echo "== XM530V200, atbm-wifi, open network"
@@ -83,7 +105,9 @@ QEMU_CMD="$QEMU -M xm530v200,flash-file=$WORK/flash.bin -nic none"
 QEMU_CMD="$QEMU_CMD -netdev user,id=w,net=10.0.2.0/24,host=10.0.2.2"
 QEMU_CMD="$QEMU_CMD -device $DEV -display none -monitor none -serial stdio"
 QEMU_CMD="$QEMU_CMD -d guest_errors -D $OUT/qemu.log"
-export QEMU_CMD SSID NET WRONG OUT
+WAIT2=0
+[ -n "$REKEY" ] && WAIT2=$((2 * REKEY + 4))
+export QEMU_CMD SSID NET WRONG OUT WAIT2
 timeout 900 python3 - <<'PY'
 import os, pexpect, sys
 log = open(os.path.join(os.environ['OUT'], 'console.log'), 'w')
@@ -123,6 +147,13 @@ if not os.environ['WRONG']:
     run('udhcpc -i wlan0 -n -q -t 5 2>&1 | grep -iE "obtained|fail"; '
         'ifconfig wlan0 | grep "inet addr"', 90)
     run('ping -c 3 -W 3 10.0.2.2 2>&1 | grep -E "transmitted"', 60)
+    w2 = int(os.environ['WAIT2'])
+    if w2:
+        # traffic across the group rekeys, then a ping and the state again
+        run('ping -c %d -W 2 10.0.2.2 >/dev/null 2>&1; '
+            'echo AFTER-$(ping -c 3 -W 3 10.0.2.2 2>&1 | grep -oE "[0-9] (packets )?received"); '
+            'wpa_cli -p /tmp/wpa -i wlan0 status 2>/dev/null | '
+            'sed -n "s/^wpa_state=/AFTER-STATE=/p"' % w2, w2 * 3 + 60)
 run('echo OOPS=$(dmesg | grep -ciE "oops|unable to handle|BUG:")')
 p.sendline('poweroff')
 try:
@@ -151,17 +182,31 @@ else
     grep -aq "wpa_state=COMPLETED" "$C" && pass "associated to $SSID" ||
         bad "wpa_supplicant did not complete"
     if [ -n "$PSK" ]; then
-        for k in 'EAPOL message 4 ok' 'pairwise key installed, matching' \
-                 'group key installed, matching'; do
+        KEYS=('EAPOL message 4 ok' 'pairwise key installed, matching'
+              'group key installed, matching')
+        [ "$PROTO" = wpa ] && KEYS+=('group message 2 ok, port open')
+        [ -n "$PMF" ] && KEYS+=('IGTK installed, matching')
+        for k in "${KEYS[@]}"; do
             grep -aq "$k" "$Q" && pass "access point: $k" || bad "no '$k'"
         done
-        grep -aq "key_mgmt=WPA2-PSK" "$C" && pass "wpa_supplicant: WPA2-PSK" ||
-            bad "wpa_supplicant key_mgmt not WPA2-PSK"
+        grep -aq "key_mgmt=$KM" "$C" && pass "wpa_supplicant: $KM" ||
+            bad "wpa_supplicant key_mgmt not $KM"
+        grep -aq "pairwise_cipher=$WCIPH" "$C" &&
+            pass "wpa_supplicant: pairwise $WCIPH" ||
+            bad "wpa_supplicant pairwise cipher not $WCIPH"
     fi
     ip=$(grep -ao "inet addr:10\.0\.2\.[0-9]*" "$C" | head -1 | cut -d: -f2)
     [ -n "$ip" ] && pass "DHCP address $ip" || bad "no 10.0.2.x lease on wlan0"
     grep -aqE "3 packets transmitted, [1-3] (packets )?received" "$C" &&
         pass "ping to the host" || bad "ping to 10.0.2.2"
+fi
+if [ -n "$REKEY" ] && [ -z "$WRONG" ]; then
+    nr=$(grep -ac 'group rekey [0-9]* done' "$Q")
+    [ "$nr" -ge 2 ] && pass "$nr group rekeys done" || bad "$nr group rekeys, want 2"
+    grep -aqE "AFTER-[1-3] (packets )?received" "$C" &&
+        grep -aq "AFTER-STATE=COMPLETED" "$C" &&
+        pass "still associated and pinging after the rekeys" ||
+        bad "lost after the rekeys"
 fi
 grep -aq "^OOPS=0" "$C" && pass "no kernel oops" || bad "kernel oops in dmesg"
 [ $dev_fail = 0 ] || fail=1
