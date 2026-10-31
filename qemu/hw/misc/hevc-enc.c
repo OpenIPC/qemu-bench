@@ -13,6 +13,9 @@
  * and the inverse transform of a DC-only block), so intra prediction never
  * drifts and the decoded picture equals the reconstruction.
  *
+ * Engines that ask for it (HevcEncParams.inter) get P slices with real inter
+ * coding instead: hevc-enc-inter.c.inc.
+ *
  * The CABAC engine is H.264's (the arithmetic coder is the same), copied
  * from hantro-h264.c with its x264-derived tables; the contexts and their
  * I-slice init values are HEVC's (Tables 9-5 to 9-37).
@@ -98,7 +101,15 @@ enum {
     CTX_MERGE_IDX = 86,         /* P slices */
     CTX_SPLIT_TRAFO = 87,       /* 3 */
     CTX_TRANSFORM_SKIP = 90,    /* 2: luma, chroma */
-    CTX_NUM = 92
+    /* inter coding (hevc-enc-inter.c.inc) */
+    CTX_MERGE_FLAG = 92,
+    CTX_MVD_G0 = 93,            /* abs_mvd_greater0_flag */
+    CTX_MVD_G1 = 94,            /* abs_mvd_greater1_flag */
+    CTX_MVP = 95,               /* mvp_l0_flag */
+    CTX_ROOT_CBF = 96,          /* rqt_root_cbf */
+    CTX_CSBF = 97,              /* coded_sub_block_flag: 4 */
+    CTX_SIG = 101,              /* sig_coeff_flag: 42 */
+    CTX_NUM = 143
 };
 
 /* initValue, in the order above: initType 0 (I slices), 1 (P slices
@@ -126,6 +137,15 @@ static const uint8_t hevc_init[3][CTX_NUM] = { {
     154,                                                /* (merge_idx) */
     153, 138, 138,                                      /* split_transform */
     139, 139,                                           /* transform_skip */
+    154,                                                /* (merge_flag) */
+    154, 154,                                           /* (mvd g0, g1) */
+    154,                                                /* (mvp_l0_flag) */
+    154,                                                /* (rqt_root_cbf) */
+    91, 171, 134, 141,                                  /* coded_sub_block */
+    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153,
+    125, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140,
+    139, 182, 182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111,
+                                                        /* sig_coeff_flag */
 }, {
     107, 139, 126,
     154,
@@ -148,6 +168,14 @@ static const uint8_t hevc_init[3][CTX_NUM] = { {
     122,
     124, 138, 94,
     139, 139,
+    110,
+    140, 198,
+    168,
+    79,
+    121, 140, 61, 154,
+    155, 154, 139, 153, 139, 123, 123, 63, 153, 166, 183, 140, 136, 153,
+    154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170,
+    153, 123, 123, 107, 121, 107, 121, 167, 151, 183, 140, 151, 183, 140,
 }, {
     107, 139, 126,
     154,
@@ -170,6 +198,14 @@ static const uint8_t hevc_init[3][CTX_NUM] = { {
     137,
     224, 167, 122,
     139, 139,
+    154,
+    169, 198,
+    168,
+    79,
+    121, 140, 61, 154,
+    170, 154, 139, 153, 139, 123, 123, 63, 124, 166, 183, 140, 136, 153,
+    154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170,
+    153, 138, 138, 122, 121, 122, 121, 167, 151, 183, 140, 151, 183, 140,
 } };
 
 typedef struct Cabac {
@@ -366,6 +402,11 @@ typedef struct Pic {
     uint8_t *cuqp;                  /* per 8x8 CU: its QpY */
     int skip_thr;                   /* skip_threshold() at qp */
     const HevcEncParams *prm;
+    /* inter coding (hevc-enc-inter.c.inc), per 8x8 CU */
+    bool force_intra;               /* code the CU intra, not skipped */
+    uint8_t *intra;                 /* intra (else skipped / inter) */
+    int16_t *mvx, *mvy;             /* its vector, quarter samples */
+    uint8_t *cbfy;                  /* luma coefficients */
 } Pic;
 
 static void hevc_enc_ref_clear(HevcEncRef *r);
@@ -375,6 +416,10 @@ static void hevc_enc_ref_clear(HevcEncRef *r);
 struct HevcEncRef {
     int w, h;
     uint8_t *y, *cb, *cr;
+    /* its motion, per 8x8 block, when it was inter coded: for the
+     * temporal candidates of the picture after (NULL: none) */
+    uint8_t *intra;
+    int16_t *mvx, *mvy;
 };
 
 static uint8_t clip1(int v)
@@ -650,7 +695,7 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
                         (y0 > 0 && p->skip[cu - cw]);
         bool skip = false;
 
-        if (p->ref) {
+        if (p->ref && !p->force_intra) {
             int sse_i = 0, sse_s = 0;
             for (y = 0; y < 8; y++) {
                 const int o = (y0 + y) * p->w + x0;
@@ -951,6 +996,8 @@ static void deblock(Pic *p, const HevcEncParams *prm)
     }
 }
 
+#include "hevc-enc-inter.c.inc"
+
 /* coding quadtree (7.3.8.4) from a CTB down to 8x8 CUs: split_cu_flag
  * coded inside the picture, inferred at its edges; z-scan order */
 static void quadtree(Pic *p, Cabac *c, int x0, int y0, int log2, int qp,
@@ -972,7 +1019,11 @@ static void quadtree(Pic *p, Cabac *c, int x0, int y0, int log2, int qp,
         p->qp_delta_coded = false;
     }
     if (log2 == 3) {
-        encode_cu(p, c, x0, y0, qp, p_slice);
+        if (p_slice && p->prm->inter) {
+            encode_cu_inter(p, c, x0, y0);
+        } else {
+            encode_cu(p, c, x0, y0, qp, p_slice);
+        }
         return;
     }
     if (x0 + (1 << log2) <= p->w && y0 + (1 << log2) <= p->h) {
@@ -1008,8 +1059,18 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
 {
     const int ctb = 1 << prm->log2_ctb;
     int x, yy;
+    /*
+     * The CUs' QP: at most HEVC_QP_MAX whatever the slice's (cu_qp_delta),
+     * inter coded P pictures too -- the libraries' rate control goes as far
+     * as QP 44 on these scenes, where the residuals of fine detail (a
+     * counter's 6-sample cells) quantise away and the intra fallback is DC
+     * only; cu_qp (an engine fitting a picture into its buffer) overrides
+     */
+    const int cuqp_p = prm->cu_qp ? MIN(MAX(prm->cu_qp, 0), 51)
+                                  : MIN(qp, HEVC_QP_MAX);
     Pic p = { .w = w, .h = h, .sy = y, .suv = uv, .sw = sw, .sh = sh,
-              .sys = ys, .scs = cs, .qp = MIN(qp, HEVC_QP_MAX),
+              .sys = ys, .scs = cs,
+              .qp = prm->inter && p_slice ? cuqp_p : MIN(qp, HEVC_QP_MAX),
               .qp_prev = qp, .log2_ctb = prm->log2_ctb,
               .cqp_offset = prm->chroma_qp_offset,
               .log2_qg = prm->log2_qg ? prm->log2_qg : prm->log2_ctb,
@@ -1023,6 +1084,15 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
     g_autofree uint8_t *cy = g_malloc((size_t)w * h);
     g_autofree uint8_t *ccb = g_malloc((size_t)w * h / 4);
     g_autofree uint8_t *ccr = g_malloc((size_t)w * h / 4);
+    const size_t ncu = (size_t)(w / 8) * (h / 8);
+    g_autofree uint8_t *intra = g_malloc0(ncu);
+    g_autofree int16_t *mvx = g_new0(int16_t, ncu);
+    g_autofree int16_t *mvy = g_new0(int16_t, ncu);
+    g_autofree uint8_t *cbfy = g_malloc0(ncu);
+    p.intra = intra;
+    p.mvx = mvx;
+    p.mvy = mvy;
+    p.cbfy = cbfy;
     p.y = ry;
     p.cb = rcb;
     p.cr = rcr;
@@ -1077,10 +1147,17 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
         }
     }
     pic_maps_free(&p);
+    if (prm->inter && !p_slice) {
+        memset(intra, 1, ncu);          /* every CU of an I picture */
+    }
     if (recon) {
         /* the in-loop filter, then keep the picture as the next one's
          * reference */
-        deblock(&p, prm);
+        if (prm->inter && p_slice) {
+            deblock_inter(&p, prm);
+        } else {
+            deblock(&p, prm);
+        }
         if (recon->w != w || recon->h != h) {
             hevc_enc_ref_clear(recon);
             recon->w = w;
@@ -1092,6 +1169,16 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
         memcpy(recon->y, ry, (size_t)w * h);
         memcpy(recon->cb, rcb, (size_t)w * h / 4);
         memcpy(recon->cr, rcr, (size_t)w * h / 4);
+        g_free(recon->intra);
+        g_free(recon->mvx);
+        g_free(recon->mvy);
+        recon->intra = NULL;
+        recon->mvx = recon->mvy = NULL;
+        if (prm->inter) {
+            recon->intra = g_memdup2(intra, ncu);
+            recon->mvx = g_memdup2(mvx, ncu * sizeof(int16_t));
+            recon->mvy = g_memdup2(mvy, ncu * sizeof(int16_t));
+        }
     }
     return MIN((size_t)(c.p - rbsp), cap);
 }
@@ -1101,12 +1188,23 @@ static void hevc_enc_ref_clear(HevcEncRef *r)
     g_free(r->y);
     g_free(r->cb);
     g_free(r->cr);
+    g_free(r->intra);
+    g_free(r->mvx);
+    g_free(r->mvy);
     *r = (HevcEncRef){ 0 };
 }
 
 HevcEncRef *hevc_enc_ref_new(void)
 {
     return g_new0(HevcEncRef, 1);
+}
+
+void hevc_enc_ref_planes(const HevcEncRef *r, const uint8_t **y,
+                         const uint8_t **cb, const uint8_t **cr)
+{
+    *y = r ? r->y : NULL;
+    *cb = r ? r->cb : NULL;
+    *cr = r ? r->cr : NULL;
 }
 
 void hevc_enc_ref_free(HevcEncRef *r)
@@ -1142,7 +1240,9 @@ size_t hevc_enc_slice_data(const HevcEncParams *prm,
     if (!size_ok(w, h)) {
         return 0;
     }
-    const size_t rbsp_cap = (size_t)(w / 8) * (h / 8) * 48 + 256;
+    /* an inter CU's residual may take a few hundred bytes */
+    const size_t rbsp_cap = (size_t)(w / 8) * (h / 8) *
+                            (prm->inter ? 320 : 48) + 256;
     g_autofree uint8_t *rbsp = g_malloc0(rbsp_cap);
     const size_t n = slice_data(prm, w, h, MIN(MAX(qp, 0), 51), p_slice,
                                 ref, recon, y, sw, sh, ys, uv, cs, rbsp,
@@ -1224,9 +1324,13 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
     bw_ue(&b, prm->log2_ctb - 3);           /* CTB 16, 32 or 64 */
     bw_ue(&b, 0);                           /* min TB 4 */
     bw_ue(&b, MIN(prm->log2_ctb, 5) - 2);   /* max TB: the CTB, 32 at most */
-    bw_ue(&b, 0);                           /* hierarchy depth inter */
-    bw_ue(&b, 0);                           /* hierarchy depth intra */
-    bw_bits(&b, 0, 1);                      /* scaling lists */
+    /* the inter coder's engines say what their libraries' SPS says */
+    bw_ue(&b, prm->inter ? prm->trafo_depth_inter : 0); /* depth inter */
+    bw_ue(&b, prm->inter ? prm->trafo_depth_intra : 0); /* depth intra */
+    bw_bits(&b, prm->inter && prm->scaling_list, 1);   /* scaling lists */
+    if (prm->inter && prm->scaling_list) {
+        bw_bits(&b, 0, 1);                  /*   the defaults */
+    }
     bw_bits(&b, 0, 1);                      /* amp */
     bw_bits(&b, prm->sao, 1);               /* sao */
     bw_bits(&b, 0, 1);                      /* pcm */
@@ -1236,7 +1340,7 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
     bw_ue(&b, 0);                           /*   delta POC -1, */
     bw_bits(&b, 1, 1);                      /*   used by the current one */
     bw_bits(&b, 0, 1);                      /* long-term refs */
-    bw_bits(&b, 0, 1);                      /* temporal mvp */
+    bw_bits(&b, prm->inter && prm->tmvp, 1); /* temporal mvp */
     bw_bits(&b, 0, 1);                      /* strong intra smoothing */
     bw_bits(&b, prm->vui, 1);               /* vui: */
     if (prm->vui) {
@@ -1259,13 +1363,13 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
     bw_bits(&b, 0, 1);                      /* dependent slices */
     bw_bits(&b, 0, 1);                      /* output_flag_present */
     bw_bits(&b, 0, 3);                      /* extra slice header bits */
-    bw_bits(&b, 0, 1);                      /* sign data hiding */
+    bw_bits(&b, prm->inter && prm->sign_hiding, 1); /* sign data hiding */
     bw_bits(&b, 1, 1);                      /* cabac_init_present */
     bw_ue(&b, 0);
     bw_ue(&b, 0);
     bw_se(&b, 0);                           /* init_qp 26 */
     bw_bits(&b, 0, 1);                      /* constrained intra */
-    bw_bits(&b, 0, 1);                      /* transform skip */
+    bw_bits(&b, prm->inter && prm->transform_skip, 1); /* transform skip */
     bw_bits(&b, 1, 1);                      /* cu_qp_delta, */
     bw_ue(&b, prm->log2_qg ? prm->log2_ctb - prm->log2_qg : 0); /* QG */
     bw_se(&b, prm->chroma_qp_offset);       /* pps_cb_qp_offset */
@@ -1303,14 +1407,19 @@ slice:
     if (p_slice) {
         bw_bits(&b, poc & 1023, 10);        /* pic_order_cnt_lsb */
         bw_bits(&b, 1, 1);                  /* the SPS's RPS */
+        if (prm->inter && prm->tmvp) {
+            bw_bits(&b, 1, 1);              /* slice_temporal_mvp_enabled */
+        }
     }
     if (prm->sao) {
         bw_bits(&b, prm->sao_luma_only ? 2 : 3, 2); /* slice_sao_luma/chroma */
     }
     if (p_slice) {
         bw_bits(&b, 0, 1);                  /* num_ref_idx_active_override */
-        bw_bits(&b, 0, 1);                  /* cabac_init_flag */
-        bw_ue(&b, 1);                       /* five_minus_max_num_merge_cand */
+        bw_bits(&b, prm->cabac_init_flag, 1); /* cabac_init_flag */
+        bw_ue(&b, prm->inter ? 5 - (prm->max_merge_cand ?
+                                   prm->max_merge_cand : 5) : 1);
+                                            /* five_minus_max_num_merge_cand */
     }
     bw_se(&b, qp - 26);                     /* slice_qp_delta */
     bw_bits(&b, 1, 1);                      /* deblocking override: */

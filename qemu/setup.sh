@@ -48,6 +48,7 @@ cp qemu/hw/misc/xm-jpeg.c qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h \
 cp qemu/hw/misc/xm-audio.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/usb/atbm-wifi.c          "$QEMU_DIR/hw/usb/"
 cp qemu/hw/misc/xm-hevc.c qemu/hw/misc/hevc-enc.c qemu/hw/misc/hevc-enc.h \
+   qemu/hw/misc/hevc-enc-inter.c.inc \
                                     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-h1.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h264-tables.h \

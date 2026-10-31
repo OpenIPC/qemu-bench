@@ -32,6 +32,26 @@ typedef struct HevcEncParams {
     int trafo_depth_intra;
     bool transform_skip;
     bool cabac_init_flag;
+    /*
+     * P slices with real inter coding (hevc-enc-inter.c.inc), for engines
+     * that ask for it: CUs skipped or merged from the merge list, or coded
+     * with a motion vector (AMVP) and a residual, or intra DC; what the
+     * library's SPS / PPS / slice headers say: scaling_list_enabled_flag
+     * with the default lists, slice_temporal_mvp_enabled_flag,
+     * max_transform_hierarchy_depth_inter, MaxNumMergeCand (0: 5),
+     * sign_data_hiding_enabled_flag; cu_qp: the CUs' QP (0: the slice's,
+     * at most HEVC_QP_MAX for I pictures)
+     */
+    bool inter;
+    bool scaling_list;
+    bool tmvp;
+    int trafo_depth_inter;
+    int max_merge_cand;
+    bool sign_hiding;
+    int cu_qp;
+    /* every CU of a P slice skipped (merge candidate 0): the least a
+     * picture can take, for a stream buffer with no more room */
+    bool all_skip;
 } HevcEncParams;
 
 /* XM535 / XM533's library: CTB 16, no SAO; XM530V200's: CTB 32, SAO */
@@ -47,6 +67,9 @@ extern const HevcEncParams hevc_params_ctb32_sao;
 typedef struct HevcEncRef HevcEncRef;
 HevcEncRef *hevc_enc_ref_new(void);
 void hevc_enc_ref_free(HevcEncRef *r);
+/* its planes (w x h luma, w/2 x h/2 chroma), NULL before it holds one */
+void hevc_enc_ref_planes(const HevcEncRef *r, const uint8_t **y,
+                         const uint8_t **cb, const uint8_t **cr);
 
 /*
  * slice_segment_data() of one picture of w x h (each a multiple of 8) from
