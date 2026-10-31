@@ -135,6 +135,17 @@ cp qemu/hw/misc/sstar-cmdq.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
 cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
 cp qemu/hw/net/atbm-sdio.c          "$QEMU_DIR/hw/net/"
+# the WPA2-PSK authenticator both AltoBeam models share (atbm-sdio.c for
+# Ingenic, atbm-wifi.c for Xiongmai)
+cp qemu/hw/net/atbm-wpa.c qemu/hw/net/atbm-wpa.h "$QEMU_DIR/hw/net/"
+for cfg in INGENIC XIONGMAI; do
+    if ! grep -q "CONFIG_$cfg', if_true: files('atbm-wpa.c')" \
+            "$QEMU_DIR/hw/net/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_$cfg', if_true: files('atbm-wpa.c'))" \
+            >> "$QEMU_DIR/hw/net/meson.build"
+        echo "  hw/net/meson.build: added atbm-wpa.c for $cfg"
+    fi
+done
 if ! grep -q "atbm-sdio" "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('atbm-sdio.c'))" \
         >> "$QEMU_DIR/hw/net/meson.build"

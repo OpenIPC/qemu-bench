@@ -35,9 +35,8 @@
 #include "hw/sd/sd.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
-#include "crypto/aes.h"
-#include "qemu/guest-random.h"
 #include "qom/object.h"
+#include "atbm-wpa.h"
 
 #define TYPE_ATBM_SDIO "atbm-sdio"
 OBJECT_DECLARE_TYPE(AtbmSdioState, AtbmSdioClass, ATBM_SDIO)
@@ -142,15 +141,7 @@ struct AtbmSdioState {
 
     /* WPA2-PSK (with "psk"): the access point's authenticator */
     char *psk;
-    uint8_t pmk[32];
-    uint8_t anonce[32], snonce[32];
-    uint8_t ptk[48];            /* KCK 0..15, KEK 16..31, TK 32..47 */
-    uint8_t gtk[16];
-    uint64_t replay;            /* the EAPOL-Key replay counter */
-    uint8_t rsn_state, rsn_tries;
-    uint64_t pn_unicast, pn_group;
-    bool ptk_installed, gtk_installed;
-    QEMUTimer *eapol_timer;
+    AtbmWpa wpa;
     bool trace;
 };
 
@@ -342,387 +333,28 @@ static size_t ap_rates(uint8_t *f)
     return sizeof(r);
 }
 
-/*
- * WPA2-PSK.  With "psk" the access point advertises RSN (WPA2-PSK, CCMP
- * pairwise and group) and runs the authenticator's side of the 4-way
- * handshake and the group key (IEEE 802.11-2016 12.7): PMK = PBKDF2-
- * HMAC-SHA1(passphrase, SSID, 4096, 256 bits); PTK = PRF-384(PMK,
- * "Pairwise key expansion", min/max of the two addresses and the two
- * nonces); EAPOL-Key frames with descriptor version 2 (HMAC-SHA1-128
- * MICs keyed by the KCK, the GTK wrapped with AES key wrap under the
- * KEK).  A message 2 whose MIC fails -- a wrong passphrase -- is dropped;
- * after a few unanswered retries the station is deauthenticated.
- *
- * Data protection is the chip's job: the atbm driver installs the
- * keys with WSM_ADD_KEY and sends plaintext (its mac80211's own CCMP is
- * compiled out), so the "firmware" here checks that the installed keys
- * are the handshake's, strips the CCMP header and MIC space protected
- * frames carry, and hands the driver frames flagged AES-decrypted with a
- * CCMP header whose PN rises.
- */
-enum { RSN_NONE, RSN_M1, RSN_M3, RSN_DONE };
-
-#define KEYINFO_VER2        2
-#define KEYINFO_PAIRWISE    (1u << 3)
-#define KEYINFO_INSTALL     (1u << 6)
-#define KEYINFO_ACK         (1u << 7)
-#define KEYINFO_MIC         (1u << 8)
-#define KEYINFO_SECURE      (1u << 9)
-#define KEYINFO_ENC_DATA    (1u << 12)
-
-#define EAPOL_KEY_BODY      95      /* the EAPOL-Key fields before key data */
-#define WSM_RX_AES          3
-#define WSM_RX_GROUP_KEY    (1u << 19)
-#define WSM_ADD_KEY         0x000C
-#define WSM_KEY_AES_GROUP       4
-#define WSM_KEY_AES_PAIRWISE    5
-
-/* RSN IE: version 1, CCMP group, one CCMP pairwise, one PSK AKM */
-static const uint8_t rsn_ie[] = {
-    0x30, 20, 1, 0,
-    0x00, 0x0f, 0xac, 4,
-    1, 0, 0x00, 0x0f, 0xac, 4,
-    1, 0, 0x00, 0x0f, 0xac, 2,
-    0, 0,
-};
-
-static uint16_t ap_capability(AtbmSdioState *s)
+/* WPA2-PSK (atbm-wpa.c): the authenticator's frames to the station */
+static void wpa_rx(void *opaque, const uint8_t *f, size_t n)
 {
-    return 0x0401 | (s->psk ? 0x0010 : 0);      /* ESS, short slot, privacy */
+    AtbmSdioState *s = opaque;
+
+    atbm_rx(s, f, n, 0, s->sta_if);
 }
 
-static void hmac_sha1(const uint8_t *key, size_t klen,
-                      const uint8_t *a, size_t alen,
-                      const uint8_t *b, size_t blen, uint8_t out[20])
+static void wpa_deauth(void *opaque, uint16_t reason)
 {
-    GHmac *h = g_hmac_new(G_CHECKSUM_SHA1, key, klen);
-    gsize n = 20;
-
-    g_hmac_update(h, a, alen);
-    if (blen) {
-        g_hmac_update(h, b, blen);
-    }
-    g_hmac_get_digest(h, out, &n);
-    g_hmac_unref(h);
-}
-
-/* PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096 iterations, 32 bytes) */
-static void rsn_pmk(const char *pass, const char *ssid, uint8_t pmk[32])
-{
-    const size_t plen = strlen(pass), slen = MIN(strlen(ssid), 32);
-
-    for (int blk = 1; blk <= 2; blk++) {
-        uint8_t idx[4] = { 0, 0, 0, blk }, u[20], t[20];
-
-        hmac_sha1((const uint8_t *)pass, plen, (const uint8_t *)ssid, slen,
-                  idx, 4, u);
-        memcpy(t, u, 20);
-        for (int i = 1; i < 4096; i++) {
-            hmac_sha1((const uint8_t *)pass, plen, u, 20, NULL, 0, u);
-            for (int j = 0; j < 20; j++) {
-                t[j] ^= u[j];
-            }
-        }
-        memcpy(pmk + 20 * (blk - 1), t, blk == 1 ? 20 : 12);
-    }
-}
-
-/* PRF-n (12.7.1.2): HMAC-SHA1(K, label || 0 || data || i), i = 0, 1, ... */
-static void rsn_prf(const uint8_t *key, size_t klen, const char *label,
-                    const uint8_t *data, size_t dlen,
-                    uint8_t *out, size_t olen)
-{
-    const size_t llen = strlen(label);
-    g_autofree uint8_t *a = g_malloc(llen + 1 + dlen + 1);
-
-    memcpy(a, label, llen);
-    a[llen] = 0;
-    memcpy(a + llen + 1, data, dlen);
-    for (size_t i = 0, done = 0; done < olen; i++) {
-        uint8_t h[20];
-
-        a[llen + 1 + dlen] = i;
-        hmac_sha1(key, klen, a, llen + 2 + dlen, NULL, 0, h);
-        memcpy(out + done, h, MIN(20, olen - done));
-        done += 20;
-    }
-}
-
-/* AES key wrap (RFC 3394) of n bytes (a multiple of 8) into n + 8 */
-static void rsn_aes_wrap(const uint8_t kek[16], const uint8_t *in, size_t n,
-                         uint8_t *out)
-{
-    AES_KEY k;
-    uint8_t b[16];
-    const size_t blocks = n / 8;
-
-    AES_set_encrypt_key(kek, 128, &k);
-    memset(out, 0xa6, 8);
-    memcpy(out + 8, in, n);
-    for (int j = 0; j < 6; j++) {
-        for (size_t i = 1; i <= blocks; i++) {
-            uint64_t t = blocks * j + i;
-
-            memcpy(b, out, 8);
-            memcpy(b + 8, out + 8 * i, 8);
-            AES_encrypt(b, b, &k);
-            for (int x = 0; x < 8; x++) {
-                b[7 - x] ^= t >> (8 * x);
-            }
-            memcpy(out, b, 8);
-            memcpy(out + 8 * i, b + 8, 8);
-        }
-    }
-}
-
-/* known-answer tests (IEEE 802.11-2016 J.4.2 PSK and J.3 PRF, RFC 3394
- * 4.1 key wrap), for the "selftest" property a qtest reads */
-static bool rsn_selftest(void)
-{
-    static const uint8_t pmk_kat[32] = {
-        0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef,
-        0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,
-        0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2,
-        0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,
-    };
-    static const uint8_t prf_kat[16] = {
-        0xbc, 0xd4, 0xc6, 0x50, 0xb3, 0x0b, 0x96, 0x84,
-        0x95, 0x18, 0x29, 0xe0, 0xd7, 0x5f, 0x9d, 0x54,
-    };
-    static const uint8_t kek[16] = {
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    };
-    static const uint8_t plain[16] = {
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    static const uint8_t wrap_kat[24] = {
-        0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47,
-        0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a, 0x7b, 0x82,
-        0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
-    };
-    uint8_t key[20], out[64], pmk[32], wrapped[24];
-
-    rsn_pmk("password", "IEEE", pmk);
-    memset(key, 0x0b, sizeof(key));
-    rsn_prf(key, sizeof(key), "prefix", (const uint8_t *)"Hi There", 8,
-            out, 64);
-    rsn_aes_wrap(kek, plain, 16, wrapped);
-    return !memcmp(pmk, pmk_kat, 32) && !memcmp(out, prf_kat, 16) &&
-           !memcmp(wrapped, wrap_kat, 24);
-}
-
-static void rsn_derive_ptk(AtbmSdioState *s)
-{
-    uint8_t d[6 + 6 + 32 + 32];
-    const uint8_t *aa = s->bssid, *spa = s->sta;
-    const bool a_first = memcmp(aa, spa, 6) < 0;
-    const bool an_first = memcmp(s->anonce, s->snonce, 32) < 0;
-
-    memcpy(d, a_first ? aa : spa, 6);
-    memcpy(d + 6, a_first ? spa : aa, 6);
-    memcpy(d + 12, an_first ? s->anonce : s->snonce, 32);
-    memcpy(d + 44, an_first ? s->snonce : s->anonce, 32);
-    rsn_prf(s->pmk, 32, "Pairwise key expansion", d, sizeof(d),
-            s->ptk, sizeof(s->ptk));
-}
-
-static void ap_rx_eapol(AtbmSdioState *s, const uint8_t *e, size_t elen);
-
-/* an EAPOL-Key frame to the station, its MIC under the KCK if asked */
-static void rsn_send_key(AtbmSdioState *s, uint16_t info, const uint8_t *kd,
-                         size_t kdlen)
-{
-    uint8_t f[24 + 8 + 4 + EAPOL_KEY_BODY + 128];
-    uint8_t *e = f + 24 + 8, *k = e + 4;
-    const size_t elen = 4 + EAPOL_KEY_BODY + kdlen;
-
-    memset(f, 0, sizeof(f));
-    f[0] = FC_DATA;
-    f[1] = 0x02;                /* FromDS */
-    memcpy(f + 4, s->sta, 6);
-    memcpy(f + 10, s->bssid, 6);
-    memcpy(f + 16, s->bssid, 6);
-    stw_le_p(f + 22, s->ap_seq++ << 4);
-    memcpy(f + 24, llc_snap, 6);
-    stw_be_p(f + 30, 0x888e);
-    e[0] = 2;                   /* 802.1X-2004 */
-    e[1] = 3;                   /* EAPOL-Key */
-    stw_be_p(e + 2, EAPOL_KEY_BODY + kdlen);
-    k[0] = 2;                   /* RSN key descriptor */
-    stw_be_p(k + 1, info);
-    stw_be_p(k + 3, 16);
-    stq_be_p(k + 5, s->replay);
-    memcpy(k + 13, s->anonce, 32);
-    stw_be_p(k + 93, kdlen);
-    memcpy(k + 95, kd, kdlen);
-    if (info & KEYINFO_MIC) {
-        uint8_t mic[20];
-
-        hmac_sha1(s->ptk, 16, e, elen, NULL, 0, mic);
-        memcpy(k + 77, mic, 16);
-    }
-    atbm_rx(s, f, 24 + 8 + elen, 0, s->sta_if);
-}
-
-static void rsn_send_m1(AtbmSdioState *s)
-{
-    s->replay++;
-    rsn_send_key(s, KEYINFO_VER2 | KEYINFO_PAIRWISE | KEYINFO_ACK, NULL, 0);
-    s->rsn_state = RSN_M1;
-}
-
-static void rsn_send_m3(AtbmSdioState *s)
-{
-    uint8_t kd[64], wrapped[64 + 8];
-    size_t n = 0;
-
-    memcpy(kd, rsn_ie, sizeof(rsn_ie));
-    n += sizeof(rsn_ie);
-    /* GTK KDE: key ID 1 */
-    kd[n++] = 0xdd;
-    kd[n++] = 6 + 16;
-    kd[n++] = 0x00;
-    kd[n++] = 0x0f;
-    kd[n++] = 0xac;
-    kd[n++] = 1;
-    kd[n++] = 1;
-    kd[n++] = 0;
-    memcpy(kd + n, s->gtk, 16);
-    n += 16;
-    if (n % 8) {                /* pad: 0xdd then zeros (12.7.2) */
-        kd[n++] = 0xdd;
-        while (n % 8) {
-            kd[n++] = 0;
-        }
-    }
-    rsn_aes_wrap(s->ptk + 16, kd, n, wrapped);
-    s->replay++;
-    rsn_send_key(s, KEYINFO_VER2 | KEYINFO_PAIRWISE | KEYINFO_INSTALL |
-                 KEYINFO_ACK | KEYINFO_MIC | KEYINFO_SECURE |
-                 KEYINFO_ENC_DATA, wrapped, n + 8);
-    s->rsn_state = RSN_M3;
-}
-
-static void ap_deauth(AtbmSdioState *s, uint16_t reason)
-{
+    AtbmSdioState *s = opaque;
     uint8_t f[32];
     size_t n = ap_hdr(s, f, FC_DEAUTH, s->sta);
 
     stw_le_p(f + n, reason);
     atbm_rx(s, f, n + 2, 0, s->sta_if);
     s->associated = false;
-    s->rsn_state = RSN_NONE;
 }
 
-/* message 1 after association, and the retries of 1 and 3 */
-static void rsn_timer(void *opaque)
+static uint16_t ap_capability(AtbmSdioState *s)
 {
-    AtbmSdioState *s = opaque;
-
-    if (!s->associated || s->rsn_state == RSN_DONE) {
-        return;
-    }
-    if (s->rsn_tries++ >= 4) {
-        if (s->trace) {
-            qemu_log("atbm-sdio: 4-way handshake timeout, deauth\n");
-        }
-        ap_deauth(s, 15);       /* 4-way handshake timeout */
-        return;
-    }
-    if (s->rsn_state == RSN_M3) {
-        rsn_send_m3(s);
-    } else {
-        rsn_send_m1(s);
-    }
-    timer_mod(s->eapol_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
-}
-
-static void rsn_start(AtbmSdioState *s)
-{
-    qemu_guest_getrandom_nofail(s->anonce, sizeof(s->anonce));
-    s->rsn_state = RSN_NONE;
-    s->rsn_tries = 0;
-    s->ptk_installed = s->gtk_installed = false;
-    s->pn_unicast = s->pn_group = 0;
-    timer_mod(s->eapol_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
-}
-
-/* an EAPOL frame from the station (e: the 802.1X header onwards) */
-static void ap_rx_eapol(AtbmSdioState *s, const uint8_t *e, size_t elen)
-{
-    uint8_t mic[20], save[16];
-    g_autofree uint8_t *c = NULL;
-    const uint8_t *k = e + 4;
-    uint16_t info;
-
-    if (!s->psk || elen < 4 + EAPOL_KEY_BODY || e[1] != 3 || k[0] != 2) {
-        return;
-    }
-    elen = MIN(elen, 4 + (size_t)lduw_be_p(e + 2));
-    info = lduw_be_p(k + 1);
-    if (!(info & KEYINFO_MIC) || (info & KEYINFO_ACK) ||
-        ldq_be_p(k + 5) != s->replay) {
-        return;
-    }
-    if (s->rsn_state == RSN_M1 && !(info & KEYINFO_SECURE)) {
-        memcpy(s->snonce, k + 13, 32);
-        rsn_derive_ptk(s);
-    } else if (s->rsn_state != RSN_M3) {
-        return;
-    }
-    /* the MIC over the frame with its MIC field zeroed */
-    c = g_memdup2(e, elen);
-    memcpy(save, k + 77, 16);
-    memset(c + 4 + 77, 0, 16);
-    hmac_sha1(s->ptk, 16, c, elen, NULL, 0, mic);
-    if (memcmp(mic, save, 16)) {
-        if (s->trace) {
-            qemu_log("atbm-sdio: EAPOL message %d MIC mismatch "
-                     "(wrong passphrase?)\n", s->rsn_state == RSN_M1 ? 2 : 4);
-        }
-        return;
-    }
-    if (s->rsn_state == RSN_M1) {
-        if (s->trace) {
-            qemu_log("atbm-sdio: EAPOL message 2 ok, sending 3\n");
-        }
-        s->rsn_tries = 0;
-        rsn_send_m3(s);
-        timer_mod(s->eapol_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
-    } else {
-        if (s->trace) {
-            qemu_log("atbm-sdio: EAPOL message 4 ok, port open\n");
-        }
-        s->rsn_state = RSN_DONE;
-        timer_del(s->eapol_timer);
-    }
-}
-
-/* WSM_ADD_KEY: the driver hands the chip the handshake's keys */
-static void rsn_add_key(AtbmSdioState *s, const uint8_t *b, size_t n)
-{
-    if (n < 4 + 24) {
-        return;
-    }
-    switch (b[0]) {
-    case WSM_KEY_AES_PAIRWISE:
-        s->ptk_installed = !memcmp(b + 12, s->ptk + 32, 16);
-        if (s->trace) {
-            qemu_log("atbm-sdio: pairwise key installed, %s the TK\n",
-                     s->ptk_installed ? "matching" : "NOT matching");
-        }
-        break;
-    case WSM_KEY_AES_GROUP:
-        s->gtk_installed = !memcmp(b + 4, s->gtk, 16);
-        if (s->trace) {
-            qemu_log("atbm-sdio: group key installed, %s the GTK\n",
-                     s->gtk_installed ? "matching" : "NOT matching");
-        }
-        break;
-    }
+    return 0x0401 | atbm_wpa_capability(&s->wpa);  /* ESS, short slot */
 }
 
 static void ap_beacon(AtbmSdioState *s, const uint8_t *da, uint8_t if_id)
@@ -746,10 +378,7 @@ static void ap_beacon(AtbmSdioState *s, const uint8_t *da, uint8_t if_id)
     f[n++] = 0x2a;
     f[n++] = 1;
     f[n++] = 0;
-    if (s->psk) {
-        memcpy(f + n, rsn_ie, sizeof(rsn_ie));
-        n += sizeof(rsn_ie);
-    }
+    n += atbm_wpa_ie(&s->wpa, f + n);
     if (!da) {
         static const uint8_t tim[] = { 5, 4, 0, 1, 0, 0 };
 
@@ -789,9 +418,7 @@ static void ap_assoc(AtbmSdioState *s, const uint8_t *sta, bool re,
                  sta[0], sta[1], sta[2], sta[3], sta[4], sta[5]);
     }
     atbm_rx(s, f, n, 0, if_id);
-    if (s->psk) {
-        rsn_start(s);
-    }
+    atbm_wpa_associated(&s->wpa, s->bssid, sta);
 }
 
 static void atbm_scan_done(void *opaque)
@@ -809,32 +436,12 @@ static void ap_data_from_sta(AtbmSdioState *s, const uint8_t *f, size_t n)
 {
     const size_t hl = (f[0] == FC_QOS_DATA) ? 26 : 24;
     uint8_t eth[2048];
-    size_t p = hl, end = n;
+    size_t p, end;
 
-    if (!s->associated || !(f[1] & 1)) {
-        return;
-    }
-    if (f[1] & 0x40) {
-        /*
-         * Protected: with the key in the chip the driver leaves room for
-         * the CCMP header (8) and MIC (8) around a plaintext body
-         */
-        if (!s->psk || s->rsn_state != RSN_DONE || n < hl + 16) {
-            return;
-        }
-        p += 8;
-        end -= 8;
-    }
-    if (end < p + 8 || memcmp(f + p, llc_snap, 6) ||
+    if (!s->associated || !(f[1] & 1) ||
+        atbm_wpa_from_sta(&s->wpa, f, n, hl, &p, &end) != ATBM_WPA_PASS ||
         end - p - 6 + 12 > sizeof(eth)) {
         return;
-    }
-    if (lduw_be_p(f + p + 6) == 0x888e) {
-        ap_rx_eapol(s, f + p + 8, end - p - 8);
-        return;
-    }
-    if (s->psk && s->rsn_state != RSN_DONE) {
-        return;                 /* the port is closed until message 4 */
     }
     memcpy(eth, f + 16, 6);
     memcpy(eth + 6, f + 10, 6);
@@ -867,8 +474,7 @@ static void ap_tx(AtbmSdioState *s, const uint8_t *f, size_t n, uint8_t if_id)
     case FC_DEAUTH:
     case FC_DISASSOC:
         s->associated = false;
-        s->rsn_state = RSN_NONE;
-        timer_del(s->eapol_timer);
+        atbm_wpa_reset(&s->wpa);
         break;
     case FC_DATA:
     case FC_QOS_DATA:
@@ -889,14 +495,13 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
     uint8_t f[24 + 8 + 6 + 2 + 2048 + 8];
     const bool group = buf[0] & 1;
     uint32_t flags = group ? 1u << 9 : 0;
-    size_t n = 24;
+    size_t n = 24, mic;
 
     if (size < 14) {
         return size;
     }
     if (!s->associated || 24 + 8 + 8 + size - 12 + 8 > sizeof(f) ||
-        (!group && memcmp(buf, s->sta, 6)) ||
-        (s->psk && s->rsn_state != RSN_DONE)) {
+        (!group && memcmp(buf, s->sta, 6)) || !atbm_wpa_port_open(&s->wpa)) {
         return size;
     }
     memset(f, 0, 24);
@@ -906,31 +511,17 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
     memcpy(f + 10, s->bssid, 6);
     memcpy(f + 16, buf + 6, 6);
     stw_le_p(f + 22, s->ap_seq++ << 4);
-    if (s->psk) {
-        /*
-         * "Decrypted by the chip": Protected, a CCMP header (ExtIV, key
-         * 0 pairwise / 1 group, a rising PN that mac80211's replay check
-         * accepts) and 8 bytes of MIC, which the driver strips
-         */
-        const uint64_t pn = group ? ++s->pn_group : ++s->pn_unicast;
-
-        f[1] |= 0x40;
-        f[n++] = pn;
-        f[n++] = pn >> 8;
-        f[n++] = 0;
-        f[n++] = 0x20 | (group ? 1 << 6 : 0);
-        f[n++] = pn >> 16;
-        f[n++] = pn >> 24;
-        f[n++] = pn >> 32;
-        f[n++] = pn >> 40;
-        flags |= WSM_RX_AES | (group ? WSM_RX_GROUP_KEY : 0);
+    mic = atbm_wpa_to_sta(&s->wpa, group, f + n, &flags);
+    if (mic) {
+        f[1] |= 0x40;           /* Protected */
+        n += mic;
     }
     memcpy(f + n, llc_snap, 6);
     memcpy(f + n + 6, buf + 12, size - 12);
     n += 6 + size - 12;
-    if (s->psk) {
-        memset(f + n, 0, 8);
-        n += 8;
+    if (mic) {
+        memset(f + n, 0, ATBM_WPA_CCMP_MIC);
+        n += ATBM_WPA_CCMP_MIC;
     }
     atbm_rx(s, f, n, flags, 0);
     return size;
@@ -994,7 +585,7 @@ static void atbm_wsm_out(AtbmSdioState *s, const uint8_t *d, size_t n)
         }
         break;
     case WSM_ADD_KEY:
-        rsn_add_key(s, d + 4, len - 4);
+        atbm_wpa_add_key(&s->wpa, d + 4, len - 4);
         atbm_confirm(s, cmd, NULL, 0);
         break;
     case WSM_START_SCAN:
@@ -1360,22 +951,13 @@ static void atbm_sdio_realize(DeviceState *dev, Error **errp)
     QSIMPLEQ_INIT(&s->rxq);
     s->start_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, atbm_startup, s);
     s->scan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, atbm_scan_done, s);
-    s->eapol_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, rsn_timer, s);
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     memcpy(s->bssid, s->conf.macaddr.a, 6);
     s->bssid[0] = 0x02;
     s->bssid[5] ^= 0x80;
-    if (s->psk && !*s->psk) {
-        g_free(s->psk);
-        s->psk = NULL;
-    }
-    if (s->psk) {
-        if (strlen(s->psk) < 8 || strlen(s->psk) > 63) {
-            error_setg(errp, "atbm-sdio: psk must be 8..63 characters");
-            return;
-        }
-        rsn_pmk(s->psk, s->ssid, s->pmk);
-        qemu_guest_getrandom_nofail(s->gtk, sizeof(s->gtk));
+    if (!atbm_wpa_init(&s->wpa, s->psk, s->ssid, "atbm-sdio", s->trace, s,
+                       wpa_rx, wpa_deauth, &s->ap_seq, errp)) {
+        return;
     }
     s->nic = qemu_new_nic(&atbm_net_info, &s->conf,
                           object_get_typename(OBJECT(s)),
@@ -1400,8 +982,7 @@ static void atbm_sdio_reset(DeviceState *dev)
 
     timer_del(s->start_timer);
     timer_del(s->scan_timer);
-    timer_del(s->eapol_timer);
-    s->rsn_state = RSN_NONE;
+    atbm_wpa_reset(&s->wpa);
     atbm_flush(s);
     g_hash_table_remove_all(s->mem);
     s->state = ATBM_IDLE;
@@ -1423,7 +1004,7 @@ static void atbm_sdio_unrealize(DeviceState *dev)
 
     timer_free(s->start_timer);
     timer_free(s->scan_timer);
-    timer_free(s->eapol_timer);
+    atbm_wpa_free(&s->wpa);
     qemu_del_nic(s->nic);
     atbm_flush(s);
     g_hash_table_destroy(s->mem);
@@ -1457,7 +1038,7 @@ static const Property atbm_sdio_props[] = {
 
 static bool atbm_get_selftest(Object *obj, Error **errp)
 {
-    return rsn_selftest();
+    return atbm_wpa_selftest();
 }
 
 static void atbm_sdio_class_init(ObjectClass *klass, const void *data)
