@@ -124,6 +124,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicMachineState, INGENIC_MACHINE)
 #define IVDC_STORE_SIZE 0x02000000
 #define IVDC_BASE       0x13200000  /* T41: the IVDC's registers */
 #define IRQ_IVDC_T41    13          /* core INTC; "isp-ivdc" in tx-isp */
+#define IRQ_IVDC_T23    38          /* tx-isp-t23.ko's ivdc resource: 46 */
 #define ORAM_SIZE       0x100000
 #define NNDMA_BASE      0x12500000  /* T40, T41: the NNA's DMA */
 #define IO_BASE         0x10000000
@@ -1029,11 +1030,12 @@ static void ingenic_init(MachineState *ms)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NNDMA_BASE);
     }
-    if (info->soc == INGENIC_T41) {
+    if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
         /*
          * IVDC (direct_mode): tx-isp queues channel 0 the pair 0x80000000 /
          * 0x81000000, which the scaler writes into the IVDC and the encoder
-         * reads back; RAM there stands in for its store
+         * (T41's AVPU, T23's HELIX) reads back; RAM there stands in for its
+         * store
          */
         MemoryRegion *ivdc = g_new(MemoryRegion, 1);
 
@@ -1280,12 +1282,13 @@ static void ingenic_init(MachineState *ms)
                                                info->irq_isp : IRQ_ISP));
         sysbus_connect_irq(sbd, 1, ingenic_irq(ims, info->irq_vic ?
                                                info->irq_vic : IRQ_VIC));
-        if (info->soc == INGENIC_T41) {
+        if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
             /*
-             * the IVDC's registers (its store is RAM, above), core INTC
-             * source 13 (IRQ_IVDC: tx-isp's "isp-ivdc"; the device tree's
-             * node names 0, which is jpeg0's); the ISP tells it of each
-             * picture it writes into the store
+             * the IVDC's registers (its store is RAM, above): T41's core
+             * INTC source 13 (IRQ_IVDC: tx-isp's "isp-ivdc"; the device
+             * tree's node names 0, which is jpeg0's), T23's INTC 38
+             * (tx-isp-t23.ko's tx_isp_ivdc_resource: Linux IRQ 46); the ISP
+             * tells it of each picture it writes into the store
              */
             DeviceState *ivdc = qdev_new("ingenic-ivdc");
 
@@ -1293,7 +1296,8 @@ static void ingenic_init(MachineState *ms)
             sysbus_realize_and_unref(SYS_BUS_DEVICE(ivdc), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(ivdc), 0, IVDC_BASE);
             sysbus_connect_irq(SYS_BUS_DEVICE(ivdc), 0,
-                               ingenic_irq(ims, IRQ_IVDC_T41));
+                               ingenic_irq(ims, info->soc == INGENIC_T41 ?
+                                           IRQ_IVDC_T41 : IRQ_IVDC_T23));
             qdev_connect_gpio_out_named(dev, "ivdc-frame", 0,
                                         qdev_get_gpio_in_named(ivdc,
                                                                "frame", 0));

@@ -92,8 +92,8 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
 | 0x12600000 | XBurst2 ORAM, the NNA's memory (1 MiB; the T41 SPL's core-1 stub at 0x12660000) | RAM |
 | 0x12500000 | T40, T41: NNDMA, the NNA's DMA (descriptor RAM, channels at +0x8000) (`/machine/nndma`) | `ingenic-nndma` |
-| 0x80000000 | T41: the IVDC's frame store as `direct_mode` addresses it (32 MiB) | RAM |
-| 0x13200000 | T41: the IVDC's registers, core INTC 13 | `ingenic-ivdc` |
+| 0x80000000 | T41, T23: the IVDC's frame store as `direct_mode` addresses it (32 MiB) | RAM |
+| 0x13200000 | T41, T23: the IVDC's registers, core INTC 13 (T23: INTC 38) | `ingenic-ivdc` |
 | 0x1F000000 | cache-as-RAM window (32 KiB) | RAM |
 | 0x1FC00000 | boot ROM (the reset vector, 0xBFC00000) | ROM |
 
@@ -1095,8 +1095,8 @@ frame it paints a test picture into the buffers the driver queued.
   `/proc/jz/isp/isp-w02` prints and libimp's "video drop" watchdog reads.
 - CSI host and D-PHY: storage (the driver only writes them and reads
   ERR1/ERR2 as 0). T21 has none; it is DVP only. T23's IVDC (the direct
-  ISP-to-encoder path at 0x13200000) is used only with the module's
-  `direct_mode`, off by default, and is left unmodelled.
+  ISP-to-encoder path at 0x13200000, INTC 38) is used only with the
+  module's `direct_mode`, off by default: see below.
 - `ingenic-cpm`: before resetting the ISP the driver sets SRBC (0xC4)
   bit 21 and waits a second for bit 20, which now follows it.
 
@@ -1548,6 +1548,23 @@ decodes with the scene, and the IVDC counters read 102 ISP frame starts
 and dones and no errors by the time of the check. The core's 0x204 bit 0 follows 0x200
 bit 0: `ispcore_video_s_stream` and `ispcore_suspend_module` set the one
 and spin on the other without a timeout.
+
+T23's IVDC (`tx-isp-t23.ko`'s `tx-isp-ivdc.c`, the same driver; its
+resource 0x13200000-0x1320FFFF, Linux IRQ 46 = INTC 38) works the same
+way with two differences in the ISP core's ISR (T23 SDK build 0x65cf8):
+the frame source gets its "buffer done" with the pair at frame start
+(int_sta 0x1000; 0x2000 with `ivdc_vb_type` 1), and channel 0's done bit
+still pops the done FIFO -- only to push each popped pair straight back
+into the queue. So the scaler paints the pair into the store (RAM at
+0x80000000 on T23 too), pushes it to the done FIFO as for any buffer and
+raises the IVDC's frame start and done; HELIX reads the store at its
+full address. `ivdc_core_ops_init` sets ISP 0xD060 and the top three
+bits of 0x1C and resets the block through 0x00, all as on T41; the ISR
+only counts. `test-ingenic-t23-enc.sh --direct 1` (OpenIPC's T23 kernel,
+its own `tx-isp-t23.ko` H20240204a with `direct_mode=1` and its libimp):
+the main stream's encoder channel set `bEnableIvdc`, HELIX encodes from
+0x80000000 / 0x81000000, both streams decode with the scene, and
+`/proc/jz/isp/isp-ivdc` counts ISP frames done (about 100).
 
 T30 couples the same Apical core with a T31-style MSCA scaler of its own
 (0x130B0000, IRQ 27), which `ingenic-isp`'s "t30" layout models, and

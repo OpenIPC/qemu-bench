@@ -1,10 +1,12 @@
 /*
- * Ingenic IVDC: T41's direct ISP-to-encoder buffer at 0x13200000.
+ * Ingenic IVDC: T41's and T23's direct ISP-to-encoder buffer at
+ * 0x13200000.
  *
  * In direct_mode the ISP's channel 0 writes into the IVDC's store and
- * the AVPU reads it from there (ingenic-isp.c, ingenic-avpu.c); this is
- * the block's own register file, as tx-isp-t41.ko's IVDC driver
- * (tx-isp-ivdc.c, inside the ISP module) uses it:
+ * the encoder (T41's AVPU, T23's HELIX) reads it from there
+ * (ingenic-isp.c, ingenic-avpu.c, ingenic-vpu.c); this is the block's own
+ * register file, as the IVDC driver inside tx-isp-t41.ko and
+ * tx-isp-t23.ko (tx-isp-ivdc.c, the same on both) uses it:
  *
  *   0x00         bit 0 resets the block: the driver writes 1 and spins
  *                (rewriting 0x70 / 0x88) until it reads back 0, which it
@@ -25,9 +27,9 @@
  *                (cleared by writing 0)
  *   others       storage
  *
- * The interrupt (core INTC source 13, IRQ_IVDC: tx-isp requests it as
- * "isp-ivdc"; the device tree's node names 0, jpeg0's line) is high while
- * an enabled status bit is set.  The ISP raises frame start and
+ * The interrupt (T41's core INTC source 13, IRQ_IVDC: tx-isp requests it
+ * as "isp-ivdc"; the device tree's node names 0, jpeg0's line; T23's INTC
+ * 38) is high while an enabled status bit is set.  The ISP raises frame start and
  * frame done for each picture it writes into the store (the "frame" GPIO
  * input); nothing here overflows, so the error bits stay clear.  The
  * driver counts the bits; at frame done it moves its state to 2 (running)
