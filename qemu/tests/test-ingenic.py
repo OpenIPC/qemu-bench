@@ -1106,6 +1106,57 @@ def ssi_setup(qt, base, cr0_extra=0):
     qt.writel(base + 0x04, (1 << 15) | (1 << 7) | 0x6 | cr0_extra)
 
 
+def test_uart_dma(qt):
+    """jz_uart.c's DMA mode: 32-byte bursts at the trigger level, the
+    tail for the receive timeout (IER bit 4 alone), on UART2 looped back"""
+    print('UART DMA (T31 UART2, loopback)')
+    U = 0x10032000
+    rb = lambda r: int(qt.cmd('readb 0x%x' % (U + 4 * r)).split()[1], 16)
+    wb = lambda r, v: qt.cmd('writeb 0x%x 0x%x' % (U + 4 * r, v))
+    wb(3, 0x80)
+    wb(0, 1)                                    # DLL: 1.5 Mbaud
+    wb(1, 0)
+    wb(3, 0x03)                                 # 8N1
+    wb(4, 0x10)                                 # MCR: loopback
+    wb(2, 0x8F)                                 # FE, both resets, DMS, 32
+    wb(1, 0x10)                                 # IER: the RX timeout only
+    check('IER keeps bit 4 (RTOIE)', rb(1), 0x10)
+    qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
+    data = bytes((i * 37 + 5) & 0xff for i in range(72))
+    tx, rx = SCRATCH + 0xA000, SCRATCH + 0xB000
+    qt.write(tx, data)
+    qt.write(rx, bytes(72))
+    # RX: RBR -> memory, 8-bit ports, 32-byte units, two of them
+    c = PDMA + 0x20 * 5
+    qt.writel(c + 0x00, U)
+    qt.writel(c + 0x04, rx)
+    qt.writel(c + 0x08, 2)
+    qt.writel(c + 0x0C, 0x11)                   # UART2 RX
+    qt.writel(c + 0x14, (1 << 22) | (1 << 14) | (1 << 12) | (4 << 8) | 2)
+    qt.writel(c + 0x10, (1 << 31) | 1)
+    # TX: memory -> THR, byte units
+    c = PDMA + 0x20 * 4
+    qt.writel(c + 0x00, tx)
+    qt.writel(c + 0x04, U)
+    qt.writel(c + 0x08, len(data))
+    qt.writel(c + 0x0C, 0x10)                   # UART2 TX
+    qt.writel(c + 0x14, (1 << 23) | (1 << 14) | (1 << 12) | (1 << 8) | 2)
+    qt.writel(c + 0x10, (1 << 31) | 1)
+    qt.step(2 * 1000 * 1000)                    # 72 characters and then some
+    check('TX: all 72 bytes went out, the channel done',
+          (qt.readl(PDMA + 0x80 + 0x08), qt.readl(PDMA + 0x80 + 0x10) & 8),
+          (0, 8))
+    check('RX: two 32-byte bursts by DMA',
+          (qt.read(rx, 64), qt.readl(PDMA + 0xA0 + 0x08)), (data[:64], 0))
+    check('both channels interrupted', qt.readl(PDMA + 0x1004) & 0x30, 0x30)
+    check('the 8-byte tail is left for the timeout interrupt: CTI',
+          (rb(5) & 1, rb(2) & 0x0F), (1, 0x0C))
+    check('PIO reads take the tail', bytes(rb(0) for _ in range(8)),
+          data[64:])
+    check('the FIFO empty again', rb(5) & 1, 0)
+    qt.writel(PDMA + 0x1004, 0)
+
+
 def test_ssi(qt, intc=INTC):
     print('ingenic-ssi')
     sr = lambda b: qt.readl(b + 0x0C)
@@ -2654,6 +2705,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't31', ['-device', 'w25q80,bus=ssi0,cs=0'])
         test_ssi(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31')
+        test_uart_dma(qt)
         qt.close()
         qt = QTest(a.qemu, 't41', ['-device', 'w25q80,bus=ssi0,cs=0'])
         test_ssi(qt, CORE_INTC)

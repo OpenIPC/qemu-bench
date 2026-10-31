@@ -46,7 +46,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
 | 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
-| 0x10030000 + 0x1000 n | UART0..3, 16550 with a 4-byte stride, paced at the line rate, 64-byte TX FIFO | QEMU `serial-mm` (patch 0021) |
+| 0x10030000 + 0x1000 n | UART0..3, 16550 with a 4-byte stride, paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0022) |
 | 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c) | `ingenic-i2c` |
 | 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
 | 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
@@ -832,7 +832,14 @@ transfers.
   type 8 (AUTO) is a memory copy done at once; the others wait on the
   peripheral's request line for every access to it: the AIC's 6 (play),
   7 (record) and 5 (loop record, the echo canceller's reference), the
-  DMIC's 13.
+  DMIC's 13, the UARTs' 0x14 - 2 n (TX) / 0x15 - 2 n (RX), the SSIs' and
+  the DES's (below). The bus decodes 29 address bits: an address 0x20000000
+  high still reaches DDR -- `jz_uart.c` maps its uncached (KSEG1) receive
+  buffers through virt_to_phys, as T41's SFC driver does its descriptors.
+  Of the request types the drivers' tables list, the MSC moves its data by
+  its own descriptor DMA (`jzmmc_v12.c`'s SDMA, above), no driver gives
+  the I2C (`i2c-v12-jz.c` only prints DMACR / DMATDLR / DMARDLR), the SADC
+  or the SSI slave a channel, and there is no PCM driver.
 - `ingenic-aic`: AICFR (ENB, RST), AICCR (EREC/ERPL, the flushes, M2S,
   MONOCTR, TDMS/RDMS, ISS/OSS, TLDMS/ETFL, CHANNEL, PACK16), AICSR (levels,
   TUR/ROR), AICDR and AICLR over the hardware's FIFOs (64 to play, 32 to
@@ -937,6 +944,28 @@ T40 boots passed paced, one went quiet after its application started.
 The cost is the real rate, some 11.5 KB a second: an OpenIPC boot takes
 about 2 s longer, a 420 KB console flood 41 s instead of 6, and the test
 harnesses wait for the console to drain before they power off.
+
+Bytes come in at the line rate too (patch 0022, with `paced`): one a
+character time. The UARTs have the jz47xx's 64-byte receive FIFO, whose
+FCR trigger levels are 1, 16, 32 and 60, and IER bit 4 (RTOIE) enables
+the receive timeout interrupt by itself. And they request the PDMA in
+FCR's DMA mode (DMS): TX while the transmit FIFO has room, RX once the
+receive FIFO reaches its trigger level, held for that many bytes -- one
+request, one burst -- so a shorter tail stays for the timeout interrupt.
+That is what `jz_uart.c` does with `CONFIG_SERIAL_JZ47XX_UARTn_DMA`
+(trigger 32, 32-byte PDMA units into two 1 KiB buffers, IER 0x14: the
+timeout and line status, no RDI; the tail by the timeout interrupt, the
+residue and PIO). No shipped config sets it; with it, on a T31 kernel
+built so (`test-ingenic-uart-dma.sh`), 32 KiB come in on UART0 and go
+back out intact. Two of the driver's own faults show there: T31's PDMA
+table (`jzdma_pdata`) has channels for UART0 and UART1 only, so with
+UART2_DMA the driver dereferences a channel it never got; and its
+shutdown frees the receive buffer's pages wrongly ("Bad page state" at
+close), so the test keeps the port open throughout. Without paced input
+the host's bytes all arrived at once and the driver lost data in the
+window between reading a channel's residue and stopping it; at the line
+rate a burst takes 2.8 ms to fill and the window is as narrow as on
+silicon.
 
 ### The image pipeline: `sensor=` and `ingenic-isp`
 
@@ -1434,6 +1463,7 @@ teardown, so the verdict comes first.
 | T40N SDK image, its kernel's `ingenic_bscaler` + magik-toolkit nna1 `libvenus.a` (its BSCALER objects) | `t40` | flash, `test-ingenic-bscaler.sh --image` | the library's own bs_* calls: BGRA 64x32 -> 32x16 and a many-tile 32x16 -> 160x80 within 0.7 of the ramps at half-pixel positions, NV12 256x128 -> 128x64 (both planes) within 0.7, NV12 -> BGRA / RGBA / ARGB resizes and the T unit's NV12 -> BGRA / RGBA matching BT.601 exactly, affine and projective perspective warps moving a square where the forward matrix sends it with the pad value outside |
 | T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
 | OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
+| OpenIPC T31 kernel with `CONFIG_SERIAL_JZ47XX_UART0_DMA` + the release's root | `t31`, UART0 on a socket | `-kernel` + NOR root, `test-ingenic-uart-dma.sh --kernel` | 32 KiB of random bytes in on ttyS0 by the PDMA (32 full 1 KiB buffers, 3 of 3 runs) and back out by it, both intact |
 | OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
 
 `python3 qemu/tests/test-ingenic.py` checks the models at register
@@ -1450,8 +1480,10 @@ the DMIC's packed samples on request 13, its FIFO filling without
 DMA and its voice trigger (modes 0 and 2, rearm, silence), the AIC playing at the CPM's 48 kHz speaker clock over the codec's
 16 kHz, and the T31 codec's record gain and switches; the SSI (READ ID from a
 `w25q80` by PIO, the underrun interrupt, 300 frames looped back through
-the PDMA), AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib
-and pow(), and the TCU's PWM pins.
+the PDMA), the UART's DMA mode (two 32-byte bursts by the PDMA, an 8-byte
+tail for the receive timeout with IER bit 4 alone, PIO reads of it),
+AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib and pow(),
+and the TCU's PWM pins.
 
 ## Not modelled
 
@@ -1462,8 +1494,8 @@ share a pipe through VIC MDMA raw caching) and that raw caching (VIC
 +0x300.., `vic_mdma_enable`, also the `snapraw` debug command),
 T40/T41's WDR statistics (bit 11, a WDR mode's), T40's GSM and LCE
 (read otherwise than T41's), the Apical AF and the zone statistics
-beyond AE and AWB, PDMA transfers for peripherals other than the AIC,
-the SSI and the DES, the SSI slave and the HASH engine's CPU mode (no
+beyond AE and AWB, DMA for the I2C, the SADC and the SSI slave (no
+driver programs it; above), the SSI slave and the HASH engine's CPU mode (no
 driver, sample or document in any tree here, so no contract; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2
