@@ -552,6 +552,9 @@ in this order:
 - **Sensors** are I2C/SSI slave models in `qemu/hw/i2c/` and `qemu/hw/ssi/`,
   selected by name in a `strcmp` chain in `hisilicon_common_init()`
   (`imx335`, `imx307`, `f37`, `gc2053`, `sc2315e`, … , or `none`).
+  The Xiongmai machines take a QOM type name instead (`sensor=hisi-imx335`,
+  `sensor=none`) plus `sensor-addr=`; `xm-sensor` is a generic register-file
+  sensor whose ID comes from `-global xm-sensor.regs=` (`docs/xiongmai.md`).
 
 ## Adding a SoC or a device
 

@@ -14,6 +14,8 @@
 #include "qapi/error.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
+#include "qapi/visitor.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/xiongmai.h"
@@ -399,6 +401,9 @@ typedef struct XmMachineState {
     MachineState parent_obj;
     char *flash_file;
     uint32_t sensor_id;         /* 0: the SoC config's */
+    char *sensor;               /* NULL: the SoC's; "none"; or a QOM type */
+    uint32_t sensor_addr;       /* with sensor_addr_set; else the SoC's */
+    bool sensor_addr_set;
 } XmMachineState;
 
 #define XM_MACHINE(obj) ((XmMachineState *)(obj))
@@ -433,21 +438,74 @@ static void xm_machine_set_sensor_id(Object *obj, const char *value,
     XM_MACHINE(obj)->sensor_id = v;
 }
 
+static char *xm_machine_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(XM_MACHINE(obj)->sensor);
+}
 
-/* the board's sensor (and its identical twin, if any) on an I2C bus */
+static void xm_machine_set_sensor(Object *obj, const char *value,
+                                  Error **errp)
+{
+    XmMachineState *s = XM_MACHINE(obj);
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
+}
+
+static void xm_machine_get_sensor_addr(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    visit_type_uint32(v, name, &XM_MACHINE(obj)->sensor_addr, errp);
+}
+
+static void xm_machine_set_sensor_addr(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    uint32_t addr;
+
+    if (!visit_type_uint32(v, name, &addr, errp)) {
+        return;
+    }
+    if (!addr || addr > 0x7f) {
+        /* 0 is the general call: every device on the bus answers it */
+        error_setg(errp, "sensor-addr is a 7-bit I2C address, 1-0x7f");
+        return;
+    }
+    XM_MACHINE(obj)->sensor_addr = addr;
+    XM_MACHINE(obj)->sensor_addr_set = true;
+}
+
+/*
+ * The board's sensor (and its identical twin, if any) on an I2C bus, or the
+ * one sensor= and sensor-addr= name instead.  sensor-id picks the part of
+ * the SoC's own model (hisi-smartsens).
+ */
 static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
                               I2CBus *bus)
 {
+    const char *type = ms->sensor ? ms->sensor : c->sensor_type;
     uint16_t id = ms->sensor_id ? ms->sensor_id : c->sensor_id;
-    const uint8_t addrs[2] = { c->sensor_addr, c->sensor_addr2 };
+    uint8_t addrs[2] = { c->sensor_addr, c->sensor_addr2 };
 
-    if (!c->sensor_type) {
+    if (!type || !strcmp(type, "none")) {
         return;
     }
-    for (int i = 0; i < 2 && addrs[i]; i++) {
-        I2CSlave *sns = i2c_slave_new(c->sensor_type, addrs[i]);
+    if (!object_class_dynamic_cast(object_class_by_name(type),
+                                   TYPE_I2C_SLAVE)) {
+        error_report("sensor=%s: not an I2C device model", type);
+        exit(1);
+    }
+    if (ms->sensor_addr_set) {
+        addrs[0] = ms->sensor_addr;
+        addrs[1] = 0;
+    } else if (ms->sensor) {
+        addrs[1] = 0;           /* the twin is the SoC's own model */
+    }
+    for (int i = 0; i < 2 && (i == 0 || addrs[i]); i++) {
+        I2CSlave *sns = i2c_slave_new(type, addrs[i]);
 
-        if (id) {               /* hisi-smartsens: which SC part */
+        if (id && !ms->sensor) {    /* hisi-smartsens: which SC part */
             qdev_prop_set_uint8(DEVICE(sns), "id_high", id >> 8);
             qdev_prop_set_uint8(DEVICE(sns), "id_low", id & 0xff);
         }
@@ -1043,6 +1101,16 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         object_class_property_set_description(OBJECT_CLASS(mc),      \
             "sensor-id", "the SmartSens sensor's chip ID, hex (later " \
             "XM53x boards; e.g. da4d for SC1346)");                  \
+        object_class_property_add_str(OBJECT_CLASS(mc), "sensor",    \
+            xm_machine_get_sensor, xm_machine_set_sensor);           \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "sensor", "image sensor model in place of the board's: an " \
+            "I2C device type (xm-sensor for a generic one), or none");            \
+        object_class_property_add(OBJECT_CLASS(mc), "sensor-addr",   \
+            "uint32", xm_machine_get_sensor_addr,                    \
+            xm_machine_set_sensor_addr, NULL, NULL);                 \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "sensor-addr", "the sensor's 7-bit I2C address");           \
     }                                                                \
     DEFINE_MACHINE_EXTENDED(namestr, MACHINE, XmMachineState,        \
                             tag##_class_init, false,                  \
