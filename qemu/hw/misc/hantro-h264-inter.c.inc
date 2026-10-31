@@ -6,10 +6,11 @@
  * Each macroblock is P_Skip, P_L0_16x16 or the I_16x16 DC macroblock of
  * the I slices:
  *
- *  - motion: full-pel luma vectors (quarter-pel units, multiples of 4),
- *    found by testing the predicted, skip, neighbours' and zero vectors,
- *    then (if none is close) a 4-pixel grid over +-16 pixels, and refining
- *    the best with a diamond search; one reference (the previous
+ *  - motion: quarter-pel luma vectors, found by testing the predicted,
+ *    skip, neighbours' and zero vectors at whole samples, then (if none is
+ *    close) a 4-pixel grid over +-16 pixels, a diamond search, and a
+ *    refinement to half and quarter samples; luma predicted by the 6-tap
+ *    and averaging interpolation of 8.4.2.2.1; one reference (the previous
  *    picture: num_ref_idx_l0_active 1, so ref_idx is not sent); the
  *    16x16 vector prediction and the P_Skip vector of 8.4.1.1 / 8.4.1.3;
  *    chroma at eighth-pel by the bilinear filter of 8.4.2.2.2;
@@ -120,21 +121,99 @@ static inline uint8_t ref_y(const PPic *p, int x, int y)
                  clampi(x, 0, p->f.w - 1)];
 }
 
-/* motion-compensated luma (full-pel) and chroma (eighth-pel) prediction */
+/*
+ * Luma sample interpolation (8.4.2.2.1): the half samples by the 6-tap
+ * filter (1, -5, 20, 20, -5, 1) -- b, h rounded >> 5 from their sums, j
+ * from the sums of the sums >> 10 -- and the quarter samples as the
+ * rounded-up average of the two nearest integer / half samples.
+ */
+static inline int tap6(int e, int f, int g, int h, int i, int j)
+{
+    return e - 5 * f + 20 * g + 20 * h - 5 * i + j;
+}
+
+/* b1: the sum for the half sample right of integer (x, y) */
+static inline int b1_at(const PPic *p, int x, int y)
+{
+    return tap6(ref_y(p, x - 2, y), ref_y(p, x - 1, y), ref_y(p, x, y),
+                ref_y(p, x + 1, y), ref_y(p, x + 2, y), ref_y(p, x + 3, y));
+}
+
+static inline int clip255(int v)
+{
+    return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+/* b: the half sample right of (x, y); h: below it; j: right and below */
+static inline int hb(const PPic *p, int x, int y)
+{
+    return clip255((b1_at(p, x, y) + 16) >> 5);
+}
+
+static inline int hh(const PPic *p, int x, int y)
+{
+    return clip255((tap6(ref_y(p, x, y - 2), ref_y(p, x, y - 1),
+                         ref_y(p, x, y), ref_y(p, x, y + 1),
+                         ref_y(p, x, y + 2), ref_y(p, x, y + 3)) + 16) >> 5);
+}
+
+static inline int hj(const PPic *p, int x, int y)
+{
+    return clip255((tap6(b1_at(p, x, y - 2), b1_at(p, x, y - 1),
+                         b1_at(p, x, y), b1_at(p, x, y + 1),
+                         b1_at(p, x, y + 2), b1_at(p, x, y + 3)) + 512) >> 10);
+}
+
+/* the luma prediction sample at integer (x, y) plus (fx, fy) quarters */
+static int luma_q(const PPic *p, int x, int y, int fx, int fy)
+{
+    switch (fy * 4 + fx) {
+    case 0:  return ref_y(p, x, y);                                 /* G */
+    case 1:  return (ref_y(p, x, y) + hb(p, x, y) + 1) >> 1;        /* a */
+    case 2:  return hb(p, x, y);                                    /* b */
+    case 3:  return (ref_y(p, x + 1, y) + hb(p, x, y) + 1) >> 1;    /* c */
+    case 4:  return (ref_y(p, x, y) + hh(p, x, y) + 1) >> 1;        /* d */
+    case 5:  return (hb(p, x, y) + hh(p, x, y) + 1) >> 1;           /* e */
+    case 6:  return (hb(p, x, y) + hj(p, x, y) + 1) >> 1;           /* f */
+    case 7:  return (hb(p, x, y) + hh(p, x + 1, y) + 1) >> 1;       /* g */
+    case 8:  return hh(p, x, y);                                    /* h */
+    case 9:  return (hh(p, x, y) + hj(p, x, y) + 1) >> 1;           /* i */
+    case 10: return hj(p, x, y);                                    /* j */
+    case 11: return (hj(p, x, y) + hh(p, x + 1, y) + 1) >> 1;       /* k */
+    case 12: return (ref_y(p, x, y + 1) + hh(p, x, y) + 1) >> 1;    /* n */
+    case 13: return (hh(p, x, y) + hb(p, x, y + 1) + 1) >> 1;       /* p */
+    case 14: return (hj(p, x, y) + hb(p, x, y + 1) + 1) >> 1;       /* q */
+    default: return (hh(p, x + 1, y) + hb(p, x, y + 1) + 1) >> 1;   /* r */
+    }
+}
+
+/* the 16x16 luma prediction by quarter-pel vector mv */
+static void mc_luma(const PPic *p, int mx, int my, const int16_t mv[2],
+                    uint8_t py[256])
+{
+    const int dx = mv[0] >> 2, dy = mv[1] >> 2, fx = mv[0] & 3,
+              fy = mv[1] & 3;
+    int x, y;
+
+    for (y = 0; y < 16; y++) {
+        for (x = 0; x < 16; x++) {
+            const int X = mx * 16 + x + dx, Y = my * 16 + y + dy;
+            py[y * 16 + x] = fx | fy ? luma_q(p, X, Y, fx, fy)
+                                     : ref_y(p, X, Y);
+        }
+    }
+}
+
+/* motion-compensated luma (quarter-pel) and chroma (eighth-pel) prediction */
 static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
                   uint8_t py[256], uint8_t pc[2][64])
 {
-    const int dx = mv[0] >> 2, dy = mv[1] >> 2;
     const int cw = p->f.w / 2, ch = p->rh / 2;
     const int fx = mv[0] & 7, fy = mv[1] & 7;
     const int ix = mv[0] >> 3, iy = mv[1] >> 3;
     int x, y, comp;
 
-    for (y = 0; y < 16; y++) {
-        for (x = 0; x < 16; x++) {
-            py[y * 16 + x] = ref_y(p, mx * 16 + x + dx, my * 16 + y + dy);
-        }
-    }
+    mc_luma(p, mx, my, mv, py);
     for (comp = 0; comp < 2; comp++) {
         const uint8_t *r = comp ? p->rcr : p->rcb;
 
@@ -157,6 +236,7 @@ static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
     }
 }
 
+/* full-pel luma SAD (the integer search) */
 static int sad_mb(const PPic *p, int mx, int my, int dx, int dy, int best)
 {
     int x, y, s = 0;
@@ -174,9 +254,27 @@ static int sad_mb(const PPic *p, int mx, int my, int dx, int dy, int best)
     return s;
 }
 
-/* SAD left after each 4x4 block's mean difference is removed: what an
- * inter macroblock with only DC residuals would still miss */
-static int mrsad_mb(const PPic *p, int mx, int my, int dx, int dy)
+/* the luma SAD of a quarter-pel vector's prediction (the refinement) */
+static int sad_mb_q(const PPic *p, int mx, int my, const int16_t mv[2])
+{
+    uint8_t py[256];
+    int x, y, s = 0;
+
+    mc_luma(p, mx, my, mv, py);
+    for (y = 0; y < 16; y++) {
+        const uint8_t *src = p->f.sy + (my * 16 + y) * p->f.sys + mx * 16;
+
+        for (x = 0; x < 16; x++) {
+            s += abs(src[x] - py[y * 16 + x]);
+        }
+    }
+    return s;
+}
+
+/* SAD left after each 4x4 block's mean difference from the prediction py
+ * is removed: what an inter macroblock with only DC residuals would still
+ * miss */
+static int mrsad_mb(const PPic *p, int mx, int my, const uint8_t py[256])
 {
     int bx, by, x, y, e = 0;
 
@@ -187,10 +285,10 @@ static int mrsad_mb(const PPic *p, int mx, int my, int dx, int dy)
             for (y = 0; y < 4; y++) {
                 for (x = 0; x < 4; x++) {
                     const int px = mx * 16 + bx * 4 + x;
-                    const int py = my * 16 + by * 4 + y;
+                    const int pyy = my * 16 + by * 4 + y;
 
-                    d[y * 4 + x] = p->f.sy[py * p->f.sys + px] -
-                                   ref_y(p, px + dx, py + dy);
+                    d[y * 4 + x] = p->f.sy[pyy * p->f.sys + px] -
+                                   py[(by * 4 + y) * 16 + bx * 4 + x];
                     m += d[y * 4 + x];
                 }
             }
@@ -1244,9 +1342,46 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
                 }
                 mv[0] = bx * 4;
                 mv[1] = by * 4;
+                /* then half and quarter samples around it */
+                {
+                    int step, dx, dy;
+
+                    best = sad_mb_q(p, mx, my, mv) +
+                        lambda * (abs(mv[0] - mvp[0]) + abs(mv[1] - mvp[1]))
+                        / 4;
+                    for (step = 2; step >= 1; step >>= 1) {
+                        int16_t nb[2] = { mv[0], mv[1] };
+
+                        for (dy = -step; dy <= step; dy += step) {
+                            for (dx = -step; dx <= step; dx += step) {
+                                const int16_t m[2] = {
+                                    (int16_t)(mv[0] + dx),
+                                    (int16_t)(mv[1] + dy),
+                                };
+                                int cost;
+
+                                if ((!dx && !dy) || abs(m[0]) > 256 ||
+                                    abs(m[1]) > 256) {
+                                    continue;
+                                }
+                                cost = sad_mb_q(p, mx, my, m) +
+                                    lambda * (abs(m[0] - mvp[0]) +
+                                              abs(m[1] - mvp[1])) / 4;
+                                if (cost < best) {
+                                    best = cost;
+                                    nb[0] = m[0];
+                                    nb[1] = m[1];
+                                }
+                            }
+                        }
+                        mv[0] = nb[0];
+                        mv[1] = nb[1];
+                    }
+                }
 
                 /* nothing near: the scene changed, code it intra */
-                if (mrsad_mb(p, mx, my, bx, by) >
+                mc_mb(p, mx, my, mv, py, pc);
+                if (mrsad_mb(p, mx, my, py) >
                     2 * intra_dc_error(p, mx, my) + 1024) {
                     cabac_decision(&c, 11 + skip_inc, 0);
                     me->type = PMB_INTRA;
