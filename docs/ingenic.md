@@ -1503,8 +1503,11 @@ it the T23 AE hunted: with the GC2053's steps some 1.18x apart it ran
 analogue 2272/256 with digital 1.21x, saw the picture too dark, stepped
 to 2683/256 with 1.0x, saw it too bright, and flipped between the two
 every 5 frames; with it, it settles (2283/256 held for 153 frames of a
-200-frame run). T21 writes its digital gain to 0x408 / 0x40C (not
-applied); T40 and T41 apply theirs elsewhere and converge as they are.
+200-frame run). T21's `tisp_ae_process_impl` packs its digital gain
+the same way and writes it to 0x408 / 0x40C (G in 0x408's top half),
+which the light takes too: its AE then holds 129/256 at a mean of 8
+from frame 65 on. T40 and T41 apply theirs elsewhere and converge as
+they are.
 The painted scene counts as display light (gamma 2.2): the exposure
 scales its linear light, white clips, and the picture is gamma-encoded
 again, so a longer exposure lifts the navy while the logo stays white.

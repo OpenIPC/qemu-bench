@@ -3140,6 +3140,23 @@ def test_isp_stats_t21(qt):
     check('a light of R 0.65 for 0.55: that zone\'s R/G x 1.18',
           n2 > 0 and abs((r2 / g2) / (r / g) - 650 / 550) < 0.03, True)
     qt.qom_set('/machine/isp', 'light-r', 550)
+    # the AE's ISP digital gain (JZ_Isp_Ae_Dg2reg into 0x408, G in its top
+    # half, Q10): the navy zone's mean in linear light doubles at 2.0
+    qt.qom_set('/machine/isp', 'light', 400)
+
+    def navy():
+        qt.step(81 * 1000 * 1000)
+        idx = qt.readl(AE + 0x50)
+        z = qt.read(zb + 0x1000 * ((idx >> 4) & 3), 16)
+        return sum(isp_bits(z, b, 21) for b in (0, 21, 42))
+
+    qt.writel(ISP + 0x408, 0x400 << 16)
+    m1 = navy()
+    qt.writel(ISP + 0x408, 0x800 << 16)
+    m2 = navy()
+    check('digital gain 2.0 at 0x408: the navy zone x2',
+          m1 > 0 and abs(m2 / m1 - 2) < 0.1, True)
+    qt.writel(ISP + 0x408, 0)
     qt.qom_set('/machine/isp', 'light', 100)
 
 

@@ -192,7 +192,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * channel-stop poll on 0x2308, the VIC's status/mask/ack at
          * 0x100/0x104/0x108 (ISR 0xe5c); DVP only, no CSI.
          */
-        .name = "t21", .isp_size = 0x10000,
+        .name = "t21", .isp_size = 0x10000, .dgain = 0x408,
         .int_en = 0x80, .int_sta = 0x84, .int_clr = 0x88,
         .ch_base = 0x2400, .ch_en = 0x2304, .ch_busy = 0x2308,
         .osize = 0x00, .csize = 0x2C, .push_y = 0x6C, .push_uv = 0x84,
