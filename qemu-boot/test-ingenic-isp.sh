@@ -18,7 +18,7 @@
 #               t41 gc4663)]
 #        [--joint MODE (t40 with --sensor1: libimp's joint picture,
 #               1 main left, 2 right, 3 above, 4 under)]
-#        [--ldc K1,K2 (t41: the ISP's lens distortion correction, HLDC,
+#        [--ldc K1,K2 (t40, t41: the ISP's lens distortion correction, HLDC,
 #               turned on between the first and the last frame saved)]
 #        [--fw DIR] [--qemu PATH] [--toolchain BINDIR] [--sdk DIR]
 #        [--libimp rootfs|sdk] [--frames N] [--out DIR] [--png]
@@ -118,7 +118,7 @@ t20) SENSOR=${SENSOR:-jxf22} ;;
 t10) SENSOR=${SENSOR:-jxh62} ;;     # T10's ISP takes at most 1280x960
 t30) SENSOR=${SENSOR:-ov2735b} ;;
 t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}
-     DEFS="-DSNAP_T40 -DSNAP_DUAL -DSNAP_WDR_API"
+     DEFS="-DSNAP_T40 -DSNAP_DUAL -DSNAP_WDR_API -DSNAP_LDC"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64 ;;
 t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41
@@ -168,7 +168,7 @@ if [ -n "$JOINT" ]; then
     SLOT_STEP=16
 fi
 if [ -n "$LDC" ]; then
-    [ $SOC = t41 ] || { echo "--ldc is for t41" >&2; exit 2; }
+    case $SOC in t40|t41) ;; *) echo "--ldc is for t40 and t41" >&2; exit 2 ;; esac
     SNAP_ENV="$SNAP_ENV SNAP_LDC=$LDC"
 fi
 SLOT_MB=${SLOT_MB:-$((RMEM_MB + 32))}

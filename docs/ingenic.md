@@ -1543,8 +1543,10 @@ alternate about 1.8 million), 0 without; ADR rewrites its outputs
 (0x50024..0x5040C) about three times as often and defog its (0xC0xx)
 half again as often as with no statistics. Which reader field means
 what (ADR's, defog's order, TMO's pair) is the model's reading of their
-widths. T40 reads its GSM and LCE through other paths and has no TMO;
-those are T41's only. T40's `tisp_af_get_metric`, asked for the AF
+widths. T40's module reads GSM and LCE the same way
+(`tisp_gsm_single_get_hist`, `tisp_lce_get_data`: the flags, the RAM
+ports and bits 7 and 8 above; it has no "hist error" check), so the
+model fills them on both; TMO is T41's only. T40's `tisp_af_get_metric`, asked for the AF
 metric from a single-sensor run once AF statistics arrive, faults on a
 pointer of its own (a TLB load in module space); the tests do not ask
 it there.
@@ -1766,8 +1768,13 @@ picture (0x80) before the scaler, each channel mapped by its scale.
 through `/dev/tisp`, saves frames, clears the bypass through libimp and
 saves more: the later frames match the earlier remapped on the host from
 the same registers (95 % of pixels identical, against 157 levels apart
-without the remap). T40's HLDC (`tisp_hldc_con_par_cfg`) is not
-modelled.
+without the remap). T40's module writes the same registers through
+`tisp_hldc_con_par_cfg` -- the main pipe's at (0x2A0 << 7) = 0x15000, its
+second pipe's at 0x15080 (not applied: the model corrects the main pipe)
+-- and the same bypass bit 20; `/dev/tisp` reaches it as module 20 (T41:
+21), the pipe in word 3 and the 16 halfwords from word 4 (T41: from
+word 3). `--ldc` on T40 passes the same way (100 % of the sampled pixels
+within 0 of the host's remap, against 111 levels without it).
 
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
@@ -1969,7 +1976,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t40` + vendor modules + the SDK's `sensor_gc4653s1_t40.ko`, two sensors | `t40,sensor=gc4653,sensor1=gc4653 -m 256M` | `-kernel` + NOR root | libimp in the all-cached dual mode: channel 0 (pipe 0) and channel 3 (pipe 1) at 2560x1440, 40 frames each, both pipes' AE converging on their own sensors, the scene and counter checked per pipe (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`) |
 | OpenIPC `t40` + vendor modules + the gc4653 "s1" module twice (as `s1` and `s2`), three sensors | `t40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653 -m 256M` | `-kernel` + NOR root | libimp with `IMPISP_TOTAL_THR`, the third on VIC2 / DVP: both pipes' frames as above, VIC2 interrupting; the `snapraw` command while streaming saves `/tmp/snap0.raw` (2560x1440 x 2 bytes, an RGGB mosaic of the navy scene: R 186, G 216, B 335 on average) through the VIC MDMA (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --sensor2 gc4653 --snap-env SNAP_SNAPRAW=0_1`) |
 | T41NQ SDK 1.2.0 image + its modules, `sensor=gc4663` | `t41,variant=t41nq -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t41`) |
-| the same, HLDC parameters through `/dev/tisp`, the bypass cleared through libimp | `t41,variant=t41nq` | as above | the corrected frames match the uncorrected ones remapped on the host from the registers (`test-ingenic-isp.sh --soc t41 --ldc 200,40`) |
+| the same, HLDC parameters through `/dev/tisp`, the bypass cleared through libimp | `t41,variant=t41nq`; `t40` (`--soc t40 --ldc 200,40`) | as above | the corrected frames match the uncorrected ones remapped on the host from the registers (`test-ingenic-isp.sh --soc t41 --ldc 200,40`) |
 | OpenIPC `t40` + vendor modules, two gc4653, libimp's joint mode | `t40,sensor=gc4653,sensor1=gc4653` | as above | 2560x2880 on channel 0, the main sensor's part with pipe 0's counter and the secondary's with pipe 1's, above and under (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --joint 3`, `4`) |
 | OpenIPC `t10` + vendor modules, `sensor=jxh62` | `t10` | `-kernel` + NOR root | 1280x720 and 640x360, the sensor on bit-banged I2C (`test-ingenic-isp.sh --soc t10`) |
 | T40XP camera | `t40 -m 256M` | flash | login, the vendor application starts |
@@ -2034,12 +2041,11 @@ its Apical base; above), the left / right joins of T40's joint mode
 (past the scaler's limit with these sensors) and the VIC raw frame
 channel (above), the 160 values of
 T40/T41's WDR statistics at +1368, a WDR mode on T23 (no modelled sensor
-has one there), T40's GSM and LCE (read otherwise
-than T41's), the Apical DIS's motion vectors (zero: no motion), the
+has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's write-back, TLB and simple-read (RDMA) channel,
-T40's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
+T40's second pipe's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
 SDK's double firmware: the VIC caching both sensors' raw frames for the
 one ISP to process from DDR; above), T23's IVDC DRAM spill lines
 and the blocks below read as zero or as storage.
