@@ -1434,8 +1434,6 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                              f->h / 16 - r0);
         const bool cabac = f->cabac;
         const int cqp = f->cqp;
-        const uint8_t *y = f->y + (size_t)r0 * 16 * f->w;
-        const uint8_t *uv = f->uv + (size_t)r0 * 8 * f->w;
         const int nmb = mbw * rows;
         const int idc = extract32(e[0x70 / 4], 8, 2) ? : f->idc;
 

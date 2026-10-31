@@ -1122,7 +1122,7 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
     Mv merge[5], amvp[2], best = { 0, 0 };
     uint8_t py[64], pc[2][16];
     InterRes r;
-    int nm, i, best_cost = INT_MAX, skip_idx = -1, skip_sse = INT_MAX;
+    int nm, i, skip_idx = -1, skip_sse = INT_MAX;
 
     if (!p->ref) {
         /* nothing to refer to: intra (the decoder's picture unknown) */
