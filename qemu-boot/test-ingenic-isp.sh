@@ -12,6 +12,8 @@
 #
 #   bash qemu-boot/test-ingenic-isp.sh [--soc t31|t21|t23|t20|t10|t30|t40|t41] [--sensor NAME]
 #        [--sensor1 NAME (t40: a second sensor, the second pipe)]
+#        [--sensor2 NAME (t40: a third sensor, VIC2; needs --sensor1)]
+#        [--snap-env VAR=VALUE (exported to the client; repeatable)]
 #        [--fw DIR] [--qemu PATH] [--toolchain BINDIR] [--sdk DIR]
 #        [--libimp rootfs|sdk] [--frames N] [--out DIR] [--png]
 #        [--isp-ko FILE]
@@ -65,6 +67,8 @@ LIBIMP=rootfs
 SOC=t31
 SENSOR=
 SENSOR1=
+SENSOR2=
+SNAP_ENV=
 FRAMES=40
 OUT=
 PNG=
@@ -75,6 +79,8 @@ while [ $# -gt 0 ]; do
     --soc) SOC=$2; shift ;;
     --sensor) SENSOR=$2; shift ;;
     --sensor1) SENSOR1=$2; shift ;;
+    --sensor2) SENSOR2=$2; shift ;;
+    --snap-env) SNAP_ENV="$SNAP_ENV $2"; shift ;;
     --fw) FW=$2; shift ;;
     --image) IMAGE=$2; shift ;;
     --isp-ko) ISP_KO=$2; shift ;;
@@ -224,6 +230,21 @@ if [ -n "$SENSOR1" ]; then
 insmod /lib/modules/*/ingenic/sensor_${SENSOR1}s1_t40.ko
 export SNAP_SENSOR1=${SENSOR1}s1:$ADDR1"
 fi
+if [ -n "$SENSOR2" ]; then
+    [ -n "$SENSOR1" ] || { echo "--sensor2 needs --sensor1" >&2; exit 2; }
+    # the third sensor: the s1 driver under an "s2" name (the SDK ships
+    # no third driver; the drivers differ only in their names)
+    D=$(dirname "$(find "$WORK/rfs/lib/modules" -name "tx-isp-$SOC.ko" | head -1)")
+    sed "s/${SENSOR2}s1/${SENSOR2}s2/g; s/$(echo ${SENSOR2}s1 | tr a-z A-Z)/$(echo ${SENSOR2}s2 | tr a-z A-Z)/g" \
+        "$KO1" > "$D/sensor_${SENSOR2}s2_t40.ko"
+    LOADER="$LOADER
+insmod /lib/modules/*/ingenic/sensor_${SENSOR2}s2_t40.ko
+export SNAP_SENSOR2=${SENSOR2}s2:$ADDR1"
+fi
+for e in $SNAP_ENV; do
+    LOADER="$LOADER
+export $e"
+done
 cat > "$WORK/rfs/usr/bin/isp-test" <<EOF
 #!/bin/sh
 mount -t proc proc /proc
@@ -306,7 +327,7 @@ for try in 1 2 3; do
     echo "== boot ($SOC, sensor=$SENSOR)${try#1}"
     rm -f "$OUT/console.log"
     # shellcheck disable=SC2086  # QEMU_EXTRA: extra options, word-split
-    "$QEMU" -M $SOC,sensor=$SENSOR${SENSOR1:+,sensor1=$SENSOR1}$VARIANT,flash-file="$WORK/nor.bin" -m $RAM \
+    "$QEMU" -M $SOC,sensor=$SENSOR${SENSOR1:+,sensor1=$SENSOR1}${SENSOR2:+,sensor2=$SENSOR2}$VARIANT,flash-file="$WORK/nor.bin" -m $RAM \
         $QEMU_EXTRA -display none -serial file:"$OUT/console.log" \
         -monitor unix:"$WORK/mon.sock",server,nowait \
         -nic user,restrict=on -kernel "$KERNEL" \

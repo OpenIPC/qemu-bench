@@ -315,12 +315,60 @@ static void *grab(void *arg)
     return NULL;
 }
 
+#ifdef SNAP_DUAL
+/*
+ * The raw snapshots: an RGGB mosaic of the scene, so the navy background
+ * (most of the picture) has more blue than red, and green between
+ */
+static int snap_raw_check(int w, int h, int want)
+{
+    int k, good = 0;
+
+    for (k = 0; k < 8; k++) {
+        char path[32];
+        FILE *f;
+        long size, n[4] = { 0 };
+        double sum[4] = { 0 };
+        uint16_t px;
+        long i;
+
+        snprintf(path, sizeof(path), "/tmp/snap%d.raw", k);
+        f = fopen(path, "rb");
+        if (!f) {
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        for (i = 0; i < size / 2 && fread(&px, 2, 1, f) == 1; i++) {
+            int x = i % w, y = i / w, c = (y & 1) * 2 + (x & 1);
+
+            sum[c] += px;
+            n[c]++;
+        }
+        fclose(f);
+        printf("isp-snap: %s: %ld bytes (%dx%d raw16: %ld), R %.0f Gr %.0f "
+               "Gb %.0f B %.0f\n", path, size, w, h,
+               2L * w * h, n[0] ? sum[0] / n[0] : 0, n[1] ? sum[1] / n[1] : 0,
+               n[2] ? sum[2] / n[2] : 0, n[3] ? sum[3] / n[3] : 0);
+        if (size == 2L * w * h && n[0] && sum[3] / n[3] > sum[1] / n[1] &&
+            sum[1] / n[1] > sum[0] / n[0]) {
+            good++;
+        }
+    }
+    printf("isp-snap: snapraw %d of %d raw frames as expected: %s\n", good,
+           want, good == want ? "PASS" : "FAIL");
+    return good == want;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     IMPSensorInfo sensor;
 #ifdef SNAP_DUAL
-    IMPSensorInfo sensor1;
+    IMPSensorInfo sensor1, sensor2;
     const char *s1 = getenv("SNAP_SENSOR1");
+    const char *s2 = getenv("SNAP_SENSOR2");
 #endif
     const char *name = "gc2053";
     pthread_t tid[2];
@@ -367,6 +415,22 @@ int main(int argc, char **argv)
             .dual_mode = IMPISP_DUALSENSOR_DUAL_ALLCACHED_MODE,
             .joint_mode = IMPISP_NOT_JOINT,
         };
+        if (getenv("SNAP_DUAL_MODE")) {
+            mode.dual_mode = atoi(getenv("SNAP_DUAL_MODE"));
+        }
+        if (getenv("SNAP_JOINT")) {
+            mode.joint_mode = atoi(getenv("SNAP_JOINT"));
+        }
+        if (getenv("SNAP_SWITCH")) {
+            /* the frame pattern a cached pipe switches its sensors by */
+            mode.dual_mode_switch.en = IMPISP_TUNING_OPS_MODE_ENABLE;
+            mode.dual_mode_switch.switch_con = strtol(getenv("SNAP_SWITCH"),
+                                                      NULL, 0);
+            mode.dual_mode_switch.switch_con_num = 2;
+        }
+        if (s2) {
+            mode.sensor_num = IMPISP_TOTAL_THR;
+        }
         const char *colon = strchr(s1, ':');
         size_t len = colon ? (size_t)(colon - s1) : strlen(s1);
 
@@ -383,11 +447,35 @@ int main(int argc, char **argv)
         sensor1.sensor_id = 1;
         chn_id[1] = 3;
         attr(1) = attr(0);
+        if (s2) {
+            /* the third sensor: VIC2 on the DVP port (two CSI hosts), I2C0 */
+            colon = strchr(s2, ':');
+            len = colon ? (size_t)(colon - s2) : strlen(s2);
+            memcpy(&sensor2, &sensor1, sizeof(sensor2));
+            memset(sensor2.name, 0, sizeof(sensor2.name));
+            memset(sensor2.i2c.type, 0, sizeof(sensor2.i2c.type));
+            memcpy(sensor2.name, s2, len < sizeof(sensor2.name) ?
+                   len : sizeof(sensor2.name) - 1);
+            memcpy(sensor2.i2c.type, sensor2.name, sizeof(sensor2.i2c.type) - 1);
+            sensor2.i2c.addr = colon ? strtol(colon + 1, NULL, 0) :
+                               sensor.i2c.addr;
+            sensor2.i2c.i2c_adapter_id = getenv("SNAP_I2C2") ?
+                                         atoi(getenv("SNAP_I2C2")) : 0;
+            sensor2.video_interface = getenv("SNAP_VI2") ?
+                                      atoi(getenv("SNAP_VI2")) :
+                                      IMPISP_SENSOR_VI_DVP;
+            sensor2.mclk = IMPISP_SENSOR_MCLK2;
+            sensor2.sensor_id = 2;
+        }
+        printf("isp-snap: input mode: %d sensors, dual mode %d, joint %d\n",
+               mode.sensor_num, mode.dual_mode, mode.joint_mode);
         if (IMP_ISP_Open() < 0 || IMP_ISP_SetCameraInputMode(&mode) < 0 ||
             IMP_ISP_AddSensor(IMPVI_MAIN, &sensor) < 0 ||
             IMP_ISP_AddSensor(IMPVI_SEC, &sensor1) < 0 ||
+            (s2 && IMP_ISP_AddSensor(IMPVI_THR, &sensor2) < 0) ||
             IMP_ISP_EnableSensor(IMPVI_MAIN, &sensor) < 0 ||
-            IMP_ISP_EnableSensor(IMPVI_SEC, &sensor1) < 0) {
+            IMP_ISP_EnableSensor(IMPVI_SEC, &sensor1) < 0 ||
+            (s2 && IMP_ISP_EnableSensor(IMPVI_THR, &sensor2) < 0)) {
             printf("ISP / dual sensor setup failed\n");
             return 1;
         }
@@ -443,6 +531,29 @@ int main(int argc, char **argv)
     for (ch = 0; ch < 2; ch++) {
         pthread_join(tid[ch], NULL);
     }
+#ifdef SNAP_DUAL
+    if (getenv("SNAP_SNAPRAW")) {
+        /*
+         * T40's raw snapshot, while streaming: the driver's VIC MDMA
+         * stores N raw frames of sensor S, which it saves as
+         * /tmp/snap<k>.raw (16 bits a pixel)
+         */
+        char cmd[96], *u;
+
+        /* "S_N": the harness passes words without spaces */
+        snprintf(cmd, sizeof(cmd), "echo snapraw %s > /proc/jz/isp/isp-w02",
+                 getenv("SNAP_SNAPRAW"));
+        while ((u = strchr(cmd, '_'))) {
+            *u = ' ';
+        }
+        printf("isp-snap: %s: %d\n", cmd, system(cmd));
+        u = strchr(getenv("SNAP_SNAPRAW"), '_');
+        if (!snap_raw_check(attr(0).picWidth, attr(0).picHeight,
+                            u ? atoi(u + 1) : 1)) {
+            chn_ok[0] = 0;
+        }
+    }
+#endif
     /* the verdict before the teardown, which T40's IMP can hang in */
     printf("isp-snap: frames %s\n", chn_ok[0] && chn_ok[1] ? "PASS" : "FAIL");
     fflush(stdout);
@@ -471,11 +582,17 @@ int main(int argc, char **argv)
     if (s1) {
         IMP_ISP_DisableSensor(IMPVI_SEC);
     }
+    if (s1 && s2) {
+        IMP_ISP_DisableSensor(IMPVI_THR);
+    }
 #endif
     IMP_ISP_DelSensor(IMPVI_MAIN, &sensor);
 #ifdef SNAP_DUAL
     if (s1) {
         IMP_ISP_DelSensor(IMPVI_SEC, &sensor1);
+    }
+    if (s1 && s2) {
+        IMP_ISP_DelSensor(IMPVI_THR, &sensor2);
     }
 #endif
     IMP_ISP_DisableTuning();
