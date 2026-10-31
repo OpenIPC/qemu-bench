@@ -525,7 +525,8 @@ machine, the card's `ssid=`; default OpenIPC), and a join associates --
 to an open network, or with `wifi-psk=` (8..63 characters) a WPA2-PSK
 one.  The card is `/machine/atbm`.
 
-WPA2-PSK: beacons and probe responses set the privacy bit and carry an
+WPA2-PSK (`hw/net/atbm-wpa.c`, shared with the Xiongmai USB dongle
+`atbm-wifi`): beacons and probe responses set the privacy bit and carry an
 RSN IE (CCMP group, one CCMP pairwise, one PSK AKM), and after the
 association the access point runs the authenticator's 4-way handshake
 and group key (IEEE 802.11-2016 12.7), from the spec: PMK =
@@ -1964,8 +1965,9 @@ and the TCU's PWM pins.
 The SDIO Wi-Fi chip (`atbm-sdio`): open and WPA2-PSK (CCMP) networks
 only -- no WPA1/TKIP, WPA3/SAE, 802.1X, PMF or group rekeying -- no power
 save or the chip's BLE side; `wifi=atbm` puts it on MSC1 of every
-machine, tested end to end on T31 (jzmmc) and T40 (SDHCI).  The USB
-`atbm-wifi` of the Xiongmai machines stays open-network only.
+machine, tested end to end on T31 (jzmmc) and T40 (SDHCI).  The same
+limits apply to the Xiongmai machines' USB `atbm-wifi`, which shares the
+access point's WPA2 code.
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the left / right joins of T40's joint mode
