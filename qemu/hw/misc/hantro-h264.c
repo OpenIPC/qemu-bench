@@ -1360,3 +1360,5 @@ size_t h264_slice_ppcm_cabac(int qp, int cabac_init_idc, int mbw, int mbh,
     }
     return c.p - out;
 }
+
+#include "hantro-h264-inter.c.inc"

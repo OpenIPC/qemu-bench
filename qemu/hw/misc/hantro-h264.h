@@ -66,4 +66,41 @@ size_t h264_slice_ppcm_cabac(int qp, int cabac_init_idc, int mbw, int mbh,
                              int cs, uint8_t *ry, uint8_t *ruv, uint8_t *out,
                              size_t cap);
 
+
+/* the slice header's deblocking: disable_deblocking_filter_idc and the
+ * FilterOffsetA / FilterOffsetB (twice the _div2 syntax elements) */
+typedef struct H264Deblock {
+    int idc, alpha_off, beta_off;
+} H264Deblock;
+
+typedef struct H264PStats {
+    int skip, inter, intra;     /* macroblocks of each kind */
+    int qp;                     /* the QP the coded macroblocks ended at */
+} H264PStats;
+
+/*
+ * An I slice of I_16x16 DC macroblocks (as h264_slice_i16dc_cabac) that
+ * also leaves the decoder's picture, deblocked as db says, in ry / ruv
+ * (NV12 at stride mbw * 16): the reference for h264_slice_p_cabac.
+ */
+size_t h264_slice_i16dc_cabac_ref(int qp, int chroma_qp_offset,
+                                  const H264Deblock *db, int mbw, int mbh,
+                                  const uint8_t *y, int ys, const uint8_t *uv,
+                                  int cs, uint8_t *ry, uint8_t *ruv,
+                                  uint8_t *out, size_t cap);
+
+/*
+ * A P slice with inter coding (hantro-h264-inter.c.inc): P_Skip,
+ * P_L0_16x16 with motion search and residual, I_16x16 DC where nothing
+ * matches; one reference, ry / ruv (the previous picture, NV12 at stride
+ * mbw * 16), which is replaced by this picture's reconstruction.  The QP
+ * rises (mb_qp_delta) until the slice fits cap.  CABAC, cabac_init_idc
+ * from the slice header; returns bytes, as the others; st may be NULL.
+ */
+size_t h264_slice_p_cabac(int qp, int chroma_qp_offset, int cabac_init_idc,
+                          bool transform_8x8_mode, const H264Deblock *db,
+                          int mbw, int mbh, const uint8_t *y, int ys,
+                          const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
+                          uint8_t *out, size_t cap, H264PStats *st);
+
 #endif

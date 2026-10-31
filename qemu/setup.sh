@@ -51,6 +51,7 @@ cp qemu/hw/misc/xm-hevc.c qemu/hw/misc/hevc-enc.c qemu/hw/misc/hevc-enc.h \
                                     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-h1.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h264-tables.h \
+   qemu/hw/misc/hantro-h264-inter.c.inc \
                                     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
