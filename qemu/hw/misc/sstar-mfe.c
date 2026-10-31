@@ -36,9 +36,11 @@
  * (disable_deblocking_filter_idc), [8:5] and [12:9] (the alpha and beta
  * offsets / 2), chroma_qp_index_offset 0x29 [12:8]; cabac_init_idc is
  * always 0 (h264_enc.c writes sh->i_cabac_init_idc, which nothing sets).
- * 0x42 and 0x43 [7:0] report the bits written, 0x44/0x45 the write
- * pointer, and 0x1E bit 0 is frame done (bit 1 too when the buffer was
- * too small).  0x1C [7:0] masks (1 = masked) and [15:8] forces, 0x1D
+ * 0x42 and 0x43 [7:0] report the bits written, 0xF5/0xF6 the sum of the
+ * qsteps of every macroblock but the first (all at 0x27, the frame qstep:
+ * the model has no MB rate control), 0x44/0x45 the write pointer, and
+ * 0x1E bit 0 is frame done (bit 1 too when the buffer was too small).
+ * 0x1C [7:0] masks (1 = masked) and [15:8] forces, 0x1D
  * [7:0] clears; 0x1E [7:0] is the status past the mask, [15:8] the raw
  * one.  The line is high while 0x1E [7:0] is non-zero.
  *
@@ -126,6 +128,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarMfeState, SSTAR_MFE)
 #define R_FDC_CTRL          0x48
 #define R_CYCLES_LO         0x76
 #define R_CYCLES_HI         0x77
+#define R_MBR_QSTEP         0x27        /* the frame's qstep (qp2qs) */
+#define R_SUM_QSTEP_LO      0xF5        /* the qsteps of all MBs but the */
+#define R_SUM_QSTEP_HI      0xF6        /* first, 24 bits */
 #define R_PITCH_Y           0x90
 #define R_SRC_FMT           0xF3
 
@@ -1003,6 +1008,7 @@ static void mfe_encode(void *opaque)
     uint32_t i, whole = s->hdr_bits / 8, zeros = 0, cap, len;
     MfeDbf dbf = { .qp = qp };
     MfePic pic, ref;
+    uint64_t sum;
     int pcm;
 
     s->started = false;
@@ -1088,6 +1094,17 @@ static void mfe_encode(void *opaque)
     s->regs[R_WPTR_HI] = ((s->obuf[0] + len) >> 19) & 0x1FFF;
     s->regs[R_CYCLES_LO] = (w * h / 256 * 200) & 0xFFFF;
     s->regs[R_CYCLES_HI] = ((w * h / 256 * 200) >> 16) & 0xFF;
+    /*
+     * Every macroblock is coded at the slice QP.  With MB rate control on
+     * (0x00 bit 0 under msb2) the driver's msb2_enc_done() averages the
+     * qstep as (frame qstep + this) / MBs: read as 0 it makes the I
+     * frame's complexity 0, and the next I frame's msb2_enc_conf()
+     * divides by it ("Division by zero in kernel").
+     */
+    sum = (uint64_t)s->regs[R_MBR_QSTEP] * (w / 16 * (h / 16) - 1);
+    sum = MIN(sum, 0xFFFFFF);
+    s->regs[R_SUM_QSTEP_LO] = sum & 0xFFFF;
+    s->regs[R_SUM_QSTEP_HI] = sum >> 16;
     s->raw |= IRQ_DONE | (len < out->len ? IRQ_BUF_FULL : 0);
     if (s->trace) {
         qemu_log("sstar-mfe: %c %dx%d %s qp %d src 0x%x hdr %u bits, "
