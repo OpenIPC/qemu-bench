@@ -301,11 +301,19 @@ back. Every engine it waits on is modelled, from the SDK's drivers:
   packed 4:2:2 source (DIDN_CUR_TOP 0x100) -- in CABAC the 16 luma DCs
   and the chroma DCs (shared with the Xiongmai H1 model,
   `hw/misc/hantro-h264.c`), in CAVLC each macroblock's mean. P slices
-  code the macroblocks that changed against the reference as I_PCM and
-  skip the rest; the reference is kept, as the driver expects, in its
-  REC buffer (0x120 / 0x124) as NV12 and read back through ME_REF
-  (0x108 / 0x10C), so the moving dot is followed exactly at about
-  2 Mbit/s.
+  are inter coded (P_Skip, P_L0_16x16 with a quarter-sample motion
+  search and a residual, intra where nothing matches: the shared
+  `hw/misc/hantro-h264-inter.c.inc`) against the decoder's picture,
+  deblocked as the slice header asks -- the model reads the SPS, PPS and
+  slice header it packed for the frame numbering, the POC and
+  `disable_deblocking_filter_idc` with its offsets. A picture's slices
+  share one picture coder; the first reads the whole source (CUR_TOP less
+  the rows above, taken as one contiguous frame: inferred), and at the
+  last slice (PARM5 bit 31) the decoded picture goes to the REC buffer
+  (0x120 / 0x124, NV12, at the slice's first row), read back through
+  ME_REF (0x108 / 0x10C) by the next picture. A slice header the model
+  cannot follow falls back to the old coding (I_PCM where the picture
+  changed, P_Skip elsewhere). B slices skip every macroblock.
   STS1 reports the byte count the driver uses as the frame size, STS2 the
   slice-done interrupt (write 1 to clear). STS0's idle bits end the
   probe's DMA-stop poll. `-global gm-h264e.dump=DIR` saves the streams,
@@ -396,8 +404,10 @@ at "Press q -> ENTER") and the RTSP stream's PCMU track carries the tone:
 The Longse application streams this over RTSP; `qemu/tests/
 test-grainmedia.py` drives the encoder through the header FIFO as the
 driver does, in CAVLC and CABAC, and checks with ffmpeg that the stream
-decodes, the I frame's macroblock means match the source and the P frame
-follows the changed macroblock exactly. It also runs an MJPEG job through
+decodes, the I frame's macroblock means match the source, the P frame
+codes the changed macroblock and decodes sample for sample to the
+model's reconstruction (with deblocking off and on, filter offsets
+included). It also runs an MJPEG job through
 the mailbox (decoded by ffmpeg, restart markers included), GM2D fills and
 blits, the SSP tone, AES against the FIPS-197 vector, the RTC and the
 other small peripherals.

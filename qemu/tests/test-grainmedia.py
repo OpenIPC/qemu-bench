@@ -411,7 +411,7 @@ class Hdr:
         self.e = []
 
 
-def h264_stream(qt, cabac, mbw, mbh, srcs, idc=0):
+def h264_stream(qt, cabac, mbw, mbh, srcs, idc=0, dbf=1):
     """An IDR I picture and a P picture, the way slice.c drives a frame."""
     bs = SCRATCH + 0x100000
     qt.writel(H264E + 0x144, 0x80000)
@@ -445,7 +445,9 @@ def h264_stream(qt, cabac, mbw, mbh, srcs, idc=0):
         if cabac and not idr:
             h.ue(idc)                           # cabac_init_idc
         h.se(0)                                 # QP 26
-        h.ue(1)                                 # deblocking off
+        h.ue(dbf)                               # 1: deblocking off
+        if dbf != 1:
+            h.se(1); h.se(-1)                   # alpha / beta offsets
         h.pack(qt)
         qt.writel(H264E + 0x00, ((mbh - 1) << 24) | ((mbw - 1) << 8) |
                   (mbw - 1))
@@ -493,9 +495,11 @@ def test_h264e(qt, ffmpeg, tmp):
             pic2[(y * w + x) * 2 + 1] = 200
     src2 = SCRATCH + 0x60000
     qt.write(src2, bytes(pic2))
-    for cabac, idc in ((False, 0), (True, 0), (True, 1), (True, 2)):
-        stream = h264_stream(qt, cabac, mbw, mbh, (src, src2), idc)
-        name = 'cabac%d' % idc if cabac else 'cavlc'
+    for cabac, idc, dbf in ((False, 0, 1), (True, 0, 1), (True, 1, 1),
+                            (True, 2, 1), (False, 0, 0), (True, 0, 0)):
+        stream = h264_stream(qt, cabac, mbw, mbh, (src, src2), idc, dbf)
+        name = ('cabac%d' % idc if cabac else 'cavlc') + \
+            ('' if dbf == 1 else '-deblocked')
         check('%s stream starts with an SPS' % name, stream[:5],
               b'\x00\x00\x00\x01\x67')
         path = os.path.join(tmp, name + '.h264')
@@ -530,11 +534,14 @@ def test_h264e(qt, ffmpeg, tmp):
               worst <= 3, True)
         p, i = y[w * h:], y[:w * h]
         moved = [(yy, xx) for yy in range(16, 32) for xx in range(32, 48)]
-        check('%s: P frame: the changed macroblock exact (I_PCM)' % name,
-              all(p[yy * w + xx] == 200 for yy, xx in moved), True)
-        check('%s: P frame: the rest repeats the I frame (P_Skip)' % name,
-              all(p[k] == i[k] for k in range(w * h)
-                  if (k // w, k % w) not in set(moved)), True)
+        mean = sum(p[yy * w + xx] for yy, xx in moved) // len(moved)
+        check('%s: P frame: the changed macroblock coded (mean %d of 200)'
+              % (name, mean), abs(mean - 200) <= 3, True)
+        # inter coded against the decoder's picture: what ffmpeg decodes is
+        # the model's reconstruction (REC == ME_REF), sample for sample
+        rec = qt.read(SCRATCH + 0x80000, w * h)
+        check('%s: P frame decodes to the model\'s reconstruction' % name,
+              p == rec, True)
 
 
 # ---- capture, 3DNR, scaler -------------------------------------------------
