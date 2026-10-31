@@ -12,6 +12,8 @@
  *
  *   0x020 CSSR  core sleep status: bit n while core n is halted
  *   0x040 CSRR  core reset, 1 = held; core 1 comes out of reset held
+ *   0x060       bits 12:10 the L2 size, 128 KiB << (n - 1) (U-Boot's
+ *               isvp_t40.h / isvp_t41.h CONFIG_L2CACHE_REG): 1
  *   0x100 PIPR / 0x120 PIMR   INTC pending / enable to IP2, bit per core
  *   0x140 MIPR / 0x160 MIMR   mailbox pending / enable to IP3
  *   0x180 OIPR / 0x1A0 OIMR   core OST pending / enable to IP4
@@ -293,6 +295,7 @@ static void ingenic_ccu_reset(DeviceState *dev)
         s->mask[c][0] = s->mask[c][1] = 0xffffffff;
     }
     *ccu_reg(s, R_CSRR) = ~1u & ((1u << MAX_CORES) - 1);
+    *ccu_reg(s, 0x060) = 1 << 10;               /* 128 KiB of L2 */
     *ccu_reg(s, R_PIMR) = 1;
     *ccu_reg(s, R_OIMR) = 1;
     ccu_update(s);

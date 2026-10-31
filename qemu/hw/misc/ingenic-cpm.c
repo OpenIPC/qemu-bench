@@ -67,6 +67,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicCpmState, INGENIC_CPM)
 #define CPM_SIZE        0x100
 
 #define R_CPCCR         0x00
+#define R_LCR           0x04
 #define R_RSR           0x08
 #define R_CPAPCR        0x10
 #define R_CPMPCR        0x14
@@ -300,6 +301,13 @@ static uint64_t ingenic_cpm_read(void *opaque, hwaddr off, unsigned size)
 
     if ((off & ~3) == R_CPCSR) {
         v &= ~7u;
+    } else if ((off & ~3) == R_LCR) {
+        /*
+         * the power domains: bit 28 + m asks domain m off, bit 24 + m
+         * reports it off -- at once (soc-t31 pm.c's DISABLE/ENABLE_LCR_
+         * MODULES spin on it before the sleep and after the wake)
+         */
+        v = (v & ~0x0f000000u) | ((v >> 4) & 0x0f000000u);
     } else if ((off & ~3) == R_SRBC) {
         /* stop requests are acknowledged at once, in the bit below */
         v |= (v >> 1) & (SRBC_ISP_ACK | SRBC_HELIX_ACK | SRBC_RADIX_ACK);

@@ -44,9 +44,10 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10000000 | CPM: PLLs, dividers, gates, resets | `ingenic-cpm` |
 | 0x10001000 | INTC, 64 sources → IP2 (XBurst1) | `ingenic-intc` |
 | 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
-| 0x10003000 | RTC / hibernation (T40: 0x132A0000) | `ingenic-rtc` |
+| 0x10003000 | RTC / hibernation (T40: 0x132A0000), IRQ 32 (T41: 3) | `ingenic-rtc` |
+| 0x10004000 | T41: always-on RTC memory, 4 KiB | RAM |
 | 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
-| 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride, paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
+| 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride (+0x20 ISR, UMR, UACR: storage), paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
 | 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c), PDMA requests 0x24 + 2 n / 0x25 + 2 n | `ingenic-i2c` |
 | 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
 | 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
@@ -79,7 +80,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18, PDMA request 9 (`/machine/sadc`) | `ingenic-sadc` |
 | 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
 | 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
-| 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12 (`/machine/dmic`) | `ingenic-dmic` |
+| 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12, PDMA 13 (T10/T20: 0x10022000, IRQ 0; T30: 0x10023000, IRQ 40; both PDMA 0x21) (`/machine/dmic`) | `ingenic-dmic` |
 | 0x134D0000 | T41: the audio system's DMA, FIFOs, data bus and DMIC, core INTC 33 (`/machine/dmic`) | `ingenic-asdmic` |
 | 0x13460000 | T41: PWM controller, 8 channels (`/machine/pwm`) | `ingenic-pwm` |
 | 0x10043000 / 0x10044000 | SSI0 / SSI1 SPI masters (SSI1: T21, T30, T31, T40, T41), IRQ 9 / 8, buses `ssi0` / `ssi1` | `ingenic-ssi` |
@@ -161,6 +162,13 @@ QEMU's own Ingenic models are not what these kernels need, so
 The T21 and T23 have 16 KiB L1 caches where the others have 32 KiB; the
 machine sets that, and the T20's PRId, through the CPU's `l1-kib` and
 `prid` properties (`qemu/patches/0017-mips-prid-l1-size-properties.patch`).
+T40 and T41 report their L2 in Config2 (`config2`, patch 0025): 128 KiB
+(the T40 product briefs), 8 ways of 64-byte lines (U-Boot's
+`isvp_t40.h`), so the 4.4 kernels print "Unified secondary cache 128kB
+8-way, linesize 64 bytes" and do its maintenance; CCU 0x60 bits 12:10
+read 1, the size U-Boot reads. T41's L2 is taken to be T40's. The
+XBurst1 parts' L2 (the 3.10 kernels build `JZ_CPU_SCACHE`) is not
+described: nothing here states its geometry.
 
 The second XBurst2 core starts powered off. The kernel's
 `boot_secondary()` writes the entry to CCU RER and clears the core's CSRR
@@ -384,7 +392,10 @@ divider's mux reads 3 or DDRCDR's reads 0:
 | M[28:20] N[19:14] OD0[13:11] OD1[10:7] RG[6:4] | T41 | 24 MHz × 2(M+1) / (N+1) / 2^OD0 / (OD1+1) |
 
 CPPSR/CPSPPR keep what is written: the reboot code writes a signature,
-and "reboot recovery" waits to read it back.
+and "reboot recovery" waits to read it back. LCR's power domains answer
+at once -- bit 24 + m reports what bit 28 + m asks -- the handshake the
+3.10 suspend path (`soc-t31/common/pm.c` DISABLE/ENABLE_LCR_MODULES) spins
+on before the sleep and after the wake; no shipped kernel enables PM.
 
 ### Timers: `ingenic-ost` and `ingenic-tcu`
 
@@ -409,8 +420,14 @@ U-Boot and every kernel here reboot (the T40 kernel's own restart hook is
 empty). On XBurst2 TSR bit 16 does not stop the watchdog and TCSR bit 10
 zeroes its counter: the 4.4 kernels' watchdog driver sets the stop bit at
 probe and nothing clears it, and their restart writes TCSR bit 10, TDR,
-the clock and TCER and spins ("check wdt."). The PWM channels count and
-flag without interrupts. Each channel's PWM pin (TCSR bit 7 output on,
+the clock and TCER and spins ("check wdt."). Each channel counts at its
+TCSR clock from 0; reaching TDHR sets its half flag (TFR bit n + 16) and
+reaching TDFR its full flag (bit n), the counter starting again from 0,
+each on time (a timer per channel), and the flags interrupt unless TMR
+masks them: TCU0 for channel 0, TCU1 for 1, TCU2 for 2..7. The 3.10
+`jz_tcu` demuxes every channel off TCU2, and OpenIPC's `motor.ko` and
+the SDKs' `sample_motor` step on channel 2's full interrupt
+(`test-ingenic-motor.sh`). Each channel's PWM pin (TCSR bit 7 output on,
 bit 8 initial level, bit 9 shut down; OpenIPC's `jz_tcu.c` and the SDKs'
 `sample_pwm`) starts a period at the initial level and flips at TDHR,
 until TDFR: `qom-get /machine/tcu pwm2` reads it as `high/period` counter
@@ -451,7 +468,9 @@ keep the single-command path. Three details matter:
   controller `virt_to_phys()` of its uncached descriptor buffer --
   0x2xxxxxxx for RAM at 0x0xxxxxxx -- so the silicon evidently decodes
   29 bits.
-- The NOR is an m25p80 on the SSI bus. It counts fast-read dummies in
+- The NOR is an m25p80 on the SSI bus, with the 4 KiB (20h) and 32 KiB
+  (52h) erases the real parts have (patch 0024: W25Q64, W25Q256, and
+  the 0xC22018 ID that MX25L12805D/12835F/12845E share). It counts fast-read dummies in
   clocks, one transfer each, which is what DMYBITS holds; an address
   longer than the part's (the T41 SPL probes with 6 bytes) reads data,
   as on a real chip.
@@ -613,7 +632,10 @@ on the CPU (`CoreManager.c`, `EncSliceParam.c`, `SliceHdrWriter.c` in
 the SDK's `libimp.a`; contract: `tmp/media-contract.md` section 3). The
 `reg-base` property puts the 4 KiB register file at +0x8000 of the 1 MiB
 block (T31, T40) or at +0 (T41). Core c's registers are at +0x200 c:
-libimp encodes video on core 0 and JPEG on core 1.
+libimp encodes video on core 0 and JPEG on core 1. The HW ID word (0x8004
+past the UID) is the part's -- libimp's encoder library checks it
+("Board ID mismatch: ... instead of 72000460"): 0x72000460 on T31,
+0x72000760 on T40, 0x71000260 on T41 (`hw-id`).
 
 - 0x14 / 0x18: interrupt mask / W1C status, bit 4c+0 Enc1 or JPEG done,
   4c+2 Enc2 done; 0x30 a ticking 800 MHz counter (libimp spins until it is
@@ -693,6 +715,11 @@ loads `tx-isp-t41.ko` without `direct_mode`.
 - `ingenic-gpio`: S/C aliases on every register, the shadow port's
   collected set/clear masks applied by GID2LD, outputs reading back their
   level and undriven inputs reading high; one interrupt line per port.
+  Each port's external levels are a property at `/machine/gpio` ("pa"
+  .. "pf"), settable while the guest runs -- a key, a PIR sensor, a
+  limit switch: `qom-set /machine/gpio pc 0xfffffffe` pulls PC0 low, and
+  the edge or level interrupt it is set up for fires
+  (`test-ingenic-gpio.sh`: a sysfs GPIO sees both edges on T31).
 - `ingenic-i2c`: a DW_apb_i2c master moving each command at once; an
   address no device answers aborts with TXABRT bit 0, and ENSTA follows
   ENB (both drivers wait for it). The image sensor (`sensor=`) is on
@@ -705,10 +732,20 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   DMA, so this is checked by qtest only.
 - `ingenic-rtc`: WRDY always set, WEN after the 0xA55A unlock (the
   power-off path waits for both without a timeout), seconds from the
-  host's clock, HCR.PD powers off.
+  host's clock, HCR.PD powers off. Each second RTCCR.1HZ sets and, with
+  AE, RTCSR reaching RTCSAR sets AF; the line (INTC 32 on T10..T31, 3 on
+  T41, none named on T40) is up while AF and AIE or 1HZ and 1HZIE
+  (`rtc-jz.h`); an alarm with HWCR.EALM latches HWRSR.ALM and wakes a
+  suspended machine. No shipped kernel builds the RTC driver; the SDKs'
+  `sample-alarm` drives it. T41's always-on RTC memory (4 KiB at
+  0x10004000, where `pm_fastboot.c` keeps its resume code) is RAM.
 - `ingenic-efuse`: blank fuses with every read and program done at once
   (the vendor kernels poll both and CTRL's enable). Blank keeps the
-  binary-only MXU licence check in the 3.10 kernels permissive.
+  binary-only MXU licence check in the 3.10 kernels permissive. The chip
+  ID (fuse offset 0, 96 bits: `SU_Base_GetDevID`, the SDKs'
+  `sample-chipid`, `/proc/jz/efuse/efuse_chip_id`) is the SoC ID then
+  "OpenIPC!" unless `-global ingenic-efuse.chipid0..2=` says otherwise;
+  a die's own is unique.
 - `ingenic-sadc`: the AUX ADC of `jz_adc_v13.c` (3.10) and
   `ingenic_adc_v13.c` (4.4). ENA bit 15 powers it down; setting bit n
   converts AUX n 20 us later, clears the bit and raises STATUS bit n

@@ -18,7 +18,10 @@
  *
  * PIN reads an output's level and an input's external level; nothing
  * drives the inputs unless a board wires a gpio-in line, so they read
- * high (pulled up) -- a card-detect reads "no card".  Each port has one
+ * high (pulled up) -- a card-detect reads "no card".  The "pa".."pf"
+ * properties are each port's external levels, settable at run time (a
+ * key, a PIR sensor, a motor's limit switch: qom-set /machine/gpio pb
+ * 0xfffffffe pulls PB0 low), with the interrupts a change raises.  Each port has one
  * interrupt line, high while FLG & ~MSK.  The "drive" outputs (one per
  * pin) give what the SoC drives onto each pin: low for a GPIO output at
  * 0, else high (released, pulled up) -- an open-drain line such as the
@@ -32,6 +35,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
@@ -120,6 +124,30 @@ static void gpio_set_input(void *opaque, int n, int level)
 
     s->input[p] = deposit32(old, n % 32, 1, !!level);
     gpio_events(s, p, old, s->input[p]);
+}
+
+static void gpio_get_levels(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    IngenicGpioState *s = INGENIC_GPIO(obj);
+    uint32_t val = s->input[(uintptr_t)opaque];
+
+    visit_type_uint32(v, name, &val, errp);
+}
+
+static void gpio_set_levels(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    IngenicGpioState *s = INGENIC_GPIO(obj);
+    int p = (uintptr_t)opaque;
+    uint32_t val, old;
+
+    if (!visit_type_uint32(v, name, &val, errp)) {
+        return;
+    }
+    old = s->input[p];
+    s->input[p] = val;
+    gpio_events(s, p, old, val);
 }
 
 static uint64_t ingenic_gpio_read(void *opaque, hwaddr off, unsigned size)
@@ -227,6 +255,23 @@ static void ingenic_gpio_reset(DeviceState *dev)
     }
 }
 
+static void ingenic_gpio_init(Object *obj)
+{
+    IngenicGpioState *s = INGENIC_GPIO(obj);
+    uintptr_t p;
+
+    for (p = 0; p < MAX_PORTS; p++) {
+        s->input[p] = 0xffffffff;       /* pulled up */
+    }
+
+    for (p = 0; p < MAX_PORTS; p++) {
+        char name[3] = { 'p', 'a' + p, 0 };
+
+        object_property_add(obj, name, "uint32", gpio_get_levels,
+                            gpio_set_levels, NULL, (void *)p);
+    }
+}
+
 static void ingenic_gpio_realize(DeviceState *dev, Error **errp)
 {
     IngenicGpioState *s = INGENIC_GPIO(dev);
@@ -246,7 +291,6 @@ static void ingenic_gpio_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_in(dev, gpio_set_input, s->nports * 32);
     qdev_init_gpio_out_named(dev, s->drive_out, "drive", s->nports * 32);
     for (p = 0; p < MAX_PORTS; p++) {
-        s->input[p] = 0xffffffff;
         s->drive[p] = 0xffffffff;
     }
 }
@@ -285,6 +329,7 @@ static const TypeInfo ingenic_gpio_info = {
     .name = TYPE_INGENIC_GPIO,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(IngenicGpioState),
+    .instance_init = ingenic_gpio_init,
     .class_init = ingenic_gpio_class_init,
 };
 

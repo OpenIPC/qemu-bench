@@ -302,6 +302,40 @@ def test_tcu(qt):
     qt.writel(TCU + 0x04, 0)
 
 
+def test_tcu_irq(qt, intc=INTC):
+    """Channel 2 as the motor drivers run it: EXTAL/64, full at 375 ticks
+    (1 ms), its full interrupt unmasked -- TCU2 rises on time without
+    any register being read."""
+    print('ingenic-tcu channel interrupts')
+    line = lambda: (qt.readl(intc + 0x00) >> 25) & 1
+    qt.writel(TCU + 0x40 + 0x20 + 0x0C, 4 | (3 << 3))  # TCSR2: EXTAL / 64
+    qt.writel(TCU + 0x40 + 0x20 + 0x00, 375)           # TDFR2
+    qt.writel(TCU + 0x40 + 0x20 + 0x04, 375)           # TDHR2: no half
+    qt.writel(TCU + 0x40 + 0x20 + 0x08, 0)
+    qt.writel(TCU + 0x28, 0x00040004)                  # TFCR
+    qt.writel(TCU + 0x38, 1 << 2)                      # TMCR: full 2 on
+    qt.writel(TCU + 0x14, 1 << 2)                      # TESR: count
+    qt.step(900 * 1000)
+    check('no interrupt before the first full', line(), 0)
+    qt.step(200 * 1000)
+    check('TCU2 at 1 ms', line(), 1)
+    n = 0
+    for _ in range(10):
+        qt.writel(TCU + 0x28, 1 << 2)                  # ack
+        if line():
+            break
+        qt.step(1000 * 1000)
+        n += line()
+    check('one interrupt per millisecond for 10 ms', n, 10)
+    qt.writel(TCU + 0x34, 1 << 2)                      # TMSR: masked
+    qt.writel(TCU + 0x28, 1 << 2)
+    qt.step(3 * 1000 * 1000)
+    check('masked: the flag sets, the line stays low',
+          ((qt.readl(TCU + 0x20) >> 2) & 1, line()), (1, 0))
+    qt.writel(TCU + 0x18, 1 << 2)                      # TECR: stop
+    qt.writel(TCU + 0x28, 0x00ff00ff)
+
+
 def test_tcu_xburst2(qt):
     """T40/T41: the watchdog ignores TSR bit 16 and TCSR bit 10 zeroes the
     counter -- what the 4.4 kernels' restart and ping rely on."""
@@ -1487,7 +1521,7 @@ def pdma_ring(qt, ch, desc, buf, period, nper, drt, dcm, port=AIC + 0x34,
     """jz_dma.c's cyclic transfer: a ring of 8-word linked descriptors"""
     for i in range(nper):
         nxt = desc + 32 * ((i + 1) % nper)
-        dsa, dta = (port, buf + i * period) if drt in (5, 7, 13) else \
+        dsa, dta = (port, buf + i * period) if drt in (5, 7, 13, 0x21) else \
             (buf + i * period, port)
         qt.write(desc + 32 * i, struct.pack('<8I', dcm, dsa, dta,
                  (((nxt >> 4) & 0xff) << 24) | (period // unit), 0, drt, 0,
@@ -1714,15 +1748,15 @@ def test_dmic_trigger(qt):
     qt.qom_set('/machine/dmic', 'tone-amp', 8192)
 
 
-def test_dmic(qt):
-    print('ingenic-dmic')
+def test_dmic(qt, DMIC=DMIC, drq=13, name='T31'):
+    print('ingenic-dmic (%s)' % name)
     qt.writel(PDMA + 0x1000, 1 | (0x3f << 16))
     check('every interrupt masked out of reset', qt.readl(DMIC + 0x08), 0x3f)
     # audio_dmic.c: 16 kHz, one microphone, packed, DMA on request 13
     ring, desc, period = SCRATCH + 0x6000, SCRATCH + 0x7000, 128
     qt.write(ring, bytes(4 * period))
     dcm32 = (0 << 14) | (0 << 12) | (0 << 8) | 3    # 32-bit ports and units
-    pdma_ring(qt, 6, desc, ring, period, 4, 13, dcm32 | (1 << 22),
+    pdma_ring(qt, 6, desc, ring, period, 4, drq, dcm32 | (1 << 22),
               port=DMIC + 0x30, unit=4)
     qt.writel(DMIC + 0x34, (1 << 31) | 32)              # RDMS, threshold
     qt.writel(DMIC + 0x00, (1 << 31) | (1 << 8) | (1 << 6) | 1)
@@ -1827,6 +1861,16 @@ def test_sfc_v1(qt, img):
     sfc_v1(qt, 0x03, addr=0x110000, alen=3, length=16, dma=SCRATCH + 0x200)
     check('programmed after erase', qt.read(SCRATCH + 0x200, 16),
           b'OpenIPC!' + b'\xff' * 8)
+    # Block Erase 32KB (52h) at 1 MiB + 128 KiB: the block, not its
+    # neighbours
+    sfc_v1(qt, 0x06, data=False)
+    sfc_v1(qt, 0x52, addr=0x120000, alen=3, data=False)
+    for a, want in ((0x11FFF0, img[0x11FFF0:0x120000]),
+                    (0x120000, b'\xff' * 16), (0x127FF0, b'\xff' * 16),
+                    (0x128000, img[0x128000:0x128010])):
+        sfc_v1(qt, 0x03, addr=a, alen=3, length=16, dma=SCRATCH + 0x300)
+        check('32 KiB erase at 0x%x' % a, qt.read(SCRATCH + 0x300, 16),
+              bytes(want))
 
 
 def test_sfc_v2(qt, img, path):
@@ -2062,6 +2106,23 @@ def test_gpio(qt):
     check('PB3 reads 0', qt.readl(pb + 0x00) & 8, 0)
     qt.writel(pb + 0x44, 1 << 3)
     check('PAT0S drives it high', qt.readl(pb + 0x00) & 8, 8)
+    # PC0 a falling-edge interrupt, driven through /machine/gpio pc
+    pc = GPIO + 0x2000
+    qt.writel(pc + 0x14, 1)                     # INTS
+    qt.writel(pc + 0x34, 1)                     # PAT1S: edge
+    qt.writel(pc + 0x48, 1)                     # PAT0C: falling
+    qt.writel(pc + 0x28, 1)                     # MSKC
+    qt.writel(pc + 0x58, 0xFFFFFFFF)            # FLGC
+    line = lambda: (qt.readl(INTC + 0x00) >> 15) & 1
+    check('no interrupt while PC0 stays high', line(), 0)
+    qt.qom_set('/machine/gpio', 'pc', 0xFFFFFFFE)
+    check('pulling PC0 low reads 0 and flags it',
+          (qt.readl(pc + 0x00) & 1, qt.readl(pc + 0x50) & 1, line()), (0, 1, 1))
+    qt.writel(pc + 0x58, 1)
+    qt.qom_set('/machine/gpio', 'pc', 0xFFFFFFFF)
+    check('a rising edge does not', (qt.readl(pc + 0x50) & 1, line()), (0, 0))
+    check('qom-get reads the levels back',
+          qt.qom_get('/machine/gpio', 'pc'), 0xFFFFFFFF)
 
 
 def test_i2c(qt):
@@ -3217,6 +3278,46 @@ def test_rtc_efuse(qt, rtc=RTC):
     qt.writel(EFUSE + 0x00, (3 << 21) | 1)
     check('EFUSE enable self-clears', qt.readl(EFUSE + 0x00) & 1, 0)
     check('blank fuses', qt.readl(EFUSE + 0x23C), 0)
+    check('the chip ID: the SoC ID, then "OpenIPC!"',
+          tuple(qt.readl(EFUSE + 0x200 + 4 * i) for i in range(3)),
+          (qt.readl(0x1300002C), 0x6E65704F, 0x21435049))
+    qt.writel(EFUSE + 0x00, (1 << 21) | 1)      # through CTRL / DATA
+    check('chip ID word 1 through DATA', qt.readl(EFUSE + 0x0C), 0x6E65704F)
+    # the UARTs' registers past the 16550: UMR, UACR hold what is written
+    qt.writel(0x10031024, 16)
+    qt.writel(0x10031028, 0x1A5)
+    check('UART1 UMR / UACR', (qt.readl(0x10031024), qt.readl(0x10031028)),
+          (16, 0x1A5))
+
+
+def test_rtc_alarm(qt):
+    """The RTC's alarm and 1 Hz tick on INTC 32 (T31), as rtc-jz.c sets
+    them, the wake latch, and the CPM's power-domain handshake that the
+    3.10 suspend path spins on."""
+    print('ingenic-rtc alarm, CPM LCR')
+    line = lambda: qt.readl(INTC + 0x20) & 1             # source 32
+    now = qt.readl(RTC + 0x04)
+    qt.writel(RTC + 0x08, now + 3)                       # RTCSAR
+    qt.writel(RTC + 0x2C, 1)                             # HWCR.EALM
+    qt.writel(RTC + 0x00, 1 | (1 << 2) | (1 << 3))       # RTCE AE AIE
+    qt.step(1500 * 1000 * 1000)
+    check('no alarm before RTCSAR', (qt.readl(RTC + 0x00) >> 4) & 1, 0)
+    qt.step(2500 * 1000 * 1000)
+    check('alarm: AF and the line',
+          ((qt.readl(RTC + 0x00) >> 4) & 1, line()), (1, 1))
+    check('HWRSR.ALM latched for the wake', qt.readl(RTC + 0x30) & 1, 1)
+    qt.writel(RTC + 0x00, 1 | (1 << 2) | (1 << 3))       # AF written 0
+    check('AF cleared, the line drops', line(), 0)
+    qt.writel(RTC + 0x00, 1 | (1 << 5))                  # 1HZIE
+    qt.step(1100 * 1000 * 1000)
+    check('the 1 Hz tick interrupts', ((qt.readl(RTC + 0x00) >> 6) & 1, line()),
+          (1, 1))
+    qt.writel(RTC + 0x00, 1)
+    lcr = CPM + 0x04
+    qt.writel(lcr, qt.readl(lcr) | (0xF << 28))
+    check('LCR: domains off report off', (qt.readl(lcr) >> 24) & 0xF, 0xF)
+    qt.writel(lcr, qt.readl(lcr) & ~(0xF << 28))
+    check('and on again', (qt.readl(lcr) >> 24) & 0xF, 0)
 
 
 def test_ids(qemu):
@@ -3286,6 +3387,7 @@ def main():
         test_cpm(qt, 't31')
         test_ddr(qt, 't31')
         test_tcu(qt)
+        test_tcu_irq(qt)
         test_ost_v1(qt)
         test_intc(qt)
         test_sfc_v1(qt, img)
@@ -3348,6 +3450,16 @@ def main():
         qt = QTest(a.qemu, 't20')
         test_aes(qt)
         test_tcu_pwm(qt)
+        qt.close()
+
+        qt = QTest(a.qemu, 't31', ['-rtc', 'clock=vm'])
+        test_rtc_alarm(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't30')
+        test_dmic(qt, 0x10023000, 0x21, 'T30')
+        qt.close()
+        qt = QTest(a.qemu, 't20')
+        test_dmic(qt, 0x10022000, 0x21, 'T20')
         qt.close()
 
         qt = QTest(a.qemu, 't31,sensor=gc2053')

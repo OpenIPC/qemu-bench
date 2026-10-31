@@ -348,6 +348,7 @@ struct IngenicMachineState {
     Clock *cpuclk;
     DeviceState *intc, *sfc, *sfc1;
     DeviceState *nand;      /* the boot flash is a SPI NAND */
+    uint32_t uart_ext[6][8];        /* each UART's registers past the 16550 */
 };
 
 typedef struct IngenicMachineClass {
@@ -357,6 +358,39 @@ typedef struct IngenicMachineClass {
 
 DECLARE_CLASS_CHECKERS(IngenicMachineClass, INGENIC_MACHINE,
                        TYPE_INGENIC_MACHINE)
+
+/* --- the UARTs' registers past the 16550's eight --------------------------- */
+
+/*
+ * 0x20 ISR (IrDA select), 0x24 UMR (the baud M divisor), 0x28 UACR (its
+ * fine adjust), ...: the boot loaders and the kernels' jz_uart / 8250
+ * set them for each baud rate; the 16550 model times by its divisor
+ * alone, so these hold what is written.
+ */
+static uint64_t ingenic_uart_ext_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t *r = opaque;
+
+    return r[off >> 2];
+}
+
+static void ingenic_uart_ext_write(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size)
+{
+    uint32_t *r = opaque;
+
+    r[off >> 2] = val;
+}
+
+static const MemoryRegionOps ingenic_uart_ext_ops = {
+    .read = ingenic_uart_ext_read,
+    .write = ingenic_uart_ext_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
 
 /* --- interrupt lines ---------------------------------------------------- */
 
@@ -986,6 +1020,15 @@ static void ingenic_init(MachineState *ms)
                                  &error_abort);
         object_property_set_uint(OBJECT(dev), "l1-kib", info->l1_kib,
                                  &error_abort);
+        if (ingenic_is_xburst2(info->soc)) {
+            /*
+             * The L2: 128 KiB (the T40 product briefs), 8 ways of 64-byte
+             * lines (U-Boot's isvp_t40.h), so 256 sets -- Config2 SS 2,
+             * SL 5, SA 7; T41's core is taken to be the same
+             */
+            object_property_set_uint(OBJECT(dev), "config2",
+                                     (2 << 8) | (5 << 4) | 7, &error_abort);
+        }
         /*
          * No hidden tlbwr shadow entries: on two cores the T40/T41 4.4
          * kernel otherwise leaves a user page translated to stale data
@@ -1033,6 +1076,17 @@ static void ingenic_init(MachineState *ms)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NNDMA_BASE);
     }
     if (info->soc == INGENIC_T41 || info->soc == INGENIC_T23) {
+        /*
+         * T41's always-on RTC memory (RTC_FTBT_IOBASE): pm_fastboot.c keeps
+         * the resume code and the saved DDR settings there across a sleep
+         */
+        MemoryRegion *rtcmem = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(rtcmem, NULL, "ingenic.rtc-mem", 0x1000,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, 0x10004000, rtcmem);
+    }
+    if (info->soc == INGENIC_T41) {
         /*
          * IVDC (direct_mode): tx-isp queues channel 0 the pair 0x80000000 /
          * 0x81000000, which the scaler writes into the IVDC and the encoder
@@ -1109,10 +1163,16 @@ static void ingenic_init(MachineState *ms)
     sysbus_connect_irq(sbd, 2, ingenic_irq(ims, IRQ_TCU2));
 
     /* RTC */
-    sysbus_create_simple("ingenic-rtc", info->rtc_base, NULL);
+    /* the RTC: INTC 32 on T10..T31, 3 on T41; T40 names no line */
+    sysbus_create_simple("ingenic-rtc", info->rtc_base,
+                         !ingenic_is_xburst2(info->soc) ?
+                         ingenic_irq(ims, 32) :
+                         info->soc == INGENIC_T41 ? ingenic_irq(ims, 3) :
+                         NULL);
 
     /* GPIO */
     dev = gpio = qdev_new("ingenic-gpio");
+    object_property_add_child(OBJECT(ims), "gpio", OBJECT(dev));
     qdev_prop_set_uint32(dev, "num-ports", info->gpio_ports);
     qdev_prop_set_uint32(dev, "stride", info->gpio_stride);
     qdev_prop_set_uint32(dev, "shadow", info->gpio_shadow);
@@ -1160,6 +1220,14 @@ static void ingenic_init(MachineState *ms)
         memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000,
                                     sysbus_mmio_get_region(SYS_BUS_DEVICE(dev),
                                                            0));
+        {
+            MemoryRegion *ext = g_new(MemoryRegion, 1);
+
+            memory_region_init_io(ext, OBJECT(ims), &ingenic_uart_ext_ops,
+                                  ims->uart_ext[i], "ingenic.uart-ext", 0x20);
+            memory_region_add_subregion(sysmem, UART_BASE + i * 0x1000 + 0x20,
+                                        ext);
+        }
     }
 
     /* I2C, the sensor's bus on I2C0 */
@@ -1413,16 +1481,41 @@ static void ingenic_init(MachineState *ms)
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_ASDMIC));
     }
 
-    /* the digital microphones of T31 and T40, on request line 13 */
-    if (info->soc == INGENIC_T31 || info->soc == INGENIC_T40) {
-        dev = qdev_new("ingenic-dmic");
-        object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
-        sbd = SYS_BUS_DEVICE(dev);
-        sysbus_realize_and_unref(sbd, &error_fatal);
-        sysbus_mmio_map(sbd, 0, DMIC_BASE);
-        sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_DMIC));
-        qdev_connect_gpio_out_named(dev, "drq", 0,
-                                    qdev_get_gpio_in_named(pdma, "drq", 13));
+    /*
+     * The digital microphones: T31 and T40 at 0x10034000, INTC 12, request
+     * line 13; T10/T20 at 0x10022000, INTC 0, and T30 at 0x10023000, INTC
+     * 40, both on request line 0x21 (the T30 kernel's JZDMA_REQ_DMIC_RX,
+     * the slot T10/T20's lists call PCM0) -- the same block (the T30 SDK's
+     * oss2 dmic_hal.h), its driver behind CONFIG_JZ_TS_DMIC on all of them
+     */
+    {
+        hwaddr base = 0;
+        int irq = 0, drq = 0;
+
+        switch (info->soc) {
+        case INGENIC_T31: case INGENIC_T40:
+            base = DMIC_BASE, irq = IRQ_DMIC, drq = 13;
+            break;
+        case INGENIC_T10: case INGENIC_T20:
+            base = 0x10022000, irq = 0, drq = 0x21;
+            break;
+        case INGENIC_T30:
+            base = 0x10023000, irq = 40, drq = 0x21;
+            break;
+        default:
+            break;
+        }
+        if (base) {
+            dev = qdev_new("ingenic-dmic");
+            object_property_add_child(OBJECT(ims), "dmic", OBJECT(dev));
+            sbd = SYS_BUS_DEVICE(dev);
+            sysbus_realize_and_unref(sbd, &error_fatal);
+            sysbus_mmio_map(sbd, 0, base);
+            sysbus_connect_irq(sbd, 0, ingenic_irq(ims, irq));
+            qdev_connect_gpio_out_named(dev, "drq", 0,
+                                        qdev_get_gpio_in_named(pdma, "drq",
+                                                               drq));
+        }
     }
 
     /* the auxiliary ADC (jz_adc_v13 / ingenic_adc_v13): /machine/sadc */
@@ -1535,6 +1628,10 @@ static void ingenic_init(MachineState *ms)
     memory_region_add_subregion(sysmem, USBPHY_BASE, usbphy);
 
     dev = qdev_new("ingenic-efuse");
+    /* the chip ID's first word: the SoC ID, unless -global set one */
+    if (!object_property_get_uint(OBJECT(dev), "chipid0", NULL)) {
+        qdev_prop_set_uint32(dev, "chipid0", info->soc_id);
+    }
     qdev_prop_set_uint32(dev, ingenic_is_xburst2(info->soc) ?
                          "subsoctype2" : "subsoctype1",
                          (uint32_t)var->code << 16);
@@ -1559,6 +1656,9 @@ static void ingenic_init(MachineState *ms)
         qdev_prop_set_uint32(dev, "reg-base", t41 ? 0 : 0x8000);
         /* T41's core is the next generation: core pages, 4 KiB entries */
         qdev_prop_set_uint8(dev, "gen", t41 ? 2 : 1);
+        qdev_prop_set_uint32(dev, "hw-id", t41 ? 0x71000260 :
+                             info->soc == INGENIC_T40 ? 0x72000760 :
+                             0x72000460);
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, t41 ? AVPU_BASE_T41 : AVPU_BASE);

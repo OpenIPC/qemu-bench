@@ -18,8 +18,12 @@
  * (U-Boot arch/mips/cpu/xburst/timer.c).  The watchdog counts while TCER
  * bit 0 is set and TSR bit 16 is clear; at TCNT >= TDR it resets the
  * system, which is how both U-Boot and the kernels reboot (soc-t31/
- * common/reset.c: TDR = 2 at RTC/64, then a spin).  The kernels use
- * channels only for PWM: they count and flag here, without interrupts.
+ * common/reset.c: TDR = 2 at RTC/64, then a spin).  Each channel counts
+ * at its TCSR clock and, on reaching TDHR (half) and TDFR (full, then
+ * from zero), sets its TFR flags on time -- a timer per channel -- and
+ * interrupts unless TMR masks it: TCU0 for channel 0, TCU1 for 1, TCU2
+ * for the rest (the 3.10 jz_tcu demuxes every channel off TCU2; the
+ * motor drivers step on channel 2's full interrupt).
  *
  * A channel's PWM pin (TCSR bit 7 enables it, bit 8 is the initial level,
  * bit 9 shuts it down; OpenIPC's jz_tcu.c and the SDKs' sample_pwm) starts
@@ -94,6 +98,8 @@ typedef struct TcuChannel {
     uint32_t tdfr, tdhr, tcsr;
     uint32_t cnt;           /* at base_ns while enabled */
     int64_t base_ns;
+    QEMUTimer *timer;       /* the next half or full compare */
+    struct IngenicTcuState *tcu;
 } TcuChannel;
 
 struct IngenicTcuState {
@@ -205,10 +211,13 @@ static uint32_t ch_count(IngenicTcuState *s, int n)
         return c->cnt;
     }
     cnt = c->cnt + tcu_ticks(tcu_rate(s, c->tcsr), c->base_ns);
-    if (cnt >= c->tdfr) {
-        /* past full: flag it, the counter restarts from zero */
+    if (c->tdfr && cnt >= c->tdfr) {
+        /* reached full: flag it (and half, passed on the way), from zero */
         s->tfr |= 1u << n;
-        period = (uint64_t)c->tdfr + 1;
+        if (c->tdhr < c->tdfr) {
+            s->tfr |= 1u << (n + 16);
+        }
+        period = c->tdfr;
         c->cnt = cnt % period;
         c->base_ns = tcu_now();
         cnt = c->cnt;
@@ -217,6 +226,50 @@ static uint32_t ch_count(IngenicTcuState *s, int n)
         s->tfr |= 1u << (n + 16);
     }
     return cnt;
+}
+
+/*
+ * Arm channel @n's timer for its next compare: half while below TDHR,
+ * else full.  A TDFR of 0 would compare on every tick; nothing programs
+ * that, and it is left to the lazy reads.
+ */
+static void ch_arm(IngenicTcuState *s, int n)
+{
+    TcuChannel *c = &s->ch[n];
+    uint64_t rate = tcu_rate(s, c->tcsr);
+    uint32_t cnt, target;
+
+    if (!(s->ter & (1u << n)) || (s->tsr & (1u << n)) || !rate || !c->tdfr) {
+        timer_del(c->timer);
+        return;
+    }
+    cnt = ch_count(s, n);
+    target = (cnt < c->tdhr && c->tdhr < c->tdfr) ? c->tdhr : c->tdfr;
+    /* c->cnt is the count at c->base_ns; round up to the tick that hits */
+    timer_mod(c->timer, c->base_ns +
+              muldiv64(target - c->cnt, NANOSECONDS_PER_SECOND, rate) + 1);
+}
+
+static void tcu_update_irq(IngenicTcuState *s);
+
+static void ch_timer_cb(void *opaque)
+{
+    TcuChannel *c = opaque;
+    IngenicTcuState *s = c->tcu;
+    int n = c - s->ch;
+
+    ch_count(s, n);
+    tcu_update_irq(s);
+    ch_arm(s, n);
+}
+
+static void ch_arm_all(IngenicTcuState *s)
+{
+    int n;
+
+    for (n = 0; n < NCH; n++) {
+        ch_arm(s, n);
+    }
 }
 
 static void ch_latch_all(IngenicTcuState *s)
@@ -364,6 +417,8 @@ static void ingenic_tcu_write(void *opaque, hwaddr off, uint64_t val,
             s->ch[n].tcsr = val;
             break;
         }
+        ch_arm_all(s);
+        tcu_update_irq(s);
         return;
     }
 
@@ -459,6 +514,7 @@ static void ingenic_tcu_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     wdt_arm(s);
+    ch_arm_all(s);
     tcu_update_irq(s);
 }
 
@@ -482,7 +538,11 @@ static void ingenic_tcu_reset(DeviceState *dev)
     s->tsr = 0;
     s->tmr = 0x00ff80ff;
     for (n = 0; n < NCH; n++) {
-        s->ch[n] = (TcuChannel) { .base_ns = now };
+        TcuChannel *c = &s->ch[n];
+
+        timer_del(c->timer);
+        c->tdfr = c->tdhr = c->tcsr = c->cnt = 0;
+        c->base_ns = now;
     }
     s->ostdr = s->ostcsr = s->osthbuf = 0;
     s->ostcnt = 0;
@@ -504,6 +564,11 @@ static void ingenic_tcu_init(Object *obj)
     }
     s->wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_timer_cb, s);
     for (i = 0; i < NCH; i++) {
+        s->ch[i].tcu = s;
+        s->ch[i].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ch_timer_cb,
+                                      &s->ch[i]);
+    }
+    for (i = 0; i < NCH; i++) {
         g_autofree char *name = g_strdup_printf("pwm%d", i);
 
         object_property_add(obj, name, "str", tcu_get_pwm, NULL, NULL,
@@ -519,22 +584,23 @@ static const Property ingenic_tcu_props[] = {
 
 static const VMStateDescription vmstate_tcu_channel = {
     .name = "ingenic-tcu-channel",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(tdfr, TcuChannel),
         VMSTATE_UINT32(tdhr, TcuChannel),
         VMSTATE_UINT32(tcsr, TcuChannel),
         VMSTATE_UINT32(cnt, TcuChannel),
         VMSTATE_INT64(base_ns, TcuChannel),
+        VMSTATE_TIMER_PTR(timer, TcuChannel),
         VMSTATE_END_OF_LIST()
     }
 };
 
 static const VMStateDescription vmstate_ingenic_tcu = {
     .name = TYPE_INGENIC_TCU,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(tdr, IngenicTcuState),
         VMSTATE_UINT32(tcer, IngenicTcuState),
@@ -546,7 +612,7 @@ static const VMStateDescription vmstate_ingenic_tcu = {
         VMSTATE_UINT32(tfr, IngenicTcuState),
         VMSTATE_UINT32(tmr, IngenicTcuState),
         VMSTATE_UINT32(tstr, IngenicTcuState),
-        VMSTATE_STRUCT_ARRAY(ch, IngenicTcuState, NCH, 1,
+        VMSTATE_STRUCT_ARRAY(ch, IngenicTcuState, NCH, 2,
                              vmstate_tcu_channel, TcuChannel),
         VMSTATE_UINT32(ostdr, IngenicTcuState),
         VMSTATE_UINT32(ostcsr, IngenicTcuState),
