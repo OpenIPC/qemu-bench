@@ -642,11 +642,13 @@ holds it:
 - each macroblock is P_Skip (where the P_Skip vector's prediction leaves
   no coefficient), P_L0_16x16 or, where the motion search finds nothing
   near (a scene change), the I slices' I_16x16 DC macroblock;
-- motion: full-pel vectors in quarter-pel units -- the predicted, P_Skip,
-  neighbours' and zero vectors, a 4-pixel grid over +-16 pixels when
-  none is close, then a diamond search; the 16x16 vector prediction and
-  the P_Skip vector of H.264 8.4.1; one reference (libimp's
-  num_ref_idx_l0_active is 1); chroma at eighth-pel, bilinear;
+- motion: quarter-pel vectors -- the predicted, P_Skip, neighbours' and
+  zero vectors at whole samples, a 4-pixel grid over +-16 pixels when
+  none is close, a diamond search, then half and quarter samples around
+  the best; luma predicted by the 6-tap / averaging interpolation of
+  H.264 8.4.2.2.1, chroma at eighth-pel, bilinear; the 16x16 vector
+  prediction and the P_Skip vector of H.264 8.4.1; one reference
+  (libimp's num_ref_idx_l0_active is 1);
 - residual: the 4x4 transform of every block, inter rounding, chroma DC
   and AC, `coded_block_pattern`; libimp's x264 port writes a High
   profile PPS with `transform_8x8_mode_flag` set whatever profile the
@@ -665,8 +667,15 @@ every five frames) is a DC residual on the motion-compensated reference
 rather than a picture of I_PCM; libimp's CBR, which held the slice QP at
 51 with I_PCM pictures, now brings it down (31 to 25 over 20 pictures in
 `test-ingenic-vpu-e2e.sh`). The AVPU codes its P slices the same way
-(H.264 and H.265: below); RADIX's H.265 P slices skip or code 8x8 intra
-DC units.
+(H.264 and H.265: below), and so does RADIX its H.265 ones, with
+`hevc-enc-inter.c.inc` and what i265e's SPS / PPS / slice headers say
+(read off a T30 stream): no scaling lists, no temporal MVP,
+`max_transform_hierarchy_depth_inter` 0, no sign hiding, two merge
+candidates (`five_minus_max_num_merge_cand` 3); a P picture that would
+take more than a byte a pixel is coded again 6 QP higher, at last all
+skipped (no register here gives i265e's room). `test-ingenic-t30-rtsp.sh`
+copies each stream before decoding it, since a P picture lost to a
+decoder falling behind would break the ones after it.
 
 The engines' TLB: libimp addresses the engines physically, but the
 driver can hand a process its DMMU table (`IOCTL_CHANNEL_PRIVATE_TLB`,
@@ -778,9 +787,9 @@ past the UID) is the part's -- libimp's encoder library checks it
   counters in the entries are made up and non-zero.
 - H.264, CABAC (what libimp uses on every part: Main profile,
   `cabac_init_idc` 1): I slices I_16x16 DC, P slices inter coded by
-  `hantro-h264-inter.c.inc` (P_Skip, P_L0_16x16 with a full-pel motion
-  search and a 4x4-transform residual, I_16x16 DC where nothing comes
-  close), the PPS's `transform_8x8_mode_flag` followed. A picture's
+  `hantro-h264-inter.c.inc` (P_Skip, P_L0_16x16 with a quarter-pel
+  motion search and a 4x4-transform residual, I_16x16 DC where nothing
+  comes close), the PPS's `transform_8x8_mode_flag` followed. A picture's
   slices (rows of macroblocks; libimp sends one a picture, the model
   takes any number, by W14) are coded on one reconstruction, each on its
   own window of it -- a slice's first row has no neighbour above for
@@ -793,18 +802,23 @@ past the UID) is the part's -- libimp's encoder library checks it
   result is the reference of the channel's next P picture, kept per
   reconstruction address (W90) and looked up by the reference address
   (WA0): the decoder's picture, bit for bit. A slice that would not fit
-  the stream buffer's room is coded again at a higher QP. CAVLC and B
-  slices (libimp sends neither) keep the older path: I_PCM where the
-  source changed, P_Skip elsewhere, at most `pcm-budget` bytes of PCM a
-  picture.
+  the stream buffer's room is coded again at a higher QP. CAVLC (a
+  Baseline PPS; libimp does not send one) codes the same macroblocks the
+  same way: `mb_skip_run`, Exp-Golomb `mb_type`, `mvd` and the inter
+  `coded_block_pattern` (Table 9-4), `residual_block_cavlc` with nC from
+  the neighbouring blocks' TotalCoeff (all four coeff_token tables). B
+  slices (libimp sends none) code every macroblock skipped. The rate
+  control's estimate of a P slice still counts I_PCM macroblocks
+  (`pcm-budget`).
 - HEVC: libimp's CTB 32, intra transform depth 1, transform skip (T31,
   T40; not T41) and cabac_init_flag; P slices inter coded by
   `hevc-enc-inter.c.inc` (`inter`, opt-in for the AVPU; the XM engines
   keep the older skip / intra DC coding): each 8x8 CU is skipped (a
   merge candidate's motion), merged with a residual, coded with a vector
   (AMVP predictor and difference, `rqt_root_cbf`) or intra DC; vectors
-  full-pel at even luma positions, so chroma is full-pel and prediction a
-  copy of the reference; the merge list (A1, B1, B0, A0, B2, the temporal
+  searched at whole samples, then refined at half and quarter samples,
+  prediction interpolated as the decoder does (the luma 8-tap and chroma
+  4-tap filters of 8.5.3.3.3); the merge list (A1, B1, B0, A0, B2, the temporal
   candidate, zeros up to MaxNumMergeCand 5) and the AMVP list built as
   the decoder builds them, the temporal candidates from the reference
   picture's decoded vectors (libimp's SPS enables TMVP; every picture
@@ -865,7 +879,8 @@ page's 0x40-0x88 (R0 0x40, size 0x44, tables 0x58, stream 0x60 / 0x68 /
 
 `python3 qemu/tests/test-ingenic-avpu.py` plays libimp's register and
 command-list sequence under qtest (I + P in CAVLC, CABAC, Enc1-only and
-Enc2 forms, HEVC, JPEG, the PCM budget, the T40/T41 bases, and a
+Enc2 forms, HEVC, JPEG, a CAVLC sequence changing every macroblock, the
+T40/T41 bases, and a
 picture of two slices panning over three pictures, which must decode to
 the model's own reconstruction, sample for sample, at 42 dB) and decodes
 the output with ffmpeg (or the `jrottenberg/ffmpeg` docker image).
