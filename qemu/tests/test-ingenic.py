@@ -3073,6 +3073,65 @@ def test_isp_hldc_t41(qt, soc='t41'):
         range(w * h // 4, w * h, 7)), True)
 
 
+def test_isp_hldc_t40_pipe1(qt):
+    """T40's second pipe's HLDC: 0x15080, its bypasses at 0x44, size 0x84"""
+    print('ingenic-isp HLDC (T40 second pipe)')
+    vic1, ch, en = 0x13390000, ISP + 0x17100, ISP + 0x17008
+    w, h, k1, k2 = 256, 144, 200, 40
+    qt.writel(ISP + 0x84, w << 16 | h)          # pipe 1's sensor picture
+    qt.writel(ch + 0x2C, w << 16 | h)
+    qt.writel(en, 1)
+    qt.writel(vic1 + 0x00, 1)
+    qt.writel(ISP + 0x40030, 0xFFFFFFFF)
+
+    def frame(addr):
+        qt.writel(ch + 0x6C, addr)
+        qt.writel(ch + 0x84, addr + w * h)
+        qt.step(41 * 1000 * 1000)
+        qt.writel(ISP + 0x40034, qt.readl(ISP + 0x40038))
+        qt.readl(ch + 0x74)
+        qt.readl(ch + 0x8C)
+        return qt.read(addr, w * h)
+
+    inv, zoom = hldc_calc(k1, k2, w, h)
+    uinv, uzoom = hldc_calc(k1, k2, w // 2, h // 2)
+    for r, v in {0x00: 0x00010001, 0x04: k2 << 16 | k1, 0x08: k2 << 16 | k1,
+                 0x0C: zoom, 0x10: uzoom, 0x14: inv, 0x18: uinv,
+                 0x1C: 0, 0x20: 0, 0x44: 3}.items():
+        qt.writel(ISP + 0x15080 + r, v)
+    qt.writel(ISP + 0x40, 0xffc00049)           # pipe 0's bypass bit clear:
+    qt.writel(ISP + 0x44, 0xffd00049)           # not pipe 1's
+    a = frame(0x00400000)
+    qt.writel(ISP + 0x44, 0xffc00049)           # pipe 1's bitBypassHLDC clear
+    b = frame(0x00500000)
+    rows = range(h // 4 * w, w * h, 5)          # below the frame counter
+    moved = sum(abs(a[i] - b[i]) > 2 for i in rows)
+    check('pipe 1 remapped only once its own bypass (0x44) clears '
+          '(%d%% moved)' % (100 * moved // len(rows)), moved > 0.08 * len(rows),
+          True)
+    # the remap matches pipe 0's for the same registers and picture size
+    cx, cy = w // 2, h // 2
+    near = n = 0
+    for y in range(h // 4, h, 3):
+        for x in range(0, w, 3):
+            dx, dy = x - cx, y - cy
+            rho = (dx * dx + dy * dy) * inv / 2.0 ** 30
+            g = (256 - k1 * rho / 4 + k2 * rho * rho / 4) / 256 * zoom / 2048
+            ux, uy = cx + dx * g, cy + dy * g
+            x0, y0 = int(math.floor(ux)), int(math.floor(uy))
+            fx, fy = ux - x0, uy - y0
+            px = lambda yy, xx: a[min(max(yy, 0), h - 1) * w +
+                                  min(max(xx, 0), w - 1)]
+            ref = ((px(y0, x0) * (1 - fx) + px(y0, x0 + 1) * fx) * (1 - fy) +
+                   (px(y0 + 1, x0) * (1 - fx) + px(y0 + 1, x0 + 1) * fx) * fy)
+            near += abs(b[y * w + x] - ref) <= 2
+            n += 1
+    check('and as the registers read (%d%% within 2)' % (100 * near // n),
+          near >= 0.95 * n, True)
+    qt.writel(ISP + 0x40, 0xffd00049)
+    qt.writel(ISP + 0x44, 0xffd00049)
+
+
 def test_isp_stats_t21(qt):
     """T21's statistics: AE 0x700, AWB 0x800, no enable bits (tisp_init)."""
     print('ingenic-isp 3A statistics (t21, sensor=jxf37)')
@@ -3966,6 +4025,9 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't40,sensor=gc4653,sensor1=gc4653')
         test_isp_t40_pipe1(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't40,sensor=gc4653,sensor1=gc4653')
+        test_isp_hldc_t40_pipe1(qt)
         qt.close()
         qt = QTest(a.qemu, 't40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653')
         test_isp_t40_mdma(qt)

@@ -381,7 +381,7 @@ struct IngenicIspState {
         uint32_t key[8];
         int32_t *xy;            /* source x, y per pixel, 1/256 pixel */
         uint32_t n;
-    } hldc_map[2];
+    } hldc_map[2][2];           /* by pipe, then plane */
     uint8_t *hldc_buf;
     uint32_t hldc_buf_size;
     /*
@@ -1955,8 +1955,10 @@ static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
  * of tx-isp-t41.ko H20230630a; on while the module bypasses at 0x40 have
  * bit 20 -- IMPISPModuleCtl.bitBypassHLDC -- clear).  T40's module writes
  * the same registers through tisp_hldc_con_par_cfg, the main pipe's at
- * (0x2A0 << 7) = 0x15000 and its second pipe's at 0x15080 (not applied
- * here: the model corrects the main pipe only).  tisp_hldc_write_reg
+ * (0x2A0 << 7) = 0x15000 and its second pipe's at 0x15080; that pipe's
+ * module bypasses are at 0x44 ((pipe + 16) << 2, tisp_s_module_control)
+ * and its sensor picture at 0x84 (tisp_sec_init), so pipe p's stage is
+ * the same at +0x80 p, +4 p, +4 p.  tisp_hldc_write_reg
  * writes, from 16 halfwords p[] (the tuning's, or /dev/tisp's module 21):
  *
  *   0x15000  p1 << 16 | p0         (1, 1 from every tuning: stored)
@@ -1984,22 +1986,27 @@ static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
 #define HLDC_BASE       0x15000
 #define HLDC_BYPASS     (1u << 20)
 
-static bool ingenic_isp_hldc_on(IngenicIspState *s)
+#define HLDC_REG(p, o)  (HLDC_BASE + 0x80 * (p) + (o))
+#define HLDC_TOP(p)     (T41_TOP + 4 * (p))
+#define HLDC_SIZE(p)    (0x80 + 4 * (p))
+
+static bool ingenic_isp_hldc_on(IngenicIspState *s, int p)
 {
-    return s->l->hldc && ISP_REG(T41_TOP) && !(ISP_REG(T41_TOP) & HLDC_BYPASS) &&
-           (ISP_REG(HLDC_BASE + 4) || ISP_REG(HLDC_BASE + 8)) &&
-           ISP_REG(0x80);
+    return s->l->hldc && ISP_REG(HLDC_TOP(p)) &&
+           !(ISP_REG(HLDC_TOP(p)) & HLDC_BYPASS) &&
+           (ISP_REG(HLDC_REG(p, 4)) || ISP_REG(HLDC_REG(p, 8))) &&
+           ISP_REG(HLDC_SIZE(p));
 }
 
-/* The map of plane @uv (0 luma, 1 chroma) of a w x h channel */
-static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int uv,
+/* The map of pipe @p's plane @uv (0 luma, 1 chroma) of a w x h channel */
+static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int p, int uv,
                                            uint32_t w, uint32_t h)
 {
-    uint32_t sw = ISP_REG(0x80) >> 16, sh = ISP_REG(0x80) & 0xFFFF;
-    uint32_t k = ISP_REG(HLDC_BASE + 4 + 4 * uv);
-    uint32_t zoom = ISP_REG(HLDC_BASE + 0xC + 4 * uv);
-    uint32_t inv = ISP_REG(HLDC_BASE + 0x14 + 4 * uv);
-    uint32_t off = ISP_REG(HLDC_BASE + 0x1C + 4 * uv);
+    uint32_t sw = ISP_REG(HLDC_SIZE(p)) >> 16, sh = ISP_REG(HLDC_SIZE(p)) & 0xFFFF;
+    uint32_t k = ISP_REG(HLDC_REG(p, 4 + 4 * uv));
+    uint32_t zoom = ISP_REG(HLDC_REG(p, 0xC + 4 * uv));
+    uint32_t inv = ISP_REG(HLDC_REG(p, 0x14 + 4 * uv));
+    uint32_t off = ISP_REG(HLDC_REG(p, 0x1C + 4 * uv));
     uint32_t key[8] = { w, h, sw, sh, k, zoom, inv, off };
     double k1 = (int16_t)k, k2 = (int16_t)(k >> 16), z = zoom / 2048.0;
     /* the plane's sensor size: a chroma plane is half the picture */
@@ -2011,10 +2018,11 @@ static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int uv,
     uint32_t n = (uint32_t)cw * (uint32_t)ch, x, y;
     int32_t *m;
 
-    if (!memcmp(s->hldc_map[uv].key, key, sizeof(key)) && s->hldc_map[uv].xy) {
-        return s->hldc_map[uv].xy;
+    if (!memcmp(s->hldc_map[p][uv].key, key, sizeof(key)) &&
+        s->hldc_map[p][uv].xy) {
+        return s->hldc_map[p][uv].xy;
     }
-    m = g_renew(int32_t, s->hldc_map[uv].xy, 2 * n);
+    m = g_renew(int32_t, s->hldc_map[p][uv].xy, 2 * n);
     for (y = 0; y < (uint32_t)ch; y++) {
         for (x = 0; x < (uint32_t)cw; x++) {
             double dx = (x + 0.5) * sx - 0.5 - cx;
@@ -2028,22 +2036,23 @@ static const int32_t *ingenic_isp_hldc_map(IngenicIspState *s, int uv,
             m[2 * (y * (uint32_t)cw + x) + 1] = lround(uy * 256);
         }
     }
-    memcpy(s->hldc_map[uv].key, key, sizeof(key));
-    s->hldc_map[uv].xy = m;
-    s->hldc_map[uv].n = n;
+    memcpy(s->hldc_map[p][uv].key, key, sizeof(key));
+    s->hldc_map[p][uv].xy = m;
+    s->hldc_map[p][uv].n = n;
     return m;
 }
 
 /*
- * Plane @uv of the w x h picture at @addr (stride @stride) through the
+ * Plane @uv of pipe @p's w x h picture at @addr (stride @stride) through the
  * HLDC: luma bytes, or chroma Cb/Cr pairs moved as units
  */
-static void ingenic_isp_hldc_plane(IngenicIspState *s, int uv, uint32_t w,
-                                   uint32_t h, int32_t stride, hwaddr addr)
+static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
+                                   uint32_t w, uint32_t h, int32_t stride,
+                                   hwaddr addr)
 {
     uint32_t cw = uv ? w / 2 : w, ch = uv ? h / 2 : h, bpp = uv ? 2 : 1;
     uint32_t row = cw * bpp, x, y, c;
-    const int32_t *m = ingenic_isp_hldc_map(s, uv, w, h);
+    const int32_t *m = ingenic_isp_hldc_map(s, p, uv, w, h);
     uint8_t *src, *dst;
 
     stride = stride ? stride : (int32_t)w;
@@ -2126,9 +2135,9 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         ivdc = ya == IVDC_Y;
         ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
                           r[l->uvstride >> 2], ya, uva, false, gain, sgain);
-        if (p == 0 && ingenic_isp_hldc_on(s)) {
-            ingenic_isp_hldc_plane(s, 0, w, h, r[l->ystride >> 2], ya);
-            ingenic_isp_hldc_plane(s, 1, w, h, r[l->uvstride >> 2], uva);
+        if (ingenic_isp_hldc_on(s, p)) {
+            ingenic_isp_hldc_plane(s, p, 0, w, h, r[l->ystride >> 2], ya);
+            ingenic_isp_hldc_plane(s, p, 1, w, h, r[l->uvstride >> 2], uva);
         }
         if (ivdc) {
             /* a picture into the IVDC's store (RAM at IVDC_Y) */

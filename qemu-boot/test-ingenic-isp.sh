@@ -474,6 +474,11 @@ if [ -n "$SENSOR1" ]; then
     # frames advance, pipe 1's counter 500000 ahead of pipe 0's
     mv "$OUT/ch1-$first.nv12" "$OUT/ch3-$first.nv12"
     mv "$OUT/ch1-$last.nv12" "$OUT/ch3-$last.nv12"
+    # with --ldc both pipes' HLDC stages are on (0x15000, 0x15080): the
+    # check below on channel 0 and on channel 3
+    [ -n "$LDC" ] && LDC_CHANS="0:${W}x$H 3:${W}x$H"
+fi
+if [ -n "$SENSOR1" ] && [ -z "$LDC" ]; then
     python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
         ${W}x$H:"$OUT/ch0-$first.nv12@0" ${W}x$H:"$OUT/ch0-$last.nv12@0" &&
     python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
@@ -485,14 +490,23 @@ if [ -n "$LDC" ]; then
     # the first frames without the correction (the scene as ever), the
     # last ones through it: the same picture remapped here from the
     # registers' reading (docs/ingenic.md, "HLDC") matches the last
-    python3 "$HERE/ingenic-isp-check.py" ${PNG:+--png "$OUT"} \
-        ${W}x$H:"$OUT/ch0-$first.nv12" 640x360:"$OUT/ch1-$first.nv12" || exit 1
+    LDC_CHANS=${LDC_CHANS:-0:${W}x$H 1:640x360}
+    if [ -n "$SENSOR1" ]; then
+        python3 "$HERE/ingenic-isp-check.py" ${PNG:+--png "$OUT"} \
+            ${W}x$H:"$OUT/ch0-$first.nv12@0" \
+            ${W}x$H:"$OUT/ch3-$first.nv12@500000" || exit 1
+    else
+        python3 "$HERE/ingenic-isp-check.py" ${PNG:+--png "$OUT"} \
+            ${W}x$H:"$OUT/ch0-$first.nv12" 640x360:"$OUT/ch1-$first.nv12" || exit 1
+    fi
     echo "== LDC"
-    python3 - "$OUT" $first $last $W $H ${LDC%,*} ${LDC#*,} <<'PY'
+    python3 - "$OUT" $first $last $W $H ${LDC%,*} ${LDC#*,} $LDC_CHANS <<'PY'
 import sys
 import numpy as np
 out, first, last, sw, sh, k1, k2 = sys.argv[1], sys.argv[2], sys.argv[3], \
     *map(int, sys.argv[4:8])
+chans = [(int(c.split(':')[0]), tuple(map(int, c.split(':')[1].split('x'))))
+         for c in sys.argv[8:]]
 
 def calc(w, h, cx, cy):
     """tisp_hldc_calc_para: 1 / r2max and the zoom"""
@@ -520,7 +534,7 @@ def remap(img):
             (px(y0 + 1, x0) * (1 - fx) + px(y0 + 1, x0 + 1) * fx) * fy)
 
 ok = True
-for ch, (w, h) in ((0, (sw, sh)), (1, (640, 360))):
+for ch, (w, h) in chans:
     load = lambda n: np.fromfile('%s/ch%d-%s.nv12' % (out, ch, n), np.uint8,
                                  w * h).reshape(h, w).astype(float)
     a, b = load(first), load(last)

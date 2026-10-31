@@ -1907,11 +1907,16 @@ saves more: the later frames match the earlier remapped on the host from
 the same registers (95 % of pixels identical, against 157 levels apart
 without the remap). T40's module writes the same registers through
 `tisp_hldc_con_par_cfg` -- the main pipe's at (0x2A0 << 7) = 0x15000, its
-second pipe's at 0x15080 (not applied: the model corrects the main pipe)
--- and the same bypass bit 20; `/dev/tisp` reaches it as module 20 (T41:
-21), the pipe in word 3 and the 16 halfwords from word 4 (T41: from
-word 3). `--ldc` on T40 passes the same way (100 % of the sampled pixels
-within 0 of the host's remap, against 111 levels without it).
+second pipe's at 0x15080 -- and the same bypass bit 20; `/dev/tisp`
+reaches it as module 20 (T41: 21), the pipe in word 3 and the 16
+halfwords from word 4 (T41: from word 3). `--ldc` on T40 passes the same
+way (100 % of the sampled pixels within 0 of the host's remap, against
+111 levels without it). The second pipe's stage is the main one's at
++0x80, with its module bypasses at 0x44 (`tisp_s_module_control`:
+(pipe + 16) << 2) and its sensor picture at 0x84 (`tisp_sec_init`), and
+corrects pipe 1's channels the same way: `--sensor1 gc4653 --ldc K1,K2`
+sets both pipes and checks channels 0 and 3 against the host's remap
+(95 % within 0 on both, against 111 levels without it).
 
 T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
 VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
@@ -2215,7 +2220,7 @@ has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's YUV422 write-back, dithering and TLB retry /
-verification registers (storage), T40's second pipe's HLDC, T41's LDC block (below), T23's double firmware's double
+verification registers (storage), T41's LDC block (below), T23's double firmware's double
 direct mode (`direct_mode=2`; above)
 and the blocks below read as zero or as storage.
 
