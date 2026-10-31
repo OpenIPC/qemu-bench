@@ -75,6 +75,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
 | 0x130C0000 | T41: VO, NV12 out over BT.656 / BT.1120, shown on the display, IRQ 43 (`/machine/vo`) | `ingenic-vo` |
 | 0x13050000 | T40, T41: DPU, the LCD controller (frame and layer descriptors, composed onto a display), IRQ 20 (`/machine/dpu`, display id `dpu`) | `ingenic-dpu` |
+| 0x13050000 | T21, T23, T30, T31: LCDC, the "tiny" LCD controller (TFT or smart panel), IRQ 31 (T30: 5) (`/machine/lcdc`, display id `lcdc`) | `ingenic-lcdc` |
 | 0x130A0000 | T40, T41: bus MONITOR (AXI/AHB bandwidth and address watch), IRQ 53 | `ingenic-monitor` |
 | 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
 | 0x13090000 | T40: BSCALER, the NNA's image engine (resize / affine / perspective, NV12 to colour), IRQ 40 (T) / 39 (C) (`/machine/bscaler`) | `ingenic-bscaler` |
@@ -974,6 +975,22 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   frame goes out over a frame time (`fps`, 30) onto the machine's display
   -- a QEMU graphic console, so `screendump` captures it -- and raises
   INT_VAL bit 0 (cleared through INT_CLC); `frames` counts them.
+- `ingenic-lcdc` (T21, T23, T30, T31; the 3.10 kernels'
+  `drivers/video/jz_fb_v14`, `jz-fb`, the SDKs' `sample_slcd`). A chain of
+  7-word frame descriptors from CHAIN_ADDR -- next, buffer, stride in
+  pixels, chain config (bit 0 go on to the next: the driver's looping
+  chain sets it, its single-frame mode not -- inferred), interrupt
+  control, UV buffer and stride -- shown each frame time (`fps`, 60) at
+  the panel's size: SLCD_FRM_SIZE with a smart panel (DISP_COMMON bit 0),
+  else the TFT's HDE / VDE windows; GLB_CFG [18:16] RGB555 / RGB565 /
+  RGB888-in-32 / NV12 / NV21 with its colour order [21:19]. CTRL
+  CHAIN_START loads the chain, SLCD_START / TFT_START run it, QCK_STOP
+  ends at once (QCK_STOPM), GEN_STOP after the frame (GEN_STOPM); ST
+  FRM_END / DMA_END each frame, CSR clears, INT_FLAG = ST & INTC drives
+  the interrupt. SLCD_CMD words (command, parameter, data) are counted
+  (`slcd-cmds`, `slcd-last`); SLCD_ST is never busy. No shipped XBurst1
+  kernel builds the driver, so it is checked by qtest; `screendump
+  device=lcdc` captures it.
 - `ingenic-dpu` (T40, T41; the 4.4 kernel's `fbdev/ingenic/fb_v12`, which
   binds `ingenic,t40-dpu`; T41's device tree calls it `t41-dpu`; the
   `/dev/fb0` of the SDK's `sample-LCD`). Neither SDK kernel builds the

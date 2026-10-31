@@ -1629,6 +1629,21 @@ static void ingenic_init(MachineState *ms)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, ingenic_irq(ims, IRQ_LCD));
     }
 
+    /*
+     * The XBurst1 parts' LCDC at the same address (jz_fb_v14, jz-fb):
+     * T21, T23, T31 on INTC 31, T30 on 5; /machine/lcdc, display "lcdc"
+     */
+    if (info->soc == INGENIC_T21 || info->soc == INGENIC_T23 ||
+        info->soc == INGENIC_T30 || info->soc == INGENIC_T31) {
+        dev = qdev_new("ingenic-lcdc");
+        dev->id = g_strdup("lcdc");
+        object_property_add_child(OBJECT(ims), "lcdc", OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, DPU_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ingenic_irq(ims, info->soc == INGENIC_T30 ? 5 : 31));
+    }
+
     /* T40's BSCALER, the NNA's image engine: /machine/bscaler */
     if (info->soc == INGENIC_T40) {
         dev = qdev_new("ingenic-bscaler");

@@ -1174,6 +1174,66 @@ def test_dpu(qt, intc=CORE_INTC):
     qt.writel(DPU + 0x3000, 0)
 
 
+def test_lcdc(qt, irq=31):
+    print('ingenic-lcdc (XBurst1 LCD controller, jz_fb_v14)')
+    L, W, H = 0x13050000, 80, 60
+    FD, BUF = SCRATCH, SCRATCH + 0x10000
+    le = lambda *w: b''.join(struct.pack('<I', v) for v in w)
+    ppm = os.path.join(qt.dir, 'lcdc.ppm')
+
+    def shot():
+        qt.qmp('screendump', filename=ppm, device='lcdc')
+        hdr = open(ppm, 'rb').read().split(b'\n', 3)
+        return hdr, (lambda x, y: tuple(hdr[3][(y * W + x) * 3:
+                                                (y * W + x) * 3 + 3]))
+
+    # a smart panel: frame size, RGB565, one frame (chain config 0)
+    qt.writel(L + 0x8000, 1)
+    qt.writel(L + 0xA00C, (H << 16) | W)
+    qt.writel(L + 0x0004, 1 << 16)
+    qt.write(BUF, struct.pack('<H', 0x07E0) * (W * H))         # green
+    qt.write(FD, le(FD, BUF, W, 0, 2, 0, 0))
+    qt.writel(L + 0x0000, FD)
+    qt.writel(L + 0x100C, 1 << 1)                              # FRM_END
+    qt.writel(L + 0xA014, (1 << 31) | 0x2c)                    # write RAM
+    check('the panel command, SLCD never busy',
+          (qt.qom_get('/machine/lcdc', 'slcd-last'), qt.readl(L + 0xA018)),
+          ((1 << 31) | 0x2c, 0))
+    qt.writel(L + 0x1000, 1)                                   # CHAIN_START
+    qt.writel(L + 0x1000, 1 << 4)                              # SLCD_START
+    check('WORKING', qt.readl(L + 0x1004) & 1, 1)
+    qt.step(20 * 1000 * 1000)
+    check('one frame: FRM_END and DMA_END, stopped (chain config 0)',
+          qt.readl(L + 0x1004) & 7, 6)
+    check('INT_FLAG and the INTC line', (qt.readl(L + 0x101C),
+          (qt.readl(INTC + 0x00 + 4 * 0) >> irq) & 1 if irq < 32 else 0),
+          (2, 1))
+    hdr, px = shot()
+    check('the display is the panel\'s %s, green' % hdr[1].decode(),
+          (hdr[1], px(40, 30)), (b'%d %d' % (W, H), (0, 255, 0)))
+    qt.writel(L + 0x1008, 0x6E)
+    check('CSR clears, the line drops', (qt.readl(L + 0x101C),
+          (qt.readl(INTC) >> irq) & 1), (0, 0))
+    # a TFT: DE window 80x60, NV12 white, a looping chain, general stop
+    qt.writel(L + 0x8000, 0)
+    qt.writel(L + 0x9008, (40 << 16) | (40 + W))
+    qt.writel(L + 0x900C, (20 << 16) | (20 + H))
+    qt.writel(L + 0x0004, 4 << 16)
+    qt.write(BUF, bytes([235]) * (W * H) + bytes([128]) * (W * H // 2))
+    qt.write(FD, le(FD, BUF, W, 1, 2, BUF + W * H, W))
+    qt.writel(L + 0x1000, 1 << 5)                              # TFT_START
+    qt.step(60 * 1000 * 1000)
+    hdr, px = shot()
+    check('a looping chain runs; NV12 white on the TFT',
+          (qt.readl(L + 0x1004) & 1,
+           qt.qom_get('/machine/lcdc', 'frames') >= 3, px(10, 10)),
+          (1, True, (255, 255, 255)))
+    qt.writel(L + 0x1000, 1 << 3)                              # GEN_STOP
+    qt.step(20 * 1000 * 1000)
+    check('a general stop after the frame: GEN_STOPM, not WORKING',
+          qt.readl(L + 0x1004) & 0x21, 0x20)
+
+
 def test_i2d(qt, intc=CORE_INTC):
     print('ingenic-i2d (T40/T41)')
     W, H = 8, 4
@@ -3746,6 +3806,12 @@ def main():
         test_bscaler(qt)
         test_bscaler_lzma(qt)
         test_nndma(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31')
+        test_lcdc(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't30')
+        test_lcdc(qt, 5)
         qt.close()
         qt = QTest(a.qemu, 't31,motor=ms41929')
         test_motor_ms41929(qt)
