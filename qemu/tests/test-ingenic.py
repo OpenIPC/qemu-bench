@@ -3196,6 +3196,55 @@ ISP_LAYOUTS = {
 }
 
 
+def test_isp_t23_dual(qt):
+    """T23's double firmware: one pipe, the two sensors' pictures in turn"""
+    print('ingenic-isp (t23 double firmware: two sensors through one pipe)')
+    (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
+     vsta, vclr) = ISP_LAYOUTS['t23']
+    w, h = 216, 108                 # the counter's cells 2 pixels wide
+    ch0 += ISP
+    buf = [0x00400000, 0x00440000, 0x00480000]
+
+    def sensor_of(a):
+        # the counter's first digit: "0" (sensor 0's frame numbers) or "5"
+        # (sensor 1's, 500000 ahead); its middle row's centre is lit in "5"
+        # only (ingenic-isp-check.py's digit grid, cell 2 at 108 lines)
+        return 1 if qt.read(a + 9 * w + 7, 1)[0] > 150 else 0
+
+    def frame(a):
+        qt.writel(ch0 + push_y, a)
+        qt.writel(ch0 + push_uv, a + w * h)
+        qt.step(41 * 1000 * 1000)
+        return qt.readl(ch0 + pop_y)
+
+    qt.writel(ch0 + size, w << 16 | h)
+    qt.writel(ch0 + 0x40, w)            # Y and UV strides
+    qt.writel(ch0 + 0x60, w)
+    qt.writel(ISP + ch_en, 1)
+    qt.writel(vic + 0x00, 1)
+    qt.writel(ISP + en, 0xFFFFFFFF)
+    frame(buf[0])
+    check('single firmware (no 0xC0 bit 15): no pass end, sensor 0',
+          (qt.readl(ISP + 0xC8), sensor_of(buf[0])), (0, 0))
+    qt.writel(ISP + clr, qt.readl(ISP + sta))
+    # tisp_init's double setup enables the pass end
+    qt.writel(ISP + 0xC0, 0x8000)
+    got = []
+    for i in range(4):
+        a = frame(buf[(i + 1) % 3])
+        got.append(sensor_of(a))
+        if i == 0:
+            check('a pass ends: 0xC8 bit 15 on the core line (INTC 29)',
+                  (qt.readl(ISP + 0xC8) & 0x8000,
+                   (qt.readl(INTC + 0x00) >> 29) & 1), (0x8000, 1))
+        qt.writel(ISP + 0xC4, qt.readl(ISP + 0xC8))     # the ISR's ack
+        qt.writel(ISP + clr, qt.readl(ISP + sta))
+    check('acked through 0xC4: 0xC8 clear, the line drops',
+          (qt.readl(ISP + 0xC8), (qt.readl(INTC + 0x00) >> 29) & 1), (0, 0))
+    check('the passes alternate the sensors, the main one first', got,
+          [0, 1, 0, 1])
+
+
 def test_isp_t40_pipe1(qt):
     """T40's second pipe: VIC1, channels 3..5, its interrupts and 3A"""
     print('ingenic-isp (T40 second pipe)')
@@ -3915,6 +3964,7 @@ def main():
               [0x20, 0x53])
         check('gc2053s1 ID at I2C0 0x3f', i2c_read_reg(qt, I2C0, 0x3F, 0xF0, 2),
               [0x20, 0x53])
+        test_isp_t23_dual(qt)
         qt.close()
         qt = QTest(a.qemu, 't20,sensor=jxf22')
         test_isp_apical(qt)

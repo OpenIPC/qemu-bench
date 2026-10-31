@@ -1974,25 +1974,48 @@ corrupts memory: a `kfree` BUG in `tiziano_load_parameters`), so the
 test fetches the 2.10 `gc2053-t23.bin` of OpenIPC's first T23 package.
 
 T23's second sensor (`sensor1=gc2053s1`: the SDK's `gc2053s1` driver, a
-GC2053 at I2C0 0x3f beside the first) is attached and probes, but T23's
-dual-sensor ISP (the SDK's `tx-isp-t23-double` firmware, H20230726b,
-linked into a module by `test-ingenic-t23-enc.sh --sensor1 gc2053s1`)
-does not stream here. It has one pipe and one VIC: in this mode the
-core sets the VIC's "raw pipe" (`tx_isp_subdev_pipo`: the VIC's qbuf,
-clearbuf and s_stream registered as the core's raw-frame ops, field 524
-of the core set) and skips the 0xB0 / 0xC0 interrupt enables in
-`ispcore_video_s_stream`; the core queues raw buffers to the VIC
-(`ispvic_frame_channel_qbuf`: VIC 0x318 + 4 n), the VIC's MDMA caches
-the sensors' raw frames into them (the 0x300-0x350 registers of T40's
-`snapraw`, `vic_mdma_enable` / `vic_pipo_mdma_enable`),
-`vic_framedone_irq_function` matches 0x380 against the queued buffers
-and sets the frame count in 0x300, and `vic_mdma_irq_function` hands the
-frames to the core (`vic_mdma_ch0_sub_get_num`, `..._set_buff_index`),
-which processes them from DDR in turn -- a path whose ISP-side input
-registers are not decoded. The firmware also writes ISP offsets
-0x20000-0x7FFFF (beyond T23's single-sensor 64 KiB window) and the VIC's
-0x200 (0x80010001) and 0x208 (200000); with the model as it is the VIC
-runs, the core is never enabled and no frame reaches a channel.
+GC2053 at I2C0 0x3f beside the first) streams through the SDK's
+dual-sensor firmware (`tx-isp-t23-double`, H20230726b, linked into a
+module by `test-ingenic-t23-enc.sh --sensor1 gc2053s1`; symbols in its
+`libt23-firmware.a`). T23 has one pipe and one set of MSCA channels:
+the firmware takes the two sensors' pictures in turn, a pass of one
+then a pass of the other. Its `tisp_init` enables a second status word
+(0xC0 = 0x8000; the single-sensor firmware never touches 0xC0-0xC8), and
+`ispcore_interrupt_service_routine`, after handling the channels' done
+bits under the current sensor index `vi_num`, acks 0xC8 into 0xC4 and on
+bit 15 -- the end of a pass -- counts, sets `vi_num = count & 1`, reloads
+that sensor's whole register set (`tisp_rcfg_cfg_trig`: top bypasses,
+AE / AWB / AF banks and zones, gamma, scaler, ...), pushes that
+sensor's queued buffers into the MSCA FIFOs and enables or disables
+each channel (`tisp_msca_chx_en`), then writes 1 to the VIC's control.
+`tisp_msca_channel_start(n)` maps frame channels 0-2 / 3-5 to sensor
+n / 3's channel n % 3 of the same hardware, so channel enables wait for
+the first pass end. The model, once 0xC0 bit 15 is set, ends every pass
+with 0xC8 bit 15 (on the core's line, cleared through 0xC4) and paints
+the next pass from the other sensor -- its scene 500000 frames ahead,
+its own exposure and gain, its statistics into the banks the reload
+set. Which sensor a pass takes is in no register the driver writes; the
+model alternates, as the firmware's count does, starting with the main
+sensor when 0xC0 bit 15 is set (inferred).
+
+Each sensor gets one AE zone and one histogram bank
+(`tisp_ae_multi_sensor_malloc_cfg`: +0x4C = 0x10010000), and the double
+firmware never writes the AE's enable at 0xA000: the model takes +0x4C
+bit 16 as the enable in that format (inferred), so each sensor's AE
+runs -- both climb from a dark start (mean Y 0 to 32 in 60 passes),
+their gains a little apart. With the same encoder sizes for both
+sensors, HELIX keeps each stream's reference by the addresses its chain
+gives (MCE's reference at 0x5006C, DBLK's destination at 0x60008)
+instead of by picture size, which mixed the two sensors' P pictures.
+`test-ingenic-t23-enc.sh --sensor1 gc2053s1`: four H.264 streams (each
+sensor's 1080p and 640x360), every picture decoded with no decoder
+message, the first and last of each showing its sensor's scene (counter
+ranges 0.. and 500000..). The firmware's "double direct" mode
+(`direct_mode=2`, both main streams into the IVDC) does not stream: the
+second sensor's passes get no IVDC buffer on channel 0 and the ISR logs
+"vb is null, buf get:0x80000000 ... isp_index = 1". The firmware also
+writes ISP offsets 0x20000-0x7FFFF (LUTs beyond the 64 KiB window,
+dropped).
 
 T30 couples the same Apical core with a T31-style MSCA scaler of its own
 (0x130B0000, IRQ 27), which `ingenic-isp`'s "t30" layout models, and
@@ -2107,6 +2130,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t31` + vendor modules, `sensor=gc2053` | `t31` | `-kernel` + NOR root | 1920x1080 and 640x360 NV12 frames through libimp's FrameSource (`test-ingenic-isp.sh`) |
 | OpenIPC `t21` + vendor modules, `sensor=jxf37` | `t21` | `-kernel` + NOR root | the same, DVP (`test-ingenic-isp.sh --soc t21`) |
 | OpenIPC `t23` + vendor modules, `sensor=gc2053` | `t23` | `-kernel` + NOR root | the same (`test-ingenic-isp.sh --soc t23`) |
+| OpenIPC `t23` + the T23 SDK's double firmware (`tx-isp-t23-double`), its `gc2053` / `gc2053s1` modules and `libimp.a` | `t23,sensor=gc2053,sensor1=gc2053s1` | `-kernel` + NOR root, `test-ingenic-t23-enc.sh --sensor1 gc2053s1` | one pipe takes the two sensors in turn: four H.264 streams (each sensor's 1080p and 640x360), every picture decoded, each showing its own sensor's scene; both sensors' AE run |
 | OpenIPC `t20` + vendor modules, `sensor=jxf22` | `t20` | `-kernel` + NOR root | the same, through the Apical core's DMA writers (`test-ingenic-isp.sh --soc t20`) |
 | OpenIPC `t40` + vendor modules, `sensor=gc4653` | `t40 -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t40`) |
 | OpenIPC `t31` / `t40` + vendor modules, `sensor=gc4653`; T41NQ SDK image, `gc4663`; the sensors' DOL WDR | `t31 -m 128M` / `t40` / `t41` | as above | frames in the WDR mode, the short exposure written (T40, T41: moving), under 2 % of the last frame clipped (`test-ingenic-isp.sh --wdr`) |
@@ -2188,9 +2212,8 @@ has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
 than 0 and 2, the DPU's YUV422 write-back, dithering and TLB retry /
-verification registers (storage), T40's second pipe's HLDC, T41's LDC block (below), T23's dual-sensor raw pipe (the
-SDK's double firmware: the VIC caching both sensors' raw frames for the
-one ISP to process from DDR; above)
+verification registers (storage), T40's second pipe's HLDC, T41's LDC block (below), T23's double firmware's double
+direct mode (`direct_mode=2`; above)
 and the blocks below read as zero or as storage.
 
 What the remaining video and compute blocks would need (survey of the

@@ -20,10 +20,11 @@
 # --direct 1 asks the main stream's encoder channel for the IVDC (and
 # loads tx-isp-t23 with direct_mode=1).  --sdk uses the T23 SDK's own
 # tx-isp-t23.ko, sensor module and libimp.a instead of OpenIPC's.
-# --sensor1 gc2053s1 loads the SDK's dual-sensor firmware; its raw pipe
-# (the VIC caching both sensors' raw frames for one ISP) is not modelled,
-# so that run does not stream yet (docs/ingenic.md); with it --direct 2
-# would be the SDK's "double direct" mode.
+# --sensor1 gc2053s1 loads the SDK's dual-sensor firmware: one ISP pipe
+# takes the two sensors' pictures in turn (docs/ingenic.md), four streams
+# (each sensor's 1080p and 640x360).  Its "double direct" mode (--direct
+# 2, both main streams through the IVDC) does not stream: the second
+# sensor's passes get no IVDC buffer on channel 0 (docs/ingenic.md).
 # The double firmware needs a 2.10 tuning file: OpenIPC's first T23
 # gc2053-t23.bin, fetched from its firmware repository (or BIN210=FILE).
 # QEMU_EXTRA in the environment adds QEMU options (its stderr goes to
@@ -248,7 +249,8 @@ done
 grep -a -E "T23TEST|^stream[0-3] picture [0-9]*:|t23-enc:|failed" "$OUT/console.log" | grep -v PMEM | tail -40 || true
 if ! grep -a "t23-enc: PASS" "$OUT/console.log" >/dev/null; then
     note=
-    [ -n "$SENSOR1" ] && note=" (the T23 dual-sensor raw pipe is not modelled)"
+    [ -n "$SENSOR1" ] && [ "$DIRECT" = 2 ] &&
+        note=" (the double firmware's double direct mode is not modelled)"
     echo "FAIL: the client did not get its streams$note"
     exit 1
 fi

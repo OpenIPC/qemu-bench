@@ -159,6 +159,14 @@ typedef struct IngenicIspLayout {
     uint16_t day_r, day_b;
     bool hldc;                  /* T40/T41: the HLDC lens correction stage */
     hwaddr dgain;               /* the AE's ISP digital gain, Q10 (0: none) */
+    /*
+     * T23's double firmware: one pipe for two sensors, the picture of
+     * each pass taken from one sensor and the next from the other.  A
+     * second status word (sta2, enabled by sta2_en, written to sta2_clr
+     * to clear) carries the end of a pass on bit 15, on the core's line;
+     * 0: none
+     */
+    hwaddr sta2, sta2_en, sta2_clr;
 } IngenicIspLayout;
 
 static const IngenicIspLayout ingenic_isp_layouts[] = {
@@ -223,6 +231,8 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         .ae_static_bit = 26, .ae_hist_bit = 27, .awb_bit = 30, .stat_gen = 1,
         .wb = 0x1804,                   /* Tiziano_awb_set_gain */
         .xstat = 2,
+        /* the double firmware's pass end (ispcore_interrupt_service_routine) */
+        .sta2 = 0xC8, .sta2_en = 0xC0, .sta2_clr = 0xC4,
     }, {
         /*
          * T30's scaler (isp-m3, 0x130B0000, IRQ 27 = INTC 19): the T31
@@ -346,7 +356,9 @@ struct IngenicIspState {
     uint32_t light_r, light_b;  /* its colour: the raw R and B of a white
                                    over its G, per mille */
     Object *sensor;             /* the image sensor, for its exposure */
-    Object *sensor1;            /* T40: the second pipe's sensor */
+    Object *sensor1;            /* T40: the second pipe's sensor; T23:
+                                   the double firmware's second one */
+    uint8_t dual_src;           /* T23 double: the sensor of this pass */
     Object *sensor2;            /* T40: the third sensor, on VIC2 */
     const IngenicIspLayout *l;
 
@@ -436,6 +448,21 @@ static int ingenic_isp_pipes(IngenicIspState *s)
     return MAX(s->l->pipes, 1);
 }
 
+/* T23's double firmware runs: it enables the pass end, sta2 bit 15 */
+static bool ingenic_isp_dual(IngenicIspState *s)
+{
+    return s->l->sta2 && (ISP_REG(s->l->sta2_en) & (1u << 15));
+}
+
+/*
+ * The sensor pipe @p's picture comes from: 1 for T40's second pipe, and
+ * on T23's double firmware the sensor of the current pass
+ */
+static int ingenic_isp_src(IngenicIspState *s, int p)
+{
+    return p ? 1 : ingenic_isp_dual(s) ? s->dual_src : 0;
+}
+
 /* VIC @v's registers (T40: three VICs, 64 KiB apart) */
 static uint32_t *ingenic_vic_regs(IngenicIspState *s, int v)
 {
@@ -467,6 +494,9 @@ static void ingenic_isp_update(IngenicIspState *s)
             en = ~en;
         }
         isp |= !!(ISP_REG(PIPE_INT(p, l->int_sta)) & en);
+    }
+    if (l->sta2) {
+        isp |= !!(ISP_REG(l->sta2) & ISP_REG(l->sta2_en));
     }
     qemu_set_irq(s->isp_irq, isp);
     qemu_set_irq(s->vic_irq, ingenic_vic_pending(s, 0));
@@ -573,7 +603,8 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 {
     uint64_t g = (uint64_t)s->light * 256 / 100;
     uint64_t level = s->l->ae ?
-        ingenic_isp_sensor_level(pipe ? s->sensor1 : s->sensor) : 0;
+        ingenic_isp_sensor_level(ingenic_isp_src(s, pipe) ? s->sensor1 :
+                                 s->sensor) : 0;
 
     if (level) {
         g = g * level / EXPOSURE_1X;
@@ -612,7 +643,8 @@ static uint32_t ingenic_isp_short_gain(IngenicIspState *s, int pipe)
     if (pipe || !ingenic_isp_wdr_mode(s)) {
         return 0;
     }
-    level = ingenic_isp_sensor_short(s->sensor);
+    level = ingenic_isp_sensor_short(ingenic_isp_src(s, pipe) ? s->sensor1 :
+                                     s->sensor);
     if (!level) {
         return 0;
     }
@@ -918,7 +950,16 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
     int lo = thr & 0xFF, hi = (thr >> 8) & 0xFF;
     /* T21 has no enable bits: a block runs once it has its banks */
     bool en_bits = l->stat_gen != 3;
-    bool ae = (!en_bits || (ISP_REG(ae_blk) & 1)) && ISP_REG(ae_blk + 0x2C);
+    /*
+     * T23's double firmware never writes the AE's enable (+0x00): its
+     * tisp_ae_multi_sensor_malloc_cfg gives each sensor one zone and one
+     * histogram bank and writes +0x4C = 0x10010000, against the single
+     * firmware's bank counts; bit 16 is taken for the enable there
+     * (inferred: no other write turns the block on)
+     */
+    bool ae = (!en_bits || (ISP_REG(ae_blk) & 1) ||
+               (l->stat_gen == 1 && (ISP_REG(ae_blk + 0x4C) & (1u << 16)))) &&
+              ISP_REG(ae_blk + 0x2C);
     bool awb = (!en_bits || (ISP_REG(awb_blk) & 1)) && ISP_REG(awb_blk + 0x3C);
     int zx, zy, i, j, w, h;
     AwbFilter flt;
@@ -1118,8 +1159,8 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                  l->wb ? ISP_REG(l->wb + 4) & 0xFFF : 0,
                  s->light_r, s->light_b,
                  ISP_REG(l->xstat == 3 ? T41_TOP : T31_TOP),
-                 (unsigned)(ingenic_isp_sensor_short(pipe ? s->sensor1 :
-                                                     s->sensor) / 1024),
+                 (unsigned)(ingenic_isp_sensor_short(
+                     ingenic_isp_src(s, pipe) ? s->sensor1 : s->sensor) / 1024),
                  ingenic_isp_wdr_mode(s) ? " wdr" : "");
         if (s->sensor) {
             IngenicSensorExposure e = { 0 };
@@ -2058,7 +2099,7 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     uint32_t en = ISP_REG(PIPE_CH(p, l->ch_en));
     uint32_t gain = ingenic_isp_gain(s, p);
     uint32_t sgain = ingenic_isp_short_gain(s, p);
-    uint32_t frame = s->frame + (p ? PIPE1_FRAME : 0);
+    uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
     hwaddr int_sta = PIPE_INT(p, l->int_sta);
     uint32_t *vic = ingenic_vic_regs(s, p);
     int n;
@@ -2122,6 +2163,18 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     if (!l->no_vic) {
         vic[l->vic_sta >> 2] |= 1;
         ingenic_vic_mdma(s, p, frame);
+    }
+    if (p == 0 && ingenic_isp_dual(s)) {
+        /*
+         * T23's double firmware: the pass of one sensor ends (sta2 bit
+         * 15); its ISR then reloads the other sensor's register set
+         * (tisp_rcfg_cfg_trig, vi_num = count & 1), queues that sensor's
+         * buffers and enables its channels, and the next picture is the
+         * other sensor's.  Which sensor a pass takes is in no register the
+         * driver writes: the two simply alternate, as its count does
+         */
+        ISP_REG(l->sta2) |= 1u << 15;
+        s->dual_src ^= 1;
     }
 }
 
@@ -2281,6 +2334,23 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
         }
     }
     if (ingenic_isp_pipe_reg(s, off, l->int_sta) >= 0) {
+        return;
+    }
+    if (l->sta2 && off == l->sta2) {
+        return;
+    }
+    if (l->sta2 && off == l->sta2_clr) {
+        ISP_REG(l->sta2) &= ~val;
+        s->isp[off >> 2] = val;
+        ingenic_isp_update(s);
+        return;
+    }
+    if (l->sta2 && off == l->sta2_en) {
+        if ((val & ~ISP_REG(off)) & (1u << 15)) {
+            s->dual_src = 0;        /* the first pass is the main sensor's */
+        }
+        s->isp[off >> 2] = val;
+        ingenic_isp_update(s);
         return;
     }
     p = ingenic_isp_pipe_reg(s, off, l->int_clr);
@@ -2472,6 +2542,7 @@ static void ingenic_isp_reset(DeviceState *dev)
     s->vic_running = false;
     s->vic1_running = false;
     s->vic2_running = false;
+    s->dual_src = 0;
     memset(s->mdma_slot, 0, sizeof(s->mdma_slot));
     s->frame = 0;
     for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
@@ -2613,7 +2684,7 @@ static const VMStateDescription vmstate_ingenic_isp_chan = {
 
 static const VMStateDescription vmstate_ingenic_isp = {
     .name = TYPE_INGENIC_ISP,
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 1,
     .post_load = ingenic_isp_post_load,
     .fields = (const VMStateField[]) {
@@ -2635,6 +2706,7 @@ static const VMStateDescription vmstate_ingenic_isp = {
         VMSTATE_BOOL_V(vic1_running, IngenicIspState, 3),
         VMSTATE_BOOL_V(vic2_running, IngenicIspState, 4),
         VMSTATE_UINT8_ARRAY_V(mdma_slot, IngenicIspState, 3, 4),
+        VMSTATE_UINT8_V(dual_src, IngenicIspState, 5),
         VMSTATE_TIMER_PTR(timer, IngenicIspState),
         VMSTATE_END_OF_LIST()
     },
