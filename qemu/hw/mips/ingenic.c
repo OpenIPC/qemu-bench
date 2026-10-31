@@ -907,7 +907,7 @@ static void ingenic_init(MachineState *ms)
     MemoryRegion *usbphy;
     const IngenicVariant *var;
     CPUMIPSState *env;
-    DeviceState *dev, *gpio, *cpm, *pdma;
+    DeviceState *dev, *gpio, *cpm, *pdma, *uart[6] = { NULL };
     SysBusDevice *sbd;
     int i;
 
@@ -1089,6 +1089,15 @@ static void ingenic_init(MachineState *ms)
         qdev_prop_set_chr(dev, "chardev", serial_hd(hd));
         qdev_prop_set_bit(dev, "paced", true);
         qdev_prop_set_uint32(dev, "tx-fifo", 64);   /* ingenic_uart.c's */
+        /*
+         * The jz47xx UART: a 64-byte receive FIFO (triggers 1/16/32/60),
+         * IER bit 4 the receive timeout's own enable (jz_uart.c's DMA
+         * mode sets it without RDI), and the PDMA requests
+         */
+        qdev_prop_set_uint32(dev, "rx-fifo", 64);
+        qdev_prop_set_bit(dev, "rtoie", true);
+        qdev_prop_set_bit(dev, "dma-requests", true);
+        uart[i] = dev;
         qdev_set_legacy_instance_id(dev, UART_BASE + i * 0x1000, 2);
         qdev_prop_set_uint8(dev, "endianness", DEVICE_LITTLE_ENDIAN);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
@@ -1250,6 +1259,16 @@ static void ingenic_init(MachineState *ms)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, PDMA_BASE);
     sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_PDMA));
+    /* UART n requests the PDMA on lines 0x14 - 2n (TX) and 0x15 - 2n (RX) */
+    for (i = 0; i < ARRAY_SIZE(uart) && uart[i]; i++) {
+        DeviceState *ser = DEVICE(object_resolve_path_component(
+                                      OBJECT(uart[i]), "serial"));
+
+        qdev_connect_gpio_out_named(ser, "drq-tx", 0,
+            qdev_get_gpio_in_named(pdma, "drq", 0x14 - 2 * i));
+        qdev_connect_gpio_out_named(ser, "drq-rx", 0,
+            qdev_get_gpio_in_named(pdma, "drq", 0x15 - 2 * i));
+    }
     dev = qdev_new("ingenic-aic");
     switch (info->soc) {
     case INGENIC_T10: case INGENIC_T20: case INGENIC_T21: case INGENIC_T30:
