@@ -40,7 +40,11 @@
  * Write-back (frame control bit 1): the composed frame also goes to the
  * write-back address, its stride in pixels, as ARGB8888 (format 0),
  * RGB565 (1), RGB555 (2), Y (4, mono) or RGB888 in 32 bits (6), raising
- * WDMA_END (ST bit 15); YUV422 (3) is not converted (logged).
+ * WDMA_END (ST bit 15); YUV422 (3) packed Y0 U Y1 V, BT.601 studio swing
+ * (byte order and matrix inferred).  Frame control bit 4 dithers the
+ * write-back (bit 5: to the format's widths, else the drop widths in
+ * [25:20]), DISP_COM (0x8000) bit 4 the display, with [21:16]: a 4x4
+ * ordered threshold (the pattern inferred).
  *
  * The simple-read channel ("RDMA", CONFIG_INGENIC_FB_SIMPLE_RDMA):
  * 0x1000 RDMA_CHAIN_ADDR the first descriptor, 0x1004 RDMA_CHAIN_CTRL
@@ -102,6 +106,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicDpuState, INGENIC_DPU)
 #define R_RDMA_DES      0x2114
 #define R_RDMA_SITE     0x2204
 #define R_TLB_GLBC      0x3000
+#define R_DISP_COM      0x8000      /* DISP_COM: bit 4 dither, [21:16] widths */
+#define DISP_COM_DITHER (1u << 4)
 #define R_TLB_TLBA      0x3010
 
 #define CTRL_QCK_STP_RD (1u << 1)
@@ -372,23 +378,89 @@ static void dpu_show(IngenicDpuState *s, const uint32_t *fb, int w, int h)
     dpy_gfx_update_full(s->con);
 }
 
-/* Write-back: the frame to @addr, @stride pixels a line, in @fmt */
-static void dpu_writeback(const uint32_t *fb, int w, int h, uint32_t addr,
-                          uint32_t stride, uint32_t fmt)
+/*
+ * Dithering, as the driver's fields set it: a drop width per channel
+ * (0, 2, 3 or 4 low bits: codes 0..3, blue / green / red two bits each
+ * from @shift), the value rounded to the kept bits through a 4x4
+ * ordered (Bayer) threshold.  The pattern is not in the driver: inferred.
+ */
+static const uint8_t dpu_bayer[4][4] = {
+    { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 },
+};
+
+static unsigned dpu_dither1(unsigned v, unsigned drop, int x, int y)
 {
+    unsigned t;
+
+    if (!drop) {
+        return v;
+    }
+    t = (dpu_bayer[y & 3][x & 3] << drop) >> 4;     /* 0 .. 2^drop - 1 */
+    v = MIN(v + t, 255u);
+    return v & ~((1u << drop) - 1);
+}
+
+static uint32_t dpu_dither(uint32_t v, uint32_t dw, int x, int y)
+{
+    static const unsigned bits[4] = { 0, 2, 3, 4 };
+    unsigned b = dpu_dither1(v & 255, bits[dw & 3], x, y);
+    unsigned g = dpu_dither1((v >> 8) & 255, bits[(dw >> 2) & 3], x, y);
+    unsigned r = dpu_dither1((v >> 16) & 255, bits[(dw >> 4) & 3], x, y);
+
+    return (r << 16) | (g << 8) | b;
+}
+
+/* BT.601 studio swing, as the CSC's mode 1 (DC_CSC_MULT_*_MD1) inverts */
+static void dpu_rgb2yuv(unsigned r, unsigned g, unsigned b,
+                        int *y, int *u, int *v)
+{
+    *y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+    *u = ((-38 * (int)r - 74 * (int)g + 112 * (int)b + 128) >> 8) + 128;
+    *v = ((112 * (int)r - 94 * (int)g - 18 * (int)b + 128) >> 8) + 128;
+}
+
+/*
+ * Write-back: the frame to @addr, @stride pixels a line, in the frame
+ * control word @ctrl's format ([18:16]), dithered when its bit 4 says so
+ * (bit 5 "auto": the drop widths the format implies, else [25:20]).
+ * YUV422 is packed Y0 U Y1 V, two bytes a pixel, the pair's chroma
+ * averaged -- the byte order and the BT.601 studio-swing matrix are
+ * inferred (the driver only names the format).
+ */
+static void dpu_writeback(const uint32_t *fb, int w, int h, uint32_t addr,
+                          uint32_t stride, uint32_t ctrl)
+{
+    uint32_t fmt = (ctrl >> 16) & 7;
     int bpp = fmt == 0 || fmt == 6 ? 4 : fmt == 4 ? 1 : 2;
-    g_autofree uint8_t *line = g_malloc((size_t)w * 4);
+    g_autofree uint8_t *line = g_malloc((size_t)w * 4 + 4);
+    uint32_t dw = 0;
     int x, y;
 
-    if (fmt == 3 || fmt == 5 || fmt == 7) {
-        qemu_log_mask(LOG_UNIMP, "ingenic-dpu: write-back format %u\n", fmt);
+    if (fmt == 5 || fmt == 7) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-dpu: write-back format %u\n",
+                      fmt);
         return;
+    }
+    if (ctrl & (1u << 4)) {
+        if (ctrl & (1u << 5)) {
+            /* auto: to the format's widths (565: 3/2/3; 555: 3/3/3) */
+            dw = fmt == 1 ? (2 << 4) | (1 << 2) | 2 :
+                 fmt == 2 ? (2 << 4) | (2 << 2) | 2 : 0;
+        } else {
+            dw = (ctrl >> 20) & 0x3f;
+        }
     }
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             uint32_t v = fb[(size_t)y * w + x];
-            unsigned r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+            unsigned r, g, b;
 
+            if (dw) {
+                v = dpu_dither(v, dw, x, y);
+            }
+            r = (v >> 16) & 255;
+            g = (v >> 8) & 255;
+            b = v & 255;
             switch (fmt) {
             case 0:
                 stl_le_p(line + 4 * x, 0xff000000u | v);
@@ -403,6 +475,23 @@ static void dpu_writeback(const uint32_t *fb, int w, int h, uint32_t addr,
             case 2:
                 stw_le_p(line + 2 * x, ((r >> 3) << 10) | ((g >> 3) << 5) |
                          (b >> 3));
+                break;
+            case 3:
+                if (!(x & 1)) {
+                    uint32_t v1 = x + 1 < w ? fb[(size_t)y * w + x + 1] : v;
+                    int y0, u0, v0, y1, u1, vv1;
+
+                    if (dw && x + 1 < w) {
+                        v1 = dpu_dither(v1, dw, x + 1, y);
+                    }
+                    dpu_rgb2yuv(r, g, b, &y0, &u0, &v0);
+                    dpu_rgb2yuv((v1 >> 16) & 255, (v1 >> 8) & 255, v1 & 255,
+                                &y1, &u1, &vv1);
+                    line[2 * x] = y0;
+                    line[2 * x + 1] = (u0 + u1 + 1) >> 1;
+                    line[2 * x + 2] = y1;
+                    line[2 * x + 3] = (v0 + vv1 + 1) >> 1;
+                }
                 break;
             case 4:
                 line[x] = (66 * r + 129 * g + 25 * b + 128 + 4096) >> 8;
@@ -513,12 +602,20 @@ static void dpu_frame(void *opaque)
                 }
             }
         }
-        dpu_show(s, fb, w, h);
         if (f[2] & FC_WB) {
-            dpu_writeback(fb, w, h, f[3], f[4] ? f[4] : w,
-                          (f[2] >> 16) & 7);
+            dpu_writeback(fb, w, h, f[3], f[4] ? f[4] : w, f[2]);
             DREG(s, R_ST) |= ST_WDMA_END;
         }
+        if (DREG(s, R_DISP_COM) & DISP_COM_DITHER) {
+            /* the panel's dither: DISP_COM [21:16], as write-back's */
+            uint32_t dw = (DREG(s, R_DISP_COM) >> 16) & 0x3f;
+            int i;
+
+            for (i = 0; i < w * h; i++) {
+                fb[i] = dpu_dither(fb[i], dw, i % w, i / w);
+            }
+        }
+        dpu_show(s, fb, w, h);
     } else {
         qemu_log_mask(LOG_GUEST_ERROR, "ingenic-dpu: bad frame %dx%d\n", w, h);
     }

@@ -1066,8 +1066,13 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   STOP_DISP_ACK. `screendump device=dpu` captures it; `frames` counts.
   Write-back (control bit 1) also stores the composed frame at the
   write-back address (stride in pixels) as ARGB8888 / RGB565 / RGB555 /
-  Y / RGB888-in-32 (control [18:16]: 0, 1, 2, 4, 6; YUV422 is not
-  converted), raising WDMA_END. Control bit 3 hands the display to the
+  YUV422 / Y / RGB888-in-32 (control [18:16]: 0, 1, 2, 3, 4, 6; YUV422
+  packed Y0 U Y1 V in BT.601 studio swing, the pair's chroma averaged --
+  byte order and matrix inferred, the driver only names the format),
+  raising WDMA_END. Control bit 4 dithers the write-back (bit 5 to the
+  format's widths, else the drop widths in [25:20], 0 / 2 / 3 / 4 bits
+  per channel) and DISP_COM (0x8000) bit 4 the display with its widths
+  in [21:16]: a 4x4 ordered threshold, whose pattern is inferred. Control bit 3 hands the display to the
   simple-read channel (CONFIG_INGENIC_FB_SIMPLE_RDMA) after the frame:
   its 5-word descriptors from RDMA_CHAIN_ADDR (0x1000; RDMA_CHAIN_CTRL bit
   0 starts it directly) -- next, buffer, stride, chain config (bit 0 the
@@ -2211,8 +2216,8 @@ channel (above), a WDR mode on T23 (no modelled sensor
 has one there), the Apical DIS's motion vectors (zero: no motion), the
 SSI slave (no driver, sample or register map in any tree here; above),
 the trigger of T41's audio-system DMIC and the DMIC trigger modes other
-than 0 and 2, the DPU's YUV422 write-back, dithering and TLB retry /
-verification registers (storage), T40's second pipe's HLDC, T41's LDC block (below), T23's double firmware's double
+than 0 and 2, the DPU's TLB retry / verification registers
+(storage), T40's second pipe's HLDC, T41's LDC block (below), T23's double firmware's double
 direct mode (`direct_mode=2`; above)
 and the blocks below read as zero or as storage.
 

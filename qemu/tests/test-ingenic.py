@@ -1172,6 +1172,47 @@ def test_dpu(qt, intc=CORE_INTC):
     check('a TLB-mapped layer reads through the table: red again',
           px(90, 20), (255, 0, 0))
     qt.writel(DPU + 0x3000, 0)
+    # YUV422 write-back (format 3): Y0 U Y1 V, BT.601 studio swing
+    yuv = lambda r, g, b: ((((66 * r + 129 * g + 25 * b + 128) >> 8) + 16),
+                           ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128,
+                           ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128)
+    qt.write(FD, le(FD, size(W, H), (3 << 16) | (1 << 1) | 1, WB, W, LD,
+                    0, 0, 0, (1 << 4), 0))
+    qt.writel(DPU + 0x2008, 0x8003FFC6)
+    qt.writel(DPU + 0x0000, FD)
+    qt.writel(DPU + 0x0004, 1)
+    qt.step(20 * 1000 * 1000)
+    y, u, v = yuv(255, 0, 0)
+    check('YUV422 write-back: the red frame as Y0 U Y1 V',
+          tuple(qt.read(WB + 2 * (W * 50 + 30), 4)), (y, u, y, v))
+    # dithered write-back: a flat grey 0x87 to 4 kept bits per channel
+    GR = BUF + 0x70000
+    qt.write(GR, struct.pack('<I', 0xFF878787) * (W * H))
+    qt.write(BUF + 0x60000, le(size(W, H), 5 << 16, GR, 0, 0, 0, 0, 0, 0,
+                               W, 0, 0))
+    qt.write(FD, le(FD, size(W, H), (0x3f << 20) | (1 << 4) | (1 << 1) | 1,
+                    WB, W, BUF + 0x60000, 0, 0, 0, (1 << 4), 0))
+    qt.writel(DPU + 0x2008, 0x8003FFC6)
+    qt.writel(DPU + 0x0004, 1)
+    qt.step(20 * 1000 * 1000)
+    blk = [qt.read(WB + 4 * (W * yy + xx), 1)[0]
+           for yy in range(4) for xx in range(4)]
+    check('a dithered write-back: 4-bit levels 128 / 144, averaging 0x87',
+          (sorted(set(blk)), sum(blk) / 16), ([128, 144], 135.0))
+    # the display's dither (DISP_COM bit 4, [21:16])
+    qt.writel(DPU + 0x8000, (0x3f << 16) | (1 << 4))
+    qt.write(FD, le(FD, size(W, H), 1, 0, 0, BUF + 0x60000, 0, 0, 0,
+                    (1 << 4), 0))
+    qt.writel(DPU + 0x2008, 0x8003FFC6)
+    qt.writel(DPU + 0x0004, 1)
+    qt.step(20 * 1000 * 1000)
+    qt.qmp('screendump', filename=ppm, device='dpu')
+    data = open(ppm, 'rb').read()
+    hdr = data.split(b'\n', 3)
+    shown = {px(xx, yy)[0] for yy in range(4) for xx in range(4)}
+    check('DISP_COM dither: the panel shows the same two levels',
+          sorted(shown), [128, 144])
+    qt.writel(DPU + 0x8000, 0)
 
 
 def test_lcdc(qt, irq=31):
