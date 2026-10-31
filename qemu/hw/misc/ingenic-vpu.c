@@ -40,12 +40,18 @@
  *   JPEG decoding (T23, T30: libimp's IMP_Decoder): a chain that starts
  *     the JPGC alone (JPGC_TRIG = 7) decodes a baseline scan; see
  *     vpu_jpeg_decode() for the contract.
- * Coding: I slices are I_16x16 DC macroblocks; H.264 P slices send each
- * macroblock whose source changed since the last picture of that size as
- * I_PCM and skip the rest (hw/misc/hantro-h264.c), so the stream decodes
- * to the source at 4x4-block resolution and is exact where it moves.
- * H.265: 8x8 DC intra CUs, skipped where the reference still matches
- * (hw/misc/hevc-enc.c).
+ * Coding (hw/misc/hantro-h264.c): I slices are I_16x16 DC macroblocks;
+ * H.264 P slices are inter coded against the previous picture of that
+ * size -- P_Skip, P_L0_16x16 with a full-pel motion search and the 4x4
+ * transform's residual, I_16x16 DC where nothing matches -- the reference
+ * being the decoder's picture, deblocked as libimp's slice header asks
+ * (on, offsets 0), so nothing drifts.  libimp's x264 port writes a High
+ * profile PPS with transform_8x8_mode_flag set whatever profile the
+ * application asks for (T21), so inter macroblocks with luma residual
+ * send transform_size_8x8_flag = 0 ("transform-8x8" turns that off).  A
+ * picture that would not fit SDE_CFG5 is coded again at a higher QP
+ * (mb_qp_delta).  H.265: 8x8 DC intra CUs, skipped where the reference
+ * still matches (hw/misc/hevc-enc.c).
  *
  * Resets: CPM SRBC bit 31 (HELIX/VPU) or 28 (RADIX), which the kernel
  * pulses before every task, clears the status -- the kernel enables the
@@ -199,6 +205,7 @@ struct IngenicVpuState {
     uint32_t taskrg;            /* where the chain address goes */
     uint32_t layout;            /* VPU_LAYOUT_*: the units' addresses */
     bool debug;
+    bool t8x8;                  /* libimp's PPS sets transform_8x8_mode */
 
     uint32_t regs[VPU_NREGS];
     uint32_t chain;             /* the chain the next job runs */
@@ -424,6 +431,9 @@ static void vpu_h264(IngenicVpuState *s)
     uint32_t cap = vpu_reg(s, R_SDE_BS_SIZE);
     int cqp = sextract32(vpu_reg(s, R_EFE_CQP_OFST), 0, 5);
     g_autofree uint8_t *y = NULL, *uv = NULL, *out = NULL;
+    /* libimp's slice header: deblocking on, offsets 0, cabac_init_idc 0 */
+    const H264Deblock db = { 0, 0, 0 };
+    H264PStats st = { 0 };
     VpuRef *ref;
     bool fresh;
     size_t n;
@@ -449,13 +459,11 @@ static void vpu_h264(IngenicVpuState *s)
     out = g_malloc(cap);
     ref = vpu_ref(s, w, h, &fresh);
     if (p_slice && !fresh) {
-        n = h264_slice_ppcm_cabac(qp, 0, mbw, mbh, y, w, uv, w,
-                                  ref->y, ref->uv, out, cap);
+        n = h264_slice_p_cabac(qp, cqp, 0, s->t8x8, &db, mbw, mbh, y, w, uv,
+                               w, ref->y, ref->uv, out, cap, &st);
     } else {
-        n = h264_slice_i16dc_cabac(qp, cqp, mbw, mbh, y, w, uv, w, out,
-                                   cap);
-        memcpy(ref->y, y, (size_t)w * h);
-        memcpy(ref->uv, uv, (size_t)w * h / 2);
+        n = h264_slice_i16dc_cabac_ref(qp, cqp, &db, mbw, mbh, y, w, uv, w,
+                                       ref->y, ref->uv, out, cap);
     }
     if (n > cap) {
         qemu_log_mask(LOG_GUEST_ERROR, "ingenic-vpu: bitstream buffer full "
@@ -471,9 +479,10 @@ static void vpu_h264(IngenicVpuState *s)
     if (s->debug) {
         qemu_log("ingenic-vpu: H.264 %c slice %dx%d rows %d-%d qp %d "
                  "src %08x/%08x stride %d/%d -> %08" HWADDR_PRIx
-                 " %zu bytes\n", p_slice ? 'P' : 'I', w, h, fst, lst, qp,
+                 " %zu bytes (skip %d inter %d intra %d, qp %d)\n",
+                 p_slice ? 'P' : 'I', w, h, fst, lst, qp,
                  vpu_reg(s, R_EFE_RAWY), vpu_reg(s, R_EFE_RAWC), ys, cs,
-                 bs, n);
+                 bs, n, st.skip, st.inter, st.intra, st.qp);
     }
 }
 
@@ -1142,6 +1151,7 @@ static const Property vpu_props[] = {
     DEFINE_PROP_UINT32("taskrg", IngenicVpuState, taskrg, R_VDMA_TASKRG),
     DEFINE_PROP_UINT32("layout", IngenicVpuState, layout, VPU_LAYOUT_HELIX),
     DEFINE_PROP_BOOL("debug", IngenicVpuState, debug, false),
+    DEFINE_PROP_BOOL("transform-8x8", IngenicVpuState, t8x8, true),
 };
 
 static const VMStateDescription vmstate_vpu = {

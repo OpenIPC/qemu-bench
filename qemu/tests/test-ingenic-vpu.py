@@ -102,6 +102,19 @@ def picture(w, h, f):
     return bytes(y), bytes(uv)
 
 
+def texture(w, h, f):
+    """NV12, stride w: random 4x4 blocks, the whole picture moved 8 right and
+    4 down a frame -- found only by motion compensation."""
+    y = bytearray(w * h)
+    for r in range(h):
+        by = (r - 4 * f) >> 2
+        for x in range(w):
+            bx = (x - 8 * f) >> 2
+            v = ((bx * 73856093) ^ (by * 19349663)) & 0xffffffff
+            y[r * w + x] = 32 + ((v * 2654435761) & 0xffffffff) % 192
+    return bytes(y), bytes([128]) * (w * h // 2)
+
+
 def psnr_y(dec, w, h, f):
     y, _ = picture(w, h, f)
     se = sum((a - b) ** 2 for a, b in zip(dec[:w * h], y))
@@ -153,8 +166,10 @@ def nal(hdr, rbsp):
 
 def h264_sps(mbw, mbh, h):
     b = Bits()
-    b.u(77, 8); b.u(0, 8); b.u(30, 8)          # Main, level 3.0
+    b.u(100, 8); b.u(0, 8); b.u(30, 8)         # High, level 3.0, as libimp
     b.ue(0)                                     # sps id
+    b.ue(1); b.ue(0); b.ue(0); b.u(0, 1)       # 4:2:0, 8-bit
+    b.u(0, 1)                                   # no scaling matrices
     b.ue(0)                                     # log2_max_frame_num - 4
     b.ue(2)                                     # POC type 2
     b.ue(1)                                     # one reference
@@ -179,6 +194,7 @@ def h264_pps():
     b.u(0, 1); b.u(0, 2)
     b.se(0); b.se(0); b.se(0)
     b.u(1, 1); b.u(0, 1); b.u(0, 1)             # deblocking control
+    b.u(1, 1); b.u(0, 1); b.se(0)               # transform_8x8_mode (High)
     b.trailing()
     return nal(b'\x68', b.bytes())
 
@@ -766,6 +782,55 @@ def main():
             p = 99.0 if not se else 10 * math.log10(255 * 255 * dw * dh / se)
             check(not err and p >= 45, 'the JPGC\'s decode against '
                   'ffmpeg\'s: Y PSNR %.1f dB (>= 45)' % p)
+    # inter coding: a textured picture moving (8, 4) pixels a frame, P
+    # pictures against the decoder's (deblocked) previous one.  Without
+    # motion compensation each P picture would cost about what I_PCM does
+    # (1.5 bytes a pixel); with it, the decoded P pictures are the decoded
+    # I moved, but for a residual here and there.
+    print('== t21: H.264 P pictures, motion')
+    base, src, taskrg = SOCS['t21']
+    q = QTest(a.qemu, 't21')
+    try:
+        stream = h264_sps(mbw, mbh, h) + h264_pps()
+        sizes = []
+        for f in range(frames):
+            y, uv = texture(w, h, f)
+            q.write(SRC, y)
+            q.write(SRC + w * h, uv)
+            idr, qp = f == 0, 20
+            chain(q, [(0x40004, ((mbh - 1) << 8) | (mbw - 1)),
+                      (0x40010, SRC), (0x40014, SRC + w * h),
+                      (0x40038, (w << 16) | w),
+                      (0x90024, BS), (0x90028, 0x100000),
+                      (0x40000, (0 if idr else 1 << 4) | (qp << 8) |
+                       (2 << 2) | 0x23)])
+            n = run_task(q, base, src, taskrg, False, lambda c, m: None)
+            sizes.append(n)
+            stream += h264_slice(idr, f, qp, q.read(BS, n))
+    finally:
+        q.close()
+    pcm = w * h * 3 // 2
+    check(all(n * 50 < pcm for n in sizes[1:]),
+          'P pictures %s bytes (the I %d), under a fiftieth of I_PCM\'s %d'
+          % (sizes[1:], sizes[0], pcm))
+    path = os.path.join(out, 'motion.h264')
+    open(path, 'wb').write(stream)
+    if ffmpeg:
+        raw, err = decode(ffmpeg, path)
+        fs = w * h * 3 // 2
+        check(not err and len(raw) == frames * fs,
+              'ffmpeg decodes motion.h264 cleanly, %d of %d pictures%s'
+              % (len(raw) // fs, frames, ': ' + err[-300:] if err else ''))
+        for f in range(1, min(frames, len(raw) // fs)):
+            d, i0 = raw[f * fs:], raw
+            same = tot = 0
+            for r in range(4 * f + 16, h - 16):
+                for x in range(8 * f + 16, w - 16):
+                    tot += 1
+                    same += d[r * w + x] == i0[(r - 4 * f) * w + x - 8 * f]
+            check(same * 100 >= tot * 99, 'P picture %d is the I picture '
+                  'moved (%d, %d): %d of %d interior samples'
+                  % (f, 8 * f, 4 * f, same, tot))
     # T41's JPEG engine: HELIX's JPEG half with its units renumbered (SCH
     # 0, VDMA 1, EFE 2, JPGC 3; the chain sets bit 19), reset through SRBC
     # 28/27/26, core INTC source 0

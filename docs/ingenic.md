@@ -539,7 +539,7 @@ What libimp keeps of the engine's output decides the split:
 | JPEG | SOI..SOS, EOI | the entropy-coded scan at JPGC_BSA; length JPGC_STAT[23:0] |
 
 The coders are the repo's: `hantro-h264.c` (I_16x16 DC intra; P slices
-I_PCM where the source changed, P_Skip elsewhere), `hevc-enc.c` (8x8 DC
+inter coded, below), `hevc-enc.c` (8x8 DC
 intra, skip where the reference still matches; extended for libimp's CTB
 64, 16x16 `cu_qp_delta` groups, chroma QP offset -3 and luma-only SAO) and
 `jpeg-enc.c` with the quantisers taken back from the JPGC's QMEM
@@ -548,6 +548,41 @@ EFE 0x20040/0x20000), so libimp's rate control (fixed QP, CBR) and its
 slice headers agree with the slices. libimp's x264 port is CABAC-only
 (`i264e_init` refuses CAVLC). The ~40 statistics registers libimp reads
 back after a task read what its chain left there.
+
+H.264 P slices (`hantro-h264-inter.c.inc`) are inter coded against the
+previous picture of that size, which the model keeps as the decoder
+holds it:
+
+- each macroblock is P_Skip (where the P_Skip vector's prediction leaves
+  no coefficient), P_L0_16x16 or, where the motion search finds nothing
+  near (a scene change), the I slices' I_16x16 DC macroblock;
+- motion: full-pel vectors in quarter-pel units -- the predicted, P_Skip,
+  neighbours' and zero vectors, a 4-pixel grid over +-16 pixels when
+  none is close, then a diamond search; the 16x16 vector prediction and
+  the P_Skip vector of H.264 8.4.1; one reference (libimp's
+  num_ref_idx_l0_active is 1); chroma at eighth-pel, bilinear;
+- residual: the 4x4 transform of every block, inter rounding, chroma DC
+  and AC, `coded_block_pattern`; libimp's x264 port writes a High
+  profile PPS with `transform_8x8_mode_flag` set whatever profile the
+  application asks for (seen with profiles 0, 1 and 2 on T21), so a
+  macroblock with luma residual sends `transform_size_8x8_flag` 0
+  (`-global ingenic-vpu.transform-8x8=off` drops it);
+- the reference is the reconstruction, deblocked as libimp's slice
+  header asks (`disable_deblocking_filter_idc` 0, offsets 0): the
+  decoder's picture, bit for bit, so nothing drifts; the I slices leave
+  theirs the same way;
+- a picture that would not fit SDE_CFG5 is coded again 6 QP higher, the
+  first coded macroblock's `mb_qp_delta` carrying the step.
+
+A whole-frame change (T23's AE flipping the sensor gain on this scene
+every five frames) is a DC residual on the motion-compensated reference
+rather than a picture of I_PCM; libimp's CBR, which held the slice QP at
+51 with I_PCM pictures, now brings it down (31 to 25 over 20 pictures in
+`test-ingenic-vpu-e2e.sh`). The AVPU's H.264 P slices
+are still I_PCM where the source changed (`hantro-h264.c`'s older path:
+the AVPU cuts pictures into several slices, which deblocking across
+slice edges would have to see whole), and RADIX's H.265 P slices skip or
+code 8x8 intra DC units.
 
 The engines' TLB: libimp addresses the engines physically, but the
 driver can hand a process its DMMU table (`IOCTL_CHANNEL_PRIVATE_TLB`,
@@ -564,8 +599,11 @@ page logs a TLB error, reads as zero, drops writes and, on HELIX / the
 VPU, sets SCH_STAT bit 10.
 
 `qemu/tests/test-ingenic-vpu.py` plays the driver and libimp at register
-level on every SoC (H.264, JPEG, H.265 on T30) and decodes the result
-with ffmpeg, and runs the JPEG (and T30's H.265 IDR picture) again
+level on every SoC (H.264 with libimp's High profile headers, JPEG, H.265
+on T30) and decodes the result with ffmpeg; on T21 a textured picture
+moving (8, 4) pixels a frame gives P pictures of a few hundred bytes (a
+fiftieth of what I_PCM would take) that decode to the I picture moved;
+it runs the JPEG (and T30's H.265 IDR picture) again
 through the TLB, over pages laid out in reverse, for the same bytes; `qemu/tests/test-ingenic-vpu-feed.py` runs libimp's own
 encoders (`i264e_*`, `i265e_*`, `ijpege_*`; `qemu/tests/ingenic-vpu-feed.c`)
 from a picture in memory on the OpenIPC kernel and rootfs of each SoC; `qemu/tests/test-ingenic-vpu-e2e.sh` runs the
@@ -1636,7 +1674,8 @@ bits of 0x1C and resets the block through 0x00, all as on T41; the ISR
 only counts. `test-ingenic-t23-enc.sh --direct 1` (OpenIPC's T23 kernel,
 its own `tx-isp-t23.ko` H20240204a with `direct_mode=1` and its libimp):
 the main stream's encoder channel set `bEnableIvdc`, HELIX encodes from
-0x80000000 / 0x81000000, both streams decode with the scene, and
+0x80000000 / 0x81000000, both streams decode with the scene (the AE left
+running; `T23ENC_AE_FREEZE` freezes it), and
 `/proc/jz/isp/isp-ivdc` counts ISP frames done (about 100).
 `--sdk` runs the same with the T23 SDK's own `tx-isp-t23.ko`
 (H20230720a), sensor module and static `libimp.a`; that firmware reads

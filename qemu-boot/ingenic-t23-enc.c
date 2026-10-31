@@ -15,9 +15,9 @@
  *
  *   ingenic-t23-enc frames direct sensor addr [sensor1 addr1 [w h]]
  *
- * @frames pictures of each stream, from five seconds in, the AE frozen
- * after four (T23ENC_SETTLE; T23ENC_AE_RUN keeps it running), at fixed QP
- * 30 and a GOP of 10.  Streams go, as a 4-byte length and the bytes, into 4 MiB
+ * @frames pictures of each stream, from four seconds in (T23ENC_SETTLE)
+ * with the AE running (T23ENC_AE_FREEZE freezes it first), at fixed QP 30
+ * and a GOP of 10.  Streams go, as a 4-byte length and the bytes, into 4 MiB
  * slots -- slot 0 the main sensor's main stream, 1 its 640x360 stream, 2
  * and 3 the second sensor's -- at SNAP_DEVMEM (a physical address, for
  * the host's pmemsave) and in /tmp/slot<n>.bin.
@@ -285,15 +285,15 @@ int main(int argc, char **argv)
         }
     }
     /*
-     * The kernel's AE settles meanwhile; then it is frozen.  On this scene
-     * T23's AE keeps flipping the sensor between two gains a step apart
-     * (the ISP model's trace: 2272 / 2683 per 256, mean Y 39 / 44, a
-     * five-frame cycle), and the HELIX model codes a changed macroblock of
-     * a P picture as I_PCM: a whole-frame change makes a picture bigger
-     * than libimp's stream buffer takes (0.75 byte a pixel).
+     * The kernel's AE settles meanwhile.  On this scene T23's AE keeps
+     * flipping the sensor between two gains a step apart (the ISP model's
+     * trace: 2272 / 2683 per 256, mean Y 39 / 44, a five-frame cycle):
+     * every macroblock of such a P picture changes, which the HELIX
+     * model's inter coding takes as a DC residual on the motion-compensated
+     * reference.
      */
     sleep(getenv("T23ENC_SETTLE") ? atoi(getenv("T23ENC_SETTLE")) : 4);
-    if (!getenv("T23ENC_AE_RUN")) {
+    if (getenv("T23ENC_AE_FREEZE")) {
         IMP_ISP_Tuning_SetAeFreeze(IMPISP_TUNING_OPS_MODE_ENABLE);
         sleep(1);
     }
