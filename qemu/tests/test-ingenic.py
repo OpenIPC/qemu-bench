@@ -2268,6 +2268,123 @@ def test_isp_xstats(qt):
 
 
 
+def i2c_write_reg16(qt, base, addr, reg, val):
+    """A register of a 16-bit-addressed sensor (GC4653 / GC4663)"""
+    qt.writel(base + 0x6C, 0)
+    qt.writel(base + 0x04, addr)
+    qt.writel(base + 0x6C, 1)
+    qt.writel(base + 0x10, reg >> 8)
+    qt.writel(base + 0x10, reg & 0xFF)
+    qt.writel(base + 0x10, val | (1 << 9))
+
+
+def gc4653_expose(qt, lines, short):
+    """gc4653_set_integration_time / _short, gain 1.0 (0x02B8:0x02B9)"""
+    for reg, val in ((0x0202, lines >> 8), (0x0203, lines & 0xFF),
+                     (0x0200, short >> 8), (0x0201, short & 0xFF),
+                     (0x02B8, 1), (0x02B9, 0)):
+        i2c_write_reg16(qt, I2C0, 0x29, reg, val)
+
+
+def test_isp_wdr(qt):
+    """T31's DOL WDR: AE1 and the WDR statistics of the short frame."""
+    print('ingenic-isp WDR, two exposures (t31, sensor=gc4653)')
+    AE, AE1 = ISP + 0xA000, ISP + 0xA800
+    zb, hb, z1, h1, wdrb = (0x00600000, 0x00604000, 0x00620000, 0x00624000,
+                            0x00680000)
+    for blk in (AE, AE1):
+        qt.writel(blk + 0x04, 0xF001F001)
+        for i in range(4):
+            qt.writel(blk + 0x08 + 4 * i, 0x20202020)
+            qt.writel(blk + 0x18 + 4 * i, 0x12121212)
+        qt.writel(blk + 0x28, 0x0011991E)
+        qt.writel(blk + 0x4C, 0x33)
+    for i in range(4):
+        qt.writel(AE + 0x2C + 4 * i, zb + 0x1000 * i)
+        qt.writel(AE + 0x3C + 4 * i, hb + 0x800 * i)
+        qt.writel(AE1 + 0x2C + 4 * i, z1 + 0x1000 * i)
+        qt.writel(AE1 + 0x3C + 4 * i, h1 + 0x800 * i)
+        qt.writel(ISP + 0x2010 + 4 * i, wdrb + 0x2000 * i)
+    qt.writel(ISP + 0x2024, 3)
+    qt.writel(AE, 1)
+    qt.writel(VIC + 0x00, 1)
+    qt.writel(ISP + 0xB0, 0xFFFFFFFF)
+    # a bright light, so that the long frame clips where the short holds
+    qt.qom_set('/machine/isp', 'light', 400)
+    gc4653_expose(qt, 1000, 125)
+    qt.writel(ISP + 0x0C, 0xB5742248)     # tisp_init's WDR: bit 0 clear
+    qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    qt.step(40 * 1000 * 1000)
+    check('WDR (11) and AE1 (28, 29) statistics in the WDR mode',
+          qt.readl(ISP + 0xB4) & 0x30000800, 0x30000800)
+    idx, idx1 = qt.readl(AE + 0x50), qt.readl(AE1 + 0x50)
+    ae0 = qt.read(zb + 0x1000 * ((idx >> 4) & 3), 225 * 16)
+    ae1 = qt.read(z1 + 0x1000 * ((idx1 >> 4) & 3), 225 * 16)
+
+    def mean(zones, n):
+        z = zones[16 * n:16 * n + 16]
+        return sum(isp_bits(z, b, 21) for b in (0, 21, 42)) / (32 * 18)
+    m0, m1 = mean(ae0, 0), mean(ae1, 0)
+    check('AE1: the short frame, an eighth of the long one\'s light in the '
+          'navy (%.1f / %.1f)' % (m1, m0), abs(m0 / max(m1, 0.01) - 8) < 1.5,
+          True)
+    logo0, logo1 = mean(ae0, 7 * 15 + 7), mean(ae1, 7 * 15 + 7)
+    check('AE1: the logo the long frame clips is below full scale in the '
+          'short one (%.0f / %.0f)' % (logo1, logo0),
+          logo1 < logo0 and logo1 < 200, True)
+    w = qt.read(qt.readl(ISP + 0x2680), 0x2000)
+    logical = b''.join(w[1024 * i:1024 * i + 516] for i in range(8))
+    top = [sum(isp_bits(logical[16 * i + 8 * e:], 21, 21)
+               for i in range(240, 256)) for e in (0, 1)]
+    check('WDR: the long frame\'s G histogram reaches full scale, the short '
+          'one\'s hardly (%d, %d)' % tuple(top), top[0] > 10 * max(top[1], 1),
+          True)
+    ys = [isp_bits(logical[0x1010 + 8 * e:], 0, 32) for e in (0, 1)]
+    check('WDR: the short frame\'s luma sum the smaller (%d, %d)' % tuple(ys),
+          ys[1] < ys[0], True)
+    qt.writel(ISP + 0x0C, 0xB5742249)     # linear again
+    qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    qt.step(40 * 1000 * 1000)
+    check('back in a linear mode: no WDR or AE1 statistics',
+          qt.readl(ISP + 0xB4) & 0x30000800, 0)
+
+
+def test_isp_wdr_t41(qt):
+    """T41's DOL WDR statistics: 6 KiB banks at 0x6010, bit 11."""
+    print('ingenic-isp WDR statistics (t41, sensor=gc4663)')
+    AE, vic, wb = ISP + 0x19000, 0x13380000, 0x00680000
+    qt.writel(AE + 0x04, 0xF001F001)
+    for i in range(4):
+        qt.writel(AE + 0x08 + 4 * i, 0x10101010)
+        qt.writel(AE + 0x18 + 4 * i, 0x09090909)
+        qt.writel(ISP + 0x6010 + 4 * i, wb + 0x1800 * i)
+    qt.writel(ISP + 0x6030, 3)
+    qt.writel(ISP + 0x80, 480 << 16 | 270)
+    qt.writel(vic + 0x00, 1)
+    qt.writel(ISP + 0x40020, 0xFFFFFFFF)
+    qt.qom_set('/machine/isp', 'light', 400)
+    gc4653_expose(qt, 1000, 125)
+    qt.writel(ISP + 0x40, 0xFFD00049)     # linear: bit 0 set
+    qt.step(41 * 1000 * 1000)
+    check('no WDR statistics (11) in a linear mode',
+          qt.readl(ISP + 0x40028) & 0x800, 0)
+    qt.writel(ISP + 0x40, 0xFF9100E0)     # the WDR mode: bit 0 clear
+    qt.writel(ISP + 0x40024, qt.readl(ISP + 0x40028))
+    qt.step(41 * 1000 * 1000)
+    check('WDR statistics (11) in the WDR mode',
+          qt.readl(ISP + 0x40028) & 0x800, 0x800)
+    idx = qt.readl(ISP + 0x6030)
+    b = qt.read(wb + 0x1800 * idx, 0x1800)
+    navy = [isp_bits(b, 24 * (e * 15), 24) for e in (0, 1)]
+    check('blocks: the long frame\'s then the short one\'s, 15 a row, '
+          'the short darker (%d, %d)' % tuple(navy),
+          navy[0] > 4 * max(navy[1], 1), True)
+    top = [sum(isp_bits(b[1848 + 2048 * e + 8 * i:], 21, 21)
+               for i in range(240, 256)) for e in (0, 1)]
+    check('histograms: the long frame clips, the short one hardly (%d, %d)'
+          % tuple(top), top[0] > 10 * max(top[1], 1), True)
+
+
 def test_isp_xstats_t41(qt):
     """T41's other statistics: AF, ADR, defog, GSM, LCE, TMO."""
     print('ingenic-isp AF / ADR / defog / GSM / LCE / TMO statistics (t41)')
@@ -2912,6 +3029,12 @@ def main():
         qt.close()
         qt = QTest(a.qemu, 't41,sensor=gc4663')
         test_isp_xstats_t41(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't31,sensor=gc4653')
+        test_isp_wdr(qt)
+        qt.close()
+        qt = QTest(a.qemu, 't41,sensor=gc4663')
+        test_isp_wdr_t41(qt)
         qt.close()
         qt = QTest(a.qemu, 't21,sensor=jxf37')
         test_isp_stats_t21(qt)

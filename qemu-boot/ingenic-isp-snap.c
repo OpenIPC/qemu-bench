@@ -25,6 +25,12 @@
  * sensor's main stream) and 3 (the second's), both at the sensor size;
  * channel 3's frames go where channel 1's would.
  *
+ * With SNAP_WDR=1 in the environment the sensor runs its two-exposure
+ * (DOL) WDR mode: IMP_ISP_WDR_ENABLE before the sensor is added, as the
+ * SDKs' headers ask, and on T40 / T41 the sensor's WDR setting
+ * (default_boot 1); on T31 the sensor module is loaded with data_type=2
+ * (TX_SENSOR_DATA_TYPE_WDR_DOL) by the harness.
+ *
  * Built two ways (test-ingenic-isp.sh does both):
  *   - static, against the SDK's uClibc libimp.a (IMP 1.1.5);
  *   - with -DSNAP_MUSL, dynamically against the rootfs's own libimp.so
@@ -189,6 +195,37 @@ static int save(int ch, int fd, const unsigned char *p, unsigned size)
         p += n;
         size -= n;
     }
+    return 0;
+}
+
+/*
+ * SNAP_WDR: the ISP's WDR mode, between IMP_ISP_Open and the sensor
+ * (built with SNAP_WDR_API: the T10..T23 libimps have no WDR call)
+ */
+static int snap_wdr(void)
+{
+    if (!getenv("SNAP_WDR")) {
+        return 0;
+    }
+#ifndef SNAP_WDR_API
+    printf("isp-snap: no WDR in this libimp\n");
+    return -1;
+#elif defined(SNAP_T40)
+    {
+        IMPISPTuningOpsMode m = IMPISP_TUNING_OPS_MODE_ENABLE;
+
+        if (IMP_ISP_WDR_ENABLE(IMPVI_MAIN, &m) < 0) {
+            printf("isp-snap: IMP_ISP_WDR_ENABLE failed\n");
+            return -1;
+        }
+    }
+#else
+    if (IMP_ISP_WDR_ENABLE(IMPISP_TUNING_OPS_MODE_ENABLE) < 0) {
+        printf("isp-snap: IMP_ISP_WDR_ENABLE failed\n");
+        return -1;
+    }
+#endif
+    printf("isp-snap: WDR enabled\n");
     return 0;
 }
 
@@ -407,6 +444,9 @@ int main(int argc, char **argv)
     sensor.power_gpio = -1;
     sensor.video_interface = IMPISP_SENSOR_VI_MIPI_CSI0;
     sensor.mclk = SNAP_MCLK;
+    if (getenv("SNAP_WDR")) {
+        sensor.default_boot = 1;        /* the sensor's WDR setting */
+    }
 #ifdef SNAP_DUAL
     if (s1) {
         /* sample-common.c: the second sensor, its input mode, channel 3 */
@@ -483,11 +523,12 @@ int main(int argc, char **argv)
                sensor1.name);
     } else
 #endif
-    if (IMP_ISP_Open() < 0 || IMP_ISP_AddSensor(IMPVI_MAIN, &sensor) < 0 ||
+    if (IMP_ISP_Open() < 0 || snap_wdr() < 0 ||
+        IMP_ISP_AddSensor(IMPVI_MAIN, &sensor) < 0 ||
         IMP_ISP_EnableSensor(IMPVI_MAIN, &sensor) < 0) {
 #else
-    if (IMP_ISP_Open() < 0 || IMP_ISP_AddSensor(&sensor) < 0 ||
-        IMP_ISP_EnableSensor() < 0) {
+    if (IMP_ISP_Open() < 0 || snap_wdr() < 0 ||
+        IMP_ISP_AddSensor(&sensor) < 0 || IMP_ISP_EnableSensor() < 0) {
 #endif
         printf("ISP / sensor setup failed\n");
         return 1;

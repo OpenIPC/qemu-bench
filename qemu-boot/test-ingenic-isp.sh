@@ -14,6 +14,8 @@
 #        [--sensor1 NAME (t40: a second sensor, the second pipe)]
 #        [--sensor2 NAME (t40: a third sensor, VIC2; needs --sensor1)]
 #        [--snap-env VAR=VALUE (exported to the client; repeatable)]
+#        [--wdr (the sensor's two-exposure WDR mode: t31, t40 gc4653,
+#               t41 gc4663)]
 #        [--fw DIR] [--qemu PATH] [--toolchain BINDIR] [--sdk DIR]
 #        [--libimp rootfs|sdk] [--frames N] [--out DIR] [--png]
 #        [--isp-ko FILE]
@@ -69,6 +71,7 @@ SENSOR=
 SENSOR1=
 SENSOR2=
 SNAP_ENV=
+WDR=
 FRAMES=40
 OUT=
 PNG=
@@ -81,6 +84,7 @@ while [ $# -gt 0 ]; do
     --sensor1) SENSOR1=$2; shift ;;
     --sensor2) SENSOR2=$2; shift ;;
     --snap-env) SNAP_ENV="$SNAP_ENV $2"; shift ;;
+    --wdr) WDR=1 ;;
     --fw) FW=$2; shift ;;
     --image) IMAGE=$2; shift ;;
     --isp-ko) ISP_KO=$2; shift ;;
@@ -99,17 +103,18 @@ while [ $# -gt 0 ]; do
 done
 
 case $SOC in
-t31) SENSOR=${SENSOR:-gc2053}; DEFS=-DSNAP_AF ;;
+t31) SENSOR=${SENSOR:-gc2053}; DEFS="-DSNAP_AF -DSNAP_WDR_API" ;;
 t21) SENSOR=${SENSOR:-jxf37} ;;
 t23) SENSOR=${SENSOR:-gc2053}; INC=${INC:-$INC23}; DEFS=-DSNAP_AF ;;
 t20) SENSOR=${SENSOR:-jxf22} ;;
 t10) SENSOR=${SENSOR:-jxh62} ;;     # T10's ISP takes at most 1280x960
 t30) SENSOR=${SENSOR:-ov2735b} ;;
-t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}; DEFS="-DSNAP_T40 -DSNAP_DUAL"
+t40) SENSOR=${SENSOR:-gc4653}; INC=${INC:-$INC40}
+     DEFS="-DSNAP_T40 -DSNAP_DUAL -DSNAP_WDR_API"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64 ;;
 t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41
-     DEFS="-DSNAP_T40 -DSNAP_I2C_ADAPTER=0 -DSNAP_MCLK=IMPISP_SENSOR_MCLK0 -DSNAP_AF"
+     DEFS="-DSNAP_T40 -DSNAP_I2C_ADAPTER=0 -DSNAP_MCLK=IMPISP_SENSOR_MCLK0 -DSNAP_AF -DSNAP_WDR_API"
      TC=$TC40; CROSS=mips-linux-gnu-; CCFLAGS="-muclibc -fno-use-linker-plugin"
      IMAGE=${IMAGE:-$IMAGE41}
      RAM=128M; MEM="mem=48M@0x0 rmem=64M@0x3000000 nmem=16M@0x7000000"
@@ -135,6 +140,16 @@ if [ -n "$SENSOR1" ]; then
     # two 2560x1440 pipes' buffers: rmem's 64 MiB is not enough for both
     # and the frames parked at its top
     RAM=256M; MEM="mem=64M rmem=192M@0x4000000"; SLOT_MB=224
+fi
+if [ -n "$WDR" ]; then
+    case $SOC/$SENSOR in
+    t31/gc4653|t40/gc4653|t41/gc4663) ;;
+    *) echo "--wdr: no WDR mode for $SENSOR on $SOC here" >&2; exit 2 ;;
+    esac
+    # T31: the WDR cache (the sensor's wdr_bufsize, 20 MB) beside the frames
+    if [ $SOC = t31 ]; then
+        RAM=128M; MEM="mem=64M rmem=64M@0x4000000"; RMEM_MB=64
+    fi
 fi
 SLOT_MB=${SLOT_MB:-$((RMEM_MB + 32))}
 if [ $SOC = t41 ]; then
@@ -241,6 +256,16 @@ if [ -n "$SENSOR2" ]; then
 insmod /lib/modules/*/ingenic/sensor_${SENSOR2}s2_t40.ko
 export SNAP_SENSOR2=${SENSOR2}s2:$ADDR1"
 fi
+if [ -n "$WDR" ]; then
+    if [ $SOC = t31 ]; then
+        # the sensor's DOL mode is a module parameter on T31
+        LOADER="$LOADER
+rmmod sensor_${SENSOR}_$SOC
+modprobe sensor_${SENSOR}_$SOC data_type=2"
+    fi
+    LOADER="$LOADER
+export SNAP_WDR=1"
+fi
 for e in $SNAP_ENV; do
     LOADER="$LOADER
 export $e"
@@ -320,6 +345,9 @@ open(sys.argv[1], 'wb').write(img)
 PY
 fi
 
+# QEMU's stderr (fd 3): with --wdr the ISP's per-frame trace, kept for
+# the checks
+if [ -n "$WDR" ]; then exec 3> "$OUT/isp-trace.log"; else exec 3>&2; fi
 # A boot now and then stops dead after the SD card is detected, before
 # init prints anything (not the ISP: no vendor module is loaded yet);
 # such a boot is retried.
@@ -332,7 +360,9 @@ for try in 1 2 3; do
         -monitor unix:"$WORK/mon.sock",server,nowait \
         -nic user,restrict=on -kernel "$KERNEL" \
         -drive if=sd,index=0,file="$WORK/sd.img",format=raw \
-        -append "console=ttyS1,115200n8 root=$ROOTDEV rootfstype=squashfs init=/usr/bin/isp-test mtdparts=$MTDPARTS $MEM" &
+        ${WDR:+-global ingenic-isp.trace=on} \
+        -append "console=ttyS1,115200n8 root=$ROOTDEV rootfstype=squashfs init=/usr/bin/isp-test mtdparts=$MTDPARTS $MEM" \
+        2>&3 &
     QPID=$!
     started=
     saved=
@@ -395,4 +425,34 @@ if [ -n "$SENSOR1" ]; then
 fi
 python3 "$HERE/ingenic-isp-check.py" --advance ${PNG:+--png "$OUT"} \
     ${W}x$H:"$OUT/ch0-$first.nv12" ${W}x$H:"$OUT/ch0-$last.nv12" \
-    640x360:"$OUT/ch1-$first.nv12" 640x360:"$OUT/ch1-$last.nv12"
+    640x360:"$OUT/ch1-$first.nv12" 640x360:"$OUT/ch1-$last.nv12" || exit 1
+[ -n "$WDR" ] || exit 0
+# WDR: the ISP ran its WDR mode, the AE gave the sensor a short exposure
+# (which follows the long one on T40 / T41; T31's tuning holds it at the
+# sensor's longest), and the fused picture keeps the whites a linear one
+# clips at this exposure
+echo "== WDR"
+python3 - "$OUT/isp-trace.log" "$OUT/ch0-$last.nv12" $W $H $SOC <<'PY'
+import re, sys
+import numpy as np
+log, frame, w, h, soc = sys.argv[1], sys.argv[2], int(sys.argv[3]), \
+    int(sys.argv[4]), sys.argv[5]
+text = open(log, errors='replace').read()
+wdr = len(re.findall(r'stats gain .* wdr$', text, re.M))
+shorts = [int(x) for x in re.findall(r'exposure long \d+ rows short (\d+) rows',
+                                      text)]
+written = sorted(set(x for x in shorts if x))
+y = np.fromfile(frame, np.uint8, w * h).reshape(h, w)[h // 10:, :]
+clipped = (y >= 234).mean() * 100
+ok = True
+def report(what, good):
+    global ok
+    print('  %s: %s' % (what, 'ok' if good else 'BAD'))
+    ok &= good
+report('%d frames in the WDR mode' % wdr, wdr > 10)
+report('short exposures written: %s rows' % (written[:8] or 'none'),
+       len(written) >= (2 if soc in ('t40', 't41') else 1))
+report('%.2f%% of the last frame clipped' % clipped, clipped < 2)
+print('PASS' if ok else 'FAIL')
+sys.exit(0 if ok else 1)
+PY

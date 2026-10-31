@@ -1188,11 +1188,11 @@ T31 and T23 also produce their other statistics
 
 | | block, banks | status bit | layout |
 |---|---|---|---|
-| AE1 | 0xA800, AE0's form; only with 0x0C bit 0 clear (a WDR mode) | 28, 29 | AE0's zones and histogram |
+| AE1 | 0xA800, AE0's form; only with 0x0C bit 0 clear (a WDR mode) | 28, 29 | AE0's zones and histogram, of the short frame |
 | AF | grid 0xB804 (pixels; 8 x 8 zones of 238 x 134 at 1080p), banks 0xB8A8, last bank number 0xB8BC | 31 | 16 bytes a zone: FIR 0 / 1, IIR 0 / 1 (22 bits each), luma sum (23), bright count (15) |
 | ADR | banks 0x4494, last bank's address 0x44B0; 0x0C bit 7 bypasses | 18 | 6 x 8 blocks of luma sum and a five-bin histogram, then a 512-bin luma histogram (three 21-bit counts per 8 bytes) |
 | defog | banks 0x5B84, last bank's address 0x5BA4; 0x0C bit 11 bypasses | 20 | from +8, 180 blocks of B, G, R sums (24 bits) and three halfwords (here the dark channel, brightest and mean luma) |
-| WDR (T31) | banks of 8 KiB at 0x2010, last address 0x2680; only with 0x0C bit 0 clear | 11 | long and short exposure R, G, B histograms (256 x 21 bits), luma counts and sums, in eight 516-byte rows 1 KiB apart |
+| WDR (T31) | banks of 8 KiB at 0x2010, last address 0x2680; only with 0x0C bit 0 clear | 11 | long and short frame R, G, B histograms (256 x 21 bits), luma counts and sums, in eight 516-byte rows 1 KiB apart |
 
 AE1 is the WDR short frame's AE. Its block's bit 0 is a latch
 (`system_reg_write_ae(2)` sets it after every AE1 update), not an
@@ -1200,6 +1200,54 @@ enable; raised in a linear mode, `ae1_interrupt_hist` stores its
 histogram over the AE's static data and pushes the AE1 process, and
 T31's AE and AWB stop where they are (the gains frozen from frame 10),
 so like WDR it runs only while 0x0C bit 0 is clear.
+
+#### WDR: two exposures
+
+The sensors' two-exposure (DOL, line-interleaved) WDR modes run end to
+end. T31 enters one with the sensor module's `data_type=2`
+(`TX_SENSOR_DATA_TYPE_WDR_DOL`) and `IMP_ISP_WDR_ENABLE` between
+`IMP_ISP_Open` and `IMP_ISP_AddSensor`; T40 and T41 with
+`IMP_ISP_WDR_ENABLE(IMPVI_MAIN, &mode)` before the sensor is added and
+the sensor's WDR setting (`default_boot` 1). `tisp_init` then clears
+bit 0 of the bypasses (T31, T23: 0x0C, 0xa1fc0202 on the OpenIPC image;
+T40, T41: 0x40, 0xff9100e0 on the T41 SDK image against 0xffd00049
+linear), which is what the model takes as the WDR mode. The sensor
+gets both exposures over I2C: the GC4653's and GC4663's long rows at
+0x0202:0x0203 as in a linear mode, the short frame's at
+0x0200[5:0]:0x0201 (`gc*_set_integration_time_short`), the gain shared
+(`galaxycore_exposure()` reports both).
+
+Each frame the model lights the scene with each exposure: AE1's zones
+and histogram (T31, T23) and the WDR statistics' short-frame half come
+from the short one, and the picture is the fusion -- the long frame
+where it does not clip, the short frame scaled by the exposure ratio
+where it does, then an extended Reinhard curve whose white is that
+ratio (`isp_wdr_tone()`), so a white the long frame clips keeps its
+shading. T40 and T41 (`tisp_wdr_interrupt_static`, T40's
+`tisp_wdr_main_interrupt_static`, bit 11 of 0x40028 on both) take four
+6 KiB banks at 0x6010.., 0x6030 the last one's number;
+`tisp_wdr_get_data` reads 456 24-bit values (the first 450: 15 rows of
+15 long-frame then 15 short-frame blocks -- here luma sums), four
+12-bit and two 23-bit values at +1352 / +1360 (here the frames' mean
+luma, bright and dark counts), 160 values from +1368 (left zero, not
+identified) and, when the tuning asks, the long and the short frame's
+R, G, B histograms from +1848 and +3896 (256 entries of three 21-bit
+counts).
+
+The kernels' WDR processes run on them: on T31 134 of the 229 WDR
+registers (0x2000..0x28FF) change from frame to frame; on T41 its
+process writes some 29 registers a frame. AE1 does not close a loop of
+its own: `tisp_ae1_process` hands its zone means and histogram to the
+WDR module (`tisp_wdr_rx_ae1_infm`), and `tisp_ae1_expt` derives the
+short exposure from the long one's (rows, analog and digital gain)
+through the tuning's `ae1_ev_list` tables. On T40 and T41 it follows
+the long exposure (T41: 7 to 94 rows as the AE settles); with the
+OpenIPC T31 tuning (`gc4653-t31.bin`) it stays at the sensor's longest
+short exposure, 310 rows, for every long exposure from 1486 rows down
+to 4. On the scene at the AE's exposure, a linear frame clips 7.5 % of
+its pixels (the logo), the WDR frame 0.4 % (T31, T40, T41;
+`test-ingenic-isp.sh --wdr`). T23's WDR-capable drivers (imx327,
+sc301IoT) are for sensors not modelled here.
 
 T40 and T41 produce theirs too (`xstat` 3; their symbols):
 
@@ -1552,6 +1600,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t23` + vendor modules, `sensor=gc2053` | `t23` | `-kernel` + NOR root | the same (`test-ingenic-isp.sh --soc t23`) |
 | OpenIPC `t20` + vendor modules, `sensor=jxf22` | `t20` | `-kernel` + NOR root | the same, through the Apical core's DMA writers (`test-ingenic-isp.sh --soc t20`) |
 | OpenIPC `t40` + vendor modules, `sensor=gc4653` | `t40 -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t40`) |
+| OpenIPC `t31` / `t40` + vendor modules, `sensor=gc4653`; T41NQ SDK image, `gc4663`; the sensors' DOL WDR | `t31 -m 128M` / `t40` / `t41` | as above | frames in the WDR mode, the short exposure written (T40, T41: moving), under 2 % of the last frame clipped (`test-ingenic-isp.sh --wdr`) |
 | OpenIPC `t40` + vendor modules + the SDK's `sensor_gc4653s1_t40.ko`, two sensors | `t40,sensor=gc4653,sensor1=gc4653 -m 256M` | `-kernel` + NOR root | libimp in the all-cached dual mode: channel 0 (pipe 0) and channel 3 (pipe 1) at 2560x1440, 40 frames each, both pipes' AE converging on their own sensors, the scene and counter checked per pipe (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`) |
 | OpenIPC `t40` + vendor modules + the gc4653 "s1" module twice (as `s1` and `s2`), three sensors | `t40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653 -m 256M` | `-kernel` + NOR root | libimp with `IMPISP_TOTAL_THR`, the third on VIC2 / DVP: both pipes' frames as above, VIC2 interrupting; the `snapraw` command while streaming saves `/tmp/snap0.raw` (2560x1440 x 2 bytes, an RGGB mosaic of the navy scene: R 186, G 216, B 335 on average) through the VIC MDMA (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --sensor2 gc4653 --snap-env SNAP_SNAPRAW=0_1`) |
 | T41NQ SDK 1.2.0 image + its modules, `sensor=gc4663` | `t41,variant=t41nq -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t41`) |
@@ -1605,8 +1654,9 @@ and the TCU's PWM pins.
 
 T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
 its Apical base; above), the placement of the two pictures in T40's
-joint mode and the VIC raw frame channel (above), T40/T41's WDR
-statistics (bit 11, a WDR mode's), T40's GSM and LCE (read otherwise
+joint mode and the VIC raw frame channel (above), the 160 values of
+T40/T41's WDR statistics at +1368, a WDR mode on T23 (no modelled sensor
+has one there), T40's GSM and LCE (read otherwise
 than T41's), the Apical DIS's motion vectors (zero: no motion), DMA for the I2C,
 the SADC and the SSI slave (no driver programs it; above), the SSI
 slave and the HASH engine's CPU mode (no
