@@ -1,5 +1,5 @@
 /*
- * Novatek NA51103 H.264 / H.265 decoder (0x2_F0600000, SPI 9).
+ * Novatek NA51103 / NA51090 H.264 / H.265 decoder (0x2_F0600000, SPI 9).
  *
  * Driven by the HDAL's kdrv_videodec/h26xdec.ko (not stripped).  The
  * driver parses the parameter sets and slice headers itself, keeps the
@@ -54,6 +54,14 @@
  * jobs complete with nothing written.  trace=on logs each list, every
  * access and the bitstream's head.
  *
+ * na51090=on is NA51090's layout (its h26xdec.ko v0.1.45): the list
+ * wrapper at 0x8000; H.264 in two stages like H.265's, AD at 0x6000 and
+ * BIN at 0x6800 (the list starts both, BIN last), each with its interrupt
+ * enable at +0x38 and flags at +0x3C (bit 0 done, both written back to
+ * clear; no 0x184C); 0x6004 the size, 0x602C the bitstream block, 0x6808
+ * the strides x4, 0x6840 / 0x6844 the picture.  The reduced copy is the
+ * "extra write" at 0x8040, for both codecs (nvt_h26xdec_put_extw()).
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -86,11 +94,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtH26xDecState, NVT_H26XDEC)
 #define AUX_INT_ACK         (AUX_BASE + 0x48)
 #define AUX_INT_STS         (AUX_BASE + 0x4C)
 #define LL_BASE             0x3000
-#define LL_CTRL             (LL_BASE + 0x00)
-#define LL_ADDR             (LL_BASE + 0x04)
-#define LL_RESET_STS        (LL_BASE + 0x08)
-#define LL_LAST_CMD         (LL_BASE + 0x18)
-#define LL_LAST_VAL         (LL_BASE + 0x1C)
+#define LL_CTRL             0x00                /* from the list's base */
+#define LL_ADDR             0x04
+#define LL_RESET_STS        0x08
+#define LL_LAST_CMD         0x18
+#define LL_LAST_VAL         0x1C
+#define LL_REGS             0x40
 
 #define H264_CTRL           0x1000
 #define H264_INT_FLG        0x103C
@@ -117,6 +126,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtH26xDecState, NVT_H26XDEC)
 #define HEVC_OUT_UV         0x28BC
 #define HEVC_SUB_CTRL       0x29D0
 #define HEVC_SUB_Y          0x29D4
+
+/* NA51090 (na51090=on): H.264's two stages, the list, the extra write */
+#define D90_LL_BASE         0x8000
+#define D90_H264_AD         0x6000
+#define D90_H264_SIZE       0x6004
+#define D90_H264_BS_DESC    0x602C
+#define D90_H264_INT_EN     0x6038
+#define D90_H264_INT_FLG    0x603C
+#define D90_H264_BIN        0x6800
+#define D90_H264_STRIDE     0x6808
+#define D90_BIN_INT_EN      0x6838
+#define D90_BIN_INT_FLG     0x683C
+#define D90_H264_OUT_Y      0x6840
+#define D90_H264_OUT_UV     0x6844
+#define EXTW_CTRL           0x8040
+#define EXTW_Y              0x8044
+#define EXTW_UV             0x8048
+#define EXTW_STRIDE         0x804C
+#define EXTW_SCALE_INT      0x8050
+#define EXTW_SCALE_Y        0x8054
+#define EXTW_CMP            (1u << 2)
 #define HEVC_PS_MAX         4096
 #define BS_MAX              (4 * MiB)
 #define DEC_CTXS            16
@@ -136,17 +166,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtH26xDecState, NVT_H26XDEC)
 typedef struct NvtDecRegs {
     uint32_t bs_desc, size, stride, out_y, out_uv, sub_ctrl, sub_y;
     bool hevc;
+    int stride_shift;                   /* NA51090's strides are x4 */
+    bool extw;                          /* the reduced copy is 0x8040's */
 } NvtDecRegs;
 
 static const NvtDecRegs nvt_h264_regs = {
     H264_BS_DESC, H264_SIZE, H264_STRIDE, H264_OUT_Y, H264_OUT_UV,
-    SUB_CTRL, SUB_Y, false,
+    SUB_CTRL, SUB_Y, false, 0, false,
 };
 
 /* H.265 has no stride register the model knows: its planes are packed. */
 static const NvtDecRegs nvt_hevc_regs = {
     HEVC_BS_DESC, HEVC_SIZE, 0, HEVC_OUT_Y, HEVC_OUT_UV,
-    HEVC_SUB_CTRL, HEVC_SUB_Y, true,
+    HEVC_SUB_CTRL, HEVC_SUB_Y, true, 0, false,
+};
+
+static const NvtDecRegs nvt_h264_regs_90 = {
+    D90_H264_BS_DESC, D90_H264_SIZE, D90_H264_STRIDE, D90_H264_OUT_Y,
+    D90_H264_OUT_UV, 0, 0, false, 2, true,
+};
+
+static const NvtDecRegs nvt_hevc_regs_90 = {
+    HEVC_BS_DESC, HEVC_SIZE, 0, HEVC_OUT_Y, HEVC_OUT_UV, 0, 0, true, 0,
+    true,
 };
 
 typedef struct NvtDecCtx {
@@ -176,7 +218,10 @@ struct NvtH26xDecState {
     bool hevc_job;                      /* the list in flight is H.265's */
     bool hevc_irq;                      /* its done, not yet taken */
     bool ll_ok;                         /* the list ran to its end */
+    bool h264_job;                      /* NA51090: an H.264 job ran */
     bool trace;
+    bool na51090;
+    uint32_t ll_base;
 };
 
 static uint32_t *reg(NvtH26xDecState *s, hwaddr off)
@@ -189,8 +234,11 @@ static void nvt_h26xdec_update_irq(NvtH26xDecState *s)
     bool aux = (*reg(s, AUX_INT_STS) & 1) != 0;
     bool core = (*reg(s, CORE_INT_STS) & *reg(s, CORE_INT_MASK) & 0x707) != 0;
     bool hevc = s->hevc_irq && *reg(s, HEVC_INT_EN);
+    bool h264 = s->na51090 &&
+        ((*reg(s, D90_H264_INT_FLG) & *reg(s, D90_H264_INT_EN)) ||
+         (*reg(s, D90_BIN_INT_FLG) & *reg(s, D90_BIN_INT_EN)));
 
-    qemu_set_irq(s->irq, aux || core || hevc);
+    qemu_set_irq(s->irq, aux || core || hevc || h264);
 }
 
 static void nvt_h26xdec_dump(NvtH26xDecState *s, const char *what, hwaddr a)
@@ -258,7 +306,8 @@ static void nvt_h26xdec_put_picture(NvtH26xDecState *s,
                                     const NvtDecRegs *rs, AVFrame *f)
 {
     uint32_t stride = rs->stride ? *reg(s, rs->stride) : 0;
-    uint32_t ys = stride & 0xFFFF, cs = stride >> 16;
+    uint32_t ys = (stride & 0xFFFF) >> rs->stride_shift;
+    uint32_t cs = (stride >> 16) >> rs->stride_shift;
     hwaddr y = *reg(s, rs->out_y), uv = *reg(s, rs->out_uv);
     g_autofree uint8_t *line = NULL;
     int r, x, w = f->width, h = f->height;
@@ -322,6 +371,69 @@ static void nvt_h26xdec_put_sub(NvtH26xDecState *s, const NvtDecRegs *rs,
         }
         dma_memory_write(&address_space_memory, uv + (hwaddr)r * sw, line,
                          sw & ~1, MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
+/*
+ * NA51090's reduced copy, the "extra write" at 0x8040: 0x8040 bit 0 on,
+ * 0x8044 / 0x8048 its Y / UV, 0x804C the strides ([15:0] Y, [31:16] UV),
+ * and the scale factors, (source - 1) / (copy - 1) in 16.16: the integer
+ * parts in 0x8050 ([3:0] across, [11:8] down, for Y), the fractions in
+ * 0x8054 ([15:0] across, [31:16] down).  The copy's size comes back from
+ * them.  With bit 2 the hardware stores the copy compressed, in about
+ * 3/4 of its width (the stride the driver gives is that); this model
+ * then stores each row resampled to the stride instead, its own stand-in
+ * that nvt-engine's scaler (na51090=on) stretches back.
+ */
+static void nvt_h26xdec_put_extw(NvtH26xDecState *s, AVFrame *f)
+{
+    uint32_t ctrl = *reg(s, EXTW_CTRL);
+    uint32_t si = *reg(s, EXTW_SCALE_INT), sf = *reg(s, EXTW_SCALE_Y);
+    uint64_t fx = ((uint64_t)(si & 0xF) << 16) | (sf & 0xFFFF);
+    uint64_t fy = ((uint64_t)((si >> 8) & 0xF) << 16) | (sf >> 16);
+    hwaddr y = *reg(s, EXTW_Y), uv = *reg(s, EXTW_UV);
+    uint32_t ys = *reg(s, EXTW_STRIDE) & 0xFFFF;
+    uint32_t cs = *reg(s, EXTW_STRIDE) >> 16;
+    g_autofree uint8_t *line = NULL;
+    int dw, dh, sw, r, x;
+
+    if (!(ctrl & 1) || !fx || !fy || !y || !ys) {
+        return;
+    }
+    dw = (((uint64_t)(f->width - 1) << 16) + fx / 2) / fx + 1;
+    dh = (((uint64_t)(f->height - 1) << 16) + fy / 2) / fy + 1;
+    sw = (ctrl & EXTW_CMP) ? ys : MIN(dw, (int)ys);
+    sw &= ~1;
+    cs = cs ? cs : ys;
+    if (s->trace) {
+        qemu_log("nvt-h26xdec: job %u extw %dx%d (%d stored) -> y %08"
+                 HWADDR_PRIx " uv %08" HWADDR_PRIx " stride %u/%u\n",
+                 s->jobs, dw, dh, sw, y, uv, ys, cs);
+    }
+    if (sw < 2 || dh < 2) {
+        return;
+    }
+    line = g_malloc(sw);
+    for (r = 0; r < dh; r++) {
+        const uint8_t *src = f->data[0] + (r * f->height / dh) * f->linesize[0];
+
+        for (x = 0; x < sw; x++) {
+            line[x] = src[x * f->width / sw];
+        }
+        dma_memory_write(&address_space_memory, y + (hwaddr)r * ys, line, sw,
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+    for (r = 0; r < dh / 2; r++) {
+        int sr = r * (f->height / 2) / (dh / 2);
+
+        for (x = 0; x < sw / 2; x++) {
+            int sx = x * (f->width / 2) / (sw / 2);
+
+            line[2 * x] = f->data[1][sr * f->linesize[1] + sx];
+            line[2 * x + 1] = f->data[2][sr * f->linesize[2] + sx];
+        }
+        dma_memory_write(&address_space_memory, uv + (hwaddr)r * cs, line,
+                         sw, MEMTXATTRS_UNSPECIFIED);
     }
 }
 
@@ -432,7 +544,11 @@ static void nvt_h26xdec_decode(NvtH26xDecState *s, const NvtDecRegs *rs)
             if (s->frame->format == AV_PIX_FMT_YUV420P ||
                 s->frame->format == AV_PIX_FMT_YUVJ420P) {
                 nvt_h26xdec_put_picture(s, rs, s->frame);
-                nvt_h26xdec_put_sub(s, rs, s->frame);
+                if (rs->extw) {
+                    nvt_h26xdec_put_extw(s, s->frame);
+                } else {
+                    nvt_h26xdec_put_sub(s, rs, s->frame);
+                }
             }
             av_frame_unref(s->frame);
         }
@@ -445,15 +561,45 @@ static void nvt_h26xdec_decode(NvtH26xDecState *s, const NvtDecRegs *rs)
 static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
                                  uint32_t val)
 {
-    if (off >= LL_BASE) {
+    if (off >= s->ll_base && off < s->ll_base + LL_REGS) {
         return;
     }
-    if (off == H264_INT_FLG) {
+    if (s->na51090) {
+        if (off == D90_H264_INT_FLG || off == D90_BIN_INT_FLG) {
+            *reg(s, off) &= ~val;
+            return;
+        }
+        if (off == D90_H264_AD || off == D90_H264_BIN) {
+            if (val & CTRL_RESET) {
+                *reg(s, off) = 0;
+                return;
+            }
+        }
+        if (off == D90_H264_BIN && (val & CTRL_START)) {
+            *reg(s, off) = val;
+            s->h264_job = true;
+            if (s->trace) {
+                uint32_t bs[3];
+
+                address_space_read(&address_space_memory,
+                                   *reg(s, D90_H264_BS_DESC),
+                                   MEMTXATTRS_UNSPECIFIED, bs, sizeof(bs));
+                qemu_log("nvt-h26xdec: job %u bs %u x %08x+%u\n", s->jobs,
+                         bs[0], bs[1], bs[2]);
+                nvt_h26xdec_dump(s, "bs", bs[1]);
+            }
+#ifdef NVT_H26XDEC_LIBAVCODEC
+            nvt_h26xdec_decode(s, &nvt_h264_regs_90);
+#endif
+            return;
+        }
+    }
+    if (off == H264_INT_FLG && !s->na51090) {
         *reg(s, off) &= ~val;               /* write 1 to clear, here too */
         return;
     }
-    if (off == H264_CTRL || off == BIN_CTRL || off == HEVC_AD_CTRL ||
-        off == HEVC_BIN_CTRL) {
+    if ((!s->na51090 && (off == H264_CTRL || off == BIN_CTRL)) ||
+        off == HEVC_AD_CTRL || off == HEVC_BIN_CTRL) {
         /*
          * A reset finishes at once and leaves the block idle; it wins over
          * the start bit VPU_ResetHW()'s read-modify-write carries along.
@@ -469,7 +615,7 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
         }
     }
     *reg(s, off) = val;
-    if (off == H264_CTRL && (val & CTRL_START)) {
+    if (off == H264_CTRL && (val & CTRL_START) && !s->na51090) {
         if (s->trace) {
             static const uint32_t regs[] = { 0x1018, 0x1024, 0x1028, 0x102C };
             int i;
@@ -499,7 +645,8 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
     if (off == HEVC_BIN_CTRL && (val & CTRL_START)) {
         s->hevc_job = true;
 #ifdef NVT_H26XDEC_LIBAVCODEC
-        nvt_h26xdec_decode(s, &nvt_hevc_regs);
+        nvt_h26xdec_decode(s, s->na51090 ? &nvt_hevc_regs_90 :
+                           &nvt_hevc_regs);
 #endif
     }
 }
@@ -507,7 +654,7 @@ static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
 /* Run the list; whether it reached its end. */
 static bool nvt_h26xdec_run_ll(NvtH26xDecState *s)
 {
-    hwaddr addr = *reg(s, LL_ADDR);
+    hwaddr addr = *reg(s, s->ll_base + LL_ADDR);
     uint32_t cmd[2];
     int n;
 
@@ -524,8 +671,8 @@ static bool nvt_h26xdec_run_ll(NvtH26xDecState *s)
             qemu_log("nvt-h26xdec: job %u ll[%d] %08x %08x\n", s->jobs, n,
                      cmd[0], cmd[1]);
         }
-        *reg(s, LL_LAST_CMD) = cmd[0];
-        *reg(s, LL_LAST_VAL) = cmd[1];
+        *reg(s, s->ll_base + LL_LAST_CMD) = cmd[0];
+        *reg(s, s->ll_base + LL_LAST_VAL) = cmd[1];
         switch (cmd[0] >> 28) {
         case LL_OP_WRITE:
             nvt_h26xdec_ll_write(s, cmd[0] & 0x7FFFC, cmd[1]);
@@ -557,12 +704,16 @@ static void nvt_h26xdec_done(void *opaque)
      * 0x18 / 0x1C, which IMVQ_VDEC_LLCheckFinalJob() reports as failed.
      */
     if (s->ll_ok) {
-        *reg(s, LL_LAST_VAL) = LL_FINAL;
+        *reg(s, s->ll_base + LL_LAST_VAL) = LL_FINAL;
     }
     if (s->hevc_job) {
         s->hevc_irq = true;
-    } else {
+    } else if (!s->na51090) {
         *reg(s, AUX_INT_STS) |= 1;
+    } else if (s->h264_job) {
+        /* both stages done; H264Dec_Isr() takes bit 0 of each */
+        *reg(s, D90_H264_INT_FLG) |= H264_INT_DONE;
+        *reg(s, D90_BIN_INT_FLG) |= H264_INT_DONE;
     }
     nvt_h26xdec_update_irq(s);
 }
@@ -579,6 +730,12 @@ static uint64_t nvt_h26xdec_read(void *opaque, hwaddr offset, unsigned size)
     case HEVC_AD_CTRL:
     case HEVC_BIN_CTRL:
         val |= CTRL_DONE;
+        break;
+    case D90_H264_AD:
+    case D90_H264_BIN:
+        if (s->na51090) {
+            val |= CTRL_DONE;
+        }
         break;
     }
 
@@ -598,6 +755,46 @@ static void nvt_h26xdec_write(void *opaque, hwaddr offset, uint64_t value,
     if (s->trace) {
         qemu_log("nvt-h26xdec: w %04x = %08x\n", (unsigned)offset, val);
     }
+    if (offset == s->ll_base + LL_CTRL) {
+        *reg(s, offset) = val;
+        if (val & LL_CTRL_RESET) {
+            *reg(s, s->ll_base + LL_RESET_STS) |= LL_RESET_DONE;
+        } else {
+            *reg(s, s->ll_base + LL_RESET_STS) &= ~LL_RESET_DONE;
+        }
+        if (val & LL_CTRL_FIRE) {
+            s->hevc_job = false;
+            s->hevc_irq = false;
+            s->h264_job = false;
+            s->ll_ok = nvt_h26xdec_run_ll(s);
+            s->jobs++;
+            timer_mod(s->done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      2 * SCALE_MS);
+        }
+        return;
+    }
+    if (s->na51090) {
+        switch (offset) {
+        case D90_H264_INT_FLG:
+        case D90_BIN_INT_FLG:
+        case D90_H264_AD:
+        case D90_H264_BIN:
+            nvt_h26xdec_ll_write(s, offset, val);
+            nvt_h26xdec_update_irq(s);
+            return;
+        case CORE_INT_STS:
+        case HEVC_AD_CTRL:
+        case HEVC_BIN_CTRL:
+            break;
+        default:
+            *reg(s, offset) = val;
+            if (offset == D90_H264_INT_EN || offset == D90_BIN_INT_EN ||
+                offset == HEVC_INT_EN || offset == CORE_INT_MASK) {
+                nvt_h26xdec_update_irq(s);
+            }
+            return;
+        }
+    }
     switch (offset) {
     case AUX_INT_STS:
     case CORE_INT_STS:
@@ -610,22 +807,6 @@ static void nvt_h26xdec_write(void *opaque, hwaddr offset, uint64_t value,
     case HEVC_AD_CTRL:
     case HEVC_BIN_CTRL:
         nvt_h26xdec_ll_write(s, offset, val);
-        return;
-    case LL_CTRL:
-        *reg(s, offset) = val;
-        if (val & LL_CTRL_RESET) {
-            *reg(s, LL_RESET_STS) |= LL_RESET_DONE;
-        } else {
-            *reg(s, LL_RESET_STS) &= ~LL_RESET_DONE;
-        }
-        if (val & LL_CTRL_FIRE) {
-            s->hevc_job = false;
-            s->hevc_irq = false;
-            s->ll_ok = nvt_h26xdec_run_ll(s);
-            s->jobs++;
-            timer_mod(s->done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      2 * SCALE_MS);
-        }
         return;
     }
     if (offset == AUX_INT_ACK) {
@@ -661,6 +842,7 @@ static void nvt_h26xdec_reset(DeviceState *dev)
     s->hevc_job = false;
     s->hevc_irq = false;
     s->ll_ok = false;
+    s->h264_job = false;
     qemu_irq_lower(s->irq);
 }
 
@@ -679,8 +861,16 @@ static void nvt_h26xdec_init(Object *obj)
 #endif
 }
 
+static void nvt_h26xdec_realize(DeviceState *dev, Error **errp)
+{
+    NvtH26xDecState *s = NVT_H26XDEC(dev);
+
+    s->ll_base = s->na51090 ? D90_LL_BASE : LL_BASE;
+}
+
 static const Property nvt_h26xdec_properties[] = {
     DEFINE_PROP_BOOL("trace", NvtH26xDecState, trace, false),
+    DEFINE_PROP_BOOL("na51090", NvtH26xDecState, na51090, false),
 };
 
 /*
@@ -690,7 +880,7 @@ static const Property nvt_h26xdec_properties[] = {
  */
 static const VMStateDescription vmstate_nvt_h26xdec = {
     .name = TYPE_NVT_H26XDEC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtH26xDecState, DEC_SIZE / 4),
@@ -698,6 +888,7 @@ static const VMStateDescription vmstate_nvt_h26xdec = {
         VMSTATE_BOOL(hevc_job, NvtH26xDecState),
         VMSTATE_BOOL(hevc_irq, NvtH26xDecState),
         VMSTATE_BOOL(ll_ok, NvtH26xDecState),
+        VMSTATE_BOOL_V(h264_job, NvtH26xDecState, 2),
         VMSTATE_TIMER_PTR(done, NvtH26xDecState),
         VMSTATE_END_OF_LIST()
     },
@@ -708,6 +899,7 @@ static void nvt_h26xdec_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, nvt_h26xdec_reset);
+    dc->realize = nvt_h26xdec_realize;
     device_class_set_props(dc, nvt_h26xdec_properties);
     dc->vmsd = &vmstate_nvt_h26xdec;
 }

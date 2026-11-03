@@ -1,10 +1,11 @@
 /*
  * Novatek HDAL media engine stand-in: a register file that completes jobs.
  *
- * NA51103's media blocks (the VPE scaler, and the HDAL engines like it)
- * are run by the HDAL's kdrv_* modules the same way: they program a job
- * -- registers, or a link list of register writes in DDR -- set a fire bit
- * in a control register, and sleep until the engine's interrupt reports
+ * NA51103's media blocks (the VPE scaler, the OSG, and the HDAL engines
+ * like them) are run by the HDAL's kdrv_* modules the same way: they
+ * program a job -- registers, or a link list of register writes in DDR --
+ * set a fire bit in a control register, and sleep until the engine's
+ * interrupt reports
  * the job done in a write-1-to-clear status register.  A job that never
  * completes stalls the HDAL's job manager (em_putjob times out after 3 s)
  * and it panics the whole media stack.
@@ -17,14 +18,30 @@
  * and bits come from the machine, per engine, from its kdrv module.
  *
  * With ll-reg set, a fire with a bit of ll-fire-mask first runs the link
- * list whose 40-bit address is at ll-reg (low word) and ll-reg + 4 (bits
- * 39:32).  The list is what the engine would otherwise be programmed with
- * -- the interrupt enable included -- as 64-bit commands, low word first
+ * list whose 40-bit address is at ll-reg (low word) and ll-hi-reg (bits
+ * 39:32; ll-reg + 4 unless set -- the OSG's is 0x340).  The list is what
+ * the engine would otherwise be programmed with -- the interrupt enable
+ * included -- as 64-bit commands, low word first
  * (vpe_drv_ll_write_reg() and friends):
  *
- *   hi[31:28] = 8   register write: hi[12:0] offset, lo the value
+ *   hi[31:28] = 8   register write: hi[12:0] offset (ll-off-mask; the
+ *                   OSG's [11:0], its byte enables in [15:12]), lo the value
  *   hi[31:28] = 2   continue at hi[15:0]:lo[31:8], lo[3:0] the job id
  *   hi[31:28] = 0   end of the list, lo[3:0] the job id
+ *
+ * ll-hi-shift moves bits 39:32 within ll-hi-reg (SSCA keeps bits 35:32 in
+ * 0xA8 [31:28], beside other settings: shift 28, four bits).
+ *
+ * ll-format 1 is the AGE's list instead, hi[31:24] the operation:
+ *
+ *   hi[31:24] = 1   register write: hi[15:0] the word offset, lo the value
+ *   hi[31:24] = 6   continue at lo
+ *   hi[31:24] = 7   (an engine event to wait for; nothing to wait for here)
+ *   hi = lo = 0     end of the list
+ *
+ * ll-active-reg, when set, reads 1 once a list has run (the AGE's 0x410,
+ * which its interrupt handler takes as list mode).  sts-read-clear makes
+ * the status clear when read (the AGE's handler never writes it back).
  *
  * trace=on logs every list command (hi, lo), for working out an engine's
  * registers from a running firmware.
@@ -55,6 +72,13 @@
  * single-channel view the decoder's full pictures (nvt-h26xdec); both
  * have their UV right after Y.  The destinations are the LCD300's video
  * frames.
+ *
+ * na51090=on is NA51090's kdrv_vpe: the window's width in 0x604 [28:16]
+ * and its x in 0x604 [11:0], its y in 0x510 [12:0], 14-bit sizes, and
+ * 0x30C / 0x364 bits 35:32 of the addresses (both UVs follow their Ys).
+ * Source formats 3 and 6 are its compressed ones, the decoder's reduced
+ * copies: nvt-h26xdec's stand-in, rows resampled to the stride the driver
+ * sizes them to, ((width + 31) & ~31) * 3 / 4, 16-aligned.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -92,9 +116,16 @@ struct NvtEngineState {
     uint32_t done_bits;
     uint32_t delay_us;
     uint32_t ll_reg;
+    uint32_t ll_hi_reg;
+    uint32_t ll_off_mask;
+    uint32_t ll_hi_shift;
+    uint32_t ll_format;
+    uint32_t ll_active_reg;
+    bool sts_read_clear;
     uint32_t ll_fire_mask;
     bool trace;
     bool scaler;
+    bool na51090;
     uint32_t jobs;
 };
 
@@ -127,7 +158,8 @@ static void nvt_engine_done(void *opaque)
 /* Apply a list's register writes; a list that loops or faults just ends. */
 static void nvt_engine_run_ll(NvtEngineState *s)
 {
-    hwaddr addr = ((hwaddr)(*reg(s, s->ll_reg + 4) & 0xFF) << 32) |
+    uint32_t hi = s->ll_hi_reg ? s->ll_hi_reg : s->ll_reg + 4;
+    hwaddr addr = ((hwaddr)((*reg(s, hi) >> s->ll_hi_shift) & 0xFF) << 32) |
                   *reg(s, s->ll_reg);
     uint32_t cmd[2], off;
     int n;
@@ -145,9 +177,34 @@ static void nvt_engine_run_ll(NvtEngineState *s)
             qemu_log("%s: job %u ll %08x %08x\n", s->name, s->jobs, cmd[1],
                      cmd[0]);
         }
+        if (s->ll_format == 1) {
+            switch (cmd[1] >> 24) {
+            case 0x01:
+                off = (cmd[1] & 0xFFFF) * 4;
+                if (off < s->size && off != s->fire_reg &&
+                    off != s->sts_reg) {
+                    *reg(s, off) = cmd[0];
+                }
+                continue;
+            case 0x06:
+                addr = (hwaddr)cmd[0] - 8;
+                continue;
+            case 0x07:
+                continue;
+            case 0x00:
+                if (!cmd[0]) {
+                    return;
+                }
+                continue;
+            default:
+                qemu_log_mask(LOG_UNIMP, "%s: link list command "
+                              "0x%08x%08x\n", s->name, cmd[1], cmd[0]);
+                continue;
+            }
+        }
         switch (cmd[1] >> 28) {
         case LL_OP_WRITE:
-            off = cmd[1] & 0x1FFC;
+            off = cmd[1] & s->ll_off_mask;
             if (off < s->size && off != s->fire_reg && off != s->sts_reg) {
                 *reg(s, off) = cmd[0];
             }
@@ -176,9 +233,40 @@ static void nvt_engine_scale(NvtEngineState *s)
     uint32_t wx = *reg(s, 0x554) & 0xFFFF, wy = *reg(s, 0x510) & 0xFFFF;
     hwaddr dy = *reg(s, 0x360), duv = *reg(s, 0x364);
     g_autofree uint8_t *src = NULL, *line = NULL;
-    uint32_t r, x;
+    uint32_t fmt = (*reg(s, 0x008) >> 10) & 7;
+    uint32_t r, x, sw0, ps;
 
+    if (s->na51090) {
+        /*
+         * NA51090's kdrv_vpe: 14-bit sizes; 0x30C and 0x364 hold bits
+         * 35:32 of the addresses, the UVs follow their Ys; the first
+         * column's 0x604 has the window's width ([28:16]) and x
+         * ([11:0]), 0x510 [12:0] its y.
+         */
+        sw = *reg(s, 0x010) & 0x3FFF;
+        sh = (*reg(s, 0x010) >> 16) & 0x3FFF;
+        fw = *reg(s, 0x50C) & 0x3FFF;
+        fh = (*reg(s, 0x50C) >> 16) & 0x3FFF;
+        dw = (*reg(s, 0x604) >> 16) & 0x1FFF;
+        dh = *reg(s, 0x508) & 0x3FFF;
+        wx = *reg(s, 0x604) & 0xFFF;
+        wy = *reg(s, 0x510) & 0x1FFF;
+        sy |= (hwaddr)(suv & 0xF) << 32;
+        dy |= (hwaddr)(duv & 0xF) << 32;
+        suv = duv = 0;
+    }
     ss = ss ? ss : sw;
+    sw0 = sw;
+    /*
+     * NA51090's formats 3 and 6 are the compressed ones (the decoder's
+     * reduced copies): nvt-h26xdec stores its stand-in for them, each row
+     * resampled to the stride the driver sizes them to, 3/4 of the width.
+     */
+    ps = 0;
+    if (s->na51090 && (fmt == 3 || fmt == 6)) {
+        ps = ((((sw + 31) & ~31u) * 3 / 4) + 15) & ~15u;
+        ss = ps;
+    }
     wx &= ~1;                           /* on a chroma pair */
     if (!dw || !dh || !fw || !fh || !dy || wx + dw > fw || wy + dh > fh) {
         return;
@@ -204,7 +292,7 @@ static void nvt_engine_scale(NvtEngineState *s)
         }
         return;
     }
-    if (!sw || !sh || !sy || ss < sw) {
+    if (!sw || !sh || !sy || (!ps && ss < sw)) {
         return;
     }
     suv = suv ? suv : sy + (hwaddr)ss * sh;
@@ -221,7 +309,9 @@ static void nvt_engine_scale(NvtEngineState *s)
         const uint8_t *row = src + (size_t)(r * sh / dh) * ss;
 
         for (x = 0; x < dw; x++) {
-            line[x] = row[x * sw / dw];
+            uint32_t sx = x * sw / dw;
+
+            line[x] = row[ps ? sx * ps / sw0 : sx];
         }
         address_space_write(&address_space_memory, dy + (hwaddr)r * fw,
                             MEMTXATTRS_UNSPECIFIED, line, dw);
@@ -232,7 +322,9 @@ static void nvt_engine_scale(NvtEngineState *s)
         const uint8_t *row = src + (size_t)(r * (sh / 2) / (dh / 2)) * ss;
 
         for (x = 0; x < dw / 2; x++) {
-            uint32_t sx = (x * (sw / 2) / (dw / 2)) * 2;
+            uint32_t sx = x * (sw / 2) / (dw / 2);
+
+            sx = (ps ? sx * (ps / 2) / (sw0 / 2) : sx) * 2;
 
             line[2 * x] = row[sx];
             line[2 * x + 1] = row[sx + 1];
@@ -245,8 +337,13 @@ static void nvt_engine_scale(NvtEngineState *s)
 static uint64_t nvt_engine_read(void *opaque, hwaddr offset, unsigned size)
 {
     NvtEngineState *s = opaque;
+    uint32_t v = *reg(s, offset & ~3);
 
-    return *reg(s, offset & ~3);
+    if (s->sts_read_clear && (offset & ~3) == s->sts_reg && v) {
+        *reg(s, offset & ~3) = 0;
+        nvt_engine_update_irq(s);
+    }
+    return v;
 }
 
 static void nvt_engine_write(void *opaque, hwaddr offset, uint64_t value,
@@ -265,6 +362,9 @@ static void nvt_engine_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset == s->fire_reg && (val & s->fire_mask)) {
         if (s->ll_reg && (val & s->ll_fire_mask)) {
             nvt_engine_run_ll(s);
+            if (s->ll_active_reg) {
+                *reg(s, s->ll_active_reg) = 1;
+            }
         }
         if (s->scaler) {
             nvt_engine_scale(s);
@@ -302,7 +402,7 @@ static void nvt_engine_realize(DeviceState *dev, Error **errp)
 
     if (!s->size || s->size & 3 || s->fire_reg >= s->size ||
         s->sts_reg >= s->size || s->en_reg >= s->size ||
-        s->ll_reg + 8 > s->size ||
+        s->ll_reg + 8 > s->size || s->ll_hi_reg + 4 > s->size ||
         !s->fire_mask || !s->done_bits) {
         error_setg(errp, "nvt-engine: bad register layout");
         return;
@@ -332,8 +432,15 @@ static const Property nvt_engine_properties[] = {
     DEFINE_PROP_UINT32("delay-us", NvtEngineState, delay_us, 1000),
     DEFINE_PROP_UINT32("ll-reg", NvtEngineState, ll_reg, 0),
     DEFINE_PROP_UINT32("ll-fire-mask", NvtEngineState, ll_fire_mask, 0),
+    DEFINE_PROP_UINT32("ll-hi-reg", NvtEngineState, ll_hi_reg, 0),
+    DEFINE_PROP_UINT32("ll-off-mask", NvtEngineState, ll_off_mask, 0x1FFC),
+    DEFINE_PROP_UINT32("ll-hi-shift", NvtEngineState, ll_hi_shift, 0),
+    DEFINE_PROP_UINT32("ll-format", NvtEngineState, ll_format, 0),
+    DEFINE_PROP_UINT32("ll-active-reg", NvtEngineState, ll_active_reg, 0),
+    DEFINE_PROP_BOOL("sts-read-clear", NvtEngineState, sts_read_clear, false),
     DEFINE_PROP_BOOL("trace", NvtEngineState, trace, false),
     DEFINE_PROP_BOOL("scaler", NvtEngineState, scaler, false),
+    DEFINE_PROP_BOOL("na51090", NvtEngineState, na51090, false),
 };
 
 static const VMStateDescription vmstate_nvt_engine = {

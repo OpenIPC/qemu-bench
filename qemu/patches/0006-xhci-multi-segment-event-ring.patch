@@ -1,0 +1,243 @@
+xhci: accept an event ring of several segments
+
+The xHCI model cached one event ring segment and declared the host
+controller dead (USBSTS.HCE) for any ERSTSZ but 1.  The spec allows a
+segment table, and a Novatek vendor kernel (NA51090, NT98633: Linux
+4.19.148's xhci with ERST_NUM_SEGS 4) asks for four: every event after
+the first reset was dropped, so the kernel saw no command completion and
+enumerated nothing.
+
+Keep the segment table (up to XHCI_ERST_MAX, 8) and count the ring's
+entries across it: the enqueue index, the dequeue pointer's index and
+the full / EHB checks all run on that one index, mapped to and from
+guest addresses through the table.  HCSPARAMS2 still advertises one
+segment, so guests that follow it see no change.  post_load re-reads
+the table from the guest's ERST.
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 292c378..3f92681 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -604,6 +604,37 @@ static inline int xhci_running(XHCIState *xhci)
+     return !(xhci->usbsts & USBSTS_HCH);
+ }
+ 
++/* The guest address of event ring entry idx, counted across the segments */
++static dma_addr_t xhci_er_addr(XHCIInterrupter *intr, unsigned int idx)
++{
++    uint32_t i;
++
++    for (i = 0; i < intr->er_nsegs; i++) {
++        if (idx < intr->er_seg_size[i]) {
++            return intr->er_seg_start[i] + TRB_SIZE * idx;
++        }
++        idx -= intr->er_seg_size[i];
++    }
++    return intr->er_start;
++}
++
++/* The entry an ERDP points at, or -1 when it is outside every segment */
++static int xhci_er_index(XHCIInterrupter *intr, dma_addr_t erdp)
++{
++    unsigned int base = 0;
++    uint32_t i;
++
++    for (i = 0; i < intr->er_nsegs; i++) {
++        dma_addr_t start = intr->er_seg_start[i];
++
++        if (erdp >= start && erdp < start + TRB_SIZE * intr->er_seg_size[i]) {
++            return base + (erdp - start) / TRB_SIZE;
++        }
++        base += intr->er_seg_size[i];
++    }
++    return -1;
++}
++
+ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
+ {
+     XHCIInterrupter *intr = &xhci->intr[v];
+@@ -623,7 +654,7 @@ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
+                                event_name(event), ev_trb.parameter,
+                                ev_trb.status, ev_trb.control);
+ 
+-    addr = intr->er_start + TRB_SIZE*intr->er_ep_idx;
++    addr = xhci_er_addr(intr, intr->er_ep_idx);
+     if (dma_memory_write(xhci->as, addr, &ev_trb, TRB_SIZE,
+                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
+@@ -642,7 +673,7 @@ static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
+ {
+     XHCIInterrupter *intr;
+     dma_addr_t erdp;
+-    unsigned int dp_idx;
++    int dp_idx;
+ 
+     if (xhci->numintrs == 1 ||
+         (xhci->intr_mapping_supported && !xhci->intr_mapping_supported(xhci))) {
+@@ -656,16 +687,14 @@ static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
+     intr = &xhci->intr[v];
+ 
+     erdp = xhci_addr64(intr->erdp_low, intr->erdp_high);
+-    if (erdp < intr->er_start ||
+-        erdp >= (intr->er_start + TRB_SIZE*intr->er_size)) {
++    dp_idx = xhci_er_index(intr, erdp);
++    if (dp_idx < 0) {
+         DPRINTF("xhci: ERDP out of bounds: "DMA_ADDR_FMT"\n", erdp);
+         DPRINTF("xhci: ER[%d] at "DMA_ADDR_FMT" len %d\n",
+                 v, intr->er_start, intr->er_size);
+         xhci_die(xhci);
+         return;
+     }
+-
+-    dp_idx = (erdp - intr->er_start) / TRB_SIZE;
+     assert(dp_idx < intr->er_size);
+ 
+     if ((intr->er_ep_idx + 2) % intr->er_size == dp_idx) {
+@@ -799,42 +828,57 @@ static int xhci_ring_chain_length(XHCIState *xhci, const XHCIRing *ring)
+     return -1;
+ }
+ 
+-static void xhci_er_reset(XHCIState *xhci, int v)
++/* Cache the event ring segment table: false (the controller dead) if bad */
++static bool xhci_er_load_segs(XHCIState *xhci, int v)
+ {
+     XHCIInterrupter *intr = &xhci->intr[v];
+     XHCIEvRingSeg seg;
+     dma_addr_t erstba = xhci_addr64(intr->erstba_low, intr->erstba_high);
++    uint32_t i;
+ 
++    intr->er_nsegs = 0;
++    intr->er_start = 0;
++    intr->er_size = 0;
+     if (intr->erstsz == 0 || erstba == 0) {
+-        /* disabled */
+-        intr->er_start = 0;
+-        intr->er_size = 0;
+-        return;
++        return true;                    /* disabled */
+     }
+-    /* cache the (sole) event ring segment location */
+-    if (intr->erstsz != 1) {
++    if (intr->erstsz > XHCI_ERST_MAX) {
+         DPRINTF("xhci: invalid value for ERSTSZ: %d\n", intr->erstsz);
+         xhci_die(xhci);
+-        return;
+-    }
+-    if (dma_memory_read(xhci->as, erstba, &seg, sizeof(seg),
+-                    MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+-        qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
+-                      __func__);
+-        xhci_die(xhci);
+-        return;
++        return false;
+     }
++    for (i = 0; i < intr->erstsz; i++) {
++        if (dma_memory_read(xhci->as, erstba + i * sizeof(seg), &seg,
++                            sizeof(seg), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
++                          __func__);
++            xhci_die(xhci);
++            return false;
++        }
++        le32_to_cpus(&seg.addr_low);
++        le32_to_cpus(&seg.addr_high);
++        le32_to_cpus(&seg.size);
++        if (seg.size < 16 || seg.size > 4096) {
++            DPRINTF("xhci: invalid value for segment size: %d\n", seg.size);
++            xhci_die(xhci);
++            return false;
++        }
++        intr->er_seg_start[i] = xhci_addr64(seg.addr_low, seg.addr_high);
++        intr->er_seg_size[i] = seg.size;
++        intr->er_size += seg.size;
++    }
++    intr->er_nsegs = intr->erstsz;
++    intr->er_start = intr->er_seg_start[0];
++    return true;
++}
+ 
+-    le32_to_cpus(&seg.addr_low);
+-    le32_to_cpus(&seg.addr_high);
+-    le32_to_cpus(&seg.size);
+-    if (seg.size < 16 || seg.size > 4096) {
+-        DPRINTF("xhci: invalid value for segment size: %d\n", seg.size);
+-        xhci_die(xhci);
++static void xhci_er_reset(XHCIState *xhci, int v)
++{
++    XHCIInterrupter *intr = &xhci->intr[v];
++
++    if (!xhci_er_load_segs(xhci, v) || !intr->er_nsegs) {
+         return;
+     }
+-    intr->er_start = xhci_addr64(seg.addr_low, seg.addr_high);
+-    intr->er_size = seg.size;
+ 
+     intr->er_ep_idx = 0;
+     intr->er_pcs = 1;
+@@ -2728,6 +2772,7 @@ static void xhci_reset(DeviceState *dev)
+ 
+         xhci->intr[i].er_ep_idx = 0;
+         xhci->intr[i].er_pcs = 1;
++        xhci->intr[i].er_nsegs = 0;
+         xhci->intr[i].ev_buffer_put = 0;
+         xhci->intr[i].ev_buffer_get = 0;
+     }
+@@ -3120,10 +3165,9 @@ static void xhci_runtime_write(void *ptr, hwaddr reg,
+         intr->erdp_low = (val & ~ERDP_EHB) | (intr->erdp_low & ERDP_EHB);
+         if (val & ERDP_EHB) {
+             dma_addr_t erdp = xhci_addr64(intr->erdp_low, intr->erdp_high);
+-            unsigned int dp_idx = (erdp - intr->er_start) / TRB_SIZE;
+-            if (erdp >= intr->er_start &&
+-                erdp < (intr->er_start + TRB_SIZE * intr->er_size) &&
+-                dp_idx != intr->er_ep_idx) {
++            int dp_idx = xhci_er_index(intr, erdp);
++
++            if (dp_idx >= 0 && dp_idx != intr->er_ep_idx) {
+                 xhci_intr_raise(xhci, v);
+             }
+         }
+@@ -3480,6 +3524,11 @@ static int usb_xhci_post_load(void *opaque, int version_id)
+ 
+     dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
+ 
++    /* the segment table, from the guest's ERST as the source had it */
++    for (slotid = 0; slotid < xhci->numintrs; slotid++) {
++        xhci_er_load_segs(xhci, slotid);
++    }
++
+     for (slotid = 1; slotid <= xhci->numslots; slotid++) {
+         slot = &xhci->slots[slotid-1];
+         if (!slot->addressed) {
+diff --git a/hw/usb/hcd-xhci.h b/hw/usb/hcd-xhci.h
+index 9c3974f..39617b9 100644
+--- a/hw/usb/hcd-xhci.h
++++ b/hw/usb/hcd-xhci.h
+@@ -149,6 +149,13 @@ typedef struct XHCIEvent {
+     uint8_t epid;
+ } XHCIEvent;
+ 
++/*
++ * Event ring segments taken: the spec allows more than one, which some
++ * guests use (a Novatek vendor kernel asks for 4), though HCSPARAMS2 still
++ * advertises one.
++ */
++#define XHCI_ERST_MAX 8
++
+ typedef struct XHCIInterrupter {
+     uint32_t iman;
+     uint32_t imod;
+@@ -161,8 +168,12 @@ typedef struct XHCIInterrupter {
+     bool msix_used, er_pcs;
+ 
+     dma_addr_t er_start;
+-    uint32_t er_size;
+-    unsigned int er_ep_idx;
++    uint32_t er_size;               /* TRBs, all segments together */
++    unsigned int er_ep_idx;         /* across the segments */
++    /* the event ring's segments (ERSTSZ of them, at most XHCI_ERST_MAX) */
++    uint32_t er_nsegs;
++    dma_addr_t er_seg_start[XHCI_ERST_MAX];
++    uint32_t er_seg_size[XHCI_ERST_MAX];
+ 
+     /* kept for live migration compat only */
+     bool er_full_unused;

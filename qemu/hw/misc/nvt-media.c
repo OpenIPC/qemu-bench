@@ -83,6 +83,13 @@ struct NvtMediaState {
     uint32_t ive_done;          /* IVE: jobs run, frame ends still to raise */
     uint32_t *ai_regs;
     uint32_t ai_res;
+    /* venc: the job a list is at, and where its report goes */
+    uint32_t venc_id;
+    uint32_t venc_dump_off;
+    uint32_t venc_dump_cnt;
+    uint32_t venc_dump_dst;
+    uint32_t venc_bslen;
+    bool venc_coding;
 };
 
 /*
@@ -304,7 +311,8 @@ static const NvtIppParams ipp_grph = {
 
 /*
  * The AI engines (kdrv_ai: cnn_reg.h, nue_reg.h, nue2_reg.h), in the
- * "ai" node's order NUE, NUE2, CNN.  Control bit 0 resets, bit 1 runs a
+ * "ai" node's order NUE, NUE2, CNN (NA51055: NUE, NUE2, CNN2, CNN1, the
+ * two CNNs alike).  Control bit 0 resets, bit 1 runs a
  * job set up in the registers (done: status bit 0), bit 28 fires a list
  * (job end bit 10, list end bit 8, a broken list bit 9).  Lists start at
  * the address register; an update with bit 59 adds the list base
@@ -870,6 +878,201 @@ static void h26x_reset(NvtMediaState *s)
 }
 
 /*
+ * NA51103 / NA51090's H.26x encoder (kdrv_venc.ko, as decompiled): a later
+ * revision of the engine above.  Its picture registers are the same --
+ * the driver's image of them goes in at 0x020 (h26x_setEncDirectRegSet,
+ * h26xEnc_wrapLLCmd), so source, reconstruction, bitstream, NAL list,
+ * FUNC_CFG and size sit where nvt-h26x.c reads them -- but the rest moved:
+ *
+ *   0x000 CTRL     bit 4 software reset, bit 8 start, bit 12 busy
+ *   0x004 INT      picture finish bit 0, buffer full bit 12, reset done
+ *                  bit 28; write 1 to clear
+ *   0x010 / 0x014  the link list's address, [7:0] its job count
+ *   0x018          [15:0] the job the engine is at
+ *   0x020 INT_EN   the image's first word
+ *   0xD00 / 0xD08  debug select [15:8], and with 0 there the bitstream
+ *                  pointer: the length coded plus the DRAM burst (128
+ *                  bytes with CTRL bit 16, else 256), h26xEnc_getBsLen
+ *   0xD14          the report, NA51089's H26XREPORT order (length at +0x18)
+ *
+ * The driver runs it from link lists by default (h26x_enc_link_list 1, up
+ * to two jobs a list).  A command word is op [31:28], job id [27:20],
+ * register offset / 4 [19:8], count [7:0]:
+ *   0  a job starts
+ *   1  the next count words go to the registers from the offset
+ *   2  the count registers from the offset go to the address in the next
+ *      word -- the report, after the picture
+ *   F  the job ends; the next word is the next job's list, or 0
+ * A picture is coded at its job's op 2 (or op F without one); after the
+ * last job (or a full buffer) INT is raised.  Without a list (0x010 0) a
+ * start codes the registers as written.
+ */
+#define VENC_LL_ADDR        0x010
+#define VENC_LL_JOBS        0x014
+#define VENC_CUR_JOB        0x018
+#define VENC_INT_EN         0x020
+#define VENC_DBG_SEL        0xD00
+#define VENC_DBG2           0xD08
+#define VENC_REPORT         0xD14
+#define VENC_LL_MAX         4096            /* commands a list may take */
+
+static void venc_update_irq(NvtMediaState *s)
+{
+    qemu_set_irq(s->irq[0],
+                 !!(*reg(s, H26X_INT_FLAG) & *reg(s, VENC_INT_EN)));
+}
+
+static uint32_t venc_ld(uint32_t addr)
+{
+    uint32_t v = 0;
+
+    dma_memory_read(&address_space_memory, addr, &v, 4,
+                    MEMTXATTRS_UNSPECIFIED);
+    return le32_to_cpu(v);
+}
+
+static void venc_code(NvtMediaState *s);
+
+/*
+ * Work through the list from ll_addr until a picture is to be coded (it
+ * goes on from venc_finish) or the list ends.
+ */
+static void venc_run(NvtMediaState *s)
+{
+    int n;
+
+    for (n = 0; n < VENC_LL_MAX && s->ll_addr; n++) {
+        uint32_t cmd = venc_ld(s->ll_addr);
+        uint32_t off = ((cmd >> 8) & 0xFFF) * 4, cnt = cmd & 0xFF, i;
+
+        switch (cmd >> 28) {
+        case 0x0:
+            s->venc_id = (cmd >> 20) & 0xFF;
+            s->venc_dump_cnt = 0;
+            s->venc_coding = false;
+            s->ll_addr += 4;
+            break;
+        case 0x1:
+            for (i = 0; i < cnt; i++) {
+                uint32_t o = off + 4 * i;
+
+                if (o >= 0x020 && o < s->size) {
+                    *reg(s, o) = venc_ld(s->ll_addr + 4 + 4 * i);
+                }
+            }
+            s->ll_addr += 4 + 4 * cnt;
+            break;
+        case 0x2:
+            s->venc_dump_off = off;
+            s->venc_dump_cnt = cnt;
+            s->venc_dump_dst = venc_ld(s->ll_addr + 4);
+            s->ll_addr += 8;
+            if (!s->venc_coding) {
+                venc_code(s);
+                return;
+            }
+            break;
+        case 0xF:
+            if (!s->venc_coding) {
+                venc_code(s);
+                return;
+            }
+            *reg(s, VENC_CUR_JOB) = s->venc_id;
+            s->ll_addr = s->phase > 1 ? venc_ld(s->ll_addr + 4) : 0;
+            s->phase = s->phase ? s->phase - 1 : 0;
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR, "nvt-media venc: list command "
+                          "0x%08x at 0x%x\n", cmd, s->ll_addr);
+            s->ll_addr = 0;
+            break;
+        }
+    }
+    s->ll_addr = 0;
+    *reg(s, H26X_INT_FLAG) |= H26X_INT_FINISH;
+    venc_update_irq(s);
+}
+
+static void venc_finish(void *opaque, const NvtH26xResult *r)
+{
+    NvtMediaState *s = opaque;
+    uint32_t i;
+
+    *reg(s, VENC_REPORT + 4 * H26X_RPT_BS_LEN) = r->len;
+    *reg(s, VENC_REPORT + 4 * H26X_RPT_RRC_BITS) = r->len * 8;
+    *reg(s, VENC_REPORT + 4 * H26X_RPT_QP_SUM) = r->qp_sum;
+    s->venc_bslen = r->len;
+    if (r->full) {
+        s->ll_addr = 0;
+        *reg(s, H26X_INT_FLAG) |= H26X_INT_BSOUT_FULL;
+        venc_update_irq(s);
+        return;
+    }
+    if (!s->ll_addr) {                  /* direct */
+        *reg(s, H26X_INT_FLAG) |= H26X_INT_FINISH;
+        venc_update_irq(s);
+        return;
+    }
+    for (i = 0; i < s->venc_dump_cnt; i++) {
+        uint32_t o = s->venc_dump_off + 4 * i;
+        uint32_t v = cpu_to_le32(o < s->size ? *reg(s, o) : 0);
+
+        dma_memory_write(&address_space_memory, s->venc_dump_dst + 4 * i, &v,
+                         4, MEMTXATTRS_UNSPECIFIED);
+    }
+    venc_run(s);
+}
+
+static void venc_code(NvtMediaState *s)
+{
+    s->venc_coding = true;
+    nvt_h26x_encode(s->h26x, s->regs, venc_finish, s);
+}
+
+static uint64_t venc_write(NvtMediaState *s, hwaddr off, uint64_t val)
+{
+    switch (off) {
+    case H26X_CTRL:
+        if (val & H26X_CTRL_SWRST) {
+            *reg(s, H26X_INT_FLAG) |= H26X_INT_SWRST;
+        }
+        if (val & H26X_CTRL_START) {
+            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      IPP_JOB_NS);
+        }
+        return val & ~(H26X_CTRL_SWRST | H26X_CTRL_START);
+    case H26X_INT_FLAG:
+        return *reg(s, off) & ~val;
+    }
+    return val;
+}
+
+static bool venc_read(NvtMediaState *s, hwaddr off, uint64_t *val)
+{
+    if (off == VENC_DBG2 && !(*reg(s, VENC_DBG_SEL) & 0xFF00)) {
+        *val = s->venc_bslen +
+               (*reg(s, H26X_CTRL) & (1u << 16) ? 0x80 : 0x100);
+        return true;
+    }
+    return false;
+}
+
+static void venc_done(NvtMediaState *s)
+{
+    uint32_t ll = *reg(s, VENC_LL_ADDR);
+
+    if (ll) {
+        s->ll_addr = ll;
+        s->phase = *reg(s, VENC_LL_JOBS) & 0xFF;
+        *reg(s, VENC_LL_ADDR) = 0;      /* a later direct start has none */
+        venc_run(s);
+    } else {
+        s->venc_dump_cnt = 0;
+        venc_code(s);
+    }
+}
+
+/*
  * The JPEG codec (kdrv_videocodec/jpeg/include/jpeg_reg.h): CTRL at 0x00 --
  * bit 0 act (start a frame), bit 3 software reset (clears itself), bit 4
  * DMA abort, bit 5 DMA idle -- INT_EN / INT_STA at 0x18 / 0x1C (frame end
@@ -1039,11 +1242,15 @@ static const NvtMediaEngine nvt_media_engines[] = {
     { "sie", sie_write, sie_read, NULL, sie_frame, sie_update_irq },
     { "sie2", sie_write, sie_read, NULL, sie_frame, sie_update_irq },
     { "sie3", sie_write, sie_read, NULL, sie_frame, sie_update_irq },
+    /* NA51055's SIE4 / SIE5 */
+    { "sie4", sie_write, sie_read, NULL, sie_frame, sie_update_irq },
+    { "sie5", sie_write, sie_read, NULL, sie_frame, sie_update_irq },
     { "ife", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ife },
     { "dce", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_dce },
     { "ipe", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ipe },
     { "ime", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ime },
     { "h26x", h26x_write, NULL, h26x_reset, h26x_done, h26x_update_irq },
+    { "venc", venc_write, venc_read, h26x_reset, venc_done, venc_update_irq },
     { "jpg", jpg_write, jpg_read, NULL, jpg_done, jpg_update_irq },
     { "ise", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq, &ipp_ise },
     { "graphic", ipp_write, NULL, NULL, ipp_job_done, ipp_update_irq,
@@ -1055,6 +1262,9 @@ static const NvtMediaEngine nvt_media_engines[] = {
     { "ai2", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
       &ipp_nue2 },
     { "ai3", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
+      &ipp_cnn },
+    /* NA51055's second CNN: its "ai" node is NUE, NUE2, CNN2, CNN1 */
+    { "ai4", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq,
       &ipp_cnn },
     { "md", ipp_write, ai_read, NULL, ipp_job_done, ipp_update_irq, &ipp_md },
     { "ive", ipp_write, ive_read, NULL, ipp_job_done, ipp_update_irq,
@@ -1148,7 +1358,7 @@ static void nvt_media_realize(DeviceState *dev, Error **errp)
     }
     s->regs = g_malloc0(s->size);
     s->ai_regs = g_malloc0(s->size);
-    if (s->engine->timer == h26x_done) {
+    if (s->engine->timer == h26x_done || s->engine->timer == venc_done) {
         s->h26x = nvt_h26x_new();
     }
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nvt_media_timer, s);
@@ -1196,7 +1406,7 @@ static int nvt_media_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_nvt_media = {
     .name = TYPE_NVT_MEDIA,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = nvt_media_post_load,
     .fields = (const VMStateField[]) {
@@ -1211,6 +1421,12 @@ static const VMStateDescription vmstate_nvt_media = {
         VMSTATE_UINT32_V(ai_res, NvtMediaState, 2),
         VMSTATE_VBUFFER_UINT32(ai_regs, NvtMediaState, 2, NULL, size),
         VMSTATE_UINT32_V(ive_done, NvtMediaState, 3),
+        VMSTATE_UINT32_V(venc_id, NvtMediaState, 4),
+        VMSTATE_UINT32_V(venc_dump_off, NvtMediaState, 4),
+        VMSTATE_UINT32_V(venc_dump_cnt, NvtMediaState, 4),
+        VMSTATE_UINT32_V(venc_dump_dst, NvtMediaState, 4),
+        VMSTATE_UINT32_V(venc_bslen, NvtMediaState, 4),
+        VMSTATE_BOOL_V(venc_coding, NvtMediaState, 4),
         VMSTATE_END_OF_LIST()
     }
 };

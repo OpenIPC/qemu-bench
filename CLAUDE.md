@@ -370,6 +370,17 @@ to `nvt_memory_cfg/uboot`, and the `LD_NVT` SHMINFO U-Boot hangs without.
 Xiongmai NOR images keep the FDT inside the loader (`XMFDT562`) and U-Boot
 LZMA-packed in `partition_boot` (`lzma` property); `qemu-boot/xmimg2flash.py`
 lays out their upgrade `*.img` files.
+A flash that starts with a real loader (header word 1 = the SRAM base, the
+entry inside it) boots through it instead: `hw/arm/nvt-bootrom.c` models the
+mask ROM (copies the loader to SRAM; stubs for its ROM routines hand their
+arguments to a C service window; the ROM image in DRAM at 0 and read-only at
+`0x80000000`), and the loader's closed DDR training runs against
+`hw/misc/nvt-ddrc.c` (done / self-clearing bits, paged PHYs). `loader=off`
+forces the stand-in. `qemu-boot/build-novatek-loader.sh` builds the SDKs'
+loaders; `docs/novatek.md#the-real-first-stage-loader` has what each loader
+waits for. Part-number machines `nt98560` / `nt98561` (NA51089), `nt98523` /
+`nt98529` (NA51055 / NA51084), `nt98532` (NS02501), `nt98321` (NA51068)
+differ from their siblings only in RAM size and split.
 SDK `FW*.bin` packages become flash images with `qemu-boot/nvtpack2flash.py`.
 A 128/256 MiB `flash-file` is a W25N SPI NAND instead of a NOR (FDT then at
 0x40000). The controller's NAND mode (MODULE0 bit 19) sends status reads as
@@ -473,6 +484,30 @@ a key queued before the CPU runs: start QEMU with `-S` and the serial line
 on a socket (`qemu-boot/test-novatek-uboot.sh`). Keyboard input to any
 16550 that a guest resets before reading relies on
 `qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch`.
+`nt98525` / `nt98528` (NA51055 / NA51084, `docs/novatek.md#nt9852x-na51055--na51084`)
+run through `novatek_common_init` with `NvtSoCConfig.na51055`: two A9s, the
+second off until the kernel writes its entry to `0xF07F8000` (the loader's
+release word, the tree's `cpu-release-addr`), and per-die tables for the
+extra UARTs / I2C, the moved hash, the 4-window AI and 5-window SIE nodes
+(`na51055_media_override`) and the dual-DDR arbiter. The NT9852x kernel
+picks the CG PLL table by chip ID, so `nvt-cg` has a `layout` property
+(1: `0x4821`, 2: `0x5021`). A missing PLL8 hangs the boot silently in
+`read_current_timer()` before the console comes up.
+`nt98323` (NA51068, `docs/novatek.md#nt98323-na51068`) is its own file,
+`hw/arm/novatek-na51068.c`: Faraday-derived blocks, not NA51089's. It reuses
+`nvt-cg` (layout 3), `nvt-top`, `nvt-wdt`, `nvt-otp` and `nvt-flash` (with
+`spi020=on`, a FTSPI020 register front end on the same NOR/NAND engine), and
+adds `hw/timer/nvt-fttmr010.c`. `-kernel` needs the SDK board tree as
+`-dtb`. With `flash-file` alone it calls novatek.c's `nvt_flash_boot()` (exported in
+`novatek.h`; it also accepts the `nvt,nvt_spi020_nor/nand` compatibles), and the SDK
+U-Boot runs. `nvt-cg` layout 3 drops writes to PLL16, which U-Boot sets
+to 1400 MHz, so `periph_clk` stays 100 MHz. `qemu-boot/build-na51068-sdk.sh` builds
+U-Boot (writing the missing `ModelConfig.mk`, LZ-packing with the SDK's
+`bfc`), the 4.9.118 kernel, the tree and a 32 MiB `nor.bin`; `--nand` the NT98321 NAND EVB and
+a 128 MiB `nand.bin`; `--test-drivers` the drivers the SDK leaves off. NA51068-only models:
+`hw/gpio/nvt-ftgpio010.c`, `hw/i2c/nvt-ftiic010.c`, `hw/dma/nvt-ftdmac030.c`,
+`hw/misc/nvt-na51068-misc.c` (PWM, IR, thermal); reused: `nvt-rtc`, `nvt-usb`, `nvt-crypto`,
+`nvt-hash` (with `iv-reversed`, which NA51055 needs too), `nvt-rsa`, `generic-sdhci`.
 `nt98533` (NS02501, `docs/novatek.md#nt98533-ns02501`) is NA51089's
 peripherals at the same addresses around two Cortex-A32s (a Cortex-A7
 here), a GIC-400 at `0xFFF01000` and the generic timer, with its own init
@@ -487,6 +522,18 @@ The aarch64 `nt98332` (NA51103, `docs/novatek.md#nt98332-na51103`) shares
 must have its security extensions (the vendor U-Boot regroups every IRQ
 otherwise), and only a flash boot or `-kernel` with the firmware's `-dtb`.
 Its flash keeps the FDT (`XMFDT32G`) and U-Boot LZMA-packed (`nvt-lzma.c`).
+By default (`-smp 3`: 2 A53s + boot core) a flash with a loader runs
+Xiongmai's AArch32 loader on an extra Cortex-A7 boot core in its own CPU
+cluster (IO also at 0xF0000000); its RMR write (`na51103_rmr_write`) stops
+it and starts the A53s at EL3 in AArch64 at 0, into the firmware's BL31
+(EL2 on, no QEMU PSCI). `loader=off` / `-smp 2` / `-kernel`: the stand-in.
+`nt98633` (NA51090, 4 A53s) is the same init with `na51090_map`
+(`NvtA64Map`: the blocks that moved); its default `-smp 5` runs its loader
+through BL31 (nvt-ddrc `na51090`: psdk, the PHY command 11 pattern echo,
+the QSEN level / gate; the trampoline's mailboxes in the core communicator
+at 0x2_F0160000); `-smp 4` / `loader=off`: the stand-in.
+The ROM's table stubs live at 0x7C00 (loaders scribble on 0x10 / 0x100),
+and its lzma_inflate returns the unpacked length.
 Do not edit the vendor device tree from machine code; board settings go in
 the U-Boot environment in the image (`qemu-boot/uboot-env.py`). Its media
 blocks are `nvt-engine` instances (fire, run the link list, report done; no

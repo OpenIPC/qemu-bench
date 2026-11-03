@@ -125,8 +125,10 @@ plays the vendor drivers (docs/novatek.md):
     python3 qemu/tests/test-novatek.py [--qemu PATH]
 """
 import argparse
+import gzip
 import hashlib
 import lzma
+import json
 import os
 import random
 import re
@@ -3174,6 +3176,209 @@ def test_nt98332_boot(qemu, tmp):
     os.unlink(path)
 
 
+def test_nt98633(qemu, tmp):
+    """NA51090 (nt98633): NA51103's machine with the blocks moved, and a
+    U-Boot packed as its SDK packs it: BCL1 algorithm 11, LZMA "alone"
+    whose 64-bit size field holds the 32-bit length twice."""
+    print('nt98633 (NA51090)')
+    path = os.path.join(tmp, 'nt98633.bin')
+    rng = random.Random(633)
+    head = struct.pack('<IIQ', 0x1400000A, 0xD503201F, NA51103_UBOOT)
+    payload = head + bytes(rng.randrange(256) for _ in range(4096)) * 4
+    stream = bytearray(lzma.compress(payload, format=lzma.FORMAT_ALONE,
+                                     filters=[{'id': lzma.FILTER_LZMA1,
+                                               'dict_size': 1 << 20}]))
+    stream[5:13] = struct.pack('<II', len(payload), len(payload))
+    part = (b'BCL1' + struct.pack('>III', 0x4DD7000B, len(payload),
+                                  len(stream)) + bytes(stream))
+    make_nt98332_image(path, part)
+    qt = QTest(qemu, 'nt98633,flash-file=' + path)
+    try:
+        check('U-Boot unpacked from BCL1 LZMA with the doubled size',
+              qt.read(NA51103_UBOOT, len(payload)), payload)
+        check('chip ID 0xBC21 (CHIP_NA51090) in TOP_VERSION[31:16]',
+              qt.readl(0x2F00100F0) >> 16, 0xBC21)
+        typer = qt.readl(NA51103_GICD + 4)
+        check('GIC-400: four CPUs (the A53s; no loader here, so the stand-in)',
+              (typer >> 5) & 7, 3)
+        qt.writel(0x2F0510004, 0x0B)
+        check('thermal at 0x2_F0510000 (45 C = trim 231 + 12)',
+              qt.readl(0x2F0510008), 0xF3)
+        check('UART 4 at 0x2_F02C0000 (16550 LSR: THR empty)',
+              qt.readl(0x2F02C0014) & 0x60, 0x60)
+        phy = 0x2F06E8000
+        qt.writel(phy + 0x3F8, 3)
+        qt.writel(phy + 0x00, 3)
+        check('PHY at 0x2_F06E8000, page 3: the lane sweep done, 0x01 = '
+              '0x78, no errors', (qt.readl(phy) & 0x80, qt.readl(phy + 4),
+                                  qt.readl(phy + 8)), (0x80, 0x78, 0))
+        check('page 3 0x70..0x73: the burst read back, the first pattern 0xAA',
+              [qt.readl(phy + 4 * r) for r in range(0x70, 0x74)],
+              [0xFF, 0, 0xFF, 0])
+        qt.writel(phy + 0x3F8, 0)
+        # PHY command 11 (0x2C [3:0] 5, 0x2B bit 7) with 0x55 in 0x29
+        qt.writel(phy + 0x29 * 4, 0x55)
+        qt.writel(phy + 0x2B * 4, 0x80)
+        qt.writel(phy + 0x2C * 4, 0xE5)
+        qt.writel(phy + 0x3F8, 3)
+        check('command 11 sets the pattern the compare bytes read back',
+              [qt.readl(phy + 4 * r) for r in range(0x70, 0x74)],
+              [0, 0xFF, 0, 0xFF])
+        def gate(coarse, fine):
+            qt.writel(phy + 0x3F8, 2)
+            qt.writel(phy + 0xBB * 4, coarse)
+            qt.writel(phy + 0x3F8, 0)
+            qt.writel(phy + 0xD2 * 4, fine)
+            return (qt.readl(phy + 0xB5 * 4) >> 4 & 1,
+                    qt.readl(phy + 0xB6 * 4) & 1)
+        # lane 0 at coarse * 16 + ((fine - 13) & 15)
+        check('QSEN lane 0: level 1 and gate 1 at 0x13, below the edge',
+              gate(1, 0), (1, 1))
+        check('the level 0 and the gate 1 at 0x15, past the edge',
+              gate(1, 2), (0, 1))
+        check('both 0 at 0x18, past the gate', gate(1, 5), (0, 0))
+        qt.writel(0x2F0160100, 0x01F00000)
+        qt.writel(0x2F0160104, 0x2)
+        check('CG PLL2 (0x2_F00244A0): 0x42AAAA, 400 MHz, not NA51089\'s 470',
+              [qt.readl(0x2F00244A0 + 4 * i) & 0xFF for i in range(3)],
+              [0xAA, 0xAA, 0x42])
+        check('core communicator 0x100: one 64-bit load reads both words',
+              qt.cmd('readq 0x2f0160100'), 'OK 0x0000000201f00000')
+        cap = qt.readl(0x2F0580000)
+        check('USB 3 at 0x2_F0580000: an xHCI (CAPLENGTH 0x40, HCIVERSION 1.0)',
+              (cap & 0xFF, cap >> 16), (0x40, 0x100))
+        v0, v1 = qt.readl(0x2F0210110), qt.readl(0x2F0200110)
+        check('Ethernet MACs at 0x2_F0210000 and 0x2_F0200000 (EQoS '
+              'version)', v0 == v1 and v0 != 0, True)
+        test_na51090_media(qt)
+    finally:
+        qt.close()
+    os.unlink(path)
+
+
+def test_na51090_media(qt):
+    """NA51090's decoder layout (h26xdec.ko v0.1.45), its second VPE (the
+    VPEL) and the VPE's registers as its kdrv_vpe uses them."""
+    print('nt98633: decoder, VPE and VPEL')
+    dec, ll = NA51103_DEC, 0x01000000
+
+    def cmd(op, off, val):
+        return struct.pack('<II', (op << 28) | off, val)
+    qt.writel(dec + 0x6000, 0x10007)
+    check('the H.264 AD stage (0x6000): a reset clears itself, reads done',
+          (qt.readl(dec + 0x6000) & 7, qt.readl(dec + 0x6000) >> 16 & 1),
+          (0, 1))
+    qt.writel(dec + 0x8000, 1)
+    check('the list wrapper is at 0x8000: reset done in 0x8008 bit 31',
+          qt.readl(dec + 0x8008) >> 31, 1)
+    qt.writel(dec + 0x8000, 0)
+    lst = (cmd(0xC, 0, ll + 8) +                 # link to the next entry
+           cmd(0, 0x4000, 0x180) +
+           cmd(0, 0x6038, 0x113) +               # AD's interrupt enable
+           cmd(0, 0x6838, 0x103) +               # BIN's
+           cmd(0, 0x603C, 0x103) +               # clear the flags
+           cmd(0, 0x683C, 0x103) +
+           cmd(0, 0x6840, 0x02000000) +          # picture Y
+           cmd(0, 0x6000, 6) +                   # AD
+           cmd(0, 0x6800, 6) +                   # BIN: the job starts
+           cmd(0xC, 0, 0xFFFFFFF0))              # end of the job
+    qt.write(ll, lst)
+    qt.writel(dec + 0x8004, ll)
+    qt.writel(dec + 0x8000, 2)
+    check('no flag before the job is done', qt.readl(dec + 0x603C) & 1, 0)
+    qt.step(5 * 1000 * 1000)
+    check('the list ran to its end (0x801C = -16)', qt.readl(dec + 0x801C),
+          0xFFFFFFF0)
+    check('the register writes landed', qt.readl(dec + 0x6840), 0x02000000)
+    check('done in both stages\' flags (0x603C, 0x683C)',
+          (qt.readl(dec + 0x603C), qt.readl(dec + 0x683C)), (1, 1))
+    check('nothing at NA51103\'s 0x184C', qt.readl(dec + 0x184C), 0)
+    check('SPI 9 raised', na51103_pending(qt, 9), True)
+    qt.writel(dec + 0x603C, 1)
+    check('one stage taken: still up', na51103_pending(qt, 9), True)
+    qt.writel(dec + 0x683C, 1)
+    check('both written back (VPU_ClearInterrupt): the line drops',
+          na51103_pending(qt, 9), False)
+
+    # a real picture: fake-ipcam's 64x48 pattern IDR, its picture to 0x6840 /
+    # 0x6844 at 0x6808's strides (x4), and the extra write's half-size copy
+    # (0x8040): 2 + 2114 / 65536 = 63 / 31 across, 47 / 23 down
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(
+        __file__)), '../../qemu-boot'))
+    import importlib
+    sys.dont_write_bytecode = True
+    cam = importlib.import_module('fake-ipcam')
+    idr = cam.H264Pattern(64, 48).picture()[0]
+    bs, desc, pic, sub = 0x01100000, 0x010F0000, 0x01200000, 0x01300000
+    qt.write(bs, idr)
+    qt.write(desc, struct.pack('<III', 1, bs, len(idr)))
+    qt.write(pic, b'\x00' * 64)
+    qt.write(sub, b'\x00' * 32)
+    lst = (cmd(0xC, 0, ll + 8) +
+           cmd(0, 0x602C, desc) + cmd(0, 0x6004, 0x00300040) +
+           cmd(0, 0x6808, (64 * 4) << 16 | 64 * 4) +
+           cmd(0, 0x6840, pic) + cmd(0, 0x6844, pic + 64 * 48) +
+           cmd(0, 0x8040, 1) + cmd(0, 0x8044, sub) +
+           cmd(0, 0x8048, sub + 32 * 24) + cmd(0, 0x804C, 32 << 16 | 32) +
+           cmd(0, 0x8050, 0x0202) + cmd(0, 0x8054, 2849 << 16 | 2114) +
+           cmd(0, 0x6000, 6) + cmd(0, 0x6800, 6) +
+           cmd(0xC, 0, 0xFFFFFFF0))
+    qt.write(ll, lst)
+    qt.writel(dec + 0x8000, 2)
+    qt.step(5 * 1000 * 1000)
+    qt.writel(dec + 0x603C, 1)
+    qt.writel(dec + 0x683C, 1)
+    if qt.read(pic, 1) == b'\x00':
+        print('  decoding skipped: built without libavcodec')
+    else:
+        check('the picture decoded to 0x6840: white bar, then yellow (Y)',
+              (qt.read(pic, 1), qt.read(pic + 8, 1)), (b'\xeb', b'\xd2'))
+        check('the extra write\'s copy, half each way: the same bars at '
+              'x 0 and 4', (qt.read(sub, 1), qt.read(sub + 4, 1)),
+              (b'\xeb', b'\xd2'))
+        check('and its UV at 0x8048 (the yellow bar\'s U, V)',
+              qt.read(sub + 32 * 24 + 4, 2), b'\x10\x92')
+
+    vpel, src, dst = 0x2F0420000, 0x01200000, 0x01400000
+    fw, fh = 64, 32
+
+    def job(base, regs):
+        lst = b''.join(struct.pack('<II', v, 0x8F000000 | off)
+                       for off, v in regs)
+        lst += struct.pack('<II', 0, 0)
+        qt.write(ll, lst)
+        qt.writel(base + 0x300, ll)
+        qt.writel(base + 0x000, 0x80000000)
+        qt.step(5 * 1000 * 1000)
+
+    frame = [(0x050C, fh << 16 | fw), (0x0360, dst), (0x0364, 0)]
+    qt.writel(vpel + 0x404, 5)
+    job(vpel, frame + [(0x0008, 0), (0x0260, 0x00804010),
+                       (0x0604, fw << 16), (0x0508, fh), (0x0510, 0)])
+    check('the VPEL (0x2_F0420000) runs a fill job, the window\'s width '
+          'from 0x604 [28:16]', qt.read(dst + fw - 2, 2), b'\x10\x10')
+    check('it reports done (frame end, list end)',
+          qt.readl(vpel + 0x400) & 5, 5)
+    check('SPI 1 raised', na51103_pending(qt, 1), True)
+    qt.writel(vpel + 0x400, 5)
+    check('written back: the line drops', na51103_pending(qt, 1), False)
+
+    # a reduced copy, compressed (format 3): the decoder's stand-in keeps
+    # each row resampled to the driver's stride, (32 * 3 / 4 + 15) & ~15
+    # = 32 samples for 8 pixels; its UV after 4 such rows
+    qt.write(src, bytes(range(32)) * 4)
+    qt.write(src + 32 * 4, b'\x11\x22' * 32)
+    job(vpel, frame + [(0x0008, 0xC00), (0x0010, 4 << 16 | 8),
+                       (0x001C, 8 << 16 | 4), (0x0308, src),
+                       (0x030C, 0), (0x0800, 8),
+                       (0x0604, 4 << 16 | 8), (0x0508, 2), (0x0510, 4)])
+    check('a compressed copy scales from its stand-in, at the window\'s '
+          'x (0x604 [11:0]) and y (0x510 [12:0])',
+          qt.read(dst + 4 * fw + 8, 4), bytes([0, 8, 16, 24]))
+    check('its UV from after the stand-in\'s rows',
+          qt.read(dst + fw * fh + 2 * fw + 8, 4), b'\x11\x22\x11\x22')
+
+
 # ---- nt98332: decoder and VPE link lists ------------------------------
 
 NA51103_DEC = 0x2F0600000
@@ -3607,6 +3812,625 @@ def test_fdt(qemu, tmp):
     os.unlink(nand)
 
 
+def test_na51055(qemu, tmp):
+    """NT98525 / NT98528 (NA51055 / NA51084): NA51089's die with deltas."""
+    kernel = os.path.join(tmp, 'kernel.bin')
+    open(kernel, 'wb').write(b'\xfe\xff\xff\xea')       # b .
+    # machine, chip ID, PLL8 RATE0 (nvt-cg layout), its ratio
+    for machine, chip, pll8, ratio in (('nt98525', 0x4821, 0x1188, 0x855555),
+                                       ('nt98528', 0x5021, 0x47E0, 0x10AAAA),
+                                       ('nt98523', 0x4821, 0x1188, 0x855555),
+                                       ('nt98529', 0x5021, 0x47E0, 0x10AAAA)):
+        print('%s (NA51055 SDK)' % machine)
+        dtb = os.path.join(tmp, machine + '.dtb')
+        subprocess.run([qemu, '-M', machine, '-machine', 'dumpdtb=' + dtb,
+                        '-kernel', kernel, '-display', 'none', '-nodefaults'],
+                       capture_output=True, timeout=30)
+        data = open(dtb, 'rb').read() if os.path.exists(dtb) else b''
+        check('dumped', data[:4] == b'\xd0\x0d\xfe\xed', True)
+        check('root compatible novatek,na51055',
+              b'novatek,na51055\0nvt,ca9\0' in data, True)
+        check('two CPUs, the second with a cpu-release-addr',
+              find_nodes(data, ['cpu@0', 'cpu@1']).count(-1) == 0 and
+              b'cpu-release-addr\0' in data, True)
+        check('UART4..6 and I2C 4 / 5',
+              find_nodes(data, ['uart@f0380000', 'uart@f03e0000',
+                                'uart@f03f0000', 'i2c4@f03b0000',
+                                'i2c5@f03c0000']).count(-1), 0)
+        check('hash at 0xF0700000, not NA51089\'s 0xF0670000',
+              find_nodes(data, ['hash@f0700000', 'hash@f0670000']),
+              [find_nodes(data, ['hash@f0700000'])[0], -1])
+        check('ai node with CNN2 (0xF0D60000), sie with SIE5 (0xF0D80000)',
+              b'\xf0\xd6\x00\x00' in data and b'\xf0\xd8\x00\x00' in data,
+              True)
+        check('SDIO1 card detect on C_GPIO 9', b'cd_gpio\0' in data, True)
+
+        qt = QTest(qemu, machine, ['-kernel', kernel])
+        try:
+            check('TOP chip ID', qt.readl(TOP + 0xF0) >> 16, chip)
+            got = sum((qt.readl(0xF0020000 + pll8 + 4 * i) & 0xFF) << (8 * i)
+                      for i in range(3))
+            check('PLL8 ratio where this die keeps it', got, ratio)
+            qt.writel(0xF07F8004, 0x12345678)
+            check('boot SRAM page around the release word keeps writes',
+                  qt.readl(0xF07F8004), 0x12345678)
+            msg = (b'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnop'
+                   b'nopq') * 2
+            check('hash: two chunks, the IV byte-reversed '
+                  '(na51055_hash.c)',
+                  hash_chunked_sha1(qt, 0xF0700000, 0x01300000, msg,
+                                    True).hex(),
+                  hashlib.sha1(msg).hexdigest())
+        finally:
+            qt.close()
+
+
+def test_nand_stand_in(qemu, qemu_aarch64, tmp):
+    """The loader stand-in's SPI NAND path on every Novatek machine: the
+    tree from block 2, U-Boot from partition_uboot, SHMINFO saying NAND."""
+    print('SPI NAND flash boot, every machine')
+    nand = os.path.join(tmp, 'boot-nand-all.bin')
+    payload, dtb = make_boot_image(nand, nand=True)
+    for machine in ('nt98562', 'nt98566', 'nt98525', 'nt98528', 'nt98533',
+                    'nt98560', 'nt98561', 'nt98523', 'nt98529', 'nt98532'):
+        qt = QTest(qemu, machine + ',flash-file=' + nand)
+        try:
+            check('%s: U-Boot from NAND, the tree from block 2' % machine,
+                  (qt.read(0x3900000, len(payload)) == payload,
+                   qt.read(0x100000, len(dtb)) == dtb), (True, True))
+            check('%s: SHMINFO boot.LdStorage SPI NAND' % machine,
+                  struct.unpack_from('<H', qt.read(0x200000 + 42, 2))[0], 2)
+            check('%s: an ARM branch to U-Boot at 0' % machine,
+                  struct.unpack('<II', qt.read(0, 8)),
+                  (0xE51FF004, 0x3900000))
+        finally:
+            qt.close()
+    os.unlink(nand)
+
+    if not os.path.exists(qemu_aarch64):
+        return
+    # NA51103: its flash controller's node, the tree plain in block 2
+    tree = {
+        '#address-cells': cells(2), '#size-cells': cells(2),
+        'nvt_memory_cfg': {
+            '#address-cells': cells(1), '#size-cells': cells(1),
+            'fdt': {'reg': cells(0x100000, 0x100000)},
+            'shmem': {'reg': cells(0xA00000, 0x100000)},
+            'uboot': {'reg': cells(NA51103_UBOOT, 0x2000000)},
+        },
+        'nand@2,f0180000': {
+            'compatible': b'nvt,nvt_spinand\0',
+            '#address-cells': cells(2), '#size-cells': cells(2),
+            'partition_uboot': {'reg': cells(0, 0xC0000, 0, 0x100000)},
+        },
+    }
+    dtb = fdt_blob(tree)
+    head = struct.pack('<IIQ', 0x1400000A, 0xD503201F, NA51103_UBOOT)
+    payload = head + bytes(range(256)) * 16
+    img = bytearray(b'\xff' * NAND_SIZE)
+    img[0x40000:0x40000 + len(dtb)] = dtb
+    img[0xC0000:0xC0000 + len(payload)] = payload
+    path = os.path.join(tmp, 'nt98332-nand.bin')
+    open(path, 'wb').write(img)
+    qt = QTest(qemu_aarch64, 'nt98332,flash-file=' + path)
+    try:
+        check('nt98332: U-Boot from NAND, the tree from block 2',
+              (qt.read(NA51103_UBOOT, len(payload)) == payload,
+               qt.read(0x100000, len(dtb)) == dtb), (True, True))
+        check('nt98332: SHMINFO boot.LdStorage SPI NAND',
+              struct.unpack_from('<H', qt.read(0xA00000 + 42, 2))[0], 2)
+        check('nt98332: an AArch64 branch to U-Boot at 0',
+              struct.unpack('<IIQ', qt.read(0, 16)),
+              (0x58000041, 0xD61F0020, NA51103_UBOOT))
+    finally:
+        qt.close()
+    os.unlink(path)
+
+
+# ---- nt98323: NA51068 ----------------------------------------------------
+
+NA51068_GICD = 0xF9C01000
+NA51068_TMR = 0xFE8C0000
+NA51068_SPI020 = 0xFA900000
+
+
+def na51068_pending(qt, spi):
+    n = 32 + spi
+    return bool(qt.readl(NA51068_GICD + 0x200 + (n // 32) * 4) &
+                (1 << (n % 32)))
+
+
+def spi020_cmd(qt, inst, count=0, addr=None, alen=0, read=True, sts=False):
+    """One SPI020 command: CMD1 address, CMD2 lengths, CMD3 count, CMD4."""
+    if addr is not None:
+        qt.writel(NA51068_SPI020 + 0x00, addr)
+    qt.writel(NA51068_SPI020 + 0x04, (1 << 24) | alen)
+    qt.writel(NA51068_SPI020 + 0x08, count)
+    qt.writel(NA51068_SPI020 + 0x0C, (inst << 24) | (0 if read else 2) |
+              (4 if sts else 0))
+
+
+def test_nt98323(qemu, tmp):
+    print('nt98323 (NA51068)')
+    kernel = os.path.join(tmp, 'kernel.bin')
+    open(kernel, 'wb').write(b'\xfe\xff\xff\xea')       # b .
+    out = subprocess.run([qemu, '-M', 'nt98323', '-display', 'none',
+                          '-nodefaults', '-kernel', kernel],
+                         capture_output=True, text=True, timeout=30)
+    check('-kernel without a board tree is refused',
+          'needs a board device tree' in out.stderr, True)
+
+    # The SDK's NOR layout (cfg_98323_DDR4_4GX1_NOR_EVB): the tree at
+    # 0x10000 with the SPI020's node, U-Boot at 0x50000 for 0x1E000000.
+    tree = {
+        '#address-cells': cells(1), '#size-cells': cells(1),
+        'nvt_memory_cfg': {
+            '#address-cells': cells(1), '#size-cells': cells(1),
+            'fdt': {'reg': cells(0x80000, 0x80000)},
+            'shmem': {'reg': cells(0xA00000, 0x100000)},
+            'uboot': {'reg': cells(0x1E000000, 0x1F80000)},
+        },
+        'nor@fa900000': {
+            'compatible': b'nvt,nvt_spi020_nor\0',
+            '#address-cells': cells(2), '#size-cells': cells(2),
+            'partition_uboot': {'reg': cells(0, 0x50000, 0, 0x70000)},
+        },
+    }
+    dtb = fdt_blob(tree)
+    uboot = b'\xfe\xff\xff\xea' + bytes(range(256)) * 4     # b .
+    nor = os.path.join(tmp, 'nt98323-nor.bin')
+    img = bytearray(b'\xff' * (8 << 20))
+    pattern = bytes(range(256)) * 4
+    img[0x1000:0x1000 + len(pattern)] = pattern
+    img[0x10000:0x10000 + len(dtb)] = dtb
+    img[0x50000:0x50000 + len(uboot)] = uboot
+    open(nor, 'wb').write(img)
+    qt = QTest(qemu, 'nt98323,flash-file=' + nor)
+    try:
+        check('flash boot: U-Boot from partition_uboot, the tree from 0x10000',
+              (qt.read(0x1E000000, len(uboot)) == uboot,
+               qt.read(0x80000, len(dtb)) == dtb), (True, True))
+        check('flash boot: SHMINFO LD_NVT, boot.LdStorage SPI NOR',
+              (qt.read(0xA00000, 6),
+               struct.unpack_from('<H', qt.read(0xA00000 + 42, 2))[0]),
+              (b'LD_NVT', 3))
+        check('flash boot: an ARM branch to U-Boot at 0',
+              struct.unpack('<II', qt.read(0, 8)), (0xE51FF004, 0x1E000000))
+        check('CG: the CPU on the APLL (CPU_CKCTRL bit 31)',
+              qt.readl(0xFE000100) >> 31, 1)
+        pll16 = sum((qt.readl(0xFE0107E0 + 4 * i) & 0xFF) << (8 * i)
+                    for i in range(3))
+        check('CG: PLL16 100 MHz, so periph_clk is 100 MHz', pll16,
+              0x10AAAA)
+        # U-Boot's clock.c: CPU 1400 MHz, PLL16 0x1D2AAA (dropped)
+        for i, b in enumerate((0xAA, 0x2A, 0x1D)):
+            qt.writel(0xFE0107E0 + 4 * i, b)
+        check('CG: PLL16 ignores U-Boot\'s 1400 MHz', qt.readl(0xFE0107E8),
+              0x10)
+        check('TOP: TOP_VERSION readable', qt.readl(0xFE0300F0), 0)
+
+        # FTTMR010: timer 1 free-running down from 0xFFFFFFFF at 12 MHz
+        qt.writel(NA51068_TMR + 0x38, 0x1FF)
+        qt.writel(NA51068_TMR + 0x14, 0xFFFFFFFF)
+        qt.writel(NA51068_TMR + 0x10, 0xFFFFFFFF)
+        qt.writel(NA51068_TMR + 0x30, 1 << 3)
+        qt.step(1000000)
+        gone = 0xFFFFFFFF - qt.readl(NA51068_TMR + 0x10)
+        check('FTTMR010: timer 1 counts down 12000 a millisecond',
+              11900 <= gone <= 12100, True)
+        # timer 0: a one-shot of 100 us, its overflow interrupt on SPI 35
+        qt.writel(NA51068_TMR + 0x38, 0x1FF & ~7)
+        qt.writel(NA51068_TMR + 0x04, 0)
+        qt.writel(NA51068_TMR + 0x00, 1200)
+        qt.writel(NA51068_TMR + 0x30, (1 << 3) | 1 | 4)
+        qt.step(50000)
+        check('FTTMR010: no interrupt before the count runs out',
+              na51068_pending(qt, 35), False)
+        qt.step(100000)
+        check('FTTMR010: timer 0 overflow, SPI 35 pending',
+              (qt.readl(NA51068_TMR + 0x34) & 4, na51068_pending(qt, 35)),
+              (4, True))
+        check('FTTMR010: a one-shot (LOAD 0) stops at 0',
+              qt.readl(NA51068_TMR + 0x00), 0)
+        qt.writel(NA51068_TMR + 0x34, 4)
+        check('FTTMR010: INTR_STATE write-1-clears, the line drops',
+              (qt.readl(NA51068_TMR + 0x34), na51068_pending(qt, 35)),
+              (0, False))
+
+        # SPI020: RDID, a READ, a status read, completion in INT_STS
+        qt.writel(NA51068_SPI020 + 0x20, 2)
+        spi020_cmd(qt, 0x9F, count=3)
+        check('SPI020: RX data ready (STATUS bit 1)',
+              qt.readl(NA51068_SPI020 + 0x18) & 2, 2)
+        check('SPI020: RDID of the 8 MiB W25Q64',
+              qt.readl(NA51068_SPI020 + 0x100) & 0xFFFFFF, 0x1740EF)
+        check('SPI020: completion with the last byte, SPI 32 pending',
+              (qt.readl(NA51068_SPI020 + 0x24) & 1, na51068_pending(qt, 32)),
+              (1, True))
+        qt.writel(NA51068_SPI020 + 0x24, 1)
+        spi020_cmd(qt, 0x03, count=16, addr=0x1000, alen=3)
+        got = b''.join(struct.pack('<I', qt.readl(NA51068_SPI020 + 0x100))
+                       for _ in range(4))
+        check('SPI020: READ 0x03 returns the image', got, pattern[:16])
+        qt.writel(NA51068_SPI020 + 0x24, 1)
+        spi020_cmd(qt, 0x05, sts=True)
+        check('SPI020: RDSR into READ_STS, not busy',
+              (qt.readl(NA51068_SPI020 + 0x28) & 1,
+               qt.readl(NA51068_SPI020 + 0x24) & 1), (0, 1))
+
+        qt.writel(0xFE0B9004, 0x12345678)
+        check('the release page keeps writes',
+              qt.readl(0xFE0B9004), 0x12345678)
+
+        # both MACs: nvt-eqos with MDIO present and the PHY at address 1
+        for n, base in enumerate((0xFCC00000, 0xFCD00000)):
+            check('MAC %d: HW feature 0 says MDIO (the driver needs it)' % n,
+                  qt.readl(base + 0x11C) & (1 << 5), 1 << 5)
+            qt.writel(base + 0x200, (1 << 21) | (1 << 16) | (3 << 2) | 1)
+            check('MAC %d: MDIO read of the PHY BMSR completes, link up' % n,
+                  (qt.readl(base + 0x200) & 1,
+                   bool(qt.readl(base + 0x204) & (1 << 2))), (0, True))
+    finally:
+        qt.close()
+    os.unlink(nor)
+
+
+def qmp(sock_path, cmd, **args):
+    """One QMP command on the monitor socket; returns its 'return'."""
+    sk = socket.socket(socket.AF_UNIX)
+    sk.connect(sock_path)
+    f = sk.makefile('rw', buffering=1)
+    f.readline()                                    # greeting
+    for c, a in (('qmp_capabilities', {}), (cmd, args)):
+        f.write(json.dumps({'execute': c, 'arguments': a}) + '\n')
+        f.flush()
+        while True:
+            r = json.loads(f.readline())
+            if 'return' in r or 'error' in r:
+                break
+    sk.close()
+    return r.get('return', r.get('error'))
+
+
+def hash_chunked_sha1(qt, base, src, msg, reversed_iv):
+    """SHA-1 of msg in two DMA chunks, the state carried through IV as the
+    driver does: NA51089 writes the digest words as read, NA51055 /
+    NA51068 byte-reversed."""
+    def run(data, cfg, padlen):
+        qt.write(src, data)
+        qt.writel(base + 0x04, padlen)
+        qt.writel(base + 0x94, src)
+        qt.writel(base + 0x9C, len(data))
+        qt.writel(base + 0x0C, 1)
+        qt.writel(base + 0x00, 0x2 | 1 << 12 | cfg)
+        return [qt.readl(base + 0x70 + 4 * i) for i in range(5)]
+    mid = run(msg[:64], 0, 0)
+    for i, w in enumerate(mid):
+        if reversed_iv:
+            w = struct.unpack('>I', struct.pack('<I', w))[0]
+        qt.writel(base + 0x50 + 4 * i, w)
+    out = run(msg[64:], 1 << 8 | 1 << 13, len(msg))
+    return b''.join(struct.pack('<I', w) for w in out)
+
+
+NA51068_GPIO0 = 0xFE400000
+NA51068_I2C0 = 0xFE300000
+NA51068_DMAC = 0xFCA00000
+
+
+def ftiic_byte(qt, data=None, start=False, stop=False, nak=False):
+    """One FTIIC010 TB_EN: returns SR, then clears it."""
+    if data is not None:
+        qt.writel(NA51068_I2C0 + 0x0C, data)
+    cr = 0x2 | 0x4 | 0x80 | (1 << 9) | (1 << 10)
+    cr |= (0x10 if start else 0) | (0x20 if stop else 0) | \
+        (0x40 if nak else 0)
+    qt.writel(NA51068_I2C0, cr)
+    sr = qt.readl(NA51068_I2C0 + 0x04)
+    qt.writel(NA51068_I2C0 + 0x04, sr)
+    return sr
+
+
+def test_nt98323_periph(qemu, tmp):
+    print('nt98323: GPIO, I2C, DMA, SD, USB, RTC, PWM, IR, thermal, '
+          'security engines')
+    sd = os.path.join(tmp, 'nt98323-sd.img')
+    stick = os.path.join(tmp, 'nt98323-usb.img')
+    for f in (sd, stick):
+        with open(f, 'wb') as fh:
+            fh.truncate(16 << 20)
+    mon = os.path.join(tmp, 'nt98323.qmp')
+    qt = QTest(qemu, 'nt98323', [
+        '-drive', 'if=sd,format=raw,file=' + sd,
+        '-drive', 'if=none,id=u,format=raw,file=' + stick,
+        '-device', 'usb-storage,drive=u',
+        '-qmp', 'unix:%s,server=on,wait=off' % mon])
+    try:
+        # FTGPIO010 bank 0: an output, an input, a falling-edge interrupt
+        g = NA51068_GPIO0
+        check('GPIO: FTGPIO010 revision', qt.readl(g + 0x7C), 0x00010A00)
+        qt.cmd('irq_intercept_out /machine/gpio0')
+        qt.writel(g + 0x08, 1 << 3)
+        qt.writel(g + 0x10, 1 << 3)
+        check('GPIO: DATASET drives an output, DATAIN reads it back',
+              (qt.readl(g + 0x00), qt.readl(g + 0x04) >> 3 & 1), (8, 1))
+        check('GPIO: the output line follows', qt.irqs.get(3), True)
+        qt.writel(g + 0x14, 1 << 3)
+        check('GPIO: DATACLEAR', qt.readl(g + 0x04) >> 3 & 1, 0)
+        check('GPIO: an undriven input reads high (pull-up)',
+              qt.readl(g + 0x04) >> 7 & 1, 1)
+        qt.writel(g + 0x34, 0)                      # edge
+        qt.writel(g + 0x3C, 1 << 7)                 # falling
+        qt.writel(g + 0x20, 1 << 7)
+        qt.cmd('set_irq_in /machine/gpio0 unnamed-gpio-in 7 0')
+        check('GPIO: falling edge latched (RAW, MASKED), SPI 31 pending',
+              (qt.readl(g + 0x24), qt.readl(g + 0x28),
+               na51068_pending(qt, 31)), (0x80, 0x80, True))
+        qt.writel(g + 0x2C, 1 << 7)
+        check('GPIO: INTRMASK hides it from MASKED and the line',
+              (qt.readl(g + 0x28), na51068_pending(qt, 31)), (0, False))
+        qt.writel(g + 0x2C, 0)
+        qt.writel(g + 0x30, 1 << 7)
+        check('GPIO: INTRCLEAR clears the edge',
+              (qt.readl(g + 0x24), na51068_pending(qt, 31)), (0, False))
+        qt.writel(g + 0x34, 1 << 7)                 # level, low active
+        check('GPIO: a level interrupt follows the pin',
+              qt.readl(g + 0x24), 0x80)
+        qt.cmd('set_irq_in /machine/gpio0 unnamed-gpio-in 7 1')
+        check('GPIO: and drops with it', qt.readl(g + 0x24), 0)
+
+        # FTIIC010 0 and its 24C02 at 0x50
+        i = NA51068_I2C0
+        qt.writel(i, 1)
+        check('I2C: RST clears itself', qt.readl(i) & 1, 0)
+        check('I2C: bus free, SDA / SCL high',
+              (qt.readl(i + 0x04) >> 13 & 1, qt.readl(i + 0x18)), (1, 3))
+        sr = [ftiic_byte(qt, 0xA0, start=True), ftiic_byte(qt, 0x10),
+              ftiic_byte(qt, 0x5A, stop=True)]
+        check('I2C: write 0x5A at 0x10, each byte done (SR DR), then STOP',
+              [x & 0xE0 for x in sr], [0x20, 0x20, 0xA0])
+        ftiic_byte(qt, 0xA0, start=True)
+        ftiic_byte(qt, 0x10)
+        ftiic_byte(qt, 0xA1, start=True)
+        ftiic_byte(qt, nak=True, stop=True)
+        check('I2C: read it back (repeated START, NACK + STOP)',
+              qt.readl(i + 0x0C), 0x5A)
+        qt.writel(i + 0x0C, 0xB0)
+        qt.writel(i, 0x2 | 0x4 | 0x80 | 0x10 | (1 << 9) | (1 << 10))
+        check('I2C: nobody at 0x58: BERR, SPI 21 pending',
+              (qt.readl(i + 0x04) >> 5 & 3, na51068_pending(qt, 21)),
+              (2, True))
+        qt.writel(i + 0x04, 0x40)
+        check('I2C: SR write-1-to-clear drops the line',
+              na51068_pending(qt, 21), False)
+
+        # FTDMAC030: a memcpy of two linked blocks, then a memset
+        d = NA51068_DMAC
+        src, dst, lld = 0x01000000, 0x01100000, 0x01200000
+        data = bytes(range(256)) * 8
+        qt.write(src, data)
+        ctrl = (2 << 22) | (2 << 25)                # 32-bit both sides
+        qt.write(lld, struct.pack('<6I', src + 1024, dst + 1024, 0, ctrl,
+                                  256, 0))
+        qt.writel(d + 0x104, 0)                     # CFG: TC unmasked
+        qt.writel(d + 0x108, src)
+        qt.writel(d + 0x10C, dst)
+        qt.writel(d + 0x110, lld)
+        qt.writel(d + 0x114, 256)                   # 256 words
+        qt.writel(d + 0x100, ctrl | (1 << 28) | (1 << 16))
+        check('DMA: two linked blocks copied, the channel idle again',
+              (qt.read(dst, 2048) == data, qt.readl(d + 0x1C)), (True, 0))
+        check('DMA: one terminal count (the first block masks its own), '
+              'SPI 14 pending',
+              (qt.readl(d + 0x04), na51068_pending(qt, 14)), (1, True))
+        qt.writel(d + 0x08, 1)
+        check('DMA: TCICR clears it', (qt.readl(d + 0x14),
+                                       na51068_pending(qt, 14)), (0, False))
+        qt.writel(d + 0x50, 0xA5A55A5A)
+        qt.writel(d + 0x124, 1 << 30)               # ch1 CFG: WO (memset)
+        qt.writel(d + 0x12C, dst)
+        qt.writel(d + 0x130, 0)
+        qt.writel(d + 0x134, 64)
+        qt.writel(d + 0x120, ctrl | (1 << 16))
+        check('DMA: write-only mode fills WO_VALUE (memset)',
+              qt.read(dst, 256), struct.pack('<I', 0xA5A55A5A) * 64)
+        qt.writel(d + 0x08, 0xFF)
+        qt.writel(d + 0x14C, 0xE0000000)            # ch2 to nowhere
+        qt.writel(d + 0x148, src)
+        qt.writel(d + 0x154, 4)
+        qt.writel(d + 0x140, ctrl | (1 << 16))
+        check('DMA: a bus error sets the channel\'s error bit',
+              qt.readl(d + 0x0C) & 4, 4)
+
+        # SD host: SDHCI 3.0 with a card; vendor registers are storage
+        check('SD: capabilities (SDMA, ADMA2, 3.3 V)',
+              qt.readl(0xFA600040), 0x057834b4)
+        check('SD: card inserted (PRNSTS bit 16)',
+              qt.readl(0xFA600024) >> 16 & 1, 1)
+        qt.writel(0xFA600100, 0x3F00)
+        check('SD: SDC_VENDOR0 keeps writes', qt.readl(0xFA600100), 0x3F00)
+
+        # USB: the two FOTG200 EHCIs; the stick is on the first
+        for n, base in enumerate((0xF9100000, 0xF9200000)):
+            caps = qt.readl(base)
+            check('USB %d: CAPLENGTH 0x10, EHCI 1.00' % n,
+                  (caps & 0xFF, caps >> 16), (0x10, 0x0100))
+        # -device usb-storage takes the last bus created: host 1, as the
+        # kernel and U-Boot find it
+        check('USB: the stick is connected (PORTSC), on host 1',
+              [qt.readl(b + 0x30) & 1 for b in (0xF9100000, 0xF9200000)],
+              [0, 1])
+        qt.writel(0xFCF000CC, 0x80)
+        check('USB: the PHY window keeps writes', qt.readl(0xFCF000CC), 0x80)
+
+        # RTC (NA51089's nvt-rtc), PWM, IR, thermal
+        check('RTC: ready', qt.readl(0xFE88000C) >> 2 & 1, 1)
+        p = 0xFE6C0000
+        qt.writel(p + 0x14, 12000)                  # 1 ms at 12 MHz
+        qt.writel(p + 0x18, 9000)                   # low 750 us
+        qt.writel(p + 0x10, (1 << 1) | (1 << 3) | (1 << 8))
+        qt.writel(p + 0x04, 1)
+        check('PWM: UPDATE clears itself', qt.readl(p + 0x10) >> 1 & 1, 0)
+        check('PWM: channel 0 runs 1 ms with 250 us high',
+              (qmp(mon, 'qom-get', path='/machine/pwm',
+                   property='period-ns0'),
+               qmp(mon, 'qom-get', path='/machine/pwm',
+                   property='duty-ns0')), (1000000, 250000))
+        qt.step(500000)
+        cnt = qt.readl(p + 0x1C)
+        check('PWM: CNTO counts down through the period',
+              5000 <= cnt <= 7000, True)
+        qt.writel(p + 0x04, 0)
+        check('PWM: stopped, no output',
+              qmp(mon, 'qom-get', path='/machine/pwm',
+                  property='period-ns0'), 0)
+        r = 0xFE540000
+        qmp(mon, 'qom-set', path='/machine/ir', property='frame',
+            value=0xFD02FF00)
+        check('IR: decoder off, a frame is not received',
+              qt.readl(r + 0x10) & 7, 0)
+        qt.writel(r + 0x1C, 7)
+        qt.writel(r + 0x00, 0x15)
+        qmp(mon, 'qom-set', path='/machine/ir', property='frame',
+            value=0xFD02FF00)
+        check('IR: a frame: RD, 32 bits, DATA, SPI 65 pending',
+              (qt.readl(r + 0x10), qt.readl(r + 0x14),
+               na51068_pending(qt, 65)), (1 | 32 << 3, 0xFD02FF00, True))
+        check('IR: the decoder stops after the frame (CTRL EN cleared)',
+              qt.readl(r + 0x00), 0x14)
+        qt.writel(r + 0x10, 1)
+        check('IR: STS write-1-to-clear drops the line',
+              na51068_pending(qt, 65), False)
+        t = 0xFE2C0000
+        check('thermal: off reads 0', qt.readl(t + 0x08), 0)
+        qt.writel(t + 0x04, 0xB)
+        check('thermal: 45 C = trim 231 + 12 steps of 1.319 C',
+              qt.readl(t + 0x08), 243)
+
+        # the security engines, NA51055's: hash IV byte-reversed
+        msg = b'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq' * 2
+        check('hash: SHA-1 in two chunks, the IV byte-reversed as '
+              'na51068_hash.c writes it',
+              hash_chunked_sha1(qt, 0xFEC80000, 0x01300000, msg,
+                                True).hex(),
+              hashlib.sha1(msg).hexdigest())
+        check('crypto and RSA respond (SRAM / status readable)',
+              (qt.readl(0xFEC60000) != 0xFFFFFFFF,
+               qt.readl(0xFECA0000) != 0xFFFFFFFF), (True, True))
+        check('AHBC and the DDR arbiters are storage',
+              [qt.writel(a, 0x1234) or qt.readl(a) for a in
+               (0xFE840010, 0xFC400010, 0xFD600010)], [0x1234] * 3)
+    finally:
+        qt.close()
+    for f in (sd, stick):
+        os.unlink(f)
+
+
+def test_adc_thermal(qemu, tmp):
+    """nvt-adc (NA51089 / NA51055 / NS02501) and nvt-thermal (NS02501)."""
+    print('ADC and thermal sensors')
+    kernel = os.path.join(tmp, 'kernel.bin')
+    open(kernel, 'wb').write(b'\xfe\xff\xff\xea')       # b .
+    # machine, ADC base, SPI, the kernel's trim, counts for 45 C / 70 C
+    for machine, trim, c45, c70 in (('nt98562', 231, 12, 31),
+                                    ('nt98525', 259, 12, 31)):
+        mon = os.path.join(tmp, machine + '-adc.qmp')
+        qt = QTest(qemu, machine, ['-kernel', kernel, '-qmp',
+                                   'unix:%s,server=on,wait=off' % mon])
+        a = 0xF0260000
+        try:
+            check('%s ADC: off, the thermal field reads 0' % machine,
+                  qt.readl(a + 0x40) >> 16 & 0x1FF, 0)
+            qt.writel(a + 0x08, 0xFF)
+            qt.writel(a + 0x00, 0xF | 1 << 23)      # continuous, enabled
+            check('%s ADC: thermal = trim %d + counts for 45 C' %
+                  (machine, trim), qt.readl(a + 0x40) >> 16 & 0x1FF,
+                  trim + c45)
+            check('%s ADC: AIN0 reads the 256 input' % machine,
+                  qt.readl(a + 0x30), 256)
+            qt.step(1500000)
+            check('%s ADC: continuous channels ready, SPI 47 pending' %
+                  machine, (qt.readl(a + 0x0C) & 0xF, gic_pending(qt, 47)),
+                  (0xF, True))
+            qt.writel(a + 0x0C, 0xF)
+            check('%s ADC: STATUS write-1-to-clear' % machine,
+                  qt.readl(a + 0x0C) & 0xF, 0)
+            qmp(mon, 'qom-set', path='/machine/adc', property='temperature',
+                value=70)
+            qmp(mon, 'qom-set', path='/machine/adc', property='ain2',
+                value=100)
+            check('%s ADC: 70 C and AIN2 = 100 set at run time' % machine,
+                  (qt.readl(a + 0x40) >> 16 & 0x1FF, qt.readl(a + 0x38)),
+                  (trim + c70, 100))
+        finally:
+            qt.close()
+
+    # NS02501: the ADC's own layout at 0xF01D0000, the thermal sensor apart
+    nand = os.path.join(tmp, 'adc-nand.bin')
+    make_boot_image(nand, nand=True)
+    qt = QTest(qemu, 'nt98533,flash-file=' + nand)
+    a, t = 0xF01D0000, 0xF0260000
+    try:
+        qt.writel(a + 0x00, 0xF | 1 << 9 | 1 << 23)    # + the bandgap
+        qt.step(1500000)
+        check('nt98533 ADC: STATUS at 0x90, the bandgap\'s bit 7 too',
+              qt.readl(a + 0x90) & 0x8F, 0x8F)
+        check('nt98533 ADC: bandgap data at 0x84', qt.readl(a + 0x84), 256)
+        qt.writel(a + 0x40, 5 | 2 << 4)                # average AIN2
+        check('nt98533 ADC: 0x40 averages the chosen channel',
+              qt.readl(a + 0x40) >> 16 & 0x1FF, 256)
+        qt.writel(t + 0x04, 0x2B)
+        check('nt98533 thermal: 45 C = trim 191 + 30 half-degrees '
+              '(the kernel\'s 0xdd)', qt.readl(t + 0x08), 0xDD)
+        test_ns02501_hrtimer(qt)
+    finally:
+        qt.close()
+    os.unlink(nand)
+
+
+def test_ns02501_hrtimer(qt):
+    """NS02501's HR timers: 64-bit up-counters at 120 MHz / (CLK_DIV + 1),
+    a one-shot that stops at TVAL with SPI 61, a free run that wraps, the
+    latch at 0x100, and the clocksource block at 0xF01C0000 (SPI 68)."""
+    h, cs = 0xF00C0000, 0xF01C0000
+    ns02501_gicd = 0xFFF01000
+    def pending(spi):
+        n = 32 + spi
+        return bool(qt.readl(ns02501_gicd + 0x200 + n // 32 * 4) &
+                    1 << n % 32)
+    qt.writel(ns02501_gicd + 0x100 + (32 + 61) // 32 * 4, 1 << (32 + 61) % 32)
+    qt.writel(h + 0x20, 119)                    # 1 MHz
+    qt.writel(h + 0x0C, 1000)
+    qt.writel(h + 0x10, 0)
+    qt.writel(h + 0x04, 1)
+    qt.writel(h + 0x08, 1)                      # one shot
+    qt.step(500000)
+    check('nt98533 HR timer: 1 MHz, 500 us in it counts 500',
+          qt.readl(h + 0x104), 500)
+    qt.step(600000)
+    check('nt98533 HR timer: one shot stops at TVAL, STS, SPI 61',
+          (qt.readl(h + 0x104), qt.readl(h + 0x08) & 1, qt.readl(h) & 1,
+           pending(61)), (1000, 0, 1, True))
+    qt.writel(h, 1)
+    check('nt98533 HR timer: STS write-1-to-clear drops the line',
+          (qt.readl(h) & 1, pending(61)), (0, False))
+    qt.writel(h + 0x0C, 99)
+    qt.writel(h + 0x08, 3)                      # free run, period 100 us
+    qt.step(250000)
+    check('nt98533 HR timer: free run wraps after TVAL (250 us -> 50)',
+          (qt.readl(h + 0x104), qt.readl(h) & 1), (50, 1))
+    qt.writel(h + 0x08, 0)
+    qt.writel(h + 0x100, 1)
+    check('nt98533 HR timer: stopped holds, the latch sets STS bit 1',
+          (qt.readl(h + 0x104), qt.readl(h) & 2), (50, 2))
+    qt.writel(cs + 0x0C, 0xFFFFFFFF)
+    qt.writel(cs + 0x10, 0xFFFFFFFF)
+    qt.writel(cs + 0x08, 3)                     # 120 MHz, never wraps
+    qt.step(10 ** 9 * 40)
+    check('nt98533 clocksource: 40 s at 120 MHz, past 32 bits',
+          qt.readl(cs + 0x104) | qt.readl(cs + 0x108) << 32, 4800000000)
+
+
 def hmp(qemu, args, cmds):
     """Run QEMU with an HMP monitor on stdio; return what it printed."""
     p = subprocess.run([qemu] + args + ['-display', 'none', '-nodefaults',
@@ -3628,6 +4452,429 @@ def test_migration(qemu, tmp):
                   ['info status'])
         check('%s: and loaded back' % m, 'error' not in out.lower() and
               'Assertion' not in out, True)
+
+
+def test_loader_models(qemu, tmp):
+    """The real-loader boot's models: nvt-bootrom, nvt-ddrc, NA51055's
+    release window, nvt-gzip and the FTTMR010's count-up mode."""
+    print('first-stage loader: ROM, DDR training, GZIP, udelay timer')
+    # A loader in the NA51089 header (entry, load address, size at 0x24)
+    # that calls the ROM's table: debug_msg(str), then Dec2HexStr(value).
+    sram = 0xF07C0000
+    code = [0xE59F001C, 0xE59F301C, 0xE5933000, 0xE12FFF33,    # 0x40
+            0xE59F0014, 0xE59F3014, 0xE5933000, 0xE12FFF33,    # 0x50
+            0xEAFFFFFE,                                         # 0x60 b .
+            sram + 0x80, 0x7FD8, 0x1234ABCD, 0x7FEC]            # 0x64
+    ldr = bytearray(0x100)
+    struct.pack_into('<II', ldr, 0, sram + 0x40, sram)
+    struct.pack_into('<I', ldr, 0x24, len(ldr))
+    struct.pack_into('<%dI' % len(code), ldr, 0x40, *code)
+    ldr[0x80:0x89] = b'ROM-OK\r\n\0'
+    img = os.path.join(tmp, 'ldr.bin')
+    open(img, 'wb').write(bytes(ldr) + b'\xff' * ((8 << 20) - len(ldr)))
+    uart = os.path.join(tmp, 'ldr.txt')
+    p = subprocess.Popen([qemu, '-M', 'nt98562,flash-file=' + img,
+                          '-display', 'none', '-nodefaults',
+                          '-serial', 'file:' + uart],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3)
+    p.kill()
+    p.wait()
+    check('the ROM runs the loader from SRAM; its debug_msg and Dec2HexStr',
+          open(uart, 'rb').read(), b'ROM-OK\r\n1234ABCD')
+    # lzma_inflate(in, in_size, out, out_size, tmp, tmp_size) returns the
+    # length it unpacked: NA51090's loader checks it against its header
+    payload = bytes(random.Random(51090).randrange(256) for _ in range(3000))
+    stream = lzma.compress(payload, format=lzma.FORMAT_ALONE)
+    code = [0xE59F003C, 0xE59F103C, 0xE59F203C, 0xE59F303C, 0xE59F403C,
+            0xE3A05801, 0xE92D0030, 0xE3A06C7F, 0xE38660D0, 0xE5966000,
+            0xE12FFF36, 0xE28DD008, 0xE3A06C7F, 0xE38660EC, 0xE5966000,
+            0xE12FFF36, 0xEAFFFFFE,
+            sram + 0x200, len(stream), 0x100000, len(payload), 0x200000]
+    ldr = bytearray(0x200 + len(stream))
+    struct.pack_into('<II', ldr, 0, sram + 0x40, sram)
+    struct.pack_into('<I', ldr, 0x24, len(ldr))
+    struct.pack_into('<%dI' % len(code), ldr, 0x40, *code)
+    ldr[0x200:] = stream
+    open(img, 'wb').write(bytes(ldr) + b'\xff' * ((8 << 20) - len(ldr)))
+    p = subprocess.Popen([qemu, '-M', 'nt98562,flash-file=' + img,
+                          '-display', 'none', '-nodefaults',
+                          '-serial', 'file:' + uart],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3)
+    p.kill()
+    p.wait()
+    check('the ROM\'s lzma_inflate returns the length it unpacked',
+          open(uart, 'rb').read(), b'%08X' % len(payload))
+    out = subprocess.run([qemu, '-M', 'nt98562,flash-file=%s,loader=off' % img,
+                          '-display', 'none', '-nodefaults', '-S'],
+                         capture_output=True, text=True, timeout=30)
+    check('loader=off: the stand-in, which wants a device tree',
+          out.returncode == 1 and 'novatek:' in out.stderr, True)
+
+    # nvt-ddrc: NA51089's controller and PHY
+    qt = QTest(qemu, 'nt98562')
+    try:
+        qt.writel(0xF0000004, 0x0F)
+        check('DDRC 0x04: the command bits clear, their done bits read set',
+              qt.readl(0xF0000004), 0x700)
+        qt.writel(0xF0000020, 0x13)
+        check('DDRC 0x20: the training run clears itself',
+              qt.readl(0xF0000020), 0x10)
+        check('PHY 0x2DC bit 7: the calibration done',
+              qt.readl(0xF00012DC) & 0x80, 0x80)
+    finally:
+        qt.close()
+    # NA51084's paged PHY, and NA51055's release window under the stack
+    qt = QTest(qemu, 'nt98528', ['-smp', '2'])
+    try:
+        qt.writel(0xF00013F8, 2)
+        qt.writel(0xF0001000 + 0x4A * 4, 0x01)
+        qt.writel(0xF00013F8, 0)
+        qt.writel(0xF0001000 + 0x4A * 4, 0x05)
+        check('paged PHY: page 0 keeps its own 0x4A',
+              qt.readl(0xF0001000 + 0x4A * 4), 0x05)
+        check('page 0 0x3D: the calibrations done',
+              qt.readl(0xF0001000 + 0x3D * 4) & 0xC0, 0xC0)
+        qt.writel(0xF00013F8, 2)
+        check('page 2 0x4A: its value and the training done (bit 5)',
+              qt.readl(0xF0001000 + 0x4A * 4), 0x21)
+        qt.write(0xF07F8FF1, b'\xa5')
+        qt.write(0xF07F8FF6, b'\x5a\xc3')
+        check('the release page takes the stack\'s byte and halfword stores',
+              qt.read(0xF07F8FF0, 8), b'\0\xa5\0\0\0\0\x5a\xc3')
+    finally:
+        qt.close()
+    # NA51068: the PHY at +0x8000, DDR4's write-Vref load strobe; the
+    # loader's udelay timer counting up
+    qt = QTest(qemu, 'nt98323')
+    try:
+        phy = 0xFC408000
+        qt.writel(phy + 0x3F8, 2)
+        qt.writel(phy + 0x8E * 4, 0x8D)
+        check('NA51068 page 2 0x8E: bit 7 loads the Vref and reads 0',
+              qt.readl(phy + 0x8E * 4), 0x0D)
+        t = 0xFE8C0000
+        qt.writel(t + 0x04, 0xFFFFFFFF)
+        qt.writel(t + 0x00, 0)
+        qt.writel(t + 0x30, 1 << 9 | 1)          # timer 0 up, enabled
+        a = qt.readl(t)
+        qt.step(1000000)
+        b = qt.readl(t)
+        check('FTTMR010 count-up: COUNTER climbs on the 12 MHz clock',
+              (b > a, 11000 <= b - a <= 13000), (True, True))
+        qt.writel(t + 0x30, 1)                   # back to counting down
+        c = qt.readl(t)
+        qt.step(100000)                          # 1200 ticks, short of 0
+        check('and counts down again without the up bit',
+              1100 <= c - qt.readl(t) <= 1300, True)
+    finally:
+        qt.close()
+    # NS02501's GZIP engine
+    data = bytes(random.Random(5).randrange(16) for _ in range(20000))
+    gz = gzip.compress(data)
+    qt = QTest(qemu, 'nt98533')
+    try:
+        g = 0xF0100000
+        qt.write(0x1000000, gz)
+        qt.writel(g + 0x20, 0x1000000)
+        qt.writel(g + 0x28, 0x2000000)
+        qt.writel(g + 0x30, len(gz))
+        qt.writel(g + 0x10, 1)
+        qt.writel(g + 0x00, 3)
+        check('GZIP: done, OUTSZ the bytes made, the interrupt raised',
+              (qt.readl(g + 0x14) & 1, qt.readl(g + 0x38)), (1, len(data)))
+        check('GZIP: the output', qt.read(0x2000000, len(data)), data)
+        qt.writel(g + 0x14, 1)
+        check('GZIP: STS write-1-to-clear', qt.readl(g + 0x14) & 1, 0)
+    finally:
+        qt.close()
+
+
+def test_na51103_loader_models(qt):
+    """NA51103's real-loader models: QSEN's per-lane compare and gate level,
+    the DRAM arbiters' testers, the 64-bit read of the BL31 entry."""
+    print('nt98332: QSEN read-gate training, DRAM testers, TOP 64-bit')
+    phy = 0x2F00E8000
+    def page(n):
+        qt.writel(phy + 0x3F8, n)
+    def gate(lane, coarse, fine):
+        sh = lane % 2 * 4
+        page(2)
+        r = phy + (0xBB + lane // 2) * 4
+        qt.writel(r, (qt.readl(r) & ~(0xF << sh)) | coarse << sh)
+        page(0)
+        r = phy + (0xD2 + lane // 2) * 4
+        qt.writel(r, (qt.readl(r) & ~(0xF << sh)) | fine << sh)
+    # lane 1 at 0x58 (coarse 5, fine 5: 8 steps past the wrap at 13), in
+    # the window and before the edge; lane 0 at 0, outside it
+    gate(1, 5, 5)
+    page(3)
+    check('QSEN: lane 1 matched (page 3 0x79 / 0x7B), lane 0 not (0x71)',
+          (qt.readl(phy + 0x79 * 4), qt.readl(phy + 0x7B * 4),
+           qt.readl(phy + 0x71 * 4)), (0xFF, 0xFF, 0))
+    page(0)
+    check('QSEN: page 0 0xB6 bit 2, lane 1\'s gate level, is 1',
+          qt.readl(phy + 0xB6 * 4), 0x04)
+    gate(1, 9, 5)
+    page(0)
+    b6 = qt.readl(phy + 0xB6 * 4)
+    page(3)
+    check('QSEN: past the edge, still matched, the level 0',
+          (qt.readl(phy + 0x79 * 4), b6), (0xFF, 0))
+    for base in (0x2F00A0000, 0x2F0110000, 0x2F0510000):
+        qt.writel(base + 0x805C, 7)
+        check('DRAM tester at 0x%X: started, done and passed' % base,
+              (qt.readl(base + 0x805C), qt.readl(base + 0x80A0) & 3), (0, 1))
+    qt.writel(0x2F0011200, 0x01F00000)
+    qt.writel(0x2F0011204, 0x2)
+    check('TOP 0x1200: one 64-bit load reads both words',
+          qt.cmd('readq 0x2f0011200'), 'OK 0x0000000201f00000')
+    t = 0x2F0890000
+    qt.writel(t + 0x04, 0x0B)
+    check('thermal at 0x2_F0890000: 45 C = trim 231 + 12 (the NVR\'s 0xf3)',
+          qt.readl(t + 0x08), 0xF3)
+    # I2C 1..4 (empty buses: an address NACKs) and the PWM's registers
+    for n, base in enumerate((0x2F01C0000, 0x2F01D0000, 0x2F01E0000,
+                              0x2F01F0000)):
+        qt.writel(base + 0x00, 2)
+        sts = i2c_chunk(qt, 1, 0x30 << 1, start=True, stop=True, base=base)
+        check('I2C %d at 0x%X: an empty bus NACKs (BERR)' % (n + 1, base),
+              sts & I2C_BERR, I2C_BERR)
+    # the HR timers with NA51103's layout: CNT at 0x14, as ptp_nvt.c's
+    # enable leaves them (free run, the full target, 120 MHz)
+    for base in (0x2F0140000, 0x2F0170000):
+        qt.writel(base + 0x0C, 0xFFFFFFFF)
+        qt.writel(base + 0x10, 0xFFFFFFFF)
+        qt.writel(base + 0x20, 0)
+        qt.writel(base + 0x08, 3)
+    qt.step(1000000)
+    check('HR timers at 0x2_F0140000 / 0x2_F0170000: 1 ms at 120 MHz at 0x14',
+          (qt.readl(0x2F0140014), qt.readl(0x2F0170014),
+           qt.readl(0x2F0170018)), (120000, 120000, 0))
+    qt.writel(0x2F0170020, 119)                 # adjfreq: stop, divide, start
+    qt.writel(0x2F0170008, 2)
+    qt.writel(0x2F0170008, 3)
+    qt.step(1000000)
+    check('PTP block: restarted at 1 MHz counts 1000 in 1 ms',
+          qt.readl(0x2F0170014), 1000)
+    qt.writel(0x2F0120004, 0x309800)
+    check('PWM at 0x2_F0120000 keeps its period register',
+          qt.readl(0x2F0120004), 0x309800)
+
+
+def test_na51103_hwcopy(qt):
+    """nvt-hwcopy (0x2_F0330000, SPI 70) through kdrv_hwcopy's own self-test
+    (emu_hwcopy_auto): linear copy, linear set, block copy, block set; the
+    JPEG codec and the OSG's link list."""
+    print('nt98332: hwcopy, JPEG, OSG, DEI, SSCA, AGE')
+    h = 0x2F0330000
+    src, dst = 0x2000000, 0x2100000
+    rng = random.Random(70)
+    data = bytes(rng.randrange(256) for _ in range(0x1000))
+    qt.write(src, data)
+    gic = 0x2FFF01000
+    def pending():
+        n = 32 + 70
+        return bool(qt.readl(gic + 0x200 + n // 32 * 4) & 1 << n % 32)
+    qt.writel(gic + 0x100 + (32 + 70) // 32 * 4, 1 << (32 + 70) % 32)
+    def run(mode, **r):
+        qt.write(dst, bytes(0x1000))
+        qt.writel(h + 0x08, 1)
+        for off, v in r.items():
+            qt.writel(h + int(off[1:], 16), v)
+        qt.writel(h + 0x04, mode)
+        qt.writel(h + 0x40, src)
+        qt.writel(h + 0x48, dst)
+        qt.writel(h + 0x00, 1)
+        qt.step(100000)
+        done = qt.readl(h + 0x0C) & 1, pending()
+        qt.writel(h + 0x0C, 1)
+        return done
+    check('linear copy: the bytes, the done flag and SPI 70',
+          (run(2, r28=0x1000), qt.read(dst, 0x1000) == data),
+          ((1, True), True))
+    check('INT_STS write-1-to-clear drops the line', pending(), False)
+    run(0, r28=0x800, r2C=0xAABB1122)
+    check('linear set: the 32-bit pattern, little-endian',
+          (qt.read(dst, 8), qt.read(dst + 0x800, 4)),
+          (bytes.fromhex('2211bbaa2211bbaa'), bytes(4)))
+    run(3, r18=4, r1C=0x40, r14=0x100, r24=0x80)
+    check('block copy: 4 lines of 0x40, source / destination line offsets',
+          [qt.read(dst + y * 0x80, 0x40) == data[y * 0x100:y * 0x100 + 0x40]
+           for y in range(4)] + [qt.read(dst + 0x40, 4)], [True] * 4 + [bytes(4)])
+    run(1, r18=2, r1C=0x10, r24=0x100, r2C=0x01020304)
+    check('block set: each line from its offset, the gap untouched',
+          (qt.read(dst + 0x100, 0x10), qt.read(dst + 0x10, 4)),
+          (bytes.fromhex('04030201') * 4, bytes(4)))
+    j = 0x2F0320000
+    qt.writel(j + 0x18, 1)
+    check('JPEG at 0x2_F0320000: NA51089\'s codec (INT_EN holds)',
+          qt.readl(j + 0x18), 1)
+    # OSG: a list (a register write, then the end) fired by writing its
+    # address to 0x30, bits 35:32 at 0x340
+    o, ll = 0x2F0300000, 0x2200000
+    qt.write(ll, struct.pack('<IIII', 0x12345678, 0x8000F000 | 0x100, 3, 0))
+    qt.writel(gic + 0x100 + (32 + 10) // 32 * 4, 1 << (32 + 10) % 32)
+    qt.writel(o + 0x340, 0)
+    qt.writel(o + 0x30, ll)
+    qt.step(2000000)
+    n = 32 + 10
+    check('OSG: the list\'s write lands, 0x70 bit 0 done, SPI 10',
+          (qt.readl(o + 0x100), qt.readl(o + 0x70) & 1,
+           bool(qt.readl(gic + 0x200 + n // 32 * 4) & 1 << n % 32)),
+          (0x12345678, 1, True))
+    # DEI: the list at 0x180 (bits 35:32 at 0x200), fired by CTRL bit 31
+    d = 0x2F0610000
+    qt.write(ll, struct.pack('<IIII', 0xCAFE, 0x8000F000 | 0x100, 5, 0))
+    qt.writel(gic + 0x100 + (32 + 6) // 32 * 4, 1 << (32 + 6) % 32)
+    qt.writel(d + 0x180, ll)
+    qt.writel(d + 0x200, 0)
+    qt.writel(d + 0x000, 0x80000000)
+    qt.step(2000000)
+    n = 32 + 6
+    check('DEI: the list\'s write lands, 0x1C frame and list done, SPI 6',
+          (qt.readl(d + 0x100), qt.readl(d + 0x1C) & 5,
+           bool(qt.readl(gic + 0x200 + n // 32 * 4) & 1 << n % 32)),
+          (0xCAFE, 5, True))
+    # SSCA: the list at 0xAC (bits 35:32 in 0xA8 [31:28]), CTRL bit 8
+    sc = 0x2F0310000
+    qt.write(ll, struct.pack('<IIII', 0xBEEF, 0x8F000000 | 0x40, 2, 0))
+    qt.writel(sc + 0x0A8, 0x5)                  # other settings, low bits
+    qt.writel(sc + 0x0AC, ll)
+    qt.writel(sc + 0x000, 0x100)
+    qt.step(2000000)
+    check('SSCA: the list\'s write lands, 0x0C list and frame done',
+          (qt.readl(sc + 0x40), qt.readl(sc + 0x0C) >> 30), (0xBEEF, 3))
+    # AGE: its own list format, fired by 0x30101 to 0x41C
+    ag = 0x2F03A0000
+    qt.write(ll, struct.pack('<8I', 0xF00D, 0x01000000 | (0x100 >> 2),
+                             1, 0x01000000, 0x200, 0x07010001, 0, 0))
+    qt.writel(ag + 0x418, ll)
+    qt.writel(ag + 0x420, 0)
+    qt.writel(ag + 0x41C, 0x1000)
+    qt.writel(ag + 0x41C, 0x30101)
+    qt.step(2000000)
+    check('AGE: the list\'s write lands, 0x410 list mode, 0x404 done, '
+          'cleared by the read', (qt.readl(ag + 0x100), qt.readl(ag + 0x410),
+                                  qt.readl(ag + 0x404), qt.readl(ag + 0x404)),
+          (0xF00D, 1, 3, 0))
+
+
+def test_na51103_venc(qt):
+    """NA51103's H.26x encoder (nvt-media "venc"): two jobs from one link
+    list, as kdrv_venc's h26xEnc_wrapLLCmd builds them -- registers from
+    0x20, the report (0xD14) copied out, the next job chained."""
+    print('nt98332: H.26x encoder link lists')
+    v, gic = 0x2F0500000, 0x2FFF01000
+    ll, dst, rep = 0x2300000, 0x2400000, 0x2500000
+    def cmd(op, job, off, cnt):
+        return op << 28 | job << 20 | (off >> 2) << 8 | cnt
+    def job(at, n, nxt):
+        w = [cmd(0, n, 0, 0),
+             cmd(1, n, 0x20, 1), 1,                      # INT_EN
+             cmd(1, n, 0x70, 4), dst + n * 0x10000, 0, 0, 0x10000,
+             cmd(2, n, 0xD14, 0x55), rep + n * 0x200,
+             cmd(0xF, n, 0, 0), nxt]
+        qt.write(at, struct.pack('<%dI' % len(w), *w))
+    job(ll, 0, ll + 0x100)
+    job(ll + 0x100, 1, 0)
+    qt.writel(gic + 0x100 + (32 + 7) // 32 * 4, 1 << (32 + 7) % 32)
+    qt.writel(v + 0x004, 0xFFFFFFFF)
+    qt.writel(v + 0x010, ll)
+    qt.writel(v + 0x014, 2)
+    qt.writel(v + 0x000, 0x100)
+    qt.step(5 * 1000 * 1000)
+    n = 32 + 7
+    check('venc list: finish, SPI 7, at job 1',
+          (qt.readl(v + 0x004) & 1,
+           bool(qt.readl(gic + 0x200 + n // 32 * 4) & 1 << n % 32),
+           qt.readl(v + 0x018)), (1, True, 1))
+    lens = [struct.unpack('<I', qt.read(rep + j * 0x200 + 0x18, 4))[0]
+            for j in range(2)]
+    check('each job\'s picture in its buffer, its report copied out (BS_LEN)',
+          (qt.read(dst, 6).hex(), qt.read(dst + 0x10000, 6).hex(), lens),
+          ('000000014c01', '000000014c01', [64, 64]))
+    check('debug 0xD08: the bitstream pointer, length plus the 256-byte burst',
+          qt.readl(v + 0xD08), 64 + 0x100)
+    qt.writel(v + 0x004, 0xFFFFFFFF)
+    qt.writel(v + 0x070, dst)
+    qt.writel(v + 0x07C, 0x10000)
+    qt.writel(v + 0x000, 0x100)
+    qt.step(2 * 1000 * 1000)
+    check('a direct start (no list): finish, the report at 0xD14',
+          (qt.readl(v + 0x004) & 1, qt.readl(v + 0xD2C)), (1, 64))
+
+
+def test_na51103_ir(qemu, tmp):
+    """nvt-ir (0x2_F0130000, SPI 25), as nvt_ir_fr.c drives it: a frame
+    delivered by qom-set, to an enabled receiver only."""
+    print('nt98332: IR remote')
+    mon = os.path.join(tmp, 'ir.qmp')
+    qt = QTest(qemu, 'nt98332', ['-qmp', 'unix:%s,server=on,wait=off' % mon])
+    ir, gic = 0x2F0130000, 0x2FFF01000
+    def pending():
+        n = 32 + 25
+        return bool(qt.readl(gic + 0x200 + n // 32 * 4) & 1 << n % 32)
+    def send(frame):
+        qmp(mon, 'qom-set', path='/machine/ir', property='frame', value=frame)
+    try:
+        qt.writel(gic + 0x100 + (32 + 25) // 32 * 4, 1 << (32 + 25) % 32)
+        qt.writel(ir + 0x08, 0x0B)                  # RD, ERR, REP
+        send(0x00FF02FD)
+        check('IR disabled: a frame is dropped', qt.readl(ir + 0x0C), 0)
+        qt.writel(ir + 0x00, 0x002001A1)            # the NVRs' CTRL
+        qt.writel(ir + 0x18, 0x00FF02FD)            # match data
+        send(0x00FF02FD)
+        check('enabled: the frame in DATA, ready and match, SPI 25',
+              (qt.readl(ir + 0x10), qt.readl(ir + 0x0C) & 0x5, pending()),
+              (0x00FF02FD, 0x5, True))
+        send(0x00FF10EF)
+        check('another before ready is cleared: overrun',
+              qt.readl(ir + 0x0C) & 0x10, 0x10)
+        qt.writel(ir + 0x0C, 0x1F)
+        check('STS write-1-to-clear drops the line',
+              (qt.readl(ir + 0x0C), pending()), (0, False))
+        qmp(mon, 'qom-set', path='/machine/ir', property='repeat', value=True)
+        check('a repeat code with repeat detect on: STS bit 3',
+              qt.readl(ir + 0x0C) & 0x8, 0x8)
+    finally:
+        qt.close()
+
+
+def test_nt98332_handoff(qemu, tmp):
+    """NA51103's real-loader boot: the boot core runs an AArch32 loader
+    from SRAM, which puts an AArch64 program at 0 and warm-resets (RMR)."""
+    print('nt98332: the loader\'s warm reset into AArch64')
+    a32 = [0xEE390F50, 0xE7E10C50, 0xE2800031,  # L2CTLR [25:24] + '1'
+           0xE59F1034, 0xE5810000,              # to the UART at 0xF0280000
+           0xE59F2030, 0xE3A03000, 0xE3A04010,  # 16 words 0xFE000100 -> 0
+           0xE4925004, 0xE4835004, 0xE2544001, 0x1AFFFFFB, 0xF57FF04F,
+           0xE3A03003, 0xEE0C3F50,              # RMR = AA64 | RR
+           0xF57FF06F, 0xE320F003, 0xEAFFFFFE, 0xF0280000, 0xFE000100]
+    a64 = [0xD53800A0, 0x92401C00, 0xB5000100,  # core 0 only:
+           0xD5384241, 0xD342FC21, 0x1100C021,  # '0' + CurrentEL,
+           0x180000C2, 0xB9000041, 0x52800961,  # then 'K', to 0xF0280000
+           0xB9000041, 0xD503207F, 0x17FFFFFF, 0xF0280000]
+    ldr = bytearray(0x200)
+    struct.pack_into('<II', ldr, 0, 0xFE000040, 0xFE000000)
+    struct.pack_into('<I', ldr, 0x24, len(ldr))
+    struct.pack_into('<%dI' % len(a32), ldr, 0x40, *a32)
+    struct.pack_into('<%dI' % len(a64), ldr, 0x100, *a64)
+    img = os.path.join(tmp, 'ldr332.bin')
+    open(img, 'wb').write(bytes(ldr) + b'\xff' * ((16 << 20) - len(ldr)))
+    uart = os.path.join(tmp, 'ldr332.txt')
+    p = subprocess.Popen([qemu, '-M', 'nt98332,flash-file=' + img,
+                          '-display', 'none', '-nodefaults',
+                          '-serial', 'file:' + uart],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3)
+    p.kill()
+    p.wait()
+    out = open(uart, 'rb').read()
+    check('the boot core\'s L2CTLR counts the two A53s', out[:1], b'2')
+    check('RMR: core 0 comes up in AArch64 at EL3, the UART at 0xF0280000',
+          out[1:], b'3K')
 
 
 def main():
@@ -3665,6 +4912,7 @@ def run(args, tmp):
     finally:
         qt.close()
     test_boot_rom(args.qemu, tmp)
+    test_loader_models(args.qemu, tmp)
 
     for with_oob in (False, True):
         nand = os.path.join(tmp, 'nand.bin')
@@ -3832,10 +5080,16 @@ def run(args, tmp):
 
     if os.path.exists(args.qemu_aarch64):
         test_nt98332_boot(args.qemu_aarch64, tmp)
+        test_nt98332_handoff(args.qemu_aarch64, tmp)
+        test_na51103_ir(args.qemu_aarch64, tmp)
+        test_nt98633(args.qemu_aarch64, tmp)
         qt = QTest(args.qemu_aarch64, 'nt98332')
         try:
             test_nt98332_dec(qt)
             test_nt98332_vpe(qt)
+            test_na51103_loader_models(qt)
+            test_na51103_hwcopy(qt)
+            test_na51103_venc(qt)
         finally:
             qt.close()
     else:
@@ -3843,6 +5097,11 @@ def run(args, tmp):
 
     test_uart_rx_after_fifo_reset(args.qemu, tmp)
     test_fdt(args.qemu, tmp)
+    test_na51055(args.qemu, tmp)
+    test_nand_stand_in(args.qemu, args.qemu_aarch64, tmp)
+    test_nt98323(args.qemu, tmp)
+    test_nt98323_periph(args.qemu, tmp)
+    test_adc_thermal(args.qemu, tmp)
     test_migration(args.qemu, tmp)
 
     print('%d failure(s)' % failures)
