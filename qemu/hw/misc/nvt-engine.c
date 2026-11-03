@@ -292,7 +292,7 @@ static void nvt_engine_scale(NvtEngineState *s)
         }
         return;
     }
-    if (!sw || !sh || !sy || (!ps && ss < sw)) {
+    if (!sw || !sh || !sy || (!ps && ss < sw) || (ps && sw0 < 2)) {
         return;
     }
     suv = suv ? suv : sy + (hwaddr)ss * sh;

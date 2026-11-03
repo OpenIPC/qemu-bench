@@ -397,7 +397,9 @@ static void nvt_h26xdec_put_extw(NvtH26xDecState *s, AVFrame *f)
     g_autofree uint8_t *line = NULL;
     int dw, dh, sw, r, x;
 
-    if (!(ctrl & 1) || !fx || !fy || !y || !ys) {
+    /* a reduced copy: a factor below 1 (a copy larger than its source) is
+     * not one the driver programs */
+    if (!(ctrl & 1) || fx < 0x10000 || fy < 0x10000 || !y || !ys) {
         return;
     }
     dw = (((uint64_t)(f->width - 1) << 16) + fx / 2) / fx + 1;
@@ -415,19 +417,20 @@ static void nvt_h26xdec_put_extw(NvtH26xDecState *s, AVFrame *f)
     }
     line = g_malloc(sw);
     for (r = 0; r < dh; r++) {
-        const uint8_t *src = f->data[0] + (r * f->height / dh) * f->linesize[0];
+        const uint8_t *src = f->data[0] +
+            (int64_t)r * f->height / dh * f->linesize[0];
 
         for (x = 0; x < sw; x++) {
-            line[x] = src[x * f->width / sw];
+            line[x] = src[(int64_t)x * f->width / sw];
         }
         dma_memory_write(&address_space_memory, y + (hwaddr)r * ys, line, sw,
                          MEMTXATTRS_UNSPECIFIED);
     }
     for (r = 0; r < dh / 2; r++) {
-        int sr = r * (f->height / 2) / (dh / 2);
+        int64_t sr = (int64_t)r * (f->height / 2) / (dh / 2);
 
         for (x = 0; x < sw / 2; x++) {
-            int sx = x * (f->width / 2) / (sw / 2);
+            int64_t sx = (int64_t)x * (f->width / 2) / (sw / 2);
 
             line[2 * x] = f->data[1][sr * f->linesize[1] + sx];
             line[2 * x + 1] = f->data[2][sr * f->linesize[2] + sx];
@@ -561,6 +564,11 @@ static void nvt_h26xdec_decode(NvtH26xDecState *s, const NvtDecRegs *rs)
 static void nvt_h26xdec_ll_write(NvtH26xDecState *s, uint32_t off,
                                  uint32_t val)
 {
+    if (off >= DEC_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "nvt-h26xdec: list write to 0x%x, "
+                      "outside the decoder\n", off);
+        return;
+    }
     if (off >= s->ll_base && off < s->ll_base + LL_REGS) {
         return;
     }
@@ -894,9 +902,30 @@ static const VMStateDescription vmstate_nvt_h26xdec = {
     },
 };
 
+/* Whether jobs decode (built with libavcodec), for the tests to ask */
+static bool nvt_h26xdec_get_libavcodec(Object *obj, Error **errp)
+{
+#ifdef NVT_H26XDEC_LIBAVCODEC
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void nvt_h26xdec_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+
+    object_class_property_add_bool(klass, "libavcodec",
+                                   nvt_h26xdec_get_libavcodec, NULL);
+    /* the value in the text too: -device help prints no getter's value */
+    object_class_property_set_description(klass, "libavcodec",
+#ifdef NVT_H26XDEC_LIBAVCODEC
+                                          "read-only, on: jobs decode");
+#else
+                                          "read-only, off: jobs complete "
+                                          "with nothing written");
+#endif
 
     device_class_set_legacy_reset(dc, nvt_h26xdec_reset);
     dc->realize = nvt_h26xdec_realize;

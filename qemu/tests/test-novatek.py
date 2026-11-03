@@ -3250,13 +3250,22 @@ def test_nt98633(qemu, tmp):
         v0, v1 = qt.readl(0x2F0210110), qt.readl(0x2F0200110)
         check('Ethernet MACs at 0x2_F0210000 and 0x2_F0200000 (EQoS '
               'version)', v0 == v1 and v0 != 0, True)
-        test_na51090_media(qt)
+        test_na51090_media(qt, qemu)
     finally:
         qt.close()
     os.unlink(path)
 
 
-def test_na51090_media(qt):
+def h26xdec_decodes(qemu):
+    """Whether the decoder was built with libavcodec: its read-only
+    "libavcodec" property, whose description -device help lists."""
+    out = subprocess.run([qemu, '-M', 'none', '-device', 'nvt-h26xdec,help'],
+                         capture_output=True, text=True).stdout
+    return any('libavcodec=' in line and 'read-only, on:' in line
+               for line in out.splitlines())
+
+
+def test_na51090_media(qt, qemu):
     """NA51090's decoder layout (h26xdec.ko v0.1.45), its second VPE (the
     VPEL) and the VPE's registers as its kdrv_vpe uses them."""
     print('nt98633: decoder, VPE and VPEL')
@@ -3328,7 +3337,7 @@ def test_na51090_media(qt):
     qt.step(5 * 1000 * 1000)
     qt.writel(dec + 0x603C, 1)
     qt.writel(dec + 0x683C, 1)
-    if qt.read(pic, 1) == b'\x00':
+    if not h26xdec_decodes(qemu):
         print('  decoding skipped: built without libavcodec')
     else:
         check('the picture decoded to 0x6840: white bar, then yellow (Y)',
@@ -3338,6 +3347,28 @@ def test_na51090_media(qt):
               (b'\xeb', b'\xd2'))
         check('and its UV at 0x8048 (the yellow bar\'s U, V)',
               qt.read(sub + 32 * 24 + 4, 2), b'\x10\x92')
+        # a factor below 1 would be a copy larger than its source: none
+        qt.write(sub, b'\x00' * 32)
+        qt.write(ll, lst.replace(cmd(0, 0x8054, 2849 << 16 | 2114),
+                                 cmd(0, 0x8054, 0)).replace(
+                                     cmd(0, 0x8050, 0x0202),
+                                     cmd(0, 0x8050, 0)))
+        qt.writel(dec + 0x8000, 2)
+        qt.step(5 * 1000 * 1000)
+        qt.writel(dec + 0x603C, 1)
+        qt.writel(dec + 0x683C, 1)
+        check('an extra write scaled up (factor 1/65536) writes nothing',
+              qt.read(sub, 1), b'\x00')
+
+    # a list writing past the decoder's 40 KiB is dropped, not stored
+    qt.write(ll, cmd(0xC, 0, ll + 8) + cmd(0, 0x7FFFC, 0xDEADBEEF) +
+             cmd(0xC, 0, 0xFFFFFFF0))
+    qt.writel(dec + 0x8000, 2)
+    qt.step(5 * 1000 * 1000)
+    check('a list write to 0x7FFFC is dropped (QEMU lives on)',
+          qt.readl(dec + 0x801C), 0xFFFFFFF0)
+    qt.writel(dec + 0x603C, 1)
+    qt.writel(dec + 0x683C, 1)
 
     vpel, src, dst = 0x2F0420000, 0x01200000, 0x01400000
     fw, fh = 64, 32
@@ -3377,6 +3408,12 @@ def test_na51090_media(qt):
           qt.read(dst + 4 * fw + 8, 4), bytes([0, 8, 16, 24]))
     check('its UV from after the stand-in\'s rows',
           qt.read(dst + fw * fh + 2 * fw + 8, 4), b'\x11\x22\x11\x22')
+    qt.write(dst + 4 * fw + 8, b'\x55' * 4)
+    job(vpel, frame + [(0x0008, 0xC00), (0x0010, 4 << 16 | 1),
+                       (0x001C, 0), (0x0308, src), (0x0800, 1),
+                       (0x0604, 4 << 16 | 8), (0x0508, 2), (0x0510, 4)])
+    check('a 1-pixel-wide compressed source is refused (no division by '
+          'zero)', qt.read(dst + 4 * fw + 8, 4), b'\x55' * 4)
 
 
 # ---- nt98332: decoder and VPE link lists ------------------------------

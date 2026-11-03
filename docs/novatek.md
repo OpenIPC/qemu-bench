@@ -327,7 +327,7 @@ keeps the SDK's `partition_uboot` (`0xC0000`, Dahua's mini-Boot, a plain
 U-Boot), so it boots straight from the dump:
 
 ```bash
-cp DH_IPC-…dump dh.bin   # writes go to the image
+cp DH_IPC-HX2X4X-Taylor_MultiLang_PN_V2.840.0000000.26.R.260225.dump dh.bin   # writes go to the image
 qemu-system-arm -M nt98566,flash-file=dh.bin -nographic -serial mon:stdio \
     -nic user -action watchdog=none
 ```

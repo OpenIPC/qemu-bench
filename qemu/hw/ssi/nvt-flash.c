@@ -1121,7 +1121,8 @@ static void nvt_spi020_start(NvtFlashState *s, uint32_t cmd4)
         nvt_spi020_xfer(s, cmd4 >> 24);
     }
     for (i = alen - 1; i >= 0; i--) {
-        nvt_spi020_xfer(s, addr >> (8 * i));
+        /* a 5..7-byte address: its bytes past the 32-bit register are 0 */
+        nvt_spi020_xfer(s, i < 4 ? addr >> (8 * i) : 0);
     }
     if (cmd2 & (1u << 28)) {
         nvt_spi020_xfer(s, cmd4 >> 16);

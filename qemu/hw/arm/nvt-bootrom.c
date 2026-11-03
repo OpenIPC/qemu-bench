@@ -159,7 +159,7 @@ static uint32_t rom_lz(NvtBootRomState *s, uint32_t in_addr, uint32_t out_addr,
     marker = in[0];
 
 #define NEED(n) do {                                    \
-        while (outpos + (n) > cap) {                    \
+        while ((n) > cap - outpos) {                    \
             if (cap >= LZ_MAX) {                        \
                 goto done;                              \
             }                                           \
@@ -189,7 +189,7 @@ static uint32_t rom_lz(NvtBootRomState *s, uint32_t in_addr, uint32_t out_addr,
                 b = inpos < in_size ? in[inpos++] : 0;
                 off = (off << 7) | (b & 0x7F);
             } while (b & 0x80 && inpos < in_size);
-            if (!off || off > outpos) {
+            if (!off || off > outpos || len > LZ_MAX - outpos) {
                 break;
             }
             NEED(len);

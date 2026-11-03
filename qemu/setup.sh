@@ -665,6 +665,7 @@ config NOVATEK
     select AHCI_SYSBUS
     select SDHCI
     select AT24C
+    select USB_XHCI_SYSBUS
 KCONFIG
     echo "  hw/arm/Kconfig: added NOVATEK"
 else
