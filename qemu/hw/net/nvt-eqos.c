@@ -33,7 +33,7 @@
  * read format: RDES0 buffer, RDES3 OWN, IOC bit 30; write-back: RDES3 FD,
  * LD, packet length [14:0] -- without the FCS, which the driver does not
  * strip (DWC_ETH_QOS_clean_rx_irq).  A frame longer than RBSZ spans
- * descriptors; Rx stops at the tail pointer; the packet filter (MPFR,
+ * descriptors; Rx stops at a descriptor it does not own; the packet filter (MPFR,
  * MAC address registers) decides what is taken at all.  A Tx frame is
  * gathered across tail writes, and one too long for the MAC is dropped
  * with ES / JT in its last write-back.  yinit() polls DSR0 until RPS0 reads
@@ -53,6 +53,7 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
+#include "net/checksum.h"
 #include "net/eth.h"
 #include "hw/net/mii.h"
 #include "qom/object.h"
@@ -75,6 +76,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtEqosState, NVT_EQOS)
 #define MAC_ADDR0_HI        0x0300
 #define MAC_ADDR0_LO        0x0304
 #define MTL_Q0TOMR          0x0D00
+#define TDES3_CIC_SHIFT     16
 #define DMA_MODE            0x1000
 #define DMA_ISR             0x1008
 #define DMA_DSR0            0x100C
@@ -159,6 +161,8 @@ struct NvtEqosState {
     /* the Tx frame being gathered, kept across tail-pointer writes */
     uint8_t tx_frame[EQOS_MAX_FRAME];
     uint32_t tx_len;
+    uint32_t tx_cic;                    /* the frame's checksum insertion */
+    uint32_t dsl_unit;                  /* bytes per DSL, the bus width */
     bool tx_overflow;
     uint16_t phy[32];
 };
@@ -249,7 +253,7 @@ static void nvt_eqos_update_irq(NvtEqosState *s)
 
 static uint32_t nvt_eqos_desc_size(NvtEqosState *s)
 {
-    return 16 + ((*ch(s, CH_CR) >> 18) & 7) * 8;
+    return 16 + ((*ch(s, CH_CR) >> 18) & 7) * s->dsl_unit;
 }
 
 static dma_addr_t nvt_eqos_desc(NvtEqosState *s, bool rx, uint32_t idx)
@@ -322,6 +326,7 @@ static void nvt_eqos_tx(NvtEqosState *s)
             if (d[3] & DES3_FD) {
                 s->tx_len = 0;
                 s->tx_overflow = false;
+                s->tx_cic = (d[3] >> TDES3_CIC_SHIFT) & 3;
             }
             l1 = d[2] & 0x3FFF;
             l2 = (d[2] >> 16) & 0x3FFF;
@@ -344,6 +349,12 @@ static void nvt_eqos_tx(NvtEqosState *s)
                 if (s->tx_overflow) {
                     d[3] |= TDES3_ES | TDES3_JT;
                 } else {
+                    /* TX checksum offload: the loaders' Ethernet boot */
+                    if (s->tx_cic) {
+                        net_checksum_calculate(s->tx_frame, s->tx_len,
+                                               s->tx_cic == 1 ? CSUM_IP :
+                                               CSUM_ALL);
+                    }
                     qemu_send_packet(qemu_get_queue(s->nic), s->tx_frame,
                                      s->tx_len);
                 }
@@ -370,9 +381,10 @@ static uint32_t nvt_eqos_rx_bufsz(NvtEqosState *s)
 }
 
 /*
- * How many descriptors from the current one the DMA may fill: owned by it
- * and short of the tail pointer, which the DMA stops at (the driver points
- * it at the last descriptor it refilled).
+ * How many descriptors from the current one the DMA may fill: those it
+ * owns.  The tail pointer does not stop it: the loaders' Ethernet boot
+ * (STRGEXT_Eth.a) sets it once, at the last of its four descriptors, and
+ * goes on to take a whole file through the ring.
  */
 static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
 {
@@ -385,9 +397,6 @@ static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
     }
     for (n = 0; n < want && n < ring; n++) {
         a = nvt_eqos_desc(s, true, (s->cur_rx + n) % ring);
-        if (a == *ch(s, CH_RDTP)) {
-            break;
-        }
         nvt_eqos_read_desc(a, d);
         if (!(d[3] & DES3_OWN)) {
             break;
@@ -673,6 +682,7 @@ static const VMStateDescription vmstate_nvt_eqos = {
 };
 
 static const Property nvt_eqos_properties[] = {
+    DEFINE_PROP_UINT32("dsl-unit", NvtEqosState, dsl_unit, 8),
     DEFINE_NIC_PROPERTIES(NvtEqosState, conf),
 };
 
