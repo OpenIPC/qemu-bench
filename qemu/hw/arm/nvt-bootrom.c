@@ -888,7 +888,7 @@ static bool rom_flash_loader_ok(NvtBootRomState *s)
     }
     img = g_malloc(size);
     nvt_flash_read(s->flash, 0, img, size);
-    return rom_loader_ok(img, size);
+    return rom_loader_ok(img, size) && ldl_le_p(img + 4) == s->sram_base;
 }
 
 static void nvt_bootrom_reset(DeviceState *dev)

@@ -1511,14 +1511,17 @@ void nvt_rom_set_fallback(bool on, uint32_t strap, bool fast)
     nvt_rom_fast = fast;
 }
 
-/* NOR, SPI NAND (2K, 4K, RS) and eMMC: what the ROM reads a loader from */
+/*
+ * What the ROM model starts from flash (nvt-bootrom.c, rom_first_source):
+ * all but SD (1), Ethernet (4), USB (5, 0xB) and UART (0xC).
+ */
 bool nvt_rom_strap_is_flash(uint32_t strap)
 {
     switch (strap & 0xF) {
-    case 0: case 2: case 3: case 6: case 8: case 9: case 0xA:
-        return true;
-    default:
+    case 1: case 4: case 5: case 0xB: case 0xC:
         return false;
+    default:
+        return true;
     }
 }
 

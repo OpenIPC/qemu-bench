@@ -1327,8 +1327,10 @@ jobs:
       - name: Make QEMU executable
         run: chmod +x qemu-src/build/qemu-system-arm
 
+      # A reviewed defib commit (Novatek UART and Ethernet recovery,
+      # OpenIPC/defib#169 and #170), not whatever master holds
       - name: Install defib
-        run: pipx install git+https://github.com/OpenIPC/defib
+        run: pipx install git+https://github.com/OpenIPC/defib@a99ceee7b4ee3de5b59272bf4caf30346243e1e4
 
       - name: Recover a blank flash over UART, through the straps and the fallback
         run: bash qemu-boot/test-novatek-recovery.sh --soc ${{ matrix.soc }}
