@@ -28,7 +28,7 @@ Builds three QEMU targets:
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (106 total)
+## Supported Machines (109 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -242,8 +242,9 @@ was at hand.
 | `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
 | `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
 | `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
+| `ssc029` | Cortex-A32 ×2 (run as A7), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
 
-SigmaStar's (formerly MStar's) infinity2m and infinity3 dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m, infinity3 and Iford dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
@@ -636,7 +637,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 69 machines build and register. Every machine marked "yes" above boots
+All 109 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -786,7 +787,7 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
-├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3 machines, synthetic mask ROM
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford machines, synthetic mask ROM
 ├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
 ├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
 ├── hw/timer/sstar-timer.c       # PIU timers + watchdog

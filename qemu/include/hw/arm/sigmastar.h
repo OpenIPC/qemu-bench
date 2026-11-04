@@ -25,6 +25,7 @@ typedef enum SsDie {
     SS_DIE_INFINITY2M = 0,
     SS_DIE_IFADO,
     SS_DIE_INFINITY3,
+    SS_DIE_IFORD,
 } SsDie;
 
 typedef struct SsSoCConfig {
@@ -37,6 +38,8 @@ typedef struct SsSoCConfig {
     uint32_t    flash_jedec;    /* the board's SPI NOR */
     uint32_t    imi_size;       /* IMI SRAM; 0 = 64 KiB */
     uint32_t    ipl_offset;     /* where the ROM looks for the IPL in NOR */
+    uint16_t    fsp_bank;       /* boot FSP's RIU bank; 0 = 0x0016 */
+    uint16_t    qspi_bank;      /* boot QSPI's RIU bank; 0 = 0x0017 */
     bool        fsp_sw_cs;      /* FSP-QSPI with the software chip select */
     bool        smf_ack;        /* the IPL's SMF stub handshake (bank 0x1121) */
     bool        urdma;          /* UART DMA, Ifado layout; SPIs 93/94 its */

@@ -1,4 +1,4 @@
-# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`, `ssc375`, `msc313e`)
+# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`, `ssc375`, `msc313e`, `ssc029`)
 
 SigmaStar's (formerly MStar's) Cortex-A7 SoCs share one memory map whatever
 the family: DRAM (the MIU0 window) at `0x20000000`, the SPI NOR read window at
@@ -27,10 +27,21 @@ from there too.
 | `ssd201` | infinity2m | 2× Cortex-A7 | 64 MiB | `0x1D` | `0xF0` | — |
 | `ssc375` | Ifado | 1× Cortex-A7 | 128 MiB | `0x15` | `0xF0`¹ | IPL → U-Boot → DHBoot → kernel → rootfs |
 | `msc313e` | infinity3 | 1× Cortex-A7 | 64 MiB | — | `0xC2` | IPL → U-Boot → kernel → shell |
+| `ssc029` | Iford | 2× Cortex-A32 (A7s here)² | 128 MiB | `0`³ | `0xF0`³ | IPL → U-Boot → kernel → shell, SDK `preview` to RTSP H.264, Ethernet, SD, USB; no AE |
 
 ¹ Not checked against silicon: the boot chain to userspace does not look
 at it. The SoC is named by the firmware itself (`CHIP=SSC375` in the Dahua
 rootfs; kernel compatible `sstar,ifado`).
+
+² QEMU has no Cortex-A32. CPU1 wakes through smpctrl (bank `0x1020`): the
+kernel writes its entry to regs `0x13`/`0x14` and sets bit 2 (wake) and bit 3
+(Non-secure) of reg `0x15`. Nothing on the flash reads those, so what parks the
+core on silicon is unseen; QEMU starts it in place of that firmware and makes
+its redistributor's lines Non-secure, as the IPL does for CPU0.
+
+³ Not from the SDK. The bond is the IPL's DRAM profile, 0-5. The kernel shows
+the chip ID as `soc_id` (bank `0x1E00` reg 0) but `mdrv_device_id.h` has no
+Iford entry, so `0xF0` remains a placeholder.
 
 The SSR621Q is the infinity2m die in Xiongmai's 4/8/16-channel NVRs, with
 SATA, HDMI and the video decoder bonded out. Its IPL reads the bond strap to
@@ -48,6 +59,121 @@ whole SPI NOR; erases and programs go back to it, so boot a copy.
 `flash-jedec=` overrides the JEDEC ID (default MX25L12835F, `0xC22018`).
 `-kernel` boots a kernel directly; the vendor kernel builds its device tree
 from the ATAGs (`atags_to_fdt`).
+
+## Iford (`ssc029`)
+
+Iford is a later generation than the other dies here. Linux is 5.10 and
+U-Boot 2021.10, and a good deal has moved. The SDK ships prebuilt NOR images
+rather than a flash dump; `qemu-boot/sstar-iford-image.py` lays one out as its
+TFTP install scripts would:
+
+```
+qemu-boot/sstar-iford-image.py \
+    Image/ipc_iford.nor.uclibc-9.1.0-squashfs.ssz029c.128.qfn128_ddr3_demo_aov_defconfig/images \
+    iford.bin
+qemu-system-arm -M ssc029,flash-file=iford.bin -serial mon:stdio -nic user
+```
+
+It boots to a shell on the console. `demo.sh` loads the MI modules with
+`printk` silenced, so the kernel goes quiet after
+`clk: Not disabling unused clocks`; the prompt comes when it is done. Its
+`scsi_mod`, `usb-storage` and `sd_mod` and a read-only `/misc` are the image's
+own errors. `sstar_emac.ko` is not in `demo.sh`: `insmod` it, and use a static
+address: this kernel has no `AF_PACKET`, so `udhcpc` cannot open its socket.
+
+What differs from the other dies:
+
+| | Iford | Older dies |
+|---|---|---|
+| Interrupt controller | GICv3, redistributors at `0x16040000`; the IPL itself uses `ICC_MSRE` | GIC-400 |
+| Interrupts | `sstar-intc`, 128 `MS_IRQ` from SPI 32, `MS_FIQ` from SPI 160. The driver runs the old registers past their ends: masks `0x54`-`0x5B`, polarity `0x58`-`0x5F`, raw `0x5C`-`0x63`, so polarity is ignored | 64 `MS_IRQ` | `MS_FIQ` from 96 |
+| Boot flash | FSP banks `0x100D`/`0x100E` | `0x0016`/`0x0017` |
+| Mask ROM | leaves the core in Monitor mode⁴ | Supervisor |
+| Secure monitor | `SMF` at `0x20000400`: A32 `CPUACTLR`/`CPUECTLR` (RAZ/WI here) and the bank `0x1121` handshake | Ifado has the handshake |
+| Unpacking | `sstar-xzdec`, below | IPL_CUST in software |
+| URDMA | UART0 `0x1F220E00`, UART1 `0x1F221C00`, FUART `0x1F220600`; SPIs 67, 92, 80 | Ifado: `0x1F220C00`, `0x1F220E00` |
+| I2C | `0x1F222800`, `0x1F222A00`, `0x1F007C00` | `0x1F223000`.. |
+| EMAC | X32 view `0x1F304200`, internal PHY `0x1F2A3000` (bank `0x1518`), SPI 51 | `0x1F343C00`, bank `0x0031`, SPI 58 |
+
+⁴ An inference: the IPL sets `SCR.NS`, touches `ICC_HSRE` and clears it again,
+which only works in Monitor mode. There is no dump of this ROM.
+
+The boot chain's status bits, in `sstar-riu`: the IPL's DRAM test (bank
+`0x1668` reg `0x50` bit 0 starts it, reg `0x59` [2:0] reads 4), the MIU MMU's
+reset (bank `0x1659` reg 0 bit 4, done in [13:12]), the FCIEs' reset
+(banks `0x1413` and `0x0042`, reg `0x3F`). DRAM size is bank `0x1659` reg
+`0x0D`, log2 of MiB, which `mi_sys` checks against `LX_MEM`.
+
+**XZ decoder.** IPL_CUST and U-Boot unpack through a hardware decoder
+(banks `0x11D7`-`0x11DC`), fed by BDMA destination port 6. The file format is
+the vendor's `sz` tool's (`sstar_sz.sh`, `szsplit`, `szrestore`):
+
+- `sstarXZ`, the block count, the chunk size `0x20`, each block's stored and
+  unpacked size as XZ VLIs, padded to 16 bytes;
+- then the blocks round-robin, a chunk of each in turn, for the four decoder
+  cores; a trailing `SZ`;
+- each block is an XZ block (header, LZMA2, padding, CRC32).
+
+**The LZMA is not standard**: a literal is eight direct bits of the range
+coder, with no context (`szdec`'s `lzma_literal`). No stock decoder reads
+these files. Matches and lengths are as usual; `xz` fails a few bytes in.
+
+**The media path.** The SDK's `amigos/preview` runs to RTSP at
+`rtsp://<ip>/video0` with its stock `pad0-venc-file.json`, VIF to ISP in frame
+mode (the uClibc binary from
+`project/release/chip/iford/ipc-rtos/common/uclibc/9.1.0/release/bin/amigos/preview`;
+keep its stdin open, or its menu loop fills the ramfs).
+
+That `preview` is the RTOS build and links no 3A, so nothing runs AE beside it.
+`qemu-boot/sstar-iford-3a-host.c` is a small dynamic host for the vendor's own
+`libcus3a` and `libispalgo`: `MI_SYS_Init`, `CUS3A_Init`,
+`MI_ISP_EnableUserspace3A`. Run beside `preview`, the unmodified algorithms
+converge, and follow `qom-set /machine/isp light|light-r|light-b`.
+
+| Stage | State |
+|---|---|
+| OS04D10 on i2c1, `0x3C`: ID, modes, stream on | modelled (`os04d10`, in the catalogue) |
+| MIU MMU, bus masters and the CPU's window at `0x60000000` | modelled, from `hal_miu.c` |
+| CMDQ, 8 engines, MI's fences | modelled |
+| Sensor to Bayer | modelled in `sstar-iford-isp`: scene × light × the sensor's own rows and gain |
+| VIF WDMA, banks `0x1358`, `0x130C`, SPI 56 | modelled: FIFO, events, the frame in DRAM. The 10-bit packing is a guess, as nothing reads it back |
+| ISP RDMA | **not modelled**: the ISP works from the sensor's frame directly, in either bind mode |
+| 3A statistics, bank `0x131B`, into `ISP0_STATS` | modelled from the Bayer data: AE, AWB, histograms |
+| WBG, bank `0x1312` | modelled, driven by the vendor's AWB |
+| Demosaic | 2×2 quads, half size |
+| Gamma, CCM | **stub**: a fixed 1/2.2 and BT.601. The IQ file's are not read |
+| Black level, LSC, NR, sharpening | not modelled |
+| SCL output, bank `0x1253` | the ISP's picture, written by nearest neighbour. Crop and filters not modelled |
+| SCL to VENC ring (`RING_UNIFIED_DMA`) | not modelled: see below |
+| VENC at its firmware interface | the interface is real; no firmware runs, and H.264 comes from `sstar-venc` (libavcodec, or the writer below) |
+| Suspend to RAM | modelled: `sstar-rtcpwc`, then the stock IPL's resume path |
+| IPU | **stub**: the supply ack and `0x19000000`-`0x1938FFFF` as plain RAM. Nothing computes; `ipu_lfw.bin` in the image is empty |
+| H.265 without libavcodec | not modelled |
+
+`prog_aov_aov_demo` gets through `MI_IPU` and `DET` init on that stub, which
+proves only that they do not touch the block, and starts its pipeline. It stops
+next at the encoder: its VENC takes `RING_UNIFIED_DMA` input, the driver sets
+the channel up but never writes the start register, so `__AovGetVencStream`
+times out. `MI_IPU_Invoke` has not been reached.
+
+**Suspend.** `sram_suspend_imi` ends by clearing `PWR_EN` in the RTCPWC (bank
+`0x0034` reg `0x0F`) and then runs off into its literal pool, as the power has
+gone. Here that suspends the machine; the RTC alarm resets it with DRAM and the
+RTC domain kept, and the PMPOR flag (bank `0x0600` reg 1 bit 3). `echo +4 >
+/sys/class/rtc/rtc0/wakealarm; echo mem > /sys/power/state` returns to the
+shell through the unmodified IPL, with CPU1 back. It needs the default host RTC
+clock: `-rtc clock=vm` stops while suspended, and the alarm never comes.
+
+Without libavcodec `sstar-venc` has a Baseline H.264 writer, which codes the
+real source buffer: Intra16x16 with no residual where a prediction is exact,
+I_PCM elsewhere, P_Skip for what stands still. No transform or motion: a lossless
+picture, not a bitrate. Frames that change everywhere take several P frames.
+
+The buffers are contiguous only as MIU addresses: a bus master must translate
+every page. `sstar-fcie` gained ADMA and `BUSY_END`, which Iford's driver uses
+and infinity3's does not; SD reads and writes `mmcblk0`. USB is one EHCI at bank
+`0x1424`, SPI 63; the image has no `usb-storage.ko`, `scsi_mod.ko` or `sd_mod.ko`,
+so a USB disk cannot work, while a `usb-kbd` enumerates and binds `usbhid`.
 
 ## Boot
 
@@ -284,7 +410,7 @@ ID, so it loads only when given that camera's value, e.g.
 `-M ssc375,flash-file=cam.bin,uuid=0x0123456789ABCDEF`.
 
 - **IPL.** It runs from IMI past 64 KiB (stack `0xA00155E0`), so IMI is
-  128 KiB here. It picks the DRAM profile from the bond strap, `0x10`-`0x19`
+  the kernel's `IMI_SIZE`, 240 KiB, here. It picks the DRAM profile from the bond strap, `0x10`-`0x19`
   (QFN88 WB512M/ESMT512M/ETRON512M DDR2, NTC1G/WB1G/PM1G DDR3); `0x15`, WB1G
   DDR3, gives the board's 128 MiB. Its SMF stub sets bank `0x1121` reg
   `0x37` bit 2 and waits for reg `0x38` to read 3 (`smf-ack`).
@@ -657,7 +783,7 @@ prompt, on a board as under QEMU.
 - HDMI TX: no EDID, so the NVR falls back to its default output mode.
 - The DIVP/DIP scalers (the VPU's own scaler serves the live view) and the
   remaining GOPs (GOP 0 is programmed but not scanned out).
-- SAR ADC, RTC (the kernel warns that RTCPWC has no power),
+- SAR ADC, RTC on infinity2m (the kernel warns that RTCPWC has no power),
   the MMU block (`HAL_MMU_Reset timeout`), audio output and the
   infinity2m's audio.
 - infinity (MSC313, MSC316 without E), infinity6 and mercury5 parts.

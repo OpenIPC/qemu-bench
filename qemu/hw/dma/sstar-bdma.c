@@ -14,8 +14,8 @@
  *   +0x0A/0B the fill pattern (source 4)
  *
  * Ports: 0/1 MIU (DRAM from bus address 0, or IMI), 4 memory fill
- * (source), 5 the SPI NOR (source), 11 the FSP's outside write buffer
- * (destination).  The boot ROM copies the IPL from flash to IMI with
+ * (source), 5 the SPI NOR (source), 6 the XZ decoder (destination, Iford),
+ * 11 the FSP's outside write buffer (destination).  The boot ROM copies the IPL from flash to IMI with
  * source 5; U-Boot programs pages with MIU -> FSP (HAL_FSP_Write_BDMA:
  * path 0x2B40) and fires the FSP after triggering the channel.
  * Transfers complete inside the trigger write.
@@ -37,6 +37,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/ssi/sstar-fsp.h"
+#include "hw/misc/sstar-xzdec.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -67,6 +68,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarBdmaState, SSTAR_BDMA)
 #define PORT_MIU1           1
 #define PORT_FILL           4
 #define PORT_SPI            5
+#define PORT_XZDEC          6       /* destination, Iford */
 #define PORT_FSP            11
 
 #define DRAM_BASE           0x20000000
@@ -77,6 +79,7 @@ struct SstarBdmaState {
 
     MemoryRegion iomem;
     SstarFspState *fsp;
+    SstarXzdecState *xzdec;
     uint16_t regs[BDMA_NUM_CHAN][BDMA_CHAN_REGS];
     qemu_irq irq[BDMA_NUM_CHAN];
 };
@@ -90,7 +93,8 @@ static hwaddr bdma_mem_addr(uint16_t *r, uint32_t a)
 {
     /* Bus addresses: DRAM from 0, as the drivers program them. */
     if (((r[R_MISC] >> 12) & 0x3) == MISC_MEM_IMI) {
-        return IMI_BASE + (a & 0xFFFF);
+        /* Iford's IPL reads into IMI above 64 KiB (0xA0010980) */
+        return IMI_BASE + (a & 0xFFFFF);
     }
     return DRAM_BASE + (a & 0x1FFFFFFF);
 }
@@ -150,6 +154,11 @@ static void bdma_run(SstarBdmaState *s, int ch)
         case PORT_FSP:
             if (s->fsp) {
                 sstar_fsp_push_outside(s->fsp, buf, n);
+            }
+            break;
+        case PORT_XZDEC:
+            if (s->xzdec) {
+                sstar_xzdec_push(s->xzdec, buf, n);
             }
             break;
         default:
@@ -258,6 +267,8 @@ static void sstar_bdma_init(Object *obj)
 static const Property sstar_bdma_props[] = {
     DEFINE_PROP_LINK("fsp", SstarBdmaState, fsp, TYPE_SSTAR_FSP,
                      SstarFspState *),
+    DEFINE_PROP_LINK("xzdec", SstarBdmaState, xzdec, TYPE_SSTAR_XZDEC,
+                     SstarXzdecState *),
 };
 
 static const VMStateDescription vmstate_sstar_bdma = {

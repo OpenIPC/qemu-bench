@@ -28,6 +28,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/guest-random.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -121,8 +122,18 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
             }
         }
         break;
+    case 0x1518:            /* ALBANY0 on Iford (DTS emac0's third reg) */
+        if (!s->iford) {
+            break;
+        }
+        /* fall through */
     case 0x0031:            /* ALBANY0: the EMAC's internal PHY, sstar-emac */
         switch (reg) {
+        case 0x00:          /* BMCR: reset and AN restart self-clear */
+            if (s->iford) {
+                v &= ~0x8200;
+            }
+            break;
         case 0x01:          /* BMSR: 10/100 half/full, AN done, link up */
             v = 0x786D;
             break;
@@ -169,9 +180,46 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
             v &= ~0x0100;
         }
         break;
+    case 0x0042:
+    case 0x1413:
+        /* Iford FCIE, SDIO and SD: as infinity3 below, the same registers */
+        if (s->iford && reg == 0x3F) {
+            v = (v & ~0x001E) | ((v & 1) ? 0 : 0x001E);
+        }
+        break;
+    case 0x1659:
+        /* Iford MIU MMU: reg 0 bit 4 resets it, [13:12] say its RAMs are up */
+        if (s->iford && reg == 0x00 && (v & 0x0010)) {
+            v |= 0x3000;
+        }
+        break;
+    case 0x1668:
+        /*
+         * Iford: the IPL's DRAM access test (MIU_MEMAUTOK): reg 0x50 bit 0
+         * starts it, reg 0x59 [2:0] reads 4 when it has passed.
+         */
+        if (s->iford && reg == 0x59) {
+            v = (s->regs[(bank << 7) | 0x50] & 1) ? 4 : 0;
+        }
+        break;
+    case 0x112F:            /* Iford: the RNG (halAESDMA.c HAL_RNG_Read) */
+        if (s->iford && reg == 0x23) {
+            v = 0x8000;         /* a word is ready */
+        } else if (s->iford && reg == 0x22) {
+            qemu_guest_getrandom_nofail(&v, sizeof(v));
+        }
+        break;
     case 0x101E:            /* chiptop: reg 0x48 is the package bond strap */
         if (reg == 0x48) {
             v = s->bond;
+        }
+        /*
+         * Iford, the IPU's power switch: bit 4 of 0x6C asks for power off
+         * and bit 8 reads back that the supply is up.  Hal_Ipu_MtcmosPowerOn,
+         * DisableIsoEn and MtcmosPowerOff spin on it.
+         */
+        if (s->iford && reg == 0x6C && !(v & 0x10)) {
+            v |= 0x0100;
         }
         break;
     case 0x0022:
@@ -195,7 +243,8 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
      * board's pull-ups hold the I2C lines the MIIC driver checks before
      * each transfer; a GPIO output reads what it drives.
      */
-    if (s->gpio_bank && bank == s->gpio_bank) {
+    if ((s->gpio_bank && bank == s->gpio_bank) ||
+        (s->iford && bank == 0x003F)) {    /* its PM pads, the same format */
         v &= ~1;
         v |= (v & 0xC) ? 1 : (v >> 1) & 1;
     }
@@ -215,6 +264,68 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
 }
 
 #define RIU_HOT_POLL        0x10000
+
+/*
+ * Iford's MIU MMU (hal_miu.c struct reg_miu_mmu): bus masters' addresses
+ * in the VPA region go through a table of 4096 pages.  Reg 0: bit 0 enable,
+ * [2:1] the page size (32, 64, 128 KiB); reg 1: the VPA region [7:0] and
+ * the PA region [15:8], a region being a table's reach; reg 2 [11:0] the
+ * entry and bit 15 write; reg 3 the entry's PA page to write, reg 4 the
+ * one read; reg 0x0A = 3 does the access.
+ */
+#define MMU_BANK            0x1659
+#define MMU_ENTRIES         4096
+#define MMU_INVALID         0x0FFF
+
+static SstarRiuState *sstar_miu_riu;
+
+uint64_t sstar_miu_xlate(uint64_t a)
+{
+    SstarRiuState *s = sstar_miu_riu;
+    uint16_t ctl, regions;
+    unsigned page, reach;
+    uint16_t pa;
+
+    if (!s) {
+        return a;
+    }
+    ctl = s->regs[MMU_BANK << 7];
+    if (!(ctl & 1)) {
+        return a;
+    }
+    regions = s->regs[(MMU_BANK << 7) | 1];
+    page = 15 + ((ctl >> 1) & 3);
+    reach = page + 12;
+    if ((a >> reach) != (regions & 0xFF)) {
+        return a;
+    }
+    pa = s->mmu[(a >> page) & (MMU_ENTRIES - 1)];
+    if (pa == MMU_INVALID) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-riu: MMU miss at 0x%" PRIx64 "\n",
+                      a);
+        return a;
+    }
+    return ((uint64_t)(regions >> 8) << reach) | ((uint64_t)pa << page) |
+           (a & ((1ull << page) - 1));
+}
+
+static void sstar_miu_mmu_write(SstarRiuState *s, uint32_t reg, uint16_t v)
+{
+    uint32_t base = MMU_BANK << 7;
+
+    if (reg == 0x00 && (v & 0x0010)) {
+        memset(s->mmu, 0xFF, sizeof(s->mmu));
+    } else if (reg == 0x0A && (v & 3) == 3) {
+        uint16_t e = s->regs[base | 2];
+        unsigned n = e & (MMU_ENTRIES - 1);
+
+        if (e & 0x8000) {
+            s->mmu[n] = s->regs[base | 3] & MMU_INVALID;
+        } else {
+            s->regs[base | 4] = s->mmu[n] & MMU_INVALID;
+        }
+    }
+}
 
 static uint64_t sstar_riu_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -286,6 +397,10 @@ static void sstar_riu_write(void *opaque, hwaddr off, uint64_t val,
     }
     s->regs[idx] = v;
 
+    if (s->iford && bank == MMU_BANK) {
+        sstar_miu_mmu_write(s, reg, v);
+    }
+
     /*
      * reset_cpu (U-Boot reset.S) and the kernel's restart hook write 0xFF
      * then 0x79 to PM_SLEEP 0x2E: the second write resets the chip.
@@ -309,8 +424,12 @@ static void sstar_riu_reset(DeviceState *dev)
 {
     SstarRiuState *s = SSTAR_RIU(dev);
     uint32_t i;
+    /* PMPOR reg 1, Iford: the warm-reset flag sram suspend leaves the IPL */
+    uint32_t por = (SSTAR_RIU_ADDR(0x0600, 1) - SSTAR_RIU_BASE) >> 2;
+    uint16_t keep = s->iford ? s->regs[por] : 0;
 
     memset(s->regs, 0, RIU_NREGS * sizeof(uint16_t));
+    s->regs[por] = keep;
     for (i = 0; i < s->num_defaults; i++) {
         const SstarRegDefault *d;
 
@@ -330,6 +449,11 @@ void sstar_riu_add_defaults(SstarRiuState *s, const SstarRegDefault *table)
 static void sstar_riu_realize(DeviceState *dev, Error **errp)
 {
     SstarRiuState *s = SSTAR_RIU(dev);
+
+    if (s->iford) {
+        memset(s->mmu, 0xFF, sizeof(s->mmu));
+        sstar_miu_riu = s;
+    }
 
     s->poll_idx = UINT32_MAX;
     if (s->trace && *s->trace) {
@@ -361,6 +485,7 @@ static const Property sstar_riu_props[] = {
     DEFINE_PROP_UINT16("bond", SstarRiuState, bond, 0),
     DEFINE_PROP_BOOL("smf-ack", SstarRiuState, smf_ack, false),
     DEFINE_PROP_BOOL("infinity3", SstarRiuState, infinity3, false),
+    DEFINE_PROP_BOOL("iford", SstarRiuState, iford, false),
     DEFINE_PROP_UINT16("gpio-bank", SstarRiuState, gpio_bank, 0),
     DEFINE_PROP_UINT64("uuid", SstarRiuState, uuid, 0),
     DEFINE_PROP_STRING("trace", SstarRiuState, trace),

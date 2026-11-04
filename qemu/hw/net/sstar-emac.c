@@ -129,6 +129,7 @@ struct SstarEmacState {
 
     uint32_t regs[EMAC_NREGS];
     SstarRiuState *phy_store;   /* the RIU storage behind ALBANY0 */
+    uint32_t phy_bank;          /* ALBANY0's bank */
     uint32_t rx_idx;
     uint32_t pend_g;
     uint16_t pend_lo;
@@ -139,7 +140,7 @@ struct SstarEmacState {
 static uint16_t emac_phy_read(SstarEmacState *s, unsigned reg)
 {
     /* The fixed registers are answered by sstar-riu's status hook too. */
-    return sstar_riu_read16(s->phy_store, EMAC_PHY_BANK, reg);
+    return sstar_riu_read16(s->phy_store, s->phy_bank, reg);
 }
 
 static void emac_phy_write(SstarEmacState *s, unsigned reg, uint16_t v)
@@ -147,7 +148,7 @@ static void emac_phy_write(SstarEmacState *s, unsigned reg, uint16_t v)
     if (reg == MII_BMCR) {
         v &= ~(MII_BMCR_RESET | MII_BMCR_ANRESTART);
     }
-    sstar_riu_set(s->phy_store, EMAC_PHY_BANK, reg, v);
+    sstar_riu_set(s->phy_store, s->phy_bank, reg, v);
 }
 
 /* ---- interrupts, RX --------------------------------------------------- */
@@ -533,6 +534,7 @@ static const Property sstar_emac_props[] = {
     DEFINE_NIC_PROPERTIES(SstarEmacState, conf),
     DEFINE_PROP_LINK("riu", SstarEmacState, phy_store, TYPE_SSTAR_RIU,
                      SstarRiuState *),
+    DEFINE_PROP_UINT32("phy-bank", SstarEmacState, phy_bank, EMAC_PHY_BANK),
 };
 
 static const VMStateDescription vmstate_sstar_emac = {
