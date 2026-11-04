@@ -468,16 +468,23 @@ or whenever `boot-strap=` is not a flash strap:
 - **Ethernet** is the ROM's DHCP and TFTP client, driving `nvt-eqos`
   before any loader does:
   - A MAC of `00:00:00` and three random bytes, new every boot.
-  - It takes the first *broadcast* offer and drops a unicast one, as
-    silicon did against dnsmasq.
-  - DHCPREQUEST, the ACK, an ARP request for the next-server, then one
-    TFTP read request for `loader.bin` from port 2962, sent to the MAC the
-    offer came from.
+  - It takes the first reply whose xid matches, broadcast or unicast, of
+    any message type, as long as yiaddr and siaddr share a subnet (option
+    1, else /24). Otherwise it keeps waiting and asks again in 5 s.
+  - The DHCPREQUEST names siaddr as the server, not the offer's option
+    54. Any reply with the xid then counts as the ACK, a NAK included.
+  - An ARP request for the next-server, then one TFTP read request for
+    `loader.bin` from port 2962, sent to the MAC the offer came from. ARP
+    requests for its own address are answered.
   - It then waits for DATA from that server with no timeout and no
     retransmission. A network DHCP server that wins the race holds it
     there for good, as on a real LAN.
-  - The letters match silicon's: `aOfIP <ip> SRV <srv>`, `MSK`, `bS2`,
-    `cAkS3S4`, `CD` for ARP, `t<block>` per block, `Dn`, then `T`.
+  - The letters follow the ROM's code, reconstructed in
+    [OpenIPC/opennovatek](https://github.com/OpenIPC/opennovatek):
+    `aOfIP <ip> SRV <srv>`, `MSK`, `bS2a`, `cAkS3S4`, `CD` for ARP
+    (`Darp` when it answers one), `t<block>` per block, `Dn`, then `T`. An
+    NT98562's serial capture lacks the `a` after `S2`, probably lost while
+    the ROM writes the UART without waiting for its FIFO.
   - With no network, nobody answers: six DHCPDISCOVERs, then `K:`.
 - **The loader check:** header word 1 is the address, word 9 the size,
   halfword 0x30 is 0xAA55, and the halfwords plus their indices sum to 0.

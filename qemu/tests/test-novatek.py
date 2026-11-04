@@ -3868,7 +3868,7 @@ def ip_udp(sip, dip, sport, dport, data):
     return bytes(hdr) + udp
 
 
-def bootp_reply(req, kind, yiaddr, siaddr):
+def bootp_reply(req, kind, yiaddr, siaddr, server_id=None):
     b = bytearray(240)
     b[0:4] = b'\x02\x01\x06\x00'
     b[4:8] = req[4:8]
@@ -3876,8 +3876,8 @@ def bootp_reply(req, kind, yiaddr, siaddr):
     b[20:24] = socket.inet_aton(siaddr)
     b[28:34] = req[28:34]
     b[236:240] = b'\x63\x82\x53\x63'
-    return bytes(b) + bytes([53, 1, kind, 54, 4]) + socket.inet_aton(siaddr) + \
-        bytes([1, 4, 255, 255, 255, 0, 255])
+    return bytes(b) + bytes([53, 1, kind, 54, 4]) + \
+        socket.inet_aton(server_id or siaddr) + bytes([1, 4, 255, 255, 255, 0, 255])
 
 
 def test_rom_eth(qemu, tmp):
@@ -3909,20 +3909,25 @@ def test_rom_eth(qemu, tmp):
         mac = f[6:12]
         check('DHCPDISCOVER from a 00:00:00 MAC', mac[:3], b'\0\0\0')
         req = f[42:]
-        # a unicast offer, to the address it has not taken: dropped
-        net.sendto(eth_frame(mac, srv_mac, 0x0800, ip_udp(
-            '10.9.0.1', '10.9.0.50', 67, 68,
-            bootp_reply(req, 2, '10.9.0.50', '10.9.0.1'))), qaddr)
-        f, _ = dhcp_request()
-        check('a unicast offer is dropped: it asks again',
-              f[42 + 240:42 + 243], bytes([53, 1, 1]))
-        req = f[42:]
+        # an offer whose server elsewhere is off-subnet: not taken
         net.sendto(eth_frame(bcast, srv_mac, 0x0800, ip_udp(
             '10.9.0.1', '255.255.255.255', 67, 68,
-            bootp_reply(req, 2, '10.9.0.50', '10.9.0.1'))), qaddr)
+            bootp_reply(req, 2, '10.9.0.50', '10.8.0.1'))), qaddr)
         f, _ = dhcp_request()
-        check('a broadcast offer is taken: DHCPREQUEST',
+        check('an offer with siaddr off the subnet: it asks again',
+              f[42 + 240:42 + 243], bytes([53, 1, 1]))
+        req = f[42:]
+        # unicast, to the address it has not taken yet: the xid is all
+        # the ROM checks; option 54 names another host than siaddr
+        net.sendto(eth_frame(mac, srv_mac, 0x0800, ip_udp(
+            '10.9.0.1', '10.9.0.50', 67, 68,
+            bootp_reply(req, 2, '10.9.0.50', '10.9.0.1', '10.9.0.99'))), qaddr)
+        f, _ = dhcp_request()
+        check('a unicast offer is taken: DHCPREQUEST',
               f[42 + 240:42 + 243], bytes([53, 1, 3]))
+        check('the REQUEST names siaddr, not option 54',
+              f[42 + 240 + 9:42 + 240 + 15],
+              bytes([54, 4]) + socket.inet_aton('10.9.0.1'))
         net.sendto(eth_frame(bcast, srv_mac, 0x0800, ip_udp(
             '10.9.0.1', '255.255.255.255', 67, 68,
             bootp_reply(f[42:], 5, '10.9.0.50', '10.9.0.1'))), qaddr)
@@ -3947,6 +3952,17 @@ def test_rom_eth(qemu, tmp):
         check('its letters: offer, request, ARP, read request',
               b'OfIP 0A090032 SRV 0A090001' in console and
               console.rstrip().endswith(b'cAkS3S4'), True)
+        net.sendto(eth_frame(bcast, srv_mac, 0x0806, struct.pack(
+            '>HHBBH', 1, 0x0800, 6, 4, 1) + srv_mac +
+            socket.inet_aton('10.9.0.1') + bytes(6) +
+            socket.inet_aton('10.9.0.50')), qaddr)
+        reply = net.recvfrom(2048)[0]
+        check('an ARP request for its address is answered',
+              (reply[:6], reply[12:14], reply[20:22], reply[22:28],
+               reply[28:32]),
+              (srv_mac, b'\x08\x06', b'\x00\x02', mac,
+               socket.inet_aton('10.9.0.50')))
+        rs.recv(timeout=0.3)
         loader = nvt_test_loader()
         net.sendto(eth_frame(mac, srv_mac, 0x0800, ip_udp(
             '10.9.0.1', '10.9.0.50', 69, 2962,
