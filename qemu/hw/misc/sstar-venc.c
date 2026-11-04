@@ -95,10 +95,13 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/cpu-timers.h"
 #include "system/dma.h"
 #include "hw/irq.h"
+#include "hw/misc/sstar-riu.h"
+#include "hw/misc/sstar-cabac.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
@@ -169,6 +172,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarVencState, SSTAR_VENC)
 #define BS_BYTES            64          /* the placeholder frame */
 #define BS_MAX              (4 * 1024 * 1024)
 #define ENCODERS            4           /* streams encoded at once */
+#define PROG_SRC_Y          0x1258
+#define PROG_SRC_C          0x125C
+#define IFORD_PROG_SRC_Y    0x1210      /* frame mode: NV12 in DRAM */
+#define IFORD_PROG_SRC_C    0x1214
+#define IFORD_PROG_OUT      0x0208      /* the stream, 16-byte units */
+#define IFORD_PROG_OUT_SIZE 0x020C      /* less one */
+#define IFORD_PROG_STATUS   0x10A8
+#define IFORD_STATUS_REC    0x58
+#define IFORD_PROG_RESULT   0x1074
 #define PROG_SCAN           0x2000      /* bytes of program searched */
 #define SS_DRAM_BASE        0x20000000
 
@@ -235,6 +247,8 @@ struct SstarVencState {
     uint32_t done_us;
     char *dump;
     bool trace;
+    bool iford;
+    struct VencLite *lite[CONTEXTS];
 };
 
 static uint32_t *venc_reg(SstarVencState *s, hwaddr off)
@@ -242,19 +256,61 @@ static uint32_t *venc_reg(SstarVencState *s, hwaddr off)
     return &s->regs[(off & (VENC_SIZE - 1)) >> 2];
 }
 
+/*
+ * Iford's HalVencIsrHandlerPartA keeps the same interface with its
+ * registers moved: status enc+0x4C, clear enc+0x50, the stream's start
+ * enc+0x210, and the frame done is bit 25 (bits 7-24 are errors).
+ */
+#define IFORD_INT_STATUS    (ENC + 0x4C)
+#define IFORD_INT_CLEAR     (ENC + 0x50)
+#define IFORD_BS_START      (ENC + 0x210)
+#define IFORD_FRAME_DONE    (1u << 25)
+
+static uint32_t *venc_int_status(SstarVencState *s)
+{
+    return &s->regs[(s->iford ? IFORD_INT_STATUS : ENC_INT_STATUS) >> 2];
+}
+
 static void sstar_venc_update_irq(SstarVencState *s)
 {
-    qemu_set_irq(s->irq, !!s->regs[ENC_INT_STATUS >> 2]);
+    qemu_set_irq(s->irq, !!*venc_int_status(s));
 }
 
 static hwaddr venc_dram(uint32_t miu16)
 {
-    hwaddr a = (hwaddr)miu16 << 4;
+    hwaddr a = sstar_miu_xlate((hwaddr)miu16 << 4);
 
     return a < SS_DRAM_BASE ? SS_DRAM_BASE + a : a;
 }
 
 /* The register a job's program sets, or 0. */
+/*
+ * A buffer as a bus master sees it: contiguous in MIU addresses, which on
+ * Iford are the MMU's and scattered over DRAM a page at a time.
+ */
+#define VENC_MMU_PAGE       0x1000
+
+static void venc_mem(uint32_t miu16, uint64_t off, void *buf, size_t len,
+                     bool write)
+{
+    uint64_t a = ((uint64_t)miu16 << 4) + off;
+    uint8_t *p = buf;
+
+    while (len) {
+        size_t n = MIN(len, VENC_MMU_PAGE - (a & (VENC_MMU_PAGE - 1)));
+        hwaddr d = sstar_miu_xlate(a);
+
+        d = d < SS_DRAM_BASE ? SS_DRAM_BASE + d : d;
+        dma_memory_rw(&address_space_memory, d, p, n,
+                      write ? DMA_DIRECTION_FROM_DEVICE
+                            : DMA_DIRECTION_TO_DEVICE,
+                      MEMTXATTRS_UNSPECIFIED);
+        a += n;
+        p += n;
+        len -= n;
+    }
+}
+
 static uint32_t venc_prog_reg(hwaddr prog, uint32_t reg)
 {
     uint32_t pair[2];
@@ -276,7 +332,8 @@ static void sstar_venc_report(SstarVencState *s)
     int n;
     uint32_t irq;
 
-    if (!s->rq_len || (s->regs[ENC_INT_STATUS >> 2] & INT_DONE_ANY) ||
+    if (!s->rq_len ||
+        (*venc_int_status(s) & (INT_DONE_ANY | IFORD_FRAME_DONE)) ||
         timer_pending(s->next)) {
         return;
     }
@@ -288,10 +345,11 @@ static void sstar_venc_report(SstarVencState *s)
                                     ~(0x3Fu << 8)) | (s->ctx[n] << 8);
     if (irq == INT_FRAME_DONE) {
         s->regs[CTRL_BS_BITS >> 2] = s->bytes[n] * 8;
-        s->regs[ENC_BS_START >> 2] = s->bs[n];
+        s->regs[(s->iford ? IFORD_BS_START : ENC_BS_START) >> 2] = s->bs[n];
         s->regs[CTRL_BS_END >> 2] = s->bs[n] + DIV_ROUND_UP(s->bytes[n], 16);
     }
-    s->regs[ENC_INT_STATUS >> 2] |= irq;
+    *venc_int_status(s) |= s->iford && irq == INT_FRAME_DONE ?
+                           IFORD_FRAME_DONE : irq;
     sstar_venc_update_irq(s);
 }
 
@@ -524,7 +582,19 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
         len = sizeof(placeholder);
     }
     s->bytes[n] = len;
-    last = venc_ring_write(s, n, prog, out, len);
+    if (s->iford) {
+        /* the job's own output buffer, regs 0x208/0x20C; no ring */
+        uint32_t base = venc_prog_reg(prog, IFORD_PROG_OUT);
+        size_t room = ((size_t)venc_prog_reg(prog, IFORD_PROG_OUT_SIZE) + 1) * 16;
+
+        len = MIN(len, room);
+        s->bytes[n] = len;
+        s->bs[n] = base;
+        venc_mem(base, 0, (void *)out, len, true);
+        last = base + DIV_ROUND_UP(len, 16) - 1;
+    } else {
+        last = venc_ring_write(s, n, prog, out, len);
+    }
     /*
      * The frame's stream goes to the output buffer the driver gave its
      * context (HalVencIosAddOutBuffer, a record of the channel's MI ring
@@ -532,7 +602,7 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
      * the program's own ring, which HalVencDpbDoneFrame checks.  A
      * context's first frame, before any, is reported in the ring.
      */
-    if (s->out_valid & (1ull << s->ctx[n])) {
+    if (!s->iford && (s->out_valid & (1ull << s->ctx[n]))) {
         int c = s->ctx[n];
         size_t room = (size_t)s->out_units[c] * 16;
 
@@ -544,8 +614,8 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
                          out, len, MEMTXATTRS_UNSPECIFIED);
     }
 
-    res = venc_prog_reg(prog, PROG_RESULT);
-    st = venc_prog_reg(prog, PROG_STATUS);
+    res = venc_prog_reg(prog, s->iford ? IFORD_PROG_RESULT : PROG_RESULT);
+    st = venc_prog_reg(prog, s->iford ? IFORD_PROG_STATUS : PROG_STATUS);
     if (st) {
         uint8_t code = STATUS_FRAME, valid = 1;
         uint32_t w[3] = {
@@ -561,6 +631,12 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
 
         dma_memory_write(&address_space_memory, venc_dram(st) + STATUS_BITS,
                          w, sizeof(w), MEMTXATTRS_UNSPECIFIED);
+        if (s->iford) {
+            /* HalMfeOpsEncDone: the reconstruction's ends are further on */
+            dma_memory_write(&address_space_memory,
+                             venc_dram(st) + IFORD_STATUS_REC, &w[1], 8,
+                             MEMTXATTRS_UNSPECIFIED);
+        }
         dma_memory_write(&address_space_memory,
                          venc_dram(st) + STATUS_BS_END, &bs_end, 4,
                          MEMTXATTRS_UNSPECIFIED);
@@ -643,6 +719,385 @@ static void venc_drop_ready(SstarVencState *s)
 }
 #endif
 
+
+/*
+ * Without libavcodec: a small H.264 Baseline writer, CAVLC, poc type 2, no
+ * deblocking.  It codes the job's real source picture (NV12 at the
+ * program's source registers), lossless where it can.  In an IDR a
+ * macroblock is Intra16x16 with no residual when a V, H or DC prediction of
+ * luma and a V or H of chroma reproduce it exactly, and I_PCM otherwise, up
+ * to "LITE_IDR_BUDGET" bytes; past that it is a plain DC, inexact, and left
+ * to the P frames.  A P frame is P_Skip, and I_PCM for what changed, up to
+ * LITE_BUDGET bytes, resuming where the last frame stopped.  A whole-picture
+ * change therefore takes some frames to come through.  It is a picture,
+ * not a rate-controlled encoder: no transform, no motion.
+ */
+#define LITE_BUDGET         (48 * KiB)
+#define LITE_IDR_BUDGET     (360 * KiB)
+
+typedef struct VencLite {
+    int w, h;                   /* in pixels, as the job says */
+    int mbw, mbh;
+    uint32_t cursor;            /* the macroblock to look at next */
+    uint32_t frame_num;
+    uint8_t *y, *uv;            /* source of this frame */
+    uint8_t *rec_y, *rec_uv;    /* what the decoder has, where clean */
+    uint8_t *clean;             /* one per macroblock */
+    uint8_t *nz;                /* its total_coeff for the CAVLC context */
+} VencLite;
+
+static void lite_free(VencLite *l)
+{
+    g_free(l->y);
+    g_free(l->uv);
+    g_free(l->rec_y);
+    g_free(l->rec_uv);
+    g_free(l->clean);
+    g_free(l->nz);
+    g_free(l);
+}
+
+static VencLite *lite_get(SstarVencState *s, int ctx, int w, int h)
+{
+    VencLite *l = s->lite[ctx];
+
+    if (l && l->w == w && l->h == h) {
+        return l;
+    }
+    if (l) {
+        lite_free(l);
+    }
+    l = g_new0(VencLite, 1);
+    l->w = w;
+    l->h = h;
+    l->mbw = (w + 15) / 16;
+    l->mbh = (h + 15) / 16;
+    l->y = g_malloc0(l->mbw * l->mbh * 256);
+    l->uv = g_malloc0(l->mbw * l->mbh * 128);
+    l->rec_y = g_malloc0(l->mbw * l->mbh * 256);
+    l->rec_uv = g_malloc0(l->mbw * l->mbh * 128);
+    l->clean = g_malloc0(l->mbw * l->mbh);
+    l->nz = g_malloc0(l->mbw * l->mbh);
+    s->lite[ctx] = l;
+    return l;
+}
+
+/* The NV12 source; a width's pitch, the driver's alignment to 16 */
+static void lite_load(VencLite *l, uint32_t ya, uint32_t ca)
+{
+    int stride = l->mbw * 16;
+
+    venc_mem(ya, 0, l->y, stride * l->mbh * 16, false);
+    venc_mem(ca, 0, l->uv, stride * l->mbh * 8, false);
+}
+
+static bool lite_changed(VencLite *l, int mb)
+{
+    int mx = mb % l->mbw, my = mb / l->mbw, r, stride = l->mbw * 16;
+    uint8_t *a = l->y + my * 16 * stride + mx * 16;
+    uint8_t *b = l->rec_y + my * 16 * stride + mx * 16;
+    uint8_t *c = l->uv + my * 8 * stride + mx * 16;
+    uint8_t *d = l->rec_uv + my * 8 * stride + mx * 16;
+
+    if (!l->clean[mb]) {
+        return true;
+    }
+    for (r = 0; r < 16; r++) {
+        if (memcmp(a + r * stride, b + r * stride, 16)) {
+            return true;
+        }
+    }
+    for (r = 0; r < 8; r++) {
+        if (memcmp(c + r * stride, d + r * stride, 16)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void lite_pcm(SstarBits *b, VencLite *l, int mb)
+{
+    int mx = mb % l->mbw, my = mb / l->mbw, r, i, stride = l->mbw * 16;
+    uint8_t *y = l->y + my * 16 * stride + mx * 16;
+    uint8_t *uv = l->uv + my * 8 * stride + mx * 16;
+
+    sstar_bits_zero_align(b);
+    for (r = 0; r < 16; r++) {
+        for (i = 0; i < 16; i++) {
+            sstar_bits_put(b, y[r * stride + i], 8);
+        }
+        memcpy(l->rec_y + (my * 16 + r) * stride + mx * 16,
+               y + r * stride, 16);
+    }
+    for (i = 0; i < 2; i++) {
+        for (r = 0; r < 8; r++) {
+            int k;
+
+            for (k = 0; k < 8; k++) {
+                sstar_bits_put(b, uv[r * stride + k * 2 + i], 8);
+            }
+        }
+    }
+    for (r = 0; r < 8; r++) {
+        memcpy(l->rec_uv + (my * 8 + r) * stride + mx * 16,
+               uv + r * stride, 16);
+    }
+    l->clean[mb] = 1;
+    l->nz[mb] = 16;
+}
+
+/* coeff_token for no coefficients, by nC */
+static void lite_no_coeffs(SstarBits *b, VencLite *l, int mb)
+{
+    int mx = mb % l->mbw, my = mb / l->mbw;
+    int na = mx ? l->nz[mb - 1] : -1;
+    int nb = my ? l->nz[mb - l->mbw] : -1;
+    int nc = na >= 0 && nb >= 0 ? (na + nb + 1) >> 1 : na >= 0 ? na :
+             nb >= 0 ? nb : 0;
+
+    if (nc < 2) {
+        sstar_bits_put(b, 1, 1);
+    } else if (nc < 4) {
+        sstar_bits_put(b, 3, 2);
+    } else if (nc < 8) {
+        sstar_bits_put(b, 15, 4);
+    } else {
+        sstar_bits_put(b, 3, 6);
+    }
+}
+
+/* Which Intra16x16 prediction reproduces luma exactly: 0 V, 1 H, 2 DC; -1 */
+static int lite_luma_pred(VencLite *l, int mb)
+{
+    int mx = mb % l->mbw, my = mb / l->mbw, st = l->mbw * 16, r, c;
+    uint8_t *p = l->y + my * 16 * st + mx * 16;
+    bool v = my, h = mx, dc = true;
+    int sum = 0, n = 0, d;
+
+    if (my) {
+        for (c = 0; c < 16; c++) {
+            sum += p[c - st];
+        }
+        n += 16;
+    }
+    if (mx) {
+        for (r = 0; r < 16; r++) {
+            sum += p[r * st - 1];
+        }
+        n += 16;
+    }
+    d = n ? (sum + n / 2) / n : 128;
+    for (r = 0; r < 16; r++) {
+        for (c = 0; c < 16; c++) {
+            uint8_t a = p[r * st + c];
+
+            v = v && a == p[c - st];
+            h = h && a == p[r * st - 1];
+            dc = dc && a == d;
+        }
+    }
+    return v ? 0 : h ? 1 : dc ? 2 : -1;
+}
+
+/* And of chroma: 1 H, 2 V; -1 (DC's four corners are not worth the code) */
+static int lite_chroma_pred(VencLite *l, int mb)
+{
+    int mx = mb % l->mbw, my = mb / l->mbw, st = l->mbw * 16, r, c;
+    uint8_t *p = l->uv + my * 8 * st + mx * 16;
+    bool v = my, h = mx;
+
+    for (r = 0; r < 8; r++) {
+        for (c = 0; c < 16; c++) {
+            v = v && p[r * st + c] == p[c - st];
+            h = h && p[r * st + c] == p[r * st - 2 + (c & 1)];
+        }
+    }
+    return h ? 1 : v ? 2 : -1;
+}
+
+static void lite_mark_exact(VencLite *l, int mb)
+{
+    int mx = mb % l->mbw, my = mb / l->mbw, st = l->mbw * 16, r;
+
+    for (r = 0; r < 16; r++) {
+        memcpy(l->rec_y + (my * 16 + r) * st + mx * 16,
+               l->y + (my * 16 + r) * st + mx * 16, 16);
+    }
+    for (r = 0; r < 8; r++) {
+        memcpy(l->rec_uv + (my * 8 + r) * st + mx * 16,
+               l->uv + (my * 8 + r) * st + mx * 16, 16);
+    }
+    l->clean[mb] = 1;
+}
+
+static void lite_nal(GByteArray *out, int hdr, GByteArray *rbsp)
+{
+    static const uint8_t start[4] = { 0, 0, 0, 1 };
+    uint8_t h = hdr;
+    int zeros = 0;
+    guint i;
+
+    g_byte_array_append(out, start, 4);
+    g_byte_array_append(out, &h, 1);
+    for (i = 0; i < rbsp->len; i++) {
+        uint8_t c = rbsp->data[i];
+
+        if (zeros >= 2 && c <= 3) {
+            static const uint8_t esc = 3;
+
+            g_byte_array_append(out, &esc, 1);
+            zeros = 0;
+        }
+        g_byte_array_append(out, &c, 1);
+        zeros = c ? 0 : zeros + 1;
+    }
+}
+
+static void lite_trailing(SstarBits *b)
+{
+    sstar_bits_put(b, 1, 1);
+    sstar_bits_zero_align(b);
+}
+
+static void lite_sps_pps(GByteArray *out, VencLite *l)
+{
+    GByteArray *r = g_byte_array_new();
+    SstarBits b = { .buf = r };
+    int crop = l->mbh * 16 - l->h, cropw = l->mbw * 16 - l->w;
+
+    sstar_bits_put(&b, 66, 8);              /* Baseline */
+    sstar_bits_put(&b, 0xC0, 8);            /* constrained */
+    sstar_bits_put(&b, 40, 8);
+    sstar_bits_ue(&b, 0);
+    sstar_bits_ue(&b, 0);                   /* frame_num: 4 bits */
+    sstar_bits_ue(&b, 2);                   /* poc type */
+    sstar_bits_ue(&b, 1);                   /* one reference */
+    sstar_bits_put(&b, 0, 1);
+    sstar_bits_ue(&b, l->mbw - 1);
+    sstar_bits_ue(&b, l->mbh - 1);
+    sstar_bits_put(&b, 1, 1);               /* frame_mbs_only */
+    sstar_bits_put(&b, 1, 1);               /* direct_8x8 */
+    sstar_bits_put(&b, crop || cropw, 1);
+    if (crop || cropw) {
+        sstar_bits_ue(&b, 0);
+        sstar_bits_ue(&b, cropw / 2);
+        sstar_bits_ue(&b, 0);
+        sstar_bits_ue(&b, crop / 2);
+    }
+    sstar_bits_put(&b, 0, 1);               /* no VUI */
+    lite_trailing(&b);
+    lite_nal(out, 0x67, r);
+
+    g_byte_array_set_size(r, 0);
+    b = (SstarBits) { .buf = r };
+    sstar_bits_ue(&b, 0);
+    sstar_bits_ue(&b, 0);
+    sstar_bits_put(&b, 0, 2);               /* CAVLC, no field order */
+    sstar_bits_ue(&b, 0);
+    sstar_bits_ue(&b, 0);
+    sstar_bits_ue(&b, 0);
+    sstar_bits_put(&b, 0, 3);
+    sstar_bits_se(&b, 0);
+    sstar_bits_se(&b, 0);
+    sstar_bits_se(&b, 0);
+    sstar_bits_put(&b, 4, 3);               /* deblocking control present */
+    lite_trailing(&b);
+    lite_nal(out, 0x68, r);
+    g_byte_array_free(r, true);
+}
+
+static void lite_encode(SstarVencState *s, int n, hwaddr prog, GByteArray *out)
+{
+    uint32_t size = venc_prog_reg(prog, PROG_SIZE);
+    int w = size & 0xFFFF, h = size >> 16;
+    bool idr = venc_prog_reg(prog, PROG_FRAME) & FRAME_I;
+    VencLite *l;
+    GByteArray *r;
+    SstarBits b;
+    int mbs, mb, order, skip = 0, spent = 0;
+    uint8_t *send;
+
+    if (!w || !h || w > 8192 || h > 8192) {
+        return;
+    }
+    l = lite_get(s, s->ctx[n], w, h);
+    mbs = l->mbw * l->mbh;
+    lite_load(l, venc_prog_reg(prog, s->iford ? IFORD_PROG_SRC_Y : PROG_SRC_Y),
+              venc_prog_reg(prog, s->iford ? IFORD_PROG_SRC_C : PROG_SRC_C));
+    if (idr) {
+        lite_sps_pps(out, l);
+        l->frame_num = 0;
+        memset(l->clean, 0, mbs);
+    }
+    /* which macroblocks a P frame sends, from where the last one stopped */
+    send = g_malloc0(mbs);
+    if (!idr) {
+        for (order = 0; order < mbs && spent + 400 <= LITE_BUDGET; order++) {
+            mb = (l->cursor + order) % mbs;
+            if (lite_changed(l, mb)) {
+                send[mb] = 1;
+                spent += 386;
+            }
+        }
+        l->cursor = (l->cursor + order) % mbs;
+    }
+
+    r = g_byte_array_new();
+    b = (SstarBits) { .buf = r };
+    sstar_bits_ue(&b, 0);
+    sstar_bits_ue(&b, idr ? 7 : 5);
+    sstar_bits_ue(&b, 0);
+    sstar_bits_put(&b, l->frame_num & 15, 4);
+    if (idr) {
+        sstar_bits_ue(&b, 0);
+        sstar_bits_put(&b, 0, 2);           /* marking */
+    } else {
+        sstar_bits_put(&b, 0, 1);           /* no override */
+        sstar_bits_put(&b, 0, 1);           /* no list modification */
+        sstar_bits_put(&b, 0, 1);           /* sliding window */
+    }
+    sstar_bits_se(&b, 0);
+    sstar_bits_ue(&b, 1);                   /* no deblocking */
+    memset(l->nz, 0, mbs);
+    for (mb = 0; mb < mbs; mb++) {
+        if (idr) {
+            int lp = lite_luma_pred(l, mb), cp = lite_chroma_pred(l, mb);
+
+            if (lp >= 0 && cp >= 0) {
+                sstar_bits_ue(&b, 1 + lp);  /* I16x16, no residual */
+                sstar_bits_ue(&b, cp);
+                sstar_bits_se(&b, 0);
+                lite_no_coeffs(&b, l, mb);
+                lite_mark_exact(l, mb);
+            } else if (spent + 400 <= LITE_IDR_BUDGET) {
+                sstar_bits_ue(&b, 25);
+                lite_pcm(&b, l, mb);
+                spent += 386;
+            } else {
+                sstar_bits_ue(&b, 3);       /* DC: wrong, the P frames fix it */
+                sstar_bits_ue(&b, 0);
+                sstar_bits_se(&b, 0);
+                lite_no_coeffs(&b, l, mb);
+            }
+        } else if (send[mb]) {
+            sstar_bits_ue(&b, skip);
+            skip = 0;
+            sstar_bits_ue(&b, 5 + 25);
+            lite_pcm(&b, l, mb);
+        } else {
+            skip++;
+        }
+    }
+    if (skip) {
+        sstar_bits_ue(&b, skip);
+    }
+    lite_trailing(&b);
+    lite_nal(out, idr ? 0x65 : 0x41, r);
+    g_byte_array_free(r, true);
+    g_free(send);
+    l->frame_num++;
+}
+
 /* The job timer, for the earliest pending slot. */
 static void venc_arm(SstarVencState *s)
 {
@@ -693,6 +1148,13 @@ static void sstar_venc_job(void *opaque)
             continue;
         }
 #endif
+        if (!(venc_prog_reg(prog, PROG_CODEC) & CODEC_H265)) {
+            g_autoptr(GByteArray) out = g_byte_array_new();
+
+            lite_encode(s, n, prog, out);
+            venc_finish(s, n, prog, out->data, out->len);
+            continue;
+        }
         venc_finish(s, n, prog, NULL, 0);
     }
     venc_arm(s);
@@ -724,8 +1186,8 @@ static uint32_t sstar_venc_reg_read(SstarVencState *s, hwaddr off)
 
 static void sstar_venc_reg_write(SstarVencState *s, hwaddr off, uint32_t v)
 {
-    if (off == ENC_INT_CLEAR) {
-        s->regs[ENC_INT_STATUS >> 2] &= ~v;
+    if (off == (s->iford ? IFORD_INT_CLEAR : ENC_INT_CLEAR)) {
+        *venc_int_status(s) &= ~v;
         sstar_venc_update_irq(s);
         /*
          * The ISR clears first and goes on with the shared registers (the
@@ -770,7 +1232,7 @@ static void sstar_venc_reg_write(SstarVencState *s, hwaddr off, uint32_t v)
             s->done = 0;
             s->rq_len = 0;
             timer_del(s->job);
-            s->regs[ENC_INT_STATUS >> 2] = 0;
+            *venc_int_status(s) = 0;
             sstar_venc_update_irq(s);
         }
         break;
@@ -882,6 +1344,7 @@ static const Property sstar_venc_props[] = {
     DEFINE_PROP_UINT32("done-us", SstarVencState, done_us, 10000),
     DEFINE_PROP_STRING("dump", SstarVencState, dump),
     DEFINE_PROP_BOOL("trace", SstarVencState, trace, false),
+    DEFINE_PROP_BOOL("iford", SstarVencState, iford, false),
 };
 
 static const VMStateDescription vmstate_sstar_venc_report = {

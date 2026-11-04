@@ -101,6 +101,8 @@ cp qemu/hw/arm/sigmastar.c          "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/sigmastar.h  "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/sstar-riu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-riu.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/sstar-xzdec.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/sstar-iford-isp.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/intc/sstar-intc.c        "$QEMU_DIR/hw/intc/"
 cp qemu/hw/timer/sstar-timer.c      "$QEMU_DIR/hw/timer/"
 cp qemu/hw/char/sstar-uart.c        "$QEMU_DIR/hw/char/"
@@ -114,6 +116,7 @@ cp qemu/hw/usb/sstar-uhc.c          "$QEMU_DIR/hw/usb/"
 cp qemu/hw/misc/sstar-vpu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-crypto.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/rtc/sstar-rtc.c          "$QEMU_DIR/hw/rtc/"
+cp qemu/hw/rtc/sstar-rtcpwc.c       "$QEMU_DIR/hw/rtc/"
 cp qemu/hw/misc/sstar-vip-gamma.c   "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-i3-isp.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-i3-isp.h "$QEMU_DIR/include/hw/misc/"
@@ -128,6 +131,9 @@ cp qemu/hw/i2c/sstar-i2c.c          "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/misc/sstar-venc.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-isp.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-vif.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-xzdec.c       "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-iford-scl.c   "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-iford-isp.c   "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-jpe.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-bach.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-i3-bach.c     "$QEMU_DIR/hw/misc/"
@@ -241,6 +247,7 @@ cp qemu/include/hw/i2c/hisi-soi.h   "$QEMU_DIR/include/hw/i2c/"
 cp qemu/include/hw/i2c/image-sensor.h "$QEMU_DIR/include/hw/i2c/"
 cp qemu/hw/i2c/image-sensor.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/imx323.c             "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/os04d10.c            "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-sp2305.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-mis2006.c      "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-nvp6124b.c     "$QEMU_DIR/hw/i2c/"
@@ -577,7 +584,7 @@ config SIGMASTAR
 KCONFIG
     echo "  hw/arm/Kconfig: added SIGMASTAR"
 else
-    for sym in A15MPCORE DS1338 ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C SD; do
+    for sym in A15MPCORE DS1338 ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C SD OR_IRQ; do
         if ! sed -n '/^config SIGMASTAR$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config SIGMASTAR\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -586,7 +593,7 @@ else
         fi
     done
 fi
-for f in misc/sstar-riu misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+for f in rtc/sstar-rtcpwc i2c/os04d10 misc/sstar-iford-scl misc/sstar-iford-isp misc/sstar-riu misc/sstar-xzdec misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

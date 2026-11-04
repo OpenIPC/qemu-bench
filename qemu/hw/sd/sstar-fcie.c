@@ -47,7 +47,7 @@
  * (_BUF_CIFD_WaitEvent): a read fills the buffer and raises WBUF_FULL,
  * the driver takes it and writes WBUF_EMPTY_TRIG for the next 64; a
  * write is taken from the buffer on RBUF_FULL_TRIG, which raises
- * RBUF_EMPTY.  ADMA (descriptor tables) is not modelled.
+ * RBUF_EMPTY.  ADMA, below, walks descriptor tables.
  *
  * The card detect, PM_SD_CDZ, is in sstar-i3-gpio: the machine sets its
  * "sd-card" when a card is attached.
@@ -94,6 +94,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarFcieState, SSTAR_FCIE)
 #define MIE_DATA_END        (1u << 0)
 #define MIE_CMD_END         (1u << 1)
 #define MIE_ERR_STS         (1u << 2)
+#define MIE_BUSY_END        (1u << 4)
 #define MIE_EVENTS          0x003F
 
 #define MODE_DEST_R2N       (1u << 4)
@@ -105,6 +106,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarFcieState, SSTAR_FCIE)
 #define CTL_JOB_DIR         (1u << 4)
 #define CTL_ADMA_EN         (1u << 5)
 #define CTL_JOB_START       (1u << 6)
+#define CTL_BUSY_DET_ON     (1u << 8)
 
 #define STS_WR_TOUT         (1u << 2)
 #define STS_CMD_NORSP       (1u << 3)
@@ -215,10 +217,10 @@ static void fcie_cifd_fill(SstarFcieState *s)
  * stops sending or taking data before the job's length, or when the DMA
  * finds nothing at the address.
  */
-static void fcie_dma(SstarFcieState *s, uint32_t len, bool write)
+static bool fcie_xfer(SstarFcieState *s, hwaddr addr, uint32_t len,
+                      bool write)
 {
     uint8_t buf[4096];
-    hwaddr addr = fcie_dma_addr(s);
     uint32_t n;
     MemTxResult r;
 
@@ -249,9 +251,51 @@ static void fcie_dma(SstarFcieState *s, uint32_t len, bool write)
                       write ? "write" : "read", len, addr);
         s->regs[R_SD_STS] |= write ? STS_WR_TOUT : STS_RD_TOUT;
         s->regs[R_MIE_EVENT] |= MIE_ERR_STS;
-        return;
+        return false;
     }
-    s->regs[R_MIE_EVENT] |= MIE_DATA_END;
+    return true;
+}
+
+static void fcie_dma(SstarFcieState *s, uint32_t len, bool write)
+{
+    if (fcie_xfer(s, fcie_dma_addr(s), len, write)) {
+        s->regs[R_MIE_EVENT] |= MIE_DATA_END;
+    }
+}
+
+/*
+ * ADMA (Iford's driver, hal_sdmmc_v5.c Hal_SDMMC_ADMASetting): the DMA
+ * address names a table of 16-byte descriptors: word 0 bit 0 the last one,
+ * word 1 the buffer, word 2 its length.  [31:16] of word 0, the blocks, say
+ * the same as the length.
+ */
+#define ADMA_MAX_DESC       512
+
+static void fcie_adma(SstarFcieState *s, bool write)
+{
+    hwaddr table = fcie_dma_addr(s);
+    int n;
+
+    for (n = 0; n < ADMA_MAX_DESC; n++) {
+        uint32_t d[4];
+        hwaddr a;
+
+        if (dma_memory_read(&address_space_memory, table + n * sizeof(d), d,
+                            sizeof(d), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            break;
+        }
+        a = le32_to_cpu(d[1]);
+        a = a < DRAM_BASE ? DRAM_BASE + a : a;
+        if (!fcie_xfer(s, a, le32_to_cpu(d[2]), write)) {
+            return;
+        }
+        if (le32_to_cpu(d[0]) & 1) {
+            s->regs[R_MIE_EVENT] |= MIE_DATA_END;
+            return;
+        }
+    }
+    s->regs[R_SD_STS] |= write ? STS_WR_TOUT : STS_RD_TOUT;
+    s->regs[R_MIE_EVENT] |= MIE_ERR_STS;
 }
 
 static void fcie_data(SstarFcieState *s, uint16_t ctl)
@@ -260,9 +304,7 @@ static void fcie_data(SstarFcieState *s, uint16_t ctl)
     bool write = ctl & CTL_JOB_DIR;
 
     if (ctl & CTL_ADMA_EN) {
-        qemu_log_mask(LOG_UNIMP, "sstar-fcie: ADMA job not modelled\n");
-        s->regs[R_SD_STS] |= write ? STS_WR_TOUT : STS_RD_TOUT;
-        s->regs[R_MIE_EVENT] |= MIE_ERR_STS;
+        fcie_adma(s, write);
         return;
     }
     if (!len) {
@@ -374,6 +416,10 @@ static void fcie_write16(SstarFcieState *s, unsigned bank, unsigned reg,
         s->regs[reg] = val & ~CTL_JOB_START;
         if (val & CTL_JOB_START) {
             fcie_job(s, val);
+        }
+        /* waits for DAT0 to rise (_REG_WaitDat0HI): the card is never busy */
+        if (val & CTL_BUSY_DET_ON) {
+            s->regs[R_MIE_EVENT] |= MIE_BUSY_END;
         }
         break;
     case R_FCIE_RST:

@@ -48,6 +48,7 @@ struct SstarIspState {
 
     MemoryRegion iomem;
     qemu_irq irq;
+    qemu_irq frame_out;         /* pulsed just before a frame's events */
     QEMUTimer *frame;
     uint16_t regs[ISP_REGS];
     uint32_t frames;
@@ -103,6 +104,7 @@ static void sstar_isp_frame(void *opaque)
     int g;
 
     s->frames++;
+    qemu_irq_pulse(s->frame_out);
     for (g = 0; g < INT_GROUPS; g++) {
         s->regs[INT_STATUS(g)] |= s->events[g];
     }
@@ -205,6 +207,7 @@ static void sstar_isp_init(Object *obj)
                           TYPE_SSTAR_ISP, ISP_REGS * 4);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->frame_out, "frame", 1);
 }
 
 static const Property sstar_isp_props[] = {

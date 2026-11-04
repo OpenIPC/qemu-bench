@@ -44,6 +44,7 @@ through the menuload, the test pattern with the ISP off).
 import re
 import argparse
 import base64
+import lzma
 import atexit
 import os
 import shutil
@@ -53,9 +54,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 RIU = 0x1F000000
 IMI = 0xA0000000
+DDR = 0x20000000
 DRAM = 0x20000000
 XIU = 0x14000000
 
@@ -98,13 +101,16 @@ class QTest:
         srv.settimeout(20)
         self.sock, _ = srv.accept()
         self.f = self.sock.makefile('rw', buffering=1)
+        self.irqs = []
 
     def cmd(self, line):
         self.f.write(line + '\n')
         self.f.flush()
         while True:
             r = self.f.readline().strip()
-            if r.startswith(('OK', 'FAIL', 'ERR')):
+            if r.startswith('IRQ'):
+                self.irqs.append(r)
+            elif r.startswith(('OK', 'FAIL', 'ERR')):
                 return r
 
     def writel(self, a, v):
@@ -1425,6 +1431,485 @@ def test_migration(qemu, tmp, path):
           True)
 
 
+def sxz_rc_literals(data, pb=2):
+    """LZMA2 chunk of literals as the vendor's sz codes them: direct bits."""
+    low, rng, cache, cache_size, out = 0, 0xFFFFFFFF, 0, 1, bytearray()
+    prob = [1024] * (12 * 16)
+
+    def shift():
+        nonlocal low, cache, cache_size
+        if low < 0xFF000000 or low >= 1 << 32:
+            carry = low >> 32
+            byte = cache
+            while cache_size:
+                out.append((byte + carry) & 0xFF)
+                byte = 0xFF
+                cache_size -= 1
+            cache = (low >> 24) & 0xFF
+        cache_size += 1
+        low = (low << 8) & 0xFFFFFFFF
+
+    def norm():
+        nonlocal rng
+        while rng < 1 << 24:
+            rng = (rng << 8) & 0xFFFFFFFF
+            shift()
+
+    for pos, byte in enumerate(data):
+        i = pos & ((1 << pb) - 1)           # state 0: is_match is 0
+        bound = (rng >> 11) * prob[i]
+        rng = bound
+        prob[i] += (2048 - prob[i]) >> 5
+        norm()
+        for bit in range(7, -1, -1):
+            rng >>= 1
+            if (byte >> bit) & 1:
+                low += rng
+            norm()
+    for _ in range(5):
+        shift()
+    packed = bytes(out)
+    un, pk = len(data) - 1, len(packed) - 1
+    return bytes([0xE0 | (un >> 16), (un >> 8) & 0xFF, un & 0xFF,
+                  pk >> 8, pk & 0xFF, 0x5D]) + packed + b'\0'
+
+
+def sxz_vli(v):
+    out = bytearray()
+    while v >= 0x80:
+        out.append((v & 0x7F) | 0x80)
+        v >>= 7
+    out.append(v)
+    return bytes(out)
+
+
+def sxz_block(data, stored):
+    """An XZ block: header, LZMA2, padding, CRC32 of the unpacked data."""
+    if stored:
+        lz = bytes([1, (len(data) - 1) >> 8, (len(data) - 1) & 0xFF]) + data + b'\0'
+    else:
+        lz = sxz_rc_literals(data)
+    hdr = b'\xC0' + sxz_vli(len(lz)) + sxz_vli(len(data)) + b'\x21\x01\x00'
+    hdr = bytes([4]) + hdr
+    hdr = hdr.ljust(16, b'\0')
+    hdr += struct.pack('<I', zlib.crc32(hdr))
+    return hdr + lz + bytes(-len(lz) & 3) + struct.pack('<I', zlib.crc32(data))
+
+
+def sxz_file(blocks):
+    """The vendor's multi-core file: the blocks round-robin in 0x20 chunks."""
+    head = b'sstarXZ' + bytes([len(blocks), 0x20])
+    for packed, data in blocks:
+        head += sxz_vli(len(packed)) + sxz_vli(len(data))
+    head = head.ljust((len(head) + 15) & ~15, b'\0')
+    body, off, more = bytearray(), 0, True
+    while more:
+        more = False
+        for packed, _ in blocks:
+            if off < len(packed):
+                body += packed[off:off + 0x20].ljust(0x20, b'\0')
+                more = True
+        off += 0x20
+    return head + bytes(body) + b'SZ'
+
+
+def test_ssc029_rtcpwc(qemu, tmp):
+    print('ssc029: RTC, the alarm, power down and wake on it')
+    path = os.path.join(tmp, 'iford-rtc.bin')
+    img = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    open(path, 'wb').write(img.ljust(0x1000000, b'\xFF'))
+    qt = QTest(qemu, 'ssc029,flash-file=' + path, ['-rtc', 'clock=vm'])
+    pwc = riu(0x0034, 0)
+    iso = lambda: (qt.writew(pwc + 0x30 * 4, 1), qt.writew(pwc + 0x32 * 4, 1))
+
+    def write32(flag, val):
+        qt.writew(pwc + 0x04 * 4, val & 0xFFFF)
+        qt.writew(pwc + 0x05 * 4, val >> 16)
+        qt.writew(pwc + 0x00 * 4, flag)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+
+    def count():
+        qt.writew(pwc + 0x0E * 4, 1)
+        return qt.readw(pwc + 0x0C * 4) | qt.readw(pwc + 0x0D * 4) << 16
+
+    def alarm_int():
+        return qt.readw(pwc + 0x08 * 4) >> 1 & 1
+
+    try:
+        check('RTC: its 32 kHz clock', qt.readw(pwc + 0x13 * 4) & 2, 2)
+        qt.writew(pwc + 0x30 * 4, 1)
+        check('RTC: ISO acks', qt.readw(pwc + 0x31 * 4) & 1, 1)
+        qt.writew(pwc + 0x32 * 4, 1)
+        check('RTC: and clears', qt.readw(pwc + 0x31 * 4) & 1, 0)
+        write32(1 << 1, 0x12345678)
+        qt.writew(pwc + 0x00 * 4, 1 << 2)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+        check('RTC: the base reads back',
+              qt.readw(pwc + 0x0A * 4) << 16 | qt.readw(pwc + 0x09 * 4),
+              0x12345678)
+        write32(1 << 5, 0xBABE)
+        qt.writew(pwc + 0x00 * 4, 1 << 7)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+        check('RTC: SW0 reads back', qt.readw(pwc + 0x09 * 4), 0xBABE)
+        write32(1 << 3, 0)
+        qt.step(3 * 10 ** 9)
+        check('RTC: the counter counts seconds', count(), 3)
+
+        qt.writew(riu(0x1009, 0x54), 0xFEFF)        # MS_IRQ 8: SPI 40
+        qt.writew(pwc + 0x01 * 4, 1 << 2)
+        write32(1 << 4, 5)
+        check('RTC: alarm enabled', qt.readw(pwc + 0x08 * 4) & 1, 1)
+        qt.step(10 ** 9)
+        check('RTC: not yet', alarm_int(), 0)
+        qt.step(10 ** 9)
+        check('RTC: the alarm at second 5', alarm_int(), 1)
+        check('RTC: on MS_IRQ 8', qt.readw(riu(0x1009, 0x5C)) >> 8 & 1, 1)
+        qt.writew(pwc + 0x01 * 4, (1 << 2) | (1 << 3))
+        iso()
+        qt.writew(pwc + 0x01 * 4, 1 << 2)
+        check('RTC: the alarm clears', alarm_int(), 0)
+
+    finally:
+        qt.close()
+
+    # Power down pauses the guest's clock, so this runs on the host's.
+    qt = QTest(qemu, 'ssc029,flash-file=' + path, [])
+    try:
+        write32(1 << 1, 0x12345678)
+        write32(1 << 3, 0)
+        qt.writew(pwc + 0x01 * 4, 1 << 2)
+        write32(1 << 4, 2)
+        # sram_suspend_imi's last steps
+        qt.writew(riu(0x0600, 1), 8)
+        qt.writew(riu(0x1659, 0x0D), 0x5A)
+        qt.writeb(pwc + 0x0F * 4, 0)
+        qt.writew(pwc + 0x32 * 4, 1)
+        check('power down: not awake before its alarm',
+              qt.readw(riu(0x1659, 0x0D)) & 0xFF, 0x5A)
+        time.sleep(3)
+        check('power down: the alarm reset the chip',
+              qt.readw(riu(0x1659, 0x0D)) & 0xFF != 0x5A, True)
+        check('power down: the warm-reset flag survives',
+              qt.readw(riu(0x0600, 1)) & 8, 8)
+        check('power down: the alarm is pending', alarm_int(), 1)
+        qt.writew(pwc + 0x00 * 4, 1 << 2)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+        check('power down: the RTC domain keeps its base',
+              qt.readw(pwc + 0x0A * 4) << 16 | qt.readw(pwc + 0x09 * 4),
+              0x12345678)
+    finally:
+        qt.close()
+
+
+# CPU0 sets CPU1's entry in smpctrl and wakes it Non-secure; CPU1 stores
+# 0x5A000000 | MPIDR.Aff0 << 8 | its mode at 0x20100000, then both idle.
+IFORD_SMP_IPL = bytes.fromhex(
+    '060000ea49504c5f000200000000000000000000000000000000000000000000'
+    '84009fe584109fe52128a0e14c2080e50128a0e12228a0e1502080e50c20a0e3'
+    '542080e503f020e3fdffffea0000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '2c009fe500100fe11f1001e2b02f10ee032002e2021481e15a24a0e3021081e1'
+    '001080e503f020e3fdffffea0040201f800000a000001020')
+
+
+def test_ssc029_smp(qemu, tmp):
+    print('ssc029: CPU1 wakes through smpctrl')
+    path = os.path.join(tmp, 'iford-smp.bin')
+    open(path, 'wb').write(IFORD_SMP_IPL.ljust(0x1000000, b'\xFF'))
+    p = subprocess.Popen([qemu, '-M', 'ssc029,flash-file=' + path,
+                          '-display', 'none', '-nodefaults',
+                          '-monitor', 'stdio'], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True)
+    time.sleep(2)
+    out, _ = p.communicate('xp /1xw 0x20100000\nquit\n', timeout=30)
+    m = re.search(r'0000000020100000: (0x[0-9a-f]+)', out)
+    check('CPU1 ran from the address in smpctrl, Non-secure SVC or lower',
+          m and int(m.group(1), 16) & 0xFFFFFF00, 0x5A000100)
+
+
+def test_ssc029(qemu, tmp):
+    print('ssc029 (Iford): GICv3, the boot FSP, the DRAM test and the XZ decoder')
+    path = os.path.join(tmp, 'iford.bin')
+    img = bytearray(b'\xFF' * 0x1000000)
+    img[0:12] = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    for i in range(0x10, 0x200):
+        img[i] = i & 0xFF
+    img[0x1234:0x1238] = b'NOR!'
+    open(path, 'wb').write(img)
+    qt = QTest(qemu, 'ssc029,flash-file=' + path, [])
+    try:
+        qt.cmd('irq_intercept_out /machine/intc')
+        check('IPL in IMI', qt.readl(IMI + 4), 0x5F4C5049)
+        check('GICv3: GICD_TYPER names 224 SPIs', qt.readl(0x16000004) & 0x1F, 7)
+        check('GICv3: redistributor at the DTS address',
+              qt.readl(0x16040008) & 0xFF != 0xFF, True)
+        check('boot FSP is at bank 0x100D: done clears',
+              qt.readw(riu(0x100D, 0x6E)) & 1, 0)
+        # the DMA that overwrote the IPL when IMI addresses wrapped at 64 KiB
+        qt.writel(IMI + 0x980, 0xC0FFEE00)
+        st = bdma_run(qt, 0, 0x0005, 0x1234, 0x10980, 4, misc=0x2000)
+        check('BDMA SPI -> IMI above 64 KiB done', st & 8, 8)
+        check('and lands there', qt.readl(IMI + 0x10980), 0x21524F4E)
+        check('not 64 KiB below it', qt.readl(IMI + 0x980), 0xC0FFEE00)
+        a = riu(0x1668, 0x50)
+        check('DRAM test idle', qt.readw(riu(0x1668, 0x59)) & 7, 0)
+        qt.writew(a, 1)
+        check('DRAM test passes', qt.readw(riu(0x1668, 0x59)) & 7, 4)
+        qt.writew(riu(0x1659, 0x00), 0x30)
+        check('MIU MMU: reset says its RAMs are up',
+              qt.readw(riu(0x1659, 0x00)) & 0x3000, 0x3000)
+        check('MIU: 128 MiB', qt.readw(riu(0x1659, 0x0D)) & 0xFF, 7)
+        qt.writew(riu(0x0042, 0x3F), 0)
+        check('SDIO FCIE reset acknowledged',
+              qt.readw(riu(0x0042, 0x3F)) & 0xE, 0xE)
+
+        # MIU -> XZ decoder (port 6): the output's address is in 16-byte units
+        def unpack(file, dsts):
+            file = file + bytes(-len(file) & 3)
+            for i in range(0, len(file), 4):
+                qt.writel(DDR + 0x200000 + i,
+                          struct.unpack_from('<I', file, i)[0])
+            xz = riu(0x11D7, 0)
+            qt.writew(xz + 0x01 * 4, 7)
+            qt.writew(xz + 0x01 * 4, 0)
+            for n, dst in enumerate(dsts):
+                out = riu(0x11DC, 0x06 + 0x20 * n)
+                qt.writew(out, (dst >> 4) & 0xFFFF)
+                qt.writew(out + 4, dst >> 20)
+            qt.writew(xz, 3)
+            bdma_run(qt, 0, 0x0600, 0x200000, 0, len(file))
+            return qt.readw(riu(0x11D7, 0x13)), qt.readw(riu(0x11D7, 0x1B))
+
+        data = [bytes(range(64)) * 3, b'SigmaStar direct literals. ' * 9]
+        st, ok = unpack(sxz_file([(sxz_block(data[0], True), data[0]),
+                                  (sxz_block(data[1], False), data[1])]),
+                        [0x300000, 0x310000])
+        check('XZ: two blocks done', st, 2)
+        check('XZ: their CRCs passed', ok & 0xF, 0xF)
+        check('XZ: stored block in DRAM', qt.readl(DDR + 0x300000 + 64),
+              struct.unpack_from('<I', data[0], 64)[0])
+        check('XZ: LZMA literals in DRAM', qt.readl(DDR + 0x310000 + 4),
+              struct.unpack_from('<I', data[1], 4)[0])
+
+        bad = bytearray(sxz_block(data[1], False))
+        bad[-1] ^= 1
+        st, ok = unpack(sxz_file([(bytes(bad), data[1])]), [0x320000])
+        check('XZ: a bad CRC still ends', st, 1)
+        check('XZ: and fails its check', ok, 0)
+        check('XZ: and writes nothing', qt.readl(DDR + 0x320000), 0)
+        st, ok = unpack(b'not an sxz file'.ljust(0x80, b'x'), [0x320000])
+        check('XZ: a stranger is refused', (st, ok), (1, 0))
+
+        # plain .xz, as a stock xz writes it: real literals, control 0x07
+        def unpack_plain(file, dst):
+            xz = riu(0x11D7, 0)
+            qt.writew(xz + 0x02 * 4, len(file) & 0xFFFF)
+            qt.writew(xz + 0x03 * 4, len(file) >> 16)
+            out = riu(0x11DC, 0x06)
+            qt.writew(out, (dst >> 4) & 0xFFFF)
+            qt.writew(out + 4, dst >> 20)
+            pad = file + bytes(-len(file) & 3)
+            for i in range(0, len(pad), 4):
+                qt.writel(DDR + 0x200000 + i,
+                          struct.unpack_from('<I', pad, i)[0])
+            qt.writew(xz, 7)
+            bdma_run(qt, 0, 0x0600, 0x200000, 0, len(pad))
+            return qt.readw(riu(0x11D7, 0x13)), qt.readw(riu(0x11D7, 0x1B))
+
+        text = (b'plain xz needs its context literals, ' * 40 +
+                bytes((i * i) & 0xFF for i in range(256)))
+        for name, check_id in (('CRC64', lzma.CHECK_CRC64),
+                               ('CRC32', lzma.CHECK_CRC32)):
+            st, ok = unpack_plain(lzma.compress(text, check=check_id),
+                                  0x340000)
+            check('plain XZ %s: done' % name, st, 1)
+            check('plain XZ %s: its check passed' % name, ok & 3, 3)
+            check('plain XZ %s: the text in DRAM' % name,
+                  qt.readl(DDR + 0x340000 + 4),
+                  struct.unpack_from('<I', text, 4)[0])
+            check('plain XZ %s: its tail in DRAM' % name,
+                  qt.readl(DDR + 0x340000 + len(text) - 4),
+                  struct.unpack_from('<I', text, len(text) - 4)[0])
+            qt.writel(DDR + 0x340000 + 4, 0)
+        odd = bytearray(lzma.compress(text))
+        odd[len(odd) // 2] ^= 1
+        st, ok = unpack_plain(bytes(odd), 0x350000)
+        check('plain XZ: damage fails its check', (st, ok & 3), (1, 0))
+
+        # the main intc: XZ's line (MS_IRQ 54, GIC SPI 86) stays behind it
+        unpack_plain(lzma.compress(text), 0x340000)
+        def line(n):
+            qt.step(1)
+            up = [i for i in qt.irqs if i.split()[-1] == str(n)]
+            return bool(up) and up[-1].startswith('IRQ raise')
+
+        check('intc: Iford\'s upper lines come out masked',
+              qt.readw(riu(0x1009, 0x5B)), 0xFFFF)
+        check('intc: XZ raw high', qt.readw(riu(0x1009, 0x5C + 3)) >> 6 & 1, 1)
+        check('intc: masked, nothing out', line(54), False)
+        qt.writew(riu(0x1009, 0x54 + 3), 0xFFBF)
+        check('intc: unmasked, it leaves for SPI 86', line(54), True)
+        qt.writew(riu(0x1009, 0x54 + 3), 0xFFFF)
+        check('intc: masked again, it stops', line(54), False)
+
+        # the MIU MMU: 32 KiB pages, VPA region 8 (MIU 0x40000000), PA 0
+        mmu = riu(0x1659, 0)
+        qt.writew(mmu + 0x01 * 4, 0x0008)
+        for vpa, pa in ((0, 0x800), (1, 0x7FF)):    # out of order in DRAM
+            qt.writew(mmu + 0x03 * 4, pa)
+            qt.writew(mmu + 0x02 * 4, 0x8000 | vpa)
+            qt.writew(mmu + 0x0A * 4, 3)
+        qt.writew(mmu, 1)
+        qt.writel(0x60000010, 0x5AFE0001)
+        qt.writel(0x60008010, 0x5AFE0002)
+        check('MMU: the CPU window reaches page 0x800',
+              qt.readl(DDR + 0x04000010), 0x5AFE0001)
+        check('MMU: and the next VPA page 0x7FF, not 0x801',
+              qt.readl(DDR + 0x03FF8010), 0x5AFE0002)
+        check('MMU: reads back through the window',
+              qt.readl(0x60008010), 0x5AFE0002)
+
+        # the scaler's frame reaches that MMU memory, in order, across pages
+        scl = riu(0x1253, 0)
+        qt.writew(scl + 0x02 * 4, 0x50)             # 1280
+        qt.writew(scl + 0x03 * 4, 16)
+        qt.writew(scl + 0x05 * 4, 0x500)
+        qt.writew(scl + 0x06 * 4, 0)                # Y: MIU 0x40000000
+        qt.writew(scl + 0x07 * 4, 0x400)
+        qt.writew(scl + (0x20 + 0x06) * 4, 0x0200)  # C: 8 KiB on
+        qt.writew(scl + (0x20 + 0x07) * 4, 0x400)
+        qt.writew(scl, 0x10)
+        check('SCL: a frame in the Y buffer, not blank',
+              qt.readl(0x60000000) != 0, True)
+        check('SCL: chroma is the scene\'s, not zero',
+              qt.readb(0x60002000) != 0, True)
+
+        # The image pipe: sensor, statistics, white balance, the scaler.  The
+        # ISP's frame clock, group 0 bit 12, with the stats grids the driver
+        # sets; the sensor's exposure over I2C, as the vendor's AE writes it.
+        qt.writew(mmu, 0)
+        st = riu(0x131B, 0)
+        ae, awb, histo = 0x500000, 0x501000, 0x509700
+        for reg, base in ((0x08, ae), (0x0A, awb), (0x0C, histo)):
+            qt.writew(st + reg * 4, (base >> 4) & 0xFFFF)
+            qt.writew(st + (reg + 1) * 4, base >> 20)
+        for reg, val in ((0x30, 79), (0x31, 44), (0x32, 31), (0x33, 31),
+                         (0x40, 19), (0x41, 15), (0x42, 127), (0x43, 89),
+                         (0x02, 0x1111)):
+            qt.writew(st + reg * 4, val)
+
+        def sensor(page, reg, val):
+            i2c = 0x1F222A00
+            for r, v in ((0xFD, page), (reg, val)):
+                qt.writew(i2c + 0x00 * 4, 0)
+                qt.writeb(i2c + 0x01 * 4, 1)
+                for b in (0x3C << 1, r, v):
+                    qt.writew(i2c + 0x02 * 4, b)
+                qt.writeb(i2c + 0x01 * 4 + 1, 1)
+
+        def frame():
+            qt.step(50000000)
+
+        def means():
+            d = [qt.readb(DDR + ae + 4 * i + 3) for i in range(32 * 32)]
+            return sum(d) / len(d), max(d)
+
+        def expose(lines):
+            sensor(1, 0x03, lines >> 8)
+            sensor(1, 0x04, lines & 0xFF)
+            frame()
+
+        qt.writew(riu(0x1302, 0x28), 0xEFFF)
+        expose(50)
+        low, _ = means()
+        check('ISP: AE statistics reach DRAM', low > 0, True)
+        expose(100)
+        high, peak = means()
+        check('ISP: twice the rows, twice the mean Y (%.1f, %.1f)' %
+              (low, high), 1.7 < high / low < 2.3, True)
+        check('ISP: the logo is brighter than the mean', peak > high * 2, True)
+        expose(1500)
+        rgb = [qt.readb(DDR + awb + 3 * (128 * 80 + 2) + c) for c in range(3)]
+        check('ISP: AWB at the wedge\'s band, the light\'s colour %r' % rgb,
+              rgb[1] > rgb[2] > rgb[0] > 0, True)
+        bins = [qt.readw(DDR + histo + 2 * i) for i in range(128)]
+        check('ISP: the histogram counts AWB\'s 128 x 90 blocks', sum(bins),
+              128 * 90)
+        check('ISP: histogram 1 likewise',
+              sum(qt.readw(DDR + histo + 0x200 + 2 * i) for i in range(128)),
+              128 * 90)
+
+        def chroma():
+            """U, V of the band at the foot of the picture, through SCL"""
+            qt.writew(scl + 0x03 * 4, 720)
+            for n, a in ((0, 0x600000), (0x20, 0x700000)):
+                qt.writew(scl + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+                qt.writew(scl + (n + 0x07) * 4, a >> 20)
+            frame()
+            qt.writew(scl, 0x10)
+            o = DDR + 0x700000 + 330 * 0x500 + 8
+            return qt.readb(o), qt.readb(o + 1)
+
+        wbg = riu(0x1312, 0)
+        qt.writew(wbg + 0x40 * 4, 0)
+        u, v = chroma()
+        check('ISP: gains off, the band keeps the light\'s tint (%d, %d)' %
+              (u, v), v < 124 or u > 132, True)
+        qt.writew(wbg + 0x41 * 4, 2089)
+        qt.writew(wbg + 0x44 * 4, 1024)
+        qt.writew(wbg + 0x47 * 4, 1024)
+        qt.writew(wbg + 0x4A * 4, 1765)
+        qt.writew(wbg + 0x40 * 4, 1)
+        u, v = chroma()
+        check('ISP: WBG takes the 5000 K tint out (%d, %d)' % (u, v),
+              abs(u - 128) <= 2 and abs(v - 128) <= 2, True)
+
+        # VIF's write DMA: a queued buffer takes the frame
+        wd, di = riu(0x1358, 0), riu(0x130C, 0)
+        qt.writew(wd + 0x04 * 4, 3200 // 16)
+        qt.writew(wd, 1)
+        qt.writew(wd + 0x06 * 4, (0x800000 >> 4) & 0xFFFF)
+        qt.writew(wd + 0x07 * 4, 0x800000 >> 20)
+        qt.writeb(wd + 0x0C * 4 + 1, 1)
+        qt.writew(wd, 0x11)
+        check('WDMA: the buffer in the FIFO', qt.readw(wd + 0x0E * 4) & 7, 1)
+        qt.writew(di + 0x03 * 0, 0xFFFE)
+        qt.step(50000000)
+        check('WDMA: the frame\'s end raised', qt.readw(di + 0x03 * 4) & 1, 1)
+        check('WDMA: and its start', qt.readw(di + 0x17 * 4) & 1, 1)
+        check('WDMA: the FIFO emptied', qt.readw(wd + 0x0E * 4) & 7, 0)
+        qt.writeb(wd + 0x0C * 4 + 1, 0)
+        check('WDMA: reports the buffer done',
+              qt.readw(wd + 0x0E * 4) | qt.readw(wd + 0x0F * 4) << 16,
+              0x800000 >> 4)
+        check('WDMA: Bayer data at the row of the logo',
+              any(qt.readl(DDR + 0x800000 + 700 * 3200 + x) for x in
+                  range(800, 2400, 80)), True)
+        qt.writew(di + 0x02 * 4, 1)
+        check('WDMA: the status clears', qt.readw(di + 0x03 * 4) & 1, 0)
+
+        # the IPU's supply and space, the RNG
+        chip = riu(0x101E, 0x6C)
+        qt.writew(chip, 1)
+        check('IPU: the supply reads up', qt.readw(chip) & 0x100, 0x100)
+        qt.writew(chip, 0x11)
+        check('IPU: power off takes it down', qt.readw(chip) & 0x100, 0)
+        qt.writew(chip, 0)
+        qt.writel(0x19000000 + 0x1360000 - 0x1000000 + 0xA4, 0x4000)
+        check('IPU: its registers hold (storage: no block behind them)',
+              qt.readl(0x19000000 + 0x1360000 - 0x1000000 + 0xA4), 0x4000)
+        check('RNG: ready', qt.readw(riu(0x112F, 0x23)) >> 15, 1)
+        a = [qt.readw(riu(0x112F, 0x22)) for i in range(8)]
+        check('RNG: its words change', len(set(a)) > 1, True)
+    finally:
+        qt.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=os.path.join(
@@ -1463,6 +1948,9 @@ def main():
     test_msc313e(args.qemu, tmp)
     test_sensor_catalogue(args.qemu)
     test_msc313e_sd(args.qemu, tmp)
+    test_ssc029(args.qemu, tmp)
+    test_ssc029_rtcpwc(args.qemu, tmp)
+    test_ssc029_smp(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 

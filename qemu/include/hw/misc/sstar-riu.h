@@ -39,7 +39,9 @@ struct SstarRiuState {
     uint32_t poll_count;
     uint16_t bond;
     bool smf_ack;               /* Ifado: bank 0x1121 handshake */
-    bool infinity3;             /* infinity3 status bits (FCIE, HVSP) */
+    bool infinity3;
+    bool iford;                 /* Iford status bits (FCIE, DRAM test) */
+    uint16_t mmu[4096];         /* Iford's MIU MMU */
     uint16_t gpio_bank;         /* Ifado PADTOP GPIO: input levels */
     uint64_t uuid;              /* OTP2 0x7C-0x7F, the die's unique ID */
     /* tables of reset values, each ended by a zero address */
@@ -55,5 +57,8 @@ void sstar_riu_set(SstarRiuState *s, uint32_t bank, uint32_t reg,
 
 /* Before realize: reset values for registers the RIU stores. */
 void sstar_riu_add_defaults(SstarRiuState *s, const SstarRegDefault *table);
+
+/* Iford's MIU MMU: a bus master's address as MIU sees it; else unchanged */
+uint64_t sstar_miu_xlate(uint64_t addr);
 
 #endif /* HW_MISC_SSTAR_RIU_H */

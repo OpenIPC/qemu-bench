@@ -49,6 +49,7 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "hw/misc/sstar-riu.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -57,7 +58,7 @@
 #define TYPE_SSTAR_CMDQ "sstar-cmdq"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarCmdqState, SSTAR_CMDQ)
 
-#define CMDQ_ENGINES        4
+#define CMDQ_ENGINES        8        /* Iford; Ifado maps four */
 #define CMDQ_REGS           0x80
 
 /* register indices (byte offset / 4) */
@@ -118,7 +119,9 @@ static uint32_t eng32(SstarCmdqEngine *e, int lo)
 
 static hwaddr cmdq_dram(uint32_t miu)
 {
-    return miu < SS_DRAM_BASE ? SS_DRAM_BASE + miu : miu;
+    uint64_t a = sstar_miu_xlate(miu);
+
+    return a < SS_DRAM_BASE ? SS_DRAM_BASE + a : a;
 }
 
 static void sstar_cmdq_update_irq(SstarCmdqState *s)

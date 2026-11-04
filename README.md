@@ -242,8 +242,9 @@ was at hand.
 | `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
 | `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
 | `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
+| `ssc029` | Cortex-A32 ×2 (run as A7), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
 
-SigmaStar's (formerly MStar's) infinity2m and infinity3 dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m, infinity3 and Iford dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
@@ -786,7 +787,7 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
-├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3 machines, synthetic mask ROM
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford machines, synthetic mask ROM
 ├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
 ├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
 ├── hw/timer/sstar-timer.c       # PIU timers + watchdog
