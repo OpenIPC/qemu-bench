@@ -88,6 +88,7 @@
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/clock.h"
 #include "hw/qdev-clock.h"
@@ -915,65 +916,6 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
  * sensor sits on I2C0 (I2C1 on T40); MCLK and the PA18 reset pulse need
  * nothing here -- the models answer whether or not they are clocked.
  */
-static const struct {
-    const char *name;
-    const char *type;           /* NULL: galaxycore-sensor */
-    uint8_t addr;
-    bool reg16;                 /* galaxycore: 16-bit register addresses */
-    uint16_t id_reg, id;        /* galaxycore / hisi-smartsens; ov2735 rev */
-} ingenic_sensors[] = {
-    { "gc2053", NULL, 0x37, false, 0xF0, 0x2053 },
-    /* T23 SDK's second-sensor driver: a gc2053 at 0x3f (sensor1=) */
-    { "gc2053s1", NULL, 0x3F, false, 0xF0, 0x2053 },
-    { "gc2083", NULL, 0x37, true, 0x03F0, 0x2083 },
-    { "sc2336", "hisi-smartsens", 0x30, true, 0x3107, 0xCB3A },
-    { "sc2335", "hisi-smartsens", 0x30, true, 0x3107, 0xCB14 },
-    { "jxf37", "hisi-f37", 0x40 },
-    { "jxf22", "hisi-jxf22", 0x40 },
-    { "jxh62", "hisi-jxh62", 0x30 },
-    { "gc4653", NULL, 0x29, true, 0x03F0, 0x4653 },
-    { "gc4663", NULL, 0x29, true, 0x03F0, 0x4653 },
-    { "ov2735b", "ingenic-ov2735", 0x3C, false, 0, 0x07 },
-    { "ov2735", "ingenic-ov2735", 0x3C, false, 0, 0x05 },
-};
-
-static DeviceState *ingenic_create_sensor(const char *name, I2CBus *bus)
-{
-    DeviceState *dev;
-    int n;
-
-    for (n = 0; n < ARRAY_SIZE(ingenic_sensors); n++) {
-        if (!strcmp(name, ingenic_sensors[n].name)) {
-            break;
-        }
-    }
-    if (n == ARRAY_SIZE(ingenic_sensors)) {
-        error_report("ingenic: unknown sensor '%s'; one of: none", name);
-        for (n = 0; n < ARRAY_SIZE(ingenic_sensors); n++) {
-            error_printf("  %s\n", ingenic_sensors[n].name);
-        }
-        exit(1);
-    }
-    if (!ingenic_sensors[n].type) {
-        dev = DEVICE(i2c_slave_new("galaxycore-sensor",
-                                   ingenic_sensors[n].addr));
-        qdev_prop_set_bit(dev, "reg16", ingenic_sensors[n].reg16);
-        qdev_prop_set_uint16(dev, "id-reg", ingenic_sensors[n].id_reg);
-        qdev_prop_set_uint16(dev, "id", ingenic_sensors[n].id);
-    } else {
-        dev = DEVICE(i2c_slave_new(ingenic_sensors[n].type,
-                                   ingenic_sensors[n].addr));
-        if (!strcmp(ingenic_sensors[n].type, "hisi-smartsens")) {
-            qdev_prop_set_uint8(dev, "id_high", ingenic_sensors[n].id >> 8);
-            qdev_prop_set_uint8(dev, "id_low", ingenic_sensors[n].id & 0xFF);
-        } else if (!strcmp(ingenic_sensors[n].type, "ingenic-ov2735")) {
-            qdev_prop_set_uint8(dev, "rev", ingenic_sensors[n].id);
-        }
-    }
-    i2c_slave_realize_and_unref(I2C_SLAVE(dev), bus, &error_fatal);
-    return dev;
-}
-
 /* --- machine ------------------------------------------------------------ */
 
 static void ingenic_cpu_reset(void *opaque)
@@ -1264,8 +1206,7 @@ static void ingenic_init(MachineState *ms)
                                             ingenic_irq(ims, IRQ_I2C0 - i));
         if (i == info->sensor_bus && !info->sensor_gpio_sda && ims->sensor &&
             strcmp(ims->sensor, "none")) {
-            ims->sensor_dev = ingenic_create_sensor(ims->sensor,
-                I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+            ims->sensor_dev = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), ims->sensor);
         }
         /*
          * the second sensor: T40's on I2C3 through CSI1, T23's (the SDK's
@@ -1273,14 +1214,12 @@ static void ingenic_init(MachineState *ms)
          */
         if (info->sensor1_bus && i == info->sensor1_bus - 1 && ims->sensor1 &&
             strcmp(ims->sensor1, "none")) {
-            ims->sensor1_dev = ingenic_create_sensor(ims->sensor1,
-                I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+            ims->sensor1_dev = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), ims->sensor1);
         }
         /* and its third, on I2C0 through VIC2 (the kernel has I2C2 off) */
         if (info->sensor2_bus && i == info->sensor2_bus - 1 && ims->sensor2 &&
             strcmp(ims->sensor2, "none")) {
-            ims->sensor2_dev = ingenic_create_sensor(ims->sensor2,
-                I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+            ims->sensor2_dev = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), ims->sensor2);
         }
     }
 
@@ -1298,8 +1237,7 @@ static void ingenic_init(MachineState *ms)
         qdev_connect_gpio_out_named(gpio, "drive", sda + 1,
                                     qdev_get_gpio_in(dev, 1));
         qdev_connect_gpio_out(dev, 0, qdev_get_gpio_in(gpio, sda));
-        ims->sensor_dev = ingenic_create_sensor(ims->sensor,
-            I2C_BUS(qdev_get_child_bus(dev, "i2c")));
+        ims->sensor_dev = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), ims->sensor);
     }
 
     /* the image pipeline: ISP core, VIC, MIPI CSI host and D-PHY */

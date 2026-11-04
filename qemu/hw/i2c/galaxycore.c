@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -142,6 +143,15 @@ bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
     return true;
 }
 
+static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
+{
+    IngenicSensorExposure x = { 0 };
+
+    galaxycore_exposure(sensor, &x);
+    e->lines = x.lines;
+    e->gain = x.gain;
+}
+
 static void gc_reset(DeviceState *dev)
 {
     GcSensorState *s = GALAXYCORE_SENSOR(dev);
@@ -188,6 +198,7 @@ static void gc_class_init(ObjectClass *klass, const void *data)
     k->event = gc_event;
     k->send = gc_send;
     k->recv = gc_recv;
+    IMAGE_SENSOR_CLASS(klass)->exposure = galaxycore_exposure_sensor;
 }
 
 static const TypeInfo gc_sensor_info = {
@@ -195,6 +206,10 @@ static const TypeInfo gc_sensor_info = {
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(GcSensorState),
     .class_init    = gc_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IMAGE_SENSOR },
+        { }
+    },
 };
 
 static void gc_sensor_register_types(void)

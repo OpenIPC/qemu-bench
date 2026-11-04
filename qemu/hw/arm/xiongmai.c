@@ -27,6 +27,7 @@
 #include "hw/sd/sd.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/sysbus.h"
 #include "qobject/qlist.h"
 #include "target/arm/arm-powerctl.h"
@@ -489,6 +490,11 @@ static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
     uint8_t addrs[2] = { c->sensor_addr, c->sensor_addr2 };
 
     if (!type || !strcmp(type, "none")) {
+        return;
+    }
+    if (image_sensor_known(ms->sensor)) {   /* sensor= the catalogue's name */
+        image_sensor_create_at(bus, ms->sensor,
+                               ms->sensor_addr_set ? ms->sensor_addr : 0);
         return;
     }
     if (!object_class_dynamic_cast(object_class_by_name(type),

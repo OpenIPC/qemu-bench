@@ -48,7 +48,7 @@
  * ("light-r", "light-b", per mille, and "light", the level: 1/1000 LSB
  * per row of exposure for a white under G; all three may change while
  * running, qom-set /machine/isp).  From the exposure rows and analog gain
- * in its I2C registers (hisi_soi_exposure()) it makes 10-bit Bayer at its
+ * in its I2C registers (image_sensor_exposure()) it makes 10-bit Bayer at its
  * window size with black at 64, in the colour order ISP0 0x11 [1:0] says
  * (0 RGGB, 1 GRBG, 2 BGGR -- the camera's, 3 GBRG), cropped by ISP0
  * 0x12-0x15.  The stages, as the camera application programs them (all
@@ -130,7 +130,7 @@
 #include "hw/sysbus.h"
 #include "hw/misc/sstar-riu.h"
 #include "hw/misc/sstar-i3-isp.h"
-#include "hw/i2c/hisi-soi.h"
+#include "hw/i2c/image-sensor.h"
 #include "aw-vinc-logo.h"
 #include "hw/misc/sstar-pattern.h"
 #include "migration/vmstate.h"
@@ -531,18 +531,22 @@ static void i3_isp_scene_row(SstarI3IspState *s, int w, int h, int y,
  */
 static bool i3_isp_sense(SstarI3IspState *s, int cx, int cy, int w, int h)
 {
-    HisiSoiExposure e;
+    ImageSensorExposure e;
     uint16_t pal[256][4];
     uint8_t col[4];
     int sw, sh, x, y, i, c, band = -1;
     double k, light[3];
 
-    if (!s->sensor || !hisi_soi_exposure(s->sensor, &e)) {
+    if (!s->sensor || !image_sensor_exposure(s->sensor, &e)) {
         return false;
     }
     sw = e.width ? e.width : cx + w;
     sh = e.height ? e.height : cy + h;
     if (sw < cx + w || sh < cy + h || sw > MAX_W) {
+        if (s->trace) {
+            qemu_log("sstar-i3-isp: no picture: sensor window %dx%d, "
+                     "crop %dx%d at %d,%d\n", sw, sh, w, h, cx, cy);
+        }
         return false;
     }
     if (e.vts) {
@@ -877,10 +881,10 @@ static void i3_isp_process(SstarI3IspState *s)
     i3_isp_write_histo(s, hisy);
     s->have_frame = true;
     if (s->trace) {
-        HisiSoiExposure e;
+        ImageSensorExposure e;
         uint64_t sum[3] = { 0 };
 
-        hisi_soi_exposure(s->sensor, &e);
+        image_sensor_exposure(s->sensor, &e);
         for (i = 0; i < ow * oh; i++) {
             sum[0] += s->yuv[i];
             sum[1] += s->yuv[ow * oh + i];

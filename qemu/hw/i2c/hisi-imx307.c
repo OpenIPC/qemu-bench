@@ -17,8 +17,10 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include <math.h>
 
 #define TYPE_HISI_IMX307 "hisi-imx307"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiIMX307State, HISI_IMX307)
@@ -39,6 +41,9 @@ static void hisi_imx307_reset_regs(HisiIMX307State *s)
     memset(s->regs, 0, sizeof(s->regs));
     /* Sofia checks reg 0x31DC: (val & 6) == 4 → bit 2 set, bit 1 clear */
     s->regs[0x31DC - IMX307_REG_BASE] = 0x04;
+    /* the MStar driver's Sensor_id_table (libdrv_ms_cus_imx307_MIPI.so) */
+    s->regs[0x3004 - IMX307_REG_BASE] = 0x10;
+    s->regs[0x3009 - IMX307_REG_BASE] = 0x01;
 }
 
 static int hisi_imx307_event(I2CSlave *i2c, enum i2c_event event)
@@ -91,6 +96,26 @@ static uint8_t hisi_imx307_recv(I2CSlave *i2c)
     return val;
 }
 
+/*
+ * VMAX in 0x3018-A, SHS1 (rows from the frame's end the exposure starts)
+ * in 0x3020-2, the gain in 0x3014 in 0.3 dB steps, the output size in
+ * 0x3472/3 and 0x3418/9: the datasheet's little-endian register groups.
+ */
+static void hisi_imx307_exposure(Object *sensor, ImageSensorExposure *e)
+{
+    HisiIMX307State *s = HISI_IMX307(sensor);
+    uint32_t shs;
+
+#define R(a) s->regs[(a) - IMX307_REG_BASE]
+    e->vts = (R(0x301A) & 3) << 16 | R(0x3019) << 8 | R(0x3018);
+    shs = (R(0x3022) & 0xF) << 16 | R(0x3021) << 8 | R(0x3020);
+    e->lines = e->vts > shs + 1 ? e->vts - shs - 1 : 1;
+    e->gain = 1024 * pow(10, R(0x3014) * 0.3 / 20);
+    e->width = (R(0x3473) & 0x1F) << 8 | R(0x3472);
+    e->height = (R(0x3419) & 0x1F) << 8 | R(0x3418);
+#undef R
+}
+
 static void hisi_imx307_reset(DeviceState *dev)
 {
     HisiIMX307State *s = HISI_IMX307(dev);
@@ -110,6 +135,7 @@ static void hisi_imx307_class_init(ObjectClass *klass, const void *data)
     k->event = hisi_imx307_event;
     k->recv  = hisi_imx307_recv;
     k->send  = hisi_imx307_send;
+    IMAGE_SENSOR_CLASS(klass)->exposure = hisi_imx307_exposure;
 }
 
 static const TypeInfo hisi_imx307_info = {
@@ -117,6 +143,10 @@ static const TypeInfo hisi_imx307_info = {
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(HisiIMX307State),
     .class_init    = hisi_imx307_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IMAGE_SENSOR },
+        { }
+    },
 };
 
 static void hisi_imx307_register_types(void)

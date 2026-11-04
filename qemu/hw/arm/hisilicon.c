@@ -43,6 +43,7 @@
 #include "system/block-backend.h"
 #include "net/net.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/clock.h"
 #include "hw/qdev-clock.h"
 #include "target/arm/cpu-qom.h"
@@ -6056,90 +6057,8 @@ static void hisilicon_common_init(MachineState *machine,
             DeviceState *sensor = qdev_new("hisi-imx122");
             qdev_realize_and_unref(sensor, ssi_bus, &error_fatal);
         } else if (sensor_name && c->num_i2c > 0 && i2c_devs[0]) {
-            BusState *i2c_bus = qdev_get_child_bus(i2c_devs[0], "i2c");
-            DeviceState *sensor = NULL;
-            uint8_t i2c_addr = 0;
-
-            if (!strcmp(sensor_name, "imx335")) {
-                sensor = qdev_new("hisi-imx335");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx307")) {
-                sensor = qdev_new("hisi-imx307");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx291")) {
-                sensor = qdev_new("hisi-imx291");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx415")) {
-                sensor = qdev_new("hisi-imx415");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx385")) {
-                sensor = qdev_new("hisi-imx385");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "f37")) {
-                sensor = qdev_new("hisi-f37");
-                i2c_addr = 0x40;
-            } else if (!strcmp(sensor_name, "gc2053")) {
-                sensor = qdev_new("hisi-gc2053");
-                i2c_addr = 0x37;
-            } else if (!strcmp(sensor_name, "sp2305")) {
-                sensor = qdev_new("hisi-sp2305");
-                i2c_addr = 0x3C;
-            } else if (!strcmp(sensor_name, "mis2006")) {
-                sensor = qdev_new("hisi-mis2006");
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "nvp6124b")) {
-                sensor = qdev_new("hisi-nvp6124b");
-                i2c_addr = 0x60;          /* 7-bit; vendor uses 0x60..0x66 */
-            } else if (!strcmp(sensor_name, "sc2315e")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x22);
-                qdev_prop_set_uint8(sensor, "id_low",  0x38);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2315")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x23);
-                qdev_prop_set_uint8(sensor, "id_low",  0x11);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2235p")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x22);
-                qdev_prop_set_uint8(sensor, "id_low",  0x32);
-                qdev_prop_set_uint8(sensor, "disc",    0x01);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2235e")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x22);
-                qdev_prop_set_uint8(sensor, "id_low",  0x32);
-                qdev_prop_set_uint8(sensor, "disc",    0x20);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2335")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0xCB);
-                qdev_prop_set_uint8(sensor, "id_low",  0x14);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2239")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0xCB);
-                qdev_prop_set_uint8(sensor, "id_low",  0x10);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc307h")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0xCB);
-                qdev_prop_set_uint8(sensor, "id_low",  0x1C);
-                i2c_addr = 0x30;
-            } else {
-                error_report("Unknown sensor '%s' (supported: imx291, "
-                             "imx307, imx335, imx385, imx415, f37, "
-                             "gc2053, sp2305, mis2006, nvp6124b, "
-                             "sc2235p, sc2235e, sc2315, sc2315e, sc2335, "
-                             "sc2239, sc307h, imx122, imx222; or 'none' "
-                             "to disable default)",
-                             sensor_name);
-                exit(1);
-            }
-
-            qdev_prop_set_uint8(sensor, "address", i2c_addr);
-            qdev_realize_and_unref(sensor, i2c_bus, &error_fatal);
+            image_sensor_create(I2C_BUS(qdev_get_child_bus(i2c_devs[0], "i2c")),
+                                sensor_name);
         } else if (sensor_name) {
             error_report("sensor '%s' requested but this SoC has no I2C "
                          "or matching SPI controller", sensor_name);

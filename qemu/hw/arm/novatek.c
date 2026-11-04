@@ -26,6 +26,7 @@
 #include "hw/loader.h"
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/ide/ahci.h"
 #include "hw/ide/ahci-sysbus.h"
 #include "hw/intc/arm_gic.h"
@@ -152,18 +153,10 @@ static const struct {
 };
 
 /*
- * Image sensors for sensor=: SmartSens parts the OpenIPC release has a
- * driver for (nvt_sen_<name>.ko), at 0x30 on I2C 0 where ipcinfo's
- * Novatek HAL probes (ssens_addrs 0x60, 8-bit), chip ID at 0x3107/0x3108.
+ * sensor= on I2C 0, where ipcinfo's Novatek HAL probes: the catalogue's
+ * parts, of which OpenIPC's firmware has a driver (nvt_sen_<name>.ko) for
+ * sc401ai and sc501ai.
  */
-static const struct {
-    const char *name;
-    uint8_t id_high, id_low;
-} nvt_sensors[] = {
-    { "sc401ai", 0xCD, 0x2E },
-    { "sc501ai", 0xCE, 0x1F },
-};
-
 /*
  * The SD hosts: card n from -drive if=sd,index=n.  reset is the host's
  * nvt-cg "sys-reset" line (CG_SYS_RESET_REG1 bit 2 / 3 / 14).  The EVB
@@ -1786,22 +1779,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
             i2c0 = (I2CBus *)qdev_get_child_bus(dev, "i2c");
         }
     }
-    if (nms->sensor && strcmp(nms->sensor, "none")) {
-        for (n = 0; n < ARRAY_SIZE(nvt_sensors); n++) {
-            if (!strcmp(nms->sensor, nvt_sensors[n].name)) {
-                break;
-            }
-        }
-        if (n == ARRAY_SIZE(nvt_sensors)) {
-            error_report("novatek: unknown sensor '%s' (none, sc401ai, "
-                         "sc501ai)", nms->sensor);
-            exit(1);
-        }
-        dev = DEVICE(i2c_slave_new("hisi-smartsens", 0x30));
-        qdev_prop_set_uint8(dev, "id_high", nvt_sensors[n].id_high);
-        qdev_prop_set_uint8(dev, "id_low", nvt_sensors[n].id_low);
-        i2c_slave_realize_and_unref(I2C_SLAVE(dev), i2c0, &error_fatal);
-    }
+    image_sensor_create(i2c0, nms->sensor);
 
     /*
      * USB: the EHCI (region 0) over the FOTG200 glue (region 1), at the

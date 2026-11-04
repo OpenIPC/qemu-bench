@@ -225,7 +225,7 @@ or OP-TEE leaves every interrupt secure and Linux hangs after the timer.
 shell. Video input: `aw-vinc` paints test frames into buffers behind
 `aw-iommu` (the media masters use IOMMU addresses); `aw-ve` answers the
 VE ID CedarC's compiled-in table and its LBC check accept (0xE0/0xE4 =
-0x21110/0x21210); the sensor is `hisi-gc2053` on TWI1; `aw-pio` reads
+0x21110/0x21210); the sensor is the catalogue's `gc2053` on TWI1; `aw-pio` reads
 inputs high (stored zeros were the YI reset button held down).
 `qemu-boot/yi-v831-prepare.sh` makes a YI image that runs as if paired.
 `aw-ve` encodes H.264: CedarC puts the headers through the bitstream
@@ -596,12 +596,20 @@ in this order:
   `chip_variant` (and `v1_chip_id_88`/`_8c` for the V1 quartet) or firmware
   prints `Wrong chip-id`/`hiunknown` and `load_hisilicon` bails before loading
   any vendor module. CI greps for exactly this.
-- **Sensors** are I2C/SSI slave models in `qemu/hw/i2c/` and `qemu/hw/ssi/`,
-  selected by name in a `strcmp` chain in `hisilicon_common_init()`
-  (`imx335`, `imx307`, `f37`, `gc2053`, `sc2315e`, … , or `none`).
-  The Xiongmai machines take a QOM type name instead (`sensor=hisi-imx335`,
-  `sensor=none`) plus `sensor-addr=`; `xm-sensor` is a generic register-file
-  sensor whose ID comes from `-global xm-sensor.regs=` (`docs/xiongmai.md`).
+- **Sensors** are I2C slave models in `qemu/hw/i2c/`, shared by every family
+  and built for every target. `sensor=` names one from the catalogue in
+  `hw/i2c/image-sensor.c` (name, model, 7-bit address, chip ID): add a part
+  there, not in a machine, and every machine takes it through
+  `image_sensor_create()`. A part new to the catalogue usually needs only a
+  line: SmartSens and GalaxyCore parts share a model. Take its ID from the
+  vendor driver. An ISP reads a sensor through the `image-sensor` interface
+  (`image_sensor_exposure()`); a model implements it from its registers. The
+  plain Sony models, `hisi-mis2006` and `hisi-sp2305` do not yet: on an ISP
+  that needs a picture from the sensor they are found but draw nothing.
+  The Xiongmai machines also take a QOM type name (`sensor=hisi-imx335`) plus
+  `sensor-addr=`; `xm-sensor` is a generic register-file sensor whose ID comes
+  from `-global xm-sensor.regs=` (`docs/xiongmai.md`). The SSI `imx122` stays
+  in `hisilicon_common_init()`.
 
 ## Adding a SoC or a device
 

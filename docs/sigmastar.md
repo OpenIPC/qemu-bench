@@ -147,6 +147,27 @@ timers count the 12 MHz crystal, timer 0 the 432 MHz MPLL divided by
 Reading a counter's low half latches its high half: U-Boot takes any step
 back for a 32-bit wrap.
 
+## Boards
+
+The `msc313e` machine takes other infinity3 boards through its options. The
+firmware expects the board's own sensor and RAM: with the wrong sensor an
+app gives up (Anjoy's reboots, Raysharp's dies under its watchdog), and with
+too little RAM the kernel's CMA pool wraps onto low memory and corrupts it.
+A board's real values are in its dump: the sensor from `Sensor_id_table` in
+the `libdrv_ms_cus_*.so` it ships, the RAM from the kernel's `Memory:` line.
+
+| Board | Options | Result |
+|---|---|---|
+| Jabsco C3001, C301-M15 | `sensor=jxf22` (the default) | login, app runs |
+| Anjoy YM200J, YM200J2 | `sensor=imx307` | YM200J: H.264 over RTSP; AE converges |
+| Anjoy MC300E10 (its "SC32xx" name notwithstanding) | `sensor=sc2315e` | no reboot, AE converges |
+| Raysharp MSC316D (RS-CH228M2NN) | `sensor=sc2310,rtc=ds1338 -m 128M` | video pipeline runs, AE converges |
+| MSC316DC | `sensor=imx323 -m 128M` | video pipeline runs; picture saturates, AE does not settle |
+
+`rtc=ds1338` puts a DS1307-family RTC at 0x68 (0xD0 in 8-bit) on the first
+I2C bus, where the Raysharp app reads its time. The Anjoy `CRY` driver
+(`/dev/cry`) reads "failed" on every board here and the firmware runs on.
+
 ## Devices
 
 - **SPI NOR** (`sstar-fsp`). One generic 3-byte-address NOR behind the four
