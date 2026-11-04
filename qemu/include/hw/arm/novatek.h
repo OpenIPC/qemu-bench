@@ -63,5 +63,7 @@ typedef struct NvtRomConfig {
 bool nvt_flash_has_loader(NvtFlashState *flash, uint64_t sram_base,
                           uint64_t sram_size);
 void nvt_rom_boot(NvtFlashState *flash, const NvtRomConfig *rc);
+/* The ROM's loader from a host file, not the flash (nvt-bootrom.c) */
+void nvt_rom_set_loader_file(const char *path);
 
 #endif /* HW_ARM_NOVATEK_H */

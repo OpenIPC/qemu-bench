@@ -34,6 +34,12 @@
  * rom_efuse_read is their own.  The ROM's part is the copy, the stack and
  * the jump.
  *
+ * The silicon's ROM also takes the loader from SD, Ethernet (DHCP and
+ * TFTP), USB or UART.  None of those is modelled: "loader-file" is what
+ * one of them delivered, a host file copied to SRAM in place of the
+ * flash's first bytes, and the machines' "boot-strap" sets the strap the
+ * loader reads back.
+ *
  * The ROM's own code is not available, so this one is QEMU's: a reset
  * vector branching to the loader's entry, and for each routine a stub that
  * hands its arguments (r0..r3 and two stack words) to a service window at
@@ -54,6 +60,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
@@ -506,13 +513,29 @@ static void nvt_bootrom_reset(DeviceState *dev)
     uint32_t hdr[10], size;
 
     /* the loader into SRAM, as the ROM copies it */
-    nvt_flash_read(s->flash, 0, hdr, sizeof(hdr));
-    size = le32_to_cpu(hdr[9]);
-    if (!size || size > s->sram_size) {
-        size = 32 * KiB;
+    if (s->loader_file) {
+        g_autoptr(GError) err = NULL;
+        gsize len;
+
+        g_free(s->loader);
+        if (!g_file_get_contents(s->loader_file, (gchar **)&s->loader, &len,
+                                 &err) || len < sizeof(hdr) ||
+            len > s->sram_size) {
+            error_report("nvt-bootrom: cannot use %s as a loader: %s",
+                         s->loader_file, err ? err->message : "its size");
+            exit(1);
+        }
+        memcpy(hdr, s->loader, sizeof(hdr));
+        size = len;
+    } else {
+        nvt_flash_read(s->flash, 0, hdr, sizeof(hdr));
+        size = le32_to_cpu(hdr[9]);
+        if (!size || size > s->sram_size) {
+            size = 32 * KiB;
+        }
+        s->loader = g_realloc(s->loader, size);
+        nvt_flash_read(s->flash, 0, s->loader, size);
     }
-    s->loader = g_realloc(s->loader, size);
-    nvt_flash_read(s->flash, 0, s->loader, size);
     address_space_write(&s->as, s->sram_base,
                         MEMTXATTRS_UNSPECIFIED, s->loader, size);
     rom_build(s, le32_to_cpu(hdr[0]));
@@ -572,6 +595,7 @@ static const Property nvt_bootrom_properties[] = {
     DEFINE_PROP_UINT64("svc-base", NvtBootRomState, svc_base, 0xF07BFF00),
     DEFINE_PROP_UINT64("rom-base", NvtBootRomState, rom_base, 0x80000000),
     DEFINE_PROP_UINT8("layout", NvtBootRomState, layout, 0),
+    DEFINE_PROP_STRING("loader-file", NvtBootRomState, loader_file),
 };
 
 static void nvt_bootrom_class_init(ObjectClass *klass, const void *data)
