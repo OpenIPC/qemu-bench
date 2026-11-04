@@ -33,6 +33,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -52,6 +53,7 @@ struct HisiSmartSensState {
     uint8_t  id_high;
     uint8_t  id_low;
     uint8_t  disc;
+    uint8_t  gain_fine;    /* 0x3E09 at 1x; 0: the SC2336's gain registers */
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -149,6 +151,44 @@ bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
     return true;
 }
 
+/*
+ * The frame around that exposure: 0x320E/F the frame length, 0x3208-B the
+ * output window, as every SmartSens driver's mode tables set them.
+ */
+static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
+{
+    HisiSmartSensState *s = HISI_SMARTSENS(sensor);
+    IngenicSensorExposure x = { 0 };
+
+#define R(a) s->regs[(a) - SS_REG_BASE]
+#define R16(a) (R(a) << 8 | R((a) + 1))
+    smartsens_exposure(sensor, &x);
+    e->lines = x.lines;
+    e->gain = x.gain;
+    if (s->gain_fine) {
+        /*
+         * The SC2310's pCus_GetAEGain, with the half rows its
+         * pCus_SetAEUSecs writes (capped at twice the frame less 6):
+         * coarse 0x3E08[4:2] + 1 (bit 5: HCG, x2.72), fine 0x3E09, digital
+         * 0x3E07 / 0x80 and 0x3E06[3:0] + 1.
+         */
+        uint8_t fine = R(0x3E09) ? R(0x3E09) : s->gain_fine;
+        uint8_t dig = R(0x3E07) ? R(0x3E07) : 0x80;
+        double gain = (((R(0x3E08) >> 2) & 7) + 1) *
+                      ((double)fine / s->gain_fine) * (dig / 128.0) *
+                      ((R(0x3E06) & 0xF) + 1) *
+                      (R(0x3E08) & 0x20 ? 2.72 : 1.0);
+
+        e->lines = x.lines / 2;
+        e->gain = gain * 1024;
+    }
+    e->vts = R16(0x320E);
+    e->width = R16(0x3208);
+    e->height = R16(0x320A);
+#undef R16
+#undef R
+}
+
 static void hisi_smartsens_reset(DeviceState *dev)
 {
     HisiSmartSensState *s = HISI_SMARTSENS(dev);
@@ -162,6 +202,7 @@ static void hisi_smartsens_reset(DeviceState *dev)
 static const Property hisi_smartsens_props[] = {
     DEFINE_PROP_UINT8("id_high", HisiSmartSensState, id_high, 0x00),
     DEFINE_PROP_UINT8("id_low",  HisiSmartSensState, id_low,  0x00),
+    DEFINE_PROP_UINT8("gain-fine", HisiSmartSensState, gain_fine, 0),
     DEFINE_PROP_UINT8("disc",    HisiSmartSensState, disc,    0x00),
 };
 
@@ -191,6 +232,7 @@ static void hisi_smartsens_class_init(ObjectClass *klass, const void *data)
     k->event = hisi_smartsens_event;
     k->recv  = hisi_smartsens_recv;
     k->send  = hisi_smartsens_send;
+    IMAGE_SENSOR_CLASS(klass)->exposure = smartsens_sensor_exposure;
 }
 
 static const TypeInfo hisi_smartsens_info = {
@@ -198,6 +240,10 @@ static const TypeInfo hisi_smartsens_info = {
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(HisiSmartSensState),
     .class_init    = hisi_smartsens_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IMAGE_SENSOR },
+        { }
+    },
 };
 
 static void hisi_smartsens_register_types(void)

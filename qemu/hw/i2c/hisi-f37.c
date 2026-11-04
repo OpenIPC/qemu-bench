@@ -32,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/i2c/hisi-soi.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -113,6 +114,18 @@ bool hisi_soi_exposure(Object *sensor, HisiSoiExposure *e)
     return true;
 }
 
+static void hisi_f37_sensor_exposure(Object *sensor, ImageSensorExposure *e)
+{
+    HisiSoiExposure soi;
+
+    hisi_soi_exposure(sensor, &soi);
+    e->lines = soi.lines;
+    e->vts = soi.vts;
+    e->gain = soi.gain;
+    e->width = soi.width;
+    e->height = soi.height;
+}
+
 static void hisi_f37_reset(DeviceState *dev)
 {
     HisiF37State *s = HISI_F37(dev);
@@ -132,6 +145,7 @@ static void hisi_f37_class_init(ObjectClass *klass, const void *data)
     k->recv  = hisi_f37_recv;
     k->send  = hisi_f37_send;
     HISI_F37_CLASS(klass)->id = 0x0F37;
+    IMAGE_SENSOR_CLASS(klass)->exposure = hisi_f37_sensor_exposure;
 }
 
 static void hisi_jxh62_class_init(ObjectClass *klass, const void *data)
@@ -149,6 +163,11 @@ static void hisi_jxf22_class_init(ObjectClass *klass, const void *data)
     HISI_F37_CLASS(klass)->id = 0x0F22;
 }
 
+static const InterfaceInfo hisi_f37_interfaces[] = {
+    { TYPE_IMAGE_SENSOR },
+    { }
+};
+
 static void hisi_f37_register_types(void)
 {
     static const TypeInfo types[] = {
@@ -158,6 +177,7 @@ static void hisi_f37_register_types(void)
             .instance_size = sizeof(HisiF37State),
             .class_size    = sizeof(HisiSoiClass),
             .class_init    = hisi_f37_class_init,
+            .interfaces    = hisi_f37_interfaces,
         }, {
             .name          = TYPE_HISI_JXH62,
             .parent        = TYPE_HISI_F37,

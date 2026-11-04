@@ -24,6 +24,7 @@
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/allwinner-i2c.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/net/allwinner-sun8i-emac.h"
 #include "hw/intc/arm_gic_common.h"
@@ -457,8 +458,7 @@ static void aw_v83x_common_init(MachineState *machine, const AwSoCConfig *c)
              * The camera sensor, a GC2053 at 0x37 on TWI1 (the vendor
              * vind DT and gc2053_mipi.c): ID 0x2053 at 0xF0/0xF1.
              */
-            i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(twi, "i2c")),
-                                    "hisi-gc2053", 0x37);
+            image_sensor_create(I2C_BUS(qdev_get_child_bus(twi, "i2c")), "gc2053");
         }
         sysbus_create_simple("aw-twi", base + 0x200,
                              qdev_get_gpio_in(orgate, 1));

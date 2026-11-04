@@ -25,6 +25,7 @@
 #include "hw/boards.h"
 #include "hw/cpu/a15mpcore.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/ide/ahci.h"
 #include "hw/ide/ahci-sysbus.h"
 #include "hw/irq.h"
@@ -311,22 +312,6 @@ static const SsSoCConfig msc313e_soc = {
     .default_sensor     = "jxf22",
 };
 
-/*
- * Image sensors for sensor=, at their address on the die's sensor bus
- * (miic_sensor_bus).  SmartSens parts are hisi-smartsens with the ID in
- * 0x3107/0x3108 (ssc375: the DTB's sensorif snr0_mipi_i2c = <1>, as the
- * board's sc431hai_mipi.ko compares it); SOI parts have their own types.
- */
-static const struct {
-    const char *name;
-    const char *type;
-    uint8_t addr;
-    uint8_t id_high, id_low;
-} ss_sensors[] = {
-    { "sc431hai", "hisi-smartsens", 0x30, 0xCD, 0x6B },
-    { "jxf22", "hisi-jxf22", 0x40 },
-};
-
 #define TYPE_SS_MACHINE MACHINE_TYPE_NAME("sigmastar")
 OBJECT_DECLARE_SIMPLE_TYPE(SsMachineState, SS_MACHINE)
 
@@ -336,6 +321,7 @@ struct SsMachineState {
     char *flash_file;
     uint32_t flash_jedec;
     char *sensor;
+    char *rtc;
     uint64_t uuid;
     bool night;
     DeviceState *i3_gpio;
@@ -363,6 +349,19 @@ static void ss_machine_set_flash_file(Object *obj, const char *value,
 
     g_free(s->flash_file);
     s->flash_file = g_strdup(value);
+}
+
+static char *ss_machine_get_rtc(Object *obj, Error **errp)
+{
+    return g_strdup(SS_MACHINE(obj)->rtc);
+}
+
+static void ss_machine_set_rtc(Object *obj, const char *value, Error **errp)
+{
+    SsMachineState *s = SS_MACHINE(obj);
+
+    g_free(s->rtc);
+    s->rtc = g_strdup(value);
 }
 
 static char *ss_machine_get_sensor(Object *obj, Error **errp)
@@ -1044,31 +1043,24 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                                ss_spi(gic, intc, spi[n]));
             bus[n] = I2C_BUS(qdev_get_child_bus(dev, "i2c"));
         }
-        if (sensor && strcmp(sensor, "none")) {
-            for (n = 0; n < ARRAY_SIZE(ss_sensors); n++) {
-                if (!strcmp(sensor, ss_sensors[n].name)) {
-                    break;
-                }
-            }
-            if (n == ARRAY_SIZE(ss_sensors)) {
-                error_report("sigmastar: unknown sensor '%s' (none, "
-                             "sc431hai, jxf22)", sensor);
+        /*
+         * A board's battery RTC, on the first bus: the Raysharp app reads
+         * a DS1307-family part at 0xD0 (8-bit), which the SoC has no twin of.
+         */
+        if (sms->rtc && strcmp(sms->rtc, "none")) {
+            if (strcmp(sms->rtc, "ds1338")) {
+                error_report("sigmastar: unknown rtc '%s' (none, ds1338)",
+                             sms->rtc);
                 exit(1);
             }
-            dev = DEVICE(i2c_slave_new(ss_sensors[n].type,
-                                       ss_sensors[n].addr));
-            if (ss_sensors[n].id_high || ss_sensors[n].id_low) {
-                qdev_prop_set_uint8(dev, "id_high", ss_sensors[n].id_high);
-                qdev_prop_set_uint8(dev, "id_low", ss_sensors[n].id_low);
-            }
-            i2c_slave_realize_and_unref(I2C_SLAVE(dev),
-                                        bus[c->miic_sensor_bus],
-                                        &error_fatal);
-            /* the infinity3 ISP renders its picture from the sensor's */
-            if (i3_isp) {
-                object_property_set_link(OBJECT(i3_isp), "sensor",
-                                         OBJECT(dev), &error_fatal);
-            }
+            i2c_slave_create_simple(bus[0], "ds1338", 0x68);
+        }
+
+        dev = image_sensor_create(bus[c->miic_sensor_bus], sensor);
+        /* the infinity3 ISP renders its picture from the sensor's */
+        if (dev && i3_isp) {
+            object_property_set_link(OBJECT(i3_isp), "sensor", OBJECT(dev),
+                                     &error_fatal);
         }
     } else if (sms->sensor && strcmp(sms->sensor, "none")) {
         error_report("sigmastar: this machine has no sensor bus");
@@ -1248,10 +1240,16 @@ static void ss_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "flash-jedec",
         "JEDEC ID the SPI NOR answers with (e.g. 0xEF4018); by default "
         "the board's part, its capacity byte taken from the image size");
+    object_class_property_add_str(oc, "rtc",
+        ss_machine_get_rtc, ss_machine_set_rtc);
+    object_class_property_set_description(oc, "rtc",
+        "Battery RTC on the first I2C bus: ds1338 (a DS1307 at 0x68), "
+        "or none, the default");
     object_class_property_add_str(oc, "sensor",
         ss_machine_get_sensor, ss_machine_set_sensor);
     object_class_property_set_description(oc, "sensor",
-        "Image sensor on the sensor I2C bus (ssc375: sc431hai, the "
+        "Image sensor on the sensor I2C bus, by its catalogue name "
+        "(hw/i2c/image-sensor.c; ssc375: sc431hai, the "
         "default; msc313e: jxf22, the default; or none)");
     object_class_property_add_str(oc, "daynight",
         ss_machine_get_daynight, ss_machine_set_daynight);

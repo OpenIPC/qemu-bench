@@ -52,6 +52,7 @@
 #include "hw/boards.h"
 #include "hw/cpu/a15mpcore.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/misc/unimp.h"
@@ -434,51 +435,6 @@ static void fh_machine_set_sensor(Object *obj, const char *value,
  * turn: the FH885xV200 ones GC2063 (0x37), GC4653 (0x29), MIS2006 (0x30);
  * the V100 / FH8626 ones GC2053, GC2093, GC1054, JX-F37, MIS2006.
  */
-static const struct {
-    const char *name;
-    const char *type;           /* NULL: galaxycore-sensor */
-    uint8_t addr;
-    bool reg16;
-    uint16_t id_reg, id;
-} fh_sensors[] = {
-    { "gc4653",  NULL,           0x29, true,  0x03F0, 0x4653 },
-    { "gc2053",  NULL,           0x37, false, 0xF0,   0x2053 },
-    { "gc2063",  NULL,           0x37, false, 0xF0,   0x2063 },
-    { "gc2093",  NULL,           0x37, true,  0x03F0, 0x2093 },
-    { "gc1054",  NULL,           0x21, false, 0xF0,   0x1054 },
-    { "mis2006", "hisi-mis2006", 0x30 },
-    { "f37",     "hisi-f37",     0x40 },
-};
-
-static void fh_create_sensor(const char *name, I2CBus *bus)
-{
-    DeviceState *dev;
-    int n;
-
-    if (!name || !strcmp(name, "none")) {
-        return;
-    }
-    for (n = 0; n < ARRAY_SIZE(fh_sensors); n++) {
-        if (!strcmp(name, fh_sensors[n].name)) {
-            break;
-        }
-    }
-    if (n == ARRAY_SIZE(fh_sensors)) {
-        error_report("fullhan: unknown sensor '%s' (none, gc4653, gc2053, "
-                     "gc2063, gc2093, gc1054, mis2006, f37)", name);
-        exit(1);
-    }
-    if (fh_sensors[n].type) {
-        i2c_slave_create_simple(bus, fh_sensors[n].type, fh_sensors[n].addr);
-        return;
-    }
-    dev = DEVICE(i2c_slave_new("galaxycore-sensor", fh_sensors[n].addr));
-    qdev_prop_set_bit(dev, "reg16", fh_sensors[n].reg16);
-    qdev_prop_set_uint16(dev, "id-reg", fh_sensors[n].id_reg);
-    qdev_prop_set_uint16(dev, "id", fh_sensors[n].id);
-    i2c_slave_realize_and_unref(I2C_SLAVE(dev), bus, &error_fatal);
-}
-
 /* Interrupt n of the SoC's numbering: DW ICTL input n, or GIC SPI n. */
 static qemu_irq fh_irq(FhMachineState *fms, int n)
 {
@@ -826,8 +782,8 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            fh_irq(fms, c->i2c_irq[n]));
         if (n == 0) {
-            fh_create_sensor(fms->sensor ? fms->sensor : c->sensor,
-                             (I2CBus *)qdev_get_child_bus(dev, "i2c"));
+            image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
+                                fms->sensor ? fms->sensor : c->sensor);
         }
     }
 

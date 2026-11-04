@@ -82,6 +82,7 @@
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/misc/unimp.h"
@@ -215,16 +216,6 @@ static const struct {
  * (fisp_<sensor>.ko) probe them: 16-bit register addresses, the ID in
  * two registers.
  */
-static const struct {
-    const char *name;
-    uint8_t addr;
-    uint16_t id_reg;
-    uint16_t id;
-} gm_sensors[] = {
-    { "ov2715", 0x36, 0x300A, 0x2715 },     /* the Longse cameras' */
-    { "ov9715", 0x30, 0x300A, 0x9711 },
-};
-
 struct GmMachineState {
     MachineState parent_obj;
     char *flash_file;
@@ -273,31 +264,6 @@ static void gm_machine_set_sensor(Object *obj, const char *value,
 
     g_free(s->sensor);
     s->sensor = g_strdup(value);
-}
-
-static void gm_create_sensor(const char *name, I2CBus *bus)
-{
-    DeviceState *dev;
-    int i;
-
-    if (!name || !strcmp(name, "none")) {
-        return;
-    }
-    for (i = 0; i < ARRAY_SIZE(gm_sensors); i++) {
-        if (!strcmp(name, gm_sensors[i].name)) {
-            break;
-        }
-    }
-    if (i == ARRAY_SIZE(gm_sensors)) {
-        error_report("grainmedia: unknown sensor '%s'", name);
-        exit(1);
-    }
-    dev = qdev_new("galaxycore-sensor");
-    qdev_prop_set_bit(dev, "reg16", true);
-    qdev_prop_set_uint16(dev, "id-reg", gm_sensors[i].id_reg);
-    qdev_prop_set_uint16(dev, "id", gm_sensors[i].id);
-    qdev_prop_set_uint8(dev, "address", gm_sensors[i].addr);
-    qdev_realize_and_unref(dev, BUS(bus), &error_fatal);
 }
 
 static qemu_irq gm_irq(GmMachineState *gms, int n)
@@ -659,7 +625,7 @@ static void grainmedia_common_init(MachineState *machine,
 
     dev = sysbus_create_simple("gm-i2c", GM_I2C_BASE,
                                gm_irq(gms, GM_IRQ_I2C));
-    gm_create_sensor(gms->sensor, (I2CBus *)qdev_get_child_bus(dev, "i2c"));
+    image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), gms->sensor);
 
     binfo.ram_size = machine->ram_size;
     binfo.loader_start = 0;

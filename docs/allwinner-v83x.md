@@ -160,7 +160,7 @@ starts, stays up, and with a configured camera opens its H.264 encoder.
   on LBC input. 0x1707 (an older guess) passes the VE layer but the
   encoder refuses it. The ID is chosen from the firmware's table, not
   read from silicon.
-- **Sensor.** The repo's GC2053 (`hisi-gc2053`, ID 0x2053 at 0xF0/0xF1)
+- **Sensor.** The catalogue's GC2053 (`galaxycore-sensor`, ID 0x2053 at 0xF0/0xF1)
   sits at 0x37 on TWI1. The VIN driver registers its video nodes and the
   ISP library finds its `gc2053_mipi_1936_1096_20` tuning.
 - **Frames.** `aw-vinc` paints the OpenIPC logo (still, white on navy)

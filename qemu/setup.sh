@@ -238,7 +238,9 @@ cp qemu/hw/i2c/hisi-imx415.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-imx385.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-f37.c          "$QEMU_DIR/hw/i2c/"
 cp qemu/include/hw/i2c/hisi-soi.h   "$QEMU_DIR/include/hw/i2c/"
-cp qemu/hw/i2c/hisi-gc2053.c       "$QEMU_DIR/hw/i2c/"
+cp qemu/include/hw/i2c/image-sensor.h "$QEMU_DIR/include/hw/i2c/"
+cp qemu/hw/i2c/image-sensor.c       "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/imx323.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-sp2305.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-mis2006.c      "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-nvp6124b.c     "$QEMU_DIR/hw/i2c/"
@@ -563,6 +565,7 @@ config SIGMASTAR
     default y
     depends on TCG && ARM
     select A15MPCORE
+    select DS1338
     select ARM_GIC
     select SERIAL_MM
     select UNIMP
@@ -880,41 +883,19 @@ fi
 
 # hw/i2c/meson.build
 if ! grep -q hisi-i2c "$QEMU_DIR/hw/i2c/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_HISI_I2C', if_true: files('hisi-i2c.c', 'hisi-i2c-v1.c', 'hisi-i2c-dw.c', 'hisi-imx335.c', 'hisi-imx307.c', 'hisi-imx291.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-f37.c', 'hisi-gc2053.c', 'hisi-sp2305.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c'))" \
+    echo "system_ss.add(when: 'CONFIG_HISI_I2C', if_true: files('hisi-i2c.c', 'hisi-i2c-v1.c', 'hisi-i2c-dw.c'))" \
         >> "$QEMU_DIR/hw/i2c/meson.build"
     echo "  patched hw/i2c/meson.build"
-else
-    # Existing tree — splice in any new files that aren't already listed.
-    if ! grep -q hisi-i2c-v1 "$QEMU_DIR/hw/i2c/meson.build"; then
-        sed -i "s/'hisi-i2c.c', 'hisi-imx335.c'/'hisi-i2c.c', 'hisi-i2c-v1.c', 'hisi-imx335.c'/" \
-            "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added hisi-i2c-v1.c"
-    fi
-    if ! grep -q hisi-i2c-dw "$QEMU_DIR/hw/i2c/meson.build"; then
-        sed -i "s/'hisi-i2c-v1.c', 'hisi-imx335.c'/'hisi-i2c-v1.c', 'hisi-i2c-dw.c', 'hisi-imx335.c'/" \
-            "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added hisi-i2c-dw.c"
-    fi
-    if ! grep -q hisi-imx291 "$QEMU_DIR/hw/i2c/meson.build"; then
-        sed -i "s/'hisi-imx307.c'/'hisi-imx307.c', 'hisi-imx291.c'/" \
-            "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added hisi-imx291.c"
-    fi
-    if ! grep -q hisi-imx385 "$QEMU_DIR/hw/i2c/meson.build"; then
-        sed -i "s/'hisi-imx291.c'/'hisi-imx291.c', 'hisi-imx385.c'/" \
-            "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added hisi-imx385.c"
-    fi
-    if ! grep -q hisi-imx415 "$QEMU_DIR/hw/i2c/meson.build"; then
-        sed -i "s/'hisi-imx385.c'/'hisi-imx385.c', 'hisi-imx415.c'/" \
-            "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added hisi-imx415.c"
-    fi
-    if ! grep -q hisi-nvp6124b "$QEMU_DIR/hw/i2c/meson.build"; then
-        sed -i "s/'hisi-mis2006.c'/'hisi-mis2006.c', 'hisi-nvp6124b.c'/" \
-            "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added hisi-nvp6124b.c"
-    fi
+fi
+# The image sensors: any machine attaches any of them by name
+# (hw/i2c/image-sensor.c), so every target builds them all.  A tree from
+# before this has them in the families' lists: take them out of those.
+sed -i -E "/CONFIG_(HISI_I2C|FULLHAN|GRAINMEDIA|INGENIC)/s/'(hisi-(imx[0-9]+|f37|gc2053|sp2305|mis2006|nvp6124b|smartsens)|galaxycore|ingenic-ov2735)\.c'(, )?//g" \
+    "$QEMU_DIR/hw/i2c/meson.build"
+if ! grep -q "'image-sensor.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_I2C', if_true: files('image-sensor.c', 'imx323.c', 'galaxycore.c', 'hisi-f37.c', 'hisi-imx291.c', 'hisi-imx307.c', 'hisi-imx335.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c', 'hisi-sp2305.c', 'ingenic-ov2735.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added the image sensors"
 fi
 
 # hw/ssi/Kconfig
@@ -1035,11 +1016,6 @@ for f in $(cd qemu && find hw -name 'fh-*.c' 2>/dev/null); do
         echo "  $d/meson.build: added $b"
     fi
 done
-if ! grep -q "'galaxycore.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_FULLHAN', if_true: files('galaxycore.c'))" \
-        >> "$QEMU_DIR/hw/i2c/meson.build"
-    echo "  hw/i2c/meson.build: added galaxycore.c"
-fi
 if ! grep -q "'fullhan.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_FULLHAN', if_true: files('fullhan.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
@@ -1086,12 +1062,6 @@ for f in $(cd qemu && find hw -name 'gm-*.c' 2>/dev/null); do
         echo "  $d/meson.build: added $b"
     fi
 done
-if ! grep -q "CONFIG_GRAINMEDIA', if_true: files('galaxycore.c')" \
-        "$QEMU_DIR/hw/i2c/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('galaxycore.c'))" \
-        >> "$QEMU_DIR/hw/i2c/meson.build"
-    echo "  hw/i2c/meson.build: added galaxycore.c for GRAINMEDIA"
-fi
 # shared models: the H.264 slice coder, the FTAES020, the JPEG scan coder
 for b in hantro-h264.c fh-aes.c nvt-pixel.c; do
     if ! grep -q "CONFIG_GRAINMEDIA', if_true: files('$b')" \
@@ -1149,15 +1119,6 @@ for f in $(cd qemu && find hw -name 'ingenic*.c' ! -path 'hw/mips/*' 2>/dev/null
         echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
             >> "$QEMU_DIR/$d/meson.build"
         echo "  $d/meson.build: added $b"
-    fi
-done
-# the image sensors sensor= attaches (models shared with the ARM families)
-for b in galaxycore.c hisi-smartsens.c hisi-f37.c; do
-    if ! grep -q "CONFIG_INGENIC', if_true: files('$b')" \
-            "$QEMU_DIR/hw/i2c/meson.build"; then
-        echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
-            >> "$QEMU_DIR/hw/i2c/meson.build"
-        echo "  hw/i2c/meson.build: added $b for INGENIC"
     fi
 done
 # shared coders for the VPU (ingenic-vpu.c): H.264 slices, H.265 slices, JPEG
