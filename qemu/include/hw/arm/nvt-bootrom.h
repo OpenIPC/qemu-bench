@@ -22,6 +22,7 @@ struct NvtBootRomState {
     MemoryRegion rom;           /* the ROM at its home, rom-base */
     uint8_t *image;
     uint8_t *loader;
+    char *loader_file;          /* what the ROM got by TFTP or serial */
     NvtFlashState *flash;
     MemoryRegion *mem;          /* the loader's view (default: system) */
     AddressSpace as;

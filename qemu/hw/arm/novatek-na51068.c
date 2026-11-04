@@ -27,6 +27,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "hw/arm/boot.h"
@@ -223,6 +224,33 @@ static const struct {
 /* -M nt98323,flash-file=: the boot flash image (SPI NOR, or SPI NAND) */
 static char *na51068_flash_file;
 
+static char *na51068_boot_file;
+static uint32_t na51068_boot_strap;
+
+static void na51068_get_boot_strap(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &na51068_boot_strap, errp);
+}
+
+static void na51068_set_boot_strap(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &na51068_boot_strap, errp);
+}
+
+static char *na51068_get_boot_file(Object *obj, Error **errp)
+{
+    return g_strdup(na51068_boot_file);
+}
+
+static void na51068_set_boot_file(Object *obj, const char *value,
+                                  Error **errp)
+{
+    g_free(na51068_boot_file);
+    na51068_boot_file = g_strdup(value);
+}
+
 static char *na51068_get_flash_file(Object *obj, Error **errp)
 {
     return g_strdup(na51068_flash_file);
@@ -378,6 +406,7 @@ static void na51068_init(MachineState *machine, const Na51068SoCConfig *c)
 
     dev = qdev_new("nvt-top");
     qdev_prop_set_uint32(dev, "chip-id", c->chip_id);
+    qdev_prop_set_uint32(dev, "strap", na51068_boot_strap);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NA51068_TOP_BASE, 1);
 
@@ -616,6 +645,7 @@ static void na51068_init(MachineState *machine, const Na51068SoCConfig *c)
      * fdt / uboot partitions and SHMINFO handoff as NA51089).
      */
     if (!machine->kernel_filename && na51068_flash_file) {
+        nvt_rom_set_loader_file(na51068_boot_file);
         /* the loader in its SRAM (LDS_LZ.lds 0xFE080000), or the stand-in */
         static const NvtRomConfig rc = {
             NA51068_SRAM_BASE, NA51068_SRAM_SIZE, 0xFE0F8000, 0xFE200000, 2,
@@ -645,6 +675,14 @@ static void na51068_init(MachineState *machine, const Na51068SoCConfig *c)
         mc->max_cpus = 2;                                            \
         mc->default_cpus = 2;                                        \
         mc->ignore_memory_transaction_failures = true;               \
+        object_class_property_add(OBJECT_CLASS(mc), "boot-strap",    \
+            "uint32", na51068_get_boot_strap, na51068_set_boot_strap,\
+            NULL, NULL);                                             \
+        object_class_property_add_str(OBJECT_CLASS(mc), "boot-file", \
+            na51068_get_boot_file, na51068_set_boot_file);           \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "boot-file", "loader image the mask ROM got by TFTP or " \
+            "UART, in place of the flash's");                        \
         object_class_property_add_str(OBJECT_CLASS(mc), "flash-file",\
             na51068_get_flash_file, na51068_set_flash_file);         \
         object_class_property_set_description(OBJECT_CLASS(mc),      \

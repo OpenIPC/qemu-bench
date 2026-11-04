@@ -447,6 +447,27 @@ the vendor init scripts. A NAND pack (`FW98566A.bin`) comes out as the
 128 MiB NAND's data, its UBI rootfs as ubinize made it. It boots the same
 way with `SOC=nt98566 FLASH=nand.bin`.
 
+## Recovery boot
+
+The silicon's ROM also takes its loader from SD, Ethernet (DHCP and TFTP),
+USB or UART. That fetch is not modelled: `boot-file=` is what it delivered,
+a host file copied to SRAM in place of the flash's first bytes, and
+`boot-strap=` is the straps as TOP+0 reads them. From there the guest code
+is the real thing: an `Eth` loader runs Novatek's DHCP and TFTP client on
+`nvt-eqos` against slirp, a `Uart` loader serves `openipc/nvt-uart-boot.py`
+from OpenIPC/u-boot's `openipc-novatek` over `-serial tcp:...`.
+
+```sh
+qemu-system-arm -M nt98562,flash-file=blank.bin,boot-file=set/loader.bin,boot-strap=4 \
+    -display none -serial stdio -nic user,tftp=set
+```
+
+On NA51068 Ethernet is strap 3 and the embedded PHY is MAC1: `-nic user`
+twice, TFTP on the second. The library showed three things in `nvt-eqos`:
+TX checksum insertion (TDES3 CIC), a tail pointer that releases the Rx DMA
+when rewritten at the descriptor it waits at, as the library does after
+every frame with one fixed address, and NA51055's DSL in units of 4 bytes.
+
 ## The real first-stage loader
 
 With `flash-file=` and no `-kernel`, a machine boots as the silicon does
