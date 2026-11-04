@@ -527,6 +527,43 @@ sudo defib burn -c nt98562 -p socket:///tmp/nvt.sock --nic tap0
 straps, through the fallback from a blank NOR, and over Ethernet. Each time
 it checks that U-Boot answers at its prompt.
 
+### The mask ROM itself (`-bios`)
+
+[OpenIPC/opennovatek](https://github.com/OpenIPC/opennovatek) reconstructs
+the NA51089 mask ROM as C and assembly, and its `re.elf` runs here in place
+of the model, as openhisilicon's av300 ROM runs on the HiSilicon machines:
+
+```sh
+make -C opennovatek/bootrom/na51089 build
+qemu-system-arm -M nt98562,flash-file=blank.bin \
+    -bios opennovatek/bootrom/na51089/re.elf -display none -serial stdio
+```
+
+- **Loading:** `-bios` puts the image at the ROM's home, 0x80000000
+  (read-only), and in DRAM at 0, where it runs, as the loaders' copy leaves
+  it. The SRAM it keeps its data and stack in is mapped. Nothing of the
+  model is used.
+- **What it does on these devices:** from a blank NOR it prints silicon's
+  letters through the whole fallback: `NPIpK9`, `S1K2`, `HE` and the PHY
+  registers, six DHCP tries, `K:`, `U`, `K:`, then UART. defib recovers a
+  blank board through it over UART (`boot-strap=0xc`) and over Ethernet
+  (`boot-strap=4`, a tap), to U-Boot's prompt. `test-novatek-recovery.sh`
+  does both with `BIOS=re.elf`, and the `maskrom-na51089` CI job runs it.
+- **Two device fixes it needed:** the timers' targets come out of reset at
+  the full count (the ROM counts timer 1 as its clock without setting
+  one), and the USB device side's soft reset clears itself (the ROM waits
+  for it before its USB boot times out).
+- **What differs from silicon:**
+  - Its random-number block is not modelled, so the MAC's random tail
+    reads 0.
+  - The `>` after `NPIp` that silicon prints from a blank NOR does not
+    appear. It comes from a flash path not reached here, on the model's
+    W25Q rather than the board's XM25QH64A.
+  - The UART fallback with a host probing all along does not recover: the
+    ROM leaves its UART unread for a minute. Silicon drops what arrives
+    then, on a full FIFO; QEMU's UART holds it back and replays it, out of
+    step with the ROM's 16-byte framing. The model drains its UART instead.
+
 `boot-file=` still stands for a loader one of those sources delivered: a
 host file copied to SRAM in place of the flash's first bytes, with
 `boot-strap=` the straps as TOP+0 reads them. From there the guest code
