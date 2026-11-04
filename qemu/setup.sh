@@ -135,6 +135,9 @@ cp qemu/hw/gpio/sstar-i3-gpio.c     "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/sd/sstar-fcie.c          "$QEMU_DIR/hw/sd/"
 cp qemu/hw/misc/sstar-cmdq.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/arm/novatek.c            "$QEMU_DIR/hw/arm/"
+cp qemu/hw/arm/novatek-na51068.c    "$QEMU_DIR/hw/arm/"
+cp qemu/hw/arm/nvt-bootrom.c        "$QEMU_DIR/hw/arm/"
+cp qemu/include/hw/arm/nvt-bootrom.h "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/arm/nvt-lzma.c           "$QEMU_DIR/hw/arm/"
 cp qemu/hw/net/atbm-sdio.c          "$QEMU_DIR/hw/net/"
 # the WPA2-PSK authenticator both AltoBeam models share (atbm-sdio.c for
@@ -186,6 +189,17 @@ cp qemu/hw/display/nvt-lcd300.c     "$QEMU_DIR/hw/display/"
 cp qemu/hw/display/nvt-ide.c        "$QEMU_DIR/hw/display/"
 cp qemu/hw/display/nvt-dsi.c        "$QEMU_DIR/hw/display/"
 cp qemu/hw/timer/nvt-timer.c        "$QEMU_DIR/hw/timer/"
+cp qemu/hw/timer/nvt-fttmr010.c     "$QEMU_DIR/hw/timer/"
+cp qemu/hw/timer/nvt-hrtimer.c      "$QEMU_DIR/hw/timer/"
+cp qemu/hw/gpio/nvt-ftgpio010.c      "$QEMU_DIR/hw/gpio/"
+cp qemu/hw/i2c/nvt-ftiic010.c       "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/dma/nvt-ftdmac030.c      "$QEMU_DIR/hw/dma/"
+cp qemu/hw/misc/nvt-na51068-misc.c  "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-adc.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-ddrc.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-gzip.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-hwcopy.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/nvt-ir.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/rtc/nvt-rtc.c            "$QEMU_DIR/hw/rtc/"
 cp qemu/hw/ssi/nvt-flash.c          "$QEMU_DIR/hw/ssi/"
@@ -649,10 +663,13 @@ config NOVATEK
     select USB_EHCI_SYSBUS
     select HISI_I2C
     select AHCI_SYSBUS
+    select SDHCI
+    select AT24C
+    select USB_XHCI_SYSBUS
 KCONFIG
     echo "  hw/arm/Kconfig: added NOVATEK"
 else
-    for sym in A9MPCORE ARM_GIC PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C AHCI_SYSBUS; do
+    for sym in A9MPCORE ARM_GIC PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C AHCI_SYSBUS SDHCI AT24C USB_XHCI_SYSBUS; do
         if ! sed -n '/^config NOVATEK$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config NOVATEK\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -661,7 +678,7 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-pixel misc/nvt-gfx misc/nvt-ai misc/nvt-md misc/nvt-ive misc/nvt-audio misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 display/nvt-ide display/nvt-dsi timer/nvt-timer gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-pixel misc/nvt-gfx misc/nvt-ai misc/nvt-md misc/nvt-ive misc/nvt-audio misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 display/nvt-ide display/nvt-dsi timer/nvt-timer timer/nvt-fttmr010 timer/nvt-hrtimer gpio/nvt-ftgpio010 i2c/nvt-ftiic010 dma/nvt-ftdmac030 misc/nvt-na51068-misc misc/nvt-adc misc/nvt-ddrc misc/nvt-hwcopy misc/nvt-ir gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
@@ -720,6 +737,21 @@ else
 endif
 MESON
     echo "  hw/misc/meson.build: added nvt-h26xdec.c"
+fi
+if ! grep -q "'nvt-gzip.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: [files('nvt-gzip.c'), zlib])" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added nvt-gzip.c"
+fi
+if ! grep -q "'nvt-bootrom.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-bootrom.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added nvt-bootrom.c"
+fi
+if ! grep -q "'novatek-na51068.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('novatek-na51068.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added novatek-na51068.c"
 fi
 if ! grep -q "'nvt-lzma.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_NOVATEK', if_true: files('nvt-lzma.c'))" \

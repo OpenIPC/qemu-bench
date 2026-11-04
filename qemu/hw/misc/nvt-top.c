@@ -64,7 +64,10 @@ static const MemoryRegionOps nvt_top_ops = {
     .write = nvt_top_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 4,
-    .valid.max_access_size = 4,
+    /* NA51103's loader reads the BL31 entry at 0x1200 with one 64-bit load */
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
 };
 
 static void nvt_top_reset(DeviceState *dev)

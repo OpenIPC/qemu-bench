@@ -12,7 +12,7 @@ desk. Vendor families covered:
 - **Goke** GK7101 / GK7102 and the GK710xS die
 - **Anyka** AK39xx
 - **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375) and infinity3 (MSC313E)
-- **Novatek** NT9856x, NT98533 and NT98332
+- **Novatek** NT9856x, NT9852x, NT98532/NT98533, NT9832x, NT98332 and NT98633
 - **Allwinner** V831 / V833
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
   FH8626V100, FH8632
@@ -24,11 +24,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
-- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
+- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (96 total)
+## Supported Machines (106 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -423,6 +423,7 @@ blocks answer the SDK's sample drivers with standard results
 |---------|-----|-----|--------|-------------|
 | `nt98562` | Cortex-A9, 64 MB in package | GIC | 4.19.91 vendor (DT) | yes¹ |
 | `nt98566` | Cortex-A9, 128 MB in package | GIC | 4.19.91 vendor (DT) | yes¹ |
+| `nt98560` / `nt98561` | Cortex-A9, 512 / 64 MB (same die and chip ID) | GIC | 4.19.91 vendor (DT) | via `nt98562`'s tests |
 
 Novatek's NA51089 camera dies, in `hw/arm/novatek.c`: an A9 MPCore at
 `0xFFD00000` and Novatek's own blocks from `0xF0000000` (TOP/chip ID, the
@@ -435,7 +436,9 @@ the closed DDR-training loader: the SDK's own `FW98562A.bin`, laid out by
 `qemu-boot/nvtpack2flash.py`, runs the vendor U-Boot, kernel and init
 scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). The 566 boards' SPI NAND
 is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
-(`qemu-boot/test-novatek-nand.sh`). SD cards attach with
+(`qemu-boot/test-novatek-nand.sh`), and so does a raw Dahua NT98566
+NAND dump. Every Novatek machine takes SPI NAND
+([docs/novatek.md](docs/novatek.md#nand-boot-on-every-machine)). SD cards attach with
 `-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
 vendor U-Boot read and write them. An eMMC attaches to the third host
 (SDIO3) with `-drive if=sd,index=2`. The USB host (FOTG200) works under the
@@ -477,8 +480,42 @@ U-Boot's boot-time stamps and the HDAL read it. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
+With a real first-stage loader at flash 0 the Novatek machines boot as the
+silicon does instead: a mask ROM model copies the loader to SRAM and runs it,
+and the loader's own closed DDR training, U-Boot load and SMP bring-up run
+against the models. That boots the Xiongmai NT98562 and Dahua NT98566 dumps
+and, with loaders built from the SDKs' source
+(`qemu-boot/build-novatek-loader.sh`; `--loader` in the NS02501 and NA51068
+build scripts), NT98525, NT98528, NT98533, NT98321 and NT98323 images
+from the flash file alone
+([docs/novatek.md](docs/novatek.md#the-real-first-stage-loader)). NT98332's
+and NT98633's AArch32 loaders run on an extra boot core and warm-reset the
+A53s into the firmware's own BL31 (`-smp 3` / `-smp 5`, the defaults).
+
 ¹ Ethernet works from the kernel (DHCP, a file over HTTP) and from the
 vendor U-Boot (`ping`, `dhcp`, `tftp`).
+
+### Novatek NT9852x (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98525` | 2x Cortex-A9, 512 MB | GIC | 4.19.91 vendor (DT) | yes³ |
+| `nt98528` | 2x Cortex-A9, 512 MB | GIC | 4.19.91 vendor (DT) | yes³ |
+
+Novatek's NA51055 die, which the NT9852x SDK builds one kernel for:
+NT98520 / NT98523 / NT98525 report chip ID `0x4821` (`nt98525`),
+NT98528 / NT98529 `0x5021`, CHIP_NA51084 (`nt98528`). It is NA51089's
+die with two A9 cores and a few deltas, so it shares the NT9856x
+machine code and models: three more UARTs and two more I2C controllers,
+the hash engine moved, a second CNN, five SIEs, a second DDR arbiter,
+and its own PLL register layout per chip ID. The second core starts
+the vendor way, through the loader's release word. The SDK's own
+kernel and initramfs boot to a shell on both cores with the generated
+device tree. With the SDK's modules added, Ethernet works (DHCP, ping),
+and the HDAL and AI modules bind every engine. Notes in
+[docs/novatek.md](docs/novatek.md#nt9852x-na51055--na51084).
+The SDK's NT98529 NAND pack, `FW98529A.bin`, boots from the emulated SPI
+NAND through the vendor U-Boot on both machines.
 
 ### Novatek NT98533 (`qemu-system-arm`)
 
@@ -493,11 +530,42 @@ models serve it. The machine stands in for the loader as on NT9856x, and
 the SDK's own U-Boot 2021.10 and kernel 5.10 boot from SPI NOR on both
 cores. The SD card and Ethernet work under the SDK's modules.
 `qemu-boot/build-ns02501-sdk.sh` builds everything from the SDK, and
-`qemu-boot/test-nt98533.sh` checks it. Notes in
+`qemu-boot/test-nt98533.sh` checks it. `--nand` builds the SDK's NAND
+board instead, which boots from the emulated SPI NAND. Notes in
 [docs/novatek.md](docs/novatek.md#nt98533-ns02501).
 
 ³ Built from the vendor SDK (not distributable, so not in CI beyond
 `test-novatek.py`).
+
+### Novatek NT98323 (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98323` | 2x Cortex-A9, 512 MB | GIC | 4.9.118 vendor (SDK DT) | yes³ |
+
+Novatek's NA51068 DVR/NVR die (NT98321 / NT98323), in
+`hw/arm/novatek-na51068.c`. It is a different design from the camera
+dies, built from Faraday-derived blocks around a dual A9 MPCore at
+`0xF9C00000`. The SDK's U-Boot boots from the 32 MiB SPI NOR, or from SPI
+NAND for the NT98321 NAND board (`flash-file=`, the machine standing in for
+the closed loader). It starts the kernel and RAMDisk from their
+partitions. Alternatively, `-kernel` with the SDK's board tree (`-dtb`)
+boots the kernel directly. Either way it comes up on both cores to a
+shell. Everything but the media blocks is modelled:
+- the FTTMR010 timer (`hw/timer/nvt-fttmr010.c`);
+- the FTGPIO010s, FTIIC010s and FTDMAC030 (`hw/gpio/nvt-ftgpio010.c`,
+  `hw/i2c/nvt-ftiic010.c`, `hw/dma/nvt-ftdmac030.c`);
+- the SPI020 flash controller (an `nvt-flash` front end, NOR and NAND);
+- the SD host, both USB 2.0 hosts and both SATA hosts;
+- both Ethernet MACs (DHCP, ping and HTTP on `eth0` and `eth1`);
+- the RTC, the watchdog (reboot), and the crypto / hash / RSA engines (all
+  22 kernel self-tests pass);
+- the PWM, IR receiver and thermal sensor (`hw/misc/nvt-na51068-misc.c`);
+- the clock generator, the OTP and the UARTs.
+
+`qemu-boot/build-na51068-sdk.sh` builds U-Boot, the kernel, the tree and
+the NOR or NAND image from the SDK.
+Notes in [docs/novatek.md](docs/novatek.md#nt98323-na51068).
 
 ### Novatek NT98332 (`qemu-system-aarch64`)
 
@@ -508,8 +576,10 @@ cores. The SD card and Ethernet work under the SDK's modules.
 Novatek's NA51103 NVR die (NT98331/NT98332/NT98631/NT98632), also in
 `hw/arm/novatek.c`: Novatek's blocks above 4 GiB at `0x2_F0000000`, most of
 them NA51089's at new offsets. A whole 16 MiB SPI NOR image boots the way
-the board does: the machine stands in for the loader (the device tree and
-U-Boot are LZMA-packed in flash, `hw/arm/nvt-lzma.c` unpacks them), and the
+the board does: the mask ROM runs Xiongmai's loader, which trains DDR and
+warm-resets into the firmware's BL31 and U-Boot (with `loader=off` or
+`-smp 2` the machine stands in for the loader: the device tree and U-Boot
+are LZMA-packed in flash, `hw/arm/nvt-lzma.c` unpacks them), and the
 vendor U-Boot loads the kernel from the squashfs, which runs the vendor NVR
 application. Its GUI shows on the QEMU display through the LCD300 model and
 takes a USB mouse; the two SATA ports take disks (`-drive if=ide`), the
@@ -524,6 +594,25 @@ H.265 too. Notes in
 [docs/novatek.md](docs/novatek.md#nt98332-na51103).
 
 ² A Xiongmai NBD80N36RA-KL NVR dump (not distributable, so not in CI).
+
+### Novatek NT98633 (`qemu-system-aarch64`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98633` | 4x Cortex-A53, 2 GB | GIC-400 | 4.19.148 vendor (its own DT) | yes³ |
+
+NA51090, NT98332's four-core relative: the same machine code with the
+blocks that moved (WDT, RTC, OTP, thermal, crypto, two Ethernet MACs,
+USB, three SATA hosts, a fifth UART) in a table of its own. A whole SPI NAND
+image (with or without its spare bytes) boots the way the board does: the
+mask ROM runs its loader on a boot core, which trains DDR and warm-resets
+the A53s into the firmware's BL31, U-Boot, the kernel and the vendor NVR
+application, with all four CPUs up and Ethernet working:
+`qemu-system-aarch64 -M nt98633,flash-file=nand.bin -nographic` (`-smp 4`
+or `loader=off`: the stand-in). Notes in
+[docs/novatek.md](docs/novatek.md#nt98633-na51090).
+
+³ An N2032-8HDD NVR SPI NAND dump (not distributable, so not in CI).
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -719,7 +808,7 @@ qemu/
 ├── hw/misc/sstar-i3-bach.c      # infinity3 audio DMA (playback, capture)
 ├── hw/gpio/sstar-i3-gpio.c      # infinity3 GPIO, SAR ADC, PM-sleep irqchip, day/night
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
-├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98533, NT98332
+├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98533, NT98332, NT98633
 ├── hw/arm/nvt-lzma.c            # LZMA decoder for the NA51103 boot stand-in
 ├── hw/misc/nvt-dai.c            # NA51103 audio interfaces (I2S DMA, silence)
 ├── hw/misc/nvt-engine.c         # HDAL media engines: link lists, job done
@@ -818,7 +907,7 @@ docs/
 ├── grainmedia.md                # Grain Media GM813x: map, nsboot boot chain, video, audio, MJPEG
 ├── ingenic.md                   # Ingenic T-series: map, CPUs, mask ROM and cache-as-RAM, devices
 ├── sigmastar.md                 # SigmaStar/MStar infinity2m/infinity3: RIU banks, boot chain
-├── novatek.md                   # NT9856x, NT98533, NT98332: DT, loader stand-in, media
+├── novatek.md                   # NT9856x, NT9852x, NT9853x, NT9832x, NT98332, NT98633: DT, loader stand-in, media
 ├── ive-registers.md             # IVE register map (from live EV300 capture)
 ├── ive-applications.md          # IVE-based video analytics for OpenIPC
 ├── ive-eval-methodology.md      # IVE motion/abandoned detection evaluation

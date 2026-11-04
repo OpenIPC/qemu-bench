@@ -60,6 +60,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -1052,6 +1053,191 @@ static const MemoryRegionOps nvt_flash_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The Faraday SPI020 front end ("spi020" set): NA51068's controller
+ * (drivers/mtd/nvt_flash_spi/nvt_flash_spi020{.c,_cmd.c,_reg.h}), the
+ * same flash behind it.  Software loads the flash address (0x00), the
+ * address length, dummy cycles and instruction length (0x04, [2:0],
+ * [23:16], [25:24], continuous-mode enable bit 28) and the data count
+ * (0x08), then starts the command with 0x0C: [31:24] instruction, [23:16]
+ * continuous-mode code, [9:8] chip select, [7:5] I/O mode, bit 2 read a
+ * status byte instead of data (into 0x28), bit 1 data goes to the flash.
+ * Data moves through the port at 0x100, a word at a time; 0x18 bit 0
+ * says the TX FIFO is empty, bit 1 that RX data is there.  Completion is
+ * 0x24 bit 0 (write 1 to clear), an interrupt with 0x20 bit 1.  0x20
+ * bit 0 hands the data port to DMA: a command with data then raises the
+ * "drq" line, which the FTDMAC030's handshake channel answers by moving
+ * the data through the port (the loader's NAND driver; Linux's has
+ * NAND_USE_DMA compiled out).  The FIFO checksum and DTR are not
+ * modelled.
+ * The flash is never busy, so a hardware status poll reads once.
+ */
+#define S020_ADDR           0x00
+#define S020_CMD2           0x04
+#define S020_COUNT          0x08
+#define S020_CMD4           0x0C
+#define S020_CTRL           0x10
+#define S020_STATUS         0x18
+#define S020_INT_CTRL       0x20
+#define S020_INT_STS        0x24
+#define S020_READ_STS       0x28
+#define S020_DATA           0x100
+#define S020_CTRL_ABORT     (1u << 8)
+#define S020_INT_EN         (1u << 1)
+#define S020_DMA_EN         (1u << 0)
+#define S020_STS_TX_EMPTY   (1u << 0)
+#define S020_STS_RX_FULL    (1u << 1)
+
+static void nvt_spi020_update_irq(NvtFlashState *s)
+{
+    qemu_set_irq(s->irq, (*reg(s, S020_INT_CTRL) & S020_INT_EN) &&
+                 (*reg(s, S020_INT_STS) & 1));
+}
+
+static void nvt_spi020_complete(NvtFlashState *s)
+{
+    spi_deselect(s);
+    s->rd_left = s->wr_left = 0;
+    *reg(s, S020_INT_STS) |= 1;
+    nvt_spi020_update_irq(s);
+}
+
+static uint8_t nvt_spi020_xfer(NvtFlashState *s, uint8_t tx)
+{
+    /* chip select 1 has nothing behind it */
+    return ((*reg(s, S020_CMD4) >> 8) & 3) ? 0xFF : spi_xfer(s, tx);
+}
+
+static void nvt_spi020_start(NvtFlashState *s, uint32_t cmd4)
+{
+    uint32_t cmd2 = *reg(s, S020_CMD2);
+    uint32_t addr = *reg(s, S020_ADDR);
+    int alen = cmd2 & 7, dummy = (cmd2 >> 16) & 0xFF;
+    int mode = (cmd4 >> 5) & 7, i;
+
+    spi_deselect(s);
+    spi_select(s);
+    if ((cmd2 >> 24) & 3) {
+        nvt_spi020_xfer(s, cmd4 >> 24);
+    }
+    for (i = alen - 1; i >= 0; i--) {
+        /* a 5..7-byte address: its bytes past the 32-bit register are 0 */
+        nvt_spi020_xfer(s, i < 4 ? addr >> (8 * i) : 0);
+    }
+    if (cmd2 & (1u << 28)) {
+        nvt_spi020_xfer(s, cmd4 >> 16);
+    }
+    /* dummy clocks as bytes: one line, or 2 / 4 in the I/O modes */
+    dummy = mode == 4 ? dummy / 2 : mode == 3 ? dummy / 4 : dummy / 8;
+    for (i = 0; i < dummy; i++) {
+        nvt_spi020_xfer(s, 0);
+    }
+    if (cmd4 & (1u << 2)) {
+        *reg(s, S020_READ_STS) = nvt_spi020_xfer(s, 0);
+        nvt_spi020_complete(s);
+    } else if (*reg(s, S020_COUNT) && (cmd4 & (1u << 1))) {
+        s->wr_left = *reg(s, S020_COUNT);
+    } else if (*reg(s, S020_COUNT)) {
+        s->rd_left = *reg(s, S020_COUNT);
+    } else {
+        nvt_spi020_complete(s);
+    }
+    /* outside this access: the DMA's reads come back to the port */
+    if ((s->rd_left || s->wr_left) &&
+        (*reg(s, S020_INT_CTRL) & S020_DMA_EN)) {
+        qemu_bh_schedule(s->drq_bh);
+    }
+}
+
+static void nvt_spi020_drq(void *opaque)
+{
+    NvtFlashState *s = opaque;
+
+    qemu_irq_raise(s->drq);
+    qemu_irq_lower(s->drq);
+}
+
+static uint64_t nvt_spi020_read(void *opaque, hwaddr off, unsigned size)
+{
+    NvtFlashState *s = opaque;
+    uint32_t val = 0;
+    int i, n;
+
+    switch (off) {
+    case S020_STATUS:
+        return S020_STS_TX_EMPTY | (s->rd_left ? S020_STS_RX_FULL : 0);
+    case S020_DATA:
+        n = MIN(s->rd_left, 4);
+        for (i = 0; i < n; i++) {
+            val |= nvt_spi020_xfer(s, 0) << (8 * i);
+        }
+        if (n) {
+            s->rd_left -= n;
+            if (!s->rd_left) {
+                nvt_spi020_complete(s);
+            }
+        }
+        return val;
+    default:
+        return off < NVT_FLASH_REGS_SIZE ? *reg(s, off) : 0;
+    }
+}
+
+static void nvt_spi020_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    NvtFlashState *s = opaque;
+    int i, n;
+
+    switch (off) {
+    case S020_CMD4:
+        *reg(s, off) = val;
+        nvt_spi020_start(s, val);
+        break;
+    case S020_DATA:
+        n = MIN(s->wr_left, 4);
+        for (i = 0; i < n; i++) {
+            nvt_spi020_xfer(s, val >> (8 * i));
+        }
+        if (n) {
+            s->wr_left -= n;
+            if (!s->wr_left) {
+                nvt_spi020_complete(s);
+            }
+        }
+        break;
+    case S020_CTRL:
+        if (val & S020_CTRL_ABORT) {
+            spi_deselect(s);
+            s->rd_left = s->wr_left = 0;
+            val &= ~S020_CTRL_ABORT;
+        }
+        *reg(s, off) = val;
+        break;
+    case S020_INT_STS:
+        *reg(s, off) &= ~val;
+        nvt_spi020_update_irq(s);
+        break;
+    case S020_INT_CTRL:
+        *reg(s, off) = val;
+        nvt_spi020_update_irq(s);
+        break;
+    default:
+        if (off < NVT_FLASH_REGS_SIZE) {
+            *reg(s, off) = val;
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps nvt_spi020_ops = {
+    .read = nvt_spi020_read,
+    .write = nvt_spi020_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static void nvt_flash_reset(DeviceState *dev)
 {
     NvtFlashState *s = NVT_FLASH(dev);
@@ -1170,10 +1356,15 @@ static void nvt_flash_realize(DeviceState *dev, Error **errp)
         s->jedec = 0xEF4000 | ctz32(s->size);
     }
 
-    memory_region_init_io(&s->iomem, OBJECT(s), &nvt_flash_ops, s,
+    memory_region_init_io(&s->iomem, OBJECT(s),
+                          s->spi020 ? &nvt_spi020_ops : &nvt_flash_ops, s,
                           TYPE_NVT_FLASH, 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+    if (s->spi020) {
+        qdev_init_gpio_out_named(dev, &s->drq, "drq", 1);
+        s->drq_bh = qemu_bh_new(nvt_spi020_drq, s);
+    }
     return;
 
 fail:
@@ -1217,6 +1408,7 @@ static const Property nvt_flash_properties[] = {
     DEFINE_PROP_STRING("flash-file", NvtFlashState, flash_file),
     DEFINE_PROP_UINT32("size", NvtFlashState, size, 8 * MiB),
     DEFINE_PROP_UINT32("jedec", NvtFlashState, jedec, 0),
+    DEFINE_PROP_BOOL("spi020", NvtFlashState, spi020, false),
 };
 
 static void nvt_flash_class_init(ObjectClass *klass, const void *data)

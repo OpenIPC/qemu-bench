@@ -1,4 +1,4 @@
-# Novatek NT9856x (`nt98562`, `nt98566`), NT98533 (`nt98533`) and NT98332 (`nt98332`)
+# Novatek NT9856x (`nt98560`, `nt98561`, `nt98562`, `nt98566`), NT9852x (`nt98523`, `nt98525`, `nt98528`, `nt98529`), NT98532 / NT98533 (`nt98532`, `nt98533`), NT9832x (`nt98321`, `nt98323`), NT98332 (`nt98332`) and NT98633 (`nt98633`)
 
 Novatek's NT9856x IP-camera SoCs (internal name NA51089): one Cortex-A9
 with DDR in the package and Novatek's own peripheral blocks from
@@ -8,9 +8,12 @@ kernel with its root on the emulated SPI NOR, Ethernet up and an SD card,
 and boots a
 whole flash image through the vendor U-Boot, on SPI NOR or (the 566 boards)
 SPI NAND with a UBIFS root. What is left is in
-[Not modelled](#not-modelled). [NT98533](#nt98533-ns02501) (NS02501) is
+[Not modelled](#not-modelled). [NT9852x](#nt9852x-na51055--na51084)
+(NA51055) is the same die with two cores and a few blocks added or moved.
+[NT98533](#nt98533-ns02501) (NS02501) is
 the same peripherals around two Cortex-A32s; [NT98332](#nt98332-na51103)
-(NA51103) is an aarch64 NVR die.
+(NA51103) is an aarch64 NVR die, and [NT98633](#nt98633-na51090) (NA51090)
+its four-core relative.
 
 ## What the SDKs support
 
@@ -24,12 +27,14 @@ the same peripherals around two Cortex-A32s; [NT98332](#nt98332-na51103)
 | `ns02501_loader_v3.07.101` | NS02501 | The loader's source, as NA51089's (`bl_func.c`, `bl_lowlevel_init.c`) |
 | `NT98533.zip` | NS02501 | `NT98533_DataSheet_Register_Map.pdf`, Boot ROM, boot loader and U-Boot guides, pinmux sheets |
 | `NT9856x-…-000/001.zip` | NA51089 | Prebuilt NVTPACK images `FW9856{2,6}A.bin` (562 NOR, 562 NAND, 566 NAND) and loaders |
-| `NT9832x_SDK_release_v1.02.0{13,24}` | NA51068 (NT98321/323/621/623) | A dual-A9 DVR part with Faraday IP at `0xFExx0000`; a different family, not modelled |
+| `NT9852X_SDK_FULL_from_Marcin_W.tar.gz` → `na51055_linux_sdk`, `na51055_ldr` | NA51055 / NA51084 (NT98520/523/525, NT98528/529) | Kernel 4.19.91 (`CONFIG_NVT_IVOT_PLAT_NA51055`) built, with its `uImage`, `vmlinux`, `System.map` and 308 modules; U-Boot (also carrying NA51000/51068/51089/51090/51102/51103 trees), RTOS, HDAL with 152 samples, board configs `cfg_*` / `cfg_528_*` / `cfg_529_*`, and in `output/` a whole NT98529 NAND image `FW98529A.bin`. Loader source with prebuilt `LD98520A.bin` / `LD98525A.bin`. Also the release tarballs `nt9852x_linux_sdk_release_{glibc,uclibc}_v2.05.009`, `nt9852x_loader_release_v2.05.013` and the toolchain |
+| `NT9832x_SDK_release_v1.02.0{13,24}` | NA51068 (NT98321/323/621/623) | A dual-A9 DVR part with Faraday IP at `0xFExx0000`: `software/board/na51068_linux_sdk.tar.bz2` (kernel 4.9.118 source, U-Boot, board trees `cfg_9832{1,3}_*`, HDAL), `NT9832x_DataSheet_Register_Map.pdf`, schematics. See [NT98323](#nt98323-na51068) |
 | `NA51023_BSP` | NT96672 | MIPS 24KEc running uITRON/eCos; not Linux, out of scope |
 
 The OpenIPC kernel (branch `novatek-nt9856x` of `openipc/linux`) is the
 v1.01.002 SDK kernel. NA51023 and NA51055 use NA51089's register offsets
-(NA51023 at `0xC0000000`), so the blocks here are not 51089-only.
+(NA51023 at `0xC0000000`), so the blocks here are not 51089-only;
+NA51055's deltas are in [NT9852x](#nt9852x-na51055--na51084).
 
 ## Machines
 
@@ -37,6 +42,13 @@ v1.01.002 SDK kernel. NA51023 and NA51055 use NA51089's register offsets
 |---|---|---|---|
 | `nt98562` | `0x7021` | 64 MiB DDR2 (SDK: 30 / 34 MiB) | 128 / 96 MiB |
 | `nt98566` | `0x7021` | 128 MiB DDR3 (SDK: 32 / 96 MiB) | 128 / 96 MiB |
+| `nt98560` | `0x7021` | 512 MiB (SDK `cfg_560_IPCAM1_EVB`: Linux 256 MiB) | 256 MiB / the rest |
+| `nt98561` | `0x7021` | 64 MiB (SDK `cfg_561_IPCAM1_EVB`: Linux 30 MiB) | as `nt98562` |
+
+The part number is only U-Boot's build-time `_CHIP_NAME_`: NT98560 and
+NT98561 are the same die and chip ID as NT98562 / NT98566, with the
+packages' DDR. Their machines differ in the RAM size and the memory split
+alone.
 
 The SDK's memory tables (`nvt-mem-tbl.dtsi`) give Linux 30 or 32 MiB and
 the HDAL media pool the rest. That is too little to run the HDAL samples
@@ -289,6 +301,50 @@ and the image file holds it afterwards. Linux keeps a file on UBIFS across
 `reboot -f`. The test takes about 20 s. `test-novatek.py` plays the
 drivers' register sequences against both image formats in CI.
 
+### NAND boot on every machine
+
+Every Novatek machine takes a 128 or 256 MiB `flash-file=` as SPI NAND
+(a W25N01GV / W25N02KV by default). The loader stand-in then reads the
+tree from block 2 and `partition_uboot` from the tree's `nand` node, and
+SHMINFO tells U-Boot it booted from SPI NAND. `test-novatek.py`
+(`test_nand_stand_in`) checks that on all six machines. What has booted
+from NAND:
+
+| Machine | Firmware | Result |
+|---|---|---|
+| `nt98566`, `nt98562` | SDK `FW98566A.bin` (`nvtpack2flash.py`) | U-Boot, kernel, UBIFS root, read-write |
+| `nt98566`, `nt98562` | Dahua `DH_IPC-HX2X4X-Taylor…260225.dump` (a raw 128 MiB dump, used as is) | Dahua U-Boot, its RSA-checked second stage, kernel, squashfs root and UBIFS from NAND, Ethernet; see below |
+| `nt98528`, `nt98525` | NT9852x SDK `output/packed/FW98529A.bin` (`nvtpack2flash.py`) | U-Boot 2019.04, kernel and ramdisk from NAND, both cores, UBI on `rootfs1` and `app`, UBIFS mounted, Ethernet |
+| `nt98533` | the NS02501 SDK built with `build-ns02501-sdk.sh --nand` | U-Boot 2021.10, kernel 5.10 and ramdisk from NAND; Linux's read of the kernel partition matches the image byte for byte |
+| `nt98332` | none | no NAND firmware or NA51103 kernel with a SPI NAND driver exists here (Xiongmai's has only `nvt,nvt_spinor`); the stand-in is covered by `test-novatek.py` |
+
+On `nt98525` the NT98529 pack's tree carries NA51084's SD pad drive
+strengths, so it logs about 50 `No Valid DS value` lines (see
+[NT9852x](#nt9852x-na51055--na51084)).
+
+**The Dahua dump** (NT98566, `BIN_NAME = FW98566A`, 128 MB): its tree
+keeps the SDK's `partition_uboot` (`0xC0000`, Dahua's mini-Boot, a plain
+U-Boot), so it boots straight from the dump:
+
+```bash
+cp DH_IPC-HX2X4X-Taylor_MultiLang_PN_V2.840.0000000.26.R.260225.dump dh.bin   # writes go to the image
+qemu-system-arm -M nt98566,flash-file=dh.bin -nographic -serial mon:stdio \
+    -nic user -action watchdog=none
+```
+
+The loader slot at 0 holds Dahua's JSON hardware description instead of
+a loader, which the stand-in does not need. Dahua's second-stage U-Boot
+blanks `console=` in the kernel command line, so Linux prints nothing
+after "Uncompressing Linux". Its log is in RAM: `pmemsave` the 128 MB
+and read the 4.19 printk records. `syslog`, `config` and `backup` are all
+zeros in the dump. The kernel finds no UBI there and the userland
+formats them, which is the dump's doing, not the NAND model's. U-Boot arms
+the watchdog for about 84 s. `rcS` feeds it once ("the watchdog timeout is
+only 65 s, feed it once before sonia starts") and leaves the rest to
+Dahua's application `sonia`, which never takes over under QEMU. So the
+board resets about 84 s after U-Boot unless the watchdog action is
+`none` or `pause`.
+
 ## Flash boot
 
 On silicon the mask ROM loads the 32 KiB loader (`LD9856xA.bin`) into SRAM.
@@ -390,6 +446,168 @@ U-Boot 2019.04 (SPI NOR probed, empty SD slot, `nvt_boot`), the kernel and
 the vendor init scripts. A NAND pack (`FW98566A.bin`) comes out as the
 128 MiB NAND's data, its UBI rootfs as ubinize made it. It boots the same
 way with `SOC=nt98566 FLASH=nand.bin`.
+
+## The real first-stage loader
+
+With `flash-file=` and no `-kernel`, a machine boots as the silicon does
+when the flash starts with a loader: its header's word 1 is the SRAM
+base and word 0 (the entry) is inside the SRAM. The mask ROM model
+(`hw/arm/nvt-bootrom.c`) copies the loader (header word 9, `+0x24`, is
+its size) into SRAM and starts it. The loader trains DDR and loads and
+starts U-Boot itself, and U-Boot boots the kernel. Without a loader in
+the flash the machine stands in for it as [above](#flash-boot).
+`loader=off` forces the stand-in either way.
+
+| Machine | SRAM | ROM calls (`layout`) | Loader verified |
+|---|---|---|---|
+| `nt98562` / `nt98566` (NA51089) | `0xF07C0000`, 256 KiB | table at `0x7FD0`: LZMA, LZ, three message routines, efuse, Dec2HexStr (0) | Xiongmai NT98562 NOR dump; the Dahua NT98566 NAND dump with the SDK's `LD98566A.bin` in block 0 |
+| `nt98525` / `nt98528` (NA51055 / NA51084) | the same | memcpy `0x14FC`, Dec2HexStr `0x2068`, efuse `0x51F8`, at fixed addresses (1) | `LD98525A.bin` / `LD98528A.bin` built from `na51055_ldr`, SPI NAND |
+| `nt98533` (NS02501) | the same | none (2) | `LD98533A.bin` built from `ns02501_ldr` (CHIP 533QD), SPI NAND |
+| `nt98321` / `nt98323` (NA51068) | `0xFE080000`, 512 KiB | none (2) | `LD98321A.bin` (DDR3, SPI NAND) and `LD98323A.bin` (DDR4, SPI NOR) built from `na51068_loader_v1.08.014` |
+| `nt98332` (NA51103) | `0xFE000000` (`0x2_FE000000`), 256 KiB | NA51089's table plus vprintf at `0x7FB8` (3) | Xiongmai's `FW98332A.BIN` (NBD80N36RA-KL dump; `-smp 3`): see below |
+| `nt98633` (NA51090) | the same | the same | `FW98633A` (N2032-8HDD NAND dump; `-smp 5`, the default): [see there](#nt98633-na51090) |
+
+Each one boots to the shell (or, on the NVR and Dahua dumps, the vendor
+application) through U-Boot and the kernel, with every CPU up.
+
+The ROM's own code is not available, so the model's ROM is a reset
+vector that sets the ROM's stack (`BOOT_ROM_SP_LIMIT_ADDR`: `0xF07F8FFC`,
+or `0xFE0F8000` on NA51068) and jumps to the loader, plus one ARM stub
+per ROM routine. Each stub stores r0..r3 and two stack words in a
+service window (`0xF07BFF00`, an unused I/O address) and the service
+does the work in C. The LZ and LZMA decoders are the stand-in's, the
+messages go to UART 0, and the efuse reads blank. The loaders copy the
+32 KiB ROM from its home, `0x80000000` (NA51103: `0xF0000000` in its
+32-bit map), into DRAM at 0 before they use the table from there. So
+the image sits read-only at its home and, from reset, in DRAM at 0.
+
+What the loaders' closed DDR set-up (`Reset_*.a`, `configDDR`) waits for,
+each found by running them:
+
+- **`nvt-ddrc`** (the controller, its PHY and the arbiter): storage
+  whose status bits read as done and whose command bits clear
+  themselves. On NA51089 / NA51055 these are 0x04 [3:0] → [10:8], 0x20
+  [1:0] and PHY 0x2DC bit 7.
+  - NA51084's, NA51068's and NA51103's PHYs (`phy-pages`) are paged:
+    PHY `0x3F8` selects one of 16 pages, register n at PHY + 4n. Their
+    done flags are page 0 0x3D [7:6], page 0 0x43 bit 6 and page 2 0x4A
+    bit 5.
+  - NA51068 (`phy-offset` `0x8000`, two controllers at `0xFC400000` /
+    `0xFD600000`): DDR4's write Vref, page 2 0x8E, is written with
+    bit 7 set as a load strobe and read back as [6:0] (`vref-strobe`).
+  - NS02501 (`ns02501`, unpaged): Delayline_K's 0x105 / 0x106 bit 0, and
+    the run started at 0xCF, done at 0xBB bit 5 and passed at 0x6E
+    bit 5.
+- **`nvt-cg`**: the sleep-mode switch, 0xA0 (`sleep-reg`; NA51103 0xB0).
+  The loader sets bits 2 and 4 and waits for bit 3.
+- **The second core.** NA51055's loader takes core 2 out of reset
+  through `0xF0E400F0` bits 2/10/17/21, and NS02501's `cc_startCore(1)`
+  through `0xFFE40000` bits 2/10. NS02501's core 1 runs the DDR set-up
+  while core 0 waits on `config_dma_done`. A core leaves reset at its
+  reset vector, 0, at its highest exception level (EL3: NS02501's core 1
+  sets CNTFRQ). NS02501's loader also reads CPUECTLR (cp15 opc1 1, CRm 15,
+  64-bit), which QEMU's Cortex-A7 lacks.
+- **NA51055's release word** (`0xF07F8000`) sits in the page that also
+  holds the ROM's stack (from `0xF07F8FFC`), so that page takes any access
+  size. Byte accesses failing there broke DDR training on two-core
+  NT98528 runs.
+- **`nvt-gzip`** (NS02501, `0xF0100000`): the loader keeps its main part
+  deflated and unpacks it with this engine (CTRL bit 1 start, STS bit 0
+  done, SRC `0x20`, DST `0x28`, LEN `0x30`, OUTSZ `0x38`; gzip, zlib or raw
+  deflate).
+- **The FTTMR010 counting up** (NA51068, CR bit 9 + n): the loader's
+  `udelay()` runs timers 0 and 1 up from 0.
+- **SPI020 DMA handshakes** (NA51068 NAND): the loader reads NAND pages by
+  DMA. The flash controller's `drq` (on a data phase with `0x20` bit 0
+  set) drives the FTDMAC030's handshake input 0, and a channel with
+  `CFG` bit 7 (source) or 13 (destination) set waits for it.
+
+The real loader also checks what the stand-in does not:
+
+- The NT98533 loader checks U-Boot's header checksum length (`BinLength`
+  at `+0x368`, `encrypt_bin SUM u-boot.bin 0x350 ub02501`) and stops on
+  "uboot_size 0xFFFFFFFF" without it.
+- The SDK's prebuilt `LD98525A.bin` is the eMMC one, and the 533QC one
+  stops on "d1 s not matched": rebuild them as below.
+- The NT98525 board's tree must be SMP_OFF. The 525 loader then says
+  "not support smp".
+- To see the Dahua kernel's console, its environment (in the hwid
+  partition, flash `0x440000`, 128 KiB) needs `dh_keyboard=0`:
+  `qemu-boot/uboot-env.py --offset 0x440000 --size 0x20000 --uboot <its
+  U-Boot> flash.bin dh_keyboard=0`.
+
+### Building the loaders
+
+`qemu-boot/build-novatek-loader.sh <machine> <out.bin>` builds the SDK's
+own loader with the SDK's makefiles and its `arm-eabi` toolchain
+(`gcc-linaro-6.4.1-2018.05-x86_64_arm-eabi`), cleaning first: the
+archives carry prebuilt outputs.
+
+| Machine | Source | Settings |
+|---|---|---|
+| `nt98525` | NT9852x SDK `na51055_ldr` | `MODEL = EMU_EVB` (CHIP 525, DDR3, SPI NAND) |
+| `nt98528` | the same | `MODEL = EMU_EVB_528`, `LOADER_TYPE STAND_ALONE_LOADER_528` |
+| `nt98533` | NS02501 SDK `ns02501_ldr` | `MODEL = EMU_EVB`, `CHIP = 533QD` |
+| `nt98321` | NT9832x SDK `na51068_loader_v1.08.014` | `MODEL = 321_DDR3_4Gx1_NAND_SYS` |
+| `nt98323` | the same | `321_DDR4_8GX1_NAND_SYS` with CHIP 323, `SDRAM_SIZE 4096`, `DRAM_MUX FB`, `STORAGEINT SpiFlash` |
+
+`build-ns02501-sdk.sh` and `build-na51068-sdk.sh` take `--loader FILE` and
+put it at flash 0. The NS02501 script now always checksums U-Boot, as the
+SDK's build does. Images built that way boot from the flash file alone:
+
+```
+bash qemu-boot/build-novatek-loader.sh nt98323 ld323.bin
+bash qemu-boot/build-na51068-sdk.sh --sdk … --toolchain … --out na51068 \
+    --initrd rootfs.ramdisk.bin.raw --loader ld323.bin
+qemu-system-arm -M nt98323,flash-file=na51068/nor.bin -nographic -serial mon:stdio
+```
+
+### NT98332 (NA51103): through BL31
+
+NA51103's mask ROM starts core 0 in AArch32 at EL3. The loader runs from
+SRAM: a stub, then its main part, LZ-packed (BCL1 algorithm 9) and
+unpacked by the ROM to `0xFE020000`. It trains DDR, loads BL31 and
+U-Boot, and warm-resets the A53s into AArch64. QEMU cannot start an
+AArch64 CPU in AArch32, so the machine adds a boot core for the AArch32
+part: a Cortex-A7 in its own CPU cluster. That is why the machine takes
+three CPU slots (`-smp 3`, the default: two A53s and the boot core). With
+`-smp 2`, `loader=off` or `-kernel` there is no boot core and the stand-in
+runs. The peripherals (`0x2_F0000000`) are also at `0xF0000000` (the
+loader's view, and its AArch64 trampoline's).
+
+The boot, on Xiongmai's NBD80N36RA-KL dump, step by step:
+
+- the ROM, at `0xF0000000`: NA51089's table plus vprintf at `0x7FB8`;
+- DDR: the two controllers at `0xF00E0000` / `0xF00F0000`, NA51068's paged
+  PHYs at `+0x8000`, and CG's sleep switch at `0xB0`;
+- QSEN, the read-gate training, per byte lane (`qsen-match`). The loader
+  steps each lane's coarse (page 2 `0xBB`/`0xBC` nibbles) and fine (page 0
+  `0xD2`/`0xD3`) gate delay. It reads the MPR compare (page 3
+  `0x70 + 8 × lane`..`+3`) and the gate's sampled level (page 0 `0xB6` bit
+  `2 × lane`), looking for the window where the pattern matches and then
+  for the level's 1-to-0 edge inside it. The model matches across
+  positions `0x48`..`0xB8` with the edge at `0x80`;
+- the DRAM arbiters' testers at `0xF00A8000`, `0xF0118000` and
+  `0xF0518000` (the loader's `hvyload` check, `tester`): start bits at
+  `+0x5C`, status at `+0xA0` (bit 0 passed);
+- the A53's 64-bit IMPLEMENTATION DEFINED registers on the boot core
+  (CPUECTLR's SMPEN), as zero;
+- the boot core's L2CTLR counts the two A53s, and the loader sets up one
+  mailbox per core at `0xF0011214`..`0x121C`;
+- the warm reset: the loader puts an AArch64 trampoline at DRAM 0, BL31's
+  entry (`0x01F00000`) at `0xF0011200` / `0x120C`, and writes RMR = 3. The
+  boot core stops, and the A53s come up in AArch64 at EL3 at 0. The
+  trampoline reads the entry with one 64-bit load (TOP takes it as two),
+  and each core jumps to BL31;
+- the real BL31 (v2.2) sets up the GIC (secure) and the TZASC, answers
+  PSCI, and enters U-Boot at EL2. Linux brings CPU1 up with PSCI CPU_ON
+  and runs the NVR application.
+
+The firmware's first boot saves `osmem` to the environment and restarts
+itself; the restart runs the loader again. The loader reaches BL31 in
+about 12 s and the kernel in about 19 s, against 7 s with the stand-in.
+As with the stand-in, the kernel console needs `xmuart=0` in the U-Boot
+environment.
 
 ## SD card
 
@@ -640,7 +858,10 @@ CTR, and AES-GCM. The driver builds CCM from CBC and CTR passes.
 **`nvt-hash`** runs SHA-1, SHA-256 and their HMACs by DMA. Requests come
 in chunks: the state carries over through the IV registers, the engine
 pads the last chunk to the length in PADLEN, and it adds the HMAC's ipad
-and opad blocks itself when asked.
+and opad blocks itself when asked. On NA51055 and NA51068 the driver
+byte-reverses each word of the saved digest into the IV registers, which
+the `iv-reversed` property models; NT9852x and NT98323 set it (see
+[Security engines](#security-engines)).
 
 **`nvt-rsa`** computes DATA ^ E/D mod N, from 256 to 2048 bits. The driver
 writes the operands little-endian into the engine's SRAM through three
@@ -1713,9 +1934,10 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
 
 ## Not modelled
 
-- The real loader: it trains DDR from its ConfigRAM table with closed
-  libraries (`Reset_560.a`). Its NAND path also skips bad blocks; the
-  stand-in reads the FDT and U-Boot at their nominal offsets.
+- DDR training itself: the controller and PHY are storage whose status
+  bits read as done, so the [real loader](#the-real-first-stage-loader)
+  passes whatever it programs. The stand-in's NAND path reads the FDT and
+  U-Boot at their nominal offsets and skips no bad blocks.
 - SPI NAND other than the two Winbond parts, 4 KiB pages, bit errors and
   bad blocks, and the controller's own Reed-Solomon ECC (used only when a
   part's on-die ECC is off).
@@ -1755,10 +1977,110 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
   boxes and lines, and `/dev/fb0`. The release kernel has no
   `CONFIG_FB`, so `nvt_fb.ko` does not load.
 
+## NT9852x (NA51055 / NA51084)
+
+`nt98525` and `nt98528` (`qemu-system-arm`) are the NT9852x SDK's one die,
+with `nt98523` (NA51055, 128 MB, Linux 64: `cfg_IPCAM1_523_NOR_EVB`) and
+`nt98529` (NA51084, 512 MB, Linux 256: `cfg_529_IPCAM1_RAMDISK_EVB`) the
+other parts the SDK has boards for.
+The SDK builds one kernel (`CONFIG_NVT_IVOT_PLAT_NA51055`) and picks per
+chip ID at run time: `0x4821` (`CHIP_NA51055`: NT98520 / NT98523 /
+NT98525, `nt98525`) or `0x5021` (`CHIP_NA51084`: NT98528 / NT98529,
+`nt98528`; `NVT_CHIP_ID` in the boards' `nvt-na51055-info.dtsi`). Both
+have two Cortex-A9s at 1.2 GHz around NA51089's A9 MPCore, and NA51089's
+blocks at NA51089's addresses. `mach-nvt-ivot/board-dt.c` runs NA51055 and
+NA51089 down one path. So the NT9856x code serves it, with these
+deltas (`cfg_IPCAM1_NOR_EVB` / `cfg_528_IPCAM1_NOR_EVB`
+`nvt-na51055-peri.dtsi`, `drivers/clk/novatek/na51055-clk.c`,
+`plat-na51055/cg-reg.h`):
+
+| Block | NA51055 | NA51089 | Model |
+|---|---|---|---|
+| CPUs | 2x A9, the second released at `0xF07F8000` | 1x A9 | `-smp 2` by default; see below |
+| UART 4 / 5 / 6 | `0xF0380000` / `0xF03E0000` / `0xF03F0000`, SPI 63 / 64 / 65, 48 MHz | — | 16550, `ttyS3`..`ttyS5` |
+| I2C 4 / 5 | `0xF03B0000` / `0xF03C0000`, SPI 68 / 69 | — | `nvt-i2c` |
+| Hash | `0xF0700000` | `0xF0670000` | `nvt-hash` |
+| AI | NUE, NUE2, CNN2 `0xF0D60000` (SPI 49), CNN1 `0xF0CB0000` | NUE, NUE2, CNN | `nvt-media` `ai`..`ai4`, both CNNs `ipp_cnn` |
+| SIE | five: SIE4 `0xF0D40000` (59), SIE5 `0xF0D80000` (61) | three | `nvt-media` `sie`..`sie5` |
+| ISE | second interrupt, SPI 85 | one | in the tree only |
+| DDR arbiter | DDR1 + DDR2 (`0xF0100000`, ARB2 `0xF0FD0000`), SPI 33 + 51 | DDR1 | DDR2's windows are storage |
+| Ethernet | `reg` split around the MDIO pair at `+0x200` | one window | `nvt-eqos`, unchanged |
+| CG PLL ratios | own table (PLL8 at `0x1188`) / `CG528_*` (PLL8 at `0x47E0`) | `PLLn + 0x20` | `nvt-cg` `layout` 1 / 2 |
+| UVCP | — | `0xF0690000` | (not modelled on either) |
+
+**Clocks.** Only the PLL ratio registers move. Enables, gates and resets
+are NA51089's. `get_periph_clk()` takes PLL8 as the CPU clock on
+`0x4821`, and as an eighth of it on everything else. The machine sets the
+`nvt-cg` `layout` from the chip ID: on `0x4821` PLL8 is 800 MHz at
+`0x1188`; on `0x5021` it is 100 MHz at `0x47E0`. Either way
+`periph_clk`, which clocks the A9 global timer and TWD, is 100 MHz, as on
+NA51089. With PLL8 reading 0, `periph_clk` is 0, and the first `udelay()`
+spins in `read_current_timer()` before the console is up. That is how a
+missing table shows.
+
+**The second core.** `nvt_ca9_smp_prepare_cpus()` writes
+`virt_to_phys(nvt_secondary_startup)` to every `cpu-release-addr`:
+`CC_CPU2_CPU1_CMDBUF_REG1`, `0xF07F8000` at the top of the boot SRAM
+(`na51055_ldr` `Memory.h`). It then sends a wake-up IPI and releases the
+core from the pen through `pen_release`. The loader parks the core on
+that word. Here the core starts powered off, and the first non-zero write
+there starts it in SVC at the address. The rest of that page is storage.
+U-Boot never touches the word, so flash boot is unaffected.
+
+**Memory.** The EVBs have 512 MB at 0 and a second 512 MB at
+`0x40000000`, which only the HDAL pool uses (`/hdal-memory/media` lists
+both). The machines model the first only. They give Linux the SDK's
+`0x12800000` and the HDAL the rest, and fall back to 64 MB for Linux
+below 512 MB (the NT98523 board: 128 MB, Linux 64).
+
+**SD card detect.** `na51055_mmc.c` re-applies the pads' drive strengths
+at every clock change. With no `cd_gpio` it takes the slot as full, and
+re-initialises an empty one without end. So the NA51055 tree has the
+vendor's `cd_gpio`: SDIO1 polls C_GPIO 9, which the machine drives, and
+SDIO2 has no pin and is scanned once. Even so, `nt98525` logs about 70
+`No Valid DS value ... ELSE(51055)` lines while SDIO2 is scanned. The
+driver's own NA51055 defaults (`default_pad_io_driving`, 6 mA) are not
+values `na51055_pad_host.c` accepts for that pad group, so the silicon
+would print them too. The SDK EVB tree's `driving` values (15 / 8 mA) are
+NA51084's, and the machine leaves `driving` out so the driver picks per
+chip.
+
+**Running.** The SDK's `output/` has the kernel and initramfs:
+
+```bash
+qemu-system-arm -M nt98528 -nographic -serial mon:stdio -nic user \
+    -kernel output/uImage.bin -initrd output/raw/rootfs.ramdisk.bin.raw
+```
+
+The initramfs (LZ4 cpio in a legacy RAMDisk uImage) has no
+`/lib/modules`; the EVB keeps those in the rootfs1 UBIFS. To load them,
+put a plain newc cpio of `BSP/root-fs/rootfs`'s `lib/modules` before the
+initramfs's LZ4 payload, with `lib` and `usr` entries for the parents.
+The kernel's legacy LZ4 decoder has no end marker and eats whatever
+follows it. Then the init scripts load 64 modules. Ethernet
+(`ntkimethmac.ko`) takes a DHCP lease and pings. The HDAL's drivers bind
+all five SIEs, both arbiters and all four AI engines. `test-novatek.py`
+checks the trees, the chip IDs, the PLL layouts and the release page.
+
+**Flash boot.** The SDK's `output/packed/FW98529A.bin` is a NAND pack;
+`nvtpack2flash.py` makes it a 128 MiB image, and both machines boot it
+through the vendor U-Boot to the shell, with UBIFS on `rootfs1` and `app`
+([NAND boot on every machine](#nand-boot-on-every-machine)):
+
+```bash
+python3 qemu-boot/nvtpack2flash.py output/packed/FW98529A.bin nand.bin
+qemu-system-arm -M nt98528,flash-file=nand.bin -nographic -serial mon:stdio -nic user
+```
+
+**Not done yet.** The second DDR; the AI turnkey on NA51055's CNN pair (the
+v1.01.002 models built for chip ID 1, NT98520, should run here); the
+blocks NA51089 lacks too (ADC, VPE, RHE, IFE2, DIS, IVE, SDE, the DSP).
+
 ## NT98533 (NS02501)
 
-`nt98533` (`qemu-system-arm`) is Novatek's NS02501 camera die, sold as
-NT98532 and NT98533: two Cortex-A32s (ARMv8 cores that run only AArch32,
+`nt98533` and `nt98532` (`qemu-system-arm`; the same machine, the 532 the
+SDK's NOR board) are Novatek's NS02501 camera die, sold as NT98532 and
+NT98533: two Cortex-A32s (ARMv8 cores that run only AArch32,
 with a 32-bit ARMv7 kernel), a GIC-400, the ARMv8 generic timer, and
 256 MB of DDR on the EVBs. Its peripherals are NA51089's, at NA51089's
 addresses: U-Boot's `arch-nvt-ns02501_a32/IOAddress.h`, the SDK's
@@ -1778,15 +2100,39 @@ Where it differs from NA51089's (`cfg_532_IPC_NOR_SQUASHFS_BD_EVB`):
 | WDT | `0xF0050000` | 75 | `nvt-wdt` |
 | RTC | `0xF0060000` | 76 | `nvt-rtc` |
 | I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF0360000` | 10 / 41 / 42 | `nvt-i2c` |
+| HR timers 0..7 | `0xF00C0000`, `0xF0150000`–`0xF01A0000`, `0xF01E0000` | 61..67, 72 | `nvt-hrtimer` |
+| HR clocksource | `0xF01C0000` | 68 | `nvt-hrtimer` |
+| ADC | `0xF01D0000` | 73 | `nvt-adc` (NS02501 layout) |
+| Thermal | `0xF0260000` | | `nvt-thermal`, `/machine/thermal` |
 | USB 2.0 | `0xFF600000` | 27 | `nvt-usb` (the tree's own address) |
 | UART 1 / 2 / 3 | as NA51089 | 43 / 44 / 45 | 16550, all 48 MHz |
 
 The timer, GPIO, SPI NOR / NAND controller, SDIO 1–3, Ethernet, PWM,
 crypto, hash, RSA and OTP are NA51089's, at the same addresses and
 interrupts. The Novatek timer's dividers run from 3 MHz, as on NA51089:
-both read 1 MHz at reset. The media engines, display, audio and the
-HR timers (`0xF00C0000`, `0xF0150000`–`0xF01E0000`) are not instantiated
-and read as zero.
+both read 1 MHz at reset. The media engines, display and audio are not
+instantiated and read as zero.
+
+**HR timers** (`nvt-hrtimer`; `nvt-timer` "nvt,nvt_hwtimer" and
+`timer-novatek.c` "nvt,nvt_clk_src", `plat-ns02501_a32/hrtimer-reg.h`):
+one 64-bit up-counter per block at 120 MHz / (`0x20` + 1). `0x08` CTRL
+bit 0 enables, bit 1 runs free (else one shot), bit 2 starts from
+INIT_TVAL (`0x24` / `0x28`) instead of 0. `0x0C` / `0x10` is the target;
+`0x00` STS bit 0 flags it (write 1 to clear) and, with `0x04` bit 0, raises
+the interrupt. A one-shot timer stops at the target, a free-running one
+wraps to 0. The count reads at `0x104` / `0x108`. A write to `0x100`
+latches it and sets STS bit 1, which the kernel's polling read waits for.
+Enabling restarts the count, which `set_next_event()` (stop, write the
+delta, start) needs; the external-count captures (`0x2C`–`0x7C`) are
+storage. The SDK's release configs build neither driver, so only the
+qtest drives them.
+
+NA51103 has two such blocks (`0x2_F0140000`, `0x2_F0170000`, `0x30`
+long), with `plat-na51103_a32/hrtimer-reg.h`'s older layout. There the
+count is at `0x14` / `0x18` and there is no latch (property `count-at`).
+The NVR's tree points `nvt,nvt_hwtimer` 0 and the clocksource at the
+first, and `nvt,nvt_hwtimer` 1 and `ptp_nvt.c`'s PTP clock at the second.
+Its kernel probes none of them.
 
 ### Boot
 
@@ -1845,6 +2191,23 @@ What runs:
   1 MHz.
 
 `test-nt98533.sh` checks all of it (27 checks, about 30 s).
+
+`--nand` builds the SDK's NAND board instead (`cfg_533_IPC_NAND_RAMDISK_QD_EVB`,
+`nvt-ns02501_a32_nand_defconfig`, `ns02501_ipc_a32_evb_defconfig_release`
+with `CONFIG_RD_LZ4`) as a 128 MiB `nand.bin`. `--initrd` takes a
+RAMDisk uImage for the `rootfs` partition; the NT9852x SDK's
+`output/raw/rootfs.ramdisk.bin.raw` is an ARMv7 userland that runs on
+this kernel too:
+
+```bash
+bash qemu-boot/build-ns02501-sdk.sh --nand --sdk … --toolchain … \
+    --out ns02501-nand --initrd …/output/raw/rootfs.ramdisk.bin.raw
+qemu-system-arm -M nt98533,flash-file=ns02501-nand/nand.bin -nographic \
+    -serial mon:stdio
+```
+
+U-Boot loads the kernel and ramdisk from NAND, and Linux finds the
+W25N01GV with the board's 10 partitions.
 `test-novatek.py` covers the map and the flash boot in CI.
 
 The SDK kernel reads NOR through `mtdblock` 512 bytes at a time. Each
@@ -1855,9 +2218,344 @@ slowly. The OpenIPC nt98562 root used above is a 4.19 userland: it
 reaches its init scripts, but its modules do not match this kernel.
 
 Not modelled on NT98533: the media, display and audio engines (the
-SDK's HDAL is not set up), the HR timers, the thermal sensor, ADC and
-DSP. RTC and watchdog drivers are not in the SDK kernel config, so they
-are untested here.
+SDK's HDAL is not set up) and the DSP. RTC and watchdog drivers are not
+in the SDK kernel config, so they are untested here.
+
+## NT98323 (NA51068)
+
+`nt98323` (`qemu-system-arm`, `hw/arm/novatek-na51068.c`) is Novatek's
+NA51068 DVR/NVR die, sold as NT98321 and NT98323. It is not a relative
+of the camera dies: two Cortex-A9s at 1.4 GHz around an A9 MPCore at
+`0xF9C00000`, and Faraday-derived peripherals. The kernel maps three
+windows statically (`plat-na51068/hardware.h`): `0xFA000000` (10 MiB),
+`0xFC000000` and `0xFE000000` (13 MiB). The source is the NT9832x SDK
+v1.02.024: kernel 4.9.118 (`na51068_evb_defconfig_nor_release`), the
+board trees `cfg_98321_*` / `cfg_98323_*`, and the register-map PDF.
+
+### Memory map
+
+| Block | Base | IRQ (SPI) | Model |
+|---|---|---|---|
+| A9 MPCore (SCU, GIC, global timer, TWD) | `0xF9C00000` | | `a9mpcore_priv`, 2 cores |
+| PL310 | `0xF9C20000` | 97 | `l2x0` |
+| CG (clock generator) | `0xFE000000` (128 KiB) | | `nvt-cg` layout 3 |
+| TOP (pinmux, chip ID) | `0xFE030000` | | `nvt-top` |
+| Second core's release word | `0xFE0B9000` | | storage; the first write starts core 1 |
+| UART 0..3 | `0xFE200000` / `0xFE220000` / `0xFE240000` / `0xFE260000` | 29 / 30 / 56 / 67 | 16550, reg-shift 2, 48 MHz |
+| FTTMR010 | `0xFE8C0000` | 35 | `nvt-fttmr010`, 12 MHz |
+| WDT | `0xFE8A0000` | | `nvt-wdt` (the keyed NA51089 block) |
+| OTP | `0xFECE0000` | | `nvt-otp` (NA51089's protocol) |
+| SPI020 NOR / NAND | `0xFA900000` | 32 | `nvt-flash` with `spi020=on` |
+| SATA 0 / 1 (AHCI) | `0xF9E00000` / `0xF9F00000`, PHY `0xFDC00000` / `0xFDD00000` | 15 / 16 | `sysbus-ahci`, PHY storage |
+| Ethernet MAC 0 / 1 | `0xFCC00000` / `0xFCD00000` | 59 / 60 | `nvt-eqos` |
+| FTGPIO010 0..3 (pins 0 / 32 / 64 / 96) | `0xFE400000` / `0xFE420000` / `0xFE440000` / `0xFE640000` | 31 / 54 / 55 / 87 | `nvt-ftgpio010`, `/machine/gpio0..3` |
+| FTIIC010 0..5 | `0xFE300000` + `0x20000` n | 21 / 36 / 63 / 66 / 86 / 19 | `nvt-ftiic010`; a 24C02 at `0x50` on bus 0 |
+| FTDMAC030 | `0xFCA00000` | 14 | `nvt-ftdmac030`, 8 channels |
+| SDHCI (SD 3.0) | `0xFA600000`, vendor registers from `+0x100` | 64 | `generic-sdhci`, vendor storage; `-drive if=sd` |
+| USB 2.0 host 0 / 1 | `0xF9100000` / `0xF9200000`, PHY `0xFCF00000` / `0xFD000000` | 61 / 62 | `nvt-usb` (FOTG200), PHY storage |
+| RTC | `0xFE880000` | 95 | `nvt-rtc` |
+| Crypto / hash / RSA | `0xFEC60000` / `0xFEC80000` / `0xFECA0000` | 44 / 45 / 46 | `nvt-crypto`, `nvt-hash` (`iv-reversed`), `nvt-rsa` |
+| PWM (3 channels) | `0xFE6C0000` | 43 | `nvt-na51068-pwm`, `/machine/pwm` |
+| IR receiver | `0xFE540000` | 65 | `nvt-na51068-ir`, `/machine/ir` |
+| Thermal | `0xFE2C0000` | | `nvt-thermal`, `/machine/thermal` |
+| PAD, AHBC, DDR arbiters | `0xFE040000`, `0xFE840000`, `0xFC400000` / `0xFD600000` | | storage |
+
+What is left reads as zero and shows under `-d unimp`: the media blocks
+(VCAP, VPE, DEI, OSG, the codecs, the displays, audio, the DSP, CNN,
+GM2D and TSE). A boot of the SDK kernel with every driver below enabled
+logs no unimplemented access outside them.
+
+The chip ID (TOP `0xF0` [31:16]) is in none of the SDK's sources, and no
+NA51068 code compares it. The machine leaves it 0 until someone reads it
+off a part.
+
+### Clocks and timers
+
+`get_periph_clk()` (`na51068-clk.c`) takes the CPU from the APLL when
+`CPU_CKCTRL` (`0x100`) bit 31 is set, at eight times PLL16. Otherwise it
+falls back to 80 MHz, which would make `periph_clk` 10 MHz. QEMU's A9 timers run
+at 100 MHz, so the CG resets with bit 31 set and PLL16 at 100 MHz
+(`0x10AAAA`): the CPU at 800 MHz and `periph_clk` at 100 MHz, as on
+NA51089. The PLL ratio bytes sit at `PLLn RATE0 + 0x20 / 0x24 / 0x28`
+(`nvt-im-clk-bk.c`), with RATE0 from `0x10400`. The other PLLs reset to
+`na51068-clk.c`'s defaults. U-Boot's `clock.c` sets PLL16 to the tree's
+`cpu freq` before booting Linux: 1400 MHz on the EVB boards, ratio
+`0x1D2AAA`. The kernel would then take `periph_clk` as 175 MHz, and every
+delay and jiffy would run 1.75 times slow, so writes to PLL16 are dropped.
+
+The FTTMR010 has three down counters at `0x10` apart, with CR / INTR_STATE
+/ INTR_MASK at `0x30` / `0x34` / `0x38`, three bits per timer. The kernel
+(`drivers/clocksource/fttmr010.c`) runs timer 1 as a free-running
+clocksource (`~COUNTER`) and timer 0 as a one-shot clockevent. It writes
+COUNTER with the delta, LOAD 0, and takes the overflow interrupt.
+`plat-na51068/nvt_jiffies.c` reads the clocksource too. A one-shot stops
+at 0 rather than reloading 0 at every tick. Counting up and the match
+interrupts are not modelled; no NA51068 driver uses them. The
+clocksource the kernel picks is still the A9 global timer.
+
+### Flash: the SPI020
+
+The controller is Faraday's FTSPI020 (`drivers/mtd/nvt_flash_spi/
+nvt_flash_spi020*`). It takes four command words: the address at `0x00`,
+the address length, dummy cycles and instruction length at `0x04`, the
+data count at `0x08`, and at `0x0C` the instruction, I/O mode, chip
+select, write and status-read bits. A write to `0x0C` starts the command. Data goes through
+`0x100` a word at a time, gated by `0x18` (bit 0 TX empty, bit 1 RX
+ready). A status read lands in `0x28`, and completion is `0x24` bit 0
+(interrupt enable `0x20` bit 1). The flash behind it is `nvt-flash`'s
+NOR / NAND engine, so the same images, `flash-file=`, JEDEC defaults and
+write-back apply. Dummy cycles become bytes: 8 a byte on one line, 4 in
+dual I/O, 2 in quad I/O. The SDK compiles out the driver's DMA (through
+the FTDMAC030) and FIFO-checksum paths (`NAND_USE_DMA`,
+`NAND_CMP_CHKSUM`), so neither is modelled. The vendor driver reads the
+default 8 MiB part as a W25Q64 (`EF 40 17`). It creates the board's
+partitions, reads byte-exactly, and its writes reach the image file.
+
+### Ethernet
+
+The two MACs (`"nvt,synopsys_eth"`, `drivers/net/ethernet/novatek/na51068`,
+built in) are NA51089's DWC Ethernet QoS core: the same register map
+(`DWC_ETH_QOS_yregacc.h`), the glue at `+0x3000` with `ETH_ISR` at
+`+0x3008`, and the embedded PHY's analog block at `+0x3800`. So
+`nvt-eqos` serves both. `nvt_eth_env_probe()` reads the ETH pinmux
+(`0x1201` on the EVB): MAC 0 runs RGMII to an external PHY, MAC 1 the
+embedded PHY, whose power-on sequence is plain register writes. Either
+way the PHY is `nvt-eqos`'s MII PHY at address 1, each MAC on its own MDIO
+bus. With the core's HFR0 reporting MDIO, the driver no longer says "MDIO
+is not present". `-nic` fills MAC 0 (`eth0`) first, then MAC 1 (`eth1`).
+Both take a DHCP lease and pass ping and HTTP.
+
+The driver gives every MAC the same address, a constant
+`00:55:7B:B5:7D:F7` (`DWC_ETH_QOS.c` `dev_addr[]`). There is no tree or
+command-line override, so on two interfaces in one network, set one by
+hand (`ifconfig eth1 hw ether …`). A link takes a few seconds after
+`ifconfig up`, before which DHCP gets no answer.
+
+### SMP, SATA, OTP
+
+The second core starts as on NA51055: `nvt_ca9_smp_prepare_cpus()`
+writes its entry to `cpu-release-addr` (`0xFE0B9000`). The first non-zero
+write there powers the core on at that address. The SATA hosts are the
+`NVT_SATA100` driver's, as on NA51103, with the same fix: the driver's
+later `GHC = 0` would clear AE | IE on QEMU's AHCI, so GHC keeps them.
+Disks attach with `-drive if=ide,index=0/1`. `efuse_open()` (in the
+shipped `otp_protected.o_shipped`) polls `0xFECE0030` until the array is
+up. It is NA51089's protocol, so `nvt-otp` serves it.
+
+### Flash boot
+
+With `flash-file` and no `-kernel` the machine boots the flash as the
+SDK's loader would, through the stand-in shared with NA51089 (see
+[Flash boot](#flash-boot)). It reads the tree at `0x10000`
+and unpacks the BCL1 / LZ U-Boot from `partition_uboot`. It then fills the
+SHMINFO block at `/nvt_memory_cfg/shmem` (`LD_NVT`, SPI NOR) and starts U-Boot
+at `/nvt_memory_cfg/uboot`, `0x1E000000`. NA51068's trees name the
+flash nodes `nvt,nvt_spi020_nor` / `nvt,nvt_spi020_nand`, which the
+stand-in accepts beside NA51089's names. The mask ROM and the closed
+loader (DDR training) are not run.
+
+The SDK's U-Boot 2016.07 (`nvt-na51068_evb_nor_defconfig`) then runs as
+on the board:
+- it probes the 32 MiB W25Q256 on the SPI020 in 1-bit mode;
+- it reads the kernel uImage and the RAMDisk from `partition_kernel` /
+  `partition_rootfs`, builds `mtdparts`, and boots Linux with both CPUs;
+- `saveenv` writes the `uenv` partition (`0xC0000`), and the variables
+  are there after `reset`.
+
+Linux's MTD partitions read back what the host wrote, and its writes go
+back into the image.
+
+The SDK ships no `ModelConfig.mk`, which U-Boot's board `config.mk`
+needs for its addresses. `build-na51068-sdk.sh` writes one from the
+board's `nvt-na51068-mem-tbl.dtsi`. U-Boot (560 KiB) does not fit the
+448 KiB `uboot` partition plain, so the script packs it as the SDK's
+build does, with `build/nvt-tools/bfc c lz`.
+
+U-Boot's own timer assumes a 960 MHz CPU (`CONFIG_SYS_TIMER_CLK` 120),
+so its delays run 20% short against the 100 MHz global timer. Autoboot's
+countdown is the one place it shows. The SD slot is absent (`MMC Device 0
+not found`), and the boot carries on.
+
+### GPIO, I2C, DMA
+
+The **FTGPIO010** banks (`gpio-ftgpio010.c`) are Faraday's:
+- `DATAOUT`, `DATAIN`, `PINDIR`, and `DATASET` / `DATACLEAR`;
+- interrupts per line: edge or level (`INTRTRIGGER`), both edges
+  (`INTRBOTH`), polarity (`INTRRISENEG`), and `ENABLE` / `MASK` /
+  `CLEAR`.
+
+`MASKEDSTATE` drives the bank's interrupt. An edge latches until cleared,
+and a level follows the pin. The pins are qdev GPIOs on
+`/machine/gpio0..3`: inputs read high until driven, and outputs follow
+`DATAOUT`. TOP's `gpio_config` (`pinctrl-nvt-plat.c`) programs the same
+bank 0 window.
+
+The **FTIIC010s** (`i2c-ftiic010.c`) move a byte per `TB_EN`, and the driver
+sleeps on the interrupt:
+- a byte with `START` is an address, and an absent slave raises `BERR`,
+  which the driver takes as a NACK;
+- later bytes go to or come from that slave, and `NAK` on a read byte
+  sends the NACK;
+- `STOP` ends the transfer, and a repeated `START` turns it around.
+
+The EVB's buses are empty, so a 24C02 (QEMU's `at24c-eeprom`) sits at
+`0x50` on bus 0. `echo 24c02 0x50 > /sys/bus/i2c/devices/i2c-0/new_device`
+binds the kernel's at24 to it.
+
+The **FTDMAC030** (`ftdmac030.c`) runs a channel to the end of its chain
+when `CTRL` bit 16 is set. Each block is the channel registers, or a
+24-byte descriptor at `LLP` (SRC, DST, LLP, CTRL, CYC, STRIDE). `CYC`
+counts source-width units. The driver masks TC on every block but the
+last, so a chain raises one TC. `CFG` bit 30 writes `WO_VALUE` instead of
+reading (memset), and 2D mode uses `CYC` x lines with the strides. There
+are no peripheral handshakes: a slave transfer is done as memory to
+memory. The kernel's `dmatest` passes on all eight channels.
+
+### SD, USB, RTC
+
+The **SD host** (`sdhci-nvt_ivot_sdc.c`) is a standard SDHCI. QEMU's
+`generic-sdhci` serves it as SD 3.0 with SDMA / ADMA2 at 3.3 V; the
+vendor registers from `+0x100` (pulse latch, delays, tuning) are storage.
+A card is `-drive if=sd,file=…`. Linux finds `mmcblk0` and uses ADMA;
+U-Boot's `mmc` reads it too.
+
+The **USB 2.0 hosts** (`ehci-na51068.c`, `CONFIG_USB_NVTIVOT_HCD`) are
+NA51089's FOTG200, so they are `nvt-usb`, the EHCI over its glue. Their
+UTMI PHYs sit in separate windows (the tree's `phy_reg`), as storage.
+`-device usb-storage,drive=…` lands on the second host, where Linux
+(`sda`) and U-Boot's `usb start` both find it.
+
+The **RTC** (`rtc-na51068.c`) is NA51055's driver almost line for line, so
+`nvt-rtc` serves it. The clock starts at the host's time, and the "RTC
+ready timeout" is gone. Reboot does not go through the RTC here:
+`plat-na51068/reset.c` keys the watchdog and asks it for a manual reset,
+which `nvt-wdt` does.
+
+### Security engines
+
+The crypto, hash and RSA drivers (`na51068_{crypto,hash,rsa}.c`) are
+NA51055's except for their clock names. One thing differs from NA51089:
+when a message is fed in more than one chunk, the driver writes the saved
+digest into the hash IV registers with each word byte-reversed.
+NA51089's driver does so only when the chip ID is NA51055's. `nvt-hash`
+therefore has an `iv-reversed` property, which `nt98323`, `nt98525`
+and `nt98528` set. Without it, any message longer than the driver's
+384-byte buffer hashes wrong, and testmgr's 1023-byte SHA-1 / SHA-256
+vectors fail, along with the HMACs whose long keys are hashed through
+them. With it, all 22 `na51068-*` algorithms report `selftest: passed`.
+
+### PWM, IR, thermal
+
+The **PWM** (`pwm-na51068.c`) has three channels at 12 MHz:
+- `CNTB` is the period in ticks and `CMPB` its low part;
+- `CTRL` bit 1 loads them, and `START_CTRL` runs the channel;
+- `CNTO` counts down through the period.
+
+There is no pin: `qom-get /machine/pwm period-ns<n>` / `duty-ns<n>` read
+a running channel's waveform.
+
+The **IR receiver** (`drivers/media/rc/novatek_ir`) is a decoder that
+hands over whole frames:
+- `STS` has RD, REP and TOUT, with the bit count in `[8:3]`, enabled by
+  `INT`;
+- the frame is in `DATA_LO` / `DATA_HI`;
+- the decoder clears its enable after each frame, and the driver turns it
+  back on.
+
+`qom-set /machine/ir frame 0x…` delivers a frame (`repeat` a repeat
+code) once the driver has a protocol (`echo nec >
+/sys/class/rc/rc0/protocols`).
+
+The **thermal sensor** (`nvtivot_thermal.c`) reads `0x08`, which the
+kernel turns into (reading − trim) × 1.319 + 30 degrees. The trim comes
+from the blank efuse, so the tree's 231 applies. The model returns the
+reading for its `temperature` property, 45 °C by default.
+
+### Running
+
+```bash
+bash qemu-boot/build-na51068-sdk.sh --sdk …/na51068_linux_sdk \
+    --toolchain …/arm-ca9-linux-gnueabihf-8.4 --out na51068 \
+    --initrd …/rootfs.ramdisk.bin.raw
+# U-Boot from the 32 MiB NOR (the image is written to)
+qemu-system-arm -M nt98323,flash-file=na51068/nor.bin -nographic \
+    -serial mon:stdio -nic user
+# or the kernel directly
+qemu-system-arm -M nt98323 -nographic -serial mon:stdio \
+    -kernel na51068/zImage -dtb na51068/nt98323.dtb -initrd <initramfs> \
+    -append "console=ttyS0,115200 rdinit=/linuxrc"
+# the NT98321 NAND EVB, U-Boot and the kernel from SPI NAND
+bash qemu-boot/build-na51068-sdk.sh … --out na51068-nand --nand \
+    --initrd …/rootfs.ramdisk.bin.raw
+qemu-system-arm -M nt98323,flash-file=na51068-nand/nand.bin -nographic \
+    -serial mon:stdio
+```
+
+`--test-drivers` turns on the drivers the SDK leaves off: the watchdog,
+PWM, IR, the security engines with their self-tests, EHCI built in,
+`dmatest`, `i2c-dev` and at24. Add `-drive if=sd,file=sd.img` and
+`-drive if=none,id=u,file=usb.img -device usb-storage,drive=u` for the
+SD card and a USB stick. With `-kernel`, the tree's bootargs are empty,
+so `-append` gives the console.
+
+**NAND.** The NAND board (`cfg_98321_DDR3_4GX1_NAND_EVB`) boots the same
+way, through the stand-in reading the tree from block 2. Its
+U-Boot (`nvt-na51068_evb_nand_defconfig`) drives the SPI020 in NAND mode,
+4-bit, against the W25N01GV that a 128 MiB image gives. `saveenv`
+writes `uenv` in NAND, and the variable survives `reset`. The kernel's
+`spi020_nand` finds the part, its MTD partitions read back what the host
+wrote, and UBI attaches the empty `rootfs1` / `app`.
+
+The SDK's root filesystem is only a skeleton (it is assembled by the
+build). The NT9852x SDK's `output/raw/rootfs.ramdisk.bin.raw` (ARMv7
+glibc, LZ4, a legacy RAMDisk uImage) boots to a shell either way, as the
+kernel has `CONFIG_RD_LZ4`. The tree's memory table gives Linux 192 MB of
+the 512 MB. In U-Boot the boot command is `nvt_boot`; there is no `boot`.
+That userland formats the `app` partition (`0x1200000`) at its first boot.
+
+`test-novatek.py` (`test_nt98323`) checks:
+- the flash-boot stand-in on a synthetic NOR (U-Boot, tree, SHMINFO, the
+  branch at 0);
+- the CG, including the dropped PLL16 write;
+- TOP;
+- the FTTMR010's rate and interrupt;
+- the SPI020's ID / read / status / completion;
+- the release page;
+- both MACs' MDIO and PHY.
+
+`test_nt98323_periph` checks the rest at register level:
+- GPIO: output, input, edge and level interrupts;
+- I2C: an EEPROM write and read back, and a NACK;
+- DMA: a linked memcpy with one TC, a memset, and a bus error;
+- the SDHCI and its card;
+- both EHCIs and the stick;
+- the RTC;
+- PWM over QMP;
+- an IR frame over QMP;
+- the thermal reading;
+- a two-chunk SHA-1 with the IV reversed;
+- the storage glue.
+
+Run with `--test-drivers` and an SD card and a stick, the SDK kernel
+checks the same from Linux:
+- it reads and writes the card and the stick;
+- `hwclock` reads the RTC;
+- the at24 round-trips through the FTIIC010;
+- GPIO works through sysfs;
+- the PWM's `period` / `duty_cycle` reach the model;
+- an injected IR frame raises its interrupt;
+- `dmatest` passes;
+- the crypto self-tests pass;
+- `reboot` restarts it through the watchdog.
+
+### Not modelled on NT98323
+
+- The media engines: VCAP, VPE, DEI, OSG, the H.26x / JPEG codecs, GM2D,
+  TSE, the LCD / HDMI / TV outputs, audio, the DSP and CNN.
+- Peripheral DMA handshakes other than the flash controller's (other
+  FTDMAC030 slave transfers run as memory to memory), I2C slave mode and SMBus timeouts, GPIO debounce, IR raw
+  timing (frames arrive decoded), and the PWM's pattern and repeat modes
+  (storage).
 
 ## NT98332 (NA51103)
 
@@ -1878,8 +2576,6 @@ tree does not use, which are not modelled:
 - SDIO 1 / 2 at `0x2_F0190000` / `0x2_F01A0000` (U-Boot's EVB tree has
   `mmc@2,f0190000`);
 - a second Ethernet at `0x2_F0450000`;
-- I2C 1–4 at `0x2_F01C0000`–`0x2_F01F0000`;
-- PWM at `0x2_F0120000`;
 - the system counter at `0x2_FFE50000` / `0x2_FFE60000`.
 
 Much of the header is a template copy of NA51089's. Its media and display
@@ -1898,6 +2594,18 @@ The map is that firmware's own device tree; the machine builds none.
 | TOP / CG / PAD / GPIO | `0x2_F0010000` / `…20000` / `…30000` / `…40000` | 24 | `nvt-top`, `nvt-cg`, storage, `nvt-gpio` |
 | WDT | `0x2_F0060000` | 57 | `nvt-wdt` |
 | Novatek timer | `0x2_F0100000` | 0 | `nvt-timer` |
+| PWM | `0x2_F0120000` | 26 | `nvt-pwm` |
+| HR timer 0 + clocksource / HR timer 1 + PTP | `0x2_F0140000` / `…170000` | 83 / 84 | `nvt-hrtimer`, `count-at` `0x14` |
+| I2C 1..4 | `0x2_F01C0000` / `…1D0000` / `…1E0000` / `…1F0000` | 41 / 42 / 60 / 50 | `nvt-i2c`, empty buses |
+| Crypto / hash / RSA | `0x2_F0640000` / `…650000` / `…660000` | 79 / 46 / 48 | `nvt-crypto`, `nvt-hash`, `nvt-rsa` |
+| Thermal | `0x2_F0890000` | | `nvt-thermal`: trim 231 (`default_trim`), step 1319 |
+| OSG | `0x2_F0300000` | 10 | `nvt-engine`: link lists complete |
+| JPEG codec | `0x2_F0320000` | 17 | `nvt-media` `jpg`, NA51089's |
+| Hardware copy | `0x2_F0330000` | 70 | `nvt-hwcopy` |
+| H.26x encoder | `0x2_F0500000` | 7 | `nvt-media` `venc` (NA51090: and `…A00000`, 8) |
+| DEI (deinterlacer) | `0x2_F0610000` | 6 | `nvt-engine`: link lists complete (NA51090: and `…620000`, 21) |
+| SSCA / AGE (2D) | `0x2_F0310000` / `…3A0000` | 74 / 16 | `nvt-engine`: link lists complete |
+| IR remote | `0x2_F0130000` | 25 | `nvt-ir`; `qom-set /machine/ir frame=…` |
 | SPI NOR controller | `0x2_F0180000` | 29 | `nvt-flash` |
 | UART 0..3 | `0x2_F0280000` / `…290000` / `…2A0000` / `…2B0000` | 43 / 44 / 45 / 38 | 16550, reg-shift 2, 48 MHz |
 | VPE (scaler) | `0x2_F0410000` | 3 | `nvt-engine` |
@@ -1921,7 +2629,9 @@ The flash has the loader (`FW98332A.BIN`, with the DDR training and BL31)
 at 0, the device tree at `0x10000` behind an 8-byte `XMFDT32G` tag, LZMA,
 and U-Boot LZMA-packed as the whole of `partition_boot` (`0x20000`, Xiongmai's
 name for the SDK's `partition_uboot`). With `flash-file` and no `-kernel`
-the machine does the loader's part: it unpacks both with
+the mask ROM runs that loader, which goes through BL31 into U-Boot at EL2
+([the real first-stage loader](#nt98332-na51103-through-bl31)). With `loader=off` or
+`-smp 2` the machine does the loader's part instead: it unpacks both with
 `hw/arm/nvt-lzma.c` (a plain decoder after the public-domain LzmaSpec; QEMU
 links no LZMA library), fills the `LD_NVT` SHMINFO as on NA51089, and starts
 U-Boot at its link address `0x1E000000` from an AArch64 stub at 0. U-Boot
@@ -1981,6 +2691,103 @@ engine's interrupt enable, so it has to be run. VPE: CTRL bit 31 fires the
 list at `+0x300`, status `+0x400`, enable `+0x404`. Without a completion the
 job manager's `em_putjob` timed out ("Scaler putjob not response!") and the
 HDAL panicked.
+
+### JPEG, hardware copy, OSG, H.26x encoder
+
+These are the HDAL's support engines. The firmware sets them up at boot
+and uses them for snapshots, frame copies and overlays. Their drivers were
+read with Ghidra.
+
+- **JPEG** (`kdrv_jpg`). The register layout is NA51089's, so this is that
+  model:
+  - interrupt enable and status at `0x18` / `0x1C`;
+  - picture size and MCU count at `0x28` / `0x2C`;
+  - Y / CbCr at `0x54` / `0x58`, line offsets at `0x60` / `0x64`;
+  - software reset at `0x00` bit 3.
+
+  NA51103 adds address bits 35:32 at `0xC8` / `0xCC`, which DRAM below
+  4 GiB leaves 0.
+- **Hardware copy** (`kdrv_hwcopy`, `nvt-hwcopy`). `0x04` [1:0] picks the
+  job: linear set, block set, linear copy or block copy.
+  - Source and destination addresses are at `0x40` / `0x48`, with bits
+    35:32 at `+4`.
+  - A linear job takes its length from `0x28`.
+  - A block job takes its lines from `0x18` and the bytes a line from
+    `0x1C`, with source and destination line offsets at `0x14` / `0x24`.
+  - A set fills with the 32-bit pattern at `0x2C`, little-endian in
+    memory.
+  - `0x00` = 1 starts the job; `0x0C` bit 0 is done (write 1 to clear),
+    and `0x08` bit 0 lets it interrupt.
+
+  The driver's own self-test (`emu_hwcopy_auto`) fixes these semantics,
+  and the qtest repeats it.
+- **OSG** (`kdrv_osg`, `nvt-engine`). Writing a link list's address to
+  `0x30` fires it, with bits 35:32 at `0x340`. The list's commands are the
+  VPE's format, with byte enables in `hi` [15:12]. `0x70` bit 0 reports
+  the list done, and is written back to clear. The model applies the
+  list's register writes and completes it, but blends nothing.
+
+- **DEI** (`kdrv_dei`, `nvt-engine`). The OSG's interface at other
+  offsets:
+  - the list's address goes to `0x180`, bits 35:32 to `0x200`, and
+    `CTRL` bit 31 fires it (bit 30 a single job);
+  - `0x1C` is the status, bit 0 frame done and bit 2 list done, written
+    back to clear.
+- **SSCA** (`kdrv_ssca`, `nvt-engine`).
+  - The list's address is at `0xAC`, bits 35:32 in `0xA8` [31:28]
+    (`ll-hi-shift` 28), and `CTRL` bit 8 fires it (bit 1 a single job).
+  - `0x0C` is the status, bits 31 / 30 list and frame done, written back
+    to clear.
+  - Its writes are `0x8F000000 | offset`.
+- **AGE** (`kdrv_age`, `nvt-engine` `ll-format` 1). The list's address is
+  at `0x418`, bits 35:32 at `0x420`. `0x41C` takes `0x1000`, then
+  `0x30101` to fire it. Its own list format, `hi` [31:24] the operation:
+  - 1 writes: `hi` [15:0] the word offset, `lo` the value;
+  - 6 continues at `lo`;
+  - 7 is an event to wait for;
+  - 0 / 0 ends the list.
+
+  `0x410` reads 1 once a list has run, which the handler takes as list
+  mode. `0x404` bits 1:0 report the list done. The handler never writes
+  them back, so the model clears them when read (an assumption).
+- **IR remote** (`nvt-ir`; `nvt_ir_fr.c` in the NS02501 SDK kernel, which
+  the NVRs' kernels carry):
+  - `CTRL` at `0x00` (bit 0 enable, bit 7 repeat detect, [22:16] length);
+  - the interrupt enable at `0x08`, the status at `0x0C` (bit 0 ready, 2
+    match, 3 repeat, 4 overrun; write 1 to clear);
+  - the frame at `0x10` / `0x14`, the match data at `0x18` / `0x1C`.
+
+  `qom-set /machine/ir frame=<64-bit>` delivers a frame to an enabled
+  receiver, and `repeat=true` a repeat code. On NT98332 the vendor
+  driver takes such a frame: its handler clears the status, and its
+  decode re-enables the receiver.
+- **H.26x encoder** (`kdrv_venc`, `nvt-media` `venc`). This is a later
+  revision of NA51089's engine.
+  - **Same picture registers.** The driver's image of them goes in from
+    `0x020`, both directly (`h26x_setEncDirectRegSet`) and through its
+    link lists (`h26xEnc_wrapLLCmd`). Source, reconstruction, bitstream,
+    NAL list, `FUNC_CFG` and size are therefore where `nvt-h26x.c` reads
+    them.
+  - **Moved registers.** The interrupt enable is `0x020`, the image's
+    first word. The report, in NA51089's order (length at `+0x18`), is at
+    `0xD14`. `0xD08`, with `0xD00` [15:8] = 0, is the bitstream pointer:
+    the length plus the DRAM burst, 128 bytes with CTRL bit 16, else 256.
+  - **Link lists**, the default (`h26x_enc_link_list` 1, two jobs a list).
+    `0x010` is the list's address and `0x014` [7:0] its job count;
+    `0x018` [15:0] is the job reached. A command is op [31:28], job
+    [27:20], register offset / 4 [19:8], count [7:0]:
+    - op 0 starts a job;
+    - op 1 writes the next words to the registers;
+    - op 2 copies registers to the address in the next word (the
+      report, after the picture);
+    - op F ends the job, its next word the next job's list.
+
+    The model codes a picture at its job's op 2, and raises finish (`0x004`
+    bit 0) after the last job, or buffer full (bit 12).
+
+The U-Boot boot logo ("load jpeg err." on the NBD80N36RA-KL dump) is a
+software decoder (`nvt_logo/jpg.c`), not this engine. That dump's logo
+partition does not parse.
 
 ### Display (`nvt-lcd300`) and HDMI (`nvt-hdmi`)
 
@@ -2164,12 +2971,237 @@ for them.
 
 ### Not modelled on NT98332
 
-- The other media engines: OSG, SSCA, JPEG, AGE, the H.26x encoder, the
-  DEI, hwcopy and VCAP have no model and read as zero. Their drivers only
-  set them up at boot; live view, the single-channel view, recording and
-  playback use none of them. The VPE does only the fill and the plain
-  scale the NVR uses.
+- VCAP (capture) has no model and reads as zero. Neither NVR has a capture
+  input: NT98332 loads no VCAP driver, and NT98633's never reaches the
+  hardware. The VPE does only the fill and the plain scale (with its crop)
+  the NVR uses. The OSG, DEI, SSCA and AGE only complete their lists:
+  there is no blending, deinterlacing or 2D work. Their drivers only set
+  them up at boot, and live view, the single-channel view, recording and
+  playback use none of them.
+- The encoder's coding is NA51089's (`nvt-h26x.c`; with x264 / x265 built
+  in, real pictures). The firmware never encodes on these boots, so only
+  the qtest's list jobs drive it.
 - The decoder's own picture formats beyond what is described above.
 - Audio content (RX is silence, TX is dropped), HDMI hotplug / EDID, the
   CVBS output (LCD200, TVE100), the LCD300's cursor and colour pipeline.
-- The real loader and BL31 (DDR training, secure world).
+- DDR training's real results (the read-gate window and the DRAM
+  testers always pass) and secure-world memory protection: nothing
+  blocks the normal world from secure memory.
+
+## NT98633 (NA51090)
+
+`nt98633` (`qemu-system-aarch64`) is Novatek's NA51090 NVR die ("Novatek
+NA51090", `CHIP_NA51090` = `0xBC21`): four Cortex-A53s, 2 GB of DDR (Linux
+gets the first `0x57600000`), and NA51103's address map with a few blocks
+moved. It shares NA51103's code in `novatek.c`; what differs is a table
+(`NvtA64Map`, `na51090_map`). It was brought up on an N2032-8HDD NVR (the
+app reports device type N2332) from a 128 MiB Winbond W25N01GV SPI NAND
+dump, 2112 bytes a page with the on-die ECC's spare area. Its parts are
+U-Boot 2019.04, kernel 4.19.148 with a ramdisk root, and the NVR app in a
+squashfs. The tree is the flash's own, at `0x40000`.
+
+### Memory map
+
+What moved from NA51103 (the rest is [NT98332's](#memory-map-2)):
+
+| Block | Base | IRQ | Model |
+|---|---|---|---|
+| WDT | `0x2_F0110000` | 57 | `nvt-wdt` |
+| RTC | `0x2_F0A50000` | 56 | `nvt-rtc` |
+| OTP | `0x2_F0A90000` | | `nvt-otp` (the loader reads its trims) |
+| Thermal | `0x2_F0510000` | | `nvt-thermal`, trim 231, step 1319 |
+| Crypto / hash / RSA | `0x2_F0950000` / `…960000` / `…A80000` | 79 / 46 / 48 | `nvt-crypto`, `nvt-hash`, `nvt-rsa` |
+| Ethernet ×2 | `0x2_F0210000` (eth0), `0x2_F0200000` (eth1) | 11 / 12 | `nvt-eqos`; the first `-nic` is eth0 |
+| USB 2.0 ×2 | `0x2_F0380000` / `…390000` (PHY `…3E1000` / `…3F1000`) | 27 / 78 | `nvt-usb`, PHY storage |
+| SATA ×3 | `0x2_F0B80000`, `…B90000`, `…480000` (glue `…BC0000` / `…BD0000` / `…4E0000`) | 13 / 14 / 69 | `sysbus-ahci` |
+| UART 4 | `0x2_F02C0000` | 47 | 16550 |
+| USB 3 host | `0x2_F0580000` (PHYs `…5F0000`) | 28 | `sysbus-xhci`, `usb-bus.2`; PHY storage |
+| Second H.26x encoder | `0x2_F0A00000` | 8 | `nvt-media` `venc` |
+| H.26x decoder | `0x2_F0600000` (NT98332's place, its own layout) | 9 | `nvt-h26xdec`, `na51090` |
+| VPEL (the VPE's second instance) | `0x2_F0420000` | 1 | `nvt-engine`, `scaler`, `na51090` |
+| DDR controller / PHY | `0x2_F06E0000` / `…6F0000`, PHY at +`0x8000` | | `nvt-ddrc`, `na51090` |
+| DRAM testers | `0x2_F0080000`, `…A0000` (+`0x805C` / +`0x80A0`) | | `nvt-ddrc`, `tester` |
+
+**USB 3.** The host (`0x2_F0580000`, SPI 28) is QEMU's `sysbus-xhci`, the
+third USB bus (`-device usb-storage,bus=usb-bus.2,drive=…`). The kernel
+drives it with `xhci-plat` and Novatek's set-up (`xhci_nvt_host_init`,
+decompiled from the dump's `xhci-plat-hcd.ko`). That set-up programs the
+PHYs at `0x2_F05F0000` (U2 at `+0x1000`, U3 at `+0x2000`), which are
+storage, and starts two monitor threads. They read the PHYs and a vendor
+word at operational `0x3F0`. This vendor kernel asks for an event ring of
+four segments (`ERSTSZ` 4). QEMU's xHCI took one and declared the
+controller dead otherwise, so `qemu/patches/0006` adds segment tables (up
+to 8). A stick then enumerates as a SuperSpeed device and attaches as
+`sda`. Without the host, U-Boot's probe failed and the monitor thread
+faulted (an oops in `xhci_usb_monito`).
+
+The clock generator is NA51089's block with NA51090's PLL table (`nvt-cg`
+`layout` 4: PLL0 and PLL2..20 at `0x4420` + `0x40` n, `na51090-clk.c`'s
+ratios). With NA51089's table, PLL2, the OSG's and hwcopy's 400 MHz
+parent, read 470 MHz. The clock framework then refused to enable both,
+and `kdrv_osg`'s init hit a kernel warning.
+
+The JPEG codec, hardware copy, OSG and H.26x encoder are NT98332's
+([above](#jpeg-hardware-copy-osg-h26x-encoder)), at the same addresses.
+
+### Boot
+
+By default (`-smp 5`: four A53s and the boot core) the board boots as
+the silicon does, from the flash file alone:
+1. the mask ROM model runs the board's loader (`FW98633A`) on the boot
+   core, as on NT98332;
+2. the loader trains DDR, finds no SD card (SDIO 1, `0x2_F0190000`, is
+   `nvt-sdio`), reads BL31 and the LZMA U-Boot from the NAND, and
+   warm-resets the A53s into its AArch64 trampoline;
+3. the firmware's BL31 v2.2 sets up the TZASC and enters U-Boot;
+4. U-Boot reads the env, shows the HDMI boot logo, finds both MACs and
+   boots the kernel with the ramdisk;
+5. the kernel brings up four CPUs through BL31's PSCI, then SATA, I2C and
+   Ethernet (DHCP on QEMU's user network), and the vendor modules and the
+   NVR application start.
+
+The kernel starts about 12 s in, most of it U-Boot's autoboot countdown and
+USB scan:
+
+    qemu-system-aarch64 -M nt98633,flash-file=nand.bin -nographic
+
+`-smp 4` or `loader=off` boots with the stand-in instead. U-Boot is BCL1
+algorithm 11 in the flash: LZMA "alone", whose 64-bit size field the SDK's
+packer fills with the 32-bit length twice. `nvt-lzma.c` reads that as the
+length.
+
+**What the loader needs**, each found by running it:
+- **The ROM's `lzma_inflate`** returns the length it unpacked. The stub
+  checks it against its header ("UNZIP&CKSUMFail!" otherwise).
+- **The ROM's stubs** sit at `0x7C00`, just below its table. This loader
+  keeps the data cache's set and way counts at `0x100` and `0x10` of the
+  ROM's copy in DRAM, where the stubs were.
+- **The OTP** at `0x2_F0A90000`, for the ZQ and LDO trims.
+- **The per-lane PHY sweep, `psdk`.** It starts with page 3 `0x00` [1:0]
+  and waits for bit 7 there. A lane is good when page 3 `0x01` reads
+  `0x78`, `0x02`..`0x05` read 0 and `0x06` bit 7 is clear.
+- **The PHY commands.** The loader drives the DRAM through page 0
+  `0x29`..`0x2C`:
+  - `0x2C` [3:0] is the command >> 1, and `0x2B` bit 7 its bit 0;
+  - `0x2A`/`0x29` are the data;
+  - `0x2C` bit 7 starts it.
+
+  Command 11 writes the read-training pattern, the byte in `0x29`.
+- **The read-gate training, `qsenk`.** The delays are NA51103's: coarse
+  page 2 `0xBB`/`0xBC`, fine page 0 `0xD2`/`0xD3`, position coarse × 16 +
+  ((fine − 13) & 15). The loader's fine stepper treats each nibble as two
+  halves of eight steps.
+  - **The compare.** The loader reads the lane's eight compare bytes
+    (page 3 `0x70` + 8 × lane) as one word: the burst read back. Byte n
+    is `0xFF` where bit 7 − n of the last pattern is set. The first
+    pattern is `0xAA`, and the loader inverts it between passes, so the
+    model has to echo it.
+  - **The level.** The gate level is page 0 `0xB5` bit 4 + lane. A
+    coarse sweep (coarse 0..2, fine `0x0D` / `0x05`) finds where it falls
+    from 1 to 0; the model puts the edge at `0x14`, inside coarse 1.
+  - **The gate.** Bit 0 of the lane's 2-bit field in page 0 `0xB6`
+    ([2 × lane + 1 : 2 × lane]) then sets the direction: clear means step
+    the fine delay down, until it reads set with the level still 0. The
+    model sets it below `0x16`.
+- **The DRAM testers**, at the arbiters' `0x80000` and `0xA0000`, as on
+  NT98332.
+- **The core communicator** (`0x2_F0160000`, storage). The trampoline's
+  mailboxes are there:
+  - BL31's entry at `0x100`, which core 0 reads as one 64-bit word;
+  - the other cores' entry at `0x10C`;
+  - their arrival flags at `0x114`..`0x11C`.
+
+  NA51103 keeps them in TOP.
+
+### Video: live view and snapshots
+
+The local GUI's live view works: a camera's pictures play in its tile.
+Three things differ from NT98332.
+
+**The decoder's layout.** `h26xdec.ko` here is v0.1.45, NT98332's v0.1.9;
+`nvt-h26xdec` takes `na51090=on` for it. The jobs are the same link lists
+of register writes, and the bitstream block is the same `{count, address,
+length}`. Only the offsets move (`IMVQ_VDEC_SetupRegisterBaseAddress`,
+`LLD_H264DEC_TriggerBin`):
+
+- The list wrapper is at `+0x8000` (NT98332: `+0x3000`). Its registers
+  are the same, plus the address's bits 35:32 at `+0x30`.
+- H.264 has two stages, like H.265. Each has the H.265 control word:
+  AD at `+0x6000` and BIN at `+0x6800`. The list starts both with 6, BIN
+  last. Per stage, `+0x38` is the interrupt enable and `+0x3C` the flags,
+  bit 0 done. `H264Dec_Isr()` reads both, and `VPU_ClearInterrupt()`
+  writes both back, which drops the line; there is no `+0x184C`.
+- The picture's registers: `+0x6004` size, `+0x602C` the bitstream
+  block, `+0x6808` the strides ×4, `+0x6840` / `+0x6844` Y / UV.
+- The reduced copy is the "extra write" at `+0x8040`, for both codecs:
+  - bit 0 of `+0x8040` turns it on; `+0x8044` / `+0x8048` hold Y / UV,
+    `+0x804C` the strides;
+  - the scale is any factor, (source − 1) / (copy − 1) in 16.16. The
+    integer parts are in `+0x8050`, the fractions in `+0x8054`. The model
+    works the copy's size back from them.
+- H.265 keeps NT98332's offsets.
+
+**The compressed copy.** The NVR asks for the reduced copy compressed
+(`+0x8040` bit 2). The stride the driver gives is about 3/4 of the
+width: 240 bytes for a 320-pixel copy. Novatek's compressed format is not
+known, so the model stores a stand-in in that space: each row resampled
+to the stride. The VPE reads it back when the source format (`0x008`
+[12:10]) is 3 or 6, the two compressed formats in
+`vpe_drv_uti_fmt_is_sce()`, and stretches it.
+
+**The VPE's registers.** NA51090's `kdrv_vpe` (v1.01.18) moves the
+window:
+
+- its width is the first column's `0x604` [28:16], its x `0x604` [11:0],
+  and its y `0x510` [12:0] (NT98332: `0x550`, `0x554`, `0x510` [15:0]);
+- the sizes are 14 bits wide;
+- `0x30C` and `0x364` hold bits 35:32 of the source and destination
+  addresses (NT98332 keeps UV addresses there), so both UVs follow their
+  Ys.
+
+The VPE model takes `na51090=on` for this.
+
+**The VPEL.** The VPE's second instance ("nvt,vpel", `0x2_F0420000`, SPI
+1) gets the same lists, `kdrv_vpe` sharing the preview's jobs between the
+two. Without a model, the one list it was given never finished. That list
+held one of the display's three frames, so the video graph stopped after
+three pictures, and the decoder after four.
+
+**A camera.** `qemu-boot/fake-ipcam.py` on the host serves the test
+pattern over RTSP and ONVIF:
+
+```sh
+python3 qemu-boot/fake-ipcam.py --http 28080 --rtsp 28554 --advertise 10.0.2.2 \
+    --advertise-http 28080 --advertise-rtsp 28554 &
+qemu-system-aarch64 -M nt98633,flash-file=nand.bin -nic user,hostfwd=tcp:127.0.0.1:18080-:80 …
+```
+
+The channel is added through the web API (`ChannelConfig/IPChannel/Set`,
+`operation_type` `AddOrEditChannel`, `channel_info.CH1`). Two protocols
+work:
+
+- **RTSP** (`main_url` `rtsp://10.0.2.2:28554/stream1`, `sub_url`
+  `…/sub`) plays.
+- **Onvif** (`ip_address` 10.0.2.2, `port` 28080) plays too. fake-ipcam
+  offers two profiles, so the grid decodes the sub stream. The NVR's
+  client needs `GetNetworkProtocols` and
+  `GetVideoEncoderConfigurationOptions`.
+
+**Snapshots.** `/API/Snapshot/Get` (`{"channel":"CH1"}`, the JPEG
+base64 in `data.img_data`) works for an Onvif channel. The NVR fetches
+the picture from the camera's `GetSnapshotUri`, so fake-ipcam serves
+`/snapshot.jpg`: the current picture, baseline JPEG, pure Python. For an
+RTSP channel the API always answers "Get image failed!":
+`RtspNetObj::RemoteSnapPic` in `device-app` returns −1, so the firmware
+has no snapshot for such a channel. The NVR's own JPEG encoder
+(`YuvToJpeg`, `hd_videoenc`) is used only for its local captures to
+disk (`SnapFromVdec`). None of these boots ran it.
+
+### Not modelled on NT98633
+
+- DDR training's real results (all of the above always pass) and the
+  TZASC BL31 programs.
+- The USB 3 device side (FOTG330), PCIe, the IR remote, and the media
+  engines NT98332 lacks too.
+- The decoder's compressed reduced copy (a stand-in, above). The encoder
+  is NT98332's model: the NVR firmware never encodes on these boots.
