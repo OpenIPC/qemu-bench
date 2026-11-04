@@ -473,6 +473,8 @@ struct NvtMachineState {
 
     char *flash_file;
     bool real_loader;
+    bool rom_fallback;
+    bool rom_fast;
     char *boot_file;
     uint32_t boot_strap;
     uint32_t flash_jedec;
@@ -1499,6 +1501,27 @@ void nvt_rom_set_loader_file(const char *path)
     nvt_rom_loader_file = path;
 }
 
+static bool nvt_rom_fallback, nvt_rom_fast;
+static uint32_t nvt_rom_strap;
+
+void nvt_rom_set_fallback(bool on, uint32_t strap, bool fast)
+{
+    nvt_rom_fallback = on;
+    nvt_rom_strap = strap;
+    nvt_rom_fast = fast;
+}
+
+/* NOR, SPI NAND (2K, 4K, RS) and eMMC: what the ROM reads a loader from */
+bool nvt_rom_strap_is_flash(uint32_t strap)
+{
+    switch (strap & 0xF) {
+    case 0: case 2: case 3: case 6: case 8: case 9: case 0xA:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool nvt_flash_has_loader(NvtFlashState *flash, uint64_t sram_base,
                           uint64_t sram_size)
 {
@@ -1537,6 +1560,11 @@ void nvt_rom_boot(NvtFlashState *flash, const NvtRomConfig *rc)
     qdev_prop_set_uint8(rom, "layout", rc->layout);
     if (nvt_rom_loader_file) {
         qdev_prop_set_string(rom, "loader-file", nvt_rom_loader_file);
+    }
+    if (nvt_rom_fallback && rc->layout == 0) {
+        qdev_prop_set_bit(rom, "fallback", true);
+        qdev_prop_set_bit(rom, "fast", nvt_rom_fast);
+        qdev_prop_set_uint8(rom, "strap", nvt_rom_strap & 0xF);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(rom), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(rom), 0,
@@ -1886,10 +1914,16 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     arm_load_kernel(cpu[0], machine, &binfo);
 
     if (!machine->kernel_filename && nms->flash_file) {
+        /* NA51089's ROM: the fallback, asked for or implied by the straps */
+        bool fallback = nms->real_loader && !c->na51055 &&
+                        (nms->rom_fallback ||
+                         !nvt_rom_strap_is_flash(nms->boot_strap));
+
         nvt_rom_set_loader_file(nms->boot_file);
+        nvt_rom_set_fallback(fallback, nms->boot_strap, nms->rom_fast);
         if (nms->real_loader &&
-            nvt_flash_has_loader(NVT_FLASH(flash), NVT_SRAM_BASE,
-                                 NVT_SRAM_SIZE)) {
+            (fallback || nvt_flash_has_loader(NVT_FLASH(flash), NVT_SRAM_BASE,
+                                              NVT_SRAM_SIZE))) {
             /* NA51055's ROM has its routines at fixed addresses */
             nvt_rom_boot(NVT_FLASH(flash), &nvt_rom_cfg[c->na51055 ? 1 : 0]);
         } else {
@@ -1976,6 +2010,26 @@ static void nvt_machine_set_boot_strap(Object *obj, Visitor *v,
     visit_type_uint32(v, name, &NVT_MACHINE(obj)->boot_strap, errp);
 }
 
+static bool nvt_machine_get_rom_fallback(Object *obj, Error **errp)
+{
+    return NVT_MACHINE(obj)->rom_fallback;
+}
+
+static void nvt_machine_set_rom_fallback(Object *obj, bool value, Error **errp)
+{
+    NVT_MACHINE(obj)->rom_fallback = value;
+}
+
+static bool nvt_machine_get_rom_fast(Object *obj, Error **errp)
+{
+    return NVT_MACHINE(obj)->rom_fast;
+}
+
+static void nvt_machine_set_rom_fast(Object *obj, bool value, Error **errp)
+{
+    NVT_MACHINE(obj)->rom_fast = value;
+}
+
 static void nvt_machine_instance_init(Object *obj)
 {
     NVT_MACHINE(obj)->real_loader = true;
@@ -2005,6 +2059,16 @@ static void nvt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "boot-strap",
         "boot strap pins as TOP+0 reads them (BS[3:0]: NT9856x 4 Ethernet, "
         "0xC UART)");
+    object_class_property_add_bool(oc, "rom-fallback",
+        nvt_machine_get_rom_fallback, nvt_machine_set_rom_fallback);
+    object_class_property_set_description(oc, "rom-fallback",
+        "NA51089: with no valid loader in flash, run the mask ROM's own "
+        "fallback (SD, Ethernet, USB, UART) as the silicon does, instead of "
+        "the stand-in; implied by boot-strap other than flash");
+    object_class_property_add_bool(oc, "rom-fast",
+        nvt_machine_get_rom_fast, nvt_machine_set_rom_fast);
+    object_class_property_set_description(oc, "rom-fast",
+        "the ROM fallback's waits before UART (DHCP 5 s, USB 30 s) / 10");
     object_class_property_add_str(oc, "flash-file",
         nvt_machine_get_flash_file, nvt_machine_set_flash_file);
     object_class_property_set_description(oc, "flash-file",
