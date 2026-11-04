@@ -3703,6 +3703,17 @@ def test_eqos_rx(qt, sock, port):
     for _ in range(20):
         qt.cmd('clock_step 1000000')
     check('and fills it once the tail moves on', rdes3(3) >> 28 & 3, 3)
+    # The ring is back at descriptor 0, which the guest refills and makes the
+    # tail: a rewrite of the same tail, as the loaders' Ethernet boot does
+    # after every frame, is what lets the waiting DMA take it
+    qt.writel(ring + 12, 0xC0000000)
+    send(small)
+    check('stopped at the tail again', rdes3(0) >> 31, 1)
+    qt.writel(ETH + 0x1100 + 0x28, ring)
+    for _ in range(20):
+        qt.cmd('clock_step 1000000')
+    check('rewriting the tail it waits at lets it through',
+          rdes3(0) >> 28 & 3, 3)
 
 
 # ldr r0,=0xF0290000; FCR = 7; 1: wait for LSR.DR; RBR -> THR; b 1b

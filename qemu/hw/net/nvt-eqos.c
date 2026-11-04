@@ -33,8 +33,8 @@
  * read format: RDES0 buffer, RDES3 OWN, IOC bit 30; write-back: RDES3 FD,
  * LD, packet length [14:0] -- without the FCS, which the driver does not
  * strip (DWC_ETH_QOS_clean_rx_irq).  A frame longer than RBSZ spans
- * descriptors; Rx stops at a descriptor it does not own; the packet filter (MPFR,
- * MAC address registers) decides what is taken at all.  A Tx frame is
+ * descriptors; Rx stops at the tail pointer until it is written again;
+ * the packet filter (MPFR, MAC address registers) decides what is taken at all.  A Tx frame is
  * gathered across tail writes, and one too long for the MAC is dropped
  * with ES / JT in its last write-back.  yinit() polls DSR0 until RPS0 reads
  * 3 (running, waiting for a packet) and re-initialises the core until it
@@ -162,6 +162,7 @@ struct NvtEqosState {
     uint8_t tx_frame[EQOS_MAX_FRAME];
     uint32_t tx_len;
     uint32_t tx_cic;                    /* the frame's checksum insertion */
+    bool rx_past_tail;                  /* the tail was written at cur_rx */
     uint32_t dsl_unit;                  /* bytes per DSL, the bus width */
     bool tx_overflow;
     uint16_t phy[32];
@@ -381,10 +382,12 @@ static uint32_t nvt_eqos_rx_bufsz(NvtEqosState *s)
 }
 
 /*
- * How many descriptors from the current one the DMA may fill: those it
- * owns.  The tail pointer does not stop it: the loaders' Ethernet boot
- * (STRGEXT_Eth.a) sets it once, at the last of its four descriptors, and
- * goes on to take a whole file through the ring.
+ * How many descriptors from the current one the DMA may fill: owned by it
+ * and short of the tail pointer, which the DMA stops at (the driver points
+ * it at the last descriptor it refilled).  A write to the tail while the
+ * DMA waits there lets it take that descriptor: the loaders' Ethernet boot
+ * (STRGEXT_Eth.a) rewrites the same address, the last of its four, after
+ * every frame, and takes a whole file through the ring.
  */
 static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
 {
@@ -397,6 +400,9 @@ static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
     }
     for (n = 0; n < want && n < ring; n++) {
         a = nvt_eqos_desc(s, true, (s->cur_rx + n) % ring);
+        if (a == *ch(s, CH_RDTP) && !(n == 0 && s->rx_past_tail)) {
+            break;
+        }
         nvt_eqos_read_desc(a, d);
         if (!(d[3] & DES3_OWN)) {
             break;
@@ -491,6 +497,7 @@ static ssize_t nvt_eqos_receive(NetClientState *nc, const uint8_t *buf,
         *ch(s, CH_CHRDR) = a;
         *ch(s, CH_CHRBAR) = d[0];
         s->cur_rx = (s->cur_rx + 1) % ring;
+        s->rx_past_tail = false;
     }
     nvt_eqos_update_irq(s);
     return size;
@@ -520,6 +527,8 @@ static void nvt_eqos_soft_reset(NvtEqosState *s)
     s->cur_tx = s->cur_rx = 0;
     s->tx_len = 0;
     s->tx_overflow = false;
+    s->tx_cic = 0;
+    s->rx_past_tail = false;
     s->rps = RPS_STOPPED;
     s->irq_level = false;
     qemu_irq_lower(s->irq);
@@ -608,6 +617,7 @@ static void nvt_eqos_write(void *opaque, hwaddr off, uint64_t val,
         case CH_RCR:
         case CH_RDTP:
             *reg(s, off) = val;
+            s->rx_past_tail = val == nvt_eqos_desc(s, true, s->cur_rx);
             if (*ch(s, CH_RCR) & RCR_SR) {
                 s->rps = RPS_WAITING;
                 qemu_flush_queued_packets(qemu_get_queue(s->nic));
@@ -665,7 +675,7 @@ static void nvt_eqos_init(Object *obj)
 
 static const VMStateDescription vmstate_nvt_eqos = {
     .name = TYPE_NVT_EQOS,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtEqosState, EQOS_SIZE / 4),
@@ -677,6 +687,8 @@ static const VMStateDescription vmstate_nvt_eqos = {
         VMSTATE_UINT32(tx_len, NvtEqosState),
         VMSTATE_BOOL(tx_overflow, NvtEqosState),
         VMSTATE_UINT16_ARRAY(phy, NvtEqosState, 32),
+        VMSTATE_UINT32_V(tx_cic, NvtEqosState, 2),
+        VMSTATE_BOOL_V(rx_past_tail, NvtEqosState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

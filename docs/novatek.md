@@ -464,9 +464,9 @@ qemu-system-arm -M nt98562,flash-file=blank.bin,boot-file=set/loader.bin,boot-st
 
 On NA51068 Ethernet is strap 3 and the embedded PHY is MAC1: `-nic user`
 twice, TFTP on the second. The library showed three things in `nvt-eqos`:
-TX checksum insertion (TDES3 CIC), an Rx ring that stops at a descriptor
-it does not own and not at the tail pointer, which the library sets once,
-and NA51055's DSL in units of 4 bytes.
+TX checksum insertion (TDES3 CIC), a tail pointer that releases the Rx DMA
+when rewritten at the descriptor it waits at, as the library does after
+every frame with one fixed address, and NA51055's DSL in units of 4 bytes.
 
 ## The real first-stage loader
 

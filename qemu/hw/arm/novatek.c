@@ -3085,6 +3085,9 @@ static void na51103_boot_core(MachineState *machine)
     qdev_prop_set_uint64(rom, "uart", 0xF0280000);
     qdev_prop_set_uint8(rom, "layout", 3);
     qdev_prop_set_uint64(rom, "rom-base", NA51103_A32_IO);
+    if (nvt_rom_loader_file) {
+        qdev_prop_set_string(rom, "loader-file", nvt_rom_loader_file);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(rom), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(rom), 0,
                             NA51103_IO(object_property_get_uint(OBJECT(rom),
@@ -3127,6 +3130,7 @@ static void novatek_a64_init(MachineState *machine, const NvtSoCConfig *c)
      * a CPU slot for the boot core; loader=off, -smp 2 or -kernel: the
      * stand-in.
      */
+    nvt_rom_set_loader_file(nms->boot_file);
     rom = nms->real_loader && nms->flash_file &&
           !machine->kernel_filename && machine->smp.cpus > smp_cpus &&
           nvt_flash_has_loader(nms->flash, NA51103_SRAM_A32,
@@ -3232,6 +3236,7 @@ static void novatek_a64_init(MachineState *machine, const NvtSoCConfig *c)
 
     dev = qdev_new("nvt-top");
     qdev_prop_set_uint32(dev, "chip-id", c->chip_id);
+    qdev_prop_set_uint32(dev, "strap", nms->boot_strap);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NA51103_TOP_BASE, 1);
 
