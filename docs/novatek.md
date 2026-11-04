@@ -534,6 +534,7 @@ the NA51089 mask ROM as C and assembly, and its `re.elf` runs here in place
 of the model, as openhisilicon's av300 ROM runs on the HiSilicon machines:
 
 ```sh
+git clone https://github.com/OpenIPC/opennovatek
 make -C opennovatek/bootrom/na51089 build
 qemu-system-arm -M nt98562,flash-file=blank.bin \
     -bios opennovatek/bootrom/na51089/re.elf -display none -serial stdio

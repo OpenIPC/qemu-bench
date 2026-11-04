@@ -1341,6 +1341,9 @@ jobs:
     name: NA51089 mask-ROM end-to-end (-bios re.elf, defib)
     needs: build
     runs-on: ubuntu-24.04
+    # it builds and runs another repository's code: no write token
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -1365,6 +1368,7 @@ jobs:
         with:
           repository: openipc/opennovatek
           path: opennovatek
+          persist-credentials: false
 
       - name: Build the NA51089 mask-ROM re.elf
         run: |
