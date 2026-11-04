@@ -1673,6 +1673,70 @@ def test_ssc029_power_off(qemu, tmp):
         qt.close()
 
 
+def test_infinity2m_rtcpwc(qemu, tmp):
+    print('infinity2m: the RTCPWC, as ms_rtcpwc.c drives it')
+    path = os.path.join(tmp, 'i2m-rtc.bin')
+    img = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    open(path, 'wb').write(img.ljust(0x1000000, b'\xFF'))
+    qt = QTest(qemu, 'ssd201,flash-file=' + path,
+               ['-rtc', 'clock=vm,base=2021-08-26T00:42:00'])
+    pwc = riu(0x0034, 0)
+    seq = (0, 1, 3, 7, 5, 1, 0)
+
+    def iso():
+        acks = []
+        for state in seq:
+            qt.writew(pwc + 0x03 * 4, state)
+            acks.append(qt.readw(pwc + 0x08 * 4) >> 3 & 1)
+        return acks
+
+    def read32(flag):
+        qt.writew(pwc + 0x00 * 4, flag)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+        return qt.readw(pwc + 0x0A * 4) << 16 | qt.readw(pwc + 0x09 * 4)
+
+    def write32(flag, val):
+        qt.writew(pwc + 0x00 * 4, flag)
+        qt.writew(pwc + 0x04 * 4, val & 0xFFFF)
+        qt.writew(pwc + 0x05 * 4, val >> 16)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+
+    def count():
+        qt.writew(pwc + 0x01 * 4, 1)
+        iso()
+        qt.writew(pwc + 0x0E * 4, 1)
+        v = qt.readw(pwc + 0x0D * 4) << 16 | qt.readw(pwc + 0x0C * 4)
+        qt.writew(pwc + 0x01 * 4, 0)
+        return v
+
+    try:
+        check('RTC: ISO_EN and the 1 kHz clock, no power warning',
+              qt.readw(pwc + 0x15 * 4) & 0x21, 0x21)
+        check('RTC: each ISO step acks as the driver waits for',
+              iso(), [0, 1, 0, 1, 0, 1, 0])
+        check('RTC: the battery kept the driver\'s magic in SW0',
+              read32(1 << 7), 0xBABE)
+        check('RTC: the base is the machine\'s RTC time',
+              read32(1 << 2), 1629938520)
+        write32(1 << 1, 0x12345678)
+        check('RTC: a new base reads back', read32(1 << 2), 0x12345678)
+        write32(1 << 5, 0xCAFE)
+        check('RTC: SW0 writes back', read32(1 << 7), 0xCAFE)
+        write32(1 << 3, 0)
+        qt.step(3 * 10 ** 9)
+        check('RTC: the counter counts seconds', count(), 3)
+        qt.writew(pwc + 0x00 * 4, 1 << 3)
+        for state in (0, 1, 3):
+            qt.writew(pwc + 0x03 * 4, state)
+        qt.writew(pwc + 0x03 * 4, 0)
+        qt.writew(pwc + 0x00 * 4, 0)
+        check('RTC: a sequence cut short sends nothing', count(), 3)
+    finally:
+        qt.close()
+
+
 def test_ssc029_smp(qemu, tmp):
     print('ssc029: CPU1 wakes through smpctrl')
     path = os.path.join(tmp, 'iford-smp.bin')
@@ -2030,6 +2094,7 @@ def main():
     test_ssc029_rtcpwc(args.qemu, tmp)
     test_ssc029_power_off(args.qemu, tmp)
     test_ssc029_smp(args.qemu, tmp)
+    test_infinity2m_rtcpwc(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 
