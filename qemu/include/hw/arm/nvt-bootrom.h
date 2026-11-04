@@ -70,7 +70,6 @@ struct NvtBootRomState {
     uint8_t mac[6];
     int eth_state;
     uint32_t xid, my_ip, srv_ip, mask;
-    uint32_t server_id;         /* the offer's option 54, for the REQUEST */
     uint8_t srv_mac[6];
     uint16_t srv_port, block;
     uint32_t got;

@@ -552,13 +552,18 @@ static void rom_build(NvtBootRomState *s, uint32_t entry)
  *
  *   - A MAC of 00:00:00 and three random bytes, new at every reset.
  *   - DHCPDISCOVER broadcast ("S1"), again every 5 s.
- *   - The first offer it can read: a broadcast one ("a", then
- *     "OfIP <yiaddr> SRV <next-server>", "MSK <mask>", "b"); a unicast
- *     offer to an address it has not taken yet is dropped ("ab"), as
- *     silicon drops it.
- *   - DHCPREQUEST ("S2"), the ACK ("cAk"), an ARP request for the server
- *     ("S3"), and one TFTP read request for loader.bin from port 2962
- *     ("S4"), to the MAC the offer came from.
+ *   - The first offer whose xid matches, broadcast or unicast, of any
+ *     message type ("a", "OfIP <yiaddr> SRV <siaddr>", "MSK <mask>" if
+ *     option 1 is there, else /24 is assumed, then "b" -- "a...b" for any
+ *     other frame).  It is taken only if yiaddr and siaddr share a
+ *     subnet; if not, the ROM keeps waiting and asks again in 5 s.
+ *   - DHCPREQUEST naming siaddr, not the offer's option 54, as the server
+ *     ("S2a"; the "a" is lost on silicon's busy FIFO), then any reply
+ *     with the xid as the ACK, NAK or not ("cAk"), an ARP request for the
+ *     server ("S3"), and one TFTP read request for loader.bin from port
+ *     2962 ("S4"), to the MAC the offer came from.
+ *   - ARP requests for its address are answered ("Dar p" -- "D" alone
+ *     for other ARP).
  *   - From then on it waits for DATA from that server with no timeout and
  *     no retransmission, ignoring errors: a server that never sends holds
  *     it there for good ("C" for every frame, "D" for ARP).
@@ -863,7 +868,7 @@ static void eth_dhcp(NvtBootRomState *s, int type)
         stl_be_p(o, s->my_ip);
         o += 4;
         *o++ = 54, *o++ = 4;
-        stl_be_p(o, s->server_id);
+        stl_be_p(o, s->srv_ip);         /* siaddr, not the offer's option 54 */
         o += 4;
     }
     *o = 255;
@@ -886,6 +891,25 @@ static void eth_arp_request(NvtBootRomState *s)
     stl_be_p(f + 28, s->my_ip);
     stl_be_p(f + 38, s->srv_ip);
     nvt_eqos_rom_send(s->eth, f, sizeof(f));
+}
+
+/* "arp": the reply to a request for our address */
+static void eth_arp_reply(NvtBootRomState *s, const uint8_t *req)
+{
+    uint8_t f[60] = { 0 };
+
+    rom_puts(s, "a");
+    memcpy(f, req + 6, 6);
+    memcpy(f + 6, s->mac, 6);
+    stw_be_p(f + 12, 0x0806);
+    memcpy(f + 14, req + 14, 6);        /* htype, ptype, sizes */
+    stw_be_p(f + 20, 2);                /* reply */
+    memcpy(f + 22, s->mac, 6);
+    stl_be_p(f + 28, s->my_ip);
+    memcpy(f + 32, req + 22, 10);       /* the asker's MAC and IP */
+    rom_puts(s, "r");
+    nvt_eqos_rom_send(s->eth, f, sizeof(f));
+    rom_puts(s, "p");
 }
 
 static void eth_tftp_rrq(NvtBootRomState *s)
@@ -928,7 +952,7 @@ static void rom_eth_rx(void *opaque, const uint8_t *f, size_t len)
 {
     NvtBootRomState *s = opaque;
     const uint8_t *ip = f + ETH_HLEN, *udp, *data;
-    uint32_t dip, sip;
+    uint32_t sip;
     size_t dlen;
     char buf[64];
 
@@ -942,6 +966,10 @@ static void rom_eth_rx(void *opaque, const uint8_t *f, size_t len)
     if (lduw_be_p(f + 12) == 0x0806) {
         if (s->eth_state == ETH_TFTP) {
             rom_puts(s, "D");
+            if (len >= 42 && lduw_be_p(f + 20) == 1 &&
+                ldl_be_p(f + 38) == s->my_ip) {
+                eth_arp_reply(s, f);
+            }
         }
         return;
     }
@@ -950,7 +978,6 @@ static void rom_eth_rx(void *opaque, const uint8_t *f, size_t len)
         return;
     }
     sip = ldl_be_p(ip + 12);
-    dip = ldl_be_p(ip + 16);
     udp = ip + (ip[0] & 0xF) * 4;
     data = udp + UDP_HLEN;
     if (data > f + len) {
@@ -963,34 +990,43 @@ static void rom_eth_rx(void *opaque, const uint8_t *f, size_t len)
         if (lduw_be_p(udp + 2) != 68) {
             return;
         }
+        /*
+         * The xid is all the ROM checks (net_run, 0x3438): broadcast or
+         * unicast, offer or not.  The mask is option 1's, else /24.
+         */
         rom_puts(s, "a");
-        /* a broadcast offer for this request; a unicast one is dropped */
-        if (dlen < 240 || data[0] != 2 || ldl_be_p(data + 4) != s->xid ||
-            memcmp(data + 28, s->mac, 6) || dip != 0xFFFFFFFF ||
-            bootp_option(data, dlen, 53, 0) != 2) {
+        if (dlen < 240 || ldl_be_p(data + 4) != s->xid) {
             rom_puts(s, "b");
             return;
         }
         s->my_ip = ldl_be_p(data + 16);
-        s->srv_ip = ldl_be_p(data + 20) ? ldl_be_p(data + 20) :
-                    bootp_option(data, dlen, 54, sip);
-        s->mask = bootp_option(data, dlen, 1, 0xFFFFFF00);
-        s->server_id = bootp_option(data, dlen, 54, sip);
-        memcpy(s->srv_mac, f + 6, 6);
-        snprintf(buf, sizeof(buf), "OfIP %08X SRV %08X\r\nMSK %08X\r\nb",
-                 s->my_ip, s->srv_ip, s->mask);
+        s->srv_ip = ldl_be_p(data + 20);
+        snprintf(buf, sizeof(buf), "OfIP %08X SRV %08X\r\n",
+                 s->my_ip, s->srv_ip);
         rom_puts(s, buf);
+        s->mask = bootp_option(data, dlen, 1, 0);
+        if (s->mask) {
+            snprintf(buf, sizeof(buf), "MSK %08X\r\n", s->mask);
+            rom_puts(s, buf);
+        } else {
+            s->mask = 0xFFFFFF00;
+        }
+        memcpy(s->srv_mac, f + 6, 6);
+        rom_puts(s, "b");
+        if ((s->my_ip ^ s->srv_ip) & s->mask) {
+            return;                     /* a server elsewhere: wait, ask again */
+        }
         s->eth_state = ETH_REQUEST;
         eth_dhcp(s, 3);
-        rom_puts(s, "S2");
+        rom_puts(s, "S2a");
         break;
     case ETH_REQUEST:
-        if (lduw_be_p(udp + 2) != 68 || dlen < 240 || data[0] != 2 ||
-            ldl_be_p(data + 4) != s->xid || memcmp(data + 28, s->mac, 6)) {
+        /* any reply with the xid is the ACK: a NAK would do as well */
+        if (lduw_be_p(udp + 2) != 68) {
             return;
         }
         rom_puts(s, "c");
-        if (bootp_option(data, dlen, 53, 0) != 5) {
+        if (dlen < 240 || ldl_be_p(data + 4) != s->xid) {
             return;
         }
         rom_puts(s, "Ak");
