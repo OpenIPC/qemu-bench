@@ -3717,6 +3717,140 @@ def test_eqos_rx(qt, sock, port):
 
 
 # ldr r0,=0xF0290000; FCR = 7; 1: wait for LSR.DR; RBR -> THR; b 1b
+def nvt_cdb(op, addr=0, size=0, bad=False):
+    """A ROM command: the eight halfwords plus 0..7 sum to 0 (scsi_op.h)."""
+    c = bytearray(struct.pack('<BBII', 0xC0, op, addr, size).ljust(16, b'\0'))
+    total = sum(w + i for i, w in enumerate(struct.unpack('<8H', c)))
+    struct.pack_into('<H', c, 14, (-total + (1 if bad else 0)) & 0xFFFF)
+    return bytes(c)
+
+
+def nvt_echo(cdb):
+    """What the ROM echoes: the command with a fresh checksum."""
+    return nvt_cdb(cdb[1], *struct.unpack_from('<II', cdb, 2))
+
+
+def nvt_test_loader(base=0xF07C0000):
+    """A loader the ROM's check takes: entry and base, size at 0x24,
+    0xAA55 at 0x30, halfwords plus indices summing to 0.  It prints OK."""
+    img = bytearray(0x80)
+    struct.pack_into('<II', img, 0, base + 0x40, base)
+    struct.pack_into('<I', img, 0x24, len(img))
+    struct.pack_into('<H', img, 0x30, 0xAA55)
+    struct.pack_into('<7I', img, 0x40, 0xE59F0010, 0xE3A0104F, 0xE5801000,
+                     0xE3A0104B, 0xE5801000, 0xEAFFFFFE, UART0)
+    words = struct.unpack('<64H', img)
+    total = sum(w + i for i, w in enumerate(words[:63])) + 63
+    struct.pack_into('<H', img, 0x7E, -total & 0xFFFF)
+    return bytes(img)
+
+
+class RomSerial:
+    """nt98562 with a blank flash and the ROM's fallback, its UART 0 on a
+    Unix socket."""
+
+    def __init__(self, qemu, tmp, opts):
+        flash = os.path.join(tmp, 'blank.bin')
+        open(flash, 'wb').write(b'\xff' * (8 << 20))
+        self.path = os.path.join(tmp, 'rom-ser.sock')
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+        self.proc = subprocess.Popen(
+            [qemu, '-M', 'nt98562,flash-file=%s,rom-fast=on,%s' % (flash, opts),
+             '-display', 'none', '-nodefaults',
+             '-serial', 'unix:%s,server=on,wait=on' % self.path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if os.path.exists(self.path):
+                break
+            time.sleep(0.05)
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(self.path)
+        self.sock.settimeout(0.1)
+
+    def send(self, data):
+        self.sock.sendall(data)
+
+    def recv(self, n=None, timeout=3.0):
+        """Up to n bytes (all that comes in timeout if n is None)."""
+        out = b''
+        end = time.time() + timeout
+        while time.time() < end and (n is None or len(out) < n):
+            try:
+                out += self.sock.recv(4096)
+            except socket.timeout:
+                pass
+        return out
+
+    def close(self):
+        self.sock.close()
+        self.proc.kill()
+        self.proc.wait()
+
+
+def test_rom_uart(qemu, tmp):
+    """The ROM's UART download, straps at UART: its command engine as read
+    from the NA51089 ROM, down to its lack of resync and payload aliasing."""
+    print('Mask ROM: UART download (boot-strap=0xc)')
+    rs = RomSerial(qemu, tmp, 'boot-strap=0xc')
+    try:
+        check('UART boot prints nothing', rs.recv(timeout=0.5), b'')
+        rs.send(b'\x55' + nvt_cdb(0x81))
+        check('a stray byte puts it out of step', rs.recv(timeout=0.5), b'')
+        rs.send(b'\0' * 15)
+        rs.send(nvt_cdb(0x81))
+        check('IS_NVT, back in step: echo and the chip word',
+              rs.recv(20), nvt_echo(nvt_cdb(0x81)) + b'\0\0\x21\x70')
+        bad = nvt_cdb(0x81, bad=True)
+        rs.send(bad)
+        check('IS_NVT, bad checksum: echo and zeros', rs.recv(20),
+              nvt_echo(bad) + b'\0' * 4)
+        rs.send(nvt_cdb(0x03, 0xF07D8000, 0x12345678, bad=True))
+        rs.recv(16)
+        rs.send(nvt_cdb(0x83, 0xF07D8000))
+        got = rs.recv(24)
+        check('ADDR_WRITE lands despite a bad checksum',
+              got[16:], struct.pack('<II', 0xF07D8000, 0x12345678))
+        rs.send(nvt_cdb(0x01))
+        check('OPEN_DEVICE: echo', rs.recv(16), nvt_echo(nvt_cdb(0x01)))
+        # A payload chunk that reads as WRLOADER moves the store
+        alias = nvt_cdb(0x02, 0xF07D1000, 0x20)
+        rs.send(nvt_cdb(0x02, 0xF07D0000, 0x40) + b'\x11' * 16 + alias +
+                b'\x22' * 16 + b'\x33' * 16)
+        check('a payload chunk that is a WRLOADER answers as one',
+              rs.recv(16), nvt_echo(alias))
+        rs.send(nvt_cdb(0x83, 0xF07D1000))
+        check('... and the rest of the payload goes where it says',
+              rs.recv(24)[20:], b'\x22' * 4)
+        loader = nvt_test_loader()
+        rs.send(nvt_cdb(0x02, 0xF07C0000, len(loader)) + loader)
+        check('WRLOADER: echo once the loader is in', rs.recv(16),
+              nvt_echo(nvt_cdb(0x02, 0xF07C0000, len(loader))))
+        rs.send(nvt_cdb(0x82))
+        check('WAIT_DONE: echo, the jump, and the loader runs',
+              rs.recv(19), nvt_echo(nvt_cdb(0x82)) + b'TOK')
+    finally:
+        rs.close()
+
+
+def test_rom_fallback(qemu, tmp):
+    """A blank flash with the straps at NOR: the ROM's letters on the way
+    through SD, Ethernet (no DHCP server) and USB, then UART."""
+    print('Mask ROM: fallback from a blank NOR')
+    rs = RomSerial(qemu, tmp, 'rom-fallback=on')
+    try:
+        start = b'NPIp>K9S1K2HE00003500000037000000D1E1s100FXS1'
+        got = rs.recv(timeout=8.0)
+        check('NOR fails, no SD card, Ethernet starts',
+              got[:len(start)], start)
+        check('six DHCP tries, then USB, then UART',
+              got[len(start):], b'S1' * 5 + b'K:UK:')
+        rs.send(nvt_cdb(0x81))
+        check('the UART stage answers', rs.recv(20)[16:], b'\0\0\x21\x70')
+    finally:
+        rs.close()
+
+
 UART_ECHO = [0xE59F001C, 0xE3A01007, 0xE5801008, 0xE5901014, 0xE3110001,
              0x0AFFFFFC, 0xE5902000, 0xE5802000, 0xEAFFFFF9, 0xF0290000]
 
@@ -4960,6 +5094,8 @@ def run(args, tmp):
     finally:
         qt.close()
     test_boot_rom(args.qemu, tmp)
+    test_rom_uart(args.qemu, tmp)
+    test_rom_fallback(args.qemu, tmp)
     test_loader_models(args.qemu, tmp)
 
     for with_oob in (False, True):

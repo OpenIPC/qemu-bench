@@ -35,10 +35,11 @@
  * the jump.
  *
  * The silicon's ROM also takes the loader from SD, Ethernet (DHCP and
- * TFTP), USB or UART.  None of those is modelled: "loader-file" is what
- * one of them delivered, a host file copied to SRAM in place of the
- * flash's first bytes, and the machines' "boot-strap" sets the strap the
- * loader reads back.
+ * TFTP), USB or UART.  "loader-file" stands for what one of them
+ * delivered, a host file copied to SRAM in place of the flash's first
+ * bytes.  With "fallback" (NA51089), the ROM's own fallback runs instead
+ * when the flash has no valid loader or the straps are not at flash: see
+ * "the ROM's fallback" below.
  *
  * The ROM's own code is not available, so this one is QEMU's: a reset
  * vector branching to the loader's entry, and for each routine a stub that
@@ -71,6 +72,8 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "hw/core/cpu.h"
+#include "qemu/timer.h"
 
 #define ROM_SIZE        0x8000
 #define ROM_SVC_SIZE    0x100
@@ -507,10 +510,404 @@ static void rom_build(NvtBootRomState *s, uint32_t entry)
     }
 }
 
+/*
+ * The ROM's fallback, as NA51089's mask ROM does it (read from a dump of
+ * it, and the NT9856x ROM code application note): with no valid loader in
+ * flash it tries SD, Ethernet, USB and UART in turn, and again from SD,
+ * printing a letter or two for each on UART 0.  The straps pick where it
+ * starts: 0xC is UART, 4 Ethernet, 1 SD, 5 and 0xB USB, the rest flash.
+ *
+ *   flash     "PIp>", then "K9" for a loader that fails the check below
+ *   SD        "S1K2": no card is modelled
+ *   Ethernet  "HE", the PHY's registers, "s100FX", then a DHCPDISCOVER
+ *             ("S1") every 5 s; six unanswered and it gives up ("K:")
+ *   USB       "U"; 30 s and it gives up ("K:")
+ *   UART      nothing; 30 s and it gives up ("K:"), unless OPEN_DEVICE
+ *
+ * The UART stage takes 16-byte commands (the CDB format of the SDK's
+ * scsi_op.h): byte 0 0xC0, byte 1 the op, bytes 2..5 an address, 6..9 a
+ * size or a value, 14..15 a checksum that brings the eight halfwords plus
+ * 0..7 to 0.  As in the ROM, every 16 bytes received are one command and
+ * nothing ever resyncs, and once a WRLOADER has started, everything that
+ * follows is stored at dest + count -- and still decoded as commands, so a
+ * payload chunk that looks like one acts as one:
+ *
+ *   IS_NVT     (word 0x000081C0) echo, then the chip word (zeros on a
+ *              bad checksum)
+ *   OPEN_DEVICE (0x000001C0) echo, and the 30 s timeout stops (16 zeros
+ *              on a bad checksum)
+ *   ADDR_READ  (0x83C0) echo, the address and the word there
+ *   ADDR_WRITE (0x03C0) the word at the address, bad checksum or not; echo
+ *   WRLOADER   (0x02C0) the store's address and size; the echo comes once
+ *              size bytes are in
+ *   WAIT_DONE  (word 0x000082C0) echo, then the loader is checked and run
+ *
+ * Every echo carries a fresh checksum.  The check before the jump is the
+ * ROM's: the header's word 1 is the loader's address, word 9 its size,
+ * halfword 0x30 is 0xAA55, and its halfwords plus their indices sum to 0.
+ * Then "T" and the jump to word 0, or "K9" and the next source.
+ *
+ * The CPU waits in WFI in a parked ROM while this runs on timers, and the
+ * loader's arrival rewrites the ROM at 0 and wakes it.  The Ethernet
+ * stage sends nothing yet: it behaves as a network with no DHCP server.
+ */
+enum {
+    NVT_SRC_FLASH, NVT_SRC_SD, NVT_SRC_ETH, NVT_SRC_USB, NVT_SRC_UART,
+    NVT_SRC_DONE,
+};
+
+#define UART_RBR        0x00
+#define UART_FCR        0x08
+#define UART_LCR        0x0C
+#define UART_LSR        0x14
+#define UART_POLL_NS    (200 * SCALE_US)
+
+#define DHCP_INTERVAL   5000
+#define DHCP_TRIES      6
+#define USB_TIMEOUT     30000
+#define UART_TIMEOUT    30000
+
+static void rom_stage(NvtBootRomState *s);
+static void rom_fallback_start(void *opaque);
+
+/*
+ * "fast" shortens the waits on the way to UART (DHCP, USB), not the UART
+ * window: that is the host's time to find the 16-byte alignment.
+ */
+static void rom_arm(NvtBootRomState *s, int64_t ms)
+{
+    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              (s->fast && s->source != NVT_SRC_UART ? ms / 10 : ms));
+}
+
+static bool rom_loader_ok(const uint8_t *img, uint32_t len)
+{
+    uint32_t size, sum = 0, i;
+
+    if (len < 0x34) {
+        return false;
+    }
+    size = ldl_le_p(img + 0x24);
+    if (size < 0x34 || size > len || size & 1 ||
+        lduw_le_p(img + 0x30) != 0xAA55) {
+        return false;
+    }
+    for (i = 0; i < size / 2; i++) {
+        sum += lduw_le_p(img + 2 * i) + i;
+    }
+    return !(sum & 0xFFFF);
+}
+
+/* The parked ROM: wfi, b 0 */
+static void rom_park(NvtBootRomState *s)
+{
+    uint32_t *w = (uint32_t *)s->image;
+
+    memset(s->image, 0, ROM_SIZE);
+    w[0] = cpu_to_le32(0xE320F003);
+    w[1] = cpu_to_le32(0xEAFFFFFD);
+    address_space_write(&s->as, 0, MEMTXATTRS_UNSPECIFIED, s->image, ROM_SIZE);
+    memory_region_set_dirty(&s->rom, 0, ROM_SIZE);
+}
+
+/* "T": the loader in SRAM is run, as after a flash boot */
+static void rom_run(NvtBootRomState *s, uint32_t entry)
+{
+    CPUState *cs = first_cpu;
+
+    rom_puts(s, "T");
+    s->source = NVT_SRC_DONE;
+    timer_del(s->timer);
+    timer_del(s->poll);
+    rom_build(s, entry);
+    address_space_write(&s->as, 0, MEMTXATTRS_UNSPECIFIED, s->image, ROM_SIZE);
+    memory_region_set_dirty(&s->rom, 0, ROM_SIZE);
+    if (cs) {
+        cs->halted = 0;
+        qemu_cpu_kick(cs);
+    }
+}
+
+/* The loader at addr, checked; run, or "K9" and on to the next source */
+static void rom_try_loader(NvtBootRomState *s, uint32_t addr, uint32_t len)
+{
+    g_autofree uint8_t *img = g_malloc0(len);
+
+    if (len >= 0x34 && !dma_memory_read(&s->as, addr, img, len,
+                                        MEMTXATTRS_UNSPECIFIED) &&
+        rom_loader_ok(img, len) && ldl_le_p(img + 4) == addr) {
+        rom_run(s, ldl_le_p(img));
+        return;
+    }
+    rom_puts(s, "K9");
+    s->source = s->source == NVT_SRC_UART ? NVT_SRC_SD : s->source + 1;
+    rom_stage(s);
+}
+
+static void rom_uart_send(NvtBootRomState *s, const uint8_t *buf, int n)
+{
+    while (n--) {
+        rom_putc(s, *buf++);
+    }
+}
+
+static bool cdb_sum_ok(const uint8_t *c)
+{
+    uint32_t sum = 0;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        sum += lduw_le_p(c + 2 * i) + i;
+    }
+    return !(sum & 0xFFFF);
+}
+
+static void cdb_echo(NvtBootRomState *s, const uint8_t *c)
+{
+    uint8_t e[16];
+    uint32_t sum = 7;
+    int i;
+
+    memcpy(e, c, 16);
+    for (i = 0; i < 7; i++) {
+        sum += lduw_le_p(e + 2 * i) + i;
+    }
+    stw_le_p(e + 14, -sum);
+    rom_uart_send(s, e, 16);
+}
+
+static void rom_cdb(NvtBootRomState *s, const uint8_t *c)
+{
+    static const uint8_t zeros[16];
+    uint32_t w0 = ldl_le_p(c), addr = ldl_le_p(c + 2), val = ldl_le_p(c + 6);
+    uint16_t h0 = lduw_le_p(c);
+    bool ok = cdb_sum_ok(c);
+    uint8_t out[8];
+
+    if (w0 == 0x000081C0) {                     /* IS_NVT */
+        cdb_echo(s, c);
+        stl_le_p(out, ok ? address_space_ldl_le(&s->as, s->top + 0xF0,
+                                                MEMTXATTRS_UNSPECIFIED,
+                                                NULL) : 0);
+        rom_uart_send(s, out, 4);
+    } else if (w0 == 0x000001C0) {              /* OPEN_DEVICE */
+        if (ok) {
+            cdb_echo(s, c);
+            timer_del(s->timer);
+        } else {
+            rom_uart_send(s, zeros, 16);
+        }
+    } else if (w0 == 0x000082C0) {              /* WAIT_DONE */
+        cdb_echo(s, c);
+        if (s->storing) {
+            uint32_t size = address_space_ldl_le(&s->as, s->dest + 0x24,
+                                                 MEMTXATTRS_UNSPECIFIED, NULL);
+            rom_try_loader(s, s->dest, MIN(size, s->sram_size));
+        } else {
+            rom_try_loader(s, s->sram_base, 0);
+        }
+    } else if (h0 == 0x83C0) {                  /* ADDR_READ */
+        cdb_echo(s, c);
+        stl_le_p(out, addr);
+        stl_le_p(out + 4, address_space_ldl_le(&s->as, addr,
+                                               MEMTXATTRS_UNSPECIFIED, NULL));
+        rom_uart_send(s, out, 8);
+    } else if (h0 == 0x03C0) {                  /* ADDR_WRITE */
+        address_space_stl_le(&s->as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
+        cdb_echo(s, c);
+    } else if (h0 == 0x02C0) {                  /* WRLOADER */
+        s->storing = true;
+        s->echo_due = true;
+        s->dest = addr;
+        s->size = val;
+        s->count = 0;
+        memcpy(s->wr_cdb, c, 16);
+    }
+}
+
+static void rom_uart_byte(NvtBootRomState *s, uint8_t b)
+{
+    s->chunk[s->nchunk++] = b;
+    if (s->nchunk < 16) {
+        return;
+    }
+    s->nchunk = 0;
+    if (s->storing) {
+        dma_memory_write(&s->as, s->dest + s->count, s->chunk, 16,
+                         MEMTXATTRS_UNSPECIFIED);
+        s->count += 16;
+    }
+    rom_cdb(s, s->chunk);
+    if (s->source == NVT_SRC_UART && s->echo_due && s->count >= s->size) {
+        s->echo_due = false;
+        cdb_echo(s, s->wr_cdb);
+    }
+}
+
+/*
+ * The UART stage takes what comes in.  The other stages read nothing, and
+ * on silicon what arrives then overruns the FIFO and is lost; QEMU's 16550
+ * would hold the backend back instead, and hand the UART stage a backlog
+ * of whatever a host sent meanwhile, so it is drained here.
+ */
+static void rom_uart_poll(void *opaque)
+{
+    NvtBootRomState *s = opaque;
+    int n;
+    uint8_t b;
+
+    for (n = 0; n < 64 && s->source != NVT_SRC_DONE; n++) {
+        if (!(address_space_ldub(&s->as, s->uart + UART_LSR,
+                                 MEMTXATTRS_UNSPECIFIED, NULL) & 1)) {
+            break;
+        }
+        b = address_space_ldub(&s->as, s->uart + UART_RBR,
+                               MEMTXATTRS_UNSPECIFIED, NULL);
+        if (s->source == NVT_SRC_UART) {
+            rom_uart_byte(s, b);
+        }
+    }
+    if (s->source != NVT_SRC_DONE) {
+        timer_mod(s->poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  UART_POLL_NS);
+    }
+}
+
+/* A stage's timeout ran out, or the next DHCPDISCOVER is due */
+static void rom_timeout(void *opaque)
+{
+    NvtBootRomState *s = opaque;
+
+    switch (s->source) {
+    case -1:                            /* just out of reset */
+        rom_fallback_start(s);
+        return;
+    case NVT_SRC_ETH:
+        if (++s->tries < DHCP_TRIES) {
+            rom_puts(s, "S1");
+            rom_arm(s, DHCP_INTERVAL);
+            return;
+        }
+        break;
+    case NVT_SRC_USB:
+        break;
+    case NVT_SRC_UART:
+        break;
+    default:
+        return;
+    }
+    rom_puts(s, "K:");
+    s->source = s->source == NVT_SRC_UART ? NVT_SRC_SD : s->source + 1;
+    rom_stage(s);
+}
+
+static void rom_stage(NvtBootRomState *s)
+{
+    uint32_t size;
+
+    switch (s->source) {
+    case NVT_SRC_FLASH:
+        rom_puts(s, "PIp>");
+        nvt_flash_read(s->flash, 0x24, &size, 4);
+        size = MIN(le32_to_cpu(size), s->sram_size);
+        s->loader = g_realloc(s->loader, MAX(size, 4));
+        nvt_flash_read(s->flash, 0, s->loader, size);
+        address_space_write(&s->as, s->sram_base, MEMTXATTRS_UNSPECIFIED,
+                            s->loader, size);
+        rom_try_loader(s, s->sram_base, size);
+        break;
+    case NVT_SRC_SD:
+        rom_puts(s, "S1K2");
+        s->source = NVT_SRC_ETH;
+        rom_stage(s);
+        break;
+    case NVT_SRC_ETH:
+        rom_puts(s, "HE00003500000037000000D1E1s100FXS1");
+        s->tries = 0;
+        rom_arm(s, DHCP_INTERVAL);
+        break;
+    case NVT_SRC_USB:
+        rom_puts(s, "U");
+        rom_arm(s, USB_TIMEOUT);
+        break;
+    case NVT_SRC_UART:
+        /*
+         * 8N1, FIFOs on and reset.  The receive trigger at 14 bytes: QEMU's
+         * 16550 offers its backend only up to the trigger level, so at 1 a
+         * 32 KiB loader would take half a minute.
+         */
+        address_space_stb(&s->as, s->uart + UART_LCR, 0x03,
+                          MEMTXATTRS_UNSPECIFIED, NULL);
+        address_space_stb(&s->as, s->uart + UART_FCR, 0xC7,
+                          MEMTXATTRS_UNSPECIFIED, NULL);
+        s->nchunk = 0;
+        s->storing = s->echo_due = false;
+        rom_arm(s, UART_TIMEOUT);
+        break;
+    }
+}
+
+/* Where the straps send the ROM first */
+static int rom_first_source(uint8_t strap)
+{
+    switch (strap & 0xF) {
+    case 0xC:
+        return NVT_SRC_UART;
+    case 4:
+        return NVT_SRC_ETH;
+    case 1:
+        return NVT_SRC_SD;
+    case 5: case 0xB:
+        return NVT_SRC_USB;
+    default:
+        return NVT_SRC_FLASH;
+    }
+}
+
+static void rom_fallback_start(void *opaque)
+{
+    NvtBootRomState *s = opaque;
+
+    s->source = rom_first_source(s->strap);
+    if (s->source != NVT_SRC_UART) {    /* UART boot prints nothing */
+        rom_puts(s, "N");
+    }
+    timer_mod(s->poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + UART_POLL_NS);
+    rom_stage(s);
+}
+
+static bool rom_flash_loader_ok(NvtBootRomState *s)
+{
+    uint32_t size;
+    g_autofree uint8_t *img = NULL;
+
+    nvt_flash_read(s->flash, 0x24, &size, 4);
+    size = le32_to_cpu(size);
+    if (size < 0x34 || size > s->sram_size) {
+        return false;
+    }
+    img = g_malloc(size);
+    nvt_flash_read(s->flash, 0, img, size);
+    return rom_loader_ok(img, size) && ldl_le_p(img + 4) == s->sram_base;
+}
+
 static void nvt_bootrom_reset(DeviceState *dev)
 {
     NvtBootRomState *s = NVT_BOOTROM(dev);
     uint32_t hdr[10], size;
+
+    timer_del(s->timer);
+    timer_del(s->poll);
+    s->source = NVT_SRC_DONE;
+    if (s->fallback && !s->loader_file &&
+        (rom_first_source(s->strap) != NVT_SRC_FLASH ||
+         !rom_flash_loader_ok(s))) {
+        rom_park(s);
+        /* from the main loop, once every device is out of reset */
+        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+        s->source = -1;
+        return;
+    }
 
     /* the loader into SRAM, as the ROM copies it */
     if (s->loader_file) {
@@ -562,6 +959,8 @@ static void nvt_bootrom_realize(DeviceState *dev, Error **errp)
                                ROM_SIZE, s->image);
     memory_region_set_readonly(&s->rom, true);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->rom);
+    s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, rom_timeout, s);
+    s->poll = timer_new_ns(QEMU_CLOCK_VIRTUAL, rom_uart_poll, s);
 }
 
 static void nvt_bootrom_init(Object *obj)
@@ -596,6 +995,10 @@ static const Property nvt_bootrom_properties[] = {
     DEFINE_PROP_UINT64("rom-base", NvtBootRomState, rom_base, 0x80000000),
     DEFINE_PROP_UINT8("layout", NvtBootRomState, layout, 0),
     DEFINE_PROP_STRING("loader-file", NvtBootRomState, loader_file),
+    DEFINE_PROP_BOOL("fallback", NvtBootRomState, fallback, false),
+    DEFINE_PROP_BOOL("fast", NvtBootRomState, fast, false),
+    DEFINE_PROP_UINT8("strap", NvtBootRomState, strap, 0),
+    DEFINE_PROP_UINT64("top", NvtBootRomState, top, 0xF0010000),
 };
 
 static void nvt_bootrom_class_init(ObjectClass *klass, const void *data)

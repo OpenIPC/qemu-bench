@@ -450,9 +450,56 @@ way with `SOC=nt98566 FLASH=nand.bin`.
 ## Recovery boot
 
 The silicon's ROM also takes its loader from SD, Ethernet (DHCP and TFTP),
-USB or UART. That fetch is not modelled: `boot-file=` is what it delivered,
-a host file copied to SRAM in place of the flash's first bytes, and
-`boot-strap=` is the straps as TOP+0 reads them. From there the guest code
+USB or UART. On NA51089 (NT98560/561/562/566) the ROM model runs that
+fallback itself, as read from a dump of the ROM and the NT9856x ROM code
+application note, when the flash has no valid loader and `rom-fallback=on`,
+or whenever `boot-strap=` is not a flash strap:
+
+- **Order:** flash, SD, Ethernet, USB, UART, then SD again. The straps pick
+  where it starts: 0xC UART, 4 Ethernet, 1 SD, 5 and 0xB USB.
+- **Console letters on UART 0:**
+  - `NPIp>K9`: the flash loader fails the ROM's check.
+  - `S1K2`: no SD card.
+  - `HE00003500000037000000D1E1s100FX` then `S1` per DHCPDISCOVER, every
+    5 s, six of them, then `K:`.
+  - `U`, then `K:` after 30 s.
+  - Then UART, which prints nothing.
+  - `T` on the jump.
+- **Ethernet** sends nothing yet: the stage behaves like a network with no
+  DHCP server.
+- **The loader check:** header word 1 is the address, word 9 the size,
+  halfword 0x30 is 0xAA55, and the halfwords plus their indices sum to 0.
+- **The UART stage** is the ROM's command engine (the SDK's `scsi_op.h`
+  CDBs, opset 0xC0):
+  - IS_NVT answers with the chip word.
+  - OPEN_DEVICE stops the stage's 30 s timeout.
+  - ADDR_READ and ADDR_WRITE; ADDR_WRITE acts even with a bad checksum.
+  - WRLOADER, then WAIT_DONE, which checks the loader and runs it or
+    prints `K9` and moves on.
+- **The ROM's quirks are kept:** every 16 bytes are one command, nothing
+  resyncs, and the WRLOADER payload is decoded as commands too, so a
+  payload chunk that looks like one acts as one. Bytes that arrive outside
+  the UART stage are dropped, as a full FIFO drops them on silicon.
+- **`rom-fast=on`** cuts the DHCP and USB waits tenfold. The 30 s UART
+  window is the host's, and stays.
+
+OpenIPC's [defib](https://github.com/OpenIPC/defib) recovers a blank board
+through it as it does a real one:
+
+```sh
+qemu-system-arm -M nt98562,flash-file=blank.bin,boot-strap=0xc \
+    -display none -nodefaults \
+    -chardev socket,id=s0,path=/tmp/nvt.sock,server=on,wait=off -serial chardev:s0 &
+defib burn -c nt98562 -p socket:///tmp/nvt.sock -b
+```
+
+`qemu-boot/test-novatek-recovery.sh` does that both ways in, through the
+straps and through the fallback from a blank NOR, and checks that U-Boot
+answers at its prompt.
+
+`boot-file=` still stands for a loader one of those sources delivered: a
+host file copied to SRAM in place of the flash's first bytes, with
+`boot-strap=` the straps as TOP+0 reads them. From there the guest code
 is the real thing: an `Eth` loader runs Novatek's DHCP and TFTP client on
 `nvt-eqos` against slirp, a `Uart` loader serves `openipc/nvt-uart-boot.py`
 from OpenIPC/u-boot's `openipc-novatek` over `-serial tcp:...`.

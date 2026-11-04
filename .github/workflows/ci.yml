@@ -1301,6 +1301,40 @@ jobs:
         if: matrix.soc == 'nt98566' && steps.kmod.outputs.args != ''
         run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }} ${{ steps.kmod.outputs.args }} --panel nt35510
 
+  boot-novatek-recovery:
+    name: Novatek recovery ${{ matrix.soc }} (defib, mask ROM fallback)
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [nt98562, nt98566]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      # A reviewed defib commit (Novatek UART and Ethernet recovery,
+      # OpenIPC/defib#169 and #170), not whatever master holds
+      - name: Install defib
+        run: pipx install git+https://github.com/OpenIPC/defib@a99ceee7b4ee3de5b59272bf4caf30346243e1e4
+
+      - name: Recover a blank flash over UART, through the straps and the fallback
+        run: bash qemu-boot/test-novatek-recovery.sh --soc ${{ matrix.soc }}
+
   boot-fullhan:
     name: Boot ${{ matrix.soc }}
     needs: build

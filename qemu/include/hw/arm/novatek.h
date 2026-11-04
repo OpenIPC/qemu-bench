@@ -65,5 +65,11 @@ bool nvt_flash_has_loader(NvtFlashState *flash, uint64_t sram_base,
 void nvt_rom_boot(NvtFlashState *flash, const NvtRomConfig *rc);
 /* The ROM's loader from a host file, not the flash (nvt-bootrom.c) */
 void nvt_rom_set_loader_file(const char *path);
+/*
+ * The ROM's own fallback (NA51089, nvt-bootrom.c): with no loader in
+ * flash, or the straps not at flash, it looks on SD, Ethernet, USB and UART.
+ */
+void nvt_rom_set_fallback(bool on, uint32_t strap, bool fast);
+bool nvt_rom_strap_is_flash(uint32_t strap);
 
 #endif /* HW_ARM_NOVATEK_H */

@@ -11,6 +11,7 @@
 #include "system/memory.h"
 #include "hw/ssi/nvt-flash.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 #define TYPE_NVT_BOOTROM "nvt-bootrom"
 OBJECT_DECLARE_SIMPLE_TYPE(NvtBootRomState, NVT_BOOTROM)
@@ -35,6 +36,27 @@ struct NvtBootRomState {
     uint8_t layout;     /* 0 NA51089's table, 1 NA51055's, 2 NS02501 (none) */
     uint32_t args[6];
     uint32_t ret;
+
+    /*
+     * Recovery (nvt-bootrom.c, "the ROM's fallback"): with no loader in
+     * flash, or straps not at flash, the CPU parks while the ROM looks for
+     * a loader on its other sources.
+     */
+    bool fallback;              /* run it when the flash has no loader */
+    bool fast;                  /* timeouts / 10, for tests */
+    uint8_t strap;              /* TOP+0 BS[3:0] */
+    uint64_t top;               /* TOP, for the chip word at +0xF0 */
+    QEMUTimer *timer;           /* the current stage's timeout */
+    QEMUTimer *poll;            /* the UART receive poll */
+    int source;                 /* the stage running, NVT_SRC_* */
+    int tries;
+    /* UART download (the ROM's CDB engine) */
+    uint8_t chunk[16];
+    int nchunk;
+    bool storing;               /* a WRLOADER has started the store */
+    bool echo_due;              /* the WRLOADER's echo, once size is in */
+    uint8_t wr_cdb[16];
+    uint32_t dest, size, count;
 };
 
 #endif /* HW_ARM_NVT_BOOTROM_H */
