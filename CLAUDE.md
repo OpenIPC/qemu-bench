@@ -378,8 +378,8 @@ arguments to a C service window; the ROM image in DRAM at 0 and read-only at
 `hw/misc/nvt-ddrc.c` (done / self-clearing bits, paged PHYs). `loader=off`
 forces the stand-in. On NA51089, `rom-fallback=on` (or a `boot-strap=` that
 is not a flash strap) runs the ROM's own fallback when the flash has no
-valid loader: SD, Ethernet (no DHCP yet), USB and its UART download engine,
-which `defib burn` drives as on silicon (`qemu-boot/test-novatek-recovery.sh`,
+valid loader: SD, Ethernet (its DHCP/TFTP client on `nvt-eqos`), USB and its
+UART download engine, which `defib burn` (and `burn --nic`) drive as on silicon (`qemu-boot/test-novatek-recovery.sh`,
 `docs/novatek.md#recovery-boot`). `qemu-boot/build-novatek-loader.sh` builds the SDKs'
 loaders; `docs/novatek.md#the-real-first-stage-loader` has what each loader
 waits for. Part-number machines `nt98560` / `nt98561` (NA51089), `nt98523` /

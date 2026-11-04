@@ -547,9 +547,28 @@ static void rom_build(NvtBootRomState *s, uint32_t entry)
  * halfword 0x30 is 0xAA55, and its halfwords plus their indices sum to 0.
  * Then "T" and the jump to word 0, or "K9" and the next source.
  *
+ * The Ethernet stage (with "eth", the machine's nvt-eqos) is the ROM's
+ * DHCP and TFTP client:
+ *
+ *   - A MAC of 00:00:00 and three random bytes, new at every reset.
+ *   - DHCPDISCOVER broadcast ("S1"), again every 5 s.
+ *   - The first offer it can read: a broadcast one ("a", then
+ *     "OfIP <yiaddr> SRV <next-server>", "MSK <mask>", "b"); a unicast
+ *     offer to an address it has not taken yet is dropped ("ab"), as
+ *     silicon drops it.
+ *   - DHCPREQUEST ("S2"), the ACK ("cAk"), an ARP request for the server
+ *     ("S3"), and one TFTP read request for loader.bin from port 2962
+ *     ("S4"), to the MAC the offer came from.
+ *   - From then on it waits for DATA from that server with no timeout and
+ *     no retransmission, ignoring errors: a server that never sends holds
+ *     it there for good ("C" for every frame, "D" for ARP).
+ *   - Each block in order is written to SRAM ("t<block>") and ACKed.
+ *   - A short block ends it ("Dn"), then the loader check.
+ *
+ * Every frame also prints "RI".
+ *
  * The CPU waits in WFI in a parked ROM while this runs on timers, and the
- * loader's arrival rewrites the ROM at 0 and wakes it.  The Ethernet
- * stage sends nothing yet: it behaves as a network with no DHCP server.
+ * loader's arrival rewrites the ROM at 0 and wakes it.
  */
 enum {
     NVT_SRC_FLASH, NVT_SRC_SD, NVT_SRC_ETH, NVT_SRC_USB, NVT_SRC_UART,
@@ -568,6 +587,7 @@ enum {
 #define UART_TIMEOUT    30000
 
 static void rom_stage(NvtBootRomState *s);
+static void rom_eth_detach(NvtBootRomState *s);
 static void rom_fallback_start(void *opaque);
 
 /*
@@ -616,6 +636,7 @@ static void rom_run(NvtBootRomState *s, uint32_t entry)
     CPUState *cs = first_cpu;
 
     rom_puts(s, "T");
+    rom_eth_detach(s);
     s->source = NVT_SRC_DONE;
     timer_del(s->timer);
     timer_del(s->poll);
@@ -773,6 +794,274 @@ static void rom_uart_poll(void *opaque)
     }
 }
 
+/* The Ethernet stage: DHCP, then loader.bin over TFTP */
+enum { ETH_DISCOVER, ETH_REQUEST, ETH_TFTP, ETH_DONE };
+
+#define ETH_HLEN        14
+#define IP_HLEN         20
+#define UDP_HLEN        8
+#define BOOTP_LEN       300
+#define TFTP_PORT       2962
+#define TFTP_BLOCK      512
+
+static void eth_ip_udp(NvtBootRomState *s, uint8_t *f, const uint8_t *dmac,
+                       uint32_t sip, uint32_t dip, uint16_t sport,
+                       uint16_t dport, size_t len)
+{
+    uint8_t *ip = f + ETH_HLEN, *udp = ip + IP_HLEN;
+    uint32_t sum = 0;
+    int i;
+
+    memcpy(f, dmac, 6);
+    memcpy(f + 6, s->mac, 6);
+    stw_be_p(f + 12, 0x0800);
+    memset(ip, 0, IP_HLEN);
+    ip[0] = 0x45;
+    stw_be_p(ip + 2, IP_HLEN + UDP_HLEN + len);
+    ip[8] = 255;
+    ip[9] = 17;
+    stl_be_p(ip + 12, sip);
+    stl_be_p(ip + 16, dip);
+    for (i = 0; i < IP_HLEN; i += 2) {
+        sum += lduw_be_p(ip + i);
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    stw_be_p(ip + 10, ~sum);
+    stw_be_p(udp, sport);
+    stw_be_p(udp + 2, dport);
+    stw_be_p(udp + 4, UDP_HLEN + len);
+    stw_be_p(udp + 6, 0);               /* no UDP checksum */
+}
+
+static void eth_send_udp(NvtBootRomState *s, const uint8_t *dmac,
+                         uint32_t sip, uint32_t dip, uint16_t sport,
+                         uint16_t dport, const uint8_t *data, size_t len)
+{
+    g_autofree uint8_t *f = g_malloc0(ETH_HLEN + IP_HLEN + UDP_HLEN + len);
+
+    eth_ip_udp(s, f, dmac, sip, dip, sport, dport, len);
+    memcpy(f + ETH_HLEN + IP_HLEN + UDP_HLEN, data, len);
+    nvt_eqos_rom_send(s->eth, f, ETH_HLEN + IP_HLEN + UDP_HLEN + len);
+}
+
+static const uint8_t eth_bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+/* DHCPDISCOVER or DHCPREQUEST, broadcast */
+static void eth_dhcp(NvtBootRomState *s, int type)
+{
+    uint8_t b[BOOTP_LEN] = { 1, 1, 6, 0 };
+    uint8_t *o = b + 240;
+
+    stl_be_p(b + 4, s->xid);
+    memcpy(b + 28, s->mac, 6);
+    stl_be_p(b + 236, 0x63825363);
+    *o++ = 53, *o++ = 1, *o++ = type;
+    if (type == 3) {
+        *o++ = 50, *o++ = 4;
+        stl_be_p(o, s->my_ip);
+        o += 4;
+        *o++ = 54, *o++ = 4;
+        stl_be_p(o, s->server_id);
+        o += 4;
+    }
+    *o = 255;
+    eth_send_udp(s, eth_bcast, 0, 0xFFFFFFFF, 68, 67, b, sizeof(b));
+}
+
+static void eth_arp_request(NvtBootRomState *s)
+{
+    uint8_t f[60] = { 0 };
+
+    memcpy(f, eth_bcast, 6);
+    memcpy(f + 6, s->mac, 6);
+    stw_be_p(f + 12, 0x0806);
+    stw_be_p(f + 14, 1);                /* Ethernet */
+    stw_be_p(f + 16, 0x0800);
+    f[18] = 6;
+    f[19] = 4;
+    stw_be_p(f + 20, 1);                /* request */
+    memcpy(f + 22, s->mac, 6);
+    stl_be_p(f + 28, s->my_ip);
+    stl_be_p(f + 38, s->srv_ip);
+    nvt_eqos_rom_send(s->eth, f, sizeof(f));
+}
+
+static void eth_tftp_rrq(NvtBootRomState *s)
+{
+    static const char rrq[] = "\0\1loader.bin\0octet";
+
+    eth_send_udp(s, s->srv_mac, s->my_ip, s->srv_ip, TFTP_PORT, 69,
+                 (const uint8_t *)rrq, sizeof(rrq));
+}
+
+static void eth_tftp_ack(NvtBootRomState *s, uint16_t block)
+{
+    uint8_t ack[4];
+
+    stw_be_p(ack, 4);
+    stw_be_p(ack + 2, block);
+    eth_send_udp(s, s->srv_mac, s->my_ip, s->srv_ip, TFTP_PORT, s->srv_port,
+                 ack, sizeof(ack));
+}
+
+static uint32_t bootp_option(const uint8_t *b, size_t len, uint8_t want,
+                             uint32_t dflt)
+{
+    size_t i = 240;
+
+    while (i + 1 < len && b[i] != 255) {
+        if (!b[i]) {
+            i++;
+            continue;
+        }
+        if (b[i] == want && b[i + 1] >= 1 && i + 2 + b[i + 1] <= len) {
+            return b[i + 1] >= 4 ? ldl_be_p(b + i + 2) : b[i + 2];
+        }
+        i += 2 + b[i + 1];
+    }
+    return dflt;
+}
+
+static void rom_eth_rx(void *opaque, const uint8_t *f, size_t len)
+{
+    NvtBootRomState *s = opaque;
+    const uint8_t *ip = f + ETH_HLEN, *udp, *data;
+    uint32_t dip, sip;
+    size_t dlen;
+    char buf[64];
+
+    if (s->source != NVT_SRC_ETH || len < ETH_HLEN) {
+        return;
+    }
+    rom_puts(s, "RI\r\n");
+    if (s->eth_state == ETH_TFTP) {
+        rom_puts(s, "C");
+    }
+    if (lduw_be_p(f + 12) == 0x0806) {
+        if (s->eth_state == ETH_TFTP) {
+            rom_puts(s, "D");
+        }
+        return;
+    }
+    if (lduw_be_p(f + 12) != 0x0800 || len < ETH_HLEN + IP_HLEN + UDP_HLEN ||
+        ip[9] != 17) {
+        return;
+    }
+    sip = ldl_be_p(ip + 12);
+    dip = ldl_be_p(ip + 16);
+    udp = ip + (ip[0] & 0xF) * 4;
+    data = udp + UDP_HLEN;
+    if (data > f + len) {
+        return;
+    }
+    dlen = MIN(len - (data - f), lduw_be_p(udp + 4) - UDP_HLEN);
+
+    switch (s->eth_state) {
+    case ETH_DISCOVER:
+        if (lduw_be_p(udp + 2) != 68) {
+            return;
+        }
+        rom_puts(s, "a");
+        /* a broadcast offer for this request; a unicast one is dropped */
+        if (dlen < 240 || data[0] != 2 || ldl_be_p(data + 4) != s->xid ||
+            memcmp(data + 28, s->mac, 6) || dip != 0xFFFFFFFF ||
+            bootp_option(data, dlen, 53, 0) != 2) {
+            rom_puts(s, "b");
+            return;
+        }
+        s->my_ip = ldl_be_p(data + 16);
+        s->srv_ip = ldl_be_p(data + 20) ? ldl_be_p(data + 20) :
+                    bootp_option(data, dlen, 54, sip);
+        s->mask = bootp_option(data, dlen, 1, 0xFFFFFF00);
+        s->server_id = bootp_option(data, dlen, 54, sip);
+        memcpy(s->srv_mac, f + 6, 6);
+        snprintf(buf, sizeof(buf), "OfIP %08X SRV %08X\r\nMSK %08X\r\nb",
+                 s->my_ip, s->srv_ip, s->mask);
+        rom_puts(s, buf);
+        s->eth_state = ETH_REQUEST;
+        eth_dhcp(s, 3);
+        rom_puts(s, "S2");
+        break;
+    case ETH_REQUEST:
+        if (lduw_be_p(udp + 2) != 68 || dlen < 240 || data[0] != 2 ||
+            ldl_be_p(data + 4) != s->xid || memcmp(data + 28, s->mac, 6)) {
+            return;
+        }
+        rom_puts(s, "c");
+        if (bootp_option(data, dlen, 53, 0) != 5) {
+            return;
+        }
+        rom_puts(s, "Ak");
+        timer_del(s->timer);            /* no timeout from here on */
+        s->eth_state = ETH_TFTP;
+        s->block = 0;
+        s->got = 0;
+        s->srv_port = 0;
+        eth_arp_request(s);
+        rom_puts(s, "S3");
+        eth_tftp_rrq(s);
+        rom_puts(s, "S4");
+        break;
+    case ETH_TFTP:
+        /* DATA from the server to our port; anything else is ignored */
+        if (sip != s->srv_ip || lduw_be_p(udp + 2) != TFTP_PORT ||
+            dlen < 4 || lduw_be_p(data) != 3) {
+            return;
+        }
+        if (!s->srv_port) {
+            s->srv_port = lduw_be_p(udp);
+        }
+        if (lduw_be_p(udp) != s->srv_port) {
+            return;
+        }
+        if (lduw_be_p(data + 2) == s->block) {
+            eth_tftp_ack(s, s->block);  /* our ACK was lost: again */
+            return;
+        }
+        if (lduw_be_p(data + 2) != (uint16_t)(s->block + 1)) {
+            return;
+        }
+        s->block++;
+        dlen -= 4;
+        if (s->got + dlen > s->sram_size) {
+            dlen = s->sram_size - s->got;
+        }
+        dma_memory_write(&s->as, s->sram_base + s->got, data + 4, dlen,
+                         MEMTXATTRS_UNSPECIFIED);
+        s->got += dlen;
+        snprintf(buf, sizeof(buf), "t%08X", s->block);
+        rom_puts(s, buf);
+        eth_tftp_ack(s, s->block);
+        if (dlen < TFTP_BLOCK || s->got >= s->sram_size) {
+            rom_puts(s, "Dn");
+            s->eth_state = ETH_DONE;
+            rom_eth_detach(s);
+            rom_try_loader(s, s->sram_base, s->got);
+        }
+        break;
+    }
+}
+
+static void rom_eth_detach(NvtBootRomState *s)
+{
+    if (s->eth) {
+        nvt_eqos_rom_attach(s->eth, NULL, NULL);
+    }
+}
+
+/* "S1": a DHCPDISCOVER, if there is a MAC to send it on */
+static void rom_eth_discover(NvtBootRomState *s)
+{
+    rom_puts(s, "S1");
+    if (s->eth) {
+        s->eth_state = ETH_DISCOVER;
+        s->xid = g_random_int();
+        eth_dhcp(s, 1);
+    }
+}
+
 /* A stage's timeout ran out, or the next DHCPDISCOVER is due */
 static void rom_timeout(void *opaque)
 {
@@ -784,10 +1073,11 @@ static void rom_timeout(void *opaque)
         return;
     case NVT_SRC_ETH:
         if (++s->tries < DHCP_TRIES) {
-            rom_puts(s, "S1");
+            rom_eth_discover(s);
             rom_arm(s, DHCP_INTERVAL);
             return;
         }
+        rom_eth_detach(s);
         break;
     case NVT_SRC_USB:
         break;
@@ -822,8 +1112,18 @@ static void rom_stage(NvtBootRomState *s)
         rom_stage(s);
         break;
     case NVT_SRC_ETH:
-        rom_puts(s, "HE00003500000037000000D1E1s100FXS1");
+        rom_puts(s, "HE00003500000037000000D1E1s100FX");
         s->tries = 0;
+        if (s->eth) {
+            uint32_t r = g_random_int();
+
+            s->mac[0] = s->mac[1] = s->mac[2] = 0;
+            s->mac[3] = r >> 16;
+            s->mac[4] = r >> 8;
+            s->mac[5] = r;
+            nvt_eqos_rom_attach(s->eth, rom_eth_rx, s);
+        }
+        rom_eth_discover(s);
         rom_arm(s, DHCP_INTERVAL);
         break;
     case NVT_SRC_USB:
@@ -898,6 +1198,7 @@ static void nvt_bootrom_reset(DeviceState *dev)
 
     timer_del(s->timer);
     timer_del(s->poll);
+    rom_eth_detach(s);
     s->source = NVT_SRC_DONE;
     if (s->fallback && !s->loader_file &&
         (rom_first_source(s->strap) != NVT_SRC_FLASH ||
@@ -999,6 +1300,7 @@ static const Property nvt_bootrom_properties[] = {
     DEFINE_PROP_BOOL("fast", NvtBootRomState, fast, false),
     DEFINE_PROP_UINT8("strap", NvtBootRomState, strap, 0),
     DEFINE_PROP_UINT64("top", NvtBootRomState, top, 0xF0010000),
+    DEFINE_PROP_LINK("eth", NvtBootRomState, eth, TYPE_DEVICE, DeviceState *),
 };
 
 static void nvt_bootrom_class_init(ObjectClass *klass, const void *data)
