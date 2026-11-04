@@ -1616,6 +1616,63 @@ IFORD_SMP_IPL = bytes.fromhex(
     '001080e503f020e3fdffffea0040201f800000a000001020')
 
 
+def test_ssc029_power_off(qemu, tmp):
+    print('ssc029: power off, with and without an alarm to come')
+    path = os.path.join(tmp, 'iford-off.bin')
+    img = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    open(path, 'wb').write(img.ljust(0x1000000, b'\xFF'))
+    pwc = riu(0x0034, 0)
+
+    def write32(qt, flag, val):
+        qt.writew(pwc + 0x04 * 4, val & 0xFFFF)
+        qt.writew(pwc + 0x05 * 4, val >> 16)
+        qt.writew(pwc + 0x00 * 4, flag)
+        qt.writew(pwc + 0x30 * 4, 1)
+        qt.writew(pwc + 0x32 * 4, 1)
+        qt.writew(pwc + 0x00 * 4, 0)
+
+    # hal_rtc_power_off with the alarm enabled, as it is from init, but with
+    # no alarm to come: the chip stays off
+    qt = QTest(qemu, 'ssc029,flash-file=' + path, [])
+    try:
+        write32(qt, 1 << 3, 0)
+        qt.writew(pwc + 0x01 * 4, 1 << 2)
+        write32(qt, 1 << 4, 0)
+        time.sleep(1.2)
+        qt.writew(pwc + 0x01 * 4, 1 << 2)
+        write32(qt, 0, 0)
+        qt.writeb(pwc + 0x0F * 4, 2)
+        try:
+            qt.writew(pwc + 0x32 * 4, 1)
+        except OSError:
+            pass
+        try:
+            rc = qt.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rc = 'still running'
+        check('power off: a stale alarm does not wake it', rc, 0)
+    finally:
+        qt.close()
+
+    # an alarm due between the suspend request and the suspend itself: all
+    # of this reaches QEMU at once, so its main loop has not suspended yet.
+    # The wake that follows needs the host's clock, which cannot be raced.
+    qt = QTest(qemu, 'ssc029,flash-file=' + path, ['-rtc', 'clock=vm'])
+    try:
+        write32(qt, 1 << 3, 0)
+        qt.writew(pwc + 0x01 * 4, 1 << 2)
+        write32(qt, 1 << 4, 1)
+        qt.f.write('writeb 0x%x 0x0\nwritew 0x%x 0x1\nclock_step %d\n' %
+                   (pwc + 0x0F * 4, pwc + 0x32 * 4, 2 * 10 ** 9))
+        qt.f.flush()
+        for _ in range(3):
+            qt.f.readline()
+        check('power off: an alarm that races it does not abort QEMU',
+              qt.proc.poll() is None, True)
+    finally:
+        qt.close()
+
+
 def test_ssc029_smp(qemu, tmp):
     print('ssc029: CPU1 wakes through smpctrl')
     path = os.path.join(tmp, 'iford-smp.bin')
@@ -1740,6 +1797,27 @@ def test_ssc029(qemu, tmp):
         odd[len(odd) // 2] ^= 1
         st, ok = unpack_plain(bytes(odd), 0x350000)
         check('plain XZ: damage fails its check', (st, ok & 3), (1, 0))
+        good = lzma.compress(text)
+        idx = (struct.unpack_from('<I', good, len(good) - 8)[0] + 1) * 4
+        cut = len(good) - 12 - idx
+        for name, file in (
+                ('no index', good[:cut]),
+                ('only the index byte', good[:cut + 1]),
+                ('a stray byte for a block', good[:cut] + b'\x01'),
+                ('no footer', good[:-12])):
+            st, ok = unpack_plain(file, 0x350000)
+            check('plain XZ: refused, %s' % name, (st, ok & 3), (1, 0))
+        for name, at in (('stream header', 8),
+                         ('block header', 12 + (good[12] + 1) * 4 - 1),
+                         ('index', cut + idx - 1),
+                         ('footer', len(good) - 12)):
+            bad = bytearray(good)
+            bad[at] ^= 1
+            st, ok = unpack_plain(bytes(bad), 0x350000)
+            check('plain XZ: refused, a bad %s CRC' % name, (st, ok & 3),
+                  (1, 0))
+        st, ok = unpack_plain(good + bytes(4), 0x340000)
+        check('plain XZ: stream padding is fine', (st, ok & 3), (1, 3))
 
         # the main intc: XZ's line (MS_IRQ 54, GIC SPI 86) stays behind it
         unpack_plain(lzma.compress(text), 0x340000)
@@ -1950,6 +2028,7 @@ def main():
     test_msc313e_sd(args.qemu, tmp)
     test_ssc029(args.qemu, tmp)
     test_ssc029_rtcpwc(args.qemu, tmp)
+    test_ssc029_power_off(args.qemu, tmp)
     test_ssc029_smp(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)

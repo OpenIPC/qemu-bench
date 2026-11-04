@@ -114,7 +114,7 @@ static void scl_frame(SstarIfordSclState *s)
             continue;
         }
         for (x = 0; x < w; x += 2) {
-            int px = (int64_t)x * pw / w & ~1;
+            int px = MIN((int64_t)x * pw / w, pw - 2) & ~1;
 
             s->row[x] = in[px];
             s->row[x + 1] = in[px + 1];

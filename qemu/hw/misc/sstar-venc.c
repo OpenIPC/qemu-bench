@@ -197,7 +197,7 @@ typedef struct SstarVencWork {
     int ctx;
     bool h265, intra;
     int width, height;
-    hwaddr prog;
+    uint32_t prog;
     uint8_t *out;
     size_t len;
 } SstarVencWork;
@@ -311,14 +311,14 @@ static void venc_mem(uint32_t miu16, uint64_t off, void *buf, size_t len,
     }
 }
 
-static uint32_t venc_prog_reg(hwaddr prog, uint32_t reg)
+/* prog, as everywhere: the program's MIU address, in 16-byte units */
+static uint32_t venc_prog_reg(uint32_t prog, uint32_t reg)
 {
     uint32_t pair[2];
     hwaddr i;
 
     for (i = 0; i < PROG_SCAN; i += 8) {
-        dma_memory_read(&address_space_memory, prog + i, pair, sizeof(pair),
-                        MEMTXATTRS_UNSPECIFIED);
+        venc_mem(prog, i, pair, sizeof(pair), false);
         if (le32_to_cpu(pair[1]) == reg) {
             return le32_to_cpu(pair[0]);
         }
@@ -531,7 +531,7 @@ static void venc_encode(SstarVencState *s, SstarVencWork *w)
  * Write an access unit into the bitstream ring from its write pointer;
  * the last 16-byte unit written, and the start in s->bs[n].
  */
-static uint32_t venc_ring_write(SstarVencState *s, int n, hwaddr prog,
+static uint32_t venc_ring_write(SstarVencState *s, int n, uint32_t prog,
                                 const uint8_t *out, size_t len)
 {
     uint32_t base = venc_prog_reg(prog, PROG_BS);
@@ -551,18 +551,16 @@ static uint32_t venc_ring_write(SstarVencState *s, int n, hwaddr prog,
     ring = end - ((uint64_t)base << 4);
     len = MIN(len, ring);
     first = MIN(len, end - start);
-    dma_memory_write(&address_space_memory, venc_dram(wptr), out, first,
-                     MEMTXATTRS_UNSPECIFIED);
+    venc_mem(wptr, 0, (void *)out, first, true);
     if (first < len) {
-        dma_memory_write(&address_space_memory, venc_dram(base),
-                         out + first, len - first, MEMTXATTRS_UNSPECIFIED);
+        venc_mem(base, 0, (void *)out + first, len - first, true);
         return base + DIV_ROUND_UP(len - first, 16) - 1;
     }
     return (start + len - 1) >> 4;
 }
 
 /* A job's frame is encoded: write it out and report the slot done. */
-static void venc_finish(SstarVencState *s, int n, hwaddr prog,
+static void venc_finish(SstarVencState *s, int n, uint32_t prog,
                         const uint8_t *out, size_t len)
 {
     uint32_t *w0 = &s->regs[(CTRL + n * SLOT_STRIDE) >> 2];
@@ -610,8 +608,7 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
         len = MIN(len, room);
         s->bytes[n] = len;
         s->bs[n] = s->out_base[c];
-        dma_memory_write(&address_space_memory, venc_dram(s->out_base[c]),
-                         out, len, MEMTXATTRS_UNSPECIFIED);
+        venc_mem(s->out_base[c], 0, (void *)out, len, true);
     }
 
     res = venc_prog_reg(prog, s->iford ? IFORD_PROG_RESULT : PROG_RESULT);
@@ -629,35 +626,26 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
         };
         uint32_t bs_end = cpu_to_le32(last);
 
-        dma_memory_write(&address_space_memory, venc_dram(st) + STATUS_BITS,
-                         w, sizeof(w), MEMTXATTRS_UNSPECIFIED);
+        venc_mem(st, STATUS_BITS, w, sizeof(w), true);
         if (s->iford) {
             /* HalMfeOpsEncDone: the reconstruction's ends are further on */
-            dma_memory_write(&address_space_memory,
-                             venc_dram(st) + IFORD_STATUS_REC, &w[1], 8,
-                             MEMTXATTRS_UNSPECIFIED);
+            venc_mem(st, IFORD_STATUS_REC, &w[1], 8, true);
         }
-        dma_memory_write(&address_space_memory,
-                         venc_dram(st) + STATUS_BS_END, &bs_end, 4,
-                         MEMTXATTRS_UNSPECIFIED);
-        dma_memory_write(&address_space_memory, venc_dram(st) + STATUS_SUB_Y,
-                         sub, sizeof(sub), MEMTXATTRS_UNSPECIFIED);
-        dma_memory_write(&address_space_memory, venc_dram(st) + STATUS_CODE,
-                         &code, 1, MEMTXATTRS_UNSPECIFIED);
-        dma_memory_write(&address_space_memory, venc_dram(st) + STATUS_VALID,
-                         &valid, 1, MEMTXATTRS_UNSPECIFIED);
+        venc_mem(st, STATUS_BS_END, &bs_end, 4, true);
+        venc_mem(st, STATUS_SUB_Y, sub, sizeof(sub), true);
+        venc_mem(st, STATUS_CODE, &code, 1, true);
+        venc_mem(st, STATUS_VALID, &valid, 1, true);
     }
     if (res) {
         uint32_t bytes = cpu_to_le32(len);
 
-        dma_memory_write(&address_space_memory, venc_dram(res) + RESULT_BYTES,
-                         &bytes, 4, MEMTXATTRS_UNSPECIFIED);
+        venc_mem(res, RESULT_BYTES, &bytes, 4, true);
     }
     if (s->trace) {
         qemu_log("sstar-venc: %" PRId64 " ms slot %d done, ctx %d, %zu bytes"
                  " at 0x%08" PRIx64 ", program 0x%08" PRIx64 "\n",
                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), n, s->ctx[n], len,
-                 (uint64_t)venc_dram(s->bs[n]), (uint64_t)prog);
+                 (uint64_t)venc_dram(s->bs[n]), (uint64_t)venc_dram(prog));
     }
     *w0 &= ~SLOT_BUSY;
     venc_queue_report(s, n, INT_FRAME_DONE);
@@ -680,7 +668,7 @@ static void venc_finish(SstarVencState *s, int n, hwaddr prog,
  */
 static void venc_submit(SstarVencState *s, int n, uint32_t w0, bool hold)
 {
-    hwaddr prog = venc_dram(s->regs[(CTRL + n * SLOT_STRIDE + 8) >> 2]);
+    uint32_t prog = s->regs[(CTRL + n * SLOT_STRIDE + 8) >> 2];
     uint32_t size = venc_prog_reg(prog, PROG_SIZE);
     SstarVencWork *w = g_new0(SstarVencWork, 1);
 
@@ -1006,7 +994,7 @@ static void lite_sps_pps(GByteArray *out, VencLite *l)
     g_byte_array_free(r, true);
 }
 
-static void lite_encode(SstarVencState *s, int n, hwaddr prog, GByteArray *out)
+static void lite_encode(SstarVencState *s, int n, uint32_t prog, GByteArray *out)
 {
     uint32_t size = venc_prog_reg(prog, PROG_SIZE);
     int w = size & 0xFFFF, h = size >> 16;
@@ -1128,14 +1116,14 @@ static void sstar_venc_job(void *opaque)
 
     for (n = 0; n < SLOTS; n++) {
         uint32_t *w0 = &s->regs[(CTRL + n * SLOT_STRIDE) >> 2];
-        hwaddr prog;
+        uint32_t prog;
 
         if (!(s->pending & (1u << n)) ||
             s->due[n] > qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
             continue;
         }
         s->pending &= ~(1u << n);
-        prog = venc_dram(s->regs[(CTRL + n * SLOT_STRIDE + 8) >> 2]);
+        prog = s->regs[(CTRL + n * SLOT_STRIDE + 8) >> 2];
         s->ctx[n] = (*w0 >> 24) & 0x3F;
 #ifdef SSTAR_VENC_LIBAVCODEC
         if (s->ready[n]) {

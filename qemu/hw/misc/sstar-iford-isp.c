@@ -424,7 +424,7 @@ static void isp_picture(SstarIfordIspState *s)
             cg = s->gamma[MIN(g, ISP_FULL)];
             cb = s->gamma[MIN(b, ISP_FULL)];
             oy[x] = 16 + ((66 * cr + 129 * cg + 25 * cb + 128) >> 8);
-            if (!(y & 1) && !(x & 1)) {
+            if (!(y & 1) && !(x & 1) && x + 1 < qw) {
                 ouv[x] = 128 + ((-38 * cr - 74 * cg + 112 * cb + 128) >> 8);
                 ouv[x + 1] = 128 + ((112 * cr - 94 * cg - 18 * cb + 128) >> 8);
             }

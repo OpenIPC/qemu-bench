@@ -628,12 +628,20 @@ static uint64_t crc64_xz(const uint8_t *p, size_t n)
 static bool xz_block(const uint8_t *b, size_t len, unsigned check, uint8_t *out,
                      size_t outmax, size_t *got, size_t *blen)
 {
-    size_t hdr = (b[0] + 1) * 4, pos = 2, used = 0, end;
+    size_t hdr, pos = 2, used = 0, end;
     uint32_t cz = 0, uz = 0;
-    unsigned flags = b[1];
+    unsigned flags;
 
+    if (len < 2) {
+        return false;
+    }
+    hdr = (b[0] + 1) * 4;
+    flags = b[1];
     if (hdr + 4 > len || (flags & 3) || (flags & 0x3C)) {
         return false;                       /* one filter, known flags */
+    }
+    if (crc32(0, b, hdr - 4) != (uint32_t)ldl_le_p(b + hdr - 4)) {
+        return false;
     }
     if ((flags & 0x40) && !vli(b, hdr, &pos, &cz)) {
         return false;
@@ -674,15 +682,45 @@ static bool xz_block(const uint8_t *b, size_t len, unsigned check, uint8_t *out,
     return true;
 }
 
+/* The index at pos, of this many blocks, and the footer after it. */
+static bool xz_tail(const uint8_t *b, size_t len, size_t pos, uint32_t blocks)
+{
+    size_t start = pos;
+    uint32_t n, v, i;
+
+    if (pos >= len || b[pos++]) {
+        return false;
+    }
+    if (!vli(b, len, &pos, &n) || n != blocks) {
+        return false;
+    }
+    for (i = 0; i < n * 2; i++) {
+        if (!vli(b, len, &pos, &v)) {
+            return false;
+        }
+    }
+    pos = start + ROUND_UP(pos - start, 4);
+    if (pos + 4 + 12 > len ||
+        crc32(0, b + start, pos - start) != (uint32_t)ldl_le_p(b + pos)) {
+        return false;
+    }
+    pos += 4;
+    return crc32(0, b + pos + 4, 6) == (uint32_t)ldl_le_p(b + pos) &&
+           !memcmp(b + pos + 8, b + 6, 2) && b[pos + 10] == 'Y' &&
+           b[pos + 11] == 'Z';
+}
+
 static void xzd_decode_plain(SstarXzdecState *s)
 {
     static const uint8_t magic[6] = { 0xFD, '7', 'z', 'X', 'Z', 0 };
     const uint8_t *b = s->in->data;
     size_t len = s->in->len, pos = 12, o = 0;
+    uint32_t blocks = 0;
     g_autofree uint8_t *out = NULL;
     uint32_t w = s->regs[OUT_BANK + 0x06] |
                  (uint32_t)s->regs[OUT_BANK + 0x07] << 16;
-    bool ok = len >= 24 && !memcmp(b, magic, sizeof(magic));
+    bool ok = len >= 24 && !memcmp(b, magic, sizeof(magic)) &&
+              crc32(0, b + 6, 2) == (uint32_t)ldl_le_p(b + 8);
 
     if (ok) {
         out = g_try_malloc(SXZ_MAX_UNPACKED);
@@ -695,7 +733,9 @@ static void xzd_decode_plain(SstarXzdecState *s)
                       SXZ_MAX_UNPACKED - o, &got, &blen);
         pos += blen;
         o += got;
+        blocks++;
     }
+    ok = ok && xz_tail(b, len, pos, blocks);
     if (ok) {
         dma_memory_write(&address_space_memory,
                          DRAM_BASE + ((hwaddr)w << 4), out, o,

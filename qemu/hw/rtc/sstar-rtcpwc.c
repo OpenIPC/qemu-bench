@@ -22,12 +22,15 @@
  *
  * Power: the kernel turns the chip off by clearing 0x0F bit 0 (PWR_EN), then
  * touching the ISO or SW registers (sram_suspend_imi; hal_rtc_power_off).
- * Here that suspends the machine.  With the alarm enabled and 0x0F bit 1
- * (alarm power-on) set, or in the kernel's suspend, the alarm brings it back
- * by waking the machine: a cold start of the CPUs that DRAM survives, so the
- * IPL finds the kernel's resume record.  With nothing to wake it the machine
- * shuts down.  The PM reset flag in bank 0x0600 (reg 1 bit 3) that the kernel
- * sets is the RIU's to keep.
+ * Here that suspends the machine if an alarm is still to come: it brings the
+ * chip back by waking the machine, a cold start of the CPUs that DRAM
+ * survives, so the IPL finds the kernel's resume record.  0x0F bit 1 (alarm
+ * power-on) is not consulted: hal_rtc_power_off sets it itself and
+ * sram_suspend_imi does not, yet the alarm ends that suspend.  With nothing
+ * to wake it the machine shuts down.  The kernel enables the alarm from init,
+ * so a power off usually finds one enabled that matched long ago; it matches
+ * the counter, so that one never fires.  The PM reset flag in bank 0x0600
+ * (reg 1 bit 3) that the kernel sets is the RIU's to keep.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -115,7 +118,7 @@ static void rtcpwc_arm(SstarRtcpwcState *s)
 
     timer_del(s->alarm_timer);
     if (!(s->regs[R_ALARM_INT] & AI_ENABLED) ||
-        (s->regs[R_ALARM_INT] & AI_INT)) {
+        (s->regs[R_ALARM_INT] & AI_INT) || s->alarm < now) {
         return;
     }
     timer_mod(s->alarm_timer, qemu_clock_get_ms(rtc_clock) +
@@ -126,6 +129,11 @@ static void rtcpwc_alarm(void *opaque)
 {
     SstarRtcpwcState *s = opaque;
 
+    /* the power off is on its way: only a suspended machine can wake */
+    if (s->sleeping && !runstate_check(RUN_STATE_SUSPENDED)) {
+        timer_mod(s->alarm_timer, qemu_clock_get_ms(rtc_clock) + 1);
+        return;
+    }
     s->regs[R_ALARM_INT] |= AI_INT;
     qemu_irq_raise(s->irq);
     if (s->sleeping) {
@@ -137,7 +145,8 @@ static void rtcpwc_alarm(void *opaque)
 static void rtcpwc_power_off(SstarRtcpwcState *s)
 {
     s->off_pending = false;
-    if (s->regs[R_ALARM_INT] & AI_ENABLED) {
+    if ((s->regs[R_ALARM_INT] & AI_ENABLED) &&
+        !(s->regs[R_ALARM_INT] & AI_INT) && s->alarm >= rtcpwc_count(s)) {
         s->sleeping = true;
         qemu_system_wakeup_enable(QEMU_WAKEUP_REASON_RTC, true);
         qemu_system_suspend_request();

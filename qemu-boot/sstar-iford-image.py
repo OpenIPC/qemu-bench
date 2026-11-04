@@ -41,9 +41,13 @@ def main():
         sys.exit(__doc__)
     images, out = sys.argv[1:]
     img = bytearray(b"\xff" * SIZE)
-    for name, off in PARTS:
+    ends = [ENV_OFFSET] + [off for _, off in PARTS[2:]] + [SIZE]
+    for (name, off), end in zip(PARTS, ends):
         with open(os.path.join(images, name), "rb") as f:
             data = f.read()
+        if off + len(data) > end:
+            sys.exit("%s: 0x%x bytes do not fit before 0x%x"
+                     % (name, len(data), end))
         img[off:off + len(data)] = data
     env = b"".join(("%s=%s" % kv).encode() + b"\0" for kv in ENV) + b"\0"
     env = env.ljust(ENV_SIZE - 4, b"\0")
