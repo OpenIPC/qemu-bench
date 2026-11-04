@@ -24,6 +24,7 @@
 #include "hw/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/loader.h"
+#include "elf.h"
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/image-sensor.h"
@@ -1583,6 +1584,54 @@ void nvt_rom_boot(NvtFlashState *flash, const NvtRomConfig *rc)
                                                      &error_fatal), 10);
 }
 
+/*
+ * -bios: a mask ROM image of one's own -- OpenIPC/opennovatek's re.elf,
+ * the NA51089 ROM reconstructed as source -- runs in place of the model.
+ * It is loaded twice: read-only at its home (0x80000000, which the
+ * loaders' DDR bring-up copies from) and into DRAM at 0, where it runs,
+ * as the copy leaves it.  The SRAM it keeps its data and stack in is
+ * mapped; nothing else of nvt-bootrom is used.  The CPU starts at 0.
+ */
+#define NVT_ROM_HOME        0x80000000
+#define NVT_ROM_SIZE        0x8000
+
+static uint64_t nvt_rom_home(void *opaque, uint64_t addr)
+{
+    return addr + NVT_ROM_HOME;
+}
+
+static void nvt_maskrom_load(const char *file)
+{
+    MemoryRegion *sysmem = get_system_memory();
+    MemoryRegion *sram = g_new(MemoryRegion, 1);
+    MemoryRegion *home = g_new(MemoryRegion, 1);
+    uint64_t entry, low, high;
+    ssize_t n;
+
+    memory_region_init_ram(sram, NULL, "nvt.sram", NVT_SRAM_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, NVT_SRAM_BASE, sram, 0);
+    memory_region_init_rom(home, NULL, "nvt.maskrom", NVT_ROM_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, NVT_ROM_HOME, home, 10);
+
+    n = load_elf(file, NULL, nvt_rom_home, NULL, &entry, &low, &high, NULL,
+                 ELFDATA2LSB, EM_ARM, 1, 0);
+    if (n < 0) {
+        error_report("novatek: cannot load -bios '%s': %s", file,
+                     load_elf_strerror(n));
+        exit(1);
+    }
+    if (low != NVT_ROM_HOME || high > NVT_ROM_HOME + NVT_ROM_SIZE) {
+        error_report("novatek: -bios '%s' spans 0x%" PRIx64 "..0x%" PRIx64
+                     ", not a mask ROM linked at 0 (32 KiB)", file,
+                     low - NVT_ROM_HOME, high - NVT_ROM_HOME);
+        exit(1);
+    }
+    load_elf(file, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ELFDATA2LSB,
+             EM_ARM, 1, 0);
+}
+
 /* the ROMs of NA51089 / NA51055 (layout 0 / 1) and NS02501 (2) */
 static const NvtRomConfig nvt_rom_cfg[] = {
     { NVT_SRAM_BASE, NVT_SRAM_SIZE, 0xF07F8FFC, 0xF0290000, 0 },
@@ -1922,7 +1971,14 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     binfo.secondary_cpu_reset_hook = nvt_reset_secondary;
     arm_load_kernel(cpu[0], machine, &binfo);
 
-    if (!machine->kernel_filename && nms->flash_file) {
+    if (machine->firmware && !machine->kernel_filename) {
+        if (c->na51055) {
+            error_report("novatek: -bios takes an NA51089 mask ROM; this "
+                         "machine's ROM is not reconstructed");
+            exit(1);
+        }
+        nvt_maskrom_load(machine->firmware);
+    } else if (!machine->kernel_filename && nms->flash_file) {
         /* NA51089's ROM: the fallback, asked for or implied by the straps */
         bool fallback = nms->real_loader && !c->na51055 &&
                         (nms->rom_fallback ||

@@ -15,7 +15,8 @@
  *          speed of the device on the port in [23:22] (0 full, 1 low,
  *          2 high), which ehci_hub_control() reads in place of PORTSC's
  *          (has_tt, ehci_port_speed())
- *   0x100  device-side main control, 0x1C8 PHY suspend, 0x30C PHY trim,
+ *   0x100  device-side main control (its soft reset clears itself),
+ *          0x1C8 PHY suspend, 0x30C PHY trim,
  *   0x400  USB ID / VBUS, 0x1000.. the UTMI PHY (U2PHY_SETREG): storage
  *
  * The driver finds the block at 0xFF600000 rather than 0xF0600000 unless
@@ -87,11 +88,22 @@ static uint64_t nvt_usb_glue_read(void *opaque, hwaddr off, unsigned size)
     return v;
 }
 
+/*
+ * The device side's main control (FOTG2xx DMCR): its soft reset, bit 4,
+ * clears itself once done.  The NA51089 mask ROM sets it and waits for
+ * that before its USB boot times out to the next source.
+ */
+#define NVT_USB_DEV_CTRL    0x100
+#define DEV_CTRL_SFRST      (1u << 4)
+
 static void nvt_usb_glue_write(void *opaque, hwaddr off, uint64_t val,
                                unsigned size)
 {
     NvtUsbState *s = opaque;
 
+    if (off == NVT_USB_DEV_CTRL) {
+        val &= ~DEV_CTRL_SFRST;
+    }
     s->regs[off / 4] = val;
 }
 
