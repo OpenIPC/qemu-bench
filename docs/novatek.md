@@ -549,16 +549,26 @@ qemu-system-arm -M nt98562,flash-file=blank.bin \
   blank board through it over UART (`boot-strap=0xc`) and over Ethernet
   (`boot-strap=4`, a tap), to U-Boot's prompt. `test-novatek-recovery.sh`
   does both with `BIOS=re.elf`, and the `maskrom-na51089` CI job runs it.
-- **Two device fixes it needed:** the timers' targets come out of reset at
-  the full count (the ROM counts timer 1 as its clock without setting
-  one), and the USB device side's soft reset clears itself (the ROM waits
-  for it before its USB boot times out).
+- **From a vendor flash** it boots as silicon does: `NPIp>T`, then the
+  loader. The `>` is not the ROM's: it is the last write of the loader
+  header's register script (0xF0290000 = 0x3E, UART0's THR), so it shows
+  only when a header was read and its script ran. With an XM NT98566's
+  8 MiB NOR the vendor loader runs (`Loader Start`, `LD_VER 02.01.02`) and
+  starts its U-Boot.
+- **Four device fixes it needed:**
+  - The timers' targets come out of reset at the full count. The ROM
+    counts timer 1 as its clock without setting one.
+  - The USB device side's soft reset clears itself. The ROM waits for it
+    before its USB boot times out.
+  - The IDE takes byte and halfword accesses. The ROM keeps the staged
+    loader header, its DMA flag and a USB bounce buffer in the IDE's
+    palette RAM (0xF0800200..0x5FF), and reads the 0xAA55 tag with `ldrh`.
+  - The SPI controller sums the halfwords it reads into 0x58, cleared by
+    a FIFO reset (0x54 bit 4). A header with flags bit 31 makes the ROM
+    trust that sum instead of its own loop. Vendor loaders set it.
 - **What differs from silicon:**
   - Its random-number block is not modelled, so the MAC's random tail
     reads 0.
-  - The `>` after `NPIp` that silicon prints from a blank NOR does not
-    appear. It comes from a flash path not reached here, on the model's
-    W25Q rather than the board's XM25QH64A.
   - The UART fallback with a host probing all along does not recover: the
     ROM leaves its UART unread for a minute. Silicon drops what arrives
     then, on a full FIFO; QEMU's UART holds it back and replays it, out of

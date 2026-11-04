@@ -1393,6 +1393,43 @@ jobs:
             exit 1
           fi
 
+      # A loader header as vendor flashes carry it, cut down: one script
+      # entry writing '>' to UART0, flags bit 31 (trust the SPI
+      # controller's checksum), halfword sum balanced.  Silicon prints
+      # "NPIp>T" from a vendor NOR.  It needs the IDE's halfword access
+      # (the ROM stages the header in the IDE palette RAM and reads the
+      # tag with ldrh) and the SPI checksum at 0x58.
+      - name: The ROM boots a loader header from NOR
+        timeout-minutes: 2
+        run: |
+          python3 - <<'EOF'
+          import struct
+          h = bytearray(0x400)
+          struct.pack_into('<II', h, 0x00, 0xF07C0100, 0xF07C0000)
+          struct.pack_into('<I', h, 0x24, 0x400)               # size
+          struct.pack_into('<H', h, 0x30, 0xAA55)              # tag
+          struct.pack_into('<II', h, 0x38, 1, 0)               # 1 entry
+          struct.pack_into('<II', h, 0x40, 0xF1290000, 0x3E)   # THR <- '>'
+          struct.pack_into('<I', h, 0x88, 0x80000000)          # hw sum
+          struct.pack_into('<I', h, 0x100, 0xEAFFFFFE)         # b .
+          n = len(h) // 2
+          s = sum(struct.unpack_from('<%dH' % n, h)) + n * (n - 1) // 2
+          struct.pack_into('<H', h, 0x08, -s & 0xFFFF)
+          open('/tmp/hdr.bin', 'wb').write(h + b'\xff' * ((8 << 20) - len(h)))
+          EOF
+          timeout 15 ./qemu-src/build/qemu-system-arm \
+              -M nt98562,flash-file=/tmp/hdr.bin \
+              -bios opennovatek/bootrom/na51089/re.elf \
+              -display none -nodefaults -serial file:/tmp/hdr.out \
+              2>/tmp/hdr.err || true
+          head=$(head -c 6 /tmp/hdr.out)
+          echo "captured: $(xxd /tmp/hdr.out | head -3)"
+          if [ "$head" != "NPIp>T" ]; then
+            echo "FAIL: expected NPIp>T, got: $head"
+            cat /tmp/hdr.err
+            exit 1
+          fi
+
       - name: Install defib
         run: pipx install git+https://github.com/OpenIPC/defib@74e1bccf574b6f2e055f9ae93ad5ca88c30206d8
 
