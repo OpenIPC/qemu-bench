@@ -14,6 +14,14 @@
 #include "qemu/timer.h"
 
 #define TYPE_NVT_BOOTROM "nvt-bootrom"
+
+/*
+ * The ROM's Ethernet boot drives the MAC (nvt-eqos) itself before any
+ * loader runs: attached, it gets every frame instead of the DMA rings.
+ */
+typedef void (*NvtEqosRomRx)(void *opaque, const uint8_t *buf, size_t len);
+void nvt_eqos_rom_attach(DeviceState *eqos, NvtEqosRomRx rx, void *opaque);
+void nvt_eqos_rom_send(DeviceState *eqos, const uint8_t *buf, size_t len);
 OBJECT_DECLARE_SIMPLE_TYPE(NvtBootRomState, NVT_BOOTROM)
 
 struct NvtBootRomState {
@@ -57,6 +65,14 @@ struct NvtBootRomState {
     bool echo_due;              /* the WRLOADER's echo, once size is in */
     uint8_t wr_cdb[16];
     uint32_t dest, size, count;
+    /* Ethernet boot: DHCP, then loader.bin over TFTP */
+    DeviceState *eth;           /* nvt-eqos, if the machine has one */
+    uint8_t mac[6];
+    int eth_state;
+    uint32_t xid, my_ip, srv_ip, mask;
+    uint8_t srv_mac[6];
+    uint16_t srv_port, block;
+    uint32_t got;
 };
 
 #endif /* HW_ARM_NVT_BOOTROM_H */

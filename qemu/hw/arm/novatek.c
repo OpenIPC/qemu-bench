@@ -1503,6 +1503,7 @@ void nvt_rom_set_loader_file(const char *path)
 
 static bool nvt_rom_fallback, nvt_rom_fast;
 static uint32_t nvt_rom_strap;
+static DeviceState *nvt_rom_eth;        /* the MAC its Ethernet boot drives */
 
 void nvt_rom_set_fallback(bool on, uint32_t strap, bool fast)
 {
@@ -1568,6 +1569,10 @@ void nvt_rom_boot(NvtFlashState *flash, const NvtRomConfig *rc)
         qdev_prop_set_bit(rom, "fallback", true);
         qdev_prop_set_bit(rom, "fast", nvt_rom_fast);
         qdev_prop_set_uint8(rom, "strap", nvt_rom_strap & 0xF);
+        if (nvt_rom_eth) {
+            object_property_set_link(OBJECT(rom), "eth", OBJECT(nvt_rom_eth),
+                                     &error_fatal);
+        }
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(rom), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(rom), 0,
@@ -1843,6 +1848,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     qdev_prop_set_uint32(dev, "dsl-unit", c->chip_id == 0x4821 ? 4 : 8);
     qemu_configure_nic_device(dev, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    nvt_rom_eth = dev;
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_ETH_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_ETH]);
 

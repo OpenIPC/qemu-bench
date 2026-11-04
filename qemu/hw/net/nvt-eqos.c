@@ -46,6 +46,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/nvt-bootrom.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
@@ -166,6 +167,9 @@ struct NvtEqosState {
     uint32_t dsl_unit;                  /* bytes per DSL, the bus width */
     bool tx_overflow;
     uint16_t phy[32];
+    /* the mask ROM's Ethernet boot, while it runs (nvt-bootrom.c) */
+    NvtEqosRomRx rom_rx;
+    void *rom_opaque;
 };
 
 static uint32_t *reg(NvtEqosState *s, hwaddr off)
@@ -415,6 +419,9 @@ static bool nvt_eqos_can_receive(NetClientState *nc)
 {
     NvtEqosState *s = qemu_get_nic_opaque(nc);
 
+    if (s->rom_rx) {
+        return true;
+    }
     return nvt_eqos_rx_avail(s, 1) > 0;
 }
 
@@ -461,6 +468,10 @@ static ssize_t nvt_eqos_receive(NetClientState *nc, const uint8_t *buf,
     uint32_t need = DIV_ROUND_UP(size, bufsz), done = 0, i, chunk, d[4];
     dma_addr_t a;
 
+    if (s->rom_rx) {
+        s->rom_rx(s->rom_opaque, buf, size);
+        return size;
+    }
     if (!nvt_eqos_accept(s, buf, size)) {
         return size;                /* filtered out: not for us */
     }
@@ -642,6 +653,27 @@ static NetClientInfo nvt_eqos_net_info = {
     .can_receive = nvt_eqos_can_receive,
     .receive = nvt_eqos_receive,
 };
+
+/*
+ * The ROM's Ethernet boot: frames to rx instead of the rings, until it
+ * detaches (rx NULL) to run a loader, which then brings the MAC up itself.
+ */
+void nvt_eqos_rom_attach(DeviceState *dev, NvtEqosRomRx rx, void *opaque)
+{
+    NvtEqosState *s = NVT_EQOS(dev);
+
+    s->rom_rx = rx;
+    s->rom_opaque = opaque;
+    /* can_receive changes: wake a backend (tap) that stopped polling */
+    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+}
+
+void nvt_eqos_rom_send(DeviceState *dev, const uint8_t *buf, size_t len)
+{
+    NvtEqosState *s = NVT_EQOS(dev);
+
+    qemu_send_packet(qemu_get_queue(s->nic), buf, len);
+}
 
 static void nvt_eqos_reset(DeviceState *dev)
 {

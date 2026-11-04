@@ -3749,7 +3749,7 @@ class RomSerial:
     """nt98562 with a blank flash and the ROM's fallback, its UART 0 on a
     Unix socket."""
 
-    def __init__(self, qemu, tmp, opts):
+    def __init__(self, qemu, tmp, opts, extra=()):
         flash = os.path.join(tmp, 'blank.bin')
         open(flash, 'wb').write(b'\xff' * (8 << 20))
         self.path = os.path.join(tmp, 'rom-ser.sock')
@@ -3758,7 +3758,8 @@ class RomSerial:
         self.proc = subprocess.Popen(
             [qemu, '-M', 'nt98562,flash-file=%s,rom-fast=on,%s' % (flash, opts),
              '-display', 'none', '-nodefaults',
-             '-serial', 'unix:%s,server=on,wait=on' % self.path],
+             '-serial', 'unix:%s,server=on,wait=on' % self.path] +
+            list(extra),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             if os.path.exists(self.path):
@@ -3849,6 +3850,113 @@ def test_rom_fallback(qemu, tmp):
         check('the UART stage answers', rs.recv(20)[16:], b'\0\0\x21\x70')
     finally:
         rs.close()
+
+
+def eth_frame(dst, src, ethertype, payload):
+    return dst + src + struct.pack('>H', ethertype) + payload
+
+
+def ip_udp(sip, dip, sport, dport, data):
+    udp = struct.pack('>HHHH', sport, dport, 8 + len(data), 0) + data
+    hdr = bytearray(struct.pack('>BBHHHBBH4s4s', 0x45, 0, 20 + len(udp), 0, 0,
+                                64, 17, 0, socket.inet_aton(sip),
+                                socket.inet_aton(dip)))
+    total = sum(struct.unpack('>10H', hdr))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    struct.pack_into('>H', hdr, 10, ~total & 0xFFFF)
+    return bytes(hdr) + udp
+
+
+def bootp_reply(req, kind, yiaddr, siaddr):
+    b = bytearray(240)
+    b[0:4] = b'\x02\x01\x06\x00'
+    b[4:8] = req[4:8]
+    b[16:20] = socket.inet_aton(yiaddr)
+    b[20:24] = socket.inet_aton(siaddr)
+    b[28:34] = req[28:34]
+    b[236:240] = b'\x63\x82\x53\x63'
+    return bytes(b) + bytes([53, 1, kind, 54, 4]) + socket.inet_aton(siaddr) + \
+        bytes([1, 4, 255, 255, 255, 0, 255])
+
+
+def test_rom_eth(qemu, tmp):
+    """The ROM's Ethernet boot against a hand-driven network (frames over
+    UDP, -netdev dgram): what silicon showed on a real LAN."""
+    print('Mask ROM: Ethernet boot (boot-strap=4)')
+    net = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    net.bind(('127.0.0.1', 0))
+    free = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    free.bind(('127.0.0.1', 0))
+    qport = free.getsockname()[1]
+    free.close()
+    rs = RomSerial(qemu, tmp, 'boot-strap=4', extra=[
+        '-nic', 'socket,udp=127.0.0.1:%d,localaddr=127.0.0.1:%d' %
+        (net.getsockname()[1], qport)])
+    srv_mac = b'\x02\x00\x00\x00\x00\x01'
+    bcast = b'\xff' * 6
+    net.settimeout(3)
+
+    def dhcp_request():
+        while True:
+            f, addr = net.recvfrom(2048)
+            if f[12:14] == b'\x08\x00' and f[23] == 17 and \
+                    struct.unpack('>H', f[36:38])[0] == 67:
+                return f, addr
+
+    try:
+        f, qaddr = dhcp_request()
+        mac = f[6:12]
+        check('DHCPDISCOVER from a 00:00:00 MAC', mac[:3], b'\0\0\0')
+        req = f[42:]
+        # a unicast offer, to the address it has not taken: dropped
+        net.sendto(eth_frame(mac, srv_mac, 0x0800, ip_udp(
+            '10.9.0.1', '10.9.0.50', 67, 68,
+            bootp_reply(req, 2, '10.9.0.50', '10.9.0.1'))), qaddr)
+        f, _ = dhcp_request()
+        check('a unicast offer is dropped: it asks again',
+              f[42 + 240:42 + 243], bytes([53, 1, 1]))
+        req = f[42:]
+        net.sendto(eth_frame(bcast, srv_mac, 0x0800, ip_udp(
+            '10.9.0.1', '255.255.255.255', 67, 68,
+            bootp_reply(req, 2, '10.9.0.50', '10.9.0.1'))), qaddr)
+        f, _ = dhcp_request()
+        check('a broadcast offer is taken: DHCPREQUEST',
+              f[42 + 240:42 + 243], bytes([53, 1, 3]))
+        net.sendto(eth_frame(bcast, srv_mac, 0x0800, ip_udp(
+            '10.9.0.1', '255.255.255.255', 67, 68,
+            bootp_reply(f[42:], 5, '10.9.0.50', '10.9.0.1'))), qaddr)
+        frames = [net.recvfrom(2048)[0] for _ in range(2)]
+        arp = [x for x in frames if x[12:14] == b'\x08\x06']
+        rrq = [x for x in frames if x[12:14] == b'\x08\x00']
+        check('an ARP request for the server', bool(arp) and
+              arp[0][38:42] == socket.inet_aton('10.9.0.1'), True)
+        check('one TFTP read request for loader.bin, from port 2962, '
+              'to the offering MAC',
+              bool(rrq) and (rrq[0][:6], rrq[0][34:36], rrq[0][36:38],
+                             rrq[0][42:55]) ==
+              (srv_mac, b'\x0b\x92', b'\x00\x45', b'\x00\x01loader.bin\x00'),
+              True)
+        net.settimeout(2.5)
+        try:
+            extra = net.recvfrom(2048)[0]
+        except socket.timeout:
+            extra = b''
+        check('no timeout, no retransmission while it waits', extra, b'')
+        console = rs.recv(timeout=0.5)
+        check('its letters: offer, request, ARP, read request',
+              b'OfIP 0A090032 SRV 0A090001' in console and
+              console.rstrip().endswith(b'cAkS3S4'), True)
+        loader = nvt_test_loader()
+        net.sendto(eth_frame(mac, srv_mac, 0x0800, ip_udp(
+            '10.9.0.1', '10.9.0.50', 69, 2962,
+            b'\x00\x03\x00\x01' + loader)), qaddr)
+        got = rs.recv(timeout=2.0)
+        check('one short block: ACK, "Dn", the jump and the loader',
+              got.endswith(b't00000001DnTOK'), True)
+    finally:
+        rs.close()
+        net.close()
 
 
 UART_ECHO = [0xE59F001C, 0xE3A01007, 0xE5801008, 0xE5901014, 0xE3110001,
@@ -5096,6 +5204,7 @@ def run(args, tmp):
     test_boot_rom(args.qemu, tmp)
     test_rom_uart(args.qemu, tmp)
     test_rom_fallback(args.qemu, tmp)
+    test_rom_eth(args.qemu, tmp)
     test_loader_models(args.qemu, tmp)
 
     for with_oob in (False, True):

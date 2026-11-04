@@ -465,8 +465,20 @@ or whenever `boot-strap=` is not a flash strap:
   - `U`, then `K:` after 30 s.
   - Then UART, which prints nothing.
   - `T` on the jump.
-- **Ethernet** sends nothing yet: the stage behaves like a network with no
-  DHCP server.
+- **Ethernet** is the ROM's DHCP and TFTP client, driving `nvt-eqos`
+  before any loader does:
+  - A MAC of `00:00:00` and three random bytes, new every boot.
+  - It takes the first *broadcast* offer and drops a unicast one, as
+    silicon did against dnsmasq.
+  - DHCPREQUEST, the ACK, an ARP request for the next-server, then one
+    TFTP read request for `loader.bin` from port 2962, sent to the MAC the
+    offer came from.
+  - It then waits for DATA from that server with no timeout and no
+    retransmission. A network DHCP server that wins the race holds it
+    there for good, as on a real LAN.
+  - The letters match silicon's: `aOfIP <ip> SRV <srv>`, `MSK`, `bS2`,
+    `cAkS3S4`, `CD` for ARP, `t<block>` per block, `Dn`, then `T`.
+  - With no network, nobody answers: six DHCPDISCOVERs, then `K:`.
 - **The loader check:** header word 1 is the address, word 9 the size,
   halfword 0x30 is 0xAA55, and the halfwords plus their indices sum to 0.
 - **The UART stage** is the ROM's command engine (the SDK's `scsi_op.h`
@@ -493,9 +505,20 @@ qemu-system-arm -M nt98562,flash-file=blank.bin,boot-strap=0xc \
 defib burn -c nt98562 -p socket:///tmp/nvt.sock -b
 ```
 
-`qemu-boot/test-novatek-recovery.sh` does that both ways in, through the
-straps and through the fallback from a blank NOR, and checks that U-Boot
-answers at its prompt.
+Over Ethernet, `defib burn --nic` answers the ROM's DHCP and serves
+`loader.bin` and the U-Boot pack. The real Ethernet loader then does its own
+DHCP and TFTP and starts U-Boot. Use a tap device (root for ports 67 and 69):
+
+```sh
+qemu-system-arm -M nt98562,flash-file=blank.bin,boot-strap=4 -display none -nodefaults \
+    -chardev socket,id=s0,path=/tmp/nvt.sock,server=on,wait=off -serial chardev:s0 \
+    -nic tap,ifname=tap0,script=no,downscript=no &
+sudo defib burn -c nt98562 -p socket:///tmp/nvt.sock --nic tap0
+```
+
+`qemu-boot/test-novatek-recovery.sh` runs all three ways in: through the
+straps, through the fallback from a blank NOR, and over Ethernet. Each time
+it checks that U-Boot answers at its prompt.
 
 `boot-file=` still stands for a loader one of those sources delivered: a
 host file copied to SRAM in place of the flash's first bytes, with
