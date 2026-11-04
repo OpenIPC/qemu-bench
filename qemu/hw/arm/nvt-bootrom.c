@@ -863,7 +863,7 @@ static void eth_dhcp(NvtBootRomState *s, int type)
         stl_be_p(o, s->my_ip);
         o += 4;
         *o++ = 54, *o++ = 4;
-        stl_be_p(o, s->srv_ip);
+        stl_be_p(o, s->server_id);
         o += 4;
     }
     *o = 255;
@@ -975,6 +975,7 @@ static void rom_eth_rx(void *opaque, const uint8_t *f, size_t len)
         s->srv_ip = ldl_be_p(data + 20) ? ldl_be_p(data + 20) :
                     bootp_option(data, dlen, 54, sip);
         s->mask = bootp_option(data, dlen, 1, 0xFFFFFF00);
+        s->server_id = bootp_option(data, dlen, 54, sip);
         memcpy(s->srv_mac, f + 6, 6);
         snprintf(buf, sizeof(buf), "OfIP %08X SRV %08X\r\nMSK %08X\r\nb",
                  s->my_ip, s->srv_ip, s->mask);

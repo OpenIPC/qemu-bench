@@ -38,10 +38,16 @@ done
 WORK=$(mktemp -d)
 QPID=
 TAP=${TAP:-nvt-rec0}
+TAP_IP=192.168.77.1/24
 MADE_TAP=
+ADDED_IP=
 cleanup() {
     [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true
-    [ -n "$MADE_TAP" ] && sudo ip link del "$TAP" 2>/dev/null || true
+    if [ -n "$MADE_TAP" ]; then
+        sudo ip link del "$TAP" 2>/dev/null || true
+    elif [ -n "$ADDED_IP" ]; then
+        sudo ip addr del "$TAP_IP" dev "$TAP" 2>/dev/null || true
+    fi
     if [ -n "${KEEP:-}" ]; then
         echo "logs kept in $WORK"
     else
@@ -81,12 +87,16 @@ for way in ${WAYS:-strap fallback eth}; do
         fallback) opts="rom-fallback=on" ;;
         eth)
             opts="boot-strap=4"
+            # A tap of the caller's keeps its state; one made here goes
             if ! ip link show "$TAP" > /dev/null 2>&1; then
                 sudo ip tuntap add "$TAP" mode tap user "$(id -un)"
                 MADE_TAP=1
+                sudo ip link set "$TAP" up
             fi
-            sudo ip addr replace 192.168.77.1/24 dev "$TAP"
-            sudo ip link set "$TAP" up
+            if ! ip -4 addr show dev "$TAP" | grep -q "inet ${TAP_IP%/*}/"; then
+                sudo ip addr add "$TAP_IP" dev "$TAP"
+                ADDED_IP=1
+            fi
             net=(-nic "tap,ifname=$TAP,script=no,downscript=no")
             burn=(sudo timeout 300 "$(command -v $DEFIB)" burn -c "$SOC"
                   --nic "$TAP")
