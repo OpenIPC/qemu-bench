@@ -577,7 +577,7 @@ config SIGMASTAR
 KCONFIG
     echo "  hw/arm/Kconfig: added SIGMASTAR"
 else
-    for sym in A15MPCORE ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C SD; do
+    for sym in A15MPCORE DS1338 ARM_GIC SERIAL_MM UNIMP USB_EHCI_SYSBUS AHCI_SYSBUS I2C HISI_I2C SD; do
         if ! sed -n '/^config SIGMASTAR$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config SIGMASTAR\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym

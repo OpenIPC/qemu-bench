@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -71,6 +72,15 @@ bool ov2735_exposure(Object *sensor, IngenicSensorExposure *e)
     e->gain = s->regs[1][0x24] * 64;
     e->gain = e->gain ? e->gain : 1024;
     return true;
+}
+
+static void ov2735_exposure_sensor(Object *sensor, ImageSensorExposure *e)
+{
+    IngenicSensorExposure x = { 0 };
+
+    ov2735_exposure(sensor, &x);
+    e->lines = x.lines;
+    e->gain = x.gain;
 }
 
 static int ov_event(I2CSlave *i2c, enum i2c_event event)
@@ -147,6 +157,7 @@ static void ov_class_init(ObjectClass *oc, const void *data)
     k->event = ov_event;
     k->send = ov_send;
     k->recv = ov_recv;
+    IMAGE_SENSOR_CLASS(oc)->exposure = ov2735_exposure_sensor;
 }
 
 static const TypeInfo ov_info = {
@@ -154,6 +165,10 @@ static const TypeInfo ov_info = {
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(IngenicOv2735State),
     .class_init    = ov_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IMAGE_SENSOR },
+        { }
+    },
 };
 
 static void ov_register_types(void)

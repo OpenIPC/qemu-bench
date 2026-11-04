@@ -614,6 +614,22 @@ def test_sensor_catalogue(qemu):
           "unknown sensor 'nosuch'" in out and 'imx307' in out, True)
     out = hmp(qemu, ['-M', 'msc313e,rtc=ds1338', '-S'], ['info qtree'])
     check('rtc=ds1338: a DS1307 at 0x68', i2c_device_at(out, 'ds1338'), 0x68)
+    out = hmp(qemu, ['-M', 'msc313e,rtc=nosuch', '-S'], [])
+    check('an unknown rtc is refused', "unknown rtc 'nosuch'" in out, True)
+    out = hmp(qemu, ['-M', 'ssd201,rtc=ds1338', '-S'], [])
+    check('rtc= is refused where there is no I2C bus',
+          'no I2C bus for an rtc' in out, True)
+    p = subprocess.run([qemu, '-M', 'none', '-display', 'none', '-nodefaults',
+                        '-qmp', 'stdio'], capture_output=True, text=True,
+                       timeout=60,
+                       input='{"execute":"qmp_capabilities"}\n'
+                             '{"execute":"qom-list-types","arguments":'
+                             '{"implements":"image-sensor"}}\n'
+                             '{"execute":"quit"}\n')
+    for model in ('galaxycore-sensor', 'ingenic-ov2735', 'hisi-smartsens',
+                  'hisi-imx307', 'imx323', 'hisi-jxf22'):
+        check('%s gives an ISP its exposure' % model,
+              '"%s"' % model in p.stdout, True)
 
 
 PMGPIO = riu(0x000F, 0)

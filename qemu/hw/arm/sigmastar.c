@@ -1065,6 +1065,9 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     } else if (sms->sensor && strcmp(sms->sensor, "none")) {
         error_report("sigmastar: this machine has no sensor bus");
         exit(1);
+    } else if (sms->rtc && strcmp(sms->rtc, "none")) {
+        error_report("sigmastar: this machine has no I2C bus for an rtc");
+        exit(1);
     }
 
     /*

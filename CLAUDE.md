@@ -603,7 +603,9 @@ in this order:
   `image_sensor_create()`. A part new to the catalogue usually needs only a
   line: SmartSens and GalaxyCore parts share a model. Take its ID from the
   vendor driver. An ISP reads a sensor through the `image-sensor` interface
-  (`image_sensor_exposure()`); a model implements it from its registers.
+  (`image_sensor_exposure()`); a model implements it from its registers. The
+  plain Sony models, `hisi-mis2006` and `hisi-sp2305` do not yet: on an ISP
+  that needs a picture from the sensor they are found but draw nothing.
   The Xiongmai machines also take a QOM type name (`sensor=hisi-imx335`) plus
   `sensor-addr=`; `xm-sensor` is a generic register-file sensor whose ID comes
   from `-global xm-sensor.regs=` (`docs/xiongmai.md`). The SSI `imx122` stays
