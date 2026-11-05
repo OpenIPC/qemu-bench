@@ -527,6 +527,54 @@ sudo defib burn -c nt98562 -p socket:///tmp/nvt.sock --nic tap0
 straps, through the fallback from a blank NOR, and over Ethernet. Each time
 it checks that U-Boot answers at its prompt.
 
+### The mask ROM itself (`-bios`)
+
+[OpenIPC/opennovatek](https://github.com/OpenIPC/opennovatek) reconstructs
+the NA51089 mask ROM as C and assembly, and its `re.elf` runs here in place
+of the model, as openhisilicon's av300 ROM runs on the HiSilicon machines:
+
+```sh
+git clone https://github.com/OpenIPC/opennovatek
+make -C opennovatek/bootrom/na51089 build
+qemu-system-arm -M nt98562,flash-file=blank.bin \
+    -bios opennovatek/bootrom/na51089/re.elf -display none -serial stdio
+```
+
+- **Loading:** `-bios` puts the image at the ROM's home, 0x80000000
+  (read-only), and in DRAM at 0, where it runs, as the loaders' copy leaves
+  it. The SRAM it keeps its data and stack in is mapped. Nothing of the
+  model is used.
+- **What it does on these devices:** from a blank NOR it prints silicon's
+  letters through the whole fallback: `NPIpK9`, `S1K2`, `HE` and the PHY
+  registers, six DHCP tries, `K:`, `U`, `K:`, then UART. defib recovers a
+  blank board through it over UART (`boot-strap=0xc`) and over Ethernet
+  (`boot-strap=4`, a tap), to U-Boot's prompt. `test-novatek-recovery.sh`
+  does both with `BIOS=re.elf`, and the `maskrom-na51089` CI job runs it.
+- **From a vendor flash** it boots as silicon does: `NPIp>T`, then the
+  loader. The `>` is not the ROM's: it is the last write of the loader
+  header's register script (0xF0290000 = 0x3E, UART0's THR), so it shows
+  only when a header was read and its script ran. With an XM NT98566's
+  8 MiB NOR the vendor loader runs (`Loader Start`, `LD_VER 02.01.02`) and
+  starts its U-Boot.
+- **Four device fixes it needed:**
+  - The timers' targets come out of reset at the full count. The ROM
+    counts timer 1 as its clock without setting one.
+  - The USB device side's soft reset clears itself. The ROM waits for it
+    before its USB boot times out.
+  - The IDE takes byte and halfword accesses. The ROM keeps the staged
+    loader header, its DMA flag and a USB bounce buffer in the IDE's
+    palette RAM (0xF0800200..0x5FF), and reads the 0xAA55 tag with `ldrh`.
+  - The SPI controller sums the halfwords it reads into 0x58, cleared by
+    a FIFO reset (0x54 bit 4). A header with flags bit 31 makes the ROM
+    trust that sum instead of its own loop. Vendor loaders set it.
+- **What differs from silicon:**
+  - Its random-number block is not modelled, so the MAC's random tail
+    reads 0.
+  - The UART fallback with a host probing all along does not recover: the
+    ROM leaves its UART unread for a minute. Silicon drops what arrives
+    then, on a full FIFO; QEMU's UART holds it back and replays it, out of
+    step with the ROM's 16-byte framing. The model drains its UART instead.
+
 `boot-file=` still stands for a loader one of those sources delivered: a
 host file copied to SRAM in place of the flash's first bytes, with
 `boot-strap=` the straps as TOP+0 reads them. From there the guest code

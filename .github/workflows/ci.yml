@@ -1337,6 +1337,113 @@ jobs:
       - name: Recover a blank flash over UART and over Ethernet
         run: bash qemu-boot/test-novatek-recovery.sh --soc ${{ matrix.soc }}
 
+  maskrom-na51089:
+    name: NA51089 mask-ROM end-to-end (-bios re.elf, defib)
+    needs: build
+    runs-on: ubuntu-24.04
+    # it builds and runs another repository's code: no write token
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0 \
+            gcc-arm-none-eabi make
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      - name: Checkout opennovatek (mask-ROM reconstruction)
+        uses: actions/checkout@v4
+        with:
+          repository: openipc/opennovatek
+          path: opennovatek
+          persist-credentials: false
+
+      - name: Build the NA51089 mask-ROM re.elf
+        run: |
+          make -C opennovatek/bootrom/na51089 build
+          ls -la opennovatek/bootrom/na51089/re.elf
+
+      # A blank NOR with the straps at flash: the reconstructed ROM finds no
+      # loader ("NPIpK9"), no SD card ("S1K2"), and starts Ethernet ("HE").
+      # That runs _start -> boot_dispatch -> flash_boot -> boot_fail ->
+      # next_boot_source -> sd_boot -> eth_boot from source, on the
+      # machine's own devices.
+      - name: The ROM's letters from a blank NOR
+        timeout-minutes: 2
+        run: |
+          python3 -c "open('/tmp/blank.bin','wb').write(b'\xff' * (8 << 20))"
+          timeout 15 ./qemu-src/build/qemu-system-arm \
+              -M nt98562,flash-file=/tmp/blank.bin \
+              -bios opennovatek/bootrom/na51089/re.elf \
+              -display none -nodefaults -serial file:/tmp/rom.out \
+              2>/tmp/rom.err || true
+          head=$(head -c 12 /tmp/rom.out)
+          echo "captured: $(xxd /tmp/rom.out | head -3)"
+          if [ "$head" != "NPIpK9S1K2HE" ]; then
+            echo "FAIL: expected NPIpK9S1K2HE, got: $head"
+            cat /tmp/rom.err
+            exit 1
+          fi
+
+      # A loader header as vendor flashes carry it, cut down: one script
+      # entry writing '>' to UART0, flags bit 31 (trust the SPI
+      # controller's checksum), halfword sum balanced.  Silicon prints
+      # "NPIp>T" from a vendor NOR.  It needs the IDE's halfword access
+      # (the ROM stages the header in the IDE palette RAM and reads the
+      # tag with ldrh) and the SPI checksum at 0x58.
+      - name: The ROM boots a loader header from NOR
+        timeout-minutes: 2
+        run: |
+          python3 - <<'EOF'
+          import struct
+          h = bytearray(0x400)
+          struct.pack_into('<II', h, 0x00, 0xF07C0100, 0xF07C0000)
+          struct.pack_into('<I', h, 0x24, 0x400)               # size
+          struct.pack_into('<H', h, 0x30, 0xAA55)              # tag
+          struct.pack_into('<II', h, 0x38, 1, 0)               # 1 entry
+          struct.pack_into('<II', h, 0x40, 0xF1290000, 0x3E)   # THR <- '>'
+          struct.pack_into('<I', h, 0x88, 0x80000000)          # hw sum
+          struct.pack_into('<I', h, 0x100, 0xEAFFFFFE)         # b .
+          n = len(h) // 2
+          s = sum(struct.unpack_from('<%dH' % n, h)) + n * (n - 1) // 2
+          struct.pack_into('<H', h, 0x08, -s & 0xFFFF)
+          open('/tmp/hdr.bin', 'wb').write(h + b'\xff' * ((8 << 20) - len(h)))
+          EOF
+          timeout 15 ./qemu-src/build/qemu-system-arm \
+              -M nt98562,flash-file=/tmp/hdr.bin \
+              -bios opennovatek/bootrom/na51089/re.elf \
+              -display none -nodefaults -serial file:/tmp/hdr.out \
+              2>/tmp/hdr.err || true
+          head=$(head -c 6 /tmp/hdr.out)
+          echo "captured: $(xxd /tmp/hdr.out | head -3)"
+          if [ "$head" != "NPIp>T" ]; then
+            echo "FAIL: expected NPIp>T, got: $head"
+            cat /tmp/hdr.err
+            exit 1
+          fi
+
+      - name: Install defib
+        run: pipx install git+https://github.com/OpenIPC/defib@74e1bccf574b6f2e055f9ae93ad5ca88c30206d8
+
+      # defib's own recovery, run against the reconstructed ROM's UART
+      # download and its DHCP/TFTP client, to U-Boot's prompt
+      - name: defib recovers a blank board through re.elf (UART, Ethernet)
+        run: |
+          BIOS=$PWD/opennovatek/bootrom/na51089/re.elf \
+              bash qemu-boot/test-novatek-recovery.sh --soc nt98562
+
   boot-fullhan:
     name: Boot ${{ matrix.soc }}
     needs: build

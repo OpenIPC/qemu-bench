@@ -83,6 +83,8 @@
 #define REG_ROWADDR     0x3C
 #define REG_INTMASK     0x44
 #define REG_CTRL_STS    0x48
+#define REG_FIFO_RST    0x54        /* bit 4: FIFO reset, clears CHECKSUM */
+#define REG_CHECKSUM    0x58        /* 16-bit sum of the data read */
 #define REG_COMMAND2    0xB4
 #define REG_STS_CHECK   0xBC
 #define REG_DUMMY_CLK   0xC0
@@ -114,6 +116,7 @@
 #define SPI_CFG_CS_HIGH (1u << 4)
 #define DLL1_SW_RESET   (1u << 0)
 #define FIFO_CTRL_DMA   (1u << 1)
+#define FIFO_RST        (1u << 4)
 #define FIFO_EMPTY      (1u << 8)
 #define FIFO_FULL       (1u << 9)
 #define FIFO_WORDS      16
@@ -689,6 +692,24 @@ static void nvt_flash_poll_status(NvtFlashState *s, uint32_t cmd, int ncmd)
     nvt_flash_set_status(s, st);
 }
 
+/*
+ * The controller sums, as little-endian halfwords, the data it reads
+ * from the flash into REG_CHECKSUM, until a FIFO reset clears it.  The
+ * mask ROM trusts it over its own loop when the loader header asks
+ * (flags bit 31): it resets the FIFO, reads the header and then the rest
+ * of the image, and boots when this plus the index sum is 0.  Every read
+ * the ROM makes is a whole number of halfwords.
+ */
+static void nvt_flash_sum(NvtFlashState *s, const uint8_t *p, uint32_t n)
+{
+    uint32_t sum = *reg(s, REG_CHECKSUM), i;
+
+    for (i = 0; i + 1 < n; i += 2) {
+        sum += lduw_le_p(p + i);
+    }
+    *reg(s, REG_CHECKSUM) = sum & 0xFFFF;
+}
+
 /* Clock len bytes between the flash and guest memory at a. */
 static void nvt_flash_dma_in(NvtFlashState *s, dma_addr_t a, uint32_t len)
 {
@@ -700,6 +721,7 @@ static void nvt_flash_dma_in(NvtFlashState *s, dma_addr_t a, uint32_t len)
         for (i = 0; i < n; i++) {
             chunk[i] = spi_xfer(s, 0);
         }
+        nvt_flash_sum(s, chunk, n);
         dma_memory_write(&address_space_memory, a + done, chunk, n,
                          MEMTXATTRS_UNSPECIFIED);
     }
@@ -955,6 +977,9 @@ static uint64_t nvt_flash_mmio_read(void *opaque, hwaddr off, unsigned size)
             return 0;
         }
         v = ldl_le_p(s->buf + s->buf_pos);
+        if (!s->wr_left) {
+            nvt_flash_sum(s, s->buf + s->buf_pos, 4);
+        }
         s->buf_pos += 4;
         if (s->buf_pos >= s->buf_len && s->rd_left) {
             nvt_flash_fifo_load(s);
@@ -1033,6 +1058,13 @@ static void nvt_flash_mmio_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     case REG_FIFO_STS:
+    case REG_CHECKSUM:
+        break;
+    case REG_FIFO_RST:
+        *reg(s, off) = val & ~FIFO_RST;         /* resets at once */
+        if (val & FIFO_RST) {
+            *reg(s, REG_CHECKSUM) = 0;
+        }
         break;
     case REG_SPARE ... REG_SPARE + NVT_SPARE_SIZE - 4:
         stl_le_p(s->spare + (off - REG_SPARE), val);
