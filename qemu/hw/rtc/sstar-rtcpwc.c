@@ -118,10 +118,11 @@ struct SstarRtcpwcState {
     QEMUTimer *alarm_timer;
     uint16_t regs[RTCPWC_REGS];
     uint32_t base, alarm, sw[4];
-    int64_t epoch;                  /* host seconds at the counter's zero */
+    int64_t epoch;                  /* rtc_clock seconds at counter zero */
+    uint32_t saved_count;           /* the counter, across a migration */
     bool off_pending, sleeping;
     bool iso_fsm;                   /* the property: infinity2m */
-    bool iso_full;                  /* the sequence reached 111 */
+    int8_t iso_step;                /* in iso_seq, -1 out of sequence */
 };
 
 static int64_t rtcpwc_now(void)
@@ -266,6 +267,25 @@ static uint64_t rtcpwc_read(void *opaque, hwaddr off, unsigned size)
     return size == 1 ? (v & 0xFF) : v;
 }
 
+/*
+ * The sequence again from 000 is how the driver retries, so that always
+ * starts over; anything else out of order sends nothing.
+ */
+static void rtcpwc_fsm_step(SstarRtcpwcState *s, uint8_t state)
+{
+    static const uint8_t iso_seq[] = { 0, 1, 3, 7, 5, 1, 0 };
+
+    if (state == iso_seq[s->iso_step + 1]) {
+        s->iso_step++;
+    } else {
+        s->iso_step = state ? -1 : 0;
+    }
+    if (s->iso_step == ARRAY_SIZE(iso_seq) - 1) {
+        s->iso_step = 0;
+        rtcpwc_iso(s);
+    }
+}
+
 /* infinity2m: the command goes across as the state sequence ends */
 static void rtcpwc_fsm_write(SstarRtcpwcState *s, int reg, uint16_t v)
 {
@@ -274,11 +294,8 @@ static void rtcpwc_fsm_write(SstarRtcpwcState *s, int reg, uint16_t v)
     switch (reg) {
     case R_ISO_CTRL:
         s->regs[reg] = v;
-        if ((v & ISO_STATES) == ISO_STATES) {
-            s->iso_full = true;
-        } else if (s->iso_full && !(v & ISO_STATES) && (old & ISO_STATES)) {
-            s->iso_full = false;
-            rtcpwc_iso(s);
+        if ((v ^ old) & ISO_STATES) {
+            rtcpwc_fsm_step(s, v & ISO_STATES);
         }
         break;
     case R_CNT_TRIG:
@@ -381,7 +398,7 @@ static void rtcpwc_reset(DeviceState *dev)
     if (s->iso_fsm) {
         s->regs[R_ISO_CTRL] = 0;
     }
-    s->iso_full = false;
+    s->iso_step = 0;
     s->off_pending = false;
     s->sleeping = false;
     if (!(s->regs[R_ALARM_INT] & AI_INT)) {
@@ -406,20 +423,39 @@ static void rtcpwc_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static int rtcpwc_pre_save(void *opaque)
+{
+    SstarRtcpwcState *s = opaque;
+
+    /* The counter, not a reading of this host's rtc_clock */
+    s->saved_count = rtcpwc_count(s);
+    return 0;
+}
+
+static int rtcpwc_post_load(void *opaque, int version_id)
+{
+    SstarRtcpwcState *s = opaque;
+
+    s->epoch = rtcpwc_now() - s->saved_count;
+    rtcpwc_arm(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_rtcpwc = {
     .name = TYPE_SSTAR_RTCPWC,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = rtcpwc_pre_save,
+    .post_load = rtcpwc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, SstarRtcpwcState, RTCPWC_REGS),
         VMSTATE_UINT32(base, SstarRtcpwcState),
         VMSTATE_UINT32(alarm, SstarRtcpwcState),
         VMSTATE_UINT32_ARRAY(sw, SstarRtcpwcState, 4),
-        VMSTATE_INT64(epoch, SstarRtcpwcState),
+        VMSTATE_UINT32(saved_count, SstarRtcpwcState),
         VMSTATE_BOOL(off_pending, SstarRtcpwcState),
         VMSTATE_BOOL(sleeping, SstarRtcpwcState),
-        VMSTATE_BOOL(iso_full, SstarRtcpwcState),
-        VMSTATE_TIMER_PTR(alarm_timer, SstarRtcpwcState),
+        VMSTATE_INT8(iso_step, SstarRtcpwcState),
         VMSTATE_END_OF_LIST()
     }
 };

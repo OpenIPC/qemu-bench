@@ -1733,6 +1733,41 @@ def test_infinity2m_rtcpwc(qemu, tmp):
         qt.writew(pwc + 0x03 * 4, 0)
         qt.writew(pwc + 0x00 * 4, 0)
         check('RTC: a sequence cut short sends nothing', count(), 3)
+        for cut, name in (((0, 1, 3, 7, 0), 'after 111'),
+                          ((0, 1, 3, 7, 5, 0), 'after 101'),
+                          ((0, 1, 3, 7, 1, 0), 'that skips 101')):
+            qt.writew(pwc + 0x00 * 4, 1 << 3)
+            for state in cut:
+                qt.writew(pwc + 0x03 * 4, state)
+            qt.writew(pwc + 0x00 * 4, 0)
+            check('RTC: a sequence cut ' + name + ' sends nothing',
+                  count(), 3)
+        qt.writew(pwc + 0x00 * 4, 1 << 3)
+        for state in (0, 1, 3, 0):
+            qt.writew(pwc + 0x03 * 4, state)
+        iso()
+        qt.writew(pwc + 0x00 * 4, 0)
+        check('RTC: the sequence retried from 000 sends', count(), 0)
+    finally:
+        qt.close()
+
+    # The counter survives a change of rtc_clock; a saved reading would not
+    mig = os.path.join(tmp, 'i2m-rtc.mig')
+    out = hmp(qemu, ['-M', 'ssd201', '-machine', 'accel=qtest', '-S', '-rtc',
+                     'clock=host,base=2015-01-01T00:00:00'],
+              ['migrate file:' + mig, 'info migrate'])
+    check('RTC: ssd201 migrates', 'completed' in out, True)
+    qt = QTest(qemu, 'ssd201', ['-rtc', 'clock=vm,base=2021-08-26T00:42:00',
+                                '-incoming', 'file:' + mig])
+    try:
+        for _ in range(500):
+            if read32(1 << 2) == 1420070400:
+                break
+            time.sleep(0.01)
+        check('RTC: the base came across', read32(1 << 2), 1420070400)
+        qt.writew(pwc + 0x0E * 4, 1)
+        c = qt.readw(pwc + 0x0D * 4) << 16 | qt.readw(pwc + 0x0C * 4)
+        check('RTC: the counter came across', c < 60, True)
     finally:
         qt.close()
 
