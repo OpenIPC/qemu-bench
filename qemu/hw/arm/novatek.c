@@ -69,11 +69,13 @@
 #define NVT_DAI_BASE        0xF0630000
 #define NVT_IDE_BASE        0xF0800000
 /*
- * -bios: ms of UART 0 left unread before its input is lost.  Silicon
- * loses it after its 16-byte FIFO fills, 1.4 ms at 115200; this leaves
- * room for emulation stalls while the ROM is reading.
+ * -bios: ms a full UART 0 goes without an RBR read before its input is
+ * lost.  Silicon loses it after one character time, 87 us at 115200; a
+ * starved vCPU on a busy host can go far longer than that mid-transfer
+ * (250 ms dropped bytes of the U-Boot pack), and the ROM leaves its UART
+ * alone for a minute, so seconds separate the two.
  */
-#define NVT_ROM_UART_IDLE_MS 250
+#define NVT_ROM_UART_IDLE_MS 5000
 #define NVT_DSI_BASE        0xF0840000
 #define NVT_EAC_BASE        0xF0640000
 #define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */

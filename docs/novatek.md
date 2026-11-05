@@ -579,9 +579,9 @@ qemu-system-arm -M nt98562,flash-file=blank.bin \
 - **What differs from silicon:**
   - Its random-number block is not modelled, so the MAC's random tail
     reads 0.
-  - UART 0 loses input after 250 ms unread, not when its 16-byte FIFO
-    fills (1.4 ms at 115200), so emulation stalls cannot cost bytes while
-    the ROM or a loader is reading. See the UART bullet above.
+  - UART 0 loses input once full and 5 s without an RBR read, not after
+    one character time, so a starved vCPU cannot lose bytes while the
+    ROM or a loader is reading. See the UART bullet above.
 
 `boot-file=` still stands for a loader one of those sources delivered: a
 host file copied to SRAM in place of the flash's first bytes, with
