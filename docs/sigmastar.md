@@ -570,8 +570,8 @@ those models serve it unchanged. What differs:
   `CMD_NORSP` with no answer; the data by DMA between the card and DDR
   (`DMA_ADDR`, MIU addresses) or, with `DEST_R2N`, 64 bytes at a time
   through the CIFD (bank `0x1411`); `DATA_END`. DAT0-3 read high: the card
-  is never busy. ADMA is not modelled. The card is `-drive
-  if=sd,format=raw,file=sd.img`; PM_SD_CDZ (PM GPIO `0x47` bit 2, active
+  is never busy. ADMA is Iford's; this driver does not use it. The card is
+  `-drive if=sd,format=raw,file=sd.img`; PM_SD_CDZ (PM GPIO `0x47` bit 2, active
   low) reads "card in" then, else the drivers report no card at once.
   The vendor U-Boot's `mmc info`, `fatls`, `fatload` and `mmc write`/`read`
   work against it (its FAT wants a partition table: an MBR with one FAT
@@ -581,6 +581,17 @@ those models serve it unchanged. What differs:
   load and latch requests the hardware clears (the driver spins on them
   with no timeout: the boot hung there) and a match alarm. It starts at
   the host's time. infinity2m and later have the RTCPWC instead.
+- **RTCPWC on infinity2m** (`sstar-rtcpwc` with `iso-fsm`, bank `0x0034` at
+  `0x1F006800`): the flags and data of Iford's RTCPWC behind another
+  handshake, from `drivers/sstar/rtc/ms_rtcpwc.c`. The driver steps reg 3
+  through 000, 001, 011, 111, 101, 001, 000; reg 8 bit 3 acks each step and
+  reads as the state's parity, and the command crosses as the sequence ends.
+  The driver retries that sequence forever under a spinlock, so a wrong ack
+  hangs the kernel rather than warning. SW0 starts at the driver's magic
+  `0xBABE` and the base at the machine's RTC time, as on a board that kept
+  its battery. Its alarm and power off are not modelled: this driver has
+  the alarm compiled out and takes no interrupt, and what reg `0x0F` and
+  the registers at `0x30` do on this die is not known.
 - **Scaler gamma SRAMs** (`sstar-vip-gamma`, `sstar-rgb-gamma`). The SCL
   driver loads the VIP's YUV gamma curves through an indirect port at
   bank `0x1226` regs `0x40`-`0x4F` and the RGB ones through two ports at
@@ -783,12 +794,10 @@ prompt, on a board as under QEMU.
 - HDMI TX: no EDID, so the NVR falls back to its default output mode.
 - The DIVP/DIP scalers (the VPU's own scaler serves the live view) and the
   remaining GOPs (GOP 0 is programmed but not scanned out).
-- SAR ADC, RTC on infinity2m (the kernel warns that RTCPWC has no power),
-  the MMU block (`HAL_MMU_Reset timeout`), audio output and the
-  infinity2m's audio.
+- SAR ADC, the RTCPWC's alarm and power off on infinity2m, the MMU block
+  (`HAL_MMU_Reset timeout`), audio output and the infinity2m's audio.
 - infinity (MSC313, MSC316 without E), infinity6 and mercury5 parts.
   The I3 SDK's kernel also has `infinity.dtsi`; Daniel Palmer's
   `mstar-miyoo-working` branch has the mercury5 map.
-- On infinity3, the media blocks (MFE, IVE, audio), the second SD host
-  (FCIE, bank `0x1402`, the NAND pads), ADMA, the SAR ADC and the FUART's
-  URDMA.
+- On infinity3, the IVE, the second SD host (FCIE, bank `0x1402`, the NAND
+  pads), the SAR ADC and the FUART's URDMA.

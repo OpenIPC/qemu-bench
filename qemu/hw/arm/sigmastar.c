@@ -1031,7 +1031,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
 
     /*
      * The infinity/infinity3 PM RTC, bank 0x0012 (DTS "mstar,infinity-rtc"
-     * at 0x1F002400).  infinity2m and later have the RTCPWC instead.
+     * at 0x1F002400).  infinity2m and later have the RTCPWC instead; its
+     * interrupt goes unconnected on infinity2m, whose driver takes none.
      */
     if (c->die == SS_DIE_IFORD) {
         /*
@@ -1050,6 +1051,12 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x0034, 0));
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            ss_spi(gic, intc, SS_SPI_IFORD_RTC));
+    }
+    if (c->die == SS_DIE_INFINITY2M) {
+        dev = qdev_new("sstar-rtcpwc");
+        qdev_prop_set_bit(dev, "iso-fsm", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x0034, 0));
     }
     if (c->die == SS_DIE_INFINITY3) {
         dev = qdev_new("sstar-rtc");
