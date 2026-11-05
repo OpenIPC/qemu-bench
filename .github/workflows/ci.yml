@@ -1328,9 +1328,9 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-arm
 
       # A reviewed defib commit (Novatek UART and Ethernet recovery,
-      # OpenIPC/defib#169, #170 and #171), not whatever master holds
+      # OpenIPC/defib#169, #170, #171 and #172), not whatever master holds
       - name: Install defib
-        run: pipx install git+https://github.com/OpenIPC/defib@74e1bccf574b6f2e055f9ae93ad5ca88c30206d8
+        run: pipx install git+https://github.com/OpenIPC/defib@6017307be58fe821ac5040d0d963a8af35e0a885
 
       # UART through the straps and through the fallback, then Ethernet
       # over a tap device (sudo: the tap, DHCP's port 67, TFTP's 69)
@@ -1434,8 +1434,9 @@ jobs:
             exit 1
           fi
 
+      # The same reviewed defib commit as the novatek-recovery job's
       - name: Install defib
-        run: pipx install git+https://github.com/OpenIPC/defib@74e1bccf574b6f2e055f9ae93ad5ca88c30206d8
+        run: pipx install git+https://github.com/OpenIPC/defib@6017307be58fe821ac5040d0d963a8af35e0a885
 
       # defib's own recovery, run against the reconstructed ROM's UART
       # download (straps at UART, and the minute-long fallback with defib
