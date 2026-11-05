@@ -1438,8 +1438,9 @@ jobs:
         run: pipx install git+https://github.com/OpenIPC/defib@74e1bccf574b6f2e055f9ae93ad5ca88c30206d8
 
       # defib's own recovery, run against the reconstructed ROM's UART
-      # download and its DHCP/TFTP client, to U-Boot's prompt
-      - name: defib recovers a blank board through re.elf (UART, Ethernet)
+      # download (straps at UART, and the minute-long fallback with defib
+      # probing all along) and its DHCP/TFTP client, to U-Boot's prompt
+      - name: defib recovers a blank board through re.elf (UART, fallback, Ethernet)
         run: |
           BIOS=$PWD/opennovatek/bootrom/na51089/re.elf \
               bash qemu-boot/test-novatek-recovery.sh --soc nt98562

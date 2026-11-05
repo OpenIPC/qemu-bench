@@ -547,16 +547,17 @@ qemu-system-arm -M nt98562,flash-file=blank.bin \
 - **What it does on these devices:** from a blank NOR it prints silicon's
   letters through the whole fallback: `NPIpK9`, `S1K2`, `HE` and the PHY
   registers, six DHCP tries, `K:`, `U`, `K:`, then UART. defib recovers a
-  blank board through it over UART (`boot-strap=0xc`) and over Ethernet
+  blank board through it over UART (`boot-strap=0xc`, or through the
+  fallback from the flash straps) and over Ethernet
   (`boot-strap=4`, a tap), to U-Boot's prompt. `test-novatek-recovery.sh`
-  does both with `BIOS=re.elf`, and the `maskrom-na51089` CI job runs it.
+  does all three with `BIOS=re.elf`, and the `maskrom-na51089` CI job runs it.
 - **From a vendor flash** it boots as silicon does: `NPIp>T`, then the
   loader. The `>` is not the ROM's: it is the last write of the loader
   header's register script (0xF0290000 = 0x3E, UART0's THR), so it shows
   only when a header was read and its script ran. With an XM NT98566's
   8 MiB NOR the vendor loader runs (`Loader Start`, `LD_VER 02.01.02`) and
   starts its U-Boot.
-- **Four device fixes it needed:**
+- **Five device fixes it needed:**
   - The timers' targets come out of reset at the full count. The ROM
     counts timer 1 as its clock without setting one.
   - The USB device side's soft reset clears itself. The ROM waits for it
@@ -567,13 +568,20 @@ qemu-system-arm -M nt98562,flash-file=blank.bin \
   - The SPI controller sums the halfwords it reads into 0x58, cleared by
     a FIFO reset (0x54 bit 4). A header with flags bit 31 makes the ROM
     trust that sum instead of its own loop. Vendor loaders set it.
+  - UART 0 loses what comes in while nobody reads it (serial
+    `rx-idle-drop`, `qemu/patches/0028`, only under `-bios`). The ROM
+    leaves its UART alone for the minute it spends on SD, Ethernet and
+    USB, then resets the FIFO and frames 16-byte commands from what
+    follows. QEMU's UART would
+    otherwise hold a host's probes back and replay them all at once, out
+    of step with that framing. defib's `fallback` way, probing all along,
+    now recovers through it.
 - **What differs from silicon:**
   - Its random-number block is not modelled, so the MAC's random tail
     reads 0.
-  - The UART fallback with a host probing all along does not recover: the
-    ROM leaves its UART unread for a minute. Silicon drops what arrives
-    then, on a full FIFO; QEMU's UART holds it back and replays it, out of
-    step with the ROM's 16-byte framing. The model drains its UART instead.
+  - UART 0 loses input after 250 ms unread, not when its 16-byte FIFO
+    fills (1.4 ms at 115200), so emulation stalls cannot cost bytes while
+    the ROM or a loader is reading. See the UART bullet above.
 
 `boot-file=` still stands for a loader one of those sources delivered: a
 host file copied to SRAM in place of the flash's first bytes, with

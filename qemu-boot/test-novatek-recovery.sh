@@ -21,11 +21,10 @@
 #   WAYS="strap eth" picks the ways (default all three); KEEP=1 keeps the
 #   logs; TAP names the tap device (default nvt-rec0, 192.168.77.1/24).
 #   BIOS=re.elf runs a mask ROM image in place of the model: OpenIPC/
-#   opennovatek's reconstruction of the NA51089 ROM.  Its ways default to
-#   "strap eth": the fallback reaches UART only after a minute of the ROM
-#   not reading it, and where silicon drops what arrives meanwhile (a full
-#   FIFO), QEMU's UART holds it back and then replays it, out of step with
-#   the ROM's 16-byte framing.  The model drains its UART instead.
+#   opennovatek's reconstruction of the NA51089 ROM, at silicon's timing,
+#   so "fallback" reaches UART after about a minute.  defib probes all
+#   along; UART 0 loses what comes in while the ROM is not reading it, as
+#   silicon does (serial rx-idle-drop).
 
 set -euo pipefail
 
@@ -84,12 +83,7 @@ EOF
 }
 
 fails=0
-if [ -n "${BIOS:-}" ]; then
-    default_ways="strap eth"
-else
-    default_ways="strap fallback eth"
-fi
-for way in ${WAYS:-$default_ways}; do
+for way in ${WAYS:-strap fallback eth}; do
     net=()
     burn=(timeout 300 $DEFIB burn -c "$SOC" -b)
     ready="U-Boot console ready"

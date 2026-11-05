@@ -1,0 +1,126 @@
+From: OpenIPC
+Subject: [PATCH] serial: rx-idle-drop, input lost while nobody reads it
+
+Off (0) by default.  With rx-idle-drop=N, once the guest has neither read
+RBR or LSR for N ms nor enabled the RX interrupt, a full receiver stops
+holding the backend back: what comes in is taken and lost (LSR OE), as
+on a line nobody reads.  Without it QEMU keeps the input waiting in the
+backend and delivers it all when the guest looks again; a mask ROM that
+leaves its UART alone while it tries other boot sources then reads a
+minute of stale input silicon never kept.  A guest that is reading keeps
+QEMU's flow control, so emulation stalls lose nothing.  A timer reopens
+the backend when the wait runs out.
+---
+--- a/hw/char/serial.c
++++ b/hw/char/serial.c
+@@ -567,6 +567,7 @@
+         if (s->lcr & UART_LCR_DLAB) {
+             ret = extract16(s->divider, 8 * addr, 8);
+         } else {
++            s->rx_last_read = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+             if(s->fcr & UART_FCR_FE) {
+                 ret = fifo8_is_empty(&s->recv_fifo) ?
+                             0 : fifo8_pop(&s->recv_fifo);
+@@ -612,6 +613,7 @@
+         break;
+     case 5:
+         ret = s->lsr;
++        s->rx_last_read = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+         /* Clear break and overrun interrupts */
+         if (s->lsr & (UART_LSR_BI|UART_LSR_OE)) {
+             s->lsr &= ~(UART_LSR_BI|UART_LSR_OE);
+@@ -687,16 +689,49 @@
+  * Paced, bytes come in at the line rate too: one a character time, so
+  * that a burst of input takes the time it takes on the wire.
+  */
++/*
++ * rx-idle-drop: once the guest has neither read RBR or LSR for that many
++ * ms nor enabled the RX interrupt, a full receiver no longer holds the
++ * backend back: what comes in is lost (LSR OE), as on a line nobody
++ * reads.  Without it the backend's input waits and is then delivered in
++ * one go when the guest looks again -- code that leaves the UART alone
++ * for a while (a mask ROM trying its other boot sources) would get a
++ * minute's worth of stale input that silicon never kept.  A guest that
++ * is reading still gets QEMU's flow control, so emulation stalls do not
++ * lose bytes.
++ */
++static bool serial_rx_unattended(SerialState *s)
++{
++    return s->rx_idle_drop && !(s->ier & UART_IER_RDI) &&
++           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->rx_last_read >
++               (int64_t)s->rx_idle_drop * SCALE_MS;
++}
++
+ static int serial_can_receive1(void *opaque)
+ {
+     SerialState *s = opaque;
+ 
++    if (s->rx_idle_drop && !serial_can_receive(s)) {
++        if (serial_rx_unattended(s)) {
++            return 1;                   /* taken, and lost */
++        }
++        /* full: the backend waits, until the guest reads or gives up */
++        timer_mod(s->rx_idle_timer,
++                  s->rx_last_read + (int64_t)s->rx_idle_drop * SCALE_MS + 1);
++    }
+     if (s->paced) {
+         return timer_pending(s->recv_timer) ? 0 : MIN(serial_can_receive(s), 1);
+     }
+     return serial_can_receive(s);
+ }
+ 
++static void serial_rx_idle_timer(void *opaque)
++{
++    SerialState *s = opaque;
++
++    qemu_chr_fe_accept_input(&s->chr);
++}
++
+ static void serial_recv_timer(void *opaque)
+ {
+     SerialState *s = opaque;
+@@ -1023,6 +1058,8 @@
+ {
+     SerialState *s = opaque;
+ 
++    s->rx_last_read = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
+     if (s->watch_tag > 0) {
+         g_source_remove(s->watch_tag);
+         s->watch_tag = 0;
+@@ -1098,6 +1135,7 @@
+     s->fifo_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) fifo_timeout_int, s);
+     s->xmit_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, serial_xmit_timer, s);
+     s->recv_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, serial_recv_timer, s);
++    s->rx_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, serial_rx_idle_timer, s);
+     qemu_register_reset(serial_reset, s);
+ 
+     qemu_chr_fe_set_handlers(&s->chr, serial_can_receive1, serial_receive1,
+@@ -1127,6 +1165,7 @@
+ 
+     timer_free(s->fifo_timeout_timer);
+     timer_free(s->xmit_timer);
++    timer_free(s->rx_idle_timer);
+ 
+     fifo8_destroy(&s->recv_fifo);
+     fifo8_destroy(&s->xmit_fifo);
+@@ -1156,6 +1195,7 @@
+     DEFINE_PROP_UINT32("rx-fifo", SerialState, rx_fifo, UART_FIFO_LENGTH),
+     DEFINE_PROP_BOOL("rtoie", SerialState, rtoie, false),
+     DEFINE_PROP_BOOL("dma-requests", SerialState, dma_requests, false),
++    DEFINE_PROP_UINT32("rx-idle-drop", SerialState, rx_idle_drop, 0),
+ };
+ 
+ static void serial_class_init(ObjectClass *klass, const void *data)
+--- a/include/hw/char/serial.h
++++ b/include/hw/char/serial.h
+@@ -80,6 +80,9 @@
+     bool rtoie;                     /* IER bit 4 enables the RX timeout */
+     bool dma_requests;              /* drq-tx / drq-rx while FCR DMS */
+     uint8_t rx_burst_left;          /* bytes of the RX burst still to read */
++    uint32_t rx_idle_drop;          /* ms unread before input is lost */
++    int64_t rx_last_read;           /* QEMU_CLOCK_VIRTUAL of the last RBR/LSR read */
++    QEMUTimer *rx_idle_timer;       /* rx-idle-drop: reopen the backend */
+     qemu_irq drq_tx, drq_rx;
+     int poll_msl;
+ 

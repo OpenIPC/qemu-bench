@@ -68,6 +68,12 @@
 #define NVT_PWM_BASE        0xF0210000
 #define NVT_DAI_BASE        0xF0630000
 #define NVT_IDE_BASE        0xF0800000
+/*
+ * -bios: ms of UART 0 left unread before its input is lost.  Silicon
+ * loses it after its 16-byte FIFO fills, 1.4 ms at 115200; this leaves
+ * room for emulation stalls while the ROM is reading.
+ */
+#define NVT_ROM_UART_IDLE_MS 250
 #define NVT_DSI_BASE        0xF0840000
 #define NVT_EAC_BASE        0xF0640000
 #define NVT_USB_ALIAS       0xFF600000  /* where NA51089's driver looks */
@@ -1938,6 +1944,26 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_FLASH]);
 
     for (n = 0; n < nvt_num_uarts(c); n++) {
+        /*
+         * Under a mask ROM image (-bios), UART 0 loses its input while
+         * nobody reads it, as silicon's does: the ROM leaves it alone for
+         * a minute while it tries SD, Ethernet and USB, then resets the
+         * FIFO and frames 16-byte commands from what comes after.
+         */
+        if (n == 0 && machine->firmware && !machine->kernel_filename) {
+            dev = qdev_new(TYPE_SERIAL_MM);
+            qdev_prop_set_uint8(dev, "regshift", 2);
+            qdev_prop_set_uint32(dev, "baudbase", nvt_uart_clk(n) / 16);
+            qdev_prop_set_chr(dev, "chardev", serial_hd(n));
+            qdev_set_legacy_instance_id(dev, nvt_uart_base(n), 2);
+            qdev_prop_set_uint8(dev, "endianness", DEVICE_LITTLE_ENDIAN);
+            qdev_prop_set_uint32(dev, "rx-idle-drop", NVT_ROM_UART_IDLE_MS);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[nvt_uart_irq(n)]);
+            memory_region_add_subregion(sysmem, nvt_uart_base(n),
+                    sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0));
+            continue;
+        }
         serial_mm_init(sysmem, nvt_uart_base(n), 2, pic[nvt_uart_irq(n)],
                        nvt_uart_clk(n) / 16, serial_hd(n),
                        DEVICE_LITTLE_ENDIAN);
