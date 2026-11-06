@@ -29,6 +29,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/guest-random.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -37,6 +38,7 @@
 #include "migration/vmstate.h"
 #include "hw/qdev-properties.h"
 #include "hw/misc/sstar-riu.h"
+#include "system/address-spaces.h"
 #include "system/runstate.h"
 
 #define RIU_NREGS           (SSTAR_RIU_SIZE / 4)
@@ -85,6 +87,17 @@ void sstar_riu_set(SstarRiuState *s, uint32_t bank, uint32_t reg,
 static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
                                  uint32_t reg, uint16_t v)
 {
+    /* Input pads: firmware writes these registers, the level stays */
+    for (int p = 0; p < ARRAY_SIZE(s->pad_addr); p++) {
+        if (s->pad_addr[p] &&
+            s->pad_addr[p] == SSTAR_RIU_ADDR(bank, reg)) {
+            v = (v & ~s->pad_mask[p]) | s->pad_level[p];
+        }
+    }
+    /* ALBANY0 where infinity6e and infinity6c put it */
+    if (s->phy_bank && bank == s->phy_bank) {
+        bank = 0x0031;
+    }
     switch (bank) {
     case 0x1012:            /* MIU digital */
         if (reg == 0x00) {
@@ -130,7 +143,7 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
     case 0x0031:            /* ALBANY0: the EMAC's internal PHY, sstar-emac */
         switch (reg) {
         case 0x00:          /* BMCR: reset and AN restart self-clear */
-            if (s->iford) {
+            if (s->iford || s->phy_bank) {
                 v &= ~0x8200;
             }
             break;
@@ -168,7 +181,7 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
          * the IPL ("[HSD] IP Reset Switch", its table at IPL 0x7670 names
          * FCIE1 and FCIE2).
          */
-        if (s->infinity3 && reg == 0x3F) {
+        if ((s->infinity3 || s->fcie_ack) && reg == 0x3F) {
             v = (v & ~0x000E) | ((v & 1) ? 0 : 0x000E);
         }
         break;
@@ -183,14 +196,23 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
     case 0x0042:
     case 0x1413:
         /* Iford FCIE, SDIO and SD: as infinity3 below, the same registers */
-        if (s->iford && reg == 0x3F) {
+        if ((s->iford || s->fcie_ack) && reg == 0x3F) {
             v = (v & ~0x001E) | ((v & 1) ? 0 : 0x001E);
         }
         break;
+    case 0x1013:
+        /* infinity6e MMU: its reset's init done */
+        if (s->i6e_mmu && reg == 0x50 && (v & 0x10)) {
+            v |= 0x0080;
+        }
+        break;
     case 0x1659:
-        /* Iford MIU MMU: reg 0 bit 4 resets it, [13:12] say its RAMs are up */
-        if (s->iford && reg == 0x00 && (v & 0x0010)) {
-            v |= 0x3000;
+        /*
+         * Iford's and infinity6c's MIU MMU: reg 0 bit 4 resets it, and
+         * [13:12] (Iford) or bit 9 (infinity6c) say its RAMs are up
+         */
+        if (s->miu_mmu && reg == 0x00 && (v & 0x0010)) {
+            v |= s->iford ? 0x3000 : 0x0200;
         }
         break;
     case 0x1668:
@@ -277,26 +299,106 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
 #define MMU_ENTRIES         4096
 #define MMU_INVALID         0x0FFF
 
+/*
+ * infinity6e's MMU (regMIU.h, mhal_miu.c), in the MIU's own bank: 1024
+ * entries.  Reg 0x50: bit 0 enable, 1 256 KiB pages (else 128), 4 and 5 reset,
+ * 7 init done, [11:8] the VPA region, [15:12] the PA region; reg 0x51 [9:0]
+ * the entry and bit 15 write; 0x52 the PA page to write, 0x53 the one read;
+ * 0x5B bit 0 does the access.
+ */
+#define I6E_MMU_BANK        0x1013
+#define I6E_MMU_CTRL        0x50
+#define I6E_MMU_ENTRY       0x51
+#define I6E_MMU_WDATA       0x52
+#define I6E_MMU_RDATA       0x53
+#define I6E_MMU_ACCESS      0x5B
+#define I6E_MMU_ENTRIES     1024
+#define I6E_MMU_INVALID     0x03FF
+
 static SstarRiuState *sstar_miu_riu;
+
+static uint64_t sstar_i6e_xlate(SstarRiuState *s, uint64_t a)
+{
+    uint16_t ctl = s->regs[(I6E_MMU_BANK << 7) | I6E_MMU_CTRL];
+    unsigned page = (ctl & 2) ? 18 : 17;
+    unsigned reach = page + 10;
+    uint16_t pa;
+
+    if (!(ctl & 1) || (a >> reach) != ((ctl >> 8) & 0xF)) {
+        return a;
+    }
+    pa = s->mmu[(a >> page) & (I6E_MMU_ENTRIES - 1)];
+    if (pa >= I6E_MMU_INVALID) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-riu: MMU miss at 0x%" PRIx64 "\n",
+                      a);
+        return a;
+    }
+    return ((uint64_t)(ctl >> 12) << reach) | ((uint64_t)pa << page) |
+           (a & ((1ull << page) - 1));
+}
+
+/* A VPA address with no entry: nothing is behind it on the bus. */
+bool sstar_miu_missed(uint64_t a)
+{
+    SstarRiuState *s = sstar_miu_riu;
+    uint16_t ctl;
+    unsigned page;
+
+    if (!s || !s->i6e_mmu) {
+        return false;
+    }
+    ctl = s->regs[(I6E_MMU_BANK << 7) | I6E_MMU_CTRL];
+    page = (ctl & 2) ? 18 : 17;
+    return (ctl & 1) && (a >> (page + 10)) == ((ctl >> 8) & 0xF) &&
+           s->mmu[(a >> page) & (I6E_MMU_ENTRIES - 1)] >= I6E_MMU_INVALID;
+}
+
+static void sstar_i6e_mmu_write(SstarRiuState *s, uint32_t reg, uint16_t v)
+{
+    uint32_t base = I6E_MMU_BANK << 7;
+
+    if (reg == I6E_MMU_CTRL && (v & 0x10)) {
+        memset(s->mmu, 0xFF, sizeof(s->mmu));
+    } else if (reg == I6E_MMU_ACCESS && (v & 1)) {
+        uint16_t e = s->regs[base | I6E_MMU_ENTRY];
+        unsigned n = e & (I6E_MMU_ENTRIES - 1);
+
+        if (e & 0x8000) {
+            s->mmu[n] = s->regs[base | I6E_MMU_WDATA] & I6E_MMU_INVALID;
+        } else {
+            s->regs[base | I6E_MMU_RDATA] = s->mmu[n] & I6E_MMU_INVALID;
+        }
+    }
+}
 
 uint64_t sstar_miu_xlate(uint64_t a)
 {
     SstarRiuState *s = sstar_miu_riu;
-    uint16_t ctl, regions;
+    uint16_t ctl, region, replace;
     unsigned page, reach;
     uint16_t pa;
 
     if (!s) {
         return a;
     }
+    if (s->i6e_mmu) {
+        return sstar_i6e_xlate(s, a);
+    }
     ctl = s->regs[MMU_BANK << 7];
     if (!(ctl & 1)) {
         return a;
     }
-    regions = s->regs[(MMU_BANK << 7) | 1];
+    /* Iford packs both regions in reg 1, infinity6c has regs 5 and 6 */
+    if (s->iford) {
+        region = s->regs[(MMU_BANK << 7) | 1] & 0xFF;
+        replace = s->regs[(MMU_BANK << 7) | 1] >> 8;
+    } else {
+        region = s->regs[(MMU_BANK << 7) | 5];
+        replace = s->regs[(MMU_BANK << 7) | 6];
+    }
     page = 15 + ((ctl >> 1) & 3);
     reach = page + 12;
-    if ((a >> reach) != (regions & 0xFF)) {
+    if ((a >> reach) != region) {
         return a;
     }
     pa = s->mmu[(a >> page) & (MMU_ENTRIES - 1)];
@@ -305,7 +407,7 @@ uint64_t sstar_miu_xlate(uint64_t a)
                       a);
         return a;
     }
-    return ((uint64_t)(regions >> 8) << reach) | ((uint64_t)pa << page) |
+    return ((uint64_t)replace << reach) | ((uint64_t)pa << page) |
            (a & ((1ull << page) - 1));
 }
 
@@ -363,6 +465,44 @@ static uint64_t sstar_riu_read(void *opaque, hwaddr off, unsigned size)
     return size == 1 ? (v & 0xFF) : v;
 }
 
+/*
+ * The MIU's memory BIST, which the IPL runs on every boot, cold or warm: it
+ * leaves its pattern in DRAM.  Regs 0x72/0x73 are the length in 16-byte units
+ * (the IPL gives 0x3EFFFF on a 64 MiB part, 63 MiB exactly), 0x74 the pattern.
+ * An inference: no vendor source documents them.  It matters because IPL_CUST
+ * on these dies reads a header byte at 0x23D0001F before it has put anything
+ * there, and takes a zero for a chained image; zeroed DRAM never boots twice.
+ */
+#define MIU_BANK        0x1012
+#define MIU_REG(r)      s->regs[MIU_BANK * 128 + (r)]
+
+static void sstar_miu_bist(SstarRiuState *s)
+{
+    uint64_t len = (MIU_REG(0x72) | ((uint32_t)MIU_REG(0x73) << 16)) + 1ULL;
+    uint16_t pattern = cpu_to_le16(MIU_REG(0x74));
+    uint16_t buf[2048];
+    hwaddr addr = 0x20000000;
+    int i;
+
+    len = MIN(len * 16, 1 * GiB);
+    if (MIU_REG(0x71)) {
+        qemu_log_mask(LOG_UNIMP, "sstar-riu: MIU BIST base 0x%04x\n",
+                      MIU_REG(0x71));
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(buf); i++) {
+        buf[i] = pattern;
+    }
+    while (len) {
+        hwaddr n = MIN(len, sizeof(buf));
+
+        address_space_write(&address_space_memory, addr,
+                            MEMTXATTRS_UNSPECIFIED, buf, n);
+        addr += n;
+        len -= n;
+    }
+}
+
 static void sstar_riu_write(void *opaque, hwaddr off, uint64_t val,
                             unsigned size)
 {
@@ -396,8 +536,14 @@ static void sstar_riu_write(void *opaque, hwaddr off, uint64_t val,
         v = val;
     }
     s->regs[idx] = v;
+    if (s->miu_bist && bank == 0x1012 && reg == 0x70 && (v & 1)) {
+        sstar_miu_bist(s);
+    }
 
-    if (s->iford && bank == MMU_BANK) {
+    if (s->i6e_mmu && bank == I6E_MMU_BANK) {
+        sstar_i6e_mmu_write(s, reg, v);
+    }
+    if (s->miu_mmu && bank == MMU_BANK) {
         sstar_miu_mmu_write(s, reg, v);
     }
 
@@ -450,7 +596,7 @@ static void sstar_riu_realize(DeviceState *dev, Error **errp)
 {
     SstarRiuState *s = SSTAR_RIU(dev);
 
-    if (s->iford) {
+    if (s->miu_mmu || s->i6e_mmu) {
         memset(s->mmu, 0xFF, sizeof(s->mmu));
         sstar_miu_riu = s;
     }
@@ -486,6 +632,17 @@ static const Property sstar_riu_props[] = {
     DEFINE_PROP_BOOL("smf-ack", SstarRiuState, smf_ack, false),
     DEFINE_PROP_BOOL("infinity3", SstarRiuState, infinity3, false),
     DEFINE_PROP_BOOL("iford", SstarRiuState, iford, false),
+    DEFINE_PROP_BOOL("miu-bist", SstarRiuState, miu_bist, false),
+    DEFINE_PROP_BOOL("fcie-ack", SstarRiuState, fcie_ack, false),
+    DEFINE_PROP_BOOL("miu-mmu", SstarRiuState, miu_mmu, false),
+    DEFINE_PROP_BOOL("i6e-mmu", SstarRiuState, i6e_mmu, false),
+    DEFINE_PROP_UINT16("phy-bank", SstarRiuState, phy_bank, 0),
+    DEFINE_PROP_UINT32("pad0-addr", SstarRiuState, pad_addr[0], 0),
+    DEFINE_PROP_UINT16("pad0-mask", SstarRiuState, pad_mask[0], 0),
+    DEFINE_PROP_UINT16("pad0-level", SstarRiuState, pad_level[0], 0),
+    DEFINE_PROP_UINT32("pad1-addr", SstarRiuState, pad_addr[1], 0),
+    DEFINE_PROP_UINT16("pad1-mask", SstarRiuState, pad_mask[1], 0),
+    DEFINE_PROP_UINT16("pad1-level", SstarRiuState, pad_level[1], 0),
     DEFINE_PROP_UINT16("gpio-bank", SstarRiuState, gpio_bank, 0),
     DEFINE_PROP_UINT64("uuid", SstarRiuState, uuid, 0),
     DEFINE_PROP_STRING("trace", SstarRiuState, trace),

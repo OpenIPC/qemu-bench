@@ -1,11 +1,11 @@
-# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd202d`, `ssd201`, `ssc375`, `msc313e`, `ssc029`)
+# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd20x`, `ssc375`, `msc313e`, `ssc029`, infinity6 dies)
 
 SigmaStar's (formerly MStar's) Cortex-A7 SoCs share one memory map whatever
 the family: DRAM (the MIU0 window) at `0x20000000`, the SPI NOR read window at
 `0x14000000`, the A7 private region with the GIC at `0x16000000`, IMI SRAM at
 `0xA0000000` and every peripheral behind the RIU at `0x1F000000`. One machine
 file (`hw/arm/sigmastar.c`) covers them with a table entry per SoC: the
-infinity2m dies, Ifado and infinity3.
+infinity2m dies, Ifado, infinity3, Iford and the infinity6 dies.
 
 Sources: the vendor infinity2m SDK (`boot_621_release_20200522`: U-Boot
 2015.01; `kernel_621_release_20200522`: Linux 4.9.84), the device tree built
@@ -27,7 +27,20 @@ from there too.
 | `ssd201` | infinity2m | 2× Cortex-A7 | 64 MiB | `0x1D` | `0xF0` | — |
 | `ssc375` | Ifado | 1× Cortex-A7 | 128 MiB | `0x15` | `0xF0`¹ | IPL → U-Boot → DHBoot → kernel → rootfs |
 | `msc313e` | infinity3 | 1× Cortex-A7 | 64 MiB | — | `0xC2` | IPL → U-Boot → kernel → shell |
+| `msc316dc`, `msc316dm` | infinity3 | 1× Cortex-A7 | 128 MiB | — | `0xC2` | IPL → OpenIPC U-Boot: flash, environment, network, SD |
 | `ssc029` | Iford | 2× Cortex-A32 (A7s here)² | 128 MiB | `0`³ | `0xF0`³ | IPL → U-Boot → kernel → shell, SDK `preview` to RTSP H.264, Ethernet, SD, USB; no AE |
+
+| `ssc325` | infinity6 | 1× Cortex-A7 | 128 MiB⁴ | — | `0xEF` | IPL → vendor U-Boot → OpenIPC login, NOR and SPI NAND |
+| `ssc325de` | infinity6 | 1× Cortex-A7 | 256 MiB⁴ | — | `0xEF` | IPL → vendor U-Boot → OpenIPC login from SPI NAND |
+| `ssc333`, `ssc335`, `ssc337` | infinity6b0 | 1× Cortex-A7 | 64 MiB | — | `0xF2` | IPL → vendor U-Boot; `ssc337` to OpenIPC login |
+| `ssc335de`, `ssc337de` | infinity6b0 | 1× Cortex-A7 | 128 MiB | — | `0xF2` | IPL → vendor U-Boot |
+| `ssc30kd`, `ssc30kq` | infinity6e | 2× Cortex-A7 | 128 MiB⁴ | `0x10` | `0xF1` | IPL → vendor U-Boot |
+| `ssc338q` | infinity6e | 2× Cortex-A7 | 256 MiB⁴ | `0x10` | `0xF1` | IPL → vendor U-Boot → OpenIPC login |
+| `ssc377`, `ssc377d`, `ssc377de`, `ssc378de` | infinity6c | 1× Cortex-A35 (`max` here) | 128 MiB⁴ | — | `0xF9` | IPL → vendor U-Boot; `ssc377` to OpenIPC login |
+| `ssc377qe`, `ssc378qe` | infinity6c | 1× Cortex-A35 (`max` here) | 256 MiB⁴ | — | `0xF9` | IPL → vendor U-Boot |
+
+⁴ A starting value, not a known size: see [Part defaults](#part-defaults).
+The machine warns unless `-m` chooses.
 
 ¹ Not checked against silicon: the boot chain to userspace does not look
 at it. The SoC is named by the firmware itself (`CHIP=SSC375` in the Dahua
@@ -174,6 +187,290 @@ every page. `sstar-fcie` gained ADMA and `BUSY_END`, which Iford's driver uses
 and infinity3's does not; SD reads and writes `mmcblk0`. USB is one EHCI at bank
 `0x1424`, SPI 63; the image has no `usb-storage.ko`, `scsi_mod.ko` or `sd_mod.ko`,
 so a USB disk cannot work, while a `usb-kbd` enumerates and binds `usbhid`.
+
+## infinity6 dies
+
+Sources: the vendor Pudding (infinity6, 6b0, 6e) and Maruko (6c) SDKs, chip
+IDs from ipctool, and the published `u-boot-<soc>-nor.bin` and
+`openipc.<soc>-nor-lite.tgz` of OpenIPC/firmware, the controls every result
+here was judged by. Nothing is checked on silicon. The default DRAM of each part
+is a convenience, not a datasheet value: use `-m`, the IPL sizes what it finds.
+
+```
+qemu-system-arm -M ssc338q,flash-file=full.bin -nographic \
+    -nic user,net=192.168.1.0/24,host=192.168.1.107 -drive if=sd,format=raw,file=card.img
+```
+
+| | infinity6, 6b0 | infinity6e | infinity6c |
+|---|---|---|---|
+| CPU, GIC | A7, GIC-400 | 2× A7, GIC-400 | A35 (A7 with its MIDR), GICv3, Monitor at reset |
+| IMI | 96 KiB | 184 KiB | 240 KiB |
+| Boot strap | PM clkgen `+0x7C` bit 14 | DID key reg `0x70` | DID key reg `0x70` |
+| DRAM size the IPL records | MIU `0x1012` reg `0x69` | same | bank `0x1659` reg `0x0D`, log2 MiB; `0x69` is a fixed `0x6000` |
+| FSP | `0x0016` | follows `bond=`: `[5:4]` 0 is `0x0016`, else `0x100D` | `0x0016`, software CS, outside size is count + 1 |
+| RTC | `sstar-rtc`, bank `0x0012` | RTCPWC with the ISO FSM | RTCPWC, Iford's handshake |
+| EMAC PHY bank | `0x0031` | `0x1514` | `0x1518` |
+| SD card detect (input pad) | PM GPIO `0x47` bit 2 | PADTOP `0x11` bit 0 | PADGPIO `0x06` bit 0 |
+| Console DMA | no | no | URDMA, Iford's bases |
+
+What the boot chain needs, each found by a vendor image failing without it:
+
+- **None of the SSD202D capture.** Its efuse trim at `0x1F004014` sends the
+  6b0 IPL into a deliberate `b .`.
+- **The MIU BIST writes DRAM.** The IPL runs it on every boot: length in regs
+  `0x72`/`0x73`, pattern in `0x74`. IPL_CUST reads a header's compression byte
+  from `0x23D0001F` before it has put anything there and takes a zero for a
+  chained image, so zeroed DRAM boots into nowhere, and U-Boot's heap does the
+  same on a warm reset. The 16-byte length unit is an inference: 63 MiB exactly
+  on a 64 MiB part.
+- **infinity6c must say Cortex-A35.** `__v7_ca35_setup` in the kernel's
+  `proc-v7.S` leaves Monitor mode Non-secure, and it matches MIDR `0x411FD040`
+  and no other. In the Secure state the kernel's Group 1 NS interrupts never
+  arrive, and it hangs at its first sleep.
+- **infinity6e's MMU** (bank `0x1013` regs `0x50`-`0x5B`, 1024 entries, 128 or
+  256 KiB pages). `mi_sys` takes the region above DRAM, CPU `0x50000000` on a
+  256 MiB part, where QEMU would repeat DRAM from 0, so a window translates it
+  and an address with no entry reaches nothing. BDMA goes through it too.
+  BDMA's address registers are full words: the 12-bit mask in the IPLs is
+  theirs. Masking to 28 bits wraps those clears onto the kernel's page tables.
+
+Not modelled: USB beyond one host and BDMA's second group on infinity6c
+(`0x1F201600`). The second SD host is bank `0x1410` on every infinity6 die,
+`-drive if=sd,index=1`, interrupt `INT_IRQ_SDIO` or, on infinity6c,
+`INT_IRQ_FCIE_TOP`; Linux finds its card on `ssc337de` and `ssc338q`. OpenIPC's kernel
+for infinity6e has the bond hard-coded to `0x10` (`halSERFLASH.c`), so with
+`bond=0` it finds no flash and panics at root mount: U-Boot follows the strap,
+that kernel does not.
+
+### Media on infinity6
+
+`ssc325` follows `ssc337` with these differences, each from its `mhal.ko` and
+device tree: VIF at bank `0x1319` with frame end on bit 1, not 5; five ISP
+interrupt groups that are not contiguous (regs `0x28`, `0x56`, `0x4A`, `0x5B`,
+`0x2D`), with frame start and process done on group 0 bits 14 and 15; the CMDQ's
+idle on bit 11 alone, since `0x1700` of that word is an error; and an MFE at
+`0x1F264E00` and an MHE at `0x1F264800` in place of the Wave5.
+
+Through the real boot chain its closed modules load, the VPE runs and the scaler
+draws frames. `mi_vpe` is woken only by the scaler's interrupt and sets its first
+buffer after one, so that interrupt follows the scaler's input with or without a
+buffer. MJPEG comes out (see below).
+
+H.264 runs on `sstar-mfe` with `riu` linked, through the vendor driver on a
+`mitest` pipeline: 997 frames at baseline CAVLC and 1056 at main profile CABAC,
+both 0 decode errors with I frames every 30. There is no vendor source for this
+generation, so what is here comes from `mhal.ko` and traces. The core is
+infinity3's. The size, source and output moved to the `ven` banks: `0x1329` regs
+`0x10` start, `0x11`/`0x12` size, `0x15` pitch, `0x20`-`0x23` source; `0x132B`
+`0x03`-`0x06` output. Regs `0x01`/`0x02` hold a 216-byte record the driver ends a
+frame from, and `0x39` bit 4 marks an I frame, which every slice header of a run
+agreed with. CMDQ1 carries the job, waits for the encoder and forces frame done
+through `0x1C`.
+
+Limits of this model:
+
+- The reconstruction stays inside the device, per stream, because the layout of
+  the reference buffers is not known. It is not migrated.
+- The CMDQ does not hold on a wait, so the frame is encoded inline.
+- `disable_deblocking_filter_idc` is taken as 0: the driver always sent that.
+- Only `mitest` has driven this, without 3A, so the picture is dark.
+- The driver logs a few `mfe ref_ring_EndAddr out of range` lines. The ring
+  position alternates between two slots and the record's end runs past the ring
+  from the second one. The real wrap needs a ring size the model does not know,
+  and the stream is not affected.
+
+H.265 runs on `sstar-mhe`, through the same driver and `mitest`: 871 frames under
+rate control and 874 at a fixed QP 33, both 0 decode errors, an I frame every
+30. It too comes from `mhal.ko` and traces, and it shares the `ven` banks. The
+driver feeds VPS, SPS, PPS and the slice header through a packer (`0x1324` regs
+`0x49`-`0x4B`) and the hardware appends the slice data, which is
+`hevc_enc_slice_data()` here. `0x48` is the QP, the only register that followed
+the slice header at both QPs. The bit count is at `0x1325` regs `0x73`/`0x74`, and
+the record is at `0x1326` regs `0x65`-`0x67`. The same limits apply as for the
+MFE, and:
+
+- `hevc-enc` codes I pictures at 8x8 block resolution, and CUs that changed in a
+  P picture as intra, so the picture is coarser than the H.264 path's.
+- The coding parameters are fixed to what the driver's SPS and PPS said (CTB 32,
+  transform depth 2, no SAO), not read from them.
+- `mhe ref_ring_EndAddr out of range` lines appear for the same reason as the MFE's.
+- Under rate control the driver logs a few `uiTotalCnt is 0` lines: the record's
+  histograms are zero. Whether that changes rate control is not known; QP stayed at
+  10 throughout, and the model's P frames are very small.
+
+Boot with the board's U-Boot for this: under `-kernel`, `insmod mi_sys.ko`
+sleeps forever on `ssc325`. The cause is not known.
+
+### H.264 on the Wave5
+
+These dies' drivers ask for it in the instance register's high half, 3 for AVC.
+The model answers with its own baseline CAVLC SPS and PPS, in front of every
+IDR, and intra pictures from `hantro-h264.c`, so the stream holds no P slices
+and is far larger than silicon's. On `ssc337` the vendor drivers stream it and
+`ffmpeg` decodes it without errors. The other dies share the path but have not
+been run.
+
+### Media on infinity6e, infinity6b0 and infinity6c
+
+All three run the vendor stack from sensor to H.265 over the network: the
+OpenIPC kernel and `osdrv` modules and libraries, with
+[waybeam](https://github.com/OpenIPC/waybeam) in front on `ssc338q` and
+`ssc377`, a small MI test program on `ssc337`. None of these has a first-boot
+gate or needs an EULA acceptance. `chagall.bin` has to be the set's own: the
+driver compares the build digits in the image.
+
+| Block | infinity6e, infinity6b0 | infinity6c |
+|---|---|---|
+| Sensor | `sensor=` on MIIC1, as `ipctool` looks for it; `imx415` on infinity6e, `imx307` on infinity6b0 | the same, `imx415` |
+| VIF | `sstar-vif` with `i6e`, bank `0x1304`: per channel, mask reg `0x0B`, clear `0x0D`, status `0x0E` | `sstar-vif`, bank `0x1308`, Iford's layout |
+| ISP top | `sstar-isp`, bank `0x1302`, five interrupt groups. On infinity6b0 group 0 bit 1 too: `mi_vpe` counts frames on it, and drops a realtime channel's first ten against that count, for ever if it does not move | `sstar-isp`, seven groups |
+| Picture | `sstar-iford-isp` with `sensor-window`: the scene through the sensor's exposure | the same |
+| Scaler output | `sstar-i6e-scl`: bank `0x1213`, `0x1215`; interrupts bank `0x1218` | `sstar-iford-scl`, bank `0x1253` |
+| CMDQ | `sstar-cmdq`, Ifado's four banks | twelve, banks `0x1120`, `0x1123`-`0x1129`, `0x1360`-`0x1363`; idle is status bit 27 alone |
+| MIU MMU | infinity6e: bank `0x1013`; infinity6b0 has none | bank `0x1659` as Iford, init done bit 9, regions in regs 5 and 6, and the CPU's window at `0x60000000` |
+| Encoder | `sstar-wave5` at `0x1F345200`: host commands, H.265 from `hevc-enc.c` | `sstar-wave5` at `0x1F34D000`: the same, and pictures through a queue |
+| CPU | Cortex-A7 | QEMU's ARMv8 `max`, saying A35: userland built for the A35 traps on a plain A7 |
+
+VPE to VENC is a **hardware ring**: on `ssc338q` the port's buffer holds 138
+lines of a 1280x720 stream and the MIU MMU maps nothing beyond them, and on
+infinity6c the ring is at the sensor's pitch and shorter than the frame, so a
+frame is never in memory. The scaler gives the frame straight to the encoder
+(`sstar_i6e_scl_ring()`, `sstar_iford_scl_ring()`). infinity6b0's ring is a
+whole frame, which the encoder reads like a whole-buffer bind; both bind types
+stream there.
+
+infinity6c's driver (`codec40`) queues pictures: sixteen 256-byte pages in
+memory, each an image of registers `0x100`-`0x1FF`, named by `0x16C` at
+`INIT_VPU`, with the host's index in `0x1F8` and the firmware's in `0x1F4`. A
+picture's results go to memory too, in the buffer `CREATE` names in `0x14C`.
+Reg `0x1E8` is bit 24 and an instance number there, not a bitmask. Addresses
+are relative to 1 MiB below the configured base, except the sources'.
+
+### 3A, JPEG and audio on the infinity6 family
+
+The vendor's own AE and AWB run on `ssc337`, `ssc338q` and `ssc377`, reading
+the statistics this model writes. Two things hold them up on real firmware, and
+neither is the model's:
+
+- **`iqfile0.bin` and the API `.bin` are different files.** `libcus3a` loads its
+  own IQ file from `<isproot>/iqfile0.bin` and checks its size. Putting
+  `configs/<sensor>.bin` there fails that check, and AE then starts with a NULL
+  configuration and segfaults in `AE_GetParamFromCfg`.
+- **OpenIPC's `sigmastar-osdrv-infinity6c` mixes builds.** Its `mi.ko` is from
+  2024-06-18 and its `libcus3a`, `libispalgo` and `libmi_isp` from 2022-09-07.
+  They disagree on a structure ("Structure size not match (112, 108)"), so the AE
+  limits read back as zeros and AE stays at the floor. The 2024-06-18 set in
+  `waybeam`'s `vendor-libs/maruko` works.
+
+The model's part: the AE grid is a fixed 32 x 32 here, with no block count
+register. `ssc377` needs frame done on ISP group 0 bit 10, armed by bit 9, for
+the statistics to change buffer and `/dev/isp_fe` to wake the 3A.
+
+Measured with `waybeam` from a lossless capture at QEMU's network layer:
+
+| | Mean Y | Lines | Gain | Frames decoded |
+|---|---|---|---|---|
+| `ssc337` | 32 | 1124 | 1024 | 2056 |
+| `ssc338q` | 41 | 1620 | 1024 | 1261 |
+| `ssc377` | 45 | 949 | 2043 | 827 |
+
+`ssc338q`'s yellow picture under `waybeam` is not a model error. `waybeam` takes
+AWB from the ISP there and runs its own grey-world loop, and the scene averages
+blue: the block means are 18/36/88, the loop's target 2012/418, the gains settle
+at 2011/428 inside its 3% deadband. With `awbFps: 0` the vendor's AWB keeps it
+and gives 2077/1759 on the neutral band. Sensor exposure in this model is linear,
+so only the statistics, not the picture's look, are comparable with silicon.
+
+JPEG uses `sstar-i3-jpe`: the family keeps jpe2's registers, the mask moved to
+`0x22` and addresses widened, and goes through the MIU MMU. `ssc337` streams
+MJPEG through the vendor driver with a correct picture. `ssc338q` answers
+`waybeam`'s `/api/v1/snapshot.jpg`, 4 of 4 clean: its driver finishes a picture
+from a record the engine writes to memory (regs `0x52`/`0x53`), and the JPEG
+channel shares scaler port 0's ring with H.265, so the JPE takes that frame from
+the scaler. No register marks a ring; the MMU table does, with pages missing or
+wrapping onto pages already used.
+`ssc325` streams MJPEG through the vendor driver on a `mitest` pipeline: 1017
+frames, with `0x1C` still its interrupt mask (`mask-1c`) and rate mode 6 for
+fixed-QP JPEG on that SDK. Without 3A running the picture is dark. One early
+frame of 1017 was flat. `ssc377` keeps `sstar-jpe`, not run.
+
+Audio capture reaches `waybeam` on `ssc337`, `ssc338q` and `ssc377`: a 1 kHz tone
+at amplitude 8000 with no RTP gaps. `mi_ai` reads the ring as two interleaved
+channels. `ssc377`'s DMA counts 16-byte units and goes through the MIU MMU; with
+8-byte units the tone overwrote the kernel. Playback (AO) is not modelled.
+
+## Part defaults
+
+Where each default comes from. OpenIPC/firmware's defconfigs name the vendor
+SKU of each part; the SDK's device trees and board configs give the SKU's
+sizes. **Unknown** means no source ties a size to that part. Those machines
+print a warning naming the evidence unless `-m` sets the size.
+
+| Part | SKU | DRAM | Status | Source | Package / bond |
+|---|---|---|---|---|---|
+| `ssr621q` | SSC010A | 256 MiB | sourced | retail U-Boot `LX_MEM=0xFF00000`; vendor `ssc010a-s01a-2Gb` DTS | bond `0x1E`, source not rechecked |
+| `ssd202d` | SSC010A | 128 MiB | sourced | kernel `mstar_get_package_type`: SSC010A is `QFN_DDR3_128MB`; DTS `0x07E00000` | QFN, bond `0x1E` from the capture |
+| `ssd201` | SSC011A | 64 MiB | partly | DTS `0x03E00000`; that SSD201 is SSC011A is inferred | bond `0x1D` from the capture |
+| `ssc375` | SSC032B | 128 MiB | sourced | retail Dahua `mem=128M` | bond `0x15`, WB1G DDR3 in its IPL |
+| `msc313e` | | 64 MiB | sourced | SDK `image_QFN64M-MSC313E`; datasheet "up to 512Mb" | QFN, not read |
+| `msc316dc` | | 128 MiB | sourced | SDK `image_QFN128M-MSC316DC` | QFN, not read |
+| `msc316dm` | | 128 MiB | partly | OpenIPC U-Boot only; the SDK has no MSC316DM image | **unknown** |
+| `ssc029` | | 128 MiB | partly | the model's MIU size register; not rechecked against the SDK | bond `0` picks a DRAM profile |
+| `ssc325` | SSC009A | 128 MiB | **unknown** | vendor DTS `0x07E00000`, nothing else | **unknown**, not read |
+| `ssc325de` | SSC009B | 256 MiB | **unknown** | vendor DTS `0x0FE00000`, nothing else | **unknown**, not read |
+| `ssc333`, `ssc335`, `ssc337` | 6b0 SSC009A | 64 MiB | sourced | vendor DTS `0x04000000` | **unknown**, not read |
+| `ssc335de`, `ssc337de` | 6b0 SSC009B | 128 MiB | sourced | vendor DTS `0x08000000` | **unknown**, not read |
+| `ssc30kd`, `ssc30kq`, `ssc338q` | SSC012B | 128, 128, 256 MiB | **unknown** | SDK builds 128 and 256 | QFN128, bond `0x10` (`CHIP_BOUND_QFN128`) |
+| `ssc377`, `ssc377d` | SSC027A | 128 MiB | **unknown** | SDK builds 64 and 128 | QFN88 in the SDK's names, not read |
+| `ssc377de`, `ssc378de` | SSC027D | 128 MiB | **unknown** | SDK builds 128 and 256 | QFN128 in the SDK's names, not read |
+| `ssc377qe`, `ssc378qe` | SSC027D | 256 MiB | **unknown** | SDK builds 128 and 256 | QFN128 in the SDK's names, not read |
+
+The 64 MiB `ssc325` used to have was a guess, and the vendor's device trees
+disagree with it. Vendor trees state DRAM less 2 MiB (`ssc010a` too), but they
+are explicitly "replaced with LX_MEM" and name a SKU, not a part. So `ssc325`
+stays unknown at their size.
+
+## SPI NAND
+
+An image starting with an SNI (`MSTARSEMIUSFDCIS`) on an infinity6 family
+machine gets a SPI NAND on the FSP in place of the NOR, and the boot straps to
+match. `sstar-fsp` holds page + spare for every page in `flash-file`, so
+bad-block marks survive. `tools/sstar-nand-image.py` lays out the published
+images (`u-boot-*-nand.bin`, `rootfs.ubi.*`), which carry no spares:
+
+    tools/sstar-nand-image.py flash.nand u-boot-ssc337de-nand.bin rootfs.ubi.ssc337de
+    qemu-system-arm -M ssc337de,flash-file=flash.nand -nographic
+
+- **Straps.** Each reader has its own, in the vendor's sources. On infinity6
+  and 6b0 U-Boot reads PM clkgen `+0x7C` [14:10] (`BIT4|BIT0`) and the kernel
+  DID key reg `0x70` (`BIT2`); on infinity6e both read DID key reg `0x70`
+  (`BIT4`). The kernel binds `ms-spinand` only if its own strap says NAND.
+- **The ROM's part.** Inferred, no dump exists. It finds an SNI at a block
+  start, takes the IPL from BL0PBA or BL1PBA past a block marked bad, and leaves
+  page 0 at `0xA0010000` and page 1 at `0xA0010A00`: the IPLs of all three dies
+  read their geometry from those copies.
+- **The chip.** Page read, cache read by RIU or BDMA, load, execute, block
+  erase, features. Bits only clear, and BP bits set at power-on refuse writes.
+  `flash-nand-id=` overrides the ID; otherwise it is what the SNI names, or a
+  GD5F1GQ4U (`0xC8F1`) for a generic SNI, whose ID is `0xEE 0xEE` and a version.
+- **Faults for testing.** `-global sstar-fsp.ecc-flip-page=`, `ecc-err-page=`
+  and `fail-block=` make the status report a corrected read, an uncorrectable
+  read, or a failed erase or program. The data stay as stored: there is no ECC
+  computation behind the status field.
+- **A held page load.** `HAL_SPINAND_PROGRAM_BY_BDMA` opens a load in one fire
+  with the software chip select off, and enables it only for the next. The model
+  keeps a load selected until a later fire without it, or the driver's release.
+  That is inferred from the driver working on silicon, not from a document.
+
+Tested from the published images: `ssc325`, `ssc325de`, `ssc337de` and
+`ssc338q` to login, `ssc30kq` to `OpenIPC #`; `nand` erase, write, read and
+`cmp` on `ssc337de`, the bytes checked in the raw file; `markbad` surviving a
+reboot; `ecc error` on an uncorrectable page; `MTD Erase failure` on a failing
+block.
+
+Geometry comes from the SNI, so a 4 KiB page part works, at register level only.
+infinity6c gets the strap (DID key reg `0x70` BIT4, from its U-Boot and kernel)
+but no published NAND image exists for it, so that path has never run.
 
 ## Boot
 
@@ -789,15 +1086,52 @@ is not a full flash image: the SDK's flashing script writes it and then
 saves the U-Boot environment, so on its own it stops at the `MStar #`
 prompt, on a board as under QEMU.
 
+### IVE
+
+`sstar-ive`, banks `0x1520` and `0x1521`, interrupt 56, runs all 24 operations of
+the I3 SDK's `mdrv_ive_io_st.h` in driver order, from the vendor's `hal_ive.c`.
+What each computes comes from `mi_ive_datatype.h`. The sources do not settle the
+following, so these are assumptions, listed at the top of `sstar-ive.c`: frame
+edges repeat, CSC coefficients are Q8, magnitude is `|Gx| + |Gy|`, angle is 256
+steps, integral "both" packs a 28-bit sum under the square sum, and an 8-bit SAD
+is the 16-bit one >> 8. No vendor program has driven it: the SDK kernels here
+carry no IVE driver, so the checks replay the HAL's register order.
+
+The second SD host is the FCIE at bank `0x1402`, `INT_IRQ_FCIE`,
+`-drive if=sd,index=1`. The vendor DTS leaves it unused.
+
+### MSC316
+
+`msc316dc` and `msc316dm` are the same die with 128 MiB. Their IPL ("IPL_EFUSE",
+`gd156225`) reads efuse `0x1F004014`, which `msc313e`'s does not. The SSD202D
+capture in the default register table holds `0x0809` there and sends it round
+the DDR set-up: it prints `D-ff` and never writes the PHY, yet still boots, since
+the model needs no training. So these machines take no capture, and it prints
+`D-02.` and programs the DDR itself:
+
+| | `msc316dc` | `msc313e` |
+|---|---|---|
+| Banner | `D-02.` | `D-01.` |
+| PHY (bank `0x1010`) writes | 93 | 94 |
+| MIU (bank `0x1012`) writes | 141 | 142 |
+| DDR PLL (regs `0x18`, `0x19`) | `0x8F5C`, `0x001E` | `0x8000`, `0x0029` |
+| Timing (`0x1012` regs `0x01`-`0x05`) | `03A3 000E 1538 20DD 2D76` | `0392 000D 1B28 1E99 2777` |
+| BIST length (`0x1012` reg `0x73`) | `0x007E` | `0x003E` |
+
+The size comes from the wrap: `-m 64M` gives `64MB`. U-Boot then caps at the 128
+MiB it was built for, so `-m 256M` shows `256MB` from the IPL and 128 MiB from
+U-Boot. The model does no DDR training, so none of these values is checked
+against anything but the IPL's own tables. `msc313e` itself still takes the
+SSD202D capture: its IPL does not read that fuse.
+
 ## Not modelled
 
 - HDMI TX: no EDID, so the NVR falls back to its default output mode.
 - The DIVP/DIP scalers (the VPU's own scaler serves the live view) and the
   remaining GOPs (GOP 0 is programmed but not scanned out).
-- SAR ADC, the RTCPWC's alarm and power off on infinity2m, the MMU block
-  (`HAL_MMU_Reset timeout`), audio output and the infinity2m's audio.
-- infinity (MSC313, MSC316 without E), infinity6 and mercury5 parts.
+- SAR ADC, the MMU block (`HAL_MMU_Reset timeout`), audio output and the
+  infinity2m's audio.
+- infinity (MSC313, MSC316 without E) and mercury5 parts.
   The I3 SDK's kernel also has `infinity.dtsi`; Daniel Palmer's
   `mstar-miyoo-working` branch has the mercury5 map.
-- On infinity3, the IVE, the second SD host (FCIE, bank `0x1402`, the NAND
-  pads), the SAR ADC and the FUART's URDMA.
+- On infinity3, the SAR ADC and the FUART's URDMA.

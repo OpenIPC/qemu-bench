@@ -12,7 +12,7 @@
 #define TYPE_SSTAR_FSP "sstar-fsp"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarFspState, SSTAR_FSP)
 
-#define SSTAR_FSP_OUTSIDE_MAX   0x400
+#define SSTAR_FSP_OUTSIDE_MAX   0x1000
 
 struct SstarFspState {
     SysBusDevice parent_obj;
@@ -35,6 +35,7 @@ struct SstarFspState {
     uint32_t size;
     uint32_t jedec;
     bool sw_cs;                 /* Ifado/Iford FSP-QSPI */
+    bool out_plus_one;
     char *flash_file;
     int fd;
     Error *migration_blocker;
@@ -48,6 +49,16 @@ struct SstarFspState {
     uint32_t dirty_lo, dirty_hi;
     uint8_t isp_rdata;
 
+    /* the SPI NAND in place of the NOR; array is page + spare per page */
+    bool nand;
+    uint32_t nand_id;           /* big-endian in its low bytes: 0xC8F1 */
+    uint32_t page_size, spare_size, block_pages;
+    uint8_t *cache;             /* the chip's page register */
+    uint8_t feat_prot, feat_conf, feat_stat;
+    uint32_t col;
+    /* one page or block that misbehaves, for the driver's error paths */
+    uint32_t ecc_flip_page, ecc_err_page, fail_block;
+
     /* bytes BDMA has queued for the FSP's outside write buffer */
     uint8_t outside[SSTAR_FSP_OUTSIDE_MAX];
     uint32_t outside_len;
@@ -56,7 +67,7 @@ struct SstarFspState {
 /* BDMA channel with the FSP as destination (MIU -> FSP page program). */
 void sstar_fsp_push_outside(SstarFspState *s, const uint8_t *buf,
                             uint32_t len);
-/* BDMA channel with the SPI flash as source. */
+/* BDMA channel with the SPI flash as source: on NAND, the page register. */
 void sstar_fsp_read_flash(SstarFspState *s, uint32_t off, uint8_t *buf,
                           uint32_t len);
 

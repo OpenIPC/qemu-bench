@@ -75,6 +75,33 @@
  * straight into the encoder through IMI, the 64 MiB parts'
  * mi.sys.shrink_mem) it is the test pattern itself.
  *
+ * infinity6's MFE ("riu" linked; 0x1F264E00, IRQ 60) keeps this core: QP,
+ * frame type, CABAC, deblocking, the FDC, the bit count and 0x1C-0x1E are
+ * where they were.  What the frame is made of moved out to the "ven" banks,
+ * which the model reads from the RIU's storage (mhal.ko _EncFire, MfeOps):
+ *
+ *   0x1329  0x10 bit 0 frame start, 0x11/0x12 width and height, 0x15 pitch,
+ *           0x20-0x23 the source Y and C, MIU bytes
+ *   0x132B  0x03-0x06 the output buffer's start and last 16-byte unit
+ *
+ * 0x01 and 0x02 [11:0] here hold the record the driver finishes a frame
+ * from (MIU address >> 4), which _EncDone() and _OpsCheckStatus() read: +0
+ * and +2 the bit count, +0xBE bit 0 done, +0xB8/+0xBA the cycles, +0xC2/+0xC4
+ * the qstep sum, +0xD0-+0xD6 where the reconstruction ended (bytes / 2 in two
+ * registers, 16-byte aligned), which _PutData() checks against the rings at
+ * 0x1329 0x58-0x5B.  It clears the record itself each frame.  0x39 bit 4 is
+ * set for an I frame, where 0x00 [5:4] was: every slice header of a 855-frame
+ * run agrees.  So do 0x3A [8:5] and [12:9], the deblocking offsets; the driver
+ * always sends disable_deblocking_filter_idc 0, and its PPS always has the
+ * control flag, so neither is read from a register here.
+ *
+ * CMDQ1 carries the job, waits for the encoder's event, then forces frame
+ * done through 0x1C [15:8].  The CMDQ model does not hold on a wait, so the
+ * frame is encoded inline, at the last FDC word, before that force runs.
+ *
+ * The reference buffers' layout is not known, so the reconstruction stays
+ * in the device, per stream, which the record's address tells apart.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -89,6 +116,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/misc/sstar-cabac.h"
+#include "hw/misc/sstar-riu.h"
 #include "aw-vinc-logo.h"
 #include "hw/misc/sstar-pattern.h"
 #include "migration/vmstate.h"
@@ -134,6 +162,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarMfeState, SSTAR_MFE)
 #define R_PITCH_Y           0x90
 #define R_SRC_FMT           0xF3
 
+#define I6_BANK_SRC         0x1329
+#define I6_BANK_OUT         0x132B
+#define I6_SRC_CTRL         0x10
+#define I6_SRC_WIDTH        0x11
+#define I6_SRC_HEIGHT       0x12
+#define I6_SRC_PITCH        0x15
+#define I6_SRC_Y            0x20
+#define I6_SRC_C            0x22
+#define I6_REC_Y            0x58        /* the reconstruction's rings */
+#define I6_REC_C            0x5A
+#define I6_OUT_START        0x03
+#define I6_OUT_END          0x05
+#define I6_REC_LO           0x01
+#define I6_REC_HI           0x02
+#define I6_REC_SIZE         216
+#define I6_REFS             4
+#define I6_INTRA            (1u << 4)   /* in 0x39 */
+
 #define CTRL_START          (1u << 0)
 #define CTRL_RSTZ           (1u << 1)
 #define MODE_CABAC          (1u << 13)
@@ -167,11 +213,25 @@ struct SstarMfeState {
     char *dump;
     uint8_t skip_tol;
     uint32_t pcm_next;                  /* where P frames look for changes */
+    SstarRiuState *riu;                 /* infinity6: the "ven" banks */
+    struct {
+        uint32_t stream;
+        int w, h;
+        uint8_t *y, *c;
+    } refs[I6_REFS];
+    int ref_next;
 };
 
 static void mfe_update(SstarMfeState *s)
 {
     qemu_set_irq(s->irq, !!(s->raw & ~s->regs[R_IRQ_MASK] & 0xFF));
+}
+
+/* Infinity6: a 32-bit value in two registers of a "ven" bank */
+static uint32_t i6_reg32(SstarMfeState *s, uint32_t bank, int reg)
+{
+    return sstar_riu_get(s->riu, bank, reg) |
+           (uint32_t)sstar_riu_get(s->riu, bank, reg + 1) << 16;
 }
 
 static uint32_t mfe_addr(SstarMfeState *s, int reg, int shift)
@@ -207,10 +267,14 @@ static bool mfe_in_dram(SstarMfeState *s, uint32_t miu, size_t len)
 
 static void mfe_load_source(SstarMfeState *s, MfePic *p)
 {
-    uint32_t ya = mfe_addr(s, R_CUR_Y, 8), ca = mfe_addr(s, R_CUR_C, 8);
-    uint32_t pitch = s->regs[R_PITCH_Y];
-    bool yuyv = s->regs[R_SRC_FMT] & 1;
-    bool swap = s->regs[R_SRC_FMT] & 0x8000;
+    uint32_t ya = s->riu ? i6_reg32(s, I6_BANK_SRC, I6_SRC_Y)
+                         : mfe_addr(s, R_CUR_Y, 8);
+    uint32_t ca = s->riu ? i6_reg32(s, I6_BANK_SRC, I6_SRC_C)
+                         : mfe_addr(s, R_CUR_C, 8);
+    uint32_t pitch = s->riu ? sstar_riu_get(s->riu, I6_BANK_SRC, I6_SRC_PITCH)
+                            : s->regs[R_PITCH_Y];
+    bool yuyv = !s->riu && (s->regs[R_SRC_FMT] & 1);
+    bool swap = !s->riu && (s->regs[R_SRC_FMT] & 0x8000);
     g_autofree uint8_t *line = NULL;
     int x, y;
 
@@ -291,12 +355,59 @@ static void mfe_pic_no_zero(MfePic *p)
 }
 
 /* A picture to or from DRAM, NV12 at the address in @yreg and @creg. */
+/* Infinity6: this stream's slot, or the oldest one for a new stream */
+static uint32_t i6_rec_addr(SstarMfeState *s)
+{
+    return (uint32_t)s->regs[I6_REC_LO] << 4 |
+           (uint32_t)(s->regs[I6_REC_HI] & 0xFFF) << 20;
+}
+
+static int i6_ref_slot(SstarMfeState *s, uint32_t stream)
+{
+    int i;
+
+    for (i = 0; i < I6_REFS; i++) {
+        if (s->refs[i].y && s->refs[i].stream == stream) {
+            return i;
+        }
+    }
+    i = s->ref_next;
+    s->ref_next = (i + 1) % I6_REFS;
+    g_free(s->refs[i].y);
+    g_free(s->refs[i].c);
+    s->refs[i].y = s->refs[i].c = NULL;
+    s->refs[i].stream = stream;
+    return i;
+}
+
+static void i6_ref_rw(SstarMfeState *s, MfePic *p, bool write)
+{
+    size_t ylen = (size_t)p->w * p->h;
+    int i = i6_ref_slot(s, i6_rec_addr(s));
+
+    if (write) {
+        g_free(s->refs[i].y);
+        g_free(s->refs[i].c);
+        s->refs[i].y = g_memdup2(p->y, ylen);
+        s->refs[i].c = g_memdup2(p->c, ylen / 2);
+        s->refs[i].w = p->w;
+        s->refs[i].h = p->h;
+    } else if (s->refs[i].y && s->refs[i].w == p->w && s->refs[i].h == p->h) {
+        memcpy(p->y, s->refs[i].y, ylen);
+        memcpy(p->c, s->refs[i].c, ylen / 2);
+    }
+}
+
 static void mfe_pic_rw(SstarMfeState *s, MfePic *p, int yreg, int creg,
                        bool write)
 {
     uint32_t ya = mfe_addr(s, yreg, 8), ca = mfe_addr(s, creg, 8);
     size_t ylen = (size_t)p->w * p->h;
 
+    if (s->riu) {
+        i6_ref_rw(s, p, write);
+        return;
+    }
     if (!mfe_in_dram(s, ya, ylen) || !mfe_in_dram(s, ca, ylen / 2)) {
         return;
     }
@@ -995,11 +1106,43 @@ static void mfe_dump(SstarMfeState *s, int w, int h, const uint8_t *data,
     fclose(f);
 }
 
+static void mfe_new_frame(SstarMfeState *s);
+
+/* The record infinity6's driver takes the finished frame from */
+static void i6_record(SstarMfeState *s, uint32_t bits, uint32_t ylen,
+                      uint32_t cycles, uint32_t qsteps)
+{
+    uint32_t yend = (i6_reg32(s, I6_BANK_SRC, I6_REC_Y) + ylen) >> 1;
+    uint32_t cend = (i6_reg32(s, I6_BANK_SRC, I6_REC_C) + ylen / 2) >> 1;
+    uint32_t miu = i6_rec_addr(s);
+    uint16_t rec[I6_REC_SIZE / 2] = { 0 };
+
+    rec[0] = cpu_to_le16(bits & 0xFFFF);
+    rec[1] = cpu_to_le16((bits >> 16) & 0xFF);
+    rec[0xB8 / 2] = cpu_to_le16(cycles & 0xFFFF);
+    rec[0xBA / 2] = cpu_to_le16((cycles >> 16) & 0xFF);
+    rec[0xBE / 2] = cpu_to_le16(IRQ_DONE);
+    rec[0xC2 / 2] = cpu_to_le16((qsteps & 0xFF) << 8);
+    rec[0xC4 / 2] = cpu_to_le16((qsteps >> 8) & 0xFFFF);
+    rec[0xD0 / 2] = cpu_to_le16(yend & 0xFFF0);
+    rec[0xD2 / 2] = cpu_to_le16(yend >> 16);
+    rec[0xD4 / 2] = cpu_to_le16(cend & 0xFFF0);
+    rec[0xD6 / 2] = cpu_to_le16(cend >> 16);
+    if (miu && mfe_in_dram(s, miu, sizeof(rec))) {
+        address_space_write(&address_space_memory, DRAM_BASE + miu,
+                            MEMTXATTRS_UNSPECIFIED, rec, sizeof(rec));
+    }
+}
+
 static void mfe_encode(void *opaque)
 {
     SstarMfeState *s = opaque;
-    int w = s->regs[R_WIDTH] & ~15, h = s->regs[R_HEIGHT] & ~15;
-    bool pframe = ((s->regs[R_CTRL] >> 4) & 3) == 1;
+    int w = s->riu ? sstar_riu_get(s->riu, I6_BANK_SRC, I6_SRC_WIDTH) & ~15
+                   : s->regs[R_WIDTH] & ~15;
+    int h = s->riu ? sstar_riu_get(s->riu, I6_BANK_SRC, I6_SRC_HEIGHT) & ~15
+                   : s->regs[R_HEIGHT] & ~15;
+    bool pframe = s->riu ? !(s->regs[R_DBF_CTRL] & I6_INTRA)
+                         : ((s->regs[R_CTRL] >> 4) & 3) == 1;
     bool cabac = s->regs[R_MODE] & MODE_CABAC;
     int qp = (s->regs[R_CTRL] >> 8) & 0x3F;
     SstarBits b = { .buf = g_byte_array_new() };
@@ -1012,6 +1155,10 @@ static void mfe_encode(void *opaque)
     int pcm;
 
     s->started = false;
+    if (s->riu) {
+        s->obuf[0] = i6_reg32(s, I6_BANK_OUT, I6_OUT_START);
+        s->obuf[1] = i6_reg32(s, I6_BANK_OUT, I6_OUT_END) | 15;
+    }
     if (!w || !h || (uint64_t)w * h / 256 > MAX_MBS) {
         qemu_log_mask(LOG_GUEST_ERROR, "sstar-mfe: picture %dx%d\n", w, h);
         g_byte_array_unref(b.buf);
@@ -1054,8 +1201,8 @@ static void mfe_encode(void *opaque)
     }
 
     /* the reconstruction: the decoder's picture, deblocked */
-    if (s->regs[R_DBF_CTRL] & DBF_CONTROL_PRESENT) {
-        dbf.idc = (s->regs[R_DBF_IDC] >> 3) & 3;
+    if (s->riu || (s->regs[R_DBF_CTRL] & DBF_CONTROL_PRESENT)) {
+        dbf.idc = s->riu ? 0 : (s->regs[R_DBF_IDC] >> 3) & 3;
         dbf.offset_a = 2 * sext(s->regs[R_DBF_IDC] >> 5, 4);
         dbf.offset_b = 2 * sext(s->regs[R_DBF_IDC] >> 9, 4);
     }
@@ -1105,13 +1252,21 @@ static void mfe_encode(void *opaque)
     sum = MIN(sum, 0xFFFFFF);
     s->regs[R_SUM_QSTEP_LO] = sum & 0xFFFF;
     s->regs[R_SUM_QSTEP_HI] = sum >> 16;
+    if (s->riu) {
+        i6_record(s, len * 8, w * h, w * h / 256 * 200, sum);
+    }
     s->raw |= IRQ_DONE | (len < out->len ? IRQ_BUF_FULL : 0);
     if (s->trace) {
         qemu_log("sstar-mfe: %c %dx%d %s qp %d src 0x%x hdr %u bits, "
                  "%u bytes (%d PCM MBs) at 0x%x%s\n", pframe ? 'P' : 'I',
                  w, h, cabac ? "CABAC" : "CAVLC", qp,
-                 mfe_addr(s, R_CUR_Y, 8), s->hdr_bits, len, pcm, s->obuf[0],
+                 s->riu ? i6_reg32(s, I6_BANK_SRC, I6_SRC_Y)
+                        : mfe_addr(s, R_CUR_Y, 8),
+                 s->hdr_bits, len, pcm, s->obuf[0],
                  len < out->len ? " (buffer full)" : "");
+    }
+    if (s->riu) {
+        mfe_new_frame(s);
     }
     s->frames++;
     mfe_update(s);
@@ -1148,7 +1303,14 @@ static void mfe_fdc_push(SstarMfeState *s)
         }
         s->hdr_bits++;
     }
-    if (++s->hdr_words == count + 1 && s->started) {
+    if (++s->hdr_words != count + 1) {
+        return;
+    }
+    if (s->riu) {
+        if (sstar_riu_get(s->riu, I6_BANK_SRC, I6_SRC_CTRL) & 1) {
+            mfe_encode(s);
+        }
+    } else if (s->started) {
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   ENCODE_NS);
     }
@@ -1173,6 +1335,9 @@ static void mfe_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     if (size == 1) {
         v = off & 1 ? (s->regs[reg] & 0x00FF) | ((val & 0xFF) << 8)
                     : (s->regs[reg] & 0xFF00) | (val & 0xFF);
+    }
+    if (s->trace) {
+        qemu_log("sstar-mfe: W %02x = %04x\n", reg, v);
     }
     switch (reg) {
     case R_CTRL:
@@ -1260,6 +1425,8 @@ static void sstar_mfe_init(Object *obj)
 static const Property sstar_mfe_props[] = {
     DEFINE_PROP_UINT64("dram-size", SstarMfeState, dram_size, 64 * MiB),
     DEFINE_PROP_BOOL("trace", SstarMfeState, trace, false),
+    DEFINE_PROP_LINK("riu", SstarMfeState, riu, TYPE_SSTAR_RIU,
+                     SstarRiuState *),
     DEFINE_PROP_UINT8("skip-tolerance", SstarMfeState, skip_tol, 2),
     DEFINE_PROP_STRING("dump", SstarMfeState, dump),
 };

@@ -22,6 +22,10 @@
  *   0x90  flags (HalAudDmaGetFlags): bit 1 overrun, bit 5 the level at
  *         or above the threshold, bit 6 full
  *
+ * infinity6c's registers count 16-byte units, not 8 (its HalAudDmaSetPhyAddr
+ * writes [15:4] and [30:16]): "unit-shift" 4, or the ring lands at twice its
+ * address, in the kernel.
+ *
  * The model's microphone hears a 1 kHz tone: while the DMA runs the
  * ring fills at "rate" bytes a second of 16-bit samples ("sample-rate"
  * Hz), the level count growing until the buffer is full; samples
@@ -45,6 +49,7 @@
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "hw/irq.h"
+#include "hw/misc/sstar-riu.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
@@ -74,6 +79,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarBachState, SSTAR_BACH)
 #define FLAG_FULL           (1u << 6)
 #define TICK_NS             (10 * SCALE_MS)
 #define SS_DRAM_BASE        0x20000000
+#define SS_PAGE             4096
 
 struct SstarBachState {
     SysBusDevice parent_obj;
@@ -89,23 +95,25 @@ struct SstarBachState {
 
     uint32_t rate;
     uint32_t sample_rate;
+    uint32_t unit_shift;        /* log2 of the DMA's address and size unit */
+    uint32_t channels;          /* interleaved in the ring: mi_ai takes one */
     bool trace;
 };
 
 static uint64_t bach_base(SstarBachState *s)
 {
-    return ((uint64_t)(s->regs[AI_ADDR_HI] & 0x7FFF) << 15) |
-           ((uint64_t)(s->regs[AI_ADDR_LO] & 0xFFF) << 3);
+    return ((uint64_t)(s->regs[AI_ADDR_HI] & 0x7FFF) << (12 + s->unit_shift)) |
+           ((uint64_t)(s->regs[AI_ADDR_LO] & 0xFFF) << s->unit_shift);
 }
 
 static uint32_t bach_size(SstarBachState *s)
 {
-    return (uint32_t)s->regs[AI_SIZE] << 3;
+    return (uint32_t)s->regs[AI_SIZE] << s->unit_shift;
 }
 
 static void bach_update(SstarBachState *s)
 {
-    uint32_t thresh = (uint32_t)s->regs[AI_THRESH] << 3;
+    uint32_t thresh = (uint32_t)s->regs[AI_THRESH] << s->unit_shift;
     uint16_t f = s->regs[AI_FLAGS] & ~(FLAG_HIGH | FLAG_FULL);
     uint16_t en = s->regs[AI_IRQEN];
     bool on = s->regs[AI_ADDR_LO] & AI_RUN;
@@ -136,17 +144,23 @@ static void bach_fill(SstarBachState *s, uint32_t n)
             break;
         }
         for (i = 0; i < chunk; i += 2) {
-            int16_t v = (int16_t)(8000 * sin(2 * M_PI * 1000 * s->sample++ /
+            int16_t v = (int16_t)(8000 * sin(2 * M_PI * 1000 *
+                                             (s->sample / MAX(s->channels, 1)) /
                                              MAX(s->sample_rate, 1)));
 
+            s->sample++;
             buf[i] = v & 0xFF;
             buf[i + 1] = (v >> 8) & 0xFF;
         }
-        if (a < SS_DRAM_BASE) {
-            a += SS_DRAM_BASE;
+        /* DMA goes through the MIU's MMU where a die has one */
+        for (i = 0; i < chunk; ) {
+            uint32_t run = MIN(chunk - i, SS_PAGE - ((a + i) & (SS_PAGE - 1)));
+
+            dma_memory_write(&address_space_memory,
+                             SS_DRAM_BASE + sstar_miu_xlate(a + i), buf + i,
+                             run, MEMTXATTRS_UNSPECIFIED);
+            i += run;
         }
-        dma_memory_write(&address_space_memory, a, buf, chunk,
-                         MEMTXATTRS_UNSPECIFIED);
         s->wptr = (s->wptr + chunk) % size;
         n -= chunk;
     }
@@ -238,10 +252,10 @@ static void sstar_bach_write(void *opaque, hwaddr off, uint64_t val,
             bach_tick(s);
         }
         if (s->regs[reg] & AI_LATCH) {
-            s->regs[AI_LEVEL] = MIN(s->level >> 3, 0xFFFF);
+            s->regs[AI_LEVEL] = MIN(s->level >> s->unit_shift, 0xFFFF);
         }
         if ((s->regs[reg] ^ old) & AI_TRIG) {
-            uint32_t n = (uint32_t)s->regs[AI_READ] << 3;
+            uint32_t n = (uint32_t)s->regs[AI_READ] << s->unit_shift;
 
             s->level -= MIN(n, s->level);
         }
@@ -292,6 +306,8 @@ static void sstar_bach_init(Object *obj)
 static const Property sstar_bach_props[] = {
     DEFINE_PROP_UINT32("rate", SstarBachState, rate, 32000),
     DEFINE_PROP_UINT32("sample-rate", SstarBachState, sample_rate, 16000),
+    DEFINE_PROP_UINT32("unit-shift", SstarBachState, unit_shift, 3),
+    DEFINE_PROP_UINT32("channels", SstarBachState, channels, 1),
     DEFINE_PROP_BOOL("trace", SstarBachState, trace, false),
 };
 

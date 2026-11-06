@@ -39,6 +39,25 @@
  * address register (0xC5/0xC8) only reads back: 16 MiB needs no fourth
  * address byte.
  *
+ * With "nand" the chip is a generic SPI NAND on the same four faces, the
+ * vendor's drivers/mstar/spinand HAL: 0x13 loads a page into the chip's
+ * page register, 0x03 or BDMA from the SPI port reads it by column, 0x02,
+ * 0x32 and 0x84 fill it, 0x10 programs it and 0xD8 erases, with 0x0F/0x1F
+ * reaching the protect (0xA0), feature (0xB0) and status (0xC0) registers.
+ * BDMA's SPI source address is then a column, not a flash address.  The
+ * file holds page + spare for every page, so bad-block marks persist.
+ * Programs and erases complete at once and only clear bits or set them
+ * all.  The on-die ECC is the status field alone: ecc-flip-page and
+ * ecc-err-page report a corrected or an uncorrectable read of that page,
+ * and fail-block fails programs and erases of that block; the data stay
+ * as stored.  Reset leaves the BP bits set, as these parts power up.
+ *
+ * The driver opens a page load in one fire with the software chip select
+ * off, and only then enables it for the data fires
+ * (HAL_SPINAND_PROGRAM_BY_BDMA), which still reaches one transfer on
+ * silicon.  So a load stays selected past its fire, until a later fire
+ * without the software chip select, or the driver's own release.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -106,7 +125,9 @@ static void sstar_fsp_persist(SstarFspState *s)
     len = s->dirty_hi - s->dirty_lo;
     s->dirty_lo = UINT32_MAX;
     s->dirty_hi = 0;
-    memory_region_set_dirty(&s->xiu, off, len);
+    if (!s->nand) {
+        memory_region_set_dirty(&s->xiu, off, len);
+    }
     while (s->fd >= 0 && len) {
         ssize_t n = pwrite(s->fd, s->array + off, len, off);
 
@@ -137,11 +158,227 @@ static void sstar_fsp_erase(SstarFspState *s, uint32_t addr, uint32_t len)
     sstar_fsp_dirty(s, addr, len);
 }
 
+/* ---- the SPI NAND -------------------------------------------------- */
+
+#define NAND_REG_PROT       0xA0
+#define NAND_REG_CONF       0xB0
+#define NAND_REG_STAT       0xC0
+
+#define NAND_PROT_BP        0x38
+#define NAND_CONF_ECC_EN    (1u << 4)
+#define NAND_STAT_WEL       (1u << 1)
+#define NAND_STAT_E_FAIL    (1u << 2)
+#define NAND_STAT_P_FAIL    (1u << 3)
+#define NAND_STAT_ECC_SHIFT 4
+#define NAND_STAT_ECC_MASK  (3u << NAND_STAT_ECC_SHIFT)
+
+static uint32_t nand_page_raw(SstarFspState *s)
+{
+    return s->page_size + s->spare_size;
+}
+
+/* The bit above the page and its spare is the plane select. */
+static uint32_t nand_col(SstarFspState *s, uint32_t col)
+{
+    return col & (s->page_size * 2 - 1);
+}
+
+static bool nand_cmd_is_load(uint8_t cmd)
+{
+    return cmd == 0x02 || cmd == 0x32 || cmd == 0x84 || cmd == 0x34;
+}
+
+static uint32_t nand_pages(SstarFspState *s)
+{
+    return s->size / nand_page_raw(s);
+}
+
+static void nand_page_read(SstarFspState *s)
+{
+    uint32_t page = s->addr;
+
+    s->feat_stat &= ~NAND_STAT_ECC_MASK;
+    if (page >= nand_pages(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-fsp: NAND page 0x%x past the "
+                      "end\n", page);
+        memset(s->cache, 0xFF, nand_page_raw(s));
+        return;
+    }
+    memcpy(s->cache, s->array + page * nand_page_raw(s), nand_page_raw(s));
+    if (s->feat_conf & NAND_CONF_ECC_EN) {
+        if (page == s->ecc_err_page) {
+            s->feat_stat |= 2u << NAND_STAT_ECC_SHIFT;
+        } else if (page == s->ecc_flip_page) {
+            s->feat_stat |= 1u << NAND_STAT_ECC_SHIFT;
+        }
+    }
+}
+
+/* The write latch is spent either way; a refused operation reports a fail. */
+static bool nand_may_write(SstarFspState *s, uint32_t page, uint8_t fail)
+{
+    bool wel = s->wel;
+
+    s->feat_stat &= ~(NAND_STAT_E_FAIL | NAND_STAT_P_FAIL);
+    s->wel = false;
+    if (!wel) {
+        return false;
+    }
+    if ((s->feat_prot & NAND_PROT_BP) || page >= nand_pages(s) ||
+        page / s->block_pages == s->fail_block) {
+        s->feat_stat |= fail;
+        return false;
+    }
+    return true;
+}
+
+static void nand_page_program(SstarFspState *s)
+{
+    uint32_t raw = nand_page_raw(s);
+    uint32_t off = s->addr * raw;
+    uint32_t i;
+
+    if (!nand_may_write(s, s->addr, NAND_STAT_P_FAIL)) {
+        return;
+    }
+    for (i = 0; i < raw; i++) {
+        s->array[off + i] &= s->cache[i];
+    }
+    sstar_fsp_dirty(s, off, raw);
+}
+
+static void nand_block_erase(SstarFspState *s)
+{
+    uint32_t page = s->addr & ~(s->block_pages - 1);
+    uint32_t len = s->block_pages * nand_page_raw(s);
+
+    if (!nand_may_write(s, page, NAND_STAT_E_FAIL)) {
+        return;
+    }
+    memset(s->array + page * nand_page_raw(s), 0xFF, len);
+    sstar_fsp_dirty(s, page * nand_page_raw(s), len);
+}
+
+static void nand_deselect(SstarFspState *s)
+{
+    switch (s->cmd) {
+    case 0x06:                              /* WRITE ENABLE */
+        s->wel = true;
+        break;
+    case 0x04:                              /* WRITE DISABLE */
+        s->wel = false;
+        break;
+    case 0xFF:                              /* RESET */
+        s->wel = false;
+        s->feat_stat = 0;
+        break;
+    case 0x13:                              /* PAGE READ, to the register */
+        if (s->pos >= 4) {
+            nand_page_read(s);
+        }
+        break;
+    case 0x10:                              /* PROGRAM EXECUTE */
+        if (s->pos >= 4) {
+            nand_page_program(s);
+        }
+        break;
+    case 0xD8:                              /* BLOCK ERASE */
+        if (s->pos >= 4) {
+            nand_block_erase(s);
+        }
+        break;
+    }
+    sstar_fsp_persist(s);
+}
+
+static uint8_t nand_feature(SstarFspState *s, uint8_t reg)
+{
+    switch (reg) {
+    case NAND_REG_PROT:
+        return s->feat_prot;
+    case NAND_REG_CONF:
+        return s->feat_conf;
+    case NAND_REG_STAT:
+        return s->feat_stat | (s->wel ? NAND_STAT_WEL : 0);
+    }
+    return 0;
+}
+
+static uint8_t nand_xfer(SstarFspState *s, uint32_t pos, uint8_t tx)
+{
+    uint32_t raw = nand_page_raw(s);
+    uint8_t rx = 0xFF;
+
+    switch (s->cmd) {
+    case 0x9F:                              /* READ ID, after one dummy */
+        if (pos >= 2) {
+            int n = (32 - clz32(s->nand_id | 1) + 7) / 8;
+            int i = pos - 2;
+
+            rx = i < n ? s->nand_id >> (8 * (n - 1 - i)) : 0;
+        }
+        break;
+    case 0x0F:                              /* GET FEATURE */
+        if (pos == 1) {
+            s->addr = tx;
+        } else {
+            rx = nand_feature(s, s->addr);
+        }
+        break;
+    case 0x1F:                              /* SET FEATURE */
+        if (pos == 1) {
+            s->addr = tx;
+        } else if (pos == 2) {
+            if (s->addr == NAND_REG_PROT) {
+                s->feat_prot = tx;
+            } else if (s->addr == NAND_REG_CONF) {
+                s->feat_conf = tx;
+            }
+        }
+        break;
+    case 0x13: case 0x10: case 0xD8:        /* three page address bytes */
+        if (pos <= 3) {
+            s->addr = (s->addr << 8) | tx;
+        }
+        break;
+    case 0x03: case 0x0B:                   /* READ FROM CACHE */
+    case 0x3B: case 0x6B:                   /* dual, quad output */
+        if (pos <= 2) {
+            s->col = (s->col << 8) | tx;
+        } else if (pos > 3) {
+            rx = s->cache[nand_col(s, s->col++) % raw];
+        }
+        break;
+    case 0x02: case 0x32:                   /* PROGRAM LOAD: register to FF */
+        if (pos == 1) {
+            memset(s->cache, 0xFF, raw);
+        }
+        /* fall through */
+    case 0x84: case 0x34:                   /* RANDOM LOAD: register kept */
+        if (pos <= 2) {
+            s->col = (s->col << 8) | tx;
+        } else if (nand_col(s, s->col) < raw) {
+            s->cache[nand_col(s, s->col++)] = tx;
+        }
+        break;
+    case 0x06: case 0x04: case 0xFF:
+        break;
+    default:
+        if (pos == 1) {
+            qemu_log_mask(LOG_UNIMP, "sstar-fsp: NAND opcode 0x%02x\n",
+                          s->cmd);
+        }
+        break;
+    }
+    return rx;
+}
+
 static void spi_select(SstarFspState *s)
 {
     s->selected = true;
     s->pos = 0;
     s->addr = 0;
+    s->col = 0;
 }
 
 static void spi_deselect(SstarFspState *s)
@@ -151,6 +388,10 @@ static void spi_deselect(SstarFspState *s)
     }
     s->selected = false;
     if (!s->pos) {
+        return;
+    }
+    if (s->nand) {
+        nand_deselect(s);
         return;
     }
     switch (s->cmd) {
@@ -205,6 +446,9 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
     if (pos == 0) {
         s->cmd = tx;
         return 0xFF;
+    }
+    if (s->nand) {
+        return nand_xfer(s, pos, tx);
     }
     switch (s->cmd) {
     case 0x03:                              /* READ */
@@ -299,6 +543,12 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
 void sstar_fsp_read_flash(SstarFspState *s, uint32_t off, uint8_t *buf,
                           uint32_t len)
 {
+    if (s->nand) {
+        while (len--) {
+            *buf++ = s->cache[nand_col(s, off++) % nand_page_raw(s)];
+        }
+        return;
+    }
     while (len--) {
         *buf++ = s->array[off++ & (s->size - 1)];
     }
@@ -345,12 +595,12 @@ static bool fsp_sw_cs(SstarFspState *s)
     return s->sw_cs && (s->qspi[QSPI_SW_MODE] & QSPI_SW_CS_EN);
 }
 
-/* How many bytes the outside buffer holds: sw-cs counts one more. */
+/* How many bytes the outside buffer holds: the FSP-QSPI counts one more. */
 static uint32_t fsp_outside_len(SstarFspState *s)
 {
     uint32_t out_len = s->fsp[FSP_WBF_SIZE_OUT];
 
-    return s->sw_cs && out_len ? out_len - 1 : out_len;
+    return s->out_plus_one && out_len ? out_len - 1 : out_len;
 }
 
 /* The bytes BDMA queued, in place of write buffer byte (0x79 & 0xFF). */
@@ -396,6 +646,7 @@ static void fsp_fire(SstarFspState *s)
             continue;
         }
         if (!sw_cs) {
+            spi_deselect(s);        /* a NAND page load left open */
             spi_select(s);
         } else if (!s->selected) {
             qemu_log_mask(LOG_GUEST_ERROR, "sstar-fsp: fire with the "
@@ -422,7 +673,7 @@ static void fsp_fire(SstarFspState *s)
                 s->rbf[rpos] = b;
             }
         }
-        if (!sw_cs) {
+        if (!sw_cs && !(s->nand && nand_cmd_is_load(s->cmd))) {
             spi_deselect(s);
         }
     }
@@ -622,11 +873,16 @@ static void xiu_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 static uint64_t xiu_read(void *opaque, hwaddr off, unsigned size)
 {
     SstarFspState *s = opaque;
+    uint8_t buf[8] = {};
     uint64_t v = 0;
     unsigned i;
 
+    if (s->nand) {
+        sstar_fsp_read_flash(s, off, buf, size);
+    }
     for (i = 0; i < size; i++) {
-        v |= (uint64_t)s->array[(off + i) & (s->size - 1)] << (8 * i);
+        v |= (uint64_t)(s->nand ? buf[i] :
+                        s->array[(off + i) & (s->size - 1)]) << (8 * i);
     }
     return v;
 }
@@ -647,6 +903,10 @@ static void sstar_fsp_reset(DeviceState *dev)
     memset(s->rbf, 0, sizeof(s->rbf));
     memset(s->sr, 0, sizeof(s->sr));
     s->ear = 0;
+    s->feat_prot = NAND_PROT_BP;
+    s->feat_conf = NAND_CONF_ECC_EN;
+    s->feat_stat = 0;
+    s->col = 0;
     s->fire_wait = false;
     s->done = false;
     s->wel = false;
@@ -662,6 +922,7 @@ static void sstar_fsp_realize(DeviceState *dev, Error **errp)
     ERRP_GUARD();
     SstarFspState *s = SSTAR_FSP(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    uint32_t nand_block = (s->page_size + s->spare_size) * s->block_pages;
     ssize_t got;
     off_t len;
 
@@ -683,7 +944,15 @@ static void sstar_fsp_realize(DeviceState *dev, Error **errp)
             goto fail;
         }
         len = lseek(s->fd, 0, SEEK_END);
-        if (len < 1 * MiB || len > 32 * MiB || (len & (len - 1))) {
+        if (s->nand) {
+            if (!len || len > 1 * GiB || len % nand_block) {
+                error_setg(errp, "sstar-fsp: %s is not whole NAND blocks of "
+                           "%u bytes with their spare; "
+                           "tools/sstar-nand-image.py makes one",
+                           s->flash_file, nand_block);
+                goto fail;
+            }
+        } else if (len < 1 * MiB || len > 32 * MiB || (len & (len - 1))) {
             error_setg(errp, "sstar-fsp: %s is not a power-of-two size "
                        "from 1 to 32 MiB", s->flash_file);
             goto fail;
@@ -695,19 +964,35 @@ static void sstar_fsp_realize(DeviceState *dev, Error **errp)
         }
         s->size = len;
     }
-    if (s->size < 1 * MiB || s->size > 32 * MiB ||
-        (s->size & (s->size - 1))) {
-        error_setg(errp, "sstar-fsp: size must be a power of two from 1 to "
-                   "32 MiB");
-        goto fail;
-    }
+    if (s->nand) {
+        if (s->fd < 0) {
+            s->size = 1024 * nand_block;
+            error_setg(&s->migration_blocker, "sstar-fsp: the NAND array "
+                       "cannot be migrated");
+            if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
+                goto fail;
+            }
+        }
+        memory_region_init_io(&s->xiu, OBJECT(s), &xiu_ops, s,
+                              "sstar-fsp.xiu", 16 * MiB);
+        s->array = g_malloc(s->size);
+        s->cache = g_malloc(s->page_size + s->spare_size);
+        memset(s->cache, 0xFF, s->page_size + s->spare_size);
+    } else {
+        if (s->size < 1 * MiB || s->size > 32 * MiB ||
+            (s->size & (s->size - 1))) {
+            error_setg(errp, "sstar-fsp: size must be a power of two from 1 "
+                       "to 32 MiB");
+            goto fail;
+        }
 
-    /* Reads straight from the array; writes trap. */
-    if (!memory_region_init_rom_device(&s->xiu, OBJECT(s), &xiu_ops, s,
-                                       "sstar-fsp.xiu", s->size, errp)) {
-        goto fail;
+        /* Reads straight from the array; writes trap. */
+        if (!memory_region_init_rom_device(&s->xiu, OBJECT(s), &xiu_ops, s,
+                                           "sstar-fsp.xiu", s->size, errp)) {
+            goto fail;
+        }
+        s->array = memory_region_get_ram_ptr(&s->xiu);
     }
-    s->array = memory_region_get_ram_ptr(&s->xiu);
     memset(s->array, 0xFF, s->size);
     if (s->fd >= 0) {
         got = pread(s->fd, s->array, s->size, 0);
@@ -750,16 +1035,29 @@ static const Property sstar_fsp_props[] = {
     DEFINE_PROP_UINT32("size", SstarFspState, size, 16 * MiB),
     /* the Ifado/Iford-generation FSP-QSPI: software chip select */
     DEFINE_PROP_BOOL("sw-cs", SstarFspState, sw_cs, false),
+    /* the FSP-QSPI driver writes the "outside" size as the count + 1 */
+    DEFINE_PROP_BOOL("out-plus-one", SstarFspState, out_plus_one, false),
+    /* a SPI NAND in place of the NOR; 128 MiB unless the file says more */
+    DEFINE_PROP_BOOL("nand", SstarFspState, nand, false),
+    DEFINE_PROP_UINT32("nand-id", SstarFspState, nand_id, 0xC8F1),
+    DEFINE_PROP_UINT32("page-size", SstarFspState, page_size, 2048),
+    DEFINE_PROP_UINT32("spare-size", SstarFspState, spare_size, 64),
+    DEFINE_PROP_UINT32("block-pages", SstarFspState, block_pages, 64),
+    DEFINE_PROP_UINT32("ecc-flip-page", SstarFspState, ecc_flip_page,
+                       UINT32_MAX),
+    DEFINE_PROP_UINT32("ecc-err-page", SstarFspState, ecc_err_page,
+                       UINT32_MAX),
+    DEFINE_PROP_UINT32("fail-block", SstarFspState, fail_block, UINT32_MAX),
 };
 
 /*
- * The flash array is the XIU ROM device's RAM, which migrates by itself;
- * a file-backed flash blocks migration.
+ * The NOR array is the XIU ROM device's RAM, which migrates by itself; a
+ * file-backed flash or a NAND array blocks migration.
  */
 static const VMStateDescription vmstate_sstar_fsp = {
     .name = TYPE_SSTAR_FSP,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(isp, SstarFspState, 0x80),
         VMSTATE_UINT16_ARRAY(fsp, SstarFspState, 0x80),

@@ -38,10 +38,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIspState, SSTAR_ISP)
 #define ISP_REGS            0x80
 #define INT_BASE            0x28        /* reg index of group 0's mask */
 #define INT_GROUPS          7
-#define INT_MASK(g)         (INT_BASE + 4 * (g))
-#define INT_FORCE(g)        (INT_BASE + 4 * (g) + 1)
-#define INT_CLEAR(g)        (INT_BASE + 4 * (g) + 2)
-#define INT_STATUS(g)       (INT_BASE + 4 * (g) + 3)
+#define INT_BASE_OF(s, g)   ((s)->i6_layout ? i6_group_base[g] : \
+                             INT_BASE + 4 * (g))
+#define INT_MASK(g)         INT_BASE_OF(s, g)
+#define INT_FORCE(g)        (INT_BASE_OF(s, g) + 1)
+#define INT_CLEAR(g)        (INT_BASE_OF(s, g) + 2)
+#define INT_STATUS(g)       (INT_BASE_OF(s, g) + 3)
+
+/* infinity6's groups are not contiguous: its HalIspGetIntStatus1..5 */
+static const uint8_t i6_group_base[5] = { 0x28, 0x56, 0x4A, 0x5B, 0x2D };
 
 struct SstarIspState {
     SysBusDevice parent_obj;
@@ -56,14 +61,21 @@ struct SstarIspState {
     uint32_t fps;
     uint32_t events[INT_GROUPS];    /* bits raised each frame, per group */
     bool trace;
+    bool gated;
+    uint32_t groups;            /* infinity6e has 5, HalIspGetIntStatus1-5 */
+    bool i6_layout;
 };
 
-static int isp_group(int reg)
+static int isp_group(SstarIspState *s, int reg)
 {
-    if (reg < INT_BASE || reg >= INT_BASE + 4 * INT_GROUPS) {
-        return -1;
+    int g;
+
+    for (g = 0; g < s->groups; g++) {
+        if (reg >= INT_MASK(g) && reg <= INT_STATUS(g)) {
+            return g;
+        }
     }
-    return (reg - INT_BASE) / 4;
+    return -1;
 }
 
 static void sstar_isp_update_irq(SstarIspState *s)
@@ -71,7 +83,7 @@ static void sstar_isp_update_irq(SstarIspState *s)
     int g;
     bool level = false;
 
-    for (g = 0; g < INT_GROUPS; g++) {
+    for (g = 0; g < s->groups; g++) {
         level |= !!(s->regs[INT_STATUS(g)] & ~s->regs[INT_MASK(g)]);
     }
     qemu_set_irq(s->irq, level);
@@ -81,7 +93,12 @@ static bool sstar_isp_streaming(SstarIspState *s)
 {
     int g;
 
-    for (g = 0; g < INT_GROUPS; g++) {
+    /* infinity6e: ISP_EnableISP, reg 0x00 bits 1:0 */
+    if (s->gated && !(s->regs[0] & 3)) {
+        return false;
+    }
+
+    for (g = 0; g < s->groups; g++) {
         if (s->events[g] & ~s->regs[INT_MASK(g)]) {
             return true;
         }
@@ -105,7 +122,7 @@ static void sstar_isp_frame(void *opaque)
 
     s->frames++;
     qemu_irq_pulse(s->frame_out);
-    for (g = 0; g < INT_GROUPS; g++) {
+    for (g = 0; g < s->groups; g++) {
         s->regs[INT_STATUS(g)] |= s->events[g];
     }
     if (s->trace) {
@@ -136,7 +153,7 @@ static void sstar_isp_write(void *opaque, hwaddr off, uint64_t val,
 {
     SstarIspState *s = opaque;
     int reg = (off >> 2) & (ISP_REGS - 1);
-    int g = isp_group(reg);
+    int g = isp_group(s, reg);
     uint16_t mask, v;
 
     if ((off & 3) >= 2) {
@@ -164,8 +181,8 @@ static void sstar_isp_write(void *opaque, hwaddr off, uint64_t val,
             s->regs[INT_STATUS(g)] |= v & mask;
         }
         sstar_isp_update_irq(s);
-        sstar_isp_schedule(s);
     }
+    sstar_isp_schedule(s);
 }
 
 static const MemoryRegionOps sstar_isp_ops = {
@@ -184,7 +201,7 @@ static void sstar_isp_reset(DeviceState *dev)
     int g;
 
     memset(s->regs, 0, sizeof(s->regs));
-    for (g = 0; g < INT_GROUPS; g++) {
+    for (g = 0; g < s->groups; g++) {
         s->regs[INT_MASK(g)] = 0xFFFF;
     }
     s->frames = 0;
@@ -225,6 +242,9 @@ static const Property sstar_isp_props[] = {
     DEFINE_PROP_UINT32("events5", SstarIspState, events[5], 0),
     DEFINE_PROP_UINT32("events6", SstarIspState, events[6], 0),
     DEFINE_PROP_BOOL("trace", SstarIspState, trace, false),
+    DEFINE_PROP_BOOL("gated", SstarIspState, gated, false),
+    DEFINE_PROP_BOOL("i6-layout", SstarIspState, i6_layout, false),
+    DEFINE_PROP_UINT32("groups", SstarIspState, groups, INT_GROUPS),
 };
 
 static const VMStateDescription vmstate_sstar_isp = {

@@ -106,6 +106,7 @@ cp qemu/include/hw/arm/sigmastar.h  "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/sstar-riu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-riu.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/sstar-xzdec.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/sstar-i6e-scl.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/sstar-iford-isp.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/intc/sstar-intc.c        "$QEMU_DIR/hw/intc/"
 cp qemu/hw/timer/sstar-timer.c      "$QEMU_DIR/hw/timer/"
@@ -127,8 +128,12 @@ cp qemu/include/hw/misc/sstar-i3-isp.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/sstar-i3-scl.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-pattern.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/sstar-mfe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-mhe.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-i3-jpe.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-vhe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-wave5.c       "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-ive.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-i6e-scl.c     "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-jpeg.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/sstar-cabac.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/i2c/sstar-i2c.c          "$QEMU_DIR/hw/i2c/"
@@ -369,6 +374,11 @@ if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q USB
     sed -i '/^config XIONGMAI$/,/^$/ s/^    select XM_DWMAC$/    select XM_DWMAC\n    select USB_DWC2/' \
         "$QEMU_DIR/hw/arm/Kconfig"
     echo "  hw/arm/Kconfig: XIONGMAI selects USB_DWC2"
+fi
+if ! grep -q sstar-wave5 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-wave5.c', 'sstar-mhe.c', 'sstar-ive.c', 'sstar-i6e-scl.c', 'hevc-enc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added sstar-wave5.c"
 fi
 if ! grep -q xm-sfc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sfc.c'))" \
@@ -634,7 +644,7 @@ else
         fi
     done
 fi
-for f in rtc/sstar-rtcpwc i2c/os04d10 misc/sstar-iford-scl misc/sstar-iford-isp misc/sstar-riu misc/sstar-xzdec misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+for f in rtc/sstar-rtcpwc i2c/os04d10 misc/sstar-iford-scl misc/sstar-iford-isp misc/sstar-riu misc/sstar-xzdec misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-mhe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-wave5 misc/sstar-ive misc/sstar-i6e-scl misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

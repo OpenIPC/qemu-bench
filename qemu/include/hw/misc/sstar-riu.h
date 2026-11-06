@@ -41,6 +41,14 @@ struct SstarRiuState {
     bool smf_ack;               /* Ifado: bank 0x1121 handshake */
     bool infinity3;
     bool iford;                 /* Iford status bits (FCIE, DRAM test) */
+    bool miu_bist;              /* the IPL's MIU BIST writes its pattern */
+    bool fcie_ack;              /* bank 0x1413's FCIE soft reset, as on Iford */
+    bool miu_mmu;
+    bool i6e_mmu;               /* the MIU MMU in bank 0x1013 */
+    uint16_t phy_bank;          /* ALBANY0 at another bank than 0x0031 */
+    uint32_t pad_addr[2];       /* input pads: the bits under mask read level */
+    uint16_t pad_mask[2];
+    uint16_t pad_level[2];
     uint16_t mmu[4096];         /* Iford's MIU MMU */
     uint16_t gpio_bank;         /* Ifado PADTOP GPIO: input levels */
     uint64_t uuid;              /* OTP2 0x7C-0x7F, the die's unique ID */
@@ -60,5 +68,6 @@ void sstar_riu_add_defaults(SstarRiuState *s, const SstarRegDefault *table);
 
 /* Iford's MIU MMU: a bus master's address as MIU sees it; else unchanged */
 uint64_t sstar_miu_xlate(uint64_t addr);
+bool sstar_miu_missed(uint64_t addr);
 
 #endif /* HW_MISC_SSTAR_RIU_H */

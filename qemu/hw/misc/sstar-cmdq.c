@@ -58,7 +58,7 @@
 #define TYPE_SSTAR_CMDQ "sstar-cmdq"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarCmdqState, SSTAR_CMDQ)
 
-#define CMDQ_ENGINES        8        /* Iford; Ifado maps four */
+#define CMDQ_ENGINES        12       /* infinity6c; Iford 8, Ifado 4 */
 #define CMDQ_REGS           0x80
 
 /* register indices (byte offset / 4) */
@@ -80,7 +80,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarCmdqState, SSTAR_CMDQ)
 #define R_MASK_I3           0x47
 #define R_CLEAR_LO          0x48
 
-#define STATUS_HI_IDLE      (3u << 11)  /* bits 27, 28 of the word */
+/*
+ * Idle, in the status's high half: bits 27 and 28 of the word on Ifado, and
+ * only bit 27 on infinity6c, where HAL_SCL_UTILITY_RegFire takes bit 28, in
+ * 0x1700 of the high half, for a queue still busy or in error.
+ */
+#define STATUS_HI_IDLE      (3u << 11)
 #define SW_INT(n)           (1u << (n))     /* a guess; see the ISR */
 #define I3_STATE_TRIG       (1u << 0)
 #define I3_STATE_DONE       (1u << 2)
@@ -110,6 +115,7 @@ struct SstarCmdqState {
     SstarCmdqEngine eng[CMDQ_ENGINES];
     bool trace;
     bool infinity3;
+    uint32_t idle_bits;
 };
 
 static uint32_t eng32(SstarCmdqEngine *e, int lo)
@@ -317,7 +323,7 @@ static uint64_t sstar_cmdq_read(void *opaque, hwaddr off, unsigned size)
     }
     v = e->regs[reg];
     if (reg == R_STATUS_HI) {
-        v |= STATUS_HI_IDLE;
+        v |= b->s->idle_bits;
     }
     if (off & 1) {
         return v >> 8;
@@ -431,6 +437,7 @@ static void sstar_cmdq_init(Object *obj)
 
 static const Property sstar_cmdq_props[] = {
     DEFINE_PROP_BOOL("trace", SstarCmdqState, trace, false),
+    DEFINE_PROP_UINT32("idle-bits", SstarCmdqState, idle_bits, STATUS_HI_IDLE),
     DEFINE_PROP_BOOL("infinity3", SstarCmdqState, infinity3, false),
 };
 

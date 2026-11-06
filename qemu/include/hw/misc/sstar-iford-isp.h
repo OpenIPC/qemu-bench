@@ -13,6 +13,9 @@
 
 #define TYPE_SSTAR_IFORD_ISP "sstar-iford-isp"
 
+/* One frame through the pipe, for an owner with no "frame" input wired. */
+void sstar_iford_isp_frame(Object *isp);
+
 /*
  * The ISP's last picture, 8-bit NV12 at half the sensor's window.  @y has
  * *w x *h bytes, @uv *w x *h / 2.  The pointers hold until the next frame.
