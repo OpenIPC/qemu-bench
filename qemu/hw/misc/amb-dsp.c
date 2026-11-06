@@ -232,13 +232,19 @@ static void amb_dsp_tick(void *opaque)
         }
     }
 
-    /* General and vcap ports are the two 4 KiB halves of each buffer. */
+    /*
+     * General and vcap ports are the two 4 KiB halves of each buffer.  The
+     * driver flushes its queued commands into the command buffer and reads
+     * our replies only from inside the vcap/vdsp interrupt handler, so the
+     * interrupt has to keep ticking for the command handshake to run at all --
+     * it is the DSP's heartbeat, not an event we can gate on a command we have
+     * not been handed yet.
+     */
     seq_gen = amb_dsp_service_port(s, cmd, 0);
     seq_vcap = amb_dsp_service_port(s, cmd + DSP_PORT_SIZE, 1);
     amb_dsp_reply(s, msg, seq_gen);
     amb_dsp_reply(s, msg + DSP_PORT_SIZE, seq_vcap);
 
-    /* The driver's vdsp/vcap handlers drain the message ports. */
     qemu_irq_pulse(s->vdsp_irq);
     qemu_irq_pulse(s->vcap_irq);
 
