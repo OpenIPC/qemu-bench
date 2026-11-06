@@ -29,7 +29,7 @@ Builds three QEMU targets:
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (110 total)
+## Supported Machines (107 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
