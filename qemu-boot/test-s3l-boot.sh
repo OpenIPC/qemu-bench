@@ -48,7 +48,14 @@ done
 cp "$pkg"/kmod/*.ko "$kdir/ambarella/"
 install -m 755 "$pkg/script/load_ambarella" "$root/usr/bin/"
 install -m 755 "$IPCTOOL/ipctool" "$IPCTOOL/ipcinfo" "$root/usr/bin/"
-printf '#!/bin/sh\nexit 1\n' > "$root/usr/bin/fw_printenv"
+# The environment: sensor= when the kernel command line asks for it
+cat > "$root/usr/bin/fw_printenv" <<'ENV'
+#!/bin/sh
+case "$(cat /proc/cmdline)" in
+*s3l.env_sensor*) [ "$2" = sensor ] && echo ov4689 && exit 0 ;;
+esac
+exit 1
+ENV
 chmod +x "$root/usr/bin/fw_printenv"
 /usr/sbin/depmod -b "$root" 3.10.104 2>/dev/null
 
@@ -135,11 +142,11 @@ case "$(cat /proc/cmdline)" in
     sleep 1000
     ;;
 esac
-echo "### ipctool"
-ipctool
 echo "### load"
 load_ambarella -i
 echo "### first rc=$?"
+echo "### ipctool"
+ipctool
 echo "### modules"
 awk '{print $1}' /proc/modules | tr '\n' ' '
 echo
@@ -181,8 +188,9 @@ boot() {    # log machine-options extra-cmdline
     wait "$pid" 2>/dev/null
 }
 
-# First as the camera is: the sensor held in reset, until load_ambarella reads
-# the pin from the device tree.  The rest runs on a board with no reset line.
+# First as the camera is, with nothing in the environment: the sensor held in
+# reset until load_ambarella reads the pin from the device tree.  Then with
+# sensor= set, so nothing probes and the real driver releases the line.
 log=$work/held.log
 boot "$log" "" s3l.held
 
@@ -215,9 +223,9 @@ absent 'no sensor complaint' 'none detected'
 absent 'no oops' 'Oops|Kernel panic|Unable to handle'
 cp "$log" "$work/held.keep"
 
-echo 'with no reset line:'
+echo 'with sensor= in the environment:'
 log=$work/console.log
-boot "$log" ",sensor-reset=off" ""
+boot "$log" "" s3l.env_sensor
 
 want 'the guest reached the end' '^### end'
 want 'vendor' 'vendor: Ambarella'

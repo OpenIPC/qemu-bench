@@ -58,7 +58,9 @@ that have `/proc/device-tree`. Stock Dahua firmware has neither that nor this
 node in flash, and ipctool falls back to the boot log there; this machine does
 not reproduce that path.
 
-**The device tree has two nodes nothing obviously needs.** The UART driver
+**The device tree has three nodes nothing obviously needs.** A sensor driver
+binds to `ambvin0@01` under I2C0: without it the module loads and silently never
+probes, so it never releases the sensor's reset. The UART driver
 refuses to probe with no default pin state, so `pinctrl-0` is present and
 empty. `iav.ko` calls `of_get_child_by_name()` on `/iav` without checking it
 exists, so `/iav/vinc0` is needed or `modprobe iav` oopses.
@@ -66,9 +68,11 @@ exists, so `/iav/vinc0` is needed or `modprobe iav` oopses.
 **The sensor starts in reset.** On the IP4M-1026E, XSHUTDN is GPIO 107, active
 low, and a pad nobody drives holds it. So does this machine: until GPIO 107 is
 an output driven high, I2C0 acknowledges nothing, which is why a probe at boot
-finds no sensor. `iav.ko` only drives the line when a VIN mode is set, and that
-is after anything would have probed, so the firmware's `load_ambarella` reads
-`/iav/vinc0/vinrst-gpios` and releases it first. The pin is board data: a
+finds no sensor. Loading a sensor driver releases it and removing one holds it
+again, so the probe that would say which driver to load cannot work without
+that driver. The firmware's `load_ambarella` gets round this two ways: `sensor`
+in the environment skips the probe, and otherwise it reads
+`/iav/vinc0/vinrst-gpios` and releases the line itself. The pin is board data: a
 Hikvision DS-2CD2423G0-I has GPIO 39. The flag is the level `iav.ko` resets with,
 so 0 means held low, whatever `OF_GPIO_ACTIVE_LOW` suggests. The whole bus goes
 quiet, not just the one address, because the sensor is all that is on it here.
@@ -91,7 +95,8 @@ the models over qtest the way the kernel does.
 `qemu-boot/test-s3l-boot.sh` boots twice. The first boot is the camera as it
 is: nothing answers on I2C, driving GPIO 107 high from sysfs makes `ipcinfo -s`
 find the sensor, and `load_ambarella` releases it by itself from the device
-tree. The second uses `sensor-reset=off` and checks what the camera in
+tree. The second sets `sensor=ov4689` in the environment, so nothing probes and
+the real driver releases the line on loading, then checks what the camera in
 [ipctool#266](https://github.com/OpenIPC/ipctool/issues/266) reported: `ipctool`
 says Ambarella S3L, 512M total, 392M media and an OV4689 at 0x6c on bus 0;
 `load_ambarella` loads `iav` and the sensor through `modules.dep`, makes

@@ -195,8 +195,8 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
                            ms->ram_size - AMB_IAVMEM_BASE);
 
     /* iav.ko dereferences /iav/vinc0 without checking.  It takes the
-     * VIN's reset from here, and drives it when a mode is set: with the
-     * flag as the reset level, so 0 holds it low. */
+     * VIN's reset from here, and a sensor driver releases it on loading:
+     * the flag is the reset level, so 0 holds it low. */
     qemu_fdt_add_subnode(fdt, "/iav");
     qemu_fdt_setprop_string(fdt, "/iav", "compatible", "ambarella,iav");
     qemu_fdt_add_subnode(fdt, "/iav/vinc0");
@@ -300,6 +300,16 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
         amb_fdt_irq(fdt, p, amb_idc[i].irq, AMB_DT_LEVEL_HIGH);
         qemu_fdt_setprop_cell(fdt, p, "clock-frequency", 100000);
         qemu_fdt_setprop_cell(fdt, p, "amb,i2c-class", 0x81);
+        if (i == 0) {
+            /* What a sensor driver binds to, which is what releases its
+             * reset.  The address is overwritten at run time. */
+            g_autofree char *vin = g_strdup_printf("%s/ambvin0@01", p);
+
+            qemu_fdt_add_subnode(fdt, vin);
+            qemu_fdt_setprop_string(fdt, vin, "compatible",
+                                    "ambarella,ambvin");
+            qemu_fdt_setprop_cell(fdt, vin, "reg", 1);
+        }
     }
 
     qemu_fdt_add_subnode(fdt, "/l2-cache@f0002000");
