@@ -32,6 +32,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbRctState, AMB_RCT)
 
 #define AMB_RCT_SIZE    0x1000
 #define R_PLL_CORE      0x000
+#define R_PLL_AUDIO     0x054    /* PLL_AUDIO_CTRL */
+#define R_PLL_AUDIO_FRAC 0x058
+#define R_SCALER_AUDIO_POST 0x05c
+#define R_SCALER_AUDIO_PRE  0x060
 #define R_PLL_LOCK      0x02c
 #define R_SYS_CONFIG    0x034
 #define R_CG_UART       0x038
@@ -118,6 +122,20 @@ static void amb_rct_reset(DeviceState *dev)
     s->regs[R_PLL_CORTEX / 4] = PLL(34, 1);     /* 816 MHz */
     s->regs[R_PLL_DDR / 4] = PLL(70, 1);        /* gclk_ddr is half: 840 MHz */
     s->regs[R_PLL_IDSP / 4] = PLL(29, 2);       /* 348 MHz */
+
+    /*
+     * gclk_audio = 12.288 MHz, which iav's audio setup requires (24.576 MHz
+     * VCO, post-scaled by 2).  It is a fractional PLL: the kernel reads
+     * rate = ref * intp * sdiv * (1 + frac/2^32) / (pre * sout * post) with
+     * intp = sdiv = sout = 1, pre = 1, post = 2 (the S3L post scaler holds
+     * (reg>>4)+1), and frac = round(0.024 * 2^32) tops the 24 MHz reference
+     * up to 24.576 MHz.  Reset values alone, so no boot-time clk_set_rate.
+     */
+    s->regs[R_PLL_AUDIO / 4] = 1u << 3;         /* frac_mode, intp/sdiv/sout 0 */
+    s->regs[R_PLL_AUDIO_FRAC / 4] = 103079216u; /* +0.024 * 2^32, positive */
+    s->regs[R_SCALER_AUDIO_POST / 4] = 0x10;    /* post scaler = (0x10>>4)+1 = 2 */
+    s->regs[R_SCALER_AUDIO_PRE / 4] = 0;        /* pre scaler = 1 */
+
     s->regs[R_CG_UART / 4] = 1;                 /* the 24 MHz reference */
     s->regs[R_SOFT_RESET / 4] = 3;
     s->regs[R_SYS_CONFIG / 4] = s->sys_config;
