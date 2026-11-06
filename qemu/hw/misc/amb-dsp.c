@@ -99,6 +99,8 @@ struct AmbDspState {
 
     bool chip_written;
     uint32_t op_mode;           /* what we report back to the driver */
+    uint32_t boot_ticks;        /* heartbeats since reset */
+    bool mode_commanded;        /* set once the driver asks for a mode */
     uint32_t last_seq[2];       /* last command seq seen per port (debug) */
     bool debug;
     bool init_dumped;
@@ -163,6 +165,7 @@ static uint32_t amb_dsp_service_port(AmbDspState *s, hwaddr cmd_port, int port)
             uint32_t m = amb_dsp_ld(c + 4) & 0xff;
             if (m == DSP_OP_MODE_CAMERA_RECORD || m == DSP_OP_MODE_IDLE) {
                 s->op_mode = m;
+                s->mode_commanded = true;
             }
         }
     }
@@ -203,6 +206,18 @@ static void amb_dsp_tick(void *opaque)
         s->chip_written = true;
     }
 
+    /*
+     * The real DSP reports INIT (255) once while the microcode boots, then
+     * drops to IDLE.  Mirror that: hold INIT for the first few heartbeats so
+     * the driver sees the part come up, then report IDLE unless it has asked
+     * for a specific mode -- otherwise iav never leaves its own INIT state and
+     * never allocates the default resources a client queries.
+     */
+    if (!s->mode_commanded && s->op_mode == DSP_OP_MODE_INIT &&
+        ++s->boot_ticks >= 3) {
+        s->op_mode = DSP_OP_MODE_IDLE;
+    }
+
     if (s->debug && !s->init_dumped) {
         hwaddr id = amb_dsp_ucode(s) + DSP_INIT_DATA_OFFSET;
         if (amb_dsp_ld(id + INIT_DEFBIN_ADDR)) {
@@ -238,6 +253,8 @@ static void amb_dsp_reset(DeviceState *dev)
 
     s->chip_written = false;
     s->op_mode = DSP_OP_MODE_INIT;
+    s->boot_ticks = 0;
+    s->mode_commanded = false;
     s->last_seq[0] = s->last_seq[1] = 0;
     timer_mod(&s->heartbeat,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
