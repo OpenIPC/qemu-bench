@@ -39,7 +39,7 @@ pkg=$FIRMWARE/general/package/legacy/ambarella-osdrv-s3l/files
 mkdir -p "$root"/{bin,sbin,usr/bin,proc,sys,dev,tmp,lib} "$kdir/ambarella"
 cp "$TARGET/bin/busybox" "$root/bin/"
 cp -L "$TARGET/lib/ld-musl-arm.so.1" "$TARGET/lib/libc.so" "$root/lib/"
-for a in sh mount ls cat grep awk tr logger sleep mknod echo; do
+for a in sh mount ls cat grep awk tr logger sleep mknod echo od; do
     ln -s busybox "$root/bin/$a"
 done
 for a in modprobe insmod; do
@@ -126,6 +126,7 @@ case "$(cat /proc/cmdline)" in
     echo 0 > $g/value
     echo "### low ipcinfo=[$(ipcinfo -s 2>/dev/null)]"
     echo 107 > /sys/class/gpio/unexport
+    # Finds the pin in the device tree and releases it
     load_ambarella -i
     echo "### held load rc=$?"
     awk '{print $1}' /proc/modules | tr '\n' ' '
@@ -180,9 +181,8 @@ boot() {    # log machine-options extra-cmdline
     wait "$pid" 2>/dev/null
 }
 
-# First as the camera is: what ipcinfo and load_ambarella see with the sensor
-# held in reset.  The checks on load_ambarella below this are a board with no
-# reset line, because nothing in the firmware releases GPIO 107 at boot yet.
+# First as the camera is: the sensor held in reset, until load_ambarella reads
+# the pin from the device tree.  The rest runs on a board with no reset line.
 log=$work/held.log
 boot "$log" "" s3l.held
 
@@ -209,10 +209,9 @@ want 'the guest reached the end' '^### end'
 want 'held: nothing answers' '^### held ipcinfo=\[\]'
 want 'GPIO 107 high: the sensor answers' '^### released ipcinfo=\[ov4689\]'
 want 'GPIO 107 low: gone again' '^### low ipcinfo=\[\]'
-want 'load_ambarella finds no sensor, as on the board' \
-    'No sensor in the environment and none detected'
-want 'and the drivers still come up' '^iav .*dsp'
-absent 'no sensor driver was loaded' 'ov4689_mipi'
+want 'load_ambarella releases it from the device tree' \
+    '^ov4689_mipi .*iav .*dsp'
+absent 'no sensor complaint' 'none detected'
 absent 'no oops' 'Oops|Kernel panic|Unable to handle'
 cp "$log" "$work/held.keep"
 

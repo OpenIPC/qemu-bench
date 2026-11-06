@@ -67,7 +67,6 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_L2_BASE         0xf0002000
 
 #define AMB_GPIO_XSHUTDN    107
-#define AMB_DT_GPIO_ACTIVE_LOW 1
 
 #define AMB_IRQ_TIMER7      6
 #define AMB_IRQ_GPIO3       49
@@ -196,13 +195,14 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
                            ms->ram_size - AMB_IAVMEM_BASE);
 
     /* iav.ko dereferences /iav/vinc0 without checking.  It takes the
-     * VIN's reset from here, and drives it when a mode is set. */
+     * VIN's reset from here, and drives it when a mode is set: with the
+     * flag as the reset level, so 0 holds it low. */
     qemu_fdt_add_subnode(fdt, "/iav");
     qemu_fdt_setprop_string(fdt, "/iav", "compatible", "ambarella,iav");
     qemu_fdt_add_subnode(fdt, "/iav/vinc0");
     if (!ams->no_sensor_reset) {
         qemu_fdt_setprop_cells(fdt, "/iav/vinc0", "vinrst-gpios", gpio,
-                               AMB_GPIO_XSHUTDN, AMB_DT_GPIO_ACTIVE_LOW);
+                               AMB_GPIO_XSHUTDN, 0);
     }
 
     qemu_fdt_add_subnode(fdt, "/cpus");

@@ -67,9 +67,11 @@ exists, so `/iav/vinc0` is needed or `modprobe iav` oopses.
 low, and a pad nobody drives holds it. So does this machine: until GPIO 107 is
 an output driven high, I2C0 acknowledges nothing, which is why a probe at boot
 finds no sensor. `iav.ko` only drives the line when a VIN mode is set, and that
-is after anything would have probed. The device tree says so in
-`/iav/vinc0/vinrst-gpios`. The whole bus goes quiet, not just the one address,
-because the sensor is all that is on it here.
+is after anything would have probed, so the firmware's `load_ambarella` reads
+`/iav/vinc0/vinrst-gpios` and releases it first. The pin is board data: a
+Hikvision DS-2CD2423G0-I has GPIO 39. The flag is the level `iav.ko` resets with,
+so 0 means held low, whatever `OF_GPIO_ACTIVE_LOW` suggests. The whole bus goes
+quiet, not just the one address, because the sensor is all that is on it here.
 
 **PLL rates are read back.** The kernel derives every clock from the RCT words,
 so these reset to the rates `/proc/ambarella/clock` shows on the camera. Note
@@ -87,10 +89,9 @@ silicon: `RELOAD` 0 is the reset value, and 11 ns ticks only spin the host.
 the models over qtest the way the kernel does.
 
 `qemu-boot/test-s3l-boot.sh` boots twice. The first boot is the camera as it
-is: nothing answers on I2C, `load_ambarella` finds no sensor, and driving GPIO
-107 high from sysfs makes `ipcinfo -s` find it. The second uses
-`sensor-reset=off`, because nothing in the firmware releases that line at boot
-yet, and checks what the camera in
+is: nothing answers on I2C, driving GPIO 107 high from sysfs makes `ipcinfo -s`
+find the sensor, and `load_ambarella` releases it by itself from the device
+tree. The second uses `sensor-reset=off` and checks what the camera in
 [ipctool#266](https://github.com/OpenIPC/ipctool/issues/266) reported: `ipctool`
 says Ambarella S3L, 512M total, 392M media and an OV4689 at 0x6c on bus 0;
 `load_ambarella` loads `iav` and the sensor through `modules.dep`, makes
