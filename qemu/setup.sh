@@ -499,10 +499,12 @@ config AMBARELLA
     select A9MPCORE
     select PL310
     select I2C
+    select SDHCI
+    select XM_DWMAC
 KCONFIG
     echo "  hw/arm/Kconfig: added AMBARELLA"
 fi
-for f in amb-vic amb-timer amb-rct amb-gpio; do
+for f in amb-vic amb-timer amb-rct amb-gpio amb-nand; do
     if ! grep -q "'$f.c'" "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('$f.c'))" \
             >> "$QEMU_DIR/hw/misc/meson.build"
