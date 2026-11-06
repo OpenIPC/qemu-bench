@@ -245,7 +245,7 @@ was at hand.
 | `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
 | `msc316dc`, `msc316dm` | Cortex-A7, 128 MB in package | GIC + main-intc | — | U-Boot, the IPL's own DDR set-up |
 | `ssc029` | Cortex-A32 ×2 (run as A7), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
-| `ssc325`, `ssc33x`, `ssc30kx`, `ssc338q`, `ssc37x`, `ssc378x` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
+| `ssc325`, `ssc325de`, `ssc333`, `ssc335`, `ssc335de`, `ssc337`, `ssc337de`, `ssc30kd`, `ssc30kq`, `ssc338q`, `ssc377`, `ssc377d`, `ssc377de`, `ssc377qe`, `ssc378de`, `ssc378qe` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
 
 SigmaStar's (formerly MStar's) infinity2m, infinity3, Iford and infinity6 family dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An

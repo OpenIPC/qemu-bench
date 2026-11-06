@@ -205,7 +205,15 @@ static void jpe_mem(SstarI3JpeState *s, uint32_t miu, void *buf, size_t len,
 
 static bool jpe_in_dram(SstarI3JpeState *s, uint32_t miu, uint64_t len)
 {
-    return s->i6_irq || (uint64_t)miu + len <= s->dram_size;
+    uint64_t last = (uint64_t)miu + MAX(len, 1) - 1;
+
+    if (!s->i6_irq) {
+        return (uint64_t)miu + len <= s->dram_size;
+    }
+    /* through the MIU MMU, so past dram_size can still be DRAM */
+    return !sstar_miu_missed(miu) && !sstar_miu_missed(last) &&
+           sstar_miu_xlate(miu) < s->dram_size &&
+           sstar_miu_xlate(last) < s->dram_size;
 }
 
 /*
@@ -243,7 +251,7 @@ static void jpe_load(SstarI3JpeState *s, JpePic *pic, int w, int h,
         ypitch *= 2;                /* YUYV: two bytes a pixel */
     }
 
-    if (s->i6_irq && !yuv422) {
+    if (s->i6_irq && !yuv422 && w >= 2) {
         g_autofree uint8_t *ry = g_malloc((size_t)w * h);
         g_autofree uint8_t *ruv = g_malloc((size_t)w * (h / 2));
 
@@ -603,8 +611,8 @@ static const Property sstar_i3_jpe_props[] = {
 
 static const VMStateDescription vmstate_sstar_i3_jpe = {
     .name = TYPE_SSTAR_I3_JPE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, SstarI3JpeState, JPE_REGS),
         VMSTATE_UINT8(raw, SstarI3JpeState),
@@ -612,6 +620,7 @@ static const VMStateDescription vmstate_sstar_i3_jpe = {
         VMSTATE_UINT32_ARRAY(obuf, SstarI3JpeState, 4),
         VMSTATE_UINT32(frames, SstarI3JpeState),
         VMSTATE_TIMER_PTR(timer, SstarI3JpeState),
+        VMSTATE_UINT16_ARRAY(fired, SstarI3JpeState, 4),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -86,8 +86,7 @@
  *
  * 0x01 and 0x02 [11:0] here hold the record the driver finishes a frame
  * from (MIU address >> 4), which _EncDone() and _OpsCheckStatus() read: +0
- * and +2 the bit count, +0xBE bit 0 done, +0xB8/+0xBA the cycles, +0xC2/+0xC4
- * the qstep sum, +0xD0-+0xD6 where the reconstruction ended (bytes / 2 in two
+ * and +2 the bit count, +0xBE bit 0 done, +0xD0-+0xD6 where the reconstruction ended (bytes / 2 in two
  * registers, 16-byte aligned), which _PutData() checks against the rings at
  * 0x1329 0x58-0x5B.  It clears the record itself each frame.  0x39 bit 4 is
  * set for an I frame, where 0x00 [5:4] was: every slice header of a 855-frame
@@ -1109,8 +1108,7 @@ static void mfe_dump(SstarMfeState *s, int w, int h, const uint8_t *data,
 static void mfe_new_frame(SstarMfeState *s);
 
 /* The record infinity6's driver takes the finished frame from */
-static void i6_record(SstarMfeState *s, uint32_t bits, uint32_t ylen,
-                      uint32_t cycles, uint32_t qsteps)
+static void i6_record(SstarMfeState *s, uint32_t bits, uint32_t ylen)
 {
     uint32_t yend = (i6_reg32(s, I6_BANK_SRC, I6_REC_Y) + ylen) >> 1;
     uint32_t cend = (i6_reg32(s, I6_BANK_SRC, I6_REC_C) + ylen / 2) >> 1;
@@ -1119,11 +1117,7 @@ static void i6_record(SstarMfeState *s, uint32_t bits, uint32_t ylen,
 
     rec[0] = cpu_to_le16(bits & 0xFFFF);
     rec[1] = cpu_to_le16((bits >> 16) & 0xFF);
-    rec[0xB8 / 2] = cpu_to_le16(cycles & 0xFFFF);
-    rec[0xBA / 2] = cpu_to_le16((cycles >> 16) & 0xFF);
     rec[0xBE / 2] = cpu_to_le16(IRQ_DONE);
-    rec[0xC2 / 2] = cpu_to_le16((qsteps & 0xFF) << 8);
-    rec[0xC4 / 2] = cpu_to_le16((qsteps >> 8) & 0xFFFF);
     rec[0xD0 / 2] = cpu_to_le16(yend & 0xFFF0);
     rec[0xD2 / 2] = cpu_to_le16(yend >> 16);
     rec[0xD4 / 2] = cpu_to_le16(cend & 0xFFF0);
@@ -1253,7 +1247,7 @@ static void mfe_encode(void *opaque)
     s->regs[R_SUM_QSTEP_LO] = sum & 0xFFFF;
     s->regs[R_SUM_QSTEP_HI] = sum >> 16;
     if (s->riu) {
-        i6_record(s, len * 8, w * h, w * h / 256 * 200, sum);
+        i6_record(s, len * 8, w * h);
     }
     s->raw |= IRQ_DONE | (len < out->len ? IRQ_BUF_FULL : 0);
     if (s->trace) {
@@ -1400,6 +1394,7 @@ static const MemoryRegionOps mfe_ops = {
 static void sstar_mfe_reset(DeviceState *dev)
 {
     SstarMfeState *s = SSTAR_MFE(dev);
+    int i;
 
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[R_IRQ_MASK] = 0xFF;
@@ -1408,6 +1403,11 @@ static void sstar_mfe_reset(DeviceState *dev)
     s->started = false;
     mfe_new_frame(s);
     timer_del(s->timer);
+    for (i = 0; i < I6_REFS; i++) {
+        g_clear_pointer(&s->refs[i].y, g_free);
+        g_clear_pointer(&s->refs[i].c, g_free);
+    }
+    s->ref_next = 0;
     qemu_set_irq(s->irq, 0);
 }
 

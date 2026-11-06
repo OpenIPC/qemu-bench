@@ -25,8 +25,7 @@
  * header's NAL type.
  *
  * It finishes a frame from a 216-byte record: +8/+0xA the bit count, +0x10
- * bit 0 done, +0xC0/+0xC2 the cycles, +0xC8/+0xCA the qstep sum, +0xD0-+0xD6
- * where the reconstruction ended.  As with the MFE, CMDQ1 carries the job,
+ * bit 0 done, +0xD0-+0xD6 where the reconstruction ended.  As with the MFE, CMDQ1 carries the job,
  * waits and then forces frame done, and the CMDQ model does not hold on a
  * wait, so the frame is encoded inline at the last packer word.  The
  * reconstruction stays here, per stream, not in the driver's rings.
@@ -169,8 +168,7 @@ static int mhe_nal_type(SstarMheState *s)
     return -1;
 }
 
-static void mhe_record(SstarMheState *s, uint32_t bits, uint32_t ylen,
-                       uint32_t mbs)
+static void mhe_record(SstarMheState *s, uint32_t bits, uint32_t ylen)
 {
     uint32_t miu = mhe_rec_addr(s);
     uint32_t yend = (mhe_reg32(s, BANK_SRC, REC_Y) + ylen) >> 1;
@@ -183,8 +181,6 @@ static void mhe_record(SstarMheState *s, uint32_t bits, uint32_t ylen,
     rec[0x08 / 2] = cpu_to_le16(bits & 0xFFFF);
     rec[0x0A / 2] = cpu_to_le16(bits >> 16);
     rec[0x10 / 2] = cpu_to_le16(IRQ_DONE);
-    rec[0xC0 / 2] = cpu_to_le16(mbs * 200 & 0xFFFF);
-    rec[0xC2 / 2] = cpu_to_le16((mbs * 200 >> 16) & 0xFF);
     rec[0xD0 / 2] = cpu_to_le16(yend & 0xFFF0);
     rec[0xD2 / 2] = cpu_to_le16(yend >> 16);
     rec[0xD4 / 2] = cpu_to_le16(cend & 0xFFF0);
@@ -237,7 +233,7 @@ static void mhe_encode(SstarMheState *s)
     }
     s->regs[R_BITS_LO] = (len * 8) & 0xFFFF;
     s->regs[R_BITS_HI] = (len * 8) >> 16;
-    mhe_record(s, len * 8, w * h, w * h / 256);
+    mhe_record(s, len * 8, w * h);
     if (s->trace) {
         qemu_log("sstar-mhe: %c %dx%d nal %d qp %d src 0x%x hdr %u, %zu bytes "
                  "at 0x%x\n", p_slice ? 'P' : 'I', w, h, nal, qp, ya,
@@ -342,11 +338,19 @@ static const MemoryRegionOps mhe_ops = {
 static void sstar_mhe_reset(DeviceState *dev)
 {
     SstarMheState *s = SSTAR_MHE(dev);
+    int i;
 
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[R_IRQ_MASK] = 0xFF;
     s->raw = 0;
     s->hdr_len = s->hdr_words = 0;
+    for (i = 0; i < STREAMS; i++) {
+        if (s->streams[i].ref) {
+            hevc_enc_ref_free(s->streams[i].ref);
+            s->streams[i].ref = NULL;
+        }
+    }
+    s->stream_next = 0;
     qemu_set_irq(s->irq, 0);
 }
 

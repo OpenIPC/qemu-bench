@@ -54,6 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIveState, SSTAR_IVE)
 
 #define R1_OP           0x04
 #define R1_FMT          0x05
+#define IVE_MAX_DIM         8192
 #define R1_WIDTH        0x06
 #define R1_HEIGHT       0x07
 #define R1_SRC(n)       (0x08 + 4 * (n))
@@ -249,7 +250,8 @@ static uint8_t *csc_input(IveJob *j, int fmt, const uint8_t *y)
         for (px_ = 0; px_ < j->w * j->h; px_++) {
             int ly = px_ / j->w, row = fmt == FMT_420SP ? ly / 2 : ly;
 
-            x = (px_ % j->w) & ~1;
+            /* an odd width's last pixel shares the last pair */
+            x = MIN((px_ % j->w) & ~1, (j->w & ~1) - 2);
             rgb[px_ * 3] = y ? y[px_] : a[px_];
             rgb[px_ * 3 + 1] = b[row * (j->w & ~1) + x];
             rgb[px_ * 3 + 2] = b[row * (j->w & ~1) + x + 1];
@@ -603,7 +605,7 @@ static void do_sad(IveJob *j)
     SstarIveState *s = j->s;
     g_autofree uint8_t *a = luma_in(j);
     g_autofree uint8_t *b = plane_in(j, 1, j->w, j->h, 1);
-    int bs = 4 << j->mode, cols = j->w / bs, rows = j->h / bs;
+    int bs = 4 << MIN(j->mode, 2), cols = j->w / bs, rows = j->h / bs;
     int out = s->bank1[R1_FMT] >> 8, thresh = s->bank1[R1_THRESH1];
     int m = s->bank1[R1_MASK], x, y, c, r;
     g_autofree uint16_t *sad = g_new0(uint16_t, cols * rows);
@@ -696,6 +698,11 @@ static void ive_run(SstarIveState *s)
     int infmt = s->bank1[R1_FMT] & 0xFF, outfmt = s->bank1[R1_FMT] >> 8;
     uint32_t cycles = j->w * j->h;
 
+    /* the size registers reach 65536: past int's products below */
+    if (j->w < 2 || j->w > IVE_MAX_DIM || j->h > IVE_MAX_DIM) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-ive: picture %dx%d\n", j->w, j->h);
+        return;
+    }
     switch (j->op) {
     case OP_FILTER: {
         g_autofree uint8_t *src = luma_in(j);

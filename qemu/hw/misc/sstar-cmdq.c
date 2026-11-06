@@ -455,8 +455,8 @@ static const VMStateDescription vmstate_sstar_cmdq_engine = {
 
 static const VMStateDescription vmstate_sstar_cmdq = {
     .name = TYPE_SSTAR_CMDQ,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(eng, SstarCmdqState, CMDQ_ENGINES, 1,
                              vmstate_sstar_cmdq_engine, SstarCmdqEngine),

@@ -2492,6 +2492,16 @@ def test_i6e_media(qemu, tmp):
                   [w, (b >> 1) & 0x3F], [0x01000000, [32, 1, 32][f]])
         check('Wave5: a P picture of the same source is smaller',
               sizes[1] < sizes[0], True)
+        # strides narrower than the picture, and a stream buffer of 4 GiB
+        qt.writel(wave + 0x118, bs)
+        qt.writel(wave + 0x11C, 0xFFFFFFFF)
+        qt.writel(wave + 0x148, src)
+        qt.writel(wave + 0x14C, src + 64 * 64)
+        qt.writel(wave + 0x154, 1 << 16 | 1)
+        cmd(0x0100, 0x02)
+        qt.step(10 * 1000000)
+        check('Wave5: survives them', qt.proc.poll() is None, True)
+        cmd(0x4000, 0x02)
         # headers asked for mid-GOP, as mi_venc does, leave the stream alone
         mid = 2
         cmd(0x0008, 0, mid)
@@ -2641,6 +2651,20 @@ def test_i6_jpe(qemu, tmp):
         check('a reset after the start leaves the frame',
               qt.readw(jpe + 0x1E * 4) & 1, 1)
         check('and its source', qt.readw(jpe + 0x06 * 4), 0x1000)
+        # a source past DRAM, unmapped: the scaler's pattern, not wrapped DRAM
+        def scan(page):
+            qt.writew(jpe + 0x06 * 4, page & 0xFFFF)
+            qt.writew(jpe + 0x07 * 4, page >> 16)
+            qt.writew(jpe + 0x1D * 4, 0xFF)
+            qt.writew(jpe + 0x00 * 4, 3)
+            qt.step(100 * 1000000)
+            return qt.readw(jpe + 0x44 * 4)
+
+        # 128 MiB here: past it reads as nothing, unless it is the pattern
+        check('a source past DRAM is the test pattern',
+              scan(0x100000) != scan(0x7000), True)
+        qt.writew(jpe + 0x06 * 4, 0x1000)
+        qt.writew(jpe + 0x07 * 4, 0)
         # infinity6e's driver finishes a picture from a record the engine
         # writes: _IsrFunc() and _EncDone()
         dump = 0x300000
@@ -2860,6 +2884,70 @@ def test_i6_mhe(qemu, tmp):
         qt.close()
 
 
+def test_i6_all_machines(qemu, tmp):
+    print('every infinity6 family and msc316 machine starts')
+    i6 = i6_image(tmp, 'i6all.bin')
+    for machine in ('ssc325', 'ssc325de', 'ssc333', 'ssc335', 'ssc335de',
+                    'ssc337', 'ssc337de', 'ssc338q', 'ssc30kd', 'ssc30kq',
+                    'ssc377', 'ssc377d', 'ssc377de', 'ssc377qe', 'ssc378de',
+                    'ssc378qe'):
+        qt = QTest(qemu, machine + ',flash-file=' + i6, [])
+        try:
+            qt.step(1000000)
+            check(machine + ': starts', qt.proc.poll() is None, True)
+        finally:
+            qt.close()
+
+
+def test_guest_limits(qemu, tmp):
+    print('what a guest or an image cannot do to the host')
+    path = os.path.join(tmp, 'i3-lim.bin')
+    make_i3_image(path)
+    qt = QTest(qemu, 'msc313e,flash-file=' + path, [])
+    try:
+        ive = ((0x00, 0, 0xFFFF, 0xFFFF, 'a 65536-square picture'),
+               (0x00, 0, 0xFFFF, 0, 'a 65536-wide picture'),
+               (0x01, 0, 0, 4, 'colour conversion one pixel wide'))
+        for op, mode, w, h, name in ive:
+            qt.writew(IVE1 + 0x04 * 4, op | mode << 8)
+            qt.writew(IVE1 + 0x05 * 4, 0)
+            qt.writew(IVE1 + 0x06 * 4, w)
+            qt.writew(IVE1 + 0x07 * 4, h)
+            qt.writew(IVE0, 1)
+            check('IVE: ' + name + ' is refused',
+                  qt.readw(IVE0 + 0x40 * 4), 0)
+        qt.writew(IVE1 + 0x04 * 4, 0x15 | 30 << 8)
+        qt.writew(IVE1 + 0x06 * 4, 63)
+        qt.writew(IVE1 + 0x07 * 4, 63)
+        qt.writew(IVE0, 1)
+        check('IVE: an absurd SAD block mode', qt.proc.poll() is None, True)
+    finally:
+        qt.close()
+    bad = os.path.join(tmp, 'nand-bad.bin')
+    with open(bad, 'wb') as f:
+        f.write(b'MSTARSEMIUSFDCIS' + bytes(0x10000 - 16))
+    p = subprocess.run([qemu, '-M', 'ssc337,flash-file=' + bad, '-display',
+                        'none', '-nodefaults', '-S'], capture_output=True,
+                       timeout=30)
+    check('NAND: a zero geometry is an error, not a crash', p.returncode, 1)
+    boot = os.path.join(tmp, 'boot.bin')
+    with open(boot, 'wb') as f:
+        f.write(bytes(4096))
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
+                        'tools', 'sstar-nand-image.py')
+    p = subprocess.run([sys.executable, '-I', tool,
+                        os.path.join(tmp, 'o.nand'), boot, '--bad', '0'],
+                       capture_output=True, timeout=30)
+    check('NAND tool: a bad block under an image is refused',
+          p.returncode != 0, True)
+    i6 = i6_image(tmp, 'i6lim.bin')
+    out = hmp(qemu, ['-M', 'ssc338q,flash-file=' + i6, '-machine',
+                     'accel=qtest', '-S'],
+              ['migrate file:' + bad + '.mig', 'info migrate'])
+    check('Wave5: migration is refused, not lossy',
+          'sstar-wave5' in out, True)
+
+
 def test_i6e_ring(qemu, tmp):
     print('infinity6e scaler ring: what the MMU maps, and who reads it')
     path = i6_image(tmp, 'i6r.bin')
@@ -2927,10 +3015,15 @@ def test_i6e_ring(qemu, tmp):
             qt.writew(jpe + 0x3D * 4, addr >> 16 | name << 14)
             qt.writew(jpe + 0x3E * 4, 1)
         qt.writew(jpe + 0x22 * 4, 0xFE)
-        flat = jpe_size(0x30300000, 0x30400000)
+        flat = jpe_size(0x300000, 0x400000)
         scene = jpe_size(ya, ca)
         check('the scene, not the ring\'s flat memory (%d > %d)' % (scene, flat),
               scene > flat * 3 / 2, True)
+        qt.writew(jpe + 0x01 * 4, 1)
+        qt.writew(jpe + 0x1D * 4, 0xFF)
+        qt.writew(jpe + 0x00 * 4, 3)
+        qt.step(300 * 1000000)
+        check('a picture one pixel wide', qt.proc.poll() is None, True)
     finally:
         qt.close()
     qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
@@ -3492,6 +3585,8 @@ def main():
     test_i6_mask(args.qemu, tmp)
     test_i6_mfe(args.qemu, tmp)
     test_i6_mhe(args.qemu, tmp)
+    test_i6_all_machines(args.qemu, tmp)
+    test_guest_limits(args.qemu, tmp)
     test_i6_stats_audio(args.qemu, tmp)
     test_i6b0_media(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)

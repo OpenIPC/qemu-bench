@@ -1228,8 +1228,17 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     }
 
     /* The image says which chip the board carries, the straps follow it. */
-    nand = img && img_len > 16 && ss_i6(c) &&
+    nand = img && img_len >= SS_SNI_SIZE && ss_i6(c) &&
            !memcmp(img, SS_SNI_MAGIC, 16);
+    if (nand) {
+        SsNandGeom g = ss_nand_geom(img);
+
+        if (!is_power_of_2(g.page) || !is_power_of_2(g.block_pages)) {
+            error_report("sigmastar: NAND image with page %u, %u pages a block",
+                         g.page, g.block_pages);
+            exit(1);
+        }
+    }
 
     for (n = 0; n < ncpus; n++) {
         Object *o = object_new(machine->cpu_type);

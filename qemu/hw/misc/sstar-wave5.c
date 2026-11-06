@@ -59,6 +59,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -82,6 +83,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarWave5State, SSTAR_WAVE5)
 #define WAVE5_MMU_PAGE      0x1000
 #define WAVE5_INSTANCES     8
 #define WAVE5_MAX_DIM       8192
+#define WAVE5_MAX_STRIDE    (2 * WAVE5_MAX_DIM)
+#define WAVE5_MAX_BS        (64 * MiB)
 #define WAVE5_QP            30
 
 #define R_PC                0x004
@@ -268,8 +271,12 @@ static void wave5_source(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
 
     *ys = (stride >> 16) ? stride >> 16 : in->width;
     *cs = (stride & 0xFFFF) ? stride & 0xFFFF : *ys;
+    /* every plane holds a row of the picture, at a size the host can spare */
+    *ys = MIN(MAX(*ys, in->width), WAVE5_MAX_STRIDE);
+    *cs = MIN(MAX(*cs, in->width), WAVE5_MAX_STRIDE);
     ylen = (size_t)*ys * in->height;
-    clen = (size_t)*cs * (in->height / 2);
+    /* the scaler's ring writes chroma rows as wide as luma's */
+    clen = (size_t)MAX(*cs, *ys) * (in->height / 2);
     *y = g_malloc(ylen);
     *uv = g_malloc(clen);
     if (sstar_i6e_scl_ring(*wave5_reg(s, R_SRC_Y), *ys, in->height, *y,
@@ -449,6 +456,7 @@ static size_t wave5_encode(SstarWave5State *s, Wave5Inst *in, bool headers)
     if (!in->ref) {
         in->ref = hevc_enc_ref_new();
     }
+    cap = MIN(cap, WAVE5_MAX_BS);
     out = g_malloc(MAX(cap, 128));
     if (in->avc) {
         if (headers) {
@@ -759,10 +767,17 @@ static const Property sstar_wave5_props[] = {
     DEFINE_PROP_BOOL("trace", SstarWave5State, trace, false),
 };
 
+/* The instances' queues and pictures are host state: refuse, do not lose them */
+static const VMStateDescription vmstate_sstar_wave5 = {
+    .name = TYPE_SSTAR_WAVE5,
+    .unmigratable = 1,
+};
+
 static void sstar_wave5_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    dc->vmsd = &vmstate_sstar_wave5;
     dc->realize = sstar_wave5_realize;
     device_class_set_legacy_reset(dc, sstar_wave5_reset);
     device_class_set_props(dc, sstar_wave5_props);

@@ -40,6 +40,15 @@ def main():
             ap.error("the UBI image does not fit")
         data[UBI_OFFSET : UBI_OFFSET + len(ubi)] = ubi
 
+    # a skipped block's bytes are lost, and everything after it moves
+    used = [(0, len(boot))]
+    if args.ubi:
+        used.append((UBI_OFFSET, UBI_OFFSET + len(ubi)))
+    for block in args.bad:
+        for start, end in used:
+            if block * BLOCK < end and (block + 1) * BLOCK > start:
+                ap.error("bad block %d holds part of an image" % block)
+
     with open(args.out, "wb") as out:
         for off in range(0, len(data), PAGE):
             spare = bytearray(b"\xff" * SPARE)

@@ -43,6 +43,7 @@
 #include "hw/misc/sstar-riu.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 
@@ -308,9 +309,36 @@ static const Property scl_props[] = {
     DEFINE_PROP_BOOL("trace", SstarI6eSclState, trace, false),
 };
 
+static void scl_reset(DeviceState *dev)
+{
+    SstarI6eSclState *s = SSTAR_I6E_SCL(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    memset(s->regs + R_IRQ_MASK, 0xFF, IRQ_WORDS * sizeof(s->regs[0]));
+    s->ring = false;
+    s->frames = 0;
+    qemu_set_irq(s->irq, 0);
+}
+
+static const VMStateDescription vmstate_scl = {
+    .name = TYPE_SSTAR_I6E_SCL,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, SstarI6eSclState, IRQ_REGS),
+        VMSTATE_UINT32(frames, SstarI6eSclState),
+        VMSTATE_BOOL(ring, SstarI6eSclState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void scl_class_init(ObjectClass *oc, const void *data)
 {
-    device_class_set_props(DEVICE_CLASS(oc), scl_props);
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    device_class_set_legacy_reset(dc, scl_reset);
+    device_class_set_props(dc, scl_props);
+    dc->vmsd = &vmstate_scl;
 }
 
 static const TypeInfo scl_info = {
