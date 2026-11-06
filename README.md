@@ -753,6 +753,7 @@ qemu/
 ├── hw/misc/amb-vic.c            # Ambarella VIC and the scratchpad that names the IRQ
 ├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
 ├── hw/misc/amb-rct.c            # Ambarella reset and clock tree
+├── hw/misc/amb-gpio.c           # Ambarella GPIO; 107 holds the sensor in reset
 ├── hw/i2c/amb-idc.c             # Ambarella IDC I2C master
 ├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
 ├── hw/mips/ingenic.c            # Ingenic T10..T41 machines, mask ROM stand-in, bootm

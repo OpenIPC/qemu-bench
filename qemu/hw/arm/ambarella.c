@@ -9,6 +9,10 @@
  * it.  What software needs from the IAV blocks stops at loading its modules;
  * there is no video here.  Blocks with no model read as zero.
  *
+ * As on the camera, the sensor stays off I2C until GPIO 107 releases its
+ * XSHUTDN, so software that probes too early finds nothing.  sensor-reset=off
+ * is a board with no such line.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -49,6 +53,11 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_IDC1_BASE       0xe8001000
 #define AMB_IDC0_BASE       0xe8003000
 #define AMB_UART0_BASE      0xe8005000
+#define AMB_GPIO0_BASE      0xe8009000
+#define AMB_GPIO1_BASE      0xe800a000
+#define AMB_GPIO2_BASE      0xe800e000
+#define AMB_GPIO3_BASE      0xe8010000
+#define AMB_IOMUX_BASE      0xe8016000
 #define AMB_IDC2_BASE       0xe8007000
 #define AMB_TIMER_BASE      0xe800b000
 #define AMB_DBGBUS_BASE     0xec000000
@@ -57,7 +66,14 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_AXI_BASE        0xf0000000
 #define AMB_L2_BASE         0xf0002000
 
+#define AMB_GPIO_XSHUTDN    107
+#define AMB_DT_GPIO_ACTIVE_LOW 1
+
 #define AMB_IRQ_TIMER7      6
+#define AMB_IRQ_GPIO3       49
+#define AMB_IRQ_GPIO2       50
+#define AMB_IRQ_GPIO1       51
+#define AMB_IRQ_GPIO0       52
 #define AMB_IRQ_UART0       61
 #define AMB_IRQ_TIMER8      63
 #define AMB_IRQ_IDC2        81
@@ -75,6 +91,7 @@ struct AmbMachineState {
     MachineState parent_obj;
 
     char *sensor;
+    bool no_sensor_reset;
 };
 
 static const struct {
@@ -140,9 +157,12 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
     void *fdt = create_device_tree(size);
-    uint32_t intc;
+    AmbMachineState *ams = AMB_MACHINE(ms);
+    uint32_t intc, pinctrl, gpio;
 
     intc = qemu_fdt_alloc_phandle(fdt);
+    pinctrl = qemu_fdt_alloc_phandle(fdt);
+    gpio = qemu_fdt_alloc_phandle(fdt);
     qemu_fdt_setprop_string(fdt, "/", "model", "Ambarella S3L Olive Board");
     qemu_fdt_setprop_string(fdt, "/", "compatible", "ambarella,s3l");
     qemu_fdt_setprop_cell(fdt, "/", "#address-cells", 1);
@@ -175,11 +195,15 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
     qemu_fdt_setprop_cells(fdt, "/iavmem", "reg", AMB_IAVMEM_BASE,
                            ms->ram_size - AMB_IAVMEM_BASE);
 
-    /* iav.ko dereferences this without checking; it holds the VIN's reset
-     * and power GPIOs, which are optional and left out. */
+    /* iav.ko dereferences /iav/vinc0 without checking.  It takes the
+     * VIN's reset from here, and drives it when a mode is set. */
     qemu_fdt_add_subnode(fdt, "/iav");
     qemu_fdt_setprop_string(fdt, "/iav", "compatible", "ambarella,iav");
     qemu_fdt_add_subnode(fdt, "/iav/vinc0");
+    if (!ams->no_sensor_reset) {
+        qemu_fdt_setprop_cells(fdt, "/iav/vinc0", "vinrst-gpios", gpio,
+                               AMB_GPIO_XSHUTDN, AMB_DT_GPIO_ACTIVE_LOW);
+    }
 
     qemu_fdt_add_subnode(fdt, "/cpus");
     qemu_fdt_setprop_cell(fdt, "/cpus", "#address-cells", 1);
@@ -217,6 +241,39 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
                   AMB_IRQ_TIMER7, 24);
     amb_fdt_timer(fdt, "ambarella,clock-event", AMB_TIMER_BASE + 0x74,
                   AMB_IRQ_TIMER8, 28);
+
+    /* The driver walks its children for pin groups, and there are none. */
+    qemu_fdt_add_subnode(fdt, "/apb@e8000000/pinctrl@e8009000");
+    {
+        const char *p = "/apb@e8000000/pinctrl@e8009000";
+        const char *g = "/apb@e8000000/pinctrl@e8009000/gpio@0";
+        static const char compat[] = "ambarella,pinctrl\0simple-bus";
+        static const char names[] = "gpio0\0gpio1\0gpio2\0gpio3\0iomux";
+
+        qemu_fdt_setprop(fdt, p, "compatible", compat, sizeof(compat));
+        qemu_fdt_setprop_cell(fdt, p, "#address-cells", 1);
+        qemu_fdt_setprop_cell(fdt, p, "#size-cells", 0);
+        qemu_fdt_setprop_cells(fdt, p, "reg", AMB_GPIO0_BASE, 0x1000,
+                               AMB_GPIO1_BASE, 0x1000, AMB_GPIO2_BASE, 0x1000,
+                               AMB_GPIO3_BASE, 0x1000, AMB_IOMUX_BASE, 0x1000);
+        qemu_fdt_setprop(fdt, p, "reg-names", names, sizeof(names));
+        qemu_fdt_setprop_cell(fdt, p, "#gpio-range-cells", 3);
+        qemu_fdt_setprop_cell(fdt, p, "phandle", pinctrl);
+
+        qemu_fdt_add_subnode(fdt, g);
+        qemu_fdt_setprop_string(fdt, g, "compatible", "ambarella,gpio");
+        qemu_fdt_setprop_cells(fdt, g, "interrupts",
+                               AMB_IRQ_GPIO0, AMB_DT_LEVEL_HIGH,
+                               AMB_IRQ_GPIO1, AMB_DT_LEVEL_HIGH,
+                               AMB_IRQ_GPIO2, AMB_DT_LEVEL_HIGH,
+                               AMB_IRQ_GPIO3, AMB_DT_LEVEL_HIGH);
+        qemu_fdt_setprop(fdt, g, "gpio-controller", NULL, 0);
+        qemu_fdt_setprop_cell(fdt, g, "#gpio-cells", 2);
+        qemu_fdt_setprop_cells(fdt, g, "gpio-ranges", pinctrl, 0, 0, 128);
+        qemu_fdt_setprop(fdt, g, "interrupt-controller", NULL, 0);
+        qemu_fdt_setprop_cell(fdt, g, "#interrupt-cells", 2);
+        qemu_fdt_setprop_cell(fdt, g, "phandle", gpio);
+    }
 
     qemu_fdt_add_subnode(fdt, "/apb@e8000000/uart@e8005000");
     {
@@ -263,7 +320,8 @@ static void amb_init(MachineState *ms)
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *uart_ext = g_new(MemoryRegion, 1);
     Object *cpuobj;
-    DeviceState *cpu, *vic, *timer;
+    DeviceState *cpu, *vic, *timer, *pads;
+    qemu_irq not_held;
     SysBusDevice *sbd;
 
     if (ms->ram_size <= AMB_IAVMEM_BASE) {
@@ -311,6 +369,14 @@ static void amb_init(MachineState *ms)
     sysbus_connect_irq(sbd, 6, qdev_get_gpio_in(vic, AMB_IRQ_TIMER7));
     sysbus_connect_irq(sbd, 7, qdev_get_gpio_in(vic, AMB_IRQ_TIMER8));
 
+    pads = qdev_new("amb-gpio");
+    sbd = SYS_BUS_DEVICE(pads);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, AMB_GPIO0_BASE);
+    sysbus_mmio_map(sbd, 1, AMB_GPIO1_BASE);
+    sysbus_mmio_map(sbd, 2, AMB_GPIO2_BASE);
+    sysbus_mmio_map(sbd, 3, AMB_GPIO3_BASE);
+
     sysbus_create_simple("amb-rct", AMB_RCT_BASE, NULL);
     sysbus_create_simple("l2x0", AMB_L2_BASE, NULL);
 
@@ -332,6 +398,13 @@ static void amb_init(MachineState *ms)
         if (i == 0) {
             image_sensor_create(I2C_BUS(qdev_get_child_bus(idc, "i2c")),
                                 ams->sensor ? ams->sensor : "ov4689");
+            if (!ams->no_sensor_reset) {
+                /* XSHUTDN is active low: a low pad holds the sensor */
+                not_held = qemu_irq_invert(
+                    qdev_get_gpio_in_named(idc, "bus-held", 0));
+                qdev_connect_gpio_out(pads, AMB_GPIO_XSHUTDN, not_held);
+                qemu_irq_lower(not_held);
+            }
         }
     }
 
@@ -355,6 +428,16 @@ static void amb_set_sensor(Object *obj, const char *val, Error **errp)
     ams->sensor = g_strdup(val);
 }
 
+static bool amb_get_sensor_reset(Object *obj, Error **errp)
+{
+    return !AMB_MACHINE(obj)->no_sensor_reset;
+}
+
+static void amb_set_sensor_reset(Object *obj, bool val, Error **errp)
+{
+    AMB_MACHINE(obj)->no_sensor_reset = !val;
+}
+
 static void amb_machine_class_init(MachineClass *mc)
 {
     ObjectClass *oc = OBJECT_CLASS(mc);
@@ -370,6 +453,11 @@ static void amb_machine_class_init(MachineClass *mc)
     object_class_property_set_description(oc, "sensor",
         "image sensor on I2C0, from the sensor catalogue (default ov4689); "
         "none for no sensor");
+    object_class_property_add_bool(oc, "sensor-reset", amb_get_sensor_reset,
+                                   amb_set_sensor_reset);
+    object_class_property_set_description(oc, "sensor-reset",
+        "hold the sensor off I2C until GPIO 107 is released, as on the "
+        "IP4M-1026E (default on)");
 }
 
 DEFINE_MACHINE_EXTENDED("s3l", MACHINE, AmbMachineState,

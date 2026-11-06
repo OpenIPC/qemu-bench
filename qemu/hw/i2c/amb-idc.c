@@ -8,6 +8,10 @@
  * (ACK here means "do not acknowledge this one", for the last byte), until
  * one carries STOP, which raises nothing.
  *
+ * The named input "bus-held" keeps every address from being acknowledged
+ * while it is high.  The machine uses it for a sensor in reset: nothing else
+ * is on that bus here, so the whole bus goes quiet rather than one address.
+ *
  * The FIFO path (FMCTRL / FMDATA) is the driver's turbo mode, which only
  * the amb,turbo-mode device tree property turns on, and is not modelled.
  *
@@ -58,6 +62,7 @@ struct AmbIdcState {
     uint32_t stretch;
     bool active;
     bool reading;
+    bool held;
 };
 
 static void amb_idc_done(AmbIdcState *s, bool nack)
@@ -80,7 +85,8 @@ static void amb_idc_control(AmbIdcState *s, uint32_t val)
     }
     if (val & CTRL_START) {
         s->reading = s->data & 1;
-        s->active = !i2c_start_transfer(s->bus, (s->data & 0xff) >> 1,
+        s->active = !s->held &&
+                    !i2c_start_transfer(s->bus, (s->data & 0xff) >> 1,
                                         s->reading);
         amb_idc_done(s, !s->active);
         return;
@@ -96,6 +102,11 @@ static void amb_idc_control(AmbIdcState *s, uint32_t val)
     } else {
         amb_idc_done(s, i2c_send(s->bus, s->data & 0xff) != 0);
     }
+}
+
+static void amb_idc_set_held(void *opaque, int line, int level)
+{
+    AMB_IDC(opaque)->held = level;
 }
 
 static uint64_t amb_idc_read(void *opaque, hwaddr off, unsigned size)
@@ -191,6 +202,7 @@ static void amb_idc_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
     s->bus = i2c_init_bus(DEVICE(obj), "i2c");
+    qdev_init_gpio_in_named(DEVICE(obj), amb_idc_set_held, "bus-held", 1);
 }
 
 static const VMStateDescription amb_idc_vmstate = {
@@ -207,6 +219,7 @@ static const VMStateDescription amb_idc_vmstate = {
         VMSTATE_UINT32(stretch, AmbIdcState),
         VMSTATE_BOOL(active, AmbIdcState),
         VMSTATE_BOOL(reading, AmbIdcState),
+        VMSTATE_BOOL(held, AmbIdcState),
         VMSTATE_END_OF_LIST()
     },
 };

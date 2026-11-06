@@ -39,7 +39,7 @@ pkg=$FIRMWARE/general/package/legacy/ambarella-osdrv-s3l/files
 mkdir -p "$root"/{bin,sbin,usr/bin,proc,sys,dev,tmp,lib} "$kdir/ambarella"
 cp "$TARGET/bin/busybox" "$root/bin/"
 cp -L "$TARGET/lib/ld-musl-arm.so.1" "$TARGET/lib/libc.so" "$root/lib/"
-for a in sh mount ls cat grep awk tr logger sleep mknod; do
+for a in sh mount ls cat grep awk tr logger sleep mknod echo; do
     ln -s busybox "$root/bin/$a"
 done
 for a in modprobe insmod; do
@@ -114,6 +114,26 @@ export PATH=/sbin:/bin:/usr/bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
+case "$(cat /proc/cmdline)" in
+*s3l.held*)
+    # The camera at boot: the sensor is in reset until GPIO 107 is released
+    g=/sys/class/gpio/gpio107
+    echo "### held ipcinfo=[$(ipcinfo -s 2>/dev/null)]"
+    echo 107 > /sys/class/gpio/export
+    echo out > $g/direction
+    echo 1 > $g/value
+    echo "### released ipcinfo=[$(ipcinfo -s 2>/dev/null)]"
+    echo 0 > $g/value
+    echo "### low ipcinfo=[$(ipcinfo -s 2>/dev/null)]"
+    echo 107 > /sys/class/gpio/unexport
+    load_ambarella -i
+    echo "### held load rc=$?"
+    awk '{print $1}' /proc/modules | tr '\n' ' '
+    echo
+    echo "### end"
+    sleep 1000
+    ;;
+esac
 echo "### ipctool"
 ipctool
 echo "### load"
@@ -146,18 +166,25 @@ INIT
 chmod +x "$root/init"
 (cd "$root" && find . | cpio -o -H newc 2>/dev/null | gzip -9) > "$work/rd.gz"
 
-log=$work/console.log
-"$QEMU" -M s3l -nographic -monitor none -kernel "$KERNEL" \
-    -initrd "$work/rd.gz" \
-    -append 'console=ttyS0,115200 rdinit=/init loglevel=4' > "$log" 2>&1 &
-pid=$!
-for _ in $(seq 1 120); do
-    grep -q '^### end' "$log" && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-done
-kill "$pid" 2>/dev/null
-wait "$pid" 2>/dev/null
+boot() {    # log machine-options extra-cmdline
+    "$QEMU" -M "s3l$2" -nographic -monitor none -kernel "$KERNEL" \
+        -initrd "$work/rd.gz" \
+        -append "console=ttyS0,115200 rdinit=/init loglevel=4 $3" > "$1" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 120); do
+        grep -q '^### end' "$1" && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+}
+
+# First as the camera is: what ipcinfo and load_ambarella see with the sensor
+# held in reset.  The checks on load_ambarella below this are a board with no
+# reset line, because nothing in the firmware releases GPIO 107 at boot yet.
+log=$work/held.log
+boot "$log" "" s3l.held
 
 failures=0
 want() {
@@ -176,6 +203,22 @@ absent() {
         echo "  PASS: $1"
     fi
 }
+
+echo 'sensor held in reset, as on the camera:'
+want 'the guest reached the end' '^### end'
+want 'held: nothing answers' '^### held ipcinfo=\[\]'
+want 'GPIO 107 high: the sensor answers' '^### released ipcinfo=\[ov4689\]'
+want 'GPIO 107 low: gone again' '^### low ipcinfo=\[\]'
+want 'load_ambarella finds no sensor, as on the board' \
+    'No sensor in the environment and none detected'
+want 'and the drivers still come up' '^iav .*dsp'
+absent 'no sensor driver was loaded' 'ov4689_mipi'
+absent 'no oops' 'Oops|Kernel panic|Unable to handle'
+cp "$log" "$work/held.keep"
+
+echo 'with no reset line:'
+log=$work/console.log
+boot "$log" ",sensor-reset=off" ""
 
 want 'the guest reached the end' '^### end'
 want 'vendor' 'vendor: Ambarella'
@@ -221,6 +264,8 @@ want 'gclk_ddr' 'gclk_ddr:[[:space:]]+840000000 Hz'
 absent 'no oops' 'Oops|Kernel panic|Unable to handle'
 
 if [ "$failures" -ne 0 ]; then
+    echo "--- console, held"
+    cat "$work/held.keep"
     echo "--- console"
     cat "$log"
 fi

@@ -22,8 +22,9 @@ branch `ambarella-s3l`, with the firmware's
 ```
 
 `-M s3l,sensor=<name>` picks another sensor from the catalogue for I2C0, and
-`sensor=none` leaves the bus empty. `-m` sets DRAM: over 120 MiB, for the DSP,
-and at most 0xDFFE0000, where the peripherals start.
+`sensor=none` leaves the bus empty. `sensor-reset=off` is a board with no reset
+line, where the sensor answers at once. `-m` sets DRAM: over 120 MiB, for the
+DSP, and at most 0xDFFE0000, where the peripherals start.
 
 ## What is modelled
 
@@ -34,12 +35,13 @@ and at most 0xDFFE0000, where the peripherals start.
 | Timers | `0xE800B000` | `amb-timer` |
 | UART0 | `0xE8005000` | QEMU's 16550, plus a status word at 0x7C |
 | I2C0, 1, 2 | `0xE8003000`, `0xE8001000`, `0xE8007000` | `amb-idc` |
+| GPIO, 4 banks | `0xE8009000`, `0xE800A000`, `0xE800E000`, `0xE8010000` | `amb-gpio` |
 | RCT | `0xEC170000` | `amb-rct` |
 | L2 cache | `0xF0002000` | QEMU's `l2x0` |
 
 Everything else in the AHB, APB, debug bus, DRAM controller and AXI windows is
 an unimplemented device, so `-d unimp` lists what software touched. There is
-no pad mux, Ethernet, flash or GPIO.
+no pad mux, Ethernet or flash, and GPIO has no interrupts.
 
 ## Things that are easy to get wrong
 
@@ -61,6 +63,14 @@ refuses to probe with no default pin state, so `pinctrl-0` is present and
 empty. `iav.ko` calls `of_get_child_by_name()` on `/iav` without checking it
 exists, so `/iav/vinc0` is needed or `modprobe iav` oopses.
 
+**The sensor starts in reset.** On the IP4M-1026E, XSHUTDN is GPIO 107, active
+low, and a pad nobody drives holds it. So does this machine: until GPIO 107 is
+an output driven high, I2C0 acknowledges nothing, which is why a probe at boot
+finds no sensor. `iav.ko` only drives the line when a VIN mode is set, and that
+is after anything would have probed. The device tree says so in
+`/iav/vinc0/vinrst-gpios`. The whole bus goes quiet, not just the one address,
+because the sensor is all that is on it here.
+
 **PLL rates are read back.** The kernel derives every clock from the RCT words,
 so these reset to the rates `/proc/ambarella/clock` shows on the camera. Note
 `gclk_ddr` is half its PLL.
@@ -76,7 +86,11 @@ silicon: `RELOAD` 0 is the reset value, and 11 ns ticks only spin the host.
 `qemu/tests/test-ambarella.py` needs only a built QEMU and runs in CI. It drives
 the models over qtest the way the kernel does.
 
-`qemu-boot/test-s3l-boot.sh` boots a kernel and checks what the camera in
+`qemu-boot/test-s3l-boot.sh` boots twice. The first boot is the camera as it
+is: nothing answers on I2C, `load_ambarella` finds no sensor, and driving GPIO
+107 high from sysfs makes `ipcinfo -s` find it. The second uses
+`sensor-reset=off`, because nothing in the firmware releases that line at boot
+yet, and checks what the camera in
 [ipctool#266](https://github.com/OpenIPC/ipctool/issues/266) reported: `ipctool`
 says Ambarella S3L, 512M total, 392M media and an OV4689 at 0x6c on bus 0;
 `load_ambarella` loads `iav` and the sensor through `modules.dep`, makes

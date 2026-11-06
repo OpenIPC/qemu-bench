@@ -11,6 +11,8 @@ kernel (docs/ambarella.md):
   - amb-vic: the scratchpad names the pending line and all ones when there
     is none, which is the only way irq-ambarella.c looks on S3L; indexed and
     mask registers agree, an edge stays latched until cleared;
+  - amb-gpio: the sensor is off I2C until GPIO 107 goes high, as on the
+    camera, and comes off again when it goes low, or back to an input;
   - amb-idc: the driver's CTRL conversation reads the OV4689's chip ID from
     I2C0, and an address nobody answers comes back not acknowledged;
   - a guest reset clears what was pending, sensor=none leaves the bus
@@ -33,6 +35,8 @@ VIC1 = 0xE0010000
 VIC2 = 0xE001C000
 SCRATCHPAD = 0xE001B000
 IDC0 = 0xE8003000
+GPIO3 = 0xE8010000
+XSHUTDN = 1 << 11                   # GPIO 107, bit 11 of the fourth bank
 TIMER = 0xE800B000
 RCT = 0xEC170000
 
@@ -267,6 +271,35 @@ def read_reg16(qt, addr, reg):
     return val
 
 
+def xshutdn(qt, high):
+    """gpio_direction_output(107, high), as gpio-ambarella.c does it."""
+    qt.writel(GPIO3 + 0x18, qt.readl(GPIO3 + 0x18) & ~XSHUTDN)  # not AFSEL
+    qt.writel(GPIO3 + 0x04, qt.readl(GPIO3 + 0x04) | XSHUTDN)   # output
+    qt.writel(GPIO3 + 0x28, XSHUTDN)                            # MASK
+    qt.writel(GPIO3 + 0x00, XSHUTDN if high else 0)             # DATA
+
+
+def test_sensor_reset(qt):
+    print('amb-gpio: the sensor reset')
+    qt.writel(IDC0 + ENR, 1)
+    check('held at power-on', read_reg16(qt, OV4689, 0x300A), None)
+    xshutdn(qt, True)
+    check('released by GPIO 107', read_reg16(qt, OV4689, 0x300A), 0x46)
+    check('the pad reads back', qt.readl(GPIO3) & XSHUTDN, XSHUTDN)
+    xshutdn(qt, False)
+    check('held again when it goes low', read_reg16(qt, OV4689, 0x300A), None)
+    xshutdn(qt, True)
+    qt.writel(GPIO3 + 0x04, qt.readl(GPIO3 + 0x04) & ~XSHUTDN)
+    check('an input does not drive it: held',
+          read_reg16(qt, OV4689, 0x300A), None)
+    qt.writel(GPIO3 + 0x04, qt.readl(GPIO3 + 0x04) | XSHUTDN)
+    qt.writel(GPIO3 + 0x18, qt.readl(GPIO3 + 0x18) | XSHUTDN)
+    check('nor does a peripheral function',
+          read_reg16(qt, OV4689, 0x300A), None)
+    qt.writel(GPIO3 + 0x18, qt.readl(GPIO3 + 0x18) & ~XSHUTDN)
+    check('released once it is back', read_reg16(qt, OV4689, 0x300A), 0x46)
+
+
 def test_i2c(qt):
     print('amb-idc')
     # irq_set_type() for level high, as the device tree asks on line 83
@@ -296,11 +329,19 @@ def hmp(qemu, args, cmds):
 
 
 def test_no_sensor(qemu):
-    print('sensor=none')
+    print('sensor=none, sensor-reset=off')
     qt = QTest(qemu, 's3l,sensor=none')
     try:
         qt.writel(IDC0 + ENR, 1)
+        xshutdn(qt, True)
         check('the bus is empty', read_reg16(qt, OV4689, 0x300A), None)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 's3l,sensor-reset=off')
+    try:
+        qt.writel(IDC0 + ENR, 1)
+        check('no reset line: it answers at once',
+              read_reg16(qt, OV4689, 0x300A), 0x46)
     finally:
         qt.close()
 
@@ -344,6 +385,7 @@ def main():
         test_rct(qt)
         test_timer_and_vic(qt)
         test_lines(qt)
+        test_sensor_reset(qt)
         test_i2c(qt)
         test_reset(qt)
     finally:

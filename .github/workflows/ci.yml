@@ -154,7 +154,7 @@ jobs:
       # drives them: the scratchpad that names the pending line, timers,
       # the PLL rates, and the I2C conversation with the OV4689.  The boot
       # test needs a kernel build: qemu-boot/test-s3l-boot.sh.
-      - name: Ambarella S3L devices (amb-vic, amb-timer, amb-rct, amb-idc)
+      - name: Ambarella S3L devices (amb-vic, amb-timer, amb-rct, amb-gpio, amb-idc)
         run: python3 qemu/tests/test-ambarella.py
 
       # The Anyka AK39xx models driven over qtest the way the vendor drivers
