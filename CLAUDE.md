@@ -357,6 +357,8 @@ is below 0x07800000. On S3L the kernel takes interrupts from one scratchpad
 register, not the banks, and all ones there means none (0x60 is S3's value).
 `iav.ko` oopses without an `/iav/vinc0` node. The sensor is off I2C until GPIO
 107 goes high (`amb-gpio`), as on the camera; `sensor-reset=off` removes that.
+With `flash-file=` and no `-kernel` it runs a camera's own BST and BLD: the first
+NAND page sits at the high vectors `0xffff0000`, which the BST copies from.
 The vendor modules load, but no microcode ships, so the DSP stays down. `flash-file=` adds NAND
 (`amb-nand`), page data alone or with spare bytes. BCH is not modelled, partitions
 come from `mtdparts=`, and a dump's bad blocks must be listed in `bad-blocks=`. Use

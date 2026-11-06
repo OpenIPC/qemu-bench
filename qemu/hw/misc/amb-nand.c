@@ -102,10 +102,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbNandState, AMB_NAND)
 #define FDMA_SRC        (0x304 / 4)
 #define FDMA_DST        (0x308 / 4)
 #define FDMA_STA        (0x30c / 4)
+#define FDMA_SPR_DA     (0x280 / 4)
+#define FDMA_DA         (0x380 / 4)
 #define FDMA_INT        (0x3f0 / 4)
 #define FDMA_REGS       (0x1000 / 4)
 
 #define FDMA_CTR_EN     0x80000000
+#define FDMA_CTR_D      0x40000000  /* the transfer is in a descriptor */
 #define FDMA_CTR_LEN    0x003fffff
 #define FDMA_STA_AE     0x00800000
 #define FDMA_STA_DN     0x00400000
@@ -230,6 +233,45 @@ static bool amb_nand_move(uint8_t *chip, hwaddr mem, uint32_t len, bool to_chip)
     return true;
 }
 
+/*
+ * A DMA descriptor, which the boot loader uses where the kernel programs the
+ * registers.  Words 0 to 5: source, destination, next, where to write the
+ * report, count, control.
+ */
+typedef struct AmbNandDesc {
+    bool used;
+    hwaddr src;
+    hwaddr dst;
+    hwaddr report;
+    uint32_t count;
+} AmbNandDesc;
+
+static AmbNandDesc amb_nand_desc(hwaddr addr)
+{
+    AmbNandDesc d = { 0 };
+    uint32_t w[5];
+
+    if (addr && dma_memory_read(&address_space_memory, addr, w, sizeof(w),
+                                MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
+        d.used = true;
+        d.src = le32_to_cpu(w[0]);
+        d.dst = le32_to_cpu(w[1]);
+        d.report = le32_to_cpu(w[3]);
+        d.count = le32_to_cpu(w[4]);
+    }
+    return d;
+}
+
+static void amb_nand_desc_report(const AmbNandDesc *d, uint32_t status)
+{
+    uint32_t val = cpu_to_le32(status);
+
+    if (d->used && d->report) {
+        dma_memory_write(&address_space_memory, d->report, &val, sizeof(val),
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
 {
     uint64_t addr = amb_nand_address(s, s->fio[FIO_DMAADR]);
@@ -242,6 +284,16 @@ static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
     hwaddr aux = to_chip ? s->fdma[FDMA_SPR_SRC] : s->fdma[FDMA_SPR_DST];
     uint8_t *chip;
     bool ok = true;
+    AmbNandDesc desc = { 0 }, spare_desc = { 0 };
+
+    if (s->fdma[FDMA_CTR] & FDMA_CTR_D) {
+        desc = amb_nand_desc(s->fdma[FDMA_DA]);
+        spare_desc = amb_nand_desc(s->fdma[FDMA_SPR_DA]);
+        len = desc.count;
+        main = to_chip ? desc.src : desc.dst;
+        spare = spare_desc.count;
+        aux = to_chip ? spare_desc.src : spare_desc.dst;
+    }
 
     /* Spare-only commands address the spare area with the main transfer */
     if (s->fio[FLASH_CTR] & NAND_CTR_SA) {
@@ -252,8 +304,26 @@ static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
     s->fio[FIO_DMACTR] = ctr & ~FIO_DMACTR_EN;
     s->fdma[FDMA_CTR] &= ~FDMA_CTR_EN;
 
-    if (page >= NAND_PAGES || column + len > NAND_RAW ||
-        spare > NAND_SPARE || (spare && len != NAND_PAGE)) {
+    /*
+     * A read may run over many pages: the kernel asks for one, the BST for a
+     * block at a time, its spare bytes following in their own transfer.
+     */
+    if (!to_chip && !column && len > NAND_PAGE && !(len % NAND_PAGE) &&
+        !(spare % (NAND_SPARE * (len / NAND_PAGE))) &&
+        page + len / NAND_PAGE <= NAND_PAGES) {
+        uint32_t pages = len / NAND_PAGE;
+        uint32_t each = spare / pages;
+
+        for (uint32_t i = 0; ok && i < pages; i++) {
+            chip = s->array + (size_t)(page + i) * NAND_RAW;
+            ok = amb_nand_move(chip, main + i * NAND_PAGE, NAND_PAGE, false);
+            if (ok && each) {
+                ok = amb_nand_move(chip + NAND_PAGE, aux + i * each, each,
+                                   false);
+            }
+        }
+    } else if (page >= NAND_PAGES || column + len > NAND_RAW ||
+               spare > NAND_SPARE || (spare && len != NAND_PAGE)) {
         qemu_log_mask(LOG_GUEST_ERROR, "amb-nand: page %u column %u len %u "
                       "spare %u\n", page, column, len, spare);
         ok = false;
@@ -271,6 +341,8 @@ static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
     s->fio[FIO_DMASTA] = ok ? FIO_DMASTA_DN : FIO_DMASTA_AE;
     s->fdma[FDMA_STA] = ok ? FDMA_STA_DN : FDMA_STA_AE;
     s->fdma[FDMA_SPR_STA] = spare ? s->fdma[FDMA_STA] : 0;
+    amb_nand_desc_report(&desc, s->fdma[FDMA_STA]);
+    amb_nand_desc_report(&spare_desc, s->fdma[FDMA_STA]);
     amb_nand_finish(s);
 }
 
@@ -287,6 +359,9 @@ static uint64_t amb_nand_fio_read(void *opaque, hwaddr off, unsigned size)
         return NAND_ID;
     case FLASH_EX_ID:
         return NAND_ID5;
+    case FLASH_INT:
+        /* The kernel looks at FIO_STA, the BST polls this */
+        return s->fio[FIO_STA] & FIO_STA_FI;
     default:
         return s->fio[r];
     }

@@ -9,6 +9,10 @@
  * intp [30:24], sout [19:16] and sdiv [15:12]: ref * (intp + 1) *
  * (sdiv + 1) / (sout + 1), from a 24 MHz reference.
  *
+ * Two counters run from the reference, at 0x254 and 0x494, and the boot
+ * chain times everything with them before it has anything else: bit 0 of
+ * the register behind each restarts it from zero.
+ *
  * The rest is storage.  Writing SOFT_OR_DLL_RESET's bit 0 back to 1 after 0
  * is how the kernel restarts.
  *
@@ -20,6 +24,7 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "system/runstate.h"
 
 #define TYPE_AMB_RCT "amb-rct"
@@ -33,7 +38,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbRctState, AMB_RCT)
 #define R_SOFT_RESET    0x068
 #define R_PLL_DDR       0x0dc
 #define R_PLL_IDSP      0x0e4
+#define R_TIMER         0x254
+#define R_TIMER_CTRL    0x258
+#define R_TIMER2        0x494
+#define R_TIMER2_CTRL   0x498
 #define R_PLL_CORTEX    0x264
+
+#define AMB_RCT_REF_HZ  24000000
 
 #define PLL(intp, sout) (((uint32_t)(intp) - 1) << 24 | ((sout) - 1) << 16)
 
@@ -43,6 +54,7 @@ struct AmbRctState {
     MemoryRegion iomem;
     uint32_t sys_config;
     uint32_t regs[AMB_RCT_SIZE / 4];
+    int64_t timer_base[2];  /* when each free-running counter was zero */
 };
 
 static uint64_t amb_rct_read(void *opaque, hwaddr off, unsigned size)
@@ -52,6 +64,11 @@ static uint64_t amb_rct_read(void *opaque, hwaddr off, unsigned size)
     if (off == R_PLL_LOCK) {
         return 0xffffffff;
     }
+    if (off == R_TIMER || off == R_TIMER2) {
+        return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                        s->timer_base[off == R_TIMER2], AMB_RCT_REF_HZ,
+                        NANOSECONDS_PER_SECOND);
+    }
     return s->regs[off / 4];
 }
 
@@ -60,6 +77,10 @@ static void amb_rct_write(void *opaque, hwaddr off, uint64_t val,
 {
     AmbRctState *s = opaque;
 
+    if ((off == R_TIMER_CTRL || off == R_TIMER2_CTRL) && (val & 1)) {
+        s->timer_base[off == R_TIMER2_CTRL] =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
     if (off == R_SOFT_RESET && !(s->regs[off / 4] & 1) && (val & 1)) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
@@ -103,6 +124,7 @@ static const VMStateDescription amb_rct_vmstate = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AmbRctState, AMB_RCT_SIZE / 4),
+        VMSTATE_INT64_ARRAY(timer_base, AmbRctState, 2),
         VMSTATE_END_OF_LIST()
     },
 };

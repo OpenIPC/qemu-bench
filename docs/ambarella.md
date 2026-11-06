@@ -117,6 +117,17 @@ Hikvision DS-2CD2423G0-I has GPIO 39. The flag is the level `iav.ko` resets with
 so 0 means held low, whatever `OF_GPIO_ACTIVE_LOW` suggests. The whole bus goes
 quiet, not just the one address, because the sensor is all that is on it here.
 
+**The boot chain uses the hardware differently from the kernel.** With
+`flash-file=` and no `-kernel` the machine boots a camera's own loaders: the
+chip puts the first NAND page at the high vectors, `0xffff0000`, and the BST
+copies itself from those addresses. Both loaders time everything with RCT's
+free-running counters, the BST polls `FLASH_INT` and reads whole blocks with one
+DMA, and the BLD reads spare areas through DMA descriptors and looks for its
+bad-block table in the last blocks. A stock image from a real camera reaches its
+main application this way, then reboots, because the vendor's `hikio` driver
+wants board data this machine does not provide. Straps are the camera's:
+`SYS_CONFIG` picks NAND, 2K pages and BCH.
+
 **PLL rates are read back.** The kernel derives every clock from the RCT words,
 so these reset to the rates `/proc/ambarella/clock` shows on the IP4M-1026E. They
 are that board's, not the SoC's: the DS-2CD2423G0-I runs its core PLL at 576 MHz.

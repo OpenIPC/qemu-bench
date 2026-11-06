@@ -19,6 +19,9 @@ kernel (docs/ambarella.md):
     DMA engines and all three interrupts, erase and program written through
     to the file, a page program only clearing bits, write protection, bad
     blocks, images with and without spare bytes, read-only files;
+  - the path the camera's own loaders take: the first page at the high
+    vectors, RCT's free-running counters, a polled run of pages and
+    descriptor DMA reporting into memory;
   - a guest reset clears what was pending, sensor=none leaves the bus
     empty, RAM that leaves no room for the DSP or runs into the peripherals
     is refused, and machine state migrates to a file and back.
@@ -57,6 +60,8 @@ SPARE_BUF = BUF + NAND_PAGE
 CMD_RESET, CMD_ERASE, CMD_READID, CMD_READSTATUS = 0x2, 0x9, 0xA, 0xC
 FIO_DMA_EN, FIO_DMA_RM = 0x80000000, 0x40000000
 FDMA_EN, FDMA_RM, FDMA_WM = 0x80000000, 0x10000000, 0x20000000
+FDMA_DESC = 0x40000000
+BOOT = 0xFFFF0000
 DMASTA_DN, DMASTA_AE = 0x01000000, 0x02000000
 FDMASTA_DN = 0x00400000
 LINE_FDMA, LINE_CMD, LINE_DMA = 6, 8, 9     # bits of bank 2: 70, 72, 73
@@ -406,6 +411,77 @@ def nand_program(qt, page, data, spare=b'\xFF' * NAND_SPARE, ctr=0):
     return sta
 
 
+def test_boot_chain(qemu, tmp):
+    """What the camera's own loaders use that the kernel does not.  Their
+    images are vendor code, so this drives the same paths by hand."""
+    print('amb-nand and amb-rct, as the boot loaders use them')
+    path = os.path.join(tmp, 'boot.bin')
+    make_nand(path)
+    with open(path, 'rb') as f:
+        first = f.read(NAND_PAGE)
+        f.seek(5 * NAND_PAGE)
+        pages = f.read(2 * NAND_PAGE)
+    qt = QTest(qemu, 's3l,flash-file=' + path)
+    try:
+        check('the first page is at the high vectors',
+              qt.read(BOOT, 2048), first)
+        check('the reset vector jumps there', qt.readl(0), 0xE51FF004)
+        check('to that address', qt.readl(4), BOOT)
+
+        a = qt.readl(RCT + 0x254)
+        qt.step(1000)
+        check('RCT timer runs at 24 MHz', qt.readl(RCT + 0x254) - a, 24)
+        qt.step(100000)
+        qt.writel(RCT + 0x498, 1)
+        qt.writel(RCT + 0x498, 0)
+        b = qt.readl(RCT + 0x494)
+        qt.step(1000)
+        check('timer 2 restarts from zero', b, 0)
+        check('and counts', qt.readl(RCT + 0x494), 24)
+
+        # bst: a run of pages with their spare bytes, polling, no interrupts
+        qt.writel(FDMA + 0x30C, 0)
+        qt.writel(FDMA + 0x304, FIFO)
+        qt.writel(FDMA + 0x308, BUF)
+        qt.writel(FDMA + 0x20C, 0)
+        qt.writel(FDMA + 0x204, FIFO)
+        qt.writel(FDMA + 0x208, BUF + 0x10000)
+        qt.writel(FDMA + 0x200, 2 * NAND_SPARE)
+        qt.writel(FDMA + 0x300, FDMA_EN | FDMA_WM | 2 * NAND_PAGE)
+        qt.writel(FIO + 0x084, 5 * NAND_PAGE)
+        qt.writel(FIO + 0x080, FIO_DMA_EN | (2 * NAND_RAW))
+        check('polled done flag', qt.readl(FIO + 0x150) & 1, 1)
+        check('polled DMA done', qt.readl(FIO + 0x08C), DMASTA_DN)
+        check('two pages at once', qt.read(BUF, 2 * NAND_PAGE), pages)
+        nand_ack(qt)
+
+        # bld: spare bytes through descriptors, reporting into memory
+        desc, spare = BUF + 0x20000, BUF + 0x20100
+        report = BUF + 0x20200
+        for addr, dst, count, rpt in ((desc, BUF + 0x30000, NAND_PAGE, report),
+                                      (spare, BUF + 0x40000, NAND_SPARE,
+                                       report + 4)):
+            for i, word in enumerate((FIFO, dst, 0, rpt, count)):
+                qt.writel(addr + i * 4, word)
+        qt.writel(report, 0)
+        qt.writel(report + 4, 0)
+        qt.writel(FDMA + 0x380, desc)
+        qt.writel(FDMA + 0x30C, 0)
+        qt.writel(FDMA + 0x280, spare)
+        qt.writel(FDMA + 0x20C, 0)
+        qt.writel(FDMA + 0x300, FDMA_EN | FDMA_DESC)
+        qt.writel(FIO + 0x084, 5 * NAND_PAGE)
+        qt.writel(FIO + 0x080, FIO_DMA_EN | NAND_RAW)
+        check('a descriptor reads a page', qt.read(BUF + 0x30000, NAND_PAGE),
+              pages[:NAND_PAGE])
+        check('blank spare through its descriptor',
+              qt.read(BUF + 0x40000, NAND_SPARE), b'\xff' * NAND_SPARE)
+        check('the report lands in memory', qt.readl(report), FDMASTA_DN)
+        check('for both', qt.readl(report + 4), FDMASTA_DN)
+    finally:
+        qt.close()
+
+
 def test_nand(qemu, tmp):
     print('amb-nand')
     path = os.path.join(tmp, 'nand.bin')
@@ -631,6 +707,7 @@ def main():
     finally:
         qt.close()
     test_nand(args.qemu, tmp)
+    test_boot_chain(args.qemu, tmp)
     test_no_sensor(args.qemu)
     test_rejections_and_migration(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))

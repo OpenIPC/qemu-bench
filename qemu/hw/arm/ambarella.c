@@ -25,6 +25,7 @@
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "hw/arm/boot.h"
+#include "hw/loader.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
@@ -49,6 +50,9 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_IAVMEM_BASE     0x07800000  /* mem=118M, as on the IP4M-1026E */
 
 #define AMB_AHB_BASE        0xe0000000
+#define AMB_BOOT_BASE       0xffff0000  /* the high vectors */
+#define AMB_BOOT_SIZE       0x1000
+#define AMB_BST_SIZE        2048
 #define AMB_FIO_FIFO_BASE   0xe0000000
 #define AMB_FIO_BASE        0xe0001000
 #define AMB_FDMA_BASE       0xe0012000
@@ -93,7 +97,7 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_DT_LEVEL_HIGH   4
 
 /* SYS_CONFIG straps for 2K pages, read-confirm and BCH on a 6-bit spare */
-#define AMB_SYS_CONFIG_NAND 0x00070000
+#define AMB_SYS_CONFIG_NAND 0x2007005b  /* as strapped on the DS-2CD2423G0-I */
 
 #define AMB_UART_US         0x7c    /* past what the 16550 model covers */
 #define AMB_UART_US_TFE     0x04
@@ -359,6 +363,34 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
     return fdt;
 }
 
+/*
+ * What the chip does at power-on from NAND: its boot logic reads the first
+ * page into a buffer at the high vectors, and the CPU starts there.  That page
+ * is the BST, which copies parts of itself to DRAM from those addresses, so
+ * they are not incidental.  The stand-in for the CPU starting there sits at the
+ * reset vector in DRAM, where the BST will put the BLD over it.
+ */
+static void amb_boot_from_flash(MemoryRegion *sysmem, const char *path)
+{
+    static const uint32_t jump[] = {
+        0xe51ff004,                 /* ldr pc, [pc, #-4] */
+        AMB_BOOT_BASE,
+    };
+    MemoryRegion *buf = g_new(MemoryRegion, 1);
+    g_autofree char *image = NULL;
+    gsize len;
+
+    if (!g_file_get_contents(path, &image, &len, NULL) ||
+        len < AMB_BST_SIZE) {
+        error_report("s3l: cannot read the BST from %s", path);
+        exit(1);
+    }
+    memory_region_init_ram(buf, NULL, "amb-boot", AMB_BOOT_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, AMB_BOOT_BASE, buf);
+    rom_add_blob_fixed("amb-bst", image, AMB_BST_SIZE, AMB_BOOT_BASE);
+    rom_add_blob_fixed("amb-reset", jump, sizeof(jump), 0);
+}
+
 static void amb_init(MachineState *ms)
 {
     static struct arm_boot_info binfo;
@@ -479,7 +511,11 @@ static void amb_init(MachineState *ms)
     binfo.loader_start = AMB_LINUX_BASE;
     binfo.board_id = -1;
     binfo.get_dtb = amb_build_fdt;
-    arm_load_kernel(ARM_CPU(cpu), ms, &binfo);
+    if (ms->kernel_filename || !ams->flash_file) {
+        arm_load_kernel(ARM_CPU(cpu), ms, &binfo);
+    } else {
+        amb_boot_from_flash(sysmem, ams->flash_file);
+    }
 }
 
 static char *amb_get_sensor(Object *obj, Error **errp)
