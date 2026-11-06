@@ -17,6 +17,7 @@ desk. Vendor families covered:
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
   FH8626V100, FH8632
 - **Grain Media** GM8135S, GM8136, GM8136S
+- **Ambarella** S3L
 - **Ingenic** T10, T20, T21, T23, T30, T31 (XBurst1) and T40, T41 (XBurst2) —
   the one MIPS family
 
@@ -24,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (109 total)
+## Supported Machines (110 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -381,6 +382,18 @@ OpenIPC's `gm8136` and `gm8135` releases boot with `-kernel`
 (`qemu-boot/test-grainmedia-boot.sh`) to a login prompt with a DHCP lease
 and the JFFS2 overlay on the NOR. Map, boot chain and devices are in
 [docs/grainmedia.md](docs/grainmedia.md).
+
+### Ambarella S3L (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `s3l` | Cortex-A9 | Ambarella VIC | 3.10.104 | yes |
+
+A test bench for the Amcrest IP4M-1026E / Dahua IPC-HFW1430SN, in
+`hw/arm/ambarella.c`, with no video. The vendor kernel boots to a shell,
+`ipctool` reports the same SoC, RAM and OV4689 as the camera, and the
+firmware's `load_ambarella` loads the shipped modules. See
+[docs/ambarella.md](docs/ambarella.md).
 
 ### Ingenic T-series (`qemu-system-mipsel`)
 
@@ -736,6 +749,11 @@ qemu/
 ├── hw/rtc/fh-rtc.c              # Fullhan RTC, command-based and v1 layouts
 ├── hw/watchdog/fh-wdt.c         # DW watchdog
 ├── hw/misc/fh-efuse.c           # eFuse controller
+├── hw/arm/ambarella.c           # Ambarella S3L machine, generated device tree
+├── hw/misc/amb-vic.c            # Ambarella VIC and the scratchpad that names the IRQ
+├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
+├── hw/misc/amb-rct.c            # Ambarella reset and clock tree
+├── hw/i2c/amb-idc.c             # Ambarella IDC I2C master
 ├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
 ├── hw/mips/ingenic.c            # Ingenic T10..T41 machines, mask ROM stand-in, bootm
 ├── hw/misc/ingenic-cpm.c        # CPM: PLL lock, divider busy, per-SoC PLL encodings
@@ -867,6 +885,7 @@ qemu-boot/
 ├── run-fullhan.sh               # Fullhan: boot a NOR image (dump or OpenIPC) on any fh* machine
 ├── fh-openipc-flash.sh          # Fullhan: OpenIPC release onto a dump's vendor U-Boot
 ├── test-fullhan-boot.sh         # Fullhan OpenIPC kernel: login, DHCP, JFFS2 written back
+├── test-s3l-boot.sh             # Ambarella S3L: ipctool and load_ambarella on a guest
 ├── test-grainmedia-boot.sh      # Grain Media OpenIPC kernel: login, DHCP, JFFS2 written back
 ├── test-grainmedia-rtsp.sh      # Grain Media camera dump from flash: its RTSP H.264 decodes
 ├── test-ingenic-boot.sh         # Ingenic OpenIPC: -kernel or SPL+U-Boot from flash; login, DHCP, JFFS2
@@ -905,6 +924,7 @@ docs/
 ├── goke-gk710x.md               # GK7101/GK7102: the HAL, real memory map, boot
 ├── anyka.md                     # AK39xx: L2 buffer, mask ROM, boot NOR
 ├── fullhan.md                   # Fullhan: generations, mask ROM, SPIC, DMACs
+├── ambarella.md                 # Ambarella S3L: map, what it proves and what it does not
 ├── grainmedia.md                # Grain Media GM813x: map, nsboot boot chain, video, audio, MJPEG
 ├── ingenic.md                   # Ingenic T-series: map, CPUs, mask ROM and cache-as-RAM, devices
 ├── sigmastar.md                 # SigmaStar/MStar infinity2m/infinity3: RIU banks, boot chain

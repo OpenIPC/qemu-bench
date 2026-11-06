@@ -1,0 +1,387 @@
+/*
+ * Ambarella S3L: a single Cortex-A9 among Ambarella's own peripherals, as in
+ * the Amcrest IP4M-1026E / Dahua IPC-HFW1430SN (docs/ambarella.md).
+ *
+ * The map follows arch/arm/boot/dts/ambarella-s3l.dtsi in the vendor kernel
+ * (OpenIPC/linux, branch ambarella-s3l).  With -kernel the machine generates
+ * the device tree the boot loader would pass, including the /iavmem node
+ * that says how much of DRAM belongs to the DSP: Linux gets what is below
+ * it.  What software needs from the IAV blocks stops at loading its modules;
+ * there is no video here.  Blocks with no model read as zero.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qemu/units.h"
+#include "hw/arm/boot.h"
+#include "hw/arm/machines-qom.h"
+#include "hw/boards.h"
+#include "hw/char/serial-mm.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
+#include "hw/irq.h"
+#include "hw/misc/unimp.h"
+#include "hw/qdev-properties.h"
+#include "hw/sysbus.h"
+#include "system/address-spaces.h"
+#include "system/device_tree.h"
+#include "system/system.h"
+#include "target/arm/cpu.h"
+#include <libfdt.h>
+
+#define TYPE_AMB_MACHINE MACHINE_TYPE_NAME("s3l")
+OBJECT_DECLARE_SIMPLE_TYPE(AmbMachineState, AMB_MACHINE)
+
+#define AMB_RAM_DEFAULT     (512 * MiB)
+#define AMB_LINUX_BASE      0x00200000  /* the PPM below it is the DSP's */
+#define AMB_IAVMEM_BASE     0x07800000  /* mem=118M, as on the IP4M-1026E */
+
+#define AMB_AHB_BASE        0xe0000000
+#define AMB_VIC0_BASE       0xe0003000
+#define AMB_VIC1_BASE       0xe0010000
+#define AMB_SCRATCHPAD_BASE 0xe001b000
+#define AMB_VIC2_BASE       0xe001c000
+#define AMB_APB_BASE        0xe8000000
+#define AMB_IDC1_BASE       0xe8001000
+#define AMB_IDC0_BASE       0xe8003000
+#define AMB_UART0_BASE      0xe8005000
+#define AMB_IDC2_BASE       0xe8007000
+#define AMB_TIMER_BASE      0xe800b000
+#define AMB_DBGBUS_BASE     0xec000000
+#define AMB_RCT_BASE        0xec170000
+#define AMB_DRAMC_BASE      0xdffe0000
+#define AMB_AXI_BASE        0xf0000000
+#define AMB_L2_BASE         0xf0002000
+
+#define AMB_IRQ_TIMER7      6
+#define AMB_IRQ_UART0       61
+#define AMB_IRQ_TIMER8      63
+#define AMB_IRQ_IDC2        81
+#define AMB_IRQ_IDC1        82
+#define AMB_IRQ_IDC0        83
+
+#define AMB_DT_EDGE_RISING  1
+#define AMB_DT_LEVEL_HIGH   4
+
+#define AMB_UART_US         0x7c    /* past what the 16550 model covers */
+#define AMB_UART_US_TFE     0x04
+#define AMB_UART_US_TFNF    0x02
+
+struct AmbMachineState {
+    MachineState parent_obj;
+
+    char *sensor;
+};
+
+static const struct {
+    const char *name;
+    hwaddr base;
+    uint64_t size;
+} amb_unimp[] = {
+    { "amb-ahb", AMB_AHB_BASE, 16 * MiB },
+    { "amb-apb", AMB_APB_BASE, 16 * MiB },
+    { "amb-dbgbus", AMB_DBGBUS_BASE, 2 * MiB },
+    { "amb-dramc", AMB_DRAMC_BASE, 128 * KiB },
+    { "amb-axi", AMB_AXI_BASE, 192 * KiB },
+};
+
+static const struct {
+    hwaddr base;
+    int irq;
+} amb_idc[] = {
+    { AMB_IDC0_BASE, AMB_IRQ_IDC0 },
+    { AMB_IDC1_BASE, AMB_IRQ_IDC1 },
+    { AMB_IDC2_BASE, AMB_IRQ_IDC2 },
+};
+
+/* The driver only reads this to see whether its transmit FIFO has room. */
+static uint64_t amb_uart_ext_read(void *opaque, hwaddr off, unsigned size)
+{
+    return off == 0 ? AMB_UART_US_TFE | AMB_UART_US_TFNF : 0;
+}
+
+static void amb_uart_ext_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size)
+{
+}
+
+static const MemoryRegionOps amb_uart_ext_ops = {
+    .read = amb_uart_ext_read,
+    .write = amb_uart_ext_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+static void amb_fdt_irq(void *fdt, const char *path, int irq, int type)
+{
+    qemu_fdt_setprop_cells(fdt, path, "interrupts", irq, type);
+}
+
+static void amb_fdt_timer(void *fdt, const char *compat, hwaddr base, int irq,
+                          int ctrl_offset)
+{
+    g_autofree char *path = g_strdup_printf("/apb@e8000000/timer@%" HWADDR_PRIx,
+                                            base);
+
+    qemu_fdt_add_subnode(fdt, path);
+    qemu_fdt_setprop_string(fdt, path, "compatible", compat);
+    qemu_fdt_setprop_cells(fdt, path, "reg", base, 0x10,
+                           AMB_TIMER_BASE + 0x30, 4);
+    amb_fdt_irq(fdt, path, irq, AMB_DT_EDGE_RISING);
+    qemu_fdt_setprop_cell(fdt, path, "ctrl-offset", ctrl_offset);
+}
+
+static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    void *fdt = create_device_tree(size);
+    uint32_t intc;
+
+    intc = qemu_fdt_alloc_phandle(fdt);
+    qemu_fdt_setprop_string(fdt, "/", "model", "Ambarella S3L Olive Board");
+    qemu_fdt_setprop_string(fdt, "/", "compatible", "ambarella,s3l");
+    qemu_fdt_setprop_cell(fdt, "/", "#address-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/", "#size-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/", "interrupt-parent", intc);
+
+    qemu_fdt_add_subnode(fdt, "/aliases");
+    qemu_fdt_setprop_string(fdt, "/aliases", "serial0",
+                            "/apb@e8000000/uart@e8005000");
+    qemu_fdt_setprop_string(fdt, "/aliases", "i2c0",
+                            "/apb@e8000000/i2c@e8003000");
+    qemu_fdt_setprop_string(fdt, "/aliases", "i2c1",
+                            "/apb@e8000000/i2c@e8001000");
+    qemu_fdt_setprop_string(fdt, "/aliases", "i2c2",
+                            "/apb@e8000000/i2c@e8007000");
+
+    qemu_fdt_add_subnode(fdt, "/chosen");
+    qemu_fdt_setprop_string(fdt, "/chosen", "linux,stdout-path",
+                            "/apb@e8000000/uart@e8005000");
+
+    qemu_fdt_add_subnode(fdt, "/memory");
+    qemu_fdt_setprop_string(fdt, "/memory", "device_type", "memory");
+    qemu_fdt_setprop_cells(fdt, "/memory", "reg", AMB_LINUX_BASE,
+                           AMB_IAVMEM_BASE - AMB_LINUX_BASE);
+
+    /* What the boot loader adds.  The kernel takes it from here, and so
+     * does anything reading /proc/device-tree/iavmem/reg. */
+    qemu_fdt_add_subnode(fdt, "/iavmem");
+    qemu_fdt_setprop_string(fdt, "/iavmem", "device_type", "iavmem");
+    qemu_fdt_setprop_cells(fdt, "/iavmem", "reg", AMB_IAVMEM_BASE,
+                           ms->ram_size - AMB_IAVMEM_BASE);
+
+    /* iav.ko dereferences this without checking; it holds the VIN's reset
+     * and power GPIOs, which are optional and left out. */
+    qemu_fdt_add_subnode(fdt, "/iav");
+    qemu_fdt_setprop_string(fdt, "/iav", "compatible", "ambarella,iav");
+    qemu_fdt_add_subnode(fdt, "/iav/vinc0");
+
+    qemu_fdt_add_subnode(fdt, "/cpus");
+    qemu_fdt_setprop_cell(fdt, "/cpus", "#address-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/cpus", "#size-cells", 0);
+    qemu_fdt_add_subnode(fdt, "/cpus/cpu@0");
+    qemu_fdt_setprop_string(fdt, "/cpus/cpu@0", "device_type", "cpu");
+    qemu_fdt_setprop_string(fdt, "/cpus/cpu@0", "compatible",
+                            "arm,cortex-a9");
+    qemu_fdt_setprop_cell(fdt, "/cpus/cpu@0", "reg", 0);
+
+    qemu_fdt_add_subnode(fdt, "/ahb@e0000000");
+    qemu_fdt_setprop_string(fdt, "/ahb@e0000000", "compatible", "simple-bus");
+    qemu_fdt_setprop_cell(fdt, "/ahb@e0000000", "#address-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/ahb@e0000000", "#size-cells", 1);
+    qemu_fdt_setprop(fdt, "/ahb@e0000000", "ranges", NULL, 0);
+    qemu_fdt_add_subnode(fdt, "/ahb@e0000000/interrupt-controller@e0003000");
+    {
+        const char *p = "/ahb@e0000000/interrupt-controller@e0003000";
+
+        qemu_fdt_setprop_string(fdt, p, "compatible", "ambarella,vic");
+        qemu_fdt_setprop(fdt, p, "interrupt-controller", NULL, 0);
+        qemu_fdt_setprop_cell(fdt, p, "#interrupt-cells", 2);
+        qemu_fdt_setprop_cells(fdt, p, "reg", AMB_VIC0_BASE, 0x1000,
+                               AMB_VIC1_BASE, 0x1000, AMB_VIC2_BASE, 0x1000);
+        qemu_fdt_setprop_cell(fdt, p, "phandle", intc);
+    }
+
+    qemu_fdt_add_subnode(fdt, "/apb@e8000000");
+    qemu_fdt_setprop_string(fdt, "/apb@e8000000", "compatible", "simple-bus");
+    qemu_fdt_setprop_cell(fdt, "/apb@e8000000", "#address-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/apb@e8000000", "#size-cells", 1);
+    qemu_fdt_setprop(fdt, "/apb@e8000000", "ranges", NULL, 0);
+
+    amb_fdt_timer(fdt, "ambarella,clock-source", AMB_TIMER_BASE + 0x64,
+                  AMB_IRQ_TIMER7, 24);
+    amb_fdt_timer(fdt, "ambarella,clock-event", AMB_TIMER_BASE + 0x74,
+                  AMB_IRQ_TIMER8, 28);
+
+    qemu_fdt_add_subnode(fdt, "/apb@e8000000/uart@e8005000");
+    {
+        const char *p = "/apb@e8000000/uart@e8005000";
+
+        qemu_fdt_setprop_string(fdt, p, "compatible", "ambarella,uart");
+        qemu_fdt_setprop_cells(fdt, p, "reg", AMB_UART0_BASE, 0x1000);
+        amb_fdt_irq(fdt, p, AMB_IRQ_UART0, AMB_DT_LEVEL_HIGH);
+        /* The driver refuses to probe with no default pin state.  An empty
+         * one is a dummy to Linux, and there is no pad mux to set up here. */
+        qemu_fdt_setprop_string(fdt, p, "pinctrl-names", "default");
+        qemu_fdt_setprop(fdt, p, "pinctrl-0", NULL, 0);
+    }
+
+    for (int i = 0; i < ARRAY_SIZE(amb_idc); i++) {
+        g_autofree char *p = g_strdup_printf("/apb@e8000000/i2c@%" HWADDR_PRIx,
+                                             amb_idc[i].base);
+
+        qemu_fdt_add_subnode(fdt, p);
+        qemu_fdt_setprop_string(fdt, p, "compatible", "ambarella,i2c");
+        qemu_fdt_setprop_cell(fdt, p, "#address-cells", 1);
+        qemu_fdt_setprop_cell(fdt, p, "#size-cells", 0);
+        qemu_fdt_setprop_cells(fdt, p, "reg", amb_idc[i].base, 0x1000);
+        amb_fdt_irq(fdt, p, amb_idc[i].irq, AMB_DT_LEVEL_HIGH);
+        qemu_fdt_setprop_cell(fdt, p, "clock-frequency", 100000);
+        qemu_fdt_setprop_cell(fdt, p, "amb,i2c-class", 0x81);
+    }
+
+    qemu_fdt_add_subnode(fdt, "/l2-cache@f0002000");
+    qemu_fdt_setprop_string(fdt, "/l2-cache@f0002000", "compatible",
+                            "arm,pl310-cache");
+    qemu_fdt_setprop_cells(fdt, "/l2-cache@f0002000", "reg", AMB_L2_BASE,
+                           0x1000);
+    qemu_fdt_setprop(fdt, "/l2-cache@f0002000", "cache-unified", NULL, 0);
+    qemu_fdt_setprop_cell(fdt, "/l2-cache@f0002000", "cache-level", 2);
+
+    return fdt;
+}
+
+static void amb_init(MachineState *ms)
+{
+    static struct arm_boot_info binfo;
+    AmbMachineState *ams = AMB_MACHINE(ms);
+    MemoryRegion *sysmem = get_system_memory();
+    MemoryRegion *uart_ext = g_new(MemoryRegion, 1);
+    Object *cpuobj;
+    DeviceState *cpu, *vic, *timer;
+    SysBusDevice *sbd;
+
+    if (ms->ram_size <= AMB_IAVMEM_BASE) {
+        error_report("s3l: -m must leave room for the DSP above %d MiB",
+                     AMB_IAVMEM_BASE / (int)MiB);
+        exit(1);
+    }
+
+    memory_region_add_subregion(sysmem, 0, ms->ram);
+
+    for (int i = 0; i < ARRAY_SIZE(amb_unimp); i++) {
+        create_unimplemented_device(amb_unimp[i].name, amb_unimp[i].base,
+                                    amb_unimp[i].size);
+    }
+
+    cpuobj = object_new(ms->cpu_type);
+    if (object_property_find(cpuobj, "has_el3")) {
+        object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
+    }
+    /* r4p1, as the camera reports: /proc/cpuinfo prints it */
+    object_property_set_uint(cpuobj, "midr", 0x414fc091, &error_fatal);
+    qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+    cpu = DEVICE(cpuobj);
+    object_unref(cpuobj);
+
+    vic = qdev_new("amb-vic");
+    sbd = SYS_BUS_DEVICE(vic);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, AMB_VIC0_BASE);
+    sysbus_mmio_map(sbd, 1, AMB_VIC1_BASE);
+    sysbus_mmio_map(sbd, 2, AMB_VIC2_BASE);
+    sysbus_mmio_map(sbd, 3, AMB_SCRATCHPAD_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(cpu, ARM_CPU_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(cpu, ARM_CPU_FIQ));
+
+    timer = qdev_new("amb-timer");
+    sbd = SYS_BUS_DEVICE(timer);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, AMB_TIMER_BASE);
+    sysbus_connect_irq(sbd, 6, qdev_get_gpio_in(vic, AMB_IRQ_TIMER7));
+    sysbus_connect_irq(sbd, 7, qdev_get_gpio_in(vic, AMB_IRQ_TIMER8));
+
+    sysbus_create_simple("amb-rct", AMB_RCT_BASE, NULL);
+    sysbus_create_simple("l2x0", AMB_L2_BASE, NULL);
+
+    serial_mm_init(sysmem, AMB_UART0_BASE, 2,
+                   qdev_get_gpio_in(vic, AMB_IRQ_UART0), 115200,
+                   serial_hd(0), DEVICE_LITTLE_ENDIAN);
+    memory_region_init_io(uart_ext, OBJECT(ms), &amb_uart_ext_ops, NULL,
+                          "amb-uart-ext", 0x10);
+    memory_region_add_subregion(sysmem, AMB_UART0_BASE + AMB_UART_US,
+                                uart_ext);
+
+    for (int i = 0; i < ARRAY_SIZE(amb_idc); i++) {
+        DeviceState *idc = qdev_new("amb-idc");
+
+        sbd = SYS_BUS_DEVICE(idc);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, amb_idc[i].base);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, amb_idc[i].irq));
+        if (i == 0) {
+            image_sensor_create(I2C_BUS(qdev_get_child_bus(idc, "i2c")),
+                                ams->sensor);
+        }
+    }
+
+    binfo.ram_size = AMB_IAVMEM_BASE - AMB_LINUX_BASE;
+    binfo.loader_start = AMB_LINUX_BASE;
+    binfo.board_id = -1;
+    binfo.get_dtb = amb_build_fdt;
+    arm_load_kernel(ARM_CPU(cpu), ms, &binfo);
+}
+
+static char *amb_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(AMB_MACHINE(obj)->sensor);
+}
+
+static void amb_set_sensor(Object *obj, const char *val, Error **errp)
+{
+    AmbMachineState *ams = AMB_MACHINE(obj);
+
+    g_free(ams->sensor);
+    ams->sensor = g_strdup(val);
+}
+
+static void amb_machine_instance_init(Object *obj)
+{
+    AMB_MACHINE(obj)->sensor = g_strdup("ov4689");
+}
+
+static void amb_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Ambarella S3L (Cortex-A9)";
+    mc->init = amb_init;
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a9");
+    mc->default_ram_size = AMB_RAM_DEFAULT;
+    mc->default_ram_id = "ambarella.ram";
+    mc->ignore_memory_transaction_failures = true;
+    object_class_property_add_str(oc, "sensor", amb_get_sensor,
+                                  amb_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "image sensor on I2C0, from the sensor catalogue; none for no sensor");
+}
+
+static const TypeInfo amb_machine_info = {
+    .name = TYPE_AMB_MACHINE,
+    .parent = TYPE_MACHINE,
+    .instance_size = sizeof(AmbMachineState),
+    .instance_init = amb_machine_instance_init,
+    .class_init = amb_machine_class_init,
+    .interfaces = arm_machine_interfaces,
+};
+
+static void amb_machine_register(void)
+{
+    type_register_static(&amb_machine_info);
+}
+
+type_init(amb_machine_register)

@@ -61,6 +61,10 @@ cp qemu/hw/gpio/xm-gpio.c           "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/gpio/xm510-gpio.c        "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/watchdog/arm-sp805.c     "$QEMU_DIR/hw/watchdog/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
+cp qemu/hw/arm/ambarella.c          "$QEMU_DIR/hw/arm/"
+for f in $(cd qemu && find hw include -name 'amb-*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
 cp qemu/hw/arm/goke.c               "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/goke.h       "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/gk-vic.c            "$QEMU_DIR/hw/misc/"
@@ -479,6 +483,41 @@ if ! grep -q xiongmai "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xiongmai.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added xiongmai.c"
+fi
+
+# Ambarella S3L (hw/arm/ambarella.c).  Same guarded appends as the others,
+# for a fresh tree and an existing one alike.
+if ! grep -q "^config AMBARELLA$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config AMBARELLA
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+    select UNIMP
+    select A9MPCORE
+    select PL310
+    select I2C
+KCONFIG
+    echo "  hw/arm/Kconfig: added AMBARELLA"
+fi
+for f in amb-vic amb-timer amb-rct; do
+    if ! grep -q "'$f.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('$f.c'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $f.c"
+    fi
+done
+if ! grep -q "'amb-idc.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('amb-idc.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added amb-idc.c"
+fi
+if ! grep -q "'ambarella.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('ambarella.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added ambarella.c"
 fi
 
 # Goke GK7101/GK7102: Goke's own Ambarella-IP design (hw/arm/goke.c), seen
