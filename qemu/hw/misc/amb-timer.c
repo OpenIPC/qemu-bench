@@ -32,6 +32,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbTimerState, AMB_TIMER)
 #define CTRL_CSL        0x2
 #define CTRL_OF         0x4
 
+/*
+ * The shortest a reloading timer repeats.  The silicon would go faster with
+ * RELOAD near 0, but at 11 ns a tick that only leaves the host spinning.
+ */
+#define AMB_TIMER_MIN_PERIOD_NS 1000
+
 typedef struct AmbTimer {
     struct AmbTimerState *owner;
     QEMUTimer *timer;
@@ -92,7 +98,8 @@ static void amb_timer_sync(AmbTimer *t)
 
         t->count = t->reload - past % period;
     }
-    t->base_ns = now;
+    /* Only the whole ticks: the rest of one still counts towards the next */
+    t->base_ns += muldiv64(ticks, NANOSECONDS_PER_SECOND, s->freq);
 }
 
 static void amb_timer_arm(AmbTimer *t)
@@ -123,6 +130,10 @@ static void amb_timer_expire(void *opaque)
         qemu_irq_pulse(t->irq);
     }
     amb_timer_arm(t);
+    if (timer_pending(t->timer)) {
+        timer_mod(t->timer, MAX(timer_expire_time_ns(t->timer),
+                                t->base_ns + AMB_TIMER_MIN_PERIOD_NS));
+    }
 }
 
 static AmbTimer *amb_timer_decode(AmbTimerState *s, hwaddr off, unsigned *reg)

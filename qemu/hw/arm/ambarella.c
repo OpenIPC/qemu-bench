@@ -33,7 +33,8 @@
 #include <libfdt.h>
 
 #define TYPE_AMB_MACHINE MACHINE_TYPE_NAME("s3l")
-OBJECT_DECLARE_SIMPLE_TYPE(AmbMachineState, AMB_MACHINE)
+typedef struct AmbMachineState AmbMachineState;
+DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 
 #define AMB_RAM_DEFAULT     (512 * MiB)
 #define AMB_LINUX_BASE      0x00200000  /* the PPM below it is the DSP's */
@@ -270,6 +271,11 @@ static void amb_init(MachineState *ms)
                      AMB_IAVMEM_BASE / (int)MiB);
         exit(1);
     }
+    if (ms->ram_size > AMB_DRAMC_BASE) {
+        error_report("s3l: -m must end below the peripherals at 0x%x",
+                     AMB_DRAMC_BASE);
+        exit(1);
+    }
 
     memory_region_add_subregion(sysmem, 0, ms->ram);
 
@@ -325,7 +331,7 @@ static void amb_init(MachineState *ms)
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, amb_idc[i].irq));
         if (i == 0) {
             image_sensor_create(I2C_BUS(qdev_get_child_bus(idc, "i2c")),
-                                ams->sensor);
+                                ams->sensor ? ams->sensor : "ov4689");
         }
     }
 
@@ -349,14 +355,9 @@ static void amb_set_sensor(Object *obj, const char *val, Error **errp)
     ams->sensor = g_strdup(val);
 }
 
-static void amb_machine_instance_init(Object *obj)
+static void amb_machine_class_init(MachineClass *mc)
 {
-    AMB_MACHINE(obj)->sensor = g_strdup("ov4689");
-}
-
-static void amb_machine_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
+    ObjectClass *oc = OBJECT_CLASS(mc);
 
     mc->desc = "Ambarella S3L (Cortex-A9)";
     mc->init = amb_init;
@@ -367,21 +368,9 @@ static void amb_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "sensor", amb_get_sensor,
                                   amb_set_sensor);
     object_class_property_set_description(oc, "sensor",
-        "image sensor on I2C0, from the sensor catalogue; none for no sensor");
+        "image sensor on I2C0, from the sensor catalogue (default ov4689); "
+        "none for no sensor");
 }
 
-static const TypeInfo amb_machine_info = {
-    .name = TYPE_AMB_MACHINE,
-    .parent = TYPE_MACHINE,
-    .instance_size = sizeof(AmbMachineState),
-    .instance_init = amb_machine_instance_init,
-    .class_init = amb_machine_class_init,
-    .interfaces = arm_machine_interfaces,
-};
-
-static void amb_machine_register(void)
-{
-    type_register_static(&amb_machine_info);
-}
-
-type_init(amb_machine_register)
+DEFINE_MACHINE_EXTENDED("s3l", MACHINE, AmbMachineState,
+                        amb_machine_class_init, false, arm_machine_interfaces)

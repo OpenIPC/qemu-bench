@@ -317,6 +317,7 @@ static void amb_vic_reset(DeviceState *dev)
         s->bank[i].level = level;
     }
     memset(s->scratch, 0, sizeof(s->scratch));
+    amb_vic_update(s);
 }
 
 static void amb_vic_init(Object *obj)

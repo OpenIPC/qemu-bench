@@ -3,22 +3,25 @@
 # what the IP4M-1026E in ipctool#266 reported.  See docs/ambarella.md.
 #
 #   qemu-boot/test-s3l-boot.sh --kernel zImage --ipctool DIR --firmware DIR \
-#       --target DIR [--qemu PATH]
+#       --target DIR [--cc CROSS-GCC] [--qemu PATH]
 #
 #   --kernel    zImage built from OpenIPC/linux branch ambarella-s3l
 #   --ipctool   directory with ARM builds of ipctool and ipcinfo
 #   --firmware  an OpenIPC/firmware checkout: the shipped modules and script
 #   --target    a built firmware target/ with an ARM bin/busybox and its libc
+#   --cc        an ARM gcc: also build the firmware's load_ucode and run it
+#               against the real dsp.ko, with made-up microcode
 set -u
 
 QEMU=./qemu-src/build/qemu-system-arm
-KERNEL= IPCTOOL= FIRMWARE= TARGET=
+KERNEL= IPCTOOL= FIRMWARE= TARGET= CROSS=
 while [ $# -gt 0 ]; do
     case "$1" in
         --kernel) KERNEL=$2; shift 2 ;;
         --ipctool) IPCTOOL=$2; shift 2 ;;
         --firmware) FIRMWARE=$2; shift 2 ;;
         --target) TARGET=$2; shift 2 ;;
+        --cc) CROSS=$2; shift 2 ;;
         --qemu) QEMU=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -49,6 +52,62 @@ printf '#!/bin/sh\nexit 1\n' > "$root/usr/bin/fw_printenv"
 chmod +x "$root/usr/bin/fw_printenv"
 /usr/sbin/depmod -b "$root" 3.10.104 2>/dev/null
 
+# Reads the window back: the three words the version comes from, and a sum
+# over the whole of it, so a bad set can be shown to have changed nothing.
+peek_c() {
+    cat <<'PEEK'
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/mman.h>
+int main(void)
+{
+    int fd = open("/dev/ucode", O_RDWR);
+    uint32_t *m = mmap(0, 5 << 20, PROT_READ, MAP_SHARED, fd, 0);
+    uint32_t sum = 0;
+
+    if (m == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    for (uint32_t i = 0; i < (5 << 20) / 4; i++) {
+        sum += m[i] * (i | 1);
+    }
+    printf("window %08x %u %u sum %08x\n", m[23], m[22], m[24], sum);
+    return 0;
+}
+PEEK
+}
+
+ucode_set() {   # dir num ver date orccode-size orcme-size binary-size
+    python3 - "$@" <<'SET'
+import os
+import struct
+import sys
+
+d, num, ver, date, a, b, c = sys.argv[1:]
+os.makedirs(d, exist_ok=True)
+code = bytearray(b'\x5a' * int(a))
+if int(a) >= 100:
+    struct.pack_into('<III', code, 88, int(num), int(date), int(ver))
+open(d + '/orccode.bin', 'wb').write(code)
+open(d + '/orcme.bin', 'wb').write(b'\x5b' * int(b))
+open(d + '/default_binary.bin', 'wb').write(b'\x5c' * int(c))
+SET
+}
+
+ucode_run=
+if [ -n "$CROSS" ]; then
+    src=$FIRMWARE/general/package/legacy/ambarella-osdrv-s3l/src/load_ucode.c
+    "$CROSS" -static -O2 -o "$root/usr/bin/load_ucode" "$src" || exit 1
+    peek_c | "$CROSS" -static -O2 -x c -o "$root/usr/bin/peek" - || exit 1
+    # 2017/2/22
+    ucode_set "$root/lib/firmware" 267837 266889 132186646 1648217 201712 399808
+    ucode_set "$root/t/big" 1 2 3 1000 655361 1000
+    ucode_set "$root/t/empty" 1 2 3 1000 0 1000
+    ucode_run=1
+fi
+
 cat > "$root/init" <<'INIT'
 #!/bin/sh
 export PATH=/sbin:/bin:/usr/bin
@@ -59,6 +118,7 @@ echo "### ipctool"
 ipctool
 echo "### load"
 load_ambarella -i
+echo "### first rc=$?"
 echo "### modules"
 awk '{print $1}' /proc/modules | tr '\n' ' '
 echo
@@ -68,6 +128,18 @@ echo "### clock"
 cat /proc/ambarella/clock
 echo "### again"
 load_ambarella -i
+echo "### again rc=$?"
+if [ -x /usr/bin/peek ]; then
+    # load_ambarella keeps the loader quiet, so once more where it shows
+    load_ucode /lib/firmware
+    echo "### window"
+    peek
+    for d in /nonexistent /t/big /t/empty; do
+        load_ucode $d
+        echo "### bad set rc=$?"
+        peek
+    done
+fi
 echo "### end"
 sleep 1000
 INIT
@@ -113,10 +185,37 @@ want 'media RAM from /iavmem' 'media: 392M'
 want 'the sensor' 'model: OV4689'
 want 'on bus 0' 'bus: 0'
 want 'at its address' 'addr: 0x6c'
+if [ -n "$ucode_run" ]; then
+    want 'load_ambarella ran the loader' '^### first rc=0'
+    want 'and again' '^### again rc=0'
+    want 'the driver read the version back' \
+        'ucode version 2017/2/22 267837\.266889'
+    want 'orccode.bin at its offset' 'orccode\.bin: 1648217 bytes at \+0x000000'
+    want 'orcme.bin at its offset' 'orcme\.bin: 201712 bytes at \+0x300000'
+    want 'too big a file is refused' 'orcme\.bin is 655361 bytes'
+    want 'an empty file is refused' 'orcme\.bin is 0 bytes'
+    [ "$(grep -c '^### bad set rc=1' "$log")" = 3 ] && result=true || result=false
+    if $result; then
+        echo "  PASS: every bad set exits 1"
+    else
+        echo "  FAIL: every bad set exits 1"
+        failures=$((failures + 1))
+    fi
+    if [ "$(grep '^window ' "$log" | sort -u | wc -l)" = 1 ] &&
+       [ "$(grep -c '^window ' "$log")" = 4 ]; then
+        echo "  PASS: a bad set leaves the window as it was"
+    else
+        echo "  FAIL: a bad set leaves the window as it was"
+        failures=$((failures + 1))
+    fi
+else
+    want 'no microcode is said out loud' 'No DSP microcode on this image'
+    # load_ambarella returns 1 for that, the same both times
+    want 'the second run ended as the first' '^### again rc=1'
+fi
 want 'iav and what it needs came up' '^(.* )?ov4689_mipi .*iav .*dsp'
 want '/dev/iav, root only' 'crw------- .*248, +0 '
 want '/dev/ucode, root only' 'crw------- .*248, +1 '
-want 'no microcode is said out loud' 'No DSP microcode on this image'
 want 'gclk_apb' 'gclk_apb:[[:space:]]+90000000 Hz'
 want 'gclk_ddr' 'gclk_ddr:[[:space:]]+840000000 Hz'
 absent 'no oops' 'Oops|Kernel panic|Unable to handle'

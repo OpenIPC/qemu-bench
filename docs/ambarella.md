@@ -22,7 +22,8 @@ branch `ambarella-s3l`, with the firmware's
 ```
 
 `-M s3l,sensor=<name>` picks another sensor from the catalogue for I2C0, and
-`sensor=none` leaves the bus empty. `-m` sets DRAM and must be over 120 MiB.
+`sensor=none` leaves the bus empty. `-m` sets DRAM: over 120 MiB, for the DSP,
+and at most 0xDFFE0000, where the peripherals start.
 
 ## What is modelled
 
@@ -66,7 +67,9 @@ so these reset to the rates `/proc/ambarella/clock` shows on the camera. Note
 
 **A timer's expiry is an underflow.** Working the count out from the clock at
 that moment can come to zero ticks, because the conversions truncate, and the
-timer then re-arms at the same instant for ever. The handler just reloads.
+timer then re-arms at the same instant for ever. The handler just reloads. A
+reloading timer repeats no faster than every microsecond, slower than the
+silicon: `RELOAD` 0 is the reset value, and 11 ns ticks only spin the host.
 
 ## Testing
 
@@ -80,6 +83,11 @@ says Ambarella S3L, 512M total, 392M media and an OV4689 at 0x6c on bus 0;
 `/dev/iav` and `/dev/ucode` root-only at 248:0 and 248:1, and reports that no
 microcode is present. It takes the kernel, ipctool, and a firmware checkout, so
 it does not run in CI.
+
+With `--cc`, it also builds the firmware's `load_ucode` and runs it against the
+real `dsp.ko` with made-up microcode: the files land at their offsets, the
+version comes back through the driver, and a bad set leaves the window as it
+was. That proves the loader and the ABI, not a DSP boot.
 
 What this does not prove: anything about the DSP, the sensor's real timing, or
 the Dahua kernel's behaviour. The sensor here is a register file that answers

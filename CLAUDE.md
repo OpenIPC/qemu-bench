@@ -357,7 +357,8 @@ is below 0x07800000. On S3L the kernel takes interrupts from one scratchpad
 register, not the banks, and all ones there means none (0x60 is S3's value).
 `iav.ko` oopses without an `/iav/vinc0` node. The vendor modules load, but no
 microcode ships, so the DSP stays down. `-m` must be over 120 MiB, so the smoke
-test above needs its default RAM.
+test above needs its default RAM. A reloading `amb-timer` repeats no faster
+than 1 us, so `RELOAD` 0 cannot pin the host.
 
 Novatek NT9856x / NA51089 (`hw/arm/novatek.c`, `docs/novatek.md`) is a
 fifth: a Cortex-A9 whose MPCore is at `0xFFD00000` (the `0xF1500000` GIC in

@@ -13,8 +13,9 @@ kernel (docs/ambarella.md):
     mask registers agree, an edge stays latched until cleared;
   - amb-idc: the driver's CTRL conversation reads the OV4689's chip ID from
     I2C0, and an address nobody answers comes back not acknowledged;
-  - sensor=none leaves the bus empty, too little RAM for the DSP is refused,
-    and machine state migrates to a file and back.
+  - a guest reset clears what was pending, sensor=none leaves the bus
+    empty, RAM that leaves no room for the DSP or runs into the peripherals
+    is refused, and machine state migrates to a file and back.
 
     python3 qemu/tests/test-ambarella.py [--qemu PATH]
 """
@@ -182,6 +183,43 @@ def test_timer_and_vic(qt):
     check('the clocksource counts down', a - qt.readl(TIMER7), 90)
     qt.writel(TIMER_CTRL, 0)
 
+    # A guest polling or rewriting a register more often than one tick
+    # (11 ns) must not hold the expiry off.
+    qt.writel(bank + INT_EN, bit)
+    qt.writel(TIMER8 + 0x0, 9)          # 100 ns
+    qt.writel(TIMER8 + 0x4, 0xFFFFFFFF)
+    qt.writel(TIMER_CTRL, T8_EN | T8_OF)
+    for _ in range(25):
+        qt.writel(TIMER8 + 0x8, 0)
+        qt.step(5)
+    check('writes under a tick apart do not postpone it', qt.readl(PRI_IRQ),
+          LINE_TIMER8)
+    qt.writel(TIMER_CTRL, 0)
+    qt.writel(bank + INT_EDGE_CLR, bit)
+
+    # RELOAD 0 is the reset value: this has to return, not spin
+    qt.writel(TIMER8 + 0x0, 0)
+    qt.writel(TIMER8 + 0x4, 0)
+    qt.writel(TIMER_CTRL, T8_EN | T8_OF)
+    qt.step(100000)
+    check('RELOAD 0 fires without pinning the host', qt.readl(PRI_IRQ),
+          LINE_TIMER8)
+    qt.writel(TIMER_CTRL, 0)
+    qt.writel(bank + INT_EDGE_CLR, bit)
+    qt.writel(bank + INT_EN_CLR, bit)
+
+
+def test_reset(qt):
+    print('guest reset')
+    qt.writel(VIC2 + 0x18, 1 << 3)
+    qt.writel(VIC2 + INTEN, 1 << 3)
+    check('pending before the reset', qt.readl(PRI_IRQ), 64 + 3)
+    qt.writel(RCT + 0x68, 0x2)
+    qt.writel(RCT + 0x68, 0x3)
+    qt.step(1000)
+    check('nothing pending after it', qt.readl(PRI_IRQ), NO_IRQ)
+    check('the mask went with it', qt.readl(VIC2 + INTEN), 0)
+
 
 def test_lines(qt):
     print('amb-vic trigger setup')
@@ -275,6 +313,12 @@ def test_rejections_and_migration(qemu, tmp):
     check('no room for the DSP is refused', 'room for the DSP' in r.stderr,
           True)
 
+    r = subprocess.run([qemu, '-M', 's3l', '-m', '3584M', '-display', 'none',
+                        '-nodefaults', '-kernel', '/dev/null'],
+                       capture_output=True, text=True, timeout=20)
+    check('RAM over the peripherals is refused',
+          'end below the peripherals' in r.stderr, True)
+
     mig = os.path.join(tmp, 's3l.mig')
     out = hmp(qemu, ['-M', 's3l', '-S'],
               ['migrate file:' + mig, 'info migrate'])
@@ -301,6 +345,7 @@ def main():
         test_timer_and_vic(qt)
         test_lines(qt)
         test_i2c(qt)
+        test_reset(qt)
     finally:
         qt.close()
     test_no_sensor(args.qemu)
