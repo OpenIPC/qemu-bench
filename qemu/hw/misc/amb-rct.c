@@ -43,6 +43,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbRctState, AMB_RCT)
 #define R_TIMER2        0x494
 #define R_TIMER2_CTRL   0x498
 #define R_PLL_CORTEX    0x264
+#define R_CHIP_ID       0x300
+
+/*
+ * The boot loader identifies the SoC from bits [31:24] of 0x300 (RCT + 0x300)
+ * and picks the matching device tree from the ones packed in the BLD: it
+ * decodes 0x4a000000 as "chip 4" (S3Lm, e.g. the DS-2CD2423G0-I), 0x40000000
+ * as chip 5, and defaults to a generic tree ("chip id error, default dtb_0")
+ * otherwise -- which leaves the kernel with the wrong flash/eMMC and board
+ * description.  The S3Lm value is what the Hikvision stock loader expects.
+ */
+#define AMB_CHIP_ID_S3LM 0x4a000000
 
 #define AMB_RCT_REF_HZ  24000000
 
@@ -63,6 +74,9 @@ static uint64_t amb_rct_read(void *opaque, hwaddr off, unsigned size)
 
     if (off == R_PLL_LOCK) {
         return 0xffffffff;
+    }
+    if (off == R_CHIP_ID) {
+        return AMB_CHIP_ID_S3LM;
     }
     if (off == R_TIMER || off == R_TIMER2) {
         return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -

@@ -78,7 +78,7 @@ is, and the guest's changes last until it exits, so `chmod 444` protects a dump.
 | FIO, FDMA, NAND | `0xE0001000`, `0xE0012000` | `amb-nand`, with `flash-file=` |
 | Ethernet | `0xE000E000` | `xm-dwmac`, keeping the FCS: the driver takes 4 off |
 | SD0, SD2 | `0xE0002000`, `0xE001F000` | QEMU's SDHCI with capability bit 27 |
-| RCT | `0xEC170000` | `amb-rct` |
+| RCT | `0xEC170000` | `amb-rct`: PLL words, free-running timers, chip id at 0x300 |
 | L2 cache | `0xF0002000` | QEMU's `l2x0` |
 
 Everything else in the AHB, APB, debug bus, DRAM controller and AXI windows is
@@ -126,9 +126,19 @@ copies itself from those addresses. Both loaders time everything with RCT's
 free-running counters, the BST polls `FLASH_INT` and reads whole blocks with one
 DMA, and the BLD reads spare areas through DMA descriptors and looks for its
 bad-block table in the last blocks. A stock image from a real camera reaches its
-main application this way, then reboots, because the vendor's `hikio` driver
-wants board data this machine does not provide. Straps are the camera's:
-`SYS_CONFIG` picks NAND, 2K pages and BCH.
+main application this way, then reboots: see "The stock app" below. Straps are
+the camera's: `SYS_CONFIG` picks NAND, 2K pages and BCH.
+
+**The boot loader needs a chip id.** The BLD reads `RCT + 0x300` to name the
+SoC and pick one of the device trees packed in it: `0x4a000000` is an S3Lm
+(`hik_chip_name` "S3L11M", e.g. the DS-2CD2423G0-I), `0x40000000` the next part
+up, and anything else is "chip id error, default dtb_0" -- a generic tree that
+leaves the kernel with the wrong flash, SD and board description. `amb-rct`
+returns the S3Lm value, so the BLD runs the real board init and patches the
+right tree (`hik_chip_id`, `hik_dram_size`, the NAND partition table from the
+`ptb` partition, and the board-identity nodes the kernel reads). Without it the
+BLD defaulted everything and the kernel came up on a tree that could not mount
+its own volumes.
 
 **PLL rates are read back.** The kernel derives every clock from the RCT words,
 so these reset to the rates `/proc/ambarella/clock` shows on the IP4M-1026E. They
@@ -140,6 +150,31 @@ whole transfer happens in that write, and `amb-nand` then raises all three
 interrupts. The driver waits for all of them. The straps in `SYS_CONFIG` decide
 its ECC mode, so `flash-file=` sets them; without them it would pick 1-bit ECC and
 a different spare layout.
+
+**The stock app needs a chip this machine does not model.** With the chip id in
+place (above) the stock loader boots its own kernel and device tree correctly,
+but the application (`davinci`) still reboots within half a minute:
+`HIKIO_GET_DEV_HARD_INFO error. errno 14`, then `hwif_getcoreinfo failed` and
+`sys app init failed to reboot!`. That ioctl in the vendor `hikio` driver maps
+any failure of its `get_dev_info` to `EFAULT`, and `get_dev_info` is gated on a
+flag a kernel `__init` sets only after reading a two-byte id from a board
+info/security chip that it bit-bangs over GPIO (the same chip behind the early
+"Card authentication succeeded" line). This machine models no such chip, so the
+read returns nothing, the flag stays clear and the app gives up. It is not the
+eMMC: `mmc2` (`sdmmc2`) is the camera's microSD slot, and it finds no card on
+the real hardware too. Standing the app up would mean emulating that
+Hikvision-specific chip with board-specific responses, and the DSP (ORC
+microcode via `/dev/ucode`) cannot run here regardless, so the machine is not
+meant to reach the vendor app -- it reaches OpenIPC and ipctool, which is the
+point.
+
+**The stock kernel's console is silent without a baud.** Its bootargs are
+`console=ttyS0` with no rate, and the vendor `ambarella-uart` driver's console
+does not enable against QEMU's plain 16550 then (it sets the rate through
+vendor registers this machine does not carry). Userspace still prints, so a
+flash boot shows the loaders and busybox but no kernel log. OpenIPC always
+passes `console=ttyS0,115200`, so the bench is unaffected; it is only a trap if
+you try to read a stock kernel's dmesg here.
 
 **A timer's expiry is an underflow.** Working the count out from the clock at
 that moment can come to zero ticks, because the conversions truncate, and the
