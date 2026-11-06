@@ -87,6 +87,7 @@ static const ImageSensorSpec image_sensors[] = {
     /* OmniVision */
     { "os04d10", "os04d10", 0x3C },
     OV16("ov2715", 0x36, 0x2715),
+    OV16("ov4689", 0x36, 0x4688),
     OV16("ov9715", 0x30, 0x9711),
     { "ov2735", OV2735, 0x3C, 0x05 },
     { "ov2735b", OV2735, 0x3C, 0x07 },

@@ -85,7 +85,7 @@ bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
-                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py,
+                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
 ```
 
@@ -347,6 +347,19 @@ finds it at build time (CI builds without it); queued commands complete
 from a timer, because the vendor driver arms its wait for the interrupt
 after issuing the command and loses a completion raised inside the
 doorbell write.
+
+Ambarella S3L (`hw/arm/ambarella.c`, `docs/ambarella.md`) is one Cortex-A9
+machine, `s3l`, whose blocks are the `amb-*` files under AMBARELLA. It stops
+short of video: it exists so ipctool and the firmware's `load_ambarella` can
+be tested without the camera. With `-kernel` the machine generates the device
+tree, including `/iavmem`, the DSP's share of DRAM, from `-m`; Linux gets what
+is below 0x07800000. On S3L the kernel takes interrupts from one scratchpad
+register, not the banks, and all ones there means none (0x60 is S3's value).
+`iav.ko` oopses without an `/iav/vinc0` node. The sensor is off I2C until GPIO
+107 goes high (`amb-gpio`), as on the camera; `sensor-reset=off` removes that.
+The vendor modules load, but no microcode ships, so the DSP stays down. `-m` must be over 120 MiB, so the smoke
+test above needs its default RAM. A reloading `amb-timer` repeats no faster
+than 1 us, so `RELOAD` 0 cannot pin the host.
 
 Novatek NT9856x / NA51089 (`hw/arm/novatek.c`, `docs/novatek.md`) is a
 fifth: a Cortex-A9 whose MPCore is at `0xFFD00000` (the `0xF1500000` GIC in

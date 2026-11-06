@@ -50,6 +50,7 @@ jobs:
           # Goke GK7101/GK7102 (hw/arm/goke.c), Goke's own Ambarella-IP design
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7101 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7102 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^s3l '
           # SigmaStar infinity2m and infinity3 (hw/arm/sigmastar.c)
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssr621q '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^ssd202d '
@@ -148,6 +149,13 @@ jobs:
       # Wrong, and every SD card in the guest mounts read-only (#209).
       - name: HiSilicon/Goke SDHCI write-protect polarity
         run: bash qemu/tests/test-hisi-sdhci-wp.sh
+
+      # The Ambarella S3L models driven over qtest the way the vendor kernel
+      # drives them: the scratchpad that names the pending line, timers,
+      # the PLL rates, and the I2C conversation with the OV4689.  The boot
+      # test needs a kernel build: qemu-boot/test-s3l-boot.sh.
+      - name: Ambarella S3L devices (amb-vic, amb-timer, amb-rct, amb-gpio, amb-idc)
+        run: python3 qemu/tests/test-ambarella.py
 
       # The Anyka AK39xx models driven over qtest the way the vendor drivers
       # drive them: mask-ROM staging of the boot header, timer into the
