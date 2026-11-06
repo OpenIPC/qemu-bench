@@ -81,7 +81,6 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_DRAMC_BASE      0xdffe0000
 #define AMB_AXI_BASE        0xf0000000
 #define AMB_L2_BASE         0xf0002000
-#define AMB_FIO_BASE        0xe0001000
 #define AMB_SD0_BASE        0xe0002000
 #define AMB_ETH_BASE        0xe000e000
 #define AMB_SD2_BASE        0xe001f000
@@ -349,7 +348,8 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
         qemu_fdt_setprop_string(fdt, p, "pinctrl-names", "default");
         qemu_fdt_setprop(fdt, p, "pinctrl-0", NULL, 0);
         qemu_fdt_add_subnode(fdt, phy);
-        qemu_fdt_setprop_cell(fdt, phy, "reg", 0);
+        /* amb_ethernet() puts a NAND board's PHY at MDIO address 1 */
+        qemu_fdt_setprop_cell(fdt, phy, "reg", ams->flash_file ? 1 : 0);
     }
 
     amb_fdt_sd(fdt, AMB_SD0_BASE, AMB_IRQ_SD0, "gclk_sd", 0, 0xec1704c0);
@@ -491,14 +491,14 @@ static void amb_boot_from_flash(MemoryRegion *sysmem, const char *path)
         AMB_BOOT_BASE,
     };
     MemoryRegion *buf = g_new(MemoryRegion, 1);
-    g_autofree char *image = NULL;
-    gsize len;
+    uint8_t image[AMB_BST_SIZE];
+    int fd = open(path, O_RDONLY | O_BINARY);
 
-    if (!g_file_get_contents(path, &image, &len, NULL) ||
-        len < AMB_BST_SIZE) {
+    if (fd < 0 || read(fd, image, AMB_BST_SIZE) != AMB_BST_SIZE) {
         error_report("s3l: cannot read the BST from %s", path);
         exit(1);
     }
+    close(fd);
     memory_region_init_ram(buf, NULL, "amb-boot", AMB_BOOT_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, AMB_BOOT_BASE, buf);
     rom_add_blob_fixed("amb-bst", image, AMB_BST_SIZE, AMB_BOOT_BASE);

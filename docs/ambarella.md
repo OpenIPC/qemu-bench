@@ -9,8 +9,9 @@ shell, gives `ipctool` the same answers the real board does, and runs
 `load_ambarella` with the shipped modules. With `flash-file=` it has the NAND of
 a Hikvision DS-2CD2423G0-I, so a kernel mounts a camera's own UBI volumes. There
 is no video: nothing models the DSP, VIN or the encoder, and blocks with no
-model read as zero. Booting through the camera's own `bst` and `bld` is not done
-yet, so a flash image still needs `-kernel`.
+model read as zero. With `flash-file=` and no `-kernel` the machine boots a
+camera's own `bst` and `bld` from that image; with `-kernel` it loads the kernel
+directly and generates the device tree instead.
 
 ## Running it
 

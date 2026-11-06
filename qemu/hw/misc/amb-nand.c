@@ -149,21 +149,22 @@ static void amb_nand_finish(AmbNandState *s)
     amb_nand_update(s);
 }
 
-static void amb_nand_persist(AmbNandState *s, uint32_t page, uint32_t n)
+static bool amb_nand_persist(AmbNandState *s, uint32_t page, uint32_t n)
 {
     size_t unit = s->raw_file ? NAND_RAW : NAND_PAGE;
 
     if (s->fd < 0) {
-        return;
+        return true;
     }
     for (uint32_t i = page; i < page + n; i++) {
         if (pwrite(s->fd, s->array + (size_t)i * NAND_RAW, unit,
                    (off_t)i * unit) != (ssize_t)unit) {
             error_report("amb-nand: write-through to %s failed at page %u: %s",
                          s->flash_file, i, strerror(errno));
-            return;
+            return false;
         }
     }
+    return true;
 }
 
 static bool amb_nand_writable(AmbNandState *s, uint32_t page)
@@ -203,7 +204,9 @@ static void amb_nand_command(AmbNandState *s, uint32_t val)
         } else if (amb_nand_writable(s, page)) {
             memset(s->array + (size_t)page * NAND_RAW, 0xff,
                    (size_t)NAND_BLOCK_PAGES * NAND_RAW);
-            amb_nand_persist(s, page, NAND_BLOCK_PAGES);
+            if (!amb_nand_persist(s, page, NAND_BLOCK_PAGES)) {
+                s->status_fail = STATUS_FAIL;
+            }
         }
         break;
     default:
@@ -289,7 +292,7 @@ static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
     if (s->fdma[FDMA_CTR] & FDMA_CTR_D) {
         desc = amb_nand_desc(s->fdma[FDMA_DA]);
         spare_desc = amb_nand_desc(s->fdma[FDMA_SPR_DA]);
-        len = desc.count;
+        len = desc.count & FDMA_CTR_LEN;
         main = to_chip ? desc.src : desc.dst;
         spare = spare_desc.count;
         aux = to_chip ? spare_desc.src : spare_desc.dst;
@@ -309,10 +312,10 @@ static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
      * block at a time, its spare bytes following in their own transfer.
      */
     if (!to_chip && !column && len > NAND_PAGE && !(len % NAND_PAGE) &&
-        !(spare % (NAND_SPARE * (len / NAND_PAGE))) &&
+        (spare == 0 || spare == NAND_SPARE * (len / NAND_PAGE)) &&
         page + len / NAND_PAGE <= NAND_PAGES) {
         uint32_t pages = len / NAND_PAGE;
-        uint32_t each = spare / pages;
+        uint32_t each = spare / pages;      /* 0 or NAND_SPARE */
 
         for (uint32_t i = 0; ok && i < pages; i++) {
             chip = s->array + (size_t)(page + i) * NAND_RAW;
@@ -334,7 +337,7 @@ static void amb_nand_transfer(AmbNandState *s, uint32_t ctr)
             ok = amb_nand_move(chip + NAND_PAGE, aux, spare, to_chip);
         }
         if (ok && to_chip) {
-            amb_nand_persist(s, page, 1);
+            ok = amb_nand_persist(s, page, 1);
         }
     }
 
