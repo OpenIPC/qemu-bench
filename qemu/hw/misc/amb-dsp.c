@@ -47,6 +47,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbDspState, AMB_DSP)
 #define DSP_CHIP_ID_OFFSET   0x424000
 #define DSP_INIT_DATA_OFFSET 0x424408      /* chip-id + 4 + 1 KiB + 4 */
 
+/* DSP_INIT_DATA field offsets iav fills (daddr = DSP address). */
+#define INIT_DEFBIN_ADDR     0
+#define INIT_CMD_GEN_DADDR   8
+#define INIT_MSG_GEN_DADDR   16
+#define INIT_CMD_VCAP_DADDR  24
+#define INIT_MSG_VCAP_DADDR  32
+#define INIT_CHIP_ID_DADDR   92
+
 /* The S3Lm part id the loader also selects by (RCT 0x300 == 0x4a000000). */
 #define AMBA_CHIP_ID_S3L_66  4
 
@@ -91,6 +99,9 @@ struct AmbDspState {
 
     bool chip_written;
     uint32_t op_mode;           /* what we report back to the driver */
+    uint32_t last_seq[2];       /* last command seq seen per port (debug) */
+    bool debug;
+    bool init_dumped;
 };
 
 static hwaddr amb_dsp_ucode(AmbDspState *s)
@@ -130,21 +141,35 @@ static void amb_dsp_st(hwaddr a, uint32_t v)
  * Read the sequence number the driver last wrote into a command port, and
  * note any operation-mode request so we report the mode it asked for.
  */
-static uint32_t amb_dsp_service_port(AmbDspState *s, hwaddr cmd_port)
+static uint32_t amb_dsp_service_port(AmbDspState *s, hwaddr cmd_port, int port)
 {
     uint32_t seq = amb_dsp_ld(cmd_port + CMD_HDR_SEQ_OFF);
     uint32_t num = amb_dsp_ld(cmd_port + CMD_HDR_NUM_OFF);
+    bool fresh = s->debug && seq != s->last_seq[port];
+
+    if (fresh) {
+        fprintf(stderr, "amb-dsp: port%d seq %u->%u num=%u codes:", port,
+                s->last_seq[port], seq, num);
+    }
 
     /* Walk the iteration's commands for a set-operation-mode. */
     for (uint32_t i = 0; i < num && i < DSP_PORT_SIZE / DSP_CMD_SIZE; i++) {
         hwaddr c = cmd_port + (i + 1) * DSP_CMD_SIZE;
-        if (amb_dsp_ld(c + CMD_HDR_CODE_OFF) == CMD_DSP_SET_OPERATION_MODE) {
+        uint32_t code = amb_dsp_ld(c + CMD_HDR_CODE_OFF);
+        if (fresh) {
+            fprintf(stderr, " %08x", code);
+        }
+        if (code == CMD_DSP_SET_OPERATION_MODE) {
             uint32_t m = amb_dsp_ld(c + 4) & 0xff;
             if (m == DSP_OP_MODE_CAMERA_RECORD || m == DSP_OP_MODE_IDLE) {
                 s->op_mode = m;
             }
         }
     }
+    if (fresh) {
+        fprintf(stderr, " (op_mode=%u)\n", s->op_mode);
+    }
+    s->last_seq[port] = seq;
     return seq;
 }
 
@@ -178,9 +203,23 @@ static void amb_dsp_tick(void *opaque)
         s->chip_written = true;
     }
 
+    if (s->debug && !s->init_dumped) {
+        hwaddr id = amb_dsp_ucode(s) + DSP_INIT_DATA_OFFSET;
+        if (amb_dsp_ld(id + INIT_DEFBIN_ADDR)) {
+            fprintf(stderr, "amb-dsp: init_data@%08x cmd_gen=%08x msg_gen=%08x "
+                    "cmd_vcap=%08x msg_vcap=%08x chip_id=%08x\n", (uint32_t)id,
+                    amb_dsp_ld(id + INIT_CMD_GEN_DADDR),
+                    amb_dsp_ld(id + INIT_MSG_GEN_DADDR),
+                    amb_dsp_ld(id + INIT_CMD_VCAP_DADDR),
+                    amb_dsp_ld(id + INIT_MSG_VCAP_DADDR),
+                    amb_dsp_ld(id + INIT_CHIP_ID_DADDR));
+            s->init_dumped = true;
+        }
+    }
+
     /* General and vcap ports are the two 4 KiB halves of each buffer. */
-    seq_gen = amb_dsp_service_port(s, cmd);
-    seq_vcap = amb_dsp_service_port(s, cmd + DSP_PORT_SIZE);
+    seq_gen = amb_dsp_service_port(s, cmd, 0);
+    seq_vcap = amb_dsp_service_port(s, cmd + DSP_PORT_SIZE, 1);
     amb_dsp_reply(s, msg, seq_gen);
     amb_dsp_reply(s, msg + DSP_PORT_SIZE, seq_vcap);
 
@@ -199,6 +238,7 @@ static void amb_dsp_reset(DeviceState *dev)
 
     s->chip_written = false;
     s->op_mode = DSP_OP_MODE_INIT;
+    s->last_seq[0] = s->last_seq[1] = 0;
     timer_mod(&s->heartbeat,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / AMB_DSP_HZ);
@@ -211,6 +251,12 @@ static void amb_dsp_realize(DeviceState *dev, Error **errp)
     if (s->iavmem_end <= s->iavmem_base + DSP_UCODE_SIZE) {
         error_setg(errp, "amb-dsp: iavmem region too small for the DSP area");
         return;
+    }
+    s->debug = getenv("AMB_DSP_DEBUG") != NULL;
+    if (s->debug) {
+        fprintf(stderr, "amb-dsp: iavmem [%08x,%08x) ucode=%08x cmd=%08x msg=%08x\n",
+                s->iavmem_base, s->iavmem_end, (uint32_t)amb_dsp_ucode(s),
+                (uint32_t)amb_dsp_cmd_buf(s), (uint32_t)amb_dsp_msg_buf(s));
     }
     timer_init_ns(&s->heartbeat, QEMU_CLOCK_VIRTUAL, amb_dsp_tick, s);
 }
