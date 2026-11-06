@@ -106,9 +106,9 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_IRQ_IDC2        81
 #define AMB_IRQ_IDC1        82
 #define AMB_IRQ_IDC0        83
-#define AMB_IRQ_VDSP        3    /* CODE_VDSP_0, VIC0.3 */
-#define AMB_IRQ_VENC        55   /* CODE_VDSP_2, VIC1.23 */
-#define AMB_IRQ_VCAP        56   /* CODE_VDSP_1, VIC1.24 */
+#define AMB_IRQ_VDSP        45   /* CODE_VDSP_0 "vdsp", per /proc/interrupts */
+#define AMB_IRQ_VCAP        46   /* CODE_VDSP_1 "vcap" */
+#define AMB_IRQ_VENC        47   /* CODE_VDSP_2 "venc" */
 
 #define AMB_DT_EDGE_RISING  1
 #define AMB_DT_LEVEL_HIGH   4
