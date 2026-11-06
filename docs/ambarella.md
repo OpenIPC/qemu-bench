@@ -76,12 +76,14 @@ is, and the guest's changes last until it exits, so `chmod 444` protects a dump.
 | I2C0, 1, 2 | `0xE8003000`, `0xE8001000`, `0xE8007000` | `amb-idc` |
 | GPIO, 4 banks | `0xE8009000`, `0xE800A000`, `0xE800E000`, `0xE8010000` | `amb-gpio` |
 | FIO, FDMA, NAND | `0xE0001000`, `0xE0012000` | `amb-nand`, with `flash-file=` |
+| Ethernet | `0xE000E000` | `xm-dwmac`, keeping the FCS: the driver takes 4 off |
+| SD0, SD2 | `0xE0002000`, `0xE001F000` | QEMU's SDHCI with capability bit 27 |
 | RCT | `0xEC170000` | `amb-rct` |
 | L2 cache | `0xF0002000` | QEMU's `l2x0` |
 
 Everything else in the AHB, APB, debug bus, DRAM controller and AXI windows is
 an unimplemented device, so `-d unimp` lists what software touched. There is
-no pad mux or Ethernet, and GPIO has no interrupts.
+no pad mux, and GPIO has no interrupts.
 
 ## Things that are easy to get wrong
 

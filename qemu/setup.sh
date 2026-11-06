@@ -499,6 +499,8 @@ config AMBARELLA
     select A9MPCORE
     select PL310
     select I2C
+    select SDHCI
+    select XM_DWMAC
 KCONFIG
     echo "  hw/arm/Kconfig: added AMBARELLA"
 fi

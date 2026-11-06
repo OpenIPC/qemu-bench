@@ -47,6 +47,9 @@ XSHUTDN = 1 << 11                   # GPIO 107, bit 11 of the fourth bank
 TIMER = 0xE800B000
 RCT = 0xEC170000
 FIO = 0xE0001000
+SD0 = 0xE0002000
+SD2 = 0xE001F000
+ETH = 0xE000E000
 FDMA = 0xE0012000
 FIFO = 0xE0000000
 
@@ -243,6 +246,35 @@ def test_timer_and_vic(qt):
     qt.writel(TIMER_CTRL, 0)
     qt.writel(bank + INT_EDGE_CLR, bit)
     qt.writel(bank + INT_EN_CLR, bit)
+
+
+def mdio_read(qt, phy, reg):
+    """The driver's MII read: address, wait for busy to fall, data."""
+    qt.writel(ETH + 0x10, phy << 11 | reg << 6 | 1)
+    check('MDIO finishes', qt.readl(ETH + 0x10) & 1, 0)
+    return qt.readl(ETH + 0x14)
+
+
+def test_peripherals(qemu):
+    print('Ethernet and SD')
+    qt = QTest(qemu, 's3l')
+    try:
+        check('the Ethernet strap', qt.readl(RCT + 0x34) & 1, 1)
+        check('PHY ID high', mdio_read(qt, 0, 2), 0x001C)
+        check('PHY ID low', mdio_read(qt, 0, 3), 0xC816)
+        for name, base in (('SD0', SD0), ('SD2', SD2)):
+            check(name + ' offers interrupt mode',
+                  qt.readl(base + 0x40) >> 27 & 1, 1)
+    finally:
+        qt.close()
+    path = tempfile.mktemp()
+    make_nand(path)
+    qt = QTest(qemu, 's3l,flash-file=' + path)
+    try:
+        check('a NAND board has its own PHY', mdio_read(qt, 1, 3), 0x0C54)
+    finally:
+        qt.close()
+        os.unlink(path)
 
 
 def test_reset(qt):
@@ -630,7 +662,7 @@ def test_nand(qemu, tmp):
     qt = QTest(qemu, 's3l')
     try:
         check('no flash-file, no NAND straps',
-              qt.readl(RCT + 0x34), 0)
+              qt.readl(RCT + 0x34) & 0x78000, 0)
     finally:
         qt.close()
 
@@ -708,6 +740,7 @@ def main():
         qt.close()
     test_nand(args.qemu, tmp)
     test_boot_chain(args.qemu, tmp)
+    test_peripherals(args.qemu)
     test_no_sensor(args.qemu)
     test_rejections_and_migration(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
