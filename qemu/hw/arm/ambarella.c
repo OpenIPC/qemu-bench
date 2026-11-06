@@ -9,6 +9,10 @@
  * it.  What software needs from the IAV blocks stops at loading its modules;
  * there is no video here.  Blocks with no model read as zero.
  *
+ * flash-file= attaches NAND, as on the Hikvision DS-2CD2423G0-I.  There are no
+ * partitions in the generated tree: that layout is the board's, so a kernel
+ * takes it from mtdparts= on its command line.
+ *
  * As on the camera, the sensor stays off I2C until GPIO 107 releases its
  * XSHUTDN, so software that probes too early finds nothing.  sensor-reset=off
  * is a board with no such line.
@@ -45,6 +49,9 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_IAVMEM_BASE     0x07800000  /* mem=118M, as on the IP4M-1026E */
 
 #define AMB_AHB_BASE        0xe0000000
+#define AMB_FIO_FIFO_BASE   0xe0000000
+#define AMB_FIO_BASE        0xe0001000
+#define AMB_FDMA_BASE       0xe0012000
 #define AMB_VIC0_BASE       0xe0003000
 #define AMB_VIC1_BASE       0xe0010000
 #define AMB_SCRATCHPAD_BASE 0xe001b000
@@ -75,12 +82,18 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_IRQ_GPIO0       52
 #define AMB_IRQ_UART0       61
 #define AMB_IRQ_TIMER8      63
+#define AMB_IRQ_FDMA        70
+#define AMB_IRQ_FIO_CMD     72
+#define AMB_IRQ_FIO_DMA     73
 #define AMB_IRQ_IDC2        81
 #define AMB_IRQ_IDC1        82
 #define AMB_IRQ_IDC0        83
 
 #define AMB_DT_EDGE_RISING  1
 #define AMB_DT_LEVEL_HIGH   4
+
+/* SYS_CONFIG straps for 2K pages, read-confirm and BCH on a 6-bit spare */
+#define AMB_SYS_CONFIG_NAND 0x00070000
 
 #define AMB_UART_US         0x7c    /* past what the 16550 model covers */
 #define AMB_UART_US_TFE     0x04
@@ -91,6 +104,8 @@ struct AmbMachineState {
 
     char *sensor;
     bool no_sensor_reset;
+    char *flash_file;
+    char *bad_blocks;
 };
 
 static const struct {
@@ -231,6 +246,27 @@ static void *amb_build_fdt(const struct arm_boot_info *info, int *size)
         qemu_fdt_setprop_cell(fdt, p, "phandle", intc);
     }
 
+    /*
+     * No nand-on-flash-bbt, which the real tree has: with none found the
+     * kernel would write a table into blocks a dump may not have read.
+     * Without it, it reads the markers of every block at boot and writes
+     * nothing.
+     */
+    if (ams->flash_file) {
+        const char *p = "/ahb@e0000000/nand@e0001000";
+
+        qemu_fdt_add_subnode(fdt, p);
+        qemu_fdt_setprop_string(fdt, p, "compatible", "ambarella,nand");
+        qemu_fdt_setprop_cell(fdt, p, "#address-cells", 1);
+        qemu_fdt_setprop_cell(fdt, p, "#size-cells", 1);
+        qemu_fdt_setprop_cells(fdt, p, "reg", AMB_FIO_BASE, 0x1000,
+                               AMB_FDMA_BASE, 0x1000, AMB_FIO_FIFO_BASE, 4);
+        qemu_fdt_setprop_cells(fdt, p, "interrupts",
+                               AMB_IRQ_FIO_CMD, AMB_DT_LEVEL_HIGH,
+                               AMB_IRQ_FIO_DMA, AMB_DT_LEVEL_HIGH,
+                               AMB_IRQ_FDMA, AMB_DT_LEVEL_HIGH);
+    }
+
     qemu_fdt_add_subnode(fdt, "/apb@e8000000");
     qemu_fdt_setprop_string(fdt, "/apb@e8000000", "compatible", "simple-bus");
     qemu_fdt_setprop_cell(fdt, "/apb@e8000000", "#address-cells", 1);
@@ -330,7 +366,7 @@ static void amb_init(MachineState *ms)
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *uart_ext = g_new(MemoryRegion, 1);
     Object *cpuobj;
-    DeviceState *cpu, *vic, *timer, *pads;
+    DeviceState *cpu, *vic, *timer, *pads, *rct;
     qemu_irq not_held;
     SysBusDevice *sbd;
 
@@ -387,7 +423,28 @@ static void amb_init(MachineState *ms)
     sysbus_mmio_map(sbd, 2, AMB_GPIO2_BASE);
     sysbus_mmio_map(sbd, 3, AMB_GPIO3_BASE);
 
-    sysbus_create_simple("amb-rct", AMB_RCT_BASE, NULL);
+    rct = qdev_new("amb-rct");
+    qdev_prop_set_uint32(rct, "sys-config",
+                         ams->flash_file ? AMB_SYS_CONFIG_NAND : 0);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(rct), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(rct), 0, AMB_RCT_BASE);
+
+    if (ams->flash_file) {
+        DeviceState *nand = qdev_new("amb-nand");
+
+        sbd = SYS_BUS_DEVICE(nand);
+        qdev_prop_set_string(nand, "flash-file", ams->flash_file);
+        if (ams->bad_blocks) {
+            qdev_prop_set_string(nand, "bad-blocks", ams->bad_blocks);
+        }
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, AMB_FIO_BASE);
+        sysbus_mmio_map(sbd, 1, AMB_FDMA_BASE);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, AMB_IRQ_FIO_CMD));
+        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(vic, AMB_IRQ_FIO_DMA));
+        sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(vic, AMB_IRQ_FDMA));
+    }
+
     sysbus_create_simple("l2x0", AMB_L2_BASE, NULL);
 
     serial_mm_init(sysmem, AMB_UART0_BASE, 2,
@@ -448,6 +505,32 @@ static void amb_set_sensor_reset(Object *obj, bool val, Error **errp)
     AMB_MACHINE(obj)->no_sensor_reset = !val;
 }
 
+static char *amb_get_flash_file(Object *obj, Error **errp)
+{
+    return g_strdup(AMB_MACHINE(obj)->flash_file);
+}
+
+static void amb_set_flash_file(Object *obj, const char *val, Error **errp)
+{
+    AmbMachineState *ams = AMB_MACHINE(obj);
+
+    g_free(ams->flash_file);
+    ams->flash_file = g_strdup(val);
+}
+
+static char *amb_get_bad_blocks(Object *obj, Error **errp)
+{
+    return g_strdup(AMB_MACHINE(obj)->bad_blocks);
+}
+
+static void amb_set_bad_blocks(Object *obj, const char *val, Error **errp)
+{
+    AmbMachineState *ams = AMB_MACHINE(obj);
+
+    g_free(ams->bad_blocks);
+    ams->bad_blocks = g_strdup(val);
+}
+
 static void amb_machine_class_init(MachineClass *mc)
 {
     ObjectClass *oc = OBJECT_CLASS(mc);
@@ -468,6 +551,15 @@ static void amb_machine_class_init(MachineClass *mc)
     object_class_property_set_description(oc, "sensor-reset",
         "hold the sensor off I2C until GPIO 107 is released, as on the "
         "IP4M-1026E (default on)");
+    object_class_property_add_str(oc, "flash-file", amb_get_flash_file,
+                                  amb_set_flash_file);
+    object_class_property_set_description(oc, "flash-file",
+        "128 MiB of NAND page data, or 132 MiB with spare bytes; written "
+        "through unless the file is read-only");
+    object_class_property_add_str(oc, "bad-blocks", amb_get_bad_blocks,
+                                  amb_set_bad_blocks);
+    object_class_property_set_description(oc, "bad-blocks",
+        "NAND blocks to mark bad, as byte offsets separated by colons");
 }
 
 DEFINE_MACHINE_EXTENDED("s3l", MACHINE, AmbMachineState,

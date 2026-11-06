@@ -392,7 +392,8 @@ and the JFFS2 overlay on the NOR. Map, boot chain and devices are in
 A test bench for the Amcrest IP4M-1026E / Dahua IPC-HFW1430SN, in
 `hw/arm/ambarella.c`, with no video. The vendor kernel boots to a shell,
 `ipctool` reports the same SoC, RAM and OV4689 as the camera, and the
-firmware's `load_ambarella` loads the shipped modules. See
+firmware's `load_ambarella` loads the shipped modules. `flash-file=` adds NAND,
+so a kernel can mount a camera's UBI volumes. See
 [docs/ambarella.md](docs/ambarella.md).
 
 ### Ingenic T-series (`qemu-system-mipsel`)
@@ -754,6 +755,7 @@ qemu/
 ├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
 ├── hw/misc/amb-rct.c            # Ambarella reset and clock tree
 ├── hw/misc/amb-gpio.c           # Ambarella GPIO; 107 holds the sensor in reset
+├── hw/misc/amb-nand.c           # Ambarella FIO, FDMA and a 128 MiB NAND
 ├── hw/i2c/amb-idc.c             # Ambarella IDC I2C master
 ├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
 ├── hw/mips/ingenic.c            # Ingenic T10..T41 machines, mask ROM stand-in, bootm

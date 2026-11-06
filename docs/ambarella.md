@@ -6,8 +6,11 @@ IPC-HFW1430SN. The default 512 MiB matches that camera.
 
 The machine is a test bench, not a camera. It boots the vendor kernel to a
 shell, gives `ipctool` the same answers the real board does, and runs
-`load_ambarella` with the shipped modules. There is no video: nothing models
-the DSP, VIN or the encoder, and blocks with no model read as zero.
+`load_ambarella` with the shipped modules. With `flash-file=` it has the NAND of
+a Hikvision DS-2CD2423G0-I, so a kernel mounts a camera's own UBI volumes. There
+is no video: nothing models the DSP, VIN or the encoder, and blocks with no
+model read as zero. Booting through the camera's own `bst` and `bld` is not done
+yet, so a flash image still needs `-kernel`.
 
 ## Running it
 
@@ -26,6 +29,42 @@ branch `ambarella-s3l`, with the firmware's
 line, where the sensor answers at once. `-m` sets DRAM: over 120 MiB, for the
 DSP, and at most 0xDFFE0000, where the peripherals start.
 
+## NAND
+
+```sh
+./qemu-src/build/qemu-system-arm -M s3l,flash-file=flash.bin -nographic \
+    -monitor none -kernel arch/arm/boot/zImage -initrd rootfs.cpio.gz \
+    -append 'console=ttyS0,115200 rdinit=/init mtdparts=amba_nand:... ubi.mtd=10'
+```
+
+Work on a copy: erases and programs are written through to the file, as on the
+repo's other flash models. A file that cannot be opened for writing stays as it
+is, and the guest's changes last until it exits, so `chmod 444` protects a dump.
+
+- **Image:** 128 MiB of page data, or 132 MiB with 64 spare bytes behind each
+  2048 byte page, as `nanddump -o` writes them. Any other size is refused. With
+  page data alone the spare area starts blank, and programmed spare bytes last
+  only until QEMU exits.
+- **Partitions:** none in the generated tree. They are the board's, so they come
+  from `mtdparts=amba_nand:...`, with the kernel's `MTD_CMDLINE_PARTS`. The
+  camera's own kernel takes them from its device tree.
+- **ECC:** BCH is not modelled. Nothing corrupts data here, so the report stays
+  clean, and no parity bytes appear in the spare area. An image programmed here
+  would not read back on a chip.
+- **Bad blocks:** a dump cannot show one, since a block that read as nothing
+  looks erased. `bad-blocks=` lists byte offsets, separated by colons. Each gets
+  the factory marker in its first spare byte, and fails erase and program. With
+  none listed, every block is good. Reading such a block returns what the image
+  has there.
+- **Bad block table:** the generated tree leaves out `nand-on-flash-bbt`, which
+  the real one has. Finding no table, a kernel would write one to the end of the
+  chip, and a dump may not have read those blocks. Instead it reads every block's
+  marker at boot and writes nothing.
+- **ID:** `98 f1 80 15 00`. Only the first two bytes are known from a camera. The
+  next two give 2048 + 64 byte pages and 128 KiB blocks through the kernel's
+  generic decode. `98 f1 80 15 72` would not do: `nand_ids.c` lists that with 128
+  byte spare areas, and the driver then asks for more than the chip has.
+
 ## What is modelled
 
 | Block | Address | Model |
@@ -36,12 +75,13 @@ DSP, and at most 0xDFFE0000, where the peripherals start.
 | UART0 | `0xE8005000` | QEMU's 16550, plus a status word at 0x7C |
 | I2C0, 1, 2 | `0xE8003000`, `0xE8001000`, `0xE8007000` | `amb-idc` |
 | GPIO, 4 banks | `0xE8009000`, `0xE800A000`, `0xE800E000`, `0xE8010000` | `amb-gpio` |
+| FIO, FDMA, NAND | `0xE0001000`, `0xE0012000` | `amb-nand`, with `flash-file=` |
 | RCT | `0xEC170000` | `amb-rct` |
 | L2 cache | `0xF0002000` | QEMU's `l2x0` |
 
 Everything else in the AHB, APB, debug bus, DRAM controller and AXI windows is
 an unimplemented device, so `-d unimp` lists what software touched. There is
-no pad mux, Ethernet or flash, and GPIO has no interrupts.
+no pad mux or Ethernet, and GPIO has no interrupts.
 
 ## Things that are easy to get wrong
 
@@ -78,8 +118,15 @@ so 0 means held low, whatever `OF_GPIO_ACTIVE_LOW` suggests. The whole bus goes
 quiet, not just the one address, because the sensor is all that is on it here.
 
 **PLL rates are read back.** The kernel derives every clock from the RCT words,
-so these reset to the rates `/proc/ambarella/clock` shows on the camera. Note
-`gclk_ddr` is half its PLL.
+so these reset to the rates `/proc/ambarella/clock` shows on the IP4M-1026E. They
+are that board's, not the SoC's: the DS-2CD2423G0-I runs its core PLL at 576 MHz.
+Note `gclk_ddr` is half its PLL.
+
+**A page moves when FIO DMA is enabled.** The driver sets up FDMA first, so the
+whole transfer happens in that write, and `amb-nand` then raises all three
+interrupts. The driver waits for all of them. The straps in `SYS_CONFIG` decide
+its ECC mode, so `flash-file=` sets them; without them it would pick 1-bit ECC and
+a different spare layout.
 
 **A timer's expiry is an underflow.** Working the count out from the clock at
 that moment can come to zero ticks, because the conversions truncate, and the

@@ -15,6 +15,10 @@ kernel (docs/ambarella.md):
     camera, and comes off again when it goes low, or back to an input;
   - amb-idc: the driver's CTRL conversation reads the OV4689's chip ID from
     I2C0, and an address nobody answers comes back not acknowledged;
+  - amb-nand, on made-up images: the ID, a page and its spare through both
+    DMA engines and all three interrupts, erase and program written through
+    to the file, a page program only clearing bits, write protection, bad
+    blocks, images with and without spare bytes, read-only files;
   - a guest reset clears what was pending, sensor=none leaves the bus
     empty, RAM that leaves no room for the DSP or runs into the peripherals
     is refused, and machine state migrates to a file and back.
@@ -39,6 +43,23 @@ GPIO3 = 0xE8010000
 XSHUTDN = 1 << 11                   # GPIO 107, bit 11 of the fourth bank
 TIMER = 0xE800B000
 RCT = 0xEC170000
+FIO = 0xE0001000
+FDMA = 0xE0012000
+FIFO = 0xE0000000
+
+NAND_PAGE = 2048
+NAND_SPARE = 64
+NAND_RAW = NAND_PAGE + NAND_SPARE
+NAND_PAGES = 65536
+NAND_BLOCK = 64 * NAND_PAGE
+BUF = 0x01000000                    # in guest RAM
+SPARE_BUF = BUF + NAND_PAGE
+CMD_RESET, CMD_ERASE, CMD_READID, CMD_READSTATUS = 0x2, 0x9, 0xA, 0xC
+FIO_DMA_EN, FIO_DMA_RM = 0x80000000, 0x40000000
+FDMA_EN, FDMA_RM, FDMA_WM = 0x80000000, 0x10000000, 0x20000000
+DMASTA_DN, DMASTA_AE = 0x01000000, 0x02000000
+FDMASTA_DN = 0x00400000
+LINE_FDMA, LINE_CMD, LINE_DMA = 6, 8, 9     # bits of bank 2: 70, 72, 73
 
 PRI_IRQ = SCRATCHPAD + 0x38
 NO_IRQ = 0xFFFFFFFF
@@ -97,6 +118,12 @@ class QTest:
 
     def readl(self, a):
         return int(self.cmd('readl 0x%x' % a).split()[1], 16)
+
+    def read(self, a, n):
+        return bytes.fromhex(self.cmd('read 0x%x 0x%x' % (a, n)).split()[1][2:])
+
+    def write(self, a, data):
+        self.cmd('write 0x%x 0x%x 0x%s' % (a, len(data), data.hex()))
 
     def step(self, ns):
         self.cmd('clock_step %d' % ns)
@@ -319,6 +346,219 @@ def test_i2c(qt):
     check('STOP lowers the line', qt.readl(VIC2 + 0x08) & (1 << 19), 0)
 
 
+def make_nand(path, spare=False):
+    """A sparse image, zero but for the two pages the checks read."""
+    unit = NAND_RAW if spare else NAND_PAGE
+    with open(path, 'wb') as f:
+        f.truncate(NAND_PAGES * unit)
+        for page in (5, 300):
+            f.seek(page * unit)
+            f.write(bytes((page + i) & 0xFF for i in range(unit)))
+
+
+def nand_cmd(qt, cmd, addr=0, ctr=0):
+    qt.writel(FIO + 0x120, ctr)
+    qt.writel(FIO + 0x124, addr | cmd)
+
+
+def nand_status(qt):
+    nand_cmd(qt, CMD_READSTATUS)
+    return qt.readl(FIO + 0x140)
+
+
+def nand_ack(qt):
+    """What the three interrupt handlers do."""
+    qt.writel(FIO + 0x150, 0)
+    qt.writel(FIO + 0x08C, 0)
+    qt.writel(FDMA + 0x30C, 0)
+    qt.writel(FDMA + 0x20C, 0)
+
+
+def nand_dma(qt, page, write, ctr=0):
+    """nand_amb_setup_dma_devmem() / _memdev() in dual-space mode."""
+    qt.writel(FDMA + 0x30C, 0)
+    qt.writel(FDMA + 0x304, BUF if write else FIFO)
+    qt.writel(FDMA + 0x308, FIFO if write else BUF)
+    qt.writel(FDMA + 0x20C, 0)
+    qt.writel(FDMA + 0x204, SPARE_BUF if write else FIFO)
+    qt.writel(FDMA + 0x208, FIFO if write else SPARE_BUF)
+    qt.writel(FDMA + 0x200, NAND_SPARE)
+    qt.writel(FDMA + 0x300, FDMA_EN | (FDMA_RM if write else FDMA_WM) |
+              NAND_PAGE)
+    qt.writel(FIO + 0x120, ctr)
+    qt.writel(FIO + 0x084, page * NAND_PAGE)
+    qt.writel(FIO + 0x080, FIO_DMA_EN | (FIO_DMA_RM if write else 0) |
+              (NAND_PAGE + NAND_SPARE))
+    return qt.readl(FIO + 0x08C)
+
+
+def nand_read(qt, page):
+    sta = nand_dma(qt, page, False)
+    nand_ack(qt)
+    return sta, qt.read(BUF, NAND_PAGE), qt.read(SPARE_BUF, NAND_SPARE)
+
+
+def nand_program(qt, page, data, spare=b'\xFF' * NAND_SPARE, ctr=0):
+    qt.write(BUF, data)
+    qt.write(SPARE_BUF, spare)
+    sta = nand_dma(qt, page, True, ctr)
+    nand_ack(qt)
+    return sta
+
+
+def test_nand(qemu, tmp):
+    print('amb-nand')
+    path = os.path.join(tmp, 'nand.bin')
+    make_nand(path)
+    qt = QTest(qemu, 's3l,flash-file=%s,bad-blocks=0x20000:0x60000' % path)
+    try:
+        check('the straps say BCH on 2K pages',
+              qt.readl(RCT + 0x34) & 0x78000, 0x70000)
+
+        nand_cmd(qt, CMD_RESET)
+        check('a command sets FI', qt.readl(FIO + 0x04) & 1, 1)
+        qt.writel(FIO + 0x150, 0)
+        check('FLASH_INT clears it', qt.readl(FIO + 0x04) & 1, 0)
+
+        nand_cmd(qt, CMD_READID)
+        check('the ID', qt.readl(FIO + 0x144), 0x98F18015)
+        qt.writel(FIO + 0x150, 0)
+        check('ready, not protected', nand_status(qt), 0xC0)
+        qt.writel(FIO + 0x150, 0)
+
+        for line in (LINE_FDMA, LINE_CMD, LINE_DMA):
+            qt.writel(VIC2 + INT_SENSE, line)
+            qt.writel(VIC2 + INT_EVT, line)
+        check('quiet between transfers', qt.readl(VIC2 + 0x08) & 0x340, 0)
+
+        sta = nand_dma(qt, 5, False)
+        check('FIO DMA done', sta, DMASTA_DN)
+        check('FDMA done', qt.readl(FDMA + 0x30C), FDMASTA_DN)
+        check('FDMA channel 0 pending', qt.readl(FDMA + 0x3F0) & 1, 1)
+        check('all three lines up', qt.readl(VIC2 + 0x08) & 0x340, 0x340)
+        check('the enable falls', qt.readl(FIO + 0x080) >> 31, 0)
+        check('ECC reports nothing', qt.readl(FIO + 0x0A4), 0)
+        nand_ack(qt)
+        check('each handler lowers its own', qt.readl(VIC2 + 0x08) & 0x340, 0)
+        check('the page arrived', qt.read(BUF, NAND_PAGE),
+              bytes((5 + i) & 0xFF for i in range(NAND_PAGE)))
+        check('with no spare bytes in the file, they are blank',
+              qt.read(SPARE_BUF, NAND_SPARE), b'\xFF' * NAND_SPARE)
+
+        nand_cmd(qt, CMD_ERASE, 8 * NAND_BLOCK)
+        qt.writel(FIO + 0x150, 0)
+        check('erased', nand_read(qt, 8 * 64)[1], b'\xFF' * NAND_PAGE)
+        data = bytes(i & 0xF0 for i in range(NAND_PAGE))
+        tag = bytes(range(NAND_SPARE))
+        check('program', nand_program(qt, 8 * 64, data, tag), DMASTA_DN)
+        check('reads back', nand_read(qt, 8 * 64)[1], data)
+        check('and its spare', nand_read(qt, 8 * 64)[2], tag)
+        with open(path, 'rb') as f:
+            f.seek(8 * NAND_BLOCK)
+            check('written through', f.read(NAND_PAGE), data)
+        nand_program(qt, 8 * 64, b'\x0F' * NAND_PAGE)
+        check('programming only clears bits', nand_read(qt, 8 * 64)[1],
+              bytes(NAND_PAGE))
+
+        sta = nand_program(qt, 9 * 64, b'\x00' * NAND_PAGE, ctr=0x200)
+        check('write protect: the DMA itself completes', sta, DMASTA_DN)
+        check('but the chip reports failure', nand_status(qt) & 1, 1)
+        qt.writel(FIO + 0x150, 0)
+        nand_cmd(qt, CMD_READSTATUS, ctr=0x200)
+        check('and reads as protected', qt.readl(FIO + 0x140) & 0x80, 0)
+        qt.writel(FIO + 0x150, 0)
+        nand_cmd(qt, CMD_RESET)
+        qt.writel(FIO + 0x150, 0)
+        check('nothing was written', nand_read(qt, 9 * 64)[1][:4],
+              bytes(4))
+
+        check('a bad block has the factory marker',
+              nand_read(qt, 64)[2][0], 0)
+        check('the next block has not', nand_read(qt, 128)[2][0], 0xFF)
+        check('and the listed third has', nand_read(qt, 192)[2][0], 0)
+        nand_cmd(qt, CMD_ERASE, NAND_BLOCK)
+        qt.writel(FIO + 0x150, 0)
+        check('erasing it fails', nand_status(qt) & 1, 1)
+        qt.writel(FIO + 0x150, 0)
+
+        sta = nand_dma(qt, NAND_PAGES, False, 0)
+        check('past the chip: a DMA error', sta, DMASTA_AE)
+        nand_ack(qt)
+    finally:
+        qt.close()
+
+    # The file holds what it was given, and survives into a new run
+    qt = QTest(qemu, 's3l,flash-file=%s' % path)
+    try:
+        check('a new run reads it back', nand_read(qt, 8 * 64)[1],
+              bytes(NAND_PAGE))
+        check('with no bad-blocks, no marker', nand_read(qt, 64)[2][0], 0xFF)
+    finally:
+        qt.close()
+
+    raw = os.path.join(tmp, 'raw.bin')
+    make_nand(raw, spare=True)
+    qt = QTest(qemu, 's3l,flash-file=%s' % raw)
+    try:
+        sta, page, spare = nand_read(qt, 5)
+        check('an image with spare bytes: the page',
+              page, bytes((5 + i) & 0xFF for i in range(NAND_PAGE)))
+        check('and its spare', spare,
+              bytes((5 + NAND_PAGE + i) & 0xFF for i in range(NAND_SPARE)))
+        nand_cmd(qt, CMD_ERASE, 8 * NAND_BLOCK)
+        qt.writel(FIO + 0x150, 0)
+        nand_program(qt, 8 * 64, bytes(NAND_PAGE), bytes(range(NAND_SPARE)))
+    finally:
+        qt.close()
+    with open(raw, 'rb') as f:
+        f.seek(8 * 64 * NAND_RAW + NAND_PAGE)
+        check('spare bytes reach such a file', f.read(NAND_SPARE),
+              bytes(range(NAND_SPARE)))
+
+    ro = os.path.join(tmp, 'ro.bin')
+    make_nand(ro)
+    os.chmod(ro, 0o444)
+    before = os.path.getmtime(ro)
+    qt = QTest(qemu, 's3l,flash-file=%s' % ro)
+    try:
+        nand_cmd(qt, CMD_ERASE, 8 * NAND_BLOCK)
+        qt.writel(FIO + 0x150, 0)
+        check('a read-only file: the guest still erases',
+              nand_read(qt, 8 * 64)[1], b'\xFF' * NAND_PAGE)
+    finally:
+        qt.close()
+    with open(ro, 'rb') as f:
+        f.seek(8 * NAND_BLOCK)
+        check('and the file does not change', f.read(16), bytes(16))
+    check('not even its time', os.path.getmtime(ro), before)
+
+    small = os.path.join(tmp, 'small.bin')
+    with open(small, 'wb') as f:
+        f.truncate(1 << 20)
+    out = subprocess.run([qemu, '-M', 's3l,flash-file=' + small, '-display',
+                          'none', '-nodefaults', '-kernel', '/dev/null'],
+                         capture_output=True, text=True, timeout=20)
+    check('the wrong size is refused', 'expected' in out.stderr, True)
+    out = subprocess.run([qemu, '-M',
+                          's3l,flash-file=%s,bad-blocks=0x1234' % path,
+                          '-display', 'none', '-nodefaults', '-kernel',
+                          '/dev/null'],
+                         capture_output=True, text=True, timeout=20)
+    check('so is a bad block that is not a block',
+          'not the offset of a block' in out.stderr, True)
+    out = hmp(qemu, ['-M', 's3l,flash-file=' + path, '-S'],
+              ['migrate file:' + os.path.join(tmp, 'blocked.mig')])
+    check('a file-backed NAND blocks migration', 'written through' in out,
+          True)
+
+    qt = QTest(qemu, 's3l')
+    try:
+        check('no flash-file, no NAND straps',
+              qt.readl(RCT + 0x34), 0)
+    finally:
+        qt.close()
+
+
 def hmp(qemu, args, cmds):
     """Run QEMU with an HMP monitor on stdio; return what it printed."""
     p = subprocess.run([qemu] + args + ['-display', 'none', '-nodefaults',
@@ -390,6 +630,7 @@ def main():
         test_reset(qt)
     finally:
         qt.close()
+    test_nand(args.qemu, tmp)
     test_no_sensor(args.qemu)
     test_rejections_and_migration(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))

@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -27,6 +28,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbRctState, AMB_RCT)
 #define AMB_RCT_SIZE    0x1000
 #define R_PLL_CORE      0x000
 #define R_PLL_LOCK      0x02c
+#define R_SYS_CONFIG    0x034
 #define R_CG_UART       0x038
 #define R_SOFT_RESET    0x068
 #define R_PLL_DDR       0x0dc
@@ -39,6 +41,7 @@ struct AmbRctState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    uint32_t sys_config;
     uint32_t regs[AMB_RCT_SIZE / 4];
 };
 
@@ -82,6 +85,7 @@ static void amb_rct_reset(DeviceState *dev)
     s->regs[R_PLL_IDSP / 4] = PLL(29, 2);       /* 348 MHz */
     s->regs[R_CG_UART / 4] = 1;                 /* the 24 MHz reference */
     s->regs[R_SOFT_RESET / 4] = 3;
+    s->regs[R_SYS_CONFIG / 4] = s->sys_config;
 }
 
 static void amb_rct_init(Object *obj)
@@ -103,11 +107,17 @@ static const VMStateDescription amb_rct_vmstate = {
     },
 };
 
+/* The power-on straps: how the board boots, and its NAND's page size and ECC */
+static const Property amb_rct_props[] = {
+    DEFINE_PROP_UINT32("sys-config", AmbRctState, sys_config, 0),
+};
+
 static void amb_rct_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, amb_rct_reset);
+    device_class_set_props(dc, amb_rct_props);
     dc->vmsd = &amb_rct_vmstate;
 }
 

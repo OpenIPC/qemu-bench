@@ -502,7 +502,7 @@ config AMBARELLA
 KCONFIG
     echo "  hw/arm/Kconfig: added AMBARELLA"
 fi
-for f in amb-vic amb-timer amb-rct amb-gpio; do
+for f in amb-vic amb-timer amb-rct amb-gpio amb-nand; do
     if ! grep -q "'$f.c'" "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('$f.c'))" \
             >> "$QEMU_DIR/hw/misc/meson.build"
