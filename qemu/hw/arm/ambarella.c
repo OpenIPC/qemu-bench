@@ -106,6 +106,9 @@ DECLARE_INSTANCE_CHECKER(AmbMachineState, AMB_MACHINE, TYPE_AMB_MACHINE)
 #define AMB_IRQ_IDC2        81
 #define AMB_IRQ_IDC1        82
 #define AMB_IRQ_IDC0        83
+#define AMB_IRQ_VDSP        3    /* CODE_VDSP_0, VIC0.3 */
+#define AMB_IRQ_VENC        55   /* CODE_VDSP_2, VIC1.23 */
+#define AMB_IRQ_VCAP        56   /* CODE_VDSP_1, VIC1.24 */
 
 #define AMB_DT_EDGE_RISING  1
 #define AMB_DT_LEVEL_HIGH   4
@@ -125,6 +128,7 @@ struct AmbMachineState {
     bool no_sensor_reset;
     char *flash_file;
     char *bad_blocks;
+    bool dsp;
 };
 
 static const struct {
@@ -630,6 +634,20 @@ static void amb_init(MachineState *ms)
     amb_sd(vic, AMB_SD0_BASE, AMB_IRQ_SD0, 0);
     amb_sd(vic, AMB_SD2_BASE, AMB_IRQ_SD2, 1);
 
+    if (ams->dsp) {
+        /* A stand-in for the ORC DSP, so iav sees a coprocessor to drive. */
+        DeviceState *dsp = qdev_new("amb-dsp");
+        qdev_prop_set_uint32(dsp, "iavmem-base", AMB_IAVMEM_BASE);
+        qdev_prop_set_uint32(dsp, "iavmem-end", ms->ram_size);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dsp), &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dsp), 0,
+                           qdev_get_gpio_in(vic, AMB_IRQ_VDSP));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dsp), 1,
+                           qdev_get_gpio_in(vic, AMB_IRQ_VCAP));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dsp), 2,
+                           qdev_get_gpio_in(vic, AMB_IRQ_VENC));
+    }
+
     if (ms->kernel_filename || !ams->flash_file) {
         arm_load_kernel(ARM_CPU(cpu), ms, &binfo);
     } else {
@@ -658,6 +676,16 @@ static bool amb_get_sensor_reset(Object *obj, Error **errp)
 static void amb_set_sensor_reset(Object *obj, bool val, Error **errp)
 {
     AMB_MACHINE(obj)->no_sensor_reset = !val;
+}
+
+static bool amb_get_dsp(Object *obj, Error **errp)
+{
+    return AMB_MACHINE(obj)->dsp;
+}
+
+static void amb_set_dsp(Object *obj, bool val, Error **errp)
+{
+    AMB_MACHINE(obj)->dsp = val;
 }
 
 static char *amb_get_flash_file(Object *obj, Error **errp)
@@ -715,6 +743,10 @@ static void amb_machine_class_init(MachineClass *mc)
                                   amb_set_bad_blocks);
     object_class_property_set_description(oc, "bad-blocks",
         "NAND blocks to mark bad, as byte offsets separated by colons");
+
+    object_class_property_add_bool(oc, "dsp", amb_get_dsp, amb_set_dsp);
+    object_class_property_set_description(oc, "dsp",
+        "model a stand-in for the ORC DSP (experimental, for the encoder path)");
 }
 
 DEFINE_MACHINE_EXTENDED("s3l", MACHINE, AmbMachineState,
