@@ -34,6 +34,7 @@ TRACE=0
 CC=${CC:-arm-openipc-linux-musleabi-gcc}
 OPENHISILICON=${OPENHISILICON:-}
 TOOLCHAIN_URL=https://github.com/OpenIPC/firmware/releases/download/toolchain/toolchain.hisilicon-hi3516ev200.tgz
+TOOLCHAIN_SHA256=4c1074928423ae6b7fd79b4b502a0da7f40cd058ca067cb747c804f820298bb6
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -64,7 +65,10 @@ fi
 if ! command -v "$CC" >/dev/null; then
     TC=$WORK/arm-openipc-linux-musleabi_sdk-buildroot
     if [ ! -x "$TC/bin/arm-openipc-linux-musleabi-gcc" ]; then
-        curl -fsSL --retry 3 "$TOOLCHAIN_URL" | tar xz -C "$WORK"
+        curl -fsSL --retry 3 -o "$WORK/toolchain.tgz" "$TOOLCHAIN_URL"
+        echo "$TOOLCHAIN_SHA256  $WORK/toolchain.tgz" | sha256sum -c - >/dev/null
+        tar xzf "$WORK/toolchain.tgz" -C "$WORK"
+        rm -f "$WORK/toolchain.tgz"
     fi
     CC=$TC/bin/arm-openipc-linux-musleabi-gcc
 fi

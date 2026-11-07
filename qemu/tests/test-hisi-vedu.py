@@ -120,13 +120,19 @@ def blocks4(y):
 
 
 def decode(path, fmt):
+    """Clean decode?  And the luma planes, in the decoder's own pixel format:
+    converting to yuv420p rescales a full-range stream's luma on some
+    ffmpeg versions, and gray does it on all of them."""
     err = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode',
                           '-f', fmt, '-i', path, '-f', 'null', '-'],
                          capture_output=True, text=True)
-    # yuv420p, not gray: ffmpeg's gray output rescales limited-range luma
+    pix = subprocess.run(['ffprobe', '-v', 'error', '-f', fmt,
+                          '-show_entries', 'stream=pix_fmt', '-of', 'csv=p=0',
+                          path], capture_output=True, text=True).stdout.strip()
+    if pix not in ('yuv420p', 'yuvj420p'):
+        return False, b''
     raw = subprocess.run(['ffmpeg', '-v', 'error', '-f', fmt, '-i', path,
-                          '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'],
-                         capture_output=True).stdout
+                          '-f', 'rawvideo', '-'], capture_output=True).stdout
     luma = b''.join(raw[i:i + W * H] for i in range(0, len(raw), W * H * 3 // 2))
     return err.returncode == 0 and not err.stderr.strip(), luma
 
@@ -265,6 +271,41 @@ def main():
         check(ok and len(raw) == W * H, 'JPEG: decodes cleanly')
         p = luma_psnr(raw, pics[0][0])
         check(p > 35, 'JPEG: luma PSNR %.1f dB' % p)
+        # A ring with no room left: buffer full, nothing written, the write
+        # pointer where it was.  The read pointer sits just past it.
+        RING = RINGS[0]
+        wp = q.readl(WP_CELL)
+        q.writel(RP_CELL, wp + 64)
+        q.write(RING + wp, b'\xa5' * 64)
+        q.writel(VEDU + 0x0008, 1)
+        q.cmd('clock_step 5000000')
+        raw = q.readl(VEDU + 0x3004)
+        check(raw & 4, 'full ring: buffer full (0x%x)' % raw)
+        check(q.readl(WP_CELL) == wp and q.read(RING + wp, 64) == b'\xa5' * 64,
+              'full ring: nothing written')
+        q.writel(VEDU + 0x0004, 0xffffffff)
+        q.writel(RP_CELL, 0)
+
+        # A packet claiming nearly the whole address space, and the driver
+        # starting the ring over (a destroyed and recreated channel): the
+        # model must neither allocate nor read past the ring, and must find
+        # the new channel's parameter sets from offset 0.
+        q.write(RING + wp, struct.pack('<II', 0xffffffc0, 0) + b'\0' * 56)
+        q.writel(WP_CELL, 0)
+        t, flags, nal = vedu_job(0, {}, H264_PS, 0)
+        check(t == 5, 'recreated channel: an IDR again (type %d)' % t)
+
+        # JPEG with no room: error and ring full, not done
+        RING = RINGS[2]
+        wp = q.readl(WP_CELL)
+        q.writel(RP_CELL, wp + 64)
+        q.writel(JPGE + 0x02c, 0)
+        q.writel(JPGE + 0x02c, 1)
+        q.cmd('clock_step 5000000')
+        raw = q.readl(JPGE + 0x008)
+        check(raw & 0x22 == 0x22 and not raw & 1,
+              'full JPEG ring: error and ring full, not done (0x%x)' % raw)
+        q.writel(JPGE + 0x00c, 0xffffffff)
     finally:
         q.close()
 

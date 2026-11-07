@@ -74,6 +74,7 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -98,6 +99,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
 #define VEDU_BUS_IDLE       0x3010
 
 #define VEDU_INT_EOP        (1u << 0)
+#define VEDU_INT_BUF_FULL   (1u << 2)
 
 /* register image offsets */
 #define IMG_SRC_Y           0x104
@@ -132,12 +134,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
 #define JPGE_STRM_WP        0x0218  /* address of the write-pointer cell */
 #define JPGE_QUANT_Y        0x0800  /* 64 reciprocals, 2^23 / q, by column */
 #define JPGE_QUANT_CB       0x0900
+#define JPGE_QUANT_CR       0x0a00
 #define JPGE_BUS_IDLE       0x0c0c
 
 #define JPGE_INT_DONE       (1u << 0)
+#define JPGE_INT_ERROR      (1u << 1)
+#define JPGE_INT_RING_FULL  (1u << 5)
 #define JPGE_PACK_ECS       5
 
 #define PKT_HDR             64
+#define PKT_MAX_READ        (64 * KiB)  /* parameter sets, JFIF headers */
+#define RING_MAX            (64 * MiB)
+#define PIC_MAX             4096        /* V4 encodes 2304 x 1296 at most */
 #define VEDU_DONE_NS        (1 * SCALE_MS)
 #define VEDU_MAX_CHN        8
 
@@ -272,16 +280,36 @@ static void vedu_dump(HisiVeduState *s, VeduChannel *c, const uint8_t *buf,
 
 static void hevc_parse_nal(HevcHdrs *h, const uint8_t *p, size_t n);
 
-/*
- * The driver's packets between what the model has read and the engine's
- * start: parameter sets to fit the slice to, and the channel id.
- * Returns true when the picture is an IDR (an SPS came with it).
- */
-static bool vedu_scan_packets(HisiVeduState *s, VeduChannel *c,
-                              uint32_t base, uint32_t size, uint32_t start)
+static void vedu_channel_free(VeduChannel *c)
 {
-    bool sps = false;
-    uint32_t off = c->scanned;
+    g_free(c->ref_y);
+    g_free(c->ref_uv);
+    hevc_enc_ref_free(c->hevc_ref);
+    hevc_enc_ref_free(c->hevc_spare);
+}
+
+/* a channel the driver destroyed and created again on the same ring */
+static void vedu_channel_reset(VeduChannel *c, int codec)
+{
+    const uint32_t ring = c->ring;
+    const unsigned index = c->index;
+
+    vedu_channel_free(c);
+    memset(c, 0, sizeof(*c));
+    c->ring = ring;
+    c->index = index;
+    c->codec = codec;
+}
+
+/*
+ * Walk the driver's packets from off to the engine's start: parameter
+ * sets to fit the slice to, the channel id and PTS.  False when they do
+ * not lead there (a ring the driver started over).
+ */
+static bool vedu_walk(HisiVeduState *s, VeduChannel *c, uint32_t base,
+                      uint32_t size, uint32_t off, uint32_t start, bool *sps)
+{
+    uint32_t walked = 0;
 
     while (off != start) {
         uint32_t hdr[PKT_HDR / 4], len, pad, payload;
@@ -292,50 +320,72 @@ static bool vedu_scan_packets(HisiVeduState *s, VeduChannel *c,
         len = le32_to_cpu(hdr[0]);
         pad = le32_to_cpu(hdr[1]);
         type = le32_to_cpu(hdr[2]) & 0xff;
-        if (len < PKT_HDR || len % 64 || len > size ||
+        if (len < PKT_HDR || len % 64 || len > size - walked ||
             pad > len - PKT_HDR) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "hisi-vedu: bad packet at ring offset 0x%x\n", off);
-            break;
+            return false;
         }
         payload = len - PKT_HDR - pad;
         c->chn = le32_to_cpu(hdr[3]);
         c->pts = le32_to_cpu(hdr[4]) | (uint64_t)le32_to_cpu(hdr[5]) << 32;
-        p = g_malloc(payload);
-        ring_read(base, size, off + PKT_HDR, p, payload);
-        if (c->codec == CODEC_JPEG) {
-            /* JPEGE_PACK_*: the header the scan goes under */
-        } else if (type == 7 || type == 8) {
-            c->codec = CODEC_H264;
-            h264_enc_parse_headers(&c->h264, p, payload);
-            sps |= type == 7;
-        } else if (type >= 32 && type <= 34) {
-            c->codec = CODEC_H265;
-            hevc_parse_nal(&c->hevc, p, payload);
-            sps |= type == 32;
+        if (payload <= PKT_MAX_READ) {
+            p = g_malloc(payload);
+            ring_read(base, size, off + PKT_HDR, p, payload);
+            if (c->codec == CODEC_JPEG) {
+                /* JPEGE_PACK_*: the header the scan goes under */
+            } else if (type == 7 || type == 8) {
+                c->codec = CODEC_H264;
+                h264_enc_parse_headers(&c->h264, p, payload);
+                *sps |= type == 7;
+            } else if (type >= 32 && type <= 34) {
+                c->codec = CODEC_H265;
+                hevc_parse_nal(&c->hevc, p, payload);
+                *sps |= type == 32;
+            }
+            vedu_dump(s, c, p, payload);
+        } else {
+            qemu_log_mask(LOG_UNIMP, "hisi-vedu: %u-byte packet of type %u "
+                          "skipped\n", payload, type);
         }
-        vedu_dump(s, c, p, payload);
         off = (off + len) % size;
+        walked += len;
+    }
+    return true;
+}
+
+/*
+ * The driver's packets between what the model has read and the engine's
+ * start.  Returns true when the picture is an IDR (an SPS came with it).
+ */
+static bool vedu_scan_packets(HisiVeduState *s, VeduChannel *c,
+                              uint32_t base, uint32_t size, uint32_t start)
+{
+    bool sps = false;
+
+    if (!vedu_walk(s, c, base, size, c->scanned, start, &sps)) {
+        vedu_channel_reset(c, c->codec == CODEC_JPEG ? CODEC_JPEG
+                                                     : CODEC_NONE);
+        sps = false;
+        if (!vedu_walk(s, c, base, size, 0, start, &sps)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "hisi-vedu: no packets lead to "
+                          "ring offset 0x%x\n", start);
+        }
     }
     c->scanned = start;
     return sps;
 }
 
-static void vedu_channel_free(VeduChannel *c)
+static VeduChannel *vedu_channel(HisiVeduState *s, uint32_t ring, bool jpeg)
 {
-    g_free(c->ref_y);
-    g_free(c->ref_uv);
-    hevc_enc_ref_free(c->hevc_ref);
-    hevc_enc_ref_free(c->hevc_spare);
-}
-
-static VeduChannel *vedu_channel(HisiVeduState *s, uint32_t ring)
-{
+    VeduChannel *c;
     unsigned i;
 
     for (i = 0; i < s->nchn; i++) {
-        if (s->chn[i].ring == ring) {
-            return &s->chn[i];
+        c = &s->chn[i];
+        if (c->ring == ring) {
+            if (jpeg != (c->codec == CODEC_JPEG)) {
+                vedu_channel_reset(c, jpeg ? CODEC_JPEG : CODEC_NONE);
+            }
+            return c;
         }
     }
     if (s->nchn == VEDU_MAX_CHN) {
@@ -343,10 +393,24 @@ static VeduChannel *vedu_channel(HisiVeduState *s, uint32_t ring)
         vedu_channel_free(&s->chn[0]);
         memmove(&s->chn[0], &s->chn[1], sizeof(s->chn[0]) * --s->nchn);
     }
-    memset(&s->chn[s->nchn], 0, sizeof(s->chn[0]));
-    s->chn[s->nchn].ring = ring;
-    s->chn[s->nchn].index = s->nchn;
-    return &s->chn[s->nchn++];
+    c = &s->chn[s->nchn];
+    memset(c, 0, sizeof(*c));
+    c->ring = ring;
+    c->index = s->nchn++;
+    c->codec = jpeg ? CODEC_JPEG : CODEC_NONE;
+    return c;
+}
+
+/*
+ * Room for need bytes at the write pointer wp before the read pointer rp
+ * (offsets in a ring of size; rp == wp: empty).  No read-pointer cell:
+ * the whole ring.
+ */
+static uint32_t ring_room(uint32_t size, uint32_t wp, hwaddr rp_cell)
+{
+    const uint32_t rp = rp_cell ? vedu_ldl(rp_cell) % size : wp;
+
+    return size - (wp + size - rp) % size - 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -440,12 +504,13 @@ static void vedu_load_nv12(uint32_t ya, uint32_t ca, int ys, int cs,
  * One picture as one slice NAL into out (byte stream, start code
  * included).  Returns its length, 0 if the headers seen do not allow it.
  */
-static size_t vedu_h264_picture(VeduChannel *c, bool idr, int qp, int w,
+static size_t vedu_h264_picture(VeduChannel *c, bool *idr_io, int qp, int w,
                                 int h, const uint8_t *y, const uint8_t *uv,
                                 uint8_t *out, size_t cap)
 {
     H264Enc *e = &c->h264;
     const int mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
+    bool idr = *idr_io;
     const bool p = !idr && c->have_ref && c->mbw == mbw && c->mbh == mbh;
     H264Deblock db = { 0, 0, 0 };
     g_autofree uint8_t *rbsp = g_malloc0(cap);
@@ -457,8 +522,9 @@ static size_t vedu_h264_picture(VeduChannel *c, bool idr, int qp, int w,
         return 0;
     }
     if (!p) {
-        idr = true;
+        idr = true;     /* nothing to refer to: the picture is an IDR */
     }
+    *idr_io = idr;
     if (idr) {
         c->frame_num = 0;
         c->poc_lsb = 0;
@@ -501,6 +567,9 @@ static size_t vedu_h264_picture(VeduChannel *c, bool idr, int qp, int w,
         bw_se(&bw, 0);
     }
 
+    if (bw.bits / 8 + 256 > cap) {
+        return 0;                       /* no room for any slice data */
+    }
     if (c->mbw != mbw || c->mbh != mbh) {
         g_free(c->ref_y);
         g_free(c->ref_uv);
@@ -764,6 +833,11 @@ static void hevc_parse_pps(HevcHdrs *h, const uint8_t *b, size_t n)
     }
     h->output_flag = br_bits(&r, 1);
     h->num_extra_bits = br_bits(&r, 3);
+    if (h->num_extra_bits) {
+        /* slice_reserved_flags would sit before slice_type, which is
+         * where the driver's part 2 starts */
+        h->unsupported = true;
+    }
     h->sign_hiding = br_bits(&r, 1);
     h->cabac_init_present = br_bits(&r, 1);
     h->num_ref_idx_l0 = br_ue(&r) + 1;
@@ -820,6 +894,9 @@ static void hevc_parse_nal(HevcHdrs *h, const uint8_t *p, size_t n)
         }
         if (j + 2 >= n) {
             j = n;
+        }
+        if (j < i + 2) {
+            continue;                   /* no room for a NAL header */
         }
         type = (p[i] >> 1) & 0x3f;
         rbsp = g_malloc(j - i);
@@ -987,6 +1064,9 @@ static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
     prm.max_merge_cand = sl.max_merge;
     prm.sign_hiding = h->sign_hiding;
 
+    if (cap < 256) {
+        return 0;
+    }
     if (!c->hevc_spare) {
         c->hevc_spare = hevc_enc_ref_new();
     }
@@ -1031,7 +1111,8 @@ static void vedu_update_irq(HisiVeduState *s)
     qemu_set_irq(s->vedu_irq, s->vedu_regs[VEDU_INTSTAT / 4] != 0);
 }
 
-static void vedu_encode(HisiVeduState *s)
+/* one picture; returns the raw interrupt bits it ends with */
+static uint32_t vedu_encode(HisiVeduState *s)
 {
     const uint32_t *img = s->img;
     const uint32_t size_reg = s->vedu_regs[VEDU_PIC_SIZE / 4];
@@ -1039,22 +1120,30 @@ static void vedu_encode(HisiVeduState *s)
     const uint32_t base = img[IMG_STRM_BASE / 4];
     const uint32_t size = img[IMG_STRM_SIZE / 4];
     const uint32_t wp_cell = img[IMG_STRM_WP / 4];
-    const int mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
+    const size_t mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
     VeduChannel *c;
-    uint32_t start, hdr[PKT_HDR / 4] = { 0 }, total;
+    uint32_t start, room, hdr[PKT_HDR / 4] = { 0 }, total;
     uint64_t pts;
     g_autofree uint8_t *y = NULL, *uv = NULL, *nal = NULL;
-    size_t cap, n;
+    size_t want, cap, n;
     bool idr;
 
-    if (!base || !size || !wp_cell || w < 16 || h < 16) {
+    if (!base || size < 4 * PKT_HDR || size > RING_MAX || !wp_cell ||
+        w < 16 || h < 16 || w > PIC_MAX || h > PIC_MAX) {
         qemu_log_mask(LOG_GUEST_ERROR, "hisi-vedu: picture not set up "
                       "(ring 0x%x+0x%x, %dx%d)\n", base, size, w, h);
-        return;
+        return VEDU_INT_EOP;
     }
-    c = vedu_channel(s, base);
+    c = vedu_channel(s, base, false);
     start = vedu_ldl(wp_cell) % size;
     idr = vedu_scan_packets(s, c, base, size, start);
+    room = ring_room(size, start, img[IMG_STRM_RP / 4]);
+
+    want = mbw * mbh * 512 + 4096;
+    cap = room > 2 * PKT_HDR ? MIN(want, (size_t)room - 2 * PKT_HDR) : 0;
+    if (cap < 1024) {
+        return VEDU_INT_EOP | VEDU_INT_BUF_FULL;
+    }
 
     y = g_malloc(mbw * mbh * 256);
     uv = g_malloc(mbw * mbh * 128);
@@ -1062,19 +1151,21 @@ static void vedu_encode(HisiVeduState *s)
                    img[IMG_SRC_STRIDE / 4] & 0xffff,
                    img[IMG_SRC_STRIDE / 4] >> 16, w, h, true, mbw, mbh, y, uv);
 
-    cap = MIN(size / 2, (size_t)mbw * mbh * 512 + 4096);
     nal = g_malloc(cap + 64);
     if (c->codec == CODEC_H265) {
         n = vedu_h265_picture(c, img, &idr, y, uv, mbw * 16, mbh * 16,
                               nal, cap);
     } else {
-        n = vedu_h264_picture(c, idr, img[IMG_SLICE_QP / 4] & 0x3f, w, h,
+        n = vedu_h264_picture(c, &idr, img[IMG_SLICE_QP / 4] & 0x3f, w, h,
                               y, uv, nal, cap);
     }
     if (!n) {
+        if (cap < want) {
+            return VEDU_INT_EOP | VEDU_INT_BUF_FULL;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "hisi-vedu: no usable parameter sets "
                       "for channel %u, picture dropped\n", c->chn);
-        return;
+        return VEDU_INT_EOP;
     }
 
     total = PKT_HDR + ROUND_UP(n, 64);
@@ -1095,14 +1186,14 @@ static void vedu_encode(HisiVeduState *s)
 
     c->scanned = (start + total) % size;
     vedu_stl(wp_cell, c->scanned);
+    return VEDU_INT_EOP;
 }
 
 static void vedu_done(void *opaque)
 {
     HisiVeduState *s = opaque;
 
-    vedu_encode(s);
-    s->vedu_raw |= VEDU_INT_EOP;
+    s->vedu_raw |= vedu_encode(s);
     vedu_update_irq(s);
 }
 
@@ -1194,42 +1285,55 @@ static void jpge_update_irq(HisiVeduState *s)
     qemu_set_irq(s->jpge_irq, s->jpge_regs[JPGE_INTSTAT / 4] != 0);
 }
 
-static void jpge_encode(HisiVeduState *s)
+/* one picture; returns the raw interrupt bits it ends with */
+static uint32_t jpge_encode(HisiVeduState *s)
 {
     const uint32_t *r = s->jpge_regs;
     const int w = (r[JPGE_PIC_SIZE / 4] & 0xffff) + 1;
     const int h = (r[JPGE_PIC_SIZE / 4] >> 16) + 1;
     const uint32_t base = r[JPGE_STRM_BASE / 4], size = r[JPGE_STRM_SIZE / 4];
     const uint32_t wp_cell = r[JPGE_STRM_WP / 4];
-    const int mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
-    const int pw = mbw * 16, ph = mbh * 16;
+    const size_t mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
+    const size_t pw = mbw * 16, ph = mbh * 16;
     g_autofree uint8_t *y = NULL, *uv = NULL, *cb = NULL, *cr = NULL;
     g_autofree uint8_t *out = NULL;
     uint8_t ql[64], qc[64];
-    uint32_t start, hdr[PKT_HDR / 4] = { 0 }, total;
+    uint32_t start, room, hdr[PKT_HDR / 4] = { 0 }, total;
     VeduChannel *c;
     bool overflow = false;
-    size_t cap, n;
-    int i;
+    size_t cap, n, i;
 
-    if (!base || !size || !wp_cell || w < 8 || h < 8) {
+    if (!base || size < 4 * PKT_HDR || size > RING_MAX || !wp_cell ||
+        w < 8 || h < 8 || w > PIC_MAX || h > PIC_MAX) {
         qemu_log_mask(LOG_GUEST_ERROR, "hisi-jpge: picture not set up "
                       "(ring 0x%x+0x%x, %dx%d)\n", base, size, w, h);
-        return;
+        return JPGE_INT_ERROR;
     }
-    c = vedu_channel(s, base);
-    c->codec = CODEC_JPEG;
+    c = vedu_channel(s, base, true);
     start = vedu_ldl(wp_cell) % size;
     vedu_scan_packets(s, c, base, size, start);
+    room = ring_room(size, start, r[JPGE_STRM_RP / 4]);
 
     for (i = 0; i < 64; i++) {
         /* register i holds row i % 8, column i / 8 */
         const uint32_t ry = r[JPGE_QUANT_Y / 4 + i] ?: 1;
         const uint32_t rc = r[JPGE_QUANT_CB / 4 + i] ?: 1;
-        const int k = (i % 8) * 8 + i / 8;
+        const size_t k = (i % 8) * 8 + i / 8;
 
         ql[k] = MIN(255, MAX(1, ((1u << 23) + ry / 2) / ry));
         qc[k] = MIN(255, MAX(1, ((1u << 23) + rc / 2) / rc));
+    }
+    if (memcmp(&r[JPGE_QUANT_CB / 4], &r[JPGE_QUANT_CR / 4], 64 * 4)) {
+        /* jpeg-enc.c codes Cb and Cr with one table, as the driver's
+         * two-table DQT does */
+        qemu_log_mask(LOG_UNIMP, "hisi-jpge: Cr quantisers differ from Cb's; "
+                      "Cr coded with Cb's\n");
+    }
+
+    cap = room > 2 * PKT_HDR ? MIN(pw * ph * 2 + 1024,
+                                   (size_t)room - 2 * PKT_HDR) : 0;
+    if (cap < 1024) {
+        return JPGE_INT_ERROR | JPGE_INT_RING_FULL;
     }
 
     y = g_malloc(pw * ph);
@@ -1244,13 +1348,11 @@ static void jpge_encode(HisiVeduState *s)
         cr[i] = uv[i * 2 + 1];
     }
 
-    cap = MIN(size / 2, (size_t)pw * ph * 2 + 1024);
     out = g_malloc(cap + 64);
     n = jpeg_enc_scan(y, pw, cb, cr, pw / 2, w, h, ql, qc, true, out, cap,
                       &overflow);
     if (overflow) {
-        s->jpge_raw |= 1u << 5;                 /* stream buffer full */
-        return;
+        return JPGE_INT_ERROR | JPGE_INT_RING_FULL;
     }
 
     total = PKT_HDR + ROUND_UP(n, 64);
@@ -1267,14 +1369,14 @@ static void jpge_encode(HisiVeduState *s)
 
     c->scanned = (start + total) % size;
     vedu_stl(wp_cell, c->scanned);
+    return JPGE_INT_DONE;
 }
 
 static void jpge_done(void *opaque)
 {
     HisiVeduState *s = opaque;
 
-    jpge_encode(s);
-    s->jpge_raw |= JPGE_INT_DONE;
+    s->jpge_raw |= jpge_encode(s);
     jpge_update_irq(s);
 }
 

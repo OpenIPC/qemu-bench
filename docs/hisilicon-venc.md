@@ -97,6 +97,10 @@ bits. It then codes the slice data:
   cabac_init and merge candidates from the SPS / PPS and the slice header.
 
 Completion comes 1 ms later in virtual time, never inside the START write.
+A picture that does not fit between the write and read pointers is not
+written. VEDU then raises end of picture with buffer full (`0x3004` bit 2),
+which `h264e_drv_read_regs` reports. JPGE raises error and ring full
+(bits 1 and 5), never done.
 
 ## JPGE
 
@@ -155,8 +159,7 @@ The release's MPI libraries are uClibc builds. Under musl they need:
 - **VI, ISP and VPSS:** the stock `sample_venc` captures from a sensor and
   would need these to run. `hisi-vi-fp`'s pulses (EV300) are not enough:
   the VPSS handler needs channel state that only real frames create.
-- **Multi-slice pictures, B frames and a full stream buffer:** the model
-  codes one slice per picture and has no B frames. It reports a full
-  stream buffer only for JPEG.
+- **Multi-slice pictures and B frames:** the model codes one slice per
+  picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own
   encoder layouts and are still register stubs.

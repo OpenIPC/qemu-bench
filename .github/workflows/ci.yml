@@ -344,19 +344,25 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-arm
 
       # The release's libmpi.so / libgk_api.so are uClibc builds the guest
-      # program links against with OpenIPC's own musl toolchain.
+      # program links against with OpenIPC's own musl toolchain.  The
+      # tarball is a moving release asset: it is pinned by hash, so a
+      # republished one fails here (update the hash and the cache key)
+      # instead of running unchecked.
       - name: OpenIPC toolchain cache
         uses: actions/cache@v4
         with:
           path: venc-toolchain
-          key: toolchain-hisilicon-hi3516ev200-v1
+          key: toolchain-hisilicon-hi3516ev200-4c107492
 
       - name: OpenIPC toolchain
         run: |
           if [ ! -x venc-toolchain/bin/arm-openipc-linux-musleabi-gcc ]; then
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/tc.tgz" \
+              https://github.com/OpenIPC/firmware/releases/download/toolchain/toolchain.hisilicon-hi3516ev200.tgz
+            echo "4c1074928423ae6b7fd79b4b502a0da7f40cd058ca067cb747c804f820298bb6  $RUNNER_TEMP/tc.tgz" |
+              sha256sum -c -
             rm -rf venc-toolchain && mkdir venc-toolchain
-            curl -fsSL --retry 3 https://github.com/OpenIPC/firmware/releases/download/toolchain/toolchain.hisilicon-hi3516ev200.tgz |
-              tar xz -C venc-toolchain --strip-components=1
+            tar xzf "$RUNNER_TEMP/tc.tgz" -C venc-toolchain --strip-components=1
           fi
           echo "CC=$PWD/venc-toolchain/bin/arm-openipc-linux-musleabi-gcc" >> "$GITHUB_ENV"
 
