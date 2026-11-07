@@ -701,8 +701,8 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
 the vendor VENC stack; `frames`: the online VI → VPSS pipeline produces
 pictures, so majestic and the SDK's `sample_venc` stream from a sensor
-(`docs/hisilicon-venc.md`). ¹ HiSilicon EV200 / EV300 / 18EV300 / 16DV200;
-the Goke rebrands keep stubs. V5 (×3) = CV608/CV610/CV613 (same die, different feature
+(`docs/hisilicon-venc.md`). ¹ EV200 / EV300 / 18EV300 / 16DV200 and their
+Goke rebrands. V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
 
