@@ -327,8 +327,9 @@ static void scene_ae_global(HisiViState *s, uint32_t *regs)
 {
     int c;
 
+    /* every pixel counted; the total's field is the narrower (27 bits) */
     regs[0] = MIN(scene_samples(s) * 4, 0x7ffffff);
-    regs[1] = MIN(scene_samples(s) * 4, 0x7fffffff);
+    regs[1] = regs[0];
     for (c = 0; c < 4; c++) {
         regs[2 + c] = scene_mean(c == 0 ? 0 : c == 3 ? 2 : 1, 0, 1, s->level);
     }
