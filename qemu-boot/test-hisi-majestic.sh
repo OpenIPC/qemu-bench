@@ -2,8 +2,11 @@
 # majestic's video on an emulated HiSilicon V4 camera, end to end.
 #
 # Boots the OpenIPC release (kernel, squashfs root) the way U-Boot would
-# start it (mem= and the allocator, load_hisilicon sizing MMZ itself) with
-# an SC2315E on the sensor bus, and leaves majestic to start on its own.
+# start it (mem= and the allocator, load_hisilicon / load_goke sizing MMZ
+# itself) with a 1080p sensor on the bus, and leaves majestic to start on
+# its own.  The sensor has to be one the release has a config for in
+# /etc/sensors: SC2315E for HiSilicon's releases, SC2335 for Goke's (which
+# lack the SC2315E; majestic then stops at "Cannot start SDK", in syslog).
 # Its pipeline is the vendor's, unmodified: sensor and ISP, VI online into
 # VPSS (hisi-vi, hisi-vpss: the frame clock and the pictures), VENC on
 # VEDU (hisi-vedu).  hisi-vedu keeps the stream it encodes
@@ -15,8 +18,9 @@
 # interrupt handlers always finish within a frame of VI's (without it, a
 # slow host lets frames overtake the driver and the counter can repeat).
 #
-#   test-hisi-majestic.sh [--soc hi3516ev200|hi3516ev300] [--qemu Q]
-#                         [--work DIR] [--timeout SECONDS] [--min-frames N]
+#   test-hisi-majestic.sh [--soc hi3516ev200|hi3516ev300|gk7205v200|...]
+#                         [--sensor NAME] [--qemu Q] [--work DIR]
+#                         [--timeout SECONDS] [--min-frames N]
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -25,6 +29,7 @@ QEMU=$HERE/../qemu-src/build/qemu-system-arm
 WORK=
 TIMEOUT=420
 MIN_FRAMES=50
+SENSOR=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -33,10 +38,15 @@ while [ $# -gt 0 ]; do
     --work) WORK=$2; shift ;;
     --timeout) TIMEOUT=$2; shift ;;
     --min-frames) MIN_FRAMES=$2; shift ;;
+    --sensor) SENSOR=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
 done
+case $SOC in
+gk*) ALLOC=gk; SENSOR=${SENSOR:-sc2335} ;;
+*) ALLOC=hisi; SENSOR=${SENSOR:-sc2315e} ;;
+esac
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
@@ -49,9 +59,9 @@ rm -rf "$DUMP"
 mkdir -p "$DUMP"
 
 # QEMU is stopped by the timeout: majestic streams until then
-timeout "$TIMEOUT" "$QEMU" -M "$SOC,sensor=sc2315e" \
+timeout "$TIMEOUT" "$QEMU" -M "$SOC,sensor=$SENSOR" \
     -kernel "$WORK/uImage.$SOC" -initrd "$WORK/rootfs.squashfs.$SOC" \
-    -append "console=ttyAMA0,115200 mem=32M mmz_allocator=hisi root=/dev/ram0 rootfstype=squashfs" \
+    -append "console=ttyAMA0,115200 mem=32M mmz_allocator=$ALLOC root=/dev/ram0 rootfstype=squashfs" \
     -icount shift=0 -global hisi-vedu.dump-dir="$DUMP" \
     -nographic -serial mon:stdio -nic user,restrict=on -no-reboot \
     > "$WORK/console.log" 2>&1 || true

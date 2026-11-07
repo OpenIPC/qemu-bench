@@ -14,14 +14,20 @@ release's `open_*.ko` / `gk7205v200_*.ko` modules and `libmpi.so` /
 `libgk_api.so`. Pictures sent with `VENC_SendFrame` come back from
 `VENC_GetStream` as streams ffmpeg decodes.
 
-On the HiSilicon EV200-class machines (hi3516ev200, hi3516ev300,
-hi3518ev300, hi3516dv200), `hisi-vi` and `hisi-vpss` add the camera
-pipeline in front of it (see [VI and VPSS](#vi-and-vpss) below). With an
-SC2315E on the sensor bus (`sensor=sc2315e`), two unmodified programs run
-from sensor to stream:
+On the EV200-class machines (hi3516ev200, hi3516ev300, hi3518ev300,
+hi3516dv200 and the Goke rebrands gk7205v200, gk7205v300, gk7202v300,
+gk7605v100, gk7201v200), `hisi-vi` and `hisi-vpss` add the camera pipeline
+in front of it (see [VI and VPSS](#vi-and-vpss) below). With a 1080p
+sensor on the bus, two unmodified programs run from sensor to stream:
 
 - the SDK's own `sample_venc` (mode 1: 1080p H.265 and 640x480 H.264);
-- the OpenIPC release's majestic.
+- the OpenIPC release's majestic, with HiSilicon's `open_*.ko` or Goke's
+  `gk7205v200_*.ko`.
+
+The sensor has to be one the firmware has a config for in `/etc/sensors`.
+`sensor=sc2315e` suits HiSilicon's releases. Goke's releases have no
+SC2315E config, so use `sensor=sc2335` there. With an unlisted sensor,
+majestic stops at "Cannot start SDK", in syslog, before it touches VI.
 
 The contract below was taken from the SDK's driver objects
 (`Hi3516EV200_SDK_V1.0.1.2/mpp/obj/hi_vedu.o`, `hi_h264e.o`, `hi_h265e.o`;
@@ -210,7 +216,7 @@ encoded picture may repeat or reorder (the streams still decode).
 Running it:
 
 ```bash
-bash qemu-boot/test-hisi-majestic.sh --soc hi3516ev200        # the release's majestic (CI)
+bash qemu-boot/test-hisi-majestic.sh --soc hi3516ev200        # the release's majestic (CI; also gk7205v200)
 bash qemu-boot/test-hisi-sample-venc.sh --sdk <Hi3516EV200_SDK_V1.0.1.2>   # the SDK's sample_venc
 ```
 
@@ -247,9 +253,6 @@ The release's MPI libraries are uClibc builds. Under musl they need:
   drivers write VI's frames to DDR for VPSS to read, which is not
   modelled. ISP statistics are not produced either: the 3A algorithms run,
   but on nothing.
-- **Goke rebrands:** their own `gk7205v200_*.ko` start the pipeline under
-  `hisi-vi` / `hisi-vpss` but deliver no frame yet, so those machines keep
-  register stubs for VI and VPSS.
 - **Multi-slice pictures and B frames:** the model codes one slice per
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own
