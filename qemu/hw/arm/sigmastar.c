@@ -441,16 +441,13 @@ static const SstarRegDefault ss_msc316_defaults[] = {
 SS_MSC316_SOC(msc316dc, "MSC316DC");
 SS_MSC316_SOC(msc316dm, "MSC316DM");
 
-static const SstarRegDefault ss_iford_defaults[] = {
-    /*
-     * MIU: DRAM size, log2 of MiB, which the kernel's
-     * reg_miu_dram_get_size and so mi_sys read.  The IPL writes it once
-     * it has found where DRAM wraps (sstar-riu's fill engine); this is for
-     * a boot with no IPL (-kernel).
-     */
-    { SSTAR_RIU_ADDR(0x1659, 0x0D), 7 },
-    { 0 }
-};
+/*
+ * MIU: DRAM size, log2 of MiB, which the kernel's reg_miu_dram_get_size and
+ * so mi_sys read.  The IPL writes it once it has found where DRAM wraps
+ * (sstar-riu's fill engine); for a boot with no IPL (-kernel) it starts at
+ * the machine's own size (sigmastar_common_init).
+ */
+#define SS_MIU_DRAM_SIZE    SSTAR_RIU_ADDR(0x1659, 0x0D)
 
 /*
  * SSC029 (die "iford", Linux "sstar,iford"): two Cortex-A32s, run here by
@@ -475,7 +472,6 @@ static const SstarRegDefault ss_iford_defaults[] = {
     .fsp_sw_cs          = true,                                       \
     .fsp_bank           = 0x100D,                                     \
     .qspi_bank          = 0x100E,                                     \
-    .defaults           = ss_iford_defaults,                          \
     .smf_ack            = true,                                       \
     .urdma              = true,                                       \
     .sd_cd_addr         = SSTAR_RIU_ADDR(0x103E, 0x14),               \
@@ -541,7 +537,6 @@ static const SsSoCConfig ssc029b_soc = {
     .fsp_sw_cs          = true,                                       \
     .fsp_bank           = 0x100D,                                     \
     .qspi_bank          = 0x100E,                                     \
-    .defaults           = ss_iford_defaults,                          \
     .smf_ack            = true,                                       \
     .urdma              = true,                                       \
     .sd_bank            = 0x1413,           /* DTS sdmmc0 0x1F282600 */ \
@@ -753,6 +748,7 @@ struct SsMachineState {
     uint16_t smpctrl_regs[0x80];
     bool iford;
     bool gicv3;
+    bool cpu1_stub;             /* SS_IFORD_CPU1_STUB is installed */
     /* what bus masters see: MIU bus addresses, DRAM from 0 */
     MemoryRegion miu_root;
     MemoryRegion miu_sys;
@@ -957,7 +953,7 @@ static void ss_smpctrl_write(void *opaque, hwaddr off, uint64_t val,
          * kernel (Iford's OP-TEE does) relies on it: an NS write to
          * ICC_PMR is ignored while PMR is in the Secure half.
          */
-        if (s->gicv3 && s->iford && el == 3) {
+        if (s->cpu1_stub && el == 3) {
             entry = SS_IFORD_CPU1_STUB;
         }
         ret = arm_set_cpu_on(s->cpus[1]->mp_affinity, entry, 0, el, false);
@@ -1625,6 +1621,13 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     }
     if (c->defaults) {
         sstar_riu_add_defaults(SSTAR_RIU(riu), c->defaults);
+    }
+    if (ss_iford_gen(c)) {
+        static SstarRegDefault miu_size[2];
+
+        miu_size[0].addr = SS_MIU_DRAM_SIZE;
+        miu_size[0].val = ctz64(machine->ram_size / MiB);
+        sstar_riu_add_defaults(SSTAR_RIU(riu), miu_size);
     }
     if (nand) {
         sstar_riu_add_defaults(SSTAR_RIU(riu),
@@ -2609,9 +2612,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     binfo.secondary_cpu_reset_hook = ss_reset_secondary;
     arm_load_kernel(sms->cpus[0], machine, &binfo);
 
-    if (machine->kernel_filename) {
-        return;
-    }
+    /* without a ROM dump, CPU1's Secure way out of the ROM is ours */
     if (c->die == SS_DIE_IFORD && !machine->firmware) {
         uint32_t stub[ARRAY_SIZE(ss_iford_cpu1_stub)];
         int k;
@@ -2621,6 +2622,10 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         }
         rom_add_blob_fixed("sigmastar.cpu1", stub, sizeof(stub),
                            SS_IFORD_CPU1_STUB);
+        sms->cpu1_stub = true;
+    }
+    if (machine->kernel_filename) {
+        return;
     }
     if (machine->firmware) {
         /* A real mask ROM dump: it loads the IPL itself, through BDMA. */

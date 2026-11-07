@@ -2208,6 +2208,19 @@ def test_ssc034_sd_venc(qemu, tmp):
         check('VENC: an H.265 stream, a VPS first',
               qt.readl(DRAM + bsb) | qt.readw(DRAM + bsb + 4) << 32,
               0x0140_01000000)
+        # a ring too small for the picture: an error, nothing written
+        qt.writel(DRAM + ctl + 0x08, 8)
+        qt.writel(DRAM + ctl + 0x40, 0)
+        qt.writel(res + 0x160, 1)
+        qt.writel(ctrl + 0x04, 2)                   # the same entry again
+        e1 = DRAM + ring + 0x1B40
+        for off in range(0, 0x1B40, 4):
+            qt.writel(e1 + off, qt.readl(e + off))
+        qt.step(6000000)
+        check('VENC: a picture that does not fit is an error (status 7), '
+              'the ring untouched',
+              (qt.readl(res + 0x160), qt.readl(res + 0x08) >> 24,
+               qt.readl(DRAM + ctl + 0x40)), (7, 0, 0))
     finally:
         qt.close()
 
@@ -2242,6 +2255,131 @@ def test_ssc034_sd_venc(qemu, tmp):
                 qt.close()
     finally:
         SDIO0 = saved
+
+
+# IFLIEGEN_SMP_IPL with 0x15 = 0x04, a Secure wake: on Iford CPU1 leaves the
+# ROM through the model's stub, then stores its mode as above.
+IFORD_SMP_SECURE_IPL = IFLIEGEN_SMP_IPL.replace(bytes.fromhex('0c20a0e3'),
+                                                bytes.fromhex('0420a0e3'))
+
+
+def test_iford_storage(qemu, tmp):
+    print('Iford: SD card detect, DRAM size, the DRAM fill engine, CPU1 '
+          'Secure; W25N continuous read; infinity6c FCIE ECC decode')
+    path = os.path.join(tmp, 'iford-st.bin')
+    img = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    open(path, 'wb').write(img.ljust(0x1000000, b'\xFF'))
+    card = os.path.join(tmp, 'iford-sd.img')
+    open(card, 'wb').write(bytes(SD_BLOCKS * 512))
+    for extra, want in (([], 1), (['-drive', 'if=sd,format=raw,file=' + card], 0)):
+        qt = QTest(qemu, 'ssc029,flash-file=' + path, extra)
+        try:
+            check('Iford SD: PAD_SD0_CDZ (0x103E reg 0x14) %s'
+                  % ('high, no card' if want else 'low, a card'),
+                  qt.readw(riu(0x103E, 0x14)) & 1, want)
+        finally:
+            qt.close()
+    for m, log2 in (('ssc029a', 9), ('ssc029b,bond=0x10', 8), ('ssc034b', 6)):
+        qt = QTest(qemu, m + ',flash-file=' + path, [])
+        try:
+            check(m + ': the MIU size register is its DRAM, log2 MiB',
+                  qt.readw(riu(0x1659, 0x0D)) & 0xFF, log2)
+        finally:
+            qt.close()
+
+    qt = QTest(qemu, 'ssc029,flash-file=' + path, [])
+    try:
+        bist = riu(0x1668, 0)
+        qt.writel(DRAM + 0x10000, 0)
+        qt.writel(DRAM + 0x100FC, 0)
+        qt.writel(DRAM + 0x10100, 0x11223344)
+        qt.writew(bist + 0x52 * 4, 0x18)            # fill
+        qt.writew(bist + 0x56 * 4, 0xA55A)
+        qt.writew(bist + 0x54 * 4, 16)              # 256 bytes
+        qt.writew(bist + 0x55 * 4, 0)
+        qt.writew(bist + 0x57 * 4, 64)              # at 64 KiB
+        qt.writew(bist + 0x58 * 4, 0)
+        qt.writew(bist + 0x50 * 4, 1)
+        check('DRAM fill: done in 0x59 [2:0]', qt.readw(bist + 0x59 * 4) & 7, 4)
+        check('DRAM fill: the pattern from 64 KiB, 256 bytes',
+              (qt.readl(DRAM + 0x10000), qt.readl(DRAM + 0x100FC),
+               qt.readl(DRAM + 0x10100)), (0xA55AA55A, 0xA55AA55A, 0x11223344))
+        # at 128 MiB on a 128 MiB part the MIU wraps: what the IPL sizes by
+        qt.writew(bist + 0x56 * 4, 0x5AA5)
+        qt.writew(bist + 0x57 * 4, (128 << 10) & 0xFFFF)
+        qt.writew(bist + 0x58 * 4, (128 << 10) >> 16)
+        qt.writew(bist + 0x50 * 4, 0)
+        qt.writew(bist + 0x50 * 4, 1)
+        check('DRAM fill: past the end it lands at 0, where DRAM wraps',
+              qt.readl(DRAM + 0x10000) & 0xFFFF, 0xA55A)
+        check('and at its start', qt.readl(DRAM), 0x5AA55AA5)
+    finally:
+        qt.close()
+
+    smp = os.path.join(tmp, 'iford-smp-s.bin')
+    open(smp, 'wb').write(IFORD_SMP_SECURE_IPL.ljust(0x1000000, b'\xFF'))
+    p = subprocess.Popen([qemu, '-M', 'ssc029,flash-file=' + smp,
+                          '-display', 'none', '-nodefaults',
+                          '-monitor', 'stdio'], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True)
+    time.sleep(2)
+    out, _ = p.communicate('xp /1xw 0x20100000\nquit\n', timeout=30)
+    m = re.search(r'0000000020100000: (0x[0-9a-f]+)', out)
+    check('Iford CPU1 woken Secure (0x15 = 0x04) runs its entry Secure, '
+          'through the ROM stub', m and int(m.group(1), 16), 0x5A000116)
+
+    # W25N: with BUF clear a read runs on into the next page
+    nand = nand_image(tmp, 'w25n.nand')
+    data = bytearray(open(nand, 'rb').read())
+    tail = 5 * NAND_BLOCK + 2 * NAND_RAW + 2048 - 16
+    data[tail:tail + 16] = b'TAIL-OF-PAGE-TWO'
+    open(nand, 'wb').write(data)
+    qt = QTest(qemu, 'ssc337,flash-file=' + nand + ',flash-nand-id=0xEFAA21',
+               [])
+    try:
+        check('W25N: BUF (feature 0xB0 bit 3) set at power-up',
+              fsp_run(qt, [0x0F, 0xB0], (2, 0, 0), (1, 0, 0))[1][0] & 8, 8)
+        nand_page_read(qt, 5 * 64 + 2)
+        bdma_run(qt, 0, 0x4035, 2048 - 16, 0x100000, 32)
+        check('W25N buffer mode: the page and its spare',
+              bytes(qt.readb(DRAM + 0x100000 + i) for i in range(20)),
+              b'TAIL-OF-PAGE-TWO\xff\xff\xff\xff')
+        fsp_run(qt, [0x1F, 0xB0, 0x00], (3, 0, 0), (0, 0, 0))
+        nand_page_read(qt, 5 * 64 + 2)
+        bdma_run(qt, 0, 0x4035, 2048 - 16, 0x200000, 32)
+        check('W25N continuous read: on into the next page, no spare',
+              bytes(qt.readb(DRAM + 0x200000 + i) for i in range(20)),
+              b'TAIL-OF-PAGE-TWOPAGE')
+    finally:
+        qt.close()
+
+    # infinity6c SoC ECC: a decode job copies a sector and its spare
+    i6c = os.path.join(tmp, 'i6c.bin')
+    open(i6c, 'wb').write(img.ljust(0x1000000, b'\xFF'))
+    qt = QTest(qemu, 'ssc377,flash-file=' + i6c, [])
+    try:
+        nc = lambda n: riu(0x1410, n)
+        for i in range(0, 512, 4):
+            qt.writel(DRAM + 0x100000 + i, 0xC0DE0000 | i)
+        for i in range(0, 16, 4):
+            qt.writel(DRAM + 0x101000 + i, 0x5EA50000 | i)
+        for reg, v in ((0x78, 0x100000 >> 4), (0x7A, 0x101000 >> 4),
+                       (0x64, 0x200000), (0x68, 0x201000)):
+            qt.writew(nc(reg), v & 0xFFFF)
+            qt.writew(nc(reg + 1), v >> 16)
+        qt.writew(nc(0x47), 0)                      # one sector
+        qt.writew(nc(0x7C), 0)                      # of 512 bytes
+        qt.writew(nc(0x7D), 16)
+        qt.writew(nc(0x60), 1)
+        qt.writew(nc(0x44), 0x98)                   # SER_DIN, decode
+        qt.writew(nc(0x45), 1)
+        check('FCIE ECC decode: JOB_END', qt.readw(nc(0x60)) & 1, 1)
+        check('FCIE ECC decode: the sector and its spare where asked',
+              (qt.readl(DRAM + 0x200000 + 0x1FC), qt.readl(DRAM + 0x20100C)),
+              (0xC0DE01FC, 0x5EA5000C))
+    finally:
+        qt.close()
 
 
 def test_ssc029(qemu, tmp):
@@ -3754,6 +3892,7 @@ def main():
     test_ssc029_smp(args.qemu, tmp)
     test_ssc034(args.qemu, tmp)
     test_ssc034_sd_venc(args.qemu, tmp)
+    test_iford_storage(args.qemu, tmp)
     test_infinity2m_rtcpwc(args.qemu, tmp)
     test_i6(args.qemu, tmp)
     test_nand(args.qemu, tmp)

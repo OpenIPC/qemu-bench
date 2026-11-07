@@ -225,6 +225,9 @@ def nand(a, lx_mem, mma):
     sni = bytearray(snigen(read("%s/spinand/partition/flash.sni" % b),
                            bl0, bl1, page=NAND_PG, spare=NAND_SPARE))
     flist = snigen(read("%s/spinand/partition/flash_list.sni" % b), bl0, bl1)
+    if not 0 <= a.part < len(flist) // 1024:
+        raise SystemExit("--part %d: the flash list has %d records"
+                         % (a.part, len(flist) // 1024))
     sni[0x100:0x400] = flist[a.part * 1024 + 0x100:a.part * 1024 + 0x400]
     cis = bytearray(b"\xff" * (2 * NAND_PG))
     cis[0:len(sni)] = sni
@@ -233,7 +236,10 @@ def nand(a, lx_mem, mma):
     cis = bytes(cis) + flist
     for blk in range(10):
         img[blk * NAND_BLK:blk * NAND_BLK + len(cis)] = cis
-    place(img, *where["KERNEL"], read(a.kernel), "KERNEL")
+    kernel = read(a.kernel)
+    # bootcmd falls back to KERNEL_BACKUP: the same kernel
+    place(img, *where["KERNEL"], kernel, "KERNEL")
+    place(img, *where["KERNEL_BACKUP"], kernel, "KERNEL_BACKUP")
     place(img, *where["rootfs"], read(a.rootfs), "rootfs")
 
     mtdparts = "nand0:" + ",".join(

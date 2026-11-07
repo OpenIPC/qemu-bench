@@ -41,7 +41,8 @@
  *
  * Ifliegen ("cmd-ring", mi_venc.ko DRV_VENC_CTX_TriggerTopRiscCmd) has the
  * same boot handshake but no job slots: commands are 0x1B40-byte entries
- * of a 12-entry ring in DRAM (a 0x180-byte header, then the encoder
+ * of a six-entry ring in DRAM, its indexes counting to 12 (a 0x180-byte
+ * header, then the encoder
  * context), ctrl+0x04 the host's write index and ctrl+0x08 the firmware's
  * read index; a synchronous command sets ctrl+0x18 bit 0, which the
  * firmware clears when done, and the host rings the firmware through RIU
@@ -177,6 +178,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarVencState, SSTAR_VENC)
 #define IFL_CMD_ENCODE      8
 #define IFL_MSG_DONE        9           /* the picture */
 #define IFL_STATUS_DONE     2
+#define IFL_STATUS_ERROR    7           /* CheckInstanceStatus: failed */
+#define IFL_OUT_MAX         (16 * MiB)  /* an 8192x8192 picture's room */
 #define IFL_QP              30
 #define IFL_PIC_NS          (5 * 1000 * 1000)   /* a picture's time */
 #define SLOT_STRIDE         0x0C
@@ -1242,7 +1245,8 @@ static size_t ifl_encode(SstarVencState *s, const uint8_t *e, int ctx,
     g_autofree uint8_t *y = NULL, *uv = NULL;
     size_t n = 0;
 
-    if (!w || !h || w > 8192 || h > 8192 || ys < w || cs < w) {
+    /* NV12: whole chroma pairs and rows */
+    if (w < 2 || h < 2 || w > 8192 || h > 8192 || ys < w || cs < w) {
         return 0;
     }
     y = g_malloc0(pw * ph);
@@ -1282,7 +1286,7 @@ static void ifl_run(void *opaque)
 {
     SstarVencState *s = opaque;
     g_autofree uint8_t *e = NULL, *out = NULL;
-    uint32_t ent, rb, base, size, pos, res;
+    uint32_t ent, rb, base, size, cap, pos, res;
     int ctx, task;
     size_t n;
     bool idr;
@@ -1301,30 +1305,45 @@ static void ifl_run(void *opaque)
         base = ifl_ld32(rb);
         size = ifl_ld32(rb + 8);
         idr = s->ifl_restart[ctx] || e[2];
-        out = g_malloc(MAX(size, 1));
-        n = size ? ifl_encode(s, e, ctx, idr, out, size) : 0;
-        n = MIN(n, size);
-        /* the firmware's write offset, +0x40 of the ring's control block */
-        pos = ifl_ld32(rb + IFL_RING_WR);
-        if (pos >= size || pos + n > size) {
-            pos = 0;
-        }
-        ifl_mem(base + pos, out, n, true);
-        ifl_st32(rb + IFL_RING_WR, ROUND_UP(pos + n, 16) % MAX(size, 16));
+        /* the host's buffer is the ring's size; ours, what a picture needs */
+        cap = MIN(size, IFL_OUT_MAX);
+        out = g_malloc(MAX(cap, 1));
+        n = cap ? ifl_encode(s, e, ctx, idr, out, cap) : 0;
         res = s->ifl_ring + (IFL_ENTRIES + 1) * IFL_ENTRY +
               (ctx * IFL_TASKS + task) * IFL_TASK;
-        ifl_st32(res + 0x00, 0);            /* 1-3 drop the picture */
-        ifl_st32(res + 0x08, 1 << 24);      /* +0x0B: a picture came out */
-        ifl_st32(res + 0x10, base + pos);
-        ifl_st32(res + 0x14, 0);
-        ifl_st32(res + 0x18, n * 8);
-        ifl_st32(res + 0x160, IFL_STATUS_DONE);
-        if (s->trace) {
-            qemu_log("sstar-venc: ifliegen ctx %d task %d %s %zu bytes at "
-                     "0x%08x\n", ctx, task, idr ? "IDR" : "P", n, base + pos);
+        /* the firmware's write offset, +0x40 of the ring's control block */
+        pos = ifl_ld32(rb + IFL_RING_WR);
+        if (pos >= size || n > size - pos) {
+            pos = 0;
         }
-        s->ifl_restart[ctx] = false;
-        s->ifl_pics[ctx] = idr ? 1 : s->ifl_pics[ctx] + 1;
+        if (!n || n > cap) {
+            /* nothing, or not all of it: an error, and the stream restarts */
+            ifl_st32(res + 0x00, 0);
+            ifl_st32(res + 0x08, 0);
+            ifl_st32(res + 0x18, 0);
+            ifl_st32(res + 0x160, IFL_STATUS_ERROR);
+            s->ifl_restart[ctx] = true;
+            if (s->trace) {
+                qemu_log("sstar-venc: ifliegen ctx %d task %d: no picture "
+                         "(%zu bytes, room for %u)\n", ctx, task, n, cap);
+            }
+        } else {
+            ifl_mem(base + pos, out, n, true);
+            ifl_st32(rb + IFL_RING_WR, ROUND_UP(pos + n, 16) % size);
+            ifl_st32(res + 0x00, 0);        /* 1-3 drop the picture */
+            ifl_st32(res + 0x08, 1 << 24);  /* +0x0B: a picture came out */
+            ifl_st32(res + 0x10, base + pos);
+            ifl_st32(res + 0x14, 0);
+            ifl_st32(res + 0x18, n * 8);
+            ifl_st32(res + 0x160, IFL_STATUS_DONE);
+            if (s->trace) {
+                qemu_log("sstar-venc: ifliegen ctx %d task %d %s %zu bytes at "
+                         "0x%08x\n", ctx, task, idr ? "IDR" : "P", n,
+                         base + pos);
+            }
+            s->ifl_restart[ctx] = false;
+            s->ifl_pics[ctx] = idr ? 1 : s->ifl_pics[ctx] + 1;
+        }
         s->regs[(CTRL + IFL_MBOX) >> 2] = IFL_MSG_DONE << 16 | ctx << 8 | 1;
         qemu_irq_pulse(s->irq);
     }
