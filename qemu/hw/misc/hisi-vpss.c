@@ -99,6 +99,13 @@ static void vpss_update_irq(HisiVpssState *s)
     qemu_set_irq(s->irq, (s->raw & s->regs[VPSS_INTMASK / 4]) != 0);
 }
 
+/* the online video is enabled and its frame interrupt unmasked */
+static bool vpss_running(HisiVpssState *s)
+{
+    return (s->regs[VPSS_CTRL / 4] & (1u << 31)) &&
+           (s->regs[VPSS_INTMASK / 4] & VPSS_INT_START);
+}
+
 /*
  * The test picture, NV21: vertical bars that move 8 pixels a frame, the
  * frame number as 16 binary squares along the top.  Rows of luma are
@@ -140,6 +147,10 @@ static void vpss_frame(void *opaque)
     HisiVpssState *s = opaque;
     const uint32_t *r = s->active;
     int c;
+
+    if (!vpss_running(s)) {
+        return;             /* the group stopped since VI's frame */
+    }
 
     /*
      * VPSS's frame starts after VI's early interrupt, in whose handler the
@@ -227,10 +238,12 @@ static void hisi_vpss_write(void *opaque, hwaddr offset, uint64_t val,
     }
     if (offset == VPSS_INTMASK || offset == VPSS_CTRL) {
         /* VI runs while the online video is enabled and its frame
-         * interrupt unmasked: from VPSS_OnlineEn to the group's stop */
-        qemu_set_irq(s->running,
-                     (s->regs[VPSS_CTRL / 4] & (1u << 31)) &&
-                     (s->regs[VPSS_INTMASK / 4] & VPSS_INT_START));
+         * interrupt unmasked: from VPSS_OnlineEn to the group's stop.
+         * A frame due after the stop is not written. */
+        qemu_set_irq(s->running, vpss_running(s));
+        if (!vpss_running(s)) {
+            timer_del(s->timer);
+        }
         vpss_update_irq(s);
     }
 }
@@ -266,6 +279,8 @@ static void hisi_vpss_reset(DeviceState *dev)
     s->regup = false;
     s->raw = 0;
     s->frame = 0;
+    qemu_set_irq(s->irq, 0);
+    qemu_set_irq(s->running, 0);
 }
 
 static const Property hisi_vpss_properties[] = {

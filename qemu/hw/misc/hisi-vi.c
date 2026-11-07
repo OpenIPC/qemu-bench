@@ -223,6 +223,8 @@ static void hisi_vi_reset(DeviceState *dev)
     s->run = false;
     memset(s->cap, 0, VI_CAP_SIZE);
     memset(s->proc, 0, VI_PROC_SIZE);
+    qemu_set_irq(s->cap_irq, 0);
+    qemu_set_irq(s->proc_irq, 0);
 }
 
 static const Property hisi_vi_properties[] = {
