@@ -456,7 +456,7 @@ static void ap_send_data(AtbmWpa *w, bool protect, const uint8_t *body,
     memcpy(f + n, body, blen);
     n += blen;
     if (protect) {
-        n += atbm_wpa_trailer(w, false, w->spa, w->aa, body, blen, f + n);
+        n += atbm_wpa_trailer(w, false, w->spa, w->aa, 0, body, blen, f + n);
     }
     w->rx(w->opaque, f, n, flags);
 }
@@ -966,8 +966,8 @@ size_t atbm_wpa_to_sta(AtbmWpa *w, bool group, uint8_t *hdr,
 }
 
 size_t atbm_wpa_trailer(AtbmWpa *w, bool group, const uint8_t *da,
-                        const uint8_t *sa, const uint8_t *body, size_t blen,
-                        uint8_t *out)
+                        const uint8_t *sa, uint8_t prio, const uint8_t *body,
+                        size_t blen, uint8_t *out)
 {
     if (!w->enabled) {
         return 0;
@@ -977,7 +977,7 @@ size_t atbm_wpa_trailer(AtbmWpa *w, bool group, const uint8_t *da,
         return ATBM_WPA_CCMP_MIC;
     }
     /* the authenticator's Tx MIC key: the PTK's or the GTK's */
-    michael_msdu(group ? w->gtk + 16 : w->ptk + 48, da, sa, 0, body, blen,
+    michael_msdu(group ? w->gtk + 16 : w->ptk + 48, da, sa, prio, body, blen,
                  out);
     memset(out + 8, 0, 4);                      /* the ICV, room only */
     return 12;

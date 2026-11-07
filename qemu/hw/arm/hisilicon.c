@@ -2164,6 +2164,11 @@ static const HisiSoCConfig gk7205v200_soc = {
     HISI_V4_DDR_64M,                /* EV200 die: 512Mb DDR2 */
     HISI_V4_COMMON_PERIPH,
     HISI_V4_TIMER_CLOCKS,
+    /* USB 2.0 host (gk7205v200.dtsi): the same DWC3 at 0x10030000, GIC_SPI
+     * 39, dr_mode "host" as gk7201v200 -- see there. */
+    .xhci_base          = 0x10030000,
+    .xhci_irq           = 39,
+    .xhci_dwc3_core     = true,
 };
 
 /*
