@@ -433,6 +433,35 @@ The dongle takes the same security options as the SDIO chip
 driver's power-mode request with the set-PM-mode indication the driver
 waits for.
 
+**A real link.** Left at their defaults, the options below give a clean,
+fast, non-QoS link. Turned on, they bring in what a real access point and a
+real distance add:
+  - `ht=on`: HT capabilities, HT operation and WMM in the beacons, probe
+    responses and association responses; QoS data to the station on per-TID
+    sequence numbers, and an ADDBA request before a TID's first frame, so
+    the station's mac80211 reorders that TID (`addba=off` leaves the
+    sessions out);
+  - `rx-tids=N`: the frames to the station spread over N TIDs;
+  - `rx-drop=N`: every Nth frame to the station lost, a hole in its reorder
+    window;
+  - `tx-rate=KBIT`: the station's transmissions take the air at that rate.
+    A bulk OUT `WSM_TX` is NAKed, untaken, until the air is free, and a
+    timer wakes the endpoint, so the backlog builds in the driver as it
+    does on a camera far from its access point.
+
+The station's QoS data shifts its frame by two bytes for alignment
+(`WSM_TX_2BYTES_SHIFT` in the `wsm_tx` flags), and the model follows it.
+
+The Goke `gk7201v200` and `gk7205v200` machines take the dongle too:
+their DWC3 runs as an xHCI host (`xhci_dwc3_core`), which parks a NAKed bulk
+IN until the endpoint is woken, so the model wakes it whenever it queues a
+message. With it, OpenIPC/firmware#2455 reproduced without hardware. That
+was a GK7205V210 with an ATBM6012B (`pid=0x888b,chip-version=0x4a`),
+`mem=32M`, and an upload whose application never reads its server's small
+replies. The driver's 32 KiB page-frag copies of those replies took the
+camera to OOM within 30 s; with the driver's RX copies from kmalloc
+(OpenIPC/atbm-wifi#1, OpenIPC/atbm_60xx#8) it stayed flat.
+
 `qemu-boot/test-xm-wifi.sh --image openipc-xm530v200-nor.bin [--psk P
 [--wrong-psk]] [--proto wpa] [--cipher tkip] [--pmf optional|required]
 [--rekey N]` boots an OpenIPC XM530V200 build with the atbm-wifi
