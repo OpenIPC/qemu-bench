@@ -24,7 +24,11 @@
  *           0 = off (drivers/sstar/watchdog/mdrv_wdt.c)
  *
  * The watchdog resets the machine when it runs out.  Interrupt outputs:
- * timer 0, timer 1, watchdog, timer 2 (MS_FIQ 0, 1, 2 and 12).
+ * timer 0, timer 1, watchdog, timer 2 (MS_FIQ 0, 1, 2 and 12), each a
+ * pulse at the wrap for those edge-latched lines.  On Ifliegen the timers
+ * are MS_IRQ lines, which latch nothing ("level"): a timer's line is HIT
+ * while its interrupt is enabled, and its driver's ISR clears HIT
+ * (drv_timer_lnx.c, timer_common_isr).
  *
  * Copyright (c) 2026 Daniel Palmer <daniel@thingy.jp>
  * Copyright (c) 2026 OpenIPC.
@@ -86,7 +90,16 @@ struct SstarTimerState {
     SstarRiuState *riu;
     uint32_t freq;
     uint32_t mpll_freq;
+    bool level;
 };
+
+static void piu_update_irq(SstarTimerState *s, SstarPiuTimer *t)
+{
+    if (s->level) {
+        qemu_set_irq(t->irq, (t->regs[T_HIT] & 1) &&
+                             (t->regs[T_CTRL] & CTRL_INT));
+    }
+}
 
 static uint32_t piu_max(SstarPiuTimer *t)
 {
@@ -156,7 +169,11 @@ static void piu_timer_cb(void *opaque)
     SstarTimerState *s = t->s;
 
     t->regs[T_HIT] |= 1;
-    qemu_irq_pulse(t->irq);
+    if (s->level) {
+        piu_update_irq(s, t);
+    } else {
+        qemu_irq_pulse(t->irq);
+    }
     piu_schedule(s, t);
 }
 
@@ -255,10 +272,12 @@ static void sstar_timer_reg_write(SstarTimerState *s, int reg, uint16_t v)
             t->regs[T_CNT_L] = cnt;
             t->regs[T_CNT_H] = cnt >> 16;
         }
+        piu_update_irq(s, t);
         break;
     }
     case T_HIT:
         t->regs[T_HIT] &= ~v;
+        piu_update_irq(s, t);
         break;
     case T_CNT_L:
     case T_CNT_H:
@@ -357,6 +376,7 @@ static void sstar_timer_init(Object *obj)
 static const Property sstar_timer_props[] = {
     DEFINE_PROP_UINT32("freq", SstarTimerState, freq, 12000000),
     DEFINE_PROP_UINT32("mpll-freq", SstarTimerState, mpll_freq, 432000000),
+    DEFINE_PROP_BOOL("level", SstarTimerState, level, false),
     /* Where the clkgen timer source select lives. */
     DEFINE_PROP_LINK("riu", SstarTimerState, riu, TYPE_SSTAR_RIU,
                      SstarRiuState *),

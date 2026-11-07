@@ -30,6 +30,7 @@ typedef enum SsDie {
     SS_DIE_INFINITY6B0,
     SS_DIE_INFINITY6E,
     SS_DIE_INFINITY6C,
+    SS_DIE_IFLIEGEN,
 } SsDie;
 
 typedef struct SsSoCConfig {
@@ -39,6 +40,8 @@ typedef struct SsSoCConfig {
     uint64_t    ram_size_default;
     /* the evidence there is, for a part with no part-level size */
     const char *ram_unknown;
+    /* why a part has no bond default: the machine warns until bond= */
+    const char *bond_unknown;
     uint16_t    chip_id;        /* chipver bank 0x001E reg 0x00 */
     uint16_t    bond;           /* chiptop bank 0x101E reg 0x48 */
     uint32_t    flash_jedec;    /* the board's SPI NOR */

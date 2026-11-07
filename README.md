@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 23 SigmaStar (Cortex-A7, or `max` for the A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (125 total)
+## Supported Machines (131 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -244,10 +244,12 @@ was at hand.
 | `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
 | `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
 | `msc316dc`, `msc316dm` | Cortex-A7, 128 MB in package | GIC + main-intc | — | U-Boot, the IPL's own DDR set-up |
-| `ssc029` | Cortex-A32 ×2 (run as A7), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
-| `ssc325`, `ssc325de`, `ssc333`, `ssc335`, `ssc335de`, `ssc337`, `ssc337de`, `ssc30kd`, `ssc30kq`, `ssc338q`, `ssc377`, `ssc377d`, `ssc377de`, `ssc377qe`, `ssc378de`, `ssc378qe` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
+| `ssc029` | Cortex-A32 ×2 (run as `max`), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
+| `ssc029a`, `ssc029b` | Cortex-A32 ×2 (run as `max`), 512 / 256 MB | GICv3 | 5.10.117 vendor | `ssc029a`: SDK SPI NAND through OP-TEE to a shell; `ssc029b`: U-Boot with `bond=` |
+| `ssc034a`, `ssc034b` | Cortex-A7 ×2, 128 / 64 MB | GIC-400 + main-intc | 4.9.84 vendor (SDK build) | SDK IPL → TF-A → U-Boot → kernel → shell from NOR and SPI NAND, 2 CPUs, Ethernet, SD, SDK `venc_demo` to H.264/H.265 |
+| `ssc325`, `ssc325de`, `ssc327de`, `ssc333`, `ssc335`, `ssc335de`, `ssc337`, `ssc337de`, `ssc30kd`, `ssc30kq`, `ssc338q`, `ssc377`, `ssc377d`, `ssc377de`, `ssc377qe`, `ssc378de`, `ssc378qe` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
 
-SigmaStar's (formerly MStar's) infinity2m, infinity3, Iford and infinity6 family dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m, infinity3, Iford, Ifliegen and infinity6 family dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
@@ -653,7 +655,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 125 machines build and register. Every machine marked "yes" above boots
+All 131 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -817,7 +819,7 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
-├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford/infinity6 machines, synthetic mask ROM
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford/Ifliegen/infinity6 machines, synthetic mask ROM
 ├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
 ├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
 ├── hw/timer/sstar-timer.c       # PIU timers + watchdog

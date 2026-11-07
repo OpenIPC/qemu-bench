@@ -166,6 +166,7 @@ static void sstar_fsp_erase(SstarFspState *s, uint32_t addr, uint32_t len)
 
 #define NAND_PROT_BP        0x38
 #define NAND_CONF_ECC_EN    (1u << 4)
+#define NAND_CONF_BUF       (1u << 3)
 #define NAND_STAT_WEL       (1u << 1)
 #define NAND_STAT_E_FAIL    (1u << 2)
 #define NAND_STAT_P_FAIL    (1u << 3)
@@ -197,6 +198,7 @@ static void nand_page_read(SstarFspState *s)
 {
     uint32_t page = s->addr;
 
+    s->nand_page = page;
     s->feat_stat &= ~NAND_STAT_ECC_MASK;
     if (page >= nand_pages(s)) {
         qemu_log_mask(LOG_GUEST_ERROR, "sstar-fsp: NAND page 0x%x past the "
@@ -212,6 +214,36 @@ static void nand_page_read(SstarFspState *s)
             s->feat_stat |= 1u << NAND_STAT_ECC_SHIFT;
         }
     }
+}
+
+/*
+ * Winbond's W25N parts (maker 0xEF) have a BUF bit in feature 0xB0, set at
+ * power-up: with it clear a read from the cache runs on through the next
+ * pages, their data only, and leaves the page register past the last one
+ * (W25N01GV/W25N01JW datasheets, "Continuous Read Mode").  Iford's IPL
+ * clears it to load a whole stage with one BDMA, the W25N01JW profile of
+ * the SDK's flash_list-fb.sni telling it to.
+ */
+static bool nand_continuous(SstarFspState *s)
+{
+    return (s->nand_id >> (8 * ((32 - clz32(s->nand_id | 1) + 7) / 8 - 1)))
+           == 0xEF && !(s->feat_conf & NAND_CONF_BUF);
+}
+
+static uint8_t nand_cache_next(SstarFspState *s)
+{
+    uint8_t b;
+
+    if (!nand_continuous(s)) {
+        return s->cache[nand_col(s, s->col++) % nand_page_raw(s)];
+    }
+    if (s->col >= s->page_size) {
+        s->addr = s->nand_page + 1;
+        nand_page_read(s);
+        s->col = 0;
+    }
+    b = s->cache[s->col++];
+    return b;
 }
 
 /* The write latch is spent either way; a refused operation reports a fail. */
@@ -346,7 +378,7 @@ static uint8_t nand_xfer(SstarFspState *s, uint32_t pos, uint8_t tx)
         if (pos <= 2) {
             s->col = (s->col << 8) | tx;
         } else if (pos > 3) {
-            rx = s->cache[nand_col(s, s->col++) % raw];
+            rx = nand_cache_next(s);
         }
         break;
     case 0x02: case 0x32:                   /* PROGRAM LOAD: register to FF */
@@ -543,6 +575,16 @@ static uint8_t spi_xfer(SstarFspState *s, uint8_t tx)
 void sstar_fsp_read_flash(SstarFspState *s, uint32_t off, uint8_t *buf,
                           uint32_t len)
 {
+    if (s->nand && nand_continuous(s)) {
+        /* BDMA asks in chunks, its offset running on: the stream does */
+        if (off < s->page_size) {
+            s->col = off;
+        }
+        while (len--) {
+            *buf++ = nand_cache_next(s);
+        }
+        return;
+    }
     if (s->nand) {
         while (len--) {
             *buf++ = s->cache[nand_col(s, off++) % nand_page_raw(s)];
@@ -905,6 +947,9 @@ static void sstar_fsp_reset(DeviceState *dev)
     s->ear = 0;
     s->feat_prot = NAND_PROT_BP;
     s->feat_conf = NAND_CONF_ECC_EN;
+    if (nand_continuous(s)) {
+        s->feat_conf |= NAND_CONF_BUF;      /* W25N: buffer mode at power-up */
+    }
     s->feat_stat = 0;
     s->col = 0;
     s->fire_wait = false;

@@ -1,4 +1,4 @@
-# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd20x`, `ssc375`, `msc313e`, `ssc029`, infinity6 dies)
+# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd20x`, `ssc375`, `msc313e`, `ssc029`, `ssc034`, infinity6 dies)
 
 SigmaStar's (formerly MStar's) Cortex-A7 SoCs share one memory map whatever
 the family: DRAM (the MIU0 window) at `0x20000000`, the SPI NOR read window at
@@ -28,10 +28,15 @@ from there too.
 | `ssc375` | Ifado | 1× Cortex-A7 | 128 MiB | `0x15` | `0xF0`¹ | IPL → U-Boot → DHBoot → kernel → rootfs |
 | `msc313e` | infinity3 | 1× Cortex-A7 | 64 MiB | — | `0xC2` | IPL → U-Boot → kernel → shell |
 | `msc316dc`, `msc316dm` | infinity3 | 1× Cortex-A7 | 128 MiB | — | `0xC2` | IPL → OpenIPC U-Boot: flash, environment, network, SD |
-| `ssc029` | Iford | 2× Cortex-A32 (A7s here)² | 128 MiB | `0`³ | `0xF0`³ | IPL → U-Boot → kernel → shell, SDK `preview` to RTSP H.264, Ethernet, SD, USB; no AE |
+| `ssc029` | Iford | 2× Cortex-A32 (`max` here)² | 128 MiB | `0`³ | `0xF0`³ | IPL → U-Boot → kernel → shell, SDK `preview` to RTSP H.264, Ethernet, SD, USB; no AE |
+| `ssc029a` | Iford | 2× Cortex-A32 (`max` here)² | 512 MiB | `0`³ | `0xF0`³ | SDK SPI NAND: IPL → OP-TEE → U-Boot → kernel → shell |
+| `ssc029b` | Iford | 2× Cortex-A32 (`max` here)² | 256 MiB | none: `bond=` needed³ | `0xF0`³ | IPL → U-Boot with `bond=0x10` |
+| `ssc034a` | Ifliegen | 2× Cortex-A7 | 128 MiB | `0x09`⁵ | `0xF0`⁵ | SDK IPL → TF-A → U-Boot → SDK kernel → shell from NOR and SPI NAND, 2 CPUs, Ethernet, SD, SDK `venc_demo` H.264/H.265 |
+| `ssc034b` | Ifliegen | 2× Cortex-A7 | 64 MiB | `0x00`⁵ | `0xF0`⁵ | the same, from its QFN88 IPL |
 
 | `ssc325` | infinity6 | 1× Cortex-A7 | 128 MiB⁴ | — | `0xEF` | IPL → vendor U-Boot → OpenIPC login, NOR and SPI NAND |
 | `ssc325de` | infinity6 | 1× Cortex-A7 | 256 MiB⁴ | — | `0xEF` | IPL → vendor U-Boot → OpenIPC login from SPI NAND |
+| `ssc327de` | infinity6 | 1× Cortex-A7 | 128 MiB | — | `0xEF` | a Raysharp camera's SPI NAND dump to login |
 | `ssc333`, `ssc335`, `ssc337` | infinity6b0 | 1× Cortex-A7 | 64 MiB | — | `0xF2` | IPL → vendor U-Boot; `ssc337` to OpenIPC login |
 | `ssc335de`, `ssc337de` | infinity6b0 | 1× Cortex-A7 | 128 MiB | — | `0xF2` | IPL → vendor U-Boot |
 | `ssc30kd`, `ssc30kq` | infinity6e | 2× Cortex-A7 | 128 MiB⁴ | `0x10` | `0xF1` | IPL → vendor U-Boot |
@@ -46,7 +51,9 @@ The machine warns unless `-m` chooses.
 at it. The SoC is named by the firmware itself (`CHIP=SSC375` in the Dahua
 rootfs; kernel compatible `sstar,ifado`).
 
-² QEMU has no Cortex-A32. CPU1 wakes through smpctrl (bank `0x1020`): the
+² QEMU has no Cortex-A32: the cores are QEMU's ARMv8 `max` in AArch32,
+with an A32 MIDR (`0x410FD011`), as the SDK's OP-TEE uses `LDAEX`/`STLEX`,
+which an A7 lacks. CPU1 wakes through smpctrl (bank `0x1020`): the
 kernel writes its entry to regs `0x13`/`0x14` and sets bit 2 (wake) and bit 3
 (Non-secure) of reg `0x15`. Nothing on the flash reads those, so what parks the
 core on silicon is unseen; QEMU starts it in place of that firmware and makes
@@ -55,6 +62,12 @@ its redistributor's lines Non-secure, as the IPL does for CPU0.
 ³ Not from the SDK. The bond is the IPL's DRAM profile, 0-5. The kernel shows
 the chip ID as `soc_id` (bank `0x1E00` reg 0) but `mdrv_device_id.h` has no
 Iford entry, so `0xF0` remains a placeholder.
+
+⁵ The bond is the IPL's DRAM profile, which it prints: the QFN88 IPL takes
+0, 1, 4 and 5, the QFN128 one 9, 10, 13 and 14, and bit 2 changes neither.
+Each default is the one profile that matches the part's DRAM size in the SDK
+(`ssc034a.128.qfn128`, `ssc034b.64.qfn88`). Nothing in the boot chain reads the
+chip ID, so `0xF0` is a placeholder.
 
 The SSR621Q is the infinity2m die in Xiongmai's 4/8/16-channel NVRs, with
 SATA, HDMI and the video decoder bonded out. Its IPL reads the bond strap to
@@ -187,6 +200,107 @@ every page. `sstar-fcie` gained ADMA and `BUSY_END`, which Iford's driver uses
 and infinity3's does not; SD reads and writes `mmcblk0`. USB is one EHCI at bank
 `0x1424`, SPI 63; the image has no `usb-storage.ko`, `scsi_mod.ko` or `sd_mod.ko`,
 so a USB disk cannot work, while a `usb-kbd` enumerates and binds `usbhid`.
+
+## Ifliegen (`ssc034a`, `ssc034b`)
+
+Ifliegen is Iford's register map on two Cortex-A7s and a GIC-400, with its
+interrupt lines renumbered (vendor Ifliegen SDK ILSSV01C12: U-Boot 2021.10,
+Linux 4.9.84, TF-A SP_MIN 2.5 as the secure monitor). The SDK ships no images
+for it, so the image is built from its sources and board files:
+
+```
+# U-Boot: ifliegen_ssc034a_s01a_defconfig -> u-boot.xz.img.bin
+# kernel: ifliegen_ssc034a_s01a_defconfig, uImage.xz (it must fit 0x310000)
+qemu-boot/sstar-ifliegen-image.py project/board/ifliegen/boot \
+    u-boot.xz.img.bin uImage.xz rootfs.sqfs ifliegen.bin
+qemu-system-arm -M ssc034a,flash-file=ifliegen.bin -serial mon:stdio -nic user
+
+# SPI NAND: ..._spinand_defconfig for both -> u-boot_spinand.xz.img.bin and
+# uImage.xz; the squashfs in a UBI image as a static volume "rootfs"
+ubinize -o rootfs.ubi -p 0x20000 -m 2048 -s 2048 -O 2048 ubi.cfg
+qemu-boot/sstar-ifliegen-image.py project/board/ifliegen/boot \
+    u-boot_spinand.xz.img.bin uImage.xz rootfs.ubi ifliegen.nand --nand
+qemu-system-arm -M ssc034a,flash-file=ifliegen.nand -serial mon:stdio
+```
+
+`--package qfn88` and `-M ssc034b` give the 64 MiB part. Both boot the SDK's
+IPL (DDR init and BIST), TF-A, IPL_CUST and U-Boot, then the kernel to a shell
+with both CPUs, I2C, the RTC and Ethernet: from NOR with a squashfs root, from
+SPI NAND (KERNEL, then the root through `ubiblock1_0`, UBI on `ubia` too).
+
+**SPI NAND.** The NAND IPL has no package variants. Its CIS is what the SDK's
+`snigenerator` (whose C source the SDK carries; the script does the same, and
+matches it byte for byte) leaves: BL0PBA 10 and BL1PBA 25 in the SNIB and every
+SNIF, their CRCs. The SNIF must be a listed part's, as U-Boot's probe writes on
+a board: the IPL takes its status-poll timeout from the record, and the generic
+one and some parts (GD5F1GQ4U, record 17) leave it zero, so the first poll
+times out (`load header fail`). Record 57, a W25N01GV, is the default.
+
+**SD.** The FCIE at bank `0x1413` (`-drive if=sd`) and the SDIO slot's at
+`0x1416` (`if=sd,index=1`, INT_IRQ_SDIO, SPI 86). Card detect: `PAD_PM_SD_CDZ`
+at bank `0x103E` reg `0x16` bit 0 and `PAD_SD1_IO6` at reg `0x06` bit 0
+(`hal_gpio_common.c`), low with a card in. The driver (`kdrv_sdmmc.ko`, a
+module in the SDK config) writes with `EN_AUTO_TRIG`: `SD_CTL` bit 12
+(`R_CMD_END_AUTO_TRIG_EN`) sends a write's data after its command in the same
+job, which `sstar-fcie` now does. Reads and writes go through to the image.
+
+**Encoder.** Not Wave5: the DTS `venc` "vpu-bit" `0x1F34D000` lies in Iford's
+RISC firmware window at `0x1F34C800` (mi_venc.ko `DRV_VENC_TOP_RiscHostFwInit`),
+`sstar-venc` here, on INT_FIQ_HST_2 (SPI 174), with a 32-bit wrapper page at
+`0x1F34E000` as storage (+0x404 [28:27] = 2, buffers in MIU, which
+`DRV_VENC_DEV_ImiShareCheck` requires). Its firmware ABI is not Iford's, and
+`sstar-venc` (`cmd-ring`) stands in for the firmware:
+
+- **Commands.** The first word written to ctrl+0x04 is the ring's MIU
+  address; later writes there are the host's index into its six 0x1B40-byte
+  entries, and ctrl+0x08 is the firmware's index. ctrl+0x18 bit 0 is a
+  synchronous command, which it clears; ctrl+0x14 reads 2, running.
+- **An entry.** Header +0x00 the stream, +0x01 its task, +0x10 the command
+  (8 encode), +0x4C/+0x58 luma stride and MIU address, +0x64/+0x70 chroma's,
+  +0xD0 the bitstream ring's control block (+0x00 base, +0x08 size, +0x40
+  the firmware's write offset). Context +0x19C the codec (1 H.264, 2
+  H.265), +0xFC4/+0xFC6 width and height.
+- **Results.** Blocks of 0x180 after the ring (ring + 7 × 0x1B40), two per
+  stream: +0x00 0 (1-3 make MI drop the picture), +0x0B nonzero, +0x10 the
+  stream's MIU address, +0x18 its size in bits, +0x160 status 2. Then
+  message 9 in ctrl+0x10 [23:16] on the interrupt. Messages 1 and 3 (from
+  5) are "output buffer full" and are not sent.
+- **Pictures.** Coded by the model's own encoders (H.265 `hevc-enc`, H.264
+  a baseline SPS/PPS and `hantro-h264` I slices), not the firmware's.
+
+The SDK's own `venc_demo` sample (built from `sdk/verify/sample_code` with
+GCC 10.3 and the toolchain's glibc, run with the prebuilt glibc-9.1.0
+`mi_common`, `mi_sys`, `mi_rgn`, `mi_venc` and their libraries) writes
+`venc_demo_case_h265.es` and `venc_demo_case_h264.es` from its 1920×1080
+NV12 frame, both decoding to that picture. It needed the BDMA fix below:
+`msys_dma_copy` uses BDMA channel 2, whose done interrupt was never wired,
+and the input buffer copy waited forever.
+
+**BDMA.** All four channels of the first group share INT_IRQ_BDMA (SPI 72)
+here (DTS); the second group (`0x1F201600`, INT_IRQ_BDMA2) is not modelled.
+
+The kernel builds with
+GCC 10.3. The vendor tree needs `scripts/sgs_coding_style_sanitize.py`,
+which is missing from U-Boot and needs `/usr/bin/python` in Linux; an empty
+script that exits 0 works in both.
+
+What differs from Iford:
+
+| | Ifliegen | Iford |
+|---|---|---|
+| Cores, interrupt controller | Cortex-A7, GIC-400 (distributor `0x16001000`, CPU interface `0x16002000`), 224 interrupts | Cortex-A32, GICv3 |
+| Interrupts | the same `sstar-intc` groups (128 `MS_IRQ` from SPI 32, `MS_FIQ` from 160); UART1 60, URDMA 69/53/92, MIIC0 98, timers `MS_IRQ` 101-103 and level, watchdog 162 | UART1 69, URDMA 67/92/80, timers `MS_FIQ` |
+| Console | IPL and kernel print through the URDMA's TX FIFO (reg `0x17` data, `0x1C` status, `0x1D` enable) | the UART |
+| Secure monitor | TF-A at the top of DRAM. PSCI `CPU_ON` writes smpctrl `0x13`/`0x14` and `0x15 = 0x0C`; CPU1 starts Secure at TF-A's warm entry | OP-TEE, or none |
+| I2C | `0x1F222800`, `0x1F222A00`, `0x1F222C00` | `0x1F222800`, `0x1F222A00`, `0x1F007C00` |
+| SD | FCIE banks `0x1413` and `0x1416`, write data by auto-trigger | `0x0042` |
+| Encoder | `sstar-venc`, a command-ring firmware ABI | `sstar-venc`, job slots |
+| Crypto | the AES and RSA reset-done bits (`0x7F` bit 4, `0x29` bit 3), which its driver waits for at probe | |
+
+Not done: the rest of the media path (VIF, ISP, scaler): no sensor runs
+on this machine, so the encoder is fed from memory only. U-Boot's `DRAM: 48 MiB` is its
+build's `CONFIG_UBOOT_RAM_SIZE`; mstar-88 found SP_MIN stays resident at
+`0x23FE0000`, so a U-Boot relocating above it overwrites it.
 
 ## infinity6 dies
 
@@ -416,6 +530,10 @@ print a warning naming the evidence unless `-m` sets the size.
 | `msc316dc` | | 128 MiB | sourced | SDK `image_QFN128M-MSC316DC` | QFN, not read |
 | `msc316dm` | | 128 MiB | partly | OpenIPC U-Boot only; the SDK has no MSC316DM image | **unknown** |
 | `ssc029` | | 128 MiB | partly | the model's MIU size register; not rechecked against the SDK | bond `0` picks a DRAM profile |
+| `ssc029a` | | 512 MiB | sourced | SDK `ssc029a.512.bga12_ddr4`; its IPL sizes it to 512 MiB | BGA, any bond |
+| `ssc029b` | | 256 MiB | sourced | SDK `ssc029b.256.bga11_ddr3` | BGA; the IPL takes `0x10`-`0x1D`, `0x34`-`0x35`, `0x50`-`0x5D`: **unknown** which |
+| `ssc034a` | | 128 MiB | sourced | SDK `ssc034a.128.qfn128`; the IPL prints `QFN128 DDR3 4x 1G` | QFN128, bond `0x09` (inferred, see ⁵) |
+| `ssc034b` | | 64 MiB | sourced | SDK `ssc034b.64.qfn88`; the IPL prints `QFN88 DDR2 4x 512M` | QFN88, bond `0x00` (inferred, see ⁵) |
 | `ssc325` | SSC009A | 128 MiB | **unknown** | vendor DTS `0x07E00000`, nothing else | **unknown**, not read |
 | `ssc325de` | SSC009B | 256 MiB | **unknown** | vendor DTS `0x0FE00000`, nothing else | **unknown**, not read |
 | `ssc333`, `ssc335`, `ssc337` | 6b0 SSC009A | 64 MiB | sourced | vendor DTS `0x04000000` | **unknown**, not read |
@@ -469,8 +587,9 @@ reboot; `ecc error` on an uncorrectable page; `MTD Erase failure` on a failing
 block.
 
 Geometry comes from the SNI, so a 4 KiB page part works, at register level only.
-infinity6c gets the strap (DID key reg `0x70` BIT4, from its U-Boot and kernel)
-but no published NAND image exists for it, so that path has never run.
+infinity6c gets the strap (DID key reg `0x70` BIT4, from its U-Boot and kernel).
+No published NAND image exists for it; the Maruko SDK's own SPI NAND chain runs
+to U-Boot, and a firmware written by a NAND U-Boot to `openipc-ssc377 login:`.
 
 ## Boot
 

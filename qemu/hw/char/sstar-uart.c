@@ -24,6 +24,12 @@
  * bits moved on the Ifado generation ("urdma-tx-v2"): enable/clear/status
  * are bits 9/8/15 on infinity2m and 10/11/14 on Ifado.
  *
+ * Ifliegen's URDMA adds a TX FIFO beside the rings ("urdma-txfifo", vendor
+ * hal_uart.c CONFIG_SGS_URDMA_TXFIFO): a byte written to 0x17 goes out,
+ * 0x1C is its status (bit 0 FIFO0 empty, 1 full, 2 half; 4-6 FIFO1's) and
+ * 0x1D bit 0 enables it.  Its IPL prints through it.  The bytes go out at
+ * once, so the FIFOs always read empty.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -63,6 +69,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarUartState, SSTAR_UART)
 #define UR_RX_SIZE          0x0A
 #define UR_RX_WPTR          0x0B
 #define UR_INTR             0x0D
+#define UR_TXFIFO_DATA      0x17
+#define UR_TXFIFO_STS       0x1C
+#define UR_TXFIFO_EMPTY     0x0011      /* FIFO0 and FIFO1 empty */
 
 #define UR_CTRL_RST         (1u << 0)
 #define UR_CTRL_MODE        (1u << 1)
@@ -88,6 +97,7 @@ struct SstarUartState {
     /* URDMA */
     bool has_urdma;
     bool urdma_tx_v2;
+    bool urdma_txfifo;
     MemoryRegion urdma;
     qemu_irq urdma_irq;
     uint16_t ur[UR_SIZE / 4];
@@ -257,7 +267,8 @@ static uint64_t sstar_urdma_read(void *opaque, hwaddr off, unsigned size)
     if ((off & 3) >= 2) {
         return 0;
     }
-    v = s->ur[off >> 2];
+    v = s->urdma_txfifo && (off >> 2) == UR_TXFIFO_STS ? UR_TXFIFO_EMPTY
+                                                      : s->ur[off >> 2];
     if (off & 1) {
         return v >> 8;
     }
@@ -296,6 +307,17 @@ static void sstar_urdma_write(void *opaque, hwaddr off, uint64_t val,
         ur_tx(s);
         break;
     case UR_RX_WPTR:
+        break;
+    case UR_TXFIFO_DATA:
+        if (s->urdma_txfifo) {
+            uint8_t ch = val;
+
+            if (!(off & 1)) {
+                qemu_chr_fe_write_all(&s->serial.serial.chr, &ch, 1);
+            }
+            break;
+        }
+        s->ur[reg] = v;
         break;
     case UR_INTR: {
         uint16_t stat = UR_INTR_RX1 | (1u << 5) | UR_INTR_RX_MCU |
@@ -402,6 +424,7 @@ static void sstar_uart_realize(DeviceState *dev, Error **errp)
 static const Property sstar_uart_props[] = {
     DEFINE_PROP_BOOL("urdma", SstarUartState, has_urdma, false),
     DEFINE_PROP_BOOL("urdma-tx-v2", SstarUartState, urdma_tx_v2, false),
+    DEFINE_PROP_BOOL("urdma-txfifo", SstarUartState, urdma_txfifo, false),
 };
 
 static const VMStateDescription vmstate_sstar_uart = {

@@ -8,7 +8,8 @@ is what the sstar-fsp NAND chip stores: the U-Boot image (CIS, IPL, IPL_CUST
 and U-Boot) from offset 0 and the UBI image at the start of the ubi partition,
 "1024k(boot0),1024k(boot1),256k(env),-(ubi)" in the images' U-Boot.  Blocks
 listed with --bad get a factory bad-block mark, spare byte 0 of their first
-page, cleared.
+page, cleared.  With --dump the first image is a whole chip read back without
+its spares, which keeps its own layout.
 """
 import argparse
 
@@ -25,14 +26,20 @@ def main():
     ap.add_argument("--spare", type=int, default=64)
     ap.add_argument("--block-pages", type=int, default=64)
     ap.add_argument("--bad", type=int, action="append", default=[])
+    ap.add_argument("--dump", action="store_true")
     args = ap.parse_args()
 
     PAGE, SPARE = args.page, args.spare
     BLOCK = PAGE * args.block_pages
     data = bytearray(b"\xff" * (args.blocks * BLOCK))
     boot = open(args.boot, "rb").read()
-    if len(boot) > UBI_OFFSET:
+    if args.dump:
+        if len(boot) != len(data):
+            ap.error("a dump is the whole chip, %d bytes" % len(data))
+    elif args.ubi and len(boot) > UBI_OFFSET:
         ap.error("the boot image runs into the ubi partition")
+    if len(boot) > len(data):
+        ap.error("the boot image does not fit")
     data[: len(boot)] = boot
     if args.ubi:
         ubi = open(args.ubi, "rb").read()
