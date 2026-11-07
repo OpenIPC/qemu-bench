@@ -12,8 +12,16 @@ Hi3516EV200, Hi3516EV300, Hi3518EV300, Hi3516DV200 and their Goke rebrands
 The vendor VENC stack runs on it unmodified. That covers the OpenIPC
 release's `open_*.ko` / `gk7205v200_*.ko` modules and `libmpi.so` /
 `libgk_api.so`. Pictures sent with `VENC_SendFrame` come back from
-`VENC_GetStream` as streams ffmpeg decodes. VI and VPSS are not modelled
-yet, so the frames come from a VB pool, not a sensor.
+`VENC_GetStream` as streams ffmpeg decodes.
+
+On the HiSilicon EV200-class machines (hi3516ev200, hi3516ev300,
+hi3518ev300, hi3516dv200), `hisi-vi` and `hisi-vpss` add the camera
+pipeline in front of it (see [VI and VPSS](#vi-and-vpss) below). With an
+SC2315E on the sensor bus (`sensor=sc2315e`), two unmodified programs run
+from sensor to stream:
+
+- the SDK's own `sample_venc` (mode 1: 1080p H.265 and 640x480 H.264);
+- the OpenIPC release's majestic.
 
 The contract below was taken from the SDK's driver objects
 (`Hi3516EV200_SDK_V1.0.1.2/mpp/obj/hi_vedu.o`, `hi_h264e.o`, `hi_h265e.o`;
@@ -127,6 +135,85 @@ The driver's header packet carries Annex K Huffman tables. The model
 appends the entropy-coded scan, ending with EOI, as one `JPEGE_PACK_ECS`
 (type 5) packet with the header packet's channel and PTS.
 
+## VI and VPSS
+
+The models cover the online pipeline: VI-online into VPSS-online, which is
+what the drivers choose for a sensor up to 2304 pixels wide.
+
+- **The sensor's frames never exist.** VI (`hisi-vi`) is the frame clock.
+  VPSS (`hisi-vpss`) paints a test picture into each channel's buffers:
+  moving bars, and the frame number as 16 binary squares across the top
+  twelfth.
+- **The contract** comes from `hi_vi.o` and `hi_vpss.o`, in particular
+  `VI_COMM_CapOnLineFrameEarlyEndIrqRoute`, `VI_COMM_ProcIrqRoute`,
+  `VPSS_COMM_OnLineIrqProc` and the `VPSS_HAL_*` setters.
+
+**VI_CAP (`0x11000000`, SPI 43)**
+
+| Offset | |
+|---|---|
+| `0xf0` | status. Bit 8 (pipe 0) stands while the pipe's write channel has anything pending; the driver clears only the write channel. |
+| `0xf8` | mask. The driver sets all of it when the module loads, so it says nothing about the pipe running. |
+| `0x10000 + pipe × 0x1000 + 0xf0` | the pipe's write-channel status, write 1s to clear. Bit 0: frame start. Bit 15: "early", where VPSS's early handler programs this frame's buffers. Bit 1: frame end, where VI sends the frame on. |
+
+**VI_PROC (`0x11200000`, SPI 44)**
+
+| Offset | |
+|---|---|
+| `0x310` | status, write 1s to clear: bit 10 frame start, bit 1 frame end. `VI_COMM_ProcIrqRoute` panics on a zero status. |
+| `0x318` | cleared together with `0x310`. |
+
+The rest of both windows, the ISP's registers at `0x11220000` included,
+is storage.
+
+**VPSS (`0x11400000`, SPI 46)**
+
+| Offset | |
+|---|---|
+| `0x000` | bit 31: online video enable. |
+| `0x010` | REGUP. |
+| `0x0f0` | interrupt mask, `0x7401`. |
+| `0x310` | raw status, write 1s to clear: bit 10 frame start, bit 0 end of frame; `0xadc` clears the errors. |
+| `0x314` | masked status. |
+| channel size | `0x44c` / `0x4a0` / `0x4e8` |
+| channel control | `0x450` / `0x4a4` / `0x4ec`; bit 31 enable, toggled per frame by frame-rate control. |
+| channel addresses | `0x468` / `0x4b0` / `0x4f4`: header Y, header C, Y, C, 8 bytes apart. |
+| channel stride | `0x488` / `0x4d0` / `0x514` |
+| `0x700` | bit 0: channel 0 compression. |
+
+**Each frame**
+
+1. VI raises the write channel's start, early and end bits and the
+   pipe's start and end. The driver's handlers program VPSS for this
+   frame and write REGUP.
+2. An eighth of a frame later, VPSS takes the configuration (if REGUP was
+   written since the last frame), paints every enabled channel and raises
+   frame start and end. The driver then sends the buffers to VENC.
+
+**When frames run.** VI runs while VPSS's online video is enabled and its
+frame interrupt unmasked, from the group's start to its stop. An interrupt
+for a pipe that does not exist yet, or any more, dereferences a NULL
+context in the driver.
+
+**Compressed channels.** Channel 0 is compressed (`COMPRESS_MODE_SEG`) in
+both programs. Its buffers are smaller than a linear picture, and the
+real format is not modelled. Instead the two models share a stand-in:
+VPSS stores every other row at the channel's Y and C addresses, with the
+width as the stride. VEDU sees compression headers in its register image
+(`0x1ec`) and doubles the rows back.
+
+**icount.** Run with `-icount shift=0`. Guest time then follows the
+guest's instructions, so its interrupt handlers always finish within a
+frame. Without it, on a slow host frames can overtake the driver, and an
+encoded picture may repeat or reorder (the streams still decode).
+
+Running it:
+
+```bash
+bash qemu-boot/test-hisi-majestic.sh --soc hi3516ev200        # the release's majestic (CI)
+bash qemu-boot/test-hisi-sample-venc.sh --sdk <Hi3516EV200_SDK_V1.0.1.2>   # the SDK's sample_venc
+```
+
 ## Running it
 
 ```bash
@@ -156,9 +243,13 @@ The release's MPI libraries are uClibc builds. Under musl they need:
 
 ## Not yet
 
-- **VI, ISP and VPSS:** the stock `sample_venc` captures from a sensor and
-  would need these to run. `hisi-vi-fp`'s pulses (EV300) are not enough:
-  the VPSS handler needs channel state that only real frames create.
+- **VI offline:** a sensor wider than 2304 (EV300's 5 MP IMX335) makes the
+  drivers write VI's frames to DDR for VPSS to read, which is not
+  modelled. ISP statistics are not produced either: the 3A algorithms run,
+  but on nothing.
+- **Goke rebrands:** their own `gk7205v200_*.ko` start the pipeline under
+  `hisi-vi` / `hisi-vpss` but deliver no frame yet, so those machines keep
+  register stubs for VI and VPSS.
 - **Multi-slice pictures and B frames:** the model codes one slice per
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own

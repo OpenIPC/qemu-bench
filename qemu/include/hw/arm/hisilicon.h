@@ -262,6 +262,12 @@ typedef struct HisiSoCConfig {
     hwaddr          jpge_base;
     int             vedu_irq;
     int             jpge_irq;
+    hwaddr          vpss_base;         /* 0 = none; online-mode frame source */
+    int             vpss_irq;
+    hwaddr          vi_cap_base;       /* 0 = none; VI as the frame clock */
+    hwaddr          vi_proc_base;
+    int             vi_cap_irq;
+    int             vi_proc_irq;
 
     /* Watchdog (SP805 / cmsdk-apb-watchdog) */
     hwaddr          wdt_base;       /* 0 = no watchdog */
@@ -346,10 +352,6 @@ typedef struct HisiSoCConfig {
     /* VI frame producer — periodic VI/VPSS IRQ pulses to wake the
      * vendor MPP pipeline so VENC stops timing out.  MVP scaffolding,
      * wired only on hi3516ev300 for now. */
-    hwaddr          vi_fp_base;        /* 0 = no frame producer */
-    int             vi_fp_cap_irq;     /* GIC SPI for VI_CAP0 */
-    int             vi_fp_proc_irq;    /* GIC SPI for VI_PROC0 */
-    int             vi_fp_vpss_irq;    /* GIC SPI for VPSS */
 
     /* CPU soft-reset register offset in CRG (for SMP bringup) */
     uint32_t        cpu_srst_offset; /* 0 = disabled, e.g. 0x78 for CV500 */
