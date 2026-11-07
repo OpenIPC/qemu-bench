@@ -70,6 +70,12 @@
 #define SS_GICV3_REDIST     0x16040000  /* Iford DTS */
 #define SS_CNTFRQ_HZ        6000000     /* arm,armv7-timer clock-frequency */
 #define SS_MIDR_A35         0x411FD040  /* r1p0, __v7_ca35_proc_info */
+/*
+ * Iford's Cortex-A32, r0p1 by the A32 TRM's MIDR (part 0xD01).  Its
+ * OP-TEE is built for ARMv8 AArch32 and takes locks with LDAEX/STLEX,
+ * which an A7 does not have: the cores are QEMU's "max", saying A32.
+ */
+#define SS_MIDR_A32         0x410FD011
 
 /* RIU blocks with models; bank numbers as the vendor code names them. */
 #define SS_ISP_BASE         SSTAR_RIU_ADDR(0x0008, 0)
@@ -93,6 +99,12 @@
  * looks at them (the IPL brings up CPU0's GIC only), so what parks CPU1 is
  * the ROM's or a secure firmware's, and QEMU stands in for it: the core comes
  * up at that address, in the state asked for, as arm_set_cpu_on() leaves it.
+ *
+ * Ifliegen's TF-A (SP_MIN) wakes CPU1 the Iford way for PSCI CPU_ON, with
+ * 0x15 = 0x0C and its own warm-boot entry, which must run Secure (it goes
+ * to Monitor mode): there bit 3 is not a Non-secure start, and the core
+ * starts Secure, as a core leaves reset.  At its own cold boot it also
+ * writes its entry and 0xBEEF to 0x16; nothing here acts on that.
  */
 #define SMPCTRL_BOOT_HI     0x13
 #define SMPCTRL_BOOT_LO     0x14
@@ -185,6 +197,20 @@ static const ARMCPRegInfo ss_a32_cp_reginfo[] = {
 #define SS_SPI_I6C_UART1    60          /* INT_IRQ_FUART1_28 */
 #define SS_SPI_I6C_UR1      75          /* INT_IRQ_URDMA1_0 */
 #define SS_SPI_IFORD_WDT    161
+/*
+ * Ifliegen's (its irqs.h): Iford's groups, many lines moved.  The timers
+ * are MS_IRQ lines here, INT_IRQ_TIMER0-2, and the watchdog INT_FIQ_WDT_ADD.
+ */
+#define SS_SPI_IFL_UART1    60          /* INT_IRQ_FUART1 */
+#define SS_SPI_IFL_UR0      69          /* INT_IRQ_FUART0_MERGE */
+#define SS_SPI_IFL_UR1      53          /* INT_IRQ_FUART1_MERGE */
+#define SS_SPI_IFL_FURDMA   92          /* INT_IRQ_FUART_MERGE */
+#define SS_SPI_IFL_MIIC0    98          /* INT_IRQ_MIIC0; i2c1-2 INT_IRQ_MIIC */
+#define SS_SPI_IFL_TIMER0   101
+#define SS_SPI_IFL_TIMER1   102
+#define SS_SPI_IFL_TIMER2   103
+#define SS_SPI_IFL_WDT      162
+#define SS_SPI_IFL_VENC     174         /* INT_FIQ_HST_2, the DTS venc's */
 #define SS_SPI_TIMER0       96
 #define SS_SPI_TIMER1       97
 #define SS_SPI_WDT          98
@@ -415,16 +441,13 @@ static const SstarRegDefault ss_msc316_defaults[] = {
 SS_MSC316_SOC(msc316dc, "MSC316DC");
 SS_MSC316_SOC(msc316dm, "MSC316DM");
 
-static const SstarRegDefault ss_iford_defaults[] = {
-    /*
-     * MIU: DRAM size, log2 of MiB, which the kernel's
-     * reg_miu_dram_get_size and so mi_sys read.  Nothing in the boot
-     * chain writes it here: on silicon it is presumably strapped or set
-     * by the DRAM init this model skips.
-     */
-    { SSTAR_RIU_ADDR(0x1659, 0x0D), 7 },
-    { 0 }
-};
+/*
+ * MIU: DRAM size, log2 of MiB, which the kernel's reg_miu_dram_get_size and
+ * so mi_sys read.  The IPL writes it once it has found where DRAM wraps
+ * (sstar-riu's fill engine); for a boot with no IPL (-kernel) it starts at
+ * the machine's own size (sigmastar_common_init).
+ */
+#define SS_MIU_DRAM_SIZE    SSTAR_RIU_ADDR(0x1659, 0x0D)
 
 /*
  * SSC029 (die "iford", Linux "sstar,iford"): two Cortex-A32s, run here by
@@ -439,26 +462,109 @@ static const SstarRegDefault ss_iford_defaults[] = {
  * works for this QFN128 DDR3 image).  IMI is the kernel's IMI_SIZE
  * (registers.h), 240 KiB.
  */
+/* SD card detect: PAD_SD0_CDZ (vendor hal_card_platform.c), low = card */
+#define SS_IFORD_COMMON                                               \
+    .die                = SS_DIE_IFORD,                               \
+    .num_cpus           = 2,                                          \
+    .chip_id            = 0xF0,                                       \
+    .flash_jedec        = 0xEF4018,         /* W25Q128 */             \
+    .imi_size           = 240 * KiB,                                  \
+    .fsp_sw_cs          = true,                                       \
+    .fsp_bank           = 0x100D,                                     \
+    .qspi_bank          = 0x100E,                                     \
+    .smf_ack            = true,                                       \
+    .urdma              = true,                                       \
+    .sd_cd_addr         = SSTAR_RIU_ADDR(0x103E, 0x14),               \
+    .sd_cd_bit          = 1 << 0,                                     \
+    .miic               = 3,                                          \
+    .miic_sensor_bus    = 1,                /* DTS snr0_mipi_i2c */   \
+    .default_sensor     = "os04d10",                                  \
+    .ipc                = true,                                       \
+    .gpio_bank          = 0x103E
+
 static const SsSoCConfig iford_soc = {
     .desc               = "SigmaStar SSC029 (iford, 2x Cortex-A32)",
-    .die                = SS_DIE_IFORD,
-    .num_cpus           = 2,
     .ram_size_default   = 128 * MiB,
-    .chip_id            = 0xF0,
     .bond               = 0,
-    .flash_jedec        = 0xEF4018,         /* W25Q128 */
-    .imi_size           = 240 * KiB,
-    .fsp_sw_cs          = true,
-    .fsp_bank           = 0x100D,
-    .qspi_bank          = 0x100E,
-    .defaults           = ss_iford_defaults,
-    .smf_ack            = true,
-    .urdma              = true,
-    .miic               = 3,
-    .miic_sensor_bus    = 1,                /* DTS snr0_mipi_i2c */
-    .default_sensor     = "os04d10",
-    .ipc                = true,
-    .gpio_bank          = 0x103E,
+    SS_IFORD_COMMON,
+};
+
+/*
+ * The SDK's other Iford parts, by its NOR IPLs and defconfigs: SSC029A,
+ * 512 MiB DDR4 in a BGA (DDR4_3200_NTC4G_BGA2, ...ssc029a.512.bga12_ddr4),
+ * whose IPL takes any bond; SSC029B, 256 MiB DDR3 (BGA1_DDR3,
+ * ...ssc029b.256.bga11_ddr3), whose IPL decodes the bond to its DRAM part
+ * and accepts 0x10-0x1D, 0x34-0x35 and 0x50-0x5D only.  Which of those a
+ * real SSC029B carries is not known: it has none until bond= is given.
+ */
+static const SsSoCConfig ssc029a_soc = {
+    .desc               = "SigmaStar SSC029A (iford, 2x Cortex-A32)",
+    .ram_size_default   = 512 * MiB,
+    .bond               = 0,
+    SS_IFORD_COMMON,
+};
+
+static const SsSoCConfig ssc029b_soc = {
+    .desc               = "SigmaStar SSC029B (iford, 2x Cortex-A32)",
+    .ram_size_default   = 256 * MiB,
+    .bond               = 0,
+    .bond_unknown       = "the BGA1 DDR3 IPL takes 0x10-0x1D, 0x34-0x35 or "
+                          "0x50-0x5D, and no board value is known",
+    SS_IFORD_COMMON,
+};
+
+/*
+ * SSC034A/B (die "ifliegen", Linux "sgs,ifliegen"): Iford's register map
+ * on two Cortex-A7s and a GIC-400 (distributor 0x16001000, CPU interface
+ * 0x16002000), its interrupt lines renumbered.  Sources: the vendor
+ * Ifliegen SDK (ILSSV01C12: U-Boot 2021.10, TF-A SP_MIN 2.5 as BL32) --
+ * its device tree, irqs.h and registers.h, NOR IPLs and defconfigs:
+ * SSC034A with 128 MiB in a QFN128 (...ssc034a.128.qfn128), SSC034B with
+ * 64 MiB in a QFN88 (...ssc034b.64.qfn88).  The SDK's Linux is 4.9.84.
+ *
+ * The bond is the IPL's DRAM profile, which it prints: the QFN88 IPL takes
+ * 0, 1, 4 and 5 (DDR2 512 Mbit, DDR3 1 Gbit), the QFN128 one 9, 10, 13 and
+ * 14 (DDR3 1 Gbit, 2 Gbit), bit 2 making no difference to either.  The
+ * defaults are the one profile of each that is the part's DRAM size.  Not
+ * from the SDK: the chip ID byte, which nothing in the boot chain checks.
+ */
+#define SS_IFLIEGEN_COMMON                                            \
+    .die                = SS_DIE_IFLIEGEN,                            \
+    .num_cpus           = 2,                                          \
+    .chip_id            = 0xF0,                                       \
+    .flash_jedec        = 0xEF4018,         /* W25Q128 */             \
+    .imi_size           = 240 * KiB,                                  \
+    .fsp_sw_cs          = true,                                       \
+    .fsp_bank           = 0x100D,                                     \
+    .qspi_bank          = 0x100E,                                     \
+    .smf_ack            = true,                                       \
+    .urdma              = true,                                       \
+    .sd_bank            = 0x1413,           /* DTS sdmmc0 0x1F282600 */ \
+    .sd_spi             = 50,               /* INT_IRQ_SD */          \
+    /* PAD_PM_SD_CDZ: GPIO22_IN_REG 0x103E2C BIT0 (hal_gpio_common.c) */ \
+    .sd_cd_addr         = SSTAR_RIU_ADDR(0x103E, 0x16),               \
+    .sd_cd_bit          = 1 << 0,                                     \
+    /* sdmmc1 0x1F282C00, INT_IRQ_SDIO; PAD_SD1_IO6, 0x103E0C BIT0 */  \
+    .sd2_bank           = 0x1416,                                     \
+    .sd2_spi            = 86,                                         \
+    .sd_cd2_addr        = SSTAR_RIU_ADDR(0x103E, 0x06),               \
+    .miic               = 3,                                          \
+    .miic_sensor_bus    = 1,                                          \
+    .ipc                = true,                                       \
+    .gpio_bank          = 0x103E
+
+static const SsSoCConfig ssc034a_soc = {
+    .desc               = "SigmaStar SSC034A (ifliegen, 2x Cortex-A7)",
+    .ram_size_default   = 128 * MiB,
+    .bond               = 0x09,             /* QFN128 DDR3 1 Gbit */
+    SS_IFLIEGEN_COMMON,
+};
+
+static const SsSoCConfig ssc034b_soc = {
+    .desc               = "SigmaStar SSC034B (ifliegen, 2x Cortex-A7)",
+    .ram_size_default   = 64 * MiB,
+    .bond               = 0x00,             /* QFN88 DDR2 512 Mbit */
+    SS_IFLIEGEN_COMMON,
 };
 
 /*
@@ -595,6 +701,12 @@ SS_I6_SOC(ssc325, 128 * MiB, SS_DIE_INFINITY6, 0xEF, "SSC325 (infinity6",
           SS_RAM_I6_009A);
 SS_I6_SOC(ssc325de, 256 * MiB, SS_DIE_INFINITY6, 0xEF,
           "SSC325DE (infinity6", SS_RAM_I6_009B);
+/*
+ * The one board seen, a Raysharp camera, says "ChipType: SC327DE_128M" and
+ * its U-Boot passes LX_MEM=0x7fc6000.  Its kernel's device tree is SSC009B.
+ */
+SS_I6_SOC(ssc327de, 128 * MiB, SS_DIE_INFINITY6, 0xEF,
+          "SSC327DE (infinity6", NULL);
 SS_I6_SOC(ssc333, 64 * MiB, SS_DIE_INFINITY6B0, 0xF2, "SSC333 (infinity6b0",
           NULL);
 SS_I6_SOC(ssc335, 64 * MiB, SS_DIE_INFINITY6B0, 0xF2, "SSC335 (infinity6b0",
@@ -635,6 +747,8 @@ struct SsMachineState {
     MemoryRegion smpctrl;
     uint16_t smpctrl_regs[0x80];
     bool iford;
+    bool gicv3;
+    bool cpu1_stub;             /* SS_IFORD_CPU1_STUB is installed */
     /* what bus masters see: MIU bus addresses, DRAM from 0 */
     MemoryRegion miu_root;
     MemoryRegion miu_sys;
@@ -776,6 +890,19 @@ static uint64_t ss_smpctrl_read(void *opaque, hwaddr off, unsigned size)
     return size == 1 ? (v & 0xFF) : v;
 }
 
+/*
+ * Iford CPU1's way out of the mask ROM, at the top of its stand-in: in
+ * Monitor mode ICC_PMR = 0xF0, ICC_IGRPEN0 = 1, ICC_MGRPEN1 = 3 (the
+ * IPL's own sequence for CPU0), back to Secure SVC, and on to the entry
+ * in smpctrl 0x13/0x14.  Inferred, as the rest of the ROM is.
+ */
+#define SS_IFORD_CPU1_STUB  (SS_BOOTROM_BASE + SS_BOOTROM_SIZE - 0x100)
+static const uint32_t ss_iford_cpu1_stub[] = {
+    0xF1020016, 0xE3A000F0, 0xEE040F16, 0xE3A00001, 0xEE0C0FDC,
+    0xE3A00003, 0xEECC0FFC, 0xF1020013, 0xE59F100C, 0xE5912050,
+    0xE591304C, 0xE1822803, 0xE12FFF12, SS_SMPCTRL_BASE,
+};
+
 static void ss_smpctrl_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size)
 {
@@ -799,16 +926,35 @@ static void ss_smpctrl_write(void *opaque, hwaddr off, uint64_t val,
                          ((uint32_t)s->smpctrl_regs[SMPCTRL_BOOT_HI] << 16);
         /* Released from the mask ROM, so in the Secure state. */
         int el = arm_feature(&s->cpus[1]->env, ARM_FEATURE_EL3) &&
-                 !(s->iford && (*r & SMPCTRL_NS_CPU1)) ? 3 : 1;
+                 !(s->iford && s->gicv3 && (*r & SMPCTRL_NS_CPU1)) ? 3 : 1;
         int ret;
 
-        if (s->iford) {
-            /* the IPL's GIC init, for this core: its lines are Non-secure */
+        if (s->gicv3 && s->iford) {
+            /*
+             * The IPL's GIC init, for this core: its redistributor awake
+             * (GICR_WAKER.ProcessorSleep clear, a Secure-only write the
+             * IPL makes for CPU0) and its lines Non-secure.  A kernel that
+             * runs Secure does both itself; under OP-TEE it runs
+             * Non-secure, and CPU1's timer would never reach it.
+             */
             MemTxAttrs secure = { .secure = 1 };
 
             address_space_stl_le(&address_space_memory,
+                                 SS_GICV3_REDIST + 0x20000 + 0x14, 0,
+                                 secure, NULL);
+            address_space_stl_le(&address_space_memory,
                                  SS_GICV3_REDIST + 0x20000 +
                                  0x10000 + 0x80, UINT32_MAX, secure, NULL);
+        }
+        /*
+         * A Secure start goes through the stub ROM code below, which
+         * gives CPU1's interface what the IPL gives CPU0's from Monitor
+         * mode.  A Secure firmware that hands the core to a Non-secure
+         * kernel (Iford's OP-TEE does) relies on it: an NS write to
+         * ICC_PMR is ignored while PMR is in the Secure half.
+         */
+        if (s->cpu1_stub && el == 3) {
+            entry = SS_IFORD_CPU1_STUB;
         }
         ret = arm_set_cpu_on(s->cpus[1]->mp_affinity, entry, 0, el, false);
 
@@ -883,11 +1029,6 @@ static const uint32_t ss_bootrom_script[] = {
  */
 #define SS_NAND_CIS_BLOCKS  10
 #define SS_SNI_MAGIC        "MSTARSEMIUSFDCIS"
-#define SS_SNI_SPARE         0x20
-#define SS_SNI_PAGE          0x22
-#define SS_SNI_BLOCK_PAGES   0x24
-#define SS_SNI_BL0PBA       0x2F
-#define SS_SNI_BL1PBA       0x30
 /*
  * Where the ROM leaves page 0 (the SNI) and page 1 (the PNI) of the block
  * it found them in: the IPLs of infinity6, 6b0 and 6e take the flash
@@ -896,18 +1037,68 @@ static const uint32_t ss_bootrom_script[] = {
 #define SS_IMI_SNI          (SS_IMI_BASE + 0x10000)
 #define SS_IMI_PNI          (SS_IMI_BASE + 0x10A00)
 #define SS_SNI_SIZE         0x200
+/*
+ * infinity6c's IPL looks for the PNI further up, and takes up to 62 records
+ * of it, not the 0x200 bytes the older IPLs read: the same inference, from
+ * the address and magic it checks in the Maruko SDK's IPL.bin.
+ */
+#define SS_I6C_IMI_PNI      (SS_IMI_BASE + 0x18000)
+/*
+ * infinity2m's IPL (the SSD20x SDK's board/i2m/boot/ipl) has its copies
+ * lower: the SNI at 0xA000A000, its ID count read at +0x10, and the PNI at
+ * 0xA000AA00, the same 0xA00 apart.  Without them it reads page 0 forever.
+ */
+#define SS_I2M_IMI_SNI      (SS_IMI_BASE + 0xA000)
+#define SS_I2M_IMI_PNI      (SS_IMI_BASE + 0xAA00)
+
+/*
+ * Two forms of SNI.  The older dies' starts "MSTARSEMIUSFDCIS" (the SDKs'
+ * snigenerator SPINAND_INFO_t); Iford's starts "SNIB" and has the same
+ * fields further on, its ID count at 0x2C (the Iford SDK's own
+ * images/cis.bin: page 0x800 at 0x36, BL0PBA 10 and BL1PBA 27 as its
+ * partition_layout.txt lists IPL and the backup IPL).  The part itself is
+ * in the "SNIF" profile at 0x100, the older layout from its +8: the ID
+ * count at 0x108.  The SDK's flash.sni has a generic SNIF, all zero, which
+ * the IPL cannot drive the flash with; a board has the record of its part
+ * from flash_list-fb.sni there.
+ */
+typedef struct SsSniForm {
+    const char *magic;
+    unsigned magic_len, id, spare, page, block_pages, bl0, bl1;
+} SsSniForm;
+
+static const SsSniForm ss_sni_mstar = {
+    SS_SNI_MAGIC, 16, 0x10, 0x20, 0x22, 0x24, 0x2F, 0x30,
+};
+static const SsSniForm ss_sni_snib = {
+    "SNIB", 4, 0x108, 0x34, 0x36, 0x3A, 0x3F, 0x40,
+};
+
+static const SsSniForm *ss_sni_form(const uint8_t *img, gsize len)
+{
+    if (len < SS_SNI_SIZE) {
+        return NULL;
+    }
+    if (!memcmp(img, ss_sni_mstar.magic, ss_sni_mstar.magic_len)) {
+        return &ss_sni_mstar;
+    }
+    if (!memcmp(img, ss_sni_snib.magic, ss_sni_snib.magic_len)) {
+        return &ss_sni_snib;
+    }
+    return NULL;
+}
 
 /* The SNI in block 0 names its own geometry; so do its copies. */
 typedef struct SsNandGeom {
     uint32_t page, spare, block_pages;
 } SsNandGeom;
 
-static SsNandGeom ss_nand_geom(const uint8_t *img)
+static SsNandGeom ss_nand_geom(const uint8_t *img, const SsSniForm *f)
 {
     SsNandGeom g = {
-        .page = lduw_le_p(img + SS_SNI_PAGE),
-        .spare = lduw_le_p(img + SS_SNI_SPARE),
-        .block_pages = lduw_le_p(img + SS_SNI_BLOCK_PAGES),
+        .page = lduw_le_p(img + f->page),
+        .spare = lduw_le_p(img + f->spare),
+        .block_pages = lduw_le_p(img + f->block_pages),
     };
 
     return g;
@@ -926,9 +1117,12 @@ static const uint8_t *ss_nand_block(const uint8_t *img, gsize len,
 }
 
 /* The IPL's bytes without the spares; the CIS goes to IMI on the way. */
-static uint8_t *ss_nand_find_ipl(const uint8_t *img, gsize len, gsize *out)
+static uint8_t *ss_nand_find_ipl(const uint8_t *img, gsize len,
+                                 SsDie die, gsize *out)
 {
-    SsNandGeom g = ss_nand_geom(img);
+    bool i6c = die == SS_DIE_INFINITY6C, i2m = die == SS_DIE_INFINITY2M;
+    const SsSniForm *f = ss_sni_form(img, len);
+    SsNandGeom g = ss_nand_geom(img, f);
     gsize raw = g.page + g.spare, max = g.block_pages * g.page;
     uint32_t b;
     int copy, p;
@@ -939,12 +1133,12 @@ static uint8_t *ss_nand_find_ipl(const uint8_t *img, gsize len, gsize *out)
     for (b = 0; b < SS_NAND_CIS_BLOCKS; b++) {
         const uint8_t *cis = ss_nand_block(img, len, &g, b);
 
-        if (!cis || memcmp(cis, SS_SNI_MAGIC, 16)) {
+        if (!cis || memcmp(cis, f->magic, f->magic_len)) {
             continue;
         }
         for (copy = 0; copy < 2; copy++) {
             const uint8_t *ipl = ss_nand_block(img, len, &g,
-                cis[copy ? SS_SNI_BL1PBA : SS_SNI_BL0PBA]);
+                cis[copy ? f->bl1 : f->bl0]);
 
             if (ipl && ldl_le_p(ipl + 4) == SS_IPL_MAGIC) {
                 uint8_t *buf = g_malloc(max);
@@ -953,9 +1147,11 @@ static uint8_t *ss_nand_find_ipl(const uint8_t *img, gsize len, gsize *out)
                     memcpy(buf + p * g.page, ipl + p * raw, g.page);
                 }
                 rom_add_blob_fixed("sigmastar.sni", cis, SS_SNI_SIZE,
-                                   SS_IMI_SNI);
+                                   i2m ? SS_I2M_IMI_SNI : SS_IMI_SNI);
                 rom_add_blob_fixed("sigmastar.pni", cis + raw,
-                                   SS_SNI_SIZE, SS_IMI_PNI);
+                                   i6c ? g.page : SS_SNI_SIZE,
+                                   i6c ? SS_I6C_IMI_PNI :
+                                   i2m ? SS_I2M_IMI_PNI : SS_IMI_PNI);
                 *out = max;
                 return buf;
             }
@@ -1087,6 +1283,18 @@ static bool ss_gicv3(const SsSoCConfig *c)
     return c->die == SS_DIE_IFORD || c->die == SS_DIE_INFINITY6C;
 }
 
+/* Iford's register map: Iford, and Ifliegen on its GIC-400 */
+static bool ss_iford_gen(const SsSoCConfig *c)
+{
+    return c->die == SS_DIE_IFORD || c->die == SS_DIE_IFLIEGEN;
+}
+
+/* 128 MS_IRQ lines from SPI 32, MS_FIQ from 160 */
+static bool ss_wide_intc(const SsSoCConfig *c)
+{
+    return ss_gicv3(c) || c->die == SS_DIE_IFLIEGEN;
+}
+
 /* the infinity6 dies */
 static bool ss_i6(const SsSoCConfig *c)
 {
@@ -1191,6 +1399,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     gsize img_len = 0;
     DeviceState *gic, *intc, *riu, *fsp, *dev, *i3_isp = NULL, *isp0 = NULL;
     bool nand;
+    const SsSniForm *sni;
     const int ncpus = MIN(machine->smp.cpus, c->num_cpus);
     const uint16_t bond = sms->bond_set ? sms->bond : c->bond;
     /* vendor halSERFLASH.c: only the QFN88 has the flash on the PM FSP */
@@ -1220,6 +1429,10 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         }
     }
 
+    if (c->bond_unknown && !sms->bond_set) {
+        warn_report("sigmastar: this part's bond strap is unknown (%s): "
+                    "set it with bond=", c->bond_unknown);
+    }
     if (c->ram_unknown &&
         !qemu_opt_get(qemu_find_opts_singleton("memory"), "size")) {
         warn_report("sigmastar: this part's DRAM size is unknown (%s): "
@@ -1228,10 +1441,11 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     }
 
     /* The image says which chip the board carries, the straps follow it. */
-    nand = img && img_len >= SS_SNI_SIZE && ss_i6(c) &&
-           !memcmp(img, SS_SNI_MAGIC, 16);
+    sni = img ? ss_sni_form(img, img_len) : NULL;
+    nand = sni && (ss_i6(c) || c->die == SS_DIE_INFINITY2M ||
+                   ss_iford_gen(c));
     if (nand) {
-        SsNandGeom g = ss_nand_geom(img);
+        SsNandGeom g = ss_nand_geom(img, sni);
 
         if (!is_power_of_2(g.page) || !is_power_of_2(g.block_pages)) {
             error_report("sigmastar: NAND image with page %u, %u pages a block",
@@ -1258,6 +1472,9 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
          */
         if (c->die == SS_DIE_INFINITY6C) {
             object_property_set_int(o, "midr", SS_MIDR_A35, &error_fatal);
+        } else if (c->die == SS_DIE_IFORD &&
+                   !strcmp(machine->cpu_type, ARM_CPU_TYPE_NAME("max"))) {
+            object_property_set_int(o, "midr", SS_MIDR_A32, &error_fatal);
         }
         /* CPU1 parks in the mask ROM until smpctrl releases it. */
         object_property_set_bool(o, "start-powered-off", n > 0,
@@ -1350,7 +1567,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         /* GIC-400 in the A7 private region: distributor +0x1000, CPU +0x2000 */
         gic = qdev_new(TYPE_A15MPCORE_PRIV);
         qdev_prop_set_uint32(gic, "num-cpu", ncpus);
-        qdev_prop_set_uint32(gic, "num-irq", SS_GIC_NUM_SPI + 32);
+        qdev_prop_set_uint32(gic, "num-irq",
+                             (ss_wide_intc(c) ? 192 : SS_GIC_NUM_SPI) + 32);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gic), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(gic), 0, SS_PERIPHBASE);
     }
@@ -1374,10 +1592,10 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     qdev_prop_set_uint16(riu, "bond", bond);
     qdev_prop_set_bit(riu, "smf-ack", c->smf_ack);
     qdev_prop_set_bit(riu, "infinity3", c->die == SS_DIE_INFINITY3);
-    qdev_prop_set_bit(riu, "iford", c->die == SS_DIE_IFORD);
+    qdev_prop_set_bit(riu, "iford", ss_iford_gen(c));
     qdev_prop_set_bit(riu, "miu-bist", ss_i6(c));
     qdev_prop_set_bit(riu, "fcie-ack", ss_i6(c) || c->sd_bank);
-    qdev_prop_set_bit(riu, "miu-mmu", c->die == SS_DIE_IFORD ||
+    qdev_prop_set_bit(riu, "miu-mmu", ss_iford_gen(c) ||
                                       c->die == SS_DIE_INFINITY6C);
     qdev_prop_set_bit(riu, "i6e-mmu", c->die == SS_DIE_INFINITY6E);
     qdev_prop_set_uint16(riu, "phy-bank", c->phy_bank);
@@ -1394,7 +1612,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         qdev_prop_set_uint16(riu, "pad1-level",
                              c->sd2_bank && drive_get(IF_SD, 0, 1) ? 0 : 1);
     }
-    sms->iford = c->die == SS_DIE_IFORD;
+    sms->iford = ss_iford_gen(c);
+    sms->gicv3 = ss_gicv3(c);
     qdev_prop_set_uint16(riu, "gpio-bank", c->gpio_bank);
     qdev_prop_set_uint64(riu, "uuid", sms->uuid);
     if (!c->no_i2m_defaults) {
@@ -1402,6 +1621,13 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     }
     if (c->defaults) {
         sstar_riu_add_defaults(SSTAR_RIU(riu), c->defaults);
+    }
+    if (ss_iford_gen(c)) {
+        static SstarRegDefault miu_size[2];
+
+        miu_size[0].addr = SS_MIU_DRAM_SIZE;
+        miu_size[0].val = ctz64(machine->ram_size / MiB);
+        sstar_riu_add_defaults(SSTAR_RIU(riu), miu_size);
     }
     if (nand) {
         sstar_riu_add_defaults(SSTAR_RIU(riu),
@@ -1417,16 +1643,17 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(riu), 0, SSTAR_RIU_BASE, -2);
 
     intc = qdev_new("sstar-intc");
-    qdev_prop_set_bit(intc, "iford", ss_gicv3(c));
+    qdev_prop_set_bit(intc, "iford", ss_wide_intc(c));
     object_property_add_child(OBJECT(machine), "intc", OBJECT(intc));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(intc), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(intc), 0, SS_INTC_BASE);
-    for (n = 0; n < (ss_gicv3(c) ? 160 : 96); n++) {
+    for (n = 0; n < (ss_wide_intc(c) ? 160 : 96); n++) {
         qdev_connect_gpio_out(intc, n, qdev_get_gpio_in(gic, 32 + n));
     }
 
     dev = qdev_new("sstar-timer");
     object_property_set_link(OBJECT(dev), "riu", OBJECT(riu), &error_fatal);
+    qdev_prop_set_bit(dev, "level", c->die == SS_DIE_IFLIEGEN);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SS_TIMER_BASE);
     if (c->die == SS_DIE_IFORD) {
@@ -1435,6 +1662,16 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                            ss_spi(gic, intc, SS_SPI_IFORD_TIMER));
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 2,
                            ss_spi(gic, intc, SS_SPI_IFORD_WDT));
+    } else if (c->die == SS_DIE_IFLIEGEN) {
+        static const int spi[4] = {
+            SS_SPI_IFL_TIMER0, SS_SPI_IFL_TIMER1, SS_SPI_IFL_WDT,
+            SS_SPI_IFL_TIMER2,
+        };
+
+        for (n = 0; n < 4; n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
+                               ss_spi(gic, intc, spi[n]));
+        }
     } else if (c->die == SS_DIE_INFINITY6C) {
         /* INT_FIQ_TIMER_0, _1, WDT, _2: MS_FIQ from SPI 160 */
         for (n = 0; n < 4; n++) {
@@ -1483,17 +1720,31 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         static const int i6c_ur_spi[3] = {
             SS_SPI_IFORD_UR0, SS_SPI_I6C_UR1, SS_SPI_FURDMA,
         };
-        bool iford = ss_gicv3(c);
+        static const int ifl_spi[4] = {
+            SS_SPI_UART0, SS_SPI_IFL_UART1, SS_SPI_FUART, SS_SPI_UART2,
+        };
+        static const int ifl_ur_spi[3] = {
+            SS_SPI_IFL_UR0, SS_SPI_IFL_UR1, SS_SPI_IFL_FURDMA,
+        };
+        bool iford = ss_wide_intc(c);
         const int *uspi = c->die == SS_DIE_INFINITY6C ? i6c_spi :
+                          c->die == SS_DIE_IFLIEGEN ? ifl_spi :
                           c->die == SS_DIE_IFORD ? iford_spi : spi;
         const int *urspi = c->die == SS_DIE_INFINITY6C ? i6c_ur_spi :
+                           c->die == SS_DIE_IFLIEGEN ? ifl_ur_spi :
                            c->die == SS_DIE_IFORD ? iford_ur_spi : ur_spi;
         bool ur = c->urdma && n < 3;
 
+        /* Ifliegen has uart0, uart1 and fuart only */
+        if (c->die == SS_DIE_IFLIEGEN && n == 3) {
+            break;
+        }
         dev = qdev_new("sstar-uart");
         qdev_prop_set_chr(dev, "chardev", serial_hd(n));
         qdev_prop_set_bit(dev, "urdma", ur);
         qdev_prop_set_bit(dev, "urdma-tx-v2", ur);
+        qdev_prop_set_bit(dev, "urdma-txfifo",
+                          ur && c->die == SS_DIE_IFLIEGEN);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
@@ -1536,16 +1787,16 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         uint32_t id = sms->flash_nand_id;
         int i;
 
-        if (!id && img[0x11] != 0xEE && img[0x10] <= 4) {
-            for (i = 0; i < img[0x10]; i++) {
-                id = id << 8 | img[0x11 + i];
+        if (!id && img[sni->id + 1] != 0xEE && img[sni->id] <= 4) {
+            for (i = 0; i < img[sni->id]; i++) {
+                id = id << 8 | img[sni->id + 1 + i];
             }
         }
         qdev_prop_set_bit(fsp, "nand", true);
-        qdev_prop_set_uint32(fsp, "page-size", lduw_le_p(img + SS_SNI_PAGE));
-        qdev_prop_set_uint32(fsp, "spare-size", lduw_le_p(img + SS_SNI_SPARE));
+        qdev_prop_set_uint32(fsp, "page-size", lduw_le_p(img + sni->page));
+        qdev_prop_set_uint32(fsp, "spare-size", lduw_le_p(img + sni->spare));
         qdev_prop_set_uint32(fsp, "block-pages",
-                             lduw_le_p(img + SS_SNI_BLOCK_PAGES));
+                             lduw_le_p(img + sni->block_pages));
         qdev_prop_set_uint32(fsp, "nand-id", id ?: 0xC8F1);
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(fsp), &error_fatal);
@@ -1576,6 +1827,14 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                                &error_fatal);
         memory_region_add_subregion(sysmem, SS_IPU_BASE, ipu);
 
+        dev = qdev_new("sstar-rtcpwc");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x0034, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_IFORD_RTC));
+    }
+    if (c->die == SS_DIE_IFLIEGEN) {
+        /* the DTS rtcpwc: INT_IRQ_FLAG_POC, Iford's line */
         dev = qdev_new("sstar-rtcpwc");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x0034, 0));
@@ -1769,13 +2028,16 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
          */
         qdev_prop_set_uint32(dev, "addr-mask", 0x7FFFFFFF);
     }
-    if (c->die == SS_DIE_IFORD) {
+    if (ss_iford_gen(c)) {
         DeviceState *xzd = qdev_new(TYPE_SSTAR_XZDEC);
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(xzd), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(xzd), 0, SSTAR_RIU_ADDR(0x11D7, 0));
-        sysbus_connect_irq(SYS_BUS_DEVICE(xzd), 0,
-                           ss_spi(gic, intc, SS_SPI_IFORD_XZDEC));
+        /* Ifliegen's irqs.h has no XZ_DEC line: polled, as its IPL does */
+        if (c->die == SS_DIE_IFORD) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(xzd), 0,
+                               ss_spi(gic, intc, SS_SPI_IFORD_XZDEC));
+        }
         object_property_set_link(OBJECT(dev), "xzdec", OBJECT(xzd),
                                  &error_fatal);
     }
@@ -1786,11 +2048,51 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             SS_SPI_BDMA0, SS_SPI_BDMA1, SS_SPI_BDMA2, SS_SPI_BDMA3,
         };
 
-        /* On Ifado SPIs 93/94 are URDMA's; its DTS gives BDMA 72/73 */
-        for (n = 0; n < (c->urdma ? 2 : 4); n++) {
-            sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
-                               ss_spi(gic, intc, spi[n]));
+        if (c->die == SS_DIE_IFLIEGEN) {
+            /* bdma0-3 share INT_IRQ_BDMA (DTS); msys copies on channel 2 */
+            DeviceState *or = qdev_new(TYPE_OR_IRQ);
+
+            qdev_prop_set_uint16(or, "num-lines", 4);
+            qdev_realize_and_unref(or, NULL, &error_fatal);
+            qdev_connect_gpio_out(or, 0, ss_spi(gic, intc, SS_SPI_BDMA0));
+            for (n = 0; n < 4; n++) {
+                sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
+                                   qdev_get_gpio_in(or, n));
+            }
+        } else {
+            /* On Ifado SPIs 93/94 are URDMA's; its DTS gives BDMA 72/73 */
+            for (n = 0; n < (c->urdma ? 2 : 4); n++) {
+                sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
+                                   ss_spi(gic, intc, spi[n]));
+            }
         }
+    }
+
+    /*
+     * Ifliegen's encoder is Iford's: the RISC firmware interface at
+     * 0x1F34C800 (mi_venc.ko DRV_VENC_TOP_RiscHostFwInit), whose window the
+     * DTS venc's "vpu-bit" 0x1F34D000 lies in; its interrupt INT_FIQ_HST_2.
+     * Beside it a 32-bit wrapper page at 0x1F34E000, as plain storage
+     * (DRV_VENC_DEV_GpCtrlInit and EnableHskMode write +0x204, +0x420,
+     * +0x480): +0x404 [28:27] = 2 is its buffers in MIU, not shared IMI,
+     * which DRV_VENC_DEV_ImiShareCheck requires.
+     */
+    if (c->die == SS_DIE_IFLIEGEN) {
+        MemoryRegion *gp = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(gp, NULL, "sigmastar.venc-wrapper", 0x1000,
+                               &error_fatal);
+        stl_le_p((uint8_t *)memory_region_get_ram_ptr(gp) + 0x404,
+                 0x10000000);
+        memory_region_add_subregion(sysmem, 0x1F34E000, gp);
+
+        dev = qdev_new("sstar-venc");
+        qdev_prop_set_bit(dev, "iford", true);
+        qdev_prop_set_bit(dev, "cmd-ring", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x1F34C800);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           ss_spi(gic, intc, SS_SPI_IFL_VENC));
     }
 
     /*
@@ -2026,10 +2328,15 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         static const int i6e_spi[3] = {
             SS_SPI_MIIC0, SS_SPI_MIIC1, SS_SPI_I6E_MIIC2,
         };
+        /* i2c1 and i2c2 share INT_IRQ_MIIC, i2c0 has its own */
+        static const int ifl_spi[3] = {
+            SS_SPI_IFL_MIIC0, SS_SPI_MIIC0, SS_SPI_MIIC0,
+        };
         qemu_irq iford_miic = NULL;
         DeviceState *or_gate = NULL;
         bool iford = c->die == SS_DIE_IFORD;
-        bool shared = ss_gicv3(c);     /* the OR gate */
+        bool ifl = c->die == SS_DIE_IFLIEGEN;
+        bool shared = ss_gicv3(c) || ifl;     /* the OR gate */
         const char *sensor = sms->sensor ? sms->sensor : c->default_sensor;
         I2CBus *bus[3];
 
@@ -2039,10 +2346,11 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0,
                             iford ? iford_base[n] :
-                            c->die == SS_DIE_INFINITY6C ? i6c_base[n] :
+                            c->die == SS_DIE_INFINITY6C || ifl ? i6c_base[n] :
                             c->die == SS_DIE_INFINITY6E ? i6e_base[n] :
                             base[n]);
-            if (shared && (n < 2 || c->die == SS_DIE_INFINITY6C)) {
+            if (shared && (ifl ? n > 0 :
+                           n < 2 || c->die == SS_DIE_INFINITY6C)) {
                 if (!iford_miic) {
                     DeviceState *or = qdev_new(TYPE_OR_IRQ);
 
@@ -2050,6 +2358,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                     qdev_prop_set_uint16(or, "num-lines", 3);
                     qdev_realize_and_unref(or, NULL, &error_fatal);
                     qdev_connect_gpio_out(or, 0, ss_spi(gic, intc,
+                                                        ifl ? ifl_spi[n] :
                                                         iford_spi[n]));
                     iford_miic = qdev_get_gpio_in(or, 0);
                 }
@@ -2059,6 +2368,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                 sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                                    ss_spi(gic, intc,
                                           iford ? iford_spi[n] :
+                                          ifl ? ifl_spi[n] :
                                           c->die == SS_DIE_INFINITY6E ?
                                           i6e_spi[n] : spi[n]));
             }
@@ -2154,7 +2464,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
      */
     dev = qdev_new("sstar-emac");
     qemu_configure_nic_device(dev, true, NULL);
-    if (c->die == SS_DIE_IFORD) {
+    if (ss_iford_gen(c)) {
         qdev_prop_set_uint32(dev, "phy-bank", 0x1518);  /* 0x1F2A3000 */
     } else if (c->phy_bank) {
         qdev_prop_set_uint32(dev, "phy-bank", c->phy_bank);
@@ -2165,7 +2475,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1,
                     c->die == SS_DIE_IFORD ? 0x1F304200 : 0x1F343C00);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                       ss_spi(gic, intc, ss_gicv3(c) ?
+                       ss_spi(gic, intc, ss_wide_intc(c) ?
                               SS_SPI_IFORD_EMAC : SS_SPI_EMAC));
 
     /*
@@ -2261,7 +2571,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
      * UTMI PHY and USBC wrapper banks (ehci-mstar-chip.h).  -device
      * usb-tablet / usb-kbd / usb-storage attach as USB 2.0 devices.
      */
-    for (n = 0; n < (c->die == SS_DIE_IFORD || ss_i6(c) ? 1 : 3); n++) {
+    for (n = 0; n < (ss_iford_gen(c) || ss_i6(c) ? 1 : 3); n++) {
         static const uint32_t bank[3] = { 0x1424, 0x1428, 0x1432 };
         static const int spi[3] = { SS_SPI_UHC0, SS_SPI_UHC1, SS_SPI_UHC2 };
 
@@ -2269,7 +2579,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(bank[n], 0));
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                           ss_spi(gic, intc, c->die == SS_DIE_IFORD || ss_i6(c) ?
+                           ss_spi(gic, intc, ss_iford_gen(c) || ss_i6(c) ?
                                   SS_SPI_IFORD_UHC : spi[n]));
     }
 
@@ -2302,6 +2612,18 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
     binfo.secondary_cpu_reset_hook = ss_reset_secondary;
     arm_load_kernel(sms->cpus[0], machine, &binfo);
 
+    /* without a ROM dump, CPU1's Secure way out of the ROM is ours */
+    if (c->die == SS_DIE_IFORD && !machine->firmware) {
+        uint32_t stub[ARRAY_SIZE(ss_iford_cpu1_stub)];
+        int k;
+
+        for (k = 0; k < ARRAY_SIZE(stub); k++) {
+            stub[k] = cpu_to_le32(ss_iford_cpu1_stub[k]);
+        }
+        rom_add_blob_fixed("sigmastar.cpu1", stub, sizeof(stub),
+                           SS_IFORD_CPU1_STUB);
+        sms->cpu1_stub = true;
+    }
     if (machine->kernel_filename) {
         return;
     }
@@ -2314,7 +2636,9 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         }
     } else if (nand) {
         gsize ipl_len = 0;
-        g_autofree uint8_t *ipl = ss_nand_find_ipl(img, img_len, &ipl_len);
+
+        g_autofree uint8_t *ipl = ss_nand_find_ipl(img, img_len, c->die,
+                                                    &ipl_len);
 
         if (!ipl) {
             error_report("sigmastar: %s has no SNI naming a good IPL block; "
@@ -2429,7 +2753,8 @@ type_init(ss_machine_register_types)
         mc->max_cpus = config.num_cpus;                              \
         mc->default_cpus = config.num_cpus;                          \
         /* "max" is ARMv8 AArch32: userland built for the A35 needs it */ \
-        if (config.die == SS_DIE_INFINITY6C) {                       \
+        if (config.die == SS_DIE_INFINITY6C ||                       \
+            config.die == SS_DIE_IFORD) {                            \
             mc->default_cpu_type = ARM_CPU_TYPE_NAME("max");         \
         }                                                            \
     }                                                                \
@@ -2445,8 +2770,13 @@ DEFINE_SS_MACHINE("msc313e", msc313e, msc313e_soc)
 DEFINE_SS_MACHINE("msc316dc", msc316dc, msc316dc_soc)
 DEFINE_SS_MACHINE("msc316dm", msc316dm, msc316dm_soc)
 DEFINE_SS_MACHINE("ssc029", ssc029, iford_soc)
+DEFINE_SS_MACHINE("ssc029a", ssc029a, ssc029a_soc)
+DEFINE_SS_MACHINE("ssc029b", ssc029b, ssc029b_soc)
+DEFINE_SS_MACHINE("ssc034a", ssc034a, ssc034a_soc)
+DEFINE_SS_MACHINE("ssc034b", ssc034b, ssc034b_soc)
 DEFINE_SS_MACHINE("ssc325", ssc325, ssc325_soc)
 DEFINE_SS_MACHINE("ssc325de", ssc325de, ssc325de_soc)
+DEFINE_SS_MACHINE("ssc327de", ssc327de, ssc327de_soc)
 DEFINE_SS_MACHINE("ssc333", ssc333, ssc333_soc)
 DEFINE_SS_MACHINE("ssc335", ssc335, ssc335_soc)
 DEFINE_SS_MACHINE("ssc335de", ssc335de, ssc335de_soc)

@@ -87,11 +87,15 @@ void sstar_riu_set(SstarRiuState *s, uint32_t bank, uint32_t reg,
 static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
                                  uint32_t reg, uint16_t v)
 {
-    /* Input pads: firmware writes these registers, the level stays */
+    /*
+     * Input pads: firmware writes these registers, the level stays.  A pad
+     * in a GPIO bank (Iford's SD card detect) is not then read back as
+     * the GPIO rule below would.
+     */
     for (int p = 0; p < ARRAY_SIZE(s->pad_addr); p++) {
         if (s->pad_addr[p] &&
             s->pad_addr[p] == SSTAR_RIU_ADDR(bank, reg)) {
-            v = (v & ~s->pad_mask[p]) | s->pad_level[p];
+            return (v & ~s->pad_mask[p]) | s->pad_level[p];
         }
     }
     /* ALBANY0 where infinity6e and infinity6c put it */
@@ -213,15 +217,6 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
          */
         if (s->miu_mmu && reg == 0x00 && (v & 0x0010)) {
             v |= s->iford ? 0x3000 : 0x0200;
-        }
-        break;
-    case 0x1668:
-        /*
-         * Iford: the IPL's DRAM access test (MIU_MEMAUTOK): reg 0x50 bit 0
-         * starts it, reg 0x59 [2:0] reads 4 when it has passed.
-         */
-        if (s->iford && reg == 0x59) {
-            v = (s->regs[(bank << 7) | 0x50] & 1) ? 4 : 0;
         }
         break;
     case 0x112F:            /* Iford: the RNG (halAESDMA.c HAL_RNG_Read) */
@@ -476,6 +471,37 @@ static uint64_t sstar_riu_read(void *opaque, hwaddr off, unsigned size)
 #define MIU_BANK        0x1012
 #define MIU_REG(r)      s->regs[MIU_BANK * 128 + (r)]
 
+/*
+ * Iford: the DRAM test engine at reg 0x50 of banks 0x1668/0x1669, whose
+ * mode 0x18 in reg 0x52 is a fill (seen in the SDK's NOR IPLs, which size
+ * DRAM with it): reg 0x56 the 16-bit pattern, regs 0x54/0x55 the length in
+ * 16-byte units, regs 0x57/0x58 the MIU address in KiB.  The IPL fills 16
+ * bytes at 32 MiB, 64 MiB and up, and reads DRAM's first word to find
+ * where the decode wraps.
+ */
+static void sstar_iford_fill(SstarRiuState *s, uint32_t bank)
+{
+    uint16_t *r = &s->regs[bank << 7];
+    uint64_t len = ((uint64_t)r[0x54] | ((uint64_t)r[0x55] << 16)) << 4;
+    uint64_t addr = ((uint64_t)r[0x57] | ((uint64_t)r[0x58] << 16)) << 10;
+    uint16_t pattern = cpu_to_le16(r[0x56]);
+    uint16_t buf[2048];
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(buf); i++) {
+        buf[i] = pattern;
+    }
+    len = MIN(len, 1 * GiB);
+    while (len && addr < 1 * GiB) {
+        hwaddr n = MIN(len, sizeof(buf));
+
+        address_space_write(&address_space_memory, 0x20000000 + addr,
+                            MEMTXATTRS_UNSPECIFIED, buf, n);
+        addr += n;
+        len -= n;
+    }
+}
+
 static void sstar_miu_bist(SstarRiuState *s)
 {
     uint64_t len = (MIU_REG(0x72) | ((uint32_t)MIU_REG(0x73) << 16)) + 1ULL;
@@ -536,6 +562,23 @@ static void sstar_riu_write(void *opaque, hwaddr off, uint64_t val,
         v = val;
     }
     s->regs[idx] = v;
+    /*
+     * Iford: the IPL's DRAM access test (MIU_MEMAUTOK): reg 0x50 bit 0
+     * starts it, and reg 0x59 [2:0] reads 4 once it has passed, until the
+     * next start.  The QFN128 DDR3 IPL polls with the start bit still set;
+     * the BGA2 DDR4 one clears it first, then polls bit 2, and keeps its
+     * own mode in [4:3] of the same register, and runs a second test in
+     * the next bank, 0x1669, the same way.
+     */
+    if (s->iford && (bank == 0x1668 || bank == 0x1669) && reg == 0x50 &&
+        (v & 1)) {
+        uint32_t st = (bank << 7) | 0x59;
+
+        s->regs[st] = (s->regs[st] & ~7) | 4;
+        if ((s->regs[(bank << 7) | 0x52] & 0xFF) == 0x18) {
+            sstar_iford_fill(s, bank);
+        }
+    }
     if (s->miu_bist && bank == 0x1012 && reg == 0x70 && (v & 1)) {
         sstar_miu_bist(s);
     }

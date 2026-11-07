@@ -55,6 +55,7 @@ struct SstarFspState {
     uint32_t page_size, spare_size, block_pages;
     uint8_t *cache;             /* the chip's page register */
     uint8_t feat_prot, feat_conf, feat_stat;
+    uint32_t nand_page;         /* in the cache, for a continuous read */
     uint32_t col;
     /* one page or block that misbehaves, for the driver's error paths */
     uint32_t ecc_flip_page, ecc_err_page, fail_block;

@@ -18,8 +18,11 @@
  *         word 0 is the least significant.  0x28 control (bit 0 reset,
  *         bit 1 hardware key, bit 2 public key, [13:8] the key length in
  *         words less one), 0x27 bit 0 starts Z = A^E mod N, 0x29 status
- *         (bit 0 busy, bit 1 done).
- *   AES   0x50-0x7F, the AES DMA; storage only so far.
+ *         (bit 0 busy, bit 1 done, bit 3 reset done).
+ *   AES   0x50-0x7F, the AES DMA; storage only so far, but for its
+ *         software reset: 0x79 bit 15 resets the engine, which then shows
+ *         reset done in 0x7F bit 4 (Ifliegen's hal_aesdma.c waits for it
+ *         at probe).  The reset completes at once.
  *
  * The Ifado (SSC375) boot chain checks its images with SHA-256 and a
  * 2048-bit public key through these (Dahua's DHBoot, MDrv_SHA_Run and
@@ -70,6 +73,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarCryptoState, SSTAR_CRYPTO)
 #define RSA_EXP             0x27
 #define RSA_CTRL            0x28
 #define RSA_STATUS          0x29
+#define AES_CTRL            0x79
+#define AES_STATUS          0x7F
+
+#define AES_CTRL_SW_RST     (1u << 15)
+#define AES_STATUS_RST_DONE (1u << 4)
 
 #define RSA_IND32_WRITE     (1u << 1)
 #define RSA_IND32_AUTO_INC  (1u << 2)
@@ -77,6 +85,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarCryptoState, SSTAR_CRYPTO)
 #define RSA_CTRL_RST        (1u << 0)
 #define RSA_CTRL_HW_KEY     (1u << 1)
 #define RSA_STATUS_DONE     (1u << 1)
+#define RSA_STATUS_RST_DONE (1u << 3)   /* Ifliegen hal_akcipher_reset */
 
 #define RSA_RAM_WORDS       0x100
 #define RSA_E               0x00
@@ -313,6 +322,11 @@ static void sstar_crypto_reg_write(SstarCryptoState *s, int reg, uint16_t v)
 
     s->regs[reg] = v;
     switch (reg) {
+    case AES_CTRL:
+        if (v & AES_CTRL_SW_RST) {
+            s->regs[AES_STATUS] |= AES_STATUS_RST_DONE;
+        }
+        break;
     case SHA_CTRL:
         if (v & SHA_CTRL_RST) {
             s->regs[SHA_STATUS] = 0;
@@ -344,7 +358,7 @@ static void sstar_crypto_reg_write(SstarCryptoState *s, int reg, uint16_t v)
         break;
     case RSA_CTRL:
         if (v & RSA_CTRL_RST) {
-            s->regs[RSA_STATUS] = 0;
+            s->regs[RSA_STATUS] = RSA_STATUS_RST_DONE;
             s->wr_halves = s->rd_halves = 0;
         }
         break;

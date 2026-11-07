@@ -24,6 +24,12 @@ typedef struct H264Enc {
 void h264_enc_parse_headers(H264Enc *e, const uint8_t *buf, size_t len);
 
 /*
+ * A CAVLC baseline SPS and PPS for a w x h picture, cropped from whole
+ * macroblocks, as byte-stream NALs; at most 128 bytes.
+ */
+size_t h264_enc_baseline_headers(uint32_t w, uint32_t h, uint8_t *out);
+
+/*
  * Encode one picture from NV12 (y stride ys, interleaved CbCr stride cs) as
  * one I slice, an IDR if idr: a byte-stream NAL with its start code.
  * Returns the bytes it needed (more than cap means the output is

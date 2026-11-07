@@ -297,108 +297,6 @@ static void wave5_source(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
 /* One access unit into the instance's buffer; returns its bytes */
 /* ---- AVC ------------------------------------------------------------ */
 
-typedef struct BitW {
-    uint8_t *p;
-    size_t n;       /* bytes, emulation prevention included */
-    uint32_t acc;
-    int bits, zeros;
-} BitW;
-
-static void bw_byte(BitW *b, uint8_t v)
-{
-    if (b->zeros >= 2 && v <= 3) {
-        b->p[b->n++] = 3;
-        b->zeros = 0;
-    }
-    b->p[b->n++] = v;
-    b->zeros = v ? 0 : b->zeros + 1;
-}
-
-static void bw_put(BitW *b, uint32_t v, int n)
-{
-    while (n--) {
-        b->acc = b->acc << 1 | ((v >> n) & 1);
-        if (++b->bits == 8) {
-            bw_byte(b, b->acc);
-            b->acc = b->bits = 0;
-        }
-    }
-}
-
-static void bw_ue(BitW *b, uint32_t v)
-{
-    int len = 32 - clz32(v + 1);
-
-    bw_put(b, 0, len - 1);
-    bw_put(b, v + 1, len);
-}
-
-static void bw_nal(BitW *b, uint8_t head)
-{
-    static const uint8_t start[4] = { 0, 0, 0, 1 };
-
-    memcpy(b->p + b->n, start, 4);
-    b->n += 4;
-    b->p[b->n++] = head;
-    b->zeros = 0;
-}
-
-static void bw_trail(BitW *b)
-{
-    bw_put(b, 1, 1);
-    while (b->bits) {
-        bw_put(b, 0, 1);
-    }
-}
-
-/* SPS and PPS for a w x h baseline stream; 128 bytes is plenty. */
-static size_t wave5_avc_headers(uint32_t w, uint32_t h, uint8_t *out)
-{
-    BitW b = { .p = out };
-    uint32_t mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
-    uint32_t cropr = (mbw * 16 - w) / 2, cropb = (mbh * 16 - h) / 2;
-
-    bw_nal(&b, 0x67);
-    bw_put(&b, 66, 8);                  /* baseline */
-    bw_put(&b, 0xC0, 8);                /* constraint_set0, 1 */
-    bw_put(&b, 41, 8);                  /* level */
-    bw_ue(&b, 0);                       /* seq_parameter_set_id */
-    bw_ue(&b, 0);                       /* log2_max_frame_num - 4 */
-    bw_ue(&b, 2);                       /* pic_order_cnt_type */
-    bw_ue(&b, 1);                       /* max_num_ref_frames */
-    bw_put(&b, 0, 1);                   /* gaps */
-    bw_ue(&b, mbw - 1);
-    bw_ue(&b, mbh - 1);
-    bw_put(&b, 1, 1);                   /* frame_mbs_only */
-    bw_put(&b, 1, 1);                   /* direct_8x8 */
-    bw_put(&b, cropr || cropb, 1);
-    if (cropr || cropb) {
-        bw_ue(&b, 0);
-        bw_ue(&b, cropr);
-        bw_ue(&b, 0);
-        bw_ue(&b, cropb);
-    }
-    bw_put(&b, 0, 1);                   /* vui */
-    bw_trail(&b);
-
-    bw_nal(&b, 0x68);
-    bw_ue(&b, 0);                       /* pic_parameter_set_id */
-    bw_ue(&b, 0);                       /* seq_parameter_set_id */
-    bw_put(&b, 0, 1);                   /* CAVLC */
-    bw_put(&b, 0, 1);                   /* no bottom-field POC */
-    bw_ue(&b, 0);                       /* slice groups */
-    bw_ue(&b, 0);
-    bw_ue(&b, 0);
-    bw_put(&b, 0, 3);                   /* weighted prediction */
-    bw_ue(&b, 0);                       /* pic_init_qp - 26, se */
-    bw_ue(&b, 0);                       /* pic_init_qs */
-    bw_ue(&b, 0);                       /* chroma_qp_index_offset */
-    bw_put(&b, 1, 1);                   /* deblocking control present */
-    bw_put(&b, 0, 2);
-    bw_trail(&b);
-    return b.n;
-}
-
 /* One picture, the plane padded out to whole macroblocks. */
 static size_t wave5_avc_frame(SstarWave5State *s, Wave5Inst *in, bool idr,
                               uint8_t *out, size_t cap)
@@ -428,7 +326,7 @@ static size_t wave5_avc_frame(SstarWave5State *s, Wave5Inst *in, bool idr,
     }
     /* implicit headers, in front of an IDR */
     if (idr && cap > 128) {
-        hdr = wave5_avc_headers(in->width, in->height, out);
+        hdr = h264_enc_baseline_headers(in->width, in->height, out);
     }
     return hdr + h264_enc_frame(&in->h264, idr, WAVE5_QP, mbw, mbh,
                                 py, mbw * 16, pc, mbw * 16,
@@ -460,14 +358,14 @@ static size_t wave5_encode(SstarWave5State *s, Wave5Inst *in, bool headers)
     out = g_malloc(MAX(cap, 128));
     if (in->avc) {
         if (headers) {
-            n = wave5_avc_headers(in->width, in->height, out);
+            n = h264_enc_baseline_headers(in->width, in->height, out);
             h264_enc_parse_headers(&in->h264, out, n);
         } else {
             if (!in->h264.have_sps) {
                 uint8_t sets[128];
 
                 h264_enc_parse_headers(&in->h264, sets,
-                                       wave5_avc_headers(in->width,
+                                       h264_enc_baseline_headers(in->width,
                                                          in->height, sets));
             }
             n = wave5_avc_frame(s, in, idr, out, cap);

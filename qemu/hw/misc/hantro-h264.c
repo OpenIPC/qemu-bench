@@ -34,6 +34,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/host-utils.h"
 #include "hantro-h264.h"
 #include "hantro-h264-tables.h"
 
@@ -1407,3 +1408,107 @@ size_t h264_slice_ppcm_cabac(int qp, int cabac_init_idc, int mbw, int mbh,
 }
 
 #include "hantro-h264-inter.c.inc"
+
+/* The baseline SPS and PPS the SigmaStar encoder models put in front of an
+ * IDR (theirs is the firmware's, which is not run). */
+typedef struct H264HdrW {
+    uint8_t *p;
+    size_t n;       /* bytes, emulation prevention included */
+    uint32_t acc;
+    int bits, zeros;
+} H264HdrW;
+
+static void hdrw_byte(H264HdrW *b, uint8_t v)
+{
+    if (b->zeros >= 2 && v <= 3) {
+        b->p[b->n++] = 3;
+        b->zeros = 0;
+    }
+    b->p[b->n++] = v;
+    b->zeros = v ? 0 : b->zeros + 1;
+}
+
+static void hdrw_put(H264HdrW *b, uint32_t v, int n)
+{
+    while (n--) {
+        b->acc = b->acc << 1 | ((v >> n) & 1);
+        if (++b->bits == 8) {
+            hdrw_byte(b, b->acc);
+            b->acc = b->bits = 0;
+        }
+    }
+}
+
+static void hdrw_ue(H264HdrW *b, uint32_t v)
+{
+    int len = 32 - clz32(v + 1);
+
+    hdrw_put(b, 0, len - 1);
+    hdrw_put(b, v + 1, len);
+}
+
+static void hdrw_nal(H264HdrW *b, uint8_t head)
+{
+    static const uint8_t start[4] = { 0, 0, 0, 1 };
+
+    memcpy(b->p + b->n, start, 4);
+    b->n += 4;
+    b->p[b->n++] = head;
+    b->zeros = 0;
+}
+
+static void hdrw_trail(H264HdrW *b)
+{
+    hdrw_put(b, 1, 1);
+    while (b->bits) {
+        hdrw_put(b, 0, 1);
+    }
+}
+
+/* SPS and PPS for a w x h baseline stream; 128 bytes is plenty. */
+size_t h264_enc_baseline_headers(uint32_t w, uint32_t h, uint8_t *out)
+{
+    H264HdrW b = { .p = out };
+    uint32_t mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
+    uint32_t cropr = (mbw * 16 - w) / 2, cropb = (mbh * 16 - h) / 2;
+
+    hdrw_nal(&b, 0x67);
+    hdrw_put(&b, 66, 8);                  /* baseline */
+    hdrw_put(&b, 0xC0, 8);                /* constraint_set0, 1 */
+    hdrw_put(&b, 41, 8);                  /* level */
+    hdrw_ue(&b, 0);                       /* seq_parameter_set_id */
+    hdrw_ue(&b, 0);                       /* log2_max_frame_num - 4 */
+    hdrw_ue(&b, 2);                       /* pic_order_cnt_type */
+    hdrw_ue(&b, 1);                       /* max_num_ref_frames */
+    hdrw_put(&b, 0, 1);                   /* gaps */
+    hdrw_ue(&b, mbw - 1);
+    hdrw_ue(&b, mbh - 1);
+    hdrw_put(&b, 1, 1);                   /* frame_mbs_only */
+    hdrw_put(&b, 1, 1);                   /* direct_8x8 */
+    hdrw_put(&b, cropr || cropb, 1);
+    if (cropr || cropb) {
+        hdrw_ue(&b, 0);
+        hdrw_ue(&b, cropr);
+        hdrw_ue(&b, 0);
+        hdrw_ue(&b, cropb);
+    }
+    hdrw_put(&b, 0, 1);                   /* vui */
+    hdrw_trail(&b);
+
+    hdrw_nal(&b, 0x68);
+    hdrw_ue(&b, 0);                       /* pic_parameter_set_id */
+    hdrw_ue(&b, 0);                       /* seq_parameter_set_id */
+    hdrw_put(&b, 0, 1);                   /* CAVLC */
+    hdrw_put(&b, 0, 1);                   /* no bottom-field POC */
+    hdrw_ue(&b, 0);                       /* slice groups */
+    hdrw_ue(&b, 0);
+    hdrw_ue(&b, 0);
+    hdrw_put(&b, 0, 3);                   /* weighted prediction */
+    hdrw_ue(&b, 0);                       /* pic_init_qp - 26, se */
+    hdrw_ue(&b, 0);                       /* pic_init_qs */
+    hdrw_ue(&b, 0);                       /* chroma_qp_index_offset */
+    hdrw_put(&b, 1, 1);                   /* deblocking control present */
+    hdrw_put(&b, 0, 2);
+    hdrw_trail(&b);
+    return b.n;
+}
