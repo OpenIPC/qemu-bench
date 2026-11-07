@@ -1627,7 +1627,6 @@ static const HisiSoCConfig hi3516ev300_soc = {
     .vi_fp_cap_irq      = 43,              /* VI_CAP0  = SPI 43 (GIC 75) */
     .vi_fp_proc_irq     = 44,              /* VI_PROC0 = SPI 44 (GIC 76) */
     .vi_fp_vpss_irq     = 46,              /* VPSS     = SPI 46 (GIC 78) */
-    .vi_fp_vedu_irq     = 47,              /* VEDU     = SPI 47 (GIC 79) */
     /* 128 MiB on-chip DDR3L (1Gb).  Kernel gets 32 MiB, vendor mmz.ko
      * claims 96 MiB at 0x42000000 — matches the canonical EV300 layout
      * documented in OpenIPC's /usr/bin/load_hisilicon. */
@@ -5852,12 +5851,7 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->vedu_base);
         sysbus_mmio_map(busdev, 1, c->jpge_base);
-        /* Skip the VEDU IRQ wire when hisi-vi-fp also drives it —
-         * QEMU's GIC has one input level per SPI, so two devices
-         * sharing pic[N] clobber each other (last-writer-wins). */
-        if (!c->vi_fp_vedu_irq || c->vi_fp_vedu_irq != c->vedu_irq) {
-            sysbus_connect_irq(busdev, 0, pic[c->vedu_irq]);
-        }
+        sysbus_connect_irq(busdev, 0, pic[c->vedu_irq]);
         sysbus_connect_irq(busdev, 1, pic[c->jpge_irq]);
     }
 
@@ -5881,9 +5875,6 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_connect_irq(busdev, 0, pic[c->vi_fp_cap_irq]);
         sysbus_connect_irq(busdev, 1, pic[c->vi_fp_proc_irq]);
         sysbus_connect_irq(busdev, 2, pic[c->vi_fp_vpss_irq]);
-        if (c->vi_fp_vedu_irq) {
-            sysbus_connect_irq(busdev, 3, pic[c->vi_fp_vedu_irq]);
-        }
     }
 
     /* Watchdog (SP805-compatible, reuse cmsdk-apb-watchdog) */

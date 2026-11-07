@@ -101,6 +101,13 @@ jobs:
       - name: Hantro H1 H.264 encode (xm-h1)
         run: python3 qemu/tests/test-xm-h1-h264.py
 
+      # HiSilicon V4 VEDU (H.264 / H.265) and JPGE, driven the way the
+      # HiMPP driver drives them: its parameter-set packets in the stream
+      # ring, its H.265 slice header bits in the register image, its JFIF
+      # header ahead of the scan.  ffmpeg must decode every picture.
+      - name: HiSilicon VEDU + JPGE encode (hisi-vedu)
+        run: python3 qemu/tests/test-hisi-vedu.py
+
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)
@@ -309,6 +316,82 @@ jobs:
           name: ive-test-log
           path: ive-output.txt
           retention-days: 7
+
+  venc-hisilicon:
+    name: VENC user frames on ${{ matrix.soc }} (H.264, H.265, JPEG)
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [hi3516ev200, gk7205v200]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfdt1 \
+            libglib2.0-0 libpixman-1-0 libslirp0 squashfs-tools cpio
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      # The release's libmpi.so / libgk_api.so are uClibc builds the guest
+      # program links against with OpenIPC's own musl toolchain.
+      - name: OpenIPC toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: venc-toolchain
+          key: toolchain-hisilicon-hi3516ev200-v1
+
+      - name: OpenIPC toolchain
+        run: |
+          if [ ! -x venc-toolchain/bin/arm-openipc-linux-musleabi-gcc ]; then
+            rm -rf venc-toolchain && mkdir venc-toolchain
+            curl -fsSL --retry 3 https://github.com/OpenIPC/firmware/releases/download/toolchain/toolchain.hisilicon-hi3516ev200.tgz |
+              tar xz -C venc-toolchain --strip-components=1
+          fi
+          echo "CC=$PWD/venc-toolchain/bin/arm-openipc-linux-musleabi-gcc" >> "$GITHUB_ENV"
+
+      - name: ffmpeg cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-btbn-lgpl-v1
+
+      - name: ffmpeg
+        timeout-minutes: 20
+        run: |
+          if ! ffmpeg-static/ffmpeg -version >/dev/null 2>&1; then
+            rm -rf ffmpeg-static && mkdir ffmpeg-static
+            curl -fsSL --retry 3 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz |
+              tar xJ -C ffmpeg-static --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' || true
+          fi
+          if ffmpeg-static/ffmpeg -version >/dev/null 2>&1 &&
+             ffmpeg-static/ffprobe -version >/dev/null 2>&1; then
+            echo "$PWD/ffmpeg-static" >> "$GITHUB_PATH"
+          else
+            rm -rf ffmpeg-static
+            sudo apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=5 -o Acquire::http::Timeout=30 ffmpeg
+          fi
+
+      # The vendor's VENC stack (OpenIPC release modules and MPI library)
+      # encodes test-pattern frames through hisi-vedu; every stream must
+      # decode and carry the frames' counter in order.
+      - name: VENC_SendFrame through VEDU and JPGE
+        timeout-minutes: 15
+        run: |
+          bash qemu-boot/test-hisi-venc.sh --soc ${{ matrix.soc }} \
+            --qemu ./qemu-src/build/qemu-system-arm --frames 10 \
+            --work "$RUNNER_TEMP/venc"
 
   sofia-isp:
     name: Sofia ISP regression (hi3516ev200, sc2315e)

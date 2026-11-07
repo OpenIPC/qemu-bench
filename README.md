@@ -691,13 +691,14 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **DMA (PL080)** | yes | yes | — | yes | — | — | — | — |
 | **MIPI RX** | — | — | stub | — | yes | stub | yes | yes |
 | **RTC** | — | — | yes | — | yes | yes | yes | yes |
-| **VEDU/JPGE** | — | — | stub | — | yes | stub | yes | yes |
+| **VEDU/JPGE** | — | — | stub | — | yes | stub | **encodes** | yes |
 | **Watchdog** | yes | yes | yes | yes | yes | yes | yes | yes |
 | **Sensor I2C** | — | — | — | — | — | — | yes | — |
 | **IVE (18 ops)** | — | — | — | — | — | — | **yes** | — |
 | **NPU** | — | — | — | — | — | — | — | stub |
 
-Notes: `stub` = regbank stub only. V5 (×3) = CV608/CV610/CV613 (same die, different feature
+Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
+the vendor VENC stack (`docs/hisilicon-venc.md`). V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
 
@@ -716,7 +717,7 @@ qemu/
 ├── hw/misc/hisi-regbank.c       # Generic RAM-backed register bank
 ├── hw/misc/hisi-ive.c           # IVE: 18 ops (SAD, CCL, Sub, Thresh, Erode...)
 ├── hw/misc/hisi-fastboot.c      # Boot ROM fastboot serial protocol (defib compat)
-├── hw/misc/hisi-vedu.c          # Video encoder stub (VEDU + JPGE)
+├── hw/misc/hisi-vedu.c          # V4 video encoder: VEDU (H.264/H.265) + JPGE
 ├── hw/misc/hisi-mipi-rx.c       # MIPI RX controller stub
 ├── hw/misc/hisi-rtc.c           # SPI-bridge RTC device
 ├── hw/net/hisi-femac.c          # Fast Ethernet MAC + MDIO PHY stub

@@ -350,7 +350,6 @@ typedef struct HisiSoCConfig {
     int             vi_fp_cap_irq;     /* GIC SPI for VI_CAP0 */
     int             vi_fp_proc_irq;    /* GIC SPI for VI_PROC0 */
     int             vi_fp_vpss_irq;    /* GIC SPI for VPSS */
-    int             vi_fp_vedu_irq;    /* GIC SPI for VEDU */
 
     /* CPU soft-reset register offset in CRG (for SMP bringup) */
     uint32_t        cpu_srst_offset; /* 0 = disabled, e.g. 0x78 for CV500 */

@@ -5,19 +5,21 @@
  *
  * On real silicon the MIPI receiver delivers a CSI-2 frame to a VI capture
  * buffer in DDR, and the VI hardware fires the VI_CAP IRQ (followed by
- * VI_PROC then VPSS then VEDU once the frame walks through the pipeline).
+ * VI_PROC then VPSS, and VEDU once the frame walks through the pipeline).
  * Without any of that hardware on QEMU the vendor VENC blob blocks forever
  * in its "wait for next encoded frame" loop, hence Majestic's repeating
  *   "Timeout from venc channel 0"
  * messages.
  *
- * The four pipeline IRQ lines are fired on a periodic timer matching the
+ * The three VI / VPSS IRQ lines are fired on a periodic timer matching the
  * configured sensor framerate (default 5 fps).  Per-line delivery is
  * gated by the QOM property `autoclear_mask`:
  *   bit 0 = VI_CAP    (always safe — handler validates with status read)
  *   bit 1 = VI_PROC
  *   bit 2 = VPSS      (vendor handler NULL-derefs without group state)
- *   bit 3 = VEDU
+ *
+ * VEDU is not among them: hisi-vedu encodes the pictures the driver
+ * starts and raises its own end-of-picture interrupt.
  *
  * Each enabled line uses a small MMIO subregion overlapping the IRQ
  * status register the vendor handler reads — a guest read returns the
@@ -28,7 +30,7 @@
  *
  * Override at runtime: `-global hisi-vi-fp.autoclear_mask=0xN`.
  * Default 0x1 (VI_CAP only) is the conservative baseline — enabling
- * VI_PROC / VPSS / VEDU silently reboots the kernel because their
+ * VI_PROC / VPSS silently reboots the kernel because their
  * vendor handlers expect channel state allocated lazily on first
  * frame, which we don't model.
  *
@@ -59,7 +61,6 @@ enum {
     VI_FP_IRQ_CAP,
     VI_FP_IRQ_PROC,
     VI_FP_IRQ_VPSS,
-    VI_FP_IRQ_VEDU,
     VI_FP_NUM_IRQS,
 };
 
@@ -88,7 +89,6 @@ typedef struct AutoClearReg {
 
 /* Status registers we overlay.  Reverse-engineered from
  *   /home/john-1/git/openhisilicon/kernel/{vi,vpss}/{vi,vpss}.o
- *   /home/john-1/git/HI3516CV500-SDK/sdk/drivers/hi3516cv500_vedu/
  *
  *   VI_CAP0+0xF0 : VI_HAL_GetCapIntStatus / VI_DRV_IsCapValidInt
  *                  validates (status & 0xF00) != 0; without this the
@@ -97,8 +97,7 @@ typedef struct AutoClearReg {
  *                  validates status != 0; without this VI_COMM_ProcIrqRoute
  *                  panics at vi.o:1993.  Real-cam capture: 0x06732001.
  *   VPSS+0x314   : VPSS_HAL_GetIntStatus reads masked IRQ status.
- *                  Bit 0 = EOF (end of frame).
- *   VEDU+0x3000  : VEDU_HAL_ReadEndOfPicInt reads bit 0 of status. */
+ *                  Bit 0 = EOF (end of frame). */
 static const struct {
     hwaddr      addr;
     uint32_t    poke_value;
@@ -108,7 +107,6 @@ static const struct {
     [VI_FP_IRQ_CAP]  = { 0x110000F0, 0x00000F00, VI_FP_IRQ_CAP,  "VI_CAP0+0xF0"   },
     [VI_FP_IRQ_PROC] = { 0x11200310, 0x06732001, VI_FP_IRQ_PROC, "VI_PROC0+0x310" },
     [VI_FP_IRQ_VPSS] = { 0x11400314, 0x00000001, VI_FP_IRQ_VPSS, "VPSS+0x314"     },
-    [VI_FP_IRQ_VEDU] = { 0x11413000, 0x00000001, VI_FP_IRQ_VEDU, "VEDU+0x3000"    },
 };
 
 struct HisiViFpState {
@@ -243,7 +241,7 @@ static void hisi_vi_fp_tick(void *opaque)
 
     /* Only fire lines selected by the mask.  Bits OUT of the mask are
      * NOT delivered to the GIC at all — empirically, invoking the
-     * VPSS / VEDU vendor handlers without their channel state silently
+     * VPSS vendor handler without its channel state silently
      * reboots the kernel.  Default 0x1 = VI_CAP only matches what
      * worked in PR #58 plus per-line auto-clear (instead of the
      * fallback deassert timer that PR used). */
@@ -273,7 +271,7 @@ static void hisi_vi_fp_realize(DeviceState *dev, Error **errp)
     s->frame_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                   hisi_vi_fp_tick, s);
 
-    /* Map per-line auto-clear overlays for ALL four lines (mask is
+    /* Map per-line auto-clear overlays for all three lines (mask is
      * checked at tick/read time, not realize time, so users can flip
      * it at runtime via QOM if needed). */
     for (i = 0; i < VI_FP_NUM_IRQS; i++) {
@@ -320,7 +318,7 @@ static void hisi_vi_fp_reset(DeviceState *dev)
 
 static const Property hisi_vi_fp_properties[] = {
     DEFINE_PROP_UINT32("fps", HisiViFpState, fps, 5),
-    /* Bit 0 = VI_CAP, 1 = VI_PROC, 2 = VPSS, 3 = VEDU.
+    /* Bit 0 = VI_CAP, 1 = VI_PROC, 2 = VPSS.
      * Default 0x1 — only VI_CAP, the only line whose vendor handler
      * is empirically safe to invoke without channel state set up. */
     DEFINE_PROP_UINT32("autoclear_mask", HisiViFpState, autoclear_mask, 0x1),
