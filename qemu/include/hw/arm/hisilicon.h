@@ -294,6 +294,11 @@ typedef struct HisiSoCConfig {
     int             xhci_irq;
     int             xhci_slots;     /* 0 = default 4 */
     int             xhci_intrs;     /* 0 = default 1 */
+    /* The xHCI sits in a DWC3 core the kernel probes with "snps,dwc3"
+     * (dwc3/core.c), not as a bare generic-xhci: it reads the core's ID
+     * and hardware parameters past the xHCI window and soft-resets it
+     * first.  The "hisi-usb3" regbank over the window then answers them. */
+    bool            xhci_dwc3_core;
 
     /* HiSilicon HIL2V200 L2 cache controller — used by Hi3520D family
      * (CONFIG_CACHE_HIL2V200).  Vendor 3.0.x driver hangs in early init
