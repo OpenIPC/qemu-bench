@@ -92,6 +92,16 @@ struct AtbmState {
     uint8_t sta[6];             /* the camera's address, once associated */
     uint8_t bssid[6];
     uint16_t ap_seq;
+    bool ht;                    /* HT + WMM AP: QoS data, RX Block Ack */
+    bool addba;                 /* with ht: open the RX Block Ack sessions */
+    uint8_t rx_tids;            /* TIDs the frames to the station spread over */
+    uint32_t rx_drop;           /* every Nth frame to the station is lost */
+    uint32_t rx_count;
+    uint16_t tid_seq[8];
+    bool ba_sent[8];
+    uint32_t tx_rate;           /* kbit/s the air takes the station's frames */
+    int64_t air_busy;           /* QEMU_CLOCK_VIRTUAL ns: the air is free */
+    QEMUTimer *air_timer;
     uint16_t pid;
     USBDesc desc;               /* atbm_desc with the product ID */
     uint8_t chip_version;
@@ -201,8 +211,12 @@ static void atbm_send(AtbmState *s, uint16_t id, const void *body, size_t n)
  * packetID, maxTxRate, queueId, more, flags, reserved, expireTime,
  * htTxParameters, then the 802.11 frame */
 #define TX_PACKET_ID        12
+#define TX_FLAGS            19
 #define TX_HT_PARAMS        28
 #define TX_FRAME            32
+/* in flags: the frame starts two bytes later, for its payload's alignment
+ * (a QoS data header is 26 bytes) */
+#define WSM_TX_2BYTES_SHIFT 0x80
 
 /* firmwareCap: data frames are not confirmed one by one (the driver is
  * built with CONFIG_TX_NO_CONFIRM and refuses an LMAC without it) */
@@ -303,6 +317,37 @@ static uint16_t ap_capability(AtbmState *s)
     return 0x0401 | atbm_wpa_capability(&s->wpa);  /* ESS, short slot */
 }
 
+/* HT capabilities, HT operation and the WMM parameter element: without
+ * them mac80211 neither sends QoS data nor accepts an ADDBA request */
+static size_t ap_ht_ies(AtbmState *s, uint8_t *f)
+{
+    static const uint8_t wmm[] = {
+        221, 24, 0x00, 0x50, 0xf2, 2, 1, 1, 0x80, 0,
+        0x03, 0xa4, 0, 0,   0x27, 0xa4, 0, 0,
+        0x42, 0x43, 0x5e, 0,   0x62, 0x32, 0x2f, 0,
+    };
+    size_t n = 0;
+
+    if (!s->ht) {
+        return 0;
+    }
+    f[n++] = 45;                        /* HT capabilities */
+    f[n++] = 26;
+    memset(f + n, 0, 26);
+    stw_le_p(f + n, 0x000c);            /* SM power save disabled, 20 MHz */
+    f[n + 2] = 0x17;                    /* A-MPDU 64 kB, 8 us spacing */
+    f[n + 3] = 0xff;                    /* MCS 0-7 */
+    n += 26;
+    f[n++] = 61;                        /* HT operation */
+    f[n++] = 22;
+    memset(f + n, 0, 22);
+    f[n] = s->channel;
+    f[n + 4] = 0xff;                    /* basic MCS 0-7 */
+    n += 22;
+    memcpy(f + n, wmm, sizeof(wmm));
+    return n + sizeof(wmm);
+}
+
 /* WPA2-PSK (atbm-wpa.c): the authenticator's frames to the station */
 static void wpa_rx(void *opaque, const uint8_t *f, size_t n, uint32_t flags)
 {
@@ -345,6 +390,7 @@ static void ap_beacon(AtbmState *s, const uint8_t *da, uint8_t if_id)
     f[n++] = 1;
     f[n++] = 0;
     n += atbm_wpa_ie(&s->wpa, f + n);
+    n += ap_ht_ies(s, f + n);
     if (!da) {
         static const uint8_t tim[] = { 5, 4, 0, 1, 0, 0 };
 
@@ -367,7 +413,7 @@ static void ap_auth(AtbmState *s, const uint8_t *sta, uint8_t if_id)
 
 static void ap_assoc(AtbmState *s, const uint8_t *sta, bool re, uint8_t if_id)
 {
-    uint8_t f[64];
+    uint8_t f[192];
     size_t n = ap_hdr(s, f, re ? FC_REASSOC_RESP : FC_ASSOC_RESP, sta);
 
     stw_le_p(f + n, ap_capability(s));  /* capabilities */
@@ -375,7 +421,9 @@ static void ap_assoc(AtbmState *s, const uint8_t *sta, bool re, uint8_t if_id)
     stw_le_p(f + n + 4, 0xc001);        /* AID 1 */
     n += 6;
     n += ap_rates(f + n);
+    n += ap_ht_ies(s, f + n);
     memcpy(s->sta, sta, 6);
+    memset(s->ba_sent, 0, sizeof(s->ba_sent));
     s->associated = true;
     s->sta_if = if_id;
     if (s->trace) {
@@ -449,6 +497,15 @@ static void ap_tx(AtbmState *s, const uint8_t *f, size_t n, uint8_t if_id)
         atbm_wpa_reset(&s->wpa);
         break;
     case FC_ACTION:
+        if (n >= 24 + 3 && f[24] == 3 && s->trace) {
+            /* Block Ack: 1 the ADDBA response (status at +3), 2 DELBA */
+            if (f[25] == 1 && n >= 24 + 9) {
+                qemu_log("atbm: ADDBA response, tid %u status %u\n",
+                         (lduw_le_p(f + 29) >> 2) & 0xf, lduw_le_p(f + 27));
+            } else if (f[25] == 2) {
+                qemu_log("atbm: DELBA from the station\n");
+            }
+        }
         atbm_wpa_action_from_sta(&s->wpa, f, n);
         break;
     case FC_DATA:
@@ -456,6 +513,28 @@ static void ap_tx(AtbmState *s, const uint8_t *f, size_t n, uint8_t if_id)
         ap_data_from_sta(s, f, n);
         break;
     }
+}
+
+/* an ADDBA request: the AP opens an RX Block Ack session on tid, so the
+ * station's mac80211 reorders that TID's frames in its reorder buffer */
+static void ap_addba(AtbmState *s, uint8_t tid)
+{
+    uint8_t f[40];
+    size_t n = ap_hdr(s, f, FC_ACTION, s->sta);
+
+    f[n++] = 3;                         /* Block Ack */
+    f[n++] = 0;                         /* ADDBA request */
+    f[n++] = tid + 1;                   /* dialog token */
+    stw_le_p(f + n, 64 << 6 | tid << 2 | 1 << 1);   /* immediate, 64 */
+    stw_le_p(f + n + 2, 0);             /* no timeout */
+    stw_le_p(f + n + 4, s->tid_seq[tid] << 4);
+    n += 6;
+    s->ba_sent[tid] = true;
+    if (s->trace) {
+        qemu_log("atbm: ADDBA request, tid %u ssn %u\n", tid,
+                 s->tid_seq[tid]);
+    }
+    atbm_rx(s, f, n, 0, s->sta_if);
 }
 
 /* the netdev's frames, to the camera from the AP */
@@ -472,7 +551,7 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
     AtbmState *s = qemu_get_nic_opaque(nc);
     /* the 802.11 header, the CCMP header, LLC/SNAP, then the frame from
      * its type on, then the MIC room */
-    uint8_t f[24 + 8 + 6 + 2 + 2048 + ATBM_WPA_TRAILER_MAX];
+    uint8_t f[26 + 8 + 6 + 2 + 2048 + ATBM_WPA_TRAILER_MAX];
     const bool group = buf[0] & 1;
     uint32_t flags = group ? 1u << 9 : 0;
     size_t n = 24, mic;
@@ -485,17 +564,40 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
                  "%02x%02x%s\n", size, buf[0], buf[1], buf[2], buf[3], buf[4],
                  buf[5], buf[12], buf[13], s->associated ? "" : " (dropped)");
     }
-    if (!s->associated || 24 + 8 + 8 + size - 12 + ATBM_WPA_TRAILER_MAX > sizeof(f) ||
+    if (!s->associated || 26 + 8 + 8 + size - 12 + ATBM_WPA_TRAILER_MAX > sizeof(f) ||
         (!group && memcmp(buf, s->sta, 6)) || !atbm_wpa_port_open(&s->wpa)) {
         return size;
     }
-    memset(f, 0, 24);
+    memset(f, 0, 26);
     f[0] = FC_DATA;
     f[1] = 0x02;                        /* FromDS */
     memcpy(f + 4, buf, 6);              /* DA */
     memcpy(f + 10, s->bssid, 6);
     memcpy(f + 16, buf + 6, 6);         /* SA */
-    stw_le_p(f + 22, s->ap_seq++ << 4);
+    if (s->ht && !group) {
+        uint8_t tid = s->rx_count % MAX(s->rx_tids, 1);
+
+        if (s->addba && !s->ba_sent[tid]) {
+            ap_addba(s, tid);
+        }
+        f[0] = FC_QOS_DATA;
+        f[24] = tid;                    /* QoS control */
+        n = 26;
+        stw_le_p(f + 22, s->tid_seq[tid] << 4);
+        s->tid_seq[tid] = (s->tid_seq[tid] + 1) & 0xfff;
+        if (s->rx_drop && ++s->rx_count % s->rx_drop == 0) {
+            if (s->trace) {
+                qemu_log("atbm: lost to the station: tid %u seq %u\n", tid,
+                         (s->tid_seq[tid] - 1) & 0xfff);
+            }
+            return size;                /* a hole in the reorder window */
+        }
+        if (!s->rx_drop) {
+            s->rx_count++;
+        }
+    } else {
+        stw_le_p(f + 22, s->ap_seq++ << 4);
+    }
     mic = atbm_wpa_to_sta(&s->wpa, group, f + n, &flags);
     if (mic) {
         f[1] |= 0x40;                   /* Protected */
@@ -563,10 +665,12 @@ static void atbm_wsm_out(AtbmState *s, const uint8_t *d, size_t n)
     case WSM_FIRMWARE_CHECK:
         break;
     case WSM_TX:
-        if (len + TX_HDR > TX_FRAME) {
+        if (len + TX_HDR > TX_FRAME + 2) {
             const uint8_t *w = d - TX_HDR;
+            const size_t fo = TX_FRAME +
+                              (w[TX_FLAGS] & WSM_TX_2BYTES_SHIFT ? 2 : 0);
 
-            ap_tx(s, w + TX_FRAME, len + TX_HDR - TX_FRAME, (id >> 6) & 0xf);
+            ap_tx(s, w + fo, len + TX_HDR - fo, (id >> 6) & 0xf);
             if (ldl_le_p(w + TX_HT_PARAMS) & WSM_NEED_TX_CONFIRM) {
                 uint8_t b[4 + 4 + 4 + 4 + 4] = { 0 };
 
@@ -724,12 +828,34 @@ static void atbm_handle_data(USBDevice *dev, USBPacket *p)
         p->status = USB_RET_NAK;
         break;
     case USB_TOKEN_OUT: {
-        g_autofree uint8_t *buf = g_malloc(p->iov.size);
+        g_autofree uint8_t *buf = NULL;
+        uint8_t hdr[TX_HDR];
 
         if (p->ep->nr != EP_OUT) {
             p->status = USB_RET_STALL;
             return;
         }
+        /*
+         * tx-rate: a transmission waits for the air, as on a link far from
+         * its access point. NAK it, untaken, until the air is free (the
+         * timer wakes the endpoint), and the backlog builds in the driver.
+         */
+        if (s->tx_rate && p->iov.size >= TX_HDR &&
+            iov_to_buf(p->iov.iov, p->iov.niov, 0, hdr, TX_HDR) == TX_HDR &&
+            (lduw_le_p(hdr + 10) & 0x3f) == WSM_TX) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+            if (now < s->air_busy) {
+                if (!timer_pending(s->air_timer)) {
+                    timer_mod(s->air_timer, s->air_busy);
+                }
+                p->status = USB_RET_NAK;
+                return;
+            }
+            s->air_busy = now + (int64_t)p->iov.size * 8 * 1000000 /
+                                s->tx_rate;
+        }
+        buf = g_malloc(p->iov.size);
         usb_packet_copy(p, buf, p->iov.size);
         atbm_wsm_out(s, buf, p->iov.size);
         break;
@@ -738,6 +864,13 @@ static void atbm_handle_data(USBDevice *dev, USBPacket *p)
         p->status = USB_RET_STALL;
         break;
     }
+}
+
+static void atbm_air_free(void *opaque)
+{
+    AtbmState *s = opaque;
+
+    usb_wakeup(usb_ep_get(&s->dev, USB_TOKEN_OUT, EP_OUT), 0);
 }
 
 static void atbm_flush(AtbmState *s)
@@ -846,6 +979,7 @@ static void atbm_realize(USBDevice *dev, Error **errp)
     QSIMPLEQ_INIT(&s->rxq);
     s->start_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, atbm_startup, s);
     s->scan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, atbm_scan_done, s);
+    s->air_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, atbm_air_free, s);
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     /* the AP's BSSID: the NIC's address, locally administered */
     memcpy(s->bssid, s->conf.macaddr.a, 6);
@@ -867,6 +1001,7 @@ static void atbm_unrealize(USBDevice *dev)
 
     timer_free(s->start_timer);
     timer_free(s->scan_timer);
+    timer_free(s->air_timer);
     atbm_wpa_free(&s->wpa);
     qemu_del_nic(s->nic);
     atbm_flush(s);
@@ -885,6 +1020,15 @@ static const Property atbm_props[] = {
     DEFINE_PROP_UINT8("chip-version", AtbmState, chip_version, CHIP_ARES_B),
     DEFINE_PROP_UINT8("channel", AtbmState, channel, 6),
     DEFINE_PROP_BOOL("trace", AtbmState, trace, false),
+    /* A real link, which the defaults leave out: an HT + WMM access point
+     * that sends QoS data and opens RX Block Ack sessions, over rx-tids
+     * TIDs; every rx-drop'th frame to the station lost; the station's
+     * frames taking the air at tx-rate kbit/s. */
+    DEFINE_PROP_BOOL("ht", AtbmState, ht, false),
+    DEFINE_PROP_BOOL("addba", AtbmState, addba, true),
+    DEFINE_PROP_UINT8("rx-tids", AtbmState, rx_tids, 1),
+    DEFINE_PROP_UINT32("rx-drop", AtbmState, rx_drop, 0),
+    DEFINE_PROP_UINT32("tx-rate", AtbmState, tx_rate, 0),
 };
 
 static bool atbm_get_selftest(Object *obj, Error **errp)
