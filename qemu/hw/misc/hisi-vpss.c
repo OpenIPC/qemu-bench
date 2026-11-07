@@ -214,6 +214,11 @@ static void vpss_load_nodes(HisiVpssState *s)
         }
         a = node[VPSS_PNEXT / 4];
     }
+    for (c = 0; c < VPSS_CHN; c++) {
+        if (s->node_out[c].cmp) {
+            s->node_out[c].stride = s->node_out[c].w;   /* the stand-in's */
+        }
+    }
 }
 
 static void vpss_frame(void *opaque)

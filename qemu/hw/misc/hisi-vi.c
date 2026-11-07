@@ -36,8 +36,9 @@
  * DDR; the driver then starts the pipe on the frame (VI_PROC 0x300), VPSS
  * takes its output (the pulse goes out then) and the job's end comes on
  * the pipe's interrupt a quarter frame later.  The first start switches
- * the model to offline; before it, the pipe's per-frame interrupt finds no
- * job and is harmless (VI_COMM_VIOffLineVPSSOffLineIrqRoute).  Nothing in VI's own
+ * the model to offline (until the write channel is disabled, the pipe's
+ * stop); before it, the pipe's per-frame interrupt finds no job and is
+ * harmless (VI_COMM_VIOffLineVPSSOffLineIrqRoute).  Nothing in VI's own
  * registers says so early enough or late enough: its interrupt mask is
  * set in full when the module loads, and an interrupt for a pipe that is
  * not there (any more) dereferences a NULL context in the driver.
@@ -141,6 +142,9 @@ static void vi_proc_done(void *opaque)
 {
     HisiViState *s = opaque;
 
+    if (!vi_running(s)) {
+        return;                     /* the pipe was stopped meanwhile */
+    }
     s->proc[PROC_INT / 4] |= PROC_INT_FSTART | PROC_INT_FEND;
     vi_update(s);
 }
@@ -181,9 +185,14 @@ static void vi_cap_write(void *opaque, hwaddr offset, uint64_t val,
     } else {
         s->cap[offset / 4] = val;
     }
-    if (offset == CAP_WCH_CTRL(0) && vi_running(s) &&
-        !timer_pending(s->timer)) {
-        vi_arm(s);                  /* capture into DDR enabled */
+    if (offset == CAP_WCH_CTRL(0)) {
+        if (!(val & (1u << 31))) {
+            /* the pipe stopped: whatever it is rebuilt as starts online */
+            s->offline = false;
+            timer_del(s->proc_timer);
+        } else if (vi_running(s) && !timer_pending(s->timer)) {
+            vi_arm(s);              /* capture into DDR enabled */
+        }
     }
     vi_update(s);
 }

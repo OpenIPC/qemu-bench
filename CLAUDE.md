@@ -85,6 +85,7 @@ bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
 python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpeg-checked
+python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wide sensors)
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)

@@ -108,6 +108,12 @@ jobs:
       - name: HiSilicon VEDU + JPGE encode (hisi-vedu)
         run: python3 qemu/tests/test-hisi-vedu.py
 
+      # VI offline into node-driven VPSS (a sensor wider than 2304): both
+      # strips of a picture painted, linear and compressed; no pipe
+      # interrupt after a stop; online again after an offline run.
+      - name: HiSilicon VI offline + VPSS node list (hisi-vi, hisi-vpss)
+        run: python3 qemu/tests/test-hisi-vpss.py
+
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)
