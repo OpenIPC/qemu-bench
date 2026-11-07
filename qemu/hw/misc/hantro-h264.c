@@ -230,6 +230,14 @@ static void bw_se(BitWriter *w, int32_t v)
     bw_ue(w, v <= 0 ? -2 * v : 2 * v - 1);
 }
 
+static void bw_rbsp_trailing(BitWriter *w)
+{
+    bw_bits(w, 1, 1);                   /* rbsp_stop_one_bit */
+    while (w->bits) {
+        bw_bits(w, 0, 1);              /* byte-align with zeros */
+    }
+}
+
 /* ---- CABAC (after x264) ----------------------------------------------- */
 
 typedef struct Cabac {
@@ -969,6 +977,79 @@ static size_t nal_wrap(uint8_t *out, size_t cap, int ref_idc, int type,
     }
 #undef PUT
     return o;
+}
+
+void h264_enc_headers(H264Enc *e, GByteArray *out, int profile, int level,
+                      int w_px, int h_px, int qp)
+{
+    uint8_t rbsp[64], nal[80];
+    BitWriter w;
+    size_t n;
+    const int mbw = (w_px + 15) / 16, mbh = (h_px + 15) / 16;
+    /* 4:2:0 frame: crop units are 2 luma samples both ways */
+    const int crop_r = (mbw * 16 - w_px) / 2, crop_b = (mbh * 16 - h_px) / 2;
+
+    /* seq_parameter_set_rbsp() -- Baseline, no VUI */
+    memset(&w, 0, sizeof w); w.p = rbsp; w.cap = sizeof rbsp;
+    bw_bits(&w, profile, 8);
+    bw_bits(&w, 0, 8);                 /* constraint_set flags + reserved */
+    bw_bits(&w, level, 8);
+    bw_ue(&w, 0);                      /* seq_parameter_set_id */
+    bw_ue(&w, 0);                      /* log2_max_frame_num_minus4 (->4) */
+    bw_ue(&w, 2);                      /* pic_order_cnt_type = 2 (no POC) */
+    bw_ue(&w, 1);                      /* max_num_ref_frames */
+    bw_bits(&w, 0, 1);                 /* gaps_in_frame_num_value_allowed */
+    bw_ue(&w, mbw - 1);                /* pic_width_in_mbs_minus1 */
+    bw_ue(&w, mbh - 1);                /* pic_height_in_map_units_minus1 */
+    bw_bits(&w, 1, 1);                 /* frame_mbs_only_flag */
+    bw_bits(&w, 0, 1);                 /* direct_8x8_inference_flag */
+    bw_bits(&w, crop_r || crop_b, 1);  /* frame_cropping_flag */
+    if (crop_r || crop_b) {
+        bw_ue(&w, 0);                  /* crop left */
+        bw_ue(&w, crop_r);             /* crop right */
+        bw_ue(&w, 0);                  /* crop top */
+        bw_ue(&w, crop_b);             /* crop bottom */
+    }
+    bw_bits(&w, 0, 1);                 /* vui_parameters_present_flag */
+    bw_rbsp_trailing(&w);
+    n = nal_wrap(nal, sizeof nal, 3, 7, rbsp, w.n);
+    g_byte_array_append(out, nal, n);
+
+    /* pic_parameter_set_rbsp() */
+    memset(&w, 0, sizeof w); w.p = rbsp; w.cap = sizeof rbsp;
+    bw_ue(&w, 0);                      /* pic_parameter_set_id */
+    bw_ue(&w, 0);                      /* seq_parameter_set_id */
+    bw_bits(&w, 0, 1);                 /* entropy_coding_mode_flag (CAVLC) */
+    bw_bits(&w, 0, 1);                 /* bottom_field_pic_order_present */
+    bw_ue(&w, 0);                      /* num_slice_groups_minus1 */
+    bw_ue(&w, 0);                      /* num_ref_idx_l0_default_active_minus1 */
+    bw_ue(&w, 0);                      /* num_ref_idx_l1_default_active_minus1 */
+    bw_bits(&w, 0, 1);                 /* weighted_pred_flag */
+    bw_bits(&w, 0, 2);                 /* weighted_bipred_idc */
+    bw_se(&w, qp - 26);                /* pic_init_qp_minus26 */
+    bw_se(&w, 0);                      /* pic_init_qs_minus26 */
+    bw_se(&w, 0);                      /* chroma_qp_index_offset */
+    bw_bits(&w, 1, 1);                 /* deblocking_filter_control_present */
+    bw_bits(&w, 0, 1);                 /* constrained_intra_pred_flag */
+    bw_bits(&w, 0, 1);                 /* redundant_pic_cnt_present_flag */
+    bw_rbsp_trailing(&w);
+    n = nal_wrap(nal, sizeof nal, 3, 8, rbsp, w.n);
+    g_byte_array_append(out, nal, n);
+
+    /* Make the encoder state consistent with what we just wrote. */
+    e->have_sps = e->have_pps = true;
+    e->unsupported = false;
+    e->log2_max_frame_num = 4;
+    e->poc_type = 2;
+    e->log2_max_poc_lsb = 4;
+    e->pps_id = 0;
+    e->pic_init_qp = qp;
+    e->chroma_qp_offset = 0;
+    e->cabac = false;
+    e->bottom_field_poc_present = false;
+    e->deblocking_control = true;
+    e->redundant_pic_cnt_present = false;
+    e->frame_num = e->poc = e->idr_pic_id = 0;
 }
 
 size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,

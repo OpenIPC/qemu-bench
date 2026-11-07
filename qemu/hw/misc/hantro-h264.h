@@ -24,6 +24,16 @@ typedef struct H264Enc {
 void h264_enc_parse_headers(H264Enc *e, const uint8_t *buf, size_t len);
 
 /*
+ * Write a Baseline SPS and PPS (byte-stream NALs) for an all-intra CAVLC
+ * stream showing a w_px x h_px picture at pic_init_qp (the SPS crops the
+ * macroblock padding away), and set *e so that the slices h264_enc_frame()
+ * then produces are consistent with them.  For encoder models that generate
+ * the stream themselves rather than copying a guest library's headers.
+ */
+void h264_enc_headers(H264Enc *e, GByteArray *out, int profile, int level,
+                      int w_px, int h_px, int qp);
+
+/*
  * Encode one picture from NV12 (y stride ys, interleaved CbCr stride cs) as
  * one I slice, an IDR if idr: a byte-stream NAL with its start code.
  * Returns the bytes it needed (more than cap means the output is
