@@ -42,7 +42,8 @@
  *
  * Every other word is RAM-backed.  Read from the vendor modules (no public
  * source).  The pictures are generated: colour bars, the channel's number
- * and a bar that moves a step a frame, a camera on every channel.
+ * and a bar that moves a step a frame (20 s moving, 20 s still), a
+ * camera on every channel.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -85,7 +86,7 @@ struct XmDvrViState {
     Object *ahd;                /* layout 1: the AHD receiver feeding it */
     uint32_t vports;            /* its port on lane A [3:0], B [7:4] */
     XmViLatch latch[VI_MAX_CHN];
-    uint64_t frame;
+    uint64_t frame, bar;
     uint8_t *pic;               /* one generated picture, re-used per channel */
     uint32_t pic_w, pic_h;
     int pic_chn;
@@ -218,9 +219,12 @@ static void xm_dvr_vi_store(XmDvrViState *s, int c, XmViLatch *l)
                         s->pic, w * h);
     address_space_write(&address_space_memory, l->c, MEMTXATTRS_UNSPECIFIED,
                         s->pic + w * h, w * h / 2);
-    /* a white bar sweeping down, so motion is visible */
-    bar = (s->frame * 8) % (h - h / 32);
-    for (j = bar; j < bar + h / 32; j++) {
+    /* a white bar sweeping down, so motion is visible: an eighth of the
+     * picture tall, as the XM8521DV200 Sofia's software detector (on the
+     * 256x144 output) only counts objects 14 lines tall; it stops while
+     * the test cameras are still (xm_dvr_moving) */
+    bar = (s->bar * 8) % (h - h / 8);
+    for (j = bar; j < bar + h / 8; j++) {
         static uint8_t white[VI_MAX_W];
 
         if (!white[0]) {
@@ -228,6 +232,12 @@ static void xm_dvr_vi_store(XmDvrViState *s, int c, XmViLatch *l)
         }
         address_space_write(&address_space_memory, l->y + (hwaddr)j * w,
                             MEMTXATTRS_UNSPECIFIED, white, w);
+    }
+    /* v100: the channel's covers, 0x112000 + engine * 0x40000 + output *
+     * 0x4000 (the status block's page before) */
+    if (s->layout) {
+        xm_dvr_cover(&R(0x112000 + (c & 3) * 0x40000 + (c >> 2) * 0x4000),
+                     l->y, l->c, w, w, h);
     }
 }
 
@@ -266,6 +276,7 @@ static void xm_dvr_vi_tick(void *opaque)
     }
     if (!s->arm_phase) {
         s->frame++;
+        s->bar += xm_dvr_moving();
     }
     xm_dvr_vi_update(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +

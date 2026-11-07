@@ -749,7 +749,7 @@ qemu/
 ├── hw/misc/xm-h2.c              # Hantro H2 (VC8000E) encoder: H.265, H.264, JPEG
 ├── hw/misc/xm-dvr-vi.c          # DVR capture of the AHD receivers' ports
 ├── hw/misc/xm-dvr-vpss.c        # DVR scaler
-├── hw/misc/xm-dvr-osd.c         # DVR OSD engine (jobs complete, nothing drawn)
+├── hw/misc/xm-dvr-osd.c         # DVR OSD engine (region bitmaps blended into frames)
 ├── hw/misc/xm-rtc2.c            # NVR/DVR RTC
 ├── hw/i2c/nvp6158.c             # Nextchip NVP6158C AHD receiver
 ├── hw/i2c/tp2830.c              # Techpoint TP2830 AHD receiver

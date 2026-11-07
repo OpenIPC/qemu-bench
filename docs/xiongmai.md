@@ -518,7 +518,9 @@ otherwise. Playback of recordings works through the network keyboard
 (DVRIP 1550 `OPNetKeyboard`: Esc, Play, Enter).
 
 **Capture (`xm-dvr-vi`, `xm-dvr-vpss`).** One store engine per channel; the
-pictures are colour bars with the camera's number and a moving bar. On
+pictures are colour bars with the camera's number and a bar an eighth of
+the picture tall that moves for 20 s, then stands for 20 s (virtual time),
+so motion alarms start and stop. On
 XM8520D engine *e* = channel & 3 takes BT.656 lane *e* >> 1, time slot
 *e* & 1 of a 2-mux; which camera that is comes from the NVP6158C's port
 sequence registers (bank 1 0xC0 + 2·port), set by Sofia, and the board's
@@ -529,8 +531,32 @@ and reboots ("can not find dll") unless delays 32..63 lock.
 detection (1080p25), cable / EQ words. XM8521DV200's Sofia runs motion
 detection only with Techpoint parts and crashes without it, hence TP2830.
 
-**OSD (`xm-dvr-osd`, 0x34000000).** Jobs start at +0x060 and complete
-100 µs later (+0xF0 / +0xFC, IRQ). Nothing is drawn yet.
+**Motion detection.** XM8520D's Sofia takes it from the NVP6158C's own
+detector: every 200 ms it reads bank 0 0xA9 (a bit per channel), which
+the model sets while the bar moves, for channels with a camera, detection
+on (bank 2 ch·7 bit 0 clear) and a non-empty region. XM8521DV200's Sofia
+detects in software on the VPSS's 256×144 output (channel 3) and counts
+only objects at least 14 lines tall there, hence the bar's height. Both
+send `VideoMotion` Start / Stop alarms over DVRIP once
+`Detect.MotionDetect` is enabled (it is off by default).
+
+**OSD (`xm-dvr-osd`, 0x34000000).** The encoder driver runs one job per
+frame: up to four regions, stage *n* in the 0x100-byte block *n*,
++0x064 the last stage, +0x060 1 to start; done at +0xF0 / +0xFC with the
+interrupt 100 µs later. A stage blends a bitmap (+0x40, +0x30 bytes a
+line, scaled by +0x24 / +0x28) of +0x4C × (+0x34 + 1) pixels into the
+NV12 frame in place (Y / C +0x44 / +0x48 → +0x50 / +0x54, stride +0x2C):
+ARGB1555 (mode 0 / 1, alpha +0x20; XM8520D's Sofia), one bit (1 / 0) or
+two bits a pixel (1 / 4, AYUV palette +0x10..+0x1C; XM8521DV200's Sofia).
+The planar-RGB snapshot modes are not modelled. The encoders' intra
+coding is DC-only per 8×8 block, so the text is blurred in the streams
+though exact in the frames.
+
+**Covers.** rgn.ko's privacy masks: XM8520D's VI draws them per channel
+(block 0x112000 + engine·0x40000 + output·0x4000), XM8521DV200's VPSS per
+output (0x25000 + output·0x1000, in that output's pixels): +0x00 enable
+bits, mask *n* at +0x40 + 0x10·*n* (x0 | y0 << 16, x1 | y1 << 16, colour
+0x00YYUUVV), filled solid. Lines are not modelled.
 
 **Encoders.** XM8520D's Hantro H2 (`xm-h2`, register table as VC8000E): the
 library writes VPS/SPS/PPS (JPEG: SOI..SOS) in front of the output, the

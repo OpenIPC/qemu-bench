@@ -16,6 +16,8 @@
 #ifndef HW_ARM_XIONGMAI_H
 #define HW_ARM_XIONGMAI_H
 
+#include "qemu/timer.h"
+
 #include "exec/hwaddr.h"
 
 #define XM_MAX_UART     3
@@ -222,5 +224,20 @@ typedef struct XmAhdClass {
     int (*camera)(Object *obj, int vport, int slot);
 } XmAhdClass;
 DECLARE_CLASS_CHECKERS(XmAhdClass, XM_AHD, TYPE_XM_AHD)
+
+/*
+ * The DVR test cameras' motion: 20 s of a moving bar, then 20 s still
+ * (virtual time), so motion alarms both start and stop.  The VI moves the
+ * bar, AHD receivers that detect motion themselves (NVP6158) report it.
+ */
+#define XM_DVR_MOTION_NS    (20 * NANOSECONDS_PER_SECOND)
+static inline bool xm_dvr_moving(void)
+{
+    return !((qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / XM_DVR_MOTION_NS) & 1);
+}
+
+/* xm-dvr-vpss.c: fill a DVR cover block's masks into an NV12 picture */
+void xm_dvr_cover(const uint32_t *b, hwaddr ya, hwaddr ca, uint32_t stride,
+                  uint32_t w, uint32_t h);
 
 #endif /* HW_ARM_XIONGMAI_H */

@@ -18,6 +18,9 @@
  * +0x3000 when that is not 0x400); five outputs, store at 0x24000 + c *
  * 0x1000 (+0x34 active), window at 0x10000 + c * 0x1000.
  *
+ * XM8521DV200: output c's covers (privacy masks) at 0x25000 + c * 0x1000,
+ * see xm_dvr_cover().
+ *
  * A job scales the whole source (nearest) into each active output's window
  * size; output 0 may be the source buffer itself (same size: nothing to
  * do).  It completes at once.  Every other word is RAM-backed.  Read from
@@ -34,6 +37,7 @@
 #include "hw/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
+#include "hw/arm/xiongmai.h"
 
 #define TYPE_XM_DVR_VPSS "xm-dvr-vpss"
 OBJECT_DECLARE_SIMPLE_TYPE(XmDvrVpssState, XM_DVR_VPSS)
@@ -98,6 +102,46 @@ static void xm_dvr_vpss_scale(XmDvrVpssState *s, hwaddr sy, hwaddr sc,
     }
 }
 
+/*
+ * Cover (privacy mask) block, rgn.ko's "cover" regions as the VI
+ * (XM8520D) or the VPSS (XM8521DV200) draws them: +0x00 enable, one bit a
+ * mask (16), +0x04 a second mask (the region's type: Sofia sets it with
+ * the first); mask n at +0x40 + 0x10 n: x0 | y0 << 16, x1 | y1 << 16 (the
+ * end exclusive), colour 0x00YYUUVV.  Filled solid.
+ */
+void xm_dvr_cover(const uint32_t *b, hwaddr ya, hwaddr ca, uint32_t stride,
+                  uint32_t w, uint32_t h)
+{
+    uint8_t line[VPSS_MAX_W];
+
+    for (int n = 0; n < 16; n++) {
+        const uint32_t *r = &b[0x10 + n * 4];
+        uint32_t x0 = (r[0] & 0xffff) & ~1u, y0 = (r[0] >> 16) & ~1u;
+        uint32_t x1 = MIN(r[1] & 0xffff, w), y1 = MIN(r[1] >> 16, h);
+
+        if (!(b[0] & (1u << n)) || x1 <= x0 || y1 <= y0 || w > stride ||
+            w > VPSS_MAX_W) {
+            continue;
+        }
+        memset(line, r[2] >> 16, x1 - x0);
+        for (uint32_t y = y0; y < y1; y++) {
+            address_space_write(&address_space_memory,
+                                ya + (hwaddr)y * stride + x0,
+                                MEMTXATTRS_UNSPECIFIED, line, x1 - x0);
+        }
+        x1 &= ~1u;
+        for (uint32_t x = 0; x < x1 - x0; x += 2) {
+            line[x] = r[2] >> 8;
+            line[x + 1] = r[2];
+        }
+        for (uint32_t y = y0 / 2; y < (y1 + 1) / 2; y++) {
+            address_space_write(&address_space_memory,
+                                ca + (hwaddr)y * stride + x0,
+                                MEMTXATTRS_UNSPECIFIED, line, x1 - x0);
+        }
+    }
+}
+
 static void xm_dvr_vpss_run(XmDvrVpssState *s)
 {
     hwaddr sy = DDR_BASE + R(0x1000), sc = DDR_BASE + R(0x1010);
@@ -150,6 +194,12 @@ static void xm_dvr_vpss_run(XmDvrVpssState *s)
         }
         xm_dvr_vpss_scale(s, sy, sc, sys, scs, sw, sh, DDR_BASE + dy,
                           DDR_BASE + dc, ds, dw, dh);
+        /* XM8521DV200: output c's covers at 0x25000 + c * 0x1000, in its
+         * own pixels (the XM8520D has them in the VI) */
+        if (!s->layout) {
+            xm_dvr_cover(&R(0x25000 + c * 0x1000), DDR_BASE + dy,
+                         DDR_BASE + dc, ds, dw, dh);
+        }
     }
 }
 

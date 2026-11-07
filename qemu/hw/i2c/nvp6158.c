@@ -12,7 +12,13 @@
  *             0xF5  revision
  *             0xA8  no-video bitmask, a bit per channel (the "cameras"
  *                   property: a 1 bit there is a camera, so a 0 here)
- *             0xA9  motion bitmask (0)
+ *             0xA9  motion bitmask: the chip's own detector, which
+ *                   Sofia polls every 200 ms (bit ch counts only while
+ *                   0x7A / 0x7B's nibble for ch is not 0xF, no video).
+ *                   Set while the test cameras move (xm_dvr_moving) on
+ *                   channels with a camera, detection on (bank 2
+ *                   ch * 7 + 0 bit 0 clear) and a region (bank 2 0x40 +
+ *                   ch * 0x18: 12 rows of 16 bits) not empty
  *             0xE2  a bit per channel the EQ path reads (0)
  *   bank 0x13 0xF0+ch  the format code ("VFC") detected on channel ch
  *             0xC8/0xC9  cable distance, must not be 0
@@ -63,6 +69,27 @@ static void nvp6158_log(Nvp6158State *s, const char *op, uint8_t reg,
     }
 }
 
+static uint8_t nvp6158_motion(Nvp6158State *s)
+{
+    uint8_t v = 0;
+
+    if (!xm_dvr_moving()) {
+        return 0;
+    }
+    for (unsigned ch = 0; ch < 4; ch++) {
+        const uint8_t *rows = &s->regs[2][0x40 + ch * 0x18];
+        bool region = false;
+
+        for (unsigned i = 0; i < 0x18; i++) {
+            region |= rows[i] != 0;
+        }
+        if ((s->cameras & (1 << ch)) && !(s->regs[2][ch * 7] & 1) && region) {
+            v |= 1 << ch;
+        }
+    }
+    return v;
+}
+
 static uint8_t nvp6158_status(Nvp6158State *s, uint8_t bank, uint8_t reg,
                               bool *fixed)
 {
@@ -78,6 +105,7 @@ static uint8_t nvp6158_status(Nvp6158State *s, uint8_t bank, uint8_t reg,
         case 0xA8:
             return ~s->cameras & 0x0F;
         case 0xA9:
+            return nvp6158_motion(s);
         case 0xE2:
             return 0;
         }
