@@ -62,7 +62,12 @@
  *   +0x210     output pointer (the stream buffer + 256)
  *   (layout "xm530v200", its earlier revision: the output pointer at
  *   +0x200, the source strides at +0x214 / +0x218; its library codes
- *   32x32 CTBs with SAO, so the slice data does too)
+ *   32x32 CTBs with SAO, so the slice data does too.  Layout
+ *   "xm8521dv200": the XM8521DV200 DVR library, the same registers, its
+ *   CTBs 32x32 without SAO; it writing its headers in front of the
+ *   output only after the job, and with +0x1C4 set checks that the
+ *   engine filled its per-CTB tables at +0x20C / +0x210, see
+ *   xm_hevc_ctb_tables())
  *   +0x058     status, 3 frame done; 3 to +0x030 acknowledges.  +0x054
  *              (acknowledged at +0x02C) and +0x050 (errors, at +0x028)
  *              also raise the interrupt; neither happens here.
@@ -153,9 +158,12 @@ struct XmHevcState {
     QEMUTimer *timer;
     uint32_t regs[XM_HEVC_SIZE / 4];
     uint32_t regs2[XM_HEVC2_SIZE / 4];
+    bool dbg_level;
+    unsigned dbg_n;
     char *dump_dir;
     char *layout;
-    bool v3;                    /* layout "xm533" or "xm530v200" */
+    bool v3;                    /* layout "xm533", "xm530v200" or
+                                 * "xm8521dv200" */
     uint32_t v3_out, v3_ys, v3_cs;  /* where they differ */
     const HevcEncParams *prm;   /* what the library's headers say */
     uint32_t ref_off, recon_off;    /* the reference / reconstruction luma */
@@ -196,8 +204,16 @@ typedef struct XmHevcJob {
 static void xm_hevc_update(XmHevcState *s)
 {
     if (s->v3) {
-        qemu_set_irq(s->irq, ((R(s, V3_STATUS) | R(s, V3_ST2) |
-                               R(s, V3_ERR)) & 3) != 0);
+        bool lv = ((R(s, V3_STATUS) | R(s, V3_ST2) | R(s, V3_ERR)) & 3) != 0 ||
+                  s->regs2[0x0C / 4] != 0;
+
+        if (lv != s->dbg_level && s->dbg_n < 40) {
+            s->dbg_n++;
+            qemu_log_mask(LOG_UNIMP, "xm-hevc: irq %d (status %x st2 %x err %x)\n",
+                          lv, R(s, V3_STATUS), R(s, V3_ST2), R(s, V3_ERR));
+        }
+        s->dbg_level = lv;
+        qemu_set_irq(s->irq, lv);
         return;
     }
     qemu_set_irq(s->irq, R(s, R_STATUS) != 0);
@@ -330,6 +346,39 @@ static void xm_hevc_job_free(XmHevcJob *j)
     g_free(j);
 }
 
+/*
+ * xm530v200 layout with +0x1C4 set (Sofia's DVR library on XM8521DV200):
+ * the engine writes 16 bytes a 32x32 CTB of its own into the tables at
+ * +0x20C (and +0x210), CTB columns outside, rows inside.  The library
+ * marks them 0xff before the job and drops the frame (-10, silently) if a
+ * marker is left; nothing reads the contents, so they are cleared here.
+ */
+/* the DVR library's parameter sets: 32x32 CTBs, no SAO, deblocking
+ * offsets 5 / -5, a QP group a CTB */
+static const HevcEncParams xm_hevc_params_dvr = {
+    .log2_ctb = 5, .sao = false, .beta_offset_div2 = 5, .tc_offset_div2 = -5,
+};
+
+static void xm_hevc_ctb_tables(XmHevcState *s, int w, int h)
+{
+    static const uint8_t zero[4096];
+    size_t len = (size_t)DIV_ROUND_UP(w, 32) * DIV_ROUND_UP(h, 32) * 16, k;
+    hwaddr t[2];
+
+    if (!s->v3 || s->v3_out != 0x200 || !R(s, 0x1C4)) {
+        return;
+    }
+    t[0] = R(s, 0x20C);
+    t[1] = R(s, 0x210);
+    for (int i = 0; i < 2; i++) {
+        for (k = 0; t[i] && k < len; k += sizeof(zero)) {
+            dma_memory_write(&address_space_memory, t[i] + k, zero,
+                             MIN(sizeof(zero), len - k),
+                             MEMTXATTRS_UNSPECIFIED);
+        }
+    }
+}
+
 /* back in the main loop: the stream into guest memory, then done */
 static void xm_hevc_done(void *opaque)
 {
@@ -347,6 +396,7 @@ static void xm_hevc_done(void *opaque)
             }
             dma_memory_write(&address_space_memory, j->out_pa, j->out, n,
                              MEMTXATTRS_UNSPECIFIED);
+            xm_hevc_ctb_tables(s, j->w, j->h);
             s->regs[j->len_reg / 4] = n;
             if (s->v3) {
                 R(s, V3_STATUS) = ST_DONE;
@@ -527,10 +577,25 @@ static uint64_t xm_hevc2_read(void *opaque, hwaddr off, unsigned size)
     return XM_HEVC(opaque)->regs2[off / 4];
 }
 
+/*
+ * The second window is the OSD engine rgn.ko's compressed-frame path
+ * drives on the v3 engines (XM8521DV200 / XM8536E): +0x00 bit 0 starts a
+ * job, and it reports done in +0x0C on the encoder's interrupt, which
+ * hevc_interrupt checks first and clears by writing 0.  Jobs complete at
+ * once; nothing is drawn.
+ */
 static void xm_hevc2_write(void *opaque, hwaddr off, uint64_t val,
                            unsigned size)
 {
-    XM_HEVC(opaque)->regs2[off / 4] = val;
+    XmHevcState *s = XM_HEVC(opaque);
+
+    s->regs2[off / 4] = val;
+    if (s->v3 && off == 0 && (val & 1)) {
+        s->regs2[0x0C / 4] = 1;
+    }
+    if (s->v3) {
+        xm_hevc_update(s);
+    }
 }
 
 static const MemoryRegionOps xm_hevc2_ops = {
@@ -587,12 +652,14 @@ static void xm_hevc_realize(DeviceState *dev, Error **errp)
         s->v3_out = 0x210;
         s->v3_ys = 0x224;
         s->v3_cs = 0x228;
-    } else if (!strcmp(s->layout, "xm530v200")) {
+    } else if (!strcmp(s->layout, "xm530v200") ||
+               !strcmp(s->layout, "xm8521dv200")) {
         s->v3 = true;
         s->v3_out = 0x200;
         s->v3_ys = 0x214;
         s->v3_cs = 0x218;
-        s->prm = &hevc_params_ctb32_sao;
+        s->prm = strcmp(s->layout, "xm530v200") ? &xm_hevc_params_dvr :
+                 &hevc_params_ctb32_sao;
     } else {
         error_setg(errp, "xm-hevc: unknown layout '%s'", s->layout);
     }

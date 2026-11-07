@@ -1,4 +1,4 @@
-# Xiongmai XM510 / XM530 / XM550 Hardware Reference
+# Xiongmai XM510 / XM530 / XM550 / XM85xx Hardware Reference
 
 Every address here is read from the vendor kernels OpenIPC builds for these
 SoCs: 3.0.101 for XM510 (`xm510_lite`) and 3.10.103 for XM530/XM550
@@ -483,6 +483,81 @@ not scan without provisioning (above).
 Not modelled: WPA3-SAE and 802.1X (the guests' `wpa_supplicant` has
 neither; see `docs/ingenic.md`); XM535D2's `6132cu.ko` and XM533's SDIO
 SSV6158.
+
+## DVRs and NVRs (XM8536E / XM8520D / XM8521DV200)
+
+Three machines for Xiongmai's recorder SoCs, all booting vendor flash dumps
+(U-Boot, the 3.10.103 kernel, Sofia) to the GUI on HDMI:
+
+| Machine | Board | RAM | Media blocks |
+|---|---|---|---|
+| `xm8536e` | YK NBD88X16S-KL-V3 NVR | 256 MB | VC8000D decoder, VO2 display, JPEG, xm-hevc (`xm533`) |
+| `xm8520d` | AHB88X04R XVR (NVP6158C) | 128 MB | G2 decoder at 0x21100000, Hantro H2 encoder at 0x21000000, DVR VI / VPSS / OSD (`layout 1`) |
+| `xm8521dv200` | AHB88X08R-LM-V3 XVR (2× TP2830) | 256 MB | xm-hevc (`xm8521dv200`), jpeg.ko's engine (`xm8521`), DVR VI / VPSS / OSD |
+
+Common to all three: uMCTL2 DDR, two DWC2 USB hosts (0x50300000, 0x50400000),
+two AHCI hosts, PL330 (`xm_dma.ko`), the RTC at 0x100A0000, the bit-banged
+EEPROM (`at24c.ko`), and the I2S window at 0x10060000. Sofia wants
+`xmuart=0` in the U-Boot environment, and the LibCrypto "HWID" block
+(1 KiB, 1 KiB before the environment at 0x2FC00) must decode: its chip code,
+product model, and video / audio channel counts decide what Sofia starts.
+
+**Display (`xm-vo2`, 0x31000000).** Background colour, 16 NV12 windows (three
+buffers each, the index register picks), the ARGB1555 GUI layer (bit 15
+transparent) and the hardware cursor, composed onto the QEMU console.
+`layout=1` is XM8520D's: window *n* at +0x1000 + 0x80 *n*.
+
+**Decoder (`xm-vc8000d`).** VC8000D (NVR) and the G2 (XM8520D, mapped at
+base − 0x800) with libavcodec: HEVC, H.264, and JPEG for the boot logos,
+through the post-processor's NV12 output. libvdec takes codec support from
+its own table keyed by the build ID in swreg309; the NVR's Sofia knows
+0x1F9F, XM8520D's (2021) only 0x1F41..0x1F66 / 0xFFFC..0xFFFF, so its G2
+reports 0xFFFF (`build-id`). After a run swreg169 moves on by swreg6: the
+older library counts what was consumed from it and drops the picture
+otherwise. Playback of recordings works through the network keyboard
+(DVRIP 1550 `OPNetKeyboard`: Esc, Play, Enter).
+
+**Capture (`xm-dvr-vi`, `xm-dvr-vpss`).** One store engine per channel; the
+pictures are colour bars with the camera's number and a moving bar. On
+XM8520D engine *e* = channel & 3 takes BT.656 lane *e* >> 1, time slot
+*e* & 1 of a 2-mux; which camera that is comes from the NVP6158C's port
+sequence registers (bank 1 0xC0 + 2·port), set by Sofia, and the board's
+lane wiring (`vports` = 0x12). Sofia sweeps each channel's sampling delay
+and reboots ("can not find dll") unless delays 32..63 lock.
+
+**AHD receivers (`nvp6158`, `tp2830`).** Chip IDs, per-channel format
+detection (1080p25), cable / EQ words. XM8521DV200's Sofia runs motion
+detection only with Techpoint parts and crashes without it, hence TP2830.
+
+**OSD (`xm-dvr-osd`, 0x34000000).** Jobs start at +0x060 and complete
+100 µs later (+0xF0 / +0xFC, IRQ). Nothing is drawn yet.
+
+**Encoders.** XM8520D's Hantro H2 (`xm-h2`, register table as VC8000E): the
+library writes VPS/SPS/PPS (JPEG: SOI..SOS) in front of the output, the
+engine the slice; H.265, H.264 (High, CABAC or CAVLC) and JPEG, with the
+JPEG header's last bits carried in +0x048 [31:26] / +0x04C / +0x054. Sizes
+go back in bytes (+0x024); completion is delayed 2 ms. XM8521DV200 runs
+hevc.ko's v3 engine (`xm8521dv200` layout: stream at +0x200, 32×32 CTBs
+without SAO); its library writes the headers after the job and drops the
+frame unless the engine overwrote the 0xff markers in its per-CTB tables
+(+0x20C / +0x210, with +0x1C4 set). Its jpeg.ko engine has the registers
+moved (`xm8521` layout: status +0x030, scan +0x054, source +0x05C).
+
+**Audio (`xm-audio`, layouts `dvr` / `dvr2`).** XM8520D: +0x5000 the AHD
+receivers' capture, eight channels time-multiplexed (sample *i* is channel
+*i* & 7), 960 samples an interrupt (Linux IRQ 47); +0x6000 HDMI playback;
++0x7000 the codec. XM8521DV200 / XM8536E: capture at +0x3000 (IRQ 94),
+playback / talk at +0x4000..+0x7000 (IRQs 47, 48, 49, 95). The capture
+carries a tone per camera (1000 + 250·*n* Hz). Sofia encodes audio only for
+channels below the HWID's audio count (hwinfo 0x44), capped by
+`Ability.DeviceDesc.AudioInChannel`; per-camera audio over coax needs
+`fVideo.AudioAcquisitionMode` 1.
+
+**USB.** QEMU's DWC2 host with a working core soft reset (XM8521DV200's
+U-Boot leaves the port in reset), one interrupt level per controller, and
+USB-storage short replies cut at the host's length (the vendor drivers
+round IN transfers up to whole packets). XM8520D's second host is on
+SPI 59. A `-device usb-mouse` drives the GUI; a stick mounts.
 
 ## XM530 media pipeline (in progress)
 

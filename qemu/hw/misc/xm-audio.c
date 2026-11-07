@@ -26,6 +26,21 @@
  * mic=on so does capture come from it.  A chunk moves every chunk / rate
  * seconds of virtual time while its direction is on.
  *
+ * layout "dvr" / "dvr2": the DVRs' xm_i2s.ko, the same blocks (control,
+ * statuses, FIFO) at other places and more of them, each with its own
+ * interrupt and chunk:
+ *   "dvr"  (XM8520D, 2020): +0x5000 the AHD receivers' capture, eight
+ *          channels time-multiplexed (sample i is channel i & 7), 960 a
+ *          chunk, IRQ 47; +0x6000 HDMI playback, 480, IRQ 48; +0x7000
+ *          the codec's capture and playback, 160, IRQ 49
+ *   "dvr2" (XM8521DV200 / XM8536E, 2022): +0x3000 the eight-channel
+ *          capture, 960, IRQ 94; +0x4000 / +0x5000 / +0x6000 / +0x7000
+ *          playback and talk (the codec's at +0x6000), 160, IRQs 47, 48,
+ *          49, 95
+ * every channel 8000 samples a second.  The multiplexed capture carries a
+ * tone a camera, "tone" + 250 Hz x channel; the codec's block is the one
+ * an audiodev plays and records.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -60,11 +75,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmAudioState, XM_AUDIO)
 #define TX_ST_REQ       (1 << 2)
 #define RX_ST_FULL      (1 << 4)
 
-#define CHUNK_MAX       512         /* samples the handler moves at a time */
+#define CHUNK_MAX       1024        /* samples the handler moves at a time */
+#define XM_AUDIO_BLOCKS 5
 #define RING            8192        /* audiodev buffering, a power of 2 */
 
+typedef struct XmAudioState XmAudioState;
+
 typedef struct XmI2sBlock {
+    XmAudioState *s;
     hwaddr base;
+    int chunk;                  /* samples an interrupt */
+    int chans;                  /* time-multiplexed channels */
+    bool codec;                 /* the audiodev's */
     qemu_irq irq;
     QEMUTimer *timer;
     int16_t rx[CHUNK_MAX];
@@ -78,7 +100,10 @@ struct XmAudioState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     uint32_t regs[XM_AUDIO_SIZE / 4];
-    XmI2sBlock blk[2];          /* AI, AO */
+    XmI2sBlock blk[XM_AUDIO_BLOCKS];
+    int nblk;
+    char *layout;
+    uint64_t tdm_phase;         /* multiplexed capture frames generated */
     uint32_t rate;
     uint32_t tone;
     uint32_t chunk;
@@ -120,7 +145,8 @@ static void xm_audio_arm(XmAudioState *s, XmI2sBlock *b)
         timer_del(b->timer);
     } else if (!timer_pending(b->timer)) {
         timer_mod(b->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND * s->chunk / MAX(s->rate, 1));
+                  NANOSECONDS_PER_SECOND * b->chunk /
+                  ((uint64_t)MAX(s->rate, 1) * b->chans));
     }
 }
 
@@ -133,9 +159,22 @@ static void xm_audio_chunk(XmAudioState *s, int n)
     if (!(c & CTRL_ON)) {
         return;
     }
-    if (c & CTRL_RX) {
-        for (int i = 0; i < s->chunk; i++) {
-            if (!s->in) {
+    if ((c & CTRL_RX) && b->chans > 1) {
+        /* a tone a channel, interleaved */
+        for (int i = 0; i < b->chunk; i++) {
+            const int ch = i % b->chans;
+            const double t = (double)(s->tdm_phase + i / b->chans) / s->rate;
+
+            b->rx[i] = (int16_t)lrint(12000.0 *
+                                      sin(2 * M_PI * (s->tone + 250 * ch) * t));
+        }
+        s->tdm_phase += b->chunk / b->chans;
+        b->rx_pos = 0;
+        b->rx_len = b->chunk;
+        REG(s, b, I2S_RX_ST) |= RX_ST_FULL;
+    } else if (c & CTRL_RX) {
+        for (int i = 0; i < b->chunk; i++) {
+            if (!s->in || !b->codec) {
                 b->rx[i] = xm_audio_sample(s);
             } else if (s->rec_rd != s->rec_wr) {
                 b->rx[i] = s->rec[s->rec_rd++ % RING];
@@ -144,11 +183,11 @@ static void xm_audio_chunk(XmAudioState *s, int n)
             }
         }
         b->rx_pos = 0;
-        b->rx_len = s->chunk;
+        b->rx_len = b->chunk;
         REG(s, b, I2S_RX_ST) |= RX_ST_FULL;
     }
     if (c & CTRL_TX) {
-        for (int i = 0; s->out && i < b->tx_len; i++) {
+        for (int i = 0; s->out && b->codec && i < b->tx_len; i++) {
             if (s->play_wr - s->play_rd < RING) {
                 s->play[s->play_wr++ % RING] = b->tx[i];
             }
@@ -159,25 +198,18 @@ static void xm_audio_chunk(XmAudioState *s, int n)
     xm_audio_update(s, b);
 }
 
-static void xm_audio_ai_tick(void *opaque)
+static void xm_audio_tick(void *opaque)
 {
-    XmAudioState *s = opaque;
+    XmI2sBlock *b = opaque;
+    XmAudioState *s = b->s;
 
-    xm_audio_chunk(s, 0);
-    xm_audio_arm(s, &s->blk[0]);
-}
-
-static void xm_audio_ao_tick(void *opaque)
-{
-    XmAudioState *s = opaque;
-
-    xm_audio_chunk(s, 1);
-    xm_audio_arm(s, &s->blk[1]);
+    xm_audio_chunk(s, b - s->blk);
+    xm_audio_arm(s, b);
 }
 
 static XmI2sBlock *xm_audio_block(XmAudioState *s, hwaddr off)
 {
-    for (int n = 0; n < 2; n++) {
+    for (int n = 0; n < s->nblk; n++) {
         if (off >= s->blk[n].base && off < s->blk[n].base + 0x1000) {
             return &s->blk[n];
         }
@@ -249,7 +281,8 @@ static void xm_audio_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     s->play_rd = s->play_wr = s->rec_rd = s->rec_wr = 0;
     s->phase = 0;
-    for (int n = 0; n < 2; n++) {
+    s->tdm_phase = 0;
+    for (int n = 0; n < s->nblk; n++) {
         timer_del(s->blk[n].timer);
         s->blk[n].rx_pos = s->blk[n].rx_len = 0;
         s->blk[n].tx_len = 0;
@@ -264,13 +297,57 @@ static void xm_audio_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &xm_audio_ops, s, TYPE_XM_AUDIO,
                           XM_AUDIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
-    s->blk[0].base = AI_BLOCK;
-    s->blk[1].base = AO_BLOCK;
-    for (int n = 0; n < 2; n++) {
+    for (int n = 0; n < XM_AUDIO_BLOCKS; n++) {
+        s->blk[n].s = s;
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->blk[n].irq);
+        s->blk[n].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xm_audio_tick,
+                                       &s->blk[n]);
     }
-    s->blk[0].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xm_audio_ai_tick, s);
-    s->blk[1].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xm_audio_ao_tick, s);
+}
+
+/* the blocks of a layout: base, chunk, channels, the audiodev's */
+static bool xm_audio_layout(XmAudioState *s, Error **errp)
+{
+    static const struct {
+        const char *name;
+        struct { hwaddr base; int chunk, chans; bool codec; } b[5];
+    } layouts[] = {
+        { "dvr", { { 0x5000, 960, 8 }, { 0x6000, 480, 1 },
+                   { 0x7000, 160, 1, true } } },
+        { "dvr2", { { 0x3000, 960, 8 }, { 0x4000, 160, 1 },
+                    { 0x5000, 160, 1 }, { 0x6000, 160, 1, true },
+                    { 0x7000, 160, 1 } } },
+    };
+
+    if (!s->layout || !*s->layout) {
+        /* the cameras' i2s.ko: AI, AO */
+        s->nblk = 2;
+        s->blk[0] = (XmI2sBlock){ .s = s, .base = AI_BLOCK, .chunk = s->chunk,
+                                  .chans = 1, .codec = true,
+                                  .irq = s->blk[0].irq,
+                                  .timer = s->blk[0].timer };
+        s->blk[1] = (XmI2sBlock){ .s = s, .base = AO_BLOCK, .chunk = s->chunk,
+                                  .chans = 1, .codec = true,
+                                  .irq = s->blk[1].irq,
+                                  .timer = s->blk[1].timer };
+        return true;
+    }
+    for (int l = 0; l < ARRAY_SIZE(layouts); l++) {
+        if (strcmp(s->layout, layouts[l].name)) {
+            continue;
+        }
+        s->nblk = 0;
+        for (int n = 0; n < XM_AUDIO_BLOCKS && layouts[l].b[n].base; n++) {
+            s->blk[n].base = layouts[l].b[n].base;
+            s->blk[n].chunk = layouts[l].b[n].chunk;
+            s->blk[n].chans = layouts[l].b[n].chans;
+            s->blk[n].codec = layouts[l].b[n].codec;
+            s->nblk++;
+        }
+        return true;
+    }
+    error_setg(errp, "xm-audio: unknown layout '%s'", s->layout);
+    return false;
 }
 
 /* the backend pulls as it plays: what AO has written, else silence */
@@ -332,6 +409,9 @@ static void xm_audio_realize(DeviceState *dev, Error **errp)
                    CHUNK_MAX);
         return;
     }
+    if (!xm_audio_layout(s, errp)) {
+        return;
+    }
     if (!s->audio_be) {
         return;
     }
@@ -355,6 +435,7 @@ static const Property xm_audio_props[] = {
     DEFINE_PROP_UINT32("tone", XmAudioState, tone, 1000),
     DEFINE_PROP_UINT32("chunk", XmAudioState, chunk, 256),
     DEFINE_PROP_BOOL("trace", XmAudioState, trace, false),
+    DEFINE_PROP_STRING("layout", XmAudioState, layout),
 };
 
 static void xm_audio_class_init(ObjectClass *klass, const void *data)
