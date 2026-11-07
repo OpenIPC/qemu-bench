@@ -326,7 +326,7 @@ FIFOs keep samples behind the 16 they report; the Longse app captures
 only with sysenv.cfg byte 0x98C set. The FTAES020 is `fh-aes` with
 `advance=on` (addresses move on between chunks).
 
-SigmaStar/MStar infinity2m, Ifado and infinity3 (`hw/arm/sigmastar.c`,
+SigmaStar/MStar infinity2m, Ifado, infinity3, Iford and infinity6* (`hw/arm/sigmastar.c`,
 `docs/sigmastar.md`) are a fourth: Cortex-A7 parts whose blocks sit in
 16-bit RIU register banks at `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
 at +1). `sstar-riu` is mapped under every model as storage plus the status

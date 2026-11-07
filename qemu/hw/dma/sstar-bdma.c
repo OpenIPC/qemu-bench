@@ -80,6 +80,7 @@ struct SstarBdmaState {
     MemoryRegion iomem;
     SstarFspState *fsp;
     SstarXzdecState *xzdec;
+    uint32_t addr_mask;     /* MIU addresses it reaches, 512 MiB by default */
     uint16_t regs[BDMA_NUM_CHAN][BDMA_CHAN_REGS];
     qemu_irq irq[BDMA_NUM_CHAN];
 };
@@ -89,14 +90,14 @@ static uint32_t reg32(uint16_t *r, int lo)
     return r[lo] | ((uint32_t)r[lo + 1] << 16);
 }
 
-static hwaddr bdma_mem_addr(uint16_t *r, uint32_t a)
+static hwaddr bdma_mem_addr(SstarBdmaState *s, uint16_t *r, uint32_t a)
 {
     /* Bus addresses: DRAM from 0, as the drivers program them. */
     if (((r[R_MISC] >> 12) & 0x3) == MISC_MEM_IMI) {
         /* Iford's IPL reads into IMI above 64 KiB (0xA0010980) */
         return IMI_BASE + (a & 0xFFFFF);
     }
-    return DRAM_BASE + (a & 0x1FFFFFFF);
+    return DRAM_BASE + (a & s->addr_mask);
 }
 
 static void bdma_update_irq(SstarBdmaState *s, int ch)
@@ -124,7 +125,7 @@ static void bdma_run(SstarBdmaState *s, int ch)
         switch (src) {
         case PORT_MIU0:
         case PORT_MIU1:
-            dma_memory_read(&address_space_memory, bdma_mem_addr(r, sa), buf,
+            dma_memory_read(&address_space_memory, bdma_mem_addr(s, r, sa), buf,
                             n, MEMTXATTRS_UNSPECIFIED);
             break;
         case PORT_FILL:
@@ -148,7 +149,7 @@ static void bdma_run(SstarBdmaState *s, int ch)
         switch (dst) {
         case PORT_MIU0:
         case PORT_MIU1:
-            dma_memory_write(&address_space_memory, bdma_mem_addr(r, da),
+            dma_memory_write(&address_space_memory, bdma_mem_addr(s, r, da),
                              buf, n, MEMTXATTRS_UNSPECIFIED);
             break;
         case PORT_FSP:
@@ -265,6 +266,7 @@ static void sstar_bdma_init(Object *obj)
 }
 
 static const Property sstar_bdma_props[] = {
+    DEFINE_PROP_UINT32("addr-mask", SstarBdmaState, addr_mask, 0x1FFFFFFF),
     DEFINE_PROP_LINK("fsp", SstarBdmaState, fsp, TYPE_SSTAR_FSP,
                      SstarFspState *),
     DEFINE_PROP_LINK("xzdec", SstarBdmaState, xzdec, TYPE_SSTAR_XZDEC,

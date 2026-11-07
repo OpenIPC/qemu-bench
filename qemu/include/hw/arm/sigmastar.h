@@ -26,6 +26,10 @@ typedef enum SsDie {
     SS_DIE_IFADO,
     SS_DIE_INFINITY3,
     SS_DIE_IFORD,
+    SS_DIE_INFINITY6,
+    SS_DIE_INFINITY6B0,
+    SS_DIE_INFINITY6E,
+    SS_DIE_INFINITY6C,
 } SsDie;
 
 typedef struct SsSoCConfig {
@@ -33,6 +37,8 @@ typedef struct SsSoCConfig {
     SsDie       die;
     uint32_t    num_cpus;
     uint64_t    ram_size_default;
+    /* the evidence there is, for a part with no part-level size */
+    const char *ram_unknown;
     uint16_t    chip_id;        /* chipver bank 0x001E reg 0x00 */
     uint16_t    bond;           /* chiptop bank 0x101E reg 0x48 */
     uint32_t    flash_jedec;    /* the board's SPI NOR */
@@ -49,6 +55,16 @@ typedef struct SsSoCConfig {
     bool        ipc;            /* a camera die: no SATA/display/VPU/GE */
     uint16_t    gpio_bank;      /* PADTOP GPIO bank, Ifado layout; 0 none */
     const SstarRegDefault *defaults;    /* over the infinity2m ones */
+    bool        no_i2m_defaults;    /* not the SSD202D capture: another die's fuses */
+    uint16_t    sd_bank;        /* the SD host's RIU bank, for -drive if=sd */
+    uint16_t    sd_spi;
+    uint16_t    sd2_bank;       /* a second SD host, on -drive if=sd,index=1 */
+    int         sd2_spi;
+    uint32_t    sd_cd_addr;     /* card detect pad, low with a card in */
+    uint16_t    sd_cd_bit;
+    uint32_t    sd_cd2_addr;    /* the second slot's, bit 0 */
+    uint16_t    phy_bank;       /* EMAC ALBANY0's bank; 0 = 0x0031 */
+    uint16_t    rtcpwc_spi;     /* the RTCPWC, bank 0x0034; 0 = none */
 } SsSoCConfig;
 
 #endif /* HW_ARM_SIGMASTAR_H */

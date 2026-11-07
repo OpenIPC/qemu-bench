@@ -39,6 +39,10 @@ set over MIIC1 into AE/AWB block statistics that scale with it, WB gains
 that neutralise the logo's white in the scaler's NV12 output, a gamma table
 through the menuload, the test pattern with the ISP off).
 
+Then the infinity6 dies (ssc325, ssc337, ssc338q, ssc377): chip IDs and boot
+straps, the MIU BIST's pattern in DRAM, the I6E MMU, the I6E FSP following
+the bond, and card detect as an input pad; SPI NAND in place of the NOR.
+
     python3 qemu/tests/test-sigmastar.py [--qemu PATH]
 """
 import re
@@ -602,6 +606,280 @@ def i2c_device_at(qtree, model):
     m = re.search(r'dev: %s, id ""[\s\S]*?address = \d+ \(0x([0-9a-f]+)\)'
                   % model, qtree)
     return int(m.group(1), 16) if m else None
+
+
+def test_msc316(qemu, tmp):
+    print('msc316dc, msc316dm: the DDR comes from the IPL, not from presets')
+    path = os.path.join(tmp, 'i3-316.bin')
+    make_i3_image(path)
+    for machine in ('msc316dc', 'msc316dm'):
+        qt = QTest(qemu, machine + ',flash-file=' + path, [])
+        try:
+            check(machine + ': IPL from NOR 0x4000', qt.readl(IMI + 4),
+                  0x5F4C5049)
+            check(machine + ': chip ID', qt.readw(riu(0x001E, 0x00)), 0xC2)
+            check(machine + ': 128 MiB, no wrap at 64',
+                  qt.writel(DRAM + 0x4000000, 0x31364D53) or
+                  qt.writel(DRAM, 0) or qt.readl(DRAM + 0x4000000),
+                  0x31364D53)
+            # 0x0809 here, the SSD202D capture's, sends its IPL round the
+            # DDR set-up altogether: "D-ff" and nothing written to the PHY
+            check(machine + ': no SSD202D efuse', qt.readw(0x1F004014), 0)
+            check(machine + ': SPI NOR on the DID key strap',
+                  qt.readw(0x1F0071C0), 0x20)
+            check(machine + ': nothing presets the DDR',
+                  [qt.readw(riu(0x1010, r)) for r in (0x00, 0x18, 0x19)] +
+                  [qt.readw(riu(0x1012, 0x69))], [0, 0, 0, 0])
+        finally:
+            qt.close()
+
+
+IVE0 = 0x1F2A4000
+IVE1 = 0x1F2A4200
+IVE_SRC = DRAM + 0x100000
+IVE_SRC2 = DRAM + 0x110000
+IVE_DST = DRAM + 0x120000
+IVE_DST2 = DRAM + 0x130000
+
+
+def ive_run(qt, op, mode, w, h, a, b=b'', regs=(), fmt=0, sa=None, da=None,
+            stride=None):
+    """hal_ive.c's order: reset, operation, images, coefficients, fire."""
+    b64write(qt, IVE_SRC, a)
+    if b:
+        b64write(qt, IVE_SRC2, b)
+    qt.writew(IVE0 + 0x02 * 4, 1)
+    qt.writew(IVE0 + 0x02 * 4, 0)
+    qt.writew(IVE0 + 0x10 * 4, 0xFE)
+    qt.writew(IVE1 + 0x04 * 4, op | mode << 8)
+    qt.writew(IVE1 + 0x05 * 4, fmt)
+    qt.writew(IVE1 + 0x06 * 4, w - 1)
+    qt.writew(IVE1 + 0x07 * 4, h - 1)
+    src = sa if sa is not None else IVE_SRC - DRAM
+    for reg, addr in ((0x08, src), (0x0A, IVE_DST - DRAM),
+                      (0x0C, IVE_SRC2 - DRAM), (0x0E, IVE_DST2 - DRAM)):
+        qt.writew(IVE1 + reg * 4, addr & 0xFFFF)
+        qt.writew(IVE1 + (reg + 1) * 4, addr >> 16)
+    for reg in (0x14, 0x15, 0x16, 0x17):
+        qt.writew(IVE1 + reg * 4, (stride or w) - 1)
+    for reg, v in regs:
+        qt.writew(IVE1 + reg * 4, v)
+    qt.writew(IVE0, 1)
+    check('IVE op 0x%x: frame done' % op, qt.readw(IVE0 + 0x13 * 4) & 1, 1)
+    qt.writew(IVE0 + 0x15 * 4, 1)
+    return b64read(qt, IVE_DST, 0x400)
+
+
+def ive_mask(values, shift=0):
+    regs = []
+    v = [x & 0xFF for x in values]
+    for i in range(0, 24, 2):
+        regs.append((0x1A + i // 2, v[i] | v[i + 1] << 8))
+    regs.append((0x26, v[24] | shift << 8))
+    return regs
+
+
+def test_i3_ive(qemu, tmp):
+    print('infinity3 IVE: the driver\'s sequence, each operation')
+    path = os.path.join(tmp, 'i3-ive.bin')
+    make_i3_image(path)
+    qt = QTest(qemu, 'msc313e,flash-file=' + path, [])
+    try:
+        w, h = 16, 5
+        ramp = bytes((x * 10 + y) & 0xFF for y in range(h) for x in range(w))
+        other = bytes((x + y * 3) & 0xFF for y in range(h) for x in range(w))
+        n = w * h
+        check('interrupts masked from reset', qt.readw(IVE0 + 0x10 * 4), 0xFF)
+
+        # identity filter
+        out = ive_run(qt, 0x00, 0, w, h, ramp,
+                      regs=ive_mask([0] * 12 + [1] + [0] * 12))
+        check('filter: identity', out[:n], ramp)
+        # a shift of 1 halves a mask of 2
+        out = ive_run(qt, 0x00, 0, w, h, ramp,
+                      regs=ive_mask([0] * 12 + [2] + [0] * 12, shift=1))
+        check('filter: the mask\'s shift', out[:n], ramp)
+        # negative coefficients clip to 0
+        out = ive_run(qt, 0x00, 0, w, h, bytes([100] * n),
+                      regs=ive_mask([0] * 12 + [-1] + [0] * 12))
+        check('filter: clips at 0', out[:4], bytes(4))
+
+        # stride in pixels
+        padded = b''.join(ramp[y * w:(y + 1) * w] + b'\xEE' * 4
+                          for y in range(h))
+        out = ive_run(qt, 0x00, 0, w, h, padded,
+                      regs=ive_mask([0] * 12 + [1] + [0] * 12), stride=w + 4)
+        check('source and destination strides', out[w + 4:2 * w + 4],
+              ramp[w:2 * w])
+
+        # dilate and erode a single bright pixel
+        dot = bytearray(n)
+        dot[2 * w + 8] = 255
+        out = ive_run(qt, 0x07, 0, w, h, bytes(dot),
+                      regs=ive_mask([0] * 7 + [255] * 3 + [0, 255, 255, 255, 0]
+                                    + [255] * 3 + [0] * 7 + [0] * 0))
+        check('dilate spreads under the mask', out[2 * w + 7], 255)
+        check('dilate stops at its edge', out[2 * w + 5], 0)
+        out = ive_run(qt, 0x08, 0, w, h, bytes(dot),
+                      regs=ive_mask([255] * 25))
+        check('erode removes it', out[2 * w + 8], 0)
+
+        # thresholds: mi_ive_datatype.h's table
+        src = bytes(range(0, 160, 2))
+        for mode, want in ((0, (1, 3, 3)), (1, (10, 3, 3)), (2, (1, 40, 90)),
+                           (3, (1, 2, 3)), (4, (10, 2, 3)), (5, (1, 2, 90)),
+                           (6, (1, 40, 3)), (7, (10, 2, 90))):
+            out = ive_run(qt, 0x09, mode, w, h, src,
+                          regs=((0x1A, 1 | 2 << 8), (0x1B, 3),
+                                (0x28, 20), (0x29, 60)))
+            check('threshold mode %d' % mode,
+                  (out[5], out[20], out[45]), want)
+
+        # logic and arithmetic
+        out = ive_run(qt, 0x0C, 0, w, h, ramp, other)
+        check('and', out[:n], bytes(a & b for a, b in zip(ramp, other)))
+        out = ive_run(qt, 0x0D, 0, w, h, ramp, other)
+        check('or', out[:n], bytes(a | b for a, b in zip(ramp, other)))
+        out = ive_run(qt, 0x0E, 0, w, h, ramp, other)
+        check('xor', out[:n], bytes(a ^ b for a, b in zip(ramp, other)))
+        out = ive_run(qt, 0x0F, 0, w, h, ramp, other,
+                      regs=((0x2B, 0x4000), (0x2C, 0xC000)))
+        check('add: xA + yB in Q16', out[:n],
+              bytes(min(255, (a * 0x4000 + b * 0xC000 + 0x8000) >> 16)
+                    for a, b in zip(ramp, other)))
+        out = ive_run(qt, 0x10, 0, w, h, ramp, other)
+        check('sub: absolute', out[:n],
+              bytes(abs(a - b) for a, b in zip(ramp, other)))
+        out = ive_run(qt, 0x10, 1, w, h, ramp, other)
+        check('sub: shifted, sign kept', out[:n],
+              bytes(((a - b) >> 1) & 0xFF for a, b in zip(ramp, other)))
+
+        # the map table in source 1, the image in source 2
+        table = bytes(255 - i for i in range(256))
+        out = ive_run(qt, 0x12, 0, w, h, table, ramp)
+        check('map', out[:n], bytes(255 - a for a in ramp))
+
+        out = ive_run(qt, 0x13, 0, w, h, bytes([7] * 30 + [9] * 50))
+        check('histogram', struct.unpack('<256I', out[:1024])[7:10],
+              (30, 0, 50))
+
+        # integral image, sum only
+        out = ive_run(qt, 0x14, 1, w, h, bytes([2] * n))
+        check('integral: bottom right', struct.unpack('<I', out[n * 4 - 4:n * 4])[0],
+              2 * n)
+
+        # SAD over 4x4 blocks into 16 bits
+        a = bytes([10] * 64)
+        b = bytes([13] * 64)
+        out = ive_run(qt, 0x15, 0, 16, 4, a + b'\0' * 0, b,
+                      regs=((0x05, 2 << 8), ))
+        check('SAD: 4x4 of 3', struct.unpack('<H', out[:2])[0], 48)
+
+        out = ive_run(qt, 0x16, 0, w, h, bytes([2] * n), bytes([3] * n))
+        check('NCC: numerator, sum1, sum2',
+              struct.unpack('<3Q', out[:24]), (6 * n, 4 * n, 9 * n))
+
+        # LBP: a brighter neighbour at the top left sets bit 0
+        lbp = bytearray([50] * n)
+        lbp[1 * w + 3] = 90
+        out = ive_run(qt, 0x18, 0, w, h, bytes(lbp), regs=((0x28, 9),))
+        check('LBP: a neighbour over the threshold', out[2 * w + 4], 1)
+
+        out = ive_run(qt, 0x18, 0, w, h, bytes(lbp), regs=((0x28, 40),))
+        check('LBP: the driver\'s thresh - 1, so at it is not over',
+              out[2 * w + 4], 0)
+
+        # strides count pixels, 16-bit ones too
+        rows = [struct.pack('<%dH' % w, *([300 + 20 * y] * w)) + b'\xEE' * 8
+                for y in range(h)]
+        out = ive_run(qt, 0x11, 3, w, h, b''.join(rows),
+                      regs=((0x2A, 0x8000),), stride=w + 4)
+        check('16 to 8: a 16-bit stride', out[w + 4], 160)
+
+        # 16 to 8: 1/2 of a 16-bit value
+        v = struct.pack('<%dH' % n, *([300] * n))
+        out = ive_run(qt, 0x11, 3, w, h, v, regs=((0x2A, 0x8000),))
+        check('16 to 8: U16 scaled', out[:2], bytes([150, 150]))
+
+        # order statistics
+        spot = bytearray([10] * n)
+        spot[2 * w + 8] = 200
+        out = ive_run(qt, 0x05, 0, w, h, bytes(spot))
+        check('median removes a spot', out[2 * w + 8], 10)
+        out = ive_run(qt, 0x05, 1, w, h, bytes(spot))
+        check('max spreads it', out[2 * w + 7], 200)
+
+        # Sobel, horizontal gradient of a ramp
+        s = [0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, -2, 0, 2, 0, 0, -1, 0, 1, 0,
+             0, 0, 0, 0, 0]
+        grad = bytes(x * 10 for _ in range(h) for x in range(w))
+        out = ive_run(qt, 0x03, 0, w, h, grad, regs=ive_mask(s) +
+                      [(0x05, 1 << 8)])
+        check('sobel: horizontal, S16',
+              struct.unpack('<h', out[(2 * w + 5) * 2:(2 * w + 5) * 2 + 2])[0],
+              80)
+
+        # Bernsen 3x3: the local midpoint
+        out = ive_run(qt, 0x06, 0, w, h, bytes(spot))
+        check('bernsen: over the midpoint', out[2 * w + 8], 255)
+        check('bernsen: under it', out[2 * w + 7], 0)
+
+        # the 16-bit thresholds: low, between, high
+        v = struct.pack('<%dh' % n, *([-100, 5, 100] * n)[:n])
+        out = ive_run(qt, 0x0A, 0, w, h, v,
+                      regs=((0x1A, 1 | 2 << 8), (0x1B, 3),
+                            (0x28, 0xFFF6), (0x29, 50)))
+        check('threshold S16: signed against signed', out[:3],
+              bytes([1, 2, 3]))
+        v = struct.pack('<%dH' % n, *([10, 300, 4000] * n)[:n])
+        out = ive_run(qt, 0x0B, 1, w, h, v,
+                      regs=((0x1A, 1 | 2 << 8), (0x1B, 3),
+                            (0x28, 200), (0x29, 500)))
+        check('threshold U16: the original between', out[:3],
+              bytes([1, 44, 3]))
+
+        # magnitude, the angle second
+        out = ive_run(qt, 0x04, 1, w, h, grad, regs=ive_mask(s) +
+                      [(0x05, 1 << 8), (0x28, 1)])
+        check('magnitude: |Gx| + |Gy|',
+              struct.unpack('<H', out[(2 * w + 5) * 2:(2 * w + 5) * 2 + 2])[0],
+              80)
+        check('magnitude: a horizontal gradient\'s angle is 0',
+              qt.readb(IVE_DST2 + 2 * w + 5), 0)
+
+        # integral, sum and square sum together
+        out = ive_run(qt, 0x14, 0, w, h, bytes([2] * n))
+        q = struct.unpack('<Q', out[(n - 1) * 8:n * 8])[0] if n * 8 <= 0x400 \
+            else 0
+        check('integral both: sum under the square sum',
+              (q & 0xFFFFFFF, q >> 28), (2 * n, 4 * n))
+
+        # CSC, packed: unity with an offset and a clamp
+        rgb = bytes([10, 20, 30] * n)
+        regs = [(0x30, 0x100), (0x31, 0), (0x32, 0), (0x33, 0), (0x34, 0x100),
+                (0x35, 0), (0x36, 0), (0x37, 0), (0x38, 0x100),
+                (0x39, 5), (0x3A, 0), (0x3B, 0xFFF),
+                (0x3C, 0xFF00), (0x3D, 0x0F00), (0x3E, 0xFF21)]
+        out = ive_run(qt, 0x01, 0, w, h, rgb, regs=regs, fmt=4 | 4 << 8)
+        check('CSC: Q8, signed offsets, both clamps', out[:3],
+              bytes([15, 15, 33]))
+
+        # filter and CSC together: the filter reaches the first channel
+        b64write(qt, IVE_SRC2 + 0x8000, bytes([30] * n))
+        out = ive_run(qt, 0x02, 0, w, h, bytes([100] * n), bytes([20] * n),
+                      regs=ive_mask([0] * 12 + [2] + [0] * 12) + regs +
+                      [(0x10, (IVE_SRC2 + 0x8000 - DRAM) & 0xFFFF),
+                       (0x11, (IVE_SRC2 + 0x8000 - DRAM) >> 16),
+                       (0x18, w - 1), (0x19, w - 1)],
+                      fmt=2 | 4 << 8)
+        check('filter and CSC: the filtered channel', out[:3],
+              bytes([205, 15, 33]))
+
+        # bits 0 clear: the interrupt masked in, then cleared
+        check('frame done cleared', qt.readw(IVE0 + 0x13 * 4) & 1, 0)
+        check('cycle counter ran', qt.readw(IVE0 + 0x40 * 4) != 0, True)
+    finally:
+        qt.close()
 
 
 def test_sensor_catalogue(qemu):
@@ -2087,6 +2365,1171 @@ def test_ssc029(qemu, tmp):
         qt.close()
 
 
+def i6_image(tmp, name):
+    path = os.path.join(tmp, name)
+    img = bytearray(b'\xFF' * 0x1000000)
+    img[0:12] = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    img[0x1234:0x1238] = b'NOR!'
+    open(path, 'wb').write(img)
+    return path
+
+
+def test_i6e_media(qemu, tmp):
+    print('infinity6e media: VIF, ISP, the Wave5 encoder, SCL interrupts')
+    path = i6_image(tmp, 'i6m.bin')
+    wave = 0x1F345200
+    bs = 0x01000000     # MIU; DRAM holds it at +0x20000000
+    src = 0x01100000
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
+    try:
+        # MIIC1 DMA: a NACK is reported, as HAL_HWI2C_DMA_WaitDone reads it
+        i2c = 0x1F223200
+        def dma_read(addr):
+            qt.writew(i2c + 0x2A * 4, 1)
+            qt.writew(i2c + 0x29 * 4, 0)
+            qt.writew(i2c + 0x23 * 4, 1 << 6)
+            qt.writew(i2c + 0x21 * 4, 0)
+            qt.writew(i2c + 0x22 * 4, 0x0120)
+            qt.writew(i2c + 0x2E * 4, addr)
+            qt.writew(i2c + 0x2F * 4, 1)
+            qt.writew(i2c + 0x24 * 4, 1)
+            return (qt.readw(i2c + 0x02 * 4) >> 8) & 1
+        check('MIIC DMA: nobody at 0x40 is a NACK', dma_read(0x40), 1)
+        check('MIIC DMA: the imx415 at 0x1A answers', dma_read(0x1A), 0)
+        # VIF: unmasked but not enabled, no frames
+        vif = riu(0x1304, 0)
+        qt.writew(vif + 0x0B * 4, 0xFFDE)
+        qt.step(100 * 1000000)
+        check('VIF: no frames before the channel is enabled',
+              qt.readw(vif + 0x0E * 4), 0)
+        qt.writew(vif, 0x8000)
+        qt.step(50 * 1000000)
+        check('VIF: frame start and frame end once enabled',
+              qt.readw(vif + 0x0E * 4) & 0x21, 0x21)
+        qt.writew(vif + 0x0D * 4, 0x21)
+        check('VIF: status clears', qt.readw(vif + 0x0E * 4) & 0x21, 0)
+        qt.writew(vif, 0)
+        # ISP: five groups, so reg 0x40 is not a mask reset to all ones
+        isp = riu(0x1302, 0)
+        check('ISP: group 1 masked from reset', qt.readw(isp + 0x28 * 4), 0xFFFF)
+        check('ISP: reg 0x40 (WDMA status, polled for bit 9) idle',
+              qt.readw(isp + 0x40 * 4) & 0x200, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.step(100 * 1000000)
+        check('ISP: no frames before ISP_EnableISP', qt.readw(isp + 0x2B * 4), 0)
+        qt.writew(isp, 1)
+        qt.step(50 * 1000000)
+        check('ISP: frames once enabled',
+              (qt.readw(isp + 0x2B * 4) >> 12) & 1, 1)
+        qt.writew(isp, 0)
+        # Wave5: boot
+        check('Wave5: not running before INIT_VPU', qt.readl(wave + 0x04), 0)
+        qt.writel(wave + 0x70, 1)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+        check('Wave5: INIT_VPU ends busy', qt.readl(wave + 0x70), 0)
+        check('Wave5: INIT_VPU succeeded', qt.readl(wave + 0x108), 1)
+        check('Wave5: running', qt.readl(wave + 0x04) != 0, True)
+        check('Wave5: FIO ready', qt.readl(wave + 0x20) >> 31, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        cmd(0x0008)
+        qt.writel(wave + 0x11C, 64 << 16 | 64)
+        qt.writel(wave + 0x130, 2 << 16)
+        cmd(0x0200)
+        cmd(0x4000, 0x40)
+        check('Wave5: sequence query succeeds', qt.readl(wave + 0x1DC), 1)
+        check('Wave5: one framebuffer asked for', qt.readl(wave + 0x11C), 1)
+        # headers
+        qt.writel(wave + 0x118, bs)
+        qt.writel(wave + 0x11C, 0x10000)
+        cmd(0x0100, 0x10)
+        qt.step(10 * 1000000)
+        cmd(0x4000, 0x02)
+        n = qt.readl(wave + 0x14C)
+        check('Wave5: headers written', n > 0, True)
+        head = [qt.readl(0x20000000 + bs + i) for i in range(0, 8, 4)]
+        check('Wave5: headers start with a VPS',
+              [head[0], head[1] & 0x7E], [0x01000000, 32 << 1])
+        # pictures: a source, IDR then P with a GOP of 2
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + src + i, 0x80808080 if i >= 64 * 64
+                      else 0x20406080)
+        sizes = []
+        for f in range(3):
+            qt.writel(wave + 0x118, bs)
+            qt.writel(wave + 0x11C, 0x10000)
+            qt.writel(wave + 0x148, src)
+            qt.writel(wave + 0x14C, src + 64 * 64)
+            qt.writel(wave + 0x154, 64 << 16 | 64)
+            qt.writel(wave + 0x1E8, 0)
+            qt.writel(wave + 0x34, 0xFFFFFFFF)
+            qt.writel(wave + 0x48, 0x100)
+            cmd(0x0100, 0x02)
+            check('Wave5: picture %d busy until done' % f,
+                  qt.readl(wave + 0x70), 1)
+            qt.step(10 * 1000000)
+            check('Wave5: picture %d done' % f, qt.readl(wave + 0x70), 0)
+            check('Wave5: picture %d in the done-instance bits' % f,
+                  qt.readl(wave + 0x1E8), 1)
+            check('Wave5: picture %d raises the encoder bit' % f,
+                  qt.readl(wave + 0x4C) & 0x100, 0x100)
+            cmd(0x4000, 0x02)
+            check('Wave5: picture %d type' % f, qt.readl(wave + 0x124),
+                  [0, 1, 0][f])
+            check('Wave5: no stale warning', qt.readl(wave + 0x1D4), 0)
+            sizes.append(qt.readl(wave + 0x14C))
+            w = qt.readl(0x20000000 + bs)
+            b = qt.readl(0x20000000 + bs + 4) & 0xFF
+            check('Wave5: picture %d starts with %s' % (f, ['a VPS', 'a slice',
+                                                            'a VPS'][f]),
+                  [w, (b >> 1) & 0x3F], [0x01000000, [32, 1, 32][f]])
+        check('Wave5: a P picture of the same source is smaller',
+              sizes[1] < sizes[0], True)
+        # strides narrower than the picture, and a stream buffer of 4 GiB
+        qt.writel(wave + 0x118, bs)
+        qt.writel(wave + 0x11C, 0xFFFFFFFF)
+        qt.writel(wave + 0x148, src)
+        qt.writel(wave + 0x14C, src + 64 * 64)
+        qt.writel(wave + 0x154, 1 << 16 | 1)
+        cmd(0x0100, 0x02)
+        qt.step(10 * 1000000)
+        check('Wave5: survives them', qt.proc.poll() is None, True)
+        cmd(0x4000, 0x02)
+        # headers asked for mid-GOP, as mi_venc does, leave the stream alone
+        mid = 2
+        cmd(0x0008, 0, mid)
+        qt.writel(wave + 0x11C, 64 << 16 | 64)
+        qt.writel(wave + 0x130, 30 << 16)
+        cmd(0x0200, 0, mid)
+        pocs = []
+        for f in range(4):
+            qt.writel(wave + 0x118, bs)
+            qt.writel(wave + 0x11C, 0x10000)
+            if f == 2:
+                cmd(0x0100, 0x10, mid)
+                qt.step(10 * 1000000)
+                cmd(0x4000, 0x02, mid)
+                qt.writel(wave + 0x118, bs)
+                qt.writel(wave + 0x11C, 0x10000)
+            qt.writel(wave + 0x148, src)
+            qt.writel(wave + 0x14C, src + 64 * 64)
+            qt.writel(wave + 0x154, 64 << 16 | 64)
+            cmd(0x0100, 0x02, mid)
+            qt.step(10 * 1000000)
+            cmd(0x4000, 0x02, mid)
+            pocs.append(qt.readl(wave + 0x128))
+        check('Wave5: POC runs on across a header request',
+              pocs[3] - pocs[0], 3)
+        # H.264: the instance register's high half, as mi_venc writes it
+        avc = 3 << 16 | 1
+        cmd(0x0008, 0, avc)
+        qt.writel(wave + 0x11C, 64 << 16 | 64)
+        qt.writel(wave + 0x130, 2 << 16)
+        cmd(0x0200, 0, avc)
+        qt.writel(wave + 0x118, bs)
+        qt.writel(wave + 0x11C, 0x10000)
+        cmd(0x0100, 0x10, avc)
+        qt.step(10 * 1000000)
+        cmd(0x4000, 0x02, avc)
+        check('AVC: headers are an SPS', [qt.readl(0x20000000 + bs),
+              qt.readb(0x20000000 + bs + 4)], [0x01000000, 0x67])
+        check('AVC: and no VPS', qt.readb(0x20000000 + bs + 4) >> 1 & 0x3F != 32,
+              True)
+        nal = []
+        for f in range(2):
+            qt.writel(wave + 0x118, bs)
+            qt.writel(wave + 0x11C, 0x10000)
+            qt.writel(wave + 0x148, src)
+            qt.writel(wave + 0x14C, src + 64 * 64)
+            qt.writel(wave + 0x154, 64 << 16 | 64)
+            cmd(0x0100, 0x02, avc)
+            qt.step(10 * 1000000)
+            cmd(0x4000, 0x02, avc)
+            nal.append(qt.readb(0x20000000 + bs + 4))
+        check('AVC: the IDR brings its SPS, the next is a slice', nal,
+              [0x67, 0x41])
+        # SCL interrupts
+        sc = riu(0x1218, 0)
+        check('SCL: masked from reset', qt.readw(sc + 0x08 * 4), 0xFFFF)
+    finally:
+        qt.close()
+
+
+def test_sd2(qemu, tmp):
+    print('second SD hosts: their bank, their own card')
+    card = os.path.join(tmp, 'card2.img')
+    with open(card, 'wb') as f:
+        f.truncate(16 * 1024 * 1024)
+    extra = ['-drive', 'if=sd,index=1,format=raw,file=' + card]
+    path = i6_image(tmp, 'i6sd.bin')
+    for machine in ('ssc325', 'ssc337', 'ssc338q', 'ssc377'):
+        qt = QTest(qemu, machine + ',flash-file=' + path, extra)
+        try:
+            check(machine + ': a host at bank 0x1410 answers its reset',
+                  (qt.writew(riu(0x1410, 0x3F), 0) or
+                   qt.readw(riu(0x1410, 0x3F))) & 0xE, 0xE)
+        finally:
+            qt.close()
+
+
+def test_i6_media(qemu, tmp):
+    print('infinity6 media: the wiring OpenIPC\'s mhal.ko expects')
+    path = i6_image(tmp, 'i6m.bin')
+    qt = QTest(qemu, 'ssc325,flash-file=' + path, [])
+    try:
+        isp = riu(0x1302, 0)
+        for reg in (0x28, 0x56, 0x4A, 0x5B, 0x2D):
+            check('ISP: a group masked from reset at reg 0x%x' % reg,
+                  qt.readw(isp + reg * 4), 0xFFFF)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(50 * 1000000)
+        check('ISP: frame start and process done, DrvIspISR',
+              qt.readw(isp + 0x2B * 4) >> 14, 3)
+        check('ISP: no ROT ERROR in the fifth group',
+              qt.readw(isp + 0x30 * 4), 0)
+        vif = riu(0x1319, 0)
+        qt.writew(vif, 0x8000)
+        qt.writew(vif + 0x0B * 4, 0)
+        qt.step(50 * 1000000)
+        check('VIF: at bank 0x1319, frame end on bit 1',
+              qt.readw(vif + 0x0E * 4) & 3, 3)
+        cq = riu(0x1120, 0)
+        check('CMDQ: idle, with HAL_CMDQ_Read_Irq_Status\'s error bits clear',
+              qt.readw(cq + 0x45 * 4) & 0x1F00, 0x0800)
+        check('H.265 is not modelled here: no Wave5 at 0x1F345200',
+              qt.readl(0x1F345204), 0)
+        mfe = 0x1F264E00
+        qt.writew(mfe + 0x1C * 4, 0xFE)
+        check('MFE: at the DTS "mfe-0"', qt.readw(mfe + 0x1C * 4) & 0xFF, 0xFE)
+    finally:
+        qt.close()
+
+
+def test_i6_jpe(qemu, tmp):
+    print('infinity6 family JPE: jpe2\'s registers, its own interrupt mask')
+    path = i6_image(tmp, 'i6j.bin')
+    jpe = 0x1F2C4000
+    qt = QTest(qemu, 'ssc337,flash-file=' + path, [])
+    try:
+        check('masked from reset', qt.readw(jpe + 0x22 * 4), 0xFF)
+        qt.writew(jpe + 0x01 * 4, 64)
+        qt.writew(jpe + 0x02 * 4, 64)
+        qt.writew(jpe + 0x5E * 4, 0x0404)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(DRAM + 0x100000 + i, 0x80808080)
+        qt.writew(jpe + 0x06 * 4, 0x1000)
+        qt.writew(jpe + 0x07 * 4, 0)
+        qt.writew(jpe + 0x0A * 4, 0x1100)
+        qt.writew(jpe + 0x0B * 4, 0)
+        out, end = 0x200000 >> 2, 0x20FFFF >> 2
+        for addr, name in ((out, 0), (end, 1)):
+            qt.writew(jpe + 0x3C * 4, addr & 0xFFFF)
+            qt.writew(jpe + 0x3D * 4, addr >> 16 | name << 14)
+            qt.writew(jpe + 0x3E * 4, 1)
+        qt.writew(jpe + 0x22 * 4, 0xFE)
+        qt.writew(jpe + 0x00 * 4, 3)
+        qt.step(100 * 1000000)
+        check('frame done, past the mask at 0x22',
+              qt.readw(jpe + 0x1E * 4) & 1, 1)
+        check('a scan in DRAM', qt.readl(DRAM + 0x200000) != 0, True)
+        qt.writew(jpe + 0x1D * 4, 1)
+        check('0x1D clears it', qt.readw(jpe + 0x1E * 4) & 1, 0)
+        # infinity6e's driver resets just after the start it means
+        qt.writew(jpe + 0x00 * 4, 3)
+        qt.writew(jpe + 0x06 * 4, 1)
+        qt.writew(jpe + 0x00 * 4, 0xF0)
+        qt.writew(jpe + 0x00 * 4, 0xF2)
+        qt.step(100 * 1000000)
+        check('a reset after the start leaves the frame',
+              qt.readw(jpe + 0x1E * 4) & 1, 1)
+        check('and its source', qt.readw(jpe + 0x06 * 4), 0x1000)
+        # a source past DRAM, unmapped: the scaler's pattern, not wrapped DRAM
+        def scan(page):
+            qt.writew(jpe + 0x06 * 4, page & 0xFFFF)
+            qt.writew(jpe + 0x07 * 4, page >> 16)
+            qt.writew(jpe + 0x1D * 4, 0xFF)
+            qt.writew(jpe + 0x00 * 4, 3)
+            qt.step(100 * 1000000)
+            return qt.readw(jpe + 0x44 * 4)
+
+        # 128 MiB here: past it reads as nothing, unless it is the pattern
+        check('a source past DRAM is the test pattern',
+              scan(0x100000) != scan(0x7000), True)
+        qt.writew(jpe + 0x06 * 4, 0x1000)
+        qt.writew(jpe + 0x07 * 4, 0)
+        # infinity6e's driver finishes a picture from a record the engine
+        # writes: _IsrFunc() and _EncDone()
+        dump = 0x300000
+        qt.writew(jpe + 0x52 * 4, (dump >> 4) & 0xFFFF)
+        qt.writew(jpe + 0x53 * 4, dump >> 20)
+        qt.writew(jpe + 0x1D * 4, 1)
+        qt.writew(jpe + 0x00 * 4, 3)
+        qt.step(100 * 1000000)
+        check('no record while 0x53 bit 15 is off',
+              qt.readl(DRAM + dump + 4), 0)
+        qt.writew(jpe + 0x53 * 4, dump >> 20 | 0x8000)
+        # a size that ends inside a word, so the index is not 0
+        for height in range(64, 160, 8):
+            qt.writew(jpe + 0x02 * 4, height)
+            qt.writel(DRAM + 0x100000 + height, 0x8000FF40 + height)
+            qt.writew(jpe + 0x1D * 4, 1)
+            qt.writew(jpe + 0x00 * 4, 3)
+            qt.step(100 * 1000000)
+            if qt.readw(jpe + 0x42 * 4) & 3:
+                break
+        check('a scan ending inside a word',
+              qt.readw(jpe + 0x42 * 4) & 3 != 0, True)
+        word = qt.readl(DRAM + dump + 4)
+        check('the record names a finished picture', word & 0x1FF, 1)
+        check('from the output buffer\'s start',
+              qt.readl(DRAM + dump + 8), out)
+        wptr = qt.readw(jpe + 0x44 * 4) | qt.readw(jpe + 0x45 * 4) << 16
+        check('to the last word', qt.readl(DRAM + dump + 12), wptr)
+        check('and the byte in it', word >> 24 & 3,
+              qt.readw(jpe + 0x42 * 4) & 3)
+        # a full buffer is a picture in progress to the driver
+        qt.writel(DRAM + dump + 4, 0)
+        for addr, name in ((out, 0), (out + 4, 1)):
+            qt.writew(jpe + 0x3C * 4, addr & 0xFFFF)
+            qt.writew(jpe + 0x3D * 4, addr >> 16 | name << 14)
+            qt.writew(jpe + 0x3E * 4, 1)
+        qt.writew(jpe + 0x1D * 4, 0xFF)
+        qt.writew(jpe + 0x22 * 4, 0xFC)
+        qt.writew(jpe + 0x00 * 4, 3)
+        qt.step(100 * 1000000)
+        check('buffer full', qt.readw(jpe + 0x1E * 4) & 2, 2)
+        check('leaves no record', qt.readl(DRAM + dump + 4), 0)
+    finally:
+        qt.close()
+
+
+def test_i6_mask(qemu, tmp):
+    print('infinity6 proper: JPE and the scaler\'s first interrupt')
+    path = i6_image(tmp, 'i6m.bin')
+    jpe = 0x1F264000
+    qt = QTest(qemu, 'ssc325,flash-file=' + path, [])
+    try:
+        check('the JPE mask stays at 0x1C', qt.readw(jpe + 0x1C * 4), 0xFF)
+        check('0x22 is free', qt.readw(jpe + 0x22 * 4), 0)
+        scl = riu(0x1218, 0)
+        # no buffer programmed: the driver waits for this one to set it
+        for r in range(3):
+            qt.writew(scl + (0x08 + r) * 4, 0)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(100 * 1000000)
+        check('the scaler interrupts with no buffer',
+              qt.readw(scl + 0x13 * 4) != 0, True)
+    finally:
+        qt.close()
+
+
+def test_i6_mfe(qemu, tmp):
+    print('infinity6 MFE: the ven banks, the record, I and P')
+    path = i6_image(tmp, 'i6f.bin')
+    mfe, ven, out = 0x1F264E00, riu(0x1329, 0), riu(0x132B, 0)
+    w, h, src, obuf = 128, 96, 0x100000, 0x200000
+    rec_a, rec_b = 0x300000, 0x310000
+
+    def job(qt, rec, intra, start=True):
+        for r, v in ((0x11, w), (0x12, h), (0x15, w),
+                     (0x20, src & 0xFFFF), (0x21, src >> 16),
+                     (0x22, (src + w * h) & 0xFFFF),
+                     (0x23, (src + w * h) >> 16)):
+            qt.writew(ven + r * 4, v)
+        for r, v in ((0x03, obuf & 0xFFFF), (0x04, obuf >> 16),
+                     (0x05, 0xFFF0), (0x06, (obuf >> 16))):
+            qt.writew(out + r * 4, v)
+        qt.writew(mfe + 0x1C * 4, 0)
+        qt.writew(mfe + 0x1D * 4, 0xFF)
+        qt.writew(mfe + 0x00 * 4, 0xE200)
+        qt.writew(mfe + 0x01 * 4, (rec >> 4) & 0xFFFF)
+        qt.writew(mfe + 0x02 * 4, rec >> 20)
+        qt.writew(mfe + 0x03 * 4, 0x0243)
+        qt.writew(mfe + 0x39 * 4, 0x9C if intra else 0x8C)
+        qt.writew(ven + 0x10 * 4, 0x0609 if start else 0x0608)
+        qt.writew(mfe + 0x47 * 4, 0x10)
+        qt.writew(mfe + 0x46 * 4, 0x1234)
+        qt.writew(mfe + 0x48 * 4, 0x0800)
+        return qt.readw(mfe + 0x42 * 4) | qt.readw(mfe + 0x43 * 4) << 16
+
+    qt = QTest(qemu, 'ssc325,flash-file=' + path, [])
+    try:
+        x = 1
+        # noise in Y only, so that the planes cannot be swapped unseen
+        for i in range(0, w * h, 4):
+            x = (x * 1103515245 + 12345) & 0xFFFFFFFF
+            qt.writel(DRAM + src + i, x)
+        for i in range(0, w * h // 2, 4):
+            qt.writel(DRAM + src + w * h + i, 0x80808080)
+        job(qt, rec_a, True, start=False)
+        check('no start bit, no frame', qt.readw(mfe + 0x1E * 4) & 1, 0)
+        check('and no record', qt.readl(DRAM + rec_a), 0)
+        bits_i = job(qt, rec_a, True)
+        check('frame done', qt.readw(mfe + 0x1E * 4) & 1, 1)
+        check('the record: the bit count',
+              qt.readw(DRAM + rec_a) | qt.readw(DRAM + rec_a + 2) << 16,
+              bits_i)
+        check('more bits than 16 can hold', bits_i > 0xFFFF, True)
+        check('the record: done', qt.readw(DRAM + rec_a + 0xBE) & 1, 1)
+        check('the header, at the output buffer in 0x132B',
+              qt.readw(DRAM + obuf), 0x3412)
+        check('a whole picture of noise, at 0x1329\'s size',
+              bits_i > w * h * 8, True)
+        qt.writew(mfe + 0x90 * 4, 1)
+        check('the pitch is 0x1329\'s, not 0x90\'s',
+              job(qt, rec_a, True), bits_i)
+        bits_p = job(qt, rec_a, False)
+        check('0x39 bit 4 clear: P, skipped against its reference',
+              bits_p < bits_i / 8, True)
+        bits_other = job(qt, rec_b, False)
+        check('another stream has its own reference',
+              bits_other > bits_i / 2, True)
+        check('its record is its own',
+              qt.readw(DRAM + rec_b + 0xBE) & 1, 1)
+        qt.writew(mfe + 0x1D * 4, 0xFF)
+        qt.writew(mfe + 0x1C * 4, 0x0100)
+        check('CMDQ\'s force raises frame done',
+              qt.readw(mfe + 0x1E * 4) & 1, 1)
+    finally:
+        qt.close()
+
+
+def test_i6_mhe(qemu, tmp):
+    print('infinity6 MHE: the packer, the record, I and P')
+    path = i6_image(tmp, 'i6h.bin')
+    mhe, ven, out = 0x1F264800, riu(0x1329, 0), riu(0x132B, 0)
+    w, h, src, obuf = 640, 480, 0x100000, 0x200000
+    rec_a, rec_b = 0x300000, 0x310000
+    idr = (0x0000, 0x0001, 0x2601, 0xAC10, 0xC000)
+    trail = (0x0000, 0x0001, 0x0201, 0xD00C, 0x8218)
+
+    def job(qt, rec, words, qp=30, start=True, rec_on=True):
+        for r, v in ((0x13, w - 1), (0x14, h - 1), (0x15, w),
+                     (0x20, src & 0xFFFF), (0x21, src >> 16),
+                     (0x22, (src + w * h) & 0xFFFF),
+                     (0x23, (src + w * h) >> 16)):
+            qt.writew(ven + r * 4, v)
+        for r, v in ((0x03, obuf & 0xFFFF), (0x04, obuf >> 16),
+                     (0x05, 0xFFF0), (0x06, (obuf >> 16))):
+            qt.writew(out + r * 4, v)
+        qt.writew(mhe + 0x1C * 4, 0)
+        qt.writew(mhe + 0x1D * 4, 0xFF)
+        qt.writew(mhe + 0x48 * 4, qp)
+        qt.writew(mhe + 0x400 + 0x65 * 4, rec & 0xFFFF)
+        qt.writew(mhe + 0x400 + 0x66 * 4, rec >> 16)
+        qt.writew(mhe + 0x400 + 0x67 * 4, 1 if rec_on else 0)
+        qt.writew(ven + 0x10 * 4, 0x0603 if start else 0x0602)
+        qt.writew(mhe + 0x4A * 4, (len(words) - 1) << 5 | 8)
+        for v in words:
+            qt.writew(mhe + 0x49 * 4, v)
+            qt.writew(mhe + 0x4B * 4, 0x2F38)
+        return (qt.readw(mhe + 0x200 + 0x73 * 4) |
+                qt.readw(mhe + 0x200 + 0x74 * 4) << 16)
+
+    qt = QTest(qemu, 'ssc325,flash-file=' + path, [])
+    try:
+        # hevc-enc codes a block's level, so flat 8x8 blocks of noise
+        x = 1
+        for by in range(0, h, 8):
+            row = []
+            for bx in range(0, w, 8):
+                x = (x * 1103515245 + 12345) & 0xFFFFFFFF
+                row.append(((x >> 16) & 0xFF) * 0x01010101)
+            for line in range(8):
+                base = DRAM + src + (by + line) * w
+                for i, v in enumerate(row):
+                    qt.writel(base + i * 8, v)
+                    qt.writel(base + i * 8 + 4, v)
+        for i in range(0, w * h // 2, 4):
+            qt.writel(DRAM + src + w * h + i, 0x80808080)
+        job(qt, rec_a, idr, start=False)
+        check('no start bit, no frame', qt.readw(mhe + 0x1E * 4) & 1, 0)
+        job(qt, rec_a, idr, rec_on=False)
+        check('frame done', qt.readw(mhe + 0x1E * 4) & 1, 1)
+        check('no record while 0x67 bit 0 is off', qt.readl(DRAM + rec_a + 8),
+              0)
+        bits_i = job(qt, rec_a, idr)
+        check('the record: the bit count',
+              qt.readw(DRAM + rec_a + 8) | qt.readw(DRAM + rec_a + 10) << 16,
+              bits_i)
+        check('more bits than 16 can hold', bits_i > 0xFFFF, True)
+        check('the record: done', qt.readw(DRAM + rec_a + 0x10) & 1, 1)
+        check('the packer\'s bytes first, in 0x132B\'s buffer',
+              qt.readl(DRAM + obuf + 4), 0x10AC0126)
+        check('the slice data past them',
+              qt.readl(DRAM + obuf + 9) != 0, True)
+        check('0x48 is the QP', job(qt, rec_a, idr, qp=8) > bits_i * 5 / 4,
+              True)
+        bits_p = job(qt, rec_a, trail)
+        check('a TRAIL NAL: P, skipped against its reference',
+              bits_p < bits_i / 8, True)
+        bits_other = job(qt, rec_b, trail)
+        check('another stream has its own reference',
+              bits_other > bits_i / 2, True)
+        qt.writew(mhe + 0x1D * 4, 0xFF)
+        qt.writew(mhe + 0x1C * 4, 0x0100)
+        check('CMDQ\'s force raises frame done',
+              qt.readw(mhe + 0x1E * 4) & 1, 1)
+    finally:
+        qt.close()
+
+
+def test_i6_all_machines(qemu, tmp):
+    print('every infinity6 family and msc316 machine starts')
+    i6 = i6_image(tmp, 'i6all.bin')
+    for machine in ('ssc325', 'ssc325de', 'ssc333', 'ssc335', 'ssc335de',
+                    'ssc337', 'ssc337de', 'ssc338q', 'ssc30kd', 'ssc30kq',
+                    'ssc377', 'ssc377d', 'ssc377de', 'ssc377qe', 'ssc378de',
+                    'ssc378qe'):
+        qt = QTest(qemu, machine + ',flash-file=' + i6, [])
+        try:
+            qt.step(1000000)
+            check(machine + ': starts', qt.proc.poll() is None, True)
+        finally:
+            qt.close()
+
+
+def test_guest_limits(qemu, tmp):
+    print('what a guest or an image cannot do to the host')
+    path = os.path.join(tmp, 'i3-lim.bin')
+    make_i3_image(path)
+    qt = QTest(qemu, 'msc313e,flash-file=' + path, [])
+    try:
+        ive = ((0x00, 0, 0xFFFF, 0xFFFF, 'a 65536-square picture'),
+               (0x00, 0, 0xFFFF, 0, 'a 65536-wide picture'),
+               (0x01, 0, 0, 4, 'colour conversion one pixel wide'))
+        for op, mode, w, h, name in ive:
+            qt.writew(IVE1 + 0x04 * 4, op | mode << 8)
+            qt.writew(IVE1 + 0x05 * 4, 0)
+            qt.writew(IVE1 + 0x06 * 4, w)
+            qt.writew(IVE1 + 0x07 * 4, h)
+            qt.writew(IVE0, 1)
+            check('IVE: ' + name + ' is refused',
+                  qt.readw(IVE0 + 0x40 * 4), 0)
+        qt.writew(IVE1 + 0x04 * 4, 0x15 | 30 << 8)
+        qt.writew(IVE1 + 0x06 * 4, 63)
+        qt.writew(IVE1 + 0x07 * 4, 63)
+        qt.writew(IVE0, 1)
+        check('IVE: an absurd SAD block mode', qt.proc.poll() is None, True)
+    finally:
+        qt.close()
+    bad = os.path.join(tmp, 'nand-bad.bin')
+    with open(bad, 'wb') as f:
+        f.write(b'MSTARSEMIUSFDCIS' + bytes(0x10000 - 16))
+    p = subprocess.run([qemu, '-M', 'ssc337,flash-file=' + bad, '-display',
+                        'none', '-nodefaults', '-S'], capture_output=True,
+                       timeout=30)
+    check('NAND: a zero geometry is an error, not a crash', p.returncode, 1)
+    boot = os.path.join(tmp, 'boot.bin')
+    with open(boot, 'wb') as f:
+        f.write(bytes(4096))
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
+                        'tools', 'sstar-nand-image.py')
+    p = subprocess.run([sys.executable, '-I', tool,
+                        os.path.join(tmp, 'o.nand'), boot, '--bad', '0'],
+                       capture_output=True, timeout=30)
+    check('NAND tool: a bad block under an image is refused',
+          p.returncode != 0, True)
+    i6 = i6_image(tmp, 'i6lim.bin')
+    out = hmp(qemu, ['-M', 'ssc338q,flash-file=' + i6, '-machine',
+                     'accel=qtest', '-S'],
+              ['migrate file:' + bad + '.mig', 'info migrate'])
+    check('Wave5: migration is refused, not lossy',
+          'sstar-wave5' in out, True)
+
+
+def test_i6e_ring(qemu, tmp):
+    print('infinity6e scaler ring: what the MMU maps, and who reads it')
+    path = i6_image(tmp, 'i6r.bin')
+    mmu = riu(0x1013, 0)
+    w, h, ya = 1280, 736, 0x30100000
+    ca = ya + w * h
+    guard = 0x1000000
+
+    def map_pages(qt, pages):
+        qt.writew(mmu + 0x50 * 4, 0x0610)
+        qt.writew(mmu + 0x50 * 4, 0x0601)
+        for i, pa in enumerate(pages):
+            qt.writew(mmu + 0x51 * 4, 0x8000 | ((ya >> 17) + i) & 0x3FF)
+            qt.writew(mmu + 0x52 * 4, pa)
+            qt.writew(mmu + 0x5B * 4, 1)
+
+    def frame(qt):
+        dma, stride = riu(0x1213, 0), riu(0x1215, 0)
+        qt.writew(dma + 0x08 * 4, (ya >> 3) & 0xFFFF)
+        qt.writew(dma + 0x09 * 4, ya >> 19)
+        qt.writew(dma + 0x10 * 4, (ca >> 3) & 0xFFFF)
+        qt.writew(dma + 0x11 * 4, ca >> 19)
+        qt.writew(stride + 0x54 * 4, w)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(200 * 1000000)
+
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
+    try:
+        map_pages(qt, range(0x80, 0x80 + 12))
+        qt.writel(DRAM + guard, 0xAAAAAAAA)
+        frame(qt)
+        check('a whole buffer is written',
+              qt.readl(DRAM + guard) != 0xAAAAAAAA, True)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
+    try:
+        # the pages wrap, as a ring's few lines do: nothing unmapped
+        map_pages(qt, [0x80, 0x81, 0x82] * 4)
+        qt.writel(DRAM + guard, 0xAAAAAAAA)
+        frame(qt)
+        check('a ring that wraps is not written',
+              qt.readl(DRAM + guard), 0xAAAAAAAA)
+
+        def jpe_size(y, c):
+            qt.writew(jpe + 0x06 * 4, (y >> 8) & 0xFFFF)
+            qt.writew(jpe + 0x07 * 4, y >> 24)
+            qt.writew(jpe + 0x0A * 4, (c >> 8) & 0xFFFF)
+            qt.writew(jpe + 0x0B * 4, c >> 24)
+            qt.writew(jpe + 0x1D * 4, 0xFF)
+            qt.writew(jpe + 0x00 * 4, 3)
+            qt.step(300 * 1000000)
+            check('the JPE got a picture', qt.readw(jpe + 0x1E * 4) & 1, 1)
+            return (qt.readw(jpe + 0x44 * 4) |
+                    qt.readw(jpe + 0x45 * 4) << 16) - out
+        jpe = 0x1F2C4000
+        qt.writew(jpe + 0x01 * 4, 1280)
+        qt.writew(jpe + 0x02 * 4, 720)
+        qt.writew(jpe + 0x5E * 4, 0x5050)
+        out, end = 0x2000000 >> 2, 0x20FFFFF >> 2
+        for addr, name in ((out, 0), (end, 1)):
+            qt.writew(jpe + 0x3C * 4, addr & 0xFFFF)
+            qt.writew(jpe + 0x3D * 4, addr >> 16 | name << 14)
+            qt.writew(jpe + 0x3E * 4, 1)
+        qt.writew(jpe + 0x22 * 4, 0xFE)
+        flat = jpe_size(0x300000, 0x400000)
+        scene = jpe_size(ya, ca)
+        check('the scene, not the ring\'s flat memory (%d > %d)' % (scene, flat),
+              scene > flat * 3 / 2, True)
+        qt.writew(jpe + 0x01 * 4, 1)
+        qt.writew(jpe + 0x1D * 4, 0xFF)
+        qt.writew(jpe + 0x00 * 4, 3)
+        qt.step(300 * 1000000)
+        check('a picture one pixel wide', qt.proc.poll() is None, True)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
+    try:
+        # the same with the pages past the first few not mapped at all
+        map_pages(qt, [0x80, 0x81, 0x82])
+        qt.writel(DRAM + guard, 0xAAAAAAAA)
+        frame(qt)
+        check('a ring with pages missing is not written',
+              qt.readl(DRAM + guard), 0xAAAAAAAA)
+    finally:
+        qt.close()
+
+
+def test_i6_stats_audio(qemu, tmp):
+    print('infinity6 family: the AE grid, frame done, audio units')
+    path = i6_image(tmp, 'i6s.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        st = riu(0x131B, 0)
+        base = 0x1000000
+        qt.writew(st + 0x02 * 4, 1)
+        qt.writew(st + 0x08 * 4, (base >> 4) & 0xFFFF)
+        qt.writew(st + 0x09 * 4, base >> 20)
+        last = DRAM + base + (32 * 32 - 1) * 4
+        beyond = DRAM + base + 32 * 32 * 4
+        qt.writel(last, 0xAAAAAAAA)
+        qt.writel(beyond, 0xAAAAAAAA)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(100 * 1000000)
+        check('AE: the 32 x 32 grid reaches its last block',
+              qt.readl(last) != 0xAAAAAAAA, True)
+        check('AE: and stops there', qt.readl(beyond), 0xAAAAAAAA)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(100 * 1000000)
+        check('infinity6c ISP: frame done and its arming, HalIspIsr',
+              (qt.readw(isp + 0x2B * 4) >> 9) & 3, 3)
+        bach = riu(0x1502, 0)
+        qt.writew(bach + (0x94 >> 1) * 4, 0x10)
+        qt.writew(bach + (0x96 >> 1) * 4, 0x100)
+        qt.writew(bach + (0x92 >> 1) * 4, 0x8000)
+        qt.step(100 * 1000000)
+        tone = [qt.readw(DRAM + 0x100000 + i) for i in (4, 6, 8, 10)]
+        check('audio: 16-byte units, the ring where the driver put it',
+              tone != [0, 0, 0, 0], True)
+        check('audio: not at twice the address',
+              qt.readl(DRAM + 0x200000 + 8), 0)
+        check('audio: two interleaved channels', tone[0], tone[1])
+        check('audio: and the next sample differs', tone[2] != tone[0], True)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ssc337,flash-file=' + path, [])
+    try:
+        bach = riu(0x1502, 0)
+        qt.writew(bach + (0x94 >> 1) * 4, 0x20)
+        qt.writew(bach + (0x96 >> 1) * 4, 0x200)
+        qt.writew(bach + (0x92 >> 1) * 4, 0x8000)
+        qt.step(100 * 1000000)
+        check('audio: 8-byte units elsewhere',
+              qt.readl(DRAM + 0x100000 + 8) != 0, True)
+    finally:
+        qt.close()
+
+
+def test_i6b0_media(qemu, tmp):
+    print('infinity6b0 media: the frame mi_vpe counts')
+    path = i6_image(tmp, 'i6b.bin')
+    qt = QTest(qemu, 'ssc337,flash-file=' + path, [])
+    try:
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(50 * 1000000)
+        # HalIspCheckIrqMapTable: without it mi_vpe drops a realtime channel
+        check('ISP: group 0 bit 1, _MI_VPE_IspIsr\'s frame count',
+              (qt.readw(isp + 0x2B * 4) >> 1) & 1, 1)
+    finally:
+        qt.close()
+
+
+def test_i6c_media(qemu, tmp):
+    print('infinity6c media: CMDQ, MIU MMU, the Wave5 queue and results')
+    path = i6_image(tmp, 'i6c.bin')
+    wave = 0x1F34D000
+    base = 0x3FF00000       # mem-base: the addresses the firmware is given
+    dram = 0x22000000       # what the MMU maps it to, from the CPU
+    src = 0x01100000        # absolute
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        # bit 28 would stall HAL_SCL_UTILITY_RegFire
+        cmdq = riu(0x1120, 0)
+        check('CMDQ: idle is bit 11 of the high half alone',
+              qt.readw(cmdq + 0x45 * 4) & 0x1800, 0x0800)
+        check('CMDQ: the twelfth engine is mapped',
+              qt.readw(riu(0x1363, 0x45)) & 0x1800, 0x0800)
+        # the MMU: bank 0x1659, regions in regs 5 and 6, init done bit 9
+        mmu = riu(0x1659, 0)
+        qt.writew(mmu, 0x0030)
+        check('MMU: reset reports init done', (qt.readw(mmu) >> 9) & 1, 1)
+        qt.writew(mmu, 0)
+        qt.writew(mmu + 0x05 * 4, 1)        # 0x20000000 up
+        qt.writew(mmu + 0x06 * 4, 0)
+        for n in range(3):                  # 128 KiB pages
+            qt.writew(mmu + 0x03 * 4, 0x100 + n)
+            qt.writew(mmu + 0x02 * 4, 0x8000 | ((base >> 17) + n) & 0xFFF)
+            qt.writew(mmu + 0x0A * 4, 3)
+        qt.writew(mmu, (2 << 1) | 1)
+        # boot; the queue's address is taken at INIT_VPU
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+        check('Wave5: running', qt.readl(wave + 0x04) != 0, True)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        cmd(0x4000)
+        check('Wave5: the version chagall.bin must match',
+              qt.readl(wave + 0x118), 0x23121119)
+        qt.writel(wave + 0x14C, 0x20000)    # the results' buffer
+        cmd(0x0008)
+        check('Wave5: a polled command raises no reason',
+              qt.readl(wave + 0x4C), 0)
+        qt.writel(wave + 0x11C, 64 << 16 | 64)
+        qt.writel(wave + 0x130, 2 << 16)
+        cmd(0x0200)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + src + i, 0x20406080)
+
+        def page(n, fire):
+            p = dram + n * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x18, 0x40000)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x48, src)
+            qt.writel(p + 0x4C, src + 64 * 64)
+            qt.writel(p + 0x54, 64 << 16 | 64)
+            qt.writel(p + 0xC0, fire)
+
+        for n, fire in enumerate((0x55, 0x66)):
+            page(n, fire)
+            qt.writel(wave + 0x1F8, n + 1)
+            qt.step(10 * 1000000)
+            check('Wave5: queue page %d taken' % n, qt.readl(wave + 0x1F4),
+                  n + 1)
+            check('Wave5: done, bit 24 with the instance, not a bitmask',
+                  qt.readl(wave + 0x1E8), 1 << 24)
+            check('Wave5: the picture raises the encoder bit',
+                  qt.readl(wave + 0x4C), 0x100)
+            qt.writel(wave + 0x34, 0x100)
+            qt.writel(wave + 0x3C, 1)
+            dump = dram + 0x20000
+            check('Wave5: results name the picture', qt.readl(dump), fire)
+            check('Wave5: results carry no error bits', qt.readl(dump + 4), 0)
+            check('Wave5: results succeed', qt.readl(dump + 8), 1)
+            check('Wave5: results hold its bytes', qt.readl(dump + 0x4C) > 0,
+                  True)
+        check('Wave5: the stream is relative to mem-base, and starts a VPS',
+              qt.readl(dram + 0x40000), 0x01000000)
+    finally:
+        qt.close()
+
+
+NAND_RAW = 2048 + 64
+NAND_BLOCK = 64 * NAND_RAW
+
+
+def nand_image(tmp, name, bad_bl0=False):
+    """A CIS in block 0, the IPL in blocks 2 and 4, as the writer lays them."""
+    path = os.path.join(tmp, name)
+    img = bytearray(b'\xFF' * (64 * NAND_BLOCK))
+    img[0:16] = b'MSTARSEMIUSFDCIS'
+    img[0x10:0x13] = bytes([2, 0xC8, 0xF1])
+    img[0x20:0x26] = struct.pack('<HHH', 64, 2048, 64)
+    img[0x2F:0x31] = bytes([2, 4])
+    img[NAND_RAW:NAND_RAW + 4] = b'PNI!'
+    ipl = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    img[2 * NAND_BLOCK:2 * NAND_BLOCK + 12] = ipl
+    img[4 * NAND_BLOCK:4 * NAND_BLOCK + 12] = ipl
+    img[2 * NAND_BLOCK + 12:2 * NAND_BLOCK + 16] = b'BL-0'
+    img[4 * NAND_BLOCK + 12:4 * NAND_BLOCK + 16] = b'BL-1'
+    img[5 * NAND_BLOCK + 3 * NAND_RAW:
+        5 * NAND_BLOCK + 3 * NAND_RAW + 4] = b'PAGE'
+    if bad_bl0:
+        img[2 * NAND_BLOCK + 2048] = 0
+    open(path, 'wb').write(img)
+    return path
+
+
+def nand_page_read(qt, page):
+    fsp_run(qt, [0x13, page >> 16, (page >> 8) & 0xFF, page & 0xFF],
+            (4, 0, 0), (0, 0, 0))
+
+
+def nand_status(qt):
+    return fsp_run(qt, [0x0F, 0xC0], (2, 0, 0), (1, 0, 0))[1][0]
+
+
+def nand_erase(qt, page):
+    fsp_run(qt, [0x06], (1, 0, 0), (0, 0, 0))
+    fsp_run(qt, [0xD8, page >> 16, (page >> 8) & 0xFF, page & 0xFF],
+            (4, 0, 0), (0, 0, 0))
+
+
+def nand_unlock(qt):
+    fsp_run(qt, [0x1F, 0xA0, 0x00], (3, 0, 0), (0, 0, 0))
+
+
+def nand_program_bdma(qt, page, src, size):
+    """HAL_SPINAND_PROGRAM_BY_BDMA, the load open across two fires."""
+    qspi = riu(0x0017, 0)
+    fsp_run(qt, [0x06], (1, 0, 0), (0, 0, 0))
+    fsp_run(qt, [0x02, 0, 0], (3, 0, 0), (0, 0, 0))
+    qt.writew(qspi + 0x0A * 4, 1)
+    bdma_run(qt, 0, 0x2B40, src, 0, size)
+    fsp_run(qt, [], (0, 0, 0), (0, 0, 0), out=(size + 1, 0))
+    qt.writew(qspi + 0x0A * 4, 2)
+    fsp_run(qt, [0x10, page >> 16, (page >> 8) & 0xFF, page & 0xFF],
+            (4, 0, 0), (0, 0, 0))
+
+
+def test_nand(qemu, tmp):
+    print('SPI NAND: the straps, the ROM\'s CIS, reads, programs, failures')
+    path = nand_image(tmp, 'nand.bin')
+    qt = QTest(qemu, 'ssc337,flash-file=' + path +
+               ',flash-nand-id=0xC8F1',
+               ['-global', 'sstar-fsp.ecc-flip-page=%d' % (5 * 64 + 3),
+                '-global', 'sstar-fsp.ecc-err-page=%d' % (5 * 64 + 4),
+                '-global', 'sstar-fsp.fail-block=7'])
+    try:
+        check('strap: U-Boot sees SPI NAND',
+              (qt.readw(0x1F001C7C) >> 10) & 0x19, 0x11)
+        check('strap: the kernel sees SPI NAND',
+              qt.readw(0x1F0071C0) & 0x3C, 0x04)
+        check('the IPL staged from block 2', qt.readl(IMI + 12),
+              int.from_bytes(b'BL-0', 'little'))
+        check('the ROM left the SNI in IMI', qt.readl(IMI + 0x10000),
+              int.from_bytes(b'MSTA', 'little'))
+        check('the ROM left the PNI in IMI', qt.readl(IMI + 0x10A00),
+              int.from_bytes(b'PNI!', 'little'))
+        check('READ ID after its dummy',
+              fsp_run(qt, [0x9F, 0], (2, 0, 0), (2, 0, 0))[1][:2],
+              [0xC8, 0xF1])
+        check('BP bits set at power-on',
+              fsp_run(qt, [0x0F, 0xA0], (2, 0, 0), (1, 0, 0))[1][0], 0x38)
+        page = 5 * 64 + 3
+        nand_page_read(qt, page)
+        check('corrected read reports its bitflips',
+              (nand_status(qt) >> 4) & 3, 1)
+        check('read from cache by column',
+              fsp_run(qt, [0x03, 0, 0, 0], (4, 0, 0), (4, 0, 0))[1][:4],
+              list(b'PAGE'))
+        bdma_run(qt, 0, 0x4035, 2, 0x100000, 4)
+        check('BDMA reads the page register by column',
+              qt.readw(DRAM + 0x100000), int.from_bytes(b'GE', 'little'))
+        nand_page_read(qt, page + 1)
+        check('uncorrectable read reports it',
+              (nand_status(qt) >> 4) & 3, 2)
+        nand_page_read(qt, page + 2)
+        check('a clean read clears the ECC field',
+              (nand_status(qt) >> 4) & 3, 0)
+
+        nand_erase(qt, 6 * 64)
+        check('erase of a locked block: E_FAIL', nand_status(qt) & 4, 4)
+        nand_unlock(qt)
+        nand_erase(qt, 2 * 64)
+        check('erase: no E_FAIL', nand_status(qt) & 4, 0)
+        check('erase spends the write latch', nand_status(qt) & 2, 0)
+        nand_erase(qt, 7 * 64)
+        check('erase of the failing block: E_FAIL', nand_status(qt) & 4, 4)
+        for i in range(64):
+            qt.writel(DRAM + 0x200000 + i * 4, 0xC0DE0000 + i)
+        nand_program_bdma(qt, 6 * 64 + 1, 0x200000, 256)
+        check('program: no P_FAIL', nand_status(qt) & 8, 0)
+        data = open(path, 'rb').read()
+        off = 6 * NAND_BLOCK + NAND_RAW
+        check('program through BDMA written to the file',
+              data[off + 4:off + 8], struct.pack('<I', 0xC0DE0001))
+        check('the load left the rest of the page erased',
+              data[off + 256:off + 260], b'\xFF' * 4)
+        check('erase wrote the file, spare included',
+              data[2 * NAND_BLOCK:2 * NAND_BLOCK + 4] +
+              data[2 * NAND_BLOCK + 2048:2 * NAND_BLOCK + 2052], b'\xFF' * 8)
+        # a bad-block mark in the spare, loaded at column 2048 through the RIU
+        fsp_run(qt, [0x06], (1, 0, 0), (0, 0, 0))
+        fsp_run(qt, [0x02, 0x08, 0x00, 0x00], (4, 0, 0), (0, 0, 0))
+        fsp_run(qt, [0x10, 0, 0x01, 0x40], (4, 0, 0), (0, 0, 0))
+        data = open(path, 'rb').read()
+        check('a page load closed by the next fire programs the spare',
+              data[5 * NAND_BLOCK + 2048], 0)
+        # the page register full of "PAGE" from the read: a load wipes it
+        page = 6 * 64 + 2
+        nand_page_read(qt, 5 * 64 + 3)
+        for byte in (0xF0, 0x0F):
+            fsp_run(qt, [0x06], (1, 0, 0), (0, 0, 0))
+            fsp_run(qt, [0x02, 0x00, 0x10, byte], (4, 0, 0), (0, 0, 0))
+            fsp_run(qt, [0x10, page >> 16, (page >> 8) & 0xFF, page & 0xFF],
+                    (4, 0, 0), (0, 0, 0))
+        data = open(path, 'rb').read()
+        off = page * NAND_RAW
+        check('PROGRAM LOAD clears the page register, a read\'s bytes gone',
+              data[off:off + 4], b'\xFF' * 4)
+        check('programming only clears bits', data[off + 16], 0)
+    finally:
+        qt.close()
+
+    path = nand_image(tmp, 'nand-bad.bin', bad_bl0=True)
+    qt = QTest(qemu, 'ssc337,flash-file=' + path, [])
+    try:
+        check('the bad IPL block skipped for its copy', qt.readl(IMI + 12),
+              int.from_bytes(b'BL-1', 'little'))
+        check('the part the SNI names',
+              fsp_run(qt, [0x9F, 0], (2, 0, 0), (2, 0, 0))[1][:2],
+              [0xC8, 0xF1])
+    finally:
+        qt.close()
+
+    # a 4 KiB page part: the geometry comes from the SNI
+    raw4 = 4096 + 128
+    img = bytearray(b'\xFF' * (64 * 8 * raw4))
+    img[0:16] = b'MSTARSEMIUSFDCIS'
+    img[0x10:0x13] = bytes([2, 0xC8, 0xF1])
+    img[0x20:0x26] = struct.pack('<HHH', 128, 4096, 64)
+    img[0x2F:0x31] = bytes([2, 4])
+    img[raw4:raw4 + 4] = b'PNI!'
+    block = 64 * raw4
+    img[2 * block:2 * block + 12] = (b'\x06\x00\x00\xEAIPL_' +
+                                     struct.pack('<I', 0x200))
+    img[2 * block + 16 * 0 + 12:2 * block + 16] = b'BL4K'
+    img[5 * raw4 + 4100:5 * raw4 + 4104] = b'SPAR'
+    path = os.path.join(tmp, 'nand4k.bin')
+    open(path, 'wb').write(img)
+    qt = QTest(qemu, 'ssc337,flash-file=' + path, [])
+    try:
+        check('4 KiB pages: the IPL found by the SNI\'s geometry',
+              qt.readl(IMI + 12), int.from_bytes(b'BL4K', 'little'))
+        nand_page_read(qt, 5)
+        check('4 KiB pages: a read past 4096 reaches the spare',
+              fsp_run(qt, [0x03, 0x10, 0x04, 0], (4, 0, 0), (4, 0, 0))[1][:4],
+              list(b'SPAR'))
+    finally:
+        qt.close()
+
+    path = nand_image(tmp, 'nand-e.bin')
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
+    try:
+        check('infinity6e strap: DID key BIT4',
+              qt.readw(0x1F0071C0) & 0x10BE, 0x10)
+    finally:
+        qt.close()
+
+    for machine, says in (('ssc338q', b'DRAM size is unknown'),
+                          ('ssc325de', b'DRAM size is unknown'),
+                          ('ssc337de', b'')):
+        r = subprocess.run([qemu, '-M', machine, '-display', 'none', '-S',
+                            '-nodefaults', '-qmp', 'stdio'],
+                           input=b'{"execute":"qmp_capabilities"}'
+                                 b'{"execute":"quit"}',
+                           capture_output=True, timeout=20)
+        check(machine + ': says when its DRAM size is a guess',
+              b'DRAM size is unknown' in r.stderr, bool(says))
+    r = subprocess.run([qemu, '-M', 'ssc338q', '-m', '128M', '-display',
+                        'none', '-S', '-nodefaults', '-qmp', 'stdio'],
+                       input=b'{"execute":"qmp_capabilities"}'
+                             b'{"execute":"quit"}',
+                       capture_output=True, timeout=20)
+    check('ssc338q: -m settles it', b'DRAM size is unknown' in r.stderr,
+          False)
+
+    path = os.path.join(tmp, 'nand-short.bin')
+    data = bytearray(open(nand_image(tmp, 'nand-s.bin'), 'rb').read())
+    open(path, 'wb').write(data[:0x200000])
+    r = subprocess.run([qemu, '-M', 'ssc337,flash-file=' + path,
+                        '-display', 'none', '-S'], capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=20)
+    check('an image without spares is refused by name',
+          b'sstar-nand-image' in r.stderr, True)
+
+
+def test_i6(qemu, tmp):
+    print('infinity6 dies: straps, the MIU BIST, BDMA, card detect, the bond')
+    path = i6_image(tmp, 'i6.bin')
+    want = {'ssc325': 0xEF, 'ssc337': 0xF2, 'ssc338q': 0xF1, 'ssc377': 0xF9}
+    for machine, chip in want.items():
+        qt = QTest(qemu, machine + ',flash-file=' + path, [])
+        try:
+            check(machine + ': chip ID', qt.readw(riu(0x001E, 0)) & 0xFF, chip)
+            check(machine + ': SPI NOR on the PM clkgen strap',
+                  qt.readw(0x1F001C7C) >> 14 & 1, 1)
+            check(machine + ': SPI NOR on the DID key strap',
+                  qt.readw(0x1F0071C0) & 0x10BE, 0x20)
+            check(machine + ': none of the SSD202D fuses',
+                  qt.readw(0x1F004014), 0)
+            check(machine + ': the IPL sets the DRAM size, not the model',
+                  qt.readw(riu(0x1012, 0x69)), 0)
+            # the BIST: 63 MiB of 0x5AA5, as the IPL runs it on 64 MiB
+            qt.writew(riu(0x1012, 0x71), 0)
+            qt.writew(riu(0x1012, 0x72), 0xFFFF)
+            qt.writew(riu(0x1012, 0x73), 0x003E)
+            qt.writew(riu(0x1012, 0x74), 0x5AA5)
+            qt.writew(riu(0x1012, 0x70), 1)
+            check(machine + ': BIST done', qt.readw(riu(0x1012, 0x70)) >> 15, 1)
+            check(machine + ': BIST pattern in DRAM',
+                  (qt.readb(0x20000000), qt.readb(0x20000001)), (0xA5, 0x5A))
+            check(machine + ': BIST reaches IPL_CUST\'s header byte',
+                  qt.readb(0x23D0001F), 0x5A)
+            check(machine + ': BIST stops at 63 MiB',
+                  qt.readb(0x20000000 + 0x3F00000), 0)
+        finally:
+            qt.close()
+
+    # The I6E MMU: BDMA and the CPU reach the region through the table, an
+    # address with no entry reaches nothing, and low DRAM is left alone.
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, ['-m', '256M'])
+    try:
+        ctl = riu(0x1013, 0x50)
+        qt.writew(ctl, 0x30)
+        check('MMU: reset, init done', qt.readw(ctl) >> 7 & 1, 1)
+        qt.writew(ctl, 0)
+        qt.writew(ctl, 0x0333)
+        qt.writew(riu(0x1013, 0x52), 0x186)
+        qt.writew(riu(0x1013, 0x51), 0x8000)
+        qt.writew(riu(0x1013, 0x5B), 1)
+        qt.writel(0x20004000, 0x11223344)
+        ch = riu(0x1002, 0)
+        qt.writew(ch + 0x02 * 4, 0x4035)
+        qt.writew(ch + 0x03 * 4, 0)
+        qt.writew(ch + 0x04 * 4, 0x1234)
+        qt.writew(ch + 0x05 * 4, 0)
+        qt.writew(ch + 0x06 * 4, 0x0100)
+        qt.writew(ch + 0x07 * 4, 0x3000)
+        qt.writew(ch + 0x08 * 4, 4)
+        qt.writew(ch + 0x09 * 4, 0)
+        qt.writew(ch, 1)
+        pa = 0x20000000 + (0x186 << 18) + 0x100
+        check('MMU: BDMA to MIU 0x30000100 lands on the mapped page',
+              qt.readl(pa), 0x21524F4E)
+        check('MMU: the CPU sees it at 0x50000100', qt.readl(0x50000100),
+              0x21524F4E)
+        qt.writel(0x50000104, 0xCAFEF00D)
+        check('MMU: a CPU write goes through', qt.readl(pa + 4), 0xCAFEF00D)
+        qt.writel(0x50040000, 0xDEADBEEF)
+        check('MMU: no entry reads nothing', qt.readl(0x50040000), 0)
+        check('MMU: and no write reached DRAM', qt.readl(0x20000000 + 0x40000),
+              0)
+        qt.writew(ch + 0x06 * 4, 0x4000)
+        qt.writew(ch + 0x07 * 4, 0x3004)
+        qt.writew(ch, 1)
+        check('MMU: a DMA miss spares the kernel\'s page table',
+              qt.readl(0x20004000), 0x11223344)
+        check('outside the region DRAM still repeats, for the IPL\'s sizing',
+              qt.readl(0x30004000), 0x11223344)
+    finally:
+        qt.close()
+
+    # the I6E FSP follows the bond, vendor halSERFLASH.c
+    for bond, bank in ((0x00, 0x0016), (0x10, 0x100D), (0x30, 0x100D)):
+        qt = QTest(qemu, 'ssc338q,bond=0x%x,flash-file=%s' % (bond, path), [])
+        try:
+            check('bond 0x%02x in CHIPTOP' % bond,
+                  qt.readw(riu(0x101E, 0x48)), bond)
+            base = riu(bank, 0)
+            qt.writew(base + 0x60 * 4, 0x9F)
+            qt.writew(base + 0x6A * 4, 1)
+            qt.writew(base + 0x6B * 4, 3)
+            qt.writew(base + 0x6C * 4, 0x0007)
+            qt.writew(base + 0x6D * 4, 1)
+            check('bond 0x%02x: RDID on FSP 0x%04x' % (bond, bank),
+                  qt.readw(base + 0x65 * 4) & 0xFF, 0xEF)
+        finally:
+            qt.close()
+
+    # Card detect is an input: firmware's writes do not move it
+    card = os.path.join(tmp, 'i6-sd.img')
+    open(card, 'wb').truncate(16 << 20)
+    pad = {'ssc337': (riu(0x000F, 0x47), 4), 'ssc338q': (riu(0x103C, 0x11), 1),
+           'ssc377': (riu(0x103E, 0x06), 1), 'ssd202d': (riu(0x000F, 0x47), 4)}
+    for machine, (addr, bit) in pad.items():
+        for sd, level in ((True, 0), (False, bit)):
+            qt = QTest(qemu, machine, ['-drive', 'if=sd,format=raw,file=' + card]
+                       if sd else [])
+            try:
+                qt.writew(addr, 0xFFFF if sd else 0)
+                check('%s: CDZ %s a card' % (machine, 'with' if sd else
+                                             'without'),
+                      qt.readw(addr) & bit, level)
+            finally:
+                qt.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=os.path.join(
@@ -2123,6 +3566,8 @@ def main():
         qt.close()
     test_migration(args.qemu, tmp, path)
     test_msc313e(args.qemu, tmp)
+    test_msc316(args.qemu, tmp)
+    test_i3_ive(args.qemu, tmp)
     test_sensor_catalogue(args.qemu)
     test_msc313e_sd(args.qemu, tmp)
     test_ssc029(args.qemu, tmp)
@@ -2130,6 +3575,21 @@ def main():
     test_ssc029_power_off(args.qemu, tmp)
     test_ssc029_smp(args.qemu, tmp)
     test_infinity2m_rtcpwc(args.qemu, tmp)
+    test_i6(args.qemu, tmp)
+    test_nand(args.qemu, tmp)
+    test_i6e_media(args.qemu, tmp)
+    test_i6_media(args.qemu, tmp)
+    test_sd2(args.qemu, tmp)
+    test_i6_jpe(args.qemu, tmp)
+    test_i6e_ring(args.qemu, tmp)
+    test_i6_mask(args.qemu, tmp)
+    test_i6_mfe(args.qemu, tmp)
+    test_i6_mhe(args.qemu, tmp)
+    test_i6_all_machines(args.qemu, tmp)
+    test_guest_limits(args.qemu, tmp)
+    test_i6_stats_audio(args.qemu, tmp)
+    test_i6b0_media(args.qemu, tmp)
+    test_i6c_media(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 
