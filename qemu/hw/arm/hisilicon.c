@@ -1607,9 +1607,8 @@ static const HisiSoCConfig hi3516av200_soc = {
  * The EV200-class V4 dies' online video pipeline: VI as the frame clock,
  * VPSS painting the pictures (hisi-vi, hisi-vpss).  Their regbanks in
  * HISI_V4_REGBANK_LIST stay in the list and are not mapped over them.
- * HiSilicon's EV200 / EV300 / 18EV300 / 16DV200 only: the Goke rebrands'
- * own gk7205v200_*.ko start the pipeline under it but deliver no frame
- * yet, so they keep the register stubs.
+ * HiSilicon's EV200 / EV300 / 18EV300 / 16DV200 and the Goke rebrands of
+ * the same die, whose gk7205v200_*.ko drive it the same way.
  */
 #define HISI_V4_VIDEO_PIPE                                  \
     .vi_cap_base        = 0x11000000,                       \
@@ -2157,6 +2156,7 @@ static const HisiSoCConfig hi3516dv200_soc = {
 
 static const HisiSoCConfig gk7205v200_soc = {
     .name               = "gk7205v200",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7205V200 (Cortex-A7, ~Hi3516EV200)",
     .soc_id             = GOKE_SOC_ID_7205V200,
     .gpio_count         = 8,
@@ -2194,6 +2194,7 @@ static const HisiSoCConfig gk7205v200_soc = {
  */
 static const HisiSoCConfig gk7201v200_soc = {
     .name               = "gk7201v200",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7201V200 (Cortex-A7, ~Hi3516EV200 stripped)",
     .soc_id             = GOKE_SOC_ID_7201V200,
     .gpio_count         = 8,
@@ -2211,6 +2212,7 @@ static const HisiSoCConfig gk7201v200_soc = {
 
 static const HisiSoCConfig gk7205v300_soc = {
     .name               = "gk7205v300",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7205V300 (Cortex-A7, ~Hi3516EV300)",
     .soc_id             = GOKE_SOC_ID_7205V300,
     .gpio_count         = 10,
@@ -2222,6 +2224,7 @@ static const HisiSoCConfig gk7205v300_soc = {
 
 static const HisiSoCConfig gk7202v300_soc = {
     .name               = "gk7202v300",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7202V300 (Cortex-A7, ~Hi3518EV300)",
     .soc_id             = GOKE_SOC_ID_7202V300,
     .gpio_count         = 8,
@@ -2232,6 +2235,7 @@ static const HisiSoCConfig gk7202v300_soc = {
 
 static const HisiSoCConfig gk7605v100_soc = {
     .name               = "gk7605v100",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7605V100 (Cortex-A7, ~Hi3516DV200)",
     .soc_id             = GOKE_SOC_ID_7605V100,
     .gpio_count         = 10,

@@ -329,8 +329,10 @@ jobs:
             majestic: true
           - soc: hi3516ev300
             majestic: true
-          # Goke's own gk7205v200_*.ko: the encoder, not yet VI / VPSS
+          # Goke's own gk7205v200_*.ko; its release has no SC2315E
+          # config, so majestic runs with an SC2335 there
           - soc: gk7205v200
+            majestic: true
     steps:
       - uses: actions/checkout@v4
 
@@ -405,8 +407,8 @@ jobs:
             --qemu ./qemu-src/build/qemu-system-arm --frames 10 \
             --work "$RUNNER_TEMP/venc"
 
-      # The release's own majestic, left to start, with an SC2315E on the
-      # sensor bus: sensor and ISP, VI online into VPSS (hisi-vi,
+      # The release's own majestic, left to start, with a 1080p sensor
+      # its /etc/sensors knows: sensor and ISP, VI online into VPSS (hisi-vi,
       # hisi-vpss), VENC on VEDU.  Its H.265 must decode and carry
       # hisi-vpss's frame counter, rising.
       - name: majestic through VI, VPSS and VEDU
