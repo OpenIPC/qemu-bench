@@ -127,13 +127,13 @@ bool atbm_wpa_action_from_sta(AtbmWpa *w, const uint8_t *f, size_t n);
  * TSC), the Protected bit to set and the RX flags.  Returns the header
  * length (0: send in the clear).  After the body the caller appends
  * atbm_wpa_trailer()'s bytes: CCMP's MIC room, TKIP's Michael MIC (which
- * mac80211 checks) and ICV room.
+ * mac80211 checks; prio is the QoS TID, 0 for non-QoS data) and ICV room.
  */
 size_t atbm_wpa_to_sta(AtbmWpa *w, bool group, uint8_t *hdr,
                        uint32_t *flags);
 size_t atbm_wpa_trailer(AtbmWpa *w, bool group, const uint8_t *da,
-                        const uint8_t *sa, const uint8_t *body, size_t blen,
-                        uint8_t *out);
+                        const uint8_t *sa, uint8_t prio, const uint8_t *body,
+                        size_t blen, uint8_t *out);
 
 /* WSM_ADD_KEY's body: the driver installs the handshake's keys */
 void atbm_wpa_add_key(AtbmWpa *w, const uint8_t *b, size_t n);

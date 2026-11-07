@@ -341,8 +341,8 @@ static size_t ap_ht_ies(AtbmState *s, uint8_t *f)
     f[n++] = 61;                        /* HT operation */
     f[n++] = 22;
     memset(f + n, 0, 22);
-    f[n] = s->channel;
-    f[n + 4] = 0xff;                    /* basic MCS 0-7 */
+    f[n] = s->channel;                  /* then 5 bytes of operation info */
+    f[n + 6] = 0xff;                    /* basic MCS set: 0-7 */
     n += 22;
     memcpy(f + n, wmm, sizeof(wmm));
     return n + sizeof(wmm);
@@ -497,13 +497,29 @@ static void ap_tx(AtbmState *s, const uint8_t *f, size_t n, uint8_t if_id)
         atbm_wpa_reset(&s->wpa);
         break;
     case FC_ACTION:
-        if (n >= 24 + 3 && f[24] == 3 && s->trace) {
-            /* Block Ack: 1 the ADDBA response (status at +3), 2 DELBA */
+        if (n >= 24 + 4 && f[24] == 3) {
+            /* Block Ack: 1 the ADDBA response (status at +3, parameters at
+             * +5), 2 DELBA (parameters at +2, TID in bits 12..15). A
+             * session refused or torn down is asked for again by the next
+             * frame on its TID. */
             if (f[25] == 1 && n >= 24 + 9) {
-                qemu_log("atbm: ADDBA response, tid %u status %u\n",
-                         (lduw_le_p(f + 29) >> 2) & 0xf, lduw_le_p(f + 27));
+                uint8_t tid = (lduw_le_p(f + 29) >> 2) & 7;
+                uint16_t status = lduw_le_p(f + 27);
+
+                if (status) {
+                    s->ba_sent[tid] = false;
+                }
+                if (s->trace) {
+                    qemu_log("atbm: ADDBA response, tid %u status %u\n", tid,
+                             status);
+                }
             } else if (f[25] == 2) {
-                qemu_log("atbm: DELBA from the station\n");
+                uint8_t tid = (lduw_le_p(f + 26) >> 12) & 7;
+
+                s->ba_sent[tid] = false;
+                if (s->trace) {
+                    qemu_log("atbm: DELBA from the station, tid %u\n", tid);
+                }
             }
         }
         atbm_wpa_action_from_sta(&s->wpa, f, n);
@@ -608,6 +624,7 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
     n += 6 + size - 12;
     if (mic) {
         n += atbm_wpa_trailer(&s->wpa, group, f + 4, f + 16,
+                              f[0] == FC_QOS_DATA ? (f[24] & 7) : 0,
                               f + n - (6 + size - 12), 6 + size - 12, f + n);
     }
     atbm_rx(s, f, n, flags, 0);
@@ -890,6 +907,8 @@ static void atbm_handle_reset(USBDevice *dev)
 
     timer_del(s->start_timer);
     timer_del(s->scan_timer);
+    timer_del(s->air_timer);
+    s->air_busy = 0;
     atbm_flush(s);
     s->associated = false;
     atbm_wpa_reset(&s->wpa);
@@ -969,6 +988,11 @@ static void atbm_realize(USBDevice *dev, Error **errp)
 
     if (!s->ssid) {
         s->ssid = g_strdup("OpenIPC");
+    }
+    if (s->rx_tids < 1 || s->rx_tids > ARRAY_SIZE(s->tid_seq)) {
+        error_setg(errp, "atbm-wifi: rx-tids must be 1..%zu",
+                   ARRAY_SIZE(s->tid_seq));
+        return;
     }
     s->desc = atbm_desc;
     s->desc.id.idProduct = s->pid;
