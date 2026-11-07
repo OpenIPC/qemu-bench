@@ -168,7 +168,7 @@ def main():
             q.write(RING + start, p)
             start += len(p)
         q.writel(WP_CELL, start)
-        img = {0x104: SRC, 0x108: SRC + W * H, 0x160: W | W << 16,
+        img = {0x104: SRC, 0x108: SRC + W * H, 0x1f4: W | W << 16,
                0x12c: WP_CELL, 0x130: RP_CELL, 0x16c: RINGS[chn],
                0x4a0: RING_SIZE, 0x4a4: 40000 * n, 0x61c: 26 + 2 * n}
         img.update(img_extra)

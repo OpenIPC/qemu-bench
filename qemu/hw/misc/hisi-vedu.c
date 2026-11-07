@@ -25,7 +25,9 @@
  * MMIO space, which the engine fetches at START from REG_IMAGE.  Of it:
  *
  *   0x104 / 0x108  source luma / chroma (NV21, PIXEL_FORMAT_YVU_SEMIPLANAR_420)
- *   0x160          source strides: luma | chroma << 16
+ *   0x1f4          source strides: luma | chroma << 16 (0x160 / 0x170
+ *                  are the reconstruction / reference pictures', aligned
+ *                  to 64: the same only while the width is)
  *   0x12c          address of the stream ring's write-pointer cell
  *   0x130          address of its read-pointer cell
  *   0x16c          stream ring base;  0x4a0  its size
@@ -108,7 +110,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
 #define IMG_SRC_C           0x108
 #define IMG_STRM_WP         0x12c
 #define IMG_STRM_RP         0x130
-#define IMG_SRC_STRIDE      0x160
+#define IMG_SRC_STRIDE      0x1f4
 #define IMG_SRC_CMP_HDR     0x1ec   /* compressed source: its header address */
 #define IMG_STRM_BASE       0x16c
 #define IMG_STRM_SIZE       0x4a0

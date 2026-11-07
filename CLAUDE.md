@@ -659,7 +659,14 @@ in this order:
   config in `/etc/sensors`: use `sensor=sc2335` there)
   (`test-hisi-majestic.sh`, `test-hisi-sample-venc.sh --sdk`). VI runs only
   while VPSS's online video is enabled: an interrupt for a pipe that does
-  not exist oopses the driver. Compressed VPSS channels use a private
+  not exist oopses the driver (or while pipe 0's write channel is on,
+  which also starts the clock in offline mode). A sensor wider than 2304
+  (`sensor=imx335`, `gc4653` on hi3516ev300) runs VI offline: the driver
+  starts the pipe per frame (VI_PROC 0x300), and VPSS, armed by its 0x304,
+  loads the node list at its 0x2f8 then (register images in DDR, one per
+  vertical strip; the model paints the strips' widths as one picture) and
+  raises no interrupt. VEDU's source stride is image 0x1f4, not 0x160
+  (the 64-aligned reference stride). Compressed VPSS channels use a private
   half-height stand-in shared with `hisi-vedu`. Use `-icount shift=0`, or
   frames overtake the driver on a slow host.
 

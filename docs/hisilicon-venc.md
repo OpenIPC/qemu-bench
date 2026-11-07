@@ -63,7 +63,7 @@ fetches it at START. Of it:
 | Image offset | |
 |---|---|
 | `0x104` / `0x108` | source luma / chroma; NV21 (`PIXEL_FORMAT_YVU_SEMIPLANAR_420`, V first) |
-| `0x160` | source strides, luma \| chroma << 16 |
+| `0x1f4` | source strides, luma \| chroma << 16 (`h264e_drv_cfg_address` / `h265e_drv_cfg_addr`); `0x160` / `0x170` are the reconstruction / reference strides, aligned to 64 |
 | `0x12c` | address of the stream ring's write-pointer cell |
 | `0x130` | address of its read-pointer cell |
 | `0x16c` | stream ring base |
@@ -146,8 +146,10 @@ appends the entropy-coded scan, ending with EOI, as one `JPEGE_PACK_ECS`
 
 ## VI and VPSS
 
-The models cover the online pipeline: VI-online into VPSS-online, which is
-what the drivers choose for a sensor up to 2304 pixels wide.
+The models cover both pipelines the drivers choose between. VI-online into
+VPSS-online serves a sensor up to 2304 pixels wide. VI-offline into
+VPSS-online serves a wider one: EV300's 5 MP IMX335 and the 4 MP GC4653
+(see "Offline" below).
 
 - **The sensor's frames never exist.** VI (`hisi-vi`) is the frame clock.
   VPSS (`hisi-vpss`) paints a test picture into each channel's buffers:
@@ -204,6 +206,33 @@ frame interrupt unmasked, from the group's start to its stop. An interrupt
 for a pipe that does not exist yet, or any more, dereferences a NULL
 context in the driver.
 
+**Offline (`VI_OFFLINE_VPSS_ONLINE`).** VPSS's line buffer holds 2304
+pixels, so for a wider sensor VI captures into DDR and the driver starts
+the pipe on each frame:
+
+1. The pipe's write channel (`VI_CAP 0x10000 + pipe × 0x1000`, bit 31,
+   `VI_HAL_SetWchEn`) is enabled. It is set in online mode too, so it
+   starts VI's frame clock in either mode. Capture raises only the write
+   channel's bits.
+2. For each captured frame the driver arms VPSS: it writes `0x304` (bit 0
+   starts the node list; `0x0900647f`) and the first node's address to
+   `0x2f8`, then reads `0x2f8` back.
+3. It starts the pipe: VI_PROC `0x2f8` (the pipe's own node), `0xf0 = 6`,
+   `0x300 = 1` (`VI_HAL_Start`; online mode never writes `0x300`). At that
+   moment VPSS loads its node list.
+4. A quarter frame later the pipe's interrupt reports frame start and
+   end. The offline route takes `status & 0x19c` as an error.
+
+VPSS raises no interrupt of its own in this mode, and nothing reads
+`0x314`. Each node is a VPSS register image in DDR in the MMIO layout,
+chained through its own `0x2f8`. A picture wider than 2304 comes as
+vertical strips, one node per strip, with the same buffer addresses and
+stride and each strip's output width in the channel size. For IMX335 the
+strips are 1536 + 1056 = 2592 wide (1664 and 1184 in, the overlap).
+Neither the node fields seen so far nor the model place a strip
+horizontally. The model paints one picture per channel instead: the
+strips' widths together, at the first node's addresses.
+
 **Compressed channels.** Channel 0 is compressed (`COMPRESS_MODE_SEG`) in
 both programs. Its buffers are smaller than a linear picture, and the
 real format is not modelled. Instead the two models share a stand-in:
@@ -220,6 +249,7 @@ Running it:
 
 ```bash
 bash qemu-boot/test-hisi-majestic.sh --soc hi3516ev200        # the release's majestic (CI; also gk7205v200)
+bash qemu-boot/test-hisi-majestic.sh --soc hi3516ev300 --sensor imx335   # offline (CI; also gc4653)
 bash qemu-boot/test-hisi-sample-venc.sh --sdk <Hi3516EV200_SDK_V1.0.1.2>   # the SDK's sample_venc
 ```
 
@@ -252,10 +282,8 @@ The release's MPI libraries are uClibc builds. Under musl they need:
 
 ## Not yet
 
-- **VI offline:** a sensor wider than 2304 (EV300's 5 MP IMX335) makes the
-  drivers write VI's frames to DDR for VPSS to read, which is not
-  modelled. ISP statistics are not produced either: the 3A algorithms run,
-  but on nothing.
+- **ISP statistics** are not produced: the 3A algorithms run, but on
+  nothing.
 - **Multi-slice pictures and B frames:** the model codes one slice per
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own
