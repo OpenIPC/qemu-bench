@@ -178,6 +178,10 @@ static void atbm_send(AtbmState *s, uint16_t id, const void *body, size_t n)
     }
     QSIMPLEQ_INSERT_TAIL(&s->rxq, m, next);
     s->rxq_len++;
+    /* An xHCI leaves a NAKed bulk IN parked until the endpoint is woken
+     * (DWC2 polls it again by itself): without this the startup
+     * indication sits here and the driver times out waiting for it. */
+    usb_wakeup(usb_ep_get(&s->dev, USB_TOKEN_IN, EP_IN), 0);
 }
 
 #define WSM_STARTUP_IND     0x0801
@@ -702,7 +706,8 @@ static void atbm_handle_data(USBDevice *dev, USBPacket *p)
             return;
         }
         /*
-         * NAK until there is a message (the host controller retries).
+         * NAK until there is a message (the host controller retries: DWC2
+         * by polling, xHCI once atbm_send() wakes the endpoint).
          * Parking the packet (USB_RET_ASYNC) would be cheaper, but the
          * driver kills its IN URBs on recovery and the DWC2 model reuses
          * a halted channel's packet while it is still in flight.

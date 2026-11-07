@@ -2183,6 +2183,14 @@ static const HisiSoCConfig gk7201v200_soc = {
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 */
     HISI_V4_COMMON_PERIPH,
+    /* USB 2.0 host (xm72050200.dtsi): a DWC3 at 0x10030000, GIC_SPI 39,
+     * dr_mode "host", probed by dwc3/core.c, which hands the xHCI at the
+     * start of its window to xhci-plat.  The board's only USB port is
+     * where the Wi-Fi dongle of a Wi-Fi-only camera sits (G3-WQ-G:
+     * ATBM6012B-X, `-device atbm-wifi,pid=0x888b,chip-version=0x4a`). */
+    .xhci_base          = 0x10030000,
+    .xhci_irq           = 39,
+    .xhci_dwc3_core     = true,
 };
 
 static const HisiSoCConfig gk7205v300_soc = {
@@ -5943,7 +5951,13 @@ static void hisilicon_common_init(MachineState *machine,
         }
         SysBusDevice *busdev = SYS_BUS_DEVICE(xhci);
         sysbus_realize_and_unref(busdev, &error_fatal);
-        sysbus_mmio_map(busdev, 0, c->xhci_base);
+        if (c->xhci_dwc3_core) {
+            /* Above the "hisi-usb3" regbank that covers the whole DWC3
+             * window and answers the core's global registers. */
+            sysbus_mmio_map_overlap(busdev, 0, c->xhci_base, 1);
+        } else {
+            sysbus_mmio_map(busdev, 0, c->xhci_base);
+        }
         sysbus_connect_irq(busdev, 0, pic[c->xhci_irq]);
     }
 
@@ -5998,11 +6012,37 @@ static void hisilicon_common_init(MachineState *machine,
             }
 
             DeviceState *rb = qdev_new("hisi-regbank");
+            bool dwc3 = c->xhci_dwc3_core &&
+                        c->regbanks[n].base == c->xhci_base;
             qdev_prop_set_uint32(rb, "size", c->regbanks[n].size);
             qdev_prop_set_string(rb, "name", c->regbanks[n].name);
+            if (dwc3) {
+                /* DCTL.CSFTRST: dwc3_soft_reset() waits for it to clear */
+                qdev_prop_set_uint32(rb, "autoclear-offset", 0xc704);
+                qdev_prop_set_uint32(rb, "autoclear-mask", 1u << 30);
+            }
 
             sysbus_realize_and_unref(SYS_BUS_DEVICE(rb), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(rb), 0, c->regbanks[n].base);
+
+            if (dwc3) {
+                /* What dwc3_core_init() and dwc3_get_dr_mode() read:
+                 * GSNPSID a DWC_usb3 2.90a; GHWPARAMS0 a dual-role core
+                 * (the device tree's dr_mode then makes it a host) with a
+                 * 64-bit master bus; GHWPARAMS3 no SuperSpeed PHY and a
+                 * UTMI+ high-speed one, as the board's USB 2.0 port. */
+                static const struct { hwaddr off; uint32_t val; } id[] = {
+                    { 0xc120, 0x5533290a },     /* GSNPSID */
+                    { 0xc140, 0x00004002 },     /* GHWPARAMS0 */
+                    { 0xc14c, 0x00000004 },     /* GHWPARAMS3 */
+                };
+                for (int k = 0; k < ARRAY_SIZE(id); k++) {
+                    address_space_stl(&address_space_memory,
+                                      c->regbanks[n].base + id[k].off,
+                                      id[k].val, MEMTXATTRS_UNSPECIFIED,
+                                      NULL);
+                }
+            }
 
             if (!strcmp(c->regbanks[n].name, "hisi-nandc")) {
                 address_space_stl(&address_space_memory,
