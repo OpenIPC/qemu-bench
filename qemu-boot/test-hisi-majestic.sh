@@ -3,12 +3,14 @@
 #
 # Boots the OpenIPC release (kernel, squashfs root) the way U-Boot would
 # start it (mem= and the allocator, load_hisilicon / load_goke sizing MMZ
-# itself) with a 1080p sensor on the bus, and leaves majestic to start on
+# itself) with a sensor on the bus (1080p by default), and leaves majestic to start on
 # its own.  The sensor has to be one the release has a config for in
 # /etc/sensors: SC2315E for HiSilicon's releases, SC2335 for Goke's (which
 # lack the SC2315E; majestic then stops at "Cannot start SDK", in syslog).
 # Its pipeline is the vendor's, unmodified: sensor and ISP, VI online into
-# VPSS (hisi-vi, hisi-vpss: the frame clock and the pictures), VENC on
+# VPSS (hisi-vi, hisi-vpss: the frame clock and the pictures), or for a
+# sensor wider than 2304 (--sensor imx335 / gc4653 on hi3516ev300) VI
+# offline and VPSS running the driver's node list, VENC on
 # VEDU (hisi-vedu).  hisi-vedu keeps the stream it encodes
 # (-global hisi-vedu.dump-dir) and the host checks it: ffmpeg decodes it
 # with no errors, at least --min-frames pictures, each carrying hisi-vpss's

@@ -108,6 +108,12 @@ jobs:
       - name: HiSilicon VEDU + JPGE encode (hisi-vedu)
         run: python3 qemu/tests/test-hisi-vedu.py
 
+      # VI offline into node-driven VPSS (a sensor wider than 2304): both
+      # strips of a picture painted, linear and compressed; no pipe
+      # interrupt after a stop; online again after an offline run.
+      - name: HiSilicon VI offline + VPSS node list (hisi-vi, hisi-vpss)
+        run: python3 qemu/tests/test-hisi-vpss.py
+
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)
@@ -327,8 +333,10 @@ jobs:
         include:
           - soc: hi3516ev200
             majestic: true
+          # and sensors wider than VPSS's line buffer (2304): VI offline
           - soc: hi3516ev300
             majestic: true
+            wide: imx335 gc4653
           # Goke's own gk7205v200_*.ko; its release has no SC2315E
           # config, so majestic runs with an SC2335 there
           - soc: gk7205v200
@@ -418,6 +426,19 @@ jobs:
           bash qemu-boot/test-hisi-majestic.sh --soc ${{ matrix.soc }} \
             --qemu ./qemu-src/build/qemu-system-arm --timeout 480 \
             --work "$RUNNER_TEMP/majestic"
+
+      # A 5 MP IMX335 (2592x1944) and a 4 MP GC4653 (2560x1440): too wide
+      # for online, so VI captures into DDR, the driver starts the pipe
+      # on each frame and VPSS runs the node list it hands it, in strips.
+      - name: majestic with wide sensors (VI offline, VPSS nodes)
+        if: matrix.wide
+        timeout-minutes: 25
+        run: |
+          for s in ${{ matrix.wide }}; do
+            bash qemu-boot/test-hisi-majestic.sh --soc ${{ matrix.soc }} \
+              --sensor "$s" --qemu ./qemu-src/build/qemu-system-arm \
+              --timeout 480 --work "$RUNNER_TEMP/majestic"
+          done
 
   sofia-isp:
     name: Sofia ISP regression (hi3516ev200, sc2315e)

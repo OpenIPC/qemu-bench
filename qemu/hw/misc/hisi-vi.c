@@ -14,7 +14,9 @@
  *             online VPSS prepares its next frame, VPSS_COMM_VI_EarlyIrqProc),
  *             bit 1 frame end (the frame is sent on)
  *             (VI_COMM_CapOnLineFrameStartIrqRoute / ...EarlyEndIrqRoute)
+ *   VI_CAP 0x10000 + pipe * 0x1000: the pipe's write channel, bit 31 on
  *   VI_PROC (0x11200000):
+ *     0x0300  offline: writing 1 (or 3) starts the pipe on a captured frame
  *     0x0310  status, write 1s to clear: bit 10 frame start, bit 1 frame
  *             end; VI_COMM_ProcIrqRoute panics on a zero status
  *     0x0318  cleared with 0x310 (VI_HAL_ClearAnyProcInt)
@@ -23,9 +25,20 @@
  * interrupts go out on the first line, the pipe's on the second; the
  * "frame" GPIO pulses once a frame, for VPSS to write it.
  *
- * Frames run while the "run" GPIO is high: hisi-vpss raises it while its
+ * Frames run while the "run" GPIO is high (hisi-vpss raises it while its
  * online frame interrupt is unmasked, which the driver does only once the
- * whole pipeline (VI pipe, VPSS group) exists.  Nothing in VI's own
+ * whole pipeline exists) or pipe 0's write channel is enabled (the pipe's
+ * start, in both modes).
+ *
+ * Online (VI_ONLINE_VPSS_ONLINE) the pipe follows capture: every frame
+ * raises VI_PROC's start and end too, and pulses VPSS.  Offline
+ * (VI_OFFLINE_VPSS_ONLINE, a sensor wider than 2304) capture only fills
+ * DDR; the driver then starts the pipe on the frame (VI_PROC 0x300), VPSS
+ * takes its output (the pulse goes out then) and the job's end comes on
+ * the pipe's interrupt a quarter frame later.  The first start switches
+ * the model to offline (until the write channel is disabled, the pipe's
+ * stop); before it, the pipe's per-frame interrupt finds no job and is
+ * harmless (VI_COMM_VIOffLineVPSSOffLineIrqRoute).  Nothing in VI's own
  * registers says so early enough or late enough: its interrupt mask is
  * set in full when the module loads, and an interrupt for a pipe that is
  * not there (any more) dereferences a NULL context in the driver.
@@ -52,11 +65,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define CAP_INT             0x00f0
 #define CAP_INT_MASK        0x00f8
 #define CAP_INT_PIPE0       (1u << 8)
+#define CAP_WCH_CTRL(p)     (0x10000 + (p) * 0x1000)    /* bit 31 enable */
 #define CAP_WCH_INT(p)      (0x10000 + (p) * 0x1000 + 0xf0)
 #define WCH_INT_FSTART      (1u << 0)
 #define WCH_INT_FEND        (1u << 1)
 #define WCH_INT_EARLY       (1u << 15)  /* lines in: VPSS prepares the next */
 
+#define PROC_START          0x0300  /* offline: 1 / 3 starts the node list */
 #define PROC_INT            0x0310
 #define PROC_INT2           0x0318
 #define PROC_INT_FEND       (1u << 1)
@@ -70,10 +85,12 @@ struct HisiViState {
     qemu_irq proc_irq;
     qemu_irq frame_out;
     QEMUTimer *timer;
+    QEMUTimer *proc_timer;      /* an offline pipe job finishing */
     uint32_t *cap;
     uint32_t *proc;
     uint32_t fps;
     bool run;
+    bool offline;               /* the driver starts the pipe per frame */
     bool trace;
 };
 
@@ -98,18 +115,38 @@ static void vi_arm(HisiViState *s)
               NANOSECONDS_PER_SECOND / MAX(s->fps, 1));
 }
 
+static bool vi_running(HisiViState *s)
+{
+    return s->run || (s->cap[CAP_WCH_CTRL(0) / 4] & (1u << 31));
+}
+
 static void vi_frame(void *opaque)
 {
     HisiViState *s = opaque;
 
-    if (!s->run) {
+    if (!vi_running(s)) {
         return;                     /* the pipeline was stopped */
     }
     s->cap[CAP_WCH_INT(0) / 4] |= WCH_INT_FSTART | WCH_INT_EARLY | WCH_INT_FEND;
+    if (!s->offline && s->run) {
+        /* online: the pipe runs with capture, VPSS behind it */
+        s->proc[PROC_INT / 4] |= PROC_INT_FSTART | PROC_INT_FEND;
+        qemu_irq_pulse(s->frame_out);
+    }
+    vi_update(s);
+    vi_arm(s);
+}
+
+/* offline: the job the driver started on a captured frame is done */
+static void vi_proc_done(void *opaque)
+{
+    HisiViState *s = opaque;
+
+    if (!vi_running(s)) {
+        return;                     /* the pipe was stopped meanwhile */
+    }
     s->proc[PROC_INT / 4] |= PROC_INT_FSTART | PROC_INT_FEND;
     vi_update(s);
-    qemu_irq_pulse(s->frame_out);
-    vi_arm(s);
 }
 
 static void vi_run(void *opaque, int n, int level)
@@ -117,7 +154,7 @@ static void vi_run(void *opaque, int n, int level)
     HisiViState *s = opaque;
 
     s->run = level;
-    if (level && !timer_pending(s->timer)) {
+    if (vi_running(s) && !timer_pending(s->timer)) {
         vi_arm(s);
     }
 }
@@ -148,6 +185,15 @@ static void vi_cap_write(void *opaque, hwaddr offset, uint64_t val,
     } else {
         s->cap[offset / 4] = val;
     }
+    if (offset == CAP_WCH_CTRL(0)) {
+        if (!(val & (1u << 31))) {
+            /* the pipe stopped: whatever it is rebuilt as starts online */
+            s->offline = false;
+            timer_del(s->proc_timer);
+        } else if (vi_running(s) && !timer_pending(s->timer)) {
+            vi_arm(s);              /* capture into DDR enabled */
+        }
+    }
     vi_update(s);
 }
 
@@ -175,6 +221,18 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
         s->proc[offset / 4] &= ~(uint32_t)val;
     } else {
         s->proc[offset / 4] = val;
+    }
+    if (offset == PROC_START && (val & 1)) {
+        /*
+         * Offline (a sensor too wide for online, VI_OFFLINE_VPSS_ONLINE):
+         * the driver starts the pipe on each captured frame (VI_HAL_Start),
+         * VPSS takes the pipe's output online, and the job's end comes on
+         * the pipe's interrupt.
+         */
+        s->offline = true;
+        qemu_irq_pulse(s->frame_out);
+        timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / 4 / MAX(s->fps, 1));
     }
     vi_update(s);
 }
@@ -213,6 +271,7 @@ static void hisi_vi_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), &s->frame_out, "frame", 1);
     qdev_init_gpio_in_named(DEVICE(obj), vi_run, "run", 1);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vi_frame, s);
+    s->proc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vi_proc_done, s);
 }
 
 static void hisi_vi_reset(DeviceState *dev)
@@ -220,7 +279,9 @@ static void hisi_vi_reset(DeviceState *dev)
     HisiViState *s = HISI_VI(dev);
 
     timer_del(s->timer);
+    timer_del(s->proc_timer);
     s->run = false;
+    s->offline = false;
     memset(s->cap, 0, VI_CAP_SIZE);
     memset(s->proc, 0, VI_PROC_SIZE);
     qemu_set_irq(s->cap_irq, 0);

@@ -1,6 +1,6 @@
 /*
- * HiSilicon V4 VPSS (Hi3516EV200 family) in VI-online / VPSS-online mode:
- * the frame source of the video pipeline.
+ * HiSilicon V4 VPSS (Hi3516EV200 family), VPSS-online behind VI online
+ * or offline: the frame source of the video pipeline.
  *
  * In online mode the sensor's frames stream from VI through the ISP into
  * VPSS, which scales them into up to three output channels in DDR.  The
@@ -27,6 +27,14 @@
  *            (compressed output), then luma and chroma
  *     stride 0x488 / 0x4d0 / 0x514   luma | chroma << 16
  *   0x0700  channel 0's compression (VPSS_HAL_SetChnCmpAttr), bit 0 on
+ *
+ * Behind VI offline (a sensor wider than VPSS's 2304-pixel line buffer)
+ * VPSS is node-driven instead: per frame the driver writes 0x304 (bit 0
+ * starts the node list) and PNEXT (0x2f8, the first node), then starts
+ * VI's pipe, which is when VPSS loads the list ("vi-frame").  The nodes
+ * are register images in DDR, in the layout above, chained through their
+ * own PNEXT, one per vertical strip of a wide picture; no VPSS interrupt
+ * is used.
  *
  * A compressed channel's buffers are smaller than a linear picture and
  * the real format (headers at the first two addresses) is not modelled.
@@ -64,6 +72,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssState, HISI_VPSS)
 #define VPSS_RAWINT         0x0310
 #define VPSS_INTSTAT        0x0314
 #define VPSS_CHN0_CMP       0x0700  /* bit 0: channel 0 writes compressed */
+#define VPSS_PNEXT          0x02f8  /* node mode: the first node */
+#define VPSS_NODE_START     0x0304  /* node mode: bit 0 starts the list */
+#define VPSS_NODE_MAX       8       /* strips of one picture */
+#define VPSS_NODE_SIZE      0x800   /* what of a node the model reads */
 
 #define VPSS_INT_EOF        (1u << 0)
 #define VPSS_INT_START      (1u << 10)
@@ -79,6 +91,13 @@ static const struct {
     { 0x4e8, 0x4ec, 0x4f4, 0x514 },
 };
 
+/* one channel's output of a frame */
+typedef struct VpssOut {
+    uint32_t ya, ca;
+    int stride, w, h;
+    bool cmp;
+} VpssOut;
+
 struct HisiVpssState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -88,6 +107,8 @@ struct HisiVpssState {
     uint32_t regs[VPSS_REG_SIZE / 4];
     uint32_t active[VPSS_REG_SIZE / 4];  /* what frames are written with */
     bool regup;                          /* REGUP written since the last */
+    bool node_armed;                     /* node mode: VPSS waits for VI */
+    VpssOut node_out[VPSS_CHN];          /* ... and what it then loaded */
     uint32_t raw;
     uint32_t frame;
     uint32_t fps;               /* VI's frame rate */
@@ -142,44 +163,104 @@ static void vpss_paint(uint32_t ya, uint32_t ca, int stride, int w, int h,
     }
 }
 
+/*
+ * A channel's output as a register file (the registers, or a node in
+ * DDR) sets it; w is 0 when the channel writes nothing this frame (off,
+ * or skipped by the driver's frame-rate control).
+ */
+static void vpss_chn_out(const uint32_t *r, int c, VpssOut *o)
+{
+    const uint32_t size = r[vpss_chn[c].size / 4];
+
+    o->w = (size & 0xffff) + 1;
+    o->h = (size >> 16) + 1;
+    o->ya = r[vpss_chn[c].addr / 4 + 4];
+    o->ca = r[vpss_chn[c].addr / 4 + 6];
+    o->cmp = c == 0 && (r[VPSS_CHN0_CMP / 4] & 1);
+    o->stride = o->cmp ? o->w : r[vpss_chn[c].stride / 4] & 0xffff;
+    if (!(r[vpss_chn[c].ctrl / 4] & (1u << 31)) || !o->ya || !o->ca ||
+        o->w > PIC_MAX || o->h > PIC_MAX) {
+        o->w = 0;
+    }
+}
+
+/*
+ * Node mode: the driver's node list for the frame.  Each node is a
+ * register image in DDR (the MMIO layout), chained through its own PNEXT;
+ * a picture wider than VPSS's line buffer comes as vertical strips, one
+ * node each, that write the same buffers side by side.  The picture each
+ * channel gets is the strips' widths together, at the first node's
+ * addresses.
+ */
+static void vpss_load_nodes(HisiVpssState *s)
+{
+    uint32_t node[VPSS_NODE_SIZE / 4];
+    uint32_t a = s->regs[VPSS_PNEXT / 4];
+    int c, k;
+
+    memset(s->node_out, 0, sizeof(s->node_out));
+    for (k = 0; k < VPSS_NODE_MAX && a; k++) {
+        dma_memory_read(&address_space_memory, a, node, sizeof(node),
+                        MEMTXATTRS_UNSPECIFIED);
+        for (c = 0; c < VPSS_CHN; c++) {
+            VpssOut o;
+
+            vpss_chn_out(node, c, &o);
+            if (k == 0) {
+                s->node_out[c] = o;
+            } else if (o.w && s->node_out[c].w) {
+                s->node_out[c].w += o.w;
+            }
+        }
+        a = node[VPSS_PNEXT / 4];
+    }
+    for (c = 0; c < VPSS_CHN; c++) {
+        if (s->node_out[c].cmp) {
+            s->node_out[c].stride = s->node_out[c].w;   /* the stand-in's */
+        }
+    }
+}
+
 static void vpss_frame(void *opaque)
 {
     HisiVpssState *s = opaque;
-    const uint32_t *r = s->active;
+    VpssOut out[VPSS_CHN];
+    bool online = vpss_running(s);
     int c;
 
-    if (!vpss_running(s)) {
+    if (online) {
+        /*
+         * VPSS's frame starts after VI's early interrupt, in whose handler
+         * the driver programs this frame's buffers and writes REGUP: once
+         * REGUP was written, the configuration as it stands now is the one
+         * this frame is written with.  (The SDK sample's driver path writes
+         * REGUP before the addresses, majestic's sets and clears it after
+         * them.)
+         */
+        if (s->regup) {
+            memcpy(s->active, s->regs, sizeof(s->active));
+            s->regup = false;
+        }
+        for (c = 0; c < VPSS_CHN; c++) {
+            vpss_chn_out(s->active, c, &out[c]);
+        }
+    } else if (s->node_armed) {
+        s->node_armed = false;
+        memcpy(out, s->node_out, sizeof(out));
+    } else {
         return;             /* the group stopped since VI's frame */
     }
-
-    /*
-     * VPSS's frame starts after VI's early interrupt, in whose handler the
-     * driver programs this frame's buffers and writes REGUP: once REGUP
-     * was written, the configuration as it stands now is the one this
-     * frame is written with.  (The SDK sample's driver path writes REGUP
-     * before the addresses, majestic's sets and clears it after them.)
-     */
-    if (s->regup) {
-        memcpy(s->active, s->regs, sizeof(s->active));
-        s->regup = false;
-    }
     for (c = 0; c < VPSS_CHN; c++) {
-        const uint32_t size = r[vpss_chn[c].size / 4];
-        const int w = (size & 0xffff) + 1, h = (size >> 16) + 1;
-        const uint32_t ya = r[vpss_chn[c].addr / 4 + 4];
-        const uint32_t ca = r[vpss_chn[c].addr / 4 + 6];
-        const bool cmp = c == 0 && (r[VPSS_CHN0_CMP / 4] & 1);
-        const int stride = cmp ? w : r[vpss_chn[c].stride / 4] & 0xffff;
-
-        if (!(r[vpss_chn[c].ctrl / 4] & (1u << 31)) || !ya || !ca ||
-            w > PIC_MAX || h > PIC_MAX || stride < w) {
-            continue;       /* not written this frame (frame-rate control) */
+        if (out[c].w && out[c].stride >= out[c].w) {
+            vpss_paint(out[c].ya, out[c].ca, out[c].stride, out[c].w,
+                       out[c].h, s->frame, out[c].cmp);
         }
-        vpss_paint(ya, ca, stride, w, h, s->frame, cmp);
     }
     s->frame++;
-    s->raw |= VPSS_INT_START | VPSS_INT_EOF;
-    vpss_update_irq(s);
+    if (online) {
+        s->raw |= VPSS_INT_START | VPSS_INT_EOF;
+        vpss_update_irq(s);
+    }
 }
 
 /*
@@ -190,7 +271,13 @@ static void vpss_vi_frame(void *opaque, int n, int level)
 {
     HisiVpssState *s = opaque;
 
-    if (level && (s->regs[VPSS_INTMASK / 4] & VPSS_INT_START)) {
+    if (!level) {
+        return;
+    }
+    if (s->node_armed) {
+        vpss_load_nodes(s);     /* node mode: the list is loaded at start */
+    }
+    if ((s->regs[VPSS_INTMASK / 4] & VPSS_INT_START) || s->node_armed) {
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   NANOSECONDS_PER_SECOND / 8 / MAX(s->fps, 1));
     }
@@ -236,6 +323,9 @@ static void hisi_vpss_write(void *opaque, hwaddr offset, uint64_t val,
     if (offset == VPSS_REGUP && (val & 1)) {
         s->regup = true;
     }
+    if (offset == VPSS_NODE_START && (val & 1)) {
+        s->node_armed = true;   /* runs on VI's output, from PNEXT */
+    }
     if (offset == VPSS_INTMASK || offset == VPSS_CTRL) {
         /* VI runs while the online video is enabled and its frame
          * interrupt unmasked: from VPSS_OnlineEn to the group's stop.
@@ -277,6 +367,7 @@ static void hisi_vpss_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->active, 0, sizeof(s->active));
     s->regup = false;
+    s->node_armed = false;
     s->raw = 0;
     s->frame = 0;
     qemu_set_irq(s->irq, 0);

@@ -701,7 +701,8 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **NPU** | — | — | — | — | — | — | — | stub |
 
 Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
-the vendor VENC stack; `frames`: the online VI → VPSS pipeline produces
+the vendor VENC stack; `frames`: the VI → VPSS pipeline (online, or VI
+offline for sensors wider than 2304, IMX335 and GC4653) produces
 pictures, so majestic and the SDK's `sample_venc` stream from a sensor
 (`docs/hisilicon-venc.md`). ¹ EV200 / EV300 / 18EV300 / 16DV200 and their
 Goke rebrands. V5 (×3) = CV608/CV610/CV613 (same die, different feature
@@ -725,7 +726,7 @@ qemu/
 ├── hw/misc/hisi-fastboot.c      # Boot ROM fastboot serial protocol (defib compat)
 ├── hw/misc/hisi-vedu.c          # V4 video encoder: VEDU (H.264/H.265) + JPGE
 ├── hw/misc/hisi-vi.c            # V4 VI capture + ISP pipe: the frame clock
-├── hw/misc/hisi-vpss.c          # V4 VPSS online: paints the channels' frames
+├── hw/misc/hisi-vpss.c          # V4 VPSS online / node list: paints the channels' frames
 ├── hw/misc/hisi-mipi-rx.c       # MIPI RX controller stub
 ├── hw/misc/hisi-rtc.c           # SPI-bridge RTC device
 ├── hw/net/hisi-femac.c          # Fast Ethernet MAC + MDIO PHY stub
