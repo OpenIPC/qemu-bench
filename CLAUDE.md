@@ -84,6 +84,7 @@ bash qemu/tests/test-hisi-rtc.sh
 bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
+python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpeg-checked
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
@@ -634,6 +635,22 @@ in this order:
   `sensor-addr=`; `xm-sensor` is a generic register-file sensor whose ID comes
   from `-global xm-sensor.regs=` (`docs/xiongmai.md`). The SSI `imx122` stays
   in `hisilicon_common_init()`.
+- **Video encoding (V4: EV200/EV300/18EV300/16DV200, GK7205V200 family)** is
+  `hisi-vedu` (`docs/hisilicon-venc.md`). The HiMPP driver writes only a few
+  VEDU MMIO registers per picture; the rest is a register image in DDR at
+  VEDU+0x58 that the engine fetches at START. Output goes into a per-channel
+  stream ring of 64-byte-header packets the driver itself parses (type,
+  last-slice / slice-type byte, channel id -- it panics on a wrong one --
+  PTS); the driver writes the SPS/PPS/VPS/SEI and JFIF header packets, the
+  model appends the slice or scan and moves the ring's write-pointer cell.
+  H.264 slice headers are the model's own, H.265 ones the driver's bits from
+  the image (0x404-0x42c). JPGE is plain MMIO, quantisers as 2^23/q
+  reciprocals. Completion is on a virtual-time timer, never inside START.
+  `-global hisi-vedu.dump-dir=DIR` keeps each channel's stream,
+  `trace=on` logs every access and the image at START.
+  `qemu-boot/test-hisi-venc.sh` runs the vendor stack (`VENC_SendFrame`, no
+  VI) under the OpenIPC release; its guest program needs a 32-bit-`off_t`
+  `mmap()` shim, because the release's MPI libraries are uClibc builds.
 
 ## Adding a SoC or a device
 

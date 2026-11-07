@@ -832,6 +832,16 @@ else
     echo "  hw/misc/Kconfig already patched"
 fi
 
+# shared coders for hisi-vedu: H.264 slices (H.265 slices, JPEG scans)
+for b in hantro-h264.c hevc-enc.c jpeg-enc.c; do
+    if ! grep -q "CONFIG_HISI_MISC', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for HISI_MISC"
+    fi
+done
+
 # hw/misc/meson.build
 if ! grep -q hisi-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-vi-fp.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c'))" \
