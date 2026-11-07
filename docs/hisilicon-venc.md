@@ -18,11 +18,14 @@ On the EV200-class machines (hi3516ev200, hi3516ev300, hi3518ev300,
 hi3516dv200 and the Goke rebrands gk7205v200, gk7205v300, gk7202v300,
 gk7605v100, gk7201v200), `hisi-vi` and `hisi-vpss` add the camera pipeline
 in front of it (see [VI and VPSS](#vi-and-vpss) below). With a 1080p
-sensor on the bus, two unmodified programs run from sensor to stream:
+sensor on the bus, unmodified programs run from sensor to stream:
 
-- the SDK's own `sample_venc` (mode 1: 1080p H.265 and 640x480 H.264);
-- the OpenIPC release's majestic, with HiSilicon's `open_*.ko` or Goke's
-  `gk7205v200_*.ko`.
+- the OpenIPC release's majestic, on every one of them, with HiSilicon's
+  `open_*.ko` or Goke's `gk7205v200_*.ko`;
+- the HiSilicon SDK's own `sample_venc` (mode 1: 1080p H.265 and 640x480
+  H.264), on hi3516ev200 with HiSilicon's modules; it is built from that
+  SDK, so `test-hisi-sample-venc.sh` runs it there only (the Goke SDK's
+  sample is not covered).
 
 The sensor has to be one the firmware has a config for in `/etc/sensors`.
 `sensor=sc2315e` suits HiSilicon's releases. Goke's releases have no
