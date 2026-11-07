@@ -6133,8 +6133,14 @@ static void hisilicon_common_init(MachineState *machine,
             DeviceState *sensor = qdev_new("hisi-imx122");
             qdev_realize_and_unref(sensor, ssi_bus, &error_fatal);
         } else if (sensor_name && c->num_i2c > 0 && i2c_devs[0]) {
-            image_sensor_create(I2C_BUS(qdev_get_child_bus(i2c_devs[0], "i2c")),
-                                sensor_name);
+            DeviceState *sensor = image_sensor_create(
+                I2C_BUS(qdev_get_child_bus(i2c_devs[0], "i2c")), sensor_name);
+
+            if (vi && sensor) {
+                /* the ISP's statistics measure the sensor's exposure */
+                object_property_set_link(OBJECT(vi), "sensor",
+                                         OBJECT(sensor), &error_fatal);
+            }
         } else if (sensor_name) {
             error_report("sensor '%s' requested but this SoC has no I2C "
                          "or matching SPI controller", sensor_name);

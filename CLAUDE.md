@@ -86,6 +86,7 @@ bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
 python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpeg-checked
 python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wide sensors)
+python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
@@ -669,7 +670,15 @@ in this order:
   raises no interrupt. VEDU's source stride is image 0x1f4, not 0x160
   (the 64-aligned reference stride). Compressed VPSS channels use a private
   half-height stand-in shared with `hisi-vedu`. Use `-icount shift=0`, or
-  frames overtake the driver on a slow host.
+  frames overtake the driver on a slow host. `hisi-vi` also writes the
+  ISP's statistics (front-end AE histogram, backend AE histogram, zones
+  and AWB, the STT layouts in openhisilicon's `isp_stt_define.h`). They
+  come from a grey-bar scene lit by the sensor's exposure × gain
+  (`image-sensor`, one frame late; `hisi-vi.light*` properties), so AE
+  converges. The ISP driver's per-frame work runs on the front end's
+  FSTART / FEND (VI_CAP 0x200f0, SPI 43, shared with capture), and a
+  port status (0x10f0) with error bits set makes it skip the frame.
+  `-global hisi-vi.stats-trace=on` prints what AE / AWB see.
 
 ## Adding a SoC or a device
 
