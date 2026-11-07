@@ -692,13 +692,17 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **MIPI RX** | — | — | stub | — | yes | stub | yes | yes |
 | **RTC** | — | — | yes | — | yes | yes | yes | yes |
 | **VEDU/JPGE** | — | — | stub | — | yes | stub | **encodes** | yes |
+| **VI/VPSS** | stub | stub | stub | — | stub | stub | **frames**¹ | stub |
 | **Watchdog** | yes | yes | yes | yes | yes | yes | yes | yes |
 | **Sensor I2C** | — | — | — | — | — | — | yes | — |
 | **IVE (18 ops)** | — | — | — | — | — | — | **yes** | — |
 | **NPU** | — | — | — | — | — | — | — | stub |
 
 Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
-the vendor VENC stack (`docs/hisilicon-venc.md`). V5 (×3) = CV608/CV610/CV613 (same die, different feature
+the vendor VENC stack; `frames`: the online VI → VPSS pipeline produces
+pictures, so majestic and the SDK's `sample_venc` stream from a sensor
+(`docs/hisilicon-venc.md`). ¹ HiSilicon EV200 / EV300 / 18EV300 / 16DV200;
+the Goke rebrands keep stubs. V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
 
@@ -718,6 +722,8 @@ qemu/
 ├── hw/misc/hisi-ive.c           # IVE: 18 ops (SAD, CCL, Sub, Thresh, Erode...)
 ├── hw/misc/hisi-fastboot.c      # Boot ROM fastboot serial protocol (defib compat)
 ├── hw/misc/hisi-vedu.c          # V4 video encoder: VEDU (H.264/H.265) + JPGE
+├── hw/misc/hisi-vi.c            # V4 VI capture + ISP pipe: the frame clock
+├── hw/misc/hisi-vpss.c          # V4 VPSS online: paints the channels' frames
 ├── hw/misc/hisi-mipi-rx.c       # MIPI RX controller stub
 ├── hw/misc/hisi-rtc.c           # SPI-bridge RTC device
 ├── hw/net/hisi-femac.c          # Fast Ethernet MAC + MDIO PHY stub

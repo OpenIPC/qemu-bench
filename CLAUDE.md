@@ -651,6 +651,16 @@ in this order:
   `qemu-boot/test-hisi-venc.sh` runs the vendor stack (`VENC_SendFrame`, no
   VI) under the OpenIPC release; its guest program needs a 32-bit-`off_t`
   `mmap()` shim, because the release's MPI libraries are uClibc builds.
+  In front of it on the HiSilicon EV200-class machines, `hisi-vi` (the
+  frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
+  start / end) and `hisi-vpss` (paints its channels, then frame start +
+  end) run the online pipeline, so majestic and the SDK's own
+  `sample_venc` stream from `sensor=sc2315e`
+  (`test-hisi-majestic.sh`, `test-hisi-sample-venc.sh --sdk`). VI runs only
+  while VPSS's online video is enabled: an interrupt for a pipe that does
+  not exist oopses the driver. Compressed VPSS channels use a private
+  half-height stand-in shared with `hisi-vedu`. Use `-icount shift=0`, or
+  frames overtake the driver on a slow host.
 
 ## Adding a SoC or a device
 

@@ -31,6 +31,8 @@
  *   0x16c          stream ring base;  0x4a0  its size
  *   0x61c          slice QP (low 6 bits)
  *   0x4a4 / 0x4a8  PTS
+ *   0x1ec          compression header address of a compressed source
+ *                  (hisi-vpss's half-height stand-in, see there)
  *
  * The stream ring holds packets, each a 64-byte header and its payload
  * padded to 64 bytes:
@@ -107,6 +109,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
 #define IMG_STRM_WP         0x12c
 #define IMG_STRM_RP         0x130
 #define IMG_SRC_STRIDE      0x160
+#define IMG_SRC_CMP_HDR     0x1ec   /* compressed source: its header address */
 #define IMG_STRM_BASE       0x16c
 #define IMG_STRM_SIZE       0x4a0
 #define IMG_SLICE_QP        0x61c
@@ -473,24 +476,28 @@ static size_t nal_wrap(uint8_t hdr, const uint8_t *rbsp, size_t n,
     return o;
 }
 
-/* NV21 / NV12 source into an NV12 picture padded to whole macroblocks */
+/*
+ * NV21 / NV12 source into an NV12 picture padded to whole macroblocks.
+ * half: a compressed source in hisi-vpss's stand-in, every other row
+ * stored (see hisi-vpss.c), which is doubled back here.
+ */
 static void vedu_load_nv12(uint32_t ya, uint32_t ca, int ys, int cs,
                            int w, int h, bool vu, int mbw, int mbh,
-                           uint8_t *y, uint8_t *uv)
+                           uint8_t *y, uint8_t *uv, bool half)
 {
-    const int pw = mbw * 16, ph = mbh * 16;
+    const int pw = mbw * 16, ph = mbh * 16, step = half ? 2 : 1;
     g_autofree uint8_t *line = g_malloc(MAX(w, 1));
     int r, x;
 
     for (r = 0; r < ph; r++) {
-        vedu_dma_read(ya + (uint64_t)MIN(r, h - 1) * ys, line, w);
+        vedu_dma_read(ya + (uint64_t)(MIN(r, h - 1) / step) * ys, line, w);
         memcpy(y + r * pw, line, w);
         memset(y + r * pw + w, line[w - 1], pw - w);
     }
     for (r = 0; r < ph / 2; r++) {
         uint8_t *d = uv + r * pw;
 
-        vedu_dma_read(ca + (uint64_t)MIN(r, h / 2 - 1) * cs, line, w);
+        vedu_dma_read(ca + (uint64_t)(MIN(r, h / 2 - 1) / step) * cs, line, w);
         for (x = 0; x < pw / 2; x++) {
             int sx = MIN(x, w / 2 - 1) * 2;
 
@@ -1149,7 +1156,8 @@ static uint32_t vedu_encode(HisiVeduState *s)
     uv = g_malloc(mbw * mbh * 128);
     vedu_load_nv12(img[IMG_SRC_Y / 4], img[IMG_SRC_C / 4],
                    img[IMG_SRC_STRIDE / 4] & 0xffff,
-                   img[IMG_SRC_STRIDE / 4] >> 16, w, h, true, mbw, mbh, y, uv);
+                   img[IMG_SRC_STRIDE / 4] >> 16, w, h, true, mbw, mbh, y, uv,
+                   img[IMG_SRC_CMP_HDR / 4] != 0);
 
     nal = g_malloc(cap + 64);
     if (c->codec == CODEC_H265) {
@@ -1342,7 +1350,8 @@ static uint32_t jpge_encode(HisiVeduState *s)
     cr = g_malloc(pw * ph / 4);
     vedu_load_nv12(r[JPGE_SRC_Y / 4], r[JPGE_SRC_C / 4],
                    r[JPGE_SRC_STRIDE / 4] & 0xffff,
-                   r[JPGE_SRC_STRIDE / 4] >> 16, w, h, true, mbw, mbh, y, uv);
+                   r[JPGE_SRC_STRIDE / 4] >> 16, w, h, true, mbw, mbh, y, uv,
+                   false);
     for (i = 0; i < pw * ph / 4; i++) {
         cb[i] = uv[i * 2];
         cr[i] = uv[i * 2 + 1];

@@ -1604,6 +1604,22 @@ static const HisiSoCConfig hi3516av200_soc = {
 };
 
 /*
+ * The EV200-class V4 dies' online video pipeline: VI as the frame clock,
+ * VPSS painting the pictures (hisi-vi, hisi-vpss).  Their regbanks in
+ * HISI_V4_REGBANK_LIST stay in the list and are not mapped over them.
+ * HiSilicon's EV200 / EV300 / 18EV300 / 16DV200 only: the Goke rebrands'
+ * own gk7205v200_*.ko start the pipeline under it but deliver no frame
+ * yet, so they keep the register stubs.
+ */
+#define HISI_V4_VIDEO_PIPE                                  \
+    .vi_cap_base        = 0x11000000,                       \
+    .vi_proc_base       = 0x11200000,                       \
+    .vi_cap_irq         = 43,                               \
+    .vi_proc_irq        = 44,                               \
+    .vpss_base          = 0x11400000,                       \
+    .vpss_irq           = 46
+
+/*
  * Hi3516EV300 (V4): 2019, 5M professional.  Cortex-A7 @900MHz.
  * Video: H.265/H.264, 5M(2592x1944)@15fps / 4M(2688x1520)@25fps.
  * Memory: 1Gbit DDR3L integrated (128MB).  279-pin TFBGA.
@@ -1618,15 +1634,7 @@ static const HisiSoCConfig hi3516ev300_soc = {
     .default_sensor     = "imx335",        /* Sony 5MP on EV300 ref boards */
     .hwrng_base         = 0x10080000,      /* HISEC_TRNG_CTRL (V4) */
     .hwrng_data_offset  = 0x204,
-    /* MVP video pipeline IRQ heartbeat — pulses VI_CAP0/VI_PROC0/VPSS
-     * at 25 Hz so the vendor MPP modules' IRQ handlers run and Majestic
-     * gets past its "Timeout from venc channel 0" loop.
-     * SPI numbers are GIC absolute IRQ - 32 (per /proc/interrupts the
-     * kernel shows GIC-75/76/78 for VI_CAP0/VI_PROC0/VPSS). */
-    .vi_fp_base         = 0x11FE0000,      /* unused gap above vedu/jpge */
-    .vi_fp_cap_irq      = 43,              /* VI_CAP0  = SPI 43 (GIC 75) */
-    .vi_fp_proc_irq     = 44,              /* VI_PROC0 = SPI 44 (GIC 76) */
-    .vi_fp_vpss_irq     = 46,              /* VPSS     = SPI 46 (GIC 78) */
+    HISI_V4_VIDEO_PIPE,
     /* 128 MiB on-chip DDR3L (1Gb).  Kernel gets 32 MiB, vendor mmz.ko
      * claims 96 MiB at 0x42000000 — matches the canonical EV300 layout
      * documented in OpenIPC's /usr/bin/load_hisilicon. */
@@ -1815,6 +1823,13 @@ static const HisiSoCConfig hi3516ev200_soc = {
      * "Uncompress hardware decompress overtime!" before reaching the
      * U-Boot banner.  See openhisilicon#60. */
     .gzip_base          = 0x11310000,
+
+    HISI_V4_VIDEO_PIPE,
+
+    .num_regbanks       = 1,
+    .regbanks           = {
+        { "hisi-vgs",        0x11300000, 0x10000  },
+    },
 };
 
 /*
@@ -1827,6 +1842,7 @@ static const HisiSoCConfig hi3516ev200_soc = {
  */
 static const HisiSoCConfig hi3518ev300_soc = {
     .name               = "hi3518ev300",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "HiSilicon Hi3518EV300 (Cortex-A7)",
     .cpu_type           = ARM_CPU_TYPE_NAME("cortex-a7"),
     .soc_id             = HISI_SOC_ID_18EV300,
@@ -1915,6 +1931,7 @@ static const HisiSoCConfig hi3518ev300_soc = {
  */
 static const HisiSoCConfig hi3516dv200_soc = {
     .name               = "hi3516dv200",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "HiSilicon Hi3516DV200 (Cortex-A7)",
     .cpu_type           = ARM_CPU_TYPE_NAME("cortex-a7"),
     .soc_id             = HISI_SOC_ID_DV200,
@@ -5855,6 +5872,33 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_connect_irq(busdev, 1, pic[c->jpge_irq]);
     }
 
+    /* VI: capture and the ISP pipe, the online pipeline's frame clock */
+    DeviceState *vi = NULL;
+    if (c->vi_cap_base) {
+        vi = qdev_new("hisi-vi");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(vi);
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->vi_cap_base);
+        sysbus_mmio_map(busdev, 1, c->vi_proc_base);
+        sysbus_connect_irq(busdev, 0, pic[c->vi_cap_irq]);
+        sysbus_connect_irq(busdev, 1, pic[c->vi_proc_irq]);
+    }
+
+    /* VPSS, the online pipeline's frame source */
+    if (c->vpss_base) {
+        DeviceState *vpss = qdev_new("hisi-vpss");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(vpss);
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->vpss_base);
+        sysbus_connect_irq(busdev, 0, pic[c->vpss_irq]);
+        if (vi) {
+            qdev_connect_gpio_out_named(vi, "frame", 0,
+                qdev_get_gpio_in_named(vpss, "vi-frame", 0));
+            qdev_connect_gpio_out_named(vpss, "running", 0,
+                qdev_get_gpio_in_named(vi, "run", 0));
+        }
+    }
+
     /* Hardware True Random Number Generator
      * (HISEC_TRNG_CTRL on V3+, RNG_GEN on V2) */
     if (c->hwrng_base) {
@@ -5865,17 +5909,6 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_mmio_map(busdev, 0, c->hwrng_base);
     }
 
-    /* VI frame producer — periodic VI_CAP/VI_PROC/VPSS IRQ heartbeat
-     * to wake the vendor MPP pipeline.  MVP, EV300 only for now. */
-    if (c->vi_fp_base) {
-        DeviceState *vifp = qdev_new("hisi-vi-fp");
-        SysBusDevice *busdev = SYS_BUS_DEVICE(vifp);
-        sysbus_realize_and_unref(busdev, &error_fatal);
-        sysbus_mmio_map(busdev, 0, c->vi_fp_base);
-        sysbus_connect_irq(busdev, 0, pic[c->vi_fp_cap_irq]);
-        sysbus_connect_irq(busdev, 1, pic[c->vi_fp_proc_irq]);
-        sysbus_connect_irq(busdev, 2, pic[c->vi_fp_vpss_irq]);
-    }
 
     /* Watchdog (SP805-compatible, reuse cmsdk-apb-watchdog) */
     if (c->wdt_base) {
@@ -5980,7 +6013,10 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* Generic register banks (pin mux, DDR PHY, PWM, etc.) */
     for (n = 0; n < c->num_regbanks; n++) {
-        if (c->regbanks[n].base) {
+        if (c->regbanks[n].base &&
+            c->regbanks[n].base != c->vi_cap_base &&
+            c->regbanks[n].base != c->vi_proc_base &&
+            c->regbanks[n].base != c->vpss_base) {
             /* IVE gets a proper functional device instead of regbank */
             if (!strcmp(c->regbanks[n].name, "hisi-ive")) {
                 DeviceState *ive = qdev_new("hisi-ive");

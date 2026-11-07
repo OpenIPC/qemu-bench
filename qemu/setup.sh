@@ -231,12 +231,13 @@ cp qemu/hw/misc/hisi-himci.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-regbank.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-sfc350.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vedu.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-vpss.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-vi.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-mipi-rx.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-rtc.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-ive.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-nnie.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-hwrng.c        "$QEMU_DIR/hw/misc/"
-cp qemu/hw/misc/hisi-vi-fp.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-fastboot.c     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-gzip.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-l2cache.c     "$QEMU_DIR/hw/misc/"
@@ -844,7 +845,7 @@ done
 
 # hw/misc/meson.build
 if ! grep -q hisi-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-vi-fp.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c'))" \
+    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c', 'hisi-vpss.c', 'hisi-vi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  patched hw/misc/meson.build"
 else
@@ -853,13 +854,14 @@ else
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-hwrng.c"
     fi
-    if ! grep -q hisi-vi-fp "$QEMU_DIR/hw/misc/meson.build"; then
-        sed -i "s/'hisi-hwrng.c'/'hisi-hwrng.c', 'hisi-vi-fp.c'/" \
-            "$QEMU_DIR/hw/misc/meson.build"
-        echo "  hw/misc/meson.build: added hisi-vi-fp.c"
+    if grep -q hisi-vi-fp "$QEMU_DIR/hw/misc/meson.build"; then
+        # hisi-vi-fp (forged VI/VPSS/VEDU interrupts) gave way to hisi-vi
+        # and hisi-vpss
+        sed -i "s/, 'hisi-vi-fp.c'//" "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: removed hisi-vi-fp.c"
     fi
     if ! grep -q hisi-l2cache "$QEMU_DIR/hw/misc/meson.build"; then
-        sed -i "s/'hisi-vi-fp.c'/'hisi-vi-fp.c', 'hisi-l2cache.c'/" \
+        sed -i "s/'hisi-hwrng.c'/'hisi-hwrng.c', 'hisi-l2cache.c'/" \
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-l2cache.c"
     fi
@@ -877,6 +879,16 @@ else
         sed -i "s/'hisi-xmsp804.c'/'hisi-xmsp804.c', 'hisi-ddrc-v1.c'/" \
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-ddrc-v1.c"
+    fi
+    if ! grep -q hisi-vpss "$QEMU_DIR/hw/misc/meson.build"; then
+        sed -i "s/'hisi-ddrc-v1.c'/'hisi-ddrc-v1.c', 'hisi-vpss.c'/" \
+            "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added hisi-vpss.c"
+    fi
+    if ! grep -q "'hisi-vi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+        sed -i "s/'hisi-vpss.c'/'hisi-vpss.c', 'hisi-vi.c'/" \
+            "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added hisi-vi.c"
     fi
 fi
 
