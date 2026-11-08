@@ -675,7 +675,11 @@ in this order:
   and AWB, the STT layouts in openhisilicon's `isp_stt_define.h`). They
   come from a grey-bar scene lit by the sensor's exposure × gain
   (`image-sensor`, one frame late; `hisi-vi.light*` properties), so AE
-  converges. The ISP driver's per-frame work runs on the front end's
+  and AWB converge. An AWB zone's count is every pixel of the zone:
+  lib_hiawb leaves its gains alone unless the zones' average count passes
+  1024. Offline, each strip's VIPROC node (0x2f8 chain) has its own
+  statistics block (S_ISP_STT_REGS_TYPE) at the address in its 0x5d0.
+  The ISP driver's per-frame work runs on the front end's
   FSTART / FEND (VI_CAP 0x200f0, SPI 43, shared with capture), and a
   port status (0x10f0) with error bits set makes it skip the frame.
   `-global hisi-vi.stats-trace=on` prints what AE / AWB see.

@@ -7,6 +7,9 @@ front end's interrupt its per-frame work runs from (ISP_ISR).
 No sensor here, so the scene's white is half scale (65535 / 2): eight grey
 bars under a light of R 0.55, G 1, B 0.7, the brightest bar white.
 
+Offline, the pipe's strips each write a block at the address in their
+VIPROC register image (VI_HAL_SetIspSttAddr, 0x5d0).
+
     python3 qemu/tests/test-hisi-isp.py [--qemu PATH] [--machine M]
 """
 import argparse
@@ -89,17 +92,51 @@ def main():
           'AE zone 254 (the black bar): R %d' % (last >> 16))
 
     w0, w1 = words(BE_STT + 0x2800, 2)
-    n = SAMPLES // 1024
+    n = 1920 * 1080 // 1024                 # every pixel of the zone
     check(w0 == (G << 16 | R) and w1 == (n << 16 | B),
           'AWB zone 0: R %d G %d B %d count %d' %
           (w0 & 0xffff, w0 >> 16, w1 & 0xffff, w1 >> 16))
 
     r, g, b, cnt = (q.readl(VI_PROC + 0x22140 + 4 * i) for i in range(4))
-    check(0 < r < g and 0 < b < g and cnt == min(SAMPLES, 0xffff),
+    check(0 < r < g and 0 < b < g and cnt == n,
           'AWB global: R %d G %d B %d count %d' % (r, g, b, cnt))
     tot, aver_r = q.readl(VI_PROC + 0x22018), q.readl(VI_PROC + 0x22020)
     check(tot == SAMPLES * 4 and aver_r == r,
           'AE global: %d pixels, R mean %d' % (tot, aver_r))
+
+    # offline (a sensor wider than 2304): the pipe runs two strips, VIPROC
+    # register images chained through 0x2f8, each writing its statistics
+    # block (S_ISP_STT_REGS_TYPE) to the address at its 0x5d0
+    NODE0, NODE1 = 0x42a00000, 0x42a20000
+    STT0, STT1 = 0x42b00000, 0x42b10000
+    for node, nxt, stt in ((NODE0, NODE1, STT0), (NODE1, 0, STT1)):
+        q.write(node, b'\0' * 0x800)
+        q.writel(node + 0x2f8, nxt)
+        q.writel(node + 0x5d0, stt)
+    q.write(STT0, b'\0' * 0x4000)
+    q.write(STT1, b'\0' * 0x4000)
+    q.writel(VI_PROC + 0x2f8, NODE0)
+    q.writel(VI_PROC + 0x300, 1)                    # VI_HAL_Start
+    q.cmd('clock_step %d' % (FRAME_NS // 2))
+
+    hist = [a + b for a, b in zip(words(STT0 + 0x1c, 1024),
+                                  words(STT1 + 0x1c, 1024))]
+    check(abs(sum(hist) - SAMPLES * 4) <= 16,
+          'offline: the strips\' histograms add up to the picture (%d)' %
+          sum(hist))
+    # strip 1 starts at AWB column 16 of 32: the fifth bar (luma 106)
+    bar4 = int(WHITE * (106 - 16) / 219)
+    z0 = words(STT0 + 0x182c, 2)
+    z1 = words(STT1 + 0x182c, 2)
+    check(z0[0] == (G << 16 | R) and z1[0] >> 16 == bar4 and
+          z1[1] >> 16 == n,
+          'offline: AWB zone 0 of each strip: G %d, G %d (bar 4), count %d'
+          % (z0[0] >> 16, z1[0] >> 16, z1[1] >> 16))
+    # strip 0 has AE columns 0..8 (row width 9), strip 1 9..16 (width 8)
+    ae1 = words(STT1 + 0x101c + 8 * 4, 1)[0]        # row 1, column 9
+    ae1_ref = words(STT1 + 0x101c, 1)[0]            # row 0, column 9
+    check(ae1 == ae1_ref and words(STT0 + 0x1c, 1)[0] == 0,
+          'offline: AE zones row by row at the strip\'s width')
     q.close()
 
     print('%d failure(s)' % fails)
