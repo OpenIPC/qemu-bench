@@ -16,6 +16,11 @@
 # with no errors, at least --min-frames pictures, each carrying hisi-vpss's
 # frame counter, rising from picture to picture (a stale buffer fails).
 #
+# The ISP's statistics follow the sensor's exposure (hisi-vi): with a
+# sensor model that reports it, auto exposure must have settled the scene
+# between 10 % and 70 % of full scale (pinned at its longest exposure and
+# highest gain, it reads 0 or 65535).
+#
 # -icount shift=0: guest time follows the guest's instructions, so its
 # interrupt handlers always finish within a frame of VI's (without it, a
 # slow host lets frames overtake the driver and the counter can repeat).
@@ -65,6 +70,7 @@ timeout "$TIMEOUT" "$QEMU" -M "$SOC,sensor=$SENSOR" \
     -kernel "$WORK/uImage.$SOC" -initrd "$WORK/rootfs.squashfs.$SOC" \
     -append "console=ttyAMA0,115200 mem=32M mmz_allocator=$ALLOC root=/dev/ram0 rootfstype=squashfs" \
     -icount shift=0 -global hisi-vedu.dump-dir="$DUMP" \
+    -global hisi-vi.stats-trace=on \
     -nographic -serial mon:stdio -nic user,restrict=on -no-reboot \
     > "$WORK/console.log" 2>&1 || true
 
@@ -77,5 +83,16 @@ if ! grep -q "Starting majestic: OK" "$WORK/console.log"; then
     echo "majestic did not start; console in $WORK/console.log" >&2
     exit 1
 fi
+case $SENSOR in
+sc*|gc*)        # SmartSens / GalaxyCore models report their exposure
+    last=$(grep -a "^isp stats:" "$WORK/console.log" | tail -1)
+    mean=$(echo "$last" | sed -n 's/.*G mean \([0-9]*\).*/\1/p')
+    echo "AE: $last"
+    if [ -z "$mean" ] || [ "$mean" -lt 6553 ] || [ "$mean" -gt 45875 ]; then
+        echo "auto exposure did not settle; console in $WORK/console.log" >&2
+        exit 1
+    fi
+    ;;
+esac
 python3 "$HERE/check-hisi-venc.py" --min-frames "$MIN_FRAMES" --rising \
     "$DUMP" h265

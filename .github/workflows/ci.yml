@@ -114,6 +114,12 @@ jobs:
       - name: HiSilicon VI offline + VPSS node list (hisi-vi, hisi-vpss)
         run: python3 qemu/tests/test-hisi-vpss.py
 
+      # The ISP statistics hisi-vi writes (front-end and backend AE
+      # histograms, AE / AWB zones, globals) in the driver's STT layouts,
+      # and the front-end interrupt the ISP's per-frame work runs from.
+      - name: HiSilicon ISP statistics (hisi-vi)
+        run: python3 qemu/tests/test-hisi-isp.py
+
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)

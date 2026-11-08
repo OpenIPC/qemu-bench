@@ -253,6 +253,74 @@ bash qemu-boot/test-hisi-majestic.sh --soc hi3516ev300 --sensor imx335   # offli
 bash qemu-boot/test-hisi-sample-venc.sh --sdk <Hi3516EV200_SDK_V1.0.1.2>   # the SDK's sample_venc
 ```
 
+## ISP statistics
+
+The ISP's 3A algorithms (`lib_hiae`, `lib_hiawb`) measure each frame
+through statistics the ISP hardware writes. `hisi-vi` renders a scene and
+writes those statistics, so auto exposure has something to measure:
+
+- **The scene** is eight grey bars, as in hisi-vpss's picture, as raw
+  Bayer under a light whose response is R 0.55, G 1, B 0.7
+  (`-global hisi-vi.light-r=` / `light-b=`, per mille of G).
+- **Brightness** is white × rows × gain, clipped to 16 bits. White is
+  `-global hisi-vi.light=` (default 600 per row at ×1).
+- **Exposure and gain** come from the sensor through the `image-sensor`
+  interface, one frame late, as a sensor applies registers written during
+  the previous frame.
+- **Without a model** that reports exposure (no sensor, or the plain Sony
+  models such as IMX335), white is fixed at half scale.
+
+The driver's per-frame work (`ISP_ISR`, then its bottom half) runs on the
+ISP front end's frame start and end. These share SPI 43 with VI_CAP (the
+DTS's "ISP" interrupt). The front end's statistics are read there; the
+backend's are read on the pipe's frame.
+
+**Front end (VI_CAP)**
+
+| Offset | |
+|---|---|
+| `0x10f0` | port status, write 1s to clear. Bits 1-2 are errors, and `ISP_ISR` skips the frame while they read set. |
+| `0x200f0` / `0x200f8` | front-end status (write 1s to clear: bit 0 frame start, bit 4 frame end) and mask. |
+| `0x10208` | STT address of the AE histogram: 256 u32 bins of the Bayer samples >> 8. The driver swaps it between two buffers every frame (`ISP_DRV_FE_SwitchSttAddr`). |
+| `0x10210` / `0x10218` | STT addresses of the AE zone means. |
+| `0x22810` | AE zones (hnum \| vnum << 8). |
+| `0x22818` / `0x2281c` | AE pixels, total / counted. |
+| `0x22820..0x2282c` | AE global R / Gr / Gb / B means. |
+
+**Backend (VI_PROC; the SDK's `ISP_BE_REG_BASE` 0x11220000 is VI_PROC + 0x20000)**
+
+| Offset | |
+|---|---|
+| `0x668` | STT: AE histogram, 1024 u32 bins of the samples >> 6. |
+| `0x670` / `0x678` | STT: AE zone means, `R << 16 \| Gr` and `Gb << 16 \| B`, row by row. |
+| `0x680` | STT: AWB zones, two u32 each: `G << 16 \| R`, `count << 16 \| B`. |
+| `0x22010` / `0x22110` | AE zones (17 × 15) / AWB zones (32 × 32). |
+| `0x22018..0x2202c` | AE global, as in the front end. |
+| `0x22140..0x2214c` | AWB global R / G / B means and count. |
+
+The backend's STT addresses are set once (`ISP_DRV_SetOnlineSttAddr`).
+Every value is 16-bit, and the AWB means are taken before the white
+balance gains (FE_MODULE_POS `0x20090` bits 3:2 are not 2). The layouts
+are `S_ISP_ONLINE_STT_REGS_TYPE` / `S_ISP_FE_STT_REGS_TYPE` in
+openhisilicon's `isp_stt_define.h`.
+
+**What it does.**
+
+- On hi3516ev200 with an SC2315E, majestic's AE settles at 61 rows ×1
+  with its measured average at its target. Before, it read `OriAve 0` in
+  `/proc/umap/isp` and ran exposure and gain to their limits (6750 rows,
+  ×15.5).
+- AWB's colour temperature follows the light, from 2659 K for R 1.0 /
+  B 0.4 to 6451 K for R 0.65 / B 0.68.
+- AWB's gains stay at the sensor's static calibration on that camera. The
+  cause is inside the closed `lib_hiawb` and has not been found.
+
+`test-hisi-majestic.sh` passes `-global hisi-vi.stats-trace=on`, which
+prints one line a second of what AE and AWB see. It fails if AE has not
+brought the scene between 10 % and 70 % of full scale. The check applies
+to SmartSens and GalaxyCore sensors, whose models report exposure.
+`qemu/tests/test-hisi-isp.py` checks the layouts at register level.
+
 ## Running it
 
 ```bash
@@ -282,8 +350,9 @@ The release's MPI libraries are uClibc builds. Under musl they need:
 
 ## Not yet
 
-- **ISP statistics** are not produced: the 3A algorithms run, but on
-  nothing.
+- **AWB gains** stay at the static calibration (see "ISP statistics"),
+  and AF, the local-average (LA) and dehaze statistics are not
+  produced.
 - **Multi-slice pictures and B frames:** the model codes one slice per
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own
