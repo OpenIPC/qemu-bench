@@ -566,11 +566,23 @@ config AMBARELLA
 KCONFIG
     echo "  hw/arm/Kconfig: added AMBARELLA"
 fi
-for f in amb-vic amb-timer amb-rct amb-gpio amb-nand; do
+for f in amb-vic amb-timer amb-rct amb-gpio amb-nand amb-dsp; do
     if ! grep -q "'$f.c'" "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('$f.c'))" \
             >> "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added $f.c"
+    fi
+done
+# shared software encoders amb-dsp.c calls: the JPEG scan coder and the H.264
+# slice/header coder, each already built for the XM/GM/Ingenic models too.  The
+# file is guarded per machine (meson folds the duplicate adds into one build of
+# it), so an Ambarella-only configuration links without CONFIG_XIONGMAI.
+for b in jpeg-enc.c hantro-h264.c; do
+    if ! grep -q "CONFIG_AMBARELLA', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_AMBARELLA', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for AMBARELLA"
     fi
 done
 if ! grep -q "'amb-idc.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
