@@ -106,6 +106,6 @@ if [ -z "$t" ] || ! awk -v t="$t" -v e="$END" 'BEGIN { exit !(t >= e) }'; then
 fi
 # White balance is reported, not enforced: in some runs lib_hiawb stops
 # moving its gains seconds after boot and then ignores the light's colour
-# (docs/hisilicon-digital-twin.md, "Open issues").
+# (OpenIPC/qemu-bench#252).
 python3 "$HERE/twin-metrics.py" "$RECORD" --timeline "$TIMELINE" \
     --settle-max "$SETTLE" --awb-advisory

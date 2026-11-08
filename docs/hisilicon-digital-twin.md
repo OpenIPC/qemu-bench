@@ -278,34 +278,12 @@ Each step is one PR, landed before the next starts.
   scenario: a quarter of the light at 20 s, full at 35 s, a warmer light
   (R 0.82 / B 0.52) at 50 s, stopping at 65 s. It runs in CI on
   hi3516ev200, enforcing AE and the timeline and reporting white balance
-  (see "Open issues").
+  (lib_hiawb freezes in some runs, OpenIPC/qemu-bench#252).
   - AE meets the quarter light with exactly 4x the exposure (61 to 244
     rows) and is back at its level within 1 s.
   - In a run where AWB keeps working, it moves its gains from
     R x1.64 / B x1.52 to x1.23 / x1.89 over about 5 s, leaving a grey
     within 2 %.
-
-## Open issues
-
-- **AWB freezes in some runs.** The same scenario on hi3516ev200 /
-  SC2315E ran two ways:
-  - Once, lib_hiawb kept adjusting its gains throughout, and after the
-    warm light moved them from x1.64 / x1.52 to x1.23 / x1.89.
-  - Once, it settled 2.6 s after boot, never changed them again, and left
-    the warm light at +39 % / -23 % off neutral.
-
-  AE behaved the same in both. The runs are not bit-identical, because
-  host-side timing still reaches the guest.
-
-  A suspect is the open driver's STT ping-pong: the hardware writes
-  buffer 0 only, and the driver reads its two buffers in turn, so the
-  library sees the boot frame's statistics every other frame
-  (`ISP_DRV_BE_STT_StatisticsRead`, whose per-frame address switch is
-  commented out). If so, the same would happen on silicon, and the twin
-  is the place to show it.
-
-  Until this is settled, `test-hisi-scenario.sh` reports white balance
-  (`--awb-advisory`) and enforces only AE and the timeline.
 
 ## Open questions
 
