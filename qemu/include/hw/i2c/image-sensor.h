@@ -29,9 +29,10 @@ typedef struct ImageSensorClass {
     void (*exposure)(Object *sensor, ImageSensorExposure *e);
     /*
      * Optional, for an ISP model with a frame clock: a frame starts, so
-     * the registers written for it take effect (sensor-sync.h)
+     * the registers written for it take effect (sensor-sync.h).  False
+     * when this part keeps no frame timing (its writes apply at once).
      */
-    void (*frame_start)(Object *sensor);
+    bool (*frame_start)(Object *sensor);
     /* Optional: the frame's length its registers set, 0 when not known */
     int64_t (*frame_ns)(Object *sensor);
 } ImageSensorClass;

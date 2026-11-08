@@ -196,14 +196,14 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
  * effect, and the exposure must leave the frame 8 rows
  * (gc4653_2l_cmos.c: u32MaxIntTime = full lines - 8).
  */
-static void galaxycore_frame_start(Object *sensor)
+static bool galaxycore_frame_start(Object *sensor)
 {
     GcSensorState *s = GALAXYCORE_SENSOR(sensor);
     ImageSensorExposure e = { 0 };
     int i;
 
     if (!s->reg16) {
-        return;                 /* the 8-bit parts apply writes at once */
+        return false;           /* the 8-bit parts apply writes at once */
     }
     if (sensor_sync_frame_start(&s->sync, 0, 0)) {
         for (i = 0; i < ARRAY_SIZE(gc_latched); i++) {
@@ -212,10 +212,11 @@ static void galaxycore_frame_start(Object *sensor)
     }
     galaxycore_exposure_sensor(sensor, &e);
     s->sync.vts = e.vts;
-    if (e.vts && e.lines > e.vts - 8) {
+    if (e.vts && e.lines + 8 > e.vts) {
         sensor_sync_violation(&s->sync, "exposure %u rows beyond the frame "
                               "(VTS %u - 8)", e.lines, e.vts);
     }
+    return true;
 }
 
 static void gc_init(Object *obj)
@@ -245,12 +246,26 @@ static void gc_reset(DeviceState *dev)
     s->page = 0;
     memset(s->p0, 0, sizeof(s->p0));
     memcpy(s->applied, s->regs, sizeof(s->applied));
+    sensor_sync_reset(&s->sync);
+}
+
+/* a stream from before applied[] (version 2): the frame uses what was
+ * written */
+static int gc_post_load(void *opaque, int version_id)
+{
+    GcSensorState *s = opaque;
+
+    if (version_id < 3) {
+        memcpy(s->applied, s->regs, sizeof(s->applied));
+    }
+    return 0;
 }
 
 static const VMStateDescription vmstate_gc_sensor = {
     .name = TYPE_GALAXYCORE_SENSOR,
     .version_id = 3,
     .minimum_version_id = 1,
+    .post_load = gc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, GcSensorState),
         VMSTATE_UINT16(ptr, GcSensorState),
@@ -261,6 +276,7 @@ static const VMStateDescription vmstate_gc_sensor = {
         VMSTATE_UINT8_ARRAY_V(applied, GcSensorState, GC_REGS, 3),
         VMSTATE_BOOL_V(sync.latching, GcSensorState, 3),
         VMSTATE_UINT32_V(sync.frame, GcSensorState, 3),
+        VMSTATE_UINT32_V(sync.violations, GcSensorState, 3),
         VMSTATE_END_OF_LIST()
     },
 };

@@ -20,8 +20,7 @@
 typedef struct SensorSync {
     const char *name;           /* the model, for the log */
     bool latching;              /* a frame clock drives the sensor */
-    bool hold;                  /* a group hold is open */
-    bool released;              /* ...was closed: latch at the next frame */
+    bool hold;                  /* a group hold is open: nothing latches */
     uint32_t frame;             /* frames started */
     int64_t t0;                 /* the frame's start, virtual ns */
     int64_t frame_ns;           /* its length, 0 when not known */
@@ -32,7 +31,8 @@ typedef struct SensorSync {
 
 /*
  * A frame starts: true when the latched registers should be copied from
- * what the driver wrote to what the frame uses (latching, and no hold).
+ * what the driver wrote to what the frame uses (no group hold open; a
+ * write made before the first frame applied at once anyway).
  */
 bool sensor_sync_frame_start(SensorSync *s, int64_t frame_ns, uint32_t vts);
 
@@ -41,6 +41,9 @@ void sensor_sync_write(SensorSync *s, uint16_t reg, uint8_t val);
 
 /* Group hold: opened / closed by the driver */
 void sensor_sync_hold(SensorSync *s, bool on);
+
+/* The sensor's reset: no frames, no hold, no violations; the log stays */
+void sensor_sync_reset(SensorSync *s);
 
 /*
  * A datasheet rule broken: counted (the "violations" property) and

@@ -145,7 +145,7 @@ static int hisi_smartsens_send(I2CSlave *i2c, uint8_t data)
             s->streaming = data & 1;
         } else if (addr >= SS_REG_BASE &&
                    addr < SS_REG_BASE + SS_REG_COUNT) {
-            if (s->streaming && s->sync.latching && ss_mode_reg(addr) &&
+            if (s->streaming && ss_mode_reg(addr) &&
                 s->regs[addr - SS_REG_BASE] != data) {
                 sensor_sync_violation(&s->sync, "mode register %04x changed "
                                       "while streaming (%02x -> %02x)", addr,
@@ -268,11 +268,11 @@ static int64_t smartsens_frame_ns(Object *sensor)
  * group hold is still open; then the datasheet's rules on the frame
  * (sc2315e_cmos.c: the exposure is in half rows, at most 2 x VTS - 4).
  */
-static void smartsens_frame_start(Object *sensor)
+static bool smartsens_frame_start(Object *sensor)
 {
     HisiSmartSensState *s = HISI_SMARTSENS(sensor);
     ImageSensorExposure e = { 0 };
-    uint32_t half;
+    IngenicSensorExposure raw = { 0 };
     int i;
 
     if (sensor_sync_frame_start(&s->sync, smartsens_frame_ns(sensor),
@@ -287,19 +287,20 @@ static void smartsens_frame_start(Object *sensor)
                   s->applied[0x320F - SS_REG_BASE];
     s->sync.frame_ns = smartsens_frame_ns(sensor);
     if (!s->streaming) {
-        return;
+        return true;
     }
     IMAGE_SENSOR_GET_CLASS(sensor)->exposure(sensor, &e);
-    /* the register counts half rows; the SC2310 layout reports rows */
-    half = s->gain_fine ? e.lines * 2 : e.lines;
-    if (e.vts && half > 2 * e.vts - 4) {
+    /* the registers count half rows (decoded before any conversion) */
+    smartsens_exposure(sensor, &raw);
+    if (e.vts && raw.lines + 4 > 2 * e.vts) {
         sensor_sync_violation(&s->sync, "exposure %u half rows beyond the "
-                              "frame (2 x VTS %u - 4)", half, e.vts);
+                              "frame (2 x VTS %u - 4)", raw.lines, e.vts);
     }
     if (e.vts && e.height && e.vts <= e.height) {
         sensor_sync_violation(&s->sync, "frame of %u rows shorter than its "
                               "window of %u", e.vts, e.height);
     }
+    return true;
 }
 
 /* "lines" / "vts": the exposure and frame length the frame in progress
@@ -343,7 +344,20 @@ static void hisi_smartsens_reset(DeviceState *dev)
     s->cur_reg = 0;
     memset(s->reg_buf, 0, sizeof(s->reg_buf));
     s->streaming = false;
+    sensor_sync_reset(&s->sync);
     hisi_smartsens_reset_regs(s);
+}
+
+/* a stream from before applied[] (version 1): the frame uses what was
+ * written */
+static int hisi_smartsens_post_load(void *opaque, int version_id)
+{
+    HisiSmartSensState *s = opaque;
+
+    if (version_id < 2) {
+        memcpy(s->applied, s->regs, sizeof(s->applied));
+    }
+    return 0;
 }
 
 static const Property hisi_smartsens_props[] = {
@@ -351,8 +365,9 @@ static const Property hisi_smartsens_props[] = {
     DEFINE_PROP_UINT8("id_low",  HisiSmartSensState, id_low,  0x00),
     DEFINE_PROP_UINT8("gain-fine", HisiSmartSensState, gain_fine, 0),
     DEFINE_PROP_UINT8("disc",    HisiSmartSensState, disc,    0x00),
-    /* 1080p30 at HTS 2200 x VTS 1125, the SC2315E's init table */
-    DEFINE_PROP_UINT32("pclk",   HisiSmartSensState, pclk,    74250000),
+    /* the pixel clock, when the part's is known (the catalogue's): 0 for
+     * none, then the ISP keeps its own frame rate */
+    DEFINE_PROP_UINT32("pclk",   HisiSmartSensState, pclk,    0),
 };
 
 /* What the guest programmed: the register file and the address pointer. */
@@ -360,6 +375,7 @@ static const VMStateDescription vmstate_hisi_smartsens = {
     .name = TYPE_HISI_SMARTSENS,
     .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = hisi_smartsens_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, HisiSmartSensState),
         VMSTATE_UINT8_ARRAY(reg_buf, HisiSmartSensState, 2),
@@ -371,6 +387,7 @@ static const VMStateDescription vmstate_hisi_smartsens = {
         VMSTATE_BOOL_V(sync.latching, HisiSmartSensState, 2),
         VMSTATE_BOOL_V(sync.hold, HisiSmartSensState, 2),
         VMSTATE_UINT32_V(sync.frame, HisiSmartSensState, 2),
+        VMSTATE_UINT32_V(sync.violations, HisiSmartSensState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

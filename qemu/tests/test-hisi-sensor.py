@@ -163,6 +163,27 @@ def main():
     check(v3 == v2, 'none once the exposure fits again (%d)' % (v3 - v2))
     check(v4 == v3 + 1, 'HTS written while streaming: %d' % (v4 - v3))
 
+    # the limit in half rows, odd ones included: VTS 100 allows 196
+    def expo(half):
+        wr(0x3E00, half >> 12)
+        wr(0x3E01, (half >> 4) & 0xFF)
+        wr(0x3E02, (half & 0xF) << 4)
+    wr(0x320A, 0x00)                                # an 80-row window
+    wr(0x320B, 80)
+    wr(0x320E, 0x00)
+    wr(0x320F, 100)
+    expo(196)
+    frames(3, 15)
+    v5 = get('violations')
+    frames(2, 15)
+    v6 = get('violations')
+    expo(197)
+    frames(3, 15)
+    v7 = get('violations')
+    check(v6 == v5 and v7 > v6,
+          'VTS 100: 196 half rows fit, 197 do not (+%d, +%d)' %
+          (v6 - v5, v7 - v6))
+
     qmp.close()
     q.close()
     print('%d failure(s)' % fails)

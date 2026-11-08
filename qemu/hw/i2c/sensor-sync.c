@@ -17,18 +17,23 @@
 
 bool sensor_sync_frame_start(SensorSync *s, int64_t frame_ns, uint32_t vts)
 {
-    const bool first = !s->latching;
-
     s->latching = true;
     s->frame++;
     s->t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->frame_ns = frame_ns;
     s->vts = vts;
-    if (s->hold) {
-        return first;           /* the group is still being written */
-    }
-    s->released = false;
-    return true;
+    return !s->hold;            /* an open group is still being written */
+}
+
+void sensor_sync_reset(SensorSync *s)
+{
+    s->latching = false;
+    s->hold = false;
+    s->frame = 0;
+    s->t0 = 0;
+    s->frame_ns = 0;
+    s->vts = 0;
+    s->violations = 0;
 }
 
 /* where in the frame the sensor is: its line, or microseconds when the
@@ -60,9 +65,6 @@ void sensor_sync_write(SensorSync *s, uint16_t reg, uint8_t val)
 
 void sensor_sync_hold(SensorSync *s, bool on)
 {
-    if (!on && s->hold) {
-        s->released = true;
-    }
     s->hold = on;
 }
 

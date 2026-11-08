@@ -32,6 +32,7 @@ typedef struct ImageSensorSpec {
     bool reg16;         /* GALAXYCORE: 16-bit register addresses */
     uint8_t disc;       /* SMARTSENS: 0x3109 where parts share an ID */
     uint8_t gain_fine;  /* SMARTSENS: 0x3E09 at 1x, on the SC2310's layout */
+    uint32_t pclk;      /* SMARTSENS: pixel clock, when known: frame timing */
 } ImageSensorSpec;
 
 /* GalaxyCore's register pairs; OmniVision's OV27x5/OV97x5 have the same */
@@ -72,9 +73,14 @@ static const ImageSensorSpec image_sensors[] = {
     SC_DISC("sc2235e", 0x2232, 0x20),
     SC_DISC("sc2235p", 0x2232, 0x01),
     SC("sc2239", 0xCB10),
-    { "sc2310", SMARTSENS, 0x30, 0x2311, .gain_fine = 0x20 },
-    { "sc2315", SMARTSENS, 0x30, 0x2311, .gain_fine = 0x20 },
-    { "sc2315e", SMARTSENS, 0x30, 0x2238, .disc = 0x20, .gain_fine = 0x10 },
+    /* 74.25 MHz: the SC2315E's init table runs HTS 2200 x VTS 1125 at
+     * 1080p30 (sc2315e_sensor_ctl.c), and its driver's VTS is 33750 / fps */
+    { "sc2310", SMARTSENS, 0x30, 0x2311, .gain_fine = 0x20,
+      .pclk = 74250000 },
+    { "sc2315", SMARTSENS, 0x30, 0x2311, .gain_fine = 0x20,
+      .pclk = 74250000 },
+    { "sc2315e", SMARTSENS, 0x30, 0x2238, .disc = 0x20, .gain_fine = 0x10,
+      .pclk = 74250000 },
     SC("sc2335", 0xCB14),
     SC("sc2336", 0xCB3A),
     SC("sc307h", 0xCB1C),
@@ -143,6 +149,7 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint8(dev, "id_low", spec->id & 0xFF);
         qdev_prop_set_uint8(dev, "disc", spec->disc);
         qdev_prop_set_uint8(dev, "gain-fine", spec->gain_fine);
+        qdev_prop_set_uint32(dev, "pclk", spec->pclk);
     } else if (!strcmp(spec->type, OV2735)) {
         qdev_prop_set_uint8(dev, "rev", spec->id);
     }
@@ -173,11 +180,7 @@ bool image_sensor_frame_start(Object *sensor)
         return false;
     }
     k = IMAGE_SENSOR_GET_CLASS(sensor);
-    if (!k->frame_start) {
-        return false;
-    }
-    k->frame_start(sensor);
-    return true;
+    return k->frame_start && k->frame_start(sensor);
 }
 
 int64_t image_sensor_frame_ns(Object *sensor)
