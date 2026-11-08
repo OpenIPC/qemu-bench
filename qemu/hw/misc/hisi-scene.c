@@ -8,7 +8,7 @@
  *
  *   file     what is in front of the camera: a binary PPM (P6, sRGB,
  *            8 or 16 bits) or a PFM (linear float, so an HDR scene keeps
- *            its range); empty for the built-in grey bars (hisi-vpss's
+ *            its range), up to 64 Mpixel; empty for the built-in grey bars (hisi-vpss's
  *            old test picture, eight bars from white to black)
  *   light    white's raw level a row at 1x gain, 16-bit units
  *   light-r  the light's colour as the sensor sees it: R and B
@@ -33,6 +33,7 @@
 #define SCENE_BARS          8
 #define SCENE_CACHE         4
 #define GAMMA_STEPS         4096
+#define SCENE_MAX_PIXELS    (64 * 1024 * 1024)  /* 768 MiB decoded */
 
 typedef struct SceneGrid {
     int w, h;
@@ -53,6 +54,7 @@ struct HisiSceneState {
     uint32_t light, light_r, light_b;
 
     double level;               /* the frame's white, 16-bit raw */
+    double tint[3];             /* the light it was captured under */
     double wb[3];               /* the driver's white balance gains */
     uint8_t gamma[GAMMA_STEPS + 1];
 };
@@ -87,6 +89,9 @@ static bool pnm_token(const uint8_t *b, size_t len, size_t *pos, char *tok,
         tok[n++] = b[(*pos)++];
     }
     tok[n] = 0;
+    if (*pos >= len || !g_ascii_isspace(b[*pos])) {
+        return false;           /* no delimiter: truncated, or too long */
+    }
     (*pos)++;                   /* the single whitespace before the data */
     return n > 0;
 }
@@ -111,20 +116,21 @@ static float *scene_load(const char *path, int *pw, int *ph, Error **errp)
     }
     w = atoi(tw);
     h = atoi(th);
-    if (w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+    /* pos <= len: pnm_token() stops at the end */
+    if (w <= 0 || h <= 0 || (int64_t)w * h > SCENE_MAX_PIXELS) {
         goto bad;
     }
-    img = g_new(float, (size_t)w * h * 3);
 
     if (!strcmp(magic, "P6")) {
         const int maxval = atoi(tm);
         const int bpc = maxval > 255 ? 2 : 1;
 
+        /* the payload is there before anything is allocated for it */
         if (maxval <= 0 || maxval > 65535 ||
             len - pos < (size_t)w * h * 3 * bpc) {
-            g_free(img);
             goto bad;
         }
+        img = g_new(float, (size_t)w * h * 3);
         for (x = 0; x < w * h * 3; x++) {
             const uint8_t *p = b + pos + (size_t)x * bpc;
             const int v = bpc == 2 ? p[0] << 8 | p[1] : p[0];
@@ -136,9 +142,9 @@ static float *scene_load(const char *path, int *pw, int *ph, Error **errp)
         const bool le = atof(tm) < 0;
 
         if (len - pos < (size_t)w * h * chans * 4) {
-            g_free(img);
             goto bad;
         }
+        img = g_new(float, (size_t)w * h * 3);
         for (y = 0; y < h; y++) {
             /* PFM rows run bottom to top */
             const uint8_t *row = b + pos + (size_t)(h - 1 - y) * w * chans * 4;
@@ -156,7 +162,6 @@ static float *scene_load(const char *path, int *pw, int *ph, Error **errp)
             }
         }
     } else {
-        g_free(img);
         goto bad;
     }
     *pw = w;
@@ -242,10 +247,11 @@ double hisi_scene_light(HisiSceneState *s, double tint[3])
     return s->light;
 }
 
-void hisi_scene_set_frame(HisiSceneState *s, double level, double wb_r,
-                          double wb_b)
+void hisi_scene_set_frame(HisiSceneState *s, double level,
+                          const double tint[3], double wb_r, double wb_b)
 {
     s->level = level;
+    memcpy(s->tint, tint, sizeof(s->tint));
     s->wb[0] = wb_r > 0 ? wb_r : 1.0;
     s->wb[1] = 1.0;
     s->wb[2] = wb_b > 0 ? wb_b : 1.0;
@@ -254,13 +260,12 @@ void hisi_scene_set_frame(HisiSceneState *s, double level, double wb_r,
 void hisi_scene_display_row(HisiSceneState *s, const float *rgb, int w,
                             uint8_t *y, uint8_t *vu)
 {
-    double tint[3], k[3];
+    double k[3];
     int x, c;
 
-    hisi_scene_light(s, tint);
     for (c = 0; c < 3; c++) {
         /* raw (clipped at the sensor's range) times the WB gain */
-        k[c] = tint[c] * s->level / 65535.0;
+        k[c] = s->tint[c] * s->level / 65535.0;
     }
     for (x = 0; x < w; x++) {
         const float *p = rgb + x * 3;
@@ -333,6 +338,9 @@ static void hisi_scene_init(Object *obj)
     s->light_r = 550;
     s->light_b = 700;
     s->level = 65535.0 / 2;
+    s->tint[0] = s->light_r / 1000.0;
+    s->tint[1] = 1.0;
+    s->tint[2] = s->light_b / 1000.0;
     s->wb[0] = s->wb[1] = s->wb[2] = 1.0;
     for (i = 0; i <= GAMMA_STEPS; i++) {
         s->gamma[i] = lrint(255 * pow((double)i / GAMMA_STEPS, 1 / 2.2));

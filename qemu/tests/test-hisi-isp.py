@@ -199,6 +199,18 @@ def main():
           (z0[0] & 0xffff))
     r = qmp_cmd('qom-get', path='/machine/scene', property='file')
     check(r.get('return') == ppm, 'qom-get file: %s' % r.get('return'))
+    # broken files are refused and leave the scene as it was: a header
+    # that ends at the end of the file, a huge picture with no pixels
+    for name, data in (('eof.ppm', b'P6\n64 36\n255'),
+                       ('huge.ppm', b'P6\n8192 8192\n255\n')):
+        bad = os.path.join(tmp, name)
+        with open(bad, 'wb') as f:
+            f.write(data)
+        r = qmp_cmd('qom-set', path='/machine/scene', property='file',
+                    value=bad)
+        z0, _ = frame()
+        check('error' in r and z0[0] >> 16 == G,
+              'scene file %s refused, the picture kept' % name)
     qmp.close()
     q.close()
 

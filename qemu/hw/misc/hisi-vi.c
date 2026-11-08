@@ -148,6 +148,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define BE_AWB_AVG          0x22140     /* R, G, B, count */
 #define PROC_PNEXT          0x02f8      /* offline: the pipe's node list */
 #define PROC_STT_OFFLINE    0x05d0      /* offline: the strip's STT block */
+#define PROC_BE_CFG         0x0240      /* offline: the strip's BE registers */
+#define BE_WB_GAIN1         0x21210     /* R << 16 | Gr */
+#define BE_WB_GAIN2         0x21214     /* B << 16 | Gb */
 #define PROC_NODE_MAX       4           /* strips */
 #define FE_STT_AE_HIST      0x10208     /* VI_CAP, pipe 0's channel */
 #define FE_STT_AE_RGR       0x10210
@@ -183,6 +186,7 @@ struct HisiViState {
     ImageSensorExposure frame_expo;     /* what the current frame had */
     double level;               /* the current frame's white, 16-bit */
     uint16_t *raw;              /* the frame on the grid, R / G / B */
+    double tint[3];             /* the light it was captured under */
     int gw, gh;
     uint32_t stat_frames;
 };
@@ -276,13 +280,41 @@ static void vi_scene_frame(HisiViState *s)
             s->raw[i] = MIN(s->level / 2 * tint[i % 3], 65535.0);
         }
     }
-    if (s->scene) {
-        /* the white balance the driver programmed (online: ISP_WB_GAIN1 /
-         * 2, R and B high; offline they are in the strips' images) */
-        hisi_scene_set_frame(s->scene, s->level,
-                             (s->proc[0x21210 / 4] >> 16) / 256.0,
-                             (s->proc[0x21214 / 4] >> 16) / 256.0);
+    memcpy(s->tint, tint, sizeof(s->tint));
+    if (s->scene && !s->offline) {
+        /* the white balance the driver programmed: ISP_WB_GAIN1 / 2, R and
+         * B in the high halves (offline: vi_offline_wb()) */
+        hisi_scene_set_frame(s->scene, s->level, s->tint,
+                             (s->proc[BE_WB_GAIN1 / 4] >> 16) / 256.0,
+                             (s->proc[BE_WB_GAIN2 / 4] >> 16) / 256.0);
     }
+}
+
+/*
+ * Offline, when the driver starts the pipe on a frame: its white balance
+ * gains are in the strips' backend register images, the block at each
+ * VIPROC node's 0x240 laid out from ISP_BE_REG_BASE (ISP_WB_GAIN1 / 2 at
+ * +0x1210 / +0x1214), not in the MMIO registers.
+ */
+static void vi_offline_wb(HisiViState *s)
+{
+    uint32_t node[PROC_BE_CFG / 4 + 1], gain[2] = { 0, 0 };
+
+    if (!s->scene) {
+        return;
+    }
+    if (s->proc[PROC_PNEXT / 4]) {
+        dma_memory_read(&address_space_memory, s->proc[PROC_PNEXT / 4], node,
+                        sizeof(node), MEMTXATTRS_UNSPECIFIED);
+        if (node[PROC_BE_CFG / 4]) {
+            dma_memory_read(&address_space_memory,
+                            node[PROC_BE_CFG / 4] + BE_WB_GAIN1 - 0x20000,
+                            gain, sizeof(gain), MEMTXATTRS_UNSPECIFIED);
+        }
+    }
+    hisi_scene_set_frame(s->scene, s->level, s->tint,
+                         (le32_to_cpu(gain[0]) >> 16) / 256.0,
+                         (le32_to_cpu(gain[1]) >> 16) / 256.0);
 }
 
 /* the mean of colour c over grid columns [x0, x1), rows [y0, y1) */
@@ -446,6 +478,10 @@ static void vi_be_stats(HisiViState *s)
     uint32_t rgr[AE_ZONES_MAX], gbb[AE_ZONES_MAX];
     int nx, ny, awx, awy, c;
 
+    if (!s->raw) {
+        return;                     /* no frame captured yet */
+    }
+
     if (p[STT_AE_HIST / 4]) {
         uint32_t hist[AE_BINS] = { 0 };
         int b;
@@ -483,7 +519,7 @@ static void vi_be_stats(HisiViState *s)
                 "WB gains R %#x B %#x\n", s->frame_expo.lines,
                 s->frame_expo.gain / 1024.0, p[BE_AWB_AVG / 4],
                 p[BE_AWB_AVG / 4 + 1], p[BE_AWB_AVG / 4 + 2],
-                p[0x21210 / 4] >> 16, p[0x21214 / 4] >> 16);
+                p[BE_WB_GAIN1 / 4] >> 16, p[BE_WB_GAIN2 / 4] >> 16);
     }
     s->stat_frames++;
 }
@@ -529,6 +565,9 @@ static void vi_be_stats_offline(HisiViState *s)
     uint32_t a = s->proc[PROC_PNEXT / 4];
     int aex, aey, awx, awy, strips = 0, k, b, c;
 
+    if (!s->raw) {
+        return;                     /* the pipe ran before any capture */
+    }
     ae_grid(aez, &aex, &aey);
     awb_grid(awz, &awx, &awy);
     for (k = 0; k < PROC_NODE_MAX && a; k++) {
@@ -698,6 +737,7 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
          * the pipe's interrupt.
          */
         s->offline = true;
+        vi_offline_wb(s);
         qemu_irq_pulse(s->frame_out);
         timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   NANOSECONDS_PER_SECOND / 4 / MAX(s->fps, 1));

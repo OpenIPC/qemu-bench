@@ -26,11 +26,13 @@ const float *hisi_scene_grid(HisiSceneState *s, int w, int h);
 double hisi_scene_light(HisiSceneState *s, double tint[3]);
 
 /*
- * The current frame, from the ISP: raw level of white (16-bit units) and
- * the white balance gains the driver programmed (1.0 = none).
+ * The current frame, from the ISP: raw level of white (16-bit units), the
+ * light's tint it was captured under, and the white balance gains the
+ * driver programmed (1.0 = none).  The picture is painted with these, not
+ * with the scene's properties as they stand later.
  */
-void hisi_scene_set_frame(HisiSceneState *s, double level, double wb_r,
-                          double wb_b);
+void hisi_scene_set_frame(HisiSceneState *s, double level,
+                          const double tint[3], double wb_r, double wb_b);
 
 /*
  * What the ISP makes of the scene for display: a row of w pixels of the
