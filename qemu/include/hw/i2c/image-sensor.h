@@ -27,6 +27,13 @@ typedef struct ImageSensorClass {
 
     /* Fill @e from the sensor's registers */
     void (*exposure)(Object *sensor, ImageSensorExposure *e);
+    /*
+     * Optional, for an ISP model with a frame clock: a frame starts, so
+     * the registers written for it take effect (sensor-sync.h)
+     */
+    void (*frame_start)(Object *sensor);
+    /* Optional: the frame's length its registers set, 0 when not known */
+    int64_t (*frame_ns)(Object *sensor);
 } ImageSensorClass;
 
 #define IMAGE_SENSOR_CLASS(klass) \
@@ -36,6 +43,15 @@ typedef struct ImageSensorClass {
 
 /* Fill @e from @sensor; false if @sensor implements no image-sensor. */
 bool image_sensor_exposure(Object *sensor, ImageSensorExposure *e);
+
+/*
+ * A frame starts on @sensor: what was written for it takes effect.  False
+ * when the model has no frame timing (its writes apply at once).
+ */
+bool image_sensor_frame_start(Object *sensor);
+
+/* The frame length @sensor's registers set, ns; 0 when not modelled */
+int64_t image_sensor_frame_ns(Object *sensor);
 
 /* Whether the catalogue has a sensor called @name. */
 bool image_sensor_known(const char *name);

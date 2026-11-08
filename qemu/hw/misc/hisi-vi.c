@@ -208,10 +208,19 @@ static void vi_update(HisiViState *s)
     qemu_set_irq(s->proc_irq, s->proc[PROC_INT / 4] != 0);
 }
 
+/*
+ * The next frame: as long as the sensor's registers make it (HTS x VTS /
+ * pclk, so a driver's slow shutter or frame rate change shows), or the
+ * "fps" property when the sensor does not model its timing.
+ */
 static void vi_arm(HisiViState *s)
 {
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / MAX(s->fps, 1));
+    int64_t ns = image_sensor_frame_ns(s->sensor);
+
+    if (ns < NANOSECONDS_PER_SECOND / 240 || ns > NANOSECONDS_PER_SECOND * 2) {
+        ns = NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
+    }
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
 }
 
 static bool vi_running(HisiViState *s)
@@ -254,9 +263,20 @@ static void vi_scene_frame(HisiViState *s)
         light = hisi_scene_light(s->scene, tint);
     }
     if (s->sensor && image_sensor_exposure(s->sensor, &now)) {
-        s->frame_expo = s->expo;
-        s->level = (double)s->expo.lines * s->expo.gain / 1024 * light;
-        s->expo = now;
+        if (image_sensor_frame_start(s->sensor)) {
+            /*
+             * The sensor keeps its own frame timing (sensor-sync.h): what
+             * it applied for the frame ending now is this frame's, and
+             * the frame start latches what was written for the next.
+             */
+            s->frame_expo = now;
+        } else {
+            /* writes apply at once: a sensor uses them a frame later */
+            s->frame_expo = s->expo;
+            s->expo = now;
+        }
+        s->level = (double)s->frame_expo.lines * s->frame_expo.gain / 1024 *
+                   light;
     } else {
         memset(&s->frame_expo, 0, sizeof(s->frame_expo));
         s->level = 65535.0 / 2;     /* no sensor model: white at half */

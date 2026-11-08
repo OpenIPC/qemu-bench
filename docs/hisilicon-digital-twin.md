@@ -189,6 +189,50 @@ Each step is one PR, landed before the next starts.
     machine runs.
   - majestic's end-to-end tests run unchanged.
 
+## Step 2 in detail
+
+- **`sensor-sync`** (`hw/i2c/sensor-sync.c`, `include/hw/i2c/sensor-sync.h`)
+  is the timing a model embeds:
+  - whether a frame clock drives the sensor;
+  - group hold;
+  - the frame counter and the frame's start;
+  - the frame's length and rows;
+  - violations.
+
+  The `image-sensor` interface gains `frame_start()` and `frame_ns()`.
+  Latching starts with the first `frame_start()`, so machines whose ISP
+  has no frame clock (Ingenic, SigmaStar, Novatek, Xiongmai) keep applying
+  writes at once.
+- **SmartSens** (`hisi-smartsens`) keeps what the driver wrote and what the
+  frame uses.
+  - Latched at frame start: the registers `sc2315e_cmos.c` writes every
+    frame (exposure 0x3e00–02, gains 0x3e06–09, VTS 0x320e/f, 0x3301,
+    0x3632).
+  - Group hold: 0x3812, 0x00 opens and 0x30 closes; a group applies at the
+    frame start after it closes.
+  - Frame length: HTS (0x320c/d) × VTS / `pclk`, by default 74.25 MHz
+    (1080p30 at 2200 × 1125, the SC2315E's init table). `hisi-vi` runs its
+    frame clock from it, so a driver's frame-rate change or slow shutter is
+    a real change of timing.
+  - Rules:
+    - exposure beyond 2 × VTS − 4 half rows;
+    - a frame shorter than its window;
+    - window, HTS, MIPI, PLL or bit-depth registers changed while
+      streaming (0x0100).
+- **GalaxyCore**, the 16-bit parts (GC4653, GC2093): exposure, gains and
+  VTS latch at frame start (`gc4653_2l_cmos.c`'s list). The rule is
+  exposure beyond VTS − 8. The pixel clock is not modelled yet.
+- **Observability.**
+  - QOM properties on the sensor: `frame`, `violations`, and on SmartSens
+    the `lines` / `vts` in effect.
+  - `-d guest_errors` reports each violation with its frame and line.
+  - `trace-i2c=on` logs every write, e.g.
+    `smartsens-2238: frame 24 line 0: 3e01 = 07`. The vendor ISP's sync
+    writes land at line 0, from its frame-start interrupt.
+- **What it found.** majestic's SC2315E (hi3516ev200), SC2335
+  (gk7205v200) and GC4653 (hi3516ev300) drivers break no rule. The test
+  shows that a driver which does is caught.
+
 ## Open questions
 
 - **Which camera to twin and validate first:** an EV300 or GK7205V200

@@ -165,6 +165,32 @@ bool image_sensor_exposure(Object *sensor, ImageSensorExposure *e)
     return true;
 }
 
+bool image_sensor_frame_start(Object *sensor)
+{
+    ImageSensorClass *k;
+
+    if (!sensor || !object_dynamic_cast(sensor, TYPE_IMAGE_SENSOR)) {
+        return false;
+    }
+    k = IMAGE_SENSOR_GET_CLASS(sensor);
+    if (!k->frame_start) {
+        return false;
+    }
+    k->frame_start(sensor);
+    return true;
+}
+
+int64_t image_sensor_frame_ns(Object *sensor)
+{
+    ImageSensorClass *k;
+
+    if (!sensor || !object_dynamic_cast(sensor, TYPE_IMAGE_SENSOR)) {
+        return 0;
+    }
+    k = IMAGE_SENSOR_GET_CLASS(sensor);
+    return k->frame_ns ? k->frame_ns(sensor) : 0;
+}
+
 static const TypeInfo image_sensor_info = {
     .name       = TYPE_IMAGE_SENSOR,
     .parent     = TYPE_INTERFACE,

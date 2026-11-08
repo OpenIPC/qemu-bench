@@ -87,6 +87,7 @@ bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info ta
 python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpeg-checked
 python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wide sensors)
 python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
+python3 qemu/tests/test-hisi-sensor.py     # sensor timing: frame latching, group hold, fps, violations
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
@@ -679,7 +680,16 @@ in this order:
   by `light` / `light-r` / `light-b` (settable at runtime with QMP
   `qom-set`) times the sensor's exposure × gain (`image-sensor`, one
   frame late), so AE and AWB converge. VPSS paints the same scene through
-  the frame's exposure, WB gains and gamma. An AWB zone's count is every pixel of the zone:
+  the frame's exposure, WB gains and gamma. The SmartSens and 16-bit
+  GalaxyCore models keep a sensor's timing once an ISP drives their frames
+  (`sensor-sync.h`, `image_sensor_frame_start()`). Writes to exposure,
+  gain and VTS latch at the next frame start, and the SmartSens group hold
+  (0x3812) holds them. VI's frame clock is HTS x VTS / `pclk`. Datasheet
+  violations (exposure beyond the frame, mode registers written while
+  streaming) are counted (QOM `violations`) and logged with
+  `-d guest_errors`. `-global hisi-smartsens.trace-i2c=on` logs every write
+  with its frame and line. Families without a frame clock see writes apply
+  at once, as before. An AWB zone's count is every pixel of the zone:
   lib_hiawb leaves its gains alone unless the zones' average count passes
   1024. Offline, each strip's VIPROC node (0x2f8 chain) has its own
   statistics block (S_ISP_STT_REGS_TYPE) at the address in its 0x5d0.
