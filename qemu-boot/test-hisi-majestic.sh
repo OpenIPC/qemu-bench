@@ -106,9 +106,15 @@ sc*|gc*)        # SmartSens / GalaxyCore models report their exposure
             if ($i == "R" && $(i + 1) ~ /^[0-9]+$/) r = $(i + 1)
             if ($i == "B" && $(i + 1) ~ /^[0-9]+,?$/) b = $(i + 1) + 0
             if ($i == "mean") g = $(i + 1) + 0
-            if ($i == "gains") { gr = hex($(i + 2)); gb = hex($(i + 4)) }
+            if ($i == "gains") {
+                seen = 1; gr = hex($(i + 2)); gb = hex($(i + 4))
+            }
         }
-        if (!gr) exit 0                         # offline: not visible here
+        if (!seen) exit 0           # offline: the gains are not visible here
+        if (!gr || !gb || !g) {
+            print "AWB: no gains programmed"
+            exit 1
+        }
         er = r * gr / 256 / g - 1; eb = b * gb / 256 / g - 1
         printf "AWB: R x%.2f B x%.2f -> %+.0f%% / %+.0f%% of G\n",
                gr / 256, gb / 256, er * 100, eb * 100
