@@ -144,25 +144,16 @@ def run(a, machine, L):
     if len(frames) != 3:
         return fails
 
-    # DC-only 8x8 blocks: judge the luma against the source averaged the same way
-    def blocks(plane):
-        ref = bytearray(w * h)
-        for by in range(0, h, 8):
-            for bx in range(0, w, 8):
-                s = sum(plane[(by + j) * w + bx + i] for j in range(8) for i in range(8))
-                for j in range(8):
-                    ref[(by + j) * w + bx:(by + j) * w + bx + 8] = bytes([(s + 32) // 64]) * 8
-        return ref
-
     def psnr(p, q_):
         mse = sum((x - y) ** 2 for x, y in zip(p, q_)) / len(p)
         return 99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)
 
     v = psnr(frames[1], frames[0])
     check(v > 40, 'the unchanged P picture is the IDR\'s: %.1f dB' % v)
+    # intra blocks carry their whole residual: the detail is kept
     for f in (0, 2):
-        v = psnr(frames[f][:w * h], blocks(sources[f][0]))
-        check(v > 25, 'frame %d luma: %.1f dB against the 8x8 block means' % (f, v))
+        v = psnr(frames[f][:w * h], sources[f][0])
+        check(v > 45, 'frame %d luma: %.1f dB against the source' % (f, v))
     sq = frames[2][110 * w + 140]
     check(sq > 200, 'the square is there in the last picture (luma %d)' % sq)
     return fails

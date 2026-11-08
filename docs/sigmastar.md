@@ -403,10 +403,11 @@ the slice header at both QPs. The bit count is at `0x1325` regs `0x73`/`0x74`, a
 the record is at `0x1326` regs `0x65`-`0x67`. The same limits apply as for the
 MFE, and:
 
-- `hevc-enc` codes I pictures at 8x8 block resolution, and CUs that changed in a
-  P picture as intra, so the picture is coarser than the H.264 path's.
+- `hevc-enc` codes CUs that changed in a P picture as intra (DC prediction,
+  the residual transformed), not with motion.
 - The coding parameters are fixed to what the driver's SPS and PPS said (CTB 32,
-  transform depth 2, no SAO), not read from them.
+  transform depth 2, no SAO), not read from them; only the PPS's sign hiding
+  flag is.
 - `mhe ref_ring_EndAddr out of range` lines appear for the same reason as the MFE's.
 - Under rate control the driver logs a few `uiTotalCnt is 0` lines: the record's
   histograms are zero. Whether that changes rate control is not known; QP stayed at

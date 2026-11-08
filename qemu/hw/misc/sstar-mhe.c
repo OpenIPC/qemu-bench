@@ -21,8 +21,8 @@
  * The driver feeds VPS, SPS, PPS and the slice header through the packer, and
  * the hardware appends the slice data: hevc_enc_slice_data() here, with what
  * the driver's parameter sets choose (CTB 32, TBs 4-32 at transform depth 2,
- * no SAO, no scaling lists, cu_qp_delta on at the CTB).  The slice type is the
- * header's NAL type.
+ * no SAO, no scaling lists, cu_qp_delta on at the CTB; sign hiding as the
+ * PPS says).  The slice type is the header's NAL type.
  *
  * It finishes a frame from a 216-byte record: +8/+0xA the bit count, +0x10
  * bit 0 done, +0xD0-+0xD6 where the reconstruction ended.  As with the MFE, CMDQ1 carries the job,
@@ -107,6 +107,7 @@ struct SstarMheState {
         HevcEncRef *ref;
     } streams[STREAMS];
     int stream_next;
+    bool sign_hiding;           /* the last PPS's sign_data_hiding_enabled_flag */
 };
 
 static const HevcEncParams mhe_params = {
@@ -168,6 +169,47 @@ static int mhe_nal_type(SstarMheState *s)
     return -1;
 }
 
+/*
+ * sign_data_hiding_enabled_flag of a PPS the packer carried (7.3.2.3.1:
+ * after pps_pic_parameter_set_id, pps_seq_parameter_set_id and five bits),
+ * which the slice data has to follow; the last one holds until another
+ */
+static void mhe_parse_pps(SstarMheState *s)
+{
+    for (int i = 0; i + 4 < s->hdr_len; i++) {
+        uint8_t rbsp[16];
+        int n = 0, zeros = 0, bit = 0;
+
+        if (s->hdr[i] || s->hdr[i + 1] || s->hdr[i + 2] != 1 ||
+            ((s->hdr[i + 3] >> 1) & 0x3F) != 34) {
+            continue;
+        }
+        for (int k = i + 5; k < s->hdr_len && n < sizeof(rbsp); k++) {
+            if (zeros >= 2 && s->hdr[k] == 3) {
+                zeros = 0;          /* emulation prevention */
+                continue;
+            }
+            zeros = s->hdr[k] ? 0 : zeros + 1;
+            rbsp[n++] = s->hdr[k];
+        }
+        /* two ue(v), then dependent_slice_segments_enabled_flag,
+         * output_flag_present_flag and num_extra_slice_header_bits */
+        for (int ue = 0; ue < 2; ue++) {
+            int lz = 0;
+
+            while (bit < n * 8 && !((rbsp[bit / 8] >> (7 - bit % 8)) & 1)) {
+                lz++;
+                bit++;
+            }
+            bit += 1 + lz;
+        }
+        bit += 5;
+        if (bit < n * 8) {
+            s->sign_hiding = (rbsp[bit / 8] >> (7 - bit % 8)) & 1;
+        }
+    }
+}
+
 static void mhe_record(SstarMheState *s, uint32_t bits, uint32_t ylen)
 {
     uint32_t miu = mhe_rec_addr(s);
@@ -221,9 +263,13 @@ static void mhe_encode(SstarMheState *s)
                            MEMTXATTRS_UNSPECIFIED, y, (size_t)pitch * h);
         address_space_read(&address_space_memory, DRAM_BASE + ca,
                            MEMTXATTRS_UNSPECIFIED, uv, (size_t)pitch * (h / 2));
+        HevcEncParams prm = mhe_params;
+
+        mhe_parse_pps(s);
+        prm.sign_hiding = s->sign_hiding;
         memcpy(out, s->hdr, s->hdr_len);
         ref = mhe_stream_ref(s, mhe_rec_addr(s));
-        len = hevc_enc_slice_data(&mhe_params, w, h, qp, p_slice,
+        len = hevc_enc_slice_data(&prm, w, h, qp, p_slice,
                                   p_slice ? ref : NULL, ref, y, w, h, pitch,
                                   uv, pitch, out + s->hdr_len,
                                   cap - s->hdr_len);
@@ -351,6 +397,7 @@ static void sstar_mhe_reset(DeviceState *dev)
         }
     }
     s->stream_next = 0;
+    s->sign_hiding = false;
     qemu_set_irq(s->irq, 0);
 }
 
@@ -366,8 +413,8 @@ static void sstar_mhe_init(Object *obj)
 
 static const VMStateDescription vmstate_sstar_mhe = {
     .name = TYPE_SSTAR_MHE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, SstarMheState, MHE_REGS),
         VMSTATE_UINT8(raw, SstarMheState),
@@ -375,6 +422,7 @@ static const VMStateDescription vmstate_sstar_mhe = {
         VMSTATE_UINT32(hdr_len, SstarMheState),
         VMSTATE_UINT8_ARRAY(hdr, SstarMheState, HDR_MAX),
         VMSTATE_UINT32(frames, SstarMheState),
+        VMSTATE_BOOL(sign_hiding, SstarMheState),
         VMSTATE_END_OF_LIST()
     }
 };

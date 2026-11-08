@@ -57,24 +57,6 @@ static const uint8_t sl_inter8[64] = {
     20, 24, 25, 28, 33, 41, 54, 71, 24, 25, 28, 33, 41, 54, 71, 91,
 };
 
-/* the 8-point transform matrix (8.6.4.2); the 4-point one is its even rows'
- * first four columns */
-static const int8_t tm8[8][8] = {
-    { 64,  64,  64,  64,  64,  64,  64,  64 },
-    { 89,  75,  50,  18, -18, -50, -75, -89 },
-    { 83,  36, -36, -83, -83, -36,  36,  83 },
-    { 75, -18, -89, -50,  50,  89,  18, -75 },
-    { 64, -64, -64,  64,  64, -64, -64,  64 },
-    { 50, -89,  18,  75, -75, -18,  89, -50 },
-    { 36, -83,  83, -36, -36,  83, -83,  36 },
-    { 18, -50,  75, -89,  89, -75,  50, -18 },
-};
-
-static inline int tmat(int n, int k, int j)
-{
-    return n == 8 ? tm8[k][j] : tm8[2 * k][j];
-}
-
 static const int quant_scale[6] = { 26214, 23302, 20560, 18396, 16384, 14564 };
 
 /* up-right diagonal scans (6.5.3): 4x4 positions (x, y), and the 2x2
@@ -102,6 +84,69 @@ static int scale_m(const Pic *p, int log2, int x, int y, bool inter)
     return inter ? sl_inter8[y * 8 + x] : sl_intra8[y * 8 + x];
 }
 
+/* the 1-D transforms as partial butterflies: the same integer sums as the
+ * matrix products (8.6.4.2), unshifted; s / d strided */
+static inline void fwd1(int n, const int *s, int ss, int *d, int ds)
+{
+    if (n == 4) {
+        const int e0 = s[0] + s[3 * ss], o0 = s[0] - s[3 * ss];
+        const int e1 = s[ss] + s[2 * ss], o1 = s[ss] - s[2 * ss];
+
+        d[0] = 64 * (e0 + e1);
+        d[2 * ds] = 64 * (e0 - e1);
+        d[ds] = 83 * o0 + 36 * o1;
+        d[3 * ds] = 36 * o0 - 83 * o1;
+        return;
+    }
+    int e[4], o[4];
+    for (int k = 0; k < 4; k++) {
+        e[k] = s[k * ss] + s[(7 - k) * ss];
+        o[k] = s[k * ss] - s[(7 - k) * ss];
+    }
+    const int ee0 = e[0] + e[3], eo0 = e[0] - e[3];
+    const int ee1 = e[1] + e[2], eo1 = e[1] - e[2];
+
+    d[0] = 64 * (ee0 + ee1);
+    d[4 * ds] = 64 * (ee0 - ee1);
+    d[2 * ds] = 83 * eo0 + 36 * eo1;
+    d[6 * ds] = 36 * eo0 - 83 * eo1;
+    d[ds] = 89 * o[0] + 75 * o[1] + 50 * o[2] + 18 * o[3];
+    d[3 * ds] = 75 * o[0] - 18 * o[1] - 89 * o[2] - 50 * o[3];
+    d[5 * ds] = 50 * o[0] - 89 * o[1] + 18 * o[2] + 75 * o[3];
+    d[7 * ds] = 18 * o[0] - 50 * o[1] + 75 * o[2] - 89 * o[3];
+}
+
+static inline void inv1(int n, const int *c, int cs, int *d, int ds)
+{
+    if (n == 4) {
+        const int o0 = 83 * c[cs] + 36 * c[3 * cs];
+        const int o1 = 36 * c[cs] - 83 * c[3 * cs];
+        const int e0 = 64 * (c[0] + c[2 * cs]), e1 = 64 * (c[0] - c[2 * cs]);
+
+        d[0] = e0 + o0;
+        d[ds] = e1 + o1;
+        d[2 * ds] = e1 - o1;
+        d[3 * ds] = e0 - o0;
+        return;
+    }
+    const int c1 = c[cs], c3 = c[3 * cs], c5 = c[5 * cs], c7 = c[7 * cs];
+    const int o[4] = {
+        89 * c1 + 75 * c3 + 50 * c5 + 18 * c7,
+        75 * c1 - 18 * c3 - 89 * c5 - 50 * c7,
+        50 * c1 - 89 * c3 + 18 * c5 + 75 * c7,
+        18 * c1 - 50 * c3 + 75 * c5 - 89 * c7,
+    };
+    const int eo0 = 83 * c[2 * cs] + 36 * c[6 * cs];
+    const int eo1 = 36 * c[2 * cs] - 83 * c[6 * cs];
+    const int ee0 = 64 * (c[0] + c[4 * cs]), ee1 = 64 * (c[0] - c[4 * cs]);
+    const int e[4] = { ee0 + eo0, ee1 + eo1, ee1 - eo1, ee0 - eo0 };
+
+    for (int k = 0; k < 4; k++) {
+        d[k * ds] = e[k] + o[k];
+        d[(7 - k) * ds] = e[k] - o[k];
+    }
+}
+
 /* the forward transform (T R T^T) and quantisation of an n x n residual,
  * both raster; any rounding will do here, the decoder's side is exact */
 static void fwd_quant(const Pic *p, const int *res, int log2, int qp,
@@ -109,30 +154,24 @@ static void fwd_quant(const Pic *p, const int *res, int log2, int qp,
 {
     const int n = 1 << log2, s1 = log2 - 1, s2 = log2 + 6;
     const int qbits = 14 + qp / 6 + (15 - 8 - log2);
-    int tmp[64], c[64], i, j, k;
+    const int64_t off = (int64_t)(inter ? 85 : 171) << (qbits - 9);
+    int tmp[64], c[64], t[8], i, j;
 
     for (i = 0; i < n; i++) {                   /* each row, horizontally */
-        for (k = 0; k < n; k++) {
-            int64_t s = 0;
-            for (j = 0; j < n; j++) {
-                s += (int64_t)tmat(n, k, j) * res[i * n + j];
-            }
-            tmp[i * n + k] = (int)((s + (1 << (s1 - 1))) >> s1);
+        fwd1(n, &res[i * n], 1, t, 1);
+        for (j = 0; j < n; j++) {
+            tmp[i * n + j] = (t[j] + (1 << (s1 - 1))) >> s1;
         }
     }
     for (j = 0; j < n; j++) {                   /* each column, vertically */
-        for (k = 0; k < n; k++) {
-            int64_t s = 0;
-            for (i = 0; i < n; i++) {
-                s += (int64_t)tmat(n, k, i) * tmp[i * n + j];
-            }
-            c[k * n + j] = (int)((s + (1 << (s2 - 1))) >> s2);
+        fwd1(n, &tmp[j], n, t, 1);
+        for (i = 0; i < n; i++) {
+            c[i * n + j] = (t[i] + (1 << (s2 - 1))) >> s2;
         }
     }
     for (i = 0; i < n * n; i++) {
         const int m = scale_m(p, log2, i % n, i / n, inter);
         const int64_t q = ((int64_t)quant_scale[qp % 6] << 4) / m;
-        const int64_t off = (int64_t)(inter ? 85 : 171) << (qbits - 9);
         const int64_t a = ((int64_t)abs(c[i]) * q + off) >> qbits;
 
         lev[i] = (int)MIN(a, 32767) * (c[i] < 0 ? -1 : 1);
@@ -146,9 +185,13 @@ static void dequant_inv(const Pic *p, const int *lev, int log2, int qp,
 {
     static const int ls[6] = { 40, 45, 51, 57, 64, 72 };
     const int n = 1 << log2, bd = 8 + log2 - 5;
-    int d[64], e[64], x, y, k;
+    int d[64], e[64], t[8], x, y, k;
 
     for (k = 0; k < n * n; k++) {
+        if (!lev[k]) {
+            d[k] = 0;
+            continue;
+        }
         const int m = scale_m(p, log2, k % n, k / n, inter);
         int64_t v = ((int64_t)lev[k] * m * ls[qp % 6]) << (qp / 6);
 
@@ -156,21 +199,15 @@ static void dequant_inv(const Pic *p, const int *lev, int log2, int qp,
         d[k] = (int)MIN(MAX(v, -32768), 32767);
     }
     for (x = 0; x < n; x++) {                   /* columns */
+        inv1(n, &d[x], n, t, 1);
         for (y = 0; y < n; y++) {
-            int64_t s = 0;
-            for (k = 0; k < n; k++) {
-                s += (int64_t)tmat(n, k, y) * d[k * n + x];
-            }
-            e[y * n + x] = (int)MIN(MAX((s + 64) >> 7, -32768), 32767);
+            e[y * n + x] = MIN(MAX((t[y] + 64) >> 7, -32768), 32767);
         }
     }
     for (y = 0; y < n; y++) {                   /* rows */
+        inv1(n, &e[y * n], 1, t, 1);
         for (x = 0; x < n; x++) {
-            int64_t s = 0;
-            for (k = 0; k < n; k++) {
-                s += (int64_t)tmat(n, k, x) * e[y * n + k];
-            }
-            res[y * n + x] = (int)((s + 2048) >> 12);
+            res[y * n + x] = (t[x] + 2048) >> 12;
         }
     }
 }

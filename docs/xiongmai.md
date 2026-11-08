@@ -257,7 +257,8 @@ logo with a moving dot, as the Allwinner models do:
     model writes the slice data (`hevc-enc.c`) under them, so its CABAC
     must follow the library's choices: CTB 16 without SAO (XM535, XM533)
     or CTB 32 with SAO (XM530V200), deblocking with beta offset +5.
-    Every CU is 8x8 with a DC-only intra block, or, in a P picture,
+    Every CU is 8x8 intra DC with its residual through the whole integer
+    transform (a flat one coded as its DC alone), or, in a P picture,
     skipped: zero motion into the previous picture, the only one the
     library's RPS names. A CU is skipped where copying the reference costs
     no more than coding it again (squared error plus lambda times the
@@ -267,8 +268,8 @@ logo with a moving dot, as the Allwinner models do:
     programs (+0x0B0 on XM535, +0x1F0 on the others); a P job's reference
     address (+0x0A8 / +0x1E8) names it. P pictures of the test picture
     are about 1 KB. `cu_qp_delta` caps the QP at 22 whatever the slice
-    QP: the rate control raises that to 44 within a GOP, and DC-only
-    blocks need the finer steps. `-global xm-hevc.dump-dir=DIR` keeps
+    QP: the rate control raises that to 44 within a GOP, where small text
+    loses its strokes. `-global xm-hevc.dump-dir=DIR` keeps
     every job as a whole access unit.
   - **xm-osd**: the OSD engine (rgn.ko) blends the clock and title into
     the frame in place (2 bits a pixel, two regions a job). XM535's main
@@ -548,9 +549,7 @@ line, scaled by +0x24 / +0x28) of +0x4C × (+0x34 + 1) pixels into the
 NV12 frame in place (Y / C +0x44 / +0x48 → +0x50 / +0x54, stride +0x2C):
 ARGB1555 (mode 0 / 1, alpha +0x20; XM8520D's Sofia), one bit (1 / 0) or
 two bits a pixel (1 / 4, AYUV palette +0x10..+0x1C; XM8521DV200's Sofia).
-The planar-RGB snapshot modes are not modelled. The encoders' intra
-coding is DC-only per 8×8 block, so the text is blurred in the streams
-though exact in the frames.
+The planar-RGB snapshot modes are not modelled.
 
 **Covers.** rgn.ko's privacy masks: XM8520D's VI draws them per channel
 (block 0x112000 + engine·0x40000 + output·0x4000), XM8521DV200's VPSS per
@@ -565,8 +564,9 @@ JPEG header's last bits carried in +0x048 [31:26] / +0x04C / +0x054. Sizes
 go back in bytes (+0x024); completion is delayed 2 ms. XM8521DV200 runs
 hevc.ko's v3 engine (`xm8521dv200` layout: stream at +0x200, 32×32 CTBs
 without SAO); its library writes the headers after the job and drops the
-frame unless the engine overwrote the 0xff markers in its per-CTB tables
-(+0x20C / +0x210, with +0x1C4 set). Its jpeg.ko engine has the registers
+frame unless the engine overwrote the 0xff markers in its per-CTB table
+(+0x20C, with +0x1C4 set). The second table (+0x210) is smaller and the
+stream buffer follows it, so the model leaves that one alone. Its jpeg.ko engine has the registers
 moved (`xm8521` layout: status +0x030, scan +0x054, source +0x05C).
 
 **Audio (`xm-audio`, layouts `dvr` / `dvr2`).** XM8520D: +0x5000 the AHD

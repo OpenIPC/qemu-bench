@@ -4,14 +4,14 @@
  * Every picture is an IDR access unit with its own VPS, SPS and PPS, one I
  * slice, 16x16 CTBs each split into four 8x8 coding units.  Every CU is
  * 2Nx2N intra DC (chroma: DM, so DC too) with one transform unit -- an 8x8
- * luma and two 4x4 chroma blocks -- that carries only its DC coefficient.
- * So the picture comes out at 8x8 (chroma 4x4) block resolution, which is
- * plenty for a test pattern.  PCM, sign hiding and transform skip are off,
- * QP deltas cap the QP (HEVC_QP_MAX), and the encoder reconstructs exactly as a
- * decoder does (ITU-T H.265 8.4.4.2: reference sample availability and
- * substitution, DC prediction with its edge filter; 8.6.2-8.6.4: scaling
- * and the inverse transform of a DC-only block), so intra prediction never
- * drifts and the decoded picture equals the reconstruction.
+ * luma and two 4x4 chroma blocks -- whose residual against the prediction
+ * goes through the whole integer transform (hevc-enc-inter.c.inc's), so the
+ * picture keeps its detail: OSD text, edges.  PCM and transform skip are
+ * off, QP deltas cap the QP (HEVC_QP_MAX), and the encoder reconstructs
+ * exactly as a decoder does (ITU-T H.265 8.4.4.2: reference sample
+ * availability and substitution, DC prediction with its edge filter;
+ * 8.6.2-8.6.4: scaling and the inverse transform), so intra prediction
+ * never drifts and the decoded picture equals the reconstruction.
  *
  * Engines that ask for it (HevcEncParams.inter) get P slices with real inter
  * coding instead: hevc-enc-inter.c.inc.
@@ -660,42 +660,170 @@ static int skip_threshold(int qp)
     return (int)(0.57 * pow(2.0, (qp - 12) / 3.0) * INTRA_BITS);
 }
 
-/* one 8x8 CU at luma (x0, y0) */
+/* hevc-enc-inter.c.inc's transforms and residual_coding(), for the intra
+ * CUs' full residuals */
+static void fwd_quant(const Pic *p, const int *res, int log2, int qp,
+                      bool inter, int *lev);
+static void dequant_inv(const Pic *p, const int *lev, int log2, int qp,
+                        bool inter, int *res);
+static void residual_full(Pic *p, Cabac *c, int *lev, int log2, int cidx);
+
+/*
+ * The residual of one intra TB of n x n (log2) against its prediction:
+ * levels lev[] and what the decoder adds back, res[] (both raster).  TBs
+ * of 4 and 8 get the whole transform (8.6.4.2), so the block keeps its
+ * detail -- OSD text, edges; a flat residual its DC alone.
+ * Returns whether a level is not zero.
+ */
+static bool intra_residual(Pic *p, const uint8_t *src, int sstride, int sx,
+                           int sy, const int *pred, int log2, int qp,
+                           int *lev, int *res)
+{
+    const int n = 1 << log2;
+    int diff[256], i, x, y;
+    bool nz = false;
+
+    for (y = 0; y < n; y++) {
+        for (x = 0; x < n; x++) {
+            diff[y * n + x] = src[(sy + y) * sstride + sx + x] -
+                              pred[y * n + x];
+        }
+    }
+    int sum = 0, lo = INT_MAX, hi = INT_MIN;
+    for (i = 0; i < n * n; i++) {
+        sum += diff[i];
+        lo = MIN(lo, diff[i]);
+        hi = MAX(hi, diff[i]);
+    }
+    /* a flat residual (most of a test pattern) has nothing but its DC to
+     * code: the cheap way */
+    if (log2 <= 3 && hi - lo > 2) {
+        fwd_quant(p, diff, log2, qp, false, lev);
+        for (i = 0; i < n * n; i++) {
+            nz |= lev[i] != 0;
+        }
+        if (nz) {
+            dequant_inv(p, lev, log2, qp, false, res);
+        } else {
+            memset(res, 0, n * n * sizeof(int));
+        }
+        return nz;
+    }
+    memset(lev, 0, n * n * sizeof(int));
+    lev[0] = dc_level((sum + (sum < 0 ? -n * n / 2 : n * n / 2)) / (n * n),
+                      qp, log2);
+    const int r = dc_residual(lev[0], qp, log2);
+    for (i = 0; i < n * n; i++) {
+        res[i] = r;
+    }
+    return lev[0] != 0;
+}
+
+/* residual_coding() of what intra_residual() made of a TB; the decoder's
+ * residual again if sign hiding changed a level */
+static void intra_residual_code(Pic *p, Cabac *c, int *lev, int log2,
+                                int cidx, int qp, int *res)
+{
+    bool dc_only = true;
+
+    for (int i = 1; i < (1 << (2 * log2)) && dc_only; i++) {
+        dc_only = !lev[i];
+    }
+    if (dc_only) {
+        residual_dc(c, lev[0], log2, cidx > 0, p->prm->transform_skip);
+        return;
+    }
+    residual_full(p, c, lev, log2, cidx);
+    if (p->prm->sign_hiding) {
+        dequant_inv(p, lev, log2, qp, false, res);
+    }
+}
+
+/* the squared error of the reference's CU of n against the source */
+static int cu_ref_sse(Pic *p, int x0, int y0, int n)
+{
+    const int nc = n / 2, cs = p->w / 2;
+    int x, y, e = 0;
+
+    for (y = 0; y < n; y++) {
+        const int o = (y0 + y) * p->w + x0;
+        for (x = 0; x < n; x++) {
+            const int d = p->ref->y[o + x] - p->cy[o + x];
+            e += d * d;
+        }
+    }
+    for (y = 0; y < nc; y++) {
+        const int o = (y0 / 2 + y) * cs + x0 / 2;
+        for (x = 0; x < nc; x++) {
+            const int d = p->ref->cb[o + x] - p->ccb[o + x];
+            const int f = p->ref->cr[o + x] - p->ccr[o + x];
+            e += d * d + f * f;
+        }
+    }
+    return e;
+}
+
+/* a skipped CU of n at (x0, y0): merge candidate 0 (every candidate is the
+ * zero vector into the one reference), no residual */
+static void cu_skip(Pic *p, Cabac *c, int x0, int y0, int n)
+{
+    const int nc = n / 2, cs = p->w / 2, cw = p->w >> 3;
+    const int cu = (y0 >> 3) * cw + (x0 >> 3);
+    const int ctx = (x0 > 0 && p->skip[cu - 1]) + (y0 > 0 && p->skip[cu - cw]);
+
+    cabac_decision(c, CTX_SKIP + ctx, 1);
+    cabac_decision(c, CTX_MERGE_IDX, 0);
+    for (int y = 0; y < n; y++) {
+        memcpy(&p->y[(y0 + y) * p->w + x0], &p->ref->y[(y0 + y) * p->w + x0],
+               n);
+    }
+    for (int y = 0; y < nc; y++) {
+        const int o = (y0 / 2 + y) * cs + x0 / 2;
+        memcpy(&p->cb[o], &p->ref->cb[o], nc);
+        memcpy(&p->cr[o], &p->ref->cr[o], nc);
+    }
+    p->skip[cu] = 1;
+    p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
+    p->qp_prev = p->cuqp[cu];
+    p->done[cu] = 1;
+}
+
+/*
+ * One 8x8 CU: skipped, or intra DC with one transform unit -- an 8x8 luma
+ * and two 4x4 chroma blocks.
+ */
 static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
 {
-    int pred[64], x, y, comp;
-    int lev_c[2], pred_c[2][16], r_c[2];
+    const int l2 = 3, n = 8, nc = 4;
+    int pred[256], x, y, comp;
+    int lev_y[256], res_y[256];
+    int lev_c[2][64], pred_c[2][64], res_c[2][64];
+    bool nz_y, nz_c[2];
     const int cw = p->w >> 3, cu = (y0 >> 3) * cw + (x0 >> 3);
     const int cs = p->w / 2;
 
-    /* the intra candidate: DC prediction, DC residual, luma 8x8 */
-    pred_dc(p, p->y, p->w, 1, x0, y0, 8, true, pred);
-    int sum = 0;
-    for (y = 0; y < 8; y++) {
-        for (x = 0; x < 8; x++) {
-            sum += p->cy[(y0 + y) * p->w + x0 + x] - pred[y * 8 + x];
-        }
-    }
     qp = p->qp;
-    const int lev_y = dc_level((sum + (sum < 0 ? -32 : 32)) / 64, qp, 3);
-    const int r_y = dc_residual(lev_y, qp, 3);
+    if (p_slice && p->ref && !p->force_intra &&
+        cu_ref_sse(p, x0, y0, n) <= p->skip_thr * (n * n / 64)) {
+        /* the reference block is closer than any intra one could be
+         * cheaper: skipped, whatever the intra candidate */
+        cu_skip(p, c, x0, y0, n);
+        return;
+    }
 
-    /* chroma, 4x4 at (x0/2, y0/2) */
+    /* the intra candidate: DC prediction, the residual transformed */
+    pred_dc(p, p->y, p->w, 1, x0, y0, n, true, pred);
+    nz_y = intra_residual(p, p->cy, p->w, x0, y0, pred, l2, qp, lev_y, res_y);
+
+    /* chroma, nc x nc at (x0/2, y0/2) */
     const int qpc = chroma_qp(MIN(MAX(qp + p->cqp_offset, 0), 57));
     for (comp = 0; comp < 2; comp++) {
         const uint8_t *plane = comp ? p->cr : p->cb;
-        const uint8_t *src = comp ? p->ccr : p->ccb;
-        pred_dc(p, (uint8_t *)plane, cs, 2, x0 / 2, y0 / 2, 4, false,
+        pred_dc(p, (uint8_t *)plane, cs, 2, x0 / 2, y0 / 2, nc, false,
                 pred_c[comp]);
-        int t = 0;
-        for (y = 0; y < 4; y++) {
-            for (x = 0; x < 4; x++) {
-                t += src[(y0 / 2 + y) * cs + x0 / 2 + x] -
-                     pred_c[comp][y * 4 + x];
-            }
-        }
-        lev_c[comp] = dc_level((t + (t < 0 ? -8 : 8)) / 16, qpc, 2);
-        r_c[comp] = dc_residual(lev_c[comp], qpc, 2);
+        nz_c[comp] = intra_residual(p, comp ? p->ccr : p->ccb, cs, x0 / 2,
+                                    y0 / 2, pred_c[comp], l2 - 1, qpc,
+                                    lev_c[comp], res_c[comp]);
     }
 
     if (p_slice) {
@@ -706,11 +834,12 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
 
         if (p->ref && !p->force_intra) {
             int sse_i = 0, sse_s = 0;
-            for (y = 0; y < 8; y++) {
+            for (y = 0; y < n; y++) {
                 const int o = (y0 + y) * p->w + x0;
-                for (x = 0; x < 8; x++) {
+                for (x = 0; x < n; x++) {
                     const int src = p->cy[o + x];
-                    const int di = clip1(pred[y * 8 + x] + r_y) - src;
+                    const int di = clip1(pred[y * n + x] +
+                                         res_y[y * n + x]) - src;
                     const int ds = p->ref->y[o + x] - src;
                     sse_i += di * di;
                     sse_s += ds * ds;
@@ -719,37 +848,22 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
             for (comp = 0; comp < 2; comp++) {
                 const uint8_t *src = comp ? p->ccr : p->ccb;
                 const uint8_t *ref = comp ? p->ref->cr : p->ref->cb;
-                for (y = 0; y < 4; y++) {
+                for (y = 0; y < nc; y++) {
                     const int o = (y0 / 2 + y) * cs + x0 / 2;
-                    for (x = 0; x < 4; x++) {
-                        const int di = clip1(pred_c[comp][y * 4 + x] +
-                                             r_c[comp]) - src[o + x];
+                    for (x = 0; x < nc; x++) {
+                        const int di = clip1(pred_c[comp][y * nc + x] +
+                                             res_c[comp][y * nc + x]) -
+                                       src[o + x];
                         const int ds = ref[o + x] - src[o + x];
                         sse_i += di * di;
                         sse_s += ds * ds;
                     }
                 }
             }
-            skip = sse_s <= sse_i + p->skip_thr;
+            skip = sse_s <= sse_i + p->skip_thr * (n * n / 64);
         }
         if (skip) {
-            /* merge candidate 0 (every candidate is the zero vector into
-             * the one reference), no residual */
-            cabac_decision(c, CTX_SKIP + ctx, 1);
-            cabac_decision(c, CTX_MERGE_IDX, 0);
-            for (y = 0; y < 8; y++) {
-                memcpy(&p->y[(y0 + y) * p->w + x0],
-                       &p->ref->y[(y0 + y) * p->w + x0], 8);
-            }
-            for (y = 0; y < 4; y++) {
-                const int o = (y0 / 2 + y) * cs + x0 / 2;
-                memcpy(&p->cb[o], &p->ref->cb[o], 4);
-                memcpy(&p->cr[o], &p->ref->cr[o], 4);
-            }
-            p->skip[cu] = 1;
-            p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
-            p->qp_prev = p->cuqp[cu];
-            p->done[cu] = 1;
+            cu_skip(p, c, x0, y0, n);
             return;
         }
         /* not skipped, coded intra */
@@ -768,40 +882,46 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
     /* transform_tree: no split (said when the SPS allows one: ctxInc
      * 5 - log2TrafoSize); cbf_cb, cbf_cr, cbf_luma */
     if (p->prm->trafo_depth_intra > 0) {
-        cabac_decision(c, CTX_SPLIT_TRAFO + 5 - 3, 0);
+        cabac_decision(c, CTX_SPLIT_TRAFO + 5 - l2, 0);
     }
-    cabac_decision(c, CTX_CBF_CHROMA + 0, lev_c[0] != 0);
-    cabac_decision(c, CTX_CBF_CHROMA + 0, lev_c[1] != 0);
-    cabac_decision(c, CTX_CBF_LUMA + 1, lev_y != 0);
+    cabac_decision(c, CTX_CBF_CHROMA + 0, nz_c[0]);
+    cabac_decision(c, CTX_CBF_CHROMA + 0, nz_c[1]);
+    cabac_decision(c, CTX_CBF_LUMA + 1, nz_y);
     /* cu_qp_delta, once per quantization group: from the group's
      * predicted QP (8.6.1) to ours */
-    if ((lev_y || lev_c[0] || lev_c[1]) && !p->qp_delta_coded) {
+    if ((nz_y || nz_c[0] || nz_c[1]) && !p->qp_delta_coded) {
         cu_qp_delta(c, p->qp - p->qg_pred);
         p->qp_delta_coded = true;
     }
-    if (lev_y) {
-        residual_dc(c, lev_y, 3, false, p->prm->transform_skip);
+    /* DC prediction: the diagonal scan (7.4.9.11, scanIdx 0) */
+    if (nz_y) {
+        intra_residual_code(p, c, lev_y, l2, 0, qp, res_y);
     }
     for (comp = 0; comp < 2; comp++) {
-        if (lev_c[comp]) {
-            residual_dc(c, lev_c[comp], 2, true, p->prm->transform_skip);
+        if (nz_c[comp]) {
+            intra_residual_code(p, c, lev_c[comp], l2 - 1, comp + 1, qpc,
+                                res_c[comp]);
         }
     }
 
     /* reconstruct */
-    for (y = 0; y < 8; y++) {
-        for (x = 0; x < 8; x++) {
-            p->y[(y0 + y) * p->w + x0 + x] = clip1(pred[y * 8 + x] + r_y);
+    for (y = 0; y < n; y++) {
+        for (x = 0; x < n; x++) {
+            p->y[(y0 + y) * p->w + x0 + x] = clip1(pred[y * n + x] +
+                                                   res_y[y * n + x]);
         }
     }
     for (comp = 0; comp < 2; comp++) {
         uint8_t *plane = comp ? p->cr : p->cb;
-        for (y = 0; y < 4; y++) {
-            for (x = 0; x < 4; x++) {
+        for (y = 0; y < nc; y++) {
+            for (x = 0; x < nc; x++) {
                 plane[(y0 / 2 + y) * cs + x0 / 2 + x] =
-                    clip1(pred_c[comp][y * 4 + x] + r_c[comp]);
+                    clip1(pred_c[comp][y * nc + x] + res_c[comp][y * nc + x]);
             }
         }
+    }
+    if (p_slice) {
+        p->skip[cu] = 0;
     }
     p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
     p->qp_prev = p->cuqp[cu];
@@ -1053,11 +1173,12 @@ static void quadtree(Pic *p, Cabac *c, int x0, int y0, int log2, int qp,
 /*
  * The QP the CUs are coded with at most, whatever the slice's.  The vendor
  * libraries' rate control raises the slice QP as far as 44 (XM533's main
- * stream, within a GOP), where DC-only blocks go blotchy; and on a flat
- * picture even QP 30's DC steps (2.5 luma, 4.5 chroma levels) show as bands
- * where blocks were coded again in a P picture next to ones from the I
- * picture.  cu_qp_delta brings it down to where neither shows; skipped P
- * blocks keep the cost down.
+ * stream, within a GOP), where blocks go blotchy and small text loses its
+ * strokes; and on a flat picture even QP 30's DC steps (2.5 luma, 4.5
+ * chroma levels) show as bands where blocks were coded again in a P picture
+ * next to ones from the I picture.  cu_qp_delta brings it down to where
+ * neither shows; skipped P blocks and flat residuals coded as their DC
+ * alone keep the cost down.
  */
 #define HEVC_QP_MAX     22
 
@@ -1268,9 +1389,8 @@ size_t hevc_enc_slice_data(const HevcEncParams *prm,
     if (!size_ok(w, h)) {
         return 0;
     }
-    /* an inter CU's residual may take a few hundred bytes */
-    const size_t rbsp_cap = (size_t)(w / 8) * (h / 8) *
-                            (prm->inter ? 320 : 48) + 256;
+    /* a CU's residual may take a few hundred bytes */
+    const size_t rbsp_cap = (size_t)(w / 8) * (h / 8) * 320 + 256;
     g_autofree uint8_t *rbsp = g_malloc0(rbsp_cap);
     const size_t n = slice_data(prm, w, h, MIN(MAX(qp, 0), 51), p_slice,
                                 ref, NULL, false, false, recon, y, sw, sh,
@@ -1372,7 +1492,7 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
     bw_ue(&b, MIN(prm->log2_ctb, 5) - 2);   /* max TB: the CTB, 32 at most */
     /* the inter coder's engines say what their libraries' SPS says */
     bw_ue(&b, prm->inter ? prm->trafo_depth_inter : 0); /* depth inter */
-    bw_ue(&b, prm->inter ? prm->trafo_depth_intra : 0); /* depth intra */
+    bw_ue(&b, prm->trafo_depth_intra);                  /* depth intra */
     bw_bits(&b, prm->inter && prm->scaling_list, 1);   /* scaling lists */
     if (prm->inter && prm->scaling_list) {
         bw_bits(&b, 0, 1);                  /*   the defaults */

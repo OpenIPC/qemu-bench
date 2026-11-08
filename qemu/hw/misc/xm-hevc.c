@@ -66,8 +66,7 @@
  *   "xm8521dv200": the XM8521DV200 DVR library, the same registers, its
  *   CTBs 32x32 without SAO; it writing its headers in front of the
  *   output only after the job, and with +0x1C4 set checks that the
- *   engine filled its per-CTB tables at +0x20C / +0x210, see
- *   xm_hevc_ctb_tables())
+ *   engine filled its per-CTB table at +0x20C, see xm_hevc_ctb_tables())
  *   +0x058     status, 3 frame done; 3 to +0x030 acknowledges.  +0x054
  *              (acknowledged at +0x02C) and +0x050 (errors, at +0x028)
  *              also raise the interrupt; neither happens here.
@@ -348,10 +347,13 @@ static void xm_hevc_job_free(XmHevcJob *j)
 
 /*
  * xm530v200 layout with +0x1C4 set (Sofia's DVR library on XM8521DV200):
- * the engine writes 16 bytes a 32x32 CTB of its own into the tables at
- * +0x20C (and +0x210), CTB columns outside, rows inside.  The library
- * marks them 0xff before the job and drops the frame (-10, silently) if a
- * marker is left; nothing reads the contents, so they are cleared here.
+ * the engine writes 16 bytes a 32x32 CTB of its own into the table at
+ * +0x20C (and a smaller one at +0x210), CTB columns outside, rows inside.
+ * The library marks the first 0xff before the job and drops the frame
+ * (-10, silently) if a marker is left; nothing reads the contents, so that
+ * one is cleared here.  The one at +0x210 is left alone: 16 bytes a CTB
+ * there run into the stream buffer after it, where the frame just written
+ * can start.
  */
 /* the DVR library's parameter sets: 32x32 CTBs, no SAO, deblocking
  * offsets 5 / -5, a QP group a CTB */
@@ -363,19 +365,14 @@ static void xm_hevc_ctb_tables(XmHevcState *s, int w, int h)
 {
     static const uint8_t zero[4096];
     size_t len = (size_t)DIV_ROUND_UP(w, 32) * DIV_ROUND_UP(h, 32) * 16, k;
-    hwaddr t[2];
+    const hwaddr t = R(s, 0x20C);
 
     if (!s->v3 || s->v3_out != 0x200 || !R(s, 0x1C4)) {
         return;
     }
-    t[0] = R(s, 0x20C);
-    t[1] = R(s, 0x210);
-    for (int i = 0; i < 2; i++) {
-        for (k = 0; t[i] && k < len; k += sizeof(zero)) {
-            dma_memory_write(&address_space_memory, t[i] + k, zero,
-                             MIN(sizeof(zero), len - k),
-                             MEMTXATTRS_UNSPECIFIED);
-        }
+    for (k = 0; t && k < len; k += sizeof(zero)) {
+        dma_memory_write(&address_space_memory, t + k, zero,
+                         MIN(sizeof(zero), len - k), MEMTXATTRS_UNSPECIFIED);
     }
 }
 

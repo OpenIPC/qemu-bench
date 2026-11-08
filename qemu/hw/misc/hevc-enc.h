@@ -76,8 +76,8 @@ void hevc_enc_ref_planes(const HevcEncRef *r, const uint8_t **y,
  * an NV12 source of sw x sh (y stride ys, interleaved CbCr stride cs),
  * scaled to w x h by nearest neighbour, emulation prevention applied: what
  * the HEVC engines write after the slice header the vendor library puts in
- * front.  I slices code intra DC CUs; P slices skip the CUs whose source is
- * the reference's and code the others intra.
+ * front.  I slices code intra DC CUs with transformed residuals; P slices
+ * skip the CUs whose source is the reference's and code the others intra.
  * Returns the bytes it needed (more than cap: truncated).
  */
 size_t hevc_enc_slice_data(const HevcEncParams *prm,
