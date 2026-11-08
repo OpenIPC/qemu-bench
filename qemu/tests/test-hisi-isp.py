@@ -154,7 +154,9 @@ def main():
         f.write(b'P6\n64 36\n255\n' +
                 (b'\xff' * 96 + b'\x00' * 96) * 36)
     qmp_path = os.path.join(tmp, 'qmp.sock')
+    record = os.path.join(tmp, 'record.csv')
     q = QTest(a.qemu, a.machine, ('-global', 'hisi-scene.file=' + ppm,
+                                  '-global', 'hisi-vi.record=' + record,
                                   '-qmp', 'unix:%s,server=on,wait=off' %
                                   qmp_path))
     qmp = socket.socket(socket.AF_UNIX)
@@ -211,6 +213,36 @@ def main():
         z0, _ = frame()
         check('error' in r and z0[0] >> 16 == G,
               'scene file %s refused, the picture kept' % name)
+
+    # a timeline (step 3): its clock starts at the next frame; a step at
+    # 0.1 s and a ramp over 0.2..0.4 s
+    timeline = os.path.join(tmp, 'timeline')
+    with open(timeline, 'w') as f:
+        f.write('# test\n0.1 light-r=300\n0.2..0.4 light-r=300->900\n')
+    r = qmp_cmd('qom-set', path='/machine/scene', property='timeline',
+                value=timeline)
+    check('return' in r, 'timeline loaded over QMP')
+    z0, _ = frame()                                 # t = 0: unchanged
+    before = z0[0] & 0xffff
+    for _ in range(3):                              # t = 0.12 s
+        z0, _ = frame()
+    step = z0[0] & 0xffff
+    for _ in range(9):                              # past the ramp
+        z0, _ = frame()
+    ramp = z0[0] & 0xffff
+    check(before == G and step == int(WHITE * 0.3) and
+          ramp == int(WHITE * 0.9),
+          'timeline: R %d, after the step %d, after the ramp %d' %
+          (before, step, ramp))
+
+    rows = open(record).read().splitlines()
+    head = rows[0].split(',')
+    lr = [int(float(x.split(',')[head.index('light_r')])) for x in rows[1:]]
+    check(head[:3] == ['t', 'frame', 'light'] and len(rows) > 10 and
+          300 in lr and 900 in lr and any(300 < v < 900 for v in lr),
+          'record: %d frames, light-r through %s' %
+          (len(rows) - 1, sorted(set(lr))[:3] + ['...'] +
+           sorted(set(lr))[-1:]))
     qmp.close()
     q.close()
 

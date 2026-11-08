@@ -107,6 +107,7 @@
 #include "qemu/timer.h"
 #include "hw/i2c/image-sensor.h"
 #include "hw/misc/hisi-scene.h"
+#include "qemu/error-report.h"
 #include "system/dma.h"
 
 #define TYPE_HISI_VI "hisi-vi"
@@ -187,6 +188,11 @@ struct HisiViState {
     double level;               /* the current frame's white, 16-bit */
     uint16_t *raw;              /* the frame on the grid, R / G / B */
     double tint[3];             /* the light it was captured under */
+    double light;               /* ...and its level */
+    double scene_t;             /* the scene's timeline clock, s */
+    double wb[2];               /* the WB gains the driver programmed */
+    char *record;               /* a CSV of every measured frame */
+    FILE *record_f;
     int gw, gh;
     uint32_t stat_frames;
 };
@@ -260,8 +266,10 @@ static void vi_scene_frame(HisiViState *s)
     tint[1] = 1.0;
     tint[2] = 0.7;
     if (s->scene) {
+        s->scene_t = hisi_scene_frame_begin(s->scene);
         light = hisi_scene_light(s->scene, tint);
     }
+    s->light = light;
     if (s->sensor && image_sensor_exposure(s->sensor, &now)) {
         if (image_sensor_frame_start(s->sensor)) {
             /*
@@ -301,12 +309,15 @@ static void vi_scene_frame(HisiViState *s)
         }
     }
     memcpy(s->tint, tint, sizeof(s->tint));
-    if (s->scene && !s->offline) {
+    if (!s->offline) {
         /* the white balance the driver programmed: ISP_WB_GAIN1 / 2, R and
          * B in the high halves (offline: vi_offline_wb()) */
-        hisi_scene_set_frame(s->scene, s->level, s->tint,
-                             (s->proc[BE_WB_GAIN1 / 4] >> 16) / 256.0,
-                             (s->proc[BE_WB_GAIN2 / 4] >> 16) / 256.0);
+        s->wb[0] = (s->proc[BE_WB_GAIN1 / 4] >> 16) / 256.0;
+        s->wb[1] = (s->proc[BE_WB_GAIN2 / 4] >> 16) / 256.0;
+        if (s->scene) {
+            hisi_scene_set_frame(s->scene, s->level, s->tint, s->wb[0],
+                                 s->wb[1]);
+        }
     }
 }
 
@@ -332,9 +343,43 @@ static void vi_offline_wb(HisiViState *s)
                             gain, sizeof(gain), MEMTXATTRS_UNSPECIFIED);
         }
     }
-    hisi_scene_set_frame(s->scene, s->level, s->tint,
-                         (le32_to_cpu(gain[0]) >> 16) / 256.0,
-                         (le32_to_cpu(gain[1]) >> 16) / 256.0);
+    s->wb[0] = (le32_to_cpu(gain[0]) >> 16) / 256.0;
+    s->wb[1] = (le32_to_cpu(gain[1]) >> 16) / 256.0;
+    hisi_scene_set_frame(s->scene, s->level, s->tint, s->wb[0], s->wb[1]);
+}
+
+/*
+ * The record (docs/hisilicon-digital-twin.md, step 3): a CSV line a
+ * measured frame, what the scene was, what the sensor applied, what the
+ * statistics saw and what the 3A loop answered with.
+ */
+static void vi_record(HisiViState *s, uint32_t r, uint32_t g, uint32_t b)
+{
+    uint64_t violations = 0;
+
+    if (!s->record || !*s->record) {
+        return;
+    }
+    if (!s->record_f) {
+        s->record_f = fopen(s->record, "w");
+        if (!s->record_f) {
+            warn_report("hisi-vi: cannot write the record '%s'", s->record);
+            g_free(s->record);
+            s->record = NULL;
+            return;
+        }
+        fprintf(s->record_f, "t,frame,light,light_r,light_b,lines,gain,"
+                "r,g,b,wb_r,wb_b,violations\n");
+    }
+    if (s->sensor && object_property_find(s->sensor, "violations")) {
+        violations = object_property_get_uint(s->sensor, "violations", NULL);
+    }
+    fprintf(s->record_f, "%.4f,%u,%.0f,%.0f,%.0f,%u,%.3f,%u,%u,%u,%.3f,%.3f,"
+            "%" PRIu64 "\n", s->scene_t, s->stat_frames, s->light,
+            s->tint[0] * 1000, s->tint[2] * 1000, s->frame_expo.lines,
+            s->frame_expo.gain / 1024.0, r, g, b, s->wb[0], s->wb[1],
+            violations);
+    fflush(s->record_f);
 }
 
 /* the mean of colour c over grid columns [x0, x1), rows [y0, y1) */
@@ -541,6 +586,8 @@ static void vi_be_stats(HisiViState *s)
                 p[BE_AWB_AVG / 4 + 1], p[BE_AWB_AVG / 4 + 2],
                 p[BE_WB_GAIN1 / 4] >> 16, p[BE_WB_GAIN2 / 4] >> 16);
     }
+    vi_record(s, p[BE_AWB_AVG / 4], p[BE_AWB_AVG / 4 + 1],
+              p[BE_AWB_AVG / 4 + 2]);
     s->stat_frames++;
 }
 
@@ -636,6 +683,9 @@ static void vi_be_stats_offline(HisiViState *s)
                 raw_mean(s, 1, 0, s->gw, 0, s->gh),
                 raw_mean(s, 2, 0, s->gw, 0, s->gh), strips);
     }
+    vi_record(s, raw_mean(s, 0, 0, s->gw, 0, s->gh),
+              raw_mean(s, 1, 0, s->gw, 0, s->gh),
+              raw_mean(s, 2, 0, s->gw, 0, s->gh));
     s->stat_frames++;
 }
 
@@ -832,6 +882,7 @@ static const Property hisi_vi_properties[] = {
     DEFINE_PROP_UINT32("fps", HisiViState, fps, 25),
     DEFINE_PROP_BOOL("trace", HisiViState, trace, false),
     DEFINE_PROP_BOOL("stats-trace", HisiViState, stats_trace, false),
+    DEFINE_PROP_STRING("record", HisiViState, record),
 };
 
 static void hisi_vi_class_init(ObjectClass *klass, const void *data)

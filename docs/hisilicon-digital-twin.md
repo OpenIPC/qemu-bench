@@ -233,6 +233,53 @@ Each step is one PR, landed before the next starts.
   (gk7205v200) and GC4653 (hi3516ev300) drivers break no rule. The test
   shows that a driver which does is caught.
 
+## Step 3 in detail
+
+- **Timeline** (`-global hisi-scene.timeline=FILE`, or `qom-set` at
+  runtime). One event per line, in seconds of the scene's clock, which
+  starts at the first frame the ISP measures (and again whenever a
+  timeline is loaded):
+
+  ```
+  20 light=150                           # a step
+  35..39 light-r=550->1000 light-b=700->400    # a ramp, a step a frame
+  50 file=/path/office.ppm               # any scene property
+  ```
+
+  Events apply at frame boundaries (`hisi_scene_frame_begin()`, called by
+  `hisi-vi` before it measures a frame), through the same property
+  setters as QMP.
+- **Record** (`-global hisi-vi.record=FILE`): a CSV line for each
+  measured frame. The columns are `t, frame, light, light_r, light_b,
+  lines, gain, r, g, b, wb_r, wb_b, violations`:
+  - the scene's clock and light;
+  - what the sensor applied;
+  - the statistics' raw means;
+  - the WB gains the driver programmed (0 offline, where they are in the
+    strips' images);
+  - the sensor's violation count.
+- **Metrics** (`qemu-boot/twin-metrics.py RECORD`): the segments come from
+  the record itself, a new one each time the light stops changing. For
+  each segment the tool reports:
+  - its steady G level;
+  - how long G takes to stay within `--tol` of it;
+  - the overshoot after that;
+  - the level against the first segment (does AE bring the picture back
+    to its target?);
+  - R and B × their gains against G at the end (how neutral AWB leaves a
+    grey).
+
+  It fails a segment (other than the first, which is boot) that does not
+  settle within `--settle-max` seconds, comes back more than `--tol` off,
+  or leaves white balance more than `--awb-tol` off.
+- **`qemu-boot/test-hisi-scenario.sh`** runs majestic through a default
+  scenario: a quarter of the light at 20 s, full at 35 s, a warmer light
+  (R 0.82 / B 0.52) at 50 s, stopping at 65 s. It runs in CI on
+  hi3516ev200. There, AE meets the quarter light with exactly 4x the exposure (61 to
+  244 rows), back at its level within 1 s; AWB moves its gains from
+  R x1.64 / B x1.52 to x1.23 / x1.89 over about 5 s, leaving a grey
+  within 2 %.
+
 ## Open questions
 
 - **Which camera to twin and validate first:** an EV300 or GK7205V200

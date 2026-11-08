@@ -22,6 +22,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiSceneState, HISI_SCENE)
  */
 const float *hisi_scene_grid(HisiSceneState *s, int w, int h);
 
+/*
+ * A frame begins (from the ISP, before it measures the scene): the
+ * timeline's events that are due apply.  Returns the timeline's clock,
+ * seconds since the first frame.
+ */
+double hisi_scene_frame_begin(HisiSceneState *s);
+
 /* The light: white's raw level a row at 1x gain, and its R / G / B tint */
 double hisi_scene_light(HisiSceneState *s, double tint[3]);
 
