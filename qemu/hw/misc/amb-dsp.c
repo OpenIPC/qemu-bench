@@ -175,6 +175,22 @@ struct dsp_status_msg {
 
 #define AMB_DSP_HZ 30
 
+/* Largest encode this stand-in will synthesise; a guest setup past it is
+ * rejected rather than turned into a multi-gigabyte host allocation. */
+#define ENC_MAX_DIM 4096
+
+/* Per-stream encode state, exactly as the setup command gave it.  Scalars
+ * only (the encoder scratch is local to amb_dsp_emit_frame), so it migrates. */
+typedef struct AmbDspStream {
+    uint32_t bits_base, bits_size;   /* the BSB: where the bitstream goes */
+    uint32_t info_base, info_size;   /* the BSH: enc_bits_info_t ring */
+    uint32_t bits_off;               /* rolling write offset within the BSB */
+    uint32_t frames;                 /* frames emitted (this stream's counter) */
+    uint16_t w, h;
+    uint8_t codec;                   /* AMB_CODEC_JPEG / _H264 */
+    uint8_t profile, level;          /* H.264 only */
+} AmbDspStream;
+
 struct AmbDspState {
     SysBusDevice parent_obj;
 
@@ -191,18 +207,9 @@ struct AmbDspState {
     uint32_t boot_ticks;        /* heartbeats since reset */
     bool mode_commanded;        /* set once the driver asks for a mode */
     uint32_t enc_streams;       /* bitmask of streams the driver has started */
-    uint32_t enc_frames;        /* total encoded frames (the bits-info counter) */
     char *dump_dir;             /* if set, each frame is kept as frame-N.jpg/.h264 */
 
-    /* Per-stream encode buffers, exactly as the setup command gave them. */
-    struct {
-        uint32_t bits_base, bits_size;   /* the BSB: where the bitstream goes */
-        uint32_t info_base, info_size;   /* the BSH: enc_bits_info_t ring */
-        uint32_t bits_off;               /* rolling write offset within the BSB */
-        uint16_t w, h;
-        uint8_t codec;                   /* AMB_CODEC_JPEG / _H264 */
-        uint8_t profile, level;          /* H.264 only */
-    } estr[8];
+    AmbDspStream estr[8];
 
     uint32_t last_seq[2];       /* last command seq seen per port (debug) */
     bool debug;
@@ -257,8 +264,12 @@ static uint32_t amb_dsp_service_port(AmbDspState *s, hwaddr cmd_port, int port)
                 s->last_seq[port], seq, num);
     }
 
-    /* Walk the iteration's commands for a set-operation-mode. */
-    for (uint32_t i = 0; i < num && i < DSP_PORT_SIZE / DSP_CMD_SIZE; i++) {
+    /*
+     * Walk the iteration's commands.  Command i sits at slot i + 1 (slot 0 is
+     * the port header), so i + 1 must stay below the port's slot count or the
+     * last read would spill into the next port.
+     */
+    for (uint32_t i = 0; i < num && i + 1 < DSP_PORT_SIZE / DSP_CMD_SIZE; i++) {
         hwaddr c = cmd_port + (i + 1) * DSP_CMD_SIZE;
         uint32_t code = amb_dsp_ld(c + CMD_HDR_CODE_OFF);
         if (fresh) {
@@ -432,12 +443,22 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
     uint32_t info_base = s->estr[sid].info_base, info_size = s->estr[sid].info_size;
     int w = s->estr[sid].w ? s->estr[sid].w : ENC_W;
     int h = s->estr[sid].h ? s->estr[sid].h : ENC_H;
+    uint32_t fn = s->estr[sid].frames;
     int pic_type;
     const char *ext;
 
     if (!s->estr[sid].codec || !bits_base || !info_base ||
         info_size < EBI_STEP || bits_size == 0) {
         return;     /* the driver has not told us where its buffers are yet */
+    }
+    if (w <= 0 || h <= 0 || w > ENC_MAX_DIM || h > ENC_MAX_DIM) {
+        return;     /* a resolution we will not allocate a host buffer for */
+    }
+    /* 4:2:0 subsampling and the SPS's 2-sample crop units both need even
+     * dimensions; the driver aligns to the encoder grid, so this only rejects
+     * a malformed setup rather than silently coding the wrong size. */
+    if (s->estr[sid].codec == AMB_CODEC_H264 && ((w | h) & 1)) {
+        return;
     }
 
     g_autoptr(GByteArray) bs = g_byte_array_new();
@@ -450,7 +471,7 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
         H264Enc e;
         int qp = 30;
 
-        amb_dsp_fill_luma(y, pw, pw, ph, s->enc_frames);
+        amb_dsp_fill_luma(y, pw, pw, ph, fn);
         for (int r = 0; r < ph / 2; r++) {        /* NV12 interleaved chroma */
             for (int c = 0; c < pw / 2; c++) {
                 int b = (2 * c) * 8 / pw;
@@ -467,6 +488,9 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
         g_autofree uint8_t *slice = g_malloc(cap);
         size_t n = h264_enc_frame(&e, true, qp, mbw, mbh, y, pw, uv, pw,
                                   slice, cap);
+        if (n > cap) {
+            return;     /* truncated slice: drop the frame rather than ship it */
+        }
         g_byte_array_append(bs, slice, n);
         pic_type = FRAME_TYPE_IDR;
         ext = "h264";
@@ -477,7 +501,7 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
         g_autofree uint8_t *cr = g_malloc((size_t)cw * ch);
         bool overflow;
 
-        amb_dsp_fill_luma(y, w, w, h, s->enc_frames);
+        amb_dsp_fill_luma(y, w, w, h, fn);
         for (int r = 0; r < ch; r++) {
             for (int c = 0; c < cw; c++) {
                 int b = (2 * c) * 8 / w;
@@ -486,10 +510,16 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
             }
         }
         jpeg_enc_header(bs, w, h, amb_dsp_ql, amb_dsp_qc);
-        size_t cap = (size_t)w * h;
+        /* Baseline entropy coding can expand a pathological block past the
+         * pixel count; size for that and bail if the encoder still overflows,
+         * rather than publishing a truncated scan with no EOI. */
+        size_t cap = (size_t)w * h * 2 + 1024;
         g_autofree uint8_t *scan = g_malloc(cap);
         size_t n = jpeg_enc_scan(y, w, cb, cr, cw, w, h, amb_dsp_ql, amb_dsp_qc,
                                  true, scan, cap, &overflow);
+        if (overflow) {
+            return;
+        }
         g_byte_array_append(bs, scan, n);
         pic_type = FRAME_TYPE_JPG;
         ext = "jpg";
@@ -497,6 +527,12 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
 
     uint32_t len = bs->len;
     uint32_t info_ents = info_size / EBI_STEP;
+
+    /* A frame that cannot fit the BSB at all would have its DMA write run off
+     * the end of the driver's buffer; drop it instead. */
+    if (len > bits_size) {
+        return;
+    }
 
     /* Place the bitstream in the BSB ring the driver gave us, 32B-aligned. */
     if (s->estr[sid].bits_off + len > bits_size) {
@@ -511,21 +547,24 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
     uint32_t e[EBI_STEP / 4] = { 0 };
     e[EBI_W_ID]       = cpu_to_le32((sid & 0xff) | (JPEG_QUALITY << 8));
     e[EBI_W_PICTYPE]  = cpu_to_le32(pic_type);
-    e[EBI_W_FRAMENUM] = cpu_to_le32(s->enc_frames);
-    e[EBI_W_PTS]      = cpu_to_le32(s->enc_frames);   /* 1 tick/frame is fine */
+    e[EBI_W_FRAMENUM] = cpu_to_le32(fn);
+    e[EBI_W_PTS]      = cpu_to_le32(fn);   /* 1 tick/frame is fine */
     e[EBI_W_START]    = cpu_to_le32((uint32_t)addr);
     e[EBI_W_SIZE]     = cpu_to_le32(len & 0xffffff);
+    /* 64-bit arithmetic so a ring index near the 4 GiB mark cannot wrap the
+     * descriptor write down into low guest RAM; info_base + info_size was the
+     * driver's own allocation, and the index stays inside it. */
     dma_memory_write(&address_space_memory,
-                     info_base + (s->enc_frames % info_ents) * EBI_STEP, e,
-                     sizeof(e), MEMTXATTRS_UNSPECIFIED);
+                     (hwaddr)info_base + (uint64_t)(fn % info_ents) * EBI_STEP,
+                     e, sizeof(e), MEMTXATTRS_UNSPECIFIED);
 
     if (s->dump_dir) {
-        g_autofree char *path = g_strdup_printf("%s/frame-%05u.%s",
-                                                s->dump_dir, s->enc_frames, ext);
+        g_autofree char *path = g_strdup_printf("%s/frame-s%u-%05u.%s",
+                                                s->dump_dir, sid, fn, ext);
         g_file_set_contents(path, (const char *)bs->data, bs->len, NULL);
     }
 
-    s->enc_frames++;
+    s->estr[sid].frames++;
 }
 
 static void amb_dsp_tick(void *opaque)
@@ -601,8 +640,10 @@ static void amb_dsp_tick(void *opaque)
     for (uint32_t sid = 0; sid < 8; sid++) {
         if (s->enc_streams & (1u << sid)) {
             amb_dsp_emit_frame(s, sid);
+            /* The per-codec counter iav diffs must count only this stream's
+             * frames; emit_frame advanced estr[sid].frames iff it shipped one. */
             amb_dsp_post_enc(msg, enc_msgs, sid, s->estr[sid].codec,
-                             s->enc_frames);
+                             s->estr[sid].frames);
             enc_msgs++;
         }
     }
@@ -630,7 +671,6 @@ static void amb_dsp_reset(DeviceState *dev)
     s->boot_ticks = 0;
     s->mode_commanded = false;
     s->enc_streams = 0;
-    s->enc_frames = 0;
     memset(s->estr, 0, sizeof(s->estr));
     s->last_seq[0] = s->last_seq[1] = 0;
     timer_mod(&s->heartbeat,
@@ -671,6 +711,26 @@ static const Property amb_dsp_props[] = {
     DEFINE_PROP_STRING("dump-dir", AmbDspState, dump_dir),
 };
 
+static const VMStateDescription vmstate_amb_dsp_stream = {
+    .name = "amb-dsp/stream",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(bits_base, AmbDspStream),
+        VMSTATE_UINT32(bits_size, AmbDspStream),
+        VMSTATE_UINT32(info_base, AmbDspStream),
+        VMSTATE_UINT32(info_size, AmbDspStream),
+        VMSTATE_UINT32(bits_off, AmbDspStream),
+        VMSTATE_UINT32(frames, AmbDspStream),
+        VMSTATE_UINT16(w, AmbDspStream),
+        VMSTATE_UINT16(h, AmbDspStream),
+        VMSTATE_UINT8(codec, AmbDspStream),
+        VMSTATE_UINT8(profile, AmbDspStream),
+        VMSTATE_UINT8(level, AmbDspStream),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_amb_dsp = {
     .name = "amb-dsp",
     .version_id = 1,
@@ -679,6 +739,12 @@ static const VMStateDescription vmstate_amb_dsp = {
         VMSTATE_TIMER(heartbeat, AmbDspState),
         VMSTATE_BOOL(chip_written, AmbDspState),
         VMSTATE_UINT32(op_mode, AmbDspState),
+        VMSTATE_UINT32(boot_ticks, AmbDspState),
+        VMSTATE_BOOL(mode_commanded, AmbDspState),
+        VMSTATE_UINT32(enc_streams, AmbDspState),
+        VMSTATE_UINT32_ARRAY(last_seq, AmbDspState, 2),
+        VMSTATE_STRUCT_ARRAY(estr, AmbDspState, 8, 1, vmstate_amb_dsp_stream,
+                             AmbDspStream),
         VMSTATE_END_OF_LIST()
     },
 };
