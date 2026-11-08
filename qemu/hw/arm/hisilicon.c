@@ -5881,11 +5881,24 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_connect_irq(busdev, 1, pic[c->jpge_irq]);
     }
 
+    /*
+     * The scene in front of the camera (docs/hisilicon-digital-twin.md):
+     * what VI's statistics measure and VPSS's pictures show.
+     */
+    DeviceState *scene = NULL;
+    if (c->vi_cap_base) {
+        scene = qdev_new("hisi-scene");
+        object_property_add_child(OBJECT(machine), "scene", OBJECT(scene));
+        qdev_realize_and_unref(scene, NULL, &error_fatal);
+    }
+
     /* VI: capture and the ISP pipe, the online pipeline's frame clock */
     DeviceState *vi = NULL;
     if (c->vi_cap_base) {
         vi = qdev_new("hisi-vi");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vi);
+        object_property_set_link(OBJECT(vi), "scene", OBJECT(scene),
+                                 &error_fatal);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->vi_cap_base);
         sysbus_mmio_map(busdev, 1, c->vi_proc_base);
@@ -5897,6 +5910,10 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vpss_base) {
         DeviceState *vpss = qdev_new("hisi-vpss");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vpss);
+        if (scene) {
+            object_property_set_link(OBJECT(vpss), "scene", OBJECT(scene),
+                                     &error_fatal);
+        }
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->vpss_base);
         sysbus_connect_irq(busdev, 0, pic[c->vpss_irq]);

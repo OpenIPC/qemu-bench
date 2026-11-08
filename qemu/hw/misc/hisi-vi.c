@@ -56,13 +56,16 @@
  * every frame (ISP_DRV_FE_SwitchSttAddr), zone means at 0x10210 / 0x10218,
  * and AE1 globals at 0x22818..0x2282c laid out as the backend's.
  *
- * The scene is the one hisi-vpss paints, eight grey bars, as raw Bayer
- * under a light of R 0.55, G 1, B 0.7 ("light-r" / "light-b", per mille
- * of G).  How bright it comes out follows the sensor's exposure and gain
+ * The statistics measure the scene in front of the camera ("scene" link,
+ * hisi-scene: a picture or grey bars, and the light) as raw Bayer on a
+ * grid of an eighth of the window.  How bright it comes out follows the
+ * sensor's exposure and gain
  * (the image-sensor interface, "sensor" link) one frame late, as a sensor
  * applies what was written during the frame before; without a model of
  * them, white is half scale.  So auto exposure converges on an exposure
- * time, and auto white balance on gains that neutralise the light.
+ * time, and auto white balance on gains that neutralise the light.  Each
+ * frame VI hands the scene the level and the white balance gains, which
+ * hisi-vpss paints the picture with.
  *
  * Offline the pipe's strips write their statistics themselves, one block
  * each at the address in their VIPROC register image (see
@@ -103,6 +106,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/i2c/image-sensor.h"
+#include "hw/misc/hisi-scene.h"
 #include "system/dma.h"
 
 #define TYPE_HISI_VI "hisi-vi"
@@ -144,6 +148,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define BE_AWB_AVG          0x22140     /* R, G, B, count */
 #define PROC_PNEXT          0x02f8      /* offline: the pipe's node list */
 #define PROC_STT_OFFLINE    0x05d0      /* offline: the strip's STT block */
+#define PROC_BE_CFG         0x0240      /* offline: the strip's BE registers */
+#define BE_WB_GAIN1         0x21210     /* R << 16 | Gr */
+#define BE_WB_GAIN2         0x21214     /* B << 16 | Gb */
 #define PROC_NODE_MAX       4           /* strips */
 #define FE_STT_AE_HIST      0x10208     /* VI_CAP, pipe 0's channel */
 #define FE_STT_AE_RGR       0x10210
@@ -156,7 +163,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define AE_BINS             1024
 #define AE_ZONES_MAX        (17 * 15)
 #define AWB_ZONES_MAX       (32 * 32)
-#define SCENE_BARS          8
 
 struct HisiViState {
     SysBusDevice parent_obj;
@@ -175,11 +181,13 @@ struct HisiViState {
     bool trace;
     bool stats_trace;           /* a line of what AE / AWB see, each second */
     Object *sensor;             /* what the statistics measure */
-    uint32_t light;             /* white, 16-bit units a row at 1x */
-    uint32_t light_r, light_b;  /* its colour: R, B per mille of G */
+    HisiSceneState *scene;      /* what is in front of the camera */
     ImageSensorExposure expo;   /* applied this frame (written the last) */
     ImageSensorExposure frame_expo;     /* what the current frame had */
     double level;               /* the current frame's white, 16-bit */
+    uint16_t *raw;              /* the frame on the grid, R / G / B */
+    double tint[3];             /* the light it was captured under */
+    int gw, gh;
     uint32_t stat_frames;
 };
 
@@ -212,41 +220,6 @@ static bool vi_running(HisiViState *s)
 }
 
 
-/*
- * The scene, in 16-bit raw: SCENE_BARS vertical grey bars (hisi-vpss's,
- * light to dark) under a light whose raw response is R 0.55, G 1, B 0.7
- * of white, times the exposure, clipped.
- */
-static const uint8_t scene_y[SCENE_BARS] = { 235, 210, 170, 145, 106, 81, 41, 16 };
-/* the light's raw response, R and B per mille of G */
-static uint32_t scene_light_r = 550, scene_light_b = 700;
-
-static double scene_level(int bar, int c, double expo)
-{
-    double refl = MAX(scene_y[bar] - 16, 6) / 219.0;
-    double tint = c == 0 ? scene_light_r / 1000.0 :
-                  c == 2 ? scene_light_b / 1000.0 : 1.0;
-
-    return MIN(refl * tint * expo, 65535.0);
-}
-
-/* the mean of colour c over [x0, x1) of the width (0..1), bars clipped */
-static double scene_mean(int c, double x0, double x1, double expo)
-{
-    double sum = 0;
-    int b;
-
-    for (b = 0; b < SCENE_BARS; b++) {
-        double l = MAX(x0, (double)b / SCENE_BARS);
-        double r = MIN(x1, (double)(b + 1) / SCENE_BARS);
-
-        if (r > l) {
-            sum += (r - l) * scene_level(b, c, expo);
-        }
-    }
-    return x1 > x0 ? sum / (x1 - x0) : 0;
-}
-
 static void stt_write(uint32_t addr, const void *buf, size_t len)
 {
     dma_memory_write(&address_space_memory, addr, buf, len,
@@ -254,34 +227,136 @@ static void stt_write(uint32_t addr, const void *buf, size_t len)
 }
 
 /*
- * A captured frame: the exposure it had, which is what the sensor was
- * told during the frame before (a sensor applies its registers at the
- * next frame start).
+ * The frame as the sensor delivers it, measured on a grid of an eighth of
+ * its window each way (hisi-scene's reflectance times the light, the
+ * exposure and the gain, clipped at 16 bits).  A grid pixel stands for
+ * 8 x 8 sensor pixels: 4 of the AE's samples (every 4th row and column),
+ * each of them four Bayer samples, R, Gr, Gb, B.
+ */
+#define GRID_DIV            8
+#define GRID_SAMPLES        4
+
+/*
+ * A captured frame: the exposure it had is what the sensor was told during
+ * the frame before (a sensor applies its registers at the next frame start).
  */
 static void vi_scene_frame(HisiViState *s)
 {
     ImageSensorExposure now = { 0 };
+    double tint[3], light = 600;
+    const float *refl;
+    int i, c;
 
-    scene_light_r = s->light_r;
-    scene_light_b = s->light_b;
-
+    tint[0] = 0.55;
+    tint[1] = 1.0;
+    tint[2] = 0.7;
+    if (s->scene) {
+        light = hisi_scene_light(s->scene, tint);
+    }
     if (s->sensor && image_sensor_exposure(s->sensor, &now)) {
         s->frame_expo = s->expo;
-        s->level = (double)s->expo.lines * s->expo.gain / 1024 * s->light;
+        s->level = (double)s->expo.lines * s->expo.gain / 1024 * light;
         s->expo = now;
     } else {
         memset(&s->frame_expo, 0, sizeof(s->frame_expo));
         s->level = 65535.0 / 2;     /* no sensor model: white at half */
     }
+
+    s->gw = MAX((s->frame_expo.width ? s->frame_expo.width : 1920) /
+                GRID_DIV, 1);
+    s->gh = MAX((s->frame_expo.height ? s->frame_expo.height : 1080) /
+                GRID_DIV, 1);
+    s->raw = g_renew(uint16_t, s->raw, (size_t)s->gw * s->gh * 3);
+    if (s->scene) {
+        refl = hisi_scene_grid(s->scene, s->gw, s->gh);
+        for (i = 0; i < s->gw * s->gh; i++) {
+            for (c = 0; c < 3; c++) {
+                s->raw[i * 3 + c] = MIN(refl[i * 3 + c] * tint[c] * s->level,
+                                        65535.0);
+            }
+        }
+    } else {
+        for (i = 0; i < s->gw * s->gh * 3; i++) {
+            s->raw[i] = MIN(s->level / 2 * tint[i % 3], 65535.0);
+        }
+    }
+    memcpy(s->tint, tint, sizeof(s->tint));
+    if (s->scene && !s->offline) {
+        /* the white balance the driver programmed: ISP_WB_GAIN1 / 2, R and
+         * B in the high halves (offline: vi_offline_wb()) */
+        hisi_scene_set_frame(s->scene, s->level, s->tint,
+                             (s->proc[BE_WB_GAIN1 / 4] >> 16) / 256.0,
+                             (s->proc[BE_WB_GAIN2 / 4] >> 16) / 256.0);
+    }
 }
 
-/* every 4th row and column (the AE skip), all four Bayer samples */
-static uint32_t scene_samples(HisiViState *s)
+/*
+ * Offline, when the driver starts the pipe on a frame: its white balance
+ * gains are in the strips' backend register images, the block at each
+ * VIPROC node's 0x240 laid out from ISP_BE_REG_BASE (ISP_WB_GAIN1 / 2 at
+ * +0x1210 / +0x1214), not in the MMIO registers.
+ */
+static void vi_offline_wb(HisiViState *s)
 {
-    const uint32_t w = s->frame_expo.width ? s->frame_expo.width : 1920;
-    const uint32_t h = s->frame_expo.height ? s->frame_expo.height : 1080;
+    uint32_t node[PROC_BE_CFG / 4 + 1], gain[2] = { 0, 0 };
 
-    return (w / 4) * (h / 4);
+    if (!s->scene) {
+        return;
+    }
+    if (s->proc[PROC_PNEXT / 4]) {
+        dma_memory_read(&address_space_memory, s->proc[PROC_PNEXT / 4], node,
+                        sizeof(node), MEMTXATTRS_UNSPECIFIED);
+        if (node[PROC_BE_CFG / 4]) {
+            dma_memory_read(&address_space_memory,
+                            node[PROC_BE_CFG / 4] + BE_WB_GAIN1 - 0x20000,
+                            gain, sizeof(gain), MEMTXATTRS_UNSPECIFIED);
+        }
+    }
+    hisi_scene_set_frame(s->scene, s->level, s->tint,
+                         (le32_to_cpu(gain[0]) >> 16) / 256.0,
+                         (le32_to_cpu(gain[1]) >> 16) / 256.0);
+}
+
+/* the mean of colour c over grid columns [x0, x1), rows [y0, y1) */
+static uint32_t raw_mean(HisiViState *s, int c, int x0, int x1, int y0,
+                         int y1)
+{
+    uint64_t sum = 0;
+    int x, y;
+
+    x1 = MAX(x1, x0 + 1);
+    y1 = MAX(y1, y0 + 1);
+    for (y = y0; y < y1; y++) {
+        for (x = x0; x < x1; x++) {
+            sum += s->raw[((size_t)y * s->gw + x) * 3 + c];
+        }
+    }
+    return sum / ((uint64_t)(x1 - x0) * (y1 - y0));
+}
+
+/* zone z of n across d grid pixels: [*z0, return) */
+static int zone_span(int z, int n, int d, int *z0)
+{
+    *z0 = MIN((int64_t)z * d / n, d - 1);
+    return MAX((int64_t)(z + 1) * d / n, *z0 + 1);
+}
+
+/* the AE histogram of grid columns [x0, x1), bins of 65536 / nbins */
+static void raw_hist(HisiViState *s, uint32_t *hist, int nbins, int x0,
+                     int x1)
+{
+    const int shift = nbins == FE_AE_BINS ? 8 : 6;
+    int x, y;
+
+    for (y = 0; y < s->gh; y++) {
+        for (x = x0; x < x1; x++) {
+            const uint16_t *p = s->raw + ((size_t)y * s->gw + x) * 3;
+
+            hist[p[0] >> shift] += GRID_SAMPLES;
+            hist[p[1] >> shift] += 2 * GRID_SAMPLES;
+            hist[p[2] >> shift] += GRID_SAMPLES;
+        }
+    }
 }
 
 /*
@@ -292,119 +367,149 @@ static uint32_t scene_samples(HisiViState *s)
  */
 static uint32_t scene_awb_count(HisiViState *s, int zones)
 {
-    const uint32_t w = s->frame_expo.width ? s->frame_expo.width : 1920;
-    const uint32_t h = s->frame_expo.height ? s->frame_expo.height : 1080;
-
-    return MIN(w * h / MAX(zones, 1), 0xffff);
+    return MIN((uint64_t)s->gw * s->gh * GRID_DIV * GRID_DIV /
+               MAX(zones, 1), 0xffff);
 }
 
-/* AE zone means, R << 16 | Gr and Gb << 16 | B, row by row */
-static void scene_ae_zones(HisiViState *s, uint32_t zone, uint32_t rgr_addr,
-                           uint32_t gbb_addr)
+/*
+ * AE zone means, R << 16 | Gr and Gb << 16 | B, row by row: zone columns
+ * [cx0, cx0 + width) of nx across the picture, into rows of width
+ */
+static void scene_ae_zones(HisiViState *s, int nx, int ny, int cx0,
+                           int width, uint32_t *rgr, uint32_t *gbb)
 {
-    uint32_t rgr[AE_ZONES_MAX], gbb[AE_ZONES_MAX];
-    int nx = MAX(MIN(zone & 0x1f, 17), 1);
-    int ny = MAX(MIN((zone >> 8) & 0x1f, 15), 1);
     int x, y;
 
-    for (x = 0; x < nx; x++) {
-        const double x0 = (double)x / nx, x1 = (double)(x + 1) / nx;
-        const uint32_t r = scene_mean(0, x0, x1, s->level);
-        const uint32_t g = scene_mean(1, x0, x1, s->level);
-        const uint32_t b = scene_mean(2, x0, x1, s->level);
+    for (y = 0; y < ny; y++) {
+        int y0, y1 = zone_span(y, ny, s->gh, &y0);
 
-        for (y = 0; y < ny; y++) {
-            rgr[y * nx + x] = cpu_to_le32(r << 16 | g);
-            gbb[y * nx + x] = cpu_to_le32(g << 16 | b);
+        for (x = 0; x < width; x++) {
+            int x0, x1 = zone_span(cx0 + x, nx, s->gw, &x0);
+            const uint32_t r = raw_mean(s, 0, x0, x1, y0, y1);
+            const uint32_t g = raw_mean(s, 1, x0, x1, y0, y1);
+            const uint32_t b = raw_mean(s, 2, x0, x1, y0, y1);
+
+            rgr[y * width + x] = cpu_to_le32(r << 16 | g);
+            gbb[y * width + x] = cpu_to_le32(g << 16 | b);
         }
     }
-    if (rgr_addr) {
-        stt_write(rgr_addr, rgr, nx * ny * 4);
-    }
-    if (gbb_addr) {
-        stt_write(gbb_addr, gbb, nx * ny * 4);
-    }
 }
 
-/* an AE histogram of the Bayer samples, bins of 65536 / nbins */
-static void scene_ae_hist(HisiViState *s, uint32_t addr, int nbins)
+/* AWB zones, G << 16 | R and count << 16 | B, as scene_ae_zones() */
+static void scene_awb_zones(HisiViState *s, int nx, int ny, int cx0,
+                            int width, uint32_t *awb)
 {
-    uint32_t hist[AE_BINS] = { 0 };
-    const uint32_t n = scene_samples(s) / SCENE_BARS;
-    const int shift = nbins == FE_AE_BINS ? 8 : 6;
-    int b;
+    const uint32_t n = scene_awb_count(s, nx * ny);
+    int x, y;
 
-    for (b = 0; b < SCENE_BARS; b++) {
-        hist[(int)scene_level(b, 0, s->level) >> shift] += n;
-        hist[(int)scene_level(b, 1, s->level) >> shift] += 2 * n;
-        hist[(int)scene_level(b, 2, s->level) >> shift] += n;
+    for (y = 0; y < ny; y++) {
+        int y0, y1 = zone_span(y, ny, s->gh, &y0);
+
+        for (x = 0; x < width; x++) {
+            int x0, x1 = zone_span(cx0 + x, nx, s->gw, &x0);
+            const uint32_t r = raw_mean(s, 0, x0, x1, y0, y1);
+            const uint32_t g = raw_mean(s, 1, x0, x1, y0, y1);
+            const uint32_t b = raw_mean(s, 2, x0, x1, y0, y1);
+
+            awb[(y * width + x) * 2] = cpu_to_le32(g << 16 | r);
+            awb[(y * width + x) * 2 + 1] = cpu_to_le32(n << 16 | b);
+        }
     }
-    for (b = 0; b < nbins; b++) {
-        hist[b] = cpu_to_le32(hist[b]);
-    }
-    stt_write(addr, hist, nbins * 4);
 }
 
-/* AE global: pixels total / counted, then R, Gr, Gb, B means */
-static void scene_ae_global(HisiViState *s, uint32_t *regs)
+/* AE global over grid columns [x0, x1): pixels total / counted, R, Gr,
+ * Gb, B means */
+static void scene_ae_global(HisiViState *s, uint32_t *regs, int x0, int x1)
 {
     int c;
 
-    /* every pixel counted; the total's field is the narrower (27 bits) */
-    regs[0] = MIN(scene_samples(s) * 4, 0x7ffffff);
+    regs[0] = MIN((uint64_t)(x1 - x0) * s->gh * GRID_SAMPLES * 4, 0x7ffffff);
     regs[1] = regs[0];
     for (c = 0; c < 4; c++) {
-        regs[2 + c] = scene_mean(c == 0 ? 0 : c == 3 ? 2 : 1, 0, 1, s->level);
+        regs[2 + c] = raw_mean(s, c == 0 ? 0 : c == 3 ? 2 : 1, x0, x1, 0,
+                               s->gh);
     }
+}
+
+static void ae_grid(uint32_t zone, int *nx, int *ny)
+{
+    *nx = MAX(MIN(zone & 0x1f, 17), 1);
+    *ny = MAX(MIN((zone >> 8) & 0x1f, 15), 1);
+}
+
+static void awb_grid(uint32_t zone, int *nx, int *ny)
+{
+    *nx = MAX(MIN(zone & 0x3f, 32), 1);
+    *ny = MAX(MIN((zone >> 8) & 0x3f, 32), 1);
 }
 
 /* the front end's statistics of the frame captured now */
 static void vi_fe_stats(HisiViState *s)
 {
     uint32_t *p = s->cap;
+    uint32_t rgr[AE_ZONES_MAX], gbb[AE_ZONES_MAX];
+    int nx, ny;
 
     if (p[FE_STT_AE_HIST / 4]) {
-        scene_ae_hist(s, p[FE_STT_AE_HIST / 4], FE_AE_BINS);
+        uint32_t hist[FE_AE_BINS] = { 0 };
+        int b;
+
+        raw_hist(s, hist, FE_AE_BINS, 0, s->gw);
+        for (b = 0; b < FE_AE_BINS; b++) {
+            hist[b] = cpu_to_le32(hist[b]);
+        }
+        stt_write(p[FE_STT_AE_HIST / 4], hist, sizeof(hist));
     }
-    scene_ae_zones(s, p[FE_AE_ZONE / 4], p[FE_STT_AE_RGR / 4],
-                   p[FE_STT_AE_GBB / 4]);
-    scene_ae_global(s, p + FE_AE_TOTAL / 4);
+    ae_grid(p[FE_AE_ZONE / 4], &nx, &ny);
+    scene_ae_zones(s, nx, ny, 0, nx, rgr, gbb);
+    if (p[FE_STT_AE_RGR / 4]) {
+        stt_write(p[FE_STT_AE_RGR / 4], rgr, nx * ny * 4);
+    }
+    if (p[FE_STT_AE_GBB / 4]) {
+        stt_write(p[FE_STT_AE_GBB / 4], gbb, nx * ny * 4);
+    }
+    scene_ae_global(s, p + FE_AE_TOTAL / 4, 0, s->gw);
 }
 
 /* the backend's statistics of the frame the pipe finishes now */
 static void vi_be_stats(HisiViState *s)
 {
     uint32_t *p = s->proc;
-    int awx = MAX(MIN(p[BE_AWB_ZONE / 4] & 0x3f, 32), 1);
-    int awy = MAX(MIN((p[BE_AWB_ZONE / 4] >> 8) & 0x3f, 32), 1);
-    int c, x, y;
+    uint32_t rgr[AE_ZONES_MAX], gbb[AE_ZONES_MAX];
+    int nx, ny, awx, awy, c;
+
+    if (!s->raw) {
+        return;                     /* no frame captured yet */
+    }
 
     if (p[STT_AE_HIST / 4]) {
-        scene_ae_hist(s, p[STT_AE_HIST / 4], AE_BINS);
+        uint32_t hist[AE_BINS] = { 0 };
+        int b;
+
+        raw_hist(s, hist, AE_BINS, 0, s->gw);
+        for (b = 0; b < AE_BINS; b++) {
+            hist[b] = cpu_to_le32(hist[b]);
+        }
+        stt_write(p[STT_AE_HIST / 4], hist, sizeof(hist));
     }
-    scene_ae_zones(s, p[BE_AE_ZONE / 4], p[STT_AE_RGR / 4],
-                   p[STT_AE_GBB / 4]);
-    scene_ae_global(s, p + BE_AE_TOTAL / 4);
+    ae_grid(p[BE_AE_ZONE / 4], &nx, &ny);
+    scene_ae_zones(s, nx, ny, 0, nx, rgr, gbb);
+    if (p[STT_AE_RGR / 4]) {
+        stt_write(p[STT_AE_RGR / 4], rgr, nx * ny * 4);
+    }
+    if (p[STT_AE_GBB / 4]) {
+        stt_write(p[STT_AE_GBB / 4], gbb, nx * ny * 4);
+    }
+    scene_ae_global(s, p + BE_AE_TOTAL / 4, 0, s->gw);
+    awb_grid(p[BE_AWB_ZONE / 4], &awx, &awy);
     if (p[STT_AWB / 4]) {
         uint32_t awb[AWB_ZONES_MAX * 2];
-        const uint32_t n = scene_awb_count(s, awx * awy);
 
-        for (x = 0; x < awx; x++) {
-            uint32_t m[3];
-
-            for (c = 0; c < 3; c++) {
-                m[c] = scene_mean(c, (double)x / awx, (double)(x + 1) / awx,
-                                  s->level);
-            }
-            for (y = 0; y < awy; y++) {
-                awb[(y * awx + x) * 2] = cpu_to_le32(m[1] << 16 | m[0]);
-                awb[(y * awx + x) * 2 + 1] = cpu_to_le32(n << 16 | m[2]);
-            }
-        }
+        scene_awb_zones(s, awx, awy, 0, awx, awb);
         stt_write(p[STT_AWB / 4], awb, awx * awy * 8);
     }
     for (c = 0; c < 3; c++) {
-        p[BE_AWB_AVG / 4 + c] = scene_mean(c, 0, 1, s->level);
+        p[BE_AWB_AVG / 4 + c] = raw_mean(s, c, 0, s->gw, 0, s->gh);
     }
     p[BE_AWB_AVG / 4 + 3] = scene_awb_count(s, awx * awy);
 
@@ -414,7 +519,7 @@ static void vi_be_stats(HisiViState *s)
                 "WB gains R %#x B %#x\n", s->frame_expo.lines,
                 s->frame_expo.gain / 1024.0, p[BE_AWB_AVG / 4],
                 p[BE_AWB_AVG / 4 + 1], p[BE_AWB_AVG / 4 + 2],
-                p[0x21210 / 4] >> 16, p[0x21214 / 4] >> 16);
+                p[BE_WB_GAIN1 / 4] >> 16, p[BE_WB_GAIN2 / 4] >> 16);
     }
     s->stat_frames++;
 }
@@ -455,16 +560,16 @@ static void vi_be_stats_offline(HisiViState *s)
                                                   : 0xf11;
     const uint32_t awz = s->proc[BE_AWB_ZONE / 4] ? s->proc[BE_AWB_ZONE / 4]
                                                    : 0x2020;
-    const int aex = MAX(MIN(aez & 0x1f, 17), 1);
-    const int aey = MAX(MIN((aez >> 8) & 0x1f, 15), 1);
-    const int awx = MAX(MIN(awz & 0x3f, 32), 1);
-    const int awy = MAX(MIN((awz >> 8) & 0x3f, 32), 1);
-    const uint32_t count = scene_awb_count(s, awx * awy);
-    uint32_t stt[AWB_ZONES_MAX], node[PROC_STT_OFFLINE / 4 + 1];
+    uint32_t stt[PROC_NODE_MAX], node[PROC_STT_OFFLINE / 4 + 1];
     g_autofree uint32_t *blk = g_malloc(OFF_STT_SIZE);
     uint32_t a = s->proc[PROC_PNEXT / 4];
-    int strips = 0, k, b, c, x, y;
+    int aex, aey, awx, awy, strips = 0, k, b, c;
 
+    if (!s->raw) {
+        return;                     /* the pipe ran before any capture */
+    }
+    ae_grid(aez, &aex, &aey);
+    awb_grid(awz, &awx, &awy);
     for (k = 0; k < PROC_NODE_MAX && a; k++) {
         dma_memory_read(&address_space_memory, a, node, sizeof(node),
                         MEMTXATTRS_UNSPECIFIED);
@@ -473,63 +578,31 @@ static void vi_be_stats_offline(HisiViState *s)
         strips++;
     }
     for (k = 0; k < strips; k++) {
-        int ae0, aw0;
+        int ae0, aw0, gx0, gx1;
         const int aew = strip_cols(aex, strips, k, &ae0);
         const int aww = strip_cols(awx, strips, k, &aw0);
-        const double x0 = (double)aw0 / awx, x1 = (double)(aw0 + aww) / awx;
-        const uint32_t n = scene_samples(s) * aww / awx;
-        uint32_t *hist = blk + OFF_AE_HIST / 4;
 
         if (!stt[k]) {
             continue;
         }
+        /* the strip's grid columns: its share of the AWB zones */
+        gx0 = (int64_t)aw0 * s->gw / awx;
+        gx1 = MAX((int64_t)(aw0 + aww) * s->gw / awx, gx0 + 1);
         memset(blk, 0, OFF_STT_SIZE);
-        blk[0] = MIN(n * 4, 0x7ffffff);
-        blk[1] = blk[0];
-        for (c = 0; c < 4; c++) {
-            blk[2 + c] = scene_mean(c == 0 ? 0 : c == 3 ? 2 : 1, x0, x1,
-                                    s->level);
-        }
-        /* the histogram counts this strip's share of every bar */
-        for (b = 0; b < SCENE_BARS; b++) {
-            const double l = MAX(x0, (double)b / SCENE_BARS);
-            const double r = MIN(x1, (double)(b + 1) / SCENE_BARS);
-            const uint32_t m = r > l ? scene_samples(s) * (r - l) : 0;
-
-            hist[(int)scene_level(b, 0, s->level) >> 6] += m;
-            hist[(int)scene_level(b, 1, s->level) >> 6] += 2 * m;
-            hist[(int)scene_level(b, 2, s->level) >> 6] += m;
-        }
-        for (x = 0; x < aew; x++) {
-            const double z0 = (double)(ae0 + x) / aex;
-            const double z1 = (double)(ae0 + x + 1) / aex;
-            const uint32_t r = scene_mean(0, z0, z1, s->level);
-            const uint32_t g = scene_mean(1, z0, z1, s->level);
-            const uint32_t bl = scene_mean(2, z0, z1, s->level);
-
-            for (y = 0; y < aey; y++) {
-                blk[OFF_AE_RGR / 4 + y * aew + x] = r << 16 | g;
-                blk[OFF_AE_GBB / 4 + y * aew + x] = g << 16 | bl;
-            }
-        }
+        scene_ae_global(s, blk + OFF_AE_GLOBAL / 4, gx0, gx1);
+        raw_hist(s, blk + OFF_AE_HIST / 4, AE_BINS, gx0, gx1);
+        scene_ae_zones(s, aex, aey, ae0, aew, blk + OFF_AE_RGR / 4,
+                       blk + OFF_AE_GBB / 4);
         for (c = 0; c < 3; c++) {
-            blk[OFF_AWB_GLOBAL / 4 + c] = scene_mean(c, x0, x1, s->level);
+            blk[OFF_AWB_GLOBAL / 4 + c] = raw_mean(s, c, gx0, gx1, 0, s->gh);
         }
-        blk[OFF_AWB_GLOBAL / 4 + 3] = count;
-        for (x = 0; x < aww; x++) {
-            const double z0 = (double)(aw0 + x) / awx;
-            const double z1 = (double)(aw0 + x + 1) / awx;
-            const uint32_t r = scene_mean(0, z0, z1, s->level);
-            const uint32_t g = scene_mean(1, z0, z1, s->level);
-            const uint32_t bl = scene_mean(2, z0, z1, s->level);
-
-            for (y = 0; y < awy; y++) {
-                blk[OFF_AWB_ZONES / 4 + (y * aww + x) * 2] = g << 16 | r;
-                blk[OFF_AWB_ZONES / 4 + (y * aww + x) * 2 + 1] =
-                    count << 16 | bl;
-            }
+        blk[OFF_AWB_GLOBAL / 4 + 3] = scene_awb_count(s, awx * awy);
+        scene_awb_zones(s, awx, awy, aw0, aww, blk + OFF_AWB_ZONES / 4);
+        /* the zone writers stored little-endian already */
+        for (b = 0; b < OFF_AE_RGR / 4; b++) {
+            blk[b] = cpu_to_le32(blk[b]);
         }
-        for (b = 0; b < OFF_STT_SIZE / 4; b++) {
+        for (b = OFF_AWB_GLOBAL / 4; b < OFF_AWB_ZONES / 4; b++) {
             blk[b] = cpu_to_le32(blk[b]);
         }
         stt_write(stt[k], blk, OFF_STT_SIZE);
@@ -539,9 +612,9 @@ static void vi_be_stats_offline(HisiViState *s)
         fprintf(stderr, "isp stats: %u rows x%.2f gain, R %u G mean %u B %u, "
                 "offline, %d strips\n", s->frame_expo.lines,
                 s->frame_expo.gain / 1024.0,
-                (uint32_t)scene_mean(0, 0, 1, s->level),
-                (uint32_t)scene_mean(1, 0, 1, s->level),
-                (uint32_t)scene_mean(2, 0, 1, s->level), strips);
+                raw_mean(s, 0, 0, s->gw, 0, s->gh),
+                raw_mean(s, 1, 0, s->gw, 0, s->gh),
+                raw_mean(s, 2, 0, s->gw, 0, s->gh), strips);
     }
     s->stat_frames++;
 }
@@ -664,6 +737,7 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
          * the pipe's interrupt.
          */
         s->offline = true;
+        vi_offline_wb(s);
         qemu_irq_pulse(s->frame_out);
         timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   NANOSECONDS_PER_SECOND / 4 / MAX(s->fps, 1));
@@ -710,6 +784,10 @@ static void hisi_vi_init(Object *obj)
     object_property_add_link(obj, "sensor", TYPE_DEVICE, &s->sensor,
                              object_property_allow_set_link,
                              OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "scene", TYPE_HISI_SCENE,
+                             (Object **)&s->scene,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static void hisi_vi_reset(DeviceState *dev)
@@ -734,9 +812,6 @@ static const Property hisi_vi_properties[] = {
     DEFINE_PROP_UINT32("fps", HisiViState, fps, 25),
     DEFINE_PROP_BOOL("trace", HisiViState, trace, false),
     DEFINE_PROP_BOOL("stats-trace", HisiViState, stats_trace, false),
-    DEFINE_PROP_UINT32("light", HisiViState, light, 600),
-    DEFINE_PROP_UINT32("light-r", HisiViState, light_r, 550),
-    DEFINE_PROP_UINT32("light-b", HisiViState, light_b, 700),
 };
 
 static void hisi_vi_class_init(ObjectClass *klass, const void *data)

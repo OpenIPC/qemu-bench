@@ -7,15 +7,22 @@ front end's interrupt its per-frame work runs from (ISP_ISR).
 No sensor here, so the scene's white is half scale (65535 / 2): eight grey
 bars under a light of R 0.55, G 1, B 0.7, the brightest bar white.
 
+The scene (hisi-scene) can be a picture and its light can change while
+the machine runs (QMP qom-set /machine/scene ...).
+
 Offline, the pipe's strips each write a block at the address in their
 VIPROC register image (VI_HAL_SetIspSttAddr, 0x5d0).
 
     python3 qemu/tests/test-hisi-isp.py [--qemu PATH] [--machine M]
 """
 import argparse
+import json
 import os
+import socket
 import struct
 import sys
+import tempfile
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(__file__))
@@ -137,6 +144,74 @@ def main():
     ae1_ref = words(STT1 + 0x101c, 1)[0]            # row 0, column 9
     check(ae1 == ae1_ref and words(STT0 + 0x1c, 1)[0] == 0,
           'offline: AE zones row by row at the strip\'s width')
+    q.close()
+
+    # the scene (hisi-scene): a picture instead of the bars, and the light
+    # changed over QMP while the machine runs
+    tmp = tempfile.mkdtemp()
+    ppm = os.path.join(tmp, 'half.ppm')
+    with open(ppm, 'wb') as f:                      # white left, black right
+        f.write(b'P6\n64 36\n255\n' +
+                (b'\xff' * 96 + b'\x00' * 96) * 36)
+    qmp_path = os.path.join(tmp, 'qmp.sock')
+    q = QTest(a.qemu, a.machine, ('-global', 'hisi-scene.file=' + ppm,
+                                  '-qmp', 'unix:%s,server=on,wait=off' %
+                                  qmp_path))
+    qmp = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            qmp.connect(qmp_path)
+            break
+        except OSError:
+            time.sleep(0.1)
+    qf = qmp.makefile('rw')
+    qf.readline()                                   # the greeting
+
+    def qmp_cmd(cmd, **args):
+        qf.write(json.dumps({'execute': cmd, 'arguments': args}) + '\n')
+        qf.flush()
+        while True:
+            r = json.loads(qf.readline())
+            if 'return' in r or 'error' in r:
+                return r
+    qmp_cmd('qmp_capabilities')
+
+    def frame():
+        q.writel(VI_PROC + 0x680, BE_STT + 0x2800)
+        q.writel(VI_PROC + 0x22110, 0x2020)
+        q.writel(VI_CAP + 0x10000, 1 << 31)
+        q.writel(VPSS + 0x000, 1 << 31)
+        q.writel(VPSS + 0x0f0, 0x7401)
+        q.cmd('clock_step %d' % FRAME_NS)
+        z0 = words(BE_STT + 0x2800, 2)
+        z31 = words(BE_STT + 0x2800 + 31 * 8, 2)
+        return z0, z31
+
+    z0, z31 = frame()
+    check(z0[0] >> 16 == G and z31[0] >> 16 < 64,
+          'scene file: white on the left (G %d), black on the right (G %d)'
+          % (z0[0] >> 16, z31[0] >> 16))
+    r = qmp_cmd('qom-set', path='/machine/scene', property='light-r',
+                value=1000)
+    z0, _ = frame()
+    check('return' in r and z0[0] & 0xffff == G,
+          'qom-set light-r 1000: the white zone\'s R follows (%d)' %
+          (z0[0] & 0xffff))
+    r = qmp_cmd('qom-get', path='/machine/scene', property='file')
+    check(r.get('return') == ppm, 'qom-get file: %s' % r.get('return'))
+    # broken files are refused and leave the scene as it was: a header
+    # that ends at the end of the file, a huge picture with no pixels
+    for name, data in (('eof.ppm', b'P6\n64 36\n255'),
+                       ('huge.ppm', b'P6\n8192 8192\n255\n')):
+        bad = os.path.join(tmp, name)
+        with open(bad, 'wb') as f:
+            f.write(data)
+        r = qmp_cmd('qom-set', path='/machine/scene', property='file',
+                    value=bad)
+        z0, _ = frame()
+        check('error' in r and z0[0] >> 16 == G,
+              'scene file %s refused, the picture kept' % name)
+    qmp.close()
     q.close()
 
     print('%d failure(s)' % fails)
