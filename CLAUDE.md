@@ -673,9 +673,13 @@ in this order:
   frames overtake the driver on a slow host. `hisi-vi` also writes the
   ISP's statistics (front-end AE histogram, backend AE histogram, zones
   and AWB, the STT layouts in openhisilicon's `isp_stt_define.h`). They
-  come from a grey-bar scene lit by the sensor's exposure × gain
-  (`image-sensor`, one frame late; `hisi-vi.light*` properties), so AE
-  and AWB converge. An AWB zone's count is every pixel of the zone:
+  come from the scene in front of the camera, `hisi-scene` at
+  `/machine/scene` (`docs/hisilicon-digital-twin.md`): grey bars by
+  default, or `-global hisi-scene.file=` a PPM / PFM picture. It is lit
+  by `light` / `light-r` / `light-b` (settable at runtime with QMP
+  `qom-set`) times the sensor's exposure × gain (`image-sensor`, one
+  frame late), so AE and AWB converge. VPSS paints the same scene through
+  the frame's exposure, WB gains and gamma. An AWB zone's count is every pixel of the zone:
   lib_hiawb leaves its gains alone unless the zones' average count passes
   1024. Offline, each strip's VIPROC node (0x2f8 chain) has its own
   statistics block (S_ISP_STT_REGS_TYPE) at the address in its 0x5d0.

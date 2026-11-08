@@ -8,8 +8,9 @@
  * it hands the frame VPSS has just written to the bound modules (VENC)
  * and programs the next frame's buffers, latched by REGUP.  This model
  * produces the frames: on every frame of VI's (the "vi-frame" GPIO, from
- * hisi-vi) it paints a test picture into every enabled channel's buffers
- * and raises frame start and end.
+ * hisi-vi) it paints the scene in front of the camera (hisi-scene, as the
+ * ISP renders it with the frame's exposure and white balance) into every
+ * enabled channel's buffers and raises frame start and end.
  *
  *   0x0000  CTRL      bit 31 online video enable (VPSS_HAL_OnLineVideoEn)
  *   0x0010  REGUP     writing bit 0 has VPSS's next frame take the
@@ -61,6 +62,7 @@
 #include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "hw/misc/hisi-scene.h"
 
 #define TYPE_HISI_VPSS "hisi-vpss"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssState, HISI_VPSS)
@@ -113,6 +115,7 @@ struct HisiVpssState {
     uint32_t frame;
     uint32_t fps;               /* VI's frame rate */
     bool trace;
+    HisiSceneState *scene;      /* what the pictures show */
 };
 
 static void vpss_update_irq(HisiVpssState *s)
@@ -128,37 +131,45 @@ static bool vpss_running(HisiVpssState *s)
 }
 
 /*
- * The test picture, NV21: vertical bars that move 8 pixels a frame, the
- * frame number as 16 binary squares along the top.  Rows of luma are
- * written while they fit before the chroma plane (a compressed channel's
- * buffer is smaller than a linear picture).
+ * The picture, NV21: the scene (hisi-scene) as the ISP renders it with
+ * the frame's exposure and white balance, and the frame number as 16
+ * binary squares along the top twelfth (the stream checks read it).  Rows
+ * of luma are written while they fit before the chroma plane (a
+ * compressed channel's buffer is smaller than a linear picture).
  */
-static void vpss_paint(uint32_t ya, uint32_t ca, int stride, int w, int h,
-                       uint32_t n, bool half)
+static void vpss_paint(HisiVpssState *s, uint32_t ya, uint32_t ca,
+                       int stride, int w, int h, uint32_t n, bool half)
 {
-    static const uint8_t bar_y[8] = { 235, 210, 170, 145, 106, 81, 41, 16 };
-    const int bw = MAX(w / 8, 1), sq = MAX(w / 16, 1), step = half ? 2 : 1;
-    g_autofree uint8_t *line = g_malloc(MAX(stride, w));
+    const int sq = MAX(w / 16, 1), step = half ? 2 : 1;
+    const float *grid = s->scene ? hisi_scene_grid(s->scene, w, h) : NULL;
+    g_autofree uint8_t *line = g_malloc(MAX(stride, w) + 1);
+    g_autofree uint8_t *vu = g_malloc(w + 2);
     int r, x;
 
     for (r = 0; r < h; r += step) {
-        for (x = 0; x < w; x++) {
-            line[x] = r < h / 12 ? ((n >> (15 - MIN(x / sq, 15))) & 1 ? 235 : 16)
-                                 : bar_y[((x + n * 8) / bw) % 8];
+        if (r < h / 12) {
+            for (x = 0; x < w; x++) {
+                line[x] = (n >> (15 - MIN(x / sq, 15))) & 1 ? 235 : 16;
+            }
+        } else if (grid) {
+            hisi_scene_display_row(s->scene, grid + (size_t)r * w * 3, w,
+                                   line, NULL);
+        } else {
+            memset(line, 126, w);
         }
         dma_memory_write(&address_space_memory,
                          ya + (uint64_t)(r / step) * stride, line, w,
                          MEMTXATTRS_UNSPECIFIED);
     }
     for (r = 0; r < h / 2; r += step) {
-        for (x = 0; x < w / 2; x++) {
-            const int b = ((x * 2 + n * 8) / bw) % 8;
-
-            line[x * 2] = b & 1 ? 188 : 68;         /* V */
-            line[x * 2 + 1] = b & 2 ? 188 : 68;     /* U */
+        if (2 * r < h / 12 || !grid) {
+            memset(vu, 128, w & ~1);
+        } else {
+            hisi_scene_display_row(s->scene, grid + (size_t)2 * r * w * 3,
+                                   w & ~1, line, vu);
         }
         dma_memory_write(&address_space_memory,
-                         ca + (uint64_t)(r / step) * stride, line, w & ~1,
+                         ca + (uint64_t)(r / step) * stride, vu, w & ~1,
                          MEMTXATTRS_UNSPECIFIED);
     }
 }
@@ -252,7 +263,7 @@ static void vpss_frame(void *opaque)
     }
     for (c = 0; c < VPSS_CHN; c++) {
         if (out[c].w && out[c].stride >= out[c].w) {
-            vpss_paint(out[c].ya, out[c].ca, out[c].stride, out[c].w,
+            vpss_paint(s, out[c].ya, out[c].ca, out[c].stride, out[c].w,
                        out[c].h, s->frame, out[c].cmp);
         }
     }
@@ -357,6 +368,10 @@ static void hisi_vpss_init(Object *obj)
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vpss_frame, s);
     qdev_init_gpio_in_named(DEVICE(obj), vpss_vi_frame, "vi-frame", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->running, "running", 1);
+    object_property_add_link(obj, "scene", TYPE_HISI_SCENE,
+                             (Object **)&s->scene,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static void hisi_vpss_reset(DeviceState *dev)

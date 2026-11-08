@@ -152,9 +152,9 @@ VPSS-online serves a wider one: EV300's 5 MP IMX335 and the 4 MP GC4653
 (see "Offline" below).
 
 - **The sensor's frames never exist.** VI (`hisi-vi`) is the frame clock.
-  VPSS (`hisi-vpss`) paints a test picture into each channel's buffers:
-  moving bars, and the frame number as 16 binary squares across the top
-  twelfth.
+  VPSS (`hisi-vpss`) paints the scene in front of the camera (`hisi-scene`,
+  see "ISP statistics") into each channel's buffers, and the frame number
+  as 16 binary squares across the top twelfth.
 - **The contract** comes from `hi_vi.o` and `hi_vpss.o`, in particular
   `VI_COMM_CapOnLineFrameEarlyEndIrqRoute`, `VI_COMM_ProcIrqRoute`,
   `VPSS_COMM_OnLineIrqProc` and the `VPSS_HAL_*` setters.
@@ -256,14 +256,27 @@ bash qemu-boot/test-hisi-sample-venc.sh --sdk <Hi3516EV200_SDK_V1.0.1.2>   # the
 ## ISP statistics
 
 The ISP's 3A algorithms (`lib_hiae`, `lib_hiawb`) measure each frame
-through statistics the ISP hardware writes. `hisi-vi` renders a scene and
-writes those statistics, so auto exposure has something to measure:
+through statistics the ISP hardware writes. `hisi-vi` measures the scene
+in front of the camera (`hisi-scene`, `docs/hisilicon-digital-twin.md`)
+and writes those statistics, so AE and AWB have something to measure:
 
-- **The scene** is eight grey bars, as in hisi-vpss's picture, as raw
-  Bayer under a light whose response is R 0.55, G 1, B 0.7
-  (`-global hisi-vi.light-r=` / `light-b=`, per mille of G).
-- **Brightness** is white × rows × gain, clipped to 16 bits. White is
-  `-global hisi-vi.light=` (default 600 per row at ×1).
+- **The scene** is `/machine/scene`:
+  - by default eight grey bars, white to black;
+  - or a picture, `-global hisi-scene.file=` with a binary PPM (sRGB)
+    or a PFM (linear, HDR);
+  - under a light whose response is R 0.55, G 1, B 0.7
+    (`light-r` / `light-b`, per mille of G).
+- **Brightness** is reflectance × white × rows × gain, clipped to 16 bits.
+  White is `light` (default 600 per row at ×1).
+- **Runtime changes:** every scene property can change while the guest
+  runs, e.g. `qom-set /machine/scene light-r 1000` over QMP.
+- **Resolution:** `hisi-vi` measures the scene on a grid of an eighth of
+  the sensor's window each way. Each grid pixel stands for 8 × 8 sensor
+  pixels, i.e. 4 AE samples. The histograms, zones and globals are sums
+  over it.
+- **The picture:** VPSS paints the same scene into its channels as the ISP
+  would render it: the frame's exposure, the driver's WB gains, gamma
+  1/2.2, BT.601. The encoded stream therefore shows AE and AWB at work.
 - **Exposure and gain** come from the sensor through the `image-sensor`
   interface, one frame late, as a sensor applies registers written during
   the previous frame.
