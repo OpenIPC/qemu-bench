@@ -84,6 +84,9 @@ bash qemu/tests/test-hisi-rtc.sh
 bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
+python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpeg-checked
+python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wide sensors)
+python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
@@ -326,7 +329,7 @@ FIFOs keep samples behind the 16 they report; the Longse app captures
 only with sysenv.cfg byte 0x98C set. The FTAES020 is `fh-aes` with
 `advance=on` (addresses move on between chunks).
 
-SigmaStar/MStar infinity2m, Ifado and infinity3 (`hw/arm/sigmastar.c`,
+SigmaStar/MStar infinity2m, Ifado, infinity3, Iford and infinity6* (`hw/arm/sigmastar.c`,
 `docs/sigmastar.md`) are a fourth: Cortex-A7 parts whose blocks sit in
 16-bit RIU register banks at `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
 at +1). `sstar-riu` is mapped under every model as storage plus the status
@@ -634,6 +637,48 @@ in this order:
   `sensor-addr=`; `xm-sensor` is a generic register-file sensor whose ID comes
   from `-global xm-sensor.regs=` (`docs/xiongmai.md`). The SSI `imx122` stays
   in `hisilicon_common_init()`.
+- **Video encoding (V4: EV200/EV300/18EV300/16DV200, GK7205V200 family)** is
+  `hisi-vedu` (`docs/hisilicon-venc.md`). The HiMPP driver writes only a few
+  VEDU MMIO registers per picture; the rest is a register image in DDR at
+  VEDU+0x58 that the engine fetches at START. Output goes into a per-channel
+  stream ring of 64-byte-header packets the driver itself parses (type,
+  last-slice / slice-type byte, channel id -- it panics on a wrong one --
+  PTS); the driver writes the SPS/PPS/VPS/SEI and JFIF header packets, the
+  model appends the slice or scan and moves the ring's write-pointer cell.
+  H.264 slice headers are the model's own, H.265 ones the driver's bits from
+  the image (0x404-0x42c). JPGE is plain MMIO, quantisers as 2^23/q
+  reciprocals. Completion is on a virtual-time timer, never inside START.
+  `-global hisi-vedu.dump-dir=DIR` keeps each channel's stream,
+  `trace=on` logs every access and the image at START.
+  `qemu-boot/test-hisi-venc.sh` runs the vendor stack (`VENC_SendFrame`, no
+  VI) under the OpenIPC release; its guest program needs a 32-bit-`off_t`
+  `mmap()` shim, because the release's MPI libraries are uClibc builds.
+  In front of it on the EV200-class machines (Goke rebrands too), `hisi-vi` (the
+  frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
+  start / end) and `hisi-vpss` (paints its channels, then frame start +
+  end) run the online pipeline, so majestic and the SDK's own
+  `sample_venc` stream from `sensor=sc2315e` (Goke releases have no SC2315E
+  config in `/etc/sensors`: use `sensor=sc2335` there)
+  (`test-hisi-majestic.sh`, `test-hisi-sample-venc.sh --sdk`). VI runs only
+  while VPSS's online video is enabled: an interrupt for a pipe that does
+  not exist oopses the driver (or while pipe 0's write channel is on,
+  which also starts the clock in offline mode). A sensor wider than 2304
+  (`sensor=imx335`, `gc4653` on hi3516ev300) runs VI offline: the driver
+  starts the pipe per frame (VI_PROC 0x300), and VPSS, armed by its 0x304,
+  loads the node list at its 0x2f8 then (register images in DDR, one per
+  vertical strip; the model paints the strips' widths as one picture) and
+  raises no interrupt. VEDU's source stride is image 0x1f4, not 0x160
+  (the 64-aligned reference stride). Compressed VPSS channels use a private
+  half-height stand-in shared with `hisi-vedu`. Use `-icount shift=0`, or
+  frames overtake the driver on a slow host. `hisi-vi` also writes the
+  ISP's statistics (front-end AE histogram, backend AE histogram, zones
+  and AWB, the STT layouts in openhisilicon's `isp_stt_define.h`). They
+  come from a grey-bar scene lit by the sensor's exposure × gain
+  (`image-sensor`, one frame late; `hisi-vi.light*` properties), so AE
+  converges. The ISP driver's per-frame work runs on the front end's
+  FSTART / FEND (VI_CAP 0x200f0, SPI 43, shared with capture), and a
+  port status (0x10f0) with error bits set makes it skip the frame.
+  `-global hisi-vi.stats-trace=on` prints what AE / AWB see.
 
 ## Adding a SoC or a device
 

@@ -47,7 +47,20 @@
  * start raises one; a scan larger than the buffer is cut at its end and
  * raises buffer full instead of frame done.
  *
- * The source is read from DRAM; when its MIU address is outside DRAM
+ * The infinity6 family drives the same engine (mhal.ko _EncFire, _IsrFunc)
+ * with the interrupt mask at 0x22 ("i6-irq"); 0x1D and 0x1E stay.  infinity6
+ * proper keeps it at 0x1C ("mask-1c": ssc325's mhal.ko writes only that).
+ *
+ * infinity6e's driver also keeps a 256-byte block it clears per picture and
+ * sets at 0x52 (low) and 0x53 [10:0] (high) in 16-byte units, 0x53 bit 15
+ * on.  Its _IsrFunc() and _EncDone() call it the dump: a picture counts as
+ * finished once the low 9 bits of the word at +4 are non-zero, and on the
+ * buffer full path those same bits being zero name the picture in progress,
+ * so it is written at frame done only.  Word +8 is the start and +12 the
+ * last byte's word, both in 4-byte units, and +7 [1:0] the byte index.
+ *
+ * The source is read from DRAM, or for a scaler's ring taken from the scaler
+ * (sstar_i6e_scl_ring()), since a ring holds a few lines; when its MIU address is outside DRAM
  * (0x5F bit 14, the IMI path from the scaler) it is the test pattern of
  * sstar-pattern.h.
  *
@@ -65,6 +78,8 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/misc/sstar-jpeg.h"
+#include "hw/misc/sstar-riu.h"
+#include "hw/misc/sstar-i6e-scl.h"
 #include "aw-vinc-logo.h"
 #include "hw/misc/sstar-pattern.h"
 #include "migration/vmstate.h"
@@ -85,6 +100,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarI3JpeState, SSTAR_I3_JPE)
 #define R_IRQ_MASK          0x1C
 #define R_IRQ_CLR           0x1D
 #define R_IRQ_STATUS        0x1E
+#define R_IRQ_MASK_I6       0x22
 #define R_OBUF_CTRL         0x3B
 #define R_OBUF_LO           0x3C
 #define R_OBUF_HI           0x3D
@@ -96,6 +112,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarI3JpeState, SSTAR_I3_JPE)
 #define R_TBC_CTRL          0x49
 #define R_TBC_WDATA         0x4A
 #define R_TBC_RDATA         0x4B
+#define R_DUMP_LO           0x52
+#define R_DUMP_HI           0x53
 #define R_PITCH             0x5E
 #define R_YUVLDR            0x5F
 
@@ -110,6 +128,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarI3JpeState, SSTAR_I3_JPE)
 #define TBC_RW              (1u << 0)
 #define TBC_DONE_CLR        (1u << 1)
 #define TBC_DONE            (1u << 2)
+#define DUMP_EN             (1u << 15)
+#define DUMP_HI_MASK        0x7FF
 #define YUVLDR_SWAP         (1u << 15)
 #define IRQ_FRAME_DONE      (1u << 0)
 #define IRQ_OBUF0_FULL      (1u << 1)
@@ -132,21 +152,68 @@ struct SstarI3JpeState {
     uint32_t frames;
     uint64_t dram_size;
     bool trace;
+    bool i6_irq;
+    bool mask_1c;               /* infinity6: the mask stays at 0x1C */
+    uint16_t fired[4];          /* the source, as the frame was started */
 };
+
+/* infinity6 itself keeps infinity3's mask; its successors moved it */
+static int jpe_mask_reg(SstarI3JpeState *s)
+{
+    return s->i6_irq && !s->mask_1c ? R_IRQ_MASK_I6 : R_IRQ_MASK;
+}
 
 static void jpe_update(SstarI3JpeState *s)
 {
-    qemu_set_irq(s->irq, !!(s->raw & ~s->regs[R_IRQ_MASK] & 0xFF));
+    qemu_set_irq(s->irq, !!(s->raw & ~s->regs[jpe_mask_reg(s)] & 0xFF));
+}
+
+/* The high half of a 4-byte-unit address: wider on infinity6 */
+static uint32_t jpe_hi_mask(SstarI3JpeState *s)
+{
+    return s->i6_irq ? 0x3FFF : 0x7FF;
 }
 
 static uint32_t jpe_addr(SstarI3JpeState *s, int reg)
 {
-    return (s->regs[reg] | (uint32_t)(s->regs[reg + 1] & 0x1F) << 16) << 8;
+    return (s->regs[reg] |
+            (uint32_t)(s->regs[reg + 1] & (s->i6_irq ? 0xFF : 0x1F)) << 16) << 8;
+}
+
+/* DRAM through the MIU's MMU, a page at a time, where the die has one */
+static void jpe_mem(SstarI3JpeState *s, uint32_t miu, void *buf, size_t len,
+                    bool write)
+{
+    uint8_t *p = buf;
+
+    while (len) {
+        size_t n = MIN(len, 4096 - (miu & 4095));
+        hwaddr a = DRAM_BASE + (s->i6_irq ? sstar_miu_xlate(miu) : miu);
+
+        if (write) {
+            address_space_write(&address_space_memory, a,
+                                MEMTXATTRS_UNSPECIFIED, p, n);
+        } else {
+            address_space_read(&address_space_memory, a,
+                               MEMTXATTRS_UNSPECIFIED, p, n);
+        }
+        miu += n;
+        p += n;
+        len -= n;
+    }
 }
 
 static bool jpe_in_dram(SstarI3JpeState *s, uint32_t miu, uint64_t len)
 {
-    return (uint64_t)miu + len <= s->dram_size;
+    uint64_t last = (uint64_t)miu + MAX(len, 1) - 1;
+
+    if (!s->i6_irq) {
+        return (uint64_t)miu + len <= s->dram_size;
+    }
+    /* through the MIU MMU, so past dram_size can still be DRAM */
+    return !sstar_miu_missed(miu) && !sstar_miu_missed(last) &&
+           sstar_miu_xlate(miu) < s->dram_size &&
+           sstar_miu_xlate(last) < s->dram_size;
 }
 
 /*
@@ -184,6 +251,24 @@ static void jpe_load(SstarI3JpeState *s, JpePic *pic, int w, int h,
         ypitch *= 2;                /* YUYV: two bytes a pixel */
     }
 
+    if (s->i6_irq && !yuv422 && w >= 2) {
+        g_autofree uint8_t *ry = g_malloc((size_t)w * h);
+        g_autofree uint8_t *ruv = g_malloc((size_t)w * (h / 2));
+
+        if (sstar_i6e_scl_ring(ya, w, h, ry, ruv) ||
+            sstar_iford_scl_ring(ya, w, h, ry, ruv)) {
+            memcpy(pic->p[0], ry, (size_t)w * h);
+            for (y = 0; y < h / 2; y++) {
+                for (x = 0; x < pic->cw; x++) {
+                    int o = y * w + 2 * MIN(x, w / 2 - 1);
+
+                    pic->p[1][y * pic->cw + x] = ruv[o + (swap ? 1 : 0)];
+                    pic->p[2][y * pic->cw + x] = ruv[o + (swap ? 0 : 1)];
+                }
+            }
+            return;
+        }
+    }
     if (!jpe_in_dram(s, ya, (uint64_t)ypitch * h) ||
         (!yuv422 && !jpe_in_dram(s, ca, (uint64_t)cpitch * h / 2))) {
         /* fed through IMI by the scaler: the picture it would carry */
@@ -207,9 +292,7 @@ static void jpe_load(SstarI3JpeState *s, JpePic *pic, int w, int h,
         g_autofree uint8_t *line = g_malloc(MAX(ypitch, cpitch));
 
         for (y = 0; y < h; y++) {
-            address_space_read(&address_space_memory,
-                               DRAM_BASE + ya + (hwaddr)ypitch * y,
-                               MEMTXATTRS_UNSPECIFIED, line, ypitch);
+            jpe_mem(s, ya + ypitch * y, line, ypitch, false);
             if (yuv422) {
                 for (x = 0; x < w; x++) {
                     pic->p[0][y * w + x] = line[2 * MIN(x, ypitch / 2 - 1)];
@@ -227,9 +310,7 @@ static void jpe_load(SstarI3JpeState *s, JpePic *pic, int w, int h,
             }
         }
         for (y = 0; !yuv422 && y < pic->ch; y++) {
-            address_space_read(&address_space_memory,
-                               DRAM_BASE + ca + (hwaddr)cpitch * y,
-                               MEMTXATTRS_UNSPECIFIED, line, cpitch);
+            jpe_mem(s, ca + cpitch * y, line, cpitch, false);
             for (x = 0; x < pic->cw; x++) {
                 int o = 2 * MIN((uint32_t)x, cpitch / 2 - 1);
 
@@ -307,6 +388,23 @@ static size_t jpe_scan(SstarI3JpeState *s, const JpePic *pic, bool yuv422,
     return o.len;
 }
 
+/* The record infinity6e reads the finished picture from */
+static void jpe_dump(SstarI3JpeState *s, uint32_t s0, uint32_t last)
+{
+    uint32_t miu = (uint32_t)(s->regs[R_DUMP_HI] & DUMP_HI_MASK) << 20 |
+                   (uint32_t)s->regs[R_DUMP_LO] << 4;
+    uint32_t rec[4] = {
+        0,
+        cpu_to_le32(IRQ_FRAME_DONE | (last & 3) << 24),
+        cpu_to_le32(s0 >> 2),
+        cpu_to_le32(last >> 2),
+    };
+
+    if ((s->regs[R_DUMP_HI] & DUMP_EN) && jpe_in_dram(s, miu, sizeof(rec))) {
+        jpe_mem(s, miu, rec, sizeof(rec), true);
+    }
+}
+
 static void jpe_encode(void *opaque)
 {
     SstarI3JpeState *s = opaque;
@@ -317,6 +415,10 @@ static void jpe_encode(void *opaque)
     uint32_t last;
     bool full = true;
 
+    s->regs[R_Y0_LO] = s->fired[0];
+    s->regs[R_Y0_LO + 1] = s->fired[1];
+    s->regs[R_C0_LO] = s->fired[2];
+    s->regs[R_C0_LO + 1] = s->fired[3];
     cap = MIN(cap, OUT_MAX);
     if (w && h && cap) {
         g_autofree uint8_t *buf = g_malloc(cap);
@@ -328,8 +430,7 @@ static void jpe_encode(void *opaque)
         g_free(pic.p[1]);
         g_free(pic.p[2]);
         if (jpe_in_dram(s, s0, len)) {
-            address_space_write(&address_space_memory, DRAM_BASE + s0,
-                                MEMTXATTRS_UNSPECIFIED, buf, len);
+            jpe_mem(s, s0, buf, len, true);
         }
     } else {
         qemu_log_mask(LOG_GUEST_ERROR, "sstar-i3-jpe: picture %dx%d, "
@@ -339,8 +440,11 @@ static void jpe_encode(void *opaque)
     /* the last byte written: wptr in words and its index in the word */
     last = s0 + MAX(len, 1) - 1;
     s->regs[R_WPTR_LO] = (last >> 2) & 0xFFFF;
-    s->regs[R_WPTR_HI] = (last >> 18) & 0x7FF;
+    s->regs[R_WPTR_HI] = (last >> 18) & jpe_hi_mask(s);
     s->regs[R_BYTE_IDX] = (s->regs[R_BYTE_IDX] & ~3) | (last & 3);
+    if (!full) {
+        jpe_dump(s, s0, last);
+    }
     s->raw |= full ? IRQ_OBUF0_FULL : IRQ_FRAME_DONE;
     if (s->trace) {
         qemu_log("sstar-i3-jpe: %dx%d %s src 0x%x, %zu bytes at 0x%x%s\n",
@@ -362,7 +466,7 @@ static uint64_t jpe_read(void *opaque, hwaddr off, unsigned size)
     }
     switch (reg) {
     case R_IRQ_STATUS:
-        v = s->raw & ~s->regs[R_IRQ_MASK] & 0xFF;
+        v = s->raw & ~s->regs[jpe_mask_reg(s)] & 0xFF;
         break;
     case R_WPTR_LO:
     case R_WPTR_HI:
@@ -370,7 +474,7 @@ static uint64_t jpe_read(void *opaque, hwaddr off, unsigned size)
         if (s->regs[R_OBUF_CTRL] & OBUF_RCHK_EN) {
             uint32_t a = s->obuf[(s->regs[R_OBUF_CTRL] >> 11) & 3] >> 2;
 
-            v = reg == R_WPTR_LO ? a & 0xFFFF : (a >> 16) & 0x7FF;
+            v = reg == R_WPTR_LO ? a & 0xFFFF : (a >> 16) & jpe_hi_mask(s);
         }
         break;
     }
@@ -393,13 +497,26 @@ static void jpe_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         v = off & 1 ? (s->regs[reg] & 0x00FF) | ((val & 0xFF) << 8)
                     : (s->regs[reg] & 0xFF00) | (val & 0xFF);
     }
+    if (s->trace) {
+        qemu_log("sstar-i3-jpe: W %02x = %04x\n", reg, v);
+    }
     switch (reg) {
     case R_CTRL:
         if (!(v & CTRL_RSTZ)) {
-            /* soft reset: drops a start not yet done (the stale one) */
-            timer_del(s->timer);
-            s->raw = 0;
+            /*
+             * soft reset: drops a start not yet done (the stale one).  With
+             * a ring source infinity6e's driver resets just after the start
+             * it means, its address registers scribbled: the frame stands.
+             */
+            if (!(s->i6_irq && timer_pending(s->timer))) {
+                timer_del(s->timer);
+                s->raw = 0;
+            }
         } else if (v & CTRL_START) {
+            s->fired[0] = s->regs[R_Y0_LO];
+            s->fired[1] = s->regs[R_Y0_LO + 1];
+            s->fired[2] = s->regs[R_C0_LO];
+            s->fired[3] = s->regs[R_C0_LO + 1];
             timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       ENCODE_NS);
         }
@@ -423,7 +540,7 @@ static void jpe_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             int id = s->regs[R_OBUF_HI] >> 14;
 
             s->obuf[id] = (s->regs[R_OBUF_LO] |
-                           (uint32_t)(s->regs[R_OBUF_HI] & 0x7FF) << 16) << 2;
+                           (uint32_t)(s->regs[R_OBUF_HI] & jpe_hi_mask(s)) << 16) << 2;
         }
         v = 0;
         break;
@@ -468,7 +585,7 @@ static void sstar_i3_jpe_reset(DeviceState *dev)
     memset(s->qtab, 0, sizeof(s->qtab));
     memset(s->obuf, 0, sizeof(s->obuf));
     s->regs[R_CTRL] = CTRL_RSTZ;
-    s->regs[R_IRQ_MASK] = 0xFF;
+    s->regs[jpe_mask_reg(s)] = 0xFF;
     s->raw = 0;
     timer_del(s->timer);
     qemu_set_irq(s->irq, 0);
@@ -488,12 +605,14 @@ static void sstar_i3_jpe_init(Object *obj)
 static const Property sstar_i3_jpe_props[] = {
     DEFINE_PROP_UINT64("dram-size", SstarI3JpeState, dram_size, 64 * MiB),
     DEFINE_PROP_BOOL("trace", SstarI3JpeState, trace, false),
+    DEFINE_PROP_BOOL("mask-1c", SstarI3JpeState, mask_1c, false),
+    DEFINE_PROP_BOOL("i6-irq", SstarI3JpeState, i6_irq, false),
 };
 
 static const VMStateDescription vmstate_sstar_i3_jpe = {
     .name = TYPE_SSTAR_I3_JPE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, SstarI3JpeState, JPE_REGS),
         VMSTATE_UINT8(raw, SstarI3JpeState),
@@ -501,6 +620,7 @@ static const VMStateDescription vmstate_sstar_i3_jpe = {
         VMSTATE_UINT32_ARRAY(obuf, SstarI3JpeState, 4),
         VMSTATE_UINT32(frames, SstarI3JpeState),
         VMSTATE_TIMER_PTR(timer, SstarI3JpeState),
+        VMSTATE_UINT16_ARRAY(fired, SstarI3JpeState, 4),
         VMSTATE_END_OF_LIST()
     }
 };

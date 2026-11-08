@@ -116,6 +116,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordIspState, SSTAR_IFORD_ISP)
 #define HISTO_BINS          128
 
 /* before the driver has configured the grids */
+#define ISP_AE_GRID         32
 #define ISP_DEF_W           2560
 #define ISP_DEF_H           1440
 #define ISP_MAX_DIM         8192
@@ -172,6 +173,8 @@ struct SstarIfordIspState {
     uint32_t fifo[WD_FIFO];
     int fifo_n;
     uint32_t done;                  /* the last buffer done, MIU >> 4 */
+    bool sensor_window;
+    bool ae_grid_32;
 };
 
 /* the site's colour: BGGR */
@@ -351,11 +354,24 @@ static inline uint8_t isp_luma(const uint8_t *rgb)
     return (30 * rgb[0] + 59 * rgb[1] + 11 * rgb[2]) / 100;
 }
 
+/*
+ * The infinity6 family has no block count: HalIspAeSetWin writes the size at
+ * 0x30/0x31 and an offset at 0x34/0x35 of a fixed 32 x 32 grid, which is how
+ * they add up to the sensor's window on all three dies.
+ */
+static int ae_blocks(SstarIfordIspState *s, int reg)
+{
+    if (s->ae_grid_32) {
+        return ISP_AE_GRID;
+    }
+    return (sstar_riu_get(s->riu, BANK_STATS, reg) & 0x7F) + 1;
+}
+
 static void isp_stats(SstarIfordIspState *s, const ImageSensorExposure *e)
 {
     uint16_t en = sstar_riu_get(s->riu, BANK_STATS, STS_ENABLE);
-    int aex = (sstar_riu_get(s->riu, BANK_STATS, STS_AE_BLOCKS_X) & 0x7F) + 1;
-    int aey = (sstar_riu_get(s->riu, BANK_STATS, STS_AE_BLOCKS_Y) & 0x7F) + 1;
+    int aex = ae_blocks(s, STS_AE_BLOCKS_X);
+    int aey = ae_blocks(s, STS_AE_BLOCKS_Y);
     int awx = (sstar_riu_get(s->riu, BANK_STATS, STS_AWB_BLOCKS_X) & 0xFF) + 1;
     int awy = (sstar_riu_get(s->riu, BANK_STATS, STS_AWB_BLOCKS_Y) & 0x7F) + 1;
     int64_t sum = 0;
@@ -612,21 +628,31 @@ static void isp_frame(SstarIfordIspState *s)
 {
     ImageSensorExposure e = { .lines = 1, .gain = 1024 };
     int w = ((sstar_riu_get(s->riu, BANK_STATS, STS_AE_SIZE_X) & 0x1FFF) + 1) *
-            ((sstar_riu_get(s->riu, BANK_STATS, STS_AE_BLOCKS_X) & 0x7F) + 1);
+            ae_blocks(s, STS_AE_BLOCKS_X);
     int h = ((sstar_riu_get(s->riu, BANK_STATS, STS_AE_SIZE_Y) & 0x1FFF) + 1) *
-            ((sstar_riu_get(s->riu, BANK_STATS, STS_AE_BLOCKS_Y) & 0x7F) + 1);
+            ae_blocks(s, STS_AE_BLOCKS_Y);
 
     if (w < 64 || h < 64 || w > ISP_MAX_DIM || h > ISP_MAX_DIM) {
         w = ISP_DEF_W;
         h = ISP_DEF_H;
     }
     image_sensor_exposure(s->sensor, &e);
+    /* infinity6e, infinity6c: the sensor gives the window */
+    if (s->sensor_window && e.width && e.height) {
+        w = MIN(e.width / 2, ISP_MAX_DIM) & ~1;
+        h = MIN(e.height / 2, ISP_MAX_DIM) & ~1;
+    }
     isp_window(s, w, h);
     isp_sensor(s, &e);
     isp_vif_dma(s);
     isp_stats(s, &e);
     isp_picture(s);
     s->frames++;
+}
+
+void sstar_iford_isp_frame(Object *isp)
+{
+    isp_frame(SSTAR_IFORD_ISP(isp));
 }
 
 void sstar_iford_isp_picture(Object *isp, const uint8_t **y,
@@ -685,6 +711,8 @@ static const Property isp_props[] = {
     DEFINE_PROP_LINK("riu", SstarIfordIspState, riu, TYPE_SSTAR_RIU,
                      SstarRiuState *),
     DEFINE_PROP_BOOL("trace", SstarIfordIspState, trace, false),
+    DEFINE_PROP_BOOL("sensor-window", SstarIfordIspState, sensor_window, false),
+    DEFINE_PROP_BOOL("ae-grid-32", SstarIfordIspState, ae_grid_32, false),
 };
 
 static void isp_class_init(ObjectClass *oc, const void *data)

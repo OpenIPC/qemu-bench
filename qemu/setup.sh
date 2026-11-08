@@ -58,6 +58,23 @@ cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/xm-sensor.c          "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/gpio/xm-gpio.c           "$QEMU_DIR/hw/gpio/"
+# The DVRs and NVRs (XM8520D, XM8521DV200, XM8536E): display, decoder,
+# capture, scaler, OSD, H2 encoder, RTC, AHD receivers
+cp qemu/hw/misc/xm-rtc2.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-vc8000d.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-vo2.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-dvr-vi.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-dvr-vpss.c       "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-dvr-osd.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-h2.c             "$QEMU_DIR/hw/misc/"
+cp qemu/hw/i2c/nvp6158.c            "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/tp2830.c             "$QEMU_DIR/hw/i2c/"
+# QEMU's own DWC2 host and USB stick, fixed: a core soft reset that
+# releases the port, an interrupt level per controller, and short
+# mass-storage replies cut at the host's length (the DWC2 drivers round
+# IN transfers up to whole packets)
+cp qemu/hw/usb/hcd-dwc2.c qemu/hw/usb/hcd-dwc2.h qemu/hw/usb/dev-storage.c \
+   "$QEMU_DIR/hw/usb/"
 cp qemu/hw/gpio/xm510-gpio.c        "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/watchdog/arm-sp805.c     "$QEMU_DIR/hw/watchdog/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
@@ -106,6 +123,7 @@ cp qemu/include/hw/arm/sigmastar.h  "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/sstar-riu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-riu.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/sstar-xzdec.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/sstar-i6e-scl.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/sstar-iford-isp.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/intc/sstar-intc.c        "$QEMU_DIR/hw/intc/"
 cp qemu/hw/timer/sstar-timer.c      "$QEMU_DIR/hw/timer/"
@@ -127,8 +145,12 @@ cp qemu/include/hw/misc/sstar-i3-isp.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/sstar-i3-scl.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-pattern.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/sstar-mfe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-mhe.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-i3-jpe.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/sstar-vhe.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-wave5.c       "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-ive.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/sstar-i6e-scl.c     "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/sstar-jpeg.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/sstar-cabac.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/i2c/sstar-i2c.c          "$QEMU_DIR/hw/i2c/"
@@ -226,12 +248,13 @@ cp qemu/hw/misc/hisi-himci.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-regbank.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-sfc350.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vedu.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-vpss.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-vi.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-mipi-rx.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-rtc.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-ive.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-nnie.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-hwrng.c        "$QEMU_DIR/hw/misc/"
-cp qemu/hw/misc/hisi-vi-fp.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-fastboot.c     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-gzip.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-l2cache.c     "$QEMU_DIR/hw/misc/"
@@ -370,6 +393,20 @@ if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q USB
         "$QEMU_DIR/hw/arm/Kconfig"
     echo "  hw/arm/Kconfig: XIONGMAI selects USB_DWC2"
 fi
+# The DVRs / NVRs: SATA (AHCI), xm_dma.ko's PL330, the bit-banged I2C
+# EEPROM (at24c.ko)
+for k in AHCI_SYSBUS PL330 BITBANG_I2C AT24C; do
+    if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q "select $k$"; then
+        sed -i '/^config XIONGMAI$/,/^$/ s/^    select USB_DWC2$/    select USB_DWC2\n    select '"$k"'/' \
+            "$QEMU_DIR/hw/arm/Kconfig"
+        echo "  hw/arm/Kconfig: XIONGMAI selects $k"
+    fi
+done
+if ! grep -q sstar-wave5 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-wave5.c', 'sstar-mhe.c', 'sstar-ive.c', 'sstar-i6e-scl.c', 'hevc-enc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added sstar-wave5.c"
+fi
 if ! grep -q xm-sfc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-sfc.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
@@ -444,6 +481,31 @@ if ! grep -q xm-vi "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-vi.c"
+fi
+if ! grep -q xm-rtc2 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-rtc2.c', 'xm-vo2.c', 'xm-dvr-vi.c', 'xm-dvr-vpss.c', 'xm-h2.c', 'xm-dvr-osd.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added the DVR / NVR blocks"
+fi
+# xm-vc8000d decodes H.264 / HEVC with libavcodec when it is there
+if ! grep -q XM_VC8000D_LIBAVCODEC "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'EOF'
+xm_avcodec = dependency('libavcodec', version: '>=58', required: false)
+xm_avutil = dependency('libavutil', version: '>=56', required: false)
+if xm_avcodec.found() and xm_avutil.found()
+  system_ss.add(when: 'CONFIG_XIONGMAI', if_true: [files('xm-vc8000d.c'),
+    xm_avcodec, xm_avutil,
+    declare_dependency(compile_args: '-DXM_VC8000D_LIBAVCODEC')])
+else
+  system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vc8000d.c'))
+endif
+EOF
+    echo "  hw/misc/meson.build: added xm-vc8000d.c"
+fi
+if ! grep -q tp2830 "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('tp2830.c', 'nvp6158.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added tp2830.c, nvp6158.c"
 fi
 if ! grep -q xm-gpio "$QEMU_DIR/hw/gpio/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-gpio.c'))" \
@@ -646,7 +708,7 @@ else
         fi
     done
 fi
-for f in rtc/sstar-rtcpwc i2c/os04d10 misc/sstar-iford-scl misc/sstar-iford-isp misc/sstar-riu misc/sstar-xzdec misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
+for f in rtc/sstar-rtcpwc i2c/os04d10 misc/sstar-iford-scl misc/sstar-iford-isp misc/sstar-riu misc/sstar-xzdec misc/sstar-crypto rtc/sstar-rtc misc/sstar-vip-gamma misc/sstar-i3-isp misc/sstar-i3-scl misc/sstar-mfe misc/sstar-mhe misc/sstar-i3-jpe misc/sstar-vhe misc/sstar-wave5 misc/sstar-ive misc/sstar-i6e-scl misc/sstar-isp misc/sstar-vif misc/sstar-jpe misc/sstar-bach misc/sstar-i3-bach gpio/sstar-i3-gpio sd/sstar-fcie misc/sstar-cmdq i2c/sstar-i2c intc/sstar-intc timer/sstar-timer char/sstar-uart ssi/sstar-fsp dma/sstar-bdma net/sstar-emac display/mstar-ge display/mstar-disp usb/sstar-uhc; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
@@ -834,9 +896,19 @@ else
     echo "  hw/misc/Kconfig already patched"
 fi
 
+# shared coders for hisi-vedu: H.264 slices (H.265 slices, JPEG scans)
+for b in hantro-h264.c hevc-enc.c jpeg-enc.c; do
+    if ! grep -q "CONFIG_HISI_MISC', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for HISI_MISC"
+    fi
+done
+
 # hw/misc/meson.build
 if ! grep -q hisi-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-vi-fp.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c'))" \
+    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c', 'hisi-vpss.c', 'hisi-vi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  patched hw/misc/meson.build"
 else
@@ -845,13 +917,14 @@ else
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-hwrng.c"
     fi
-    if ! grep -q hisi-vi-fp "$QEMU_DIR/hw/misc/meson.build"; then
-        sed -i "s/'hisi-hwrng.c'/'hisi-hwrng.c', 'hisi-vi-fp.c'/" \
-            "$QEMU_DIR/hw/misc/meson.build"
-        echo "  hw/misc/meson.build: added hisi-vi-fp.c"
+    if grep -q hisi-vi-fp "$QEMU_DIR/hw/misc/meson.build"; then
+        # hisi-vi-fp (forged VI/VPSS/VEDU interrupts) gave way to hisi-vi
+        # and hisi-vpss
+        sed -i "s/, 'hisi-vi-fp.c'//" "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: removed hisi-vi-fp.c"
     fi
     if ! grep -q hisi-l2cache "$QEMU_DIR/hw/misc/meson.build"; then
-        sed -i "s/'hisi-vi-fp.c'/'hisi-vi-fp.c', 'hisi-l2cache.c'/" \
+        sed -i "s/'hisi-hwrng.c'/'hisi-hwrng.c', 'hisi-l2cache.c'/" \
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-l2cache.c"
     fi
@@ -869,6 +942,16 @@ else
         sed -i "s/'hisi-xmsp804.c'/'hisi-xmsp804.c', 'hisi-ddrc-v1.c'/" \
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-ddrc-v1.c"
+    fi
+    if ! grep -q hisi-vpss "$QEMU_DIR/hw/misc/meson.build"; then
+        sed -i "s/'hisi-ddrc-v1.c'/'hisi-ddrc-v1.c', 'hisi-vpss.c'/" \
+            "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added hisi-vpss.c"
+    fi
+    if ! grep -q "'hisi-vi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+        sed -i "s/'hisi-vpss.c'/'hisi-vpss.c', 'hisi-vi.c'/" \
+            "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added hisi-vi.c"
     fi
 fi
 

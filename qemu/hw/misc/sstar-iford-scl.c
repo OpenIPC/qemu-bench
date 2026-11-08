@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "hw/misc/sstar-i6e-scl.h"
 #include "hw/misc/sstar-iford-isp.h"
 #include "hw/misc/sstar-riu.h"
 #include "hw/qdev-properties.h"
@@ -60,6 +61,8 @@ struct SstarIfordSclState {
     int w;
     uint8_t *row;
 };
+
+static SstarIfordSclState *scl_state;
 
 static void scl_write_mem(uint64_t miu, const uint8_t *p, size_t len)
 {
@@ -128,6 +131,43 @@ static void scl_frame(SstarIfordSclState *s)
     s->frame++;
 }
 
+/*
+ * infinity6c binds this output to the encoder as a ring: lines at a pitch of
+ * the sensor's width, fewer of them than the frame has, which the encoder
+ * drains as they come.  The picture goes to it from here, as NV12 at the
+ * encoder's size.
+ */
+bool sstar_iford_scl_ring(uint64_t ya, int w, int h, uint8_t *dy, uint8_t *duv)
+{
+    SstarIfordSclState *s = scl_state;
+    const uint8_t *py, *puv;
+    int pw, ph, x, y;
+
+    if (!s || ya != ((uint64_t)s->regs[R_ADDR_HI] << 16 |
+                     s->regs[R_ADDR_LO]) << 4) {
+        return false;
+    }
+    sstar_iford_isp_picture(s->isp, &py, &puv, &pw, &ph);
+    for (y = 0; y < h; y++) {
+        const uint8_t *in = py + (int64_t)y * ph / h * pw;
+
+        for (x = 0; x < w; x++) {
+            dy[(size_t)y * w + x] = in[(int64_t)x * pw / w];
+        }
+    }
+    for (y = 0; y < h / 2; y++) {
+        const uint8_t *in = puv + (int64_t)y * (ph / 2) / (h / 2) * pw;
+
+        for (x = 0; x + 1 < w; x += 2) {
+            int px = MIN((int64_t)x * pw / w, pw - 2) & ~1;
+
+            duv[(size_t)y * w + x] = in[px];
+            duv[(size_t)y * w + x + 1] = in[px + 1];
+        }
+    }
+    return true;
+}
+
 static uint64_t scl_read(void *opaque, hwaddr off, unsigned size)
 {
     SstarIfordSclState *s = opaque;
@@ -182,6 +222,7 @@ static void scl_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &scl_ops, s, TYPE_SSTAR_IFORD_SCL,
                           SCL_REGS * 4);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    scl_state = s;
 }
 
 static const Property scl_props[] = {

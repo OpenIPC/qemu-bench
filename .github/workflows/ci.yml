@@ -101,6 +101,25 @@ jobs:
       - name: Hantro H1 H.264 encode (xm-h1)
         run: python3 qemu/tests/test-xm-h1-h264.py
 
+      # HiSilicon V4 VEDU (H.264 / H.265) and JPGE, driven the way the
+      # HiMPP driver drives them: its parameter-set packets in the stream
+      # ring, its H.265 slice header bits in the register image, its JFIF
+      # header ahead of the scan.  ffmpeg must decode every picture.
+      - name: HiSilicon VEDU + JPGE encode (hisi-vedu)
+        run: python3 qemu/tests/test-hisi-vedu.py
+
+      # VI offline into node-driven VPSS (a sensor wider than 2304): both
+      # strips of a picture painted, linear and compressed; no pipe
+      # interrupt after a stop; online again after an offline run.
+      - name: HiSilicon VI offline + VPSS node list (hisi-vi, hisi-vpss)
+        run: python3 qemu/tests/test-hisi-vpss.py
+
+      # The ISP statistics hisi-vi writes (front-end and backend AE
+      # histograms, AE / AWB zones, globals) in the driver's STT layouts,
+      # and the front-end interrupt the ISP's per-frame work runs from.
+      - name: HiSilicon ISP statistics (hisi-vi)
+        run: python3 qemu/tests/test-hisi-isp.py
+
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)
@@ -309,6 +328,123 @@ jobs:
           name: ive-test-log
           path: ive-output.txt
           retention-days: 7
+
+  venc-hisilicon:
+    name: VENC on ${{ matrix.soc }} (user frames${{ matrix.majestic && ', majestic' || '' }})
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - soc: hi3516ev200
+            majestic: true
+          # and sensors wider than VPSS's line buffer (2304): VI offline
+          - soc: hi3516ev300
+            majestic: true
+            wide: imx335 gc4653
+          # Goke's own gk7205v200_*.ko; its release has no SC2315E
+          # config, so majestic runs with an SC2335 there
+          - soc: gk7205v200
+            majestic: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfdt1 \
+            libglib2.0-0 libpixman-1-0 libslirp0 squashfs-tools cpio
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      # The release's libmpi.so / libgk_api.so are uClibc builds the guest
+      # program links against with OpenIPC's own musl toolchain.  The
+      # tarball is a moving release asset: it is pinned by hash, so a
+      # republished one fails here (update the hash and the cache key)
+      # instead of running unchecked.
+      - name: OpenIPC toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: venc-toolchain
+          key: toolchain-hisilicon-hi3516ev200-4c107492
+
+      - name: OpenIPC toolchain
+        run: |
+          if [ ! -x venc-toolchain/bin/arm-openipc-linux-musleabi-gcc ]; then
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/tc.tgz" \
+              https://github.com/OpenIPC/firmware/releases/download/toolchain/toolchain.hisilicon-hi3516ev200.tgz
+            echo "4c1074928423ae6b7fd79b4b502a0da7f40cd058ca067cb747c804f820298bb6  $RUNNER_TEMP/tc.tgz" |
+              sha256sum -c -
+            rm -rf venc-toolchain && mkdir venc-toolchain
+            tar xzf "$RUNNER_TEMP/tc.tgz" -C venc-toolchain --strip-components=1
+          fi
+          echo "CC=$PWD/venc-toolchain/bin/arm-openipc-linux-musleabi-gcc" >> "$GITHUB_ENV"
+
+      - name: ffmpeg cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-btbn-lgpl-v1
+
+      - name: ffmpeg
+        timeout-minutes: 20
+        run: |
+          if ! ffmpeg-static/ffmpeg -version >/dev/null 2>&1; then
+            rm -rf ffmpeg-static && mkdir ffmpeg-static
+            curl -fsSL --retry 3 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz |
+              tar xJ -C ffmpeg-static --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' || true
+          fi
+          if ffmpeg-static/ffmpeg -version >/dev/null 2>&1 &&
+             ffmpeg-static/ffprobe -version >/dev/null 2>&1; then
+            echo "$PWD/ffmpeg-static" >> "$GITHUB_PATH"
+          else
+            rm -rf ffmpeg-static
+            sudo apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=5 -o Acquire::http::Timeout=30 ffmpeg
+          fi
+
+      # The vendor's VENC stack (OpenIPC release modules and MPI library)
+      # encodes test-pattern frames through hisi-vedu; every stream must
+      # decode and carry the frames' counter in order.
+      - name: VENC_SendFrame through VEDU and JPGE
+        timeout-minutes: 15
+        run: |
+          bash qemu-boot/test-hisi-venc.sh --soc ${{ matrix.soc }} \
+            --qemu ./qemu-src/build/qemu-system-arm --frames 10 \
+            --work "$RUNNER_TEMP/venc"
+
+      # The release's own majestic, left to start, with a 1080p sensor
+      # its /etc/sensors knows: sensor and ISP, VI online into VPSS (hisi-vi,
+      # hisi-vpss), VENC on VEDU.  Its H.265 must decode and carry
+      # hisi-vpss's frame counter, rising.
+      - name: majestic through VI, VPSS and VEDU
+        if: matrix.majestic
+        timeout-minutes: 15
+        run: |
+          bash qemu-boot/test-hisi-majestic.sh --soc ${{ matrix.soc }} \
+            --qemu ./qemu-src/build/qemu-system-arm --timeout 480 \
+            --work "$RUNNER_TEMP/majestic"
+
+      # A 5 MP IMX335 (2592x1944) and a 4 MP GC4653 (2560x1440): too wide
+      # for online, so VI captures into DDR, the driver starts the pipe
+      # on each frame and VPSS runs the node list it hands it, in strips.
+      - name: majestic with wide sensors (VI offline, VPSS nodes)
+        if: matrix.wide
+        timeout-minutes: 25
+        run: |
+          for s in ${{ matrix.wide }}; do
+            bash qemu-boot/test-hisi-majestic.sh --soc ${{ matrix.soc }} \
+              --sensor "$s" --qemu ./qemu-src/build/qemu-system-arm \
+              --timeout 480 --work "$RUNNER_TEMP/majestic"
+          done
 
   sofia-isp:
     name: Sofia ISP regression (hi3516ev200, sc2315e)

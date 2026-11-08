@@ -41,13 +41,41 @@
  * JOB_BLK_CNT bytes between the card and DDR at DMA_ADDR, and DATA_END is
  * raised.  A read's command and data are one job; a write's data is a
  * second job (JOB_DIR, DTRX_EN without CMD_EN) once the command is
- * answered.  JOB_START reads back clear: the job is done.
+ * answered.  JOB_START reads back clear: the job is done.  With
+ * CMD_END_AUTO_TRIG_EN (SD_CTL bit 12, EN_AUTO_TRIG in Ifliegen's driver) a
+ * write's data follows its command in the same job, once it is answered.
  *
  * DEST_R2N moves the data through the CIFD instead, 64 bytes at a time
  * (_BUF_CIFD_WaitEvent): a read fills the buffer and raises WBUF_FULL,
  * the driver takes it and writes WBUF_EMPTY_TRIG for the next 64; a
  * write is taken from the buffer on RBUF_FULL_TRIG, which raises
  * RBUF_EMPTY.  ADMA, below, walks descriptor tables.
+ *
+ * The same bank's upper half is the NAND side of the FCIE.  infinity6c's
+ * SPI NAND reads and writes through it when OTP says SoC ECC (the vendor's
+ * flash/fcie/infinity6c: spinand_soc_ecc.c, drvFCIE.c, halFCIE_reg.h), the
+ * ipc_i6c.spinand defconfigs' "spinand.socecc" layout.  The flash data does
+ * not pass through it: the driver moves a page to a buffer by BDMA, then
+ * runs a job to decode that buffer into its destination, or encodes a
+ * buffer before the BDMA programs it:
+ *   0x37 BOOT_MODE   bit 2: the addresses below are IMI, as the CPU sees
+ *                    it; otherwise MIU addresses, DDR from 0
+ *   0x44 AUX data    the instruction: 0x98 SER_DIN decodes, 0x90 SER_DOUT
+ *                    encodes, in the low byte
+ *   0x45 NC_CTRL     JOB_START 0
+ *   0x47 PART_MODE   enable 0, [6:1] sectors - 1
+ *   0x53 ECC_STAT2   [1:0] 0 clean, 1 corrected, 2 not correctable
+ *   0x60 MIE_EVENT   JOB_END 0, written ones clear; polled, never enabled
+ *                    by a driver seen here as an interrupt
+ *   0x64/65 RDATA, 0x66/67 WDATA, 0x68/69 RSPARE, 0x6A/6B WSPARE: DMA
+ *   0x76/77 [3:0] read and [11:8] write address bits 35:32 of data, spare
+ *   0x78/79, 0x7A/7B the codec's side of data and spare, address >> 4
+ *   0x7C ECC_MODE_SEL bit 0: 1024-byte sectors, not 512
+ *   0x7D ECC_SPARE_SIZE [7:0] spare bytes a sector; ADDR_LATCH 8, ECC_DIR 9,
+ *                    WRITE_MIU_BUSY 10
+ * No parity here: a decode copies with status clean and an encode leaves
+ * the spare as the driver gave it, so a flash bit error cannot be seen and
+ * an SDK image's parity is not checked.
  *
  * The card detect, PM_SD_CDZ, is in sstar-i3-gpio: the machine sets its
  * "sd-card" when a card is attached.
@@ -106,6 +134,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarFcieState, SSTAR_FCIE)
 #define CTL_JOB_DIR         (1u << 4)
 #define CTL_ADMA_EN         (1u << 5)
 #define CTL_JOB_START       (1u << 6)
+#define CTL_AUTO_TRIG       (1u << 12)  /* R_CMD_END_AUTO_TRIG_EN */
 #define CTL_BUSY_DET_ON     (1u << 8)
 
 #define STS_WR_TOUT         (1u << 2)
@@ -122,7 +151,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarFcieState, SSTAR_FCIE)
 #define CIFD_BYTES          64
 
 #define RST_N               (1u << 0)
-#define RST_STATES          0x000E
+#define RST_STATES          0x001E      /* bit 4, ECC, on the NAND side */
+
+#define NC_BOOT_MODE        0x37
+#define NC_IMI_SEL          (1u << 2)
+#define NC_AUX_DAT          0x44
+#define NC_ACT_SER_DOUT     0x90
+#define NC_ACT_SER_DIN      0x98
+#define NC_CTRL             0x45
+#define NC_JOB_START        (1u << 0)
+#define NC_PART_MODE        0x47
+#define NC_MIE_EVENT        0x60
+#define NC_JOB_END          (1u << 0)
+#define NC_RDATA_ADR        0x64
+#define NC_WDATA_ADR        0x66
+#define NC_RSPARE_ADR       0x68
+#define NC_WSPARE_ADR       0x6A
+#define NC_DATA_ADDR_MSB    0x76
+#define NC_SPARE_ADDR_MSB   0x77
+#define NC_ECC_DATA_ADR     0x78
+#define NC_ECC_SPARE_ADR    0x7A
+#define NC_ECC_MODE_SEL     0x7C
+#define NC_ECC_SPARE_SIZE   0x7D
+#define NC_WRITE_MIU_BUSY   (1u << 10)
 
 struct SstarFcieState {
     SysBusDevice parent_obj;
@@ -340,7 +391,9 @@ static void fcie_job(SstarFcieState *s, uint16_t ctl)
             return;
         }
     }
-    if (ctl & CTL_DTRX_EN) {
+    if ((ctl & CTL_DTRX_EN) ||
+        ((ctl & (CTL_CMD_EN | CTL_AUTO_TRIG | CTL_JOB_DIR)) ==
+         (CTL_CMD_EN | CTL_AUTO_TRIG | CTL_JOB_DIR))) {
         fcie_data(s, ctl);
     }
 }
@@ -366,6 +419,69 @@ static void fcie_cifd_event(SstarFcieState *s, uint16_t val)
     if (!s->r2n_left) {
         s->regs[R_MIE_EVENT] |= MIE_DATA_END;
     }
+}
+
+static hwaddr nc_addr(SstarFcieState *s, uint64_t a)
+{
+    return (s->regs[NC_BOOT_MODE] & NC_IMI_SEL) ? a : DRAM_BASE + a;
+}
+
+static uint32_t nc_reg32(SstarFcieState *s, unsigned reg)
+{
+    return s->regs[reg] | (uint32_t)s->regs[reg + 1] << 16;
+}
+
+static void nc_copy(SstarFcieState *s, hwaddr dst, hwaddr src, uint32_t len)
+{
+    g_autofree uint8_t *buf = NULL;
+
+    if (dst == src || !len) {
+        return;
+    }
+    buf = g_malloc(len);
+    if (dma_memory_read(&address_space_memory, src, buf, len,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+        dma_memory_write(&address_space_memory, dst, buf, len,
+                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-fcie: ECC job of 0x%x bytes "
+                      "from 0x%" HWADDR_PRIx " to 0x%" HWADDR_PRIx " failed\n",
+                      len, src, dst);
+    }
+}
+
+/* One decode or encode, whole at once: nothing polls long enough to see it */
+static void nc_job(SstarFcieState *s)
+{
+    uint32_t sectors = (s->regs[NC_PART_MODE] & 1) ?
+                       ((s->regs[NC_PART_MODE] >> 1) & 0x3F) + 1 : 1;
+    uint32_t sector = (s->regs[NC_ECC_MODE_SEL] & 1) ? 1024 : 512;
+    uint32_t spare = s->regs[NC_ECC_SPARE_SIZE] & 0xFF;
+    uint8_t op = s->regs[NC_AUX_DAT];
+    uint64_t data = nc_reg32(s, NC_ECC_DATA_ADR), oob;
+    uint64_t data_hi, oob_hi;
+
+    oob = (uint64_t)nc_reg32(s, NC_ECC_SPARE_ADR) << 4;
+    data <<= 4;
+    if (op == NC_ACT_SER_DIN) {
+        data_hi = (uint64_t)(s->regs[NC_DATA_ADDR_MSB] & 0xF) << 32;
+        oob_hi = (uint64_t)(s->regs[NC_SPARE_ADDR_MSB] & 0xF) << 32;
+        nc_copy(s, nc_addr(s, data_hi | nc_reg32(s, NC_RDATA_ADR)),
+                nc_addr(s, data), sectors * sector);
+        nc_copy(s, nc_addr(s, oob_hi | nc_reg32(s, NC_RSPARE_ADR)),
+                nc_addr(s, oob), sectors * spare);
+    } else if (op == NC_ACT_SER_DOUT) {
+        data_hi = (uint64_t)((s->regs[NC_DATA_ADDR_MSB] >> 8) & 0xF) << 32;
+        oob_hi = (uint64_t)((s->regs[NC_SPARE_ADDR_MSB] >> 8) & 0xF) << 32;
+        nc_copy(s, nc_addr(s, data),
+                nc_addr(s, data_hi | nc_reg32(s, NC_WDATA_ADR)),
+                sectors * sector);
+        nc_copy(s, nc_addr(s, oob),
+                nc_addr(s, oob_hi | nc_reg32(s, NC_WSPARE_ADR)),
+                sectors * spare);
+    } else {
+        qemu_log_mask(LOG_UNIMP, "sstar-fcie: NAND instruction 0x%02x\n", op);
+    }
+    s->regs[NC_MIE_EVENT] |= NC_JOB_END;
 }
 
 static uint16_t fcie_read16(SstarFcieState *s, unsigned bank, unsigned reg)
@@ -406,6 +522,18 @@ static void fcie_write16(SstarFcieState *s, unsigned bank, unsigned reg,
     case R_MIE_EVENT:
         s->regs[reg] &= ~val;
         break;
+    case NC_MIE_EVENT:
+        s->regs[reg] &= ~val;
+        break;
+    case NC_CTRL:
+        s->regs[reg] = val & ~NC_JOB_START;
+        if (val & NC_JOB_START) {
+            nc_job(s);
+        }
+        break;
+    case NC_ECC_SPARE_SIZE:
+        s->regs[reg] = val & ~NC_WRITE_MIU_BUSY;
+        break;
     case R_SD_STS:
         s->regs[reg] &= ~(val & STS_ERRORS);
         break;
@@ -428,6 +556,7 @@ static void fcie_write16(SstarFcieState *s, unsigned bank, unsigned reg,
             s->regs[R_MIE_EVENT] = 0;
             s->regs[R_SD_STS] = 0;
             s->regs[R_CIFD_EVENT] = 0;
+            s->regs[NC_MIE_EVENT] = 0;
             s->r2n_left = 0;
         }
         break;
@@ -466,7 +595,8 @@ static void fcie_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         /* A byte lane: the rest of the register as it reads, not W1C bits */
         v = bank ? fcie_read16(s, bank, reg) : s->regs[reg];
         if (!bank && (reg == R_MIE_EVENT || reg == R_SD_STS ||
-                      reg == R_CIFD_EVENT || reg == R_SD_CTL)) {
+                      reg == R_CIFD_EVENT || reg == R_SD_CTL ||
+                      reg == NC_MIE_EVENT || reg == NC_CTRL)) {
             v = 0;
         }
         v = (off & 1) ? (v & 0x00FF) | (val & 0xFF) << 8

@@ -479,11 +479,14 @@ static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
                 uv[(size_t)r * pw + 2 * c + 1] = amb_bar_v[b];
             }
         }
-        /* Fresh SPS+PPS+IDR every frame: each one decodes on its own. */
+        /* Fresh SPS+PPS+IDR every frame: each one decodes on its own.  Write
+         * the Baseline parameter sets with the shared generator, then parse
+         * them back so h264_enc_frame()'s slice is consistent with them. */
+        uint8_t sets[128];
+        size_t sn = h264_enc_baseline_headers(w, h, sets);
         memset(&e, 0, sizeof e);
-        h264_enc_headers(&e, bs, 66,
-                         s->estr[sid].level ? s->estr[sid].level : 40,
-                         w, h, qp);
+        h264_enc_parse_headers(&e, sets, sn);
+        g_byte_array_append(bs, sets, sn);
         size_t cap = (size_t)mbw * mbh * 512 + 256;
         g_autofree uint8_t *slice = g_malloc(cap);
         size_t n = h264_enc_frame(&e, true, qp, mbw, mbh, y, pw, uv, pw,

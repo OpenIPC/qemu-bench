@@ -525,7 +525,7 @@ static ssize_t atbm_receive(NetClientState *nc, const uint8_t *buf,
     memcpy(f + n + 6, buf + 12, size - 12);
     n += 6 + size - 12;
     if (mic) {
-        n += atbm_wpa_trailer(&s->wpa, group, f + 4, f + 16, f + n - (6 + size - 12),
+        n += atbm_wpa_trailer(&s->wpa, group, f + 4, f + 16, 0, f + n - (6 + size - 12),
                               6 + size - 12, f + n);
     }
     atbm_rx(s, f, n, flags, 0);

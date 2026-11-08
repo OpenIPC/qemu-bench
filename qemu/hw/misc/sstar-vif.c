@@ -8,6 +8,12 @@
  * the status at reg 0x70 (+0x1C0).  DRV_VIF_EventIspVifIsr runs one
  * event callback per bit.
  *
+ * infinity6e keeps them per channel in banks 0x1304/0x1305, the odd
+ * channel at +0x100: mask at reg 0x0B, clear at 0x0D, status at 0x0E
+ * (mhal.ko HalVif_IrqMask, HalVif_IrqClr, HalVif_IrqFinalStatus), and
+ * DrvVif_ISR takes bit 0 for the frame start.  The "i6e" property picks
+ * that layout; this model covers channel 0.
+ *
  * There is no sensor, so this is the frame clock: while any bit of
  * "events" is unmasked, a timer at "fps" raises those bits each frame.
  * Everything else in the bank is storage.
@@ -32,9 +38,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarVifState, SSTAR_VIF)
 
 #define ISP_REGS            0x80
 #define INT_GROUPS          1
-#define INT_MASK(g)         0x60
-#define INT_CLEAR(g)        0x6A
-#define INT_STATUS(g)       0x70
+#define INT_MASK(g)         (s->i6e ? 0x0B : 0x60)
+#define INT_CLEAR(g)        (s->i6e ? 0x0D : 0x6A)
+#define INT_STATUS(g)       (s->i6e ? 0x0E : 0x70)
 
 struct SstarVifState {
     SysBusDevice parent_obj;
@@ -48,9 +54,10 @@ struct SstarVifState {
     uint32_t fps;
     uint32_t events[INT_GROUPS];    /* bits raised each frame, per group */
     bool trace;
+    bool i6e;
 };
 
-static int isp_group(int reg)
+static int isp_group(SstarVifState *s, int reg)
 {
     return reg == INT_MASK(0) || reg == INT_CLEAR(0) ||
            reg == INT_STATUS(0) ? 0 : -1;
@@ -70,6 +77,11 @@ static void sstar_vif_update_irq(SstarVifState *s)
 static bool sstar_vif_streaming(SstarVifState *s)
 {
     int g;
+
+    /* infinity6e: HalVif_SensorChannelEnable, reg 0x00 bit 15 */
+    if (s->i6e && !(s->regs[0] & 0x8000)) {
+        return false;
+    }
 
     for (g = 0; g < INT_GROUPS; g++) {
         if (s->events[g] & ~s->regs[INT_MASK(g)]) {
@@ -127,7 +139,7 @@ static void sstar_vif_write(void *opaque, hwaddr off, uint64_t val,
 {
     SstarVifState *s = opaque;
     int reg = (off >> 2) & (ISP_REGS - 1);
-    int g = isp_group(reg);
+    int g = isp_group(s, reg);
     uint16_t mask, v;
 
     if ((off & 3) >= 2) {
@@ -152,8 +164,8 @@ static void sstar_vif_write(void *opaque, hwaddr off, uint64_t val,
             s->regs[INT_STATUS(g)] &= ~(v & mask);
         }
         sstar_vif_update_irq(s);
-        sstar_vif_schedule(s);
     }
+    sstar_vif_schedule(s);
 }
 
 static const MemoryRegionOps sstar_vif_ops = {
@@ -202,6 +214,7 @@ static const Property sstar_vif_props[] = {
     /* channel 0's bits 0, 1 and 3: the ones the driver unmasks */
     DEFINE_PROP_UINT32("events", SstarVifState, events[0], 0xB),
     DEFINE_PROP_BOOL("trace", SstarVifState, trace, false),
+    DEFINE_PROP_BOOL("i6e", SstarVifState, i6e, false),
 };
 
 static const VMStateDescription vmstate_sstar_isp = {

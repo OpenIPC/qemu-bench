@@ -23,7 +23,9 @@
  *
  * A DMA job sends START, the address, the command bytes and then writes
  * the buffer, or (repeated START) reads into it; STOP unless 0x23 bit 5.
- * It completes at once.  The interrupt line is the DMA done flag with
+ * It completes at once, leaving the slave's answer in 0x02 bit 8 as a byte
+ * does (HAL_HWI2C_DMA_WaitDone reads it to tell a NACK from data, so a probe
+ * of an empty address must not look like a read).  The interrupt line is the DMA done flag with
  * DMA interrupts on, or the byte-mode flag with interrupts on.
  *
  * Copyright (c) 2026 OpenIPC.
@@ -180,6 +182,7 @@ static void sstar_i2c_dma(SstarI2cState *s)
     bool ten = s->regs[R_SLAVE] & (1u << 10);
     g_autofree uint8_t *buf = NULL;
     uint32_t done = 0;
+    bool acked = false;
     int i;
 
     if (ten) {
@@ -206,6 +209,7 @@ static void sstar_i2c_dma(SstarI2cState *s)
                 ok = sstar_i2c_start(s, slave, true);
             }
         }
+        acked = ok;
         if (ok && read) {
             for (done = 0; done < len; done++) {
                 buf[done] = i2c_recv(s->bus);
@@ -220,11 +224,14 @@ static void sstar_i2c_dma(SstarI2cState *s)
                             MEMTXATTRS_UNSPECIFIED);
             for (done = 0; done < len; done++) {
                 if (i2c_send(s->bus, buf[done])) {
+                    acked = false;
                     break;
                 }
             }
         }
     }
+    s->regs[R_WDATA] = (s->regs[R_WDATA] & ~WDATA_NACK) |
+                       (acked ? 0 : WDATA_NACK);
     if (!(s->regs[R_DMA_CTRL] & DMACTRL_NO_STOP)) {
         sstar_i2c_stop(s);
     }

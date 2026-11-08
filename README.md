@@ -11,7 +11,7 @@ desk. Vendor families covered:
 - **Xiongmai** XM510 / XM530 / XM550, and XM530V200 / XM533 / XM535
 - **Goke** GK7101 / GK7102 and the GK710xS die
 - **Anyka** AK39xx
-- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375) and infinity3 (MSC313E)
+- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375), infinity3 (MSC313E, MSC316) and the infinity6 family (SSC325, SSC33x, SSC30Kx, SSC338Q, SSC37x, SSC378x)
 - **Novatek** NT9856x, NT9852x, NT98532/NT98533, NT9832x, NT98332 and NT98633
 - **Allwinner** V831 / V833
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 5 SigmaStar (Cortex-A7) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (107 total)
+## Supported Machines (134 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -120,6 +120,9 @@ modelled yet.
 | `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm8536e` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+| `xm8520d` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+| `xm8521dv200` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 
 ³ Flash boot of a camera dump only: vendor U-Boot, kernel and Sofia, no
 OpenIPC release yet. These are the second-generation parts (#154): DDR
@@ -128,6 +131,13 @@ the SDIO controller moved. Sofia streams H.265 over RTSP from a test
 picture (capture, ISP, VPSS, HEVC and JPEG engines, OSD), with audio, SD
 recording, USB and an AltoBeam USB Wi-Fi dongle; multi-lens boards (spliced
 and three-camera) included. See [docs/xiongmai.md](docs/xiongmai.md).
+
+⁴ Flash boot of NVR / DVR dumps (YK NBD88X16S-KL-V3 NVR on `xm8536e`,
+AHB88X04R XVRs on `xm8520d`, AHB88X08R-LM-V3 on `xm8521dv200`): Sofia's GUI
+on HDMI, live view of IP cameras (NVR) or of the AHD receivers' test
+pictures (DVRs, NVP6158C / TP2830), H.265 / H.264 / JPEG encoding streamed
+over RTSP, SATA recording and playback, per-camera audio, USB mouse and
+stick. See [docs/xiongmai.md](docs/xiongmai.md#dvrs-and-nvrs-xm8536e--xm8520d--xm8521dv200).
 
 Not HiSilicon parts, although their BSP kernels started from HiSilicon
 templates: the memory map and the flash controller (xmsfc) are Xiongmai's own,
@@ -243,9 +253,13 @@ was at hand.
 | `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
 | `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
 | `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
-| `ssc029` | Cortex-A32 ×2 (run as A7), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
+| `msc316dc`, `msc316dm` | Cortex-A7, 128 MB in package | GIC + main-intc | — | U-Boot, the IPL's own DDR set-up |
+| `ssc029` | Cortex-A32 ×2 (run as `max`), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
+| `ssc029a`, `ssc029b` | Cortex-A32 ×2 (run as `max`), 512 / 256 MB | GICv3 | 5.10.117 vendor | `ssc029a`: SDK SPI NAND through OP-TEE to a shell; `ssc029b`: U-Boot with `bond=` |
+| `ssc034a`, `ssc034b` | Cortex-A7 ×2, 128 / 64 MB | GIC-400 + main-intc | 4.9.84 vendor (SDK build) | SDK IPL → TF-A → U-Boot → kernel → shell from NOR and SPI NAND, 2 CPUs, Ethernet, SD, SDK `venc_demo` to H.264/H.265 |
+| `ssc325`, `ssc325de`, `ssc327de`, `ssc333`, `ssc335`, `ssc335de`, `ssc337`, `ssc337de`, `ssc30kd`, `ssc30kq`, `ssc338q`, `ssc377`, `ssc377d`, `ssc377de`, `ssc377qe`, `ssc378de`, `ssc378qe` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
 
-SigmaStar's (formerly MStar's) infinity2m, infinity3 and Iford dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m, infinity3, Iford, Ifliegen and infinity6 family dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
@@ -651,7 +665,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 109 machines build and register. Every machine marked "yes" above boots
+All 134 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -689,13 +703,19 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **DMA (PL080)** | yes | yes | — | yes | — | — | — | — |
 | **MIPI RX** | — | — | stub | — | yes | stub | yes | yes |
 | **RTC** | — | — | yes | — | yes | yes | yes | yes |
-| **VEDU/JPGE** | — | — | stub | — | yes | stub | yes | yes |
+| **VEDU/JPGE** | — | — | stub | — | yes | stub | **encodes** | yes |
+| **VI/VPSS** | stub | stub | stub | — | stub | stub | **frames**¹ | stub |
 | **Watchdog** | yes | yes | yes | yes | yes | yes | yes | yes |
 | **Sensor I2C** | — | — | — | — | — | — | yes | — |
 | **IVE (18 ops)** | — | — | — | — | — | — | **yes** | — |
 | **NPU** | — | — | — | — | — | — | — | stub |
 
-Notes: `stub` = regbank stub only. V5 (×3) = CV608/CV610/CV613 (same die, different feature
+Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
+the vendor VENC stack; `frames`: the VI → VPSS pipeline (online, or VI
+offline for sensors wider than 2304, IMX335 and GC4653) produces
+pictures, so majestic and the SDK's `sample_venc` stream from a sensor
+(`docs/hisilicon-venc.md`). ¹ EV200 / EV300 / 18EV300 / 16DV200 and their
+Goke rebrands. V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
 
@@ -714,14 +734,27 @@ qemu/
 ├── hw/misc/hisi-regbank.c       # Generic RAM-backed register bank
 ├── hw/misc/hisi-ive.c           # IVE: 18 ops (SAD, CCL, Sub, Thresh, Erode...)
 ├── hw/misc/hisi-fastboot.c      # Boot ROM fastboot serial protocol (defib compat)
-├── hw/misc/hisi-vedu.c          # Video encoder stub (VEDU + JPGE)
+├── hw/misc/hisi-vedu.c          # V4 video encoder: VEDU (H.264/H.265) + JPGE
+├── hw/misc/hisi-vi.c            # V4 VI capture + ISP pipe: the frame clock
+├── hw/misc/hisi-vpss.c          # V4 VPSS online / node list: paints the channels' frames
 ├── hw/misc/hisi-mipi-rx.c       # MIPI RX controller stub
 ├── hw/misc/hisi-rtc.c           # SPI-bridge RTC device
 ├── hw/net/hisi-femac.c          # Fast Ethernet MAC + MDIO PHY stub
 ├── hw/i2c/hisi-i2c.c            # HiBVT I2C controller
 ├── hw/i2c/hisi-imx335.c         # IMX335 image sensor I2C device
 ├── include/hw/arm/hisilicon.h   # SoC config structure + constants
-├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 machines
+├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 cameras, XM8536E/XM8520D/XM8521DV200 NVR/DVRs
+├── hw/misc/xm-vo2.c             # NVR/DVR display: windows, GUI, cursor on HDMI
+├── hw/misc/xm-vc8000d.c         # Hantro VC8000D / G2 decoder (libavcodec)
+├── hw/misc/xm-h2.c              # Hantro H2 (VC8000E) encoder: H.265, H.264, JPEG
+├── hw/misc/xm-dvr-vi.c          # DVR capture of the AHD receivers' ports
+├── hw/misc/xm-dvr-vpss.c        # DVR scaler
+├── hw/misc/xm-dvr-osd.c         # DVR OSD engine (jobs complete, nothing drawn)
+├── hw/misc/xm-rtc2.c            # NVR/DVR RTC
+├── hw/i2c/nvp6158.c             # Nextchip NVP6158C AHD receiver
+├── hw/i2c/tp2830.c              # Techpoint TP2830 AHD receiver
+├── hw/usb/hcd-dwc2.c            # QEMU's DWC2 host, fixed: core soft reset, IRQ level per host
+├── hw/usb/dev-storage.c         # QEMU's USB stick, fixed: short replies cut at the host's length
 ├── hw/misc/xm-sysctl.c          # XM SYS_CTRL: soft reset, PLL lock
 ├── hw/misc/xm-ddrc.c            # XM510 uPCTL DDR controller (U-Boot)
 ├── hw/misc/xm-sfc.c             # xmsfc v1/v2 SPI-NOR controller (flash-file)
@@ -808,7 +841,7 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
-├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford machines, synthetic mask ROM
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford/Ifliegen/infinity6 machines, synthetic mask ROM
 ├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
 ├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
 ├── hw/timer/sstar-timer.c       # PIU timers + watchdog
