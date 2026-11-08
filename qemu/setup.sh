@@ -58,6 +58,23 @@ cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/xm-sensor.c          "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/gpio/xm-gpio.c           "$QEMU_DIR/hw/gpio/"
+# The DVRs and NVRs (XM8520D, XM8521DV200, XM8536E): display, decoder,
+# capture, scaler, OSD, H2 encoder, RTC, AHD receivers
+cp qemu/hw/misc/xm-rtc2.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-vc8000d.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-vo2.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-dvr-vi.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-dvr-vpss.c       "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-dvr-osd.c        "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-h2.c             "$QEMU_DIR/hw/misc/"
+cp qemu/hw/i2c/nvp6158.c            "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/tp2830.c             "$QEMU_DIR/hw/i2c/"
+# QEMU's own DWC2 host and USB stick, fixed: a core soft reset that
+# releases the port, an interrupt level per controller, and short
+# mass-storage replies cut at the host's length (the DWC2 drivers round
+# IN transfers up to whole packets)
+cp qemu/hw/usb/hcd-dwc2.c qemu/hw/usb/hcd-dwc2.h qemu/hw/usb/dev-storage.c \
+   "$QEMU_DIR/hw/usb/"
 cp qemu/hw/gpio/xm510-gpio.c        "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/watchdog/arm-sp805.c     "$QEMU_DIR/hw/watchdog/"
 cp qemu/hw/net/xm-dwmac.c           "$QEMU_DIR/hw/net/"
@@ -376,6 +393,15 @@ if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q USB
         "$QEMU_DIR/hw/arm/Kconfig"
     echo "  hw/arm/Kconfig: XIONGMAI selects USB_DWC2"
 fi
+# The DVRs / NVRs: SATA (AHCI), xm_dma.ko's PL330, the bit-banged I2C
+# EEPROM (at24c.ko)
+for k in AHCI_SYSBUS PL330 BITBANG_I2C AT24C; do
+    if ! sed -n '/^config XIONGMAI$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | grep -q "select $k$"; then
+        sed -i '/^config XIONGMAI$/,/^$/ s/^    select USB_DWC2$/    select USB_DWC2\n    select '"$k"'/' \
+            "$QEMU_DIR/hw/arm/Kconfig"
+        echo "  hw/arm/Kconfig: XIONGMAI selects $k"
+    fi
+done
 if ! grep -q sstar-wave5 "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_SIGMASTAR', if_true: files('sstar-wave5.c', 'sstar-mhe.c', 'sstar-ive.c', 'sstar-i6e-scl.c', 'hevc-enc.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
@@ -455,6 +481,31 @@ if ! grep -q xm-vi "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-vi.c"
+fi
+if ! grep -q xm-rtc2 "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-rtc2.c', 'xm-vo2.c', 'xm-dvr-vi.c', 'xm-dvr-vpss.c', 'xm-h2.c', 'xm-dvr-osd.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added the DVR / NVR blocks"
+fi
+# xm-vc8000d decodes H.264 / HEVC with libavcodec when it is there
+if ! grep -q XM_VC8000D_LIBAVCODEC "$QEMU_DIR/hw/misc/meson.build"; then
+    cat >> "$QEMU_DIR/hw/misc/meson.build" <<'EOF'
+xm_avcodec = dependency('libavcodec', version: '>=58', required: false)
+xm_avutil = dependency('libavutil', version: '>=56', required: false)
+if xm_avcodec.found() and xm_avutil.found()
+  system_ss.add(when: 'CONFIG_XIONGMAI', if_true: [files('xm-vc8000d.c'),
+    xm_avcodec, xm_avutil,
+    declare_dependency(compile_args: '-DXM_VC8000D_LIBAVCODEC')])
+else
+  system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vc8000d.c'))
+endif
+EOF
+    echo "  hw/misc/meson.build: added xm-vc8000d.c"
+fi
+if ! grep -q tp2830 "$QEMU_DIR/hw/i2c/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('tp2830.c', 'nvp6158.c'))" \
+        >> "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added tp2830.c, nvp6158.c"
 fi
 if ! grep -q xm-gpio "$QEMU_DIR/hw/gpio/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-gpio.c'))" \

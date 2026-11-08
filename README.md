@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 6 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (131 total)
+## Supported Machines (134 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -120,6 +120,9 @@ modelled yet.
 | `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm8536e` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+| `xm8520d` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+| `xm8521dv200` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 
 ³ Flash boot of a camera dump only: vendor U-Boot, kernel and Sofia, no
 OpenIPC release yet. These are the second-generation parts (#154): DDR
@@ -128,6 +131,13 @@ the SDIO controller moved. Sofia streams H.265 over RTSP from a test
 picture (capture, ISP, VPSS, HEVC and JPEG engines, OSD), with audio, SD
 recording, USB and an AltoBeam USB Wi-Fi dongle; multi-lens boards (spliced
 and three-camera) included. See [docs/xiongmai.md](docs/xiongmai.md).
+
+⁴ Flash boot of NVR / DVR dumps (YK NBD88X16S-KL-V3 NVR on `xm8536e`,
+AHB88X04R XVRs on `xm8520d`, AHB88X08R-LM-V3 on `xm8521dv200`): Sofia's GUI
+on HDMI, live view of IP cameras (NVR) or of the AHD receivers' test
+pictures (DVRs, NVP6158C / TP2830), H.265 / H.264 / JPEG encoding streamed
+over RTSP, SATA recording and playback, per-camera audio, USB mouse and
+stick. See [docs/xiongmai.md](docs/xiongmai.md#dvrs-and-nvrs-xm8536e--xm8520d--xm8521dv200).
 
 Not HiSilicon parts, although their BSP kernels started from HiSilicon
 templates: the memory map and the flash controller (xmsfc) are Xiongmai's own,
@@ -655,7 +665,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 131 machines build and register. Every machine marked "yes" above boots
+All 134 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -733,7 +743,18 @@ qemu/
 ├── hw/i2c/hisi-i2c.c            # HiBVT I2C controller
 ├── hw/i2c/hisi-imx335.c         # IMX335 image sensor I2C device
 ├── include/hw/arm/hisilicon.h   # SoC config structure + constants
-├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 machines
+├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 cameras, XM8536E/XM8520D/XM8521DV200 NVR/DVRs
+├── hw/misc/xm-vo2.c             # NVR/DVR display: windows, GUI, cursor on HDMI
+├── hw/misc/xm-vc8000d.c         # Hantro VC8000D / G2 decoder (libavcodec)
+├── hw/misc/xm-h2.c              # Hantro H2 (VC8000E) encoder: H.265, H.264, JPEG
+├── hw/misc/xm-dvr-vi.c          # DVR capture of the AHD receivers' ports
+├── hw/misc/xm-dvr-vpss.c        # DVR scaler
+├── hw/misc/xm-dvr-osd.c         # DVR OSD engine (jobs complete, nothing drawn)
+├── hw/misc/xm-rtc2.c            # NVR/DVR RTC
+├── hw/i2c/nvp6158.c             # Nextchip NVP6158C AHD receiver
+├── hw/i2c/tp2830.c              # Techpoint TP2830 AHD receiver
+├── hw/usb/hcd-dwc2.c            # QEMU's DWC2 host, fixed: core soft reset, IRQ level per host
+├── hw/usb/dev-storage.c         # QEMU's USB stick, fixed: short replies cut at the host's length
 ├── hw/misc/xm-sysctl.c          # XM SYS_CTRL: soft reset, PLL lock
 ├── hw/misc/xm-ddrc.c            # XM510 uPCTL DDR controller (U-Boot)
 ├── hw/misc/xm-sfc.c             # xmsfc v1/v2 SPI-NOR controller (flash-file)

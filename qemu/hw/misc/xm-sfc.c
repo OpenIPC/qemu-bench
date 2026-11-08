@@ -214,6 +214,8 @@ static void xm_sfc_erase(XmSfcState *s)
         return;
     case 0x06:                /* write enable / disable: nothing to model */
     case 0x04:
+    case 0x36:                /* individual block lock / unlock (Winbond): */
+    case 0x39:                /* only the global WPS state is modelled */
         return;
     case 0xC7:
     case 0x60:

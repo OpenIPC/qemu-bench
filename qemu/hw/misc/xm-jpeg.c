@@ -24,6 +24,12 @@
  * entropy-coded scan (jpeg-enc.c).  A job completes a millisecond after
  * its start.
  *
+ * layout "xm8521" (XM8521DV200's jpeg.ko, built 2023): the same engine
+ * with its registers moved: +0x030 status (3 done), +0x034 errors,
+ * +0x038 bytes of scan, +0x054 / +0x058 the scan and the buffer's end,
+ * +0x05C / +0x060 the source luma / chroma, +0x070 / +0x074 the
+ * quantisers; jpeg_interrupt writes 0 to +0x000 and +0x020 when done.
+ *
  * dump-dir (-global xm-jpeg.dump-dir=DIR) keeps every job on the host as a
  * whole frame-NNNNN.jpg (a header like the library's, the scan, EOI).
  *
@@ -37,6 +43,7 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/dma.h"
@@ -49,15 +56,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmJpegState, XM_JPEG)
 #define J_START         0x000
 #define J_SIZE          0x00C
 #define J_STRIDE        0x014
-#define J_STATUS        0x03C
-#define J_ERR           0x040
-#define J_LEN           0x044
-#define J_QUANT_LUMA    0x060
-#define J_QUANT_CHROMA  0x064
-#define J_OUT           0x088
-#define J_OUT_END       0x08C
-#define J_SRC_Y         0x090
-#define J_SRC_C         0x094
+#define J_STATUS        (s->o->status)
+#define J_ERR           (s->o->err)
+#define J_LEN           (s->o->len)
+#define J_QUANT_LUMA    (s->o->ql)
+#define J_QUANT_CHROMA  (s->o->qc)
+#define J_OUT           (s->o->out)
+#define J_OUT_END       (s->o->out_end)
+#define J_SRC_Y         (s->o->src_y)
+#define J_SRC_C         (s->o->src_c)
+
+typedef struct XmJpegLayout {
+    hwaddr status, err, len, ql, qc, out, out_end, src_y, src_c;
+} XmJpegLayout;
+
+static const XmJpegLayout xm_jpeg_v1 = {
+    0x03C, 0x040, 0x044, 0x060, 0x064, 0x088, 0x08C, 0x090, 0x094,
+};
+static const XmJpegLayout xm_jpeg_xm8521 = {
+    0x030, 0x034, 0x038, 0x070, 0x074, 0x054, 0x058, 0x05C, 0x060,
+};
 
 #define ST_DONE         3
 #define ERR_BUF_FULL    1
@@ -70,6 +88,8 @@ struct XmJpegState {
     uint32_t regs[XM_JPEG_SIZE / 4];
     uint8_t q[2][64];           /* luma, chroma; natural order */
     char *dump_dir;
+    char *layout;
+    const XmJpegLayout *o;
     uint32_t jobs;
     bool trace;
 };
@@ -176,8 +196,7 @@ static void xm_jpeg_write(void *opaque, hwaddr off, uint64_t val,
     if (s->trace) {
         qemu_log("xm-jpeg: +0x%03x = 0x%08x\n", (unsigned)off, (unsigned)val);
     }
-    switch (off) {
-    case J_START:
+    if (off == J_START) {
         R(s, off) = val;
         if (val & 1) {
             R(s, J_STATUS) = 0;
@@ -191,19 +210,11 @@ static void xm_jpeg_write(void *opaque, hwaddr off, uint64_t val,
             R(s, J_STATUS) = 0;
             R(s, J_ERR) = 0;
         }
-        break;
-    case J_QUANT_LUMA:
-    case J_QUANT_CHROMA:
+    } else if (off == J_QUANT_LUMA || off == J_QUANT_CHROMA) {
         R(s, off) = val;
         xm_jpeg_quant(s, off == J_QUANT_CHROMA, val);
-        break;
-    case J_STATUS:
-    case J_ERR:
-    case J_LEN:
-        break;
-    default:
+    } else if (off != J_STATUS && off != J_ERR && off != J_LEN) {
         R(s, off) = val;
-        break;
     }
     xm_jpeg_update(s);
 }
@@ -235,15 +246,29 @@ static void xm_jpeg_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xm_jpeg_done, s);
+    s->o = &xm_jpeg_v1;
+}
+
+static void xm_jpeg_realize(DeviceState *dev, Error **errp)
+{
+    XmJpegState *s = XM_JPEG(dev);
+
+    if (s->layout && !strcmp(s->layout, "xm8521")) {
+        s->o = &xm_jpeg_xm8521;
+    } else if (s->layout && *s->layout) {
+        error_setg(errp, "xm-jpeg: unknown layout '%s'", s->layout);
+    }
 }
 
 static const Property xm_jpeg_props[] = {
     DEFINE_PROP_STRING("dump-dir", XmJpegState, dump_dir),
     DEFINE_PROP_BOOL("trace", XmJpegState, trace, false),
+    DEFINE_PROP_STRING("layout", XmJpegState, layout),
 };
 
 static void xm_jpeg_class_init(ObjectClass *klass, const void *data)
 {
+    DEVICE_CLASS(klass)->realize = xm_jpeg_realize;
     device_class_set_legacy_reset(DEVICE_CLASS(klass), xm_jpeg_reset);
     device_class_set_props(DEVICE_CLASS(klass), xm_jpeg_props);
 }

@@ -68,7 +68,21 @@ struct XmI2cState {
     I2CBus *bus;
     Fifo8 tx, rx;
     uint32_t ctrl, addr, wcnt, rcnt, st;
+    uint8_t nak_seen[128 / 8];
 };
+
+/* A slave that is not there: logged once per address under -d unimp, so
+ * a board's probes show which chips its firmware expects. */
+static void xm_i2c_nak(XmI2cState *s)
+{
+    unsigned a = s->addr & 0x7f;
+
+    if (!(s->nak_seen[a / 8] & (1 << (a % 8)))) {
+        s->nak_seen[a / 8] |= 1 << (a % 8);
+        qemu_log_mask(LOG_UNIMP, "xm-i2c@0x%" HWADDR_PRIx ": no slave at "
+                      "0x%02x\n", s->iomem.addr, a);
+    }
+}
 
 /*
  * A transfer that cannot move its whole programmed count is not done: the
@@ -88,7 +102,9 @@ static void xm_i2c_write_xfer(XmI2cState *s)
         return;
     }
     ok = !i2c_start_send(s->bus, s->addr & 0x7f);
-
+    if (!ok) {
+        xm_i2c_nak(s);
+    }
     while (ok && n--) {
         ok = !i2c_send(s->bus, fifo8_pop(&s->tx));
     }
@@ -110,6 +126,7 @@ static void xm_i2c_read_xfer(XmI2cState *s)
         return;
     }
     if (i2c_start_recv(s->bus, s->addr & 0x7f)) {
+        xm_i2c_nak(s);
         i2c_end_transfer(s->bus);
         return;
     }
@@ -136,6 +153,9 @@ static void xm_i2c_write_read_xfer(XmI2cState *s)
         return;
     }
     ok = !i2c_start_send(s->bus, s->addr & 0x7f);
+    if (!ok) {
+        xm_i2c_nak(s);
+    }
     while (ok && n--) {
         ok = !i2c_send(s->bus, fifo8_pop(&s->tx));
     }
