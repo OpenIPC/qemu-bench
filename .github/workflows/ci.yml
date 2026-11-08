@@ -120,6 +120,11 @@ jobs:
       - name: HiSilicon ISP statistics (hisi-vi)
         run: python3 qemu/tests/test-hisi-isp.py
 
+      # The sensor's timing (sensor-sync): writes latch at frame start,
+      # group hold, frame rate from HTS x VTS / pclk, datasheet violations.
+      - name: HiSilicon sensor timing (hisi-smartsens, sensor-sync)
+        run: python3 qemu/tests/test-hisi-sensor.py
+
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)

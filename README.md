@@ -738,6 +738,7 @@ qemu/
 ├── hw/misc/hisi-vi.c            # V4 VI capture + ISP pipe: the frame clock
 ├── hw/misc/hisi-vpss.c          # V4 VPSS online / node list: paints the channels' frames
 ├── hw/misc/hisi-scene.c         # V4 camera twin: the scene the sensor looks at (PPM/PFM, light)
+├── hw/i2c/sensor-sync.c         # sensor timing: frame-start latching, group hold, violations
 ├── hw/misc/hisi-mipi-rx.c       # MIPI RX controller stub
 ├── hw/misc/hisi-rtc.c           # SPI-bridge RTC device
 ├── hw/net/hisi-femac.c          # Fast Ethernet MAC + MDIO PHY stub
