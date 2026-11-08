@@ -235,6 +235,30 @@ def main():
           'timeline: R %d, after the step %d, after the ramp %d' %
           (before, step, ramp))
 
+    # an integer ramp (0..1: '%lf' alone would eat the first dot)
+    with open(timeline, 'w') as f:
+        f.write('0..1 light-b=100->1000\n')
+    qmp_cmd('qom-set', path='/machine/scene', property='timeline',
+            value=timeline)
+    for _ in range(32):                             # 1.3 s
+        z0, _ = frame()
+    check(z0[1] & 0xffff == int(WHITE),
+          'integer ramp 0..1: B at its end, %d' % (z0[1] & 0xffff))
+    # timelines that are refused, leaving the one loaded
+    for name, text in (('nested', '1 timeline=/tmp/x\n'),
+                       ('nan', '1..2 light=oops->600\n'),
+                       ('reversed', '2..1 light=100->600\n'),
+                       ('garbage', '10xyz light=100\n')):
+        bad = os.path.join(tmp, name)
+        with open(bad, 'w') as f:
+            f.write(text)
+        r = qmp_cmd('qom-set', path='/machine/scene', property='timeline',
+                    value=bad)
+        cur = qmp_cmd('qom-get', path='/machine/scene',
+                      property='timeline').get('return')
+        check('error' in r and cur == timeline,
+              'timeline "%s" refused' % text.strip())
+
     rows = open(record).read().splitlines()
     head = rows[0].split(',')
     lr = [int(float(x.split(',')[head.index('light_r')])) for x in rows[1:]]

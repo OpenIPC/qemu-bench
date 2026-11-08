@@ -280,6 +280,33 @@ static void scene_events_free(GArray *ev)
     g_array_free(ev, true);
 }
 
+/* a whole finite number, nothing after it */
+static bool scene_parse_number(const char *str, double *v)
+{
+    char *end;
+
+    if (!str || !*str) {
+        return false;
+    }
+    *v = g_ascii_strtod(str, &end);
+    return end != str && !*end && isfinite(*v);
+}
+
+/* "t" or a rising "a..b" (a ramp), each a whole number of seconds */
+static bool scene_parse_time(const char *tok, double *t0, double *t1)
+{
+    const char *dots = strstr(tok, "..");
+    g_autofree char *a = NULL;
+
+    if (!dots) {
+        return scene_parse_number(tok, t0) && *t0 >= 0 &&
+               (*t1 = *t0, true);
+    }
+    a = g_strndup(tok, dots - tok);
+    return scene_parse_number(a, t0) && scene_parse_number(dots + 2, t1) &&
+           *t0 >= 0 && *t1 > *t0;
+}
+
 static GArray *scene_timeline_load(const char *path, Error **errp)
 {
     g_autofree char *text = NULL;
@@ -296,7 +323,7 @@ static GArray *scene_timeline_load(const char *path, Error **errp)
     for (n = 0; lines[n]; n++) {
         g_auto(GStrv) tok = NULL;
         char *hash = strchr(lines[n], '#');
-        double t0, t1;
+        double t0 = 0, t1 = 0;
         int i;
 
         if (hash) {
@@ -306,13 +333,9 @@ static GArray *scene_timeline_load(const char *path, Error **errp)
         if (!tok[0] || !*tok[0]) {
             continue;
         }
-        if (sscanf(tok[0], "%lf..%lf", &t0, &t1) == 2 && t1 > t0) {
-            /* a ramp */
-        } else if (sscanf(tok[0], "%lf", &t0) == 1) {
-            t1 = t0;
-        } else {
-            error_setg(errp, "hisi-scene: %s:%d: no time in '%s'", path,
-                       n + 1, tok[0]);
+        if (!scene_parse_time(tok[0], &t0, &t1)) {
+            error_setg(errp, "hisi-scene: %s:%d: '%s' is not a time or a "
+                       "rising a..b ramp", path, n + 1, tok[0]);
             goto bad;
         }
         for (i = 1; tok[i]; i++) {
@@ -323,21 +346,30 @@ static GArray *scene_timeline_load(const char *path, Error **errp)
             if (!*tok[i]) {
                 continue;
             }
-            if (!eq) {
+            if (!eq || eq == tok[i]) {
                 error_setg(errp, "hisi-scene: %s:%d: '%s' is not prop=value",
                            path, n + 1, tok[i]);
                 goto bad;
             }
             e.prop = g_strndup(tok[i], eq - tok[i]);
+            if (!strcmp(e.prop, "timeline")) {
+                /* it would free the events while they play */
+                error_setg(errp, "hisi-scene: %s:%d: a timeline cannot load "
+                           "another", path, n + 1);
+                g_free(e.prop);
+                goto bad;
+            }
             if (t1 > t0) {
-                if (!arrow) {
+                g_autofree char *from = arrow ?
+                    g_strndup(eq + 1, arrow - eq - 1) : NULL;
+
+                if (!arrow || !scene_parse_number(from, &e.from) ||
+                    !scene_parse_number(arrow + 2, &e.to)) {
                     error_setg(errp, "hisi-scene: %s:%d: a ramp needs "
-                               "prop=from->to", path, n + 1);
+                               "prop=from->to with two numbers", path, n + 1);
                     g_free(e.prop);
                     goto bad;
                 }
-                e.from = g_ascii_strtod(eq + 1, NULL);
-                e.to = g_ascii_strtod(arrow + 2, NULL);
             } else {
                 e.value = g_strdup(eq + 1);
             }

@@ -694,7 +694,9 @@ in this order:
   `-global hisi-vi.record=FILE` writes a CSV line for each frame.
   `qemu-boot/twin-metrics.py` turns the CSV into settle time, overshoot,
   level and AWB residual per segment. `qemu-boot/test-hisi-scenario.sh`
-  runs majestic through a scenario (CI on hi3516ev200). An AWB zone's count is every pixel of the zone:
+  runs majestic through a scenario (CI on hi3516ev200). It enforces AE
+  and the timeline but only reports AWB, since lib_hiawb freezes in some
+  runs (the twin doc's "Open issues"). An AWB zone's count is every pixel of the zone:
   lib_hiawb leaves its gains alone unless the zones' average count passes
   1024. Offline, each strip's VIPROC node (0x2f8 chain) has its own
   statistics block (S_ISP_STT_REGS_TYPE) at the address in its 0x5d0.

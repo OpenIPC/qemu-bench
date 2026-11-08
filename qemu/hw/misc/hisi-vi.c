@@ -165,6 +165,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define AE_ZONES_MAX        (17 * 15)
 #define AWB_ZONES_MAX       (32 * 32)
 
+/* what a frame's statistics and record are made from */
+typedef struct ViFrame {
+    uint16_t *raw;
+    int gw, gh;
+    bool valid;
+    double scene_t, light, tint[3], wb[2];
+    ImageSensorExposure frame_expo;
+} ViFrame;
+
 struct HisiViState {
     SysBusDevice parent_obj;
     MemoryRegion cap_iomem;
@@ -192,6 +201,7 @@ struct HisiViState {
     double scene_t;             /* the scene's timeline clock, s */
     double wb[2];               /* the WB gains the driver programmed */
     char *record;               /* a CSV of every measured frame */
+    ViFrame job;                /* offline: the frame the pipe runs on */
     FILE *record_f;
     int gw, gh;
     uint32_t stat_frames;
@@ -331,9 +341,6 @@ static void vi_offline_wb(HisiViState *s)
 {
     uint32_t node[PROC_BE_CFG / 4 + 1], gain[2] = { 0, 0 };
 
-    if (!s->scene) {
-        return;
-    }
     if (s->proc[PROC_PNEXT / 4]) {
         dma_memory_read(&address_space_memory, s->proc[PROC_PNEXT / 4], node,
                         sizeof(node), MEMTXATTRS_UNSPECIFIED);
@@ -345,7 +352,58 @@ static void vi_offline_wb(HisiViState *s)
     }
     s->wb[0] = (le32_to_cpu(gain[0]) >> 16) / 256.0;
     s->wb[1] = (le32_to_cpu(gain[1]) >> 16) / 256.0;
-    hisi_scene_set_frame(s->scene, s->level, s->tint, s->wb[0], s->wb[1]);
+    if (s->scene) {
+        hisi_scene_set_frame(s->scene, s->level, s->tint, s->wb[0],
+                             s->wb[1]);
+    }
+}
+
+/*
+ * An offline job runs on the frame the driver started it on: what its
+ * statistics and record use is kept from the start (vi_job_start()) and
+ * swapped in at its end (vi_job_swap()), so a capture in between does not
+ * mix two frames.
+ */
+static void vi_job_start(HisiViState *s)
+{
+    ViFrame *j = &s->job;
+
+    j->raw = g_renew(uint16_t, j->raw, (size_t)MAX(s->gw * s->gh, 1) * 3);
+    if (s->raw) {
+        memcpy(j->raw, s->raw, (size_t)s->gw * s->gh * 3 * sizeof(*s->raw));
+    }
+    j->valid = s->raw != NULL;
+    j->gw = s->gw;
+    j->gh = s->gh;
+    j->scene_t = s->scene_t;
+    j->light = s->light;
+    memcpy(j->tint, s->tint, sizeof(j->tint));
+    memcpy(j->wb, s->wb, sizeof(j->wb));
+    j->frame_expo = s->frame_expo;
+}
+
+static void vi_job_swap(HisiViState *s)
+{
+    ViFrame *j = &s->job;
+    uint16_t *raw = s->raw;
+    ViFrame live = {
+        .raw = s->raw, .gw = s->gw, .gh = s->gh, .scene_t = s->scene_t,
+        .light = s->light, .frame_expo = s->frame_expo,
+    };
+
+    memcpy(live.tint, s->tint, sizeof(live.tint));
+    memcpy(live.wb, s->wb, sizeof(live.wb));
+    s->raw = j->raw;
+    s->gw = j->gw;
+    s->gh = j->gh;
+    s->scene_t = j->scene_t;
+    s->light = j->light;
+    memcpy(s->tint, j->tint, sizeof(s->tint));
+    memcpy(s->wb, j->wb, sizeof(s->wb));
+    s->frame_expo = j->frame_expo;
+    live.valid = j->valid;
+    *j = live;
+    j->raw = raw;
 }
 
 /*
@@ -719,7 +777,12 @@ static void vi_proc_done(void *opaque)
     if (!vi_running(s)) {
         return;                     /* the pipe was stopped meanwhile */
     }
-    vi_be_stats_offline(s);
+    if (s->job.valid) {
+        /* the statistics and record of the frame the job was started on */
+        vi_job_swap(s);
+        vi_be_stats_offline(s);
+        vi_job_swap(s);
+    }
     s->proc[PROC_INT / 4] |= PROC_INT_FSTART | PROC_INT_FEND;
     vi_update(s);
 }
@@ -808,6 +871,7 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
          */
         s->offline = true;
         vi_offline_wb(s);
+        vi_job_start(s);
         qemu_irq_pulse(s->frame_out);
         timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   NANOSECONDS_PER_SECOND / 4 / MAX(s->fps, 1));
