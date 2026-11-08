@@ -43,7 +43,9 @@
  *   to registers:
  *     0x22018 / 0x2201c  AE pixels, total / counted
  *     0x22020..0x2202c   AE global R / Gr / Gb / B means
- *     0x22140..0x2214c   AWB global R / G / B means, zone count
+ *     0x22140..0x2214c   AWB global R / G / B means, count (a zone's,
+ *                        every pixel: lib_hiawb holds its gains while the
+ *                        zones' average is 1024 or less)
  *   read from registers: 0x22010 AE zones (hnum | vnum << 8, 17 x 15),
  *   0x22110 AWB zones (32 x 32)
  *
@@ -60,7 +62,11 @@
  * (the image-sensor interface, "sensor" link) one frame late, as a sensor
  * applies what was written during the frame before; without a model of
  * them, white is half scale.  So auto exposure converges on an exposure
- * time, and auto white balance measures the light's colour temperature.
+ * time, and auto white balance on gains that neutralise the light.
+ *
+ * Offline the pipe's strips write their statistics themselves, one block
+ * each at the address in their VIPROC register image (see
+ * vi_be_stats_offline()).
  *
  * Every other register is storage.  Capture
  * interrupts go out on the first line, the pipe's on the second; the
@@ -136,6 +142,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define BE_AE_AVER          0x22020     /* R, Gr, Gb, B */
 #define BE_AWB_ZONE         0x22110
 #define BE_AWB_AVG          0x22140     /* R, G, B, count */
+#define PROC_PNEXT          0x02f8      /* offline: the pipe's node list */
+#define PROC_STT_OFFLINE    0x05d0      /* offline: the strip's STT block */
+#define PROC_NODE_MAX       4           /* strips */
 #define FE_STT_AE_HIST      0x10208     /* VI_CAP, pipe 0's channel */
 #define FE_STT_AE_RGR       0x10210
 #define FE_STT_AE_GBB       0x10218
@@ -275,6 +284,20 @@ static uint32_t scene_samples(HisiViState *s)
     return (w / 4) * (h / 4);
 }
 
+/*
+ * An AWB zone's count: every pixel of the zone (no skip).  lib_hiawb
+ * averages the zones' counts and leaves its gains alone unless that
+ * average passes 1024 (its ext register +0x30), and it ignores a zone
+ * of 64 or fewer (AwbWbMatrixCalculate / AwbWbMatrixNormalize).
+ */
+static uint32_t scene_awb_count(HisiViState *s, int zones)
+{
+    const uint32_t w = s->frame_expo.width ? s->frame_expo.width : 1920;
+    const uint32_t h = s->frame_expo.height ? s->frame_expo.height : 1080;
+
+    return MIN(w * h / MAX(zones, 1), 0xffff);
+}
+
 /* AE zone means, R << 16 | Gr and Gb << 16 | B, row by row */
 static void scene_ae_zones(HisiViState *s, uint32_t zone, uint32_t rgr_addr,
                            uint32_t gbb_addr)
@@ -364,7 +387,7 @@ static void vi_be_stats(HisiViState *s)
     scene_ae_global(s, p + BE_AE_TOTAL / 4);
     if (p[STT_AWB / 4]) {
         uint32_t awb[AWB_ZONES_MAX * 2];
-        const uint32_t n = MIN(scene_samples(s) / (awx * awy), 0xffff);
+        const uint32_t n = scene_awb_count(s, awx * awy);
 
         for (x = 0; x < awx; x++) {
             uint32_t m[3];
@@ -383,13 +406,142 @@ static void vi_be_stats(HisiViState *s)
     for (c = 0; c < 3; c++) {
         p[BE_AWB_AVG / 4 + c] = scene_mean(c, 0, 1, s->level);
     }
-    p[BE_AWB_AVG / 4 + 3] = MIN(scene_samples(s), 0xffff);
+    p[BE_AWB_AVG / 4 + 3] = scene_awb_count(s, awx * awy);
 
     if (s->stats_trace && s->stat_frames % MAX(s->fps, 1) == 0) {
-        fprintf(stderr, "isp stats: %u rows x%.2f gain, G mean %u, "
+        /* the WB gains the driver set (ISP_WB_GAIN1 / 2: R, B high) */
+        fprintf(stderr, "isp stats: %u rows x%.2f gain, R %u G mean %u B %u, "
                 "WB gains R %#x B %#x\n", s->frame_expo.lines,
-                s->frame_expo.gain / 1024.0, p[BE_AWB_AVG / 4 + 1],
+                s->frame_expo.gain / 1024.0, p[BE_AWB_AVG / 4],
+                p[BE_AWB_AVG / 4 + 1], p[BE_AWB_AVG / 4 + 2],
                 p[0x21210 / 4] >> 16, p[0x21214 / 4] >> 16);
+    }
+    s->stat_frames++;
+}
+
+/*
+ * Offline (VI_OFFLINE_VPSS_ONLINE) the pipe runs a list of VIPROC
+ * register images in DDR, one a vertical strip, chained through their
+ * PNEXT (0x2f8); each strip writes its statistics as one block
+ * (S_ISP_STT_REGS_TYPE) to the address at its 0x5d0 (VI_HAL_SetIspSttAddr),
+ * which VI copies to the ISP (VI_DRV_GetBeSttInfo).  Strip k holds the
+ * zone columns n / strips (+ 1 for the first n % strips) of the AE and
+ * AWB grids, row by row at that width; the ISP sums the histograms and
+ * puts the columns side by side (ISP_DRV_BE_*_OfflineStatisticsRead).
+ */
+#define OFF_AE_GLOBAL       0x0000      /* total, count, R, Gr, Gb, B means */
+#define OFF_AE_HIST         0x001c
+#define OFF_AE_RGR          0x101c
+#define OFF_AE_GBB          0x141c
+#define OFF_AWB_GLOBAL      0x181c      /* R, G, B means, count */
+#define OFF_AWB_ZONES       0x182c
+#define OFF_STT_SIZE        0x382c      /* up to the AF statistics */
+
+static int strip_cols(int cols, int strips, int k, int *first)
+{
+    int i, w = 0;
+
+    *first = 0;
+    for (i = 0; i <= k; i++) {
+        *first += w;
+        w = cols / strips + (i < cols % strips);
+    }
+    return w;
+}
+
+static void vi_be_stats_offline(HisiViState *s)
+{
+    const uint32_t aez = s->proc[BE_AE_ZONE / 4] ? s->proc[BE_AE_ZONE / 4]
+                                                  : 0xf11;
+    const uint32_t awz = s->proc[BE_AWB_ZONE / 4] ? s->proc[BE_AWB_ZONE / 4]
+                                                   : 0x2020;
+    const int aex = MAX(MIN(aez & 0x1f, 17), 1);
+    const int aey = MAX(MIN((aez >> 8) & 0x1f, 15), 1);
+    const int awx = MAX(MIN(awz & 0x3f, 32), 1);
+    const int awy = MAX(MIN((awz >> 8) & 0x3f, 32), 1);
+    const uint32_t count = scene_awb_count(s, awx * awy);
+    uint32_t stt[AWB_ZONES_MAX], node[PROC_STT_OFFLINE / 4 + 1];
+    g_autofree uint32_t *blk = g_malloc(OFF_STT_SIZE);
+    uint32_t a = s->proc[PROC_PNEXT / 4];
+    int strips = 0, k, b, c, x, y;
+
+    for (k = 0; k < PROC_NODE_MAX && a; k++) {
+        dma_memory_read(&address_space_memory, a, node, sizeof(node),
+                        MEMTXATTRS_UNSPECIFIED);
+        stt[k] = node[PROC_STT_OFFLINE / 4];
+        a = node[PROC_PNEXT / 4];
+        strips++;
+    }
+    for (k = 0; k < strips; k++) {
+        int ae0, aw0;
+        const int aew = strip_cols(aex, strips, k, &ae0);
+        const int aww = strip_cols(awx, strips, k, &aw0);
+        const double x0 = (double)aw0 / awx, x1 = (double)(aw0 + aww) / awx;
+        const uint32_t n = scene_samples(s) * aww / awx;
+        uint32_t *hist = blk + OFF_AE_HIST / 4;
+
+        if (!stt[k]) {
+            continue;
+        }
+        memset(blk, 0, OFF_STT_SIZE);
+        blk[0] = MIN(n * 4, 0x7ffffff);
+        blk[1] = blk[0];
+        for (c = 0; c < 4; c++) {
+            blk[2 + c] = scene_mean(c == 0 ? 0 : c == 3 ? 2 : 1, x0, x1,
+                                    s->level);
+        }
+        /* the histogram counts this strip's share of every bar */
+        for (b = 0; b < SCENE_BARS; b++) {
+            const double l = MAX(x0, (double)b / SCENE_BARS);
+            const double r = MIN(x1, (double)(b + 1) / SCENE_BARS);
+            const uint32_t m = r > l ? scene_samples(s) * (r - l) : 0;
+
+            hist[(int)scene_level(b, 0, s->level) >> 6] += m;
+            hist[(int)scene_level(b, 1, s->level) >> 6] += 2 * m;
+            hist[(int)scene_level(b, 2, s->level) >> 6] += m;
+        }
+        for (x = 0; x < aew; x++) {
+            const double z0 = (double)(ae0 + x) / aex;
+            const double z1 = (double)(ae0 + x + 1) / aex;
+            const uint32_t r = scene_mean(0, z0, z1, s->level);
+            const uint32_t g = scene_mean(1, z0, z1, s->level);
+            const uint32_t bl = scene_mean(2, z0, z1, s->level);
+
+            for (y = 0; y < aey; y++) {
+                blk[OFF_AE_RGR / 4 + y * aew + x] = r << 16 | g;
+                blk[OFF_AE_GBB / 4 + y * aew + x] = g << 16 | bl;
+            }
+        }
+        for (c = 0; c < 3; c++) {
+            blk[OFF_AWB_GLOBAL / 4 + c] = scene_mean(c, x0, x1, s->level);
+        }
+        blk[OFF_AWB_GLOBAL / 4 + 3] = count;
+        for (x = 0; x < aww; x++) {
+            const double z0 = (double)(aw0 + x) / awx;
+            const double z1 = (double)(aw0 + x + 1) / awx;
+            const uint32_t r = scene_mean(0, z0, z1, s->level);
+            const uint32_t g = scene_mean(1, z0, z1, s->level);
+            const uint32_t bl = scene_mean(2, z0, z1, s->level);
+
+            for (y = 0; y < awy; y++) {
+                blk[OFF_AWB_ZONES / 4 + (y * aww + x) * 2] = g << 16 | r;
+                blk[OFF_AWB_ZONES / 4 + (y * aww + x) * 2 + 1] =
+                    count << 16 | bl;
+            }
+        }
+        for (b = 0; b < OFF_STT_SIZE / 4; b++) {
+            blk[b] = cpu_to_le32(blk[b]);
+        }
+        stt_write(stt[k], blk, OFF_STT_SIZE);
+    }
+    if (s->stats_trace && s->stat_frames % MAX(s->fps, 1) == 0) {
+        /* the gains are in the strips' register images, not shown */
+        fprintf(stderr, "isp stats: %u rows x%.2f gain, R %u G mean %u B %u, "
+                "offline, %d strips\n", s->frame_expo.lines,
+                s->frame_expo.gain / 1024.0,
+                (uint32_t)scene_mean(0, 0, 1, s->level),
+                (uint32_t)scene_mean(1, 0, 1, s->level),
+                (uint32_t)scene_mean(2, 0, 1, s->level), strips);
     }
     s->stat_frames++;
 }
@@ -424,7 +576,7 @@ static void vi_proc_done(void *opaque)
     if (!vi_running(s)) {
         return;                     /* the pipe was stopped meanwhile */
     }
-    vi_be_stats(s);
+    vi_be_stats_offline(s);
     s->proc[PROC_INT / 4] |= PROC_INT_FSTART | PROC_INT_FEND;
     vi_update(s);
 }

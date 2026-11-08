@@ -298,6 +298,31 @@ backend's are read on the pipe's frame.
 | `0x22018..0x2202c` | AE global, as in the front end. |
 | `0x22140..0x2214c` | AWB global R / G / B means and count. |
 
+**A zone's count is every pixel of the zone** (1920 × 1080 / 1024 = 2025),
+not the AE's subsampled count. `lib_hiawb` averages the zones' counts in
+`AwbWbMatrixCalculate`. `AwbWbMatrixNormalize` moves the gains only while
+that average is above its ext register +0x30 (default 1024), and zones of
+64 or less are skipped. With subsampled counts (126) AWB worked out the
+colour temperature but never moved its gains.
+
+**Offline** (a sensor wider than 2304) no STT pointer above is used. Each
+strip's VIPROC register image, the nodes VI_PROC 0x2f8 chains, carries the
+address of a whole statistics block at its 0x5d0 (`VI_HAL_SetIspSttAddr`).
+The block is `S_ISP_STT_REGS_TYPE`:
+
+| Offset | |
+|---|---|
+| `0x0000..0x0014` | AE pixels total / counted, R / Gr / Gb / B means. |
+| `0x001c` | AE histogram, 1024 bins. |
+| `0x101c` / `0x141c` | AE zone means. |
+| `0x181c..0x1828` | AWB global R / G / B means and count. |
+| `0x182c` | AWB zones. |
+
+VI copies the block to the ISP (`VI_DRV_GetBeSttInfo`). Strip k holds
+`n / strips` zone columns (+1 for the first `n % strips`), row by row at
+that width. The ISP sums the histograms and puts the columns side by side
+(`ISP_DRV_BE_*_OfflineStatisticsRead`).
+
 The backend's STT addresses are set once (`ISP_DRV_SetOnlineSttAddr`).
 Every value is 16-bit, and the AWB means are taken before the white
 balance gains (FE_MODULE_POS `0x20090` bits 3:2 are not 2). The layouts
@@ -310,14 +335,28 @@ openhisilicon's `isp_stt_define.h`.
   with its measured average at its target. Before, it read `OriAve 0` in
   `/proc/umap/isp` and ran exposure and gain to their limits (6750 rows,
   ×15.5).
-- AWB's colour temperature follows the light, from 2659 K for R 1.0 /
-  B 0.4 to 6451 K for R 0.65 / B 0.68.
-- AWB's gains stay at the sensor's static calibration on that camera. The
-  cause is inside the closed `lib_hiawb` and has not been found.
+- AWB converges on gains that neutralise the light. For the default light
+  (R 0.55, B 0.7) it ends at R ×1.63 and B ×1.53 on hi3516ev200 / SC2315E,
+  which leaves R and B within 10 % of G, and at ×1.78 / ×1.47 on
+  gk7205v200 / SC2335. Offline on hi3516ev300 / GC4653, lights near the
+  sensor's calibration come out within a few per cent of `1 / light`:
+
+  | Light R / B | Gains R / B | CoTemp |
+  |---|---|---|
+  | 0.634 / 0.503 (the calibration) | 1.57 / 1.98 | 4761 K |
+  | 0.60 / 0.56 | 1.66 / 1.78 | 5586 K |
+  | 0.70 / 0.47 | 1.43 / 2.12 | 4184 K |
+  | 0.76 / 0.43 | 1.38 / 2.23 | 3663 K |
+
+  Lights far off the sensor's calibrated curve (0.82 / 0.52 or 1.0 / 0.4
+  on the GC4653) leave its gains at the static calibration, which
+  `lib_hiawb` falls back to when no zone looks white.
 
 `test-hisi-majestic.sh` passes `-global hisi-vi.stats-trace=on`, which
 prints one line a second of what AE and AWB see. It fails if AE has not
-brought the scene between 10 % and 70 % of full scale. The check applies
+brought the scene between 10 % and 70 % of full scale. Online, where the
+WB gain registers are MMIO (0x21210 / 0x21214), it also fails unless the
+light's R and B, times the gains, are within 15 % of G. The checks apply
 to SmartSens and GalaxyCore sensors, whose models report exposure.
 `qemu/tests/test-hisi-isp.py` checks the layouts at register level.
 
@@ -350,9 +389,7 @@ The release's MPI libraries are uClibc builds. Under musl they need:
 
 ## Not yet
 
-- **AWB gains** stay at the static calibration (see "ISP statistics"),
-  and AF, the local-average (LA) and dehaze statistics are not
-  produced.
+- **AF, the local-average (LA) and dehaze statistics** are not produced.
 - **Multi-slice pictures and B frames:** the model codes one slice per
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own

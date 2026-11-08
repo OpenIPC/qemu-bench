@@ -19,7 +19,8 @@
 # The ISP's statistics follow the sensor's exposure (hisi-vi): with a
 # sensor model that reports it, auto exposure must have settled the scene
 # between 10 % and 70 % of full scale (pinned at its longest exposure and
-# highest gain, it reads 0 or 65535).
+# highest gain, it reads 0 or 65535), and where the white balance gains
+# are visible (online) they must bring the light's R and B within 15 % of G.
 #
 # -icount shift=0: guest time follows the guest's instructions, so its
 # interrupt handlers always finish within a frame of VI's (without it, a
@@ -90,6 +91,35 @@ sc*|gc*)        # SmartSens / GalaxyCore models report their exposure
     echo "AE: $last"
     if [ -z "$mean" ] || [ "$mean" -lt 6553 ] || [ "$mean" -gt 45875 ]; then
         echo "auto exposure did not settle; console in $WORK/console.log" >&2
+        exit 1
+    fi
+    # AWB, where the driver programs the gains through MMIO (online): the
+    # light's R and B, times its gains, within 15 % of G
+    if ! echo "$last" | awk '
+        function hex(s,   n, i) {            # POSIX awk has no strtonum
+            n = 0; s = tolower(s); sub(/^0x/, "", s)
+            for (i = 1; i <= length(s); i++)
+                n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+            return n
+        }
+        { for (i = 1; i <= NF; i++) {
+            if ($i == "R" && $(i + 1) ~ /^[0-9]+$/) r = $(i + 1)
+            if ($i == "B" && $(i + 1) ~ /^[0-9]+,?$/) b = $(i + 1) + 0
+            if ($i == "mean") g = $(i + 1) + 0
+            if ($i == "gains") {
+                seen = 1; gr = hex($(i + 2)); gb = hex($(i + 4))
+            }
+        }
+        if (!seen) exit 0           # offline: the gains are not visible here
+        if (!gr || !gb || !g) {
+            print "AWB: no gains programmed"
+            exit 1
+        }
+        er = r * gr / 256 / g - 1; eb = b * gb / 256 / g - 1
+        printf "AWB: R x%.2f B x%.2f -> %+.0f%% / %+.0f%% of G\n",
+               gr / 256, gb / 256, er * 100, eb * 100
+        exit (er < -0.15 || er > 0.15 || eb < -0.15 || eb > 0.15) }'; then
+        echo "auto white balance did not settle; console in $WORK/console.log" >&2
         exit 1
     fi
     ;;
