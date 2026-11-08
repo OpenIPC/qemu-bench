@@ -104,10 +104,14 @@ static inline uint32_t vo2_1555(uint16_t p)
     return (r << 3 | r >> 2) << 16 | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2);
 }
 
-/* Clip an inclusive rectangle to the screen; false when nothing is left */
+/* Clip an inclusive rectangle to the screen; false when nothing is left
+ * or it starts off the screen */
 static bool vo2_rect(XmVo2State *s, hwaddr o, int w, int h,
                      int *x0, int *x1, int *y0, int *y1)
 {
+    if (R(o) >= (uint32_t)w || R(o + 8) >= (uint32_t)h) {
+        return false;
+    }
     *x0 = R(o);
     *x1 = MIN((int)R(o + 4), w - 1);
     *y0 = R(o + 8);

@@ -5,11 +5,13 @@
  * xm_rgn.ko's osd_process: +0x408 0 then 1 resets, +0xF8 1 enables the
  * interrupt, 0 to +0xF4 clears the done flags; region n at +0x100 * n
  * (+0x00 enable, colours at +0x10.., size +0x2C/+0x30, bitmap and frame
- * addresses +0x40..+0x54); +0x064 / +0x068 / +0x060 1 start the job.  It
- * then sleeps until +0xF0 reads non-zero (done), osd_int seeing +0xFC.  Without completions every OSD update times out ("osd:
- * timeout"), which stalls Sofia's start-up long enough that its main
- * thread applies the motion-detect config before the capture thread has
- * created the detectors, and Sofia crashes on the NULL handle.
+ * addresses +0x40..+0x54); a job is +0x064 (the last stage) and +0x068
+ * (their order), then 1 to +0x060, which starts it.  It then sleeps until
+ * +0xF0 reads non-zero (done), osd_int seeing +0xFC.  Without completions
+ * every OSD update times out ("osd: timeout"), which stalls Sofia's
+ * start-up long enough that its main thread applies the motion-detect
+ * config before the capture thread has created the detectors, and Sofia
+ * crashes on the NULL handle.
  *
  * Stage n (0 .. +0x064, in 0x100 blocks; +0x068 is the order, 0x3210)
  * overlays one region in place: +0x00 / +0x04 the mode, 0 / 1 ARGB1555

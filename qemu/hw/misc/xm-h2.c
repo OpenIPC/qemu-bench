@@ -68,6 +68,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmH2State, XM_H2)
 
 #define H2_MAX_W        4096
 #define H2_MAX_H        2304
+#define H2_MAX_STRIDE   8192
+/* the source: luma and chroma (NV12 or JPEG's planar copy) at the
+ * largest stride and height the jobs accept */
+#define H2_SRC_SIZE     ((size_t)H2_MAX_STRIDE * H2_MAX_H * 3 / 2)
 #define H2_REFS         32  /* 8 streams, up to 3 reconstructions each */
 #define H2_PS_WINDOW    2048
 #define H2_STREAMS      4
@@ -405,7 +409,7 @@ static size_t h2_hevc(XmH2State *s, uint8_t *out, size_t cap)
     int i;
 
     if (w < 8 || h < 8 || w > H2_MAX_W || h > H2_MAX_H || ys < w || cs < w ||
-        ys > 8192 || cs > 8192 || cap < 64) {
+        ys > H2_MAX_STRIDE || cs > H2_MAX_STRIDE || cap < 64) {
         return 0;
     }
     /* the parameter sets: in front of the output, else this size's last */
@@ -621,7 +625,7 @@ static size_t h2_h264(XmH2State *s, uint8_t *out, size_t cap)
     size_t n, k, hdr;
 
     if (w < 16 || h < 16 || (w & 15) || (h & 15) || w > H2_MAX_W ||
-        h > H2_MAX_H || ys < w || cs < w || ys > 8192 || cs > 8192 ||
+        h > H2_MAX_H || ys < w || cs < w || ys > H2_MAX_STRIDE || cs > H2_MAX_STRIDE ||
         cap < 64) {
         return 0;
     }
@@ -798,7 +802,7 @@ static size_t h2_jpeg(XmH2State *s, uint8_t *out, size_t cap)
         cs = ys;
     }
     if (w < 8 || h < 8 || w > H2_MAX_W || h > H2_MAX_H || ys < w ||
-        ys > 8192 || cs < w) {
+        ys > H2_MAX_STRIDE || cs < w || cs > H2_MAX_STRIDE) {
         return 0;
     }
     n = h2_front(s, R(0x020), win);
@@ -1005,7 +1009,7 @@ static void xm_h2_init(Object *obj)
     XmH2State *s = XM_H2(obj);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xm_h2_complete, s);
-    s->src = g_malloc((size_t)H2_MAX_W * H2_MAX_H * 2);
+    s->src = g_malloc(H2_SRC_SIZE);
     s->out = g_malloc((size_t)H2_MAX_W * H2_MAX_H * 2);
     memory_region_init_io(&s->iomem, obj, &xm_h2_ops, s, TYPE_XM_H2, H2_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);

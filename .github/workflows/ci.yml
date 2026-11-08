@@ -47,6 +47,9 @@ jobs:
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm530v200 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm533 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm535 '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm8536e '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm8520d '
+          ./qemu-src/build/qemu-system-arm -machine help | grep -E '^xm8521dv200 '
           # Goke GK7101/GK7102 (hw/arm/goke.c), Goke's own Ambarella-IP design
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7101 '
           ./qemu-src/build/qemu-system-arm -machine help | grep -E '^gk7102 '
