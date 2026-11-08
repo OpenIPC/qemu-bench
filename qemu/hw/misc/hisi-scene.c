@@ -16,6 +16,14 @@
  *
  * Every property can be changed while the guest runs, e.g.
  *   qom-set /machine/scene light 1200
+ * or scripted:
+ *   timeline a file of events, seconds from the first frame the ISP
+ *            measures; each line a time and properties to set:
+ *              8 light=150
+ *              16..20 light-r=550->1000 light-b=700->400
+ *              30 file=/path/office.ppm
+ *            "a..b prop=x->y" ramps a number from x to y over a..b, a
+ *            step each frame; '#' starts a comment
  *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
@@ -28,6 +36,8 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "hw/qdev-core.h"
+#include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "hw/misc/hisi-scene.h"
 
 #define SCENE_BARS          8
@@ -41,8 +51,21 @@ typedef struct SceneGrid {
     float *rgb;
 } SceneGrid;
 
+typedef struct SceneEvent {
+    double t0, t1;              /* seconds; t1 > t0 for a ramp */
+    char *prop;
+    char *value;                /* a step's value */
+    double from, to;            /* a ramp's ends */
+    bool done;
+} SceneEvent;
+
 struct HisiSceneState {
     DeviceState parent_obj;
+
+    char *timeline;
+    GArray *events;             /* SceneEvent */
+    bool started;
+    int64_t start_ns;           /* the first frame, virtual time */
 
     char *file;
     float *img;                 /* the source, linear, NULL for the bars */
@@ -239,6 +262,170 @@ const float *hisi_scene_grid(HisiSceneState *s, int w, int h)
     return g->rgb;
 }
 
+/* --- the timeline ------------------------------------------------------ */
+
+static void scene_events_free(GArray *ev)
+{
+    int i;
+
+    if (!ev) {
+        return;
+    }
+    for (i = 0; i < ev->len; i++) {
+        SceneEvent *e = &g_array_index(ev, SceneEvent, i);
+
+        g_free(e->prop);
+        g_free(e->value);
+    }
+    g_array_free(ev, true);
+}
+
+/* a whole finite number, nothing after it */
+static bool scene_parse_number(const char *str, double *v)
+{
+    char *end;
+
+    if (!str || !*str) {
+        return false;
+    }
+    *v = g_ascii_strtod(str, &end);
+    return end != str && !*end && isfinite(*v);
+}
+
+/* "t" or a rising "a..b" (a ramp), each a whole number of seconds */
+static bool scene_parse_time(const char *tok, double *t0, double *t1)
+{
+    const char *dots = strstr(tok, "..");
+    g_autofree char *a = NULL;
+
+    if (!dots) {
+        return scene_parse_number(tok, t0) && *t0 >= 0 &&
+               (*t1 = *t0, true);
+    }
+    a = g_strndup(tok, dots - tok);
+    return scene_parse_number(a, t0) && scene_parse_number(dots + 2, t1) &&
+           *t0 >= 0 && *t1 > *t0;
+}
+
+static GArray *scene_timeline_load(const char *path, Error **errp)
+{
+    g_autofree char *text = NULL;
+    g_auto(GStrv) lines = NULL;
+    GArray *ev = g_array_new(false, true, sizeof(SceneEvent));
+    int n;
+
+    if (!g_file_get_contents(path, &text, NULL, NULL)) {
+        error_setg(errp, "hisi-scene: cannot read timeline '%s'", path);
+        g_array_free(ev, true);
+        return NULL;
+    }
+    lines = g_strsplit(text, "\n", -1);
+    for (n = 0; lines[n]; n++) {
+        g_auto(GStrv) tok = NULL;
+        char *hash = strchr(lines[n], '#');
+        double t0 = 0, t1 = 0;
+        int i;
+
+        if (hash) {
+            *hash = 0;
+        }
+        tok = g_strsplit_set(g_strstrip(lines[n]), " \t", -1);
+        if (!tok[0] || !*tok[0]) {
+            continue;
+        }
+        if (!scene_parse_time(tok[0], &t0, &t1)) {
+            error_setg(errp, "hisi-scene: %s:%d: '%s' is not a time or a "
+                       "rising a..b ramp", path, n + 1, tok[0]);
+            goto bad;
+        }
+        for (i = 1; tok[i]; i++) {
+            SceneEvent e = { .t0 = t0, .t1 = t1 };
+            char *eq = strchr(tok[i], '=');
+            char *arrow = eq ? strstr(eq, "->") : NULL;
+
+            if (!*tok[i]) {
+                continue;
+            }
+            if (!eq || eq == tok[i]) {
+                error_setg(errp, "hisi-scene: %s:%d: '%s' is not prop=value",
+                           path, n + 1, tok[i]);
+                goto bad;
+            }
+            e.prop = g_strndup(tok[i], eq - tok[i]);
+            if (!strcmp(e.prop, "timeline")) {
+                /* it would free the events while they play */
+                error_setg(errp, "hisi-scene: %s:%d: a timeline cannot load "
+                           "another", path, n + 1);
+                g_free(e.prop);
+                goto bad;
+            }
+            if (t1 > t0) {
+                g_autofree char *from = arrow ?
+                    g_strndup(eq + 1, arrow - eq - 1) : NULL;
+
+                if (!arrow || !scene_parse_number(from, &e.from) ||
+                    !scene_parse_number(arrow + 2, &e.to)) {
+                    error_setg(errp, "hisi-scene: %s:%d: a ramp needs "
+                               "prop=from->to with two numbers", path, n + 1);
+                    g_free(e.prop);
+                    goto bad;
+                }
+            } else {
+                e.value = g_strdup(eq + 1);
+            }
+            g_array_append_val(ev, e);
+        }
+    }
+    return ev;
+
+bad:
+    scene_events_free(ev);
+    return NULL;
+}
+
+static void scene_apply(HisiSceneState *s, const char *prop,
+                        const char *value)
+{
+    Error *err = NULL;
+
+    if (!object_property_parse(OBJECT(s), prop, value, &err)) {
+        warn_report_err(err);
+    }
+}
+
+double hisi_scene_frame_begin(HisiSceneState *s)
+{
+    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    double t;
+    int i;
+
+    if (!s->started) {
+        s->started = true;
+        s->start_ns = now;
+    }
+    t = (double)(now - s->start_ns) / NANOSECONDS_PER_SECOND;
+    for (i = 0; s->events && i < s->events->len; i++) {
+        SceneEvent *e = &g_array_index(s->events, SceneEvent, i);
+        char buf[32];
+
+        if (e->done || t < e->t0) {
+            continue;
+        }
+        if (e->t1 > e->t0) {
+            const double f = MIN((t - e->t0) / (e->t1 - e->t0), 1.0);
+
+            snprintf(buf, sizeof(buf), "%.0f",
+                     e->from + (e->to - e->from) * f);
+            scene_apply(s, e->prop, buf);
+            e->done = f >= 1.0;
+        } else {
+            scene_apply(s, e->prop, e->value);
+            e->done = true;
+        }
+    }
+    return t;
+}
+
 double hisi_scene_light(HisiSceneState *s, double tint[3])
 {
     tint[0] = s->light_r / 1000.0;
@@ -313,6 +500,30 @@ static void scene_set_file(Object *obj, const char *value, Error **errp)
     s->gen++;
 }
 
+static char *scene_get_timeline(Object *obj, Error **errp)
+{
+    return g_strdup(HISI_SCENE(obj)->timeline ? HISI_SCENE(obj)->timeline
+                                               : "");
+}
+
+static void scene_set_timeline(Object *obj, const char *value, Error **errp)
+{
+    HisiSceneState *s = HISI_SCENE(obj);
+    GArray *ev = NULL;
+
+    if (value && *value) {
+        ev = scene_timeline_load(value, errp);
+        if (!ev) {
+            return;
+        }
+    }
+    scene_events_free(s->events);
+    g_free(s->timeline);
+    s->events = ev;
+    s->timeline = g_strdup(value);
+    s->started = false;         /* its clock starts at the next frame */
+}
+
 static void scene_get_u32(Object *obj, Visitor *v, const char *name,
                           void *opaque, Error **errp)
 {
@@ -363,6 +574,8 @@ static void hisi_scene_finalize(Object *obj)
     }
     g_free(s->img);
     g_free(s->file);
+    scene_events_free(s->events);
+    g_free(s->timeline);
 }
 
 static void hisi_scene_class_init(ObjectClass *klass, const void *data)
@@ -371,6 +584,8 @@ static void hisi_scene_class_init(ObjectClass *klass, const void *data)
 
     object_class_property_add_str(klass, "file", scene_get_file,
                                   scene_set_file);
+    object_class_property_add_str(klass, "timeline", scene_get_timeline,
+                                  scene_set_timeline);
     dc->desc = "the scene in front of an emulated HiSilicon camera";
     dc->user_creatable = false;
 }

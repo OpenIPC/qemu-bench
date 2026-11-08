@@ -344,6 +344,7 @@ jobs:
         include:
           - soc: hi3516ev200
             majestic: true
+            scenario: true
           # and sensors wider than VPSS's line buffer (2304): VI offline
           - soc: hi3516ev300
             majestic: true
@@ -437,6 +438,18 @@ jobs:
           bash qemu-boot/test-hisi-majestic.sh --soc ${{ matrix.soc }} \
             --qemu ./qemu-src/build/qemu-system-arm --timeout 480 \
             --work "$RUNNER_TEMP/majestic"
+
+      # A scenario in front of the camera (docs/hisilicon-digital-twin.md
+      # step 3): the light drops to a quarter and comes back, then turns
+      # warmer; hisi-vi records every frame and twin-metrics.py checks
+      # that AE settles back to its level and AWB leaves a grey neutral.
+      - name: majestic through a lighting scenario (AE / AWB metrics)
+        if: matrix.scenario
+        timeout-minutes: 30
+        run: |
+          bash qemu-boot/test-hisi-scenario.sh --soc ${{ matrix.soc }} \
+            --qemu ./qemu-src/build/qemu-system-arm --timeout 1500 \
+            --work "$RUNNER_TEMP/scenario"
 
       # A 5 MP IMX335 (2592x1944) and a 4 MP GC4653 (2560x1440): too wide
       # for online, so VI captures into DDR, the driver starts the pipe
