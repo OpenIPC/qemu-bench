@@ -74,6 +74,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbDspState, AMB_DSP)
 
 /* command/message category and the codes we care about */
 #define CMD_DSP_SET_OPERATION_MODE 0x01000001
+#define CMD_DSP_SUSPEND_OPERATION_MODE 0x01000003
+#define CMD_VCAP_TMR_MODE          0x08000003
 #define CMD_H264ENC_START          0x02000002
 #define CMD_H264ENC_STOP           0x02000003
 #define CMD_H264ENC_SETUP          0x02000001
@@ -206,6 +208,8 @@ struct AmbDspState {
     uint32_t op_mode;           /* what we report back to the driver */
     uint32_t boot_ticks;        /* heartbeats since reset */
     bool mode_commanded;        /* set once the driver asks for a mode */
+    bool vcap_paused;           /* capture timer stopped: report vcap setup
+                                 * mode IDLE so iav's enc-sub-mode wait wakes */
     uint32_t enc_streams;       /* bitmask of streams the driver has started */
     char *dump_dir;             /* if set, each frame is kept as frame-N.jpg/.h264 */
 
@@ -280,7 +284,34 @@ static uint32_t amb_dsp_service_port(AmbDspState *s, hwaddr cmd_port, int port)
             if (m == DSP_OP_MODE_CAMERA_RECORD || m == DSP_OP_MODE_IDLE) {
                 s->op_mode = m;
                 s->mode_commanded = true;
+                if (m == DSP_OP_MODE_CAMERA_RECORD) {
+                    s->vcap_paused = false;   /* capture resumes with the mode */
+                }
             }
+        } else if (code == CMD_VCAP_TMR_MODE) {
+            /*
+             * iav moves the VCAP "setup mode" -- the enc sub-mode it polls --
+             * by starting/stopping the capture timer.  A zero timer scaler
+             * stops it; iav then waits (dsp_set_enc_sub_mode) for the DSP to
+             * report setup mode IDLE before suspending the operation mode.
+             * Track the pause so the next VCAP_STATUS carries setup mode 0 and
+             * that wait completes instead of timing out.
+             */
+            s->vcap_paused = (amb_dsp_ld(c + 4) == 0);
+        } else if (code == CMD_DSP_SUSPEND_OPERATION_MODE) {
+            /*
+             * iav leaves PREVIEW/ENCODE by suspending the operation mode back
+             * to IDLE -- not with SET_OPERATION_MODE(IDLE) but with this
+             * SUSPEND command, which carries no mode byte.  iav_goto_idle then
+             * polls the DSP-reported op_mode to reach IDLE (dsp_set_op_mode's
+             * "Enter mode event").  Real iav.ko on silicon sees the part return
+             * to idle and the transition succeeds; report IDLE here so the same
+             * PREVIEW->IDLE goto_idle completes instead of timing out (the
+             * emulated DSP otherwise stayed in CAMERA_RECORD and iav failed the
+             * whole pipeline with EPERM).
+             */
+            s->op_mode = DSP_OP_MODE_IDLE;
+            s->mode_commanded = true;
         }
         /*
          * Track per-stream encode start/stop (stream_id in byte 4).  Only a
@@ -372,13 +403,20 @@ static void amb_dsp_reply(AmbDspState *s, hwaddr msg_port, uint32_t seq,
  * when it sees this message with vcap_setup_mode == VIDEO and a non-zero
  * main_pic_luma_addr while the DSP is in CAMERA_RECORD -- so a captured frame
  * is exactly "a VCAP_STATUS whose luma address points at the picture".
+ *
+ * The low 3 bits of that setup-mode field are also the DSP "enc sub mode" iav
+ * polls (dsp_set_enc_sub_mode) across a PREVIEW<->IDLE restart: VIDEO(1) while
+ * capturing, IDLE(0) once iav has stopped the capture timer.  Report IDLE when
+ * paused so that wait wakes -- and with it the frame counter stops advancing,
+ * which is what a stopped timer means.
  */
-static void amb_dsp_post_vcap(hwaddr msg_port, uint32_t luma)
+static void amb_dsp_post_vcap(hwaddr msg_port, uint32_t luma, bool active)
 {
     uint32_t v[DSP_MSG_SIZE / 4] = { 0 };
 
     v[0] = cpu_to_le32(MSG_VCAP_STATUS);
-    v[VCAP_MSG_MODE_OFF / 4] = cpu_to_le32(VCAP_VIDEO_MODE | (1u << 3));
+    v[VCAP_MSG_MODE_OFF / 4] = active ? cpu_to_le32(VCAP_VIDEO_MODE | (1u << 3))
+                                      : 0;
     v[VCAP_MSG_LUMA_OFF / 4] = cpu_to_le32(luma);
     dma_memory_write(&address_space_memory, msg_port + DSP_MSG_SIZE, v,
                      sizeof(v), MEMTXATTRS_UNSPECIFIED);
@@ -632,7 +670,7 @@ static void amb_dsp_tick(void *opaque)
         if (!luma) {
             luma = s->iavmem_base;
         }
-        amb_dsp_post_vcap(msg + DSP_PORT_SIZE, luma);
+        amb_dsp_post_vcap(msg + DSP_PORT_SIZE, luma, !s->vcap_paused);
     }
 
     /*
@@ -642,7 +680,15 @@ static void amb_dsp_tick(void *opaque)
     uint32_t enc_msgs = 0;
     for (uint32_t sid = 0; sid < 8; sid++) {
         if (s->enc_streams & (1u << sid)) {
-            amb_dsp_emit_frame(s, sid);
+            /* A stopped capture timer means no new captured picture to encode,
+             * so hold frame production (and the per-stream counter) while the
+             * vcap is paused -- matching the IDLE setup mode VCAP_STATUS then
+             * reports.  The encode-status handshake still goes out with the
+             * unchanged counter (delta 0), so iav keeps the stream marked
+             * encoding and simply sees no new frames until capture resumes. */
+            if (!s->vcap_paused) {
+                amb_dsp_emit_frame(s, sid);
+            }
             /* The per-codec counter iav diffs must count only this stream's
              * frames; emit_frame advanced estr[sid].frames iff it shipped one. */
             amb_dsp_post_enc(msg, enc_msgs, sid, s->estr[sid].codec,
@@ -673,6 +719,7 @@ static void amb_dsp_reset(DeviceState *dev)
     s->op_mode = DSP_OP_MODE_INIT;
     s->boot_ticks = 0;
     s->mode_commanded = false;
+    s->vcap_paused = false;
     s->enc_streams = 0;
     memset(s->estr, 0, sizeof(s->estr));
     s->last_seq[0] = s->last_seq[1] = 0;
@@ -736,7 +783,7 @@ static const VMStateDescription vmstate_amb_dsp_stream = {
 
 static const VMStateDescription vmstate_amb_dsp = {
     .name = "amb-dsp",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(heartbeat, AmbDspState),
@@ -744,6 +791,7 @@ static const VMStateDescription vmstate_amb_dsp = {
         VMSTATE_UINT32(op_mode, AmbDspState),
         VMSTATE_UINT32(boot_ticks, AmbDspState),
         VMSTATE_BOOL(mode_commanded, AmbDspState),
+        VMSTATE_BOOL_V(vcap_paused, AmbDspState, 2),
         VMSTATE_UINT32(enc_streams, AmbDspState),
         VMSTATE_UINT32_ARRAY(last_seq, AmbDspState, 2),
         VMSTATE_STRUCT_ARRAY(estr, AmbDspState, 8, 1, vmstate_amb_dsp_stream,
