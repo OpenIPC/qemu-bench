@@ -447,11 +447,16 @@ if ! grep -q xm-osd "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-osd.c"
 fi
-if ! grep -q atbm-wifi "$QEMU_DIR/hw/usb/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('atbm-wifi.c'))" \
-        >> "$QEMU_DIR/hw/usb/meson.build"
-    echo "  hw/usb/meson.build: added atbm-wifi.c"
-fi
+# the USB AltoBeam dongle: Xiongmai and Goke boards, and the Ingenic T31's
+# DWC2 host (OpenIPC/firmware#1655's ATBM6012B-X)
+for cfg in XIONGMAI INGENIC; do
+    if ! grep -q "CONFIG_$cfg', if_true: files('atbm-wifi.c')" \
+            "$QEMU_DIR/hw/usb/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_$cfg', if_true: files('atbm-wifi.c'))" \
+            >> "$QEMU_DIR/hw/usb/meson.build"
+        echo "  hw/usb/meson.build: added atbm-wifi.c for $cfg"
+    fi
+done
 if ! grep -q jpeg-enc "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('jpeg-enc.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"

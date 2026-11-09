@@ -363,6 +363,12 @@ Their Wi-Fi is an AltoBeam ATBM60xx USB dongle (`atbm-wifi`):
 -device atbm-wifi,bus=usb-bus.0,port=1,netdev=w,pid=0x888b,chip-version=0x4a
 ```
 
+An AresLite tells its variant by eFuse UID bits, which OpenIPC's atbm-wifi
+driver reads through 0x16b00000 (the byte index << 8) and 0x16b00004:
+bits 8 and 10 set and 3 clear are a 6012B-X, all clear a 6032-X.
+`efuse=` gives bytes 0..3 (`efuse=0x0500`: the 6012B-X); the default, 0,
+is a 6032-X.
+
 The chip runs an LMAC firmware that speaks ST-Ericsson's CW1200 WSM to the
 driver (`hal_apollo`, source in OpenIPC's `atbm_60xx`). The model answers
 WSM itself:

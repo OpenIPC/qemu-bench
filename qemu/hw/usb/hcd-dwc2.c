@@ -758,7 +758,7 @@ static void dwc2_work_bh(void *opaque)
             dwc2_handle_packet(s, p->devadr, dev, ep, p->index, true);
             found = true;
         }
-        if (++chan == DWC2_NB_CHAN) {
+        if (++chan == s->num_chan) {
             chan = 0;
         }
         if (found) {
@@ -825,6 +825,32 @@ static void dwc2_enable_chan(DWC2State *s,  uint32_t index)
 
     dwc2_handle_packet(s, devadr, dev, ep, index, true);
     qemu_bh_schedule(s->async_bh);
+}
+
+/*
+ * The ID pin's debounce: an A-device core (otg-a-device) reports its
+ * connector once, when the filter settles after power-on, as a connector
+ * ID status change.  Drivers that bring the host up from that interrupt
+ * (Ingenic's dwc2, A_HOST in dwc2_conn_id_status_change_work) soft-reset
+ * the core, clear GINTSTS and unmask it first, so the 100 ms (long
+ * debounce) count restarts at each core soft reset until it has fired;
+ * the host bring-up's own soft reset after that changes nothing.
+ */
+static void dwc2_id_debounced(void *opaque)
+{
+    DWC2State *s = opaque;
+
+    s->id_reported = true;
+    s->gintsts |= GINTSTS_CONIDSTSCHNG;
+    dwc2_update_irq(s);
+}
+
+static void dwc2_id_arm(DWC2State *s)
+{
+    if (s->otg_a_device && !s->id_reported) {
+        timer_mod(s->id_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  100 * SCALE_MS);
+    }
 }
 
 /*
@@ -967,6 +993,7 @@ static void dwc2_glbreg_write(void *ptr, hwaddr addr, int index, uint64_t val,
         }
         if (!(old & GRSTCTL_CSFTRST) && (val & GRSTCTL_CSFTRST)) {
             dwc2_core_soft_reset(s);
+            dwc2_id_arm(s);
         }
         /* don't allow clearing of self-clearing bits */
         val |= old & (GRSTCTL_TXFFLSH | GRSTCTL_RXFFLSH |
@@ -1174,7 +1201,7 @@ static uint64_t dwc2_hreg1_read(void *ptr, hwaddr addr, int index,
     DWC2State *s = ptr;
     uint32_t val;
 
-    if (addr < HCCHAR(0) || addr > HCDMAB(DWC2_NB_CHAN - 1)) {
+    if (addr < HCCHAR(0) || addr > HCDMAB(s->num_chan - 1)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
         return 0;
@@ -1197,7 +1224,7 @@ static void dwc2_hreg1_write(void *ptr, hwaddr addr, int index, uint64_t val,
     int enflg = 0;
     int disflg = 0;
 
-    if (addr < HCCHAR(0) || addr > HCDMAB(DWC2_NB_CHAN - 1)) {
+    if (addr < HCCHAR(0) || addr > HCDMAB(s->num_chan - 1)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
         return;
@@ -1446,6 +1473,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
     }
 
     timer_del(s->frame_timer);
+    timer_del(s->id_timer);
+    s->id_reported = false;
     qemu_bh_cancel(s->async_bh);
 
     if (s->uport.dev && s->uport.dev->attached) {
@@ -1454,7 +1483,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
 
     dwc2_bus_stop(s);
 
-    s->gotgctl = GOTGCTL_BSESVLD | GOTGCTL_ASESVLD | GOTGCTL_CONID_B;
+    s->gotgctl = GOTGCTL_BSESVLD | GOTGCTL_ASESVLD |
+                 (s->otg_a_device ? 0 : GOTGCTL_CONID_B);
     s->gotgint = 0;
     s->gahbcfg = 0;
     s->gusbcfg = 5 << GUSBCFG_USBTRDTIM_SHIFT;
@@ -1478,7 +1508,7 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
                  (4 << GHWCFG2_NONPERIO_TX_Q_DEPTH_SHIFT) |
                  GHWCFG2_DYNAMIC_FIFO |
                  GHWCFG2_PERIO_EP_SUPPORTED |
-                 ((DWC2_NB_CHAN - 1) << GHWCFG2_NUM_HOST_CHAN_SHIFT) |
+                 ((s->num_chan - 1) << GHWCFG2_NUM_HOST_CHAN_SHIFT) |
                  (GHWCFG2_INT_DMA_ARCH << GHWCFG2_ARCHITECTURE_SHIFT) |
                  (GHWCFG2_OP_MODE_NO_SRP_CAPABLE_HOST << GHWCFG2_OP_MODE_SHIFT);
     s->ghwcfg3 = (4096 << GHWCFG3_DFIFO_DEPTH_SHIFT) |
@@ -1565,6 +1595,21 @@ static void dwc2_realize(DeviceState *dev, Error **errp)
     DWC2State *s = DWC2_USB(dev);
     Object *obj;
 
+    if (s->num_chan < 1 || s->num_chan > DWC2_NB_CHAN) {
+        error_setg(errp, "dwc2: host-channels must be 1..%d", DWC2_NB_CHAN);
+        return;
+    }
+    /* a ghwcfg2 override must tell the guest the channels the core has */
+    if (s->cfg_ghwcfg2 &&
+        ((s->cfg_ghwcfg2 & GHWCFG2_NUM_HOST_CHAN_MASK) >>
+         GHWCFG2_NUM_HOST_CHAN_SHIFT) + 1 != s->num_chan) {
+        error_setg(errp, "dwc2: ghwcfg2 0x%08x gives %u host channels, "
+                   "host-channels %u", s->cfg_ghwcfg2,
+                   ((s->cfg_ghwcfg2 & GHWCFG2_NUM_HOST_CHAN_MASK) >>
+                    GHWCFG2_NUM_HOST_CHAN_SHIFT) + 1, s->num_chan);
+        return;
+    }
+    s->usb_buf_hi = &s->usb_buf[DWC2_NB_CHAN_V1][0];
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
 
     s->dma_mr = MEMORY_REGION(obj);
@@ -1586,6 +1631,7 @@ static void dwc2_realize(DeviceState *dev, Error **errp)
     s->fi = USB_FRMINTVL - 1;
     s->eof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_frame_boundary, s);
     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_work_timer, s);
+    s->id_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_id_debounced, s);
     s->async_bh = qemu_bh_new_guarded(dwc2_work_bh, s,
                                       &dev->mem_reentrancy_guard);
 
@@ -1633,6 +1679,52 @@ static const VMStateDescription vmstate_dwc2_state_packet = {
     },
 };
 
+/*
+ * The main part is the 8-channel core's stream, byte for byte, so state
+ * saved before host-channels existed still loads.  Channels 8..15 travel
+ * in a subsection, sent only for a core that has them, as does the ID
+ * debounce of an A-device core.
+ */
+static bool dwc2_more_channels_needed(void *opaque)
+{
+    return ((DWC2State *)opaque)->num_chan > DWC2_NB_CHAN_V1;
+}
+
+static const VMStateDescription vmstate_dwc2_more_channels = {
+    .name = "dwc2/more-channels",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = dwc2_more_channels_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_SUB_ARRAY(hreg1, DWC2State, DWC2_NB_CHAN_V1 * 8,
+                                 (DWC2_NB_CHAN - DWC2_NB_CHAN_V1) * 8),
+        VMSTATE_STRUCT_SUB_ARRAY(packet, DWC2State, DWC2_NB_CHAN_V1,
+                                 DWC2_NB_CHAN - DWC2_NB_CHAN_V1, 1,
+                                 vmstate_dwc2_state_packet, DWC2Packet),
+        VMSTATE_BUFFER_POINTER_UNSAFE(usb_buf_hi, DWC2State, 0,
+                                      (DWC2_NB_CHAN - DWC2_NB_CHAN_V1) *
+                                      DWC2_MAX_XFER_SIZE),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool dwc2_otg_a_device_needed(void *opaque)
+{
+    return ((DWC2State *)opaque)->otg_a_device;
+}
+
+static const VMStateDescription vmstate_dwc2_otg_a_device = {
+    .name = "dwc2/otg-a-device",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = dwc2_otg_a_device_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER_PTR(id_timer, DWC2State),
+        VMSTATE_BOOL(id_reported, DWC2State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_dwc2_state = {
     .name = "dwc2",
     .version_id = 1,
@@ -1644,8 +1736,7 @@ const VMStateDescription vmstate_dwc2_state = {
                              DWC2_FSZREG_SIZE / sizeof(uint32_t)),
         VMSTATE_UINT32_ARRAY(hreg0, DWC2State,
                              DWC2_HREG0_SIZE / sizeof(uint32_t)),
-        VMSTATE_UINT32_ARRAY(hreg1, DWC2State,
-                             DWC2_HREG1_SIZE / sizeof(uint32_t)),
+        VMSTATE_UINT32_SUB_ARRAY(hreg1, DWC2State, 0, DWC2_NB_CHAN_V1 * 8),
         VMSTATE_UINT32_ARRAY(pcgreg, DWC2State,
                              DWC2_PCGREG_SIZE / sizeof(uint32_t)),
 
@@ -1660,12 +1751,17 @@ const VMStateDescription vmstate_dwc2_state = {
         VMSTATE_UINT16(next_chan, DWC2State),
         VMSTATE_BOOL(working, DWC2State),
 
-        VMSTATE_STRUCT_ARRAY(packet, DWC2State, DWC2_NB_CHAN, 1,
-                             vmstate_dwc2_state_packet, DWC2Packet),
-        VMSTATE_UINT8_2DARRAY(usb_buf, DWC2State, DWC2_NB_CHAN,
-                              DWC2_MAX_XFER_SIZE),
+        VMSTATE_STRUCT_SUB_ARRAY(packet, DWC2State, 0, DWC2_NB_CHAN_V1, 1,
+                                 vmstate_dwc2_state_packet, DWC2Packet),
+        VMSTATE_BUFFER_UNSAFE(usb_buf, DWC2State, 1,
+                              DWC2_NB_CHAN_V1 * DWC2_MAX_XFER_SIZE),
 
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_dwc2_more_channels,
+        &vmstate_dwc2_otg_a_device,
+        NULL
     }
 };
 
@@ -1676,6 +1772,8 @@ static const Property dwc2_usb_properties[] = {
     DEFINE_PROP_UINT32("ghwcfg3", DWC2State, cfg_ghwcfg3, 0),
     DEFINE_PROP_UINT32("ghwcfg4", DWC2State, cfg_ghwcfg4, 0),
     DEFINE_PROP_UINT32("hptxfsiz", DWC2State, cfg_hptxfsiz, 0),
+    DEFINE_PROP_BOOL("otg-a-device", DWC2State, otg_a_device, false),
+    DEFINE_PROP_UINT32("host-channels", DWC2State, num_chan, 8),
 };
 
 static void dwc2_class_init(ObjectClass *klass, const void *data)

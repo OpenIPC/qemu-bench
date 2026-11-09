@@ -1704,9 +1704,18 @@ static void ingenic_init(MachineState *ms)
         sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_AVPU));
     }
 
-    /* USB: the DWC2 OTG core, host mode (QEMU's Raspberry Pi model) */
+    /*
+     * USB: the DWC2 OTG core, host mode (QEMU's Raspberry Pi model).  The
+     * cameras' ID pin makes it an A-device -- the kernels' dwc2 starts the
+     * host only from the connector ID change it reports (otg-a-device) --
+     * and it has 16 host channels, which that driver uses in turn without
+     * asking GHWCFG2 (MAX_EPS_CHANNELS); with 8, every ninth transfer of a
+     * USB device went nowhere and enumeration never finished
+     */
     dev = qdev_new("dwc2-usb");
     object_property_add_const_link(OBJECT(dev), "dma-mr", OBJECT(sysmem));
+    qdev_prop_set_bit(dev, "otg-a-device", true);
+    qdev_prop_set_uint32(dev, "host-channels", 16);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, OTG_BASE);
