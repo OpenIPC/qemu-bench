@@ -75,7 +75,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbDspState, AMB_DSP)
 /* command/message category and the codes we care about */
 #define CMD_DSP_SET_OPERATION_MODE 0x01000001
 #define CMD_DSP_SUSPEND_OPERATION_MODE 0x01000003
+#define CMD_VCAP_SETUP             0x08000001
 #define CMD_VCAP_TMR_MODE          0x08000003
+#define VCAP_SETUP_MAIN_WH_OFF     12    /* main_w:16 | main_h:16 */
 #define CMD_H264ENC_START          0x02000002
 #define CMD_H264ENC_STOP           0x02000003
 #define CMD_H264ENC_SETUP          0x02000001
@@ -102,6 +104,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmbDspState, AMB_DSP)
 #define AMB_CODEC_H264   2
 #define MSG_DSP_STATUS             0x81000001
 #define MSG_VCAP_STATUS            0x88000001
+#define MSG_VCAP_FRAME_DONE        0x88000003
 #define MSG_H264ENC_STATUS         0x82000001
 
 /* enc_status_msg_t: the one field iav keys the encode-start gate on. */
@@ -156,6 +159,17 @@ static const uint8_t amb_dsp_qc[64] = {
 #define VCAP_VIDEO_MODE            1   /* vcap_setup_mode value for recording */
 #define VCAP_MSG_MODE_OFF          4   /* vcap_setup_mode (low 3 bits) + flags */
 #define VCAP_MSG_LUMA_OFF          16  /* main_pic_luma_addr; nonzero => captured */
+/*
+ * The message carries a buffer-report block at byte 8 that handle_vcap_msg
+ * memcpys wholesale into iav's buffer-descriptor global (.LANCHOR1+4); from
+ * there irq_update_bufcap feeds the main source buffer's luma/chroma/pitch into
+ * what iav_query_yuvdesc returns.  The main buffer's fields sit at block+8/+12/
+ * +18 => message bytes 16/20/26.  Without chroma and pitch a raw-YUV readback
+ * comes back pitch 0 and gets rejected by the client's validity check.
+ */
+#define VCAP_MSG_CHROMA_OFF        20  /* main_pic_chroma_addr */
+#define VCAP_MSG_WIDTH_OFF         24  /* main buffer width (u16) */
+#define VCAP_MSG_PITCH_OFF         26  /* main buffer line pitch (u16) */
 
 /* DSP_HEADER_CMD: the first command in each iteration (128 bytes). */
 #define CMD_HDR_CODE_OFF   0
@@ -210,6 +224,7 @@ struct AmbDspState {
     bool mode_commanded;        /* set once the driver asks for a mode */
     bool vcap_paused;           /* capture timer stopped: report vcap setup
                                  * mode IDLE so iav's enc-sub-mode wait wakes */
+    uint16_t main_w, main_h;    /* main capture buffer size (CMD_VCAP_SETUP) */
     uint32_t enc_streams;       /* bitmask of streams the driver has started */
     char *dump_dir;             /* if set, each frame is kept as frame-N.jpg/.h264 */
 
@@ -288,6 +303,13 @@ static uint32_t amb_dsp_service_port(AmbDspState *s, hwaddr cmd_port, int port)
                     s->vcap_paused = false;   /* capture resumes with the mode */
                 }
             }
+        } else if (code == CMD_VCAP_SETUP) {
+            /* The main capture buffer's dimensions: the raw-YUV readback a
+             * client meters 3A from reports this geometry with a matching
+             * pitch (main_w:16 | main_h:16 at byte 12). */
+            uint32_t wh = amb_dsp_ld(c + VCAP_SETUP_MAIN_WH_OFF);
+            s->main_w = wh & 0xffff;
+            s->main_h = wh >> 16;
         } else if (code == CMD_VCAP_TMR_MODE) {
             /*
              * iav moves the VCAP "setup mode" -- the enc sub-mode it polls --
@@ -410,7 +432,8 @@ static void amb_dsp_reply(AmbDspState *s, hwaddr msg_port, uint32_t seq,
  * paused so that wait wakes -- and with it the frame counter stops advancing,
  * which is what a stopped timer means.
  */
-static void amb_dsp_post_vcap(hwaddr msg_port, uint32_t luma, bool active)
+static void amb_dsp_post_vcap(hwaddr msg_port, uint32_t luma, uint32_t chroma,
+                              uint32_t w, uint32_t pitch, bool active)
 {
     uint32_t v[DSP_MSG_SIZE / 4] = { 0 };
 
@@ -418,8 +441,30 @@ static void amb_dsp_post_vcap(hwaddr msg_port, uint32_t luma, bool active)
     v[VCAP_MSG_MODE_OFF / 4] = active ? cpu_to_le32(VCAP_VIDEO_MODE | (1u << 3))
                                       : 0;
     v[VCAP_MSG_LUMA_OFF / 4] = cpu_to_le32(luma);
+    v[VCAP_MSG_CHROMA_OFF / 4] = cpu_to_le32(chroma);
+    /* width (u16) and pitch (u16) share the word at byte 24. */
+    v[VCAP_MSG_WIDTH_OFF / 4] = cpu_to_le32((w & 0xffff) |
+                                            ((pitch & 0xffff) << 16));
     dma_memory_write(&address_space_memory, msg_port + DSP_MSG_SIZE, v,
                      sizeof(v), MEMTXATTRS_UNSPECIFIED);
+}
+
+/*
+ * A "captured picture is ready in the YUV buffer" report, in the slot after
+ * VCAP_STATUS.  handle_vcap_msg calls irq_update_bufcap -- which sets the
+ * per-buffer YUV-ready flag and wakes the waitqueue iav_query_yuvdesc blocks
+ * on -- only for VCAP code 0x88000003, and only when the preceding
+ * 0x88000001 recorded setup mode VIDEO.  Without it a client's raw-YUV
+ * readback (divinus' software AE/AWB) blocks the full 2 s then gets -EAGAIN.
+ */
+static void amb_dsp_post_vcap_done(hwaddr msg_port, uint32_t slot, uint32_t luma)
+{
+    uint32_t v[DSP_MSG_SIZE / 4] = { 0 };
+
+    v[0] = cpu_to_le32(MSG_VCAP_FRAME_DONE);
+    v[VCAP_MSG_LUMA_OFF / 4] = cpu_to_le32(luma);
+    dma_memory_write(&address_space_memory, msg_port + (slot + 1) * DSP_MSG_SIZE,
+                     v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
 }
 
 /*
@@ -473,6 +518,32 @@ static void amb_dsp_fill_luma(uint8_t *y, int stride, int w, int h,
             y[(size_t)r * stride + c] = l;
         }
     }
+}
+
+/*
+ * Write the main capture buffer as an NV12 (4:2:0, interleaved chroma) picture
+ * at the DSP address the VCAP report points iav's raw-YUV readback at.  The
+ * same colour-bar pattern the encoder synthesises, so a client's software 3A
+ * meters a real, moving image.  luma plane is pitch*h, chroma plane pitch*h/2.
+ */
+static void amb_dsp_write_yuv(hwaddr luma, uint32_t pitch, uint32_t w,
+                              uint32_t h, uint32_t frame)
+{
+    g_autofree uint8_t *y = g_malloc((size_t)pitch * h);
+    g_autofree uint8_t *uv = g_malloc((size_t)pitch * (h / 2));
+
+    amb_dsp_fill_luma(y, pitch, w, h, frame);
+    for (uint32_t r = 0; r < h / 2; r++) {
+        for (uint32_t c = 0; c + 1 < pitch; c += 2) {
+            int b = c < w ? (int)(c * 8 / w) : 0;
+            uv[(size_t)r * pitch + c]     = amb_bar_u[b];
+            uv[(size_t)r * pitch + c + 1] = amb_bar_v[b];
+        }
+    }
+    dma_memory_write(&address_space_memory, luma, y, (size_t)pitch * h,
+                     MEMTXATTRS_UNSPECIFIED);
+    dma_memory_write(&address_space_memory, luma + (hwaddr)pitch * h, uv,
+                     (size_t)pitch * (h / 2), MEMTXATTRS_UNSPECIFIED);
 }
 
 static void amb_dsp_emit_frame(AmbDspState *s, uint32_t sid)
@@ -670,7 +741,24 @@ static void amb_dsp_tick(void *opaque)
         if (!luma) {
             luma = s->iavmem_base;
         }
-        amb_dsp_post_vcap(msg + DSP_PORT_SIZE, luma, !s->vcap_paused);
+        /* Main source-buffer geometry for the raw-YUV readback.  NV12 pitch is
+         * the main width rounded to the DSP's 32-pixel grid; the chroma plane
+         * follows the luma plane. */
+        uint32_t mw = s->main_w ? s->main_w : ENC_W;
+        uint32_t mh = s->main_h ? s->main_h : ENC_H;
+        uint32_t mpitch = ROUND_UP(mw, 32);
+        uint32_t mchroma = luma + mpitch * mh;
+        if (!s->vcap_paused) {
+            amb_dsp_write_yuv(luma, mpitch, mw, mh, s->estr[0].frames);
+        }
+        amb_dsp_post_vcap(msg + DSP_PORT_SIZE, luma, mchroma, mw, mpitch,
+                          !s->vcap_paused);
+        /* With a live capture, follow the status with a frame-done report so
+         * iav's raw-YUV readback (QUERY_DESC yuv) wakes instead of timing out.
+         * Paused means the capture timer is stopped: no new picture. */
+        if (!s->vcap_paused) {
+            amb_dsp_post_vcap_done(msg + DSP_PORT_SIZE, 1, luma);
+        }
     }
 
     /*
@@ -698,7 +786,10 @@ static void amb_dsp_tick(void *opaque)
     }
 
     amb_dsp_reply(s, msg, seq_gen, enc_msgs);
-    amb_dsp_reply(s, msg + DSP_PORT_SIZE, seq_vcap, capturing ? 1 : 0);
+    /* vcap port: the status (slot 1), plus a frame-done (slot 2) when a live
+     * capture produced a picture this heartbeat. */
+    uint32_t vcap_msgs = capturing ? (s->vcap_paused ? 1 : 2) : 0;
+    amb_dsp_reply(s, msg + DSP_PORT_SIZE, seq_vcap, vcap_msgs);
 
     qemu_irq_pulse(s->vdsp_irq);
     qemu_irq_pulse(s->vcap_irq);
@@ -720,6 +811,7 @@ static void amb_dsp_reset(DeviceState *dev)
     s->boot_ticks = 0;
     s->mode_commanded = false;
     s->vcap_paused = false;
+    s->main_w = s->main_h = 0;
     s->enc_streams = 0;
     memset(s->estr, 0, sizeof(s->estr));
     s->last_seq[0] = s->last_seq[1] = 0;
@@ -783,7 +875,7 @@ static const VMStateDescription vmstate_amb_dsp_stream = {
 
 static const VMStateDescription vmstate_amb_dsp = {
     .name = "amb-dsp",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(heartbeat, AmbDspState),
@@ -792,6 +884,8 @@ static const VMStateDescription vmstate_amb_dsp = {
         VMSTATE_UINT32(boot_ticks, AmbDspState),
         VMSTATE_BOOL(mode_commanded, AmbDspState),
         VMSTATE_BOOL_V(vcap_paused, AmbDspState, 2),
+        VMSTATE_UINT16_V(main_w, AmbDspState, 3),
+        VMSTATE_UINT16_V(main_h, AmbDspState, 3),
         VMSTATE_UINT32(enc_streams, AmbDspState),
         VMSTATE_UINT32_ARRAY(last_seq, AmbDspState, 2),
         VMSTATE_STRUCT_ARRAY(estr, AmbDspState, 8, 1, vmstate_amb_dsp_stream,
