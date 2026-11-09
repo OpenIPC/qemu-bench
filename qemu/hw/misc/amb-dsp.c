@@ -225,6 +225,7 @@ struct AmbDspState {
     bool vcap_paused;           /* capture timer stopped: report vcap setup
                                  * mode IDLE so iav's enc-sub-mode wait wakes */
     uint16_t main_w, main_h;    /* main capture buffer size (CMD_VCAP_SETUP) */
+    uint32_t capture_frames;    /* captured pictures: animates the raw YUV */
     uint32_t enc_streams;       /* bitmask of streams the driver has started */
     char *dump_dir;             /* if set, each frame is kept as frame-N.jpg/.h264 */
 
@@ -735,29 +736,53 @@ static void amb_dsp_tick(void *opaque)
      * encode step); any non-zero address is enough to advance the counter.
      */
     bool capturing = (s->op_mode == DSP_OP_MODE_CAMERA_RECORD);
+    bool vcap_frame_done = false;
     if (capturing) {
         hwaddr id = amb_dsp_ucode(s) + DSP_INIT_DATA_OFFSET;
         uint32_t luma = amb_dsp_ld(id + INIT_DSPBUF_DADDR);
+        uint32_t scratch = amb_dsp_ld(id + INIT_DSPBUF_SIZE);
         if (!luma) {
             luma = s->iavmem_base;
+            scratch = 0;            /* fallback address: no advertised size */
         }
-        /* Main source-buffer geometry for the raw-YUV readback.  NV12 pitch is
-         * the main width rounded to the DSP's 32-pixel grid; the chroma plane
-         * follows the luma plane. */
-        uint32_t mw = s->main_w ? s->main_w : ENC_W;
-        uint32_t mh = s->main_h ? s->main_h : ENC_H;
-        uint32_t mpitch = ROUND_UP(mw, 32);
-        uint32_t mchroma = luma + mpitch * mh;
-        if (!s->vcap_paused) {
-            amb_dsp_write_yuv(luma, mpitch, mw, mh, s->estr[0].frames);
+        /*
+         * Publish a raw-YUV picture -- so a client's software 3A can meter it
+         * -- only once the main buffer geometry is known from CMD_VCAP_SETUP
+         * and sane.  The encoder's dimension limit caps the host allocation
+         * here too; an unset/oversized/odd size just leaves the readback
+         * unarmed (the query times out, as before) rather than fabricating a
+         * geometry or allocating gigabytes.  NV12 pitch is the width rounded to
+         * the DSP's 32-pixel grid; the chroma plane follows the luma plane and
+         * both must fit the scratch buffer and iavmem, or the DMA would overrun.
+         */
+        uint32_t mw = s->main_w, mh = s->main_h, mpitch = 0, mchroma = 0;
+        bool have_yuv = !s->vcap_paused && mw && mh &&
+                        mw <= ENC_MAX_DIM && mh <= ENC_MAX_DIM &&
+                        !((mw | mh) & 1);
+        if (have_yuv) {
+            mpitch = ROUND_UP(mw, 32);
+            uint64_t need = (uint64_t)mpitch * mh + (uint64_t)mpitch * (mh / 2);
+            if (luma >= s->iavmem_base &&
+                (uint64_t)luma + need <= s->iavmem_end &&
+                (!scratch || need <= scratch)) {
+                mchroma = luma + mpitch * mh;
+                amb_dsp_write_yuv(luma, mpitch, mw, mh, s->capture_frames);
+            } else {
+                have_yuv = false;   /* would run off the scratch buffer */
+            }
         }
-        amb_dsp_post_vcap(msg + DSP_PORT_SIZE, luma, mchroma, mw, mpitch,
+        amb_dsp_post_vcap(msg + DSP_PORT_SIZE, luma, mchroma,
+                          have_yuv ? mw : 0, have_yuv ? mpitch : 0,
                           !s->vcap_paused);
-        /* With a live capture, follow the status with a frame-done report so
-         * iav's raw-YUV readback (QUERY_DESC yuv) wakes instead of timing out.
-         * Paused means the capture timer is stopped: no new picture. */
-        if (!s->vcap_paused) {
+        if (have_yuv) {
+            /* Follow the status with a frame-done report so iav's raw-YUV
+             * readback (QUERY_DESC yuv) wakes instead of timing out, in vcap
+             * slot 2. */
             amb_dsp_post_vcap_done(msg + DSP_PORT_SIZE, 1, luma);
+            vcap_frame_done = true;
+        }
+        if (!s->vcap_paused) {
+            s->capture_frames++;    /* animates the picture per captured frame */
         }
     }
 
@@ -786,9 +811,9 @@ static void amb_dsp_tick(void *opaque)
     }
 
     amb_dsp_reply(s, msg, seq_gen, enc_msgs);
-    /* vcap port: the status (slot 1), plus a frame-done (slot 2) when a live
-     * capture produced a picture this heartbeat. */
-    uint32_t vcap_msgs = capturing ? (s->vcap_paused ? 1 : 2) : 0;
+    /* vcap port: the status (slot 1), plus a frame-done (slot 2) when we
+     * published a captured picture this heartbeat. */
+    uint32_t vcap_msgs = capturing ? (vcap_frame_done ? 2 : 1) : 0;
     amb_dsp_reply(s, msg + DSP_PORT_SIZE, seq_vcap, vcap_msgs);
 
     qemu_irq_pulse(s->vdsp_irq);
@@ -812,6 +837,7 @@ static void amb_dsp_reset(DeviceState *dev)
     s->mode_commanded = false;
     s->vcap_paused = false;
     s->main_w = s->main_h = 0;
+    s->capture_frames = 0;
     s->enc_streams = 0;
     memset(s->estr, 0, sizeof(s->estr));
     s->last_seq[0] = s->last_seq[1] = 0;
@@ -886,6 +912,7 @@ static const VMStateDescription vmstate_amb_dsp = {
         VMSTATE_BOOL_V(vcap_paused, AmbDspState, 2),
         VMSTATE_UINT16_V(main_w, AmbDspState, 3),
         VMSTATE_UINT16_V(main_h, AmbDspState, 3),
+        VMSTATE_UINT32_V(capture_frames, AmbDspState, 3),
         VMSTATE_UINT32(enc_streams, AmbDspState),
         VMSTATE_UINT32_ARRAY(last_seq, AmbDspState, 2),
         VMSTATE_STRUCT_ARRAY(estr, AmbDspState, 8, 1, vmstate_amb_dsp_stream,
