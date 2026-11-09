@@ -1688,6 +1688,50 @@ def test_otg_host(qt):
           0)
 
 
+def _migrate_qtest(qemu, machine, qt, out):
+    """migrate qt's machine to a file, close it, start the destination"""
+    qt.qmp('migrate', uri='exec:cat > %s' % out)
+    for _ in range(100):
+        if qt.qmp('query-migrate').get('status') in ('completed', 'failed'):
+            break
+        time.sleep(0.1)
+    qt.close()
+    qt = QTest(qemu, machine, ['-incoming', 'exec:cat %s' % out])
+    for _ in range(100):
+        if qt.qmp('query-status').get('status') != 'inmigrate':
+            break
+        time.sleep(0.1)
+    return qt
+
+
+def test_otg_migration(qemu, tmp):
+    """the ID debounce and its one-shot travel with the machine"""
+    print('DWC2 OTG: the ID debounce across a migration')
+    out = os.path.join(tmp, 'mig-otg')
+    qt = QTest(qemu, 't31')
+    qt.writel(OTG + 0x10, 1)                    # core soft reset
+    qt.writel(OTG + 0x14, 0xffffffff)
+    qt.step(50 * 1000 * 1000)                   # half the debounce
+    qt = _migrate_qtest(qemu, 't31', qt, out)
+    check('no change yet on the destination',
+          qt.readl(OTG + 0x14) & (1 << 28), 0)
+    # qtest's clock starts again at 0 on the destination while the timer
+    # keeps its deadline (the source's 100 ms): step past it
+    qt.step(150 * 1000 * 1000)
+    check('the pending debounce fires on the destination',
+          qt.readl(OTG + 0x14) & (1 << 28), 1 << 28)
+    qt.writel(OTG + 0x14, 1 << 28)
+    qt = _migrate_qtest(qemu, 't31', qt, out)
+    qt.writel(OTG + 0x10, 1)
+    qt.step(200 * 1000 * 1000)
+    check('reported once, across the migration',
+          qt.readl(OTG + 0x14) & (1 << 28), 0)
+    qt.writel(OTG + 0x5ec, 0x5)                 # HCINTMSK15
+    qt = _migrate_qtest(qemu, 't31', qt, out)
+    check("channel 15's registers migrate", qt.readl(OTG + 0x5ec), 0x5)
+    qt.close()
+
+
 # --- SSI (SPI masters) -------------------------------------------------------
 
 SSI0 = 0x10043000
@@ -4279,6 +4323,7 @@ def main():
         test_migration(a.qemu, 't31,sensor=gc2053', tmp)
         test_migration(a.qemu, 't31,wifi=atbm6441', tmp)
         test_sdio_6441_migration(a.qemu, tmp)
+        test_otg_migration(a.qemu, tmp)
         test_migration(a.qemu, 't41', tmp)
         test_migration(a.qemu, 't40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653',
                        tmp)

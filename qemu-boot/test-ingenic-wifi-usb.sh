@@ -66,7 +66,10 @@ command -v mksquashfs >/dev/null || { echo "SKIP: no mksquashfs"; exit 0; }
 
 WORK=$(mktemp -d)
 trap 'kill $QPID $HPID 2>/dev/null || true; rm -rf "$WORK"' EXIT
-OUT=${OUT:-$WORK/out}
+# the logs outlive the work directory: kept on failure, dropped on a pass
+# unless --out named them
+KEEP=$OUT
+OUT=${OUT:-$(mktemp -d)}
 mkdir -p "$OUT"
 
 mkdir -p "$WORK/www"
@@ -144,11 +147,16 @@ EOF
 chmod +x "$WORK/rfs/usr/bin/wifi-init"
 mksquashfs "$WORK/rfs" "$WORK/rootfs.squashfs" -comp xz -noappend -quiet \
     -all-root >/dev/null
+# the guest's mtdparts: 2048k(kernel) at 0x50000, 8192k(rootfs) at 0x250000
 python3 - "$WORK/nor.bin" "$KERNEL" "$WORK/rootfs.squashfs" <<'PY'
-import sys
+import os, sys
 img = bytearray(b'\xff' * (16 << 20))
-for path, off in ((sys.argv[2], 0x50000), (sys.argv[3], 0x250000)):
+for path, off, cap in ((sys.argv[2], 0x50000, 2048 << 10),
+                       (sys.argv[3], 0x250000, 8192 << 10)):
     data = open(path, 'rb').read()
+    if len(data) > cap:
+        sys.exit('%s: %d bytes, its partition holds %d'
+                 % (os.path.basename(path), len(data), cap))
     img[off:off + len(data)] = data
 open(sys.argv[1], 'wb').write(img)
 PY
@@ -187,5 +195,12 @@ check 'WIFI ping: ok' "ping to the host"
 check "WIFI http: $TOKEN" "TCP fetch from the host"
 check 'WIFI lsmod: ok' "lsmod returns"
 check 'WIFI kernel: clean' "no oops, BUG or WARNING in dmesg"
-[ $fail = 0 ] && echo PASS || { echo FAIL; grep -a 'WIFI\|DMESG' "$OUT/console.log"; }
+if [ $fail = 0 ]; then
+    echo PASS
+    [ -n "$KEEP" ] || rm -rf "$OUT"
+else
+    echo FAIL
+    grep -a 'WIFI\|DMESG' "$OUT/console.log"
+    echo "logs: $OUT"
+fi
 exit $fail

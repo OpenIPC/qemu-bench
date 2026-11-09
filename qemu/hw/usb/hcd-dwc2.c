@@ -1599,6 +1599,17 @@ static void dwc2_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "dwc2: host-channels must be 1..%d", DWC2_NB_CHAN);
         return;
     }
+    /* a ghwcfg2 override must tell the guest the channels the core has */
+    if (s->cfg_ghwcfg2 &&
+        ((s->cfg_ghwcfg2 & GHWCFG2_NUM_HOST_CHAN_MASK) >>
+         GHWCFG2_NUM_HOST_CHAN_SHIFT) + 1 != s->num_chan) {
+        error_setg(errp, "dwc2: ghwcfg2 0x%08x gives %u host channels, "
+                   "host-channels %u", s->cfg_ghwcfg2,
+                   ((s->cfg_ghwcfg2 & GHWCFG2_NUM_HOST_CHAN_MASK) >>
+                    GHWCFG2_NUM_HOST_CHAN_SHIFT) + 1, s->num_chan);
+        return;
+    }
+    s->usb_buf_hi = &s->usb_buf[DWC2_NB_CHAN_V1][0];
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
 
     s->dma_mr = MEMORY_REGION(obj);
@@ -1668,6 +1679,52 @@ static const VMStateDescription vmstate_dwc2_state_packet = {
     },
 };
 
+/*
+ * The main part is the 8-channel core's stream, byte for byte, so state
+ * saved before host-channels existed still loads.  Channels 8..15 travel
+ * in a subsection, sent only for a core that has them, as does the ID
+ * debounce of an A-device core.
+ */
+static bool dwc2_more_channels_needed(void *opaque)
+{
+    return ((DWC2State *)opaque)->num_chan > DWC2_NB_CHAN_V1;
+}
+
+static const VMStateDescription vmstate_dwc2_more_channels = {
+    .name = "dwc2/more-channels",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = dwc2_more_channels_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_SUB_ARRAY(hreg1, DWC2State, DWC2_NB_CHAN_V1 * 8,
+                                 (DWC2_NB_CHAN - DWC2_NB_CHAN_V1) * 8),
+        VMSTATE_STRUCT_SUB_ARRAY(packet, DWC2State, DWC2_NB_CHAN_V1,
+                                 DWC2_NB_CHAN - DWC2_NB_CHAN_V1, 1,
+                                 vmstate_dwc2_state_packet, DWC2Packet),
+        VMSTATE_BUFFER_POINTER_UNSAFE(usb_buf_hi, DWC2State, 0,
+                                      (DWC2_NB_CHAN - DWC2_NB_CHAN_V1) *
+                                      DWC2_MAX_XFER_SIZE),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool dwc2_otg_a_device_needed(void *opaque)
+{
+    return ((DWC2State *)opaque)->otg_a_device;
+}
+
+static const VMStateDescription vmstate_dwc2_otg_a_device = {
+    .name = "dwc2/otg-a-device",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = dwc2_otg_a_device_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER_PTR(id_timer, DWC2State),
+        VMSTATE_BOOL(id_reported, DWC2State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_dwc2_state = {
     .name = "dwc2",
     .version_id = 1,
@@ -1679,8 +1736,7 @@ const VMStateDescription vmstate_dwc2_state = {
                              DWC2_FSZREG_SIZE / sizeof(uint32_t)),
         VMSTATE_UINT32_ARRAY(hreg0, DWC2State,
                              DWC2_HREG0_SIZE / sizeof(uint32_t)),
-        VMSTATE_UINT32_ARRAY(hreg1, DWC2State,
-                             DWC2_HREG1_SIZE / sizeof(uint32_t)),
+        VMSTATE_UINT32_SUB_ARRAY(hreg1, DWC2State, 0, DWC2_NB_CHAN_V1 * 8),
         VMSTATE_UINT32_ARRAY(pcgreg, DWC2State,
                              DWC2_PCGREG_SIZE / sizeof(uint32_t)),
 
@@ -1695,12 +1751,17 @@ const VMStateDescription vmstate_dwc2_state = {
         VMSTATE_UINT16(next_chan, DWC2State),
         VMSTATE_BOOL(working, DWC2State),
 
-        VMSTATE_STRUCT_ARRAY(packet, DWC2State, DWC2_NB_CHAN, 1,
-                             vmstate_dwc2_state_packet, DWC2Packet),
-        VMSTATE_UINT8_2DARRAY(usb_buf, DWC2State, DWC2_NB_CHAN,
-                              DWC2_MAX_XFER_SIZE),
+        VMSTATE_STRUCT_SUB_ARRAY(packet, DWC2State, 0, DWC2_NB_CHAN_V1, 1,
+                                 vmstate_dwc2_state_packet, DWC2Packet),
+        VMSTATE_BUFFER_UNSAFE(usb_buf, DWC2State, 1,
+                              DWC2_NB_CHAN_V1 * DWC2_MAX_XFER_SIZE),
 
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_dwc2_more_channels,
+        &vmstate_dwc2_otg_a_device,
+        NULL
     }
 };
 
