@@ -92,6 +92,7 @@ struct Atbm6441Class {
 
 #define XFER_MAX        (32 * 1024)
 #define RXQ_MAX         256
+#define RXQ_DATA_MAX    (RXQ_MAX - 32)  /* room left for confirms and events */
 #define RX_ALIGN        256     /* SDIO_BLOCK_SIZE: reads are rounded to it */
 #define TX_ALIGN        256
 
@@ -165,10 +166,15 @@ struct Atbm6441State {
 
     /* chip -> host: queued messages and the read image being served */
     QSIMPLEQ_HEAD(, Msg) rxq;
-    unsigned rxq_len;
+    uint32_t rxq_len;
     uint8_t  rx_seq;
     uint8_t  img[XFER_MAX];
     uint32_t img_len, img_pos;
+    bool     rx_held;           /* the netdev holds frames for queue room */
+
+    /* migration: the queue flattened as { u16 len, data } records */
+    uint8_t *mig_rxq;
+    uint32_t mig_rxq_len;
 
     /* host -> chip */
     uint32_t consumed;          /* messages taken off the queue port */
@@ -212,7 +218,7 @@ static void update_irq(Atbm6441State *s)
     sdbus_set_sdio_irq(s->sdbus, level);
 }
 
-static void send_msg(Atbm6441State *s, uint16_t id, const void *body,
+static bool send_msg(Atbm6441State *s, uint16_t id, const void *body,
                      size_t n)
 {
     Msg *m;
@@ -220,7 +226,7 @@ static void send_msg(Atbm6441State *s, uint16_t id, const void *body,
     if (s->rxq_len >= RXQ_MAX || 4 + n > XFER_MAX - RX_ALIGN) {
         qemu_log_mask(LOG_GUEST_ERROR, "atbm6441: queue full, 0x%04x "
                       "dropped\n", id);
-        return;
+        return false;
     }
     m = g_malloc0(sizeof(*m) + 4 + n);
     m->len = 4 + n;
@@ -236,6 +242,7 @@ static void send_msg(Atbm6441State *s, uint16_t id, const void *body,
     QSIMPLEQ_INSERT_TAIL(&s->rxq, m, next);
     s->rxq_len++;
     update_irq(s);
+    return true;
 }
 
 static void send_event(Atbm6441State *s, uint32_t event, const void *buf,
@@ -381,8 +388,16 @@ static void host_data(Atbm6441State *s, const uint8_t *d, size_t len)
     qemu_send_packet(qemu_get_queue(s->nic), eth, 12 + n - hl - 6);
 }
 
+/* frames wait in the netdev while the queue has no room for data;
+ * before NETWORK_OK they are dropped, as the chip's stack keeps them */
 static bool can_receive(NetClientState *nc)
 {
+    Atbm6441State *s = qemu_get_nic_opaque(nc);
+
+    if (s->network_ok && s->rxq_len >= RXQ_DATA_MAX) {
+        s->rx_held = true;
+        return false;
+    }
     return true;
 }
 
@@ -396,6 +411,10 @@ static ssize_t receive(NetClientState *nc, const uint8_t *buf, size_t size)
     if (size < 14 || size > 2048 || !s->network_ok ||
         (!(buf[0] & 1) && memcmp(buf, s->conf.macaddr.a, 6))) {
         return size;
+    }
+    if (s->rxq_len >= RXQ_DATA_MAX) {
+        s->rx_held = true;
+        return 0;
     }
     b = g_malloc0(16 + 24 + 6 + size - 12);
     stw_le_p(b + 4, s->channel);
@@ -460,6 +479,7 @@ static void host_msg(Atbm6441State *s, const uint8_t *d, size_t len)
         qemu_log_mask(LOG_GUEST_ERROR, "atbm6441: message 0x%04x flag "
                       "0x%08x, want 0x%08x\n", id, flag,
                       (uint32_t)((len & 0xffff) | sum << 24));
+        return;                         /* corrupted on the bus: dropped */
     }
     if (s->trace && cmd != WSM_TX) {
         qemu_log("atbm6441: <- 0x%04x len %zu\n", id, len);
@@ -562,6 +582,10 @@ static void queue_read(Atbm6441State *s, uint8_t *out, uint32_t len)
             }
             QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
             s->rxq_len--;
+            if (s->rx_held && s->rxq_len < RXQ_DATA_MAX) {
+                s->rx_held = false;
+                qemu_flush_queued_packets(qemu_get_queue(s->nic));
+            }
             s->img_len = rx_image_len(m->len);
             s->img_pos = 0;
             memset(s->img, 0, s->img_len);
@@ -640,6 +664,35 @@ static void fn1_write_end(Atbm6441State *s)
     }
 }
 
+/*
+ * CMD52 to function 1: one byte of a 32-bit HIF register, read or
+ * read-modify-written through the CMD53 paths (the driver uses CMD53 for
+ * all of them; a byte of the queue port would split a message, so that
+ * stays refused)
+ */
+static uint8_t fn1_byte(Atbm6441State *s, uint32_t addr, bool write,
+                        uint8_t data)
+{
+    const unsigned sh = (addr & 3) * 8;
+    uint32_t v;
+
+    s->io_reg = addr & 0x1c;
+    if (s->io_reg == HIF_QUEUE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "atbm6441: CMD52 to the queue port "
+                      "0x%x\n", addr);
+        return 0;
+    }
+    fn1_read_begin(s, 4);
+    v = ldl_le_p(s->xfer);
+    if (write) {
+        v = (v & ~(0xffu << sh)) | (uint32_t)data << sh;
+        stl_le_p(s->xfer, v);
+        s->xfer_len = 4;
+        fn1_write_end(s);
+    }
+    return v >> sh;
+}
+
 /* ---- SDIO card --------------------------------------------------------- */
 
 static void build_cis(Atbm6441State *s)
@@ -715,7 +768,12 @@ static void fn0_write(Atbm6441State *s, uint32_t addr, uint8_t v)
         return;
     case CCCR_ABORT:
         if (v & ABORT_RES) {
+            /* RES: every I/O function back to its power-on state */
+            cccr_reset(s);
             hif_reset(s);
+            if (s->trace) {
+                qemu_log("atbm6441: CCCR RES\n");
+            }
         }
         return;
     case 0x07: s->bus_width = v; return;
@@ -766,6 +824,8 @@ static size_t do_command(SDState *sd, SDRequest *req, uint8_t *resp,
                 fn0_write(s, addr, data);
             }
             out = fn0_read(s, addr);
+        } else if (fn == 1) {
+            out = fn1_byte(s, addr, write, data);
         } else {
             qemu_log_mask(LOG_GUEST_ERROR, "atbm6441: CMD52 to F%d 0x%x\n",
                           fn, addr);
@@ -883,15 +943,91 @@ static void atbm6441_unrealize(DeviceState *dev)
 
     qemu_del_nic(s->nic);
     flush_rxq(s);
+    g_free(s->mig_rxq);
     g_hash_table_destroy(s->ahb);
 }
 
-/* the chip's messages are rebuilt by the driver reloading (WUP), so
- * migration keeps only the SDIO plumbing */
+/*
+ * Migration carries the running link: the HIF state, a CMD53 in flight,
+ * the read image being served and the queue behind it (flattened as
+ * { u16 len, data } records).  The AHB words are not carried: the driver
+ * touches one, once, at probe.
+ */
+static int atbm6441_pre_save(void *opaque)
+{
+    Atbm6441State *s = opaque;
+    uint32_t n = 0;
+    Msg *m;
+
+    QSIMPLEQ_FOREACH(m, &s->rxq, next) {
+        n += 2 + m->len;
+    }
+    g_free(s->mig_rxq);
+    s->mig_rxq = g_malloc(MAX(n, 1));
+    s->mig_rxq_len = n;
+    n = 0;
+    QSIMPLEQ_FOREACH(m, &s->rxq, next) {
+        stw_le_p(s->mig_rxq + n, m->len);
+        memcpy(s->mig_rxq + n + 2, m->data, m->len);
+        n += 2 + m->len;
+    }
+    return 0;
+}
+
+static int atbm6441_post_save(void *opaque)
+{
+    Atbm6441State *s = opaque;
+
+    g_clear_pointer(&s->mig_rxq, g_free);
+    s->mig_rxq_len = 0;
+    return 0;
+}
+
+static int atbm6441_post_load(void *opaque, int version_id)
+{
+    Atbm6441State *s = opaque;
+    uint32_t off = 0, rxq_len = 0;
+
+    if (s->xfer_pos > XFER_MAX || s->xfer_len > XFER_MAX ||
+        s->io_left > XFER_MAX || s->img_len > XFER_MAX ||
+        s->img_pos > s->img_len) {
+        return -EINVAL;
+    }
+    while (!QSIMPLEQ_EMPTY(&s->rxq)) {      /* the image fields stay */
+        Msg *m = QSIMPLEQ_FIRST(&s->rxq);
+
+        QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
+        g_free(m);
+    }
+    while (off + 2 <= s->mig_rxq_len) {
+        uint16_t len = lduw_le_p(s->mig_rxq + off);
+        Msg *m;
+
+        if (len < 4 || off + 2 + len > s->mig_rxq_len ||
+            rxq_len >= RXQ_MAX) {
+            atbm6441_post_save(s);
+            return -EINVAL;
+        }
+        m = g_malloc(sizeof(*m) + len);
+        m->len = len;
+        memcpy(m->data, s->mig_rxq + off + 2, len);
+        QSIMPLEQ_INSERT_TAIL(&s->rxq, m, next);
+        rxq_len++;
+        off += 2 + len;
+    }
+    s->rxq_len = rxq_len;
+    atbm6441_post_save(s);
+    update_irq(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_atbm6441 = {
     .name = TYPE_ATBM6441,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = atbm6441_pre_save,
+    .post_save = atbm6441_post_save,
+    .post_load = atbm6441_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(state, Atbm6441State),
         VMSTATE_UINT16(rca, Atbm6441State),
@@ -899,7 +1035,26 @@ static const VMStateDescription vmstate_atbm6441 = {
         VMSTATE_UINT8(int_enable, Atbm6441State),
         VMSTATE_UINT8(bus_width, Atbm6441State),
         VMSTATE_UINT16(fn1_block_size, Atbm6441State),
+        VMSTATE_BOOL(io_rw, Atbm6441State),
+        VMSTATE_UINT8(io_fn, Atbm6441State),
+        VMSTATE_UINT8(io_reg, Atbm6441State),
+        VMSTATE_UINT32(io_left, Atbm6441State),
+        VMSTATE_UINT32(xfer_pos, Atbm6441State),
+        VMSTATE_UINT32(xfer_len, Atbm6441State),
+        VMSTATE_BUFFER(xfer, Atbm6441State),
         VMSTATE_UINT32(config, Atbm6441State),
+        VMSTATE_BOOL(wup, Atbm6441State),
+        VMSTATE_UINT32(sram_base, Atbm6441State),
+        VMSTATE_UINT8(rx_seq, Atbm6441State),
+        VMSTATE_BUFFER(img, Atbm6441State),
+        VMSTATE_UINT32(img_len, Atbm6441State),
+        VMSTATE_UINT32(img_pos, Atbm6441State),
+        VMSTATE_UINT32(consumed, Atbm6441State),
+        VMSTATE_BOOL(network_ok, Atbm6441State),
+        VMSTATE_UINT16(seq, Atbm6441State),
+        VMSTATE_UINT32(mig_rxq_len, Atbm6441State),
+        VMSTATE_VBUFFER_ALLOC_UINT32(mig_rxq, Atbm6441State, 0, NULL,
+                                     mig_rxq_len),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -7,7 +7,8 @@
 # address the chip leased (the driver applies none) -- and then checks
 # what that issue reports broken with the vendor's binary driver:
 #   - the probe ends without an oops or a warning;
-#   - wlan0 carries traffic: ping and a TCP fetch from the host;
+#   - wlan0 carries traffic: ping, a TCP fetch from the host and 4 MiB
+#     over TCP with its md5 intact;
 #   - lsmod returns;
 #   - /dev/atbm_ioctl answers an AT command (ATBM_FW_AT_CMD) and its
 #     reader gets the chip's reply event;
@@ -68,6 +69,8 @@ mkdir -p "$OUT"
 mkdir -p "$WORK/www"
 TOKEN=atbm6441-$RANDOM$RANDOM
 echo "$TOKEN" > "$WORK/www/token"
+head -c 4194304 /dev/urandom > "$WORK/www/bulk"
+BULK=$(md5sum < "$WORK/www/bulk" | cut -d' ' -f1)
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$WORK/www" \
     > "$OUT/http.log" 2>&1 &
@@ -117,6 +120,8 @@ echo "WIFI mac: $(cat /sys/class/net/wlan0/address)"
 ping -c 3 -W 3 10.0.2.2 >/dev/null 2>&1 && echo "WIFI ping: ok" || echo "WIFI ping: fail"
 T=$(wget -q -T 10 -O - "http://10.0.2.2:$PORT/token" 2>/dev/null)
 echo "WIFI http: ${T:-none}"
+M=$(wget -q -T 60 -O - "http://10.0.2.2:$PORT/bulk" 2>/dev/null | md5sum | cut -d' ' -f1)
+echo "WIFI bulk: $M"
 
 # lsmod hung after the vendor driver's oops; give it 10 s
 ( lsmod > /tmp/lsmod.out 2>&1; echo done > /tmp/lsmod.done ) &
@@ -196,6 +201,7 @@ check 'WIFI insmod: 0' "insmod returns 0"
 check 'WIFI wlan0 present' "wlan0 created"
 check 'WIFI ping: ok' "ping to the host over wlan0"
 check "WIFI http: $TOKEN" "TCP fetch from the host over wlan0"
+check "WIFI bulk: $BULK" "4 MiB over TCP, md5 intact"
 check 'WIFI lsmod: ok .*atbm6441_wifi_sdio' "lsmod returns and lists the driver"
 if [ -n "$AT" ]; then
     check 'WIFI AT ioctl: 0' "the AT command ioctl returns 0"
