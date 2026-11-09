@@ -59,6 +59,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | 0x13450000 | T41: SFC1, IRQ 19 (`-drive if=mtd,index=1`) | `ingenic-sfc` |
 | 0x13450000 / 0x13460000 | MSC0/1 (XBurst1) | `ingenic-msc` |
 | MSC1 SDIO | ATBM6031 Wi-Fi (`-M t31,wifi=atbm`; T40/T41 on the SDHCI MSC1) | `atbm-sdio` |
+| MSC1 SDIO | ATBM6441 IoT Wi-Fi (`-M t31,wifi=atbm6441`) | `atbm6441-sdio` |
 | 0x13060000 / 0x13070000 | MSC0/1 (XBurst2): SDHCI 3.0 | QEMU `generic-sdhci` |
 | 0x134B0000 | Synopsys GMAC, IP101G PHY | `ingenic-gmac` |
 | 0x13500000 | DWC2 USB OTG, host | QEMU `dwc2-usb` |
@@ -632,6 +633,51 @@ without the built driver (`--driver`, the vendor tree built with
 `platform=PLATFORM_INGENICT31 ATBM_WIFI__EXT_CCFLAGS=-DATBM_WIFI_PLATFORM=24`;
 without the platform define its insert hook is a stub that never asks the
 MSC to detect the card).
+
+### `atbm6441-sdio`
+
+The AltoBeam ATBM6441 in "IoT mode", the Wi-Fi of battery doorbells such
+as the Merkury MI-CW074-125W (OpenIPC/firmware#1974): a whole Wi-Fi SoC
+that keeps its credentials in its own flash and is associated, with a
+DHCP lease, before the host boots.  `-M t31,wifi=atbm6441` attaches it to
+MSC1, with `-nic user,model=atbm6441-sdio`; it is `/machine/atbm6441`.
+The model follows what the `atbm6441` driver (gtxaspec/atbm6441,
+`hal_apollo` built for HERA, `ATBM_WIFI_PLATFORM=22`) expects of the chip:
+
+- Same HIF registers as the 6031 (CMD53, address = register << 2), but
+  no firmware download: the driver sets CONTROL's WUP and waits for the
+  startup indication.  It discards the first four messages it reads
+  unparsed and arms its sequence check at 4, so the chip sends four
+  trace indications first and the startup indication (firmware version
+  13679, 16 input buffers of 2048 bytes) with sequence 4.
+- A read of the queue port is the head message rounded up to 256 bytes
+  with the next CONTROL value in its last two bytes.
+- Host messages are `{ flag, len, id }` (the flag carries a length
+  checksum, which the model checks) packed on 256-byte boundaries.  TX
+  flow control is a credit count: after each queue write the chip sends
+  event 3 with the messages consumed plus the window.  Only the commands
+  the driver waits on are confirmed -- never data, NETWORK_OK or IPC data.
+- GET_CONFIG reports the chip's MAC (which `wlan0` takes), STA mode and
+  the link it holds: the SSID (`wifi-ssid=`), a BSSID derived from the
+  MAC, an open network, and the address it leased (`ip=`, `gw=`, `dns=`
+  on the card; the driver only passes them to `/dev/atbm_ioctl` readers,
+  so the guest sets them itself).
+- Data is raw 802.11 both ways (ToDS from the host, FromDS to it, LLC/SNAP),
+  bridged to the netdev once the host has sent NETWORK_OK.
+- An AT command (`/dev/atbm_ioctl` `ATBM_FW_AT_CMD`, WSM 0x0023) is logged
+  (`-d unimp`, and with `trace=on`) and answered with a customer event,
+  `<command>\r\nOK\r\n`, which the ioctl device's reader gets.  The real
+  firmware's AT replies are not visible from the driver; that text is the
+  model's.
+
+`qemu-boot/test-ingenic-wifi-6441.sh` runs the driver as #1974's S96wifi
+does -- SDIO rescan through `jzmmc_v1.2.1/present`, cfg80211 alone (or
+with mac80211, `--mac80211`), insmod, a static address -- on OpenIPC's
+T31 kernel and release rootfs, and passes: wlan0 with the chip's MAC,
+ping and a TCP fetch from the host, `lsmod`, an AT command round trip
+through `/dev/atbm_ioctl` (`qemu-boot/atbm6441-at.c`), rmmod and a second
+insmod, no oops or warning.  The qtest checks the enumeration (product id
+0x6441) and that `wifi-psk=` is refused.
 
 ### `ingenic-gmac`
 

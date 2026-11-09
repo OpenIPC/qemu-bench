@@ -923,16 +923,32 @@ static void ingenic_cpu_reset(void *opaque)
     cpu_reset(CPU(opaque));
 }
 
-/* the SDIO Wi-Fi chip on MSC1 (wifi=atbm): /machine/atbm */
+/*
+ * the SDIO Wi-Fi chip on MSC1: wifi=atbm, the ATBM6031 (/machine/atbm), or
+ * wifi=atbm6441, the IoT-mode ATBM6441 already on its network
+ * (/machine/atbm6441)
+ */
+static bool ingenic_has_wifi(IngenicMachineState *ims)
+{
+    return ims->wifi && (!strcmp(ims->wifi, "atbm") ||
+                         !strcmp(ims->wifi, "atbm6441"));
+}
+
 static void ingenic_wifi_card(IngenicMachineState *ims, DeviceState *host)
 {
-    DeviceState *card = qdev_new("atbm-sdio");
+    const bool iot = !strcmp(ims->wifi, "atbm6441");
+    DeviceState *card = qdev_new(iot ? "atbm6441-sdio" : "atbm-sdio");
 
-    object_property_add_child(OBJECT(ims), "atbm", OBJECT(card));
+    object_property_add_child(OBJECT(ims), iot ? "atbm6441" : "atbm",
+                              OBJECT(card));
     if (ims->wifi_ssid) {
         qdev_prop_set_string(card, "ssid", ims->wifi_ssid);
     }
     if (ims->wifi_psk) {
+        if (iot) {
+            error_report("wifi-psk: the ATBM6441 joins an open network");
+            exit(1);
+        }
         qdev_prop_set_string(card, "psk", ims->wifi_psk);
     }
     qemu_configure_nic_device(card, false, NULL);
@@ -1752,7 +1768,7 @@ static void ingenic_init(MachineState *ms)
                                         &error_fatal);
                 qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                        &error_fatal);
-            } else if (i == 1 && ims->wifi && !strcmp(ims->wifi, "atbm")) {
+            } else if (i == 1 && ingenic_has_wifi(ims)) {
                 /* the SDIO Wi-Fi chip on MSC1, as on the XBurst1 parts */
                 ingenic_wifi_card(ims, dev);
             }
@@ -1782,7 +1798,7 @@ static void ingenic_init(MachineState *ms)
                                         blk_by_legacy_dinfo(di), &error_fatal);
                 qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                        &error_fatal);
-            } else if (i == 1 && ims->wifi && !strcmp(ims->wifi, "atbm")) {
+            } else if (i == 1 && ingenic_has_wifi(ims)) {
                 /* an SDIO Wi-Fi chip on MSC1 (the camera boards' slot) */
                 ingenic_wifi_card(ims, dev);
             }
@@ -1983,8 +1999,9 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "wifi",
         ingenic_get_wifi, ingenic_set_wifi);
     object_class_property_set_description(oc, "wifi",
-        "an SDIO Wi-Fi chip on MSC1: none (default) or atbm (AltoBeam "
-        "ATBM6031); give it a -nic and the guest's driver brings up wlan0");
+        "an SDIO Wi-Fi chip on MSC1: none (default), atbm (AltoBeam "
+        "ATBM6031) or atbm6441 (the IoT-mode ATBM6441, associated on its "
+        "own); give it a -nic and the guest's driver brings up wlan0");
     object_class_property_add_str(oc, "wifi-ssid",
         ingenic_get_wifi_ssid, ingenic_set_wifi_ssid);
     object_class_property_set_description(oc, "wifi-ssid",
