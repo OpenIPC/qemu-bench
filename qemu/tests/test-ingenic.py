@@ -1662,6 +1662,32 @@ def test_usbphy(qt):
           int(qt.cmd('readb 0x10060078').split()[1], 16), 0x20)
 
 
+OTG = 0x13500000
+
+
+def test_otg_host(qt):
+    """the DWC2 as the T-series kernels' dwc2 needs it: an A-device that
+    reports its connector after the ID debounce, with 16 host channels"""
+    print('DWC2 OTG: A-device, 16 host channels')
+    check('ConIDSts 0: an A-device (host)', qt.readl(OTG + 0x00) & (1 << 16), 0)
+    check('GHWCFG2 reports 16 host channels',
+          ((qt.readl(OTG + 0x48) >> 14) & 0xf) + 1, 16)
+    qt.writel(OTG + 0x5ec, 0x5)                 # HCINTMSK15
+    check("channel 15's registers exist", qt.readl(OTG + 0x5ec), 0x5)
+    qt.writel(OTG + 0x10, 1)                    # GRSTCTL: core soft reset
+    qt.writel(OTG + 0x14, 0xffffffff)           # GINTSTS: clear
+    check('no connector ID change before the debounce',
+          qt.readl(OTG + 0x14) & (1 << 28), 0)
+    qt.step(100 * 1000 * 1000)
+    check('ConIDStsChng 100 ms after the soft reset',
+          qt.readl(OTG + 0x14) & (1 << 28), 1 << 28)
+    qt.writel(OTG + 0x14, 1 << 28)
+    qt.writel(OTG + 0x10, 1)                    # the host bring-up's reset
+    qt.step(200 * 1000 * 1000)
+    check('reported once: no second change', qt.readl(OTG + 0x14) & (1 << 28),
+          0)
+
+
 # --- SSI (SPI masters) -------------------------------------------------------
 
 SSI0 = 0x10043000
@@ -4013,6 +4039,7 @@ def main():
         test_hash_cpu(qt)
         test_rsa(qt)
         test_usbphy(qt)
+        test_otg_host(qt)
         qt.close()
         qt = QTest(a.qemu, 't31')
         test_i2s_clock(qt)

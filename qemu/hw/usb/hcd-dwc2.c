@@ -758,7 +758,7 @@ static void dwc2_work_bh(void *opaque)
             dwc2_handle_packet(s, p->devadr, dev, ep, p->index, true);
             found = true;
         }
-        if (++chan == DWC2_NB_CHAN) {
+        if (++chan == s->num_chan) {
             chan = 0;
         }
         if (found) {
@@ -825,6 +825,32 @@ static void dwc2_enable_chan(DWC2State *s,  uint32_t index)
 
     dwc2_handle_packet(s, devadr, dev, ep, index, true);
     qemu_bh_schedule(s->async_bh);
+}
+
+/*
+ * The ID pin's debounce: an A-device core (otg-a-device) reports its
+ * connector once, when the filter settles after power-on, as a connector
+ * ID status change.  Drivers that bring the host up from that interrupt
+ * (Ingenic's dwc2, A_HOST in dwc2_conn_id_status_change_work) soft-reset
+ * the core, clear GINTSTS and unmask it first, so the 100 ms (long
+ * debounce) count restarts at each core soft reset until it has fired;
+ * the host bring-up's own soft reset after that changes nothing.
+ */
+static void dwc2_id_debounced(void *opaque)
+{
+    DWC2State *s = opaque;
+
+    s->id_reported = true;
+    s->gintsts |= GINTSTS_CONIDSTSCHNG;
+    dwc2_update_irq(s);
+}
+
+static void dwc2_id_arm(DWC2State *s)
+{
+    if (s->otg_a_device && !s->id_reported) {
+        timer_mod(s->id_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  100 * SCALE_MS);
+    }
 }
 
 /*
@@ -967,6 +993,7 @@ static void dwc2_glbreg_write(void *ptr, hwaddr addr, int index, uint64_t val,
         }
         if (!(old & GRSTCTL_CSFTRST) && (val & GRSTCTL_CSFTRST)) {
             dwc2_core_soft_reset(s);
+            dwc2_id_arm(s);
         }
         /* don't allow clearing of self-clearing bits */
         val |= old & (GRSTCTL_TXFFLSH | GRSTCTL_RXFFLSH |
@@ -1174,7 +1201,7 @@ static uint64_t dwc2_hreg1_read(void *ptr, hwaddr addr, int index,
     DWC2State *s = ptr;
     uint32_t val;
 
-    if (addr < HCCHAR(0) || addr > HCDMAB(DWC2_NB_CHAN - 1)) {
+    if (addr < HCCHAR(0) || addr > HCDMAB(s->num_chan - 1)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
         return 0;
@@ -1197,7 +1224,7 @@ static void dwc2_hreg1_write(void *ptr, hwaddr addr, int index, uint64_t val,
     int enflg = 0;
     int disflg = 0;
 
-    if (addr < HCCHAR(0) || addr > HCDMAB(DWC2_NB_CHAN - 1)) {
+    if (addr < HCCHAR(0) || addr > HCDMAB(s->num_chan - 1)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
         return;
@@ -1446,6 +1473,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
     }
 
     timer_del(s->frame_timer);
+    timer_del(s->id_timer);
+    s->id_reported = false;
     qemu_bh_cancel(s->async_bh);
 
     if (s->uport.dev && s->uport.dev->attached) {
@@ -1454,7 +1483,8 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
 
     dwc2_bus_stop(s);
 
-    s->gotgctl = GOTGCTL_BSESVLD | GOTGCTL_ASESVLD | GOTGCTL_CONID_B;
+    s->gotgctl = GOTGCTL_BSESVLD | GOTGCTL_ASESVLD |
+                 (s->otg_a_device ? 0 : GOTGCTL_CONID_B);
     s->gotgint = 0;
     s->gahbcfg = 0;
     s->gusbcfg = 5 << GUSBCFG_USBTRDTIM_SHIFT;
@@ -1478,7 +1508,7 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
                  (4 << GHWCFG2_NONPERIO_TX_Q_DEPTH_SHIFT) |
                  GHWCFG2_DYNAMIC_FIFO |
                  GHWCFG2_PERIO_EP_SUPPORTED |
-                 ((DWC2_NB_CHAN - 1) << GHWCFG2_NUM_HOST_CHAN_SHIFT) |
+                 ((s->num_chan - 1) << GHWCFG2_NUM_HOST_CHAN_SHIFT) |
                  (GHWCFG2_INT_DMA_ARCH << GHWCFG2_ARCHITECTURE_SHIFT) |
                  (GHWCFG2_OP_MODE_NO_SRP_CAPABLE_HOST << GHWCFG2_OP_MODE_SHIFT);
     s->ghwcfg3 = (4096 << GHWCFG3_DFIFO_DEPTH_SHIFT) |
@@ -1565,6 +1595,10 @@ static void dwc2_realize(DeviceState *dev, Error **errp)
     DWC2State *s = DWC2_USB(dev);
     Object *obj;
 
+    if (s->num_chan < 1 || s->num_chan > DWC2_NB_CHAN) {
+        error_setg(errp, "dwc2: host-channels must be 1..%d", DWC2_NB_CHAN);
+        return;
+    }
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
 
     s->dma_mr = MEMORY_REGION(obj);
@@ -1586,6 +1620,7 @@ static void dwc2_realize(DeviceState *dev, Error **errp)
     s->fi = USB_FRMINTVL - 1;
     s->eof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_frame_boundary, s);
     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_work_timer, s);
+    s->id_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_id_debounced, s);
     s->async_bh = qemu_bh_new_guarded(dwc2_work_bh, s,
                                       &dev->mem_reentrancy_guard);
 
@@ -1676,6 +1711,8 @@ static const Property dwc2_usb_properties[] = {
     DEFINE_PROP_UINT32("ghwcfg3", DWC2State, cfg_ghwcfg3, 0),
     DEFINE_PROP_UINT32("ghwcfg4", DWC2State, cfg_ghwcfg4, 0),
     DEFINE_PROP_UINT32("hptxfsiz", DWC2State, cfg_hptxfsiz, 0),
+    DEFINE_PROP_BOOL("otg-a-device", DWC2State, otg_a_device, false),
+    DEFINE_PROP_UINT32("host-channels", DWC2State, num_chan, 8),
 };
 
 static void dwc2_class_init(ObjectClass *klass, const void *data)

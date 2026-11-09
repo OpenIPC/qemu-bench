@@ -62,7 +62,7 @@ Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
 | MSC1 SDIO | ATBM6441 IoT Wi-Fi (`-M t31,wifi=atbm6441`) | `atbm6441-sdio` |
 | 0x13060000 / 0x13070000 | MSC0/1 (XBurst2): SDHCI 3.0 | QEMU `generic-sdhci` |
 | 0x134B0000 | Synopsys GMAC, IP101G PHY | `ingenic-gmac` |
-| 0x13500000 | DWC2 USB OTG, host | QEMU `dwc2-usb` |
+| 0x13500000 | DWC2 USB OTG, host: an A-device, 16 host channels | QEMU `dwc2-usb` (`otg-a-device`, `host-channels=16`) |
 | 0x13540000 | EFUSE: blank but for the grade code | `ingenic-efuse` |
 | 0x13300000 | ISP core (T31: to 0x1338FFFF; T21, T23: 64 KiB; T40, T41: 512 KiB, T41's scaler at 0x133F0000; T10/T20/T30's Apical core at 0x13380000) | `ingenic-isp`, `ingenic-isp-apical` |
 | 0x133E0000 | VIC (T21: 0x13310000; T40, T41: 0x13380000, T40's VIC1 / VIC2 at 0x13390000 / 0x133A0000) | `ingenic-isp` |
@@ -678,6 +678,37 @@ ping and a TCP fetch from the host, `lsmod`, an AT command round trip
 through `/dev/atbm_ioctl` (`qemu-boot/atbm6441-at.c`), rmmod and a second
 insmod, no oops or warning.  The qtest checks the enumeration (product id
 0x6441) and that `wifi-psk=` is refused.
+
+### USB: `dwc2-usb` and the AltoBeam dongle
+
+The OTG core is QEMU's DWC2 (the Raspberry Pi's, with qemu-bench's own
+`hw/usb/hcd-dwc2.c`), set up as the T-series kernels' `drivers/usb/dwc2`
+needs it:
+
+- `otg-a-device`: ConIDSts reads 0 and, 100 ms after the driver's first
+  core soft reset (the long ID debounce), the core raises a connector ID
+  status change, once.  The driver (`cpm_usb.c` puts the PHY in OTG mode)
+  brings the host up only from that interrupt -- port power, root hub
+  polling -- after clearing GINTSTS and unmasking it; without it a USB
+  device on the bus was never seen.
+- `host-channels=16`: the driver hands transfers to 16 channels in turn
+  (`MAX_EPS_CHANNELS`) and never reads GHWCFG2's count.  With QEMU's 8,
+  every ninth transfer -- on a new device the configuration descriptor --
+  ran nowhere: "unable to read config index 0 descriptor/start: -145",
+  a port reset, forever.
+
+The USB AltoBeam dongle, `atbm-wifi` (docs/xiongmai.md), takes the bus:
+`-device atbm-wifi,bus=usb-bus.0,netdev=w,pid=0x888b,chip-version=0x4a,efuse=0x0500`
+is the ATBM6012B-X of OpenIPC/firmware#1655 (a T31L, the vendor driver's
+"current chiptype 6012B-X").  `qemu-boot/test-ingenic-wifi-usb.sh` runs
+OpenIPC's atbm-wifi package built for it (`atbm6012b_wifi_usb.ko`, model
+6012B, USB) on OpenIPC's `t31_ultimate` kernel and rootfs and passes:
+the driver reports a 6012B-X, wlan0 comes up, `wpa_supplicant` joins the
+open (or `--psk`, WPA2-PSK) access point, `udhcpc` leases 10.0.2.15, the
+host answers ping and a TCP fetch, `lsmod` returns, no oops.  The
+issue's other driver, `atbm60xx` built for the 603x over USB
+(`atbm603x_wifi_usb.ko`, `--module`), loads and never binds: its ID table
+holds 007a:8888 only, so wlan0 never appears -- what the issue reports.
 
 ### `ingenic-gmac`
 

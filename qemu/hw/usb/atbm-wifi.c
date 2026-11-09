@@ -51,6 +51,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(AtbmState, ATBM_WIFI)
 #define REQ_EP0_CMD         7
 
 #define REG_CHIP_VERSION    0x0acc017c
+/* eFuse: a write of the byte index << 8 to CTRL, the byte back in DATA */
+#define REG_EFUSE_CTRL      0x16b00000
+#define REG_EFUSE_DATA      0x16b00004
 #define CHIP_ARES_B         0x49
 #define REG_CPU_CTRL        0x16101000      /* bit 8: CPU held in reset */
 /* 0x0acc017c's low byte: 0x49 ARES_B (xm713g.ko: XM713G), 0x4a AresLite
@@ -105,6 +108,7 @@ struct AtbmState {
     uint16_t pid;
     USBDesc desc;               /* atbm_desc with the product ID */
     uint8_t chip_version;
+    uint32_t efuse;             /* eFuse bytes 0..3, the chip's UID bits */
     bool trace;
 };
 
@@ -777,6 +781,11 @@ static void atbm_handle_control(USBDevice *dev, USBPacket *p, int request,
         if (addr == REG_CHIP_VERSION && length >= 4) {
             stl_le_p(data, s->chip_version);
         }
+        if (addr == REG_EFUSE_DATA && length >= 4) {
+            const uint32_t byte = (atbm_reg(s, REG_EFUSE_CTRL) >> 8) & 0xff;
+
+            stl_le_p(data, byte < 4 ? (s->efuse >> (8 * byte)) & 0xff : 0);
+        }
         if (s->trace) {
             qemu_log("atbm: rd %d 0x%08x/%d = 0x%08x\n", request & 0xff,
                      addr, length, length >= 4 ? ldl_le_p(data) : 0);
@@ -1042,6 +1051,9 @@ static const Property atbm_props[] = {
      * 0x888b with chip-version 0x4a: 6012B_x.ko (XM535W1 / D1) */
     DEFINE_PROP_UINT16("pid", AtbmState, pid, ATBM_PID),
     DEFINE_PROP_UINT8("chip-version", AtbmState, chip_version, CHIP_ARES_B),
+    /* the AresLite UID: bits 8 and 10 set, 3 clear (0x0500) make the
+     * atbm-wifi driver's chip 6012B-X; all clear, 6032-X */
+    DEFINE_PROP_UINT32("efuse", AtbmState, efuse, 0),
     DEFINE_PROP_UINT8("channel", AtbmState, channel, 6),
     DEFINE_PROP_BOOL("trace", AtbmState, trace, false),
     /* A real link, which the defaults leave out: an HT + WMM access point

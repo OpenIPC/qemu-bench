@@ -28,7 +28,7 @@
 
 #define DWC2_MMIO_SIZE      0x11000
 
-#define DWC2_NB_CHAN        8       /* Number of host channels */
+#define DWC2_NB_CHAN        16      /* host channels: the most a core has */
 #define DWC2_MAX_XFER_SIZE  65536   /* Max transfer size expected in HCTSIZ */
 
 typedef struct DWC2Packet DWC2Packet;
@@ -173,6 +173,10 @@ struct DWC2State {
     uint32_t cfg_ghwcfg3;
     uint32_t cfg_ghwcfg4;
     uint32_t cfg_hptxfsiz;
+    uint32_t num_chan;      /* host channels the core has (host-channels) */
+    bool otg_a_device;      /* the ID pin grounded: an A-device, host */
+    QEMUTimer *id_timer;    /* the core's ID debounce */
+    bool id_reported;       /* ConIDStsChng raised since power-on */
     uint16_t frame_number;
     uint16_t fi;
     uint16_t next_chan;
