@@ -27,14 +27,19 @@ typedef struct SensorSync {
     uint32_t vts;               /* its rows, for the log's line */
     uint32_t violations;        /* datasheet rules broken */
     bool trace;                 /* log every write with frame and line */
+    uint32_t late_latch;        /* fault: this latch lands a frame late */
+    uint32_t latches;           /* latches that changed a register */
 } SensorSync;
 
 /*
  * A frame starts: true when the latched registers should be copied from
  * what the driver wrote to what the frame uses (no group hold open; a
- * write made before the first frame applied at once anyway).
+ * write made before the first frame applied at once anyway).  @pending:
+ * the two copies differ, so the latch changes something; the
+ * "late-latch" fault holds the Nth of those back one frame.
  */
-bool sensor_sync_frame_start(SensorSync *s, int64_t frame_ns, uint32_t vts);
+bool sensor_sync_frame_start(SensorSync *s, int64_t frame_ns, uint32_t vts,
+                             bool pending);
 
 /* The driver wrote @val to @reg (the log, with frame and line) */
 void sensor_sync_write(SensorSync *s, uint16_t reg, uint8_t val);
@@ -52,7 +57,10 @@ void sensor_sync_reset(SensorSync *s);
 void G_GNUC_PRINTF(2, 3) sensor_sync_violation(SensorSync *s,
                                                const char *fmt, ...);
 
-/* "frame", "violations" (read-only) and "trace-i2c" on the sensor */
+/*
+ * "frame", "violations", "latches" (read-only), "trace-i2c" and
+ * "late-latch" on the sensor
+ */
 void sensor_sync_add_properties(Object *obj, SensorSync *s);
 
 #endif

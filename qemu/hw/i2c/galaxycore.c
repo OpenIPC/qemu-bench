@@ -22,6 +22,7 @@
 #include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
 #include "hw/i2c/sensor-sync.h"
+#include "qapi/visitor.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -67,6 +68,8 @@ struct GcSensorState {
 static const uint16_t gc_latched[] = {
     0x0200, 0x0201, 0x0202, 0x0203, 0x020E, 0x020F, 0x02B3, 0x02B4,
     0x02B8, 0x02B9, 0x02D9, 0x0515, 0x0519, 0x0340, 0x0341,
+    /* GC2083: its exposure and gain, where galaxycore_exposure() reads them */
+    0x0D03, 0x0D04, 0x00B8, 0x00B9,
 };
 
 static bool gc_is_latched(uint16_t a)
@@ -200,12 +203,18 @@ static bool galaxycore_frame_start(Object *sensor)
 {
     GcSensorState *s = GALAXYCORE_SENSOR(sensor);
     ImageSensorExposure e = { 0 };
+    bool pending = false;
     int i;
 
     if (!s->reg16) {
         return false;           /* the 8-bit parts apply writes at once */
     }
-    if (sensor_sync_frame_start(&s->sync, 0, 0)) {
+    for (i = 0; i < ARRAY_SIZE(gc_latched); i++) {
+        if (s->applied[gc_latched[i]] != s->regs[gc_latched[i]]) {
+            pending = true;
+        }
+    }
+    if (sensor_sync_frame_start(&s->sync, 0, 0, pending)) {
         for (i = 0; i < ARRAY_SIZE(gc_latched); i++) {
             s->applied[gc_latched[i]] = s->regs[gc_latched[i]];
         }
@@ -219,11 +228,28 @@ static bool galaxycore_frame_start(Object *sensor)
     return true;
 }
 
+/* "lines" / "vts": the exposure and frame length the frame in progress
+ * uses (qom-get) */
+static void gc_get_applied(Object *obj, Visitor *v, const char *name,
+                           void *opaque, Error **errp)
+{
+    ImageSensorExposure e = { 0 };
+    uint32_t value;
+
+    galaxycore_exposure_sensor(obj, &e);
+    value = !strcmp(name, "lines") ? e.lines : e.vts;
+    visit_type_uint32(v, name, &value, errp);
+}
+
 static void gc_init(Object *obj)
 {
     GcSensorState *s = GALAXYCORE_SENSOR(obj);
 
     sensor_sync_add_properties(obj, &s->sync);
+    object_property_add(obj, "lines", "uint32", gc_get_applied, NULL, NULL,
+                        NULL);
+    object_property_add(obj, "vts", "uint32", gc_get_applied, NULL, NULL,
+                        NULL);
 }
 
 static void gc_realize(DeviceState *dev, Error **errp)
@@ -263,7 +289,7 @@ static int gc_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_gc_sensor = {
     .name = TYPE_GALAXYCORE_SENSOR,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = gc_post_load,
     .fields = (const VMStateField[]) {
@@ -277,6 +303,8 @@ static const VMStateDescription vmstate_gc_sensor = {
         VMSTATE_BOOL_V(sync.latching, GcSensorState, 3),
         VMSTATE_UINT32_V(sync.frame, GcSensorState, 3),
         VMSTATE_UINT32_V(sync.violations, GcSensorState, 3),
+        VMSTATE_UINT32_V(sync.latches, GcSensorState, 4),
+        VMSTATE_UINT32_V(sync.late_latch, GcSensorState, 4),
         VMSTATE_END_OF_LIST()
     },
 };

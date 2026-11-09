@@ -15,14 +15,36 @@
 #include "qom/object.h"
 #include "hw/i2c/sensor-sync.h"
 
-bool sensor_sync_frame_start(SensorSync *s, int64_t frame_ns, uint32_t vts)
+bool sensor_sync_frame_start(SensorSync *s, int64_t frame_ns, uint32_t vts,
+                             bool pending)
 {
     s->latching = true;
     s->frame++;
     s->t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->frame_ns = frame_ns;
     s->vts = vts;
-    return !s->hold;            /* an open group is still being written */
+    if (s->hold) {
+        return false;           /* an open group is still being written */
+    }
+    if (!pending) {
+        return true;
+    }
+    if (s->late_latch && s->late_latch == s->latches + 1) {
+        /*
+         * The fault: the writes miss this frame's start and take the
+         * next one's, as when a driver's I2C runs past the frame
+         * boundary.  The frame keeps the previous exposure a frame
+         * longer.  Once: the property reads 0 after it fired.
+         */
+        if (s->trace) {
+            fprintf(stderr, "%s: frame %u: latch %u held back a frame\n",
+                    s->name, s->frame, s->late_latch);
+        }
+        s->late_latch = 0;
+        return false;
+    }
+    s->latches++;
+    return true;
 }
 
 void sensor_sync_reset(SensorSync *s)
@@ -34,6 +56,7 @@ void sensor_sync_reset(SensorSync *s)
     s->frame_ns = 0;
     s->vts = 0;
     s->violations = 0;
+    s->latches = 0;
 }
 
 /* where in the frame the sensor is: its line, or microseconds when the
@@ -91,6 +114,16 @@ static void sync_get_u32(Object *obj, Visitor *v, const char *name,
     visit_type_uint32(v, name, opaque, errp);
 }
 
+static void sync_set_u32(Object *obj, Visitor *v, const char *name,
+                         void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (visit_type_uint32(v, name, &value, errp)) {
+        *(uint32_t *)opaque = value;
+    }
+}
+
 static void sync_get_bool(Object *obj, Visitor *v, const char *name,
                           void *opaque, Error **errp)
 {
@@ -115,4 +148,13 @@ void sensor_sync_add_properties(Object *obj, SensorSync *s)
                         NULL, &s->violations);
     object_property_add(obj, "trace-i2c", "bool", sync_get_bool,
                         sync_set_bool, NULL, &s->trace);
+    /*
+     * Fault injection: the Nth latch that changes a register (counted
+     * from the sensor's reset, "latches" so far) takes effect a frame
+     * late; 0 = never, and 0 again once it has fired.
+     */
+    object_property_add(obj, "latches", "uint32", sync_get_u32, NULL, NULL,
+                        &s->latches);
+    object_property_add(obj, "late-latch", "uint32", sync_get_u32,
+                        sync_set_u32, NULL, &s->late_latch);
 }

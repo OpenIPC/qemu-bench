@@ -219,16 +219,22 @@ Each step is one PR, landed before the next starts.
     - a frame shorter than its window;
     - window, HTS, MIPI, PLL or bit-depth registers changed while
       streaming (0x0100).
-- **GalaxyCore**, the 16-bit parts (GC4653, GC2093): exposure, gains and
-  VTS latch at frame start (`gc4653_2l_cmos.c`'s list). The rule is
-  exposure beyond VTS − 8. The pixel clock is not modelled yet.
+- **GalaxyCore**, the 16-bit parts (GC4653, GC2093, GC2083): exposure,
+  gains and VTS latch at frame start (`gc4653_2l_cmos.c`'s list, plus
+  GC2083's exposure 0x0d03/04 and gain 0x00b8/b9). The rule is exposure
+  beyond VTS − 8. The pixel clock is not modelled yet.
 - **Observability.**
-  - QOM properties on the sensor: `frame`, `violations`, and on SmartSens
-    the `lines` / `vts` in effect.
+  - QOM properties on the sensor: `frame`, `violations`, and the
+    `lines` / `vts` in effect.
   - `-d guest_errors` reports each violation with its frame and line.
   - `trace-i2c=on` logs every write, e.g.
     `smartsens-2238: frame 24 line 0: 3e01 = 07`. The vendor ISP's sync
     writes land at line 0, from its frame-start interrupt.
+- **Fault injection.** `late-latch=N` on the sensor makes its Nth latch
+  that changes a register (counted from reset; `latches` reads the count
+  so far) land a frame late, as when a driver's I2C runs past the frame
+  boundary. The frame keeps the previous exposure for one more frame.
+  It fires once and then reads 0. `trace-i2c=on` logs it.
 - **What it found.** majestic's SC2315E (hi3516ev200), SC2335
   (gk7205v200) and GC4653 (hi3516ev300) drivers break no rule. The test
   shows that a driver which does is caught.
@@ -277,11 +283,16 @@ Each step is one PR, landed before the next starts.
 - **`qemu-boot/test-hisi-scenario.sh`** runs majestic through a default
   scenario: a quarter of the light at 20 s, full at 35 s, a warmer light
   (R 0.82 / B 0.52) at 50 s, stopping at 65 s. It runs in CI on
-  hi3516ev200, enforcing AE and the timeline and reporting white balance
-  (lib_hiawb freezes in some runs, OpenIPC/qemu-bench#252).
+  hi3516ev200, enforcing AE, white balance and the timeline.
+  - lib_hiawb froze in some runs (OpenIPC/qemu-bench#252) until
+    OpenIPC/openhisilicon#295. The open `open_isp.ko` never moved the
+    hardware to the other online statistics buffer, so every other frame
+    it read the copy made at boot. When a boot AE step latched a frame
+    late, that copy and the live frame passed `AWBSceneFixeCheck` as a
+    fixed scene. `late-latch` on the sensor provokes such a step.
   - AE meets the quarter light with exactly 4x the exposure (61 to 244
     rows) and is back at its level within 1 s.
-  - In a run where AWB keeps working, it moves its gains from
+  - Under the warm light AWB moves its gains from
     R x1.64 / B x1.52 to x1.23 / x1.89 over about 5 s, leaving a grey
     within 2 %.
 
