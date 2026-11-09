@@ -56,6 +56,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 CPM = 0x10000000
 INTC = 0x10001000
@@ -473,8 +474,8 @@ def _sdio52(qt, fn, addr, data=None):
     return _msc_cmd(qt, 52, arg, 5)[2] & 0xff
 
 
-def test_sdio(qt):
-    print('atbm-sdio (SDIO enumeration on MSC1)')
+def test_sdio(qt, card='atbm-sdio', pid=0x6011):
+    print('%s (SDIO enumeration on MSC1)' % card)
     qt.writel(MSC1 + 0x00, 1 << 2 | 2)          # start the clock
     # CMD5 IO_SEND_OP_COND: the inquiry (arg 0) is not ready; once a
     # voltage is offered the card reports ready (R4 bit 31)
@@ -498,13 +499,67 @@ def test_sdio(qt):
     check('CIS tuple is MANFID', _sdio52(qt, 0, ptr), 0x20)
     check('CIS MANFID length', _sdio52(qt, 0, ptr + 1), 4)
     vid = _sdio52(qt, 0, ptr + 2) | _sdio52(qt, 0, ptr + 3) << 8
+    want_pid = pid
     pid = _sdio52(qt, 0, ptr + 4) | _sdio52(qt, 0, ptr + 5) << 8
     check('CIS vendor id', vid, 0x007a)
-    check('CIS product id', pid, 0x6011)
+    check('CIS product id', pid, want_pid)
     # function 1: enable it, read it back ready; FBR class
     _sdio52(qt, 0, 0x02, 0x02)
     check('function 1 enabled and ready', _sdio52(qt, 0, 0x03) & 2, 2)
     check('FBR1 standard SDIO function', _sdio52(qt, 0, 0x100) & 0x0f, 0x0c)
+
+
+def test_sdio_6441(qt):
+    """after test_sdio: the HIF bytes through CMD52, then CCCR RES"""
+    print('atbm6441-sdio (CMD52 to function 1, CCCR RES)')
+    # CONFIG out of reset: ACCESS_MODE (bit 10), byte 1 of the register
+    check('F1 CMD52 reads CONFIG byte 1', _sdio52(qt, 1, 0x01), 0x04)
+    # SRAM_BASE_ADDR (0x10): a byte written reads back, its neighbours kept
+    _sdio52(qt, 1, 0x12, 0x5a)
+    check('F1 CMD52 writes SRAM_BASE byte 2', _sdio52(qt, 1, 0x12), 0x5a)
+    check('the other bytes untouched', _sdio52(qt, 1, 0x11), 0)
+    check('the queue port refuses a byte', _sdio52(qt, 1, 0x08), 0)
+    _sdio52(qt, 0, 0x04, 0x03)                  # IENx: master + F1
+    check('IENx set', _sdio52(qt, 0, 0x04), 0x03)
+    _sdio52(qt, 0, 0x06, 0x08)                  # ABORT: RES
+    check('RES disables function 1', _sdio52(qt, 0, 0x02), 0)
+    check('RES clears the interrupt enables', _sdio52(qt, 0, 0x04), 0)
+    check('RES resets the HIF (SRAM_BASE)', _sdio52(qt, 1, 0x12), 0)
+    _sdio52(qt, 0, 0x02, 0x02)
+    check('function 1 enables again after RES', _sdio52(qt, 0, 0x03) & 2, 2)
+
+
+def test_sdio_6441_migration(qemu, tmp):
+    """the card's state across a migration: enables and a HIF register"""
+    print('atbm6441-sdio migration (state carried)')
+    out = os.path.join(tmp, 'mig6441')
+    qt = QTest(qemu, 't31,wifi=atbm6441')
+    qt.writel(MSC1 + 0x00, 1 << 2 | 2)
+    _msc_cmd(qt, 5, 0x300000, 4)
+    rca = _msc_cmd(qt, 3, 0, 6)[1] >> 8
+    _msc_cmd(qt, 7, rca << 16, 1)
+    _sdio52(qt, 0, 0x02, 0x02)                  # F1 on
+    _sdio52(qt, 0, 0x04, 0x03)                  # IENx
+    _sdio52(qt, 1, 0x12, 0xa5)                  # SRAM_BASE byte 2
+    qt.qmp('migrate', uri='exec:cat > %s' % out)
+    st = None
+    for _ in range(100):
+        st = qt.qmp('query-migrate').get('status')
+        if st in ('completed', 'failed'):
+            break
+        time.sleep(0.1)
+    qt.close()
+    check('saved', st, 'completed')
+    qt = QTest(qemu, 't31,wifi=atbm6441', ['-incoming', 'exec:cat %s' % out])
+    for _ in range(100):
+        if qt.qmp('query-status').get('status') != 'inmigrate':
+            break
+        time.sleep(0.1)
+    check('function 1 still enabled', _sdio52(qt, 0, 0x02), 0x02)
+    check('interrupt enables kept', _sdio52(qt, 0, 0x04), 0x03)
+    check('SRAM_BASE kept', _sdio52(qt, 1, 0x12), 0xa5)
+    check('CONFIG kept (ACCESS_MODE)', _sdio52(qt, 1, 0x01), 0x04)
+    qt.close()
 
 
 SDHCI1 = 0x13070000
@@ -3965,6 +4020,18 @@ def main():
         qt = QTest(a.qemu, 't31,wifi=atbm', ['-nic', 'user'])
         test_sdio(qt)
         qt.close()
+        qt = QTest(a.qemu, 't31,wifi=atbm6441', ['-nic', 'user'])
+        test_sdio(qt, 'atbm6441-sdio', 0x6441)
+        test_sdio_6441(qt)
+        check('the ATBM6441 is /machine/atbm6441, on its own network',
+              qt.qom_get('/machine/atbm6441', 'ssid'), 'OpenIPC')
+        qt.close()
+        r = subprocess.run(
+            [a.qemu, '-M', 't31,wifi=atbm6441,wifi-psk=password',
+             '-machine', 'accel=qtest', '-display', 'none', '-nic', 'user',
+             '-S'], capture_output=True, text=True, timeout=30, input='')
+        check('refused: wifi-psk with the ATBM6441',
+              'joins an open network' in r.stderr, True)
         qt = QTest(a.qemu, 't31,wifi=atbm,wifi-ssid=IEEE,wifi-psk=password',
                    ['-nic', 'user'])
         print('atbm-sdio WPA2-PSK authenticator')
@@ -4183,6 +4250,8 @@ def main():
         test_ids(a.qemu)
         test_migration(a.qemu, 't31', tmp)
         test_migration(a.qemu, 't31,sensor=gc2053', tmp)
+        test_migration(a.qemu, 't31,wifi=atbm6441', tmp)
+        test_sdio_6441_migration(a.qemu, tmp)
         test_migration(a.qemu, 't41', tmp)
         test_migration(a.qemu, 't40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653',
                        tmp)
