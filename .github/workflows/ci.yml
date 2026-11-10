@@ -1713,6 +1713,37 @@ jobs:
           bash qemu-boot/test-ingenic-boot.sh --soc ${{ matrix.soc }}
           --mode ${{ matrix.mode }} --net
 
+  # docs/ingenic.md, "majestic on T40": the release's majestic starts the
+  # SDK, a light sensor switches it to night and back, and the night
+  # settings reach the ISP
+  majestic-ingenic:
+    name: majestic on t40 (day/night)
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0 curl squashfs-tools
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-mipsel
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-mipsel
+
+      - name: majestic, day and night
+        timeout-minutes: 12
+        run: >-
+          bash qemu-boot/test-ingenic-majestic.sh
+          --work "$RUNNER_TEMP/majestic"
+
   boot-hi3516cv610:
     name: Boot hi3516cv610
     needs: build

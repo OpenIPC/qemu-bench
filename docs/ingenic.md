@@ -1844,7 +1844,9 @@ zones captured from a guest (gdbstub, the module's pages walked through
 
 `-global ingenic-isp.trace=on` logs the MSCA and 3A register writes and
 each frame with its light, mean luma and white-balance gains; `-global
-galaxycore-sensor.trace=on` the sensor's register writes.
+ingenic-isp.trace-regs=on` every ISP core and VIC write (`ingenic-isp:
+core [0x...] = 0x...`); `-global galaxycore-sensor.trace=on` the sensor's
+register writes.
 
 T20 and T10 are the older design, an Apical ISP core, and have their own
 model, `ingenic-isp-apical` (read off the OpenIPC `tx-isp-t20.ko`,
@@ -2251,6 +2253,49 @@ client copies the frames into rmem through `/dev/mem` and the host reads
 them with the monitor's `pmemsave`; T40's IMP also hangs in its
 teardown, so the verdict comes first.
 
+### majestic on T40: a digital twin
+
+`qemu-boot/test-ingenic-majestic.sh` runs the streamer OpenIPC ships, or a
+build of it (`--majestic BIN`), on a T40N with a GC4653
+(`t40,variant=t40n,sensor=gc4653 -m 128M`), to reproduce what a T40 owner
+reports without the camera. The root is the `t40` lite release's, rebuilt
+with an init of the test's own: the release's `load_ingenic` loads
+`tx-isp-t40`, the sensor driver, `audio.ko` and `avpu` as on the camera,
+then majestic starts with a `majestic.yaml` the test writes (H.264 on the
+main channel, `colorToGray`, the IR-cut pins, and a light sensor on PB17).
+The checks:
+
+- majestic brings the SDK up -- with `--audio`, with the microphone on,
+  which OpenIPC/majestic#257 was about (the T40 build stopped at
+  `IMP_AI_SetChnParam() failed`; a release from before the fix fails this
+  check here the same way);
+- the host pulls PB17 low (`qom-set /machine/gpio pb 0xfffdffff`), and
+  majestic changes to night; it lets it go, and majestic changes back;
+- the change reaches the ISP. `-global ingenic-isp.trace-regs=on` logs
+  every write to the ISP core (and the VIC) on stderr, and the test counts
+  the core registers the night window writes with values the ten seconds
+  of day before it did not: about 980 on the current release, the night
+  tuning set. A build whose switch never reached the ISP
+  (OpenIPC/majestic#258: the call handed back the mode it had just read)
+  logs "Change mode to NIGHT" all the same and writes 8 to 15, the
+  per-frame curves' drift. `--min-night-regs` (100) is the line.
+
+The picture itself does not turn grey: the model paints the scene from
+the exposure alone (above), so the twin shows that the night settings are
+written, not what they do to the colour.
+
+The machine gathers almost no entropy (`jitterentropy` refuses it), and
+the kernel's pool never initialises on its own: majestic would wait in
+`getrandom()` before it reads its configuration, for good. The init gives
+the release's busybox `seedrng` a creditable seed; the pool is ready about
+a minute into the boot, and the SDK a second after that.
+
+With the microphone on, the release's `audio.ko` and `libimp.so` record
+for about a second -- majestic gets 20 ms frames of the codec's 1 kHz tone
+(peak 9191 at 8 kHz) -- and then the driver prints `get mic timeout!` and
+`Error: Not Find any irq`, and libimp's record thread ends (below, "Not
+modelled").
+
 ## Tested
 
 | Image | Machine | Path | Result |
@@ -2276,6 +2321,7 @@ teardown, so the verdict comes first.
 | OpenIPC `t40` + vendor modules, two gc4653, libimp's joint mode | `t40,sensor=gc4653,sensor1=gc4653` | as above | 2560x2880 on channel 0, the main sensor's part with pipe 0's counter and the secondary's with pipe 1's, above and under (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --joint 3`, `4`) |
 | OpenIPC `t10` + vendor modules, `sensor=jxh62` | `t10` | `-kernel` + NOR root | 1280x720 and 640x360, the sensor on bit-banged I2C (`test-ingenic-isp.sh --soc t10`) |
 | T40XP camera | `t40 -m 256M` | flash | login, the vendor application starts |
+| OpenIPC `t40` + its majestic (or `--majestic BIN`), vendor modules, `sensor=gc4653` | `t40,variant=t40n -m 128M` | `-kernel` + NOR root, `test-ingenic-majestic.sh [--audio]` | majestic starts the SDK (with the microphone on: `--audio`); a light sensor on PB17 switches it to night and back, and the switch to night writes about 980 ISP core registers the day did not (`ingenic-isp.trace-regs`) |
 | U-Boot `isvp_t31_sfcnand` (+ patch), 3.10 with `MTD_JZ_SFC_NAND`, UBI, OpenIPC t31 rootfs | `t31` | SPI NAND (`w25n01gv`) | SPL, U-Boot saves its env, UBI, SquashFS root on ubiblock, UBIFS overlay, login; a file written persists (`test-ingenic-nand.sh`) |
 | Vendor U-Boot `isvp_t41n_sfc0_nand`, SDK 4.4 `isvp_tomcat_nand_defconfig` (+ UBI_BLOCK, cmdline from U-Boot), OpenIPC t40 rootfs as UBIFS | `t41` | SPI NAND (`gd5f1gq4ub` with OOB) | SPL, U-Boot, the 4.4 driver by command table + descriptor DMA, UBIFS root, login; a file written persists (`test-ingenic-nand.sh --soc t41`, `maxcpus=1`) |
 | OpenIPC `t40` / `t31` + their libimp.so, `sensor=gc4653` / `gc2053` | `t40` / `t31` | NOR root, `test-ingenic-avpu.sh` | 2560x1440 (T40) or 1920x1080 (T31) + 640x360: 10 H.264 and 10 H.265 pictures and a JPEG per channel, all decoded with `-err_detect explode` and checked against the ISP's scene |
@@ -2325,6 +2371,12 @@ AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib and pow(),
 and the TCU's PWM pins.
 
 ## Not modelled
+
+Recording past the first second with the OpenIPC `t40` release's own
+`audio.ko` and `libimp.so` (majestic, 8 kHz): after about fifty 20 ms
+frames the driver prints `get mic timeout!` and `Error: Not Find any
+irq` and libimp's record thread ends; the `pdma` and `pdmam`
+interrupts stay at 0.
 
 The SDIO Wi-Fi chip (`atbm-sdio`): open, WPA2 and WPA1 with CCMP or TKIP,
 PMF and group rekeying are modelled; not WPA3-SAE (the guests'
