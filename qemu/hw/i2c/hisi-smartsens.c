@@ -273,11 +273,18 @@ static bool smartsens_frame_start(Object *sensor)
     HisiSmartSensState *s = HISI_SMARTSENS(sensor);
     ImageSensorExposure e = { 0 };
     IngenicSensorExposure raw = { 0 };
+    bool pending = false;
     int i;
 
+    for (i = 0; i < ARRAY_SIZE(ss_latched); i++) {
+        if (s->applied[ss_latched[i] - SS_REG_BASE] !=
+            s->regs[ss_latched[i] - SS_REG_BASE]) {
+            pending = true;
+        }
+    }
     if (sensor_sync_frame_start(&s->sync, smartsens_frame_ns(sensor),
                                 s->applied[0x320E - SS_REG_BASE] << 8 |
-                                s->applied[0x320F - SS_REG_BASE])) {
+                                s->applied[0x320F - SS_REG_BASE], pending)) {
         for (i = 0; i < ARRAY_SIZE(ss_latched); i++) {
             s->applied[ss_latched[i] - SS_REG_BASE] =
                 s->regs[ss_latched[i] - SS_REG_BASE];
@@ -373,7 +380,7 @@ static const Property hisi_smartsens_props[] = {
 /* What the guest programmed: the register file and the address pointer. */
 static const VMStateDescription vmstate_hisi_smartsens = {
     .name = TYPE_HISI_SMARTSENS,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = hisi_smartsens_post_load,
     .fields = (const VMStateField[]) {
@@ -388,6 +395,8 @@ static const VMStateDescription vmstate_hisi_smartsens = {
         VMSTATE_BOOL_V(sync.hold, HisiSmartSensState, 2),
         VMSTATE_UINT32_V(sync.frame, HisiSmartSensState, 2),
         VMSTATE_UINT32_V(sync.violations, HisiSmartSensState, 2),
+        VMSTATE_UINT32_V(sync.latches, HisiSmartSensState, 3),
+        VMSTATE_UINT32_V(sync.late_latch, HisiSmartSensState, 3),
         VMSTATE_END_OF_LIST()
     }
 };

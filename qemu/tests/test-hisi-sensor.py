@@ -12,7 +12,9 @@ counts half rows) / "vts" in effect, "frame" and "violations".
 - a group hold (0x3812 = 0x00 ... 0x30) keeps them back until released;
 - the frame length is HTS x VTS / pclk: VTS 1125 is 30 fps, 2250 15;
 - an exposure beyond 2 x VTS - 4 half rows and a mode register written
-  while streaming count as violations.
+  while streaming count as violations;
+- late-latch=N holds the Nth latch that changes a register back a frame,
+  on the SC2315E and on a 16-bit GalaxyCore part (GC2083).
 
     python3 qemu/tests/test-hisi-sensor.py [--qemu PATH]
 """
@@ -51,51 +53,61 @@ def main():
         fails += not ok
 
     tmp = tempfile.mkdtemp()
-    qmp_path = os.path.join(tmp, 'qmp.sock')
-    q = QTest(a.qemu, 'hi3516ev200,sensor=sc2315e',
-              ('-qmp', 'unix:%s,server=on,wait=off' % qmp_path))
-    qmp = socket.socket(socket.AF_UNIX)
-    for _ in range(50):
-        try:
-            qmp.connect(qmp_path)
-            break
-        except OSError:
-            time.sleep(0.1)
-    qf = qmp.makefile('rw')
-    qf.readline()
 
-    def qmp_cmd(cmd, **args):
-        qf.write(json.dumps({'execute': cmd, 'arguments': args}) + '\n')
-        qf.flush()
-        while True:
-            r = json.loads(qf.readline())
-            if 'return' in r or 'error' in r:
-                return r
-    qmp_cmd('qmp_capabilities')
+    def machine(sensor_name, qom_type, addr):
+        """hi3516ev200 with that sensor: QTest, QMP, the sensor's QOM
+        path, and its get / wr"""
+        qmp_path = os.path.join(tmp, '%s.sock' % sensor_name)
+        q = QTest(a.qemu, 'hi3516ev200,sensor=%s' % sensor_name,
+                  ('-qmp', 'unix:%s,server=on,wait=off' % qmp_path))
+        qmp = socket.socket(socket.AF_UNIX)
+        for _ in range(50):
+            try:
+                qmp.connect(qmp_path)
+                break
+            except OSError:
+                time.sleep(0.1)
+        qf = qmp.makefile('rw')
+        qf.readline()
 
-    # the sensor's QOM path
-    sensor = None
-    for c in qmp_cmd('qom-list', path='/machine/unattached')['return']:
-        if c['type'] == 'child<hisi-smartsens>':
-            sensor = '/machine/unattached/' + c['name']
-    check(sensor is not None, 'the SC2315E is on the machine: %s' % sensor)
+        def qmp_cmd(cmd, **args):
+            qf.write(json.dumps({'execute': cmd, 'arguments': args}) + '\n')
+            qf.flush()
+            while True:
+                r = json.loads(qf.readline())
+                if 'return' in r or 'error' in r:
+                    return r
+        qmp_cmd('qmp_capabilities')
 
-    def get(prop):
-        return qmp_cmd('qom-get', path=sensor, property=prop)['return']
+        path = None
+        for c in qmp_cmd('qom-list', path='/machine/unattached')['return']:
+            if c['type'] == 'child<%s>' % qom_type:
+                path = '/machine/unattached/' + c['name']
+        check(path is not None, 'the %s is on the machine: %s' %
+              (sensor_name.upper(), path))
 
-    def wr(reg, val):
-        """i2c-hibvt's write: START, address, three bytes, STOP"""
-        q.writel(I2C + 0x000, 1)                    # GLB: enable
-        q.writel(I2C + 0x010, SENSOR << 1)          # DATA1
-        for b in (reg >> 8, reg & 0xFF, val):
-            q.writel(I2C + 0x020, b)                # TX FIFO
-        for i, c in enumerate((CMD_TX_S, CMD_TX_D1_1, CMD_TX_FIFO,
-                               CMD_TX_FIFO, CMD_TX_FIFO, CMD_TX_P,
-                               CMD_EXIT)):
-            q.writel(I2C + 0x030 + 4 * i, c)
-        q.writel(I2C + 0x0E0, 0xFFFFFFFF)           # clear status
-        q.writel(I2C + 0x0D0, 1)                    # CTRL1: start
+        def get(prop):
+            return qmp_cmd('qom-get', path=path, property=prop)['return']
 
+        def wr(reg, val):
+            """i2c-hibvt's write: START, address, three bytes, STOP"""
+            q.writel(I2C + 0x000, 1)                # GLB: enable
+            q.writel(I2C + 0x010, addr << 1)        # DATA1
+            for b in (reg >> 8, reg & 0xFF, val):
+                q.writel(I2C + 0x020, b)            # TX FIFO
+            for i, c in enumerate((CMD_TX_S, CMD_TX_D1_1, CMD_TX_FIFO,
+                                   CMD_TX_FIFO, CMD_TX_FIFO, CMD_TX_P,
+                                   CMD_EXIT)):
+                q.writel(I2C + 0x030 + 4 * i, c)
+            q.writel(I2C + 0x0E0, 0xFFFFFFFF)       # clear status
+            q.writel(I2C + 0x0D0, 1)                # CTRL1: start
+
+        def qom_set(prop, value):
+            return qmp_cmd('qom-set', path=path, property=prop, value=value)
+
+        return q, qmp, get, wr, qom_set
+
+    q, qmp, get, wr, qom_set = machine('sc2315e', 'hisi-smartsens', SENSOR)
     def frames(n, fps=30):
         q.cmd('clock_step %d' % (SEC * n // fps))
 
@@ -131,6 +143,24 @@ def main():
     frames(1)
     check(held == 0x100 and get('lines') == 0x180,
           'group hold: %d while open, %d once closed' % (held, get('lines')))
+
+    # fault injection: the next latch that changes something lands a
+    # frame late, and only that one
+    n = get('latches')
+    qom_set('late-latch', n + 1)
+    wr(0x3E01, 0x40)
+    frames(1)
+    late = get('lines')
+    frames(1)
+    check(late == 0x180 and get('lines') == 0x200,
+          'late-latch: %d a frame on, %d the frame after' %
+          (late, get('lines')))
+    wr(0x3E01, 0x30)
+    frames(1)
+    check(get('lines') == 0x180 and get('latches') == n + 2 and
+          get('late-latch') == 0,
+          'the next change is on time: %d, %d latches, fault spent' %
+          (get('lines'), get('latches') - n))
 
     # the frame clock follows HTS x VTS / pclk
     f0 = get('frame')
@@ -184,6 +214,32 @@ def main():
           'VTS 100: 196 half rows fit, 197 do not (+%d, +%d)' %
           (v6 - v5, v7 - v6))
 
+    qmp.close()
+    q.close()
+
+    # a 16-bit GalaxyCore part: GC2083's exposure (0x0D03/04) latches at
+    # frame start and takes the late-latch fault too
+    q, qmp, get, wr, qom_set = machine('gc2083', 'galaxycore-sensor', 0x37)
+    q.writel(VI_CAP + 0x10000, 1 << 31)
+    wr(0x0D03, 0x01)
+    wr(0x0D04, 0x00)
+    frames(2)
+    check(get('lines') == 0x100, 'GC2083: exposure applies: %d' %
+          get('lines'))
+    wr(0x0D04, 0x80)
+    l0 = get('lines')
+    frames(1)
+    check(l0 == 0x100 and get('lines') == 0x180,
+          'GC2083: exposure written mid-frame: %d, then %d' %
+          (l0, get('lines')))
+    qom_set('late-latch', get('latches') + 1)
+    wr(0x0D03, 0x02)
+    frames(1)
+    late = get('lines')
+    frames(1)
+    check(late == 0x180 and get('lines') == 0x280,
+          'GC2083 late-latch: %d a frame on, %d the frame after' %
+          (late, get('lines')))
     qmp.close()
     q.close()
     print('%d failure(s)' % fails)

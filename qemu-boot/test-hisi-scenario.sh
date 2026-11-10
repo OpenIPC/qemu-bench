@@ -16,12 +16,18 @@
 # (seconds of the scene's clock, from VI's first frame).  QEMU is stopped
 # when the record passes the end; twin-metrics.py then checks each
 # segment, and that every change the timeline plans shows in the record:
-# AE settles within --settle-max seconds at the first segment's level;
-# white balance (how neutral it leaves a grey) is reported.
+# AE settles within --settle-max seconds at the first segment's level,
+# and white balance leaves a grey neutral.
 #
 #   test-hisi-scenario.sh [--soc hi3516ev200] [--sensor NAME] [--qemu Q]
 #                         [--work DIR] [--timeline FILE] [--end SECONDS]
 #                         [--timeout SECONDS] [--settle-max SECONDS]
+#                         [--late-latch N]
+#
+# --late-latch N: the sensor's Nth register latch lands a frame late
+# (its late-latch property), a fault in the boot AE sweep.  Only sensors
+# that keep frame timing take it: SmartSens and the 16-bit GalaxyCore
+# parts.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -33,6 +39,7 @@ END=65
 TIMEOUT=900
 SETTLE=8
 SENSOR=
+LATE=0
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -44,6 +51,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT=$2; shift ;;
     --settle-max) SETTLE=$2; shift ;;
     --sensor) SENSOR=$2; shift ;;
+    --late-latch) LATE=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -52,6 +60,12 @@ case $SOC in
 gk*) ALLOC=gk; SENSOR=${SENSOR:-sc2335} ;;
 *) ALLOC=hisi; SENSOR=${SENSOR:-sc2315e} ;;
 esac
+if [ "$LATE" != 0 ]; then
+    case $SENSOR in
+    sc*|gc2083|gc2093|gc4653|gc4663) ;;
+    *) echo "--late-latch: $SENSOR keeps no frame timing" >&2; exit 2 ;;
+    esac
+fi
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
@@ -76,6 +90,8 @@ rm -f "$RECORD"
     -append "console=ttyAMA0,115200 mem=32M mmz_allocator=$ALLOC root=/dev/ram0 rootfstype=squashfs" \
     -icount shift=0 -global hisi-scene.timeline="$TIMELINE" \
     -global hisi-vi.record="$RECORD" \
+    -global hisi-smartsens.late-latch="$LATE" \
+    -global galaxycore-sensor.late-latch="$LATE" \
     -nographic -serial mon:stdio -nic user,restrict=on -no-reboot \
     > "$WORK/console.log" 2>&1 &
 QPID=$!
@@ -104,8 +120,8 @@ if [ -z "$t" ] || ! awk -v t="$t" -v e="$END" 'BEGIN { exit !(t >= e) }'; then
          "console in $WORK/console.log" >&2
     exit 1
 fi
-# White balance is reported, not enforced: in some runs lib_hiawb stops
-# moving its gains seconds after boot and then ignores the light's colour
-# (OpenIPC/qemu-bench#252).
+# White balance is enforced.  A release whose open_isp.ko reads the boot
+# copy of the statistics every other frame (OpenIPC/openhisilicon#295)
+# freezes lib_hiawb in some runs (OpenIPC/qemu-bench#252).
 python3 "$HERE/twin-metrics.py" "$RECORD" --timeline "$TIMELINE" \
-    --settle-max "$SETTLE" --awb-advisory
+    --settle-max "$SETTLE"

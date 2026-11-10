@@ -100,7 +100,9 @@ the CI boot matrix use) — from the GitHub release. The release publishes
 it as `openipc.<soc>-nor-lite.tgz` (the two files) or, for SoCs moved since
 OpenIPC/firmware#2638, `openipc.<soc>-nor-lite-split.tgz` (one
 `firmware.bin.<soc>`: uImage, then SquashFS); `fetch-openipc-lite.sh` takes
-either and leaves `uImage.<soc>` + `rootfs.squashfs.<soc>`:
+either and leaves `uImage.<soc>` + `rootfs.squashfs.<soc>`. When both exist it
+takes the newer: a moved SoC's plain tgz can stay in the release, frozen at the
+move (hi3516ev200's at 2026-10-25):
 
 ```bash
 bash qemu-boot/fetch-openipc-lite.sh hi3516ev300 qemu-boot
@@ -688,15 +690,19 @@ in this order:
   violations (exposure beyond the frame, mode registers written while
   streaming) are counted (QOM `violations`) and logged with
   `-d guest_errors`. `-global hisi-smartsens.trace-i2c=on` logs every write
-  with its frame and line. Families without a frame clock see writes apply
+  with its frame and line, and `late-latch=N` makes the Nth latch that
+  changes a register land a frame late (a fault, once; `latches` counts
+  them). Families without a frame clock see writes apply
   at once, as before. Scenarios: `-global hisi-scene.timeline=FILE` plays
   timed scene changes (`20 light=150`, ramps `a..b prop=x->y`), and
   `-global hisi-vi.record=FILE` writes a CSV line for each frame.
   `qemu-boot/twin-metrics.py` turns the CSV into settle time, overshoot,
   level and AWB residual per segment. `qemu-boot/test-hisi-scenario.sh`
-  runs majestic through a scenario (CI on hi3516ev200). It enforces AE
-  and the timeline but only reports AWB, since lib_hiawb freezes in some
-  runs (#252). An AWB zone's count is every pixel of the zone:
+  runs majestic through a scenario (CI on hi3516ev200), enforcing AE, AWB
+  and the timeline. lib_hiawb froze in some runs (#252) on releases whose
+  `open_isp.ko` never switched the online STT buffer (openhisilicon#295;
+  HiSilicon's VI, unlike Goke's, does not call the frame-start switch).
+  An AWB zone's count is every pixel of the zone:
   lib_hiawb leaves its gains alone unless the zones' average count passes
   1024. Offline, each strip's VIPROC node (0x2f8 chain) has its own
   statistics block (S_ISP_STT_REGS_TYPE) at the address in its 0x5d0.
