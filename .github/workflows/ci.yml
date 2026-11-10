@@ -108,6 +108,12 @@ jobs:
       - name: HiSilicon VEDU + JPGE encode (hisi-vedu)
         run: python3 qemu/tests/test-hisi-vedu.py
 
+      # The same pictures through the V5 (Hi3516CV610) front end: image
+      # address and START moved, two register sets queued, statistics
+      # written back for rate control, JPGE through an image.
+      - name: HiSilicon V5 VEDU + JPGE encode (hisi-vedu gen 5)
+        run: python3 qemu/tests/test-hisi-vedu.py --gen 5
+
       # VI offline into node-driven VPSS (a sensor wider than 2304): both
       # strips of a picture painted, linear and compressed; no pipe
       # interrupt after a stop; online again after an offline run.

@@ -656,6 +656,15 @@ in this order:
   `qemu-boot/test-hisi-venc.sh` runs the vendor stack (`VENC_SendFrame`, no
   VI) under the OpenIPC release; its guest program needs a 32-bit-`off_t`
   `mmap()` shim, because the release's MPI libraries are uClibc builds.
+  V5 (cv608 / cv610 / cv613, `media_gen = 5` → `hisi-vedu.gen=5`) keeps the
+  image and the ring. Its front end moved: the image address is at 0x08,
+  START at 0x0c, and a second register set at +0x10 that the driver queues
+  while the first encodes. The picture size (0x44) and QP (0x60) are in the
+  image, and the engine writes rate-control statistics back to image +
+  0xb10 (0xb28, the macroblock count, is a divisor). JPGE runs from an image
+  too, its quantisers at 0x300 / 0x400 / 0x500. `test-hisi-vedu.py --gen 5`
+  (CI) and `test-hisi-v5-venc.sh --sdk DIR` (local; the guest links the
+  SDK's static MPI libraries) test it.
   In front of it on the EV200-class machines (Goke rebrands too), `hisi-vi` (the
   frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
   start / end) and `hisi-vpss` (paints its channels, then frame start +

@@ -147,6 +147,55 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
 #define JPGE_INT_RING_FULL  (1u << 5)
 #define JPGE_PACK_ECS       5
 
+/*
+ * V5 (Hi3516CV610, gen 5): two register sets (set 1 = set 0 + 0x10), the
+ * image address and START moved, the picture size and QP into the image,
+ * and the engine writes statistics back (docs/hisilicon-venc.md, "V5").
+ */
+#define V5_SET_STRIDE       0x10
+#define V5_VEDU_INTEN       0x0000
+#define V5_VEDU_INTCLR      0x0004
+#define V5_VEDU_IMAGE       0x0008
+#define V5_VEDU_START       0x000c
+#define V5_VEDU_RESET       0x002c  /* 1: abandon the pictures, idle the bus */
+#define V5_VEDU_INTSTAT     0x3000
+#define V5_VEDU_RAWINT      0x3004
+#define V5_VEDU_STATE       0x3008  /* 0 idle, 1 busy */
+#define V5_VEDU_BUS_IDLE    0x3020
+#define V5_VEDU_VERSION     0x400c  /* 0x12 / 0x13 (vedu_hal_read_reg_id) */
+#define V5_IMG_PIC_SIZE     0x044   /* (width - 1) | (height - 1) << 16 */
+#define V5_IMG_QP           0x060   /* frame QP in bits 21:16 */
+#define V5_IMG_STATS        0x23c   /* address of image + 0xb10 */
+#define V5_STAT_MBS         (0xb28 - 0xb10)     /* rc divides by it */
+#define V5_STAT_BYTES_H264  (0xbb0 - 0xb10)
+#define V5_STAT_BYTES_H265  (0xb70 - 0xb10)
+#define V5_STAT_QP_SUM      (0xc24 - 0xb10)
+#define V5_STAT_QP_MAXMIN   (0xc28 - 0xb10)     /* max, then min (bytes) */
+#define V5_STAT_SIZE        0x200
+
+#define V5_JPGE_INTEN       0x0000
+#define V5_JPGE_INTCLR      0x0004
+#define V5_JPGE_IMAGE       0x0008
+#define V5_JPGE_START       0x000c
+#define V5_JPGE_RESET       0x0028
+#define V5_JPGE_INTSTAT     0x0600  /* set 1: 0x608 */
+#define V5_JPGE_RAWINT      0x0604  /* set 1: 0x60c */
+#define V5_JPGE_STATE       0x0610  /* set 1: 0x614 */
+#define V5_JPGE_BUS_IDLE    0x0620
+#define V5_JPGE_VERSION     0x0d68  /* 0x10 / 0x11 */
+#define V5_JPGE_IMG_BYTES   0x1000
+
+/* where JPGE's parameters are: the V4 MMIO file, or the V5 image */
+typedef struct JpgeLayout {
+    uint32_t pic_size, strm_size, quant_y, quant_cb, quant_cr;
+} JpgeLayout;
+
+static const JpgeLayout jpge_v4 = {
+    JPGE_PIC_SIZE, JPGE_STRM_SIZE, JPGE_QUANT_Y, JPGE_QUANT_CB, JPGE_QUANT_CR,
+};
+/* the V5 image keeps V4's MMIO offsets for addresses and strides */
+static const JpgeLayout jpge_v5 = { 0x070, 0x098, 0x300, 0x400, 0x500 };
+
 #define PKT_HDR             64
 #define PKT_MAX_READ        (64 * KiB)  /* parameter sets, JFIF headers */
 #define RING_MAX            (64 * MiB)
@@ -202,6 +251,19 @@ struct HisiVeduState {
     unsigned nchn;
     bool trace;
     char *dump_dir;
+    uint8_t gen;                /* 4: Hi3516EV200 family, 5: Hi3516CV610 */
+    /* gen 5: per register set */
+    uint32_t v5_raw[2], v5_jraw[2];
+    unsigned vset, jset;        /* the set that started it */
+    /*
+     * The driver queues the next picture in the other set while one
+     * encodes: each set keeps its image, and they run in start order.
+     */
+    uint32_t v5_img[2][IMG_WORDS];
+    bool v5_queued[2];
+    uint32_t jimg[V5_JPGE_IMG_BYTES / 4];    /* the running picture's */
+    uint32_t v5_jimg[2][V5_JPGE_IMG_BYTES / 4];
+    bool v5_jqueued[2];
 };
 
 /* ------------------------------------------------------------------ */
@@ -1015,7 +1077,7 @@ static bool hevc_parse_slice(const HevcHdrs *h, bool irap, const uint8_t *b,
  * byte_alignment() behind, then slice data from hevc-enc.c.
  */
 static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
-                                bool *irap, const uint8_t *y,
+                                bool *irap, int *qp_out, const uint8_t *y,
                                 const uint8_t *uv, int sw, int sh,
                                 uint8_t *out, size_t cap)
 {
@@ -1098,6 +1160,7 @@ static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
             zeros = hdr[i] ? 0 : zeros + 1;
         }
     }
+    *qp_out = sl.qp;
     n = hevc_enc_slice_data(&prm, h->w, h->h, sl.qp, sl.type == 1,
                             sl.type == 1 ? c->hevc_ref : NULL, c->hevc_spare,
                             y, sw, sh, sw, uv, sw, out + o, cap - o);
@@ -1120,12 +1183,38 @@ static void vedu_update_irq(HisiVeduState *s)
     qemu_set_irq(s->vedu_irq, s->vedu_regs[VEDU_INTSTAT / 4] != 0);
 }
 
+/*
+ * gen 5: the statistics the driver reads back after a picture (rate
+ * control: frame bytes, QP sum / extremes over the macroblocks)
+ */
+static void vedu_v5_stats(HisiVeduState *s, bool h265, size_t bytes, int qp,
+                          size_t mbs)
+{
+    const uint32_t base = s->img[V5_IMG_STATS / 4];
+    uint8_t st[V5_STAT_SIZE];
+
+    if (!base) {
+        return;
+    }
+    vedu_dma_read(base, st, sizeof(st));
+    stl_le_p(st + V5_STAT_MBS, mbs);
+    stl_le_p(st + (h265 ? V5_STAT_BYTES_H265 : V5_STAT_BYTES_H264), bytes);
+    stl_le_p(st + V5_STAT_QP_SUM, qp * mbs);
+    st[V5_STAT_QP_MAXMIN] = qp;
+    st[V5_STAT_QP_MAXMIN + 1] = qp;
+    vedu_dma_write(base, st, sizeof(st));
+}
+
 /* one picture; returns the raw interrupt bits it ends with */
 static uint32_t vedu_encode(HisiVeduState *s)
 {
     const uint32_t *img = s->img;
-    const uint32_t size_reg = s->vedu_regs[VEDU_PIC_SIZE / 4];
+    const uint32_t size_reg = s->gen == 5 ? img[V5_IMG_PIC_SIZE / 4]
+                                          : s->vedu_regs[VEDU_PIC_SIZE / 4];
     const int w = (size_reg & 0xffff) + 1, h = (size_reg >> 16) + 1;
+    /* H.265 codes at its slice header's QP; that one goes in the stats */
+    int qp = s->gen == 5 ? (img[V5_IMG_QP / 4] >> 16) & 0x3f
+                         : img[IMG_SLICE_QP / 4] & 0x3f;
     const uint32_t base = img[IMG_STRM_BASE / 4];
     const uint32_t size = img[IMG_STRM_SIZE / 4];
     const uint32_t wp_cell = img[IMG_STRM_WP / 4];
@@ -1163,11 +1252,10 @@ static uint32_t vedu_encode(HisiVeduState *s)
 
     nal = g_malloc(cap + 64);
     if (c->codec == CODEC_H265) {
-        n = vedu_h265_picture(c, img, &idr, y, uv, mbw * 16, mbh * 16,
+        n = vedu_h265_picture(c, img, &idr, &qp, y, uv, mbw * 16, mbh * 16,
                               nal, cap);
     } else {
-        n = vedu_h264_picture(c, &idr, img[IMG_SLICE_QP / 4] & 0x3f, w, h,
-                              y, uv, nal, cap);
+        n = vedu_h264_picture(c, &idr, qp, w, h, y, uv, nal, cap);
     }
     if (!n) {
         if (cap < want) {
@@ -1196,35 +1284,142 @@ static uint32_t vedu_encode(HisiVeduState *s)
 
     c->scanned = (start + total) % size;
     vedu_stl(wp_cell, c->scanned);
+    if (s->gen == 5) {
+        vedu_v5_stats(s, c->codec == CODEC_H265, total, qp, mbw * mbh);
+    }
     return VEDU_INT_EOP;
 }
+
+static void vedu_v5_update_irq(HisiVeduState *s)
+{
+    bool level = false;
+    int k;
+
+    for (k = 0; k < 2; k++) {
+        level |= (s->v5_raw[k] &
+                  s->vedu_regs[(V5_VEDU_INTEN + k * V5_SET_STRIDE) / 4]) != 0;
+    }
+    qemu_set_irq(s->vedu_irq, level);
+}
+
+static void vedu_v5_run(HisiVeduState *s, unsigned k);
 
 static void vedu_done(void *opaque)
 {
     HisiVeduState *s = opaque;
 
+    if (s->gen == 5) {
+        s->v5_raw[s->vset] |= vedu_encode(s);
+        if (s->v5_queued[!s->vset]) {
+            vedu_v5_run(s, !s->vset);
+        }
+        vedu_v5_update_irq(s);
+        return;
+    }
     s->vedu_raw |= vedu_encode(s);
     vedu_update_irq(s);
 }
 
-static void vedu_start(HisiVeduState *s)
+static void vedu_v5_run(HisiVeduState *s, unsigned k)
 {
-    vedu_dma_read(s->vedu_regs[VEDU_REG_IMAGE / 4], s->img, sizeof(s->img));
+    s->vset = k;
+    s->v5_queued[k] = false;
+    memcpy(s->img, s->v5_img[k], sizeof(s->img));
+    timer_mod(s->vedu_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VEDU_DONE_NS);
+}
+
+/* the image a START points at, into img (traced with trace=on) */
+static void vedu_fetch(HisiVeduState *s, uint32_t image, uint32_t *img)
+{
+    vedu_dma_read(image, img, IMG_WORDS * 4);
     if (s->trace) {
         int i;
 
-        fprintf(stderr, "vedu START image @%08x\n",
-                s->vedu_regs[VEDU_REG_IMAGE / 4]);
+        fprintf(stderr, "vedu START image @%08x\n", image);
         for (i = 0; i < IMG_WORDS; i += 4) {
-            if (s->img[i] | s->img[i + 1] | s->img[i + 2] | s->img[i + 3]) {
+            if (img[i] | img[i + 1] | img[i + 2] | img[i + 3]) {
                 fprintf(stderr, "img %04x: %08x %08x %08x %08x\n", i * 4,
-                        s->img[i], s->img[i + 1], s->img[i + 2],
-                        s->img[i + 3]);
+                        img[i], img[i + 1], img[i + 2], img[i + 3]);
             }
         }
     }
+}
+
+static void vedu_start(HisiVeduState *s, uint32_t image)
+{
+    vedu_fetch(s, image, s->img);
     timer_mod(s->vedu_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VEDU_DONE_NS);
+}
+
+static uint32_t hisi_vedu_v5_read(HisiVeduState *s, hwaddr offset)
+{
+    const bool busy = timer_pending(s->vedu_timer);
+    const unsigned k = (offset >> 4) & 1;
+
+    switch (offset) {
+    case V5_VEDU_INTSTAT:
+    case V5_VEDU_INTSTAT + V5_SET_STRIDE:
+        return s->v5_raw[k] & s->vedu_regs[(V5_VEDU_INTEN + k * 0x10) / 4];
+    case V5_VEDU_RAWINT:
+    case V5_VEDU_RAWINT + V5_SET_STRIDE:
+        return s->v5_raw[k];
+    case V5_VEDU_STATE:
+    case V5_VEDU_STATE + V5_SET_STRIDE:
+        return (busy && s->vset == k) || s->v5_queued[k];
+    case V5_VEDU_BUS_IDLE:
+        return !busy;
+    case V5_VEDU_VERSION:
+        return 0x12;
+    }
+    return s->vedu_regs[offset / 4];
+}
+
+static void vedu_v5_abandon(HisiVeduState *s)
+{
+    timer_del(s->vedu_timer);
+    memset(s->v5_queued, 0, sizeof(s->v5_queued));
+    memset(s->v5_raw, 0, sizeof(s->v5_raw));
+    s->vset = 0;
+}
+
+static void hisi_vedu_v5_write(HisiVeduState *s, hwaddr offset, uint32_t val)
+{
+    const unsigned k = (offset >> 4) & 1;
+
+    switch (offset) {
+    case V5_VEDU_RESET:
+        if (val & 1) {
+            vedu_v5_abandon(s);
+            vedu_v5_update_irq(s);
+        }
+        break;
+    case V5_VEDU_INTCLR:
+    case V5_VEDU_INTCLR + V5_SET_STRIDE:
+        s->v5_raw[k] &= ~val;
+        vedu_v5_update_irq(s);
+        return;
+    case V5_VEDU_INTEN:
+    case V5_VEDU_INTEN + V5_SET_STRIDE:
+        s->vedu_regs[offset / 4] = val;
+        vedu_v5_update_irq(s);
+        return;
+    case V5_VEDU_START:
+    case V5_VEDU_START + V5_SET_STRIDE:
+        s->vedu_regs[offset / 4] = val;
+        if (val & 1) {
+            const uint32_t image = s->vedu_regs[(V5_VEDU_IMAGE + k * 0x10) / 4];
+
+            vedu_fetch(s, image, s->v5_img[k]);
+            s->v5_queued[k] = true;
+            if (!timer_pending(s->vedu_timer)) {
+                vedu_v5_run(s, k);  /* else it follows the running one */
+            }
+        }
+        return;
+    }
+    s->vedu_regs[offset / 4] = val;
 }
 
 static uint64_t hisi_vedu_read(void *opaque, hwaddr offset, unsigned size)
@@ -1232,6 +1427,13 @@ static uint64_t hisi_vedu_read(void *opaque, hwaddr offset, unsigned size)
     HisiVeduState *s = HISI_VEDU(opaque);
     uint32_t val;
 
+    if (s->gen == 5) {
+        val = hisi_vedu_v5_read(s, offset);
+        if (s->trace) {
+            fprintf(stderr, "vedu R %04x = %08x\n", (int)offset, val);
+        }
+        return val;
+    }
     switch (offset) {
     case VEDU_INTSTAT:
         val = s->vedu_raw & s->vedu_regs[VEDU_INTMASK / 4];
@@ -1260,6 +1462,10 @@ static void hisi_vedu_write(void *opaque, hwaddr offset,
     if (s->trace) {
         fprintf(stderr, "vedu W %04x : %08x\n", (int)offset, (uint32_t)val);
     }
+    if (s->gen == 5) {
+        hisi_vedu_v5_write(s, offset, val);
+        return;
+    }
     switch (offset) {
     case VEDU_INTCLR:
         s->vedu_raw &= ~(uint32_t)val;
@@ -1272,7 +1478,7 @@ static void hisi_vedu_write(void *opaque, hwaddr offset,
     case VEDU_START:
         s->vedu_regs[offset / 4] = val;
         if (val & 1) {
-            vedu_start(s);
+            vedu_start(s, s->vedu_regs[VEDU_REG_IMAGE / 4]);
         }
         return;
     case VEDU_RESET:
@@ -1298,10 +1504,11 @@ static void jpge_update_irq(HisiVeduState *s)
 /* one picture; returns the raw interrupt bits it ends with */
 static uint32_t jpge_encode(HisiVeduState *s)
 {
-    const uint32_t *r = s->jpge_regs;
-    const int w = (r[JPGE_PIC_SIZE / 4] & 0xffff) + 1;
-    const int h = (r[JPGE_PIC_SIZE / 4] >> 16) + 1;
-    const uint32_t base = r[JPGE_STRM_BASE / 4], size = r[JPGE_STRM_SIZE / 4];
+    const uint32_t *r = s->gen == 5 ? s->jimg : s->jpge_regs;
+    const JpgeLayout *l = s->gen == 5 ? &jpge_v5 : &jpge_v4;
+    const int w = (r[l->pic_size / 4] & 0xffff) + 1;
+    const int h = (r[l->pic_size / 4] >> 16) + 1;
+    const uint32_t base = r[JPGE_STRM_BASE / 4], size = r[l->strm_size / 4];
     const uint32_t wp_cell = r[JPGE_STRM_WP / 4];
     const size_t mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
     const size_t pw = mbw * 16, ph = mbh * 16;
@@ -1326,14 +1533,14 @@ static uint32_t jpge_encode(HisiVeduState *s)
 
     for (i = 0; i < 64; i++) {
         /* register i holds row i % 8, column i / 8 */
-        const uint32_t ry = r[JPGE_QUANT_Y / 4 + i] ?: 1;
-        const uint32_t rc = r[JPGE_QUANT_CB / 4 + i] ?: 1;
+        const uint32_t ry = r[l->quant_y / 4 + i] ?: 1;
+        const uint32_t rc = r[l->quant_cb / 4 + i] ?: 1;
         const size_t k = (i % 8) * 8 + i / 8;
 
         ql[k] = MIN(255, MAX(1, ((1u << 23) + ry / 2) / ry));
         qc[k] = MIN(255, MAX(1, ((1u << 23) + rc / 2) / rc));
     }
-    if (memcmp(&r[JPGE_QUANT_CB / 4], &r[JPGE_QUANT_CR / 4], 64 * 4)) {
+    if (memcmp(&r[l->quant_cb / 4], &r[l->quant_cr / 4], 64 * 4)) {
         /* jpeg-enc.c codes Cb and Cr with one table, as the driver's
          * two-table DQT does */
         qemu_log_mask(LOG_UNIMP, "hisi-jpge: Cr quantisers differ from Cb's; "
@@ -1383,12 +1590,120 @@ static uint32_t jpge_encode(HisiVeduState *s)
     return JPGE_INT_DONE;
 }
 
+static void jpge_v5_update_irq(HisiVeduState *s)
+{
+    bool level = false;
+    int k;
+
+    for (k = 0; k < 2; k++) {
+        level |= (s->v5_jraw[k] &
+                  s->jpge_regs[(V5_JPGE_INTEN + k * V5_SET_STRIDE) / 4]) != 0;
+    }
+    qemu_set_irq(s->jpge_irq, level);
+}
+
+/* gen 5: run a fetched set (two can be queued, as with VEDU) */
+static void jpge_v5_run(HisiVeduState *s, unsigned k)
+{
+    s->jset = k;
+    s->v5_jqueued[k] = false;
+    memcpy(s->jimg, s->v5_jimg[k], sizeof(s->jimg));
+    timer_mod(s->jpge_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VEDU_DONE_NS);
+}
+
 static void jpge_done(void *opaque)
 {
     HisiVeduState *s = opaque;
 
+    if (s->gen == 5) {
+        s->v5_jraw[s->jset] |= jpge_encode(s);
+        if (s->v5_jqueued[!s->jset]) {
+            jpge_v5_run(s, !s->jset);
+        }
+        jpge_v5_update_irq(s);
+        return;
+    }
     s->jpge_raw |= jpge_encode(s);
     jpge_update_irq(s);
+}
+
+static uint32_t hisi_jpge_v5_read(HisiVeduState *s, hwaddr offset)
+{
+    const bool busy = timer_pending(s->jpge_timer);
+
+    switch (offset) {
+    case V5_JPGE_INTSTAT:
+    case V5_JPGE_INTSTAT + 8:
+        return s->v5_jraw[(offset >> 3) & 1] &
+               s->jpge_regs[(V5_JPGE_INTEN + ((offset >> 3) & 1) * 0x10) / 4];
+    case V5_JPGE_RAWINT:
+    case V5_JPGE_RAWINT + 8:
+        return s->v5_jraw[(offset >> 3) & 1];
+    case V5_JPGE_STATE:
+    case V5_JPGE_STATE + 4:
+        return (busy && s->jset == ((offset >> 2) & 1)) ||
+               s->v5_jqueued[(offset >> 2) & 1];
+    case V5_JPGE_BUS_IDLE:
+        return !busy;
+    case V5_JPGE_VERSION:
+        return 0x10;
+    }
+    return s->jpge_regs[offset / 4];
+}
+
+static void hisi_jpge_v5_write(HisiVeduState *s, hwaddr offset, uint32_t val)
+{
+    const unsigned k = (offset >> 4) & 1;
+
+    switch (offset) {
+    case V5_JPGE_INTCLR:
+    case V5_JPGE_INTCLR + V5_SET_STRIDE:
+        s->v5_jraw[k] &= ~val;
+        jpge_v5_update_irq(s);
+        return;
+    case V5_JPGE_INTEN:
+    case V5_JPGE_INTEN + V5_SET_STRIDE:
+        s->jpge_regs[offset / 4] = val;
+        jpge_v5_update_irq(s);
+        return;
+    case V5_JPGE_START:
+    case V5_JPGE_START + V5_SET_STRIDE:
+        s->jpge_regs[offset / 4] = val;
+        if (val & 1) {
+            const uint32_t image =
+                s->jpge_regs[(V5_JPGE_IMAGE + k * V5_SET_STRIDE) / 4];
+            uint32_t *img = s->v5_jimg[k];
+
+            vedu_dma_read(image, img, sizeof(s->v5_jimg[k]));
+            if (s->trace) {
+                int i;
+
+                fprintf(stderr, "jpge START set %u image @%08x\n", k, image);
+                for (i = 0; i < V5_JPGE_IMG_BYTES / 4; i += 4) {
+                    if (img[i] | img[i + 1] | img[i + 2] | img[i + 3]) {
+                        fprintf(stderr, "jimg %04x: %08x %08x %08x %08x\n",
+                                i * 4, img[i], img[i + 1], img[i + 2],
+                                img[i + 3]);
+                    }
+                }
+            }
+            s->v5_jqueued[k] = true;
+            if (!timer_pending(s->jpge_timer)) {
+                jpge_v5_run(s, k);  /* else it follows the running one */
+            }
+        }
+        return;
+    case V5_JPGE_RESET:
+        if (val & 1) {
+            timer_del(s->jpge_timer);
+            s->v5_jraw[0] = s->v5_jraw[1] = 0;
+            s->v5_jqueued[0] = s->v5_jqueued[1] = false;
+            jpge_v5_update_irq(s);
+        }
+        break;
+    }
+    s->jpge_regs[offset / 4] = val;
 }
 
 static uint64_t hisi_jpge_read(void *opaque, hwaddr offset, unsigned size)
@@ -1396,6 +1711,13 @@ static uint64_t hisi_jpge_read(void *opaque, hwaddr offset, unsigned size)
     HisiVeduState *s = HISI_VEDU(opaque);
     uint32_t val;
 
+    if (s->gen == 5) {
+        val = hisi_jpge_v5_read(s, offset);
+        if (s->trace) {
+            fprintf(stderr, "jpge R %04x = %08x\n", (int)offset, val);
+        }
+        return val;
+    }
     switch (offset) {
     case JPGE_INTSTAT:
         val = s->jpge_raw & s->jpge_regs[JPGE_INTEN / 4];
@@ -1423,6 +1745,10 @@ static void hisi_jpge_write(void *opaque, hwaddr offset,
 
     if (s->trace) {
         fprintf(stderr, "jpge W %04x : %08x\n", (int)offset, (uint32_t)val);
+    }
+    if (s->gen == 5) {
+        hisi_jpge_v5_write(s, offset, val);
+        return;
     }
     switch (offset) {
     case JPGE_INTCLR:
@@ -1497,6 +1823,10 @@ static void hisi_vedu_reset(DeviceState *dev)
     memset(s->jpge_regs, 0, sizeof(s->jpge_regs));
     s->vedu_raw = 0;
     s->jpge_raw = 0;
+    vedu_v5_abandon(s);
+    memset(s->v5_jraw, 0, sizeof(s->v5_jraw));
+    memset(s->v5_jqueued, 0, sizeof(s->v5_jqueued));
+    s->jset = 0;
     for (i = 0; i < s->nchn; i++) {
         vedu_channel_free(&s->chn[i]);
     }
@@ -1507,6 +1837,8 @@ static void hisi_vedu_reset(DeviceState *dev)
 static const Property hisi_vedu_properties[] = {
     DEFINE_PROP_BOOL("trace", HisiVeduState, trace, false),
     DEFINE_PROP_STRING("dump-dir", HisiVeduState, dump_dir),
+    /* register layout: 4 (Hi3516EV200 family) or 5 (Hi3516CV610) */
+    DEFINE_PROP_UINT8("gen", HisiVeduState, gen, 4),
 };
 
 static void hisi_vedu_class_init(ObjectClass *klass, const void *data)

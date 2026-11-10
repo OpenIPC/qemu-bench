@@ -86,6 +86,7 @@ static const ImageSensorSpec image_sensors[] = {
     SC("sc307h", 0xCB1C),
     SC("sc401ai", 0xCD2E),
     SC("sc431hai", 0xCD6B),
+    SC("sc4336p", 0x9C42),          /* hi3516cv6xx: load_hisilicon's default */
     SC("sc501ai", 0xCE1F),
     SC("sc5035", 0x5035),
     SC("sc5238", 0x5235),

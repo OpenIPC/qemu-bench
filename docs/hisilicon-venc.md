@@ -400,10 +400,76 @@ The release's MPI libraries are uClibc builds. Under musl they need:
   `mmap err, page addr` and `0xa008800c`;
 - stand-ins for the audio VQE / voice symbols they import.
 
+## V5 (Hi3516CV610 / CV608 / CV613)
+
+`hisi-vedu` takes `gen=5` on the cv6xx machines (`media_gen` in their
+configs). The SDK's `mod_venc.o`, `mod_chnl.o` (`chnl_vpu_isr`),
+`mod_h264e.o`, `mod_h265e.o`, `mod_jpege.o` and `mod_rc.o` keep V4's
+register image and stream ring. What changed is the front end, plus a
+statistics write-back:
+
+| | V4 | V5 |
+|---|---|---|
+| image address / START | 0x58 / 0x08 | 0x08 / 0x0c; a second register set at +0x10 (0x18 / 0x1c) |
+| status, raw | 0x3000 / 0x3004 | the same for set 0; set 1 at 0x3010 / 0x3014; state (busy) 0x3008 / 0x3018 |
+| interrupt enable / clear | 0x00 / 0x04 | 0x00 / 0x04, set 1 at 0x10 / 0x14; the driver enables 3 (end of picture, slice) |
+| bus idle | 0x3010 bit 0 | 0x3020 bit 0 (reset requests it at 0x2c) |
+| picture size | MMIO 0x14 | image 0x44, `(w - 1) \| (h - 1) << 16` |
+| QP | image 0x61c | image 0x60 bits 21:16 |
+| statistics | none | the engine writes them at the address in image 0x23c (image + 0xb10) |
+
+- **Two register sets.** The driver queues the next picture in the other
+  set while one encodes (H.264 in set 0 with H.265 in set 1, say), and
+  `chnl_vpu_isr` takes the set whose raw status is non-zero. The model
+  fetches each set's image at its START and runs the sets in start order.
+- **Statistics.** Rate control reads, relative to image + 0xb10:
+  - 0x18 (image 0xb28): the macroblock count. `rc_drv_avc_get_rc_info`
+    divides by it, so it must not be 0.
+  - 0xa0 (0xbb0) for H.264, or 0x60 (0xb70) for H.265: the frame's bytes.
+  - 0x114 (0xc24): the QP sum.
+  - 0x118 / 0x119: the maximum and minimum QP.
+- **Slice headers.** The V5 driver also writes H.264 slice header bits
+  into the image (0x454-0x478, parts A / B / C). The model still codes its
+  own, which only has to agree with the driver's SPS / PPS. H.265 is
+  unchanged (0x404-0x42c).
+- **JPGE** is programmed through a register image too.
+  - The image address is at 0x08, START at 0x0c (written 0, then 1), set
+    1 at +0x10.
+  - Status is at 0x600 (raw 0x604, set 1 0x608 / 0x60c), state at
+    0x610 / 0x614, and bus idle at 0x620 bit 0.
+  - The image keeps V4's MMIO offsets for the strides (0x164), the source
+    (0x200 / 0x204) and the ring with its cells (0x210-0x218).
+  - Its own offsets are the size (0x70), the ring size (0x98) and the
+    quantisers' reciprocals (0x300 / 0x400 / 0x500, not 0x800).
+- **No probe ID.** The version registers (VEDU 0x400c = 0x12, JPGE 0xd68 =
+  0x10) are read only on the timeout path.
+
+Testing:
+
+```bash
+python3 qemu/tests/test-hisi-vedu.py --gen 5    # register level, CI
+bash qemu-boot/test-hisi-v5-venc.sh --sdk ~/projects/cameras/sdk/Hi3516CV610_SDK_V1.0.2.0
+```
+
+`test-hisi-v5-venc.sh` is the V5 `test-hisi-venc.sh`.
+
+- The guest is the OpenIPC hi3516cv6xx rootfs as an initramfs. Its own
+  `load_hisilicon` loads every module, then `hisi-v5-venc-userframe` runs.
+- The program sends the same test frames through `ss_mpi_venc_send_frame`.
+  It links the SDK's headers and static MPI libraries, which are not
+  redistributable, so the test is local only.
+- The kernel gets 80 of the 128 MiB, because the initramfs does not fit in
+  the camera's 32.
+
+H.264, H.265 and JPEG each encode 6 of 6 frames, and the counter decodes
+as 0..5.
+
 ## Not yet
 
 - **AF, the local-average (LA) and dehaze statistics** are not produced.
 - **Multi-slice pictures and B frames:** the model codes one slice per
   picture and has no B frames.
-- **Other generations:** V1 (CV100), CV300, AV100 and V5 have their own
+- **Other generations:** V1 (CV100), CV300 and AV100 have their own
   encoder layouts and are still register stubs.
+- **V5 VI / VPSS:** the cv6xx machines encode user frames, but majestic
+  has no picture to encode yet.
