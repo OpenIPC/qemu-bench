@@ -2654,6 +2654,7 @@ static const HisiSoCConfig hi3516cv608_soc = {
     .rtc_irq            = 37,
 
     .vedu_base          = 0x17140000,
+    .media_gen          = 5,
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -2682,7 +2683,8 @@ static const HisiSoCConfig hi3516cv608_soc = {
 /*
  * Hi3516CV610: V5 generation (~2023) — Dual Cortex-A7 MP2, GICv2.
  * Completely new address map (0x11xxxxxx peripherals, GIC @ 0x124xxxxx).
- * No SP804 timer — uses ARM arch timer exclusively.
+ * The kernel times with the ARM arch timer; the one SP804 below is for
+ * U-Boot's udelay().
  * FEMAC-v2 with integrated FEPHY, "nebula,sdhci" for SD/MMC.
  * FMC memory window below registers at 0x0F000000.
  */
@@ -2757,6 +2759,7 @@ static const HisiSoCConfig hi3516cv610_soc = {
     .rtc_irq            = 37,
 
     .vedu_base          = 0x17140000,
+    .media_gen          = 5,
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -2848,6 +2851,7 @@ static const HisiSoCConfig hi3516cv613_soc = {
     .rtc_irq            = 37,
 
     .vedu_base          = 0x17140000,
+    .media_gen          = 5,
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -5874,6 +5878,9 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vedu_base) {
         DeviceState *vedu = qdev_new("hisi-vedu");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vedu);
+        if (c->media_gen) {
+            qdev_prop_set_uint8(vedu, "gen", c->media_gen);
+        }
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->vedu_base);
         sysbus_mmio_map(busdev, 1, c->jpge_base);

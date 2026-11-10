@@ -8,7 +8,13 @@ the parameter-set packets it puts in the stream ring, the H.265 slice
 header bits it leaves in the register image, the JFIF header it writes in
 front of a JPEG scan and the quantisers' reciprocals it programs.
 
-    python3 qemu/tests/test-hisi-vedu.py [--qemu PATH] [--machine M]
+--gen 5 replays the same pictures through the V5 (Hi3516CV610) front end,
+as hisi-v5-venc-userframe traced it: the register image's address at
+0x08 and START at 0x0c, the picture size and QP in the image, the
+statistics the engine writes back for rate control, two register sets
+queued back to back, and JPGE programmed through an image too.
+
+    python3 qemu/tests/test-hisi-vedu.py [--qemu PATH] [--machine M] [--gen 4|5]
 """
 import argparse
 import math
@@ -23,13 +29,18 @@ sys.path.insert(0, os.path.dirname(__file__))
 from importlib import import_module
 QTest = import_module('test-xm-h1-jpeg').QTest
 
-VEDU, JPGE = 0x11410000, 0x11420000
+BASES = {4: (0x11410000, 0x11420000), 5: (0x17140000, 0x171c0000)}
+MACHINES = {4: 'hi3516ev200', 5: 'hi3516cv610'}
+VEDU, JPGE = BASES[4]
+GEN = 4
 W, H = 640, 368                 # the size the captured SPS describe
 SRC = 0x41000000                # NV21: Y, then VU
 RING_SIZE = 0x80000            # one ring per channel, as the driver has
 RINGS = {0: 0x42000000, 1: 0x42080000, 2: 0x42300000}
 WP_CELL, RP_CELL = 0x42100080, 0x42100040
 IMAGE = 0x42200000
+IMAGE1 = 0x42201000             # gen 5: register set 1's image
+JIMAGE = 0x42202000             # gen 5: JPGE's image
 
 # the driver's packets for an IDR, as hi_h264e / hi_h265e write them
 H264_PS = [(7, '6742001e963541405f4dc040404080'),
@@ -141,8 +152,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=os.path.join(os.path.dirname(__file__),
                     '..', '..', 'qemu-src', 'build', 'qemu-system-arm'))
-    ap.add_argument('--machine', default='hi3516ev200')
+    ap.add_argument('--machine')
+    ap.add_argument('--gen', type=int, default=4, choices=(4, 5))
     a = ap.parse_args()
+    global VEDU, JPGE, GEN
+    GEN = a.gen
+    VEDU, JPGE = BASES[GEN]
+    a.machine = a.machine or MACHINES[GEN]
     fails = 0
 
     def check(ok, what):
@@ -171,18 +187,37 @@ def main():
         img = {0x104: SRC, 0x108: SRC + W * H, 0x1f4: W | W << 16,
                0x12c: WP_CELL, 0x130: RP_CELL, 0x16c: RINGS[chn],
                0x4a0: RING_SIZE, 0x4a4: 40000 * n, 0x61c: 26 + 2 * n}
+        if GEN == 5:
+            # size and QP in the image; statistics written back at +0xb10
+            img.update({0x44: (W - 1) | (H - 1) << 16,
+                        0x60: (26 + 2 * n) << 16, 0x23c: IMAGE + 0xb10})
+            del img[0x61c]
         img.update(img_extra)
         q.write(IMAGE, b'\0' * 0x1000)
         for off, v in img.items():
             q.writel(IMAGE + off, v)
-        q.writel(VEDU + 0x0000, 1)                  # INTMASK: end of picture
-        q.writel(VEDU + 0x0014, (W - 1) | (H - 1) << 16)
-        q.writel(VEDU + 0x0058, IMAGE)
-        q.writel(VEDU + 0x0008, 1)
-        check(not q.readl(VEDU + 0x3010) & 1, 'picture %d: busy after START' % n)
+        if GEN == 5:
+            q.writel(VEDU + 0x0000, 3)              # end of picture, slice
+            q.writel(VEDU + 0x0008, IMAGE)
+            q.writel(VEDU + 0x000c, 1)
+            check(q.readl(VEDU + 0x3008) == 1 and
+                  not q.readl(VEDU + 0x3020) & 1,
+                  'picture %d: set 0 busy, bus not idle after START' % n)
+        else:
+            q.writel(VEDU + 0x0000, 1)              # INTMASK: end of picture
+            q.writel(VEDU + 0x0014, (W - 1) | (H - 1) << 16)
+            q.writel(VEDU + 0x0058, IMAGE)
+            q.writel(VEDU + 0x0008, 1)
+            check(not q.readl(VEDU + 0x3010) & 1,
+                  'picture %d: busy after START' % n)
         q.cmd('clock_step 5000000')
         st = q.readl(VEDU + 0x3000)
         check(st & 1, 'picture %d: end of picture (0x%x)' % (n, st))
+        if GEN == 5:
+            mbs, = struct.unpack('<I', q.read(IMAGE + 0xb28, 4))
+            check(mbs == (W // 16) * (H // 16) and q.readl(VEDU + 0x3020) & 1,
+                  'picture %d: statistics written back (%d macroblocks), '
+                  'bus idle' % (n, mbs))
         end = q.readl(WP_CELL)
         ln, pad, ptype, _, _, flags, pchn, pts = struct.unpack(
             '<IIBBBBIQ', q.read(RING + start, 24))
@@ -190,7 +225,20 @@ def main():
               'its packet (0x%x)' % (n, end))
         check(pchn == chn and pts == 40000 * n,
               'picture %d: channel %d, PTS %d' % (n, pchn, pts))
-        q.writel(VEDU + 0x0004, 1)
+        if GEN == 5:
+            h265 = chn == 1
+            nbytes, = struct.unpack('<I', q.read(
+                IMAGE + (0xb70 if h265 else 0xbb0), 4))
+            check(nbytes == ln, 'picture %d: frame bytes %d in the statistics '
+                  '(packet %d)' % (n, nbytes, ln))
+            qsum, qmax, qmin = struct.unpack('<IBB', q.read(IMAGE + 0xc24, 6))
+            mbs = (W // 16) * (H // 16)
+            image_qp = q.readl(IMAGE + 0x60) >> 16 & 0x3f
+            check(qmax == qmin and qsum == qmax * mbs and
+                  (qmax != image_qp if h265 else qmax == image_qp),
+                  'picture %d: QP %d in the statistics (%s)' %
+                  (n, qmax, "the slice header's" if h265 else "the image's"))
+        q.writel(VEDU + 0x0004, 1 if GEN == 4 else 0xffffffff)
         check(q.readl(VEDU + 0x3000) == 0, 'picture %d: cleared' % n)
         return ptype, flags, q.read(RING + start + 64, ln - 64 - pad)
 
@@ -219,6 +267,8 @@ def main():
             ln, p1, p2 = H265_HDR[n == 0]
             img = {0x404: ln, 0x408: p1}
             img.update({0x40c + 4 * i: v for i, v in enumerate(p2)})
+            if GEN == 5:
+                img[0x60] = 51 << 16    # not the slice header's QP
             t, flags, nal = vedu_job(n, img, H265_PS if n == 0 else [], 1)
             check(t == (19 if n == 0 else 1),
                   'H.265 picture %d: packet type %d' % (n, t))
@@ -244,27 +294,42 @@ def main():
         p = packet(8, hdr, 2)
         q.write(RING, p)
         q.writel(WP_CELL, len(p))
-        for t, base in ((0, 0x800), (1, 0x900), (1, 0xa00)):
+        # V4: MMIO; V5: an image with V4's offsets but its own for the
+        # size, the ring size and the quantisers
+        jbase = JPGE if GEN == 4 else JIMAGE
+        qoff = (0x800, 0x900, 0xa00) if GEN == 4 else (0x300, 0x400, 0x500)
+        if GEN == 5:
+            q.write(JIMAGE, b'\0' * 0x1000)
+        for t, base in zip((0, 1, 1), qoff):
             nat = [0] * 64
             for k, v in enumerate(tables[t]):
                 nat[ZIGZAG[k]] = v
             for r in range(64):     # register r: row r % 8, column r / 8
-                q.writel(JPGE + base + 4 * r, (1 << 23) // nat[(r % 8) * 8 + r // 8])
-        for off, v in ((0x004, 3), (0x034, (W - 1) | (H - 1) << 16),
-                       (0x060, RING_SIZE), (0x164, W | W << 16),
-                       (0x200, SRC), (0x204, SRC + W * H), (0x210, RING),
-                       (0x214, RP_CELL), (0x218, WP_CELL), (0x02c, 0),
-                       (0x02c, 1)):
-            q.writel(JPGE + off, v)
+                q.writel(jbase + base + 4 * r, (1 << 23) // nat[(r % 8) * 8 + r // 8])
+        fields = [(0x164, W | W << 16), (0x200, SRC), (0x204, SRC + W * H),
+                  (0x210, RING), (0x214, RP_CELL), (0x218, WP_CELL)]
+        if GEN == 4:
+            fields += [(0x004, 3), (0x034, (W - 1) | (H - 1) << 16),
+                       (0x060, RING_SIZE), (0x02c, 0), (0x02c, 1)]
+        else:
+            fields += [(0x070, (W - 1) | (H - 1) << 16), (0x098, RING_SIZE)]
+        for off, v in fields:
+            q.writel(jbase + off, v)
+        if GEN == 5:
+            for off, v in ((0x000, 0x1a1), (0x008, JIMAGE), (0x00c, 0),
+                           (0x00c, 1)):
+                q.writel(JPGE + off, v)
+            check(not q.readl(JPGE + 0x620) & 1, 'JPEG: bus busy after START')
         q.cmd('clock_step 5000000')
-        st = q.readl(JPGE + 0x000)
+        st = q.readl(JPGE + (0x000 if GEN == 4 else 0x600))
         check(st & 1, 'JPEG: done (0x%x)' % st)
         ln, pad, t = struct.unpack('<IIB', q.read(RING + len(p), 9))
         check(t == 5, 'JPEG: an ECS packet (type %d)' % t)
         scan = q.read(RING + len(p) + 64, ln - 64 - pad)
         check(scan.endswith(b'\xff\xd9'), 'JPEG: the scan ends with EOI')
-        q.writel(JPGE + 0x00c, 0xffffffff)
-        check(q.readl(JPGE + 0x000) == 0, 'JPEG: cleared')
+        q.writel(JPGE + (0x00c if GEN == 4 else 0x004), 0xffffffff)
+        check(q.readl(JPGE + (0x000 if GEN == 4 else 0x600)) == 0,
+              'JPEG: cleared')
         path = os.path.join(tmp, 'jpeg')
         open(path, 'wb').write(hdr + scan)
         ok, raw = decode(path, 'mjpeg')
@@ -277,7 +342,7 @@ def main():
         wp = q.readl(WP_CELL)
         q.writel(RP_CELL, wp + 64)
         q.write(RING + wp, b'\xa5' * 64)
-        q.writel(VEDU + 0x0008, 1)
+        q.writel(VEDU + (0x0008 if GEN == 4 else 0x000c), 1)
         q.cmd('clock_step 5000000')
         raw = q.readl(VEDU + 0x3004)
         check(raw & 4, 'full ring: buffer full (0x%x)' % raw)
@@ -299,13 +364,96 @@ def main():
         RING = RINGS[2]
         wp = q.readl(WP_CELL)
         q.writel(RP_CELL, wp + 64)
-        q.writel(JPGE + 0x02c, 0)
-        q.writel(JPGE + 0x02c, 1)
+        start_reg = 0x02c if GEN == 4 else 0x00c
+        q.writel(JPGE + start_reg, 0)
+        q.writel(JPGE + start_reg, 1)
         q.cmd('clock_step 5000000')
-        raw = q.readl(JPGE + 0x008)
+        raw = q.readl(JPGE + (0x008 if GEN == 4 else 0x604))
         check(raw & 0x22 == 0x22 and not raw & 1,
               'full JPEG ring: error and ring full, not done (0x%x)' % raw)
-        q.writel(JPGE + 0x00c, 0xffffffff)
+        q.writel(JPGE + (0x00c if GEN == 4 else 0x004), 0xffffffff)
+        q.writel(RP_CELL, 0)
+
+        if GEN == 5:
+            # the driver queues the next picture in set 1 while set 0
+            # encodes: both finish, in order, each in its own status.  A
+            # fresh ring starts with the driver's parameter sets.
+            ps = b''.join(packet(t, bytes.fromhex('00000001' + h), 0)
+                          for t, h in H264_PS)
+            q.write(RINGS[0], ps)
+            q.writel(WP_CELL, len(ps))
+            img = bytearray(q.read(IMAGE, 0x1000))
+            struct.pack_into('<I', img, 0x23c, IMAGE1 + 0xb10)
+            q.write(IMAGE1, bytes(img))
+            q.write(IMAGE + 0xb10, b'\0' * 0x200)
+            q.write(IMAGE1 + 0xb10, b'\0' * 0x200)
+            q.writel(VEDU + 0x0010, 3)
+            q.writel(VEDU + 0x0008, IMAGE)
+            q.writel(VEDU + 0x0018, IMAGE1)
+            q.writel(VEDU + 0x000c, 1)
+            q.writel(VEDU + 0x001c, 1)
+            s0, s1 = q.readl(VEDU + 0x3008), q.readl(VEDU + 0x3018)
+            check(s0 == 1 and s1 == 1, 'two sets: both busy (%d, %d)' % (s0, s1))
+            q.cmd('clock_step 1500000')
+            r0, r1 = q.readl(VEDU + 0x3004), q.readl(VEDU + 0x3014)
+            check(r0 & 1 and not r1 & 1,
+                  'two sets: set 0 first (0x%x, 0x%x)' % (r0, r1))
+            q.cmd('clock_step 5000000')
+            r1 = q.readl(VEDU + 0x3014)
+            check(r1 & 1 and q.readl(VEDU + 0x3010) & 1,
+                  'two sets: then set 1 (0x%x)' % r1)
+            b0, b1 = (struct.unpack('<I', q.read(i + 0xbb0, 4))[0]
+                      for i in (IMAGE, IMAGE1))
+            check(b0 and b1 and q.readl(WP_CELL) == len(ps) + b0 + b1,
+                  'two sets: each its statistics (%d, %d bytes), both '
+                  'pictures in the ring' % (b0, b1))
+            q.writel(VEDU + 0x0004, 0xffffffff)
+            q.writel(VEDU + 0x0014, 0xffffffff)
+            check(q.readl(VEDU + 0x3000) == 0 and q.readl(VEDU + 0x3010) == 0,
+                  'two sets: cleared')
+
+            # reset (0x2c) with one picture encoding and one queued: neither
+            # finishes, neither stays busy, and the next one runs alone
+            wp = q.readl(WP_CELL)
+            q.writel(VEDU + 0x000c, 1)
+            q.writel(VEDU + 0x001c, 1)
+            q.writel(VEDU + 0x002c, 1)
+            q.cmd('clock_step 5000000')
+            check(q.readl(VEDU + 0x3004) == 0 and q.readl(VEDU + 0x3014) == 0
+                  and q.readl(VEDU + 0x3008) == 0 and
+                  q.readl(VEDU + 0x3018) == 0 and q.readl(WP_CELL) == wp and
+                  q.readl(VEDU + 0x3020) & 1,
+                  'reset: both pictures abandoned, bus idle')
+            q.writel(VEDU + 0x000c, 1)
+            q.cmd('clock_step 5000000')
+            check(q.readl(VEDU + 0x3004) & 1 and q.readl(VEDU + 0x3014) == 0,
+                  'reset: the next picture runs alone')
+            q.writel(VEDU + 0x0004, 0xffffffff)
+
+            # JPGE: two sets queued back to back, each from its own image
+            RING = RINGS[2]
+            q.writel(WP_CELL, 0)
+            q.writel(RP_CELL, 0)
+            jimg = q.read(JIMAGE, 0x1000)
+            q.write(JIMAGE + 0x1000, jimg)
+            q.writel(JPGE + 0x010, 0x1a1)
+            q.writel(JPGE + 0x018, JIMAGE + 0x1000)
+            for off in (0x00c, 0x01c):
+                q.writel(JPGE + off, 0)
+                q.writel(JPGE + off, 1)
+            j0, j1 = q.readl(JPGE + 0x610), q.readl(JPGE + 0x614)
+            check(j0 == 1 and j1 == 1, 'JPEG two sets: both busy (%d, %d)'
+                  % (j0, j1))
+            q.cmd('clock_step 5000000')
+            r0, r1 = q.readl(JPGE + 0x604), q.readl(JPGE + 0x60c)
+            check(r0 & 1 and r1 & 1, 'JPEG two sets: both done (0x%x, 0x%x)'
+                  % (r0, r1))
+            ln0, = struct.unpack('<I', q.read(RING, 4))
+            ln1, t1 = struct.unpack('<I4xB', q.read(RING + ln0, 9))
+            check(q.readl(WP_CELL) == ln0 + ln1 and t1 == 5,
+                  'JPEG two sets: two scans in the ring')
+            q.writel(JPGE + 0x004, 0xffffffff)
+            q.writel(JPGE + 0x014, 0xffffffff)
     finally:
         q.close()
 
