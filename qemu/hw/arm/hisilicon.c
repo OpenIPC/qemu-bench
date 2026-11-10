@@ -1610,6 +1610,19 @@ static const HisiSoCConfig hi3516av200_soc = {
  * HiSilicon's EV200 / EV300 / 18EV300 / 16DV200 and the Goke rebrands of
  * the same die, whose gk7205v200_*.ko drive it the same way.
  */
+/*
+ * V5 (Hi3516CV610 / CV608 / CV613) media blocks, from hi3516cv610.dtsi:
+ * vi_cap0 SPI 65 (int0; int1 = 66 stays masked), vi_proc0 SPI 67, vpss
+ * SPI 71.  They take the V5 layouts (media_gen = 5).
+ */
+#define HISI_V5_VIDEO_PIPE                          \
+    .vi_cap_base        = 0x17400000,               \
+    .vi_cap_irq         = 65,                       \
+    .vi_proc_base       = 0x17800000,               \
+    .vi_proc_irq        = 67,                       \
+    .vpss_base          = 0x17900000,               \
+    .vpss_irq           = 71
+
 #define HISI_V4_VIDEO_PIPE                                  \
     .vi_cap_base        = 0x11000000,                       \
     .vi_proc_base       = 0x11200000,                       \
@@ -2655,6 +2668,10 @@ static const HisiSoCConfig hi3516cv608_soc = {
 
     .vedu_base          = 0x17140000,
     .media_gen          = 5,
+    HISI_V5_VIDEO_PIPE,
+    /* sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel (mod_sys.o) */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0 },
+    .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -2760,6 +2777,10 @@ static const HisiSoCConfig hi3516cv610_soc = {
 
     .vedu_base          = 0x17140000,
     .media_gen          = 5,
+    HISI_V5_VIDEO_PIPE,
+    /* sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel (mod_sys.o) */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0 },
+    .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -2852,6 +2873,10 @@ static const HisiSoCConfig hi3516cv613_soc = {
 
     .vedu_base          = 0x17140000,
     .media_gen          = 5,
+    HISI_V5_VIDEO_PIPE,
+    /* sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel (mod_sys.o) */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0 },
+    .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -5608,6 +5633,15 @@ static void hisilicon_common_init(MachineState *machine,
             qdev_prop_set_uint32(crg, "pll-lock-offset", c->crg_pll_lock_offset);
             qdev_prop_set_uint32(crg, "pll-lock-bits", c->crg_pll_lock_bits);
         }
+        if (c->crg_rst_ack[0]) {
+            QList *acks = qlist_new();
+
+            for (n = 0; n < ARRAY_SIZE(c->crg_rst_ack) && c->crg_rst_ack[n];
+                 n++) {
+                qlist_append_int(acks, c->crg_rst_ack[n]);
+            }
+            qdev_prop_set_array(crg, "rst-ack", acks);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(crg), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(crg), 0, c->crg_base);
         if (c->cpu_srst_offset && smp_cpus > 1) {
@@ -5904,6 +5938,9 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vi_cap_base) {
         vi = qdev_new("hisi-vi");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vi);
+        if (c->media_gen) {
+            qdev_prop_set_uint8(vi, "gen", c->media_gen);
+        }
         object_property_set_link(OBJECT(vi), "scene", OBJECT(scene),
                                  &error_fatal);
         sysbus_realize_and_unref(busdev, &error_fatal);
@@ -5917,6 +5954,9 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vpss_base) {
         DeviceState *vpss = qdev_new("hisi-vpss");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vpss);
+        if (c->media_gen) {
+            qdev_prop_set_uint8(vpss, "gen", c->media_gen);
+        }
         if (scene) {
             object_property_set_link(OBJECT(vpss), "scene", OBJECT(scene),
                                      &error_fatal);

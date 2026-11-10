@@ -704,7 +704,7 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **MIPI RX** | — | — | stub | — | yes | stub | yes | yes |
 | **RTC** | — | — | yes | — | yes | yes | yes | yes |
 | **VEDU/JPGE** | — | — | stub | — | yes | stub | **encodes** | **encodes**² |
-| **VI/VPSS** | stub | stub | stub | — | stub | stub | **frames**¹ | stub |
+| **VI/VPSS** | stub | stub | stub | — | stub | stub | **frames**¹ | **frames**² |
 | **Watchdog** | yes | yes | yes | yes | yes | yes | yes | yes |
 | **Sensor I2C** | — | — | — | — | — | — | yes | yes |
 | **IVE (18 ops)** | — | — | — | — | — | — | **yes** | — |
@@ -718,9 +718,9 @@ pictures, so majestic and the SDK's `sample_venc` stream from a sensor
 Goke rebrands. V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
-²: V5 (`gen=5`) encodes user frames sent through the SDK's VENC
-(`test-hisi-v5-venc.sh`); with VI / VPSS still stubs, majestic has no
-picture to encode yet.
+²: V5 (`gen=5`): majestic streams from an SC4336P through VI online,
+VPSS and VEDU (`test-hisi-majestic.sh --soc hi3516cv610`). The ISP's V5
+statistics are not modelled yet.
 
 ## Project Structure
 
