@@ -60,7 +60,9 @@ done
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
-[ -f "$WORK/uImage.$SOC" ] || bash "$HERE/fetch-openipc-lite.sh" "$SOC" "$WORK"
+if [ ! -f "$WORK/uImage.$SOC" ] || [ ! -f "$WORK/rootfs.squashfs.$SOC" ]; then
+    bash "$HERE/fetch-openipc-lite.sh" "$SOC" "$WORK"
+fi
 
 RFS=$WORK/rfs
 rm -rf "$RFS"
@@ -153,9 +155,11 @@ PY
 }
 # the windows the trace is split into
 mark() { echo "=== TWIN $1" >> "$TRACE"; }
+# waitfor PATTERN SECONDS [LINE]: the console from LINE on (a mode change
+# must be one logged after the stimulus, not an earlier one)
 waitfor() {
     for _ in $(seq "$2"); do
-        grep -aq -E "$1" "$CON" && return 0
+        tail -n +"${3:-1}" "$CON" | grep -aq -E "$1" && return 0
         kill -0 $QPID 2>/dev/null || return 1
         sleep 1
     done
@@ -177,12 +181,15 @@ if grep -aq 'Ingenic SDK started' "$CON"; then
     mark DAY
     sleep 10
     mark NIGHT
+    from=$(($(wc -l < "$CON") + 1))
     mon "qom-set /machine/gpio pb 0xfffdffff"
-    check "the light sensor turns night on" waitfor 'Change mode to NIGHT' 60
+    check "the light sensor turns night on" \
+        waitfor 'Change mode to NIGHT' 60 "$from"
     sleep 20
     mark BACK
+    from=$(($(wc -l < "$CON") + 1))
     mon "qom-set /machine/gpio pb 0xffffffff"
-    check "and day again" waitfor 'Change mode to DAY' 60
+    check "and day again" waitfor 'Change mode to DAY' 60 "$from"
     sleep 5
     mark END
     n=$(python3 - "$TRACE" <<'PY'
