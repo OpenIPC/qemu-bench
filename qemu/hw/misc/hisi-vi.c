@@ -108,6 +108,7 @@
 #include "hw/i2c/image-sensor.h"
 #include "hw/misc/hisi-scene.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
 #include "system/dma.h"
 
 #define TYPE_HISI_VI "hisi-vi"
@@ -129,6 +130,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define CAP_FE_INT_MASK(p)  (0x20000 + (p) * 0x20000 + 0xf8)
 #define FE_INT_FSTART       (1u << 0)
 #define FE_INT_FEND         (1u << 4)
+
+/*
+ * V5 (Hi3516CV610, gen 5; mod_vi.o vi_drv_capture_irq_route and
+ * vi_drv_process_irq_route, the open ISP driver's isp_drv_define.h): the
+ * same blocks at the same offsets, with these differences.  The capture
+ * window is 1 MiB.  Its top-level status is read at 0xf4 (int0, SPI 65)
+ * and 0xe4 (int1), never cleared, and derived from the blocks: write
+ * channel c at bit 8 + c, the ISP FE of pipe p at bit 16 + p; int0's mask
+ * is 0xf8.  FE's frame end is bit 8.  VI_PROC's raw status 0x310 / 0x318
+ * is masked by 0xf0 / 0xf4 into 0x314 / 0x31c; online it raises frame
+ * start (bit 10) together with the previous frame's end (bit 0), offline
+ * a finished job is bit 1.
+ */
+#define V5_CAP_SIZE         0x100000
+#define V5_CAP_INT          0x00f4
+#define V5_CAP_INT_LOG      0x00f0  /* read and logged only */
+#define V5_CAP_INT1         0x00e4
+#define V5_CAP_INT_WCH0     (1u << 8)
+#define V5_CAP_INT_FE0      (1u << 16)
+#define V5_FE_INT_FEND      (1u << 8)
+#define V5_PROC_INT_MASK    0x00f0
+#define V5_PROC_INT_STAT    0x0314
+#define V5_PROC_INT_END     (1u << 0)
 
 #define PROC_START          0x0300  /* offline: 1 / 3 starts the node list */
 #define PROC_INT            0x0310
@@ -205,18 +229,34 @@ struct HisiViState {
     FILE *record_f;
     int gw, gh;
     uint32_t stat_frames;
+    uint8_t gen;                /* 4: Hi3516EV200 family, 5: Hi3516CV610 */
+    uint32_t cap_size;
 };
 
 /* the capture status: pipe 0's bit stands while its write channel has
  * anything pending, the driver clears only the latter */
 static uint32_t vi_cap_status(HisiViState *s)
 {
+    if (s->gen == 5) {
+        return (s->cap[CAP_WCH_INT(0) / 4] ? V5_CAP_INT_WCH0 : 0) |
+               (s->cap[CAP_WCH_INT(1) / 4] ? V5_CAP_INT_WCH0 << 1 : 0) |
+               (s->cap[CAP_FE_INT(0) / 4] ? V5_CAP_INT_FE0 : 0);
+    }
     return s->cap[CAP_INT / 4] |
            (s->cap[CAP_WCH_INT(0) / 4] ? CAP_INT_PIPE0 : 0);
 }
 
 static void vi_update(HisiViState *s)
 {
+    if (s->gen == 5) {
+        qemu_set_irq(s->cap_irq,
+                     (vi_cap_status(s) & s->cap[CAP_INT_MASK / 4]) != 0);
+        qemu_set_irq(s->proc_irq,
+                     ((s->proc[PROC_INT / 4] & s->proc[V5_PROC_INT_MASK / 4]) |
+                      (s->proc[PROC_INT2 / 4] &
+                       s->proc[V5_PROC_INT_MASK / 4 + 1])) != 0);
+        return;
+    }
     qemu_set_irq(s->cap_irq, (vi_cap_status(s) & s->cap[CAP_INT_MASK / 4] &
                               0xf00) ||
                              (s->cap[CAP_FE_INT(0) / 4] &
@@ -755,6 +795,18 @@ static void vi_frame(void *opaque)
         return;                     /* the pipeline was stopped */
     }
     vi_scene_frame(s);
+    if (s->gen == 5) {
+        /* the ISP's statistics on V5 come with its layout (not yet) */
+        s->cap[CAP_WCH_INT(0) / 4] |= WCH_INT_FSTART | WCH_INT_FEND;
+        s->cap[CAP_FE_INT(0) / 4] |= FE_INT_FSTART | V5_FE_INT_FEND;
+        if (!s->offline && s->run) {
+            s->proc[PROC_INT / 4] |= PROC_INT_FSTART | V5_PROC_INT_END;
+            qemu_irq_pulse(s->frame_out);
+        }
+        vi_update(s);
+        vi_arm(s);
+        return;
+    }
     vi_fe_stats(s);
     s->cap[CAP_WCH_INT(0) / 4] |= WCH_INT_FSTART | WCH_INT_EARLY | WCH_INT_FEND;
     /* the ISP front end's frame: its driver's per-frame work (ISP_ISR) */
@@ -777,13 +829,15 @@ static void vi_proc_done(void *opaque)
     if (!vi_running(s)) {
         return;                     /* the pipe was stopped meanwhile */
     }
-    if (s->job.valid) {
-        /* the statistics and record of the frame the job was started on */
+    if (s->job.valid && s->gen != 5) {
+        /* the statistics and record of the frame the job was started on
+         * (V4's STT layout and node offsets; V5's are not modelled yet) */
         vi_job_swap(s);
         vi_be_stats_offline(s);
         vi_job_swap(s);
     }
-    s->proc[PROC_INT / 4] |= PROC_INT_FSTART | PROC_INT_FEND;
+    s->proc[PROC_INT / 4] |= s->gen == 5 ? PROC_INT_FEND
+                                         : PROC_INT_FSTART | PROC_INT_FEND;
     vi_update(s);
 }
 
@@ -800,8 +854,11 @@ static void vi_run(void *opaque, int n, int level)
 static uint64_t vi_cap_read(void *opaque, hwaddr offset, unsigned size)
 {
     HisiViState *s = HISI_VI(opaque);
-    const uint32_t val = offset == CAP_INT ? vi_cap_status(s)
-                                           : s->cap[offset / 4];
+    const bool top = s->gen == 5 ? offset == V5_CAP_INT ||
+                                   offset == V5_CAP_INT1 ||
+                                   offset == V5_CAP_INT_LOG
+                                 : offset == CAP_INT;
+    const uint32_t val = top ? vi_cap_status(s) : s->cap[offset / 4];
 
     if (s->trace) {
         fprintf(stderr, "vi-cap R %06x = %08x\n", (int)offset, val);
@@ -817,7 +874,7 @@ static void vi_cap_write(void *opaque, hwaddr offset, uint64_t val,
     if (s->trace) {
         fprintf(stderr, "vi-cap W %06x : %08x\n", (int)offset, (uint32_t)val);
     }
-    if (offset == CAP_INT || offset == CAP_WCH_INT(0) ||
+    if ((offset == CAP_INT && s->gen != 5) || offset == CAP_WCH_INT(0) ||
         offset == CAP_WCH_INT(1) || offset == CAP_FE_INT(0) ||
         (offset >= CAP_PT_INT(0) && offset <= CAP_PT_INT(3) &&
          (offset & 0xff) == 0xf0)) {
@@ -840,12 +897,20 @@ static void vi_cap_write(void *opaque, hwaddr offset, uint64_t val,
 static uint64_t vi_proc_read(void *opaque, hwaddr offset, unsigned size)
 {
     HisiViState *s = HISI_VI(opaque);
+    uint32_t val = s->proc[offset / 4];
 
-    if (s->trace && offset < 0x1000) {
-        fprintf(stderr, "vi-proc R %05x = %08x\n", (int)offset,
-                s->proc[offset / 4]);
+    if (s->gen == 5 && (offset == V5_PROC_INT_STAT ||
+                        offset == V5_PROC_INT_STAT + 8)) {
+        /* masked: 0x314 = 0x310 & 0xf0, 0x31c = 0x318 & 0xf4 */
+        const int hi = offset == V5_PROC_INT_STAT + 8;
+
+        val = s->proc[(PROC_INT + hi * 8) / 4] &
+              s->proc[V5_PROC_INT_MASK / 4 + hi];
     }
-    return s->proc[offset / 4];
+    if (s->trace && offset < 0x1000) {
+        fprintf(stderr, "vi-proc R %05x = %08x\n", (int)offset, val);
+    }
+    return val;
 }
 
 static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
@@ -870,7 +935,9 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
          * the pipe's interrupt.
          */
         s->offline = true;
-        vi_offline_wb(s);
+        if (s->gen != 5) {
+            vi_offline_wb(s);       /* V4's node offsets */
+        }
         vi_job_start(s);
         qemu_irq_pulse(s->frame_out);
         timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -900,14 +967,6 @@ static void hisi_vi_init(Object *obj)
     HisiViState *s = HISI_VI(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    s->cap = g_new0(uint32_t, VI_CAP_SIZE / 4);
-    s->proc = g_new0(uint32_t, VI_PROC_SIZE / 4);
-    memory_region_init_io(&s->cap_iomem, obj, &vi_cap_ops, s, "hisi-vi-cap",
-                          VI_CAP_SIZE);
-    memory_region_init_io(&s->proc_iomem, obj, &vi_proc_ops, s,
-                          "hisi-vi-proc", VI_PROC_SIZE);
-    sysbus_init_mmio(sbd, &s->cap_iomem);
-    sysbus_init_mmio(sbd, &s->proc_iomem);
     sysbus_init_irq(sbd, &s->cap_irq);
     sysbus_init_irq(sbd, &s->proc_irq);
     qdev_init_gpio_out_named(DEVICE(obj), &s->frame_out, "frame", 1);
@@ -924,6 +983,26 @@ static void hisi_vi_init(Object *obj)
                              OBJ_PROP_LINK_STRONG);
 }
 
+static void hisi_vi_realize(DeviceState *dev, Error **errp)
+{
+    HisiViState *s = HISI_VI(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    if (s->gen != 4 && s->gen != 5) {
+        error_setg(errp, "hisi-vi: gen must be 4 or 5");
+        return;
+    }
+    s->cap_size = s->gen == 5 ? V5_CAP_SIZE : VI_CAP_SIZE;
+    s->cap = g_new0(uint32_t, s->cap_size / 4);
+    s->proc = g_new0(uint32_t, VI_PROC_SIZE / 4);
+    memory_region_init_io(&s->cap_iomem, OBJECT(dev), &vi_cap_ops, s,
+                          "hisi-vi-cap", s->cap_size);
+    memory_region_init_io(&s->proc_iomem, OBJECT(dev), &vi_proc_ops, s,
+                          "hisi-vi-proc", VI_PROC_SIZE);
+    sysbus_init_mmio(sbd, &s->cap_iomem);
+    sysbus_init_mmio(sbd, &s->proc_iomem);
+}
+
 static void hisi_vi_reset(DeviceState *dev)
 {
     HisiViState *s = HISI_VI(dev);
@@ -936,7 +1015,7 @@ static void hisi_vi_reset(DeviceState *dev)
     memset(&s->frame_expo, 0, sizeof(s->frame_expo));
     s->level = 0;
     s->stat_frames = 0;
-    memset(s->cap, 0, VI_CAP_SIZE);
+    memset(s->cap, 0, s->cap_size);
     memset(s->proc, 0, VI_PROC_SIZE);
     qemu_set_irq(s->cap_irq, 0);
     qemu_set_irq(s->proc_irq, 0);
@@ -947,6 +1026,8 @@ static const Property hisi_vi_properties[] = {
     DEFINE_PROP_BOOL("trace", HisiViState, trace, false),
     DEFINE_PROP_BOOL("stats-trace", HisiViState, stats_trace, false),
     DEFINE_PROP_STRING("record", HisiViState, record),
+    /* register layout: 4 (Hi3516EV200 family) or 5 (Hi3516CV610) */
+    DEFINE_PROP_UINT8("gen", HisiViState, gen, 4),
 };
 
 static void hisi_vi_class_init(ObjectClass *klass, const void *data)
@@ -955,6 +1036,7 @@ static void hisi_vi_class_init(ObjectClass *klass, const void *data)
 
     device_class_set_props(dc, hisi_vi_properties);
     device_class_set_legacy_reset(dc, hisi_vi_reset);
+    dc->realize = hisi_vi_realize;
 }
 
 static const TypeInfo hisi_vi_info = {

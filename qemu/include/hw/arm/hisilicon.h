@@ -265,6 +265,9 @@ typedef struct HisiSoCConfig {
     /* media register layouts (hisi-vedu / -vi / -vpss "gen"): 0 = 4,
      * the Hi3516EV200 family; 5 = Hi3516CV610 */
     uint8_t         media_gen;
+    /* CRG reset handshakes: request registers whose bit 0 the next one
+     * echoes (hisi-crg "rst-ack"); 0 ends the list */
+    uint32_t        crg_rst_ack[4];
     hwaddr          vpss_base;         /* 0 = none; online-mode frame source */
     int             vpss_irq;
     hwaddr          vi_cap_base;       /* 0 = none; VI as the frame clock */

@@ -26,7 +26,11 @@
 # interrupt handlers always finish within a frame of VI's (without it, a
 # slow host lets frames overtake the driver and the counter can repeat).
 #
-#   test-hisi-majestic.sh [--soc hi3516ev200|hi3516ev300|gk7205v200|...]
+# V5 (--soc hi3516cv610 / cv608 / cv613) boots the hi3516cv6xx release
+# with an SC4336P, load_hisilicon's default; the ISP's statistics are not
+# modelled there yet, so only the stream is checked.
+#
+#   test-hisi-majestic.sh [--soc hi3516ev200|hi3516ev300|gk7205v200|hi3516cv610|...]
 #                         [--sensor NAME] [--qemu Q] [--work DIR]
 #                         [--timeout SECONDS] [--min-frames N]
 set -eu
@@ -51,16 +55,20 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+REL=$SOC
+ISP=1
 case $SOC in
 gk*) ALLOC=gk; SENSOR=${SENSOR:-sc2335} ;;
+hi3516cv6*)     # one release for cv608 / cv610 / cv613
+    ALLOC=hisi; SENSOR=${SENSOR:-sc4336p}; REL=hi3516cv6xx; ISP=0 ;;
 *) ALLOC=hisi; SENSOR=${SENSOR:-sc2315e} ;;
 esac
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
 
-if [ ! -f "$WORK/uImage.$SOC" ]; then
-    bash "$HERE/fetch-openipc-lite.sh" "$SOC" "$WORK"
+if [ ! -f "$WORK/uImage.$REL" ]; then
+    bash "$HERE/fetch-openipc-lite.sh" "$REL" "$WORK"
 fi
 DUMP=$WORK/dump
 rm -rf "$DUMP"
@@ -68,7 +76,7 @@ mkdir -p "$DUMP"
 
 # QEMU is stopped by the timeout: majestic streams until then
 timeout "$TIMEOUT" "$QEMU" -M "$SOC,sensor=$SENSOR" \
-    -kernel "$WORK/uImage.$SOC" -initrd "$WORK/rootfs.squashfs.$SOC" \
+    -kernel "$WORK/uImage.$REL" -initrd "$WORK/rootfs.squashfs.$REL" \
     -append "console=ttyAMA0,115200 mem=32M mmz_allocator=$ALLOC root=/dev/ram0 rootfstype=squashfs" \
     -icount shift=0 -global hisi-vedu.dump-dir="$DUMP" \
     -global hisi-vi.stats-trace=on \
@@ -84,8 +92,8 @@ if ! grep -q "Starting majestic: OK" "$WORK/console.log"; then
     echo "majestic did not start; console in $WORK/console.log" >&2
     exit 1
 fi
-case $SENSOR in
-sc*|gc*)        # SmartSens / GalaxyCore models report their exposure
+case $ISP$SENSOR in
+1sc*|1gc*)      # SmartSens / GalaxyCore models report their exposure
     last=$(grep -a "^isp stats:" "$WORK/console.log" | tail -1)
     mean=$(echo "$last" | sed -n 's/.*G mean \([0-9]*\).*/\1/p')
     echo "AE: $last"

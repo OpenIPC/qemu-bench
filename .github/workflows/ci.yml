@@ -120,6 +120,11 @@ jobs:
       - name: HiSilicon VI offline + VPSS node list (hisi-vi, hisi-vpss)
         run: python3 qemu/tests/test-hisi-vpss.py
 
+      # V5 online: VI's derived status, VI_PROC behind its mask, VPSS's V5
+      # channel registers, the CRG's reset handshake
+      - name: HiSilicon V5 VI + VPSS online (hisi-vi / hisi-vpss gen 5)
+        run: python3 qemu/tests/test-hisi-vpss.py --gen 5
+
       # The ISP statistics hisi-vi writes (front-end and backend AE
       # histograms, AE / AWB zones, globals) in the driver's STT layouts,
       # and the front-end interrupt the ISP's per-frame work runs from.
@@ -359,6 +364,12 @@ jobs:
           # config, so majestic runs with an SC2335 there
           - soc: gk7205v200
             majestic: true
+          # V5: majestic links the SDK statically, so the release has no
+          # MPI library for a user-frame program (test-hisi-v5-venc.sh,
+          # local); majestic with an SC4336P is the end-to-end test
+          - soc: hi3516cv610
+            majestic: true
+            v5: true
     steps:
       - uses: actions/checkout@v4
 
@@ -383,12 +394,14 @@ jobs:
       # republished one fails here (update the hash and the cache key)
       # instead of running unchecked.
       - name: OpenIPC toolchain cache
+        if: ${{ !matrix.v5 }}
         uses: actions/cache@v4
         with:
           path: venc-toolchain
           key: toolchain-hisilicon-hi3516ev200-4c107492
 
       - name: OpenIPC toolchain
+        if: ${{ !matrix.v5 }}
         run: |
           if [ ! -x venc-toolchain/bin/arm-openipc-linux-musleabi-gcc ]; then
             curl -fsSL --retry 3 -o "$RUNNER_TEMP/tc.tgz" \
@@ -427,6 +440,7 @@ jobs:
       # encodes test-pattern frames through hisi-vedu; every stream must
       # decode and carry the frames' counter in order.
       - name: VENC_SendFrame through VEDU and JPGE
+        if: ${{ !matrix.v5 }}
         timeout-minutes: 15
         run: |
           bash qemu-boot/test-hisi-venc.sh --soc ${{ matrix.soc }} \

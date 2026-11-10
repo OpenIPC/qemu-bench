@@ -74,6 +74,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -1841,12 +1842,22 @@ static const Property hisi_vedu_properties[] = {
     DEFINE_PROP_UINT8("gen", HisiVeduState, gen, 4),
 };
 
+static void hisi_vedu_realize(DeviceState *dev, Error **errp)
+{
+    HisiVeduState *s = HISI_VEDU(dev);
+
+    if (s->gen != 4 && s->gen != 5) {
+        error_setg(errp, "hisi-vedu: gen must be 4 or 5");
+    }
+}
+
 static void hisi_vedu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_props(dc, hisi_vedu_properties);
     device_class_set_legacy_reset(dc, hisi_vedu_reset);
+    dc->realize = hisi_vedu_realize;
 }
 
 static const TypeInfo hisi_vedu_info = {

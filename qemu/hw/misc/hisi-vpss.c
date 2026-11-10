@@ -54,6 +54,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -85,12 +86,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssState, HISI_VPSS)
 #define VPSS_CHN            3
 #define PIC_MAX             4096
 
-static const struct {
+/*
+ * A channel's output registers.  Its address block holds the header Y,
+ * header C, Y and C addresses: V4 spaces them 8 bytes apart (Y is word
+ * 4, C word 6), V5 (Hi3516CV610, vpss_drv_update_chn_addr) packs them
+ * (Y word 2, C word 3).
+ */
+typedef struct VpssChnRegs {
     hwaddr size, ctrl, addr, stride;
-} vpss_chn[VPSS_CHN] = {
+} VpssChnRegs;
+
+static const VpssChnRegs vpss_chn_v4[VPSS_CHN] = {
     { 0x44c, 0x450, 0x468, 0x488 },
     { 0x4a0, 0x4a4, 0x4b0, 0x4d0 },
     { 0x4e8, 0x4ec, 0x4f4, 0x514 },
+};
+
+static const VpssChnRegs vpss_chn_v5[VPSS_CHN] = {
+    { 0x428, 0x42c, 0x444, 0x454 },
+    { 0x458, 0x45c, 0x468, 0x478 },
+    { 0x47c, 0x480, 0x488, 0x498 },
 };
 
 /* one channel's output of a frame */
@@ -115,6 +130,7 @@ struct HisiVpssState {
     uint32_t frame;
     uint32_t fps;               /* VI's frame rate */
     bool trace;
+    uint8_t gen;                /* 4: Hi3516EV200 family, 5: Hi3516CV610 */
     HisiSceneState *scene;      /* what the pictures show */
 };
 
@@ -179,17 +195,20 @@ static void vpss_paint(HisiVpssState *s, uint32_t ya, uint32_t ca,
  * DDR) sets it; w is 0 when the channel writes nothing this frame (off,
  * or skipped by the driver's frame-rate control).
  */
-static void vpss_chn_out(const uint32_t *r, int c, VpssOut *o)
+static void vpss_chn_out(HisiVpssState *s, const uint32_t *r, int c,
+                         VpssOut *o)
 {
-    const uint32_t size = r[vpss_chn[c].size / 4];
+    const VpssChnRegs *ch = s->gen == 5 ? &vpss_chn_v5[c] : &vpss_chn_v4[c];
+    const int yw = s->gen == 5 ? 2 : 4, cw = s->gen == 5 ? 3 : 6;
+    const uint32_t size = r[ch->size / 4];
 
     o->w = (size & 0xffff) + 1;
     o->h = (size >> 16) + 1;
-    o->ya = r[vpss_chn[c].addr / 4 + 4];
-    o->ca = r[vpss_chn[c].addr / 4 + 6];
+    o->ya = r[ch->addr / 4 + yw];
+    o->ca = r[ch->addr / 4 + cw];
     o->cmp = c == 0 && (r[VPSS_CHN0_CMP / 4] & 1);
-    o->stride = o->cmp ? o->w : r[vpss_chn[c].stride / 4] & 0xffff;
-    if (!(r[vpss_chn[c].ctrl / 4] & (1u << 31)) || !o->ya || !o->ca ||
+    o->stride = o->cmp ? o->w : r[ch->stride / 4] & 0xffff;
+    if (!(r[ch->ctrl / 4] & (1u << 31)) || !o->ya || !o->ca ||
         o->w > PIC_MAX || o->h > PIC_MAX) {
         o->w = 0;
     }
@@ -216,7 +235,7 @@ static void vpss_load_nodes(HisiVpssState *s)
         for (c = 0; c < VPSS_CHN; c++) {
             VpssOut o;
 
-            vpss_chn_out(node, c, &o);
+            vpss_chn_out(s, node, c, &o);
             if (k == 0) {
                 s->node_out[c] = o;
             } else if (o.w && s->node_out[c].w) {
@@ -253,7 +272,7 @@ static void vpss_frame(void *opaque)
             s->regup = false;
         }
         for (c = 0; c < VPSS_CHN; c++) {
-            vpss_chn_out(s->active, c, &out[c]);
+            vpss_chn_out(s, s->active, c, &out[c]);
         }
     } else if (s->node_armed) {
         s->node_armed = false;
@@ -392,7 +411,18 @@ static void hisi_vpss_reset(DeviceState *dev)
 static const Property hisi_vpss_properties[] = {
     DEFINE_PROP_UINT32("fps", HisiVpssState, fps, 25),
     DEFINE_PROP_BOOL("trace", HisiVpssState, trace, false),
+    /* register layout: 4 (Hi3516EV200 family) or 5 (Hi3516CV610) */
+    DEFINE_PROP_UINT8("gen", HisiVpssState, gen, 4),
 };
+
+static void hisi_vpss_realize(DeviceState *dev, Error **errp)
+{
+    HisiVpssState *s = HISI_VPSS(dev);
+
+    if (s->gen != 4 && s->gen != 5) {
+        error_setg(errp, "hisi-vpss: gen must be 4 or 5");
+    }
+}
 
 static void hisi_vpss_class_init(ObjectClass *klass, const void *data)
 {
@@ -400,6 +430,7 @@ static void hisi_vpss_class_init(ObjectClass *klass, const void *data)
 
     device_class_set_props(dc, hisi_vpss_properties);
     device_class_set_legacy_reset(dc, hisi_vpss_reset);
+    dc->realize = hisi_vpss_realize;
 }
 
 static const TypeInfo hisi_vpss_info = {

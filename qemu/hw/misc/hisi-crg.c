@@ -56,6 +56,14 @@ struct HisiCrgState {
     uint32_t pll_lock_offset;   /* per-PLL lock status, 0 = none */
     uint32_t pll_lock_bits;     /* bits that read as locked there */
     qemu_irq cpu1_reset;        /* CPU1_SRST_REQ level, 1 = in reset */
+    /*
+     * Reset handshakes: a write to one of these mirrors its bit 0 into
+     * the register after it at once.  The V5 sys driver resets VPSS
+     * (0x9b40 / 0x9b44) and VGS (0x9ec0 / 0x9ec4) that way and polls the
+     * status ten times with no delay ("vpss0 reset failed").
+     */
+    uint32_t num_rst_ack;
+    uint32_t *rst_ack;
 };
 
 static bool is_pll_status_reg(hwaddr offset)
@@ -114,7 +122,15 @@ static void hisi_crg_write(void *opaque, hwaddr offset,
     }
 
     uint32_t old = s->regs[offset / 4];
+    uint32_t i;
+
     s->regs[offset / 4] = (uint32_t)val;
+    for (i = 0; i < s->num_rst_ack; i++) {
+        if (offset == s->rst_ack[i] && offset + 4 < HISI_CRG_REG_SIZE) {
+            s->regs[offset / 4 + 1] = (s->regs[offset / 4 + 1] & ~1u) |
+                                      (val & 1);
+        }
+    }
 
     /*
      * CPU soft-reset register: the vendor kernel's SMP bringup
@@ -167,6 +183,8 @@ static const Property hisi_crg_properties[] = {
     DEFINE_PROP_UINT32("cpu-srst-offset", HisiCrgState, cpu_srst_offset, 0),
     DEFINE_PROP_UINT32("pll-lock-offset", HisiCrgState, pll_lock_offset, 0),
     DEFINE_PROP_UINT32("pll-lock-bits", HisiCrgState, pll_lock_bits, 0),
+    DEFINE_PROP_ARRAY("rst-ack", HisiCrgState, num_rst_ack, rst_ack,
+                      qdev_prop_uint32, uint32_t),
 };
 
 static void hisi_crg_class_init(ObjectClass *klass, const void *data)

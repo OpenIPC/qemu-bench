@@ -664,7 +664,19 @@ in this order:
   0xb10 (0xb28, the macroblock count, is a divisor). JPGE runs from an image
   too, its quantisers at 0x300 / 0x400 / 0x500. `test-hisi-vedu.py --gen 5`
   (CI) and `test-hisi-v5-venc.sh --sdk DIR` (local; the guest links the
-  SDK's static MPI libraries) test it.
+  SDK's static MPI libraries) test it. `hisi-vi` / `hisi-vpss` gen 5
+  (`HISI_V5_VIDEO_PIPE`, SPI 65 / 67 / 71) run the V5 online pipeline,
+  so majestic streams from the default `sc4336p`:
+  - VI_CAP's top status (0xf4 / 0xe4) is derived: write channel at bit 8,
+    FE at bit 16. FE end is bit 8.
+  - VI_PROC is raw 0x310 masked by 0xf0 into 0x314; online it raises start
+    (bit 10) with end (bit 0).
+  - VPSS keeps V4's interrupts, but its channel registers moved: the
+    address words are packed, Y at +8, C at +0xc.
+  - The sys driver's VPSS / VGS resets poll CRG+0x9b44 / 0x9ec4 with no
+    delay (`hisi-crg` `rst-ack`).
+  - The 5.10 i2c-bsp repeats write programs with JMP2 (0x19, LOOP2 / DST2
+    at 0xb8 / 0xbc).
   In front of it on the EV200-class machines (Goke rebrands too), `hisi-vi` (the
   frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
   start / end) and `hisi-vpss` (paints its channels, then frame start +

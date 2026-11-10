@@ -464,6 +464,45 @@ bash qemu-boot/test-hisi-v5-venc.sh --sdk ~/projects/cameras/sdk/Hi3516CV610_SDK
 H.264, H.265 and JPEG each encode 6 of 6 frames, and the counter decodes
 as 0..5.
 
+### V5 VI and VPSS (online)
+
+`hisi-vi` and `hisi-vpss` take `gen=5` too. The cv6xx machines map them at
+vi_cap 0x17400000 (SPI 65), vi_proc 0x17800000 (SPI 67) and vpss
+0x17900000 (SPI 71), from hi3516cv610.dtsi. The sources are mod_vi.o
+(`vi_drv_capture_irq_route`, `vi_drv_process_irq_route`), mod_vpss.o and
+mod_sys.o. The blocks sit where they do on V4; what differs:
+
+| | V4 | V5 |
+|---|---|---|
+| VI_CAP window | 2 MiB | 1 MiB |
+| VI_CAP top status | 0xf0, bit 8 = pipe 0 | read at 0xf4 (int0) / 0xe4 (int1), never cleared: write channel c at bit 8 + c, the ISP FE of pipe p at bit 16 + p; int0 mask 0xf8 |
+| FE frame end | bit 4 | bit 8 |
+| VI_PROC status | 0x310 (start bit 10, end bit 1) | raw 0x310 / 0x318, masked by 0xf0 / 0xf4 into 0x314 / 0x31c; online: start (bit 10) with the previous frame's end (bit 0); offline job done: bit 1 |
+| VPSS channel 0 / 1 / 2 size | 0x44c / 0x4a0 / 0x4e8 | 0x428 / 0x458 / 0x47c |
+| control (bit 31) | 0x450 / 0x4a4 / 0x4ec | 0x42c / 0x45c / 0x480 |
+| addresses (header Y, header C, Y, C) | from 0x468 / 0x4b0 / 0x4f4, 8 bytes apart | from 0x444 / 0x468 / 0x488, packed |
+| stride | 0x488 / 0x4d0 / 0x514 | 0x454 / 0x478 / 0x498 |
+
+VPSS's interrupts, its online enable (0x0 bit 31) and REGUP are V4's.
+Online, VPSS runs on its own START / EOF interrupts; VI never calls into
+it.
+
+Two pieces of the machine outside the media blocks matter:
+
+- **CRG reset handshake.** The sys driver resets VPSS by writing
+  CRG+0x9b40 bit 0 and VGS by writing 0x9ec0 bit 0. It then polls the
+  register after each, ten times with no delay ("vpss0 reset failed").
+  `hisi-crg`'s `rst-ack` mirrors bit 0 into the status at once.
+- **I2C.** The 5.10 kernel's `i2c-bsp` repeats a multi-register write
+  program with JMP2 (command 0x19, LOOP2 / DST2 at 0xb8 / 0xbc). Before
+  `hisi-i2c` knew them, every such write aborted.
+
+The machines' default sensor is the SC4336P, load_hisilicon's.
+`test-hisi-majestic.sh --soc hi3516cv610` boots the hi3516cv6xx release:
+majestic streams 2560x1440 H.265, and the frame counter rises. The ISP's
+statistics (the V5 STT layout) are not written yet, so the script checks
+the stream only.
+
 ## Not yet
 
 - **AF, the local-average (LA) and dehaze statistics** are not produced.
@@ -471,5 +510,5 @@ as 0..5.
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300 and AV100 have their own
   encoder layouts and are still register stubs.
-- **V5 VI / VPSS:** the cv6xx machines encode user frames, but majestic
-  has no picture to encode yet.
+- **V5 ISP statistics:** the cv6xx pipeline streams, but AE / AWB have
+  nothing to measure yet (the V5 STT layout).
