@@ -113,6 +113,68 @@ def gen5(qemu, machine, check):
           and not any(words(B_, 1024)),
           'restarted: the first frame goes to the buffer programmed for the '
           'new run')
+
+    # offline (VI_OFFLINE_VPSS_ONLINE): two strip nodes, each with its BE
+    # image, header and arrays; slot 0 at 0x300 / 0x368
+    NODES, BES, STT = 0x43000000, 0x43100000, 0x43200000
+    q.writel(VP + 0x000, 0)                         # VPSS no longer online
+
+    def node(k, last):
+        n_ = bytearray(0x600)
+        stt = STT + k * 0x7000
+
+        def put(off, v):
+            struct.pack_into('<I', n_, off, v)
+        put(0x240, BES + k * 0x10000)
+        put(0x2f8, 0 if last else NODES + (k + 1) * 0x1000)
+        put(0x400, (1280 + 96 - 1) | (1080 - 1) << 16)
+        put(0x4dc, stt)
+        for i, off in enumerate((0x100, 0x1100, 0x2100, 0x3100)):
+            put(0x560 + 4 * i, stt + off)
+        put(0xf0, 0x806 if last else 0x4)
+        q.write(NODES + k * 0x1000, bytes(n_))
+        be = BES + k * 0x10000
+        q.writel(be + 0x1210, 0x1a0 << 16 | 0x100)  # WB gains R, B
+        q.writel(be + 0x1214, 0x180 << 16 | 0x100)
+        q.writel(be + 0x2010, 0x2010)               # 16 x 32 AE zones
+        q.writel(be + 0x2110, 0x2010)               # 16 x 32 AWB zones
+        q.write(stt, b'\0' * 0x7000)
+
+    node(0, False)
+    node(1, True)
+    q.writel(PROC + 0x368, NODES)
+    q.writel(PROC + 0x300, 1)
+    st = q.readl(PROC + 0x310)
+    q.cmd('clock_step %d' % FRAME_NS)
+    raw, msk = q.readl(PROC + 0x310), q.readl(PROC + 0x314)
+    check(not st & 0x802 and raw & 0x802 == 0x802 and msk == raw & 0x806,
+          'offline: the list ends with done and bit 11 (0x%x), behind the '
+          'last node\'s enables (0x%x)' % (raw, msk))
+    hdr = [words(STT + k * 0x7000, 11) for k in (0, 1)]
+    hists = [sum(words(STT + k * 0x7000 + 0x100, 1024)) for k in (0, 1)]
+    check(all(h[0] for h in hdr) and sum(hists) == SAMPLES * 4,
+          'offline: each strip its header (%d, %d pixels) and histogram, '
+          'the frame between them' % (hdr[0][0], hdr[1][0]))
+    check(all(h[10] >= 1024 and h[7] and h[8] and h[9] for h in hdr),
+          'offline: AWB globals in the headers (count %d)' % hdr[0][10])
+    z0 = words(STT + 0x1100, 16 * 32)
+    z1 = words(STT + 0x7000 + 0x1100, 16 * 32)
+    a1 = words(STT + 0x7000 + 0x3100, 16 * 32 * 2)
+    check(all(z0) and all(z1) and all(a1[1::2]) and
+          not any(words(STT + 0x1100 + 16 * 32 * 4, 16)),
+          'offline: 16 AE / AWB zone columns a strip, 32 rows')
+    q.writel(PROC + 0x310, 0xffffffff & ~0x10000)
+
+    # a second job queued in slot 1 (0x360 / 0x364) while slot 0 runs
+    q.writel(PROC + 0x368, NODES)
+    q.writel(PROC + 0x364, NODES)
+    q.writel(PROC + 0x300, 1)
+    q.writel(PROC + 0x360, 1)
+    q.cmd('clock_step %d' % (FRAME_NS * 2))
+    r0, r1 = q.readl(PROC + 0x310), q.readl(PROC + 0x370)
+    check(r0 & 0x802 == 0x802 and r1 & 0x802 == 0x802,
+          'offline: slot 1 queued behind slot 0, both done (0x%x, 0x%x)'
+          % (r0, r1))
     q.close()
 
 

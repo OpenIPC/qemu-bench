@@ -540,6 +540,66 @@ headers in `user/firmware/arch/hi3516cv610/include`). Against V4:
 cv610, `test-hisi-majestic.sh` passes with AE settling the scene at 34 %
 of full scale and AWB at 0 % / 0 % off grey.
 
+### V5 offline
+
+On cv610 nothing that OpenIPC ships forces VI offline:
+
+- VI and VPSS take lines up to 3200 wide online, or 3840 with the 4K
+  profile (`vi_drv_get_pipe_max_width`, `vpss_drv_check_grp_attr`).
+- The widest shipped sensor is 2880 (sc500ai). The IMX335 (2592 x 1944)
+  streams online under majestic.
+- Offline is software's choice: the SDK's aiisp / kol samples use
+  `VI_OFFLINE_VPSS_ONLINE`, and `sample_vie` runs both blocks offline.
+- More than 3200 wide, VI cuts a frame into 2 strips with a 192-pixel
+  overlap (`vi_drv_calc_split_num`).
+
+The contract, from mod_vi.o / mod_vpss.o and the open ISP driver:
+
+- **Starting a job.** VI_PROC has two slots: 0x300 bit 0 with the head
+  node at 0x368, or 0x360 with 0x364. The driver takes slot 1 while slot 0
+  is busy, and the model queues it.
+- **Nodes.** A node is a VIPROC register image in DDR, one per strip,
+  chained through its 0x2f8.
+  - 0xf0 / 0xf4 (slot 1: 0xe0 / 0xe4) hold its enables, 0x806 on the last
+    node.
+  - 0x240 is the strip's BE register image: WB gains at +0x1210 / 0x1214,
+    AE / AWB zones at +0x2010 / 0x2110.
+  - 0x400 is the strip's size.
+  - 0x560-0x56c are the array pointers, plus 0x4dc for the block's start.
+- **The statistics block** (`isp_be_offline_stat`, 0x7000 bytes):
+  - a 0x100-byte header of globals: AE total, count and R / Gr / Gb / B
+    means at 0x00-0x14; AWB R / G / B means and count at 0x1c-0x28;
+  - then the online buffer's arrays, 0x100 further on.
+- **Strips.** The driver adds the strips' histograms, weights their means
+  by their counts, and lays their zone columns side by side. Each strip's
+  BE image gives its own column count. The model writes each strip's
+  share.
+- **Completion.** The end of the list raises bit 1 (done) and bit 11 on
+  its slot's raw status (0x310 / 0x370, masked by 0xf0 / 0xe0).
+- **Waiting for a frame.** The driver turns the write channel on per
+  frame from the frame interrupt. VI's frame clock therefore also runs
+  while the port (VI dev 0, 0x1000 bit 31) is on, not only once capture
+  is.
+- **VPSS.** In this mode VPSS runs node lists, armed by 0x304 as on V4,
+  but with its head node at 0x368 (V4: 0x2f8).
+
+`test-hisi-v5-sample-venc.sh --sdk DIR` runs the SDK's `sample_venc` in
+`VI_OFFLINE_VPSS_ONLINE`:
+
+- VPSS -> VENC wrap is off, and a raw-frame pool replaces the wrap
+  buffer.
+- It requires a clean exit, offline statistics, AE settled between 10 %
+  and 70 % and AWB within 15 % of grey.
+- AE converges on the offline statistics to the online result (72 rows,
+  G at 33 %), and the stream decodes with the counter rising.
+- Online, this sample gets no stream: its VPSS channels are set up in a
+  way the model does not follow (#263). Majestic is the online test.
+- Under a warm light (R 0.70 / B 0.52) AWB moves to R 0x171 / B 0x1e5,
+  the same gains as online.
+
+Two strips are modelled from the source and checked by
+`test-hisi-isp.py --gen 5`; no shipped sensor makes the driver use them.
+
 ## Not yet
 
 - **AF, the local-average (LA) and dehaze statistics** are not produced.
@@ -547,6 +607,6 @@ of full scale and AWB at 0 % / 0 % off grey.
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300 and AV100 have their own
   encoder layouts and are still register stubs.
-- **V5 offline statistics:** a V5 pipe that runs offline (a sensor too
-  wide for online) writes no statistics: its buffer carries a 0x100-byte
-  header of globals (`isp_be_offline_stat`).
+- **V5 strips with a real driver:** two-strip offline (wider than 3200)
+  is modelled from the source and tested at register level, but no
+  sensor OpenIPC or the SDK ships drives it.
