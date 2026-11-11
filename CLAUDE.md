@@ -691,8 +691,13 @@ in this order:
     a block with a 0x100-byte header of globals. VPSS's node head is 0x368.
   - VI ticks while its port (0x1000 bit 31) is on, because the driver
     enables capture per frame.
-  - `test-hisi-v5-sample-venc.sh` (local) checks it with the SDK sample,
-    offline only (#263).
+  - `test-hisi-v5-sample-venc.sh` (local) runs the SDK sample online and
+    `--offline`. Its VPSS group is `EARLY_END`: the driver unmasks the
+    delay interrupt (bit 8) and hands channels on only at an EOF without
+    START. Its channel 1 is low delay (0x400 bit 4 + chn, tunnel word at
+    0x4a8 + 4 x chn): the driver sends a frame only between START and the
+    channel's tunnel interrupt (0x1000 << chn). So in either mode
+    `hisi-vpss` raises START, tunnel, delay and EOF apart.
   - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`
     (2800) and `pclk` (126 MHz) make VTS 1500 30 fps. It counts exposure
     in rows (`exp-rows`), and 0x3E06 is its digital gain's coarse step.

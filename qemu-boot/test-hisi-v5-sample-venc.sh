@@ -6,22 +6,22 @@
 # libraries (with OpenIPC's musl toolchain), and runs it from an initramfs
 # made of the OpenIPC hi3516cv6xx rootfs, whose own load_hisilicon loads
 # every module, with an SC4336P on the sensor bus.  sample_venc's case 0
-# is built with VI_OFFLINE_VPSS_ONLINE (the SDK's aiisp / kol mode), so
-# VI runs its pipe per frame from a node list, VPSS its node lists, and
-# the ISP's statistics go through the offline blocks; without its VPSS ->
-# VENC wrap (a low-delay ring the model does not run), and with a pool
-# for the raw frames in the wrap buffer's place.  The sample must exit
-# cleanly, its H.265 stream decode with hisi-vpss's frame counter rising,
-# and the ISP's AE / AWB settle on the offline statistics.
-#
-# Online, majestic is the test (test-hisi-majestic.sh): this sample's
-# online VPSS channels are set up in a way the model does not follow yet
-# (OpenIPC/qemu-bench#263).
+# runs VI and VPSS online, its group's frame interrupt EARLY_END (the
+# driver prepares each frame on VPSS's early interrupt, 0x100).  It is
+# built without its VPSS -> VENC wrap (a low-delay ring the model does
+# not run), with a common pool large enough for channel 0's 2560x1440 in
+# the wrap buffer's place (the sample sizes none for it otherwise).
+# --offline builds it with VI_OFFLINE_VPSS_ONLINE (the SDK's aiisp / kol
+# mode): VI runs its pipe per frame from a node list, VPSS its node lists,
+# the ISP's statistics go through the offline blocks, and the pool holds
+# the raw frames too.  The sample must exit cleanly, its H.265 and H.264
+# streams decode with hisi-vpss's frame counter rising, and the ISP's
+# AE / AWB settle.
 #
 # The SDK is not public, so this runs locally, not in CI:
 #
 #   test-hisi-v5-sample-venc.sh --sdk ~/projects/cameras/sdk/Hi3516CV610_SDK_V1.0.2.0
-#                               [--qemu Q] [--work DIR] [--seconds 30]
+#                               [--offline] [--qemu Q] [--work DIR] [--seconds 30]
 #
 # Needs arm-openipc-linux-musleabi-gcc (or CC), unsquashfs, cpio, ffmpeg.
 set -eu
@@ -31,7 +31,7 @@ SDK=
 QEMU=$HERE/../qemu-src/build/qemu-system-arm
 WORK=
 SECS=30
-OFFLINE=1
+OFFLINE=0
 CC=${CC:-arm-openipc-linux-musleabi-gcc}
 
 while [ $# -gt 0 ]; do
@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
     --qemu) QEMU=$2; shift ;;
     --work) WORK=$2; shift ;;
     --seconds) SECS=$2; shift ;;
-    --offline) ;;           # the only mode (kept for old command lines)
+    --offline) OFFLINE=1 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -67,19 +67,17 @@ cp "$SMP/venc/sample_venc.c" "$OBJ/"
 sed -i -e 's/sys_cfg->vpss_wrap_en = TD_TRUE;/sys_cfg->vpss_wrap_en = TD_FALSE;/' \
     -e 's/vpss_cfg->wrap_attr\[0\].enable = TD_TRUE;/vpss_cfg->wrap_attr[0].enable = TD_FALSE;/' \
     "$OBJ/sample_venc.c"
+# a common pool for channel 0 (and offline, the raw frames) where the
+# disabled wrap buffer's was: 2560x1440 at 12 bits a pixel covers both
+perl -0pi -e 's/vb_cfg->common_pool\[i\]\.blk_cnt = 1;\n\s*vb_cfg->common_pool\[i\]\.blk_size = wrap_size;/{ ot_pic_buf_attr raw = { .width = 2560, .height = 1440, .align = OT_DEFAULT_ALIGN, .bit_width = OT_DATA_BIT_WIDTH_12, .pixel_format = OT_PIXEL_FORMAT_RGB_BAYER_12BPP, .compress_mode = OT_COMPRESS_MODE_NONE, .video_format = OT_VIDEO_FORMAT_LINEAR };\n        (void)wrap_size; ot_common_get_pic_buf_cfg(&raw, &calc_cfg);\n        vb_cfg->common_pool[i].blk_size = calc_cfg.vb_size;\n        vb_cfg->common_pool[i].blk_cnt = 4; }/' \
+    "$OBJ/sample_venc.c"
+grep -q OT_PIXEL_FORMAT_RGB_BAYER_12BPP "$OBJ/sample_venc.c"
 if [ "$OFFLINE" = 1 ]; then
     sed -i 's/sys_cfg->mode_type = OT_VI_ONLINE_VPSS_ONLINE;/sys_cfg->mode_type = OT_VI_OFFLINE_VPSS_ONLINE;/' \
         "$OBJ/sample_venc.c"
     grep -q OT_VI_OFFLINE_VPSS_ONLINE "$OBJ/sample_venc.c"
-    # offline, VI captures raw frames into DDR first: a pool for them
-    # where the (disabled) wrap buffer's was
-    perl -0pi -e 's/vb_cfg->common_pool\[i\]\.blk_cnt = 1;\n\s*vb_cfg->common_pool\[i\]\.blk_size = wrap_size;/{ ot_pic_buf_attr raw = { .width = 2560, .height = 1440, .align = OT_DEFAULT_ALIGN, .bit_width = OT_DATA_BIT_WIDTH_12, .pixel_format = OT_PIXEL_FORMAT_RGB_BAYER_12BPP, .compress_mode = OT_COMPRESS_MODE_NONE, .video_format = OT_VIDEO_FORMAT_LINEAR };\n        (void)wrap_size; ot_common_get_pic_buf_cfg(&raw, &calc_cfg);\n        vb_cfg->common_pool[i].blk_size = calc_cfg.vb_size;\n        vb_cfg->common_pool[i].blk_cnt = 4; }/' \
-        "$OBJ/sample_venc.c"
-    grep -q OT_PIXEL_FORMAT_RGB_BAYER_12BPP "$OBJ/sample_venc.c"
-    MEM="mem=64M mmz_allocator=hisi mmz=anonymous,0,0x44000000,64M"
-else
-    MEM="mem=80M mmz_allocator=hisi mmz=anonymous,0,0x45000000,48M"
 fi
+MEM="mem=64M mmz_allocator=hisi mmz=anonymous,0,0x44000000,64M"
 SNS=SC4336P_MIPI_4M_30FPS_10BIT
 CFLAGS="-O2 -I$OUT/include -I$SMP/common -Dhi3516cv610 -DOT_XXXX -DISP_V2
     -DSENSOR0_TYPE=$SNS -DSENSOR1_TYPE=$SNS -D${SNS}_SELECT=y
@@ -134,7 +132,7 @@ DUMP=$WORK/dump
 rm -rf "$DUMP"
 mkdir -p "$DUMP"
 # the initramfs is the whole rootfs: the OS gets more than the camera's
-# 32 MiB (online 80; offline 64, and 64 for MMZ: the raw frames)
+# 32 MiB, 64, and MMZ the other 64 (the 2560x1440 pool)
 timeout $((SECS * 20 + 300)) "$QEMU" -M hi3516cv610,sensor=sc4336p -m 128M \
     -kernel "$WORK/uImage.$REL" -initrd "$WORK/sample.cpio" \
     -append "console=ttyAMA0,115200 rdinit=/init $MEM" \
@@ -178,4 +176,7 @@ if ! echo "$last" | awk '
     echo "AE / AWB did not settle; console in $WORK/console.log" >&2
     exit 1
 fi
-python3 "$HERE/check-hisi-venc.py" --min-frames 25 --rising "$DUMP" h265
+# both channels: the H.265 one at 2560x1440, the H.264 one VPSS scales
+for codec in h265 h264; do
+    python3 "$HERE/check-hisi-venc.py" --min-frames 25 --rising "$DUMP" $codec
+done
