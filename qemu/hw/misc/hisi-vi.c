@@ -149,6 +149,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define V5_CAP_INT1         0x00e4
 #define V5_CAP_INT_WCH0     (1u << 8)
 #define V5_CAP_INT_FE0      (1u << 16)
+#define V5_CAP_PORT0        0x1000      /* VI dev 0: bit 31 enable */
 #define V5_FE_INT_FEND      (1u << 8)
 #define V5_PROC_INT_MASK    0x00f0
 #define V5_PROC_INT_STAT    0x0314
@@ -168,6 +169,41 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define V5_STT_AE_RGR       0x0564
 #define V5_STT_AE_GBB       0x0568
 #define V5_STT_AWB          0x056c
+/*
+ * V5 offline (mod_vi.o vi_hal_start_viproc, vi_drv_process_irq_route; the
+ * open isp_stt_define.h isp_be_offline_stat, isp_drv_statistics.c).  Two
+ * slots: slot 0 starts at 0x300 bit 0 with its head node at 0x368, slot 1
+ * at 0x360 with 0x364.  A node is a VIPROC register image in DDR, one a
+ * vertical strip, chained through its 0x2f8; its 0xf0 / 0xf4 (slot 1:
+ * 0xe0 / 0xe4) are the enables, 0x240 the strip's BE register image (WB
+ * gains and zone grids at the BE offsets), 0x400 the strip's size, and
+ * its statistics pointers: 0x560 / 0x564 / 0x568 / 0x56c as online, plus
+ * 0x4dc, a header of globals ahead of them.  A finished list raises bit 1
+ * (done) and bit 11 on its slot's raw status, 0x310 or 0x370 (masked by
+ * 0xf0 / 0xe0 into 0x314 / 0x374).
+ */
+#define V5_PROC_START1      0x0360
+#define V5_PROC_HEAD1       0x0364
+#define V5_PROC_HEAD0       0x0368
+#define V5_PROC_INT1        0x0370      /* slot 1's raw status */
+#define V5_PROC_INT1_MASK   0x00e0
+#define V5_PROC_INT1_STAT   0x0374
+#define V5_PROC_DONE        ((1u << 1) | (1u << 11))
+#define V5_NODE_BE          0x0240
+#define V5_NODE_NEXT        0x02f8
+#define V5_NODE_SIZE        0x0400
+#define V5_NODE_STT_HDR     0x04dc
+#define V5_NODE_WORDS       (0x0570 / 4)
+#define V5_BE_WB_GAIN1      0x1210      /* in a strip's BE image */
+#define V5_BE_AE_ZONE       0x2010
+#define V5_BE_AWB_ZONE      0x2110
+#define V5_OFF_HDR_SIZE     0x2c        /* globals, up to awb_count_all */
+
+/* one strip of a V5 offline job, as its node had it at the start */
+typedef struct ViStrip5 {
+    uint32_t hdr, stt[4], be, w;
+    uint32_t ae_zone, awb_zone;
+} ViStrip5;
 
 #define PROC_START          0x0300  /* offline: 1 / 3 starts the node list */
 #define PROC_INT            0x0310
@@ -250,6 +286,11 @@ struct HisiViState {
      * (AE histogram, R:Gr, Gb:B, AWB; the FE histogram) */
     uint32_t stt_latch[4], fe_latch;
     bool stt_latched;           /* false until a run's first frame start */
+    /* gen 5 offline: the job running and the slot queued behind it */
+    ViStrip5 strip5[2][PROC_NODE_MAX];
+    int nstrips5[2];
+    int slot5;                  /* running, -1 none */
+    bool queued5[2];
 };
 
 /* the capture status: pipe 0's bit stands while its write channel has
@@ -273,7 +314,11 @@ static void vi_update(HisiViState *s)
         qemu_set_irq(s->proc_irq,
                      ((s->proc[PROC_INT / 4] & s->proc[V5_PROC_INT_MASK / 4]) |
                       (s->proc[PROC_INT2 / 4] &
-                       s->proc[V5_PROC_INT_MASK / 4 + 1])) != 0);
+                       s->proc[V5_PROC_INT_MASK / 4 + 1]) |
+                      (s->proc[V5_PROC_INT1 / 4] &
+                       s->proc[V5_PROC_INT1_MASK / 4]) |
+                      (s->proc[V5_PROC_INT1 / 4 + 2] &
+                       s->proc[V5_PROC_INT1_MASK / 4 + 1])) != 0);
         return;
     }
     qemu_set_irq(s->cap_irq, (vi_cap_status(s) & s->cap[CAP_INT_MASK / 4] &
@@ -300,7 +345,15 @@ static void vi_arm(HisiViState *s)
 
 static bool vi_running(HisiViState *s)
 {
-    return s->run || (s->cap[CAP_WCH_CTRL(0) / 4] & (1u << 31));
+    /*
+     * V5 also while its port (VI dev 0, 0x1000 bit 31) is on: offline,
+     * the driver enables the write channel per frame from the frame
+     * interrupt (vi_drv_pipe_set_capture_frame_cfg), so it waits for a
+     * frame before it turns capture on.  A V5 interrupt nobody enabled
+     * is "No available int!", not an oops as on V4.
+     */
+    return s->run || (s->cap[CAP_WCH_CTRL(0) / 4] & (1u << 31)) ||
+           (s->gen == 5 && (s->cap[V5_CAP_PORT0 / 4] & (1u << 31)));
 }
 
 
@@ -839,6 +892,182 @@ static void vi_be_stats_offline(HisiViState *s)
     s->stat_frames++;
 }
 
+/*
+ * V5 offline: a slot's node list, read when it starts (the nodes are
+ * rewritten for the next job while this one runs).  The enables of its
+ * last node are what its interrupt is masked with.
+ */
+static void vi_v5_load_job(HisiViState *s, int slot)
+{
+    uint32_t a = s->proc[(slot ? V5_PROC_HEAD1 : V5_PROC_HEAD0) / 4];
+    uint32_t node[V5_NODE_WORDS + 1], mask[2] = { 0, 0 };
+    int k;
+
+    for (k = 0; k < PROC_NODE_MAX && a; k++) {
+        ViStrip5 *st = &s->strip5[slot][k];
+        uint32_t zones[2] = { 0, 0 };
+
+        dma_memory_read(&address_space_memory, a, node, sizeof(node),
+                        MEMTXATTRS_UNSPECIFIED);
+        st->hdr = le32_to_cpu(node[V5_NODE_STT_HDR / 4]);
+        st->stt[0] = le32_to_cpu(node[V5_STT_AE_HIST / 4]);
+        st->stt[1] = le32_to_cpu(node[V5_STT_AE_RGR / 4]);
+        st->stt[2] = le32_to_cpu(node[V5_STT_AE_GBB / 4]);
+        st->stt[3] = le32_to_cpu(node[V5_STT_AWB / 4]);
+        st->be = le32_to_cpu(node[V5_NODE_BE / 4]);
+        st->w = (le32_to_cpu(node[V5_NODE_SIZE / 4]) & 0xffff) + 1;
+        mask[0] = le32_to_cpu(node[(slot ? V5_PROC_INT1_MASK
+                                         : V5_PROC_INT_MASK) / 4]);
+        mask[1] = le32_to_cpu(node[(slot ? V5_PROC_INT1_MASK
+                                         : V5_PROC_INT_MASK) / 4 + 1]);
+        if (st->be) {
+            dma_memory_read(&address_space_memory, st->be + V5_BE_AE_ZONE,
+                            &zones[0], 4, MEMTXATTRS_UNSPECIFIED);
+            dma_memory_read(&address_space_memory, st->be + V5_BE_AWB_ZONE,
+                            &zones[1], 4, MEMTXATTRS_UNSPECIFIED);
+        }
+        st->ae_zone = le32_to_cpu(zones[0]);
+        st->awb_zone = le32_to_cpu(zones[1]);
+        a = le32_to_cpu(node[V5_NODE_NEXT / 4]);
+    }
+    s->nstrips5[slot] = k;
+    if (k) {
+        const uint32_t m = slot ? V5_PROC_INT1_MASK : V5_PROC_INT_MASK;
+
+        s->proc[m / 4] = mask[0];
+        s->proc[m / 4 + 1] = mask[1];
+    }
+}
+
+/* the WB gains the driver set for the job: its first strip's BE image */
+static void vi_v5_offline_wb(HisiViState *s, int slot)
+{
+    uint32_t gain[2] = { 0, 0 };
+
+    if (s->nstrips5[slot] && s->strip5[slot][0].be) {
+        dma_memory_read(&address_space_memory,
+                        s->strip5[slot][0].be + V5_BE_WB_GAIN1, gain,
+                        sizeof(gain), MEMTXATTRS_UNSPECIFIED);
+    }
+    s->wb[0] = (le32_to_cpu(gain[0]) >> 16) / 256.0;
+    s->wb[1] = (le32_to_cpu(gain[1]) >> 16) / 256.0;
+    if (s->scene) {
+        hisi_scene_set_frame(s->scene, s->level, s->tint, s->wb[0],
+                             s->wb[1]);
+    }
+}
+
+/*
+ * V5 offline statistics of the job's frame, strip by strip
+ * (isp_drv_be_offline_statistics_read): each strip's zone columns are its
+ * BE image's grid, laid side by side across the frame; the histograms and
+ * globals are the strip's own, which the driver sums and weights.
+ */
+static void vi_v5_stats_offline(HisiViState *s, int slot)
+{
+    const int n = s->nstrips5[slot];
+    int aex = 0, awx = 0, aey = 1, awy = 1, ae0 = 0, aw0 = 0, k, c;
+
+    if (!s->raw || !n) {
+        return;
+    }
+    for (k = 0; k < n; k++) {
+        int x, y;
+
+        ae_grid(s, s->strip5[slot][k].ae_zone ?: 0x2020, &x, &y);
+        aex += x;
+        aey = y;
+        awb_grid(s->strip5[slot][k].awb_zone ?: 0x2020, &x, &y);
+        awx += x;
+        awy = y;
+    }
+    aex = MIN(aex, 32);
+    awx = MIN(awx, 32);
+    for (k = 0; k < n; k++) {
+        const ViStrip5 *st = &s->strip5[slot][k];
+        uint32_t hdr[V5_OFF_HDR_SIZE / 4] = { 0 };
+        uint32_t rgr[AE_ZONES_MAX], gbb[AE_ZONES_MAX];
+        uint32_t awb[AWB_ZONES_MAX * 2], hist[AE_BINS] = { 0 };
+        int aew, aww, y, gx0, gx1;
+
+        ae_grid(s, st->ae_zone ?: 0x2020, &aew, &y);
+        awb_grid(st->awb_zone ?: 0x2020, &aww, &y);
+        aew = MIN(aew, aex - ae0);
+        aww = MIN(aww, awx - aw0);
+        /* the strip's grid columns: its share of the AWB zones */
+        gx0 = (int64_t)aw0 * s->gw / awx;
+        gx1 = MAX((int64_t)(aw0 + aww) * s->gw / awx, gx0 + 1);
+
+        scene_ae_global(s, hdr, gx0, gx1);  /* total, count, R Gr Gb B */
+        for (c = 0; c < 3; c++) {
+            hdr[7 + c] = raw_mean(s, c, gx0, gx1, 0, s->gh);
+        }
+        hdr[10] = scene_awb_count(s, awx * awy);
+        for (c = 0; c < ARRAY_SIZE(hdr); c++) {
+            hdr[c] = cpu_to_le32(hdr[c]);
+        }
+        if (st->hdr) {
+            stt_write(st->hdr, hdr, sizeof(hdr));
+        }
+        if (st->stt[0]) {
+            raw_hist(s, hist, AE_BINS, gx0, gx1);
+            for (c = 0; c < AE_BINS; c++) {
+                hist[c] = cpu_to_le32(hist[c]);
+            }
+            stt_write(st->stt[0], hist, sizeof(hist));
+        }
+        scene_ae_zones(s, aex, aey, ae0, aew, rgr, gbb);
+        if (st->stt[1]) {
+            stt_write(st->stt[1], rgr, aew * aey * 4);
+        }
+        if (st->stt[2]) {
+            stt_write(st->stt[2], gbb, aew * aey * 4);
+        }
+        if (st->stt[3]) {
+            scene_awb_zones(s, awx, awy, aw0, aww, awb);
+            stt_write(st->stt[3], awb, aww * awy * 8);
+        }
+        ae0 += aew;
+        aw0 += aww;
+    }
+    if (s->stats_trace && s->stat_frames % MAX(s->fps, 1) == 0) {
+        fprintf(stderr, "isp stats: %u rows x%.2f gain, R %u G mean %u B %u, "
+                "WB gains R %#x B %#x, offline, %d strips\n",
+                s->frame_expo.lines, s->frame_expo.gain / 1024.0,
+                raw_mean(s, 0, 0, s->gw, 0, s->gh),
+                raw_mean(s, 1, 0, s->gw, 0, s->gh),
+                raw_mean(s, 2, 0, s->gw, 0, s->gh),
+                (unsigned)(s->wb[0] * 256), (unsigned)(s->wb[1] * 256), n);
+    }
+    vi_record(s, raw_mean(s, 0, 0, s->gw, 0, s->gh),
+              raw_mean(s, 1, 0, s->gw, 0, s->gh),
+              raw_mean(s, 2, 0, s->gw, 0, s->gh));
+    s->stat_frames++;
+}
+
+/* gen 5: run a started slot's job (the other may be queued behind) */
+static void vi_v5_run_job(HisiViState *s, int slot)
+{
+    s->slot5 = slot;
+    s->queued5[slot] = false;
+    vi_v5_offline_wb(s, slot);
+    vi_job_start(s);
+    qemu_irq_pulse(s->frame_out);
+    timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / 4 / MAX(s->fps, 1));
+}
+
+static void vi_v5_start(HisiViState *s, int slot)
+{
+    s->offline = true;
+    vi_v5_load_job(s, slot);
+    if (s->slot5 < 0) {
+        vi_v5_run_job(s, slot);
+    } else {
+        s->queued5[slot] = true;
+    }
+}
+
 static void vi_frame(void *opaque)
 {
     HisiViState *s = opaque;
@@ -896,7 +1125,23 @@ static void vi_proc_done(void *opaque)
     if (!vi_running(s)) {
         return;                     /* the pipe was stopped meanwhile */
     }
-    if (s->job.valid && s->gen != 5) {
+    if (s->gen == 5) {
+        const int slot = s->slot5 < 0 ? 0 : s->slot5;
+
+        if (s->job.valid) {
+            vi_job_swap(s);
+            vi_v5_stats_offline(s, slot);
+            vi_job_swap(s);
+        }
+        s->proc[(slot ? V5_PROC_INT1 : PROC_INT) / 4] |= V5_PROC_DONE;
+        s->slot5 = -1;
+        if (s->queued5[!slot]) {
+            vi_v5_run_job(s, !slot);
+        }
+        vi_update(s);
+        return;
+    }
+    if (s->job.valid) {
         /* the statistics and record of the frame the job was started on
          * (V4's STT layout and node offsets; V5's are not modelled yet) */
         vi_job_swap(s);
@@ -952,9 +1197,15 @@ static void vi_cap_write(void *opaque, hwaddr offset, uint64_t val,
     } else {
         s->cap[offset / 4] = val;
     }
+    if (s->gen == 5 && offset == V5_CAP_PORT0 && (val & (1u << 31)) &&
+        !timer_pending(s->timer)) {
+        vi_arm(s);                  /* the port started: frames come */
+    }
     if (offset == CAP_WCH_CTRL(0)) {
         if (!(val & (1u << 31))) {
             s->stt_latched = false;     /* the next run latches afresh */
+            s->slot5 = -1;
+            s->queued5[0] = s->queued5[1] = false;
             /* the pipe stopped: whatever it is rebuilt as starts online */
             s->offline = false;
             timer_del(s->proc_timer);
@@ -977,6 +1228,13 @@ static uint64_t vi_proc_read(void *opaque, hwaddr offset, unsigned size)
 
         val = s->proc[(PROC_INT + hi * 8) / 4] &
               s->proc[V5_PROC_INT_MASK / 4 + hi];
+    } else if (s->gen == 5 && (offset == V5_PROC_INT1_STAT ||
+                               offset == V5_PROC_INT1_STAT + 8)) {
+        /* slot 1: 0x374 = 0x370 & 0xe0, 0x37c = 0x378 & 0xe4 */
+        const int hi = offset == V5_PROC_INT1_STAT + 8;
+
+        val = s->proc[(V5_PROC_INT1 + hi * 8) / 4] &
+              s->proc[V5_PROC_INT1_MASK / 4 + hi];
     }
     if (s->trace && offset < 0x1000) {
         fprintf(stderr, "vi-proc R %05x = %08x\n", (int)offset, val);
@@ -993,12 +1251,17 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
         fprintf(stderr, "vi-proc W %05x : %08x\n", (int)offset,
                 (uint32_t)val);
     }
-    if (offset == PROC_INT || offset == PROC_INT2) {
+    if (offset == PROC_INT || offset == PROC_INT2 ||
+        (s->gen == 5 && (offset == V5_PROC_INT1 ||
+                         offset == V5_PROC_INT1 + 8))) {
         s->proc[offset / 4] &= ~(uint32_t)val;
     } else {
         s->proc[offset / 4] = val;
     }
-    if (offset == PROC_START && (val & 1)) {
+    if (s->gen == 5 && (offset == PROC_START || offset == V5_PROC_START1) &&
+        (val & 1)) {
+        vi_v5_start(s, offset == V5_PROC_START1);
+    } else if (offset == PROC_START && (val & 1)) {
         /*
          * Offline (a sensor too wide for online, VI_OFFLINE_VPSS_ONLINE):
          * the driver starts the pipe on each captured frame (VI_HAL_Start),
@@ -1006,9 +1269,7 @@ static void vi_proc_write(void *opaque, hwaddr offset, uint64_t val,
          * the pipe's interrupt.
          */
         s->offline = true;
-        if (s->gen != 5) {
-            vi_offline_wb(s);       /* V4's node offsets */
-        }
+        vi_offline_wb(s);
         vi_job_start(s);
         qemu_irq_pulse(s->frame_out);
         timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -1091,6 +1352,8 @@ static void hisi_vi_reset(DeviceState *dev)
     memset(s->stt_latch, 0, sizeof(s->stt_latch));
     s->fe_latch = 0;
     s->stt_latched = false;
+    s->slot5 = -1;
+    s->queued5[0] = s->queued5[1] = false;
     qemu_set_irq(s->cap_irq, 0);
     qemu_set_irq(s->proc_irq, 0);
 }

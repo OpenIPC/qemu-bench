@@ -77,6 +77,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssState, HISI_VPSS)
 #define VPSS_CHN0_CMP       0x0700  /* bit 0: channel 0 writes compressed */
 #define VPSS_PNEXT          0x02f8  /* node mode: the first node */
 #define VPSS_NODE_START     0x0304  /* node mode: bit 0 starts the list */
+#define V5_VPSS_HEAD        0x0368  /* V5 node mode: the first node (V4:
+                                     * 0x2f8); nodes still chain at 0x2f8 */
 #define VPSS_NODE_MAX       8       /* strips of one picture */
 #define VPSS_NODE_SIZE      0x800   /* what of a node the model reads */
 
@@ -225,7 +227,7 @@ static void vpss_chn_out(HisiVpssState *s, const uint32_t *r, int c,
 static void vpss_load_nodes(HisiVpssState *s)
 {
     uint32_t node[VPSS_NODE_SIZE / 4];
-    uint32_t a = s->regs[VPSS_PNEXT / 4];
+    uint32_t a = s->regs[(s->gen == 5 ? V5_VPSS_HEAD : VPSS_PNEXT) / 4];
     int c, k;
 
     memset(s->node_out, 0, sizeof(s->node_out));

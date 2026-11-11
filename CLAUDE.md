@@ -684,6 +684,15 @@ in this order:
   - lib_awb stays inside the sensor's calibrated range, so cv6xx scenes are
     lit at the SC4336P's grey (light-r 625 / light-b 565), and the
     scenario's warm light is 700 / 520.
+  - Offline (only when software asks: the online limit is 3200 wide), VI_PROC
+    starts at 0x300 / head 0x368 (slot 1: 0x360 / 0x364), and the done
+    status is bits 1 + 11 on 0x310 / 0x370.
+  - Each strip's node holds the array pointers (0x560-0x56c) and, at 0x4dc,
+    a block with a 0x100-byte header of globals. VPSS's node head is 0x368.
+  - VI ticks while its port (0x1000 bit 31) is on, because the driver
+    enables capture per frame.
+  - `test-hisi-v5-sample-venc.sh` (local) checks it with the SDK sample,
+    offline only (#263).
   - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`
     (2800) and `pclk` (126 MHz) make VTS 1500 30 fps. It counts exposure
     in rows (`exp-rows`), and 0x3E06 is its digital gain's coarse step.
