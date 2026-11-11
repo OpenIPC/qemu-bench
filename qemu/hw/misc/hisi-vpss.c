@@ -104,6 +104,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssState, HISI_VPSS)
  * interrupt (0x1000 << chn) fires at the line count; the driver counts
  * START up and the tunnel interrupt down per channel and hands the frame
  * on only while the count is 1 (vpss_get_tunl_int, vpss_online_irq_proc).
+ * Channel 2 has no low delay: the HAL's enable and line-count setters
+ * (vpss_hal_enable_chn_low_delay, vpss_hal_set_chn_low_delay_attr) take
+ * channels 0 and 1 only.
  */
 #define V5_VPSS_LOWDELAY    0x0400
 #define V5_VPSS_TUNL_ADDR   0x04a8
@@ -159,7 +162,9 @@ struct HisiVpssState {
     VpssOut node_out[VPSS_CHN];          /* ... and what it then loaded */
     uint32_t raw;
     uint32_t frame;
-    uint32_t fps;               /* VI's frame rate */
+    uint32_t fps;               /* VI's frame rate, until it is measured */
+    int64_t vi_ns;              /* VI's last frame */
+    int64_t period_ns;          /* ... and the interval before it */
     bool trace;
     uint8_t gen;                /* 4: Hi3516EV200 family, 5: Hi3516CV610 */
     HisiSceneState *scene;      /* what the pictures show */
@@ -289,11 +294,21 @@ static void vpss_load_nodes(HisiVpssState *s)
  */
 enum { VPSS_PH_TUNL = 1, VPSS_PH_DELAY, VPSS_PH_EOF };
 
+/*
+ * VI's frame interval as measured, so that a frame's interrupts all fall
+ * before the next one whatever the sensor's timing; "fps" until then.
+ */
+static int64_t vpss_period(HisiVpssState *s)
+{
+    return s->period_ns ? s->period_ns
+                        : NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
+}
+
 static void vpss_next_phase(HisiVpssState *s, unsigned phase)
 {
     s->phase = phase;
-    timer_mod(s->phase_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / 8 / MAX(s->fps, 1));
+    timer_mod(s->phase_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + vpss_period(s) / 8);
 }
 
 static void vpss_frame(void *opaque)
@@ -399,16 +414,21 @@ static void vpss_phase(void *opaque)
 static void vpss_vi_frame(void *opaque, int n, int level)
 {
     HisiVpssState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (!level) {
         return;
     }
+    /* a gap of over a second is a pause, not the frame rate */
+    if (s->vi_ns && now - s->vi_ns < NANOSECONDS_PER_SECOND) {
+        s->period_ns = now - s->vi_ns;
+    }
+    s->vi_ns = now;
     if (s->node_armed) {
         vpss_load_nodes(s);     /* node mode: the list is loaded at start */
     }
     if ((s->regs[VPSS_INTMASK / 4] & VPSS_INT_START) || s->node_armed) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND / 8 / MAX(s->fps, 1));
+        timer_mod(s->timer, now + vpss_period(s) / 8);
     }
 }
 
@@ -501,6 +521,8 @@ static void hisi_vpss_reset(DeviceState *dev)
     timer_del(s->timer);
     timer_del(s->phase_timer);
     s->phase = 0;
+    s->vi_ns = 0;
+    s->period_ns = 0;
     memset(s->tunl_addr, 0, sizeof(s->tunl_addr));
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->active, 0, sizeof(s->active));
