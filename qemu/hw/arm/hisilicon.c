@@ -50,6 +50,7 @@
 #include "target/arm/gtimer.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
+#include "target/arm/cpregs.h"
 #include <libfdt.h>
 #include "hw/loader.h"
 #include <zlib.h>  /* crc32() for uImage header fixup */
@@ -180,6 +181,11 @@ static const HisiSoCConfig hi3516cv100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -292,6 +298,11 @@ static const HisiSoCConfig hi3518av100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -392,6 +403,11 @@ static const HisiSoCConfig hi3518cv100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -494,6 +510,11 @@ static const HisiSoCConfig hi3518ev100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -5211,6 +5232,21 @@ static void hisi_register_uart_pre_enable_reset(const HisiSoCConfig *c)
     qemu_add_machine_init_done_notifier(&nf->notifier);
 }
 
+/*
+ * ARM926EJ-S TCM region registers, absent from QEMU's arm926.  They exist on
+ * every ARM926EJ-S whether or not TCM is fitted, and the Xiongmai V1 U-Boot
+ * (2010.06, 2012 build) writes the ITCM one in its start code
+ * (mcr p15, 0, r0, c9, c1, 1 with 0xd); without it that write is an
+ * Undefined Instruction before the exception stack exists, and the board
+ * never prints a line.  No TCM is modelled: they read as zero, size 0.
+ */
+static const ARMCPRegInfo hisi_arm926_tcm_cp_reginfo[] = {
+    { .name = "DTCMRR", .cp = 15, .crn = 9, .crm = 1, .opc1 = 0, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "ITCMRR", .cp = 15, .crn = 9, .crm = 1, .opc1 = 0, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+};
+
 static void hisilicon_common_init(MachineState *machine,
                                   const HisiSoCConfig *c)
 {
@@ -5453,6 +5489,9 @@ static void hisilicon_common_init(MachineState *machine,
         }
         qdev_realize(DEVICE(cpuobj[n]), NULL, &error_fatal);
         cpu[n] = ARM_CPU(cpuobj[n]);
+        if (!strcmp(machine->cpu_type, ARM_CPU_TYPE_NAME("arm926"))) {
+            define_arm_cp_regs(cpu[n], hisi_arm926_tcm_cp_reginfo);
+        }
     }
 
     /* Mask-ROM ELF (-bios) is loaded once CPU 0 exists; the registered
