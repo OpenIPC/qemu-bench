@@ -33,6 +33,8 @@ typedef struct ImageSensorSpec {
     uint8_t disc;       /* SMARTSENS: 0x3109 where parts share an ID */
     uint8_t gain_fine;  /* SMARTSENS: 0x3E09 at 1x, on the SC2310's layout */
     uint32_t pclk;      /* SMARTSENS: pixel clock, when known: frame timing */
+    uint16_t hts;       /* SMARTSENS: HTS at reset, where a mode leaves it */
+    bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
 } ImageSensorSpec;
 
 /* GalaxyCore's register pairs; OmniVision's OV27x5/OV97x5 have the same */
@@ -86,7 +88,14 @@ static const ImageSensorSpec image_sensors[] = {
     SC("sc307h", 0xCB1C),
     SC("sc401ai", 0xCD2E),
     SC("sc431hai", 0xCD6B),
-    SC("sc4336p", 0x9C42),          /* hi3516cv6xx: load_hisilicon's default */
+    /*
+     * hi3516cv6xx: load_hisilicon's default.  Its 4M mode (sc4336p_cfg.h,
+     * "27M input, 2 lanes, 10 bit, 630 Mbps, 2560x1440 30 fps") writes VTS
+     * 1500 but leaves HTS at reset: 630 Mbps x 2 / 10 = 126 Mpixel/s, so
+     * HTS is 2800 (0x0af0, which the 2M mode writes) for 30 fps.
+     */
+    { "sc4336p", SMARTSENS, 0x30, 0x9C42, .pclk = 126000000, .hts = 2800,
+      .exp_rows = true },
     SC("sc501ai", 0xCE1F),
     SC("sc5035", 0x5035),
     SC("sc5238", 0x5235),
@@ -151,6 +160,8 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint8(dev, "disc", spec->disc);
         qdev_prop_set_uint8(dev, "gain-fine", spec->gain_fine);
         qdev_prop_set_uint32(dev, "pclk", spec->pclk);
+        qdev_prop_set_uint16(dev, "hts", spec->hts);
+        qdev_prop_set_bit(dev, "exp-rows", spec->exp_rows);
     } else if (!strcmp(spec->type, OV2735)) {
         qdev_prop_set_uint8(dev, "rev", spec->id);
     }

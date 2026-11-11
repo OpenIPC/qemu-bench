@@ -10,7 +10,8 @@
 #    0 s   the room as it is, AE and AWB settle from boot
 #   20 s   the light drops to a quarter: AE must open up 4x
 #   35 s   back to full
-#   50 s   a warmer light (R 0.82 / B 0.52 of G): AWB moves its gains
+#   50 s   a warmer light (R 0.82 / B 0.52 of G; on cv6xx, whose SC4336P
+#          starts at R 0.625 / B 0.565, R 0.70 / B 0.52): AWB moves its gains
 #   65 s   end
 #
 # (seconds of the scene's clock, from VI's first frame).  QEMU is stopped
@@ -56,8 +57,18 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+REL=$SOC
+LIGHT=()
+WARM="light-r=820 light-b=520"
 case $SOC in
 gk*) ALLOC=gk; SENSOR=${SENSOR:-sc2335} ;;
+hi3516cv6*)
+    # one release for cv608 / cv610 / cv613, and an SC4336P: its AWB
+    # stays inside its calibrated range, so the room is lit at its grey
+    # (R 0.625 / B 0.565) and turns warmer along its colour line
+    ALLOC=hisi; SENSOR=${SENSOR:-sc4336p}; REL=hi3516cv6xx
+    LIGHT=(-global hisi-scene.light-r=625 -global hisi-scene.light-b=565)
+    WARM="light-r=700 light-b=520" ;;
 *) ALLOC=hisi; SENSOR=${SENSOR:-sc2315e} ;;
 esac
 if [ "$LATE" != 0 ]; then
@@ -70,25 +81,25 @@ WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
 
-if [ ! -f "$WORK/uImage.$SOC" ]; then
-    bash "$HERE/fetch-openipc-lite.sh" "$SOC" "$WORK"
+if [ ! -f "$WORK/uImage.$REL" ]; then
+    bash "$HERE/fetch-openipc-lite.sh" "$REL" "$WORK"
 fi
 if [ -z "$TIMELINE" ]; then
     TIMELINE=$WORK/timeline
-    cat > "$TIMELINE" <<'EOF'
+    cat > "$TIMELINE" <<EOF
 # the light drops to a quarter, comes back, then turns warmer
 20 light=150
 35 light=600
-50 light-r=820 light-b=520
+50 $WARM
 EOF
 fi
 RECORD=$WORK/record.csv
 rm -f "$RECORD"
 
 "$QEMU" -M "$SOC,sensor=$SENSOR" \
-    -kernel "$WORK/uImage.$SOC" -initrd "$WORK/rootfs.squashfs.$SOC" \
+    -kernel "$WORK/uImage.$REL" -initrd "$WORK/rootfs.squashfs.$REL" \
     -append "console=ttyAMA0,115200 mem=32M mmz_allocator=$ALLOC root=/dev/ram0 rootfstype=squashfs" \
-    -icount shift=0 -global hisi-scene.timeline="$TIMELINE" \
+    -icount shift=0 -global hisi-scene.timeline="$TIMELINE" "${LIGHT[@]}" \
     -global hisi-vi.record="$RECORD" \
     -global hisi-smartsens.late-latch="$LATE" \
     -global galaxycore-sensor.late-latch="$LATE" \

@@ -374,6 +374,7 @@ jobs:
           # local); majestic with an SC4336P is the end-to-end test
           - soc: hi3516cv610
             majestic: true
+            scenario: true
             v5: true
     steps:
       - uses: actions/checkout@v4

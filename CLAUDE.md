@@ -682,7 +682,12 @@ in this order:
   - The driver reprograms a buffer address right after reading it, so a
     frame goes to the addresses latched at its start (`stt_latch`).
   - lib_awb stays inside the sensor's calibrated range, so cv6xx scenes are
-    lit at the SC4336P's grey (light-r 625 / light-b 565).
+    lit at the SC4336P's grey (light-r 625 / light-b 565), and the
+    scenario's warm light is 700 / 520.
+  - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`
+    (2800) and `pclk` (126 MHz) make VTS 1500 30 fps. It counts exposure
+    in rows (`exp-rows`), and 0x3E06 is its digital gain's coarse step.
+    `test-hisi-scenario.sh --soc hi3516cv610` runs in CI.
   In front of it on the EV200-class machines (Goke rebrands too), `hisi-vi` (the
   frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
   start / end) and `hisi-vpss` (paints its channels, then frame start +
