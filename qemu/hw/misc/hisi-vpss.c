@@ -84,6 +84,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssState, HISI_VPSS)
 
 #define VPSS_INT_EOF        (1u << 0)
 #define VPSS_INT_START      (1u << 10)
+/*
+ * The early ("delay") interrupt, at the line in 0x4[31:16]: a group whose
+ * frame interrupt is EARLY / EARLY_END (the SDK's sample_venc) unmasks it
+ * (0xf0 = 0x7fd9, START alone 0x7ed9), and its driver then prepares the
+ * next frame there -- buffers, channel enables, REGUP -- not at START.
+ * That driver also hands the frame's channels on only at an EOF that
+ * comes on its own, without START (mod_vpss.o vpss_online_irq_proc,
+ * `(raw & 0x401) == 1`), so in that mode they are raised apart, as
+ * silicon does (vpss_phase).
+ */
+#define VPSS_INT_DELAY      (1u << 8)
+/*
+ * V5 low delay (`ot_low_delay_info`, the SDK sample's channel 1): 0x400 bit
+ * 4 + chn turns it on, 0x4b4 holds the line count (chn 0 low half), and
+ * 0x4a8 + 4 * chn the frame's tunnel word in DDR, whose u16 at +0 (luma)
+ * and +32 (chroma) count the lines written so far -- VENC follows them, and
+ * the driver checks them against the height at EOF.  The channel's tunnel
+ * interrupt (0x1000 << chn) fires at the line count; the driver counts
+ * START up and the tunnel interrupt down per channel and hands the frame
+ * on only while the count is 1 (vpss_get_tunl_int, vpss_online_irq_proc).
+ */
+#define V5_VPSS_LOWDELAY    0x0400
+#define V5_VPSS_TUNL_ADDR   0x04a8
+#define VPSS_INT_TUNL(c)    (0x1000u << (c))
+#define VPSS_LD_CHN         2
 
 #define VPSS_CHN            3
 #define PIC_MAX             4096
@@ -123,6 +148,10 @@ struct HisiVpssState {
     qemu_irq irq;
     qemu_irq running;           /* to hisi-vi: the online pipeline runs */
     QEMUTimer *timer;
+    QEMUTimer *phase_timer;     /* the frame's later interrupts */
+    unsigned phase;             /* which of them is next (VPSS_PH_*) */
+    uint32_t tunl_addr[VPSS_LD_CHN];     /* this frame's low-delay channels */
+    uint32_t tunl_h[VPSS_LD_CHN];        /* ... and their heights */
     uint32_t regs[VPSS_REG_SIZE / 4];
     uint32_t active[VPSS_REG_SIZE / 4];  /* what frames are written with */
     bool regup;                          /* REGUP written since the last */
@@ -253,11 +282,26 @@ static void vpss_load_nodes(HisiVpssState *s)
     }
 }
 
+/*
+ * A frame with low-delay channels or the early interrupt has its
+ * interrupts apart, an eighth of a frame each: START, the tunnel
+ * interrupts, the early line, EOF.
+ */
+enum { VPSS_PH_TUNL = 1, VPSS_PH_DELAY, VPSS_PH_EOF };
+
+static void vpss_next_phase(HisiVpssState *s, unsigned phase)
+{
+    s->phase = phase;
+    timer_mod(s->phase_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / 8 / MAX(s->fps, 1));
+}
+
 static void vpss_frame(void *opaque)
 {
     HisiVpssState *s = opaque;
     VpssOut out[VPSS_CHN];
     bool online = vpss_running(s);
+    bool apart = false;
     int c;
 
     if (online) {
@@ -289,10 +333,63 @@ static void vpss_frame(void *opaque)
         }
     }
     s->frame++;
-    if (online) {
-        s->raw |= VPSS_INT_START | VPSS_INT_EOF;
-        vpss_update_irq(s);
+    if (!online) {
+        return;
     }
+    for (c = 0; c < VPSS_LD_CHN; c++) {
+        s->tunl_addr[c] = 0;
+        if (s->gen == 5 && out[c].w &&
+            (s->active[V5_VPSS_LOWDELAY / 4] & (1u << (4 + c)))) {
+            s->tunl_addr[c] = s->active[V5_VPSS_TUNL_ADDR / 4 + c];
+            s->tunl_h[c] = out[c].h;
+            apart |= s->tunl_addr[c] != 0;
+        }
+    }
+    if (apart || (s->regs[VPSS_INTMASK / 4] & VPSS_INT_DELAY)) {
+        s->raw |= VPSS_INT_START;
+        vpss_next_phase(s, VPSS_PH_TUNL);
+    } else {
+        s->raw |= VPSS_INT_START | VPSS_INT_EOF;
+    }
+    vpss_update_irq(s);
+}
+
+static void vpss_phase(void *opaque)
+{
+    HisiVpssState *s = opaque;
+    int c;
+
+    if (!vpss_running(s)) {
+        return;
+    }
+    switch (s->phase) {
+    case VPSS_PH_TUNL:
+        for (c = 0; c < VPSS_LD_CHN; c++) {
+            if (s->tunl_addr[c]) {
+                uint16_t lines[2] = { cpu_to_le16(s->tunl_h[c]),
+                                      cpu_to_le16(s->tunl_h[c] / 2) };
+
+                /* the whole picture is written: every line is done */
+                dma_memory_write(&address_space_memory, s->tunl_addr[c],
+                                 &lines[0], 2, MEMTXATTRS_UNSPECIFIED);
+                dma_memory_write(&address_space_memory, s->tunl_addr[c] + 32,
+                                 &lines[1], 2, MEMTXATTRS_UNSPECIFIED);
+                s->raw |= VPSS_INT_TUNL(c);
+            }
+        }
+        vpss_next_phase(s, VPSS_PH_DELAY);
+        break;
+    case VPSS_PH_DELAY:
+        if (s->regs[VPSS_INTMASK / 4] & VPSS_INT_DELAY) {
+            s->raw |= VPSS_INT_DELAY;
+        }
+        vpss_next_phase(s, VPSS_PH_EOF);
+        break;
+    default:
+        s->raw |= VPSS_INT_EOF;
+        break;
+    }
+    vpss_update_irq(s);
 }
 
 /*
@@ -365,6 +462,7 @@ static void hisi_vpss_write(void *opaque, hwaddr offset, uint64_t val,
         qemu_set_irq(s->running, vpss_running(s));
         if (!vpss_running(s)) {
             timer_del(s->timer);
+            timer_del(s->phase_timer);
         }
         vpss_update_irq(s);
     }
@@ -387,6 +485,7 @@ static void hisi_vpss_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vpss_frame, s);
+    s->phase_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vpss_phase, s);
     qdev_init_gpio_in_named(DEVICE(obj), vpss_vi_frame, "vi-frame", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->running, "running", 1);
     object_property_add_link(obj, "scene", TYPE_HISI_SCENE,
@@ -400,6 +499,9 @@ static void hisi_vpss_reset(DeviceState *dev)
     HisiVpssState *s = HISI_VPSS(dev);
 
     timer_del(s->timer);
+    timer_del(s->phase_timer);
+    s->phase = 0;
+    memset(s->tunl_addr, 0, sizeof(s->tunl_addr));
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->active, 0, sizeof(s->active));
     s->regup = false;

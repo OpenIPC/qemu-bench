@@ -583,17 +583,40 @@ The contract, from mod_vi.o / mod_vpss.o and the open ISP driver:
 - **VPSS.** In this mode VPSS runs node lists, armed by 0x304 as on V4,
   but with its head node at 0x368 (V4: 0x2f8).
 
-`test-hisi-v5-sample-venc.sh --sdk DIR` runs the SDK's `sample_venc` in
-`VI_OFFLINE_VPSS_ONLINE`:
+`test-hisi-v5-sample-venc.sh --sdk DIR` runs the SDK's `sample_venc`
+online, or with `--offline` in `VI_OFFLINE_VPSS_ONLINE`:
 
-- VPSS -> VENC wrap is off, and a raw-frame pool replaces the wrap
-  buffer.
-- It requires a clean exit, offline statistics, AE settled between 10 %
-  and 70 % and AWB within 15 % of grey.
+- VPSS -> VENC wrap is off. A 2560 x 1440 pool at 12 bits a pixel takes
+  the wrap buffer's place. Without wrap the sample sizes no pool for
+  channel 0, and offline the pool also holds the raw frames.
+- It requires a clean exit, AE settled between 10 % and 70 %, AWB within
+  15 % of grey, and both streams (H.265 2560 x 1440, H.264 720 x 480)
+  decoding with the counter rising. With `--offline` it also requires
+  offline statistics.
 - AE converges on the offline statistics to the online result (72 rows,
-  G at 33 %), and the stream decodes with the counter rising.
-- Online, this sample gets no stream: its VPSS channels are set up in a
-  way the model does not follow (#263). Majestic is the online test.
+  G at 33 %).
+- **The early interrupt.** The sample sets its VPSS group's frame
+  interrupt to `EARLY_END`, which majestic does not use. The driver then
+  unmasks VPSS's delay interrupt (bit 8; INTMASK 0x7fd9 instead of
+  0x7ed9), whose line is in 0x4[31:16]. It prepares the next frame there
+  (buffers, scaler coefficient addresses 0x4e8-0x4f4, REGUP 7), not at
+  START. It hands a frame's channels to VENC only on an EOF that comes
+  without START (`vpss_online_irq_proc`).
+- **Low delay.** Channel 1 (720 x 480, the H.264 stream) is a low-delay
+  channel:
+  - 0x400 bit 4 + chn enables it, and 0x4b4 holds its line count (200).
+  - 0x4a8 + 4 x chn points at the frame's tunnel word in DDR. VPSS keeps
+    the lines written in its u16 at +0 (luma) and +32 (chroma), and the
+    driver checks them against the height at EOF.
+  - The channel's tunnel interrupt is 0x1000 << chn. The driver counts
+    START up and the tunnel interrupt down per channel, and sends the
+    frame only while the count is 1 (`vpss_get_tunl_int`). Without the
+    tunnel interrupt the count runs past 1 after the first frame, and
+    the H.264 channel gets a single frame.
+- **Timing.** A frame with either feature has its interrupts an eighth
+  of a frame apart: START, the tunnel interrupts (with the lines
+  written), the early line, then EOF. Otherwise START and EOF stay
+  together, as majestic expects (#263).
 - Under a warm light (R 0.70 / B 0.52) AWB moves to R 0x171 / B 0x1e5,
   the same gains as online.
 
