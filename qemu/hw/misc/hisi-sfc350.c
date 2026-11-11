@@ -200,12 +200,13 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
     /* A status read longer than one byte gets the register again and again,
      * as from the chip; U-Boot's "Enable QE" reads SR2 two bytes long. */
     case SPI_CMD_RDSR:
-        s->cmd_databuf[0] = s->sr * 0x01010101u;
+    case SPI_CMD_RDSR2: {
+        uint32_t rep = (opcode == SPI_CMD_RDSR ? s->sr : s->sr2) * 0x01010101u;
+        for (uint32_t i = 0; i < DIV_ROUND_UP(data_cnt, 4); i++) {
+            s->cmd_databuf[i] = rep;
+        }
         break;
-
-    case SPI_CMD_RDSR2:
-        s->cmd_databuf[0] = s->sr2 * 0x01010101u;
-        break;
+    }
 
     case SPI_CMD_WREN:
         s->sr |= SPI_SR_WEL;
@@ -517,12 +518,25 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
                        s->flash_file);
             return;
         }
+        /* The window maps at most 32 MiB, so a bigger part could not be
+         * read through it; refuse rather than show a chip half of which is
+         * out of reach. */
+        if (st.st_size > MEM_WINDOW_SIZE) {
+            error_setg(errp, "hisi-sfc350: flash file '%s' is %lld bytes, "
+                       "more than the %u the controller maps",
+                       s->flash_file, (long long)st.st_size,
+                       MEM_WINDOW_SIZE);
+            return;
+        }
         uint32_t file_size = (uint32_t)st.st_size;
+        /* A part is a power of two in size: an odd-sized dump (a backup with
+         * a trailer) gets the chip that holds it, the rest erased, so what
+         * RDID says and what can be read are the same size. */
         if (file_size > s->flash_size) {
             g_free(s->flash);
-            s->flash_size = file_size;
-            s->flash = g_malloc(file_size);
-            memset(s->flash, 0xFF, file_size);
+            s->flash_size = pow2ceil(file_size);
+            s->flash = g_malloc(s->flash_size);
+            memset(s->flash, 0xFF, s->flash_size);
         }
         FILE *f = fopen(s->flash_file, "rb");
         if (!f) {
