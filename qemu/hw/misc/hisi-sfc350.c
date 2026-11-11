@@ -17,6 +17,7 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
+#include "qemu/host-utils.h"
 #include "system/dma.h"
 #include <sys/stat.h>
 
@@ -70,6 +71,7 @@
 #define SPI_CMD_RDSR            0x05
 #define SPI_CMD_RDSR2           0x35
 #define SPI_CMD_WRSR            0x01
+#define SPI_CMD_WRSR2           0x31
 #define SPI_CMD_RDID            0x9F
 #define SPI_CMD_READ            0x03
 #define SPI_CMD_FAST_READ       0x0B
@@ -85,11 +87,12 @@
 
 /* SPI status register bits */
 #define SPI_SR_WEL              BIT(1)
+#define SPI_SR2_QE              BIT(1)
 
-/* Flash: Winbond W25Q64 (8 MiB) */
+/* Flash: Winbond W25Q64 (8 MiB) unless a larger flash-file picks the
+ * W25Q128/256 of its size (capacity byte = log2 of the size in bytes). */
 #define NOR_JEDEC_MFR           0xEF
 #define NOR_JEDEC_TYPE          0x40
-#define NOR_JEDEC_CAP           0x17
 #define NOR_FLASH_SIZE          (8 * 1024 * 1024)
 #define NOR_SECTOR_SIZE         (64 * 1024)
 #define NOR_PAGE_SIZE           256
@@ -140,6 +143,8 @@ struct HisiSfc350State {
 
     /* SPI flash state */
     uint8_t  sr;
+    uint8_t  sr2;
+    uint8_t  jedec_cap;
     uint8_t *flash;
     uint32_t flash_size;
 };
@@ -184,7 +189,7 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         uint32_t cs = (s->cmd_config >> CMD_CONFIG_SEL_CS_SHIFT) & 1;
         if (cs == 0) {
             s->cmd_databuf[0] = NOR_JEDEC_MFR | (NOR_JEDEC_TYPE << 8) |
-                                (NOR_JEDEC_CAP << 16);
+                                (s->jedec_cap << 16);
         } else {
             s->cmd_databuf[0] = 0;
         }
@@ -192,12 +197,14 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         break;
     }
 
+    /* A status read longer than one byte gets the register again and again,
+     * as from the chip; U-Boot's "Enable QE" reads SR2 two bytes long. */
     case SPI_CMD_RDSR:
-        s->cmd_databuf[0] = s->sr;
+        s->cmd_databuf[0] = s->sr * 0x01010101u;
         break;
 
     case SPI_CMD_RDSR2:
-        s->cmd_databuf[0] = 0;
+        s->cmd_databuf[0] = s->sr2 * 0x01010101u;
         break;
 
     case SPI_CMD_WREN:
@@ -209,7 +216,18 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         break;
 
     case SPI_CMD_WRSR:
-        /* Accept write but only clear WEL */
+        /* SR1 is not kept (no protection modelled); a second data byte is
+         * SR2, whose QE bit U-Boot sets and reads back ("Enable QE"). */
+        if ((s->sr & SPI_SR_WEL) && data_en && !rw_read && data_cnt >= 2) {
+            s->sr2 = (s->cmd_databuf[0] >> 8) & SPI_SR2_QE;
+        }
+        s->sr &= ~SPI_SR_WEL;
+        break;
+
+    case SPI_CMD_WRSR2:
+        if ((s->sr & SPI_SR_WEL) && data_en && !rw_read) {
+            s->sr2 = s->cmd_databuf[0] & SPI_SR2_QE;
+        }
         s->sr &= ~SPI_SR_WEL;
         break;
 
@@ -482,6 +500,7 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
     HisiSfc350State *s = HISI_SFC350(dev);
 
     s->flash_size = NOR_FLASH_SIZE;
+    s->jedec_cap = 0x17;
     s->flash = g_malloc(s->flash_size);
     memset(s->flash, 0xFF, s->flash_size);
 
@@ -521,6 +540,14 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
         }
         qemu_log("hisi-sfc350: loaded %u bytes from '%s'\n",
                  file_size, s->flash_file);
+
+        /* Answer RDID and BUS_FLASH_SIZE as the part of that size would: a
+         * 16 MiB image read as a W25Q64 gave the kernel an 8 MiB MTD, so
+         * an "-(rootfs_data)" tail partition came out wrong. */
+        if (s->flash_size > NOR_FLASH_SIZE) {
+            s->jedec_cap = 31 - clz32(s->flash_size);
+            s->bus_flash_size = 0x00;        /* 16 MiB, the field's largest */
+        }
     }
 }
 
