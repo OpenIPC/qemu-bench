@@ -125,6 +125,11 @@ jobs:
       - name: HiSilicon V5 VI + VPSS online (hisi-vi / hisi-vpss gen 5)
         run: python3 qemu/tests/test-hisi-vpss.py --gen 5
 
+      # V5 statistics: the moved buffer pointers, 32 x 32 AE zones, each
+      # frame written to the addresses latched at its start
+      - name: HiSilicon V5 ISP statistics (hisi-vi gen 5)
+        run: python3 qemu/tests/test-hisi-isp.py --gen 5
+
       # The ISP statistics hisi-vi writes (front-end and backend AE
       # histograms, AE / AWB zones, globals) in the driver's STT layouts,
       # and the front-end interrupt the ISP's per-frame work runs from.

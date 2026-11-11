@@ -719,8 +719,9 @@ Goke rebrands. V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
 ²: V5 (`gen=5`): majestic streams from an SC4336P through VI online,
-VPSS and VEDU (`test-hisi-majestic.sh --soc hi3516cv610`). The ISP's V5
-statistics are not modelled yet.
+VPSS and VEDU, and its AE and AWB converge on the ISP statistics
+`hisi-vi` writes in the V5 layout (`test-hisi-majestic.sh --soc
+hi3516cv610`).
 
 ## Project Structure
 

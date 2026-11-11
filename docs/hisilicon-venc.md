@@ -499,9 +499,42 @@ Two pieces of the machine outside the media blocks matter:
 
 The machines' default sensor is the SC4336P, load_hisilicon's.
 `test-hisi-majestic.sh --soc hi3516cv610` boots the hi3516cv6xx release:
-majestic streams 2560x1440 H.265, and the frame counter rises. The ISP's
-statistics (the V5 STT layout) are not written yet, so the script checks
-the stream only.
+majestic streams 2560x1440 H.265, and the frame counter rises.
+
+### V5 ISP statistics
+
+The V5 ISP kernel driver ships as source in the SDK (`mpp/cbb/isp/kernel`,
+headers in `user/firmware/arch/hi3516cv610/include`). Against V4:
+
+- **Unchanged:** the front end's histogram pointer (VICAP channel +0x208),
+  the backend's zone, global, AWB and WB-gain registers (VIPROC
+  0x22010-0x2214c, 0x21210 / 0x21214) and every word's packing.
+- **Moved:** the backend's online buffer pointers, now at VIPROC 0x560 (AE
+  histogram), 0x564 / 0x568 (AE zones, R:Gr / Gb:B) and 0x56c (AWB zones).
+- **Larger:** the AE grid reaches 32 x 32 (6-bit fields at 0x22010).
+- **Unused:** the FE's zone averages are compiled out.
+- **The ISP's frame:** it is the write channel's frame start (VICAP
+  channel 0xf0 bit 0); `isp_irq_route` reads both blocks' statistics
+  then.
+- **Latched addresses:** the driver reads one buffer of the ping-pong at
+  a frame start, then programs that same address. The engine must
+  therefore write each frame to the addresses latched at the frame's
+  start (`stt_latch` in `hisi-vi`). Writing to the registers' current
+  values gives the driver a frame-old buffer every time. The per-frame
+  switch is on in V5's driver: #252's stale-buffer bug is V4-only.
+- **AWB's count gate:** lib_awb holds its gains unless the global count
+  (0x2214c) reaches 1024, as on V4.
+- **AWB's calibrated range:** lib_awb keeps the gains inside the
+  sensor's calibrated range. The SC4336P's static gains (409 / 452 at
+  5000 K) put its grey at R 0.625 / B 0.565 of G, and under hisi-scene's
+  default light (R 0.55 / B 0.7, the SC2315E's) it barely moves. The
+  majestic test therefore lights cv6xx scenes at the SC4336P's grey.
+  Along the colour-temperature line it follows the light: under R 0.70 /
+  B 0.52 it settles at +1 % / -2 % of G.
+
+`test-hisi-isp.py --gen 5` checks the layout and the latching. On
+cv610, `test-hisi-majestic.sh` passes with AE settling the scene at 34 %
+of full scale and AWB at 0 % / 0 % off grey.
 
 ## Not yet
 
@@ -510,5 +543,6 @@ the stream only.
   picture and has no B frames.
 - **Other generations:** V1 (CV100), CV300 and AV100 have their own
   encoder layouts and are still register stubs.
-- **V5 ISP statistics:** the cv6xx pipeline streams, but AE / AWB have
-  nothing to measure yet (the V5 STT layout).
+- **V5 offline statistics:** a V5 pipe that runs offline (a sensor too
+  wide for online) writes no statistics: its buffer carries a 0x100-byte
+  header of globals (`isp_be_offline_stat`).
