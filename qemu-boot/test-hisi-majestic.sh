@@ -27,8 +27,10 @@
 # slow host lets frames overtake the driver and the counter can repeat).
 #
 # V5 (--soc hi3516cv610 / cv608 / cv613) boots the hi3516cv6xx release
-# with an SC4336P, load_hisilicon's default; the ISP's statistics are not
-# modelled there yet, so only the stream is checked.
+# with an SC4336P, load_hisilicon's default.  Its AWB keeps the gains
+# within the sensor's calibrated range (sc4336p_cmos.h: 409 / 452 at
+# 5000 K), so the scene is lit at that grey (R 0.625 / B 0.565 of G)
+# rather than hisi-scene's default, which is the SC2315E's.
 #
 #   test-hisi-majestic.sh [--soc hi3516ev200|hi3516ev300|gk7205v200|hi3516cv610|...]
 #                         [--sensor NAME] [--qemu Q] [--work DIR]
@@ -57,10 +59,12 @@ while [ $# -gt 0 ]; do
 done
 REL=$SOC
 ISP=1
+LIGHT=()
 case $SOC in
 gk*) ALLOC=gk; SENSOR=${SENSOR:-sc2335} ;;
 hi3516cv6*)     # one release for cv608 / cv610 / cv613
-    ALLOC=hisi; SENSOR=${SENSOR:-sc4336p}; REL=hi3516cv6xx; ISP=0 ;;
+    ALLOC=hisi; SENSOR=${SENSOR:-sc4336p}; REL=hi3516cv6xx
+    LIGHT=(-global hisi-scene.light-r=625 -global hisi-scene.light-b=565) ;;
 *) ALLOC=hisi; SENSOR=${SENSOR:-sc2315e} ;;
 esac
 WORK=${WORK:-$(mktemp -d)}
@@ -78,7 +82,7 @@ mkdir -p "$DUMP"
 timeout "$TIMEOUT" "$QEMU" -M "$SOC,sensor=$SENSOR" \
     -kernel "$WORK/uImage.$REL" -initrd "$WORK/rootfs.squashfs.$REL" \
     -append "console=ttyAMA0,115200 mem=32M mmz_allocator=$ALLOC root=/dev/ram0 rootfstype=squashfs" \
-    -icount shift=0 -global hisi-vedu.dump-dir="$DUMP" \
+    -icount shift=0 -global hisi-vedu.dump-dir="$DUMP" "${LIGHT[@]}" \
     -global hisi-vi.stats-trace=on \
     -nographic -serial mon:stdio -nic user,restrict=on -no-reboot \
     > "$WORK/console.log" 2>&1 || true

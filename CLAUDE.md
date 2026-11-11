@@ -677,6 +677,12 @@ in this order:
     delay (`hisi-crg` `rst-ack`).
   - The 5.10 i2c-bsp repeats write programs with JMP2 (0x19, LOOP2 / DST2
     at 0xb8 / 0xbc).
+  - ISP statistics: the BE buffer pointers moved to VIPROC 0x560-0x56c;
+    the rest of the layout is V4's, with AE zones up to 32 x 32.
+  - The driver reprograms a buffer address right after reading it, so a
+    frame goes to the addresses latched at its start (`stt_latch`).
+  - lib_awb stays inside the sensor's calibrated range, so cv6xx scenes are
+    lit at the SC4336P's grey (light-r 625 / light-b 565).
   In front of it on the EV200-class machines (Goke rebrands too), `hisi-vi` (the
   frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
   start / end) and `hisi-vpss` (paints its channels, then frame start +

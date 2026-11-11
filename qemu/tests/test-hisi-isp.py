@@ -13,7 +13,12 @@ the machine runs (QMP qom-set /machine/scene ...).
 Offline, the pipe's strips each write a block at the address in their
 VIPROC register image (VI_HAL_SetIspSttAddr, 0x5d0).
 
-    python3 qemu/tests/test-hisi-isp.py [--qemu PATH] [--machine M]
+--gen 5 checks the V5 (Hi3516CV610) layout: the backend's buffer pointers
+at VIPROC 0x560-0x56c, 32 x 32 AE zones, and each frame written to the
+addresses latched at its start (the driver reprograms them for the frame
+after next as soon as it has read a buffer).
+
+    python3 qemu/tests/test-hisi-isp.py [--qemu PATH] [--machine M] [--gen 4|5]
 """
 import argparse
 import json
@@ -37,11 +42,86 @@ R, G, B = int(WHITE * 0.55), int(WHITE), int(WHITE * 0.7)
 SAMPLES = (1920 // 4) * (1080 // 4)         # every 4th row and column
 
 
+def gen5(qemu, machine, check):
+    """V5: online statistics through the latched addresses."""
+    CAP, PROC, VP = 0x17400000, 0x17800000, 0x17900000
+    A, B_ = 0x42940000, 0x42960000                  # the driver's ping-pong
+    FE_A, FE_B = 0x42900000, 0x42901000
+    q = QTest(qemu, machine)
+
+    def words(addr, n):
+        return struct.unpack('<%dI' % n, q.read(addr, n * 4))
+
+    def program(be, fe):
+        for i, off in enumerate((0x560, 0x564, 0x568, 0x56c)):
+            q.writel(PROC + off, be + (0, 0x1000, 0x2000, 0x3000)[i])
+        q.writel(CAP + 0x10208, fe)
+
+    for addr in (A, B_):
+        q.write(addr, b'\0' * 0x5000)
+    q.write(FE_A, b'\0' * 0x400)
+    q.write(FE_B, b'\0' * 0x400)
+    program(A, FE_A)
+    q.writel(PROC + 0x22010, 0x2020)                # AE zones 32 x 32
+    q.writel(PROC + 0x22110, 0x2020)                # AWB zones 32 x 32
+    q.writel(CAP + 0x10000, 1 << 31)                # write channel on
+    q.writel(VP + 0xf0, 0x7ed9)                     # VPSS online
+    q.writel(VP + 0x000, 1 << 31)
+    q.cmd('clock_step %d' % FRAME_NS)               # first start: A latches
+    program(B_, FE_B)                               # ...the driver moves on
+    q.cmd('clock_step %d' % FRAME_NS)               # the frame ends into A
+
+    hist = words(A, 1024)
+    check(sum(hist) == SAMPLES * 4 and not any(words(B_, 1024)),
+          'BE histogram in the latched buffer (%d samples), none in the '
+          'reprogrammed one' % sum(hist))
+    fe = words(FE_A, 256)
+    check(sum(fe) == SAMPLES * 4 and not any(words(FE_B, 256)),
+          'FE histogram in the latched buffer (%d samples)' % sum(fe))
+    rgr, gbb = words(A + 0x1000, 1024), words(A + 0x2000, 1024)
+    check(all(rgr) and all(gbb) and
+          (rgr[0] >> 16) * 100 // (rgr[0] & 0xffff) in range(50, 60) and
+          (gbb[0] & 0xffff) * 100 // (gbb[0] >> 16) in range(65, 75),
+          'AE: 32 x 32 zones, R:Gr and Gb:B (zone 0 0x%08x 0x%08x)'
+          % (rgr[0], gbb[0]))
+    awb = words(A + 0x3000, 2048)
+    check(all(awb[1::2]) and awb[1] >> 16 >= 64,
+          'AWB: 32 x 32 zones, count %d' % (awb[1] >> 16))
+    total, count = q.readl(PROC + 0x22018), q.readl(PROC + 0x2201c)
+    cnt = q.readl(PROC + 0x2214c)
+    check(total and count and cnt >= 1024,
+          'BE globals: AE total %d, AWB count %d (lib_awb wants >= 1024)'
+          % (total, cnt))
+    q.cmd('clock_step %d' % FRAME_NS)               # next ends into B_
+    check(sum(words(B_, 1024)) == SAMPLES * 4,
+          'the next frame goes to the buffer latched at its start')
+
+    # stopped, its buffers moved (C), restarted: the first frame of the new
+    # run goes to C, not to what the old run had latched
+    C_ = 0x42980000
+    q.write(C_, b'\0' * 0x1000)
+    q.writel(CAP + 0x10000, 0)
+    q.writel(VP + 0x000, 0)
+    q.cmd('clock_step %d' % FRAME_NS)
+    for addr in (A, B_):
+        q.write(addr, b'\0' * 0x1000)
+    program(C_, FE_A)
+    q.writel(CAP + 0x10000, 1 << 31)
+    q.writel(VP + 0x000, 1 << 31)
+    q.cmd('clock_step %d' % FRAME_NS)
+    check(sum(words(C_, 1024)) == SAMPLES * 4 and not any(words(A, 1024))
+          and not any(words(B_, 1024)),
+          'restarted: the first frame goes to the buffer programmed for the '
+          'new run')
+    q.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=os.path.join(os.path.dirname(__file__),
                     '..', '..', 'qemu-src', 'build', 'qemu-system-arm'))
-    ap.add_argument('--machine', default='hi3516ev200,sensor=none')
+    ap.add_argument('--machine')
+    ap.add_argument('--gen', type=int, default=4, choices=(4, 5))
     a = ap.parse_args()
     fails = 0
 
@@ -49,6 +129,12 @@ def main():
         nonlocal fails
         print(('ok   ' if ok else 'FAIL ') + what)
         fails += not ok
+
+    if a.gen == 5:
+        gen5(a.qemu, a.machine or 'hi3516cv610,sensor=none', check)
+        print('%d failure(s)' % fails)
+        return 1 if fails else 0
+    a.machine = a.machine or 'hi3516ev200,sensor=none'
 
     def words(addr, n):
         return struct.unpack('<%dI' % n, q.read(addr, n * 4))

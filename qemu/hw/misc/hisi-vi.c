@@ -153,6 +153,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define V5_PROC_INT_MASK    0x00f0
 #define V5_PROC_INT_STAT    0x0314
 #define V5_PROC_INT_END     (1u << 0)
+/*
+ * V5's ISP statistics (the open isp_viproc_reg_define.h, isp_stt_define.h,
+ * isp_drv_statistics.c).  The backend's online buffer pointers moved to
+ * VIPROC 0x560 (AE histogram), 0x564 / 0x568 (AE zones R:Gr, Gb:B), 0x56c
+ * (AWB zones); the front end's histogram pointer, the backend's zone,
+ * global and WB gain registers and every word's packing are V4's.  The
+ * AE grid reaches 32 x 32 (6-bit fields at BE 0x2010).  The driver reads
+ * a buffer at frame start and then programs that same address for the
+ * frame after next, so the engine writes each frame to the addresses
+ * latched at its start, not to the registers' current values.
+ */
+#define V5_STT_AE_HIST      0x0560
+#define V5_STT_AE_RGR       0x0564
+#define V5_STT_AE_GBB       0x0568
+#define V5_STT_AWB          0x056c
 
 #define PROC_START          0x0300  /* offline: 1 / 3 starts the node list */
 #define PROC_INT            0x0310
@@ -186,7 +201,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViState, HISI_VI)
 #define FE_AE_AVER          0x22820
 #define FE_AE_BINS          256
 #define AE_BINS             1024
-#define AE_ZONES_MAX        (17 * 15)
+#define AE_ZONES_MAX        (32 * 32)   /* V4: 17 x 15 */
 #define AWB_ZONES_MAX       (32 * 32)
 
 /* what a frame's statistics and record are made from */
@@ -231,6 +246,10 @@ struct HisiViState {
     uint32_t stat_frames;
     uint8_t gen;                /* 4: Hi3516EV200 family, 5: Hi3516CV610 */
     uint32_t cap_size;
+    /* gen 5: the statistics addresses the frame in progress started with
+     * (AE histogram, R:Gr, Gb:B, AWB; the FE histogram) */
+    uint32_t stt_latch[4], fe_latch;
+    bool stt_latched;           /* false until a run's first frame start */
 };
 
 /* the capture status: pipe 0's bit stands while its write channel has
@@ -594,10 +613,40 @@ static void scene_ae_global(HisiViState *s, uint32_t *regs, int x0, int x1)
     }
 }
 
-static void ae_grid(uint32_t zone, int *nx, int *ny)
+static void ae_grid(HisiViState *s, uint32_t zone, int *nx, int *ny)
 {
+    if (s->gen == 5) {
+        *nx = MAX(MIN(zone & 0x3f, 32), 1);
+        *ny = MAX(MIN((zone >> 8) & 0x3f, 32), 1);
+        return;
+    }
     *nx = MAX(MIN(zone & 0x1f, 17), 1);
     *ny = MAX(MIN((zone >> 8) & 0x1f, 15), 1);
+}
+
+/*
+ * Where this frame's statistics go: V4 the registers as they stand, V5
+ * the addresses latched at the frame's start (vi_stt_latch()).
+ */
+static uint32_t be_stt(HisiViState *s, int i)
+{
+    static const uint32_t v4[4] = { STT_AE_HIST, STT_AE_RGR, STT_AE_GBB,
+                                    STT_AWB };
+
+    return s->gen == 5 ? s->stt_latch[i] : s->proc[v4[i] / 4];
+}
+
+/* gen 5, at a frame start: what the next frame's statistics will use */
+static void vi_stt_latch(HisiViState *s)
+{
+    static const uint32_t v5[4] = { V5_STT_AE_HIST, V5_STT_AE_RGR,
+                                    V5_STT_AE_GBB, V5_STT_AWB };
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        s->stt_latch[i] = s->proc[v5[i] / 4];
+    }
+    s->fe_latch = s->cap[FE_STT_AE_HIST / 4];
 }
 
 static void awb_grid(uint32_t zone, int *nx, int *ny)
@@ -613,7 +662,10 @@ static void vi_fe_stats(HisiViState *s)
     uint32_t rgr[AE_ZONES_MAX], gbb[AE_ZONES_MAX];
     int nx, ny;
 
-    if (p[FE_STT_AE_HIST / 4]) {
+    const uint32_t fe_hist = s->gen == 5 ? s->fe_latch
+                                         : p[FE_STT_AE_HIST / 4];
+
+    if (fe_hist) {
         uint32_t hist[FE_AE_BINS] = { 0 };
         int b;
 
@@ -621,9 +673,9 @@ static void vi_fe_stats(HisiViState *s)
         for (b = 0; b < FE_AE_BINS; b++) {
             hist[b] = cpu_to_le32(hist[b]);
         }
-        stt_write(p[FE_STT_AE_HIST / 4], hist, sizeof(hist));
+        stt_write(fe_hist, hist, sizeof(hist));
     }
-    ae_grid(p[FE_AE_ZONE / 4], &nx, &ny);
+    ae_grid(s, p[FE_AE_ZONE / 4], &nx, &ny);
     scene_ae_zones(s, nx, ny, 0, nx, rgr, gbb);
     if (p[FE_STT_AE_RGR / 4]) {
         stt_write(p[FE_STT_AE_RGR / 4], rgr, nx * ny * 4);
@@ -645,7 +697,7 @@ static void vi_be_stats(HisiViState *s)
         return;                     /* no frame captured yet */
     }
 
-    if (p[STT_AE_HIST / 4]) {
+    if (be_stt(s, 0)) {
         uint32_t hist[AE_BINS] = { 0 };
         int b;
 
@@ -653,23 +705,23 @@ static void vi_be_stats(HisiViState *s)
         for (b = 0; b < AE_BINS; b++) {
             hist[b] = cpu_to_le32(hist[b]);
         }
-        stt_write(p[STT_AE_HIST / 4], hist, sizeof(hist));
+        stt_write(be_stt(s, 0), hist, sizeof(hist));
     }
-    ae_grid(p[BE_AE_ZONE / 4], &nx, &ny);
+    ae_grid(s, p[BE_AE_ZONE / 4], &nx, &ny);
     scene_ae_zones(s, nx, ny, 0, nx, rgr, gbb);
-    if (p[STT_AE_RGR / 4]) {
-        stt_write(p[STT_AE_RGR / 4], rgr, nx * ny * 4);
+    if (be_stt(s, 1)) {
+        stt_write(be_stt(s, 1), rgr, nx * ny * 4);
     }
-    if (p[STT_AE_GBB / 4]) {
-        stt_write(p[STT_AE_GBB / 4], gbb, nx * ny * 4);
+    if (be_stt(s, 2)) {
+        stt_write(be_stt(s, 2), gbb, nx * ny * 4);
     }
     scene_ae_global(s, p + BE_AE_TOTAL / 4, 0, s->gw);
     awb_grid(p[BE_AWB_ZONE / 4], &awx, &awy);
-    if (p[STT_AWB / 4]) {
+    if (be_stt(s, 3)) {
         uint32_t awb[AWB_ZONES_MAX * 2];
 
         scene_awb_zones(s, awx, awy, 0, awx, awb);
-        stt_write(p[STT_AWB / 4], awb, awx * awy * 8);
+        stt_write(be_stt(s, 3), awb, awx * awy * 8);
     }
     for (c = 0; c < 3; c++) {
         p[BE_AWB_AVG / 4 + c] = raw_mean(s, c, 0, s->gw, 0, s->gh);
@@ -733,7 +785,7 @@ static void vi_be_stats_offline(HisiViState *s)
     if (!s->raw) {
         return;                     /* the pipe ran before any capture */
     }
-    ae_grid(aez, &aex, &aey);
+    ae_grid(s, aez, &aex, &aey);
     awb_grid(awz, &awx, &awy);
     for (k = 0; k < PROC_NODE_MAX && a; k++) {
         dma_memory_read(&address_space_memory, a, node, sizeof(node),
@@ -796,7 +848,22 @@ static void vi_frame(void *opaque)
     }
     vi_scene_frame(s);
     if (s->gen == 5) {
-        /* the ISP's statistics on V5 come with its layout (not yet) */
+        /*
+         * The frame ending now goes to the addresses latched at its
+         * start; then the next one starts: its addresses latch, and the
+         * write channel's frame start is the ISP's (isp_irq_route reads
+         * the statistics there), FE's frame end its sensor sync.
+         */
+        if (!s->stt_latched) {
+            /* a run's first frame: it started with what is programmed */
+            vi_stt_latch(s);
+            s->stt_latched = true;
+        }
+        vi_fe_stats(s);
+        if (!s->offline && s->run) {
+            vi_be_stats(s);
+        }
+        vi_stt_latch(s);
         s->cap[CAP_WCH_INT(0) / 4] |= WCH_INT_FSTART | WCH_INT_FEND;
         s->cap[CAP_FE_INT(0) / 4] |= FE_INT_FSTART | V5_FE_INT_FEND;
         if (!s->offline && s->run) {
@@ -846,6 +913,9 @@ static void vi_run(void *opaque, int n, int level)
     HisiViState *s = opaque;
 
     s->run = level;
+    if (!level) {
+        s->stt_latched = false;
+    }
     if (vi_running(s) && !timer_pending(s->timer)) {
         vi_arm(s);
     }
@@ -884,6 +954,7 @@ static void vi_cap_write(void *opaque, hwaddr offset, uint64_t val,
     }
     if (offset == CAP_WCH_CTRL(0)) {
         if (!(val & (1u << 31))) {
+            s->stt_latched = false;     /* the next run latches afresh */
             /* the pipe stopped: whatever it is rebuilt as starts online */
             s->offline = false;
             timer_del(s->proc_timer);
@@ -1017,6 +1088,9 @@ static void hisi_vi_reset(DeviceState *dev)
     s->stat_frames = 0;
     memset(s->cap, 0, s->cap_size);
     memset(s->proc, 0, VI_PROC_SIZE);
+    memset(s->stt_latch, 0, sizeof(s->stt_latch));
+    s->fe_latch = 0;
+    s->stt_latched = false;
     qemu_set_irq(s->cap_irq, 0);
     qemu_set_irq(s->proc_irq, 0);
 }
