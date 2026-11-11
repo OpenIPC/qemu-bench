@@ -521,7 +521,11 @@ headers in `user/firmware/arch/hi3516cv610/include`). Against V4:
   therefore write each frame to the addresses latched at the frame's
   start (`stt_latch` in `hisi-vi`). Writing to the registers' current
   values gives the driver a frame-old buffer every time. The per-frame
-  switch is on in V5's driver: #252's stale-buffer bug is V4-only.
+  switch is on in V5's driver (`isp_drv_switch_be_online_stt_addr`). V4's
+  open `open_isp.ko` had it commented out. In #252's scenario runs on
+  hi3516ev200 / SC2315E, with the 442-row boot step held, AWB froze in 9
+  of 10 runs with the stale buffer and in 0 of 7 with fresh statistics.
+  openhisilicon#295 restored the switch.
 - **AWB's count gate:** lib_awb holds its gains unless the global count
   (0x2214c) reaches 1024, as on V4.
 - **AWB's calibrated range:** lib_awb keeps the gains inside the

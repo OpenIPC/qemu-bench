@@ -14,7 +14,10 @@ counts half rows) / "vts" in effect, "frame" and "violations".
 - an exposure beyond 2 x VTS - 4 half rows and a mode register written
   while streaming count as violations;
 - late-latch=N holds the Nth latch that changes a register back a frame,
-  on the SC2315E and on a 16-bit GalaxyCore part (GC2083).
+  on the SC2315E and on a 16-bit GalaxyCore part (GC2083);
+- on hi3516cv610 the SC4336P runs its 4M mode at 30 fps from VTS 1500 alone
+  (HTS is left at its reset value, 2800, at 126 MHz), and an exposure
+  longer than the frame (it counts whole rows) is a violation.
 
     python3 qemu/tests/test-hisi-sensor.py [--qemu PATH]
 """
@@ -54,11 +57,11 @@ def main():
 
     tmp = tempfile.mkdtemp()
 
-    def machine(sensor_name, qom_type, addr):
+    def machine(sensor_name, qom_type, addr, soc='hi3516ev200', i2c=I2C):
         """hi3516ev200 with that sensor: QTest, QMP, the sensor's QOM
         path, and its get / wr"""
         qmp_path = os.path.join(tmp, '%s.sock' % sensor_name)
-        q = QTest(a.qemu, 'hi3516ev200,sensor=%s' % sensor_name,
+        q = QTest(a.qemu, '%s,sensor=%s' % (soc, sensor_name),
                   ('-qmp', 'unix:%s,server=on,wait=off' % qmp_path))
         qmp = socket.socket(socket.AF_UNIX)
         for _ in range(50):
@@ -91,16 +94,16 @@ def main():
 
         def wr(reg, val):
             """i2c-hibvt's write: START, address, three bytes, STOP"""
-            q.writel(I2C + 0x000, 1)                # GLB: enable
-            q.writel(I2C + 0x010, addr << 1)        # DATA1
+            q.writel(i2c + 0x000, 1)                # GLB: enable
+            q.writel(i2c + 0x010, addr << 1)        # DATA1
             for b in (reg >> 8, reg & 0xFF, val):
-                q.writel(I2C + 0x020, b)            # TX FIFO
+                q.writel(i2c + 0x020, b)            # TX FIFO
             for i, c in enumerate((CMD_TX_S, CMD_TX_D1_1, CMD_TX_FIFO,
                                    CMD_TX_FIFO, CMD_TX_FIFO, CMD_TX_P,
                                    CMD_EXIT)):
-                q.writel(I2C + 0x030 + 4 * i, c)
-            q.writel(I2C + 0x0E0, 0xFFFFFFFF)       # clear status
-            q.writel(I2C + 0x0D0, 1)                # CTRL1: start
+                q.writel(i2c + 0x030 + 4 * i, c)
+            q.writel(i2c + 0x0E0, 0xFFFFFFFF)       # clear status
+            q.writel(i2c + 0x0D0, 1)                # CTRL1: start
 
         def qom_set(prop, value):
             return qmp_cmd('qom-set', path=path, property=prop, value=value)
@@ -240,6 +243,29 @@ def main():
     check(late == 0x180 and get('lines') == 0x280,
           'GC2083 late-latch: %d a frame on, %d the frame after' %
           (late, get('lines')))
+    qmp.close()
+    q.close()
+    # V5: the SC4336P on hi3516cv610 (i2c0 at 0x11060000, VI at 0x17400000)
+    q, qmp, get, wr, qom_set = machine('sc4336p', 'hisi-smartsens', SENSOR,
+                                       'hi3516cv610', 0x11060000)
+    for reg, val in ((0x320E, 0x05), (0x320F, 0xdc), (0x3E01, 0x40),
+                     (0x0100, 0x01)):           # VTS 1500, stream
+        wr(reg, val)
+    q.writel(0x17400000 + 0x10000, 1 << 31)
+    frames(2)
+    f0 = get('frame')
+    frames(30)
+    n = get('frame') - f0
+    check(abs(n - 30) <= 1 and get('vts') == 1500,
+          'SC4336P: %d frames a second at VTS %d (HTS 2800 at reset)' %
+          (n, get('vts')))
+    v0 = get('violations')
+    wr(0x3E00, 0x00)
+    wr(0x3E01, 0x5e)                            # 0x5e0 = 1504 rows
+    wr(0x3E02, 0x00)
+    frames(2)
+    check(get('violations') > v0, 'SC4336P: an exposure of %d rows in a '
+          '%d-row frame is a violation' % (get('lines'), get('vts')))
     qmp.close()
     q.close()
     print('%d failure(s)' % fails)

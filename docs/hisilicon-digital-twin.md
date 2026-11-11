@@ -296,6 +296,33 @@ Each step is one PR, landed before the next starts.
     R x1.64 / B x1.52 to x1.23 / x1.89 over about 5 s, leaving a grey
     within 2 %.
 
+## V5 (Hi3516CV610)
+
+The cv608 / cv610 / cv613 machines run the twin as V4 does, with the V5
+layouts (`media_gen = 5`; `docs/hisilicon-venc.md`, "V5").
+
+- **The scene and the ISP.** `hisi-vi` writes the statistics in V5's
+  layout. Each frame goes to the addresses latched at its start, because
+  the driver reprograms a buffer right after it reads it.
+- **The sensor.** The default is the SC4336P, load_hisilicon's.
+  - Its 4M mode leaves HTS at reset: 2800, the catalogue's `hts`. At 126
+    MHz (`pclk`) VTS 1500 is 30 fps, so VI's frame clock follows the
+    driver's VTS.
+  - It counts exposure in rows (`exp-rows`; most SmartSens parts count
+    half rows). An exposure longer than the frame is a violation.
+  - Its digital gain steps its coarse part in 0x3E06.
+- **AWB.** lib_awb keeps the gains inside the sensor's calibrated range.
+  The SC4336P's calibration puts its grey at R 0.625 / B 0.565 of G, so
+  cv6xx scenes start there, and the scenario's warm light is R 0.70 /
+  B 0.52, along its colour line. Under hisi-scene's default light, the
+  SC2315E's, its AWB barely moves.
+- **`test-hisi-scenario.sh --soc hi3516cv610`** (CI) passes.
+  - AE settles from boot in 1 s and takes the quarter light with 4x the
+    exposure (73 to 289 rows), back at its level 0.4 s after the light
+    returns.
+  - AWB ends the warm light at -0 % / -1 % of G.
+  - 1954 frames in 65 s (30.0 fps), no violations.
+
 ## Open questions
 
 - **Which camera to twin and validate first:** an EV300 or GK7205V200

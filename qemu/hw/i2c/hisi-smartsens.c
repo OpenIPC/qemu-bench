@@ -59,6 +59,8 @@ struct HisiSmartSensState {
     uint8_t  gain_fine;    /* 0x3E09 at 1x; 0: the SC2336's gain registers */
 
     uint32_t pclk;         /* pixel clock: HTS x VTS / pclk is the frame */
+    uint16_t hts;          /* 0x320C/D at reset (0: none) */
+    bool     exp_rows;     /* 0x3E00-02 counts rows, not half rows */
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -111,6 +113,9 @@ static void hisi_smartsens_reset_regs(HisiSmartSensState *s)
     s->regs[0x3107 - SS_REG_BASE] = s->id_high;
     s->regs[0x3108 - SS_REG_BASE] = s->id_low;
     s->regs[0x3109 - SS_REG_BASE] = s->disc;
+    /* the line length a mode's init table leaves at its reset value */
+    s->regs[0x320C - SS_REG_BASE] = s->hts >> 8;
+    s->regs[0x320D - SS_REG_BASE] = s->hts & 0xFF;
     memcpy(s->applied, s->regs, sizeof(s->applied));
 }
 
@@ -185,7 +190,9 @@ static uint8_t hisi_smartsens_recv(I2CSlave *i2c)
  * The exposure as the T31 SDK's sensor_sc2336 programs it (sc2336_set_expo):
  * rows in 0x3E00[3:0]:0x3E01:0x3E02[7:4], the analog gain's coarse step in
  * 0x3E09 (0x00 1x, 0x08 2x, 0x09 4x, 0x0B 8x, 0x0F 16x, 0x1F 32x) and its
- * fine part in 0x3E07, 0x80 = 1.0.
+ * fine part in 0x3E07, 0x80 = 1.0.  The SC4336P's driver (Hi3516CV610 SDK,
+ * sc4336p_cmos.c dgain_table) also steps the digital gain's coarse part
+ * in 0x3E06: 0x00, 0x01, 0x03, 0x07 for x1, x2, x4, x8.
  */
 bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
 {
@@ -206,7 +213,8 @@ bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
     case 0x1F: coarse = 32; break;
     default:   coarse = 1; break;
     }
-    e->gain = coarse * (R(0x3E07) ? R(0x3E07) : 0x80) * 8;
+    e->gain = coarse * (R(0x3E07) ? R(0x3E07) : 0x80) * 8 *
+              ((R(0x3E06) & 0xF) + 1);
 #undef R
     return true;
 }
@@ -297,11 +305,17 @@ static bool smartsens_frame_start(Object *sensor)
         return true;
     }
     IMAGE_SENSOR_GET_CLASS(sensor)->exposure(sensor, &e);
-    /* the registers count half rows (decoded before any conversion) */
     smartsens_exposure(sensor, &raw);
-    if (e.vts && raw.lines + 4 > 2 * e.vts) {
-        sensor_sync_violation(&s->sync, "exposure %u half rows beyond the "
-                              "frame (2 x VTS %u - 4)", raw.lines, e.vts);
+    if (!s->exp_rows) {
+        /* most parts count half rows (decoded before any conversion) */
+        if (e.vts && raw.lines + 4 > 2 * e.vts) {
+            sensor_sync_violation(&s->sync, "exposure %u half rows beyond "
+                                  "the frame (2 x VTS %u - 4)", raw.lines,
+                                  e.vts);
+        }
+    } else if (e.vts && raw.lines > e.vts) {
+        sensor_sync_violation(&s->sync, "exposure %u rows longer than the "
+                              "frame (VTS %u)", raw.lines, e.vts);
     }
     if (e.vts && e.height && e.vts <= e.height) {
         sensor_sync_violation(&s->sync, "frame of %u rows shorter than its "
@@ -375,6 +389,12 @@ static const Property hisi_smartsens_props[] = {
     /* the pixel clock, when the part's is known (the catalogue's): 0 for
      * none, then the ISP keeps its own frame rate */
     DEFINE_PROP_UINT32("pclk",   HisiSmartSensState, pclk,    0),
+    /* 0x320C/D's reset value, for modes whose init table leaves it: 0
+     * for none */
+    DEFINE_PROP_UINT16("hts",    HisiSmartSensState, hts,     0),
+    /* the exposure registers count whole rows (the SC4336P: its driver
+     * bounds them by VTS - 10), not half rows as most parts do */
+    DEFINE_PROP_BOOL("exp-rows", HisiSmartSensState, exp_rows, false),
 };
 
 /* What the guest programmed: the register file and the address pointer. */
