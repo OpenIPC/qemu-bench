@@ -23,15 +23,27 @@ URL=https://github.com/OpenIPC/firmware/releases/download/$REL
 TGZ=$(mktemp)
 trap 'rm -f "$TGZ"' EXIT
 
-# an asset's Last-Modified in seconds, or nothing when it is not published
+# An asset's Last-Modified in seconds, or nothing when it is not published.
+# Only a 404 means "not published": a request that failed for any other
+# reason fails the fetch.  Taking it as absent would hand the choice to the
+# other archive, and for a SoC that moved that is the frozen plain one -- a
+# network blip would boot a weeks-old image without a word.
 modified() {
-    local d
-    d=$(curl -fsIL --retry 3 "$URL/$1" 2>/dev/null |
-        tr -d '\r' | sed -n 's/^[Ll]ast-[Mm]odified: //p' | tail -1)
-    [ -n "$d" ] && date -d "$d" +%s
+    local h code d
+    h=$(mktemp)
+    code=$(curl -sIL --retry 3 -D "$h" -o /dev/null -w '%{http_code}' "$URL/$1") ||
+        code=000
+    d=$(tr -d '\r' < "$h" | sed -n 's/^[Ll]ast-[Mm]odified: //p' | tail -1)
+    rm -f "$h"
+    case $code in
+    200) if [ -n "$d" ]; then date -d "$d" +%s; else echo 0; fi ;;
+    404) ;;
+    *) echo "$URL/$1: HTTP $code, cannot tell whether it is published" >&2
+       return 1 ;;
+    esac
 }
-PLAIN=$(modified "openipc.$SOC-nor-lite.tgz" || true)
-SPLIT=$(modified "openipc.$SOC-nor-lite-split.tgz" || true)
+PLAIN=$(modified "openipc.$SOC-nor-lite.tgz") || exit 1
+SPLIT=$(modified "openipc.$SOC-nor-lite-split.tgz") || exit 1
 
 if [ -n "$PLAIN" ] && [ "${SPLIT:-0}" -le "$PLAIN" ] &&
    curl -fsL --retry 3 -o "$TGZ" "$URL/openipc.$SOC-nor-lite.tgz"; then
