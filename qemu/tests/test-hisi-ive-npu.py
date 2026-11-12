@@ -206,6 +206,72 @@ def main():
         check(q.readl(G1 + 4) & 1 == 1, 'a masked finish still shows in status')
         check(q.read(DMA_DST, W * H) == B, 'DMA: the second copy')
         q.writel(SQ + 0x14, 31)
+
+        # DMA interval copy: 2 of every 4 bytes of every 2nd row; then
+        # fields that would wrap the row (seg past it) do nothing
+        IV = IMG + 0x58000
+        q.write(IV, b'\xaa' * 0x800)
+        t = task(7, 0, W, H, [(80, 'Q', IMG), (104, 'I', W), (96, 'Q', IV),
+                              (112, 'I', W // 2), (308, 'I', 1),
+                              (336, 'I', 4), (340, 'I', 2), (344, 'I', 2)])
+        bad = task(0, 0, 4096, 2, [(80, 'Q', IMG), (104, 'I', 4096),
+                                   (96, 'Q', IV + 0x1000), (112, 'I', 4096),
+                                   (308, 'I', 1), (336, 'I', 0xfffff830),
+                                   (340, 'I', 3000), (344, 'I', 1)])
+        q.write(slot(7), t)
+        q.write(slot(0), bad)
+        q.write(IV + 0x1000, b'\xbb' * 16)
+        q.writel(SQ + 0x10, 2 << 8)
+        q.cmd('clock_step 2000000')
+        want = b''.join(bytes(A[y * W + x] for x in range(W) if x % 4 < 2)
+                        for y in range(0, H, 2))
+        got = b''.join(q.read(IV + r * (W // 2), W // 2) for r in range(H // 2))
+        check(got == want, 'DMA: interval copy (2 of 4 bytes, every 2nd row)')
+        check(q.read(IV + 0x1000, 16) == b'\xbb' * 16,
+              'DMA: a segment past the row is refused')
+        q.writel(SQ + 0x14, 31)
+
+        # CCL with more regions than the blob holds: 300 dots of areas
+        # 1..300 (on every other row, apart); the threshold goes from 1 by 7 straight to
+        # 50, the first step value leaving at most 254 (areas 50..300 are
+        # 251).  A huge step takes it to its 23-bit limit, no regions.
+        BW, BH = 304, 600
+        BIG, BIGBLOB = IMG + 0x100000, IMG + 0x140000
+        img = bytearray(BW * BH)
+        for a in range(1, 301):
+            img[2 * (a - 1) * BW:2 * (a - 1) * BW + a] = b'\xff' * a
+        for i, (step, thr, n) in enumerate(((7, 50, 251),
+                                            (0xffff, 0x10000, 0))):
+            q.write(BIG, bytes(img))
+            q.write(slot(1 + i), task(1 + i, 21, BW, BH,
+                                      [(64, 'Q', BIG), (88, 'I', BW),
+                                       (80, 'Q', BIGBLOB), (300, 'I', 0),
+                                       (304, 'I', 1), (308, 'I', step)]))
+            q.writel(SQ + 0x10, 1 << 8)
+            q.cmd('clock_step 2000000')
+            info = struct.unpack('<I', q.read(BIGBLOB, 4))[0]
+            check(info & 0x7fffff == thr and info >> 24 == n and
+                  not info & (1 << 23),
+                  'CCL: step %d -> threshold %d, %d regions (info %#x)' %
+                  (step, thr, n, info))
+            q.writel(SQ + 0x14, 31)
+
+        # More than a call's worth (512) pushed at once: all of them run
+        for i in range(NSLOT):
+            q.write(slot(i), task(i, 0, 4, 1, [(80, 'Q', IMG), (104, 'I', 4),
+                                              (96, 'Q', IV), (112, 'I', 4),
+                                              (308, 'I', 0)]))
+        start = q.readl(SQ + 0x20) & 0xffff
+        for _ in range(40):
+            q.writel(SQ + 0x10, 15 << 8)            # 600 tasks
+        q.cmd('clock_step 2000000')
+        mid = q.readl(SQ + 0x20) & 0xffff
+        q.cmd('clock_step 2000000')
+        end = q.readl(SQ + 0x20) & 0xffff
+        check(end == (start + 600) % NSLOT,
+              '600 tasks: the last id %d (from %d, %d after 512)' %
+              (end, start, mid))
+        check(q.readl(SQ + 0x18) & 0xfff == 0, 'none left queued')
     finally:
         q.close()
     print('%d failure(s)' % fails)

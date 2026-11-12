@@ -115,6 +115,7 @@ struct HisiIveNpuState {
     uint32_t cur[NPU_STREAMS];  /* the next task to run */
     uint32_t pending[NPU_STREAMS];
     uint32_t last_id[NPU_STREAMS];
+    int64_t due[NPU_STREAMS];   /* when a stream's pushed tasks run */
     uint32_t ops;               /* tasks run */
     bool trace;
 };
@@ -173,14 +174,15 @@ static void op_dma(const uint8_t *t, uint32_t w, uint32_t h)
         uint32_t rows = task_u32(t, 344), dy = 0;
         g_autofree uint8_t *out = g_malloc(w);
 
-        if (!seg || !elem || elem >= seg || !rows) {
+        /* guest fields: every segment inside the row, no wrapping */
+        if (!seg || !elem || elem >= seg || seg > w || !rows || rows > h) {
             break;
         }
         for (uint32_t y = 0; y < h; y += rows, dy++) {
             uint32_t n = 0;
 
             img_read(src + y * sstride, sstride, row, w, 1);
-            for (uint32_t x = 0; x + elem <= w; x += seg) {
+            for (uint32_t x = 0; x < w && w - x >= elem; x += seg) {
                 memcpy(out + n, row + x, elem);
                 n += elem;
             }
@@ -280,11 +282,19 @@ typedef struct {
     uint16_t left, right, top, bottom;
 } Rgn;
 
+static int cmp_desc(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
 static void op_ccl(const uint8_t *t, uint32_t w, uint32_t h)
 {
     uint32_t a = task_addr(t, 64), stride = task_u32(t, 88);
     bool c8 = task_u32(t, 300) == 1;
-    uint32_t thr = task_u32(t, 304) & 0xffff, step = task_u32(t, 308);
+    uint32_t thr = task_u32(t, 304) & 0xffff;
+    uint32_t step = task_u32(t, 308) & 0xffff;
     g_autofree uint8_t *img = g_malloc(w * h);
     g_autofree uint32_t *lab = g_malloc0(sizeof(uint32_t) * w * h);
     g_autofree uint32_t *stack = g_malloc(sizeof(uint32_t) * w * h);
@@ -333,18 +343,33 @@ static void op_ccl(const uint8_t *t, uint32_t w, uint32_t h)
         g_array_append_val(rgn, r);
     }
     n = rgn->len;
-    for (;;) {
-        for (kept = 0, i = 0; i < n; i++) {
-            kept += g_array_index(rgn, Rgn, i).area >= thr;
+    for (kept = 0, i = 0; i < n; i++) {
+        kept += g_array_index(rgn, Rgn, i).area >= thr;
+    }
+    if (kept > RGN_MAX) {
+        /*
+         * The threshold rises by step until at most 254 regions are left:
+         * straight to the first value above the 255th largest area
+         * (stepping there could take ~2^32 rescans)
+         */
+        g_autofree uint32_t *area = g_new(uint32_t, n);
+        uint64_t need, k;
+
+        for (i = 0; i < n; i++) {
+            area[i] = g_array_index(rgn, Rgn, i).area;
         }
-        if (kept <= RGN_MAX) {
-            break;
-        }
+        qsort(area, n, sizeof(*area), cmp_desc);
+        need = (uint64_t)area[RGN_MAX] + 1;
         if (!step) {
             failed = true;
-            break;
+        } else {
+            k = (need - thr + step - 1) / step;
+            thr = MIN(thr + k * step, 0x7fffff);
+            for (kept = 0, i = 0; i < n; i++) {
+                kept += area[i] >= thr;
+            }
+            failed = kept > RGN_MAX;
         }
-        thr += step;
     }
     /* the regions that remain, in order, as labels 1..kept */
     map = g_malloc0(n + 1);
@@ -480,15 +505,40 @@ static void npu_update_irq(HisiIveNpuState *s)
     }
 }
 
-/* The pushed tasks, in order along the ring; each stream's finish */
+/* Arm the timer for the earliest stream with tasks waiting */
+static void npu_schedule(HisiIveNpuState *s)
+{
+    int64_t next = INT64_MAX;
+
+    for (int sq = 0; sq < NPU_STREAMS; sq++) {
+        if (s->pending[sq]) {
+            next = MIN(next, s->due[sq]);
+        }
+    }
+    if (next == INT64_MAX) {
+        timer_del(s->timer);
+    } else {
+        timer_mod(s->timer, next);
+    }
+}
+
+/*
+ * Each stream whose time has come runs its pushed tasks, in order along
+ * the ring, up to a ring's worth per call (the rest go on 1 ms later),
+ * and reports a finish
+ */
 static void npu_run(void *opaque)
 {
     HisiIveNpuState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint8_t t[TASK_SIZE];
 
     for (int sq = 0; sq < NPU_STREAMS; sq++) {
         bool ran = false;
 
+        if (!s->pending[sq] || s->due[sq] > now) {
+            continue;
+        }
         for (int n = 0; s->pending[sq] && n < TASK_MAX; n++) {
             if (!s->cur[sq] ||
                 dma_memory_read(&address_space_memory, s->cur[sq], t,
@@ -505,7 +555,9 @@ static void npu_run(void *opaque)
         if (ran) {
             s->node[npu_group(s, sq)] |= 1u << sq;
         }
+        s->due[sq] = now + TASK_NS;
     }
+    npu_schedule(s);
     npu_update_irq(s);
 }
 
@@ -612,11 +664,11 @@ static void hisi_ive_npu_write(void *opaque, hwaddr offset, uint64_t val64,
             s->alloc &= ~(1u << sq);
         }
         if (val & 0xf00) {
-            s->pending[sq] += (val >> 8) & 0xf;
-            if (!timer_pending(s->timer)) {
-                timer_mod(s->timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TASK_NS);
+            if (!s->pending[sq]) {
+                s->due[sq] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TASK_NS;
             }
+            s->pending[sq] += (val >> 8) & 0xf;
+            npu_schedule(s);
         }
         break;
     case SQ_CLEAR:
@@ -646,6 +698,7 @@ static void hisi_ive_npu_reset(DeviceState *dev)
     memset(s->cur, 0, sizeof(s->cur));
     memset(s->pending, 0, sizeof(s->pending));
     memset(s->last_id, 0, sizeof(s->last_id));
+    memset(s->due, 0, sizeof(s->due));
     s->ops = 0;
 }
 
@@ -677,6 +730,7 @@ static const VMStateDescription vmstate_hisi_ive_npu = {
         VMSTATE_UINT32_ARRAY(cur, HisiIveNpuState, NPU_STREAMS),
         VMSTATE_UINT32_ARRAY(pending, HisiIveNpuState, NPU_STREAMS),
         VMSTATE_UINT32_ARRAY(last_id, HisiIveNpuState, NPU_STREAMS),
+        VMSTATE_INT64_ARRAY(due, HisiIveNpuState, NPU_STREAMS),
         VMSTATE_TIMER_PTR(timer, HisiIveNpuState),
         VMSTATE_END_OF_LIST()
     },
