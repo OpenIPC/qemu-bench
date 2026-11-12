@@ -62,6 +62,40 @@ def sad_ref(a, b, w, h, blk, thr, lo, hi):
     return sad, out
 
 
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def px(img, w, h, x, y):
+    """the pixel at (x, y), edges replicated"""
+    return img[clamp(y, 0, h - 1) * w + clamp(x, 0, w - 1)]
+
+
+def correlate(img, w, h, mask, kw, kh):
+    return [sum(mask[j * kw + i] * px(img, w, h, x + i - kw // 2, y + j - kh // 2)
+                for j in range(kh) for i in range(kw))
+            for y in range(h) for x in range(w)]
+
+
+def band(v, lo, hi, a, b, c):
+    r = a if v <= lo else b if v <= hi else c
+    return v if r is None else r
+
+
+def thresh_ref(src, mode, lo, hi, mn, md, mx):
+    lut = [(mn, mx, mx), (None, mx, mx), (mn, None, None), (mn, md, mx),
+           (None, md, mx), (mn, md, None), (mn, None, mx), (None, md, None)]
+    a, b, c = lut[mode]
+    top = lo if mode <= 2 else hi
+    return [band(v, lo, top, a, b, c) for v in src]
+
+
+def rnd_q16(v, ratio):
+    """v * ratio / 2^16, rounded to nearest, halves away from zero"""
+    v = v * ratio + (0x8000 if v >= 0 else -0x8000)
+    return v // 0x10000 if v >= 0 else -((-v) // 0x10000)
+
+
 def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
@@ -272,6 +306,153 @@ def main():
               '600 tasks: the last id %d (from %d, %d after 512)' %
               (end, start, mid))
         check(q.readl(SQ + 0x18) & 0xfff == 0, 'none left queued')
+
+        # --- the rest of part 2a, one task at a time on a small picture --
+        SW, SH = 16, 12
+
+        def run(op, fields, w=SW, h=SH):
+            i = (q.readl(SQ + 0x20) + 1) % NSLOT
+            q.write(slot(i), task(i, op, w, h, fields))
+            q.writel(SQ + 0x10, 1 << 8)
+            q.cmd('clock_step 2000000')
+            q.writel(SQ + 0x14, 31)
+
+        P, Q, R = IMG + 0x200000, IMG + 0x210000, IMG + 0x220000
+        LUT = IMG + 0x230000
+        a = bytes((x * 37 + y * 11 + x * y) & 0xff for y in range(SH) for x in range(SW))
+        b = bytes((x * 5 + y * 23 + 7) & 0xff for y in range(SH) for x in range(SW))
+        n = SW * SH
+        q.write(P, a)
+        q.write(Q, b)
+
+        two = [(80, 'Q', P), (88, 'Q', Q), (104, 'Q', R), (112, 'I', SW),
+               (116, 'I', SW), (124, 'I', SW)]
+        for op, name, f in ((8, 'AND', lambda x, y: x & y),
+                            (10, 'OR', lambda x, y: x | y),
+                            (19, 'XOR', lambda x, y: x ^ y)):
+            run(op, two)
+            check(list(q.read(R, n)) == [f(x, y) for x, y in zip(a, b)], name)
+        run(9, two + [(300, 'I', 1)])
+        check(list(q.read(R, n)) == [((x - y) >> 1) & 0xff for x, y in zip(a, b)],
+              'SUB: shift mode, (a - b) >> 1 as S8')
+
+        one = [(80, 'Q', P), (104, 'I', SW), (96, 'Q', R), (112, 'I', SW)]
+        for mode in range(8):
+            run(7, one + [(300, 'I', mode), (304, 'I', 60), (308, 'I', 170),
+                          (312, 'I', 1), (316, 'I', 128), (320, 'I', 250)])
+            check(list(q.read(R, n)) == thresh_ref(a, mode, 60, 170, 1, 128, 250),
+                  'THRESH: mode %d' % mode)
+
+        s16 = [clamp((v - 128) * 300, -32768, 32767) for v in a]
+        q.write(LUT, struct.pack('<%dh' % n, *s16))
+        s16t = [(80, 'Q', LUT), (104, 'I', 2 * SW), (96, 'Q', R), (112, 'I', SW)]
+        for mode in range(4):
+            mn, md, mx = (-100, 5, 100) if mode < 2 else (3, 70, 240)
+            run(13, s16t + [(300, 'I', mode), (304, 'i', -5000), (308, 'i', 9000),
+                            (312, 'i', mn), (316, 'i', md), (320, 'i', mx)])
+            want = [band(v, -5000, 9000, mn, None if mode & 1 else md, mx) for v in s16]
+            want = [clamp(v, -128, 127) & 0xff if mode < 2 else clamp(v, 0, 255)
+                    for v in want]
+            check(list(q.read(R, n)) == want, 'THRESH_S16: mode %d' % mode)
+        u16 = [v * 200 for v in a]
+        q.write(LUT, struct.pack('<%dH' % n, *u16))
+        for mode in range(2):
+            run(14, s16t + [(300, 'I', mode), (304, 'I', 9000), (308, 'I', 30000),
+                            (312, 'I', 2), (316, 'I', 90), (320, 'I', 230)])
+            want = [clamp(band(v, 9000, 30000, 2, None if mode else 90, 230), 0, 255)
+                    for v in u16]
+            check(list(q.read(R, n)) == want, 'THRESH_U16: mode %d' % mode)
+
+        # 16 to 8: num / den as the driver's rounded Q16 ratio
+        num, den, bias = 3, 700, -20
+        ratio = ((den >> 1) + (num << 16)) // den
+        for mode in range(4):
+            src = u16 if mode == 3 else s16
+            q.write(LUT, struct.pack('<%d%s' % (n, 'H' if mode == 3 else 'h'), *src))
+            run(15, s16t + [(300, 'I', mode), (304, 'i', bias), (308, 'I', ratio)])
+            r = [rnd_q16(abs(v) if mode == 1 else v, ratio) for v in src]
+            want = ([clamp(v, -128, 127) & 0xff for v in r] if mode == 0 else
+                    [clamp(v + bias, 0, 255) for v in r] if mode == 2 else
+                    [clamp(v, 0, 255) for v in r])
+            check(list(q.read(R, n)) == want, '16BIT_TO_8BIT: mode %d' % mode)
+
+        # MAP: a U8 table, then an S16 one
+        lut8 = bytes((255 - i) ^ 0x5a for i in range(256))
+        q.write(LUT, lut8)
+        run(17, [(80, 'Q', P), (88, 'Q', LUT), (104, 'Q', R), (112, 'I', SW),
+                 (124, 'I', SW), (300, 'I', 0)])
+        check(q.read(R, n) == bytes(lut8[v] for v in a), 'MAP: U8 table')
+        lut16 = [i * 129 - 16000 for i in range(256)]
+        q.write(LUT, struct.pack('<256h', *lut16))
+        run(17, [(80, 'Q', P), (88, 'Q', LUT), (104, 'Q', R), (112, 'I', SW),
+                 (124, 'I', 2 * SW), (300, 'I', 1)])
+        check(list(struct.unpack('<%dh' % n, q.read(R, 2 * n))) ==
+              [lut16[v] for v in a], 'MAP: S16 table')
+
+        # INTEG: sums (u32), squares (u64), both packed in a u64
+        isum = [sum(a[j * SW + i] for j in range(y + 1) for i in range(x + 1))
+                for y in range(SH) for x in range(SW)]
+        isq = [sum(a[j * SW + i] ** 2 for j in range(y + 1) for i in range(x + 1))
+               for y in range(SH) for x in range(SW)]
+        run(11, [(80, 'Q', P), (104, 'I', SW), (96, 'Q', R), (112, 'I', 4 * SW),
+                 (300, 'I', 1)])
+        check(list(struct.unpack('<%dI' % n, q.read(R, 4 * n))) == isum,
+              'INTEG: sums')
+        run(11, [(80, 'Q', P), (104, 'I', SW), (96, 'Q', R), (112, 'I', 8 * SW),
+                 (300, 'I', 2)])
+        check(list(struct.unpack('<%dQ' % n, q.read(R, 8 * n))) == isq,
+              'INTEG: sums of squares')
+        run(11, [(80, 'Q', P), (104, 'I', SW), (96, 'Q', R), (112, 'I', 8 * SW),
+                 (300, 'I', 0)])
+        check(list(struct.unpack('<%dQ' % n, q.read(R, 8 * n))) ==
+              [(s1 & 0xfffffff) | s2 << 28 for s1, s2 in zip(isum, isq)],
+              'INTEG: combined')
+
+        run(20, [(80, 'Q', P), (88, 'Q', Q), (104, 'Q', R), (112, 'I', SW),
+                 (116, 'I', SW)])
+        check(struct.unpack('<3Q', q.read(R, 24)) ==
+              (sum(x * y for x, y in zip(a, b)), sum(x * x for x in a),
+               sum(y * y for y in b)), 'NCC: the three sums')
+
+        # DILATE / ERODE of a binary picture, a plus-shaped 3x3 mask
+        binimg = bytes(255 if v > 150 else 0 for v in a)
+        q.write(P + 0x8000, binimg)
+        mask = [1 if (abs(k % 5 - 2) + abs(k // 5 - 2)) <= 1 else 0 for k in range(25)]
+        for op, name, f in ((5, 'DILATE', max), (6, 'ERODE', min)):
+            run(op, [(64, 'Q', P + 0x8000), (96, 'I', SW), (80, 'Q', R),
+                     (104, 'I', SW)] + [(300 + k, 'B', mask[k]) for k in range(25)])
+            want = [f(px(binimg, SW, SH, x + k % 5 - 2, y + k // 5 - 2)
+                      for k in range(25) if mask[k])
+                    for y in range(SH) for x in range(SW)]
+            check(list(q.read(R, n)) == want, name + ': plus mask')
+
+        # FILTER: a 3x3 blur, then a 5x5 sharpen, normalised by right shift
+        for kw, m, norm in ((3, [1, 2, 1, 2, 4, 2, 1, 2, 1], 4),
+                            (5, [0, 0, -1, 0, 0, 0, -1, -2, -1, 0, -1, -2, 20,
+                                 -2, -1, 0, -1, -2, -1, 0, 0, 0, -1, 0, 0], 3)):
+            run(1, [(64, 'Q', P), (104, 'I', SW), (88, 'Q', R), (116, 'I', SW),
+                    (300, 'I', 0), (304, 'I', norm), (308, 'I', kw),
+                    (312, 'I', kw)] + [(332 + k, 'b', v) for k, v in enumerate(m)])
+            want = [clamp(v >> norm, 0, 255) for v in correlate(a, SW, SH, m, kw, kw)]
+            check(list(q.read(R, n)) == want, 'FILTER: %dx%d >> %d' % (kw, kw, norm))
+
+        # SOBEL: the SDK sample's mask, both gradients
+        sm = [0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, -2, 0, 2, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 0]
+        smt = [sm[(k % 5) * 5 + k // 5] for k in range(25)]
+        run(3, [(64, 'Q', P), (96, 'I', SW), (80, 'Q', R), (88, 'Q', LUT),
+                (104, 'I', 2 * SW), (108, 'I', 2 * SW), (328, 'I', 0)] +
+            [(300 + k, 'b', v) for k, v in enumerate(sm)])
+        check(list(struct.unpack('<%dh' % n, q.read(R, 2 * n))) ==
+              correlate(a, SW, SH, sm, 5, 5), 'SOBEL: horizontal')
+        check(list(struct.unpack('<%dh' % n, q.read(LUT, 2 * n))) ==
+              correlate(a, SW, SH, smt, 5, 5), 'SOBEL: vertical (the transpose)')
+
+        for mode, name, pick in ((0, 'median', 4), (1, 'max', 8), (2, 'min', 0)):
+            run(16, one + [(300, 'I', mode)])
+            want = [sorted(px(a, SW, SH, x + k % 3 - 1, y + k // 3 - 1)
+                           for k in range(9))[pick]
+                    for y in range(SH) for x in range(SW)]
+            check(list(q.read(R, n)) == want, 'ORD_STAT: ' + name)
     finally:
         q.close()
     print('%d failure(s)' % fails)

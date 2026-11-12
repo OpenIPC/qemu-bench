@@ -278,7 +278,9 @@ between ops, so dispatch is on this code alone:
 | 10 | or | 22 | canny_hys_edge | 34 | alpha_blending |
 | 11 | integ | | | | |
 
-Modelled so far, with their fields:
+Modelled so far, with their fields. Their pixel work is in
+`hw/misc/hisi-ive-ops.c`, which V4's `hisi-ive` shares where its
+semantics are the same:
 
 | Op | Fields |
 |---|---|
@@ -287,6 +289,22 @@ Modelled so far, with their fields:
 | ccl | +64 image (labelled in place), +88 stride, +80 `ot_ive_ccblob`; 8-connected if +300 is 1, area threshold +304, step +308 |
 | add / sub | +80 / +88 sources, +104 destination, +112 / +116 / +124 strides; add's Q0.16 weights at +300 / +304, sub's mode at +300 |
 | hist | +80 source, +104 stride, +96 the 256 u32 bins |
+| and / or / xor | add's layout |
+| thresh | +80 / +104 source, +96 / +112 destination; mode +300 (8 modes), low / high +304 / +308, min / mid / max +312 / +316 / +320 |
+| thresh_s16 / _u16 | the same, a 16-bit source (stride in bytes); s16 modes 0 / 1 give S8 |
+| 16bit_to_8bit | +80 / +104 source, +96 / +112 destination; mode +300, bias +304, num / den as the driver's rounded Q16 ratio +308 |
+| map | +80 / +112 source, +88 the table (256 U8, S16 or U16), +104 / +124 destination; mode +300 |
+| integ | +80 / +104 source, +96 / +112 destination; out_ctrl +300: 1 u32 sums, 2 u64 squares, 0 both in a u64 (sum [27:0]) |
+| ncc | add's sources, +104 `ot_ive_ncc_dst_mem` (Σab, Σa², Σb²) |
+| dilate / erode | +64 / +96 source, +80 / +104 destination; the 5x5 mask as 25 bytes of 0 / 1 at +300 |
+| filter | +64 / +104 source Y, +88 / +116 destination Y (UV at +72 / +96 when +300 is set); norm +304, kernel w / h +308 / +312, the S8 mask at +332 |
+| sobel | +64 / +96 source; 5x5 S8 mask at +300, its transpose for the vertical; out_ctrl +328: both at +80 / +88 (+104 / +108), or one at +80 |
+| ord_stat_filter | +80 / +104 source, +96 / +112 destination; mode +300: median, max, min |
+
+Edges are replicated. Still to come: csc, mag_and_ang, lbp, norm_grad,
+st_box_flt_and_eigen, candidate_corner, canny_hys_edge,
+lk_optical_flow_pyr, gmm2, acc, image_dot, alpha_blending, resize. Their
+semantics need checking against the SDK's samples first (#268).
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
 `cur_area_threshold` [22:0], `label_status` [23] and `rgn_num` [31:24],
@@ -297,4 +315,5 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
 - `qemu-boot/test-hisi-v5-sample-ive.sh --sdk DIR` (local): the SDK's
-  memory test (dma, sub, hist) through `ive.ko`.
+  memory test (dma, sub, hist) and its sobel through `ive.ko`; sobel's
+  four gradient files must equal numpy's correlation of the same input.

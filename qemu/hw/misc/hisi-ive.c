@@ -18,6 +18,7 @@
 #include "hw/irq.h"
 #include "qemu/log.h"
 #include "system/dma.h"
+#include "hw/misc/hisi-ive-ops.h"
 
 #define TYPE_HISI_IVE "hisi-ive"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiIveState, HISI_IVE)
@@ -249,25 +250,15 @@ static void ive_op_sad(HisiIveState *s)
                         MEMTXATTRS_UNSPECIFIED);
     }
 
-    /* Compute SAD per 4×4 block */
-    for (uint16_t by = 0; by < bh; by++) {
-        for (uint16_t bx = 0; bx < bw; bx++) {
-            uint32_t sad = 0;
-            for (int dy = 0; dy < 4; dy++) {
-                for (int dx = 0; dx < 4; dx++) {
-                    int y = by * 4 + dy;
-                    int x = bx * 4 + dx;
-                    if (y < height && x < width) {
-                        int a = frame1[y * width + x];
-                        int b = frame2[y * width + x];
-                        sad += abs(a - b);
-                    }
-                }
-            }
-            sad_out[by * bw + bx] = (sad > 0xFFFF) ? 0xFFFF : sad;
-            thr_out[by * bw + bx] = (sad > threshold) ? max_val : min_val;
-        }
+    /* SAD per 4x4 block (hisi-ive-ops) */
+    uint32_t *sad = g_new(uint32_t, MAX(bw * bh, 1));
+
+    ive_sad(frame1, frame2, width, height, 4, sad);
+    for (uint32_t i = 0; i < bw * bh; i++) {
+        sad_out[i] = MIN(sad[i], 0xFFFF);
+        thr_out[i] = sad[i] > threshold ? max_val : min_val;
     }
+    g_free(sad);
 
     /* Write U16 SAD values */
     if (dst_sad) {
@@ -508,9 +499,7 @@ static void ive_op_sub(HisiIveState *s)
     uint8_t *f1, *f2;
     ive_read_frames(s, &f1, &f2, &w, &h);
     uint8_t *out = g_malloc(w * h);
-    for (int i = 0; i < w * h; i++) {
-        out[i] = (uint8_t)abs((int)f1[i] - (int)f2[i]);
-    }
+    ive_sub(f1, f2, out, w * h, false);
     ive_write_frame(s, out, w, h);
     g_free(f1); g_free(f2); g_free(out);
 }
@@ -524,10 +513,7 @@ static void ive_op_add(HisiIveState *s)
     uint16_t wx = wts & 0xFFFF, wy = wts >> 16;
     if (!wx && !wy) { wx = 32768; wy = 32768; } /* default 50/50 */
     uint8_t *out = g_malloc(w * h);
-    for (int i = 0; i < w * h; i++) {
-        int val = ((int)f1[i] * wx + (int)f2[i] * wy) >> 16;
-        out[i] = (val > 255) ? 255 : val;
-    }
+    ive_add(f1, f2, out, w * h, wx, wy);
     ive_write_frame(s, out, w, h);
     g_free(f1); g_free(f2); g_free(out);
 }
@@ -538,13 +524,8 @@ static void ive_op_bitwise(HisiIveState *s, int op)
     uint8_t *f1, *f2;
     ive_read_frames(s, &f1, &f2, &w, &h);
     uint8_t *out = g_malloc(w * h);
-    for (int i = 0; i < w * h; i++) {
-        switch (op) {
-        case IVE_OP_AND: out[i] = f1[i] & f2[i]; break;
-        case IVE_OP_OR:  out[i] = f1[i] | f2[i]; break;
-        case IVE_OP_XOR: out[i] = f1[i] ^ f2[i]; break;
-        }
-    }
+    ive_bitwise(op == IVE_OP_AND ? IVE_AND : op == IVE_OP_OR ? IVE_OR : IVE_XOR,
+                f1, f2, out, w * h);
     ive_write_frame(s, out, w, h);
     g_free(f1); g_free(f2); g_free(out);
 }
@@ -562,10 +543,8 @@ static void ive_op_thresh(HisiIveState *s)
     uint8_t maxv = s->regs[IVE_THRESH_MAX / 4] & 0xFF;
     if (!maxv) maxv = 255;
     uint8_t *out = g_malloc(w * h);
-    for (int i = 0; i < w * h; i++) {
-        /* Default: binary threshold */
-        out[i] = (f1[i] > thr) ? maxv : minv;
-    }
+    /* binary threshold: at or below thr min, above it max */
+    ive_thresh(f1, out, w * h, 0, thr, thr, minv, minv, maxv);
     ive_write_frame(s, out, w, h);
     g_free(f1); g_free(out);
 }
@@ -575,10 +554,8 @@ static void ive_op_hist(HisiIveState *s)
     uint16_t w, h;
     uint8_t *f1;
     ive_read_frames(s, &f1, NULL, &w, &h);
-    uint32_t hist[256] = {0};
-    for (int i = 0; i < w * h; i++) {
-        hist[f1[i]]++;
-    }
+    uint32_t hist[256];
+    ive_hist(f1, w * h, hist);
     uint32_t dst = s->regs[IVE_DST1_ADDR / 4];
     dma_memory_write(&address_space_memory, dst,
                      hist, sizeof(hist), MEMTXATTRS_UNSPECIFIED);
@@ -875,19 +852,7 @@ static void ive_op_dilate(HisiIveState *s)
     }
 
     uint8_t *out = g_malloc(w * h);
-    for (uint16_t y = 0; y < h; y++) {
-        for (uint16_t x = 0; x < w; x++) {
-            uint8_t orv = 0; /* bitwise OR accumulator */
-            for (int ky = -2; ky <= 2; ky++) {
-                for (int kx = -2; kx <= 2; kx++) {
-                    int sy = y + ky < 0 ? 0 : (y + ky >= h ? h - 1 : y + ky);
-                    int sx = x + kx < 0 ? 0 : (x + kx >= w ? w - 1 : x + kx);
-                    orv |= f1[sy * w + sx] & mask[(ky + 2) * 5 + (kx + 2)];
-                }
-            }
-            out[y * w + x] = orv;
-        }
-    }
+    ive_morph(f1, w, h, mask, true, out);
     ive_write_frame(s, out, w, h);
     g_free(f1); g_free(out);
 }
@@ -910,19 +875,7 @@ static void ive_op_erode(HisiIveState *s)
     }
 
     uint8_t *out = g_malloc(w * h);
-    for (uint16_t y = 0; y < h; y++) {
-        for (uint16_t x = 0; x < w; x++) {
-            uint8_t andv = 255; /* bitwise AND accumulator */
-            for (int ky = -2; ky <= 2; ky++) {
-                for (int kx = -2; kx <= 2; kx++) {
-                    int sy = y + ky < 0 ? 0 : (y + ky >= h ? h - 1 : y + ky);
-                    int sx = x + kx < 0 ? 0 : (x + kx >= w ? w - 1 : x + kx);
-                    andv &= f1[sy * w + sx] | (~mask[(ky + 2) * 5 + (kx + 2)] & 0xFF);
-                }
-            }
-            out[y * w + x] = andv;
-        }
-    }
+    ive_morph(f1, w, h, mask, false, out);
     ive_write_frame(s, out, w, h);
     g_free(f1); g_free(out);
 }
@@ -935,15 +888,7 @@ static void ive_op_integ(HisiIveState *s)
     uint8_t *f1;
     ive_read_frames(s, &f1, NULL, &w, &h);
     uint32_t *out = g_malloc0(w * h * sizeof(uint32_t));
-    for (uint16_t y = 0; y < h; y++) {
-        for (uint16_t x = 0; x < w; x++) {
-            uint32_t val = f1[y * w + x];
-            if (x > 0) val += out[y * w + x - 1];
-            if (y > 0) val += out[(y-1) * w + x];
-            if (x > 0 && y > 0) val -= out[(y-1) * w + x - 1];
-            out[y * w + x] = val;
-        }
-    }
+    ive_integ(f1, w, h, out, NULL);
     uint32_t dst = s->regs[IVE_DST1_ADDR / 4];
     dma_memory_write(&address_space_memory, dst,
                      out, w * h * sizeof(uint32_t), MEMTXATTRS_UNSPECIFIED);
@@ -974,14 +919,9 @@ static void ive_op_ncc(HisiIveState *s)
     uint8_t *f1, *f2;
     ive_read_frames(s, &f1, &f2, &w, &h);
     /* NCC: sum(a*b) / sqrt(sum(a*a) * sum(b*b)) scaled to Q1.15 */
-    int64_t sum_ab = 0, sum_aa = 0, sum_bb = 0;
-    for (int i = 0; i < w * h; i++) {
-        sum_ab += (int64_t)f1[i] * f2[i];
-        sum_aa += (int64_t)f1[i] * f1[i];
-        sum_bb += (int64_t)f2[i] * f2[i];
-    }
     /* Write 3 u64 values: sum_ab, sum_aa, sum_bb to dst */
-    uint64_t result[3] = { sum_ab, sum_aa, sum_bb };
+    uint64_t result[3];
+    ive_ncc(f1, f2, w * h, result);
     uint32_t dst = s->regs[IVE_DST1_ADDR / 4];
     dma_memory_write(&address_space_memory, dst,
                      result, sizeof(result), MEMTXATTRS_UNSPECIFIED);
