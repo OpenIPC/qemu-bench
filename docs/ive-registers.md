@@ -309,6 +309,7 @@ semantics are the same:
 | alpha_blending | +80 / +88 / +96 the sources and the alpha, +112 destination, strides +120 / +124 / +128 / +136 |
 | resize | the only op with no fields in the task: see below |
 | canny_hys_edge | +64 the magnitude (U16, byte stride +96) with the octant angle right after it, +80 the edge picture (+104), +88 the stack of seeds; low / high at +300 / +304 |
+| gmm2 | +72 the picture (+132), +64 the per-pixel factor when either mode is per-pixel (+128; else the model's address again), +80 / +120 the model, +96 the match info (+144), +104 the foreground (+148), +112 the background (+152); the control struct's fields in order from +312, the two byte ones at +348 / +352 |
 
 Edges are replicated.
 
@@ -378,8 +379,34 @@ binary under QEMU and compares file by file):
   intermediate width and the asymmetric rounding matter: nothing simpler
   matches the silicon.
 
-Still to come (#268): st_box_flt_and_eigen, candidate_corner,
-lk_optical_flow_pyr, gmm2. What is known about them:
+- **gmm2** keeps `model_num` Gaussians of 8 bytes per pixel, pixel by
+  pixel: the mean and the variance as U9Q7, then the frequency and the
+  life as U16. A sample matches the first Gaussian whose squared
+  distance passes the sensitivity gate,
+  `(sample - mean)^2 <= var * sns_factor << 7` — with the variance in
+  U9Q7 that is `|d| <= 2.83 sigma` for the default factor of 8. The
+  matched Gaussian then walks towards the sample, and both updates are
+  `x -= (x - target) >> 7`, which rounds towards +infinity; the
+  variance's target is the squared distance **in whole grey levels,
+  rounded up** (`dg = -((-d) >> 7)`, `target = dg * dg << 7`), and it is
+  clamped to the control's min and max. Its frequency becomes
+  `((freq * freq_reduce_factor) >> 16) + freq_add_factor` and its life
+  rises by the life factor, saturating; every other Gaussian only loses
+  frequency, `(freq * freq_reduce_factor) >> 16`. With no match, a new
+  Gaussian takes the **last** free slot — the weakest if none is free —
+  as (sample, `max_var`, `freq_init_val`, 1). A slot with no frequency
+  reads its life back as 0xffff.
+  The outputs: the foreground flag is 255 while the matched Gaussian's
+  life is below `life_threshold`, the background is the mean of the
+  frequency leader *before* the update, and the match info is that
+  leader's index in the high 7 bits with the match flag in the low one
+  (which is what `ss_mpi_ive_gmm2`'s comment means by "Low-1bit is match
+  flag, and high-7bits is max freq index"). `freq_threshold` did not
+  enter any of the captured cases, and the shift of 7 is `var_rate`'s
+  default of 1; the captures do not cover another rate.
+
+Still to come (#268): st_box_flt_and_eigen, candidate_corner and
+lk_optical_flow_pyr. What is known about them:
 
 - **st_cand_corner is a sequence**, not one op: norm_grad (norm 3, both
   gradients interleaved as S8C2) into the ctrl's mem, then
@@ -394,15 +421,7 @@ lk_optical_flow_pyr, gmm2. What is known about them:
   structure tensor and is close to `det / trace` divided by about 13,
   but no arithmetic fitted so far matches it: the scale drifts a few
   percent with the window's anisotropy.
-- **gmm2**'s model is 8 bytes per Gaussian: the mean and the variance as
-  U9Q7, then the frequency and the life as U16. A new Gaussian starts at
-  (value, `max_var`, `freq_init_val`, 1). On a match the variance falls
-  by `var >> 7` and the frequency becomes
-  `((freq * freq_reduce_factor) >> 16) + freq_add_factor`; on a miss the
-  frequency is `(freq * freq_reduce_factor) >> 16` and the variance does
-  not move. Both were checked against a flat picture stepped twice. The
-  match test, the mean update and the background decision are still
-  open.
+
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
 `cur_area_threshold` [22:0], `label_status` [23] and `rgn_num` [31:24],

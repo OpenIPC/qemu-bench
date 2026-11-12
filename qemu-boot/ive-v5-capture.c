@@ -757,6 +757,71 @@ static void cap_gmm2_flat(void)
     freeimg(&match);
 }
 
+/*
+ * A third GMM2 sequence, built to show the match test and the updates:
+ * the picture settles flat at 100 and then every column steps by its own
+ * index, so one frame holds the boundary for every step size at once.
+ * A whole row of models is dumped after each frame.
+ */
+static void cap_gmm2_step(void)
+{
+    ot_svp_img src, factor, fg, bg, match;
+    ot_svp_mem_info model;
+    ot_ive_gmm2_ctrl c = { 0 };
+    ot_ive_handle h;
+    char n[64];
+
+    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&factor, OT_SVP_IMG_TYPE_U16C1, W, H) ||
+        mk(&fg, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&bg, OT_SVP_IMG_TYPE_U8C1, W, H) ||
+        mk(&match, OT_SVP_IMG_TYPE_U8C1, W, H)) {
+        return;
+    }
+    c.var_rate = 1;
+    c.model_num = 3;
+    c.max_var = (16 * 16) << 7;
+    c.min_var = (8 * 8) << 7;
+    c.global_sns_factor = 8;
+    c.sns_factor_mode = OT_IVE_GMM2_SNS_FACTOR_MODE_GLOBAL;
+    c.freq_threshold = 12000;
+    c.freq_init_val = 20000;
+    c.freq_add_factor = 0xEF;
+    c.freq_reduce_factor = 0xFF00;
+    c.life_threshold = 500;
+    c.life_update_factor_mode = OT_IVE_GMM2_LIFE_UPDATE_FACTOR_MODE_GLOBAL;
+    c.global_life_update_factor = 0xFFFF;
+    if (mkmem(&model, c.model_num * sizeof(td_u64) * W * H)) {
+        return;
+    }
+    for (int f = 0; f < 10; f++) {
+        for (td_u32 y = 0; y < H; y++) {
+            td_u8 *row = PTR(td_u8, src.virt_addr[0]) + y * src.stride[0];
+
+            for (td_u32 x = 0; x < W; x++) {
+                row[x] = f < 4 ? 100 : (td_u8)(100 + x);
+            }
+        }
+        snprintf(n, sizeof(n), "gmm2step_f%d", f);
+        if (done(n, ss_mpi_ive_gmm2(&h, &src, &factor, &fg, &bg, &match, &model, &c,
+                                    TD_TRUE), h)) {
+            continue;
+        }
+        snprintf(n, sizeof(n), "gmm2step_f%d_fg", f);
+        dump_img(n, &fg);
+        snprintf(n, sizeof(n), "gmm2step_f%d_bg", f);
+        dump_img(n, &bg);
+        snprintf(n, sizeof(n), "gmm2step_f%d_match", f);
+        dump_img(n, &match);
+        snprintf(n, sizeof(n), "gmm2step_f%d_model", f);
+        dump_mem(n, model.virt_addr, c.model_num * sizeof(td_u64) * W);
+    }
+    freemem(&model);
+    freeimg(&src);
+    freeimg(&factor);
+    freeimg(&fg);
+    freeimg(&bg);
+    freeimg(&match);
+}
+
 static void cap_acc_dot_alpha(void)
 {
     ot_svp_img a, b, al, d, s1, s2, d32;
@@ -916,6 +981,7 @@ int main(int argc, char **argv)
     cap_lk();
     cap_gmm2();
     cap_gmm2_flat();
+    cap_gmm2_step();
     cap_acc_dot_alpha();
     cap_csc();
     cap_resize();

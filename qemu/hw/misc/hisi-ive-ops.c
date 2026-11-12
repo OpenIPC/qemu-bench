@@ -581,3 +581,87 @@ void ive_canny_hys_edge(const uint16_t *mag, const uint8_t *ang, uint32_t w,
         *stack_size = n;
     }
 }
+
+uint8_t ive_gmm2_pixel(IveGmm2Model *g, uint8_t v, const IveGmm2Ctrl *c,
+                       uint8_t *bg, uint8_t *info)
+{
+    int n = MIN(MAX(c->model_num, 1), 5), hit = -1, lead = 0;
+    int sample = v << 7;                /* the pixel in the model's U9Q7 */
+    bool matched;
+
+    /* the frequency leader before the update: the background, and the
+     * match info's high bits */
+    for (int i = 1; i < n; i++) {
+        if (g[i].freq > g[lead].freq) {
+            lead = i;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        int d = sample - g[i].mean;
+
+        if (g[i].freq &&
+            (int64_t)d * d <= ((int64_t)g[i].var * c->sns_factor << 7)) {
+            hit = i;
+            break;
+        }
+    }
+    matched = hit >= 0;
+    if (hit >= 0) {
+        /*
+         * The matched Gaussian walks towards the sample: both updates are
+         * x -= (x - target) >> shift, which rounds towards +infinity, and
+         * the variance's target is the squared distance in whole grey
+         * levels, also rounded up
+         */
+        int d = sample - g[hit].mean, shift = 6 + MAX(c->var_rate, 1);
+        int dg = -((-d) >> 7), sq = (dg * dg) << 7;
+        int var = g[hit].var - ((g[hit].var - sq) >> shift);
+        uint32_t freq = ((uint32_t)g[hit].freq * c->freq_reduce >> 16) +
+                        c->freq_add;
+
+        g[hit].mean = g[hit].mean - ((g[hit].mean - sample) >> shift);
+        g[hit].var = MIN(MAX(var, c->min_var), c->max_var);
+        g[hit].freq = MIN(freq, UINT16_MAX);
+        g[hit].life = MIN(g[hit].life + c->life_factor, UINT16_MAX);
+    }
+    for (int i = 0; i < n; i++) {       /* the others only decay */
+        if (i != hit && g[i].freq) {
+            g[i].freq = (uint32_t)g[i].freq * c->freq_reduce >> 16;
+        }
+    }
+    if (hit < 0) {
+        int slot = -1;
+
+        for (int i = n - 1; i >= 0; i--) {
+            if (!g[i].freq) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < n; i++) {
+                if (g[i].freq < g[slot].freq) {
+                    slot = i;
+                }
+            }
+        }
+        g[slot].mean = sample;
+        g[slot].var = c->max_var;
+        g[slot].freq = c->freq_init;
+        g[slot].life = 1;
+        hit = slot;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!g[i].freq) {              /* an unused slot reads life 0xffff */
+            g[i].life = UINT16_MAX;
+        }
+    }
+    if (bg) {
+        *bg = g[lead].mean >> 7;
+    }
+    if (info) {
+        *info = lead << 1 | matched;
+    }
+    return g[hit].life < c->life_threshold ? 255 : 0;
+}

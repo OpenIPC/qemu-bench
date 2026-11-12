@@ -160,6 +160,49 @@ def canny_ref(mag, ang, w, h, lo, hi):
     return edge, seeds
 
 
+GMM2_CTRL = dict(life_factor=0xffff, life_threshold=500, freq_init=20000,
+                 freq_reduce=0xff00, freq_add=0xef, freq_threshold=12000,
+                 var_rate=1, max_var=(16 * 16) << 7, min_var=(8 * 8) << 7,
+                 sns=8, num=3)
+
+
+def gmm2_pixel(g, v, c):
+    """one pixel's Gaussians updated as the engine does"""
+    sample = v << 7
+    lead = max(range(len(g)), key=lambda i: (g[i][2], -i))
+    hit = -1
+    for i, (mean, var, freq, life) in enumerate(g):
+        d = sample - mean
+        if freq and d * d <= (var * c['sns'] << 7):
+            hit = i
+            break
+    matched = hit >= 0
+    if matched:
+        mean, var, freq, life = g[hit]
+        sh = 6 + max(c['var_rate'], 1)
+        d = sample - mean
+        dg = -((-d) >> 7)
+        var -= (var - ((dg * dg) << 7)) >> sh
+        g[hit] = [mean - ((mean - sample) >> sh),
+                  min(max(var, c['min_var']), c['max_var']),
+                  min(((freq * c['freq_reduce']) >> 16) + c['freq_add'], 0xffff),
+                  min(life + c['life_factor'], 0xffff)]
+    for i, (mean, var, freq, life) in enumerate(g):
+        if i != hit and freq:
+            g[i] = [mean, var, (freq * c['freq_reduce']) >> 16, life]
+    if not matched:
+        slot = next((i for i in range(len(g) - 1, -1, -1) if not g[i][2]), None)
+        if slot is None:
+            slot = min(range(len(g)), key=lambda i: g[i][2])
+        g[slot] = [sample, c['max_var'], c['freq_init'], 1]
+        hit = slot
+    for q in g:
+        if not q[2]:
+            q[3] = 0xffff
+    return (255 if g[hit][3] < c['life_threshold'] else 0,
+            g[lead][0] >> 7, lead << 1 | int(matched))
+
+
 def band(v, lo, hi, a, b, c):
     r = a if v <= lo else b if v <= hi else c
     return v if r is None else r
@@ -699,6 +742,40 @@ def main():
                   'CANNY_HYS_EDGE: %d seeds in raster order' % len(seeds))
             check(struct.unpack('<I', q.read(STACK + 4 * n, 4))[0] == len(seeds),
                   'CANNY_HYS_EDGE: the stack size past the points')
+
+        # GMM2: three frames over a picture that steps, with the model
+        # read back each time -- 8 bytes per Gaussian, model_num of them
+        # per pixel, pixel by pixel
+        MODEL = IMG + 0x280000
+        FG, BG, MINFO = R, R + 0x1000, R + 0x2000
+        c = GMM2_CTRL
+        q.write(MODEL, bytes(8 * c['num'] * n))
+        state = [[[0, 0, 0, 0] for _ in range(c['num'])] for _ in range(n)]
+        gfields = [(72, 'Q', P), (132, 'I', SW), (80, 'Q', MODEL),
+                   (120, 'Q', MODEL), (96, 'Q', MINFO), (144, 'I', SW),
+                   (104, 'Q', FG), (148, 'I', SW), (112, 'Q', BG),
+                   (152, 'I', SW), (312, 'I', c['life_factor']),
+                   (316, 'I', c['life_threshold']), (320, 'I', c['freq_init']),
+                   (324, 'I', c['freq_reduce']), (328, 'I', c['freq_add']),
+                   (332, 'I', c['freq_threshold']), (336, 'I', c['var_rate']),
+                   (340, 'I', c['max_var']), (344, 'I', c['min_var']),
+                   (348, 'I', c['sns']), (352, 'I', c['num'])]
+        for frame in range(3):
+            pic = bytes((100 if frame < 2 else 100 + i % SW) & 0xff
+                        for i in range(n))
+            q.write(P, pic)
+            run(30, gfields)
+            want = [gmm2_pixel(state[i], pic[i], c) for i in range(n)]
+            got_model = list(struct.unpack('<%dH' % (4 * c['num'] * n),
+                                           q.read(MODEL, 8 * c['num'] * n)))
+            flat = [v for px in state for g in px for v in g]
+            check(got_model == flat, 'GMM2: the model after frame %d' % frame)
+            check(list(q.read(FG, n)) == [t[0] for t in want],
+                  'GMM2: foreground, frame %d' % frame)
+            check(list(q.read(BG, n)) == [t[1] for t in want],
+                  'GMM2: background, frame %d' % frame)
+            check(list(q.read(MINFO, n)) == [t[2] for t in want],
+                  'GMM2: match info, frame %d' % frame)
 
         # RESIZE: the op whose parameters sit in a block of its own, which
         # is also why its task carries no op code and no size

@@ -166,4 +166,31 @@ void ive_canny_hys_edge(const uint16_t *mag, const uint8_t *ang, uint32_t w,
                         uint32_t *stack, uint32_t max_pts,
                         uint32_t *stack_size);
 
+/* One pixel's Gaussians, as the engine keeps them: 8 bytes each */
+typedef struct {
+    uint16_t mean;              /* U9Q7 */
+    uint16_t var;               /* U9Q7 */
+    uint16_t freq;
+    uint16_t life;
+} IveGmm2Model;
+
+typedef struct {
+    uint16_t life_factor, life_threshold;
+    uint16_t freq_init, freq_reduce, freq_add, freq_threshold;
+    uint16_t var_rate, max_var, min_var;
+    uint8_t sns_factor, model_num;
+} IveGmm2Ctrl;
+
+/*
+ * GMM2 for one pixel: picks the first Gaussian whose squared distance
+ * passes the sensitivity gate, updates it towards the sample and decays
+ * the others, or starts a new Gaussian in the last free slot (the
+ * weakest, if none is free).  Returns the foreground flag, and through
+ * `bg` and `info` the background value and the match info the engine
+ * writes: the frequency leader's index in the high 7 bits and the match
+ * flag in the low one, both from the state before the update.
+ */
+uint8_t ive_gmm2_pixel(IveGmm2Model *g, uint8_t v, const IveGmm2Ctrl *c,
+                       uint8_t *bg, uint8_t *info);
+
 #endif

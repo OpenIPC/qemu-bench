@@ -103,7 +103,8 @@ enum {
     OP_HIST = 12, OP_THRESH_S16 = 13, OP_THRESH_U16 = 14, OP_16TO8 = 15,
     OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
     OP_CCL = 21, OP_LBP = 23, OP_NORM_GRAD = 24, OP_SAD = 27, OP_RESIZE = 29,
-    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_ACC = 32,
+    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_GMM2 = 30,
+    OP_ACC = 32,
     OP_IMAGE_DOT = 33,
     OP_ALPHA = 34,
 };
@@ -973,6 +974,64 @@ static void op_canny_hys_edge(const uint8_t *t, uint32_t w, uint32_t h)
                      MEMTXATTRS_UNSPECIFIED);
 }
 
+/*
+ * GMM2 (ot_ive_gmm2_ctrl): +72 the U8 picture (+132), +64 the per-pixel
+ * factor picture when either mode is per-pixel (+128, U16; otherwise the
+ * driver puts the model's address there), +80 and +120 the model, +96 the
+ * match info (+144), +104 the foreground (+148), +112 the background
+ * (+152).  The control fields follow the struct's order from +312:
+ * life factor, life threshold, initial / reduce / add / threshold
+ * frequency, variation rate, max and min variation, then the global
+ * sensitivity factor and the model count as bytes at +348 / +352.
+ *
+ * The model is model_num Gaussians of 8 bytes per pixel, pixel by pixel.
+ */
+static void op_gmm2(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    IveGmm2Ctrl c = {
+        .life_factor = task_u32(t, 312), .life_threshold = task_u32(t, 316),
+        .freq_init = task_u32(t, 320), .freq_reduce = task_u32(t, 324),
+        .freq_add = task_u32(t, 328), .freq_threshold = task_u32(t, 332),
+        .var_rate = task_u32(t, 336), .max_var = task_u32(t, 340),
+        .min_var = task_u32(t, 344), .sns_factor = task_u32(t, 348),
+        .model_num = task_u32(t, 352),
+    };
+    uint32_t n = w * h, num = MIN(MAX(c.model_num, 1), 5);
+    uint32_t model = task_addr(t, 80);
+    g_autofree uint8_t *src = task_img(t, 72, 132, w, h, 1);
+    g_autofree uint8_t *fg = g_malloc(n);
+    g_autofree uint8_t *bg = g_malloc(n);
+    g_autofree uint8_t *info = g_malloc(n);
+    g_autofree IveGmm2Model *g = g_new(IveGmm2Model, (size_t)n * num);
+
+    if (!model || num * 8 * (uint64_t)n > (1u << 28)) {
+        return;
+    }
+    dma_memory_read(&address_space_memory, model, g,
+                    (uint64_t)n * num * 8, MEMTXATTRS_UNSPECIFIED);
+    for (uint32_t i = 0; i < n * num; i++) {
+        g[i].mean = le16_to_cpu(g[i].mean);
+        g[i].var = le16_to_cpu(g[i].var);
+        g[i].freq = le16_to_cpu(g[i].freq);
+        g[i].life = le16_to_cpu(g[i].life);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        fg[i] = ive_gmm2_pixel(g + (size_t)i * num, src[i], &c,
+                               &bg[i], &info[i]);
+    }
+    for (uint32_t i = 0; i < n * num; i++) {
+        g[i].mean = cpu_to_le16(g[i].mean);
+        g[i].var = cpu_to_le16(g[i].var);
+        g[i].freq = cpu_to_le16(g[i].freq);
+        g[i].life = cpu_to_le16(g[i].life);
+    }
+    dma_memory_write(&address_space_memory, task_addr(t, 120), g,
+                     (uint64_t)n * num * 8, MEMTXATTRS_UNSPECIFIED);
+    task_put(t, 104, 148, fg, w, h, 1);
+    task_put(t, 112, 152, bg, w, h, 1);
+    task_put(t, 96, 144, info, w, h, 1);
+}
+
 static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
 {
     uint32_t op = task_u32(t, TASK_OP);
@@ -1050,6 +1109,9 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
         break;
     case OP_CANNY:
         op_canny_hys_edge(t, w, h);
+        break;
+    case OP_GMM2:
+        op_gmm2(t, w, h);
         break;
     case OP_NORM_GRAD:
         op_norm_grad(t, w, h);
