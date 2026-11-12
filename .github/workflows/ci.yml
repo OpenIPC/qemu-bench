@@ -130,6 +130,11 @@ jobs:
       - name: HiSilicon V5 ISP statistics (hisi-vi gen 5)
         run: python3 qemu/tests/test-hisi-isp.py --gen 5
 
+      # V5 IVE: ops as tasks on the SVP NPU's scheduler, a ring that links
+      # its tasks, the finish on IVE's interrupt group, the ops' outputs
+      - name: HiSilicon V5 IVE (hisi-ive-npu)
+        run: python3 qemu/tests/test-hisi-ive-npu.py
+
       # The ISP statistics hisi-vi writes (front-end and backend AE
       # histograms, AE / AWB zones, globals) in the driver's STT layouts,
       # and the front-end interrupt the ISP's per-frame work runs from.

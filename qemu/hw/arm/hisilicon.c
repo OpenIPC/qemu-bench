@@ -1642,7 +1642,9 @@ static const HisiSoCConfig hi3516av200_soc = {
     .vi_proc_base       = 0x17800000,               \
     .vi_proc_irq        = 67,                       \
     .vpss_base          = 0x17900000,               \
-    .vpss_irq           = 71
+    .vpss_irq           = 71,                       \
+    .ive_npu_base       = 0x14000000,               \
+    .ive_npu_irq        = { 75, 76 }
 
 #define HISI_V4_VIDEO_PIPE                                  \
     .vi_cap_base        = 0x11000000,                       \
@@ -5959,6 +5961,20 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_mmio_map(busdev, 1, c->jpge_base);
         sysbus_connect_irq(busdev, 0, pic[c->vedu_irq]);
         sysbus_connect_irq(busdev, 1, pic[c->jpge_irq]);
+    }
+
+    /*
+     * V5 IVE: the SVP NPU's task scheduler, over the first 64 KiB of the
+     * "hisi-npu" bank (mapped later, below it)
+     */
+    if (c->ive_npu_base) {
+        DeviceState *ive = qdev_new("hisi-ive-npu");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(ive);
+
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map_overlap(busdev, 0, c->ive_npu_base, 1);
+        sysbus_connect_irq(busdev, 0, pic[c->ive_npu_irq[0]]);
+        sysbus_connect_irq(busdev, 1, pic[c->ive_npu_irq[1]]);
     }
 
     /*
