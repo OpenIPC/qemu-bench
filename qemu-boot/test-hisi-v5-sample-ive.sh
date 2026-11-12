@@ -1,24 +1,34 @@
 #!/bin/bash
-# The vendor SDK's IVE memory test on an emulated Hi3516CV610, end to end
+# The vendor SDK's IVE samples on an emulated Hi3516CV610, end to end
 # through ive.ko and the SVP NPU's task scheduler (hisi-ive-npu).
 #
-# Builds the memory test of mpp/sample/svp/ive (sample_ive_test_memory.c:
-# DMA a picture, subtract the copy from the original, histogram the
-# difference) statically from the SDK's sources and static MPI libraries,
-# with a main that runs that case alone, and runs it from an initramfs made
-# of the OpenIPC hi3516cv6xx rootfs, whose own load_hisilicon loads every
-# module.  The sample writes the difference to test_mem_out.yuv and prints
-# "Test mem error" when the histogram is not all in bin 0, yet exits 0
-# either way, so the host checks both: no such line, and the difference
-# all zeros.
+# Builds two file-based cases of mpp/sample/svp/ive statically from the
+# SDK's sources and static MPI libraries, with a main that runs them, and
+# runs it from an initramfs made of the OpenIPC hi3516cv6xx rootfs, whose
+# own load_hisilicon loads every module:
+#
+#   memory test   DMA a picture, subtract the copy from the original,
+#                 histogram the difference.  It prints "Test mem error"
+#                 when the histogram is not all in bin 0, yet exits 0
+#                 either way, so the host checks both: no such line, and
+#                 the difference all zeros.
+#   sobel         The SDK's 5x5 mask on a 720x576 picture, both gradients
+#                 as S16, twice (cached and uncached buffers).  The host
+#                 computes the same correlation (edges replicated) with
+#                 numpy, and the four files must match it.
 #
 # The SDK is not public, so this runs locally, not in CI:
 #
 #   test-hisi-v5-sample-ive.sh --sdk ~/projects/cameras/sdk/Hi3516CV610_SDK_V1.0.2.0
 #                              [--qemu Q] [--work DIR]
 #
-# Needs arm-openipc-linux-musleabi-gcc (or CC), unsquashfs, cpio.
+# Needs arm-openipc-linux-musleabi-gcc (or CC), unsquashfs, cpio, and
+# python3 with numpy (the sobel reference).
 set -eu
+if ! python3 -c 'import numpy' 2>/dev/null; then
+    echo "python3 with numpy is needed for the sobel check (pip install numpy)" >&2
+    exit 2
+fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SDK=
@@ -58,6 +68,7 @@ cat > "$OBJ/main.c" <<'EOF'
 int main(void)
 {
     sample_ive_test_memory();
+    sample_ive_sobel();
     return 0;
 }
 EOF
@@ -71,7 +82,8 @@ CFLAGS="-O2 -I$OUT/include -I$SMP/common -I$SVP/common -I$SVP/ive/sample
 objs=()
 for f in "$SMP"/common/{sample_comm_sys,sample_comm_isp,sample_comm_vi,sample_comm_vpss,loadbmp,ot_confaccess,sample_comm_venc,sample_comm_region,sample_comm_osd_drawline,sample_ipc}.c \
          "$SVP"/common/{sample_common_svp,sample_common_ive}.c \
-         "$SVP"/ive/sample/sample_ive_test_memory.c "$OBJ/main.c"; do
+         "$SVP"/ive/sample/sample_ive_test_memory.c \
+         "$SVP"/ive/sample/sample_ive_sobel_with_cached_mem.c "$OBJ/main.c"; do
     o=$OBJ/$(basename "$f" .c).o
     # shellcheck disable=SC2086
     "$CC" $CFLAGS -c -o "$o" "$f"
@@ -95,9 +107,12 @@ INITRD=$WORK/initrd
 rm -rf "$INITRD"
 unsquashfs -q -d "$INITRD" "$WORK/rootfs.squashfs.$REL" >/dev/null
 cp "$WORK/sample_ive" "$INITRD/usr/bin/"
-mkdir -p "$INITRD/root/data/input/testmem" "$INITRD/root/data/output/testmem"
+for d in testmem sobel; do
+    mkdir -p "$INITRD/root/data/input/$d" "$INITRD/root/data/output/$d"
+done
 cp "$SVP/ive/data/input/testmem/test_mem_in.yuv" \
     "$INITRD/root/data/input/testmem/"
+cp "$SVP/ive/data/input/sobel/sobel.yuv" "$INITRD/root/data/input/sobel/"
 cat > "$INITRD/init" <<'EOF'
 #!/bin/sh
 mount -t proc proc /proc
@@ -110,6 +125,9 @@ sample_ive
 echo "=== done rc=$?"
 f=data/output/testmem/test_mem_out.yuv
 echo "=== out $(wc -c < $f) bytes, $(tr -d '\000' < $f | wc -c) nonzero"
+for g in h1 h2 v1 v2; do
+    echo "=== sobel $g $(md5sum < data/output/sobel/sobel$g.dat)"
+done
 echo b > /proc/sysrq-trigger
 EOF
 chmod +x "$INITRD/init"
@@ -138,3 +156,26 @@ case $out in
 *" 0 nonzero") echo "PASS ive: DMA, SUB and HIST through ive.ko" ;;
 *) fail "the difference of a picture and its copy is not zero" ;;
 esac
+
+# sobel: the same correlation on the host
+want=$(python3 - "$SVP/ive/data/input/sobel/sobel.yuv" <<'PY'
+import hashlib, sys
+import numpy as np
+w, h = 720, 576
+img = np.fromfile(sys.argv[1], np.uint8)[:w * h].reshape(h, w).astype(np.int32)
+m = np.array([0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, -2, 0, 2, 0,
+              0, -1, 0, 1, 0, 0, 0, 0, 0, 0]).reshape(5, 5)
+pad = np.pad(img, 2, mode='edge')
+for k in (m, m.T):
+    g = sum(k[j, i] * pad[j:j + h, i:i + w] for j in range(5) for i in range(5))
+    print(hashlib.md5(np.clip(g, -32768, 32767).astype('<i2').tobytes()).hexdigest())
+PY
+)
+set -- $want
+for g in h1 v1 h2 v2; do
+    case $g in h*) w=$1 ;; *) w=$2 ;; esac
+    got=$(grep -a "^=== sobel $g " "$WORK/console.log" | tail -1 | tr -d '\r' |
+          awk '{print $4}')
+    [ "$got" = "$w" ] || fail "sobel$g.dat differs from numpy's ($got, want $w)"
+done
+echo "PASS ive: SOBEL through ive.ko, both gradients as numpy has them"

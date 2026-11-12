@@ -35,10 +35,11 @@
  * +6 is the task's id (its slot), +8 the next task's address, the last
  * slot pointing back at the first.  Images are at +64 onwards with their
  * strides at +104.., the op code at +288, width / height at +292 / +296
- * and the op's own fields from +300.  dma, sad, ccl and add (majestic's
- * motion detection) and sub and hist (the SDK sample's memory test) are
- * modelled; any other op completes and leaves its output alone
- * (LOG_UNIMP).
+ * and the op's own fields from +300.  21 ops are modelled -- dma, sad,
+ * ccl, add, sub, hist, and, or, xor, the three thresholds, 16bit_to_8bit,
+ * map, integ, ncc, dilate, erode, filter, sobel, ord_stat_filter -- their
+ * pixel work in hisi-ive-ops.c, shared with V4's hisi-ive; any other op
+ * completes and leaves its output alone (LOG_UNIMP).
  *
  * Copyright (c) 2026 OpenIPC
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -52,6 +53,7 @@
 #include "hw/qdev-properties.h"
 #include "system/dma.h"
 #include "migration/vmstate.h"
+#include "hw/misc/hisi-ive-ops.h"
 
 #define TYPE_HISI_IVE_NPU "hisi-ive-npu"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiIveNpuState, HISI_IVE_NPU)
@@ -96,8 +98,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiIveNpuState, HISI_IVE_NPU)
 
 /* the op codes ive_fill_npu_*_task write at +288 */
 enum {
-    OP_DMA = 0, OP_SUB = 9, OP_HIST = 12, OP_ADD = 18, OP_CCL = 21,
-    OP_SAD = 27,
+    OP_DMA = 0, OP_FILTER = 1, OP_SOBEL = 3, OP_DILATE = 5, OP_ERODE = 6,
+    OP_THRESH = 7, OP_AND = 8, OP_SUB = 9, OP_OR = 10, OP_INTEG = 11,
+    OP_HIST = 12, OP_THRESH_S16 = 13, OP_THRESH_U16 = 14, OP_16TO8 = 15,
+    OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
+    OP_CCL = 21, OP_SAD = 27,
 };
 
 #define PIC_MAX             4096
@@ -228,6 +233,7 @@ static void op_sad(const uint8_t *t, uint32_t w, uint32_t h)
     uint32_t bw = w / b, bh = h / b, nb = MAX(bw * bh, 1);
     g_autofree uint8_t *f1 = g_malloc(w * h);
     g_autofree uint8_t *f2 = g_malloc(w * h);
+    g_autofree uint32_t *sad = g_new(uint32_t, nb);
     g_autofree uint8_t *sad8 = g_malloc(nb);
     g_autofree uint16_t *sad16 = g_malloc(2 * nb);
     g_autofree uint8_t *thr8 = g_malloc(nb);
@@ -238,21 +244,11 @@ static void op_sad(const uint8_t *t, uint32_t w, uint32_t h)
     }
     img_read(task_addr(t, 64), task_u32(t, 104), f1, w, h);
     img_read(task_addr(t, 72), task_u32(t, 108), f2, w, h);
-    for (uint32_t by = 0; by < bh; by++) {
-        for (uint32_t bx = 0; bx < bw; bx++) {
-            uint32_t sad = 0, i = by * bw + bx;
-
-            for (int dy = 0; dy < b; dy++) {
-                for (int dx = 0; dx < b; dx++) {
-                    uint32_t p = (by * b + dy) * w + bx * b + dx;
-
-                    sad += abs((int)f1[p] - (int)f2[p]);
-                }
-            }
-            sad16[i] = cpu_to_le16(MIN(sad, 0xffff));
-            sad8[i] = MIN(sad, 0xff);
-            thr8[i] = sad > thr ? hi : lo;
-        }
+    ive_sad(f1, f2, w, h, b, sad);
+    for (uint32_t i = 0; i < bw * bh; i++) {
+        sad16[i] = cpu_to_le16(MIN(sad[i], 0xffff));
+        sad8[i] = MIN(sad[i], 0xff);
+        thr8[i] = sad[i] > thr ? hi : lo;
     }
     if (ctrl == 4) {
         img_write(out1, task_u32(t, 116), thr8, bw, bh);
@@ -396,60 +392,271 @@ static void op_ccl(const uint8_t *t, uint32_t w, uint32_t h)
     img_write(a, stride, img, w, h);
 }
 
-/*
- * ADD (ot_ive_add_ctrl): +80 / +88 the U8 sources, +104 the destination,
- * their strides at +112 / +116 / +124; dst = (x * src1 + y * src2) >> 16
- * with the Q0.16 weights x / y at +300 / +304, saturated.
- */
-static void op_add(const uint8_t *t, uint32_t w, uint32_t h)
+/* A picture of bpp-byte pixels from +addr with its stride at +stride */
+static void *task_img(const uint8_t *t, int addr, int stride, uint32_t w,
+                      uint32_t h, int bpp)
 {
-    uint32_t x = task_u32(t, 300) & 0xffff, y = task_u32(t, 304) & 0xffff;
-    g_autofree uint8_t *f1 = g_malloc(w * h);
-    g_autofree uint8_t *f2 = g_malloc(w * h);
+    uint8_t *buf = g_malloc(w * h * bpp);
 
-    img_read(task_addr(t, 80), task_u32(t, 112), f1, w, h);
-    img_read(task_addr(t, 88), task_u32(t, 116), f2, w, h);
-    for (uint32_t i = 0; i < w * h; i++) {
-        f1[i] = MIN((f1[i] * x + f2[i] * y) >> 16, 255);
-    }
-    img_write(task_addr(t, 104), task_u32(t, 124), f1, w, h);
+    img_read(task_addr(t, addr), task_u32(t, stride), buf, w * bpp, h);
+    return buf;
+}
+
+static void task_put(const uint8_t *t, int addr, int stride, const void *buf,
+                     uint32_t w, uint32_t h, int bpp)
+{
+    img_write(task_addr(t, addr), task_u32(t, stride), buf, w * bpp, h);
 }
 
 /*
- * SUB (ot_ive_sub_ctrl), add's layout: dst = |src1 - src2|, or with mode
- * 1 (+300) the signed difference halved, as S8.
+ * Two U8 sources into a U8 destination (add, sub, and, or, xor): +80 / +88
+ * the sources, +104 the destination, strides at +112 / +116 / +124; add's
+ * Q0.16 weights at +300 / +304, sub's mode (|a - b|, or the signed
+ * difference halved) at +300
  */
-static void op_sub(const uint8_t *t, uint32_t w, uint32_t h)
+static void op_two(const uint8_t *t, uint32_t op, uint32_t w, uint32_t h)
 {
-    bool shift = task_u32(t, 300) == 1;
-    g_autofree uint8_t *f1 = g_malloc(w * h);
-    g_autofree uint8_t *f2 = g_malloc(w * h);
+    g_autofree uint8_t *a = task_img(t, 80, 112, w, h, 1);
+    g_autofree uint8_t *b = task_img(t, 88, 116, w, h, 1);
 
-    img_read(task_addr(t, 80), task_u32(t, 112), f1, w, h);
-    img_read(task_addr(t, 88), task_u32(t, 116), f2, w, h);
-    for (uint32_t i = 0; i < w * h; i++) {
-        int d = (int)f1[i] - (int)f2[i];
-
-        f1[i] = shift ? (uint8_t)(int8_t)(d >> 1) : abs(d);
+    switch (op) {
+    case OP_ADD:
+        ive_add(a, b, a, w * h, task_u32(t, 300), task_u32(t, 304));
+        break;
+    case OP_SUB:
+        ive_sub(a, b, a, w * h, task_u32(t, 300) == 1);
+        break;
+    default:
+        ive_bitwise(op == OP_AND ? IVE_AND : op == OP_OR ? IVE_OR : IVE_XOR,
+                    a, b, a, w * h);
+        break;
     }
-    img_write(task_addr(t, 104), task_u32(t, 124), f1, w, h);
+    task_put(t, 104, 124, a, w, h, 1);
 }
 
-/* HIST: the U8 image at +80 (stride +104) into 256 u32 bins at +96 */
+/* HIST: the U8 picture at +80 (stride +104) into 256 u32 bins at +96 */
 static void op_hist(const uint8_t *t, uint32_t w, uint32_t h)
 {
-    g_autofree uint8_t *f = g_malloc(w * h);
-    uint32_t bins[256] = { 0 };
+    g_autofree uint8_t *f = task_img(t, 80, 104, w, h, 1);
+    uint32_t bins[256];
 
-    img_read(task_addr(t, 80), task_u32(t, 104), f, w, h);
-    for (uint32_t i = 0; i < w * h; i++) {
-        bins[f[i]]++;
-    }
+    ive_hist(f, w * h, bins);
     for (int i = 0; i < 256; i++) {
         bins[i] = cpu_to_le32(bins[i]);
     }
     dma_memory_write(&address_space_memory, task_addr(t, 96), bins,
                      sizeof(bins), MEMTXATTRS_UNSPECIFIED);
+}
+
+/*
+ * The thresholds (ot_ive_threshold_*_ctrl): +80 the source, +104 its
+ * stride in bytes, +96 / +112 the U8 (or S8) destination; mode +300, low
+ * / high +304 / +308, min / mid / max +312 / +316 / +320 (sign-extended
+ * for the S16-to-S8 modes)
+ */
+static void op_thresh(const uint8_t *t, uint32_t op, uint32_t w, uint32_t h)
+{
+    uint32_t mode = task_u32(t, 300), n = w * h;
+    int lo = task_u32(t, 304), hi = task_u32(t, 308);
+    int min = task_u32(t, 312), mid = task_u32(t, 316), max = task_u32(t, 320);
+    g_autofree uint8_t *out = g_malloc(n);
+
+    if (op == OP_THRESH) {
+        g_autofree uint8_t *f = task_img(t, 80, 104, w, h, 1);
+
+        ive_thresh(f, out, n, mode, lo, hi, min, mid, max);
+    } else {
+        g_autofree uint16_t *f = task_img(t, 80, 104, w, h, 2);
+
+        for (uint32_t i = 0; i < n; i++) {
+            f[i] = le16_to_cpu(f[i]);
+        }
+        if (op == OP_THRESH_S16) {
+            ive_thresh_s16((int16_t *)f, out, n, mode, lo, hi, min, mid, max);
+        } else {
+            ive_thresh_u16(f, out, n, mode, lo, hi, min, mid, max);
+        }
+    }
+    task_put(t, 96, 112, out, w, h, 1);
+}
+
+/*
+ * 16BIT_TO_8BIT (ot_ive_16bit_to_8bit_ctrl): +80 the 16-bit source (stride
+ * +104, bytes), +96 / +112 the destination; mode +300, bias +304, and
+ * num / den as the Q16 ratio the driver computes, +308
+ */
+static void op_16to8(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint16_t *f = task_img(t, 80, 104, w, h, 2);
+    g_autofree uint8_t *out = g_malloc(w * h);
+
+    for (uint32_t i = 0; i < w * h; i++) {
+        f[i] = le16_to_cpu(f[i]);
+    }
+    ive_16bit_to_8bit(f, out, w * h, task_u32(t, 300), task_u32(t, 308),
+                      (int8_t)task_u32(t, 304));
+    task_put(t, 96, 112, out, w, h, 1);
+}
+
+/*
+ * MAP (ot_ive_map_ctrl): +80 the U8 source (+112), +88 the 256-entry table,
+ * +104 the destination (+124, bytes); mode +300: U8, S16 or U16 entries
+ */
+static void op_map(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    int bpp = task_u32(t, 300) ? 2 : 1;
+    g_autofree uint8_t *f = task_img(t, 80, 112, w, h, 1);
+    g_autofree uint8_t *out = g_malloc(w * h * bpp);
+    uint8_t lut[512];
+
+    dma_memory_read(&address_space_memory, task_addr(t, 88), lut,
+                    256 * bpp, MEMTXATTRS_UNSPECIFIED);
+    for (uint32_t i = 0; i < w * h; i++) {
+        memcpy(out + i * bpp, lut + f[i] * bpp, bpp);
+    }
+    task_put(t, 104, 124, out, w, h, bpp);
+}
+
+/*
+ * INTEG (ot_ive_integ_ctrl): +80 the U8 source (+104), +96 the destination
+ * (+112, bytes); out_ctrl +300: 1 sums (u32); 2 sums of squares (u64);
+ * 0 both in one u64, the sum in [27:0] and the squares above
+ */
+static void op_integ(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t mode = task_u32(t, 300), n = w * h;
+    g_autofree uint8_t *f = task_img(t, 80, 104, w, h, 1);
+    g_autofree uint32_t *sum = g_new(uint32_t, n);
+    g_autofree uint64_t *sq = g_new(uint64_t, n);
+
+    ive_integ(f, w, h, sum, sq);
+    if (mode == 1) {
+        for (uint32_t i = 0; i < n; i++) {
+            sum[i] = cpu_to_le32(sum[i]);
+        }
+        task_put(t, 96, 112, sum, w, h, 4);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t v = mode == 2 ? sq[i] : (sum[i] & 0xfffffff) | sq[i] << 28;
+
+        sq[i] = cpu_to_le64(v);
+    }
+    task_put(t, 96, 112, sq, w, h, 8);
+}
+
+/*
+ * NCC: +80 / +88 the U8 sources (+112 / +116), +104 ot_ive_ncc_dst_mem,
+ * whose three sums are written; its reserved tail is left alone
+ */
+static void op_ncc(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *a = task_img(t, 80, 112, w, h, 1);
+    g_autofree uint8_t *b = task_img(t, 88, 116, w, h, 1);
+    uint64_t r[3];
+
+    ive_ncc(a, b, w * h, r);
+    for (int i = 0; i < 3; i++) {
+        r[i] = cpu_to_le64(r[i]);
+    }
+    dma_memory_write(&address_space_memory, task_addr(t, 104), r, sizeof(r),
+                     MEMTXATTRS_UNSPECIFIED);
+}
+
+/*
+ * DILATE / ERODE (ot_ive_dilate_ctrl): +64 the binary U8 source (+96),
+ * +80 the destination (+104); the 5x5 mask as 25 bytes of 0 / 1 at +300
+ */
+static void op_morph(const uint8_t *t, bool dilate, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *f = task_img(t, 64, 96, w, h, 1);
+    g_autofree uint8_t *out = g_malloc(w * h);
+    uint8_t mask[25];
+
+    for (int i = 0; i < 25; i++) {
+        mask[i] = t[300 + i] & 1 ? 0xff : 0;
+    }
+    ive_morph(f, w, h, mask, dilate, out);
+    task_put(t, 80, 104, out, w, h, 1);
+}
+
+/*
+ * FILTER (ot_ive_filter_ctrl): +64 the source's Y (+104), +88 the
+ * destination's (+116); for a semi-planar picture (+300 non-zero) the UV
+ * planes at +72 (+108) and +96 (+120) pass through.  A kernel_w x
+ * kernel_h mask (+308 / +312, 3 or 5) of S8 at +332, the sum shifted right
+ * by norm (+304) and saturated; edges replicated (+316, constant padding,
+ * is taken as replication too).
+ */
+static void op_filter(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    int kw = task_u32(t, 308), kh = task_u32(t, 312);
+    uint32_t norm = MIN(task_u32(t, 304), 31);   /* guest's: no wild shift */
+    g_autofree uint8_t *f = task_img(t, 64, 104, w, h, 1);
+    g_autofree int32_t *sum = g_new(int32_t, w * h);
+
+    if (kw != 3 && kw != 5) {
+        kw = 5;
+    }
+    if (kh != 3 && kh != 5) {
+        kh = 5;
+    }
+    ive_correlate(f, w, h, (const int8_t *)t + 332, kw, kh, sum);
+    for (uint32_t i = 0; i < w * h; i++) {
+        f[i] = MIN(MAX(sum[i] >> norm, 0), 255);
+    }
+    task_put(t, 88, 116, f, w, h, 1);
+    if (task_u32(t, 300)) {
+        g_autofree uint8_t *uv = task_img(t, 72, 108, w, h / 2, 1);
+
+        task_put(t, 96, 120, uv, w, h / 2, 1);
+    }
+}
+
+/*
+ * SOBEL (ot_ive_sobel_ctrl): +64 the U8 source (+96); the 5x5 S8 mask at
+ * +300 gives the horizontal gradient, its transpose the vertical, as S16;
+ * out_ctrl +328: 0 both (+80 / +88, strides +104 / +108), 1 horizontal or
+ * 2 vertical alone at +80 (+104).  Edges replicated.
+ */
+static void op_sobel(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t ctrl = task_u32(t, 328), n = w * h;
+    g_autofree uint8_t *f = task_img(t, 64, 96, w, h, 1);
+    g_autofree int32_t *g = g_new(int32_t, n);
+    g_autofree int16_t *out = g_new(int16_t, n);
+    int8_t mask[2][25];
+
+    memcpy(mask[0], t + 300, 25);
+    for (int k = 0; k < 25; k++) {
+        mask[1][k] = mask[0][(k % 5) * 5 + k / 5];
+    }
+    for (int dir = 0; dir < 2; dir++) {
+        int slot;
+
+        if ((ctrl == 1 && dir) || (ctrl == 2 && !dir) || ctrl > 2) {
+            continue;
+        }
+        slot = ctrl == 0 && dir ? 1 : 0;
+        ive_correlate(f, w, h, mask[dir], 5, 5, g);
+        for (uint32_t i = 0; i < n; i++) {
+            out[i] = cpu_to_le16(MIN(MAX(g[i], INT16_MIN), INT16_MAX));
+        }
+        task_put(t, 80 + 8 * slot, 104 + 4 * slot, out, w, h, 2);
+    }
+}
+
+/*
+ * ORD_STAT_FILTER: +80 the U8 source (+104), +96 the destination (+112);
+ * mode +300: 3x3 median, max or min
+ */
+static void op_ord_stat(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *f = task_img(t, 80, 104, w, h, 1);
+    g_autofree uint8_t *out = g_malloc(w * h);
+
+    ive_ord_stat(f, w, h, task_u32(t, 300), out);
+    task_put(t, 96, 112, out, w, h, 1);
 }
 
 static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
@@ -475,13 +682,44 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
         op_ccl(t, w, h);
         break;
     case OP_ADD:
-        op_add(t, w, h);
-        break;
     case OP_SUB:
-        op_sub(t, w, h);
+    case OP_AND:
+    case OP_OR:
+    case OP_XOR:
+        op_two(t, op, w, h);
         break;
     case OP_HIST:
         op_hist(t, w, h);
+        break;
+    case OP_THRESH:
+    case OP_THRESH_S16:
+    case OP_THRESH_U16:
+        op_thresh(t, op, w, h);
+        break;
+    case OP_16TO8:
+        op_16to8(t, w, h);
+        break;
+    case OP_MAP:
+        op_map(t, w, h);
+        break;
+    case OP_INTEG:
+        op_integ(t, w, h);
+        break;
+    case OP_NCC:
+        op_ncc(t, w, h);
+        break;
+    case OP_DILATE:
+    case OP_ERODE:
+        op_morph(t, op == OP_DILATE, w, h);
+        break;
+    case OP_FILTER:
+        op_filter(t, w, h);
+        break;
+    case OP_SOBEL:
+        op_sobel(t, w, h);
+        break;
+    case OP_ORD_STAT:
+        op_ord_stat(t, w, h);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "hisi-ive-npu: op %u\n", op);
