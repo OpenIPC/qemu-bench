@@ -545,12 +545,15 @@ static void op_integ(const uint8_t *t, uint32_t w, uint32_t h)
     task_put(t, 96, 112, sq, w, h, 8);
 }
 
-/* NCC: +80 / +88 the U8 sources (+112 / +116), +104 ot_ive_ncc_dst_mem */
+/*
+ * NCC: +80 / +88 the U8 sources (+112 / +116), +104 ot_ive_ncc_dst_mem,
+ * whose three sums are written; its reserved tail is left alone
+ */
 static void op_ncc(const uint8_t *t, uint32_t w, uint32_t h)
 {
     g_autofree uint8_t *a = task_img(t, 80, 112, w, h, 1);
     g_autofree uint8_t *b = task_img(t, 88, 116, w, h, 1);
-    uint64_t r[4] = { 0 };
+    uint64_t r[3];
 
     ive_ncc(a, b, w * h, r);
     for (int i = 0; i < 3; i++) {
@@ -587,7 +590,8 @@ static void op_morph(const uint8_t *t, bool dilate, uint32_t w, uint32_t h)
  */
 static void op_filter(const uint8_t *t, uint32_t w, uint32_t h)
 {
-    int kw = task_u32(t, 308), kh = task_u32(t, 312), norm = task_u32(t, 304);
+    int kw = task_u32(t, 308), kh = task_u32(t, 312);
+    uint32_t norm = MIN(task_u32(t, 304), 31);   /* guest's: no wild shift */
     g_autofree uint8_t *f = task_img(t, 64, 104, w, h, 1);
     g_autofree int32_t *sum = g_new(int32_t, w * h);
 
@@ -599,7 +603,7 @@ static void op_filter(const uint8_t *t, uint32_t w, uint32_t h)
     }
     ive_correlate(f, w, h, (const int8_t *)t + 332, kw, kh, sum);
     for (uint32_t i = 0; i < w * h; i++) {
-        f[i] = MIN(MAX(sum[i] >> MIN(norm, 31), 0), 255);
+        f[i] = MIN(MAX(sum[i] >> norm, 0), 255);
     }
     task_put(t, 88, 116, f, w, h, 1);
     if (task_u32(t, 300)) {

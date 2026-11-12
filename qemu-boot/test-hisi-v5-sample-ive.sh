@@ -22,8 +22,13 @@
 #   test-hisi-v5-sample-ive.sh --sdk ~/projects/cameras/sdk/Hi3516CV610_SDK_V1.0.2.0
 #                              [--qemu Q] [--work DIR]
 #
-# Needs arm-openipc-linux-musleabi-gcc (or CC), unsquashfs, cpio.
+# Needs arm-openipc-linux-musleabi-gcc (or CC), unsquashfs, cpio, and
+# python3 with numpy (the sobel reference).
 set -eu
+if ! python3 -c 'import numpy' 2>/dev/null; then
+    echo "python3 with numpy is needed for the sobel check (pip install numpy)" >&2
+    exit 2
+fi
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SDK=

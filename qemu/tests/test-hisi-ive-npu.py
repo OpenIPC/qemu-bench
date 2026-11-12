@@ -408,11 +408,13 @@ def main():
               [(s1 & 0xfffffff) | s2 << 28 for s1, s2 in zip(isum, isq)],
               'INTEG: combined')
 
+        q.write(R + 24, b'\xcd' * 8)              # the struct's reserved tail
         run(20, [(80, 'Q', P), (88, 'Q', Q), (104, 'Q', R), (112, 'I', SW),
                  (116, 'I', SW)])
         check(struct.unpack('<3Q', q.read(R, 24)) ==
               (sum(x * y for x, y in zip(a, b)), sum(x * x for x in a),
                sum(y * y for y in b)), 'NCC: the three sums')
+        check(q.read(R + 24, 8) == b'\xcd' * 8, 'NCC: nothing past them')
 
         # DILATE / ERODE of a binary picture, a plus-shaped 3x3 mask
         binimg = bytes(255 if v > 150 else 0 for v in a)
@@ -425,6 +427,12 @@ def main():
                       for k in range(25) if mask[k])
                     for y in range(SH) for x in range(SW)]
             check(list(q.read(R, n)) == want, name + ': plus mask')
+
+        # FILTER: a norm past 31 (a negative int) is capped, not a wild shift
+        run(1, [(64, 'Q', P), (104, 'I', SW), (88, 'Q', R), (116, 'I', SW),
+                (300, 'I', 0), (304, 'I', 0xffffffff), (308, 'I', 3),
+                (312, 'I', 3)] + [(332 + k, 'b', 1) for k in range(9)])
+        check(list(q.read(R, n)) == [0] * n, 'FILTER: norm 0xffffffff shifts by 31')
 
         # FILTER: a 3x3 blur, then a 5x5 sharpen, normalised by right shift
         for kw, m, norm in ((3, [1, 2, 1, 2, 4, 2, 1, 2, 1], 4),
