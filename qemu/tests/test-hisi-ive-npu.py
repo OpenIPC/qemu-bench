@@ -125,6 +125,41 @@ CSC_TO_YUV = {
 }
 
 
+OCT_STEP = ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))
+
+
+def canny_ref(mag, ang, w, h, lo, hi):
+    """the engine's thinning and hysteresis: classes and the seed list"""
+    def m(x, y):
+        return 0 if x < 0 or y < 0 or x >= w or y >= h else mag[y * w + x]
+    state = [0] * (w * h)
+    edge = [1] * (w * h)
+    seeds = []
+    for y in range(h):
+        for x in range(w):
+            i = y * w + x
+            dx, dy = OCT_STEP[ang[i] & 7]
+            v = mag[i]
+            n1, n2 = m(x + dx, y + dy), m(x - dx, y - dy)
+            if (ang[i] & 1):
+                keep = v > n1 and v > n2
+            elif dy < 0 or (dy == 0 and dx < 0):
+                keep = v > n1 and v >= n2
+            else:
+                keep = v >= n1 and v > n2
+            if not keep or v <= lo:
+                continue
+            if v <= hi:
+                state[i], edge[i] = 1, 0
+                continue
+            if (x and state[i - 1] in (2, 3)) or (y and state[i - w] == 2):
+                state[i], edge[i] = 3, 0
+                continue
+            state[i], edge[i] = 2, 2
+            seeds.append(x | y << 16)
+    return edge, seeds
+
+
 def band(v, lo, hi, a, b, c):
     r = a if v <= lo else b if v <= hi else c
     return v if r is None else r
@@ -640,6 +675,30 @@ def main():
                                           0, 255))
             check(list(q.read(R + 0x1000, n // 2)) == want,
                   'CSC: mode %d, the chroma of each block top-left pixel' % mode)
+
+        # CANNY_HYS_EDGE: the task has no picture -- the driver runs a
+        # mag_and_ang task into the ctrl's mem first, so the input is a
+        # U16 magnitude with the octant angle right after it
+        MAGB = IMG + 0x240000
+        STACK = IMG + 0x260000
+        magv = [min(abs(x), 0xffff) for x in gh]
+        angv = [octant(x, y) for x, y in zip(gh, gv)]
+        q.write(MAGB, struct.pack('<%dH' % n, *magv))
+        q.write(MAGB + 2 * SW * SH, bytes(angv))
+        for lo, hi in ((60, 400), (2, 10), (300, 301)):
+            q.write(STACK, b'\xee' * (4 * n + 16))
+            run(22, [(64, 'Q', MAGB), (96, 'I', 2 * SW), (80, 'Q', R),
+                     (104, 'I', SW), (88, 'Q', STACK), (300, 'I', lo),
+                     (304, 'I', hi)])
+            want, seeds = canny_ref(magv, angv, SW, SH, lo, hi)
+            check(list(q.read(R, n)) == want,
+                  'CANNY_HYS_EDGE: classes, %d / %d' % (lo, hi))
+            got = list(struct.unpack('<%dI' % len(seeds),
+                                     q.read(STACK, 4 * len(seeds)))) if seeds else []
+            check(got == seeds,
+                  'CANNY_HYS_EDGE: %d seeds in raster order' % len(seeds))
+            check(struct.unpack('<I', q.read(STACK + 4 * n, 4))[0] == len(seeds),
+                  'CANNY_HYS_EDGE: the stack size past the points')
 
         # RESIZE: the op whose parameters sit in a block of its own, which
         # is also why its task carries no op code and no size

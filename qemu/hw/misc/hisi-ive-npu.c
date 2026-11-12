@@ -103,7 +103,8 @@ enum {
     OP_HIST = 12, OP_THRESH_S16 = 13, OP_THRESH_U16 = 14, OP_16TO8 = 15,
     OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
     OP_CCL = 21, OP_LBP = 23, OP_NORM_GRAD = 24, OP_SAD = 27, OP_RESIZE = 29,
-    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_ACC = 32, OP_IMAGE_DOT = 33,
+    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_ACC = 32,
+    OP_IMAGE_DOT = 33,
     OP_ALPHA = 34,
 };
 
@@ -932,6 +933,46 @@ static bool op_resize(const uint8_t *t)
     return true;
 }
 
+/*
+ * CANNY_HYS_EDGE (ot_ive_canny_hys_edge_ctrl): the task has no source
+ * picture.  The driver runs a mag_and_ang task first, into the ctrl's own
+ * mem: the U16 magnitude, then the octant angle right after it.  This
+ * task gets that buffer at +64 (the magnitude's byte stride at +96, the
+ * angle's rows are w), the edge picture at +80 (+104) and the stack of
+ * seeds at +88, with the thresholds at +300 / +304.  The stack is
+ * ot_svp_point_u16 per seed and then, past the picture's worth of them,
+ * the ot_ive_canny_stack_size the MPI's walk reads.
+ */
+static void op_canny_hys_edge(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t n = w * h, base = task_addr(t, 64), stride = task_u32(t, 96);
+    g_autofree uint16_t *mag = g_new(uint16_t, n);
+    g_autofree uint8_t *ang = g_malloc(n);
+    g_autofree uint8_t *edge = g_malloc(n);
+    g_autofree uint32_t *stack = g_new0(uint32_t, n);
+    uint32_t count = 0;
+    uint8_t tail[16] = { 0 };
+
+    img_read(base, stride, (uint8_t *)mag, w * 2, h);
+    /* the angle follows the magnitude, one byte per pixel */
+    img_read(base + (uint64_t)stride * h, w, ang, w, h);
+    for (uint32_t i = 0; i < n; i++) {
+        mag[i] = le16_to_cpu(mag[i]);
+    }
+    ive_canny_hys_edge(mag, ang, w, h, task_u32(t, 300), task_u32(t, 304),
+                       edge, stack, n, &count);
+    task_put(t, 80, 104, edge, w, h, 1);
+    for (uint32_t i = 0; i < count && i < n; i++) {
+        stack[i] = cpu_to_le32(stack[i]);
+    }
+    dma_memory_write(&address_space_memory, task_addr(t, 88), stack,
+                     (uint64_t)MIN(count, n) * 4, MEMTXATTRS_UNSPECIFIED);
+    stl_le_p(tail, count);
+    dma_memory_write(&address_space_memory,
+                     task_addr(t, 88) + (uint64_t)n * 4, tail, sizeof(tail),
+                     MEMTXATTRS_UNSPECIFIED);
+}
+
 static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
 {
     uint32_t op = task_u32(t, TASK_OP);
@@ -1006,6 +1047,9 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
         break;
     case OP_MAG_AND_ANG:
         op_mag_and_ang(t, w, h);
+        break;
+    case OP_CANNY:
+        op_canny_hys_edge(t, w, h);
         break;
     case OP_NORM_GRAD:
         op_norm_grad(t, w, h);

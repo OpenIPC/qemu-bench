@@ -308,6 +308,7 @@ semantics are the same:
 | image_dot | acc's layout with S32 pictures, so the strides are already in bytes |
 | alpha_blending | +80 / +88 / +96 the sources and the alpha, +112 destination, strides +120 / +124 / +128 / +136 |
 | resize | the only op with no fields in the task: see below |
+| canny_hys_edge | +64 the magnitude (U16, byte stride +96) with the octant angle right after it, +80 the edge picture (+104), +88 the stack of seeds; low / high at +300 / +304 |
 
 Edges are replicated.
 
@@ -341,6 +342,27 @@ binary under QEMU and compares file by file):
   the standard coefficients divided by 1.164 where the output is video
   range. Modes 4..7 (HSV, LAB) do not exist on V5 -- the MPI refuses
   them with "mode must be in [0, 3] or [8, 12)".
+- **canny_hys_edge** takes no picture: the driver runs a mag_and_ang
+  task into the ctrl's own `mem` first, so the op reads that buffer --
+  the U16 magnitude, then the octant angle immediately after it -- and
+  writes the edge classes plus a stack of seeds. The classes are
+  **1 for not an edge, 0 for a possible edge and 2 for an edge**, which
+  is the opposite way round from what the numbers suggest.
+  Suppression keeps a pixel whose magnitude beats its two neighbours
+  along the gradient's octant, reading a neighbour outside the picture
+  as 0 (not replicated, so border pixels survive): strictly on the side
+  that comes earlier in raster order for the axis-aligned octants, and
+  strictly on both sides for the diagonals. The low threshold is strict
+  (`mag > low`), the high one too. A kept pixel over the high threshold
+  is a seed unless the pixel to its left is itself an edge or the pixel
+  above it is a seed -- the engine thins the seeds, so a straight edge
+  alternates 2, 0, 2, 0 -- and the seeds go on the stack in raster
+  order as `ot_svp_point_u16`, with `ot_ive_canny_stack_size` after a
+  picture's worth of them. The thinning rule fitted here still puts
+  about one seed in a thousand on the other pixel of a pair, which
+  changes nothing: `ss_mpi_ive_canny_edge` walks 8-connected from every
+  seed, and the edge picture it produces is byte-identical to the
+  board's in all 18 captured cases.
 - **resize**: `ive_fill_npu_resize_task` puts the parameters in a block
   of its own in DDR, whose address is at task +64 and whose first word is
   the op code 29 and second the number of records. The task's +288, +292
@@ -357,7 +379,30 @@ binary under QEMU and compares file by file):
   matches the silicon.
 
 Still to come (#268): st_box_flt_and_eigen, candidate_corner,
-canny_hys_edge, lk_optical_flow_pyr, gmm2.
+lk_optical_flow_pyr, gmm2. What is known about them:
+
+- **st_cand_corner is a sequence**, not one op: norm_grad (norm 3, both
+  gradients interleaved as S8C2) into the ctrl's mem, then
+  st_box_flt_and_eigen (op 25) over those gradients, writing a U16 map
+  of the corner measure and, right after it, that map's maximum; then
+  16bit_to_8bit with the ratio 255 / maximum, a threshold at
+  `quality_level`, a 3x3 maximum filter (ord_stat_filter), and finally
+  candidate_corner (op 26). **Op 26 is `(a == b && a > 0) ? a : 0`** of
+  the thresholded map and its maximum filter -- plain non-maximum
+  suppression -- which reproduces the captured candidate picture
+  exactly. Op 25's measure is homogeneous of degree one in the 3x3
+  structure tensor and is close to `det / trace` divided by about 13,
+  but no arithmetic fitted so far matches it: the scale drifts a few
+  percent with the window's anisotropy.
+- **gmm2**'s model is 8 bytes per Gaussian: the mean and the variance as
+  U9Q7, then the frequency and the life as U16. A new Gaussian starts at
+  (value, `max_var`, `freq_init_val`, 1). On a match the variance falls
+  by `var >> 7` and the frequency becomes
+  `((freq * freq_reduce_factor) >> 16) + freq_add_factor`; on a miss the
+  frequency is `(freq * freq_reduce_factor) >> 16` and the variance does
+  not move. Both were checked against a flat picture stepped twice. The
+  match test, the mean update and the background decision are still
+  open.
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
 `cur_area_threshold` [22:0], `label_status` [23] and `rgn_num` [31:24],

@@ -264,6 +264,41 @@ static const td_s8 g_sobel[OT_IVE_MASK_NUM] = {
 #define W   64
 #define H   64
 
+/*
+ * A picture whose normalised gradients are a controlled sweep: with
+ * src = (x^2 * ax + y^2 * ay) / 64 the Sobel's gx grows with x and gy
+ * with y, so a 3x3 window's structure tensor is near-diagonal and its
+ * two entries sweep the picture.  That is what makes the eigen op's
+ * arithmetic readable: every (A, C) pair appears somewhere, with B ~ 0.
+ */
+static void fill_quad(ot_svp_img *img, int ax, int ay, int off)
+{
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int v = off + ((int)(x * x) * ax + (int)(y * y) * ay) / 64;
+
+            row[x] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+    }
+}
+
+/* a tilted plane plus a fine ripple, so the gradient direction turns */
+static void fill_swirl(ot_svp_img *img, int k, int amp)
+{
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int v = 128 + ((int)x * k) / 4 - ((int)y * k) / 4 +
+                    amp * (((x / 3) % 2) ? 1 : -1) * (((y / 3) % 2) ? 1 : -1);
+
+            row[x] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+    }
+}
+
 static void cap_mag_and_ang(void)
 {
     ot_svp_img src, mag, ang;
@@ -306,7 +341,14 @@ static void cap_canny(void)
     ot_ive_canny_hys_edge_ctrl c = { 0 };
     ot_ive_handle h;
     /* a weak band that touches the strong pixels (20 / 60) as well as 50 / 150 */
-    static const td_u16 lo[] = { 50, 20, 100 }, hi[] = { 150, 60, 400 };
+    /*
+     * Thresholds chosen to separate the two rules: a band that touches
+     * the strong pixels (20 / 60), one that is almost everything
+     * (2 / 10), one where weak is wide and strong rare (10 / 600), and
+     * one with no weak band at all (300 / 301).
+     */
+    static const td_u16 lo[] = { 50, 20, 100, 2, 10, 300 },
+                        hi[] = { 150, 60, 400, 10, 600, 301 };
     char n[64];
 
     if (mk(&src, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&edge, OT_SVP_IMG_TYPE_U8C1, W, H)) {
@@ -320,7 +362,7 @@ static void cap_canny(void)
     memcpy(c.mask, g_sobel, sizeof(c.mask));
     for (int s = 0; s < 3; s++) {
         fill_u8(&src, 2 + s * 7);
-        for (int t = 0; t < 3; t++) {
+        for (int t = 0; t < 6; t++) {
             c.low_threshold = lo[t];
             c.high_threshold = hi[t];
             snprintf(n, sizeof(n), "canny_s%d_t%d", s, t);
@@ -436,12 +478,30 @@ static void cap_st(void)
         return;
     }
     c.quality_level = 25;
-    for (int s = 0; s < 2; s++) {
-        fill_u8(&src, 5 + s * 9);
+    for (int s = 0; s < 6; s++) {
+        switch (s) {
+        case 0: case 1:
+            fill_u8(&src, 5 + s * 9);
+            break;
+        case 2:
+            fill_quad(&src, 6, 1, 0);           /* A >> C, both sweeping */
+            break;
+        case 3:
+            fill_quad(&src, 2, 2, 0);           /* A ~ C */
+            break;
+        case 4:
+            fill_swirl(&src, 8, 20);            /* B large */
+            break;
+        default:
+            fill_swirl(&src, 2, 60);
+            break;
+        }
         snprintf(n, sizeof(n), "st_s%d_cand_corner", s);
         if (done(n, ss_mpi_ive_st_cand_corner(&h, &src, &cand, &c, TD_TRUE), h)) {
             continue;
         }
+        snprintf(n, sizeof(n), "st_s%d_src", s);
+        dump_img(n, &src);
         snprintf(n, sizeof(n), "st_s%d_cand", s);
         dump_img(n, &cand);
         /*
@@ -538,11 +598,34 @@ static void cap_lk(void)
     c.min_eig_val_threshold = 100;
     c.iter_cnt = 10;
     c.eps = 2;
-    if (!done("lk_optical_flow_pyr", ss_mpi_ive_lk_optical_flow_pyr(&h, prev, next, &pp, &np,
-                                                                   &st, &er, &c, TD_TRUE), h)) {
-        dump_mem("lk_next_points", np.virt_addr, sizeof(ot_svp_point_s25q7) * LK_PTS);
-        dump_mem("lk_status", st.virt_addr, LK_PTS);
-        dump_mem("lk_err", er.virt_addr, sizeof(td_u9q7) * LK_PTS);
+    /* in eighths of a pixel: along x, along y, diagonal, sub-pixel, large */
+    static const int dxs[] = { 13, 8, 0, 16, 2, 40 },
+                     dys[] = { -9, 0, 12, 16, 1, -24 };
+
+    for (int k = 0; k < (int)(sizeof(dxs) / sizeof(dxs[0])); k++) {
+        char n[64];
+
+        for (int l = 0; l <= LK_LVL; l++) {
+            fill_scene(&next[l], l, dxs[k], dys[k]);
+        }
+        for (int i = 0; i < LK_PTS; i++) {
+            ot_svp_point_s25q7 *p = PTR(ot_svp_point_s25q7, pp.virt_addr) + i;
+
+            p->x = (48 + (i % 4) * 48) << 7;
+            p->y = (48 + (i / 4) * 48) << 7;
+        }
+        memset(PTR(td_u8, np.virt_addr), 0, sizeof(ot_svp_point_s25q7) * LK_PTS);
+        snprintf(n, sizeof(n), "lk_d%d", k);
+        if (done(n, ss_mpi_ive_lk_optical_flow_pyr(&h, prev, next, &pp, &np,
+                                                   &st, &er, &c, TD_TRUE), h)) {
+            continue;
+        }
+        snprintf(n, sizeof(n), "lk_d%d_next", k);
+        dump_mem(n, np.virt_addr, sizeof(ot_svp_point_s25q7) * LK_PTS);
+        snprintf(n, sizeof(n), "lk_d%d_status", k);
+        dump_mem(n, st.virt_addr, LK_PTS);
+        snprintf(n, sizeof(n), "lk_d%d_err", k);
+        dump_mem(n, er.virt_addr, sizeof(td_u9q7) * LK_PTS);
     }
     for (int l = 0; l <= LK_LVL; l++) {
         freeimg(&prev[l]);
@@ -603,6 +686,69 @@ static void cap_gmm2(void)
         dump_img(n, &match);
     }
     dump_mem("gmm2_model", model.virt_addr, c.model_num * sizeof(td_u64) * W * H);
+    freemem(&model);
+    freeimg(&src);
+    freeimg(&factor);
+    freeimg(&fg);
+    freeimg(&bg);
+    freeimg(&match);
+}
+
+/*
+ * A second GMM2 sequence, built so the model is readable: the picture is
+ * one value everywhere, so every pixel shares a history, and it steps
+ * twice.  The model slice after each frame shows the update rule, which
+ * the long random-scene run above cannot (its pixels all differ).
+ */
+static void cap_gmm2_flat(void)
+{
+    ot_svp_img src, factor, fg, bg, match;
+    ot_svp_mem_info model;
+    ot_ive_gmm2_ctrl c = { 0 };
+    ot_ive_handle h;
+    static const int val[] = { 100, 100, 100, 100, 150, 150, 100, 220 };
+    char n[64];
+
+    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&factor, OT_SVP_IMG_TYPE_U16C1, W, H) ||
+        mk(&fg, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&bg, OT_SVP_IMG_TYPE_U8C1, W, H) ||
+        mk(&match, OT_SVP_IMG_TYPE_U8C1, W, H)) {
+        return;
+    }
+    c.var_rate = 1;
+    c.model_num = 3;
+    c.max_var = (16 * 16) << 7;
+    c.min_var = (8 * 8) << 7;
+    c.global_sns_factor = 8;
+    c.sns_factor_mode = OT_IVE_GMM2_SNS_FACTOR_MODE_GLOBAL;
+    c.freq_threshold = 12000;
+    c.freq_init_val = 20000;
+    c.freq_add_factor = 0xEF;
+    c.freq_reduce_factor = 0xFF00;
+    c.life_threshold = 500;
+    c.life_update_factor_mode = OT_IVE_GMM2_LIFE_UPDATE_FACTOR_MODE_GLOBAL;
+    c.global_life_update_factor = 0xFFFF;
+    if (mkmem(&model, c.model_num * sizeof(td_u64) * W * H)) {
+        return;
+    }
+    for (int f = 0; f < (int)(sizeof(val) / sizeof(val[0])); f++) {
+        for (td_u32 y = 0; y < H; y++) {
+            memset(PTR(td_u8, src.virt_addr[0]) + y * src.stride[0], val[f], W);
+        }
+        snprintf(n, sizeof(n), "gmm2flat_f%d", f);
+        if (done(n, ss_mpi_ive_gmm2(&h, &src, &factor, &fg, &bg, &match, &model, &c,
+                                    TD_TRUE), h)) {
+            continue;
+        }
+        snprintf(n, sizeof(n), "gmm2flat_f%d_fg", f);
+        dump_img(n, &fg);
+        snprintf(n, sizeof(n), "gmm2flat_f%d_bg", f);
+        dump_img(n, &bg);
+        snprintf(n, sizeof(n), "gmm2flat_f%d_match", f);
+        dump_img(n, &match);
+        /* the first pixels' models: every pixel has the same history */
+        snprintf(n, sizeof(n), "gmm2flat_f%d_model", f);
+        dump_mem(n, model.virt_addr, c.model_num * sizeof(td_u64) * 16);
+    }
     freemem(&model);
     freeimg(&src);
     freeimg(&factor);
@@ -769,6 +915,7 @@ int main(int argc, char **argv)
     cap_st();
     cap_lk();
     cap_gmm2();
+    cap_gmm2_flat();
     cap_acc_dot_alpha();
     cap_csc();
     cap_resize();

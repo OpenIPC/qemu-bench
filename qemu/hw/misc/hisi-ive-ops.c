@@ -21,6 +21,20 @@ static inline uint8_t at(const uint8_t *src, uint32_t w, uint32_t h,
     return src[clampi(y, 0, h - 1) * w + clampi(x, 0, w - 1)];
 }
 
+/*
+ * The 16-bit pixel at (x, y), zero past the picture: the suppression
+ * reads a neighbour outside it as 0, so a border pixel is kept rather
+ * than compared with itself
+ */
+static inline uint16_t at16(const uint16_t *src, uint32_t w, uint32_t h,
+                            int x, int y)
+{
+    if (x < 0 || y < 0 || x >= (int)w || y >= (int)h) {
+        return 0;
+    }
+    return src[(uint32_t)y * w + (uint32_t)x];
+}
+
 void ive_bitwise(int op, const uint8_t *a, const uint8_t *b, uint8_t *out,
                  size_t n)
 {
@@ -502,5 +516,68 @@ void ive_csc_rgb_to_yuv(const uint8_t *b, const uint8_t *g, const uint8_t *r,
                 cout[(size_t)y * w + 2 * x + c] = clampi(t >> 10, 0, 255);
             }
         }
+    }
+}
+
+/* the two neighbours along octant o, and whether each is strictly beaten */
+static const struct {
+    int dx, dy;
+} ive_octant_step[8] = {
+    { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+    { -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+};
+
+void ive_canny_hys_edge(const uint16_t *mag, const uint8_t *ang, uint32_t w,
+                        uint32_t h, uint16_t lo, uint16_t hi, uint8_t *edge,
+                        uint32_t *stack, uint32_t max_pts,
+                        uint32_t *stack_size)
+{
+    /* 0 none, 1 weak by magnitude, 2 a seed, 3 an edge thinned away */
+    g_autofree uint8_t *state = g_malloc0((size_t)w * h);
+    uint32_t n = 0;
+
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            size_t i = (size_t)y * w + x;
+            int o = ang[i] & 7, dx = ive_octant_step[o].dx;
+            int dy = ive_octant_step[o].dy, m = mag[i];
+            /* the neighbour the raster scan has already passed */
+            bool first_earlier = dy < 0 || (dy == 0 && dx < 0);
+            int n1 = at16(mag, w, h, (int)x + dx, (int)y + dy);
+            int n2 = at16(mag, w, h, (int)x - dx, (int)y - dy);
+            bool keep;
+
+            if (o & 1) {                        /* the diagonals: both strict */
+                keep = m > n1 && m > n2;
+            } else {
+                keep = first_earlier ? (m > n1 && m >= n2)
+                                     : (m >= n1 && m > n2);
+            }
+            edge[i] = 1;
+            if (!keep || m <= lo) {
+                continue;
+            }
+            if (m <= hi) {
+                state[i] = 1;
+                edge[i] = 0;
+                continue;
+            }
+            /* an edge: a seed unless one is already next to it */
+            if ((x && (state[i - 1] == 2 || state[i - 1] == 3)) ||
+                (y && state[i - w] == 2)) {
+                state[i] = 3;
+                edge[i] = 0;
+                continue;
+            }
+            state[i] = 2;
+            edge[i] = 2;
+            if (stack && n < max_pts) {
+                stack[n] = x | y << 16;         /* ot_svp_point_u16 */
+            }
+            n++;
+        }
+    }
+    if (stack_size) {
+        *stack_size = n;
     }
 }

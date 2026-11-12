@@ -143,4 +143,27 @@ void ive_csc_rgb_to_yuv(const uint8_t *b, const uint8_t *g, const uint8_t *r,
                         int rgb_stride, uint32_t w, uint32_t h, int mode,
                         uint8_t *yout, uint8_t *cout);
 
+/*
+ * CANNY_HYS_EDGE: the thinning and hysteresis the engine does on
+ * mag_and_ang's two outputs (the U16 magnitude and the octant angle it
+ * wrote first).  Each pixel comes out 1 (not an edge), 0 (a possible
+ * edge) or 2 (an edge, and a seed for the walk ss_mpi_ive_canny_edge
+ * then does over the stack).  `stack` takes the seeds in raster order,
+ * at most `max_pts` of them, and `stack_size` their number.
+ *
+ * Non-maximum suppression keeps a pixel whose magnitude beats its two
+ * neighbours along the gradient's octant: strictly on the side that
+ * comes earlier in raster order for the axis-aligned octants, and
+ * strictly on both sides for the diagonal ones.  A kept pixel above the
+ * low threshold is a possible edge, above the high one an edge, and an
+ * edge is a seed unless the pixel to its left is also one (seeded or
+ * not) or the pixel above it is a seed -- the engine thins the seeds, so
+ * a straight edge alternates.  Which of a run's pixels is the seed does
+ * not change what the walk then produces.
+ */
+void ive_canny_hys_edge(const uint16_t *mag, const uint8_t *ang, uint32_t w,
+                        uint32_t h, uint16_t lo, uint16_t hi, uint8_t *edge,
+                        uint32_t *stack, uint32_t max_pts,
+                        uint32_t *stack_size);
+
 #endif
