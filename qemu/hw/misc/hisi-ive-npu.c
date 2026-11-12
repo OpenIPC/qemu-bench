@@ -102,7 +102,9 @@ enum {
     OP_THRESH = 7, OP_AND = 8, OP_SUB = 9, OP_OR = 10, OP_INTEG = 11,
     OP_HIST = 12, OP_THRESH_S16 = 13, OP_THRESH_U16 = 14, OP_16TO8 = 15,
     OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
-    OP_CCL = 21, OP_SAD = 27,
+    OP_CCL = 21, OP_LBP = 23, OP_NORM_GRAD = 24, OP_SAD = 27, OP_RESIZE = 29,
+    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_ACC = 32, OP_IMAGE_DOT = 33,
+    OP_ALPHA = 34,
 };
 
 #define PIC_MAX             4096
@@ -659,6 +661,277 @@ static void op_ord_stat(const uint8_t *t, uint32_t w, uint32_t h)
     task_put(t, 96, 112, out, w, h, 1);
 }
 
+/*
+ * MAG_AND_ANG (ot_ive_mag_and_ang_ctrl): +64 the U8 source (+96); the
+ * magnitude as U16 at +80 (+104, bytes) and, when out_ctrl (+328) is 1,
+ * the angle at +88 (+108).  The 5x5 S8 mask is at +300, the threshold at
+ * +332 and the mask's range code -- which picks the engine's internal
+ * scale, and is 0 for the Sobel masks the SDK uses -- at +336.
+ */
+static void op_mag_and_ang(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t n = w * h, ctrl = task_u32(t, 328);
+    g_autofree uint8_t *f = task_img(t, 64, 96, w, h, 1);
+    g_autofree uint16_t *mag = g_new(uint16_t, n);
+    g_autofree uint8_t *ang = ctrl == 1 ? g_malloc(n) : NULL;
+
+    ive_mag_and_ang(f, w, h, (const int8_t *)t + 300, task_u32(t, 332),
+                    mag, ang);
+    for (uint32_t i = 0; i < n; i++) {
+        mag[i] = cpu_to_le16(mag[i]);
+    }
+    task_put(t, 80, 104, mag, w, h, 2);
+    if (ang) {
+        task_put(t, 88, 108, ang, w, h, 1);
+    }
+}
+
+/*
+ * NORM_GRAD (ot_ive_norm_grad_ctrl): +64 the U8 source (+96), the 5x5 S8
+ * mask at +300, norm at +336 and out_ctrl at +328: 0 both gradients as S8
+ * (+80 / +104 and +88 / +108), 1 the horizontal or 2 the vertical alone
+ * at +80, 3 both interleaved as S8C2 at +80 with a doubled stride
+ */
+static void op_norm_grad(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t n = w * h, ctrl = task_u32(t, 328);
+    g_autofree uint8_t *f = task_img(t, 64, 96, w, h, 1);
+    g_autofree int8_t *gh = g_new(int8_t, n);
+    g_autofree int8_t *gv = g_new(int8_t, n);
+
+    if (ctrl > 3) {
+        return;
+    }
+    ive_norm_grad(f, w, h, (const int8_t *)t + 300, task_u32(t, 336),
+                  ctrl == 2 ? NULL : gh, ctrl == 1 ? NULL : gv);
+    if (ctrl == 3) {
+        g_autofree int8_t *pack = g_new(int8_t, 2 * n);
+
+        for (uint32_t i = 0; i < n; i++) {
+            pack[2 * i] = gh[i];
+            pack[2 * i + 1] = gv[i];
+        }
+        task_put(t, 80, 104, pack, w, h, 2);
+        return;
+    }
+    task_put(t, 80, 104, ctrl == 2 ? gv : gh, w, h, 1);
+    if (!ctrl) {
+        task_put(t, 88, 108, gv, w, h, 1);
+    }
+}
+
+/*
+ * LBP (ot_ive_lbp_ctrl): +80 the U8 source (+104), +96 the destination
+ * (+112); mode at +300 and the threshold at +304, signed in normal mode
+ */
+static void op_lbp(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t mode = task_u32(t, 300);
+    g_autofree uint8_t *f = task_img(t, 80, 104, w, h, 1);
+    g_autofree uint8_t *out = g_malloc(w * h);
+    int thr = mode ? (uint8_t)task_u32(t, 304) : (int8_t)task_u32(t, 304);
+
+    ive_lbp(f, w, h, mode, thr, out);
+    task_put(t, 96, 112, out, w, h, 1);
+}
+
+/*
+ * ACC (+80 / +88 the sources, +104 the destination, strides +112 / +116 /
+ * +124, mode +300), IMAGE_DOT (the same with S32 pictures, so the strides
+ * are in bytes already) and ALPHA_BLENDING (+80 / +88 / +96 the two
+ * sources and the alpha, +112 the destination, strides +120 / +124 /
+ * +128 / +136)
+ */
+static void op_acc(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *a = task_img(t, 80, 112, w, h, 1);
+    g_autofree uint8_t *b = task_img(t, 88, 116, w, h, 1);
+
+    ive_acc(a, b, a, w * h, task_u32(t, 300));
+    task_put(t, 104, 124, a, w, h, 1);
+}
+
+static void op_image_dot(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t n = w * h;
+    g_autofree int32_t *a = task_img(t, 80, 112, w, h, 4);
+    g_autofree int32_t *b = task_img(t, 88, 116, w, h, 4);
+
+    for (uint32_t i = 0; i < n; i++) {
+        a[i] = le32_to_cpu(a[i]);
+        b[i] = le32_to_cpu(b[i]);
+    }
+    ive_image_dot(a, b, a, n);
+    for (uint32_t i = 0; i < n; i++) {
+        a[i] = cpu_to_le32(a[i]);
+    }
+    task_put(t, 104, 124, a, w, h, 4);
+}
+
+static void op_alpha_blend(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *a = task_img(t, 80, 120, w, h, 1);
+    g_autofree uint8_t *b = task_img(t, 88, 124, w, h, 1);
+    g_autofree uint8_t *al = task_img(t, 96, 128, w, h, 1);
+
+    ive_alpha_blend(a, b, al, a, w * h);
+    task_put(t, 112, 136, a, w, h, 1);
+}
+
+/*
+ * CSC (ot_ive_csc_ctrl): the source's format code at +300 and the
+ * destination's at +304 (1 / 0 YUV420SP, 2 / 1 YUV422SP, 3 / 2 packed
+ * RGB, 4 / 3 planar RGB), the mode at +308.  The source planes are at
+ * +80 / +88 / +96 with their strides at +136 / +140 / +144, the
+ * destination's at +112 / +120 / +128 and +152 / +156 / +160.
+ */
+static void op_csc(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    uint32_t sfmt = task_u32(t, 300), dfmt = task_u32(t, 304);
+    uint32_t mode = task_u32(t, 308), n = w * h;
+    bool to_rgb = mode < 4;
+
+    /*
+     * The format codes are the source's 1 / 2 / 3 / 4 and the
+     * destination's 0 / 1 / 2 / 3 for YUV420SP, YUV422SP, packed and
+     * planar RGB.  Only the pairs the SDK's modes allow are computed:
+     * semi-planar YUV to RGB, or RGB to YUV420SP.
+     */
+    if (!ive_csc_mode_valid(mode) || (w | h) & 1 ||
+        (to_rgb ? (sfmt != 1 && sfmt != 2) || (dfmt != 2 && dfmt != 3)
+                : (sfmt != 3 && sfmt != 4) || dfmt != 0)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "hisi-ive-npu: csc mode %u, %u to %u, %ux%u\n",
+                      mode, sfmt, dfmt, w, h);
+        return;
+    }
+    if (to_rgb) {
+        /* Y at +80, the chroma pairs at +88; 420 doubles each line */
+        bool sp420 = sfmt == 1;
+        g_autofree uint8_t *y = task_img(t, 80, 136, w, h, 1);
+        g_autofree uint8_t *c = task_img(t, 88, 140, w, sp420 ? h / 2 : h, 1);
+        g_autofree uint8_t *u = g_malloc(n);
+        g_autofree uint8_t *v = g_malloc(n);
+        g_autofree uint8_t *out = g_malloc(3 * n);
+        uint8_t *ch[3];
+
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t row = sp420 ? (i / w) / 2 : i / w;
+            const uint8_t *p = c + row * w + (i % w & ~1u);
+
+            v[i] = p[0];
+            u[i] = p[1];
+        }
+        for (int k = 0; k < 3; k++) {
+            ch[k] = out + (dfmt == 3 ? k * n : k);
+        }
+        ive_csc_yuv_to_rgb(y, u, v, ch, dfmt == 3 ? 1 : 3, n, mode);
+        if (dfmt == 3) {
+            for (int k = 0; k < 3; k++) {
+                task_put(t, 112 + 8 * k, 152 + 4 * k, out + k * n, w, h, 1);
+            }
+        } else {
+            task_put(t, 112, 152, out, w, h, 3);
+        }
+        return;
+    }
+    {
+        /* RGB in, YUV420SP out: the chroma plane is half the height */
+        bool planar = sfmt == 4;
+        g_autofree uint8_t *rgb = planar ? g_malloc(3 * n)
+                                         : task_img(t, 80, 136, w, h, 3);
+        g_autofree uint8_t *y = g_malloc(n);
+        g_autofree uint8_t *c = g_malloc(n / 2);
+        const uint8_t *p[3];
+        int step = planar ? 1 : 3;
+
+        if (planar) {
+            for (int k = 0; k < 3; k++) {
+                g_autofree uint8_t *pl = task_img(t, 80 + 8 * k, 136 + 4 * k,
+                                                  w, h, 1);
+
+                memcpy(rgb + k * n, pl, n);
+            }
+        }
+        for (int k = 0; k < 3; k++) {
+            p[k] = rgb + (planar ? k * n : k);
+        }
+        ive_csc_rgb_to_yuv(p[0], p[1], p[2], step, w, h, mode, y, c);
+        task_put(t, 112, 152, y, w, h, 1);
+        task_put(t, 120, 156, c, w, h / 2, 1);
+    }
+}
+
+/*
+ * RESIZE (op 29): the one op whose parameters are not in the task.  The
+ * driver (ive_fill_npu_resize_task) builds a block in DDR -- its address
+ * at task +64 -- holding the op code, the number of records, and then one
+ * 64-byte record per picture (or per plane), with the fields from +16:
+ * source and destination addresses, their strides, the source and
+ * destination sizes, and a Q27 ratio and start fraction per axis.  The
+ * task's own op code and size are left at zero, which is how a resize is
+ * told apart from a DMA.
+ */
+#define RSZ_OP          0
+#define RSZ_COUNT       4
+#define RSZ_RECORD      64
+#define RSZ_SRC         16
+#define RSZ_DST         20
+#define RSZ_SRC_STRIDE  24
+#define RSZ_DST_STRIDE  28
+#define RSZ_SRC_W       32
+#define RSZ_SRC_H       36
+#define RSZ_DST_W       40
+#define RSZ_DST_H       44
+#define RSZ_XRATIO      48
+#define RSZ_XOFF        52
+#define RSZ_YRATIO      56
+#define RSZ_YOFF        60
+#define RSZ_MAX         64      /* records per push: the SDK's num is <= 32 */
+
+static bool op_resize(const uint8_t *t)
+{
+    uint32_t base = task_addr(t, 64);
+    uint8_t hdr[8];
+    uint32_t count;
+
+    if (!base) {
+        return false;
+    }
+    dma_memory_read(&address_space_memory, base, hdr, sizeof(hdr),
+                    MEMTXATTRS_UNSPECIFIED);
+    if (ldl_le_p(hdr + RSZ_OP) != OP_RESIZE) {
+        return false;
+    }
+    count = ldl_le_p(hdr + RSZ_COUNT);
+    for (uint32_t i = 0; i < MIN(count, RSZ_MAX); i++) {
+        uint8_t r[RSZ_RECORD + 4];
+        uint32_t sw, sh, dw, dh;
+
+        dma_memory_read(&address_space_memory, base + (uint64_t)i * RSZ_RECORD,
+                        r, sizeof(r), MEMTXATTRS_UNSPECIFIED);
+        sw = ldl_le_p(r + RSZ_SRC_W);
+        sh = ldl_le_p(r + RSZ_SRC_H);
+        dw = ldl_le_p(r + RSZ_DST_W);
+        dh = ldl_le_p(r + RSZ_DST_H);
+        if (!sw || !sh || !dw || !dh ||
+            sw > PIC_MAX || sh > PIC_MAX || dw > PIC_MAX || dh > PIC_MAX) {
+            continue;
+        }
+        g_autofree uint8_t *src = g_malloc((size_t)sw * sh);
+        g_autofree uint8_t *dst = g_malloc((size_t)dw * dh);
+
+        img_read(ldl_le_p(r + RSZ_SRC), ldl_le_p(r + RSZ_SRC_STRIDE),
+                 src, sw, sh);
+        ive_resize(src, sw, sh, dst, dw, dh,
+                   ldl_le_p(r + RSZ_XRATIO), (int32_t)ldl_le_p(r + RSZ_XOFF),
+                   ldl_le_p(r + RSZ_YRATIO), (int32_t)ldl_le_p(r + RSZ_YOFF));
+        img_write(ldl_le_p(r + RSZ_DST), ldl_le_p(r + RSZ_DST_STRIDE),
+                  dst, dw, dh);
+    }
+    return true;
+}
+
 static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
 {
     uint32_t op = task_u32(t, TASK_OP);
@@ -667,6 +940,13 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
     if (s->trace) {
         fprintf(stderr, "hisi-ive-npu: task %u op %u %ux%u\n",
                 lduw_le_p(t + TASK_ID), op, w, h);
+    }
+    if (!op && !w && !h) {
+        /* a resize carries its own parameter block and no size */
+        if (op_resize(t)) {
+            s->ops++;
+        }
+        return;
     }
     if (!w || !h || w > PIC_MAX || h > PIC_MAX) {
         return;
@@ -720,6 +1000,27 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
         break;
     case OP_ORD_STAT:
         op_ord_stat(t, w, h);
+        break;
+    case OP_CSC:
+        op_csc(t, w, h);
+        break;
+    case OP_MAG_AND_ANG:
+        op_mag_and_ang(t, w, h);
+        break;
+    case OP_NORM_GRAD:
+        op_norm_grad(t, w, h);
+        break;
+    case OP_LBP:
+        op_lbp(t, w, h);
+        break;
+    case OP_ACC:
+        op_acc(t, w, h);
+        break;
+    case OP_IMAGE_DOT:
+        op_image_dot(t, w, h);
+        break;
+    case OP_ALPHA:
+        op_alpha_blend(t, w, h);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "hisi-ive-npu: op %u\n", op);
