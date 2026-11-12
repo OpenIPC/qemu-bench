@@ -702,10 +702,18 @@ in this order:
     ring in DDR that the SVP NPU's task scheduler runs (`hisi-ive-npu`,
     0x14000000, SPI 76). The model follows the ring's links (+6 id, +8
     next) and computes the op named by the code at +288; the NPU models
-    the driver loads are shared between ops and are never run. 21 ops
+    the driver loads are shared between ops and are never run. 29 ops
     are modelled, their pixel work in `hisi-ive-ops.c`, shared with V4's
     `hisi-ive` (`test-hisi-ive-npu.py`, CI; `test-hisi-v5-sample-ive.sh
-    --sdk`, local: the SDK's memory test, and its sobel against numpy). majestic's motion
+    --sdk`, local: the SDK's memory test, and its sobel against numpy).
+    Resize is the one op whose parameters are not in the task: they are
+    in a block whose address is at +64, and its task carries no op code
+    and no size. The engine's rounding is in neither the driver nor the
+    SDK, so the ops' arithmetic is fitted against a CV608 board:
+    `ive-v5-capture.sh --board HOST --qemu` runs every op through the MPI
+    on both and compares the outputs byte for byte (references in
+    `qemu/tests/data/`). canny_hys_edge, the Shi-Tomasi pair, LK and GMM2
+    are still open (#268). majestic's motion
     detection would use it, but reads VPSS extended channel 3, which is
     not modelled (#273).
   - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`

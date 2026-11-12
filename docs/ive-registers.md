@@ -300,11 +300,64 @@ semantics are the same:
 | filter | +64 / +104 source Y, +88 / +116 destination Y (UV at +72 / +96 when +300 is set); norm +304, kernel w / h +308 / +312, the S8 mask at +332 |
 | sobel | +64 / +96 source; 5x5 S8 mask at +300, its transpose for the vertical; out_ctrl +328: both at +80 / +88 (+104 / +108), or one at +80 |
 | ord_stat_filter | +80 / +104 source, +96 / +112 destination; mode +300: median, max, min |
+| csc | source planes +80 / +88 / +96 and strides +136 / +144, destination +112 / +120 / +128 and +152 / +160; source and destination format codes +300 / +304, mode +308 |
+| mag_and_ang | +64 / +96 source; magnitude (U16) +80 / +104, angle +88 / +108 when out_ctrl (+328) is 1; 5x5 S8 mask +300, threshold +332, the mask's range code +336 |
+| norm_grad | +64 / +96 source, 5x5 S8 mask +300, norm +336; out_ctrl +328: 0 both at +80 / +88, 1 or 2 one at +80, 3 both interleaved as S8C2 |
+| lbp | +80 / +104 source, +96 / +112 destination; mode +300, threshold +304 (S8 in normal mode) |
+| acc | +80 / +88 sources, +104 destination, strides +112 / +116 / +124; mode +300 |
+| image_dot | acc's layout with S32 pictures, so the strides are already in bytes |
+| alpha_blending | +80 / +88 / +96 the sources and the alpha, +112 destination, strides +120 / +124 / +128 / +136 |
+| resize | the only op with no fields in the task: see below |
 
-Edges are replicated. Still to come: csc, mag_and_ang, lbp, norm_grad,
-st_box_flt_and_eigen, candidate_corner, canny_hys_edge,
-lk_optical_flow_pyr, gmm2, acc, image_dot, alpha_blending, resize. Their
-semantics need checking against the SDK's samples first (#268).
+Edges are replicated.
+
+### The ops' arithmetic, from a board
+
+The engine's rounding is not in the driver, so these were fitted against
+a Hi3516CV608 running the same SDK (`qemu-boot/ive-v5-capture.c` runs
+every op on fixed inputs; the references are in
+`qemu/tests/data/ive-v5-cv608-ref.tar.xz` and `--qemu` runs the same
+binary under QEMU and compares file by file):
+
+- **mag_and_ang**: the magnitude is `|gh| + |gv|` saturated to U16 and
+  zeroed below the threshold; the angle is the gradient's octant --
+  `atan2` rounded to the nearest 45 degrees, 0 for +x -- and the
+  threshold does not apply to it.
+- **norm_grad**: `(g + (1 << (norm - 1))) >> norm` saturated to S8, so
+  halves round up.
+- **lbp**: bit 7 is the top-left neighbour, then clockwise to bit 0
+  (left). Normal mode sets a bit where `neighbour - centre >= thr` with
+  `thr` as S8, abs mode where `|neighbour - centre| >= thr`.
+- **acc**: mode 0 `a + b`, mode 1 `a - b`, mode 2 `a + (b & 1)`, each
+  saturated to U8.
+- **image_dot**: `(a * b + 2^29) >> 30` of two S17Q15 pictures.
+- **alpha_blending**: `(a * alpha + b * (255 - alpha) + 128) >> 8`.
+- **csc**: a Q10 matrix and a per-channel constant, clamped to 16..235
+  for the video-range modes (0 / 1 out, 10 / 11 in) and 0..255 for the
+  full-range ones (2 / 3, 8 / 9); BT.601 is each pair's even mode. RGB,
+  packed or planar, is B, G, R, and YUV420SP's chroma plane is V then U.
+  Out of 420 the chroma is replicated; into it each 2x2 block takes its
+  top-left pixel's chroma. The matrices are in `hisi-ive-ops.c`; they are
+  the standard coefficients divided by 1.164 where the output is video
+  range. Modes 4..7 (HSV, LAB) do not exist on V5 -- the MPI refuses
+  them with "mode must be in [0, 3] or [8, 12)".
+- **resize**: `ive_fill_npu_resize_task` puts the parameters in a block
+  of its own in DDR, whose address is at task +64 and whose first word is
+  the op code 29 and second the number of records. The task's +288, +292
+  and +296 stay zero, which is how a resize is told from a dma. Each
+  record is 64 bytes, its fields from +16: source and destination
+  addresses, their strides, source and destination width and height, and
+  a Q27 ratio and start fraction per axis (`(ratio - 2^27) / 2`, negative
+  when upscaling, its integer part folded into the source address).
+  Per pixel: `p = offset + i * ratio`, the index `p >> 27` clamped to the
+  source, the low 27 bits taken to a Q12 weight; the two rows are
+  interpolated into a 7-bit intermediate (`+ 16 >> 5`) and the column
+  weights applied to that (`>> 17`, summed, `+ 2 >> 2`). Both the
+  intermediate width and the asymmetric rounding matter: nothing simpler
+  matches the silicon.
+
+Still to come (#268): st_box_flt_and_eigen, candidate_corner,
+canny_hys_edge, lk_optical_flow_pyr, gmm2.
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
 `cur_area_threshold` [22:0], `label_status` [23] and `rgn_num` [31:24],
@@ -314,6 +367,9 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
+- `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local):
+  every op through the MPI on a board and under QEMU, compared file by
+  file.
 - `qemu-boot/test-hisi-v5-sample-ive.sh --sdk DIR` (local): the SDK's
   memory test (dma, sub, hist) and its sobel through `ive.ko`; sobel's
   four gradient files must equal numpy's correlation of the same input.

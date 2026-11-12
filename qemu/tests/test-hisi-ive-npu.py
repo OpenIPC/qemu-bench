@@ -5,7 +5,7 @@ On V5 an IVE op is a 576-byte task in a ring in DDR that the SVP NPU's
 hardware task scheduler runs.  Like ive_init and ive_post_npu_task, this
 acks the AI core's soft reset, allocates a stream, points it at a ring
 whose tasks link to each other (+6 the id, +8 the next task), fills tasks
-as ive_fill_npu_{dma,sad,ccl,add,sub,hist}_task do, pushes them, and waits for the
+as the ive_fill_npu_*_task functions do, pushes them, and waits for the
 finish: interrupt status bit 0 on IVE's group, the stream's bit, the last
 task's id.  The outputs are checked against the same ops done here.
 
@@ -75,6 +75,54 @@ def correlate(img, w, h, mask, kw, kh):
     return [sum(mask[j * kw + i] * px(img, w, h, x + i - kw // 2, y + j - kh // 2)
                 for j in range(kh) for i in range(kw))
             for y in range(h) for x in range(w)]
+
+
+
+def octant(gh, gv):
+    """the gradient's octant, as MAG_AND_ANG's angle"""
+    import math
+    if not gh and not gv:
+        return 0
+    return int(round(math.degrees(math.atan2(gv, gh)) / 45)) % 8
+
+
+def resize_ref(src, sw, sh, dw, dh):
+    """the engine's walk: a Q27 ratio and start offset, Q12 weights"""
+    def axis(sn, dn):
+        r = (sn << 27) // dn
+        off = (r - (1 << 27)) >> 1
+        return [(off + i * r) for i in range(dn)]
+    xs, ys = axis(sw, dw), axis(sh, dh)
+    out = []
+    for py in ys:
+        y0, y1 = clamp(py >> 27, 0, sh - 1), clamp((py >> 27) + 1, 0, sh - 1)
+        ay = (py & 0x7ffffff) >> 15
+        for px_ in xs:
+            x0, x1 = clamp(px_ >> 27, 0, sw - 1), clamp((px_ >> 27) + 1, 0, sw - 1)
+            ax = (px_ & 0x7ffffff) >> 15
+            top = (src[y0 * sw + x0] * ((1 << 12) - ax) +
+                   src[y0 * sw + x1] * ax + 16) >> 5
+            bot = (src[y1 * sw + x0] * ((1 << 12) - ax) +
+                   src[y1 * sw + x1] * ax + 16) >> 5
+            out.append((((top * ((1 << 12) - ay)) >> 17) +
+                        ((bot * ay) >> 17) + 2) >> 2)
+    return out
+
+
+# B, G, R as (Y, U, V, constant) and the output range, per CSC mode
+CSC_TO_RGB = {
+    0: (((1024, 1774, 0, -226504), (1024, -344, -715, 136040),
+         (1024, 0, 1404, -179187)), 16, 235),
+    2: (((1192, 2066, 0, -283062), (1192, -400, -833, 139252),
+         (1192, 0, 1634, -227750)), 0, 255),
+}
+# Y, V, U as (B, G, R, constant)
+CSC_TO_YUV = {
+    8: ((117, 601, 306, 512), (-85, -438, 523, 131584),
+        (523, -347, -176, 131584)),
+    10: ((100, 516, 263, 16896), (-73, -377, 450, 131584),
+         (450, -298, -152, 131584)),
+}
 
 
 def band(v, lo, hi, a, b, c):
@@ -461,6 +509,162 @@ def main():
                            for k in range(9))[pick]
                     for y in range(SH) for x in range(SW)]
             check(list(q.read(R, n)) == want, 'ORD_STAT: ' + name)
+
+        # --- part 2b: the ops fitted against a Hi3516CV608 board ---------
+        # (qemu-boot/ive-v5-capture.c; the references are in
+        # qemu/tests/data/ive-v5-cv608-ref.tar.xz)
+
+        # LBP: bit 7 the top-left neighbour, then clockwise
+        nb = ((-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0))
+        for mode, thr in ((0, 0), (0, -5), (1, 10)):
+            run(23, [(80, 'Q', P), (104, 'I', SW), (96, 'Q', R), (112, 'I', SW),
+                     (300, 'I', mode), (304, 'i', thr)])
+            want = []
+            for y in range(SH):
+                for x in range(SW):
+                    v = 0
+                    for k, (dx, dy) in enumerate(nb):
+                        d = px(a, SW, SH, x + dx, y + dy) - a[y * SW + x]
+                        if (abs(d) if mode else d) >= thr:
+                            v |= 1 << (7 - k)
+                    want.append(v)
+            check(list(q.read(R, n)) == want,
+                  'LBP: %s mode, threshold %d' % ('abs' if mode else 'normal', thr))
+
+        # MAG_AND_ANG: |gh| + |gv| thresholded, and the gradient's octant
+        gh = correlate(a, SW, SH, sm, 5, 5)
+        gv = correlate(a, SW, SH, smt, 5, 5)
+        for thr in (0, 200):
+            run(4, [(64, 'Q', P), (96, 'I', SW), (80, 'Q', R), (104, 'I', 2 * SW),
+                    (88, 'Q', LUT), (108, 'I', SW), (328, 'I', 1),
+                    (332, 'I', thr)] + [(300 + k, 'b', v) for k, v in enumerate(sm)])
+            mag = [m if m >= thr else 0
+                   for m in (min(abs(x) + abs(y), 0xffff) for x, y in zip(gh, gv))]
+            check(list(struct.unpack('<%dH' % n, q.read(R, 2 * n))) == mag,
+                  'MAG_AND_ANG: magnitude, threshold %d' % thr)
+            check(list(q.read(LUT, n)) == [octant(x, y) for x, y in zip(gh, gv)],
+                  'MAG_AND_ANG: the angle is not thresholded (%d)' % thr)
+        run(4, [(64, 'Q', P), (96, 'I', SW), (80, 'Q', R), (104, 'I', 2 * SW),
+                (328, 'I', 0), (332, 'I', 0)] +
+            [(300 + k, 'b', v) for k, v in enumerate(sm)])
+        check(list(struct.unpack('<%dH' % n, q.read(R, 2 * n))) ==
+              [min(abs(x) + abs(y), 0xffff) for x, y in zip(gh, gv)],
+              'MAG_AND_ANG: out_ctrl 0, magnitude alone')
+
+        # NORM_GRAD: each gradient shifted right, halves up, saturated
+        norm = 3
+        want_h = [clamp((v + (1 << (norm - 1))) >> norm, -128, 127) & 0xff
+                  for v in gh]
+        want_v = [clamp((v + (1 << (norm - 1))) >> norm, -128, 127) & 0xff
+                  for v in gv]
+        mg = [(300 + k, 'b', v) for k, v in enumerate(sm)]
+        run(24, [(64, 'Q', P), (96, 'I', SW), (80, 'Q', R), (104, 'I', SW),
+                 (88, 'Q', LUT), (108, 'I', SW), (328, 'I', 0),
+                 (336, 'I', norm)] + mg)
+        check(list(q.read(R, n)) == want_h and list(q.read(LUT, n)) == want_v,
+              'NORM_GRAD: both gradients')
+        for ctrl, want in ((1, want_h), (2, want_v)):
+            run(24, [(64, 'Q', P), (96, 'I', SW), (80, 'Q', R), (104, 'I', SW),
+                     (328, 'I', ctrl), (336, 'I', norm)] + mg)
+            check(list(q.read(R, n)) == want,
+                  'NORM_GRAD: out_ctrl %d alone' % ctrl)
+        run(24, [(64, 'Q', P), (96, 'I', SW), (80, 'Q', R), (104, 'I', 2 * SW),
+                 (328, 'I', 3), (336, 'I', norm)] + mg)
+        check(list(q.read(R, 2 * n)) ==
+              [v for pair in zip(want_h, want_v) for v in pair],
+              'NORM_GRAD: out_ctrl 3, interleaved as S8C2')
+
+        # ACC, IMAGE_DOT, ALPHA_BLENDING
+        for mode, f in ((0, lambda x, y: x + y), (1, lambda x, y: x - y),
+                        (2, lambda x, y: x + (y & 1))):
+            run(32, two + [(300, 'I', mode)])
+            check(list(q.read(R, n)) == [clamp(f(x, y), 0, 255)
+                                         for x, y in zip(a, b)],
+                  'ACC: mode %d' % mode)
+        run(34, [(80, 'Q', P), (88, 'Q', Q), (96, 'Q', P + 0x8000),
+                 (112, 'Q', R), (120, 'I', SW), (124, 'I', SW),
+                 (128, 'I', SW), (136, 'I', SW)])
+        check(list(q.read(R, n)) ==
+              [(x * al + y * (255 - al) + 128) >> 8
+               for x, y, al in zip(a, b, binimg)], 'ALPHA_BLENDING')
+        d1 = [(x - 32) * 4099 + y * 77 for y in range(SH) for x in range(SW)]
+        d2 = [(y - 20) * 3001 - x * 911 for y in range(SH) for x in range(SW)]
+        q.write(P + 0x10000, struct.pack('<%di' % n, *d1))
+        q.write(Q + 0x10000, struct.pack('<%di' % n, *d2))
+        run(33, [(80, 'Q', P + 0x10000), (88, 'Q', Q + 0x10000),
+                 (104, 'Q', R), (112, 'I', 4 * SW), (116, 'I', 4 * SW),
+                 (124, 'I', 4 * SW)])
+        check(list(struct.unpack('<%di' % n, q.read(R, 4 * n))) ==
+              [clamp((x * y + (1 << 29)) >> 30, -(1 << 31), (1 << 31) - 1)
+               for x, y in zip(d1, d2)], 'IMAGE_DOT: round to S17Q15')
+
+        # CSC both ways, on a YUV420SP / packed-RGB pair
+        yuv = bytes((x * 9 + y * 5) & 0xff for y in range(SH) for x in range(SW))
+        chroma = bytes((x * 13 + y * 29 + 11) & 0xff
+                       for y in range(SH // 2) for x in range(SW))
+        q.write(P, yuv)
+        q.write(P + 0x1000, chroma)
+        for mode in (0, 2):
+            run(2, [(80, 'Q', P), (136, 'I', SW), (88, 'Q', P + 0x1000),
+                    (140, 'I', SW), (112, 'Q', R), (152, 'I', 3 * SW),
+                    (300, 'I', 1), (304, 'I', 2), (308, 'I', mode)])
+            rows, lo, hi = CSC_TO_RGB[mode]
+            want = []
+            for y in range(SH):
+                for x in range(SW):
+                    c = chroma[(y // 2) * SW + (x & ~1)], chroma[(y // 2) * SW + (x & ~1) + 1]
+                    for cy, cu, cv, k in rows:
+                        want.append(clamp((cy * yuv[y * SW + x] + cu * c[1] +
+                                           cv * c[0] + k) >> 10, lo, hi))
+            check(list(q.read(R, 3 * n)) == want,
+                  'CSC: mode %d, YUV420SP to packed RGB' % mode)
+        rgb = bytes((x * 17 + y * 7 + c * 61) & 0xff
+                    for y in range(SH) for x in range(SW) for c in range(3))
+        q.write(P, rgb)
+        for mode in (8, 10):
+            run(2, [(80, 'Q', P), (136, 'I', 3 * SW), (112, 'Q', R),
+                    (152, 'I', SW), (120, 'Q', R + 0x1000), (156, 'I', SW),
+                    (300, 'I', 3), (304, 'I', 0), (308, 'I', mode)])
+            my, mv, mu = CSC_TO_YUV[mode]
+            want = [clamp((my[0] * rgb[3 * i] + my[1] * rgb[3 * i + 1] +
+                           my[2] * rgb[3 * i + 2] + my[3]) >> 10, 0, 255)
+                    for i in range(n)]
+            check(list(q.read(R, n)) == want, 'CSC: mode %d, luma' % mode)
+            want = []
+            for y in range(0, SH, 2):
+                for x in range(0, SW, 2):
+                    i = 3 * (y * SW + x)
+                    for m in (mv, mu):
+                        want.append(clamp((m[0] * rgb[i] + m[1] * rgb[i + 1] +
+                                           m[2] * rgb[i + 2] + m[3]) >> 10,
+                                          0, 255))
+            check(list(q.read(R + 0x1000, n // 2)) == want,
+                  'CSC: mode %d, the chroma of each block top-left pixel' % mode)
+
+        # RESIZE: the op whose parameters sit in a block of its own, which
+        # is also why its task carries no op code and no size
+        BLK = IMG + 0x300000
+        for dw, dh in ((10, 6), (SW * 2, SH * 2)):
+            q.write(P, a)
+            q.write(BLK, struct.pack('<II', 29, 1))
+            xr, yr = (SW << 27) // dw, (SH << 27) // dh
+            q.write(BLK + 16, struct.pack('<IIIIIIIIIiIi', P, R, SW, dw,
+                                          SW, SH, dw, dh, xr,
+                                          ((xr - (1 << 27)) >> 1) & 0x7ffffff
+                                          if xr >= (1 << 27)
+                                          else (xr - (1 << 27)) >> 1,
+                                          yr,
+                                          ((yr - (1 << 27)) >> 1) & 0x7ffffff
+                                          if yr >= (1 << 27)
+                                          else (yr - (1 << 27)) >> 1))
+            i = (q.readl(SQ + 0x20) + 1) % NSLOT
+            t = bytearray(task(i, 0, 0, 0, [(64, 'Q', BLK)]))
+            q.write(slot(i), bytes(t))
+            q.writel(SQ + 0x10, 1 << 8)
+            q.cmd('clock_step 2000000')
+            q.writel(SQ + 0x14, 31)
+            check(list(q.read(R, dw * dh)) == resize_ref(a, SW, SH, dw, dh),
+                  'RESIZE: %dx%d to %dx%d' % (SW, SH, dw, dh))
     finally:
         q.close()
     print('%d failure(s)' % fails)
