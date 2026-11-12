@@ -106,6 +106,12 @@ static FILE *out_file(const char *name)
     return f;
 }
 
+/* a plane's own row count: 420's chroma plane is half the picture's */
+static td_u32 plane_rows(ot_svp_img_type t, int p, td_u32 h)
+{
+    return p && t == OT_SVP_IMG_TYPE_YUV420SP ? h / 2 : h;
+}
+
 /* every plane, rows packed */
 static void dump_img(const char *name, const ot_svp_img *img)
 {
@@ -125,11 +131,8 @@ static void dump_img(const char *name, const ot_svp_img *img)
         planes = 1;             /* both channels interleaved in plane 0 */
     }
     for (int p = 0; p < planes; p++) {
-        td_u32 h = img->height;
+        td_u32 h = plane_rows(img->type, p, img->height);
 
-        if (p && img->type == OT_SVP_IMG_TYPE_YUV420SP) {
-            h /= 2;
-        }
         for (td_u32 y = 0; y < h; y++) {
             fwrite(PTR(td_u8, img->virt_addr[p]) + y * img->stride[p] * e,
                    img->width * e, 1, f);
@@ -203,7 +206,8 @@ static int mk(ot_svp_img *img, ot_svp_img_type t, td_u32 w, td_u32 h)
     for (int p = 0; p < 3; p++) {
         if (img->virt_addr[p]) {
             memset(PTR(td_u8, img->virt_addr[p]), 0,
-                   img->stride[p] * img->height * elem_size(t));
+                   img->stride[p] * plane_rows(t, p, img->height) *
+                   elem_size(t));
         }
     }
     return 0;

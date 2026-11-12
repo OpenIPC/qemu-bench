@@ -367,9 +367,14 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
-- `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local):
-  every op through the MPI on a board and under QEMU, compared file by
-  file.
+- `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local,
+  since the capture links the SDK's MPI libraries): every op through the
+  MPI on a board and under QEMU, compared file by file. Without
+  `--board` it compares against the stored CV608 outputs. CI cannot run
+  it, but it does not guard anything the register test above does not:
+  that test computes each op's expected output from the rules this
+  capture established, so an op that regresses fails CI, and the capture
+  is what establishes or revises a rule.
 - `qemu-boot/test-hisi-v5-sample-ive.sh --sdk DIR` (local): the SDK's
   memory test (dma, sub, hist) and its sobel through `ive.ko`; sobel's
   four gradient files must equal numpy's correlation of the same input.
