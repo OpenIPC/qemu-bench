@@ -200,3 +200,101 @@ with command params starting at 0x0100 instead of Sigmastar's separate bank1 bas
 [0x0090] = 0x01AB5159    HW_CAP
 [0x0300] = 0x00100000    RESULT0 (default)
 ```
+
+## V5 (Hi3516CV608 / CV610): IVE as SVP NPU tasks
+
+On V5 the IVE is not a block of its own. Each IVE op is a 576-byte task
+that `ive.ko` builds in DDR and hands to the SVP NPU's hardware task
+scheduler (HWTS). The scheduler runs it on the AI core with an NPU model
+compiled into `ive.ko`. `hisi-ive-npu` models the scheduler's side and
+computes each op in C. Source: SDK V1.0.2.0 `out/obj/mod_ive.o`
+(unstripped) and `hi3516cv610.dtsi`.
+
+### Hardware
+
+| Property | Value |
+|---|---|
+| Base | 0x14000000; the driver maps 64 KiB |
+| DT | `ive@0x14000000`, SPI 76, sharing the 8 MiB window with `npu@0x14000000` (SPI 75) |
+| Interrupt groups | group 1 is IVE's (SPI 76), group 0 `svp_npu`'s (SPI 75) |
+| Locks | the driver's "ear lock" is a call into the sys module, not hardware |
+
+### Registers
+
+| Offset | Meaning |
+|---|---|
+| 0x0100 / 0x0104 | AI core interrupt status / clear (the driver acts only if `& 0x100001`) |
+| 0x80a0 bit 10 | AI core working |
+| 0x8108 bit 0 / 0x8110 bit 0 | AI core soft reset / its ack |
+| 0x8200 / 0x82b0 | interrupt mask, group 0 / 1; a set bit masks (`ive.ko` writes 0x332, finish unmasked; 0x1ff at close) |
+| 0x8204 / 0x82b4 | interrupt status; bit 0: a stream finished tasks |
+| 0x8210 / 0x82c0 | finished streams, one bit each |
+| 0x8218 / 0x82c8, 0x821c / 0x82cc | timed-out / failed streams |
+| 0x8220 / 0x82d0 | stream stopped, one bit each |
+| 0x8228 / 0x82d8 | stream pre-stopped, one bit each |
+| 0x8280 | read: allocate a stream |
+| 0x8500 + 0x40·s | stream config; bit 5 selects the interrupt group |
+| +0x08 | task ring base \| 1 |
+| +0x10 | control: [11:8] tasks pushed (at most 15 per write), bit 2 pre-stop, bit 1 stop, bit 0 free |
+| +0x14 | write: clear the stream's finish (`ive.ko` writes 31) |
+| +0x18 | SQE count [11:0], CQE count [27:16] |
+| +0x20 | the last finished task's id [15:0] |
+
+Stopping a stream (`hal_ive_npu_reset_stream`) is a pre-stop polled on
+0x82d8, then a stop polled on 0x82d0. Both fail as `ive stream[n] pre stop
+failure` / `stop failure` when the poll times out.
+
+### Tasks
+
+The ring has 20-512 slots (a module parameter); `ive.ko` keeps two, ping
+and pong. The tasks link to each other, so the scheduler follows the links
+and never needs the ring's size:
+
+| Offset | Field |
+|---|---|
+| +0 | header (0x4013 flags) |
+| +6 | the task's id (its slot) |
+| +8 | the next task's address; the last slot points at the first |
+| +64.. | image addresses |
+| +104.. | their strides |
+| +288 | the op code |
+| +292 / +296 | width / height |
+| +300.. | the op's own fields |
+
+Op codes at +288 (`ive_fill_npu_*_task`); the NPU models are shared
+between ops, so dispatch is on this code alone:
+
+| Code | Op | Code | Op | Code | Op |
+|---|---|---|---|---|---|
+| 0 | dma | 12 | hist | 23 | lbp |
+| 1 | filter | 13 / 14 | thresh_s16 / _u16 | 24 | norm_grad |
+| 2 | csc | 15 | 16bit_to_8bit | 25 | st_box_flt_and_eigen |
+| 3 | sobel | 16 | ord_stat_filter | 26 | candidate_corner |
+| 4 | mag_and_ang | 17 | map | 27 | sad |
+| 5 / 6 | dilate / erode | 18 | add | 28 | lk_optical_flow_pyr |
+| 7 | thresh | 19 | xor | 30 | gmm2 |
+| 8 | and | 20 | ncc | 32 | acc |
+| 9 | sub | 21 | ccl | 33 | image_dot |
+| 10 | or | 22 | canny_hys_edge | 34 | alpha_blending |
+| 11 | integ | | | | |
+
+Modelled so far, with their fields:
+
+| Op | Fields |
+|---|---|
+| dma | +80 / +104 source and stride, +96 / +112 destination; mode +308 (direct, interval with +336 / +340 / +344, set 3 / 8 bytes from +320) |
+| sad | +64 / +72 sources, +104 / +108 strides; +88 / +96 outputs, +116 / +120 byte strides; block +308 (4, 8, 16), output control +312, threshold +316, min / max +320 / +324 |
+| ccl | +64 image (labelled in place), +88 stride, +80 `ot_ive_ccblob`; 8-connected if +300 is 1, area threshold +304, step +308 |
+| add / sub | +80 / +88 sources, +104 destination, +112 / +116 / +124 strides; add's Q0.16 weights at +300 / +304, sub's mode at +300 |
+| hist | +80 source, +104 stride, +96 the 256 u32 bins |
+
+V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
+`cur_area_threshold` [22:0], `label_status` [23] and `rgn_num` [31:24],
+then 254 regions of area (u32) and left, right, top, bottom (u16).
+
+### Tests
+
+- `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
+  every modelled op.
+- `qemu-boot/test-hisi-v5-sample-ive.sh --sdk DIR` (local): the SDK's
+  memory test (dma, sub, hist) through `ive.ko`.

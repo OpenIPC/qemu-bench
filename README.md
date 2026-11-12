@@ -707,7 +707,7 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **VI/VPSS** | stub | stub | stub | — | stub | stub | **frames**¹ | **frames**² |
 | **Watchdog** | yes | yes | yes | yes | yes | yes | yes | yes |
 | **Sensor I2C** | — | — | — | — | — | — | yes | yes |
-| **IVE (18 ops)** | — | — | — | — | — | — | **yes** | — |
+| **IVE** | — | — | — | — | — | — | **18 ops** | **6 ops**³ |
 | **NPU** | — | — | — | — | — | — | — | stub |
 
 Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
@@ -721,7 +721,9 @@ IVE = Intelligent Video Engine with 18 operations validated against real IVE sil
 ²: V5 (`gen=5`): majestic streams from an SC4336P through VI online,
 VPSS and VEDU, and its AE and AWB converge on the ISP statistics
 `hisi-vi` writes in the V5 layout (`test-hisi-majestic.sh --soc
-hi3516cv610`).
+hi3516cv610`). ³: V5's IVE runs its ops as tasks on the SVP NPU's task
+scheduler (`hisi-ive-npu`): dma, sad, ccl, add, sub and hist, through
+`ive.ko` (`docs/ive-registers.md`, "V5").
 
 ## Project Structure
 
@@ -737,6 +739,7 @@ qemu/
 ├── hw/misc/hisi-himci.c         # DW MMC (himciv200) SD/MMC controller
 ├── hw/misc/hisi-regbank.c       # Generic RAM-backed register bank
 ├── hw/misc/hisi-ive.c           # IVE: 18 ops (SAD, CCL, Sub, Thresh, Erode...)
+├── hw/misc/hisi-ive-npu.c       # V5 IVE: ops as SVP NPU tasks (DMA, SAD, CCL, ADD, SUB, HIST)
 ├── hw/misc/hisi-fastboot.c      # Boot ROM fastboot serial protocol (defib compat)
 ├── hw/misc/hisi-vedu.c          # V4 / V5 video encoder: VEDU (H.264/H.265) + JPGE
 ├── hw/misc/hisi-vi.c            # V4 VI capture + ISP pipe: the frame clock

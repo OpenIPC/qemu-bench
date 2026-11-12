@@ -698,6 +698,15 @@ in this order:
     0x4a8 + 4 x chn): the driver sends a frame only between START and the
     channel's tunnel interrupt (0x1000 << chn). So in either mode
     `hisi-vpss` raises START, tunnel, delay and EOF apart.
+  - IVE is not a block of its own on V5: each op is a 576-byte task in a
+    ring in DDR that the SVP NPU's task scheduler runs (`hisi-ive-npu`,
+    0x14000000, SPI 76). The model follows the ring's links (+6 id, +8
+    next) and computes the op named by the code at +288; the NPU models
+    the driver loads are shared between ops and are never run. dma, sad,
+    ccl, add, sub and hist are modelled (`test-hisi-ive-npu.py`, CI;
+    `test-hisi-v5-sample-ive.sh --sdk`, local). majestic's motion
+    detection would use it, but reads VPSS extended channel 3, which is
+    not modelled (#273).
   - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`
     (2800) and `pclk` (126 MHz) make VTS 1500 30 fps. It counts exposure
     in rows (`exp-rows`), and 0x3E06 is its digital gain's coarse step.

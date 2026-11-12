@@ -268,6 +268,11 @@ typedef struct HisiSoCConfig {
     /* CRG reset handshakes: request registers whose bit 0 the next one
      * echoes (hisi-crg "rst-ack"); 0 ends the list */
     uint32_t        crg_rst_ack[4];
+    /* V5 IVE: tasks on the SVP NPU's scheduler (hisi-ive-npu); its first
+     * 64 KiB, over the "hisi-npu" bank.  IRQs: the svp_npu driver's group
+     * and IVE's */
+    hwaddr          ive_npu_base;
+    int             ive_npu_irq[2];
     hwaddr          vpss_base;         /* 0 = none; online-mode frame source */
     int             vpss_irq;
     hwaddr          vi_cap_base;       /* 0 = none; VI as the frame clock */
