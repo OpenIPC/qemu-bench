@@ -25,8 +25,9 @@
  *   0x700.. IEEE 1588 timestamp block (plain registers)
  *
  * DMA block at +0x1000 (enum DmaRegisters):
- *   0x00 BusMode: SWR 0 (self-clearing; the drivers poll it for ~10 ms
- *        and fail probe or open if it sticks, synopGMAC_Dev.c:206-231),
+ *   0x00 BusMode: SWR 0 (self-clearing given the PHY's clock, below; the
+ *        drivers poll it for ~10 ms and fail probe or open if it sticks,
+ *        synopGMAC_Dev.c:206-231),
  *        DSL 6:2 (words skipped between ring descriptors), ATDS 7
  *   0x04/0x08 TX/RX poll demand, 0x0C/0x10 RX/TX list base
  *   0x14 Status: TI 0, TPS 1, TU 2, UNF 5, RI 6, RU 7, RPS 8, FBI 13,
@@ -54,6 +55,30 @@
  * has negotiated 100 Mbit/s full duplex; BMCR reset and restart-autoneg
  * self-clear -- jz_mac_open() spins on BMCR.RESET with no timeout
  * (jz_mac_v13.c:1833, ingenic_mac.c:1733).
+ *
+ * The PHY is a chip of its own, outside the SoC: a warm reset of the SoC
+ * (watchdog, so every `reboot`) does not reset it, and whatever the last
+ * kernel left in its registers is there for the next one.  So it is set up
+ * once, at realize, and a system reset leaves it alone -- unless
+ * phy-cold-reset says the board resets it too.  What does reset it is
+ * BMCR.RESET, and the board's reset line where it has one: the driver
+ * pulses the DT's ingenic,rst-gpio before the soft reset (ingenic_mac.c
+ * ingenic_mac_phy_hwrst; PC7, active low, in the release's DT as on
+ * shark.dts).  phy-rst-gpio names that pin for the machine to wire to the
+ * "phy-rst" input -- held in reset while low -- and is -1 (not wired) by
+ * default, which is the board of OpenIPC/firmware#2839.
+ *
+ * DmaBusMode.SWR resets the core in all its clock domains, and it finishes
+ * only when they are all running: the RX and TX clocks of an RMII MAC come
+ * from REF_CLK, which on these boards the PHY drives.  ingenic_mac_close()
+ * -- every ifdown, so every `reboot` -- sets BMCR.PDOWN (ingenic_mac.c:
+ * 1790), and a powered-down PHY drives no REF_CLK, so the next kernel's
+ * probe finds SWR stuck: "Bus Mode Reg after reset: 0x00020101" ten times,
+ * then "PROB:synopGMAC_reset timeout" and no eth0 until a power cycle
+ * (firmware#2839).  With swr-needs-phy-clk (the default) SWR stays set
+ * while the PHY is powered down or held in reset, and completes when the
+ * clock returns: a BMCR write without PDOWN, BMCR.RESET, or the reset line
+ * released.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -236,6 +261,7 @@ struct IngenicGmacState {
     bool tx_suspended, rx_suspended;
 
     uint16_t phy[32];
+    bool phy_rst_held;                  /* "phy-rst" low: held in reset */
 
     uint8_t frame[FRAME_MAX];
     uint8_t rx_frame[FRAME_MAX + 4];
@@ -247,6 +273,9 @@ struct IngenicGmacState {
     uint32_t phy_addr;
     uint32_t phy_id;
     bool enh_desc;
+    bool phy_cold_reset;
+    bool swr_needs_phy_clk;
+    int32_t phy_rst_gpio;
 };
 
 /* --- interrupts --------------------------------------------------------- */
@@ -286,6 +315,22 @@ static void gmac_phy_reset(IngenicGmacState *s)
     s->phy[4] = 0x01e1;                 /* ANAR: 100/10 FD/HD, CSMA */
 }
 
+/* REF_CLK: the PHY drives it unless powered down or held in reset. */
+static bool gmac_phy_clk(IngenicGmacState *s)
+{
+    return !s->phy_rst_held && !(s->phy[0] & PHY_BMCR_PDOWN);
+}
+
+static void gmac_soft_reset(IngenicGmacState *s);
+
+/* A soft reset waiting for the PHY's clock finishes once it is back. */
+static void gmac_swr_poll(IngenicGmacState *s)
+{
+    if ((s->bus_mode & BUS_SWR) && gmac_phy_clk(s)) {
+        gmac_soft_reset(s);
+    }
+}
+
 static uint16_t gmac_phy_read(IngenicGmacState *s, int reg)
 {
     const NetClientState *nc = qemu_get_queue(s->nic);
@@ -323,6 +368,19 @@ static void gmac_phy_write(IngenicGmacState *s, int reg, uint16_t val)
         s->phy[reg] = val;
         break;
     }
+    gmac_swr_poll(s);
+}
+
+/* The board's PHY reset line ("phy-rst"), active low. */
+static void gmac_phy_rst(void *opaque, int n, int level)
+{
+    IngenicGmacState *s = opaque;
+
+    if (!level || s->phy_rst_held) {
+        gmac_phy_reset(s);              /* registers back to their defaults */
+    }
+    s->phy_rst_held = !level;
+    gmac_swr_poll(s);
 }
 
 static void gmac_mdio(IngenicGmacState *s, uint32_t val)
@@ -335,12 +393,13 @@ static void gmac_mdio(IngenicGmacState *s, uint32_t val)
         return;                                    /* CR update only */
     }
     if (val & GMII_GW) {
-        if (pa == s->phy_addr) {
+        if (pa == s->phy_addr && !s->phy_rst_held) {
             gmac_phy_write(s, gr, s->mac[MAC_GMII_DATA / 4] & 0xffff);
         }
     } else {
         s->mac[MAC_GMII_DATA / 4] =
-            pa == s->phy_addr ? gmac_phy_read(s, gr) : 0xffff;
+            pa == s->phy_addr && !s->phy_rst_held ? gmac_phy_read(s, gr)
+                                                   : 0xffff;
     }
 }
 
@@ -792,8 +851,15 @@ static void gmac_dma_write(IngenicGmacState *s, hwaddr off, uint32_t val)
 {
     switch (off) {
     case DMA_BUS_MODE:
+        if (s->bus_mode & BUS_SWR) {
+            break;                      /* still in reset: SWR sticks */
+        }
         if (val & BUS_SWR) {
+            /* done at once, or when the PHY's clock is back (the top) */
             gmac_soft_reset(s);
+            if (s->swr_needs_phy_clk && !gmac_phy_clk(s)) {
+                s->bus_mode |= BUS_SWR;
+            }
         } else {
             s->bus_mode = val;
         }
@@ -917,15 +983,40 @@ static void gmac_realize(DeviceState *dev, Error **errp)
                           object_get_typename(OBJECT(dev)), dev->id,
                           &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    /* the board's PHY reset line, for the machine to wire (phy-rst-gpio) */
+    qdev_init_gpio_in_named(dev, gmac_phy_rst, "phy-rst", 1);
+    /* the PHY is powered up once, with the board (see the top) */
+    gmac_phy_reset(s);
 }
 
 static void gmac_reset(DeviceState *dev)
 {
     IngenicGmacState *s = INGENIC_GMAC(dev);
 
-    gmac_phy_reset(s);
+    if (s->phy_cold_reset) {
+        gmac_phy_reset(s);
+    }
     gmac_soft_reset(s);
 }
+
+static bool gmac_phy_rst_needed(void *opaque)
+{
+    IngenicGmacState *s = opaque;
+
+    return s->phy_rst_held;
+}
+
+static const VMStateDescription vmstate_ingenic_gmac_phy_rst = {
+    .name = TYPE_INGENIC_GMAC "/phy-rst",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = gmac_phy_rst_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(phy_rst_held, IngenicGmacState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_ingenic_gmac = {
     .name = TYPE_INGENIC_GMAC,
@@ -954,6 +1045,10 @@ static const VMStateDescription vmstate_ingenic_gmac = {
         VMSTATE_BUFFER(frame, IngenicGmacState),
         VMSTATE_TIMER_PTR(rx_retry, IngenicGmacState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ingenic_gmac_phy_rst,
+        NULL
     }
 };
 
@@ -967,6 +1062,14 @@ static const Property gmac_props[] = {
     DEFINE_PROP_UINT32("phy-id", IngenicGmacState, phy_id, 0x02430c54),
     /* enhanced descriptors even with 4-word ones (no ATDS) */
     DEFINE_PROP_BOOL("enh-desc", IngenicGmacState, enh_desc, true),
+    /* the board resets the PHY with the SoC (else it keeps its state) */
+    DEFINE_PROP_BOOL("phy-cold-reset", IngenicGmacState, phy_cold_reset,
+                     false),
+    /* DmaBusMode.SWR waits for the PHY's REF_CLK (firmware#2839) */
+    DEFINE_PROP_BOOL("swr-needs-phy-clk", IngenicGmacState,
+                     swr_needs_phy_clk, true),
+    /* GPIO pin (port * 32 + n) on the PHY's reset, active low; -1: none */
+    DEFINE_PROP_INT32("phy-rst-gpio", IngenicGmacState, phy_rst_gpio, -1),
 };
 
 static void gmac_class_init(ObjectClass *klass, const void *data)

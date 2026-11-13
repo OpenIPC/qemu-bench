@@ -719,6 +719,26 @@ kernels' `open` spins on the last with no timeout); the PHY is an IP101G
 (0x0243/0x0C54) at address 0 with a 100 Mbit/s full-duplex link. Received
 frames carry their FCS, which the drivers subtract.
 
+PHY power-down and reboot (OpenIPC/firmware#2839). The PHY is a chip of
+its own: a system reset (the TCU watchdog, so every guest `reboot`) leaves
+its registers as the last kernel left them, and only BMCR.RESET or the
+board's reset line resets it (`phy-cold-reset=on` makes it reset with the
+SoC instead). DmaBusMode.SWR completes only with the PHY's RMII REF_CLK
+running, so while BMCR.PDOWN is set it stays set -- the T40 kernel's
+`ingenic_mac_close()` sets PDOWN on every ifdown, and the next probe then
+prints `Bus Mode Reg after reset: 0x00020101` ten times and
+`PROB:synopGMAC_reset timeout`, with no eth0, as on the board. A BMCR write
+without PDOWN, BMCR.RESET or the reset line released finishes the pending
+reset; `swr-needs-phy-clk=off` makes SWR complete at once regardless. The
+line: the driver pulses the DT's `ingenic,rst-gpio` (PC7, active low, in the
+release DT) before SWR, and `-global ingenic-gmac.phy-rst-gpio=71` wires that
+pin to the PHY (held in reset, not answering MDIO, while low); the default
+-1 leaves it unwired, the board of the issue. `qemu-boot/test-ingenic-eth-reboot.sh`
+reboots the release twice side by side: `reboot -f` (no ifdown) must keep
+eth0, `reboot` loses it -- reported as the known failure; `--expect-fixed`
+requires both, for a fixed `--kernel` or with `--phy-rst-gpio 71`, where
+the release kernel already keeps eth0.
+
 ### The video encoders: `ingenic-vpu`
 
 T10/T20's VPU (`jz-vpu.0`), the HELIX of T21/T23/T30 (H.264, JPEG) and
@@ -2301,6 +2321,7 @@ modelled").
 | Image | Machine | Path | Result |
 |---|---|---|---|
 | OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` | own | `-kernel` + NOR root; flash (release SPL + U-Boot) | login, DHCP lease, U-Boot environment and JFFS2 overlay written back (`test-ingenic-boot.sh`) |
+| OpenIPC `t40`, two boots through the watchdog | `t40` | `-kernel` + NOR root, `test-ingenic-eth-reboot.sh` | `reboot -f` keeps eth0; `reboot` (ifdown: PHY powered down) loses it, SWR timeout as in firmware#2839; with `--phy-rst-gpio 71` both keep it |
 | T41LQ / NQ / XQ SDK 1.2.0 full images (8 and 16 MiB) | `t41,variant=t41lq/nq/x`, 64 / 128 / 256 MiB | flash | SPL (DDR test in cache-as-RAM), U-Boot, kernel on two cores, `Ingenic-uc1_1 login:`, telnet over the GMAC, the vendor `carrier-server` with `sensor=gc4663` and its RTSP H.265 stream pulled and decoded, `reboot` through the watchdog back to login (`test-ingenic-sdk-boot.sh`) |
 | T40N / T40XP SDK 1.2.0 full images (glibc and uClibc, 8 and 16 MiB), T30X SDK 1.0.5 | `t40,variant=t40n/t40xp` (`sensor=gc2053`), `t30,variant=t30x` | flash | the same boot, telnet and reboot cycle; on T40 `carrier-server` streams 1080p H.265 over RTSP through the IPU and AVPU; 20 pulled frames show the ISP scene (`test-ingenic-sdk-boot.sh`: the bitstream is copied off RTSP and decoded afterwards -- decoding 1080p while pulling falls behind, and live555 then drops RTP packets, a lost P picture; the app's timestamp OSD covers the counter's top row, so the counter is read from its other four) |
 | T10 camera (APK-Link) | `t10` | flash | vendor U-Boot, kernel, login, the camera application |

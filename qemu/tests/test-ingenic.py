@@ -4020,6 +4020,111 @@ def test_ids(qemu):
         qt.close()
 
 
+# --- GMAC: the PHY's power-down and DmaBusMode.SWR (firmware#2839) ---------
+
+GMAC = 0x134B0000
+GMAC_BUS = GMAC + 0x1000                        # DmaBusMode
+GMAC_RXBASE = GMAC + 0x100C
+
+
+def gmac_mdio(qt, reg, val=None):
+    """One MDIO transfer to the PHY at address 0, through GmiiAddr/Data."""
+    if val is not None:
+        qt.writel(GMAC + 0x14, val)
+    qt.writel(GMAC + 0x10, (reg << 6) | (2 if val is not None else 0) | 1)
+    return None if val is not None else qt.readl(GMAC + 0x14)
+
+
+def gmac_system_reset(qt):
+    """system_reset, then wait until the GMAC has seen it."""
+    qt.writel(GMAC_RXBASE, 0x1000)
+    qt.qmp('system_reset')
+    for _ in range(100):
+        if qt.readl(GMAC_RXBASE) == 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_gmac_phy_pdown(qt):
+    print('ingenic-gmac: PHY power-down, SWR, reset persistence')
+    check('BusMode after reset', qt.readl(GMAC_BUS), 0x00020100)
+    qt.writel(GMAC_BUS, 1)
+    check('SWR with the PHY up completes at once', qt.readl(GMAC_BUS),
+          0x00020100)
+    bmcr = gmac_mdio(qt, 0)
+    check('BMCR: AN, 100 Mbit/s, full duplex', bmcr, 0x3100)
+    gmac_mdio(qt, 0, bmcr | 0x0800)             # ingenic_mac_close()
+    qt.writel(GMAC_BUS, 1)
+    reads = [qt.readl(GMAC_BUS) for _ in range(10)]
+    check('PDOWN: SWR stays set, as on the board (0x00020101 x10)',
+          all(r == 0x00020101 for r in reads), True)
+    qt.writel(GMAC_BUS, 0)
+    check('and a write cannot clear it', qt.readl(GMAC_BUS), 0x00020101)
+    check('the PHY still answers MDIO', gmac_mdio(qt, 0), 0x3900)
+    check('system reset seen', gmac_system_reset(qt), True)
+    check('the PHY keeps PDOWN across a system reset', gmac_mdio(qt, 0),
+          0x3900)
+    check('the MAC does not keep SWR', qt.readl(GMAC_BUS), 0x00020100)
+    qt.writel(GMAC_BUS, 1)
+    check('so the next SWR sticks again', qt.readl(GMAC_BUS), 0x00020101)
+    gmac_mdio(qt, 0, 0x3100)                    # ingenic_mac_open()
+    check('clearing PDOWN completes it', qt.readl(GMAC_BUS), 0x00020100)
+    gmac_mdio(qt, 0, 0x3900)
+    qt.writel(GMAC_BUS, 1)
+    gmac_mdio(qt, 0, 0x8000)
+    check('BMCR.RESET completes it too',
+          (qt.readl(GMAC_BUS), gmac_mdio(qt, 0)), (0x00020100, 0x3100))
+
+
+def test_gmac_phy_props(qemu):
+    qt = QTest(qemu, 't40', ['-global', 'ingenic-gmac.phy-cold-reset=on'])
+    print('ingenic-gmac phy-cold-reset=on')
+    gmac_mdio(qt, 0, 0x3900)
+    gmac_system_reset(qt)
+    check('the board resets the PHY with the SoC', gmac_mdio(qt, 0), 0x3100)
+    qt.close()
+
+    qt = QTest(qemu, 't40', ['-global', 'ingenic-gmac.swr-needs-phy-clk=off'])
+    print('ingenic-gmac swr-needs-phy-clk=off')
+    gmac_mdio(qt, 0, 0x3900)
+    qt.writel(GMAC_BUS, 1)
+    check('SWR completes at once even with PDOWN', qt.readl(GMAC_BUS),
+          0x00020100)
+    qt.close()
+
+    qt = QTest(qemu, 't40', ['-global', 'ingenic-gmac.phy-rst-gpio=71'])
+    print('ingenic-gmac phy-rst-gpio=71 (PC7, as in the T40 DT)')
+    pc = GPIO + 0x2000
+    gmac_mdio(qt, 0, 0x3900)
+    qt.writel(GMAC_BUS, 1)
+    check('SWR pending', qt.readl(GMAC_BUS), 0x00020101)
+    qt.writel(pc + 0x18, 1 << 7)                # INTC
+    qt.writel(pc + 0x24, 1 << 7)                # MSKS
+    qt.writel(pc + 0x38, 1 << 7)                # PAT1C: output
+    qt.writel(pc + 0x48, 1 << 7)                # PAT0C: low
+    check('PC7 low holds the PHY in reset: MDIO reads all ones, SWR waits',
+          (gmac_mdio(qt, 0), qt.readl(GMAC_BUS)), (0xffff, 0x00020101))
+    qt.writel(pc + 0x44, 1 << 7)                # PAT0S: high
+    check('released: the PHY is up at its defaults and SWR done',
+          (gmac_mdio(qt, 0), qt.readl(GMAC_BUS)), (0x3100, 0x00020100))
+    qt.close()
+
+    r = subprocess.run(
+        [qemu, '-M', 't40', '-machine', 'accel=qtest', '-display', 'none',
+         '-global', 'ingenic-gmac.phy-rst-gpio=200', '-S'],
+        capture_output=True, text=True, timeout=30, input='')
+    check('refused: phy-rst-gpio past the last pin',
+          'past the last pin' in r.stderr, True)
+
+    r = subprocess.run(
+        [qemu, '-M', 't40', '-machine', 'accel=qtest', '-display', 'none',
+         '-global', 'ingenic-gmac.phy-rst-gpio=-2', '-S'],
+        capture_output=True, text=True, timeout=30, input='')
+    check('refused: phy-rst-gpio below -1',
+          '-1 (not wired) or a pin' in r.stderr, True)
+
+
 def test_migration(qemu, machine, tmp):
     print('migration round trip (%s)' % machine)
     out = os.path.join(tmp, 'mig')
@@ -4164,6 +4269,10 @@ def main():
         test_rsa(qt)
         test_des(qt)
         qt.close()
+        qt = QTest(a.qemu, 't40')
+        test_gmac_phy_pdown(qt)
+        qt.close()
+        test_gmac_phy_props(a.qemu)
         qt = QTest(a.qemu, 't40')
         test_drawbox(qt)
         test_i2d(qt)
