@@ -341,6 +341,7 @@ struct IngenicMachineState {
     char *variant;
     char *sensor;
     DeviceState *sensor_dev;        /* the sensor= model, for the ISP */
+    int sensor_bus;                 /* sensor-bus=, or -1: the SoC's own */
     char *sensor1;
     DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
     char *sensor2;
@@ -989,6 +990,7 @@ static void ingenic_init(MachineState *ms)
     DeviceState *i2c[5] = { NULL };
     DeviceState *ssi[2] = { NULL };
     SysBusDevice *sbd;
+    int sensor_bus;
     int i;
 
     ims->info = info;
@@ -1235,12 +1237,34 @@ static void ingenic_init(MachineState *ms)
         }
     }
 
-    /* I2C, the sensor's bus on I2C0 */
+    /* I2C, the sensor's bus on I2C0, or where sensor-bus= puts it */
+    sensor_bus = ims->sensor_bus >= 0 ? ims->sensor_bus : info->sensor_bus;
+    if (sensor_bus >= info->num_i2c) {
+        error_report("sensor-bus=%d: this SoC has I2C0..%d", sensor_bus,
+                     info->num_i2c - 1);
+        exit(1);
+    }
+    if (ims->sensor_bus >= 0 && info->sensor_gpio_sda) {
+        /* T10 bit-bangs the sensor bus: there is no adapter to move it to */
+        error_report("sensor-bus: this SoC's sensor is on GPIO I2C "
+                     "(i2c-gpio), not an I2C adapter");
+        exit(1);
+    }
+    if (ims->sensor_bus >= 0 &&
+        ((info->sensor1_bus && sensor_bus == info->sensor1_bus - 1 &&
+          ims->sensor1 && strcmp(ims->sensor1, "none")) ||
+         (info->sensor2_bus && sensor_bus == info->sensor2_bus - 1 &&
+          ims->sensor2 && strcmp(ims->sensor2, "none")))) {
+        /* the same model twice on one adapter answers at one address */
+        error_report("sensor-bus=%d: sensor1= or sensor2= is already on "
+                     "I2C%d", sensor_bus, sensor_bus);
+        exit(1);
+    }
     for (i = 0; i < info->num_i2c; i++) {
         dev = i2c[i] = sysbus_create_simple("ingenic-i2c",
                                             I2C_BASE + i * 0x1000,
                                             ingenic_irq(ims, IRQ_I2C0 - i));
-        if (i == info->sensor_bus && !info->sensor_gpio_sda && ims->sensor &&
+        if (i == sensor_bus && !info->sensor_gpio_sda && ims->sensor &&
             strcmp(ims->sensor, "none")) {
             ims->sensor_dev = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), ims->sensor);
         }
@@ -1934,6 +1958,28 @@ static void ingenic_set_sensor(Object *obj, const char *value, Error **errp)
     ims->sensor = g_strdup(value);
 }
 
+static void ingenic_machine_instance_init(Object *obj)
+{
+    INGENIC_MACHINE(obj)->sensor_bus = -1;
+}
+
+static char *ingenic_get_sensor_bus(Object *obj, Error **errp)
+{
+    return g_strdup_printf("%d", INGENIC_MACHINE(obj)->sensor_bus);
+}
+
+static void ingenic_set_sensor_bus(Object *obj, const char *value,
+                                   Error **errp)
+{
+    int bus;
+
+    if (qemu_strtoi(value, NULL, 0, &bus) < 0 || bus < -1) {
+        error_setg(errp, "sensor-bus: -1 or an I2C adapter number");
+        return;
+    }
+    INGENIC_MACHINE(obj)->sensor_bus = bus;
+}
+
 static char *ingenic_get_sensor1(Object *obj, Error **errp)
 {
     return g_strdup(INGENIC_MACHINE(obj)->sensor1);
@@ -2038,6 +2084,12 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "variant",
         "the grade within the family the SoC reports in CPPSR and the "
         "EFUSE (e.g. t31x, t40xp, t41lq); DRAM is still -m");
+    object_class_property_add_str(oc, "sensor-bus",
+        ingenic_get_sensor_bus, ingenic_set_sensor_bus);
+    object_class_property_set_description(oc, "sensor-bus",
+        "the I2C adapter sensor= sits on, for boards wired unlike the SoC's "
+        "reference design (OpenIPC/firmware#1884); -1 (default) keeps the "
+        "SoC's own (I2C0, or I2C1 on T40)");
     object_class_property_add_str(oc, "sensor",
         ingenic_get_sensor, ingenic_set_sensor);
     object_class_property_set_description(oc, "sensor",
@@ -2191,6 +2243,7 @@ static void ingenic_machine_register_types(void)
         .parent = TYPE_MACHINE,
         .abstract = true,
         .instance_size = sizeof(IngenicMachineState),
+        .instance_init = ingenic_machine_instance_init,
         .class_size = sizeof(IngenicMachineClass),
         .class_init = ingenic_machine_class_init,
     };
