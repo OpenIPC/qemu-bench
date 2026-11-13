@@ -15,6 +15,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <math.h>
 
 #include "sample_common_ive.h"
 #include "ss_mpi_ive.h"
@@ -264,6 +265,84 @@ static const td_s8 g_sobel[OT_IVE_MASK_NUM] = {
 #define W   64
 #define H   64
 
+/*
+ * A picture whose normalised gradients are a controlled sweep: with
+ * src = (x^2 * ax + y^2 * ay) / 64 the Sobel's gx grows with x and gy
+ * with y, so a 3x3 window's structure tensor is near-diagonal and its
+ * two entries sweep the picture.  That is what makes the eigen op's
+ * arithmetic readable: every (A, C) pair appears somewhere, with B ~ 0.
+ */
+static void fill_quad(ot_svp_img *img, int ax, int ay, int off)
+{
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int v = off + ((int)(x * x) * ax + (int)(y * y) * ay) / 64;
+
+            row[x] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+    }
+}
+
+/* a tilted plane plus a fine ripple, so the gradient direction turns */
+static void fill_swirl(ot_svp_img *img, int k, int amp)
+{
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int v = 128 + ((int)x * k) / 4 - ((int)y * k) / 4 +
+                    amp * (((x / 3) % 2) ? 1 : -1) * (((y / 3) % 2) ? 1 : -1);
+
+            row[x] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+    }
+}
+
+/*
+ * A separable picture, src = F(x) + G(y), so the Sobel's gx depends only
+ * on x and gy only on y.  A 3x3 window's structure tensor is then
+ * A = 3 sum gx^2, C = 3 sum gy^2 and B = (sum gx)(sum gy), all of which
+ * these sawtooth ramps drive directly -- which is what makes the eigen
+ * op's arithmetic readable over a structured sweep instead of the clumps
+ * a random picture gives.
+ */
+static void fill_separable(ot_svp_img *img, int ax, int ay, int period)
+{
+    int fx[128], gy[128];
+    int v = 0;
+
+    for (td_u32 x = 0; x < img->width && x < 128; x++) {
+        int step = ((x / period) % 2) ? -ax : ax;
+
+        fx[x] = v;
+        v += step * (1 + (int)(x % 3));
+        if (v < 0 || v > 120) {
+            v = v < 0 ? 0 : 120;
+        }
+    }
+    v = 0;
+    for (td_u32 y = 0; y < img->height && y < 128; y++) {
+        int step = ((y / period) % 2) ? -ay : ay;
+
+        gy[y] = v;
+        v += step * (1 + (int)(y % 2));
+        if (v < 0 || v > 120) {
+            v = v < 0 ? 0 : 120;
+        }
+    }
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int p = fx[x] + gy[y];
+
+            row[x] = p < 0 ? 0 : p > 255 ? 255 : p;
+        }
+    }
+}
+
 static void cap_mag_and_ang(void)
 {
     ot_svp_img src, mag, ang;
@@ -305,8 +384,14 @@ static void cap_canny(void)
     ot_svp_mem_info stack;
     ot_ive_canny_hys_edge_ctrl c = { 0 };
     ot_ive_handle h;
-    /* a weak band that touches the strong pixels (20 / 60) as well as 50 / 150 */
-    static const td_u16 lo[] = { 50, 20, 100 }, hi[] = { 150, 60, 400 };
+    /*
+     * Thresholds chosen to separate the two rules: a band that touches
+     * the strong pixels (20 / 60), one that is almost everything
+     * (2 / 10), one where weak is wide and strong rare (10 / 600), and
+     * one with no weak band at all (300 / 301).
+     */
+    static const td_u16 lo[] = { 50, 20, 100, 2, 10, 300 },
+                        hi[] = { 150, 60, 400, 10, 600, 301 };
     char n[64];
 
     if (mk(&src, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&edge, OT_SVP_IMG_TYPE_U8C1, W, H)) {
@@ -320,7 +405,7 @@ static void cap_canny(void)
     memcpy(c.mask, g_sobel, sizeof(c.mask));
     for (int s = 0; s < 3; s++) {
         fill_u8(&src, 2 + s * 7);
-        for (int t = 0; t < 3; t++) {
+        for (int t = 0; t < 6; t++) {
             c.low_threshold = lo[t];
             c.high_threshold = hi[t];
             snprintf(n, sizeof(n), "canny_s%d_t%d", s, t);
@@ -436,12 +521,42 @@ static void cap_st(void)
         return;
     }
     c.quality_level = 25;
-    for (int s = 0; s < 2; s++) {
-        fill_u8(&src, 5 + s * 9);
+    for (int s = 0; s < 10; s++) {
+        switch (s) {
+        case 0: case 1:
+            fill_u8(&src, 5 + s * 9);
+            break;
+        case 2:
+            fill_quad(&src, 6, 1, 0);           /* A >> C, both sweeping */
+            break;
+        case 3:
+            fill_quad(&src, 2, 2, 0);           /* A ~ C */
+            break;
+        case 4:
+            fill_swirl(&src, 8, 20);            /* B large */
+            break;
+        case 5:
+            fill_swirl(&src, 2, 60);
+            break;
+        case 6:
+            fill_separable(&src, 1, 1, 7);
+            break;
+        case 7:
+            fill_separable(&src, 3, 1, 5);
+            break;
+        case 8:
+            fill_separable(&src, 2, 5, 11);
+            break;
+        default:
+            fill_separable(&src, 6, 4, 3);
+            break;
+        }
         snprintf(n, sizeof(n), "st_s%d_cand_corner", s);
         if (done(n, ss_mpi_ive_st_cand_corner(&h, &src, &cand, &c, TD_TRUE), h)) {
             continue;
         }
+        snprintf(n, sizeof(n), "st_s%d_src", s);
+        dump_img(n, &src);
         snprintf(n, sizeof(n), "st_s%d_cand", s);
         dump_img(n, &cand);
         /*
@@ -483,26 +598,54 @@ static void cap_st(void)
     freeimg(&cand);
 }
 
-#define LK_W    256
-#define LK_H    256
-#define LK_LVL  2
+#define LK_W    128
+#define LK_H    128
+#define LK_LVL  1
 #define LK_PTS  16
 
-/* pyramid level l of a scene shifted by (dx, dy) / 8 pixels */
-static void fill_scene(ot_svp_img *img, int l, int dx, int dy)
+/*
+ * The scene LK is tracked in.  The first one moved by whole pixels only
+ * -- it divided the shifted coordinate by 8 -- so a sub-pixel shift
+ * produced no sub-pixel motion, and every point of a periodic picture
+ * answered the same.  This one is a sum of sinusoids whose periods share
+ * no factor with the point spacing, sampled at the shifted coordinate,
+ * so the motion really is a fraction of a pixel and each point sees its
+ * own texture.  The pictures are dumped: the fit needs the exact bytes,
+ * and a sine computed here need not match one computed elsewhere to the
+ * last bit.  Level l samples the same scene at twice the step, which is
+ * what a correctly built pyramid of a smooth picture holds; the shift is
+ * in eighths of a level-0 pixel.
+ */
+static void fill_wave(ot_svp_img *img, int l, int dx8, int dy8)
 {
+    const double pi2 = 6.283185307179586;
+
     for (td_u32 y = 0; y < img->height; y++) {
         td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
 
         for (td_u32 x = 0; x < img->width; x++) {
-            int sx = ((int)x << l) * 8 - dx, sy = ((int)y << l) * 8 - dy;
-            int v = ((sx / 8 / 16 + sy / 8 / 16) & 1) ? 200 : 40;
+            double u = (double)((int)x << l) - dx8 / 8.0;
+            double v = (double)((int)y << l) - dy8 / 8.0;
+            double p = 128 + 44 * sin(pi2 * u / 13.7) +
+                             36 * sin(pi2 * v / 9.3) +
+                             26 * sin(pi2 * (u + v) / 21.1) +
+                             14 * sin(pi2 * (u - 2 * v) / 31.3);
+            int q = (int)(p + 0.5);
 
-            v += (sx / 8) % 16 * 2 + (sy / 8) % 12;
-            row[x] = v > 255 ? 255 : v;
+            row[x] = q < 0 ? 0 : q > 255 ? 255 : q;
         }
     }
 }
+
+/* the tracked points: spread, and not on the scene's periods */
+static const struct {
+    int x, y;
+} g_lk_pts[LK_PTS] = {
+    { 29, 23 }, { 41, 58 }, { 67, 31 }, { 83, 71 },
+    { 37, 89 }, { 59, 43 }, { 95, 61 }, { 71, 97 },
+    { 25, 47 }, { 53, 79 }, { 89, 37 }, { 97, 83 },
+    { 33, 67 }, { 47, 101 }, { 79, 53 }, { 61, 29 },
+};
 
 static void cap_lk(void)
 {
@@ -510,14 +653,26 @@ static void cap_lk(void)
     ot_svp_mem_info pp, np, st, er;
     ot_ive_lk_optical_flow_pyr_ctrl c = { 0 };
     ot_ive_handle h;
+    /* in eighths of a pixel: sub-pixel, a half, whole, and longer ones */
+    static const int dxs[] = { 3, 4, 8, 12, 25, -9 },
+                     dys[] = { 1, -4, 0, 20, 7, -17 };
+    /*
+     * One level and one iteration first, then more of each: a single
+     * step at a single level is what makes the arithmetic readable, and
+     * the rest show the iteration and the pyramid.  (max_level 2 on a
+     * 128-pixel picture is refused by the MPI, 0xa01d8007.)
+     */
+    static const int lvls[] = { 0, 0, 0, LK_LVL }, iters[] = { 1, 2, 10, 10 };
+    char n[64];
 
     for (int l = 0; l <= LK_LVL; l++) {
         if (mk(&prev[l], OT_SVP_IMG_TYPE_U8C1, LK_W >> l, LK_H >> l) ||
             mk(&next[l], OT_SVP_IMG_TYPE_U8C1, LK_W >> l, LK_H >> l)) {
             return;
         }
-        fill_scene(&prev[l], l, 0, 0);
-        fill_scene(&next[l], l, 13, -9);       /* +1.6, -1.1 pixels */
+        fill_wave(&prev[l], l, 0, 0);
+        snprintf(n, sizeof(n), "lk_prev_l%d", l);
+        dump_img(n, &prev[l]);
     }
     if (mkmem(&pp, sample_common_ive_calc_stride(sizeof(ot_svp_point_s25q7) * LK_PTS, OT_IVE_ALIGN)) ||
         mkmem(&np, sample_common_ive_calc_stride(sizeof(ot_svp_point_s25q7) * LK_PTS, OT_IVE_ALIGN)) ||
@@ -525,24 +680,40 @@ static void cap_lk(void)
         mkmem(&er, sample_common_ive_calc_stride(sizeof(td_u9q7) * LK_PTS, OT_IVE_ALIGN))) {
         return;
     }
-    for (int i = 0; i < LK_PTS; i++) {
-        ot_svp_point_s25q7 *p = PTR(ot_svp_point_s25q7, pp.virt_addr) + i;
-
-        p->x = (48 + (i % 4) * 48) << 7;        /* on the checker corners */
-        p->y = (48 + (i / 4) * 48) << 7;
-    }
     c.out_mode = OT_IVE_LK_OPTICAL_FLOW_PYR_OUT_MODE_BOTH;
     c.use_init_flow = TD_FALSE;
     c.points_num = LK_PTS;
-    c.max_level = LK_LVL;
     c.min_eig_val_threshold = 100;
-    c.iter_cnt = 10;
     c.eps = 2;
-    if (!done("lk_optical_flow_pyr", ss_mpi_ive_lk_optical_flow_pyr(&h, prev, next, &pp, &np,
-                                                                   &st, &er, &c, TD_TRUE), h)) {
-        dump_mem("lk_next_points", np.virt_addr, sizeof(ot_svp_point_s25q7) * LK_PTS);
-        dump_mem("lk_status", st.virt_addr, LK_PTS);
-        dump_mem("lk_err", er.virt_addr, sizeof(td_u9q7) * LK_PTS);
+    for (int k = 0; k < (int)(sizeof(dxs) / sizeof(dxs[0])); k++) {
+        for (int l = 0; l <= LK_LVL; l++) {
+            fill_wave(&next[l], l, dxs[k] >> l, dys[k] >> l);
+            snprintf(n, sizeof(n), "lk_next_d%d_l%d", k, l);
+            dump_img(n, &next[l]);
+        }
+        for (int m = 0; m < (int)(sizeof(lvls) / sizeof(lvls[0])); m++) {
+            c.max_level = lvls[m];
+            c.iter_cnt = iters[m];
+            for (int i = 0; i < LK_PTS; i++) {
+                ot_svp_point_s25q7 *q = PTR(ot_svp_point_s25q7, pp.virt_addr) + i;
+
+                q->x = g_lk_pts[i].x << 7;
+                q->y = g_lk_pts[i].y << 7;
+            }
+            memset(PTR(td_u8, np.virt_addr), 0, sizeof(ot_svp_point_s25q7) * LK_PTS);
+            memset(PTR(td_u8, st.virt_addr), 0, LK_PTS);
+            snprintf(n, sizeof(n), "lk_d%d_m%d", k, m);
+            if (done(n, ss_mpi_ive_lk_optical_flow_pyr(&h, prev, next, &pp, &np,
+                                                       &st, &er, &c, TD_TRUE), h)) {
+                continue;
+            }
+            snprintf(n, sizeof(n), "lk_d%d_m%d_next", k, m);
+            dump_mem(n, np.virt_addr, sizeof(ot_svp_point_s25q7) * LK_PTS);
+            snprintf(n, sizeof(n), "lk_d%d_m%d_status", k, m);
+            dump_mem(n, st.virt_addr, LK_PTS);
+            snprintf(n, sizeof(n), "lk_d%d_m%d_err", k, m);
+            dump_mem(n, er.virt_addr, sizeof(td_u9q7) * LK_PTS);
+        }
     }
     for (int l = 0; l <= LK_LVL; l++) {
         freeimg(&prev[l]);
@@ -604,6 +775,136 @@ static void cap_gmm2(void)
     }
     dump_mem("gmm2_model", model.virt_addr, c.model_num * sizeof(td_u64) * W * H);
     freemem(&model);
+    freeimg(&src);
+    freeimg(&factor);
+    freeimg(&fg);
+    freeimg(&bg);
+    freeimg(&match);
+}
+
+/*
+ * A second GMM2 sequence, built so the model is readable: the picture is
+ * one value everywhere, so every pixel shares a history, and it steps
+ * twice.  The model slice after each frame shows the update rule, which
+ * the long random-scene run above cannot (its pixels all differ).
+ */
+static void cap_gmm2_flat(void)
+{
+    ot_svp_img src, factor, fg, bg, match;
+    ot_svp_mem_info model;
+    ot_ive_gmm2_ctrl c = { 0 };
+    ot_ive_handle h;
+    static const int val[] = { 100, 100, 100, 100, 150, 150, 100, 220 };
+    char n[64];
+
+    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&factor, OT_SVP_IMG_TYPE_U16C1, W, H) ||
+        mk(&fg, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&bg, OT_SVP_IMG_TYPE_U8C1, W, H) ||
+        mk(&match, OT_SVP_IMG_TYPE_U8C1, W, H)) {
+        return;
+    }
+    c.var_rate = 1;
+    c.model_num = 3;
+    c.max_var = (16 * 16) << 7;
+    c.min_var = (8 * 8) << 7;
+    c.global_sns_factor = 8;
+    c.sns_factor_mode = OT_IVE_GMM2_SNS_FACTOR_MODE_GLOBAL;
+    c.freq_threshold = 12000;
+    c.freq_init_val = 20000;
+    c.freq_add_factor = 0xEF;
+    c.freq_reduce_factor = 0xFF00;
+    c.life_threshold = 500;
+    c.life_update_factor_mode = OT_IVE_GMM2_LIFE_UPDATE_FACTOR_MODE_GLOBAL;
+    c.global_life_update_factor = 0xFFFF;
+    if (mkmem(&model, c.model_num * sizeof(td_u64) * W * H)) {
+        goto out;
+    }
+    for (int f = 0; f < (int)(sizeof(val) / sizeof(val[0])); f++) {
+        for (td_u32 y = 0; y < H; y++) {
+            memset(PTR(td_u8, src.virt_addr[0]) + y * src.stride[0], val[f], W);
+        }
+        snprintf(n, sizeof(n), "gmm2flat_f%d", f);
+        if (done(n, ss_mpi_ive_gmm2(&h, &src, &factor, &fg, &bg, &match, &model, &c,
+                                    TD_TRUE), h)) {
+            continue;
+        }
+        snprintf(n, sizeof(n), "gmm2flat_f%d_fg", f);
+        dump_img(n, &fg);
+        snprintf(n, sizeof(n), "gmm2flat_f%d_bg", f);
+        dump_img(n, &bg);
+        snprintf(n, sizeof(n), "gmm2flat_f%d_match", f);
+        dump_img(n, &match);
+        /* the first pixels' models: every pixel has the same history */
+        snprintf(n, sizeof(n), "gmm2flat_f%d_model", f);
+        dump_mem(n, model.virt_addr, c.model_num * sizeof(td_u64) * 16);
+    }
+    freemem(&model);
+out:
+    freeimg(&src);
+    freeimg(&factor);
+    freeimg(&fg);
+    freeimg(&bg);
+    freeimg(&match);
+}
+
+/*
+ * A third GMM2 sequence, built to show the match test and the updates:
+ * the picture settles flat at 100 and then every column steps by its own
+ * index, so one frame holds the boundary for every step size at once.
+ * A whole row of models is dumped after each frame.
+ */
+static void cap_gmm2_step(void)
+{
+    ot_svp_img src, factor, fg, bg, match;
+    ot_svp_mem_info model;
+    ot_ive_gmm2_ctrl c = { 0 };
+    ot_ive_handle h;
+    char n[64];
+
+    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&factor, OT_SVP_IMG_TYPE_U16C1, W, H) ||
+        mk(&fg, OT_SVP_IMG_TYPE_U8C1, W, H) || mk(&bg, OT_SVP_IMG_TYPE_U8C1, W, H) ||
+        mk(&match, OT_SVP_IMG_TYPE_U8C1, W, H)) {
+        return;
+    }
+    c.var_rate = 1;
+    c.model_num = 3;
+    c.max_var = (16 * 16) << 7;
+    c.min_var = (8 * 8) << 7;
+    c.global_sns_factor = 8;
+    c.sns_factor_mode = OT_IVE_GMM2_SNS_FACTOR_MODE_GLOBAL;
+    c.freq_threshold = 12000;
+    c.freq_init_val = 20000;
+    c.freq_add_factor = 0xEF;
+    c.freq_reduce_factor = 0xFF00;
+    c.life_threshold = 500;
+    c.life_update_factor_mode = OT_IVE_GMM2_LIFE_UPDATE_FACTOR_MODE_GLOBAL;
+    c.global_life_update_factor = 0xFFFF;
+    if (mkmem(&model, c.model_num * sizeof(td_u64) * W * H)) {
+        goto out;
+    }
+    for (int f = 0; f < 10; f++) {
+        for (td_u32 y = 0; y < H; y++) {
+            td_u8 *row = PTR(td_u8, src.virt_addr[0]) + y * src.stride[0];
+
+            for (td_u32 x = 0; x < W; x++) {
+                row[x] = f < 4 ? 100 : (td_u8)(100 + x);
+            }
+        }
+        snprintf(n, sizeof(n), "gmm2step_f%d", f);
+        if (done(n, ss_mpi_ive_gmm2(&h, &src, &factor, &fg, &bg, &match, &model, &c,
+                                    TD_TRUE), h)) {
+            continue;
+        }
+        snprintf(n, sizeof(n), "gmm2step_f%d_fg", f);
+        dump_img(n, &fg);
+        snprintf(n, sizeof(n), "gmm2step_f%d_bg", f);
+        dump_img(n, &bg);
+        snprintf(n, sizeof(n), "gmm2step_f%d_match", f);
+        dump_img(n, &match);
+        snprintf(n, sizeof(n), "gmm2step_f%d_model", f);
+        dump_mem(n, model.virt_addr, c.model_num * sizeof(td_u64) * W);
+    }
+    freemem(&model);
+out:
     freeimg(&src);
     freeimg(&factor);
     freeimg(&fg);
@@ -769,6 +1070,8 @@ int main(int argc, char **argv)
     cap_st();
     cap_lk();
     cap_gmm2();
+    cap_gmm2_flat();
+    cap_gmm2_step();
     cap_acc_dot_alpha();
     cap_csc();
     cap_resize();

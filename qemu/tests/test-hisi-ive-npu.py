@@ -12,6 +12,7 @@ task's id.  The outputs are checked against the same ops done here.
     python3 qemu/tests/test-hisi-ive-npu.py [--qemu PATH] [--machine M]
 """
 import argparse
+import math
 import os
 import struct
 import sys
@@ -123,6 +124,84 @@ CSC_TO_YUV = {
     10: ((100, 516, 263, 16896), (-73, -377, 450, 131584),
          (450, -298, -152, 131584)),
 }
+
+
+OCT_STEP = ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))
+
+
+def canny_ref(mag, ang, w, h, lo, hi):
+    """the engine's thinning and hysteresis: classes and the seed list"""
+    def m(x, y):
+        return 0 if x < 0 or y < 0 or x >= w or y >= h else mag[y * w + x]
+    state = [0] * (w * h)
+    edge = [1] * (w * h)
+    seeds = []
+    for y in range(h):
+        for x in range(w):
+            i = y * w + x
+            dx, dy = OCT_STEP[ang[i] & 7]
+            v = mag[i]
+            n1, n2 = m(x + dx, y + dy), m(x - dx, y - dy)
+            if (ang[i] & 1):
+                keep = v > n1 and v > n2
+            elif dy < 0 or (dy == 0 and dx < 0):
+                keep = v > n1 and v >= n2
+            else:
+                keep = v >= n1 and v > n2
+            if not keep or v <= lo:
+                continue
+            if v <= hi:
+                state[i], edge[i] = 1, 0
+                continue
+            if (x and state[i - 1] in (2, 3)) or (y and state[i - w] == 2):
+                state[i], edge[i] = 3, 0
+                continue
+            state[i], edge[i] = 2, 2
+            seeds.append(x | y << 16)
+    return edge, seeds
+
+
+GMM2_CTRL = dict(life_factor=0xffff, life_threshold=500, freq_init=20000,
+                 freq_reduce=0xff00, freq_add=0xef, freq_threshold=12000,
+                 var_rate=1, max_var=(16 * 16) << 7, min_var=(8 * 8) << 7,
+                 sns=8, num=3)
+
+
+def gmm2_pixel(g, v, c):
+    """one pixel's Gaussians updated as the engine does"""
+    sample = v << 7
+    lead = max(range(len(g)), key=lambda i: (g[i][2], -i))
+    hit = -1
+    for i, (mean, var, freq, life) in enumerate(g):
+        d = sample - mean
+        if freq and d * d <= (var * c['sns'] << 7):
+            hit = i
+            break
+    matched = hit >= 0
+    if matched:
+        mean, var, freq, life = g[hit]
+        sh = 6 + max(c['var_rate'], 1)
+        d = sample - mean
+        dg = -((-d) >> 7)
+        var -= (var - ((dg * dg) << 7)) >> sh
+        g[hit] = [mean - ((mean - sample) >> sh),
+                  min(max(var, c['min_var']), c['max_var']),
+                  min(((freq * c['freq_reduce']) >> 16) + c['freq_add'], 0xffff),
+                  min(life + c['life_factor'], 0xffff)]
+    for i, (mean, var, freq, life) in enumerate(g):
+        if i != hit and freq:
+            g[i] = [mean, var, (freq * c['freq_reduce']) >> 16, life]
+    if not matched:
+        slot = next((i for i in range(len(g) - 1, -1, -1) if not g[i][2]), None)
+        if slot is None:
+            slot = min(range(len(g)), key=lambda i: g[i][2])
+        g[slot] = [sample, c['max_var'], c['freq_init'], 1]
+        hit = slot
+    for q in g:
+        if not q[2]:
+            q[3] = 0xffff
+    return (255 if g[hit][3] < c['life_threshold'] else 0,
+            g[lead][0] >> 7, lead << 1 | int(matched))
 
 
 def band(v, lo, hi, a, b, c):
@@ -640,6 +719,105 @@ def main():
                                           0, 255))
             check(list(q.read(R + 0x1000, n // 2)) == want,
                   'CSC: mode %d, the chroma of each block top-left pixel' % mode)
+
+        # CANNY_HYS_EDGE: the task has no picture -- the driver runs a
+        # mag_and_ang task into the ctrl's mem first, so the input is a
+        # U16 magnitude with the octant angle right after it
+        MAGB = IMG + 0x240000
+        STACK = IMG + 0x260000
+        magv = [min(abs(x), 0xffff) for x in gh]
+        angv = [octant(x, y) for x, y in zip(gh, gv)]
+        q.write(MAGB, struct.pack('<%dH' % n, *magv))
+        q.write(MAGB + 2 * SW * SH, bytes(angv))
+        for lo, hi in ((60, 400), (2, 10), (300, 301)):
+            q.write(STACK, b'\xee' * (4 * n + 16))
+            run(22, [(64, 'Q', MAGB), (96, 'I', 2 * SW), (80, 'Q', R),
+                     (104, 'I', SW), (88, 'Q', STACK), (300, 'I', lo),
+                     (304, 'I', hi)])
+            want, seeds = canny_ref(magv, angv, SW, SH, lo, hi)
+            check(list(q.read(R, n)) == want,
+                  'CANNY_HYS_EDGE: classes, %d / %d' % (lo, hi))
+            got = list(struct.unpack('<%dI' % len(seeds),
+                                     q.read(STACK, 4 * len(seeds)))) if seeds else []
+            check(got == seeds,
+                  'CANNY_HYS_EDGE: %d seeds in raster order' % len(seeds))
+            check(struct.unpack('<I', q.read(STACK + 4 * n, 4))[0] == len(seeds),
+                  'CANNY_HYS_EDGE: the stack size past the points')
+
+        # GMM2: three frames over a picture that steps, with the model
+        # read back each time -- 8 bytes per Gaussian, model_num of them
+        # per pixel, pixel by pixel
+        MODEL = IMG + 0x280000
+        FG, BG, MINFO = R, R + 0x1000, R + 0x2000
+        c = GMM2_CTRL
+        q.write(MODEL, bytes(8 * c['num'] * n))
+        state = [[[0, 0, 0, 0] for _ in range(c['num'])] for _ in range(n)]
+        gfields = [(72, 'Q', P), (132, 'I', SW), (80, 'Q', MODEL),
+                   (120, 'Q', MODEL), (96, 'Q', MINFO), (144, 'I', SW),
+                   (104, 'Q', FG), (148, 'I', SW), (112, 'Q', BG),
+                   (152, 'I', SW), (312, 'I', c['life_factor']),
+                   (316, 'I', c['life_threshold']), (320, 'I', c['freq_init']),
+                   (324, 'I', c['freq_reduce']), (328, 'I', c['freq_add']),
+                   (332, 'I', c['freq_threshold']), (336, 'I', c['var_rate']),
+                   (340, 'I', c['max_var']), (344, 'I', c['min_var']),
+                   (348, 'I', c['sns']), (352, 'I', c['num'])]
+        for frame in range(3):
+            pic = bytes((100 if frame < 2 else 100 + i % SW) & 0xff
+                        for i in range(n))
+            q.write(P, pic)
+            run(30, gfields)
+            want = [gmm2_pixel(state[i], pic[i], c) for i in range(n)]
+            got_model = list(struct.unpack('<%dH' % (4 * c['num'] * n),
+                                           q.read(MODEL, 8 * c['num'] * n)))
+            flat = [v for px in state for g in px for v in g]
+            check(got_model == flat, 'GMM2: the model after frame %d' % frame)
+            check(list(q.read(FG, n)) == [t[0] for t in want],
+                  'GMM2: foreground, frame %d' % frame)
+            check(list(q.read(BG, n)) == [t[1] for t in want],
+                  'GMM2: background, frame %d' % frame)
+            check(list(q.read(MINFO, n)) == [t[2] for t in want],
+                  'GMM2: match info, frame %d' % frame)
+
+        # LK_OPTICAL_FLOW_PYR: the task's size fields hold 2 and the
+        # maximum level, with the picture's own size at +320 / +324
+        LKW, LKH = 64, 64
+        LKP, LKN = IMG + 0x300000, IMG + 0x310000
+        PIN, POUT = IMG + 0x320000, IMG + 0x320100
+        LST, LERR = IMG + 0x320200, IMG + 0x320300
+        wave = bytes(clamp(int(128 + 40 * math.sin(x / 2.1) +
+                               30 * math.sin(y / 1.7)), 0, 255)
+                     for y in range(LKH) for x in range(LKW))
+        shifted = bytes(clamp(int(128 + 40 * math.sin((x - 1) / 2.1) +
+                                  30 * math.sin(y / 1.7)), 0, 255)
+                        for y in range(LKH) for x in range(LKW))
+        q.write(LKP, wave)
+        q.write(LKN, shifted)
+        lkpts = ((21, 17), (33, 29), (45, 41))
+        q.write(PIN, b''.join(struct.pack('<ii', x << 7, y << 7)
+                              for x, y in lkpts))
+        q.write(LST, b'\xee' * len(lkpts))
+        i = (q.readl(SQ + 0x20) + 1) % NSLOT
+        t = bytearray(task(i, 28, 2, 0, [(64, 'Q', LKP), (176, 'I', LKW),
+                                         (96, 'Q', LKN), (192, 'I', LKW),
+                                         (128, 'Q', PIN), (136, 'Q', POUT),
+                                         (160, 'Q', LST), (168, 'Q', LERR),
+                                         (304, 'I', 100), (308, 'I', 2),
+                                         (312, 'I', 10), (316, 'I', len(lkpts)),
+                                         (320, 'I', LKW), (324, 'I', LKH)]))
+        q.write(slot(i), bytes(t))
+        q.writel(SQ + 0x10, 1 << 8)
+        q.cmd('clock_step 2000000')
+        q.writel(SQ + 0x14, 31)
+        got = struct.unpack('<%di' % (2 * len(lkpts)), q.read(POUT, 8 * len(lkpts)))
+        check(list(q.read(LST, len(lkpts))) == [1] * len(lkpts),
+              'LK: every point tracked')
+        # a one-pixel shift along x, to an eighth of a pixel
+        ok = all(abs(got[2 * k] - ((x + 1) << 7)) <= 16 and
+                 abs(got[2 * k + 1] - (y << 7)) <= 16
+                 for k, (x, y) in enumerate(lkpts))
+        check(ok, 'LK: the flow is the picture\'s shift (%s)' %
+              ' '.join('%.2f,%.2f' % (got[2 * k] / 128 - x, got[2 * k + 1] / 128 - y)
+                       for k, (x, y) in enumerate(lkpts)))
 
         # RESIZE: the op whose parameters sit in a block of its own, which
         # is also why its task carries no op code and no size

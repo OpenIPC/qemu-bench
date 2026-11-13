@@ -702,7 +702,7 @@ in this order:
     ring in DDR that the SVP NPU's task scheduler runs (`hisi-ive-npu`,
     0x14000000, SPI 76). The model follows the ring's links (+6 id, +8
     next) and computes the op named by the code at +288; the NPU models
-    the driver loads are shared between ops and are never run. 29 ops
+    the driver loads are shared between ops and are never run. 32 ops
     are modelled, their pixel work in `hisi-ive-ops.c`, shared with V4's
     `hisi-ive` (`test-hisi-ive-npu.py`, CI; `test-hisi-v5-sample-ive.sh
     --sdk`, local: the SDK's memory test, and its sobel against numpy).
@@ -712,8 +712,17 @@ in this order:
     SDK, so the ops' arithmetic is fitted against a CV608 board:
     `ive-v5-capture.sh --board HOST --qemu` runs every op through the MPI
     on both and compares the outputs byte for byte (references in
-    `qemu/tests/data/`). canny_hys_edge, the Shi-Tomasi pair, LK and GMM2
-    are still open (#268). majestic's motion
+    `qemu/tests/data/`). Some ops are a sequence the MPI submits, not one
+    task: canny_hys_edge reads a mag_and_ang result from the ctrl's mem
+    (its classes are 1 not-an-edge, 0 weak, 2 seed, and the seeds are
+    thinned in raster order), and st_cand_corner runs norm_grad, op 25,
+    16bit_to_8bit, a threshold, a 3x3 maximum and op 26. The Shi-Tomasi
+    measure is still open (#268). LK is the one op modelled to a
+    tolerance and not exactly: a 7x7 window, the Sobel over 8 as the
+    gradient, Cramer's rule truncated towards minus infinity, which
+    places a point within 0.03 pixels of the board. GMM2 keeps 3 to 5 Gaussians of
+    8 bytes per pixel and updates them with shifts that round towards
+    +infinity (`docs/ive-registers.md`). majestic's motion
     detection would use it, but reads VPSS extended channel 3, which is
     not modelled (#273).
   - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`

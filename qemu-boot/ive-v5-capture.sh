@@ -139,7 +139,10 @@ cd /tmp
 ive-v5-capture /tmp/ivecap
 echo "=== rc=$?"
 echo "=== tar begin"
-tar -C /tmp/ivecap -cf - . | base64
+# a prefix per line: the kernel and the vendor modules write to the same
+# console, and a stray message in the middle of the stream would otherwise
+# corrupt the archive
+tar -C /tmp/ivecap -cf - . | base64 | sed 's/^/B64:/'
 echo "=== tar end"
 echo b > /proc/sysrq-trigger
 EOF
@@ -152,8 +155,8 @@ EOF
         -no-reboot > "$WORK/qemu.log" 2>&1 || true
     rm -rf "$WORK/qemu"
     mkdir -p "$WORK/qemu"
-    sed -n '/^=== tar begin/,/^=== tar end/p' "$WORK/qemu.log" | tr -d '\r' |
-        sed '1d;$d' | base64 -d | tar -C "$WORK/qemu" -xf -
+    tr -d '\r' < "$WORK/qemu.log" | sed -n 's/^B64://p' | base64 -d |
+        tar -C "$WORK/qemu" -xf -
     QEMU_RC=$(sed -n 's/^=== rc=//p' "$WORK/qemu.log" | tr -d '\r' | tail -1)
     QEMU_RC=${QEMU_RC:-1}
     echo "qemu: $(grep -ac '^ok ' "$WORK/qemu.log") ok," \

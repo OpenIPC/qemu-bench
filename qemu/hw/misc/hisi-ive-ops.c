@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "hw/misc/hisi-ive-ops.h"
 
 static inline int clampi(int v, int lo, int hi)
@@ -19,6 +20,20 @@ static inline uint8_t at(const uint8_t *src, uint32_t w, uint32_t h,
                          int x, int y)
 {
     return src[clampi(y, 0, h - 1) * w + clampi(x, 0, w - 1)];
+}
+
+/*
+ * The 16-bit pixel at (x, y), zero past the picture: the suppression
+ * reads a neighbour outside it as 0, so a border pixel is kept rather
+ * than compared with itself
+ */
+static inline uint16_t at16(const uint16_t *src, uint32_t w, uint32_t h,
+                            int x, int y)
+{
+    if (x < 0 || y < 0 || x >= (int)w || y >= (int)h) {
+        return 0;
+    }
+    return src[(uint32_t)y * w + (uint32_t)x];
 }
 
 void ive_bitwise(int op, const uint8_t *a, const uint8_t *b, uint8_t *out,
@@ -503,4 +518,295 @@ void ive_csc_rgb_to_yuv(const uint8_t *b, const uint8_t *g, const uint8_t *r,
             }
         }
     }
+}
+
+/* the two neighbours along octant o, and whether each is strictly beaten */
+static const struct {
+    int dx, dy;
+} ive_octant_step[8] = {
+    { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+    { -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+};
+
+void ive_canny_hys_edge(const uint16_t *mag, const uint8_t *ang, uint32_t w,
+                        uint32_t h, uint16_t lo, uint16_t hi, uint8_t *edge,
+                        uint32_t *stack, uint32_t max_pts,
+                        uint32_t *stack_size)
+{
+    /* 0 none, 1 weak by magnitude, 2 a seed, 3 an edge thinned away */
+    g_autofree uint8_t *state = g_malloc0((size_t)w * h);
+    uint32_t n = 0;
+
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            size_t i = (size_t)y * w + x;
+            int o = ang[i] & 7, dx = ive_octant_step[o].dx;
+            int dy = ive_octant_step[o].dy, m = mag[i];
+            /* the neighbour the raster scan has already passed */
+            bool first_earlier = dy < 0 || (dy == 0 && dx < 0);
+            int n1 = at16(mag, w, h, (int)x + dx, (int)y + dy);
+            int n2 = at16(mag, w, h, (int)x - dx, (int)y - dy);
+            bool keep;
+
+            if (o & 1) {                        /* the diagonals: both strict */
+                keep = m > n1 && m > n2;
+            } else {
+                keep = first_earlier ? (m > n1 && m >= n2)
+                                     : (m >= n1 && m > n2);
+            }
+            edge[i] = 1;
+            if (!keep || m <= lo) {
+                continue;
+            }
+            if (m <= hi) {
+                state[i] = 1;
+                edge[i] = 0;
+                continue;
+            }
+            /* an edge: a seed unless one is already next to it */
+            if ((x && (state[i - 1] == 2 || state[i - 1] == 3)) ||
+                (y && state[i - w] == 2)) {
+                state[i] = 3;
+                edge[i] = 0;
+                continue;
+            }
+            state[i] = 2;
+            edge[i] = 2;
+            if (stack && n < max_pts) {
+                stack[n] = x | y << 16;         /* ot_svp_point_u16 */
+            }
+            n++;
+        }
+    }
+    if (stack_size) {
+        *stack_size = n;
+    }
+}
+
+uint8_t ive_gmm2_pixel(IveGmm2Model *g, uint8_t v, const IveGmm2Ctrl *c,
+                       uint8_t *bg, uint8_t *info)
+{
+    int n = MIN(MAX(c->model_num, 1), 5), hit = -1, lead = 0;
+    int sample = v << 7;                /* the pixel in the model's U9Q7 */
+    bool matched;
+
+    /* the frequency leader before the update: the background, and the
+     * match info's high bits */
+    for (int i = 1; i < n; i++) {
+        if (g[i].freq > g[lead].freq) {
+            lead = i;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        int d = sample - g[i].mean;
+
+        if (g[i].freq &&
+            (int64_t)d * d <= ((int64_t)g[i].var * c->sns_factor << 7)) {
+            hit = i;
+            break;
+        }
+    }
+    matched = hit >= 0;
+    if (hit >= 0) {
+        /*
+         * The matched Gaussian walks towards the sample: both updates are
+         * x -= (x - target) >> shift, which rounds towards +infinity, and
+         * the variance's target is the squared distance in whole grey
+         * levels, also rounded up
+         */
+        int d = sample - g[hit].mean, shift = 6 + MAX(c->var_rate, 1);
+        int dg = -((-d) >> 7), sq = (dg * dg) << 7;
+        int var = g[hit].var - ((g[hit].var - sq) >> shift);
+        uint32_t freq = ((uint32_t)g[hit].freq * c->freq_reduce >> 16) +
+                        c->freq_add;
+
+        g[hit].mean = g[hit].mean - ((g[hit].mean - sample) >> shift);
+        g[hit].var = MIN(MAX(var, c->min_var), c->max_var);
+        g[hit].freq = MIN(freq, UINT16_MAX);
+        g[hit].life = MIN(g[hit].life + c->life_factor, UINT16_MAX);
+    }
+    for (int i = 0; i < n; i++) {       /* the others only decay */
+        if (i != hit && g[i].freq) {
+            g[i].freq = (uint32_t)g[i].freq * c->freq_reduce >> 16;
+        }
+    }
+    if (hit < 0) {
+        int slot = -1;
+
+        for (int i = n - 1; i >= 0; i--) {
+            if (!g[i].freq) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < n; i++) {
+                if (g[i].freq < g[slot].freq) {
+                    slot = i;
+                }
+            }
+        }
+        g[slot].mean = sample;
+        g[slot].var = c->max_var;
+        g[slot].freq = c->freq_init;
+        g[slot].life = 1;
+        hit = slot;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!g[i].freq) {              /* an unused slot reads life 0xffff */
+            g[i].life = UINT16_MAX;
+        }
+    }
+    if (bg) {
+        *bg = g[lead].mean >> 7;
+    }
+    if (info) {
+        *info = lead << 1 | matched;
+    }
+    return g[hit].life < c->life_threshold ? 255 : 0;
+}
+
+/* a picture sampled at a Q7 position, bilinear, edges clamped */
+static int lk_pixel(const IveLkLevel *l, int32_t xq, int32_t yq)
+{
+    int x0 = xq >> 7, y0 = yq >> 7, fx = xq & 127, fy = yq & 127;
+    int x1 = clampi(x0 + 1, 0, l->w - 1), y1 = clampi(y0 + 1, 0, l->h - 1);
+    int a, b, c, d, top, bot;
+
+    x0 = clampi(x0, 0, l->w - 1);
+    y0 = clampi(y0, 0, l->h - 1);
+    a = l->img[y0 * l->stride + x0];
+    b = l->img[y0 * l->stride + x1];
+    c = l->img[y1 * l->stride + x0];
+    d = l->img[y1 * l->stride + x1];
+    top = a * (128 - fx) + b * fx;
+    bot = c * (128 - fx) + d * fx;
+    return (top * (128 - fy) + bot * fy + 8192) >> 14;
+}
+
+#define LK_R    3                       /* the window is 7x7 */
+#define LK_N    ((2 * LK_R + 1) * (2 * LK_R + 1))
+
+static int lk_level(const IveLkLevel *prev, const IveLkLevel *next,
+                    int32_t px, int32_t py, int32_t *gx, int32_t *gy,
+                    int iters, int eps, uint32_t min_eig, uint16_t *err)
+{
+    int ix[LK_N], iy[LK_N], pv[LK_N];
+    int64_t A = 0, B = 0, C = 0, det;
+    int k = 0;
+
+    if ((px >> 7) < LK_R + 1 || (py >> 7) < LK_R + 1 ||
+        (px >> 7) >= (int)prev->w - LK_R - 1 ||
+        (py >> 7) >= (int)prev->h - LK_R - 1) {
+        return 0;                       /* the window leaves the picture */
+    }
+    /*
+     * The gradients are the Sobel of the previous picture at the window's
+     * taps, over 8 -- the same normalised gradient norm_grad produces --
+     * kept here as the raw Sobel with the 8 folded into the step instead,
+     * so nothing is lost to rounding
+     */
+    for (int j = -LK_R; j <= LK_R; j++) {
+        for (int i = -LK_R; i <= LK_R; i++) {
+            int32_t x = px + (i << 7), y = py + (j << 7);
+            int tl = lk_pixel(prev, x - 128, y - 128);
+            int t = lk_pixel(prev, x, y - 128);
+            int tr = lk_pixel(prev, x + 128, y - 128);
+            int ml = lk_pixel(prev, x - 128, y);
+            int mr = lk_pixel(prev, x + 128, y);
+            int bl = lk_pixel(prev, x - 128, y + 128);
+            int bb = lk_pixel(prev, x, y + 128);
+            int br = lk_pixel(prev, x + 128, y + 128);
+
+            ix[k] = tr + 2 * mr + br - tl - 2 * ml - bl;
+            iy[k] = bl + 2 * bb + br - tl - 2 * t - tr;
+            pv[k] = lk_pixel(prev, x, y);
+            A += (int64_t)ix[k] * ix[k];
+            B += (int64_t)ix[k] * iy[k];
+            C += (int64_t)iy[k] * iy[k];
+            k++;
+        }
+    }
+    det = A * C - B * B;
+    if (!det) {
+        return 0;
+    }
+    {
+        /*
+         * The lesser eigenvalue of the window's gradient tensor, at the
+         * scale of the normalised gradients (the Sobel over 8, so the
+         * tensor over 64).  No captured point is ever rejected, so the
+         * threshold's scale is what the SDK's default makes plausible,
+         * not something measured.
+         */
+        double tr = (double)(A + C) / 2, dsc = (double)(A - C) / 2;
+        double lo = tr - sqrt(dsc * dsc + (double)B * B);
+
+        if (lo / 64.0 < (double)min_eig) {
+            return 0;
+        }
+    }
+    for (int it = 0; it < iters; it++) {
+        int64_t d0 = 0, d1 = 0, dx, dy;
+        int sum = 0;
+
+        k = 0;
+        for (int j = -LK_R; j <= LK_R; j++) {
+            for (int i = -LK_R; i <= LK_R; i++) {
+                int d = lk_pixel(next, px + *gx + (i << 7),
+                                 py + *gy + (j << 7)) - pv[k];
+
+                d0 += (int64_t)ix[k] * d;
+                d1 += (int64_t)iy[k] * d;
+                sum += abs(d);
+                k++;
+            }
+        }
+        if (err) {
+            *err = MIN(((int64_t)sum << 7) / LK_N, UINT16_MAX);
+        }
+        /* Cramer's rule, with the gradients' 8 and the Q7 in one step */
+        dx = -(d0 * C - d1 * B) * (8 * 128);
+        dy = -(d1 * A - d0 * B) * (8 * 128);
+        dx = dx >= 0 ? dx / det : -((-dx + det - 1) / det);
+        dy = dy >= 0 ? dy / det : -((-dy + det - 1) / det);
+        if (det < 0) {
+            dx = -dx;
+            dy = -dy;
+        }
+        *gx += dx;
+        *gy += dy;
+        if (llabs(dx) < eps && llabs(dy) < eps) {
+            break;
+        }
+    }
+    return 1;
+}
+
+int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
+                 int32_t *px, int32_t *py, int iters, int eps,
+                 uint32_t min_eig, uint16_t *err)
+{
+    int32_t gx = 0, gy = 0;
+    int ok = 1;
+
+    for (int l = levels - 1; l >= 0; l--) {
+        int32_t x = *px >> l, y = *py >> l;
+
+        ok = lk_level(&prev[l], &next[l], x, y, &gx, &gy, iters, eps,
+                      min_eig, err);
+        if (!ok) {
+            break;
+        }
+        if (l) {
+            gx *= 2;
+            gy *= 2;
+        }
+    }
+    if (ok) {
+        *px += gx;
+        *py += gy;
+    }
+    return ok;
 }

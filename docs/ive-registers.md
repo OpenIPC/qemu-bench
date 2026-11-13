@@ -308,6 +308,9 @@ semantics are the same:
 | image_dot | acc's layout with S32 pictures, so the strides are already in bytes |
 | alpha_blending | +80 / +88 / +96 the sources and the alpha, +112 destination, strides +120 / +124 / +128 / +136 |
 | resize | the only op with no fields in the task: see below |
+| canny_hys_edge | +64 the magnitude (U16, byte stride +96) with the octant angle right after it, +80 the edge picture (+104), +88 the stack of seeds; low / high at +300 / +304 |
+| lk_optical_flow_pyr | the pyramids at +64.. (previous) and +96.. (next), level 0 first, strides at +176.. and +192..; +128 the points in, +136 out, +160 the status, +168 the error. The size fields hold 2 and the maximum level, and the level-0 size is at +320 / +324; minimum eigenvalue, eps, iterations and point count at +304, +308, +312, +316 |
+| gmm2 | +72 the picture (+132), +64 the per-pixel factor when either mode is per-pixel (+128; else the model's address again), +80 / +120 the model, +96 the match info (+144), +104 the foreground (+148), +112 the background (+152); the control struct's fields in order from +312, the two byte ones at +348 / +352 |
 
 Edges are replicated.
 
@@ -341,6 +344,27 @@ binary under QEMU and compares file by file):
   the standard coefficients divided by 1.164 where the output is video
   range. Modes 4..7 (HSV, LAB) do not exist on V5 -- the MPI refuses
   them with "mode must be in [0, 3] or [8, 12)".
+- **canny_hys_edge** takes no picture: the driver runs a mag_and_ang
+  task into the ctrl's own `mem` first, so the op reads that buffer --
+  the U16 magnitude, then the octant angle immediately after it -- and
+  writes the edge classes plus a stack of seeds. The classes are
+  **1 for not an edge, 0 for a possible edge and 2 for an edge**, which
+  is the opposite way round from what the numbers suggest.
+  Suppression keeps a pixel whose magnitude beats its two neighbours
+  along the gradient's octant, reading a neighbour outside the picture
+  as 0 (not replicated, so border pixels survive): strictly on the side
+  that comes earlier in raster order for the axis-aligned octants, and
+  strictly on both sides for the diagonals. The low threshold is strict
+  (`mag > low`), the high one too. A kept pixel over the high threshold
+  is a seed unless the pixel to its left is itself an edge or the pixel
+  above it is a seed -- the engine thins the seeds, so a straight edge
+  alternates 2, 0, 2, 0 -- and the seeds go on the stack in raster
+  order as `ot_svp_point_u16`, with `ot_ive_canny_stack_size` after a
+  picture's worth of them. The thinning rule fitted here still puts
+  about one seed in a thousand on the other pixel of a pair, which
+  changes nothing: `ss_mpi_ive_canny_edge` walks 8-connected from every
+  seed, and the edge picture it produces is byte-identical to the
+  board's in all 18 captured cases.
 - **resize**: `ive_fill_npu_resize_task` puts the parameters in a block
   of its own in DDR, whose address is at task +64 and whose first word is
   the op code 29 and second the number of records. The task's +288, +292
@@ -356,8 +380,69 @@ binary under QEMU and compares file by file):
   intermediate width and the asymmetric rounding matter: nothing simpler
   matches the silicon.
 
-Still to come (#268): st_box_flt_and_eigen, candidate_corner,
-canny_hys_edge, lk_optical_flow_pyr, gmm2.
+- **gmm2** keeps `model_num` Gaussians of 8 bytes per pixel, pixel by
+  pixel: the mean and the variance as U9Q7, then the frequency and the
+  life as U16. A sample matches the first Gaussian whose squared
+  distance passes the sensitivity gate,
+  `(sample - mean)^2 <= var * sns_factor << 7` — with the variance in
+  U9Q7 that is `|d| <= 2.83 sigma` for the default factor of 8. The
+  matched Gaussian then walks towards the sample, and both updates are
+  `x -= (x - target) >> 7`, which rounds towards +infinity; the
+  variance's target is the squared distance **in whole grey levels,
+  rounded up** (`dg = -((-d) >> 7)`, `target = dg * dg << 7`), and it is
+  clamped to the control's min and max. Its frequency becomes
+  `((freq * freq_reduce_factor) >> 16) + freq_add_factor` and its life
+  rises by the life factor, saturating; every other Gaussian only loses
+  frequency, `(freq * freq_reduce_factor) >> 16`. With no match, a new
+  Gaussian takes the **last** free slot — the weakest if none is free —
+  as (sample, `max_var`, `freq_init_val`, 1). A slot with no frequency
+  reads its life back as 0xffff.
+  The outputs: the foreground flag is 255 while the matched Gaussian's
+  life is below `life_threshold`, the background is the mean of the
+  frequency leader *before* the update, and the match info is that
+  leader's index in the high 7 bits with the match flag in the low one
+  (which is what `ss_mpi_ive_gmm2`'s comment means by "Low-1bit is match
+  flag, and high-7bits is max freq index"). `freq_threshold` did not
+  enter any of the captured cases, and the shift of 7 is `var_rate`'s
+  default of 1; the captures do not cover another rate.
+
+- **lk_optical_flow_pyr** is the one op modelled to a tolerance rather
+  than exactly. Each level iterates over a **7x7** window: the gradients
+  are the Sobel of the previous picture over 8 (the same normalised
+  gradient norm_grad writes), the pictures are sampled bilinearly at the
+  Q7 position, the 2x2 system is solved by Cramer's rule and the step
+  truncated towards minus infinity, and an iteration stops when a step
+  moves less than `eps`. The error output is the mean absolute residual
+  over the window in Q7. Against a board that places the tracked points
+  within **0.0043 pixels on average and 0.03 at worst** (768 components
+  over 24 runs; the status matches everywhere, and half the captured
+  files are byte-identical), which is the engine's own accumulation and
+  division rounding, not a difference in the algorithm. The window size,
+  the gradient operator and the solve were each fitted: a 7x7 window
+  tracks to 0.016 px where 5x5 and 9x9 are out by 0.4, and the gradient
+  scale has to be the Sobel over 8 or the step comes out 8 times too
+  small. `min_eig_val_threshold` is compared against the lesser
+  eigenvalue of the window's gradient tensor at that scale; no captured
+  point is ever rejected, so that scale is plausible rather than
+  measured.
+
+Still to come (#268): st_box_flt_and_eigen and candidate_corner. What is
+known about them:
+
+- **st_cand_corner is a sequence**, not one op: norm_grad (norm 3, both
+  gradients interleaved as S8C2) into the ctrl's mem, then
+  st_box_flt_and_eigen (op 25) over those gradients, writing a U16 map
+  of the corner measure and, right after it, that map's maximum; then
+  16bit_to_8bit with the ratio 255 / maximum, a threshold at
+  `quality_level`, a 3x3 maximum filter (ord_stat_filter), and finally
+  candidate_corner (op 26). **Op 26 is `(a == b && a > 0) ? a : 0`** of
+  the thresholded map and its maximum filter -- plain non-maximum
+  suppression -- which reproduces the captured candidate picture
+  exactly. Op 25's measure is homogeneous of degree one in the 3x3
+  structure tensor and is close to `det / trace` divided by about 13,
+  but no arithmetic fitted so far matches it: the scale drifts a few
+  percent with the window's anisotropy.
+
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
 `cur_area_threshold` [22:0], `label_status` [23] and `rgn_num` [31:24],
@@ -367,6 +452,10 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
+The LK and Shi-Tomasi files in the capture's reference set therefore
+differ by design: LK's by up to 4 Q7 units, and the Shi-Tomasi pair's
+because op 25 is not modelled at all.
+
 - `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local,
   since the capture links the SDK's MPI libraries): every op through the
   MPI on a board and under QEMU, compared file by file. Without

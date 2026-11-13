@@ -143,4 +143,77 @@ void ive_csc_rgb_to_yuv(const uint8_t *b, const uint8_t *g, const uint8_t *r,
                         int rgb_stride, uint32_t w, uint32_t h, int mode,
                         uint8_t *yout, uint8_t *cout);
 
+/*
+ * CANNY_HYS_EDGE: the thinning and hysteresis the engine does on
+ * mag_and_ang's two outputs (the U16 magnitude and the octant angle it
+ * wrote first).  Each pixel comes out 1 (not an edge), 0 (a possible
+ * edge) or 2 (an edge, and a seed for the walk ss_mpi_ive_canny_edge
+ * then does over the stack).  `stack` takes the seeds in raster order,
+ * at most `max_pts` of them, and `stack_size` their number.
+ *
+ * Non-maximum suppression keeps a pixel whose magnitude beats its two
+ * neighbours along the gradient's octant: strictly on the side that
+ * comes earlier in raster order for the axis-aligned octants, and
+ * strictly on both sides for the diagonal ones.  A kept pixel above the
+ * low threshold is a possible edge, above the high one an edge, and an
+ * edge is a seed unless the pixel to its left is also one (seeded or
+ * not) or the pixel above it is a seed -- the engine thins the seeds, so
+ * a straight edge alternates.  Which of a run's pixels is the seed does
+ * not change what the walk then produces.
+ */
+void ive_canny_hys_edge(const uint16_t *mag, const uint8_t *ang, uint32_t w,
+                        uint32_t h, uint16_t lo, uint16_t hi, uint8_t *edge,
+                        uint32_t *stack, uint32_t max_pts,
+                        uint32_t *stack_size);
+
+/* One pixel's Gaussians, as the engine keeps them: 8 bytes each */
+typedef struct {
+    uint16_t mean;              /* U9Q7 */
+    uint16_t var;               /* U9Q7 */
+    uint16_t freq;
+    uint16_t life;
+} IveGmm2Model;
+
+typedef struct {
+    uint16_t life_factor, life_threshold;
+    uint16_t freq_init, freq_reduce, freq_add, freq_threshold;
+    uint16_t var_rate, max_var, min_var;
+    uint8_t sns_factor, model_num;
+} IveGmm2Ctrl;
+
+/*
+ * GMM2 for one pixel: picks the first Gaussian whose squared distance
+ * passes the sensitivity gate, updates it towards the sample and decays
+ * the others, or starts a new Gaussian in the last free slot (the
+ * weakest, if none is free).  Returns the foreground flag, and through
+ * `bg` and `info` the background value and the match info the engine
+ * writes: the frequency leader's index in the high 7 bits and the match
+ * flag in the low one, both from the state before the update.
+ */
+uint8_t ive_gmm2_pixel(IveGmm2Model *g, uint8_t v, const IveGmm2Ctrl *c,
+                       uint8_t *bg, uint8_t *info);
+
+/* One level of an LK pyramid: a picture and how to walk it */
+typedef struct {
+    const uint8_t *img;
+    uint32_t w, h, stride;
+} IveLkLevel;
+
+/*
+ * LK optical flow for one point, over a pyramid of up to 4 levels
+ * (coarsest last in `prev` / `next`, both arrays level 0 first).  The
+ * point and the result are S25Q7, as the SDK's ot_svp_point_s25q7.  Each
+ * level iterates at most `iters` times over a 7x7 window, stopping when
+ * a step moves less than `eps` Q7 units; the gradients are the Sobel of
+ * the previous picture over 8, the system is solved by Cramer's rule and
+ * the step truncated towards minus infinity, which is what a board does
+ * to within a Q7 unit or two.  Returns 1 when the point was tracked and
+ * 0 when the window left the picture or the structure tensor was too
+ * weak (its lesser eigenvalue below min_eig), and writes the mean
+ * absolute residual over the window, in Q7, through `err`.
+ */
+int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
+                 int32_t *px, int32_t *py, int iters, int eps,
+                 uint32_t min_eig, uint16_t *err);
+
 #endif
