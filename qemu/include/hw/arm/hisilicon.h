@@ -182,6 +182,7 @@ typedef struct HisiSoCConfig {
     /* hisi-fmc register-map variant: 0 = HiFMC V100 (default), 1 = fmc100
      * ("lotus,fmc" on Goke xmorca / GK7206 — same IP, shuffled offsets). */
     uint32_t        fmc_variant;
+    uint8_t         fmc_flash_cs;   /* hisi-sfc350: chip select with the NOR (default 0) */
     /* FMC op/DMA-done IRQ (GIC SPI).  0 = unconnected (V100 users poll);
      * the fmc100 driver waits on an interrupt for DMA completion. */
     int             fmc_irq;
