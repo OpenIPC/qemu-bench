@@ -1244,6 +1244,22 @@ static void ingenic_init(MachineState *ms)
                      info->num_i2c - 1);
         exit(1);
     }
+    if (ims->sensor_bus >= 0 && info->sensor_gpio_sda) {
+        /* T10 bit-bangs the sensor bus: there is no adapter to move it to */
+        error_report("sensor-bus: this SoC's sensor is on GPIO I2C "
+                     "(i2c-gpio), not an I2C adapter");
+        exit(1);
+    }
+    if (ims->sensor_bus >= 0 &&
+        ((info->sensor1_bus && sensor_bus == info->sensor1_bus - 1 &&
+          ims->sensor1 && strcmp(ims->sensor1, "none")) ||
+         (info->sensor2_bus && sensor_bus == info->sensor2_bus - 1 &&
+          ims->sensor2 && strcmp(ims->sensor2, "none")))) {
+        /* the same model twice on one adapter answers at one address */
+        error_report("sensor-bus=%d: sensor1= or sensor2= is already on "
+                     "I2C%d", sensor_bus, sensor_bus);
+        exit(1);
+    }
     for (i = 0; i < info->num_i2c; i++) {
         dev = i2c[i] = sysbus_create_simple("ingenic-i2c",
                                             I2C_BASE + i * 0x1000,
