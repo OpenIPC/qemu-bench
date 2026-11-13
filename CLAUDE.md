@@ -702,7 +702,7 @@ in this order:
     ring in DDR that the SVP NPU's task scheduler runs (`hisi-ive-npu`,
     0x14000000, SPI 76). The model follows the ring's links (+6 id, +8
     next) and computes the op named by the code at +288; the NPU models
-    the driver loads are shared between ops and are never run. 31 ops
+    the driver loads are shared between ops and are never run. 32 ops
     are modelled, their pixel work in `hisi-ive-ops.c`, shared with V4's
     `hisi-ive` (`test-hisi-ive-npu.py`, CI; `test-hisi-v5-sample-ive.sh
     --sdk`, local: the SDK's memory test, and its sobel against numpy).
@@ -717,7 +717,10 @@ in this order:
     (its classes are 1 not-an-edge, 0 weak, 2 seed, and the seeds are
     thinned in raster order), and st_cand_corner runs norm_grad, op 25,
     16bit_to_8bit, a threshold, a 3x3 maximum and op 26. The Shi-Tomasi
-    measure and LK are still open (#268). GMM2 keeps 3 to 5 Gaussians of
+    measure is still open (#268). LK is the one op modelled to a
+    tolerance and not exactly: a 7x7 window, the Sobel over 8 as the
+    gradient, Cramer's rule truncated towards minus infinity, which
+    places a point within 0.03 pixels of the board. GMM2 keeps 3 to 5 Gaussians of
     8 bytes per pixel and updates them with shifts that round towards
     +infinity (`docs/ive-registers.md`). majestic's motion
     detection would use it, but reads VPSS extended channel 3, which is

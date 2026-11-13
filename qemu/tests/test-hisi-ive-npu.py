@@ -12,6 +12,7 @@ task's id.  The outputs are checked against the same ops done here.
     python3 qemu/tests/test-hisi-ive-npu.py [--qemu PATH] [--machine M]
 """
 import argparse
+import math
 import os
 import struct
 import sys
@@ -776,6 +777,47 @@ def main():
                   'GMM2: background, frame %d' % frame)
             check(list(q.read(MINFO, n)) == [t[2] for t in want],
                   'GMM2: match info, frame %d' % frame)
+
+        # LK_OPTICAL_FLOW_PYR: the task's size fields hold 2 and the
+        # maximum level, with the picture's own size at +320 / +324
+        LKW, LKH = 64, 64
+        LKP, LKN = IMG + 0x300000, IMG + 0x310000
+        PIN, POUT = IMG + 0x320000, IMG + 0x320100
+        LST, LERR = IMG + 0x320200, IMG + 0x320300
+        wave = bytes(clamp(int(128 + 40 * math.sin(x / 2.1) +
+                               30 * math.sin(y / 1.7)), 0, 255)
+                     for y in range(LKH) for x in range(LKW))
+        shifted = bytes(clamp(int(128 + 40 * math.sin((x - 1) / 2.1) +
+                                  30 * math.sin(y / 1.7)), 0, 255)
+                        for y in range(LKH) for x in range(LKW))
+        q.write(LKP, wave)
+        q.write(LKN, shifted)
+        lkpts = ((21, 17), (33, 29), (45, 41))
+        q.write(PIN, b''.join(struct.pack('<ii', x << 7, y << 7)
+                              for x, y in lkpts))
+        q.write(LST, b'\xee' * len(lkpts))
+        i = (q.readl(SQ + 0x20) + 1) % NSLOT
+        t = bytearray(task(i, 28, 2, 0, [(64, 'Q', LKP), (176, 'I', LKW),
+                                         (96, 'Q', LKN), (192, 'I', LKW),
+                                         (128, 'Q', PIN), (136, 'Q', POUT),
+                                         (160, 'Q', LST), (168, 'Q', LERR),
+                                         (304, 'I', 100), (308, 'I', 2),
+                                         (312, 'I', 10), (316, 'I', len(lkpts)),
+                                         (320, 'I', LKW), (324, 'I', LKH)]))
+        q.write(slot(i), bytes(t))
+        q.writel(SQ + 0x10, 1 << 8)
+        q.cmd('clock_step 2000000')
+        q.writel(SQ + 0x14, 31)
+        got = struct.unpack('<%di' % (2 * len(lkpts)), q.read(POUT, 8 * len(lkpts)))
+        check(list(q.read(LST, len(lkpts))) == [1] * len(lkpts),
+              'LK: every point tracked')
+        # a one-pixel shift along x, to an eighth of a pixel
+        ok = all(abs(got[2 * k] - ((x + 1) << 7)) <= 16 and
+                 abs(got[2 * k + 1] - (y << 7)) <= 16
+                 for k, (x, y) in enumerate(lkpts))
+        check(ok, 'LK: the flow is the picture\'s shift (%s)' %
+              ' '.join('%.2f,%.2f' % (got[2 * k] / 128 - x, got[2 * k + 1] / 128 - y)
+                       for k, (x, y) in enumerate(lkpts)))
 
         # RESIZE: the op whose parameters sit in a block of its own, which
         # is also why its task carries no op code and no size

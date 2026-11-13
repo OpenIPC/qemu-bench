@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "hw/misc/hisi-ive-ops.h"
 
 static inline int clampi(int v, int lo, int hi)
@@ -664,4 +665,148 @@ uint8_t ive_gmm2_pixel(IveGmm2Model *g, uint8_t v, const IveGmm2Ctrl *c,
         *info = lead << 1 | matched;
     }
     return g[hit].life < c->life_threshold ? 255 : 0;
+}
+
+/* a picture sampled at a Q7 position, bilinear, edges clamped */
+static int lk_pixel(const IveLkLevel *l, int32_t xq, int32_t yq)
+{
+    int x0 = xq >> 7, y0 = yq >> 7, fx = xq & 127, fy = yq & 127;
+    int x1 = clampi(x0 + 1, 0, l->w - 1), y1 = clampi(y0 + 1, 0, l->h - 1);
+    int a, b, c, d, top, bot;
+
+    x0 = clampi(x0, 0, l->w - 1);
+    y0 = clampi(y0, 0, l->h - 1);
+    a = l->img[y0 * l->stride + x0];
+    b = l->img[y0 * l->stride + x1];
+    c = l->img[y1 * l->stride + x0];
+    d = l->img[y1 * l->stride + x1];
+    top = a * (128 - fx) + b * fx;
+    bot = c * (128 - fx) + d * fx;
+    return (top * (128 - fy) + bot * fy + 8192) >> 14;
+}
+
+#define LK_R    3                       /* the window is 7x7 */
+#define LK_N    ((2 * LK_R + 1) * (2 * LK_R + 1))
+
+static int lk_level(const IveLkLevel *prev, const IveLkLevel *next,
+                    int32_t px, int32_t py, int32_t *gx, int32_t *gy,
+                    int iters, int eps, uint32_t min_eig, uint16_t *err)
+{
+    int ix[LK_N], iy[LK_N], pv[LK_N];
+    int64_t A = 0, B = 0, C = 0, det;
+    int k = 0;
+
+    if ((px >> 7) < LK_R + 1 || (py >> 7) < LK_R + 1 ||
+        (px >> 7) >= (int)prev->w - LK_R - 1 ||
+        (py >> 7) >= (int)prev->h - LK_R - 1) {
+        return 0;                       /* the window leaves the picture */
+    }
+    /*
+     * The gradients are the Sobel of the previous picture at the window's
+     * taps, over 8 -- the same normalised gradient norm_grad produces --
+     * kept here as the raw Sobel with the 8 folded into the step instead,
+     * so nothing is lost to rounding
+     */
+    for (int j = -LK_R; j <= LK_R; j++) {
+        for (int i = -LK_R; i <= LK_R; i++) {
+            int32_t x = px + (i << 7), y = py + (j << 7);
+            int tl = lk_pixel(prev, x - 128, y - 128);
+            int t = lk_pixel(prev, x, y - 128);
+            int tr = lk_pixel(prev, x + 128, y - 128);
+            int ml = lk_pixel(prev, x - 128, y);
+            int mr = lk_pixel(prev, x + 128, y);
+            int bl = lk_pixel(prev, x - 128, y + 128);
+            int bb = lk_pixel(prev, x, y + 128);
+            int br = lk_pixel(prev, x + 128, y + 128);
+
+            ix[k] = tr + 2 * mr + br - tl - 2 * ml - bl;
+            iy[k] = bl + 2 * bb + br - tl - 2 * t - tr;
+            pv[k] = lk_pixel(prev, x, y);
+            A += (int64_t)ix[k] * ix[k];
+            B += (int64_t)ix[k] * iy[k];
+            C += (int64_t)iy[k] * iy[k];
+            k++;
+        }
+    }
+    det = A * C - B * B;
+    if (!det) {
+        return 0;
+    }
+    {
+        /*
+         * The lesser eigenvalue of the window's gradient tensor, at the
+         * scale of the normalised gradients (the Sobel over 8, so the
+         * tensor over 64).  No captured point is ever rejected, so the
+         * threshold's scale is what the SDK's default makes plausible,
+         * not something measured.
+         */
+        double tr = (double)(A + C) / 2, dsc = (double)(A - C) / 2;
+        double lo = tr - sqrt(dsc * dsc + (double)B * B);
+
+        if (lo / 64.0 < (double)min_eig) {
+            return 0;
+        }
+    }
+    for (int it = 0; it < iters; it++) {
+        int64_t d0 = 0, d1 = 0, dx, dy;
+        int sum = 0;
+
+        k = 0;
+        for (int j = -LK_R; j <= LK_R; j++) {
+            for (int i = -LK_R; i <= LK_R; i++) {
+                int d = lk_pixel(next, px + *gx + (i << 7),
+                                 py + *gy + (j << 7)) - pv[k];
+
+                d0 += (int64_t)ix[k] * d;
+                d1 += (int64_t)iy[k] * d;
+                sum += abs(d);
+                k++;
+            }
+        }
+        if (err) {
+            *err = MIN(((int64_t)sum << 7) / LK_N, UINT16_MAX);
+        }
+        /* Cramer's rule, with the gradients' 8 and the Q7 in one step */
+        dx = -(d0 * C - d1 * B) * (8 * 128);
+        dy = -(d1 * A - d0 * B) * (8 * 128);
+        dx = dx >= 0 ? dx / det : -((-dx + det - 1) / det);
+        dy = dy >= 0 ? dy / det : -((-dy + det - 1) / det);
+        if (det < 0) {
+            dx = -dx;
+            dy = -dy;
+        }
+        *gx += dx;
+        *gy += dy;
+        if (llabs(dx) < eps && llabs(dy) < eps) {
+            break;
+        }
+    }
+    return 1;
+}
+
+int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
+                 int32_t *px, int32_t *py, int iters, int eps,
+                 uint32_t min_eig, uint16_t *err)
+{
+    int32_t gx = 0, gy = 0;
+    int ok = 1;
+
+    for (int l = levels - 1; l >= 0; l--) {
+        int32_t x = *px >> l, y = *py >> l;
+
+        ok = lk_level(&prev[l], &next[l], x, y, &gx, &gy, iters, eps,
+                      min_eig, err);
+        if (!ok) {
+            break;
+        }
+        if (l) {
+            gx *= 2;
+            gy *= 2;
+        }
+    }
+    if (ok) {
+        *px += gx;
+        *py += gy;
+    }
+    return ok;
 }

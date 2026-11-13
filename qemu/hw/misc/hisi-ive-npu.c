@@ -103,7 +103,8 @@ enum {
     OP_HIST = 12, OP_THRESH_S16 = 13, OP_THRESH_U16 = 14, OP_16TO8 = 15,
     OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
     OP_CCL = 21, OP_LBP = 23, OP_NORM_GRAD = 24, OP_SAD = 27, OP_RESIZE = 29,
-    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_GMM2 = 30,
+    OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_LK = 28,
+    OP_GMM2 = 30,
     OP_ACC = 32,
     OP_IMAGE_DOT = 33,
     OP_ALPHA = 34,
@@ -1032,6 +1033,77 @@ static void op_gmm2(const uint8_t *t, uint32_t w, uint32_t h)
     task_put(t, 96, 144, info, w, h, 1);
 }
 
+/*
+ * LK_OPTICAL_FLOW_PYR (ot_ive_lk_optical_flow_pyr_ctrl): the pyramids are
+ * at +64.. (previous) and +96.. (next), level 0 first, with their strides
+ * at +176.. and +192..; +128 the points in, +136 the points out, +160 the
+ * status, +168 the error.  The op's usual size fields hold 2 and the
+ * maximum level instead, and the level-0 picture's width and height are at
+ * +320 / +324; the minimum eigenvalue, eps, the iteration count and the
+ * point count at +304, +308, +312 and +316.
+ */
+#define LK_LEVELS   4
+#define LK_PTS_MAX  2048
+
+static void op_lk(const uint8_t *t)
+{
+    uint32_t w = task_u32(t, 320), h = task_u32(t, 324);
+    int levels = MIN(task_u32(t, 296) + 1, LK_LEVELS);
+    uint32_t n = MIN(task_u32(t, 316), LK_PTS_MAX);
+    int iters = MAX(task_u32(t, 312), 1), eps = task_u32(t, 308);
+    uint32_t min_eig = task_u32(t, 304);
+    g_autofree uint8_t *bufs[2 * LK_LEVELS] = { };
+    IveLkLevel prev[LK_LEVELS], next[LK_LEVELS];
+    g_autofree uint32_t *pts = NULL;
+    g_autofree uint8_t *status = NULL;
+    g_autofree uint16_t *errs = NULL;
+
+    if (!w || !h || w > PIC_MAX || h > PIC_MAX || !n) {
+        return;
+    }
+    for (int l = 0; l < levels; l++) {
+        uint32_t lw = w >> l, lh = h >> l;
+
+        for (int side = 0; side < 2; side++) {
+            IveLkLevel *dst = side ? &next[l] : &prev[l];
+            uint32_t addr = task_addr(t, (side ? 96 : 64) + 8 * l);
+            uint32_t stride = task_u32(t, (side ? 192 : 176) + 4 * l);
+
+            if (!addr || !lw || !lh) {
+                return;
+            }
+            bufs[2 * l + side] = g_malloc((size_t)lw * lh);
+            img_read(addr, stride, bufs[2 * l + side], lw, lh);
+            *dst = (IveLkLevel){ bufs[2 * l + side], lw, lh, lw };
+        }
+    }
+    pts = g_new(uint32_t, 2 * n);
+    status = g_malloc0(n);
+    errs = g_new0(uint16_t, n);
+    dma_memory_read(&address_space_memory, task_addr(t, 128), pts,
+                    (uint64_t)n * 8, MEMTXATTRS_UNSPECIFIED);
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t x = (int32_t)le32_to_cpu(pts[2 * i]);
+        int32_t y = (int32_t)le32_to_cpu(pts[2 * i + 1]);
+
+        status[i] = ive_lk_track(prev, next, levels, &x, &y, iters, eps,
+                                 min_eig, &errs[i]);
+        pts[2 * i] = cpu_to_le32(x);
+        pts[2 * i + 1] = cpu_to_le32(y);
+        errs[i] = cpu_to_le16(errs[i]);
+    }
+    dma_memory_write(&address_space_memory, task_addr(t, 136), pts,
+                     (uint64_t)n * 8, MEMTXATTRS_UNSPECIFIED);
+    if (task_addr(t, 160)) {
+        dma_memory_write(&address_space_memory, task_addr(t, 160), status,
+                         n, MEMTXATTRS_UNSPECIFIED);
+    }
+    if (task_addr(t, 168)) {
+        dma_memory_write(&address_space_memory, task_addr(t, 168), errs,
+                         (uint64_t)n * 2, MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
 {
     uint32_t op = task_u32(t, TASK_OP);
@@ -1040,6 +1112,11 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
     if (s->trace) {
         fprintf(stderr, "hisi-ive-npu: task %u op %u %ux%u\n",
                 lduw_le_p(t + TASK_ID), op, w, h);
+    }
+    if (op == OP_LK) {
+        op_lk(t);
+        s->ops++;
+        return;
     }
     if (!op && !w && !h) {
         /* a resize carries its own parameter block and no size */

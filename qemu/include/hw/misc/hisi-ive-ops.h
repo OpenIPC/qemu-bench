@@ -193,4 +193,27 @@ typedef struct {
 uint8_t ive_gmm2_pixel(IveGmm2Model *g, uint8_t v, const IveGmm2Ctrl *c,
                        uint8_t *bg, uint8_t *info);
 
+/* One level of an LK pyramid: a picture and how to walk it */
+typedef struct {
+    const uint8_t *img;
+    uint32_t w, h, stride;
+} IveLkLevel;
+
+/*
+ * LK optical flow for one point, over a pyramid of up to 4 levels
+ * (coarsest last in `prev` / `next`, both arrays level 0 first).  The
+ * point and the result are S25Q7, as the SDK's ot_svp_point_s25q7.  Each
+ * level iterates at most `iters` times over a 7x7 window, stopping when
+ * a step moves less than `eps` Q7 units; the gradients are the Sobel of
+ * the previous picture over 8, the system is solved by Cramer's rule and
+ * the step truncated towards minus infinity, which is what a board does
+ * to within a Q7 unit or two.  Returns 1 when the point was tracked and
+ * 0 when the window left the picture or the structure tensor was too
+ * weak (its lesser eigenvalue below min_eig), and writes the mean
+ * absolute residual over the window, in Q7, through `err`.
+ */
+int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
+                 int32_t *px, int32_t *py, int iters, int eps,
+                 uint32_t min_eig, uint16_t *err);
+
 #endif

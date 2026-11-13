@@ -309,6 +309,7 @@ semantics are the same:
 | alpha_blending | +80 / +88 / +96 the sources and the alpha, +112 destination, strides +120 / +124 / +128 / +136 |
 | resize | the only op with no fields in the task: see below |
 | canny_hys_edge | +64 the magnitude (U16, byte stride +96) with the octant angle right after it, +80 the edge picture (+104), +88 the stack of seeds; low / high at +300 / +304 |
+| lk_optical_flow_pyr | the pyramids at +64.. (previous) and +96.. (next), level 0 first, strides at +176.. and +192..; +128 the points in, +136 out, +160 the status, +168 the error. The size fields hold 2 and the maximum level, and the level-0 size is at +320 / +324; minimum eigenvalue, eps, iterations and point count at +304, +308, +312, +316 |
 | gmm2 | +72 the picture (+132), +64 the per-pixel factor when either mode is per-pixel (+128; else the model's address again), +80 / +120 the model, +96 the match info (+144), +104 the foreground (+148), +112 the background (+152); the control struct's fields in order from +312, the two byte ones at +348 / +352 |
 
 Edges are replicated.
@@ -405,8 +406,28 @@ binary under QEMU and compares file by file):
   enter any of the captured cases, and the shift of 7 is `var_rate`'s
   default of 1; the captures do not cover another rate.
 
-Still to come (#268): st_box_flt_and_eigen, candidate_corner and
-lk_optical_flow_pyr. What is known about them:
+- **lk_optical_flow_pyr** is the one op modelled to a tolerance rather
+  than exactly. Each level iterates over a **7x7** window: the gradients
+  are the Sobel of the previous picture over 8 (the same normalised
+  gradient norm_grad writes), the pictures are sampled bilinearly at the
+  Q7 position, the 2x2 system is solved by Cramer's rule and the step
+  truncated towards minus infinity, and an iteration stops when a step
+  moves less than `eps`. The error output is the mean absolute residual
+  over the window in Q7. Against a board that places the tracked points
+  within **0.0043 pixels on average and 0.03 at worst** (768 components
+  over 24 runs; the status matches everywhere, and half the captured
+  files are byte-identical), which is the engine's own accumulation and
+  division rounding, not a difference in the algorithm. The window size,
+  the gradient operator and the solve were each fitted: a 7x7 window
+  tracks to 0.016 px where 5x5 and 9x9 are out by 0.4, and the gradient
+  scale has to be the Sobel over 8 or the step comes out 8 times too
+  small. `min_eig_val_threshold` is compared against the lesser
+  eigenvalue of the window's gradient tensor at that scale; no captured
+  point is ever rejected, so that scale is plausible rather than
+  measured.
+
+Still to come (#268): st_box_flt_and_eigen and candidate_corner. What is
+known about them:
 
 - **st_cand_corner is a sequence**, not one op: norm_grad (norm 3, both
   gradients interleaved as S8C2) into the ctrl's mem, then
@@ -431,6 +452,10 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
+The LK and Shi-Tomasi files in the capture's reference set therefore
+differ by design: LK's by up to 4 Q7 units, and the Shi-Tomasi pair's
+because op 25 is not modelled at all.
+
 - `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local,
   since the capture links the SDK's MPI libraries): every op through the
   MPI on a board and under QEMU, compared file by file. Without
