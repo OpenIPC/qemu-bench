@@ -1540,8 +1540,8 @@ silicon.
 `-M <soc>,sensor=<name>` puts an image sensor on I2C0 (I2C1 on T40) at
 the address and with the ID that OpenIPC's `sinfo.ko` table probes:
 `gc2053` (0x37, `galaxycore-sensor`), `gc2083` (0x37, 16-bit registers),
-`sc2336` and `sc2335` (0x30, `hisi-smartsens`), `jxf37` and `jxf22`
-(0x40, `hisi-f37`, `hisi-jxf22`), `ov2735b` and `ov2735` (0x3C,
+`sc2336` and `sc2335` (0x30, `hisi-smartsens`), `jxf37`, `jxf22` and
+`jxf23` (0x40, `hisi-f37`, `hisi-jxf22`, `hisi-jxf23`), `ov2735b` and `ov2735` (0x3C,
 `ingenic-ov2735`: 8-bit registers in pages, the revision in page 0's
 0x04 telling the two apart), `gc4653` (0x29, 16-bit registers; T40, on
 I2C1), `gc4663` (T41, the same ID), `jxh62` (0x30, `hisi-jxh62`; T10).
