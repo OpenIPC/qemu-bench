@@ -104,6 +104,7 @@
 #include "hw/sysbus.h"
 #include "hw/arm/nvt-lzma.h"
 #include "elf.h"
+#include "exec/tb-flush.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
@@ -924,6 +925,24 @@ static void ingenic_cpu_reset(void *opaque)
 }
 
 /*
+ * A reset leaves nothing of the code the cores ran before it; here the
+ * translations of it have to go as well.  QEMU files every block it
+ * translates under the physical page it came from and keeps it until the
+ * page is written.  A shared library page that the last boot's processes
+ * mapped at as many randomised addresses carries its blocks once per
+ * mapping -- up to 64k of them on one page, measured after a T40 lite
+ * boot.  The next boot hands those pages out as plain memory, and every
+ * store into one searches that list (and each block it drops searches it
+ * again): after a guest reboot the second T40 boot crawled for minutes
+ * and then stalled RCU.  The flush runs on core 0 before it executes
+ * again.
+ */
+static void ingenic_tb_reset(void *opaque)
+{
+    queue_tb_flush(CPU(opaque));
+}
+
+/*
  * the SDIO Wi-Fi chip on MSC1: wifi=atbm, the ATBM6031 (/machine/atbm), or
  * wifi=atbm6441, the IoT-mode ATBM6441 already on its network
  * (/machine/atbm6441)
@@ -1029,6 +1048,7 @@ static void ingenic_init(MachineState *ms)
         cpu_mips_clock_init(ims->cpu[i]);
         qemu_register_reset(ingenic_cpu_reset, ims->cpu[i]);
     }
+    qemu_register_reset(ingenic_tb_reset, ims->cpu[0]);
     env = &ims->cpu[0]->env;
 
     memory_region_add_subregion(sysmem, 0, ms->ram);
