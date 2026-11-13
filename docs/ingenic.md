@@ -437,6 +437,17 @@ until TDFR: `qom-get /machine/tcu pwm2` reads it as `high/period` counter
 ticks while the channel counts, `0` / `1` for a level that stays, or
 `off` while the TCU does not drive the pin.
 
+A reset, from the watchdog or the monitor's `system_reset`, also drops
+every translated block (`ingenic_tb_reset` in `hw/mips/ingenic.c`). QEMU
+files each block under the physical page it came from and keeps it until
+that page is written; a shared library page that the first boot's
+processes mapped at as many randomised addresses ends up with up to 64k
+blocks (measured after a T40 lite boot). The second boot uses those pages
+as plain memory, and each store into one searched that list: a T40 that
+rebooted mounted its overlay at 32-43 s instead of 3 s, and on the release
+with majestic, crawled into RCU stalls. `test-ingenic-boot.sh --reset`
+boots twice in one QEMU and compares the two mounts.
+
 ### `ingenic-intc`, `ingenic-ccu`
 
 The INTC is two banks of ISR/IMR/IMSR/IMCR/IPR, everything masked out of

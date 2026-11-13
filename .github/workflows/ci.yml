@@ -1739,12 +1739,15 @@ jobs:
         run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
 
       # flash: the release's SPL and U-Boot from the NOR, U-Boot's
-      # saveenv, then the kernel; kernel: -kernel with its root on the NOR
+      # saveenv, then the kernel; kernel: -kernel with its root on the NOR.
+      # T40 -kernel also boots a second time after a system_reset (the
+      # translations of the first boot must not slow the second)
       - name: Boot to login, DHCP over the GMAC, JFFS2 on the NOR
         timeout-minutes: 8
         run: >-
           bash qemu-boot/test-ingenic-boot.sh --soc ${{ matrix.soc }}
           --mode ${{ matrix.mode }} --net
+          ${{ matrix.soc == 't40' && matrix.mode == 'kernel' && '--reset' || '' }}
 
   # docs/ingenic.md, "majestic on T40": the release's majestic starts the
   # SDK, a light sensor switches it to night and back, and the night
