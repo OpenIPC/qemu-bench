@@ -63,6 +63,7 @@
 #define DMA_CTRL_CS_SHIFT       4
 
 /* INT_RAW_STATUS bits */
+#define INT_CMD_DONE            BIT(0)
 #define INT_DMA_DONE            BIT(1)
 
 /* SPI commands */
@@ -140,6 +141,7 @@ struct HisiSfc350State {
 
     /* Configuration properties */
     char    *flash_file;
+    uint8_t  flash_cs;      /* chip select the NOR answers on; the other is empty */
 
     /* SPI flash state */
     uint8_t  sr;
@@ -183,16 +185,24 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         data_cnt = DATABUF_BYTES;
     }
 
+    /*
+     * Only one chip select carries a chip. A command to the other reaches no
+     * device: the bus floats and nothing changes state, so RDID reads back 0
+     * and a driver probing that select finds nothing. Hi3520DV200 boards have
+     * their NOR on CS1 (the XiongMai NBD6808T-PL, and the 32 MiB MX25L25635E
+     * on the lab board), which a CS0-only model hid: a kernel DT naming the
+     * wrong select still found flash here and lost it on hardware.
+     */
+    if (((s->cmd_config >> CMD_CONFIG_SEL_CS_SHIFT) & 1) != s->flash_cs) {
+        memset(s->cmd_databuf, 0, sizeof(s->cmd_databuf));
+        goto done;
+    }
+
     switch (opcode) {
     case SPI_CMD_RDID: {
-        /* Only CS0 has a flash chip; CS1 returns 0 (no chip) */
-        uint32_t cs = (s->cmd_config >> CMD_CONFIG_SEL_CS_SHIFT) & 1;
-        if (cs == 0) {
-            s->cmd_databuf[0] = NOR_JEDEC_MFR | (NOR_JEDEC_TYPE << 8) |
-                                (s->jedec_cap << 16);
-        } else {
-            s->cmd_databuf[0] = 0;
-        }
+        /* the empty chip select returned above */
+        s->cmd_databuf[0] = NOR_JEDEC_MFR | (NOR_JEDEC_TYPE << 8) |
+                            (s->jedec_cap << 16);
         s->cmd_databuf[1] = 0;
         break;
     }
@@ -313,8 +323,15 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         break;
     }
 
-    /* Command completes instantly: clear START bit */
+done:
+    /*
+     * Command completes instantly: clear START and raise the completion bit.
+     * The v3xx driver in mainline (spi-hisi-sfc-v3xx.c) reads RAW_INT_STAT
+     * after every command and fails it with EIO unless bit 0 is set; the
+     * vendor 3.0.8 driver only polled START, so the bit went unmodelled.
+     */
     s->cmd_config &= ~CMD_CONFIG_START;
+    s->int_raw_status |= INT_CMD_DONE;
 }
 
 /* ── DMA execution ───────────────────────────────────────────────────── */
@@ -500,6 +517,13 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
 {
     HisiSfc350State *s = HISI_SFC350(dev);
 
+    if (s->flash_cs == 0xff) {
+        s->flash_cs = 0;
+    } else if (s->flash_cs > 1) {
+        error_setg(errp, "hisi-sfc350: flash-cs must be 0 or 1");
+        return;
+    }
+
     s->flash_size = NOR_FLASH_SIZE;
     s->jedec_cap = 0x17;
     s->flash = g_malloc(s->flash_size);
@@ -573,6 +597,8 @@ static void hisi_sfc350_finalize(Object *obj)
 
 static const Property hisi_sfc350_properties[] = {
     DEFINE_PROP_STRING("flash-file", HisiSfc350State, flash_file),
+    /* 0xff = unset: the machine fills in its SoC's select, else CS0 */
+    DEFINE_PROP_UINT8("flash-cs", HisiSfc350State, flash_cs, 0xff),
 };
 
 static void hisi_sfc350_class_init(ObjectClass *klass, const void *data)

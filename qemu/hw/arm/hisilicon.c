@@ -3620,6 +3620,11 @@ static const HisiSoCConfig hi3520dv200_soc = {
     .fmc_ctrl_base      = 0x10010000,
     .fmc_mem_base       = 0x58000000,
     .fmc_type           = "hisi-sfc350",
+    /* The NOR is on CS1 on every Hi3520DV200 board seen so far: the XiongMai
+     * NBD6808T-PL (whose kernel DT says flash@1) and the lab board's
+     * MX25L25635E.  The boot ROM and U-Boot read through the memory window,
+     * which does not depend on the select. */
+    .fmc_flash_cs       = 1,
 
     .num_i2c            = 1,
     .i2c_bases          = { 0x200d0000 },
@@ -5285,6 +5290,11 @@ static void hisilicon_common_init(MachineState *machine,
          * Goke xmorca / GK7206).  Only the hisi-fmc model has this property. */
         if (c->fmc_variant && (!c->fmc_type || !strcmp(fmc_type, "hisi-fmc"))) {
             qdev_prop_set_uint32(fmc, "variant", c->fmc_variant);
+        }
+        /* The SoC's select, unless `-global hisi-sfc350.flash-cs=` chose one. */
+        if (c->fmc_flash_cs && fmc_type && !strcmp(fmc_type, "hisi-sfc350") &&
+            object_property_get_uint(OBJECT(fmc), "flash-cs", NULL) == 0xff) {
+            qdev_prop_set_uint8(fmc, "flash-cs", c->fmc_flash_cs);
         }
 
         /*
