@@ -24,6 +24,7 @@ static const char *g_out;
 static int g_fail;
 
 #define PTR(t, a)   ((t *)(td_uintptr_t)(a))
+#define MIN2(a, b)  ((a) < (b) ? (a) : (b))
 
 /* a deterministic picture: shapes with sharp edges, a ramp, some noise */
 static void fill_u8(ot_svp_img *img, int seed)
@@ -343,6 +344,93 @@ static void fill_separable(ot_svp_img *img, int ax, int ay, int period)
     }
 }
 
+/*
+ * A picture built from a wanted gradient sequence, to answer one
+ * question: does the eigen op's measure depend on the window's
+ * structure tensor alone, or on the individual gradients?  With
+ * src = F(x) + G(y) the Sobel's gx is (F(x+1) - F(x-1)) / 2, so F can
+ * be built backwards from any gx sequence, odd and even columns being
+ * independent chains.  The sequences below put triples with the *same*
+ * sum and sum of squares -- (1,5,6) against (2,3,7), say -- next to each
+ * other: their windows share A, B and C exactly while their gradients
+ * differ, so the two answers settle it.
+ *
+ * Each triple is followed by three columns that walk the ramp back to
+ * where it started, because F's odd and even columns are *separate*
+ * chains: placing the plain negation cancels neither, and the drift
+ * accumulates until the clamp below changes the later triples'
+ * gradients, so a pair meant to be matched is not one.  The even chain
+ * sees positions 1, 3, 5 of the group and the odd chain 0, 2, 4, so
+ * (t0, t1, t2, -t1, -(t0 + t2), 0) returns both to their start while
+ * leaving the window at position 1 reading the triple itself.
+ */
+static const int g_tri[][3] = {
+    { 1, 5, 6 }, { 2, 3, 7 }, { 0, 4, 5 }, { 1, 2, 6 },
+    { 2, 5, 5 }, { 3, 3, 6 }, { 0, 6, 6 }, { 2, 2, 8 },
+    { 3, 6, 6 }, { 4, 4, 7 }, { 0, 3, 3 }, { 1, 1, 4 },
+};
+#define TRI_NUM     (int)(sizeof(g_tri) / sizeof(g_tri[0]))
+#define TRI_PITCH   7
+#define TRI_BASE    4
+#define TRI_PER_PIC 8                   /* what fits across 64 columns */
+
+/* the column at the centre of the t'th triple placed, where it is read */
+static int tri_centre(int t)
+{
+    return TRI_BASE + t * TRI_PITCH + 1;
+}
+
+static void build_ramp(int *out, int n, const int *want, int start)
+{
+    out[0] = start;
+    out[1] = start;
+    for (int i = 1; i + 1 < n; i++) {
+        out[i + 1] = out[i - 1] + 2 * want[i];
+    }
+}
+
+static void fill_tensor_probe(ot_svp_img *img, int gy_a, int gy_b, int gy_c,
+                              int first)
+{
+    int fx[256], gyv[256], wx[256] = { 0 }, wy[256] = { 0 };
+    int w = MIN2((int)img->width, 256), h = MIN2((int)img->height, 256);
+
+    for (int t = 0; t < TRI_PER_PIC; t++) {
+        const int *tri = g_tri[(first + t) % TRI_NUM];
+        int c = tri_centre(t);
+
+        if (c + 4 >= w) {
+            break;                      /* no room for the triple and its undo */
+        }
+        for (int i = 0; i < 3; i++) {
+            wx[c - 1 + i] = tri[i];
+        }
+        wx[c + 2] = -tri[1];            /* both chains back to the start */
+        wx[c + 3] = -(tri[0] + tri[2]);
+        wx[c + 4] = 0;
+    }
+    /* the rows carry one triple and the same undo, over and over */
+    for (int y = 0; y + 5 < h; y += 6) {
+        wy[y] = gy_a;
+        wy[y + 1] = gy_b;
+        wy[y + 2] = gy_c;
+        wy[y + 3] = -gy_b;
+        wy[y + 4] = -(gy_a + gy_c);
+        wy[y + 5] = 0;
+    }
+    build_ramp(fx, w, wx, 100);
+    build_ramp(gyv, h, wy, 0);
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int v = fx[MIN2((int)x, w - 1)] + gyv[MIN2((int)y, h - 1)];
+
+            row[x] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+    }
+}
+
 static void cap_mag_and_ang(void)
 {
     ot_svp_img src, mag, ang;
@@ -521,7 +609,7 @@ static void cap_st(void)
         return;
     }
     c.quality_level = 25;
-    for (int s = 0; s < 10; s++) {
+    for (int s = 0; s < 12; s++) {
         switch (s) {
         case 0: case 1:
             fill_u8(&src, 5 + s * 9);
@@ -547,8 +635,14 @@ static void cap_st(void)
         case 8:
             fill_separable(&src, 2, 5, 11);
             break;
-        default:
+        case 9:
             fill_separable(&src, 6, 4, 3);
+            break;
+        case 10:
+            fill_tensor_probe(&src, 3, 1, 2, 0);
+            break;
+        default:
+            fill_tensor_probe(&src, 5, 4, 6, 4);
             break;
         }
         snprintf(n, sizeof(n), "st_s%d_cand_corner", s);

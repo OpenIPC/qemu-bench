@@ -440,8 +440,48 @@ known about them:
   suppression -- which reproduces the captured candidate picture
   exactly. Op 25's measure is homogeneous of degree one in the 3x3
   structure tensor and is close to `det / trace` divided by about 13,
-  but no arithmetic fitted so far matches it: the scale drifts a few
-  percent with the window's anisotropy.
+  but no arithmetic fitted so far matches it.
+
+  What the captures *do* establish, and what they rule out:
+
+  - The measure is a **function of that 3x3 tensor alone**. The probe
+    pictures (cases 10 and 11) are built backwards from a wanted gradient
+    sequence -- with `src = F(x) + G(y)` the Sobel's gx is
+    `(F(x+1) - F(x-1)) / 2`, so F follows from any gx sequence, odd and
+    even columns being independent chains -- and they place triples with
+    the same sum and sum of squares next to each other, (1,5,6) against
+    (2,3,7) and so on. Each triple is followed by three columns that walk
+    the ramp back to where it started, which takes some care because F's
+    odd and even columns are separate chains: the plain negation cancels
+    neither, and the drift accumulates until the clamp at 0 and 255
+    changes the later triples' gradients, so a pair meant to be matched
+    is not one. `(t0, t1, t2, -t1, -(t0 + t2), 0)` returns both chains to
+    their start while the window at the triple still reads it, and the
+    rows are built the same way; the pictures then stay inside 90..134,
+    nowhere near a clamp. The tensors are still read back from the
+    captured picture rather than assumed, and all 64 compared windows are
+    tensor-equal and agree on the measure.
+    Without them the point is nearly unevidenced: of the 6144 distinct
+    tensors in the other pictures, exactly one with a non-zero measure is
+    ever reached by two different gradient patterns.
+  - It is **not** a scalar multiple of det/trace, of the lesser
+    eigenvalue, of min(A, C), of sqrt(det) or of det/min(A, C): a tensor
+    of (89, 54, 40) gives 1 while (180, 137, 150) gives 0, though
+    det/trace (4.99 against 24.94) and the lesser eigenvalue (5.20
+    against 27.18) both rank the second higher, and both pixels are well
+    inside their picture.
+  - It is not **any** ratio of a quadratic in (A, C, |B|, the
+    discriminant) to a linear form in them, nor a square, square root or
+    cube root of one. That is a linear programme over the inequalities
+    `lambda <= P/Q < lambda + 1`, which is infeasible for every
+    normalisation; the same programme recovers `floor(det/trace/13)` from
+    synthetic data, so it is the family that is refuted and not the
+    method.
+  - Nor is it the lesser eigenvalue computed with a square root of
+    reduced precision, a block-floating-point det/trace, a truncated
+    reciprocal of the trace, or one to three steps of the secant
+    iteration `x <- det / (trace - x)` (that last gets 26% of tensors
+    wrong and every one of the 579 with a measure over 100).
 
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of

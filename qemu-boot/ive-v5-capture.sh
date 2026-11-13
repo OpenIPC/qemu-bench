@@ -139,9 +139,12 @@ cd /tmp
 ive-v5-capture /tmp/ivecap
 echo "=== rc=$?"
 echo "=== tar begin"
-# a prefix per line: the kernel and the vendor modules write to the same
-# console, and a stray message in the middle of the stream would otherwise
-# corrupt the archive
+# Quiet the console first: the vendor modules print without a newline, so
+# a message lands inside whatever line is being written -- and since its
+# letters are valid base64, no prefix or filter on this side can tell it
+# from data.  The B64: prefix stays as a second line of defence against
+# anything that still gets through.
+dmesg -n 1 2>/dev/null
 tar -C /tmp/ivecap -cf - . | base64 | sed 's/^/B64:/'
 echo "=== tar end"
 echo b > /proc/sysrq-trigger
@@ -155,7 +158,11 @@ EOF
         -no-reboot > "$WORK/qemu.log" 2>&1 || true
     rm -rf "$WORK/qemu"
     mkdir -p "$WORK/qemu"
-    tr -d '\r' < "$WORK/qemu.log" | sed -n 's/^B64://p' | base64 -d |
+    # only the leading base64 run of each prefixed line: a vendor module
+    # writes to the console without a newline first, so its message lands
+    # on the end of whatever line was being printed
+    tr -d '\r' < "$WORK/qemu.log" |
+        sed -n 's|^B64:\([A-Za-z0-9+/=]*\).*|\1|p' | base64 -d |
         tar -C "$WORK/qemu" -xf -
     QEMU_RC=$(sed -n 's/^=== rc=//p' "$WORK/qemu.log" | tr -d '\r' | tail -1)
     QEMU_RC=${QEMU_RC:-1}
