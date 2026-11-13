@@ -11,6 +11,7 @@
 
 #define TYPE_HISI_F37 "hisi-f37"
 #define TYPE_HISI_JXF22 "hisi-jxf22"
+#define TYPE_HISI_JXF23 "hisi-jxf23"
 
 typedef struct HisiSoiExposure {
     uint32_t lines;         /* exposure, rows: 0x02 high, 0x01 low */
