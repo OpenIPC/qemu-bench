@@ -10,6 +10,8 @@
  *               ("rb jxh42" U-Boot and kernel builds).
  *   hisi-jxf23  JX-F23, ID 0x0F23, at 0x40: the T20/T31 drivers' jxf23,
  *               which read 0x0A/0x0B as the JX-F22's do
+ *   hisi-jxq03  JX-Q03, ID 0x0507, at 0x40: the T31 jxq03 driver (MIPI,
+ *               2304x1296)
  *   hisi-jxf22  JX-F22, ID 0x0F22, at 0x80 (8-bit) = 0x40: MStar MSC313E
  *               cameras, whose libdrv_ms_cus_JXF22.so checks Sensor_id_table
  *               {0x0A, 0x0F}, {0x0B, 0x22}.
@@ -170,6 +172,11 @@ static void hisi_jxf23_class_init(ObjectClass *klass, const void *data)
     HISI_F37_CLASS(klass)->id = 0x0F23;
 }
 
+static void hisi_jxq03_class_init(ObjectClass *klass, const void *data)
+{
+    HISI_F37_CLASS(klass)->id = 0x0507;
+}
+
 static const InterfaceInfo hisi_f37_interfaces[] = {
     { TYPE_IMAGE_SENSOR },
     { }
@@ -201,6 +208,10 @@ static void hisi_f37_register_types(void)
             .name          = TYPE_HISI_JXF23,
             .parent        = TYPE_HISI_F37,
             .class_init    = hisi_jxf23_class_init,
+        }, {
+            .name          = TYPE_HISI_JXQ03,
+            .parent        = TYPE_HISI_F37,
+            .class_init    = hisi_jxq03_class_init,
         },
     };
     int i;
