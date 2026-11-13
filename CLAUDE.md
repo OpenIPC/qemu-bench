@@ -143,7 +143,18 @@ bash qemu-boot/test-linux-network.sh --soc <soc> --machine <machine> --append '<
     --qemu ./qemu-src/build/qemu-system-arm --setup-network
 bash qemu-boot/sofia-isp-ci-test.sh      # hi3516ev200 + sc2315e ISP regression
 python3 qemu-boot/test-fastboot-protocol.py /tmp/hisi-fb   # boot-ROM serial protocol
+VARIANT=neo bash qemu-boot/fetch-openipc-lite.sh hi3516cv200 qemu-boot
+bash qemu-boot/test-vtund-tunnel.sh --soc hi3516cv200   # vtund between two guests
 ```
+
+`test-vtund-tunnel.sh` boots the image twice on a QEMU socket network and
+runs each guest's script as PID 1 from the kernel command line
+(`init=/bin/sh -- -c "..."`), so nothing types at a shell. Two traps it works
+around, worth knowing for any test built that way: the guest echoes its
+command line at boot, so a result marker must be assembled at run time
+(`echo vtund-result-$r`) or the grep matches the command line; and a
+backgrounded QEMU must get `</dev/null`, or SIGTTIN stops it on its first
+read of the terminal.
 
 `test-linux-network.sh` needs `--setup-network` when run by hand: without it
 the harness assumes the caller already built the whole environment its ping and

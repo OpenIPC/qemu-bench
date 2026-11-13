@@ -1495,6 +1495,57 @@ jobs:
         if: matrix.soc == 'nt98566' && steps.kmod.outputs.args != ''
         run: bash qemu-boot/test-novatek-hdal.sh --soc ${{ matrix.soc }} ${{ steps.kmod.outputs.args }} --panel nt35510
 
+  # vtund end to end on OpenIPC neo (OpenIPC/firmware#2835): two guests of the
+  # release image on a QEMU socket network, a vtund server in one and the
+  # shipped tunnel client in the other, pinging across the tunnel.  ev300
+  # carries tun as a module; cv200 has it built in (OpenIPC/firmware#2844).
+  vtund-neo:
+    name: vtund tunnel ${{ matrix.soc }} neo
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - soc: hi3516ev300
+            machine: hi3516ev300,sensor=none
+          - soc: hi3516cv200
+            machine: hi3516cv200
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      - name: Download OpenIPC neo firmware
+        run: VARIANT=neo bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
+
+      - name: vtund session and a ping across the tunnel
+        timeout-minutes: 8
+        run: |
+          bash qemu-boot/test-vtund-tunnel.sh \
+            --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
+            --output-dir "$RUNNER_TEMP/vtund-${{ matrix.soc }}"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtund-${{ matrix.soc }}-logs
+          path: ${{ runner.temp }}/vtund-${{ matrix.soc }}
+
   boot-novatek-recovery:
     name: Novatek recovery ${{ matrix.soc }} (defib, mask ROM UART and Ethernet)
     needs: build

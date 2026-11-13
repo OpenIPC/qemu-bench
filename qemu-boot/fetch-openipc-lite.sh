@@ -13,12 +13,17 @@
 # nightly split bundle; others publish both, fresh.  So when both exist the
 # newer one (Last-Modified) is taken.
 #
+# VARIANT=neo (or ultimate) fetches that variant's NOR release instead, in
+# the same two shapes.
+#
 #   bash qemu-boot/fetch-openipc-lite.sh <soc> [DIR] [RELEASE]
+#   VARIANT=neo bash qemu-boot/fetch-openipc-lite.sh <soc> [DIR] [RELEASE]
 set -euo pipefail
 
 SOC=$1
 DIR=${2:-.}
 REL=${3:-latest}
+VARIANT=${VARIANT:-lite}
 URL=https://github.com/OpenIPC/firmware/releases/download/$REL
 TGZ=$(mktemp)
 trap 'rm -f "$TGZ"' EXIT
@@ -42,13 +47,13 @@ modified() {
        return 1 ;;
     esac
 }
-PLAIN=$(modified "openipc.$SOC-nor-lite.tgz") || exit 1
-SPLIT=$(modified "openipc.$SOC-nor-lite-split.tgz") || exit 1
+PLAIN=$(modified "openipc.$SOC-nor-$VARIANT.tgz") || exit 1
+SPLIT=$(modified "openipc.$SOC-nor-$VARIANT-split.tgz") || exit 1
 
 if [ -n "$PLAIN" ] && [ "${SPLIT:-0}" -le "$PLAIN" ] &&
-   curl -fsL --retry 3 -o "$TGZ" "$URL/openipc.$SOC-nor-lite.tgz"; then
+   curl -fsL --retry 3 -o "$TGZ" "$URL/openipc.$SOC-nor-$VARIANT.tgz"; then
     tar xzf "$TGZ" -C "$DIR"
-elif curl -fsSL --retry 3 -o "$TGZ" "$URL/openipc.$SOC-nor-lite-split.tgz"; then
+elif curl -fsSL --retry 3 -o "$TGZ" "$URL/openipc.$SOC-nor-$VARIANT-split.tgz"; then
     tar xzf "$TGZ" -C "$DIR"
     FW=$DIR/firmware.bin.$SOC
     if [ "$(od -An -tx1 -N4 "$FW" | tr -d ' \n')" != 27051956 ]; then
@@ -70,7 +75,7 @@ elif curl -fsSL --retry 3 -o "$TGZ" "$URL/openipc.$SOC-nor-lite-split.tgz"; then
     len=$(((($4 << 24) | ($3 << 16) | ($2 << 8) | $1) + 4095 & ~4095))
     tail -c +$((sq + 1)) "$FW" | head -c $len > "$DIR/rootfs.squashfs.$SOC"
 else
-    echo "$REL has no lite NOR release for $SOC" >&2
+    echo "$REL has no $VARIANT NOR release for $SOC" >&2
     exit 1
 fi
 ls -l "$DIR/uImage.$SOC" "$DIR/rootfs.squashfs.$SOC"
