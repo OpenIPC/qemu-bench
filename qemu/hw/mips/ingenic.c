@@ -2022,7 +2022,8 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
         ingenic_get_sensor, ingenic_set_sensor);
     object_class_property_set_description(oc, "sensor",
         "image sensor on the sensor I2C bus: none (default), gc2053, "
-        "gc2083, gc4653, gc4663, sc2336, sc2335, jxf37, jxf22, ov2735b, ov2735");
+        "gc2083, gc4653, gc4663, sc2336, sc2335, jxf37, jxf22, jxf23, ov2735b, "
+        "ov2735");
     object_class_property_add_str(oc, "sensor1",
         ingenic_get_sensor1, ingenic_set_sensor1);
     object_class_property_set_description(oc, "sensor1",

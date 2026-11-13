@@ -57,6 +57,7 @@ static const ImageSensorSpec image_sensors[] = {
     { "f37", "hisi-f37", 0x40 },
     { "jxf37", "hisi-f37", 0x40 },
     { "jxf22", "hisi-jxf22", 0x40 },
+    { "jxf23", "hisi-jxf23", 0x40 },
     { "jxh42", "hisi-jxh42", 0x30 },
     { "jxh62", "hisi-jxh62", 0x30 },
 
