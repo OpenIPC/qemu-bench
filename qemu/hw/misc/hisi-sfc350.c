@@ -346,6 +346,11 @@ static void hisi_sfc350_exec_dma(HisiSfc350State *s)
     if (flash_addr + len > s->flash_size) {
         len = (flash_addr < s->flash_size) ? s->flash_size - flash_addr : 0;
     }
+    /* As in register mode, the empty select reaches no chip: the transfer
+     * completes and moves nothing. */
+    if (((s->bus_dma_ctrl >> DMA_CTRL_CS_SHIFT) & 1) != s->flash_cs) {
+        len = 0;
+    }
 
     if (len > 0) {
         if (is_read) {
