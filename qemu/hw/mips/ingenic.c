@@ -1728,6 +1728,33 @@ static void ingenic_init(MachineState *ms)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, GMAC_BASE);
     sysbus_connect_irq(sbd, 0, ingenic_irq(ims, IRQ_GMAC));
+    /*
+     * The PHY's reset line, where the board wires the DT's ingenic,rst-gpio
+     * to it (-global ingenic-gmac.phy-rst-gpio=71 for PC7).  Not wired by
+     * default: the board of OpenIPC/firmware#2839, whose PHY stays powered
+     * down across a reboot (hw/net/ingenic-gmac.c)
+     */
+    {
+        const int64_t pin = object_property_get_int(OBJECT(dev),
+                                                    "phy-rst-gpio",
+                                                    &error_abort);
+
+        if (pin >= (int64_t)info->gpio_ports * 32) {
+            error_report("ingenic-gmac: phy-rst-gpio %" PRId64 " is past "
+                         "the last pin (%d)", pin, info->gpio_ports * 32 - 1);
+            exit(1);
+        }
+        if (pin >= 0) {
+            if (qdev_get_gpio_out_connector(gpio, "drive", pin)) {
+                error_report("ingenic-gmac: GPIO pin %" PRId64 " is wired "
+                             "to another device", pin);
+                exit(1);
+            }
+            qdev_connect_gpio_out_named(gpio, "drive", pin,
+                                        qdev_get_gpio_in_named(dev,
+                                                               "phy-rst", 0));
+        }
+    }
 
     ingenic_vpu_create(ims, cpm, info->soc);
 
