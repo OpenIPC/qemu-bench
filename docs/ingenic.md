@@ -1577,6 +1577,10 @@ the address and with the ID that OpenIPC's `sinfo.ko` table probes:
 `ingenic-ov2735`: 8-bit registers in pages, the revision in page 0's
 0x04 telling the two apart), `gc4653` (0x29, 16-bit registers; T40, on
 I2C1), `gc4663` (T41, the same ID), `jxh62` (0x30, `hisi-jxh62`; T10).
+`sensor-bus=<n>` moves it to I2C<n>, for boards wired unlike the
+SoC's reference design (OpenIPC/firmware#1884: a T40 whose sensor is not
+on I2C1 times out in tx-isp's probe until the streamer is told the bus);
+-1, the default, keeps the SoC's own.
 The default is none. On T40 `sensor1=<name>` (the same names) adds a
 second sensor on I2C3, the second pipe's, and `sensor2=<name>` a third
 on I2C0, VIC2's (below). T10's kernel bit-bangs the sensor bus (`i2c-gpio`,
