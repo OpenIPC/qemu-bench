@@ -1739,6 +1739,12 @@ static void ingenic_init(MachineState *ms)
                                                     "phy-rst-gpio",
                                                     &error_abort);
 
+        if (pin < -1) {
+            error_report("ingenic-gmac: phy-rst-gpio %" PRId64 ": -1 (not "
+                         "wired) or a pin from 0 to %d", pin,
+                         info->gpio_ports * 32 - 1);
+            exit(1);
+        }
         if (pin >= (int64_t)info->gpio_ports * 32) {
             error_report("ingenic-gmac: phy-rst-gpio %" PRId64 " is past "
                          "the last pin (%d)", pin, info->gpio_ports * 32 - 1);

@@ -4117,6 +4117,13 @@ def test_gmac_phy_props(qemu):
     check('refused: phy-rst-gpio past the last pin',
           'past the last pin' in r.stderr, True)
 
+    r = subprocess.run(
+        [qemu, '-M', 't40', '-machine', 'accel=qtest', '-display', 'none',
+         '-global', 'ingenic-gmac.phy-rst-gpio=-2', '-S'],
+        capture_output=True, text=True, timeout=30, input='')
+    check('refused: phy-rst-gpio below -1',
+          '-1 (not wired) or a pin' in r.stderr, True)
+
 
 def test_migration(qemu, machine, tmp):
     print('migration round trip (%s)' % machine)

@@ -194,7 +194,8 @@ for p in "${QPIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null 
 QPIDS=()
 
 fail=0
-# ok WHAT LOG: one run's checks; prints them, returns 0 if eth0 survived
+# ok WHAT LOG: one run's checks; prints them, returns 0 if eth0 survived,
+# 1 for firmware#2839's failure (no eth0 after an SWR timeout), 2 otherwise
 ok() {
     local what=$1 log=$2 good=0
     local boot1 boot2
@@ -218,11 +219,18 @@ ok() {
     if grep -aq 'synopGMAC_reset timeout' <<< "$boot2"; then
         say INFO "boot 2: DmaBusMode.SWR timed out (firmware#2839)"
     fi
+    # 1 is only firmware#2839 itself: no eth0 because the MAC's reset
+    # timed out. eth0 without a lease, or no eth0 for another reason, is
+    # a failure of its own and always counts.
     if grep -aq 'QEMU-ETH: boot 2: eth0 present' <<< "$boot2" &&
        grep -aq 'lease of 10.0.2.15' <<< "$boot2"; then
-        [ $good -eq 0 ] || good=2
-    else
+        :
+    elif ! grep -aq 'QEMU-ETH: boot 2: eth0 present' <<< "$boot2" &&
+         grep -aq 'synopGMAC_reset timeout' <<< "$boot2"; then
         [ $good -eq 2 ] || good=1
+    else
+        say FAIL "boot 2: eth0 and a lease, or the known SWR timeout"
+        good=2
     fi
     return $good
 }
