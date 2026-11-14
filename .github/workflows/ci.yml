@@ -1739,10 +1739,10 @@ jobs:
           ${{ matrix.soc == 't40' && matrix.mode == 'kernel' && '--reset' || '' }}
 
   # docs/ingenic.md, "majestic on T40": the release's majestic starts the
-  # SDK, a light sensor switches it to night and back, and the night
-  # settings reach the ISP
+  # SDK with the microphone on (OpenIPC/majestic#257), a light sensor
+  # switches it to night and back, and the night settings reach the ISP
   majestic-ingenic:
-    name: majestic on t40 (day/night)
+    name: majestic on t40 (audio, day/night)
     needs: [select, build]
     if: fromJSON(needs.select.outputs.jobs)['majestic-ingenic']
     runs-on: ubuntu-24.04
@@ -1764,10 +1764,10 @@ jobs:
       - name: Make QEMU executable
         run: chmod +x qemu-src/build/qemu-system-mipsel
 
-      - name: majestic, day and night
+      - name: majestic, audio, day and night
         timeout-minutes: 12
         run: >-
-          bash qemu-boot/test-ingenic-majestic.sh
+          bash qemu-boot/test-ingenic-majestic.sh --audio
           --work "$RUNNER_TEMP/majestic"
 
   boot-hi3516cv610:
