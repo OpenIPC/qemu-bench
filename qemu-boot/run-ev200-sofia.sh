@@ -28,7 +28,16 @@
 # the host automatically.
 #
 # Usage:
-#   bash qemu-boot/run-ev200-sofia.sh [--sensor sc2315e]
+#   bash qemu-boot/run-ev200-sofia.sh [--sensor sc2315e] [--debug]
+#
+# --debug enables Sofia's verbose env-var logs (XMVIDEO_DEBUG_ON,
+#         XMCAP_DEBUG_ON, XMIMP_DEBUG_ON, JSON_PARSE_RES_OUTPUT) so
+#         Sofia traces high-level events (switchDayNightColor,
+#         setVideoStd, AE-weight changes, gamma day/night, etc.) in
+#         the chroot's /tmp/sofia.log.  Note: HI_MPI_ISP_* per-call
+#         tracing requires gdb breakpoints — see
+#         tools/isp-profile/README.md "Driving Sofia via gdb on a
+#         camera" appendix in the majestic repo.
 #
 # Idempotent: if /utils is already an NFS mount and /tmp/vendor/Sofia
 # already exists, skip remount and untar so repeated runs are fast.
@@ -41,12 +50,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SENSOR="${SENSOR:-sc2315e}"
 NFS_HOST="${NFS_HOST:-10.216.128.227}"
 NFS_PATH="${NFS_PATH:-/srv/nfsroot}"
+DEBUG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --sensor)   SENSOR="$2"; shift 2;;
         --sensor=*) SENSOR="${1#--sensor=}"; shift;;
         --nfs)      NFS_HOST="$2"; shift 2;;
+        --debug)    DEBUG=1; shift;;
         *)          break;;
     esac
 done
@@ -117,7 +128,8 @@ for m in sys_config hi_osal hi3516ev200_base hi3516ev200_sys \
 done
 
 echo "===setup: launch Sofia==="
-chroot /tmp/vendor /Sofia > /tmp/sofia.log 2>&1 &
+${DEBUG:+XMVIDEO_DEBUG_ON=1 XMCAP_DEBUG_ON=1 XMIMP_DEBUG_ON=1 JSON_PARSE_RES_OUTPUT=1} \\
+    chroot /tmp/vendor /Sofia > /tmp/sofia.log 2>&1 &
 SPID=\$!
 echo "Sofia pid=\$SPID"
 
