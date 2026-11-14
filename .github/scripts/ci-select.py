@@ -90,6 +90,7 @@ JOB_FAMILIES = {
     "boot-ingenic": {"ingenic"},
     "majestic-ingenic": {"ingenic"},
     "vtund-neo": {"hisilicon"},
+    "wifi-xiongmai": {"xiongmai"},
 }
 SPECIAL_JOBS = {"select", "build", "boot", "ci-gate"}
 

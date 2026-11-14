@@ -1479,6 +1479,55 @@ jobs:
           name: vtund-${{ matrix.soc }}-logs
           path: ${{ runner.temp }}/vtund-${{ matrix.soc }}
 
+  # USB Wi-Fi on the Xiongmai releases, brought up as a camera does it: the
+  # env names the profile and the network, S40network loads the driver and
+  # joins (qemu-boot/test-xm-usb-wifi.sh).  xm530v200 runs its own profile
+  # end to end -- the regression test for OpenIPC/firmware#2854, whose
+  # modules.dep left every modprobe in it failing; xm530 on -M xm550 has no
+  # driver in the release, so it checks the vendor USB path enumerates.
+  wifi-xiongmai:
+    name: USB Wi-Fi ${{ matrix.soc }}
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['wifi-xiongmai']
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [xm530v200, xm530]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0 squashfs-tools
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      - name: Download OpenIPC firmware
+        run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
+
+      - name: Wi-Fi through S40network
+        timeout-minutes: 8
+        run: |
+          bash qemu-boot/test-xm-usb-wifi.sh --soc ${{ matrix.soc }} \
+            --timeout 300 --keep "$RUNNER_TEMP/wifi-${{ matrix.soc }}"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-${{ matrix.soc }}-logs
+          path: ${{ runner.temp }}/wifi-${{ matrix.soc }}
+
   boot-novatek-recovery:
     name: Novatek recovery ${{ matrix.soc }} (defib, mask ROM UART and Ethernet)
     needs: [select, build]
@@ -1992,6 +2041,7 @@ jobs:
       - boot
       - boot-novatek
       - boot-novatek-recovery
+      - wifi-xiongmai
       - maskrom-na51089
       - boot-fullhan
       - boot-grainmedia
