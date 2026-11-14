@@ -1867,17 +1867,17 @@ jobs:
             # Split image: the uImage (64-byte header + data, size big-endian
             # at byte 12), its DTB appended to the zImage inside, so no -dtb.
             set -- $(od -An -tu1 -j12 -N4 "$FW")
-            head -c $(( 64 + (($1 << 24) | ($2 << 16) | ($3 << 8) | $4) )) "$FW" > uImage.hi3516cv610
+            head -c $(( 64 + (($1 << 24) | ($2 << 16) | ($3 << 8) | $4) )) "$FW" > uImage.hi3516cv6xx
           else
             # FIT: image 1 = linux_kernel (zImage), image 0 = fdt-1 (dtb).
-            dumpimage -T flat_dt -p 1 -o uImage.hi3516cv610 "$FW"
-            dumpimage -T flat_dt -p 0 -o cv610.dtb          "$FW"
+            dumpimage -T flat_dt -p 1 -o uImage.hi3516cv6xx "$FW"
+            dumpimage -T flat_dt -p 0 -o cv6xx.dtb          "$FW"
           fi
           # SquashFS rootfs is appended right after the kernel.
           sqoff=$(grep -aboP 'hsqs' "$FW" | head -1 | cut -d: -f1)
-          dd if="$FW" of=rootfs.squashfs.hi3516cv610 bs=64k iflag=skip_bytes \
+          dd if="$FW" of=rootfs.squashfs.hi3516cv6xx bs=64k iflag=skip_bytes \
               skip="$sqoff" status=none
-          ls -la uImage.hi3516cv610 rootfs.squashfs.hi3516cv610 cv610.dtb 2>/dev/null || true
+          ls -la uImage.hi3516cv6xx rootfs.squashfs.hi3516cv6xx cv6xx.dtb 2>/dev/null || true
 
       - name: "OpenIPC kernel + rootfs boot"
         timeout-minutes: 12
@@ -1893,9 +1893,9 @@ jobs:
             echo "::group::$mach"
             out=boot-output-$mach.txt
             timeout 150 $QEMU -M $mach -m 256M \
-              -kernel qemu-boot/uImage.hi3516cv610 \
-              $( [ -f qemu-boot/cv610.dtb ] && echo -dtb qemu-boot/cv610.dtb ) \
-              -initrd qemu-boot/rootfs.squashfs.hi3516cv610 \
+              -kernel qemu-boot/uImage.hi3516cv6xx \
+              $( [ -f qemu-boot/cv6xx.dtb ] && echo -dtb qemu-boot/cv6xx.dtb ) \
+              -initrd qemu-boot/rootfs.squashfs.hi3516cv6xx \
               -nographic -serial mon:stdio -nic user,restrict=on \
               -append 'mem=128M console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs' \
               -d unimp,guest_errors -D qemu-boot/qemu-$mach.log 2>&1 | tee "$out" &
