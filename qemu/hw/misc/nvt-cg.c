@@ -1,4 +1,4 @@
-/*
+/* 
  * Novatek NA51089 (NT9856x) clock generator (CG).
  *
  * Storage with reset values a booted loader leaves behind, so the clock
