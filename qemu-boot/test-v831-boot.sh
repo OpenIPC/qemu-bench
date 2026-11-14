@@ -121,11 +121,15 @@ s.settimeout(0.5)
 steps = [
     (b'HELLO! BOOT0 is starting', 'boot0 runs from SRAM'),
     (b'DRAM simple test OK', 'boot0 trained DRAM'),
-    (b'Jump to second Boot', 'boot0 loaded the boot package over SPI'),
+    (b'Jump to sec', 'boot0 loaded the boot package over SPI'),  # y211ga's boot0: "secend"
     (b'OP-TEE version', 'OP-TEE runs'),
     (b'U-Boot 2018', 'U-Boot runs'),
-    (b'Loading Environment from SUNXI_FLASH... OK', 'U-Boot env via SPI DMA'),
-    (b'find /debug_tty', 'U-Boot read the SD card'),
+    ((b'Loading Environment from SUNXI_FLASH... OK',   # y291ga
+      b'Loading Environment from SUNXI_FLASH... start:'),  # y211ga
+     'U-Boot env via SPI DMA'),
+    ((b'find /debug_tty',   # y291ga
+      b'Nothing updated'), # y211ga: no debug_tty logic; its SD update scan found no image
+     'U-Boot read the SD card'),
     (b'Starting kernel', 'U-Boot loaded the kernel from the GPT'),
     (b"'/etc/init.d/rcS", 'init runs rcS from the NOR root'),
     (b'BusyBox', 'init started a shell'),
@@ -149,8 +153,15 @@ while time.time() - t0 < limit:
     except socket.timeout:
         pass
     # each milestone counts only after the one before it
-    while i < len(steps) and buf.find(steps[i][0], at) >= 0:
-        at = buf.find(steps[i][0], at) + len(steps[i][0])
+    # a milestone is one pattern or a tuple of alternatives (YI y291ga / y211ga)
+    def find(pats, at):
+        hits = [(buf.find(p, at), p) for p in
+                (pats if isinstance(pats, tuple) else (pats,))]
+        hits = [h for h in hits if h[0] >= 0]
+        return min(hits) if hits else (-1, b'')
+    while i < len(steps) and find(steps[i][0], at)[0] >= 0:
+        pos, pat = find(steps[i][0], at)
+        at = pos + len(pat)
         print('ok   %-45s %6.1fs' % (steps[i][1], time.time() - t0))
         i += 1
     if i < len(steps):

@@ -249,6 +249,30 @@ small" for it, and `qemu/patches/0010` lets SDHC cards initialise. It
 records on events (motion, people) only; whether it then writes files has
 not been checked.
 
+## The y211ga
+
+The other YI V831 camera (U-Boot strings `/home_y211ga` and so on;
+`SUFFIX=y211ga` in `/backup/init.sh`) boots the same way, with these
+differences:
+
+- Its boot0 prints `Jump to secend Boot.`
+- Its U-Boot has no `/debug_tty` or `/Factory` logic and keeps
+  `console=ttyS0`, so the kernel console works without a card.
+- The sensor is an SP2305 at 0x3C on TWI1 (`sp2305_mipi_y211_y291`,
+  ISP tuning `sp2305_mipi_1936_1096_20_2`). The driver checks no chip ID;
+  the vendor builds the right `cam_sensor.ko` into each model's image. The
+  machine puts the `hisi-sp2305` stub there next to the GC2053.
+- `yi-v831-prepare.sh` needs a musl `CC_ARM` (see the script).
+- `test-v831-boot.sh` accepts its U-Boot lines (`Loading Environment from
+  SUNXI_FLASH... start:`, and `Nothing updated` once it has scanned the card
+  for `/home_y211ga` and the other update images) and passes every milestone.
+
+Prepared and booted with `-nic user,restrict=on`, a 12.0.37.0 dump stays up
+past the watchdog, takes a lease and runs its PilotAI loop on VIPP 2. Its
+`rmm` then waits for a cloud time sync (`sleeping 30s waiting for
+cloud_sync_time`) before it starts the encoders, so a restricted network
+gives no H.264.
+
 ## Not modelled
 
 USB (the atbm Wi-Fi is USB), the real LBC/FBC formats (LBC is a private
