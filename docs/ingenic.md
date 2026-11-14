@@ -2304,7 +2304,7 @@ The checks:
 - majestic brings the SDK up -- with `--audio`, with the microphone on,
   which OpenIPC/majestic#257 was about (the T40 build stopped at
   `IMP_AI_SetChnParam() failed`; a release from before the fix fails this
-  check here the same way);
+  check here the same way, and CI runs the test with `--audio`);
 - the host pulls PB17 low (`qom-set /machine/gpio pb 0xfffdffff`), and
   majestic changes to night; it lets it go, and majestic changes back;
 - the change reaches the ISP. `-global ingenic-isp.trace-regs=on` logs
