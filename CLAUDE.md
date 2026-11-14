@@ -853,7 +853,8 @@ jobs whose workflow text names them. setup.sh, ci.yml and
 by their diff. Docs run nothing. Anything unrecognised runs everything. Dry-run
 a change with `git diff --name-only master | python3
 .github/scripts/ci-select.py --stdin --base master`; `--explain <path>` shows
-what a path reaches. A new job must go into the script's `JOB_FAMILIES` and a
+what a path reaches. A new job must go into the script's `JOB_FAMILIES` and
+`ci-gate`'s `needs`, and a
 new qtest step needs an `if:` on its `qtests` entry: `--self-test`, run in
 `select`, fails the PR otherwise. The only required check is `CI Gate`, which
 fails if a job select asked for did not succeed.

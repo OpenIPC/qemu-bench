@@ -289,48 +289,77 @@ def qtest_family(script):
 # ── Scripts and which jobs run them ─────────────────────────────────────
 
 class ScriptGraph:
-    """Which jobs (and build-step qtests) each script under SCRIPT_DIRS feeds."""
+    """Which jobs, build-step qtests and boot rows each script feeds."""
 
     def __init__(self, files, wf):
         self.wf = wf
         self.scripts = [f for f in files if f.startswith(SCRIPT_DIRS)]
         self.text = {f: read(f) for f in self.scripts}
-        texts = {j: wf.job_text(j) for j in wf.jobs}
-        texts["boot"] += read(BOOT_MATRIX)
+        texts = {j: wf.job_text(j) for j in wf.jobs if j not in ("build", "boot")}
+        boot_steps = wf.jobs["boot"]["steps"]
         self.direct = {}
         for s in self.scripts:
-            base = os.path.basename(s)
-            jobs = {j for j, t in texts.items()
-                    if j != "build" and (s in t or re.search(
-                        r"(?<![\w.\-])%s(?![\w.\-])" % re.escape(base), t))}
+            rx = self._name_rx(s)
+            named = lambda t: s in t or rx.search(t)
+            jobs = {j for j, t in texts.items() if named(t)}
             jobs |= EXTRA_JOB_EDGES.get(s, set())
             qt = {q for q in wf.qtests if q == s}
-            self.direct[s] = (jobs, qt)
-        # Scripts that call another script (by file name) pass its jobs on.
+            # A boot step that runs only for rows with a matrix flag
+            # (`if: matrix.stream_test`) reaches only those rows.
+            rows = set()
+            for step in boot_steps:
+                if not named(yaml.dump(step)):
+                    continue
+                keys = re.findall(r"matrix\.(\w+)", str(step.get("if", "")))
+                if not keys:
+                    rows = None
+                    break
+                rows |= {r["name"] for r in wf.boot_rows
+                         if any(r.get(k) for k in keys)}
+            if rows is not None:
+                rows |= {r["name"] for r in wf.boot_rows if named(yaml.dump(r))}
+            self.direct[s] = (jobs, qt, rows)
+        # Scripts that call or import another script pass its jobs on.
         self.callers = {s: set() for s in self.scripts}
         for s in self.scripts:
-            base = os.path.basename(s)
-            rx = re.compile(r"(?<![\w.\-])%s(?![\w.\-])" % re.escape(base))
+            rx = self._name_rx(s)
             for c in self.scripts:
                 if c != s and rx.search(self.text[c]):
                     self.callers[s].add(c)
 
+    @staticmethod
+    def _name_rx(path):
+        """A script's file name, or its stem as a Python import names it
+        (`import ive_xnn`, `importlib` of "fake-ipcam")."""
+        base = os.path.basename(path)
+        stem = os.path.splitext(base)[0]
+        names = {base}
+        if base.endswith(".py"):
+            names |= {stem, stem.replace("-", "_")}
+        return re.compile(r"(?<![\w.\-])(?:%s)(?![\w\-])"
+                          % "|".join(map(re.escape, sorted(names))))
+
     def reach(self, path):
-        jobs, qts = set(), set()
+        """(jobs, qtests, boot rows); rows None means every row."""
+        jobs, qts, rows = set(), set(), set()
         seen, todo = set(), [path]
         while todo:
             s = todo.pop()
             if s in seen:
                 continue
             seen.add(s)
-            j, q = self.direct.get(s, (set(), set()))
+            j, q, r = self.direct.get(s, (set(), set(), set()))
             jobs |= j
             qts |= q
+            if r is None or rows is None:
+                rows = None
+            else:
+                rows |= r
             if s == path and s not in self.direct:
                 # New script: nothing names it yet.
                 continue
             todo.extend(self.callers.get(s, ()))
-        return jobs, qts
+        return jobs, qts, rows
 
 
 # ── Classification ──────────────────────────────────────────────────────
@@ -417,6 +446,18 @@ def show(rev, path):
     return r.stdout if r.returncode == 0 else None
 
 
+# Words of the cp / meson / Kconfig boilerplate setup.sh wraps around each
+# model: a line of nothing else (a continuation line, a `fi`) is explained by
+# the hunk it sits in.
+SETUP_GLUE = set("""
+QEMU_DIR SRC_DIR hw include misc i2c net ssi usb sd char audio intc timer gpio
+display dma rtc watchdog arm mips nvram ide meson build Kconfig qemu
+if then else elif fi for in do done while grep q E echo sed i s a cp mkdir p
+added patched system_ss arm_ss specific_ss add when if_true files cfg k f
+select config bool default y n depends on imply the to for and
+""".split())
+
+
 def setup_sh_diff(base, dev, d):
     """Narrow a qemu/setup.sh change to the families its hunks name.
 
@@ -437,6 +478,18 @@ def setup_sh_diff(base, dev, d):
     # Per hunk, the words it adds or removes: appending one file to a meson
     # line that lists twenty must name that one file, not the twenty.
     word = re.compile(r"[A-Za-z0-9_+-]+(?:\.[ch])?")
+
+    def recognise(w):
+        stem = re.sub(r"\.[ch]$", "", w)
+        if stem in by_stem:
+            return by_stem[stem]
+        fam = family_of_name(stem)
+        if fam and (w != stem or any(stem.startswith(x) and x.endswith("-")
+                                     for x in PREFIX_FAMILY)):
+            # a file (xm-rtc2.c) or a marker (grep -q hisi-vi-fp)
+            return {fam}
+        fam = CONFIG_FAMILY.get(w) or CONFIG_FAMILY.get("CONFIG_" + w)
+        return {fam} if fam else None
     hunks, cur = [], None
     for line in r.stdout.splitlines():
         if line.startswith("@@"):
@@ -454,21 +507,29 @@ def setup_sh_diff(base, dev, d):
         changed = (added - removed) + (removed - added)
         if not changed:
             continue                # comments, whitespace or a reorder
-        first = (hunk["+"] or hunk["-"])[0]
+        # Every changed line has to be explained on its own: by a model or
+        # family symbol it names, or by being nothing but the shell and
+        # meson glue around those.  One recognised word must not cover an
+        # upstream sed patch that happens to sit in the same hunk.
+        other = {"+": set(hunk["-"]), "-": set(hunk["+"])}
+        for sign in "+-":
+            for line in hunk[sign]:
+                if line in other[sign]:
+                    continue
+                words = word.findall(line)
+                if any(recognise(w) for w in words):
+                    continue
+                if all(w in SETUP_GLUE for w in words):
+                    continue
+                d.why.append(("qemu/setup.sh", "ALL (line names no model: %s)"
+                              % line[:60]))
+                return False
         found = set()
-        for word_ in changed:
-            word_ = word_
-            stem = re.sub(r"\.[ch]$", "", word_)
-            if stem in by_stem:
-                found |= by_stem[stem]
-            elif word_ != stem and family_of_name(stem):
-                found.add(family_of_name(stem))
-            fam = CONFIG_FAMILY.get(word_) or CONFIG_FAMILY.get("CONFIG_" + word_)
-            if fam:
-                found.add(fam)
+        for w in changed:
+            found |= recognise(w) or set()
         if not found or ALL in found:
             d.why.append(("qemu/setup.sh", "ALL (hunk names no model: %s)"
-                          % first[:60]))
+                          % (hunk["+"] or hunk["-"])[0][:60]))
             return False
         fams |= found
     d.families |= fams
@@ -503,16 +564,21 @@ def workflow_diff(base, wf, d):
             if a != b:
                 d.why.append((WORKFLOW, "ALL (build job changed)"))
                 return False
-            before = {st.get("name"): st for st in oj[job].get("steps", [])}
-            for st in nj[job].get("steps", []):
-                if before.get(st.get("name")) == st:
-                    continue
+            # Only the qtest steps narrow.  Any other step added, removed,
+            # changed or moved (the build itself, the uploads the other jobs
+            # download) runs everything.
+            def qtest(st):
                 m = re.search(r"qemu/tests/[\w.\-]+", st.get("run", ""))
-                if not m:
-                    d.why.append((WORKFLOW, "ALL (build step %r changed)" % st.get("name")))
-                    return False
-                d.qtests.add(m.group(0))
-                d.why.append((WORKFLOW, "qtest %s" % m.group(0)))
+                return m.group(0) if m else None
+            os_, ns_ = oj[job].get("steps", []), nj[job].get("steps", [])
+            if [st for st in os_ if not qtest(st)] != [st for st in ns_ if not qtest(st)]:
+                d.why.append((WORKFLOW, "ALL (a build step other than a qtest changed)"))
+                return False
+            before = [st for st in os_ if qtest(st)]
+            for st in ns_:
+                if qtest(st) and st not in before:
+                    d.qtests.add(qtest(st))
+                    d.why.append((WORKFLOW, "qtest %s" % qtest(st)))
             continue
         d.jobs.add(job)
         d.why.append((WORKFLOW, "job %s" % job))
@@ -532,6 +598,17 @@ def boot_matrix_diff(base, wf, d):
         if old.get(r["name"]) != r:
             d.boot_names.add(r["name"])
             d.why.append((BOOT_MATRIX, "row %s" % r["name"]))
+    # A removed row: run the rest of its group, so the change still runs
+    # something and the boot job itself is shown to work.
+    names = {r["name"] for r in wf.boot_rows}
+    for name, r in old.items():
+        if name not in names:
+            group = {x["name"] for x in wf.boot_rows if x["group"] == r.get("group")}
+            if not group:
+                d.why.append((BOOT_MATRIX, "ALL (removed row %s, its group is gone)" % name))
+                return False
+            d.boot_names |= group
+            d.why.append((BOOT_MATRIX, "removed row %s: rows of %s" % (name, r.get("group"))))
     return True
 
 
@@ -568,10 +645,16 @@ def classify(paths, files=None, base=None):
             d.qtests.add("qemu/tests/test-hisi-ive-npu.py")
             d.why.append((p, "qtest test-hisi-ive-npu.py"))
         elif p.startswith(SCRIPT_DIRS):
-            jobs, qts = scr.reach(p)
+            jobs, qts, rows = scr.reach(p)
             d.jobs |= jobs
             d.qtests |= qts
             what = sorted(jobs) + sorted(os.path.basename(q) for q in qts)
+            if rows is None:
+                d.jobs.add("boot")
+                what.append("boot")
+            elif rows:
+                d.boot_names |= rows
+                what.append("boot rows " + ",".join(sorted(rows)))
             d.why.append((p, ("runs " + ", ".join(what)) if what
                           else "nothing (no job runs it)"))
         else:
@@ -661,6 +744,12 @@ def self_test():
             cond = str(wf.jobs[job].get("if", ""))
             if "'%s'" % job not in cond:
                 errors.append("job %r has no `if:` on its selector output" % job)
+
+    gate_needs = set(wf.jobs.get("ci-gate", {}).get("needs", []))
+    for job in wf.jobs:
+        if job != "ci-gate" and job not in gate_needs:
+            errors.append("ci-gate does not need job %r, so its failure would "
+                          "not block a merge" % job)
 
     for row in wf.boot_rows:
         if row.get("group") not in FAMILIES:

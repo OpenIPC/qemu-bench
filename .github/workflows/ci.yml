@@ -2027,6 +2027,9 @@ jobs:
               print("%-24s wanted=%-5s %s" % (job, want[job], r))
               if not ok:
                   bad.append("%s: %s" % (job, r))
+          for job, wanted in want.items():
+              if wanted and job not in needs:
+                  bad.append("%s: selected, but ci-gate does not need it" % job)
           if bad:
               sys.exit("\n".join(bad))
           PY
