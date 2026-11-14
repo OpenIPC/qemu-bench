@@ -73,13 +73,21 @@ else
     # The SquashFS superblock's bytes_used (little-endian at +40), rounded
     # up to 4 KiB as the release's own rootfs files are: the erased flash
     # after it is left out.
-    sq=$(grep -abo hsqs "$FW" | head -1 | cut -d: -f1)
+    # No pipes into head here: under pipefail the writer is killed (or gets
+    # EPIPE) when head has what it wants and closes the pipe, and whether the
+    # writer still had bytes to write is down to scheduling -- CI failed with
+    # "tail: error writing 'standard output': Broken pipe" now and then.
+    # grep -m1 stops at the first matching line; -o can still print several
+    # offsets from it, so keep the first.
+    sq=$(grep -abo -m1 hsqs "$FW" || true)
+    sq=${sq%%:*}
     if [ -z "$sq" ]; then
         echo "$FW has no SquashFS" >&2
         exit 1
     fi
     set -- $(od -An -tu1 -j$((sq + 40)) -N4 "$FW")
     len=$(((($4 << 24) | ($3 << 16) | ($2 << 8) | $1) + 4095 & ~4095))
-    tail -c +$((sq + 1)) "$FW" | head -c $len > "$DIR/rootfs.squashfs.$SOC"
+    dd if="$FW" of="$DIR/rootfs.squashfs.$SOC" iflag=skip_bytes,count_bytes \
+        skip=$sq count=$len bs=64K status=none
 fi
 ls -l "$DIR/uImage.$SOC" "$DIR/rootfs.squashfs.$SOC"
