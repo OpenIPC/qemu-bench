@@ -49,6 +49,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 
 #define AK_SYSCTRL_SIZE     0x8000
 #define AK_SYSCTRL_NREGS    (0x400 / 4)
+#define AK_SYSCTRL_NREGS_V1 (0x200 / 4)  /* migration version 1 */
 #define AK_TIMER_MAX        10
 #define AK_TIMER_FREQ       12000000
 /* Watchdog count unit: 21.333 us (ak_top_wdt.c UNIT_NS). */
@@ -530,16 +531,25 @@ static int ak_sysctrl_post_load(void *opaque, int version_id)
 static const VMStateDescription vmstate_ak_sysctrl = {
     .name = TYPE_AK_SYSCTRL,
     .version_id = 2,
-    .minimum_version_id = 2,
+    .minimum_version_id = 1,
     .post_load = ak_sysctrl_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS),
+        /*
+         * Version 1 had 0x200 bytes of registers; the EV300L's pad
+         * registers run past them. A version-1 stream leaves the upper
+         * half at its reset value.
+         */
+        VMSTATE_SUB_ARRAY(regs, AkSysctrlState, 0, AK_SYSCTRL_NREGS_V1, 0,
+                          vmstate_info_uint32, uint32_t),
         VMSTATE_UINT32(level, AkSysctrlState),
         VMSTATE_STRUCT_ARRAY(timer, AkSysctrlState, AK_TIMER_MAX, 1,
                              vmstate_ak_timer, AkTimer),
         VMSTATE_UINT16_ARRAY(rtc, AkSysctrlState, RTC_NREGS),
         VMSTATE_PTIMER(wdt, AkSysctrlState),
         VMSTATE_UINT32(wdt_load, AkSysctrlState),
+        VMSTATE_SUB_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS_V1,
+                          AK_SYSCTRL_NREGS - AK_SYSCTRL_NREGS_V1, 2,
+                          vmstate_info_uint32, uint32_t),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -427,6 +427,7 @@ def test_ev330(qemu, path):
 
 
 SPI0_ASPEN = 0x21100000
+UART2_ASPEN = 0x201A0000
 
 
 def test_ev300l(qemu, path):
@@ -442,7 +443,10 @@ def test_ev300l(qemu, path):
     struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
     img[0x190:0x194] = b'\0' * 4                   # SPIP with no ID
     open(path, 'wb').write(img)
-    qt = QTest(qemu, 'ak3918ev300l,flash-file=%s' % path)
+    out2 = path + '.uart2'
+    qt = QTest(qemu, 'ak3918ev300l,flash-file=%s' % path,
+               ['-serial', 'null', '-serial', 'null',
+                '-serial', 'file:' + out2])
     try:
         table = [qt.readl(0x28 + 4 * i) for i in range(7)]
         check('script: poll and ROM ops dropped', table ==
@@ -474,6 +478,15 @@ def test_ev300l(qemu, path):
         qt.writel(s, 0x51)
         check('RDID through SPI0 at 0x21100000 (empty SPIP: GD25Q64)',
               int.from_bytes(jedec.to_bytes(3, 'little'), 'big'), 0xC84017)
+        # UART 2 at 0x201A0000, its TX ring at L2 + 0x1200
+        qt.writel(L2MEM + 0x1200, ord('2'))
+        qt.writel(UART2_ASPEN + 0x00, 1 << 28)
+        qt.writel(UART2_ASPEN + 0x04, (1 << 4) | (1 << 16))
+        check('UART2: TX done reads as idle',
+              (qt.readl(UART2_ASPEN + 0x04) >> 19) & 1, 1)
+        time.sleep(0.2)
+        check('UART2: byte reached the third serial port',
+              open(out2, 'rb').read(), b'2')
     finally:
         qt.close()
     qt = QTest(qemu, 'ak3918av100,flash-file=%s' % path)

@@ -424,7 +424,7 @@ static int ak_spi_post_load(void *opaque, int version_id)
 static const VMStateDescription vmstate_ak_spi = {
     .name = TYPE_AK_SPI,
     .version_id = 2,
-    .minimum_version_id = 2,
+    .minimum_version_id = 1,
     .post_load = ak_spi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(con, AkSpiState),
@@ -432,8 +432,6 @@ static const VMStateDescription vmstate_ak_spi = {
         VMSTATE_UINT32(cnt, AkSpiState),
         VMSTATE_UINT32(extx, AkSpiState),
         VMSTATE_UINT32(exrx, AkSpiState),
-        VMSTATE_UINT32(rtim, AkSpiState),
-        VMSTATE_UINT32(work_mode, AkSpiState),
         VMSTATE_BOOL(done, AkSpiState),
         VMSTATE_BOOL(cs_gpio, AkSpiState),
         VMSTATE_FIFO8(txfifo, AkSpiState),
@@ -443,6 +441,9 @@ static const VMStateDescription vmstate_ak_spi = {
         VMSTATE_UINT8(txblk_pos, AkSpiState),
         VMSTATE_UINT8_ARRAY(rxblk, AkSpiState, AK_L2_BLOCK),
         VMSTATE_UINT8(rxblk_len, AkSpiState),
+        /* Version 2: the EV300L / AV100 SPI's RTIM and WORK_MODE */
+        VMSTATE_UINT32_V(rtim, AkSpiState, 2),
+        VMSTATE_UINT32_V(work_mode, AkSpiState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

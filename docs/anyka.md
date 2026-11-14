@@ -61,7 +61,7 @@ appended DTB.
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
 | `0x20120000` / `0x20128000` | SPI0 (boot NOR) / SPI1 | `ak-spi`, `ak-spinor` |
-| `0x20130000` / `0x20138000` | UART0 / UART1 | `ak-uart` |
+| `0x20130000` / `0x20138000` | UART0 / UART1 (UART2 at `0x201A0000`, interrupt 24, on the EV300L and AV100) | `ak-uart` |
 | `0x20140000` | L2 buffer controller | `ak-l2` |
 | `0x20150000`, `0x20190000`, `0x201A0000` | I2C 0 (1, 2 on EV330; EV300L: I2C 2 at `0x201C0000`, UART 2 at `0x201A0000`) | `ak-i2c` |
 | `0x20170000` | GPIO | `ak-gpio` |

@@ -49,6 +49,8 @@
 #define AK_IRQ_SPI1         9
 #define AK_IRQ_UART0        10
 #define AK_IRQ_UART1        11
+#define AK_ASPEN_UART2_BASE 0x201A0000
+#define AK_ASPEN_IRQ_UART2  24
 #define AK_IRQ_L2           12
 #define AK_IRQ_GPIO         15
 #define AK_IRQ_MAC          16
@@ -428,9 +430,17 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(l2), 0,
                        qdev_get_gpio_in(sysctrl, AK_IRQ_L2));
 
-    for (n = 0; n < 2; n++) {
-        static const hwaddr base[2] = { AK_UART0_BASE, AK_UART1_BASE };
-        static const int irq[2] = { AK_IRQ_UART0, AK_IRQ_UART1 };
+    /*
+     * UART 2 on the EV300L and AV100 (their DTs: 0x201A0000, interrupt 24,
+     * its L2 rings after UART 1's), where the EV330 has I2C 2.
+     */
+    for (n = 0; n < (c->aspen ? 3 : 2); n++) {
+        static const hwaddr base[3] = {
+            AK_UART0_BASE, AK_UART1_BASE, AK_ASPEN_UART2_BASE,
+        };
+        static const int irq[3] = {
+            AK_IRQ_UART0, AK_IRQ_UART1, AK_ASPEN_IRQ_UART2,
+        };
 
         dev = qdev_new("ak-uart");
         qdev_prop_set_chr(dev, "chardev", serial_hd(n));
@@ -483,7 +493,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
 
     /*
      * I2C 0, and the EV330's extra two (its DTS; harmless on the rest).
-     * EV300L: I2C 2 at 0x201C0000, UART 2 being at 0x201A0000.
+     * EV300L: I2C 2 at 0x201C0000, UART 2 (above) being at 0x201A0000.
      */
     for (n = 0; n < 3; n++) {
         const hwaddr base[3] = {
