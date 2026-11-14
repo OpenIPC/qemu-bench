@@ -495,6 +495,21 @@ stock X6C-WEQ firmware's `6012B_x.ko` loads its firmware into a
 `psk=`-configured dongle and runs its WSM exchange as before; Sofia does
 not scan without provisioning (above).
 
+`qemu-boot/test-xm-usb-wifi.sh --soc xm530v200|xm530` takes the release
+bundle instead (`fetch-openipc-lite.sh`) and brings Wi-Fi up the way a
+camera does: the U-Boot environment (written at 0x40000 with its CRC, as
+OpenIPC's `fw_printenv` scans for it) names the profile and the network
+(`wlandev`, `wlanssid`, `wlanpass`), and S40network loads the driver
+through the profile in `/etc/wireless/usb` and joins over WPA2-PSK. An init
+script added to a copy of the root reports, so there is no login and no
+claim. On `xm530v200` the release's X2-WQ2 profile must associate, lease
+10.0.2.15 and ping: the CI job `wifi-xiongmai` (OpenIPC/firmware#2854,
+whose `modules.dep` listed none of `dwc2`, `xm_usb0` or the ATBM driver,
+so every `modprobe` in the profile failed). `xm530` boots on `-M xm550`,
+whose release has no ATBM driver: there it checks that `dwc_otg` and
+`wifi_pdn value=96` enumerate the dongle, or runs the full check with
+`--wlandev` on an image that has a profile (firmware#2316).
+
 Not modelled: WPA3-SAE and 802.1X (the guests' `wpa_supplicant` has
 neither; see `docs/ingenic.md`); XM535D2's `6132cu.ko` and XM533's SDIO
 SSV6158.
