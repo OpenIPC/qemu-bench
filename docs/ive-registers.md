@@ -541,8 +541,8 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
 The LK and Shi-Tomasi files in the capture's reference set therefore
-differ by design: LK's by up to 4 Q7 units, and op 25's by at most one
-count on 2% of pixels.
+differ by design: LK's by up to 4 Q7 units, and op 25's on 7.5% of
+pixels -- by one count on 5.5% of them and by two on the remaining 2%.
 
 - `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local,
   since the capture links the SDK's MPI libraries): every op through the
