@@ -810,3 +810,63 @@ int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
     }
     return ok;
 }
+
+/*
+ * ST_BOX_FLT_AND_EIGEN (op 25): the Shi-Tomasi corner measure in the
+ * middle of ss_mpi_ive_st_cand_corner.  The engine box-filters the
+ * products of the S8 gradient pair over 3x3 (edges replicated) and
+ * reduces the resulting structure tensor to one U16 per pixel, plus the
+ * picture's maximum.
+ *
+ * The measure is a function of the tensor's trace and determinant only
+ * -- exactly rotation invariant -- and homogeneous of degree one to
+ * within half a percent, which is the signature of a sum of two
+ * separately rounded terms.  What the engine actually computes is
+ * `t1 + 16 * t1^2 / tr` with `t1 = det / (16 * tr)`: the first iterate
+ * of `l <- det / (tr - l)` with its division expanded to two terms,
+ * over 16.  Against the CV608 that is exact on 84.6% of the 7933 clean
+ * tensors the trace sweep provides and within one count on 95.4%, with
+ * a symmetric residual -- so the last count is a quantisation inside
+ * the engine that is not yet pinned down (#300), not a wrong shape.
+ * `lmin` itself is 13.4% out and `det / trace` 5.1%, so neither is what
+ * the silicon does.
+ */
+void ive_st_eigen(const int8_t *grad, uint32_t w, uint32_t h, uint16_t *out,
+                  uint16_t *max_out)
+{
+    uint16_t max = 0;
+
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            int64_t a = 0, b = 0, c = 0;
+
+            for (int j = -1; j <= 1; j++) {
+                uint32_t yy = y + j >= h ? (j < 0 ? 0 : h - 1) : y + j;
+
+                for (int i = -1; i <= 1; i++) {
+                    uint32_t xx = x + i >= w ? (i < 0 ? 0 : w - 1) : x + i;
+                    int gh = grad[2 * (yy * w + xx)];
+                    int gv = grad[2 * (yy * w + xx) + 1];
+
+                    a += gh * gh;
+                    b += gh * gv;
+                    c += gv * gv;
+                }
+            }
+            int64_t tr = a + c, det = a * c - b * b, v = 0;
+
+            if (tr > 0 && det > 0) {
+                int64_t t1 = det / (16 * tr);
+
+                v = t1 + 16 * t1 * t1 / tr;
+            }
+            out[y * w + x] = v > 0xffff ? 0xffff : v;
+            if (out[y * w + x] > max) {
+                max = out[y * w + x];
+            }
+        }
+    }
+    if (max_out) {
+        *max_out = max;
+    }
+}

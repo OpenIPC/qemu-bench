@@ -216,4 +216,16 @@ int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
                  int32_t *px, int32_t *py, int iters, int eps,
                  uint32_t min_eig, uint16_t *err);
 
+/*
+ * ST_BOX_FLT_AND_EIGEN: the 3x3 box filter of the interleaved S8
+ * gradient pair's products and the corner measure of the resulting
+ * structure tensor, one U16 per pixel, plus the picture's maximum
+ * through `max_out` (which may be NULL).  `grad` is w x h pairs, gh
+ * then gv.  The measure is `t1 + 16 * t1^2 / tr` with
+ * `t1 = det / (16 * tr)` -- see hisi-ive-ops.c; it matches a CV608
+ * exactly on 84.6% of pixels and within one count on 95.4% (#300).
+ */
+void ive_st_eigen(const int8_t *grad, uint32_t w, uint32_t h, uint16_t *out,
+                  uint16_t *max_out);
+
 #endif

@@ -593,6 +593,44 @@ def main():
         # (qemu-boot/ive-v5-capture.c; the references are in
         # qemu/tests/data/ive-v5-cv608-ref.tar.xz)
 
+        # ST_BOX_FLT_AND_EIGEN (op 25): the 3x3 box filter of the S8
+        # gradient pair's products, reduced to one U16 per pixel plus the
+        # picture's maximum.  The rule is t1 + 16 t1^2 / tr with
+        # t1 = det // (16 tr); it matches a CV608 on 92.5% of pixels and
+        # within one count on 98.0% (#300), so this pins the model, not
+        # the silicon.
+        grad = bytes(b for i in range(n)
+                     for b in (((i * 13) % 61 - 30) & 0xff,
+                               ((i * 7) % 47 - 23) & 0xff))
+        q.write(P, grad)
+        run(25, [(80, 'Q', P), (112, 'I', 2 * SW), (96, 'Q', R),
+                 (120, 'I', 2 * SW), (104, 'Q', R + 2 * n)])
+        g = [(v - 256 if v > 127 else v) for v in grad]
+        want, mx = [], 0
+        for y in range(SH):
+            for x in range(SW):
+                A = B = C = 0
+                for dy in (-1, 0, 1):
+                    yy = min(max(y + dy, 0), SH - 1)
+                    for dx in (-1, 0, 1):
+                        xx = min(max(x + dx, 0), SW - 1)
+                        gh = g[2 * (yy * SW + xx)]
+                        gv = g[2 * (yy * SW + xx) + 1]
+                        A += gh * gh
+                        B += gh * gv
+                        C += gv * gv
+                tr, det, v = A + C, A * C - B * B, 0
+                if tr > 0 and det > 0:
+                    t1 = det // (16 * tr)
+                    v = min(t1 + 16 * t1 * t1 // tr, 0xffff)
+                want.append(v)
+                mx = max(mx, v)
+        got = struct.unpack('<%dH' % n, q.read(R, 2 * n))
+        check(list(got) == want, 'st_box_flt_and_eigen: the measure')
+        check(struct.unpack('<H', q.read(R + 2 * n, 2))[0] == mx,
+              'st_box_flt_and_eigen: the picture maximum')
+        q.write(P, a)                   # the later ops share this buffer
+
         # LBP: bit 7 the top-left neighbour, then clockwise
         nb = ((-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0))
         for mode, thr in ((0, 0), (0, -5), (1, 10)):

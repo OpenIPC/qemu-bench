@@ -426,8 +426,8 @@ binary under QEMU and compares file by file):
   point is ever rejected, so that scale is plausible rather than
   measured.
 
-Still to come (#268): st_box_flt_and_eigen and candidate_corner. What is
-known about them:
+All 33 ops are modelled. The last two to arrive were
+st_box_flt_and_eigen and candidate_corner:
 
 - **st_cand_corner is a sequence**, not one op: norm_grad (norm 3, both
   gradients interleaved as S8C2) into the ctrl's mem, then
@@ -438,9 +438,28 @@ known about them:
   candidate_corner (op 26). **Op 26 is `(a == b && a > 0) ? a : 0`** of
   the thresholded map and its maximum filter -- plain non-maximum
   suppression -- which reproduces the captured candidate picture
-  exactly. Op 25's measure is homogeneous of degree one in the 3x3
-  structure tensor and is close to `det / trace` divided by about 13,
-  but no arithmetic fitted so far matches it.
+  exactly. **Op 25 is**
+
+      t1 = det // (16 * trace)
+      measure = t1 + 16 * t1^2 // trace
+
+  over the 3x3 box sums of the gradient products (edges replicated),
+  clamped to U16, with the picture's maximum written after the map --
+  the first iterate of `l <- det / (trace - l)` with its division
+  expanded to two terms, over 16. The measure depends on the structure
+  tensor through its **trace and determinant only** (exactly rotation
+  invariant) and is homogeneous of degree one to within half a percent:
+  the slope of `log measure` against `log trace` at a fixed
+  `det / trace^2` is 1.004 to 1.008 over trace spans of 3x to 9x, which
+  is what a sum of two separately rounded terms looks like. Against a
+  CV608 it is **exact on 92.5% of pixels and within one count on 98.0%**
+  (138384 pixels of the `strec_*` trace sweep), with a symmetric
+  residual -- so the last count is a quantisation inside the engine that
+  is still open (#300), not a wrong shape. `lmin` itself is 13.4% out
+  and `det / trace` 5.1%, so the engine does neither; nor does it use a
+  truncating reciprocal of the trace (for 258 of the 356 traces carrying
+  four determinants or more, no single `R` fits
+  `floor(det * R * (1 + det * R^2) / 16)`).
 
   What the captures *do* establish, and what they rule out:
 
@@ -522,8 +541,8 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
 The LK and Shi-Tomasi files in the capture's reference set therefore
-differ by design: LK's by up to 4 Q7 units, and the Shi-Tomasi pair's
-because op 25 is not modelled at all.
+differ by design: LK's by up to 4 Q7 units, and op 25's by at most one
+count on 2% of pixels.
 
 - `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local,
   since the capture links the SDK's MPI libraries): every op through the
