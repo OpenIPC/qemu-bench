@@ -3359,3 +3359,4 @@ disk (`SnapFromVdec`). None of these boots ran it.
   engines NT98332 lacks too.
 - The decoder's compressed reduced copy (a stand-in, above). The encoder
   is NT98332's model: the NVR firmware never encodes on these boots.
+
