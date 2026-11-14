@@ -438,9 +438,30 @@ known about them:
   candidate_corner (op 26). **Op 26 is `(a == b && a > 0) ? a : 0`** of
   the thresholded map and its maximum filter -- plain non-maximum
   suppression -- which reproduces the captured candidate picture
-  exactly. Op 25's measure is homogeneous of degree one in the 3x3
-  structure tensor and is close to `det / trace` divided by about 13,
-  but no arithmetic fitted so far matches it.
+  exactly. Op 25's measure is a function of the window's
+  3x3 structure tensor through its **trace and determinant only**
+  (exactly rotation invariant), and is homogeneous of degree one to
+  within 0.5% -- the slope of `log measure` against `log trace` at a
+  fixed `det / trace^2` is 1.004 to 1.008 across trace spans of 3x to
+  9x, which is the signature of a sum of two separately rounded terms.
+  The best rule so far is
+
+      t1 = det // (16 * trace)
+      measure = t1 + (16 * t1^2) // trace
+
+  -- the first iterate of `l <- det / (trace - l)` with its division
+  expanded to two terms, over 16 -- which is **exact on 84.6%** of the
+  7933 clean tensors the trace sweep provides and within one count on
+  95.4%.  `qemu-boot/ive-v5-st-measure.py` scores it against the stored
+  reference, so a candidate rule can be tried without a board.  Ruled
+  out: lmin itself (13.4% rms), `det / trace` (5.1% rms), any Newton or
+  fixed-point iterate of either, any single-floor two-term rational (an
+  exact LP over the clean samples is infeasible), and a truncating
+  reciprocal of the trace -- for 258 of the 356 traces carrying four
+  determinants or more there is no single `R` with
+  `measure = floor(det * R * (1 + det * R^2) / 16)`.  The remaining
+  1-count residual is symmetric, so it is a quantisation rather than a
+  bias (#300).
 
   What the captures *do* establish, and what they rule out:
 
