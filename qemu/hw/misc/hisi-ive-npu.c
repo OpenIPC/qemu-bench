@@ -104,6 +104,7 @@ enum {
     OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
     OP_CCL = 21, OP_LBP = 23, OP_NORM_GRAD = 24, OP_SAD = 27, OP_RESIZE = 29,
     OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_LK = 28,
+    OP_ST_EIGEN = 25,
     OP_GMM2 = 30,
     OP_ACC = 32,
     OP_IMAGE_DOT = 33,
@@ -936,6 +937,28 @@ static bool op_resize(const uint8_t *t)
 }
 
 /*
+ * ST_BOX_FLT_AND_EIGEN (op 25), the one step of ss_mpi_ive_st_cand_corner
+ * that is not plain: +80 is norm_grad's interleaved S8 pair (its stride at
+ * +112 counts both components), +96 the U16 measure (+120) and +104 that
+ * picture's maximum, which 16bit_to_8bit then scales 255 / maximum by.
+ */
+static void op_st_box_flt_and_eigen(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *grad = task_img(t, 80, 112, w, h, 2);
+    g_autofree uint16_t *dst = g_new0(uint16_t, w * h);
+    uint16_t max = 0, le;
+
+    ive_st_eigen((const int8_t *)grad, w, h, dst, &max);
+    for (uint32_t i = 0; i < w * h; i++) {
+        dst[i] = cpu_to_le16(dst[i]);
+    }
+    task_put(t, 96, 120, dst, w, h, 2);
+    le = cpu_to_le16(max);
+    dma_memory_write(&address_space_memory, task_addr(t, 104), &le, sizeof(le),
+                     MEMTXATTRS_UNSPECIFIED);
+}
+
+/*
  * CANNY_HYS_EDGE (ot_ive_canny_hys_edge_ctrl): the task has no source
  * picture.  The driver runs a mag_and_ang task first, into the ctrl's own
  * mem: the U16 magnitude, then the octant angle right after it.  This
@@ -1183,6 +1206,9 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
         break;
     case OP_MAG_AND_ANG:
         op_mag_and_ang(t, w, h);
+        break;
+    case OP_ST_EIGEN:
+        op_st_box_flt_and_eigen(t, w, h);
         break;
     case OP_CANNY:
         op_canny_hys_edge(t, w, h);
