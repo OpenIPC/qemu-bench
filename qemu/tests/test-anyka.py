@@ -520,6 +520,15 @@ def test_av100(qemu, tmp):
                   qt.readl(LOAD), code[0])
             check('%s: 0x600 header in front of U-Boot (TEXT_BASE)' % machine,
                   qt.readl(LOAD - 0x600 + 4), 0x4B594E41)
+            # DDR size is the one difference between the two: the last word
+            # of RAM holds a value, the word past it does not.
+            end = 0x80000000 + (ram << 20)
+            qt.writel(end - 4, 0x5AA5C33C)
+            check('%s: RAM up to %d MiB' % (machine, ram),
+                  qt.readl(end - 4), 0x5AA5C33C)
+            qt.writel(end, 0x5AA5C33C)
+            check('%s: no RAM past %d MiB' % (machine, ram),
+                  qt.readl(end) != 0x5AA5C33C, True)
             # eFuse read: bit 31 start/busy, cleared when done (the AV100's
             # ak_efuse.ko polls SYSCTRL + 0x8C the way the EV330 reader does).
             qt.writel(SYSCTRL + 0x8C, (1 << 31) | (1 << 21))

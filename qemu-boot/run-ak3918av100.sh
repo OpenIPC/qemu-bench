@@ -14,6 +14,8 @@
 # Serial goes to the terminal and /tmp/ak3918av100_serial.log.  Boot a
 # copy: erases and programs are written back to the image.
 #
+set -o pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 QEMU="$REPO_ROOT/qemu-src/build/qemu-system-arm"
@@ -26,7 +28,7 @@ if [ ! -f "$FLASH_FILE" ]; then
     exit 1
 fi
 
-exec "$QEMU" -M "$MACHINE,flash-file=$FLASH_FILE" \
+"$QEMU" -M "$MACHINE,flash-file=$FLASH_FILE" \
     -nographic -serial mon:stdio \
     -nic user,restrict=on \
     -d unimp,guest_errors \
