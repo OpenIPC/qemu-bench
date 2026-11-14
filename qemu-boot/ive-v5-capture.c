@@ -575,21 +575,33 @@ static void cap_st_recip(void)
     td_u32 stride = sample_common_ive_calc_stride(RP_W, OT_IVE_ALIGN);
     char n[64];
 
-    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, RP_W, RP_H) ||
-        mk(&cand, OT_SVP_IMG_TYPE_U8C1, RP_W, RP_H)) {
+    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, RP_W, RP_H)) {
+        return;
+    }
+    if (mk(&cand, OT_SVP_IMG_TYPE_U8C1, RP_W, RP_H)) {
+        freeimg(&src);
         return;
     }
     if (mkmem(&c.mem, sizeof(td_u32) * stride * RP_H +
                       sizeof(ot_ive_st_max_eig_val))) {
+        freeimg(&src);
+        freeimg(&cand);
         return;
     }
     c.quality_level = 25;
     for (td_u32 p = 0; p < sizeof(g_recip) / sizeof(g_recip[0]); p++) {
         td_u32 tr = g_recip[p].trace;
+        td_s32 ret;
 
         fill_recip_probe(&src, &g_recip[p]);
         snprintf(n, sizeof(n), "strec_tr%u_cand_corner", tr);
-        if (done(n, ss_mpi_ive_st_cand_corner(&h, &src, &cand, &c, TD_TRUE), h)) {
+        /*
+         * in its own statement: the handle is written through &h by the call
+         * and read again by done(), and the order of a call's arguments is
+         * unspecified
+         */
+        ret = ss_mpi_ive_st_cand_corner(&h, &src, &cand, &c, TD_TRUE);
+        if (done(n, ret, h)) {
             continue;
         }
         snprintf(n, sizeof(n), "strec_tr%u_src", tr);
