@@ -1061,6 +1061,14 @@ static const HisiSoCConfig hi3516cv500_soc = {
     .extra_cmdline      = "mmz_allocator=hisi "
                           "mmz=anonymous,0,0x82000000,96M",
     .max_cpus           = 2,
+    /* Dual Cortex-A7.  Two CPUs by default, not for the second core's sake:
+     * with one CPU interface the GICv2 reads ITARGETSR as zero, the kernel's
+     * gic_get_cpumask() finds no mask ("GIC CPU mask not found - kernel will
+     * fail to boot") and every SPI targets no CPU.  The vendor 4.9 kernel
+     * gets by; the OpenIPC neo kernel (mainline 7.0) goes idle for good
+     * during the driver initcalls, its last word the console handover.
+     * The same trap as gk7202v330. */
+    .default_cpus       = 2,
 
     .ram_base           = 0x80000000,
     .sram_base          = 0x04010000,
@@ -1182,6 +1190,7 @@ static const HisiSoCConfig hi3516av300_soc = {
     .extra_cmdline      = "mmz_allocator=hisi "
                           "mmz=anonymous,0,0x82000000,96M",
     .max_cpus           = 2,
+    .default_cpus       = 2,            /* GIC CPU mask: see hi3516cv500 */
 
     .ram_base           = 0x80000000,
     .sram_base          = 0x04010000,
@@ -1310,6 +1319,7 @@ static const HisiSoCConfig hi3516dv300_soc = {
     .extra_cmdline      = "mmz_allocator=hisi "
                           "mmz=anonymous,0,0x82000000,96M",
     .max_cpus           = 2,
+    .default_cpus       = 2,            /* GIC CPU mask: see hi3516cv500 */
 
     .ram_base           = 0x80000000,
     .sram_base          = 0x04010000,
