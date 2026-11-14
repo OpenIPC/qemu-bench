@@ -228,4 +228,12 @@ int ive_lk_track(const IveLkLevel *prev, const IveLkLevel *next, int levels,
 void ive_st_eigen(const int8_t *grad, uint32_t w, uint32_t h, uint16_t *out,
                   uint16_t *max_out);
 
+/*
+ * CANDIDATE_CORNER: `(a == b && a > 0) ? a : 0`, the non-maximum
+ * suppression st_cand_corner ends with -- `a` the thresholded measure,
+ * `b` its 3x3 maximum.
+ */
+void ive_cand_corner(const uint8_t *a, const uint8_t *b, uint8_t *out,
+                     size_t n);
+
 #endif

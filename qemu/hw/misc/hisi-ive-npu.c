@@ -104,7 +104,7 @@ enum {
     OP_ORD_STAT = 16, OP_MAP = 17, OP_ADD = 18, OP_XOR = 19, OP_NCC = 20,
     OP_CCL = 21, OP_LBP = 23, OP_NORM_GRAD = 24, OP_SAD = 27, OP_RESIZE = 29,
     OP_CSC = 2, OP_MAG_AND_ANG = 4, OP_CANNY = 22, OP_LK = 28,
-    OP_ST_EIGEN = 25,
+    OP_ST_EIGEN = 25, OP_CAND_CORNER = 26,
     OP_GMM2 = 30,
     OP_ACC = 32,
     OP_IMAGE_DOT = 33,
@@ -940,7 +940,21 @@ static bool op_resize(const uint8_t *t)
  * ST_BOX_FLT_AND_EIGEN (op 25), the one step of ss_mpi_ive_st_cand_corner
  * that is not plain: +80 is norm_grad's interleaved S8 pair (its stride at
  * +112 counts both components), +96 the U16 measure (+120) and +104 that
- * picture's maximum, which 16bit_to_8bit then scales 255 / maximum by.
+ * picture's maximum.
+ *
+ * The maximum is what the next step scales by, and nothing in the task says
+ * so: it is the driver that closes the loop.  A task's +300 is an "ext work"
+ * code, and 36 means this one (ive_int_ext_work, mod_ive.o 0x858).  The
+ * driver pushes only the tasks up to and including it, maps the maximum's
+ * word nocache (its address kept in the task at +308), and on the finish
+ * interrupt computes 16bit_to_8bit's Q16 ratio from it --
+ * min(0xffff, (255 << 16 | max / 2) / max), or 0 for a flat picture -- writes
+ * that into the *following* task's +308, and only then pushes the rest.  So
+ * the scale is 255 / maximum, clamped at 1.0: a picture whose measure peaks
+ * at 255 or less is not stretched, and with quality_level above that peak it
+ * yields no candidates at all.  Modelling this needs nothing here beyond
+ * writing the maximum where the driver will look for it, and running a push
+ * no further than the tasks it was given.
  */
 static void op_st_box_flt_and_eigen(const uint8_t *t, uint32_t w, uint32_t h)
 {
@@ -956,6 +970,20 @@ static void op_st_box_flt_and_eigen(const uint8_t *t, uint32_t w, uint32_t h)
     le = cpu_to_le16(max);
     dma_memory_write(&address_space_memory, task_addr(t, 104), &le, sizeof(le),
                      MEMTXATTRS_UNSPECIFIED);
+}
+
+/*
+ * CANDIDATE_CORNER (op 26), the step st_cand_corner ends with: the same
+ * two-source layout as the element-wise ops -- +80 the thresholded measure
+ * (+112), +88 its 3x3 maximum (+116), +104 the destination (+124).
+ */
+static void op_candidate_corner(const uint8_t *t, uint32_t w, uint32_t h)
+{
+    g_autofree uint8_t *a = task_img(t, 80, 112, w, h, 1);
+    g_autofree uint8_t *b = task_img(t, 88, 116, w, h, 1);
+
+    ive_cand_corner(a, b, a, w * h);
+    task_put(t, 104, 124, a, w, h, 1);
 }
 
 /*
@@ -1209,6 +1237,9 @@ static void npu_run_task(HisiIveNpuState *s, const uint8_t *t)
         break;
     case OP_ST_EIGEN:
         op_st_box_flt_and_eigen(t, w, h);
+        break;
+    case OP_CAND_CORNER:
+        op_candidate_corner(t, w, h);
         break;
     case OP_CANNY:
         op_canny_hys_edge(t, w, h);

@@ -426,19 +426,47 @@ binary under QEMU and compares file by file):
   point is ever rejected, so that scale is plausible rather than
   measured.
 
-All 33 ops are modelled. The last two to arrive were
+All 34 ops are modelled. The last two to arrive were
 st_box_flt_and_eigen and candidate_corner:
 
 - **st_cand_corner is a sequence**, not one op: norm_grad (norm 3, both
   gradients interleaved as S8C2) into the ctrl's mem, then
   st_box_flt_and_eigen (op 25) over those gradients, writing a U16 map
   of the corner measure and, right after it, that map's maximum; then
-  16bit_to_8bit with the ratio 255 / maximum, a threshold at
-  `quality_level`, a 3x3 maximum filter (ord_stat_filter), and finally
-  candidate_corner (op 26). **Op 26 is `(a == b && a > 0) ? a : 0`** of
-  the thresholded map and its maximum filter -- plain non-maximum
-  suppression -- which reproduces the captured candidate picture
-  exactly. **Op 25 is**
+  16bit_to_8bit, a threshold at `quality_level`, a 3x3 maximum filter
+  (ord_stat_filter), and finally candidate_corner (op 26). **Op 26 is
+  `(a == b && a > 0) ? a : 0`** of the thresholded map and its maximum
+  filter -- plain non-maximum suppression -- which reproduces the
+  captured candidate picture exactly.
+
+  **The 16bit_to_8bit step is the sequence's hinge, and the driver, not
+  the engine, sets it up.** A task's +300 is an *ext work* code naming
+  what the driver must do when the task finishes; 36 is op 25's
+  (`ive_int_ext_work`, `mod_ive.o` 0x858). So the driver pushes only the
+  tasks up to and including op 25 -- the push helper stops counting at
+  the first one with an ext-work code -- having mapped the maximum's word
+  nocache and kept that pointer in the task at +308. On the finish
+  interrupt it reads the maximum and computes 16bit_to_8bit's Q16 ratio,
+  the same `(num << 16 | den / 2) / den` clamped to `0xffff` that
+  `ive_fill_npu_16bit_to_8bit_task` computes, but with `num` 255 and
+  `den` the maximum; it writes that into the *following* task's +308 and
+  pushes the remaining four. (Ext work 35 is the other one: it builds
+  equalize_hist's cumulative table and rewrites the next task's op code
+  to 17.)
+
+  So the scale is **255 / maximum, clamped at 1.0**, and the clamp is
+  what decides whether a picture has any corners: a measure peaking at
+  255 or less is passed through unstretched, so with `quality_level`
+  above that peak nothing survives the threshold. On the CV608 that is
+  six of the twelve captured pictures -- maxima 1, 1, 5, 7, 12 and 19
+  against a `quality_level` of 25 -- and every one of them gives an empty
+  candidate map. Taking the board's own eigen maps as the input, this
+  rule reproduces all twelve candidate pictures **to the pixel**, which
+  leaves op 25's own last count (below) as the sequence's only residual.
+  Scaling by a plain 255 / maximum instead invents corners in those six;
+  scaling by 1 instead over-produces in the other six.
+
+  **Op 25 is**
 
       t1 = det // (16 * trace)
       measure = t1 + 16 * t1^2 // trace
@@ -540,9 +568,22 @@ then 254 regions of area (u32) and left, right, top, bottom (u16).
 
 - `qemu/tests/test-hisi-ive-npu.py` (CI): register level, one ring of
   every modelled op.
-The LK and Shi-Tomasi files in the capture's reference set therefore
-differ by design: LK's by up to 4 Q7 units, and op 25's on 7.5% of
-pixels -- by one count on 5.5% of them and by two on the remaining 2%.
+Of the 343 files in the capture's reference set, 246 come out of QEMU
+byte-identical and 97 do not. What differs, measured against a CV608 on
+2026-11-14 (the board itself reproduces the stored set exactly, all 343
+files):
+
+- 48 LK files, by design: that op is modelled to a tolerance, within
+  0.03 pixels, so its flow and error words differ by up to 4 Q7 units.
+- 18 Shi-Tomasi eigen maps (`st_s*_eig`, `strec_tr*_eig`), op 25's own
+  residual (#300): 7.5% of pixels, by one count on 5.5% of them and by
+  two on the remaining 2%. One `max_eig` follows from it, and so do
+  four candidate maps -- but only just: 3, 4, 10 and 31 pixels of 4096,
+  and the six pictures whose measure peaks below `quality_level` come
+  out empty on both sides, as the clamped ratio above says they must.
+- 29 canny_hys_edge files (#308), 2 to 21 pixels of 4096 on the edge
+  maps and more of the seed stack, which the thinning's raster order
+  amplifies. Not yet characterised.
 
 - `qemu-boot/ive-v5-capture.sh --sdk DIR --board HOST --qemu` (local,
   since the capture links the SDK's MPI libraries): every op through the
