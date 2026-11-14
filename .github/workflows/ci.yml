@@ -4,11 +4,66 @@ on:
   push:
     branches: [master]
   pull_request:
+  # The full suite, whatever changed: the backstop for anything the selector
+  # narrows wrongly.  Pushes and PRs run only what their paths reach.
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+# One run per PR: a new push cancels the run it supersedes (a PR run tests the
+# whole PR against its base, so nothing is lost).  Every other run gets a group
+# of its own: a master push tests only its own before..after, and GitHub
+# cancels a *pending* run when a third joins its group, which would leave that
+# push's changes untested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Which jobs can this change reach?  Nearly every change lands in one
+  # family, and every PR used to run all ~50 jobs (~150 runner-minutes; a
+  # README edit included).  .github/scripts/ci-select.py maps the changed
+  # paths to jobs; anything it does not recognise runs everything.
+  #
+  # The narrowing happens here, in a job that always runs, and never in a
+  # `paths:` filter on the trigger: a workflow filtered out does not run at
+  # all, and the required "CI Gate" check would stay pending forever.
+  select:
+    name: Select jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.pick.outputs.build }}
+      jobs: ${{ steps.pick.outputs.jobs }}
+      qtests: ${{ steps.pick.outputs.qtests }}
+      boot-matrix: ${{ steps.pick.outputs.boot-matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The PR merge commit and its base, for the diff.
+          fetch-depth: 2
+
+      # Fails the PR that makes the selector disagree with the tree (a job or
+      # a qtest it does not classify, a model built for a family it does not
+      # reach) rather than letting coverage fall out quietly.
+      - name: Check the selector still describes the tree
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y python3-yaml
+          python3 .github/scripts/ci-select.py --self-test
+
+      - name: Pick the jobs this change reaches
+        id: pick
+        run: python3 .github/scripts/ci-select.py
+
   build:
     name: Build QEMU
+    needs: select
+    if: needs.select.outputs.build == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_BASEDIR: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,10 +74,35 @@ jobs:
             build-essential ninja-build meson pkg-config \
             libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev libslirp-dev \
             python3 python3-venv git gcc-arm-linux-gnueabi libc6-dev-armel-cross \
-            python3-pil ffmpeg
+            python3-pil ffmpeg ccache
 
+      # The QEMU tree is the same v10.2.0 every run, so most objects come
+      # back from the cache.  Only master saves it: PR runs restore the
+      # newest master cache and leave the cache store alone.
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ hashFiles('qemu/setup.sh', 'qemu/patches/**') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ hashFiles('qemu/setup.sh', 'qemu/patches/**') }}-
+            ccache-
+
+      # /usr/lib/ccache holds cc/gcc wrappers; QEMU's configure picks up cc
+      # from PATH, so setup.sh needs no change.
       - name: Build QEMU
-        run: bash qemu/setup.sh
+        run: |
+          export PATH=/usr/lib/ccache:$PATH
+          ccache -z
+          bash qemu/setup.sh
+          ccache -s
+
+      - name: Save ccache
+        if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ hashFiles('qemu/setup.sh', 'qemu/patches/**') }}-${{ github.sha }}
 
       - name: Build IVE test initramfs
         run: |
@@ -81,24 +161,29 @@ jobs:
           done
 
       - name: SPI-NAND erase/program addressing (hisi-fmc)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-fmc-nand-erase.sh']
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
 
       - name: CPU1 release via CRG soft-reset (hisi-crg, -bios path)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-smp-release.sh']
         run: bash qemu/tests/test-hisi-smp-release.sh
 
       - name: V1 DDR needs the reg_info table (hisi-ddrc-v1, flash boot)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-v1-ddr-init.sh']
         run: bash qemu/tests/test-hisi-v1-ddr-init.sh
 
       # The Hantro H1 driven over qtest the way mainline Linux's
       # hantro_h1_jpeg_enc.c drives it; the JPEG must decode and match
       # libjpeg's encode of the same frame.
       - name: Hantro H1 JPEG encode (xm-h1)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-jpeg.py']
         run: python3 qemu/tests/test-xm-h1-jpeg.py
 
       # H.264 the way Hantro's library drives it: majestic's own SPS/PPS
       # ahead of the output, the header remainder in STR_HDR_REM; ffmpeg must
       # decode every frame.
       - name: Hantro H1 H.264 encode (xm-h1)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
         run: python3 qemu/tests/test-xm-h1-h264.py
 
       # HiSilicon V4 VEDU (H.264 / H.265) and JPGE, driven the way the
@@ -106,49 +191,58 @@ jobs:
       # ring, its H.265 slice header bits in the register image, its JFIF
       # header ahead of the scan.  ffmpeg must decode every picture.
       - name: HiSilicon VEDU + JPGE encode (hisi-vedu)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-vedu.py']
         run: python3 qemu/tests/test-hisi-vedu.py
 
       # The same pictures through the V5 (Hi3516CV610) front end: image
       # address and START moved, two register sets queued, statistics
       # written back for rate control, JPGE through an image.
       - name: HiSilicon V5 VEDU + JPGE encode (hisi-vedu gen 5)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-vedu.py']
         run: python3 qemu/tests/test-hisi-vedu.py --gen 5
 
       # VI offline into node-driven VPSS (a sensor wider than 2304): both
       # strips of a picture painted, linear and compressed; no pipe
       # interrupt after a stop; online again after an offline run.
       - name: HiSilicon VI offline + VPSS node list (hisi-vi, hisi-vpss)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-vpss.py']
         run: python3 qemu/tests/test-hisi-vpss.py
 
       # V5 online: VI's derived status, VI_PROC behind its mask, VPSS's V5
       # channel registers, the CRG's reset handshake
       - name: HiSilicon V5 VI + VPSS online (hisi-vi / hisi-vpss gen 5)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-vpss.py']
         run: python3 qemu/tests/test-hisi-vpss.py --gen 5
 
       # V5 statistics: the moved buffer pointers, 32 x 32 AE zones, each
       # frame written to the addresses latched at its start
       - name: HiSilicon V5 ISP statistics (hisi-vi gen 5)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-isp.py']
         run: python3 qemu/tests/test-hisi-isp.py --gen 5
 
       # V5 IVE: ops as tasks on the SVP NPU's scheduler, a ring that links
       # its tasks, the finish on IVE's interrupt group, the ops' outputs
       - name: HiSilicon V5 IVE (hisi-ive-npu)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-ive-npu.py']
         run: python3 qemu/tests/test-hisi-ive-npu.py
 
       # The ISP statistics hisi-vi writes (front-end and backend AE
       # histograms, AE / AWB zones, globals) in the driver's STT layouts,
       # and the front-end interrupt the ISP's per-frame work runs from.
       - name: HiSilicon ISP statistics (hisi-vi)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-isp.py']
         run: python3 qemu/tests/test-hisi-isp.py
 
       # The sensor's timing (sensor-sync): writes latch at frame start,
       # group hold, frame rate from HTS x VTS / pclk, datasheet violations.
       - name: HiSilicon sensor timing (hisi-smartsens, sensor-sync)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-sensor.py']
         run: python3 qemu/tests/test-hisi-sensor.py
 
       # ...and with the Baseline (CAVLC) SPS/PPS Sofia's library writes for
       # the second-generation XM535's H.264 substream.
       - name: Hantro H1 H.264 encode, Baseline (xm-h1)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
         run: python3 qemu/tests/test-xm-h1-h264.py --baseline --machine xm535
 
       # The second generation's HEVC engines (XM535, XM533, XM530V200
@@ -156,24 +250,29 @@ jobs:
       # skip blocks against the previous job's reconstruction; ffmpeg
       # decodes the dump-dir stream.
       - name: HEVC engines (xm-hevc)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-hevc.py']
         run: python3 qemu/tests/test-xm-hevc.py
 
       # The XM530 pad controller as the gpio-xm530 kernel driver and the
       # vendor ISP drive it: output levels, input lines, mux bits kept.
       - name: XM530 pad GPIO (xm-gpio)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-gpio.py']
         run: python3 qemu/tests/test-xm-gpio.py
 
       # XM510's banked GPIO: data/output enable per port, muxed pins idle.
       - name: XM510 GPIO (xm510-gpio)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm510-gpio.py']
         run: python3 qemu/tests/test-xm510-gpio.py
 
       # The XM510/XM530 watchdog: SP805 identity, so Linux's sp805_wdt
       # binds; fed it stays armed, unfed it resets the machine.
       - name: XM SP805 watchdog (arm-sp805)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-sp805.py']
         run: python3 qemu/tests/test-xm-sp805.py
 
       # sensor=/sensor-addr= and the generic xm-sensor, through xm-i2c.
       - name: XM sensor selection (xm-sensor)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-sensor.py']
         run: python3 qemu/tests/test-xm-sensor.py
 
       # The GK710x models driven over qtest at the silicon addresses the
@@ -181,18 +280,21 @@ jobs:
       # write-back, timer edge into the VIC, I2C to a sensor, watchdog.
       # Boot tests need the vendor HAL, which is not redistributable.
       - name: Goke GK710x devices (gk-sflash, gk-vic, gk-idc, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-gk710x.py']
         run: python3 qemu/tests/test-gk710x.py
 
       # The GK7102S / GK7102C machine: the same models in the S register
       # layouts the vendor drivers use directly (gk-remap), its boot
       # header, and the DMA controller the GK7102C U-Boot checks.
       - name: Goke GK710xS devices (gk-remap, gk-dma)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-gk710xs.py']
         run: python3 qemu/tests/test-gk710xs.py
 
       # SDHCI write-protect polarity per kernel driver: the sdhci-hisi,
       # -goke, -xmedia and -lotus drivers invert it, nebula does not.
       # Wrong, and every SD card in the guest mounts read-only (#209).
       - name: HiSilicon/Goke SDHCI write-protect polarity
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-sdhci-wp.sh']
         run: bash qemu/tests/test-hisi-sdhci-wp.sh
 
       # The Ambarella S3L models driven over qtest the way the vendor kernel
@@ -201,6 +303,7 @@ jobs:
       # made-up images.  The boot test needs a kernel build:
       # qemu-boot/test-s3l-boot.sh.
       - name: Ambarella S3L devices (amb-vic, amb-timer, amb-rct, amb-gpio, amb-idc, amb-nand)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-ambarella.py']
         run: python3 qemu/tests/test-ambarella.py
 
       # The Anyka AK39xx models driven over qtest the way the vendor drivers
@@ -210,6 +313,7 @@ jobs:
       # PHY and 24-byte descriptor ring, an empty SD slot.  Boot tests
       # need camera dumps, which are vendor firmware.
       - name: Anyka AK39xx devices (ak-sysctrl, ak-l2, ak-spi, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-anyka.py']
         run: python3 qemu/tests/test-anyka.py
 
       # The SigmaStar infinity2m models driven over qtest the way the vendor
@@ -220,6 +324,7 @@ jobs:
       # through the halves with a USB keyboard, AHCI with a disk, GE and
       # vsync.  Boot tests need an NVR flash dump, which is vendor firmware.
       - name: SigmaStar infinity2m devices (sstar-fsp, sstar-emac, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-sigmastar.py']
         run: python3 qemu/tests/test-sigmastar.py
 
       # The Novatek NT9856x models driven over qtest the way the vendor
@@ -228,6 +333,7 @@ jobs:
       # GPIO pads and both interrupt kinds, the RTC's CSET handshake and its
       # power-off-with-alarm reboot, and the device tree the machine builds.
       - name: Novatek NT9856x devices (nvt-top, nvt-cg, nvt-rtc, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-novatek.py']
         run: python3 qemu/tests/test-novatek.py
 
       # The V3s and V851s machines and the Allwinner models they share with
@@ -238,6 +344,7 @@ jobs:
       # a watchdog that MODE rewrites do not hold off. Boot tests need the
       # images OpenIPC/u-boot's build-allwinner.yml smoke-tests.
       - name: Allwinner V3s/V851s machines (aw-ccu, aw-dramcom, aw-wdt, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-allwinner-cam.py']
         run: python3 qemu/tests/test-allwinner-cam.py
 
       # The Fullhan models driven over qtest the way the vendor U-Boots and
@@ -248,6 +355,7 @@ jobs:
       # GMAC's PHY, and the FH865x GIC.  Booting the camera dumps needs
       # vendor firmware; the OpenIPC releases boot in boot-fullhan.
       - name: Fullhan devices (fh-spi, fh-axi-dmac, fh-ahb-dmac, fh-rtc, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-fullhan.py']
         run: python3 qemu/tests/test-fullhan.py
 
       # The Grain Media models driven over qtest the way nsboot, the vendor
@@ -262,6 +370,7 @@ jobs:
       # Booting the camera dumps needs vendor firmware; the OpenIPC
       # releases boot in boot-grainmedia.
       - name: Grain Media devices (gm-spi020, gm-dmac, gm-intc, gm-timer, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-grainmedia.py']
         run: python3 qemu/tests/test-grainmedia.py
 
       # Ingenic: the mask ROM stand-in and cache-as-RAM, CPM PLL/divider
@@ -271,6 +380,7 @@ jobs:
       # v2 command table through a descriptor, GPIO, I2C, RTC, EFUSE,
       # and migration of t31 and t41.
       - name: Ingenic devices (ingenic-cpm, ingenic-sfc, ingenic-ost, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-ingenic.py']
         run: python3 qemu/tests/test-ingenic.py
 
       - name: Upload QEMU binary
@@ -296,7 +406,8 @@ jobs:
 
   ive-test:
     name: IVE register tests (19 ops)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['ive-test']
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -357,7 +468,8 @@ jobs:
 
   venc-hisilicon:
     name: VENC on ${{ matrix.soc }} (user frames${{ matrix.majestic && ', majestic' || '' }})
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['venc-hisilicon']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -497,7 +609,8 @@ jobs:
 
   sofia-isp:
     name: Sofia ISP regression (hi3516ev200, sc2315e)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['sofia-isp']
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -546,7 +659,8 @@ jobs:
 
   maskrom-av300:
     name: AV300 mask-ROM end-to-end (-bios re.elf)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['maskrom-av300']
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -750,200 +864,14 @@ jobs:
 
   boot:
     name: Boot ${{ matrix.name }}
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # mem/kernel_mem_mb/MMZ layout now lives in HisiSoCConfig; no -m
-          # override here so CI exercises the same defaults as the run
-          # scripts and real users.
-          - name: hi3516cv100
-            soc: hi3516cv100
-            machine: hi3516cv100
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3516cv100-universal.bin
-
-          - name: hi3516cv200
-            soc: hi3516cv200
-            machine: hi3516cv200
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3516cv200-universal.bin
-            flash_mem: 256M
-
-          - name: hi3516av100
-            soc: hi3516av100
-            machine: hi3516av100
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3516av100-universal.bin
-
-          - name: hi3516cv300
-            soc: hi3516cv300
-            machine: hi3516cv300
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3516cv300-universal.bin
-            flash_mem: 256M
-
-          # The 1M sibling of cv300: same die and map, 64 MiB, SCSYSID0
-          # variant byte 4.
-          - name: hi3516ev100
-            soc: hi3516ev100
-            machine: hi3516ev100
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3516ev100-universal.bin
-
-          # cv500 family covers av300 (same die, av300 is variant id 5);
-          # one Linux + U-Boot gate exercises both.  flash_mem=1G because
-          # the OpenIPC cv500 U-Boot is built assuming the platform-max
-          # 1 GiB DDR and relocates itself to top-of-RAM (~0xBFEE2000).
-          # The default 128 MiB ram_size leaves that target unmapped,
-          # the relocation jump faults, and the CPU resets in a loop.
-          - name: hi3516cv500
-            soc: hi3516cv500
-            machine: hi3516cv500
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            # Dual Cortex-A7: CPU1 released through CRG REG_CPU_SRST_CRG (#34)
-            smp: 2
-            ping_linux: true
-            uboot_bin: u-boot-hi3516cv500-universal.bin
-            flash_mem: 1G
-
-          - name: hi3519v101
-            soc: hi3519v101
-            machine: hi3519v101
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3519v101-universal.bin
-
-          - name: hi3516ev300
-            soc: hi3516ev300
-            # sensor=none skips the SoC-default IMX335 attach so OpenIPC's
-            # /usr/sbin/load_hisilicon does not insmod the vendor MPP blob
-            # (which segfaults on QEMU and prevents reaching login).
-            machine: hi3516ev300,sensor=none
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            uboot_bin: u-boot-hi3516ev300-universal.bin
-            flash_mem: 128M
-            # Exercise the HiFMC NOR erase+program path from Linux userspace
-            # (flash_eraseall + flashcp -v). Guards the erase-address/WEL fix
-            # that OpenIPC firstboot & sysupgrade depend on. ev300 stands in
-            # for all hisi-fmc SoCs (the fix is in shared hisi-fmc.c).
-            flash_rw: true
-
-          # gk7205v500 (Goke V500) full-Linux boot regression gate.
-          # The goke V500 OpenIPC kernel uses an "xmsp804" timer
-          # (4 single-timer blocks at 0x100 stride, hisi-xmsp804.c);
-          # before the fix Linux hung at "Calibrating delay loop" because
-          # the periodic timer IRQ at block1 (0x12000100, GIC SPI 27) was
-          # never delivered.  Plain console=ttyAMA0 (no earlycon) suffices
-          # once the timer IRQ works.  Stands in for the whole V500 family
-          # (gk7205v510/v530, gk7202v330 share the xmsp804 wiring).
-          - name: gk7205v500
-            soc: gk7205v500
-            machine: gk7205v500,sensor=none
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs"
-
-          # hi3516cv610 (V5) has its own boot-hi3516cv610 job below: its
-          # OpenIPC release is a combined firmware.bin (FIT kernel+dtb with an
-          # appended SquashFS) under the SoC-family name, so it needs an
-          # extraction step and doesn't fit this download/boot matrix.
-
-          # NVR/DVR family — OpenIPC ships nor-lite firmware (kernel +
-          # rootfs) and u-boot-${soc}-universal.bin for 3 SoCs:
-          # hi3520dv200, hi3536cv100, hi3536dv100.  Linux boot test runs
-          # for all three; all three also run the full U-Boot ping path
-          # (parallel to hi3516av100, openhisilicon#59 / #74).  See the
-          # per-SoC notes in qemu/hw/arm/hisilicon.c for which Ethernet
-          # controller each instantiates (hieth-sf, femac, gmac).
-          - name: hi3520dv200
-            soc: hi3520dv200
-            machine: hi3520dv200
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
-            ping_linux: true
-            uboot_bin: u-boot-hi3520dv200-universal.bin
-
-          - name: hi3536cv100
-            soc: hi3536cv100
-            machine: hi3536cv100
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
-            uboot_bin: u-boot-hi3536cv100-universal.bin
-
-          - name: hi3536dv100
-            soc: hi3536dv100
-            machine: hi3536dv100
-            append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
-            ping_linux: true
-            uboot_bin: u-boot-hi3536dv100-universal.bin
-
-          # Xiongmai XM510 (hw/arm/xiongmai.c): the vendor 3.0.101 kernel on a
-          # PL190 VIC, SP804, xmsfc NOR and the xmmac DWMAC 10/100.  No
-          # uboot_bin -- OpenIPC publishes no XM U-Boot.  flash_rw runs the
-          # xmsfc erase/program path on an 8 MiB NOR, the only size the
-          # XM510 kernel's chip table knows.
-          # mem= first, as U-Boot passes it: load_xiongmai sizes MMZ from the
-          # first argument, and without it lays MMZ over the whole kernel.
-          # Since the media blocks are modelled, VI and the H1 really write
-          # those buffers, and the guest dies or corrupts its overlay.
-          # mem=20M rather than the board's 18M: the -initrd boot needs it
-          # (QEMU loads the initrd at 16 MiB, half of RAM), and at 18M
-          # `sysupgrade --archive` refuses on silicon too, with no room in
-          # /tmp to unpack it.  test-xm-stream.sh runs the board's 18M.
-          - name: xm510
-            soc: xm510
-            machine: xm510
-            append: "mem=20M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            flash_rw: true
-            flash_rw_mem: 32M
-            mtd_name: xm_sfc
-            flash_mb: 8
-            cmdline_prefix: "mem=20M"
-            # sysupgrade, firstboot and the firmware#2613 overlay case, on the
-            # 32 MB board where sysupgrade's RAM phase is tightest.
-            flash_tests: true
-            overlay_keep: true
-            # Last xm510 kernel without jffs2 xattrs (before firmware#2606).
-            overlay_keep_kernel: nightly-20261015-1d9c834
-            stream_test: true
-
-          # Xiongmai XM530 (hw/arm/xiongmai.c): dual Cortex-A5 MPCore (A9
-          # stand-in, GIC, TWD, PL310), xmsfc v2, DWMAC at 0x10010000.  CPU1
-          # comes up through REG_SC_REMAP + REG_CPU1_SOFT_RST as on silicon.
-          #
-          # The flash tests put mem= FIRST (cmdline_prefix), as OpenIPC's
-          # U-Boot passes it: load_xiongmai sizes MMZ from the first
-          # argument, and without it lays MMZ over all of RAM, majestic
-          # Oopses in mmz, never stops the xm_wdt the same script started,
-          # and the guest resets a minute later.  Not on the -initrd boot
-          # above: QEMU loads the initrd high in RAM, past a mem=32M kernel.
-          - name: xm530
-            soc: xm530
-            machine: xm530
-            smp: 2
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
-            ping_linux: true
-            flash_rw: true
-            flash_rw_mem: 64M
-            mtd_name: xm_sfc
-            flash_mb: 8
-            cmdline_prefix: "mem=32M"
-            flash_tests: true
-            stream_test: true
-
-          # XM550 is the XM530 die with 128 MB; OpenIPC ships it the xm530
-          # image, so this boots that bundle on the 128 MB machine.
-          - name: xm550
-            soc: xm530
-            machine: xm550
-            smp: 2
-            append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+        # The rows are in .github/ci/boot-matrix.yml, narrowed by select.
+        include: ${{ fromJSON(needs.select.outputs.boot-matrix) }}
 
     continue-on-error: ${{ matrix.allow_failure == true }}
 
@@ -1433,7 +1361,8 @@ jobs:
   # has none; flash boot is not modelled yet.
   boot-novatek:
     name: Boot ${{ matrix.soc }}
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-novatek']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1501,7 +1430,8 @@ jobs:
   # carries tun as a module; cv200 has it built in (OpenIPC/firmware#2844).
   vtund-neo:
     name: vtund tunnel ${{ matrix.soc }} neo
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['vtund-neo']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1551,7 +1481,8 @@ jobs:
 
   boot-novatek-recovery:
     name: Novatek recovery ${{ matrix.soc }} (defib, mask ROM UART and Ethernet)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-novatek-recovery']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1589,7 +1520,8 @@ jobs:
 
   maskrom-na51089:
     name: NA51089 mask-ROM end-to-end (-bios re.elf, defib)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['maskrom-na51089']
     runs-on: ubuntu-24.04
     # it builds and runs another repository's code: no write token
     permissions:
@@ -1698,7 +1630,8 @@ jobs:
 
   boot-fullhan:
     name: Boot ${{ matrix.soc }}
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-fullhan']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1731,7 +1664,8 @@ jobs:
 
   boot-grainmedia:
     name: Boot ${{ matrix.soc }}
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-grainmedia']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1764,7 +1698,8 @@ jobs:
 
   boot-ingenic:
     name: Boot ${{ matrix.soc }} (${{ matrix.mode }})
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-ingenic']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1808,7 +1743,8 @@ jobs:
   # settings reach the ISP
   majestic-ingenic:
     name: majestic on t40 (day/night)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['majestic-ingenic']
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -1836,7 +1772,8 @@ jobs:
 
   boot-hi3516cv610:
     name: Boot hi3516cv610
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-hi3516cv610']
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -1947,7 +1884,8 @@ jobs:
 
   boot-hi3516ev300-nand:
     name: Boot hi3516ev300 (SPI-NAND / UBI)
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-hi3516ev300-nand']
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -2034,3 +1972,66 @@ jobs:
             boot-output.txt
             qemu-boot/qemu.log
           retention-days: 7
+
+  # The one required check.  Branch protection used to require 17 job names,
+  # and a job the selector skips never reports under its name, so narrowing
+  # needs a single check that always reports.
+  #
+  # A skipped job passes only when select did not ask for it: blanket-
+  # accepting `skipped` would let a selector bug that narrows a real change
+  # to nothing read as green.
+  ci-gate:
+    name: CI Gate
+    needs:
+      - select
+      - build
+      - ive-test
+      - venc-hisilicon
+      - sofia-isp
+      - maskrom-av300
+      - boot
+      - boot-novatek
+      - boot-novatek-recovery
+      - maskrom-na51089
+      - boot-fullhan
+      - boot-grainmedia
+      - boot-ingenic
+      - majestic-ingenic
+      - boot-hi3516cv610
+      - boot-hi3516ev300-nand
+      - vtund-neo
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every selected job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          WANT_JOBS: ${{ needs.select.outputs.jobs }}
+          WANT_BUILD: ${{ needs.select.outputs.build }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          if needs["select"]["result"] != "success":
+              sys.exit("select: %s" % needs["select"]["result"])
+          want = json.loads(os.environ["WANT_JOBS"] or "{}")
+          want["build"] = os.environ["WANT_BUILD"] == "true"
+          bad = []
+          for job, n in needs.items():
+              if job == "select":
+                  continue
+              if job not in want:
+                  bad.append("%s: not in select's output" % job)
+                  continue
+              r = n["result"]
+              ok = r == "success" if want[job] else r in ("skipped", "success")
+              print("%-24s wanted=%-5s %s" % (job, want[job], r))
+              if not ok:
+                  bad.append("%s: %s" % (job, r))
+          for job, wanted in want.items():
+              if wanted and job not in needs:
+                  bad.append("%s: selected, but ci-gate does not need it" % job)
+          if bad:
+              sys.exit("\n".join(bad))
+          PY
