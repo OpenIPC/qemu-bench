@@ -23,7 +23,10 @@
 #
 # Offsets are this firmware's (y291ga, dispatch read_mtd_conf / get_config);
 # the script checks them before writing.  Needs unsquashfs, mksquashfs and
-# arm-linux-gnueabihf-gcc.
+# an ARM cross compiler: CC_ARM, default arm-linux-gnueabihf-gcc.  The
+# y211ga's home SquashFS has less room: a static glibc ifrename leaves it
+# about 60 KiB too big, so build with a musl one there (the rootfs is musl,
+# ld-musl-armhf.so.1), e.g. CC_ARM=arm-linux-musleabihf-gcc.
 set -euo pipefail
 
 IN=${1:?usage: yi-v831-prepare.sh IN.bin OUT.bin [SSID [PSK]]}
@@ -34,7 +37,8 @@ PSK=${4:-qemuqemu}
 HOME_OFF=$((0x350000))
 HOME_SIZE=$((0x340000))
 
-for t in unsquashfs mksquashfs arm-linux-gnueabihf-gcc python3; do
+CC_ARM=${CC_ARM:-arm-linux-gnueabihf-gcc}
+for t in unsquashfs mksquashfs "$CC_ARM" python3; do
     command -v "$t" >/dev/null || { echo "need $t" >&2; exit 2; }
 done
 
@@ -99,7 +103,7 @@ int main(int argc, char **argv)
     return 0;
 }
 C
-arm-linux-gnueabihf-gcc -static -Os -s -o "$WORK/home/app/localbin/ifrename" \
+"$CC_ARM" -static -Os -s -o "$WORK/home/app/localbin/ifrename" \
     "$WORK/ifrename.c"
 
 # the SSID inside single quotes in the stand-in: ' becomes '\''
@@ -174,7 +178,7 @@ img = bytearray(open(sys.argv[1], 'rb').read())
 sq = open(sys.argv[2], 'rb').read()
 off, size = int(sys.argv[3]), int(sys.argv[4])
 if len(sq) > size:
-    sys.exit('new home SquashFS (%d bytes) does not fit %d' % (len(sq), size))
+    sys.exit('new home SquashFS (%d bytes) does not fit %d; try a musl CC_ARM' % (len(sq), size))
 img[off:off + size] = sq + b'\xff' * (size - len(sq))
 open(sys.argv[1], 'wb').write(img)
 print('home: %d of %d bytes' % (len(sq), size))

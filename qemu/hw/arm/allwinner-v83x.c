@@ -459,6 +459,14 @@ static void aw_v83x_common_init(MachineState *machine, const AwSoCConfig *c)
              * vind DT and gc2053_mipi.c): ID 0x2053 at 0xF0/0xF1.
              */
             image_sensor_create(I2C_BUS(qdev_get_child_bus(twi, "i2c")), "gc2053");
+            /*
+             * The y211ga's sensor, an SP2305 at 0x3C on the same bus
+             * (sp2305_mipi_y211_y291): 8-bit registers, page select at
+             * 0xFD.  Its driver reads no ID, so the stub only has to
+             * answer.  One dump uses one of the two addresses.
+             */
+            i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(twi, "i2c")),
+                                    "hisi-sp2305", 0x3c);
         }
         sysbus_create_simple("aw-twi", base + 0x200,
                              qdev_get_gpio_in(orgate, 1));
