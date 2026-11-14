@@ -148,7 +148,7 @@ timeout "$TIMEOUT" "$QEMU" -M "$MACHINE,flash-file=$WORK/flash.bin" -smp 2 \
     -device atbm-wifi,bus=usb-bus.0,port=1,netdev=w,ssid=OpenIPC,psk=$PSK,trace=on \
     -append "mem=$MEM console=ttyAMA0,115200 root=/dev/mtdblock3 rootfstype=squashfs init=/init mtdparts=$MTD" \
     -display none -monitor none -serial "file:$WORK/console.log" \
-    -d guest_errors -D "$WORK/qemu.log" &
+    -d guest_errors -D "$WORK/qemu.log" < /dev/null &
 QPID=$!
 for _ in $(seq "$TIMEOUT"); do
     grep -aq 'QEMU-WIFI: done' "$WORK/console.log" 2>/dev/null && break
@@ -164,7 +164,9 @@ fail=0
 pass() { echo "  PASS: $1"; }
 bad() { echo "  FAIL: $1"; fail=1; }
 echo "$SOC on -M $MACHINE, atbm-wifi${WLANDEV:+, wlandev=$WLANDEV}:"
-grep -a 'not found in modules.dep' "$C" | sort -u | sed 's/^/    /'
+# what the profile could not load; none on a good image, and an empty grep
+# must not end the script under errexit / pipefail
+grep -a 'not found in modules.dep' "$C" | sort -u | sed 's/^/    /' || true
 grep -aq 'QEMU-WIFI: done' "$C" && pass "the report ran" || bad "no report"
 grep -aq 'QEMU-WIFI: usb 007a:8888' "$C" && pass "the dongle enumerated" ||
     bad "no 007a:8888 on the USB bus"
@@ -180,6 +182,10 @@ if [ -n "$WLANDEV" ]; then
 else
     grep -aq 'QEMU-WIFI: modprobe dwc_otg ok' "$C" && pass "modprobe dwc_otg" ||
         bad "modprobe dwc_otg"
+    # the dongle is plugged in by QEMU whatever the pad does, so its power
+    # module has to be checked on its own
+    grep -aq 'QEMU-WIFI: modprobe wifi_pdn ok' "$C" &&
+        pass "modprobe wifi_pdn value=96" || bad "modprobe wifi_pdn value=96"
 fi
 grep -aqiE 'Oops|Unable to handle|BUG:' "$C" && bad "a kernel oops" || true
 exit $fail
