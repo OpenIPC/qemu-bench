@@ -149,7 +149,10 @@ wait $QPID 2>/dev/null || true
 echo "$SOC, $MODE boot:"
 if [ "$MODE" = flash ]; then
     check "SPL" 'U-Boot SPL'
-    check "U-Boot boots the kernel" 'Starting kernel'
+    # "Starting kernel" from the vendor U-Boot 2013.07, "Uncompressing
+    # Kernel Image" from mainline (OpenIPC/u-boot openipc-ingenic)
+    check "U-Boot boots the kernel" \
+        'Starting kernel\|Uncompressing Kernel Image'
 fi
 check "kernel up" 'Linux version'
 check "root from the NOR" 'VFS: Mounted root (squashfs'
