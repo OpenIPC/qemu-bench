@@ -498,9 +498,15 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(sysctrl, irq[n]));
     }
-    /* MCI0 (the SD slot, -drive if=sd) and MCI1 (SDIO Wi-Fi, empty). */
+    /*
+     * The SD slot (-drive if=sd) and an empty SDIO Wi-Fi controller: the
+     * slot is MCI0 on the older parts, MCI1 on the EV300L and AV100, whose
+     * vendor device trees put the TF card on mmc1 (0x20108000, pads 31-36,
+     * power on GPIO 50) and leave MCI0 to SDIO.
+     */
     for (n = 0; n < 2; n++) {
-        DriveInfo *di = n ? NULL : drive_get(IF_SD, 0, 0);
+        DriveInfo *di = n == (c->aspen ? 1 : 0) ? drive_get(IF_SD, 0, 0)
+                                                 : NULL;
 
         dev = sysbus_create_simple("ak-mci", 0x20100000 + 0x8000 * n,
                                    qdev_get_gpio_in(sysctrl, 4 + n));

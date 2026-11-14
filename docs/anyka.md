@@ -58,7 +58,7 @@ appended DTB.
 | `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
 | `0x20000000` | ISP / VI | storage |
 | `0x20020000` | video encoder | storage |
-| `0x20100000` / `0x20108000` | MCI0 (SD, `-drive if=sd`) / MCI1 (SDIO) | `ak-mci` |
+| `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
 | `0x20120000` / `0x20128000` | SPI0 (boot NOR) / SPI1 | `ak-spi`, `ak-spinor` |
 | `0x20130000` / `0x20138000` | UART0 / UART1 | `ak-uart` |
