@@ -431,6 +431,203 @@ static void fill_tensor_probe(ot_svp_img *img, int gy_a, int gy_b, int gy_c,
     }
 }
 
+/*
+ * The reciprocal probe (#300).  Op 25's measure is a function of the
+ * window's trace and determinant alone, homogeneous of degree 1, and
+ * `(det / tr) (1 + det / tr^2) / 16` describes it to 0.25% -- about twice
+ * the output's own quantisation, so what is left is structure.  The
+ * standing guess is a truncating reciprocal of the trace inside the
+ * engine, which would show up as `L` departing from that expression by an
+ * amount that depends on the trace and not on the determinant.
+ *
+ * Telling the two apart needs many determinants at *one* trace, which
+ * `fill_tensor_probe` cannot give: it places one row triple per picture.
+ * So here both axes carry a designed triple and the tensors are the outer
+ * product of the two.  With src = F(x) + G(y) the Sobel's gx is a function
+ * of x alone and gy of y alone (the cross terms cancel), so for the window
+ * at the centre of column group i and row group j
+ *
+ *      A = 3 (a^2 + b^2 + c^2)     over the column triple (a, b, c)
+ *      C = 3 (d^2 + e^2 + f^2)     over the row triple (d, e, f)
+ *      B = (a + b + c) (d + e + f)
+ *
+ * The rows carry (d, 0, -d), so C = 6 d^2 and B = 0; the columns carry
+ * (t0, t1, -t0), so A = 3 (2 t0^2 + t1^2), which is dense enough to hit a
+ * wanted value.  Each picture's A_i is chosen as `trace - C_i`, so its
+ * diagonal holds one tensor per group pair with the *same* trace and a
+ * different determinant, and the off-diagonal pairs sweep the trace over
+ * everything from trace - 13818 to trace + 13818 as a bonus.
+ *
+ * Each triple is followed by its undo, as in fill_tensor_probe: F's odd and
+ * even columns are separate chains, and (t0, t1, -t0) completes to
+ * (t0, t1, -t0, -t1, 0, 0) -- a pitch of 6 columns, which also keeps the
+ * ramp inside [60, 252] for gradients up to 48, so nothing clips.
+ *
+ * Two of the four traces sit either side of 8192 and two either side of
+ * 16384: if the reciprocal is bucketed by exponent, the pairs straddle a
+ * bucket boundary.
+ */
+#define RP_W        192
+#define RP_H        192
+#define RP_PITCH    6
+#define RP_BASE     4
+#define RP_NMAX     31
+
+typedef struct {
+    td_u32 trace;
+    td_u32 num;
+    td_u8 d[RP_NMAX];               /* the row triple is (d, 0, -d) */
+    td_u8 t0[RP_NMAX];              /* the column triple is (t0, t1, -t0) */
+    td_u8 t1[RP_NMAX];
+} IveRecipDesign;
+
+static const IveRecipDesign g_recip[] = {
+    {   /* trace 7977, 25 determinants: L 24..155 */
+        7977, 25,
+        { 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35 },
+        { 35, 18, 35, 14, 9, 34, 11, 0, 31, 26, 9, 13, 24, 25, 16, 21, 22, 17, 24, 1, 22, 3, 16, 13, 8 },
+        { 9, 43, 3, 45, 47, 3, 45, 47, 15, 27, 43, 39, 25, 21, 33, 25, 21, 27, 7, 33, 3, 29, 15, 3, 9 },
+    },
+    {   /* trace 8313, 25 determinants: L 24..162 */
+        8313, 25,
+        { 8, 10, 11, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36 },
+        { 29, 35, 30, 34, 34, 33, 28, 29, 32, 29, 20, 29, 26, 7, 26, 23, 17, 20, 11, 20, 19, 16, 13, 10, 7 },
+        { 31, 11, 27, 11, 3, 9, 25, 21, 1, 17, 33, 11, 19, 39, 13, 19, 25, 17, 27, 7, 1, 9, 11, 11, 9 },
+    },
+    {   /* trace 16377, 27 determinants: L 37..319 */
+        16377, 27,
+        { 10, 14, 16, 17, 19, 20, 22, 23, 26, 28, 29, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47 },
+        { 47, 43, 37, 40, 38, 43, 45, 44, 37, 41, 28, 34, 35, 40, 31, 32, 26, 35, 14, 33, 28, 31, 20, 23, 22, 23, 16 },
+        { 29, 37, 47, 41, 43, 31, 21, 23, 37, 23, 47, 35, 31, 9, 35, 31, 37, 11, 45, 9, 23, 3, 31, 23, 21, 13, 23 },
+    },
+    {   /* trace 16425, 20 determinants: L 37..319 */
+        16425, 20,
+        { 10, 11, 13, 17, 19, 20, 21, 24, 30, 31, 34, 35, 36, 39, 41, 42, 43, 45, 46, 48 },
+        { 45, 48, 48, 42, 42, 45, 46, 41, 35, 36, 39, 30, 31, 34, 24, 31, 24, 20, 21, 17 },
+        { 35, 25, 23, 37, 35, 25, 19, 31, 35, 31, 11, 35, 31, 11, 31, 5, 25, 25, 19, 17 },
+    },
+};
+
+/* coverage
+ * trace  7977: n=25  C=[384, 486, 600, 726, 864, 1014, 1176, 1350, 1536, 1734, 1944, 2400, 2646, 2904, 3174, 3456, 3750, 4056, 4374, 4704, 5046, 5400, 5766, 6936, 7350]
+ *              A=[7593, 7491, 7377, 7251, 7113, 6963, 6801, 6627, 6441, 6243, 6033, 5577, 5331, 5073, 4803, 4521, 4227, 3921, 3603, 3273, 2931, 2577, 2211, 1041, 627]
+ *              L=[24, 30, 37, 45, 53, 61, 70, 80, 89, 99, 109, 127, 135, 142, 148, 152, 155, 155, 154, 149, 142, 133, 120, 63, 39]
+ * trace  8313: n=25  C=[384, 600, 726, 1014, 1350, 1536, 1734, 1944, 2166, 2400, 2646, 2904, 3174, 3456, 3750, 4056, 4704, 5046, 5400, 5766, 6144, 6534, 6936, 7350, 7776]
+ *              A=[7929, 7713, 7587, 7299, 6963, 6777, 6579, 6369, 6147, 5913, 5667, 5409, 5139, 4857, 4563, 4257, 3609, 3267, 2913, 2547, 2169, 1779, 1377, 963, 537]
+ *              L=[24, 37, 45, 61, 80, 90, 100, 109, 119, 128, 137, 145, 151, 156, 160, 162, 159, 153, 145, 134, 119, 102, 82, 58, 33]
+ * trace 16377: n=27  C=[600, 1176, 1536, 1734, 2166, 2400, 2904, 3174, 4056, 4704, 5046, 5766, 6144, 6534, 6936, 7350, 8214, 8664, 9126, 9600, 10086, 10584, 11094, 11616, 12150, 12696, 13254]
+ *              A=[15777, 15201, 14841, 14643, 14211, 13977, 13473, 13203, 12321, 11673, 11331, 10611, 10233, 9843, 9441, 9027, 8163, 7713, 7251, 6777, 6291, 5793, 5283, 4761, 4227, 3681, 3123]
+ *              L=[37, 73, 94, 106, 131, 144, 171, 184, 226, 252, 264, 286, 295, 304, 310, 315, 319, 318, 314, 308, 299, 287, 272, 254, 233, 209, 182]
+ * trace 16425: n=20  C=[600, 726, 1014, 1734, 2166, 2400, 2646, 3456, 5400, 5766, 6936, 7350, 7776, 9126, 10086, 10584, 11094, 12150, 12696, 13824]
+ *              A=[15825, 15699, 15411, 14691, 14259, 14025, 13779, 12969, 11025, 10659, 9489, 9075, 8649, 7299, 6339, 5841, 5331, 4275, 3729, 2601]
+ *              L=[37, 45, 63, 106, 131, 144, 157, 198, 276, 286, 311, 316, 319, 315, 300, 288, 274, 235, 211, 155]
+ */
+
+/* the column (or row) at the centre of the i'th group, where it is read */
+static int rp_centre(int i)
+{
+    return RP_BASE + i * RP_PITCH + 1;
+}
+
+static void fill_recip_probe(ot_svp_img *img, const IveRecipDesign *p)
+{
+    int wx[RP_W + 8] = { 0 }, wy[RP_H + 8] = { 0 };
+    int fx[RP_W + 8], gy[RP_H + 8];
+
+    for (td_u32 i = 0; i < p->num; i++) {
+        int c = rp_centre((int)i);
+
+        if (c + 4 >= RP_W) {
+            break;
+        }
+        wx[c - 1] = p->t0[i];
+        wx[c] = p->t1[i];
+        wx[c + 1] = -(int)p->t0[i];
+        wx[c + 2] = -(int)p->t1[i];
+        wy[c - 1] = p->d[i];
+        wy[c] = 0;
+        wy[c + 1] = -(int)p->d[i];
+    }
+    build_ramp(fx, RP_W, wx, 30);
+    build_ramp(gy, RP_H, wy, 30);
+    for (td_u32 y = 0; y < img->height; y++) {
+        td_u8 *row = PTR(td_u8, img->virt_addr[0]) + y * img->stride[0];
+
+        for (td_u32 x = 0; x < img->width; x++) {
+            int v = fx[MIN2((int)x, RP_W - 1)] + gy[MIN2((int)y, RP_H - 1)];
+
+            row[x] = v < 0 ? 0 : v > 255 ? 255 : v;
+        }
+    }
+}
+
+/*
+ * The engine writes op 25's measure as U16 with a 2 x stride byte pitch at
+ * ctrl->mem + 2 * stride * h, and its maximum at + 4 * stride * h -- not as
+ * the U32 array per pixel that the mem size the API asks for suggests.  So
+ * dump it from there, rows packed, and the maximum after it.
+ */
+static void cap_st_recip(void)
+{
+    ot_svp_img src, cand;
+    ot_ive_st_cand_corner_ctrl c = { 0 };
+    ot_ive_handle h;
+    td_u32 stride = sample_common_ive_calc_stride(RP_W, OT_IVE_ALIGN);
+    char n[64];
+
+    if (mk(&src, OT_SVP_IMG_TYPE_U8C1, RP_W, RP_H)) {
+        return;
+    }
+    if (mk(&cand, OT_SVP_IMG_TYPE_U8C1, RP_W, RP_H)) {
+        freeimg(&src);
+        return;
+    }
+    if (mkmem(&c.mem, sizeof(td_u32) * stride * RP_H +
+                      sizeof(ot_ive_st_max_eig_val))) {
+        freeimg(&src);
+        freeimg(&cand);
+        return;
+    }
+    c.quality_level = 25;
+    for (td_u32 p = 0; p < sizeof(g_recip) / sizeof(g_recip[0]); p++) {
+        td_u32 tr = g_recip[p].trace;
+        td_s32 ret;
+
+        fill_recip_probe(&src, &g_recip[p]);
+        snprintf(n, sizeof(n), "strec_tr%u_cand_corner", tr);
+        /*
+         * in its own statement: the handle is written through &h by the call
+         * and read again by done(), and the order of a call's arguments is
+         * unspecified
+         */
+        ret = ss_mpi_ive_st_cand_corner(&h, &src, &cand, &c, TD_TRUE);
+        if (done(n, ret, h)) {
+            continue;
+        }
+        snprintf(n, sizeof(n), "strec_tr%u_src", tr);
+        dump_img(n, &src);
+        snprintf(n, sizeof(n), "strec_tr%u_eig", tr);
+        {
+            FILE *f = out_file(n);
+
+            if (f) {
+                td_u64 base = c.mem.virt_addr + 2 * stride * RP_H;
+
+                for (td_u32 y = 0; y < RP_H; y++) {
+                    fwrite(PTR(td_u8, base) + y * stride * sizeof(td_u16),
+                           RP_W * sizeof(td_u16), 1, f);
+                }
+                fclose(f);
+            }
+        }
+        snprintf(n, sizeof(n), "strec_tr%u_max_eig", tr);
+        dump_mem(n, c.mem.virt_addr + sizeof(td_u32) * stride * RP_H, 2);
+    }
+    freemem(&c.mem);
+    freeimg(&src);
+    freeimg(&cand);
+}
+
 static void cap_mag_and_ang(void)
 {
     ot_svp_img src, mag, ang;
@@ -1162,6 +1359,7 @@ int main(int argc, char **argv)
     cap_lbp();
     cap_norm_grad();
     cap_st();
+    cap_st_recip();
     cap_lk();
     cap_gmm2();
     cap_gmm2_flat();
