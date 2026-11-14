@@ -2702,8 +2702,13 @@ static const HisiSoCConfig hi3516cv608_soc = {
     .vedu_base          = 0x17140000,
     .media_gen          = 5,
     HISI_V5_VIDEO_PIPE,
-    /* sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel (mod_sys.o) */
-    .crg_rst_ack        = { 0x9b40, 0x9ec0 },
+    /*
+     * sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel /
+     * sys_hal_svp_npu0_reset_sel (mod_sys.o).  The NPU's pair is at
+     * 0x6680 / 0x6684 because the vendor maps the CRG from 0x11015000,
+     * not from its base.
+     */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0, 0x6680 },
     .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
@@ -2811,8 +2816,13 @@ static const HisiSoCConfig hi3516cv610_soc = {
     .vedu_base          = 0x17140000,
     .media_gen          = 5,
     HISI_V5_VIDEO_PIPE,
-    /* sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel (mod_sys.o) */
-    .crg_rst_ack        = { 0x9b40, 0x9ec0 },
+    /*
+     * sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel /
+     * sys_hal_svp_npu0_reset_sel (mod_sys.o).  The NPU's pair is at
+     * 0x6680 / 0x6684 because the vendor maps the CRG from 0x11015000,
+     * not from its base.
+     */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0, 0x6680 },
     .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
@@ -2907,8 +2917,13 @@ static const HisiSoCConfig hi3516cv613_soc = {
     .vedu_base          = 0x17140000,
     .media_gen          = 5,
     HISI_V5_VIDEO_PIPE,
-    /* sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel (mod_sys.o) */
-    .crg_rst_ack        = { 0x9b40, 0x9ec0 },
+    /*
+     * sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel /
+     * sys_hal_svp_npu0_reset_sel (mod_sys.o).  The NPU's pair is at
+     * 0x6680 / 0x6684 because the vendor maps the CRG from 0x11015000,
+     * not from its base.
+     */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0, 0x6680 },
     .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
