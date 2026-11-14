@@ -1115,7 +1115,7 @@ jobs:
 
       - name: "sysupgrade from a local archive"
         if: matrix.flash_tests
-        timeout-minutes: 12
+        timeout-minutes: 10
         run: |
           bash qemu-boot/test-sysupgrade.sh \
             --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
@@ -1814,13 +1814,13 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-mipsel
 
       - name: majestic, audio, day and night
-        timeout-minutes: 12
+        timeout-minutes: 10
         run: >-
           bash qemu-boot/test-ingenic-majestic.sh --audio
           --work "$RUNNER_TEMP/majestic"
 
   boot-hi3516cv610:
-    name: Boot hi3516cv610
+    name: Boot hi3516cv6xx (cv608 / cv610 / cv613)
     needs: [select, build]
     if: fromJSON(needs.select.outputs.jobs)['boot-hi3516cv610']
     runs-on: ubuntu-24.04
@@ -1867,68 +1867,86 @@ jobs:
             # Split image: the uImage (64-byte header + data, size big-endian
             # at byte 12), its DTB appended to the zImage inside, so no -dtb.
             set -- $(od -An -tu1 -j12 -N4 "$FW")
-            head -c $(( 64 + (($1 << 24) | ($2 << 16) | ($3 << 8) | $4) )) "$FW" > uImage.hi3516cv610
+            head -c $(( 64 + (($1 << 24) | ($2 << 16) | ($3 << 8) | $4) )) "$FW" > uImage.hi3516cv6xx
           else
             # FIT: image 1 = linux_kernel (zImage), image 0 = fdt-1 (dtb).
-            dumpimage -T flat_dt -p 1 -o uImage.hi3516cv610 "$FW"
-            dumpimage -T flat_dt -p 0 -o cv610.dtb          "$FW"
+            dumpimage -T flat_dt -p 1 -o uImage.hi3516cv6xx "$FW"
+            dumpimage -T flat_dt -p 0 -o cv6xx.dtb          "$FW"
           fi
           # SquashFS rootfs is appended right after the kernel.
           sqoff=$(grep -aboP 'hsqs' "$FW" | head -1 | cut -d: -f1)
-          dd if="$FW" of=rootfs.squashfs.hi3516cv610 bs=64k iflag=skip_bytes \
+          dd if="$FW" of=rootfs.squashfs.hi3516cv6xx bs=64k iflag=skip_bytes \
               skip="$sqoff" status=none
-          ls -la uImage.hi3516cv610 rootfs.squashfs.hi3516cv610 cv610.dtb 2>/dev/null || true
+          ls -la uImage.hi3516cv6xx rootfs.squashfs.hi3516cv6xx cv6xx.dtb 2>/dev/null || true
 
       - name: "OpenIPC kernel + rootfs boot"
-        timeout-minutes: 4
+        timeout-minutes: 10
         run: |
-          # cv610's kernel is capped to 32 MiB by default (mmz claims the
-          # rest); the "ultimate" rootfs ramdisk needs more, so pass mem=128M.
+          # All three V5 dies take the one hi3516cv6xx release, so they boot
+          # from the kernel and rootfs fetched above rather than each paying
+          # for its own download (#272).  cv610's kernel is capped to 32 MiB
+          # by default (mmz claims the rest); the "ultimate" rootfs ramdisk
+          # needs more, so pass mem=128M.
           QEMU=./qemu-src/build/qemu-system-arm
-          timeout 150 $QEMU -M hi3516cv610 -m 256M \
-            -kernel qemu-boot/uImage.hi3516cv610 \
-            $( [ -f qemu-boot/cv610.dtb ] && echo -dtb qemu-boot/cv610.dtb ) \
-            -initrd qemu-boot/rootfs.squashfs.hi3516cv610 \
-            -nographic -serial mon:stdio -nic user,restrict=on \
-            -append 'mem=128M console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs' \
-            -d unimp,guest_errors -D qemu-boot/qemu.log 2>&1 | tee boot-output.txt &
-          QEMU_PID=$!
+          rc=0
+          for mach in hi3516cv608 hi3516cv610 hi3516cv613; do
+            echo "::group::$mach"
+            out=boot-output-$mach.txt
+            timeout 150 $QEMU -M $mach -m 256M \
+              -kernel qemu-boot/uImage.hi3516cv6xx \
+              $( [ -f qemu-boot/cv6xx.dtb ] && echo -dtb qemu-boot/cv6xx.dtb ) \
+              -initrd qemu-boot/rootfs.squashfs.hi3516cv6xx \
+              -nographic -serial mon:stdio -nic user,restrict=on \
+              -append 'mem=128M console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs' \
+              -d unimp,guest_errors -D qemu-boot/qemu-$mach.log > "$out" 2>&1 &
+            # $! of a pipeline is its LAST process, so this must not pipe
+            # into tee: killing tee would leave QEMU running into the next
+            # machine's boot.  It is timeout's pid, and timeout forwards the
+            # signal to QEMU.
+            QEMU_PID=$!
 
-          # Wait for the login prompt.
-          for i in $(seq 1 150); do
-            if grep -qE "login:" boot-output.txt 2>/dev/null; then
-              echo ""
-              echo "=== Boot successful: login prompt reached ==="
-              kill $QEMU_PID 2>/dev/null || true
-              if grep -qE "SQUASHFS error|Kernel panic|deadlocked" boot-output.txt; then
-                echo "=== FAIL: squashfs corruption / kernel panic ==="
-                grep -nE "SQUASHFS error|Kernel panic|deadlocked" boot-output.txt | head
-                exit 1
+            # Wait for the login prompt.
+            ok=0
+            for i in $(seq 1 150); do
+              if grep -qE "login:" "$out" 2>/dev/null; then
+                echo "=== $mach: login prompt reached ($i s) ==="
+                if grep -qE "SQUASHFS error|Kernel panic|deadlocked" "$out"; then
+                  echo "=== FAIL: squashfs corruption / kernel panic ==="
+                  grep -nE "SQUASHFS error|Kernel panic|deadlocked" "$out" | head
+                else
+                  echo "=== $mach: boot clean ==="
+                  ok=1
+                fi
+                break
               fi
-              echo "=== Boot clean ==="
-              exit 0
+              if ! kill -0 $QEMU_PID 2>/dev/null; then
+                echo "=== FAIL: $mach QEMU exited before login ==="
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ok" = 0 ]; then
+              kill -0 $QEMU_PID 2>/dev/null &&
+                echo "=== TIMEOUT: $mach login prompt not reached ==="
+              rc=1
             fi
-            if ! kill -0 $QEMU_PID 2>/dev/null; then
-              echo "=== FAIL: QEMU exited before login ==="
-              tail -30 boot-output.txt
-              exit 1
-            fi
-            sleep 1
+            kill $QEMU_PID 2>/dev/null || true
+            wait $QEMU_PID 2>/dev/null || true
+            # the console is in the file rather than streamed, so show it --
+            # all of it when the boot failed, the tail otherwise
+            if [ "$ok" = 1 ]; then tail -20 "$out"; else cat "$out"; fi
+            echo "::endgroup::"
           done
-
-          echo "=== TIMEOUT: login prompt not reached ==="
-          tail -30 boot-output.txt
-          kill $QEMU_PID 2>/dev/null || true
-          exit 1
+          exit $rc
 
       - name: Upload boot log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: boot-log-hi3516cv610
+          name: boot-log-hi3516cv6xx
           path: |
-            boot-output.txt
-            qemu-boot/qemu.log
+            boot-output-*.txt
+            qemu-boot/qemu-*.log
           retention-days: 7
 
   boot-hi3516ev300-nand:
