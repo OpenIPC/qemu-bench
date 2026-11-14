@@ -132,11 +132,23 @@ PIDS+=($!)
 # reach a server that is already up: if the client's first attempt finds no
 # listener, tunnel backs off and the session can miss the window.  That also
 # means the server's socket netdev is listening when the client connects.
+# A server that never listens fails here, inside the timeout, rather than
+# spending a second timeout on a client with nothing to reach.
+listening=""
 for _ in $(seq 1 "$TIMEOUT"); do
-    tr -d '\r' 2>/dev/null < "$OUTPUT_DIR/server.log" | grep -aq 'vtund-server-listening' && break
+    if tr -d '\r' 2>/dev/null < "$OUTPUT_DIR/server.log" | grep -aq 'vtund-server-listening'; then
+        listening=1
+        break
+    fi
     kill -0 "${PIDS[0]}" 2>/dev/null || break
     sleep 1
 done
+if [ -z "$listening" ]; then
+    echo "=== server ($SOC)"
+    tr -d '\r' < "$OUTPUT_DIR/server.log" 2>/dev/null | sed -n '/Run \/bin\/sh as init/,$p' | grep -avE '^\s*$' | tail -20 || true
+    echo "FAIL: vtund server never listened within ${TIMEOUT}s; logs in $OUTPUT_DIR"
+    exit 1
+fi
 boot client "$CLIENT" "socket,connect=127.0.0.1:$PORT,mac=$CLIENT_MAC"
 PIDS+=($!)
 

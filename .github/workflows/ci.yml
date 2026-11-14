@@ -1534,8 +1534,11 @@ jobs:
 
       - name: vtund session and a ping across the tunnel
         timeout-minutes: 8
+        # The test waits up to --timeout for the server, then as long again for
+        # the client: two 200 s waits fit the step, so a failure prints its own
+        # result instead of being cut off.  A passing run takes under a minute.
         run: |
-          bash qemu-boot/test-vtund-tunnel.sh \
+          bash qemu-boot/test-vtund-tunnel.sh --timeout 200 \
             --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
             --output-dir "$RUNNER_TEMP/vtund-${{ matrix.soc }}"
 
