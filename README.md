@@ -244,7 +244,8 @@ either was at hand.
 | `ak3918ev330` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
 | `ak3919ev330` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
 | `ak3918ev300l` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes |
-| `ak3918av100` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4 vendor (DT) | —³ |
+| `ak3918av100` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
+| `ak3918av100x` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
 
 Anyka's camera SoCs, unrelated to HiSilicon: one memory map from the
 AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330) and the
@@ -261,8 +262,10 @@ The SoC list from the SDKs, the map, the boot header and the dumps tried
 are in [docs/anyka.md](docs/anyka.md).
 
 ¹ An AK3916EV301 dump.  ² Same die and models as a tested sibling; no image
-was at hand.  ³ The EV300L's twin in the SDK's headers; no firmware of one
-has been seen, and its boot-header magic (`ANYKA322`) is inferred.
+was at hand.  ³ AK3918AV100 (and KM01N) / AK3918AV100X (and KM01D), which
+differ only in DDR size: images built from the AnyCloud39AV100 SDK's U-Boot
+and 4.4.282 kernel (`ANYKA322` header, U-Boot at flash 0x600) boot to
+`login:`; no camera dump has been seen.
 
 ### SigmaStar / MStar family (`qemu-system-arm`)
 

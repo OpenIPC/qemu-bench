@@ -1,12 +1,14 @@
-# Anyka AK39xx (`ak3918ev200`, `ak391xev300`, `ak391xev330`, `ak3918ev300l`, `ak3918av100`)
+# Anyka AK39xx (`ak3918ev200`, `ak391xev300`, `ak391xev330`, `ak3918ev300l`, `ak3918av100`, `ak3918av100x`)
 
 Anyka's IP-camera SoCs: one ARM926EJ-S with DDR2 in the package. The memory
 map has not moved from the AK3918EV200 through the AnyCloud39EV300 parts to
 the AnyCloud V500 (EV330), so one machine file (`hw/arm/anyka.c`) covers all
-three generations with a table entry each. The AK3918EV300L and AK3918AV100
-(the vendor's "ASPEN" code, despite the EV300L's name not an EV300) keep the
-map with two moves -- SPI0 to `0x21100000`, I2C 2 to `0x201C0000` -- and a
-new clock block; a flag in the table entry (`aspen`) selects those.
+three generations with a table entry each. The AK3918EV300L and the
+AK3918AV100 family (the vendor's "ASPEN" code, despite the EV300L's name not
+an EV300) keep the map with two moves -- SPI0 to `0x21100000`, I2C 2 to
+`0x201C0000` -- and a new clock block; a flag in the table entry (`aspen`)
+selects those. The AV100 adds blocks on top (`av100`): a second MIPI/CSI
+input, an NPU and a video pipe higher in the map (`0x212`--`0x215`).
 
 ## What the SDKs support
 
@@ -16,6 +18,7 @@ new clock block; a flag in the table entry (`aspen`) selects those.
 | AnyCloud39EV300 | AK3916EV300, AK3918EV300, AK3919EV300 (B and C silicon revisions), AK3916EV301 | `anycloud39ev300` SDK: kernel 3.4.35 board files, U-Boot 2013.10, spiboot | 3.4.35 vendor | `ANYKA_H3` |
 | AnyCloud V500 / EV330 | AK3916EV330, AK3918EV330, AK3919EV330, and the EV331 trio (one `dt_compat` list, `mach-ak39ev330.c`) | `ak3918ev200-kernel` (`anycloud_ak39ev330*.dtsi`), dump | 4.4.192 vendor (DT) | `ANYKAH3B` |
 | AnyCloud39AV130 SDK V1.03 (one tree for several lines) | AK3918EV300L, AK3918AV100 (N/P/X/XP) | `ANYKA_130L_SDK`: U-Boot 2019.10 (`arch-ak3918ev300l`, `arch-ak3918av100`), kernel 4.4.302 (`anycloud_ak3918ev300l*.dtsi`), dump | 4.4.282 vendor (DT) | `AK_H322L` / `AKH322LS` (EV300L), `ANYKA322` (AV100, inferred from `ak_ddr_param`) |
+| AnyCloud39AV100 SDK V1.12 | AK3918AV100 (N/P/X/XP), KM01 (N/D) | `ANYKA_AV100_SDK`: U-Boot 2019.10.0-V4.0.27 (`arch-ak3918av100`, `ak3918av100_nor_defconfig`), kernel 4.4.282 (`anycloud_ak3918av100*.dtsi`), prebuilt `image/` | 4.4.282 vendor (DT) | `ANYKA322` (confirmed: U-Boot `vectors.S` builds `ANYKAH3D`, the burn tool patches it to `ANYKA322`; `ak_secureboot` header template) |
 | AK37D, AK37E | — | `#ifdef`s in the 4.4 tree's `map.h`, `irqs.h`, `ak_timer.c` only | — | — |
 
 The `Aimer39_PDK_V1.1.00` archive (AK3918 datasheet and programming guide)
@@ -32,7 +35,17 @@ is header-encrypted and was not usable.
 | `ak3918ev330` | `0x20160101` | 64 MiB | 10 | eFuse reader, I2C v2, flash CS on GPIO 25 |
 | `ak3919ev330` | `0x20160101` | 128 MiB | 10 | U-Boot of the dump prints `ramsize: 08000000` |
 | `ak3918ev300l` | `0x53543400` | 64 MiB | 10 | "ASPEN": SPI0 at `0x21100000`, clock block v2; `socinfo` prints `0x535434` |
-| `ak3918av100` | `0x53533500` | 128 MiB | 10 | the EV300L's headers with other comments; no firmware seen, unverified |
+| `ak3918av100` | `0x53533500` | 64 MiB | 10 | ASPEN + AV100 blocks; AK3918AV100N/P, KM01N; boots the AnyCloud39AV100 SDK V1.12 firmware to login |
+| `ak3918av100x` | `0x53533500` | 128 MiB | 10 | same die, 128 MiB; AK3918AV100X/XP, KM01D |
+
+The AV100 family all read chip ID `0x53533500` (`socinfo` `0x535335`,
+"AK3918AV100-A"; the C revision is `0x53533501`, "-C"). The vendor tells the
+parts apart not by this register but by the eFuse global ID and the DDR bank
+count: `libplat_osal.so` (`osal_get_chip_type`) reads the eFuse model code
+and `osal_get_mem_bank_num` reads a DDRC bit (`0x21000000`, `0x200` = 8
+banks / 128 MiB, else 4 banks / 64 MiB). So KM01N and the 64 MiB AK3918AV100
+parts map onto `ak3918av100`, KM01D and the 128 MiB X parts onto
+`ak3918av100x`; the two machines differ only in DDR size.
 
 ¹ Not seen on a dump; `-m` overrides it.
 
@@ -69,8 +82,11 @@ appended DTB.
 | `0x20300000` | Ethernet: Synopsys GMAC, RMII PHY at MDIO 1 | `xm-dwmac` |
 | `0x21000000` | DDR2 controller | `ak-ddrc` |
 | `0x21100000` | EV300L / AV100: SPI0 (boot NOR), the old SPI0 register set plus `+0x20` RTIM and `+0x24` WORK_MODE | `ak-spi`, `ak-spinor` |
+| `0x201A8000` / `0x58000000` | AV100: second L2 buffer controller / its SRAM (`l2-buffer_1`, interrupt 25; disabled on the single-sensor boards) | unimplemented (reads 0) |
+| `0x20400000` / `0x20500000` | AV100: MIPI0 / MIPI1 receiver (the GPIO node's second and third `reg`) | `ak-mipi` storage / unimplemented |
+| `0x21200000`--`0x21500000` | AV100: VI/ISP (`0x21200000`), NPU/CNN (`0x21300000`), video encoder (`0x21400000`), encoder bridge (`0x21500000`) | the `ak-apb` catch-all (reads 0) |
 | `0x48000000` | L2 memory, 8 KiB, mirrored over 64 KiB | `ak-l2` |
-| `0x80000000` | DDR | RAM |
+| `0x80000000` | DDR (64 MiB; 128 MiB on `ak3919*`, `ak3918av100x`) | RAM |
 
 Interrupts are SYSCTRL's: module sources 0..23 in `+0x24` (enable) and
 `+0x4C` (status), source 3 being the "system" sub-controller, whose sources
@@ -86,11 +102,21 @@ The first 512 bytes of the NOR (U-Boot port `mkaksh.py`, and every dump):
 | Offset | Content |
 |---|---|
 | `+0x00` | branch |
-| `+0x04` | magic `AKSH_240` / `ANYKA_H3` / `ANYKAH3B` / `AK_H322L` (EV300L) |
+| `+0x04` | magic `AKSH_240` / `ANYKA_H3` / `ANYKAH3B` / `AK_H322L` (EV300L) / `ANYKA322` (AV100) |
 | `+0x0C` | payload length (it follows the header) |
-| `+0x20` | load address: `0x80E00000` (U-Boot, EV200/EV300) or `0x48000000` (EV330 first stage) |
-| `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` / `0x66668882` = EV300L ROM operations of one value (skipped), `0x88888888` = end |
+| `+0x20` | load address: `0x80E00000` (U-Boot, EV200/EV300/EV300L/AV100) or `0x48000000` (EV330 first stage) |
+| `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` / `0x66668882` = EV300L / AV100 ROM operations of one value (skipped), `0x88888888` = end |
 | `+0x18C` | `SPIP` + the SPI NOR descriptor (JEDEC ID, size, page, erase size, partition-table block) |
+
+The AV100's `ANYKA322` payload does not follow the header at `+0x200` but at
+`+0x600`: `vectors.S` under `CONFIG_3918AV100_CODE` reserves `0x400` more
+bytes (secure boot keeps the public key at `+0x200` and the signature at
+`+0x300`; `tools/secureboot/ak_secureboot`), and the vendor U-Boot is linked
+at the load address `- 0x600` (`CONFIG_SYS_TEXT_BASE 0x80DFFA00`). The model
+copies an `ANYKA322` payload from flash `0x600`; the others still from
+`0x200`. (Signed images also write `0x84000000` at `+0x1C`; unsigned ones
+keep `6`.) `0x600` is inferred from the SDK -- no AV100 flash dump has been
+seen -- and matches what the OpenIPC U-Boot `ak3918av100` port emits.
 
 The ROM replays the script (PLLs, DDR controller), copies the payload to the
 load address and enters it. The EV300L header has the EV300's fields (its
@@ -191,6 +217,8 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `AK3918_V300s_dumps.zip`, `AK3918_V330L_dumps.zip` (AK3918EV330, U-Boot V3.1.28, 4.4.192; partitions only) | `ak3918ev330` | assembled at the `mtdparts` offsets: login; ENV, CONFIG and APP are not in the zips, so `/usr` (and `ak_eth.ko`) is missing. Flash BY25Q64A (`0x684017`) |
 | gzhongshi HVT3610S3 QQ-WiFi v2.0 (AK3918EV300L, U-Boot 2019.10.0-V4.0.25, 4.4.282, XM25QH64C; ipctool backup, rebuilt into a raw image) | `ak3918ev300l` | `GZhongshi login:`, vendor app (no sensor answers on I2C); vendor U-Boot `sf probe/read/erase/write` and `reset` (watchdog) work; matches the board's own boot log up to the PHY (absent on the board) |
 | `XM25QH64A@SOIC8.BIN` | — | the dump has bit errors throughout (`consold=ttyS@K0`); not bootable |
+| AnyCloud39AV100 SDK V1.12 firmware, assembled into an 8 MiB image (`qemu-boot/anyka-sdk-image.py`): the SDK's own U-Boot 2019.10.0-V4.0.27 (`ak3918av100_nor_defconfig`) under an `ANYKA322` header with the burn tool's 64 MiB DDR script, `image/uImage` (vendor 4.4.282), `EVB_CBDM_AK3918AV100N_V1.0.0.dtb`, `root.sqsh4`, `usr.jffs2`, `usr.sqsh4` at the burn-config offsets | `ak3918av100` | `anyka login:` (`ANYKA CPU AK3918AV100-A (ID 0x535335)`, GD25Q64 NOR, 8 MTD partitions, squashfs root, jffs2 config, APP mounted). The vendor modules load without crashing: `ak_rtc`, `ak_i2c`, `ak_efuse`, `ak_ion`, `ak_pcm`, `ak_isp`, `ak_venc_adapter`, `ak_npu`, `ak_eth`. (`ak_venc_bridge` and `ak_hcd` need symbols from `ak_venc_adapter` / usbcore loaded first, as the vendor scripts do.) |
+| the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
 
 ## Ethernet checks
 
@@ -205,4 +233,25 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 ## Not modelled
 
 The MCI's L2 DMA data path, ISP, video encoder, audio codec, SAR ADC. No
-sensor models are attached to I2C yet.
+sensor models are attached to I2C yet. On the AV100 the second MIPI/CSI
+input, the NPU (`0x21300000`) and the video pipe (`0x212`--`0x215`) are the
+`ak-apb` catch-all (reads 0): the vendor modules probe and map them but no
+frames flow. The second L2 buffer (`0x201A8000` / `0x58000000`) and the
+third MCI (`mmc2` at `0x201B0000`, SDIO Wi-Fi) are likewise unmodelled and
+disabled on the single-sensor boards.
+
+## Building an AV100 flash image
+
+The AnyCloud39AV100 SDK ships no U-Boot binary (the `*.bin` are gitignored).
+Build it from the SDK's `os/uboot` (`ak3918av100_nor_defconfig`), then wrap
+it with the header and partitions the burn tool writes:
+
+```
+python3 qemu-boot/anyka-sdk-image.py <sdk> <u-boot.bin> flash.bin --ram 64
+bash qemu-boot/run-ak3918av100.sh flash.bin ak3918av100
+```
+
+`--ram 128` with `--dtb EVB_CBDM_AK3918AV100X_V1.0.0.dtb` makes the 128 MiB
+image for `ak3918av100x`. The script reads the DDR register script from the
+SDK's `tools/burntool/SDK_CPU_DDR2.ini` and the DTB, kernel and rootfs from
+the SDK's `image/`.

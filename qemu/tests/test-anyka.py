@@ -26,6 +26,9 @@ script plays the vendor drivers (docs/anyka.md):
     ROM operations, the chip ID, the clock block's self-clearing apply /
     valid bits, SPI0 at 0x21100000 with WORK_MODE, ROM word 0x24 a
     harmless in-ROM pointer;
+  - ak3918av100 / ak3918av100x: the ANYKA322 header whose payload the ROM
+    copies from flash 0x600 (secure-boot keys behind the 0x200 header), the
+    chip ID, and the eFuse read the vendor ak_efuse.ko polls;
   - outside qtest: a flash image smaller than an erase block is refused,
     machine state migrates to a file and back on five- and ten-timer
     parts, and a file-backed flash blocks migration.
@@ -489,11 +492,50 @@ def test_ev300l(qemu, path):
               open(out2, 'rb').read(), b'2')
     finally:
         qt.close()
-    qt = QTest(qemu, 'ak3918av100,flash-file=%s' % path)
-    try:
-        check('ak3918av100 chip ID', qt.readl(SYSCTRL), 0x53533500)
-    finally:
-        qt.close()
+def test_av100(qemu, tmp):
+    print('ak3918av100 / ak3918av100x: ANYKA322 0x600 header, eFuse')
+    # The AV100 ROM keeps 0x400 bytes for secure boot behind the 0x200
+    # header (pubkey 0x200, signature 0x300) and copies the payload from
+    # flash offset 0x600 to the load address.
+    code = [0xE1A00000, 0xEAFFFFFE]
+    img = bytearray(b'\xFF' * (8 << 20))
+    struct.pack_into('<I', img, 0, 0xEA00017E)
+    img[4:12] = b'ANYKA322'
+    struct.pack_into('<I', img, 0x0C, 4 * len(code))
+    struct.pack_into('<I', img, 0x20, LOAD)
+    script = [DDRC + 0x14, 0x00423E71,
+              0x66668881, DDRC + 0xA4, 0x10000,
+              0x88888888, 0]
+    struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    struct.pack_into('<%dI' % len(code), img, 0x600, *code)
+    path = os.path.join(tmp, 'av100.bin')
+    open(path, 'wb').write(img)
+
+    for machine, ram, chip in (('ak3918av100', 64, 0x53533500),
+                               ('ak3918av100x', 128, 0x53533500)):
+        qt = QTest(qemu, '%s,flash-file=%s' % (machine, path))
+        try:
+            check('%s chip ID' % machine, qt.readl(SYSCTRL), chip)
+            check('%s: payload copied from flash 0x600' % machine,
+                  qt.readl(LOAD), code[0])
+            check('%s: 0x600 header in front of U-Boot (TEXT_BASE)' % machine,
+                  qt.readl(LOAD - 0x600 + 4), 0x4B594E41)
+            # DDR size is the one difference between the two: the last word
+            # of RAM holds a value, the word past it does not.
+            end = 0x80000000 + (ram << 20)
+            qt.writel(end - 4, 0x5AA5C33C)
+            check('%s: RAM up to %d MiB' % (machine, ram),
+                  qt.readl(end - 4), 0x5AA5C33C)
+            qt.writel(end, 0x5AA5C33C)
+            check('%s: no RAM past %d MiB' % (machine, ram),
+                  qt.readl(end) != 0x5AA5C33C, True)
+            # eFuse read: bit 31 start/busy, cleared when done (the AV100's
+            # ak_efuse.ko polls SYSCTRL + 0x8C the way the EV330 reader does).
+            qt.writel(SYSCTRL + 0x8C, (1 << 31) | (1 << 21))
+            check('%s: eFuse read completes' % machine,
+                  qt.readl(SYSCTRL + 0x8C) & (3 << 30), 0)
+        finally:
+            qt.close()
 
 
 def main():
@@ -528,6 +570,7 @@ def main():
     path300l = os.path.join(tmp, 'flash300l.bin')
     make_image(path300l, b'AK_H322L')
     test_ev300l(args.qemu, path300l)
+    test_av100(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
