@@ -1115,7 +1115,7 @@ jobs:
 
       - name: "sysupgrade from a local archive"
         if: matrix.flash_tests
-        timeout-minutes: 12
+        timeout-minutes: 10
         run: |
           bash qemu-boot/test-sysupgrade.sh \
             --soc "${{ matrix.soc }}" --machine "${{ matrix.machine }}" \
@@ -1814,7 +1814,7 @@ jobs:
         run: chmod +x qemu-src/build/qemu-system-mipsel
 
       - name: majestic, audio, day and night
-        timeout-minutes: 12
+        timeout-minutes: 10
         run: >-
           bash qemu-boot/test-ingenic-majestic.sh --audio
           --work "$RUNNER_TEMP/majestic"
@@ -1880,7 +1880,7 @@ jobs:
           ls -la uImage.hi3516cv6xx rootfs.squashfs.hi3516cv6xx cv6xx.dtb 2>/dev/null || true
 
       - name: "OpenIPC kernel + rootfs boot"
-        timeout-minutes: 12
+        timeout-minutes: 10
         run: |
           # All three V5 dies take the one hi3516cv6xx release, so they boot
           # from the kernel and rootfs fetched above rather than each paying
@@ -1898,15 +1898,18 @@ jobs:
               -initrd qemu-boot/rootfs.squashfs.hi3516cv6xx \
               -nographic -serial mon:stdio -nic user,restrict=on \
               -append 'mem=128M console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs' \
-              -d unimp,guest_errors -D qemu-boot/qemu-$mach.log 2>&1 | tee "$out" &
+              -d unimp,guest_errors -D qemu-boot/qemu-$mach.log > "$out" 2>&1 &
+            # $! of a pipeline is its LAST process, so this must not pipe
+            # into tee: killing tee would leave QEMU running into the next
+            # machine's boot.  It is timeout's pid, and timeout forwards the
+            # signal to QEMU.
             QEMU_PID=$!
 
             # Wait for the login prompt.
             ok=0
             for i in $(seq 1 150); do
               if grep -qE "login:" "$out" 2>/dev/null; then
-                echo ""
-                echo "=== $mach: login prompt reached ==="
+                echo "=== $mach: login prompt reached ($i s) ==="
                 if grep -qE "SQUASHFS error|Kernel panic|deadlocked" "$out"; then
                   echo "=== FAIL: squashfs corruption / kernel panic ==="
                   grep -nE "SQUASHFS error|Kernel panic|deadlocked" "$out" | head
@@ -1918,18 +1921,20 @@ jobs:
               fi
               if ! kill -0 $QEMU_PID 2>/dev/null; then
                 echo "=== FAIL: $mach QEMU exited before login ==="
-                tail -30 "$out"
                 break
               fi
               sleep 1
             done
-            if [ "$ok" = 0 ] && kill -0 $QEMU_PID 2>/dev/null; then
-              echo "=== TIMEOUT: $mach login prompt not reached ==="
-              tail -30 "$out"
+            if [ "$ok" = 0 ]; then
+              kill -0 $QEMU_PID 2>/dev/null &&
+                echo "=== TIMEOUT: $mach login prompt not reached ==="
+              rc=1
             fi
             kill $QEMU_PID 2>/dev/null || true
             wait $QEMU_PID 2>/dev/null || true
-            [ "$ok" = 1 ] || rc=1
+            # the console is in the file rather than streamed, so show it --
+            # all of it when the boot failed, the tail otherwise
+            if [ "$ok" = 1 ]; then tail -20 "$out"; else cat "$out"; fi
             echo "::endgroup::"
           done
           exit $rc
