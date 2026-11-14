@@ -160,18 +160,36 @@ static const AkSoCConfig ak3918ev300l_soc = {
 };
 
 /*
- * AK3918AV100: the same SDK's arch-ak3918av100 headers differ from the
- * EV300L's only in comments; 128 MiB, socinfo 0x535335.  No firmware of
- * one has been seen: unverified.
+ * AK3918AV100: the AnyCloud39AV100 SDK V1.12 (kernel 4.4.282, U-Boot
+ * 2019.10, anycloud_ak3918av100*.dtsi).  The EV300L's map and drivers,
+ * socinfo 0x535335.  Two DDR sizes, one die: AK3918AV100N / P and KM01N
+ * have 64 MiB (anycloud_ak3918av100np.dtsi), AK3918AV100X / XP and KM01D
+ * 128 MiB (anycloud_ak3918av100x.dtsi); the SDK's DDR scripts differ only
+ * in the DDRC row setting.  Names as OpenIPC's: ak3918av100 (64 MiB),
+ * ak3918av100x (128 MiB).
  */
 static const AkSoCConfig ak3918av100_soc = {
-    .desc               = "Anyka AK3918AV100 (ARM926EJ-S, 128 MB DDR2)",
+    .desc               = "Anyka AK3918AV100N/P, KM01N (ARM926EJ-S, 64 MB DDR2)",
+    .chip_id            = 0x53533500,
+    .ram_size_default   = 64 * MiB,
+    .num_timers         = 10,
+    .flash_cs_gpio      = -1,
+    .i2c_layout         = 2,
+    .has_efuse          = true,
+    .aspen              = true,
+    .av100              = true,
+};
+
+static const AkSoCConfig ak3918av100x_soc = {
+    .desc               = "Anyka AK3918AV100X/XP, KM01D (ARM926EJ-S, 128 MB DDR2)",
     .chip_id            = 0x53533500,
     .ram_size_default   = 128 * MiB,
     .num_timers         = 10,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 2,
+    .has_efuse          = true,
     .aspen              = true,
+    .av100              = true,
 };
 
 #define TYPE_AK_MACHINE MACHINE_TYPE_NAME("anyka")
@@ -289,9 +307,21 @@ static bool ak_boot_header_ok(const uint8_t *img, gsize len)
     return false;
 }
 
+/*
+ * The AV100's header is 0x600 bytes: vectors.S reserves 1 KiB more behind
+ * the usual 0x200 (CONFIG_3918AV100_CODE) and U-Boot is linked at the load
+ * address - 0x600 (CONFIG_SYS_TEXT_BASE 0x80DFFA00), so the payload the
+ * ROM copies to the load address starts at flash offset 0x600.
+ */
+static uint32_t ak_boot_header_len(const uint8_t *img)
+{
+    return !memcmp(img + 4, "ANYKA322", 8) ? 0x600 : AK_HDR_LEN;
+}
+
 static void ak_boot_rom_setup(const uint8_t *img, gsize len,
                               MachineState *machine, const char *path)
 {
+    uint32_t hlen = ak_boot_header_len(img);
     uint32_t plen = ldl_le_p(img + 0x0C);
     uint32_t load = ldl_le_p(img + 0x20);
     GArray *rom = g_array_new(false, false, sizeof(uint32_t));
@@ -302,7 +332,7 @@ static void ak_boot_rom_setup(const uint8_t *img, gsize len,
     const uint32_t end = 0;
     uint32_t off;
 
-    if (!plen || AK_HDR_LEN + (uint64_t)plen > len || (!in_ddr && !in_l2)) {
+    if (!plen || hlen + (uint64_t)plen > len || (!in_ddr && !in_l2)) {
         error_report("anyka: %s: boot header does not fit (0x%x bytes to "
                      "0x%08x)", path, plen, load);
         exit(1);
@@ -337,7 +367,7 @@ static void ak_boot_rom_setup(const uint8_t *img, gsize len,
     rom_add_blob_fixed("anyka.bootrom", rom->data, rom->len * 4, 0);
     g_array_free(rom, true);
 
-    rom_add_blob_fixed("anyka.boot", img + AK_HDR_LEN, plen, load);
+    rom_add_blob_fixed("anyka.boot", img + hlen, plen, load);
     if (in_ddr) {
         /*
          * The ROM reads the header into L2 memory at +0x200 and leaves it
@@ -347,9 +377,8 @@ static void ak_boot_rom_setup(const uint8_t *img, gsize len,
          */
         rom_add_blob_fixed("anyka.boot-header-l2", img, AK_HDR_LEN,
                            AK_L2_MEM_BASE + AK_HDR_LEN);
-        if (load - AK_DDR_BASE >= AK_HDR_LEN) {
-            rom_add_blob_fixed("anyka.boot-header", img, AK_HDR_LEN,
-                               load - AK_HDR_LEN);
+        if (load - AK_DDR_BASE >= hlen) {
+            rom_add_blob_fixed("anyka.boot-header", img, hlen, load - hlen);
         }
     }
 }
@@ -548,6 +577,34 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(rb), 0, ak_regbanks[n].base);
     }
     /*
+     * AV100 extras (anycloud_ak3918av100_common.dtsi): the second MIPI/CSI
+     * receiver (0x20500000, the GPIO node's third reg) and the second L2
+     * buffer's SRAM (0x58000000, l2-buffer_1) -- the latter sits outside
+     * the ak-apb catch-all, so back it with storage.  Their controllers
+     * (second L2 DMA, NPU, the 0x212-0x215 video pipe) stay in the
+     * catch-all: the vendor modules probe them but no frames flow.
+     */
+    if (c->av100) {
+        static const struct {
+            const char *name;
+            hwaddr base;
+            uint32_t size;
+        } extra[] = {
+            { "ak-mipi1",      0x20500000, 0x100000 },
+            { "ak-l2-mem-1",   0x58000000, 0x10000 },
+        };
+
+        for (n = 0; n < ARRAY_SIZE(extra); n++) {
+            DeviceState *rb = qdev_new("hisi-regbank");
+
+            qdev_prop_set_uint32(rb, "size", extra[n].size);
+            qdev_prop_set_string(rb, "name", extra[n].name);
+            qdev_prop_set_bit(rb, "sub-word", true);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(rb), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(rb), 0, extra[n].base);
+        }
+    }
+    /*
      * Ethernet: a Synopsys GMAC driven by a synopGMAC-derived driver
      * (SDK drivers/net/ethernet/ak-ethernet), normal descriptors two
      * software words apart (DmaDescriptorSkip2), an RMII PHY at MDIO
@@ -641,3 +698,4 @@ DEFINE_AK_MACHINE("ak3918ev330", ak3918ev330, ak3918ev330_soc)
 DEFINE_AK_MACHINE("ak3919ev330", ak3919ev330, ak3919ev330_soc)
 DEFINE_AK_MACHINE("ak3918ev300l", ak3918ev300l, ak3918ev300l_soc)
 DEFINE_AK_MACHINE("ak3918av100", ak3918av100, ak3918av100_soc)
+DEFINE_AK_MACHINE("ak3918av100x", ak3918av100x, ak3918av100x_soc)
