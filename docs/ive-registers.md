@@ -481,7 +481,36 @@ known about them:
     reduced precision, a block-floating-point det/trace, a truncated
     reciprocal of the trace, or one to three steps of the secant
     iteration `x <- det / (trace - x)` (that last gets 26% of tensors
-    wrong and every one of the 579 with a measure over 100).
+    wrong and every one of the 579 with a measure over 100). Nor an
+    asymmetric window (1x3 for A and 3x1 for C and so on -- only the
+    plain 3x3 is free of contradictions), a discriminant approximated as
+    `alpha max(|A - C|, 2|B|) + beta min(...)` for any alpha and beta in
+    thirty-seconds, arithmetic with a limited mantissa (5 to 24 bits), a
+    linear blend of the two eigenvalues, or the trace times a small
+    lookup table in the anisotropy.
+
+  **Why a global fit cannot work, and what to fit instead.** Write
+  `a = sqrt((A - C)^2 + 4B^2) / trace` for the anisotropy. Binning the
+  measure by `a` shows its spread within a bin growing from 2.6% at
+  `a < 0.1` to 85% at `a > 0.9` -- because the lesser eigenvalue there is
+  a small difference of large numbers, so the engine's own rounding, in
+  whatever form, swamps the result. No closed formula can match those
+  samples, which is why every exact fit over all of them is infeasible by
+  construction. Fit the well-conditioned ones instead.
+
+  On those (`a <= 0.1`, 3309 samples with a measure of 5 or more), the
+  measure is **det/trace times about 0.07805** -- that is 1/12.814, and
+  not 5/64 = 0.078125, which is a percent too large and costs 20% of the
+  matches. The best scale gets **79%** of them exactly right, and no
+  choice of scale, of rounding, or of truncating the division before or
+  after the scale does better than about 80%: a second effect of a few
+  percent per sample remains. It is also established that the measure
+  vanishes as the tensor becomes singular (no sample with
+  `det/(AC) < 0.1` ever reaches 5), that it depends on *both*
+  eigenvalues -- `(11289, 0, 10800)` gives 431 and `(10809, 0, 10800)`
+  gives 421, the same lesser eigenvalue -- and that it is
+  rotation-invariant to within the quantisation where it is well
+  conditioned.
 
 
 V5's `ot_ive_ccblob` differs from V4's. It starts with a word of
