@@ -2078,7 +2078,7 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
         "flash part: an m25p80 NOR, default by size w25q64 (8 MiB), "
         "mx25l12805d (16 MiB), w25q256 (32 MiB); or a SPI NAND, w25n01gv "
         "(128/132 MiB), gd5f1gq4ub (136 MiB), gd5f2gq4ub (256/272 MiB), "
-        "mx35lf2ge4ab (264 MiB)");
+        "mx35lf2ge4ab (264 MiB); gd5f1gq5ue (136 MiB) by name only");
     object_class_property_add_str(oc, "variant",
         ingenic_get_variant, ingenic_set_variant);
     object_class_property_set_description(oc, "variant",
