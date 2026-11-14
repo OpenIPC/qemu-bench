@@ -33,6 +33,7 @@
 
 #define AK_SYSCTRL_BASE     0x08000000
 #define AK_SPI0_BASE        0x20120000
+#define AK_ASPEN_SPI0_BASE  0x21100000
 #define AK_SPI1_BASE        0x20128000
 #define AK_UART0_BASE       0x20130000
 #define AK_UART1_BASE       0x20138000
@@ -48,6 +49,8 @@
 #define AK_IRQ_SPI1         9
 #define AK_IRQ_UART0        10
 #define AK_IRQ_UART1        11
+#define AK_ASPEN_UART2_BASE 0x201A0000
+#define AK_ASPEN_IRQ_UART2  24
 #define AK_IRQ_L2           12
 #define AK_IRQ_GPIO         15
 #define AK_IRQ_MAC          16
@@ -139,6 +142,38 @@ static const AkSoCConfig ak3919ev330_soc = {
     .i2c_layout         = 2,
 };
 
+/*
+ * AK3918EV300L: the AnyCloud39AV130 SDK's unified tree (arch-ak3918ev300l,
+ * anycloud_ak3918ev300l*.dtsi), 64 MiB, ten timers in the EV330 layout,
+ * the EV200 / EV300 interrupt controller (ak_irq_v2.c falls back to it),
+ * SPI0 at 0x21100000.  Chip ID: anyka-socinfo.c reads SYSCTRL +0 >> 8 =
+ * 0x535434 ("4TS"); ipctool sees 0x53543400.
+ */
+static const AkSoCConfig ak3918ev300l_soc = {
+    .desc               = "Anyka AK3918EV300L (ARM926EJ-S, 64 MB DDR2)",
+    .chip_id            = 0x53543400,
+    .ram_size_default   = 64 * MiB,
+    .num_timers         = 10,
+    .flash_cs_gpio      = -1,
+    .i2c_layout         = 2,
+    .aspen              = true,
+};
+
+/*
+ * AK3918AV100: the same SDK's arch-ak3918av100 headers differ from the
+ * EV300L's only in comments; 128 MiB, socinfo 0x535335.  No firmware of
+ * one has been seen: unverified.
+ */
+static const AkSoCConfig ak3918av100_soc = {
+    .desc               = "Anyka AK3918AV100 (ARM926EJ-S, 128 MB DDR2)",
+    .chip_id            = 0x53533500,
+    .ram_size_default   = 128 * MiB,
+    .num_timers         = 10,
+    .flash_cs_gpio      = -1,
+    .i2c_layout         = 2,
+    .aspen              = true,
+};
+
 #define TYPE_AK_MACHINE MACHINE_TYPE_NAME("anyka")
 OBJECT_DECLARE_SIMPLE_TYPE(AkMachineState, AK_MACHINE)
 
@@ -181,12 +216,15 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
  * U-Boot port's mkaksh.py, and the dumps):
  *
  *   +0x00  branch, for a ROM that enters at the header
- *   +0x04  magic: "AKSH_240" (EV200), "ANYKA_H3" (EV300), "ANYKAH3B" (EV330)
+ *   +0x04  magic: "AKSH_240" (EV200), "ANYKA_H3" (EV300), "ANYKAH3B" (EV330),
+ *          "AK_H322L" / "AKH322LS" (EV300L), "ANYKA322" (AV100, inferred
+ *          from ak_ddr_param's table)
  *   +0x0C  length of what follows the header      +0x20  load address
  *   +0x2C  register script, {address, value} pairs, with markers in the
  *          address word: 0x66668888 = wait <value> (delay units),
  *          0x66668881 = poll <value> for <next word> (three words),
- *          0x88888888 = end
+ *          0x66668880 / 0x66668882 = EV300L ROM operations of one word
+ *          (SDK_CPU_DDR2.ini; skipped), 0x88888888 = end
  *   +0x18C "SPIP" + the SPI NOR descriptor the vendor drivers use
  *
  * The ROM replays the script -- DDR controller and PLLs -- then copies
@@ -201,6 +239,8 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
 #define AK_HDR_SPIP         0x18C
 #define AK_SCRIPT_DELAY     0x66668888
 #define AK_SCRIPT_POLL      0x66668881
+#define AK_SCRIPT_OP_MASK   0xFFFFFF00
+#define AK_SCRIPT_OP        0x66668800
 #define AK_SCRIPT_END       0x88888888
 
 #define AK_BOOTROM_SIZE     0x8000
@@ -213,20 +253,29 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
  * resets run after reset handlers and would undo it -- and the EV330's
  * script leaves the first stage its load parameters in timer registers.
  *
- *     add   r2, pc, #16        @ r2 = table
+ *     add   r2, pc, #32        @ r2 = table, at 0x28
  *  1: ldmia r2!, {r0, r1}
  *     cmp   r0, #0
  *     strne r1, [r0]
  *     bne   1b
  *     ldr   pc, [r2]
+ *
+ * Word 0x24 is a pointer into the ROM itself.  The EV300L vendor U-Boot's
+ * ak_spi_set_mode() takes the platdata of the SPI bus's parent, which is
+ * NULL, and so read-modify-writes SPICON at (ROM word 0x24) + 0: harmless
+ * on silicon, an alignment abort if a script word sits there.
  */
+#define AK_BOOTROM_SCRATCH  0x7F00
 static const uint32_t ak_bootrom_stub[] = {
-    0xE28F2010, 0xE8B20003, 0xE3500000, 0x15801000, 0x1AFFFFFB, 0xE592F000,
+    0xE28F2020, 0xE8B20003, 0xE3500000, 0x15801000, 0x1AFFFFFB, 0xE592F000,
+    0, 0, 0, AK_BOOTROM_SCRATCH,
 };
 
 static bool ak_boot_header_ok(const uint8_t *img, gsize len)
 {
-    static const char *const magic[] = { "AKSH_240", "ANYKA_H3", "ANYKAH3B" };
+    static const char *const magic[] = {
+        "AKSH_240", "ANYKA_H3", "ANYKAH3B", "AK_H322L", "AKH322LS", "ANYKA322",
+    };
     int i;
 
     if (len < AK_HDR_LEN) {
@@ -272,7 +321,7 @@ static void ak_boot_rom_setup(const uint8_t *img, gsize len,
             continue;
         }
         off += 8;
-        if (a == AK_SCRIPT_DELAY || !a) {
+        if ((a & AK_SCRIPT_OP_MASK) == AK_SCRIPT_OP || !a) {
             continue;
         }
         g_array_append_val(rom, a);
@@ -315,8 +364,13 @@ static uint32_t ak_flash_jedec(const uint8_t *img, gsize len)
     if (len >= AK_HDR_SPIP + 8 && !memcmp(img + AK_HDR_SPIP, "SPIP", 4)) {
         uint32_t id = ldl_le_p(img + AK_HDR_SPIP + 4);
 
-        /* Stored as read: manufacturer in the low byte. */
-        return ((id & 0xFF) << 16) | (id & 0xFF00) | ((id >> 16) & 0xFF);
+        /*
+         * Stored as read: manufacturer in the low byte.  The EV300L's
+         * descriptor is all zeroes (its drivers probe the part instead).
+         */
+        if (id) {
+            return ((id & 0xFF) << 16) | (id & 0xFF00) | ((id >> 16) & 0xFF);
+        }
     }
     return 0xC84017;            /* GD25Q64, the commonest fit */
 }
@@ -357,6 +411,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     qdev_prop_set_uint32(sysctrl, "chip-id", c->chip_id);
     qdev_prop_set_uint32(sysctrl, "num-timers", c->num_timers);
     qdev_prop_set_bit(sysctrl, "has-efuse", c->has_efuse);
+    qdev_prop_set_bit(sysctrl, "clk-v2", c->aspen);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(sysctrl), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sysctrl), 0, AK_SYSCTRL_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(sysctrl), 0,
@@ -375,9 +430,17 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(l2), 0,
                        qdev_get_gpio_in(sysctrl, AK_IRQ_L2));
 
-    for (n = 0; n < 2; n++) {
-        static const hwaddr base[2] = { AK_UART0_BASE, AK_UART1_BASE };
-        static const int irq[2] = { AK_IRQ_UART0, AK_IRQ_UART1 };
+    /*
+     * UART 2 on the EV300L and AV100 (their DTs: 0x201A0000, interrupt 24,
+     * its L2 rings after UART 1's), where the EV330 has I2C 2.
+     */
+    for (n = 0; n < (c->aspen ? 3 : 2); n++) {
+        static const hwaddr base[3] = {
+            AK_UART0_BASE, AK_UART1_BASE, AK_ASPEN_UART2_BASE,
+        };
+        static const int irq[3] = {
+            AK_IRQ_UART0, AK_IRQ_UART1, AK_ASPEN_IRQ_UART2,
+        };
 
         dev = qdev_new("ak-uart");
         qdev_prop_set_chr(dev, "chardev", serial_hd(n));
@@ -391,7 +454,9 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     }
 
     for (n = 0; n < 2; n++) {
-        static const hwaddr base[2] = { AK_SPI0_BASE, AK_SPI1_BASE };
+        const hwaddr base[2] = {
+            c->aspen ? AK_ASPEN_SPI0_BASE : AK_SPI0_BASE, AK_SPI1_BASE,
+        };
         static const int irq[2] = { AK_IRQ_SPI0, AK_IRQ_SPI1 };
         static const uint32_t rx_dev[2] = { AK_L2_DEV_SPI0_RX,
                                             AK_L2_DEV_SPI1_RX };
@@ -426,9 +491,14 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                                                            0));
     }
 
-    /* I2C 0, and the EV330's extra two (its DTS; harmless on the rest). */
+    /*
+     * I2C 0, and the EV330's extra two (its DTS; harmless on the rest).
+     * EV300L: I2C 2 at 0x201C0000, UART 2 (above) being at 0x201A0000.
+     */
     for (n = 0; n < 3; n++) {
-        static const hwaddr base[3] = { 0x20150000, 0x20190000, 0x201A0000 };
+        const hwaddr base[3] = {
+            0x20150000, 0x20190000, c->aspen ? 0x201C0000 : 0x201A0000,
+        };
         static const int irq[3] = { 13, 20, 29 };
 
         dev = qdev_new("ak-i2c");
@@ -438,9 +508,15 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(sysctrl, irq[n]));
     }
-    /* MCI0 (the SD slot, -drive if=sd) and MCI1 (SDIO Wi-Fi, empty). */
+    /*
+     * The SD slot (-drive if=sd) and an empty SDIO Wi-Fi controller: the
+     * slot is MCI0 on the older parts, MCI1 on the EV300L and AV100, whose
+     * vendor device trees put the TF card on mmc1 (0x20108000, pads 31-36,
+     * power on GPIO 50) and leave MCI0 to SDIO.
+     */
     for (n = 0; n < 2; n++) {
-        DriveInfo *di = n ? NULL : drive_get(IF_SD, 0, 0);
+        DriveInfo *di = n == (c->aspen ? 1 : 0) ? drive_get(IF_SD, 0, 0)
+                                                 : NULL;
 
         dev = sysbus_create_simple("ak-mci", 0x20100000 + 0x8000 * n,
                                    qdev_get_gpio_in(sysctrl, 4 + n));
@@ -563,3 +639,5 @@ DEFINE_AK_MACHINE("ak3918ev300", ak3918ev300, ak3918ev300_soc)
 DEFINE_AK_MACHINE("ak3919ev300", ak3919ev300, ak3919ev300_soc)
 DEFINE_AK_MACHINE("ak3918ev330", ak3918ev330, ak3918ev330_soc)
 DEFINE_AK_MACHINE("ak3919ev330", ak3919ev330, ak3919ev330_soc)
+DEFINE_AK_MACHINE("ak3918ev300l", ak3918ev300l, ak3918ev300l_soc)
+DEFINE_AK_MACHINE("ak3918av100", ak3918av100, ak3918av100_soc)

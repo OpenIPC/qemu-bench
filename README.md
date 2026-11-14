@@ -25,7 +25,7 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 8 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
@@ -243,10 +243,13 @@ either was at hand.
 | `ak3919ev300` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 3.4.35 vendor | —² |
 | `ak3918ev330` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
 | `ak3919ev330` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
+| `ak3918ev300l` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes |
+| `ak3918av100` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4 vendor (DT) | —³ |
 
 Anyka's camera SoCs, unrelated to HiSilicon: one memory map from the
-AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330), in
-`hw/arm/anyka.c`. The UART and the SPI master move their data through the
+AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330) and the
+AK3918EV300L / AK3918AV100 ("ASPEN": SPI0 moved to 0x21100000, a new clock
+block), in `hw/arm/anyka.c`. The UART and the SPI master move their data through the
 L2 buffer SRAM rather than FIFOs, which `hw/misc/ak-l2.c` models with its
 block handshakes and DMA. A camera's SPI-NOR dump boots the way the mask ROM
 does -- boot-header register script, then U-Boot (EV200 / EV300) or the
@@ -258,7 +261,8 @@ The SoC list from the SDKs, the map, the boot header and the dumps tried
 are in [docs/anyka.md](docs/anyka.md).
 
 ¹ An AK3916EV301 dump.  ² Same die and models as a tested sibling; no image
-was at hand.
+was at hand.  ³ The EV300L's twin in the SDK's headers; no firmware of one
+has been seen, and its boot-header magic (`ANYKA322`) is inferred.
 
 ### SigmaStar / MStar family (`qemu-system-arm`)
 

@@ -48,7 +48,8 @@
 OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 
 #define AK_SYSCTRL_SIZE     0x8000
-#define AK_SYSCTRL_NREGS    (0x200 / 4)
+#define AK_SYSCTRL_NREGS    (0x400 / 4)
+#define AK_SYSCTRL_NREGS_V1 (0x200 / 4)  /* migration version 1 */
 #define AK_TIMER_MAX        10
 #define AK_TIMER_FREQ       12000000
 /* Watchdog count unit: 21.333 us (ak_top_wdt.c UNIT_NS). */
@@ -57,6 +58,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 #define R_CHIP_ID           (0x00 / 4)
 #define R_CPU_PLL           (0x04 / 4)
 #define R_ASIC_PLL          (0x08 / 4)
+#define R_SPI0_CLK          (0x0C / 4)
+#define R_HS_CLK            (0x10 / 4)
 #define R_PERI_PLL1         (0x14 / 4)
 #define R_PERI_PLL2         (0x18 / 4)
 #define R_IRQ_MASK          (0x24 / 4)
@@ -73,6 +76,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 #define CPU_PLL_APPLY       (1u << 28)
 #define EFUSE_BUSY          (3u << 30)
 #define PERI_PLL2_APPLY     (1u << 29)
+/*
+ * EV300L / AV100 clock block (U-Boot clk-ak3918ev300l.h): writes that
+ * take effect when the clock settles, self-clearing.
+ */
+#define CLK_V2_PLL_ADJ      (7u << 28)
+#define CLK_V2_GCLK_VLD     (1u << 25)
+#define CLK_V2_DIV_VLD      ((1u << 29) | (1u << 19) | (1u << 9))
 
 #define IRQ_SYSCTRL         3
 
@@ -129,6 +139,7 @@ struct AkSysctrlState {
     uint32_t chip_id;
     uint32_t num_timers;
     bool has_efuse;
+    bool clk_v2;
 };
 
 /* CTRL1 / CTRL2 offsets of timer n (1-based in the vendor's naming). */
@@ -325,10 +336,27 @@ static void ak_sysctrl_write(void *opaque, hwaddr offset, uint64_t val,
     case R_INT_STATUS:
         return;
     case R_CPU_PLL:
-        /* The new PLL setting takes at once: the apply bit reads back 0. */
-        s->regs[R_CPU_PLL] = val & ~CPU_PLL_APPLY;
+        /*
+         * The new PLL setting takes at once: the apply bit reads back 0.
+         * EV300L / AV100: bits 30 / 29 / 28 apply PLL1 / PLL3 / PLL2.
+         */
+        s->regs[R_CPU_PLL] = val & ~(s->clk_v2 ? CLK_V2_PLL_ADJ
+                                                : CPU_PLL_APPLY);
+        return;
+    case R_ASIC_PLL:
+        s->regs[R_ASIC_PLL] = s->clk_v2 ? val & ~CLK_V2_GCLK_VLD : val;
+        return;
+    case R_SPI0_CLK:
+    case R_HS_CLK:
+        /* EV300L: SD ADC / SPI0 / SD DAC divider "valid" bits */
+        s->regs[offset / 4] = s->clk_v2 ? val & ~CLK_V2_DIV_VLD : val;
         return;
     case R_PERI_PLL2:
+        if (s->clk_v2) {
+            /* EV300L: CSI / MAC_OPCLK dividers; bit 9 is MAC's "valid" */
+            s->regs[R_PERI_PLL2] = val & ~(1u << 9);
+            return;
+        }
         s->regs[R_PERI_PLL2] = val & ~PERI_PLL2_APPLY;
         return;
     case R_EFUSE_CTRL:
@@ -383,9 +411,21 @@ static void ak_sysctrl_reset(DeviceState *dev)
      * 400 MHz CPU PLL, 400 MHz ASIC PLL (ASIC = /4 = 100 MHz), 600 MHz peri
      * PLL: what the boot header scripts and U-Boot program.
      */
-    s->regs[R_CPU_PLL] = 0x011253C8;
-    s->regs[R_ASIC_PLL] = 0x018213C8;
-    s->regs[R_PERI_PLL1] = 0x000012C8;
+    if (s->clk_v2) {
+        /*
+         * EV300L: 24 MHz * (M + 1) / (N + 1) / (OD + 1), M 12:0, N 18:13,
+         * OD 22:19.  PLL1 (CPU) 888 MHz is what the boot header script
+         * writes; PLL2 240 MHz with GCLK = PLL2 / 2(23:24 + 1) = 60 MHz
+         * is the reset default the clock driver's comment gives (U-Boot
+         * then sets 400 / 200 MHz).
+         */
+        s->regs[R_CPU_PLL] = 0x00000024;
+        s->regs[R_ASIC_PLL] = 0x00980027;
+    } else {
+        s->regs[R_CPU_PLL] = 0x011253C8;
+        s->regs[R_ASIC_PLL] = 0x018213C8;
+        s->regs[R_PERI_PLL1] = 0x000012C8;
+    }
     for (n = 0; n < AK_TIMER_MAX; n++) {
         AkTimer *t = &s->timer[n];
 
@@ -467,6 +507,7 @@ static const Property ak_sysctrl_properties[] = {
     DEFINE_PROP_UINT32("chip-id", AkSysctrlState, chip_id, 0x20160100),
     DEFINE_PROP_UINT32("num-timers", AkSysctrlState, num_timers, 5),
     DEFINE_PROP_BOOL("has-efuse", AkSysctrlState, has_efuse, false),
+    DEFINE_PROP_BOOL("clk-v2", AkSysctrlState, clk_v2, false),
 };
 
 static const VMStateDescription vmstate_ak_timer = {
@@ -489,17 +530,26 @@ static int ak_sysctrl_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ak_sysctrl = {
     .name = TYPE_AK_SYSCTRL,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = ak_sysctrl_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS),
+        /*
+         * Version 1 had 0x200 bytes of registers; the EV300L's pad
+         * registers run past them. A version-1 stream leaves the upper
+         * half at its reset value.
+         */
+        VMSTATE_SUB_ARRAY(regs, AkSysctrlState, 0, AK_SYSCTRL_NREGS_V1, 0,
+                          vmstate_info_uint32, uint32_t),
         VMSTATE_UINT32(level, AkSysctrlState),
         VMSTATE_STRUCT_ARRAY(timer, AkSysctrlState, AK_TIMER_MAX, 1,
                              vmstate_ak_timer, AkTimer),
         VMSTATE_UINT16_ARRAY(rtc, AkSysctrlState, RTC_NREGS),
         VMSTATE_PTIMER(wdt, AkSysctrlState),
         VMSTATE_UINT32(wdt_load, AkSysctrlState),
+        VMSTATE_SUB_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS_V1,
+                          AK_SYSCTRL_NREGS - AK_SYSCTRL_NREGS_V1, 2,
+                          vmstate_info_uint32, uint32_t),
         VMSTATE_END_OF_LIST()
     }
 };

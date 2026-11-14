@@ -22,6 +22,10 @@ script plays the vendor drivers (docs/anyka.md):
     and reading STATUS clears it;
   - a full-duplex PIO transfer that fills the RX FIFO loses no TX byte, and
     an L2 read whose DMA ends in a short fraction drains the buffer;
+  - ak3918ev300l: an AK_H322L header whose script carries the one-word
+    ROM operations, the chip ID, the clock block's self-clearing apply /
+    valid bits, SPI0 at 0x21100000 with WORK_MODE, ROM word 0x24 a
+    harmless in-ROM pointer;
   - outside qtest: a flash image smaller than an erase block is refused,
     machine state migrates to a file and back on five- and ten-timer
     parts, and a file-backed flash blocks migration.
@@ -140,10 +144,10 @@ def make_image(path, magic=b'ANYKA_H3'):
 
 def test_boot_rom(qt, code):
     print('mask ROM')
-    stub = [0xE28F2010, 0xE8B20003, 0xE3500000, 0x15801000, 0x1AFFFFFB,
-            0xE592F000]
-    check('ROM stub at 0', [qt.readl(4 * i) for i in range(6)] == stub, True)
-    table = [qt.readl(0x18 + 4 * i) for i in range(7)]
+    stub = [0xE28F2020, 0xE8B20003, 0xE3500000, 0x15801000, 0x1AFFFFFB,
+            0xE592F000, 0, 0, 0, 0x7F00]
+    check('ROM stub at 0', [qt.readl(4 * i) for i in range(10)] == stub, True)
+    table = [qt.readl(0x28 + 4 * i) for i in range(7)]
     check('script table, delay dropped, then {0, 0} and the entry',
           table == [DDRC + 0x04, 0x0D493315, DDRC + 0x0C, 0x00000A8B,
                     0, 0, LOAD], True)
@@ -422,6 +426,76 @@ def test_ev330(qemu, path):
         qt.close()
 
 
+SPI0_ASPEN = 0x21100000
+UART2_ASPEN = 0x201A0000
+
+
+def test_ev300l(qemu, path):
+    print('ak3918ev300l: AK_H322L header, clocks, SPI0 at 0x21100000')
+    img = bytearray(open(path, 'rb').read())
+    script = [DDRC + 0x14, 0x00423E71,
+              0x66668881, DDRC + 0xA4, 0x10000,     # poll: three words
+              DDRC + 0x0C, 0x00001A5D,
+              0x66668882, 0x54535150,               # one-word ROM ops
+              0x66668880, 0x1,
+              0x88888888, 0]
+    img[0x2C:0x18C] = b'\0' * 0x160
+    struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x190:0x194] = b'\0' * 4                   # SPIP with no ID
+    open(path, 'wb').write(img)
+    out2 = path + '.uart2'
+    qt = QTest(qemu, 'ak3918ev300l,flash-file=%s' % path,
+               ['-serial', 'null', '-serial', 'null',
+                '-serial', 'file:' + out2])
+    try:
+        table = [qt.readl(0x28 + 4 * i) for i in range(7)]
+        check('script: poll and ROM ops dropped', table ==
+              [DDRC + 0x14, 0x00423E71, DDRC + 0x0C, 0x00001A5D,
+               0, 0, LOAD], True)
+        check('ROM word 0x24 points into the ROM', qt.readl(0x24), 0x7F00)
+        check('chip ID', qt.readl(SYSCTRL), 0x53543400)
+        qt.writel(SYSCTRL + 0x04, 0x40000024)
+        check('PLL1 adjust bit self-clears', qt.readl(SYSCTRL + 0x04),
+              0x24)
+        qt.writel(SYSCTRL + 0x08, 0x02280063)
+        check('GCLK divider valid bit self-clears',
+              qt.readl(SYSCTRL + 0x08), 0x00280063)
+        qt.writel(SYSCTRL + 0x0C, (1 << 19) | (1 << 18) | (2 << 10))
+        check('SPI0 HS clock divider valid bit self-clears',
+              qt.readl(SYSCTRL + 0x0C), (1 << 18) | (2 << 10))
+        qt.writel(SYSCTRL + 0x264, 0x1234)
+        check('pad registers past 0x200 are storage',
+              qt.readl(SYSCTRL + 0x264), 0x1234)
+        s = SPI0_ASPEN
+        qt.writel(s + 0x24, qt.readl(s + 0x24) | 1)
+        check('WORK_MODE normal mode reads back', qt.readl(s + 0x24) & 1, 1)
+        qt.writel(s, 0x72)
+        qt.writel(s + 0x0C, 1)
+        qt.writel(s + 0x18, 0x9F)
+        qt.writel(s, 0x71)
+        qt.writel(s + 0x0C, 3)
+        jedec = qt.readl(s + 0x1C) & 0xFFFFFF
+        qt.writel(s, 0x51)
+        check('RDID through SPI0 at 0x21100000 (empty SPIP: GD25Q64)',
+              int.from_bytes(jedec.to_bytes(3, 'little'), 'big'), 0xC84017)
+        # UART 2 at 0x201A0000, its TX ring at L2 + 0x1200
+        qt.writel(L2MEM + 0x1200, ord('2'))
+        qt.writel(UART2_ASPEN + 0x00, 1 << 28)
+        qt.writel(UART2_ASPEN + 0x04, (1 << 4) | (1 << 16))
+        check('UART2: TX done reads as idle',
+              (qt.readl(UART2_ASPEN + 0x04) >> 19) & 1, 1)
+        time.sleep(0.2)
+        check('UART2: byte reached the third serial port',
+              open(out2, 'rb').read(), b'2')
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ak3918av100,flash-file=%s' % path)
+    try:
+        check('ak3918av100 chip ID', qt.readl(SYSCTRL), 0x53533500)
+    finally:
+        qt.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -451,6 +525,9 @@ def main():
     path330 = os.path.join(tmp, 'flash330.bin')
     make_image(path330, b'ANYKAH3B')
     test_ev330(args.qemu, path330)
+    path300l = os.path.join(tmp, 'flash300l.bin')
+    make_image(path300l, b'AK_H322L')
+    test_ev300l(args.qemu, path300l)
     test_rejections_and_migration(args.qemu, tmp, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
