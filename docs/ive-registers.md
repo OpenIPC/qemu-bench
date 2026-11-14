@@ -575,12 +575,13 @@ files):
 
 - 48 LK files, by design: that op is modelled to a tolerance, within
   0.03 pixels, so its flow and error words differ by up to 4 Q7 units.
-- 18 Shi-Tomasi eigen maps (`st_s*_eig`, `strec_tr*_eig`), op 25's own
+- 14 Shi-Tomasi eigen maps (`st_s*_eig`, `strec_tr*_eig`), op 25's own
   residual (#300): 7.5% of pixels, by one count on 5.5% of them and by
-  two on the remaining 2%. One `max_eig` follows from it, and so do
-  four candidate maps -- but only just: 3, 4, 10 and 31 pixels of 4096,
-  and the six pictures whose measure peaks below `quality_level` come
-  out empty on both sides, as the clamped ratio above says they must.
+  two on the remaining 2%. One `max_eig` and one corner list follow
+  from it, and so do four candidate maps -- but only just: 3, 4, 10 and
+  31 pixels of 4096, and the six pictures whose measure peaks below
+  `quality_level` come out empty on both sides, as the clamped ratio
+  above says they must.
 - 29 canny_hys_edge files (#308), 2 to 21 pixels of 4096 on the edge
   maps and more of the seed stack, which the thinning's raster order
   amplifies. Not yet characterised.
