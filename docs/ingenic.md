@@ -496,7 +496,8 @@ keep the single-command path. Three details matter:
 ### `ingenic-spinand`
 
 A SPI NAND on the SSI bus (`hw/block/ingenic-spinand.c`), one QOM type
-per part (`w25n01gv`, `gd5f1gq4ub`, `gd5f2gq4ub`, `mx35lf2ge4ab`): READ ID
+per part (`w25n01gv`, `gd5f1gq4ub`, `gd5f2gq4ub`, `mx35lf2ge4ab`,
+`gd5f1gq5ue`): READ ID
 (the ID after one dummy byte; the drivers try without and with it), page
 read to the cache (0x13), read from cache 0x03/0x0B/0x3B/0x6B (two column
 bytes, 8 dummy clocks; the bit above the column is a plane select that a
@@ -507,7 +508,25 @@ erase 0xD8, get/set feature A0 (protection; locked at power-up, and
 program/erase fail with P_FAIL/E_FAIL while any BP bit is set), B0
 (ECC enable, BUF, QE), C0 (status), D0/F0, write enable/disable, reset.
 Operations finish at once; `busy-polls=n` keeps OIP up for the next n
-status reads after each one. On-die ECC never reports an error.
+status reads after each one.
+
+On-die ECC reports no error of its own. `ecc-fail=` makes it: a list of
+absolute page numbers and ranges (`4470,16190-16191`) whose page read sets
+the status ECC bits 5:4 to 10b, uncorrectable, while ECC is on (B0 bit 4).
+The data still reaches the cache, as on a part, so it tests what the host
+does with the error. The 3.10 `jz_sfc_nand` returns -EBADMSG from
+`mtd_read` for it (for C8 51 and the D1..D4 GigaDevice parts; B1..B4 want
+111b), which mtdblock turns into `Buffer I/O error` and `/dev/mtdN`'s
+`read()` ignores -- the camera in OpenIPC/ipctool#283, reproduced with:
+
+```bash
+./qemu-src/build/qemu-system-mipsel -M t31,flash-file=nand.bin,flash-type=gd5f1gq5ue \
+    -global gd5f1gq5ue.ecc-fail=4470,16190 -kernel uImage -initrd rootfs.squashfs ...
+```
+
+`gd5f1gq5ue` (C8 51, the GD5F1GQ5UEYIGR) is in the 3.10 kernel's table
+but not the SPL's or U-Boot's, so it boots with `-kernel` only, and only
+by `flash-type=`: its 136 MiB image is `gd5f1gq4ub`'s size.
 
 ### `ingenic-msc`
 
