@@ -8,6 +8,7 @@
  *   gd5f1gq4ub    GigaDev  C8 D1     2048 + 128, 1024 blocks (1 Gbit)
  *   gd5f2gq4ub    GigaDev  C8 D2     2048 + 128, 2048 blocks (2 Gbit)
  *   mx35lf2ge4ab  Macronix C2 22     2048 + 64,  2048 blocks, 2 planes
+ *   gd5f1gq5ue    GigaDev  C8 51     2048 + 128, 1024 blocks (1 Gbit)
  *
  * Commands (one per chip-select assertion):
  *
@@ -27,7 +28,7 @@
  *   0F a / 1F a v  GET / SET FEATURE: A0 protection, B0 configuration
  *              (ECC enable bit 4, BUF bit 3 on Winbond, QE bit 0 on
  *              GigaDevice), C0 status (OIP 0, WEL 1, E_FAIL 2, P_FAIL 3,
- *              ECC 5:4 -- always "no error"), D0/F0 storage.  A GET
+ *              ECC 5:4 of the last page read), D0/F0 storage.  A GET
  *              FEATURE keeps clocking the register out, which is what
  *              a status-poll phase of the SFC reads.
  *   06 / 04    WRITE ENABLE / DISABLE; program execute and erase need
@@ -41,8 +42,15 @@
  * The protection register comes up with the block-protect bits set (as
  * on the parts); with any of BP bits 6:3 set, program and erase fail
  * with P_FAIL / E_FAIL.  Every driver clears it first.  ECC is on-die
- * and never sees an error; the OOB is plain storage.  All blocks are
+ * and sees no error of its own; the OOB is plain storage.  All blocks are
  * good: a blank part reads FF everywhere, bad-block markers included.
+ *
+ * ecc-fail = "p[-q][,...]" names pages (absolute page numbers) whose
+ * page read reports an uncorrectable ECC error, status ECC 5:4 = 10b,
+ * while ECC is enabled (B0 bit 4).  The data still reaches the cache, as
+ * on the parts, so what the host does with the error is what is tested:
+ * Linux returns -EBADMSG from mtd_read, which mtdblock turns into an I/O
+ * error and /dev/mtdN's read ignores.
  *
  * Backing store ("drive"): either the whole raw array, page by page
  * (data then OOB, pages * (page + oob) bytes), or the data alone
@@ -87,6 +95,8 @@ static const SpiNandPart spinand_parts[] = {
       0x38, 0x10 },
     { "mx35lf2ge4ab", { 0xc2, 0x22, 0x00 }, 2048, 64,  64, 2048, 2,
       0x38, 0x10 },
+    { "gd5f1gq5ue",   { 0xc8, 0x51, 0x00 }, 2048, 128, 64, 1024, 1,
+      0x38, 0x10 },
 };
 
 #define FEAT_PROT   0xa
@@ -97,6 +107,9 @@ static const SpiNandPart spinand_parts[] = {
 #define ST_WEL      (1u << 1)
 #define ST_EFAIL    (1u << 2)
 #define ST_PFAIL    (1u << 3)
+#define ST_ECC_MASK (3u << 4)
+#define ST_ECC_FAIL (2u << 4)
+#define CFG_ECC_EN  (1u << 4)
 #define PROT_BP     0x78
 
 #define DUMMY_CLOCKS 8
@@ -114,6 +127,9 @@ struct SpiNandState {
 
     BlockBackend *blk;
     uint32_t busy_polls;
+    char *ecc_fail;         /* "p[-q][,...]" */
+    uint32_t *ecc_ranges;    /* first, last; n_ecc_ranges pairs */
+    uint32_t n_ecc_ranges;
 
     const SpiNandPart *part;
     uint32_t page_size, oob_size, ppb;
@@ -198,11 +214,60 @@ static uint32_t spinand_column(SpiNandState *s, uint32_t col, bool read)
     return col & ((1u << s->col_bits) - 1);
 }
 
+static bool spinand_ecc_fails(SpiNandState *s, uint32_t row)
+{
+    uint32_t i;
+
+    for (i = 0; i < s->n_ecc_ranges; i++) {
+        if (row >= s->ecc_ranges[2 * i] && row <= s->ecc_ranges[2 * i + 1]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void spinand_page_read(SpiNandState *s, uint32_t row)
 {
     s->row = row % s->pages;
     memcpy(s->cache, spinand_page(s, row), s->raw);
+    s->feat[FEAT_STATUS] &= ~ST_ECC_MASK;
+    if ((s->feat[FEAT_CFG] & CFG_ECC_EN) && spinand_ecc_fails(s, s->row)) {
+        s->feat[FEAT_STATUS] |= ST_ECC_FAIL;
+    }
     spinand_set_busy(s);
+}
+
+/* ecc-fail: "p[-q][,p[-q]...]", decimal or 0x page numbers. */
+static bool spinand_parse_ecc_fail(SpiNandState *s, Error **errp)
+{
+    gchar **items;
+    int i;
+
+    if (!s->ecc_fail || !*s->ecc_fail) {
+        return true;
+    }
+    items = g_strsplit(s->ecc_fail, ",", -1);
+    s->n_ecc_ranges = g_strv_length(items);
+    s->ecc_ranges = g_new(uint32_t, 2 * s->n_ecc_ranges);
+    for (i = 0; items[i]; i++) {
+        char *end;
+        unsigned long lo = strtoul(items[i], &end, 0), hi = lo;
+
+        if (*end == '-') {
+            hi = strtoul(end + 1, &end, 0);
+        }
+        if (end == items[i] || *end || hi < lo || hi >= s->pages) {
+            error_setg(errp, "%s: ecc-fail: '%s' is not a page or a range "
+                       "of pages below %u", s->part->name, items[i],
+                       s->pages);
+            g_strfreev(items);
+            return false;
+        }
+        s->ecc_ranges[2 * i] = lo;
+        s->ecc_ranges[2 * i + 1] = hi;
+    }
+    g_strfreev(items);
+    return true;
 }
 
 static void spinand_program(SpiNandState *s, uint32_t row)
@@ -422,6 +487,9 @@ static void spinand_realize(SSIPeripheral *ss, Error **errp)
     const SpiNandPart *p = s->part;
     uint64_t data_size, raw_size;
 
+    if (!spinand_parse_ecc_fail(s, errp)) {
+        return;
+    }
     data_size = (uint64_t)s->pages * p->page_size;
     raw_size = (uint64_t)s->pages * s->raw;
     s->array = g_malloc(raw_size);
@@ -494,6 +562,7 @@ static void spinand_reset(DeviceState *dev)
 static const Property spinand_props[] = {
     DEFINE_PROP_DRIVE("drive", SpiNandState, blk),
     DEFINE_PROP_UINT32("busy-polls", SpiNandState, busy_polls, 0),
+    DEFINE_PROP_STRING("ecc-fail", SpiNandState, ecc_fail),
 };
 
 static const VMStateDescription vmstate_spinand = {
