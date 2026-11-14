@@ -1430,7 +1430,8 @@ jobs:
   # carries tun as a module; cv200 has it built in (OpenIPC/firmware#2844).
   vtund-neo:
     name: vtund tunnel ${{ matrix.soc }} neo
-    needs: build
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['vtund-neo']
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -1998,6 +1999,7 @@ jobs:
       - majestic-ingenic
       - boot-hi3516cv610
       - boot-hi3516ev300-nand
+      - vtund-neo
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

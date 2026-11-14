@@ -89,6 +89,7 @@ JOB_FAMILIES = {
     "boot-grainmedia": {"grainmedia"},
     "boot-ingenic": {"ingenic"},
     "majestic-ingenic": {"ingenic"},
+    "vtund-neo": {"hisilicon"},
 }
 SPECIAL_JOBS = {"select", "build", "boot", "ci-gate"}
 
