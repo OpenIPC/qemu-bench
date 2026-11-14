@@ -203,6 +203,12 @@ static const XmSoCConfig xm530_soc = {
     .ddrc_mirror        = 0x10B8,
     .ddrc_mirror_of     = 0x10A8,
     .gpio_base          = 0x10020000,
+    /* dwc_otg.ko registers the platform device itself: the DWC2 OTG core
+     * at 0x50300000, IRQ 76 (SPI 44), the same as the V200 series' xm_usb0.
+     * The USB Wi-Fi of these boards (XM711, ATBM6032 / XM713G) sits on it,
+     * powered by wifi_pdn.ko's pad. */
+    .usb_base           = 0x50300000,
+    .usb_irq            = 44,
     .num_regbanks       = 5,
     .regbanks           = {
         { "xm-i2c1",     0x10001000, 0x0F000 },  /* xm_i2c1, unmodelled */

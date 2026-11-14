@@ -353,6 +353,15 @@ XM530V200 and XM535 get QEMU's `dwc2-usb` (raspi's model) at 0x50300000.
 Its root port takes any QEMU USB device; give `bus=usb-bus.0,port=1` to
 plug one in directly instead of behind QEMU's automatic hub.
 
+XM530 and XM550 have the same core at the same place: their `dwc_otg.ko`
+(Synopsys's driver, not `dwc2.ko`) registers the platform device itself,
+with 0x50300000 and IRQ 76 (SPI 44) in its own resource table. Their USB
+Wi-Fi (XM711, or an ATBM6032 / XM713G with `wifi_pdn.ko value=96`) sits on
+it. An OpenIPC `xm530_lite` image on `-M xm550` with `atbm-wifi` plugged in
+enumerates 007a:8888 after `modprobe dwc_otg`; with an ATBM driver that
+modprobe can find, wlan0 associates, takes a lease and pings
+(OpenIPC/firmware#2853, #2854).
+
 Their Wi-Fi is an AltoBeam ATBM60xx USB dongle (`atbm-wifi`):
 
 ```sh
