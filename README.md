@@ -80,10 +80,13 @@ boot with a jffs2 root. No vendor artifacts are committed here; see the script
 header for how to build them from the SDK.
 
 The three dual-core Cortex-A7 parts (`hi3516cv500`, `hi3516dv300`,
-`hi3516av300`) boot both cores with `-smp 2`, from `-kernel` and from a
+`hi3516av300`) boot both cores by default, from `-kernel` and from a
 `flash-file` image alike. As on silicon, the kernel writes a reset trampoline
 at physical 0 and clears CPU1's soft-reset bit in CRG `REG_CPU_SRST_CRG`
-(0x78), and that bit drives CPU1's power state. The default is still one CPU.
+(0x78), and that bit drives CPU1's power state. `-smp 1` still works for the
+vendor 4.9 kernel, but with a single GIC CPU interface no SPI reaches a CPU,
+and the OpenIPC neo kernel (mainline 7.0) stalls in its driver initcalls
+(#290).
 The other "MP2" parts leave CPU1 offline: their vendor release methods are not
 modelled yet.
 
