@@ -843,6 +843,21 @@ boots ~14 SoCs (HiSilicon, Goke, Xiongmai) to a login prompt, plus dedicated
 Linux ping+curl, and SPI-NOR erase/program steps. Everything runs under TCG on
 GitHub runners, so a boot iteration is minutes — smoke-test locally first.
 
+A PR or master push runs only the jobs its paths reach; the weekly `schedule`
+run (and `workflow_dispatch`) runs everything. The `select` job's
+`.github/scripts/ci-select.py` decides. A model reaches the family its file
+name names, the families qemu/setup.sh builds it under, and transitively every
+family whose code names its QOM type, TYPE_ macro or header. Scripts reach the
+jobs whose workflow text names them. setup.sh, ci.yml and
+`.github/ci/boot-matrix.yml` (the `boot` rows, each with a `group`) are read
+by their diff. Docs run nothing. Anything unrecognised runs everything. Dry-run
+a change with `git diff --name-only master | python3
+.github/scripts/ci-select.py --stdin --base master`; `--explain <path>` shows
+what a path reaches. A new job must go into the script's `JOB_FAMILIES` and a
+new qtest step needs an `if:` on its `qtests` entry: `--self-test`, run in
+`select`, fails the PR otherwise. The only required check is `CI Gate`, which
+fails if a job select asked for did not succeed.
+
 ## Conventions
 
 Commit subjects are `<area>: <imperative summary> (#PR)` where area is a

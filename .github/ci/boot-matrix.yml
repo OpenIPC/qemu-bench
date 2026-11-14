@@ -1,0 +1,210 @@
+# Rows of the `boot` job in ci.yml: one OpenIPC release booted per row.
+#
+# They live here rather than inline because .github/scripts/ci-select.py
+# narrows them to the families a change reaches and hands the job the result
+# as JSON.  `group` is the family whose code a row exercises; the selector's
+# --self-test rejects a row without a known one.
+include:
+  # mem/kernel_mem_mb/MMZ layout now lives in HisiSoCConfig; no -m
+  # override here so CI exercises the same defaults as the run
+  # scripts and real users.
+  - name: hi3516cv100
+    group: hisilicon
+    soc: hi3516cv100
+    machine: hi3516cv100
+    append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3516cv100-universal.bin
+
+  - name: hi3516cv200
+    group: hisilicon
+    soc: hi3516cv200
+    machine: hi3516cv200
+    append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3516cv200-universal.bin
+    flash_mem: 256M
+
+  - name: hi3516av100
+    group: hisilicon
+    soc: hi3516av100
+    machine: hi3516av100
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3516av100-universal.bin
+
+  - name: hi3516cv300
+    group: hisilicon
+    soc: hi3516cv300
+    machine: hi3516cv300
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3516cv300-universal.bin
+    flash_mem: 256M
+
+  # The 1M sibling of cv300: same die and map, 64 MiB, SCSYSID0
+  # variant byte 4.
+  - name: hi3516ev100
+    group: hisilicon
+    soc: hi3516ev100
+    machine: hi3516ev100
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3516ev100-universal.bin
+
+  # cv500 family covers av300 (same die, av300 is variant id 5);
+  # one Linux + U-Boot gate exercises both.  flash_mem=1G because
+  # the OpenIPC cv500 U-Boot is built assuming the platform-max
+  # 1 GiB DDR and relocates itself to top-of-RAM (~0xBFEE2000).
+  # The default 128 MiB ram_size leaves that target unmapped,
+  # the relocation jump faults, and the CPU resets in a loop.
+  - name: hi3516cv500
+    group: hisilicon
+    soc: hi3516cv500
+    machine: hi3516cv500
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    # Dual Cortex-A7: CPU1 released through CRG REG_CPU_SRST_CRG (#34)
+    smp: 2
+    ping_linux: true
+    uboot_bin: u-boot-hi3516cv500-universal.bin
+    flash_mem: 1G
+
+  - name: hi3519v101
+    group: hisilicon
+    soc: hi3519v101
+    machine: hi3519v101
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3519v101-universal.bin
+
+  - name: hi3516ev300
+    group: hisilicon
+    soc: hi3516ev300
+    # sensor=none skips the SoC-default IMX335 attach so OpenIPC's
+    # /usr/sbin/load_hisilicon does not insmod the vendor MPP blob
+    # (which segfaults on QEMU and prevents reaching login).
+    machine: hi3516ev300,sensor=none
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs mtdparts=hi_sfc:256k(boot),64k(env),3072k(kernel),10240k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    uboot_bin: u-boot-hi3516ev300-universal.bin
+    flash_mem: 128M
+    # Exercise the HiFMC NOR erase+program path from Linux userspace
+    # (flash_eraseall + flashcp -v). Guards the erase-address/WEL fix
+    # that OpenIPC firstboot & sysupgrade depend on. ev300 stands in
+    # for all hisi-fmc SoCs (the fix is in shared hisi-fmc.c).
+    flash_rw: true
+
+  # gk7205v500 (Goke V500) full-Linux boot regression gate.
+  # The goke V500 OpenIPC kernel uses an "xmsp804" timer
+  # (4 single-timer blocks at 0x100 stride, hisi-xmsp804.c);
+  # before the fix Linux hung at "Calibrating delay loop" because
+  # the periodic timer IRQ at block1 (0x12000100, GIC SPI 27) was
+  # never delivered.  Plain console=ttyAMA0 (no earlycon) suffices
+  # once the timer IRQ works.  Stands in for the whole V500 family
+  # (gk7205v510/v530, gk7202v330 share the xmsp804 wiring).
+  - name: gk7205v500
+    group: hisilicon
+    soc: gk7205v500
+    machine: gk7205v500,sensor=none
+    append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs"
+
+  # hi3516cv610 (V5) has its own boot-hi3516cv610 job below: its
+  # OpenIPC release is a combined firmware.bin (FIT kernel+dtb with an
+  # appended SquashFS) under the SoC-family name, so it needs an
+  # extraction step and doesn't fit this download/boot matrix.
+
+  # NVR/DVR family — OpenIPC ships nor-lite firmware (kernel +
+  # rootfs) and u-boot-${soc}-universal.bin for 3 SoCs:
+  # hi3520dv200, hi3536cv100, hi3536dv100.  Linux boot test runs
+  # for all three; all three also run the full U-Boot ping path
+  # (parallel to hi3516av100, openhisilicon#59 / #74).  See the
+  # per-SoC notes in qemu/hw/arm/hisilicon.c for which Ethernet
+  # controller each instantiates (hieth-sf, femac, gmac).
+  - name: hi3520dv200
+    group: hisilicon
+    soc: hi3520dv200
+    machine: hi3520dv200
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
+    ping_linux: true
+    uboot_bin: u-boot-hi3520dv200-universal.bin
+
+  - name: hi3536cv100
+    group: hisilicon
+    soc: hi3536cv100
+    machine: hi3536cv100
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
+    uboot_bin: u-boot-hi3536cv100-universal.bin
+
+  - name: hi3536dv100
+    group: hisilicon
+    soc: hi3536dv100
+    machine: hi3536dv100
+    append: "console=ttyAMA0,115200 earlyprintk root=/dev/ram0 rootfstype=squashfs"
+    ping_linux: true
+    uboot_bin: u-boot-hi3536dv100-universal.bin
+
+  # Xiongmai XM510 (hw/arm/xiongmai.c): the vendor 3.0.101 kernel on a
+  # PL190 VIC, SP804, xmsfc NOR and the xmmac DWMAC 10/100.  No
+  # uboot_bin -- OpenIPC publishes no XM U-Boot.  flash_rw runs the
+  # xmsfc erase/program path on an 8 MiB NOR, the only size the
+  # XM510 kernel's chip table knows.
+  # mem= first, as U-Boot passes it: load_xiongmai sizes MMZ from the
+  # first argument, and without it lays MMZ over the whole kernel.
+  # Since the media blocks are modelled, VI and the H1 really write
+  # those buffers, and the guest dies or corrupts its overlay.
+  # mem=20M rather than the board's 18M: the -initrd boot needs it
+  # (QEMU loads the initrd at 16 MiB, half of RAM), and at 18M
+  # `sysupgrade --archive` refuses on silicon too, with no room in
+  # /tmp to unpack it.  test-xm-stream.sh runs the board's 18M.
+  - name: xm510
+    group: xiongmai
+    soc: xm510
+    machine: xm510
+    append: "mem=20M console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    flash_rw: true
+    flash_rw_mem: 32M
+    mtd_name: xm_sfc
+    flash_mb: 8
+    cmdline_prefix: "mem=20M"
+    # sysupgrade, firstboot and the firmware#2613 overlay case, on the
+    # 32 MB board where sysupgrade's RAM phase is tightest.
+    flash_tests: true
+    overlay_keep: true
+    # Last xm510 kernel without jffs2 xattrs (before firmware#2606).
+    overlay_keep_kernel: nightly-20261015-1d9c834
+    stream_test: true
+
+  # Xiongmai XM530 (hw/arm/xiongmai.c): dual Cortex-A5 MPCore (A9
+  # stand-in, GIC, TWD, PL310), xmsfc v2, DWMAC at 0x10010000.  CPU1
+  # comes up through REG_SC_REMAP + REG_CPU1_SOFT_RST as on silicon.
+  #
+  # The flash tests put mem= FIRST (cmdline_prefix), as OpenIPC's
+  # U-Boot passes it: load_xiongmai sizes MMZ from the first
+  # argument, and without it lays MMZ over all of RAM, majestic
+  # Oopses in mmz, never stops the xm_wdt the same script started,
+  # and the guest resets a minute later.  Not on the -initrd boot
+  # above: QEMU loads the initrd high in RAM, past a mem=32M kernel.
+  - name: xm530
+    group: xiongmai
+    soc: xm530
+    machine: xm530
+    smp: 2
+    append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
+    ping_linux: true
+    flash_rw: true
+    flash_rw_mem: 64M
+    mtd_name: xm_sfc
+    flash_mb: 8
+    cmdline_prefix: "mem=32M"
+    flash_tests: true
+    stream_test: true
+
+  # XM550 is the XM530 die with 128 MB; OpenIPC ships it the xm530
+  # image, so this boots that bundle on the 128 MB machine.
+  - name: xm550
+    group: xiongmai
+    soc: xm530
+    machine: xm550
+    smp: 2
+    append: "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mtdparts=xm_sfc:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
