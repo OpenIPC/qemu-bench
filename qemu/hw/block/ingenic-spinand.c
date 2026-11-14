@@ -45,7 +45,8 @@
  * and sees no error of its own; the OOB is plain storage.  All blocks are
  * good: a blank part reads FF everywhere, bad-block markers included.
  *
- * ecc-fail = "p[-q][,...]" names pages (absolute page numbers) whose
+ * ecc-fail = "p[-q][,...]" names pages (absolute page numbers, decimal
+ * or 0x hex) whose
  * page read reports an uncorrectable ECC error, status ECC 5:4 = 10b,
  * while ECC is enabled (B0 bit 4).  The data still reaches the cache, as
  * on the parts, so what the host does with the error is what is tested:
@@ -237,7 +238,32 @@ static void spinand_page_read(SpiNandState *s, uint32_t row)
     spinand_set_busy(s);
 }
 
-/* ecc-fail: "p[-q][,p[-q]...]", decimal or 0x page numbers. */
+/*
+ * One page number of ecc-fail at *p: decimal, or hex after 0x -- never
+ * octal, so 010 is page 10. Digits are required: an empty end of a
+ * range, a sign or a space is an error, not page 0.
+ */
+static bool spinand_parse_page(const char **p, uint32_t pages,
+                               unsigned long *page)
+{
+    const char *digits = *p;
+    int base = 10;
+    char *end;
+
+    if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        digits += 2;
+        base = 16;
+    }
+    if (base == 10 ? !g_ascii_isdigit(*digits) : !g_ascii_isxdigit(*digits)) {
+        return false;
+    }
+    errno = 0;
+    *page = strtoul(digits, &end, base);
+    *p = end;
+    return errno == 0 && *page < pages;
+}
+
+/* ecc-fail: "p[-q][,p[-q]...]". */
 static bool spinand_parse_ecc_fail(SpiNandState *s, Error **errp)
 {
     gchar **items;
@@ -250,13 +276,16 @@ static bool spinand_parse_ecc_fail(SpiNandState *s, Error **errp)
     s->n_ecc_ranges = g_strv_length(items);
     s->ecc_ranges = g_new(uint32_t, 2 * s->n_ecc_ranges);
     for (i = 0; items[i]; i++) {
-        char *end;
-        unsigned long lo = strtoul(items[i], &end, 0), hi = lo;
+        const char *p = items[i];
+        unsigned long lo, hi;
+        bool ok = spinand_parse_page(&p, s->pages, &lo);
 
-        if (*end == '-') {
-            hi = strtoul(end + 1, &end, 0);
+        hi = lo;
+        if (ok && *p == '-') {
+            p++;
+            ok = spinand_parse_page(&p, s->pages, &hi);
         }
-        if (end == items[i] || *end || hi < lo || hi >= s->pages) {
+        if (!ok || *p || hi < lo) {
             error_setg(errp, "%s: ecc-fail: '%s' is not a page or a range "
                        "of pages below %u", s->part->name, items[i],
                        s->pages);
