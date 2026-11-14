@@ -446,6 +446,7 @@ def main():
 
         P, Q, R = IMG + 0x200000, IMG + 0x210000, IMG + 0x220000
         LUT = IMG + 0x230000
+        CH = IMG + 0x240000             # the st_cand_corner chain's buffers
         a = bytes((x * 37 + y * 11 + x * y) & 0xff for y in range(SH) for x in range(SW))
         b = bytes((x * 5 + y * 23 + 7) & 0xff for y in range(SH) for x in range(SW))
         n = SW * SH
@@ -630,6 +631,71 @@ def main():
         check(struct.unpack('<H', q.read(R + 2 * n, 2))[0] == mx,
               'st_box_flt_and_eigen: the picture maximum')
         q.write(P, a)                   # the later ops share this buffer
+
+        # The rest of st_cand_corner, pushed the way ive_st_candi_corner
+        # and ive_int_ext_work do it.  Nothing in the tasks says what
+        # 16bit_to_8bit should scale by, because only op 25 knows: the
+        # driver pushes the tasks up to and including it (its +300 is the
+        # ext-work code 36), reads the maximum it wrote, computes the Q16
+        # ratio min(0xffff, (255 << 16) + max / 2) / max) and patches it
+        # into the *next* task before pushing the remaining four.  The
+        # clamp at 0xffff is what matters: a measure peaking at 255 or
+        # less is passed through unstretched, so a quality_level above
+        # that peak leaves no candidates at all.  Taking a CV608's own
+        # eigen maps as the input, this reproduced all twelve of its
+        # captured candidate pictures to the pixel.
+        G, E, U, TM, MF, CD = (CH + k * 0x1000 for k in range(6))
+        q.write(G, grad)
+        for ql in (25, 250):
+            i = (q.readl(SQ + 0x20) + 1) % NSLOT
+            nxt = [(i + k) % NSLOT for k in range(5)]
+            q.write(slot(nxt[0]), task(nxt[0], 25, SW, SH,
+                                       [(80, 'Q', G), (112, 'I', 2 * SW),
+                                        (96, 'Q', E), (120, 'I', 2 * SW),
+                                        (104, 'Q', E + 2 * n), (300, 'I', 36)]))
+            q.write(slot(nxt[1]), task(nxt[1], 15, SW, SH,
+                                       [(80, 'Q', E), (104, 'I', 2 * SW),
+                                        (96, 'Q', U), (112, 'I', SW),
+                                        (300, 'I', 3), (304, 'i', 0),
+                                        (308, 'I', 0)]))
+            q.write(slot(nxt[2]), task(nxt[2], 7, SW, SH,
+                                       [(80, 'Q', U), (104, 'I', SW),
+                                        (96, 'Q', TM), (112, 'I', SW),
+                                        (300, 'I', 2), (304, 'I', ql),
+                                        (308, 'I', 0), (312, 'I', 0),
+                                        (316, 'I', 0), (320, 'I', 0)]))
+            q.write(slot(nxt[3]), task(nxt[3], 16, SW, SH,
+                                       [(80, 'Q', TM), (104, 'I', SW),
+                                        (96, 'Q', MF), (112, 'I', SW),
+                                        (300, 'I', 1)]))
+            q.write(slot(nxt[4]), task(nxt[4], 26, SW, SH,
+                                       [(80, 'Q', TM), (112, 'I', SW),
+                                        (88, 'Q', MF), (116, 'I', SW),
+                                        (104, 'Q', CD), (124, 'I', SW)]))
+            q.write(CD, b'\xee' * n)
+            q.writel(SQ + 0x10, 1 << 8)         # op 25 alone, as the driver
+            q.cmd('clock_step 2000000')
+            check(q.readl(SQ + 0x18) & 0xfff == 0 and
+                  q.readl(SQ + 0x20) & 0xffff == nxt[0],
+                  'st_cand_corner: a push of one stops after op 25')
+            mx = struct.unpack('<H', q.read(E + 2 * n, 2))[0]
+            ratio = (0xff0000 + mx // 2) // mx if mx else 0
+            ratio = 0xffff if ratio > 0xffff else ratio
+            q.write(slot(nxt[1]) + 308, struct.pack('<I', ratio))
+            q.writel(SQ + 0x10, 4 << 8)         # the ext work done, the rest
+            q.cmd('clock_step 2000000')
+            q.writel(SQ + 0x14, 31)
+            u8 = [min(max(rnd_q16(v, ratio), 0), 255) for v in want]
+            tm = thresh_ref(u8, 2, ql, ql, 0, 0, 0)
+            mf = [max(px(tm, SW, SH, x + k % 3 - 1, y + k // 3 - 1)
+                      for k in range(9))
+                  for y in range(SH) for x in range(SW)]
+            got = list(q.read(CD, n))
+            check(got == [v if v == m and v > 0 else 0
+                          for v, m in zip(tm, mf)],
+                  'st_cand_corner: quality_level %d -> %d candidates '
+                  '(maximum %d, ratio %#x)'
+                  % (ql, sum(1 for v in got if v), mx, ratio))
 
         # LBP: bit 7 the top-left neighbour, then clockwise
         nb = ((-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0))

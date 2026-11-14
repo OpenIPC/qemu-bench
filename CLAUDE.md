@@ -713,7 +713,7 @@ in this order:
     ring in DDR that the SVP NPU's task scheduler runs (`hisi-ive-npu`,
     0x14000000, SPI 76). The model follows the ring's links (+6 id, +8
     next) and computes the op named by the code at +288; the NPU models
-    the driver loads are shared between ops and are never run. 32 ops
+    the driver loads are shared between ops and are never run. 34 ops
     are modelled, their pixel work in `hisi-ive-ops.c`, shared with V4's
     `hisi-ive` (`test-hisi-ive-npu.py`, CI; `test-hisi-v5-sample-ive.sh
     --sdk`, local: the SDK's memory test, and its sobel against numpy).

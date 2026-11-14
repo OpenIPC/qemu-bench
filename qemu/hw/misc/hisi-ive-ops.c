@@ -152,6 +152,12 @@ void ive_thresh_u16(const uint16_t *src, uint8_t *out, size_t n, int mode,
     }
 }
 
+/*
+ * The Q16 ratio is the driver's (num << 16 | den / 2) / den, clamped to
+ * 0xffff -- so a ratio can scale down but never up by more than 1.0.  In
+ * st_cand_corner that clamp is what decides whether a picture has corners
+ * at all: see op_st_box_flt_and_eigen.
+ */
 void ive_16bit_to_8bit(const uint16_t *src, uint8_t *out, size_t n, int mode,
                        uint32_t ratio_q16, int8_t bias)
 {
@@ -868,5 +874,21 @@ void ive_st_eigen(const int8_t *grad, uint32_t w, uint32_t h, uint16_t *out,
     }
     if (max_out) {
         *max_out = max;
+    }
+}
+
+/*
+ * CANDIDATE_CORNER (op 26), the last step of ss_mpi_ive_st_cand_corner:
+ * non-maximum suppression written as an element-wise op.  `a` is the
+ * thresholded measure and `b` its own 3x3 maximum (the ord_stat_filter
+ * task before it), so `a == b` says the pixel is the largest in its
+ * window, and the surviving value is the measure itself rather than a
+ * flag -- which is what ss_mpi_ive_st_corner then sorts the corners by.
+ */
+void ive_cand_corner(const uint8_t *a, const uint8_t *b, uint8_t *out,
+                     size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        out[i] = a[i] == b[i] && a[i] > 0 ? a[i] : 0;
     }
 }
