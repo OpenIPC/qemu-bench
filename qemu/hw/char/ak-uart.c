@@ -320,9 +320,186 @@ static const TypeInfo ak_uart_info = {
     .class_init    = ak_uart_class_init,
 };
 
+
+/*
+ * The AV130's UART ("anyka,ak3918av100plus-uart" in its U-Boot DT), a
+ * FIFO UART with a data register, as its U-Boot driver uses it:
+ *
+ *   0x00  control: 27:25 set at init        0x04  bit 31 set at init
+ *   0x0C  data: a write sends bits 23:16, a read takes the next received
+ *         byte in 7:0
+ *   0x14  baud divider (15:0) and fraction  0x18  status: 2 = TX busy
+ *         (never, here); 8, 10 and 13 write-1-to-clear
+ *   0x1C / 0x20  stored                    0x38  25:16 bytes received
+ *
+ * The kernel's driver is not modelled yet: no interrupt is raised.
+ */
+#define TYPE_AK_UART2 "ak-uart2"
+OBJECT_DECLARE_SIMPLE_TYPE(AkUart2State, AK_UART2)
+
+#define AK_UART2_FIFO 64
+
+struct AkUart2State {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    CharFrontend chr;
+    qemu_irq irq;
+    uint32_t regs[0x40 / 4];
+    uint8_t rx[AK_UART2_FIFO];
+    uint32_t rx_head, rx_len;
+};
+
+static int ak_uart2_can_receive(void *opaque)
+{
+    AkUart2State *s = opaque;
+
+    return AK_UART2_FIFO - s->rx_len;
+}
+
+static void ak_uart2_receive(void *opaque, const uint8_t *buf, int size)
+{
+    AkUart2State *s = opaque;
+    int i;
+
+    for (i = 0; i < size && s->rx_len < AK_UART2_FIFO; i++) {
+        s->rx[(s->rx_head + s->rx_len++) % AK_UART2_FIFO] = buf[i];
+    }
+}
+
+static uint64_t ak_uart2_read(void *opaque, hwaddr offset, unsigned size)
+{
+    AkUart2State *s = opaque;
+    uint8_t c;
+
+    switch (offset) {
+    case 0x0C:
+        if (!s->rx_len) {
+            return 0;
+        }
+        c = s->rx[s->rx_head];
+        s->rx_head = (s->rx_head + 1) % AK_UART2_FIFO;
+        s->rx_len--;
+        qemu_chr_fe_accept_input(&s->chr);
+        return c;
+    case 0x18:
+        return s->regs[0x18 / 4] & ~(1u << 2);
+    case 0x38:
+        return (s->regs[0x38 / 4] & ~0x03FF0000u) | (s->rx_len << 16);
+    }
+    return offset < sizeof(s->regs) ? s->regs[offset / 4] : 0;
+}
+
+static void ak_uart2_write(void *opaque, hwaddr offset, uint64_t val,
+                           unsigned size)
+{
+    AkUart2State *s = opaque;
+    uint8_t c;
+
+    if (offset == 0x0C) {
+        c = val >> 16;
+        qemu_chr_fe_write_all(&s->chr, &c, 1);
+        return;
+    }
+    if (offset == 0x18) {
+        /* 8, 10 and 13 acknowledge: write-1-to-clear; the rest is stored */
+        uint32_t w1c = (1u << 8) | (1u << 10) | (1u << 13);
+
+        s->regs[0x18 / 4] = (s->regs[0x18 / 4] & ~(uint32_t)val & w1c) |
+                            (val & ~w1c);
+        return;
+    }
+    if (offset < sizeof(s->regs)) {
+        s->regs[offset / 4] = val;
+    }
+}
+
+static const MemoryRegionOps ak_uart2_ops = {
+    .read = ak_uart2_read,
+    .write = ak_uart2_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void ak_uart2_reset(DeviceState *dev)
+{
+    AkUart2State *s = AK_UART2(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->rx_head = s->rx_len = 0;
+}
+
+static void ak_uart2_realize(DeviceState *dev, Error **errp)
+{
+    AkUart2State *s = AK_UART2(dev);
+
+    qemu_chr_fe_set_handlers(&s->chr, ak_uart2_can_receive, ak_uart2_receive,
+                             NULL, NULL, s, NULL, true);
+}
+
+static void ak_uart2_init(Object *obj)
+{
+    AkUart2State *s = AK_UART2(obj);
+
+    memory_region_init_io(&s->iomem, obj, &ak_uart2_ops, s, TYPE_AK_UART2,
+                          0x8000);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+}
+
+static const Property ak_uart2_properties[] = {
+    DEFINE_PROP_CHR("chardev", AkUart2State, chr),
+};
+
+static int ak_uart2_post_load(void *opaque, int version_id)
+{
+    AkUart2State *s = opaque;
+
+    if (s->rx_head >= AK_UART2_FIFO || s->rx_len > AK_UART2_FIFO) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_ak_uart2 = {
+    .name = TYPE_AK_UART2,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = ak_uart2_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(regs, AkUart2State, 0x40 / 4),
+        VMSTATE_UINT8_ARRAY(rx, AkUart2State, AK_UART2_FIFO),
+        VMSTATE_UINT32(rx_head, AkUart2State),
+        VMSTATE_UINT32(rx_len, AkUart2State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void ak_uart2_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = ak_uart2_realize;
+    dc->vmsd = &vmstate_ak_uart2;
+    device_class_set_legacy_reset(dc, ak_uart2_reset);
+    device_class_set_props(dc, ak_uart2_properties);
+}
+
+static const TypeInfo ak_uart2_info = {
+    .name          = TYPE_AK_UART2,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(AkUart2State),
+    .instance_init = ak_uart2_init,
+    .class_init    = ak_uart2_class_init,
+};
+
 static void ak_uart_register_types(void)
 {
     type_register_static(&ak_uart_info);
+    type_register_static(&ak_uart2_info);
 }
 
 type_init(ak_uart_register_types)

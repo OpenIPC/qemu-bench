@@ -39,6 +39,8 @@ typedef struct AkSoCConfig {
     bool        aspen;
     /* AV100: the second MIPI / CSI input, the NPU (anycloud_ak3918av100) */
     bool        av100;
+    /* AV130: the AV100's map, plus U-Boot's tick timer at 0x21110000 */
+    bool        av130;
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */
