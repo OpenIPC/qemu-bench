@@ -42,8 +42,17 @@ banks, the thermal sensor and the small per-block syscons -- are
 `hisi-regbank` instances (RAM-backed storage, reused from the
 HiSilicon family, not Axera-specific): a driver's write-then-read probe
 sees what it wrote, which the unimplemented catch-all underneath
-cannot give it. AX620Q's much smaller dtsi gets the three it actually
-has (`clk_cpu`/`clk_pllc`/`clk_common`).
+cannot give it. AX620Q is the same die: the Maix SDK's 4.19 AX620Q
+devicetrees include the same `AX620E.dtsi` (same addresses and GIC
+SPIs), so `ax620q` gets the full AX620E peripheral set
+(`axera_ax620e_periphs()`, shared with the AArch64 machines), minus the
+IP-camera board's SC450AI sensor. Its console is `ttyS3` at
+`0x06080000` (SPI 0x79, `serial_hd(0)`); UART0 is the second serial
+port. Because `uboot-file=`/`-kernel` skip SPL, a reset hook writes what
+SPL leaves in iram0: `boot_mode_info` at `0x700` (`is_sd_boot` set when
+`-drive if=sd,index=1` is given, so U-Boot runs `sd_boot`) and
+`misc_info` at `0x740` naming a 256 MiB NanoKVM-Go (AX620QF), plus the
+board's released boot key on GPIO3.
 
 Three more blocks needed real device-model behaviour, not just storage,
 because real boot code polls them expecting a side effect a passive

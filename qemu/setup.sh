@@ -41,7 +41,11 @@ cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-ddrc.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-h1.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h264-tables.h \
+   qemu/hw/misc/hantro-h264-inter.c.inc \
                                     "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hevc-enc.c qemu/hw/misc/hevc-enc.h qemu/hw/misc/hevc-enc-inter.c.inc \
+                                    "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/gpio/xm-gpio.c           "$QEMU_DIR/hw/gpio/"
@@ -169,8 +173,11 @@ cp qemu/hw/i2c/hisi-sp2305.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-mis2006.c      "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-nvp6124b.c     "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-smartsens.c    "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/axera-ov-sensor.c   "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/axera-pcal6416a.c   "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-v1.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-dw.c       "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/dw-i2c.c            "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/ssi/hisi-spi.c          "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/ssi/hisi-imx122.c       "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/arm/axera.c              "$QEMU_DIR/hw/arm/"
@@ -189,6 +196,12 @@ cp qemu/hw/misc/axera-bl1-timer.c   "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-bl1-timer.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-ddr-pll.c   "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-ddr-pll.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-ax620u-ddr-pll.c   "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-ax620u-ddr-pll.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-ax620u-smp-wake.c   "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-ax620u-smp-wake.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-ax620u-clkrst.c   "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-ax620u-clkrst.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-spi-nand.c    "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-spi-nand.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-ddr-phy.c    "$QEMU_DIR/hw/misc/"
@@ -203,6 +216,9 @@ cp qemu/hw/misc/axera-axi-dmac.c    "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-axi-dmac.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-wdt.c         "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-wdt.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/net/axera-eqos.c         "$QEMU_DIR/hw/net/"
+cp qemu/hw/rtc/axera-rtc.c          "$QEMU_DIR/hw/rtc/"
+cp qemu/hw/misc/axera-vin.c         "$QEMU_DIR/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -680,6 +696,21 @@ if ! grep -q "'axera-eip130.c'" "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-eip130.c"
 fi
+if ! grep -q "CONFIG_AXERA.*'hantro-h264.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('hantro-h264.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added hantro-h264.c for CONFIG_AXERA"
+fi
+if ! grep -q "'hevc-enc.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('hevc-enc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added hevc-enc.c"
+fi
+if ! grep -q "'jpeg-enc.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('jpeg-enc.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added jpeg-enc.c"
+fi
 if ! grep -q "'axera-vcmd.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-vcmd.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
@@ -709,6 +740,21 @@ if ! grep -q "'axera-ddr-pll.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ddr-pll.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-ddr-pll.c"
+fi
+if ! grep -q "'axera-ax620u-ddr-pll.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ax620u-ddr-pll.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-ax620u-ddr-pll.c"
+fi
+if ! grep -q "'axera-ax620u-smp-wake.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ax620u-smp-wake.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-ax620u-smp-wake.c"
+fi
+if ! grep -q "'axera-ax620u-clkrst.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ax620u-clkrst.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-ax620u-clkrst.c"
 fi
 if ! grep -q "'axera-spi-nand.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-spi-nand.c'))" \
@@ -744,6 +790,21 @@ if ! grep -q "'axera-wdt.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-wdt.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-wdt.c"
+fi
+if ! grep -q "'axera-vin.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-vin.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-vin.c"
+fi
+if ! grep -q "'axera-eqos.c'" "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-eqos.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  hw/net/meson.build: added axera-eqos.c"
+fi
+if ! grep -q "'axera-rtc.c'" "$QEMU_DIR/hw/rtc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-rtc.c'))" \
+        >> "$QEMU_DIR/hw/rtc/meson.build"
+    echo "  hw/rtc/meson.build: added axera-rtc.c"
 fi
 
 # hw/misc/Kconfig
@@ -867,7 +928,7 @@ fi
 
 # hw/i2c/meson.build
 if ! grep -q hisi-i2c "$QEMU_DIR/hw/i2c/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_HISI_I2C', if_true: files('hisi-i2c.c', 'hisi-i2c-v1.c', 'hisi-i2c-dw.c', 'hisi-imx335.c', 'hisi-imx307.c', 'hisi-imx291.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-f37.c', 'hisi-gc2053.c', 'hisi-sp2305.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c'))" \
+    echo "system_ss.add(when: 'CONFIG_HISI_I2C', if_true: files('hisi-i2c.c', 'hisi-i2c-v1.c', 'hisi-i2c-dw.c', 'dw-i2c.c', 'hisi-imx335.c', 'hisi-imx307.c', 'hisi-imx291.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-f37.c', 'hisi-gc2053.c', 'hisi-sp2305.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c', 'axera-ov-sensor.c', 'axera-pcal6416a.c'))" \
         >> "$QEMU_DIR/hw/i2c/meson.build"
     echo "  patched hw/i2c/meson.build"
 else
@@ -881,6 +942,11 @@ else
         sed -i "s/'hisi-i2c-v1.c', 'hisi-imx335.c'/'hisi-i2c-v1.c', 'hisi-i2c-dw.c', 'hisi-imx335.c'/" \
             "$QEMU_DIR/hw/i2c/meson.build"
         echo "  hw/i2c/meson.build: added hisi-i2c-dw.c"
+    fi
+    if ! grep -q "'dw-i2c.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+        sed -i "s/'hisi-i2c-dw.c', 'hisi-imx335.c'/'hisi-i2c-dw.c', 'dw-i2c.c', 'hisi-imx335.c'/" \
+            "$QEMU_DIR/hw/i2c/meson.build"
+        echo "  hw/i2c/meson.build: added dw-i2c.c"
     fi
     if ! grep -q hisi-imx291 "$QEMU_DIR/hw/i2c/meson.build"; then
         sed -i "s/'hisi-imx307.c'/'hisi-imx307.c', 'hisi-imx291.c'/" \
@@ -901,6 +967,16 @@ else
         sed -i "s/'hisi-mis2006.c'/'hisi-mis2006.c', 'hisi-nvp6124b.c'/" \
             "$QEMU_DIR/hw/i2c/meson.build"
         echo "  hw/i2c/meson.build: added hisi-nvp6124b.c"
+    fi
+    if ! grep -q "'axera-ov-sensor.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+        sed -i "s/'hisi-smartsens.c'/'hisi-smartsens.c', 'axera-ov-sensor.c'/" \
+            "$QEMU_DIR/hw/i2c/meson.build"
+        echo "  hw/i2c/meson.build: added axera-ov-sensor.c"
+    fi
+    if ! grep -q "'axera-pcal6416a.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+        sed -i "s/'axera-ov-sensor.c'/'axera-ov-sensor.c', 'axera-pcal6416a.c'/" \
+            "$QEMU_DIR/hw/i2c/meson.build"
+        echo "  hw/i2c/meson.build: added axera-pcal6416a.c"
     fi
 fi
 

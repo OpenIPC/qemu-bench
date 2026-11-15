@@ -182,6 +182,67 @@ static void axera_bl1_chipmode_reset(void *opaque)
                          MEMTXATTRS_UNSPECIFIED, NULL);
 }
 
+/*
+ * What the AX620Q's BL1/SPL leaves in iram0 for U-Boot and the kernel
+ * (boot/bl1/spl/spl_main.c setup_boot_mode() and the misc_info block,
+ * layouts from arch/arm/include/asm/arch-axera/boot_mode.h). uboot-file=
+ * and -kernel both skip SPL, so this stands in for it, the same way
+ * axera_bl1_chipmode_reset() stands in for the boot straps.
+ *
+ * boot_mode_info @ 0x700: magic, mode (SPL's BOOT_MODE_NORMALBOOT),
+ * storage_sel/boot_type (the board's eMMC UDA strap), and is_sd_boot --
+ * set when an SD card is attached at -drive if=sd,index=1, standing in
+ * for the boot ROM's COMM_SYS_DUMMY_SW5 == DL_CHAN_SD report. U-Boot
+ * turns is_sd_boot into its "sd_boot" bootcmd.
+ *
+ * misc_info @ 0x740: chip_type/phy_board_id select the board.
+ * AX620QF_CHIP (9) + PHY_AX620QF_LP4_NANOAGENT_256M (1) is the 256 MiB
+ * NanoKVM-Go this machine models; U-Boot's sd_boot only takes the
+ * NanoKVM-Go path (/boot/kernel.img off the ext4 p2) for that pair.
+ *
+ * GPIO3 @ 0x06001000, ext-port register +0x8c bit 2: the board's boot
+ * key, pulled up on the real board. Reading 0 means "pressed", which
+ * sends U-Boot and the initramfs into USB-recovery mode.
+ */
+#define AXERA_BOOT_MODE_INFO_ADDR   0x700ULL
+#define AXERA_BOOT_MODE_MAGIC       0x12345678U
+#define AXERA_SPL_MODE_NORMALBOOT   0x2U
+#define AXERA_STORAGE_TYPE_EMMC     0x0U
+#define AXERA_EMMC_BOOT_UDA         0x1U
+#define AXERA_MISC_INFO_ADDR        0x740ULL
+#define AXERA_AX620QF_CHIP          0x9U
+#define AXERA_PHY_NANOAGENT_256M    0x1U
+#define AXERA_GPIO3_EXT_PORT_ADDR   0x0600108cULL
+#define AXERA_BOOT_KEY_RELEASED     (1U << 2)
+
+static void axera_ax620q_spl_handoff_reset(void *opaque)
+{
+    bool sd_boot = (uintptr_t)opaque;
+    AddressSpace *as = &address_space_memory;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    hwaddr b = AXERA_BOOT_MODE_INFO_ADDR;
+    hwaddr m = AXERA_MISC_INFO_ADDR;
+    int i;
+
+    for (i = 0; i < 0x40; i += 4) {
+        address_space_stl_le(as, b + i, 0, attrs, NULL);
+    }
+    address_space_stl_le(as, b + 0x00, AXERA_BOOT_MODE_MAGIC, attrs, NULL);
+    address_space_stl_le(as, b + 0x04, AXERA_SPL_MODE_NORMALBOOT, attrs, NULL);
+    address_space_stl_le(as, b + 0x0c, AXERA_STORAGE_TYPE_EMMC, attrs, NULL);
+    address_space_stl_le(as, b + 0x10, AXERA_EMMC_BOOT_UDA, attrs, NULL);
+    address_space_stb(as, b + 0x14, sd_boot, attrs, NULL);
+
+    for (i = 0; i < 0x60; i += 4) {
+        address_space_stl_le(as, m + i, 0, attrs, NULL);
+    }
+    address_space_stl_le(as, m + 0x44, AXERA_AX620QF_CHIP, attrs, NULL);
+    address_space_stl_le(as, m + 0x5c, AXERA_PHY_NANOAGENT_256M, attrs, NULL);
+
+    address_space_stl_le(as, AXERA_GPIO3_EXT_PORT_ADDR,
+                         AXERA_BOOT_KEY_RELEASED, attrs, NULL);
+}
+
 typedef struct {
     ARMCPU *cpu;
     uint64_t entry;
@@ -623,6 +684,307 @@ static const MemoryRegionOps axera_cpu1_wake_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+/*
+ * The AX620E-die peripheral set behind the GIC: crypto, codecs, DMA,
+ * watchdogs, RTC, SDHCI, I2C, VIN, EQoS and USB. AX630C, AX620E and
+ * AX620Q are one die (all three boot the vendor's shared AX620E.dtsi,
+ * with the same addresses and GIC SPIs -- confirmed against the
+ * AX620Q NanoKVM-Go devicetree the Maix SDK's 4.19 kernel builds), so
+ * the AArch64 and AArch32 machines share this one list. camera_board
+ * adds the SC450AI sensor the real AX620E IP-camera board has on
+ * i2c6; the NanoKVM boards have no Bayer sensor there.
+ */
+static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
+{
+    /* crypto@4900000, "axera,ax630c-eip130", GIC_SPI 110. Real AES
+     * ECB/CBC/CTR via qcrypto, not just a satisfied probe -- see
+     * hw/misc/axera-eip130.c. */
+    sysbus_create_simple(TYPE_AXERA_EIP130, 0x04900000, pic[110]);
+
+    /* venc@4010000/jenc@4000000/vdec@4020000: the VeriSilicon VCMD
+     * command-queue front-end (probe/submit/wait/complete handshake is
+     * real). The command-buffer's own opcode stream is decoded for
+     * real, and an actual encode job (H.264/HEVC/JPEG) is bridged to
+     * the project's shared Hantro software encoder library to produce
+     * a real bitstream -- see hw/misc/axera-vcmd.c. Decode (vdec) is
+     * not bridged. */
+    sysbus_create_simple(TYPE_AXERA_VCMD, 0x04010000, pic[93]);
+    sysbus_create_simple(TYPE_AXERA_VCMD, 0x04000000, pic[91]);
+    sysbus_create_simple(TYPE_AXERA_VCMD, 0x04020000, pic[92]);
+
+    /*
+     * AX_DMAPER @ 0x048a0000 (boot/bl1/driver/dmaper/dmaper.h), GIC
+     * SPI 0x70: real BL1 stages a flash read into scratch RAM then
+     * uses this LLI-descriptor DMA engine (axi_dma_xfer_start()/
+     * axi_dma_wait_xfer_done()) to copy it into the image's final
+     * destination. Also the real target of the real kernel's own
+     * spi@1A00000 "dmas = <0x09 0x01 0x09 0x00>;" property (confirmed
+     * by checking phandle 0x09's own definition in the decompiled
+     * dtb, not just its proximity to the spi node in the source) --
+     * BL1's own real axi_dma_wait_xfer_done() never waits on an
+     * interrupt at all, just spins polling a status register
+     * directly, so this device genuinely needed no IRQ line for that
+     * consumer alone; but the real kernel's own dmaengine framework
+     * needs a genuine interrupt to wake its wait_for_completion()
+     * (confirmed live: the real DMAPER_START write does happen, the
+     * transfer itself genuinely completes, but nothing ever signals
+     * the sleeping kernel thread, so "DMA transaction timed out" fires
+     * regardless) -- see hw/misc/axera-dmaper.c's own comment for the
+     * full story and why raising this is harmless for BL1.
+     */
+    sysbus_create_simple(TYPE_AXERA_DMAPER, 0x048a0000, pic[0x70]);
+
+    /*
+     * dw_dmac@48b0000, "axera,axi-dma-1.01a", GIC SPI 0x71: a real
+     * Synopsys DesignWare AXI DMA Controller, a separate physical IP
+     * from AX_DMAPER above -- kept modelled since it's a real IP
+     * block this SoC genuinely has (some other, not yet identified
+     * consumer may legitimately need it), even though it turned out
+     * NOT to be what the kernel's SPI-NOR driver actually uses -- see
+     * hw/misc/axera-axi-dmac.c's own comment for that story.
+     */
+    sysbus_create_simple(TYPE_AXERA_AXI_DMAC, 0x048b0000, pic[0x71]);
+
+    /*
+     * watchdog@4840000, "axera,ax-wdt", GIC SPI 0x95: a real Synopsys
+     * DW_APB_WDT, confirmed (via its own IRQ-less reset-mode kick
+     * sequence, no PSCI/syscon-reboot node anywhere in the real
+     * devicetree, and a live trace showing zero PSCI SMC calls across
+     * an entire boot+reboot cycle) to be the real reboot mechanism on
+     * this SoC -- see hw/misc/axera-wdt.c's own comment for the full
+     * story and why a passive regbank here left reboot(RB_AUTOBOOT)
+     * hanging forever in the kernel's own generic machine_restart()
+     * fallback loop.
+     */
+    sysbus_create_simple(TYPE_AXERA_WDT, 0x04840000, pic[0x95]);
+
+    /*
+     * watchdog@6040000 (wdt2), the SAME "axera,ax-wdt" IP as wdt0
+     * above, GIC SPI 150 (the vendor SDK's own AX620E.dtsi marks both
+     * wdt0 and wdt2 "status = disabled" -- clearly overridden in this
+     * real dump's own compiled-in DTB, since dmesg shows
+     * "ax_wdt_drv_probe:347: done!" TWICE on every boot, not once).
+     * Previously unwired, confirmed live via a fresh '-d unimp'
+     * survey as this boot's single largest remaining offender (offset
+     * +0x30 relative to this base, 32 hits in one run) -- some
+     * runtime register this second instance's own keep-alive/refresh
+     * path reads or writes repeatedly, not just a one-off probe-time
+     * access.
+     */
+    sysbus_create_simple(TYPE_AXERA_WDT, 0x06040000, pic[0x96]);
+
+    /*
+     * rtc-top@23E0000, "axera,axi-top-rtc" (a DesignWare RTC core --
+     * see hw/rtc/axera-rtc.c's own header comment, written from the
+     * real, open drivers/rtc/rtc-axera.c vendor source), GIC SPI 0x6b.
+     * reg-num=2: the second range (0x2340000) is just a clock-enable
+     * bit (CLK_CONFIG_ADDR, offset 0x6C) the driver toggles through a
+     * separate ioremap -- a hisi-regbank write-then-read is enough for
+     * that one, so only the main register window gets the real model.
+     */
+    sysbus_create_simple("axera-rtc", 0x023e0000, pic[0x6b]);
+    {
+        DeviceState *rtc_clk = qdev_new("hisi-regbank");
+
+        qdev_prop_set_uint32(rtc_clk, "size", 0x1000);
+        qdev_prop_set_string(rtc_clk, "name", "axera-rtc-clk");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(rtc_clk), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(rtc_clk), 0, 0x02340000, 1);
+    }
+
+    /*
+     * emmc@1b40000/sd@104e0000/sdio@104d0000, "axera,sdhc","cdns,sd4hc":
+     * QEMU's own generic cadence.sdhci model, a real off-the-shelf
+     * device (not Axera-specific) that already implements this exact
+     * compatible string's register set. See axera_attach_sdhci() for
+     * the real-media wiring ("-drive if=sd,index=0" is the eMMC).
+     */
+    axera_attach_sdhci(0x01b40000, pic[9], 0, true);
+    axera_attach_sdhci(0x104e0000, pic[74], 1, false);
+    axera_attach_sdhci(0x104d0000, pic[73], 2, false);
+
+    /*
+     * i2c@4852000 (i2c2) and i2c@4856000 (i2c6), "snps,designware-i2c",
+     * GIC SPI 0x89/0x8d: of this SoC's eight i2c0-i2c7 controller
+     * instances, the real devicetree has only these two actually
+     * enabled (every other one is "status = disabled", confirmed by
+     * reading each node directly) -- and both already printed
+     * "Unknown Synopsys component type: 0x00000000" during normal
+     * boot before this (a completely unmapped MMIO region reads back
+     * all-zero, including the real driver's own IP-identification
+     * register it checks). i2c6 specifically is what this dump's own
+     * vendor userspace camera/ISP pipeline opens directly as
+     * /dev/i2c-6 to talk to the real image sensor -- confirmed by
+     * this same boot's own "Load_AX620E -i imx307" invocation (the
+     * real devicetree has no sensor child node at all under this
+     * i2c bus; the vendor's own userspace ISP library owns the
+     * sensor probe/config entirely, not the kernel). With no device
+     * node for /dev/i2c-6 ever created (this controller never having
+     * probed successfully at all), the real vendor binary's own
+     * open() failure cascaded into a guest-side SIGBUS ("Bus error")
+     * in its video pipeline shortly after.
+     *
+     * An earlier attempt wired this up with hisi-i2c-dw, but that
+     * model (despite its name) implements a different, HiSilicon-
+     * specific "AUTO mode" single-shot-transaction register protocol
+     * (see its own file header) for the drivers/i2c/busses/
+     * i2c-hisilicon.c vendor driver on CV200-family SoCs -- it is NOT
+     * register-compatible with the real mainline i2c-designware-*.c
+     * driver this AX620E kernel actually uses, which still read back
+     * "Unknown Synopsys component type: 0x00000000" from
+     * DW_IC_COMP_TYPE (offset 0xfc) against hisi-i2c-dw and bailed
+     * out of i2c_dw_set_reg_access() with -ENODEV before ever
+     * creating /dev/i2c-N, confirmed live. dw-i2c is a new, generic
+     * DW_IC_* register model (CON/TAR/DATA_CMD FIFO semantics,
+     * COMP_TYPE/COMP_VERSION/COMP_PARAM_1 included) written
+     * specifically to satisfy that real driver; hisi-imx307 (a real
+     * IMX307 stub already written for this exact Xiongmai probe
+     * sequence -- see its own comment) is a plain I2CSlave and works
+     * unchanged on either master model. The sensor's own I2C address,
+     * 0x1a, is the industry-standard Sony STARVIS address (confirmed
+     * already assumed correct elsewhere in this project, for the
+     * same sensor family, on a different Xiongmai-derived SoC).
+     */
+    sysbus_create_simple("dw-i2c", 0x04852000, pic[0x89]);
+
+    /*
+     * i2c@4850000 (i2c0) and i2c@4857000 (i2c7), GIC SPI 0x87/0x8e:
+     * these two were plain create_unimplemented_device catch-all stubs
+     * (ax620e_unimp[]) until now, exactly like i2c2/i2c6 used to be --
+     * but unlike i2c2/i2c6, this exact dump's real devicetree node for
+     * BOTH of these has "status = disabled" (confirmed by reading the
+     * node directly, same extraction this file's own i2c2/i2c6 comment
+     * above already relies on), so the guest's i2c-designware platform
+     * driver never even calls probe() on either one -- no MMIO access
+     * of any kind reaches these two addresses anywhere in a live boot,
+     * confirmed empirically with a `-d unimp` run all the way through
+     * kernel boot, rootfs mount and the real camera App's own start
+     * (Load_AX620E): the unimp log for this exact dump has zero hits
+     * on either address, before or after this fix. Neither U-Boot
+     * (whose AX620E defconfigs don't even enable CONFIG_I2C) nor BL1
+     * (no I2C driver exists anywhere in this platform's own boot/bl1
+     * tree) touch them either. So this fix is "no longer a bare
+     * catch-all stub, now a real DW_IC_* register model" for
+     * correctness/consistency with every other real IP block in this
+     * file, not because anything observed actually depends on it --
+     * if a different dump's devicetree ever flips either node to
+     * "status = okay" (or a future BL1/U-Boot image starts using
+     * CONFIG_I2C), this is already the right model to answer it,
+     * instead of silently returning zero from a generic stub the way
+     * i2c2/i2c6 themselves used to (which caused a real guest-visible
+     * "Unknown Synopsys component type" probe failure for those two).
+     * No downstream slave is attached to either bus: nothing in this
+     * dump's kernel, U-Boot, BL1, or App ever probes an address on
+     * them, so there is nothing for a stand-in sensor/PMIC to answer.
+     */
+    sysbus_create_simple("dw-i2c", 0x04850000, pic[0x87]);
+    sysbus_create_simple("dw-i2c", 0x04857000, pic[0x8e]);
+
+    {
+        DeviceState *i2c6 = sysbus_create_simple("dw-i2c", 0x04856000,
+                                                 pic[0x8d]);
+        I2CBus *i2c6_bus = I2C_BUS(qdev_get_child_bus(i2c6, "i2c"));
+
+        /*
+         * Confirmed live: the real vendor userspace ISP's own sensor
+         * auto-probe never actually tries address 0x1a (where a
+         * hisi-imx307 was first attached, based solely on this dump's
+         * "-i imx307" launch argument turning out to just be a
+         * generic/default argument, not a real indicator) -- it
+         * cycles through 0x36/0x30/0x10 looking for a response and
+         * never reaches 0x1a within many repeated passes. 0x30 is
+         * this tree's own "Sofia (XiongMai) detects these sensors at
+         * I2C addr 0x60 (8-bit) = 0x30 (7-bit)" SmartSens SC* family
+         * address (see hisi-smartsens.c) -- and this exact dump's own
+         * extracted ai_isp .axmodel filename independently confirms
+         * the real deployed sensor is a SmartSens SC450AI, not a Sony
+         * IMX307 at all. The real id_high/id_low pair (0xBD/0x2F, from
+         * SC450AI_SENSOR_ID = 0xbd2f at registers 0x3107/0x3108,
+         * maix_ax620e_sdk/msp/component/isp_proton/sensor/
+         * smartsens_sc450ai/sc450ai_reg.h) replaces an earlier sc307h
+         * stand-in (0xCB/0x1C): with the wrong ID, the app's own
+         * sensor-name lookup misidentified the chip as "sc200ai" and
+         * then failed outright trying to dlopen a /usr/lib/
+         * libsns_sc200ai.so this rootfs never ships (only
+         * libsns_sc450ai.so is present) -- confirmed live via
+         * "xmcap_sensor.c ... open /usr/lib/libsns_sc200ai.so fail!"
+         * aborting IspVi_create before it ever reaches real VIN/WDMA
+         * setup. The correct ID lets the app's own lookup resolve to
+         * "sc450ai" and successfully load the .so that's actually
+         * there.
+         */
+        if (camera_board) {
+            DeviceState *sensor = qdev_new("hisi-smartsens");
+
+            qdev_prop_set_uint8(sensor, "id_high", 0xBD);
+            qdev_prop_set_uint8(sensor, "id_low", 0x2F);
+            qdev_prop_set_uint8(sensor, "address", 0x30);
+            qdev_realize_and_unref(sensor, BUS(i2c6_bus), &error_fatal);
+        }
+    }
+
+    /*
+     * isp@2400000, "axera,proton", GIC SPI 27/28 ("isp0-0"/"isp0-1"):
+     * the real VIN/ISP frame-completion interrupt -- see
+     * hw/misc/axera-vin.c's own header comment for the full discovery
+     * (live gdbstub trace through four layers of the real ax_proton.ko
+     * down to the exact register map) and for what's still an assumption
+     * versus confirmed. Previously a passive axera-vin regbank (moved
+     * here from axera_map_regbanks() since, like AX_DMAPER above, it
+     * needs pic[] at creation time): that left the real kernel driver's
+     * frame-done wait permanently timing out, which is why the camera
+     * app never stopped logging AX_ERR_IVPS_BUF_EMPTY and, almost
+     * certainly, why it never called accept() on its RTSP socket either.
+     */
+    {
+        DeviceState *vin = qdev_new("axera-vin");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vin), 1, pic[0x1c]);
+    }
+
+    /*
+     * ethernet@104c0000, "axera,dwmac-4.10a", GIC SPI 0x50 ("macirq"):
+     * a real Synopsys DWC EQoS / dwmac-4.10a MAC+DMA core with an
+     * external RMII PHY, confirmed by the real devicetree's own
+     * clocks/resets/phy-handle properties -- see hw/net/axera-eqos.c's
+     * own header comment for why its register map is identical to
+     * hw/net/nvt-eqos.c's (same underlying Synopsys IP generation,
+     * just a different vendor glue/PHY). Previously left as a plain
+     * unimplemented register stub ("axera-eth0"), which let U-Boot's
+     * own probe see *something* respond but gave the Linux guest no
+     * way to ever bring an interface up -- confirmed live, no eth0
+     * IP configuration of any kind ever appeared in a full boot's
+     * console output against the stub.
+     */
+    {
+        DeviceState *eth = qdev_new("axera-eqos");
+
+        qemu_configure_nic_device(eth, true, NULL);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(eth), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(eth), 0, 0x104c0000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(eth), 0, pic[0x50]);
+    }
+
+    /*
+     * usb2@8000000, "snps,dwc3": QEMU's generic usb_dwc3 model (also
+     * used by Xilinx ZynqMP boards for the same Synopsys IP). Upstream
+     * does not expose its internal XHCI IRQ as a sysbus output either
+     * (confirmed: no sysbus_init_irq in hcd-dwc3.c's realize, and
+     * xlnx-zynqmp.c's own instantiation connects none) -- register-level
+     * access works, interrupt-driven transfers do not, a limitation of
+     * the upstream model itself, not introduced here.
+     */
+    {
+        DeviceState *dwc3 = qdev_new(TYPE_USB_DWC3);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dwc3), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dwc3), 0, 0x08000000);
+    }
+}
+
 static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -848,291 +1210,7 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                    AXERA_UART0_FREQ / 16, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
 
-    /* crypto@4900000, "axera,ax630c-eip130", GIC_SPI 110. Real AES
-     * ECB/CBC/CTR via qcrypto, not just a satisfied probe -- see
-     * hw/misc/axera-eip130.c. */
-    sysbus_create_simple(TYPE_AXERA_EIP130, 0x04900000, pic[110]);
-
-    /* venc@4010000/jenc@4000000/vdec@4020000: the VeriSilicon VCMD
-     * command-queue front-end (probe/submit/wait/complete handshake is
-     * real). The command-buffer's own opcode stream is decoded for
-     * real, and an actual encode job (H.264/HEVC/JPEG) is bridged to
-     * the project's shared Hantro software encoder library to produce
-     * a real bitstream -- see hw/misc/axera-vcmd.c. Decode (vdec) is
-     * not bridged. */
-    sysbus_create_simple(TYPE_AXERA_VCMD, 0x04010000, pic[93]);
-    sysbus_create_simple(TYPE_AXERA_VCMD, 0x04000000, pic[91]);
-    sysbus_create_simple(TYPE_AXERA_VCMD, 0x04020000, pic[92]);
-
-    /*
-     * AX_DMAPER @ 0x048a0000 (boot/bl1/driver/dmaper/dmaper.h), GIC
-     * SPI 0x70: real BL1 stages a flash read into scratch RAM then
-     * uses this LLI-descriptor DMA engine (axi_dma_xfer_start()/
-     * axi_dma_wait_xfer_done()) to copy it into the image's final
-     * destination. Also the real target of the real kernel's own
-     * spi@1A00000 "dmas = <0x09 0x01 0x09 0x00>;" property (confirmed
-     * by checking phandle 0x09's own definition in the decompiled
-     * dtb, not just its proximity to the spi node in the source) --
-     * BL1's own real axi_dma_wait_xfer_done() never waits on an
-     * interrupt at all, just spins polling a status register
-     * directly, so this device genuinely needed no IRQ line for that
-     * consumer alone; but the real kernel's own dmaengine framework
-     * needs a genuine interrupt to wake its wait_for_completion()
-     * (confirmed live: the real DMAPER_START write does happen, the
-     * transfer itself genuinely completes, but nothing ever signals
-     * the sleeping kernel thread, so "DMA transaction timed out" fires
-     * regardless) -- see hw/misc/axera-dmaper.c's own comment for the
-     * full story and why raising this is harmless for BL1.
-     */
-    sysbus_create_simple(TYPE_AXERA_DMAPER, 0x048a0000, pic[0x70]);
-
-    /*
-     * dw_dmac@48b0000, "axera,axi-dma-1.01a", GIC SPI 0x71: a real
-     * Synopsys DesignWare AXI DMA Controller, a separate physical IP
-     * from AX_DMAPER above -- kept modelled since it's a real IP
-     * block this SoC genuinely has (some other, not yet identified
-     * consumer may legitimately need it), even though it turned out
-     * NOT to be what the kernel's SPI-NOR driver actually uses -- see
-     * hw/misc/axera-axi-dmac.c's own comment for that story.
-     */
-    sysbus_create_simple(TYPE_AXERA_AXI_DMAC, 0x048b0000, pic[0x71]);
-
-    /*
-     * watchdog@4840000, "axera,ax-wdt", GIC SPI 0x95: a real Synopsys
-     * DW_APB_WDT, confirmed (via its own IRQ-less reset-mode kick
-     * sequence, no PSCI/syscon-reboot node anywhere in the real
-     * devicetree, and a live trace showing zero PSCI SMC calls across
-     * an entire boot+reboot cycle) to be the real reboot mechanism on
-     * this SoC -- see hw/misc/axera-wdt.c's own comment for the full
-     * story and why a passive regbank here left reboot(RB_AUTOBOOT)
-     * hanging forever in the kernel's own generic machine_restart()
-     * fallback loop.
-     */
-    sysbus_create_simple(TYPE_AXERA_WDT, 0x04840000, pic[0x95]);
-
-    /*
-     * watchdog@6040000 (wdt2), the SAME "axera,ax-wdt" IP as wdt0
-     * above, GIC SPI 150 (the vendor SDK's own AX620E.dtsi marks both
-     * wdt0 and wdt2 "status = disabled" -- clearly overridden in this
-     * real dump's own compiled-in DTB, since dmesg shows
-     * "ax_wdt_drv_probe:347: done!" TWICE on every boot, not once).
-     * Previously unwired, confirmed live via a fresh '-d unimp'
-     * survey as this boot's single largest remaining offender (offset
-     * +0x30 relative to this base, 32 hits in one run) -- some
-     * runtime register this second instance's own keep-alive/refresh
-     * path reads or writes repeatedly, not just a one-off probe-time
-     * access.
-     */
-    sysbus_create_simple(TYPE_AXERA_WDT, 0x06040000, pic[0x96]);
-
-    /*
-     * rtc-top@23E0000, "axera,axi-top-rtc" (a DesignWare RTC core --
-     * see hw/rtc/axera-rtc.c's own header comment, written from the
-     * real, open drivers/rtc/rtc-axera.c vendor source), GIC SPI 0x6b.
-     * reg-num=2: the second range (0x2340000) is just a clock-enable
-     * bit (CLK_CONFIG_ADDR, offset 0x6C) the driver toggles through a
-     * separate ioremap -- a hisi-regbank write-then-read is enough for
-     * that one, so only the main register window gets the real model.
-     */
-    sysbus_create_simple("axera-rtc", 0x023e0000, pic[0x6b]);
-    {
-        DeviceState *rtc_clk = qdev_new("hisi-regbank");
-
-        qdev_prop_set_uint32(rtc_clk, "size", 0x1000);
-        qdev_prop_set_string(rtc_clk, "name", "axera-rtc-clk");
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(rtc_clk), &error_fatal);
-        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(rtc_clk), 0, 0x02340000, 1);
-    }
-
-    /*
-     * emmc@1b40000/sd@104e0000/sdio@104d0000, "axera,sdhc","cdns,sd4hc":
-     * QEMU's own generic cadence.sdhci model, a real off-the-shelf
-     * device (not Axera-specific) that already implements this exact
-     * compatible string's register set. See axera_attach_sdhci() for
-     * the real-media wiring ("-drive if=sd,index=0" is the eMMC).
-     */
-    axera_attach_sdhci(0x01b40000, pic[9], 0, true);
-    axera_attach_sdhci(0x104e0000, pic[74], 1, false);
-    axera_attach_sdhci(0x104d0000, pic[73], 2, false);
-
-    /*
-     * i2c@4852000 (i2c2) and i2c@4856000 (i2c6), "snps,designware-i2c",
-     * GIC SPI 0x89/0x8d: of this SoC's eight i2c0-i2c7 controller
-     * instances, the real devicetree has only these two actually
-     * enabled (every other one is "status = disabled", confirmed by
-     * reading each node directly) -- and both already printed
-     * "Unknown Synopsys component type: 0x00000000" during normal
-     * boot before this (a completely unmapped MMIO region reads back
-     * all-zero, including the real driver's own IP-identification
-     * register it checks). i2c6 specifically is what this dump's own
-     * vendor userspace camera/ISP pipeline opens directly as
-     * /dev/i2c-6 to talk to the real image sensor -- confirmed by
-     * this same boot's own "Load_AX620E -i imx307" invocation (the
-     * real devicetree has no sensor child node at all under this
-     * i2c bus; the vendor's own userspace ISP library owns the
-     * sensor probe/config entirely, not the kernel). With no device
-     * node for /dev/i2c-6 ever created (this controller never having
-     * probed successfully at all), the real vendor binary's own
-     * open() failure cascaded into a guest-side SIGBUS ("Bus error")
-     * in its video pipeline shortly after.
-     *
-     * An earlier attempt wired this up with hisi-i2c-dw, but that
-     * model (despite its name) implements a different, HiSilicon-
-     * specific "AUTO mode" single-shot-transaction register protocol
-     * (see its own file header) for the drivers/i2c/busses/
-     * i2c-hisilicon.c vendor driver on CV200-family SoCs -- it is NOT
-     * register-compatible with the real mainline i2c-designware-*.c
-     * driver this AX620E kernel actually uses, which still read back
-     * "Unknown Synopsys component type: 0x00000000" from
-     * DW_IC_COMP_TYPE (offset 0xfc) against hisi-i2c-dw and bailed
-     * out of i2c_dw_set_reg_access() with -ENODEV before ever
-     * creating /dev/i2c-N, confirmed live. dw-i2c is a new, generic
-     * DW_IC_* register model (CON/TAR/DATA_CMD FIFO semantics,
-     * COMP_TYPE/COMP_VERSION/COMP_PARAM_1 included) written
-     * specifically to satisfy that real driver; hisi-imx307 (a real
-     * IMX307 stub already written for this exact Xiongmai probe
-     * sequence -- see its own comment) is a plain I2CSlave and works
-     * unchanged on either master model. The sensor's own I2C address,
-     * 0x1a, is the industry-standard Sony STARVIS address (confirmed
-     * already assumed correct elsewhere in this project, for the
-     * same sensor family, on a different Xiongmai-derived SoC).
-     */
-    sysbus_create_simple("dw-i2c", 0x04852000, pic[0x89]);
-
-    /*
-     * i2c@4850000 (i2c0) and i2c@4857000 (i2c7), GIC SPI 0x87/0x8e:
-     * these two were plain create_unimplemented_device catch-all stubs
-     * (ax620e_unimp[]) until now, exactly like i2c2/i2c6 used to be --
-     * but unlike i2c2/i2c6, this exact dump's real devicetree node for
-     * BOTH of these has "status = disabled" (confirmed by reading the
-     * node directly, same extraction this file's own i2c2/i2c6 comment
-     * above already relies on), so the guest's i2c-designware platform
-     * driver never even calls probe() on either one -- no MMIO access
-     * of any kind reaches these two addresses anywhere in a live boot,
-     * confirmed empirically with a `-d unimp` run all the way through
-     * kernel boot, rootfs mount and the real camera App's own start
-     * (Load_AX620E): the unimp log for this exact dump has zero hits
-     * on either address, before or after this fix. Neither U-Boot
-     * (whose AX620E defconfigs don't even enable CONFIG_I2C) nor BL1
-     * (no I2C driver exists anywhere in this platform's own boot/bl1
-     * tree) touch them either. So this fix is "no longer a bare
-     * catch-all stub, now a real DW_IC_* register model" for
-     * correctness/consistency with every other real IP block in this
-     * file, not because anything observed actually depends on it --
-     * if a different dump's devicetree ever flips either node to
-     * "status = okay" (or a future BL1/U-Boot image starts using
-     * CONFIG_I2C), this is already the right model to answer it,
-     * instead of silently returning zero from a generic stub the way
-     * i2c2/i2c6 themselves used to (which caused a real guest-visible
-     * "Unknown Synopsys component type" probe failure for those two).
-     * No downstream slave is attached to either bus: nothing in this
-     * dump's kernel, U-Boot, BL1, or App ever probes an address on
-     * them, so there is nothing for a stand-in sensor/PMIC to answer.
-     */
-    sysbus_create_simple("dw-i2c", 0x04850000, pic[0x87]);
-    sysbus_create_simple("dw-i2c", 0x04857000, pic[0x8e]);
-
-    {
-        DeviceState *i2c6 = sysbus_create_simple("dw-i2c", 0x04856000,
-                                                 pic[0x8d]);
-        I2CBus *i2c6_bus = I2C_BUS(qdev_get_child_bus(i2c6, "i2c"));
-
-        /*
-         * Confirmed live: the real vendor userspace ISP's own sensor
-         * auto-probe never actually tries address 0x1a (where a
-         * hisi-imx307 was first attached, based solely on this dump's
-         * "-i imx307" launch argument turning out to just be a
-         * generic/default argument, not a real indicator) -- it
-         * cycles through 0x36/0x30/0x10 looking for a response and
-         * never reaches 0x1a within many repeated passes. 0x30 is
-         * this tree's own "Sofia (XiongMai) detects these sensors at
-         * I2C addr 0x60 (8-bit) = 0x30 (7-bit)" SmartSens SC* family
-         * address (see hisi-smartsens.c) -- and this exact dump's own
-         * extracted ai_isp .axmodel filename independently confirms
-         * the real deployed sensor is a SmartSens SC450AI, not a Sony
-         * IMX307 at all. The real id_high/id_low pair (0xBD/0x2F, from
-         * SC450AI_SENSOR_ID = 0xbd2f at registers 0x3107/0x3108,
-         * maix_ax620e_sdk/msp/component/isp_proton/sensor/
-         * smartsens_sc450ai/sc450ai_reg.h) replaces an earlier sc307h
-         * stand-in (0xCB/0x1C): with the wrong ID, the app's own
-         * sensor-name lookup misidentified the chip as "sc200ai" and
-         * then failed outright trying to dlopen a /usr/lib/
-         * libsns_sc200ai.so this rootfs never ships (only
-         * libsns_sc450ai.so is present) -- confirmed live via
-         * "xmcap_sensor.c ... open /usr/lib/libsns_sc200ai.so fail!"
-         * aborting IspVi_create before it ever reaches real VIN/WDMA
-         * setup. The correct ID lets the app's own lookup resolve to
-         * "sc450ai" and successfully load the .so that's actually
-         * there.
-         */
-        DeviceState *sensor = qdev_new("hisi-smartsens");
-
-        qdev_prop_set_uint8(sensor, "id_high", 0xBD);
-        qdev_prop_set_uint8(sensor, "id_low", 0x2F);
-        qdev_prop_set_uint8(sensor, "address", 0x30);
-        qdev_realize_and_unref(sensor, BUS(i2c6_bus), &error_fatal);
-    }
-
-    /*
-     * isp@2400000, "axera,proton", GIC SPI 27/28 ("isp0-0"/"isp0-1"):
-     * the real VIN/ISP frame-completion interrupt -- see
-     * hw/misc/axera-vin.c's own header comment for the full discovery
-     * (live gdbstub trace through four layers of the real ax_proton.ko
-     * down to the exact register map) and for what's still an assumption
-     * versus confirmed. Previously a passive axera-vin regbank (moved
-     * here from axera_map_regbanks() since, like AX_DMAPER above, it
-     * needs pic[] at creation time): that left the real kernel driver's
-     * frame-done wait permanently timing out, which is why the camera
-     * app never stopped logging AX_ERR_IVPS_BUF_EMPTY and, almost
-     * certainly, why it never called accept() on its RTSP socket either.
-     */
-    {
-        DeviceState *vin = qdev_new("axera-vin");
-
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
-        sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);
-        sysbus_connect_irq(SYS_BUS_DEVICE(vin), 1, pic[0x1c]);
-    }
-
-    /*
-     * ethernet@104c0000, "axera,dwmac-4.10a", GIC SPI 0x50 ("macirq"):
-     * a real Synopsys DWC EQoS / dwmac-4.10a MAC+DMA core with an
-     * external RMII PHY, confirmed by the real devicetree's own
-     * clocks/resets/phy-handle properties -- see hw/net/axera-eqos.c's
-     * own header comment for why its register map is identical to
-     * hw/net/nvt-eqos.c's (same underlying Synopsys IP generation,
-     * just a different vendor glue/PHY). Previously left as a plain
-     * unimplemented register stub ("axera-eth0"), which let U-Boot's
-     * own probe see *something* respond but gave the Linux guest no
-     * way to ever bring an interface up -- confirmed live, no eth0
-     * IP configuration of any kind ever appeared in a full boot's
-     * console output against the stub.
-     */
-    {
-        DeviceState *eth = qdev_new("axera-eqos");
-
-        qemu_configure_nic_device(eth, true, NULL);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(eth), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(eth), 0, 0x104c0000);
-        sysbus_connect_irq(SYS_BUS_DEVICE(eth), 0, pic[0x50]);
-    }
-
-    /*
-     * usb2@8000000, "snps,dwc3": QEMU's generic usb_dwc3 model (also
-     * used by Xilinx ZynqMP boards for the same Synopsys IP). Upstream
-     * does not expose its internal XHCI IRQ as a sysbus output either
-     * (confirmed: no sysbus_init_irq in hcd-dwc3.c's realize, and
-     * xlnx-zynqmp.c's own instantiation connects none) -- register-level
-     * access works, interrupt-driven transfers do not, a limitation of
-     * the upstream model itself, not introduced here.
-     */
-    {
-        DeviceState *dwc3 = qdev_new(TYPE_USB_DWC3);
-
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(dwc3), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(dwc3), 0, 0x08000000);
-    }
+    axera_ax620e_periphs(pic, true);
 
     {
         AxeraMachineState *ams = AXERA_MACHINE(machine);
@@ -1480,46 +1558,27 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     create_unimplemented_device("axera-periph", AXERA_PERIPH_BASE,
                                  AXERA_PERIPH_SIZE);
     /*
-     * AX620Q's own dtsi only documents these three blocks (no GPIO,
-     * pinctrl or VPU/ISP nodes at all -- a much smaller feature set than
-     * AX630C/AX620E's), at the same addresses as the aarch64 family.
-     * AX620U ("axera,ax620x") is a different SoC design and its clock
-     * controller addresses are not confirmed, so it gets none of these
-     * -- only the ISP/NPU blocks a real AX620U firmware's own devicetree
-     * actually showed (same addresses as AX630C/AX620E's family, smaller
-     * register windows).
+     * AX620Q is the AX620E die (see axera_ax620e_periphs()): same
+     * clock/pinctrl/GPIO syscons, PLL, timers and SPI panel bus, and the
+     * same on-chip SRAMs, as the AArch64 machines. AX620U
+     * ("axera,ax620x") is a different SoC design whose clock controller
+     * addresses are not confirmed, so it gets none of these -- only the
+     * ISP/NPU blocks a real AX620U firmware's own devicetree actually
+     * showed (same addresses as AX630C/AX620E's family, smaller register
+     * windows).
      */
     if (!c->is_ax620x) {
-        static const struct {
-            const char *name;
-            hwaddr base;
-            uint32_t size;
-        } ax620q_regbanks[] = {
-            { "axera-clk-cpu",    0x01900000, 0x1000 },
-            { "axera-clk-pllc",   0x02210000, 0x1000 },
-            { "axera-clk-common", 0x02340000, 0x1000 },
-        };
-        int r;
+        MemoryRegion *npu_sram = g_new(MemoryRegion, 1);
+        MemoryRegion *iram0 = g_new(MemoryRegion, 1);
 
-        for (r = 0; r < ARRAY_SIZE(ax620q_regbanks); r++) {
-            DeviceState *dev = qdev_new("hisi-regbank");
+        memory_region_init_ram(npu_sram, NULL, "axera.npu-sram",
+                               0x280000, &error_fatal);
+        memory_region_add_subregion(sysmem, 0x03000000ULL, npu_sram);
+        memory_region_init_ram(iram0, NULL, "axera.iram0", 0x1000,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, 0x0ULL, iram0);
 
-            qdev_prop_set_uint32(dev, "size", ax620q_regbanks[r].size);
-            qdev_prop_set_string(dev, "name", ax620q_regbanks[r].name);
-            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-            sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0,
-                                    ax620q_regbanks[r].base, 1);
-        }
-
-        /*
-         * spi2 @ 0x06072000 (same address as AX630C/AX620E's, confirmed
-         * from arch/arm/dts/ax620e.dtsi's shared spi2 node): AX620Q's own
-         * boot logo also drives a SPI-attached panel through this same
-         * poll_transfer() loop with no timeout (see hw/misc/axera-dw-spi.c)
-         * -- a passive regbank hangs the boot dead right after relocation,
-         * same shape as the aarch64 family's panel hang.
-         */
-        sysbus_create_simple(TYPE_AXERA_DW_SPI, 0x06072000, NULL);
+        axera_map_regbanks();
     } else {
         /*
          * AX620U's real devicetree (from a deployed camera firmware,
@@ -2190,8 +2249,21 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         axera_attach_sdhci(0x04950000, pic[0x84], 1, false);
     }
 
+    if (!c->is_ax620x) {
+        axera_ax620e_periphs(pic, false);
+        qemu_register_reset(axera_ax620q_spl_handoff_reset,
+                            (void *)(uintptr_t)(drive_get(IF_SD, 0, 1)
+                                                != NULL));
+    }
+
+    /*
+     * AX620Q's console is ttyS3 @ 0x06080000 (serial3 in the shared
+     * AX620E.dtsi, GIC SPI 0x79), so it gets serial_hd(0) and UART0
+     * becomes the second serial port. AX620U's console is its own UART0.
+     */
     serial_mm_init(sysmem, c->uart0_base, 2, pic[c->uart0_irq],
-                   AXERA_UART0_FREQ / 16, serial_hd(0),
+                   AXERA_UART0_FREQ / 16,
+                   serial_hd(c->is_ax620x ? 0 : 1),
                    DEVICE_LITTLE_ENDIAN);
 
     /*
@@ -2199,12 +2271,13 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
      * CONFIG_SYS_NS16550_COM4 in include/configs/ax620e_common.h) puts
      * its console on a fourth, separate NS16550 instance at 0x06080000,
      * not on uart0_base -- confirmed by GDB-tracing a silent boot straight
-     * into eserial4_init()/NS16550_init(com_port=0x6080000). Not in
-     * AX620Q's own documented dtsi blocks (board bring-up only, no IRQ
-     * confirmed from any real devicetree), so no interrupt line.
+     * into eserial4_init()/NS16550_init(com_port=0x6080000). The kernel's
+     * own devicetree (ax_uart@6080000, serial3) gives it GIC SPI 0x79;
+     * without it the 8250 driver's THRE-interrupt TX path stalls the
+     * moment userspace starts writing to ttyS3.
      */
     if (!c->is_ax620x) {
-        serial_mm_init(sysmem, 0x06080000, 2, NULL,
+        serial_mm_init(sysmem, 0x06080000, 2, pic[0x79],
                        AXERA_UART0_FREQ / 16, serial_hd(0),
                        DEVICE_LITTLE_ENDIAN);
     }
