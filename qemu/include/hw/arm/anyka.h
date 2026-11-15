@@ -37,6 +37,8 @@ typedef struct AkSoCConfig {
      * at 0x201C0000 (0x201A0000 is UART 2 there).
      */
     bool        aspen;
+    /* AV100: the second MIPI / CSI input, the NPU (anycloud_ak3918av100) */
+    bool        av100;
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */
