@@ -108,6 +108,8 @@ failures = 0
 def shown(v):
     if isinstance(v, (bool, str)):
         return v
+    if isinstance(v, tuple):
+        return '(%s)' % ', '.join(str(shown(x)) for x in v)
     if isinstance(v, bytes):
         return v[:8].hex() + ('...' if len(v) > 8 else '')
     return hex(v)
@@ -566,8 +568,11 @@ def test_av130(qemu, tmp):
     path = os.path.join(tmp, 'av130.bin')
     open(path, 'wb').write(img)
     out = os.path.join(tmp, 'av130-uart0.txt')
+    rx = os.path.join(tmp, 'av130-uart0-in.txt')
+    open(rx, 'wb').write(b'hi')                 # what UART0 receives
     qt = QTest(qemu, 'ak3918av130,flash-file=%s' % path,
-               ['-serial', 'file:' + out])
+               ['-chardev', 'file,id=u0,path=%s,input-path=%s' % (out, rx),
+                '-serial', 'chardev:u0'])
     try:
         table = [qt.readl(0x28 + 4 * i) for i in range(9)]
         check('script: poll, ROM op and RMW dropped, nothing at 0xFFFFFFFB',
@@ -618,6 +623,44 @@ def test_av130(qemu, tmp):
               qt.readl(intc + 0x08) >> 13 & 1, 0)
         check('chip ID at SYSCTRL + 0x3FC', qt.readl(SYSCTRL + 0x3FC),
               0x56573500)
+        # Periodic: VALUE runs LOAD..0, a period of LOAD + 1 ticks, and
+        # INT_STA comes as it reaches 0, not a tick before.
+        t2 = 0x21112000
+        qt.writel(t2 + 0x00, 1199)               # 100 us at 12 MHz
+        qt.writel(t2 + 0x10, 1)
+        qt.writel(t2 + 0x08, (1 << 1) | (1 << 3) | 1)
+        qt.step(99916)                           # tick 1198
+        check('periodic: not before VALUE reaches 0',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (0, 1))
+        qt.step(1)
+        check('periodic: INT_STA as VALUE reaches 0',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x0C, 1)
+        qt.step(100000)                          # one period, LOAD + 1 ticks
+        check('periodic: the next one LOAD + 1 ticks later',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x0C, 1)
+        qt.writel(t2 + 0x00, 599)                # a new LOAD, at VALUE 0
+        qt.step(49999)
+        check('new LOAD: not before its period ends', qt.readl(t2 + 0x18), 0)
+        qt.step(1)
+        check('new LOAD: INT_STA after LOAD + 1 = 600 ticks',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x08, 0)
+        qt.writel(t2 + 0x0C, 1)
+        # The system controller's own events are bank 1: their mask and
+        # status stay at SYSCTRL + 0x2C / 0x30, and top bit 3 raises them.
+        qt.writel(intc + 0x04, 1 << 3)
+        qt.writel(SYSCTRL + 0x2C, 1 << 5)        # its timer 1
+        qt.writel(SYSCTRL + 0xB4, 12000)
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24) | (1 << 29))
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24))
+        qt.step(2000000)
+        check('a system controller timer reaches top bit 3',
+              qt.readl(intc + 0x08) >> 3 & 1, 1)
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24) | (1 << 30))
+        check('and clearing it there drops it', qt.readl(intc + 0x08) >> 3 & 1,
+              0)
         # The kernel's reboot (ak_pm.c REBOOT_DISABLE_CACHE_MMU and
         # REBOOT_SELF_REFRESH): the instruction after the MMU goes off is
         # fetched from L2 memory at its virtual address, 0xF1000000, and the
@@ -640,12 +683,24 @@ def test_av130(qemu, tmp):
         qt.writel(uart + 0x18, 1 << 17)
         check('UART: TX end is write-1-to-clear',
               qt.readl(uart + 0x18) >> 17 & 1, 0)
+        test_av130_sfc(qt)
+        # RX: two bytes from the input file, their events on UART0's
+        # interrupt (top bit 10) only while bytes wait.
+        qt.writel(intc + 0x04, 1 << 10)
+        qt.writel(uart + 0x20, (1 << 8) | (1 << 10))
+        check('UART: two bytes received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
+              2)
+        check('UART: RX threshold and timeout raised',
+              (qt.readl(uart + 0x18) >> 8) & 5, 5)
+        check('UART: on interrupt 10', qt.readl(intc + 0x08) >> 10 & 1, 1)
+        got = bytes(qt.readl(uart + 0x0C) & 0xFF for _ in range(2))
+        check('UART: the bytes, in order', got, b'hi')
+        check('UART: the RX events end with the FIFO',
+              ((qt.readl(uart + 0x18) >> 8) & 5, qt.readl(intc + 0x08) >> 10 & 1),
+              (0, 0))
         qt.writel(uart + 0x00, (1 << 28) | (1 << 25))
         check('UART: the RX FIFO clear (CFG 28) self-clears',
               qt.readl(uart + 0x00), 1 << 25)
-        test_av130_sfc(qt)
-        check('UART: nothing received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
-              0)
     finally:
         qt.close()
 

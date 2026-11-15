@@ -44,6 +44,7 @@
 #define AK_MAC_BASE         0x20300000
 #define AK_AV130_MAC_BASE   0x20240000      /* ethernet@0x20240000 */
 #define AK_AV130_INTC_BASE  0x21100000
+#define AK_AV130_IRQ_SYSCTRL 3              /* top bit: bank 1, SYSCTRL */
 #define AK_AV130_L2_VA      0xF1000000      /* the kernel's AK_VA_L2MEM */
 #define AK_L2_MEM_BASE      0x48000000
 #define AK_DDR_BASE         0x80000000
@@ -484,6 +485,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     sysctrl = qdev_new("ak-sysctrl");
     qdev_prop_set_uint32(sysctrl, "chip-id", c->chip_id);
     qdev_prop_set_uint32(sysctrl, "chip-id-av", c->chip_id_av);
+    qdev_prop_set_bit(sysctrl, "cascade", c->av130);
     qdev_prop_set_uint32(sysctrl, "num-timers", c->num_timers);
     qdev_prop_set_bit(sysctrl, "has-efuse", c->has_efuse);
     qdev_prop_set_bit(sysctrl, "clk-v2", c->aspen);
@@ -493,13 +495,16 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         /*
          * The AV130's interrupt controller and timers, at 0x21100000
          * (hw/misc/ak-av130-intc.c).  The top bank numbers the devices as
-         * the system controller does; the system controller's own events
-         * are a sub-bank there (bank 1, not modelled), so its outputs stay
-         * unconnected.
+         * the system controller does.  The system controller's own events
+         * (its timers, the RTC) are bank 1 there, with the mask and status
+         * left in the system controller (0x0800002C / 0x30): it raises top
+         * bit 3, the kernel's SYSCTRL_IRQ (ak_irq_v2.c).
          */
         irqc = qdev_new("ak-av130-intc");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(irqc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(irqc), 0, AK_AV130_INTC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(sysctrl), 0,
+                           qdev_get_gpio_in(irqc, AK_AV130_IRQ_SYSCTRL));
     } else {
         irqc = sysctrl;
     }

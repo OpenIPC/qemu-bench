@@ -16,8 +16,8 @@
  *   +0x1C / +0x20 NSS, top bit 0                              (bank 5)
  *   +0x24 / +0x28 ISS, top bit 1                              (bank 4)
  *   +0x2C / +0x30 ESS, top bit 2                              (bank 3)
- * Bank 1 is the system controller's (0x0800002C / 0x30, top bit 3), not
- * modelled here.  Top status is the raw inputs plus a cascade bit for each
+ * Bank 1 is the system controller's: its mask and status stay there
+ * (0x0800002C / 0x30) and it drives input 3, the top bit for the bank.  Top status is the raw inputs plus a cascade bit for each
  * sub-bank with an enabled interrupt pending.
  *
  * Timers: five channels at +0x10000 + n * 0x1000, 12 MHz, counting down,
@@ -26,10 +26,13 @@
  *   +0x00 LOAD   +0x04 VALUE   +0x08 CTRL: 0 enable, 2:1 mode (free,
  *   periodic, one-shot), 3 reload VALUE from LOAD now (self-clearing)
  *   +0x0C INTCLR (1 clears)   +0x10 INT_EN   +0x14 DIV   +0x18 INT_STA
- * Free mode wraps from 0 to 0xFFFFFFFF; periodic reloads LOAD.  VALUE is
- * worked out from the virtual clock, exactly (12 MHz is not a whole number
- * of nanoseconds a tick, which a ptimer's count rounds); the ptimer only
- * schedules the interrupts.
+ * VALUE counts from where CTRL (or a LOAD write) left it down to 0, then
+ * free mode goes on from 0xFFFFFFFF and periodic from LOAD -- a period of
+ * LOAD + 1 ticks, as the kernel's TIMER_CNT - 1 has it -- and one-shot
+ * stops.  INT_STA is set as VALUE reaches 0.  Both are worked out from the
+ * virtual clock and one base (12 MHz is not a whole number of nanoseconds
+ * a tick, which a ptimer's count would round): VALUE when it is read, and
+ * the next zero for the timer that raises INT_STA.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -40,7 +43,6 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
-#include "hw/ptimer.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
@@ -76,7 +78,7 @@ static const int sub_top_bit[NSUB] = { 13, 17, 0, 1, 2 };   /* TWI SSS NSS ISS E
 
 typedef struct AkAv130Timer {
     struct AkAv130IntcState *s;
-    ptimer_state *ptimer;
+    QEMUTimer *timer;
     uint32_t load, ctrl, int_en, div, sta;
     /* VALUE: base_count at base_ns, counting while CTRL_EN */
     int64_t base_ns;
@@ -161,6 +163,52 @@ static uint32_t ak_av130_timer_value(AkAv130Timer *t)
     }
 }
 
+/* Ticks from the base to the next time VALUE reaches 0, or 0 for none. */
+static uint64_t ak_av130_timer_next_zero(AkAv130Timer *t, uint64_t elapsed)
+{
+    uint64_t period, first = t->base_count;
+
+    switch (CTRL_MODE(t->ctrl)) {
+    case MODE_ONESHOT:
+        first = MAX(first, 1);
+        return elapsed < first ? first : 0;
+    case MODE_PERIOD:
+        period = (uint64_t)t->load + 1;
+        break;
+    default:
+        period = 1ull << 32;
+        break;
+    }
+    if (!first) {
+        first = period;
+    }
+    if (elapsed < first) {
+        return first;
+    }
+    return first + ((elapsed - first) / period + 1) * period;
+}
+
+static void ak_av130_timer_schedule(AkAv130Timer *t)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t elapsed, next;
+
+    if (!(t->ctrl & CTRL_EN)) {
+        timer_del(t->timer);
+        return;
+    }
+    elapsed = muldiv64(now - t->base_ns, TIMER_FREQ, NANOSECONDS_PER_SECOND);
+    next = ak_av130_timer_next_zero(t, elapsed);
+    if (!next) {
+        timer_del(t->timer);
+        return;
+    }
+    /* rounded up, so VALUE reads 0 when it fires */
+    timer_mod(t->timer, t->base_ns +
+              (int64_t)muldiv64_round_up(next, NANOSECONDS_PER_SECOND,
+                                         TIMER_FREQ));
+}
+
 static void ak_av130_timer_tick(void *opaque)
 {
     AkAv130Timer *t = opaque;
@@ -170,36 +218,22 @@ static void ak_av130_timer_tick(void *opaque)
         t->base_count = 0;
         t->ctrl &= ~CTRL_EN;
     }
+    ak_av130_timer_schedule(t);
     ak_av130_update(t->s);
 }
 
-/* Apply CTRL (inside a ptimer transaction). */
-static void ak_av130_timer_ctrl(AkAv130Timer *t, uint32_t val)
+/* VALUE carries on from now, from where it is or from start. */
+static void ak_av130_timer_rebase(AkAv130Timer *t, bool reload)
 {
-    bool reload = val & CTRL_RELOAD;
-
-    /* VALUE goes on from where it is, or from LOAD on a reload */
     t->base_count = reload ? t->load : ak_av130_timer_value(t);
     t->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static void ak_av130_timer_ctrl(AkAv130Timer *t, uint32_t val)
+{
+    ak_av130_timer_rebase(t, val & CTRL_RELOAD);
     t->ctrl = val & ~CTRL_RELOAD;
-    if (!(t->ctrl & CTRL_EN)) {
-        ptimer_stop(t->ptimer);
-        return;
-    }
-    /* the ptimer expires when VALUE reaches 0, then as the mode says */
-    switch (CTRL_MODE(t->ctrl)) {
-    case MODE_PERIOD:
-        ptimer_set_limit(t->ptimer, MAX(t->load, 1), 0);
-        break;
-    case MODE_ONESHOT:
-        ptimer_set_limit(t->ptimer, MAX(t->load, 1), 0);
-        break;
-    default:
-        ptimer_set_limit(t->ptimer, 0xFFFFFFFF, 0);
-        break;
-    }
-    ptimer_set_count(t->ptimer, t->base_count ? t->base_count : 0xFFFFFFFF);
-    ptimer_run(t->ptimer, CTRL_MODE(t->ctrl) == MODE_ONESHOT);
+    ak_av130_timer_schedule(t);
 }
 
 static uint64_t ak_av130_read(void *opaque, hwaddr off, unsigned size)
@@ -243,10 +277,15 @@ static void ak_av130_write(void *opaque, hwaddr off, uint64_t val,
     if (off >= TIMER_BASE && off < TIMER_BASE + NTIMERS * TIMER_STRIDE) {
         AkAv130Timer *t = &s->timer[(off - TIMER_BASE) / TIMER_STRIDE];
 
-        ptimer_transaction_begin(t->ptimer);
         switch (off & (TIMER_STRIDE - 1)) {
         case T_LOAD:
+            /*
+             * A running timer finishes the count it is in; the periods
+             * after it are the new LOAD's.
+             */
+            ak_av130_timer_rebase(t, false);
             t->load = val;
+            ak_av130_timer_schedule(t);
             break;
         case T_CTRL:
             ak_av130_timer_ctrl(t, val);
@@ -265,7 +304,6 @@ static void ak_av130_write(void *opaque, hwaddr off, uint64_t val,
         default:
             break;
         }
-        ptimer_transaction_commit(t->ptimer);
         ak_av130_update(s);
         return;
     }
@@ -307,10 +345,7 @@ static void ak_av130_reset(DeviceState *dev)
     for (i = 0; i < NTIMERS; i++) {
         AkAv130Timer *t = &s->timer[i];
 
-        ptimer_transaction_begin(t->ptimer);
-        ptimer_stop(t->ptimer);
-        ptimer_set_limit(t->ptimer, 0, 1);
-        ptimer_transaction_commit(t->ptimer);
+        timer_del(t->timer);
         t->load = t->ctrl = t->int_en = t->div = t->sta = 0;
         t->base_count = 0;
         t->base_ns = 0;
@@ -334,14 +369,7 @@ static void ak_av130_init(Object *obj)
         AkAv130Timer *t = &s->timer[i];
 
         t->s = s;
-        t->ptimer = ptimer_init(ak_av130_timer_tick, t,
-                                PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD |
-                                PTIMER_POLICY_NO_IMMEDIATE_TRIGGER |
-                                PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
-                                PTIMER_POLICY_NO_COUNTER_ROUND_DOWN);
-        ptimer_transaction_begin(t->ptimer);
-        ptimer_set_freq(t->ptimer, TIMER_FREQ);
-        ptimer_transaction_commit(t->ptimer);
+        t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ak_av130_timer_tick, t);
     }
 }
 
@@ -350,7 +378,7 @@ static const VMStateDescription vmstate_ak_av130_timer = {
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_PTIMER(ptimer, AkAv130Timer),
+        VMSTATE_TIMER_PTR(timer, AkAv130Timer),
         VMSTATE_UINT32(load, AkAv130Timer),
         VMSTATE_UINT32(ctrl, AkAv130Timer),
         VMSTATE_UINT32(int_en, AkAv130Timer),

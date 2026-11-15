@@ -335,7 +335,7 @@ static const TypeInfo ak_uart_info = {
  *   0x14  baud divider (15:0) and fraction
  *   0x18  status: 0 TX threshold, 1 TX FIFO empty (always: sending is
  *         instant), 2 TX FIFO full (never); 8 RX threshold, 10 RX timeout,
- *         set while bytes wait, and 17 TX end, set by a send; 3..18 are
+ *         set while bytes wait and cleared once the FIFO is empty, and 17 TX end, set by a send; 3..18 are
  *         write-1-to-clear
  *   0x20  interrupt enables, each at its status bit's position
  *   0x38  25:16 bytes received
@@ -408,7 +408,11 @@ static uint64_t ak_uart2_read(void *opaque, hwaddr offset, unsigned size)
         }
         c = s->rx[s->rx_head];
         s->rx_head = (s->rx_head + 1) % AK_UART2_FIFO;
-        s->rx_len--;
+        if (!--s->rx_len) {
+            /* the RX events last only while bytes wait */
+            s->regs[0x18 / 4] &= ~(AK_UART2_ST_RX_TH | AK_UART2_ST_RX_TIMEOUT);
+        }
+        ak_uart2_update_irq(s);
         qemu_chr_fe_accept_input(&s->chr);
         return c;
     case 0x18:
@@ -429,6 +433,7 @@ static void ak_uart2_write(void *opaque, hwaddr offset, uint64_t val,
     case 0x00:
         if (val & AK_UART2_CFG_RX_CLR) {
             s->rx_head = s->rx_len = 0;
+            s->regs[0x18 / 4] &= ~(AK_UART2_ST_RX_TH | AK_UART2_ST_RX_TIMEOUT);
             qemu_chr_fe_accept_input(&s->chr);
         }
         s->regs[0] = val & ~(AK_UART2_CFG_RX_CLR | AK_UART2_CFG_TX_CLR);
