@@ -246,7 +246,7 @@ either was at hand.
 | `ak3918ev300l` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes |
 | `ak3918av100` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
 | `ak3918av100x` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
-| `ak3918av130` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | vendor (DT) | U-Boot only⁴ |
+| `ak3918av130` | ARM926EJ-S, 64 MB in package | own (2-level, `0x21100000`) | 4.4.302 vendor (DT) | yes⁴ |
 
 Anyka's camera SoCs, unrelated to HiSilicon: one memory map from the
 AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330) and the
@@ -267,10 +267,11 @@ was at hand.  ³ AK3918AV100 (and KM01N) / AK3918AV100X (and KM01D), which
 differ only in DDR size: images built from the AnyCloud39AV100 SDK's U-Boot
 and 4.4.282 kernel (`ANYKA322` header, U-Boot at flash 0x600) boot to
 `login:`; no camera dump has been seen.  ⁴ AK3918AV130, from one camera's
-flash (an owner report on openipc.org): its U-Boot reads the kernel
-through the SPI flash controller and starts it; the kernel's interrupt
-controller and timer are not modelled yet
-([docs/anyka.md](docs/anyka.md#ak3918av130)).
+flash (an owner report on openipc.org): U-Boot and the 4.4.302 kernel
+read the NOR through the SPI flash controller, and the kernel reaches
+`login:` on the AV130's own interrupt controller and timers
+([docs/anyka.md](docs/anyka.md#ak3918av130)), and a reboot goes through
+the vendor's L2-resident code and the watchdog, as on the chip.
 
 ### SigmaStar / MStar family (`qemu-system-arm`)
 

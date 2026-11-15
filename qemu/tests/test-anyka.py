@@ -108,6 +108,8 @@ failures = 0
 def shown(v):
     if isinstance(v, (bool, str)):
         return v
+    if isinstance(v, tuple):
+        return '(%s)' % ', '.join(str(shown(x)) for x in v)
     if isinstance(v, bytes):
         return v[:8].hex() + ('...' if len(v) > 8 else '')
     return hex(v)
@@ -540,7 +542,7 @@ def test_av100(qemu, tmp):
 
 def test_av130(qemu, tmp):
     print('ak3918av130: an AKH322LS header as the first AV130 dump has it, '
-          'tick timer, FIFO UART')
+          'timers and interrupts at 0x21100000, FIFO UART')
     # As owner report r-5uwdebux's flash has it: magic AKH322LS, the payload
     # from flash 0x200 (0x400 of secure-boot space, then U-Boot at 0x600) to
     # 0x80DFFC00, so U-Boot lands at 0x80E00000; the script ends with the
@@ -566,8 +568,11 @@ def test_av130(qemu, tmp):
     path = os.path.join(tmp, 'av130.bin')
     open(path, 'wb').write(img)
     out = os.path.join(tmp, 'av130-uart0.txt')
+    rx = os.path.join(tmp, 'av130-uart0-in.txt')
+    open(rx, 'wb').write(b'hi')                 # what UART0 receives
     qt = QTest(qemu, 'ak3918av130,flash-file=%s' % path,
-               ['-serial', 'file:' + out])
+               ['-chardev', 'file,id=u0,path=%s,input-path=%s' % (out, rx),
+                '-serial', 'chardev:u0'])
     try:
         table = [qt.readl(0x28 + 4 * i) for i in range(9)]
         check('script: poll, ROM op and RMW dropped, nothing at 0xFFFFFFFB',
@@ -580,28 +585,122 @@ def test_av130(qemu, tmp):
         qt.writel(0x80000000 + (64 << 20), 0x5AA5C33C)
         check('none past 64 MiB', qt.readl(0x80000000 + (64 << 20)) !=
               0x5AA5C33C, True)
-        tick = 0x21110000
-        qt.writel(tick + 0x00, 12000)           # a millisecond at 12 MHz
-        qt.writel(tick + 0x10, 1)
-        qt.writel(tick + 0x08, 1)
-        a = qt.readl(tick + 0x04)
-        qt.step(250000)                         # a quarter of it
-        qt.writel(tick + 0x08, 1)
-        b = qt.readl(tick + 0x04)
-        check('tick timer counts down 3000 in 250 us', a - b, 3000)
-        check('the latch bit self-clears', qt.readl(tick + 0x08) & 1, 0)
+        # The timers and interrupt controller at 0x21100000, as the AV130
+        # SDK's kernel drives them (ak_timer_common.h, ak_irq_v2.c) and its
+        # U-Boot's get_timer() reads timer 0: LOAD 0x00, VALUE 0x04, CTRL
+        # 0x08 (0 enable, 2:1 mode, 3 reload now), INTCLR 0x0C, INT_EN 0x10.
+        intc, t0, t1 = 0x21100000, 0x21110000, 0x21111000
+        qt.writel(t0 + 0x00, 12000)             # U-Boot's timer_init()
+        qt.writel(t0 + 0x14, 1)
+        qt.writel(t0 + 0x10, 1)
+        qt.writel(t0 + 0x08, 1)                 # free running
+        a = qt.readl(t0 + 0x04)
+        qt.step(250000)                         # 250 us at 12 MHz
+        qt.writel(t0 + 0x08, 1)                 # get_timer() sets bit 0 again
+        b = qt.readl(t0 + 0x04)
+        check('timer 0 counts down 3000 in 250 us', (a - b) & 0xFFFFFFFF,
+              3000)
+        check('CTRL bit 0 is the enable: it stays set',
+              qt.readl(t0 + 0x08) & 1, 1)
+        qt.writel(t0 + 0x08, (1 << 3) | 1)       # the kernel's clocksource
+        check('reload: VALUE starts again from LOAD',
+              qt.readl(t0 + 0x04), 12000)
+        qt.writel(intc + 0x04, 1 << 28)          # IRQ mask: timer 1
+        qt.writel(t1 + 0x00, 12000)
+        qt.writel(t1 + 0x10, 1)
+        qt.writel(t1 + 0x08, (2 << 1) | (1 << 3) | 1)  # one-shot clock event
+        qt.step(500000)
+        check('timer 1 one-shot: not before it expires',
+              qt.readl(t1 + 0x18), 0)
+        qt.step(600000)
+        check('timer 1 one-shot: INT_STA', qt.readl(t1 + 0x18), 1)
+        check('top status bit 28 is timer 1', qt.readl(intc + 0x08) >> 28 & 1,
+              1)
+        qt.writel(t1 + 0x0C, 1)
+        check('INTCLR clears it', qt.readl(intc + 0x08) >> 28 & 1, 0)
+        qt.writel(intc + 0x0C, 1)                # TWI bank mask: I2C 0
+        check('an idle TWI bank raises no cascade bit (13)',
+              qt.readl(intc + 0x08) >> 13 & 1, 0)
+        check('chip ID at SYSCTRL + 0x3FC', qt.readl(SYSCTRL + 0x3FC),
+              0x56573500)
+        # Periodic: VALUE runs LOAD..0, a period of LOAD + 1 ticks, and
+        # INT_STA comes as it reaches 0, not a tick before.
+        t2 = 0x21112000
+        qt.writel(t2 + 0x00, 1199)               # 100 us at 12 MHz
+        qt.writel(t2 + 0x10, 1)
+        qt.writel(t2 + 0x08, (1 << 1) | (1 << 3) | 1)
+        qt.step(99916)                           # tick 1198
+        check('periodic: not before VALUE reaches 0',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (0, 1))
+        qt.step(1)
+        check('periodic: INT_STA as VALUE reaches 0',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x0C, 1)
+        qt.step(100000)                          # one period, LOAD + 1 ticks
+        check('periodic: the next one LOAD + 1 ticks later',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x0C, 1)
+        qt.writel(t2 + 0x00, 599)                # a new LOAD, at VALUE 0
+        qt.step(49999)
+        check('new LOAD: not before its period ends', qt.readl(t2 + 0x18), 0)
+        qt.step(1)
+        check('new LOAD: INT_STA after LOAD + 1 = 600 ticks',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x08, 0)
+        qt.writel(t2 + 0x0C, 1)
+        # The system controller's own events are bank 1: their mask and
+        # status stay at SYSCTRL + 0x2C / 0x30, and top bit 3 raises them.
+        qt.writel(intc + 0x04, 1 << 3)
+        qt.writel(SYSCTRL + 0x2C, 1 << 5)        # its timer 1
+        qt.writel(SYSCTRL + 0xB4, 12000)
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24) | (1 << 29))
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24))
+        qt.step(2000000)
+        check('a system controller timer reaches top bit 3',
+              qt.readl(intc + 0x08) >> 3 & 1, 1)
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24) | (1 << 30))
+        check('and clearing it there drops it', qt.readl(intc + 0x08) >> 3 & 1,
+              0)
+        # The kernel's reboot (ak_pm.c REBOOT_DISABLE_CACHE_MMU and
+        # REBOOT_SELF_REFRESH): the instruction after the MMU goes off is
+        # fetched from L2 memory at its virtual address, 0xF1000000, and the
+        # DRAM's self-refresh request (0x21000010 bit 23) reads back done.
+        qt.writel(0x48000040, 0xE1A0F001)        # mov pc, r1
+        check('L2 memory answers at the kernel\'s AK_VA_L2MEM',
+              qt.readl(0xF1000040), 0xE1A0F001)
+        qt.writel(0x21000010, (1 << 26) | (1 << 23) | (1 << 22))
+        check('DDRC: the self-refresh request (bit 23) reads back done',
+              qt.readl(0x21000010), (1 << 26) | (1 << 22))
         uart = 0x20130000
-        check('UART: never busy', qt.readl(uart + 0x18) & 4, 0)
+        check('UART: TX FIFO never full', qt.readl(uart + 0x18) & 4, 0)
         for ch in b'OK':
             qt.writel(uart + 0x0C, ch << 16)
         check('UART: bits 23:16 of DATA go out', open(out, 'rb').read(),
               b'OK')
-        qt.writel(uart + 0x18, 0x2500 | 0x40)
-        check('UART: status 8/10/13 are write-1-to-clear, the rest stored',
-              qt.readl(uart + 0x18), 0x40)
+        check('UART: TX FIFO empty and TX end after a send',
+              qt.readl(uart + 0x18) & ((1 << 1) | (1 << 17)),
+              (1 << 1) | (1 << 17))
+        qt.writel(uart + 0x18, 1 << 17)
+        check('UART: TX end is write-1-to-clear',
+              qt.readl(uart + 0x18) >> 17 & 1, 0)
         test_av130_sfc(qt)
-        check('UART: nothing received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
-              0)
+        # RX: two bytes from the input file, their events on UART0's
+        # interrupt (top bit 10) only while bytes wait.
+        qt.writel(intc + 0x04, 1 << 10)
+        qt.writel(uart + 0x20, (1 << 8) | (1 << 10))
+        check('UART: two bytes received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
+              2)
+        check('UART: RX threshold and timeout raised',
+              (qt.readl(uart + 0x18) >> 8) & 5, 5)
+        check('UART: on interrupt 10', qt.readl(intc + 0x08) >> 10 & 1, 1)
+        got = bytes(qt.readl(uart + 0x0C) & 0xFF for _ in range(2))
+        check('UART: the bytes, in order', got, b'hi')
+        check('UART: the RX events end with the FIFO',
+              ((qt.readl(uart + 0x18) >> 8) & 5, qt.readl(intc + 0x08) >> 10 & 1),
+              (0, 0))
+        qt.writel(uart + 0x00, (1 << 28) | (1 << 25))
+        check('UART: the RX FIFO clear (CFG 28) self-clears',
+              qt.readl(uart + 0x00), 1 << 25)
     finally:
         qt.close()
 

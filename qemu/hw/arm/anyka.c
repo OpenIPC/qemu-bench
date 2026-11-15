@@ -42,6 +42,10 @@
 #define AK_USB_BASE         0x20200000
 #define AK_DDRC_BASE        0x21000000
 #define AK_MAC_BASE         0x20300000
+#define AK_AV130_MAC_BASE   0x20240000      /* ethernet@0x20240000 */
+#define AK_AV130_INTC_BASE  0x21100000
+#define AK_AV130_IRQ_SYSCTRL 3              /* top bit: bank 1, SYSCTRL */
+#define AK_AV130_L2_VA      0xF1000000      /* the kernel's AK_VA_L2MEM */
 #define AK_L2_MEM_BASE      0x48000000
 #define AK_DDR_BASE         0x80000000
 
@@ -185,13 +189,16 @@ static const AkSoCConfig ak3918av100_soc = {
  * owner report r-5uwdebux): U-Boot 2019.10.0-V4.0.x, the AV100 map and
  * blocks, plus a tick timer at 0x21110000 and a FIFO UART.  64 MiB: its
  * U-Boot prints "DRAM: 64 MiB" (the DT's 128 MiB /memory is a placeholder;
- * the AV130 SDK's 64 MiB burn configs name the AV130N).  The chip ID here
- * is the AV100's; ipctool reads the AV130's at SYSCTRL + 0x3FC (0x565735xx),
- * not modelled yet.
+ * the AV130 SDK's 64 MiB burn configs name the AV130N).  SYSCTRL + 0 reads
+ * the AV100's ID; the AV130's is at SYSCTRL + 0x3FC (0x565735xx, as ipctool
+ * reads it).  The kernel (4.4.302, CONFIG_MACH_AK3918AV130 in the AnyCloud39
+ * AV130 SDK) takes its interrupts and timers from 0x21100000 instead of the
+ * system controller (ak_irq_v2.c, ak_timer_common.h): ak-av130-intc.
  */
 static const AkSoCConfig ak3918av130_soc = {
     .desc               = "Anyka AK3918AV130N (ARM926EJ-S, 64 MB DDR2)",
     .chip_id            = 0x53533500,
+    .chip_id_av         = 0x56573500,
     .ram_size_default   = 64 * MiB,
     .num_timers         = 10,
     .flash_cs_gpio      = -1,
@@ -451,7 +458,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     MemoryRegion *bootrom = g_new(MemoryRegion, 1);
     g_autofree uint8_t *img = NULL;
     gsize img_len = 0;
-    DeviceState *sysctrl, *l2, *dev;
+    DeviceState *sysctrl, *irqc, *l2, *dev;
     DeviceState *spi[2] = { NULL, NULL };
     Object *cpuobj;
     ARMCPU *cpu;
@@ -477,14 +484,33 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
 
     sysctrl = qdev_new("ak-sysctrl");
     qdev_prop_set_uint32(sysctrl, "chip-id", c->chip_id);
+    qdev_prop_set_uint32(sysctrl, "chip-id-av", c->chip_id_av);
+    qdev_prop_set_bit(sysctrl, "cascade", c->av130);
     qdev_prop_set_uint32(sysctrl, "num-timers", c->num_timers);
     qdev_prop_set_bit(sysctrl, "has-efuse", c->has_efuse);
     qdev_prop_set_bit(sysctrl, "clk-v2", c->aspen);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(sysctrl), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sysctrl), 0, AK_SYSCTRL_BASE);
-    sysbus_connect_irq(SYS_BUS_DEVICE(sysctrl), 0,
+    if (c->av130) {
+        /*
+         * The AV130's interrupt controller and timers, at 0x21100000
+         * (hw/misc/ak-av130-intc.c).  The top bank numbers the devices as
+         * the system controller does.  The system controller's own events
+         * (its timers, the RTC) are bank 1 there, with the mask and status
+         * left in the system controller (0x0800002C / 0x30): it raises top
+         * bit 3, the kernel's SYSCTRL_IRQ (ak_irq_v2.c).
+         */
+        irqc = qdev_new("ak-av130-intc");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(irqc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(irqc), 0, AK_AV130_INTC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(sysctrl), 0,
+                           qdev_get_gpio_in(irqc, AK_AV130_IRQ_SYSCTRL));
+    } else {
+        irqc = sysctrl;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(irqc), 0,
                        qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
-    sysbus_connect_irq(SYS_BUS_DEVICE(sysctrl), 1,
+    sysbus_connect_irq(SYS_BUS_DEVICE(irqc), 1,
                        qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ));
 
     l2 = qdev_new(TYPE_AK_L2);
@@ -496,7 +522,25 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                         AK_L2_MEM_BASE + n * AK_L2_MEM_SIZE);
     }
     sysbus_connect_irq(SYS_BUS_DEVICE(l2), 0,
-                       qdev_get_gpio_in(sysctrl, AK_IRQ_L2));
+                       qdev_get_gpio_in(irqc, AK_IRQ_L2));
+    if (c->av130) {
+        /*
+         * The AV130 kernel reboots from code it copies into L2 memory and
+         * runs at its mapping, AK_VA_L2MEM = 0xF1000000 (ak_pm.c,
+         * REBOOT_DISABLE_CACHE_MMU): an mcr turns the MMU off and the next
+         * instruction, a mov pc to the same code at 0x480000xx, is the one
+         * the ARM926 had already fetched.  QEMU fetches it again, at
+         * physical 0xF1000000, so L2 memory answers there too.  Then the
+         * code puts the DRAM in self-refresh and lets the watchdog reset
+         * the chip.
+         */
+        MemoryRegion *va = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(va, NULL, "anyka.l2-at-va",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(l2), 1),
+                                 0, AK_L2_MEM_SIZE);
+        memory_region_add_subregion(sysmem, AK_AV130_L2_VA, va);
+    }
 
     /*
      * UART 2 on the EV300L and AV100 (their DTs: 0x201A0000, interrupt 24,
@@ -524,7 +568,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                           qdev_get_gpio_in(sysctrl, irq[n]));
+                           qdev_get_gpio_in(irqc, irq[n]));
     }
 
     /*
@@ -550,7 +594,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(spi[n]), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(spi[n]), 0, base[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(spi[n]), 0,
-                           qdev_get_gpio_in(sysctrl, irq[n]));
+                           qdev_get_gpio_in(irqc, irq[n]));
     }
 
     /* The boot SPI NOR on SPI0's chip select, or on the AV130's SFC. */
@@ -566,7 +610,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
             sysbus_mmio_map(SYS_BUS_DEVICE(master), 0, 0x20120000);
             sysbus_mmio_map(SYS_BUS_DEVICE(master), 1, 0x30000000);
             sysbus_connect_irq(SYS_BUS_DEVICE(master), 0,
-                               qdev_get_gpio_in(sysctrl, AK_IRQ_SPI0));
+                               qdev_get_gpio_in(irqc, AK_IRQ_SPI0));
         }
         bus = qdev_get_child_bus(master, "ssi");
 
@@ -597,8 +641,10 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         qdev_prop_set_uint32(dev, "layout", c->i2c_layout);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
+        /* the AV130's I2C interrupts are its controller's TWI bank */
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                           qdev_get_gpio_in(sysctrl, irq[n]));
+                           qdev_get_gpio_in(irqc, c->av130 ? 32 + n
+                                                           : irq[n]));
     }
     /*
      * The SD slot (-drive if=sd) and an empty SDIO Wi-Fi controller: the
@@ -611,7 +657,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                                                  : NULL;
 
         dev = sysbus_create_simple("ak-mci", 0x20100000 + 0x8000 * n,
-                                   qdev_get_gpio_in(sysctrl, 4 + n));
+                                   qdev_get_gpio_in(irqc, 4 + n));
         if (di) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);
 
@@ -624,7 +670,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     sysbus_create_simple("ak-usb", AK_USB_BASE, NULL);
     sysbus_create_simple("ak-ddrc", AK_DDRC_BASE, NULL);
     dev = sysbus_create_simple("ak-gpio", AK_GPIO_BASE,
-                               qdev_get_gpio_in(sysctrl, AK_IRQ_GPIO));
+                               qdev_get_gpio_in(irqc, AK_IRQ_GPIO));
     if (c->flash_cs_gpio >= 0) {
         qdev_connect_gpio_out(dev, c->flash_cs_gpio,
                               qdev_get_gpio_in_named(spi[0], "cs-gpio", 0));
@@ -679,13 +725,10 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     qdev_prop_set_uint32(dev, "regs-size", 0x2000);
     qdev_prop_set_bit(dev, "rx-fcs", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_MAC_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0,
+                    c->av130 ? AK_AV130_MAC_BASE : AK_MAC_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
-                       qdev_get_gpio_in(sysctrl, AK_IRQ_MAC));
-    if (c->av130) {
-        /* U-Boot's tick timer (hw/timer/ak-tick.c) */
-        sysbus_create_simple("ak-tick", 0x21110000, NULL);
-    }
+                       qdev_get_gpio_in(irqc, AK_IRQ_MAC));
     /* The mask ROM.  Without a flash image to boot it stays empty. */
     memory_region_init_rom(bootrom, NULL, "anyka.bootrom", AK_BOOTROM_SIZE,
                            &error_fatal);

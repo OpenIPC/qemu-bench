@@ -17,9 +17,9 @@ input, an NPU and a video pipe higher in the map (`0x212`--`0x215`).
 | Cloud39E / EV200 | AK3918EV200 | `ak3918ev200-kernel` (4.4 port), `ak3918ev200-bsp` (U-Boot v2026.07 port), dumps | 3.4.35 vendor (dumps), 4.4.302 port | `AKSH_240` |
 | AnyCloud39EV300 | AK3916EV300, AK3918EV300, AK3919EV300 (B and C silicon revisions), AK3916EV301 | `anycloud39ev300` SDK: kernel 3.4.35 board files, U-Boot 2013.10, spiboot | 3.4.35 vendor | `ANYKA_H3` |
 | AnyCloud V500 / EV330 | AK3916EV330, AK3918EV330, AK3919EV330, and the EV331 trio (one `dt_compat` list, `mach-ak39ev330.c`) | `ak3918ev200-kernel` (`anycloud_ak39ev330*.dtsi`), dump | 4.4.192 vendor (DT) | `ANYKAH3B` |
-| AnyCloud39AV130 SDK V1.03 (one tree for several lines) | AK3918EV300L, AK3918AV100 (N/P/X/XP) | `ANYKA_130L_SDK`: U-Boot 2019.10 (`arch-ak3918ev300l`, `arch-ak3918av100`), kernel 4.4.302 (`anycloud_ak3918ev300l*.dtsi`), dump | 4.4.282 vendor (DT) | `AK_H322L` / `AKH322LS` (EV300L), `ANYKA322` (AV100, inferred from `ak_ddr_param`) |
+| AnyCloud39AV130 SDK V1.03 (one tree for several lines) | AK3918EV300L, AK3918AV100 (N/P/X/XP), AK3918AV130 (A/L/N: kernel `CONFIG_MACH_AK3918AV130`, U-Boot `CONFIG_3918AV130_CODE`) | `ANYKA_130L_SDK`: U-Boot 2019.10 (`arch-ak3918ev300l`, `arch-ak3918av100`), kernel 4.4.302 (`anycloud_ak3918ev300l*.dtsi`), dump | 4.4.282 vendor (DT) | `AK_H322L` / `AKH322LS` (EV300L), `ANYKA322` (AV100, inferred from `ak_ddr_param`) |
 | AnyCloud39AV100 SDK V1.12 | AK3918AV100 (N/P/X/XP), KM01 (N/D) | `ANYKA_AV100_SDK`: U-Boot 2019.10.0-V4.0.27 (`arch-ak3918av100`, `ak3918av100_nor_defconfig`), kernel 4.4.282 (`anycloud_ak3918av100*.dtsi`), prebuilt `image/` | 4.4.282 vendor (DT) | `ANYKA322` (confirmed: U-Boot `vectors.S` builds `ANYKAH3D`, the burn tool patches it to `ANYKA322`; `ak_secureboot` header template) |
-| AK3918AV130 | AK3918AV130 | no SDK; one flash dump (owner report r-5uwdebux on openipc.org): U-Boot 2019.10.0-V4.0.27 built for it (`EVB_CBD_AK3918AV130_V1.0.0`), its DTs `anyka,ak3918av130` | vendor (DT) | `AKH322LS`, payload from `0x200` to `0x80DFFC00` |
+| AK3918AV130 | AK3918AV130 | the AnyCloud39AV130 SDK above (kernel 4.4.302 drivers `ak_irq_v2.c`, `ak_timer*.c`, `ak_uartv2.c`, `ak_nor.c`; U-Boot `ak_sfcv2.c`, `ak_serialv2.c`), and one flash dump (owner report r-5uwdebux on openipc.org): U-Boot 2019.10.0-V4.0.27 built for it (`EVB_CBD_AK3918AV130_V1.0.0`), its DTs `anyka,ak3918av130` | vendor (DT) | `AKH322LS`, payload from `0x200` to `0x80DFFC00` |
 | AK37D, AK37E | — | `#ifdef`s in the 4.4 tree's `map.h`, `irqs.h`, `ak_timer.c` only | — | — |
 
 The `Aimer39_PDK_V1.1.00` archive (AK3918 datasheet and programming guide)
@@ -38,7 +38,7 @@ is header-encrypted and was not usable.
 | `ak3918ev300l` | `0x53543400` | 64 MiB | 10 | "ASPEN": SPI0 at `0x21100000`, clock block v2; `socinfo` prints `0x535434` |
 | `ak3918av100` | `0x53533500` | 64 MiB | 10 | ASPEN + AV100 blocks; AK3918AV100N/P, KM01N; boots the AnyCloud39AV100 SDK V1.12 firmware to login |
 | `ak3918av100x` | `0x53533500` | 128 MiB | 10 | same die, 128 MiB; AK3918AV100X/XP, KM01D |
-| `ak3918av130` | `0x53533500`¹ | 64 MiB | 10 | the AV100's map, plus U-Boot's tick timer at `0x21110000` (`ak-tick`), a FIFO UART (`ak-uart2`) and the SPI flash controller at `0x20120000` (`ak-sfc`); U-Boot boots the kernel, see below |
+| `ak3918av130` | `0x53533500`¹ | 64 MiB | 5 at `0x21110000` | the AV100's map, plus its own interrupt controller and timers at `0x21100000` (`ak-av130-intc`), a FIFO UART (`ak-uart2`) and the SPI flash controller at `0x20120000` (`ak-sfc`); the dump boots to `login:`, see below |
 
 The AV100 family all read chip ID `0x53533500` (`socinfo` `0x535335`,
 "AK3918AV100-A"; the C revision is `0x53533501`, "-C"). The vendor tells the
@@ -217,11 +217,33 @@ blocks it drives are not the AV100's:
   enters at the load address and runs through the zeroes (`andeq`) to it.
   Its script ends with the three-word `0x66668880` op; read as a pair, it
   became a store of `0x88888888` to `0xFFFFFFFB` and a data abort in the ROM.
-- **Tick timer** at `0x21110000` (`hw/timer/ak-tick.c`): U-Boot's
-  `get_timer()`. Without it the first `udelay` never returns.
-- **UART** (`anyka,ak3918av100plus-uart` in the U-Boot DT, at the old
-  addresses): a FIFO UART with a data register, not the L2-buffer UART
-  (`ak-uart2` in `hw/char/ak-uart.c`, as U-Boot drives it; no interrupt yet).
+- **Interrupt controller and timers** at `0x21100000`
+  (`hw/misc/ak-av130-intc.c`; the SDK kernel's `ak_irq_v2.c` and
+  `ak_timer_common.h` under `CONFIG_MACH_AK3918AV130`). The system
+  controller no longer takes the interrupts:
+  - **Top bank:** `+0x00` FIQ mask, `+0x04` IRQ mask (1 = enabled),
+    `+0x08` status. Devices keep the old numbers (MCI 4/5, SFC 8, UART0 10,
+    GPIO 15, MAC 16).
+  - **Sub-banks** behind it, each a mask/status pair: TWI (I2C) at
+    `+0x0C`/`+0x10` on top bit 13, SSS `+0x14` (bit 17), NSS `+0x1C`
+    (bit 0), ISS `+0x24` (bit 1), ESS `+0x2C` (bit 2). A DT specifier is
+    `<bit bank>`. The system controller's sub-bank (bank 1, `0x0800002C`)
+    is not modelled.
+  - **Five timers** at `+0x10000 + n * 0x1000`, 12 MHz, counting down, on
+    top bits 27-31. Registers: `LOAD`, `VALUE`, `CTRL` (0 enable, 2:1
+    free / periodic / one-shot, 3 reload now), `INTCLR`, `INT_EN`, `DIV`,
+    `INT_STA`. Timer 0 is U-Boot's `get_timer()` and the kernel's
+    clocksource, timer 1 its clock event. Without them U-Boot's first
+    `udelay` never returns and the kernel never ticks.
+- **UART** (`anyka,ak3918av100plus-uart` in the U-Boot DT,
+  `anyka,ak3918av130-uart0` in the kernel's, at the old addresses): a FIFO
+  UART with a data register, not the L2-buffer UART (`ak-uart2` in
+  `hw/char/ak-uart.c`, from the SDK's `ak_serialv2.c` and `ak_uartv2.c`):
+  - `CFG` bits 28/29 clear the RX/TX FIFO and clear themselves; the
+    kernel waits on 28 when the console opens.
+  - Status: TX empty (1) and TX end (17) after a send; RX threshold (8)
+    and timeout (10) while bytes wait. `0x20` enables each status bit as
+    an interrupt.
 - **SPI flash controller** `sfc@20120000` (`hw/ssi/ak-sfc.c`), where the
   older parts had SPI0: a list of command banks (`0x200 + 0x40 n`: opcode,
   address, mode, data, match mask / data, interface, lengths) that it runs
@@ -233,15 +255,37 @@ blocks it drives are not the AV100's:
   `0x100` bit 1 acknowledges the XIP stop, bit 4 resets the FIFO. The XIP
   window at `0x30000000` reads with 0x03; this U-Boot never uses it. All
   of it from the U-Boot driver's behaviour; no datasheet.
-- **Result:** U-Boot detects the GD25Q64, loads its environment from SPI
-  flash, reads the 4.4.302-cip94 kernel (checksum OK) and the DT, and
-  starts it: `Uncompressing Linux... done, booting the kernel.` The kernel
-  prints nothing after that. Next: the AV130's interrupt controller
-  (`anyka,ak3918av130-ic`) and system timer variants, and the UART v2's
-  interrupt for the kernel console. The DT also has a data mover
+- **Elsewhere:** the GMAC is at `0x20240000` (`ethernet@0x20240000`), and
+  the I2C interrupts are on the TWI bank.
+- **Result:** U-Boot detects the GD25Q64, loads its environment, reads the
+  4.4.302-cip94 kernel (checksum OK) and the DT, and starts it. The kernel
+  brings up `ttySAK0`, reads the NOR through the SFC v2 by L2 DMA
+  (`Anyka SFCv2 driver register success`), mounts the squashfs root, and
+  reaches `AnyCloud-uc1_1 login:`. The vendor modules load. The app's
+  `device_id_decryption` step then fails ("Read and decrypt failed",
+  eleven tries) and its daemon asks for a reboot. It never touches the
+  crypto engine at `0x20180000` (no access, and neither `ak_crypto.ko` nor
+  `cryptodev.ko` is loaded); what it misses is its encrypted device ID.
+  That is left failing on purpose: making it succeed would recover a
+  camera's cloud identity from an owner's dump.
+- **Reboot** (`ak_pm.c`, `L2_LINK(standby)` with `param1` set, entered
+  from `ak3918av130_restart()` through `l2_exec_buf()`): the kernel copies
+  the code into L2 memory, prints `Y` when the copy checks out, and jumps
+  to it at its mapping, `AK_VA_L2MEM` = `0xF1000000`.
+  `REBOOT_DISABLE_CACHE_MMU()` then turns the MMU off with an `mcr`. The
+  next instruction, `mov pc` to the same code at `0x480000xx`, is one the
+  ARM926 has already fetched; QEMU fetches it again, at physical
+  `0xF1000000`, so the machine maps L2 memory there too.
+  `REBOOT_SELF_REFRESH()` then puts the DRAM in self-refresh (`ak-ddrc`:
+  `0x21000010` bit 23 reads back done) and starts the watchdog
+  (`SYSCTRL +0xE4 = 0x55000009`, `+0xE8 = 0xAA000003`), whose reset
+  boots the flash again. On the dump this is a loop: login, the
+  device-ID step, a watchdog reset about every ten seconds.
+- **Not modelled:** the crypto engine itself, the system controller's
+  interrupt bank, and the XIP windows. The DT also has a data mover
   (`0x21120000`) and a remote processor (`0x21102000`).
 
-¹ The AV100's. ipctool reads the AV130's at SYSCTRL `+0x3FC` (`0x565735xx`); not modelled yet.
+¹ The AV100's. The AV130's is at SYSCTRL `+0x3FC` (`0x56573500`), where ipctool reads it.
 
 ## Dumps
 
@@ -262,7 +306,7 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `XM25QH64A@SOIC8.BIN` | — | the dump has bit errors throughout (`consold=ttyS@K0`); not bootable |
 | AnyCloud39AV100 SDK V1.12 firmware, assembled into an 8 MiB image (`qemu-boot/anyka-sdk-image.py`): the SDK's own U-Boot 2019.10.0-V4.0.27 (`ak3918av100_nor_defconfig`) under an `ANYKA322` header with the burn tool's 64 MiB DDR script, `image/uImage` (vendor 4.4.282), `EVB_CBDM_AK3918AV100N_V1.0.0.dtb`, `root.sqsh4`, `usr.jffs2`, `usr.sqsh4` at the burn-config offsets | `ak3918av100` | `anyka login:` (`ANYKA CPU AK3918AV100-A (ID 0x535335)`, GD25Q64 NOR, 8 MTD partitions, squashfs root, jffs2 config, APP mounted). The vendor modules load without crashing: `ak_rtc`, `ak_i2c`, `ak_efuse`, `ak_ion`, `ak_pcm`, `ak_isp`, `ak_venc_adapter`, `ak_npu`, `ak_eth`. (`ak_venc_bridge` and `ak_hcd` need symbols from `ak_venc_adapter` / usbcore loaded first, as the vendor scripts do.) |
 | the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
-| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | U-Boot to `Starting kernel` (GD25Q64 through the SFC, environment and kernel read, checksum OK); the 4.4.302-cip94 kernel prints nothing after decompressing |
+| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | `AnyCloud-uc1_1 login:` (4.4.302-cip94, NOR through the SFC by L2 DMA, squashfs root, the vendor modules load); then the app's device-ID decryption fails (left so on purpose, see above), its daemon asks for a reboot, and the watchdog reset boots it again: a loop of about ten seconds |
 
 ## Ethernet checks
 

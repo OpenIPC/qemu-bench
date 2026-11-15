@@ -39,8 +39,13 @@ typedef struct AkSoCConfig {
     bool        aspen;
     /* AV100: the second MIPI / CSI input, the NPU (anycloud_ak3918av100) */
     bool        av100;
-    /* AV130: the AV100's map, plus U-Boot's tick timer at 0x21110000 */
+    /*
+     * AV130: the AV100's map, but its own interrupt controller and timers
+     * at 0x21100000 (ak-av130-intc), a FIFO UART, the SFC v2 at
+     * 0x20120000, the GMAC at 0x20240000, I2C on the controller's TWI bank
+     */
     bool        av130;
+    uint32_t    chip_id_av;     /* the AV130's chip ID, SYSCTRL +0x3FC */
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */
