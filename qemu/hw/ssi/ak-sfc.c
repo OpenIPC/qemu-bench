@@ -125,6 +125,7 @@ struct AkSfcState {
     uint32_t last;
     bool in_frame;          /* chip select held, header sent */
     bool stalled;           /* a poll never matched */
+    bool four_byte;         /* the NOR takes 4-byte addresses (0xB7) */
     uint32_t data_left;     /* bytes the bank's data phase still moves */
     uint32_t data_done;
     uint8_t blk[AK_L2_BLOCK];
@@ -196,7 +197,15 @@ static void ak_sfc_header(AkSfcState *s, unsigned n)
 
     qemu_set_irq(s->cs, 0);
     if (iface & IF_INST) {
-        ssi_transfer(s->bus, ak_sfc_bank(s, n, B_INST) & 0xFF);
+        uint8_t op = ak_sfc_bank(s, n, B_INST) & 0xFF;
+
+        /* the NOR's address width, for the XIP window's reads */
+        if (op == 0xB7) {
+            s->four_byte = true;
+        } else if (op == 0xE9) {
+            s->four_byte = false;
+        }
+        ssi_transfer(s->bus, op);
     }
     if (iface & IF_ADDR) {
         uint32_t addr = ak_sfc_bank(s, n, B_ADDR);
@@ -547,6 +556,9 @@ static uint64_t ak_sfc_xip_read(void *opaque, hwaddr addr, unsigned size)
     }
     qemu_set_irq(s->cs, 0);
     ssi_transfer(s->bus, 0x03);
+    if (s->four_byte) {
+        ssi_transfer(s->bus, (addr >> 24) & 0xFF);
+    }
     ssi_transfer(s->bus, (addr >> 16) & 0xFF);
     ssi_transfer(s->bus, (addr >> 8) & 0xFF);
     ssi_transfer(s->bus, addr & 0xFF);
@@ -579,7 +591,7 @@ static void ak_sfc_reset(DeviceState *dev)
     AkSfcState *s = AK_SFC(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
-    s->busy = s->in_frame = s->stalled = false;
+    s->busy = s->in_frame = s->stalled = s->four_byte = false;
     ak_sfc_fifo_reset(s);
     qemu_set_irq(s->cs, 1);
     qemu_set_irq(s->irq, 0);
@@ -652,6 +664,7 @@ static const VMStateDescription vmstate_ak_sfc = {
         VMSTATE_UINT32(tx_pos, AkSfcState),
         VMSTATE_UINT32(rx_len, AkSfcState),
         VMSTATE_UINT32(rx_pos, AkSfcState),
+        VMSTATE_BOOL(four_byte, AkSfcState),
         VMSTATE_END_OF_LIST()
     }
 };

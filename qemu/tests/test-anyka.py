@@ -694,6 +694,16 @@ def test_av130_sfc(qt):
         ok &= qt.readl(SFC_XIP + 0x21004 + 0x10 * k) & 0xFFFF == 0xB0B0
         qt.writel(SFC + 0xD0, 0x10)
     check('SFC: repeated FIFO programs, padding dropped', ok, True)
+    # 4-byte addressing (0xB7 ... 0xE9): the XIP window follows the NOR
+    sfc_bank(qt, 0, 0xB7, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    b4 = qt.readl(SFC_XIP + 0x10000)
+    sfc_bank(qt, 0, 0xE9, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: XIP reads right in 4-byte mode and after it',
+          (b4, qt.readl(SFC_XIP + 0x10000)) == (want[0], want[0]), True)
     # a poll for a status the NOR never shows: busy, not done, until the
     # FIFO reset abandons it
     sfc_bank(qt, 0, 0x05, 0x18000040, 0, 0, 0xFFFFFFFE, 1)
