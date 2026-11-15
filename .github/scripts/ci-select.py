@@ -171,6 +171,9 @@ class DeviceGraph:
         self.files = [f for f in files if f.startswith(DEVICE_DIRS)
                       and f.endswith((".c", ".h"))]
         self.text = {f: read(f) for f in self.files}
+        self.type_macros = {}
+        for f in self.files:
+            self.type_macros.update(TYPE_DEFINE.findall(self.text[f]))
         self.reach = self._compute()
 
     def _exports(self, f):
@@ -179,6 +182,10 @@ class DeviceGraph:
         infos = "\n".join(TYPEINFO_BLOCK.findall(t))
         strings = set(TYPEINFO_NAME.findall(infos))
         macros = set(TYPEINFO_MACRO.findall(infos))
+        # A type registered here through a macro another file defines
+        # (hisi-f37.c registers TYPE_HISI_JXF22 from hisi-soi.h) is this
+        # file's type too.
+        strings |= {self.type_macros[m] for m in macros if m in self.type_macros}
         for macro, string in TYPE_DEFINE.findall(t):
             macros.add(macro)
             strings.add(string)
@@ -416,11 +423,34 @@ class HisiMachines:
                 return self._machines([c])
         for k, (a, b, _) in self.macros.items():
             if a <= pos < b:
-                if not k.startswith("HISI_"):
+                users = {c for c, (_, _, body) in self.configs.items()
+                         if re.search(r"\b%s\b" % re.escape(k), body)}
+                # A family macro (HISI_V4_COMMON_PERIPH) is the configs that
+                # expand it.  A constant the shared code uses too
+                # (HISI_PPI_PHYSTIMER, HISI_MAX_SMP), or no config uses, is
+                # every machine's.
+                if not users or self._used_in_code(k):
                     return None
-                return self._machines({c for c, (_, _, body) in self.configs.items()
-                                       if re.search(r"\b%s\b" % re.escape(k), body)})
+                return self._machines(users)
         return None
+
+    def _used_in_code(self, name):
+        """Named by the shared code itself, outside configs, macros and
+        comments."""
+        if not hasattr(self, "_comments"):
+            self._comments = [(m.start(), m.end()) for m in
+                              re.finditer(r"/\*.*?\*/|//[^\n]*", self.text, re.S)]
+        rx = re.compile(r"\b%s\b" % re.escape(name))
+        for m in rx.finditer(self.text):
+            pos = m.start()
+            if any(a <= pos < b for a, b in self._comments):
+                continue
+            if any(a <= pos < b for a, b, _ in self.configs.values()):
+                continue
+            if any(a <= pos < b for a, b, _ in self.macros.values()):
+                continue
+            return True
+        return False
 
     def _machines(self, cfgs):
         out = set()
@@ -470,12 +500,17 @@ class HisiMachines:
             for k in range(ln - 1, -1, -1):
                 line = lines[k]
                 stripped = line.strip()
-                if not stripped or stripped.startswith(("}", "/*", "*", "//", "#")):
+                if not stripped or stripped.startswith(("/*", "*", "//", "#")):
+                    continue
+                # `}` closes a block; `} else ...` opens the branch we may be in.
+                if stripped.startswith("}") and not re.match(r"\}\s*else\b", stripped):
                     continue
                 i = len(line) - len(line.lstrip())
                 if i >= ind:
                     continue
                 ind = i
+                # `} else {` is a branch whose own `if` tests something
+                # else: walking on out treats it as unguarded (a superset).
                 g = re.match(r"\s*(?:\}\s*else\s+)?if\s*\(\s*(?:c|cfg|config)->(\w+)", line) or \
                     re.match(r"\s*for\s*\([^;]*;[^;]*<\s*(?:c|cfg|config)->(\w+)", line)
                 if g:
@@ -632,6 +667,8 @@ class Decision:
         self.all = False
         self.boot_names = set()
         self.hisi_machines = set()
+        self.venc_socs = set()          # VENC rows chosen by name alone
+        self.venc_whole = False
         self.why = []
 
     def widen(self, path, reason):
@@ -654,9 +691,11 @@ class Decision:
             if qtest_family(q) in self.families or \
                     (self.hisi_machines and qtest_family(q) == "hisilicon"):
                 self.qtests.add(q)
-        whole_venc = self.all or "hisilicon" in self.families or "venc-hisilicon" in self.jobs
+        whole_venc = self.all or self.venc_whole or "hisilicon" in self.families \
+            or "venc-hisilicon" in self.jobs
         self.venc_rows = [r for r in wf.venc_rows
-                          if whole_venc or r["soc"] in self.hisi_machines]
+                          if whole_venc or r["soc"] in self.hisi_machines
+                          or r["soc"] in self.venc_socs]
         if self.venc_rows:
             self.jobs.add("venc-hisilicon")
         else:
@@ -748,13 +787,31 @@ def sensor_targets_names(label, names, fams, dev, scr, wf, d):
         return False
 
     jobs, qts, rows = set(), set(), set()
+    venc = set()
     for job, text in scr.corpus.items():
         if job not in JOB_FAMILIES:
             continue
+        if job == "venc-hisilicon":
+            # By row: a row that names the sensor (`wide: imx335`) or is a
+            # machine it is the default of.  Only when the job's scripts
+            # name it and no row does is every row a candidate.
+            for r in wf.venc_rows:
+                if name_rx.search(yaml.dump(r)) or r["soc"] in machines:
+                    venc.add(r["soc"])
+            if not venc and name_rx.search(text):
+                venc = {r["soc"] for r in wf.venc_rows}
+            continue
         if name_rx.search(text) or (mach_rx and starts_default(job)):
             jobs.add(job)
+    # A qtest that names the sensor in any case (comments say "IMX335"), or
+    # starts one of its default machines without a sensor= of its own
+    # (test-hisi-vpss.py: QTest(..., 'hi3516ev300')).
+    iname_rx = re.compile(name_rx.pattern, re.I)
     for q in wf.qtests:
-        if name_rx.search(scr.qtest_corpus.get(q, "")):
+        corpus = scr.qtest_corpus.get(q, "")
+        if iname_rx.search(corpus) or (mach_rx and any(
+                mach_rx.search(line) and "sensor=" not in line
+                for line in corpus.splitlines())):
             qts.add(q)
     for r in wf.boot_rows:
         mach = r.get("machine", "")
@@ -766,6 +823,9 @@ def sensor_targets_names(label, names, fams, dev, scr, wf, d):
     d.jobs |= jobs
     d.qtests |= qts
     d.boot_names |= rows
+    d.venc_socs |= venc
+    if venc:
+        jobs = jobs | {"venc-hisilicon (%s)" % ",".join(sorted(venc))}
     what = []
     if fams:
         what.append("families " + ", ".join(sorted(fams)))
@@ -1003,10 +1063,14 @@ def venc_matrix_diff(base, wf, d):
         return False
     for r in wf.venc_rows:
         if old.get(r["soc"]) != r:
-            d.hisi_machines.add(r["soc"])
+            # This row only: not the other jobs that boot the same SoC.
+            d.venc_socs.add(r["soc"])
             d.why.append((VENC_MATRIX, "row %s" % r["soc"]))
-    if set(old) - {r["soc"] for r in wf.venc_rows} and not wf.venc_rows:
-        return False
+    if set(old) - {r["soc"] for r in wf.venc_rows}:
+        if not wf.venc_rows:
+            return False
+        d.venc_whole = True             # a removed row: run the rest
+        d.why.append((VENC_MATRIX, "removed row(s): every remaining row"))
     return True
 
 
@@ -1344,6 +1408,32 @@ def self_test():
     if [r["soc"] for r in d.venc_rows] != ["hi3516cv610"]:
         errors.append("hisi-ive-npu.c: venc rows %s, expected hi3516cv610 only"
                       % [r["soc"] for r in d.venc_rows])
+    # The F37 file registers JX-F22 through hisi-soi.h's macro, and the
+    # Ingenic qtest starts t20,sensor=jxf22.
+    expect(["qemu/hw/i2c/hisi-f37.c"], want_all=False)
+    d = classify(["qemu/hw/i2c/hisi-f37.c"], files)
+    if "qemu/tests/test-ingenic.py" not in d.qtests:
+        errors.append("hisi-f37.c: test-ingenic.py (sensor=jxf22) not selected")
+    # The IMX335 is EV300's default and a `wide:` sensor of its VENC row only.
+    d = classify(["qemu/hw/i2c/hisi-imx335.c"], files)
+    if [r["soc"] for r in d.venc_rows] != ["hi3516ev300"]:
+        errors.append("hisi-imx335.c: venc rows %s, expected hi3516ev300"
+                      % [r["soc"] for r in d.venc_rows])
+    if "qemu/tests/test-hisi-vpss.py" not in d.qtests:
+        errors.append("hisi-imx335.c: test-hisi-vpss.py (boots hi3516ev300) not selected")
+    # A shared constant is every machine's, not the configs that use it.
+    hm = HisiMachines()
+    for k in ("HISI_PPI_PHYSTIMER", "HISI_MAX_SMP"):
+        if k in hm.macros:
+            ln = hm.text.count("\n", 0, hm.macros[k][0]) + 1
+            if hm.at_line(ln) is not None:
+                errors.append("%s: a change to it does not run every machine" % k)
+    # ...but a family macro is the configs that expand it, comments or not.
+    if "HISI_V4_COMMON_PERIPH" in hm.macros:
+        ln = hm.text.count("\n", 0, hm.macros["HISI_V4_COMMON_PERIPH"][0]) + 1
+        got = hm.at_line(ln)
+        if got is None or got == hm.all:
+            errors.append("HISI_V4_COMMON_PERIPH: resolves to every machine")
     if not hisi_default_sensors():
         errors.append("no default_sensor found in %s" % HISI_MACHINES)
     if not sensor_catalogue(read(SENSOR_CATALOGUE)):
