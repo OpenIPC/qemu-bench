@@ -242,7 +242,8 @@ or OP-TEE leaves every interrupt secure and Linux hangs after the timer.
 shell. Video input: `aw-vinc` paints test frames into buffers behind
 `aw-iommu` (the media masters use IOMMU addresses); `aw-ve` answers the
 VE ID CedarC's compiled-in table and its LBC check accept (0xE0/0xE4 =
-0x21110/0x21210); the sensor is the catalogue's `gc2053` on TWI1 (y291ga), or `sensor=sp2305` at 0x3C for the y211ga; `aw-pio` reads
+0x21110/0x21210); the sensor is the catalogue's `gc2053` on TWI1
+(y291ga), or `sensor=sp2305` at 0x3C for the y211ga; `aw-pio` reads
 inputs high (stored zeros were the YI reset button held down).
 `qemu-boot/yi-v831-prepare.sh` makes a YI image that runs as if paired.
 `aw-ve` encodes H.264: CedarC puts the headers through the bitstream
