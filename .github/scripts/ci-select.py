@@ -1428,6 +1428,40 @@ def self_test():
             ln = hm.text.count("\n", 0, hm.macros[k][0]) + 1
             if hm.at_line(ln) is not None:
                 errors.append("%s: a change to it does not run every machine" % k)
+    # Creations in `} else if (c->Y)` take Y; in `} else {` the outer guard.
+    synth = HisiMachines("""
+static const HisiSoCConfig a_soc = {
+    .x_base = 0x1,
+    .z_base = 0x1,
+};
+static const HisiSoCConfig b_soc = {
+    .y_base = 0x1,
+    .z_base = 0x1,
+};
+static const HisiSoCConfig c_soc = {
+    .q = 1,
+};
+static void hisilicon_common_init(MachineState *m, const HisiSoCConfig *c)
+{
+    if (c->z_base) {
+        if (c->x_base) {
+            qdev_new("dev-x");
+        } else if (c->y_base) {
+            qdev_new("dev-y");
+        } else {
+            qdev_new("dev-else");
+        }
+    }
+}
+DEFINE_HISI_MACHINE("ma", ma, a_soc)
+DEFINE_HISI_MACHINE("mb", mb, b_soc)
+DEFINE_HISI_MACHINE("mc", mc, c_soc)
+""")
+    for t, want in (("dev-x", {"ma"}), ("dev-y", {"mb"}), ("dev-else", {"ma", "mb"})):
+        got = synth.for_tokens({t}, set(), set())
+        if got != want:
+            errors.append("guard search: %s on %s, expected %s"
+                          % (t, sorted(got), sorted(want)))
     # ...but a family macro is the configs that expand it, comments or not.
     if "HISI_V4_COMMON_PERIPH" in hm.macros:
         ln = hm.text.count("\n", 0, hm.macros["HISI_V4_COMMON_PERIPH"][0]) + 1
