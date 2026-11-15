@@ -23,18 +23,20 @@
 # assumed.  The image is copied first: the firmware writes its settings
 # back to the flash, and the original is left as it was.
 #
-#   [--machine v831] [--qemu ./qemu-src/build/qemu-system-arm]
+#   [--machine v831] [--sensor gc2053|sp2305] [--qemu ./qemu-src/build/qemu-system-arm]
 #   [--timeout 180]
 set -euo pipefail
 
 FLASH=
 MACHINE=v831
+SENSOR=gc2053   # sp2305 for a y211ga dump
 QEMU=./qemu-src/build/qemu-system-arm
 TIMEOUT=180
 while [ $# -gt 0 ]; do
     case "$1" in
         --flash) FLASH=$2; shift 2 ;;
         --machine) MACHINE=$2; shift 2 ;;
+        --sensor) SENSOR=$2; shift 2 ;;
         --qemu) QEMU=$2; shift 2 ;;
         --timeout) TIMEOUT=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
@@ -98,7 +100,7 @@ img[dat:dat + len(data)] = data
 open(sys.argv[1], 'wb').write(img)
 PY
 
-"$QEMU" -M "$MACHINE,flash-file=$WORK/flash.bin" -nographic \
+"$QEMU" -M "$MACHINE,flash-file=$WORK/flash.bin,sensor=$SENSOR" -nographic \
     -monitor none -serial "unix:$WORK/ser.sock,server=on,wait=on" \
     -drive "if=sd,index=0,format=raw,file=$WORK/sd.img" \
     -nic user,restrict=on &
@@ -106,7 +108,7 @@ QPID=$!
 
 set +e
 python3 - "$WORK" "$TIMEOUT" <<'PY'
-import os, socket, sys, time
+import os, re, socket, sys, time
 
 work, limit = sys.argv[1], float(sys.argv[2])
 os.chdir(work)              # sun_path is short; the socket name is not
@@ -121,14 +123,22 @@ s.settimeout(0.5)
 steps = [
     (b'HELLO! BOOT0 is starting', 'boot0 runs from SRAM'),
     (b'DRAM simple test OK', 'boot0 trained DRAM'),
-    (b'Jump to sec', 'boot0 loaded the boot package over SPI'),  # y211ga's boot0: "secend"
+    ((b'Jump to second Boot', b'Jump to secend Boot'),    # y291ga, y211ga
+     'boot0 loaded the boot package over SPI'),
     (b'OP-TEE version', 'OP-TEE runs'),
     (b'U-Boot 2018', 'U-Boot runs'),
-    ((b'Loading Environment from SUNXI_FLASH... OK',   # y291ga
-      b'Loading Environment from SUNXI_FLASH... start:'),  # y211ga
+    ((b'Loading Environment from SUNXI_FLASH... OK',      # y291ga
+      # y211ga: the same message, its per-block reads, then OK on a line
+      # of its own once the environment is in (not on a bad CRC)
+      re.compile(rb'Loading Environment from SUNXI_FLASH\.\.\. start:'
+                 rb'(?:[^\n]*\n){1,40}?OK\r?\n')),
      'U-Boot env via SPI DMA'),
-    ((b'find /debug_tty',   # y291ga
-      b'Nothing updated'), # y211ga: no debug_tty logic; its SD update scan found no image
+    ((b'find /debug_tty',                                  # y291ga
+      # y211ga: no /debug_tty logic.  The card enumerates and switches
+      # to high speed, then its SD-update scan (FAT lookups of
+      # /one_y211ga.bin and the rest) finishes; without a card it says
+      # "No sd-card insert" and never prints "Nothing updated".
+      re.compile(rb'the mode SD High Speed[\s\S]*?Nothing updated')),
      'U-Boot read the SD card'),
     (b'Starting kernel', 'U-Boot loaded the kernel from the GPT'),
     (b"'/etc/init.d/rcS", 'init runs rcS from the NOR root'),
@@ -143,6 +153,23 @@ probes = [
      b'ping -c 2 10.0.2.2 && echo NET-$((6*7))',
      b'NET-42', 'Ethernet: DHCP lease and ping'),
 ]
+def find(buf, pats, at):
+    """End of the earliest match at or after at, or -1.  A milestone is a
+    bytes pattern, a compiled regex, or a tuple of alternatives (the YI
+    y291ga's and y211ga's lines differ)."""
+    best = None
+    for p in (pats if isinstance(pats, tuple) else (pats,)):
+        if isinstance(p, bytes):
+            k = buf.find(p, at)
+            hit = (k, k + len(p)) if k >= 0 else None
+        else:
+            m = p.search(buf, at)
+            hit = (m.start(), m.end()) if m else None
+        if hit and (best is None or hit < best):
+            best = hit
+    return best[1] if best else -1
+
+
 buf, t0, i, j, sent, at = b'', time.time(), 0, 0, None, 0
 while time.time() - t0 < limit:
     try:
@@ -153,15 +180,11 @@ while time.time() - t0 < limit:
     except socket.timeout:
         pass
     # each milestone counts only after the one before it
-    # a milestone is one pattern or a tuple of alternatives (YI y291ga / y211ga)
-    def find(pats, at):
-        hits = [(buf.find(p, at), p) for p in
-                (pats if isinstance(pats, tuple) else (pats,))]
-        hits = [h for h in hits if h[0] >= 0]
-        return min(hits) if hits else (-1, b'')
-    while i < len(steps) and find(steps[i][0], at)[0] >= 0:
-        pos, pat = find(steps[i][0], at)
-        at = pos + len(pat)
+    while i < len(steps):
+        end = find(buf, steps[i][0], at)
+        if end < 0:
+            break
+        at = end
         print('ok   %-45s %6.1fs' % (steps[i][1], time.time() - t0))
         i += 1
     if i < len(steps):

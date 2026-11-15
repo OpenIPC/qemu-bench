@@ -21,8 +21,10 @@
 #    after which the camera takes a DHCP lease on it and says "wifi
 #    connected".  wpa_supplicant itself fails without nl80211, harmlessly.
 #
-# Offsets are this firmware's (y291ga, dispatch read_mtd_conf / get_config);
-# the script checks them before writing.  Needs unsquashfs, mksquashfs and
+# Offsets are this firmware's (y291ga, dispatch read_mtd_conf / get_config)
+# and are the same on the y211ga (12.0.37.0 checked: home at 0x350000,
+# 0x340000 long, system config at 0x7F0000); the script checks them before
+# writing.  Needs unsquashfs, mksquashfs and
 # an ARM cross compiler: CC_ARM, default arm-linux-gnueabihf-gcc.  The
 # y211ga's home SquashFS has less room: a static glibc ifrename leaves it
 # about 60 KiB too big, so build with a musl one there (the rootfs is musl,
@@ -68,7 +70,7 @@ dd if="$WORK/img.bin" of="$WORK/home.sqfs" bs=4096 skip=$((HOME_OFF / 4096)) \
    count=$((HOME_SIZE / 4096)) status=none
 unsquashfs -q -d "$WORK/home" "$WORK/home.sqfs" >/dev/null
 for f in app/lower_half_init.sh base/tools/wpa_cli app/localbin; do
-    [ -e "$WORK/home/$f" ] || { echo "home has no $f: not y291ga?" >&2; exit 1; }
+    [ -e "$WORK/home/$f" ] || { echo "home has no $f: not a YI y291ga/y211ga image?" >&2; exit 1; }
 done
 
 cat > "$WORK/ifrename.c" <<'C'
@@ -172,13 +174,14 @@ PY
 
 mksquashfs "$WORK/home" "$WORK/home-new.sqfs" -comp xz -b 262144 -noappend \
     -all-root -quiet >/dev/null
-python3 - "$WORK/img.bin" "$WORK/home-new.sqfs" "$HOME_OFF" "$HOME_SIZE" <<'PY'
-import sys
+CC_ARM="$CC_ARM" python3 - "$WORK/img.bin" "$WORK/home-new.sqfs" "$HOME_OFF" "$HOME_SIZE" <<'PY'
+import os, sys
 img = bytearray(open(sys.argv[1], 'rb').read())
 sq = open(sys.argv[2], 'rb').read()
 off, size = int(sys.argv[3]), int(sys.argv[4])
 if len(sq) > size:
-    sys.exit('new home SquashFS (%d bytes) does not fit %d; try a musl CC_ARM' % (len(sq), size))
+    hint = '' if 'musl' in os.environ.get('CC_ARM', '') else '; a musl CC_ARM builds a smaller ifrename'
+    sys.exit('new home SquashFS (%d bytes) does not fit %d%s' % (len(sq), size, hint))
 img[off:off + size] = sq + b'\xff' * (size - len(sq))
 open(sys.argv[1], 'wb').write(img)
 print('home: %d of %d bytes' % (len(sq), size))

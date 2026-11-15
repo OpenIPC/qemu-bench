@@ -169,6 +169,7 @@ struct AwMachineState {
     MachineState parent_obj;
     char *flash_file;
     uint32_t flash_jedec;
+    char *sensor;
 };
 
 static char *aw_machine_get_flash_file(Object *obj, Error **errp)
@@ -183,6 +184,22 @@ static void aw_machine_set_flash_file(Object *obj, const char *value,
 
     g_free(s->flash_file);
     s->flash_file = g_strdup(value);
+}
+
+static char *aw_machine_get_sensor(Object *obj, Error **errp)
+{
+    AwMachineState *s = AW_MACHINE(obj);
+
+    return g_strdup(s->sensor ? s->sensor : "gc2053");
+}
+
+static void aw_machine_set_sensor(Object *obj, const char *value,
+                                  Error **errp)
+{
+    AwMachineState *s = AW_MACHINE(obj);
+
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
 }
 
 static void aw_machine_get_flash_jedec(Object *obj, Visitor *v,
@@ -458,15 +475,15 @@ static void aw_v83x_common_init(MachineState *machine, const AwSoCConfig *c)
              * The camera sensor, a GC2053 at 0x37 on TWI1 (the vendor
              * vind DT and gc2053_mipi.c): ID 0x2053 at 0xF0/0xF1.
              */
-            image_sensor_create(I2C_BUS(qdev_get_child_bus(twi, "i2c")), "gc2053");
             /*
-             * The y211ga's sensor, an SP2305 at 0x3C on the same bus
-             * (sp2305_mipi_y211_y291): 8-bit registers, page select at
-             * 0xFD.  Its driver reads no ID, so the stub only has to
-             * answer.  One dump uses one of the two addresses.
+             * sensor=sp2305 for the y211ga: the catalogue's SP2305 at
+             * 0x3C (sp2305_mipi_y211_y291).  Its driver reads no chip
+             * ID.  The stub is one flat register file: the driver's
+             * 0xFD page select is not modelled, so its page-0 and
+             * page-1 init writes land in the same registers.
              */
-            i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(twi, "i2c")),
-                                    "hisi-sp2305", 0x3c);
+            image_sensor_create(I2C_BUS(qdev_get_child_bus(twi, "i2c")),
+                                ams->sensor ? ams->sensor : "gc2053");
         }
         sysbus_create_simple("aw-twi", base + 0x200,
                              qdev_get_gpio_in(orgate, 1));
@@ -623,6 +640,11 @@ static void aw_machine_class_init(ObjectClass *oc, const void *data)
         aw_machine_get_flash_jedec, aw_machine_set_flash_jedec, NULL, NULL);
     object_class_property_set_description(oc, "flash-jedec",
         "JEDEC ID the SPI NOR answers with (default 0xC84017, GD25Q64)");
+    object_class_property_add_str(oc, "sensor",
+        aw_machine_get_sensor, aw_machine_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "image sensor on TWI1: gc2053 (default, YI y291ga), "
+        "sp2305 (YI y211ga), none");
 }
 
 static const TypeInfo aw_machine_info = {
