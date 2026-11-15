@@ -618,6 +618,16 @@ def test_av130(qemu, tmp):
               qt.readl(intc + 0x08) >> 13 & 1, 0)
         check('chip ID at SYSCTRL + 0x3FC', qt.readl(SYSCTRL + 0x3FC),
               0x56573500)
+        # The kernel's reboot (ak_pm.c REBOOT_DISABLE_CACHE_MMU and
+        # REBOOT_SELF_REFRESH): the instruction after the MMU goes off is
+        # fetched from L2 memory at its virtual address, 0xF1000000, and the
+        # DRAM's self-refresh request (0x21000010 bit 23) reads back done.
+        qt.writel(0x48000040, 0xE1A0F001)        # mov pc, r1
+        check('L2 memory answers at the kernel\'s AK_VA_L2MEM',
+              qt.readl(0xF1000040), 0xE1A0F001)
+        qt.writel(0x21000010, (1 << 26) | (1 << 23) | (1 << 22))
+        check('DDRC: the self-refresh request (bit 23) reads back done',
+              qt.readl(0x21000010), (1 << 26) | (1 << 22))
         uart = 0x20130000
         check('UART: TX FIFO never full', qt.readl(uart + 0x18) & 4, 0)
         for ch in b'OK':

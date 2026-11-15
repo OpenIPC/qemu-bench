@@ -270,8 +270,8 @@ and 4.4.282 kernel (`ANYKA322` header, U-Boot at flash 0x600) boot to
 flash (an owner report on openipc.org): U-Boot and the 4.4.302 kernel
 read the NOR through the SPI flash controller, and the kernel reaches
 `login:` on the AV130's own interrupt controller and timers
-([docs/anyka.md](docs/anyka.md#ak3918av130)); its crypto engine and
-reboot are not modelled.
+([docs/anyka.md](docs/anyka.md#ak3918av130)), and a reboot goes through
+the vendor's L2-resident code and the watchdog, as on the chip.
 
 ### SigmaStar / MStar family (`qemu-system-arm`)
 

@@ -44,6 +44,7 @@
 #define AK_MAC_BASE         0x20300000
 #define AK_AV130_MAC_BASE   0x20240000      /* ethernet@0x20240000 */
 #define AK_AV130_INTC_BASE  0x21100000
+#define AK_AV130_L2_VA      0xF1000000      /* the kernel's AK_VA_L2MEM */
 #define AK_L2_MEM_BASE      0x48000000
 #define AK_DDR_BASE         0x80000000
 
@@ -517,6 +518,24 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     }
     sysbus_connect_irq(SYS_BUS_DEVICE(l2), 0,
                        qdev_get_gpio_in(irqc, AK_IRQ_L2));
+    if (c->av130) {
+        /*
+         * The AV130 kernel reboots from code it copies into L2 memory and
+         * runs at its mapping, AK_VA_L2MEM = 0xF1000000 (ak_pm.c,
+         * REBOOT_DISABLE_CACHE_MMU): an mcr turns the MMU off and the next
+         * instruction, a mov pc to the same code at 0x480000xx, is the one
+         * the ARM926 had already fetched.  QEMU fetches it again, at
+         * physical 0xF1000000, so L2 memory answers there too.  Then the
+         * code puts the DRAM in self-refresh and lets the watchdog reset
+         * the chip.
+         */
+        MemoryRegion *va = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(va, NULL, "anyka.l2-at-va",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(l2), 1),
+                                 0, AK_L2_MEM_SIZE);
+        memory_region_add_subregion(sysmem, AK_AV130_L2_VA, va);
+    }
 
     /*
      * UART 2 on the EV300L and AV100 (their DTs: 0x201A0000, interrupt 24,

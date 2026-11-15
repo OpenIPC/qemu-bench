@@ -261,12 +261,29 @@ blocks it drives are not the AV100's:
   4.4.302-cip94 kernel (checksum OK) and the DT, and starts it. The kernel
   brings up `ttySAK0`, reads the NOR through the SFC v2 by L2 DMA
   (`Anyka SFCv2 driver register success`), mounts the squashfs root, and
-  reaches `AnyCloud-uc1_1 login:`. The vendor modules load. The app then
-  fails "Read and decrypt" (the crypto engine at `0x20180000` is not
-  modelled), and its daemon asks for a reboot. The AV130 reboots by
-  running the SDK's standby code from L2 memory (`ak_l2_exebuf.c`), which
-  is not modelled either, so the machine stops there. The DT also has a
-  data mover (`0x21120000`) and a remote processor (`0x21102000`).
+  reaches `AnyCloud-uc1_1 login:`. The vendor modules load. The app's
+  `device_id_decryption` step then fails ("Read and decrypt failed",
+  eleven tries) and its daemon asks for a reboot. It never touches the
+  crypto engine at `0x20180000` (no access, and neither `ak_crypto.ko` nor
+  `cryptodev.ko` is loaded); what it misses is its encrypted device ID.
+  That is left failing on purpose: making it succeed would recover a
+  camera's cloud identity from an owner's dump.
+- **Reboot** (`ak_pm.c`, `L2_LINK(standby)` with `param1` set, entered
+  from `ak3918av130_restart()` through `l2_exec_buf()`): the kernel copies
+  the code into L2 memory, prints `Y` when the copy checks out, and jumps
+  to it at its mapping, `AK_VA_L2MEM` = `0xF1000000`.
+  `REBOOT_DISABLE_CACHE_MMU()` then turns the MMU off with an `mcr`. The
+  next instruction, `mov pc` to the same code at `0x480000xx`, is one the
+  ARM926 has already fetched; QEMU fetches it again, at physical
+  `0xF1000000`, so the machine maps L2 memory there too.
+  `REBOOT_SELF_REFRESH()` then puts the DRAM in self-refresh (`ak-ddrc`:
+  `0x21000010` bit 23 reads back done) and starts the watchdog
+  (`SYSCTRL +0xE4 = 0x55000009`, `+0xE8 = 0xAA000003`), whose reset
+  boots the flash again. On the dump this is a loop: login, the
+  device-ID step, a watchdog reset about every ten seconds.
+- **Not modelled:** the crypto engine itself, the system controller's
+  interrupt bank, and the XIP windows. The DT also has a data mover
+  (`0x21120000`) and a remote processor (`0x21102000`).
 
 ¹ The AV100's. The AV130's is at SYSCTRL `+0x3FC` (`0x56573500`), where ipctool reads it.
 
@@ -289,7 +306,7 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `XM25QH64A@SOIC8.BIN` | — | the dump has bit errors throughout (`consold=ttyS@K0`); not bootable |
 | AnyCloud39AV100 SDK V1.12 firmware, assembled into an 8 MiB image (`qemu-boot/anyka-sdk-image.py`): the SDK's own U-Boot 2019.10.0-V4.0.27 (`ak3918av100_nor_defconfig`) under an `ANYKA322` header with the burn tool's 64 MiB DDR script, `image/uImage` (vendor 4.4.282), `EVB_CBDM_AK3918AV100N_V1.0.0.dtb`, `root.sqsh4`, `usr.jffs2`, `usr.sqsh4` at the burn-config offsets | `ak3918av100` | `anyka login:` (`ANYKA CPU AK3918AV100-A (ID 0x535335)`, GD25Q64 NOR, 8 MTD partitions, squashfs root, jffs2 config, APP mounted). The vendor modules load without crashing: `ak_rtc`, `ak_i2c`, `ak_efuse`, `ak_ion`, `ak_pcm`, `ak_isp`, `ak_venc_adapter`, `ak_npu`, `ak_eth`. (`ak_venc_bridge` and `ak_hcd` need symbols from `ak_venc_adapter` / usbcore loaded first, as the vendor scripts do.) |
 | the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
-| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | `AnyCloud-uc1_1 login:` (4.4.302-cip94, NOR through the SFC by L2 DMA, squashfs root, the vendor modules load); then the app's decrypt fails (no crypto engine) and the reboot its daemon asks for, through the L2-resident standby code, is not modelled |
+| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | `AnyCloud-uc1_1 login:` (4.4.302-cip94, NOR through the SFC by L2 DMA, squashfs root, the vendor modules load); then the app's device-ID decryption fails (left so on purpose, see above), its daemon asks for a reboot, and the watchdog reset boots it again: a loop of about ten seconds |
 
 ## Ethernet checks
 

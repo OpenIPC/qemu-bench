@@ -23,6 +23,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkDdrcState, AK_DDRC)
 #define R_INIT              (0x24 / 4)
 #define INIT_DONE           (1u << 1)
 #define INIT_FAILED         (1u << 2)
+/*
+ * 0x10: a command to the DRAM (precharge all, enter self-refresh); bit 23
+ * requests it and reads back clear once it is done, which the AV130
+ * kernel's reboot polls for (ak_pm.c REBOOT_SELF_REFRESH).
+ */
+#define R_CMD               (0x10 / 4)
+#define CMD_REQ             (1u << 23)
 
 struct AkDdrcState {
     SysBusDevice parent_obj;
@@ -52,7 +59,7 @@ static void ak_ddrc_write(void *opaque, hwaddr offset, uint64_t val,
     AkDdrcState *s = opaque;
 
     if (offset < sizeof(s->regs)) {
-        s->regs[offset / 4] = val;
+        s->regs[offset / 4] = offset / 4 == R_CMD ? val & ~CMD_REQ : val;
     }
 }
 
