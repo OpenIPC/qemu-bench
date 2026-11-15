@@ -88,7 +88,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 
 #define VCMD_MMIO_SIZE     0x10000
 #define HW_ID_OFF          0x00
-#define HW_ID_VALUE        0x43421000u /* HW_ID=0x4342, HW_VERSION=1.0.0 -- tried HW_ID_1_2_1 (0x43421201) and AX630C's real 0x43421500 as a lead on the still-open AX_VENC_Init NOT_INIT race; both cleanly falsified (30 live boots, 0 successes, see kaeru ax620e-venc-hwid-value-is-fake-placeholder-mismatches-real-named-silicon-revisions-NEW-LEAD) -- reverted to this originally-confirmed value. */
+/*
+ * VCMD front-end version 1.5.0, the value real AX630C silicon reports
+ * (same AX620E die). It matters: the driver picks its completion protocol
+ * from it. At <= 1.0.C (0x43421001) it expects an INT opcode in every
+ * command buffer and completes through IRQ_INTCMD; above that it
+ * programs CMDBUF_EXECUTING_ID, enables IRQ_JMPP/JMPD and reads the
+ * finished buffer's ID back from the status memory the buffer's own
+ * trailing RREG of the VCMD registers fills. The closed userspace encoder
+ * builds the latter kind of buffer (no INT opcode, JMP-terminated, RREG of
+ * VCMD regs 0-26 last), so with 1.0.0 no encode job was ever reported
+ * complete and every VENC worker blocked in hantrovcmd_ioctl forever.
+ */
+#define HW_ID_VALUE        0x43421500u
 #define WORK_STATE_OFF     0x3c
 #define CONTROL_OFF        0x40
 #define INT_STATUS_OFF     0x44
@@ -101,11 +113,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 #define CMD_ADDR_LO_OFF    0x50
 #define CMD_ADDR_HI_OFF    0x54
 #define CMD_LENGTH_OFF     0x58
+#define EXE_CMDBUF_COUNT_OFF 0x0c
+#define RDY_CMDBUF_COUNT_OFF 0x60
+#define EXECUTING_ID_OFF   0x68
+#define VCMD_REG_WINDOW    0x100   /* front-end registers kept as storage */
 #define START_TRIGGER      BIT(0)
 #define IRQ_ENDCMD         BIT(0)
-#define IRQ_ENDCMD_EN      BIT(0)
+/* vcmdregistertable.h: JMPD "triggered by JMP command directly" (a JMP
+ * with IE set), JMPP "triggered by JMP command when hw goes to PEND
+ * state" (a JMP with RDY clear -- the end of the linked chain, with or
+ * without IE). The encoder's buffers end in a plain JMP, so JMPP is the
+ * only interrupt that ever reports them done. */
+#define IRQ_JMPD           BIT(6)
+#define IRQ_JMPP           BIT(7)
+#define JMP_IE             BIT(25)
+#define JMP_RDY            BIT(26)
+#define VCMD_MAX_CHAIN     64
 #define WORK_STATE_IDLE    0
 #define WORK_STATE_WORK    1
+#define WORK_STATE_PEND    3
 
 /*
  * VCMD opcode stream (vcmd_abi.h, a from-scratch reverse-engineered ABI
@@ -323,6 +349,10 @@ struct AxeraVcmdState {
     uint32_t cmd_addr_lo;
     uint32_t cmd_addr_hi;
     uint32_t cmd_length;
+    uint32_t vreg[VCMD_REG_WINDOW / 4]; /* other front-end registers */
+    uint32_t exe_count;
+    uint32_t pending_status;            /* raised when the run completes */
+    hwaddr pend_jmp;                    /* parked JMP (RDY=0), or 0 */
     uint32_t core_reg[CORE_REG_COUNT];
 
     /* Encode-job bridge state: persists across jobs so inter (P-frame)
@@ -335,22 +365,47 @@ struct AxeraVcmdState {
 
 static void axera_vcmd_update_irq(AxeraVcmdState *s)
 {
-    qemu_set_irq(s->irq, (s->int_status & s->int_ctl & IRQ_ENDCMD_EN) != 0);
+    qemu_set_irq(s->irq, (s->int_status & s->int_ctl) != 0);
+}
+
+/* AXERA_VCMD_TRACE=1: log every MMIO access, with the instance base. */
+static bool axera_vcmd_trace(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("AXERA_VCMD_TRACE");
+        on = e && e[0] == '1';
+    }
+    return on;
 }
 
 static void axera_vcmd_complete(void *opaque)
 {
     AxeraVcmdState *s = opaque;
 
-    s->work_state = WORK_STATE_IDLE;
-    s->int_status |= IRQ_ENDCMD;
+    s->work_state = s->pend_jmp ? WORK_STATE_PEND : WORK_STATE_IDLE;
+    s->int_status |= s->pending_status;
+    s->pending_status = 0;
     axera_vcmd_update_irq(s);
 }
+
+static uint64_t axera_vcmd_read_reg(AxeraVcmdState *s, hwaddr offset);
 
 static uint64_t axera_vcmd_read(void *opaque, hwaddr offset, unsigned size)
 {
     AxeraVcmdState *s = opaque;
+    uint64_t v = axera_vcmd_read_reg(s, offset);
 
+    if (axera_vcmd_trace()) {
+        fprintf(stderr, "AXERA_VCMD_TRACE: %p R [0x%04" HWADDR_PRIx
+                "] = 0x%08" PRIx64 "\n", (void *)s, offset, v);
+    }
+    return v;
+}
+
+static uint64_t axera_vcmd_read_reg(AxeraVcmdState *s, hwaddr offset)
+{
     switch (offset) {
     case HW_ID_OFF:
         return HW_ID_VALUE;
@@ -368,7 +423,12 @@ static uint64_t axera_vcmd_read(void *opaque, hwaddr offset, unsigned size)
         return s->cmd_addr_hi;
     case CMD_LENGTH_OFF:
         return s->cmd_length;
+    case EXE_CMDBUF_COUNT_OFF:
+        return s->exe_count;
     default:
+        if (offset < VCMD_REG_WINDOW) {
+            return s->vreg[offset / 4];
+        }
         /* The VC8000E core's own register file (see core_reg[] below) is
          * one physical bank reachable two ways: queued WREG/RREG opcodes
          * inside an executed command buffer (axera_vcmd_exec_cmdbuf), or
@@ -556,11 +616,75 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         }
     }
 
+    /*
+     * NAL size table (swreg10, HWIF_ENC_SIZE_TBL_BASE): one u32 per NAL
+     * unit the core wrote, start code included -- confirmed live, the
+     * encoder API pre-fills the entries for the VPS/SPS/PPS it writes in
+     * software (27/50/11 bytes, exactly the 0x58 it leaves in front of
+     * swreg8) and points swreg10 just past them. It sums this table to
+     * get each frame's size, so without the core's own entries every
+     * encoded frame looked empty and was dropped (FrmEnc stayed 0).
+     */
+    if (n && (mode == ENC_MODE_H264 || mode == ENC_MODE_HEVC) &&
+        s->core_reg[10]) {
+        g_autoptr(GArray) sizes = g_array_new(false, false, sizeof(uint32_t));
+        size_t p, start = 0;
+        uint32_t zero = 0, sz;
+
+        for (p = 4; p + 4 <= n; p++) {
+            if (out[p] == 0 && out[p + 1] == 0 && out[p + 2] == 0 &&
+                out[p + 3] == 1) {
+                sz = p - start;
+                g_array_append_val(sizes, sz);
+                start = p;
+                p += 3;
+            }
+        }
+        sz = n - start;
+        g_array_append_val(sizes, sz);
+        g_array_append_val(sizes, zero);
+        dma_memory_write(&address_space_memory, s->core_reg[10],
+                         sizes->data, sizes->len * sizeof(uint32_t),
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+    if (n && getenv("AXERA_VCMD_DEBUG_JOB") && s->enc_jobs < 6) {
+        uint8_t pre[0x60];
+        uint32_t k;
+
+        dma_memory_read(&address_space_memory, out_base - 0x58, pre,
+                        sizeof(pre), MEMTXATTRS_UNSPECIFIED);
+        fprintf(stderr, "AXERA_VCMD_JOB: mode=%u %ux%u idr=%d out=0x%"
+                PRIx64 " n=%zu sizetbl=0x%x swreg4=0x%x pre:", mode, w, h,
+                idr, out_base, (size_t)n, s->core_reg[10], s->core_reg[4]);
+        for (k = 0; k < sizeof(pre); k++) {
+            fprintf(stderr, "%02x", pre[k]);
+        }
+        {
+            uint32_t tbl[4];
+
+            dma_memory_read(&address_space_memory, s->core_reg[10] - 12,
+                            tbl, sizeof(tbl), MEMTXATTRS_UNSPECIFIED);
+            fprintf(stderr, " tbl[-3..0]=%u,%u,%u,%u", tbl[0], tbl[1],
+                    tbl[2], tbl[3]);
+        }
+        fprintf(stderr, " ours:");
+        for (k = 0; k < 24 && k < n; k++) {
+            fprintf(stderr, "%02x", out[k]);
+        }
+        fprintf(stderr, "\n");
+    }
     if (n) {
         dma_memory_write(&address_space_memory, out_base, out, n,
                          MEMTXATTRS_UNSPECIFIED);
         s->core_reg[ENC_REG_OUT_LIMIT] = n;
         s->core_reg[ENC_REG_IRQ] |= ENC_IRQ_BIT | ENC_FRAME_RDY_BIT;
+        /*
+         * swreg7[24:17] HWIF_ENC_NUM_SLICES_READY: completed slices. The
+         * bridge always emits the picture as one slice; the API compares
+         * this with the slice count it asked for and treats a short count
+         * as an unfinished frame.
+         */
+        s->core_reg[7] = (s->core_reg[7] & ~(0xffu << 17)) | (1u << 17);
     } else {
         qemu_log_mask(LOG_UNIMP, "axera-vcmd: encode job produced no "
                       "output (mode=%u %ux%u idr=%d)\n", mode, w, h, idr);
@@ -583,15 +707,21 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
  * model has no need for, since completion is driven by the outer
  * CONTROL/timer handshake below, not real JMP chaining) are no-ops.
  */
-static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
+/*
+ * Run one command buffer. Returns true and sets *next_addr/*next_len when
+ * it ends in a JMP with RDY set, i.e. the driver has linked another
+ * buffer behind it and the hardware carries straight on.
+ */
+static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
+                                uint32_t length, hwaddr *next_addr,
+                                uint32_t *next_len)
 {
-    hwaddr addr = ((hwaddr)s->cmd_addr_hi << 32) | s->cmd_addr_lo;
-    uint32_t bytes = (uint32_t)s->cmd_length * 8;
+    uint32_t bytes = length * 8;
     g_autofree uint32_t *buf = NULL;
     uint32_t nwords, i;
 
     if (!addr || !bytes) {
-        return;
+        return false;
     }
     bytes = MIN(bytes, 0x2000); /* vcmd_abi.h CMDBUF_MAX_SIZE */
     nwords = bytes / 4;
@@ -605,6 +735,10 @@ static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
         uint32_t n = (word >> 16) & 0x3ff;
         uint32_t a = word & 0xffff;
 
+        if (axera_vcmd_trace()) {
+            fprintf(stderr, "AXERA_VCMD_TRACE: %p op 0x%02x n=%u a=0x%04x "
+                    "@%u word=0x%08x\n", (void *)s, op, n, a, i, word);
+        }
         if (op == VCMD_OP_WREG) {
             bool fix = word & VCMD_WREG_FIX;
             uint32_t k;
@@ -631,7 +765,22 @@ static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
                 break;
             }
             dst = buf[i + 1] | ((hwaddr)buf[i + 2] << 32);
-            if (a >= CORE_REG_BASE && dst) {
+            if (a < VCMD_REG_WINDOW && dst) {
+                /* The front-end's own registers: the encoder's buffers
+                 * end by copying VCMD regs 0..26 into status memory,
+                 * where the driver's ISR reads CMDBUF_EXECUTING_ID. */
+                g_autofree uint32_t *out = g_new0(uint32_t, n);
+                uint32_t k;
+
+                for (k = 0; k < n; k++) {
+                    hwaddr off = a + k * 4;
+
+                    out[k] = off < VCMD_REG_WINDOW ?
+                             axera_vcmd_read_reg(s, off) : 0;
+                }
+                dma_memory_write(&address_space_memory, dst, out,
+                                 (size_t)n * 4, MEMTXATTRS_UNSPECIFIED);
+            } else if (a >= CORE_REG_BASE && dst) {
                 uint32_t creg = (a - CORE_REG_BASE) / 4;
                 uint32_t k, ndst = MIN(n, CORE_REG_COUNT - creg);
                 g_autofree uint32_t *out = g_new0(uint32_t, n);
@@ -646,8 +795,30 @@ static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
         } else if (op == VCMD_OP_STALL || op == VCMD_OP_CLRINT) {
             i += 2;
         } else if (op == VCMD_OP_JMP) {
-            break; /* terminator: this model's completion is timer-driven */
-        } else if (op == VCMD_OP_NOP || op == VCMD_OP_END) {
+            /* JMP: [op|RDY|IE|next length], next addr lo, hi, next ID */
+            bool rdy = word & JMP_RDY;
+
+            s->exe_count++;
+            if (word & JMP_IE) {
+                s->pending_status |= IRQ_JMPD;
+            }
+            if (rdy && i + 3 < nwords) {
+                *next_addr = buf[i + 1] | ((hwaddr)buf[i + 2] << 32);
+                *next_len = word & 0xffff;
+                s->vreg[EXECUTING_ID_OFF / 4] = buf[i + 3];
+                return true;
+            }
+            /* End of the linked chain: the core parks on this JMP until
+             * software links another buffer behind it (see the
+             * RDY_CMDBUF_COUNT write handler). */
+            s->pend_jmp = addr + (hwaddr)i * 4;
+            s->pending_status |= IRQ_JMPP;
+            return false;
+        } else if (op == VCMD_OP_END) {
+            s->exe_count++;
+            s->pending_status |= IRQ_ENDCMD;
+            return false;
+        } else if (op == VCMD_OP_NOP) {
             i++;
         } else {
             qemu_log_mask(LOG_UNIMP, "axera-vcmd: unknown cmdbuf opcode "
@@ -657,11 +828,65 @@ static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
     }
 }
 
+static void axera_vcmd_exec_chain(AxeraVcmdState *s, hwaddr addr,
+                                  uint32_t len)
+{
+    int n;
+
+    s->pend_jmp = 0;
+    for (n = 0; n < VCMD_MAX_CHAIN; n++) {
+        hwaddr next_addr = 0;
+        uint32_t next_len = 0;
+
+        if (!axera_vcmd_exec_one(s, addr, len, &next_addr, &next_len)) {
+            break;
+        }
+        addr = next_addr;
+        len = next_len;
+    }
+}
+
+static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
+{
+    axera_vcmd_exec_chain(s, ((hwaddr)s->cmd_addr_hi << 32) | s->cmd_addr_lo,
+                          s->cmd_length);
+}
+
+/*
+ * Software linked a new buffer behind the parked JMP (rewriting it with
+ * RDY set and the next buffer's address/length/ID) and bumped
+ * RDY_CMDBUF_COUNT: re-fetch the JMP and carry on. Its interrupt was
+ * already raised when the core first parked on it.
+ */
+static void axera_vcmd_resume(AxeraVcmdState *s)
+{
+    uint32_t jmp[4];
+
+    if (!s->pend_jmp || s->work_state != WORK_STATE_PEND) {
+        return;
+    }
+    dma_memory_read(&address_space_memory, s->pend_jmp, jmp, sizeof(jmp),
+                    MEMTXATTRS_UNSPECIFIED);
+    if ((jmp[0] >> 27) != VCMD_OP_JMP || !(jmp[0] & JMP_RDY)) {
+        return;
+    }
+    s->vreg[EXECUTING_ID_OFF / 4] = jmp[3];
+    s->work_state = WORK_STATE_WORK;
+    axera_vcmd_exec_chain(s, jmp[1] | ((hwaddr)jmp[2] << 32),
+                          jmp[0] & 0xffff);
+    timer_mod(&s->completion_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AXERA_VCMD_LATENCY_NS);
+}
+
 static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
                              unsigned size)
 {
     AxeraVcmdState *s = opaque;
 
+    if (axera_vcmd_trace()) {
+        fprintf(stderr, "AXERA_VCMD_TRACE: %p W [0x%04" HWADDR_PRIx
+                "] = 0x%08" PRIx64 "\n", (void *)s, offset, value);
+    }
     switch (offset) {
     case CONTROL_OFF:
         if (value & START_TRIGGER) {
@@ -679,6 +904,7 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
             /* Abort: stop immediately, no completion interrupt. */
             timer_del(&s->completion_timer);
             s->work_state = WORK_STATE_IDLE;
+            s->pend_jmp = 0;
         }
         break;
     case INT_STATUS_OFF:
@@ -700,7 +926,18 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
     case CMD_LENGTH_OFF:
         s->cmd_length = value;
         break;
+    case EXE_CMDBUF_COUNT_OFF:
+        s->exe_count = value;
+        break;
+    case RDY_CMDBUF_COUNT_OFF:
+        s->vreg[offset / 4] = value;
+        axera_vcmd_resume(s);
+        break;
     default:
+        if (offset < VCMD_REG_WINDOW) {
+            s->vreg[offset / 4] = value;
+            break;
+        }
         if (offset >= CORE_REG_BASE) {
             uint32_t creg = (offset - CORE_REG_BASE) / 4;
 
@@ -737,6 +974,10 @@ static void axera_vcmd_reset(DeviceState *dev)
     s->cmd_addr_lo = 0;
     s->cmd_addr_hi = 0;
     s->cmd_length = 0;
+    memset(s->vreg, 0, sizeof(s->vreg));
+    s->exe_count = 0;
+    s->pending_status = 0;
+    s->pend_jmp = 0;
     memset(s->core_reg, 0, sizeof(s->core_reg));
     s->core_reg[0] = ENC_CORE_HW_ID;
     s->core_reg[80] = ENC_SWREG80_FEATURES;

@@ -219,6 +219,7 @@ cp qemu/include/hw/misc/axera-wdt.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/net/axera-eqos.c         "$QEMU_DIR/hw/net/"
 cp qemu/hw/rtc/axera-rtc.c          "$QEMU_DIR/hw/rtc/"
 cp qemu/hw/misc/axera-vin.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/axera-ivps-engine.c "$QEMU_DIR/hw/misc/"
 
 # Apply patches to upstream QEMU files
 for p in qemu/patches/*.patch; do
@@ -795,6 +796,11 @@ if ! grep -q "'axera-vin.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-vin.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-vin.c"
+fi
+if ! grep -q "'axera-ivps-engine.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-ivps-engine.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-ivps-engine.c"
 fi
 if ! grep -q "'axera-eqos.c'" "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-eqos.c'))" \

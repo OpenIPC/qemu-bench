@@ -19,6 +19,15 @@
  * solves). This model actually counts down against QEMU's virtual
  * clock so successive reads differ, exactly as real silicon would.
  *
+ * The same block is Linux's ax_hrtimer@4830000 (drivers/soc/axera/
+ * axera_hrtimer/axera_hrtimer.c, GIC SPI 124 for timer 0): the
+ * AX_HRTIMER_USLEEP ioctl that the camera stack's VENC/IVPS worker threads
+ * sleep in loads TIMER_LOADCOUNT, enables timer 0 with its interrupt
+ * unmasked (TIMER_CONTROL_REG bit 2 clear) and waits for the expiry
+ * interrupt, acked by reading TIMER_EOI. Without that interrupt every
+ * hrtimer sleep lasts forever: the encoder threads never wake to take the
+ * frames IVPS links to them, so nothing is ever encoded.
+ *
  * (Earlier mapped at this same address as a generic "axera-bl1-wdt"
  * regbank, named from an ambiguous -d unimp access pattern seen before
  * the real vendor header was read; TIMER_BASE is the correct identity.)
@@ -28,6 +37,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
 
@@ -38,7 +48,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraBl1TimerState, AXERA_BL1_TIMER)
 #define TIMER_LOADCOUNT         0x0
 #define TIMER_CURRENT_VALUE     0x4
 #define TIMER_CONTROL_REG       0x8
+#define TIMER_EOI               0xc
+#define TIMER_INT_STATUS        0x10
+#define TIMERS_INT_STATUS       0xa0
+#define TIMERS_EOI              0xa4
+#define TIMERS_RAW_INT_STATUS   0xa8
+#define TIMERS_COMP_VERSION     0xac
 #define TIMER_ENABLE            BIT(0)
+#define TIMER_INT_MASK          BIT(2)
 
 #define TIMER_TICK_HZ           24000000ULL
 
@@ -48,7 +65,40 @@ struct AxeraBl1TimerState {
     uint32_t loadcount;
     uint32_t control;
     int64_t enable_time_ns;
+    bool raw_int;
+    qemu_irq irq;
+    QEMUTimer *expiry;
 };
+
+static void axera_bl1_timer_update_irq(AxeraBl1TimerState *s)
+{
+    qemu_set_irq(s->irq, s->raw_int && !(s->control & TIMER_INT_MASK));
+}
+
+/* (Re)arm the expiry callback for the current count-down period. */
+static void axera_bl1_timer_arm(AxeraBl1TimerState *s)
+{
+    uint64_t ticks = (uint64_t)s->loadcount + 1;
+
+    if (!(s->control & TIMER_ENABLE)) {
+        timer_del(s->expiry);
+        return;
+    }
+    timer_mod(s->expiry, s->enable_time_ns +
+              muldiv64(ticks, NANOSECONDS_PER_SECOND, TIMER_TICK_HZ));
+}
+
+static void axera_bl1_timer_expire(void *opaque)
+{
+    AxeraBl1TimerState *s = opaque;
+
+    s->raw_int = true;
+    axera_bl1_timer_update_irq(s);
+    /* Count again from the reload value (user-defined and free-running
+     * modes differ only in that value; the driver re-arms explicitly). */
+    s->enable_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    axera_bl1_timer_arm(s);
+}
 
 static uint32_t axera_bl1_timer_current(AxeraBl1TimerState *s)
 {
@@ -76,6 +126,18 @@ static uint64_t axera_bl1_timer_read(void *opaque, hwaddr offset,
         return axera_bl1_timer_current(s);
     case TIMER_CONTROL_REG:
         return s->control;
+    case TIMER_EOI:
+    case TIMERS_EOI:
+        s->raw_int = false;
+        axera_bl1_timer_update_irq(s);
+        return 0;
+    case TIMER_INT_STATUS:
+    case TIMERS_INT_STATUS:
+        return s->raw_int && !(s->control & TIMER_INT_MASK);
+    case TIMERS_RAW_INT_STATUS:
+        return s->raw_int;
+    case TIMERS_COMP_VERSION:
+        return 0x3230392a; /* DW_apb_timers "209*" */
     default:
         return 0;
     }
@@ -92,12 +154,15 @@ static void axera_bl1_timer_write(void *opaque, hwaddr offset,
         if (s->control & TIMER_ENABLE) {
             s->enable_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         }
+        axera_bl1_timer_arm(s);
         break;
     case TIMER_CONTROL_REG:
         if ((value & TIMER_ENABLE) && !(s->control & TIMER_ENABLE)) {
             s->enable_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         }
         s->control = value;
+        axera_bl1_timer_arm(s);
+        axera_bl1_timer_update_irq(s);
         break;
     default:
         break;
@@ -118,6 +183,8 @@ static void axera_bl1_timer_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &axera_bl1_timer_ops, s,
                           TYPE_AXERA_BL1_TIMER, TIMER_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+    s->expiry = timer_new_ns(QEMU_CLOCK_VIRTUAL, axera_bl1_timer_expire, s);
 }
 
 static void axera_bl1_timer_class_init(ObjectClass *klass, const void *data)

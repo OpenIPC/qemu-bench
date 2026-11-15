@@ -356,7 +356,6 @@ static const struct {
      */
     { "axera-mipi-csi",     0x02600000, 0x4000 },
     { "axera-mipi-dphy",    0x023f0000, 0x1000 },
-    { "axera-tdp",          0x04405000, 0x1000 },
     /*
      * DDRMC @ 0x00100000 (boot/bl1/driver/ddr/ddr/ddrmc_reg_addr_def.h,
      * D_DDRMC_*): ddr_init.c/ddr_scan.c read back plenty of these
@@ -443,14 +442,8 @@ static void axera_map_regbanks(void)
      * silently right after console init. */
     sysbus_create_simple(TYPE_AXERA_DW_SPI, 0x06072000, NULL);
 
-    /* TIMER_BASE @ 0x04830000 (boot/bl1/driver/include/timer.h): BL1's
-     * delay()/mdelay()/udelay() -- and a timer-ratio helper called from
-     * a tight retry loop very early in boot -- read this free-running
-     * down-counter twice and spin until it's advanced, with no timeout
-     * of their own (see hw/misc/axera-bl1-timer.c). A passive regbank
-     * can never satisfy that: two reads of inert storage are always
-     * equal, so BL1 spins here forever before anything else runs. */
-    sysbus_create_simple(TYPE_AXERA_BL1_TIMER, 0x04830000, NULL);
+    /* TIMER_BASE @ 0x04830000 (BL1's delay timer, Linux's ax_hrtimer):
+     * created in axera_ax620e_periphs(), where its SPI exists. */
 
     /* dpll_ctrl_glb @ 0x00265000, the DDR system DPLL (a separate PLL
      * instance/register layout from clk_pllc above, confirmed from the
@@ -696,6 +689,67 @@ static const MemoryRegionOps axera_cpu1_wake_ops = {
  */
 static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
 {
+    /*
+     * vpp@4403000 (SPI 0x67), gdc@4404000 (SPI 0x68), tdp@4405000
+     * (SPI 0x63) and the vo@4407000 DPU (SPI 0x61, IVPS's OSD stage):
+     * the IVPS engines. Their done interrupts are what move IVPS through its
+     * per-tile command lists -- see hw/misc/axera-ivps-engine.c.
+     */
+    {
+        static const struct {
+            const char *name;
+            hwaddr base;
+            int irq;
+            uint32_t status, ack, mode;
+            uint32_t kick[4], done[4];
+        } engines[] = {
+            /* v0, v1, isp, gdc-linked channels */
+            { "axera-vpp", 0x04403000, 0x67, 0x888, 0x8b4, 0,
+              { 0x004, 0x038, 0x06c, 0x07c },
+              { 1u << 0, 1u << 3, 1u << 6, 1u << 9 } },
+            { "axera-gdc", 0x04404000, 0x68, 0x0d8, 0x0d4, 1,
+              { 0x06c }, { 1u << 16 } },
+            { "axera-tdp", 0x04405000, 0x63, 0x004, 0x010, 0,
+              { 0x01c }, { 1u << 0 } },
+            /* vo@4407000 "dpu": the IVPS OSD/overlay stage */
+            { "axera-dpu", 0x04407000, 0x61, 0x004, 0x014, 0,
+              { 0x028 }, { 1u << 0 } },
+        };
+        int e, k;
+
+        for (e = 0; e < ARRAY_SIZE(engines); e++) {
+            DeviceState *dev = qdev_new("axera-ivps-engine");
+
+            qdev_prop_set_string(dev, "name", engines[e].name);
+            qdev_prop_set_uint32(dev, "status-off", engines[e].status);
+            qdev_prop_set_uint32(dev, "ack-off", engines[e].ack);
+            qdev_prop_set_uint32(dev, "ack-mode", engines[e].mode);
+            for (k = 0; k < 4; k++) {
+                char prop[16];
+
+                snprintf(prop, sizeof(prop), "kick-off%d", k);
+                qdev_prop_set_uint32(dev, prop, engines[e].kick[k]);
+                snprintf(prop, sizeof(prop), "done-bits%d", k);
+                qdev_prop_set_uint32(dev, prop, engines[e].done[k]);
+            }
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, engines[e].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[engines[e].irq]);
+        }
+    }
+
+    /* TIMER_BASE @ 0x04830000 (boot/bl1/driver/include/timer.h): BL1's
+     * delay()/mdelay()/udelay() -- and a timer-ratio helper called from
+     * a tight retry loop very early in boot -- read this free-running
+     * down-counter twice and spin until it's advanced, with no timeout
+     * of their own (see hw/misc/axera-bl1-timer.c). A passive regbank
+     * can never satisfy that: two reads of inert storage are always
+     * equal, so BL1 spins here forever before anything else runs.
+     * Linux's ax_hrtimer@4830000 sleeps on timer 0's expiry interrupt,
+     * GIC SPI 124 (see hw/misc/axera-bl1-timer.c).
+     */
+    sysbus_create_simple(TYPE_AXERA_BL1_TIMER, 0x04830000, pic[124]);
+
     /* crypto@4900000, "axera,ax630c-eip130", GIC_SPI 110. Real AES
      * ECB/CBC/CTR via qcrypto, not just a satisfied probe -- see
      * hw/misc/axera-eip130.c. */
