@@ -38,7 +38,7 @@ is header-encrypted and was not usable.
 | `ak3918ev300l` | `0x53543400` | 64 MiB | 10 | "ASPEN": SPI0 at `0x21100000`, clock block v2; `socinfo` prints `0x535434` |
 | `ak3918av100` | `0x53533500` | 64 MiB | 10 | ASPEN + AV100 blocks; AK3918AV100N/P, KM01N; boots the AnyCloud39AV100 SDK V1.12 firmware to login |
 | `ak3918av100x` | `0x53533500` | 128 MiB | 10 | same die, 128 MiB; AK3918AV100X/XP, KM01D |
-| `ak3918av130` | `0x53533500`¹ | 128 MiB | 10 | the AV100's map, plus U-Boot's tick timer at `0x21110000` (`ak-tick`) and a FIFO UART (`ak-uart2`); U-Boot reaches `Flash:`, see below |
+| `ak3918av130` | `0x53533500`¹ | 64 MiB | 10 | the AV100's map, plus U-Boot's tick timer at `0x21110000` (`ak-tick`) and a FIFO UART (`ak-uart2`); U-Boot reaches `Flash:`, see below |
 
 The AV100 family all read chip ID `0x53533500` (`socinfo` `0x535335`,
 "AK3918AV100-A"; the C revision is `0x53533501`, "-C"). The vendor tells the
@@ -207,7 +207,8 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
 The one AV130 seen is a raw 8 MiB read sent to openipc.org (owner report
 r-5uwdebux). It was taken for an AV100 at first -- its U-Boot is the AV100
 SDK's 2019.10.0-V4.0.27 and its header magic `AKH322LS` -- but both its DTs
-say `anyka,ak3918av130` (board `EVB_CBDM_AK3918av130`, 128 MiB), and the
+say `anyka,ak3918av130` (board `EVB_CBDM_AK3918av130`; U-Boot finds 64 MiB,
+the AV130N), and the
 blocks it drives are not the AV100's:
 
 - **The header.** Payload length `0x40000` from flash `0x200` to
@@ -228,7 +229,7 @@ blocks it drives are not the AV100's:
   kernel's DT also has a data mover (`0x21120000`), a remote processor
   (`0x21102000`) and its own interrupt controller compatible.
 
-¹ The AV100's; the AV130's own ID is not known yet.
+¹ The AV100's. ipctool reads the AV130's at SYSCTRL `+0x3FC` (`0x565735xx`); not modelled yet.
 
 ## Dumps
 

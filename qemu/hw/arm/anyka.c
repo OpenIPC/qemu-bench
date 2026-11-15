@@ -182,14 +182,17 @@ static const AkSoCConfig ak3918av100_soc = {
 
 /*
  * AK3918AV130 (anyka,ak3918av130; EVB_CBDM_AK3918av130 in the first dump,
- * owner report r-5uwdebux): the AV100 SDK's U-Boot 2019.10 V4.0.x and
- * kernel, 128 MiB, the AV100 map and blocks.  Its U-Boot keeps time on a
- * timer of its own at 0x21110000 (below).
+ * owner report r-5uwdebux): U-Boot 2019.10.0-V4.0.x, the AV100 map and
+ * blocks, plus a tick timer at 0x21110000 and a FIFO UART.  64 MiB: its
+ * U-Boot prints "DRAM: 64 MiB" (the DT's 128 MiB /memory is a placeholder;
+ * the AV130 SDK's 64 MiB burn configs name the AV130N).  The chip ID here
+ * is the AV100's; ipctool reads the AV130's at SYSCTRL + 0x3FC (0x565735xx),
+ * not modelled yet.
  */
 static const AkSoCConfig ak3918av130_soc = {
-    .desc               = "Anyka AK3918AV130 (ARM926EJ-S, 128 MB DDR2)",
+    .desc               = "Anyka AK3918AV130N (ARM926EJ-S, 64 MB DDR2)",
     .chip_id            = 0x53533500,
-    .ram_size_default   = 128 * MiB,
+    .ram_size_default   = 64 * MiB,
     .num_timers         = 10,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 2,
@@ -376,7 +379,10 @@ static void ak_boot_rom_setup(const uint8_t *img, gsize len,
             /*
              * {marker, register, mask}: the stub only stores, and the one
              * seen clears a bit the script has just left clear.  Read as a
-             * pair it made {mask, end} a store to 0xFFFFFFFB.
+             * pair it made {mask, end} a store to 0xFFFFFFFB.  (The other
+             * reading -- a one-word op, then a plain store of 0xFFFFFFFB
+             * to DDRC + 0x24 -- also boots; a mask fits the value better.
+             * The SDK's SDK_CPU_DDR2.ini would settle it.)
              */
             off += 12;
             continue;

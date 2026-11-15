@@ -572,9 +572,12 @@ def test_av130(qemu, tmp):
               table[:7] == [DDRC + 0x14, 0x00423E71, DDRC + 0x24, 0x1,
                             0, 0, LOAD - 0x400], True)
         check('U-Boot lands at 0x80E00000', qt.readl(LOAD), code[0])
-        qt.writel(0x80000000 + (128 << 20) - 4, 0x5AA5C33C)
-        check('128 MiB of RAM', qt.readl(0x80000000 + (128 << 20) - 4),
+        qt.writel(0x80000000 + (64 << 20) - 4, 0x5AA5C33C)
+        check('64 MiB of RAM', qt.readl(0x80000000 + (64 << 20) - 4),
               0x5AA5C33C)
+        qt.writel(0x80000000 + (64 << 20), 0x5AA5C33C)
+        check('none past 64 MiB', qt.readl(0x80000000 + (64 << 20)) !=
+              0x5AA5C33C, True)
         tick = 0x21110000
         qt.writel(tick + 0x00, 12000)           # a millisecond at 12 MHz
         qt.writel(tick + 0x10, 1)

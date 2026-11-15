@@ -246,7 +246,7 @@ either was at hand.
 | `ak3918ev300l` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes |
 | `ak3918av100` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
 | `ak3918av100x` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
-| `ak3918av130` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | vendor (DT) | U-Boot only⁴ |
+| `ak3918av130` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | vendor (DT) | U-Boot only⁴ |
 
 Anyka's camera SoCs, unrelated to HiSilicon: one memory map from the
 AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330) and the
