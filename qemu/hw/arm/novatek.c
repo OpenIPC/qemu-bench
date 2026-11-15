@@ -91,6 +91,9 @@
 #define NVT_IRQ_IDE         48
 #define NVT_IRQ_DSI         50
 #define NVT_D_GPIO(n)       (0x80 + (n))    /* nvt-gpio.h D_GPIO() */
+#define NVT_S_GPIO(n)       (0x40 + (n))    /* nvt-gpio.h S_GPIO() */
+/* CLK_EN0 bit 2, the SIE MCLK gate (na51089-clk.c "f0c00000.siemck") */
+#define NVT_CG_SIEMCLK      2
 #define NVT_IRQ_ARB         33
 #define NVT_ARB2_BASE       0xF0FE0000
 #define NVT_IRQ_FLASH       29
@@ -1654,6 +1657,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     MemoryRegion *sysmem = get_system_memory();
     qemu_irq pic[NVT_NUM_IRQ - 32];
     DeviceState *mp, *dev, *flash, *cg, *gpio, *ife = NULL;
+    DeviceState *sensor = NULL;
     I2CBus *i2c0 = NULL;
     SysBusDevice *mpbus;
     unsigned int smp_cpus = machine->smp.cpus;
@@ -1872,7 +1876,27 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
             i2c0 = (I2CBus *)qdev_get_child_bus(dev, "i2c");
         }
     }
-    image_sensor_create(i2c0, nms->sensor);
+    if (nms->sensor && !strcmp(nms->sensor, "imx415")) {
+        sensor = DEVICE(i2c_slave_new("hisi-imx415", 0x1A));
+        qdev_prop_set_bit(sensor, "power-gated", true);
+        i2c_slave_realize_and_unref(I2C_SLAVE(sensor), i2c0, &error_fatal);
+    } else {
+        image_sensor_create(i2c0, nms->sensor);
+    }
+
+    /*
+     * An IMX415 answers only while powered, wired as on the XM IVG-N8S
+     * (its stock sen_imx415.cfg): XCLR on S_GPIO_1 and INCK from the SIE
+     * MCLK gate (CLK_EN0 bit 2, "f0c00000.siemck").  The vendor driver
+     * raises both when the HDAL opens the sensor, and drops XCLR again at
+     * close, so ipcinfo at boot finds nothing (OpenIPC/firmware#1889).
+     */
+    if (sensor) {
+        qdev_connect_gpio_out_named(gpio, "out", NVT_S_GPIO(1),
+            qdev_get_gpio_in_named(sensor, "xclr", 0));
+        qdev_connect_gpio_out_named(cg, "clk-en", NVT_CG_SIEMCLK,
+            qdev_get_gpio_in_named(sensor, "inck", 0));
+    }
 
     /*
      * USB: the EHCI (region 0) over the FOTG200 glue (region 1), at the
@@ -2176,7 +2200,7 @@ static void nvt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "sensor",
         nvt_machine_get_sensor, nvt_machine_set_sensor);
     object_class_property_set_description(oc, "sensor",
-        "Image sensor on I2C 0 (none, sc401ai, sc501ai); default none");
+        "Image sensor on I2C 0 (none, sc401ai, sc501ai, imx415); default none");
     machine_add_audiodev_property(mc);
 }
 
