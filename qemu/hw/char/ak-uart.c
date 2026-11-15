@@ -322,17 +322,23 @@ static const TypeInfo ak_uart_info = {
 
 
 /*
- * The AV130's UART ("anyka,ak3918av100plus-uart" in its U-Boot DT), a
- * FIFO UART with a data register, as its U-Boot driver uses it:
+ * The AV130's UART ("anyka,ak3918av100plus-uart" in its U-Boot DT,
+ * "anyka,ak3918av130-uart0" in the kernel's), a FIFO UART with a data
+ * register, as its U-Boot driver and the AV130 SDK's kernel driver
+ * (drivers/tty/serial/ak_uartv2.c) use it:
  *
- *   0x00  control: 27:25 set at init        0x04  bit 31 set at init
+ *   0x00  CFG: 25 enable, 26 / 27 RX / TX enable; 28 / 29 clear the RX /
+ *         TX FIFO, self-clearing (the kernel waits on 28 at open)
+ *   0x04  bit 31 set at init
  *   0x0C  data: a write sends bits 23:16, a read takes the next received
  *         byte in 7:0
- *   0x14  baud divider (15:0) and fraction  0x18  status: 2 = TX busy
- *         (never, here); 8, 10 and 13 write-1-to-clear
- *   0x1C / 0x20  stored                    0x38  25:16 bytes received
- *
- * The kernel's driver is not modelled yet: no interrupt is raised.
+ *   0x14  baud divider (15:0) and fraction
+ *   0x18  status: 0 TX threshold, 1 TX FIFO empty (always: sending is
+ *         instant), 2 TX FIFO full (never); 8 RX threshold, 10 RX timeout,
+ *         set while bytes wait, and 17 TX end, set by a send; 3..18 are
+ *         write-1-to-clear
+ *   0x20  interrupt enables, each at its status bit's position
+ *   0x38  25:16 bytes received
  */
 #define TYPE_AK_UART2 "ak-uart2"
 OBJECT_DECLARE_SIMPLE_TYPE(AkUart2State, AK_UART2)
@@ -350,6 +356,27 @@ struct AkUart2State {
     uint32_t rx_head, rx_len;
 };
 
+#define AK_UART2_CFG_RX_CLR     (1u << 28)
+#define AK_UART2_CFG_TX_CLR     (1u << 29)
+#define AK_UART2_ST_TX_TH       (1u << 0)
+#define AK_UART2_ST_TX_EMPTY    (1u << 1)
+#define AK_UART2_ST_RX_TH       (1u << 8)
+#define AK_UART2_ST_RX_TIMEOUT  (1u << 10)
+#define AK_UART2_ST_TX_END      (1u << 17)
+#define AK_UART2_ST_W1C         0x0007FFF8u
+
+/* Status: the sticky bits kept in regs[], and the levels. */
+static uint32_t ak_uart2_status(AkUart2State *s)
+{
+    return s->regs[0x18 / 4] | AK_UART2_ST_TX_TH | AK_UART2_ST_TX_EMPTY;
+}
+
+static void ak_uart2_update_irq(AkUart2State *s)
+{
+    qemu_set_irq(s->irq, !!(ak_uart2_status(s) & s->regs[0x20 / 4] &
+                            0x7FFFF));
+}
+
 static int ak_uart2_can_receive(void *opaque)
 {
     AkUart2State *s = opaque;
@@ -365,6 +392,8 @@ static void ak_uart2_receive(void *opaque, const uint8_t *buf, int size)
     for (i = 0; i < size && s->rx_len < AK_UART2_FIFO; i++) {
         s->rx[(s->rx_head + s->rx_len++) % AK_UART2_FIFO] = buf[i];
     }
+    s->regs[0x18 / 4] |= AK_UART2_ST_RX_TH | AK_UART2_ST_RX_TIMEOUT;
+    ak_uart2_update_irq(s);
 }
 
 static uint64_t ak_uart2_read(void *opaque, hwaddr offset, unsigned size)
@@ -383,7 +412,7 @@ static uint64_t ak_uart2_read(void *opaque, hwaddr offset, unsigned size)
         qemu_chr_fe_accept_input(&s->chr);
         return c;
     case 0x18:
-        return s->regs[0x18 / 4] & ~(1u << 2);
+        return ak_uart2_status(s);
     case 0x38:
         return (s->regs[0x38 / 4] & ~0x03FF0000u) | (s->rx_len << 16);
     }
@@ -396,22 +425,33 @@ static void ak_uart2_write(void *opaque, hwaddr offset, uint64_t val,
     AkUart2State *s = opaque;
     uint8_t c;
 
-    if (offset == 0x0C) {
+    switch (offset) {
+    case 0x00:
+        if (val & AK_UART2_CFG_RX_CLR) {
+            s->rx_head = s->rx_len = 0;
+            qemu_chr_fe_accept_input(&s->chr);
+        }
+        s->regs[0] = val & ~(AK_UART2_CFG_RX_CLR | AK_UART2_CFG_TX_CLR);
+        break;
+    case 0x0C:
         c = val >> 16;
         qemu_chr_fe_write_all(&s->chr, &c, 1);
-        return;
+        s->regs[0x18 / 4] |= AK_UART2_ST_TX_END;
+        break;
+    case 0x18:
+        s->regs[0x18 / 4] &= ~((uint32_t)val & AK_UART2_ST_W1C);
+        if (s->rx_len) {
+            /* bytes still waiting raise the RX events again */
+            s->regs[0x18 / 4] |= AK_UART2_ST_RX_TH | AK_UART2_ST_RX_TIMEOUT;
+        }
+        break;
+    default:
+        if (offset < sizeof(s->regs)) {
+            s->regs[offset / 4] = val;
+        }
+        break;
     }
-    if (offset == 0x18) {
-        /* 8, 10 and 13 acknowledge: write-1-to-clear; the rest is stored */
-        uint32_t w1c = (1u << 8) | (1u << 10) | (1u << 13);
-
-        s->regs[0x18 / 4] = (s->regs[0x18 / 4] & ~(uint32_t)val & w1c) |
-                            (val & ~w1c);
-        return;
-    }
-    if (offset < sizeof(s->regs)) {
-        s->regs[offset / 4] = val;
-    }
+    ak_uart2_update_irq(s);
 }
 
 static const MemoryRegionOps ak_uart2_ops = {
@@ -429,7 +469,9 @@ static void ak_uart2_reset(DeviceState *dev)
     AkUart2State *s = AK_UART2(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->regs[0x18 / 4] = AK_UART2_ST_TX_END;
     s->rx_head = s->rx_len = 0;
+    ak_uart2_update_irq(s);
 }
 
 static void ak_uart2_realize(DeviceState *dev, Error **errp)
@@ -461,6 +503,7 @@ static int ak_uart2_post_load(void *opaque, int version_id)
     if (s->rx_head >= AK_UART2_FIFO || s->rx_len > AK_UART2_FIFO) {
         return -EINVAL;
     }
+    ak_uart2_update_irq(s);
     return 0;
 }
 

@@ -110,7 +110,7 @@ cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-l2.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-ddrc.c           "$QEMU_DIR/hw/misc/"
-cp qemu/hw/timer/ak-tick.c          "$QEMU_DIR/hw/timer/"
+cp qemu/hw/misc/ak-av130-intc.c     "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/ak-l2.h     "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/char/ak-uart.c           "$QEMU_DIR/hw/char/"
 cp qemu/hw/ssi/ak-spi.c             "$QEMU_DIR/hw/ssi/"
@@ -684,7 +684,11 @@ else
         fi
     done
 fi
-for f in misc/ak-sysctrl misc/ak-l2 misc/ak-ddrc timer/ak-tick char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
+# ak-tick.c became part of ak-av130-intc.c (the AV130's timers and
+# interrupt controller): a tree configured before drops its entry.
+sed -i "/'ak-tick.c'/d" "$QEMU_DIR/hw/timer/meson.build"
+rm -f "$QEMU_DIR/hw/timer/ak-tick.c"
+for f in misc/ak-sysctrl misc/ak-av130-intc misc/ak-l2 misc/ak-ddrc char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

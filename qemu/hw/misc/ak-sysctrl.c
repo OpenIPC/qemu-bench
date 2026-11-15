@@ -137,6 +137,7 @@ struct AkSysctrlState {
     uint32_t wdt_load;
 
     uint32_t chip_id;
+    uint32_t chip_id_av;        /* AV130: the ID at +0x3FC, 0 = none */
     uint32_t num_timers;
     bool has_efuse;
     bool clk_v2;
@@ -297,6 +298,11 @@ static uint64_t ak_sysctrl_read(void *opaque, hwaddr offset, unsigned size)
     switch (offset / 4) {
     case R_CHIP_ID:
         return s->chip_id;
+    case 0x3FC / 4:
+        if (s->chip_id_av) {
+            return s->chip_id_av;
+        }
+        return s->regs[offset / 4];
     case R_SUB_STATUS:
         return ak_sub_status(s);
     case R_INT_STATUS:
@@ -505,6 +511,7 @@ static void ak_sysctrl_init(Object *obj)
 
 static const Property ak_sysctrl_properties[] = {
     DEFINE_PROP_UINT32("chip-id", AkSysctrlState, chip_id, 0x20160100),
+    DEFINE_PROP_UINT32("chip-id-av", AkSysctrlState, chip_id_av, 0),
     DEFINE_PROP_UINT32("num-timers", AkSysctrlState, num_timers, 5),
     DEFINE_PROP_BOOL("has-efuse", AkSysctrlState, has_efuse, false),
     DEFINE_PROP_BOOL("clk-v2", AkSysctrlState, clk_v2, false),
