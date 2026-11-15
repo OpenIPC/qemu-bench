@@ -848,10 +848,18 @@ A PR or master push runs only the jobs its paths reach; the weekly `schedule`
 run (and `workflow_dispatch`) runs everything. The `select` job's
 `.github/scripts/ci-select.py` decides. A model reaches the family its file
 name names, the families qemu/setup.sh builds it under, and transitively every
-family whose code names its QOM type, TYPE_ macro or header. Scripts reach the
-jobs whose workflow text names them. setup.sh, ci.yml and
-`.github/ci/boot-matrix.yml` (the `boot` rows, each with a `group`) are read
-by their diff. Docs run nothing. Anything unrecognised runs everything. Dry-run
+family whose code names its QOM type, TYPE_ macro or header (a header only
+through its includers). HiSilicon is resolved per machine: a model runs the
+jobs and rows (`boot`, and `venc-hisilicon`'s in `.github/ci/venc-matrix.yml`)
+of the machines whose `HisiSoCConfig` names its type or sets the field that
+guards its creation (`if (c->ive_npu_base)`, `for (...; n < c->num_himci;
+...)`); the build job checks that map against QEMU's own device trees
+(`--check-machines`). A sensor model runs only where it is attached: machines
+whose `default_sensor` it is, and jobs, rows and qtests that name it
+(`sensor=sc2315e`) -- not everywhere the catalogue is included. Scripts reach
+the jobs whose workflow text names them. setup.sh, ci.yml, hisilicon.c (a
+change inside one SoC's config runs that SoC), the sensor catalogue and the
+matrix files are read by their diff. Docs run nothing. Anything unrecognised runs everything. Dry-run
 a change with `git diff --name-only master | python3
 .github/scripts/ci-select.py --stdin --base master`; `--explain <path>` shows
 what a path reaches. A new job must go into the script's `JOB_FAMILIES` and

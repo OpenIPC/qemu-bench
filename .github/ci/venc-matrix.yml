@@ -1,0 +1,24 @@
+# Rows of the `venc-hisilicon` job in ci.yml, one SoC each.
+#
+# Here rather than inline so .github/scripts/ci-select.py can hand the job
+# only the rows a change reaches: a change to a model only one of these SoCs
+# instantiates runs that SoC's row, not all four (~74 runner-minutes).
+include:
+  - soc: hi3516ev200
+    majestic: true
+    scenario: true
+  # and sensors wider than VPSS's line buffer (2304): VI offline
+  - soc: hi3516ev300
+    majestic: true
+    wide: imx335 gc4653
+  # Goke's own gk7205v200_*.ko; its release has no SC2315E
+  # config, so majestic runs with an SC2335 there
+  - soc: gk7205v200
+    majestic: true
+  # V5: majestic links the SDK statically, so the release has no
+  # MPI library for a user-frame program (test-hisi-v5-venc.sh,
+  # local); majestic with an SC4336P is the end-to-end test
+  - soc: hi3516cv610
+    majestic: true
+    scenario: true
+    v5: true
