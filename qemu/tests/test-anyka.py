@@ -679,6 +679,30 @@ def test_av130_sfc(qt):
     check('SFC: the sector reads erased', qt.readl(SFC_XIP + 0x20000),
           0xFFFFFFFF)
     qt.writel(SFC + 0xD0, 0x10)
+    # programs one after another, no FIFO reset between: the FIFO recycles
+    ok = True
+    for k in range(3):
+        sfc_bank(qt, 0, 0x06, 0x10004040)
+        sfc_run(qt, 0, dma=True)
+        qt.writel(SFC + 0xD0, 0x10)
+        sfc_bank(qt, 0, 0x02, 0x44C0, 8 | (5 << 6), 0x21000 + 0x10 * k)
+        sfc_run(qt, 0)
+        qt.writel(SFC + 0x184, 0xA0A0A000 | k)
+        qt.writel(SFC + 0x184, 0x0000B0B0)        # 6 bytes, 2 of padding
+        ok &= bool(qt.readl(SFC + 0xD0) & 0x10)
+        ok &= qt.readl(SFC_XIP + 0x21000 + 0x10 * k) == 0xA0A0A000 | k
+        ok &= qt.readl(SFC_XIP + 0x21004 + 0x10 * k) & 0xFFFF == 0xB0B0
+        qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: repeated FIFO programs, padding dropped', ok, True)
+    # a poll for a status the NOR never shows: busy, not done, until the
+    # FIFO reset abandons it
+    sfc_bank(qt, 0, 0x05, 0x18000040, 0, 0, 0xFFFFFFFE, 1)
+    sfc_run(qt, 0, dma=True)
+    check('SFC: a poll that never matches is not done',
+          qt.readl(SFC + 0xD0) & 0x30, 0)
+    qt.writel(SFC + 0x100, 0x10)
+    check('SFC: the FIFO reset abandons it', qt.readl(SFC + 0xD0) & 0x20,
+          0x20)
 
 
 def main():

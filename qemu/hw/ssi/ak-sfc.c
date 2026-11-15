@@ -62,7 +62,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSfcState, AK_SFC)
 #define AK_SFC_REGS_SIZE    0x1000
 #define AK_SFC_XIP_SIZE     (16 * MiB)
 #define AK_SFC_BANKS        16
-#define AK_SFC_FIFO         (64 * KiB)      /* what a FIFO transfer may hold */
+#define AK_SFC_FIFO         (16 * KiB)      /* what a FIFO transfer may hold */
 #define AK_SFC_POLL_TRIES   10000
 
 #define R_THRESH    (0x0C0 / 4)
@@ -124,22 +124,18 @@ struct AkSfcState {
     uint32_t bank;          /* bank being run */
     uint32_t last;
     bool in_frame;          /* chip select held, header sent */
+    bool stalled;           /* a poll never matched */
     uint32_t data_left;     /* bytes the bank's data phase still moves */
     uint32_t data_done;
     uint8_t blk[AK_L2_BLOCK];
     uint32_t blk_len, blk_pos;
 
     /* FIFO transfers: what the CPU wrote, what it has to read. */
-    uint8_t *fifo;
+    uint8_t tx_fifo[AK_SFC_FIFO];
+    uint8_t rx_fifo[AK_SFC_FIFO];
     uint32_t tx_len, tx_pos;
     uint32_t rx_len, rx_pos;
 };
-
-static void ak_sfc_update_irq(AkSfcState *s)
-{
-    qemu_set_irq(s->irq, !!(s->regs[R_STATUS] & s->regs[R_INTEN] &
-                            (ST_DONE | ST_RXTH | ST_TXROOM)));
-}
 
 static uint32_t ak_sfc_status(AkSfcState *s)
 {
@@ -154,6 +150,13 @@ static uint32_t ak_sfc_status(AkSfcState *s)
         v |= ST_IDLE;
     }
     return v;
+}
+
+/* The line follows the status a read returns, FIFO levels included. */
+static void ak_sfc_update_irq(AkSfcState *s)
+{
+    qemu_set_irq(s->irq, !!(ak_sfc_status(s) & s->regs[R_INTEN] &
+                            (ST_DONE | ST_RXTH | ST_TXROOM)));
 }
 
 static uint32_t ak_sfc_bank(AkSfcState *s, unsigned n, unsigned field)
@@ -172,6 +175,16 @@ static void ak_sfc_fifo_reset(AkSfcState *s)
 {
     s->tx_len = s->tx_pos = 0;
     s->rx_len = s->rx_pos = 0;
+}
+
+/* Drop what the TX FIFO has already sent, keeping what it has not. */
+static void ak_sfc_tx_compact(AkSfcState *s)
+{
+    if (s->tx_pos) {
+        memmove(s->tx_fifo, s->tx_fifo + s->tx_pos, s->tx_len - s->tx_pos);
+        s->tx_len -= s->tx_pos;
+        s->tx_pos = 0;
+    }
 }
 
 /* Chip select, opcode, address, mode and dummy of bank n. */
@@ -215,6 +228,8 @@ static void ak_sfc_end_frame(AkSfcState *s)
 
 static void ak_sfc_finish(AkSfcState *s)
 {
+    /* What the last FIFO word carried past the length is not sent. */
+    s->tx_len = s->tx_pos = 0;
     s->busy = false;
     s->regs[R_XFER] &= ~(XFER_START | XFER_DMA);
     s->regs[R_STATUS] |= ST_DONE;
@@ -291,7 +306,7 @@ static bool ak_sfc_data(AkSfcState *s, unsigned n)
             if (s->tx_pos == s->tx_len) {
                 return false;   /* the CPU has not written it yet */
             }
-            ssi_transfer(s->bus, s->fifo[s->tx_pos++]);
+            ssi_transfer(s->bus, s->tx_fifo[s->tx_pos++]);
             s->data_left--;
         }
         return true;
@@ -300,15 +315,19 @@ static bool ak_sfc_data(AkSfcState *s, unsigned n)
         uint8_t b = ssi_transfer(s->bus, 0xFF);
 
         if (s->rx_len < AK_SFC_FIFO) {
-            s->fifo[s->rx_len++] = b;
+            s->rx_fifo[s->rx_len++] = b;
         }
         s->data_left--;
     }
     return true;
 }
 
-/* A status poll: the bank again until the byte it reads matches. */
-static void ak_sfc_poll(AkSfcState *s, unsigned n)
+/*
+ * A status poll: the bank again until the byte it reads matches.  False
+ * if it never does: the transfer stays busy, as the controller would keep
+ * polling, until the FIFO reset abandons it.
+ */
+static bool ak_sfc_poll(AkSfcState *s, unsigned n)
 {
     uint32_t mask = ~ak_sfc_bank(s, n, B_MASK);
     uint32_t want = ak_sfc_bank(s, n, B_MATCH) & mask;
@@ -319,11 +338,12 @@ static void ak_sfc_poll(AkSfcState *s, unsigned n)
         got = ssi_transfer(s->bus, 0xFF) & 0xFF;
         qemu_set_irq(s->cs, 1);
         if ((got & mask) == want) {
-            return;
+            return true;
         }
     }
     qemu_log_mask(LOG_GUEST_ERROR, "ak-sfc: bank %u poll never matched "
                   "(0x%02x, mask 0x%08x, want 0x%08x)\n", n, got, mask, want);
+    return false;
 }
 
 /* Run banks as far as the data lets; true on progress. */
@@ -336,7 +356,13 @@ static bool ak_sfc_run(AkSfcState *s)
         uint32_t iface = ak_sfc_bank(s, n, B_IFACE);
 
         if (iface & IF_POLL) {
-            ak_sfc_poll(s, n);
+            if (s->stalled) {
+                break;
+            }
+            if (!ak_sfc_poll(s, n)) {
+                s->stalled = true;
+                break;
+            }
             s->bank++;
             progress = true;
             continue;
@@ -374,6 +400,7 @@ static bool ak_sfc_run(AkSfcState *s)
         ak_sfc_finish(s);
         progress = true;
     }
+    ak_sfc_update_irq(s);
     return progress;
 }
 
@@ -406,8 +433,10 @@ static void ak_sfc_start(AkSfcState *s)
     s->bank = 0;
     s->last = MIN(x & 0xF, AK_SFC_BANKS - 1);
     s->in_frame = false;
+    s->stalled = false;
     s->rx_len = s->rx_pos = 0;
     s->regs[R_STATUS] &= ~ST_DONE;
+    ak_sfc_update_irq(s);
     qemu_log_mask(LOG_UNIMP, "ak-sfc: start, banks 0-%u, %s, bank 0 op 0x%02x"
                   " addr 0x%x len %u\n", s->last, s->dma ? "DMA" : "FIFO",
                   ak_sfc_bank(s, 0, B_INST) & 0xFF,
@@ -430,7 +459,7 @@ static uint64_t ak_sfc_read(void *opaque, hwaddr offset, unsigned size)
     case R_FIFO:
         /* An empty FIFO reads harmlessly: the driver reads one too many. */
         for (i = 0; i < 4 && s->rx_pos < s->rx_len; i++) {
-            v |= (uint32_t)s->fifo[s->rx_pos++] << (8 * i);
+            v |= (uint32_t)s->rx_fifo[s->rx_pos++] << (8 * i);
         }
         if (s->rx_pos == s->rx_len) {
             s->rx_pos = s->rx_len = 0;
@@ -454,7 +483,16 @@ static void ak_sfc_write(void *opaque, hwaddr offset, uint64_t val,
         return;
     case R_MODE:
         if (val & MODE_FRESET) {
+            if (s->busy) {
+                /* abandons a transfer still waiting, a failed poll's too */
+                if (s->in_frame) {
+                    ak_sfc_end_frame(s);
+                }
+                s->busy = s->stalled = false;
+                s->regs[R_XFER] &= ~(XFER_START | XFER_DMA);
+            }
             ak_sfc_fifo_reset(s);
+            ak_sfc_update_irq(s);
         }
         s->regs[R_MODE] = val & ~(MODE_ACK | MODE_FRESET);
         return;
@@ -465,9 +503,10 @@ static void ak_sfc_write(void *opaque, hwaddr offset, uint64_t val,
         }
         return;
     case R_FIFO:
+        ak_sfc_tx_compact(s);
         for (i = 0; i < 4; i++) {
             if (s->tx_len < AK_SFC_FIFO) {
-                s->fifo[s->tx_len++] = val >> (8 * i);
+                s->tx_fifo[s->tx_len++] = val >> (8 * i);
             }
         }
         if (s->busy) {
@@ -475,7 +514,8 @@ static void ak_sfc_write(void *opaque, hwaddr offset, uint64_t val,
         }
         return;
     case R_INTEN:
-        s->regs[R_INTEN] = val;
+    case R_THRESH:
+        s->regs[offset / 4] = val;
         ak_sfc_update_irq(s);
         return;
     }
@@ -499,6 +539,12 @@ static uint64_t ak_sfc_xip_read(void *opaque, hwaddr addr, unsigned size)
     uint64_t v = 0;
     unsigned i;
 
+    if (s->in_frame) {
+        /* a command bank holds chip select: do not end its frame */
+        qemu_log_mask(LOG_GUEST_ERROR, "ak-sfc: XIP read at 0x%" HWADDR_PRIx
+                      " while a command runs\n", addr);
+        return ~0ULL;
+    }
     qemu_set_irq(s->cs, 0);
     ssi_transfer(s->bus, 0x03);
     ssi_transfer(s->bus, (addr >> 16) & 0xFF);
@@ -533,7 +579,7 @@ static void ak_sfc_reset(DeviceState *dev)
     AkSfcState *s = AK_SFC(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
-    s->busy = s->in_frame = false;
+    s->busy = s->in_frame = s->stalled = false;
     ak_sfc_fifo_reset(s);
     qemu_set_irq(s->cs, 1);
     qemu_set_irq(s->irq, 0);
@@ -543,7 +589,6 @@ static void ak_sfc_realize(DeviceState *dev, Error **errp)
 {
     AkSfcState *s = AK_SFC(dev);
 
-    s->fifo = g_malloc0(AK_SFC_FIFO);
     if (s->l2) {
         ak_l2_register_client(s->l2, ak_sfc_l2_pump, s);
     }
@@ -572,7 +617,7 @@ static const Property ak_sfc_properties[] = {
 /*
  * Only an idle controller migrates: a transfer runs to completion within
  * one register write, or stalls on L2 or the FIFO, which the next write
- * resumes; the FIFO contents are not saved.
+ * resumes.  Both FIFOs travel, for what a finished read left unread.
  */
 static int ak_sfc_pre_save(void *opaque)
 {
@@ -581,13 +626,32 @@ static int ak_sfc_pre_save(void *opaque)
     return s->busy ? -EBUSY : 0;
 }
 
+static int ak_sfc_post_load(void *opaque, int version_id)
+{
+    AkSfcState *s = opaque;
+
+    if (s->tx_pos > s->tx_len || s->tx_len > AK_SFC_FIFO ||
+        s->rx_pos > s->rx_len || s->rx_len > AK_SFC_FIFO) {
+        return -EINVAL;
+    }
+    ak_sfc_update_irq(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_sfc = {
     .name = TYPE_AK_SFC,
     .version_id = 1,
     .minimum_version_id = 1,
     .pre_save = ak_sfc_pre_save,
+    .post_load = ak_sfc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AkSfcState, AK_SFC_REGS_SIZE / 4),
+        VMSTATE_UINT8_ARRAY(tx_fifo, AkSfcState, AK_SFC_FIFO),
+        VMSTATE_UINT8_ARRAY(rx_fifo, AkSfcState, AK_SFC_FIFO),
+        VMSTATE_UINT32(tx_len, AkSfcState),
+        VMSTATE_UINT32(tx_pos, AkSfcState),
+        VMSTATE_UINT32(rx_len, AkSfcState),
+        VMSTATE_UINT32(rx_pos, AkSfcState),
         VMSTATE_END_OF_LIST()
     }
 };
