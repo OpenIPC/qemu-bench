@@ -452,7 +452,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     g_autofree uint8_t *img = NULL;
     gsize img_len = 0;
     DeviceState *sysctrl, *l2, *dev;
-    DeviceState *spi[2];
+    DeviceState *spi[2] = { NULL, NULL };
     Object *cpuobj;
     ARMCPU *cpu;
     int n;
@@ -527,7 +527,12 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                            qdev_get_gpio_in(sysctrl, irq[n]));
     }
 
-    for (n = 0; n < 2; n++) {
+    /*
+     * The AV130 has no SPI0 at 0x21100000: its boot NOR is on the SPI
+     * flash controller at 0x20120000 (sfc@20120000, interrupt 8), whose
+     * XIP window maps the flash at 0x30000000 (hw/ssi/ak-sfc.c).
+     */
+    for (n = c->av130 ? 1 : 0; n < 2; n++) {
         const hwaddr base[2] = {
             c->aspen ? AK_ASPEN_SPI0_BASE : AK_SPI0_BASE, AK_SPI1_BASE,
         };
@@ -548,9 +553,22 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                            qdev_get_gpio_in(sysctrl, irq[n]));
     }
 
-    /* The boot SPI NOR on SPI0's chip select. */
+    /* The boot SPI NOR on SPI0's chip select, or on the AV130's SFC. */
     {
-        BusState *bus = qdev_get_child_bus(spi[0], "ssi");
+        DeviceState *master = spi[0];
+        BusState *bus;
+
+        if (c->av130) {
+            master = qdev_new("ak-sfc");
+            object_property_set_link(OBJECT(master), "l2", OBJECT(l2),
+                                     &error_fatal);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(master), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(master), 0, 0x20120000);
+            sysbus_mmio_map(SYS_BUS_DEVICE(master), 1, 0x30000000);
+            sysbus_connect_irq(SYS_BUS_DEVICE(master), 0,
+                               qdev_get_gpio_in(sysctrl, AK_IRQ_SPI0));
+        }
+        bus = qdev_get_child_bus(master, "ssi");
 
         dev = qdev_new("ak-spinor");
         if (ams->flash_file) {
@@ -560,7 +578,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                              ? ams->flash_jedec
                              : ak_flash_jedec(img, img_len));
         qdev_realize_and_unref(dev, bus, &error_fatal);
-        qdev_connect_gpio_out_named(spi[0], SSI_GPIO_CS, 0,
+        qdev_connect_gpio_out_named(master, SSI_GPIO_CS, 0,
                                     qdev_get_gpio_in_named(dev, SSI_GPIO_CS,
                                                            0));
     }

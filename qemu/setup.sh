@@ -115,6 +115,7 @@ cp qemu/include/hw/misc/ak-l2.h     "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/char/ak-uart.c           "$QEMU_DIR/hw/char/"
 cp qemu/hw/ssi/ak-spi.c             "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/ssi/ak-spinor.c          "$QEMU_DIR/hw/ssi/"
+cp qemu/hw/ssi/ak-sfc.c             "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/gpio/ak-gpio.c           "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/usb/ak-usb.c             "$QEMU_DIR/hw/usb/"
 cp qemu/hw/i2c/ak-i2c.c             "$QEMU_DIR/hw/i2c/"
@@ -683,7 +684,7 @@ else
         fi
     done
 fi
-for f in misc/ak-sysctrl misc/ak-l2 misc/ak-ddrc timer/ak-tick char/ak-uart ssi/ak-spi ssi/ak-spinor gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
+for f in misc/ak-sysctrl misc/ak-l2 misc/ak-ddrc timer/ak-tick char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

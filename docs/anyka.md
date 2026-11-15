@@ -38,7 +38,7 @@ is header-encrypted and was not usable.
 | `ak3918ev300l` | `0x53543400` | 64 MiB | 10 | "ASPEN": SPI0 at `0x21100000`, clock block v2; `socinfo` prints `0x535434` |
 | `ak3918av100` | `0x53533500` | 64 MiB | 10 | ASPEN + AV100 blocks; AK3918AV100N/P, KM01N; boots the AnyCloud39AV100 SDK V1.12 firmware to login |
 | `ak3918av100x` | `0x53533500` | 128 MiB | 10 | same die, 128 MiB; AK3918AV100X/XP, KM01D |
-| `ak3918av130` | `0x53533500`¹ | 64 MiB | 10 | the AV100's map, plus U-Boot's tick timer at `0x21110000` (`ak-tick`) and a FIFO UART (`ak-uart2`); U-Boot reaches `Flash:`, see below |
+| `ak3918av130` | `0x53533500`¹ | 64 MiB | 10 | the AV100's map, plus U-Boot's tick timer at `0x21110000` (`ak-tick`), a FIFO UART (`ak-uart2`) and the SPI flash controller at `0x20120000` (`ak-sfc`); U-Boot boots the kernel, see below |
 
 The AV100 family all read chip ID `0x53533500` (`socinfo` `0x535335`,
 "AK3918AV100-A"; the C revision is `0x53533501`, "-C"). The vendor tells the
@@ -222,12 +222,24 @@ blocks it drives are not the AV100's:
 - **UART** (`anyka,ak3918av100plus-uart` in the U-Boot DT, at the old
   addresses): a FIFO UART with a data register, not the L2-buffer UART
   (`ak-uart2` in `hw/char/ak-uart.c`, as U-Boot drives it; no interrupt yet).
-- **Not modelled yet:** the SPI flash controller `sfc@20120000`
-  (`anyka,ak3918av130-sfc`), a command-bank sequencer that also maps the
-  flash for XIP. U-Boot prints its banner, `CPU: 960MHz`, the model and
-  `DRAM`, then `Flash: wait for xip transmission stop too long`. The
-  kernel's DT also has a data mover (`0x21120000`), a remote processor
-  (`0x21102000`) and its own interrupt controller compatible.
+- **SPI flash controller** `sfc@20120000` (`hw/ssi/ak-sfc.c`), where the
+  older parts had SPI0: a list of command banks (`0x200 + 0x40 n`: opcode,
+  address, mode, data, match mask / data, interface, lengths) that it runs
+  against the boot NOR on its SSI bus, one chip-select frame each. Data
+  moves through a bank's own register (up to 4 bytes: RDID, status), the
+  `0x184` FIFO, or L2 common buffer 1 by DMA (BUFASSIGN device 0, 64-byte
+  blocks), which is how U-Boot reads the kernel. A bank with bit 27 polls
+  (RDSR until WIP is clear). `0x0D0` bit 4 is done (write 1 to clear),
+  `0x100` bit 1 acknowledges the XIP stop, bit 4 resets the FIFO. The XIP
+  window at `0x30000000` reads with 0x03; this U-Boot never uses it. All
+  of it from the U-Boot driver's behaviour; no datasheet.
+- **Result:** U-Boot detects the GD25Q64, loads its environment from SPI
+  flash, reads the 4.4.302-cip94 kernel (checksum OK) and the DT, and
+  starts it: `Uncompressing Linux... done, booting the kernel.` The kernel
+  prints nothing after that. Next: the AV130's interrupt controller
+  (`anyka,ak3918av130-ic`) and system timer variants, and the UART v2's
+  interrupt for the kernel console. The DT also has a data mover
+  (`0x21120000`) and a remote processor (`0x21102000`).
 
 ¹ The AV100's. ipctool reads the AV130's at SYSCTRL `+0x3FC` (`0x565735xx`); not modelled yet.
 
@@ -250,7 +262,7 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `XM25QH64A@SOIC8.BIN` | — | the dump has bit errors throughout (`consold=ttyS@K0`); not bootable |
 | AnyCloud39AV100 SDK V1.12 firmware, assembled into an 8 MiB image (`qemu-boot/anyka-sdk-image.py`): the SDK's own U-Boot 2019.10.0-V4.0.27 (`ak3918av100_nor_defconfig`) under an `ANYKA322` header with the burn tool's 64 MiB DDR script, `image/uImage` (vendor 4.4.282), `EVB_CBDM_AK3918AV100N_V1.0.0.dtb`, `root.sqsh4`, `usr.jffs2`, `usr.sqsh4` at the burn-config offsets | `ak3918av100` | `anyka login:` (`ANYKA CPU AK3918AV100-A (ID 0x535335)`, GD25Q64 NOR, 8 MTD partitions, squashfs root, jffs2 config, APP mounted). The vendor modules load without crashing: `ak_rtc`, `ak_i2c`, `ak_efuse`, `ak_ion`, `ak_pcm`, `ak_isp`, `ak_venc_adapter`, `ak_npu`, `ak_eth`. (`ak_venc_bridge` and `ak_hcd` need symbols from `ak_venc_adapter` / usbcore loaded first, as the vendor scripts do.) |
 | the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
-| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | U-Boot banner, then `Flash: wait for xip transmission stop too long` (the SFC is not modelled) |
+| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | U-Boot to `Starting kernel` (GD25Q64 through the SFC, environment and kernel read, checksum OK); the 4.4.302-cip94 kernel prints nothing after decompressing |
 
 ## Ethernet checks
 
