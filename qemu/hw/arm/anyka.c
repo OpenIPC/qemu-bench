@@ -264,9 +264,10 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
  *          address word: 0x66668888 = wait <value> (delay units),
  *          0x66668881 = poll <value> for <next word> (three words),
  *          0x66668880 = a read-modify-write of <value> with the mask in
- *          <next word> (three words, as the poll; an AV100 camera's flash
- *          clears bit 2 of DDRC +0x24 with it), 0x66668882 = a ROM
- *          operation of one word; both skipped, 0x88888888 = end
+ *          <next word> (three words, as the poll; the AV130 dump, owner
+ *          report r-5uwdebux, clears bit 2 of DDRC +0x24 with it),
+ *          0x66668882 = a ROM operation of one word; both skipped,
+ *          0x88888888 = end
  *   +0x18C "SPIP" + the SPI NOR descriptor the vendor drivers use
  *
  * The ROM replays the script -- DDR controller and PLLs -- then copies

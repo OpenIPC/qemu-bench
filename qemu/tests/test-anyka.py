@@ -594,6 +594,9 @@ def test_av130(qemu, tmp):
             qt.writel(uart + 0x0C, ch << 16)
         check('UART: bits 23:16 of DATA go out', open(out, 'rb').read(),
               b'OK')
+        qt.writel(uart + 0x18, 0x2500 | 0x40)
+        check('UART: status 8/10/13 are write-1-to-clear, the rest stored',
+              qt.readl(uart + 0x18), 0x40)
         check('UART: nothing received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
               0)
     finally:

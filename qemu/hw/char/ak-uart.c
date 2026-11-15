@@ -329,7 +329,7 @@ static const TypeInfo ak_uart_info = {
  *   0x0C  data: a write sends bits 23:16, a read takes the next received
  *         byte in 7:0
  *   0x14  baud divider (15:0) and fraction  0x18  status: 2 = TX busy
- *         (never, here); 8, 10 and 13 written to clear
+ *         (never, here); 8, 10 and 13 write-1-to-clear
  *   0x1C / 0x20  stored                    0x38  25:16 bytes received
  *
  * The kernel's driver is not modelled yet: no interrupt is raised.
@@ -401,6 +401,14 @@ static void ak_uart2_write(void *opaque, hwaddr offset, uint64_t val,
         qemu_chr_fe_write_all(&s->chr, &c, 1);
         return;
     }
+    if (offset == 0x18) {
+        /* 8, 10 and 13 acknowledge: write-1-to-clear; the rest is stored */
+        uint32_t w1c = (1u << 8) | (1u << 10) | (1u << 13);
+
+        s->regs[0x18 / 4] = (s->regs[0x18 / 4] & ~(uint32_t)val & w1c) |
+                            (val & ~w1c);
+        return;
+    }
     if (offset < sizeof(s->regs)) {
         s->regs[offset / 4] = val;
     }
@@ -446,10 +454,21 @@ static const Property ak_uart2_properties[] = {
     DEFINE_PROP_CHR("chardev", AkUart2State, chr),
 };
 
+static int ak_uart2_post_load(void *opaque, int version_id)
+{
+    AkUart2State *s = opaque;
+
+    if (s->rx_head >= AK_UART2_FIFO || s->rx_len > AK_UART2_FIFO) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_ak_uart2 = {
     .name = TYPE_AK_UART2,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ak_uart2_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AkUart2State, 0x40 / 4),
         VMSTATE_UINT8_ARRAY(rx, AkUart2State, AK_UART2_FIFO),
