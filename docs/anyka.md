@@ -19,6 +19,7 @@ input, an NPU and a video pipe higher in the map (`0x212`--`0x215`).
 | AnyCloud V500 / EV330 | AK3916EV330, AK3918EV330, AK3919EV330, and the EV331 trio (one `dt_compat` list, `mach-ak39ev330.c`) | `ak3918ev200-kernel` (`anycloud_ak39ev330*.dtsi`), dump | 4.4.192 vendor (DT) | `ANYKAH3B` |
 | AnyCloud39AV130 SDK V1.03 (one tree for several lines) | AK3918EV300L, AK3918AV100 (N/P/X/XP) | `ANYKA_130L_SDK`: U-Boot 2019.10 (`arch-ak3918ev300l`, `arch-ak3918av100`), kernel 4.4.302 (`anycloud_ak3918ev300l*.dtsi`), dump | 4.4.282 vendor (DT) | `AK_H322L` / `AKH322LS` (EV300L), `ANYKA322` (AV100, inferred from `ak_ddr_param`) |
 | AnyCloud39AV100 SDK V1.12 | AK3918AV100 (N/P/X/XP), KM01 (N/D) | `ANYKA_AV100_SDK`: U-Boot 2019.10.0-V4.0.27 (`arch-ak3918av100`, `ak3918av100_nor_defconfig`), kernel 4.4.282 (`anycloud_ak3918av100*.dtsi`), prebuilt `image/` | 4.4.282 vendor (DT) | `ANYKA322` (confirmed: U-Boot `vectors.S` builds `ANYKAH3D`, the burn tool patches it to `ANYKA322`; `ak_secureboot` header template) |
+| AK3918AV130 | AK3918AV130 | no SDK; one flash dump (owner report r-5uwdebux on openipc.org): U-Boot 2019.10.0-V4.0.27 built for it (`EVB_CBD_AK3918AV130_V1.0.0`), its DTs `anyka,ak3918av130` | vendor (DT) | `AKH322LS`, payload from `0x200` to `0x80DFFC00` |
 | AK37D, AK37E | — | `#ifdef`s in the 4.4 tree's `map.h`, `irqs.h`, `ak_timer.c` only | — | — |
 
 The `Aimer39_PDK_V1.1.00` archive (AK3918 datasheet and programming guide)
@@ -37,6 +38,7 @@ is header-encrypted and was not usable.
 | `ak3918ev300l` | `0x53543400` | 64 MiB | 10 | "ASPEN": SPI0 at `0x21100000`, clock block v2; `socinfo` prints `0x535434` |
 | `ak3918av100` | `0x53533500` | 64 MiB | 10 | ASPEN + AV100 blocks; AK3918AV100N/P, KM01N; boots the AnyCloud39AV100 SDK V1.12 firmware to login |
 | `ak3918av100x` | `0x53533500` | 128 MiB | 10 | same die, 128 MiB; AK3918AV100X/XP, KM01D |
+| `ak3918av130` | `0x53533500`¹ | 128 MiB | 10 | the AV100's map, plus U-Boot's tick timer at `0x21110000` (`ak-tick`) and a FIFO UART (`ak-uart2`); U-Boot reaches `Flash:`, see below |
 
 The AV100 family all read chip ID `0x53533500` (`socinfo` `0x535335`,
 "AK3918AV100-A"; the C revision is `0x53533501`, "-C"). The vendor tells the
@@ -105,7 +107,7 @@ The first 512 bytes of the NOR (U-Boot port `mkaksh.py`, and every dump):
 | `+0x04` | magic `AKSH_240` / `ANYKA_H3` / `ANYKAH3B` / `AK_H322L` (EV300L) / `ANYKA322` (AV100) |
 | `+0x0C` | payload length (it follows the header) |
 | `+0x20` | load address: `0x80E00000` (U-Boot, EV200/EV300/EV300L/AV100) or `0x48000000` (EV330 first stage) |
-| `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` / `0x66668882` = EV300L / AV100 ROM operations of one value (skipped), `0x88888888` = end |
+| `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` = three-word read-modify-write `{marker, register, mask}` (the AV130 dump clears bit 2 of DDRC `+0x24` with it), `0x66668882` = a ROM operation of one value; all skipped; `0x88888888` = end |
 | `+0x18C` | `SPIP` + the SPI NOR descriptor (JEDEC ID, size, page, erase size, partition-table block) |
 
 The AV100's `ANYKA322` payload does not follow the header at `+0x200` but at
@@ -200,6 +202,34 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   dongle. As plain storage the block echoed the driver's bits back as
   connect events and the hub layer retried forever.
 
+## AK3918AV130
+
+The one AV130 seen is a raw 8 MiB read sent to openipc.org (owner report
+r-5uwdebux). It was taken for an AV100 at first -- its U-Boot is the AV100
+SDK's 2019.10.0-V4.0.27 and its header magic `AKH322LS` -- but both its DTs
+say `anyka,ak3918av130` (board `EVB_CBDM_AK3918av130`, 128 MiB), and the
+blocks it drives are not the AV100's:
+
+- **The header.** Payload length `0x40000` from flash `0x200` to
+  `0x80DFFC00`: the 0x400 bytes of secure-boot space go first, so flash
+  `0x600` lands at `0x80E00000`, which is where U-Boot is linked. The ROM
+  enters at the load address and runs through the zeroes (`andeq`) to it.
+  Its script ends with the three-word `0x66668880` op; read as a pair, it
+  became a store of `0x88888888` to `0xFFFFFFFB` and a data abort in the ROM.
+- **Tick timer** at `0x21110000` (`hw/timer/ak-tick.c`): U-Boot's
+  `get_timer()`. Without it the first `udelay` never returns.
+- **UART** (`anyka,ak3918av100plus-uart` in the U-Boot DT, at the old
+  addresses): a FIFO UART with a data register, not the L2-buffer UART
+  (`ak-uart2` in `hw/char/ak-uart.c`, as U-Boot drives it; no interrupt yet).
+- **Not modelled yet:** the SPI flash controller `sfc@20120000`
+  (`anyka,ak3918av130-sfc`), a command-bank sequencer that also maps the
+  flash for XIP. U-Boot prints its banner, `CPU: 960MHz`, the model and
+  `DRAM`, then `Flash: wait for xip transmission stop too long`. The
+  kernel's DT also has a data mover (`0x21120000`), a remote processor
+  (`0x21102000`) and its own interrupt controller compatible.
+
+¹ The AV100's; the AV130's own ID is not known yet.
+
 ## Dumps
 
 Vendor firmware, each booted with `flash-file=` on a copy:
@@ -219,6 +249,7 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `XM25QH64A@SOIC8.BIN` | — | the dump has bit errors throughout (`consold=ttyS@K0`); not bootable |
 | AnyCloud39AV100 SDK V1.12 firmware, assembled into an 8 MiB image (`qemu-boot/anyka-sdk-image.py`): the SDK's own U-Boot 2019.10.0-V4.0.27 (`ak3918av100_nor_defconfig`) under an `ANYKA322` header with the burn tool's 64 MiB DDR script, `image/uImage` (vendor 4.4.282), `EVB_CBDM_AK3918AV100N_V1.0.0.dtb`, `root.sqsh4`, `usr.jffs2`, `usr.sqsh4` at the burn-config offsets | `ak3918av100` | `anyka login:` (`ANYKA CPU AK3918AV100-A (ID 0x535335)`, GD25Q64 NOR, 8 MTD partitions, squashfs root, jffs2 config, APP mounted). The vendor modules load without crashing: `ak_rtc`, `ak_i2c`, `ak_efuse`, `ak_ion`, `ak_pcm`, `ak_isp`, `ak_venc_adapter`, `ak_npu`, `ak_eth`. (`ak_venc_bridge` and `ak_hcd` need symbols from `ak_venc_adapter` / usbcore loaded first, as the vendor scripts do.) |
 | the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
+| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | U-Boot banner, then `Flash: wait for xip transmission stop too long` (the SFC is not modelled) |
 
 ## Ethernet checks
 

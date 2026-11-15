@@ -180,6 +180,25 @@ static const AkSoCConfig ak3918av100_soc = {
     .av100              = true,
 };
 
+/*
+ * AK3918AV130 (anyka,ak3918av130; EVB_CBDM_AK3918av130 in the first dump,
+ * owner report r-5uwdebux): the AV100 SDK's U-Boot 2019.10 V4.0.x and
+ * kernel, 128 MiB, the AV100 map and blocks.  Its U-Boot keeps time on a
+ * timer of its own at 0x21110000 (below).
+ */
+static const AkSoCConfig ak3918av130_soc = {
+    .desc               = "Anyka AK3918AV130 (ARM926EJ-S, 128 MB DDR2)",
+    .chip_id            = 0x53533500,
+    .ram_size_default   = 128 * MiB,
+    .num_timers         = 10,
+    .flash_cs_gpio      = -1,
+    .i2c_layout         = 2,
+    .has_efuse          = true,
+    .aspen              = true,
+    .av100              = true,
+    .av130              = true,
+};
+
 static const AkSoCConfig ak3918av100x_soc = {
     .desc               = "Anyka AK3918AV100X/XP, KM01D (ARM926EJ-S, 128 MB DDR2)",
     .chip_id            = 0x53533500,
@@ -241,8 +260,10 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
  *   +0x2C  register script, {address, value} pairs, with markers in the
  *          address word: 0x66668888 = wait <value> (delay units),
  *          0x66668881 = poll <value> for <next word> (three words),
- *          0x66668880 / 0x66668882 = EV300L ROM operations of one word
- *          (SDK_CPU_DDR2.ini; skipped), 0x88888888 = end
+ *          0x66668880 = a read-modify-write of <value> with the mask in
+ *          <next word> (three words, as the poll; an AV100 camera's flash
+ *          clears bit 2 of DDRC +0x24 with it), 0x66668882 = a ROM
+ *          operation of one word; both skipped, 0x88888888 = end
  *   +0x18C "SPIP" + the SPI NOR descriptor the vendor drivers use
  *
  * The ROM replays the script -- DDR controller and PLLs -- then copies
@@ -257,6 +278,7 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
 #define AK_HDR_SPIP         0x18C
 #define AK_SCRIPT_DELAY     0x66668888
 #define AK_SCRIPT_POLL      0x66668881
+#define AK_SCRIPT_RMW       0x66668880
 #define AK_SCRIPT_OP_MASK   0xFFFFFF00
 #define AK_SCRIPT_OP        0x66668800
 #define AK_SCRIPT_END       0x88888888
@@ -350,6 +372,15 @@ static void ak_boot_rom_setup(const uint8_t *img, gsize len,
             off += 12;
             continue;
         }
+        if (a == AK_SCRIPT_RMW) {
+            /*
+             * {marker, register, mask}: the stub only stores, and the one
+             * seen clears a bit the script has just left clear.  Read as a
+             * pair it made {mask, end} a store to 0xFFFFFFFB.
+             */
+            off += 12;
+            continue;
+        }
         off += 8;
         if ((a & AK_SCRIPT_OP_MASK) == AK_SCRIPT_OP || !a) {
             continue;
@@ -403,6 +434,7 @@ static uint32_t ak_flash_jedec(const uint8_t *img, gsize len)
     }
     return 0xC84017;            /* GD25Q64, the commonest fit */
 }
+
 
 static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
 {
@@ -471,11 +503,17 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
             AK_IRQ_UART0, AK_IRQ_UART1, AK_ASPEN_IRQ_UART2,
         };
 
-        dev = qdev_new("ak-uart");
-        qdev_prop_set_chr(dev, "chardev", serial_hd(n));
-        qdev_prop_set_uint32(dev, "index", n);
-        object_property_set_link(OBJECT(dev), "l2", OBJECT(l2),
-                                 &error_fatal);
+        if (c->av130) {
+            /* the AV130's FIFO UART (ak-uart.c, ak-uart2) */
+            dev = qdev_new("ak-uart2");
+            qdev_prop_set_chr(dev, "chardev", serial_hd(n));
+        } else {
+            dev = qdev_new("ak-uart");
+            qdev_prop_set_chr(dev, "chardev", serial_hd(n));
+            qdev_prop_set_uint32(dev, "index", n);
+            object_property_set_link(OBJECT(dev), "l2", OBJECT(l2),
+                                     &error_fatal);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
@@ -619,6 +657,10 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_MAC_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(sysctrl, AK_IRQ_MAC));
+    if (c->av130) {
+        /* U-Boot's tick timer (hw/timer/ak-tick.c) */
+        sysbus_create_simple("ak-tick", 0x21110000, NULL);
+    }
     /* The mask ROM.  Without a flash image to boot it stays empty. */
     memory_region_init_rom(bootrom, NULL, "anyka.bootrom", AK_BOOTROM_SIZE,
                            &error_fatal);
@@ -699,3 +741,4 @@ DEFINE_AK_MACHINE("ak3919ev330", ak3919ev330, ak3919ev330_soc)
 DEFINE_AK_MACHINE("ak3918ev300l", ak3918ev300l, ak3918ev300l_soc)
 DEFINE_AK_MACHINE("ak3918av100", ak3918av100, ak3918av100_soc)
 DEFINE_AK_MACHINE("ak3918av100x", ak3918av100x, ak3918av100x_soc)
+DEFINE_AK_MACHINE("ak3918av130", ak3918av130, ak3918av130_soc)

@@ -337,7 +337,7 @@ def test_rejections_and_migration(qemu, tmp, path):
                          capture_output=True, text=True, timeout=30)
     check('a 32 KiB flash image is refused',
           out.returncode != 0 and '64 KiB' in out.stderr, True)
-    for m in ('ak3918ev300', 'ak3919ev330'):
+    for m in ('ak3918ev300', 'ak3919ev330', 'ak3918av130'):
         mig = os.path.join(tmp, m + '.mig')
         out = hmp(qemu, ['-M', m, '-S'],
                   ['migrate file:' + mig, 'info migrate'])
@@ -439,8 +439,8 @@ def test_ev300l(qemu, path):
     script = [DDRC + 0x14, 0x00423E71,
               0x66668881, DDRC + 0xA4, 0x10000,     # poll: three words
               DDRC + 0x0C, 0x00001A5D,
-              0x66668882, 0x54535150,               # one-word ROM ops
-              0x66668880, 0x1,
+              0x66668882, 0x54535150,               # a one-word ROM op
+              0x66668880, DDRC + 0x24, 0xFFFFFFFB,  # RMW: three words
               0x88888888, 0]
     img[0x2C:0x18C] = b'\0' * 0x160
     struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
@@ -538,6 +538,65 @@ def test_av100(qemu, tmp):
             qt.close()
 
 
+def test_av130(qemu, tmp):
+    print('ak3918av130: an AKH322LS header as the first AV130 dump has it, '
+          'tick timer, FIFO UART')
+    # As owner report r-5uwdebux's flash has it: magic AKH322LS, the payload
+    # from flash 0x200 (0x400 of secure-boot space, then U-Boot at 0x600) to
+    # 0x80DFFC00, so U-Boot lands at 0x80E00000; the script ends with the
+    # three-word read-modify-write that a pair-wise reading made a store to
+    # 0xFFFFFFFB.
+    code = [0xE1A00000, 0xEAFFFFFE]
+    img = bytearray(b'\xFF' * (8 << 20))
+    struct.pack_into('<I', img, 0, 0xEA000238)
+    img[4:12] = b'AKH322LS'
+    struct.pack_into('<I', img, 0x0C, 0x400 + 4 * len(code))
+    struct.pack_into('<I', img, 0x20, LOAD - 0x400)
+    script = [DDRC + 0x14, 0x00423E71,
+              0x66668881, DDRC + 0xA4, 0x10000,
+              DDRC + 0x24, 0x1,
+              0x66668882, 0x54535150,
+              0x66668880, DDRC + 0x24, 0xFFFFFFFB,
+              0x88888888, 0]
+    struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x200:0x600] = b'\0' * 0x400
+    struct.pack_into('<%dI' % len(code), img, 0x600, *code)
+    path = os.path.join(tmp, 'av130.bin')
+    open(path, 'wb').write(img)
+    out = os.path.join(tmp, 'av130-uart0.txt')
+    qt = QTest(qemu, 'ak3918av130,flash-file=%s' % path,
+               ['-serial', 'file:' + out])
+    try:
+        table = [qt.readl(0x28 + 4 * i) for i in range(9)]
+        check('script: poll, ROM op and RMW dropped, nothing at 0xFFFFFFFB',
+              table[:7] == [DDRC + 0x14, 0x00423E71, DDRC + 0x24, 0x1,
+                            0, 0, LOAD - 0x400], True)
+        check('U-Boot lands at 0x80E00000', qt.readl(LOAD), code[0])
+        qt.writel(0x80000000 + (128 << 20) - 4, 0x5AA5C33C)
+        check('128 MiB of RAM', qt.readl(0x80000000 + (128 << 20) - 4),
+              0x5AA5C33C)
+        tick = 0x21110000
+        qt.writel(tick + 0x00, 12000)           # a millisecond at 12 MHz
+        qt.writel(tick + 0x10, 1)
+        qt.writel(tick + 0x08, 1)
+        a = qt.readl(tick + 0x04)
+        qt.step(250000)                         # a quarter of it
+        qt.writel(tick + 0x08, 1)
+        b = qt.readl(tick + 0x04)
+        check('tick timer counts down 3000 in 250 us', a - b, 3000)
+        check('the latch bit self-clears', qt.readl(tick + 0x08) & 1, 0)
+        uart = 0x20130000
+        check('UART: never busy', qt.readl(uart + 0x18) & 4, 0)
+        for ch in b'OK':
+            qt.writel(uart + 0x0C, ch << 16)
+        check('UART: bits 23:16 of DATA go out', open(out, 'rb').read(),
+              b'OK')
+        check('UART: nothing received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
+              0)
+    finally:
+        qt.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -571,6 +630,7 @@ def main():
     make_image(path300l, b'AK_H322L')
     test_ev300l(args.qemu, path300l)
     test_av100(args.qemu, tmp)
+    test_av130(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
