@@ -870,6 +870,20 @@ loads the HDAL stack and `nvt_sen_sc401ai.ko`, and majestic starts. Boot
 still reaches the login prompt. Nothing past the sensor's registers is
 modelled: no MIPI receiver or ISP, so no frames.
 
+`sensor=imx415` puts a Sony IMX415 at 0x1A (0x34 8-bit), wired as on the
+XM IVG-N8S, and unlike the SmartSens parts it answers only while
+powered. Its XCLR comes from S_GPIO_1 (GPIO 65, the `id_0_rst_pin =
+0x41` of that board's `sen_imx415.cfg`), and its INCK from CG `CLK_EN0`
+bit 2, the SIE MCLK gate (`f0c00000.siemck`; `nvt-cg` gives each gate bit
+an out line, `clk-en`). It NACKs every address until both are high, and
+XCLR going low resets its registers. On a camera the vendor driver
+raises both in `sen_pwr_ctrl_imx415()` when the HDAL opens the sensor and
+drops XCLR at close, so the boot-time `ipcinfo --short-sensor` finds
+nothing. The OpenIPC release from 2026-11-14 boots to `set SENSOR as
+unknown`, as on the reporter's camera (OpenIPC/firmware#1889). A
+`load_novatek` that releases the reset pin and opens the clock gate
+before asking again gets `imx415`.
+
 `test-novatek-boot.sh` runs with `sensor=sc401ai` and checks three
 adapters, `i2cdetect` finding 0x30, and the release's own `ipcinfo`
 naming the part. `test-novatek.py` replays the driver's chunk sequences:

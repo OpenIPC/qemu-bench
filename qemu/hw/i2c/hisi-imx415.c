@@ -17,6 +17,14 @@
  *
  * Reference: ipctool/src/sensors.c detect_sony_sensor() lines 202-209
  *
+ * "power-gated" makes it answer only while powered, as on a camera: the
+ * named inputs "xclr" (its reset, active low) and "inck" (its master
+ * clock) must both be high, or every address phase is NACKed, and XCLR
+ * going low resets the registers.  Without it the part is always on, as
+ * the HiSilicon machines have always had it.  A Novatek board holds XCLR
+ * low until the vendor sensor driver powers the sensor, so software that
+ * probes before that finds nothing (OpenIPC/firmware#1889).
+ *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
  *
@@ -26,6 +34,9 @@
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/image-sensor.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include <math.h>
@@ -42,6 +53,9 @@ struct HisiIMX415State {
     uint8_t  reg_ptr;
     uint16_t cur_reg;
     uint8_t  regs[IMX415_REG_COUNT];
+    bool     power_gated;
+    bool     xclr;
+    bool     inck;
 };
 
 static void hisi_imx415_reset_regs(HisiIMX415State *s)
@@ -55,6 +69,10 @@ static int hisi_imx415_event(I2CSlave *i2c, enum i2c_event event)
 {
     HisiIMX415State *s = HISI_IMX415(i2c);
 
+    if (s->power_gated && (!s->xclr || !s->inck) &&
+        (event == I2C_START_SEND || event == I2C_START_RECV)) {
+        return -1;
+    }
     switch (event) {
     case I2C_START_SEND:
         s->reg_ptr = 0;
@@ -123,6 +141,31 @@ static void hisi_imx415_exposure(Object *sensor, ImageSensorExposure *e)
     e->height = 2160;
 }
 
+static void hisi_imx415_set_xclr(void *opaque, int n, int level)
+{
+    HisiIMX415State *s = opaque;
+
+    if (s->xclr && !level) {
+        hisi_imx415_reset_regs(s);
+    }
+    s->xclr = level;
+}
+
+static void hisi_imx415_set_inck(void *opaque, int n, int level)
+{
+    HISI_IMX415(opaque)->inck = level;
+}
+
+static void hisi_imx415_init(Object *obj)
+{
+    qdev_init_gpio_in_named(DEVICE(obj), hisi_imx415_set_xclr, "xclr", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), hisi_imx415_set_inck, "inck", 1);
+}
+
+static const Property hisi_imx415_properties[] = {
+    DEFINE_PROP_BOOL("power-gated", HisiIMX415State, power_gated, false),
+};
+
 static void hisi_imx415_reset(DeviceState *dev)
 {
     HisiIMX415State *s = HISI_IMX415(dev);
@@ -133,12 +176,30 @@ static void hisi_imx415_reset(DeviceState *dev)
     hisi_imx415_reset_regs(s);
 }
 
+static const VMStateDescription vmstate_hisi_imx415 = {
+    .name = TYPE_HISI_IMX415,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, HisiIMX415State),
+        VMSTATE_UINT8_ARRAY(reg_buf, HisiIMX415State, 2),
+        VMSTATE_UINT8(reg_ptr, HisiIMX415State),
+        VMSTATE_UINT16(cur_reg, HisiIMX415State),
+        VMSTATE_UINT8_ARRAY(regs, HisiIMX415State, IMX415_REG_COUNT),
+        VMSTATE_BOOL(xclr, HisiIMX415State),
+        VMSTATE_BOOL(inck, HisiIMX415State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void hisi_imx415_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, hisi_imx415_reset);
+    device_class_set_props(dc, hisi_imx415_properties);
+    dc->vmsd = &vmstate_hisi_imx415;
     k->event = hisi_imx415_event;
     k->recv  = hisi_imx415_recv;
     k->send  = hisi_imx415_send;
@@ -149,6 +210,7 @@ static const TypeInfo hisi_imx415_info = {
     .name          = TYPE_HISI_IMX415,
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(HisiIMX415State),
+    .instance_init = hisi_imx415_init,
     .class_init    = hisi_imx415_class_init,
     .interfaces    = (const InterfaceInfo[]) {
         { TYPE_IMAGE_SENSOR },

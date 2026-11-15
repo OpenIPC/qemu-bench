@@ -8,7 +8,11 @@
  *   0x00 PLL_EN          one bit per PLL
  *   0x04 PLL_STAT        lock status: reads back PLL_EN
  *   0x10 SYS_CLK_RATE    [1:0] CPU clock: 0 80 MHz, 1 PLL8, 2 480 MHz
- *   0x70..0x7C CLK_EN    gates; reset 0 would leave every block stopped
+ *   0x70..0x7C CLK_EN    gates; reset 0 would leave every block stopped.
+ *                        Each bit is also a GPIO line, "clk-en" n =
+ *                        (offset - 0x70) * 8 + bit, high while the gate is
+ *                        open -- for a device that needs a clock to
+ *                        answer at all, as a sensor needs its MCLK
  *   0x80..0x88 SYS_RESET 1 = out of reset.  Each bit is also a GPIO line,
  *                        "sys-reset" n = (offset - 0x80) * 8 + bit, high
  *                        while the block is held in reset: the clock
@@ -67,6 +71,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtCgState, NVT_CG)
 #define CG_SYS_RESET0       0x80
 #define CG_SYS_RESET2       0x88
 #define CG_RESET_LINES      96
+#define CG_CLK_EN_LINES     128
 
 #define CPU_CLK_SEL_PLL8    1
 
@@ -76,6 +81,7 @@ struct NvtCgState {
     MemoryRegion iomem;
     uint32_t regs[NVT_CG_SIZE / 4];
     qemu_irq sys_reset[CG_RESET_LINES];
+    qemu_irq clk_en[CG_CLK_EN_LINES];
     uint8_t layout;
     uint32_t sleep_reg;
 };
@@ -269,8 +275,19 @@ static void nvt_cg_write(void *opaque, hwaddr offset, uint64_t val,
         return;
     }
     s->regs[offset / 4] = val;
-    if (s->layout == CG_LAYOUT_NA51068 ||
-        offset < CG_SYS_RESET0 || offset > CG_SYS_RESET2) {
+    if (s->layout == CG_LAYOUT_NA51068) {
+        return;
+    }
+    if (offset >= CG_CLK_EN0 && offset <= CG_CLK_EN3) {
+        for (bit = 0; bit < 32; bit++) {
+            if (changed & (1u << bit)) {
+                line = (offset - CG_CLK_EN0) * 8 + bit;
+                qemu_set_irq(s->clk_en[line], !!(val & (1u << bit)));
+            }
+        }
+        return;
+    }
+    if (offset < CG_SYS_RESET0 || offset > CG_SYS_RESET2) {
         return;
     }
     for (bit = 0; bit < 32; bit++) {
@@ -321,6 +338,9 @@ static void nvt_cg_reset(DeviceState *dev)
     for (i = 0; i < CG_RESET_LINES; i++) {
         qemu_irq_lower(s->sys_reset[i]);
     }
+    for (i = 0; i < CG_CLK_EN_LINES; i++) {
+        qemu_irq_raise(s->clk_en[i]);
+    }
 }
 
 static void nvt_cg_realize(DeviceState *dev, Error **errp)
@@ -339,12 +359,35 @@ static void nvt_cg_init(Object *obj)
 
     qdev_init_gpio_out_named(DEVICE(obj), s->sys_reset, "sys-reset",
                              CG_RESET_LINES);
+    qdev_init_gpio_out_named(DEVICE(obj), s->clk_en, "clk-en",
+                             CG_CLK_EN_LINES);
+}
+
+/*
+ * The clk-en lines are levels, not state: drive them from the gates just
+ * loaded, or a clock the guest had gated stays at its reset-high level and
+ * a power-gated sensor on it answers again.
+ */
+static int nvt_cg_post_load(void *opaque, int version_id)
+{
+    NvtCgState *s = opaque;
+    int i;
+
+    if (s->layout == CG_LAYOUT_NA51068) {
+        return 0;
+    }
+    for (i = 0; i < CG_CLK_EN_LINES; i++) {
+        qemu_set_irq(s->clk_en[i],
+                     s->regs[CG_CLK_EN0 / 4 + i / 32] >> (i % 32) & 1);
+    }
+    return 0;
 }
 
 static const VMStateDescription vmstate_nvt_cg = {
     .name = TYPE_NVT_CG,
     .version_id = 2,
     .minimum_version_id = 2,
+    .post_load = nvt_cg_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtCgState, NVT_CG_SIZE / 4),
         VMSTATE_END_OF_LIST()

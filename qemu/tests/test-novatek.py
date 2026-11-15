@@ -4760,6 +4760,91 @@ def test_migration(qemu, tmp):
               'Assertion' not in out, True)
 
 
+def imx415_answers(qt):
+    """ipcinfo's probe: the sensor's 7-bit 0x1A, an empty write."""
+    sts = i2c_chunk(qt, 2, 0x1A << 1, start=True, stop=True)
+    if sts & I2C_BERR:
+        i2c_chunk(qt, 1, stop=True)             # i2c_nvtim_handle_nack()
+        return False
+    return True
+
+
+def monitor(sock_path, line):
+    """One HMP command on a -monitor unix socket; returns what it said."""
+    s = socket.socket(socket.AF_UNIX)
+    for _ in range(100):
+        try:
+            s.connect(sock_path)
+            break
+        except OSError:
+            time.sleep(0.05)
+    f = s.makefile('rw', buffering=1)
+    f.readline()                                # the banner
+    f.write(line + '\n')
+    f.flush()
+    out = ''
+    s.settimeout(5)
+    try:
+        while not out.rstrip().endswith('(qemu)') or line not in out:
+            out += f.read(1)
+    except socket.timeout:
+        pass
+    s.close()
+    return out
+
+
+def test_imx415_power(qemu, tmp):
+    """OpenIPC/firmware#1889: the XM IVG-N8S IMX415 answers only with XCLR
+    (S_GPIO 1) high and its INCK gate (CLK_EN0 bit 2) open, and keeps that
+    across a migration."""
+    print('IMX415 power gating (sensor=imx415)')
+    mon = os.path.join(tmp, 'imx415-mon.sock')
+    mig = os.path.join(tmp, 'imx415.mig')
+    bank, bit = 0x08, 1 << 1                    # S_GPIO 1: bank 2
+    qt = QTest(qemu, 'nt98566,sensor=imx415',
+               ['-monitor', 'unix:%s,server,nowait' % mon])
+    try:
+        qt.writel(I2C0 + 0x00, I2C_INTR_ALL)
+        check('held in reset: NACK', imx415_answers(qt), False)
+        qt.writel(GPIO + 0x20 + bank, bit)      # DIR: output
+        qt.writel(GPIO + 0x40 + bank, bit)      # SET: XCLR high
+        check('XCLR released, INCK on: ACK', imx415_answers(qt), True)
+        i2c_write(qt, 0x1A, [0x30, 0x24, 0x5A])
+        qt.writel(CG + 0x70, qt.readl(CG + 0x70) & ~(1 << 2))
+        check('its clock gated: NACK', imx415_answers(qt), False)
+        out = monitor(mon, 'migrate file:' + mig)
+        for _ in range(100):
+            if 'completed' in monitor(mon, 'info migrate'):
+                break
+            time.sleep(0.05)
+    finally:
+        qt.close()
+    os.unlink(mon)
+    qt = QTest(qemu, 'nt98566,sensor=imx415',
+               ['-monitor', 'unix:%s,server,nowait' % mon,
+                '-incoming', 'file:' + mig])
+    try:
+        for _ in range(100):
+            if 'running' in monitor(mon, 'info status'):
+                break
+            time.sleep(0.05)
+        check('migrated with the clock gated: still NACK',
+              imx415_answers(qt), False)
+        qt.writel(CG + 0x70, qt.readl(CG + 0x70) | (1 << 2))
+        check('the gate reopened: ACK', imx415_answers(qt), True)
+        i2c_write(qt, 0x1A, [0x30, 0x24], stop=False)
+        sts, data = i2c_read(qt, 0x1A, 1)
+        check('and the VMAX byte written before migration is kept',
+              data, b'\x5a')
+        qt.writel(GPIO + 0x60 + bank, bit)      # CLR: XCLR low
+        qt.writel(GPIO + 0x40 + bank, bit)
+        i2c_write(qt, 0x1A, [0x30, 0x24], stop=False)
+        sts, data = i2c_read(qt, 0x1A, 1)
+        check('an XCLR pulse resets it', data, b'\xff')
+    finally:
+        qt.close()
+
+
 def test_loader_models(qemu, tmp):
     """The real-loader boot's models: nvt-bootrom, nvt-ddrc, NA51055's
     release window, nvt-gzip and the FTTMR010's count-up mode."""
@@ -5412,6 +5497,7 @@ def run(args, tmp):
     test_nt98323_periph(args.qemu, tmp)
     test_adc_thermal(args.qemu, tmp)
     test_migration(args.qemu, tmp)
+    test_imx415_power(args.qemu, tmp)
 
     print('%d failure(s)' % failures)
     if failures:
