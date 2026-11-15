@@ -267,8 +267,9 @@ was at hand.  ³ AK3918AV100 (and KM01N) / AK3918AV100X (and KM01D), which
 differ only in DDR size: images built from the AnyCloud39AV100 SDK's U-Boot
 and 4.4.282 kernel (`ANYKA322` header, U-Boot at flash 0x600) boot to
 `login:`; no camera dump has been seen.  ⁴ AK3918AV130, from one camera's
-flash (an owner report on openipc.org): its U-Boot prints its banner and
-stops at the SPI flash controller, which is not modelled yet
+flash (an owner report on openipc.org): its U-Boot reads the kernel
+through the SPI flash controller and starts it; the kernel's interrupt
+controller and timer are not modelled yet
 ([docs/anyka.md](docs/anyka.md#ak3918av130)).
 
 ### SigmaStar / MStar family (`qemu-system-arm`)

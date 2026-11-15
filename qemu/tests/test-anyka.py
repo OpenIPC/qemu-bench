@@ -561,6 +561,8 @@ def test_av130(qemu, tmp):
     struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
     img[0x200:0x600] = b'\0' * 0x400
     struct.pack_into('<%dI' % len(code), img, 0x600, *code)
+    for i in range(0x10000, 0x10100):          # what the SFC reads back
+        img[i] = i * 7 & 0xFF
     path = os.path.join(tmp, 'av130.bin')
     open(path, 'wb').write(img)
     out = os.path.join(tmp, 'av130-uart0.txt')
@@ -597,10 +599,120 @@ def test_av130(qemu, tmp):
         qt.writel(uart + 0x18, 0x2500 | 0x40)
         check('UART: status 8/10/13 are write-1-to-clear, the rest stored',
               qt.readl(uart + 0x18), 0x40)
+        test_av130_sfc(qt)
         check('UART: nothing received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
               0)
     finally:
         qt.close()
+
+
+SFC = 0x20120000
+SFC_XIP = 0x30000000
+
+
+def sfc_bank(qt, n, op, iface, length=0, addr=0, mask=0, match=0):
+    b = SFC + 0x200 + 0x40 * n
+    qt.writel(b + 0x00, op)
+    qt.writel(b + 0x04, addr)
+    qt.writel(b + 0x18, mask)
+    qt.writel(b + 0x1C, match)
+    qt.writel(b + 0x20, iface)
+    qt.writel(b + 0x24, length)
+
+
+def sfc_run(qt, last, dma=False):
+    qt.writel(SFC + 0x180, last | (1 << 31) | ((1 << 30) if dma else 0))
+
+
+def test_av130_sfc(qt):
+    # The AV130 U-Boot's SFC v2 driver, as hw/ssi/ak-sfc.c models it.
+    qt.writel(SFC + 0x100, 1)
+    check('SFC: XIP stop acknowledged (0x100 bit 1)',
+          qt.readl(SFC + 0x100) & 2, 2)
+    qt.writel(SFC + 0x100, 0x10)
+    check('SFC: FIFO reset self-clears', qt.readl(SFC + 0x100) & 0x10, 0)
+    check('SFC: idle', qt.readl(SFC + 0xD0) & 0x20, 0x20)
+    qt.writel(SFC + 0xC0, 0x0504)
+    # RDID: 6 bytes clocked through the bank's data register, first 4 kept
+    sfc_bank(qt, 0, 0x9F, 0x10000440, 5 << 6)
+    sfc_run(qt, 0, dma=True)
+    check('SFC: RDID done (0x0D0 bit 4)', qt.readl(SFC + 0xD0) & 0x10, 0x10)
+    check('SFC: RDID in bank 0 +0x0C, first byte low',
+          qt.readl(SFC + 0x200 + 0x0C) & 0xFFFFFF, 0x1740C8)
+    qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: done is write-1-to-clear', qt.readl(SFC + 0xD0) & 0x10, 0)
+    check('SFC: start clears itself', qt.readl(SFC + 0x180) >> 31, 0)
+    # a FIFO read of 16 bytes from the pattern at 0x10000
+    qt.writel(SFC + 0x100, 0x10)
+    sfc_bank(qt, 0, 0x03, 0x4C0, 8 | (15 << 6), 0x10000)
+    sfc_run(qt, 0)
+    words = [qt.readl(SFC + 0x184) for _ in range(4)]
+    want = [struct.unpack_from('<I', bytes((0x10000 + i) * 7 & 0xFF
+                                           for i in range(16)), 4 * k)[0]
+            for k in range(4)]
+    check('SFC: FIFO read returns the flash, little-endian', words == want,
+          True)
+    check('SFC: an empty FIFO reads 0', qt.readl(SFC + 0x184), 0)
+    # WREN, then a FIFO page program: it waits for its bytes
+    sfc_bank(qt, 0, 0x06, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    sfc_bank(qt, 0, 0x02, 0x44C0, 8 | (7 << 6), 0x20000)
+    sfc_run(qt, 0)
+    check('SFC: a program waits for the FIFO', qt.readl(SFC + 0xD0) & 0x30, 0)
+    qt.writel(SFC + 0x184, 0x44332211)
+    qt.writel(SFC + 0x184, 0x88776655)
+    check('SFC: then completes', qt.readl(SFC + 0xD0) & 0x30, 0x30)
+    check('SFC: XIP window reads what was programmed',
+          (qt.readl(SFC_XIP + 0x20000), qt.readl(SFC_XIP + 0x20004)) ==
+          (0x44332211, 0x88776655), True)
+    qt.writel(SFC + 0xD0, 0x10)
+    # WREN, then a 4 KiB erase with an RDSR poll bank behind it
+    sfc_bank(qt, 0, 0x06, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    sfc_bank(qt, 0, 0x20, 0x100040C0, 8, 0x20000)
+    sfc_bank(qt, 1, 0x05, 0x18000040, 0, 0, 0xFFFFFFFE, 0)
+    sfc_run(qt, 1, dma=True)
+    check('SFC: erase and its status poll complete',
+          qt.readl(SFC + 0xD0) & 0x10, 0x10)
+    check('SFC: the sector reads erased', qt.readl(SFC_XIP + 0x20000),
+          0xFFFFFFFF)
+    qt.writel(SFC + 0xD0, 0x10)
+    # programs one after another, no FIFO reset between: the FIFO recycles
+    ok = True
+    for k in range(3):
+        sfc_bank(qt, 0, 0x06, 0x10004040)
+        sfc_run(qt, 0, dma=True)
+        qt.writel(SFC + 0xD0, 0x10)
+        sfc_bank(qt, 0, 0x02, 0x44C0, 8 | (5 << 6), 0x21000 + 0x10 * k)
+        sfc_run(qt, 0)
+        qt.writel(SFC + 0x184, 0xA0A0A000 | k)
+        qt.writel(SFC + 0x184, 0x0000B0B0)        # 6 bytes, 2 of padding
+        ok &= bool(qt.readl(SFC + 0xD0) & 0x10)
+        ok &= qt.readl(SFC_XIP + 0x21000 + 0x10 * k) == 0xA0A0A000 | k
+        ok &= qt.readl(SFC_XIP + 0x21004 + 0x10 * k) & 0xFFFF == 0xB0B0
+        qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: repeated FIFO programs, padding dropped', ok, True)
+    # 4-byte addressing (0xB7 ... 0xE9): the XIP window follows the NOR
+    sfc_bank(qt, 0, 0xB7, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    b4 = qt.readl(SFC_XIP + 0x10000)
+    sfc_bank(qt, 0, 0xE9, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: XIP reads right in 4-byte mode and after it',
+          (b4, qt.readl(SFC_XIP + 0x10000)) == (want[0], want[0]), True)
+    # a poll for a status the NOR never shows: busy, not done, until the
+    # FIFO reset abandons it
+    sfc_bank(qt, 0, 0x05, 0x18000040, 0, 0, 0xFFFFFFFE, 1)
+    sfc_run(qt, 0, dma=True)
+    check('SFC: a poll that never matches is not done',
+          qt.readl(SFC + 0xD0) & 0x30, 0)
+    qt.writel(SFC + 0x100, 0x10)
+    check('SFC: the FIFO reset abandons it', qt.readl(SFC + 0xD0) & 0x20,
+          0x20)
 
 
 def main():
