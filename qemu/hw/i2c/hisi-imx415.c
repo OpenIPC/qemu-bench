@@ -36,6 +36,7 @@
 #include "hw/i2c/image-sensor.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include <math.h>
@@ -175,6 +176,22 @@ static void hisi_imx415_reset(DeviceState *dev)
     hisi_imx415_reset_regs(s);
 }
 
+static const VMStateDescription vmstate_hisi_imx415 = {
+    .name = TYPE_HISI_IMX415,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, HisiIMX415State),
+        VMSTATE_UINT8_ARRAY(reg_buf, HisiIMX415State, 2),
+        VMSTATE_UINT8(reg_ptr, HisiIMX415State),
+        VMSTATE_UINT16(cur_reg, HisiIMX415State),
+        VMSTATE_UINT8_ARRAY(regs, HisiIMX415State, IMX415_REG_COUNT),
+        VMSTATE_BOOL(xclr, HisiIMX415State),
+        VMSTATE_BOOL(inck, HisiIMX415State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void hisi_imx415_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -182,6 +199,7 @@ static void hisi_imx415_class_init(ObjectClass *klass, const void *data)
 
     device_class_set_legacy_reset(dc, hisi_imx415_reset);
     device_class_set_props(dc, hisi_imx415_properties);
+    dc->vmsd = &vmstate_hisi_imx415;
     k->event = hisi_imx415_event;
     k->recv  = hisi_imx415_recv;
     k->send  = hisi_imx415_send;

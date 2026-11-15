@@ -363,10 +363,31 @@ static void nvt_cg_init(Object *obj)
                              CG_CLK_EN_LINES);
 }
 
+/*
+ * The clk-en lines are levels, not state: drive them from the gates just
+ * loaded, or a clock the guest had gated stays at its reset-high level and
+ * a power-gated sensor on it answers again.
+ */
+static int nvt_cg_post_load(void *opaque, int version_id)
+{
+    NvtCgState *s = opaque;
+    int i;
+
+    if (s->layout == CG_LAYOUT_NA51068) {
+        return 0;
+    }
+    for (i = 0; i < CG_CLK_EN_LINES; i++) {
+        qemu_set_irq(s->clk_en[i],
+                     s->regs[CG_CLK_EN0 / 4 + i / 32] >> (i % 32) & 1);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_nvt_cg = {
     .name = TYPE_NVT_CG,
     .version_id = 2,
     .minimum_version_id = 2,
+    .post_load = nvt_cg_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtCgState, NVT_CG_SIZE / 4),
         VMSTATE_END_OF_LIST()
