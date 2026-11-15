@@ -19,8 +19,13 @@
  * Entropy coding is CABAC when the PPS asks for it, which majestic's
  * Main-profile setting does.  The arithmetic coder and the residual block
  * coding follow x264 (encoder/cabac.c, common/cabac.c; x264 project,
- * GPL-2.0-or-later); the tables are in hantro-h264-tables.h.  CAVLC PPSs
- * are not supported yet.
+ * GPL-2.0-or-later); the tables are in hantro-h264-tables.h.
+ *
+ * Otherwise CAVLC (ITU-T H.264 9.2), which a Baseline PPS needs (Sofia's,
+ * on the second-generation XM53x).  Only two residual blocks ever occur:
+ * Intra16x16DCLevel, whose nC is always 0 -- its neighbours' 4x4 blocks
+ * carry no AC coefficients, cbp luma being 0 -- and ChromaDCLevel (nC -1).
+ * The VLC tables are the standard's (Tables 9-5, 9-7, 9-8, 9-9, 9-10).
  *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
@@ -29,6 +34,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/host-utils.h"
 #include "hantro-h264.h"
 #include "hantro-h264-tables.h"
 
@@ -232,6 +238,212 @@ typedef struct Cabac {
     int low, range, queue, outstanding;
     uint8_t *p, *start, *end;
 } Cabac;
+
+/* ---- CAVLC (9.2) ------------------------------------------------------- */
+
+/* coeff_token, 0 <= nC < 2 (Table 9-5), [TotalCoeff][TrailingOnes] */
+static const uint8_t ct_len0[17][4] = {
+    { 1 }, { 6, 2 }, { 8, 6, 3 }, { 9, 8, 7, 5 }, { 10, 9, 8, 6 },
+    { 11, 10, 9, 7 }, { 13, 11, 10, 8 }, { 13, 13, 11, 9 },
+    { 13, 13, 13, 10 }, { 14, 14, 13, 11 }, { 14, 14, 14, 13 },
+    { 15, 15, 14, 14 }, { 15, 15, 15, 14 }, { 16, 15, 15, 15 },
+    { 16, 16, 16, 15 }, { 16, 16, 16, 16 }, { 16, 16, 16, 16 },
+};
+static const uint8_t ct_bits0[17][4] = {
+    { 1 }, { 5, 1 }, { 7, 4, 1 }, { 7, 6, 5, 3 }, { 7, 6, 5, 3 },
+    { 7, 6, 5, 4 }, { 15, 6, 5, 4 }, { 11, 14, 5, 4 }, { 8, 10, 13, 4 },
+    { 15, 14, 9, 4 }, { 11, 10, 13, 12 }, { 15, 14, 9, 12 },
+    { 11, 10, 13, 8 }, { 15, 1, 9, 12 }, { 11, 14, 13, 8 },
+    { 7, 10, 9, 12 }, { 4, 6, 5, 8 },
+};
+/* coeff_token, 2 <= nC < 4 and 4 <= nC < 8 (Table 9-5) */
+static const uint8_t ct_len1[17][4] = {
+    { 2 }, { 6, 2 }, { 6, 5, 3 }, { 7, 6, 6, 4 }, { 8, 6, 6, 4 },
+    { 8, 7, 7, 5 }, { 9, 8, 8, 6 }, { 11, 9, 9, 6 }, { 11, 11, 11, 7 },
+    { 12, 11, 11, 9 }, { 12, 12, 12, 11 }, { 12, 12, 12, 11 },
+    { 13, 13, 13, 12 }, { 13, 13, 13, 13 }, { 13, 14, 13, 13 },
+    { 14, 14, 14, 13 }, { 14, 14, 14, 14 },
+};
+static const uint8_t ct_bits1[17][4] = {
+    { 3 }, { 11, 2 }, { 7, 7, 3 }, { 7, 10, 9, 5 }, { 7, 6, 5, 4 },
+    { 4, 6, 5, 6 }, { 7, 6, 5, 8 }, { 15, 6, 5, 4 }, { 11, 14, 13, 4 },
+    { 15, 10, 9, 4 }, { 11, 14, 13, 12 }, { 8, 10, 9, 8 },
+    { 15, 14, 13, 12 }, { 11, 10, 9, 12 }, { 7, 11, 6, 8 },
+    { 9, 8, 10, 1 }, { 7, 6, 5, 4 },
+};
+static const uint8_t ct_len2[17][4] = {
+    { 4 }, { 6, 4 }, { 6, 5, 4 }, { 6, 5, 5, 4 }, { 7, 5, 5, 4 },
+    { 7, 5, 5, 4 }, { 7, 6, 6, 4 }, { 7, 6, 6, 4 }, { 8, 7, 7, 5 },
+    { 8, 8, 7, 6 }, { 9, 8, 8, 7 }, { 9, 9, 8, 8 }, { 9, 9, 9, 8 },
+    { 10, 9, 9, 9 }, { 10, 10, 10, 10 }, { 10, 10, 10, 10 },
+    { 10, 10, 10, 10 },
+};
+static const uint8_t ct_bits2[17][4] = {
+    { 15 }, { 15, 14 }, { 11, 15, 13 }, { 8, 12, 14, 12 },
+    { 15, 10, 11, 11 }, { 11, 8, 9, 10 }, { 9, 14, 13, 9 },
+    { 8, 10, 9, 8 }, { 15, 14, 13, 13 }, { 11, 14, 10, 12 },
+    { 15, 10, 13, 12 }, { 11, 14, 9, 12 }, { 8, 10, 13, 8 },
+    { 13, 7, 9, 12 }, { 9, 12, 11, 10 }, { 5, 8, 7, 6 }, { 1, 4, 3, 2 },
+};
+/* coeff_token, nC == -1: chroma DC 4:2:0 */
+static const uint8_t ct_len_cdc[5][4] = {
+    { 2 }, { 6, 1 }, { 6, 6, 3 }, { 6, 7, 7, 6 }, { 6, 8, 8, 7 },
+};
+static const uint8_t ct_bits_cdc[5][4] = {
+    { 1 }, { 7, 1 }, { 4, 6, 1 }, { 3, 3, 2, 5 }, { 2, 3, 2, 0 },
+};
+/* total_zeros, 4x4 blocks (Tables 9-7, 9-8): [TotalCoeff - 1][total_zeros] */
+static const uint8_t tz_len[15][16] = {
+    { 1, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 9 },
+    { 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 6, 6, 6, 6 },
+    { 4, 3, 3, 3, 4, 4, 3, 3, 4, 5, 5, 6, 5, 6 },
+    { 5, 3, 4, 4, 3, 3, 3, 4, 3, 4, 5, 5, 5 },
+    { 4, 4, 4, 3, 3, 3, 3, 3, 4, 5, 4, 5 },
+    { 6, 5, 3, 3, 3, 3, 3, 3, 4, 3, 6 },
+    { 6, 5, 3, 3, 3, 2, 3, 4, 3, 6 },
+    { 6, 4, 5, 3, 2, 2, 3, 3, 6 },
+    { 6, 6, 4, 2, 2, 3, 2, 5 },
+    { 5, 5, 3, 2, 2, 2, 4 },
+    { 4, 4, 3, 3, 1, 3 },
+    { 4, 4, 2, 1, 3 },
+    { 3, 3, 1, 2 },
+    { 2, 2, 1 },
+    { 1, 1 },
+};
+static const uint8_t tz_bits[15][16] = {
+    { 1, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 1 },
+    { 7, 6, 5, 4, 3, 5, 4, 3, 2, 3, 2, 3, 2, 1, 0 },
+    { 5, 7, 6, 5, 4, 3, 4, 3, 2, 3, 2, 1, 1, 0 },
+    { 3, 7, 5, 4, 6, 5, 4, 3, 3, 2, 2, 1, 0 },
+    { 5, 4, 3, 7, 6, 5, 4, 3, 2, 1, 1, 0 },
+    { 1, 1, 7, 6, 5, 4, 3, 2, 1, 1, 0 },
+    { 1, 1, 5, 4, 3, 3, 2, 1, 1, 0 },
+    { 1, 1, 1, 3, 3, 2, 2, 1, 0 },
+    { 1, 0, 1, 3, 2, 1, 1, 1 },
+    { 1, 0, 1, 3, 2, 1, 1 },
+    { 0, 1, 1, 2, 1, 3 },
+    { 0, 1, 1, 1, 1 },
+    { 0, 1, 1, 1 },
+    { 0, 1, 1 },
+    { 0, 1 },
+};
+/* total_zeros, chroma DC 4:2:0 (Table 9-9a) */
+static const uint8_t tz_len_cdc[3][4] = {
+    { 1, 2, 3, 3 }, { 1, 2, 2 }, { 1, 1 },
+};
+static const uint8_t tz_bits_cdc[3][4] = {
+    { 1, 1, 1, 0 }, { 1, 1, 0 }, { 1, 0 },
+};
+/* run_before (Table 9-10): [min(zerosLeft, 7) - 1][run_before] */
+static const uint8_t rb_len[7][15] = {
+    { 1, 1 }, { 1, 2, 2 }, { 2, 2, 2, 2 }, { 2, 2, 2, 3, 3 },
+    { 2, 2, 3, 3, 3, 3 }, { 2, 3, 3, 3, 3, 3, 3 },
+    { 3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
+};
+static const uint8_t rb_bits[7][15] = {
+    { 1, 0 }, { 1, 1, 0 }, { 3, 2, 1, 0 }, { 3, 2, 1, 1, 0 },
+    { 3, 2, 3, 2, 1, 0 }, { 3, 0, 1, 3, 2, 5, 4 },
+    { 7, 6, 5, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+};
+
+/* residual_block_cavlc() for coefficients in scan order, coeff_token by
+ * nC (9.2.1): -1 the chroma DC table, 0-1, 2-3, 4-7, 8 and more the
+ * fixed-length code */
+static void cavlc_residual_nc(BitWriter *w, const int *c, int max, int nc);
+
+/* the same with nC 0 (see the file comment), or -1 for chroma_dc */
+static void cavlc_residual(BitWriter *w, const int *c, int max, bool chroma_dc)
+{
+    cavlc_residual_nc(w, c, max, chroma_dc ? -1 : 0);
+}
+
+static void cavlc_residual_nc(BitWriter *w, const int *c, int max, int nc)
+{
+    const bool chroma_dc = nc < 0;
+    int total = 0, t1 = 0, last = -1, i, n;
+    int lev[16], run[16];               /* nonzero coefficients, high first */
+
+    for (i = max - 1; i >= 0; i--) {
+        if (c[i]) {
+            if (last < 0) {
+                last = i;
+            }
+            lev[total] = c[i];
+            run[total] = 0;
+            total++;
+        } else if (total) {
+            run[total - 1]++;           /* zeros below that coefficient */
+        }
+    }
+    for (i = 0; i < total && i < 3 && abs(lev[i]) == 1; i++) {
+        t1++;
+    }
+    if (chroma_dc) {
+        bw_bits(w, ct_bits_cdc[total][t1], ct_len_cdc[total][t1]);
+    } else if (nc < 2) {
+        bw_bits(w, ct_bits0[total][t1], ct_len0[total][t1]);
+    } else if (nc < 4) {
+        bw_bits(w, ct_bits1[total][t1], ct_len1[total][t1]);
+    } else if (nc < 8) {
+        bw_bits(w, ct_bits2[total][t1], ct_len2[total][t1]);
+    } else {
+        bw_bits(w, total ? ((total - 1) << 2) | t1 : 3, 6);
+    }
+    if (!total) {
+        return;
+    }
+    for (i = 0; i < t1; i++) {
+        bw_bits(w, lev[i] < 0, 1);
+    }
+    int suffix_len = total > 10 && t1 < 3;
+    for (i = t1; i < total; i++) {
+        int code = lev[i] > 0 ? 2 * lev[i] - 2 : -2 * lev[i] - 1;
+
+        if (i == t1 && t1 < 3) {
+            code -= 2;
+        }
+        if (suffix_len == 0) {
+            if (code < 14) {
+                bw_bits(w, 1, code + 1);
+            } else if (code < 30) {
+                bw_bits(w, 1, 15);
+                bw_bits(w, code - 14, 4);
+            } else {
+                bw_bits(w, 1, 16);
+                bw_bits(w, MIN(code - 30, 4095), 12);
+            }
+        } else if (code < (15 << suffix_len)) {
+            bw_bits(w, 1, (code >> suffix_len) + 1);
+            bw_bits(w, code & ((1 << suffix_len) - 1), suffix_len);
+        } else {
+            bw_bits(w, 1, 16);
+            bw_bits(w, MIN(code - (15 << suffix_len), 4095), 12);
+        }
+        if (suffix_len == 0) {
+            suffix_len = 1;
+        }
+        if (abs(lev[i]) > (3 << (suffix_len - 1)) && suffix_len < 6) {
+            suffix_len++;
+        }
+    }
+    if (total < max) {
+        int tz = 0;
+        for (i = 0; i < last; i++) {
+            tz += c[i] == 0;
+        }
+        if (chroma_dc) {
+            bw_bits(w, tz_bits_cdc[total - 1][tz], tz_len_cdc[total - 1][tz]);
+        } else {
+            bw_bits(w, tz_bits[total - 1][tz], tz_len[total - 1][tz]);
+        }
+        int left = tz;
+        for (n = 0; n < total - 1 && left > 0; n++) {
+            const int t = MIN(left, 7) - 1;
+            bw_bits(w, rb_bits[t][run[n]], rb_len[t][run[n]]);
+            left -= run[n];
+        }
+    }
+}
 
 static void cabac_init(Cabac *c, int qp, uint8_t *p, uint8_t *end)
 {
@@ -563,8 +775,55 @@ static uint8_t src_c(Frame *f, int comp, int x, int y)
     return f->suv[y * f->scs + 2 * x + comp];
 }
 
-static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
-                      int qp, int qpc)
+/* reconstruct an I_16x16 DC macroblock exactly as a decoder (8.5.10-11) */
+static void recon_mb(Frame *f, int mx, int my, int pred, const int lev[16],
+                     int qp, int cpred[2][4], int clev[2][4], int qpc)
+{
+    int i, bx, by, x, y, comp;
+    int f16[16];
+    for (i = 0; i < 16; i++) {
+        f16[i] = lev[i];
+    }
+    hadamard4(f16);
+    const int ls = 16 * v00[qp % 6];
+    for (by = 0; by < 4; by++) {
+        for (bx = 0; bx < 4; bx++) {
+            const int fv = f16[by * 4 + bx];
+            const int d = qp >= 36 ? (fv * ls) << (qp / 6 - 6)
+                                   : (fv * ls + (1 << (5 - qp / 6))) >>
+                                     (6 - qp / 6);
+            const int r = (d + 32) >> 6;
+            for (y = 0; y < 4; y++) {
+                for (x = 0; x < 4; x++) {
+                    f->y[(my * 16 + by * 4 + y) * f->w + mx * 16 + bx * 4 + x] =
+                        clip1(pred + r);
+                }
+            }
+        }
+    }
+    const int lsc = 16 * v00[qpc % 6];
+    for (comp = 0; comp < 2; comp++) {
+        uint8_t *rp = comp ? f->cr : f->cb;
+        const int *l = clev[comp];
+        const int fc[4] = { l[0] + l[1] + l[2] + l[3], l[0] - l[1] + l[2] - l[3],
+                            l[0] + l[1] - l[2] - l[3], l[0] - l[1] - l[2] + l[3] };
+        for (i = 0; i < 4; i++) {
+            const int d = ((fc[i] * lsc) << (qpc / 6)) >> 5;
+            const int r = (d + 32) >> 6;
+            const int xo = (i & 1) * 4, yo = (i >> 1) * 4;
+            for (y = 0; y < 4; y++) {
+                for (x = 0; x < 4; x++) {
+                    rp[(my * 8 + yo + y) * (f->w / 2) + mx * 8 + xo + x] =
+                        clip1(cpred[comp][i] + r);
+                }
+            }
+        }
+    }
+}
+
+/* cw: write the macroblock with CAVLC there instead of CABAC to c */
+static void encode_mb(Frame *f, Cabac *c, BitWriter *cw, MbInfo *info,
+                      int mx, int my, int qp, int qpc)
 {
     MbInfo *me = &info[my * f->mbw + mx];
     const MbInfo *ma = mx ? &info[my * f->mbw + mx - 1] : NULL;
@@ -620,6 +879,26 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
     }
     const int cbp_chroma = chroma_nz ? 1 : 0;
 
+    int scan[16], nz = 0;
+    for (i = 0; i < 16; i++) {
+        scan[i] = lev[zigzag4x4[i]];
+        nz |= scan[i] != 0;
+    }
+    if (cw) {
+        /* mb_type I_16x16_2_<cbp chroma>_0 (Table 7-11): 1 + 2 + 4 * cbpc */
+        bw_ue(cw, 3 + 4 * cbp_chroma);
+        bw_ue(cw, 0);                                   /* chroma pred: DC */
+        bw_se(cw, 0);                                   /* mb_qp_delta */
+        cavlc_residual(cw, scan, 16, false);
+        for (comp = 0; comp < 2 && cbp_chroma; comp++) {
+            cavlc_residual(cw, clev[comp], 4, true);
+        }
+        if (!cbp_chroma) {
+            memset(clev, 0, sizeof(clev));
+        }
+        goto reconstruct;
+    }
+
     /* mb_type: I_16x16, pred DC (2), cbp luma 0, cbp chroma 0/1 */
     const int ctx0 = 3 + (ma != NULL) + (mb != NULL);
     cabac_decision(c, ctx0, 1);                         /* not I_NxN */
@@ -637,11 +916,6 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
     cabac_decision(c, 60, 0);                           /* mb_qp_delta = 0 */
 
     /* Intra16x16DCLevel, ctxBlockCat 0 */
-    int scan[16], nz = 0;
-    for (i = 0; i < 16; i++) {
-        scan[i] = lev[zigzag4x4[i]];
-        nz |= scan[i] != 0;
-    }
     const int cbf_a = ma ? ma->luma_dc_cbf : 1, cbf_b = mb ? mb->luma_dc_cbf : 1;
     cabac_decision(c, 85 + cbf_a + 2 * cbf_b, nz != 0);
     if (nz) {
@@ -673,46 +947,9 @@ static void encode_mb(Frame *f, Cabac *c, MbInfo *info, int mx, int my,
         memset(clev, 0, sizeof(clev));
     }
 
+reconstruct:
     /* reconstruct, exactly as a decoder (8.5.10, 8.5.11) */
-    int f16[16];
-    for (i = 0; i < 16; i++) {
-        f16[i] = lev[i];
-    }
-    hadamard4(f16);
-    const int ls = 16 * v00[qp % 6];
-    for (by = 0; by < 4; by++) {
-        for (bx = 0; bx < 4; bx++) {
-            const int fv = f16[by * 4 + bx];
-            const int d = qp >= 36 ? (fv * ls) << (qp / 6 - 6)
-                                   : (fv * ls + (1 << (5 - qp / 6))) >>
-                                     (6 - qp / 6);
-            const int r = (d + 32) >> 6;
-            for (y = 0; y < 4; y++) {
-                for (x = 0; x < 4; x++) {
-                    f->y[(my * 16 + by * 4 + y) * f->w + mx * 16 + bx * 4 + x] =
-                        clip1(pred + r);
-                }
-            }
-        }
-    }
-    const int lsc = 16 * v00[qpc % 6];
-    for (comp = 0; comp < 2; comp++) {
-        uint8_t *rp = comp ? f->cr : f->cb;
-        const int *l = clev[comp];
-        const int fc[4] = { l[0] + l[1] + l[2] + l[3], l[0] - l[1] + l[2] - l[3],
-                            l[0] + l[1] - l[2] - l[3], l[0] - l[1] - l[2] + l[3] };
-        for (i = 0; i < 4; i++) {
-            const int d = ((fc[i] * lsc) << (qpc / 6)) >> 5;
-            const int r = (d + 32) >> 6;
-            const int xo = (i & 1) * 4, yo = (i >> 1) * 4;
-            for (y = 0; y < 4; y++) {
-                for (x = 0; x < 4; x++) {
-                    rp[(my * 8 + yo + y) * (f->w / 2) + mx * 8 + xo + x] =
-                        clip1(cpred[comp][i] + r);
-                }
-            }
-        }
-    }
+    recon_mb(f, mx, my, pred, lev, qp, cpred, clev, qpc);
 }
 
 static size_t nal_wrap(uint8_t *out, size_t cap, int ref_idc, int type,
@@ -748,7 +985,7 @@ size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
     Cabac c;
     int mx, my;
 
-    if (!e->have_sps || !e->have_pps || !e->cabac || e->unsupported) {
+    if (!e->have_sps || !e->have_pps || e->unsupported) {
         return 0;
     }
     qp = MIN(MAX(qp, 0), 51);
@@ -791,29 +1028,487 @@ size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
         bw_se(&w, 0);
         bw_se(&w, 0);
     }
-    while (w.bits) {                                    /* cabac_alignment */
-        bw_bits(&w, 1, 1);
-    }
-
     f.y = g_malloc(f.w * f.h);
     f.cb = g_malloc(f.w * f.h / 4);
     f.cr = g_malloc(f.w * f.h / 4);
-    cabac_init(&c, qp, rbsp + w.n, rbsp + rbsp_cap);
     const int qpc = chroma_qp(qp, e->chroma_qp_offset);
+    size_t len;
+    if (e->cabac) {
+        while (w.bits) {                                /* cabac_alignment */
+            bw_bits(&w, 1, 1);
+        }
+        cabac_init(&c, qp, rbsp + w.n, rbsp + rbsp_cap);
+        for (my = 0; my < mbh; my++) {
+            for (mx = 0; mx < mbw; mx++) {
+                encode_mb(&f, &c, NULL, info, mx, my, qp, qpc);
+                if (mx == mbw - 1 && my == mbh - 1) {
+                    cabac_flush(&c);
+                } else {
+                    cabac_terminate0(&c);
+                }
+            }
+        }
+        len = c.p - rbsp;
+    } else {
+        for (my = 0; my < mbh; my++) {
+            for (mx = 0; mx < mbw; mx++) {
+                encode_mb(&f, NULL, &w, info, mx, my, qp, qpc);
+            }
+        }
+        bw_bits(&w, 1, 1);                              /* rbsp_stop_one_bit */
+        while (w.bits) {
+            bw_bits(&w, 0, 1);
+        }
+        len = MIN(w.n, rbsp_cap);
+    }
+    g_free(f.y);
+    g_free(f.cb);
+    g_free(f.cr);
+
+    return nal_wrap(out, cap, idr ? 3 : 2, idr ? 5 : 1, rbsp, len);
+}
+
+/* ---- slice data for engines whose drivers write the headers ------------ */
+
+/*
+ * Some engines (Grain Media's MCP280) have their driver pack the SPS, PPS
+ * and slice header through the hardware's bit writer and leave the slice
+ * data to the hardware.  These produce just that: the macroblock layer of
+ * one slice covering mbw x mbh macroblocks, ending with the slice's
+ * trailing bits, as the RBSP (no emulation prevention).  The slice is a
+ * picture of its own for intra prediction, as slices are.
+ */
+
+static void frame_setup(Frame *f, int mbw, int mbh, const uint8_t *y, int ys,
+                        const uint8_t *uv, int cs)
+{
+    *f = (Frame) { .mbw = mbw, .mbh = mbh, .w = mbw * 16, .h = mbh * 16,
+                   .sy = y, .suv = uv, .sys = ys, .scs = cs };
+    f->y = g_malloc(f->w * f->h);
+    f->cb = g_malloc(f->w * f->h / 4);
+    f->cr = g_malloc(f->w * f->h / 4);
+}
+
+static void frame_free(Frame *f)
+{
+    g_free(f->y);
+    g_free(f->cb);
+    g_free(f->cr);
+}
+
+size_t h264_slice_i16dc_cabac(int qp, int chroma_qp_offset, int mbw, int mbh,
+                              const uint8_t *y, int ys, const uint8_t *uv,
+                              int cs, uint8_t *out, size_t cap)
+{
+    g_autofree MbInfo *info = g_new0(MbInfo, mbw * mbh);
+    Frame f;
+    Cabac c;
+    int mx, my;
+
+    qp = MIN(MAX(qp, 0), 51);
+    frame_setup(&f, mbw, mbh, y, ys, uv, cs);
+    cabac_init(&c, qp, out, out + cap);
+    const int qpc = chroma_qp(qp, chroma_qp_offset);
     for (my = 0; my < mbh; my++) {
         for (mx = 0; mx < mbw; mx++) {
-            encode_mb(&f, &c, info, mx, my, qp, qpc);
+            encode_mb(&f, &c, NULL, info, mx, my, qp, qpc);
             if (mx == mbw - 1 && my == mbh - 1) {
+                cabac_flush(&c);            /* with the stop bit */
+            } else {
+                cabac_terminate0(&c);
+            }
+        }
+    }
+    frame_free(&f);
+    return c.p - out;
+}
+
+/*
+ * A P slice of nmb P_Skip macroblocks.  Only mb_skip_flag's first context
+ * (11; both neighbours skipped or absent) is used, initialised for the
+ * slice's cabac_init_idc (Table 9-13).
+ */
+size_t h264_slice_pskip_cabac(int qp, int cabac_init_idc, int nmb,
+                              uint8_t *out, size_t cap)
+{
+    static const int8_t skip_init[3][2] = { { 23, 33 }, { 22, 25 },
+                                            { 29, 16 } };
+    const int8_t *mn = skip_init[MIN(MAX(cabac_init_idc, 0), 2)];
+    Cabac c;
+    int i, st;
+
+    qp = MIN(MAX(qp, 0), 51);
+    cabac_init(&c, qp, out, out + cap);
+    st = MIN(MAX(((mn[0] * qp) >> 4) + mn[1], 1), 126);
+    c.state[11] = (MIN(st, 127 - st) << 1) | (st >> 6);
+    for (i = 0; i < nmb; i++) {
+        cabac_decision(&c, 11, 1);
+        if (i == nmb - 1) {
+            cabac_flush(&c);
+        } else {
+            cabac_terminate0(&c);
+        }
+    }
+    return c.p - out;
+}
+
+/*
+ * CAVLC residual of a block with at most one coefficient, at scan
+ * position 0: what the DC-of-DC coding below sends.  nc is 0 (luma DC of
+ * an I_16x16 neighbourhood with no AC) or -1 (chroma DC).
+ */
+static void cavlc_dc1(BitWriter *w, int level, bool chroma_dc)
+{
+    const int c[16] = { level };
+
+    cavlc_residual(w, c, chroma_dc ? 4 : 16, chroma_dc);
+}
+
+/*
+ * An I slice in CAVLC: every macroblock I_16x16 with DC prediction, its
+ * luma and chroma DC sent as their first (DC-of-DC) coefficient only, so
+ * each macroblock comes out as its mean.  The slice data starts
+ * bit_offset bits into a byte of the stream (byte alignment -- PCM's,
+ * the trailing bits' -- is the stream's): out's first byte holds that
+ * many unused bits, then the data, rbsp_slice_trailing_bits included, and
+ * the return is the bits out holds, the unused ones counted.
+ */
+size_t h264_slice_i16dc_cavlc(int qp, int chroma_qp_offset, int mbw, int mbh,
+                              const uint8_t *y, int ys, const uint8_t *uv,
+                              int cs, int bit_offset, uint8_t *out, size_t cap)
+{
+    BitWriter w = { .p = out, .cap = cap, .bits = bit_offset & 7 };
+    Frame f;
+    int mx, my, i, bx, by, x, yy, comp;
+
+    qp = MIN(MAX(qp, 0), 51);
+    frame_setup(&f, mbw, mbh, y, ys, uv, cs);
+    const int qpc = chroma_qp(qp, chroma_qp_offset);
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            int dc[16], lev[16] = { 0 }, cpred[2][4], clev[2][4] = { { 0 } };
+            const int pred = pred16_dc(&f, mx, my);
+
+            for (by = 0; by < 4; by++) {
+                for (bx = 0; bx < 4; bx++) {
+                    int s = 0;
+                    for (yy = 0; yy < 4; yy++) {
+                        for (x = 0; x < 4; x++) {
+                            s += src_y(&f, mx * 16 + bx * 4 + x,
+                                       my * 16 + by * 4 + yy) - pred;
+                        }
+                    }
+                    dc[by * 4 + bx] = s;
+                }
+            }
+            hadamard4(dc);
+            lev[0] = quant(dc[0] / 2, qp, 1);
+            lev[0] = MIN(MAX(lev[0], -2047), 2047);
+
+            for (comp = 0; comp < 2; comp++) {
+                uint8_t *rp = comp ? f.cr : f.cb;
+                int s = 0;
+                for (i = 0; i < 4; i++) {
+                    const int xo = (i & 1) * 4, yo = (i >> 1) * 4;
+                    cpred[comp][i] = predc_dc(rp, f.w / 2, mx, my, xo, yo);
+                    for (yy = 0; yy < 4; yy++) {
+                        for (x = 0; x < 4; x++) {
+                            s += src_c(&f, comp, mx * 8 + xo + x,
+                                       my * 8 + yo + yy) - cpred[comp][i];
+                        }
+                    }
+                }
+                clev[comp][0] = quant(s, qpc, 1);
+                clev[comp][0] = MIN(MAX(clev[comp][0], -2047), 2047);
+            }
+            const int cbpc = clev[0][0] || clev[1][0];
+
+            bw_ue(&w, 3 + 4 * cbpc);            /* I_16x16_2_cbpc_0 */
+            bw_ue(&w, 0);                       /* chroma pred: DC */
+            bw_se(&w, 0);                       /* mb_qp_delta */
+            cavlc_dc1(&w, lev[0], false);
+            if (cbpc) {
+                cavlc_dc1(&w, clev[0][0], true);
+                cavlc_dc1(&w, clev[1][0], true);
+            }
+            recon_mb(&f, mx, my, pred, lev, qp, cpred, clev, qpc);
+        }
+    }
+    frame_free(&f);
+    bw_bits(&w, 1, 1);                          /* rbsp_stop_one_bit */
+    while (w.bits) {
+        bw_bits(&w, 0, 1);
+    }
+    return w.n * 8;
+}
+
+/* A P slice of nmb P_Skip macroblocks in CAVLC; returns bits, as above. */
+size_t h264_slice_pskip_cavlc(int nmb, int bit_offset, uint8_t *out,
+                              size_t cap)
+{
+    BitWriter w = { .p = out, .cap = cap, .bits = bit_offset & 7 };
+
+    bw_ue(&w, nmb);                             /* mb_skip_run */
+    bw_bits(&w, 1, 1);
+    while (w.bits) {
+        bw_bits(&w, 0, 1);
+    }
+    return w.n * 8;
+}
+
+/*
+ * P slices that follow the picture: every macroblock that differs from
+ * the reference is sent as I_PCM, the rest as P_Skip.  PCM needs no
+ * prediction, so the decoder's picture is exactly the source wherever
+ * something changed -- and with nothing coded, edges between PCM and
+ * skipped macroblocks are not deblocked while the slice QP stays below
+ * 31 (their average QP picks a zero alpha).  ref is the picture the
+ * decoder holds for this slice's rows, as NV12 at stride w, and is
+ * updated to what it holds afterwards.
+ */
+static bool mb_differs(int mx, int my, int w, const uint8_t *y, int ys,
+                       const uint8_t *uv, int cs, const uint8_t *ry,
+                       const uint8_t *ruv)
+{
+    int r;
+
+    for (r = 0; r < 16; r++) {
+        if (memcmp(y + (my * 16 + r) * ys + mx * 16,
+                   ry + (my * 16 + r) * w + mx * 16, 16)) {
+            return true;
+        }
+    }
+    for (r = 0; r < 8; r++) {
+        if (memcmp(uv + (my * 8 + r) * cs + mx * 16,
+                   ruv + (my * 8 + r) * w + mx * 16, 16)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* the macroblock's PCM samples (Y, Cb, Cr), copied into ref as well */
+static void mb_pcm(int mx, int my, int w, const uint8_t *y, int ys,
+                   const uint8_t *uv, int cs, uint8_t *ry, uint8_t *ruv,
+                   uint8_t pcm[384])
+{
+    int r, x;
+
+    for (r = 0; r < 16; r++) {
+        memcpy(pcm + r * 16, y + (my * 16 + r) * ys + mx * 16, 16);
+        memcpy(ry + (my * 16 + r) * w + mx * 16, pcm + r * 16, 16);
+    }
+    for (r = 0; r < 8; r++) {
+        const uint8_t *s = uv + (my * 8 + r) * cs + mx * 16;
+
+        for (x = 0; x < 8; x++) {
+            pcm[256 + r * 8 + x] = s[2 * x];
+            pcm[320 + r * 8 + x] = s[2 * x + 1];
+        }
+        memcpy(ruv + (my * 8 + r) * w + mx * 16, s, 16);
+    }
+}
+
+size_t h264_slice_ppcm_cavlc(int mbw, int mbh, const uint8_t *y, int ys,
+                             const uint8_t *uv, int cs, uint8_t *ry,
+                             uint8_t *ruv, int bit_offset, uint8_t *out,
+                             size_t cap)
+{
+    BitWriter w = { .p = out, .cap = cap, .bits = bit_offset & 7 };
+    uint8_t pcm[384];
+    int mx, my, i, run = 0;
+
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            if (!mb_differs(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv)) {
+                run++;
+                continue;
+            }
+            bw_ue(&w, run);                     /* mb_skip_run */
+            run = 0;
+            bw_ue(&w, 5 + 25);                  /* I_PCM in a P slice */
+            while (w.bits) {
+                bw_bits(&w, 0, 1);              /* pcm_alignment_zero_bit */
+            }
+            mb_pcm(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv, pcm);
+            for (i = 0; i < 384; i++) {
+                bw_bits(&w, pcm[i], 8);
+            }
+        }
+    }
+    if (run) {
+        bw_ue(&w, run);
+    }
+    bw_bits(&w, 1, 1);
+    while (w.bits) {
+        bw_bits(&w, 0, 1);
+    }
+    return w.n * 8;
+}
+
+/* (m, n) of contexts 11-14 and 17 for P slices, by cabac_init_idc */
+static const int8_t p_ctx_init[3][5][2] = {
+    { { 23, 33 }, { 23, 2 }, { 21, 0 }, { 1, 9 }, { 5, 57 } },
+    { { 22, 25 }, { 34, 0 }, { 16, 0 }, { -2, 9 }, { 2, 65 } },
+    { { 29, 16 }, { 25, 0 }, { 14, 0 }, { -10, 51 }, { 26, 16 } },
+};
+
+size_t h264_slice_ppcm_cabac(int qp, int cabac_init_idc, int mbw, int mbh,
+                             const uint8_t *y, int ys, const uint8_t *uv,
+                             int cs, uint8_t *ry, uint8_t *ruv, uint8_t *out,
+                             size_t cap)
+{
+    static const int ctx_of[5] = { 11, 12, 13, 14, 17 };
+    const int8_t (*mn)[2] = p_ctx_init[MIN(MAX(cabac_init_idc, 0), 2)];
+    g_autofree bool *skipped = g_new0(bool, mbw * mbh);
+    uint8_t pcm[384];
+    Cabac c;
+    int mx, my, i;
+
+    qp = MIN(MAX(qp, 0), 51);
+    cabac_init(&c, qp, out, out + cap);
+    for (i = 0; i < 5; i++) {
+        const int st = MIN(MAX(((mn[i][0] * qp) >> 4) + mn[i][1], 1), 126);
+
+        c.state[ctx_of[i]] = (MIN(st, 127 - st) << 1) | (st >> 6);
+    }
+    for (my = 0; my < mbh; my++) {
+        for (mx = 0; mx < mbw; mx++) {
+            const bool last = mx == mbw - 1 && my == mbh - 1;
+            /* mb_skip_flag: one per neighbour present and not skipped */
+            const int inc = (mx && !skipped[my * mbw + mx - 1]) +
+                            (my && !skipped[(my - 1) * mbw + mx]);
+
+            if (!mb_differs(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv)) {
+                skipped[my * mbw + mx] = true;
+                cabac_decision(&c, 11 + inc, 1);
+            } else {
+                cabac_decision(&c, 11 + inc, 0);
+                cabac_decision(&c, 14, 1);      /* prefix: intra */
+                cabac_decision(&c, 17, 1);      /* not I_NxN */
+                cabac_flush(&c);                /* terminate 1: I_PCM */
+                mb_pcm(mx, my, mbw * 16, y, ys, uv, cs, ry, ruv, pcm);
+                for (i = 0; i < 384; i++) {
+                    cabac_put(&c, pcm[i]);
+                }
+                c.low = 0;                      /* the engine restarts */
+                c.range = 0x1fe;
+                c.queue = -9;
+                c.outstanding = 0;
+                c.start = c.p;
+            }
+            if (last) {
                 cabac_flush(&c);
             } else {
                 cabac_terminate0(&c);
             }
         }
     }
-    g_free(f.y);
-    g_free(f.cb);
-    g_free(f.cr);
+    return c.p - out;
+}
 
-    return nal_wrap(out, cap, idr ? 3 : 2, idr ? 5 : 1, rbsp,
-                    c.p - rbsp);
+#include "hantro-h264-inter.c.inc"
+
+/* The baseline SPS and PPS the SigmaStar encoder models put in front of an
+ * IDR (theirs is the firmware's, which is not run). */
+typedef struct H264HdrW {
+    uint8_t *p;
+    size_t n;       /* bytes, emulation prevention included */
+    uint32_t acc;
+    int bits, zeros;
+} H264HdrW;
+
+static void hdrw_byte(H264HdrW *b, uint8_t v)
+{
+    if (b->zeros >= 2 && v <= 3) {
+        b->p[b->n++] = 3;
+        b->zeros = 0;
+    }
+    b->p[b->n++] = v;
+    b->zeros = v ? 0 : b->zeros + 1;
+}
+
+static void hdrw_put(H264HdrW *b, uint32_t v, int n)
+{
+    while (n--) {
+        b->acc = b->acc << 1 | ((v >> n) & 1);
+        if (++b->bits == 8) {
+            hdrw_byte(b, b->acc);
+            b->acc = b->bits = 0;
+        }
+    }
+}
+
+static void hdrw_ue(H264HdrW *b, uint32_t v)
+{
+    int len = 32 - clz32(v + 1);
+
+    hdrw_put(b, 0, len - 1);
+    hdrw_put(b, v + 1, len);
+}
+
+static void hdrw_nal(H264HdrW *b, uint8_t head)
+{
+    static const uint8_t start[4] = { 0, 0, 0, 1 };
+
+    memcpy(b->p + b->n, start, 4);
+    b->n += 4;
+    b->p[b->n++] = head;
+    b->zeros = 0;
+}
+
+static void hdrw_trail(H264HdrW *b)
+{
+    hdrw_put(b, 1, 1);
+    while (b->bits) {
+        hdrw_put(b, 0, 1);
+    }
+}
+
+/* SPS and PPS for a w x h baseline stream; 128 bytes is plenty. */
+size_t h264_enc_baseline_headers(uint32_t w, uint32_t h, uint8_t *out)
+{
+    H264HdrW b = { .p = out };
+    uint32_t mbw = DIV_ROUND_UP(w, 16), mbh = DIV_ROUND_UP(h, 16);
+    uint32_t cropr = (mbw * 16 - w) / 2, cropb = (mbh * 16 - h) / 2;
+
+    hdrw_nal(&b, 0x67);
+    hdrw_put(&b, 66, 8);                  /* baseline */
+    hdrw_put(&b, 0xC0, 8);                /* constraint_set0, 1 */
+    hdrw_put(&b, 41, 8);                  /* level */
+    hdrw_ue(&b, 0);                       /* seq_parameter_set_id */
+    hdrw_ue(&b, 0);                       /* log2_max_frame_num - 4 */
+    hdrw_ue(&b, 2);                       /* pic_order_cnt_type */
+    hdrw_ue(&b, 1);                       /* max_num_ref_frames */
+    hdrw_put(&b, 0, 1);                   /* gaps */
+    hdrw_ue(&b, mbw - 1);
+    hdrw_ue(&b, mbh - 1);
+    hdrw_put(&b, 1, 1);                   /* frame_mbs_only */
+    hdrw_put(&b, 1, 1);                   /* direct_8x8 */
+    hdrw_put(&b, cropr || cropb, 1);
+    if (cropr || cropb) {
+        hdrw_ue(&b, 0);
+        hdrw_ue(&b, cropr);
+        hdrw_ue(&b, 0);
+        hdrw_ue(&b, cropb);
+    }
+    hdrw_put(&b, 0, 1);                   /* vui */
+    hdrw_trail(&b);
+
+    hdrw_nal(&b, 0x68);
+    hdrw_ue(&b, 0);                       /* pic_parameter_set_id */
+    hdrw_ue(&b, 0);                       /* seq_parameter_set_id */
+    hdrw_put(&b, 0, 1);                   /* CAVLC */
+    hdrw_put(&b, 0, 1);                   /* no bottom-field POC */
+    hdrw_ue(&b, 0);                       /* slice groups */
+    hdrw_ue(&b, 0);
+    hdrw_ue(&b, 0);
+    hdrw_put(&b, 0, 3);                   /* weighted prediction */
+    hdrw_ue(&b, 0);                       /* pic_init_qp - 26, se */
+    hdrw_ue(&b, 0);                       /* pic_init_qs */
+    hdrw_ue(&b, 0);                       /* chroma_qp_index_offset */
+    hdrw_put(&b, 1, 1);                   /* deblocking control present */
+    hdrw_put(&b, 0, 2);
+    hdrw_trail(&b);
+    return b.n;
 }

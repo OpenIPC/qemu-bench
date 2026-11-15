@@ -113,13 +113,29 @@ other in-tree user, `hw/arm/xlnx-zynqmp.c`, which wires none either),
 so register-level access works but interrupt-driven transfers do not
 -- a limitation of the upstream device, not introduced here.
 
-The remaining IP blocks -- ISP (`axera,proton`), NPU (`axera,npu`),
-I2C/SPI/watchdog, DWMAC Ethernet -- are named
+DWMAC Ethernet (`axera-eqos`, `hw/net/axera-eqos.c`), the DesignWare
+I2C controllers (`dw-i2c`), the watchdog (`axera-wdt`), and (AX630C/
+AX620E only) the on-chip RTC (`axera-rtc`, `hw/rtc/axera-rtc.c`, a real
+free-running clock, not a stub) are real, functional device models
+now -- not unimplemented stubs. `axera-eqos` is a full Synopsys DWC EQoS/
+dwmac-4.10a model (MAC/MTL/DMA register map, real RX/TX descriptor-ring
+DMA, QEMU netdev-backed), confirmed live with real end-to-end traffic
+on both platforms (DNS/DHCP/ARP/ICMP on AX620E; ARP/ONVIF WS-Discovery
+on AX620U) -- see "What is not here yet" below for the one thing it
+still can't do. AX620E has two `dw-i2c` buses and two `axera-wdt`
+instances (`/dev/watchdog0`/`watchdog1`, both real DT nodes); AX620U
+has ten `dw-i2c` controllers wired (matching its real dtsi), with its
+real OmniVision OS04A10 sensor (see sensor models, below) on bus 8.
+AX620U additionally has a real `cadence.sdhci` eMMC/SD controller (the
+same upstream model AX620E/AX630C use) and a passive `xhci-sysbus`
+USB3 instance with `hisi-regbank` OTG/device-mode register windows.
+
+ISP (`axera,proton`) and NPU (`axera,npu`) remain
 `create_unimplemented_device` regions at their real dtsi addresses (so
 `-d unimp` names the actual block a boot stage polls), with no register
-behaviour yet. ISP and NPU have no public driver source to ground a
-model in at all (see the licensing/source-availability notes above)
-and are not planned the same way as VENC/VDEC were.
+behaviour yet -- they have no public driver source to ground a model in
+at all (see the licensing/source-availability notes above) and are not
+planned the same way as VENC/VDEC were.
 
 ## Sources, and how AX620E/AX620U's addresses were confirmed
 
@@ -204,7 +220,27 @@ below.
   `.c` files, confirmed independently by a third-party audit in
   `sipeed/maix_ax620e_sdk` issue #2). Emulating their registers usefully
   would need that source or a register-level trace against real
-  silicon.
+  silicon. This gap is also why the real camera app's RTSP server never
+  completes an inbound connection on either AX620E or AX620U, even
+  though ethernet/TCP delivery itself is confirmed fully correct (SYN
+  packets arrive, checksums validate, interrupts fire and are
+  acknowledged, and the TCP handshake itself genuinely completes). This
+  was confirmed directly on both platforms, not just inferred: building
+  a working host gdb from source (the prebuilt cross-gdbs are broken on
+  this host) and attaching it to QEMU's own `-gdb` stub -- no in-guest
+  gdbserver needed, since the real rootfs's busybox has neither `tftp`
+  nor `nc`/`wget` compiled in on either platform -- hardware breakpoints
+  on the real App binary's `accept()`/`select()`/`listen()` PLT stubs
+  (it's a non-PIE `ET_EXEC` binary on both chips, so these are fixed,
+  known addresses) showed the app's own threads actively
+  `select()`-polling thousands of times a second while a real inbound
+  connection sat in the kernel's accept backlog -- `accept()` itself is
+  simply never called, identically on AX620E (aarch64) and AX620U
+  (32-bit ARM, a completely different cross-compiled binary). The app
+  is not hung; this one connection-acceptance path specifically never
+  executes, consistent with it being gated on video-pipeline health
+  that's never true here without real ISP/VPSS pixel data, though the
+  exact upstream gate was not pinned down.
 - **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both
   use a vendor spin-table (`secondary-boot-reg`), not PSCI. AX620U
   reuses QEMU's own generic `default_write_secondary()`
@@ -214,8 +250,15 @@ below.
   devicetree -- `-smp 4` brings all 4 CPUs online cleanly. AX620Q's own
   `secondary-boot-reg` address is not yet confirmed from any real
   source, so it still only boots CPU0.
-- **No sensor models.** AX630C's real board shape is HDMI-capture
-  (NanoKVM Pro); AX620E/AX620U's real deployed boards are Bayer-sensor IP
-  cameras (confirmed sensors: Smartsens SC450AI on the AX620E dump,
-  OmniVision OS04A10 on the AX620U dump) but no `sensor=` property or I2C
-  sensor models exist yet the way the HiSilicon machines have them.
+- **Sensor models exist for identification, not real pixel data.**
+  AX630C's real board shape is HDMI-capture (NanoKVM Pro); AX620E/AX620U's
+  real deployed boards are Bayer-sensor IP cameras. Both real sensors are
+  now modelled as I2C ID-register stubs, wired to their real I2C bus/
+  address: `hisi-smartsens` for AX620E's SmartSens SC450AI, and
+  `axera-ov-sensor` (`hw/i2c/axera-ov-sensor.c`) for AX620U's OmniVision
+  OS04A10 (slave address 0x36, chip ID 0x53/0x04/0x41 at register
+  0x300A, matching the vendor SDK's own `os04a10.c` exactly). Both let
+  the real camera app's sensor-probe/ID-read succeed and load its real
+  tuning files, but neither delivers actual pixel data -- there is still
+  no ISP/VPSS frame pipeline (see below), so the camera app's own video
+  path fails downstream of a successful sensor probe either way.

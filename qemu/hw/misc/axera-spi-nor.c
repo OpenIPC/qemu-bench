@@ -161,6 +161,36 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define AXERA_ENV_OFFSET        0x50000
 #define AXERA_ENV_SIZE          0x10000
 
+/*
+ * The "mtd" partition (last 0x60000 bytes per the real mtdparts=
+ * layout above, offset 0xfa0000-0x1000000) is the vendor userspace's
+ * jffs2-formatted writable Config area (mounted at /mnt/mtd). This
+ * dump's own real bytes in that whole range are a solid run of 0x00 --
+ * confirmed by scanning the entire 16MB dump in 64KB blocks: every
+ * other all-one-value block found is a trailing-padding gap just past
+ * a partition's real content (e.g. just past the "usr" squashfs image,
+ * which doesn't need to fill its whole partition), consistent with
+ * whatever tool assembled this flat image zero-filling space it had no
+ * real content for -- not a genuine SPI NOR erase state, which per the
+ * JEDEC/SPI-NOR convention (and this exact chip, GD25Q128BFI/
+ * GD25Q127C, confirmed via this dump's own "s_flashId"/"s_aFlashName"
+ * strings) is always 0xff (erase sets bits; program only clears them --
+ * see axera_spi_nor_cmd_byte()'s Page Program comment). Confirmed live:
+ * the real vendor init script's own `mount -t jffs2 /dev/mtdblock6
+ * /mnt/mtd` fails with "Input/output error" every single boot, because
+ * JFFS2's mount-time scan sees this all-zero range as neither a valid
+ * node nor a clean/erased block and bails out -- exactly what real
+ * hardware would also do if its Config partition's flash genuinely
+ * held 0x00 instead of 0xff, which is not a real erased-NOR state at
+ * all. Serving 0xff here instead of the dump's raw (almost certainly
+ * capture-artifact) zero bytes, until real erase/program activity
+ * touches this region, lets JFFS2 recognise it as blank and build a
+ * fresh empty filesystem on it -- exactly what it would do on
+ * genuinely virgin, never-before-configured real hardware.
+ */
+#define AXERA_MTD_CONFIG_OFFSET 0xfa0000
+#define AXERA_MTD_CONFIG_SIZE   0x60000
+
 static const char axera_env_vars[] =
     "baudrate=115200\0"
     "board=ax620q\0"
@@ -217,6 +247,7 @@ struct AxeraSpiNorState {
     unsigned int session_start_cmd_len;
     bool write_enable_latch;
     bool env_overridden;
+    bool mtd_config_overridden;
     uint8_t latched_opcode;
     uint32_t latched_addr;
 
@@ -352,6 +383,12 @@ static void axera_spi_nor_fixup_first_chunk_dest(AxeraSpiNorState *s,
  * flash-erase verification reads back address 0x50000 -- exactly
  * this boundary -- and fails forever otherwise, since the override
  * doesn't know erase/program ever touched real flash underneath it).
+ *
+ * Same idea, same reason, for [AXERA_MTD_CONFIG_OFFSET,
+ * AXERA_MTD_CONFIG_OFFSET+AXERA_MTD_CONFIG_SIZE) and
+ * mtd_config_overridden -- once JFFS2 actually erases/programs this
+ * region for real, serve what's really there instead of the synthetic
+ * all-ff "still virgin" default.
  */
 static void axera_spi_nor_mark_env_overridden(AxeraSpiNorState *s,
                                               uint32_t addr, uint32_t len)
@@ -359,6 +396,10 @@ static void axera_spi_nor_mark_env_overridden(AxeraSpiNorState *s,
     if (addr < AXERA_ENV_OFFSET + AXERA_ENV_SIZE &&
         addr + len > AXERA_ENV_OFFSET) {
         s->env_overridden = true;
+    }
+    if (addr < AXERA_MTD_CONFIG_OFFSET + AXERA_MTD_CONFIG_SIZE &&
+        addr + len > AXERA_MTD_CONFIG_OFFSET) {
+        s->mtd_config_overridden = true;
     }
 }
 
@@ -397,6 +438,7 @@ static void axera_spi_nor_cmd_byte(AxeraSpiNorState *s, uint8_t byte)
             if (s->write_enable_latch) {
                 memset(s->flash, 0xff, s->flash_size);
                 s->env_overridden = true;
+                s->mtd_config_overridden = true;
             }
             s->write_enable_latch = false;
             s->cmd_len = 0;
@@ -526,7 +568,13 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
             for (i = 0; i < total; i++) {
                 uint32_t addr = s->latched_addr + i;
 
-                rxq_push(s, addr < s->flash_size ? s->flash[addr] : 0xff);
+                if (!s->mtd_config_overridden &&
+                    addr >= AXERA_MTD_CONFIG_OFFSET &&
+                    addr < AXERA_MTD_CONFIG_OFFSET + AXERA_MTD_CONFIG_SIZE) {
+                    rxq_push(s, 0xff);
+                } else {
+                    rxq_push(s, addr < s->flash_size ? s->flash[addr] : 0xff);
+                }
             }
             if (!(s->mem[DW_SPI_DMACR / 4] & SPI_DMA_RDMAE)) {
                 axera_spi_nor_fixup_first_chunk_dest(s, total);
