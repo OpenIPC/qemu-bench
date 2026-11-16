@@ -2,7 +2,14 @@
  * SigmaStar / MStar BDMA (RIU bank 0x1002, 0x1F200400).
  *
  * Four byte-DMA channels, 0x20 RIU registers (0x80 bytes) apart
- * (drivers/sstar/bdma/infinity2m/kernel_bdma.h):
+ * (drivers/sstar/bdma/infinity2m/kernel_bdma.h).  On infinity6 and
+ * infinity6b0 they are 0x10 apart ("chan-regs"): those kernels put
+ * BDMA1 at bank 0x100220, BDMA2 at 0x100240 and BDMA3 at 0x100260
+ * (registers.h, GET_BASE_ADDR_BY_BANK doubles the offset), where
+ * infinity6e and 6c have 0x100240, 0x100280 and 0x1002C0.  msys_dma_fill
+ * runs on BDMA1 and waits for its interrupt, so with the wider spacing
+ * its writes land in channel 0's spare registers, nothing runs, and the
+ * first MI_RGN_Create on an ssc337 waits for ever.
  *
  *   +0x00 trigger (bit 0, self-clearing)
  *   +0x01 status, write 1 to clear: bit 1 busy, bit 2 interrupt,
@@ -31,6 +38,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
@@ -81,6 +89,7 @@ struct SstarBdmaState {
     SstarFspState *fsp;
     SstarXzdecState *xzdec;
     uint32_t addr_mask;     /* MIU addresses it reaches, 512 MiB by default */
+    uint32_t chan_regs;     /* RIU registers from one channel to the next */
     uint16_t regs[BDMA_NUM_CHAN][BDMA_CHAN_REGS];
     qemu_irq irq[BDMA_NUM_CHAN];
 };
@@ -185,7 +194,10 @@ static uint64_t sstar_bdma_read(void *opaque, hwaddr off, unsigned size)
     if ((off & 3) >= 2) {
         return 0;
     }
-    v = s->regs[reg / BDMA_CHAN_REGS][reg % BDMA_CHAN_REGS];
+    if (reg / s->chan_regs >= BDMA_NUM_CHAN) {
+        return 0;
+    }
+    v = s->regs[reg / s->chan_regs][reg % s->chan_regs];
     if (off & 1) {
         return v >> 8;
     }
@@ -197,11 +209,15 @@ static void sstar_bdma_write(void *opaque, hwaddr off, uint64_t val,
 {
     SstarBdmaState *s = opaque;
     int reg = (off >> 2) & 0x7F;
-    int ch = reg / BDMA_CHAN_REGS;
-    uint16_t *r = s->regs[ch];
+    int ch = reg / s->chan_regs;
+    uint16_t *r;
     uint16_t v = val;
 
-    reg %= BDMA_CHAN_REGS;
+    if (ch >= BDMA_NUM_CHAN) {
+        return;
+    }
+    r = s->regs[ch];
+    reg %= s->chan_regs;
     if ((off & 3) >= 2) {
         return;
     }
@@ -252,6 +268,16 @@ static void sstar_bdma_reset(DeviceState *dev)
     }
 }
 
+static void sstar_bdma_realize(DeviceState *dev, Error **errp)
+{
+    SstarBdmaState *s = SSTAR_BDMA(dev);
+
+    if (s->chan_regs < R_PATTERN_L + 2 || s->chan_regs > BDMA_CHAN_REGS) {
+        error_setg(errp, "sstar-bdma: chan-regs must be %d to %d",
+                   R_PATTERN_L + 2, BDMA_CHAN_REGS);
+    }
+}
+
 static void sstar_bdma_init(Object *obj)
 {
     SstarBdmaState *s = SSTAR_BDMA(obj);
@@ -267,6 +293,7 @@ static void sstar_bdma_init(Object *obj)
 
 static const Property sstar_bdma_props[] = {
     DEFINE_PROP_UINT32("addr-mask", SstarBdmaState, addr_mask, 0x1FFFFFFF),
+    DEFINE_PROP_UINT32("chan-regs", SstarBdmaState, chan_regs, BDMA_CHAN_REGS),
     DEFINE_PROP_LINK("fsp", SstarBdmaState, fsp, TYPE_SSTAR_FSP,
                      SstarFspState *),
     DEFINE_PROP_LINK("xzdec", SstarBdmaState, xzdec, TYPE_SSTAR_XZDEC,
@@ -290,6 +317,7 @@ static void sstar_bdma_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_legacy_reset(dc, sstar_bdma_reset);
     device_class_set_props(dc, sstar_bdma_props);
+    dc->realize = sstar_bdma_realize;
     dc->vmsd = &vmstate_sstar_bdma;
 }
 
