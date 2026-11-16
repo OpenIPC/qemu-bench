@@ -323,6 +323,74 @@ layouts (`media_gen = 5`; `docs/hisilicon-venc.md`, "V5").
   - AWB ends the warm light at -0 % / -1 % of G.
   - 1954 frames in 65 s (30.0 fps), no violations.
 
+## Audio (`hisi-aiao`)
+
+The EV200-class dies (Hi3516EV200 / EV300, Hi3518EV300, Hi3516DV200,
+GK7205V200 / V300, GK7202V300, GK7201V200) move audio through the AIAO at
+0x100e0000, SPI 42, the kernel's "AIO Interrupt". `aio.ko` programs it and
+`ai.ko` / `ao.ko` take the interrupt. Until this model, the EV200 machines
+left the window unmapped and the Goke V4 ones had a plain register bank.
+AI started, but no frame ever arrived.
+
+The register map comes from `aio.ko`'s HAL symbols. The values come from a
+lab GK7201V200 running majestic.
+
+| Offset | Register |
+|---|---|
+| +0x0000 | interrupt enable: bit n capture channel n, bit 16 + n playback |
+| +0x0004 | interrupt status, the same bits |
+| +0x0100 + 8n | capture channel n's clocks: NCO increment over 1800 MHz / 2^27 (bits 0-26), then the bit clock's divider (bits 0-3) and bit clocks a frame (bits 4-6) |
+| +0x0140 + 8n | the same for playback channel n |
+| +0x1000 + 0x100n | capture channel n; +0x2000 + 0x100n playback |
+| ch +0x00 | interface: sample width (bits 2-3), channel count (bits 4-5, 7) |
+| ch +0x04 | bit 28 start, bit 29 stopped |
+| ch +0x7c / +0x80 | ring address, high / low |
+| ch +0x84 / +0x88 / +0x8c / +0x94 | ring size, write pointer, read pointer, bytes an interrupt |
+| ch +0xa0 / +0xa4 / +0xa8 / +0xac | mask, raw, masked status, write-1-to-clear: bit 0 a transfer, bit 1 full (capture) or empty (playback) |
+
+The board and the twin compared under the same majestic (/proc/umap/ai and
+/ao, /proc/interrupts):
+
+| Rate | Capture | Playback | Board, interrupts a second | Twin |
+|---|---|---|---|---|
+| 8 kHz | 320 B / 20.0 ms, ring 1024 | 640 B / 40 ms | 75 | 73 |
+| 16 kHz | 640 B / 20.0 ms, ring 1920 | 640 B / 20 ms | 100 | 96 |
+| 48 kHz | 960 B / 9.9 ms, ring 2944 | 640 B / 6.7 ms | 250 | 229 |
+
+The twin's frame times match the board's to 1 %.
+
+- **Capture** is a 1 kHz sine (`-global hisi-aiao.tone=N`). It reaches the
+  RTSP track as a clean tone, at the 999.7 Hz peak.
+- **Playback** goes to an audiodev:
+  ```sh
+  -audiodev wav,id=a0,path=out.wav -global hisi-aiao.audiodev=a0
+  ```
+  With `-global hisi-aiao.mic=on`, capture channel 0 comes from the
+  audiodev too.
+- **A tone POSTed to majestic's `/play_audio`** comes out at its own pitch
+  and length. Afterwards the output holds the clip's last sample, because
+  the driver keeps refilling the ring with it. The board's ring reads
+  `0xF020F020` after the same clip.
+- **Timing.** Transfers keep their own schedule. The device catches up
+  whenever the driver reads a pointer or a status, or moves its pointer,
+  so a late timer costs latency, not samples.
+  - The H.265 encoder (`hisi-vedu`) works in the main loop. Under
+    majestic's default 1080p main stream plus substream, the main loop
+    runs audio timers 50 ms late at the median and up to 0.5 s late.
+  - majestic then sends about a quarter of the audio packets over RTSP,
+    although it takes all 50 frames a second from AI.
+  - With the video load down (360p at 5 fps, no substream) transfers are
+    on time (median 10 us) and RTSP carries 599 of 600 packets.
+  - `-global hisi-aiao.trace=on` logs every write and how late each
+    transfer landed.
+- **Switching capture from mono to stereo while it runs** behaves as on
+  the board, including how a streamer copes with a mono frame arriving
+  after stereo was asked for. A lab GK7201V200 and the twin fail the same
+  way on the same sequence of settings saves.
+
+`qemu/tests/test-hisi-aiao.py` checks the rings, rates and interrupts under
+qtest (CI).
+
 ## Open questions
 
 - **Which camera to twin and validate first:** an EV300 or GK7205V200

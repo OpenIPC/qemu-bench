@@ -254,6 +254,7 @@ cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-fmc.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-himci.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-regbank.c      "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-aiao.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-sfc350.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vedu.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vpss.c         "$QEMU_DIR/hw/misc/"
@@ -920,8 +921,9 @@ else
     echo "  hw/misc/Kconfig already patched"
 fi
 
-# shared coders for hisi-vedu: H.264 slices (H.265 slices, JPEG scans)
-for b in hantro-h264.c hevc-enc.c jpeg-enc.c; do
+# shared coders for hisi-vedu: H.264 slices (H.265 slices, JPEG scans);
+# hisi-aiao, the V4 audio DMA
+for b in hantro-h264.c hevc-enc.c jpeg-enc.c hisi-aiao.c; do
     if ! grep -q "CONFIG_HISI_MISC', if_true: files('$b')" \
             "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('$b'))" \

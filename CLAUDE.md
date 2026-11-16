@@ -88,6 +88,7 @@ python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpe
 python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wide sensors)
 python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
 python3 qemu/tests/test-hisi-sensor.py     # sensor timing: frame latching, group hold, fps, violations
+python3 qemu/tests/test-hisi-aiao.py       # V4 audio DMA: capture / playback rings, rates
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
