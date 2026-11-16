@@ -33,6 +33,10 @@
 #   - majestic brings the SDK up ("Ingenic SDK started");
 #   - with --audio, with the microphone on (audio.enabled: true), which a
 #     T40 build could not do before OpenIPC/majestic#257;
+#   - with --audio on t41, the speaker too: a 1 s 440 Hz tone POSTed to
+#     /play_audio comes out of the codec, all of it (OpenIPC/majestic#376:
+#     every frame was refused, and a clip shorter than the queue was
+#     silent);
 #   - 50 pictures of each RTSP stream decode (ffmpeg's own count, with no
 #     error), and /image.jpg is a JPEG of the main stream's size;
 #   - a setting written through the API reads back, and with --reboot it
@@ -87,6 +91,11 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+# The speaker too, on T41 only: the twin's T41 audio.ko plays and records
+# through its model, T40's stops recording after about a second, and with
+# its output on as well the T40 twin's streams stalled after a power cycle
+SPEAKER=false
+[ "$AUDIO" = true ] && [ "$SOC" = t41 ] && SPEAKER=true
 case $SOC in
 t40) MACHINE=t40,variant=t40n,sensor=gc4653; SENSOR=gc4653
      MEM="mem=64M rmem=64M@0x4000000"
@@ -156,6 +165,8 @@ insmod sinfo.ko
 echo 1 > /proc/jz/sinfo/info
 insmod tx-isp-t41.ko clk_name=mpll isp_clk=300000000 direct_mode=0
 insmod sensor_gc4663_t41.ko
+# as the same camera loads it: majestic drives the speaker's enable pin
+insmod audio.ko spk_gpio=-1 spk_level=-1
 EOF
     chmod 755 "$RFS/usr/bin/load_ingenic"
 fi
@@ -175,7 +186,7 @@ jpeg:
   enabled: true
 audio:
   enabled: $AUDIO
-  outputEnabled: false
+  outputEnabled: $SPEAKER
 nightMode:
   colorToGray: true
   irCutPin1: 122
@@ -241,12 +252,21 @@ QPID=
 # the last run's, and the checks would read its "Ingenic SDK started" and
 # go on against a camera still booting.
 rm -f "$WORK"/console.*.log
+# With --audio the speaker plays into a wav. QEMU writes its header only at
+# exit, so the checks read the samples after the 44-byte header themselves.
+AUDIODEV=
+AUDIOOUT=
+if [ "$SPEAKER" = true ]; then
+    AUDIODEV=,audiodev=snd
+    AUDIOOUT="-audiodev wav,id=snd,path=$WORK/speaker.wav"
+fi
 NBOOT=0
 boot() {
     NBOOT=$((NBOOT + 1))
     CON=$WORK/console.$NBOOT.log
     : > "$CON"
-    "$QEMU" -M "$MACHINE,flash-file=$WORK/nor.bin" -m 128M \
+    # shellcheck disable=SC2086  # AUDIOOUT: options, word-split
+    "$QEMU" -M "$MACHINE,flash-file=$WORK/nor.bin$AUDIODEV" -m 128M $AUDIOOUT \
         -global ingenic-isp.trace-regs=on -display none -serial file:"$CON" \
         -monitor unix:"$MON",server,nowait \
         -nic user,restrict=on,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
@@ -291,11 +311,13 @@ check() {       # check DESCRIPTION COMMAND...
 URL=rtsp://root:12345@127.0.0.1:$RTSP
 # decodes STREAM: 50 pictures by ffmpeg's own count, ffmpeg exiting 0 and
 # saying nothing at error level (bar the RTP timestamps it complains about
-# on any live stream)
+# on any live stream).  The video track only: -frames:v ends the video, and
+# with the microphone's track live too ffmpeg would read it until killed
 decodes() {
     local out rc=0 n err
-    out=$(timeout 180 ffmpeg -nostdin -v error -progress pipe:1 \
-        -rtsp_transport tcp -i "$URL/$1" -frames:v 50 -f null - \
+    out=$(timeout -k 10 180 ffmpeg -nostdin -v error -progress pipe:1 \
+        -rtsp_transport tcp -allowed_media_types video -i "$URL/$1" \
+        -frames:v 50 -f null - \
         2>"$WORK/ffmpeg.err") || rc=$?
     n=$(printf '%s\n' "$out" | sed -n 's/^frame=//p' | tail -1)
     err=$(grep -v 'non monotonically increasing dts' "$WORK/ffmpeg.err" || true)
@@ -308,7 +330,7 @@ decodes() {
 # /image.jpg: a JPEG, and the main stream's size
 snapshot() {
     local want got
-    want=$(timeout 60 ffprobe -v error -rtsp_transport tcp -select_streams v \
+    want=$(timeout -k 10 60 ffprobe -v error -rtsp_transport tcp -select_streams v \
         -show_entries stream=width,height -of csv=s=x:p=0 "$URL/stream=0")
     curl -s -m 60 -u root:12345 -o "$WORK/snap.jpg" \
         "http://127.0.0.1:$HTTP/image.jpg" || return 1
@@ -328,6 +350,41 @@ saved() {
         -H 'Content-Type: application/json' \
         -d "$SAVED" "http://127.0.0.1:$HTTP/api/v1/config" &&
         [ "$(api_get rtsp keyframeOnSkip)" = True ]
+}
+# No microphone check: the twin's T41 audio.ko refuses the first read now and
+# then (__ai_dev_read ret=-1) and no frame follows, and it records the tone
+# on the digital and the analogue device alike, so a check could neither
+# pass reliably nor tell the right device from the wrong one.
+# speaker: a 1 s 440 Hz tone POSTed to /play_audio comes out of the codec,
+# all of it -- the end of a clip is where frames went missing
+speaker() {
+    python3 -c 'import math, struct, sys
+sys.stdout.buffer.write(b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 440 * i / 8000))) for i in range(8000)))' \
+        > "$WORK/tone.pcm"
+    local from
+    from=$(stat -c %s "$WORK/speaker.wav")
+    curl -sf -m 60 -u root:12345 -o /dev/null --data-binary @"$WORK/tone.pcm" \
+        "http://127.0.0.1:$HTTP/play_audio" || return 1
+    sleep 5
+    python3 - "$WORK/speaker.wav" "$from" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+off = max(44, int(sys.argv[2]))
+off -= (off - 44) % 4
+x = struct.unpack('<%dh' % ((len(d) - off) // 2),
+                  d[off:off + (len(d) - off) // 2 * 2])[::2]
+r = 44100
+idx = [i for i, v in enumerate(x) if abs(v) > 200]
+if not idx:
+    print('    (speaker: silent)')
+    sys.exit(1)
+a, b = idx[0], idx[-1]
+s = x[a:b]
+z = sum(1 for i in range(1, len(s)) if (s[i - 1] < 0) != (s[i] < 0))
+hz = z / 2 / (len(s) / r)
+print('    (speaker: %.2f s at %.0f Hz)' % ((b - a) / r, hz))
+sys.exit(0 if (b - a) / r > 0.8 and 420 < hz < 460 else 1)
+PY
 }
 # night_is 0|1: majestic's own answer, from /metrics.  Not the console:
 # the console is the syslog mirrored by `logread -f`, which stops following
@@ -365,6 +422,10 @@ if grep -aq 'Ingenic SDK started' "$CON"; then
     check "the main stream decodes" decodes stream=0
     check "the second stream decodes" decodes stream=1
     check "/image.jpg is a JPEG of the main stream's size" snapshot
+    # The speaker on T41, whose SDK audio.ko the twin plays through
+    if [ "$SPEAKER" = true ]; then
+        check "/play_audio is heard" speaker
+    fi
     mark DAY
     sleep 10
     mark NIGHT

@@ -2354,6 +2354,17 @@ The checks:
   which OpenIPC/majestic#257 was about (the T40 build stopped at
   `IMP_AI_SetChnParam() failed`; a release from before the fix fails this
   check here the same way, and CI runs the test with `--audio`);
+- with `--audio` on `t41`, the speaker as well: `audio.ko spk_gpio=-1
+  spk_level=-1` is loaded as on the owner's T41NQ, the speaker plays into a
+  wav audiodev, and a 1 s 440 Hz tone POSTed to `/play_audio` must come out
+  for at least 0.8 s at 440 Hz. A build from before OpenIPC/majestic#376's
+  audio fix fails it: every frame refused, and the clip silent. There is no
+  microphone check: the twin's T41 `audio.ko` refuses the first read now and
+  then and nothing follows, and it records the tone on the digital and the
+  analogue input device alike, so a check could neither pass reliably nor
+  tell the right device from the wrong one. T40 keeps its speaker off: its
+  `audio.ko` stops recording after about a second, and with the output on
+  too its streams stalled after a power cycle;
 - 50 pictures of each RTSP stream decode -- ffmpeg's own count, exit
   status 0, nothing at error level -- and `/image.jpg` is a JPEG of the
   main stream's size;
