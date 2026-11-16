@@ -202,6 +202,8 @@ static const XmSoCConfig xm530_soc = {
     /* ...then programs PHY +0xA8 and waits for +0xB8 to echo it. */
     .ddrc_mirror        = 0x10B8,
     .ddrc_mirror_of     = 0x10A8,
+    /* 64 MB: ipcinfo --chip-name says xm530 */
+    .ddrc_bank_size     = 2,
     .gpio_base          = 0x10020000,
     /* dwc_otg.ko registers the platform device itself: the DWC2 OTG core
      * at 0x50300000, IRQ 76 (SPI 44), the same as the V200 series' xm_usb0.
@@ -228,6 +230,8 @@ static const XmSoCConfig *xm550_config(void)
         c = xm530_soc;
         c.desc = "Xiongmai XM550 (2x Cortex-A5 stand-in A9, GIC, 128 MB)";
         c.ram_size_default = 128 * MiB;
+        /* 128 MB: what makes ipcinfo --chip-name say xm550 */
+        c.ddrc_bank_size = 3;
     }
     return &c;
 }
@@ -1073,6 +1077,7 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             qdev_prop_set_array(ddrc, "mirror-reads", m);
             qdev_prop_set_array(ddrc, "mirror-of", mo);
         }
+        qdev_prop_set_uint32(ddrc, "bank-size", c->ddrc_bank_size);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(ddrc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(ddrc), 0, c->ddrc_base);
     }

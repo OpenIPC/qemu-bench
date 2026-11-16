@@ -64,6 +64,7 @@ typedef struct XmSoCConfig {
     uint32_t    ddrc_done[4];   /* xm-ddrc done-offsets */
     hwaddr      ddrc_mirror;    /* xm-ddrc: reads of this offset ... */
     hwaddr      ddrc_mirror_of; /* ... return this one; 0 = none */
+    uint32_t    ddrc_bank_size; /* xm-ddrc +0x1C at reset; 0 = none */
     /* Second generation: a uMCTL2 + PHY (xm-umctl2) instead; 0 = none. */
     hwaddr      umctl2_base;
 

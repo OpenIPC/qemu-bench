@@ -20,6 +20,12 @@
  * Such pairs are mirror-reads (status) / mirror-of (request), offsets from
  * the block base.
  *
+ * +0x001C holds the DDR bank size U-Boot programmed: 2 on the XM530's 64 MB,
+ * 3 on the XM550's 128 MB.  ipctool tells the two apart by it (the die and
+ * /proc/cpuinfo are the same), and so do the scripts that read
+ * `ipcinfo --chip-name`.  With -kernel no U-Boot writes it, so the machine
+ * gives it as bank-size.
+ *
  * Everything else is RAM-backed so the init's read-modify-writes survive.
  * DDR itself is plain RAM in QEMU, so there is nothing to train.
  *
@@ -43,6 +49,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmDdrcState, XM_DDRC)
 #define DDRC_STAT           0x0008
 #define DDRC_CMD            0x0040
 #define DDRC_CMD_BUSY       (1u << 31)
+#define DDRC_BANK_SIZE      0x001C
 
 struct XmDdrcState {
     SysBusDevice parent_obj;
@@ -52,6 +59,7 @@ struct XmDdrcState {
     uint32_t *done;
     uint32_t num_mirror, num_mirror_of;
     uint32_t *mirror, *mirror_of;
+    uint32_t bank_size;
 };
 
 static uint64_t xm_ddrc_read(void *opaque, hwaddr offset, unsigned size)
@@ -106,6 +114,7 @@ static void xm_ddrc_reset(DeviceState *dev)
     XmDdrcState *s = XM_DDRC(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->regs[DDRC_BANK_SIZE / 4] = s->bank_size;
 }
 
 static void xm_ddrc_init(Object *obj)
@@ -149,6 +158,7 @@ static const Property xm_ddrc_props[] = {
                       qdev_prop_uint32, uint32_t),
     DEFINE_PROP_ARRAY("mirror-of", XmDdrcState, num_mirror_of, mirror_of,
                       qdev_prop_uint32, uint32_t),
+    DEFINE_PROP_UINT32("bank-size", XmDdrcState, bank_size, 0),
 };
 
 static void xm_ddrc_class_init(ObjectClass *klass, const void *data)
