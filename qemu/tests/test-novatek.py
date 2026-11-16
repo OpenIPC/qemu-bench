@@ -441,7 +441,7 @@ def test_rtc(qt):
           qt.readl(RTC + 0x04) & 0xFFFF, 36524)
 
 
-def test_rtc_no_crystal(qemu):
+def test_rtc_no_crystal(qemu, qemu_aarch64):
     """rtc-crystal=off, as on the XM IVG-N8S (OpenIPC/firmware#2865): the
     RTC domain is unclocked, so the time stands still and a software reset
     or a CSET, once started, never completes."""
@@ -471,8 +471,36 @@ def test_rtc_no_crystal(qemu):
         check('no CSET done', qt.readl(RTC + 0x0C) & (1 << 8), 0)
         check('and no interrupt', gic_pending(qt, SPI_RTC), False)
         check('nothing committed', qt.readl(RTC + 0x00), t)
+        # A daily alarm a few seconds on never comes: the time stands still
+        qt.writel(RTC + 0x0C, 0xFFFFFFFF)
+        qt.writel(RTC + 0x08, 3)                    # 00:00:03
+        qt.writel(RTC + 0x10, qt.readl(RTC + 0x10) | 1)
+        qt.step(5000 * 1000 * 1000)
+        check('an alarm never goes off', qt.readl(RTC + 0x0C) & 1, 0)
+        check('and raises nothing', gic_pending(qt, SPI_RTC), False)
+        # plat-na51089/reset.c reboot: arm the power-on alarm, power off
+        resets = qt.readl(CG + 0x10) & 3
+        qt.writel(RTC + 0x18, 1 << 3)
+        qt.writel(RTC + 0x18, 1 << 1)
+        try:
+            qt.proc.wait(10)
+            off = True
+        except subprocess.TimeoutExpired:
+            off = False
+        check('power off with the alarm armed stays off: it cannot wake',
+              (off, qt.proc.returncode), (True, 0))
     finally:
         qt.close()
+    for machine, rtc, qemu_bin in (('nt98533', RTC, qemu),
+                                   ('nt98332', 0x2F0620000, qemu_aarch64)):
+        if not os.path.exists(qemu_bin):
+            continue
+        qt = QTest(qemu_bin, machine + ',rtc-crystal=off')
+        try:
+            check('%s: rtc-crystal=off reaches its RTC' % machine,
+                  qt.readl(rtc + 0x24) & 0xFF, 0)
+        finally:
+            qt.close()
 
 
 def test_uart(qt):
@@ -5532,7 +5560,7 @@ def run(args, tmp):
     test_adc_thermal(args.qemu, tmp)
     test_migration(args.qemu, tmp)
     test_imx415_power(args.qemu, tmp)
-    test_rtc_no_crystal(args.qemu)
+    test_rtc_no_crystal(args.qemu, args.qemu_aarch64)
 
     print('%d failure(s)' % failures)
     if failures:

@@ -32,7 +32,8 @@
  * stays set with STATUS bit 1 busy, CSET stays set and never raises CSET
  * done -- and with no battery the key and the oscillator setting read 0,
  * which the driver takes as an RTC to reset.  Its 1 s reset timeout then
- * fires at probe, and any wait without one spins.
+ * fires at probe, and any wait without one spins.  No alarm goes off, so
+ * a power-off with the power alarm armed stays off rather than resetting.
  *
  * Reboot goes through here (plat-na51089/reset.c): the kernel arms the
  * power-on alarm a few seconds ahead and powers the chip off, and the
@@ -193,7 +194,8 @@ static void nvt_rtc_rearm(NvtRtcState *s)
 {
     int64_t next = nvt_rtc_next_alarm(s, nvt_rtc_now(s));
 
-    if (next < 0) {
+    /* Unclocked, the time never reaches an alarm. */
+    if (next < 0 || !s->oscillator) {
         timer_del(s->alarm_timer);
         return;
     }
@@ -330,7 +332,8 @@ static void nvt_rtc_write(void *opaque, hwaddr offset, uint64_t val,
         }
         s->pwbc = val & PWBC_INTEN;
         if (val & PWBC_PWR_OFF) {
-            if (s->pwbcsts & PWBCSTS_ALM) {
+            /* An alarm that cannot tick never powers it back on. */
+            if ((s->pwbcsts & PWBCSTS_ALM) && s->oscillator) {
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             } else {
                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);

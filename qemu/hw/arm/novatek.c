@@ -2494,6 +2494,7 @@ static void novatek_ns02501_init(MachineState *machine,
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NS02501_IRQ_WDT]);
 
     dev = qdev_new("nvt-rtc");
+    qdev_prop_set_bit(dev, "oscillator", !nms->no_rtc_crystal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_RTC_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NS02501_IRQ_RTC]);
@@ -3434,6 +3435,7 @@ static void novatek_a64_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[m->irq_wdt]);
 
     dev = qdev_new("nvt-rtc");
+    qdev_prop_set_bit(dev, "oscillator", !nms->no_rtc_crystal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, m->rtc, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[m->irq_rtc]);
