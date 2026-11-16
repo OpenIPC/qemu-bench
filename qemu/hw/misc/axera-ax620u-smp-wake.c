@@ -54,9 +54,11 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
 #include "hw/misc/axera-ax620u-smp-wake.h"
+#include "hw/core/cpu.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraAx620uSmpWakeState, AXERA_AX620U_SMP_WAKE)
 
@@ -83,12 +85,53 @@ static uint64_t axera_ax620u_smp_wake_read(void *opaque, hwaddr offset,
     return val;
 }
 
+/* secondary-boot-reg's offset inside this 4 KiB window (0x02220300) */
+#define BOOTREG_OFF             0x300
+#define DRAM_BASE               0x40000000U
+
+static void axera_ax620u_smp_release_cpu(CPUState *cs, run_on_cpu_data data)
+{
+    /* An even address: ARM state, as the pen code expects. */
+    cpu_set_pc(cs, data.host_int);
+    cs->halted = 0;
+}
+
 static void axera_ax620u_smp_wake_write(void *opaque, hwaddr offset,
                                         uint64_t value, unsigned size)
 {
     AxeraAx620uSmpWakeState *s = opaque;
 
     memcpy(s->mem + offset, &value, size);
+    if (getenv("AXERA_SMP_DEBUG")) {
+        qemu_log("smp-wake: W [0x%03x] = 0x%08x by cpu %d\n", (unsigned)offset,
+                 (uint32_t)value, current_cpu ? current_cpu->cpu_index : -1);
+    }
+
+    /*
+     * The Linux side of this spin table (vendor mach-axera/platsmp.c,
+     * ax620x_smp_prepare_cpus()) writes the physical address of
+     * secondary_holding_pen here exactly once, then SEVs, and
+     * boot_secondary() gives each core 2 s to show up in that pen.
+     * Under flash-file= the secondaries are still parked in the real
+     * BL1/boot code, and how long they take to get from there to the
+     * pen depends on timing: in many boots some or all of them arrive
+     * after their window and stay offline ("CPUn: failed to boot:
+     * -38"). A guest left on one CPU then starves its camera App into
+     * an mmap_sem pile-up. Do what the park loop is there to do, at
+     * the moment the kernel asks: send every secondary straight to the
+     * pen (MMU off, privileged, as they already are). The pen then
+     * waits for pen_release/the wake IPI exactly as on hardware.
+     */
+    if (offset == BOOTREG_OFF && size == 4 && (uint32_t)value >= DRAM_BASE) {
+        CPUState *cs;
+
+        CPU_FOREACH(cs) {
+            if (cs->cpu_index != 0) {
+                async_run_on_cpu(cs, axera_ax620u_smp_release_cpu,
+                                 RUN_ON_CPU_HOST_INT((uint32_t)value));
+            }
+        }
+    }
 }
 
 static const MemoryRegionOps axera_ax620u_smp_wake_ops = {

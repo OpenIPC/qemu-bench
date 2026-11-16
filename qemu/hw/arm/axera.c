@@ -1693,8 +1693,10 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         DeviceState *smpreg = qdev_new(TYPE_AXERA_AX620U_SMP_WAKE);
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(smpreg), &error_fatal);
+        /* Priority 2: the "axera-clk-common" regbank mapped later at
+         * 0x02220000 (64 KiB) would otherwise shadow this window. */
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(smpreg), 0,
-                                c->smp_bootreg_addr & ~0xfffULL, 1);
+                                c->smp_bootreg_addr & ~0xfffULL, 2);
         /* The three per-core ack words themselves, 0x1329c (see
          * hw/misc/axera-ax620u-smp-wake.c's own comment) -- overlaid
          * on top of boot_sram's plain storage below. */
