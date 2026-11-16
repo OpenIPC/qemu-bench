@@ -3513,6 +3513,29 @@ def test_i6b0_audio_out(qemu, tmp):
         qt.writew(rd, qt.readw(rd) | 0x4000)
         qt.writew(rd, qt.readw(rd) & ~0x4000)
         check('reset: the level is gone', level(), 0)
+
+        # a clear pulse on a dry running reader, with nothing read after it
+        qt.writew(ctl0, 0x0400 | 0x0002)        # EMPTY enabled only
+        qt.writew(rd, qt.readw(rd) | 0x8000)
+        qt.writew(ctl0, qt.readw(ctl0) | 0x0100)
+        qt.writew(ctl0, qt.readw(ctl0) & ~0x0100)
+        check('cleared while dry, no read after: the line is back up',
+              intc_raw(qt, 42), 1)
+        qt.writew(ctl0, 0)
+        qt.writew(rd, 0x4000)
+        qt.writew(rd, 0x0000)
+
+        # set up in the other order: run and TRIG first, the size last
+        qt.writew(bach + 0x43 * 4, 0)
+        qt.writew(rd, 0x8000)
+        trig(0)
+        qt.writew(bach + 0x44 * 4, 512 // 8)
+        qt.writew(rd, qt.readw(rd) ^ 0x2000)    # 512 bytes, but no buffer
+        qt.writew(bach + 0x43 * 4, 2048 // 8)   # the size arrives
+        trig(1024 // 8)
+        qt.step(20 * 10 ** 6)
+        check('size written last: it still drains (16 kHz, 640 bytes in '
+              '20 ms)', level(), 128 - 80)
     finally:
         qt.close()
     qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
@@ -3526,6 +3549,12 @@ def test_i6b0_audio_out(qemu, tmp):
         qt.writew(b1 + 0x00 * 4, 1)
         check('infinity6e keeps BDMA1 0x20 registers on',
               qt.readl(DRAM + 0x100000), 0x5A5A5A5A)
+        bach = riu(0x1502, 0)
+        qt.writew(bach + 0x47 * 4, 0x1234)
+        qt.writew(bach + 0x41 * 4, 0x8000 | 0x2000)
+        check('infinity6e: no reader, its registers are storage',
+              (qt.readw(bach + 0x47 * 4), qt.readw(bach + 0x48 * 4) & 0x1C),
+              (0x1234, 0))
     finally:
         qt.close()
 

@@ -2262,10 +2262,15 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         /* mi_ai reads the ring as two interleaved channels */
         qdev_prop_set_uint32(dev, "channels", 2);
         qdev_prop_set_uint32(dev, "rate", 64000);
-        /* mi_ao's reader, DMA 1: run against an ssc337's driver */
-        qdev_prop_set_bit(dev, "playback", true);
-        if (machine->audiodev) {
-            qdev_prop_set_string(dev, "audiodev", machine->audiodev);
+        /*
+         * mi_ao's reader, DMA 1: run against an ssc337's driver. Not on
+         * infinity6e, whose AO has not been: the registers stay storage.
+         */
+        if (c->die == SS_DIE_INFINITY6 || c->die == SS_DIE_INFINITY6B0) {
+            qdev_prop_set_bit(dev, "playback", true);
+            if (machine->audiodev) {
+                qdev_prop_set_string(dev, "audiodev", machine->audiodev);
+            }
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SSTAR_RIU_ADDR(0x1502, 0));

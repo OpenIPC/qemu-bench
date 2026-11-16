@@ -258,11 +258,15 @@ static void bach_voice(SstarBachState *s)
             .endianness = 0,
         };
 
+        /*
+         * What is queued stays queued: it has left the DMA ring, so
+         * dropping it here would lose it.  A rate change mid-clip plays
+         * its last few milliseconds at the new rate.
+         */
         s->vout = AUD_open_out(s->audio_be, NULL, "sstar-bach.out", s,
                                bach_out_cb, &as);
         s->voice_rate = rate;
         s->voice_chans = chans;
-        s->out_head = s->out_len = 0;
     }
     if (s->vout) {
         AUD_set_active_out(s->vout, on);
@@ -464,6 +468,15 @@ static void bach_tick(void *opaque)
     }
 }
 
+/* the tick runs while a channel can move data, whatever order it was set up */
+static void bach_kick(SstarBachState *s)
+{
+    if ((((s->regs[AI_ADDR_LO] & AI_RUN) && bach_size(s)) ||
+         (rd_running(s) && s->rd_level)) && !timer_pending(s->tick)) {
+        timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TICK_NS);
+    }
+}
+
 static uint64_t sstar_bach_read(void *opaque, hwaddr off, unsigned size)
 {
     SstarBachState *s = opaque;
@@ -544,13 +557,10 @@ static void sstar_bach_write(void *opaque, hwaddr off, uint64_t val,
             s->regs[RD_LEVEL] = rd_level_units(s);
         }
         bach_voice(s);
-        if (rd_running(s) && s->rd_level) {
-            timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      TICK_NS);
-        }
         break;
     case SR0_SEL:
     case TEST_CTRL7:
+    case RD_BUF_SIZE:
         if (s->playback) {
             bach_voice(s);
         }
@@ -572,7 +582,12 @@ static void sstar_bach_write(void *opaque, hwaddr off, uint64_t val,
         }
         break;
     }
+    if (s->playback) {
+        /* RD_EMPTY latches again as soon as its clear falls */
+        rd_sync(s);
+    }
     bach_update(s);
+    bach_kick(s);
 }
 
 static const MemoryRegionOps sstar_bach_ops = {
@@ -644,10 +659,31 @@ static const Property sstar_bach_props[] = {
     DEFINE_AUDIO_PROPERTIES(SstarBachState, audio_be),
 };
 
+static int sstar_bach_post_load(void *opaque, int version_id)
+{
+    SstarBachState *s = opaque;
+
+    if (version_id < 2) {
+        /* from before the reader: nothing queued, nothing played */
+        rd_init(s);
+        s->rd_empty = false;
+        s->out_head = s->out_len = 0;
+    }
+    if (s->out_head >= OUT_RING || s->out_len > OUT_RING ||
+        (rd_size(s) && s->rd_ptr >= rd_size(s))) {
+        return -EINVAL;
+    }
+    /* the host voice is not state: open it for a running reader */
+    bach_voice(s);
+    bach_kick(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_sstar_bach = {
     .name = TYPE_SSTAR_BACH,
     .version_id = 2,
-    .minimum_version_id = 2,
+    .minimum_version_id = 1,
+    .post_load = sstar_bach_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, SstarBachState, BACH_REGS),
         VMSTATE_UINT32(level, SstarBachState),
@@ -655,10 +691,13 @@ static const VMStateDescription vmstate_sstar_bach = {
         VMSTATE_UINT64(sample, SstarBachState),
         VMSTATE_INT64(last, SstarBachState),
         VMSTATE_TIMER_PTR(tick, SstarBachState),
-        VMSTATE_UINT32(rd_level, SstarBachState),
-        VMSTATE_UINT32(rd_ptr, SstarBachState),
-        VMSTATE_INT64(rd_t, SstarBachState),
-        VMSTATE_BOOL(rd_empty, SstarBachState),
+        VMSTATE_UINT32_V(rd_level, SstarBachState, 2),
+        VMSTATE_UINT32_V(rd_ptr, SstarBachState, 2),
+        VMSTATE_INT64_V(rd_t, SstarBachState, 2),
+        VMSTATE_BOOL_V(rd_empty, SstarBachState, 2),
+        VMSTATE_UINT8_ARRAY_V(out, SstarBachState, OUT_RING, 2),
+        VMSTATE_UINT32_V(out_head, SstarBachState, 2),
+        VMSTATE_UINT32_V(out_len, SstarBachState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
