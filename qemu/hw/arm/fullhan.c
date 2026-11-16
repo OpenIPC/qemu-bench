@@ -284,7 +284,12 @@ static const FhSoCConfig fh8856v100_soc = {
     FH885X_V100_COMMON,
     .desc               = "Fullhan FH8856 (ARM1176JZF-S, 128 MB DDR)",
     .ram_size_default   = 128 * MiB,
-    .ip_ver             = 0xD,
+    /*
+     * As two FH8856 V100 cameras (Vatilon IF56N) read it: fh_chipid.c
+     * matches the low nibble, 0xD, and prints the whole word as pkg_id
+     * (OpenIPC/firmware#1610).
+     */
+    .ip_ver             = 0x7840D,
     .ddr_mbit           = 1024,
 };
 
