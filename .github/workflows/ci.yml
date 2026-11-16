@@ -1782,11 +1782,13 @@ jobs:
           --mode ${{ matrix.mode }} --net
           ${{ matrix.soc == 't40' && matrix.mode == 'kernel' && '--reset' || '' }}
 
-  # docs/ingenic.md, "majestic on T40": the release's majestic starts the
-  # SDK with the microphone on (OpenIPC/majestic#257), a light sensor
-  # switches it to night and back, and the night settings reach the ISP
+  # docs/ingenic.md, "majestic on T40 and T41": the release's majestic
+  # starts the SDK with the microphone on (OpenIPC/majestic#257), its RTSP
+  # streams and snapshot decode, a light sensor switches it to night and
+  # back, the night settings reach the ISP, and a saved setting survives a
+  # power cycle.  The T41 run needs the SDK, which is not public.
   majestic-ingenic:
-    name: majestic on t40 (audio, day/night)
+    name: majestic on t40 (audio, day/night, power cycle)
     needs: [select, build]
     if: fromJSON(needs.select.outputs.jobs)['majestic-ingenic']
     runs-on: ubuntu-24.04
@@ -1808,10 +1810,33 @@ jobs:
       - name: Make QEMU executable
         run: chmod +x qemu-src/build/qemu-system-mipsel
 
-      - name: majestic, audio, day and night
-        timeout-minutes: 10
+      - name: ffmpeg cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-btbn-lgpl-v1
+
+      - name: ffmpeg
+        timeout-minutes: 20
+        run: |
+          if ! ffmpeg-static/ffmpeg -version >/dev/null 2>&1; then
+            rm -rf ffmpeg-static && mkdir ffmpeg-static
+            curl -fsSL --retry 3 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz |
+              tar xJ -C ffmpeg-static --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' || true
+          fi
+          if ffmpeg-static/ffmpeg -version >/dev/null 2>&1 &&
+             ffmpeg-static/ffprobe -version >/dev/null 2>&1; then
+            echo "$PWD/ffmpeg-static" >> "$GITHUB_PATH"
+          else
+            rm -rf ffmpeg-static
+            sudo apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=5 -o Acquire::http::Timeout=30 ffmpeg
+          fi
+
+      - name: majestic, audio, streams, day and night, power cycle
+        timeout-minutes: 15
         run: >-
-          bash qemu-boot/test-ingenic-majestic.sh --audio
+          bash qemu-boot/test-ingenic-majestic.sh --audio --reboot
           --work "$RUNNER_TEMP/majestic"
 
   boot-hi3516cv610:

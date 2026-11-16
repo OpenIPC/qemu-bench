@@ -4000,7 +4000,11 @@ def test_ids(qemu):
     print('SoC identification (HARB0 0x2C, CPPSR, EFUSE grade words)')
     want = {'t10': 0x10005003, 't20': 0x12000002, 't21': 0x10021003,
             't23': 0x10023003, 't30': 0x10030005, 't31': 0x10031003,
-            't40': 0x10040003, 't41': 0x10041003}
+            't40': 0x10040003,
+            # t41's default grade, the T41NQ: the T40 family's ID, as read
+            # on an owner's camera (OpenIPC/majestic#376)
+            't41': 0x10040003,
+            't41,variant=t41lq': 0x10041003}
     for soc, sid in want.items():
         qt = QTest(qemu, soc)
         check('%s SoC ID' % soc, qt.readl(0x1300002C), sid)
