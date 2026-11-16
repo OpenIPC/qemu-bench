@@ -95,7 +95,9 @@ done
 # through its model, T40's stops recording after about a second, and with
 # its output on as well the T40 twin's streams stalled after a power cycle
 SPEAKER=false
-[ "$AUDIO" = true ] && [ "$SOC" = t41 ] && SPEAKER=true
+if [ "$AUDIO" = true ] && [ "$SOC" = t41 ]; then
+    SPEAKER=true
+fi
 case $SOC in
 t40) MACHINE=t40,variant=t40n,sensor=gc4653; SENSOR=gc4653
      MEM="mem=64M rmem=64M@0x4000000"
@@ -255,18 +257,18 @@ rm -f "$WORK"/console.*.log
 # With --audio the speaker plays into a wav. QEMU writes its header only at
 # exit, so the checks read the samples after the 44-byte header themselves.
 AUDIODEV=
-AUDIOOUT=
+AUDIOOUT=()
 if [ "$SPEAKER" = true ]; then
     AUDIODEV=,audiodev=snd
-    AUDIOOUT="-audiodev wav,id=snd,path=$WORK/speaker.wav"
+    AUDIOOUT=(-audiodev "wav,id=snd,path=$WORK/speaker.wav")
 fi
 NBOOT=0
 boot() {
     NBOOT=$((NBOOT + 1))
     CON=$WORK/console.$NBOOT.log
     : > "$CON"
-    # shellcheck disable=SC2086  # AUDIOOUT: options, word-split
-    "$QEMU" -M "$MACHINE,flash-file=$WORK/nor.bin$AUDIODEV" -m 128M $AUDIOOUT \
+    "$QEMU" -M "$MACHINE,flash-file=$WORK/nor.bin$AUDIODEV" -m 128M \
+        "${AUDIOOUT[@]}" \
         -global ingenic-isp.trace-regs=on -display none -serial file:"$CON" \
         -monitor unix:"$MON",server,nowait \
         -nic user,restrict=on,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
