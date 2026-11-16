@@ -128,7 +128,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 #define IRQ_JMPP           BIT(7)
 #define JMP_IE             BIT(25)
 #define JMP_RDY            BIT(26)
-#define VCMD_MAX_CHAIN     64
+/* Runaway guard only. Real hardware follows RDY JMPs indefinitely; an
+ * earlier limit of 64 left the core neither finished nor parked once the
+ * driver had linked more than that, and the encoder stopped for good
+ * (AX620E: GetStream 0x80070222 forever -> App "zero bitrate"). */
+#define VCMD_MAX_CHAIN     65536
 #define WORK_STATE_IDLE    0
 #define WORK_STATE_WORK    1
 #define WORK_STATE_PEND    3
@@ -388,6 +392,7 @@ struct AxeraVcmdState {
         uint32_t frames;
     } streams[AXERA_VCMD_STREAMS];
     uint32_t enc_jobs;
+    bool resume_deferred;   /* RDY bump arrived while a job was running */
 
     /* Added to every bus address the guest programs (command buffers,
      * RREG destinations, picture/stream buffers): AX620U's driver hands
@@ -494,6 +499,8 @@ static void axera_vcmd_core_write(AxeraVcmdState *s, uint32_t creg,
     s->core_reg[creg] = value;
 }
 
+static void axera_vcmd_resume(AxeraVcmdState *s);
+
 static void axera_vcmd_complete(void *opaque)
 {
     AxeraVcmdState *s = opaque;
@@ -502,6 +509,17 @@ static void axera_vcmd_complete(void *opaque)
     s->int_status |= s->pending_status;
     s->pending_status = 0;
     axera_vcmd_update_irq(s);
+    /*
+     * The driver may link the next buffer (setting RDY on the JMP this
+     * buffer ends in, then bumping RDY_CMDBUF_COUNT) while the job is
+     * still "running" here. That bump found the core busy; replay it now
+     * that the core has parked -- otherwise the encoder stops for good,
+     * depending on timing (AX620E: GetStream 0x80070222 forever).
+     */
+    if (s->resume_deferred) {
+        s->resume_deferred = false;
+        axera_vcmd_resume(s);
+    }
 }
 
 static uint64_t axera_vcmd_read_reg(AxeraVcmdState *s, hwaddr offset);
@@ -727,10 +745,19 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         }
     }
 
+    bool card = false;
+
     if (fmt != 0 && stride_c >= w &&
         axera_vcmd_plane_empty(y, (size_t)stride_y * h) &&
         axera_vcmd_plane_empty(uv, (size_t)stride_c * (h / 2))) {
         axera_vcmd_test_card(y, stride_y, uv, stride_c, w, h, st->frames);
+        card = true;
+    }
+    if (getenv("AXERA_VCMD_STATS") && (st->frames % 50) == 0) {
+        fprintf(stderr, "AXERA_VCMD_STATS: %ux%u mode %u frame %u fmt %u "
+                "stride %u/%u card %d y[0..3]=%02x%02x%02x%02x\n", w, h,
+                mode, st->frames, fmt, stride_y, stride_c, card,
+                y[0], y[1], y[2], y[3]);
     }
     st->frames++;
 
@@ -1060,6 +1087,10 @@ static void axera_vcmd_resume(AxeraVcmdState *s)
 {
     uint32_t jmp[4];
 
+    if (s->work_state == WORK_STATE_WORK) {
+        s->resume_deferred = true;
+        return;
+    }
     if (!s->pend_jmp || s->work_state != WORK_STATE_PEND) {
         return;
     }
@@ -1103,6 +1134,7 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
             timer_del(&s->completion_timer);
             s->work_state = WORK_STATE_IDLE;
             s->pend_jmp = 0;
+            s->resume_deferred = false;
         }
         break;
     case INT_STATUS_OFF:
@@ -1185,6 +1217,7 @@ static void axera_vcmd_reset(DeviceState *dev)
         axera_vcmd_stream_clear(&s->streams[i]);
     }
     s->enc_jobs = 0;
+    s->resume_deferred = false;
     qemu_set_irq(s->irq, 0);
 }
 

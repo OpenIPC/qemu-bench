@@ -141,6 +141,9 @@ struct AxeraAx620uClkrstState {
      * transfer actually fires -- see DMAC_CHEN_OFF's write handling
      * below for why. */
     bool dma_desc_dirty;
+    /* A transfer ran from the direction-word trigger (no IRQ) and the
+     * kernel has not enabled the channel for it yet. */
+    bool dma_done_unsignalled;
     /* GIC SPI 5 ("dw_dmac@1920000" in ax620u.dts); wired up in
      * hw/arm/axera.c. Only ever raised for the DMAC_CHEN_OFF-triggered
      * (real kernel dmaengine) path, never for BL1/U-Boot's own
@@ -445,9 +448,21 @@ static void axera_ax620u_clkrst_write(void *opaque, hwaddr offset,
             } else if (dir_word & DMA_DIR_MEM_TO_DEV) {
                 axera_ax620u_clkrst_do_dma(s, 0x100, DMA_DIR_MEM_TO_DEV, true);
             }
+        } else if (s->dma_done_unsignalled) {
+            /*
+             * The kernel wrote this transfer's descriptor pointer before
+             * its direction word, so the transfer already ran from that
+             * trigger, without the completion IRQ the kernel's
+             * dw-axi-dmac waits on ("SPI transfer timed out" -> squashfs
+             * read errors -> App abort, intermittently). Signal it now.
+             */
+            qemu_irq_raise(s->irq);
+            s->regs[DMAC_CHEN_OFF / 4] &= ~DMAC_CHEN_CH0_EN;
         }
+        s->dma_done_unsignalled = false;
     } else if (sub_off == DMA_DESC_OFF) {
         s->dma_desc_dirty = true;
+        s->dma_done_unsignalled = false;
     } else if (sub_off == DMA_DIR_OFF &&
                (value & (DMA_DIR_DEV_TO_MEM | DMA_DIR_MEM_TO_DEV))) {
         /*
@@ -492,6 +507,7 @@ static void axera_ax620u_clkrst_write(void *opaque, hwaddr offset,
                                  DMA_DIR_DEV_TO_MEM : DMA_DIR_MEM_TO_DEV;
 
             axera_ax620u_clkrst_do_dma(s, base, this_dir, false);
+            s->dma_done_unsignalled = true;
         }
     }
 }
