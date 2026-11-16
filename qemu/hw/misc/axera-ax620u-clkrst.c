@@ -132,6 +132,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraAx620uClkrstState, AXERA_AX620U_CLKRST)
  * in axera_ax620u_clkrst_write() below. */
 #define DMAC_CHEN_OFF           0x18
 #define DMAC_CHEN_CH0_EN        BIT(0)
+/* Channel 0's DMAC_CH_INTCLEAR (channel registers at 0x100). */
+#define DMAC_CH0_INTCLEAR_OFF   0x198
 
 struct AxeraAx620uClkrstState {
     SysBusDevice parent_obj;
@@ -181,34 +183,14 @@ static uint64_t axera_ax620u_clkrst_read(void *opaque, hwaddr offset,
 {
     AxeraAx620uClkrstState *s = opaque;
 
+    if (getenv("AXERA_DMAC_REGLOG") && offset >= 0x18 && offset < 0x300) {
+        qemu_log("dmac R %03x\n", (unsigned)offset);
+    }
     if (offset == DMAC_CH1_INTSTATUS_OFF) {
         return 0;
     }
     if ((offset % INSTANCE_STRIDE) == STATUS_OFF) {
         return STATUS_READY;
-    }
-    if (offset == DMAC_CHEN_OFF) {
-        /*
-         * The real kernel's dw-axi-dmac ISR reads this register as
-         * its very first action on taking the completion IRQ (see
-         * do_dma()'s own comment), to check whether the channel it's
-         * about to handle is idle yet -- lowering the IRQ (GIC SPI 5,
-         * level-sensitive) right here, independent of any later
-         * write, is what lets do_dma() also pre-clear the enable bit
-         * before raising it (see there) without re-introducing the
-         * interrupt storm a value-independent, write-only lowering
-         * scheme hit before: the ISR now sees "idle" on its first
-         * check and takes its normal completion path instead of the
-         * warn-then-retry one, which (confirmed live) otherwise never
-         * actually completes the real kernel's own tx descriptor --
-         * only the warn-then-retry path's own side-effecting write
-         * was ever lowering the IRQ before, and that path doesn't run
-         * the normal completion callback, so the higher-level
-         * squashfs/MTD read it was for kept timing out and retrying
-         * the exact same descriptor from scratch (confirmed live: the
-         * same desc_ptr/sar/dar/count observed four times running).
-         */
-        qemu_irq_lower(s->irq);
     }
     return s->regs[offset / 4];
 }
@@ -390,18 +372,24 @@ static void axera_ax620u_clkrst_write(void *opaque, hwaddr offset,
     AxeraAx620uClkrstState *s = opaque;
     uint32_t sub_off = offset % INSTANCE_STRIDE;
 
+    if (getenv("AXERA_DMAC_REGLOG") && offset >= 0x18 && offset < 0x300) {
+        qemu_log("dmac W %03x=%08x\n", (unsigned)offset, (uint32_t)value);
+    }
     s->regs[offset / 4] = value;
 
     if (sub_off == START_OFF) {
         s->regs[offset / 4] &= ~START_BIT;
-    } else if (offset == DMAC_CHEN_OFF && !(value & DMAC_CHEN_CH0_EN)) {
+    } else if (offset == DMAC_CH0_INTCLEAR_OFF) {
         /*
-         * Disable write -- the guest always performs this shortly
-         * after the enable write below, whether or not the transfer
-         * it requested actually succeeded (confirmed live). Used as
-         * the point to lower the completion IRQ raised there, since
-         * there's no evidence of a dedicated ack/clear register for
-         * it; qemu_irq_lower() on an already-lowered line is a no-op.
+         * Completion stays asserted until the kernel's ISR writes the
+         * status it read back here (it reads INTSTATUS, writes INTCLEAR,
+         * then checks CHEN -- AXERA_DMAC_REGLOG=1 shows the sequence),
+         * like the real level interrupt. Lowering it on a CHEN read or
+         * on the channel-disable write instead occasionally dropped a
+         * completion the ISR had not seen yet (the submit path reads
+         * CHEN too): "spi-nand: SPI transfer timed out", then squashfs
+         * I/O errors, UBIFS going read-only, or the App hanging behind
+         * a read that never finished.
          */
         qemu_irq_lower(s->irq);
     } else if (offset == DMAC_CHEN_OFF && (value & DMAC_CHEN_CH0_EN)) {
