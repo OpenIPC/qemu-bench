@@ -499,8 +499,6 @@ static void axera_vcmd_core_write(AxeraVcmdState *s, uint32_t creg,
     s->core_reg[creg] = value;
 }
 
-static void axera_vcmd_resume(AxeraVcmdState *s);
-
 static void axera_vcmd_complete(void *opaque)
 {
     AxeraVcmdState *s = opaque;
@@ -509,17 +507,6 @@ static void axera_vcmd_complete(void *opaque)
     s->int_status |= s->pending_status;
     s->pending_status = 0;
     axera_vcmd_update_irq(s);
-    /*
-     * The driver may link the next buffer (setting RDY on the JMP this
-     * buffer ends in, then bumping RDY_CMDBUF_COUNT) while the job is
-     * still "running" here. That bump found the core busy; replay it now
-     * that the core has parked -- otherwise the encoder stops for good,
-     * depending on timing (AX620E: GetStream 0x80070222 forever).
-     */
-    if (s->resume_deferred) {
-        s->resume_deferred = false;
-        axera_vcmd_resume(s);
-    }
 }
 
 static uint64_t axera_vcmd_read_reg(AxeraVcmdState *s, hwaddr offset);
@@ -1088,7 +1075,7 @@ static void axera_vcmd_resume(AxeraVcmdState *s)
     uint32_t jmp[4];
 
     if (s->work_state == WORK_STATE_WORK) {
-        s->resume_deferred = true;
+        s->resume_deferred = !getenv("AXERA_VCMD_NODEFER");
         return;
     }
     if (!s->pend_jmp || s->work_state != WORK_STATE_PEND) {
@@ -1142,6 +1129,21 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
          * read, acking every bit that was set. */
         s->int_status &= ~value;
         axera_vcmd_update_irq(s);
+        /*
+         * The driver may link the next buffer (setting RDY on the JMP
+         * the running buffer ends in, then bumping RDY_CMDBUF_COUNT)
+         * while that job is still "running"; the bump found the core
+         * busy. Replay it once the core has parked and the ISR has
+         * taken that buffer's interrupt -- not straight at completion,
+         * which would let two buffers finish behind one interrupt (the
+         * AX620U driver then loses one and VENC waits forever). Without
+         * the replay the encoder stops for good, depending on timing
+         * (AX620E: GetStream 0x80070222 forever, App "zero bitrate").
+         */
+        if (s->resume_deferred && s->work_state == WORK_STATE_PEND) {
+            s->resume_deferred = false;
+            axera_vcmd_resume(s);
+        }
         break;
     case INT_CTL_OFF:
         s->int_ctl = value;
