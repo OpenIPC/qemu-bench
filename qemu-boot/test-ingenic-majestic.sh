@@ -4,7 +4,10 @@
 #
 #   t40  a T40N with a GC4653: the OpenIPC t40 lite release's kernel and
 #        root, its own majestic or --majestic BIN.
-#   t41  a T41NQ with a GC4663.  OpenIPC has no T41 release, so the root is
+#   t41  a T41NQ with a GC4663 -- the sensor the twin models and the SDK
+#        image has a driver for; the owner's camera in OpenIPC/majestic#376
+#        has a GC5603, which neither does, so that sensor is not covered
+#        here.  OpenIPC has no T41 release, so the root is
 #        still the t40 lite release's (the same musl userland; T41's
 #        libimp is uClibc-built like T40's, and runs on the same shim), and
 #        the rest comes from the T41 SDK 1.2.0 (--sdk): its libimp,
@@ -17,8 +20,8 @@
 # rootfs_data partition as the overlay, so what majestic saves stays saved
 # (across a --reboot, too), busybox init runs the release's rc scripts,
 # S70vendor loads the vendor modules through load_ingenic (on t41 a
-# stand-in with the module parameters measured on an owner's T41NQ,
-# OpenIPC/majestic#376), and S95majestic starts majestic under its
+# stand-in with the module parameters and memory split measured on that
+# owner's T41NQ), and S95majestic starts majestic under its
 # supervisor.  The twin adds three things: S00twin touches /tmp/closesimd
 # (libimp's MXU2 paths are not modelled), a creditable seedrng seed (the
 # machine gathers almost no entropy, and getrandom() would hold majestic
@@ -30,13 +33,14 @@
 #   - majestic brings the SDK up ("Ingenic SDK started");
 #   - with --audio, with the microphone on (audio.enabled: true), which a
 #     T40 build could not do before OpenIPC/majestic#257;
-#   - 50 pictures of each RTSP stream decode, and /image.jpg is a JPEG of
-#     the main stream's size;
-#   - a setting written through the API is saved and survives a power
-#     cycle (--reboot);
+#   - 50 pictures of each RTSP stream decode (ffmpeg's own count, with no
+#     error), and /image.jpg is a JPEG of the main stream's size;
+#   - a setting written through the API reads back, and with --reboot it
+#     survives a power cycle;
 #   - day/night from a light sensor: PB17 is nightMode.lightSensorPin, and
 #     the host pulls it low (night) and lets it go (day) through
-#     qom-set /machine/gpio.  majestic must change mode both ways, and the
+#     qom-set /machine/gpio.  majestic must change mode both ways (its
+#     night_enabled in /metrics), and the
 #     switch to night must reach the ISP: ingenic-isp.trace-regs logs
 #     every ISP core write, and the night window must write at least
 #     --min-night-regs registers the day before it did not (the night
@@ -50,6 +54,7 @@
 #                            [--min-night-regs N] [--keep]
 #   --sdk  the extracted Ingenic-SDK-T41-1.2.0-20230713 (default $T41_SDK);
 #          the test skips (exit 0) without it, as the other T41 tests do
+# Needs ffmpeg and ffprobe on PATH.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -88,7 +93,7 @@ t40) MACHINE=t40,variant=t40n,sensor=gc4653; SENSOR=gc4653
      # OpenIPC's 16 MiB NOR
      KERN_KB=2048; ROOT_KB=8192 ;;
 t41) MACHINE=t41,variant=t41nq,sensor=gc4663; SENSOR=gc4663
-     # an owner's T41NQ (OpenIPC/majestic#376)
+     # the owner's T41NQ in OpenIPC/majestic#376
      MEM="mem=74M@0x0 rmem=45M@0x4A00000 nmem=9M@0x7700000"
      # the SDK kernel is 2.2 MB, more than OpenIPC's 2 MiB slot
      KERN_KB=2560; ROOT_KB=8192
@@ -100,6 +105,9 @@ t41) MACHINE=t41,variant=t41nq,sensor=gc4663; SENSOR=gc4663
      [ -n "$BIN" ] || { echo "--soc t41 needs --majestic (a t41 build)" >&2; exit 2; } ;;
 *) echo "no majestic twin for $SOC" >&2; exit 2 ;;
 esac
+for t in ffmpeg ffprobe; do
+    command -v $t >/dev/null || { echo "$t is not on PATH" >&2; exit 2; }
+done
 
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
@@ -109,6 +117,7 @@ if [ ! -f "$WORK/uImage.t40" ] || [ ! -f "$WORK/rootfs.squashfs.t40" ]; then
 fi
 if [ $SOC = t41 ] && [ -z "$KERNEL" ]; then
     KERNEL=$WORK/uImage.t41
+    # the build reports its own failure on stderr
     [ -f "$KERNEL" ] || bash "$HERE/build-ingenic-t41-kernel.sh" "$SDK" "$WORK" >/dev/null
 fi
 KERNEL=${KERNEL:-$WORK/uImage.t40}
@@ -243,7 +252,7 @@ boot() {
         -nic user,restrict=on,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
         -kernel "$KERNEL" \
         -append "console=ttyS1,115200n8 root=/dev/mtdblock3 rootfstype=squashfs init=/init mtdparts=$MTDID:256k(boot),64k(env),${KERN_KB}k(kernel),${ROOT_KB}k(rootfs),-(rootfs_data) $MEM" \
-        2>>"$TRACE" &
+        </dev/null 2>>"$TRACE" &
     QPID=$!
 }
 : > "$TRACE"
@@ -263,8 +272,7 @@ PY
 }
 # the windows the trace is split into
 mark() { echo "=== TWIN $1" >> "$TRACE"; }
-# waitfor PATTERN SECONDS [LINE]: the console from LINE on (a mode change
-# must be one logged after the stimulus, not an earlier one)
+# waitfor PATTERN SECONDS [LINE]: the console from LINE on
 waitfor() {
     for _ in $(seq "$2"); do
         tail -n +"${3:-1}" "$CON" 2>/dev/null | grep -aq -E "$1" && return 0
@@ -281,24 +289,72 @@ check() {       # check DESCRIPTION COMMAND...
     if "$@"; then echo "  PASS: $what"; else echo "  FAIL: $what"; fail=1; fi
 }
 URL=rtsp://root:12345@127.0.0.1:$RTSP
-decodes() {     # decodes STREAM: 50 pictures, no decoder complaint
-    local err
-    err=$(timeout 180 ffmpeg -nostdin -v error -rtsp_transport tcp \
-        -i "$URL/$1" -frames:v 50 -f null - 2>&1 |
-        grep -v 'non monotonically increasing dts') || true
-    [ -z "$err" ] || { echo "$err" | head -3; return 1; }
-    timeout 60 ffprobe -v error -rtsp_transport tcp -select_streams v \
-        -show_entries stream=width -of csv=p=0 "$URL/$1" | grep -q .
+# decodes STREAM: 50 pictures by ffmpeg's own count, ffmpeg exiting 0 and
+# saying nothing at error level (bar the RTP timestamps it complains about
+# on any live stream)
+decodes() {
+    local out rc=0 n err
+    out=$(timeout 180 ffmpeg -nostdin -v error -progress pipe:1 \
+        -rtsp_transport tcp -i "$URL/$1" -frames:v 50 -f null - \
+        2>"$WORK/ffmpeg.err") || rc=$?
+    n=$(printf '%s\n' "$out" | sed -n 's/^frame=//p' | tail -1)
+    err=$(grep -v 'non monotonically increasing dts' "$WORK/ffmpeg.err" || true)
+    [ -z "$err" ] || echo "$err" | head -3
+    if [ "$rc" != 0 ] || [ -n "$err" ] || [ "${n:-0}" -lt 50 ]; then
+        echo "    ($1: ffmpeg exit $rc, ${n:-0} pictures)"
+        return 1
+    fi
 }
+# /image.jpg: a JPEG, and the main stream's size
 snapshot() {
+    local want got
+    want=$(timeout 60 ffprobe -v error -rtsp_transport tcp -select_streams v \
+        -show_entries stream=width,height -of csv=s=x:p=0 "$URL/stream=0")
     curl -s -m 60 -u root:12345 -o "$WORK/snap.jpg" \
-        "http://127.0.0.1:$HTTP/image.jpg" &&
-        file "$WORK/snap.jpg" | grep -q "JPEG image data"
+        "http://127.0.0.1:$HTTP/image.jpg" || return 1
+    got=$(file "$WORK/snap.jpg" | grep -o 'JPEG image data.*' |
+        grep -oE '[0-9]+x[0-9]+' | tail -1)     # after any JFIF density
+    [ -n "$got" ] && [ "$got" = "$want" ] ||
+        { echo "    (/image.jpg: '${got:-not a JPEG}', main stream '$want')"; return 1; }
+}
+# saved: written through the API, and read back from it.  A setting
+# majestic applies without rebuilding anything (rtsp.keyframeOnSkip,
+# default false), so what is tested is the flash and not a pipeline
+# rebuild -- on T40 the twin's IMP teardown hangs in one, and the HTTP
+# server stops answering with it
+SAVED='{"rtsp":{"keyframeOnSkip":true}}'
+saved() {
+    curl -sf -m 30 -u root:12345 -o /dev/null -X POST \
+        -H 'Content-Type: application/json' \
+        -d "$SAVED" "http://127.0.0.1:$HTTP/api/v1/config" &&
+        [ "$(api_get rtsp keyframeOnSkip)" = True ]
+}
+# night_is 0|1: majestic's own answer, from /metrics.  Not the console:
+# the console is the syslog mirrored by `logread -f`, which stops following
+# when syslogd's ring laps it -- on T40 with --audio the twin's audio.ko
+# fills the ring with stack dumps, and a mode change went unseen.
+night_is() {
+    curl -s -m 10 -u root:12345 "http://127.0.0.1:$HTTP/metrics" |
+        grep -qx "night_enabled $1"
+}
+# pollfor SECONDS COMMAND...: until COMMAND succeeds or the guest is gone
+pollfor() {
+    local t=$1
+    shift
+    for _ in $(seq "$t"); do
+        "$@" && return 0
+        kill -0 $QPID 2>/dev/null || return 1
+        sleep 1
+    done
+    return 1
 }
 api_get() {     # api_get SECTION KEY
     curl -s -m 30 -u root:12345 "http://127.0.0.1:$HTTP/api/v1/config.json" |
         python3 -c 'import json, sys
-print(json.load(sys.stdin).get(sys.argv[1], {}).get(sys.argv[2]))' "$1" "$2"
+try:
+    print(json.load(sys.stdin).get(sys.argv[1], {}).get(sys.argv[2]))
+except ValueError:
+    print("no answer")' "$1" "$2"
 }
 
 waitfor 'Ingenic SDK started|Cannot start SDK' "$TIMEOUT" || true
@@ -308,19 +364,16 @@ if grep -aq 'Ingenic SDK started' "$CON"; then
     sleep 5
     check "the main stream decodes" decodes stream=0
     check "the second stream decodes" decodes stream=1
-    check "/image.jpg is a JPEG" snapshot
+    check "/image.jpg is a JPEG of the main stream's size" snapshot
     mark DAY
     sleep 10
     mark NIGHT
-    from=$(($(wc -l < "$CON") + 1))
     mon "qom-set /machine/gpio pb 0xfffdffff"
-    check "the light sensor turns night on" \
-        waitfor 'Change mode to NIGHT' 60 "$from"
+    check "the light sensor turns night on" pollfor 60 night_is 1
     sleep 20
     mark BACK
-    from=$(($(wc -l < "$CON") + 1))
     mon "qom-set /machine/gpio pb 0xffffffff"
-    check "and day again" waitfor 'Change mode to DAY' 60 "$from"
+    check "and day again" pollfor 60 night_is 0
     sleep 5
     mark END
     n=$(python3 - "$TRACE" <<'PY'
@@ -341,21 +394,20 @@ PY
 )
     echo "  ($n ISP registers written at night that the day did not)"
     check "night reaches the ISP" [ "$n" -ge "$MIN_NIGHT" ]
-    # a setting saved: the overlay is the camera's flash.  Last, because
-    # it rebuilds the pipeline, and on T40 the twin's IMP teardown hangs
-    # (the SDK is not started again)
-    check "a setting is saved" curl -sf -m 30 -u root:12345 -o /dev/null \
-        -X POST -H 'Content-Type: application/json' \
-        -d '{"image":{"mirror":true}}' "http://127.0.0.1:$HTTP/api/v1/config"
+    # a setting saved: the overlay is the camera's flash
+    check "a setting is saved" saved
     sleep 5
-    if [ -n "$REBOOT" ]; then
+    if [ -n "$REBOOT" ] && ! kill -0 $QPID 2>/dev/null; then
+        check "the camera is still running for the power cycle" false
+    elif [ -n "$REBOOT" ]; then
         # a power cycle: the setting must come back from rootfs_data
-        kill $QPID; wait $QPID 2>/dev/null || true
+        kill $QPID 2>/dev/null || true
+        wait $QPID 2>/dev/null || true
         boot
         check "after a power cycle majestic starts again" \
             waitfor 'Ingenic SDK started' "$TIMEOUT"
         sleep 5
-        check "the setting survived it" [ "$(api_get image mirror)" = True ]
+        check "the setting survived it" [ "$(api_get rtsp keyframeOnSkip)" = True ]
         check "the main stream decodes again" decodes stream=0
     fi
 fi

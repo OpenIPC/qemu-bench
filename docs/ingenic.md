@@ -2318,8 +2318,11 @@ the camera:
   (`t40,variant=t40n,sensor=gc4653 -m 128M`) on the `t40` lite release's
   kernel and root.
 - `--soc t41`: a T41NQ with a GC4663 (`t41,variant=t41nq,sensor=gc4663
-  -m 128M`, `mem=74M@0x0 rmem=45M@0x4A00000 nmem=9M@0x7700000`, as on an
-  owner's T41NQ, OpenIPC/majestic#376). OpenIPC has no T41 release, so the
+  -m 128M`), in the memory split of the T41NQ in OpenIPC/majestic#376
+  (`mem=74M@0x0 rmem=45M@0x4A00000 nmem=9M@0x7700000`). That camera's
+  sensor is a GC5603, which the twin does not model and the SDK image has
+  no driver for: the GC4663 is the twin's sensor, not the owner's, and
+  the GC5603 is not covered. OpenIPC has no T41 release, so the
   root is still the `t40` lite release's -- the same musl userland, and
   T41's libimp is uClibc-built like T40's -- with the T41 SDK 1.2.0's
   `libimp`, `libalog` and `libsysutils`, and the vendor modules and the
@@ -2351,9 +2354,15 @@ The checks:
   which OpenIPC/majestic#257 was about (the T40 build stopped at
   `IMP_AI_SetChnParam() failed`; a release from before the fix fails this
   check here the same way, and CI runs the test with `--audio`);
-- 50 pictures of each RTSP stream decode, and `/image.jpg` is a JPEG;
+- 50 pictures of each RTSP stream decode -- ffmpeg's own count, exit
+  status 0, nothing at error level -- and `/image.jpg` is a JPEG of the
+  main stream's size;
 - the host pulls PB17 low (`qom-set /machine/gpio pb 0xfffdffff`), and
-  majestic changes to night; it lets it go, and majestic changes back;
+  majestic changes to night; it lets it go, and majestic changes back.
+  The test reads that from `night_enabled` in `/metrics`, not from the
+  console: the console is the syslog mirrored by `logread -f`, which stops
+  following once syslogd's ring laps it, as the twin's `audio.ko` stack
+  dumps make it do on T40 with `--audio`;
 - the change reaches the ISP. `-global ingenic-isp.trace-regs=on` logs
   every write to the ISP core (and the VIC) on stderr, and the test counts
   the core registers the night window writes with values the ten seconds
@@ -2363,11 +2372,14 @@ The checks:
   logs "Change mode to NIGHT" all the same and writes 8 to 15, the
   per-frame curves' drift. `--min-night-regs` (100) is the line. T41
   writes about 560;
-- a setting written through the API is saved, and with `--reboot` it is
-  still there after QEMU is killed and booted again from the same flash.
-  This comes last, because it rebuilds the pipeline, and on T40 the IMP
+- a setting written through the API reads back, and with `--reboot` it
+  is still there after QEMU is killed and booted again from the same
+  flash. The setting is `rtsp.keyframeOnSkip`, which majestic applies
+  without rebuilding anything, so what this tests is the flash: a
+  setting that rebuilds the pipeline would hang on T40, where the IMP
   teardown hangs here (majestic logs the reload and never starts the SDK
-  again; T41 tears down and starts again).
+  again, and the HTTP server stops answering; T41 tears down and starts
+  again).
 
 A T41NQ can report the T40 family's SoC ID: an owner's reads
 `0x1300002c = 0x10040003` with subtype `0xAAAA`, and ipctool then takes it
