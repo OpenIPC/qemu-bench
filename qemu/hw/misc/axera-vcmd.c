@@ -337,6 +337,8 @@ static void jpeg_quant_table(int quality, const uint8_t base[64],
  * boots down. */
 #define AXERA_VCMD_LATENCY_NS (1 * SCALE_MS)
 
+#define AXERA_VCMD_STREAMS 4
+
 struct AxeraVcmdState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -355,13 +357,65 @@ struct AxeraVcmdState {
     hwaddr pend_jmp;                    /* parked JMP (RDY=0), or 0 */
     uint32_t core_reg[CORE_REG_COUNT];
 
-    /* Encode-job bridge state: persists across jobs so inter (P-frame)
-     * coding chains correctly from one submitted job to the next. */
-    H264Enc h264;
-    HevcEncRef *hevc_ref;
-    uint32_t hevc_poc;
+    /* Encode-job bridge state, one context per stream: persists across
+     * jobs so inter (P-frame) coding chains correctly from one job of a
+     * stream to its next. One VCMD core serves several streams at once
+     * (the camera's 3200x1800 main and 800x448 sub channel interleave
+     * job by job), so a single shared context made every P-frame
+     * reference the other stream's picture. */
+    struct AxeraVcmdStream {
+        bool used;
+        uint32_t mode, w, h;
+        uint64_t last_job;
+        H264Enc h264;
+        HevcEncRef *hevc_ref;
+        uint32_t hevc_poc;
+        uint32_t frames;
+    } streams[AXERA_VCMD_STREAMS];
     uint32_t enc_jobs;
 };
+
+typedef struct AxeraVcmdStream AxeraVcmdStream;
+
+static void axera_vcmd_stream_clear(AxeraVcmdStream *st)
+{
+    if (st->hevc_ref) {
+        hevc_enc_ref_free(st->hevc_ref);
+    }
+    memset(st, 0, sizeof(*st));
+}
+
+/* The context for (mode, w, h), creating one -- or recycling the least
+ * recently used -- for a new stream. *fresh says the stream has no
+ * reference yet, so its first job must be coded as an IDR. */
+static AxeraVcmdStream *axera_vcmd_stream(AxeraVcmdState *s, uint32_t mode,
+                                          uint32_t w, uint32_t h,
+                                          bool *fresh)
+{
+    AxeraVcmdStream *lru = &s->streams[0];
+    int i;
+
+    for (i = 0; i < AXERA_VCMD_STREAMS; i++) {
+        AxeraVcmdStream *st = &s->streams[i];
+
+        if (st->used && st->mode == mode && st->w == w && st->h == h) {
+            st->last_job = s->enc_jobs;
+            *fresh = false;
+            return st;
+        }
+        if (!st->used || (lru->used && st->last_job < lru->last_job)) {
+            lru = st;
+        }
+    }
+    axera_vcmd_stream_clear(lru);
+    lru->used = true;
+    lru->mode = mode;
+    lru->w = w;
+    lru->h = h;
+    lru->last_job = s->enc_jobs;
+    *fresh = true;
+    return lru;
+}
 
 static void axera_vcmd_update_irq(AxeraVcmdState *s)
 {
@@ -489,6 +543,63 @@ static uint64_t axera_vcmd_read_reg(AxeraVcmdState *s, hwaddr offset)
  * register values rather than expecting guest-written header bytes
  * (which this architecture has no register pointing at).
  */
+/*
+ * Nothing in this machine produces camera pixels: there is no image
+ * sensor, and the ISP that would turn its raw Bayer data into YUV is
+ * closed silicon with no model here, so every picture that reaches the
+ * encoder is all zeros. An unchanging empty picture is not only blank
+ * (solid green once decoded), it codes to almost nothing, and the camera
+ * App treats that as a dead encoder: it logs "zero bitrate" and reboots.
+ * So when a source picture is entirely empty -- and only then; anything
+ * real that ever reaches it is encoded untouched -- this paints a test
+ * card in its place: SMPTE-style colour bars scrolling sideways with a
+ * white box sweeping across them, advancing one step per frame of that
+ * stream -- the whole picture changes every frame, as a real sensor's
+ * noise would make it, so P-frames carry real bits.
+ */
+static bool axera_vcmd_plane_empty(const uint8_t *p, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i += 64) {
+        if (p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void axera_vcmd_test_card(uint8_t *y, uint32_t stride_y,
+                                 uint8_t *uv, uint32_t stride_c,
+                                 uint32_t w, uint32_t h, uint32_t frame)
+{
+    /* 75% bars: white, yellow, cyan, green, magenta, red, blue, black */
+    static const uint8_t bars[8][3] = {
+        { 180, 128, 128 }, { 162,  44, 142 }, { 131, 156,  44 },
+        { 112,  72,  58 }, {  84, 184, 198 }, {  65, 100, 212 },
+        {  35, 212, 114 }, {  16, 128, 128 },
+    };
+    uint32_t bw = MAX(w / 8, 1), box = MAX(h / 6, 16) & ~1u;
+    uint32_t bx = (frame * 8) % MAX(w - box, 1) & ~1u;
+    uint32_t by = (h - box) / 2 & ~1u;
+    uint32_t r, c;
+
+    for (r = 0; r < h; r++) {
+        for (c = 0; c < w; c++) {
+            const uint8_t *b = bars[((c + frame * 16) / bw) % 8];
+            bool in = r >= by && r < by + box && c >= bx && c < bx + box;
+
+            y[(size_t)r * stride_y + c] = in ? 235 : b[0];
+            if (!(r & 1) && !(c & 1)) {
+                uint8_t *p = &uv[(size_t)(r / 2) * stride_c + c];
+
+                p[0] = in ? 128 : b[1];
+                p[1] = in ? 128 : b[2];
+            }
+        }
+    }
+}
+
 static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
 {
     uint32_t mode = (s->core_reg[ENC_REG_MODE] >> ENC_MODE_SHIFT) &
@@ -512,7 +623,8 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
     g_autofree uint8_t *uv = NULL;
     g_autofree uint8_t *out = NULL;
     size_t n = 0, cap;
-    bool idr;
+    bool idr, fresh;
+    AxeraVcmdStream *st;
 
     if (mode == ENC_MODE_JPEG) {
         w = ((geom >> ENC_JPEG_W_SHIFT) & ENC_JPEG_W_MASK) * 8;
@@ -538,7 +650,8 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
     if (!stride_c) {
         stride_c = (fmt == 0) ? w / 2 : w;
     }
-    idr = (coding_type == ENC_CODING_TYPE_I) || s->enc_jobs == 0;
+    st = axera_vcmd_stream(s, mode, w, h, &fresh);
+    idr = (coding_type == ENC_CODING_TYPE_I) || fresh;
 
     y = g_malloc0((size_t)stride_y * mbh * 16);
     dma_memory_read(&address_space_memory, y_base, y,
@@ -578,6 +691,13 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         }
     }
 
+    if (fmt != 0 && stride_c >= w &&
+        axera_vcmd_plane_empty(y, (size_t)stride_y * h) &&
+        axera_vcmd_plane_empty(uv, (size_t)stride_c * (h / 2))) {
+        axera_vcmd_test_card(y, stride_y, uv, stride_c, w, h, st->frames);
+    }
+    st->frames++;
+
     cap = out_cap ? out_cap : 256 * 1024;
     out = g_malloc0(cap);
 
@@ -586,35 +706,35 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
             uint8_t hdr[128];
             size_t hdr_len = h264_enc_baseline_headers(w, h, hdr);
 
-            memset(&s->h264, 0, sizeof(s->h264));
-            h264_enc_parse_headers(&s->h264, hdr, hdr_len);
+            memset(&st->h264, 0, sizeof(st->h264));
+            h264_enc_parse_headers(&st->h264, hdr, hdr_len);
             if (hdr_len <= cap) {
                 memcpy(out, hdr, hdr_len);
-                n = h264_enc_frame(&s->h264, true, qp ? qp : 26, mbw, mbh,
+                n = h264_enc_frame(&st->h264, true, qp ? qp : 26, mbw, mbh,
                                    y, stride_y, uv, stride_c,
                                    out + hdr_len, cap - hdr_len);
                 n = n ? n + hdr_len : 0;
             }
-        } else if (s->h264.have_sps && s->h264.have_pps) {
-            n = h264_enc_frame(&s->h264, false, qp ? qp : 26, mbw, mbh,
+        } else if (st->h264.have_sps && st->h264.have_pps) {
+            n = h264_enc_frame(&st->h264, false, qp ? qp : 26, mbw, mbh,
                                y, stride_y, uv, stride_c, out, cap);
         }
     } else if (mode == ENC_MODE_HEVC) {
-        bool p_slice = !idr && s->hevc_ref;
+        bool p_slice = !idr && st->hevc_ref;
 
-        if (idr && s->hevc_ref) {
-            hevc_enc_ref_free(s->hevc_ref);
-            s->hevc_ref = NULL;
+        if (idr && st->hevc_ref) {
+            hevc_enc_ref_free(st->hevc_ref);
+            st->hevc_ref = NULL;
         }
-        if (!s->hevc_ref) {
-            s->hevc_ref = hevc_enc_ref_new();
+        if (!st->hevc_ref) {
+            st->hevc_ref = hevc_enc_ref_new();
         }
         n = hevc_enc_frame(&hevc_params_ctb32_sao, w, h, qp ? qp : 26,
-                           p_slice, p_slice ? s->hevc_poc + 1 : 0,
-                           p_slice ? s->hevc_ref : NULL, s->hevc_ref,
+                           p_slice, p_slice ? st->hevc_poc + 1 : 0,
+                           p_slice ? st->hevc_ref : NULL, st->hevc_ref,
                            y, w, h, stride_y, uv, stride_c, out, cap);
         if (n) {
-            s->hevc_poc = p_slice ? s->hevc_poc + 1 : 0;
+            st->hevc_poc = p_slice ? st->hevc_poc + 1 : 0;
         }
     } else if (mode == ENC_MODE_JPEG) {
         size_t cw = mbw * 8, ch = mbh * 8, i;
@@ -706,12 +826,11 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
                          MEMTXATTRS_UNSPECIFIED);
         /*
          * On completion the core overwrites the buffer limit with the
-         * number of BITS it wrote (as the older Hantro H1 does, see
-         * xm-h1.c) and the API divides by 8 -- confirmed live: reporting
-         * bytes gave every stream a 0 bitrate, reporting bits gives the
-         * real bitrate in /proc/ax_proc/venc.
+         * number of bytes it wrote (HWIF_ENC_OUTPUT_STRM_BUFFER_LIMIT,
+         * "Output stream size (bytes)"). Confirmed over RTSP: reporting
+         * bits made the camera App send each slice 8x its real length.
          */
-        s->core_reg[ENC_REG_OUT_LIMIT] = n * 8;
+        s->core_reg[ENC_REG_OUT_LIMIT] = n;
         s->core_reg[ENC_REG_IRQ] |= ENC_IRQ_BIT | ENC_FRAME_RDY_BIT;
         /*
          * swreg7[24:17] HWIF_ENC_NUM_SLICES_READY: completed slices. The
@@ -1016,12 +1135,9 @@ static void axera_vcmd_reset(DeviceState *dev)
     memset(s->core_reg, 0, sizeof(s->core_reg));
     s->core_reg[0] = ENC_CORE_HW_ID;
     s->core_reg[80] = ENC_SWREG80_FEATURES;
-    memset(&s->h264, 0, sizeof(s->h264));
-    if (s->hevc_ref) {
-        hevc_enc_ref_free(s->hevc_ref);
-        s->hevc_ref = NULL;
+    for (int i = 0; i < AXERA_VCMD_STREAMS; i++) {
+        axera_vcmd_stream_clear(&s->streams[i]);
     }
-    s->hevc_poc = 0;
     s->enc_jobs = 0;
     qemu_set_irq(s->irq, 0);
 }
