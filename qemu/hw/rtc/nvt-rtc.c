@@ -26,6 +26,15 @@
  * here, and the time is the host's.  Either alarm matching the clock sets
  * the alarm status, an interrupt with CTRL's alarm enable.
  *
+ * "oscillator" off models a board with no 32 kHz crystal (the XM IVG-N8S,
+ * OpenIPC/firmware#2865): nothing in the RTC domain is clocked, so the
+ * time never moves, a software reset or a CSET never completes -- SRST
+ * stays set with STATUS bit 1 busy, CSET stays set and never raises CSET
+ * done -- and with no battery the key and the oscillator setting read 0,
+ * which the driver takes as an RTC to reset.  Its 1 s reset timeout then
+ * fires at probe, and any wait without one spins.  No alarm goes off, so
+ * a power-off with the power alarm armed stays off rather than resetting.
+ *
  * Reboot goes through here (plat-na51089/reset.c): the kernel arms the
  * power-on alarm a few seconds ahead and powers the chip off, and the
  * alarm powers it back on.  Power off with the alarm armed is a reset;
@@ -38,6 +47,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
@@ -60,6 +70,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtRtcState, NVT_RTC)
 #define RTC_OSCAN       0x24
 
 #define STS_ALARM       (1u << 0)
+#define STS_SRST        (1u << 1)
 #define STS_READY       (1u << 2)
 #define STS_CSET        (1u << 8)
 
@@ -96,6 +107,7 @@ struct NvtRtcState {
     MemoryRegion iomem;
     qemu_irq irq;
     QEMUTimer *alarm_timer;
+    bool oscillator;
 
     /* RTC time = this + rtc_clock seconds, in seconds since 1900. */
     int64_t base;
@@ -121,12 +133,12 @@ static int64_t nvt_rtc_clock_secs(void)
 
 static int64_t nvt_rtc_now(NvtRtcState *s)
 {
-    return s->base + nvt_rtc_clock_secs();
+    return s->oscillator ? s->base + nvt_rtc_clock_secs() : s->base;
 }
 
 static void nvt_rtc_set_now(NvtRtcState *s, int64_t secs)
 {
-    s->base = secs - nvt_rtc_clock_secs();
+    s->base = s->oscillator ? secs - nvt_rtc_clock_secs() : secs;
 }
 
 static void nvt_rtc_update_irq(NvtRtcState *s)
@@ -182,7 +194,8 @@ static void nvt_rtc_rearm(NvtRtcState *s)
 {
     int64_t next = nvt_rtc_next_alarm(s, nvt_rtc_now(s));
 
-    if (next < 0) {
+    /* Unclocked, the time never reaches an alarm. */
+    if (next < 0 || !s->oscillator) {
         timer_del(s->alarm_timer);
         return;
     }
@@ -279,6 +292,15 @@ static void nvt_rtc_write(void *opaque, hwaddr offset, uint64_t val,
         nvt_rtc_update_irq(s);
         break;
     case RTC_CTRL:
+        if (!s->oscillator) {
+            /* Unclocked: whatever was started stays started. */
+            s->ctrl = val | (s->ctrl & (CTRL_SRST | CTRL_CSET));
+            if (s->ctrl & CTRL_SRST) {
+                s->status |= STS_SRST;
+            }
+            nvt_rtc_update_irq(s);
+            break;
+        }
         if (val & CTRL_SRST) {
             /* A software reset forgets the time and the key. */
             nvt_rtc_set_now(s, 0);
@@ -310,7 +332,8 @@ static void nvt_rtc_write(void *opaque, hwaddr offset, uint64_t val,
         }
         s->pwbc = val & PWBC_INTEN;
         if (val & PWBC_PWR_OFF) {
-            if (s->pwbcsts & PWBCSTS_ALM) {
+            /* An alarm that cannot tick never powers it back on. */
+            if ((s->pwbcsts & PWBCSTS_ALM) && s->oscillator) {
                 qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             } else {
                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
@@ -359,6 +382,13 @@ static void nvt_rtc_realize(DeviceState *dev, Error **errp)
     struct tm tm;
 
     s->alarm_timer = timer_new_ns(rtc_clock, nvt_rtc_alarm_fired, s);
+    s->alarm = RTC_ALARM_RESET;
+    if (!s->oscillator) {
+        s->base = 0;
+        s->key = 0;
+        s->oscan = 0;
+        return;
+    }
     qemu_get_timedate(&tm, 0);
     nvt_rtc_set_now(s, mktimegm(&tm) + (int64_t)DAYS_1900_TO_1970 * 86400);
     s->key = RTC_KEY;
@@ -427,11 +457,16 @@ static const VMStateDescription vmstate_nvt_rtc = {
     }
 };
 
+static const Property nvt_rtc_properties[] = {
+    DEFINE_PROP_BOOL("oscillator", NvtRtcState, oscillator, true),
+};
+
 static void nvt_rtc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = nvt_rtc_realize;
+    device_class_set_props(dc, nvt_rtc_properties);
     device_class_set_legacy_reset(dc, nvt_rtc_reset);
     dc->vmsd = &vmstate_nvt_rtc;
 }
