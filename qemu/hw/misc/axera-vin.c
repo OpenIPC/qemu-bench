@@ -182,6 +182,10 @@ struct AxeraVinState {
     uint32_t raw[AXERA_VIN_RANGES][AXERA_VIN_CHANNELS];
     QEMUTimer *timer;
     uint32_t fps;
+    /* gate-on-sensor: no frame events until the image sensor wired to
+     * the "sensor-streaming" input says it is streaming. */
+    bool gate_on_sensor;
+    bool sensor_streaming;
 };
 
 enum { FIELD_MASK = 0, FIELD_CLEAR = 1, FIELD_RAW = 2, FIELD_STATUS = 3 };
@@ -358,11 +362,22 @@ static void axera_vin_tick(void *opaque)
     AxeraVinState *s = opaque;
     int range, ch;
 
-    for (range = 0; range < AXERA_VIN_RANGES; range++) {
-        for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
-            s->raw[range][ch] |= s->mask[range][ch];
+    /*
+     * Real hardware sees no frame start/end before the sensor streams:
+     * the AX620U driver unmasks its IFE WDMA frame-start event while the
+     * ISP is still being set up, and a frame-start delivered then sends
+     * isp_irq_thread -> irq_process_ife_wdma_fsof into VREG command
+     * buffers that do not exist yet (kernel paging fault in
+     * DRV_VREG_IO_WRITE32_CMD_BUF_INIT, or the same fault in the App's
+     * userspace copy of that path).
+     */
+    if (!s->gate_on_sensor || s->sensor_streaming) {
+        for (range = 0; range < AXERA_VIN_RANGES; range++) {
+            for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
+                s->raw[range][ch] |= s->mask[range][ch];
+            }
+            axera_vin_update_irq(s, range);
         }
-        axera_vin_update_irq(s, range);
     }
     timer_mod_ns(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                  NANOSECONDS_PER_SECOND / s->fps);
@@ -383,6 +398,16 @@ static void axera_vin_reset(DeviceState *dev)
     timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
 
+static void axera_vin_sensor_streaming(void *opaque, int n, int level)
+{
+    AxeraVinState *s = opaque;
+
+    if (getenv("AXERA_VIN_DEBUG")) {
+        fprintf(stderr, "axera-vin: sensor streaming %d\n", level);
+    }
+    s->sensor_streaming = level;
+}
+
 static void axera_vin_init(Object *obj)
 {
     AxeraVinState *s = AXERA_VIN(obj);
@@ -395,10 +420,13 @@ static void axera_vin_init(Object *obj)
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[range]);
     }
     s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, axera_vin_tick, s);
+    qdev_init_gpio_in_named(DEVICE(obj), axera_vin_sensor_streaming,
+                            "sensor-streaming", 1);
 }
 
 static const Property axera_vin_props[] = {
     DEFINE_PROP_UINT32("fps", AxeraVinState, fps, 30),
+    DEFINE_PROP_BOOL("gate-on-sensor", AxeraVinState, gate_on_sensor, false),
 };
 
 static void axera_vin_realize(DeviceState *dev, Error **errp)

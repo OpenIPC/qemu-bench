@@ -373,6 +373,12 @@ struct AxeraVcmdState {
         uint32_t frames;
     } streams[AXERA_VCMD_STREAMS];
     uint32_t enc_jobs;
+
+    /* Added to every bus address the guest programs (command buffers,
+     * RREG destinations, picture/stream buffers): AX620U's driver hands
+     * the hardware DRAM-relative addresses (VeriSilicon's base_ddr_addr
+     * convention), so its 0x05701000 means physical 0x45701000. */
+    uint64_t dma_offset;
 };
 
 typedef struct AxeraVcmdStream AxeraVcmdStream;
@@ -415,6 +421,21 @@ static AxeraVcmdStream *axera_vcmd_stream(AxeraVcmdState *s, uint32_t mode,
     lru->last_job = s->enc_jobs;
     *fresh = true;
     return lru;
+}
+
+static MemTxResult vcmd_dma_read(AxeraVcmdState *s, hwaddr addr,
+                                 void *buf, dma_addr_t len, MemTxAttrs attrs)
+{
+    return dma_memory_read(&address_space_memory, addr + s->dma_offset,
+                           buf, len, attrs);
+}
+
+static MemTxResult vcmd_dma_write(AxeraVcmdState *s, hwaddr addr,
+                                  const void *buf, dma_addr_t len,
+                                  MemTxAttrs attrs)
+{
+    return dma_memory_write(&address_space_memory, addr + s->dma_offset,
+                            buf, len, attrs);
 }
 
 static void axera_vcmd_update_irq(AxeraVcmdState *s)
@@ -654,7 +675,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
     idr = (coding_type == ENC_CODING_TYPE_I) || fresh;
 
     y = g_malloc0((size_t)stride_y * mbh * 16);
-    dma_memory_read(&address_space_memory, y_base, y,
+    vcmd_dma_read(s, y_base, y,
                     (size_t)stride_y * mbh * 16, MEMTXATTRS_UNSPECIFIED);
 
     if (fmt == 0 && cb_base && cr_base) {
@@ -666,9 +687,9 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         g_autofree uint8_t *cb = g_malloc0((size_t)stride_c * ch);
         g_autofree uint8_t *cr = g_malloc0((size_t)stride_c * ch);
 
-        dma_memory_read(&address_space_memory, cb_base, cb,
+        vcmd_dma_read(s, cb_base, cb,
                         (size_t)stride_c * ch, MEMTXATTRS_UNSPECIFIED);
-        dma_memory_read(&address_space_memory, cr_base, cr,
+        vcmd_dma_read(s, cr_base, cr,
                         (size_t)stride_c * ch, MEMTXATTRS_UNSPECIFIED);
         uv = g_malloc((size_t)cw * 2 * ch);
         for (i = 0; i < ch; i++) {
@@ -685,7 +706,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
 
         uv = g_malloc0((size_t)stride_c * mbh * 8);
         if (uv_base) {
-            dma_memory_read(&address_space_memory, uv_base, uv,
+            vcmd_dma_read(s, uv_base, uv,
                             (size_t)stride_c * mbh * 8,
                             MEMTXATTRS_UNSPECIFIED);
         }
@@ -787,7 +808,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         sz = n - start;
         g_array_append_val(sizes, sz);
         g_array_append_val(sizes, zero);
-        dma_memory_write(&address_space_memory, s->core_reg[10],
+        vcmd_dma_write(s, s->core_reg[10],
                          sizes->data, sizes->len * sizeof(uint32_t),
                          MEMTXATTRS_UNSPECIFIED);
     }
@@ -796,7 +817,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         uint8_t pre[0x60];
         uint32_t k;
 
-        dma_memory_read(&address_space_memory, out_base - 0x58, pre,
+        vcmd_dma_read(s, out_base - 0x58, pre,
                         sizeof(pre), MEMTXATTRS_UNSPECIFIED);
         fprintf(stderr, "AXERA_VCMD_JOB: mode=%u %ux%u idr=%d out=0x%"
                 PRIx64 " n=%zu sizetbl=0x%x swreg4=0x%x pre:", mode, w, h,
@@ -810,7 +831,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         {
             uint32_t tbl[4];
 
-            dma_memory_read(&address_space_memory, s->core_reg[10] - 12,
+            vcmd_dma_read(s, s->core_reg[10] - 12,
                             tbl, sizeof(tbl), MEMTXATTRS_UNSPECIFIED);
             fprintf(stderr, " tbl[-3..0]=%u,%u,%u,%u", tbl[0], tbl[1],
                     tbl[2], tbl[3]);
@@ -822,7 +843,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         fprintf(stderr, "\n");
     }
     if (n) {
-        dma_memory_write(&address_space_memory, out_base, out, n,
+        vcmd_dma_write(s, out_base, out, n,
                          MEMTXATTRS_UNSPECIFIED);
         /*
          * On completion the core overwrites the buffer limit with the
@@ -880,7 +901,7 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
     bytes = MIN(bytes, 0x2000); /* vcmd_abi.h CMDBUF_MAX_SIZE */
     nwords = bytes / 4;
     buf = g_new(uint32_t, nwords);
-    dma_memory_read(&address_space_memory, addr, buf, bytes,
+    vcmd_dma_read(s, addr, buf, bytes,
                     MEMTXATTRS_UNSPECIFIED);
 
     for (i = 0; i < nwords; ) {
@@ -932,7 +953,7 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                     out[k] = off < VCMD_REG_WINDOW ?
                              axera_vcmd_read_reg(s, off) : 0;
                 }
-                dma_memory_write(&address_space_memory, dst, out,
+                vcmd_dma_write(s, dst, out,
                                  (size_t)n * 4, MEMTXATTRS_UNSPECIFIED);
             } else if (a >= CORE_REG_BASE && dst) {
                 uint32_t creg = (a - CORE_REG_BASE) / 4;
@@ -942,7 +963,7 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                 for (k = 0; k < ndst; k++) {
                     out[k] = s->core_reg[creg + k];
                 }
-                dma_memory_write(&address_space_memory, dst, out,
+                vcmd_dma_write(s, dst, out,
                                  (size_t)n * 4, MEMTXATTRS_UNSPECIFIED);
             }
             i += 4;
@@ -1019,7 +1040,7 @@ static void axera_vcmd_resume(AxeraVcmdState *s)
     if (!s->pend_jmp || s->work_state != WORK_STATE_PEND) {
         return;
     }
-    dma_memory_read(&address_space_memory, s->pend_jmp, jmp, sizeof(jmp),
+    vcmd_dma_read(s, s->pend_jmp, jmp, sizeof(jmp),
                     MEMTXATTRS_UNSPECIFIED);
     if ((jmp[0] >> 27) != VCMD_OP_JMP || !(jmp[0] & JMP_RDY)) {
         return;
@@ -1154,10 +1175,15 @@ static void axera_vcmd_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
 
+static const Property axera_vcmd_props[] = {
+    DEFINE_PROP_UINT64("dma-offset", AxeraVcmdState, dma_offset, 0),
+};
+
 static void axera_vcmd_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, axera_vcmd_props);
     dc->realize = axera_vcmd_realize;
     device_class_set_legacy_reset(dc, axera_vcmd_reset);
 }

@@ -1545,6 +1545,8 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     /* Same deferred-IRQ reason as ax620u_clkrst above -- see the ten
      * i2c@0x49... controllers' own creation site for why. */
     DeviceState *ax620u_i2c_dev[10] = { NULL };
+    /* AX620U's OS04A10, kept to gate axera-vin on its stream state. */
+    DeviceState *ax620u_sensor = NULL;
 
     if (smp_cpus > ARRAY_SIZE(cpu)) {
         error_report("axera: at most %zu CPUs", ARRAY_SIZE(cpu));
@@ -2142,6 +2144,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
                 qdev_prop_set_uint8(sensor, "id2", 0x41);
                 qdev_prop_set_uint8(sensor, "address", 0x36);
                 qdev_realize_and_unref(sensor, BUS(i2c8_bus), &error_fatal);
+                ax620u_sensor = sensor;
 
                 /*
                  * expander_io@0x20 on this exact bus in the real
@@ -2260,12 +2263,45 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
          * disassembly for the compiled-in board IRQ resource table,
          * would settle.
          */
+        /*
+         * venc@4010000 / jenc@4000000 / dec@4020000: the same VeriSilicon
+         * VCMD front-ends as AX620E's, at the same addresses but on
+         * AX620U's own SPIs (0x2a/0x28/0x29, read from the running
+         * kernel's /proc/device-tree -- the boot-stage DTB in the dump
+         * has no media nodes). Without them every one of the three
+         * probes failed with -1 and nothing could ever be encoded.
+         */
+        {
+            static const struct { hwaddr base; int irq; } vcmds[] = {
+                { 0x04010000, 0x2a }, { 0x04000000, 0x28 },
+                { 0x04020000, 0x29 },
+            };
+            int v;
+
+            for (v = 0; v < ARRAY_SIZE(vcmds); v++) {
+                DeviceState *d = qdev_new(TYPE_AXERA_VCMD);
+
+                /* AX620U's driver programs DRAM-relative bus addresses */
+                qdev_prop_set_uint64(d, "dma-offset", AXERA_RAM_BASE);
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(d), &error_fatal);
+                sysbus_mmio_map(SYS_BUS_DEVICE(d), 0, vcmds[v].base);
+                sysbus_connect_irq(SYS_BUS_DEVICE(d), 0, pic[vcmds[v].irq]);
+            }
+        }
+
         DeviceState *vin = qdev_new("axera-vin");
 
+        /* No frame events before the OS04A10 is told to stream -- see
+         * axera_vin_tick(). */
+        qdev_prop_set_bit(vin, "gate-on-sensor", ax620u_sensor != NULL);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 1, pic[0x1b]);
+        if (ax620u_sensor) {
+            qdev_connect_gpio_out_named(ax620u_sensor, "streaming", 0,
+                qdev_get_gpio_in_named(vin, "sensor-streaming", 0));
+        }
     }
 
     {
