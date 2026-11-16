@@ -241,13 +241,19 @@ static uint32_t i2c_clear(IngenicI2cState *s, hwaddr off)
 static uint64_t ingenic_i2c_read(void *opaque, hwaddr off, unsigned size)
 {
     IngenicI2cState *s = opaque;
+    hwaddr reg = off & ~3;
+    unsigned shift = (off & 3) * 8;
+    uint32_t mask = size >= 4 ? ~0U : (1u << (size * 8)) - 1;
     uint32_t v;
 
-    if (off >= I2C_REGS) {
+    if (reg >= I2C_REGS) {
         return 0;
     }
-    switch (off) {
+    switch (reg) {
     case R_DC:
+        if (shift) {
+            return 0;
+        }
         if (fifo8_is_empty(&s->rx)) {
             s->raw |= INT_RXUF;
             v = 0;
@@ -265,7 +271,7 @@ static uint64_t ingenic_i2c_read(void *opaque, hwaddr off, unsigned size)
         v = s->raw;
         break;
     case R_CINTR ... R_CGC:
-        v = i2c_clear(s, off);
+        v = shift ? 0 : i2c_clear(s, reg);
         break;
     case R_STA:
         v = STA_TFNF | STA_TFE;
@@ -289,34 +295,42 @@ static uint64_t ingenic_i2c_read(void *opaque, hwaddr off, unsigned size)
         v = *i2c_reg(s, R_ENB) & 1;
         break;
     default:
-        v = *i2c_reg(s, off);
+        v = *i2c_reg(s, reg);
         break;
     }
     i2c_update(s);
-    return v;
+    return (v >> shift) & mask;
 }
 
 static void ingenic_i2c_write(void *opaque, hwaddr off, uint64_t val,
                               unsigned size)
 {
     IngenicI2cState *s = opaque;
+    hwaddr reg = off & ~3;
+    unsigned shift = (off & 3) * 8;
+    uint32_t mask = size >= 4 ? ~0U : (1u << (size * 8)) - 1;
+    uint32_t v = val & mask;
 
-    if (off >= I2C_REGS) {
+    if (reg >= I2C_REGS) {
         return;
     }
-    switch (off) {
+    switch (reg) {
     case R_DC:
-        i2c_command(s, val);
+        if (!shift) {
+            i2c_command(s, v);
+        }
         break;
     case R_ENB:
-        *i2c_reg(s, off) = val & 1;
-        if (!(val & 1)) {
-            if (s->active) {
-                i2c_end_transfer(s->bus);
-                s->active = false;
+        if (!shift) {
+            *i2c_reg(s, reg) = v & 1;
+            if (!(v & 1)) {
+                if (s->active) {
+                    i2c_end_transfer(s->bus);
+                    s->active = false;
+                }
+                fifo8_reset(&s->rx);
+                s->aborted = false;
             }
-            fifo8_reset(&s->rx);
-            s->aborted = false;
         }
         break;
     case R_INTST:
@@ -328,7 +342,7 @@ static void ingenic_i2c_write(void *opaque, hwaddr off, uint64_t val,
     case R_ENSTA:
         break;
     default:
-        *i2c_reg(s, off) = val;
+        *i2c_reg(s, reg) = (*i2c_reg(s, reg) & ~(mask << shift)) | (v << shift);
         break;
     }
     i2c_update(s);
@@ -338,7 +352,9 @@ static const MemoryRegionOps ingenic_i2c_ops = {
     .read = ingenic_i2c_read,
     .write = ingenic_i2c_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .impl.min_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
     .impl.max_access_size = 4,
 };
 

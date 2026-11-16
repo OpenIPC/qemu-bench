@@ -841,13 +841,16 @@ static void dwc2_id_debounced(void *opaque)
     DWC2State *s = opaque;
 
     s->id_reported = true;
-    s->gintsts |= GINTSTS_CONIDSTSCHNG;
-    dwc2_update_irq(s);
+    if (!(s->gusbcfg & (GUSBCFG_FORCEHOSTMODE | GUSBCFG_FORCEDEVMODE))) {
+        s->gintsts |= GINTSTS_CONIDSTSCHNG;
+        dwc2_update_irq(s);
+    }
 }
 
 static void dwc2_id_arm(DWC2State *s)
 {
-    if (s->otg_a_device && !s->id_reported) {
+    if (s->otg_a_device && !s->id_reported &&
+        !(s->gusbcfg & (GUSBCFG_FORCEHOSTMODE | GUSBCFG_FORCEDEVMODE))) {
         timer_mod(s->id_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   100 * SCALE_MS);
     }
@@ -960,6 +963,12 @@ static void dwc2_glbreg_write(void *ptr, hwaddr addr, int index, uint64_t val,
     case GAHBCFG:
         if ((val & GAHBCFG_GLBL_INTR_EN) && !(old & GAHBCFG_GLBL_INTR_EN)) {
             iflg = 1;
+        }
+        break;
+    case GUSBCFG:
+        if (val & (GUSBCFG_FORCEHOSTMODE | GUSBCFG_FORCEDEVMODE)) {
+            timer_del(s->id_timer);
+            s->id_reported = true;
         }
         break;
     case GRSTCTL:
@@ -1153,7 +1162,22 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
         val &= ~(HPRT0_OVRCURRCHG | HPRT0_ENACHG | HPRT0_ENA |
                  HPRT0_CONNDET);
         val |= tval;
-        if (!(val & HPRT0_RST) && (old & HPRT0_RST)) {
+        if (!(val & HPRT0_PWR)) {
+            val &= ~(HPRT0_CONNSTS | HPRT0_ENA | HPRT0_SUSP | HPRT0_RES |
+                     HPRT0_RST | HPRT0_SPD_MASK);
+            if (old & HPRT0_ENA) {
+                val |= HPRT0_ENACHG;
+            }
+        } else if (dev && dev->attached &&
+                   (!(old & HPRT0_PWR) ||
+                    (!(old & HPRT0_ENA) &&
+                     !(orig & (HPRT0_RST | HPRT0_CONNDET | HPRT0_ENACHG |
+                               HPRT0_OVRCURRCHG))))) {
+            dwc2_attach(&s->uport);
+            val = (val & ~HPRT0_SPD_MASK) | (*mmio & HPRT0_SPD_MASK) |
+                  HPRT0_CONNSTS | HPRT0_CONNDET;
+        }
+        if ((val & HPRT0_PWR) && !(val & HPRT0_RST) && (old & HPRT0_RST)) {
             if (dev && dev->attached) {
                 val |= HPRT0_ENA | HPRT0_ENACHG;
                 prst = 1;
@@ -1174,7 +1198,8 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
                                    val & ~HPRT0_CONNDET);
         trace_usb_dwc2_hreg0_action("call usb_port_reset");
         usb_port_reset(&s->uport);
-        val &= ~HPRT0_CONNDET;
+        val = (val & ~(HPRT0_CONNDET | HPRT0_SPD_MASK)) |
+              (*mmio & HPRT0_SPD_MASK);
     } else {
         trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old, val);
     }
@@ -1509,12 +1534,15 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
                  GHWCFG2_DYNAMIC_FIFO |
                  GHWCFG2_PERIO_EP_SUPPORTED |
                  ((s->num_chan - 1) << GHWCFG2_NUM_HOST_CHAN_SHIFT) |
+                 (s->usb_version == 2 ?
+                  (GHWCFG2_HS_PHY_TYPE_UTMI << GHWCFG2_HS_PHY_TYPE_SHIFT) : 0) |
                  (GHWCFG2_INT_DMA_ARCH << GHWCFG2_ARCHITECTURE_SHIFT) |
                  (GHWCFG2_OP_MODE_NO_SRP_CAPABLE_HOST << GHWCFG2_OP_MODE_SHIFT);
     s->ghwcfg3 = (4096 << GHWCFG3_DFIFO_DEPTH_SHIFT) |
                  (4 << GHWCFG3_PACKET_SIZE_CNTR_WIDTH_SHIFT) |
                  (4 << GHWCFG3_XFER_SIZE_CNTR_WIDTH_SHIFT);
-    s->ghwcfg4 = 0;
+    s->ghwcfg4 = GHWCFG4_UTMI_PHY_DATA_WIDTH_8_OR_16 <<
+                 GHWCFG4_UTMI_PHY_DATA_WIDTH_SHIFT;
     if (s->cfg_ghwcfg2) {
         s->ghwcfg2 = s->cfg_ghwcfg2;
     }

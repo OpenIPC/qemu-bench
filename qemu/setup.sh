@@ -1604,10 +1604,11 @@ config INGENIC
     select USB_DWC2
     select SDHCI
     select BITBANG_I2C
+    select DEVICE_TREE
 KCONFIG
     echo "  hw/mips/Kconfig: added INGENIC"
 fi
-for sym in USB_DWC2 SDHCI BITBANG_I2C; do
+for sym in USB_DWC2 SDHCI BITBANG_I2C DEVICE_TREE; do
     if ! sed -n '/^config INGENIC$/,/^$/p' "$QEMU_DIR/hw/mips/Kconfig" | \
             grep -q "select $sym\$"; then
         sed -i "/^config INGENIC\$/,/^\$/{/select I2C\$/a\\    select $sym

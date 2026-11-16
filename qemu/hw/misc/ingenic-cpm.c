@@ -76,11 +76,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicCpmState, INGENIC_CPM)
 #define R_CLKGR0        0x20
 #define R_OPCR          0x24
 #define R_DDRCDR        0x2C
+#define R_VPUCDR        0x30
 #define R_CPPSR         0x34
 #define R_CPSPPR        0x38
 #define R_USBPCR        0x3C
 #define R_USBPCR1       0x48
 #define R_CPEPCR        0x58
+#define R_SFCCDR        0x74
+#define R_CIMCDR        0x7C
+#define R_ISPCDR        0x80
 #define R_SRBC          0xC4
 #define SRBC_ISP_ACK    (1u << 20)
 #define SRBC_ISP_STP    (1u << 21)
@@ -374,6 +378,13 @@ static void ingenic_cpm_reset(DeviceState *dev)
         s->regs[R_CPEPCR >> 2] = r->epll;
     }
     s->regs[R_DDRCDR >> 2] = r->ddrcdr;
+    if (s->soc == INGENIC_T23) {
+        /* MPLL-sourced peripheral dividers so Linux clk_set_rate() finds a valid parent rate */
+        s->regs[R_VPUCDR >> 2] = 0x40000002;
+        s->regs[R_SFCCDR >> 2] = 0x4000000B;
+        s->regs[R_CIMCDR >> 2] = 0x40000031;
+        s->regs[R_ISPCDR >> 2] = 0x40000004;
+    }
     s->regs[R_OPCR >> 2] = OPCR_ERCS;
     s->regs[R_RSR >> 2] = RSR_POR;
     s->regs[R_CPPSR >> 2] = s->cppsr;

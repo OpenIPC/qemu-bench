@@ -40,6 +40,8 @@ struct GcSensorState {
     bool reg16;
     uint16_t id_reg;
     uint16_t id;
+    uint32_t pclk;
+    uint16_t hts;
     bool trace;
 
     uint16_t ptr;
@@ -144,7 +146,8 @@ static uint8_t gc_recv(I2CSlave *i2c)
     if (s->reg16 && s->naddr == 1) {
         return 0;
     }
-    val = s->regs[s->ptr];
+    val = (!s->reg16 && !s->page && s->ptr != 0xFE) ?
+          s->p0[s->ptr & 0xFF] : s->regs[s->ptr];
     s->ptr = (s->ptr + 1) & gc_mask(s);
     return val;
 }
@@ -228,6 +231,8 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
         e->vts = 720 + ((s->p0[0x07] & 0x0F) << 8 | s->p0[0x08]) + 16;
         e->width = 1280;
         e->height = 720;
+    } else if (s->id == 0x2053 || s->id == 0x2063) {
+        e->vts = (s->p0[0x41] & 0x3F) << 8 | s->p0[0x42];
     }
 }
 
@@ -235,17 +240,27 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
  * GC1054: a row is 1732 periods of its 38.8 MHz timing clock (gc1054.c),
  * so VB 160 -- the driver's default -- is 25 frames/s.  0 until the
  * driver has started the stream (page 3's 0x10 = 0x90, MIPI on).
+ * The other parts: HTS x VTS over the pixel clock, when a machine gives
+ * both ("pclk", "hts"); 0 otherwise.
  */
 static int64_t galaxycore_frame_ns(Object *sensor)
 {
     GcSensorState *s = GALAXYCORE_SENSOR(sensor);
     ImageSensorExposure e = { 0 };
 
-    if (s->reg16 || s->id != 0x1054 || !(s->p3[0x10] & 0x80)) {
-        return 0;
+    if (!s->reg16 && s->id == 0x1054) {
+        if (!(s->p3[0x10] & 0x80)) {
+            return 0;
+        }
+        galaxycore_exposure_sensor(sensor, &e);
+        return muldiv64((uint64_t)e.vts * 1732, NANOSECONDS_PER_SECOND,
+                        38800000);
     }
     galaxycore_exposure_sensor(sensor, &e);
-    return muldiv64((uint64_t)e.vts * 1732, NANOSECONDS_PER_SECOND, 38800000);
+    if (!s->pclk || !s->hts || !e.vts) {
+        return 0;
+    }
+    return (int64_t)s->hts * e.vts * NANOSECONDS_PER_SECOND / s->pclk;
 }
 
 /*
@@ -327,6 +342,10 @@ static void gc_reset(DeviceState *dev)
     memset(s->p0, 0, sizeof(s->p0));
     memset(s->p1, 0, sizeof(s->p1));
     memset(s->p3, 0, sizeof(s->p3));
+    if (!s->reg16) {
+        s->p0[s->id_reg & 0xFF] = s->id >> 8;
+        s->p0[(s->id_reg + 1) & 0xFF] = s->id & 0xFF;
+    }
     memcpy(s->applied, s->regs, sizeof(s->applied));
     sensor_sync_reset(&s->sync);
 }
@@ -337,6 +356,9 @@ static int gc_post_load(void *opaque, int version_id)
 {
     GcSensorState *s = opaque;
 
+    if (version_id < 2 && !s->reg16) {
+        memcpy(s->p0, s->regs, sizeof(s->p0));
+    }
     if (version_id < 3) {
         memcpy(s->applied, s->regs, sizeof(s->applied));
     }
@@ -371,6 +393,8 @@ static const Property gc_properties[] = {
     DEFINE_PROP_BOOL("reg16", GcSensorState, reg16, false),
     DEFINE_PROP_UINT16("id-reg", GcSensorState, id_reg, 0xF0),
     DEFINE_PROP_UINT16("id", GcSensorState, id, 0x2053),
+    DEFINE_PROP_UINT32("pclk", GcSensorState, pclk, 0),
+    DEFINE_PROP_UINT16("hts", GcSensorState, hts, 0),
     DEFINE_PROP_BOOL("trace", GcSensorState, trace, false),
 };
 

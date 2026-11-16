@@ -165,13 +165,12 @@ QEMU's own Ingenic models are not what these kernels need, so
 The T21 and T23 have 16 KiB L1 caches where the others have 32 KiB; the
 machine sets that, and the T20's PRId, through the CPU's `l1-kib` and
 `prid` properties (`qemu/patches/0017-mips-prid-l1-size-properties.patch`).
-T40 and T41 report their L2 in Config2 (`config2`, patch 0025): 128 KiB
-(the T40 product briefs), 8 ways of 64-byte lines (U-Boot's
-`isvp_t40.h`), so the 4.4 kernels print "Unified secondary cache 128kB
-8-way, linesize 64 bytes" and do its maintenance; CCU 0x60 bits 12:10
-read 1, the size U-Boot reads. T41's L2 is taken to be T40's. The
-XBurst1 parts' L2 (the 3.10 kernels build `JZ_CPU_SCACHE`) is not
-described: nothing here states its geometry.
+T23 reports its 128 KiB L2 (8 ways of 32-byte lines) in Config2
+(`0x80000347`); T40 and T41 report their 128 KiB L2 (the T40 product
+briefs, 8 ways of 64-byte lines in U-Boot's `isvp_t40.h`) in Config2 as
+well, so the Linux kernels print the L2 geometry and do its maintenance,
+with CCU 0x60 bits 12:10 reading 1 on XBurst2. The remaining XBurst1
+parts' L2 is not described.
 
 The second XBurst2 core starts powered off. The kernel's
 `boot_secondary()` writes the entry to CCU RER and clears the core's CSRR
@@ -256,7 +255,7 @@ and the JFFS2 overlay, persist.
 `-drive if=mtd,file=...` gives the NOR without booting from it. The NOR
 is a `w25q64` (8 MiB), `mx25l12805d` (16 MiB; QEMU has no W25Q128, and
 0xC22018 is in every vendor table) or `w25q256` (32 MiB), or
-`flash-type=`.
+`flash-type=` (including Zbit `zb25vq64` and `zb25vq128`).
 
 ### SPI NAND
 
@@ -335,11 +334,12 @@ default.
 `-append`, boots the way U-Boot's `bootm` does: a stub in the boot ROM
 sets UART1's LCR (the kernels' early console takes the first UART whose
 LCR is not zero) and calls the entry with `a0 = 2`, `a1 = argv`
-(`argv[1]` the command line), `a2 = envp`. The kernels size memory from
-`mem=` alone -- no DT memory node, no DDR registers -- so a command line
-without one gets the U-Boot default for the RAM size, `mem=` and the
-`rmem=` the ISP driver takes. `-initrd` goes at 16 MiB and is passed as
-`rd_start=`/`rd_size=`.
+(`argv[1]` the command line), `a2 = envp`. With `-dtb`, the machine uses
+the MIPS UHI boot protocol instead (`a0 = -2`, `a1` pointing to the FDT
+in KSEG0, updating `/chosen`'s `bootargs`, `linux,initrd-start`, and
+`linux,initrd-end`). Unless `auto-mem=off` is given, a command line
+without `mem=` gets the U-Boot default for the RAM size (`mem=` and
+`rmem=`); `-initrd` goes at 16 MiB and is passed as `rd_start=`/`rd_size=`.
 
 ```bash
 ./qemu-src/build/qemu-system-mipsel -M t31 -m 64M -nographic \
@@ -417,7 +417,8 @@ unmasked (the clock event); counter 2 is a 64-bit free-running clock
 source whose low half latches the high one into a buffer. On XBurst2 the
 two are separate blocks under other names: a global OST (counter 2) and
 one core OST per core (counter 1) behind the CCU's OIMR. Both run from
-EXTAL through a 4^n prescaler. The line follows TFR & ~TMR whether or
+EXTAL through a 4^n prescaler. XBurst1's system OST gates its line with
+`TER` bit 0 as well as `TFR & ~TMR`; XBurst2's core OST follows TFR & ~TMR whether or
 not the counter runs: the T41 kernel's `set_next_event` and shutdown
 stop the counter with the flag up and its handler clears the flag after,
 and a line left high there (the model did) made core 1 storm with "ost
@@ -543,7 +544,8 @@ The jzmmc host of T10..T31 on an SD bus (`-drive if=sd,index=0|1`):
 commands, responses, PIO through the FIFOs (U-Boot) and SDMA descriptors
 (the kernels' `jzmmc_v12`). With no card, a command times out at once,
 which is what lets U-Boot get past `mmc` init. MSC0's card detect is a
-GPIO the host drives itself -- PB27, PB20 on T21 -- so monitor
+GPIO the host drives itself -- PB27, PB20 on T21, or `msc0-cd=<gpio>`
+(e.g. 61 for PB29) -- so monitor
 `eject`/`change` are hot-plug. An SD image for U-Boot's `fatls` needs a
 partition table. XBurst2 has SDHCI hosts instead.
 
@@ -1133,8 +1135,9 @@ loads `tx-isp-t41.ko` without `direct_mode`.
   limit switch: `qom-set /machine/gpio pc 0xfffffffe` pulls PC0 low, and
   the edge or level interrupt it is set up for fires
   (`test-ingenic-gpio.sh`: a sysfs GPIO sees both edges on T31).
-- `ingenic-i2c`: a DW_apb_i2c master moving each command at once; an
-  address no device answers aborts with TXABRT bit 0, and ENSTA follows
+- `ingenic-i2c`: a DW_apb_i2c master with 8/16/32-bit register access
+  moving each command at once; an address no device answers aborts with
+  TXABRT bit 0, and ENSTA follows
   ENB (both drivers wait for it). The image sensor (`sensor=`) is on
   I2C0. DMA follows the DW_apb_i2c handshake on DMACR (0 RDMAE, 1 TDMAE),
   DMATDLR and DMARDLR (0x88..0x90, named in both vendor drivers, which
@@ -1609,7 +1612,8 @@ silicon.
 `-M <soc>,sensor=<name>` puts an image sensor on I2C0 (I2C1 on T40) at
 the address and with the ID that OpenIPC's `sinfo.ko` table probes:
 `gc2053` (0x37, `galaxycore-sensor`), `gc2083` (0x37, 16-bit registers),
-`sc2336` and `sc2335` (0x30, `hisi-smartsens`), `jxf37`, `jxf22`,
+`sc2336` and `sc2335` (0x30, `hisi-smartsens`), `sc1a4t`/`sc2336p`/`sc2337p`
+(0x30, and `sc1a4ts1`/`sc2336ps1`/`sc2337ps1` at 0x32), `jxf37`, `jxf22`,
 `jxf23` and `jxq03` (0x40, `hisi-f37`, `hisi-jxf22`, `hisi-jxf23`,
 `hisi-jxq03`; JX-Q03 is the T31's 2304x1296 MIPI part), `ov2735b` and `ov2735` (0x3C,
 `ingenic-ov2735`: 8-bit registers in pages, the revision in page 0's
@@ -1645,15 +1649,17 @@ frame it paints a test picture into the buffers the driver queued.
   T21 C+0x78) until the done FIFO's empty bit (C+0x7C) is set; C+0x2C is
   the size the channel writes, C+0x80/C+0x98 the strides; 0x9804 (0x2304)
   bit n enables channel n; a write to C+0x9C..C+0xA8 empties the FIFOs
-  (T31). T21's channel-stop poll on 0x2308 reads 0. T23 moved the
-  channels to 0xD100 + 0x100 n with other offsets (push C+0x30/C+0x50,
-  pop C+0x38/C+0x58, empty C+0x3C, size C+0x0C, strides C+0x40/C+0x60,
-  enable 0xD040).
+  (T31). T21's channel-stop poll on 0x2308 reads 0. T23 gives a `0x90000`
+  core window and moved the channels to `0xD100 + 0x100 n` with other
+  offsets (push C+0x30/C+0x50, pop C+0x38/C+0x58, empty C+0x3C/C+0x5C,
+  size C+0x0C, strides C+0x40/C+0x60, enable 0xD040, `0xD050` NV21/mirror/flip).
 - VIC: the commands 2 and 4 written to 0x00 read back 0 at once (T31
   spins on it with no timeout), 1 starts the input. Status / mask (1 =
   masked) / write-1-to-clear at 0x1E0/0x1E8/0x1F0 (+4 for the second
   word; T21 0x100/0x104/0x108), bit 0 frame done -- the counter
-  `/proc/jz/isp/isp-w02` prints and libimp's "video drop" watchdog reads.
+  `/proc/jz/isp/isp-w02` prints and libimp's "video drop" watchdog reads;
+  on T23 `VIC_PORT_SEL` (`0x204`) updates `VIC_PORT_STATUS` (`0x20C`) and
+  locks the active input port, and raw `VIC_MDMA` packs 10-bit BGGR (`<< 6`).
 - CSI host and D-PHY: storage (the driver only writes them and reads
   ERR1/ERR2 as 0). T21 has none; it is DVP only. T23's IVDC (the direct
   ISP-to-encoder path at 0x13200000, INTC 38) is used only with the
@@ -1661,13 +1667,19 @@ frame it paints a test picture into the buffers the driver queued.
 - `ingenic-cpm`: before resetting the ISP the driver sets SRBC (0xC4)
   bit 21 and waits a second for bit 20, which now follows it.
 
-Frames run at `-global ingenic-isp.fps=` (25) while the VIC is started
-and the ISP's interrupts are enabled: frame start, then for every enabled
-channel with a queued buffer the picture at its size and strides, the
-buffer into the done FIFO and its status bit, then VIC frame done. The
-picture is the OpenIPC logo on a navy gradient with a dot sliding beneath
-it (`sstar-pattern.h`, as `aw-vinc` and the SigmaStar models draw it) and
-a six-digit frame counter at the top left.
+Frames run at the sensor's programmed frame time (`HTS * VTS / pclk`, when
+`VTS` is set on a sensor with a known pixel clock) or `-global ingenic-isp.fps=`
+(25) while the VIC is started and the ISP's interrupts are enabled: frame
+start, then for every enabled channel with a queued buffer the picture at its
+size and strides, the buffer into the done FIFO and its status bit, then VIC
+frame done. `-global ingenic-isp.expo-delay=<n>` (or `qom-set /machine/isp
+expo-delay <n>`, default 0, up to 8) delays sensor exposure/gain changes by
+`<n>` frames. The picture is the OpenIPC logo on a navy gradient with a dot
+sliding beneath it (`sstar-pattern.h`, as `aw-vinc` and the SigmaStar models
+draw it) and a six-digit frame counter at the top left; output chroma follows
+`light-r`/`light-b` and the ISP's white-balance gains (`0x1804`/`0x1808` on
+T23/T31, `0x604` on T21, `0x4004` on T40/T41) while `0xB000` AWB statistics
+stay pre-WB.
 
 The 3A loop is closed (T31, T23, T40, T41; read off `tx-isp-t31.ko` and
 `tx-isp-t23.ko` of the SDKs, with symbols, and the T40/T41 SDK builds).
@@ -2276,7 +2288,9 @@ libimp uses for its timestamp), NV12 or NV21, at POS (x << 16 | y),
 GS (width in bytes << 16 | height), alpha per pixel, global ([10:3]) or
 both ([2:1]), RGB through the channel's CSC matrix at 0x148 + 0x18 n;
 OUT_END and the interrupt follow a virtual 100 us later. The conversion
-mode is there too: NV12 to NV21, to BGRA, or to HSV (D_FMT 0x4, what
+mode is there too: NV12 to NV21, to 32-bit RGB (`D_FMT` `0x00` ARGB,
+`0x28` ABGR, `0x40` RGBA, `0x68` BGRA, with global alpha from
+`CH_BK_PARA` when `CH_BK_GLOBAL_ALPHA` is set), or to HSV (D_FMT 0x4, what
 libimp's frame source gives a `PIX_FMT_HSV` channel): H in degrees, 16
 bits a pixel, at NV_OUT_ADDR; S and V a byte each at OUT_ADDR and
 OUT_V_ADDR (the planes as the kernel driver and the T23 SDK's EXTFS
