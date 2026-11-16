@@ -28,7 +28,7 @@ controller and numbering, and a few blocks.
 | `fh8652` | Cortex-A7 | 64 MB² | GIC-400 at `0x30000000` | AXI | `0x20031601`, 0x33C = `0xC` | dump |
 | `fh8656` / `fh8658` | Cortex-A7 | 128 MB² | GIC-400 | AXI | `0x20031601`, `0x8` / `0x4` | —¹ |
 | `fh8852v100` | ARM1176JZF-S | 64 MB | DW ICTL | AHB | `0x17092901`, 0x004 = `0xC` | dump, OpenIPC |
-| `fh8856v100` | ARM1176JZF-S | 128 MB | DW ICTL | AHB | `0x17092901`, 0x004 = `0xD` | dump³, OpenIPC |
+| `fh8856v100` | ARM1176JZF-S | 128 MB | DW ICTL | AHB | `0x17092901`, 0x004 = `0x7840D` | dump³, OpenIPC |
 | `fh8626v100` | ARM1176JZF-S | 64 MB | DW ICTL | AHB | `0x18112301` | dump |
 | `fh8632` | ARM1176JZF-S | 64 MB | DW ICTL | AHB | `0x46488302`, 0x054 = `0x37` | SDK images |
 
