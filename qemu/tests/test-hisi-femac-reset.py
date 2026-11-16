@@ -27,8 +27,7 @@ import argparse, os, socket, sys, time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(__file__))
-from importlib import import_module
-jt = import_module('test-xm-h1-jpeg')
+from qtest_harness import QTest
 
 MACHINE = 'hi3516cv200'
 FEMAC = 0x10090000
@@ -78,7 +77,7 @@ def wait_until_written(q, addr, deadline_s):
 
 def register_checks(qemu, check):
     """The ring is emptied -- observed through ADDRQ_STAT, no networking."""
-    q = jt.QTest(qemu, MACHINE)
+    q = QTest(qemu, MACHINE)
     try:
         # Bit 25 clears only when the ring is full, so fill it: that makes the
         # occupancy visible without a backdoor into device state.
@@ -90,9 +89,11 @@ def register_checks(qemu, check):
         q.writel(GLB_SOFT_RESET, SOFT_RESET_ALL)
         check(bool(q.readl(ADDRQ_STAT) & ADDRQ_RX_READY),
               'SOFT_RESET_ALL empties the RX ring')
-        check(not (q.readl(GLB_IRQ_RAW) & (IRQ_RX_RDY | IRQ_MULTI_RXRDY)),
-              'SOFT_RESET_ALL clears the pending RX interrupts')
         q.writel(GLB_SOFT_RESET, 0)
+        # The interrupt and descriptor-FIFO halves of the flush are checked in
+        # dma_checks(), where a delivered frame can make them pending first.
+        # Asserting them here would pass on a model that never clears them,
+        # because nothing in this half ever sets them.
 
         # The clear is the other half of hisi_femac_port_reset(); flushing on
         # it too would drop buffers posted by a driver that resets before it
@@ -119,7 +120,7 @@ def dma_checks(qemu, check):
     host = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     host.bind(('127.0.0.1', 0))
     guest_port = free_udp_port()
-    q = jt.QTest(qemu, MACHINE, extra=(
+    q = QTest(qemu, MACHINE, extra=(
         '-nic', 'socket,model=hisi-femac,udp=127.0.0.1:%d,localaddr=127.0.0.1:%d'
         % (host.getsockname()[1], guest_port),))
     try:
@@ -134,6 +135,21 @@ def dma_checks(qemu, check):
         check(landed, 'control: a frame is DMA\'d into the posted buffer')
         if not landed:
             return          # nothing below can mean anything
+
+        # That frame left an RX interrupt raised and a descriptor in the FIFO.
+        # Assert they are actually pending before asking the reset to clear
+        # them, or the clear is tested against a state that was empty anyway.
+        pending_irq = q.readl(GLB_IRQ_RAW) & (IRQ_RX_RDY | IRQ_MULTI_RXRDY)
+        pending_des = (q.readl(ADDRQ_STAT) >> 8) & 0x3F
+        check(bool(pending_irq) and pending_des > 0,
+              'a delivered frame leaves an RX interrupt and a descriptor pending')
+
+        q.writel(GLB_SOFT_RESET, SOFT_RESET_ALL)
+        q.writel(GLB_SOFT_RESET, 0)
+        check(not (q.readl(GLB_IRQ_RAW) & (IRQ_RX_RDY | IRQ_MULTI_RXRDY)),
+              'SOFT_RESET_ALL clears the pending RX interrupts')
+        check(((q.readl(ADDRQ_STAT) >> 8) & 0x3F) == 0,
+              'SOFT_RESET_ALL drains the RX descriptor FIFO')
 
         # The bug.  The guest frees the skb right where the reset is written.
         q.write(BUF_B, SENTINEL)
