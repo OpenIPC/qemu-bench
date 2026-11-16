@@ -45,6 +45,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraEqosState, AXERA_EQOS)
 #define EQOS_SIZE           0x4000
 
 #define MAC_MCR             0x0000
+#define MCR_ACS             (1u << 20)  /* auto pad/CRC stripping */
+#define MCR_CST             (1u << 21)  /* CRC stripping, Type frames */
 #define MAC_MPFR            0x0008
 #define MAC_ISR             0x00B0
 #define MAC_VR              0x0110
@@ -441,20 +443,42 @@ static bool axera_eqos_accept(AxeraEqosState *s, const uint8_t *buf,
     return false;
 }
 
-static ssize_t axera_eqos_receive(NetClientState *nc, const uint8_t *buf,
-                                  size_t size)
+static ssize_t axera_eqos_receive(NetClientState *nc, const uint8_t *pkt,
+                                  size_t pkt_size)
 {
     AxeraEqosState *s = qemu_get_nic_opaque(nc);
     const uint32_t bufsz = axera_eqos_rx_bufsz(s);
     const uint32_t ring = axera_eqos_ring_len(s, true);
-    uint32_t need = DIV_ROUND_UP(size, bufsz), done = 0, i, chunk, d[4];
+    g_autofree uint8_t *fbuf = NULL;
+    const uint8_t *buf = pkt;
+    size_t size = pkt_size;
+    uint32_t need, done = 0, i, chunk, d[4];
     dma_addr_t a;
 
-    if (!axera_eqos_accept(s, buf, size)) {
-        return size;                /* filtered out: not for us */
+    if (!axera_eqos_accept(s, pkt, pkt_size)) {
+        return pkt_size;            /* filtered out: not for us */
     }
+    /*
+     * Real silicon hands the FCS to software unless MAC_Configuration
+     * ACS/CST ask it to strip it, and stmmac (core >= 4.00) always
+     * subtracts ETH_FCS_LEN from the descriptor's packet length on that
+     * basis. Without the 4 bytes every received IP packet came out 4
+     * bytes short: IpExt InTruncatedPkts counted them all and nothing
+     * ever reached TCP/UDP/ICMP (no DNS/DHCP replies, no SYN-ACK to an
+     * RTSP client).
+     */
+    if (!(*reg(s, MAC_MCR) & (MCR_ACS | MCR_CST))) {
+        uint32_t fcs = net_crc32_le(pkt, pkt_size);
+
+        fbuf = g_malloc(pkt_size + 4);
+        memcpy(fbuf, pkt, pkt_size);
+        stl_le_p(fbuf + pkt_size, ~fcs);
+        buf = fbuf;
+        size = pkt_size + 4;
+    }
+    need = DIV_ROUND_UP(size, bufsz);
     if (size == 0 || need >= ring) {
-        return size;                /* can never fit the ring: dropped */
+        return pkt_size;            /* can never fit the ring: dropped */
     }
     if (axera_eqos_rx_avail(s, need) < need) {
         s->rps = RPS_SUSPENDED;
@@ -464,7 +488,7 @@ static ssize_t axera_eqos_receive(NetClientState *nc, const uint8_t *buf,
     }
 
     /* Spread over as many buffers as it takes: FD on the first, LD and
-     * the frame length (no FCS) on the last. */
+     * the frame length (FCS included, see above) on the last. */
     for (i = 0; i < need; i++) {
         a = axera_eqos_desc(s, true, s->cur_rx);
         axera_eqos_read_desc(a, d);
@@ -488,7 +512,7 @@ static ssize_t axera_eqos_receive(NetClientState *nc, const uint8_t *buf,
         s->cur_rx = (s->cur_rx + 1) % ring;
     }
     axera_eqos_update_irq(s);
-    return size;
+    return pkt_size;
 }
 
 /* ---- registers ----------------------------------------------------- */

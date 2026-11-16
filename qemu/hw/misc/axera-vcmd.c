@@ -380,6 +380,30 @@ static bool axera_vcmd_trace(void)
     return on;
 }
 
+/*
+ * swreg1 (HWIF_ENC_IRQ etc.) mixes write-1-to-clear status bits (IRQ,
+ * FRAME_RDY, BUS_ERROR, SW_RESET, BUFFER_FULL, TIMEOUT, LINE_BUFFER,
+ * SLICE_RDY, FUSE_ERROR, STRM_SEGMENT_RDY) with two control bits
+ * (IRQ_DIS bit 1, TIMEOUT_INT enable bit 11). Every encode job's buffer
+ * starts by writing 0x9fd there to ack stale status; storing that as
+ * plain data made the job's read-back status claim a bus error, reset,
+ * buffer-full and timeout alongside FRAME_RDY, and the encoder API
+ * discarded every frame.
+ */
+#define ENC_SWREG1_STATUS_MASK  0x000013fdu
+
+static void axera_vcmd_core_write(AxeraVcmdState *s, uint32_t creg,
+                                  uint32_t value)
+{
+    if (creg == 1) {
+        uint32_t st = s->core_reg[1] & ENC_SWREG1_STATUS_MASK & ~value;
+
+        s->core_reg[1] = st | (value & ~ENC_SWREG1_STATUS_MASK);
+        return;
+    }
+    s->core_reg[creg] = value;
+}
+
 static void axera_vcmd_complete(void *opaque)
 {
     AxeraVcmdState *s = opaque;
@@ -647,7 +671,8 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
                          sizes->data, sizes->len * sizeof(uint32_t),
                          MEMTXATTRS_UNSPECIFIED);
     }
-    if (n && getenv("AXERA_VCMD_DEBUG_JOB") && s->enc_jobs < 6) {
+    if (n && getenv("AXERA_VCMD_DEBUG_JOB") &&
+        s->enc_jobs < (uint32_t)atoi(getenv("AXERA_VCMD_DEBUG_JOB"))) {
         uint8_t pre[0x60];
         uint32_t k;
 
@@ -656,6 +681,9 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         fprintf(stderr, "AXERA_VCMD_JOB: mode=%u %ux%u idr=%d out=0x%"
                 PRIx64 " n=%zu sizetbl=0x%x swreg4=0x%x pre:", mode, w, h,
                 idr, out_base, (size_t)n, s->core_reg[10], s->core_reg[4]);
+        fprintf(stderr, " swreg5=0x%x swreg6=0x%x swreg7=0x%x swreg8=0x%x"
+                " swreg9cap=0x%x", s->core_reg[5], s->core_reg[6],
+                s->core_reg[7], s->core_reg[8], out_cap);
         for (k = 0; k < sizeof(pre); k++) {
             fprintf(stderr, "%02x", pre[k]);
         }
@@ -676,7 +704,14 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
     if (n) {
         dma_memory_write(&address_space_memory, out_base, out, n,
                          MEMTXATTRS_UNSPECIFIED);
-        s->core_reg[ENC_REG_OUT_LIMIT] = n;
+        /*
+         * On completion the core overwrites the buffer limit with the
+         * number of BITS it wrote (as the older Hantro H1 does, see
+         * xm-h1.c) and the API divides by 8 -- confirmed live: reporting
+         * bytes gave every stream a 0 bitrate, reporting bits gives the
+         * real bitrate in /proc/ax_proc/venc.
+         */
+        s->core_reg[ENC_REG_OUT_LIMIT] = n * 8;
         s->core_reg[ENC_REG_IRQ] |= ENC_IRQ_BIT | ENC_FRAME_RDY_BIT;
         /*
          * swreg7[24:17] HWIF_ENC_NUM_SLICES_READY: completed slices. The
@@ -752,7 +787,7 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                         fprintf(stderr, "AXERA_VCMD_DBG: WREG creg=%u val=0x%x\n",
                                 creg, buf[i]);
                     }
-                    s->core_reg[creg] = buf[i];
+                    axera_vcmd_core_write(s, creg, buf[i]);
                     if (creg == ENC_REG_GEOM && (buf[i] & ENC_E_BIT)) {
                         axera_vcmd_run_encode_job(s);
                     }
@@ -946,7 +981,7 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
                     fprintf(stderr, "AXERA_VCMD_DBG: MMIO-WRITE creg=%u val=0x%x\n",
                             creg, (uint32_t)value);
                 }
-                s->core_reg[creg] = value;
+                axera_vcmd_core_write(s, creg, value);
                 if (creg == ENC_REG_GEOM && (value & ENC_E_BIT)) {
                     axera_vcmd_run_encode_job(s);
                 }
