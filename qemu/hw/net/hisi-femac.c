@@ -134,6 +134,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiFemacState, HISI_FEMAC)
 /* RX ring size */
 #define RX_RING_SIZE            64
 
+/*
+ * MAC_SET bits 10:0 hold the largest frame the MAC will deliver
+ * (hisi_femac.c: MAX_FRAME_SIZE_MASK GENMASK(10, 0)), and the driver both
+ * programs it and sizes every posted RX buffer to the same MAX_FRAME_SIZE.
+ */
+#define FEMAC_MAX_FRAME_SIZE_MASK       0x7ff
+#define FEMAC_MAX_FRAME_SIZE_DEFAULT    1600
+
 struct HisiFemacState {
     SysBusDevice parent;
     MemoryRegion iomem;
@@ -425,6 +433,35 @@ static ssize_t hisi_femac_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
+    /*
+     * Bound the frame by the MAX_FRAME_SIZE field the driver programs into
+     * MAC_SET, because the RX ring carries bare addresses -- no length -- so
+     * this is the only size contract there is.  hisi_femac.c posts every RX
+     * buffer at exactly MAX_FRAME_SIZE (1600) and writes the same value into
+     * MAC_SET bits 10:0, and the MAC will not deliver a longer frame; a
+     * backend that hands us one (a tap with a large MTU, a jumbo frame) was
+     * written straight past the end of an skb, silently corrupting whatever
+     * the guest had after it.  That is the worst shape of bug this model can
+     * have: the damage lands later, in unrelated code, nowhere near here.
+     * hisi-gmac already bounds its RX this way -- its descriptors carry a
+     * buffer length, so it had something obvious to check against.
+     *
+     * Drop it as the MAC does, and report the frame consumed: returning -1
+     * means "no room right now", and the net layer would re-offer the same
+     * oversized frame forever, wedging the queue behind it.
+     */
+    uint32_t max_frame = s->mac_set & FEMAC_MAX_FRAME_SIZE_MASK;
+    if (max_frame == 0) {
+        /* Before the driver programs MAC_SET (U-Boot, early probe). */
+        max_frame = FEMAC_MAX_FRAME_SIZE_DEFAULT;
+    }
+    if (size > max_frame) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "hisi-femac: dropping %zu-byte frame, MAC_SET caps RX "
+                      "at %u bytes\n", size, max_frame);
+        return size;
+    }
+
     /* Pop buffer address from ring */
     uint32_t dma_addr = s->rx_ring[s->rx_ring_head];
     s->rx_ring_head = (s->rx_ring_head + 1) % RX_RING_SIZE;
@@ -438,7 +475,12 @@ static ssize_t hisi_femac_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
-    /* Push frame descriptor into FIFO: size + 4 for FCS */
+    /*
+     * Push frame descriptor into FIFO: size + 4 for FCS.  RX_FRAME_LEN is
+     * 12 bits; with the cap above, size + 4 can no longer reach 0x1000, so
+     * the mask cannot silently report a frame shorter than the bytes that
+     * were just written.
+     */
     s->iqfrm_des_fifo[s->iqfrm_des_tail] = (size + 4) & 0xfff;
     s->iqfrm_des_tail = (s->iqfrm_des_tail + 1) % RX_RING_SIZE;
     s->iqfrm_des_count++;
