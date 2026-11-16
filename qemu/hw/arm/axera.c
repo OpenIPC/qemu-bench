@@ -687,6 +687,41 @@ static const MemoryRegionOps axera_cpu1_wake_ops = {
  * adds the SC450AI sensor the real AX620E IP-camera board has on
  * i2c6; the NanoKVM boards have no Bayer sensor there.
  */
+typedef struct {
+    const char *name;
+    hwaddr base;
+    int irq;
+    uint32_t status, ack, mode;
+    uint32_t kick[4], done[4];
+} AxeraIvpsEngineDesc;
+
+/* IVPS processing engines, see hw/misc/axera-ivps-engine.c */
+static void axera_create_ivps_engines(const AxeraIvpsEngineDesc *engines,
+                                      int n, qemu_irq *pic)
+{
+    int e, k;
+
+    for (e = 0; e < n; e++) {
+        DeviceState *dev = qdev_new("axera-ivps-engine");
+
+        qdev_prop_set_string(dev, "name", engines[e].name);
+        qdev_prop_set_uint32(dev, "status-off", engines[e].status);
+        qdev_prop_set_uint32(dev, "ack-off", engines[e].ack);
+        qdev_prop_set_uint32(dev, "ack-mode", engines[e].mode);
+        for (k = 0; k < 4; k++) {
+            char prop[16];
+
+            snprintf(prop, sizeof(prop), "kick-off%d", k);
+            qdev_prop_set_uint32(dev, prop, engines[e].kick[k]);
+            snprintf(prop, sizeof(prop), "done-bits%d", k);
+            qdev_prop_set_uint32(dev, prop, engines[e].done[k]);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, engines[e].base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[engines[e].irq]);
+    }
+}
+
 static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
 {
     /*
@@ -696,13 +731,7 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
      * per-tile command lists -- see hw/misc/axera-ivps-engine.c.
      */
     {
-        static const struct {
-            const char *name;
-            hwaddr base;
-            int irq;
-            uint32_t status, ack, mode;
-            uint32_t kick[4], done[4];
-        } engines[] = {
+        static const AxeraIvpsEngineDesc engines[] = {
             /* v0, v1, isp, gdc-linked channels */
             { "axera-vpp", 0x04403000, 0x67, 0x888, 0x8b4, 0,
               { 0x004, 0x038, 0x06c, 0x07c },
@@ -715,27 +744,8 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
             { "axera-dpu", 0x04407000, 0x61, 0x004, 0x014, 0,
               { 0x028 }, { 1u << 0 } },
         };
-        int e, k;
 
-        for (e = 0; e < ARRAY_SIZE(engines); e++) {
-            DeviceState *dev = qdev_new("axera-ivps-engine");
-
-            qdev_prop_set_string(dev, "name", engines[e].name);
-            qdev_prop_set_uint32(dev, "status-off", engines[e].status);
-            qdev_prop_set_uint32(dev, "ack-off", engines[e].ack);
-            qdev_prop_set_uint32(dev, "ack-mode", engines[e].mode);
-            for (k = 0; k < 4; k++) {
-                char prop[16];
-
-                snprintf(prop, sizeof(prop), "kick-off%d", k);
-                qdev_prop_set_uint32(dev, prop, engines[e].kick[k]);
-                snprintf(prop, sizeof(prop), "done-bits%d", k);
-                qdev_prop_set_uint32(dev, prop, engines[e].done[k]);
-            }
-            sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-            sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, engines[e].base);
-            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[engines[e].irq]);
-        }
+        axera_create_ivps_engines(engines, ARRAY_SIZE(engines), pic);
     }
 
     /* TIMER_BASE @ 0x04830000 (boot/bl1/driver/include/timer.h): BL1's
@@ -1657,8 +1667,18 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
          * the SPI number used there is a documented ASSUMPTION, not a
          * confirmed fact, flagged at that call site.
          */
-        create_unimplemented_device("axera-npu", 0x03800000, 0x7000);
-        create_unimplemented_device("axera-npu-sram", 0x03000000, 0x500000);
+        /*
+         * axera-npu itself is created down where pic[] exists (see the
+         * axera-vin call site); its on-chip memory (OCM, which ax_npu.ko
+         * maps as "npu_ocm") is plain RAM.
+         */
+        {
+            MemoryRegion *ocm = g_new(MemoryRegion, 1);
+
+            memory_region_init_ram(ocm, NULL, "axera.npu-ocm", 0x500000,
+                                   &error_fatal);
+            memory_region_add_subregion(sysmem, 0x03000000ULL, ocm);
+        }
 
         /*
          * secondary-boot-reg @ 0x02220300 (see
@@ -2289,11 +2309,67 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             }
         }
 
+        /*
+         * NPU job-completion pass-through (hw/misc/axera-npu.c):
+         * npu_normal is GIC 68 = SPI 36 in the real AX620U's
+         * /proc/interrupts.
+         */
+        sysbus_create_simple("axera-npu", 0x03800000, pic[36]);
+
+        /*
+         * AX620U IVPS engines (register protocol from the real ARM32
+         * ax_ivps.ko/ax_gdc.ko/ax_vo.ko; IRQs from the guest's
+         * /proc/interrupts): tdp@4410000 SPI 20 (tdpdev_start's last
+         * store 0x018=1; tdp_irq acks status 0x004 via W1C 0x010),
+         * gdc@2620000 SPI 21 (gdcdev_start kicks 0x058=1; gdc_irq
+         * reads 0x048, acks 0x054), vo@4400000 SPI 19 (the IVPS draw
+         * stage: ax620a_draw_start kicks 0x020=1; dpu_irq reads 0x004,
+         * acks 0x010). Not modelled: TDP "inplace" mode's CDMA at
+         * 0x04420000 and GDC tile mode's queue at GDC+0x100.
+         */
+        {
+            static const AxeraIvpsEngineDesc engines[] = {
+                { "axera-tdp", 0x04410000, 20, 0x004, 0x010, 0,
+                  { 0x018 }, { 1u << 0 } },
+                { "axera-gdc", 0x02620000, 21, 0x048, 0x054, 0,
+                  { 0x058 }, { 1u << 0 } },
+                { "axera-dpu", 0x04400000, 19, 0x004, 0x010, 0,
+                  { 0x020 }, { 1u << 0 } },
+            };
+
+            axera_create_ivps_engines(engines, ARRAY_SIZE(engines), pic);
+            create_unimplemented_device("axera-tdp-cdma", 0x04420000,
+                                        0x1000);
+        }
+
         DeviceState *vin = qdev_new("axera-vin");
 
         /* No frame events before the OS04A10 is told to stream -- see
          * axera_vin_tick(). */
         qdev_prop_set_bit(vin, "gate-on-sensor", ax620u_sensor != NULL);
+        /*
+         * IFE WDMA status (0x50): the driver unmasks bits 17-28 only
+         * to count WDMA errors/overflows -- isp_irq_thread marks the
+         * channel's next frame for dropping on bits 17-20 -- so a tick
+         * raising them made IFE drop every frame (vin_status Loss ==
+         * InSeq). isp_irq_thread's error-class mask for this register
+         * is 0x1ffe0001 (bit 0 too): any of those also stops it
+         * forwarding the frame to userspace (the poll()/read() user-IRQ
+         * path that drives AI-ISP). Bits 29-30 are the per-channel
+         * frame starts (irq_process_ife_wdma_fsof tests bit 30-n) and
+         * bits 1/3/5 the frame ends.
+         */
+        qdev_prop_set_uint32(vin, "quiet-off", 0x50);
+        qdev_prop_set_uint32(vin, "quiet-bits", 0x1ffe0001);
+        /*
+         * RLTM histogram done: isp_itp_drv_thread polls RAW bit 19 of
+         * the 0x80020 block (isp_irq_rltm_hist_done_get reads 0x80028,
+         * W1C 0x80024) after each ITP frame end and only then hands the
+         * frame's histogram to the type-4 stat source that AX_ISP_Run's
+         * 3A loop waits on. The driver never unmasks it.
+         */
+        qdev_prop_set_uint32(vin, "poll-off", 0x80020);
+        qdev_prop_set_uint32(vin, "poll-bits", 1u << 19);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);

@@ -223,6 +223,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 #define ENC_SWREG80_FEATURES 0x88109000u
 
 /*
+ * More of the configuration EncAsicGetAsicConfig() reads once the HW ID
+ * is above 0x8000600F (from the AX620U App's statically linked encoder
+ * library):
+ *   swreg214  [25:13] H.264 max width / 8, [12:0] JPEG max width / 8
+ *             (here 4096 and 16384);
+ *   swreg319  eight 4-bit "AXI burst align" fuse fields, read raw into
+ *             asic_cfg.AXIAlignFuse. VCEncInit rejects the library's own
+ *             default config->AXIAlignment = 0x66666666 ("configured AXI
+ *             is not supported by hardware") unless every fuse nibble is
+ *             at least that config nibble.
+ */
+#define ENC_SWREG214_WIDTHS  0x00400800u
+#define ENC_SWREG319_AXI     0x66666666u
+
+/*
  * Per-job encode registers inside core_reg[] (core_reg[N] == swregN),
  * from VeriSilicon's own public SW/HW interface tables
  * (encswhwregisters.h / registertable.h for this exact VC8000E family --
@@ -933,6 +948,12 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                     }
                 }
             }
+            /*
+             * Instructions are 64-bit aligned: a WREG with an even
+             * number of values (AX620U's 478-register init buffer) is
+             * followed by one padding word, not another opcode.
+             */
+            i = ROUND_UP(i, 2);
         } else if (op == VCMD_OP_RREG) {
             hwaddr dst;
 
@@ -1001,6 +1022,8 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
             break;
         }
     }
+    /* Ran off the buffer (or hit an unknown opcode): nothing chained. */
+    return false;
 }
 
 static void axera_vcmd_exec_chain(AxeraVcmdState *s, hwaddr addr,
@@ -1156,6 +1179,8 @@ static void axera_vcmd_reset(DeviceState *dev)
     memset(s->core_reg, 0, sizeof(s->core_reg));
     s->core_reg[0] = ENC_CORE_HW_ID;
     s->core_reg[80] = ENC_SWREG80_FEATURES;
+    s->core_reg[214] = ENC_SWREG214_WIDTHS;
+    s->core_reg[319] = ENC_SWREG319_AXI;
     for (int i = 0; i < AXERA_VCMD_STREAMS; i++) {
         axera_vcmd_stream_clear(&s->streams[i]);
     }

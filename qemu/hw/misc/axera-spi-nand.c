@@ -194,6 +194,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
@@ -205,6 +206,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNandState, AXERA_SPI_NAND)
 #define DW_SPI_CTRL0            0x00
 #define DW_SPI_CTRL1            0x04
 #define DW_SPI_SSIENR           0x08
+#define DW_SPI_SER              0x10
 #define DW_SPI_TXFLR            0x20
 #define DW_SPI_RXFLR            0x24
 #define DW_SPI_SR               0x28
@@ -266,6 +268,8 @@ struct AxeraSpiNandState {
     bool ssienr;
     uint32_t program_column;
     uint32_t program_idx;
+    bool debug;
+    bool ser_seen;      /* guest drives chip select through SER */
     uint8_t program_cache[SPINAND_CACHE_SIZE];
 
     uint8_t rxq[AXERA_SPI_NAND_RXQ_MAX];
@@ -354,13 +358,23 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
             uint32_t row = (s->cmd_buf[1] << 16) | (s->cmd_buf[2] << 8) |
                            s->cmd_buf[3];
             uint64_t off = (uint64_t)row * SPINAND_PAGE_SIZE;
-            uint32_t len = MIN((uint32_t)sizeof(s->program_cache),
-                               s->flash_size > off ?
-                               (uint32_t)MIN((uint64_t)SPINAND_CACHE_SIZE,
-                                             s->flash_size - off) : 0);
+            /*
+             * Only the 2048 data bytes land in the flat image: it has no
+             * room for OOB, and copying the whole 2112-byte cache would
+             * spill the 64 OOB bytes over the start of the next page (and
+             * over the next block's UBI EC header for the last page of a
+             * block). Programming can only clear bits, as on real NAND.
+             */
+            uint32_t len = s->flash_size > off ?
+                           (uint32_t)MIN((uint64_t)SPINAND_PAGE_SIZE,
+                                         s->flash_size - off) : 0;
 
-            if (len) {
-                memcpy(s->flash + off, s->program_cache, len);
+            for (i = 0; i < len; i++) {
+                s->flash[off + i] &= s->program_cache[i];
+            }
+            if (s->debug) {
+                qemu_log("spinand: PROG_EXEC row 0x%x col %u n %u\n", row,
+                         s->program_column, s->program_idx);
             }
         }
         break;
@@ -376,6 +390,9 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
 
             if (len) {
                 memset(s->flash + block_off, 0xff, len);
+            }
+            if (s->debug) {
+                qemu_log("spinand: ERASE row 0x%x\n", row);
             }
         }
         break;
@@ -479,6 +496,10 @@ static void axera_spi_nand_write(void *opaque, hwaddr offset, uint64_t value,
 {
     AxeraSpiNandState *s = opaque;
 
+    if (s->debug && getenv("AXERA_NAND_DEBUG")[0] == '2') {
+        qemu_log("spinand: w %02x=%08x size %u act %d\n", (unsigned)offset,
+                 (uint32_t)value, size, s->program_active);
+    }
     switch (offset) {
     case DW_SPI_TXFLR:
     case DW_SPI_RXFLR:
@@ -500,11 +521,37 @@ static void axera_spi_nand_write(void *opaque, hwaddr offset, uint64_t value,
              * U-Boot's own READID, which legitimately toggles SSIENR
              * mid-command).
              */
-            if (!enable && s->ssienr && s->program_active) {
+            if (!enable && s->ssienr && s->program_active && !s->ser_seen) {
+                if (s->debug) {
+                    qemu_log("spinand: LOAD end col %u n %u\n",
+                             s->program_column, s->program_idx);
+                }
                 s->program_active = false;
                 s->cmd_len = 0;
             }
             s->ssienr = enable;
+        }
+        s->mem[offset / 4] = value;
+        return;
+    case DW_SPI_SER:
+        /*
+         * Linux's spi-dw toggles SSIENR around every spi_transfer, so a
+         * spi-mem PROGRAM_LOAD (cmd+column transfer, then the DMA data
+         * transfer) spans an SSIENR falling edge. What brackets a whole
+         * spi_message on this kernel is its SER (chip select) write: it
+         * is written (always 1, never back to 0) once at the start of
+         * every message, and never between that message's transfers.
+         * Once the guest is seen doing that, SER alone ends an open
+         * PROGRAM_LOAD -- the next message (PROGRAM_EXECUTE) begins.
+         */
+        s->ser_seen = true;
+        if (s->program_active) {
+            if (s->debug) {
+                qemu_log("spinand: LOAD end(cs) col %u n %u\n",
+                         s->program_column, s->program_idx);
+            }
+            s->program_active = false;
+            s->cmd_len = 0;
         }
         s->mem[offset / 4] = value;
         return;
@@ -523,6 +570,7 @@ static void axera_spi_nand_write(void *opaque, hwaddr offset, uint64_t value,
              * to the same address reads back what was actually set. */
             s->feature_regs[s->pending_set_feature_addr] = value & 0xff;
             s->pending_set_feature_addr = -1;
+    s->debug = getenv("AXERA_NAND_DEBUG") && getenv("AXERA_NAND_DEBUG")[0];
             return;
         }
         if (s->cmd_len < sizeof(s->cmd_buf)) {
@@ -546,7 +594,14 @@ static const MemoryRegionOps axera_spi_nand_ops = {
     .read = axera_spi_nand_read,
     .write = axera_spi_nand_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    /*
+     * The AX620U kernel's spi-dw-dma path feeds DR through the DW AXI
+     * DMAC model, which moves one byte per access: accept byte/halfword
+     * accesses (widened to one 32-bit DR access each) instead of
+     * silently dropping them -- which lost every page-program payload.
+     */
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
 static void axera_spi_nand_realize(DeviceState *dev, Error **errp)

@@ -220,36 +220,27 @@ below.
   fix that unblocked U-Boot's higher-level MMC core, not yet
   root-caused. `uboot-file=` (above) is the complete, verified
   alternative that skips BL1 entirely.
-- **No ISP, VENC/VDEC, or NPU device model.** The onekvm kernel fork has
-  open drivers for VIN/CSI2 capture, the VC8000E encoder and a Hantro
-  decoder path for AX630C; the camera-sensor ISP 3A pipeline and the NPU
-  remain closed vendor code on every chip in the family, with no public
-  kernel-driver source anywhere (checked directly: the vendor SDKs'
-  `osdrv` driver directories hold only a `Makefile` per subsystem, zero
-  `.c` files, confirmed independently by a third-party audit in
-  `sipeed/maix_ax620e_sdk` issue #2). Emulating their registers usefully
-  would need that source or a register-level trace against real
-  silicon. This gap is also why the real camera app's RTSP server never
-  completes an inbound connection on either AX620E or AX620U, even
-  though ethernet/TCP delivery itself is confirmed fully correct (SYN
-  packets arrive, checksums validate, interrupts fire and are
-  acknowledged, and the TCP handshake itself genuinely completes). This
-  was confirmed directly on both platforms, not just inferred: building
-  a working host gdb from source (the prebuilt cross-gdbs are broken on
-  this host) and attaching it to QEMU's own `-gdb` stub -- no in-guest
-  gdbserver needed, since the real rootfs's busybox has neither `tftp`
-  nor `nc`/`wget` compiled in on either platform -- hardware breakpoints
-  on the real App binary's `accept()`/`select()`/`listen()` PLT stubs
-  (it's a non-PIE `ET_EXEC` binary on both chips, so these are fixed,
-  known addresses) showed the app's own threads actively
-  `select()`-polling thousands of times a second while a real inbound
-  connection sat in the kernel's accept backlog -- `accept()` itself is
-  simply never called, identically on AX620E (aarch64) and AX620U
-  (32-bit ARM, a completely different cross-compiled binary). The app
-  is not hung; this one connection-acceptance path specifically never
-  executes, consistent with it being gated on video-pipeline health
-  that's never true here without real ISP/VPSS pixel data, though the
-  exact upstream gate was not pinned down.
+- **The camera pipeline runs end to end on the real Xiongmai firmware,
+  without real pixels.** Both AX620E (`flash-file=` of an IVG-A6 dump)
+  and AX620U (a JFtech IPC_AX620U_A8 dump) boot the vendor App and serve
+  H.265 over RTSP (`rtsp://<cam>:554/user=admin&password=&channel=1&stream=0.sdp`;
+  `qemu-boot/axera-rtsp-pull.py` pulls it). What the models do:
+  - VIN/ISP (`axera-vin`): fires the frame-start/end events the closed
+    `ax_proton.ko` has unmasked, at 30 fps; per-SoC `quiet-*` props keep
+    the WDMA error events it also unmasks silent (on AX620U they would
+    drop every frame and stop the AI-ISP user-IRQ forward), `poll-*`
+    props latch the RLTM histogram bit it polls instead of unmasking.
+  - NPU (`axera-npu`, AX620U): jobs complete without computing anything,
+    which is enough for the AI-ISP denoise stage and the App's detection
+    models to keep running.
+  - IVPS engines (`axera-ivps-engine`): VPP/GDC/TDP/DPU on AX620E,
+    TDP/GDC/DPU on AX620U; jobs complete, pixels are not processed.
+  - VENC (`axera-vcmd`): the VeriSilicon VCMD front end plus a software
+    H.264/HEVC/JPEG encoder. The frames reaching it are empty, so it
+    encodes a moving colour-bar test card instead -- which is what the
+    RTSP stream shows.
+  The App reboots on zero bitrate unless `/mnt/mtd/Config/NoBitNoReboot.flag`
+  exists; create it after login. No real sensor pixel data is modelled.
 - **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both
   use a vendor spin-table (`secondary-boot-reg`), not PSCI. AX620U
   reuses QEMU's own generic `default_write_secondary()`
@@ -268,6 +259,5 @@ below.
   OS04A10 (slave address 0x36, chip ID 0x53/0x04/0x41 at register
   0x300A, matching the vendor SDK's own `os04a10.c` exactly). Both let
   the real camera app's sensor-probe/ID-read succeed and load its real
-  tuning files, but neither delivers actual pixel data -- there is still
-  no ISP/VPSS frame pipeline (see below), so the camera app's own video
-  path fails downstream of a successful sensor probe either way.
+  tuning files, but neither delivers actual pixel data; the video path
+  downstream runs on synthetic events and a test card (see above).

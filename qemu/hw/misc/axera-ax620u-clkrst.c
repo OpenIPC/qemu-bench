@@ -103,6 +103,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "qom/object.h"
@@ -209,40 +210,13 @@ static uint64_t axera_ax620u_clkrst_read(void *opaque, hwaddr offset,
     return s->regs[offset / 4];
 }
 
-static void axera_ax620u_clkrst_do_dma(AxeraAx620uClkrstState *s,
-                                       uint32_t base, uint32_t dir,
-                                       bool raise_irq)
+static void axera_ax620u_clkrst_do_block(uint64_t sar, uint64_t dar,
+                                         uint32_t count, uint32_t dir);
+
+static void axera_ax620u_clkrst_do_block(uint64_t sar, uint64_t dar,
+                                         uint32_t count, uint32_t dir)
 {
-    uint64_t sar = s->regs[(base + DMA_SAR_OFF) / 4];
-    uint64_t dar = s->regs[(base + DMA_DAR_OFF) / 4];
-    uint32_t count = s->regs[(base + DMA_LEN_OFF) / 4] + 1;
-    uint32_t desc_ptr = s->regs[(base + DMA_DESC_OFF) / 4];
     uint32_t i;
-
-    if (desc_ptr != 0) {
-        /* LLI-descriptor mode: +0x28 holds a pointer to a software
-         * descriptor in guest RAM (sar_lo @ +0, sar_hi @ +4, dar_lo @
-         * +8, dar_hi @ +0xc, len-1 @ +0x10, ...) that U-Boot's own
-         * axi_dma_xfer_start() builds for every transfer, even a
-         * single, unchained one -- the flat +0x00/+0x08/+0x10
-         * registers are only what BL1's own, simpler driver uses
-         * directly; U-Boot always goes through a descriptor instead,
-         * so the real sar/dar/len live in RAM, not in those flat
-         * registers (confirmed live: the flat DAR register still held
-         * a stale, unrelated value from BL1's own earlier, unrelated
-         * use of this same register while the descriptor's own dar_lo
-         * held the real, correct destination).
-         */
-        uint32_t desc[5];
-
-        address_space_read(&address_space_memory, desc_ptr,
-                           MEMTXATTRS_UNSPECIFIED, desc, sizeof(desc));
-        sar = desc[0];
-        dar = desc[2];
-        count = desc[4] + 1;
-    }
-
-    s->dma_desc_dirty = false;
 
     if (dir == DMA_DIR_DEV_TO_MEM) {
         /*
@@ -304,6 +278,72 @@ static void axera_ax620u_clkrst_do_dma(AxeraAx620uClkrstState *s,
                                 MEMTXATTRS_UNSPECIFIED, &word, sizeof(word));
         }
         address_space_cache_destroy(&cache);
+    }
+
+}
+
+static void axera_ax620u_clkrst_do_dma(AxeraAx620uClkrstState *s,
+                                       uint32_t base, uint32_t dir,
+                                       bool raise_irq)
+{
+    uint64_t sar = s->regs[(base + DMA_SAR_OFF) / 4];
+    uint64_t dar = s->regs[(base + DMA_DAR_OFF) / 4];
+    uint32_t count = s->regs[(base + DMA_LEN_OFF) / 4] + 1;
+    uint32_t desc_ptr = s->regs[(base + DMA_DESC_OFF) / 4];
+
+    if (desc_ptr != 0) {
+        /* LLI-descriptor mode: +0x28 holds a pointer to a software
+         * descriptor in guest RAM (sar_lo @ +0, sar_hi @ +4, dar_lo @
+         * +8, dar_hi @ +0xc, len-1 @ +0x10, ...) that U-Boot's own
+         * axi_dma_xfer_start() builds for every transfer, even a
+         * single, unchained one -- the flat +0x00/+0x08/+0x10
+         * registers are only what BL1's own, simpler driver uses
+         * directly; U-Boot always goes through a descriptor instead,
+         * so the real sar/dar/len live in RAM, not in those flat
+         * registers (confirmed live: the flat DAR register still held
+         * a stale, unrelated value from BL1's own earlier, unrelated
+         * use of this same register while the descriptor's own dar_lo
+         * held the real, correct destination).
+         */
+        /*
+         * dw-axi-dmac LLI layout: sar u64 @0, dar u64 @8, block_ts
+         * @0x10, llp u64 @0x18 (next descriptor, low 6 bits reserved),
+         * ctl_lo @0x20, ctl_hi @0x24 (bit 30 = LLI_LAST, bit 31 =
+         * LLI_VALID). The Linux driver splits a transfer over a chain
+         * of these (a 2112-byte SPI-NAND page program arrives as four
+         * 528-byte blocks); U-Boot's descriptors are single blocks
+         * whose llp is 0. Walk the whole chain.
+         */
+        uint32_t desc[10];
+        int n;
+
+        s->dma_desc_dirty = false;
+        for (n = 0; n < 256 && desc_ptr; n++) {
+            address_space_read(&address_space_memory, desc_ptr,
+                               MEMTXATTRS_UNSPECIFIED, desc, sizeof(desc));
+            if (getenv("AXERA_DMAC_DEBUG")) {
+                qemu_log("ax620u-dma: desc %08x dir %u sar %08x dar %08x ts %u llp %08x ctl %08x:%08x\n",
+                         desc_ptr, dir, desc[0], desc[2], desc[4], desc[6],
+                         desc[8], desc[9]);
+            }
+            /*
+             * block_ts counts items of the SOURCE width (ctl_lo[10:8],
+             * log2 bytes): the kernel's page program reads memory 32
+             * bits at a time (528 items = 2112 bytes) into the 8-bit
+             * DR FIFO, so the byte count is (ts+1) << src_width.
+             */
+            axera_ax620u_clkrst_do_block(desc[0], desc[2],
+                                         (desc[4] + 1) << ((desc[8] >> 8) & 7),
+                                         dir);
+            if ((desc[9] & BIT(30)) || desc[6] == 0 ||
+                (desc[6] & ~0x3fU) == desc_ptr) {
+                break;
+            }
+            desc_ptr = desc[6] & ~0x3fU;
+        }
+    } else {
+        s->dma_desc_dirty = false;
+        axera_ax620u_clkrst_do_block(sar, dar, count, dir);
     }
 
     if (raise_irq) {

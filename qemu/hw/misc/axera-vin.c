@@ -186,6 +186,21 @@ struct AxeraVinState {
      * the "sensor-streaming" input says it is streaming. */
     bool gate_on_sensor;
     bool sensor_streaming;
+    /* Where this SoC's ISP puts its CDMA command trigger(s): AX620E's
+     * single one at 0x1008; AX620U's IFE and ITP ones at 0x3008 and
+     * 0x83008 (isp_ife/itp_cdma_cmd_cpu_trigger_* in its ax_proton.ko). */
+    uint32_t cdma_ctrl;
+    uint32_t cdma_ctrl2;
+    /* Event bits never raised by the tick, at one register block
+     * (quiet-off = its MASK offset): error/overflow events the driver
+     * unmasks to count, which healthy hardware does not report. */
+    uint32_t quiet_off;
+    uint32_t quiet_bits;
+    /* Event bits latched in RAW every tick even though masked: status
+     * the driver polls rather than takes as an interrupt (poll-off =
+     * that block's MASK offset). */
+    uint32_t poll_off;
+    uint32_t poll_bits;
 };
 
 enum { FIELD_MASK = 0, FIELD_CLEAR = 1, FIELD_RAW = 2, FIELD_STATUS = 3 };
@@ -309,7 +324,14 @@ static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
         s->cdma_info1 = val;
         return;
     }
-    if (off == CDMA_CTRL0) {
+    if (off == s->cdma_ctrl || (s->cdma_ctrl2 && off == s->cdma_ctrl2)) {
+        if (getenv("AXERA_VIN_DEBUG") && val != 0) {
+            static int n;
+            if (n++ < 20) {
+                qemu_log("axera-vin: cdma trigger [0x%05" HWADDR_PRIx "] = %08x\n",
+                         off, (uint32_t)val);
+            }
+        }
         if (val != 0) {
             axera_vin_cdma_trigger(s);
         }
@@ -323,6 +345,10 @@ static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
     }
     switch (field) {
     case FIELD_MASK:
+        if (getenv("AXERA_VIN_DEBUG") && s->mask[range][ch] != val) {
+            qemu_log("axera-vin: mask r%d ch%d [0x%05" HWADDR_PRIx "] %08x -> %08x\n",
+                     range, ch, off, s->mask[range][ch], (uint32_t)val);
+        }
         s->mask[range][ch] = val;
         break;
     case FIELD_CLEAR:
@@ -374,7 +400,20 @@ static void axera_vin_tick(void *opaque)
     if (!s->gate_on_sensor || s->sensor_streaming) {
         for (range = 0; range < AXERA_VIN_RANGES; range++) {
             for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
-                s->raw[range][ch] |= s->mask[range][ch];
+                uint32_t ev = s->mask[range][ch];
+                int qr, qc, qf;
+
+                if (s->quiet_bits &&
+                    axera_vin_decode(s->quiet_off, &qr, &qc, &qf) &&
+                    qr == range && qc == ch) {
+                    ev &= ~s->quiet_bits;
+                }
+                if (s->poll_bits &&
+                    axera_vin_decode(s->poll_off, &qr, &qc, &qf) &&
+                    qr == range && qc == ch) {
+                    ev |= s->poll_bits;
+                }
+                s->raw[range][ch] |= ev;
             }
             axera_vin_update_irq(s, range);
         }
@@ -427,6 +466,12 @@ static void axera_vin_init(Object *obj)
 static const Property axera_vin_props[] = {
     DEFINE_PROP_UINT32("fps", AxeraVinState, fps, 30),
     DEFINE_PROP_BOOL("gate-on-sensor", AxeraVinState, gate_on_sensor, false),
+    DEFINE_PROP_UINT32("cdma-ctrl", AxeraVinState, cdma_ctrl, CDMA_CTRL0),
+    DEFINE_PROP_UINT32("cdma-ctrl2", AxeraVinState, cdma_ctrl2, 0),
+    DEFINE_PROP_UINT32("quiet-off", AxeraVinState, quiet_off, 0),
+    DEFINE_PROP_UINT32("quiet-bits", AxeraVinState, quiet_bits, 0),
+    DEFINE_PROP_UINT32("poll-off", AxeraVinState, poll_off, 0),
+    DEFINE_PROP_UINT32("poll-bits", AxeraVinState, poll_bits, 0),
 };
 
 static void axera_vin_realize(DeviceState *dev, Error **errp)

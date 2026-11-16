@@ -38,6 +38,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
+#include "qemu/log.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
 #include "system/memory.h"
@@ -125,6 +126,13 @@ static void axera_axi_dmac_do_transfer(AxeraAxiDmacState *s, int ch)
                       DWAXIDMAC_CH_CTL_L_NOINC;
     uint32_t xfer_len = block_ts + 1;
     uint32_t i;
+
+    if (getenv("AXERA_DMAC_DEBUG")) {
+        qemu_log("axi-dmac: ch%d sar %" PRIx64 " dar %" PRIx64 " ts %u ctl %08x:%08x cfg %08x:%08x llp %08x:%08x\n",
+                 ch, sar, dar, block_ts, ctl_l, s->chan[ch][CH_CTL_H / 4],
+                 s->chan[ch][CH_CFG_L / 4], s->chan[ch][CH_CFG_H / 4],
+                 s->chan[ch][CH_LLP / 4], s->chan[ch][CH_LLP / 4 + 1]);
+    }
 
     for (i = 0; i < xfer_len; i++) {
         uint8_t byte;
