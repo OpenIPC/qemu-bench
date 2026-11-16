@@ -109,6 +109,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiFemacState, HISI_FEMAC)
 #define REG_GLB_IRQ_RAW         0x1338
 #define REG_MAC_FILTER_BASE     0x1400
 
+/* GLB_SOFT_RESET bits (hisi_femac.c: SOFT_RESET_ALL BIT(0)) */
+#define SOFT_RESET_ALL          (1 << 0)
+
 /* IRQ bits */
 #define IRQ_RX_RDY              (1 << 0)
 #define IRQ_TX_PER_PACKET       (1 << 1)
@@ -687,6 +690,34 @@ static void hisi_femac_write(void *opaque, hwaddr offset, uint64_t val,
         s->hostmac_h16 = val;
         break;
     case REG_GLB_SOFT_RESET:
+        /*
+         * Asserting SOFT_RESET_ALL resets the MAC, and a reset MAC has
+         * forgotten every RX buffer the driver had posted to it.  Dropping
+         * them here is not housekeeping -- it is the whole point.
+         *
+         * hisi_femac_net_close() calls hisi_femac_free_skb_rings(), which
+         * dma_unmap_single()s and frees every posted skb, and the driver
+         * brackets open/close with hisi_femac_port_reset().  Keeping the
+         * addresses across the reset left us holding kernel pointers the
+         * guest had freed and the page allocator had handed to something
+         * else; the next frame to arrive was DMA'd straight into them.
+         *
+         * The damage lands wherever those pages went, so the guest dies
+         * later in whatever walks them -- anon_vma_interval_tree_remove,
+         * __rb_insert_augmented, unmap_vmas, set_page_dirty -- with nothing
+         * pointing back at the NIC.  Removing the interface made it go away
+         * (0/8 panics with -net none, 5/8 with the NIC attached).
+         */
+        if ((val & SOFT_RESET_ALL) && !(s->soft_reset & SOFT_RESET_ALL)) {
+            s->rx_ring_head = 0;
+            s->rx_ring_tail = 0;
+            s->rx_ring_count = 0;
+            s->iqfrm_des_head = 0;
+            s->iqfrm_des_tail = 0;
+            s->iqfrm_des_count = 0;
+            s->irq_raw &= ~(IRQ_RX_RDY | IRQ_MULTI_RXRDY);
+            hisi_femac_update_irq(s);
+        }
         s->soft_reset = val;
         break;
     case REG_GLB_FWCTRL:
