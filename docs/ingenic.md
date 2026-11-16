@@ -2308,22 +2308,50 @@ client copies the frames into rmem through `/dev/mem` and the host reads
 them with the monitor's `pmemsave`; T40's IMP also hangs in its
 teardown, so the verdict comes first.
 
-### majestic on T40: a digital twin
+### majestic on T40 and T41: a digital twin
 
 `qemu-boot/test-ingenic-majestic.sh` runs the streamer OpenIPC ships, or a
-build of it (`--majestic BIN`), on a T40N with a GC4653
-(`t40,variant=t40n,sensor=gc4653 -m 128M`), to reproduce what a T40 owner
-reports without the camera. The root is the `t40` lite release's, rebuilt
-with an init of the test's own: the release's `load_ingenic` loads
-`tx-isp-t40`, the sensor driver, `audio.ko` and `avpu` as on the camera,
-then majestic starts with a `majestic.yaml` the test writes (H.264 on the
-main channel, `colorToGray`, the IR-cut pins, and a light sensor on PB17).
+build of it (`--majestic BIN`), to reproduce what an owner reports without
+the camera:
+
+- `--soc t40` (the default): a T40N with a GC4653
+  (`t40,variant=t40n,sensor=gc4653 -m 128M`) on the `t40` lite release's
+  kernel and root.
+- `--soc t41`: a T41NQ with a GC4663 (`t41,variant=t41nq,sensor=gc4663
+  -m 128M`, `mem=74M@0x0 rmem=45M@0x4A00000 nmem=9M@0x7700000`, as on an
+  owner's T41NQ, OpenIPC/majestic#376). OpenIPC has no T41 release, so the
+  root is still the `t40` lite release's -- the same musl userland, and
+  T41's libimp is uClibc-built like T40's -- with the T41 SDK 1.2.0's
+  `libimp`, `libalog` and `libsysutils`, and the vendor modules and the
+  sensor setting out of its 16 MiB T41NQ image (`--sdk`, or `T41_SDK`; the
+  test skips without it). `load_ingenic` is a stand-in that loads them
+  with the parameters measured on that camera (`tx-isp-t41.ko
+  clk_name=mpll isp_clk=300000000 direct_mode=0`). majestic must be a
+  `t41` build.
+
+The camera boots as a camera does. OpenIPC's `/init` mounts the JFFS2
+`rootfs_data` partition as the overlay, busybox init runs the release's rc
+scripts, `S70vendor` loads the vendor modules, and `S95majestic` starts
+majestic under its supervisor with a `majestic.yaml` the test writes (H.264
+on both channels, JPEG, `colorToGray`, the IR-cut pins, and a light sensor
+on PB17). What majestic saves is saved, and survives a power cycle
+(`--reboot`). T41 needs a kernel with overlayfs for that, and the SDK's
+has none: OpenIPC's `/init` then leaves the root read-only, which no
+camera does. `qemu-boot/build-ingenic-t41-kernel.sh` builds the SDK's own
+4.4.94 (`isvp_tomcat_defconfig`) with `CONFIG_OVERLAY_FS` and nothing else
+changed, so the SDK's prebuilt modules still load; the test builds it on
+first use. The twin adds three things: `S00twin` gives seedrng a
+creditable seed on every boot and turns libimp's MXU2 paths off,
+`rc.local` mirrors the syslog (`majestic -s` logs there) to the console,
+and root has a password, since an unclaimed camera streams nothing.
+
 The checks:
 
 - majestic brings the SDK up -- with `--audio`, with the microphone on,
   which OpenIPC/majestic#257 was about (the T40 build stopped at
   `IMP_AI_SetChnParam() failed`; a release from before the fix fails this
   check here the same way, and CI runs the test with `--audio`);
+- 50 pictures of each RTSP stream decode, and `/image.jpg` is a JPEG;
 - the host pulls PB17 low (`qom-set /machine/gpio pb 0xfffdffff`), and
   majestic changes to night; it lets it go, and majestic changes back;
 - the change reaches the ISP. `-global ingenic-isp.trace-regs=on` logs
@@ -2333,7 +2361,18 @@ The checks:
   tuning set. A build whose switch never reached the ISP
   (OpenIPC/majestic#258: the call handed back the mode it had just read)
   logs "Change mode to NIGHT" all the same and writes 8 to 15, the
-  per-frame curves' drift. `--min-night-regs` (100) is the line.
+  per-frame curves' drift. `--min-night-regs` (100) is the line. T41
+  writes about 560;
+- a setting written through the API is saved, and with `--reboot` it is
+  still there after QEMU is killed and booted again from the same flash.
+  This comes last, because it rebuilds the pipeline, and on T40 the IMP
+  teardown hangs here (majestic logs the reload and never starts the SDK
+  again; T41 tears down and starts again).
+
+A T41NQ can report the T40 family's SoC ID: an owner's reads
+`0x1300002c = 0x10040003` with subtype `0xAAAA`, and ipctool then takes it
+down its T40 branch, where `0xAAAA` has no name. `variant=t41nq` reports
+that ID; the other T41 grades keep `0x10041003`.
 
 The picture itself does not turn grey: the model paints the scene from
 the exposure alone (above), so the twin shows that the night settings are
@@ -2341,9 +2380,11 @@ written, not what they do to the colour.
 
 The machine gathers almost no entropy (`jitterentropy` refuses it), and
 the kernel's pool never initialises on its own: majestic would wait in
-`getrandom()` before it reads its configuration, for good. The init gives
-the release's busybox `seedrng` a creditable seed; the pool is ready about
-a minute into the boot, and the SDK a second after that.
+`getrandom()` before it reads its configuration, for good. `S00twin`
+gives the release's busybox `seedrng` a creditable seed on every boot --
+the seed seedrng saves for the next one is not creditable here, so after
+a power cycle the pool would never be ready; it is ready about a minute
+into the boot, and the SDK a second after that.
 
 With the microphone on, the release's `audio.ko` and `libimp.so` record
 for about a second -- majestic gets 20 ms frames of the codec's 1 kHz tone

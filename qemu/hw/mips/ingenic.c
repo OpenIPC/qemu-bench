@@ -278,6 +278,8 @@ typedef struct IngenicVariant {
     IngenicSoc soc;
     uint8_t cppsr;
     uint16_t code;
+    uint32_t soc_id;        /* HARB0 0x2C where the grade's differs from
+                             * its family's; 0: the family's */
 } IngenicVariant;
 
 static const IngenicVariant ingenic_variants[] = {
@@ -310,7 +312,10 @@ static const IngenicVariant ingenic_variants[] = {
     { "t40nn", INGENIC_T40, 0x01, 0x8888 },
     { "t40xp", INGENIC_T40, 0x01, 0x7777 },
     { "t40a",  INGENIC_T40, 0x01, 0x4444 },
-    { "t41nq", INGENIC_T41, 0x01, 0xaaaa },
+    /* 0x10040003 read on an owner's T41NQ (OpenIPC/majestic#376): the T40
+     * family's ID, so ipctool goes down its T40 branch, where 0xAAAA has
+     * no name */
+    { "t41nq", INGENIC_T41, 0x01, 0xaaaa, 0x10040003 },
     { "t41n",  INGENIC_T41, 0x01, 0x1111 },
     { "t41l",  INGENIC_T41, 0x01, 0x3333 },
     { "t41lq", INGENIC_T41, 0x01, 0x9999 },
@@ -985,6 +990,7 @@ static void ingenic_init(MachineState *ms)
     MemoryRegion *car = g_new(MemoryRegion, 1);
     MemoryRegion *usbphy;
     const IngenicVariant *var;
+    uint32_t soc_id;
     CPUMIPSState *env;
     DeviceState *dev, *gpio, *cpm, *pdma, *uart[6] = { NULL };
     DeviceState *i2c[5] = { NULL };
@@ -1005,6 +1011,7 @@ static void ingenic_init(MachineState *ms)
         }
         exit(1);
     }
+    soc_id = var->soc_id ? var->soc_id : info->soc_id;
     if (ms->ram_size > 256 * MiB) {
         error_report("ingenic: at most 256 MiB of RAM fit below the I/O "
                      "space");
@@ -1713,7 +1720,7 @@ static void ingenic_init(MachineState *ms)
     dev = qdev_new("ingenic-efuse");
     /* the chip ID's first word: the SoC ID, unless -global set one */
     if (!object_property_get_uint(OBJECT(dev), "chipid0", NULL)) {
-        qdev_prop_set_uint32(dev, "chipid0", info->soc_id);
+        qdev_prop_set_uint32(dev, "chipid0", soc_id);
     }
     qdev_prop_set_uint32(dev, ingenic_is_xburst2(info->soc) ?
                          "subsoctype2" : "subsoctype1",
@@ -1723,7 +1730,7 @@ static void ingenic_init(MachineState *ms)
 
     /* the AHB0 arbiter, with the SoC ID */
     dev = qdev_new("ingenic-harb");
-    qdev_prop_set_uint32(dev, "soc-id", info->soc_id);
+    qdev_prop_set_uint32(dev, "soc-id", soc_id);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, HARB0_BASE);
 
@@ -2228,6 +2235,8 @@ static const IngenicSocInfo ingenic_socs[] = {
         .sfc_version = 2, .mtd_id = "sfc0_nor",
         .nand_mtd_id = "sfc0_nand", .has_sfc1 = true,
         .rtc_base = RTC_BASE, .max_cpus = 2, .num_i2c = 3,
+        /* not measured on a T41: the one read (a T41NQ) gave the T40
+         * family's, which its variant overrides */
         .soc_id = 0x10041003, .prid = 0, .l1_kib = 0,
         /* one VIC, one CSI host; the scaler at 0x133F0000 */
         .isp = "t41", .isp_base = ISP_BASE, .vic_base = 0x13380000,

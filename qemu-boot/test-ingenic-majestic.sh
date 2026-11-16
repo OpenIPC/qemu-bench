@@ -1,37 +1,55 @@
 #!/bin/bash
-# majestic on an emulated Ingenic T40N camera with a GC4653: a digital
-# twin for reproducing what a T40 owner reports (docs/ingenic.md,
-# "majestic").
+# majestic on an emulated Ingenic camera: a digital twin for reproducing
+# what a T40 or T41 owner reports (docs/ingenic.md, "majestic").
 #
-# The OpenIPC t40 lite release's kernel and root, the root rebuilt with an
-# init of our own: the release's load_ingenic loads the vendor modules
-# (tx-isp-t40, the GC4653 driver, audio.ko, avpu) as on the camera, then
-# majestic runs with a majestic.yaml written here.  --majestic puts another
-# binary in the release's place, a local build to try a fix on.
+#   t40  a T40N with a GC4653: the OpenIPC t40 lite release's kernel and
+#        root, its own majestic or --majestic BIN.
+#   t41  a T41NQ with a GC4663.  OpenIPC has no T41 release, so the root is
+#        still the t40 lite release's (the same musl userland; T41's
+#        libimp is uClibc-built like T40's, and runs on the same shim), and
+#        the rest comes from the T41 SDK 1.2.0 (--sdk): its libimp,
+#        libalog and libsysutils, its vendor modules and sensor setting
+#        out of the 16 MiB T41NQ image, and its kernel rebuilt with
+#        overlayfs (build-ingenic-t41-kernel.sh, or --kernel).  majestic
+#        has to be a t41 build: --majestic BIN is required.
 #
-# What is checked, from the console and from QEMU:
+# The camera boots as a camera does: OpenIPC's /init mounts the JFFS2
+# rootfs_data partition as the overlay, so what majestic saves stays saved
+# (across a --reboot, too), busybox init runs the release's rc scripts,
+# S70vendor loads the vendor modules through load_ingenic (on t41 a
+# stand-in with the module parameters measured on an owner's T41NQ,
+# OpenIPC/majestic#376), and S95majestic starts majestic under its
+# supervisor.  The twin adds three things: S00twin touches /tmp/closesimd
+# (libimp's MXU2 paths are not modelled), a creditable seedrng seed (the
+# machine gathers almost no entropy, and getrandom() would hold majestic
+# before it reads its config for good), and rc.local mirrors the syslog,
+# where majestic -s logs, to the console the checks read.  root's password
+# is 12345: an unclaimed camera streams nothing.
+#
+# What is checked, from the console, the network and QEMU:
 #   - majestic brings the SDK up ("Ingenic SDK started");
 #   - with --audio, with the microphone on (audio.enabled: true), which a
 #     T40 build could not do before OpenIPC/majestic#257;
+#   - 50 pictures of each RTSP stream decode, and /image.jpg is a JPEG of
+#     the main stream's size;
+#   - a setting written through the API is saved and survives a power
+#     cycle (--reboot);
 #   - day/night from a light sensor: PB17 is nightMode.lightSensorPin, and
 #     the host pulls it low (night) and lets it go (day) through
 #     qom-set /machine/gpio.  majestic must change mode both ways, and the
 #     switch to night must reach the ISP: ingenic-isp.trace-regs logs
 #     every ISP core write, and the night window must write at least
 #     --min-night-regs registers the day before it did not (the night
-#     tuning set: about 980 on this release, against 8 to 15 -- the
+#     tuning set: about 980 on the T40 release, against 8 to 15 -- the
 #     per-frame curves' drift alone -- for a switch that never reached the
 #     ISP, as in OpenIPC/majestic#258).
 #
-# One thing the camera does not need: a seed for the kernel's random pool.
-# The machine gathers almost no entropy, and getrandom() would hold
-# majestic before it reads its config for good; the release's busybox
-# seedrng credits one.  libimp's MXU2 paths are off (/tmp/closesimd), as
-# in the other libimp tests here.
-#
-#   test-ingenic-majestic.sh [--majestic BIN] [--audio] [--work DIR]
-#                            [--qemu Q] [--timeout SECONDS]
+#   test-ingenic-majestic.sh [--soc t40|t41] [--majestic BIN] [--audio]
+#                            [--sdk DIR] [--kernel UIMAGE] [--reboot]
+#                            [--work DIR] [--qemu Q] [--timeout SECONDS]
 #                            [--min-night-regs N] [--keep]
+#   --sdk  the extracted Ingenic-SDK-T41-1.2.0-20230713 (default $T41_SDK);
+#          the test skips (exit 0) without it, as the other T41 tests do
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -43,11 +61,18 @@ AUDIO=false
 TIMEOUT=360
 MIN_NIGHT=100
 KEEP=
+SDK=${T41_SDK:-}
+KERNEL=
+REBOOT=
 
 while [ $# -gt 0 ]; do
     case $1 in
+    --soc) SOC=$2; shift ;;
     --majestic) BIN=$2; shift ;;
     --audio) AUDIO=true ;;
+    --sdk) SDK=$2; shift ;;
+    --kernel) KERNEL=$2; shift ;;
+    --reboot) REBOOT=1 ;;
     --work) WORK=$2; shift ;;
     --qemu) QEMU=$2; shift ;;
     --timeout) TIMEOUT=$2; shift ;;
@@ -57,30 +82,88 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+case $SOC in
+t40) MACHINE=t40,variant=t40n,sensor=gc4653; SENSOR=gc4653
+     MEM="mem=64M rmem=64M@0x4000000"
+     # OpenIPC's 16 MiB NOR
+     KERN_KB=2048; ROOT_KB=8192 ;;
+t41) MACHINE=t41,variant=t41nq,sensor=gc4663; SENSOR=gc4663
+     # an owner's T41NQ (OpenIPC/majestic#376)
+     MEM="mem=74M@0x0 rmem=45M@0x4A00000 nmem=9M@0x7700000"
+     # the SDK kernel is 2.2 MB, more than OpenIPC's 2 MiB slot
+     KERN_KB=2560; ROOT_KB=8192
+     IMAGE=$SDK/resource/image_t41/T41NQ_gcc720_uclibc_16M_202307061021.img
+     if [ -z "$SDK" ] || [ ! -f "$IMAGE" ]; then
+         echo "SKIP: no T41 SDK (--sdk or T41_SDK; the image is not public)"
+         exit 0
+     fi
+     [ -n "$BIN" ] || { echo "--soc t41 needs --majestic (a t41 build)" >&2; exit 2; } ;;
+*) echo "no majestic twin for $SOC" >&2; exit 2 ;;
+esac
+
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
-if [ ! -f "$WORK/uImage.$SOC" ] || [ ! -f "$WORK/rootfs.squashfs.$SOC" ]; then
-    bash "$HERE/fetch-openipc-lite.sh" "$SOC" "$WORK"
+if [ ! -f "$WORK/uImage.t40" ] || [ ! -f "$WORK/rootfs.squashfs.t40" ]; then
+    bash "$HERE/fetch-openipc-lite.sh" t40 "$WORK"
 fi
+if [ $SOC = t41 ] && [ -z "$KERNEL" ]; then
+    KERNEL=$WORK/uImage.t41
+    [ -f "$KERNEL" ] || bash "$HERE/build-ingenic-t41-kernel.sh" "$SDK" "$WORK" >/dev/null
+fi
+KERNEL=${KERNEL:-$WORK/uImage.t40}
 
 RFS=$WORK/rfs
 rm -rf "$RFS"
-unsquashfs -q -d "$RFS" "$WORK/rootfs.squashfs.$SOC" >/dev/null
+unsquashfs -q -d "$RFS" "$WORK/rootfs.squashfs.t40" >/dev/null
 if [ -n "$BIN" ]; then
     cp "$BIN" "$RFS/usr/bin/majestic"
     chmod 755 "$RFS/usr/bin/majestic"
 fi
+if [ $SOC = t41 ]; then
+    cp "$SDK"/sdk/lib/uclibc/{libimp,libalog,libsysutils}.so "$RFS/usr/lib/"
+    # the image: SPL + U-Boot, the uImage at 0x40000, the root at 0x2C0000
+    # and the vendor modules in the JFFS2 at 0x4C0000 (/system)
+    python3 - "$IMAGE" "$WORK/appfs.jffs2" <<'PY'
+import sys
+open(sys.argv[2], 'wb').write(open(sys.argv[1], 'rb').read()[0x4C0000:0xE00000])
+PY
+    rm -rf "$WORK/appfs"
+    jefferson -d "$WORK/appfs" "$WORK/appfs.jffs2" >/dev/null
+    mkdir -p "$RFS/lib/modules/t41"
+    cp "$WORK"/appfs/lib/modules/*.ko "$RFS/lib/modules/t41/"
+    cp "$WORK/appfs/etc/sensor/$SENSOR-t41.bin" "$RFS/etc/sensor/"
+    # OpenIPC's sensor file, for the GC4653's GC4663 sibling (same address
+    # and size)
+    sed "s/gc4653/$SENSOR/" "$RFS/etc/sensor/gc4653.yaml" \
+        > "$RFS/etc/sensor/$SENSOR.yaml"
+    cat > "$RFS/usr/bin/load_ingenic" <<'EOF'
+#!/bin/sh
+# T41 stand-in for the firmware's load_ingenic: the SDK image's modules,
+# with the parameters measured on an owner's T41NQ (OpenIPC/majestic#376)
+cd /lib/modules/t41 || exit 1
+insmod avpu.ko
+insmod sinfo.ko
+echo 1 > /proc/jz/sinfo/info
+insmod tx-isp-t41.ko clk_name=mpll isp_clk=300000000 direct_mode=0
+insmod sensor_gc4663_t41.ko
+EOF
+    chmod 755 "$RFS/usr/bin/load_ingenic"
+fi
 cat > "$RFS/etc/majestic.yaml" <<EOF
 system:
   logLevel: debug
+isp:
+  sensorConfig: /etc/sensor/$SENSOR.yaml
 video0:
   enabled: true
   codec: h264
 video1:
-  enabled: false
+  enabled: true
+  codec: h264
+  size: 640x360
 jpeg:
-  enabled: false
+  enabled: true
 audio:
   enabled: $AUDIO
   outputEnabled: false
@@ -91,55 +174,80 @@ nightMode:
   lightMonitor: true
   lightSensorPin: 49
 EOF
-# fw_printenv writes this on first use, but the root is read-only here
-echo "/dev/mtd1 0x0 0x10000 0x8000" > "$RFS/etc/fw_env.config"
+# claimed: an unclaimed camera streams nothing
+sed -i "s|^root:[^:]*:|root:$(openssl passwd -1 12345):|" "$RFS/etc/shadow"
+# The twin, before S01seedrng on every boot: a creditable seed (the
+# machine gathers no entropy of its own, so the seed seedrng leaves for the
+# next boot is not creditable, and after a power cycle getrandom() would
+# hold majestic for good), and libimp's MXU2 paths off (not modelled)
 head -c 512 /dev/urandom > "$RFS/etc/twin-seed"
-cat > "$RFS/usr/bin/twin-init" <<'EOF'
+cat > "$RFS/etc/init.d/S00twin" <<'EOF'
 #!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-mount -t tmpfs tmp /tmp
-mount -t tmpfs tmp /var
-mkdir -p /dev/shm /var/lock /var/run && mount -t tmpfs shm /dev/shm
-ifconfig lo 127.0.0.1 up
-mkdir -p /var/lib/seedrng && cp /etc/twin-seed /var/lib/seedrng/seed.credit
-seedrng -d /var/lib/seedrng
-load_ingenic -i
+[ "$1" = start ] || exit 0
+mkdir -p /var/lib/seedrng
+cp /etc/twin-seed /var/lib/seedrng/seed.credit
 touch /tmp/closesimd
-echo "TWIN modules: $(lsmod | cut -d' ' -f1 | tr '\n' ' ')"
-exec /usr/bin/majestic
 EOF
-chmod 755 "$RFS/usr/bin/twin-init"
+chmod 755 "$RFS/etc/init.d/S00twin"
+# majestic -s logs to syslog; the checks read the console
+sed -i 's|^exit 0$|logread -f > /dev/console 2>\&1 \&\nexit 0|' "$RFS/etc/rc.local"
+grep -q '^logread -f' "$RFS/etc/rc.local" || { echo "rc.local: no exit 0 to insert before" >&2; exit 1; }
 mksquashfs "$RFS" "$WORK/root.sq" -comp xz -noappend -quiet -all-root >/dev/null
-[ -n "$KEEP" ] || rm -rf "$RFS"
+[ -n "$KEEP" ] || rm -rf "$RFS" "$WORK/appfs"
 
-# OpenIPC's NOR layout with a U-Boot environment that names the sensor
-python3 - "$WORK/nor.bin" "$WORK/uImage.$SOC" "$WORK/root.sq" \
-    sensor=gc4653 soc=$SOC <<'PY'
+# OpenIPC's NOR layout (on t41 after the SDK image's SPL + U-Boot) with a
+# U-Boot environment that names the sensor; rootfs_data erased
+python3 - "$WORK/nor.bin" "$KERNEL" "$WORK/root.sq" "$KERN_KB" "$ROOT_KB" \
+    "${IMAGE:-}" sensor=$SENSOR soc=$SOC <<'PY'
 import struct, sys, zlib
+nor, kernel, root, kern_kb, root_kb, image = sys.argv[1:7]
 img = bytearray(b'\xff' * (16 << 20))
-for path, off in ((sys.argv[2], 0x50000), (sys.argv[3], 0x250000)):
+if image:
+    img[:0x40000] = open(image, 'rb').read()[:0x40000]
+kern_off = 0x50000
+root_off = kern_off + int(kern_kb) * 1024
+for path, off, room in ((kernel, kern_off, int(kern_kb) * 1024),
+                        (root, root_off, int(root_kb) * 1024)):
     data = open(path, 'rb').read()
-    assert len(data) <= 0x800000, path + ' does not fit'
+    assert len(data) <= room, path + ' does not fit'
     img[off:off + len(data)] = data
-env = b''.join(kv.encode() + b'\0' for kv in sys.argv[4:]) + b'\0'
+env = b''.join(kv.encode() + b'\0' for kv in sys.argv[7:]) + b'\0'
 env += b'\0' * (0x10000 - 4 - len(env))
 img[0x40000:0x50000] = struct.pack('<I', zlib.crc32(env)) + env
-open(sys.argv[1], 'wb').write(img)
+open(nor, 'wb').write(img)
 PY
 
-CON=$WORK/console.log
 TRACE=$WORK/isp-trace.log
 MON=$(mktemp -u /tmp/twin.XXXXXX.sock)     # sun_path is 108 bytes
-: > "$CON"
+read -r RTSP HTTP <<< "$(python3 -c '
+import socket
+s = [socket.socket() for _ in range(2)]
+for x in s: x.bind(("127.0.0.1", 0))
+print(*(x.getsockname()[1] for x in s))')"
+QPID=
+# the T40 kernel's SFC driver names the chip jz_sfc, T41's sfc0_nor
+[ $SOC = t40 ] && MTDID=jz_sfc || MTDID=sfc0_nor
+# One console file per boot: QEMU's -serial file: truncates what it opens.
+# Emptied here as well, before QEMU gets to it: a --work directory keeps
+# the last run's, and the checks would read its "Ingenic SDK started" and
+# go on against a camera still booting.
+rm -f "$WORK"/console.*.log
+NBOOT=0
+boot() {
+    NBOOT=$((NBOOT + 1))
+    CON=$WORK/console.$NBOOT.log
+    : > "$CON"
+    "$QEMU" -M "$MACHINE,flash-file=$WORK/nor.bin" -m 128M \
+        -global ingenic-isp.trace-regs=on -display none -serial file:"$CON" \
+        -monitor unix:"$MON",server,nowait \
+        -nic user,restrict=on,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
+        -kernel "$KERNEL" \
+        -append "console=ttyS1,115200n8 root=/dev/mtdblock3 rootfstype=squashfs init=/init mtdparts=$MTDID:256k(boot),64k(env),${KERN_KB}k(kernel),${ROOT_KB}k(rootfs),-(rootfs_data) $MEM" \
+        2>>"$TRACE" &
+    QPID=$!
+}
 : > "$TRACE"
-"$QEMU" -M "$SOC,variant=t40n,sensor=gc4653,flash-file=$WORK/nor.bin" -m 128M \
-    -global ingenic-isp.trace-regs=on -display none -serial file:"$CON" \
-    -monitor unix:"$MON",server,nowait -nic user,restrict=on \
-    -kernel "$WORK/uImage.$SOC" \
-    -append "console=ttyS1,115200n8 root=/dev/mtdblock3 rootfstype=squashfs init=/usr/bin/twin-init mtdparts=jz_sfc:256k(boot),64k(env),2048k(kernel),8192k(rootfs),-(rootfs_data) mem=64M rmem=64M@0x4000000" \
-    2>>"$TRACE" &
-QPID=$!
+boot
 trap 'kill $QPID 2>/dev/null; rm -f "$MON"' EXIT
 
 mon() {
@@ -159,7 +267,7 @@ mark() { echo "=== TWIN $1" >> "$TRACE"; }
 # must be one logged after the stimulus, not an earlier one)
 waitfor() {
     for _ in $(seq "$2"); do
-        tail -n +"${3:-1}" "$CON" | grep -aq -E "$1" && return 0
+        tail -n +"${3:-1}" "$CON" 2>/dev/null | grep -aq -E "$1" && return 0
         kill -0 $QPID 2>/dev/null || return 1
         sleep 1
     done
@@ -172,12 +280,35 @@ check() {       # check DESCRIPTION COMMAND...
     shift
     if "$@"; then echo "  PASS: $what"; else echo "  FAIL: $what"; fail=1; fi
 }
+URL=rtsp://root:12345@127.0.0.1:$RTSP
+decodes() {     # decodes STREAM: 50 pictures, no decoder complaint
+    local err
+    err=$(timeout 180 ffmpeg -nostdin -v error -rtsp_transport tcp \
+        -i "$URL/$1" -frames:v 50 -f null - 2>&1 |
+        grep -v 'non monotonically increasing dts') || true
+    [ -z "$err" ] || { echo "$err" | head -3; return 1; }
+    timeout 60 ffprobe -v error -rtsp_transport tcp -select_streams v \
+        -show_entries stream=width -of csv=p=0 "$URL/$1" | grep -q .
+}
+snapshot() {
+    curl -s -m 60 -u root:12345 -o "$WORK/snap.jpg" \
+        "http://127.0.0.1:$HTTP/image.jpg" &&
+        file "$WORK/snap.jpg" | grep -q "JPEG image data"
+}
+api_get() {     # api_get SECTION KEY
+    curl -s -m 30 -u root:12345 "http://127.0.0.1:$HTTP/api/v1/config.json" |
+        python3 -c 'import json, sys
+print(json.load(sys.stdin).get(sys.argv[1], {}).get(sys.argv[2]))' "$1" "$2"
+}
 
 waitfor 'Ingenic SDK started|Cannot start SDK' "$TIMEOUT" || true
 echo "$SOC, majestic (audio: $AUDIO):"
 check "majestic starts the SDK" grep -aq 'Ingenic SDK started' "$CON"
 if grep -aq 'Ingenic SDK started' "$CON"; then
-    sleep 20            # the ircut exercise and AE settle
+    sleep 5
+    check "the main stream decodes" decodes stream=0
+    check "the second stream decodes" decodes stream=1
+    check "/image.jpg is a JPEG" snapshot
     mark DAY
     sleep 10
     mark NIGHT
@@ -210,13 +341,30 @@ PY
 )
     echo "  ($n ISP registers written at night that the day did not)"
     check "night reaches the ISP" [ "$n" -ge "$MIN_NIGHT" ]
+    # a setting saved: the overlay is the camera's flash.  Last, because
+    # it rebuilds the pipeline, and on T40 the twin's IMP teardown hangs
+    # (the SDK is not started again)
+    check "a setting is saved" curl -sf -m 30 -u root:12345 -o /dev/null \
+        -X POST -H 'Content-Type: application/json' \
+        -d '{"image":{"mirror":true}}' "http://127.0.0.1:$HTTP/api/v1/config"
+    sleep 5
+    if [ -n "$REBOOT" ]; then
+        # a power cycle: the setting must come back from rootfs_data
+        kill $QPID; wait $QPID 2>/dev/null || true
+        boot
+        check "after a power cycle majestic starts again" \
+            waitfor 'Ingenic SDK started' "$TIMEOUT"
+        sleep 5
+        check "the setting survived it" [ "$(api_get image mirror)" = True ]
+        check "the main stream decodes again" decodes stream=0
+    fi
 fi
-if grep -aq -E 'IMP_[A-Za-z_]+\(\) failed|Cannot start SDK' "$CON"; then
-    grep -a -E 'IMP_[A-Za-z_]+\(\) failed|Cannot start SDK' "$CON" | sed 's/\x1b\[[0-9;]*m//g' | head -5
+if cat "$WORK"/console.*.log | grep -aq -E 'IMP_[A-Za-z_]+\(\) failed|Cannot start SDK'; then
+    cat "$WORK"/console.*.log | grep -a -E 'IMP_[A-Za-z_]+\(\) failed|Cannot start SDK' | sed 's/\x1b\[[0-9;]*m//g' | head -5
 fi
-if grep -aq -E 'Oops|Kernel panic' "$CON"; then
+if cat "$WORK"/console.*.log | grep -aq -E 'Oops|Kernel panic'; then
     echo "  FAIL: kernel trouble"
     fail=1
 fi
-[ $fail = 0 ] || echo "console in $CON, ISP trace in $TRACE"
+[ $fail = 0 ] || echo "consoles in $WORK/console.*.log, ISP trace in $TRACE"
 exit $fail
