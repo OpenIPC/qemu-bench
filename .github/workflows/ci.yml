@@ -239,6 +239,12 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-isp.py']
         run: python3 qemu/tests/test-hisi-isp.py
 
+      # V4 audio: capture and playback rings at a lab GK7201V200's values,
+      # the rate from the clock words, a ring nobody reads filling up.
+      - name: HiSilicon V4 AIAO (hisi-aiao)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-aiao.py']
+        run: python3 qemu/tests/test-hisi-aiao.py
+
       # The sensor's timing (sensor-sync): writes latch at frame start,
       # group hold, frame rate from HTS x VTS / pclk, datasheet violations.
       - name: HiSilicon sensor timing (hisi-smartsens, sensor-sync)

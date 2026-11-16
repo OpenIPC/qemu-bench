@@ -1726,6 +1726,8 @@ static const HisiSoCConfig hi3516ev300_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -1840,6 +1842,8 @@ static const HisiSoCConfig hi3516ev200_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -1939,6 +1943,8 @@ static const HisiSoCConfig hi3518ev300_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -2028,6 +2034,8 @@ static const HisiSoCConfig hi3516dv200_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -2154,6 +2162,11 @@ static const HisiSoCConfig hi3516dv200_soc = {
     .femac_irq          = 33,                              \
     .mipi_rx_base       = 0x11240000,                      \
     .mipi_rx_irq        = 45,                              \
+    /* hisi-aiao: audio capture / playback DMA.  The      \
+     * hisi-aiao entry in HISI_V4_REGBANK_LIST is skipped.  \
+     */                                                    \
+    .aiao_base          = 0x100e0000,                      \
+    .aiao_irq           = 42,                              \
     .rtc_base           = 0x120e0000,                      \
     .rtc_irq            = 0,                               \
     .num_sdhci          = 2,                                \
@@ -5975,6 +5988,15 @@ static void hisilicon_common_init(MachineState *machine,
         }
     }
 
+    /* AIAO: audio in / out DMA (V4) */
+    if (c->aiao_base) {
+        DeviceState *aiao = qdev_new("hisi-aiao");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(aiao);
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->aiao_base);
+        sysbus_connect_irq(busdev, 0, pic[c->aiao_irq]);
+    }
+
     /* MIPI RX */
     if (c->mipi_rx_base) {
         DeviceState *mipi = qdev_new("hisi-mipi-rx");
@@ -6188,7 +6210,8 @@ static void hisilicon_common_init(MachineState *machine,
         if (c->regbanks[n].base &&
             c->regbanks[n].base != c->vi_cap_base &&
             c->regbanks[n].base != c->vi_proc_base &&
-            c->regbanks[n].base != c->vpss_base) {
+            c->regbanks[n].base != c->vpss_base &&
+            c->regbanks[n].base != c->aiao_base) {
             /* IVE gets a proper functional device instead of regbank */
             if (!strcmp(c->regbanks[n].name, "hisi-ive")) {
                 DeviceState *ive = qdev_new("hisi-ive");
