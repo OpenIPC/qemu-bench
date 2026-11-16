@@ -28,11 +28,17 @@ controller and numbering, and a few blocks.
 | `fh8652` | Cortex-A7 | 64 MB² | GIC-400 at `0x30000000` | AXI | `0x20031601`, 0x33C = `0xC` | dump |
 | `fh8656` / `fh8658` | Cortex-A7 | 128 MB² | GIC-400 | AXI | `0x20031601`, `0x8` / `0x4` | —¹ |
 | `fh8852v100` | ARM1176JZF-S | 64 MB | DW ICTL | AHB | `0x17092901`, 0x004 = `0xC` | dump, OpenIPC |
-| `fh8856v100` | ARM1176JZF-S | 128 MB | DW ICTL | AHB | `0x17092901`, 0x004 = `0xD` | —¹ |
+| `fh8856v100` | ARM1176JZF-S | 128 MB | DW ICTL | AHB | `0x17092901`, 0x004 = `0xD` | dump³, OpenIPC |
 | `fh8626v100` | ARM1176JZF-S | 64 MB | DW ICTL | AHB | `0x18112301` | dump |
 | `fh8632` | ARM1176JZF-S | 64 MB | DW ICTL | AHB | `0x46488302`, 0x054 = `0x37` | SDK images |
 
 ¹ Same die and models as a tested sibling; no image was at hand.
+
+³ A Vatilon PB1 (board IF56N), sold as "FH8856V200": its U-Boot drives the
+AHB DMAC and its kernel is 3.0.8 (`FH8856 board init`), so it is this
+machine; on `fh8856v200` the U-Boot waits forever on the AXI DMAC's
+RawTfr. A PB4 dump of the same vendor is a V200 and boots on
+`fh8856v200`.
 ² Not seen on a dump; `-m` overrides it.
 
 ```
@@ -100,8 +106,10 @@ On FH865x the same numbers are GIC SPIs (the timer is interrupt 35).
 
 ### The mask ROM
 
-The first 0x200-0x300 bytes of the NOR are the ROM's boot header, `2BL*OABD`
-then 64-byte records from 0x100: a name, and at record +0x20 size, +0x24
+The start of the NOR is the ROM's boot header, `2BL*OABD`, version, image
+and parameter counts and the header's size at +0x14 (0x180-0x300 on most
+cameras, 0x400 on a PB4 that lists ten DDR parts), then 64-byte records from
+0x100 up to that size: a name, and at record +0x20 size, +0x24
 flash offset, +0x28 load address, +0x2C entry, +0x30 type. The parameter
 records (type 0x23 or 0x43, named for the DDR part) point at register
 scripts for the fitted DDR (16-byte {address,
@@ -130,12 +138,17 @@ PMU's boot strap, `0xF0000330`: 1 SPI NAND, 2 SPI NOR (the model's), 3 / 4
 eMMC on SD0 / SD1 -- with anything else they print `bad CRC, using default
 environment`. They read the flash through SPI0 with the AXI or AHB DMAC
 (below), probe the Ethernet PHY, and most try a TFTP update (`netupdate`)
-before `sf read` and `bootm`.
+before `sf read` and `bootm`. Some stop autoboot on one key only, whatever
+they print: the Vatilon PB1's on a capital `H` (its abortboot compares with
+0x48).
 
 ### OpenIPC
 
-OpenIPC publishes `fh8852v200` and `fh8852v100` lite bundles but no Fullhan
-bootloader: on a camera it is installed on the vendor U-Boot.
+OpenIPC publishes `fh8852v200`, `fh8852v100` and `fh8856v100` lite bundles
+but no Fullhan bootloader: on a camera it is installed on the vendor U-Boot,
+from its console -- `tftp` each file to `0xA1000000`, `sf erase` and
+`sf write` it at 0x50000 (kernel) and 0x250000 (rootfs) -- which runs the
+same under QEMU with `-nic user,tftp=<dir>` (OpenIPC/firmware#1610).
 `qemu-boot/fh-openipc-flash.sh` does the same -- a dump's boot region, the
 OpenIPC kernel and rootfs at OpenIPC's 8 MiB layout
 (`256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)`, which
@@ -273,7 +286,11 @@ normal descriptors, the MAC block where `xm-dwmac` has it. They accept only
 the PHYs on their list (IP101G `0x02430C54`, RTL8201, the internal EPHY
 `0x441400`), attach the generic PHY code to MDIO address 0, and take 4 off
 every received length; so the PHY is an IP101G at address 0 and the core
-keeps the FCS.
+keeps the FCS. The V100 U-Boot's driver ("FH EMAC") polls with the CPU's
+interrupts off: each poll sets SR, scans all 32 RX descriptors for one it
+owns and clears SR again. `xm-dwmac` delays only the first SR after the
+ring is set up (which Linux's `stmmac_open()` needs); later starts take a
+waiting frame at once, or a U-Boot TFTP download stalls for good.
 
 **AES** (`fh-aes`). The engine `fh_aes.c` registers with the kernel
 crypto API (`ecb/cbc/ctr/ofb/cfb(aes)`, DES and 3DES, priority 100) and

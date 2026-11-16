@@ -371,7 +371,7 @@ SquashFS root from the NOR. See [docs/allwinner-cam.md](docs/allwinner-cam.md).
 | `fh8652` | Cortex-A7, 64 MB in package | GIC-400 | 4.9.129 vendor | yes |
 | `fh8656` / `fh8658` | Cortex-A7, 128 MB in package | GIC-400 | — | —¹ |
 | `fh8852v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
-| `fh8856v100` | ARM1176JZF-S, 128 MB in package | DW ICTL | — | —¹ |
+| `fh8856v100` | ARM1176JZF-S, 128 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
 | `fh8626v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor | yes |
 | `fh8632` | ARM1176JZF-S, 64 MB | DW ICTL | 3.0.8 vendor (SDK) | yes |
 
@@ -383,8 +383,9 @@ watchdog) around Fullhan's PMU, RTC, AES engine and SADC, with an image sensor's
 mask ROM does -- U-Boot, FH8632's SPL, or past FH865x's DDR-sizing
 ramboot -- through the vendor U-Boot, which reads the flash by DMA, to the
 vendor kernel and application: `-M fh8856v200,flash-file=dump.bin -nic user`.
-Flash writes go back to the file. OpenIPC's `fh8852v200` and `fh8852v100`
-releases boot on the vendor U-Boot (`qemu-boot/fh-openipc-flash.sh`) or
+Flash writes go back to the file. OpenIPC's `fh8852v200`, `fh8852v100` and
+`fh8856v100` releases boot on the vendor U-Boot, which can also fetch them
+over TFTP and write them itself, as on a camera, (`qemu-boot/fh-openipc-flash.sh`) or
 with `-kernel` (`qemu-boot/test-fullhan-boot.sh`) to a login prompt with a
 DHCP lease. The media pipeline (the ARC coprocessor, ISP, encoders) and
 audio (the ARC's) are not modelled. Map, boot chain and devices are in
