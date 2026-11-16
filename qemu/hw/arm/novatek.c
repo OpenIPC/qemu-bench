@@ -491,6 +491,7 @@ struct NvtMachineState {
     uint32_t boot_strap;
     uint32_t flash_jedec;
     char *sensor;
+    bool no_rtc_crystal;
     NvtFlashState *flash;
 };
 
@@ -1760,6 +1761,7 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_WDT]);
 
     dev = qdev_new("nvt-rtc");
+    qdev_prop_set_bit(dev, "oscillator", !nms->no_rtc_crystal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, NVT_RTC_BASE, 1);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_RTC]);
@@ -2147,6 +2149,16 @@ static void nvt_machine_set_rom_fast(Object *obj, bool value, Error **errp)
     NVT_MACHINE(obj)->rom_fast = value;
 }
 
+static bool nvt_machine_get_rtc_crystal(Object *obj, Error **errp)
+{
+    return !NVT_MACHINE(obj)->no_rtc_crystal;
+}
+
+static void nvt_machine_set_rtc_crystal(Object *obj, bool value, Error **errp)
+{
+    NVT_MACHINE(obj)->no_rtc_crystal = !value;
+}
+
 static void nvt_machine_instance_init(Object *obj)
 {
     NVT_MACHINE(obj)->real_loader = true;
@@ -2201,6 +2213,11 @@ static void nvt_machine_class_init(ObjectClass *oc, const void *data)
         nvt_machine_get_sensor, nvt_machine_set_sensor);
     object_class_property_set_description(oc, "sensor",
         "Image sensor on I2C 0 (none, sc401ai, sc501ai, imx415); default none");
+    object_class_property_add_bool(oc, "rtc-crystal",
+        nvt_machine_get_rtc_crystal, nvt_machine_set_rtc_crystal);
+    object_class_property_set_description(oc, "rtc-crystal",
+        "the RTC's 32 kHz crystal (default on); off, as on the XM IVG-N8S, "
+        "leaves the RTC unclocked: its reset and CSET never complete");
     machine_add_audiodev_property(mc);
 }
 

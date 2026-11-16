@@ -441,6 +441,40 @@ def test_rtc(qt):
           qt.readl(RTC + 0x04) & 0xFFFF, 36524)
 
 
+def test_rtc_no_crystal(qemu):
+    """rtc-crystal=off, as on the XM IVG-N8S (OpenIPC/firmware#2865): the
+    RTC domain is unclocked, so the time stands still and a software reset
+    or a CSET, once started, never completes."""
+    print('nvt-rtc with no crystal (rtc-crystal=off)')
+    qt = QTest(qemu, 'nt98566,rtc-crystal=off')
+    try:
+        check('no battery: key 0', (qt.readl(RTC + 0x04) >> 16) & 0xF, 0)
+        check('oscillator setting 0, which the driver resets for',
+              qt.readl(RTC + 0x24) & 0xFF, 0)
+        t = qt.readl(RTC + 0x00)
+        qt.step(2000 * 1000 * 1000)
+        check('the time does not move', qt.readl(RTC + 0x00), t)
+        gic_enable(qt, SPI_RTC)
+        # nvt_rtc_reset(): SRST, then wait for CTRL.SRST to clear
+        qt.writel(RTC + 0x10, 1 << 1)
+        qt.step(1500 * 1000 * 1000)
+        check('SRST never clears: the probe times out',
+              qt.readl(RTC + 0x10) & (1 << 1), 1 << 1)
+        check('and STATUS stays SRST-busy, where rtc_trigger_cset spins',
+              qt.readl(RTC + 0x0C) & (1 << 1), 1 << 1)
+        # nvt_rtc_set_time(): select, shadow writes, CSET with interrupt
+        qt.writel(RTC + 0x10, (1 << 3) | (1 << 4))
+        qt.writel(RTC + 0x00, 5 | (4 << 6) | (3 << 12))
+        qt.writel(RTC + 0x10, qt.readl(RTC + 0x10) | (1 << 2) | (1 << 8))
+        qt.step(1500 * 1000 * 1000)
+        check('CSET stays set', qt.readl(RTC + 0x10) & (1 << 2), 1 << 2)
+        check('no CSET done', qt.readl(RTC + 0x0C) & (1 << 8), 0)
+        check('and no interrupt', gic_pending(qt, SPI_RTC), False)
+        check('nothing committed', qt.readl(RTC + 0x00), t)
+    finally:
+        qt.close()
+
+
 def test_uart(qt):
     print('UART (16550, reg-shift 2)')
     check('LSR: transmitter empty', qt.readl(UART0 + 0x14) & 0x60, 0x60)
@@ -5498,6 +5532,7 @@ def run(args, tmp):
     test_adc_thermal(args.qemu, tmp)
     test_migration(args.qemu, tmp)
     test_imx415_power(args.qemu, tmp)
+    test_rtc_no_crystal(args.qemu)
 
     print('%d failure(s)' % failures)
     if failures:

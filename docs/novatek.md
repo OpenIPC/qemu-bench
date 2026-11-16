@@ -210,6 +210,14 @@ Three tests cover the timer:
   power-off with the alarm armed is a reset and one without it is a shutdown
   (`poweroff`). Without an RTC node the notifier dereferences a NULL base
   and the kernel panics on `reboot`.
+  `rtc-crystal=off` models a board with no 32 kHz crystal, as on the XM
+  IVG-N8S (OpenIPC/firmware#2865). Nothing in the RTC domain is clocked:
+  the time stands still, a software reset or a CSET never completes (SRST
+  and STATUS bit 1 stay set, CSET stays set and never raises CSET done), and
+  with no battery the key and the oscillator setting read 0. The stock
+  kernel then logs `RTC s/w reset timeout` at probe, registers `rtc0`
+  anyway, and spins in `rtc_trigger_cset()` on the first write (`hwclock
+  -w`, or NTP's `sync_hw_clock`) and on `reboot`.
 - **`nvt-gpio`.** Eight 32-pin groups (C, P, S, L, D, H, A, DSI at
   `0x00`–`0xE0`), with DATA/DIR/SET/CLR words per group. Only 40 pins can
   interrupt, through a fixed table (`nvt_gpio_irq_table`), all on SPI 24.
