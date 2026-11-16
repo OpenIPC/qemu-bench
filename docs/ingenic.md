@@ -754,11 +754,13 @@ holds 007a:8888 only, so wlan0 never appears -- what the issue reports.
 ### `ingenic-gmac`
 
 The Synopsys GMAC 3.x every driver here (V12, V13, the T40 `ingenic_mac`,
-U-Boot) runs with 8-word enhanced descriptors and DSL 2 -- 40 bytes apart
-in a ring. Soft reset, MDIO and the PHY's BMCR reset self-clear (the
-kernels' `open` spins on the last with no timeout); the PHY is an IP101G
-(0x0243/0x0C54) at address 0 with a 100 Mbit/s full-duplex link. Received
-frames carry their FCS, which the drivers subtract.
+mainline `stmmac`, U-Boot) runs with 8-word enhanced descriptors and DSL 2
+-- 40 bytes apart in a ring. Soft reset, MDIO and the PHY's BMCR reset
+self-clear (the kernels' `open` spins on the last with no timeout); the PHY
+is an IP101G (0x0243/0x0C54) at address 0 with a 100 Mbit/s full-duplex
+link. Received frames carry their FCS, which the drivers subtract;
+`DMA_RIWT` (`0x1024`) drives the RX interrupt watchdog timer when mainline
+`stmmac` sets `RDES1_DIC` for RX coalescing.
 
 PHY power-down and reboot (OpenIPC/firmware#2839). The PHY is a chip of
 its own: a system reset (the TCU watchdog, so every guest `reboot`) leaves

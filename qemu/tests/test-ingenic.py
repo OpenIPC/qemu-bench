@@ -4685,6 +4685,132 @@ def test_gmac_phy_props(qemu):
           '-1 (not wired) or a pin' in r.stderr, True)
 
 
+def test_gmac_riwt(qemu, tmp):
+    print('ingenic-gmac DMA_RIWT RX coalescing watchdog')
+    net_sock = os.path.join(tmp, 'gmac-riwt.sock')
+    qt = QTest(qemu, 't23', ['-netdev', 'stream,id=n0,server=on,addr.type=unix,'
+                                        'addr.path=%s' % net_sock,
+                             '-global', 'ingenic-gmac.netdev=n0'])
+    peer = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            peer.connect(net_sock)
+            break
+        except OSError:
+            time.sleep(0.02)
+    desc0, desc1 = SCRATCH, SCRATCH + 0x10
+    buf0, buf1 = SCRATCH + 0x100, SCRATCH + 0x900
+    # Desc 0: OWN | RDES1_DIC (suppress immediate RI), Desc 1: OWN | RER (no DIC)
+    qt.write(desc0, struct.pack('<4I', 1 << 31, (1 << 31) | 2048, buf0, 0))
+    qt.write(desc1, struct.pack('<4I', 1 << 31, (1 << 15) | 2048, buf1, 0))
+    qt.writel(GMAC + 0x100C, desc0)                     # DMA_RX_BASE
+    qt.writel(GMAC + 0x1024, 10)                        # DMA_RIWT (~20480 ns)
+    qt.writel(GMAC + 0x101C, (1 << 16) | (1 << 6))      # NIE | RIE
+    qt.writel(GMAC + 0x00, 1 << 2)                      # MAC_CONFIG.RE
+    qt.writel(GMAC + 0x1018, 1 << 1)                    # DMA_OPMODE.SR
+
+    pkt = b'\xff' * 6 + b'\x02\x00\x00\x00\x00\x01\x08\x00' + bytes(46)
+    peer.sendall(struct.pack('>I', len(pkt)) + pkt)
+    for _ in range(100):
+        if (qt.readl(desc0) >> 31) == 0:
+            break
+        time.sleep(0.005)
+    check('DIC descriptor completed (OWN cleared)', qt.readl(desc0) >> 31, 0)
+    check('RDES1_DIC suppresses immediate ST_RI',
+          qt.readl(GMAC + 0x1014) & ((1 << 16) | (1 << 6)), 0)
+    qt.step(10000)
+    check('no ST_RI before DMA_RIWT expires',
+          qt.readl(GMAC + 0x1014) & (1 << 6), 0)
+    qt.step(15000)
+    check('DMA_RIWT fires ST_RI | ST_NIS on expiry',
+          qt.readl(GMAC + 0x1014) & ((1 << 16) | (1 << 6)),
+          (1 << 16) | (1 << 6))
+    check('GMAC IRQ 55 pending in INTC',
+          (qt.readl(INTC + 0x20) >> (55 - 32)) & 1, 1)
+
+    # Re-arm Desc 0 (DIC) + Desc 1 (no DIC) with longer RIWT; verify non-DIC
+    # completion asserts ST_RI immediately and cancels the RIWT timer.
+    qt.writel(GMAC + 0x1014, 0x0001ffff)
+    qt.writel(GMAC + 0x1024, 100)                       # ~204.8 us
+    qt.writel(GMAC + 0x100C, desc0)
+    qt.write(desc0, struct.pack('<4I', 1 << 31, (1 << 31) | 2048, buf0, 0))
+    qt.write(desc1, struct.pack('<4I', 1 << 31, (1 << 15) | 2048, buf1, 0))
+    peer.sendall(struct.pack('>I', len(pkt)) + pkt +
+                 struct.pack('>I', len(pkt)) + pkt)
+    for _ in range(100):
+        if (qt.readl(desc1) >> 31) == 0:
+            break
+        time.sleep(0.005)
+    check('non-DIC descriptor asserts ST_RI immediately',
+          qt.readl(GMAC + 0x1014) & (1 << 6), 1 << 6)
+    qt.writel(GMAC + 0x1014, 0x0001ffff)
+    qt.step(300000)
+    check('cancelled RIWT does not re-fire ST_RI after clear',
+          qt.readl(GMAC + 0x1014) & (1 << 6), 0)
+
+    # Idle VMState must omit ingenic-gmac/riwt for v1 snapshot compatibility,
+    # whereas an armed RIWT timer must migrate its subsection and fire on dst.
+    mig_idle = os.path.join(tmp, 'mig-gmac-idle')
+    qt.qmp('migrate', uri='exec:cat > %s' % mig_idle)
+    for _ in range(100):
+        if qt.qmp('query-migrate').get('status') in ('completed', 'failed'):
+            break
+        time.sleep(0.05)
+    with open(mig_idle, 'rb') as f:
+        check('idle GMAC omits ingenic-gmac/riwt subsection',
+              b'ingenic-gmac/riwt' not in f.read(), True)
+    peer.close()
+    qt.close()
+
+    net_sock2 = os.path.join(tmp, 'gmac-riwt2.sock')
+    qt = QTest(qemu, 't23', ['-netdev', 'stream,id=n0,server=on,addr.type=unix,'
+                                        'addr.path=%s' % net_sock2,
+                             '-global', 'ingenic-gmac.netdev=n0'])
+    peer = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            peer.connect(net_sock2)
+            break
+        except OSError:
+            time.sleep(0.02)
+    qt.write(desc0, struct.pack('<4I', 1 << 31, (1 << 31) | 2048, buf0, 0))
+    qt.write(desc1, struct.pack('<4I', 1 << 31, (1 << 15) | 2048, buf1, 0))
+    qt.writel(GMAC + 0x100C, desc0)
+    qt.writel(GMAC + 0x1024, 50)                        # ~102.4 us
+    qt.writel(GMAC + 0x101C, (1 << 16) | (1 << 6))
+    qt.writel(GMAC + 0x00, 1 << 2)
+    qt.writel(GMAC + 0x1018, 1 << 1)
+    peer.sendall(struct.pack('>I', len(pkt)) + pkt)
+    for _ in range(100):
+        if (qt.readl(desc0) >> 31) == 0:
+            break
+        time.sleep(0.005)
+    qt.step(40000)
+    mig_armed = os.path.join(tmp, 'mig-gmac-armed')
+    qt.qmp('migrate', uri='exec:cat > %s' % mig_armed)
+    for _ in range(100):
+        if qt.qmp('query-migrate').get('status') in ('completed', 'failed'):
+            break
+        time.sleep(0.05)
+    peer.close()
+    qt.close()
+    with open(mig_armed, 'rb') as f:
+        check('armed GMAC emits ingenic-gmac/riwt subsection',
+              b'ingenic-gmac/riwt' in f.read(), True)
+    qt_dst = QTest(qemu, 't23', ['-incoming', 'exec:cat %s' % mig_armed])
+    for _ in range(100):
+        if qt_dst.qmp('query-status').get('status') != 'inmigrate':
+            break
+        time.sleep(0.05)
+    check('migrated armed RIWT has not fired yet on destination',
+          qt_dst.readl(GMAC + 0x1014) & (1 << 6), 0)
+    qt_dst.step(150000)
+    check('migrated armed RIWT fires ST_RI | ST_NIS on destination',
+          qt_dst.readl(GMAC + 0x1014) & ((1 << 16) | (1 << 6)),
+          (1 << 16) | (1 << 6))
+    qt_dst.close()
+
+
 def test_migration(qemu, machine, tmp):
     print('migration round trip (%s)' % machine)
     out = os.path.join(tmp, 'mig')
@@ -4833,6 +4959,7 @@ def main():
         test_gmac_phy_pdown(qt)
         qt.close()
         test_gmac_phy_props(a.qemu)
+        test_gmac_riwt(a.qemu, tmp)
         qt = QTest(a.qemu, 't40')
         test_drawbox(qt)
         test_i2d(qt)
