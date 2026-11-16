@@ -446,7 +446,7 @@ static qemu_irq fh_irq(FhMachineState *fms, int n)
  * (the flash dumps; the SDK's flash_upgrade tools write it):
  *
  *   +0x00  "2BL*OABD", then version, image count, parameter count and
- *          header size
+ *          header size (+0x14)
  *   +0x100 64-byte records: a name, and at record +0x20 size, +0x24
  *          flash offset, +0x28 load address, +0x2C entry, +0x30 type
  *
@@ -461,10 +461,18 @@ static qemu_irq fh_irq(FhMachineState *fms, int n)
  * have) and then loads the U-Boot record (type 0x11 or 0x12).  For those
  * this stand-in loads that U-Boot itself.  Headers without types fall back
  * to the record named "uboot".
+ *
+ * The records run to the header size at +0x14.  Most headers declare
+ * 0x180-0x300, but one with many DDR parts declares more -- a Vatilon PB4
+ * (FH8856V200) lists ten parameter records and puts "ram" and "uboot" at
+ * 0x380 and 0x3C0 of a 0x400-byte header -- so the walk goes to whichever
+ * is larger, the declared size or 0x300, and no further than the image.
  */
 #define FH_HDR_MAGIC        "2BL*OABD"
 #define FH_HDR_RECORDS      0x100
 #define FH_HDR_END          0x300
+#define FH_HDR_SIZE         0x14
+#define FH_HDR_MAX          0x10000
 #define FH_HDR_REC          0x40
 #define FH_HDR_TYPE_ROM     0x10
 
@@ -484,7 +492,7 @@ static void fh_boot_rom_setup(const uint8_t *img, gsize len,
                               MachineState *machine,
                               const FhSoCConfig *c, const char *path)
 {
-    uint32_t rec, size, off, load, entry, type;
+    uint32_t rec, size, off, load, entry, type, end;
     uint32_t pick = 0, named = 0, uboot = 0;
     g_autofree uint32_t *rom = g_malloc(FH_BOOTROM_SIZE);
 
@@ -492,7 +500,12 @@ static void fh_boot_rom_setup(const uint8_t *img, gsize len,
         error_report("fullhan: %s has no Fullhan boot header", path);
         exit(1);
     }
-    for (rec = FH_HDR_RECORDS; rec < FH_HDR_END; rec += FH_HDR_REC) {
+    end = ldl_le_p(img + FH_HDR_SIZE);
+    if (end < FH_HDR_END || end > FH_HDR_MAX) {
+        end = FH_HDR_END;
+    }
+    end = MIN((uint64_t)end, len);
+    for (rec = FH_HDR_RECORDS; rec + FH_HDR_REC <= end; rec += FH_HDR_REC) {
         type = ldl_le_p(img + rec + 0x30) & 0xFF;
         if (!pick && type == FH_HDR_TYPE_ROM) {
             pick = rec;

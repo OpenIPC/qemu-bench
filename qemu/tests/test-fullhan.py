@@ -5,7 +5,10 @@ QEMU runs the fh8856v200 machine under qtest and this script plays the
 vendor drivers (docs/fullhan.md):
 
   - the mask ROM: a synthetic "2BL*" boot header's uboot record is staged
-    at its load address, with the stub at 0 that enters it;
+    at its load address, with the stub at 0 that enters it -- also from a
+    header longer than 0x300;
+  - the V100 GMAC's receive start: the first SR after the ring is set up
+    waits for the descriptor fetch, later ones take a waiting frame at once;
   - fh-pmu: chip, package and DDR IDs, the NOR boot strap U-Boot keys its
     environment on, resets that read back finished, the PTS latch;
   - fh-intc: a timer interrupt through enable and mask, FINALSTATUS read a
@@ -535,6 +538,112 @@ def test_gmac_sd(qt):
     check('SD0 empty: CDETECT reads no card', qt.readl(SDC0 + 0x50) & 1, 1)
 
 
+def make_long_header(path):
+    """A header longer than 0x300, as a Vatilon PB4's (FH8856V200): ten
+    DDR parameter records, then "ram" (type 0x10, in SRAM) at 0x380 and
+    "uboot" (type 0x11, in DDR) at 0x3C0, the size 0x400 at +0x14."""
+    code = [0xE1A00000, 0xE1A00000, 0xEAFFFFFE]
+    img = bytearray(b'\xFF' * (8 << 20))
+    img[0:8] = b'2BL*OABD'
+    struct.pack_into('<4I', img, 8, 1, 2, 10, 0x400)
+    for i in range(10):
+        rec = 0x100 + 0x40 * i
+        img[rec:rec + 0x40] = bytes(0x40)
+        img[rec:rec + 4] = b'DDR%d' % (i // 3)
+        struct.pack_into('<5I', img, rec + 0x20, 0x1080, 0x1000 + 0x1400 * i,
+                         0x10000800, 0x10000800, 0x43)
+    for rec, name, size, off, load, typ in (
+            (0x380, b'ram', 0x3600, 0x10000, 0x10008000, 0x10),
+            (0x3C0, b'uboot', 4 * len(code), 0x14000, LOAD, 0x11)):
+        img[rec:rec + 0x40] = bytes(0x40)
+        img[rec:rec + len(name)] = name
+        struct.pack_into('<5I', img, rec + 0x20, size, off, load, load, typ)
+    struct.pack_into('<%dI' % len(code), img, 0x14000, *code)
+    open(path, 'wb').write(img)
+    return code
+
+
+def test_long_header(qemu, path):
+    print('fh8856v200: a boot header longer than 0x300')
+    code = make_long_header(path)
+    qt = QTest(qemu, 'fh8856v200,flash-file=%s' % path)
+    try:
+        check('the entry is the uboot record past 0x300', qt.readl(4), LOAD)
+        check('U-Boot at its load address',
+              [qt.readl(LOAD + 4 * i) for i in range(len(code))] == code, True)
+    finally:
+        qt.close()
+
+
+def test_gmac_rx_start(qemu):
+    """Receive DMA (SR) on the V100 GMAC.  Linux sets SR once after setting
+    up the ring and needs the first descriptor fetch to come later; the V100
+    U-Boot sets and clears SR around every poll, so later starts must take a
+    waiting frame at once.  Frames come in over a dgram netdev; under qtest
+    the virtual clock moves only by clock_step, so a frame taken without one
+    was taken without the delay."""
+    print('fh8852v100: GMAC receive start')
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(('127.0.0.1', 0))
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tx.bind(('127.0.0.1', 0))
+    qport = tx.getsockname()[1]
+    tx.close()
+    qt = QTest(qemu, 'fh8852v100', (
+        '-netdev', 'dgram,id=n0,local.type=inet,local.host=127.0.0.1,'
+        'local.port=%d,remote.type=inet,remote.host=127.0.0.1,'
+        'remote.port=%d' % (qport, rx.getsockname()[1]),
+        '-net', 'nic,netdev=n0'))
+    ring, bufs = DDR + 0x500000, DDR + 0x510000
+    dma = GMAC + 0x1000
+
+    def setup_ring():
+        for i in range(4):
+            qt.writel(ring + 16 * i, 1 << 31)
+            qt.writel(ring + 16 * i + 4, 1536 | ((1 << 25) if i == 3 else 0))
+            qt.writel(ring + 16 * i + 8, bufs + 0x800 * i)
+            qt.writel(ring + 16 * i + 12, 0)
+        qt.writel(dma + 0x0C, ring)                 # RX_BASE
+
+    def send(tag):
+        frame = b'\xff' * 6 + bytes(range(6)) + b'\x88\xb5' + tag * 50
+        rx.sendto(frame, ('127.0.0.1', qport))
+        time.sleep(0.2)
+        return len(frame)
+
+    def taken(i):
+        return not qt.readl(ring + 16 * i) >> 31
+
+    try:
+        qt.writel(GMAC + 0x00, 1 << 2)              # RE
+        setup_ring()
+        qt.writel(dma + 0x18, 1 << 1)               # SR
+        n = send(b'a')
+        check('first SR after the ring: no frame before the fetch delay',
+              taken(0), False)
+        qt.step(1500000)
+        time.sleep(0.2)
+        check('... and the frame once it has passed', taken(0), True)
+        check('... whole with its FCS, first and last',
+              qt.readl(ring) & 0x3FFF0300, ((n + 4) << 16) | 0x300)
+        qt.writel(dma + 0x18, 0)                    # SR off, as U-Boot does
+        send(b'b')
+        check('SR off: the frame waits', taken(1), False)
+        qt.writel(dma + 0x18, 1 << 1)
+        time.sleep(0.2)
+        check('SR on again: taken with no clock step', taken(1), True)
+        check('... the next frame, in the next buffer',
+              qt.read(bufs + 0x800 + 14, 4), b'bbbb')
+        qt.writel(dma + 0x18, 0)
+        setup_ring()
+        qt.writel(dma + 0x18, 1 << 1)
+        send(b'c')
+        check('a new ring: the first SR is delayed again', taken(0), False)
+    finally:
+        qt.close()
+        rx.close()
+
+
 def test_v100(qemu, path, img):
     print('fh8852v100: AHB DMAC, timer clock')
     qt = QTest(qemu, 'fh8852v100,flash-file=%s' % path)
@@ -756,6 +865,8 @@ def main():
     path = os.path.join(tmp, 'flash100.bin')
     code, img = make_image(path)
     test_v100(args.qemu, path, img)
+    test_gmac_rx_start(args.qemu)
+    test_long_header(args.qemu, os.path.join(tmp, 'flash-long.bin'))
     test_fh8652(args.qemu)
     test_fh8626(args.qemu, path)
     test_fh8632(args.qemu)

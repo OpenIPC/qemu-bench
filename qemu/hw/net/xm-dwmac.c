@@ -131,6 +131,8 @@ struct XmDwmacState {
     /* Receive DMA has started fetching descriptors; see DMA_CONTROL. */
     bool rx_running;
     QEMUTimer *rx_start;
+    /* The first SR since the ring was set up has been delayed already. */
+    bool rx_start_delayed;
 };
 
 /* NIS and AIS summarise the normal and abnormal bits that are set; the line
@@ -416,6 +418,7 @@ static void xm_dwmac_soft_reset(XmDwmacState *s)
 {
     timer_del(s->rx_start);
     s->rx_running = false;
+    s->rx_start_delayed = false;
     s->bus_mode = 0;
     s->status = 0;
     s->control = 0;
@@ -533,6 +536,7 @@ static void xm_dwmac_write(void *opaque, hwaddr off, uint64_t val,
         break;
     case DMA_RX_BASE:
         s->rx_base = s->cur_rx = val;
+        s->rx_start_delayed = false;
         break;
     case DMA_TX_BASE:
         s->tx_base = s->cur_tx = val;
@@ -551,10 +555,24 @@ static void xm_dwmac_write(void *opaque, hwaddr off, uint64_t val,
          * napi_schedule is a no-op on a disabled NAPI).  QEMU queues
          * frames while SR is clear, so flushing them on the SR write
          * itself hit that window every time on a busy TAP link.
+         *
+         * That is the first start after the ring is set up.  The Fullhan
+         * V100 U-Boot ("FH EMAC", polled, CPU interrupts off) sets SR,
+         * scans its descriptors and clears SR again on every poll, a few
+         * microseconds each time: delaying every start meant receive
+         * almost never ran, and a TFTP download stalled block after block.
+         * Later starts fetch at once, as the real engine does from its
+         * FIFO.
          */
         if ((val & DMA_CONTROL_SR) && !(s->control & DMA_CONTROL_SR)) {
-            timer_mod(s->rx_start, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      RX_START_DELAY_NS);
+            if (s->rx_start_delayed) {
+                s->control = val;
+                xm_dwmac_rx_start(s);
+            } else {
+                s->rx_start_delayed = true;
+                timer_mod(s->rx_start, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          RX_START_DELAY_NS);
+            }
         } else if (!(val & DMA_CONTROL_SR)) {
             timer_del(s->rx_start);
             s->rx_running = false;
