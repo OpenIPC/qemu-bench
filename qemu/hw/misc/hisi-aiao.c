@@ -125,6 +125,7 @@ struct HisiAiaoState {
     SWVoiceOut *out;
     SWVoiceIn *in;
     uint32_t voice_rate;
+    bool in_sync;               /* a transfer's DMA is under way */
     /* between the backend's callbacks and the transfers, in samples */
     int16_t play[RING], rec[RING];
     unsigned play_rd, play_wr, rec_rd, rec_wr;
@@ -174,9 +175,11 @@ static uint32_t hisi_aiao_rate(HisiAiaoChn *c)
     static const uint32_t fs_bits[8] = { 16, 32, 48, 64, 128, 256, 8, 8 };
     const uint32_t nco = extract32(REG(c->s, c->crg), 0, 27);
     const uint32_t div = REG(c->s, c->crg + 4);
-    const uint64_t mclk = (uint64_t)nco * 1800000000ull >> 27;
-    const uint64_t fs = mclk / bclk_div[extract32(div, 0, 4)] /
-                        fs_bits[extract32(div, 4, 3)];
+    /* to the nearest hertz: 0x95218 with 32 x 32 is 7999.99, and the
+     * 44.1 kHz family has no round number to snap to */
+    const uint64_t den = (1ull << 27) * bclk_div[extract32(div, 0, 4)] *
+                         fs_bits[extract32(div, 4, 3)];
+    const uint64_t fs = ((uint64_t)nco * 1800000000ull + den / 2) / den;
 
     if (fs < 1000 || fs > 192000) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -184,11 +187,23 @@ static uint32_t hisi_aiao_rate(HisiAiaoChn *c)
                       "8000\n", c->tx ? "playback" : "capture", c->index, fs);
         return 8000;
     }
-    /* the NCO's rounding: 7999.99 is 8000 */
-    return (uint32_t)((fs + 50) / 100 * 100);
+    return fs;
 }
 
 static void hisi_aiao_voice(HisiAiaoState *s, uint32_t rate);
+
+/*
+ * Started, with a rate, and a transfer that is whole frames: what a
+ * schedule needs.  The drivers only ever program whole frames; anything
+ * else is logged once at start and the channel moves nothing.
+ */
+static bool hisi_aiao_runnable(HisiAiaoChn *c)
+{
+    const uint32_t trans = CREG(c, CH_TRANS) & PTR_MASK;
+
+    return (CREG(c, CH_CTRL) & CTRL_START) && c->rate && c->frame_bytes &&
+           trans && trans <= XFER_MAX && trans % c->frame_bytes == 0;
+}
 
 static int64_t hisi_aiao_period(HisiAiaoChn *c)
 {
@@ -200,8 +215,7 @@ static int64_t hisi_aiao_period(HisiAiaoChn *c)
 
 static void hisi_aiao_arm(HisiAiaoChn *c)
 {
-    if (!(CREG(c, CH_CTRL) & CTRL_START) ||
-        !(CREG(c, CH_TRANS) & PTR_MASK) || !c->rate) {
+    if (!hisi_aiao_runnable(c)) {
         timer_del(c->timer);
         return;
     }
@@ -317,6 +331,13 @@ static bool hisi_aiao_playback(HisiAiaoChn *c)
     avail = (wptr + size - rptr) % size;
     n = MIN(avail, trans);
     fb = hisi_aiao_frame_bytes(c, &chans, &width);
+    if (s->out && c->index == 0) {
+        /* no further than the audiodev can queue: the rest waits */
+        n = MIN(n, (RING - (s->play_wr - s->play_rd)) * fb);
+        if (!n && avail) {
+            return false;
+        }
+    }
     n -= n % fb;
     if (n) {
         buf = g_malloc(n);
@@ -335,9 +356,7 @@ static bool hisi_aiao_playback(HisiAiaoChn *c)
                         width == 2 ? (int16_t)lduw_le_p(buf + off) :
                         (int16_t)(ldl_le_p(buf + off) >> 16);
 
-            if (s->play_wr - s->play_rd < RING) {
-                s->play[s->play_wr++ % RING] = v;
-            }
+            s->play[s->play_wr++ % RING] = v;
         }
         CREG(c, CH_RPTR) = (CREG(c, CH_RPTR) & ~PTR_MASK) |
                            (rptr + n) % size;
@@ -364,17 +383,28 @@ static bool hisi_aiao_playback(HisiAiaoChn *c)
  */
 static void hisi_aiao_sync(HisiAiaoChn *c)
 {
-    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    const int64_t period = hisi_aiao_period(c);
+    HisiAiaoState *s = c->s;
+    int64_t now, period;
 
-    if (!(CREG(c, CH_CTRL) & CTRL_START) || !c->rate) {
+    /*
+     * A ring the guest points at this device's own registers reads or
+     * writes them from inside a transfer, and a pointer access syncs:
+     * that must not start another transfer.
+     */
+    if (s->in_sync || !hisi_aiao_runnable(c)) {
         return;
     }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    period = hisi_aiao_period(c);
+    s->in_sync = true;
     c->stalled = false;
     while (c->due <= now) {
         if (!(c->tx ? hisi_aiao_playback(c) : hisi_aiao_capture(c))) {
             if (now - c->due > NANOSECONDS_PER_SECOND) {
-                CREG(c, CH_INT_RAW) |= INT_FULL;
+                /* capture says it overflowed; playback just moves on */
+                if (!c->tx) {
+                    CREG(c, CH_INT_RAW) |= INT_FULL;
+                }
                 c->due = now + period;
             } else {
                 c->stalled = true;
@@ -388,7 +418,8 @@ static void hisi_aiao_sync(HisiAiaoChn *c)
         }
         c->due += period;
     }
-    hisi_aiao_update(c->s);
+    s->in_sync = false;
+    hisi_aiao_update(s);
 }
 
 static void hisi_aiao_tick(void *opaque)
@@ -399,28 +430,60 @@ static void hisi_aiao_tick(void *opaque)
     hisi_aiao_arm(c);
 }
 
+/* the rate and frame size from the clock and interface words, now */
+static void hisi_aiao_timing(HisiAiaoChn *c)
+{
+    const uint32_t trans = CREG(c, CH_TRANS) & PTR_MASK;
+
+    c->rate = hisi_aiao_rate(c);
+    c->frame_bytes = hisi_aiao_frame_bytes(c, NULL, NULL);
+    c->due = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + hisi_aiao_period(c);
+    c->stalled = false;
+    if (c->index == 0) {
+        hisi_aiao_voice(c->s, c->rate);
+    }
+    if (!trans || trans > XFER_MAX || trans % c->frame_bytes) {
+        qemu_log_mask(LOG_GUEST_ERROR, "hisi-aiao: %s %d: a transfer of "
+                      "0x%x bytes is not whole %u-byte frames; it moves "
+                      "nothing\n", c->tx ? "playback" : "capture", c->index,
+                      trans, c->frame_bytes);
+    }
+    if (c->s->trace) {
+        qemu_log("hisi-aiao: %s %d at %u Hz, %u bytes a frame, "
+                 "%u a transfer, buffer %u\n",
+                 c->tx ? "playback" : "capture", c->index, c->rate,
+                 c->frame_bytes, trans, CREG(c, CH_SIZE) & PTR_MASK);
+    }
+}
+
 static void hisi_aiao_start(HisiAiaoChn *c, bool on)
 {
     const bool was = CREG(c, CH_CTRL) & CTRL_START;
 
     if (on && !was) {
-        c->rate = hisi_aiao_rate(c);
-        c->frame_bytes = hisi_aiao_frame_bytes(c, NULL, NULL);
         c->frames = 0;
-        c->due = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                 hisi_aiao_period(c);
-        c->stalled = false;
-        if (c->index == 0) {
-            hisi_aiao_voice(c->s, c->rate);
-        }
-        if (c->s->trace) {
-            qemu_log("hisi-aiao: %s %d starts at %u Hz, %u bytes a frame, "
-                     "%u a transfer, buffer %u\n",
-                     c->tx ? "playback" : "capture", c->index, c->rate,
-                     c->frame_bytes, CREG(c, CH_TRANS) & PTR_MASK,
-                     CREG(c, CH_SIZE) & PTR_MASK);
-        }
+        hisi_aiao_timing(c);
     }
+}
+
+/*
+ * A clock, interface or transfer word changed under a running channel:
+ * what was due goes out on the old timing, the rest on the new.
+ */
+static void hisi_aiao_retime(HisiAiaoChn *c, hwaddr word, uint32_t v)
+{
+    HisiAiaoState *s = c->s;
+    const uint32_t trans = CREG(c, CH_TRANS);
+
+    hisi_aiao_sync(c);
+    s->regs[word / 4] = v;
+    /* aio.ko sets clock enables in these words while the other
+     * direction runs: only a real change moves the schedule */
+    if (hisi_aiao_rate(c) != c->rate || CREG(c, CH_TRANS) != trans ||
+        hisi_aiao_frame_bytes(c, NULL, NULL) != c->frame_bytes) {
+        hisi_aiao_timing(c);
+    }
+    hisi_aiao_arm(c);
 }
 
 static HisiAiaoChn *hisi_aiao_chn(HisiAiaoState *s, hwaddr off)
@@ -518,6 +581,23 @@ static void hisi_aiao_write(void *opaque, hwaddr off, uint64_t val,
             CREG(c, CH_INT_MASK) = v;
             hisi_aiao_update(s);
             return;
+        case CH_ATTR:
+        case CH_TRANS:
+            if (CREG(c, CH_CTRL) & CTRL_START) {
+                hisi_aiao_retime(c, word, v);
+                return;
+            }
+            break;
+        }
+    } else {
+        for (int n = 0; n < AIAO_CHNS; n++) {
+            HisiAiaoChn *k = &s->chn[n];
+
+            if ((word == k->crg || word == k->crg + 4) &&
+                (CREG(k, CH_CTRL) & CTRL_START)) {
+                hisi_aiao_retime(k, word, v);
+                return;
+            }
         }
     }
     s->regs[word / 4] = v;

@@ -50,6 +50,11 @@ def main():
         try:
             check(r(RX + CTRL) & STOPPED and r(TX + CTRL) & STOPPED,
                   '%s: both directions read stopped at reset' % mach)
+            # Pointers and statuses read before anything started (no rate)
+            vals = [r(o) for o in (RX + WPTR, RX + RPTR, RX + STA, RX + RAW,
+                                   TX + WPTR, TX + RPTR, TX + STA, INT_STA)]
+            check(vals == [0] * 8,
+                  '%s: pointers and statuses read 0 before a start' % mach)
 
             def capture(rate):
                 nco, div, size, trans = RATES[rate]
@@ -121,6 +126,68 @@ def main():
             w(RX + CTRL, 0)
             check(r(RX + CTRL) & STOPPED, '%s: capture stops' % mach)
             w(RX + CLR, 0x3f)
+
+            # Transfers that are not whole frames move nothing, and do not
+            # spin: zero bytes, then three bytes of 16-bit mono
+            for bad in (0, 3):
+                capture(8000)
+                w(RX + CTRL, 0)
+                w(RX + TRANS, bad)
+                w(RX + CTRL, START)
+                step(100)
+                check(r(RX + WPTR) == 0 and not r(RX + RAW),
+                      '%s: a %d-byte transfer moves nothing' % (mach, bad))
+                w(RX + CTRL, 0)
+
+            def count(size, trans, secs):
+                got = 0
+                for _ in range(int(secs * 100)):
+                    step(10)
+                    wp = r(RX + WPTR)
+                    got += (wp - r(RX + RPTR)) % size // trans
+                    w(RX + RPTR, wp)
+                return got
+
+            # 16 kHz's dividers written while 8 kHz runs: twice the transfers
+            size, trans = capture(8000)
+            first = count(size, trans, 1)
+            w(RX_CRG + 4, RATES[16000][1])
+            second = count(size, trans, 1)
+            check(abs(first - 50) <= 1 and abs(second - 100) <= 1,
+                  '%s: a live clock change takes effect (%d then %d '
+                  'transfers a second)' % (mach, first, second))
+            w(RX + CTRL, 0)
+
+            # 11025 Hz: MCLK 1024 x 11025 is NCO 841814; 220 samples a
+            # transfer is 50.1 a second, 501 in ten (11000 Hz would be 500)
+            w(RX_CRG, 841814)
+            w(RX_CRG + 4, 0xC119)
+            w(RX + TRANS, 440)
+            w(RX + WPTR, 0)
+            w(RX + RPTR, 0)
+            w(RX + CTRL, START)
+            got = count(0x400, 440, 10)
+            check(got == 501, '%s: 11025 Hz keeps its rate (%d transfers in '
+                  '10 s, want 501)' % (mach, got))
+            w(RX + CTRL, 0)
+            w(RX + CLR, 0x3f)
+
+            # A playback ring aimed at the device's own registers: the DMA
+            # reads them, and that must not start another transfer
+            w(TX_CRG, RATES[8000][0])
+            w(TX_CRG + 4, RATES[8000][1])
+            w(TX + ATTR, 0xe4000044)
+            w(TX + ADDR, AIAO + TX)
+            w(TX + SIZE, 0x100)
+            w(TX + TRANS, 0x40)
+            w(TX + RPTR, 0)
+            w(TX + WPTR, 0x80)
+            w(TX + CTRL, START)
+            step(50)
+            check(r(TX + CTRL) & START,
+                  '%s: a ring over its own registers does not recurse' % mach)
+            w(TX + CTRL, 0)
+            w(TX + CLR, 0x1f)
 
             # Playback, 8 kHz: 640 bytes leave every 40 ms
             nco, div = RATES[8000][:2]
