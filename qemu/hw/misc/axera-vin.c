@@ -106,36 +106,31 @@
  * unmasks never fires, so there is no cost to running continuously from
  * reset rather than only after a detected trigger.
  *
- * PRAGMATIC ADDITION (explicitly user-authorized "fix whatever it takes",
- * NOT derived from real hardware behavior): offsets 0x1000/0x1004/0x1008,
- * found this session via live guest-kallsyms tracing to be a generic
- * "CDMA command descriptor" convention (info0=command/type word,
- * info1=target guest buffer address, ctrl0=trigger) implemented by a
- * separate shared software module (ax_base.ko's cmd_info0/1_cfg_set,
- * cmd_ctrl0_cfg_set), called from this driver's own
- * ax_regio_blk_io_write_within_cdma path -- confirmed landing inside
- * THIS device's own 0x100000 region, written continuously at frame
- * cadence with real guest buffer pointers, but with no determinable
- * real completion semantics (see this session's kaeru episodes for the
- * full derivation, including a retracted "separate hardware" theory).
- * On a nonzero write to ctrl0 (0x1008), treated as a trigger:
- *   1. a small synthetic byte pattern is DMA-written to the guest
- *      address found in info1 (0x1004) -- NOT a real decoded frame,
- *      just non-zero content, in case anything downstream ever reads
- *      it back;
- *   2. ctrl0 auto-clears to 0 (the common real-hardware "write-1-to-
- *      start, HW clears on completion" convention);
- *   3. MASK and RAW are force-set for VIN channel 2/range 0 (the
- *      channel this session confirmed, via a live kernel breakpoint on
- *      vin_irq_executor_add, the real guest driver never arms on its
- *      own -- used by AX_IVPS group 0) and for every channel of range 1
- *      (used by group 1, also never armed) -- a deliberate override of
- *      this model's normal masked-IRQ semantics, since the real driver
- *      never unmasks these slots itself and the normal path can
- *      therefore never fire for them. This is a guess-and-test hack,
- *      not a modeled register; see the header comment's own MASK
- *      POLARITY section for the (unsuccessful, reverted) attempt at a
- *      principled fix along similar lines.
+ * CDMA at +0x1000 (AX620E). ax_base.ko's g_cdma_hw_info[0] is
+ * 0x02401000 (consumers 0..3; [1] = 0x04400000 serves VPP/DPU):
+ *
+ *   +0x00 CMD_INFO0  [3:0] flags, [6:4] field, [31:7] request index
+ *   +0x04 CMD_INFO1  command list physical address >> 3
+ *   +0x08 CMD_CTRL0  bit0 push INFO0/INFO1, bit1 CPU-trigger request
+ *                    INFO0[31:7] (ax_base_cdma_trigger: ctrl0=1, ctrl0=2)
+ *   +0x18 [15:1] queue occupancy ("cmd queue is full")
+ *   +0x2c bit0 CPU request busy (polled 200 x 5us)
+ *
+ * The list format is the one axera_vin_scan_cdma() walks (descriptor
+ * w0 bit31 = last, [30:24] request index, bit4 = LUT leaf; regmap leaf =
+ * count, then {value, register} pairs from +0x80). Besides the WDMA
+ * set-up the lists carry interrupt arming: vin_irq_executor_add only
+ * writes MASK over MMIO for executors not flagged CDMA-managed, and
+ * __isp_yuv_wdma_setirq / __isp_itp_wdma_setirq emit CLEAR/MASK through
+ * ax_isp_int_{clear,mask}_set_cdma instead. Live AX620E lists: CLEAR
+ * 0xffffffff for range-1 ch0..14 every frame, MASK r1/ch6 = 0x2000
+ * (__vin_itp_af_done_irq_exec_node) and r1/ch9 = 0x1
+ * (__vin_yuv_wdma_done_irq_exec_node) in the last partition, 0 in the
+ * first. Applying those writes arms exactly what the executors wait on
+ * (r0/ch1 bit0 sensor frame start and r0/ch4 bit21 IFE WDMA done are
+ * MMIO-armed). Range-0 ch2 has no executor; r1/ch12 bit25 (EIS post
+ * frame end) has one but is never armed while EIS is off, so on
+ * hardware it never fires either.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -153,6 +148,9 @@
 #include "qapi/error.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include "system/dma.h"
+#include "hw/misc/axera-fbuf.h"
+#include "axera-scene.h"
 
 #define TYPE_AXERA_VIN "axera-vin"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraVinState, AXERA_VIN)
@@ -166,11 +164,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVinState, AXERA_VIN)
 #define RANGE1A_CHANS 8
 #define RANGE1B_BASE  0xc0010
 
-/* Pragmatic CDMA command-descriptor block, see the file's own header
- * comment -- not part of the per-channel MASK/CLEAR/RAW/STATUS scheme. */
+/* AX620E CDMA block, see the header comment */
 #define CDMA_INFO0  0x1000
 #define CDMA_INFO1  0x1004
-#define CDMA_CTRL0  0x1008
+
+/*
+ * The picture the ISP writes (see "Sensor picture" below), per SoC:
+ * where its YUV write-DMA (WDMA) is programmed.
+ */
+enum { ISP_LAYOUT_NONE = 0, ISP_LAYOUT_AX620E = 1, ISP_LAYOUT_AX620U = 2 };
+#define VIN_OUTS        2       /* ITP output channels painted */
+#define VIN_PAINTED     8       /* buffers already holding the scene */
+#define CDMA_TOP_MAX    256     /* command lists per push, at most */
+#define CDMA_SUB_MAX    8192    /* register writes per command list */
+
+typedef struct AxeraVinOut {
+    AxeraNv12Buf buf;
+    bool enabled;
+    bool y_set, uv_set;     /* in the list being scanned */
+} AxeraVinOut;
 
 struct AxeraVinState {
     SysBusDevice parent_obj;
@@ -186,11 +198,8 @@ struct AxeraVinState {
      * the "sensor-streaming" input says it is streaming. */
     bool gate_on_sensor;
     bool sensor_streaming;
-    /* Where this SoC's ISP puts its CDMA command trigger(s): AX620E's
-     * single one at 0x1008; AX620U's IFE and ITP ones at 0x3008 and
-     * 0x83008 (isp_ife/itp_cdma_cmd_cpu_trigger_* in its ax_proton.ko). */
-    uint32_t cdma_ctrl;
-    uint32_t cdma_ctrl2;
+    /* Apply interrupt-register writes found in CDMA lists (AX620E) */
+    bool cdma_irq_regs;
     /* Event bits never raised by the tick, at one register block
      * (quiet-off = its MASK offset): error/overflow events the driver
      * unmasks to count, which healthy hardware does not report. */
@@ -201,6 +210,22 @@ struct AxeraVinState {
      * that block's MASK offset). */
     uint32_t poll_off;
     uint32_t poll_bits;
+
+    /* Sensor picture: see axera_vin_scan_cdma() */
+    uint32_t isp_layout;
+    uint32_t cdma_list_off;     /* the ITP CDMA list-address register */
+    uint64_t cdma_list_base;    /* that register holds (list - base) >> 3 */
+    uint32_t cdma_list;
+    uint32_t cdma_list_off2;    /* a second CDMA engine's (AX620U IFE) */
+    uint32_t cdma_list2;
+    AxeraVinOut out[VIN_OUTS];
+    AxeraPicture scene[VIN_OUTS];
+    uint32_t frame;
+    struct {
+        hwaddr y;
+        uint32_t w, h;
+    } painted[VIN_PAINTED];
+    unsigned painted_next;
 };
 
 enum { FIELD_MASK = 0, FIELD_CLEAR = 1, FIELD_RAW = 2, FIELD_STATUS = 3 };
@@ -245,37 +270,215 @@ static void axera_vin_update_irq(AxeraVinState *s, int range)
     qemu_set_irq(s->irq[range], level);
 }
 
-/* Pragmatic, explicitly user-authorized guess-and-test synthetic
- * "frame done" completion -- see the file's own header comment. Not a
- * modeled register behavior. */
-static void axera_vin_cdma_trigger(AxeraVinState *s)
+/*
+ * Sensor picture. There is no image sensor and no model of the closed
+ * ISP silicon, so the ISP's output is made up here: the OpenIPC test
+ * scene (axera-scene.h), written into the very buffers the ISP driver
+ * points its YUV write-DMA at, so that everything downstream -- IVPS
+ * scaling, OSD, the encoders -- works on real pictures.
+ *
+ * The driver never writes those addresses to registers directly. It
+ * builds command lists in memory and hands them to the ISP's CDMA
+ * engine: a write of the top list's address (absolute >> 3 on AX620E,
+ * (address - 0x40000000) >> 3 on AX620U) to the list register, then a
+ * "push" (1) to the trigger register next to it. A top list is a run
+ * of {descriptor, sub-list address} words, bit 31 of the descriptor
+ * marking the last; a sub-list is a count word, then from +0x80 that
+ * many (value, register) pairs -- the register a physical address on
+ * AX620E, a word index into the ISP block on AX620U. This walks every
+ * list pushed and picks out the WDMA settings:
+ *
+ *   AX620E  0x024d0118 Y >> 3, 0x024d00cc UV >> 3, 0x024d0028 size
+ *           (h << 16 | w), 0x024d0144 / 0x024d00f8 Y / UV stride >> 3.
+ *           The buffer is compressed (half the size of NV12), so the
+ *           picture is kept in axera-fbuf for GDC to find.
+ *   AX620U  four 12-word WDMA blocks from word 0x7007: Y and UV of ITP
+ *           output 0, then of output 1; block +0 bit 0 enable, +3
+ *           stride >> 3, +8 (address - 0x40000000) >> 3, +10 size.
+ *
+ * and paints the next frame of the scene into each output programmed.
+ */
+static void axera_vin_wdma_set(AxeraVinState *s, uint32_t key, uint32_t val)
 {
-    uint8_t buf[4096];
-    unsigned i;
-    int ch;
+    if (s->isp_layout == ISP_LAYOUT_AX620E) {
+        AxeraNv12Buf *b = &s->out[0].buf;
 
-    if (s->cdma_info1 != 0) {
-        for (i = 0; i < sizeof(buf); i++) {
-            buf[i] = (uint8_t)(i ^ (i >> 3));
+        switch (key) {
+        case 0x024d0118:
+            b->y = (hwaddr)val << 3;
+            b->compressed = true;
+            s->out[0].enabled = true;
+            break;
+        case 0x024d00cc:
+            b->uv = (hwaddr)val << 3;
+            break;
+        case 0x024d0028:
+            b->w = val & 0xffff;
+            b->h = val >> 16;
+            break;
+        case 0x024d0144:
+            b->y_stride = val << 3;
+            break;
+        case 0x024d00f8:
+            b->uv_stride = val << 3;
+            break;
         }
-        address_space_write(&address_space_memory, s->cdma_info1,
-                             MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf));
+    } else if (s->isp_layout == ISP_LAYOUT_AX620U &&
+               key >= 0x7007 && key < 0x7007 + 4 * 12) {
+        int blk = (key - 0x7007) / 12, o = (key - 0x7007) % 12;
+        AxeraVinOut *out = &s->out[blk / 2];
+        bool uv = blk & 1;
+        hwaddr a = s->cdma_list_base + ((hwaddr)val << 3);
+
+        switch (o) {
+        case 0:
+            if (!uv) {
+                out->enabled = val & 1;
+            }
+            break;
+        case 3:
+            if (uv) {
+                out->buf.uv_stride = val << 3;
+            } else {
+                out->buf.y_stride = val << 3;
+            }
+            break;
+        case 8: {
+            /*
+             * The ITP works a frame in vertical partitions, programming
+             * each one's start (the frame's address plus its x offset) in
+             * turn within one list: the frame starts at the lowest.
+             */
+            hwaddr *cur = uv ? &out->buf.uv : &out->buf.y;
+            bool *set = uv ? &out->uv_set : &out->y_set;
+
+            if (!*set || a < *cur) {
+                *cur = a;
+            }
+            *set = true;
+            break;
+        }
+        case 10:
+            if (!uv) {
+                out->buf.w = val & 0xffff;
+                out->buf.h = val >> 16;
+            }
+            break;
+        }
+    }
+}
+
+static void axera_vin_paint(AxeraVinState *s, int n)
+{
+    AxeraVinOut *out = &s->out[n];
+    AxeraPicture *pic = &s->scene[n];
+    uint32_t w = out->buf.w, h = out->buf.h, r0, r1;
+    bool fresh;
+    int i;
+
+    /* Y and UV at one address: the driver's placeholder before it has
+     * buffers (AX620U: 0x41000000, in use by the kernel) */
+    if (!out->enabled || !out->buf.y || !out->buf.uv ||
+        out->buf.y == out->buf.uv || w < 16 || h < 16 ||
+        w > 8192 || h > 8192) {
+        return;
+    }
+    if (getenv("AXERA_PIX_DEBUG") && s->frame < 400 && !(s->frame % 50)) {
+        fprintf(stderr, "axera-vin: frame %u out%d %ux%u y 0x%" HWADDR_PRIx
+                "/%u uv 0x%" HWADDR_PRIx "/%u%s\n", s->frame, n, w, h,
+                out->buf.y, out->buf.y_stride, out->buf.uv,
+                out->buf.uv_stride, out->buf.compressed ? " fbc" : "");
+    }
+    fresh = pic->w != ROUND_UP(w, 2) || pic->h != ROUND_UP(h, 2);
+    axera_picture_alloc(pic, w, h);
+    axera_scene_dot_rows(pic->h, &r0, &r1);
+    if (fresh) {
+        axera_scene_nv12(pic->y, pic->w, pic->uv, pic->w, pic->w, pic->h,
+                         s->frame);
+    } else {
+        axera_scene_nv12_rows(pic->y, pic->w, pic->uv, pic->w, pic->w,
+                              pic->h, s->frame, r0, r1);
+    }
+    if (out->buf.compressed) {
+        axera_fbuf_put(out->buf.y, pic);
+        return;
+    }
+    /* A buffer that already holds the scene only needs the dot's rows */
+    for (i = 0; i < VIN_PAINTED; i++) {
+        if (s->painted[i].y == out->buf.y && s->painted[i].w == w &&
+            s->painted[i].h == h) {
+            axera_nv12_store_rows(&out->buf, pic, r0, r1);
+            return;
+        }
+    }
+    axera_fbuf_drop(out->buf.y);
+    axera_nv12_store(&out->buf, pic);
+    i = s->painted_next++ % VIN_PAINTED;
+    s->painted[i].y = out->buf.y;
+    s->painted[i].w = w;
+    s->painted[i].h = h;
+}
+
+static void axera_vin_reg_write(AxeraVinState *s, hwaddr off, uint32_t val,
+                                bool from_cdma);
+
+static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
+{
+    g_autofree uint32_t *pairs = NULL;
+    bool seen = false;
+    int i, n;
+
+    for (n = 0; n < VIN_OUTS; n++) {
+        s->out[n].y_set = s->out[n].uv_set = false;
     }
 
-    /* VIN channel 2/range 0 (AX_IVPS group 0) and every channel of
-     * range 1 (group 1): confirmed this session that the real guest
-     * driver never arms these via vin_irq_executor_add, so the normal
-     * masked path can never fire for them. Force both MASK and RAW so
-     * this model's own status computation (MASK & RAW) is nonzero,
-     * then assert the IRQ lines directly. */
-    s->mask[0][2] |= 0xffffffffu;
-    s->raw[0][2]  |= 0xffffffffu;
-    for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
-        s->mask[1][ch] |= 0xffffffffu;
-        s->raw[1][ch]  |= 0xffffffffu;
+    for (i = 0; i < CDMA_TOP_MAX; i++) {
+        uint32_t ent[2], count;
+        hwaddr sub;
+
+        if (dma_memory_read(&address_space_memory, top + 8 * i, ent,
+                            sizeof(ent), MEMTXATTRS_UNSPECIFIED)) {
+            break;
+        }
+        sub = s->cdma_list_base + ((hwaddr)le32_to_cpu(ent[1]) << 3);
+        if (!dma_memory_read(&address_space_memory, sub, &count,
+                             sizeof(count), MEMTXATTRS_UNSPECIFIED)) {
+            count = le32_to_cpu(count);
+            if (count && count <= CDMA_SUB_MAX) {
+                pairs = g_renew(uint32_t, pairs, 2 * count);
+                if (!dma_memory_read(&address_space_memory, sub + 0x80,
+                                     pairs, 8 * count,
+                                     MEMTXATTRS_UNSPECIFIED)) {
+                    for (n = 0; n < count; n++) {
+                        uint32_t key = le32_to_cpu(pairs[2 * n + 1]);
+
+                        /* What the CDMA engine does with every pair;
+                         * here only the interrupt registers matter. */
+                        if (s->cdma_irq_regs && (key >> 20) == 0x024) {
+                            axera_vin_reg_write(s, key & 0xfffff,
+                                                le32_to_cpu(pairs[2 * n]),
+                                                true);
+                        }
+                        if ((key >= 0x7007 && key < 0x7037) ||
+                            (key >> 12) == 0x024d0) {
+                            axera_vin_wdma_set(s, key,
+                                               le32_to_cpu(pairs[2 * n]));
+                            seen = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (le32_to_cpu(ent[0]) & 0x80000000u) {
+            break;
+        }
     }
-    axera_vin_update_irq(s, 0);
-    axera_vin_update_irq(s, 1);
+    if (seen) {
+        for (n = 0; n < VIN_OUTS; n++) {
+            axera_vin_paint(s, n);
+        }
+        s->frame++;
+    }
 }
 
 static uint64_t axera_vin_read(void *opaque, hwaddr off, unsigned size)
@@ -289,8 +492,10 @@ static uint64_t axera_vin_read(void *opaque, hwaddr off, unsigned size)
     if (off == CDMA_INFO1) {
         return s->cdma_info1;
     }
-    if (off == CDMA_CTRL0) {
-        return 0; /* auto-cleared */
+    if (off >= CDMA_INFO0 + 8 && off < CDMA_INFO0 + 0x100) {
+        /* CTRL0 self-clears; queue empty (+0x18), CPU request not busy
+         * (+0x2c): a list completes as it is pushed here. */
+        return 0;
     }
 
     if (!axera_vin_decode(off, &range, &ch, &field)) {
@@ -310,44 +515,26 @@ static uint64_t axera_vin_read(void *opaque, hwaddr off, unsigned size)
     }
 }
 
-static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
-                             unsigned size)
+static void axera_vin_reg_write(AxeraVinState *s, hwaddr off, uint32_t val,
+                                bool from_cdma)
 {
-    AxeraVinState *s = AXERA_VIN(opaque);
     int range, ch, field;
 
-    if (off == CDMA_INFO0) {
-        s->cdma_info0 = val;
-        return;
-    }
-    if (off == CDMA_INFO1) {
-        s->cdma_info1 = val;
-        return;
-    }
-    if (off == s->cdma_ctrl || (s->cdma_ctrl2 && off == s->cdma_ctrl2)) {
-        if (getenv("AXERA_VIN_DEBUG") && val != 0) {
-            static int n;
-            if (n++ < 20) {
-                qemu_log("axera-vin: cdma trigger [0x%05" HWADDR_PRIx "] = %08x\n",
-                         off, (uint32_t)val);
-            }
-        }
-        if (val != 0) {
-            axera_vin_cdma_trigger(s);
-        }
-        return;
-    }
-
     if (!axera_vin_decode(off, &range, &ch, &field)) {
-        qemu_log_mask(LOG_UNIMP, "axera-vin: write [0x%05" HWADDR_PRIx
-                      "] = 0x%08" PRIx64 "\n", off, val);
+        /* ISP configuration: not modelled. Lists carry thousands of
+         * these per frame, so only CPU writes are logged. */
+        if (!from_cdma) {
+            qemu_log_mask(LOG_UNIMP, "axera-vin: write [0x%05" HWADDR_PRIx
+                          "] = 0x%08" PRIx32 "\n", off, val);
+        }
         return;
     }
     switch (field) {
     case FIELD_MASK:
         if (getenv("AXERA_VIN_DEBUG") && s->mask[range][ch] != val) {
-            qemu_log("axera-vin: mask r%d ch%d [0x%05" HWADDR_PRIx "] %08x -> %08x\n",
-                     range, ch, off, s->mask[range][ch], (uint32_t)val);
+            qemu_log("axera-vin: mask r%d ch%d [0x%05" HWADDR_PRIx
+                     "] %08x -> %08x%s\n", range, ch, off,
+                     s->mask[range][ch], val, from_cdma ? " (cdma)" : "");
         }
         s->mask[range][ch] = val;
         break;
@@ -358,6 +545,36 @@ static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     axera_vin_update_irq(s, range);
+}
+
+static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size)
+{
+    AxeraVinState *s = AXERA_VIN(opaque);
+
+    if (s->isp_layout && off == s->cdma_list_off) {
+        s->cdma_list = val;
+    }
+    if (s->isp_layout && off == s->cdma_list_off + 4 && (val & 1)) {
+        axera_vin_scan_cdma(s, s->cdma_list_base +
+                               ((hwaddr)s->cdma_list << 3));
+    }
+    if (s->cdma_list_off2 && off == s->cdma_list_off2) {
+        s->cdma_list2 = val;
+    }
+    if (s->cdma_list_off2 && off == s->cdma_list_off2 + 4 && (val & 1)) {
+        axera_vin_scan_cdma(s, s->cdma_list_base +
+                               ((hwaddr)s->cdma_list2 << 3));
+    }
+    if (off == CDMA_INFO0) {
+        s->cdma_info0 = val;
+        return;
+    }
+    if (off == CDMA_INFO1) {
+        s->cdma_info1 = val;
+        return;
+    }
+    axera_vin_reg_write(s, off, val, false);
 }
 
 /*
@@ -466,12 +683,15 @@ static void axera_vin_init(Object *obj)
 static const Property axera_vin_props[] = {
     DEFINE_PROP_UINT32("fps", AxeraVinState, fps, 30),
     DEFINE_PROP_BOOL("gate-on-sensor", AxeraVinState, gate_on_sensor, false),
-    DEFINE_PROP_UINT32("cdma-ctrl", AxeraVinState, cdma_ctrl, CDMA_CTRL0),
-    DEFINE_PROP_UINT32("cdma-ctrl2", AxeraVinState, cdma_ctrl2, 0),
+    DEFINE_PROP_BOOL("cdma-irq-regs", AxeraVinState, cdma_irq_regs, false),
     DEFINE_PROP_UINT32("quiet-off", AxeraVinState, quiet_off, 0),
     DEFINE_PROP_UINT32("quiet-bits", AxeraVinState, quiet_bits, 0),
     DEFINE_PROP_UINT32("poll-off", AxeraVinState, poll_off, 0),
     DEFINE_PROP_UINT32("poll-bits", AxeraVinState, poll_bits, 0),
+    DEFINE_PROP_UINT32("isp-layout", AxeraVinState, isp_layout, 0),
+    DEFINE_PROP_UINT32("cdma-list-off", AxeraVinState, cdma_list_off, 0),
+    DEFINE_PROP_UINT32("cdma-list-off2", AxeraVinState, cdma_list_off2, 0),
+    DEFINE_PROP_UINT64("cdma-list-base", AxeraVinState, cdma_list_base, 0),
 };
 
 static void axera_vin_realize(DeviceState *dev, Error **errp)

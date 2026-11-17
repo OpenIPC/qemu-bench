@@ -80,9 +80,13 @@
 #include "hw/sysbus.h"
 #include "qom/object.h"
 #include "system/dma.h"
+#include "block/aio.h"
+#include "block/thread-pool.h"
 #include "hantro-h264.h"
 #include "hevc-enc.h"
 #include "jpeg-enc.h"
+#include "axera-scene.h"
+#include "hw/misc/axera-fbuf.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 
@@ -394,6 +398,23 @@ struct AxeraVcmdState {
     uint32_t enc_jobs;
     bool resume_deferred;   /* RDY bump arrived while a job was running */
 
+    /*
+     * Asynchronous encode: the software encoder takes ~100 ms of host
+     * time per 4K picture. Run under the BQL inside the vCPU's MMIO
+     * write it stalled that vCPU and, through the BQL, every other vCPU,
+     * the main loop (network) and all device timers for that long. The
+     * job now runs in QEMU's thread pool on a snapshot of the core
+     * registers (job_reg); the command buffer interpreter parks right
+     * after the instruction that started it -- the hardware likewise
+     * executes nothing behind HWIF_ENC_E until the core is done -- and
+     * picks up again from axera_vcmd_job_done(), in the main loop, with
+     * the BQL. AXERA_VCMD_SYNC=1 restores the old synchronous path.
+     */
+    bool enc_busy;
+    uint32_t job_reg[CORE_REG_COUNT];
+    hwaddr susp_addr;       /* parked command buffer, resume point */
+    uint32_t susp_len, susp_word, susp_chain;
+
     /* Added to every bus address the guest programs (command buffers,
      * RREG destinations, picture/stream buffers): AX620U's driver hands
      * the hardware DRAM-relative addresses (VeriSilicon's base_ddr_addr
@@ -592,11 +613,10 @@ static uint64_t axera_vcmd_read_reg(AxeraVcmdState *s, hwaddr offset)
  * (solid green once decoded), it codes to almost nothing, and the camera
  * App treats that as a dead encoder: it logs "zero bitrate" and reboots.
  * So when a source picture is entirely empty -- and only then; anything
- * real that ever reaches it is encoded untouched -- this paints a test
- * card in its place: SMPTE-style colour bars scrolling sideways with a
- * white box sweeping across them, advancing one step per frame of that
- * stream -- the whole picture changes every frame, as a real sensor's
- * noise would make it, so P-frames carry real bits.
+ * real that ever reaches it is encoded untouched -- this paints the
+ * OpenIPC test scene of the other camera models in its place
+ * (axera-scene.h: the logo on navy, a dot sliding beneath it), advancing
+ * one step per frame of that stream.
  */
 static bool axera_vcmd_plane_empty(const uint8_t *p, size_t n)
 {
@@ -610,56 +630,25 @@ static bool axera_vcmd_plane_empty(const uint8_t *p, size_t n)
     return true;
 }
 
-static void axera_vcmd_test_card(uint8_t *y, uint32_t stride_y,
-                                 uint8_t *uv, uint32_t stride_c,
-                                 uint32_t w, uint32_t h, uint32_t frame)
+static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
 {
-    /* 75% bars: white, yellow, cyan, green, magenta, red, blue, black */
-    static const uint8_t bars[8][3] = {
-        { 180, 128, 128 }, { 162,  44, 142 }, { 131, 156,  44 },
-        { 112,  72,  58 }, {  84, 184, 198 }, {  65, 100, 212 },
-        {  35, 212, 114 }, {  16, 128, 128 },
-    };
-    uint32_t bw = MAX(w / 8, 1), box = MAX(h / 6, 16) & ~1u;
-    uint32_t bx = (frame * 8) % MAX(w - box, 1) & ~1u;
-    uint32_t by = (h - box) / 2 & ~1u;
-    uint32_t r, c;
-
-    for (r = 0; r < h; r++) {
-        for (c = 0; c < w; c++) {
-            const uint8_t *b = bars[((c + frame * 16) / bw) % 8];
-            bool in = r >= by && r < by + box && c >= bx && c < bx + box;
-
-            y[(size_t)r * stride_y + c] = in ? 235 : b[0];
-            if (!(r & 1) && !(c & 1)) {
-                uint8_t *p = &uv[(size_t)(r / 2) * stride_c + c];
-
-                p[0] = in ? 128 : b[1];
-                p[1] = in ? 128 : b[2];
-            }
-        }
-    }
-}
-
-static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
-{
-    uint32_t mode = (s->core_reg[ENC_REG_MODE] >> ENC_MODE_SHIFT) &
+    uint32_t mode = (reg[ENC_REG_MODE] >> ENC_MODE_SHIFT) &
                      ENC_MODE_MASK;
-    uint32_t geom = s->core_reg[ENC_REG_GEOM];
+    uint32_t geom = reg[ENC_REG_GEOM];
     uint32_t coding_type = (geom >> ENC_CODING_TYPE_SHIFT) &
                             ENC_CODING_TYPE_MASK;
-    uint32_t fmt = (s->core_reg[ENC_REG_IN_FORMAT] >> ENC_IN_FMT_SHIFT) &
+    uint32_t fmt = (reg[ENC_REG_IN_FORMAT] >> ENC_IN_FMT_SHIFT) &
                    ENC_IN_FMT_MASK;
-    hwaddr out_base = s->core_reg[ENC_REG_OUT_BASE];
-    hwaddr y_base = s->core_reg[ENC_REG_IN_Y];
-    hwaddr cb_base = s->core_reg[ENC_REG_IN_CB];
-    hwaddr cr_base = s->core_reg[ENC_REG_IN_CR];
-    uint32_t out_cap = s->core_reg[ENC_REG_OUT_LIMIT];
+    hwaddr out_base = reg[ENC_REG_OUT_BASE];
+    hwaddr y_base = reg[ENC_REG_IN_Y];
+    hwaddr cb_base = reg[ENC_REG_IN_CB];
+    hwaddr cr_base = reg[ENC_REG_IN_CR];
+    uint32_t out_cap = reg[ENC_REG_OUT_LIMIT];
     uint32_t w, h, mbw, mbh;
-    int qp = (s->core_reg[ENC_REG_QP] >> ENC_PIC_INIT_QP_SHIFT) &
+    int qp = (reg[ENC_REG_QP] >> ENC_PIC_INIT_QP_SHIFT) &
              ENC_PIC_INIT_QP_MASK;
-    uint32_t stride_y = s->core_reg[ENC_REG_IN_LU_STRIDE] >> ENC_STRIDE_SHIFT;
-    uint32_t stride_c = s->core_reg[ENC_REG_IN_CH_STRIDE] >> ENC_STRIDE_SHIFT;
+    uint32_t stride_y = reg[ENC_REG_IN_LU_STRIDE] >> ENC_STRIDE_SHIFT;
+    uint32_t stride_c = reg[ENC_REG_IN_CH_STRIDE] >> ENC_STRIDE_SHIFT;
     g_autofree uint8_t *y = NULL;
     g_autofree uint8_t *uv = NULL;
     g_autofree uint8_t *out = NULL;
@@ -733,11 +722,33 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
     }
 
     bool card = false;
+    AxeraPicture pic = { 0 };
 
+    /*
+     * A compressed input (AX620E VPP's main port, input format 6) holds
+     * the frame-buffer format no model writes; its picture is kept in
+     * axera-fbuf by the VPP model that made it.
+     */
+    if (fmt != 0 && stride_y >= w && stride_c >= w) {
+        axera_picture_alloc(&pic, w, h);
+        if (axera_fbuf_copy(y_base, &pic)) {
+            uint32_t r;
+
+            for (r = 0; r < h; r++) {
+                memcpy(y + (size_t)r * stride_y, pic.y + (size_t)r * pic.w,
+                       w);
+            }
+            for (r = 0; r < h / 2; r++) {
+                memcpy(uv + (size_t)r * stride_c,
+                       pic.uv + (size_t)r * pic.w, w);
+            }
+        }
+        axera_picture_free(&pic);
+    }
     if (fmt != 0 && stride_c >= w &&
         axera_vcmd_plane_empty(y, (size_t)stride_y * h) &&
         axera_vcmd_plane_empty(uv, (size_t)stride_c * (h / 2))) {
-        axera_vcmd_test_card(y, stride_y, uv, stride_c, w, h, st->frames);
+        axera_scene_nv12(y, stride_y, uv, stride_c, w, h, st->frames);
         card = true;
     }
     if (getenv("AXERA_VCMD_STATS") && (st->frames % 50) == 0) {
@@ -797,9 +808,15 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
 
         jpeg_quant_table(quality, jpeg_base_luma, ql);
         jpeg_quant_table(quality, jpeg_base_chroma, qc);
-        for (i = 0; i < cw * ch; i++) {
-            cb[i] = uv[2 * i];
-            cr[i] = uv[2 * i + 1];
+        /* interleaved Cb/Cr rows are stride_c apart (the AX620U
+         * snapshot's 800-wide picture has a stride of 832) */
+        for (i = 0; i < ch; i++) {
+            size_t j;
+
+            for (j = 0; j < cw && 2 * j + 1 < stride_c; j++) {
+                cb[i * cw + j] = uv[i * stride_c + 2 * j];
+                cr[i * cw + j] = uv[i * stride_c + 2 * j + 1];
+            }
         }
         jpeg_enc_header(hdrb, w, h, ql, qc);
         if (hdrb->len <= cap) {
@@ -820,7 +837,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
      * encoded frame looked empty and was dropped (FrmEnc stayed 0).
      */
     if (n && (mode == ENC_MODE_H264 || mode == ENC_MODE_HEVC) &&
-        s->core_reg[10]) {
+        reg[10]) {
         g_autoptr(GArray) sizes = g_array_new(false, false, sizeof(uint32_t));
         size_t p, start = 0;
         uint32_t zero = 0, sz;
@@ -837,7 +854,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
         sz = n - start;
         g_array_append_val(sizes, sz);
         g_array_append_val(sizes, zero);
-        vcmd_dma_write(s, s->core_reg[10],
+        vcmd_dma_write(s, reg[10],
                          sizes->data, sizes->len * sizeof(uint32_t),
                          MEMTXATTRS_UNSPECIFIED);
     }
@@ -850,17 +867,17 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
                         sizeof(pre), MEMTXATTRS_UNSPECIFIED);
         fprintf(stderr, "AXERA_VCMD_JOB: mode=%u %ux%u idr=%d out=0x%"
                 PRIx64 " n=%zu sizetbl=0x%x swreg4=0x%x pre:", mode, w, h,
-                idr, out_base, (size_t)n, s->core_reg[10], s->core_reg[4]);
+                idr, out_base, (size_t)n, reg[10], reg[4]);
         fprintf(stderr, " swreg5=0x%x swreg6=0x%x swreg7=0x%x swreg8=0x%x"
-                " swreg9cap=0x%x", s->core_reg[5], s->core_reg[6],
-                s->core_reg[7], s->core_reg[8], out_cap);
+                " swreg9cap=0x%x", reg[5], reg[6],
+                reg[7], reg[8], out_cap);
         for (k = 0; k < sizeof(pre); k++) {
             fprintf(stderr, "%02x", pre[k]);
         }
         {
             uint32_t tbl[4];
 
-            vcmd_dma_read(s, s->core_reg[10] - 12,
+            vcmd_dma_read(s, reg[10] - 12,
                             tbl, sizeof(tbl), MEMTXATTRS_UNSPECIFIED);
             fprintf(stderr, " tbl[-3..0]=%u,%u,%u,%u", tbl[0], tbl[1],
                     tbl[2], tbl[3]);
@@ -880,21 +897,81 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
          * "Output stream size (bytes)"). Confirmed over RTSP: reporting
          * bits made the camera App send each slice 8x its real length.
          */
-        s->core_reg[ENC_REG_OUT_LIMIT] = n;
-        s->core_reg[ENC_REG_IRQ] |= ENC_IRQ_BIT | ENC_FRAME_RDY_BIT;
+        reg[ENC_REG_OUT_LIMIT] = n;
+        reg[ENC_REG_IRQ] |= ENC_IRQ_BIT | ENC_FRAME_RDY_BIT;
         /*
          * swreg7[24:17] HWIF_ENC_NUM_SLICES_READY: completed slices. The
          * bridge always emits the picture as one slice; the API compares
          * this with the slice count it asked for and treats a short count
          * as an unfinished frame.
          */
-        s->core_reg[7] = (s->core_reg[7] & ~(0xffu << 17)) | (1u << 17);
+        reg[7] = (reg[7] & ~(0xffu << 17)) | (1u << 17);
     } else {
         qemu_log_mask(LOG_UNIMP, "axera-vcmd: encode job produced no "
                       "output (mode=%u %ux%u idr=%d)\n", mode, w, h, idr);
     }
-    s->core_reg[ENC_REG_GEOM] &= ~ENC_E_BIT;
+    reg[ENC_REG_GEOM] &= ~ENC_E_BIT;
     s->enc_jobs++;
+}
+
+static bool axera_vcmd_exec_chain_from(AxeraVcmdState *s, hwaddr addr,
+                                       uint32_t len, uint32_t word,
+                                       uint32_t chain);
+
+static int axera_vcmd_job_worker(void *opaque)
+{
+    AxeraVcmdState *s = opaque;
+
+    axera_vcmd_run_encode_job(s, s->job_reg);
+    return 0;
+}
+
+/* Main loop, BQL held: publish the job's result registers, then carry
+ * on with the command buffer behind the instruction that started it. */
+static void axera_vcmd_job_done(void *opaque, int ret)
+{
+    AxeraVcmdState *s = opaque;
+    static const int out_regs[] = { ENC_REG_OUT_LIMIT, ENC_REG_IRQ, 7 };
+    int k;
+
+    s->enc_busy = false;
+    for (k = 0; k < ARRAY_SIZE(out_regs); k++) {
+        s->core_reg[out_regs[k]] = s->job_reg[out_regs[k]];
+    }
+    s->core_reg[ENC_REG_GEOM] &= ~ENC_E_BIT;
+    if (s->work_state != WORK_STATE_WORK) {
+        return; /* aborted meanwhile */
+    }
+    if (!axera_vcmd_exec_chain_from(s, s->susp_addr, s->susp_len,
+                                    s->susp_word, s->susp_chain)) {
+        timer_mod(&s->completion_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  AXERA_VCMD_LATENCY_NS);
+    }
+}
+
+static bool axera_vcmd_async(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = !getenv("AXERA_VCMD_SYNC");
+    }
+    return on;
+}
+
+/* Start the encode job HWIF_ENC_E just asked for. Returns true when it
+ * runs in the background and the interpreter must park. */
+static bool axera_vcmd_kick_job(AxeraVcmdState *s)
+{
+    if (!axera_vcmd_async()) {
+        axera_vcmd_run_encode_job(s, s->core_reg);
+        return false;
+    }
+    memcpy(s->job_reg, s->core_reg, sizeof(s->job_reg));
+    s->enc_busy = true;
+    thread_pool_submit_aio(axera_vcmd_job_worker, s, axera_vcmd_job_done, s);
+    return true;
 }
 
 /*
@@ -916,16 +993,19 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s)
  * it ends in a JMP with RDY set, i.e. the driver has linked another
  * buffer behind it and the hardware carries straight on.
  */
-static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
-                                uint32_t length, hwaddr *next_addr,
-                                uint32_t *next_len)
+enum { EXEC_END, EXEC_NEXT, EXEC_PARKED };
+
+static int axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
+                               uint32_t length, uint32_t start,
+                               hwaddr *next_addr, uint32_t *next_len)
 {
     uint32_t bytes = length * 8;
     g_autofree uint32_t *buf = NULL;
     uint32_t nwords, i;
+    bool park = false;
 
     if (!addr || !bytes) {
-        return false;
+        return EXEC_END;
     }
     bytes = MIN(bytes, 0x2000); /* vcmd_abi.h CMDBUF_MAX_SIZE */
     nwords = bytes / 4;
@@ -933,7 +1013,7 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
     vcmd_dma_read(s, addr, buf, bytes,
                     MEMTXATTRS_UNSPECIFIED);
 
-    for (i = 0; i < nwords; ) {
+    for (i = start; i < nwords; ) {
         uint32_t word = buf[i];
         uint32_t op = word >> 27;
         uint32_t n = (word >> 16) & 0x3ff;
@@ -957,8 +1037,9 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                                 creg, buf[i]);
                     }
                     axera_vcmd_core_write(s, creg, buf[i]);
-                    if (creg == ENC_REG_GEOM && (buf[i] & ENC_E_BIT)) {
-                        axera_vcmd_run_encode_job(s);
+                    if (creg == ENC_REG_GEOM && (buf[i] & ENC_E_BIT) &&
+                        !s->enc_busy) {
+                        park |= axera_vcmd_kick_job(s);
                     }
                 }
             }
@@ -968,6 +1049,12 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
              * followed by one padding word, not another opcode.
              */
             i = ROUND_UP(i, 2);
+            if (park) {
+                s->susp_addr = addr;
+                s->susp_len = length;
+                s->susp_word = i;
+                return EXEC_PARKED;
+            }
         } else if (op == VCMD_OP_RREG) {
             hwaddr dst;
 
@@ -1016,18 +1103,18 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                 *next_addr = buf[i + 1] | ((hwaddr)buf[i + 2] << 32);
                 *next_len = word & 0xffff;
                 s->vreg[EXECUTING_ID_OFF / 4] = buf[i + 3];
-                return true;
+                return EXEC_NEXT;
             }
             /* End of the linked chain: the core parks on this JMP until
              * software links another buffer behind it (see the
              * RDY_CMDBUF_COUNT write handler). */
             s->pend_jmp = addr + (hwaddr)i * 4;
             s->pending_status |= IRQ_JMPP;
-            return false;
+            return EXEC_END;
         } else if (op == VCMD_OP_END) {
             s->exe_count++;
             s->pending_status |= IRQ_ENDCMD;
-            return false;
+            return EXEC_END;
         } else if (op == VCMD_OP_NOP) {
             i++;
         } else {
@@ -1037,31 +1124,48 @@ static bool axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
         }
     }
     /* Ran off the buffer (or hit an unknown opcode): nothing chained. */
-    return false;
+    return EXEC_END;
 }
 
-static void axera_vcmd_exec_chain(AxeraVcmdState *s, hwaddr addr,
-                                  uint32_t len)
+/* Returns true when an encode job parked the chain (see enc_busy). */
+static bool axera_vcmd_exec_chain_from(AxeraVcmdState *s, hwaddr addr,
+                                       uint32_t len, uint32_t word,
+                                       uint32_t chain)
 {
-    int n;
+    uint32_t n;
 
-    s->pend_jmp = 0;
-    for (n = 0; n < VCMD_MAX_CHAIN; n++) {
+    for (n = chain; n < VCMD_MAX_CHAIN; n++) {
         hwaddr next_addr = 0;
         uint32_t next_len = 0;
+        int r = axera_vcmd_exec_one(s, addr, len, word, &next_addr,
+                                    &next_len);
 
-        if (!axera_vcmd_exec_one(s, addr, len, &next_addr, &next_len)) {
+        if (r == EXEC_PARKED) {
+            s->susp_chain = n;
+            return true;
+        }
+        if (r != EXEC_NEXT) {
             break;
         }
         addr = next_addr;
         len = next_len;
+        word = 0;
     }
+    return false;
 }
 
-static void axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
+static bool axera_vcmd_exec_chain(AxeraVcmdState *s, hwaddr addr,
+                                  uint32_t len)
 {
-    axera_vcmd_exec_chain(s, ((hwaddr)s->cmd_addr_hi << 32) | s->cmd_addr_lo,
-                          s->cmd_length);
+    s->pend_jmp = 0;
+    return axera_vcmd_exec_chain_from(s, addr, len, 0, 0);
+}
+
+static bool axera_vcmd_exec_cmdbuf(AxeraVcmdState *s)
+{
+    return axera_vcmd_exec_chain(s,
+                                 ((hwaddr)s->cmd_addr_hi << 32) |
+                                 s->cmd_addr_lo, s->cmd_length);
 }
 
 /*
@@ -1088,8 +1192,10 @@ static void axera_vcmd_resume(AxeraVcmdState *s)
     }
     s->vreg[EXECUTING_ID_OFF / 4] = jmp[3];
     s->work_state = WORK_STATE_WORK;
-    axera_vcmd_exec_chain(s, jmp[1] | ((hwaddr)jmp[2] << 32),
-                          jmp[0] & 0xffff);
+    if (axera_vcmd_exec_chain(s, jmp[1] | ((hwaddr)jmp[2] << 32),
+                              jmp[0] & 0xffff)) {
+        return; /* the encode job's completion carries on */
+    }
     timer_mod(&s->completion_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AXERA_VCMD_LATENCY_NS);
 }
@@ -1111,8 +1217,10 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
                         "len=%u\n", s->cmd_addr_hi, s->cmd_addr_lo,
                         s->cmd_length);
             }
-            axera_vcmd_exec_cmdbuf(s);
             s->work_state = WORK_STATE_WORK;
+            if (axera_vcmd_exec_cmdbuf(s)) {
+                break; /* the encode job's completion carries on */
+            }
             timer_mod(&s->completion_timer,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                      AXERA_VCMD_LATENCY_NS);
@@ -1179,8 +1287,9 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
                             creg, (uint32_t)value);
                 }
                 axera_vcmd_core_write(s, creg, value);
-                if (creg == ENC_REG_GEOM && (value & ENC_E_BIT)) {
-                    axera_vcmd_run_encode_job(s);
+                if (creg == ENC_REG_GEOM && (value & ENC_E_BIT) &&
+                    !s->enc_busy) {
+                    axera_vcmd_run_encode_job(s, s->core_reg);
                 }
             }
         }
@@ -1199,6 +1308,10 @@ static void axera_vcmd_reset(DeviceState *dev)
 {
     AxeraVcmdState *s = AXERA_VCMD(dev);
 
+    /* an encode job still running owns the stream contexts */
+    while (s->enc_busy) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
     timer_del(&s->completion_timer);
     s->int_status = 0;
     s->int_ctl = 0;

@@ -221,26 +221,39 @@ below.
   root-caused. `uboot-file=` (above) is the complete, verified
   alternative that skips BL1 entirely.
 - **The camera pipeline runs end to end on the real Xiongmai firmware,
-  without real pixels.** Both AX620E (`flash-file=` of an IVG-A6 dump)
-  and AX620U (a JFtech IPC_AX620U_A8 dump) boot the vendor App and serve
-  H.265 over RTSP (`rtsp://<cam>:554/user=admin&password=&channel=1&stream=0.sdp`;
-  `qemu-boot/axera-rtsp-pull.py` pulls it). What the models do:
-  - VIN/ISP (`axera-vin`): fires the frame-start/end events the closed
-    `ax_proton.ko` has unmasked, at 30 fps; per-SoC `quiet-*` props keep
-    the WDMA error events it also unmasks silent (on AX620U they would
-    drop every frame and stop the AI-ISP user-IRQ forward), `poll-*`
-    props latch the RLTM histogram bit it polls instead of unmasking.
+  with a picture flowing through it.** Both AX620E (`flash-file=` of an
+  IVG-A6 dump) and AX620U (a JFtech IPC_AX620U_A8 dump) boot the vendor
+  App and serve H.265 (or H.264) over RTSP
+  (`rtsp://<cam>:554/user=admin&password=&channel=1&stream=0.sdp`, sub
+  stream `stream=1`; `qemu-boot/axera-rtsp-pull.py` pulls it). The
+  picture is the OpenIPC test scene the other camera models use (the
+  logo on navy, a dot sliding beneath it), written as the ISP's output
+  and carried by the IVPS and encoder models like a real frame:
+  - VIN/ISP (`axera-vin`): there is no sensor or ISP model, so the
+    ISP's YUV output is painted with the scene. The driver programs the
+    output buffers only through CDMA command lists in memory; the model
+    walks each list it is handed and picks out the YUV write-DMA
+    addresses (AX620E's main output is compressed, so its picture is
+    kept in `axera-fbuf` by address). The same lists arm the range-1
+    interrupts on AX620E. Frame events at 30 fps; per-SoC `quiet-*`
+    props keep the error/frame-loss events silent, `poll-*` props latch
+    the RLTM histogram bit the driver polls.
+  - IVPS engines (`axera-ivps-engine`): AX620U's TDP copy-scales NV12
+    per job; on AX620E the GDC streams the ISP picture into VPP, which
+    fills each output port (compressed ports via `axera-fbuf`). DPU
+    (OSD) jobs complete without drawing.
   - NPU (`axera-npu`, AX620U): jobs complete without computing anything,
     which is enough for the AI-ISP denoise stage and the App's detection
     models to keep running.
-  - IVPS engines (`axera-ivps-engine`): VPP/GDC/TDP/DPU on AX620E,
-    TDP/GDC/DPU on AX620U; jobs complete, pixels are not processed.
   - VENC (`axera-vcmd`): the VeriSilicon VCMD front end plus a software
-    H.264/HEVC/JPEG encoder. The frames reaching it are empty, so it
-    encodes a moving colour-bar test card instead -- which is what the
-    RTSP stream shows.
-  The App reboots on zero bitrate unless `/mnt/mtd/Config/NoBitNoReboot.flag`
-  exists; create it after login. No real sensor pixel data is modelled.
+    H.264/HEVC/JPEG encoder, run in a worker thread (`AXERA_VCMD_SYNC=1`
+    runs it inline). If a source picture is still empty it paints the
+    scene itself.
+  Not modelled: ISP 3A statistics, so the App's auto exposure judges
+  the scene dark and switches to night mode (reduced frame rate, the
+  occasional "zero bitrate" log); OSD drawing; audio.
+  `QEMU_TLBI_RELAXED=1` (patch 0006) makes broadcast TLB flushes cheaper
+  and roughly doubles AX620U's frame rate on a loaded host.
 - **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both
   use a vendor spin-table (`secondary-boot-reg`), not PSCI. AX620U
   reuses QEMU's own generic `default_write_secondary()`
@@ -260,4 +273,4 @@ below.
   0x300A, matching the vendor SDK's own `os04a10.c` exactly). Both let
   the real camera app's sensor-probe/ID-read succeed and load its real
   tuning files, but neither delivers actual pixel data; the video path
-  downstream runs on synthetic events and a test card (see above).
+  downstream runs on the painted test scene (see above).

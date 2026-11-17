@@ -668,6 +668,40 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
     const int cw = p->w >> 3, cu = (y0 >> 3) * cw + (x0 >> 3);
     const int cs = p->w / 2;
 
+    /*
+     * A P-slice CU whose skip distortion alone is within the threshold is
+     * skipped whatever the intra candidate costs (skip = sse_s <= sse_i +
+     * skip_thr, sse_i >= 0): decide that first and leave the intra
+     * analysis -- most of this function's time -- to the CUs that move.
+     * Bit-exact with the full decision.
+     */
+    bool early_skip = false;
+    if (p_slice && p->ref && !p->force_intra) {
+        int sse_s = 0;
+        for (y = 0; y < 8 && sse_s <= p->skip_thr; y++) {
+            const int o = (y0 + y) * p->w + x0;
+            for (x = 0; x < 8; x++) {
+                const int ds = p->ref->y[o + x] - p->cy[o + x];
+                sse_s += ds * ds;
+            }
+        }
+        for (comp = 0; comp < 2 && sse_s <= p->skip_thr; comp++) {
+            const uint8_t *src = comp ? p->ccr : p->ccb;
+            const uint8_t *ref = comp ? p->ref->cr : p->ref->cb;
+            for (y = 0; y < 4; y++) {
+                const int o = (y0 / 2 + y) * cs + x0 / 2;
+                for (x = 0; x < 4; x++) {
+                    const int ds = ref[o + x] - src[o + x];
+                    sse_s += ds * ds;
+                }
+            }
+        }
+        early_skip = sse_s <= p->skip_thr;
+    }
+    if (early_skip) {
+        goto p_cu;
+    }
+
     /* the intra candidate: DC prediction, DC residual, luma 8x8 */
     pred_dc(p, p->y, p->w, 1, x0, y0, 8, true, pred);
     int sum = 0;
@@ -698,13 +732,14 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
         r_c[comp] = dc_residual(lev_c[comp], qpc, 2);
     }
 
+p_cu:
     if (p_slice) {
         /* cu_skip_flag, its context from the left and upper CUs' */
         const int ctx = (x0 > 0 && p->skip[cu - 1]) +
                         (y0 > 0 && p->skip[cu - cw]);
-        bool skip = false;
+        bool skip = early_skip;
 
-        if (p->ref && !p->force_intra) {
+        if (!skip && p->ref && !p->force_intra) {
             int sse_i = 0, sse_s = 0;
             for (y = 0; y < 8; y++) {
                 const int o = (y0 + y) * p->w + x0;
@@ -1119,15 +1154,31 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
     p.ccb = ccb;
     p.ccr = ccr;
     pic_maps(&p);
-    for (yy = 0; yy < h; yy++) {
-        for (x = 0; x < w; x++) {
-            cy[yy * w + x] = src_y(&p, x, yy);
+    if (sw == w && sh == h) {
+        /* no scaling: the maps are the identity, copy whole rows */
+        for (yy = 0; yy < h; yy++) {
+            memcpy(&cy[yy * w], &y[(size_t)yy * ys], w);
         }
-    }
-    for (yy = 0; yy < h / 2; yy++) {
-        for (x = 0; x < w / 2; x++) {
-            ccb[yy * (w / 2) + x] = src_c(&p, 0, x, yy);
-            ccr[yy * (w / 2) + x] = src_c(&p, 1, x, yy);
+        for (yy = 0; yy < h / 2; yy++) {
+            const uint8_t *s2 = &uv[(size_t)yy * cs];
+            uint8_t *db = &ccb[yy * (w / 2)], *dr = &ccr[yy * (w / 2)];
+
+            for (x = 0; x < w / 2; x++) {
+                db[x] = s2[2 * x];
+                dr[x] = s2[2 * x + 1];
+            }
+        }
+    } else {
+        for (yy = 0; yy < h; yy++) {
+            for (x = 0; x < w; x++) {
+                cy[yy * w + x] = src_y(&p, x, yy);
+            }
+        }
+        for (yy = 0; yy < h / 2; yy++) {
+            for (x = 0; x < w / 2; x++) {
+                ccb[yy * (w / 2) + x] = src_c(&p, 0, x, yy);
+                ccr[yy * (w / 2) + x] = src_c(&p, 1, x, yy);
+            }
         }
     }
     if (p_slice && ref && ref->w == w && ref->h == h) {

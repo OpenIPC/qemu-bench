@@ -46,8 +46,30 @@
  * interrupt never arrives before the driver has finished its own
  * bookkeeping for the kick.
  *
- * Pixel work is not modelled yet: a job completes without touching its
- * destination buffer.
+ * Pixel work ("pixel" property), from the job registers traced live and
+ * read in tdpdev_start(); other engines and jobs complete without
+ * touching their output (the DPU draws OSD in place: nothing to do).
+ *
+ *   1  AX620U TDP: copy-scale an NV12 picture on each kick. Addresses
+ *      are (physical - 0x40000000) >> 4, strides / 16:
+ *        0x020 source size h << 16 | w, 0x028 source compressed,
+ *        0x030 / 0x038 source Y / UV, 0x034 / 0x03c their strides,
+ *        0x040 bit 0 scale enable, 0x044 output size,
+ *        0x3d0 / 0x3d8 output Y / UV, 0x3d4 / 0x3dc their strides.
+ *   2  AX620E GDC: its source is the ISP's picture, which it streams
+ *      tile by tile into VPP (TDP is never used for frames there):
+ *        0x074 / 0x078 source Y low / high, 0x07c / 0x080 UV,
+ *        0x044 source size, 0x09c bits [15:0] source stride / 8.
+ *      Each kick of the first tile has VPP scale the whole picture.
+ *   3  AX620E VPP: up to four output ports, port k's block at
+ *      0x76c + 0x30 k: +0x00 enable, +0x04 size, +0x08 format (0xa NV12),
+ *      +0x0c / +0x10 Y low / high, +0x14 Y stride, +0x18 / +0x1c UV,
+ *      +0x20 UV stride, +0x24 compression (nonzero: the frame-buffer
+ *      format the encoder reads as its input format 6). The driver
+ *      writes each port's whole-frame geometry while the port is
+ *      disabled, then per tile enables it and overwrites size and
+ *      address with the tile's; 0x000 is the tile number, 1 first.
+ *      The whole-frame geometry is what is kept and written.
  *
  * Set AXERA_IVPS_DEBUG=1 to log every register write (the way the kick
  * registers above were found).
@@ -63,6 +85,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "hw/misc/axera-fbuf.h"
 
 #define TYPE_AXERA_IVPS_ENGINE "axera-ivps-engine"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraIvpsEngineState, AXERA_IVPS_ENGINE)
@@ -70,6 +93,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraIvpsEngineState, AXERA_IVPS_ENGINE)
 #define ENGINE_SIZE   0x1000
 #define ENGINE_DELAY_NS (200 * SCALE_US)
 #define ENGINE_KICKS    4
+
+enum { PIXEL_NONE, PIXEL_U_TDP, PIXEL_E_GDC, PIXEL_E_VPP };
+#define VPP_PORTS       4
+#define VPP_PORT(k)     (0x76c + 0x30 * (k))
+#define VPP_PORT_SIZE   0x30
 
 enum {
     ACK_W1C = 0,        /* VPP: write status bits to the ack register */
@@ -93,7 +121,12 @@ struct AxeraIvpsEngineState {
     uint32_t status_off;
     uint32_t ack_off;
     uint32_t ack_mode;
+    uint32_t pixel;
+    uint32_t port[VPP_PORTS][VPP_PORT_SIZE / 4];   /* VPP whole frame */
 };
+
+/* The AX620E VPP, which the GDC streams into */
+static AxeraIvpsEngineState *engine_vpp;
 
 static void engine_update_irq(AxeraIvpsEngineState *s)
 {
@@ -112,6 +145,109 @@ static void engine_complete(void *opaque)
     s->status |= s->pending;
     s->pending = 0;
     engine_update_irq(s);
+}
+
+static uint32_t engine_reg(AxeraIvpsEngineState *s, hwaddr off)
+{
+    return s->regs[off / 4];
+}
+
+static hwaddr engine_addr64(AxeraIvpsEngineState *s, hwaddr lo)
+{
+    return engine_reg(s, lo) | ((hwaddr)engine_reg(s, lo + 4) << 32);
+}
+
+/* AX620U TDP: (physical - 0x40000000) >> 4 */
+static hwaddr tdp_addr(AxeraIvpsEngineState *s, hwaddr off)
+{
+    return 0x40000000 + ((hwaddr)engine_reg(s, off) << 4);
+}
+
+static void engine_tdp_job(AxeraIvpsEngineState *s)
+{
+    uint32_t ssz = engine_reg(s, 0x020);
+    uint32_t dsz = (engine_reg(s, 0x040) & 1) ? engine_reg(s, 0x044) : ssz;
+    AxeraNv12Buf src = {
+        .y = tdp_addr(s, 0x030), .uv = tdp_addr(s, 0x038),
+        .w = ssz & 0xffff, .h = ssz >> 16,
+        .y_stride = engine_reg(s, 0x034) << 4,
+        .uv_stride = engine_reg(s, 0x03c) << 4,
+        .compressed = engine_reg(s, 0x028) != 0,
+    };
+    AxeraNv12Buf dst = {
+        .y = tdp_addr(s, 0x3d0), .uv = tdp_addr(s, 0x3d8),
+        .w = dsz & 0xffff, .h = dsz >> 16,
+        .y_stride = engine_reg(s, 0x3d4) << 4,
+        .uv_stride = engine_reg(s, 0x3dc) << 4,
+    };
+    AxeraPicture in = { 0 }, out = { 0 };
+
+    if (!src.w || !src.h || !dst.w || !dst.h || src.w > 8192 ||
+        src.h > 8192 || dst.w > 8192 || dst.h > 8192 ||
+        !engine_reg(s, 0x030) || !engine_reg(s, 0x3d0)) {
+        return;
+    }
+    if (axera_nv12_load(&src, &in)) {
+        axera_picture_alloc(&out, dst.w, dst.h);
+        axera_picture_scale(&in, &out);
+        axera_fbuf_drop(dst.y);
+        axera_nv12_store(&dst, &out);
+    }
+    axera_picture_free(&in);
+    axera_picture_free(&out);
+}
+
+/* AX620E: the GDC kicked with VPP on its first tile: fill VPP's ports */
+static void engine_gdc_job(AxeraIvpsEngineState *s)
+{
+    AxeraIvpsEngineState *v = engine_vpp;
+    uint32_t ssz = engine_reg(s, 0x044);
+    AxeraNv12Buf src = {
+        .y = engine_addr64(s, 0x074), .uv = engine_addr64(s, 0x07c),
+        .w = ssz & 0xffff, .h = ssz >> 16,
+        .y_stride = (engine_reg(s, 0x09c) & 0xffff) << 3,
+        .uv_stride = (engine_reg(s, 0x09c) & 0xffff) << 3,
+    };
+    AxeraPicture in = { 0 }, out = { 0 };
+    bool loaded = false;
+    int k;
+
+    if (!v || engine_reg(v, 0x000) != 1 || !src.y || !src.w || !src.h ||
+        src.w > 8192 || src.h > 8192) {
+        return;
+    }
+    src.compressed = axera_fbuf_has(src.y);
+    for (k = 0; k < VPP_PORTS; k++) {
+        const uint32_t *p = v->port[k];
+        uint32_t dsz = p[0x04 / 4];
+        AxeraNv12Buf dst = {
+            .y = p[0x0c / 4] | ((hwaddr)p[0x10 / 4] << 32),
+            .uv = p[0x18 / 4] | ((hwaddr)p[0x1c / 4] << 32),
+            .w = dsz & 0xffff, .h = dsz >> 16,
+            .y_stride = p[0x14 / 4], .uv_stride = p[0x20 / 4],
+            .compressed = p[0x24 / 4] != 0,
+        };
+
+        if (!(engine_reg(v, VPP_PORT(k)) & 1) || !dst.y || !dst.w ||
+            !dst.h || dst.w > 8192 || dst.h > 8192 ||
+            (!dst.compressed && (!dst.uv || dst.y_stride < dst.w))) {
+            continue;
+        }
+        if (!loaded) {
+            if (!axera_nv12_load(&src, &in)) {
+                break;
+            }
+            loaded = true;
+        }
+        axera_picture_alloc(&out, dst.w, dst.h);
+        axera_picture_scale(&in, &out);
+        if (!dst.compressed) {
+            axera_fbuf_drop(dst.y);
+        }
+        axera_nv12_store(&dst, &out);
+    }
+    axera_picture_free(&in);
+    axera_picture_free(&out);
 }
 
 static uint64_t engine_read(void *opaque, hwaddr off, unsigned size)
@@ -135,6 +271,15 @@ static void engine_write(void *opaque, hwaddr off, uint64_t val,
     }
     s->regs[off / 4] = val;
 
+    if (s->pixel == PIXEL_E_VPP && off >= VPP_PORT(0) &&
+        off < VPP_PORT(VPP_PORTS)) {
+        int k = (off - VPP_PORT(0)) / VPP_PORT_SIZE;
+
+        /* whole-frame geometry: written while the port is disabled */
+        if (!(engine_reg(s, VPP_PORT(k)) & 1) && off != VPP_PORT(k)) {
+            s->port[k][(off - VPP_PORT(k)) / 4] = val;
+        }
+    }
     if (off == s->ack_off) {
         if (s->ack_mode == ACK_W1C) {
             s->status &= ~(uint32_t)val;
@@ -145,6 +290,11 @@ static void engine_write(void *opaque, hwaddr off, uint64_t val,
     }
     for (int k = 0; k < ENGINE_KICKS; k++) {
         if (s->done_bits[k] && off == s->kick_off[k] && (val & 1)) {
+            if (s->pixel == PIXEL_U_TDP) {
+                engine_tdp_job(s);
+            } else if (s->pixel == PIXEL_E_GDC) {
+                engine_gdc_job(s);
+            }
             s->pending |= s->done_bits[k];
             timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       ENGINE_DELAY_NS);
@@ -167,6 +317,7 @@ static void engine_reset(DeviceState *dev)
     AxeraIvpsEngineState *s = AXERA_IVPS_ENGINE(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->port, 0, sizeof(s->port));
     s->status = 0;
     s->pending = 0;
     timer_del(s->timer);
@@ -185,6 +336,9 @@ static void engine_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_complete, s);
+    if (s->pixel == PIXEL_E_VPP) {
+        engine_vpp = s;
+    }
 }
 
 static const Property engine_props[] = {
@@ -200,6 +354,7 @@ static const Property engine_props[] = {
     DEFINE_PROP_UINT32("status-off", AxeraIvpsEngineState, status_off, 0),
     DEFINE_PROP_UINT32("ack-off", AxeraIvpsEngineState, ack_off, 0),
     DEFINE_PROP_UINT32("ack-mode", AxeraIvpsEngineState, ack_mode, 0),
+    DEFINE_PROP_UINT32("pixel", AxeraIvpsEngineState, pixel, 0),
 };
 
 static void engine_class_init(ObjectClass *klass, const void *data)

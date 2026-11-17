@@ -693,6 +693,7 @@ typedef struct {
     int irq;
     uint32_t status, ack, mode;
     uint32_t kick[4], done[4];
+    uint32_t pixel;             /* pixel work, see axera-ivps-engine.c */
 } AxeraIvpsEngineDesc;
 
 /* IVPS processing engines, see hw/misc/axera-ivps-engine.c */
@@ -708,6 +709,7 @@ static void axera_create_ivps_engines(const AxeraIvpsEngineDesc *engines,
         qdev_prop_set_uint32(dev, "status-off", engines[e].status);
         qdev_prop_set_uint32(dev, "ack-off", engines[e].ack);
         qdev_prop_set_uint32(dev, "ack-mode", engines[e].mode);
+        qdev_prop_set_uint32(dev, "pixel", engines[e].pixel);
         for (k = 0; k < 4; k++) {
             char prop[16];
 
@@ -735,9 +737,9 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
             /* v0, v1, isp, gdc-linked channels */
             { "axera-vpp", 0x04403000, 0x67, 0x888, 0x8b4, 0,
               { 0x004, 0x038, 0x06c, 0x07c },
-              { 1u << 0, 1u << 3, 1u << 6, 1u << 9 } },
+              { 1u << 0, 1u << 3, 1u << 6, 1u << 9 }, 3 },
             { "axera-gdc", 0x04404000, 0x68, 0x0d8, 0x0d4, 1,
-              { 0x06c }, { 1u << 16 } },
+              { 0x06c }, { 1u << 16 }, 2 },
             { "axera-tdp", 0x04405000, 0x63, 0x004, 0x010, 0,
               { 0x01c }, { 1u << 0 } },
             /* vo@4407000 "dpu": the IVPS OSD/overlay stage */
@@ -1003,6 +1005,11 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
     {
         DeviceState *vin = qdev_new("axera-vin");
 
+        /* the sensor picture: see "Sensor picture" in axera-vin.c */
+        qdev_prop_set_uint32(vin, "isp-layout", 1);
+        qdev_prop_set_uint32(vin, "cdma-list-off", 0x1004);
+        /* CDMA lists arm the range-1 interrupts (YUV WDMA done, AF done) */
+        qdev_prop_set_bit(vin, "cdma-irq-regs", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);
@@ -2332,7 +2339,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         {
             static const AxeraIvpsEngineDesc engines[] = {
                 { "axera-tdp", 0x04410000, 20, 0x004, 0x010, 0,
-                  { 0x018 }, { 1u << 0 } },
+                  { 0x018 }, { 1u << 0 }, 1 },
                 { "axera-gdc", 0x02620000, 21, 0x048, 0x054, 0,
                   { 0x058 }, { 1u << 0 } },
                 { "axera-dpu", 0x04400000, 19, 0x004, 0x010, 0,
@@ -2359,19 +2366,31 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
          * forwarding the frame to userspace (the poll()/read() user-IRQ
          * path that drives AI-ISP). Bits 29-30 are the per-channel
          * frame starts (irq_process_ife_wdma_fsof tests bit 30-n) and
-         * bits 1/3/5 the frame ends.
+         * bits 1/3/5 the frame ends. Bit 31 is the frame-loss event:
+         * isp_irq_thread adds one to every channel's
+         * isp_err_stats_proc_param.loss_frm_total (vin_status "Loss"),
+         * and the driver first enables exactly 0x9ffe0001 -- its error
+         * set -- before adding the frame events (0xdffe002b).
          */
         qdev_prop_set_uint32(vin, "quiet-off", 0x50);
-        qdev_prop_set_uint32(vin, "quiet-bits", 0x1ffe0001);
+        qdev_prop_set_uint32(vin, "quiet-bits", 0x9ffe0001);
         /*
          * RLTM histogram done: isp_itp_drv_thread polls RAW bit 19 of
          * the 0x80020 block (isp_irq_rltm_hist_done_get reads 0x80028,
          * W1C 0x80024) after each ITP frame end and only then hands the
          * frame's histogram to the type-4 stat source that AX_ISP_Run's
-         * 3A loop waits on. The driver never unmasks it.
+         * 3A loop waits on. The driver never unmasks it: RAW
+         * (sta_int_raw) latches events whatever int_en says, and the
+         * histogram is complete when the ITP frame ends, the same tick
+         * that raises the 0x80040 bit-16 ITP frame done.
          */
         qdev_prop_set_uint32(vin, "poll-off", 0x80020);
         qdev_prop_set_uint32(vin, "poll-bits", 1u << 19);
+        /* the sensor picture: see "Sensor picture" in axera-vin.c */
+        qdev_prop_set_uint32(vin, "isp-layout", 2);
+        qdev_prop_set_uint32(vin, "cdma-list-off", 0x83004);
+        qdev_prop_set_uint32(vin, "cdma-list-off2", 0x3004);
+        qdev_prop_set_uint64(vin, "cdma-list-base", 0x40000000);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);

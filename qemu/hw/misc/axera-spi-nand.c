@@ -626,6 +626,30 @@ static void axera_spi_nand_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
 }
 
+/*
+ * A system reset (watchdog, reboot) must bring the chip back to its
+ * power-on state: features set by Linux (OTP/ECC mode in 0xb0, block
+ * lock) left in place made U-Boot read every block as bad
+ * ("eba N is bad") after a reboot.
+ */
+static void axera_spi_nand_reset(DeviceState *dev)
+{
+    AxeraSpiNandState *s = AXERA_SPI_NAND(dev);
+
+    memset(s->mem, 0, sizeof(s->mem));
+    memset(s->cmd_buf, 0, sizeof(s->cmd_buf));
+    memset(s->feature_regs, 0, sizeof(s->feature_regs));
+    s->cmd_len = 0;
+    s->pending_set_feature_addr = -1;
+    s->loaded_row = 0;
+    s->program_active = false;
+    s->ssienr = false;
+    s->program_column = 0;
+    s->program_idx = 0;
+    s->ser_seen = false;
+    rxq_reset(s);
+}
+
 static const Property axera_spi_nand_properties[] = {
     DEFINE_PROP_STRING("file", AxeraSpiNandState, file),
 };
@@ -636,6 +660,7 @@ static void axera_spi_nand_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = axera_spi_nand_realize;
     device_class_set_props(dc, axera_spi_nand_properties);
+    device_class_set_legacy_reset(dc, axera_spi_nand_reset);
 }
 
 static const TypeInfo axera_spi_nand_info = {
