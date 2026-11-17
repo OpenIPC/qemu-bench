@@ -1200,6 +1200,8 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
              * well short of the night threshold (nightExp 12518971).
              */
             qdev_prop_set_uint64(vin, "ae-ref", 121000);
+            /* the picture reads as painted where the AE settles */
+            qdev_prop_set_uint32(vin, "isp-ref-k", 584);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
@@ -2618,6 +2620,8 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
              * of the night threshold (nightExp 8518971).
              */
             qdev_prop_set_uint64(vin, "ae-ref", 450000);
+            /* the picture reads as painted where the AE settles */
+            qdev_prop_set_uint32(vin, "isp-ref-k", 325);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);

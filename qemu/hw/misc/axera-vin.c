@@ -153,6 +153,7 @@
 #include "system/dma.h"
 #include "hw/misc/axera-fbuf.h"
 #include "axera-scene.h"
+#include "axera-isp.h"
 #include "hw/core/cpu.h"
 
 #define TYPE_AXERA_VIN "axera-vin"
@@ -270,6 +271,20 @@ struct AxeraVinState {
     AxeraNv12Buf ae_raw;        /* AX620U raw: the frame (y only) */
     bool ae_raw_set;            /* in the list being scanned */
     AxeraPicture ae_scene;      /* the scene, at the size last asked */
+
+    /* ISP registers as the command lists left them, see axera_vin_isp_reg() */
+    uint32_t *isp_reg;
+    unsigned isp_dump_n;
+    bool scan_ife;              /* scanning the AX620U IFE CDMA's list */
+    /* the colour pipeline, see axera_vin_isp_params() */
+    bool isp_model;
+    uint32_t isp_ref_k;         /* AE's settled exposure / ae-ref, x 1000 */
+    AxeraIsp isp;
+    AxeraIspParams isp_cand;    /* the reference to be, and for how long */
+    uint32_t isp_stable;
+    AxeraPicture isp_pic[VIN_OUTS];
+    uint32_t isp_pic_gen[VIN_OUTS];
+    int64_t isp_ns;             /* time spent in the pipeline (debug) */
 };
 
 enum { FIELD_MASK = 0, FIELD_CLEAR = 1, FIELD_RAW = 2, FIELD_STATUS = 3 };
@@ -464,6 +479,24 @@ static void axera_vin_paint(AxeraVinState *s, int n)
     } else {
         axera_scene_nv12_rows(pic->y, pic->w, pic->uv, pic->w, pic->w,
                               pic->h, s->frame, r0, r1);
+    }
+    if (s->isp_model && s->isp.ref_set) {
+        AxeraPicture *ip = &s->isp_pic[n];
+        bool all = fresh || ip->w != pic->w || ip->h != pic->h ||
+                   s->isp_pic_gen[n] != s->isp.gen;
+
+        int64_t t0 = get_clock();
+
+        axera_picture_alloc(ip, w, h);
+        axera_isp_rows(&s->isp, pic, ip, all ? 0 : r0, all ? pic->h : r1);
+        s->isp_ns += get_clock() - t0;
+        if (getenv("AXERA_ISP_DEBUG") && !(s->frame % 300)) {
+            fprintf(stderr, "axera-vin: isp %.2f ms/frame (out%d %ux%u)\n",
+                    s->isp_ns / 300e6, n, w, h);
+            s->isp_ns = 0;
+        }
+        s->isp_pic_gen[n] = s->isp.gen;
+        pic = ip;
     }
     if (out->buf.compressed) {
         axera_fbuf_put(out->buf.y, pic);
@@ -770,6 +803,301 @@ static bool axera_vin_cdma_writes(AxeraVinState *s, hwaddr top, uint32_t key)
 static void axera_vin_itp_next(AxeraVinState *s);
 static void axera_vin_itp_settle(AxeraVinState *s);
 
+#define ISP_REGS        0x40000     /* words: AX620E 0x02400000 + 1 MiB */
+
+/*
+ * A register's place in isp_reg[]: its offset in the ISP block / 4.
+ * AX620E lists carry physical addresses; AX620U ones word indices, into
+ * the ITP (block + 0x80000) on the ITP's CDMA, into the IFE (block + 0)
+ * on the IFE's (scan_ife).
+ */
+static int axera_vin_isp_idx(AxeraVinState *s, uint32_t key)
+{
+    if (s->isp_layout == ISP_LAYOUT_AX620E) {
+        key = (key - 0x02400000u) >> 2;
+    } else if (key < 0x20000 && !s->scan_ife) {
+        key += 0x20000;
+    }
+    return key < ISP_REGS ? key : -1;
+}
+
+/* A register write the CDMA engine carries out */
+static void axera_vin_isp_reg(AxeraVinState *s, uint32_t key, uint32_t val)
+{
+    int i = axera_vin_isp_idx(s, key);
+    static int64_t trace_lo = -1, trace_hi;
+
+    if (trace_lo == -1) {
+        const char *t = getenv("AXERA_ISP_TRACE");
+
+        trace_lo = t ? strtoll(t, NULL, 16) : 0;
+        trace_hi = t && strchr(t, '-') ? strtoll(strchr(t, '-') + 1, NULL, 16)
+                                       : trace_lo;
+    }
+    if (trace_lo && key >= trace_lo && key <= trace_hi) {
+        fprintf(stderr, "axera-vin: isp reg f%u %08x = %08x\n", s->frame, key,
+                val);
+    }
+    if (i >= 0) {
+        s->isp_reg[i] = val;
+    }
+}
+
+/* Debug: AXERA_ISP_DUMP=<prefix>; touch <prefix>.req for a register dump */
+static void axera_vin_isp_dump(AxeraVinState *s)
+{
+    const char *pfx = getenv("AXERA_ISP_DUMP");
+    g_autofree char *req = NULL, *out = NULL;
+    FILE *f;
+    int i;
+
+    if (!pfx) {
+        return;
+    }
+    req = g_strdup_printf("%s.req", pfx);
+    if (access(req, F_OK)) {
+        return;
+    }
+    unlink(req);
+    out = g_strdup_printf("%s.%u", pfx, s->isp_dump_n++);
+    f = fopen(out, "w");
+    if (!f) {
+        return;
+    }
+    for (i = 0; i < ISP_REGS; i++) {
+        if (s->isp_reg[i]) {
+            fprintf(f, "%08x %08x\n", s->isp_layout == ISP_LAYOUT_AX620E ?
+                    0x02400000u + 4 * i : i, s->isp_reg[i]);
+        }
+    }
+    fclose(f);
+}
+
+/*
+ * A LUT leaf (descriptor bit 4): a 64-bit header, [15:0] words, [63:16]
+ * the first register's address >> 2, then from +0x80 that many words for
+ * consecutive registers (ax_proton.ko isp_cdma_io_write_lut).
+ */
+static void axera_vin_scan_lut(AxeraVinState *s, hwaddr sub)
+{
+    uint64_t hdr;
+    uint32_t n, i, key;
+    g_autofree uint32_t *w = NULL;
+
+    if (dma_memory_read(&address_space_memory, sub, &hdr, sizeof(hdr),
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return;
+    }
+    hdr = le64_to_cpu(hdr);
+    n = hdr & 0xffff;
+    key = s->isp_layout == ISP_LAYOUT_AX620E ? (uint32_t)(hdr >> 16) << 2
+                                             : (uint32_t)(hdr >> 16);
+    if (!n || n > CDMA_SUB_MAX) {
+        return;
+    }
+    w = g_new(uint32_t, n);
+    if (dma_memory_read(&address_space_memory, sub + 0x80, w, 4 * n,
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        axera_vin_isp_reg(s, key + (s->isp_layout == ISP_LAYOUT_AX620E ?
+                                    4 * i : i), le32_to_cpu(w[i]));
+    }
+}
+
+#define ISP_REF_FRAMES  60      /* frames the reference settings hold */
+
+/* A register as programmed: AX620E by address, AX620U by ITP word */
+static uint32_t axera_vin_isp_rd(AxeraVinState *s, uint32_t key)
+{
+    if (s->isp_layout == ISP_LAYOUT_AX620U) {
+        key += 0x20000;
+        return key < ISP_REGS ? s->isp_reg[key] : 0;
+    }
+    key = (key - 0x02400000u) >> 2;
+    return key < ISP_REGS ? s->isp_reg[key] : 0;
+}
+
+/*
+ * The colour pipeline's settings (axera-isp.h), from the registers the
+ * lists programmed. AX620E, libax_proton's register maps (its DWARF:
+ * ISP_WBC_REG_T, ISP_ITP_GAMMA_T, ISP_LCE_REG_T):
+ *
+ *   0x0248d000 ITP WBC  +0x18 d_gain [17:0]
+ *                       +0x1c r_gain [11:0], gr_gain [23:12]
+ *                       +0x20 b_gain [11:0], gb_gain [23:12]
+ *   0x024c8000 RGB GAM  +0x08 bit 0 input spacing exponential
+ *                       +0x18 64 x {low [11:0], high [27:16]}, +0x118
+ *                       the 129th: U8.4 outputs
+ *   0x024cc000 YUV LCE  +0x7c8 YCLIP_LUT 16 x {[9:0], [25:16]}, +0x808
+ *                       the 33rd [9:0] and enable (bit 10): the luma
+ *                       curve, 10-bit, input step 32
+ *                       +0x91c CCLIP enable (bit 0), +0x920..0x92c
+ *                       CCLIP_CMTX[2][2], signed 8-bit: the chroma
+ *                       matrix
+ *
+ * The camera App's image settings (AVEnc.VideoColor, AX_ISP_IQ_
+ * SetYcprocParam) land in YCLIP (brightness scales the curve, contrast
+ * steepens it about the middle) and CCLIP (saturation scales the
+ * matrix, hue rotates it, colour mode "black and white" zeroes it).
+ * Its defaults (50 each) are the reference: the curve (i - 2) x 1024 /
+ * 30, the matrix 34 x identity.
+ *
+ * AX620U, ITP list words (live diffs; the WBC base is ax_proton.ko's
+ * isp_wbc_m0_regmap, ITP byte 0x8c000):
+ *
+ *   0x3004 d_gain [17:0], 0x3005 r [11:0] gr [23:12], 0x3006 b [11:0]
+ *          gb [23:12]: the white balance, as AX620E's
+ *   0x501d in [9:0], out [19:10]; 0x501e gain U4.8: the App's
+ *          brightness and contrast, y' = (y - in) x gain + out on 10-bit
+ *          luma (default in = out = 512, gain 1)
+ *   0x5030 the chroma matrix, int8 m00 [7:0] m01 [15:8] m10 [23:16]
+ *          m11 [31:24], unity 32: saturation, hue, black and white
+ *
+ * Its gamma was not found in the lists: a nominal 1/2.2 curve stands in.
+ *
+ * White balance and digital gain come from the ISP's own algorithms:
+ * their reference is where the AWB settles on both SoCs (r 0x5d6, g
+ * 0x400, b 0xb6d on AX620E; 0x175, 0x100, 0x2db on AX620U; digital gain
+ * 0x100). The gamma's is what the camera programs once the settings
+ * have held for ISP_REF_FRAMES (the first lists carry start-up values);
+ * until then the scene goes out as painted.
+ */
+static void axera_vin_isp_params(AxeraVinState *s)
+{
+    AxeraIspParams p;
+    uint64_t e;
+    double k;
+    int i;
+
+    memset(&p, 0, sizeof(p));
+    if (s->isp_layout == ISP_LAYOUT_AX620E) {
+        uint32_t dg = axera_vin_isp_rd(s, 0x0248d018) & 0x3ffff;
+        uint32_t g0 = axera_vin_isp_rd(s, 0x0248d01c);
+        uint32_t g1 = axera_vin_isp_rd(s, 0x0248d020);
+        uint32_t yr = axera_vin_isp_rd(s, 0x024cc808);
+
+        if (dg && (g0 & 0xfff) && (g1 & 0xfff)) {
+            p.wb_set = true;
+            p.wb[0] = (double)(g0 & 0xfff) * dg;
+            p.wb[1] = (double)(((g0 >> 12) & 0xfff) + ((g1 >> 12) & 0xfff)) /
+                      2 * dg;
+            p.wb[2] = (double)(g1 & 0xfff) * dg;
+        }
+        for (i = 0; i < 64; i++) {
+            uint32_t v = axera_vin_isp_rd(s, 0x024c8018 + 4 * i);
+
+            p.gam[2 * i] = v & 0xfff;
+            p.gam[2 * i + 1] = (v >> 16) & 0xfff;
+        }
+        p.gam[128] = axera_vin_isp_rd(s, 0x024c8118) & 0xfff;
+        p.gam_set = p.gam[128] != 0;
+        p.gam_exp = axera_vin_isp_rd(s, 0x024c8008) & 1;
+        for (i = 0; i < 16; i++) {
+            uint32_t v = axera_vin_isp_rd(s, 0x024cc7c8 + 4 * i);
+
+            p.ylut[2 * i] = v & 0x3ff;
+            p.ylut[2 * i + 1] = (v >> 16) & 0x3ff;
+        }
+        p.ylut[32] = yr & 0x3ff;
+        p.ylut_set = yr & 0x400;
+        p.cm_set = axera_vin_isp_rd(s, 0x024cc91c) & 1;
+        for (i = 0; i < 4; i++) {
+            p.cm[i / 2][i % 2] =
+                (int8_t)axera_vin_isp_rd(s, 0x024cc920 + 4 * i) / 32.0;
+        }
+    } else if (s->isp_layout == ISP_LAYOUT_AX620U) {
+        uint32_t dg = axera_vin_isp_rd(s, 0x3004) & 0x3ffff;
+        uint32_t g0 = axera_vin_isp_rd(s, 0x3005);
+        uint32_t g1 = axera_vin_isp_rd(s, 0x3006);
+        uint32_t yo = axera_vin_isp_rd(s, 0x501d);
+        uint32_t yg = axera_vin_isp_rd(s, 0x501e) & 0xfff;
+        uint32_t cm = axera_vin_isp_rd(s, 0x5030);
+
+        if (dg && (g0 & 0xfff) && (g1 & 0xfff)) {
+            p.wb_set = true;
+            p.wb[0] = (double)(g0 & 0xfff) * dg;
+            p.wb[1] = (double)(((g0 >> 12) & 0xfff) + ((g1 >> 12) & 0xfff)) /
+                      2 * dg;
+            p.wb[2] = (double)(g1 & 0xfff) * dg;
+        }
+        if (yg) {
+            /* (y - in) x gain + out, 10-bit: as a 33-point curve */
+            p.ylut_set = true;
+            for (i = 0; i < AXERA_ISP_YLUT_N; i++) {
+                double v = (32.0 * i - (yo & 0x3ff)) * yg / 256 +
+                           ((yo >> 10) & 0x3ff);
+
+                p.ylut[i] = MIN(MAX(lround(v), 0), 1023);
+            }
+        }
+        p.cm_set = yg != 0;     /* 0 is black and white */
+        for (i = 0; i < 4; i++) {
+            p.cm[i / 2][i % 2] = (int8_t)(cm >> (8 * i)) / 32.0;
+        }
+    } else {
+        return;
+    }
+
+
+    if (!s->isp.ref_set) {
+        /* the reference: the settings once they have held a while */
+        p.k = 0;
+        if (!p.wb_set ||
+            (s->isp_layout == ISP_LAYOUT_AX620E && !p.gam_set) ||
+            memcmp(&p, &s->isp_cand, sizeof(p))) {
+            s->isp_cand = p;
+            s->isp_stable = 0;
+            return;
+        }
+        if (++s->isp_stable < ISP_REF_FRAMES) {
+            return;
+        }
+        s->isp.ref = p;
+        s->isp.ref.k = 1;
+        /*
+         * White balance: what the AWB settles at on both (r 1.457, b 2.856
+         * x g; it starts elsewhere), digital gain 1.
+         */
+        s->isp.ref.wb[1] = 0x100 * (s->isp_layout == ISP_LAYOUT_AX620E ?
+                                    0x400 : 0x100);
+        s->isp.ref.wb[0] = s->isp.ref.wb[1] * 1.457;
+        s->isp.ref.wb[2] = s->isp.ref.wb[1] * 2.856;
+        if (s->isp_layout == ISP_LAYOUT_AX620E) {
+            s->isp.ref.ylut_set = s->isp.ref.cm_set = true;
+            for (i = 0; i < AXERA_ISP_YLUT_N; i++) {
+                s->isp.ref.ylut[i] = MIN(MAX(lround((i - 2) * 1024 / 30.0),
+                                             0), 1023);
+            }
+            memset(s->isp.ref.cm, 0, sizeof(s->isp.ref.cm));
+            s->isp.ref.cm[0][0] = s->isp.ref.cm[1][1] = 34 / 32.0;
+        } else {
+            s->isp.ref.ylut_set = s->isp.ref.cm_set = true;
+            for (i = 0; i < AXERA_ISP_YLUT_N; i++) {
+                s->isp.ref.ylut[i] = MIN(32 * i, 1023);
+            }
+            memset(s->isp.ref.cm, 0, sizeof(s->isp.ref.cm));
+            s->isp.ref.cm[0][0] = s->isp.ref.cm[1][1] = 1;
+        }
+        s->isp.ref_set = true;
+    }
+    /* the exposure, in steps of 1/24 of a stop */
+    k = axera_vin_ae_gain(s, &e) * 1000 / MAX(s->isp_ref_k, 1);
+    p.k = k > 0 ? exp2(round(log2(k) * 24) / 24) : 0;
+    if (axera_isp_update(&s->isp, &p)) {
+        /* every buffer needs the whole new picture */
+        memset(s->painted, 0, sizeof(s->painted));
+        if (getenv("AXERA_ISP_DEBUG")) {
+            fprintf(stderr, "axera-vin: isp gen %u k %.3f wb %.0f %.0f %.0f "
+                    "gam %d/%u ylut %d/%u..%u cm %d/%.2f %.2f %.2f %.2f\n",
+                    s->isp.gen, p.k, p.wb[0], p.wb[1], p.wb[2], p.gam_set,
+                    p.gam[64], p.ylut_set, p.ylut[8], p.ylut[24], p.cm_set,
+                    p.cm[0][0], p.cm[0][1], p.cm[1][0], p.cm[1][1]);
+        }
+    }
+}
+
 static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
 {
     g_autofree uint32_t *pairs = NULL;
@@ -791,7 +1119,9 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
             break;
         }
         sub = s->cdma_list_base + ((hwaddr)le32_to_cpu(ent[1]) << 3);
-        if (!dma_memory_read(&address_space_memory, sub, &count,
+        if (le32_to_cpu(ent[0]) & 0x10) {
+            axera_vin_scan_lut(s, sub);
+        } else if (!dma_memory_read(&address_space_memory, sub, &count,
                              sizeof(count), MEMTXATTRS_UNSPECIFIED)) {
             count = le32_to_cpu(count);
             if (count && count <= CDMA_SUB_MAX) {
@@ -801,6 +1131,8 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
                                      MEMTXATTRS_UNSPECIFIED)) {
                     for (n = 0; n < count; n++) {
                         uint32_t key = le32_to_cpu(pairs[2 * n + 1]);
+
+                        axera_vin_isp_reg(s, key, le32_to_cpu(pairs[2 * n]));
 
                         /* What the CDMA engine does with every pair;
                          * here only the interrupt registers matter. */
@@ -825,6 +1157,7 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
             break;
         }
     }
+    axera_vin_isp_dump(s);
     if (s->ae_nptn) {
         axera_vin_ae_stats(s);
     }
@@ -832,6 +1165,9 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
         axera_vin_ae_raw(s);
     }
     if (seen) {
+        if (s->isp_model) {
+            axera_vin_isp_params(s);
+        }
         for (n = 0; n < VIN_OUTS; n++) {
             axera_vin_paint(s, n);
         }
@@ -943,8 +1279,15 @@ static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
         s->cdma_list2 = val;
     }
     if (s->cdma_list_off2 && off == s->cdma_list_off2 + 4 && (val & 1)) {
+        s->scan_ife = true;
         axera_vin_scan_cdma(s, s->cdma_list_base +
                                ((hwaddr)s->cdma_list2 << 3));
+        s->scan_ife = false;
+    }
+    if (s->isp_layout == ISP_LAYOUT_AX620E) {
+        axera_vin_isp_reg(s, 0x02400000u + off, val);
+    } else if (s->isp_layout && off >= 0x80000) {
+        axera_vin_isp_reg(s, (off - 0x80000) >> 2, val);    /* ITP */
     }
     if (off == CDMA_INFO0) {
         s->cdma_info0 = val;
@@ -1228,6 +1571,10 @@ static void axera_vin_reset(DeviceState *dev)
     s->settling = s->frame_owed = false;
     s->cdma_info0 = 0;
     s->cdma_info1 = 0;
+    s->isp.ref_set = false;
+    s->isp_stable = 0;
+    memset(&s->isp_cand, 0, sizeof(s->isp_cand));
+    memset(s->painted, 0, sizeof(s->painted));
     for (range = 0; range < AXERA_VIN_RANGES; range++) {
         qemu_irq_lower(s->irq[range]);
     }
@@ -1261,6 +1608,7 @@ static void axera_vin_init(Object *obj)
                                    s);
     qdev_init_gpio_in_named(DEVICE(obj), axera_vin_sensor_streaming,
                             "sensor-streaming", 1);
+    s->isp_reg = g_new0(uint32_t, ISP_REGS);
 }
 
 static const Property axera_vin_props[] = {
@@ -1283,6 +1631,8 @@ static const Property axera_vin_props[] = {
     DEFINE_PROP_UINT64("ae-ref", AxeraVinState, ae_ref, 0),
     DEFINE_PROP_UINT32("ae-shift", AxeraVinState, ae_shift, 4),
     DEFINE_PROP_UINT32("ae-black", AxeraVinState, ae_black, 1024),
+    DEFINE_PROP_BOOL("isp-model", AxeraVinState, isp_model, true),
+    DEFINE_PROP_UINT32("isp-ref-k", AxeraVinState, isp_ref_k, 1000),
 };
 
 static void axera_vin_realize(DeviceState *dev, Error **errp)
