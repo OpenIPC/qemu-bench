@@ -544,23 +544,29 @@ static int64_t ingenic_isp_period(IngenicIspState *s)
 static bool ingenic_isp_pipe_running(IngenicIspState *s, int p)
 {
     const IngenicIspLayout *l = s->l;
-    uint32_t mdma = ingenic_vic_regs(s, p)[VIC_MDMA_CTRL >> 2];
-    bool mdma_run = (mdma & (1u << 31)) && extract32(mdma, 16, 4);
 
     if (l->no_vic) {
         return !p && (ISP_REG(l->ch_en) & 7);
     }
     return (p ? s->vic1_running : s->vic_running) &&
-           (ISP_REG(PIPE_INT(p, l->int_en)) || mdma_run);
+           ISP_REG(PIPE_INT(p, l->int_en));
+}
+
+static bool ingenic_vic_mdma_running(IngenicIspState *s, int p)
+{
+    uint32_t ctrl = ingenic_vic_regs(s, p)[VIC_MDMA_CTRL >> 2];
+
+    return !s->l->no_vic && (p ? s->vic1_running : s->vic_running) &&
+           (ctrl & (1u << 31)) && extract32(ctrl, 16, 4);
 }
 
 static void ingenic_isp_schedule(IngenicIspState *s)
 {
-    bool run = false;
+    bool run = s->l->pipes > 1 && s->vic2_running;
     int p;
 
     for (p = 0; p < ingenic_isp_pipes(s); p++) {
-        run |= ingenic_isp_pipe_running(s, p);
+        run |= ingenic_isp_pipe_running(s, p) || ingenic_vic_mdma_running(s, p);
     }
 
     if (run && !timer_pending(s->timer)) {
@@ -2179,7 +2185,7 @@ static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
 
 /*
  * The frame of pipe @p: frame start, the picture into each enabled
- * channel with a queued buffer, the 3A statistics, VIC frame done.  Pipe
+ * channel with a queued buffer and the 3A statistics.  Pipe
  * 1 paints the scene with its counter 500000 ahead, so that its pictures
  * tell themselves from pipe 0's.
  */
@@ -2187,16 +2193,14 @@ static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
 /* T23 double: the pass end this long after its channels' done */
 #define DUAL_PASS_END_NS (500 * SCALE_US)
 
-static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
+static void ingenic_isp_pipe_frame(IngenicIspState *s, int p, uint32_t frame)
 {
     const IngenicIspLayout *l = s->l;
     uint32_t en = ISP_REG(PIPE_CH(p, l->ch_en));
     uint32_t gain = ingenic_isp_gain(s, p);
     uint32_t sgain = ingenic_isp_short_gain(s, p);
     uint32_t wb_r, wb_b;
-    uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
     hwaddr int_sta = PIPE_INT(p, l->int_sta);
-    uint32_t *vic = ingenic_vic_regs(s, p);
     uint32_t sta_before = ISP_REG(int_sta);
     bool to_ivdc = false;
     int n;
@@ -2204,9 +2208,6 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     ingenic_isp_wb_gains(s, &wb_r, &wb_b);
 
     ISP_REG(int_sta) |= l->fs_bit;
-    if (!l->no_vic) {
-        vic[l->vic_sta >> 2] |= l->vic_fs_bit;
-    }
     for (n = 0; n < NUM_CH; n++) {
         IngenicIspChan *c = &s->ch[p * NUM_CH + n];
         uint32_t *r = &s->isp[PIPE_CH(p, MSCA_CH(n)) >> 2];
@@ -2264,10 +2265,6 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     }
     if (l->xstat && p == 0) {
         ingenic_isp_xstats(s, gain, frame);
-    }
-    if (!l->no_vic) {
-        vic[l->vic_sta >> 2] |= 1;
-        ingenic_vic_mdma(s, p, frame);
     }
     if (p == 0 && ingenic_isp_dual(s)) {
         /*
@@ -2335,8 +2332,17 @@ static void ingenic_isp_frame(void *opaque)
         return;
     }
     for (p = 0; p < ingenic_isp_pipes(s); p++) {
-        if (ingenic_isp_pipe_running(s, p)) {
-            ingenic_isp_pipe_frame(s, p);
+        bool pipe = ingenic_isp_pipe_running(s, p);
+        uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
+
+        if (pipe) {
+            ingenic_isp_pipe_frame(s, p, frame);
+        }
+        if (!s->l->no_vic && (pipe || ingenic_vic_mdma_running(s, p))) {
+            uint32_t *vic = ingenic_vic_regs(s, p);
+
+            vic[s->l->vic_sta >> 2] |= s->l->vic_fs_bit | 1;
+            ingenic_vic_mdma(s, p, frame);
         }
     }
     if (dual && s->dual_pass_end) {
@@ -2357,8 +2363,7 @@ static void ingenic_isp_frame(void *opaque)
     }
     s->frame++;
     ingenic_isp_update(s);
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              ingenic_isp_period(s));
+    ingenic_isp_schedule(s);
 }
 
 /* --- ISP core ------------------------------------------------------------ */

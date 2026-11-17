@@ -3710,9 +3710,12 @@ def test_t23_soc_gaps(qt, img):
     qt.qom_set('/machine/isp', 'expo-delay', 0)
 
     # Raw VIC_MDMA with ISP_INT_MASK == 0: 10-bit << 6 BGGR with >= 64 black level
-    qt.writel(ISP + 0xD040, 0)
     qt.writel(ISP + 0xB0, 0)
-    qt.writel(ISP + 0xC0, 0)
+    qt.writel(ISP + 0xB8, 0xFFFFFFFF)
+    qt.writel(ISP + 0xC4, 0xFFFFFFFF)
+    qt.writel(ch0 + 0x30, buf)
+    qt.writel(ch0 + 0x50, buf + w * h)
+    qt.write(buf, b'queued')
     qt.writel(VIC + 0x00, 0)
     qt.writel(VIC + 0x1F0, 0xFFFFFFFF)
     qt.writel(VIC + 0x1F4, 0xFFFFFFFF)
@@ -3726,6 +3729,13 @@ def test_t23_soc_gaps(qt, img):
     qt.step(41 * 1000 * 1000)
     check('VIC_MDMA runs with ISP_INT_MASK == 0',
           (qt.readl(VIC + 0x1E4) & 1, qt.readl(VIC + 0x380)), (1, raw))
+    check('raw frame leaves the queued ISP buffer and both status banks alone',
+          (qt.readl(ch0 + 0x3C), qt.read(buf, 6), qt.readl(ISP + 0xB4),
+           qt.readl(ISP + 0xC8)), (1, b'queued', 0, 0))
+    qt.writel(ISP + 0xB0, 0xFFFFFFFF)
+    qt.step(41_000_000)
+    check('enabling the ISP completes the previously queued buffer',
+          (qt.readl(ch0 + 0x3C), qt.readl(ch0 + 0x38)), (0, buf))
     pixels = struct.unpack('<%dH' % (rw * rh), qt.read(raw, rw * rh * 2))
     check('T23 VIC_MDMA 10-bit << 6 alignment & black pedestal',
           (all((p & 0x3F) == 0 for p in pixels),
