@@ -120,6 +120,7 @@
 #include "qemu/timer.h"
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
+#include "qemu/rcu.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -333,6 +334,47 @@ static hwaddr avpu_addr(hwaddr a)
 }
 
 /*
+ * One run of guest RAM.  The coding thread runs without the iothread lock,
+ * so it touches RAM only: an address the guest pointed at a register (the
+ * AVPU's own among them) would dispatch that device's callbacks off the
+ * lock, and the lock taken for them can be held by a vCPU waiting for this
+ * very batch (avpu_drain).  Such a read gives zeros and a write is dropped,
+ * as a bus error leaves the encoder with nothing useful either.
+ */
+static void avpu_ram(hwaddr pa, uint8_t *buf, size_t n, bool write)
+{
+    RCU_READ_LOCK_GUARD();
+    while (n) {
+        hwaddr xlat, len = n;
+        MemoryRegion *mr = address_space_translate(&address_space_memory, pa,
+                                                   &xlat, &len, write,
+                                                   MEMTXATTRS_UNSPECIFIED);
+
+        len = MIN(len, n);
+        if (memory_access_is_direct(mr, write, MEMTXATTRS_UNSPECIFIED)) {
+            if (write) {
+                address_space_write(&address_space_memory, pa,
+                                    MEMTXATTRS_UNSPECIFIED, buf, len);
+            } else {
+                address_space_read(&address_space_memory, pa,
+                                   MEMTXATTRS_UNSPECIFIED, buf, len);
+            }
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ingenic-avpu: %s of 0x%" HWADDR_PRIx
+                          " is not RAM, ignored\n",
+                          write ? "write" : "read", pa);
+            if (!write) {
+                memset(buf, 0, len);
+            }
+        }
+        buf += len;
+        pa += len;
+        n -= len;
+    }
+}
+
+/*
  * A transfer through the 29-bit bus: an access that runs past its top
  * wraps to 0, as the masked address would on silicon (the IVDC's store
  * is not behind the mask and is taken as it is).
@@ -347,13 +389,7 @@ static void avpu_dma(hwaddr a, void *buf, size_t n, bool write)
         if (pa <= AVPU_DMA_MASK && chunk > AVPU_DMA_MASK + 1 - pa) {
             chunk = AVPU_DMA_MASK + 1 - pa;
         }
-        if (write) {
-            dma_memory_write(&address_space_memory, pa, buf, chunk,
-                             MEMTXATTRS_UNSPECIFIED);
-        } else {
-            dma_memory_read(&address_space_memory, pa, buf, chunk,
-                            MEMTXATTRS_UNSPECIFIED);
-        }
+        avpu_ram(pa, buf, chunk, write);
         buf = (uint8_t *)buf + chunk;
         n -= chunk;
         pa = (pa + chunk) & AVPU_DMA_MASK;
@@ -1828,6 +1864,7 @@ static void *avpu_thread(void *opaque)
     IngenicAvpuState *s = opaque;
     uint32_t i;
 
+    rcu_register_thread();      /* it walks the address space (avpu_ram) */
     qemu_mutex_lock(&s->lock);
     for (;;) {
         while (!s->busy || s->coded) {

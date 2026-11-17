@@ -949,7 +949,11 @@ past the UID) is the part's -- libimp's encoder library checks it
   held both CPUs for up to 0.8 s of host time while the virtual clock
   went on, so every kernel timer due meanwhile fired that late; T41's
   `audio.ko` gives a microphone read 800 ms (`get mic timeout!`, and
-  libimp then records nothing more). Addresses are masked to 29 bits.
+  libimp then records nothing more). The thread touches guest RAM only:
+  an address that lands on a register reads as zeros and a write there is
+  dropped (logged as a guest error), since dispatching a device's callbacks
+  off the lock could wait on a vCPU that is itself waiting for the batch.
+  Addresses are masked to 29 bits.
 - Bitstream split: libimp writes SPS/PPS/VPS/SEI and the slice header,
   the hardware the slice data from stream base + offset (re-emitting the
   0x78/0x7C header tail with emulation prevention); libimp writes the
@@ -2365,7 +2369,8 @@ The checks:
   wav audiodev, and a 1 s 440 Hz tone POSTed to `/play_audio` must come out
   for at least 0.8 s at 440 Hz. A build from before OpenIPC/majestic#376's
   audio fix fails it: every frame refused, and the clip silent. The
-  microphone too: 4 s of `/audio.pcm` must carry the codec's 1 kHz tone,
+  microphone too: `/audio.pcm` must stream for at least 3.5 of 4 s, with
+  the codec's 1 kHz tone in every half second of it,
   and the vendor driver must never have timed a read out (`get mic
   timeout!`; libimp records nothing after one). That timeout was the
   encoder model's: coding a 2560x1440 picture under the iothread lock froze

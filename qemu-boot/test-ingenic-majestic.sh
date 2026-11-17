@@ -369,13 +369,21 @@ d = open(sys.argv[1], 'rb').read()
 x = struct.unpack('<%dh' % (len(d) // 2), d[:len(d) // 2 * 2])
 r = 8000
 s = x[r // 4:]  # past the first quarter second
-if len(s) < r or max(abs(v) for v in s) < 200:
-    print('    (mic: %d samples, silent or short)' % len(x))
+# the whole 4 s window, less connection time (passing runs: 3.84-4.00 s),
+# and the tone in every half second of it: a stream that stalls part way
+# fails on length, one that goes quiet on the window it went quiet in
+if len(x) < 3.5 * r:
+    print('    (mic: %.2f s of 4, stalled)' % (len(x) / r))
     sys.exit(1)
-z = sum(1 for i in range(1, len(s)) if (s[i - 1] < 0) != (s[i] < 0))
-hz = z / 2 / (len(s) / r)
-print('    (mic: %.2f s at %.0f Hz)' % (len(x) / r, hz))
-sys.exit(0 if 950 < hz < 1050 else 1)
+w = r // 2
+for o in range(0, len(s) - w + 1, w):
+    v = s[o:o + w]
+    z = sum(1 for i in range(1, w) if (v[i - 1] < 0) != (v[i] < 0))
+    hz = z / 2 / (w / r)
+    if max(abs(k) for k in v) < 200 or not 950 < hz < 1050:
+        print('    (mic: %.0f Hz at %.2f s)' % (hz, (r // 4 + o) / r))
+        sys.exit(1)
+print('    (mic: %.2f s at 1 kHz)' % (len(x) / r))
 PY
 }
 # speaker: a 1 s 440 Hz tone POSTed to /play_audio comes out of the codec,
