@@ -32,14 +32,21 @@
  * timer advances the serial clock at "rate" frames/s: every frame
  * pushes one L/R entry into the RX FIFO (a low sine tone, or silence
  * with tone-hz=0) and drains one entry from the TX FIFO (playback is
- * discarded). The FIFO level drives the real status bits (RXDA when
- * level > RFCR, TXFE when level <= TFCR, RXFO/TXFO on overrun), the
- * interrupt line (AX620U: PIO mode, the driver's i2s_irq_handler
- * moves fifo_th frames per RXDA/TXFE interrupt) and two DMA request
- * outputs (AX620E: no "interrupts" in the devicetree, so the driver
+ * discarded, or appended to "<playback-file>-<name>.wav" as S16
+ * stereo when that property is set). The FIFO level drives the real
+ * status bits (RXDA when level > RFCR, TXFE when level <= TFCR,
+ * RXFO/TXFO on overrun), the interrupt line (AX620U: PIO mode, the
+ * driver's i2s_irq_handler moves fifo_th frames per RXDA/TXFE
+ * interrupt) and two DMA request outputs (AX620E: no "interrupts" in the devicetree, so the driver
  * uses dmaengine through AX_DMAPER, which pulls/pushes words through
  * RXDMA/TXDMA while the request is high -- see axera-dmaper.c). Either
  * way ALSA's period interrupts arrive at real-time pace.
+ *
+ * AXERA_I2S_DEBUG=1 prints per-device counters every 10 s of virtual
+ * time on stderr: RX frames clocked in / read by the guest / lost to
+ * overrun, the largest clock lag, stream starts (an ALSA xrun shows up
+ * as a restart), TX frames written / played / slots left empty, the
+ * played peak level and how late the frame timer itself fired.
  */
 
 #include "qemu/osdep.h"
@@ -48,6 +55,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "qemu/bswap.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
@@ -115,6 +123,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraI2SState, AXERA_I2S)
 #define RX_CAPACITY     FIFO_DEPTH
 
 /*
+ * What the model does instead is let the serial clock fall behind:
+ * frames whose sampling time has passed while the FIFO was full are
+ * not dropped at once but held back, up to "slack-ms" worth, and are
+ * shifted in as soon as the guest frees FIFO space -- at most at
+ * CLOCK_CATCHUP times the frame rate, so a backlog never keeps RXDA
+ * asserted back to back (the guest sees the ordinary 16-entry FIFO:
+ * RXDA only while the level is above RFCR, one interrupt per fifo_th
+ * frames, at most twice the nominal interrupt rate while catching
+ * up). Once the clock falls further behind than the slack the whole
+ * backlog is given up as one overrun (RXFO), so a guest that cannot
+ * keep up at all costs no more interrupts than with the plain FIFO.
+ * The backlog is a counter, not a buffer: the tone is a function of
+ * the frame index. Measured on AX620U (8 kHz, PIO) the
+ * clock regularly falls 1000-2300 frames (125-290 ms) behind under
+ * TCG while the camera app runs, so the default slack is 500 ms; on
+ * AX620E (16 kHz through AX_DMAPER, whose driver restarts the channel
+ * from a tasklet every period) the same 16-entry FIFO lost ~7%.
+ * Playback gets the same treatment (see axera_i2s_clock_frames()).
+ */
+#define CLOCK_CATCHUP   2
+
+/* Statistics period (virtual time) for AXERA_I2S_DEBUG. */
+#define STATS_NS        (10 * NANOSECONDS_PER_SECOND)
+
+/*
  * COMP_PARAM_1: APB_DATA_WIDTH=2 (32 bit), FIFO_DEPTH_GLOBAL=3 (16),
  * MODE_EN (bit 4, per "master"), TX_ENABLED, RX_ENABLED, one stereo
  * channel each way (RX/TX_CHANNELS=0), TX_WORDSIZE_0=4 (32 bit, so
@@ -141,6 +174,9 @@ struct AxeraI2SState {
     bool master;
     uint32_t rate;
     uint32_t tone_hz;
+    uint32_t slack_ms;          /* how far the serial clock may lag */
+    char *name;
+    char *playback_file;        /* prefix of a .wav of the played audio */
 
     uint32_t ier, irer, iter, cer, ccr;
     uint32_t ch[I2S_NR_CH][CH_NREGS];
@@ -149,7 +185,10 @@ struct AxeraI2SState {
     uint32_t rx_fifo[RX_CAPACITY][2];
     uint32_t rx_head, rx_level;
     bool rx_half;               /* RXDMA: left word already returned */
-    uint32_t tx_level;
+    uint64_t rx_lag;            /* frames sampled, not yet in the FIFO */
+    uint64_t tx_lag;            /* frame slots that found the FIFO empty */
+    uint32_t tx_fifo[FIFO_DEPTH][2];
+    uint32_t tx_head, tx_level;
     uint32_t tx_left;           /* LTHR / first TXDMA word pending */
     bool tx_half;
 
@@ -159,6 +198,22 @@ struct AxeraI2SState {
     uint64_t frames_done;
     uint64_t phase;             /* sample counter for the tone */
     bool rx_req_level, tx_req_level;
+    bool irq_level;
+    bool rx_was_on, tx_was_on;
+
+    /* AXERA_I2S_DEBUG statistics (frames unless noted) */
+    bool debug;
+    int64_t stats_next_ns;
+    uint64_t st_rx_in, st_rx_lost, st_rx_out, st_rx_lag_max, st_rx_starts;
+    uint64_t st_irqs, st_rx_ovr_events;
+    uint64_t st_tx_in, st_tx_out, st_tx_empty, st_tx_starts, st_tx_ovr;
+    int32_t st_tx_peak;
+    int64_t st_late_max_ns;     /* how late the frame timer fired */
+    int64_t deadline_ns;
+
+    /* playback-file */
+    FILE *wav;
+    uint64_t wav_frames;
 };
 
 static bool axera_i2s_rx_on(AxeraI2SState *s)
@@ -170,6 +225,8 @@ static bool axera_i2s_tx_on(AxeraI2SState *s)
 {
     return (s->ier & 1) && (s->iter & 1) && (s->ch[0][CH_TER / 4] & 1);
 }
+
+static void axera_i2s_wav_header(AxeraI2SState *s);
 
 static void axera_i2s_update(AxeraI2SState *s)
 {
@@ -189,7 +246,28 @@ static void axera_i2s_update(AxeraI2SState *s)
         s->ch[n][CH_ISR / 4] = 0;
     }
 
-    qemu_set_irq(s->irq, (s->ier & 1) && (isr & ~c[CH_IMR / 4] & 0x33));
+    {
+        bool irq = (s->ier & 1) && (isr & ~c[CH_IMR / 4] & 0x33);
+
+        if (irq && !s->irq_level) {
+            s->st_irqs++;
+        }
+        s->irq_level = irq;
+        qemu_set_irq(s->irq, irq);
+    }
+    if (axera_i2s_rx_on(s) != s->rx_was_on) {
+        s->rx_was_on = !s->rx_was_on;
+        s->st_rx_starts += s->rx_was_on;
+        s->rx_lag = 0;
+    }
+    if (axera_i2s_tx_on(s) != s->tx_was_on) {
+        s->tx_was_on = !s->tx_was_on;
+        s->st_tx_starts += s->tx_was_on;
+        s->tx_lag = 0;
+        if (s->wav) {
+            axera_i2s_wav_header(s);
+        }
+    }
 
     rx_req = axera_i2s_rx_on(s) && (s->rx_level > 0 || s->rx_half);
     tx_req = axera_i2s_tx_on(s) && s->tx_level < FIFO_DEPTH;
@@ -216,28 +294,152 @@ static int32_t axera_i2s_sample(AxeraI2SState *s)
     return (int32_t)(v * 2048.0);
 }
 
+static void axera_i2s_wav_header(AxeraI2SState *s)
+{
+    uint32_t data = s->wav_frames * 4;
+    uint8_t h[44];
+
+    memcpy(h, "RIFF", 4);
+    stl_le_p(h + 4, 36 + data);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    stl_le_p(h + 16, 16);
+    stw_le_p(h + 20, 1);                /* PCM */
+    stw_le_p(h + 22, 2);                /* stereo */
+    stl_le_p(h + 24, s->rate);
+    stl_le_p(h + 28, s->rate * 4);
+    stw_le_p(h + 32, 4);
+    stw_le_p(h + 34, 16);
+    memcpy(h + 36, "data", 4);
+    stl_le_p(h + 40, data);
+    if (fseek(s->wav, 0, SEEK_SET) == 0 && fwrite(h, sizeof(h), 1, s->wav)) {
+        fseek(s->wav, 0, SEEK_END);
+    }
+    fflush(s->wav);
+}
+
+/* playback: one stereo entry leaves the TX FIFO on the serial line */
+static void axera_i2s_play(AxeraI2SState *s, uint32_t l, uint32_t r)
+{
+    int16_t f[2] = { (int16_t)l, (int16_t)r };     /* S16 in the low half */
+
+    s->st_tx_out++;
+    s->st_tx_peak = MAX(s->st_tx_peak, ABS((int32_t)f[0]));
+    s->st_tx_peak = MAX(s->st_tx_peak, ABS((int32_t)f[1]));
+    if (!s->playback_file) {
+        return;
+    }
+    if (!s->wav) {
+        g_autofree char *fn = g_strdup_printf("%s-%s.wav", s->playback_file,
+                                              s->name ? s->name : "i2s");
+
+        s->wav = fopen(fn, "wb");
+        if (!s->wav) {
+            qemu_log_mask(LOG_GUEST_ERROR, "axera-i2s: cannot write %s\n",
+                          fn);
+            g_free(s->playback_file);
+            s->playback_file = NULL;
+            return;
+        }
+        s->wav_frames = 0;
+        axera_i2s_wav_header(s);
+    }
+    f[0] = cpu_to_le16(f[0]);
+    f[1] = cpu_to_le16(f[1]);
+    if (fwrite(f, sizeof(f), 1, s->wav)) {
+        s->wav_frames++;
+    }
+}
+
 static void axera_i2s_clock_frames(AxeraI2SState *s, uint64_t n)
 {
     bool rx = axera_i2s_rx_on(s), tx = axera_i2s_tx_on(s);
+    uint64_t slack = muldiv64(s->slack_ms, s->rate, 1000);
 
-    while (n--) {
-        if (rx) {
-            if (s->rx_level < RX_CAPACITY) {
-                uint32_t slot = (s->rx_head + s->rx_level) % RX_CAPACITY;
-                int32_t v = axera_i2s_sample(s);
+    if (rx) {
+        uint64_t budget = n * CLOCK_CATCHUP;
 
-                s->rx_fifo[slot][0] = v;
-                s->rx_fifo[slot][1] = v;
-                s->rx_level++;
-            } else {
-                s->ch[0][CH_ISR / 4] |= ISR_RXFO;
-            }
+        s->rx_lag += n;
+        s->st_rx_in += n;
+        while (s->rx_lag && budget && s->rx_level < RX_CAPACITY) {
+            uint32_t slot = (s->rx_head + s->rx_level) % RX_CAPACITY;
+            int32_t v = axera_i2s_sample(s);
+
+            s->rx_fifo[slot][0] = v;
+            s->rx_fifo[slot][1] = v;
+            s->rx_level++;
+            s->rx_lag--;
+            s->phase++;
+            budget--;
         }
-        if (tx && s->tx_level) {
-            s->tx_level--;      /* playback: consumed and discarded */
+        if (s->rx_lag > slack) {
+            /*
+             * Too far behind: the guest is not keeping up at all, not
+             * just late. Give the backlog up as one overrun rather than
+             * keep catching up, which would hold the interrupt rate at
+             * CLOCK_CATCHUP times nominal for as long as the overload
+             * lasts (the interrupt-storm failure mode noted above).
+             */
+            s->st_rx_lost += s->rx_lag;
+            s->st_rx_ovr_events++;
+            s->phase += s->rx_lag;
+            s->rx_lag = 0;
+            s->ch[0][CH_ISR / 4] |= ISR_RXFO;
         }
-        s->phase++;
+        s->st_rx_lag_max = MAX(s->st_rx_lag_max, s->rx_lag);
+    } else {
+        s->phase += n;
     }
+    if (tx) {
+        /*
+         * Same slack for playback: slots that found the FIFO empty
+         * (the guest refilled late) are made up by shifting queued
+         * frames out at up to CLOCK_CATCHUP times the rate, so a late
+         * guest still gets its TXFE interrupts at the nominal average
+         * pace instead of falling behind for good.
+         */
+        uint64_t budget = n * CLOCK_CATCHUP;
+
+        s->tx_lag += n;
+        while (s->tx_lag && budget && s->tx_level) {
+            axera_i2s_play(s, s->tx_fifo[s->tx_head][0],
+                           s->tx_fifo[s->tx_head][1]);
+            s->tx_head = (s->tx_head + 1) % FIFO_DEPTH;
+            s->tx_level--;
+            s->tx_lag--;
+            budget--;
+        }
+        if (s->tx_lag > slack) {
+            s->st_tx_empty += s->tx_lag;    /* zeros went out on the line */
+            s->tx_lag = 0;
+        }
+    }
+}
+
+static void axera_i2s_stats(AxeraI2SState *s, int64_t now)
+{
+    if (now < s->stats_next_ns) {
+        return;
+    }
+    s->stats_next_ns = now + STATS_NS;
+    if (s->wav) {
+        axera_i2s_wav_header(s);        /* keep the file playable */
+    }
+    if (!s->debug) {
+        return;
+    }
+    fprintf(stderr, "axera-i2s %s @%.1fs: rx in %" PRIu64 " out %" PRIu64
+            " lost %" PRIu64 " (%" PRIu64 " overruns) lag-max %" PRIu64
+            " starts %" PRIu64 " irqs %" PRIu64 " | tx in %" PRIu64
+            " played %" PRIu64 " empty %" PRIu64 " ovr %" PRIu64
+            " starts %" PRIu64 " peak %d | timer late-max %.1f ms\n",
+            s->name ? s->name : "i2s", now / 1e9, s->st_rx_in,
+            s->st_rx_out, s->st_rx_lost, s->st_rx_ovr_events,
+            s->st_rx_lag_max, s->st_rx_starts, s->st_irqs, s->st_tx_in,
+            s->st_tx_out, s->st_tx_empty, s->st_tx_ovr, s->st_tx_starts,
+            s->st_tx_peak, s->st_late_max_ns / 1e6);
+    s->st_late_max_ns = 0;
+    s->st_rx_lag_max = 0;
+    s->st_tx_peak = 0;
 }
 
 static void axera_i2s_schedule(AxeraI2SState *s)
@@ -260,6 +462,7 @@ static void axera_i2s_schedule(AxeraI2SState *s)
     }
     next = s->t0_ns + muldiv64(s->frames_done + TICK_FRAMES,
                                NANOSECONDS_PER_SECOND, s->rate);
+    s->deadline_ns = next;
     timer_mod(&s->timer, next);
 }
 
@@ -272,15 +475,16 @@ static void axera_i2s_tick(void *opaque)
     if (!s->running) {
         return;
     }
+    s->st_late_max_ns = MAX(s->st_late_max_ns, now - s->deadline_ns);
     due = muldiv64(now - s->t0_ns, s->rate, NANOSECONDS_PER_SECOND);
     if (due > s->frames_done) {
         uint64_t n = due - s->frames_done;
 
-        /* After a long host stall don't replay seconds of backlog:
-         * the RX buffer saturates after RX_CAPACITY frames anyway. */
-        axera_i2s_clock_frames(s, MIN(n, (uint64_t)RX_CAPACITY));
+        /* After a long host stall don't replay seconds of backlog. */
+        axera_i2s_clock_frames(s, MIN(n, (uint64_t)s->rate));
         s->frames_done = due;
     }
+    axera_i2s_stats(s, now);
     axera_i2s_update(s);
     axera_i2s_schedule(s);
 }
@@ -296,15 +500,22 @@ static uint32_t axera_i2s_pop_rx(AxeraI2SState *s, bool right)
     if (right) {
         s->rx_head = (s->rx_head + 1) % RX_CAPACITY;
         s->rx_level--;
+        s->st_rx_out++;
     }
     return v;
 }
 
-static void axera_i2s_push_tx(AxeraI2SState *s)
+static void axera_i2s_push_tx(AxeraI2SState *s, uint32_t right)
 {
+    s->st_tx_in++;
     if (s->tx_level < FIFO_DEPTH) {
+        uint32_t slot = (s->tx_head + s->tx_level) % FIFO_DEPTH;
+
+        s->tx_fifo[slot][0] = s->tx_left;
+        s->tx_fifo[slot][1] = right;
         s->tx_level++;
     } else {
+        s->st_tx_ovr++;
         s->ch[0][CH_ISR / 4] |= ISR_TXFO;
     }
 }
@@ -402,14 +613,14 @@ static void axera_i2s_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case I2S_TXFFR:
         if (value & 1) {
-            s->tx_level = 0;
+            s->tx_level = s->tx_head = 0;
             s->tx_half = false;
         }
         break;
     case I2S_TXDMA:
     case I2S_RTXDMA:
         if (s->tx_half) {
-            axera_i2s_push_tx(s);
+            axera_i2s_push_tx(s, value);
         } else {
             s->tx_left = value;
         }
@@ -429,7 +640,7 @@ static void axera_i2s_write(void *opaque, hwaddr offset, uint64_t value,
                 break;
             case CH_RRBR:       /* RTHR: completes the stereo entry */
                 if (n == 0) {
-                    axera_i2s_push_tx(s);
+                    axera_i2s_push_tx(s, value);
                     s->tx_half = false;
                 }
                 break;
@@ -446,7 +657,7 @@ static void axera_i2s_write(void *opaque, hwaddr offset, uint64_t value,
                 break;
             case CH_TFF:
                 if ((value & 1) && n == 0) {
-                    s->tx_level = 0;
+                    s->tx_level = s->tx_head = 0;
                     s->tx_half = false;
                 }
                 break;
@@ -491,8 +702,10 @@ static void axera_i2s_reset(DeviceState *dev)
     for (n = 0; n < I2S_NR_CH; n++) {
         s->ch[n][CH_IMR / 4] = 0x33;    /* all sources masked */
     }
-    s->rx_head = s->rx_level = s->tx_level = 0;
+    s->rx_head = s->rx_level = s->tx_head = s->tx_level = 0;
+    s->rx_lag = 0;
     s->rx_half = s->tx_half = false;
+    s->irq_level = s->rx_was_on = s->tx_was_on = false;
     s->phase = 0;
     s->rx_req_level = s->tx_req_level = false;
     qemu_set_irq(s->irq, 0);
@@ -504,6 +717,7 @@ static void axera_i2s_realize(DeviceState *dev, Error **errp)
 {
     AxeraI2SState *s = AXERA_I2S(dev);
 
+    s->debug = getenv("AXERA_I2S_DEBUG") != NULL;
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, axera_i2s_tick, s);
     memory_region_init_io(&s->iomem, OBJECT(s), &axera_i2s_ops, s,
                           TYPE_AXERA_I2S, I2S_SIZE);
@@ -517,6 +731,9 @@ static const Property axera_i2s_props[] = {
     DEFINE_PROP_BOOL("master", AxeraI2SState, master, true),
     DEFINE_PROP_UINT32("rate", AxeraI2SState, rate, 8000),
     DEFINE_PROP_UINT32("tone-hz", AxeraI2SState, tone_hz, 400),
+    DEFINE_PROP_UINT32("slack-ms", AxeraI2SState, slack_ms, 500),
+    DEFINE_PROP_STRING("name", AxeraI2SState, name),
+    DEFINE_PROP_STRING("playback-file", AxeraI2SState, playback_file),
 };
 
 static void axera_i2s_class_init(ObjectClass *klass, const void *data)

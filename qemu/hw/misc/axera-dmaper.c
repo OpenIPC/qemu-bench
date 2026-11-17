@@ -71,6 +71,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "qemu/log.h"
 #include "hw/irq.h"
 #include "system/memory.h"
@@ -139,6 +140,7 @@ struct AxeraDmaperState {
     uint64_t block_reqs;        /* property: block-mode handshake ids */
     uint64_t req_level;
     bool in_service;
+    QEMUBH *service_bh;
     struct {
         bool active;
         uint64_t sar, dar, len, done;
@@ -351,6 +353,11 @@ static void axera_dmaper_service(AxeraDmaperState *s)
     s->in_service = false;
 }
 
+static void axera_dmaper_service_bh(void *opaque)
+{
+    axera_dmaper_service(opaque);
+}
+
 static void axera_dmaper_start_paced(AxeraDmaperState *s, unsigned ch)
 {
     uint8_t desc[32];
@@ -398,7 +405,15 @@ static void axera_dmaper_req_in(void *opaque, int req, int level)
         unsigned ch;
 
         s->req_level |= 1ULL << req;
-        axera_dmaper_service(s);
+        /*
+         * Not inline either: a request typically rises inside the
+         * peripheral's own MMIO handler (the I2S raises its TX request
+         * when the guest enables the transmitter or flushes its FIFO),
+         * and the transfer then has to access that same peripheral --
+         * a re-entrant access QEMU blocks ("Blocked re-entrant IO"),
+         * which parked the TX channel before a single word moved.
+         */
+        qemu_bh_schedule(s->service_bh);
         /* Release a block-mode channel waiting on this request. Not
          * inline: the request is raised from inside the peripheral's
          * own MMIO handler, which the transfer then has to read. */
@@ -608,6 +623,8 @@ static void axera_dmaper_realize(DeviceState *dev, Error **errp)
 
     timer_init_ns(&s->completion_timer, QEMU_CLOCK_VIRTUAL,
                  axera_dmaper_timer_cb, s);
+    s->service_bh = qemu_bh_new_guarded(axera_dmaper_service_bh, s,
+                                        &dev->mem_reentrancy_guard);
     memory_region_init_io(&s->iomem, OBJECT(s), &axera_dmaper_ops, s,
                           TYPE_AXERA_DMAPER, AXERA_DMAPER_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);

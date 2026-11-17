@@ -45,6 +45,12 @@ bool axera_fbuf_has(hwaddr y);
  * is kept. Safe from any thread (the encoder works outside the BQL).
  */
 bool axera_fbuf_copy(hwaddr y, AxeraPicture *pic);
+/*
+ * Run @fn on the picture kept for the buffer at @y, in place and under
+ * the lock (an overlay drawn into a compressed frame). False if none.
+ */
+bool axera_fbuf_edit(hwaddr y, void (*fn)(AxeraPicture *, void *),
+                     void *opaque);
 /* Forget the buffer at @y: something wrote plain pixels there */
 void axera_fbuf_drop(hwaddr y);
 

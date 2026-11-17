@@ -107,6 +107,21 @@ bool axera_fbuf_copy(hwaddr y, AxeraPicture *pic)
     return true;
 }
 
+bool axera_fbuf_edit(hwaddr y, void (*fn)(AxeraPicture *, void *),
+                     void *opaque)
+{
+    int i;
+
+    QEMU_LOCK_GUARD(&fbuf_lock);
+    i = fbuf_find(y);
+    if (i < 0) {
+        return false;
+    }
+    fbuf[i].used = ++fbuf_clock;
+    fn(&fbuf[i].pic, opaque);
+    return true;
+}
+
 void axera_fbuf_drop(hwaddr y)
 {
     int i;

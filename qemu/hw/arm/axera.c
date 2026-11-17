@@ -848,7 +848,7 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
               { 0x01c }, { 1u << 0 } },
             /* vo@4407000 "dpu": the IVPS OSD/overlay stage */
             { "axera-dpu", 0x04407000, 0x61, 0x004, 0x014, 0,
-              { 0x028 }, { 1u << 0 } },
+              { 0x028 }, { 1u << 0 }, 4 },
         };
 
         axera_create_ivps_engines(engines, ARRAY_SIZE(engines), pic);
@@ -929,13 +929,14 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
          * packets/s with the tone at 400 Hz, and video streams.
          */
         static const struct {
+            const char *name;
             hwaddr base;
             bool master;
             uint32_t rate;
             int rx_req, tx_req;
         } ax620e_i2s[] = {
-            { 0x06050000, true,  8000,  0x0f, 0x0e },
-            { 0x06051000, false, 16000, 0x11, 0x10 },
+            { "i2s_mst", 0x06050000, true,  8000,  0x0f, 0x0e },
+            { "i2s_slv", 0x06051000, false, 16000, 0x11, 0x10 },
         };
         DeviceState *dmaper = qdev_new(TYPE_AXERA_DMAPER);
         uint64_t paced = 0;
@@ -959,6 +960,7 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
         for (i = 0; i < ARRAY_SIZE(ax620e_i2s); i++) {
             DeviceState *i2s = qdev_new(TYPE_AXERA_I2S);
 
+            qdev_prop_set_string(i2s, "name", ax620e_i2s[i].name);
             qdev_prop_set_bit(i2s, "master", ax620e_i2s[i].master);
             qdev_prop_set_uint32(i2s, "rate", ax620e_i2s[i].rate);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(i2s), &error_fatal);
@@ -2560,7 +2562,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
                 { "axera-gdc", 0x02620000, 21, 0x048, 0x054, 0,
                   { 0x058 }, { 1u << 0 } },
                 { "axera-dpu", 0x04400000, 19, 0x004, 0x010, 0,
-                  { 0x020 }, { 1u << 0 } },
+                  { 0x020 }, { 1u << 0 }, 5 },
             };
 
             axera_create_ivps_engines(engines, ARRAY_SIZE(engines), pic);
@@ -2656,6 +2658,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
          */
         DeviceState *i2s = qdev_new(TYPE_AXERA_I2S);
 
+        qdev_prop_set_string(i2s, "name", "i2s_mst");
         sysbus_realize_and_unref(SYS_BUS_DEVICE(i2s), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2s), 0, 0x049ac000, 3);
         sysbus_connect_irq(SYS_BUS_DEVICE(i2s), 0, pic[0x74]);
