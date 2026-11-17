@@ -402,6 +402,28 @@ static void axera_vin_wdma_set(AxeraVinState *s, uint32_t key, uint32_t val)
     }
 }
 
+/* Rows 0, h/4, h/2 (luma) and the first chroma row still hold @pic */
+static bool axera_vin_still_painted(const AxeraVinOut *out,
+                                    const AxeraPicture *pic)
+{
+    const uint32_t rows[] = { 0, pic->h / 4, pic->h / 2 };
+    const AxeraNv12Buf *b = &out->buf;
+    g_autofree uint8_t *line = g_malloc(pic->w);
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(rows); i++) {
+        if (dma_memory_read(&address_space_memory,
+                            b->y + (hwaddr)rows[i] * b->y_stride, line,
+                            pic->w, MEMTXATTRS_UNSPECIFIED) ||
+            memcmp(line, pic->y + (size_t)rows[i] * pic->w, pic->w)) {
+            return false;
+        }
+    }
+    return !dma_memory_read(&address_space_memory, b->uv, line, pic->w,
+                            MEMTXATTRS_UNSPECIFIED) &&
+           !memcmp(line, pic->uv, pic->w);
+}
+
 static void axera_vin_paint(AxeraVinState *s, int n)
 {
     AxeraVinOut *out = &s->out[n];
@@ -437,10 +459,15 @@ static void axera_vin_paint(AxeraVinState *s, int n)
         axera_fbuf_put(out->buf.y, pic);
         return;
     }
-    /* A buffer that already holds the scene only needs the dot's rows */
+    /*
+     * A buffer that already holds the scene only needs the dot's rows --
+     * unless the driver has since lent it to something else, which
+     * would leave stale rows the encoder takes in once and then keeps
+     * (it skips unchanged blocks): spot-check a few rows first.
+     */
     for (i = 0; i < VIN_PAINTED; i++) {
         if (s->painted[i].y == out->buf.y && s->painted[i].w == w &&
-            s->painted[i].h == h) {
+            s->painted[i].h == h && axera_vin_still_painted(out, pic)) {
             axera_nv12_store_rows(&out->buf, pic, r0, r1);
             return;
         }
