@@ -517,12 +517,29 @@ static void axera_ax620u_clkrst_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
 
+/*
+ * A guest reboot (watchdog) re-runs BL1 against this same device. Left
+ * holding the kernel's last LLP in DMA_DESC_OFF, BL1's flat-register
+ * transfers (they fire only while that register is 0) never ran, so its
+ * bad-block scan read nothing and marked every NAND block bad.
+ */
+static void axera_ax620u_clkrst_reset(DeviceState *dev)
+{
+    AxeraAx620uClkrstState *s = AXERA_AX620U_CLKRST(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->dma_desc_dirty = false;
+    s->dma_done_unsignalled = false;
+    qemu_irq_lower(s->irq);
+}
+
 static void axera_ax620u_clkrst_class_init(ObjectClass *klass,
                                            const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = axera_ax620u_clkrst_realize;
+    device_class_set_legacy_reset(dc, axera_ax620u_clkrst_reset);
 }
 
 static const TypeInfo axera_ax620u_clkrst_info = {

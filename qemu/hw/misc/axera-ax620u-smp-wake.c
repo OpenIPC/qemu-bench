@@ -180,6 +180,15 @@ static void axera_ax620u_smp_wake_reset(DeviceState *dev)
     AxeraAx620uSmpWakeState *s = AXERA_AX620U_SMP_WAKE(dev);
     int i;
 
+    /*
+     * A watchdog reboot re-runs BL1 with the secondaries parked again.
+     * Left holding the previous kernel's pen address, the boot register
+     * sent them into stale kernel text while CPU0 was still in BL1/
+     * U-Boot: the next kernel died before its console came up, and the
+     * secondaries sat in abort mode.
+     */
+    memset(s->mem, 0, SMP_WAKE_SIZE);
+
     for (i = 0; i < ARRAY_SIZE(s->ack_words); i++) {
         s->ack_words[i] = ACK_NOT_YET;
     }

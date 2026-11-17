@@ -85,6 +85,8 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "block/aio.h"
+#include "block/thread-pool.h"
 #include "hw/misc/axera-fbuf.h"
 
 #define TYPE_AXERA_IVPS_ENGINE "axera-ivps-engine"
@@ -123,6 +125,26 @@ struct AxeraIvpsEngineState {
     uint32_t ack_mode;
     uint32_t pixel;
     uint32_t port[VPP_PORTS][VPP_PORT_SIZE / 4];   /* VPP whole frame */
+
+    /*
+     * AX620U TDP jobs (a whole-picture NV12 load, scale and store, up to
+     * 4K) run in a worker thread on a snapshot of the registers, and the
+     * done bit is only posted once the worker is finished. Run inside
+     * the kick's MMIO write they held the BQL 40-60 ms each, hundreds of
+     * ms on a loaded host. Meanwhile no other vCPU could take an
+     * interrupt, so the SPI-NAND driver's DMA completion (GIC SPI 5, to
+     * CPU0) missed its 200 ms jiffies deadline: "polling_xfer_completion:
+     * timeout", squashfs read errors (the App's std::ios_failure abort),
+     * UBI write errors (UBIFS read-only). AXERA_IVPS_SYNC=1 restores the
+     * synchronous path.
+     */
+    uint32_t job_regs[ENGINE_SIZE / 4];
+    uint32_t job_bits;          /* done bits of the job in the worker */
+    uint32_t next_bits;         /* kicked again while busy: run next */
+    uint32_t next_regs[ENGINE_SIZE / 4];
+    bool busy;
+    uint32_t gen;               /* bumped on reset: drop a stale result */
+    uint32_t job_gen;
 };
 
 /* The AX620E VPP, which the GDC streams into */
@@ -157,34 +179,95 @@ static hwaddr engine_addr64(AxeraIvpsEngineState *s, hwaddr lo)
     return engine_reg(s, lo) | ((hwaddr)engine_reg(s, lo + 4) << 32);
 }
 
-/* AX620U TDP: (physical - 0x40000000) >> 4 */
-static hwaddr tdp_addr(AxeraIvpsEngineState *s, hwaddr off)
-{
-    return 0x40000000 + ((hwaddr)engine_reg(s, off) << 4);
-}
+static void engine_tdp_job_regs(const uint32_t *regs);
 
 static void engine_tdp_job(AxeraIvpsEngineState *s)
 {
-    uint32_t ssz = engine_reg(s, 0x020);
-    uint32_t dsz = (engine_reg(s, 0x040) & 1) ? engine_reg(s, 0x044) : ssz;
+    engine_tdp_job_regs(s->regs);
+}
+
+static int engine_tdp_worker(void *opaque)
+{
+    AxeraIvpsEngineState *s = opaque;
+
+    engine_tdp_job_regs(s->job_regs);
+    return 0;
+}
+
+static void engine_tdp_submit(AxeraIvpsEngineState *s, const uint32_t *regs,
+                              uint32_t bits);
+
+/* Main loop, BQL held */
+static void engine_tdp_done(void *opaque, int ret)
+{
+    AxeraIvpsEngineState *s = opaque;
+
+    s->busy = false;
+    if (s->job_gen != s->gen) {
+        return;
+    }
+    s->pending |= s->job_bits;
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              ENGINE_DELAY_NS);
+    if (s->next_bits) {
+        uint32_t bits = s->next_bits;
+
+        s->next_bits = 0;
+        engine_tdp_submit(s, s->next_regs, bits);
+    }
+}
+
+static void engine_tdp_submit(AxeraIvpsEngineState *s, const uint32_t *regs,
+                              uint32_t bits)
+{
+    if (s->busy) {
+        memcpy(s->next_regs, regs, sizeof(s->next_regs));
+        s->next_bits |= bits;
+        return;
+    }
+    memcpy(s->job_regs, regs, sizeof(s->job_regs));
+    s->job_bits = bits;
+    s->job_gen = s->gen;
+    s->busy = true;
+    thread_pool_submit_aio(engine_tdp_worker, s, engine_tdp_done, s);
+}
+
+static bool engine_async(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = !getenv("AXERA_IVPS_SYNC");
+    }
+    return on;
+}
+
+#define TDP_REG(off) (regs[(off) / 4])
+/* AX620U TDP: (physical - 0x40000000) >> 4 */
+#define TDP_ADDR(off) (0x40000000 + ((hwaddr)TDP_REG(off) << 4))
+
+static void engine_tdp_job_regs(const uint32_t *regs)
+{
+    uint32_t ssz = TDP_REG(0x020);
+    uint32_t dsz = (TDP_REG(0x040) & 1) ? TDP_REG(0x044) : ssz;
     AxeraNv12Buf src = {
-        .y = tdp_addr(s, 0x030), .uv = tdp_addr(s, 0x038),
+        .y = TDP_ADDR(0x030), .uv = TDP_ADDR(0x038),
         .w = ssz & 0xffff, .h = ssz >> 16,
-        .y_stride = engine_reg(s, 0x034) << 4,
-        .uv_stride = engine_reg(s, 0x03c) << 4,
-        .compressed = engine_reg(s, 0x028) != 0,
+        .y_stride = TDP_REG(0x034) << 4,
+        .uv_stride = TDP_REG(0x03c) << 4,
+        .compressed = TDP_REG(0x028) != 0,
     };
     AxeraNv12Buf dst = {
-        .y = tdp_addr(s, 0x3d0), .uv = tdp_addr(s, 0x3d8),
+        .y = TDP_ADDR(0x3d0), .uv = TDP_ADDR(0x3d8),
         .w = dsz & 0xffff, .h = dsz >> 16,
-        .y_stride = engine_reg(s, 0x3d4) << 4,
-        .uv_stride = engine_reg(s, 0x3dc) << 4,
+        .y_stride = TDP_REG(0x3d4) << 4,
+        .uv_stride = TDP_REG(0x3dc) << 4,
     };
     AxeraPicture in = { 0 }, out = { 0 };
 
     if (!src.w || !src.h || !dst.w || !dst.h || src.w > 8192 ||
         src.h > 8192 || dst.w > 8192 || dst.h > 8192 ||
-        !engine_reg(s, 0x030) || !engine_reg(s, 0x3d0)) {
+        !TDP_REG(0x030) || !TDP_REG(0x3d0)) {
         return;
     }
     if (axera_nv12_load(&src, &in)) {
@@ -290,7 +373,10 @@ static void engine_write(void *opaque, hwaddr off, uint64_t val,
     }
     for (int k = 0; k < ENGINE_KICKS; k++) {
         if (s->done_bits[k] && off == s->kick_off[k] && (val & 1)) {
-            if (s->pixel == PIXEL_U_TDP) {
+            if (s->pixel == PIXEL_U_TDP && engine_async()) {
+                engine_tdp_submit(s, s->regs, s->done_bits[k]);
+                continue;
+            } else if (s->pixel == PIXEL_U_TDP) {
                 engine_tdp_job(s);
             } else if (s->pixel == PIXEL_E_GDC) {
                 engine_gdc_job(s);
@@ -320,6 +406,8 @@ static void engine_reset(DeviceState *dev)
     memset(s->port, 0, sizeof(s->port));
     s->status = 0;
     s->pending = 0;
+    s->next_bits = 0;
+    s->gen++;
     timer_del(s->timer);
     qemu_set_irq(s->irq, 0);
 }

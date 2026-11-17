@@ -53,6 +53,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
+#include "hw/qdev-properties.h"
 #include "hw/misc/axera-wdt.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
@@ -70,6 +71,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraWdtState, AXERA_WDT)
 #define WDT_EOI                 0x14
 
 #define WDT_CR_EN               BIT(0)
+#define WDT_CR_RMOD             BIT(1)
+#define WDT_CRR_KICK            0x76
 
 /* Short enough to be clearly observable, long enough that the write
  * itself (and any immediately-following redundant register pokes)
@@ -84,17 +87,109 @@ struct AxeraWdtState {
     uint32_t cr;
     uint32_t torr;
     bool seen_first_kick;
+
+    /*
+     * dw-apb=on: a plain Synopsys DW_APB_WDT as driven by upstream
+     * drivers/watchdog/dw_wdt.c ("snps,dw-wdt" -- AX620U's
+     * watchdog@49aa000). Unlike AX620E's vendor driver above, that
+     * driver's restart handler is the documented one: TORR=0, then
+     * kick (0x76) if already enabled or set CR.WDT_EN if not, then
+     * mdelay(500) waiting for the reset. So this mode counts down for
+     * real: 2^(16 + TORR.TOP) cycles of clock-hz from every enable or
+     * kick, then a system reset (or, with CR.RMOD, an interrupt first
+     * and the reset on the following timeout). WDT_EN is sticky until
+     * reset, as on the real IP. clock-hz only needs to be no faster
+     * than what the guest believes the clock is, so a guest pinging
+     * on schedule never times out; the restart handler's TOP=0 period
+     * is 65536 cycles (~66 ms at the 1 MHz default).
+     */
+    bool dw_apb;
+    uint32_t clock_hz;
+    bool stat;
 };
+
+static void axera_wdt_dw_restart(AxeraWdtState *s)
+{
+    uint32_t top = s->torr & 0xf;
+    uint64_t cycles = 1ULL << (16 + top);
+
+    timer_mod(&s->reset_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              muldiv64(cycles, NANOSECONDS_PER_SECOND, s->clock_hz));
+}
 
 static void axera_wdt_reset_fire(void *opaque)
 {
+    AxeraWdtState *s = opaque;
+
+    if (s->dw_apb && (s->cr & WDT_CR_RMOD) && !s->stat) {
+        s->stat = true;
+        qemu_irq_raise(s->irq);
+        axera_wdt_dw_restart(s);
+        return;
+    }
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static uint64_t axera_wdt_dw_read(AxeraWdtState *s, hwaddr offset)
+{
+    switch (offset) {
+    case WDT_CR:
+        return s->cr;
+    case WDT_TORR:
+        return s->torr;
+    case WDT_CCVR:
+        if (timer_pending(&s->reset_timer)) {
+            int64_t ns = timer_expire_time_ns(&s->reset_timer) -
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+            return ns > 0 ? muldiv64(ns, s->clock_hz,
+                                     NANOSECONDS_PER_SECOND) : 0;
+        }
+        return 0;
+    case WDT_STAT:
+        return s->stat;
+    case WDT_EOI:
+        s->stat = false;
+        qemu_irq_lower(s->irq);
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static void axera_wdt_dw_write(AxeraWdtState *s, hwaddr offset,
+                               uint32_t value)
+{
+    switch (offset) {
+    case WDT_CR:
+        if ((value & WDT_CR_EN) && !(s->cr & WDT_CR_EN)) {
+            s->cr = value;
+            axera_wdt_dw_restart(s);
+        }
+        s->cr = value | (s->cr & WDT_CR_EN);
+        break;
+    case WDT_TORR:
+        s->torr = value;
+        break;
+    case WDT_CRR:
+        if ((s->cr & WDT_CR_EN) && (value & 0xff) == WDT_CRR_KICK) {
+            s->stat = false;
+            qemu_irq_lower(s->irq);
+            axera_wdt_dw_restart(s);
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static uint64_t axera_wdt_read(void *opaque, hwaddr offset, unsigned size)
 {
     AxeraWdtState *s = opaque;
 
+    if (s->dw_apb) {
+        return axera_wdt_dw_read(s, offset);
+    }
     switch (offset) {
     case WDT_CR:
         return s->cr;
@@ -116,6 +211,10 @@ static void axera_wdt_write(void *opaque, hwaddr offset, uint64_t value,
 {
     AxeraWdtState *s = opaque;
 
+    if (s->dw_apb) {
+        axera_wdt_dw_write(s, offset, value);
+        return;
+    }
     switch (offset) {
     case WDT_CR:
         s->cr = value;
@@ -164,6 +263,7 @@ static void axera_wdt_reset(DeviceState *dev)
     s->cr = 0;
     s->torr = 0;
     s->seen_first_kick = false;
+    s->stat = false;
     qemu_set_irq(s->irq, 0);
 }
 
@@ -179,11 +279,17 @@ static void axera_wdt_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
 
+static const Property axera_wdt_properties[] = {
+    DEFINE_PROP_BOOL("dw-apb", AxeraWdtState, dw_apb, false),
+    DEFINE_PROP_UINT32("clock-hz", AxeraWdtState, clock_hz, 1000000),
+};
+
 static void axera_wdt_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = axera_wdt_realize;
+    device_class_set_props(dc, axera_wdt_properties);
     device_class_set_legacy_reset(dc, axera_wdt_reset);
 }
 

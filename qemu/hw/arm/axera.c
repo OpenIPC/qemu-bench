@@ -257,6 +257,11 @@ static void axera_bootrom_cpu_reset(void *opaque)
     cpu_set_pc(cs, info->entry);
 }
 
+static void axera_cpu_reset_only(void *opaque)
+{
+    cpu_reset(CPU(opaque));
+}
+
 /* GICC includes DIR at +0x1000 past the CPU interface, as the dtsi notes. */
 #define AXERA_GIC_DIST          0x01851000
 #define AXERA_GIC_CPU           0x01852000
@@ -1761,6 +1766,20 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(clktimer), 0, 0x049a0000, 2);
 
         /*
+         * watchdog@49aa000 ("snps,dw-wdt", bound to upstream dw_wdt) also
+         * sits inside the passive regbank above. It is the kernel's only
+         * restart handler on AX620U (no PSCI, no syscon-reboot): against
+         * plain storage every reboot printed "Reboot failed -- System
+         * halted". Its interrupt is not wired: this kernel's dw_wdt
+         * never requests one.
+         */
+        DeviceState *wdt = qdev_new(TYPE_AXERA_WDT);
+
+        qdev_prop_set_bit(wdt, "dw-apb", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(wdt), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(wdt), 0, 0x049aa000, 2);
+
+        /*
          * ddr_pll @ 0x00210000 (see hw/misc/axera-ax620u-ddr-pll.c's own
          * comment): BL1's ddr-init routine spins on this block's own
          * ready bit next, right after the timer fix above lets it get
@@ -2581,6 +2600,18 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             info->cpu = cpu[0];
             info->entry = AXERA_AX620U_BL1_BASE;
             qemu_register_reset(axera_bootrom_cpu_reset, info);
+            /*
+             * Without arm_load_kernel() nothing else resets the other
+             * cores: on a guest reboot (watchdog) CPU1-3 kept running
+             * the old kernel while BL1/U-Boot reloaded it, and the new
+             * kernel died in its first SMP bring-up (garbage CPU number
+             * in the Oops) before its console came up. Reset them to
+             * their power-on state, as at cold boot: they fall through
+             * to BL1's MPIDR check and park in its spin loop.
+             */
+            for (n = 1; n < smp_cpus; n++) {
+                qemu_register_reset(axera_cpu_reset_only, cpu[n]);
+            }
             return;
         }
     }
