@@ -89,6 +89,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmAiaoState, XM_AIAO)
 #define CH_BUSY         0x3c
 
 #define CTRL_START      (1u << 0)
+#define EN_RX_ALL       (1u << 16)    /* G_ENABLE direction bits */
+#define EN_TX_ALL       (1u << 17)
 #define INT_TRANS       (1u << 0)
 #define INT_FULL        (1u << 1)     /* capture full / playback empty */
 
@@ -102,7 +104,7 @@ typedef struct XmAiaoChn {
     hwaddr base;
     hwaddr crg;
     bool tx;
-    uint32_t sta_bit;           /* in G_INT_STA */
+    uint32_t sta_bit;           /* in G_INT_STA, and its G_ENABLE bit */
     QEMUTimer *timer;
     uint32_t rate;
     uint32_t width;             /* bytes a sample */
@@ -122,6 +124,18 @@ struct XmAiaoState {
 #define REG(s, off)     ((s)->regs[(off) / 4])
 #define CREG(c, off)    REG((c)->s, (c)->base + (off))
 
+/*
+ * G_ENABLE gates a channel: its own bit and its direction's.  The HAL sets
+ * both before it starts the channel and clears them after it stopped it,
+ * but either order works here.
+ */
+static bool xm_aiao_enabled(XmAiaoChn *c)
+{
+    const uint32_t m = c->sta_bit | (c->tx ? EN_TX_ALL : EN_RX_ALL);
+
+    return (REG(c->s, G_ENABLE) & m) == m;
+}
+
 static uint32_t xm_aiao_sta(XmAiaoState *s)
 {
     uint32_t sta = 0;
@@ -129,7 +143,8 @@ static uint32_t xm_aiao_sta(XmAiaoState *s)
     for (int n = 0; n < 2; n++) {
         XmAiaoChn *c = &s->chn[n];
 
-        if (CREG(c, CH_INT_RAW) & CREG(c, CH_INT_ENA)) {
+        if (xm_aiao_enabled(c) &&
+            (CREG(c, CH_INT_RAW) & CREG(c, CH_INT_ENA))) {
             sta |= c->sta_bit;
         }
     }
@@ -173,13 +188,19 @@ static int64_t xm_aiao_period(XmAiaoChn *c)
                ((uint64_t)c->rate * c->width), 100000);
 }
 
-static bool xm_aiao_running(XmAiaoChn *c)
+/* the channel's own settings allow transfers */
+static bool xm_aiao_chn_ok(XmAiaoChn *c)
 {
     const uint32_t trans = CREG(c, CH_TRANS);
     const uint32_t size = CREG(c, CH_SIZE);
 
     return (CREG(c, CH_CTRL) & CTRL_START) && trans && trans <= XFER_MAX &&
            size && trans <= size;
+}
+
+static bool xm_aiao_running(XmAiaoChn *c)
+{
+    return xm_aiao_chn_ok(c) && xm_aiao_enabled(c);
 }
 
 /* a pointer register as an offset in the buffer; out of range is 0 */
@@ -295,7 +316,7 @@ static void xm_aiao_start(XmAiaoChn *c)
     if (xm_aiao_running(c)) {
         timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   xm_aiao_period(c));
-    } else {
+    } else if (!xm_aiao_chn_ok(c)) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-aiao: %s started with buffer "
                       "0x%x transfer 0x%x; it moves nothing\n",
                       c->tx ? "playback" : "capture", CREG(c, CH_SIZE),
@@ -352,6 +373,21 @@ static void xm_aiao_write(void *opaque, hwaddr off, uint64_t val,
     uint32_t v = deposit32(old, (off & 3) * 8, size * 8, val);
 
     if (word == G_VERSION || word == G_INT_STA) {
+        return;
+    }
+    if (word == G_ENABLE) {
+        REG(s, word) = v;
+        for (int n = 0; n < 2; n++) {
+            XmAiaoChn *ch = &s->chn[n];
+
+            if (!xm_aiao_running(ch)) {
+                timer_del(ch->timer);
+            } else if (!timer_pending(ch->timer)) {
+                timer_mod(ch->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          xm_aiao_period(ch));
+            }
+        }
+        xm_aiao_update(s);
         return;
     }
     if (!c) {

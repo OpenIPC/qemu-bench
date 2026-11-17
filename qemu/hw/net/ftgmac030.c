@@ -375,8 +375,14 @@ static void ftgmac030_do_tx(Ftgmac030State *s)
         /* Hand the descriptor back: only OWN changes, size/flags stay. */
         d[0] &= ~TXDES0_TXDMA_OWN;
         d[0] = cpu_to_le32(d[0]);
-        dma_memory_write(&address_space_memory, s->tx_ptr, &d[0], 4,
-                         MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_write(&address_space_memory, s->tx_ptr, &d[0], 4,
+                             MEMTXATTRS_UNSPECIFIED)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ftgmac030: TX desc writeback failed @0x%x\n",
+                          s->tx_ptr);
+            s->isr |= INT_AHB_ERR;
+            break;
+        }
 
         if (le32_to_cpu(d[0]) & TXDES0_EDOTR) {
             s->tx_ptr = s->nptxr_badr;
@@ -398,16 +404,28 @@ static uint32_t ftgmac030_rx_bufsz(Ftgmac030State *s)
     return sz ? sz : RBSR_RESET;
 }
 
+/*
+ * Reads the whole descriptor, so a free one is known to be fully readable
+ * before receive() consumes its buffer address.  *bus_err (if given) tells
+ * a failed read apart from a descriptor the guest still owns.
+ */
 static bool ftgmac030_rx_desc_free(Ftgmac030State *s, uint32_t addr,
-                                   uint32_t *des0)
+                                   uint32_t *des0, bool *bus_err)
 {
+    uint32_t d[4];
     uint32_t v;
 
-    if (dma_memory_read(&address_space_memory, addr, &v, 4,
+    if (bus_err) {
+        *bus_err = false;
+    }
+    if (dma_memory_read(&address_space_memory, addr, d, sizeof(d),
                         MEMTXATTRS_UNSPECIFIED)) {
+        if (bus_err) {
+            *bus_err = true;
+        }
         return false;
     }
-    v = le32_to_cpu(v);
+    v = le32_to_cpu(d[0]);
     if (des0) {
         *des0 = v;
     }
@@ -417,11 +435,15 @@ static bool ftgmac030_rx_desc_free(Ftgmac030State *s, uint32_t addr,
 static bool ftgmac030_can_receive(NetClientState *nc)
 {
     Ftgmac030State *s = FTGMAC030(qemu_get_nic_opaque(nc));
+    bool bus_err;
 
     if (!ftgmac030_rx_enabled(s)) {
         return true;    /* receive() drops it, like a disabled MAC */
     }
-    return ftgmac030_rx_desc_free(s, s->rx_ptr, NULL);
+    if (ftgmac030_rx_desc_free(s, s->rx_ptr, NULL, &bus_err)) {
+        return true;
+    }
+    return bus_err;     /* receive() reports the bus error and drops */
 }
 
 /* Returns 0 = drop, else RXDES0 BROADCAST/MULTICAST flags | 1 */
@@ -476,6 +498,7 @@ static ssize_t ftgmac030_receive(NetClientState *nc, const uint8_t *buf,
     uint32_t max_frame = (s->maccr & MACCR_JUMBO_LF) ? 9216 + 4 : 1518 + 4;
     uint32_t flags, crc, addr, des0, total, done, ftl = 0;
     uint8_t pkt[MAX_FRAME];
+    bool bus_err;
     int i, ndesc;
 
     if (!ftgmac030_rx_enabled(s) || len < 14) {
@@ -503,7 +526,14 @@ static ssize_t ftgmac030_receive(NetClientState *nc, const uint8_t *buf,
     ndesc = DIV_ROUND_UP(total, bufsz);
     addr = s->rx_ptr;
     for (i = 0; i < ndesc; i++) {
-        if (!ftgmac030_rx_desc_free(s, addr, &des0)) {
+        if (!ftgmac030_rx_desc_free(s, addr, &des0, &bus_err)) {
+            if (bus_err) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "ftgmac030: bad RX desc @0x%x\n", addr);
+                s->isr |= INT_AHB_ERR;
+                ftgmac030_update_irq(s);
+                return len;     /* drop: nothing written, ring unchanged */
+            }
             s->isr |= INT_NO_RXBUF;
             ftgmac030_update_irq(s);
             return 0;   /* queue; flushed when the guest frees buffers */
@@ -515,8 +545,14 @@ static ssize_t ftgmac030_receive(NetClientState *nc, const uint8_t *buf,
         uint32_t d[4];
         uint32_t chunk = MIN(bufsz, total - done);
 
-        dma_memory_read(&address_space_memory, s->rx_ptr, d, sizeof(d),
-                        MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_read(&address_space_memory, s->rx_ptr, d, sizeof(d),
+                            MEMTXATTRS_UNSPECIFIED)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ftgmac030: bad RX desc @0x%x\n",
+                          s->rx_ptr);
+            s->isr |= INT_AHB_ERR;
+            ftgmac030_update_irq(s);
+            return len; /* never DMA to an unread buffer address */
+        }
         des0 = le32_to_cpu(d[0]);
         if (dma_memory_write(&address_space_memory, le32_to_cpu(d[3]),
                              pkt + done, chunk, MEMTXATTRS_UNSPECIFIED)) {

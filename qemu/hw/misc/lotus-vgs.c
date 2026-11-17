@@ -7,10 +7,17 @@
  * is a list of register images ("nodes") in DDR, started in list mode:
  *   0x010  CTRL     bit 0 ctl_up_finish, 4 filter_up_finish (start, read
  *                   back 0 when done), 8 list mode
- *   0x018  INT      write the read value back to clear: bit 0 early 0
- *                   (with 0x280 bit 0 its mask), 6 list done (the job is
- *                   finished: event 2 to VPSS), 24 error / timeout
- *   0x01c           interrupt enables (the driver writes 0x1004 / 0x1008)
+ *   0x014  INT_MASK 1 = masked, bit-aligned with INT from bit 4 up
+ *                   (hal_vgs_set_int_mask; hal_vgs_startup_task writes
+ *                   0x703f: list done and the errors enabled)
+ *   0x018  INT      write the read value back to clear: bit 0 / 1 / 2
+ *                   early 0 / 1 / 2 (masked by 0x280 bits 0 / 4 / 8, not
+ *                   by 0x014), 4 frame start, 5 frame end, 6 list done
+ *                   (the job is finished: event 2 to VPSS), 12..14 early
+ *                   overflow, 21 / 22 AXI write / read error, 23 / 24
+ *                   blank / valid timeout
+ *   0x01c           AXI outstanding (hal_vgs_set_ost, 0x1004 / 0x1008),
+ *                   not an interrupt register
  *   0x184  node id, 0x188.. node addresses, 0x194 / 0x198 working /
  *          finished node id
  * A node block (hal_vgs_set_next_node_addr): the register image starts at
@@ -56,7 +63,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(LotusVgsState, LOTUS_VGS)
 #define VGS_SIZE        0x10000
 #define VGS_CTRL        0x010
 #define VGS_CTRL_START  0x11u
+#define VGS_INT_MASK    0x014
 #define VGS_INT         0x018
+#define VGS_EARLY_MASK  0x280
 #define VGS_NODE_ID     0x184
 #define VGS_WORK_NODE   0x194
 #define VGS_FINISH_NODE 0x198
@@ -220,7 +229,11 @@ static void vgs_trace(LotusVgsState *s, char rw, hwaddr off, uint64_t val)
 
 static void vgs_update(LotusVgsState *s)
 {
-    qemu_set_irq(s->irq, !!s->regs[VGS_INT >> 2]);
+    uint32_t em = s->regs[VGS_EARLY_MASK >> 2];
+    uint32_t on = (~s->regs[VGS_INT_MASK >> 2] & ~7u) |
+                  (~em & 1) | (~em >> 3 & 2) | (~em >> 6 & 4);
+
+    qemu_set_irq(s->irq, !!(s->regs[VGS_INT >> 2] & on));
 }
 
 static void vgs_done(void *opaque)
@@ -263,6 +276,9 @@ static void vgs_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                   VGS_JOB_NS);
     }
     s->regs[off >> 2] = val;
+    if (off == VGS_INT_MASK || off == VGS_EARLY_MASK) {
+        vgs_update(s);
+    }
 }
 
 static const MemoryRegionOps vgs_ops = {

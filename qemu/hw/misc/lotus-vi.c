@@ -680,6 +680,9 @@ static void lv_proc_tick(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     lv_trace(s, "prc", 'T', s->proc_phase, 0);
+    if (!(s->proc[PROC_CTRL >> 2] & PROC_CTRL_START)) {
+        return;     /* the guest stopped the task */
+    }
     switch (s->proc_phase) {
     case 0:     /* the task starts; online VPSS starts with it */
         s->proc[PROC_WORK_NODE_ID >> 2] = s->proc[PROC_NODE_ID >> 2];
@@ -780,6 +783,16 @@ static void proc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         s->proc_phase = 0;
         timer_mod(s->proc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   lv_frame_ns(s) / 20);
+    } else if (off == PROC_CTRL && !(val & PROC_CTRL_START) &&
+               (s->proc[off >> 2] & PROC_CTRL_START)) {
+        /*
+         * The guest clears START while a task runs: it stops.  xm_vi only
+         * read-modify-writes CTRL (list mode, then bit 0, then bit 4), so
+         * its writes during a task keep the START bits it reads back; the
+         * task's own end clears them in lv_proc_tick, not here.
+         */
+        s->proc_phase = 0;
+        timer_del(s->proc_timer);
     }
     s->proc[off >> 2] = val;
     if (off == PROC_INT_MASK) {

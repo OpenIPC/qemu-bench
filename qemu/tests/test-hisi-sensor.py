@@ -17,7 +17,9 @@ counts half rows) / "vts" in effect, "frame" and "violations".
   on the SC2315E and on a 16-bit GalaxyCore part (GC2083);
 - on hi3516cv610 the SC4336P runs its 4M mode at 30 fps from VTS 1500 alone
   (HTS is left at its reset value, 2800, at 126 MHz), and an exposure
-  longer than the frame (it counts whole rows) is a violation.
+  longer than the frame (it counts whole rows) is a violation;
+- the SC465SL's frame length includes 0x326D (bits 23:16) and its
+  exposure 0x3E20 (bits 20+): both in the frame's timing and its check.
 
     python3 qemu/tests/test-hisi-sensor.py [--qemu PATH]
 """
@@ -266,6 +268,38 @@ def main():
     frames(2)
     check(get('violations') > v0, 'SC4336P: an exposure of %d rows in a '
           '%d-row frame is a violation' % (get('lines'), get('vts')))
+    qmp.close()
+    q.close()
+    # the SC465SL (GK7206): the frame length's bits 23:16 in 0x326D time
+    # the frame, and its exposure's high bits in 0x3E20 count against it
+    q, qmp, get, wr, qom_set = machine('sc465sl', 'hisi-smartsens', SENSOR,
+                                       'hi3516cv610', 0x11060000)
+    for reg, val in ((0x320E, 0x0A), (0x320F, 0x6A), (0x3E01, 0x40),
+                     (0x0100, 0x01)):           # VTS 2666: 30 fps, stream
+        wr(reg, val)
+    q.writel(0x17400000 + 0x10000, 1 << 31)
+    frames(2)
+    f0 = get('frame')
+    frames(30)
+    n = get('frame') - f0
+    check(abs(n - 30) <= 1 and get('vts') == 2666,
+          'SC465SL: %d frames a second at VTS %d' % (n, get('vts')))
+    wr(0x326D, 0x01)                            # VTS 0x10A6A: 0.85 s
+    frames(30)
+    f0 = get('frame')
+    frames(120)                                 # 4 s
+    n = get('frame') - f0
+    check(get('vts') == 0x10A6A and 4 <= n <= 5,
+          'SC465SL: 0x326D extends the frame: %d frames in 4 s at VTS %d' %
+          (n, get('vts')))
+    wr(0x326D, 0x00)
+    frames(30)
+    v0 = get('violations')
+    wr(0x3E20, 0x01)                            # 1 << 20 rows
+    frames(2)
+    check(get('violations') > v0 and get('lines') >= 1 << 20,
+          'SC465SL: an exposure of %d rows (0x3E20) in a %d-row frame is '
+          'a violation' % (get('lines'), get('vts')))
     qmp.close()
     q.close()
     print('%d failure(s)' % fails)

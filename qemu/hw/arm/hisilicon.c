@@ -4865,13 +4865,20 @@ static bool hisi_xmorca_boot_header(const HisiSoCConfig *c,
     uint32_t store     = ldl_le_p(img + XMORCA_HDR_STORE_ADDR);
     uint64_t code_off  = (uint64_t)XMORCA_KEY_AREA_LEN + aux_len + mcu_len;
     uint64_t size      = code_off + MAX(total_len, boot_len);
+    /* The ROM stand-in copies whole words: bound-check what it copies. */
+    uint64_t copy      = ROUND_UP(size, 4);
 
-    if (size > len || size > 0x1000000 || boot_len < 0x40 ||
-        store < c->ram_base || store - c->ram_base + size > machine->ram_size ||
+    if (copy > len || copy > 0x1000000 || boot_len < 0x40 ||
+        store < c->ram_base || store - c->ram_base + copy > machine->ram_size ||
         boot_ep != store + code_off) {
         warn_report("gk7206: flash 0 carries an xmorca boot header "
                     "the boot ROM rejects (store 0x%x entry 0x%x size 0x%"
                     PRIx64 ")", store, boot_ep, size);
+        return false;
+    }
+    if (code_off + boot_len + 4 > len) {
+        warn_report("gk7206: flash 0 xmorca image ends before its boot code "
+                    "area's end magic");
         return false;
     }
     if (ldl_le_p(img + code_off + boot_len) != XMORCA_BOOT_AREA_MAGIC) {
@@ -4881,7 +4888,7 @@ static bool hisi_xmorca_boot_header(const HisiSoCConfig *c,
 
     *ram_dst = store;
     *entry   = boot_ep;
-    *copy_sz = ROUND_UP(size, 4);
+    *copy_sz = copy;
     return true;
 }
 

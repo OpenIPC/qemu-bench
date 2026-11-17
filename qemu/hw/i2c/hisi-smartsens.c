@@ -222,6 +222,21 @@ bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
 }
 
 /*
+ * The frame length the frame in progress uses: 0x320E/F, with the
+ * SC465SL's bits 23:16 in 0x326D (sc465sl.c).
+ */
+static uint32_t smartsens_vts(HisiSmartSensState *s)
+{
+    uint32_t vts = s->applied[0x320E - SS_REG_BASE] << 8 |
+                   s->applied[0x320F - SS_REG_BASE];
+
+    if (s->gain_hcg) {
+        vts |= (uint32_t)s->applied[0x326D - SS_REG_BASE] << 16;
+    }
+    return vts;
+}
+
+/*
  * The frame around that exposure: 0x320E/F the frame length, 0x3208-B the
  * output window, as every SmartSens driver's mode tables set them.
  */
@@ -252,7 +267,7 @@ static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
         e->lines = x.lines / 2;
         e->gain = gain * 1024;
     }
-    e->vts = R16(0x320E);
+    e->vts = smartsens_vts(s);
     if (s->gain_hcg) {
         /*
          * The SC465SL (GK7206 SDK sc465sl.c): rows in 0x3E20:0x3E00:
@@ -271,7 +286,6 @@ static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
         e->lines = (uint32_t)R(0x3E20) << 20 | R(0x3E00) << 12 |
                    R(0x3E01) << 4 | R(0x3E02) >> 4;
         e->gain = gain * 1024;
-        e->vts |= (uint32_t)R(0x326D) << 16;
     }
     e->width = R16(0x3208);
     e->height = R16(0x320A);
@@ -282,10 +296,9 @@ static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
 static int64_t smartsens_frame_ns(Object *sensor)
 {
     HisiSmartSensState *s = HISI_SMARTSENS(sensor);
-#define R16(a) (s->applied[(a) - SS_REG_BASE] << 8 | \
-                s->applied[(a) + 1 - SS_REG_BASE])
-    const uint64_t hts = R16(0x320C), vts = R16(0x320E);
-#undef R16
+    const uint64_t hts = s->applied[0x320C - SS_REG_BASE] << 8 |
+                         s->applied[0x320D - SS_REG_BASE];
+    const uint64_t vts = smartsens_vts(s);
 
     if (!s->pclk || !hts || !vts) {
         return 0;
@@ -313,21 +326,23 @@ static bool smartsens_frame_start(Object *sensor)
         }
     }
     if (sensor_sync_frame_start(&s->sync, smartsens_frame_ns(sensor),
-                                s->applied[0x320E - SS_REG_BASE] << 8 |
-                                s->applied[0x320F - SS_REG_BASE], pending)) {
+                                smartsens_vts(s), pending)) {
         for (i = 0; i < ARRAY_SIZE(ss_latched); i++) {
             s->applied[ss_latched[i] - SS_REG_BASE] =
                 s->regs[ss_latched[i] - SS_REG_BASE];
         }
     }
-    s->sync.vts = s->applied[0x320E - SS_REG_BASE] << 8 |
-                  s->applied[0x320F - SS_REG_BASE];
+    s->sync.vts = smartsens_vts(s);
     s->sync.frame_ns = smartsens_frame_ns(sensor);
     if (!s->streaming) {
         return true;
     }
     IMAGE_SENSOR_GET_CLASS(sensor)->exposure(sensor, &e);
     smartsens_exposure(sensor, &raw);
+    if (s->gain_hcg) {
+        /* the SC465SL: rows with 0x3E20's high bits (sc465sl.c) */
+        raw.lines = e.lines;
+    }
     if (!s->exp_rows) {
         /* most parts count half rows (decoded before any conversion) */
         if (e.vts && raw.lines + 4 > 2 * e.vts) {

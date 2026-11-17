@@ -7,16 +7,22 @@
  * task (lotus-vi's "vpss-start" / "vpss-early" / "vpss-done" GPIOs).
  * From xm_vpss.ko hal_vpss_isr_run_main / hal_reg_vpss_* and a
  * GK7206V11A camera streaming (devmem):
- *   0x0010  SYS_MASK   (not bit-aligned with the status: bit 16 masks
- *                      frame done's timestamp, 17 frame done)
- *   0x0014  SYS_INT    write 1 to clear: bit 0 / 3 / 6 early 0 / 1 / 2
- *                      (low delay: the online encoder may start on the
+ *   0x0010  SYS_MASK   1 = masked, not bit-aligned with the status:
+ *                      bit 15 masks frame start, 16 frame end, 17 list
+ *                      end ("frame done"); hal_vpss_set_int_mask writes
+ *                      0xfffe7fff, clean 0xffffffff
+ *   0x0014  SYS_INT    write 1 to clear: bits 0..11 early 0..2 of
+ *                      ch0 / ch1 / ch3 / start (the ISR takes 0 / 3 / 6:
+ *                      low delay, the online encoder may start on the
  *                      lines out), 12 frame start (the ISR latches the
- *                      node id), 14 frame done (VIPROC -> VPSS rendezvous
- *                      via the slave finish notify: the task completes)
+ *                      node id), 13 frame end, 14 list end = frame done
+ *                      (VIPROC -> VPSS rendezvous via the slave finish
+ *                      notify: the task completes)
  *   0x0018 / 0x001c    overflow mask / status, 0x0020 / 0x0024 error
- *                      mask / status (kept 0)
- *   0x01e4  EARLY_MASK (from the node: 0xffe, early 0 only)
+ *                      mask / status (kept 0); bit-aligned, 1 = masked
+ *   0x01e4  EARLY_MASK bits 0..11 mask SYS_INT bits 0..11, 1 = masked
+ *                      (hal_vpss_set_ochn_lowdelay writes ~enabled;
+ *                      the node's: 0xffe, early 0 only)
  *   0x0160  stage update enables, 0x0168 node id, 0x016c cnfg base
  *           address = node image + 0x160 (the image holds every register
  *           at its own offset), 0x0170 coefficient base, 0x0174 / 0x0178
@@ -87,9 +93,13 @@
 OBJECT_DECLARE_SIMPLE_TYPE(LotusVpssState, LOTUS_VPSS)
 
 #define VPSS_SIZE           0x10000
+#define VPSS_SYS_MASK       0x010
 #define VPSS_SYS_INT        0x014
+#define VPSS_OVF_MASK       0x018
 #define VPSS_OVF_INT        0x01c
+#define VPSS_ERR_MASK       0x020
 #define VPSS_ERR_INT        0x024
+#define VPSS_EARLY_MASK     0x1e4
 #define VPSS_NODE_ID        0x168
 #define VPSS_CTRL_CNFG      0x16c
 #define VPSS_WORK_NODE      0x174
@@ -161,9 +171,14 @@ static void vpss_trace(LotusVpssState *s, char rw, hwaddr off, uint64_t val)
 
 static void vpss_update(LotusVpssState *s)
 {
-    qemu_set_irq(s->irq, !!(s->regs[VPSS_SYS_INT >> 2] |
-                            s->regs[VPSS_OVF_INT >> 2] |
-                            s->regs[VPSS_ERR_INT >> 2]));
+    uint32_t *r = s->regs;
+    /* SYS_INT 12..14 are masked by SYS_MASK 15..17, 0..11 by EARLY_MASK */
+    uint32_t sys_on = (~r[VPSS_EARLY_MASK >> 2] & 0xfff) |
+                      (~r[VPSS_SYS_MASK >> 2] >> 3 & 0x7000);
+
+    qemu_set_irq(s->irq, !!((r[VPSS_SYS_INT >> 2] & sys_on) |
+                            (r[VPSS_OVF_INT >> 2] & ~r[VPSS_OVF_MASK >> 2]) |
+                            (r[VPSS_ERR_INT >> 2] & ~r[VPSS_ERR_MASK >> 2])));
 }
 
 static uint32_t vpss_node_reg(LotusVpssState *s, uint32_t off)
@@ -550,6 +565,10 @@ static void vpss_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     }
     s->regs[off >> 2] = val;
+    if (off == VPSS_SYS_MASK || off == VPSS_OVF_MASK ||
+        off == VPSS_ERR_MASK || off == VPSS_EARLY_MASK) {
+        vpss_update(s);
+    }
 }
 
 static const MemoryRegionOps vpss_ops = {
