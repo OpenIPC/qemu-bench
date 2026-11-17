@@ -90,9 +90,19 @@
  * size, offset, room), R1 [15:0] height - 1, [31:16] width - 1, R3
  * [15:0] the source pitch; the size goes to 0x234.
  *
- * Every job completes 200 us after its start (the WAIT_IRQ thread is
- * waiting by then; avpu_ip.c queues each status bit).  Addresses are
- * masked to the 29 bits the bus sees, so KSEG0/1 forms work too.
+ * A job completes 200 us after its start (the WAIT_IRQ thread is waiting
+ * by then; avpu_ip.c queues each status bit), or once it is coded if that
+ * takes longer.  The coding runs on a thread of its own, beside the CPUs,
+ * as the encoder does on silicon: coded under the iothread lock, a
+ * 2560x1440 picture held both CPUs for up to 0.8 s of host time while the
+ * virtual clock went on, and every kernel timer due meanwhile fired that
+ * late -- T41's audio.ko gives a microphone read 800 ms
+ * (dsp_get_mic_stream: "get mic timeout!"), after which libimp records
+ * nothing more (OpenIPC/majestic#376).  The jobs the timer finds queued go
+ * to the thread as one batch, the JPEG registers as they are then; their
+ * done bits and JPEG's result registers land, under the lock, when the
+ * whole batch is coded.  Addresses are masked to the 29 bits the bus
+ * sees, so KSEG0/1 forms work too.
  * "-global ingenic-avpu.dump=DIR" appends each channel's H.264 / HEVC
  * output to DIR/avpu-<w>x<h>.h264 / .h265 and writes JPEGs to
  * DIR/avpu-<n>.jpg; "-global ingenic-avpu.trace=1" logs every start and
@@ -108,6 +118,8 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -245,6 +257,14 @@ typedef struct AvpuStream {
     bool h264_t8x8;                     /* PPS transform_8x8_mode_flag */
 } AvpuStream;
 
+/* a job handed to the coding thread */
+typedef struct AvpuJob {
+    uint32_t kind, addr, core;
+    uint32_t jpeg[11];          /* JPEG's R0..R10 as the batch began */
+    uint32_t jpeg_bytes;        /* JPEG's results, for its registers */
+    bool jpeg_wrote, jpeg_overflow;
+} AvpuJob;
+
 struct IngenicAvpuState {
     SysBusDevice parent_obj;
 
@@ -275,6 +295,21 @@ struct IngenicAvpuState {
     char *dump;
     uint8_t trace;          /* 1: command entries, 2: register writes too */
     uint32_t pcm_budget;
+
+    /*
+     * The coding thread.  While "busy" the batch in run[] and the pictures
+     * (frames, refs, streams, seq, jpeg_count) are the thread's; "coded"
+     * says it has finished them, and the bottom half hands the results
+     * back under the iothread lock.
+     */
+    QemuThread thread;
+    QemuMutex lock;
+    QemuCond cond;
+    QEMUBH *bh;
+    bool busy, coded;
+    AvpuJob run[AVPU_MAX_JOBS];
+    uint32_t nrun;
+    uint32_t run_pending;
 };
 
 static void avpu_update(IngenicAvpuState *s)
@@ -1692,11 +1727,9 @@ static const uint16_t avpu_g2_jpeg[11] = {
     0x40, 0x44, 0x48, 0x74, 0x80, 0x88, 0x58, 0x60, 0x68, 0x6C, 0x70,
 };
 
-static void avpu_jpeg(IngenicAvpuState *s, int core)
+static void avpu_jpeg(IngenicAvpuState *s, AvpuJob *j)
 {
-    uint32_t *cregs = &s->regs[core * CORE_STRIDE / 4];
-    uint32_t *page = &s->regs[G2_CORE(core) / 4];
-    uint32_t r[11];
+    const uint32_t *r = j->jpeg;
     int h, w, pitch, w2, h2;
     uint32_t base, size, off, room;
     uint8_t zz[128], ql[64], qc[64];
@@ -1706,10 +1739,6 @@ static void avpu_jpeg(IngenicAvpuState *s, int core)
     size_t n, cap, i;
     bool overflow = false;
 
-    for (i = 0; i < ARRAY_SIZE(r); i++) {
-        r[i] = s->gen == 2 ? page[avpu_g2_jpeg[i] / 4]
-                           : cregs[R_JPEG(i) / 4];
-    }
     h = extract32(r[1], 0, 16) + 1;
     w = extract32(r[1], 16, 16) + 1;
     if (w > AVPU_MAX_DIM || h > AVPU_MAX_DIM) {
@@ -1773,18 +1802,10 @@ static void avpu_jpeg(IngenicAvpuState *s, int core)
             }
             done += chunk;
         }
-        if (s->gen == 2) {
-            page[0x604 / 4] = total;
-        } else {
-            cregs[R_JPEG_BYTES / 4] = total;
-        }
+        j->jpeg_bytes = total;
+        j->jpeg_wrote = true;
     }
-    if (s->gen == 2) {
-        page[0x600 / 4] = 0;
-    } else {
-        cregs[R_JPEG_STATUS / 4] = 0;
-        cregs[R_JPEG_FLAGS / 4] = overflow ? 2 : 0;
-    }
+    j->jpeg_overflow = overflow;
     if (s->dump) {
         g_autofree char *path = g_strdup_printf("%s/avpu-%u.jpg", s->dump,
                                                 s->jpeg_count);
@@ -1801,28 +1822,146 @@ static void avpu_jpeg(IngenicAvpuState *s, int core)
 
 /* ---- jobs ---------------------------------------------------------------- */
 
-static void avpu_done(void *opaque)
+/* the coding thread: one batch at a time, without the iothread lock */
+static void *avpu_thread(void *opaque)
 {
     IngenicAvpuState *s = opaque;
     uint32_t i;
 
-    for (i = 0; i < s->njobs; i++) {
-        switch (s->job_kind[i]) {
-        case START_ENC1:
-            avpu_enc1(s, s->job_addr[i]);
-            break;
-        case START_ENC2:
-            avpu_enc2(s, s->job_addr[i]);
-            break;
-        case START_JPEG:
-            avpu_jpeg(s, s->job_core[i]);
-            break;
+    qemu_mutex_lock(&s->lock);
+    for (;;) {
+        while (!s->busy || s->coded) {
+            qemu_cond_wait(&s->cond, &s->lock);
+        }
+        qemu_mutex_unlock(&s->lock);
+        for (i = 0; i < s->nrun; i++) {
+            AvpuJob *j = &s->run[i];
+
+            switch (j->kind) {
+            case START_ENC1:
+                avpu_enc1(s, j->addr);
+                break;
+            case START_ENC2:
+                avpu_enc2(s, j->addr);
+                break;
+            case START_JPEG:
+                avpu_jpeg(s, j);
+                break;
+            }
+        }
+        qemu_mutex_lock(&s->lock);
+        s->coded = true;
+        qemu_cond_broadcast(&s->cond);
+        qemu_bh_schedule(s->bh);
+    }
+    return NULL;
+}
+
+/* a coded batch: its results to the registers, its done bits raised */
+static void avpu_finish(IngenicAvpuState *s)
+{
+    uint32_t i;
+
+    qemu_mutex_lock(&s->lock);
+    if (!s->busy || !s->coded) {
+        qemu_mutex_unlock(&s->lock);
+        return;
+    }
+    for (i = 0; i < s->nrun; i++) {
+        const AvpuJob *j = &s->run[i];
+        uint32_t *cregs = &s->regs[j->core * CORE_STRIDE / 4];
+        uint32_t *page = &s->regs[G2_CORE(j->core) / 4];
+
+        if (j->kind != START_JPEG) {
+            continue;
+        }
+        if (s->gen == 2) {
+            if (j->jpeg_wrote) {
+                page[0x604 / 4] = j->jpeg_bytes;
+            }
+            page[0x600 / 4] = 0;
+        } else {
+            if (j->jpeg_wrote) {
+                cregs[R_JPEG_BYTES / 4] = j->jpeg_bytes;
+            }
+            cregs[R_JPEG_STATUS / 4] = 0;
+            cregs[R_JPEG_FLAGS / 4] = j->jpeg_overflow ? 2 : 0;
         }
     }
-    s->njobs = 0;
-    s->irq_status |= s->pending;
-    s->pending = 0;
+    s->irq_status |= s->run_pending;
+    s->nrun = 0;
+    s->run_pending = 0;
+    s->busy = s->coded = false;
+    qemu_mutex_unlock(&s->lock);
     avpu_update(s);
+}
+
+/* wait for the batch being coded, and finish it */
+static void avpu_drain(IngenicAvpuState *s)
+{
+    qemu_mutex_lock(&s->lock);
+    while (s->busy && !s->coded) {
+        qemu_cond_wait(&s->cond, &s->lock);
+    }
+    qemu_mutex_unlock(&s->lock);
+    avpu_finish(s);
+}
+
+/* the jobs queued so far, to the coding thread as one batch */
+static void avpu_done(void *opaque)
+{
+    IngenicAvpuState *s = opaque;
+    uint32_t i, k;
+
+    if (s->busy || !s->njobs) {
+        return;                 /* avpu_coded() comes back for them */
+    }
+    for (i = 0; i < s->njobs; i++) {
+        AvpuJob *j = &s->run[i];
+        const uint32_t *cregs = &s->regs[s->job_core[i] * CORE_STRIDE / 4];
+        const uint32_t *page = &s->regs[G2_CORE(s->job_core[i]) / 4];
+
+        memset(j, 0, sizeof(*j));
+        j->kind = s->job_kind[i];
+        j->addr = s->job_addr[i];
+        j->core = s->job_core[i];
+        if (j->kind == START_JPEG) {
+            for (k = 0; k < ARRAY_SIZE(j->jpeg); k++) {
+                j->jpeg[k] = s->gen == 2 ? page[avpu_g2_jpeg[k] / 4]
+                                         : cregs[R_JPEG(k) / 4];
+            }
+        }
+    }
+    qemu_mutex_lock(&s->lock);
+    s->nrun = s->njobs;
+    s->run_pending = s->pending;
+    s->busy = true;
+    s->coded = false;
+    qemu_cond_broadcast(&s->cond);
+    qemu_mutex_unlock(&s->lock);
+    s->njobs = 0;
+    s->pending = 0;
+}
+
+/* the bottom half: a batch is coded; start the next one, if any waits */
+static void avpu_coded(void *opaque)
+{
+    IngenicAvpuState *s = opaque;
+
+    avpu_finish(s);
+    if (s->njobs && !timer_pending(s->timer)) {
+        avpu_done(s);
+    }
+}
+
+/*
+ * The queue is full: the guest outran the coding.  Wait for the batch in
+ * flight and hand the queue over, which empties it.
+ */
+static void avpu_queue_full(IngenicAvpuState *s)
+{
+    avpu_drain(s);
+    avpu_done(s);
 }
 
 static void avpu_start(IngenicAvpuState *s, int core, uint32_t val)
@@ -1848,8 +1987,7 @@ static void avpu_start(IngenicAvpuState *s, int core, uint32_t val)
             continue;
         }
         if (s->njobs == AVPU_MAX_JOBS) {
-            /* run what is queued now: the guest outran the timer */
-            avpu_done(s);
+            avpu_queue_full(s);
         }
         s->job_kind[s->njobs] = kinds[i];
         s->job_addr[s->njobs] = cr[R_CL_ADDR / 4] & AVPU_DMA_MASK;
@@ -1895,7 +2033,7 @@ static void avpu_start2(IngenicAvpuState *s, int core, bool enc2,
         return;
     }
     if (s->njobs == AVPU_MAX_JOBS) {
-        avpu_done(s);
+        avpu_queue_full(s);
     }
     s->job_kind[s->njobs] = kind;
     /* the entries begin Enc2's words before */
@@ -2021,6 +2159,7 @@ static void avpu_reset(DeviceState *dev)
     int i;
 
     timer_del(s->timer);
+    avpu_drain(s);
     memset(s->regs, 0, sizeof(s->regs));
     /* board UID, HW ID, revision, date (Board.c ShowBoardInformation) */
     s->regs[R_ID0 / 4] = 0x414c4c45;            /* "ELLA" */
@@ -2067,6 +2206,18 @@ static void avpu_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, avpu_done, s);
+    s->bh = qemu_bh_new(avpu_coded, s);
+    qemu_mutex_init(&s->lock);
+    qemu_cond_init(&s->cond);
+    qemu_thread_create(&s->thread, "avpu", avpu_thread, s,
+                       QEMU_THREAD_DETACHED);
+}
+
+/* a batch in flight is finished first: its pictures are not migrated */
+static int avpu_pre_save(void *opaque)
+{
+    avpu_drain(opaque);
+    return 0;
 }
 
 static const Property avpu_props[] = {
@@ -2087,6 +2238,7 @@ static const VMStateDescription vmstate_avpu = {
     .name = TYPE_INGENIC_AVPU,
     .version_id = 2,
     .minimum_version_id = 2,
+    .pre_save = avpu_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, IngenicAvpuState),
         VMSTATE_UINT32_ARRAY(regs, IngenicAvpuState, AVPU_NREGS),

@@ -33,6 +33,9 @@
 #   - majestic brings the SDK up ("Ingenic SDK started");
 #   - with --audio, with the microphone on (audio.enabled: true), which a
 #     T40 build could not do before OpenIPC/majestic#257;
+#   - with --audio on t41, the microphone is heard: /audio.pcm carries
+#     the codec's 1 kHz tone, and the vendor driver never timed a read out
+#     ("get mic timeout!", after which libimp records nothing more);
 #   - with --audio on t41, the speaker too: a 1 s 440 Hz tone POSTed to
 #     /play_audio comes out of the codec, all of it (OpenIPC/majestic#376:
 #     every frame was refused, and a clip shorter than the queue was
@@ -353,10 +356,28 @@ saved() {
         -d "$SAVED" "http://127.0.0.1:$HTTP/api/v1/config" &&
         [ "$(api_get rtsp keyframeOnSkip)" = True ]
 }
-# No microphone check: the twin's T41 audio.ko refuses the first read now and
-# then (__ai_dev_read ret=-1) and no frame follows, and it records the tone
-# on the digital and the analogue device alike, so a check could neither
-# pass reliably nor tell the right device from the wrong one.
+# mic: /audio.pcm carries the codec's 1 kHz tone, and no read of it timed
+# out in the vendor driver.  It cannot tell IMP_AI device 0 from 1: the
+# twin's T41 audio.ko records the codec on both.
+mic() {
+    curl -s -m 4 -u root:12345 -o "$WORK/mic.pcm" \
+        "http://127.0.0.1:$HTTP/audio.pcm" || [ $? = 28 ] || return 1
+    ! grep -aq 'get mic timeout' "$CON" || { echo '    (mic: get mic timeout)'; return 1; }
+    python3 - "$WORK/mic.pcm" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+x = struct.unpack('<%dh' % (len(d) // 2), d[:len(d) // 2 * 2])
+r = 8000
+s = x[r // 4:]  # past the first quarter second
+if len(s) < r or max(abs(v) for v in s) < 200:
+    print('    (mic: %d samples, silent or short)' % len(x))
+    sys.exit(1)
+z = sum(1 for i in range(1, len(s)) if (s[i - 1] < 0) != (s[i] < 0))
+hz = z / 2 / (len(s) / r)
+print('    (mic: %.2f s at %.0f Hz)' % (len(x) / r, hz))
+sys.exit(0 if 950 < hz < 1050 else 1)
+PY
+}
 # speaker: a 1 s 440 Hz tone POSTed to /play_audio comes out of the codec,
 # all of it -- the end of a clip is where frames went missing
 speaker() {
@@ -426,6 +447,7 @@ if grep -aq 'Ingenic SDK started' "$CON"; then
     check "/image.jpg is a JPEG of the main stream's size" snapshot
     # The speaker on T41, whose SDK audio.ko the twin plays through
     if [ "$SPEAKER" = true ]; then
+        check "the microphone is heard on /audio.pcm" mic
         check "/play_audio is heard" speaker
     fi
     mark DAY

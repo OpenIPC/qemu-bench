@@ -943,7 +943,13 @@ past the UID) is the part's -- libimp's encoder library checks it
 - 0x3E0 / 0x3E4: a command list (0x200-byte entries, word 0 bit 31 the
   last) and its start, 2 Enc1, 8 Enc2, 1 JPEG from R0-R10 (0x200-0x228;
   bytes written at 0x234). Jobs complete 200 us after the start, never
-  inside the write. Addresses are masked to 29 bits.
+  inside the write, or once they are coded if that takes longer: the
+  coding runs on a thread of its own, beside the CPUs, as the encoder
+  does on silicon. Coded under the iothread lock, a 2560x1440 picture
+  held both CPUs for up to 0.8 s of host time while the virtual clock
+  went on, so every kernel timer due meanwhile fired that late; T41's
+  `audio.ko` gives a microphone read 800 ms (`get mic timeout!`, and
+  libimp then records nothing more). Addresses are masked to 29 bits.
 - Bitstream split: libimp writes SPS/PPS/VPS/SEI and the slice header,
   the hardware the slice data from stream base + offset (re-emitting the
   0x78/0x7C header tail with emulation prevention); libimp writes the
@@ -2358,11 +2364,17 @@ The checks:
   spk_level=-1` is loaded as on the owner's T41NQ, the speaker plays into a
   wav audiodev, and a 1 s 440 Hz tone POSTed to `/play_audio` must come out
   for at least 0.8 s at 440 Hz. A build from before OpenIPC/majestic#376's
-  audio fix fails it: every frame refused, and the clip silent. There is no
-  microphone check: the twin's T41 `audio.ko` refuses the first read now and
-  then and nothing follows, and it records the tone on the digital and the
-  analogue input device alike, so a check could neither pass reliably nor
-  tell the right device from the wrong one. T40 keeps its speaker off: its
+  audio fix fails it: every frame refused, and the clip silent. The
+  microphone too: 4 s of `/audio.pcm` must carry the codec's 1 kHz tone,
+  and the vendor driver must never have timed a read out (`get mic
+  timeout!`; libimp records nothing after one). That timeout was the
+  encoder model's: coding a 2560x1440 picture under the iothread lock froze
+  both CPUs for up to 0.8 s while the virtual clock ran on, past the 800 ms
+  the driver waits (the AVPU section above), and 2 of 3 runs failed until
+  the coding moved to a thread of its own. The check cannot tell IMP_AI
+  device 0 from 1: the twin's `audio.ko` records the codec on both (a build
+  that records on device 0 passes it), where the owner's camera gave
+  silence on 0. T40 keeps its speaker off: its
   `audio.ko` stops recording after about a second, and with the output on
   too its streams stalled after a power cycle;
 - 50 pictures of each RTSP stream decode -- ffmpeg's own count, exit
