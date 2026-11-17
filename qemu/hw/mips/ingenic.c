@@ -323,10 +323,9 @@ static const IngenicVariant ingenic_variants[] = {
     { "t41zl", INGENIC_T41, 0x01, 0x5555 },
     { "t41zn", INGENIC_T41, 0x01, 0x7777 },
     /* 0x6666 and 0x4444 as the T41 SDK's own SPL names them (Ingenic
-     * SDK 1.2.0, u-boot common/spl/spl.c): ipctool calls 0x6666 "T41X"
-     * and has no 0x4444.  The SDK gives no code to the T41XQ, whose
-     * U-Boot is the T41ZX's with another DDR skew, so its images boot
-     * on t41zx. */
+     * SDK 1.2.0, u-boot common/spl/spl.c), and as ipctool names them.
+     * The SDK gives no code to the T41XQ, whose U-Boot is the T41ZX's
+     * with another DDR skew, so its images boot on t41zx. */
     { "t41zx", INGENIC_T41, 0x01, 0x6666 },
     { "t41a",  INGENIC_T41, 0x01, 0x4444 },
 };

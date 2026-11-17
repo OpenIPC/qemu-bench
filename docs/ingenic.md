@@ -217,8 +217,9 @@ of each SoC is its default. DRAM stays `-m`. `ipctool` run in the guest
 reports the grade (T31X, T40XP, ...).
 
 T41's codes are the ones its SDK's SPL prints (`Board info: T41ZX` for
-0x6666, `T41A` for 0x4444). ipctool calls 0x6666 `T41X` and does not know
-0x4444, so on `t41zx` and `t41a` it disagrees with the SPL. No code is
+0x6666, `T41A` for 0x4444), and ipctool names them the same. An older
+ipctool, such as the one in the T40 release root the `t41` majestic run
+boots, says `T41X` for 0x6666 and `unknown` for 0x4444. No code is
 known for the T41XQ: its U-Boot is the T41ZX's with another DDR skew, and
 it boots on `t41zx`. Each grade's U-Boot sizes the DDR it was built for,
 so `-m` must be at least that: 64M for L/LQ, 128M for N/NQ/A and 256M for
