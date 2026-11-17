@@ -1251,11 +1251,25 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
     return dmaper_dev;
 }
 
+/*
+ * Guest time and host starvation (patches/0007): the camera firmware's
+ * drivers have tight guest-time deadlines (SPI-NAND DMA ~200 ms, ax_venc
+ * ~1 s, ax_vo draw waits) that a busy host otherwise blows while a
+ * runnable vCPU or worker is off-CPU. Freeze the virtual clock during
+ * such starvation (5 ms threshold) unless the user chose otherwise.
+ */
+static void axera_vclock_starve_default(void)
+{
+    g_setenv("QEMU_VCLOCK_STARVE", "5", FALSE);
+}
+
 static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
 {
     MemoryRegion *sysmem = get_system_memory();
     unsigned int smp_cpus = machine->smp.cpus;
     static struct arm_boot_info binfo;
+
+    axera_vclock_starve_default();
     qemu_irq pic[AXERA_NUM_SPI];
     DeviceState *gic;
     DeviceState *dmaper;
@@ -1751,6 +1765,8 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     MemoryRegion *sysmem = get_system_memory();
     static struct arm_boot_info binfo;
     qemu_irq pic[AXERA_NUM_SPI];
+
+    axera_vclock_starve_default();
     DeviceState *gic;
     SysBusDevice *gicbus;
     ARMCPU *cpu[4];

@@ -1,0 +1,315 @@
+cpu-timers: opt-in starvation-aware virtual clock (QEMU_VCLOCK_STARVE=<ms>)
+
+Without icount QEMU_CLOCK_VIRTUAL follows host time. On an overloaded
+host (load 60-190 on 32 cores) one of QEMU's threads can sit runnable
+but off-CPU for hundreds of ms while the guest's clocks keep running,
+so guest deadlines expire for work that never got a chance to run: the
+AX620U SPI-NAND driver's 200 ms DMA-completion poll ("SPI transfer
+timed out" -> squashfs EIO / UBIFS read-only) when the vCPU holding a
+spinlock CPU0 spins on is preempted, the AX620E ax_vo 300 ms draw waits
+when the GDC worker is starved. With QEMU_VCLOCK_STARVE=<ms> a watcher
+thread samples every QEMU thread's CPU clock and /proc state each ms and
+stops the virtual clock while any thread has been runnable-but-starved
+for <ms>; blocked threads (halted vCPUs, idle workers) never count. The
+clock stays monotonic and continuous; a pause is capped at
+QEMU_VCLOCK_STARVE_MAX ms (default 2000) followed by a quarter of that
+unpaused. QEMU_VCLOCK_STARVE_LOG=1 prints totals every 10 s. Off by
+default; ignored with icount. Recommended: QEMU_VCLOCK_STARVE=5.
+
+--- a/system/cpu-timers.c	2026-11-17 20:01:22.118444310 +0000
++++ b/system/cpu-timers.c	2026-11-17 21:48:57.700129522 +0000
+@@ -31,6 +31,8 @@
+ #include "qemu/main-loop.h"
+ #include "qemu/option.h"
+ #include "qemu/seqlock.h"
++#include "qemu/timer.h"
++#include <dirent.h>
+ #include "system/replay.h"
+ #include "system/runstate.h"
+ #include "hw/core/cpu.h"
+@@ -71,13 +73,22 @@
+     return ticks;
+ }
+ 
++/*
++ * Host time at which the virtual clock was paused because a QEMU thread
++ * is runnable but gets no host CPU; 0 while it runs.  Written under
++ * vm_clock_seqlock, see vclock_starve_thread().
++ */
++static int64_t vclock_stall_since;
++
+ int64_t cpu_get_clock_locked(void)
+ {
+     int64_t time;
+ 
+     time = timers_state.cpu_clock_offset;
+     if (timers_state.cpu_ticks_enabled) {
+-        time += get_clock();
++        int64_t stall = qatomic_read(&vclock_stall_since);
++
++        time += stall ? stall : get_clock();
+     }
+ 
+     return time;
+@@ -100,12 +111,253 @@
+     return ti;
+ }
+ 
++#ifdef CONFIG_LINUX
++/*
++ * QEMU_VCLOCK_STARVE=<ms> (opt-in, TCG without icount): pause
++ * QEMU_CLOCK_VIRTUAL while any QEMU thread -- a vCPU, the main loop, a
++ * device worker -- is runnable but has been denied host CPU for <ms> or
++ * longer.
++ *
++ * Without icount the virtual clock follows host time. On an overloaded
++ * host the scheduler can keep one of QEMU's threads off-CPU for hundreds
++ * of ms; the guest's clocks keep running meanwhile, so its deadlines
++ * (driver completion polls, device timeouts, watchdogs) expire for work
++ * that never got a chance to run: a guest spinlock holder's vCPU
++ * preempted while the CPU that takes a DMA completion IRQ spins on that
++ * lock; a device job waiting in a starved worker thread. Real hardware
++ * runs all of its parts all of the time, so the machine's time should
++ * only advance while QEMU's are.
++ *
++ * A watcher thread samples, every ~1 ms, each thread's CPU time and
++ * scheduler state (/proc/self/task/<tid>/stat; the thread list is
++ * re-read every 100 ms). "Starved" = state R (running or runnable) and
++ * less than a quarter of the sampling interval spent on a CPU. Threads
++ * blocked on anything (a halted vCPU, the BQL, an idle worker, I/O) are
++ * state S/D and never count, so an idle guest keeps normal time. While
++ * any thread has been starved >= <ms> the clock stands still; on resume
++ * the offset absorbs the pause, so it stays monotonic and continuous.
++ * A pause lasts at most QEMU_VCLOCK_STARVE_MAX ms (default 2000) and is
++ * followed by a quarter of that without pausing, so guest time always
++ * advances at >= 1/5 of host speed.
++ * QEMU_VCLOCK_STARVE_LOG=1 prints totals every 10 s to stderr.
++ */
++#define VCLOCK_STARVE_MAX_THREADS 256
++
++typedef struct StarveThread {
++    int tid;
++    int fd;
++    bool seen;
++    int64_t last_cpu;
++    int64_t starved_since;
++} StarveThread;
++
++typedef struct StarveState {
++    int64_t thresh_ns, max_ns;
++    bool log;
++    int self;
++    int nthreads;
++    StarveThread th[VCLOCK_STARVE_MAX_THREADS];
++} StarveState;
++
++/* A thread's CPU time, -1 once it is gone (Linux's per-thread CPU clock) */
++static int64_t vclock_starve_cpu_ns(int tid)
++{
++    clockid_t clk = (~(clockid_t)tid << 3) | 6;  /* CPUCLOCK_SCHED, thread */
++    struct timespec ts;
++
++    if (clock_gettime(clk, &ts)) {
++        return -1;
++    }
++    return ts.tv_sec * NANOSECONDS_PER_SECOND + ts.tv_nsec;
++}
++
++/* Re-read the thread list: add new threads, drop exited ones */
++static void vclock_starve_scan(StarveState *s)
++{
++    DIR *d = opendir("/proc/self/task");
++    struct dirent *e;
++    int i, j;
++
++    if (!d) {
++        return;
++    }
++    for (i = 0; i < s->nthreads; i++) {
++        s->th[i].seen = false;
++    }
++    while ((e = readdir(d))) {
++        int tid = atoi(e->d_name);
++        StarveThread *t;
++        char path[64];
++        int64_t cpu;
++
++        if (tid <= 0 || tid == s->self) {
++            continue;
++        }
++        for (i = 0; i < s->nthreads && s->th[i].tid != tid; i++) {
++        }
++        if (i < s->nthreads) {
++            s->th[i].seen = true;
++            continue;
++        }
++        cpu = vclock_starve_cpu_ns(tid);
++        if (s->nthreads == VCLOCK_STARVE_MAX_THREADS || cpu < 0) {
++            continue;
++        }
++        snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
++        t = &s->th[s->nthreads];
++        t->fd = open(path, O_RDONLY | O_CLOEXEC);
++        if (t->fd < 0) {
++            continue;
++        }
++        t->tid = tid;
++        t->seen = true;
++        t->last_cpu = cpu;
++        t->starved_since = 0;
++        s->nthreads++;
++    }
++    closedir(d);
++    for (i = j = 0; i < s->nthreads; i++) {
++        if (s->th[i].seen) {
++            s->th[j++] = s->th[i];
++        } else {
++            close(s->th[i].fd);
++        }
++    }
++    s->nthreads = j;
++}
++
++/* Scheduler state letter of a thread, '?' if unknown. */
++static char vclock_starve_state(StarveThread *t)
++{
++    char buf[256];
++    ssize_t n = pread(t->fd, buf, sizeof(buf) - 1, 0);
++    char *p;
++
++    if (n <= 0) {
++        return '?';
++    }
++    buf[n] = 0;
++    p = strrchr(buf, ')');
++    return p && p[1] == ' ' ? p[2] : '?';
++}
++
++static void vclock_starve_set(bool pause)
++{
++    seqlock_write_lock(&timers_state.vm_clock_seqlock,
++                       &timers_state.vm_clock_lock);
++    if (pause) {
++        if (timers_state.cpu_ticks_enabled && !vclock_stall_since) {
++            qatomic_set(&vclock_stall_since, get_clock());
++        }
++    } else if (vclock_stall_since) {
++        timers_state.cpu_clock_offset += vclock_stall_since - get_clock();
++        qatomic_set(&vclock_stall_since, 0);
++    }
++    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
++                         &timers_state.vm_clock_lock);
++}
++
++static void *vclock_starve_thread(void *opaque)
++{
++    StarveState *s = opaque;
++    int64_t last = get_clock(), pause_start = 0, cooldown_until = 0;
++    int64_t paused_total = 0, longest = 0, next_log = last + 10 * NANOSECONDS_PER_SECOND;
++    int64_t next_scan = 0;
++    uint64_t pauses = 0, logged = 0;
++
++    s->self = qemu_get_thread_id();
++    for (;;) {
++        bool starved = false;
++        int64_t now;
++        int i;
++
++        g_usleep(1000);
++        now = get_clock();
++        if (now >= next_scan) {
++            vclock_starve_scan(s);
++            next_scan = now + 100 * SCALE_MS;
++        }
++        for (i = 0; i < s->nthreads; i++) {
++            StarveThread *t = &s->th[i];
++            int64_t cpu = vclock_starve_cpu_ns(t->tid);
++
++            if (cpu >= 0 && (cpu - t->last_cpu) * 4 < now - last &&
++                vclock_starve_state(t) == 'R') {
++                if (!t->starved_since) {
++                    t->starved_since = last;
++                }
++                if (now - t->starved_since >= s->thresh_ns) {
++                    starved = true;
++                }
++            } else {
++                t->starved_since = 0;
++            }
++            t->last_cpu = cpu;
++        }
++        last = now;
++
++        if (pause_start) {
++            if (!starved || now - pause_start >= s->max_ns) {
++                vclock_starve_set(false);
++                paused_total += now - pause_start;
++                longest = MAX(longest, now - pause_start);
++                if (now - pause_start >= s->max_ns) {
++                    cooldown_until = now + s->max_ns / 4;
++                }
++                pause_start = 0;
++            }
++        } else if (starved && now >= cooldown_until &&
++                   qatomic_read(&timers_state.cpu_ticks_enabled)) {
++            vclock_starve_set(true);
++            pause_start = now;
++            pauses++;
++        }
++
++        if (s->log && now >= next_log) {
++            next_log = now + 10 * NANOSECONDS_PER_SECOND;
++            if (pauses != logged) {
++                logged = pauses;
++                fprintf(stderr, "vclock-starve: %" PRIu64 " pauses, %"
++                        PRId64 " ms total, longest %" PRId64 " ms\n",
++                        pauses, paused_total / SCALE_MS, longest / SCALE_MS);
++            }
++        }
++    }
++    return NULL;
++}
++
++static void vclock_starve_start(void)
++{
++    static bool started;
++    static QemuThread thread;
++    const char *e = getenv("QEMU_VCLOCK_STARVE");
++    StarveState *s;
++
++    if (started || !e || atoi(e) <= 0 || icount_enabled()) {
++        return;
++    }
++    started = true;
++    s = g_new0(StarveState, 1);
++    s->thresh_ns = atoi(e) * SCALE_MS;
++    e = getenv("QEMU_VCLOCK_STARVE_MAX");
++    s->max_ns = (e && atoi(e) > 0 ? atoi(e) : 2000) * SCALE_MS;
++    s->log = getenv("QEMU_VCLOCK_STARVE_LOG") != NULL;
++    qemu_thread_create(&thread, "vclock-starve", vclock_starve_thread, s,
++                       QEMU_THREAD_DETACHED);
++}
++#else
++static void vclock_starve_start(void)
++{
++}
++#endif
++
+ /*
+  * enable cpu_get_ticks()
+  * Caller must hold BQL which serves as mutex for vm_clock_seqlock.
+  */
+ void cpu_enable_ticks(void)
+ {
++    vclock_starve_start();
+     seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                        &timers_state.vm_clock_lock);
+     if (!timers_state.cpu_ticks_enabled) {
+@@ -130,6 +382,7 @@
+         timers_state.cpu_ticks_offset += cpu_get_host_ticks();
+         timers_state.cpu_clock_offset = cpu_get_clock_locked();
+         timers_state.cpu_ticks_enabled = 0;
++        qatomic_set(&vclock_stall_since, 0);
+     }
+     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                          &timers_state.vm_clock_lock);

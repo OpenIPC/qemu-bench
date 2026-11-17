@@ -260,6 +260,13 @@ below.
   BQL: inline they starved the vCPUs and the flash DMA interrupts.
   Not modelled: OSD drawing (DPU), real ISP image processing.
   AX620E runs both CPUs (spin-table, CPU1 released from BL1's mailbox).
+  Guest time vs. a busy host (patch 0007): the firmware's drivers have
+  tight guest-time deadlines (SPI-NAND DMA ~200 ms, ax_venc ~1 s, ax_vo
+  draw waits). The axera machines default `QEMU_VCLOCK_STARVE=5`, which
+  freezes the virtual clock while a runnable vCPU or worker thread has
+  been off-CPU for 5 ms (`=0` turns it off, `QEMU_VCLOCK_STARVE_LOG=1`
+  logs pauses). It does not cover every case: on a host loaded far
+  beyond its cores AX620U can still miss a flash deadline.
   `QEMU_TLBI_RELAXED=1` (patch 0006) makes broadcast TLB flushes cheaper
   and roughly doubles AX620U's frame rate on a loaded host.
 - **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both

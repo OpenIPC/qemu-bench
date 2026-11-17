@@ -186,6 +186,12 @@ struct AxeraIvpsEngineState {
     uint32_t job_regs[ENGINE_SIZE / 4];
     uint32_t job_bits;          /* done bits of the job in the worker */
     uint32_t next_bits;         /* kicked again while busy: run next */
+    /*
+     * AX620E GDC: done bits of a frame's later tile kicks (empty jobs,
+     * see engine_gdc_capture()), posted with the done of the frame's job
+     * in the worker (job_tail) or of the one queued after it (next_tail).
+     */
+    uint32_t job_tail, next_tail;
     uint32_t next_regs[ENGINE_SIZE / 4];
     bool busy;
     uint32_t gen;               /* bumped on reset: drop a stale result */
@@ -206,6 +212,13 @@ struct AxeraIvpsEngineState {
      * engine_dpu_defer()).
      */
     AxeraIvpsEngineState *waiter;
+    /*
+     * AX620E DPU: a kick held for the GDC (held) is given up after
+     * dpu-hold-ms of guest time (hold_timer), see engine_dpu_defer().
+     */
+    bool held;
+    uint32_t hold_ms;
+    QEMUTimer *hold_timer;
 };
 
 /* The AX620E VPP, which the GDC streams into, and the GDC */
@@ -298,23 +311,64 @@ static void engine_tdp_done(void *opaque, int ret)
     if (s->job_gen != s->gen) {
         return;
     }
-    s->pending |= s->job_bits;
+    s->pending |= s->job_bits | s->job_tail;
+    s->job_tail = 0;
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               ENGINE_DELAY_NS);
-    if (s->next_bits) {
+    if (s->next_bits && !s->held) {    /* a held DPU kick waits on */
         uint32_t bits = s->next_bits;
 
         s->next_bits = 0;
         engine_tdp_submit(s, s->next_regs, bits);
+        s->job_tail = s->next_tail;
+        s->next_tail = 0;
     }
     if (s->waiter) {
         engine_gdc_release(s);
     }
 }
 
+/*
+ * AX620E GDC: the driver kicks a frame's tiles back to back; only the
+ * first carries the frame (the worker renders it whole), the others are
+ * empty jobs. Their done must not overtake the frame's: run as their own
+ * jobs behind a busy worker, they completed after the previous frame's
+ * job and before the current one, so ax_gdc took a frame as done (and
+ * IVPS handed it to the DPU, VENC) while the worker was still writing
+ * it. Merged into the queued job's registers, a later empty tile also
+ * replaced a queued frame. Now an empty tile's done joins the done of
+ * the frame job ahead of it (or is posted at once if there is none).
+ */
+static bool engine_gdc_tail(AxeraIvpsEngineState *s, const uint32_t *regs,
+                            uint32_t bits)
+{
+    struct AxeraGdcJob job;
+
+    if (s->pixel != PIXEL_E_GDC || regs == s->next_regs) {
+        return false;
+    }
+    engine_gdc_capture(s, &job);
+    if (job.ndst) {
+        return false;
+    }
+    if (s->next_bits) {
+        s->next_tail |= bits;
+    } else if (s->busy) {
+        s->job_tail |= bits;
+    } else {
+        s->pending |= bits;
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  ENGINE_DELAY_NS);
+    }
+    return true;
+}
+
 static void engine_tdp_submit(AxeraIvpsEngineState *s, const uint32_t *regs,
                               uint32_t bits)
 {
+    if (engine_gdc_tail(s, regs, bits)) {
+        return;
+    }
     if (s->busy) {
         memcpy(s->next_regs, regs, sizeof(s->next_regs));
         if (s->pixel == PIXEL_E_GDC) {
@@ -806,7 +860,43 @@ static bool engine_dpu_defer(AxeraIvpsEngineState *s, const uint32_t *regs,
     }
     s->next_bits = bits;
     g->waiter = s;
+    if (!s->held) {
+        s->held = true;
+        timer_mod_ns(s->hold_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                     (int64_t)s->hold_ms * SCALE_MS);
+    }
     return true;
+}
+
+/*
+ * A held DPU kick whose GDC job is still not done after dpu-hold-ms of
+ * guest time: complete it without drawing. A starved GDC worker can
+ * fall far behind the guest on a loaded host, and ax_vo waits 300-500
+ * ms for a draw (draw_worker_thread / draw_finished_thread); draws kept
+ * in flight that long met its error and channel-reset paths
+ * (refcount_t underflow in ciw_put, NULL + 0x40 in
+ * draw_finished_thread). Losing the OSD on a late frame is the lesser
+ * evil.
+ */
+static void engine_dpu_hold_expired(void *opaque)
+{
+    AxeraIvpsEngineState *s = opaque;
+
+    if (!s->held) {
+        return;
+    }
+    s->held = false;
+    if (engine_gdc && engine_gdc->waiter == s) {
+        engine_gdc->waiter = NULL;
+    }
+    if (s->debug) {
+        qemu_log("%s: kick held %u ms for the GDC, done without drawing\n",
+                 s->name, s->hold_ms);
+    }
+    s->pending |= s->next_bits;
+    s->next_bits = 0;
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              ENGINE_DELAY_NS);
 }
 
 /* Main loop, BQL held: the GDC job a DPU kick waited for is done */
@@ -816,12 +906,14 @@ static void engine_gdc_release(AxeraIvpsEngineState *g)
     uint32_t bits;
 
     g->waiter = NULL;
-    if (!s || !s->next_bits) {
+    if (!s || !s->held || !s->next_bits) {
         return;
     }
     bits = s->next_bits;
     s->next_bits = 0;
     if (!engine_dpu_defer(s, s->next_regs, bits)) {
+        s->held = false;
+        timer_del(s->hold_timer);
         engine_kick(s, s->next_regs, bits);
     }
 }
@@ -894,9 +986,13 @@ static void engine_reset(DeviceState *dev)
     s->status = 0;
     s->pending = 0;
     s->next_bits = 0;
+    s->job_tail = 0;
+    s->next_tail = 0;
     s->waiter = NULL;
+    s->held = false;
     s->gen++;
     timer_del(s->timer);
+    timer_del(s->hold_timer);
     qemu_set_irq(s->irq, 0);
 }
 
@@ -913,6 +1009,8 @@ static void engine_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_complete, s);
+    s->hold_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_dpu_hold_expired,
+                                 s);
     if (s->pixel == PIXEL_E_VPP) {
         engine_vpp = s;
     } else if (s->pixel == PIXEL_E_GDC) {
@@ -934,6 +1032,7 @@ static const Property engine_props[] = {
     DEFINE_PROP_UINT32("ack-off", AxeraIvpsEngineState, ack_off, 0),
     DEFINE_PROP_UINT32("ack-mode", AxeraIvpsEngineState, ack_mode, 0),
     DEFINE_PROP_UINT32("pixel", AxeraIvpsEngineState, pixel, 0),
+    DEFINE_PROP_UINT32("dpu-hold-ms", AxeraIvpsEngineState, hold_ms, 200),
 };
 
 static void engine_class_init(ObjectClass *klass, const void *data)
