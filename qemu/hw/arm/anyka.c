@@ -58,6 +58,8 @@
 #define AK_IRQ_L2           12
 #define AK_IRQ_GPIO         15
 #define AK_IRQ_MAC          16
+#define AK_IRQ_VENC         2
+#define AK_VENC_BASE        0x20020000
 
 /* arch/arm/tools/mach-types: anyka_ak39xx, every board file uses it. */
 #define AK_MACH_AK39XX      3892
@@ -72,7 +74,7 @@ static const struct {
     uint32_t size;
 } ak_regbanks[] = {
     { "ak-isp",     0x20000000, 0x20000 },
-    { "ak-venc",    0x20020000, 0x10000 },
+    { "ak-venc",    AK_VENC_BASE, 0x10000 },  /* EV200: ak-h8290 */
     { "ak-dac",     0x20110000, 0x8000 },
     { "ak-adc",     0x20118000, 0x8000 },
     { "ak-irda",    0x20160000, 0x10000 },
@@ -92,6 +94,7 @@ static const AkSoCConfig ak3918ev200_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_h8290         = true,
 };
 
 /* AnyCloud39EV300: mach-ak39 cpu.c AKCPU_VALUE for all three parts. */
@@ -677,13 +680,25 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     }
 
     for (n = 0; n < ARRAY_SIZE(ak_regbanks); n++) {
-        DeviceState *rb = qdev_new("hisi-regbank");
+        DeviceState *rb;
 
+        if (c->venc_h8290 && ak_regbanks[n].base == AK_VENC_BASE) {
+            continue;
+        }
+        rb = qdev_new("hisi-regbank");
         qdev_prop_set_uint32(rb, "size", ak_regbanks[n].size);
         qdev_prop_set_string(rb, "name", ak_regbanks[n].name);
         qdev_prop_set_bit(rb, "sub-word", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(rb), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(rb), 0, ak_regbanks[n].base);
+    }
+    /*
+     * EV200's video encoder, a Hantro 8290 (OpenIPC's ak-venc: "8290
+     * encoder at /dev/video0, irq 2").  EV300's Allegro core stays storage.
+     */
+    if (c->venc_h8290) {
+        sysbus_create_simple("ak-h8290", AK_VENC_BASE,
+                             qdev_get_gpio_in(irqc, AK_IRQ_VENC));
     }
     /*
      * AV100 extras (anycloud_ak3918av100_common.dtsi): the second MIPI/CSI

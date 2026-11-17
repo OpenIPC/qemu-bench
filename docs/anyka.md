@@ -72,7 +72,7 @@ appended DTB.
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
 | `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
 | `0x20000000` | ISP / VI | storage |
-| `0x20020000` | video encoder | storage |
+| `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core | EV200 `ak-h8290`, others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
 | `0x20120000` / `0x20128000` | SPI0 (boot NOR) / SPI1 | `ak-spi`, `ak-spinor` |
@@ -201,6 +201,29 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
 - **USB**: the vendor scripts load the host driver to look for a USB Wi-Fi
   dongle. As plain storage the block echoed the driver's bits back as
   connect events and the hub layer retried forever.
+- **EV200 video encoder** (`ak-h8290`): the Hantro 8290 that OpenIPC's
+  in-kernel V4L2 mem2mem driver `ak-venc` drives (`8290 encoder at
+  /dev/videoN, irq 2`); the register map is the driver's
+  `ak-venc-regs.h`, summarised at the top of `hw/misc/ak-h8290.c`. swreg0
+  reads `0x82900760`. Writing swreg14 with bit 0 set starts a job, which
+  completes 1 ms of virtual time later (the driver programs the next job
+  from its interrupt handler); swreg1 bit 0 is the line, bit 2 frame
+  ready, bit 5 buffer full, bit 3 an error. The core continues from the
+  last whole 64-bit word of the header the driver wrote (swreg22 / 23,
+  bit count in swreg37 [28:23]), and swreg24 reads back the bits written
+  from there. H.264: a slice NAL with its own start code, its header from
+  the registers (16-bit frame_num, idr_pic_id, slice type, QP against the
+  PPS QP, deblocking), I_16x16 / P (skip, inter, intra) macroblocks from
+  `hantro-h264.c`, predicted from the reference store the driver names and
+  reconstructed into the other, so the driver's store rotation matters as
+  on silicon. JPEG: `jpeg-enc.c`'s 4:2:0 scan with the quantisers from
+  swreg64..95, Annex K tables, EOI. Input I420 (or NV12), height not a
+  multiple of 16 through the bottom overfill. Not modelled: the core's
+  own rate control (MAD QP adjustment, checkpoints, ROI: the frame is
+  coded at the initial QP), the clock gate / soft reset (the id reads
+  regardless), slices, restart markers, rotation, RGB input.
+  `-global ak-h8290.dump-dir=DIR` keeps each job. `qemu/tests/test-ak-h8290.py`
+  plays the driver under qtest and decodes the result with ffmpeg.
 
 ## AK3918AV130
 
@@ -320,7 +343,8 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 
 ## Not modelled
 
-The MCI's L2 DMA data path, ISP, video encoder, audio codec, SAR ADC. No
+The MCI's L2 DMA data path, ISP, the EV300 / EV330 video encoder (EV200's
+is `ak-h8290`), audio codec, SAR ADC. No
 sensor models are attached to I2C yet. On the AV100 the second MIPI/CSI
 input, the NPU (`0x21300000`) and the video pipe (`0x212`--`0x215`) are the
 `ak-apb` catch-all (reads 0): the vendor modules probe and map them but no

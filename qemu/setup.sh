@@ -111,6 +111,7 @@ cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-l2.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-ddrc.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-av130-intc.c     "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/ak-h8290.c          "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/ak-l2.h     "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/char/ak-uart.c           "$QEMU_DIR/hw/char/"
 cp qemu/hw/ssi/ak-spi.c             "$QEMU_DIR/hw/ssi/"
@@ -701,6 +702,17 @@ if ! grep -q "'anyka.c'" "$QEMU_DIR/hw/arm/meson.build"; then
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added anyka.c"
 fi
+# EV200's Hantro 8290 (ak-h8290.c) codes with the shared software
+# encoders; guarded per machine as for Ambarella, so an Anyka-only
+# configuration links without CONFIG_XIONGMAI.
+for b in ak-h8290.c jpeg-enc.c hantro-h264.c; do
+    if ! grep -q "CONFIG_ANYKA', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for ANYKA"
+    fi
+done
 
 # SigmaStar (MStar) ARMv7: Cortex-A7 SoCs behind the RIU (hw/arm/sigmastar.c).
 # Same guarded appends as Anyka, for a fresh tree and an existing one alike.

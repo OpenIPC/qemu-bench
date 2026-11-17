@@ -46,6 +46,8 @@ typedef struct AkSoCConfig {
      */
     bool        av130;
     uint32_t    chip_id_av;     /* the AV130's chip ID, SYSCTRL +0x3FC */
+    /* EV200: the Hantro 8290 video encoder at 0x20020000 (ak-h8290) */
+    bool        venc_h8290;
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */
