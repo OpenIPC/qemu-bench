@@ -35,6 +35,8 @@ typedef struct ImageSensorSpec {
     uint32_t pclk;      /* SMARTSENS: pixel clock, when known: frame timing */
     uint16_t hts;       /* SMARTSENS: HTS at reset, where a mode leaves it */
     bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
+    uint16_t gain_hcg;  /* SMARTSENS: the SC465SL's gain layout, its HCG
+                         * factor in 1/1024 */
 } ImageSensorSpec;
 
 /* GalaxyCore's register pairs; OmniVision's OV27x5/OV97x5 have the same */
@@ -98,6 +100,15 @@ static const ImageSensorSpec image_sensors[] = {
      */
     { "sc4336p", SMARTSENS, 0x30, 0x9C42, .pclk = 126000000, .hts = 2800,
       .exp_rows = true },
+    /*
+     * GK7206 SDK smartsens_sc465sl: 27 MHz in, 2560x1440 12-bit; its 30 fps
+     * modes write HTS 0x546 x VTS 0xA6A, so 1350 x 2666 x 30 = 108 Mpixel/s.
+     * The ID (0x3107:0x3108 = 0xBD82) is what XM's App compares against.
+     * Its exposure counts rows (sc465sl.c: max VTS - 8), its gains are
+     * again_table / dgain_table's layout, HCG x3.41 (3492 / 1024).
+     */
+    { "sc465sl", SMARTSENS, 0x30, 0xBD82, .pclk = 108000000, .hts = 1350,
+      .exp_rows = true, .gain_hcg = 3492 },
     SC("sc501ai", 0xCE1F),
     SC("sc5035", 0x5035),
     SC("sc5238", 0x5235),
@@ -164,6 +175,7 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint32(dev, "pclk", spec->pclk);
         qdev_prop_set_uint16(dev, "hts", spec->hts);
         qdev_prop_set_bit(dev, "exp-rows", spec->exp_rows);
+        qdev_prop_set_uint16(dev, "gain-hcg", spec->gain_hcg);
     } else if (!strcmp(spec->type, OV2735)) {
         qdev_prop_set_uint8(dev, "rev", spec->id);
     }

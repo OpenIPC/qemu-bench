@@ -255,17 +255,24 @@ cp qemu/hw/misc/hisi-fmc.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-himci.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-regbank.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-aiao.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-aiao.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-sfc350.c      "$QEMU_DIR/hw/misc/"
-cp qemu/hw/misc/hisi-vedu.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-vedu.c qemu/hw/misc/hisi-vedu-xm.c.inc "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vpss.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vi.c           "$QEMU_DIR/hw/misc/"
+# XMedia lotus SPC030 media (GK7206 xmorca): VI, VPSS, VGS
+cp qemu/hw/misc/lotus-vi.c qemu/hw/misc/lotus-vpss.c qemu/hw/misc/lotus-vgs.c \
+                                    "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-scene.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-ive-npu.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-ive-ops.c      "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/hisi-ive-ops.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/include/hw/misc/hisi-scene.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/include/hw/misc/lotus-vpss.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/hisi-mipi-rx.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-rtc.c          "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/lotus-rtc.c         "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/lotus-wdt.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-ive.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-nnie.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-hwrng.c        "$QEMU_DIR/hw/misc/"
@@ -277,6 +284,7 @@ cp qemu/hw/misc/hisi-ddrc-v1.c     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/net/hisi-femac.c         "$QEMU_DIR/hw/net/"
 cp qemu/hw/net/hisi-gmac.c          "$QEMU_DIR/hw/net/"
 cp qemu/hw/net/hisi-hieth-sf.c      "$QEMU_DIR/hw/net/"
+cp qemu/hw/net/ftgmac030.c          "$QEMU_DIR/hw/net/"
 cp qemu/hw/i2c/hisi-i2c.c          "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-imx335.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-imx307.c       "$QEMU_DIR/hw/i2c/"
@@ -922,8 +930,9 @@ else
 fi
 
 # shared coders for hisi-vedu: H.264 slices (H.265 slices, JPEG scans);
-# hisi-aiao, the V4 audio DMA
-for b in hantro-h264.c hevc-enc.c jpeg-enc.c hisi-aiao.c; do
+# hisi-aiao, the V4 audio DMA; xm-aiao, XM's (GK7206V11A)
+# lotus-rtc/lotus-wdt, GK7206 (xmorca) RTC and 3-core SP805 watchdog block
+for b in hantro-h264.c hevc-enc.c jpeg-enc.c hisi-aiao.c xm-aiao.c lotus-rtc.c lotus-wdt.c; do
     if ! grep -q "CONFIG_HISI_MISC', if_true: files('$b')" \
             "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('$b'))" \
@@ -934,7 +943,7 @@ done
 
 # hw/misc/meson.build
 if ! grep -q hisi-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c', 'hisi-vpss.c', 'hisi-vi.c', 'hisi-scene.c', 'hisi-ive-npu.c', 'hisi-ive-ops.c'))" \
+    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c', 'hisi-vpss.c', 'hisi-vi.c', 'hisi-scene.c', 'hisi-ive-npu.c', 'hisi-ive-ops.c', 'lotus-vi.c', 'lotus-vpss.c', 'lotus-vgs.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  patched hw/misc/meson.build"
 else
@@ -994,6 +1003,11 @@ else
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added hisi-ive-ops.c"
     fi
+    if ! grep -q "'lotus-vi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+        sed -i "s/'hisi-ive-ops.c'/'hisi-ive-ops.c', 'lotus-vi.c', 'lotus-vpss.c', 'lotus-vgs.c'/" \
+            "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added lotus-vi.c, lotus-vpss.c, lotus-vgs.c"
+    fi
 fi
 
 # hw/net/Kconfig
@@ -1043,6 +1057,12 @@ if ! grep -q hisi-gmac "$QEMU_DIR/hw/net/meson.build"; then
     echo "  patched hw/net/meson.build (gmac)"
 else
     echo "  hw/net/meson.build already has gmac"
+fi
+# Faraday FTGMAC030 (GK7206 xmorca) — built with the HiSilicon FEMAC symbol
+if ! grep -q ftgmac030 "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_HISI_FEMAC', if_true: files('ftgmac030.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  patched hw/net/meson.build (ftgmac030)"
 fi
 if ! grep -q hisi-hieth-sf "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_HISI_HIETH_SF', if_true: files('hisi-hieth-sf.c'))" \

@@ -63,6 +63,46 @@
 /* Register region size */
 #define GZIP_REG_SIZE       0x8000
 
+/*
+ * Register layouts.  Goke GK7206 (xmorca) has the same engine with its
+ * registers moved and the interrupt bits at [11:10] -- task at 11, block
+ * at 10 -- rather than [1:0] (task at 0, block at 1): the SDK's
+ * u-boot-2020.01 lotus/hw_dec/hw_decompress_v1.h.  Its offsets are
+ * translated to the canonical ones above.
+ */
+#define GZIP_LAYOUT_V4      0
+#define GZIP_LAYOUT_XMORCA  1
+#define XMORCA_INT_TASK     (1u << 11)
+#define XMORCA_INT_BLOCK    (1u << 10)
+
+static hwaddr hisi_gzip_xmorca_to_canonical(hwaddr off)
+{
+    switch (off) {
+    case 0x0110: return EAMR_RID;
+    case 0x0114: return EAMR_ROSD;
+    case 0x0118: return EAMR_WORK_EN;
+    case 0x0128: return EAMR_WID;
+    case 0x012C: return EAMR_WOSD;
+    case 0x0130: return INT_EN;
+    case 0x013C: return INT_STATUS;
+    case 0x0148: return INT_CLEAR;
+    case 0x2030: return DPRS_DATA_INFO_BADDR;
+    case 0x2034: return DPRS_DATA_INFO_LEN;
+    case 0x2038: return DPRS_DATA_RTN_BADDR;
+    case 0x203C: return DPRS_DATA_RTN_LEN;
+    case 0x2040: return DPRS_DATA_CRC32;
+    case 0x2058: return DPRS_DATA_SRC_BADDR;
+    case 0x205C: return DPRS_DATA_SRC_LEN;
+    case 0x2090: return DPRS_RTN_LEN;
+    case 0x2098: return BUF_INFO;
+    case 0x209C: return DPRS_RTN_INFO;
+    case 0x20A8: return BUF_INFO_CLR;
+    case 0x20AC: return RLT_INFO_CLR;
+    case 0x4018: return CRC_CHECK_EN;
+    default:     return off | 0x10000;   /* no canonical twin: unknown */
+    }
+}
+
 /* ── Device state ──────────────────────────────────────────────────── */
 
 #define TYPE_HISI_GZIP "hisi-gzip"
@@ -115,6 +155,8 @@ struct HisiGzipState {
      * every SoC currently using this device has the 8 KiB hardware.
      */
     uint32_t max_window_bytes;
+
+    uint32_t layout;          /* GZIP_LAYOUT_V4 or GZIP_LAYOUT_XMORCA */
 };
 
 /* ── Decompress engine ─────────────────────────────────────────────── */
@@ -285,10 +327,27 @@ static void hisi_gzip_do_decompress(HisiGzipState *s, uint32_t src_len_reg)
 
 /* ── Register access ───────────────────────────────────────────────── */
 
+static uint64_t hisi_gzip_read_canonical(HisiGzipState *s, hwaddr offset);
+
 static uint64_t hisi_gzip_read(void *opaque, hwaddr offset, unsigned size)
 {
     HisiGzipState *s = HISI_GZIP(opaque);
+    uint64_t val;
 
+    if (s->layout != GZIP_LAYOUT_XMORCA) {
+        return hisi_gzip_read_canonical(s, offset);
+    }
+    offset = hisi_gzip_xmorca_to_canonical(offset);
+    val = hisi_gzip_read_canonical(s, offset);
+    if (offset == INT_STATUS || offset == INT_EN) {
+        val = ((val & 1) ? XMORCA_INT_TASK : 0) |
+              ((val & 2) ? XMORCA_INT_BLOCK : 0);
+    }
+    return val;
+}
+
+static uint64_t hisi_gzip_read_canonical(HisiGzipState *s, hwaddr offset)
+{
     switch (offset) {
     case EAMR_WORK_EN:      return s->work_en;
     case EAMR_RID:          return s->eamr_rid;
@@ -318,7 +377,7 @@ static uint64_t hisi_gzip_read(void *opaque, hwaddr offset, unsigned size)
     default:
         qemu_log_mask(LOG_UNIMP,
                       "hisi-gzip: read from unknown reg 0x%04x\n",
-                      (unsigned)offset);
+                      (unsigned)(offset & 0xffff));
         return 0;
     }
 }
@@ -327,6 +386,14 @@ static void hisi_gzip_write(void *opaque, hwaddr offset,
                              uint64_t value, unsigned size)
 {
     HisiGzipState *s = HISI_GZIP(opaque);
+
+    if (s->layout == GZIP_LAYOUT_XMORCA) {
+        offset = hisi_gzip_xmorca_to_canonical(offset);
+        if (offset == INT_EN || offset == INT_CLEAR) {
+            value = ((value & XMORCA_INT_TASK) ? 1 : 0) |
+                    ((value & XMORCA_INT_BLOCK) ? 2 : 0);
+        }
+    }
 
     switch (offset) {
     case EAMR_WORK_EN:      s->work_en = value; break;
@@ -368,7 +435,7 @@ static void hisi_gzip_write(void *opaque, hwaddr offset,
     default:
         qemu_log_mask(LOG_UNIMP,
                       "hisi-gzip: write 0x%08x to unknown reg 0x%04x\n",
-                      (unsigned)value, (unsigned)offset);
+                      (unsigned)value, (unsigned)(offset & 0xffff));
         break;
     }
 }
@@ -400,6 +467,8 @@ static const Property hisi_gzip_properties[] = {
      * decompress path).  See openhisilicon#85. */
     DEFINE_PROP_UINT32("max-window-bytes", HisiGzipState,
                        max_window_bytes, 8192),
+    /* 0 = V4 / V5 register map, 1 = Goke GK7206 (xmorca) moved map. */
+    DEFINE_PROP_UINT32("layout", HisiGzipState, layout, GZIP_LAYOUT_V4),
 };
 
 static void hisi_gzip_class_init(ObjectClass *klass, const void *data)

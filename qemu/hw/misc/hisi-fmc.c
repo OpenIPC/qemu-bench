@@ -63,8 +63,11 @@
 #define FMC_OP_WRITE_DATA_EN    BIT(5)
 #define FMC_OP_ADDR_EN          BIT(6)
 #define FMC_OP_CMD1_EN          BIT(7)
-/* fmc100 shuffles OP: bit1 is ADDR_EN there, not READ_STATUS_EN. */
+/* fmc100 shuffles OP: bit1 is ADDR_EN there, not READ_STATUS_EN, which
+ * moved to bit6 (the SDK kernel's lotus/drivers/mtd/fmc100/fmc100_reg.h,
+ * LOTUS_FMC100_OP_READ_STATUS_EN 0x40; U-Boot's fmc_common.h agrees). */
 #define FMC100_OP_ADDR_EN       BIT(1)
+#define FMC100_OP_READ_STATUS_EN BIT(6)
 
 /* FMC_OP_CFG bits */
 #define FMC_OP_CFG_FM_CS_SHIFT  11
@@ -131,6 +134,7 @@ static hwaddr fmc100_to_canonical(hwaddr off)
 #define SPI_CMD_FAST_READ     0x0B
 #define SPI_CMD_PAGE_PROGRAM  0x02
 #define SPI_CMD_SECTOR_ERASE  0xD8
+#define SPI_CMD_ERASE_4K      0x20
 #define SPI_CMD_CHIP_ERASE    0xC7
 
 /* SPI NAND specific commands */
@@ -558,6 +562,7 @@ static bool hisi_fmc_exec_nor_reg_op(HisiFmcState *s)
         }
         break;
 
+    case SPI_CMD_ERASE_4K:
     case SPI_CMD_SECTOR_ERASE: {
         /* Two callers, two conventions, and FMC_OP.ADDR_EN is what tells
          * them apart.
@@ -590,8 +595,10 @@ static bool hisi_fmc_exec_nor_reg_op(HisiFmcState *s)
                 erase_addr = (erase_addr << 8) | s->iobuf[i];
             }
         }
-        uint32_t base = erase_addr & ~(NOR_SECTOR_SIZE - 1);
-        uint32_t end = base + NOR_SECTOR_SIZE;
+        /* 0x20 erases a 4 KiB sector: XM's app saves its config that way */
+        uint32_t esz = spi_cmd == SPI_CMD_ERASE_4K ? 4096 : NOR_SECTOR_SIZE;
+        uint32_t base = erase_addr & ~(esz - 1);
+        uint32_t end = base + esz;
         if (end > s->flash_size) {
             end = s->flash_size;
         }
@@ -1018,11 +1025,16 @@ static void hisi_fmc_ctrl_write(void *opaque, hwaddr offset,
         s->iobuf_valid = false;
         s->op = value;
         if (value & FMC_OP_REG_OP_START) {
-            /* On fmc100 bit1 is ADDR_EN, not READ_STATUS_EN — always dispatch
-             * by SPI command (READ_STATUS 0x05 lands the SR in iobuf, which the
-             * driver reads back from the memory window like every other op). */
-            if (s->variant != FMC_VARIANT_FMC100 &&
-                (value & FMC_OP_READ_STATUS_EN)) {
+            /* On fmc100 bit1 is ADDR_EN and READ_STATUS_EN is bit6.  A
+             * READ_STATUS (05h) sent as an ordinary command lands the SR in
+             * iobuf, which the driver reads back from the memory window
+             * like every other op; the status op latches FMC_STATUS, which
+             * U-Boot's write-enable check reads ("Write Enable failed!
+             * status: 0x0" and no saveenv when it stayed 0). */
+            uint32_t rdsr_en = (s->variant == FMC_VARIANT_FMC100)
+                               ? FMC100_OP_READ_STATUS_EN
+                               : FMC_OP_READ_STATUS_EN;
+            if (value & rdsr_en) {
                 /* The controller issues RDSR (05h) on its own and latches SR1
                  * into FMC_STATUS; FMC_CMD is not consulted.  The vendor
                  * drivers rely on that and leave FMC_CMD holding the previous
@@ -1034,6 +1046,9 @@ static void hisi_fmc_ctrl_write(void *opaque, hwaddr offset,
                  * (SR1 0x02) and SR3 0x08, FMC_STATUS reads 0x02 with FMC_CMD
                  * = 15h as with 05h. */
                 s->status = s->sr;
+                if (s->variant == FMC_VARIANT_FMC100) {
+                    s->iobuf[0] = s->sr;
+                }
                 s->iobuf_valid = true;
             } else {
                 /* Only mark iobuf valid if the command actually wrote to it.

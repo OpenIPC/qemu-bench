@@ -21,6 +21,17 @@ size_t jpeg_enc_scan(const uint8_t *y, int ys, const uint8_t *cb,
                      const uint8_t ql[64], const uint8_t qc[64], bool eoi,
                      uint8_t *out, size_t cap, bool *overflow);
 
+/*
+ * The same with the luma Huffman tables for chroma too if chroma_luma_huff
+ * (Xiongmai's JPEG driver writes Annex K's luma DC / AC tables as tables
+ * 1 as well).
+ */
+size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
+                          const uint8_t *cr, int cs, int w, int h,
+                          const uint8_t ql[64], const uint8_t qc[64],
+                          bool chroma_luma_huff, bool eoi,
+                          uint8_t *out, size_t cap, bool *overflow);
+
 /* SOI, DQT, SOF0, DHT (Annex K) and SOS for such a scan */
 void jpeg_enc_header(GByteArray *b, int w, int h, const uint8_t ql[64],
                      const uint8_t qc[64]);

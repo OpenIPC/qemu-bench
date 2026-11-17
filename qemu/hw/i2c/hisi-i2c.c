@@ -52,6 +52,7 @@
 #include "qemu/module.h"
 
 #define TYPE_HISI_I2C "hisi-i2c"
+#define TYPE_LOTUS_I2C "lotus-i2c"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiI2cState, HISI_I2C)
 
 #define HISI_I2C_REG_SIZE   0x1000
@@ -155,6 +156,8 @@ struct HisiI2cState {
     bool         pending_start;
     bool         pending_restart;
     uint32_t     pc;
+
+    bool         lotus;      /* XMedia lotus register layout */
 };
 
 static void hisi_i2c_update_irq(HisiI2cState *s)
@@ -345,7 +348,7 @@ static void hisi_i2c_run(HisiI2cState *s)
     hisi_i2c_finish_program(s);
 }
 
-static uint64_t hisi_i2c_read(void *opaque, hwaddr offset, unsigned size)
+static uint64_t hisi_i2c_do_read(void *opaque, hwaddr offset, unsigned size)
 {
     HisiI2cState *s = HISI_I2C(opaque);
 
@@ -417,8 +420,8 @@ static uint64_t hisi_i2c_read(void *opaque, hwaddr offset, unsigned size)
     }
 }
 
-static void hisi_i2c_write(void *opaque, hwaddr offset,
-                           uint64_t value, unsigned size)
+static void hisi_i2c_do_write(void *opaque, hwaddr offset,
+                              uint64_t value, unsigned size)
 {
     HisiI2cState *s = HISI_I2C(opaque);
 
@@ -519,6 +522,124 @@ static void hisi_i2c_write(void *opaque, hwaddr offset,
     }
 }
 
+/*
+ * XMedia "lotus" I2C (GK7206 / xmorca: compatible "lotus,lotus-i2c",
+ * drivers/i2c/busses/i2c-lotus.c in the SDK's lotus kernel tree).  The
+ * same command sequencer as HiBVT, with the registers at other offsets
+ * and the STAT, interrupt and CTRL2 bits renumbered:
+ *
+ *   lotus  0x00 GLB   0x04 CTRL1  0x08 CTRL2  0x0C STAT  0x10 TXF
+ *          0x14 RXF   0x18 TX_WATER  0x1C RX_WATER  0x20 SCL_H
+ *          0x24 SCL_L 0x28 DATA1  0x30 INTR_RAW  0x34 INTR_EN
+ *          0x38 INTR_STAT  0x40..0xBC 32 command slots
+ *          0xC0 LOOP1  0xC4 DST1  0xC8 LOOP2  0xCC DST2
+ *   STAT   bit 0 RX FIFO not empty, bit 3 TX FIFO not full
+ *   INTR   bits 0,3 abort, bit 4 command done, bit 5 RX, bit 6 TX
+ *   CTRL2  bit 5 SDA in
+ *
+ * The driver polls (no interrupt in the DTS): STAT for the FIFOs and
+ * INTR_RAW for done/abort.  Offsets are translated to the HiBVT ones and
+ * the bits remapped both ways, so the sequencer is shared.
+ */
+static hwaddr lotus_i2c_offset(hwaddr o)
+{
+    if (o >= 0x40 && o < 0xC0) {
+        return R_CMD_BASE + (o - 0x40);
+    }
+    switch (o) {
+    case 0x00: return R_GLB;
+    case 0x04: return R_CTRL1;
+    case 0x08: return R_CTRL2;
+    case 0x0C: return R_STAT;
+    case 0x10: return R_TXF;
+    case 0x14: return R_RXF;
+    case 0x18: return R_TX_WATER;
+    case 0x1C: return R_RX_WATER;
+    case 0x20: return R_SCL_H;
+    case 0x24: return R_SCL_L;
+    case 0x28: return R_DATA1;
+    case 0x30: return R_INTR_RAW;
+    case 0x34: return R_INTR_EN;
+    case 0x38: return R_INTR_STAT;
+    case 0xC0: return R_LOOP1;
+    case 0xC4: return R_DST1;
+    case 0xC8: return R_LOOP2;
+    case 0xCC: return R_DST2;
+    }
+    return HISI_I2C_REG_SIZE;           /* logged as a bad offset */
+}
+
+/* HiBVT interrupt bits -> lotus (abort 0|11 -> 0|3, done 12 -> 4,
+ * RX 2 -> 5, TX 4 -> 6). */
+static uint32_t lotus_intr_out(uint32_t v)
+{
+    return ((v & (1U << 0)) ? 1U << 0 : 0) | ((v & (1U << 11)) ? 1U << 3 : 0) |
+           ((v & INTR_CMD_DONE) ? 1U << 4 : 0) |
+           ((v & INTR_RX_MASK) ? 1U << 5 : 0) |
+           ((v & INTR_TX_MASK) ? 1U << 6 : 0);
+}
+
+static uint32_t lotus_intr_in(uint32_t v)
+{
+    return ((v & (1U << 0)) ? 1U << 0 : 0) | ((v & (1U << 3)) ? 1U << 11 : 0) |
+           ((v & (1U << 4)) ? INTR_CMD_DONE : 0) |
+           ((v & (1U << 5)) ? INTR_RX_MASK : 0) |
+           ((v & (1U << 6)) ? INTR_TX_MASK : 0);
+}
+
+static uint64_t hisi_i2c_read(void *opaque, hwaddr offset, unsigned size)
+{
+    HisiI2cState *s = HISI_I2C(opaque);
+    hwaddr o;
+    uint32_t v;
+
+    if (!s->lotus) {
+        return hisi_i2c_do_read(opaque, offset, size);
+    }
+    o = lotus_i2c_offset(offset);
+    if (o == HISI_I2C_REG_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "lotus-i2c: bad read offset 0x%x\n", (int)offset);
+        return 0;
+    }
+    v = hisi_i2c_do_read(opaque, o, size);
+    switch (o) {
+    case R_STAT:
+        return ((v & STAT_RXF_NOE) ? 1U << 0 : 0) |
+               ((v & STAT_TXF_NOF) ? 1U << 3 : 0);
+    case R_INTR_RAW:
+    case R_INTR_EN:
+    case R_INTR_STAT:
+        return lotus_intr_out(v);
+    case R_CTRL2:
+        return (v & ~CTRL2_SDA_IN) | (1U << 5);
+    }
+    return v;
+}
+
+static void hisi_i2c_write(void *opaque, hwaddr offset,
+                           uint64_t value, unsigned size)
+{
+    HisiI2cState *s = HISI_I2C(opaque);
+    hwaddr o;
+
+    if (!s->lotus) {
+        hisi_i2c_do_write(opaque, offset, value, size);
+        return;
+    }
+    o = lotus_i2c_offset(offset);
+    if (o == HISI_I2C_REG_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "lotus-i2c: bad write offset 0x%x val=0x%x\n",
+                      (int)offset, (unsigned)value);
+        return;
+    }
+    if (o == R_INTR_RAW || o == R_INTR_EN) {
+        value = lotus_intr_in(value);
+    }
+    hisi_i2c_do_write(opaque, o, value, size);
+}
+
 static const MemoryRegionOps hisi_i2c_ops = {
     .read  = hisi_i2c_read,
     .write = hisi_i2c_write,
@@ -587,9 +708,21 @@ static const TypeInfo hisi_i2c_info = {
     .class_init    = hisi_i2c_class_init,
 };
 
+static void lotus_i2c_init(Object *obj)
+{
+    HISI_I2C(obj)->lotus = true;
+}
+
+static const TypeInfo lotus_i2c_info = {
+    .name          = TYPE_LOTUS_I2C,
+    .parent        = TYPE_HISI_I2C,
+    .instance_init = lotus_i2c_init,
+};
+
 static void hisi_i2c_register_types(void)
 {
     type_register_static(&hisi_i2c_info);
+    type_register_static(&lotus_i2c_info);
 }
 
 type_init(hisi_i2c_register_types)

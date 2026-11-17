@@ -61,6 +61,7 @@ struct HisiSmartSensState {
     uint32_t pclk;         /* pixel clock: HTS x VTS / pclk is the frame */
     uint16_t hts;          /* 0x320C/D at reset (0: none) */
     bool     exp_rows;     /* 0x3E00-02 counts rows, not half rows */
+    uint16_t gain_hcg;     /* the SC465SL's gains: its HCG factor, 1/1024 */
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -83,6 +84,7 @@ struct HisiSmartSensState {
 static const uint16_t ss_latched[] = {
     0x3E00, 0x3E01, 0x3E02, 0x3E06, 0x3E07, 0x3E08, 0x3E09,
     0x320E, 0x320F, 0x3301, 0x3632,
+    0x3E20, 0x326D,     /* the SC465SL's exposure / frame length, bits 19+ */
 };
 #define SS_GROUP_HOLD       0x3812
 
@@ -251,6 +253,26 @@ static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
         e->gain = gain * 1024;
     }
     e->vts = R16(0x320E);
+    if (s->gain_hcg) {
+        /*
+         * The SC465SL (GK7206 SDK sc465sl.c): rows in 0x3E20:0x3E00:
+         * 0x3E01:0x3E02[7:4] (sc465sl_update_inttime), the frame length's
+         * bits 23:16 in 0x326D; analog gain 0x3E08:0x3E09 as its
+         * again_table: coarse 0x3E08[3:0] + 1 (0, 1, 3, 7, F: x1 .. x16),
+         * bit 7 the HCG (x3.41), fine 0x3E09 / 0x20; digital gain
+         * 0x3E06[3:0] + 1 times 0x3E07 / 0x80 (dgain_table).
+         */
+        uint8_t fine = R(0x3E09) ? R(0x3E09) : 0x20;
+        uint8_t dig = R(0x3E07) ? R(0x3E07) : 0x80;
+        double gain = ((R(0x3E08) & 0xF) + 1) * (fine / 32.0) *
+                      (R(0x3E08) & 0x80 ? s->gain_hcg / 1024.0 : 1.0) *
+                      ((R(0x3E06) & 0xF) + 1) * (dig / 128.0);
+
+        e->lines = (uint32_t)R(0x3E20) << 20 | R(0x3E00) << 12 |
+                   R(0x3E01) << 4 | R(0x3E02) >> 4;
+        e->gain = gain * 1024;
+        e->vts |= (uint32_t)R(0x326D) << 16;
+    }
     e->width = R16(0x3208);
     e->height = R16(0x320A);
 #undef R16
@@ -395,6 +417,8 @@ static const Property hisi_smartsens_props[] = {
     /* the exposure registers count whole rows (the SC4336P: its driver
      * bounds them by VTS - 10), not half rows as most parts do */
     DEFINE_PROP_BOOL("exp-rows", HisiSmartSensState, exp_rows, false),
+    /* not 0: the SC465SL's gain registers, with this HCG factor (1/1024) */
+    DEFINE_PROP_UINT16("gain-hcg", HisiSmartSensState, gain_hcg, 0),
 };
 
 /* What the guest programmed: the register file and the address pointer. */

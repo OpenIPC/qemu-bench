@@ -9,6 +9,9 @@
  * soft-reset request bit of that register drives the "cpu1-reset" GPIO
  * output (1 = held in reset).  The machine wires it to CPU1's power
  * state, so the kernel releasing the bit starts CPU1 like silicon does.
+ * "cpu-srst-mask" picks the bits that hold CPU1 in reset (any set = in
+ * reset; default bit 2) and "cpu-srst-reset" the register's reset value,
+ * for the SoCs that moved them (Goke xmorca: bits 7 and 20).
  *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
@@ -55,7 +58,9 @@ struct HisiCrgState {
     uint32_t cpu_srst_offset;   /* 0 = disabled, e.g. 0x78 for CV500 */
     uint32_t pll_lock_offset;   /* per-PLL lock status, 0 = none */
     uint32_t pll_lock_bits;     /* bits that read as locked there */
-    qemu_irq cpu1_reset;        /* CPU1_SRST_REQ level, 1 = in reset */
+    uint32_t cpu_srst_mask;     /* bits holding CPU1 in reset */
+    uint32_t cpu_srst_reset;    /* that register's reset value */
+    qemu_irq cpu1_reset;        /* CPU1 reset level, 1 = in reset */
     /*
      * Reset handshakes: a write to one of these mirrors its bit 0 into
      * the register after it at once.  The V5 sys driver resets VPSS
@@ -64,6 +69,14 @@ struct HisiCrgState {
      */
     uint32_t num_rst_ack;
     uint32_t *rst_ack;
+    /*
+     * One reset status register that reports each block's reset request
+     * back (xmorca: CRG+0x1e4).  Each rst-sta entry is
+     * request offset << 16 | request bit << 8 | status bit.
+     */
+    uint32_t rst_sta_offset;
+    uint32_t num_rst_sta;
+    uint32_t *rst_sta;
 };
 
 static bool is_pll_status_reg(hwaddr offset)
@@ -106,6 +119,27 @@ static uint64_t hisi_crg_read(void *opaque, hwaddr offset, unsigned size)
         val |= s->pll_lock_bits;
     }
 
+    /*
+     * Reset status: each mapped bit reads 1 while its block's reset
+     * request is set; several requests may share a bit (xmorca's IVE and
+     * GDC both read bit 5).
+     */
+    if (s->rst_sta_offset && offset == s->rst_sta_offset) {
+        uint32_t i;
+
+        for (i = 0; i < s->num_rst_sta; i++) {
+            val &= ~(1u << (s->rst_sta[i] & 31));
+        }
+        for (i = 0; i < s->num_rst_sta; i++) {
+            uint32_t req = s->rst_sta[i] >> 16;
+            uint32_t rbit = (s->rst_sta[i] >> 8) & 31;
+
+            if (req < HISI_CRG_REG_SIZE && (s->regs[req / 4] >> rbit) & 1) {
+                val |= 1u << (s->rst_sta[i] & 31);
+            }
+        }
+    }
+
     return val;
 }
 
@@ -142,8 +176,8 @@ static void hisi_crg_write(void *opaque, hwaddr offset,
      * CPU.
      */
     if (s->cpu_srst_offset && offset == s->cpu_srst_offset &&
-        ((old ^ (uint32_t)val) & CPU1_SRST_REQ)) {
-        qemu_set_irq(s->cpu1_reset, !!(val & CPU1_SRST_REQ));
+        !(old & s->cpu_srst_mask) != !(val & s->cpu_srst_mask)) {
+        qemu_set_irq(s->cpu1_reset, !!(val & s->cpu_srst_mask));
     }
 }
 
@@ -175,15 +209,22 @@ static void hisi_crg_reset(DeviceState *dev)
      * Only reinitialize the CPU reset register for SMP bringup detection.
      */
     if (s->cpu_srst_offset) {
-        s->regs[s->cpu_srst_offset / 4] = CPU1_SRST_REQ | DBG1_SRST_REQ;
+        s->regs[s->cpu_srst_offset / 4] = s->cpu_srst_reset;
     }
 }
 
 static const Property hisi_crg_properties[] = {
     DEFINE_PROP_UINT32("cpu-srst-offset", HisiCrgState, cpu_srst_offset, 0),
+    DEFINE_PROP_UINT32("cpu-srst-mask", HisiCrgState, cpu_srst_mask,
+                       CPU1_SRST_REQ),
+    DEFINE_PROP_UINT32("cpu-srst-reset", HisiCrgState, cpu_srst_reset,
+                       CPU1_SRST_REQ | DBG1_SRST_REQ),
     DEFINE_PROP_UINT32("pll-lock-offset", HisiCrgState, pll_lock_offset, 0),
     DEFINE_PROP_UINT32("pll-lock-bits", HisiCrgState, pll_lock_bits, 0),
     DEFINE_PROP_ARRAY("rst-ack", HisiCrgState, num_rst_ack, rst_ack,
+                      qdev_prop_uint32, uint32_t),
+    DEFINE_PROP_UINT32("rst-sta-offset", HisiCrgState, rst_sta_offset, 0),
+    DEFINE_PROP_ARRAY("rst-sta", HisiCrgState, num_rst_sta, rst_sta,
                       qdev_prop_uint32, uint32_t),
 };
 
