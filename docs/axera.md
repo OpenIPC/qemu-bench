@@ -249,9 +249,17 @@ below.
     H.264/HEVC/JPEG encoder, run in a worker thread (`AXERA_VCMD_SYNC=1`
     runs it inline). If a source picture is still empty it paints the
     scene itself.
-  Not modelled: ISP 3A statistics, so the App's auto exposure judges
-  the scene dark and switches to night mode (reduced frame rate, the
-  occasional "zero bitrate" log); OSD drawing; audio.
+  - AE statistics: written from the painted scene scaled by the
+    sensor's programmed exposure x gain (AX620E: ITP AE grid +
+    histogram; AX620U: the IFE raw-downscaler frame its App's CPU 3A
+    reads), so auto exposure settles on daylight instead of night mode.
+  - Audio (`axera-i2s`, Synopsys DW I2S): capture is a 400 Hz tone
+    (PCMA in the RTSP stream), playback is drained and discarded.
+    AX620E moves it by AX_DMAPER, AX620U by interrupt.
+  Pixel jobs (TDP, GDC->VPP, encoder) run in worker threads, off the
+  BQL: inline they starved the vCPUs and the flash DMA interrupts.
+  Not modelled: OSD drawing (DPU), real ISP image processing.
+  AX620E runs both CPUs (spin-table, CPU1 released from BL1's mailbox).
   `QEMU_TLBI_RELAXED=1` (patch 0006) makes broadcast TLB flushes cheaper
   and roughly doubles AX620U's frame rate on a loaded host.
 - **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both

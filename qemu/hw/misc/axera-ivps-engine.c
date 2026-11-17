@@ -137,6 +137,18 @@ struct AxeraIvpsEngineState {
      * timeout", squashfs read errors (the App's std::ios_failure abort),
      * UBI write errors (UBIFS read-only). AXERA_IVPS_SYNC=1 restores the
      * synchronous path.
+     *
+     * The AX620E GDC's job (a 2688x1520 load scaled into up to four VPP
+     * ports, one of them 3200x1800: ~20-25 ms a kick, 25-30 kicks a
+     * second) runs the same way. Inside the kick it ran on the vCPU
+     * thread and took most of that thread's time: with the guest on
+     * one CPU (before CPU1 came online) IVPS, VENC and the App fell
+     * behind a 30 fps VIN, IVPS's output allocation failed
+     * (/proc/ax_proc/ivps BlkMiss) and, with the host loaded, the main
+     * stream stopped for minutes ("zero bitrate (chn:0 main:enc_stop)",
+     * MotionDetect's AX_ERR_IVPS_BUF_EMPTY). The kick captures the
+     * source and the port geometry; the done interrupt follows the
+     * worker, so nothing downstream reads a port before it is written.
      */
     uint32_t job_regs[ENGINE_SIZE / 4];
     uint32_t job_bits;          /* done bits of the job in the worker */
@@ -145,6 +157,16 @@ struct AxeraIvpsEngineState {
     bool busy;
     uint32_t gen;               /* bumped on reset: drop a stale result */
     uint32_t job_gen;
+
+    /*
+     * AX620E GDC jobs: the source and VPP port geometry captured at the
+     * kick, for the worker (see engine_gdc_capture()).
+     */
+    struct AxeraGdcJob {
+        AxeraNv12Buf src;
+        AxeraNv12Buf dst[VPP_PORTS];
+        int ndst;
+    } gdc_job, gdc_next;
 };
 
 /* The AX620E VPP, which the GDC streams into */
@@ -186,16 +208,24 @@ static void engine_tdp_job(AxeraIvpsEngineState *s)
     engine_tdp_job_regs(s->regs);
 }
 
+static void engine_gdc_run(struct AxeraGdcJob *job);
+
 static int engine_tdp_worker(void *opaque)
 {
     AxeraIvpsEngineState *s = opaque;
 
-    engine_tdp_job_regs(s->job_regs);
+    if (s->pixel == PIXEL_E_GDC) {
+        engine_gdc_run(&s->gdc_job);
+    } else {
+        engine_tdp_job_regs(s->job_regs);
+    }
     return 0;
 }
 
 static void engine_tdp_submit(AxeraIvpsEngineState *s, const uint32_t *regs,
                               uint32_t bits);
+static void engine_gdc_capture(AxeraIvpsEngineState *s,
+                               struct AxeraGdcJob *job);
 
 /* Main loop, BQL held */
 static void engine_tdp_done(void *opaque, int ret)
@@ -222,10 +252,20 @@ static void engine_tdp_submit(AxeraIvpsEngineState *s, const uint32_t *regs,
 {
     if (s->busy) {
         memcpy(s->next_regs, regs, sizeof(s->next_regs));
+        if (s->pixel == PIXEL_E_GDC) {
+            engine_gdc_capture(s, &s->gdc_next);
+        }
         s->next_bits |= bits;
         return;
     }
     memcpy(s->job_regs, regs, sizeof(s->job_regs));
+    if (s->pixel == PIXEL_E_GDC) {
+        if (regs == s->next_regs) {
+            s->gdc_job = s->gdc_next;
+        } else {
+            engine_gdc_capture(s, &s->gdc_job);
+        }
+    }
     s->job_bits = bits;
     s->job_gen = s->gen;
     s->busy = true;
@@ -280,8 +320,13 @@ static void engine_tdp_job_regs(const uint32_t *regs)
     axera_picture_free(&out);
 }
 
-/* AX620E: the GDC kicked with VPP on its first tile: fill VPP's ports */
-static void engine_gdc_job(AxeraIvpsEngineState *s)
+/*
+ * AX620E: the GDC kicked with VPP on its first tile: capture what fills
+ * VPP's ports -- the source picture and every enabled port's whole-frame
+ * geometry. An empty job (other tiles, nothing enabled) has ndst 0.
+ */
+static void engine_gdc_capture(AxeraIvpsEngineState *s,
+                               struct AxeraGdcJob *job)
 {
     AxeraIvpsEngineState *v = engine_vpp;
     uint32_t ssz = engine_reg(s, 0x044);
@@ -291,15 +336,14 @@ static void engine_gdc_job(AxeraIvpsEngineState *s)
         .y_stride = (engine_reg(s, 0x09c) & 0xffff) << 3,
         .uv_stride = (engine_reg(s, 0x09c) & 0xffff) << 3,
     };
-    AxeraPicture in = { 0 }, out = { 0 };
-    bool loaded = false;
     int k;
 
+    job->ndst = 0;
     if (!v || engine_reg(v, 0x000) != 1 || !src.y || !src.w || !src.h ||
         src.w > 8192 || src.h > 8192) {
         return;
     }
-    src.compressed = axera_fbuf_has(src.y);
+    job->src = src;
     for (k = 0; k < VPP_PORTS; k++) {
         const uint32_t *p = v->port[k];
         uint32_t dsz = p[0x04 / 4];
@@ -316,21 +360,42 @@ static void engine_gdc_job(AxeraIvpsEngineState *s)
             (!dst.compressed && (!dst.uv || dst.y_stride < dst.w))) {
             continue;
         }
-        if (!loaded) {
-            if (!axera_nv12_load(&src, &in)) {
-                break;
+        job->dst[job->ndst++] = dst;
+    }
+}
+
+/* Scale the source into each captured port: no device state touched */
+static void engine_gdc_run(struct AxeraGdcJob *job)
+{
+    AxeraPicture in = { 0 }, out = { 0 };
+    int k;
+
+    if (!job->ndst) {
+        return;
+    }
+    job->src.compressed = axera_fbuf_has(job->src.y);
+    if (axera_nv12_load(&job->src, &in)) {
+        for (k = 0; k < job->ndst; k++) {
+            AxeraNv12Buf *dst = &job->dst[k];
+
+            axera_picture_alloc(&out, dst->w, dst->h);
+            axera_picture_scale(&in, &out);
+            if (!dst->compressed) {
+                axera_fbuf_drop(dst->y);
             }
-            loaded = true;
+            axera_nv12_store(dst, &out);
         }
-        axera_picture_alloc(&out, dst.w, dst.h);
-        axera_picture_scale(&in, &out);
-        if (!dst.compressed) {
-            axera_fbuf_drop(dst.y);
-        }
-        axera_nv12_store(&dst, &out);
     }
     axera_picture_free(&in);
     axera_picture_free(&out);
+}
+
+static void engine_gdc_job(AxeraIvpsEngineState *s)
+{
+    struct AxeraGdcJob job;
+
+    engine_gdc_capture(s, &job);
+    engine_gdc_run(&job);
 }
 
 static uint64_t engine_read(void *opaque, hwaddr off, unsigned size)
@@ -373,7 +438,8 @@ static void engine_write(void *opaque, hwaddr off, uint64_t val,
     }
     for (int k = 0; k < ENGINE_KICKS; k++) {
         if (s->done_bits[k] && off == s->kick_off[k] && (val & 1)) {
-            if (s->pixel == PIXEL_U_TDP && engine_async()) {
+            if ((s->pixel == PIXEL_U_TDP || s->pixel == PIXEL_E_GDC) &&
+                engine_async()) {
                 engine_tdp_submit(s, s->regs, s->done_bits[k]);
                 continue;
             } else if (s->pixel == PIXEL_U_TDP) {
