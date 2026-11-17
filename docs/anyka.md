@@ -71,7 +71,7 @@ appended DTB.
 |---|---|---|
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
 | `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
-| `0x20000000` | ISP / VI | storage |
+| `0x20000000` | ISP / VI (interrupt 1) | EV200 `ak-isp`, others storage |
 | `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core | EV200 `ak-h8290`, others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
@@ -224,6 +224,26 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   regardless), slices, restart markers, rotation, RGB input.
   `-global ak-h8290.dump-dir=DIR` keeps each job. `qemu/tests/test-ak-h8290.py`
   plays the driver under qtest and decodes the result with ffmpeg.
+- **EV200 ISP** (`ak-isp`): the frames of the ISP2 as OpenIPC's `ak-cam`
+  drives it through the SDK-derived `ak39_isp2.c` (EV200 build), not the
+  image processing. Most of its configuration is a register table in DRAM
+  (`+0x18` holds its address): the model reads the buffer addresses
+  (block 5 words 25..30 for buffer 1, block 1 words 31..48 for 2..4) and
+  the main / sub sizes (block 4 words 31 / 33) from it. `GEN_CTRL` bit 20
+  starts capture, bits 15..18 / 21..24 enable each buffer's main / sub
+  output; every frame period (`-global ak-isp.fps=N`, default 15) the
+  core writes an I420 test pattern -- bars, a moving block, the frame
+  number as 16 black/white cells along the bottom -- into the buffer it
+  is on, raises `FRAME_ALL_DONE`, and reports the next enabled buffer in
+  `STATUS` 23:22, the order `ak_isp_irq_work()` expects. The sensor is the
+  catalogue's `sc1345` on I2C 0 (`sensor=` picks another, or `none`).
+- **The EV200 camera pipeline end to end**: with both models, OpenIPC's
+  ak3918ev200 image boots to `ak-venc` on `/dev/video0` and `ak-cam` on
+  `/dev/video1` / `/dev/video2` as on the board, and Majestic's EV200 path
+  streams H.264 over RTSP (main and sub) and serves JPEG snapshots. The
+  capture pool is the video memory above `mem=` and has no struct pages,
+  so the kernel cannot export its buffers as dma-bufs (`failed to get
+  scatterlist from DMA API`): hand them to the encoder as USERPTR.
 
 ## AK3918AV130
 
@@ -343,9 +363,10 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 
 ## Not modelled
 
-The MCI's L2 DMA data path, ISP, the EV300 / EV330 video encoder (EV200's
-is `ak-h8290`), audio codec, SAR ADC. No
-sensor models are attached to I2C yet. On the AV100 the second MIPI/CSI
+The MCI's L2 DMA data path, the ISP's image processing and statistics
+(EV200's frames are `ak-isp`; the other parts' ISP is storage), the EV300 /
+EV330 video encoder (EV200's is `ak-h8290`), audio codec, SAR ADC. Only the
+EV200 has a sensor on I2C (`sc1345` by default). On the AV100 the second MIPI/CSI
 input, the NPU (`0x21300000`) and the video pipe (`0x212`--`0x215`) are the
 `ak-apb` catch-all (reads 0): the vendor modules probe and map them but no
 frames flow. The second L2 buffer (`0x201A8000` / `0x58000000`) and the
