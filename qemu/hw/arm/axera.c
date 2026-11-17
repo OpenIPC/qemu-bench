@@ -823,7 +823,7 @@ static void axera_create_ivps_engines(const AxeraIvpsEngineDesc *engines,
  * spi_nor_dma says that SPI NOR exists, so its request id is handshaked.
  */
 static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
-                                         bool vin_itp_lockstep,
+                                         bool vin_itp_jobs,
                                          bool spi_nor_dma)
 {
     /* the SC450AI, whose exposure scales axera-vin's 3A statistics */
@@ -1187,10 +1187,9 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
         qdev_prop_set_uint32(vin, "cdma-list-off", 0x1004);
         /* CDMA lists arm the range-1 interrupts (YUV WDMA done, AF done) */
         qdev_prop_set_bit(vin, "cdma-irq-regs", true);
-        /* ...and, with CPU1 online, the ITP's done events follow its
-         * job and the next frame waits for them: see
-         * axera_vin_itp_poll() */
-        qdev_prop_set_bit(vin, "itp-lockstep", vin_itp_lockstep);
+        /* ...and the ITP's done events follow its jobs: see
+         * axera_vin_itp_next() */
+        qdev_prop_set_bit(vin, "itp-jobs", vin_itp_jobs);
         /* 3A statistics: see axera_vin_ae_stats() */
         if (ax620e_sensor) {
             object_property_set_link(OBJECT(vin), "sensor",
@@ -1482,8 +1481,7 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     spi_nor = AXERA_MACHINE(machine)->flash_file &&
               AXERA_MACHINE(machine)->flash_file[0] &&
               !machine->kernel_filename;
-    dmaper = axera_ax620e_periphs(pic, true, c == &ax620e_soc && smp_cpus > 1,
-                                  spi_nor);
+    dmaper = axera_ax620e_periphs(pic, true, c == &ax620e_soc, spi_nor);
 
     {
         AxeraMachineState *ams = AXERA_MACHINE(machine);

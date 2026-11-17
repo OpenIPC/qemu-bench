@@ -105,6 +105,8 @@
  * own console log: "fDstFrameRate:30.000000"). A channel the guest never
  * unmasks never fires, so there is no cost to running continuously from
  * reset rather than only after a detected trigger.
+ * On AX620E ("itp-jobs") the tick raises range 0 only: the ITP's range-1
+ * events follow the jobs the driver pushes, see axera_vin_itp_next().
  *
  * CDMA at +0x1000 (AX620E). ax_base.ko's g_cdma_hw_info[0] is
  * 0x02401000 (consumers 0..3; [1] = 0x04400000 serves VPP/DPU):
@@ -177,6 +179,8 @@ enum { ISP_LAYOUT_NONE = 0, ISP_LAYOUT_AX620E = 1, ISP_LAYOUT_AX620U = 2 };
 #define VIN_OUTS        2       /* ITP output channels painted */
 #define VIN_PAINTED     8       /* buffers already holding the scene */
 #define CDMA_TOP_MAX    256     /* command lists per push, at most */
+#define ITP_YUV_Y       0x024d0118  /* AX620E ITP YUV WDMA Y address */
+#define ITP_JOBS_MAX    16      /* ITP jobs queued in the CDMA, at most */
 #define CDMA_SUB_MAX    8192    /* register writes per command list */
 
 /* 3A statistics: see axera_vin_ae_stats() */
@@ -207,15 +211,21 @@ struct AxeraVinState {
     uint32_t raw[AXERA_VIN_RANGES][AXERA_VIN_CHANNELS];
     QEMUTimer *timer;
     uint32_t fps;
-    /* itp-lockstep: see axera_vin_itp_poll() */
-    bool itp_lockstep;
-    bool itp_armed;         /* a frame ticked, its ITP job not pushed yet */
-    bool itp_pending;       /* job pushed, completion not raised yet */
-    bool itp_started;       /* a job has been pushed since reset */
-    uint32_t held;          /* frame ticks held back in a row */
-    bool frame_owed;        /* a frame tick fell due while held */
-    int64_t itp_pushed_ns;
+    /* itp-jobs: see axera_vin_itp_next() */
+    bool itp_jobs;
+    uint32_t itp_us;        /* how long the ITP works a frame */
+    hwaddr itp_q[ITP_JOBS_MAX];
+    unsigned itp_qh, itp_qn;
+    bool itp_busy;          /* a job is in the ITP */
+    bool itp_unacked;       /* its done events not cleared yet */
     QEMUTimer *itp_timer;
+    /* the driver taking the done events, see axera_vin_itp_settled() */
+    uint32_t settle_us;
+    bool settling;
+    int64_t settle_ns;      /* when the done events were cleared */
+    int64_t *settle_cpu_ns; /* each vCPU's run time then */
+    QEMUTimer *settle_timer;
+    bool frame_owed;        /* a sensor frame waits for the ITP */
     /* gate-on-sensor: no frame events until the image sensor wired to
      * the "sensor-streaming" input says it is streaming. */
     bool gate_on_sensor;
@@ -719,6 +729,47 @@ static void axera_vin_ae_raw(AxeraVinState *s)
 static void axera_vin_reg_write(AxeraVinState *s, hwaddr off, uint32_t val,
                                 bool from_cdma);
 
+/* Does the command list at top write register key? */
+static bool axera_vin_cdma_writes(AxeraVinState *s, hwaddr top, uint32_t key)
+{
+    g_autofree uint32_t *pairs = NULL;
+    int i, n;
+
+    for (i = 0; i < CDMA_TOP_MAX; i++) {
+        uint32_t ent[2], count;
+        hwaddr sub;
+
+        if (dma_memory_read(&address_space_memory, top + 8 * i, ent,
+                            sizeof(ent), MEMTXATTRS_UNSPECIFIED)) {
+            break;
+        }
+        sub = s->cdma_list_base + ((hwaddr)le32_to_cpu(ent[1]) << 3);
+        if (!dma_memory_read(&address_space_memory, sub, &count,
+                             sizeof(count), MEMTXATTRS_UNSPECIFIED)) {
+            count = le32_to_cpu(count);
+            if (count && count <= CDMA_SUB_MAX) {
+                pairs = g_renew(uint32_t, pairs, 2 * count);
+                if (!dma_memory_read(&address_space_memory, sub + 0x80,
+                                     pairs, 8 * count,
+                                     MEMTXATTRS_UNSPECIFIED)) {
+                    for (n = 0; n < count; n++) {
+                        if (le32_to_cpu(pairs[2 * n + 1]) == key) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if (le32_to_cpu(ent[0]) & 0x80000000u) {
+            break;
+        }
+    }
+    return false;
+}
+
+static void axera_vin_itp_next(AxeraVinState *s);
+static void axera_vin_itp_settle(AxeraVinState *s);
+
 static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
 {
     g_autofree uint32_t *pairs = NULL;
@@ -852,6 +903,20 @@ static void axera_vin_reg_write(AxeraVinState *s, hwaddr off, uint32_t val,
         return;
     }
     axera_vin_update_irq(s, range);
+    if (range == 1 && s->itp_unacked && !from_cdma) {
+        int c;
+
+        for (c = 0; c < AXERA_VIN_CHANNELS; c++) {
+            if (s->mask[1][c] & s->raw[1][c]) {
+                return;
+            }
+        }
+        /* the driver has taken the last job's done events */
+        s->itp_unacked = false;
+        timer_del(s->itp_timer);
+        axera_vin_itp_settle(s);
+        axera_vin_itp_next(s);
+    }
 }
 
 static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
@@ -863,14 +928,15 @@ static void axera_vin_write(void *opaque, hwaddr off, uint64_t val,
         s->cdma_list = val;
     }
     if (s->isp_layout && off == s->cdma_list_off + 4 && (val & 1)) {
-        axera_vin_scan_cdma(s, s->cdma_list_base +
-                               ((hwaddr)s->cdma_list << 3));
-        if (s->itp_lockstep && s->itp_armed && !s->itp_pending) {
-            s->itp_armed = false;
-            s->itp_pending = true;
-            s->itp_started = true;
-            s->itp_pushed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            timer_mod_ns(s->itp_timer, s->itp_pushed_ns + SCALE_MS);
+        hwaddr top = s->cdma_list_base + ((hwaddr)s->cdma_list << 3);
+
+        if (s->itp_jobs && s->itp_qn < ITP_JOBS_MAX &&
+            axera_vin_cdma_writes(s, top, ITP_YUV_Y)) {
+            /* an ITP job: queued, see axera_vin_itp_next() */
+            s->itp_q[(s->itp_qh + s->itp_qn++) % ITP_JOBS_MAX] = top;
+            axera_vin_itp_next(s);
+        } else {
+            axera_vin_scan_cdma(s, top);
         }
     }
     if (s->cdma_list_off2 && off == s->cdma_list_off2) {
@@ -919,12 +985,9 @@ static void axera_vin_frame(AxeraVinState *s)
 {
     int range, ch;
 
-    s->itp_armed = s->itp_lockstep;
-    s->frame_owed = false;
-    s->held = 0;
     for (range = 0; range < AXERA_VIN_RANGES; range++) {
-        if (range == 1 && s->itp_lockstep) {
-            continue;   /* raised by axera_vin_itp_poll() */
+        if (range == 1 && s->itp_jobs) {
+            continue;   /* raised by the ITP job, axera_vin_itp_done() */
         }
         for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
             uint32_t ev = s->mask[range][ch];
@@ -961,10 +1024,9 @@ static void axera_vin_tick(void *opaque)
      */
     if (s->gate_on_sensor && !s->sensor_streaming) {
         /* nothing */
-    } else if (s->itp_lockstep && s->itp_started &&
-               (s->itp_armed || s->itp_pending) && s->held < s->fps) {
-        /* the last frame is still in the ITP: this one waits */
-        s->held++;
+    } else if (s->itp_jobs && (s->itp_busy || s->itp_qn ||
+                               s->itp_unacked || s->settling)) {
+        /* the last frame is still in the ITP: this one ends after it */
         s->frame_owed = true;
     } else {
         axera_vin_frame(s);
@@ -974,71 +1036,180 @@ static void axera_vin_tick(void *opaque)
 }
 
 /*
- * itp-lockstep (AX620E with CPU1 online). ax_proton.ko runs each sensor
- * frame through three kernel threads:
+ * itp-jobs (AX620E). The ISP is two engines fed by the CDMA, and
+ * ax_proton.ko moves each sensor frame through them with three kernel
+ * threads (live trace, 1 and 2 vCPUs):
  *
- *   isp_irq_task_0  IFE WDMA done (range 0): sends the frame's raw block
- *                   down the pipeline (vin_ife_node_comm_wdma_img_backward)
- *   vin_nor_sch_0   pushes the frame's ITP job (a CDMA list), then
- *                   forwards the frame: ..._rgb_pst_node_comm_wdma_dehaze_
- *                   forward looks the raw block up (Block_convert_to_object)
- *   isp_irq_task_1  ITP YUV WDMA done (r1/ch9): the ITP has read the raw
- *                   frame, so vin_itp_raw_pre_node_comm_rdma_img_backward
- *                   gives the block back to its pool
+ *   IFE  sensor -> raw frame in DDR. Its events ride the sensor: frame
+ *        start r0/ch1 bit0 (isp_irq_task_0 __vin_pipe_sns_fsof_irq_exec_
+ *        node pushes the IFE list, CDMA request 3, pages 0x02400-0x02414)
+ *        and WDMA done r0/ch4 bit21 (__vin_ife_wdma_done_irq_exec_node ->
+ *        vin_ife_node_comm_wdma_img_backward sends the raw block on).
+ *   ITP  raw frame -> YUV. vin_nor_sch_0 runs the frame through the
+ *        pipe's nodes (vin_ipc_pipe_process: ..._wdma_dehaze_forward
+ *        looks the raw block up), then vin_nor_sch_1 (vin_ipc_pipe_
+ *        trigger -> ax_regio_slave_trigger) pushes the frame's ITP job:
+ *        CDMA request 29, one list of five vertical partitions (the
+ *        ITP's register pages 0x02480-0x024d0, YUV WDMA Y at 0x024d0118
+ *        in each), followed by three small lists (requests 22 and 23,
+ *        page 0x024cf; request 9, page 0x02495). The first partition
+ *        clears every range-1 event and masks YUV WDMA done (r1/ch9 bit0)
+ *        and AF done (r1/ch6 bit13); the last unmasks both, so they fire
+ *        once, when the ITP has finished the whole frame. isp_irq_task_1
+ *        then takes them: __vin_yuv_wdma_done_irq_exec_node pops the
+ *        oldest job and vin_itp_raw_pre_node_comm_rdma_img_backward
+ *        gives its raw block back to the pool.
  *
- * and pairs each ITP done with the oldest frame in flight. On silicon
- * the ITP needs milliseconds after the push and the forward takes
- * microseconds, and every frame is through long before the next.
- * Here range 1 used to ride the free-running frame tick, raised whether
- * or not a job had been pushed, and frames piled up whenever the guest
- * fell behind. On one vCPU the real-time vin_nor_sch_0 still always
- * forwarded first; with CPU1 online isp_irq_task_1 runs beside it, gives
- * the block back before the forward looks it up, and the forward oopses
- * (NULL + 0xc8 at ..._wdma_dehaze_forward+0x84, 1-4 minutes into every
- * 2-vCPU boot -- at 15 fps as at 30).
+ * The driver relies on two orderings the silicon's timing gives it:
  *
- * So, with itp-lockstep:
- *   - the first CDMA push after a frame is that frame's ITP job;
- *   - its range-1 events are raised once every vCPU has been idle
- *     (halted in WFI) after the push -- vin_nor_sch_0 has finished the
- *     forward -- or a second after it at the latest, polled every 1 ms;
- *   - the next frame waits until then (a tick that falls due earlier is
- *     owed and goes out with the ITP done), so one frame is in flight at
- *     a time, as on silicon; a pipeline that stops pushing is waited on
- *     for at most a second per frame.
+ *   1. a job's done events follow that job. Raised on the sensor tick
+ *      instead, they fell on whatever frame was oldest.
+ *   2. a job's done events have been taken (isp_irq_task_1 has run its
+ *      backward chain) before the next frame's IFE WDMA done: the ITP
+ *      works a frame in a few milliseconds, well inside a frame period.
+ *      When the pipe is behind, vin_nor_sch_0 drops the oldest frame it
+ *      holds; with a done still to come for that frame, isp_irq_task_1
+ *      then gives back the next frame's raw block, the one being
+ *      forwarded.
+ *
+ * Broken, either one oopses the forward (NULL + 0xc8 at
+ * vin_itp_rgb_pst_node_comm_wdma_dehaze_forward+0x84; on one vCPU at
+ * vin_ai3dnr_node_mode2_event_backward). With CPU1 online, or on a
+ * loaded host, the guest lags behind QEMU's clock by more than a frame
+ * often enough (11% of frames in a 2-vCPU trace saw their job finish
+ * after the next frame end) for that to happen within minutes.
+ *
+ * So, here:
+ *   - a push of a list writing the YUV WDMA is an ITP job. Jobs run one
+ *     at a time, in order: a job starts (its list is applied and the
+ *     picture painted) when the ITP is free and the last job's done
+ *     events are taken, and finishes itp-us later, raising the range-1
+ *     events its list unmasked. The sensor tick raises range 0 only.
+ *   - a sensor frame that ends while a job is queued, in the ITP or not
+ *     yet taken by the driver waits, and ends as soon as it is
+ *     (axera_vin_itp_idle()). "Taken" is the guest's progress, not
+ *     QEMU's clock: the driver has cleared the done events, and since
+ *     then every vCPU has run settle-us of its own time or is idle
+ *     (halted, nothing pending) -- what took the silicon's interrupt
+ *     thread a fraction of the frame period. A frame owed that long is
+ *     the sensor's one frame late; frames that fell due meanwhile are
+ *     lost, as when the silicon's pipe cannot keep up.
  */
-static bool axera_vin_all_idle(void)
+static void axera_vin_itp_idle(AxeraVinState *s);
+
+static void axera_vin_itp_next(AxeraVinState *s)
+{
+    if (s->itp_busy || s->itp_unacked || !s->itp_qn) {
+        return;
+    }
+    s->itp_busy = true;
+    axera_vin_scan_cdma(s, s->itp_q[s->itp_qh]);
+    s->itp_qh = (s->itp_qh + 1) % ITP_JOBS_MAX;
+    s->itp_qn--;
+    timer_mod_ns(s->itp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                 (int64_t)s->itp_us * SCALE_US);
+}
+
+static void axera_vin_itp_done(void *opaque)
+{
+    AxeraVinState *s = opaque;
+    int ch;
+
+    if (s->itp_busy) {
+        s->itp_busy = false;
+        for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
+            s->raw[1][ch] |= s->mask[1][ch];
+            if (s->mask[1][ch]) {
+                s->itp_unacked = true;
+            }
+        }
+        axera_vin_update_irq(s, 1);
+        if (s->itp_unacked) {
+            /* a driver that never clears them: go on after a second */
+            timer_mod_ns(s->itp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                         + NANOSECONDS_PER_SECOND);
+            return;
+        }
+    } else if (s->itp_unacked) {
+        s->itp_unacked = false;
+        axera_vin_itp_settle(s);
+    }
+    axera_vin_itp_next(s);
+    axera_vin_itp_idle(s);
+}
+
+/* A vCPU's own run time: what it has executed, whatever the host did */
+static int64_t axera_vin_cpu_ns(CPUState *cs)
+{
+#ifdef __linux__
+    clockid_t id;
+    struct timespec ts;
+
+    if (cs->thread && !pthread_getcpuclockid(cs->thread->thread, &id) &&
+        !clock_gettime(id, &ts)) {
+        return ts.tv_sec * NANOSECONDS_PER_SECOND + ts.tv_nsec;
+    }
+#endif
+    return get_clock();
+}
+
+static void axera_vin_itp_settle(AxeraVinState *s)
 {
     CPUState *cs;
+    int n = 0;
 
     CPU_FOREACH(cs) {
-        if (!cs->halted) {
+        n = MAX(n, cs->cpu_index + 1);
+    }
+    s->settling = true;
+    s->settle_ns = get_clock();
+    s->settle_cpu_ns = g_renew(int64_t, s->settle_cpu_ns, n);
+    CPU_FOREACH(cs) {
+        s->settle_cpu_ns[cs->cpu_index] = axera_vin_cpu_ns(cs);
+    }
+    timer_mod_ns(s->settle_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * SCALE_US);
+}
+
+static bool axera_vin_itp_settled(AxeraVinState *s)
+{
+    int64_t need = (int64_t)s->settle_us * SCALE_US;
+    CPUState *cs;
+
+    if (get_clock() - s->settle_ns > NANOSECONDS_PER_SECOND) {
+        return true;    /* a guest this stuck has bigger problems */
+    }
+    CPU_FOREACH(cs) {
+        if (!(cs->halted && !cpu_has_work(cs)) &&
+            axera_vin_cpu_ns(cs) - s->settle_cpu_ns[cs->cpu_index] < need) {
             return false;
         }
     }
     return true;
 }
 
-static void axera_vin_itp_poll(void *opaque)
+static void axera_vin_settle_poll(void *opaque)
 {
     AxeraVinState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    int ch;
 
-    if (!s->itp_pending) {
+    if (!s->settling) {
         return;
     }
-    if (!axera_vin_all_idle() &&
-        now - s->itp_pushed_ns < NANOSECONDS_PER_SECOND) {
-        timer_mod_ns(s->itp_timer, now + SCALE_MS);
+    if (!axera_vin_itp_settled(s)) {
+        timer_mod_ns(s->settle_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200 * SCALE_US);
         return;
     }
-    s->itp_pending = false;
-    for (ch = 0; ch < AXERA_VIN_CHANNELS; ch++) {
-        s->raw[1][ch] |= s->mask[1][ch];
-    }
-    axera_vin_update_irq(s, 1);
-    if (s->frame_owed) {
+    s->settling = false;
+    axera_vin_itp_idle(s);
+}
+
+/* The ITP has nothing left: a sensor frame that waited for it ends */
+static void axera_vin_itp_idle(AxeraVinState *s)
+{
+    if (s->frame_owed && !s->itp_busy && !s->itp_qn && !s->itp_unacked &&
+        !s->settling) {
+        s->frame_owed = false;
         axera_vin_frame(s);
     }
 }
@@ -1051,9 +1222,10 @@ static void axera_vin_reset(DeviceState *dev)
     memset(s->mask, 0, sizeof(s->mask));
     memset(s->raw, 0, sizeof(s->raw));
     timer_del(s->itp_timer);
-    s->itp_armed = s->itp_pending = s->itp_started = false;
-    s->frame_owed = false;
-    s->held = 0;
+    s->itp_qh = s->itp_qn = 0;
+    s->itp_busy = s->itp_unacked = false;
+    timer_del(s->settle_timer);
+    s->settling = s->frame_owed = false;
     s->cdma_info0 = 0;
     s->cdma_info1 = 0;
     for (range = 0; range < AXERA_VIN_RANGES; range++) {
@@ -1084,15 +1256,18 @@ static void axera_vin_init(Object *obj)
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[range]);
     }
     s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, axera_vin_tick, s);
-    s->itp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, axera_vin_itp_poll, s);
+    s->itp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, axera_vin_itp_done, s);
+    s->settle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, axera_vin_settle_poll,
+                                   s);
     qdev_init_gpio_in_named(DEVICE(obj), axera_vin_sensor_streaming,
                             "sensor-streaming", 1);
 }
 
 static const Property axera_vin_props[] = {
     DEFINE_PROP_UINT32("fps", AxeraVinState, fps, 30),
-    DEFINE_PROP_BOOL("itp-lockstep", AxeraVinState, itp_lockstep,
-                     false),
+    DEFINE_PROP_BOOL("itp-jobs", AxeraVinState, itp_jobs, false),
+    DEFINE_PROP_UINT32("itp-us", AxeraVinState, itp_us, 5000),
+    DEFINE_PROP_UINT32("settle-us", AxeraVinState, settle_us, 2000),
     DEFINE_PROP_BOOL("gate-on-sensor", AxeraVinState, gate_on_sensor, false),
     DEFINE_PROP_BOOL("cdma-irq-regs", AxeraVinState, cdma_irq_regs, false),
     DEFINE_PROP_UINT32("quiet-off", AxeraVinState, quiet_off, 0),
