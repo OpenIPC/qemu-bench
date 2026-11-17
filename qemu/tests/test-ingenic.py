@@ -1699,6 +1699,46 @@ def test_otg_host(qt):
           0)
 
 
+def test_otg_port_power(qt):
+    port, hfnum, gintsts = OTG + 0x440, OTG + 0x408, OTG + 0x14
+    power, sof = 1 << 12, 1 << 3
+    connected = qt.readl(port) & 0x60001  # speed and connection status
+    check('USB keyboard connected', connected & 1, 1)
+    qt.writel(OTG + 0x18, 1 << 24)  # GINTMSK.PrtIntMsk
+    qt.writel(OTG + 0x418, 1)       # HAINTMSK channel 0
+    qt.writel(OTG + 0x10, 1)
+    check('soft reset masks interrupts and latches the powered connection',
+          (qt.readl(OTG + 0x18), qt.readl(OTG + 0x418), qt.readl(port) & 3),
+          (0, 0, 3))
+    qt.step(3_000_000)
+    qt.writel(port, 0)
+    qt.writel(OTG + 0x10, 1)  # core soft reset with port power off
+    qt.writel(gintsts, sof)
+    frame = qt.readl(hfnum) & 0xffff
+    qt.step(3_000_000)
+    check('port power off stops frames and SOF',
+          (qt.readl(port) & 0x60005, qt.readl(hfnum) & 0xffff,
+           qt.readl(gintsts) & sof), (0, frame, 0))
+    qt.writel(port, power)
+    qt.step(3_000_000)
+    check('power on restores connection, speed and SOF',
+          (qt.readl(port) & 0x60001, (qt.readl(hfnum) & 0xffff) != frame,
+           qt.readl(gintsts) & sof), (connected, True, sof))
+    qt.writel(port, power | 2)  # acknowledge the power-on connection
+    qt.writel(gintsts, sof)
+    qt.step(500_000)
+    qt.writel(port, power)
+    qt.step(500_000)
+    check('writing power again preserves the next full-speed SOF',
+          qt.readl(gintsts) & sof, sof)
+    check('power is already on: no new connection or port interrupt',
+          (qt.readl(port) & 2, qt.readl(gintsts) & (1 << 24)), (0, 0))
+    qt.writel(port, power | (1 << 8))
+    qt.writel(port, power)
+    check('reset enables the port at the negotiated speed without reconnect',
+          qt.readl(port) & 0x6000f, connected | 0x0c)
+
+
 def _migrate_qtest(qemu, machine, qt, out):
     """migrate qt's machine to a file, close it, start the destination"""
     qt.qmp('migrate', uri='exec:cat > %s' % out)
@@ -5089,6 +5129,9 @@ def main():
                    'sensor=sc1a4t,sensor1=sc1a4ts1,msc0-cd=61' % img8_path)
         test_cpm(qt, 't23')
         test_t23_soc_gaps(qt, img8)
+        qt.close()
+        qt = QTest(a.qemu, 't23', ['-device', 'usb-kbd'])
+        test_otg_port_power(qt)
         qt.close()
         test_t23_uhi_and_ost_irq(a.qemu, tmp)
 

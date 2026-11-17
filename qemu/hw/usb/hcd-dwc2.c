@@ -583,7 +583,7 @@ static void dwc2_attach(USBPort *port)
     trace_usb_dwc2_attach(port);
     assert(port->index == 0);
 
-    if (!port->dev || !port->dev->attached) {
+    if (!(s->hprt0 & HPRT0_PWR) || !port->dev || !port->dev->attached) {
         return;
     }
 
@@ -623,7 +623,9 @@ static void dwc2_attach(USBPort *port)
     s->fi = USB_FRMINTVL - 1;
     s->hprt0 |= HPRT0_CONNDET | HPRT0_CONNSTS;
 
-    dwc2_bus_start(s);
+    if (!timer_pending(s->eof_timer)) {
+        dwc2_bus_start(s);
+    }
     dwc2_raise_global_irq(s, GINTSTS_PRTINT);
 }
 
@@ -634,6 +636,9 @@ static void dwc2_detach(USBPort *port)
     trace_usb_dwc2_detach(port);
     assert(port->index == 0);
 
+    if (!(s->hprt0 & HPRT0_PWR)) {
+        return;
+    }
     dwc2_bus_stop(s);
 
     s->hprt0 &= ~(HPRT0_SPD_MASK | HPRT0_SUSP | HPRT0_ENA | HPRT0_CONNSTS);
@@ -862,8 +867,8 @@ static void dwc2_id_arm(DWC2State *s)
  * device still on the port is detected anew (Connect Detected).  U-Boot's
  * dwc2 driver leaves the port in reset when it stops (XM8521DV200: HPRT0
  * PrtRst still set when Linux's dwc2.ko probes); on the chip the kernel
- * driver's soft reset releases it.  The other CSRs keep their values: the
- * drivers program them all again after the reset.
+ * driver's soft reset releases it. Interrupt status remains readable,
+ * but CSftRst clears the interrupt masks before restarting the port.
  */
 static void dwc2_core_soft_reset(DWC2State *s)
 {
@@ -883,11 +888,14 @@ static void dwc2_core_soft_reset(DWC2State *s)
         p->ddma_active = false;
     }
     memset(s->hreg1, 0, sizeof(s->hreg1));
+    s->gintmsk = 0;
+    s->haintmsk = 0;
+    dwc2_update_irq(s);
     dwc2_lower_host_irq(s, s->haint);
 
     s->hprt0 &= ~(HPRT0_RST | HPRT0_ENA | HPRT0_SUSP | HPRT0_RES |
                   HPRT0_ENACHG | HPRT0_OVRCURRCHG);
-    if (dev && dev->attached) {
+    if ((s->hprt0 & HPRT0_PWR) && dev && dev->attached) {
         s->hprt0 |= HPRT0_CONNSTS | HPRT0_CONNDET;
         dwc2_raise_global_irq(s, GINTSTS_PRTINT);
     }
@@ -1163,16 +1171,14 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
                  HPRT0_CONNDET);
         val |= tval;
         if (!(val & HPRT0_PWR)) {
+            dwc2_bus_stop(s);
             val &= ~(HPRT0_CONNSTS | HPRT0_ENA | HPRT0_SUSP | HPRT0_RES |
                      HPRT0_RST | HPRT0_SPD_MASK);
             if (old & HPRT0_ENA) {
                 val |= HPRT0_ENACHG;
             }
-        } else if (dev && dev->attached &&
-                   (!(old & HPRT0_PWR) ||
-                    (!(old & HPRT0_ENA) &&
-                     !(orig & (HPRT0_RST | HPRT0_CONNDET | HPRT0_ENACHG |
-                               HPRT0_OVRCURRCHG))))) {
+        } else if (!(old & HPRT0_PWR) && dev && dev->attached) {
+            s->hprt0 |= HPRT0_PWR;
             dwc2_attach(&s->uport);
             val = (val & ~HPRT0_SPD_MASK) | (*mmio & HPRT0_SPD_MASK) |
                   HPRT0_CONNSTS | HPRT0_CONNDET;
@@ -1194,15 +1200,10 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
     }
 
     if (prst) {
-        trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old,
-                                   val & ~HPRT0_CONNDET);
-        trace_usb_dwc2_hreg0_action("call usb_port_reset");
-        usb_port_reset(&s->uport);
-        val = (val & ~(HPRT0_CONNDET | HPRT0_SPD_MASK)) |
-              (*mmio & HPRT0_SPD_MASK);
-    } else {
-        trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old, val);
+        trace_usb_dwc2_hreg0_action("reset attached USB device");
+        usb_device_reset(dev);
     }
+    trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old, val);
 
     *mmio = val;
 
