@@ -1,2347 +1,582 @@
 # Ingenic T-series (`t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40`, `t41`)
 
-The only non-ARM family here: little-endian MIPS32 camera SoCs, built
-into `qemu-system-mipsel` (`qemu/setup.sh` adds `mipsel-softmmu` to the
-target list). One machine file, `qemu/hw/mips/ingenic.c`, with a table
-entry per SoC; the device models are `qemu/hw/*/ingenic-*.c`.
+The Ingenic T-series is the only non-ARM SoC family in this repository: little-endian MIPS32 camera SoCs built into `qemu-system-mipsel` (`qemu/setup.sh` adds `mipsel-softmmu` to QEMU's target list). One machine file, `qemu/hw/mips/ingenic.c`, defines a table entry per SoC, while the individual peripheral device models live in `qemu/hw/*/ingenic-*.c`.
 
-## What the sources cover
+## Contents
 
-| Source | What it gave |
+- [Reference sources](#reference-sources)
+- [Machines](#machines)
+- [Memory map](#memory-map)
+- [CPUs](#cpus)
+- [Boot](#boot)
+- [System and peripheral devices](#system-and-peripheral-devices)
+- [Storage, networking and Wi-Fi](#storage-networking-and-wi-fi)
+- [Audio](#audio-ingenic-pdma-ingenic-aic-ingenic-dmic-and-ingenic-asdmic)
+- [Image pipeline](#image-pipeline-sensor-ingenic-isp-ingenic-isp-apical-ingenic-ivdc-and-ingenic-ipu)
+- [Video encoders, display and NNA accelerators](#video-encoders-display-and-nna-accelerators)
+- [Tested](#tested)
+- [Not modelled](#not-modelled)
+
+## Reference sources
+
+| Source | What it provided |
 |---|---|
-| OpenIPC `linux` branches `ingenic-t31` (3.10.14: T10, T20, T21, T30, T31), `ingenic-t23`, `ingenic-t40` (4.4.94) | addresses, IRQs, every boot-time poll (`arch/mips/xburst*/soc-*/`, drivers) |
-| OpenIPC `u-boot-ingenic` (`isvp_t*`), the T40/T41 vendor U-Boots | SPL header, SPL and U-Boot polls, flash layout |
-| Vendor SDKs T23 1.1.0, T31 1.1.5, T40 1.2.0, T41 1.2.0 | the T23 N/LP/HP variants, T41's kernel 4.4.94 and full images |
-| Camera dumps: T10, T20, T21 ×2, T31 ×3 (one a Wyze Cam v3), T40XP | the vendor boot chains, end to end |
+| OpenIPC `linux` branches `ingenic-t31` (3.10.14: T10, T20, T21, T30, T31), `ingenic-t23`, and `ingenic-t40` (4.4.94) | MMIO base addresses, IRQ numbers, `arch/mips/xburst*/soc-*/` platform setup, and every boot-time hardware poll |
+| OpenIPC `u-boot-ingenic` (`isvp_t*`) and the T40/T41 vendor U-Boot trees | Mask ROM SPL header, SPL/U-Boot register polls, and flash partition layouts |
+| Vendor SDKs T23 1.1.0, T31 1.1.5, T40 1.2.0, and T41 1.2.0 | T23 N/LP/HP variants, T41 4.4.94 kernel and drivers, and full flash images |
+| Camera dumps: T10, T20, T21 x2, T31 x3 (one a Wyze Cam v3), and T40XP | Vendor boot chains end to end |
 
-All of them boot (see [Tested](#tested)).
+All of these SoCs boot cleanly; see [Tested](#tested).
+
+---
 
 ## Machines
 
-| Machine | Core | RAM default | Kernel | SFC | MSC | Notes |
+| Machine | CPU core | Default RAM | Kernel | SFC | MSC | Notes |
 |---|---|---|---|---|---|---|
-| `t10` | XBurst1 | 64 MiB | 3.10 | v1 | jzmmc | DWC DDR PHY, GPIO ports at 0x100 |
-| `t20` | XBurst1 | 64 MiB | 3.10 | v1 | jzmmc | as T10 (T20X: `-m 128M`) |
-| `t21` | XBurst1, 16 KiB caches on silicon | 64 MiB | 3.10 | v1 | jzmmc | "+1" PLL encoding, card detect PB20 |
-| `t23` | XBurst1 | 64 MiB | 3.10 | v1 | jzmmc | two PLLs; N, LP, HP differ only in clocks |
-| `t30` | XBurst1 | 64 MiB | 3.10 | v1 | jzmmc | "+1" PLL encoding, a fourth PLL (EPLL) |
-| `t31` | XBurst1 | 64 MiB | 3.10 | v1 | jzmmc | the reference part (T31X/A: `-m 128M`) |
-| `t40` | 2 × XBurst2 | 128 MiB | 4.4 (built-in DT) | v2 | SDHCI | CCU, per-core INTC and OST (T40XP: `-m 256M`) |
-| `t41` | 2 × XBurst2 | 128 MiB | 4.4 (built-in DT) | v2 | SDHCI | T41's own PLL encoding, RTC at 0x10003000 |
+| `t10` | XBurst1 | 64 MiB | 3.10 | v1 | `jzmmc` | DWC DDR PHY; GPIO port stride `0x100` |
+| `t20` | XBurst1 | 64 MiB | 3.10 | v1 | `jzmmc` | Same base layout as T10 (use `-m 128M` for T20X) |
+| `t21` | XBurst1 (16 KiB L1 caches on silicon) | 64 MiB | 3.10 | v1 | `jzmmc` | "+1" PLL encoding; SD card detect on `PB20` |
+| `t23` | XBurst1 (16 KiB L1 caches) | 64 MiB | 3.10 | v1 | `jzmmc` | Two PLLs; N, LP, and HP variants differ only in clocks |
+| `t30` | XBurst1 | 64 MiB | 3.10 | v1 | `jzmmc` | "+1" PLL encoding plus a fourth PLL (`EPLL`) |
+| `t31` | XBurst1 | 64 MiB | 3.10 | v1 | `jzmmc` | Reference part (use `-m 128M` for T31X/T31A) |
+| `t40` | 2 x XBurst2 | 128 MiB | 4.4 (built-in DT) | v2 | SDHCI | CCU, per-core INTC and OST (use `-m 256M` for T40XP) |
+| `t41` | 2 x XBurst2 | 128 MiB | 4.4 (built-in DT) | v2 | SDHCI | Dedicated T41 PLL encoding; RTC moved to `0x10003000` |
 
-The parts within a family (T31N/L/X/A/AL/LC, T23N/LP/HP, T40N/XP/A,
-T41LQ/NQ/XQ) differ in DRAM and clock settings, which the boot loader
-programs and the kernel reads; one machine serves them all, with `-m`
-for the DRAM. RAM is at most 256 MiB, all of it below the I/O space.
+Variants within each family (`T31N`/`L`/`X`/`A`/`AL`/`LC`, `T23N`/`LP`/`HP`, `T40N`/`XP`/`A`, `T41LQ`/`NQ`/`XQ`) differ only in DRAM capacity and clock settings, which the bootloader programs and the kernel reads back. A single QEMU machine serves all variants when combined with `-m` and `variant=`. Supported DRAM is at most 256 MiB, all mapped below the I/O space.
+
+### SoC identification and variants
+
+Guest software (following `ipctool` `src/hal/ingenic.c` and Ingenic's `libsysutils`) distinguishes dies and grades using three registers:
+
+- **SoC ID at `0x1300002C` (`ingenic-harb`)**: Bits `31:28` equal `1`, bits `19:12` identify the family (`0x21`, `0x23`, `0x30`, `0x31`, `0x40`, `0x41`; except bits `27:12` equal `0x0005` on T10 and `0x2000` on T20), and the lower bits hold the revision.
+- **`CPM CPPSR` low byte**: Reads `0x10` on the `L` parts of T10/T20/T30, and `1` otherwise.
+- **eFuse grade code**: Stored in the upper halfword of `SUBSOCTYPE1` (`0x13540238`) on T10–T31, and `SUBSOCTYPE2` (`0x13540250`) on T40/T41.
+
+Use `-M <soc>,variant=<grade>` to configure `CPPSR` and the eFuse code (pass `-m` separately for DRAM size). Running `ipctool` in the guest then reports the configured grade (`T31X`, `T40XP`, etc.):
+
+- `t10`: `t10`, `t10l`
+- `t20`: `t20`, `t20l`, `t20x`
+- `t21`: `t21n`, `t21l`, `t21x`, `t21z`
+- `t23`: `t23n`, `t23x`
+- `t30`: `t30n`, `t30l`, `t30x`, `t30a`, `t30z`
+- `t31`: `t31n`, `t31l`, `t31x`, `t31a`, `t31zl`, `t31zx`, `t31al`, `t31zc`, `t31lc`
+- `t40`: `t40n`, `t40nn`, `t40xp`, `t40a`
+- `t41`: `t41nq`, `t41n`, `t41l`, `t41lq`, `t41lc`, `t41zl`, `t41zn`, `t41zx`, `t41a`
+
+The first entry listed for each SoC is its default.
+
+The T41 SDK SPL and current `ipctool` identify subtype `0x6666` as T41ZX and `0x4444` as T41A. Older `ipctool` builds, including the one in the T40 release root used for the T41 Majestic test, report those codes as `T41X` and `unknown`, respectively.
+
+Use `variant=t41zx` for T41XQ images. The XQ U-Boot uses the ZX configuration with different DDR skew settings, and its subtype code is unknown. Set `-m` to at least the size the SDK U-Boot expects for the grade. L/LQ need 64 MiB, N/NQ/A need 128 MiB, and ZX/XQ need 256 MiB. The T41ZX SPL repeatedly resets at 64 MiB.
+
+---
 
 ## Memory map
 
-Physical addresses; software uses them through KSEG1 (`0xA0000000 +`).
+All base addresses below are physical addresses; guest software accesses I/O through uncached `KSEG1` (`0xA0000000 +`). Any unimplemented address inside `0x10000000`–`0x13FFFFFF` is handled by `ingenic.io`, which reads as zero and logs accesses when `-d unimp` is enabled.
 
-| Base | Block | Model |
+| Base | Block | QEMU model / Backing |
 |---|---|---|
-| 0x00000000 | DDR | RAM |
-| 0x10000000 | CPM: PLLs, dividers, gates, resets | `ingenic-cpm` |
-| 0x10001000 | INTC, 64 sources → IP2 (XBurst1) | `ingenic-intc` |
-| 0x10002000 | TCU: 8 channels, watchdog, boot loader OST | `ingenic-tcu` |
-| 0x10003000 | RTC / hibernation (T40: 0x132A0000), IRQ 32 (T41: 3) | `ingenic-rtc` |
-| 0x10004000 | T41: always-on RTC memory, 4 KiB | RAM |
-| 0x10010000 | GPIO, ports at 0x1000 (T10/T20: 0x100), shadow port Z | `ingenic-gpio` |
-| 0x10030000 + 0x1000 n | UART0..3 (T41: UART0..5, UART4/5 on 57/56), 16550 with a 4-byte stride (+0x20 ISR, UMR, UACR: storage), paced at the line rate both ways, 64-byte FIFOs, PDMA requests 0x14 - 2 n / 0x15 - 2 n | QEMU `serial-mm` (patches 0021, 0023) |
-| 0x10050000 + 0x1000 n | I2C0..3 (DW_apb_i2c), PDMA requests 0x24 + 2 n / 0x25 + 2 n | `ingenic-i2c` |
-| 0x12000000 | system OST → IP4 (XBurst1); global OST (XBurst2) | `ingenic-ost` |
-| 0x12100000 + 0x100 n | core OST → IP4 (XBurst2) | `ingenic-ost` layout 2 |
-| 0x12200000 | CCU: core reset/entry, mailboxes → IP3 (XBurst2) | `ingenic-ccu` |
-| 0x12300000 + 0x100 n | core INTC → IP2 (XBurst2) | `ingenic-ccu` |
-| 0x13010000 | DDR PHY (+0x1000) and DDRC APB (+0x2000) | `ingenic-ddr` |
-| 0x134F0000 | DDRC | `ingenic-ddr` |
-| 0x13440000 | SFC + SPI NOR or SPI NAND | `ingenic-sfc` + m25p80 / `ingenic-spinand` |
-| 0x13450000 | T41: SFC1, IRQ 19 (`-drive if=mtd,index=1`) | `ingenic-sfc` |
-| 0x13450000 / 0x13460000 | MSC0/1 (XBurst1) | `ingenic-msc` |
-| MSC1 SDIO | ATBM6031 Wi-Fi (`-M t31,wifi=atbm`; T40/T41 on the SDHCI MSC1) | `atbm-sdio` |
+| `0x00000000` | DDR | RAM |
+| `0x10000000` | CPM: PLLs, dividers, clock gates, resets | `ingenic-cpm` |
+| `0x10001000` | INTC: 64 sources routed to CPU `IP2` (XBurst1) | `ingenic-intc` |
+| `0x10002000` | TCU: 8 timer/PWM channels, watchdog, bootloader OST | `ingenic-tcu` |
+| `0x10003000` | RTC / hibernation (at `0x132A0000` on T40); IRQ `32` (`3` on T41) | `ingenic-rtc` |
+| `0x10004000` | T41 always-on RTC memory (4 KiB) | RAM |
+| `0x10010000` | GPIO: ports every `0x1000` (`0x100` on T10/T20) plus shadow port Z | `ingenic-gpio` |
+| `0x10020000` / `0x10021000` | AIC (I2S, IRQ `1`) and internal audio codec | `ingenic-aic` (`/machine/aic`) |
+| `0x10022000` / `0x10023000` | MIPI D-PHY / CSI-2 host (T23, T31; CSI1 on T40); see DMIC below for T10/T20/T30 | `ingenic-isp` |
+| `0x10030000 + 0x1000*n` | UART0..3 (UART0..5 on T41; UART4/5 on IRQs `57`/`56`), 16550 with 4-byte stride and line-rate PDMA pacing | QEMU `serial-mm` (`0021`, `0023`) |
+| `0x10034000` | T31, T40 DMIC (digital microphones), IRQ `12`, PDMA `13`; on T10/T20: `0x10022000`, IRQ `0`; on T30: `0x10023000`, IRQ `40` (both PDMA `0x21`) | `ingenic-dmic` (`/machine/dmic`) |
+| `0x10043000` / `0x10044000` | SSI0 / SSI1 SPI masters (SSI1 on T21, T30, T31, T40, T41), IRQ `9` / `8`, buses `ssi0` / `ssi1` | `ingenic-ssi` |
+| `0x10050000 + 0x1000*n` | I2C0..3 (`DW_apb_i2c`), PDMA requests `0x24 + 2*n` / `0x25 + 2*n` | `ingenic-i2c` |
+| `0x10060000` | OTG PHY byte registers | RAM |
+| `0x10061000` | DES / triple-DES engine (all SoCs), PDMA `0x2E` / `0x2F` | `ingenic-des` |
+| `0x10070000` | SADC: 8 AUX channels, 12-bit, IRQ `18`, PDMA request `9` | `ingenic-sadc` (`/machine/sadc`) |
+| `0x10072000` | DTRNG, IRQ `34` (T21, T23, T31, T40, T41) | `ingenic-dtrng` |
+| `0x12000000` | System OST (`IP4`, XBurst1); global OST (XBurst2) | `ingenic-ost` |
+| `0x12100000 + 0x100*n` | Core OST routed to `IP4` (XBurst2) | `ingenic-ost` (`layout` 2) |
+| `0x12200000` | CCU: core reset/entry and mailboxes routed to `IP3` (XBurst2) | `ingenic-ccu` |
+| `0x12300000 + 0x100*n` | Core INTC routed to `IP2` (XBurst2) | `ingenic-ccu` |
+| `0x12500000` | T40, T41 NNDMA (descriptor RAM + channels at `+0x8000`) | `ingenic-nndma` (`/machine/nndma`) |
+| `0x12600000` | XBurst2 ORAM: 1 MiB NNA SRAM (T41 SPL places its core-1 stub at `0x12660000`) | RAM |
+| `0x12B00000` (alias `0x13090000`) | T41 AIP: NNA image pre-processor (convert, resize, warp), IRQ `40` / `39` / `38` | `ingenic-aip` (`/machine/aip`) |
+| `0x13000000` | AHB0 arbiter (SoC ID at `+0x2C`) | `ingenic-harb` |
+| `0x13010000` | DDR PHY (`+0x1000`) and DDRC APB (`+0x2000`) | `ingenic-ddr` |
+| `0x13050000` | T40, T41 DPU (frame/layer LCD compositor on display `dpu`), IRQ `20`; T21, T23, T30, T31 LCDC ("tiny" TFT/smart panel controller on display `lcdc`), IRQ `31` (T30: `5`) | `ingenic-dpu` (`/machine/dpu`) / `ingenic-lcdc` (`/machine/lcdc`) |
+| `0x13060000` / `0x13070000` | MSC0 / MSC1 (XBurst2): SDHCI 3.0 | QEMU `generic-sdhci` |
+| `0x13080000` | IPU: `libimp` OSD blender and CSC (all SoCs), IRQ `14` | `ingenic-ipu` |
+| `0x13090000` | T40 BSCALER: NNA resize/affine/perspective and NV12->color engine, IRQ `40` (T) / `39` (C) | `ingenic-bscaler` (`/machine/bscaler`) |
+| `0x130A0000` | T40, T41 AXI/AHB bus MONITOR, IRQ `53` | `ingenic-monitor` |
+| `0x130B0000` | T40, T41 I2D: rotate/mirror/flip engine, IRQ `45` (on T30: MSCA scaler) | `ingenic-i2d` / `ingenic-isp` |
+| `0x130C0000` | T41 VO: NV12 out over BT.656 / BT.1120 to display, IRQ `43` | `ingenic-vo` (`/machine/vo`) |
+| `0x130D0000` | T40, T41 DRAWBOX: OSD rectangles and lines, IRQ `42` | `ingenic-drawbox` |
+| `0x13100000` | T23 HELIX (IRQ `48`); T41 AVPU (from `+0`, IRQ `70`) | `ingenic-vpu` / `ingenic-avpu` |
+| `0x13200000` | Video encoder: VPU (T10/T20), HELIX (T21/T30; T23 at `0x13100000`), IRQ `70` (T23: `48`); AVPU from `+0x8000` (T31, T40), IRQ `70`; or T41/T23 IVDC registers, core INTC `13` (T23: INTC `38`) | `ingenic-vpu` / `ingenic-avpu` / `ingenic-ivdc` |
+| `0x13280000` | T41 JPEG engine (HELIX JPEG half, renumbered units), core INTC `0` | `ingenic-vpu` (`layout` 1, `/machine/jpeg`) |
+| `0x13300000` | ISP core (T31 up to `0x1338FFFF`; T21, T23: 64 KiB; T40, T41: 512 KiB, T41 scaler at `0x133F0000`; T10/T20/T30 Apical core at `0x13380000`) | `ingenic-isp`, `ingenic-isp-apical` |
+| `0x133E0000` | VIC (T21: `0x13310000`; T40, T41: `0x13380000`; T40 VIC1/VIC2 at `0x13390000` / `0x133A0000`) | `ingenic-isp` |
+| `0x13420000` | PDMA: 32 descriptor channels, IRQ `10` | `ingenic-pdma` |
+| `0x13430000` | AES engine (all SoCs), IRQ `23` | `ingenic-aes` |
+| `0x13440000` | SFC + SPI NOR or SPI NAND | `ingenic-sfc` + `m25p80` / `ingenic-spinand` |
+| `0x13450000` | T41 SFC1, IRQ `19` (`-drive if=mtd,index=1`), or XBurst1 MSC0 | `ingenic-sfc` / `ingenic-msc` |
+| `0x13460000` | XBurst1 MSC1, or T41 8-channel PWM controller | `ingenic-msc` / `ingenic-pwm` (`/machine/pwm`) |
+| MSC1 SDIO | ATBM6031 Wi-Fi (`-M t31,wifi=atbm`; T40/T41 on SDHCI MSC1) | `atbm-sdio` |
 | MSC1 SDIO | ATBM6441 IoT Wi-Fi (`-M t31,wifi=atbm6441`) | `atbm6441-sdio` |
-| 0x13060000 / 0x13070000 | MSC0/1 (XBurst2): SDHCI 3.0 | QEMU `generic-sdhci` |
-| 0x134B0000 | Synopsys GMAC, IP101G PHY | `ingenic-gmac` |
-| 0x13500000 | DWC2 USB OTG, host: an A-device, 16 host channels | QEMU `dwc2-usb` (`otg-a-device`, `host-channels=16`) |
-| 0x13540000 | EFUSE: blank but for the grade code | `ingenic-efuse` |
-| 0x13300000 | ISP core (T31: to 0x1338FFFF; T21, T23: 64 KiB; T40, T41: 512 KiB, T41's scaler at 0x133F0000; T10/T20/T30's Apical core at 0x13380000) | `ingenic-isp`, `ingenic-isp-apical` |
-| 0x133E0000 | VIC (T21: 0x13310000; T40, T41: 0x13380000, T40's VIC1 / VIC2 at 0x13390000 / 0x133A0000) | `ingenic-isp` |
-| 0x10023000 / 0x10022000 | MIPI CSI-2 host / D-PHY (T23, T31) | `ingenic-isp` |
-| 0x13000000 | AHB0 arbiter, the SoC ID at +0x2C | `ingenic-harb` |
-| 0x13200000 | video encoder: VPU (T10/T20), HELIX (T21/T30; T23: 0x13100000), IRQ 70 (T23: 48) | `ingenic-vpu` |
-| 0x13600000 | RADIX, T30's H.265 encoder, IRQ 53 | `ingenic-vpu` kind 1 |
-| 0x13080000 | IPU, libimp's OSD blender (every part), IRQ 14 | `ingenic-ipu` |
-| 0x13280000 | T41: the JPEG engine (HELIX's JPEG half, units renumbered), core INTC 0 (`/machine/jpeg`) | `ingenic-vpu` layout 1 |
-| 0x130B0000 | T40, T41: I2D, rotate / mirror / flip (frame channel rotation), IRQ 45 | `ingenic-i2d` |
-| 0x130D0000 | T40, T41: DRAWBOX, libimp's OSD rectangles and lines, IRQ 42 | `ingenic-drawbox` |
-| 0x130C0000 | T41: VO, NV12 out over BT.656 / BT.1120, shown on the display, IRQ 43 (`/machine/vo`) | `ingenic-vo` |
-| 0x13050000 | T40, T41: DPU, the LCD controller (frame and layer descriptors, composed onto a display), IRQ 20 (`/machine/dpu`, display id `dpu`) | `ingenic-dpu` |
-| 0x13050000 | T21, T23, T30, T31: LCDC, the "tiny" LCD controller (TFT or smart panel), IRQ 31 (T30: 5) (`/machine/lcdc`, display id `lcdc`) | `ingenic-lcdc` |
-| 0x130A0000 | T40, T41: bus MONITOR (AXI/AHB bandwidth and address watch), IRQ 53 | `ingenic-monitor` |
-| 0x12B00000 (+ alias 0x13090000) | T41: AIP, the NNA's image pre-processor (convert, resize, warp), IRQ 40 / 39 / 38 (`/machine/aip`) | `ingenic-aip` |
-| 0x13090000 | T40: BSCALER, the NNA's image engine (resize / affine / perspective, NV12 to colour), IRQ 40 (T) / 39 (C) (`/machine/bscaler`) | `ingenic-bscaler` |
-| 0x10070000 | SADC: 8 AUX channels, 12 bits, IRQ 18, PDMA request 9 (`/machine/sadc`) | `ingenic-sadc` |
-| 0x10020000 / 0x10021000 | AIC (I2S, IRQ 1) / internal audio codec (`/machine/aic`) | `ingenic-aic` |
-| 0x13420000 | PDMA: 32 channels, descriptors, IRQ 10 | `ingenic-pdma` |
-| 0x10034000 | T31, T40: DMIC, digital microphones, IRQ 12, PDMA 13 (T10/T20: 0x10022000, IRQ 0; T30: 0x10023000, IRQ 40; both PDMA 0x21) (`/machine/dmic`) | `ingenic-dmic` |
-| 0x134D0000 | T41: the audio system's DMA, FIFOs, data bus and DMIC, core INTC 33 (`/machine/dmic`) | `ingenic-asdmic` |
-| 0x13460000 | T41: PWM controller, 8 channels (`/machine/pwm`) | `ingenic-pwm` |
-| 0x10043000 / 0x10044000 | SSI0 / SSI1 SPI masters (SSI1: T21, T30, T31, T40, T41), IRQ 9 / 8, buses `ssi0` / `ssi1` | `ingenic-ssi` |
-| 0x10060000 | OTG PHY registers (bytes) | RAM |
-| 0x10072000 | DTRNG, IRQ 34 (T21, T23, T31, T40, T41) | `ingenic-dtrng` |
-| 0x13430000 | AES engine, IRQ 23 (every part) | `ingenic-aes` |
-| 0x10061000 | DES / triple-DES engine, PDMA 0x2E / 0x2F (every part) | `ingenic-des` |
-| 0x13480000 | HASH engine (MD5, SHA-1/2), IRQ 22 (T21, T23, T31, T40, T41) | `ingenic-hash` |
-| 0x134C0000 | RSA engine, 1024/2048 bits, polled (T23, T31, T40, T41) | `ingenic-rsa` |
-| 0x13200000 | AVPU video encoder, registers from +0x8000 (T31, T40; T41: 0x13100000 from +0), IRQ 70 | `ingenic-avpu` |
-| 0x12600000 | XBurst2 ORAM, the NNA's memory (1 MiB; the T41 SPL's core-1 stub at 0x12660000) | RAM |
-| 0x12500000 | T40, T41: NNDMA, the NNA's DMA (descriptor RAM, channels at +0x8000) (`/machine/nndma`) | `ingenic-nndma` |
-| 0x80000000 | T41, T23: the IVDC's frame store as `direct_mode` addresses it (32 MiB) | RAM |
-| 0x13200000 | T41, T23: the IVDC's registers, core INTC 13 (T23: INTC 38) | `ingenic-ivdc` |
-| 0x1F000000 | cache-as-RAM window (32 KiB) | RAM |
-| 0x1FC00000 | boot ROM (the reset vector, 0xBFC00000) | ROM |
+| `0x13480000` | HASH engine (MD5, SHA-1/2 on T21, T23, T31, T40, T41), IRQ `22` | `ingenic-hash` |
+| `0x134B0000` | Synopsys GMAC with IP101G PHY | `ingenic-gmac` |
+| `0x134C0000` | RSA 1024/2048-bit engine, polled (T23, T31, T40, T41) | `ingenic-rsa` |
+| `0x134D0000` | T41 audio system DMA, FIFOs, data bus, and DMIC (core INTC `33`) | `ingenic-asdmic` (`/machine/dmic`) |
+| `0x134F0000` | DDRC controller | `ingenic-ddr` |
+| `0x13500000` | DWC2 USB OTG host controller (A-device, 16 host channels) | QEMU `dwc2-usb` (`otg-a-device`, `host-channels=16`) |
+| `0x13540000` | eFuse: blank except grade code | `ingenic-efuse` |
+| `0x13600000` | RADIX: T30 H.265 encoder, IRQ `53` | `ingenic-vpu` (`kind` 1) |
+| `0x1F000000` | Cache-as-RAM window (32 KiB) | RAM |
+| `0x1FC00000` | Boot ROM mapped at reset vector `0xBFC00000` | ROM |
+| `0x80000000` | T41, T23 IVDC frame store addressed by `direct_mode` (32 MiB) | RAM |
 
-Everything else in 0x10000000-0x13FFFFFF reads as zero (`ingenic.io`, an
-unimplemented device, logged with `-d unimp`). Interrupt numbers are the
-same on every part: AIC 1, SSI1 8, SSI0 9, SFC 7, PDMA 10, DMIC 12, GPIO A 17 (B 16, C 15, D 14), OTG 21,
-SADC 18, HASH 22, AES 23, DTRNG 34, TCU 27/26/25, MSC0/1 37/36, UART0..3 51..48, GMAC 55, I2C0..3 60..57,
-ISP 29, VIC 30 (T40: VIC1 29, VIC2 28), AVPU 62, on T40/T41 DRAWBOX 42 and I2D 45, T41's AIP 40 (T), 39 (F), 38 (P) and VO 43, T40's BSCALER 40 (T), 39 (C), and the MONITOR 53 (Linux
-numbers are these + 8: the ISP's 37 and 38, the AVPU's 70).
+### Interrupt map
+
+Hardware interrupt controller (INTC) source numbers are shared across the family (Linux IRQ numbers add `+8`, so ISP INTC `29` is Linux IRQ `37`, VIC `30` is `38`, and AVPU `62` is `70`):
+
+- AIC `1`, SFC `7`, SSI1 `8`, SSI0 `9`, PDMA `10`, DMIC `12` (`40` on T30, `0` on T10/T20), GPIO A `17`, B `16`, C `15`, D `14`, SADC `18`, OTG `21`, HASH `22`, AES `23`, TCU `27`/`26`/`25`, DTRNG `34`, MSC0/1 `37`/`36`, UART0..3 `51..48`, GMAC `55`, I2C0..3 `60..57`, ISP `29`, VIC `30` (T40: VIC1 `29`, VIC2 `28`), AVPU `62`.
+- On T40/T41: DRAWBOX `42`, I2D `45`, MONITOR `53`.
+- On T40: BSCALER `40` (T) / `39` (C).
+- On T41: AIP `40` (T) / `39` (F) / `38` (P), VO `43`, IVDC `13` (T23 IVDC `38`), JPEG `0`, ASDMIC `33`.
+
+---
 
 ## CPUs
 
-QEMU's own Ingenic models are not what these kernels need, so
-`qemu/patches/0015-mips-ingenic-xburst-cpus.patch` adds two:
+QEMU's upstream MIPS models lack several Ingenic CP0 features and SIMD units required by these kernels and vendor binaries, so `qemu/patches/0015-mips-ingenic-xburst-cpus.patch` adds two dedicated CPU types.
 
-- `XBurst1` (T10..T31): PRId 0x00d00100 (T20: 0x00d00101; what the
-  cameras' boot logs print), a 32-bit FPU (the kernels
-  hard-code one and OpenIPC userspace is hard-float), 32 TLB entries (the
-  kernel sets `tlbsize = 32` whatever Config1 says), 32 KiB 8-way caches,
-  and **Config7.WII**: the kernel idles in `wait` with interrupts disabled
-  (`jz_wait_irqoff`), which QEMU wakes from only with WII.  The ISA is R2
-  so that `mfc0/mtc0 $12, 2`, the SPL's second instruction, decodes; the
-  kernels are R1 and never notice. FIR.F64 is set (Status.FR stays 0):
-  QEMU decodes COP1X (MADD.D, MSUB.D...) on R2 only with it, and
-  OpenIPC's musl libm uses them -- libimp's rate control calls `logf`.
-  It has **MXU2**, Ingenic's 128-bit SIMD unit (32 × 128-bit registers;
-  the core manual's feature table gives the T-series MXU2 and not MXU1),
-  in `qemu/patches/0018-mips-ingenic-mxu2.patch`: Config1.C2 set, Status.CU2
-  writable, every instruction Coprocessor Unusable until CU2 is on -- the
-  kernels enable it lazily from that trap and save and restore the
-  registers with MXU2's own loads and stores. Encodings come from the
-  Ingenic toolchain's opcode table (`as -mmxu2`), semantics from the
-  intrinsic names and their MSA counterparts; the few that are guesses
-  are marked GUESS in the code. `qemu/tests/test-ingenic-mxu2.sh` checks
-  every instruction, the lazy enable and a context switch, and runs
-  libimp's MXU2 `jz_memcpy` (it needs the Ingenic toolchain and skips
-  without it).
-- `XBurst2` (T40, T41): PRId 0x00132100 (company 0x13, bits 15:13 = 1 is
-  what the 4.4 kernel calls XBurst2), FPU, RI/XI, UserLocal and **Config4.IE = 2**: the kernel flushes
-  the TLB with one `tlbinvf`, a no-op in QEMU without it.
-  It has **MXU3**, the 512-bit SIMD unit (32 × 512-bit registers, four
-  512-bit accumulators, 32 scalar registers; T41's MXU3.1 adds three
-  shuffles), in `qemu/patches/0019-mips-ingenic-mxu3.patch`, gated by
-  CU2 the same way. Encodings come from the Ingenic GCC 7.2 toolchain's
-  opcode table, semantics from the RTL its `mxu3.h` builtins expand to.
-  265 of the 496 mnemonics are exact; the rest -- reductions, strided
-  and gathered loads, the sub-byte forms and a few float and shuffle
-  ops, whose builtins are opaque to the compiler -- are approximations
-  or keep their destination, so code using them runs but may compute
-  wrong values. `qemu/tests/test-ingenic-mxu3.sh` checks representatives
-  of the exact groups, the lazy enable and two processes (the T40
-  kernel enables MXU3 on core 0 only; the test pins itself there), on
-  T40 from an initramfs and on T41 -- whose SDK kernel has no initramfs
-  -- as `/init` of a SquashFS on the NOR, under the SDK image's own
-  kernel; the T41 build (`-mmxu3.1`) also runs the three MXU3.1 shuffles
-  (`gshufvb`, `gshufwb_1`, `gshufwb_2`), whose builtins are opaque, so
-  there the check is that they decode, retire and are reported. The
-  T40XP camera's application and the T41 SDK image start without
-  SIGILL; their MXU3 code (libimp's motion detection and resize, the
-  libvenus networks) runs per video frame, so it is exercised once the
-  T40/T41 ISP feeds frames. The first execution of each approximated
-  mnemonic is logged under `-d unimp`, and `QEMU_MXU3_STATS=1` (`=all`
-  for every MXU3 mnemonic) prints execution counts at exit.
+### XBurst1 (T10–T31)
 
-The T21 and T23 have 16 KiB L1 caches where the others have 32 KiB; the
-machine sets that, and the T20's PRId, through the CPU's `l1-kib` and
-`prid` properties (`qemu/patches/0017-mips-prid-l1-size-properties.patch`).
-T23 reports its 128 KiB L2 (8 ways of 32-byte lines) in Config2
-(`0x80000347`); T40 and T41 report their 128 KiB L2 (the T40 product
-briefs, 8 ways of 64-byte lines in U-Boot's `isvp_t40.h`) in Config2 as
-well, so the Linux kernels print the L2 geometry and do its maintenance,
-with CCU 0x60 bits 12:10 reading 1 on XBurst2. The remaining XBurst1
-parts' L2 is not described.
+- **Identity and caches**: `PRId` is `0x00d00100` (`0x00d00101` on T20, matching camera boot logs). Models a 32-bit FPU (the kernels hard-code FPU presence and OpenIPC userspace is hard-float), 32 TLB entries (the kernel forces `tlbsize = 32` regardless of `Config1`), and 32 KiB 8-way caches. T21 and T23 have 16 KiB L1 caches; the machine sets `l1-kib` and T20's `prid` via `qemu/patches/0017-mips-prid-l1-size-properties.patch`. T23 reports its 128 KiB L2 (8 ways of 32-byte lines) in `Config2` (`0x80000347`); other XBurst1 chips do not report an L2 geometry.
+- **ISA, FPU, and idle behavior**: Implements MIPS32R2 decoding so `mfc0/mtc0 $12, 2` (the SPL's second instruction) executes without error, while 3.10 R1 kernels are unaffected. Sets `FIR.F64` (keeping `Status.FR = 0`) so QEMU decodes `COP1X` instructions (`MADD.D`, `MSUB.D`, ...) used by OpenIPC's `musl` `libm`, such as `logf` in `libimp` rate control. Enables `Config7.WII` so QEMU wakes from `wait` when the kernel idles with interrupts disabled (`jz_wait_irqoff`).
+- **MXU2 SIMD (`qemu/patches/0018-mips-ingenic-mxu2.patch`)**: Adds Ingenic's 128-bit SIMD unit (32 x 128-bit registers; note that T-series hardware includes MXU2 rather than MXU1, despite older manual summaries). `Config1.C2` is set and `Status.CU2` is writable. Every MXU2 instruction traps with Coprocessor Unusable until `CU2` is enabled, letting the kernel perform lazy trap-based context save/restore using MXU2's own loads and stores. Instruction encodings come from the Ingenic toolchain (`as -mmxu2`), and semantics come from intrinsic names and MSA equivalents (uncertain cases are marked `GUESS` in source). `qemu/tests/test-ingenic-mxu2.sh` verifies every instruction, lazy enable, context switch, and `libimp`'s MXU2 `jz_memcpy` (requires the Ingenic toolchain; skipped otherwise).
 
-The second XBurst2 core starts powered off. The kernel's
-`boot_secondary()` writes the entry to CCU RER and clears the core's CSRR
-bit, and the CCU starts it there (`-smp 1` gives one core).
+### XBurst2 (T40, T41)
 
-The machine also turns off QEMU's TLB "shadow" entries
-(`qemu/patches/0020-mips-tlb-shadow-property.patch`, CPU property
-`tlb-shadow`): when `tlbwr` replaces an entry QEMU normally keeps the old
-one as a hidden translation, valid as long as the guest drops mappings
-through `tlbp`, `tlbwi` or `tlbinv(f)`. On two cores the T40/T41 4.4
-kernel can tell: a user program now and then kept reading stale data
-through one of its pages for the rest of its life (a static T40 client's
-`pow()` returned garbage, so libimp's DMIC volume came out `inf` or 0 and
-recordings were constant 0x7FFF or silence in about 40 % of runs) while
-the kernel read the right bytes for the same page. Without the shadows
-`tlbwr` drops the old entry as a real TLB does.
+- **Identity, caches, and SMP**: `PRId` is `0x00132100` (company `0x13`, bits `15:13 = 1`, which Linux 4.4 identifies as XBurst2). Includes FPU, `RI`/`XI`, `UserLocal`, and `Config4.IE = 2` (without which single-instruction `tlbinvf` TLB flushes become no-ops). T40 and T41 report a 128 KiB L2 (T40 product briefs and U-Boot `isvp_t40.h`: 8 ways of 64-byte lines) in `Config2`, with CCU `0x60` bits `12:10` reading `1`, enabling Linux L2 detection and maintenance. Core 1 starts powered off until `boot_secondary()` writes its entry address to CCU `RER` and clears its `CSRR` bit (`-smp 1` runs single-core).
+- **MXU3 and MXU3.1 SIMD (`qemu/patches/0019-mips-ingenic-mxu3.patch`)**: Adds the 512-bit SIMD unit (32 x 512-bit vector registers, four 512-bit accumulators, 32 scalar registers, plus T41 MXU3.1's three extra shuffles), gated by lazy `CU2` trapping. Encodings come from the Ingenic GCC 7.2 toolchain's opcode table, and semantics come from RTL expansions in `mxu3.h`. Out of 496 mnemonics, 265 are exact; the remainder (reductions, strided and gathered loads, sub-byte forms, and several opaque float and shuffle intrinsics) are approximations or leave their destination untouched so code completes without crashing even if results are approximate.
+  - Under `-d unimp`, the first use of any approximated mnemonic is logged. Setting `QEMU_MXU3_STATS=1` (or `QEMU_MXU3_STATS=all` for every MXU3 mnemonic) prints execution counts at exit.
+  - `qemu/tests/test-ingenic-mxu3.sh` verifies representative exact groups, lazy `CU2` enabling, and two processes pinned to core 0 (the T40 kernel enables MXU3 only on core 0). It runs from initramfs on T40, and as `/init` inside a NOR SquashFS under the SDK kernel on T41 (since the SDK kernel lacks initramfs), where `-mmxu3.1` also checks decoding and retirement of `gshufvb`, `gshufwb_1`, and `gshufwb_2`. Both the T40XP camera app and the T41 SDK image start cleanly without `SIGILL`, exercising MXU3 per video frame (`libimp` motion/resize and `libvenus`).
 
-XBurst2 answers `rdhwr` for hardware registers MIPS leaves undefined
-(`qemu/patches/0022-mips-xburst2-hwr.patch`, on CPUs with MXU3): `$4` is
-the physical address the last `ll` touched -- the vendor kernels turn user
-addresses into physical ones with `ll; rdhwr $4` -- and `$8`..`$10` /
-`$11`, `$12` wait for the NNA DMA's read / write channels, which Ingenic's
-libvenus does from user space. HWREna keeps bits 4 and 8..12 (the
-`soc-nna` driver's `open()` writes it all ones and sets Status.CU2).
+### TLB shadow entries (`tlb-shadow`)
 
-## Identification
+When `tlbwr` replaces a TLB slot, upstream QEMU normally retains the evicted mapping in a hidden "shadow" translation cache as long as the guest uses `tlbp`, `tlbwi`, or `tlbinv(f)`. On dual-core T40/T41 Linux 4.4, user processes intermittently read stale data from a remapped page while the kernel read the current bytes for the same virtual address (for instance, `pow()` returned garbage in a static T40 client, making `libimp` DMIC volume calculate `inf` or `0` and producing constant `0x7FFF` or silent recordings in roughly 40% of runs). `qemu/patches/0020-mips-tlb-shadow-property.patch` adds the `tlb-shadow` CPU property, which the Ingenic machine disables so `tlbwr` drops the replaced entry like real hardware.
 
-Software tells the dies and their grades apart by three registers
-(ipctool `src/hal/ingenic.c`, after the vendor's libsysutils):
+### XBurst2 custom `rdhwr` registers
 
-- the SoC ID at 0x1300002C (`ingenic-harb`): bits 31:28 = 1, the family
-  in bits 19:12 (0x21, 0x23, 0x30, 0x31, 0x40, 0x41; bits 27:12 = 0x0005
-  on T10, 0x2000 on T20), a revision below;
-- CPM CPPSR's low byte: 0x10 on the L parts of T10/T20/T30, 1 otherwise;
-- a grade code in the upper half of the EFUSE's SUBSOCTYPE1 (0x13540238)
-  on T10..T31, SUBSOCTYPE2 (0x13540250) on T40/T41.
+On CPUs with MXU3, `qemu/patches/0022-mips-xburst2-hwr.patch` handles Ingenic's custom `rdhwr` registers:
+- **`$4`**: Physical address of the most recent `ll` instruction (used by vendor kernels via `ll; rdhwr $4` to translate user addresses to physical addresses).
+- **`$8`..`$10` and `$11`, `$12`**: Wait hooks for the NNA DMA read and write channels used directly from userspace by `libvenus`. `HWREna` holds bits `4` and `8..12` (the `soc-nna` driver's `open()` sets all ones in `HWREna` and enables `Status.CU2`).
 
-`-M <soc>,variant=<grade>` sets CPPSR and the code: `t10 t10l`, `t20
-t20l t20x`, `t21n t21l t21x t21z`, `t23n t23x`, `t30n t30l t30x t30a t30z`,
-`t31n t31l t31x t31a t31zl t31zx t31al t31zc t31lc`, `t40n t40nn t40xp
-t40a`, `t41nq t41n t41l t41lq t41lc t41zl t41zn t41zx t41a`; the first
-of each SoC is its default. DRAM stays `-m`. `ipctool` run in the guest
-reports the grade (T31X, T40XP, ...).
-
-T41's codes are the ones its SDK's SPL prints (`Board info: T41ZX` for
-0x6666, `T41A` for 0x4444), and ipctool names them the same. An older
-ipctool, such as the one in the T40 release root the `t41` majestic run
-boots, says `T41X` for 0x6666 and `unknown` for 0x4444. No code is
-known for the T41XQ: its U-Boot is the T41ZX's with another DDR skew, and
-it boots on `t41zx`. Each grade's U-Boot sizes the DDR it was built for,
-so `-m` must be at least that: 64M for L/LQ, 128M for N/NQ/A and 256M for
-ZX/XQ. With less, the T41ZX's SPL restarts over and over (seen at 64M).
+---
 
 ## Boot
 
-### The mask ROM
+### Mask ROM and SPI NOR
 
-`-M <soc>,flash-file=image.bin` (and no `-kernel`) boots a NOR image the
-way the mask ROM does:
+Using `-M <soc>,flash-file=image.bin` without `-kernel` emulates the on-chip Mask ROM NOR boot sequence:
 
-1. The SPL header at flash 0: `06 05 04 03 02 55 aa 55 aa`, a CRC7 of
-   bytes `[0x800, length)` in byte 9, the length (≤ 0x6800) at 0xC. The
-   CRC matches on every image we have; a mismatch is a warning.
-2. The SPL is copied to 0x80001000 and entered at 0x80001800 with
-   `sp = 0x80008000`: the SPL never sets its stack.
-3. On silicon that window is cache-as-RAM, locked cache lines with no
-   DDR behind them. Here too (`qemu/patches/0016-mips-cache-as-ram-window.patch`):
-   the CPU's `car-size`/`car-phys` properties send KSEG0
-   0x80000000-0x80007FFF to the 32 KiB at 0x1F000000 from reset until the
-   first instruction fetch from KSEG0 outside it -- the jump to U-Boot or
-   the kernel. The T41 SPL writes a pattern across all of DDR through
-   KSEG1 underneath itself, which would overwrite an SPL in DDR.
+1. **SPL header check**: At flash offset `0`, verifies the SPL magic (`06 05 04 03 02 55 aa 55 aa`), checks the CRC7 of `[0x800, length)` against byte `9`, and reads the SPL length (`<= 0x6800`) at `0xC` (emitting a warning on CRC mismatch).
+2. **Cache-as-RAM (CAR) window**: Copies the SPL to `0x80001000` and enters `0x80001800` with `sp = 0x80008000` (the SPL never sets its own stack). Using `qemu/patches/0016-mips-cache-as-ram-window.patch` (`car-size`/`car-phys`), QEMU maps `KSEG0` `0x80000000`–`0x80007FFF` onto the 32 KiB SRAM at `0x1F000000` from reset until the first instruction fetch outside that range (the jump to U-Boot or the kernel). This mirrors hardware locked cache lines and stops T41's SPL from overwriting itself when it writes test patterns across all of DDR through `KSEG1`.
+3. **Bootloader handoff and persistence**: The SPL initializes pinmux, UART1, TCU OST delays, CPM PLLs/dividers (every lock and busy poll succeeds immediately in `ingenic-cpm`), and DDR (`ingenic-ddr`). It then loads U-Boot from flash offset `0x6800` to `0x80100000` (LZO-compressed in OpenIPC builds, raw in vendor builds), and U-Boot boots Linux. Flash writes and erases write back to the image file so U-Boot's saved environment and JFFS2 overlay persist across boots.
 
-The SPL then does what it does on a camera: pinmux, UART1, the TCU's OST
-for its delays, PLLs and dividers (`ingenic-cpm` answers every lock and
-busy poll), DDR init (`ingenic-ddr` answers the PHY's), then loads U-Boot
-from flash 0x6800 to 0x80100000 -- LZO-packed in OpenIPC builds, raw in
-the vendor ones. U-Boot boots the kernel from flash. Erases and programs
-go back to the image, so the environment U-Boot saves on its first boot,
-and the JFFS2 overlay, persist.
-
-`-drive if=mtd,file=...` gives the NOR without booting from it. The NOR
-is a `w25q64` (8 MiB), `mx25l12805d` (16 MiB; QEMU has no W25Q128, and
-0xC22018 is in every vendor table) or `w25q256` (32 MiB), or
-`flash-type=` (including Zbit `zb25vq64` and `zb25vq128`).
+Use `-drive if=mtd,file=...` to attach NOR flash without booting from it. Default NOR parts are `w25q64` (8 MiB), `mx25l12805d` (16 MiB; QEMU has no `w25q128`, and JEDEC ID `0xC22018` is in all vendor tables), and `w25q256` (32 MiB), or choose explicitly with `flash-type=` (including Zbit `zb25vq64` and `zb25vq128`).
 
 ### SPI NAND
 
-A flash image of NAND size is a SPI NAND on the same SFC (SFC0 on every
-part: the T41 vendor boards and DT put NAND there too, SFC1 is optional).
-The image format is the page data of the whole part, or every page
-followed by its OOB; the size picks the part, `flash-type=` overrides:
+Any `flash-file` sized for SPI NAND attaches to `SFC0` (SFC0 is standard across all parts including T41 NAND boards; `SFC1` is optional). Raw page images keep OOB in RAM initialized to `0xFF` (all blocks good) on boot; full images with OOB read/write OOB in the file. Image size picks the part, or `flash-type=` overrides it:
 
-| Image size | Part (ID) | Geometry |
+| Image size | Part (JEDEC ID) | Geometry |
 |---|---|---|
-| 128 MiB, 132 MiB with OOB | `w25n01gv` (EF AA 21) | 2048 + 64, 64 pages/block, 1024 blocks |
-| 136 MiB with OOB (128 MiB: `flash-type=`) | `gd5f1gq4ub` (C8 D1) | 2048 + 128, 1024 blocks |
-| 256 MiB, 272 MiB with OOB | `gd5f2gq4ub` (C8 D2) | 2048 + 128, 2048 blocks |
-| 264 MiB with OOB | `mx35lf2ge4ab` (C2 22) | 2048 + 64, 2048 blocks, two planes |
+| 128 MiB, 132 MiB with OOB | `w25n01gv` (`EF AA 21`) | 2048 + 64 bytes, 64 pages/block, 1024 blocks |
+| 136 MiB with OOB (128 MiB via `flash-type=`) | `gd5f1gq4ub` (`C8 D1`) | 2048 + 128 bytes, 1024 blocks |
+| 256 MiB, 272 MiB with OOB | `gd5f2gq4ub` (`C8 D2`) | 2048 + 128 bytes, 2048 blocks |
+| 264 MiB with OOB | `mx35lf2ge4ab` (`C2 22`) | 2048 + 64 bytes, 2048 blocks, two planes |
 
-All four are in the SPL's, U-Boot's and both kernels' tables. Without
-OOB in the file the OOB is RAM and reads FF (all blocks good) on every
-start; programs and erases go back to the file either way.
+All four parts exist in SPL, U-Boot, and both kernel tables, and writes/erases persist to disk.
 
-The mask ROM's NAND path is the NOR one with a different header: byte 8
-is 00 (NOR: aa), byte 10 is pages per block / 32 and byte 11 bytes per
-page (page + OOB) / 1024 (`start.S`; 2112 bytes -> 2). The SPL is in
-the data area of the first pages, length at 0xC, CRC7 at 9, up to 28 KiB
-(the cache-as-RAM above 0x80001000). The SPL (`spl_sfc_nand.c`) probes
-the ID, unlocks, sets ECC/BUF/QE, and loads U-Boot raw from data offset
-0x6C00 (27 KiB) with page reads, `0x0B` reads from the cache and status
-polls; U-Boot's `jz_sfc_nand` reads the environment at 0xC0000/0xE0000
-(redundant) and saves it with erase and program.
+Mask ROM, U-Boot, and partition layouts:
+- **Mask ROM NAND header**: Same format as NOR except byte `8 = 00` (NOR: `aa`), byte `10 = pages_per_block / 32`, and byte `11 = (page + OOB) / 1024` (for example, `2112` bytes becomes `2` in `start.S`). Up to 28 KiB of SPL loads into CAR above `0x80001000` (length at `0xC`, CRC7 at `9`).
+- **SPL and U-Boot (`spl_sfc_nand.c`, `jz_sfc_nand`)**: Probes ID, unlocks protection, sets ECC/BUF/QE, reads U-Boot raw from data offset `0x6C00` (27 KiB) via page reads + `0x0B` cache reads + status polls, and stores redundant environments at `0xC0000` and `0xE0000`.
+- **3.10 burner partition table & `qemu-boot/ingenic-nand-image.sh`**: The 3.10 `jz_sfc_nand` driver creates no MTD partitions unless the vendor burner's partition table (magic `nand`, count, `{name[32], size, offset, mask_flags, manager_mode}`) appears at data offset `0x6800` inside SPL padding. `ingenic-nand-image.sh` builds a full image matching that layout:
 
-The 3.10 `jz_sfc_nand` registers no MTD at all without the burner's
-partition table at data offset 0x6800 (magic `nand`, a count, then
-`{name[32], size, offset, mask_flags, manager_mode}`), which the vendor
-burner writes into the SPL's padding. `qemu-boot/ingenic-nand-image.sh`
-builds a whole image the way the burner lays it out:
+```text
+0x000000  u-boot-with-spl.bin (SPL padded to 27 KiB + raw u-boot.bin)
+0x006800  Partition table: 1M(boot),8M(kernel),40M(rootfs),-(data)
+0x0C0000  U-Boot environment (blank; U-Boot saves on first boot)
+0x100000  uImage
+0x900000  UBI: "rootfs" = static SquashFS (ubi.block=0,0, root=/dev/ubiblock0_0)
+               "rootfs_data" = UBIFS overlay mounted by OpenIPC /init (holds /etc/fw_env.config)
+```
 
-    0         u-boot-with-spl.bin (SPL padded to 27 KiB, raw u-boot.bin)
-    0x6800    partition table: 1M(boot),8M(kernel),40M(rootfs),-(data)
-    0xC0000   U-Boot environment (blank; U-Boot saves it on first boot)
-    0x100000  uImage
-    0x900000  UBI: "rootfs" = the SquashFS, static (ubi.block=0,0,
-              root=/dev/ubiblock0_0); "rootfs_data" = UBIFS, the overlay
-              OpenIPC's /init mounts, holding /etc/fw_env.config
+- **OpenIPC SPI NAND fixes**: Stock `isvp_<soc>_sfcnand` builds fail because `isvp_common.h` overwrites NAND settings with NOR values (producing a 230 KiB U-Boot that SPL only partially loads, `sf` boot commands, and a `0x40000` env offset inside U-Boot). `qemu-boot/ingenic-uboot-sfcnand.patch` restores the NAND config. Bundling `/etc/fw_env.config` prevents OpenIPC's `fw_printenv` from scanning all 128 MiB via `mtdblock` for minutes. `qemu-boot/test-ingenic-nand.sh` boots twice and verifies persisted U-Boot env and UBIFS files.
+- **T41 vendor NAND layout (`ingenic-nand-image.sh --layout t41`)**: Vendor `isvp_t41*_sfc0_nand` U-Boot puts `uImage` at 1 MiB (3 MiB) and UBIFS `rootfs` at 4 MiB, passing `mtdparts=sfc0_nand:` on cmdline (4.4 reads the burner table at `0`, finds the SPL, and falls back to `mtdparts=`); `--env` writes the environment. Because T41 SPL `epc_debug.c` copies a core-1 stub to `0x12660000` inside NNA ORAM (`0x12600000`) and starts core 1 via CCU, ORAM must be backed by RAM or core 1 jumps into boot ROM exception vectors and hangs the SPL at random. Because SDK 4.4 `isvp_tomcat_nand_defconfig` kernels suffer an OST interrupt storm on core 1 (`"ost couldn't find ostfr"`), the T41 NAND test boots with `maxcpus=1`.
+- **Direct `-kernel` NAND defaults**: Pairing `-kernel` with a NAND image automatically supplies `ubi.mtd=2 ubi.block=0,0 root=/dev/ubiblock0_0` and `mtdparts=sfc_nand:` (`sfc0_nand:` on T41).
 
-OpenIPC's `isvp_<soc>_sfcnand` builds do not work as they are:
-`isvp_common.h` overrides the NAND settings with the NOR ones (a 230 KiB
-U-Boot that the NAND SPL loads only partly, `sf` boot commands, the
-environment at 0x40000 inside U-Boot). `qemu-boot/ingenic-uboot-sfcnand.patch`
-restores them. And OpenIPC's `fw_printenv` without a config reads every
-partition through mtdblock looking for the environment, which takes
-minutes on 128 MiB of emulated NAND; the image's overlay carries the
-config. `qemu-boot/test-ingenic-nand.sh` boots such an image twice (SPL,
-U-Boot saving its environment, UBI, the SquashFS root, the UBIFS overlay,
-login, a file written) and checks the second boot sees the environment
-and the file.
+### Direct `-kernel` boot
 
-On T41 the vendor U-Boot (`isvp_t41*_sfc0_nand`) has its own layout,
-`ingenic-nand-image.sh --layout t41`: the uImage at 1 MiB (3 MiB), UBI
-at 4 MiB with a UBIFS volume `rootfs`, `mtdparts=sfc0_nand:` on the
-command line (the 4.4 driver looks for the burner table at offset 0, per
-the DT, finds the SPL and falls back to `mtdparts=`); `--env` writes the
-environment. The T41 SPL's `epc_debug.c` copies a stub to the on-chip
-RAM at 0x12660000 (inside the NNA's ORAM) and runs core 1 on it through the CCU, so that RAM is
-modelled: without it core 1 ran off the I/O space into the boot ROM's
-exception vector and back into the SPL, and the SPL hung at random. A
-4.4 kernel built from the SDK tree (`isvp_tomcat_nand_defconfig`) storms
-on core 1's OST interrupt ("ost couldn't find ostfr"), NAND or not; the
-tested T41 NAND image boots it with `maxcpus=1`.
+`-kernel uImage` (LZMA, gzip, or uncompressed) or ELF sets UART1 `LCR` non-zero (early console picks the first UART with non-zero `LCR`) and enters the kernel using U-Boot arguments (`a0 = 2`, `a1 = argv`, `a2 = envp`). With `-dtb`, QEMU switches to the MIPS UHI boot protocol (`a0 = -2`, `a1` pointing to the FDT in `KSEG0`, updating `/chosen`'s `bootargs`, `linux,initrd-start`, and `linux,initrd-end`).
 
-`-kernel` with a NAND image boots with `ubi.mtd=2 ubi.block=0,0
-root=/dev/ubiblock0_0` and `mtdparts=sfc_nand:` (T41: `sfc0_nand:`) by
-default.
-
-### `-kernel`
-
-`-kernel uImage` (LZMA, gzip or none) or an ELF, with `-initrd` and
-`-append`, boots the way U-Boot's `bootm` does: a stub in the boot ROM
-sets UART1's LCR (the kernels' early console takes the first UART whose
-LCR is not zero) and calls the entry with `a0 = 2`, `a1 = argv`
-(`argv[1]` the command line), `a2 = envp`. With `-dtb`, the machine uses
-the MIPS UHI boot protocol instead (`a0 = -2`, `a1` pointing to the FDT
-in KSEG0, updating `/chosen`'s `bootargs`, `linux,initrd-start`, and
-`linux,initrd-end`). Unless `auto-mem=off` is given, a command line
-without `mem=` gets the U-Boot default for the RAM size (`mem=` and
-`rmem=`); `-initrd` goes at 16 MiB and is passed as `rd_start=`/`rd_size=`.
+- Unless `auto-mem=off` is set, missing `mem=` triggers default U-Boot `mem=` and `rmem=` values for the configured `-m` size, and `-initrd` loads at 16 MiB with `rd_start=` / `rd_size=`.
+- For Device Tree kernels using reusable CMA, pass `-M t23,auto-mem=off` and omit `mem=`, `rmem=`, and `SDKMem=` from `-append` so DT `/memory` and `/reserved-memory` take effect unaltered.
+- With no `-append`, the default OpenIPC command line is used: `console=ttyS1,115200n8`, `root=/dev/ram0` (with initrd) or `/dev/mtdblock3`, and OpenIPC `mtdparts` on `jz_sfc` (`sfc0_nor` on T41).
 
 ```bash
 ./qemu-src/build/qemu-system-mipsel -M t31 -m 64M -nographic \
     -kernel uImage.t31 -initrd rootfs.squashfs.t31 -nic user,restrict=on
 ```
 
-With no `-append` the command line is OpenIPC's: `console=ttyS1,115200n8`,
-`root=/dev/ram0` with an initrd (else `/dev/mtdblock3`), and the OpenIPC
-`mtdparts` on `jz_sfc` (`sfc0_nor` on T41).
-
 ### OpenIPC images
 
-OpenIPC releases a `u-boot-<soc>-nor.bin` (T40: `u-boot-t40n-universal.bin`)
-and the `-nor-lite` kernel and rootfs, but no full image. Laid out as
-the U-Boot environment expects -- U-Boot at 0, the uImage at 0x50000,
-the SquashFS at 0x250000 -- they boot from flash;
-`qemu-boot/test-ingenic-boot.sh --mode flash` builds that image and
-fetches the U-Boot.
+OpenIPC ships `u-boot-<soc>-nor.bin` (`u-boot-t40n-universal.bin` on T40) and `-nor-lite` kernel/rootfs binaries without pre-assembled full flash images. Placing U-Boot at `0`, `uImage` at `0x50000`, and SquashFS at `0x250000` matches U-Boot's environment and boots via `flash-file=`; `qemu-boot/test-ingenic-boot.sh --mode flash` downloads OpenIPC U-Boot and builds/boots that image.
 
 ### Vendor SDK images
 
-The T41, T40 and T30 SDKs ship full NOR images
-(`resource/image_t*/<GRADE>_gcc*_<libc>_<8|16>M_*.img`, with a `.txt`
-naming the U-Boot model and the drivers): SPL at 0, U-Boot at 0x6800,
-its environment at 0x3C000, the uImage at 0x40000, the root SquashFS at
-0x2C0000 and a JFFS2 `appfs` (`/system`: modules, `carrier-server`,
-`start.sh`) after it. They boot from `flash-file=` as they are. The
-grade decides the DRAM, which the bootargs split: T41LQ 64 MiB
-(`mem=32M rmem=32M`), T41NQ / T40N 128 MiB, T41XQ / T40XP 256 MiB, T30X
-128 MiB; pass that `-m` and `variant=`. The userspace has no DHCP
-client: rcS starts telnetd, `app_init.sh` gives eth0 a static address
-(193.169.4.151 on most images, 10.3.33.235 on the T41LQ ones and the
-T41NQ 8 MiB one) and runs `start.sh`, which loads the ISP, audio and
-sensor modules for the sensor sinfo finds and starts `carrier-server`, a
-live555 RTSP server (`rtsp://<address>:8554/main`, `/second`). Root has
-no password. `qemu-boot/test-ingenic-sdk-boot.sh --image <img>` takes
-the grade, RAM and sensor from the image, rebuilds the root so that rcS
-runs `app_init.sh` at the test's address (and, with a sensor and
-`--no-direct-mode`, without IVDC's `direct_mode`), puts QEMU's user network on that /24 with host
-forwards for telnet and RTSP, logs in over telnet
-(`qemu-boot/ingenic-telnet.py`), pulls and decodes the stream, and
-reboots the camera over telnet once.
+T41, T40, and T30 SDKs ship full NOR flash images (`resource/image_t*/<GRADE>_gcc*_<libc>_<8|16>M_*.img` accompanied by a `.txt` naming the U-Boot model and drivers): SPL at `0`, U-Boot at `0x6800`, environment at `0x3C000`, `uImage` at `0x40000`, root SquashFS at `0x2C0000`, followed by JFFS2 `appfs` (`/system`: kernel modules, `carrier-server`, and `start.sh`).
 
-## Devices
+Pass `-m` and `variant=` matching the image grade (`T41LQ`: 64 MiB with `mem=32M rmem=32M`; `T41NQ`/`T40N`/`T30X`: 128 MiB; `T41XQ`/`T40XP`: 256 MiB). These images have passwordless root via `telnetd` and no DHCP client: `app_init.sh` configures static `eth0` (`193.169.4.151` on most images; `10.3.33.235` on T41LQ and 8 MiB T41NQ), and `start.sh` loads ISP/audio/sensor modules based on `sinfo` and launches `carrier-server`, a live555 RTSP server (`rtsp://<address>:8554/main`, `/second`).
 
-### `ingenic-cpm`
+`qemu-boot/test-ingenic-sdk-boot.sh --image <img>` extracts grade, RAM, and sensor metadata from the image, rebuilds the rootfs so `rcS` invokes `app_init.sh` with test networking (and without IVDC `direct_mode` when `--no-direct-mode` is passed), forwards telnet and RTSP over slirp user networking, logs in over telnet (`qemu-boot/ingenic-telnet.py`), pulls and decodes the stream, and reboots once over telnet.
 
-Storage plus the handshakes, none of which have a timeout that would
-rescue a wrong answer: a PLL's ON bit (and LOCK, where the layout has
-one) follows its enable; CPCCR's change bits read back clear and CPCSR's
-busy bits read 0; a divider written with CE completes at once, so BUSY
-reads 0 -- bit 28, or bit 27 in the T21..T31 SSI/SFC and LPC dividers.
-The I2S dividers are M/N pairs with M in bits 28:20 and are left alone.
-The reset values are what the vendor U-Boot leaves, in each SoC's PLL
-encoding, because the kernels' clock code oopses before the console if a
-divider's mux reads 3 or DDRCDR's reads 0:
+---
 
-| Encoding | SoCs | Rate |
+## System and peripheral devices
+
+### Clocks and power (`ingenic-cpm`)
+
+Most CPM registers act as read/write storage, except clock and power handshakes (none of which have software timeouts, so incorrect readback hangs boot):
+- PLL `ON` bits (and `LOCK` bits where present) immediately follow their enable bits.
+- `CPCCR` change bits read back clear and `CPCSR` busy bits read `0`. Any divider written with `CE` clears `BUSY` immediately (bit `28`, or bit `27` for T21–T31 SSI/SFC and LPC dividers). I2S fractional `M`/`N` dividers (with `M` in bits `28:20`) remain unmodified.
+- Reset values match what vendor U-Boot leaves in each chip's PLL encoding so early kernel init does not oops on divider mux `3` or `DDRCDR = 0`.
+- `CPPSR` and `CPSPPR` preserve reboot signatures checked by reboot-recovery code.
+- `LCR` power domains immediately acknowledge state changes (bit `24 + m` mirrors bit `28 + m`) for the 3.10 suspend path (`soc-t31/common/pm.c` `DISABLE`/`ENABLE_LCR_MODULES`, though no shipped kernel enables PM).
+
+| PLL encoding | SoCs | Rate |
 |---|---|---|
-| M[31:20] N[19:14] OD1[13:11] OD0[10:8] | T10, T20, T23, T31, T40 | 24 MHz × M / N / OD1 / OD0 |
-| M[28:20] N[19:14] OD[13:11] RNG[7:5] | T21, T30 | 24 MHz × 2(M+1) / (N+1) / 2^OD |
-| M[28:20] N[19:14] OD0[13:11] OD1[10:7] RG[6:4] | T41 | 24 MHz × 2(M+1) / (N+1) / 2^OD0 / (OD1+1) |
+| `M[31:20] N[19:14] OD1[13:11] OD0[10:8]` | T10, T20, T23, T31, T40 | `24 MHz x M / N / OD1 / OD0` |
+| `M[28:20] N[19:14] OD[13:11] RNG[7:5]` | T21, T30 | `24 MHz x 2(M + 1) / (N + 1) / 2^OD` |
+| `M[28:20] N[19:14] OD0[13:11] OD1[10:7] RG[6:4]` | T41 | `24 MHz x 2(M + 1) / (N + 1) / 2^OD0 / (OD1 + 1)` |
 
-CPPSR/CPSPPR keep what is written: the reboot code writes a signature,
-and "reboot recovery" waits to read it back. LCR's power domains answer
-at once -- bit 24 + m reports what bit 28 + m asks -- the handshake the
-3.10 suspend path (`soc-t31/common/pm.c` DISABLE/ENABLE_LCR_MODULES) spins
-on before the sleep and after the wake; no shipped kernel enables PM.
+### Timers, watchdog and PWM (`ingenic-ost`, `ingenic-tcu`, `ingenic-pwm`)
 
-### Timers: `ingenic-ost` and `ingenic-tcu`
+- **OST (`ingenic-ost`, `0x12000000`)**: Clocked at `EXTAL / 4^n`. Channel 1 counts to `T1DFR`, sets `TFR` bit `0`, wraps to `0`, and interrupts `IP4` when unmasked (clockevent). Channel 2 is a 64-bit free-running clocksource whose low-word read latches the high word into a shadow buffer. XBurst2 splits these into global OST (counter 2) and per-core OST (`0x12100000 + 0x100*n`, counter 1 behind `CCU OIMR`).
+  - *XBurst1 vs XBurst2 gating*: XBurst1 system OST gates its interrupt with `TER` bit `0` in addition to `TFR & ~TMR`, whereas XBurst2 core OST drives `TFR & ~TMR` even while stopped: T41 Linux 4.4's `set_next_event` and shutdown stop the counter before its handler clears `TFR`, and suppressing the line while stopped caused core 1 to storm `"ost couldn't find ostfr"` (as seen on the SDK NAND kernel and SDK image under host load).
+- **TCU (`ingenic-tcu`, `0x10002000`)**:
+  - *Bootloader OST (`0x10002000 + 0xE0`)*: Enabled via `TESR` bit `15` (`EXTAL/4`); required for SPL and U-Boot `mdelay`.
+  - *Watchdog*: Counts while `TCER` bit `0` is set and `TSR` bit `16` is clear, resetting the SoC at `TDR`. U-Boot and every kernel (including T40, whose own restart hook is empty) reboot through it. On XBurst2, `TSR` bit `16` does not stop the watchdog and `TCSR` bit `10` zeroes the counter: Linux 4.4 probes with the stop bit set without clearing it, and restart writes `TCSR` bit `10`, `TDR`, clock, and `TCER` while spinning on `"check wdt."`.
+  - *Timers & PWM*: Each channel counts from `0` at its `TCSR` clock, setting half flag (`TFR` bit `n + 16`) at `TDHR` and full flag (bit `n`) at `TDFR` before wrapping (`TCU0` = ch0, `TCU1` = ch1, `TCU2` = ch2..7). Linux 3.10 `jz_tcu` (`jz_tcu.c`) demuxes all channels off `TCU2`, driving OpenIPC `motor.ko` and SDK `sample_motor` on channel 2's full interrupt (`test-ingenic-motor.sh`). With PWM enabled (`TCSR` bit `7` on, bit `8` initial level, bit `9` shutdown; OpenIPC `jz_tcu.c` / SDK `sample_pwm`), the pin starts at the initial level, toggles at `TDHR`, and ends at `TDFR`. `qom-get /machine/tcu pwm2` reports `high/period` ticks, constant `0`/`1`, or `off`.
+  - *Warm-reset TB flush (`ingenic_tb_reset` in `hw/mips/ingenic.c`)*: Watchdog and `system_reset` flush all QEMU translated blocks. Without flushing, ASLR shared-library mappings from boot 1 accumulated up to 64k cached blocks per physical page on T40, slowing boot 2's overlay mount from 3 s to 32–43 s and causing RCU stalls when running `majestic`. Verified by `test-ingenic-boot.sh --reset` comparing two consecutive mount times in one QEMU process.
+- **T41 PWM (`ingenic-pwm`, `0x13460000`, `pwm-ingenic.c` 4.4)**: Models `ENS`/`ENC` over `EN`, `WCFG` updates on `UPDATE`, clear `BUSYR`, `LVL`, `OEN`, and DMA register storage. Read pin state via `qom-get /machine/pwm chan2` (`high/period`, `0`, or `1`). Other SoCs use TCU channels for PWM.
 
-The kernels' clock is the OST at 0x12000000: counter 1 counts to T1DFR,
-sets TFR bit 0, starts again from 0 and interrupts IP4 directly while
-unmasked (the clock event); counter 2 is a 64-bit free-running clock
-source whose low half latches the high one into a buffer. On XBurst2 the
-two are separate blocks under other names: a global OST (counter 2) and
-one core OST per core (counter 1) behind the CCU's OIMR. Both run from
-EXTAL through a 4^n prescaler. XBurst1's system OST gates its line with
-`TER` bit 0 as well as `TFR & ~TMR`; XBurst2's core OST follows TFR & ~TMR whether or
-not the counter runs: the T41 kernel's `set_next_event` and shutdown
-stop the counter with the flag up and its handler clears the flag after,
-and a line left high there (the model did) made core 1 storm with "ost
-couldn't find ostfr" -- what the SDK NAND kernel did, and the SDK image
-too under host load.
+### Interrupt controllers and CCU (`ingenic-intc`, `ingenic-ccu`)
 
-The SPL and U-Boot use a different counter: the OST inside the TCU at
-0x10002000 + 0xE0, enabled by TESR bit 15, EXTAL/4. If it does not count,
-the first `mdelay` hangs. The TCU's watchdog counts while TCER bit 0 is set
-and TSR bit 16 is clear, and resets the machine at TDR: that is how
-U-Boot and every kernel here reboot (the T40 kernel's own restart hook is
-empty). On XBurst2 TSR bit 16 does not stop the watchdog and TCSR bit 10
-zeroes its counter: the 4.4 kernels' watchdog driver sets the stop bit at
-probe and nothing clears it, and their restart writes TCSR bit 10, TDR,
-the clock and TCER and spins ("check wdt."). Each channel counts at its
-TCSR clock from 0; reaching TDHR sets its half flag (TFR bit n + 16) and
-reaching TDFR its full flag (bit n), the counter starting again from 0,
-each on time (a timer per channel), and the flags interrupt unless TMR
-masks them: TCU0 for channel 0, TCU1 for 1, TCU2 for 2..7. The 3.10
-`jz_tcu` demuxes every channel off TCU2, and OpenIPC's `motor.ko` and
-the SDKs' `sample_motor` step on channel 2's full interrupt
-(`test-ingenic-motor.sh`). Each channel's PWM pin (TCSR bit 7 output on,
-bit 8 initial level, bit 9 shut down; OpenIPC's `jz_tcu.c` and the SDKs'
-`sample_pwm`) starts a period at the initial level and flips at TDHR,
-until TDFR: `qom-get /machine/tcu pwm2` reads it as `high/period` counter
-ticks while the channel counts, `0` / `1` for a level that stays, or
-`off` while the TCU does not drive the pin.
+- **`ingenic-intc`**: Two banks of `ISR`/`IMR`/`IMSR`/`IMCR`/`IPR` registers, all masked out of reset, raising `IP2` whenever an unmasked source is pending.
+- **`ingenic-ccu`**: On XBurst2, mirrors core INTC views over shared interrupt sources alongside `PIMR`/`MIMR`/`OIMR` (`IP2`/`IP3`/`IP4` masks — core 0's INTC and OST bits start enabled at reset because guest code never sets them), IPI mailboxes, `CSSR` (bit `n` indicates core `n` halted), and core reset/entry registers.
 
-A reset, from the watchdog or the monitor's `system_reset`, also drops
-every translated block (`ingenic_tb_reset` in `hw/mips/ingenic.c`). QEMU
-files each block under the physical page it came from and keeps it until
-that page is written; a shared library page that the first boot's
-processes mapped at as many randomised addresses ends up with up to 64k
-blocks (measured after a T40 lite boot). The second boot uses those pages
-as plain memory, and each store into one searched that list: a T40 that
-rebooted mounted its overlay at 32-43 s instead of 3 s, and on the release
-with majestic, crawled into RCU stalls. `test-ingenic-boot.sh --reset`
-boots twice in one QEMU and compares the two mounts.
+### DDR controller (`ingenic-ddr`)
 
-### `ingenic-intc`, `ingenic-ccu`
+Acts as storage except for polled PHY/DDRC initialization status bits reading done: DWC PHY `PGSR` (T10/T20), Inno PHY PLL lock/init/calibration registers (exact `3` on T21–T31), T40/T41 calibration offsets, and self-clearing `DDRC LMR` start bit. Remap registers remap nothing; DRAM size comes from `-m`.
 
-The INTC is two banks of ISR/IMR/IMSR/IMCR/IPR, everything masked out of
-reset, any pending source raising IP2. The XBurst2 core INTC is the same
-once per core over shared source levels; the CCU adds the per-core
-IP2/IP3/IP4 enables (PIMR/MIMR/OIMR -- core 0's INTC and OST bits are set
-at reset, since nothing sets them), the mailboxes that carry the IPIs,
-CSSR (bit n while core n is halted) and the core reset/entry pair.
+### GPIO (`ingenic-gpio`)
 
-### `ingenic-sfc`
+Models `S`/`C` set/clear aliases on all registers, shadow port Z (`GID2LD` applying masks), output level readback, pull-high undriven inputs, and one IRQ per port. External pin levels can be driven live via `/machine/gpio` properties (`pa`..`pf`), e.g. `qom-set /machine/gpio pc 0xfffffffe` pulls `PC0` low and triggers configured edge/level interrupts (`test-ingenic-gpio.sh` tests both edges on T31 sysfs).
 
-The flash controller of every part, v1 (T10..T31) and v2 (T40, T41) in
-one model. A transfer is a list of phases (command, 0..7 address bytes,
-dummy clocks, data) run on TRIG.START. The SPL and U-Boot move data by
-PIO through the FIFO at +0x1000, polling RREQ/TREQ and END; the 3.10
-kernels take the same flags as a level interrupt and DMA everything but
-the JEDEC ID. v2 adds the command table at +0x800 (entries chained with
-LINK, each taking its address from COL/ROW/STA0/STA1, status-poll
-entries) and descriptor DMA, which the 4.4 kernels use; the SPL and U-Boot
-keep the single-command path. Three details matter:
+### UARTs (paced 16550 and PDMA)
 
-- END means the data is all in the FIFO, not that the CPU has drained it:
-  it is raised once what is left of a read is one RREQ's worth, the GLB
-  THRESHOLD in words (at least one). The vendor U-Boots read the words
-  they want and then wait for END, leaving part of a word behind on a
-  two-byte status read; a new START closes whatever the last read left.
-  The T41 U-Boot's `jz_sfc_v1` loop goes the other way: one SR snapshot,
-  THRESHOLD words on RREQ, stop on END in the same snapshot -- an END
-  any earlier loses the words past the threshold (it did: the last 64
-  bytes of every 2 KiB NAND page).
-- DMA addresses are taken modulo 512 MiB. The T41 kernel hands the
-  controller `virt_to_phys()` of its uncached descriptor buffer --
-  0x2xxxxxxx for RAM at 0x0xxxxxxx -- so the silicon evidently decodes
-  29 bits.
-- The NOR is an m25p80 on the SSI bus, with the 4 KiB (20h) and 32 KiB
-  (52h) erases the real parts have (patch 0024: W25Q64, W25Q256, and
-  the 0xC22018 ID that MX25L12805D/12835F/12845E share). It counts fast-read dummies in
-  clocks, one transfer each, which is what DMYBITS holds; an address
-  longer than the part's (the T41 SPL probes with 6 bytes) reads data,
-  as on a real chip.
-- A POLL_EN phase (the NAND drivers' wait on OIP, also as a CDT entry)
-  reads the status until it matches and leaves the last value in
-  DEV_STA_RT (0x0C): the drivers take P_FAIL, E_FAIL and the ECC bits
-  from there.
+All UARTs (`0x10030000 + 0x1000*n`, UART0..3 or UART0..5 on T41) use `serial-mm` with 64-byte FIFOs, 4-byte strides, `+0x20` (`ISR`/`UMR`/`UACR`) storage, PDMA requests `0x14 - 2*n` (TX) / `0x15 - 2*n` (RX), and `EXTAL / 16` (`1.5 MHz` baud base; divisor `13` for `115200`):
 
-### `ingenic-spinand`
+- **Line-rate TX pacing (`qemu/patches/0021-...`)**: On T40/T41 Linux 4.4, `ingenic_uart.c`'s IRQ handler sends and stops TX without holding the port lock, racing `start_tx` on the second CPU core. Instantaneous QEMU writes returned `THRE` immediately and lost this race within a few hundred lines (`test-ingenic-audio.sh --soc t41 --console-load` stalled after lines 26, 101, and 279 in 3/3 runs). Enabling `paced` mode (`tx-fifo=64`, where the driver loads 32 bytes per IRQ) drains characters at real baud intervals (~11.5 KB/s), passing 3/3 500-line stress runs and 10/11 OpenIPC T40 boots (one still went quiet after app start, matching silicon's race window). Boot takes ~2 s longer and a 420 KB console flood takes 41 s vs 6 s; harnesses wait for drain before power-off.
+- **Line-rate RX pacing and PDMA (`qemu/patches/0023-...`)**: Incoming bytes arrive at character intervals (~`2.8 ms` to fill a 32-byte burst at `115200` baud, keeping the window between reading DMA residue and halting the channel as narrow as on silicon) using `jz47xx` 64-byte RX FIFO trigger levels (`1`, `16`, `32`, `60`), standalone `IER` bit `4` (`RTOIE`), and `FCR` `DMS` mode (TX PDMA asserted whenever TX FIFO has room; RX PDMA asserted in bursts equal to the trigger level, holding shorter tails for `RTOIE`). Matches `jz_uart.c` under `CONFIG_SERIAL_JZ47XX_UARTn_DMA` (trigger `32`, 32-byte PDMA bursts into two 1 KiB buffers, `IER = 0x14`, no `RDI`). `test-ingenic-uart-dma.sh` passes 32 KiB loopback on `ttyS0` (3/3 runs), and exposed two kernel bugs: T31's `jzdma_pdata` only defines channels for UART0 and UART1 (so `UART2_DMA` dereferences a null channel), and driver close leaks/frees RX buffer pages improperly (`"Bad page state"` at close, so the test keeps the port open).
 
-A SPI NAND on the SSI bus (`hw/block/ingenic-spinand.c`), one QOM type
-per part (`w25n01gv`, `gd5f1gq4ub`, `gd5f2gq4ub`, `mx35lf2ge4ab`,
-`gd5f1gq5ue`): READ ID
-(the ID after one dummy byte; the drivers try without and with it), page
-read to the cache (0x13), read from cache 0x03/0x0B/0x3B/0x6B (two column
-bytes, 8 dummy clocks; the bit above the column is a plane select that a
-one-plane part ignores -- the 4.4 driver sets it from the page number
-for every part), program load 0x02/0x32 (cache to FF first) and random
-load 0x84/0x34, program execute 0x10 (page &= cache, needs WEL), block
-erase 0xD8, get/set feature A0 (protection; locked at power-up, and
-program/erase fail with P_FAIL/E_FAIL while any BP bit is set), B0
-(ECC enable, BUF, QE), C0 (status), D0/F0, write enable/disable, reset.
-Operations finish at once; `busy-polls=n` keeps OIP up for the next n
-status reads after each one.
+### I2C, SPI, ADC and stepper motors (`ingenic-i2c`, `ingenic-ssi`, `ingenic-sadc`, `motor=`)
 
-On-die ECC reports no error of its own. `ecc-fail=` makes it: a list of
-absolute page numbers and ranges (`4470,16190-16191`) whose page read sets
-the status ECC bits 5:4 to 10b, uncorrectable, while ECC is on (B0 bit 4).
-The data still reaches the cache, as on a part, so it tests what the host
-does with the error. The 3.10 `jz_sfc_nand` returns -EBADMSG from
-`mtd_read` for it (for C8 51 and the D1..D4 GigaDevice parts; B1..B4 want
-111b), which mtdblock turns into `Buffer I/O error` and `/dev/mtdN`'s
-`read()` ignores -- the camera in OpenIPC/ipctool#283, reproduced with:
+- **`ingenic-i2c`**: `DW_apb_i2c` master with 8/16/32-bit accesses, instant command completion, `TXABRT` bit `0` on unaddressed devices, `ENSTA` tracking `ENB`, and PDMA handshakes (`DMACR` bit `0` `RDMAE` / bit `1` `TDMAE`, `DMATDLR`/`DMARDLR` at `0x88..0x90`, named and printed by both vendor drivers including `i2c-v12-jz.c`: TX asserted while `TDMAE` is set; RX asserted above `DMARDLR` for `DMARDLR + 1` `DATA_CMD` reads; checked by qtest since no driver enables I2C DMA). Image sensors sit on `I2C0` (or `I2C1` on T40).
+- **`ingenic-ssi`**: SPI master (`jz_spi.c`, `ingenic_spi.c`) sending `FLEN + 2` bits MSB-first into a 128-entry RX FIFO (`CR0 LOOP` / `DISREV`, `CR1 UNFIN` raising `UNDR` vs `END` + CE release, `CR0 FSEL` selecting `CE`/`CE2` on cs `0`/`1`, e.g. `-device w25q80,bus=ssi0`, PDMA `0x16`/`0x17` SSI0 and `0x18`/`0x19` SSI1). Unused by shipped configs. The SSI slave (`0x10040000`) is unmodelled: although `JZ_SPI_SLAVE` appears in Kconfig and T31 platform definitions (and T40 datasheets list pins `SSI_SLV_CLK`/`CE0`/`DT`/`DR`), no 3.10/4.4 kernel, U-Boot, SDK sample, or any of the 51 vendor PDFs contains a driver or register contract.
+- **`ingenic-sadc` (`jz_adc_v13.c`, `ingenic_adc_v13.c`, `jz_adc.h`)**: `ENA` bit `15` powers down; setting bit `n` converts AUX channel `n` in `20 us`, clears bit `n`, sets `STATUS` bit `n` (W1C), and interrupts unless masked by `CTRL`. Runtime levels (`0..4095`, `1.8 V` full scale, mid-scale default) are exposed at `/machine/sadc` as `auxN` (`qom-set /machine/sadc aux0 1234`). Inferred continuous DMA mode (`ADCFG` bit `15` `DMA_EN`, PDMA `SADC_RX` request `9`) scans enabled channels every `20 us` into an 8-word queue at port `0x10` (`AUX1:AUX0`, `AUX3:AUX2`, ...), dropping scans if full.
+- **Stepper motors (`motor=`)**: Attaches `/machine/motor-chip` (inferred from SDK samples, verified by qtest; no shipped kernel enables `sample_motor3`'s SPI driver):
+  - `ms41929` (`ingenic-ms41929`, `sample_motor3`'s `ms419xx_spi_dev.c` / `motor.c`) on `SSI0` CE: 1-byte address (bit `6` = read) + 16-bit LE register data (`0x20..0x2F`). Falling edges on `VD`/`VDFZ` (`PB25`) step channels `AB` (`0x24`) and `CD` (`0x29`) by `PSUM` (`bits 7:0`, direction bit `8`, channel-on bit `10`); `PB26` low resets. Read `pos-ab` / `pos-cd` via QOM.
+  - `ms32006` (`ingenic-ms32006`, `sample_motor_i2c`) at `0x10` on `I2C1`: byte writes (`reg`, `val`; supports pointer write + no-stop data write); `0x00` chip-on (`bit 0`) and pause `A`/`B` (`bits 2`/`1`), `0x01..0x04` motor A 14-bit speed (`speed x 128` 24 MHz cycles) and 12-bit steps (`bit 15` output on, `bit 14` CCW), `0x05..0x08` motor B, `0x09` run `A`/`B` (`bits 7`/`6`, self-clearing) and IR-cut (`bits 3:2`). Counts down in virtual time; read `pos-a`, `pos-b`, and `ircut` via QOM.
+
+### RTC, eFuse and OTG PHY (`ingenic-rtc`, `ingenic-efuse`)
+
+- **`ingenic-rtc`**: `WRDY` always `1`, `WEN` follows `0xA55A` unlock (polled without timeout on power-off), tracks host seconds, `HCR.PD` powers off, `RTCCR.1HZ` sets every second, `RTCSR == RTCSAR` sets `AF` when `AE` is set, IRQ (`32` on T10–T31, `3` on T41, none named on T40) tracks `(AF & AIE) | (1HZ & 1HZIE)` (`rtc-jz.h`), and `HWCR.EALM` latches `HWRSR.ALM` to wake suspend (`sample-alarm`). T41 includes 4 KiB always-on RTC RAM at `0x10004000` (`pm_fastboot.c`).
+- **`ingenic-efuse`**: Blank fuses with instant reads/programs, keeping 3.10's binary MXU license check permissive. Offset `0` (96-bit chip ID returned by `SU_Base_GetDevID`, `sample-chipid`, `/proc/jz/efuse/efuse_chip_id`) contains the SoC ID followed by `"OpenIPC!"` unless overridden via `-global ingenic-efuse.chipid0..2=`.
+- **OTG PHY (`0x10060000`)**: Byte storage for 4.4 `cpm_usb.c`.
+
+### Crypto and RNG engines (`ingenic-aes`, `ingenic-hash`, `ingenic-rsa`, `ingenic-dtrng`, `ingenic-des`)
+
+Follow `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des`, and Linux 4.4 crypto / `hw_random` drivers cleanly, completing immediately unless noted:
+- **`ingenic-aes`**: Supports ECB and CBC modes with 128-, 192-, or 256-bit keys (`AES-128` verified against FIPS-197 and SP 800-38A) via DMA (`ASSA`, `ASDA`, `ASTC` in 16-byte blocks) or single-block `ASDI`/`ASDO`. Keys, IVs, and data words are big-endian (matching Linux 4.4's word swap), raising `KEYD`, `AESD`, and `DMAD` interrupts under `ASINTM`.
+- **`ingenic-hash`**: Computes MD5, SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512 over driver-padded DMA blocks (`HSTC` in 64-byte units), preserving intermediate state until `HSCR` bit `4` reloads it and outputting digests as little-endian words from `HSDO`. CPU mode via `HSDI` is inferred identically: memory-order writes raise `HSSR` bit `0` every 64 bytes (`128` bytes for SHA-384/512) and bit `1` after `HSTC` 64-byte units (no Linux 4.4 code uses `HASH_FLAGS_CPU`, `sample_hash` only prints `HSDI`, no U-Boot references `HASH_BASE`, and the 51 vendor PDFs omit it). `HSCR` bits `8:7` (byte order) are ignored because 4.4 writes `3`/`0` (SHA/MD5) while `sample_hash` writes `1`/`2` and both expect standard digests.
+- **`ingenic-rsa`**: Computes $M^E \bmod N$ (`RSA-1024/2048`, selected by `RSAC` bit `7`) with MSW-first input and LSW-first output matching `sample_rsa`'s `test_rsa.h` vectors; polled (no IRQ wired).
+- **`ingenic-dtrng`**: Populates host entropy `10 us` after `CFG` bit `0`; `CFG` bit `12` clears ready and bit `11` masks IRQ `34`.
+- **`ingenic-des` (`0x10061000`, all SoCs)**: DES and triple DES (EDE with `K1`, `K2`, `K3`) in ECB/CBC (`DESCR2` bits `2`, `1`; bit `3` decrypts). Setting `DESCR1` work bit clears FIFOs and loads CBC IV; every second `DESDIN` word pushes a ciphered block into the 16-word output FIFO (`DESSR` bit `0` empty). PDMA (`DESCR2` bit `0`) uses `0x2E` (TX) / `0x2F` (RX). Keys and IV preserve word order (`L` high), while data words byte-swap under `DESCR2` bit `4` ("little endian") so FIPS 46's example (`85e813540f0ab405`) passes under `sample_des`.
+
+---
+
+## Storage, networking and Wi-Fi
+
+### SPI flash controller (`ingenic-sfc`) and `ingenic-spinand`
+
+`ingenic-sfc` models v1 (T10–T31) and v2 (T40, T41) in one device. `TRIG.START` executes command, 0..7 address bytes, dummy clocks, and data phases. SPL/U-Boot use PIO (`+0x1000` FIFO polling `RREQ`/`TREQ` and `END`), 3.10 uses interrupt-driven DMA, and 4.4 uses v2 command tables (`+0x800`, `LINK`, `COL`/`ROW`/`STA0`/`STA1`) + descriptor DMA. Key hardware details:
+
+- **`END` vs FIFO drain**: `END` asserts when remaining read data equals one `GLB THRESHOLD` in words (at least 1), not when CPU drains it. Vendor U-Boots read desired words then wait for `END` (a new `START` discards unused trailing bytes), whereas T41's `jz_sfc_v1` takes one `SR` snapshot, reads `THRESHOLD` words on `RREQ`, and exits immediately if `END` is set — meaning an early `END` lost the last 64 bytes of every 2 KiB NAND page.
+- **29-bit DMA addressing**: DMA addresses mask modulo 512 MiB because T41 passes uncached `virt_to_phys()` descriptor addresses (`0x2xxxxxxx` for `0x0xxxxxxx` RAM).
+- **NOR flash (`m25p80`, patch `0024`)**: Adds 4 KiB (`20h`) and 32 KiB (`52h`) erase support (`W25Q64`, `W25Q256`, and `0xC22018` shared by `MX25L12805D/12835F/12845E`), `DMYBITS` fast-read clocks, and data reads past 6-byte probe addresses used by T41 SPL. Patch `0029` adds the Zbit ZB25VQ64 and ZB25VQ128 parts.
+- **`POLL_EN` phase**: Polls status (`OIP`) and leaves the final byte in `DEV_STA_RT` (`0x0C`) for `P_FAIL`, `E_FAIL`, and ECC extraction.
+
+**`ingenic-spinand` (`hw/block/ingenic-spinand.c`)**: One QOM type per part (`w25n01gv`, `gd5f1gq4ub`, `gd5f2gq4ub`, `mx35lf2ge4ab`, `gd5f1gq5ue`):
+- **Commands**: `READ ID` (with or without dummy byte), page read to cache (`0x13`), cache reads (`0x03`/`0x0B`/`0x3B`/`0x6B` with 2-byte column + plane-select bit ignored by 1-plane chips despite 4.4 setting it from page number + 8 dummy clocks), program load (`0x02`/`0x32` clearing cache to `0xFF`), random load (`0x84`/`0x34`), program execute (`0x10`, requires `WEL`), block erase (`0xD8`), features `A0` (block lock on at power-up; any `BP` bit causes `P_FAIL`/`E_FAIL`), `B0` (`ECC`/`BUF`/`QE`), `C0` (status), `D0`/`F0`, write enable/disable, and reset. `busy-polls=n` keeps `OIP` set for `n` status reads.
+- **ECC fault injection (`ecc-fail=`)**: Sets status ECC bits `5:4` to `10b` (uncorrectable) while ECC (`B0` bit `4`) is enabled for listed pages/ranges (`4470,16190-16191`), still transferring cache data. Matches OpenIPC/ipctool#283 where 3.10 `jz_sfc_nand` returns `-EBADMSG` from `mtd_read` (for `C8 51` and `D1..D4` GigaDevice chips; `B1..B4` expect `111b`), causing `mtdblock` `Buffer I/O error` while `/dev/mtdN` `read()` ignores it:
 
 ```bash
 ./qemu-src/build/qemu-system-mipsel -M t31,flash-file=nand.bin,flash-type=gd5f1gq5ue \
     -global gd5f1gq5ue.ecc-fail=4470,16190 -kernel uImage -initrd rootfs.squashfs ...
 ```
 
-`gd5f1gq5ue` (C8 51, the GD5F1GQ5UEYIGR) is in the 3.10 kernel's table
-but not the SPL's or U-Boot's, so it boots with `-kernel` only, and only
-by `flash-type=`: its 136 MiB image is `gd5f1gq4ub`'s size.
+`gd5f1gq5ue` (`C8 51`, `GD5F1GQ5UEYIGR`, 136 MiB image size matching `gd5f1gq4ub`) is in Linux 3.10's table but absent from SPL and U-Boot, so it boots only via `-kernel` with `flash-type=`.
 
-### `ingenic-msc`
+### SD/MMC controller (`ingenic-msc`)
 
-The jzmmc host of T10..T31 on an SD bus (`-drive if=sd,index=0|1`):
-commands, responses, PIO through the FIFOs (U-Boot) and SDMA descriptors
-(the kernels' `jzmmc_v12`). With no card, a command times out at once,
-which is what lets U-Boot get past `mmc` init. MSC0's card detect is a
-GPIO the host drives itself -- PB27, PB20 on T21, or `msc0-cd=<gpio>`
-(e.g. 61 for PB29) -- so monitor
-`eject`/`change` are hot-plug. An SD image for U-Boot's `fatls` needs a
-partition table. XBurst2 has SDHCI hosts instead.
+XBurst1 `jzmmc` (`-drive if=sd,index=0|1`) supports U-Boot FIFO PIO and `jzmmc_v12` SDMA descriptors. Empty slots fail commands immediately so U-Boot passes `mmc` init quickly. `MSC0` card detect connects via GPIO (`PB27`, `PB20` on T21, or `msc0-cd=<gpio>` such as `61` for `PB29`), supporting monitor `eject`/`change` hotplug; `fatls` requires a partitioned disk image. XBurst2 uses SDHCI hosts.
 
-### `atbm-sdio`
+### Ethernet MAC (`ingenic-gmac`)
 
-The AltoBeam ATBM6031/Apollo SDIO Wi-Fi the camera boards carry on MSC1,
-as the vendor `atbm_wlan` driver (`hal_apollo`, `PLATFORM_INGENICT31`)
-drives it; `-M t31,wifi=atbm` attaches it, with `-nic user,model=atbm-sdio`.  It is
-an SDIO function-1 card: patch 0026 lets a non-SD/MMC card sit on the SD
-bus and raise its interrupt, and the MSC reflects that as IFLG bit 7.
-The card answers CMD5/CMD3/CMD7, the CCCR, the function-1 FBR and the CIS
-tuples (the ATBM vendor/product id), and function-1 CMD52/CMD53 to the
-eight HIF registers -- CONFIG, CONTROL, the in/out queue, the AHB/SRAM
-data ports with their base-address latch.  It accepts the firmware the
-driver downloads into chip memory, releases the "CPU" when CONFIG's reset
-bit clears, and then answers the WSM protocol itself, emulating an access
-point and bridging data frames to the netdev (the WSM/AP engine it shares
-with `hw/usb/atbm-wifi.c`): a scan reports an SSID (`wifi-ssid=` on the
-machine, the card's `ssid=`; default OpenIPC), and a join associates --
-to an open network, or with `wifi-psk=` (8..63 characters) a WPA2-PSK
-one.  The card is `/machine/atbm`.
+Synopsys GMAC 3.x supporting V12, V13, T40 `ingenic_mac`, mainline `stmmac`, and U-Boot with 8-word enhanced descriptors (`DSL 2`, 40-byte spacing), self-clearing soft/MDIO/PHY resets, IP101G PHY (`0x0243/0x0C54`) at address `0` (`100 Mbit/s` full-duplex), appended RX FCS, and `DMA_RIWT` (`0x1024`) RX interrupt watchdog timer for mainline `stmmac` `RDES1_DIC` coalescing.
 
-WPA2-PSK (`hw/net/atbm-wpa.c`, shared with the Xiongmai USB dongle
-`atbm-wifi`): beacons and probe responses set the privacy bit and carry an
-RSN IE (CCMP group, one CCMP pairwise, one PSK AKM), and after the
-association the access point runs the authenticator's 4-way handshake
-and group key (IEEE 802.11-2016 12.7), from the spec: PMK =
-PBKDF2-HMAC-SHA1(passphrase, SSID, 4096, 256 bits), PTK = PRF-384(PMK,
-"Pairwise key expansion", the two addresses and nonces, low first),
-EAPOL-Key descriptor version 2 (HMAC-SHA1-128 MICs under the KCK; the
-GTK, key ID 1, wrapped in message 3 with AES key wrap under the KEK).  A
-message 2 or 4 whose MIC fails -- a wrong passphrase -- is dropped;
-messages 1 and 3 are resent once a second, and after four the station
-is deauthenticated (reason 15).  Until message 4 only EAPOL passes.
-The atbm driver does CCMP in the chip, not in software (its mac80211's
-software CCMP is compiled out): it installs the PTK and GTK with
-WSM_ADD_KEY -- the model checks they are the handshake's TK and GTK --
-and its protected frames leave room for the CCMP header (8 bytes) and
-MIC (8) around a plaintext body, which the model strips.  Frames to the
-station go Protected with a CCMP header (ExtIV, key 0 / group key 1, a
-rising PN for mac80211's replay check) and 8 bytes of MIC, flagged
-AES-decrypted (and group-key for group frames) in the RX indication,
-which is what the chip's decryption hands the driver.  The `selftest`
-property runs the PBKDF2 (802.11 J.4.2), PRF (J.3), AES key wrap
-(RFC 3394 4.1), HMAC-MD5 (RFC 2202), RC4 and Michael (802.11i) known-
-answer tests.
+#### PHY power-down and reboot
 
-The card's properties (`-global atbm-sdio.X=`, the USB dongle's
-`-device atbm-wifi,X=`) choose the access point's security:
+To model OpenIPC/firmware#2839 accurately, the PHY retains its registers across TCU watchdog resets (`phy-cold-reset=on` resets it with the SoC instead) and `DmaBusMode.SWR` requires PHY RMII `REF_CLK`:
+- Because T40 `ingenic_mac_close()` sets `BMCR.PDOWN` during `ifdown`, a standard `reboot` leaves `SWR` stuck on the next boot (`Bus Mode Reg after reset: 0x00020101` x10, `PROB:synopGMAC_reset timeout`, missing `eth0`), whereas `reboot -f` (skipping `ifdown`) keeps `eth0`.
+- Writing `BMCR` without `PDOWN`, setting `BMCR.RESET`, or releasing reset GPIO clears pending `SWR` (`swr-needs-phy-clk=off` bypasses this check).
+- Fixed kernels pulse `ingenic,rst-gpio` (`PC7`, active low) before `SWR`. Pass `-global ingenic-gmac.phy-rst-gpio=71` to wire `PC7` to PHY reset (default `-1` matches unpatched hardware). `qemu-boot/test-ingenic-eth-reboot.sh` checks both `reboot` and `reboot -f` (with `--expect-fixed` and `--phy-rst-gpio 71` for fixed kernels).
 
-- `proto=wpa`: WPA1 -- the WPA vendor IE (00:50:f2:1), EAPOL-Key
-  descriptor type 254, message 3 carrying only the IE in the clear, and
-  a group key handshake after message 4 (the GTK under the key index in
-  the key information); the port opens at its message 2.
-- `cipher=tkip`: TKIP pairwise and group, a 512-bit PTK, EAPOL-Key
-  descriptor version 1 (HMAC-MD5 MICs; key data RC4-encrypted under the
-  frame's Key IV and the KEK, 256 bytes of keystream dropped), a 32-byte
-  GTK.  The driver installs TKIP keys in the chip too (WSM key types 3
-  and 2, the MIC keys with them), and its mac80211 leaves 12 bytes of
-  room after a TKIP body (its `icv_len`: ICV and Michael MIC) which the
-  chip fills on the air; the model strips the 8-byte IV and that room.
-  Frames to the station carry a TKIP IV (TSC1, the WEP seed, TSC0, ExtIV
-  and the key ID, TSC2..5), a real Michael MIC under the authenticator's
-  Tx MIC key -- which the driver's mac80211 checks -- and 4 bytes of ICV
-  room, flagged TKIP-decrypted.
-- `pmf=optional|required`: 802.11w -- MFPC (and MFPR) in the RSN
-  capabilities, BIP-CMAC-128 as the group management cipher, the IGTK
-  (key ID 4) in message 3's key data, which the driver installs (WSM key
-  type 8; checked), and an answer to the station's SA Query requests.
-  The access point sends no group-addressed robust management frame, so
-  BIP itself never arises.  Needs RSN and CCMP.
-- `rekey=N`: every N seconds a group key handshake with a fresh GTK under
-  the other key ID (1 / 2), sent protected with the pairwise key; frames
-  to the station switch to the new key once the station answers.
+### SDIO Wi-Fi: AltoBeam ATBM6031 (`atbm-sdio`)
 
-The driver's power-save mode needs only the chip's side: it sends
-WSM_SET_PM and holds its operation lock until the set-PM-mode indication
-(0x0809), which the model sends after the confirmation; the "chip" stays
-awake and delivers frames whatever the mode.  This driver build has no
-cfg80211 power-management hook (`CONFIG_ATBM_SMPS`), so `iwconfig power`
-fails; its private `iwpriv wlan0 common power_save,1` turns it on
-(mode 0x81).
+Attach AltoBeam ATBM6031/Apollo on MSC1 via `-M t31,wifi=atbm -nic user,model=atbm-sdio` (`/machine/atbm`), matching vendor `atbm_wlan` (`hal_apollo`, `PLATFORM_INGENICT31`). Uses patch `0026` on `jzmmc` (raising `IFLG` bit `7`) and patch `0027` on XBurst2 SDHCI ("Card Interrupt" level status):
 
-Over SDIO each WSM message the driver queues carries a 28-byte prefix
-(an 8-byte bus header and a 20-byte cipher header) ahead of its
-{ len, id }, and len counts the prefix; one queue write packs several
-messages, each on a 256-byte block boundary.  Every message counts as
-one consumed input buffer in the word the driver polls at
-`NumOfHwXmitedAddr`.
+- **SDIO / HIF / WSM**: Implements `CMD5/CMD3/CMD7`, CCCR, FBR1, ATBM CIS tuples, and `CMD52/CMD53` over 8 HIF registers (`CONFIG`, `CONTROL`, in/out queues, AHB/SRAM ports with base latch). Accepts firmware download into SRAM, releases the "CPU" when `CONFIG` reset clears, and runs the WSM AP + netdev bridge (`hw/usb/atbm-wifi.c` shared engine). Each SDIO WSM write packs a 28-byte prefix (8-byte bus + 20-byte cipher headers included in `len`) ahead of `{len, id}` on 256-byte boundaries and advances `NumOfHwXmitedAddr`.
+- **Network & security (`hw/net/atbm-wpa.c`, shared with `atbm-wifi`)**: Machine options `wifi-ssid=` (card `ssid=`, default `OpenIPC`) and `wifi-psk=` (`8..63` chars) configure open or WPA2-PSK access:
+  - *WPA2-PSK (CCMP)*: Beacons/probes set privacy + RSN IE and run IEEE 802.11-2016 12.7 4-way handshake (`PMK = PBKDF2-HMAC-SHA1(passphrase, SSID, 4096, 256 bits)`, `PTK = PRF-384(...)`, EAPOL-Key v2 `HMAC-SHA1-128` MICs under KCK, AES-key-wrapped GTK key ID `1` under KEK). Wrong MICs drop msgs 2/4 and deauthenticate after 4 retries (`1 s` interval, reason `15`). Verifies `WSM_ADD_KEY` keys match TK/GTK, strips TX CCMP 8-byte header + 8-byte MIC, and builds RX CCMP frames with rising PN flagged `AES-decrypted`.
+  - *Card properties* (`-global atbm-sdio.X=` or `-device atbm-wifi,X=`):
+    - `proto=wpa`: WPA1 vendor IE (`00:50:f2:1`), EAPOL-Key type `254`, plain IE in msg 3, separate GTK handshake after msg 4.
+    - `cipher=tkip`: 512-bit PTK, 32-byte GTK, EAPOL-Key v1 (`HMAC-MD5` MIC, RC4 key wrap dropping the first 256 bytes of keystream), `WSM` key types `3`/`2`, strips 8-byte IV + 12-byte `icv_len` on TX, and prepends a TKIP IV (`TSC1`, WEP seed, `TSC0`, ExtIV + key ID, `TSC2..5`), a real Michael MIC, and 4 bytes of ICV room flagged `TKIP-decrypted` on RX.
+    - `pmf=optional|required`: 802.11w `MFPC`/`MFPR`, `BIP-CMAC-128` group management cipher, IGTK (key ID `4`, `WSM` key `8`), and SA Query answers (no group robust management frames sent; requires RSN + CCMP).
+    - `rekey=N`: Pairwise-protected GTK rekey every `N` seconds alternating key IDs `1`/`2`.
+    - `selftest`: Runs KATs for PBKDF2 (`802.11 J.4.2`), PRF (`J.3`), AES key wrap (`RFC 3394 4.1`), HMAC-MD5 (`RFC 2202`), RC4, and Michael (`802.11i`).
+- **Power save**: Handles `WSM_SET_PM` followed by indication `0x0809` while remaining awake (`iwconfig power` fails as `CONFIG_ATBM_SMPS` is off; use `iwpriv wlan0 common power_save,1` for mode `0x81`).
+- **End-to-end & build notes (`test-ingenic-wifi.sh`)**: Passes open/WPA2/`--psk`/`--wrong-psk`/`--proto wpa`/`--cipher tkip`/`--pmf`/`--rekey`/`--powersave` with `mmc1: new SDIO card`, `wpa_supplicant` (`key_mgmt=WPA-PSK`), `udhcpc` (`10.0.2.15`), and `ping 10.0.2.2`. Build T31 driver with `platform=PLATFORM_INGENICT31 ATBM_WIFI__EXT_CCFLAGS=-DATBM_WIFI_PLATFORM=24` (`--driver`). For `--soc t40`, rebuild OpenIPC `t40.generic.config` with MSC1 enabled (`status = "okay"`, `ingenic,sdio_clk` for `sdhci-ingenic` `jzmmc_manual_detect()`, no `non-removable`), stub the three `CONFIG_WIRELESS_EXT` tx-power ioctls in `PLATFORM_INGENICT41`, and include the driver's `wireless/cfg80211.ko`. Verified by `test_sdio` and `test_sdio_sdhci` qtests too.
 
-End to end (`test-ingenic-wifi.sh`, PASS): the T31 kernel's `jzmmc_v12`
-attaches `mmc1: new SDIO card`, `atbm_wlan` downloads the firmware (ICCM
-and DCCM, by DMA CMD53 writes), the startup indication brings up `wlan0`,
-`wpa_supplicant` scans, sees the emulated SSID and associates to the open
-network, `udhcpc` gets 10.0.2.15 from slirp and `ping 10.0.2.2` answers.
-The guest NIC is `-nic user,model=atbm-sdio` (the machine binds it to the
-card).  `--psk PASSPHRASE` does the same over WPA2-PSK (`wpa_supplicant`
-with `key_mgmt=WPA-PSK`, CCMP): the handshake completes, the driver's
-installed keys match the TK and GTK, and DHCP and ping run over protected
-frames; `--wrong-psk` passes only if the station stays off (message 2's
-MIC rejected).  `--proto wpa`, `--cipher tkip`, `--pmf optional|required`
-and `--rekey N` (which waits for two rekeys and pings again) set the
-options above on both ends, and `--powersave` turns the driver's power
-save on before the ping.
+### SDIO IoT Wi-Fi: AltoBeam ATBM6441 (`atbm6441-sdio`)
 
-XBurst2 (T40/T41) puts the same card on MSC1, an SDHCI host: patch 0027
-makes an SDIO card's interrupt the SDHCI Normal Interrupt Status "Card
-Interrupt" bit, level-sensitive while enabled.  `test-ingenic-wifi.sh
---soc t40` passes the same way with OpenIPC's T40 kernel
-(`t40.generic.config`) rebuilt with MSC1 enabled in its built-in device
-tree -- `status = "okay"`, `ingenic,sdio_clk` (which puts the host on
-`sdhci-ingenic`'s manual-detect list for `jzmmc_manual_detect()`) and no
-`non-removable`; the stock tree leaves MSC1 off -- and the driver built
-for `PLATFORM_INGENICT41`.  That kernel has no `CONFIG_WIRELESS_EXT`, which
-the driver's private tx-power ioctls assume, so that build needs those
-three helpers stubbed; the driver's own `cfg80211.ko` (from its
-`wireless/`) goes with it, not the rootfs's.
+Models ATBM6441 IoT mode for battery doorbells such as the Merkury MI-CW074-125W (OpenIPC/firmware#1974), where credentials and DHCP lease persist in the module across host sleeps (`-M t31,wifi=atbm6441 -nic user,model=atbm6441-sdio`, `/machine/atbm6441`, matching `gtxaspec/atbm6441` `ATBM_WIFI_PLATFORM=22`):
 
-Qtests: the known answers (`selftest`), the machine's `wifi-ssid` /
-`wifi-psk`, the proto / cipher / rekey options reaching the card and bad
-combinations refused; `test_sdio` drives the enumeration on the T31 MSC1,
-`test_sdio_sdhci` on the T40 SDHCI MSC1 plus the card interrupt (raised
-by the startup indication after a CMD53 releases the chip's CPU, level,
-reaching the core INTC).  The guest test skips
-without the built driver (`--driver`, the vendor tree built with
-`platform=PLATFORM_INGENICT31 ATBM_WIFI__EXT_CCFLAGS=-DATBM_WIFI_PLATFORM=24`;
-without the platform define its insert hook is a stub that never asks the
-MSC to detect the card).
+- **HIF & startup**: Same HIF addressing (`register << 2`) without firmware download. Setting `CONTROL WUP` emits 4 trace indications discarded by the driver before startup indication seq `4` (firmware `13679`, 16 x 2048 B input buffers). Queue reads pad to 256 bytes with next `CONTROL` in the last two bytes.
+- **Framing & flow control**: Host `{flag, len, id}` packets (flag checksum checked) align to 256 bytes; event `3` returns consumed buffer credits + window (only synchronous commands get confirmations, not data/`NETWORK_OK`/IPC data).
+- **Network & AT commands**: `GET_CONFIG` returns MAC, STA link on `wifi-ssid=`, derived BSSID, open network, and `ip=`/`gw=`/`dns=` properties (which the driver exposes on `/dev/atbm_ioctl`). After `NETWORK_OK`, raw `ToDS`/`FromDS` 802.11 LLC/SNAP frames bridge to the netdev. `/dev/atbm_ioctl` `ATBM_FW_AT_CMD` (`WSM 0x0023`) logs under `-d unimp`/`trace=on` and emits synthetic `<command>\r\nOK\r\n` events.
+- **Tests (`qemu-boot/test-ingenic-wifi-6441.sh`)**: Runs `S96wifi`'s `jzmmc_v1.2.1/present` scan (`cfg80211` alone or `--mac80211`), ping/TCP fetch, `lsmod`, AT ioctl via `qemu-boot/atbm6441-at.c`, and `rmmod`/`insmod` reload. Qtest checks PID `0x6441` and rejects `wifi-psk=`.
 
-### `atbm6441-sdio`
+### USB OTG (`dwc2-usb`) and USB Wi-Fi (`atbm-wifi`)
 
-The AltoBeam ATBM6441 in "IoT mode", the Wi-Fi of battery doorbells such
-as the Merkury MI-CW074-125W (OpenIPC/firmware#1974): a whole Wi-Fi SoC
-that keeps its credentials in its own flash and is associated, with a
-DHCP lease, before the host boots.  `-M t31,wifi=atbm6441` attaches it to
-MSC1, with `-nic user,model=atbm6441-sdio`; it is `/machine/atbm6441`.
-The model follows what the `atbm6441` driver (gtxaspec/atbm6441,
-`hal_apollo` built for HERA, `ATBM_WIFI_PLATFORM=22`) expects of the chip:
+Uses `hw/usb/hcd-dwc2.c` configured for Ingenic `drivers/usb/dwc2`:
+- **`otg-a-device`**: Clears `ConIDSts` and raises a single connector ID status change `100 ms` after first soft reset (long ID debounce), enabling `cpm_usb.c` to bring up port power and root hub polling.
+- **`host-channels=16`**: Vendor DWC2 ignores `GHWCFG2` and dispatches across `MAX_EPS_CHANNELS = 16` round-robin (QEMU's default 8 dropped every 9th transfer: `"unable to read config index 0 descriptor/start: -145"`).
 
-- Same HIF registers as the 6031 (CMD53, address = register << 2), but
-  no firmware download: the driver sets CONTROL's WUP and waits for the
-  startup indication.  It discards the first four messages it reads
-  unparsed and arms its sequence check at 4, so the chip sends four
-  trace indications first and the startup indication (firmware version
-  13679, 16 input buffers of 2048 bytes) with sequence 4.
-- A read of the queue port is the head message rounded up to 256 bytes
-  with the next CONTROL value in its last two bytes.
-- Host messages are `{ flag, len, id }` (the flag carries a length
-  checksum, which the model checks) packed on 256-byte boundaries.  TX
-  flow control is a credit count: after each queue write the chip sends
-  event 3 with the messages consumed plus the window.  Only the commands
-  the driver waits on are confirmed -- never data, NETWORK_OK or IPC data.
-- GET_CONFIG reports the chip's MAC (which `wlan0` takes), STA mode and
-  the link it holds: the SSID (`wifi-ssid=`), a BSSID derived from the
-  MAC, an open network, and the address it leased (`ip=`, `gw=`, `dns=`
-  on the card; the driver only passes them to `/dev/atbm_ioctl` readers,
-  so the guest sets them itself).
-- Data is raw 802.11 both ways (ToDS from the host, FromDS to it, LLC/SNAP),
-  bridged to the netdev once the host has sent NETWORK_OK.
-- An AT command (`/dev/atbm_ioctl` `ATBM_FW_AT_CMD`, WSM 0x0023) is logged
-  (`-d unimp`, and with `trace=on`) and answered with a customer event,
-  `<command>\r\nOK\r\n`, which the ioctl device's reader gets.  The real
-  firmware's AT replies are not visible from the driver; that text is the
-  model's.
+Works with `atbm-wifi` (`docs/xiongmai.md`), e.g. `-device atbm-wifi,bus=usb-bus.0,netdev=w,pid=0x888b,chip-version=0x4a,efuse=0x0500` reproducing OpenIPC/firmware#1655 (`ATBM6012B-X` on T31L). `qemu-boot/test-ingenic-wifi-usb.sh` validates `atbm6012b_wifi_usb.ko` (model `6012B`, `t31_ultimate`, open/`--psk` WPA2-PSK, `10.0.2.15`, ping/TCP, `lsmod`). The issue's other driver, `atbm60xx` built for the 603x over USB (`atbm603x_wifi_usb.ko`, `--module`), loads and never binds because its ID table lists only `007a:8888`, leaving `wlan0` absent just as reported.
 
-`qemu-boot/test-ingenic-wifi-6441.sh` runs the driver as #1974's S96wifi
-does -- SDIO rescan through `jzmmc_v1.2.1/present`, cfg80211 alone (or
-with mac80211, `--mac80211`), insmod, a static address -- on OpenIPC's
-T31 kernel and release rootfs, and passes: wlan0 with the chip's MAC,
-ping and a TCP fetch from the host, `lsmod`, an AT command round trip
-through `/dev/atbm_ioctl` (`qemu-boot/atbm6441-at.c`), rmmod and a second
-insmod, no oops or warning.  The qtest checks the enumeration (product id
-0x6441) and that `wifi-psk=` is refused.
+---
 
-### USB: `dwc2-usb` and the AltoBeam dongle
+## Audio: `ingenic-pdma`, `ingenic-aic`, `ingenic-dmic` and `ingenic-asdmic`
 
-The OTG core is QEMU's DWC2 (the Raspberry Pi's, with qemu-bench's own
-`hw/usb/hcd-dwc2.c`), set up as the T-series kernels' `drivers/usb/dwc2`
-needs it:
+Vendor `audio.ko` (`drivers/audio/oss2` on T10–T31, `oss3` on T23/T40/T41; `/dev/dsp` for `IMP_AI`/`IMP_AO`/`IMP_DMIC`) transfers FIFO audio using cyclic PDMA descriptors. Attach `-audiodev wav,id=snd,path=out.wav -M t31,audiodev=snd` to record guest playback.
 
-- `otg-a-device`: ConIDSts reads 0 and, 100 ms after the driver's first
-  core soft reset (the long ID debounce), the core raises a connector ID
-  status change, once.  The driver (`cpm_usb.c` puts the PHY in OTG mode)
-  brings the host up only from that interrupt -- port power, root hub
-  polling -- after clearing GINTSTS and unmasking it; without it a USB
-  device on the bus was never seen.
-- `host-channels=16`: the driver hands transfers to 16 channels in turn
-  (`MAX_EPS_CHANNELS`) and never reads GHWCFG2's count.  With QEMU's 8,
-  every ninth transfer -- on a new device the configuration descriptor --
-  ran nowhere: "unable to read config index 0 descriptor/start: -145",
-  a port reset, forever.
+### Programmable DMA (`ingenic-pdma`)
 
-The USB AltoBeam dongle, `atbm-wifi` (docs/xiongmai.md), takes the bus:
-`-device atbm-wifi,bus=usb-bus.0,netdev=w,pid=0x888b,chip-version=0x4a,efuse=0x0500`
-is the ATBM6012B-X of OpenIPC/firmware#1655 (a T31L, the vendor driver's
-"current chiptype 6012B-X").  `qemu-boot/test-ingenic-wifi-usb.sh` runs
-OpenIPC's atbm-wifi package built for it (`atbm6012b_wifi_usb.ko`, model
-6012B, USB) on OpenIPC's `t31_ultimate` kernel and rootfs and passes:
-the driver reports a 6012B-X, wlan0 comes up, `wpa_supplicant` joins the
-open (or `--psk`, WPA2-PSK) access point, `udhcpc` leases 10.0.2.15, the
-host answers ping and a TCP fetch, `lsmod` returns, no oops.  The
-issue's other driver, `atbm60xx` built for the 603x over USB
-(`atbm603x_wifi_usb.ko`, `--module`), loads and never binds: its ID table
-holds 007a:8888 only, so wlan0 never appears -- what the issue reports.
+32 channels (`0x20*n` at `0x13420000`: `DSA`, `DTA`, `DTC`, `DRT`, `DCS` [`NDES`, `DES8`, `CDOA`, `AR`, `TT`, `HLT`, `CTE`], `DCM` [`SAI`/`DAI`, port widths, `TSZ` including 4.4 `auto` byte count, `TIE`, `LINK`], `DDA`; plus `DMAC`, `DIRQP` W1C, `DDRS`, `DIP`/`DIC`) following `jz_dma.c` (3.10) and `ingenic_dma.c` (4.4):
 
-### `ingenic-gmac`
+- Fetches 8-word descriptors from `DDA`. At `DTC == 0`, linked descriptors load the next descriptor (`DDA` page + `DOA` in `DTC` top byte) without interrupting (continuous audio rings); unlinked ones set `TT` and `DIRQP` if `TIE` is set.
+- Request `8` (`AUTO`) copies memory at once; peripheral requests pace every access: AIC (`6` play, `7` record, `5` loop echo ref), DMIC (`13`), UART (`0x14 - 2*n` / `0x15 - 2*n`), SADC (`9`), I2Cs (`0x24 + 2*n` / `0x25 + 2*n`), SSI, and DES.
+- Masks addresses to 29 bits (`0x20000000` alias reaches DDR, since `jz_uart.c` passes `virt_to_phys` of uncached KSEG1 RX buffers like T41 SFC). MSC uses SDMA (`jzmmc_v12.c`), I2C/SADC/SSI slave have no kernel DMA client, and no PCM driver exists in the vendor 3.10/4.4 trees.
 
-The Synopsys GMAC 3.x every driver here (V12, V13, the T40 `ingenic_mac`,
-mainline `stmmac`, U-Boot) runs with 8-word enhanced descriptors and DSL 2
--- 40 bytes apart in a ring. Soft reset, MDIO and the PHY's BMCR reset
-self-clear (the kernels' `open` spins on the last with no timeout); the PHY
-is an IP101G (0x0243/0x0C54) at address 0 with a 100 Mbit/s full-duplex
-link. Received frames carry their FCS, which the drivers subtract;
-`DMA_RIWT` (`0x1024`) drives the RX interrupt watchdog timer when mainline
-`stmmac` sets `RDES1_DIC` for RX coalescing.
+### AIC and internal codec (`ingenic-aic`)
 
-PHY power-down and reboot (OpenIPC/firmware#2839). The PHY is a chip of
-its own: a system reset (the TCU watchdog, so every guest `reboot`) leaves
-its registers as the last kernel left them, and only BMCR.RESET or the
-board's reset line resets it (`phy-cold-reset=on` makes it reset with the
-SoC instead). DmaBusMode.SWR completes only with the PHY's RMII REF_CLK
-running, so while BMCR.PDOWN is set it stays set -- the T40 kernel's
-`ingenic_mac_close()` sets PDOWN on every ifdown, and the next probe then
-prints `Bus Mode Reg after reset: 0x00020101` ten times and
-`PROB:synopGMAC_reset timeout`, with no eth0, as on the board. A BMCR write
-without PDOWN, BMCR.RESET or the reset line released finishes the pending
-reset; `swr-needs-phy-clk=off` makes SWR complete at once regardless. The
-line: the driver pulses the DT's `ingenic,rst-gpio` (PC7, active low, in the
-release DT) before SWR, and `-global ingenic-gmac.phy-rst-gpio=71` wires that
-pin to the PHY (held in reset, not answering MDIO, while low); the default
--1 leaves it unwired, the board of the issue. `qemu-boot/test-ingenic-eth-reboot.sh`
-reboots the release twice side by side: `reboot -f` (no ifdown) must keep
-eth0, `reboot` loses it -- reported as the known failure; `--expect-fixed`
-requires both, for a fixed `--kernel` or with `--phy-rst-gpio 71`, where
-the release kernel already keeps eth0.
+Models `AICFR` (`ENB`, `RST`), `AICCR` (`EREC`/`ERPL`, flushes, `M2S`, `MONOCTR`, `TDMS`/`RDMS`, `ISS`/`OSS`, `TLDMS`/`ETFL`, `CHANNEL`, `PACK16`), `AICSR` (levels, `TUR`/`ROR`), `AICDR`, `AICLR`, 64-entry TX FIFO, and 32-entry RX/loop FIFOs:
 
-### The video encoders: `ingenic-vpu`
+- **Clocking & pacing**: On T23, T31, T40, and T41 (AIC I2S master), CPM speaker (`I2SSPKCDR`/`I2STCDR` `0x70`) and mic (`0x84`) dividers run at `256 * fs` (`parent PLL * M / N`, snapped within 3% to standard rates). On T10–T30 or with CPM clock gated, codec `CSRR` (`0x110[2:0]`, `8`–`96 kHz`) sets both directions.
+- **Audio flow**: While `ENB` is set, frames pace in virtual time: TX writes 1 (`M2S`) or `CHANNEL + 1` samples per frame to `audiodev` (16-bit stereo) and copies TX into `loop` (`ETFL`). RX receives 1 (`MONOCTR`, right channel on T21/T31) or 2 samples: quarter-scale sine (`-global ingenic-aic.tone-hz=N`, default `1000`, `0` silence) or host audio (`-global ingenic-aic.rx-source=audiodev`). Requests trigger for TX (`TDMS` + space), RX (`RDMS` + data), and loop (`TLDMS` + data).
 
-T10/T20's VPU (`jz-vpu.0`), the HELIX of T21/T23/T30 (H.264, JPEG) and
-T30's RADIX (H.265), which OpenIPC's vendor `libimp` drives through
-`/dev/soc_vpu` (`drivers/video/soc_vpu/` in the 3.10 trees; the register
-and task contract, with its evidence, is `tmp/soc-vpu-contract.md`).
-The kernel only resets the engine through CPM SRBC (STP bit, its
-acknowledge, the SR pulse -- 30/29/31 for HELIX and the VPU, 27/26/28 for
-RADIX; `ingenic-cpm` answers the handshake and passes the reset bits on
-as GPIOs), enables the interrupt and gives the engine one VDMA chain:
-{value, VLD | TERM | register} pairs that libimp's `H264E_T21_SliceInit`
-& co. build and the engine writes into its own registers. The chain's
-address goes to 0x84 on T21/T23, to VDMA 0x10008 on T20/T30, to CFGC
-0x08 on RADIX; its last entry (EFE_CTRL with RUN; VDMA 0x8008 on RADIX)
-starts the job, and the model runs it a virtual millisecond later.
+Codec register bank (`0x10021000`, byte-per-word, `1.5 dB` analogue gain steps, muted when off, supporting `IMP_AI_SetGain`/`IMP_AO_SetGain`; digital gains scale in software via `IMP_AI/AO_SetVol`):
 
-What libimp keeps of the engine's output decides the split:
+| SoCs | Playback enable & gain (`unity`) | Record enable, ALC & gain (`unity`) | Digital vol reset (`0 dB`, 0.5 dB steps) |
+|---|---|---|---|
+| T10–T30 (`jz_t10_codec.c`) | `CAR` `0x94[3:0]`; `CHCR` `0x9C[4:0]` (`0x18`) | `CAMPCR` `0x90` bit `7`; `CACR2` `0x8C[4:0]` (`0x10`) | — |
+| T23, T31 (`inner_codecs/T23/codec.c`) | `CHR` `0xA0` bit `7`; `CHR` `0xA0[4:0]` (`0x18`) | `CMICCR` `0x8C` bit `7` (bit `4` ALC holds level); `CALCGR` `0x94[4:0]` (`0x10`) | — |
+| T40, T41 (`inner_codecs/t40`, `T41/codec.c`) | `CHR` `0xA8` bit `6`; `CHR_2b`/`CHPOUTLGR` `0xAC[4:0]` (`0x18`) | `CMICCR` `0x8C` bit `7` (T40 right ADC `0x0E` bit `3`); `CGAINR` `0x28` bit `5` (T40) / `4` (T41); `CANACR_26`/`CALCGR` `0x98[4:0]` (T40 right `0x9C`; unity `0x10` T40 / `0x1F` T41) | `CDGSR` `0x18` (`0xF1`); `CLAVR` `0x20` (T40 right `0x24`, `0xC3`, `0` mutes; assumed undocumented reset) |
 
-| | software (libimp) | `ingenic-vpu` |
-|---|---|---|
-| H.264 | SPS, PPS, slice header and `cabac_alignment_one_bits`, after the job; escapes the NAL | CABAC `slice_data()` with the flush, unescaped, at SDE_CFG4; length SDE_CFG9 |
-| H.265 | VPS, SPS, PPS, slice header and `byte_alignment()`; escapes the whole NAL | `slice_segment_data()` with its trailing bits, unescaped, at SDE 0x68008; length 0x68024 |
-| JPEG | SOI..SOS, EOI | the entropy-coded scan at JPGC_BSA; length JPGC_STAT[23:0] |
+### Digital microphones (`ingenic-dmic` and `ingenic-asdmic`)
 
-The coders are the repo's: `hantro-h264.c` (I_16x16 DC intra; P slices
-inter coded, below), `hevc-enc.c` (8x8 DC
-intra, skip where the reference still matches; extended for libimp's CTB
-64, 16x16 `cu_qp_delta` groups, chroma QP offset -3 and luma-only SAO) and
-`jpeg-enc.c` with the quantisers taken back from the JPGC's QMEM
-reciprocals. The slice QP and type come from the chain (EFE_CTRL, RADIX
-EFE 0x20040/0x20000), so libimp's rate control (fixed QP, CBR) and its
-slice headers agree with the slices. libimp's x264 port is CABAC-only
-(`i264e_init` refuses CAVLC). The ~40 statistics registers libimp reads
-back after a task read what its chain left there.
+- **`ingenic-dmic` (T31, T40)**: Matches `audio_dmic.c` (`oss3`, `dmic_enable=1` on T40) and `oss2 devices/dmic` (`CONFIG_JZ_TS_DMIC`, off in shipped kernels). Supports `CR0` enable, rate (`8`/`16`/`48 kHz`), mic count, `PACK_EN` (`bits 15:0` earlier sample), 64-entry `DR` FIFO, `FTHR RDMS` (PDMA `13`), `FSR` (`FULL`/`EMPTY`), `INTCR`/`IMR`. Synthesizes `-global ingenic-dmic.tone-hz=N` (`1 kHz`) at peak `tone-amp` (`8192`, adjustable via `qom-set /machine/dmic tone-amp N`). Other XBurst1 chips have no DMIC driver.
+  - *Low-power voice trigger (`drivers/char/voice_wakeup`)*: With `EN` + `TRI_EN`, compares samples against `THRL`: `TRICR` mode `0` fires immediately, mode `2` after exceeding `TRINMAX` (other modes act as `0`), setting `INTCR TRIFLG` (bit `0`, IRQ unless `IMR` bit `0`) and `FSR TRIGS` (bit `18`) until `TRI_CLR` or self-clearing `RESET_TRI`. `SR 3` ("data path off") continues clocking trigger logic at `16 kHz` without pushing FIFO data (`THRH`/`TRIMMAX` storage; T41 ASDMIC has empty `TCR` and no trigger).
+- **`ingenic-asdmic` (T41 `0x134D0000`, core INTC `33`, `host/T41/dmic` `dmic_enable=1`)**: Registers as platform device (`ingenic,dmic` DT disabled). Connects DMIC (`+0xA000`, `8/16/48/96 kHz`, `16/24-bit`, `GCR` storage), data bus (`+0x4000`), format converter (`+0x2000`, storage), FIFO 5 (`+0x1000`), and DMA ch5 (`+0x0` closed ring of 4-word `{flags, DBA, next, DTC}` descriptors polled or interrupting on `TIE`/`LTIE`, `AIPR`). Synthesizes `-global ingenic-asdmic.tone-hz=N` (`1 kHz`).
 
-H.264 P slices (`hantro-h264-inter.c.inc`) are inter coded against the
-previous picture of that size, which the model keeps as the decoder
-holds it:
+---
 
-- each macroblock is P_Skip (where the P_Skip vector's prediction leaves
-  no coefficient), P_L0_16x16 or, where the motion search finds nothing
-  near (a scene change), the I slices' I_16x16 DC macroblock;
-- motion: quarter-pel vectors -- the predicted, P_Skip, neighbours' and
-  zero vectors at whole samples, a 4-pixel grid over +-16 pixels when
-  none is close, a diamond search, then half and quarter samples around
-  the best; luma predicted by the 6-tap / averaging interpolation of
-  H.264 8.4.2.2.1, chroma at eighth-pel, bilinear; the 16x16 vector
-  prediction and the P_Skip vector of H.264 8.4.1; one reference
-  (libimp's num_ref_idx_l0_active is 1);
-- residual: the 4x4 transform of every block, inter rounding, chroma DC
-  and AC, `coded_block_pattern`; libimp's x264 port writes a High
-  profile PPS with `transform_8x8_mode_flag` set whatever profile the
-  application asks for (seen with profiles 0, 1 and 2 on T21), so a
-  macroblock with luma residual sends `transform_size_8x8_flag` 0
-  (`-global ingenic-vpu.transform-8x8=off` drops it);
-- the reference is the reconstruction, deblocked as libimp's slice
-  header asks (`disable_deblocking_filter_idc` 0, offsets 0): the
-  decoder's picture, bit for bit, so nothing drifts; the I slices leave
-  theirs the same way;
-- a picture that would not fit SDE_CFG5 is coded again 6 QP higher, the
-  first coded macroblock's `mb_qp_delta` carrying the step.
+## Image pipeline: `sensor=`, `ingenic-isp`, `ingenic-isp-apical`, `ingenic-ivdc` and `ingenic-ipu`
 
-A whole-frame change (T23's AE flipping the sensor gain on this scene
-every five frames) is a DC residual on the motion-compensated reference
-rather than a picture of I_PCM; libimp's CBR, which held the slice QP at
-51 with I_PCM pictures, now brings it down (31 to 25 over 20 pictures in
-`test-ingenic-vpu-e2e.sh`). The AVPU codes its P slices the same way
-(H.264 and H.265: below), and so does RADIX its H.265 ones, with
-`hevc-enc-inter.c.inc` and what i265e's SPS / PPS / slice headers say
-(read off a T30 stream): no scaling lists, no temporal MVP,
-`max_transform_hierarchy_depth_inter` 0, no sign hiding, two merge
-candidates (`five_minus_max_num_merge_cand` 3); a P picture that would
-take more than a byte a pixel is coded again 6 QP higher, at last all
-skipped (no register here gives i265e's room). `test-ingenic-t30-rtsp.sh`
-copies each stream before decoding it, since a P picture lost to a
-decoder falling behind would break the ones after it.
+### Supported sensors
 
-The engines' TLB: libimp addresses the engines physically, but the
-driver can hand a process its DMMU table (`IOCTL_CHANNEL_PRIVATE_TLB`,
-`libdmmu.c`), and with a table base set and a unit's enable on, that
-unit's addresses are virtual: a 4 KiB page directory indexed by VA bits
-31:22 whose entries (bit 0 valid) point to 1024-entry page tables
-indexed by bits 21:12 (bit 0 valid, the physical page in 31:12). HELIX
-and the VPU take the base at SCH_TLBA (0x30) and the enables in GLBC
-(bits 26..21: JPGC, DBLK, SDE, EFE, VDMA, MCE; bit 30 all of them on the
-older layout); RADIX at CFGC 0x10 and 0x1C (bits 16..21: EFE, VDMA, ODMA,
-DBLK, MCE, SDE). The model translates the EFE's source reads, the SDE /
-JPGC bitstream writes and the VDMA chain a page at a time; an unmapped
-page logs a TLB error, reads as zero, drops writes and, on HELIX / the
-VPU, sets SCH_STAT bit 10.
+Pass `-M <soc>,sensor=<name>` (on `I2C0`; `I2C1` on T40; `sensor-bus=<n>` overrides `-1` default for custom boards like OpenIPC/firmware#1884). On T40, `sensor1=` attaches pipe 1's sensor on `I2C3` and `sensor2=` attaches `VIC2`'s sensor on `I2C0`. T10 uses `i2c-gpio` (`PA12` SDA, `PA13` SCL) wired open-drain through `ingenic-gpio` drive outputs onto `gpio_i2c`. Sensors respond without waiting for `MCLK` or `PA18` reset so `sinfo.ko` (`/proc/jz/sinfo/info`) always identifies `sensor: gc2053`.
 
-`qemu/tests/test-ingenic-vpu.py` plays the driver and libimp at register
-level on every SoC (H.264 with libimp's High profile headers, JPEG, H.265
-on T30) and decodes the result with ffmpeg; on T21 a textured picture
-moving (8, 4) pixels a frame gives P pictures of a few hundred bytes (a
-fiftieth of what I_PCM would take) that decode to the I picture moved;
-it runs the JPEG (and T30's H.265 IDR picture) again
-through the TLB, over pages laid out in reverse, for the same bytes; `qemu/tests/test-ingenic-vpu-feed.py` runs libimp's own
-encoders (`i264e_*`, `i265e_*`, `ijpege_*`; `qemu/tests/ingenic-vpu-feed.c`)
-from a picture in memory on the OpenIPC kernel and rootfs of each SoC; `qemu/tests/test-ingenic-vpu-e2e.sh` runs the
-SDK samples' FrameSource -> `IMP_Encoder` path on T21 with the ISP model
-and its sensor.
+| Sensor(s) | I2C address | Model / driver ID | Notes |
+|---|---|---|---|
+| `gc2053`, `gc2083` | `0x37` | `galaxycore-sensor` | `gc2083` uses 16-bit registers |
+| `gc4653`, `gc4663` | `0x29` | `galaxycore-sensor` | 16-bit registers; T40 (`I2C1`) and T41 |
+| `sc2336`, `sc2335`, `sc1a4t`, `sc2336p`, `sc2337p` | `0x30` | `hisi-smartsens` | Single/main sensor |
+| `sc1a4ts1`, `sc2336ps1`, `sc2337ps1` | `0x32` | `hisi-smartsens` | Secondary sensor (`sensor1=`) |
+| `jxf37`, `jxf22`, `jxf23`, `jxq03` | `0x40` | `hisi-f37`, `hisi-jxf22`, `hisi-jxf23`, `hisi-jxq03` | `JX-F22` (`jxf22`), `JX-Q03` (`jxq03`, T31 `2304x1296` MIPI) |
+| `jxh62` | `0x30` | `hisi-jxh62` | T10 sensor |
+| `ov2735b`, `ov2735` | `0x3C` | `ingenic-ov2735` | Paged 8-bit registers; page `0` reg `0x04` selects variant |
 
-JPEG decoding (`IMP_Decoder`, in T23's and T30's libimp only): libimp
-parses the file itself (`ijpegd_decode_header`) and gives the JPGC a
-chain of its own (`T20_JPEGD_SliceInit`) that ends with JPGC_TRIG = 7
-(core open, bitstream and picture triggers) and no EFE: the model decodes
-a baseline scan then. What the chain sets, derived from libimp's code and
-from its parser run on known files (user-mode QEMU):
+*OpenIPC `load_ingenic` bug*: Release `sinfo.ko` prints `sensor: gc2053` with a space after `:`, making `${SENSOR_INFO#*:}` evaluate to `" gc2053"` and fail `modprobe sensor_` on boot 1 (boot 2 works using saved env). Pre-seeding `sensor=` in U-Boot's environment works around this (`qemu-boot/test-ingenic-isp.sh`).
 
-| | |
+### T21, T23, T31, T40 and T41 ISP (`ingenic-isp`)
+
+Matches `tx-isp-t31.ko` (`H20221206a` + SDK 1.1.5 symbols), `tx-isp-t23.ko` (SDK 1.1.0 + OpenIPC `H20240204a`), `tx-isp-t21.ko` (`H20200509a`), `tx-isp-t40.ko` (`H20220606a`), and `tx-isp-t41.ko` (`H20230630a`). Rather than reading sensor frames, each frame renders the synthetic test pattern (`sstar-pattern.h`, `ingenic-isp-paint.h`: OpenIPC logo on navy gradient, sliding dot, 6-patch grey step wedge bottom-left, 6-digit top-left frame counter on black box) into queued NV12 buffers.
+
+- **CPM handshake**: Sets `SRBC` (`0xC4`) bit `21` and polls bit `20` (immediately satisfied).
+- **ISP core & MSCA DMA-out channels**:
+
+| Feature | T21 | T31 | T23 (`0x90000` core) | T40 (pipe 0 / pipe 1) | T41 |
+|---|---|---|---|---|---|
+| IRQ en / sta / clr | `0x80` / `0x84` / `0x88` | `0xB0` / `0xB4` / `0xB8` | `0xB0` / `0xB4` / `0xB8` (`0xC0`-`0xC8` dual) | `0x40020`/`28`/`24`, `0x40030`/`0x40038`/`0x40034` | `0x40020` / `0x40028` / `0x40024` |
+| MSCA enable & ch base | `0x2304` (`0x2308` stop=0); `0x2400 + 0x100*n` | `0x9804`; `0x9900 + 0x100*n` | `0xD040` (`0xD050` NV21/mirror/flip); `0xD100 + 0x100*n` | `0x16008`/`0x17008`; `0x16100`/`0x17100` | `0xF0008`; `0xF0100 + 0x100*n` (`+0xF0000` = `0x133F0000`, mmio 4) |
+| QBUF push Y / UV | `C+0x6C` / `C+0x84` | `C+0x6C` / `C+0x84` | `C+0x30` / `C+0x50` | `C+0x6C` / `C+0x84` | `C+0x6C` / `C+0x84` |
+| ISR pop Y / empty / meta | `C+0x74` (`C+0x78` fnum) / `C+0x7C` | `C+0x74` (`C+0x8C`/`90`) / `C+0x7C` | `C+0x38`/`C+0x3C`, `C+0x58`/`C+0x5C` | T31 offsets | T31 offsets |
+| Size / strides | `C+0x2C` / `C+0x80`, `C+0x98` | `C+0x2C` / `C+0x80`, `C+0x98` | `C+0x0C` / `C+0x40`, `C+0x60` | T31 offsets | T31 offsets |
+
+On T31, writing `C+0x9C..C+0xA8` clears channel FIFOs; status bit `n` marks channel `n` done (`0x1000` frame start).
+
+- **VIC & CSI**: Commands `2` and `4` to `0x00` clear at once; `1` starts input. Status / mask (`1` = masked) / W1C sit at `0x1E0/0x1E8/0x1F0` (+4 bank 2; T21 `0x100/0x104/0x108`), incrementing `/proc/jz/isp/isp-w02` on bit `0` frame done for `libimp`'s "video drop" watchdog (T40 VIC0 bit `4` triggers sensor/AE work). On T23, `VIC_PORT_SEL` (`0x204`) locks `VIC_PORT_STATUS` (`0x20C`), and `VIC_MDMA` packs 10-bit BGGR (`<< 6`). CSI and D-PHY (`0x10023000`/`0x10022000`, `0x10054000` T40 pipe 0) act as storage reading `0` on `ERR1`/`ERR2` (T21 is DVP-only without CSI/PHY).
+- **Frame clock & lighting**: Runs at sensor frame time (`HTS * VTS / pclk`) or `-global ingenic-isp.fps=` (`25`) with `-global ingenic-isp.expo-delay=<n>` (or `qom-set /machine/isp expo-delay <n>`, `0..8`). Scene brightness follows `light` (`100`%), `light-r`, and `light-b` (linear scaling before gamma `2.2` encoding and white clipping); T23/T31 apply the WB gains at `0x1804`/`0x1808` to output chroma. Statistics use the scene before white balance.
+- **Tracing**: `-global ingenic-isp.trace=on` (MSCA/3A + frame summary), `trace-regs=on` (`ingenic-isp: core [0x...] = 0x...`), and `-global galaxycore-sensor.trace=on`.
+
+### Closed-loop 3A (AE, AWB, AF) and extended statistics
+
+Exposure scales linear scene brightness by `sensor rows x gain` (normalized against `1000` rows at gain `1.0`) multiplied by the ISP digital gain:
+
+- **Sensor exposure registers** (`include/hw/i2c/ingenic-sensor.h`): `gc2053` uses rows `0x03`/`0x04` and gain registers `0xB8`/`0xB9`; `gc2083` uses `0x0D03`/`0x0D04`; `gc4653` and `gc4663` use `0x0202`/`0x0203` and `0x02B8`/`0x02B9`; `sc2336` uses `0x3E00`–`0x3E02` and `0x3E07`/`0x3E09`; `jxf37` uses `0x01`/`0x02` and `0x00`; and `ov2735b` uses page `1` registers `0x03`:`0x04` and `x16` gain at `0x24`.
+- **ISP digital gain**:
+  - On T23 and T31, `tisp_ae0_process_impl` (`JZ_Isp_Ae_Dg2reg`) writes fractional gain to `0x1030`/`0x1034` (`G` sits in the upper halfword of `0x1030`, with `0x400 = 1.0`). Without this feedback, `gc2053`'s coarse `1.18x` analogue gain steps hunted every 5 frames between `2272/256` (`1.21x` digital gain) and `2683/256` (`1.0x`); with it, AE locks smoothly at `2283/256` for 153 frames of a 200-frame run.
+  - On T21, `tisp_ae_process_impl` writes `0x408`/`0x40C`, holding `129/256` (mean `8`) from frame 65 onward.
+  - T40 and T41 apply digital gain elsewhere and converge directly.
+
+#### AE0 and AWB DMA statistics
+
+`tisp_init` configures the 15 x 15 (`225`-zone) AE0 and AWB statistics blocks using shared grid registers:
+
+- **Common layout**: `+0x04` holds the zone grid (`[31:28]` columns, `[15:12]` rows = 15 x 15); `+0x08`–`0x14` and `+0x18`–`0x24` store per-zone widths and heights in `2x2-pixel` quads (one byte each); `+0x4C` holds bank counts; `+0x50` holds the last bank written (AE zone bank in `[5:4]`, histogram bank in `[1:0]`).
+- **AE0 specific registers**: `+0x28` stores dark (`[7:0]`) and bright (`[15:8]`) thresholds, `+0x2C`–`0x38` hold four zone banks, and `+0x3C`–`0x48` hold four 256-bin histogram banks containing `21-bit` quad luma counts (stored twice). `ae0_weight_mean2` divides each zone's sums by `width x height`.
+- **Per-SoC differences**:
+
+| Feature | T21 (`0x84` bits `16/17/18`) | T31, T23 (`0xB4` bits `26/27/30`) | T40, T41 (`0x40028` bits `4/5/3`) |
+|---|---|---|---|
+| AE0 / AWB base | `0x700` / `0x800` | `0xA000` / `0xB000` | `0x19000` / `0x18000` |
+| AE0 format | `16` B/zone, 20-bit histogram; quarter-scaled sums (settles at mean `7` vs T31 `10`, preventing T21 from sticking at linear mean `2` of `255` regardless of light) | `16` B/zone (21-bit dark/mid/bright sums + 13-bit counts), `8x6` sampling | 22-bit sums, 14-bit counts |
+| AWB zone record | `16` B (`R, G, B` sums + count at bit `63`; no IR sum) | Banks at `0x3C`–`0x48`; `16` B (`R, G, B, IR` 21-bit sums + 13-bit count) | `128-byte` zones: 4 pairs of `16-byte` records read by `tisp_awb_get_statistics` (`R, G, B, 4th` 22-bit sums at bit `0/22/44/66`, 14-bit count at bit `88`). Tuning bytes `3274`/`3276` select a pair; AWB reads the second record (filtered quads) while the model also fills the first (all quads). |
+
+#### AWB pixel filters and settled gains
+
+- **T21 / T23 / T31 filter (`tiziano_awb_set_hardware_param`)**: Programs T21 `0x828`–`0x838` or T23/T31 `0xB028`–`0xB038` with Q8 limits (`min` `[15:0]`, `max` `[31:16]`) on `R/G` (`+0x28`), `B/G` (`+0x2C`), diagonal bounds `k * R/G / 256 + B/G` (`+0x30`/`+0x34`), and `(R + 2G + B)/4` luma (`+0x38`, `[7:0]` low / `[15:8]` high), vs the driver's all-pass defaults (`R/G 1..4095`, bounds `0` and `65535`).
+- **T40 / T41 filter (`0x18028`)**: `tisp_awb_set_regional_threshold` and `tisp_awb_set_lum_th_freq` program tighter EV-interpolated windows (three luma bytes + frequency in `+0x38`): T41 uses `R/G 60..245`, `B/G 30..200`, `k = 256` bounds `170`/`320`, luma `10..230`; T40 uses `R/G 53..284`, `B/G 29..304`, bounds `167`/`394`, luma `0..230`.
+- **T21 `Tiziano_awb_fpga` / `Tiziano_Awb_Ct_Detect`**: Reconstructed from `swapper_pg_dir` gdbstub inspection: `_AwbPointPos[1] = 0` runs every frame with static tuning gains `1526`/`1583` (Q10), drops zones with count `<= _pixel_cnt_th` (`25`), projects zones onto the CT band (`R/G 180-400`, `B/G 260-148`) above luma floor `50`, and uses fallback `R/G 167, B/G 340`.
+- **Grey wedge & light tracking**: Because metering for the dark navy background (`Y ~90` on T40/T41, 12x past logo full scale vs `1.2%` navy) clips the logo outside the R/G and luma limits, the scene's bottom-left 6-patch neutral grey step wedge ensures valid white zones. Out-of-window lights (such as `R 0.35 / B 0.9`) hold default start gains (`2212 / 1856`). On T21, `10%`, `100%`, and `1000%` light all settle at mean `7`; on T31, `light 30%` and `100%` both converge to navy `Y 39` by frame 40.
+
+| SoC | Settled AWB gains (`per 1024`) |
 |---|---|
-| BSA (0xE000C) | the scan as in the file, byte-stuffed, restart markers and EOI kept |
-| GLBI (0xE0004) | [5:4] components - 1, [2] restart markers every NRSM + 1 MCUs |
-| NMCU (0xE0028) | MCUs - 1; libimp counts 16x16 macroblocks |
-| P0C..P3C (0xE0030..) | [7:4] blocks per MCU - 1, [3:2] quantiser table, [1] AC, [0] DC table |
-| QMEM (0xE1400) | four tables of 64 quantisers, zigzag order |
-| HUFM (0xE1300) | per Huffman table (AC0, DC0, AC1, DC1; 4 words) the canonical first code of each length, its low min(L, 8) bits: lengths 1..8 packed from the top of a 36-bit field, 9..16 a byte each |
-| HUFB (0xE1200) | per table and length, where its symbols start in HUFS minus its first code, 9 bits |
-| HUFS (0xE1800) | the symbols, a word each: AC0 from 0, AC1 from 174, both DC tables in the nibbles from 162 (table 0 low) |
-| P0A / P1A (0xE0010/14) | the picture as 16x16 tiles ("T420"): macroblock k's luma at P0A + 256 k, its chroma at P1A + 128 k, rows of 8 Cb then 8 Cr |
+| **T21** (`JX-F37`) | Daylight (`550/600`): `R 1860 / B 1712` · Warm (`R 0.9 / B 0.35`): `R 1140 / B 2740` · Cool (`R 0.45 / B 0.75`): `R 2272 / B 1360` |
+| **T31** | Daylight: `1860 / 1704` · Warm: `1136 / 2916` · Cool: `2280 / 1364` |
+| **T23** | Daylight: `1856 / 1704` |
+| **T40** | Daylight (`460/550`): `2220 / 1864` · (`500/430`): `2048 / 2380` · Warm (`700/280`): `1468 / 3636` · Cool (`380/600`): `2688 / 1712` (within 1–3% of `1024/R`, `1024/B`) |
+| **T41** | Daylight (`460/550`): `2228 / 1856` · (`500/430`): `2056 / 2388` · Warm (`700/280`): `1468 / 3704` · Cool (`380/600`): `2716 / 1704` |
 
-The JPGC never learns the picture's width, so it writes the macroblocks
-one after the other -- exact for 4:2:0, libimp's own encoder's layout;
-an MCU of another shape puts its luma blocks in its macroblock's
-quadrants (an inference). The end is JPGC_STAT's end bit and SCH_STAT bit
-4, as for encoding, and MCUS (0xE0064) the MCUs decoded: the kernel takes
-it as the task's output length and fails a decode that leaves it 0.
-libimp then turns the tiles into NV12 (`c_copy_frame_t420_to_nv12`); it
-leaves the rows of a partial last macroblock row zero (a height that is
-not a multiple of 16), whatever the tiles hold. `test-ingenic-vpu.py`
-decodes, at register level on T23 and T30, the JPEG the model encoded
-(68 dB against ffmpeg's decode) and a file with optimised Huffman tables
-and a restart marker every MCU (51 dB against libjpeg);
-`qemu-boot/test-ingenic-jpegd.sh --soc t23|t30` runs the SDK sample's
-`IMP_Decoder` sequence (`qemu-boot/ingenic-jpegd-test.c`, static against
-the SDK's libimp.a) on the OpenIPC kernel and saves each picture from
-guest memory.
+#### Extended statistics (`ingenic_isp_xstats()` / `xstat 3`)
 
-T41 keeps HELIX's JPEG half as its own engine at 0x13280000
-(`ingenic,t41-jpeg`, the 4.4 kernel's `drivers/video/ingenic_vpu/helix`,
-`/dev/soc_vpu`, core INTC source 0): libimp encodes a JPEG channel on it,
-with its own `ijpege_*`, when the channel's `encVputype` is
-`IMP_ENC_TPYE_IVPU` (the default, AVPU, takes core 1 of the AVPU). The
-units are renumbered -- SCH 0, VDMA 1, EFE 2, JPGC 3 at 64 KiB each,
-the rest folded on 7 (`helix.h`'s HID_*) -- and the chain sets bit 19 of
-every address; the model (`layout` 1) maps them back onto HELIX's
-offsets, so the kernel's JPGC_STAT read at +0x30008 and the chain's
-EFE/JPGC words land where the JPEG coder reads them. The reset is SRBC
-28 (stop 27, acknowledge 26). `test-ingenic-avpu.sh --soc t41 --ivpu`
-encodes both channels this way through libimp and the kernel driver
-(2560x1440 and 640x360, decoded by ffmpeg, the scene checked);
-`test-ingenic-vpu.py` has a register-level T41 case.
-
-### `ingenic-avpu`
-
-The T31/T40/T41 encoder is an Allegro DVT core with no MCU: `avpu.ko`
-(SDK `opensource/drivers/avpu`) only proxies register reads/writes and
-the interrupt (IRQ 70 = INTC 62), and libimp runs Allegro's scheduler
-on the CPU (`CoreManager.c`, `EncSliceParam.c`, `SliceHdrWriter.c` in
-the SDK's `libimp.a`; contract: `tmp/media-contract.md` section 3). The
-`reg-base` property puts the 4 KiB register file at +0x8000 of the 1 MiB
-block (T31, T40) or at +0 (T41). Core c's registers are at +0x200 c:
-libimp encodes video on core 0 and JPEG on core 1. The HW ID word (0x8004
-past the UID) is the part's -- libimp's encoder library checks it
-("Board ID mismatch: ... instead of 72000460"): 0x72000460 on T31,
-0x72000760 on T40, 0x71000260 on T41 (`hw-id`).
-
-- 0x14 / 0x18: interrupt mask / W1C status, bit 4c+0 Enc1 or JPEG done,
-  4c+2 Enc2 done; 0x30 a ticking 800 MHz counter (libimp spins until it is
-  non-zero); busy (0x3F8) always reads idle.
-- 0x3E0 / 0x3E4: a command list (0x200-byte entries, word 0 bit 31 the
-  last) and its start, 2 Enc1, 8 Enc2, 1 JPEG from R0-R10 (0x200-0x228;
-  bytes written at 0x234). Jobs complete 200 us after the start, never
-  inside the write, or once they are coded if that takes longer: the
-  coding runs on a thread of its own, beside the CPUs, as the encoder
-  does on silicon. Coded under the iothread lock, a 2560x1440 picture
-  held both CPUs for up to 0.8 s of host time while the virtual clock
-  went on, so every kernel timer due meanwhile fired that late; T41's
-  `audio.ko` gives a microphone read 800 ms (`get mic timeout!`, and
-  libimp then records nothing more). The thread touches guest RAM only:
-  an address that lands on a register reads as zeros and a write there is
-  dropped (logged as a guest error), since dispatching a device's callbacks
-  off the lock could wait on a vCPU that is itself waiting for the batch.
-  Addresses are masked to 29 bits.
-- Bitstream split: libimp writes SPS/PPS/VPS/SEI and the slice header,
-  the hardware the slice data from stream base + offset (re-emitting the
-  0x78/0x7C header tail with emulation prevention); libimp writes the
-  headers after the picture is done. T31 libimp sets Enc1 W8 bit 11 (Enc1
-  codes the slice; stream buffer in WC0-WCC, bytes in 0x104), offset
-  0x220, tail n = 0; the separate Enc2 pass (WF0-WFC, 0x1E4) works too.
-- Slice data: H.264 from `hantro-h264.c`, HEVC from `hevc-enc.c`, both
-  with real inter coding in P slices (below); JPEG from `jpeg-enc.c`
-  (the whole file, quantisers de-zigzagged from R6). Rate-control
-  counters in the entries are made up and non-zero.
-- H.264, CABAC (what libimp uses on every part: Main profile,
-  `cabac_init_idc` 1): I slices I_16x16 DC, P slices inter coded by
-  `hantro-h264-inter.c.inc` (P_Skip, P_L0_16x16 with a quarter-pel
-  motion search and a 4x4-transform residual, I_16x16 DC where nothing
-  comes close), the PPS's `transform_8x8_mode_flag` followed. A picture's
-  slices (rows of macroblocks; libimp sends one a picture, the model
-  takes any number, by W14) are coded on one reconstruction, each on its
-  own window of it -- a slice's first row has no neighbour above for
-  intra or vector prediction or the CABAC contexts, as in a decoder --
-  while motion compensation reads the whole reference; the in-loop
-  filter runs on the picture when its last slice is done
-  (`disable_deblocking_filter_idc` 0 with W10's offsets, alpha [13:8],
-  beta [4:0]: what every slice header libimp writes says -- the command
-  words' bit that would turn the filter off is not known), and the
-  result is the reference of the channel's next P picture, kept per
-  reconstruction address (W90) and looked up by the reference address
-  (WA0): the decoder's picture, bit for bit. A slice that would not fit
-  the stream buffer's room is coded again at a higher QP. CAVLC (a
-  Baseline PPS; libimp does not send one) codes the same macroblocks the
-  same way: `mb_skip_run`, Exp-Golomb `mb_type`, `mvd` and the inter
-  `coded_block_pattern` (Table 9-4), `residual_block_cavlc` with nC from
-  the neighbouring blocks' TotalCoeff (all four coeff_token tables).
-  B slices (W3 [29:28] 0): L0 from RefA (WA0), L1 from RefB (WA8) --
-  the slice buffers' second reference, which libimp's encode1
-  (ChannelMngr.c) copies to the words after RefA's luma / chroma, in the
-  order of Allegro's TSliceBuffersEnc (RefA, RefB, Rec) -- every
-  macroblock B_L0_16x16, B_L1_16x16 or B_Bi_16x16 (each list's vector
-  searched on its reference, the cheapest of the two and their rounded
-  average) or I_16x16 DC; never B_Skip or B_Direct_16x16, so neither
-  direct mode's derivation is needed. What the slice data follows: one
-  reference in each list (`num_ref_idx_active` 1 / 1), no weighted
-  prediction. libimp sends no B pictures in normal use
-  (IMPEncoderGopAttr's uNumB is commented out); with uGopCtrlMode
-  PYRAMIDAL it forces uNumB to 3 and, on T31 with 64 MiB of rmem,
-  creates the channels, but its own `Codec_Encode_SetGopParam` then
-  fails and no stream starts (not traced further), so B is checked at
-  register level. The rate
-  control's estimate of a P slice still counts I_PCM macroblocks
-  (`pcm-budget`).
-- HEVC: libimp's CTB 32, intra transform depth 1, transform skip (T31,
-  T40; not T41) and cabac_init_flag; P slices inter coded by
-  `hevc-enc-inter.c.inc` (`inter`, opt-in for the AVPU; the XM engines
-  keep the older skip / intra DC coding): each 8x8 CU is skipped (a
-  merge candidate's motion), merged with a residual, coded with a vector
-  (AMVP predictor and difference, `rqt_root_cbf`) or intra DC; vectors
-  searched at whole samples, then refined at half and quarter samples,
-  prediction interpolated as the decoder does (the luma 8-tap and chroma
-  4-tap filters of 8.5.3.3.3); the merge list (A1, B1, B0, A0, B2, the temporal
-  candidate, zeros up to MaxNumMergeCand 5) and the AMVP list built as
-  the decoder builds them, the temporal candidates from the reference
-  picture's decoded vectors (libimp's SPS enables TMVP; every picture
-  refers to the one before it, so no vector is scaled); residuals through
-  the HEVC integer transforms with the default scaling lists libimp's SPS
-  turns on (8x8 inter / intra lists; 4x4 flat), coded as
-  `residual_coding()` with its context sets (sign hiding when the PPS
-  has it: libimp's does not); deblocking with the inter boundary
-  strengths. The decoded pictures equal the model's reference, sample
-  for sample. B slices (`hevc_enc_slice_data_b`): L0 from RefA, L1 from
-  RefB (WA8), every inter CU bi-predicted by AMVP in each list (14-bit
-  intermediate interpolation, the default bi weighting) or intra DC --
-  never skipped or merged, so that every inter neighbour carries both
-  vectors and no candidate needs scaling by POC (the model has no POCs);
-  what the slice header must say: one reference in each list,
-  `mvd_l1_zero_flag` 0, `slice_temporal_mvp_enabled_flag` 0, initType 2
-  (1 with cabac_init_flag). Correct, dearer than skip and merge would
-  be. Every CU is coded at QP 22 at most (cu_qp_delta), P
-  pictures' too: libimp's rate control runs the slice QP up to the 40s,
-  where the residuals of fine detail (the counter's 6-sample cells)
-  quantise away; a picture that would not fit the stream buffer's room is
-  coded again at a higher QP, and as a last resort every CU (macroblock,
-  for H.264) skipped -- a slice cut short would set the overflow bit (30)
-  of its byte count.
-- The parameter sets the coders follow (HEVC SPS / PPS, H.264 PPS) are
-  read from the bytes in front of a slice's offset in its stream buffer:
-  libimp writes a picture's headers after the picture is done, so what is
-  there is an earlier picture's -- the sets an I picture carried, or
-  their remains under a P picture's header. An SPS and a PPS must follow
-  each other whole, the PPS parsed through its trailing bits, before they
-  are taken; the remains of one (on T40, alternate pictures'
-  buffers held a PPS reading `transform_skip_enabled_flag` 0) would code
-  slices the decoder parses otherwise.
-- On T31, 30 pictures of the ISP's scene (a moving dot and a counter,
-  no sensor noise): H.264 1080p I 8.9 KB, P 1.2 KB on average, luma
-  PSNR of the P pictures 47.4 dB; 640x360 I 2.6 KB, P 0.65 KB, 42.0 dB;
-  HEVC 1080p I 18.3 KB, P 2.6 KB, 43.6 dB; 640x360 I 3.2 KB, P 0.9 KB,
-  36.6 dB -- where I_PCM P pictures took 21 KB each at 1080p.
-- `-global ingenic-avpu.dump=DIR` writes every channel's stream and each
-  JPEG to DIR, and for each coded picture the reference the model kept
-  (`avpu-<w>x<h>.<ext>.rec`, NV12 at the picture's size: what a decoder
-  must output) and its source (`.src`); `trace=1` logs every start and
-  command entry (`-d unimp`), `trace=2` every register write.
-
-T41's core is the next Allegro generation (`gen=2`, libimp 1.2's
-`CoreManager.c`, `EncCmdRegs.c`, `EncSliceParam.c`): the common
-registers as above (mask 0x14, status 0x18, timer 0x30), then a 4 KiB
-page per core at 0x1000 (c + 1) -- Enc1 at +0, Enc2 at +0x800: the
-command list address (low, high) at +0, its status area at +8, control
-at +0x10, start at +0x18 (2; 1 for JPEG), busy at +0x1C -- and done bits
-2c (Enc1, JPEG) / 2c + 1 (Enc2). A list entry is 4 KiB: Enc1's words at
-0, its status at 0x5C0 (gen 1's 0x104-0x174 minus 0x118), Enc2's words
-at 0x800 and status at 0xDC0. The words that matter, read off libimp
-1.2's entries: W0 codec [1:0], log2 LCU - 4 [26:24], last [31]; W4
-width / 8 - 1 [10:0], height / 8 - 1 [26:16]; 0x0C gen 1's W8 (CABAC,
-cabac_init, Enc1 codes the slice); 0x60 / 0x64 / 0x68 gen 1's WC / W10 /
-W14; source luma / chroma 0xA0 / 0xA8, pitch 0xD0; reconstruction
-0x1C0, reference 0x108; stream base / size / offset / room 0x220 /
-0x22C / 0x230 / 0x234; Enc2 0x800-0x814. libimp 1.2 has Enc1 code every
-slice, as T31's does. Its HEVC SPS / PPS differ from T31's (scaling
-lists on with the defaults, no transform skip, depth 1), which the model
-assumes for a channel's first picture. JPEG runs on core 1 from the
-page's 0x40-0x88 (R0 0x40, size 0x44, tables 0x58, stream 0x60 / 0x68 /
-0x6C / 0x70, pitch 0x74, source 0x80 / 0x88), bytes back at 0x604.
-`avpu_g2_entry()` puts the words back in gen 1's places for the coders.
-
-`python3 qemu/tests/test-ingenic-avpu.py` plays libimp's register and
-command-list sequence under qtest (I + P in CAVLC, CABAC, Enc1-only and
-Enc2 forms, HEVC, JPEG, a CAVLC sequence changing every macroblock, the
-T40/T41 bases, and a
-picture of two slices panning over three pictures, which must decode to
-the model's own reconstruction, sample for sample, at 42 dB, and B
-pictures in H.264 -- I0 P2 B1 P4 B3, two slices a picture -- and HEVC
--- the same order, libimp's parameter sets, an RPS in each slice header
--- each decoding, in its order, to the model's reconstruction sample for
-sample, the B pictures at 41-43 dB) and decodes
-the output with ffmpeg (or the `jrottenberg/ffmpeg` docker image).
-`bash qemu-boot/test-ingenic-avpu.sh [--soc t40|t31|t41]` runs it end to
-end: OpenIPC's kernel and rootfs, `load_ingenic` (avpu.ko among the
-modules), `sensor=` and `ingenic-isp`, and an IMP_Encoder client
-(`qemu-boot/ingenic-avpu-enc.c`, linked against the rootfs's own
-libimp.so) that encodes the sensor's size and 640x360 in H.264, H.265 and
-JPEG, one boot each. The streams come back through the SD card (T31) or
-pmemsave of the top 8 MiB of RAM (T40, T41, whose SDHCI finds no card); every
-picture must decode under `ffmpeg -err_detect explode` and show the
-ISP's counter, logo and moving dot (`ingenic-isp-check.py`; at 640x360
-the HEVC I picture's 8x8 DC blocks are coarser than the counter, so
-there only the logo and the dot). With `dump`, every decoded picture of
-every stream on T31, T40 and T41 was the model's reference bit for bit
-(T40's libimp marks its HEVC streams full range, which a comparison must
-not convert, and sends them as I pictures). The register block is 4 KiB from `reg-base`, not the MiB
-avpu.ko claims: T40's RTC sits at 0x132A0000, inside it. T40's libimp
-faults on a JPEG encoder channel 0; the client uses channels 4 and 5, as
-the SDK samples do. T41 boots the SDK image the way the ISP test does
-(below), the client linked statically against the SDK's `libimp.a`, and
-loads `tx-isp-t41.ko` without `direct_mode`.
-
-### The rest
-
-- `ingenic-ddr`: storage, with the bits each DDR init polls reading
-  done -- the DWC PHY's PGSR on T10/T20; the Inno PHY's PLL lock, init and
-  calibration on T21..T31 (exact values, 3); T40's and T41's at their own
-  offsets; the DDRC LMR start bit self-clearing. The remap registers remap
-  nothing. DRAM size is the machine's `-m`.
-- `ingenic-gpio`: S/C aliases on every register, the shadow port's
-  collected set/clear masks applied by GID2LD, outputs reading back their
-  level and undriven inputs reading high; one interrupt line per port.
-  Each port's external levels are a property at `/machine/gpio` ("pa"
-  .. "pf"), settable while the guest runs -- a key, a PIR sensor, a
-  limit switch: `qom-set /machine/gpio pc 0xfffffffe` pulls PC0 low, and
-  the edge or level interrupt it is set up for fires
-  (`test-ingenic-gpio.sh`: a sysfs GPIO sees both edges on T31).
-- `ingenic-i2c`: a DW_apb_i2c master with 8/16/32-bit register access
-  moving each command at once; an address no device answers aborts with
-  TXABRT bit 0, and ENSTA follows
-  ENB (both drivers wait for it). The image sensor (`sensor=`) is on
-  I2C0. DMA follows the DW_apb_i2c handshake on DMACR (0 RDMAE, 1 TDMAE),
-  DMATDLR and DMARDLR (0x88..0x90, named in both vendor drivers, which
-  only print them): the TX request is up while TDMAE is set (commands
-  leave at once, so the TX FIFO never passes DMATDLR); the RX request
-  rises once the RX FIFO holds more than DMARDLR bytes and stays up for a
-  burst of DMARDLR + 1 DATA_CMD reads. No driver here moves I2C data by
-  DMA, so this is checked by qtest only.
-- `ingenic-rtc`: WRDY always set, WEN after the 0xA55A unlock (the
-  power-off path waits for both without a timeout), seconds from the
-  host's clock, HCR.PD powers off. Each second RTCCR.1HZ sets and, with
-  AE, RTCSR reaching RTCSAR sets AF; the line (INTC 32 on T10..T31, 3 on
-  T41, none named on T40) is up while AF and AIE or 1HZ and 1HZIE
-  (`rtc-jz.h`); an alarm with HWCR.EALM latches HWRSR.ALM and wakes a
-  suspended machine. No shipped kernel builds the RTC driver; the SDKs'
-  `sample-alarm` drives it. T41's always-on RTC memory (4 KiB at
-  0x10004000, where `pm_fastboot.c` keeps its resume code) is RAM.
-- `ingenic-efuse`: blank fuses with every read and program done at once
-  (the vendor kernels poll both and CTRL's enable). Blank keeps the
-  binary-only MXU licence check in the 3.10 kernels permissive. The chip
-  ID (fuse offset 0, 96 bits: `SU_Base_GetDevID`, the SDKs'
-  `sample-chipid`, `/proc/jz/efuse/efuse_chip_id`) is the SoC ID then
-  "OpenIPC!" unless `-global ingenic-efuse.chipid0..2=` says otherwise;
-  a die's own is unique.
-- `ingenic-sadc`: the AUX ADC of `jz_adc_v13.c` (3.10) and
-  `ingenic_adc_v13.c` (4.4). ENA bit 15 powers it down; setting bit n
-  converts AUX n 20 us later, clears the bit and raises STATUS bit n
-  (write 1 to clear), interrupting unless CTRL masks it. Each pin's level
-  is the `auxN` property (raw 0..4095, 1.8 V full scale; mid-scale by
-  default), settable at run time: `qom-set /machine/sadc aux0 1234`.
-  DMA is inferred: `jz_adc.h` names ADCFG bit 15 DMA_EN and every request
-  table has SADC_RX (9), but no driver uses either. With DMA_EN the
-  enabled channels convert continuously (ENA keeps its bits, a scan every
-  20 us); each scan queues a word per channel pair with an enabled
-  channel (AUX1:AUX0, AUX3:AUX2, ... as the data registers hold them) at
-  the 0x10 port, read 32 bits at a time; request 9 is up while the queue
-  (8 words) holds one, and a full queue drops the scan.
-- `ingenic-pwm`: T41's PWM block (`pwm-ingenic.c`, 4.4): ENS/ENC over EN,
-  WCFG taken on UPDATE, BUSYR clear, LVL and OEN; DMA mode is storage.
-  `qom-get /machine/pwm chan2` reads a pin as `high/period` cycles or a
-  fixed `0`/`1`. The other parts' PWM is the TCU's channels.
-- `ingenic-drawbox` (T40, T41; `ingenic_drawbox.c`, `/dev/dbox`): libimp
-  draws its OSD rectangles, corner marks and lines with it
-  (`OSD_Draw_Layer_Cover_Pic_RectLine` -> `dbox_osd`). The driver loads a
-  four-entry YUV palette (COLOR_Y/U/V, a byte each), the NV12 picture
-  (YB, CB, STRIDE, IMG_WH) and two RAM words per box -- x, y, w, h, colour,
-  mode (rectangle, corners, horizontal or vertical line), line width,
-  corner length -- and sets START; the boxes are drawn into the picture
-  in place (luma only with COLOR_MASK; BGRA pictures too) and the done
-  bit (CTRL bit 4) interrupts 50 us later unless IRQ_MASK. RESET clears
-  itself and empties the RAM. A line's length is its box width or
-  height, a corner arm the length field: inferred from the driver.
-- `ingenic-i2d` (T40, T41; `ingenic_i2d.c`, `/dev/i2d`): libimp rotates a
-  frame channel with it (`IMP_FrameSource_SetI2dAttr`). IMG_MODE picks
-  NV12, RAW8, RGB565 or ARGB8888, a rotation of 0/90/180/270 degrees
-  clockwise, mirror and flip; START writes the transformed picture (NV12:
-  the CbCr pairs moved as units at half size) to DST with its strides and
-  sets frame done (IRQ_STATE bit 0, cleared through IRQ_CLEAR) 100 us
-  later.
-- `ingenic-vo` (T41; `drivers/video/ingenic_vo`, `/dev/jz-vo`; the
-  device tree disables it, so no shipped kernel probes it): NV12 frames
-  out over BT.656 / BT.1120. The driver's sequence: a DMA reset whose
-  acknowledge (TOP_STATUS bit 0, write 1 to clear) follows a moment
-  later, SIZE, STRIDE, CON_PAR, the blanking, INT_EN, TRAN_EN, then Y / UV
-  addresses until ADDR_INFO bit 3 says the frame is queued. Each queued
-  frame goes out over a frame time (`fps`, 30) onto the machine's display
-  -- a QEMU graphic console, so `screendump` captures it -- and raises
-  INT_VAL bit 0 (cleared through INT_CLC); `frames` counts them.
-- `ingenic-lcdc` (T21, T23, T30, T31; the 3.10 kernels'
-  `drivers/video/jz_fb_v14`, `jz-fb`, the SDKs' `sample_slcd`). A chain of
-  7-word frame descriptors from CHAIN_ADDR -- next, buffer, stride in
-  pixels, chain config (bit 0 go on to the next: the driver's looping
-  chain sets it, its single-frame mode not -- inferred), interrupt
-  control, UV buffer and stride -- shown each frame time (`fps`, 60) at
-  the panel's size: SLCD_FRM_SIZE with a smart panel (DISP_COMMON bit 0),
-  else the TFT's HDE / VDE windows; GLB_CFG [18:16] RGB555 / RGB565 /
-  RGB888-in-32 / NV12 / NV21 with its colour order [21:19]. CTRL
-  CHAIN_START loads the chain, SLCD_START / TFT_START run it, QCK_STOP
-  ends at once (QCK_STOPM), GEN_STOP after the frame (GEN_STOPM); ST
-  FRM_END / DMA_END each frame, CSR clears, INT_FLAG = ST & INTC drives
-  the interrupt. SLCD_CMD words (command, parameter, data) are counted
-  (`slcd-cmds`, `slcd-last`); SLCD_ST is never busy. No shipped XBurst1
-  kernel builds the driver, so it is checked by qtest; `screendump
-  device=lcdc` captures it.
-- `ingenic-dpu` (T40, T41; the 4.4 kernel's `fbdev/ingenic/fb_v12`, which
-  binds `ingenic,t40-dpu`; T41's device tree calls it `t41-dpu`; the
-  `/dev/fb0` of the SDK's `sample-LCD`). Neither SDK kernel builds the
-  driver, so it follows the driver's contract. START (FRM_CFG_CTRL bit 0)
-  takes the frame descriptor at FRM_CFG_ADDR -- next descriptor, size,
-  control (bit 0: stop after this frame), write-back address and stride,
-  four layer descriptor addresses, the layer enables with each one's z order --
-  and every frame time (`fps`, 60) composes the enabled layers bottom to
-  top onto the display: RGB555 / ARGB1555 / RGB565, RGB888 and ARGB8888
-  in 32 bits (channel order 0 RGB from the top bits down .. 5 BGR, as
-  fb_v12's colour modes), NV12 / NV21 (BT.601), at their positions, a
-  layer with a scale target drawn at that size (nearest neighbour), ARGB
-  and global alpha blended. Then ST gets CMP_START, the layers' ends,
-  CMP_END and DISP_END, INT_FLAG = ST & INTC drives IRQ 20 (CLR_ST clears),
-  and the chain goes on unless the descriptor said stop; DC_CTRL's quick
-  stop ends it at once, its general stop after the frame with
-  STOP_DISP_ACK. `screendump device=dpu` captures it; `frames` counts.
-  Write-back (control bit 1) also stores the composed frame at the
-  write-back address (stride in pixels) as ARGB8888 / RGB565 / RGB555 /
-  YUV422 / Y / RGB888-in-32 (control [18:16]: 0, 1, 2, 3, 4, 6; YUV422
-  packed Y0 U Y1 V in BT.601 studio swing, the pair's chroma averaged --
-  byte order and matrix inferred, the driver only names the format),
-  raising WDMA_END. Control bit 4 dithers the write-back (bit 5 to the
-  format's widths, else the drop widths in [25:20], 0 / 2 / 3 / 4 bits
-  per channel) and DISP_COM (0x8000) bit 4 the display with its widths
-  in [21:16]: a 4x4 ordered threshold, whose pattern is inferred. Control bit 3 hands the display to the
-  simple-read channel (CONFIG_INGENIC_FB_SIMPLE_RDMA) after the frame:
-  its 5-word descriptors from RDMA_CHAIN_ADDR (0x1000; RDMA_CHAIN_CTRL bit
-  0 starts it directly) -- next, buffer, stride, chain config (bit 0 the
-  end, bit 1 back to the composer at FRM_CFG_ADDR, colour [18:16], format
-  [22:19]: RGB555 / RGB565 / RGB888-in-32), interrupt mask -- each show a
-  buffer whole at the display's current size (no size in the descriptor:
-  inferred), with SRD_START / SRD_END and SRD_WORKING; DC_CTRL bits 1 / 4
-  stop it at once / after the frame. The TLB (TLB_GLBC bits 3:0 per
-  layer, TLB_TLBA the DMMU page directory JZFB_USE_TLB passes) translates
-  layer reads as the VPU's walk does; a miss reads zero.
-- `ingenic-monitor` (T40, T41; the SDKs' `sample_bus_monitor`): six AXI
-  channels (0..4, 6; 0x100 each) and the AHB one (5, at 0x500), each with
-  CTRL, a counting window, read / write counters, a watch range and
-  INT_STA / INT_MASK / INT_CLR. In monitor mode the cycle counters follow
-  virtual time at `clock-hz` (300 MHz) and the window's end raises
-  TIME_SLOT_REACH; capture / lock / clear latch and zero them. QEMU's
-  accesses pass no bus here, so the traffic counters stay 0 and a watched
-  range never matches.
-- `ingenic-aip` (T41; `drivers/video/ingenic_aip`, `/dev/jzaip_t`, `_f`,
-  `_p`): the NNA's image pre-processor. The kernel driver only maps it,
-  hands out a chain buffer per unit and waits for the interrupt; the
-  programming is Ingenic's libaip (magik-toolkit InferenceKit/nna2, under
-  libvenus's `warp_*`, `crop_*`, `img_format_convert`), which maps the
-  same units at 0x13090000 through `/dev/mem` and writes its chains with
-  those addresses, so the machine maps them there too. The contract is
-  read from that library. Three units, each with CTRL (bit 0 one job
-  from the registers, 1 reset, 2 the chain, T's 4 a step), status (0
-  job done, 1 chain done; write 1 to clear), CFG and an interrupt
-  enable at 0x00..0x0C:
-  - T (+0): NV12 to 4-byte colour: Y, CbCr, destination, strides, size,
-    a signed Q20 3x3 YUV->RGB matrix (libvenus's default is BT.601:
-    1.164, 1.596, 0.391, 0.813, 2.018) and offsets (16, 128) with the
-    byte order.
-  - F (+0x200): bilinear resize of a box: Q16 steps and half-pixel start
-    phases, source / destination planes, box and output sizes, strides;
-    CFG [9:7] the format -- 8-bit tensors of 1, 4, 8, 16 or 32 bytes a
-    pixel, or NV12 (both planes); the output keeps it. Chains of nodes
-    (one per box) run from its chain address and length.
-  - P (+0x300): affine and perspective warps: the dst->src 3x3 matrix
-    (libaip inverts the caller's forward one) in fixed point split over
-    15 words, perspective divide, the box's pad value outside it; NV12
-    comes out as 4-byte colour by the same matrix as T, 1-, 2- and
-    4-byte pixels as they are.
-
-  The 4-byte orders: bits [2:0] the order of B, G, R, lexicographic (0
-  BGR .. 5 RGB), bit 3 alpha first -- libvenus's BGRA is 0, RGBA 5, ARGB
-  13. A chain is (value, register) word pairs; a pair marked by bit 31 of
-  its address runs the node's job. Jobs complete at once and signal 50 us
-  later. Alpha is written 0 and the source order bits of CFG (bit 0 swaps
-  T's Cb/Cr) are inferred, not checked against silicon.
-- `ingenic-bscaler` (T40; `drivers/video/ingenic_bscaler`, `/dev/bscaler0`):
-  the NNA's image engine. The kernel driver only enables its clocks, waits
-  for its two interrupts and clears their status bits; the programming is
-  in libvenus (magik-toolkit InferenceKit/nna1: bscaler_api, bscaler_hal,
-  bscaler_segmentation, under its `warp_*`, `crop_*` and
-  `warp_covert_nv2bgr`), which maps the registers through `/dev/mem`. The
-  contract is read from that library -- its register writes and chains
-  logged while it ran on the host under a user-mode MIPS QEMU, with the
-  register access and memory helpers stood in for -- and its code. Two
-  units in one 256-byte window:
-  - C (0x00..0x7F, IRQ 39): warps -- resize, affine, perspective -- of NV12
-    or 4-byte pixels, NV12 coming out as colour on the way. The library
-    splits each box into tiles of at most 64x64 output pixels and chains
-    one job per tile: source Y / CbCr, tile size and stride, the
-    destination planes pushed through 0x18 (Y, then CbCr), its size and
-    stride, the tile's source and destination origins (0x40 / 0x44, in
-    whole-picture coordinates), and the destination -> source 3x3
-    matrix (0x48..0x68, signed Q16: for a resize the scale and the
-    half-pixel phase, for warps the inverse of the caller's forward
-    matrix, with the perspective divide); 0x04 bit 0 / 3 say 4-byte
-    source / destination and [15:8] is the value outside the source;
-    0x00 = 0x201 runs a job. The chain -- (value, register) word pairs,
-    bit 31 marking a job's last -- runs from 0x34 for 0x38 bytes on 0x30
-    bit 0; at its end 0x30 bit 4 and 0x00 bit 8 are set and the
-    interrupt raised. Tiles that map wholly outside the source get no
-    job from the library, so the hardware leaves them untouched.
-  - T (0x80..0xFF, IRQ 40): NV12 to colour by lines: source Y / CbCr,
-    size, strides, destination, 0xAC's 4-byte bits, 0x84 = lines << 16 |
-    1 converts the next lines and sets 0x84 bit 2; 0x80 bit 0 stays set
-    while the frame is in progress (the library holds its lock until it
-    reads it clear) and drops, with bit 8 set, at the last line.
-  - Shared: the YUV->colour matrix at 0xC0..0xE0 (signed Q20, rows B, G,
-    R, G's U and V terms subtracted -- libvenus's defaults are all
-    positive) and 0xE4 with the CbCr and Y offsets and C's / T's output
-    orders, coded as the AIP's.
-
-  Sampling is bilinear with the edges repeated; a source position more
-  than a pixel outside the tile takes the pad value (128 for CbCr). Jobs
-  complete at once and signal 50 us later. Stored, not acted on: the
-  per-column byte table at 0x28 / 0x2C, 0x04 bits 1, 2 and 16..18, T's
-  0xA0 / 0xA8 / 0xF0 / 0xF4, and the chain-in-ORAM bit (0x30 bit 1);
-  alpha is written 0.
-  - LZMA mode: the 4.4 kernel's `drivers/lzma/lzma.c` (`CONFIG_LZMADEVICE`,
-    built into T40's kernels; `jz_lzma_decompress`, which squashfs's
-    `hardware_lzma.c` would call) drives a decompressor through this same
-    window. A write of 0x00 with bit 31 selects it (sticky); then 0x00
-    is CTRL -- bit 2 reset and bit 1 RAM init clear themselves, bit 0
-    starts and reads 1 until the run ends, bit 3 masks the interrupt --
-    0x04 / 0x08 the stream's address and size, 0x0C the destination, 0x1C
-    FINAL the bytes written (0x10 / 0x14 CRCs and 0x18 a timeout:
-    storage). The stream is taken to be a whole `.lzma` file (13-byte
-    header), decoded by the repo's LZMA decoder, at most 16 MiB out (the
-    driver's buffer). The C unit's soft reset (0x30 bit 16) gives the
-    window back to the scaler. Inferred from the driver alone: no shipped
-    kernel calls it (T40's squashfs is XZ). T41's own LZMA nodes
-    (`ingenic,t41-lzma`, 0x13C00000 / 0x13D00000) are disabled and nothing
-    addresses them.
-- `ingenic-nndma` (T40, T41): the NNA's DMA between DDR and its ORAM
-  (0x12600000). Ingenic's libvenus (magik-toolkit, `dma_func.cc`:
-  `w_d2o_orasetrun`, `aie_run_nndma_rdchn` / `wrchn`, mapped by
-  `__aie_mmap` through `/dev/mem`) drives it from user space; OpenIPC's
-  `soc-nna.ko` only answers its version ioctl, enables the hardware
-  registers and CU2. The descriptor RAM (0x0000..0x3FFF) holds 2048
-  descriptors of two words: word 0 the DDR address (bits 31:6), bit 0
-  set while another follows, bits 5:1 the length's bits 16:12; word 1 the
-  length's bits 11:0 in 31:20 and the ORAM offset from 0x12600000 in
-  64-byte units in 19:0 (length in 64-byte units, minus one). A write of
-  bit 31 | bytes / 64 << 12 | first descriptor to read channel n
-  (0x8000 + 4 n) moves DDR to ORAM, to write channel n (0x8010 + 4 n) ORAM
-  to DDR, following the chain (or the byte count when not 0); it
-  completes at once, so the library's `rdhwr` waits return. The kernel
-  driver's own RCFG / WCFG path (0x2000, a 64-bit descriptor format,
-  `CPU_SIMULATOR` in its source) lies inside the descriptor RAM and no
-  library uses it: storage.
-- `ingenic-ssi`: the SPI master of `jz_spi.c` (3.10) and `ingenic_spi.c`
-  (4.4). A queued frame (CR1 FLEN + 2 bits, MSB first) goes out on the
-  bus at once; the reply, or the frame itself with CR0 LOOP, lands in the
-  128-entry RX FIFO unless DISREV. The TX FIFO running dry with CR1 UNFIN
-  set raises UNDR -- the driver's PIO transfers end on that interrupt --
-  and with UNFIN clear the transfer ends (END) and CE is released. CE /
-  CE2 (CR0 FSEL) are the chip selects of the bus's peripherals with cs 0 /
-  1: `-device w25q80,bus=ssi0` puts a flash on SSI0. The PDMA serves it on
-  request types 0x16 / 0x17 (SSI0) and 0x18 / 0x19 (SSI1). No shipped
-  kernel enables the driver. The SSI slave (0x10040000) is not
-  modelled: the 3.10 kernel has its Kconfig entries (`JZ_SPI_SLAVE`) and
-  T31's platform device, but no tree here carries the driver, so there
-  is no register contract to follow. Also searched: every 3.10 and 4.4
-  kernel and U-Boot tree in the SDKs, the SDK samples, and the 51 vendor
-  PDFs (the T40 data sheets list only its pins, SSI_SLV_CLK/CE0/DT/DR).
-- `motor=` puts one of the SDK samples' motor driver chips on the
-  machine, at `/machine/motor-chip` (register meanings inferred from the
-  values the samples write; verified by qtest -- no shipped kernel
-  enables the SPI driver sample_motor3 needs, or carries the samples):
-  - `ms41929` (`ingenic-ms41929`, sample_motor3's `ms419xx_spi_dev.c` /
-    `motor.c`) on SSI0's CE: frames of an address byte (bit 6 a read)
-    and a 16-bit value, low byte first, into 16-bit registers 0x20..0x2F
-    that read back; each falling edge of VD (the sample's VDFZ, PB25)
-    moves channels AB (0x24) and CD (0x29) by their PSUM (bits 7:0)
-    micro-steps, bit 8 the direction, bit 10 the channel on; PB26 low
-    resets it. `pos-ab` / `pos-cd` read the positions.
-  - `ms32006` (`ingenic-ms32006`, sample_motor_i2c) at 0x10 on I2C1:
-    byte registers written as register then value (a write following a
-    pointer-only one without a stop carries data); 0x00 bit 0 the chip
-    on, bits 2 / 1 pause A / B; 0x01..0x04 motor A's 14-bit speed (a step
-    every speed x 128 cycles of 24 MHz) and 12-bit step count with bit 15
-    the output on and bit 14 counter-clockwise, 0x05..0x08 motor B's;
-    0x09 bits 7 / 6 run A / B (cleared at the end of the run), bits 3:2
-    the IR-cut output. Runs count down in virtual time; `pos-a` /
-    `pos-b` and `ircut` read the state.
-- Security blocks, as the SDKs' `sample_aes`, `sample_hash`, `sample_rsa`,
-  `sample_dtrng` and `sample_des` and the 4.4 kernel's crypto and
-  hw_random drivers use them; everything completes at once:
-  - `ingenic-aes`: ECB / CBC with 128/192/256-bit keys, by DMA (ASSA,
-    ASDA, ASTC in 16-byte blocks) or one block through ASDI/ASDO; key,
-    IV and data words are big-endian (the 4.4 driver byte-swaps every
-    data word before and after); KEYD/AESD/DMAD under ASINTM.
-  - `ingenic-hash`: MD5, SHA-1/224/256/384/512 over blocks the driver has
-    padded, by DMA (HSTC in 64-byte units), the state carried across
-    runs until HSCR bit 4 reloads it; HSDO gives the digest four bytes at
-    a time as little-endian words (what the 4.4 driver hands its
-    self-tests). HSDI (CPU mode) is inferred: no driver or sample in any
-    tree here feeds it (the 4.4 driver defines HASH_FLAGS_CPU and never
-    uses it; `sample_hash` only prints HSDI; no U-Boot uses HASH_BASE;
-    none of the 51 vendor PDFs describes the block). It is modelled as
-    the DMA path fed by the CPU: with the engine on and DMA off, each
-    HSDI word is four message bytes in memory order (a load from the
-    DMA's buffer), each 64 bytes (128 for SHA-384/512) run a block and
-    raise HSSR bit 0, and after HSTC 64-byte units bit 1, as a DMA run
-    ends; loading the state empties a part-filled block. HSCR bits 8:7
-    (byte order) are acted on in neither mode: the 4.4 driver sets 3 for
-    SHA and 0 for MD5, `sample_hash` 1 for SHA and 2 for MD5, and both
-    expect the standard digest.
-  - `ingenic-rsa`: M^E mod N, 1024 or 2048 bits (RSAC bit 7); operands
-    written most significant word first, the result read least
-    significant first -- the order the sample's own `test_rsa.h` vectors
-    decrypt with. Polled: its interrupt is not wired.
-  - `ingenic-dtrng`: a number ready 10 us after CFG bit 0, from the
-    host's entropy; CFG bit 12 clears ready, bit 11 masks the interrupt.
-  - `ingenic-des` (0x10061000, every part): DES and triple DES (EDE with
-    K1, K2, K3), ECB or CBC (DESCR2 bits 2, 1; bit 3 decrypts). Setting
-    DESCR1's work bit empties the FIFOs and loads the CBC chain from the
-    IV; every second DESDIN word completes a block, ciphered into a
-    16-word output FIFO that DESSR bit 0 reports empty. With DESCR2 bit 0
-    the PDMA moves it: request 0x2E feeds DESDIN while the output has
-    room for a block, 0x2F drains DESDOUT. Keys and IV are taken as
-    written (L the high word); data words are byte-swapped with DESCR2
-    bit 4 (the driver's "little endian"), so that a buffer's bytes form
-    the block -- the order under which FIPS 46's worked example comes out
-    of `sample_des`; nothing else pins it down.
-- The OTG PHY's byte registers at 0x10060000 (`cpm_usb.c`, the 4.4 inno
-  PHY driver): storage, nothing is polled.
-
-### Sound: `ingenic-aic`, `ingenic-dmic` and `ingenic-pdma`
-
-The vendor `audio.ko` (SDK `drivers/audio/oss2` on T10..T31,
-`oss3` on T23, T40 and T41; `/dev/dsp`, which libimp's IMP_AI, IMP_AO
-and IMP_DMIC drive) plays and records through the AIC, and on T40 also
-records through the DMIC, their FIFOs moved by the PDMA in cyclic
-transfers.
-
-- `ingenic-pdma`: the channels of `jz_dma.c` (3.10) and `ingenic_dma.c`
-  (4.4) at 0x20 n: DSA, DTA, DTC, DRT, DCS (NDES, DES8, CDOA, AR, TT, HLT,
-  CTE), DCM (SAI/DAI, port widths, TSZ -- 4.4's "auto" counts bytes --,
-  TIE, LINK), DDA; DMAC, DIRQP (a write keeps the bits written as 1),
-  DDRS doorbells, DIP/DIC. A started channel fetches its 8-word
-  descriptor at DDA; at DTC 0 one with LINK loads the next (DDA's page +
-  the DOA in DTC's top byte) without an interrupt -- the drivers' cyclic
-  rings never end -- and one without sets TT and, with TIE, DIRQP. Request
-  type 8 (AUTO) is a memory copy done at once; the others wait on the
-  peripheral's request line for every access to it: the AIC's 6 (play),
-  7 (record) and 5 (loop record, the echo canceller's reference), the
-  DMIC's 13, the UARTs' 0x14 - 2 n (TX) / 0x15 - 2 n (RX), the SADC's 9,
-  the I2Cs' 0x24 + 2 n (TX) / 0x25 + 2 n (RX), the SSIs' and the DES's
-  (below). The bus decodes 29 address bits: an address 0x20000000
-  high still reaches DDR -- `jz_uart.c` maps its uncached (KSEG1) receive
-  buffers through virt_to_phys, as T41's SFC driver does its descriptors.
-  Of the request types the drivers' tables list, the MSC moves its data by
-  its own descriptor DMA (`jzmmc_v12.c`'s SDMA, above), no driver gives
-  the I2C (`i2c-v12-jz.c` only prints DMACR / DMATDLR / DMARDLR), the SADC
-  or the SSI slave a channel -- the I2C and SADC sides are modelled anyway
-  (above), the SSI slave has no register map -- and there is no PCM
-  driver.
-- `ingenic-aic`: AICFR (ENB, RST), AICCR (EREC/ERPL, the flushes, M2S,
-  MONOCTR, TDMS/RDMS, ISS/OSS, TLDMS/ETFL, CHANNEL, PACK16), AICSR (levels,
-  TUR/ROR), AICDR and AICLR over the hardware's FIFOs (64 to play, 32 to
-  record and loop), and the codec at 0x10021000: bytes, one per word, read
-  back as written. The sample rates: on T23, T31, T40 and T41 the AIC is
-  the I2S master, and the drivers set the CPM's speaker clock
-  (I2SSPKCDR / I2STCDR 0x70) to 256 times the play rate and its
-  microphone clock (0x84) to 256 times the record rate, each when that
-  side starts; the AIC paces each side by its own clock (parent PLL x M /
-  N, a rate within 3 % of a standard one taken as that). On T10..T30, or
-  with that clock gated, the codec clocks the AIC and its CSRR (0x110
-  bits 2:0, 8 kHz to 96 kHz) is the rate. While ENB is set, frames move at
-  those rates in virtual time:
-  played samples (one per frame with M2S, CHANNEL + 1 otherwise) leave the
-  TX FIFO for the machine's audiodev as 16-bit stereo; the RX FIFO gets
-  one sample per frame with MONOCTR (T21, T31: the right channel) or two:
-  a 1 kHz sine at a quarter of full scale (`-global
-  ingenic-aic.tone-hz=N`, 0 for silence) or, with
-  `-global ingenic-aic.rx-source=audiodev`, the host's input; the loop
-  FIFO gets what is played. Requests: TX while TDMS and the TX FIFO has
-  room, RX while RDMS and it holds a sample, loop while TLDMS and it does.
-
-The codec's analogue paths follow the SDKs' codec drivers
-(`jz_t10_codec.c`, `inner_codecs/T23/codec.c`): on T10, T20, T21 and T30
-the playback gain is CHCR (0x9C) bits 4:0 with the output on while CAR
-(0x94) bits 3:0 are, the record gain CACR2 (0x8C) bits 4:0 with the ADC
-on by CAMPCR (0x90) bit 7; on T23 and T31 playback is CHR (0xA0) bits 4:0
-with the headphone output on by CHR bit 7, record CALCGR (0x94) bits 4:0
-with the ADC on by CMICCR (0x8C) bit 7, and CMICCR bit 4 (ALC) holds the
-level whatever the gain. 1.5 dB a step, unity at the drivers' defaults
-(0x18 to play, 0x10 to record); a path that is off is silent. T40 and
-T41 (`inner_codecs/t40` and `T41/codec.c` of their SDKs) share the
-offsets: playback CHR_2b / CHPOUTLGR (0xAC) bits 4:0 (unity 0x18) with
-the driver's output on by CHR (0xA8) bit 6; record CANACR_26 / CALCGR
-(0x98) bits 4:0 (unity at the drivers' 0x10 on T40, 0x1F on T41) with
-the ADC on by CMICCR (0x8C) bit 7, the ALC holding the level with CGAINR
-(0x28) bit 5 / 4; T40 records mono through its right ADC (CMICCR 0x0E:
-bit 3, gain 0x9C, ALC bit 4). Their digital volumes, 0.5 dB a step, play
-CDGSR (0x18; 0xF1 is 0 dB, 0 mutes) and record CLAVR (0x20, T40's right
-0x24; 0xC3 is 0 dB): no driver writes them -- libimp's IMP_AI/AO_SetVol
-scale in software -- so they come out of reset at 0 dB, an assumption
-(the reset values are not documented). IMP_AI_SetGain / IMP_AO_SetGain
-reach the analogue gains.
-
-- `ingenic-dmic` (T31, T40): `audio_dmic.c` (oss3, T40's `audio.ko` with
-  `dmic_enable=1`) and `devices/dmic` (oss2, T31, behind
-  `CONFIG_JZ_TS_DMIC`, off in the shipped kernels). CR0's enable, rate (8,
-  16, 48 kHz), microphone count and PACK_EN (two 16-bit samples to a FIFO
-  entry, the earlier in bits 15:0); a 64-entry FIFO read at DR; FTHR's
-  RDMS raises request 13 while it holds an entry; FSR's level and
-  FULL/EMPTY, INTCR's flags under IMR (the drivers mask them all). Every
-  microphone hears a sine of `-global ingenic-dmic.tone-hz=N` (1 kHz)
-  at the peak `tone-amp` (8192; settable at run time,
-  `qom-set /machine/dmic tone-amp N`, 0 for silence).
-  The other parts' builds drive none but T41's.
-  The voice trigger (the data sheet's "low power voice trigger", with
-  pre-fetch while the data interface is off) follows the voice-wakeup
-  firmware of the same block (`drivers/char/voice_wakeup`; no T-series
-  audio driver sets TRI_EN): with CR0's EN and TRI_EN each sample is
-  compared with THRL; TRICR mode 0 fires on the first sample over it,
-  mode 2 once more than TRINMAX have been (other modes are not described
-  anywhere here and act as mode 0). Firing sets INTCR's TRIFLG (bit 0,
-  interrupting unless IMR bit 0) and FSR's TRIGS (bit 18) and holds until
-  TRICR's TRI_CLR or CR0's RESET_TRI (self-clearing) rearms it. SR 3,
-  the firmware's "data path off", still clocks the trigger at 16 kHz and
-  fills no FIFO. THRH and TRIMMAX are storage. T41's audio-system DMIC
-  defines its TCR but no field of it, and is not given a trigger.
-- `ingenic-asdmic` (T41): T41's audio system at 0x134D0000 (core INTC
-  33), which the T41 SDK's `audio.ko` registers as its own platform
-  devices and drives with `dmic_enable=1` (oss3 `host/T41/dmic`; the
-  device tree's `ingenic,dmic` node stays disabled): the DMIC at +0xA000
-  (CR0 enable, rate 8/16/48/96 kHz, microphones, 16/24-bit; GCR gain,
-  storage), routed over the data bus (+0x4000) and the format converter
-  (+0x2000, storage) to FIFO 5 (+0x1000) and DMA channel 5 (+0x0):
-  a closed ring of 4-word descriptors (flags, DBA, the next descriptor's
-  bus address, DTC in bursts), which DBA follows as the samples land --
-  the driver's work queue polls it; no interrupt unless a descriptor asks
-  (TIE / LTIE, AIPR). Every microphone hears `-global
-  ingenic-asdmic.tone-hz=N` (1 kHz).
-
-`-audiodev wav,id=snd,path=out.wav -M t31,audiodev=snd` records what the
-guest plays.
-
-The UARTs transmit at the line rate. On T40/T41 (4.4, `ingenic_uart.c`)
-the driver's interrupt handler sends and stops the transmitter without
-the port lock, racing `start_tx` on the other core, and a lost race
-leaves bytes queued with the THR interrupt off -- the console stops for
-good. QEMU's 16550 sends a whole burst at once, so THRE (and the
-interrupt) came back after every write and the race was lost within a
-few hundred lines of heavy output: with a client printing 500 lines of
-hex from a thread while IMP_AO plays (`test-ingenic-audio.sh --soc t41
---console-load`), the console stopped after 26, 101 and 279 lines in 3
-of 3 runs. Patch 0021 adds a `paced` mode to QEMU's serial -- a byte
-leaves the shift register a character time after it entered it, THRE
-comes when the FIFO really drains, TEMT a character later -- and a
-`tx-fifo` depth; the machine sets both (64 bytes, the driver's
-`fifosize`, which loads half of it per interrupt) with a baud base of
-EXTAL / 16 (1.5 MHz: the drivers program the divisor for 24 MHz, 13 for
-115200). The same test then prints all 500 lines in 3 of 3 runs. It
-narrows the window to silicon's rather than closing it: 10 of 11 OpenIPC
-T40 boots passed paced, one went quiet after its application started.
-The cost is the real rate, some 11.5 KB a second: an OpenIPC boot takes
-about 2 s longer, a 420 KB console flood 41 s instead of 6, and the test
-harnesses wait for the console to drain before they power off.
-
-Bytes come in at the line rate too (patch 0023, with `paced`): one a
-character time. The UARTs have the jz47xx's 64-byte receive FIFO, whose
-FCR trigger levels are 1, 16, 32 and 60, and IER bit 4 (RTOIE) enables
-the receive timeout interrupt by itself. And they request the PDMA in
-FCR's DMA mode (DMS): TX while the transmit FIFO has room, RX once the
-receive FIFO reaches its trigger level, held for that many bytes -- one
-request, one burst -- so a shorter tail stays for the timeout interrupt.
-That is what `jz_uart.c` does with `CONFIG_SERIAL_JZ47XX_UARTn_DMA`
-(trigger 32, 32-byte PDMA units into two 1 KiB buffers, IER 0x14: the
-timeout and line status, no RDI; the tail by the timeout interrupt, the
-residue and PIO). No shipped config sets it; with it, on a T31 kernel
-built so (`test-ingenic-uart-dma.sh`), 32 KiB come in on UART0 and go
-back out intact. Two of the driver's own faults show there: T31's PDMA
-table (`jzdma_pdata`) has channels for UART0 and UART1 only, so with
-UART2_DMA the driver dereferences a channel it never got; and its
-shutdown frees the receive buffer's pages wrongly ("Bad page state" at
-close), so the test keeps the port open throughout. Without paced input
-the host's bytes all arrived at once and the driver lost data in the
-window between reading a channel's residue and stopping it; at the line
-rate a burst takes 2.8 ms to fill and the window is as narrow as on
-silicon.
-
-### The image pipeline: `sensor=` and `ingenic-isp`
-
-`-M <soc>,sensor=<name>` puts an image sensor on I2C0 (I2C1 on T40) at
-the address and with the ID that OpenIPC's `sinfo.ko` table probes:
-`gc2053` (0x37, `galaxycore-sensor`), `gc2083` (0x37, 16-bit registers),
-`sc2336` and `sc2335` (0x30, `hisi-smartsens`), `sc1a4t`/`sc2336p`/`sc2337p`
-(0x30, and `sc1a4ts1`/`sc2336ps1`/`sc2337ps1` at 0x32), `jxf37`, `jxf22`,
-`jxf23` and `jxq03` (0x40, `hisi-f37`, `hisi-jxf22`, `hisi-jxf23`,
-`hisi-jxq03`; JX-Q03 is the T31's 2304x1296 MIPI part), `ov2735b` and `ov2735` (0x3C,
-`ingenic-ov2735`: 8-bit registers in pages, the revision in page 0's
-0x04 telling the two apart), `gc4653` (0x29, 16-bit registers; T40, on
-I2C1), `gc4663` (T41, the same ID), `jxh62` (0x30, `hisi-jxh62`; T10).
-`sensor-bus=<n>` moves it to I2C<n>, for boards wired unlike the
-SoC's reference design (OpenIPC/firmware#1884: a T40 whose sensor is not
-on I2C1 times out in tx-isp's probe until the streamer is told the bus);
--1, the default, keeps the SoC's own.
-The default is none. On T40 `sensor1=<name>` (the same names) adds a
-second sensor on I2C3, the second pipe's, and `sensor2=<name>` a third
-on I2C0, VIC2's (below). T10's kernel bit-bangs the sensor bus (`i2c-gpio`,
-SDA PA12, SCL PA13), so there the sensor hangs off QEMU's `gpio_i2c`,
-wired open-drain to those pins through `ingenic-gpio`'s new "drive"
-outputs (a pin's level as the SoC drives it: low for a GPIO output at
-0, else released). The models answer whether or not MCLK
-runs and the PA18 reset is pulsed, so sinfo's detection needs nothing
-else; `/proc/jz/sinfo/info` reads `sensor: gc2053`.
-
-`ingenic-isp` is what the vendor `tx-isp-<soc>.ko` drives on T31, T23
-and T21 (read off the modules: `tx-isp-t31.ko` H20221206a with the SDK
-1.1.5 build's symbols, `tx-isp-t23.ko` from the T23 SDK 1.1.0 build with
-symbols and OpenIPC's H20240204a, `tx-isp-t21.ko` H20200509a). The
-three share one design and differ in where the blocks are. It has no sensor data: each
-frame it paints a test picture into the buffers the driver queued.
-
-- ISP core: storage, but for the interrupt enable / status / clear
-  (T31 0xB0/0xB4/0xB8, T21 0x80/0x84/0x88; status bit n is channel n
-  done, 0x1000 frame start on T31) and the MSCA scaler's three DMA-out
-  channels at 0x9900 + 0x100 n (T21 0x2400): QBUF pushes the Y and UV
-  addresses of an empty buffer (C+0x6C, C+0x84), the ISR pops filled
-  ones (C+0x74, with the UV address and a frame number at C+0x8C/C+0x90,
-  T21 C+0x78) until the done FIFO's empty bit (C+0x7C) is set; C+0x2C is
-  the size the channel writes, C+0x80/C+0x98 the strides; 0x9804 (0x2304)
-  bit n enables channel n; a write to C+0x9C..C+0xA8 empties the FIFOs
-  (T31). T21's channel-stop poll on 0x2308 reads 0. T23 gives a `0x90000`
-  core window and moved the channels to `0xD100 + 0x100 n` with other
-  offsets (push C+0x30/C+0x50, pop C+0x38/C+0x58, empty C+0x3C/C+0x5C,
-  size C+0x0C, strides C+0x40/C+0x60, enable 0xD040, `0xD050` NV21/mirror/flip).
-- VIC: the commands 2 and 4 written to 0x00 read back 0 at once (T31
-  spins on it with no timeout), 1 starts the input. Status / mask (1 =
-  masked) / write-1-to-clear at 0x1E0/0x1E8/0x1F0 (+4 for the second
-  word; T21 0x100/0x104/0x108), bit 0 frame done -- the counter
-  `/proc/jz/isp/isp-w02` prints and libimp's "video drop" watchdog reads;
-  on T23 `VIC_PORT_SEL` (`0x204`) updates `VIC_PORT_STATUS` (`0x20C`) and
-  locks the active input port, and raw `VIC_MDMA` packs 10-bit BGGR (`<< 6`).
-- CSI host and D-PHY: storage (the driver only writes them and reads
-  ERR1/ERR2 as 0). T21 has none; it is DVP only. T23's IVDC (the direct
-  ISP-to-encoder path at 0x13200000, INTC 38) is used only with the
-  module's `direct_mode`, off by default: see below.
-- `ingenic-cpm`: before resetting the ISP the driver sets SRBC (0xC4)
-  bit 21 and waits a second for bit 20, which now follows it.
-
-Frames run at the sensor's programmed frame time (`HTS * VTS / pclk`, when
-`VTS` is set on a sensor with a known pixel clock) or `-global ingenic-isp.fps=`
-(25) while the VIC is started and the ISP's interrupts are enabled: frame
-start, then for every enabled channel with a queued buffer the picture at its
-size and strides, the buffer into the done FIFO and its status bit, then VIC
-frame done. `-global ingenic-isp.expo-delay=<n>` (or `qom-set /machine/isp
-expo-delay <n>`, default 0, up to 8) delays sensor exposure/gain changes by
-`<n>` frames. The picture is the OpenIPC logo on a navy gradient with a dot
-sliding beneath it (`sstar-pattern.h`, as `aw-vinc` and the SigmaStar models
-draw it) and a six-digit frame counter at the top left; output chroma follows
-`light-r`/`light-b` and the ISP's white-balance gains (`0x1804`/`0x1808` on
-T23/T31, `0x604` on T21, `0x4004` on T40/T41) while `0xB000` AWB statistics
-stay pre-WB.
-
-The 3A loop is closed (T31, T23, T40, T41; read off `tx-isp-t31.ko` and
-`tx-isp-t23.ko` of the SDKs, with symbols, and the T40/T41 SDK builds).
-The scene is lit by what the sensor model's registers say the kernel's
-AE programmed -- its rows times its gain, over 1000 rows at gain 1.0,
-times `light` (percent, 100) -- read the way each part's SDK sensor
-driver writes them: GC2053 page 0 0x03/0x04 and 0xB8/0xB9, GC2083
-0x0D03/0x0D04, GC4653/GC4663 0x0202/0x0203 and 0x02B8/0x02B9, SC2336
-0x3E00-0x3E02 and 0x3E07/0x3E09 (`include/hw/i2c/ingenic-sensor.h`).
-On T23 and T31 the light also takes the AE's ISP digital gain: the
-part of its gain the sensor's coarse analogue steps cannot make, which
-`tisp_ae0_process_impl` hands `JZ_Isp_Ae_Dg2reg` to write to 0x1030 /
-0x1034 (four 16-bit lanes, G in 0x1030's top half, 0x400 = 1.0). Without
-it the T23 AE hunted: with the GC2053's steps some 1.18x apart it ran
-analogue 2272/256 with digital 1.21x, saw the picture too dark, stepped
-to 2683/256 with 1.0x, saw it too bright, and flipped between the two
-every 5 frames; with it, it settles (2283/256 held for 153 frames of a
-200-frame run). T21's `tisp_ae_process_impl` packs its digital gain
-the same way and writes it to 0x408 / 0x40C (G in 0x408's top half),
-which the light takes too: its AE then holds 129/256 at a mean of 8
-from frame 65 on. T40 and T41 apply theirs elsewhere and converge as
-they are.
-The painted scene counts as display light (gamma 2.2): the exposure
-scales its linear light, white clips, and the picture is gamma-encoded
-again, so a longer exposure lifts the navy while the logo stays white.
-At each frame's end the model
-writes the AE and AWB statistics of that picture by DMA into the banks
-`tisp_init` gave the hardware, and raises their status bits:
-
-| | T31, T23 | T40, T41 |
-|---|---|---|
-| AE0 block, AWB block | 0xA000, 0xB000 | 0x19000, 0x18000 |
-| status bits (AE zones, AE histogram, AWB) | 26, 27, 30 of 0xB4 | 4, 5, 3 of 0x40028 |
-| AE zone, 16 bytes | dark, middle, bright luma sums (21 bits), dark and bright counts (13) | the same, 22 and 14 bits |
-| AWB zone | 16 bytes: R, G, B, IR sums (21 bits), count (13) | 128 bytes: 4 pairs of records of R, G, B, IR (22), count (14): every quad, then the filtered ones |
-
-In both blocks +0x04 is the zone grid (columns [31:28], rows [15:12]:
-15 x 15), +0x08-0x14 and +0x18-0x24 the zone widths and heights a byte
-each in 2x2-pixel quads, +0x4C the bank counts and +0x50 the bank last
-written (AE: zones [5:4], histogram [1:0]); AE +0x28 holds the dark and
-bright thresholds ([7:0], [15:8]), +0x2C-0x38 four zone banks and
-+0x3C-0x48 four histogram banks (256 21-bit counts of the quads by luma,
-twice); AWB +0x3C-0x48 four zone banks. The kernel's `ae0_weight_mean2`
-takes a zone's three sums over its width x height as its mean. Zones are
-sampled 8 x 6 from the scene, in linear light (8 bits), as a sensor's
-statistics are; the light's colour scales the linear R and B, so that
-a white reads R `light-r` and B `light-b` per mille of G -- by default
-the SoC's daylight raw white, where its tuning's AWB looks for one (T21,
-T23, T31: 550, 600; T40, T41: 460, 550, the white their start gains
-2212 / 1856 make neutral). The AWB block sums only the quads inside the pixel
-filter `tiziano_awb_set_hardware_param` programs after the zone sizes
-(T21 0x828-0x838, T31 and T23 0xB028-0xB038): +0x28 a raw R/G window
-and +0x2C a B/G window (Q8, min in [15:0], max in [31:16]), +0x30 and
-+0x34 lower and upper bounds on k R/G / 256 + B/G (k in [15:0], bound
-in [31:16]), +0x38 a luma window ([7:0] low, [15:8] high; luma taken
-as (R + 2 G + B) / 4) -- the driver's all-pass values (R/G 1..4095,
-bounds 0 and 65535) read so -- and a zone's count is of the quads that
-passed. T40 and T41 program the same form at 0x18028
-(`tisp_awb_set_regional_threshold`, bounds interpolated by EV: on the
-T41 SDK image R/G 60..245, B/G 30..200, k 256 with bounds 170 and 320;
-T40's wider, R/G 53..284, B/G 29..304, bounds 167 and 394), but +0x38
-holds three luma thresholds in bytes 0..2 and a frequency in byte 3
-(`tisp_awb_set_lum_th_freq`): the window is bytes 0 and 2 (T41 10..230,
-T40 0..230). Their 128-byte zones are four pairs of 16-byte records
-(`tisp_awb_get_statistics`: R, G, B and a fourth sum in 22 bits from
-bits 0, 22, 44, 66, the count in 14 from bit 88), a pair per
-statistics position; the tuning picks the pair read (its block's bytes
-3274 / 3276). Of a pair the AWB's gains follow the second record
-alone; the model fills the first with every quad and the second with
-the filtered ones.
-
-The scene has a grey step wedge for the AWB to find a white in
-(`ingenic-isp-paint.h`: six neutral patches below the dot, bottom
-left): with only the navy, the logo and the dot, an AE that exposes for
-the navy -- T40's and T41's do -- leaves the white saturated, past the
-luma window and the R/G limit, and no zone inside the filter, as on a
-camera pointed at such a scene; the AWB then holds its start gains.
-`light`, `light-r` and `light-b` can change while running
-(`qom-set /machine/isp light 30`). The kernel's AE starts high and
-settles over a second or two -- on T31 a light of 30 % and of 100 % give
-the same picture by frame 40 (the navy at Y 39) -- and, metering linear
-light with this dark scene, exposes for the navy (Y ~90 on the T40 and
-T41 SDK images). The AWB gains follow the light's colour (per 1024,
-once settled; warm R 0.9 / B 0.35, cool R 0.45 / B 0.75):
-
-| | daylight | warm | cool |
+| Block | T31 / T23 (`0xB4` bit) | T40 / T41 (`0x40028` bit) | Structure and driver behavior |
 |---|---|---|---|
-| T21 | R 1860 / B 1712 | R 1140 / B 2740 | R 2272 / B 1360 |
-| T31 | R 1860 / B 1704 | R 1136 / B 2916 | R 2280 / B 1364 |
-| T23 | R 1856 / B 1704 | | |
-
-T40 and T41 settle on the gains that make the light's white neutral,
-1024 / R and 1024 / B to within 1-3 % (daylight 460 / 550; a white of
-500 / 430, warm 700 / 280, cool 380 / 600, all inside both SoCs'
-windows):
-
-| | daylight | 500 / 430 | warm | cool |
-|---|---|---|---|---|
-| T40 | R 2220 / B 1864 | R 2048 / B 2380 | R 1468 / B 3636 | R 2688 / B 1712 |
-| T41 | R 2228 / B 1856 | R 2056 / B 2388 | R 1468 / B 3704 | R 2716 / B 1704 |
-
-A light outside a tuning's windows (R 0.35 / B 0.9 is below both
-R/G minima; on T40/T41 a light whose R/G + B/G falls under the lower
-bound) leaves no quad to sum, and the AWB keeps its defaults, as it
-would on a camera. The white logo itself saturates once the AE brings
-the navy up -- a full-scale reflector against a 1.2 % one, some twelve
-times past full scale -- and fails the luma window on silicon too; the
-wedge's darker patches are what the AWBs settle on (T23, which held its
-defaults before, now settles at daylight's 1856 / 1704).
-
-T31 and T23 also produce their other statistics
-(`ingenic_isp_xstats()`), each into the banks `tisp_init` gives it:
-
-| | block, banks | status bit | layout |
-|---|---|---|---|
-| AE1 | 0xA800, AE0's form; only with 0x0C bit 0 clear (a WDR mode) | 28, 29 | AE0's zones and histogram, of the short frame |
-| AF | grid 0xB804 (pixels; 8 x 8 zones of 238 x 134 at 1080p), banks 0xB8A8, last bank number 0xB8BC | 31 | 16 bytes a zone: FIR 0 / 1, IIR 0 / 1 (22 bits each), luma sum (23), bright count (15) |
-| ADR | banks 0x4494, last bank's address 0x44B0; 0x0C bit 7 bypasses | 18 | 6 x 8 blocks of luma sum and a five-bin histogram, then a 512-bin luma histogram (three 21-bit counts per 8 bytes) |
-| defog | banks 0x5B84, last bank's address 0x5BA4; 0x0C bit 11 bypasses | 20 | from +8, 180 blocks of B, G, R sums (24 bits) and three halfwords (here the dark channel, brightest and mean luma) |
-| WDR (T31) | banks of 8 KiB at 0x2010, last address 0x2680; only with 0x0C bit 0 clear | 11 | long and short frame R, G, B histograms (256 x 21 bits), luma counts and sums, in eight 516-byte rows 1 KiB apart |
-
-AE1 is the WDR short frame's AE. Its block's bit 0 is a latch
-(`system_reg_write_ae(2)` sets it after every AE1 update), not an
-enable; raised in a linear mode, `ae1_interrupt_hist` stores its
-histogram over the AE's static data and pushes the AE1 process, and
-T31's AE and AWB stop where they are (the gains frozen from frame 10),
-so like WDR it runs only while 0x0C bit 0 is clear.
+| **AE1** | `0xA800`, bits `28`, `29` (`0x0C` bit `0` clear) | Inside WDR block | Short-frame AE (`system_reg_write_ae(2)` latch bit `0`). Note: if `ae1_interrupt_hist` fires while T31 is in linear mode, it freezes AE/AWB at frame 10. |
+| **AF** | Grid `0xB804` (`238x134` at 1080p `8x8`), `0xB8A8`, last `0xB8BC`; bit `31` | Grid `0x1A004`, widths `0x1A008` (u16), heights `0x1A028` (u8), banks `0x1A0CC`, cnt `0x1A0DC`, last `0x1A0E0`; bit `6` | T31 packs 16 B/zone (`FIR0/1`, `IIR0/1` 22b, luma 23b, bright 15b; `IMP_ISP_Tuning_GetAFMetrices` ~`1.6M` falling to `0.9M` when warm/clipped). T41 packs 136b/zone (row stride `2 * {3,5,7,9,11,13,15,17,20,22,24,26,28,30,32}[cols-1]` words; `IMP_ISP_Tuning_GetAFMetricesInfo` ~`3.4M`, alt `~1.8M`). T40 single-sensor `tisp_af_get_metric` faults in module space. |
+| **ADR** | `0x4494` / `0x44B0` (`0x0C` bit `7` bypass); bit `18` | Banks `0x9514`, cnt `0x9510`, last `0x9540`; bit `9` | T31: `6x8` blocks + 512-bin (`21b`) hist, writes `0x4270`–`0x43A4`. T40/T41: `4x6` blocks of 56 B (`29b`, 20-bin `18-bit` counts, `12b` min/max) + 512-bin hist at `+0x548`, writing `0x50024`–`0x5040C` (fields inferred). |
+| **Defog** | `0x5B84` / `0x5BA4` (`0x0C` bit `11` bypass); bit `20` | Banks `0xC290` (`2 KiB`), cnt `0xC28C`, last `0xC2B4`; bit `10` | Starts at `+8` with 180 blocks: `B, G, R` 24b + 3x16b (meaning guessed) on T31 (`0x58000` output); 8 B `21-bit` sums on T40/T41 (`0xC0xx` output). |
+| **WDR** | `0x2010` (`8 KiB`), last `0x2680` (`0x0C` bit `0` clear); bit `11` | `0x6010..` (`6 KiB`), last `0x6030`; bit `11` | T31 uses eight `516-byte` rows `1 KiB` apart; see WDR below for T40/T41. |
+| **GSM** | — | Write `0x201` to ports `0x501A0`/`0x501B0`, read `0x501A8`/`0x501B8`, flags `0x1B004`/`0x1B044`; bit `7` | `tisp_gsm_single_get_hist` / `tisp_gsm_process`: two 256-bin histograms required to sum to `width x height` (`0x80`). |
+| **LCE** | — | Ports `0x501C0`/`0x501C8` (`45x32` words) + `0x50200`/`0x50208`, 2nd set `+0x10`, `0x0E014` bit `0` ready / bit `8` set; bit `8` | `tisp_lce_get_data` / `lce_std_hist_transform`: `9x5` blocks x 32-bin quad luma histograms + block means. |
+| **TMO** | — | Banks `0x1E010`/`0x1E014` (`16 KiB`), last `0x1E028`; bit `17` | T41 only: `3750` halfword pairs (`75x50` mean and brightest 12-bit luma). |
 
 #### WDR: two exposures
 
-The sensors' two-exposure (DOL, line-interleaved) WDR modes run end to
-end. T31 enters one with the sensor module's `data_type=2`
-(`TX_SENSOR_DATA_TYPE_WDR_DOL`) and `IMP_ISP_WDR_ENABLE` between
-`IMP_ISP_Open` and `IMP_ISP_AddSensor`; T40 and T41 with
-`IMP_ISP_WDR_ENABLE(IMPVI_MAIN, &mode)` before the sensor is added and
-the sensor's WDR setting (`default_boot` 1). `tisp_init` then clears
-bit 0 of the bypasses (T31, T23: 0x0C, 0xa1fc0202 on the OpenIPC image;
-T40, T41: 0x40, 0xff9100e0 on the T41 SDK image against 0xffd00049
-linear), which is what the model takes as the WDR mode. The sensor
-gets both exposures over I2C: the GC4653's and GC4663's long rows at
-0x0202:0x0203 as in a linear mode, the short frame's at
-0x0200[5:0]:0x0201 (`gc*_set_integration_time_short`), the gain shared
-(`galaxycore_exposure()` reports both).
+Two-exposure DOL line-interleaved WDR runs on T31 (`data_type=2` / `TX_SENSOR_DATA_TYPE_WDR_DOL` plus `IMP_ISP_WDR_ENABLE` between `IMP_ISP_Open` and `IMP_ISP_AddSensor`), T40, and T41 (`IMP_ISP_WDR_ENABLE(IMPVI_MAIN, &mode)` plus `default_boot 1`).
 
-Each frame the model lights the scene with each exposure: AE1's zones
-and histogram (T31, T23) and the WDR statistics' short-frame half come
-from the short one, and the picture is the fusion -- the long frame
-where it does not clip, the short frame scaled by the exposure ratio
-where it does, then an extended Reinhard curve whose white is that
-ratio (`isp_wdr_tone()`), so a white the long frame clips keeps its
-shading. T40 and T41 (`tisp_wdr_interrupt_static`, T40's
-`tisp_wdr_main_interrupt_static`, bit 11 of 0x40028 on both) take four
-6 KiB banks at 0x6010.., 0x6030 the last one's number;
-`tisp_wdr_get_data` reads 456 24-bit values (the first 450: 15 rows of
-15 long-frame then 15 short-frame blocks -- here luma sums), four
-12-bit and two 23-bit values at +1352 / +1360 (here the frames' mean
-luma, bright and dark counts), 160 values from +1368 (40 groups of
-four packed 24-bit values; `tisp_wdr_get_data` unpacks them into a
-640-byte buffer that no code in either module reads -- only init
-allocates it and deinit frees it -- so they are left zero) and, when the tuning asks, the long and the short frame's
-R, G, B histograms from +1848 and +3896 (256 entries of three 21-bit
-counts).
+- **Sensor and ISP setup**: `tisp_init` clears bypass bit `0` (`0x0C`: `0xa1fc0202`, `0x40`: `0xff9100e0` in WDR vs `0xffd00049` in linear mode). `galaxycore_exposure()` reads both the long (`0x0202:0x0203`) and short (`0x0200[5:0]:0x0201` via `gc*_set_integration_time_short`, shared gain) registers on `gc4653` and `gc4663`.
+- **Scene fusion and statistics**: `ingenic-isp` illuminates both exposures independently, feeds short-exposure statistics to AE1 and the WDR block, and blends unclipped long pixels with ratio-scaled short pixels through an extended Reinhard curve (`isp_wdr_tone()`). On T40/T41, `tisp_wdr_get_data` (driven by `tisp_wdr_interrupt_static` / `tisp_wdr_main_interrupt_static` on `0x40028` bit `11`) reads:
+  - `456` 24-bit values (`15x15` long + short blocks + 450 threshold),
+  - four 12-bit and two `23-bit` values at `+1352`/`+1360` (mean luma, bright and dark counts),
+  - `160` packed words at `+1368` unpacked into an unused `640-byte` buffer (kept zero), and
+  - long and short RGB histograms at `+1848` and `+3896` (256 x 3 `21-bit` counts).
+- **Convergence and results**: T31 updates 134 of 229 WDR registers (`0x2000`–`0x28FF`) per frame; T41 writes ~29 registers/frame. `tisp_ae1_process` hands statistics to `tisp_wdr_rx_ae1_infm`, while `tisp_ae1_expt` (`ae1_ev_list`) drives short exposure (`7`–`94` rows on T41; `gc4653-t31.bin` holds 310 rows across `1486` down to `4` long rows). Logo pixel clipping drops from `7.5%` in linear mode to `0.4%` in WDR (`test-ingenic-isp.sh --wdr`). T23 WDR sensors (`imx327`, `sc301IoT`) are not modelled.
 
-The kernels' WDR processes run on them: on T31 134 of the 229 WDR
-registers (0x2000..0x28FF) change from frame to frame; on T41 its
-process writes some 29 registers a frame. AE1 does not close a loop of
-its own: `tisp_ae1_process` hands its zone means and histogram to the
-WDR module (`tisp_wdr_rx_ae1_infm`), and `tisp_ae1_expt` derives the
-short exposure from the long one's (rows, analog and digital gain)
-through the tuning's `ae1_ev_list` tables. On T40 and T41 it follows
-the long exposure (T41: 7 to 94 rows as the AE settles); with the
-OpenIPC T31 tuning (`gc4653-t31.bin`) it stays at the sensor's longest
-short exposure, 310 rows, for every long exposure from 1486 rows down
-to 4. On the scene at the AE's exposure, a linear frame clips 7.5 % of
-its pixels (the logo), the WDR frame 0.4 % (T31, T40, T41;
-`test-ingenic-isp.sh --wdr`). T23's WDR-capable drivers (imx327,
-sc301IoT) are for sensors not modelled here.
+#### HLDC
 
-T40 and T41 produce theirs too (`xstat` 3; their symbols):
+T41 (`tx-isp-t41.ko` `tiziano-hldc.c`, `tisp_hldc_write_reg`) and T40 (`tisp_hldc_con_par_cfg`, `tisp_s_module_control` `(pipe+16) << 2`) enable hardware lens distortion correction when `0x40` (`0x44` on pipe 1) bit `20` (`IMPISPModuleCtl.bitBypassHLDC`) is clear (`_IO('t', 1)` via `/dev/tisp`: module `21` sub-module `0` on T41 since stock omits `TX_ISP_LDC_ENABLE` / `tisp_hldc_set_attr`; module `20`, pipe word `3`, 16 halfwords from word `4` on T40).
 
-| | block, banks | status bit | layout |
-|---|---|---|---|
-| AF | grid 0x1A004 (T31's word), widths as halfwords from 0x1A008, heights as bytes from 0x1A028; banks 0x1A0CC, count 0x1A0DC, last bank number 0x1A0E0 | 6 | zones of 136 bits end to end: FIR 0 / 1, IIR 0 / 1 (23 bits each), luma sum (24), bright count (16); a row every 2 x {3, 5, 7, 9, 11, 13, 15, 17, 20, 22, 24, 26, 28, 30, 32}[columns - 1] words |
-| ADR | banks 0x9514, count 0x9510, last bank's address 0x9540 | 9 | 4 x 6 blocks of 56 bytes (two 29-bit words, twenty 18-bit counts, two 12-bit fields: here luma sum, quads, a 20-bin histogram, darkest and brightest luma), then the 512-bin histogram from +0x548 |
-| defog | banks 0xC290 (2 KiB), count 0xC28C, last bank's address 0xC2B4 | 10 | from +8, 180 blocks of 8 bytes: B, G, R sums (21 bits) |
-| GSM (T41) | RAMs read through ports: 0x201 to 0x501A0 / 0x501B0, then 256 reads of 0x501A8 / 0x501B8; flags 0x1B004 / 0x1B044 | 7 | two 256-bin luma histograms that add up to exactly width x height (0x80; `tisp_gsm_process` checks the total) |
-| LCE (T41) | ports 0x501C0 / 0x501C8 (45 x 32 words) and 0x50200 / 0x50208 (45), the second set at +0x10; 0x0E014 bit 0 ready, bit 8 the set | 8 | 9 x 5 blocks of a 32-bin luma histogram of quads (`lce_std_hist_transform` rejects a block that counts more than it has), then the blocks' means |
-| TMO (T41) | banks 0x1E010 / 0x1E014 (16 KiB), last bank 0x1E028 | 17 | 3750 halfword pairs: here a 75 x 50 grid of mean and brightest luma (12 bits) |
+| Offset (pipe 0) | Parameters | Notes |
+|---|---|---|
+| `0x15000` | `p1` (`[31:16]`), `p0` (`[15:0]`) | Stored as `1, 1` (`0x2A0 << 7 = 0x15000` on T40) |
+| `0x15004`, `0x15008` | `k2` (`[31:16]`), `k1` (`[15:0]`) | Radial distortion coefficients |
+| `0x1500C`, `0x15010` | Zoom (`Q11`: `2^19 / min(f(1), f_side) - 5`) | Output scale factor |
+| `0x15014`, `0x15018` | `0x3fffffff / r2max` | `r2_rep = 498` at `2560x1440` |
+| `0x1501C`, `0x15020` | `offy` (`[31:16]`), `offx` (`[15:0]`) | Optical center offset |
+| `0x15024`, `0x15028`, `0x15044` | `p14`, `p15`, `3` | Pipe 1 sits `+0x80` on (`0x15080`); T40 inputs at `0x80`/`0x84` |
 
-T41's `IMP_ISP_Tuning_GetAFMetricesInfo` reads about 3.4 million (the
-alternate about 1.8 million), 0 without; ADR rewrites its outputs
-(0x50024..0x5040C) about three times as often and defog its (0xC0xx)
-half again as often as with no statistics. Which reader field means
-what (ADR's, defog's order, TMO's pair) is the model's reading of their
-widths. T40's module reads GSM and LCE the same way
-(`tisp_gsm_single_get_hist`, `tisp_lce_get_data`: the flags, the RAM
-ports and bits 7 and 8 above; it has no "hist error" check), so the
-model fills them on both; TMO is T41's only. T40's `tisp_af_get_metric`, asked for the AF
-metric from a single-sensor run once AF statistics arrive, faults on a
-pointer of its own (a TLB load in module space); the tests do not ask
-it there.
+`tisp_hldc_calc_para` computes `rho = r^2 / r2max` and `f(rho) = 256 - k1*rho/4 + k2*rho^2/4` (`Q8`). The inferred sampler reads bilinearly at `d * f(rho)/256 * zoom/2048`. Verified by `test-ingenic-isp.sh --ldc` (`95%` match on T41 vs 157 uncorrected levels, `100%` on T40 vs 111 levels, and `95%` on T40 dual-pipe `--sensor1 gc4653` across `ch0`/`ch3`).
 
-The AF filters are the luma's differences to the next pixel and the
-one after, along the row (FIR) and down the column (IIR), summed over
-the zone. With them `IMP_ISP_Tuning_GetAFMetrices` on T31 reads about
-1.6 million, and 0 without; when the light quadruples and turns warm it
-drops to about 0.9 million as the logo clips. With ADR and defog fed,
-their algorithms run every frame and write their outputs (ADR
-0x4270..0x43A4, defog's per-block transmission and air light from
-0x58000) where without statistics only their init values are written
-once; on the static scene those outputs settle and stay, also across a
-change of light, and which of defog's three halfwords means what is a
-guess.
+### Multi-sensor modes and VIC raw capture
 
-The tests that check pictures take them once the AE has
-settled (`test-ingenic-isp.sh` the last frames of 40, the encoder client
-after four seconds), and `ingenic-isp-check.py` judges the logo and the
-dot against the background's level, and the dot's place by the frame
-counter, which is drawn on a black box so that it reads at any
-exposure.
+- **T40 dual-sensor (`sensor1=`)**: Attaches a second sensor on `I2C3` and `CSI1` (`0x10023000`, behaving like `CSI0` storage) for `IMPVI_SEC` / `IMPISP_TOTAL_TWO` / `DUALSENSOR_MODE` (`tisp_sec_*`, `sensor_gc4653s1_t40.ko`, and `/etc/sensor/gc4653s1-t40.bin` via `tisp_sec_init`). `VIC1` (`0x13390000`, `INTC 29`, queuing `sec_fs_work`) mirrors `VIC0` 64 KiB past it (the driver only maps `VIC0`'s 64 KiB and indexes past it based on the incoming IRQ). Pipe 1 interrupts use `0x40038`/`0x40034`/`0x40030` (core ISR `0x72f10` polls `0x40028` then `0x40038`, while `0x40068`/`0x400A8` stay `0`), MSCA channels `3`–`5` sit at `0x17100 + 0x100*n` (`0x17008` enable), and AE/AWB banks sit at `0x19200`/`0x18200`. Pipe 1 renders `+500000` frames ahead (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`).
+- **T40 third sensor (`sensor2=`)**: Attaches on `I2C0` for `IMPVI_THR` / `IMPISP_TOTAL_THR` using DVP `VIC2` (`0x133A0000`, `INTC 28`) after `csi_phy_start` logs `"Can not support more than 2(3) mipi sensor"` and `"The third sensor init"`. There is no third ISP pipe or tuning (`/proc/jz/isp/isp-w02` shows `"vic index: 0, 1, 2"`). `VIC2` raises frame-done interrupts while pipes 0 and 1 stream (`test-ingenic-isp.sh` aliases `s1` to `s2`).
+- **T40 `snapraw` (`VIC_MDMA`)**: `echo snapraw S N > /proc/jz/isp/isp-w02` captures `/tmp/snapK.raw` via `vic_mdma_enable` (`0x304` `w<<16|h`, `0x308=1`, strides `0x310`/`0x314`, buffer slots `0x318+4k` / `0x340+4k`, `0x300` count `<= 8`, `0x380` buffer index, and secondary status `0x1E4`/`0x1EC`/`0x1F4` triggering `vic_mdma_irq_function0`). Packs a 10-bit-in-16 RGGB mosaic (`R 186, G 216, B 335`). `ispvic_frame_channel_qbuf` is unused.
+- **T40 split-joint mode (`IMPISPDualSensorSplitJoint`, `ispcore_pad_event_handle`)**: Modes `3` and `4` (vertical above/under stacking of channel 0 and channel 3 into a `2560x2880` frame) pass (`--joint 3` / `--joint 4`). Horizontal modes `1` and `2` exceed the scaler limit with two `2560px` sensors (`5120px` total width: `"Image width cannot exceed 3840!"`).
+- **T23 dual-sensor (`tx-isp-t23-double` `H20230726b`, `libt23-firmware.a`, `sensor1=gc2053s1` at `I2C0 0x3f`)**: Alternates both sensors through T23's single pipe via pass-end `0xC8` bit `15` (enabled by `0xC0 = 0x8000`, acknowledged by `0xC4`; single-sensor firmware never touches `0xC0`–`0xC8`). On each pass end, `ispcore_interrupt_service_routine` advances `vi_num = count & 1`, reloads registers (`tisp_rcfg_cfg_trig`), queues buffers, enables channels (`tisp_msca_chx_en`), and restarts VIC (`tisp_msca_channel_start(n)` maps frame channels `0-2` and `3-5` to `n % 3`). The model alternates passes starting with the main sensor (inferred) and treats `tisp_ae_multi_sensor_malloc_cfg` (`+0x4C = 0x10010000`) bit `16` as the AE enable (since `0xA000` is never written), converging both AEs (`mean Y` `0` to `32` in 60 passes). HELIX distinguishes each stream's reference by chain addresses (`MCE 0x5006C` / `DBLK 0x60008`) instead of picture dimensions (`test-ingenic-t23-enc.sh --sensor1 gc2053s1`: four H.264 1080p/360p streams).
 
-T21 (`tx-isp-t21.ko` H20200509a, with symbols) has the same blocks at
-0x700 (AE0) and 0x800 (AWB), banks set by `tisp_init`, its callbacks on
-bits 16 (AE zones), 17 (AE histogram) and 18 (AWB) of 0x84, and no
-enable bits: a block runs once it has its banks. Its AE zones are T31's;
-its histogram counts in 20 bits, and its AWB zone has no IR sum (R, G,
-B, then the count at bit 63). Its sensor, JX-F37, is decoded as the
-other SOI parts (rows in 0x01/0x02, gain in 0x00). With T31's scale its
-AE settled at a linear mean of 2 of 255 -- too dark to see the scene --
-whatever the light; its target is a table in the sensor's tuning file,
-so the zone sums are given at a quarter scale, a calibration rather than
-something read off the module, and the AE settles at 7 (T31: 10) with
-the light at 10 %, 100 % or 1000 %. Its AWB (`Tiziano_awb_fpga`, run
-every frame -- `_AwbPointPos[1]`, the change it waits for, is 0 in the
-JX-F37 tuning) takes each zone's R/G and B/G times the tuning's static
-gains (1526 / 1583, Q10), drops the zones whose count is at most
-`_pixel_cnt_th` (25), and hands them to `Tiziano_Awb_Ct_Detect`, which
-returns the white point (Q8): a zone on the tuning's colour-temperature
-band, about R/G 180-400 against B/G 260-148, comes back as itself, one
-off it is pulled to the band's nearest end, and all zones weigh in. The
-navy background -- most of the scene, B/G over 5 -- outvoted the white
-of the logo and pinned the result at the band's blue end (R/G 167, B/G
-340) whatever the light, until the AWB block's own pixel filter (above)
-left it out, as the silicon's does: its quads fail the B/G window and
-the luma floor (50). Read off the module by running the detector on
-zones captured from a guest (gdbstub, the module's pages walked through
-`swapper_pg_dir`) in an emulator.
+### IVDC direct mode (`ingenic-ivdc` on T41 and T23)
 
-`-global ingenic-isp.trace=on` logs the MSCA and 3A register writes and
-each frame with its light, mean luma and white-balance gains; `-global
-ingenic-isp.trace-regs=on` every ISP core and VIC write (`ingenic-isp:
-core [0x...] = 0x...`); `-global galaxycore-sensor.trace=on` the sensor's
-register writes.
+ISP-to-encoder direct buffer mode (`direct_mode=1` in `tx-isp`, `--dm 1` / `bEnableIvdc` in `libimp`, `"T41 IVDC Module Application Guide"`) replaces DRAM frame buffers with the fixed pair `0x80000000` / `0x81000000` (pitch `4096`), backed by 32 MiB of RAM at `0x80000000`-`0x81FFFFFF`. The model's buffer never overflows, so spill line counts at `+0xEC`/`+0xF0` remain `0` in `/proc/jz/isp/isp-ivdc`.
 
-T20 and T10 are the older design, an Apical ISP core, and have their own
-model, `ingenic-isp-apical` (read off the OpenIPC `tx-isp-t20.ko`,
-software H201709151519 with the Apical firmware H01-380; `tx-isp-t10.ko`
-is the same software, and differs only in its VIC, whose control is at
-0x20 -- 0x00 is configuration, 0x0C the size -- and in taking at most
-1280x960 from the sensor, a limit in the driver):
+- **T41 (`0x13200000`, core INTC `13`, `tx-isp`'s `isp-ivdc` IRQ vs DT `jpeg0` IRQ)**: T41's `start_param` script loads `tx-isp-t41.ko` with `direct_mode=1` and runs the camera app with `--dm 1`. The ISP writes `0x80000000`, signals frame source on `int_sta` bit `20` (and bit `13` when `ivdc_vb_type = 1`), and AVPU reads `0x80000000`-`0x81FFFFFF` unmasked. `ingenic-ivdc` auto-clears `0x00` bit `0`, mirrors `0x200` bit `0` in `0x204` (`ispcore_video_s_stream` / `ispcore_suspend_module`), and sets `+0x44` bits `17` and `16` under `+0x40 = 0x244FC0FF` (`ivdc_core_ops_init`, cleared via `+0x54`), recording ~`102` frames in `test-ingenic-sdk-boot.sh`.
+- **T23 (`tx-isp-ivdc.c`, `0x13200000`–`0x1320FFFF`, Linux IRQ `46` = INTC `38`, build `0x65cf8`)**: Uses the same flow except frame start (`0x1000`, or `0x2000` with `ivdc_vb_type = 1`) signals frame source, and `0xD060` + the top 3 bits of `0x1C` configure HELIX reads. Verified by `test-ingenic-t23-enc.sh --direct 1` (`~100` frames, `T23ENC_AE_FREEZE`). Passing `--sdk` (`tx-isp-t23.ko H20230720a`) requires `2.10` tuning files (`gc2053-t23.bin`) because rootfs `2.20` files trigger a `kfree` BUG in `tiziano_load_parameters`.
+- **T23 double direct (`direct_mode=2`, `--direct 2`)**: When streaming two sensors directly through IVDC, the model pulses IVDC frame-done first and ISP pass-end `0.5 ms` later so `INTC 37` (`ispcore_interrupt_service_routine`) does not advance `vi_num` before `INTC 46` (`ivdc_core_interrupt_service_routine`) delivers `0x80000000` (preventing `"vb is null, buf get:0x80000000"` and unset `isp_index` errors). Sensor 0 main (`stream 0`) and both sub-streams pass `10/10` frames; sensor 1 main (`framesource 3`) still stalls because `IMP_FrameSource_EnableChn` never queues buffers (`buf_qcnt 0` in `/proc/jz/isp/isp-fs`) despite `enc_chn->index=1, direct_mode = 2` and `ispcore_pad_event_handle` setup. ISP register writes to `0x20000`–`0x7FFFF` past 64 KiB are dropped.
 
-- core 0x13380000-0x133FFFFF: storage (libimp maps 0x1B000 of it through
-  `/dev/mem` and tunes it directly), but for the 16 interrupt slots:
-  status 0xA0, write-1-to-clear 0xA4, and each slot's event in 6 bits of
-  0x80 + 4 (slot / 2), which the driver programs (frame start 24, frame
-  end 23, the three DMA writers' done 14 / 15 / 1, DS1 / DS2 end 50 / 53).
-  0x134 reports the run state 0x130 asks for (the stop path spins on it).
-- the three DMA writers at 0xB00 + 0x100 n (CbCr at +0x80): enable bit 9
-  of +0x00, size +0x04 (w | h << 16), up to five bank addresses from
-  +0x08, the bank count in +0x1C, the line offset +0x20, and +0x24: the
-  driver writes 2 or 3 as the next bank does or does not hold a buffer,
-  and reads the current bank in [10:8]. It refills empty banks from its
-  frame start and frame end ISRs, so a frame takes the next bank when
-  the last control was 2 and is dropped when it was 3.
-- VIC 0x13300000 (0x00: 2 reads back 0, 1 starts) and the interrupt
-  block at 0x13320000 that puts both on IRQ 37: status 0x0C (the core's
-  slots in 15:0, VIC frame done in 16), ack 0x04, enable 0x14, mask
-  0x1C. CSI at 0x10040000, whose PHY_STATE (0x14) reads 0x630, the stop
-  state the init polls for.
-- 3A statistics (the same in `tx-isp-t10.ko`, `-t20.ko` and the T30
-  SDK's `-t30.ko`, all with symbols): `apical_fw_interrupts_init` puts
-  the AE statistics on event 11 and the AWB statistics on event 9, and
-  their handlers read them straight from the core. The AE takes a
-  256-bin histogram at 0x10000 + 4 b (`ae_read_full_histogram_data`:
-  a 12-bit mantissa and a 4-bit exponent, m for e = 0, else (m | 0x1000)
-  << (e - 1)); the AWB 15 x 15 zones at 0x8740 + 8 z
-  (`awb_read_statistics`, 225 zones from `AWB_fsm_clear`): R/G in
-  [11:0] and B/G in [27:16], 1.0 = 256, before the white balance, and
-  the zone's weight at +4. At each frame end the model fills both from
-  the scene at the first enabled writer's size, lit as on the later
-  parts (the sensor link, `light`, `light-r`, `light-b` at
-  `/machine/isp`; OV2735B decoded from page 1, rows 0x03:0x04 and gain
-  x16 in 0x24), and raises the two events. The firmware's AE starts
-  from the sensor's init exposure -- a nearly black frame -- and climbs
-  to the scene over two or three seconds (T20 and T30: still rising at
-  frame 75; T10 settles at frame 67); with three times the light T20
-  reaches the same picture on a third of the exposure. The AWB's gains,
-  which it writes to 0x300 (B on the BGGR JX-F22) and 0x30C (R), go
-  from B 1.00 / R 2.75 in daylight to B 1.16 / R 2.24 under a warm
-  light. `-global ingenic-isp-apical.trace-core=on` logs every core
-  register the firmware changes.
-- No other statistics are read. The Apical firmware has no autofocus:
-  `af_status` returns 2 with nothing measured and `af_mode`, `af_range_*`
-  and `af_roi` only keep values, in all three modules; event 14 (slot 5)
-  has no algorithm behind it. Iridix (the DRC) reads no statistics block:
-  `iridix_fsm_process_interrupt` runs on frame end from the exposure set
-  and core 0x2C0 bit 7, so its outputs follow the AE -- on T20 the
-  strength in 0x39C goes 0x1000 -> 0x800 and the gain in 0x3DC moves
-  every few frames as the exposure settles. The DIS (`dis_update_stats`,
-  event 15, the second DMA writer's done) reads motion vectors at 0x95C0
-  + 8 i for the 0x908 grid (8 x 4) only when the stabiliser is armed; the
-  core reads zero there, no motion, which is right for a fixed camera.
+### Apical ISP (`ingenic-isp-apical` on T10, T20, T30)
 
-T40 (`tx-isp-t40.ko` H20220606a, read off the T40 SDK 1.2.0 build with
-symbols) is the T31 design again, rearranged: the core at 0x13300000 is
-512 KiB with pipe 0's interrupts at 0x40020 / 0x40028 / 0x40024 (enable,
-status, clear; IRQ 39 = INTC 31), the MSCA channels at 0x16100 + 0x100 n
-with T31's offsets and their enable at 0x16008; VIC0 at 0x13380000 (IRQ
-38) is T31's but for its frame start, bit 4 of 0x1E0, which starts the
-sensor / AE work; the single sensor's CSI host is the one at 0x10054000.
-Nothing is polled.
+Models OpenIPC `tx-isp-t20.ko` (`H201709151519` / Apical `H01-380`), `tx-isp-t10.ko` (VIC at `0x20`, config `0x00`, size `0x0C`, `1280x960` max), and T30 `tx-isp-t30.ko` (`H20190725b` with MSCA at `0x130B0000` IRQ `27` and three CPM resets in `0xAC`):
 
-T40's second pipe takes a second sensor (`sensor1=`, I2C3, CSI1 at
-0x10023000: storage, as CSI0) -- libimp's `IMPVI_SEC`, the SDK samples'
-`IMPISP_TOTAL_TWO` in a `DUALSENSOR_MODE`, the driver's `tisp_sec_*`,
-and a module of the sensor's own (`sensor_gc4653s1_t40.ko`, the gc4653
-driver under another name, and `/etc/sensor/gc4653s1-t40.bin` for
-`tisp_sec_init`). It is pipe 0 again at fixed distances: VIC1 is VIC0's
-register file 64 KiB on (0x13390000; VIC2 at 0x133A0000, storage) --
-the module maps only VIC0's 64 KiB but reaches the others past it, its
-VIC ISR picking the window by the interrupt it came in on: INTC 30 VIC0,
-29 VIC1, else VIC2 -- and VIC1's frame start queues `sec_fs_work`;
-pipe 1's status is 0x40038, cleared through 0x40034, enabled at 0x40030
-(the core ISR, 0x72f10, reads 0x40028 and 0x40038 in turn), with pipe
-0's bits: channels 3..5 on bits 0..2 and the 3A banks on 3..5; its MSCA
-channels 3..5 are at 0x17100 + 0x100 n with the T31 offsets, enable
-0x17008; its AE and AWB blocks are pipe 0's plus 0x200 (0x19200,
-0x18200), their banks set by `tisp_sec_init`. The model runs a pipe
-while its VIC is started and its interrupt enable is not zero, lights
-pipe 1 by the second sensor's exposure, and paints it with the frame
-counter 500000 ahead so that its pictures tell themselves apart. The
-interrupt status 0x40068 and 0x400A8 the ISR also reads stay 0.
+- **Core (`0x13380000`–`0x133FFFFF`)**: Storage (`0x1B000` mapped via `/dev/mem`) plus 16 interrupt slots (`0x80 + 4*(slot/2)`, acked via `0xA0`/`0xA4`: frame start `24`, end `23`, DMA writers `14`/`15`/`1`, `DS1`/`DS2` `50`/`53`) and handshake state `0x130` -> `0x134`.
+- **Three DMA writers (`0xB00 + 0x100*n`, CbCr `+0x80`)**: Size at `+0x04`, five bank addresses at `+0x08`, bank count at `+0x1C`, stride at `+0x20`, control at `+0x24` (`2` active vs `3` drop; current bank in `[10:8]`).
+- **VIC (`0x13300000`), combiner (`0x13320000`, IRQ `37`), CSI (`0x10040000`, `PHY_STATE 0x14 = 0x630`)**: Combines event slots (`15:0`) and VIC frame-done (`16`) through `0x0C`/`0x04`/`0x14`/`0x1C`.
+- **3A statistics and firmware algorithms**: `apical_fw_interrupts_init` assigns AE to event `11` (`256-bin` floating histogram at `0x10000 + 4*b`, decoded by `ae_read_full_histogram_data` as `m` when `e=0` else `(m | 0x1000) << (e - 1)`) and AWB to event `9` (`15x15` = `225` zones at `0x8740 + 8*z`, read by `awb_read_statistics` from `AWB_fsm_clear`: R/G `[11:0]`, B/G `[27:16]`, weight `+4`). AE settles by frame 67 on T10 (still rising at frame 75 on T20/T30); AWB gains at `0x300`/`0x30C` track light color from `B 1.00 / R 2.75` (daylight) to `B 1.16 / R 2.24` (warm), traceable with `-global ingenic-isp-apical.trace-core=on`.
+  - *AF / Iridix / DIS*: AF (`event 14` slot `5`, `af_status = 2`) and `af_mode`/`af_range_*`/`af_roi` act as stub storage. Iridix (`iridix_fsm_process_interrupt`, `0x2C0` bit `7`) adjusts `0x39C`/`0x3DC` from exposure steps; DIS (`event 15`, `dis_update_stats`, `0x95C0 + 8*i` for the `0x908` `8x4` grid) reads `0` motion vectors.
+- **OpenIPC `tx-isp-t30.ko` upstream fault**: Although both SDK and OpenIPC report `H20190725b`, SDK `opensource/drivers/tx-isp-t30` skips `apical-isp/apical_isp_io.c` and links `apical_isp_io.c.o` from `apical-isp/libapical_isp.a`, where `APICAL_READ_32(addr)` routes `addr < 0x1FFFF` to `system_isp_read_32()` and `0x50100`–`0x501F7` to `apical_ext_sytem_mem` using `.bss+0x1B98` (initialized by `system_isp_set_base_address()`). OpenIPC (GCC `13.3`) compiled `apical_isp_io.c` instead, whose `APICAL_READ_32` (`.text+0xF60`) reads `apical_io_base` (`.bss+0x490`, only written by uncalled `apical_iobase_init()`) while probe stores the base in `.bss+0x35F8`, oopsing at `00014000` (`epc : APICAL_WRITE_32+0xc/0x18 [tx_isp_t30]`). Work around this with the SDK module (`test-ingenic-isp.sh --soc t30 --isp-ko <SDK>/opensource/drivers/tx-isp-t30/tx-isp-t30.ko` + `sensor_ov2735b_t30.ko`), or fix upstream by dropping `apical_isp_io.o` (calling `apical_iobase_init(base)` alone still lacks the `0x501xx` RAM window).
 
-A third sensor (`sensor2=`, I2C0: the T40 kernel registers I2C0, 1 and
-3 only) is libimp's `IMPVI_THR` with `IMPISP_TOTAL_THR`: the driver
-takes it on VIC2 through the DVP port (`csi_phy_start` refuses a third
-MIPI sensor, "Can not support more than 2(3) mipi sensor"), prints "The
-third sensor init" and gives it no tuning (only indices 0 and 1 get
-`tisp_init` / `tisp_sec_init`) and no pipe: `/proc/jz/isp/isp-w02` shows
-"vic index: 0, 1, 2". The model runs VIC2 once started -- frame done,
-INTC 28; no frame start, for which the driver's VIC ISR has no work and
-only prints -- and a three-sensor libimp client still gets both pipes'
-frames. The SDK ships no driver for a third sensor; the test renames the
-gc4653 "s1" module to "s2" (the two differ only in their names).
+### Image Processing Unit (`ingenic-ipu`) and ISP test harnesses
 
-The VIC's MDMA stores raw frames in DDR. Only the `snapraw` debug
-command uses it ("echo snapraw S N > /proc/jz/isp/isp-w02", saved as
-`/tmp/snapK.raw`): `vic_mdma_enable` writes 0x304 = width << 16 |
-height, 0x308 = 1, the strides 0x310 / 0x314 (2 bytes a pixel), five
-buffers per channel at 0x318 + 4 k (channel 0) and 0x340 + 4 k (channel
-1), and 0x300 = bit 31 | frames << 16 | 0x20 (at most 8; the driver tops
-it up). The VIC ISR reads a second status, 0x1E4 under 0x1EC, acked at
-0x1F4: bit 0 is channel 0's frame, bit 1 channel 1's; on each,
-`vic_mdma_irq_function0` moves the next buffer slot on and completes the
-command when its count is out. The model stores each of its frames
-in the next slot as an RGGB mosaic of the scene, 10 bits in 16
-(undocumented: the driver only copies the bytes), sets 0x380 to the
-buffer written, counts 0x300's frames down and raises bit 0. The same
-raw path behind a VIC frame channel (`ispvic_frame_channel_qbuf`, the
-module's `isp-w02` raw dequeue) is not driven by anything here.
-
-libimp's joint mode (`IMPISPDualSensorSplitJoint`: 1 main left, 2 right,
-3 above, 4 under) puts both sensors in one picture on channel 0, twice
-the sensor's size across or down; the secondary pipe's channel 3 is
-created and enabled with the sensor's size, and its frames come through
-channel 0. `ispcore_pad_event_handle` (`tx-isp-t40.ko`) queues channel
-0's buffer to both pipes' scalers: one gets it as it is, the other at an
-offset -- across, the channel's width less the part's (main left) or the
-part's width (main right), in bytes for both planes; down, width x (the
-channel's height less the part's) (main above) or width x the part's
-height (main under) for luma and half that for the CbCr plane -- and the
-ISR pops both pipes' done FIFOs for the one "buffer done" it sends. The
-model paints each pipe at the address and size its scaler was given, so
-each sensor's scene, lit by its own sensor and 3A, lands in its part.
-Left and right joins of two 2560x1440 sensors are 5120 wide, past the
-scaler's limit ("Image width cannot exceed 3840!"), which the driver
-enforces; above and under are tested (`test-ingenic-isp.sh --sensor1
-gc4653 --joint 3|4`: the main part reads pipe 0's counter, the
-secondary's pipe 1's, 500000 ahead).
-
-T41's HLDC, the ISP's lens distortion correction (`tiziano-hldc.c` of
-`tx-isp-t41.ko`), runs while 0x40 bit 20 (`IMPISPModuleCtl.bitBypassHLDC`)
-is clear. `tisp_hldc_write_reg` writes its registers from 16 halfwords --
-the tuning's at init (1, 1 and zeros), or the tuning device `/dev/tisp`'s
-(`_IO('t', 1)` with module 21, sub-module 0; the stock module builds
-`IMP_ISP_LDC_*`'s LDC block out, `TX_ISP_LDC_ENABLE`, and calls no
-`tisp_hldc_set_attr`):
-
-| | |
-|---|---|
-| 0x15000 | p1 << 16 \| p0 (1, 1 from every tuning; stored) |
-| 0x15004 / 0x15008 | k2 << 16 \| k1, luma / chroma |
-| 0x1500C / 0x15010 | the zoom, luma / chroma |
-| 0x15014 / 0x15018 | 0x3fffffff / r2max, luma / chroma |
-| 0x1501C / 0x15020 | the centre's offset, offy << 16 \| offx, luma / chroma |
-| 0x15024 / 0x15028, 0x15044 | p14 / p15 (stored); 3 |
-
-`tisp_hldc_calc_para` gives their meaning for a plane of w x h: r2max is
-the squared distance from the centre to the farthest corner, rho = r^2 /
-r2max, the radial gain f(rho) = 256 - k1 rho / 4 + k2 rho^2 / 4 (Q8), the
-zoom 2^19 / min(f(1), f at the nearer side) - 5 (Q11); its 1 / r2max for
-2560x1440, 498, is the SDK's own `r2_rep` for that size. How the stage
-applies them is inferred: an output pixel at d from the centre shows the
-picture at d x f(rho) / 256 x zoom / 2048 -- a barrel correction for k1
-> 0 that keeps the corners and pulls the middle in -- sampled
-bilinearly, luma and chroma with their own registers, on the sensor's
-picture (0x80) before the scaler, each channel mapped by its scale.
-`test-ingenic-isp.sh --soc t41 --ldc K1,K2` writes the parameters
-through `/dev/tisp`, saves frames, clears the bypass through libimp and
-saves more: the later frames match the earlier remapped on the host from
-the same registers (95 % of pixels identical, against 157 levels apart
-without the remap). T40's module writes the same registers through
-`tisp_hldc_con_par_cfg` -- the main pipe's at (0x2A0 << 7) = 0x15000, its
-second pipe's at 0x15080 -- and the same bypass bit 20; `/dev/tisp`
-reaches it as module 20 (T41: 21), the pipe in word 3 and the 16
-halfwords from word 4 (T41: from word 3). `--ldc` on T40 passes the same
-way (100 % of the sampled pixels within 0 of the host's remap, against
-111 levels without it). The second pipe's stage is the main one's at
-+0x80, with its module bypasses at 0x44 (`tisp_s_module_control`:
-(pipe + 16) << 2) and its sensor picture at 0x84 (`tisp_sec_init`), and
-corrects pipe 1's channels the same way: `--sensor1 gc4653 --ldc K1,K2`
-sets both pipes and checks channels 0 and 3 against the host's remap
-(95 % within 0 on both, against 111 levels without it).
-
-T41 (`tx-isp-t41.ko` H20230630a of the T41 SDK 1.2.0) is T40's core and
-VIC with one pipe and one VIC, the CSI host at 0x10023000, and the scaler
-moved to core + 0xF0000: 0x133F0000, past the VIC, so `ingenic-isp`
-maps it as a window of its own (mmio 4) onto the same register file;
-channels from 0xF0100 with the T31 offsets, enable 0xF0008. OpenIPC has
-no T41 release, so its test boots the SDK's own T41NQ 16 MiB flash image
-(`--image`), kernel through `-kernel` and a rebuilt root as a fifth
-partition, with the vendor modules from the image's JFFS2 and the client
-linked statically against the SDK's `libimp.a`. The T41 `start_param`
-loads the ISP with `direct_mode=1` and the application with `--dm 1`:
-IVDC, the ISP-to-encoder path ("T41 IVDC Module Application Guide";
-its driver is part of `tx-isp-t41.ko`). In that mode tx-isp queues
-channel 0 the pair 0x80000000 / 0x81000000 instead of DRAM buffers
-(pitch 4096), the scaler writes the picture into the IVDC's 288 KiB
-store (spilling to DRAM lines it configures at IVDC +0x34 / +0x38), and
-the encoder is handed the same pair as its source. The ISR sends the
-frame source its "buffer done" on int_sta bit 20, the MSCA's first line
-(bit 13, the vertical blank, with `ivdc_vb_type` 1), and on bit 0 queues
-the pair again instead of reading the done FIFO. Here 32 MiB of RAM at
-0x80000000 stands in for the store: the scaler paints a frame queued
-the pair into it and raises bit 20 without touching the done FIFO, and
-the AVPU reads 0x80000000-0x81FFFFFF unmasked. The IVDC's own registers
-(`ingenic-ivdc`, 0x13200000) hold the sizes and DRAM spill lines the
-driver writes (the spill is the block's own: the encoder still reads the
-0x80000000 pair, and software sees it only as the maximum DRAM lines at
-+0xEC / +0xF0 that the T23 and T41 drivers print in `/proc`; the model's
-store never fills, so they read 0, no line spilled); 0x00 bit 0 is a reset that reads back 0 at once (the
-driver spins on it); the status at +0x44, cleared through +0x54, gets
-ISP frame start and frame done (bits 17 and 16) for each picture the
-scaler writes into the store, and interrupts on core INTC source 13
-(tx-isp's `isp-ivdc`; the device tree's node names 0, `jpeg0`'s line)
-under the enable mask at +0x40 (0x244FC0FF from `ivdc_core_ops_init`).
-The driver counts them in `/proc/jz/isp/isp-ivdc`, and at frame done
-moves its state to running. `test-ingenic-sdk-boot.sh` keeps the
-image's `direct_mode` (`--no-direct-mode` strips it): the stream
-decodes with the scene, and the IVDC counters read 102 ISP frame starts
-and dones and no errors by the time of the check. The core's 0x204 bit 0 follows 0x200
-bit 0: `ispcore_video_s_stream` and `ispcore_suspend_module` set the one
-and spin on the other without a timeout.
-
-T23's IVDC (`tx-isp-t23.ko`'s `tx-isp-ivdc.c`, the same driver; its
-resource 0x13200000-0x1320FFFF, Linux IRQ 46 = INTC 38) works the same
-way with two differences in the ISP core's ISR (T23 SDK build 0x65cf8):
-the frame source gets its "buffer done" with the pair at frame start
-(int_sta 0x1000; 0x2000 with `ivdc_vb_type` 1), and channel 0's done bit
-still pops the done FIFO -- only to push each popped pair straight back
-into the queue. So the scaler paints the pair into the store (RAM at
-0x80000000 on T23 too), pushes it to the done FIFO as for any buffer and
-raises the IVDC's frame start and done; HELIX reads the store at its
-full address. `ivdc_core_ops_init` sets ISP 0xD060 and the top three
-bits of 0x1C and resets the block through 0x00, all as on T41; the ISR
-only counts. `test-ingenic-t23-enc.sh --direct 1` (OpenIPC's T23 kernel,
-its own `tx-isp-t23.ko` H20240204a with `direct_mode=1` and its libimp):
-the main stream's encoder channel set `bEnableIvdc`, HELIX encodes from
-0x80000000 / 0x81000000, both streams decode with the scene (the AE left
-running; `T23ENC_AE_FREEZE` freezes it), and
-`/proc/jz/isp/isp-ivdc` counts ISP frames done (about 100).
-`--sdk` runs the same with the T23 SDK's own `tx-isp-t23.ko`
-(H20230720a), sensor module and static `libimp.a`; that firmware reads
-tuning files of format 2.10 (OpenIPC's rootfs has 2.20 ones, on which it
-corrupts memory: a `kfree` BUG in `tiziano_load_parameters`), so the
-test fetches the 2.10 `gc2053-t23.bin` of OpenIPC's first T23 package.
-
-T23's second sensor (`sensor1=gc2053s1`: the SDK's `gc2053s1` driver, a
-GC2053 at I2C0 0x3f beside the first) streams through the SDK's
-dual-sensor firmware (`tx-isp-t23-double`, H20230726b, linked into a
-module by `test-ingenic-t23-enc.sh --sensor1 gc2053s1`; symbols in its
-`libt23-firmware.a`). T23 has one pipe and one set of MSCA channels:
-the firmware takes the two sensors' pictures in turn, a pass of one
-then a pass of the other. Its `tisp_init` enables a second status word
-(0xC0 = 0x8000; the single-sensor firmware never touches 0xC0-0xC8), and
-`ispcore_interrupt_service_routine`, after handling the channels' done
-bits under the current sensor index `vi_num`, acks 0xC8 into 0xC4 and on
-bit 15 -- the end of a pass -- counts, sets `vi_num = count & 1`, reloads
-that sensor's whole register set (`tisp_rcfg_cfg_trig`: top bypasses,
-AE / AWB / AF banks and zones, gamma, scaler, ...), pushes that
-sensor's queued buffers into the MSCA FIFOs and enables or disables
-each channel (`tisp_msca_chx_en`), then writes 1 to the VIC's control.
-`tisp_msca_channel_start(n)` maps frame channels 0-2 / 3-5 to sensor
-n / 3's channel n % 3 of the same hardware, so channel enables wait for
-the first pass end. The model, once 0xC0 bit 15 is set, ends every pass
-with 0xC8 bit 15 (on the core's line, cleared through 0xC4) and paints
-the next pass from the other sensor -- its scene 500000 frames ahead,
-its own exposure and gain, its statistics into the banks the reload
-set. Which sensor a pass takes is in no register the driver writes; the
-model alternates, as the firmware's count does, starting with the main
-sensor when 0xC0 bit 15 is set (inferred).
-
-Each sensor gets one AE zone and one histogram bank
-(`tisp_ae_multi_sensor_malloc_cfg`: +0x4C = 0x10010000), and the double
-firmware never writes the AE's enable at 0xA000: the model takes +0x4C
-bit 16 as the enable in that format (inferred), so each sensor's AE
-runs -- both climb from a dark start (mean Y 0 to 32 in 60 passes),
-their gains a little apart. With the same encoder sizes for both
-sensors, HELIX keeps each stream's reference by the addresses its chain
-gives (MCE's reference at 0x5006C, DBLK's destination at 0x60008)
-instead of by picture size, which mixed the two sensors' P pictures.
-`test-ingenic-t23-enc.sh --sensor1 gc2053s1`: four H.264 streams (each
-sensor's 1080p and 640x360), every picture decoded with no decoder
-message, the first and last of each showing its sensor's scene (counter
-ranges 0.. and 500000..). In the firmware's "double direct" mode
-(`direct_mode=2`, both main streams into the IVDC) the IVDC's ISR
-(`ivdc_core_interrupt_service_routine`, status bit 17) hands the
-picture in its store, the fixed pair 0x80000000 / 0x81000000, to
-framesource `vi_num` -- the pass's sensor until the core ISR's pass end
-moves `vi_num` on. The model raised both at once; the core's line
-(INTC 37) is taken before the IVDC's (46), so every IVDC picture went to
-the other sensor's framesource ("vb is null, buf get:0x80000000 ..."; the
-"isp_index" it prints is an unset field). A pass into the IVDC now
-pulses the IVDC's frame done first and raises the core's status bits
-and the pass end together 0.5 ms later; passes without the IVDC keep
-the channels' done and the pass end in one interrupt, which the
-firmware needs (apart, its ISR requeues the channel's buffer to the
-sensor before it switches). The first sensor's main stream then streams
-in double direct mode (`--sensor1 gc2053s1 --direct 2`: stream 0 decodes
-10 of 10 pictures, as do both sub-streams). The second sensor's
-(framesource 3) still does not: libimp never queues a buffer on it
-(`/proc/jz/isp/isp-fs`: queue count 0, every buf_qcnt 0) although it
-configures the channel for the IVDC (`enc_chn->index=1, direct_mode =
-2`) and the kernel's queue path (`ispcore_pad_event_handle`) rewrites
-both channel 0's and channel 3's buffers to the IVDC pair in this mode;
-where libimp's `IMP_FrameSource_EnableChn` skips the channel's fill was
-not found. The firmware also
-writes ISP offsets 0x20000-0x7FFFF (LUTs beyond the 64 KiB window,
-dropped).
-
-T30 couples the same Apical core with a T31-style MSCA scaler of its own
-(0x130B0000, IRQ 27), which `ingenic-isp`'s "t30" layout models, and
-three CPM reset handshakes in 0xAC. With the vendor's own module it
-streams; OpenIPC's `tx-isp-t30.ko` cannot work on any hardware as built.
-
-Both modules say H20190725b, but they are linked differently. The SDK's
-Makefile (opensource/drivers/tx-isp-t30) does not compile
-`apical-isp/apical_isp_io.c`: the Apical accessors come from the
-`apical_isp_io.c.o` member of the prebuilt `apical-isp/libapical_isp.a`,
-where `APICAL_READ_32(addr)` sends `addr < 0x1FFFF` to
-`system_isp_read_32()` (and 0x50100-0x501F7 to an array in RAM,
-`apical_ext_sytem_mem`), and `system_isp_*` add the base that the
-core's probe hands to `system_isp_set_base_address()` -- one variable
-(.bss+0x1B98 in the SDK's prebuilt module, identical to the one in
-the image's /system). OpenIPC's module (GCC 13.3, Buildroot) compiled
-the source `apical_isp_io.c` instead, whose definitions win over the
-archive member: its `APICAL_READ_32` (at .text+0xF60) adds the offset to
-`apical_io_base` (.bss+0x490), which only `apical_iobase_init()` sets,
-and nothing calls that -- no call, no relocation, no export; the base
-from the probe goes into .bss+0x35F8, which no accessor reads. So the
-first Apical write, at libimp's first call, oopses:
-
-    Unable to handle kernel paging request at virtual address 00014000
-    epc : APICAL_WRITE_32+0xc/0x18 [tx_isp_t30]
-
-A model cannot change that (the pointer is NULL). Replacing only the
-module with the SDK's prebuilt one, on OpenIPC's kernel, libimp and
-`sensor_ov2735b_t30.ko`, streams: `test-ingenic-isp.sh --soc t30
---isp-ko <SDK>/opensource/drivers/tx-isp-t30/tx-isp-t30.ko`. The fix
-upstream is to drop `apical_isp_io.o` from the module's object list
-(and link `libapical_isp.a`), or to call `apical_iobase_init(base)`
-where the probe calls `system_isp_set_base_address(base)` -- the latter
-still lacks the archive's 0x501xx RAM window.
-
-The IPU (0x13080000, INTC source 6 = Linux IRQ 14 on T10, T20, T21,
-T23, T30, T31; the T40/T41 device trees the same) is the block libimp
-blends its OSD regions into the frames with, through the kernel's
-`jz_ipu_v13` (`ingenic_ipu_v13` on 4.4; one register file on all):
-`IOCTL_IPU_START` resets the unit (TRIGGER bit 3), programs the NV12
-background (IN_FM_GS, Y/U_ADDR, strides, OSD_CH_BK_PARA) and the
-OSD channels it uses, sets GLB_CTRL's IRQ_EN, runs it (TRIGGER bit 0)
-and waits two seconds for STATUS bit 0. `ingenic-ipu` blends in place:
-each channel enabled in bit 0 of its PARA (0x11C + 4 n), its picture
-ARGB8888 (byte order [17:14]), ARGB1555 ([13:11] = 4; what T30's
-libimp uses for its timestamp), NV12 or NV21, at POS (x << 16 | y),
-GS (width in bytes << 16 | height), alpha per pixel, global ([10:3]) or
-both ([2:1]), RGB through the channel's CSC matrix at 0x148 + 0x18 n;
-OUT_END and the interrupt follow a virtual 100 us later. The conversion
-mode is there too: NV12 to NV21, to 32-bit RGB (`D_FMT` `0x00` ARGB,
-`0x28` ABGR, `0x40` RGBA, `0x68` BGRA, with global alpha from
-`CH_BK_PARA` when `CH_BK_GLOBAL_ALPHA` is set), or to HSV (D_FMT 0x4, what
-libimp's frame source gives a `PIX_FMT_HSV` channel): H in degrees, 16
-bits a pixel, at NV_OUT_ADDR; S and V a byte each at OUT_ADDR and
-OUT_V_ADDR (the planes as the kernel driver and the T23 SDK's EXTFS
-sample lay them out; the value scales are the usual ones, unconfirmed).
-`-global ingenic-ipu.debug=on` logs each operation.
-
-`qemu-boot/test-ingenic-t30-rtsp.sh [IMAGE]` boots the T30 SDK 1.0.5's
-full image (T30X, 8 MiB) as it ships: its kernel, module and
-`sample-RTSPServer` (LIVE555), which encodes H.265 1920x1080 and
-640x360 with the timestamp OSD. The image sets eth0 to 193.169.4.151,
-so the user network takes that subnet and forwards 8554; the host pulls
-rtsp://127.0.0.1:<port>/main and /second with `ffmpeg -rtsp_transport
-tcp -err_detect explode`, and checks the decoded pictures' scene, the
-counter and dot advancing, and on /main the timestamp box brighter
-than the background beside it and changing (the H.265 model codes 8x8
-DC blocks, so the text is legible only as blocks).
-
-OpenIPC's `load_ingenic` takes the sensor from the U-Boot environment if
-it is set and otherwise from sinfo, but the release `sinfo.ko` prints
-`sensor: gc2053` (a space after the colon) and the script's
-`${SENSOR_INFO#*:}` then yields " gc2053": the first boot fails at
-`modprobe sensor_` (the second works, from the environment the first one
-saved). Preset `sensor=<name>` in the environment, as
-`qemu-boot/test-ingenic-isp.sh` does.
-
-`qemu-boot/test-ingenic-isp.sh --soc t31|t21|t23|t20|t10|t40|t41` boots the release kernel
-with the rootfs on a NOR image (a RAM disk takes the memory a 1080p
-capture needs at `mem=40M rmem=24M`), lets `load_ingenic` load the
-vendor modules, and runs `qemu-boot/ingenic-isp-snap.c`, an IMP
-FrameSource client built from the SDK samples: channel 0 at the sensor's
-1920x1080 and channel 1 at 640x360, NV12, ten frames each. It writes four
-frames to an SD card image, and `qemu-boot/ingenic-isp-check.py` reads
-their frame counters, finds the logo and the dot, and checks that both
-channels advance (`--png` keeps pictures). The client is linked against
-the rootfs's own `libimp.so` (IMP 1.1.6 on T31, 1.1.0 on T23, 1.0.33 on
-T21, 1.2.1 on T20; T40's, with a 64-bit FPU and NaN2008, needs the GCC
-7.2 Ingenic toolchain and its own IMP API, `IMPVI_NUM` and all), a uClibc build that OpenIPC runs on musl: like majestic, it
-exports the few uClibc-only symbols the library calls (and mmap /
-ftruncate, whose `off_t` differs, and the older libalog's ctype tables),
-and it is compiled against the SoC's SDK headers where the structs
-differ (T23's `IMPSensorInfo`). IMP 1.1.6's `IMPFSChnAttr` ends with a
-front crop the 1.1.5 headers lack -- left out, the kernel crops channel
-0 to whatever follows in memory. The test keeps libimp's MXU2 paths off
-with `/tmp/closesimd`, as the first runs did before the CPU decoded
-MXU2. On T23 the MSC driver is one of the modules `load_ingenic` loads,
-so the test waits for the card. T40's SDHCI finds no card, so there the
-client copies the frames into rmem through `/dev/mem` and the host reads
-them with the monitor's `pmemsave`; T40's IMP also hangs in its
-teardown, so the verdict comes first.
+- **`ingenic-ipu` (`0x13080000`, INTC `6` / IRQ `14`, `jz_ipu_v13` / `ingenic_ipu_v13`)**: `IOCTL_IPU_START` resets (`TRIGGER` bit `3`), configures the background frame (`IN_FM_GS`, `Y/U_ADDR`, strides, `OSD_CH_BK_PARA`) and OSD channels (`PARA` at `0x11C + 4*n`, supporting ARGB8888 `[17:14]`, ARGB1555 `[13:11]=4`, NV12/NV21, `POS`/`GS`, alpha `[10:3]`/`[2:1]`, CSC `0x148 + 0x18*n`), enables `GLB_CTRL IRQ_EN`, starts (`TRIGGER` bit `0`), and raises `OUT_END` `100 us` later (`-global ingenic-ipu.debug=on`). Also performs NV12->NV21, RGB (`D_FMT` `0x00` ARGB, `0x28` ABGR, `0x40` RGBA, `0x68` BGRA with `CH_BK_GLOBAL_ALPHA`), and HSV conversions (`D_FMT 0x4` / `PIX_FMT_HSV`: 16-bit H at `NV_OUT_ADDR`, 8-bit S/V at `OUT_ADDR`/`OUT_V_ADDR`, value ranges unconfirmed).
+- **`qemu-boot/test-ingenic-t30-rtsp.sh [IMAGE]`**: Boots T30X SDK `1.0.5` (`8 MiB`, `193.169.4.151`, forwarding `8554`), captures `rtsp://127.0.0.1:<port>/main` (`1920x1080` + IPU timestamp OSD) and `/second` (`640x360`) using `ffmpeg -rtsp_transport tcp -err_detect explode`, and decodes offline after capture so host decode latency never drops LIVE555 P frames.
+- **`qemu-boot/test-ingenic-isp.sh`**: Boots OpenIPC NOR flash (`mem=40M rmem=24M`), runs `qemu-boot/ingenic-isp-snap.c` (capturing `1920x1080` and `640x360` NV12 frames via SD on XBurst1, or `/dev/mem` + monitor `pmemsave` on T40 before IMP teardown hangs), and verifies frames using `qemu-boot/ingenic-isp-check.py` (`--png` saves images). Compiles against OpenIPC uClibc `libimp.so` (`1.1.6` T31, `1.1.0` T23, `1.0.33` T21, `1.2.1` T20; GCC 7.2 NaN2008 `IMPVI_NUM` on T40) on musl with `mmap`/`ftruncate` (`off_t`) + ctype shims, `/tmp/closesimd`, and per-SoC structs (`IMPFSChnAttr` front crop in `1.1.6`; T23 `IMPSensorInfo`).
 
 ### majestic on T40 and T41: a digital twin
 
@@ -2400,7 +635,7 @@ The checks:
   timeout!`; libimp records nothing after one). That timeout was the
   encoder model's: coding a 2560x1440 picture under the iothread lock froze
   both CPUs for up to 0.8 s while the virtual clock ran on, past the 800 ms
-  the driver waits (the AVPU section above), and 2 of 3 runs failed until
+  the driver waits (the AVPU section below), and 2 of 3 runs failed until
   the coding moved to a thread of its own. The check cannot tell IMP_AI
   device 0 from 1: the twin's `audio.ko` records the codec on both (a build
   that records on device 0 passes it), where the owner's camera gave
@@ -2457,144 +692,163 @@ for about a second -- majestic gets 20 ms frames of the codec's 1 kHz tone
 `Error: Not Find any irq`, and libimp's record thread ends (below, "Not
 modelled").
 
+---
+
+## Video encoders, display and NNA accelerators
+
+### VPU, HELIX and RADIX (`ingenic-vpu`)
+
+Models T10/T20 `jz-vpu.0`, T21/T23/T30 HELIX, T30 RADIX (`kind 1`), and T41 JPEG (`layout 1`) via `/dev/soc_vpu` (`drivers/video/soc_vpu/`, documented with evidence in `tmp/soc-vpu-contract.md`):
+
+- **Execution**: The kernel resets via CPM `SRBC` (bits `30`/`29`/`31` for VPU/HELIX, `27`/`26`/`28` for RADIX, and `28`/`27`/`26` for T41 JPEG) and submits a VDMA chain of `{value, VLD | TERM | register}` entries (written to `0x84` on T21/T23, VDMA `0x10008` on T20/T30, and CFGC `0x08` on RADIX) terminated by `EFE_CTRL RUN` (VDMA `0x8008` on RADIX). Jobs complete `1 ms` later in virtual time, retaining all chain writes in the ~40 statistics registers read back by `libimp` (`H264E_T21_SliceInit`, etc.).
+
+| Codec | Software (`libimp`) | Hardware model (`ingenic-vpu`) |
+|---|---|---|
+| H.264 | Writes `SPS`, `PPS`, slice header, `cabac_alignment_one_bits`, and NAL escaping | Writes unescaped CABAC `slice_data()` + flush at `SDE_CFG4` (`SDE_CFG9` byte count) |
+| H.265 | Writes `VPS`, `SPS`, `PPS`, slice header, `byte_alignment()`, and whole-NAL escaping | Writes unescaped `slice_segment_data()` + trailing bits at `SDE 0x68008` (`0x68024` byte count) |
+| JPEG | Writes `SOI`..`SOS` and `EOI` markers | Writes entropy-coded scan at `JPGC_BSA` (`JPGC_STAT[23:0]` byte count) |
+
+- **Coders and inter prediction**: Uses `hantro-h264.c`, `hantro-h264-inter.c.inc`, `hevc-enc.c`, `hevc-enc-inter.c.inc`, and `jpeg-enc.c` (`QMEM` reciprocals), taking QP and slice type from `EFE_CTRL` (RADIX `0x20040`/`0x20000`). `libimp`'s `x264` requires CABAC (`i264e_init` rejects CAVLC).
+  - *H.264 P slices*: Selects `P_Skip`, `P_L0_16x16` (testing predicted, `P_Skip`, neighbor, and zero vectors -> `4-pixel` grid over `+-16` pixels -> diamond search -> quarter-pel luma H.264 `8.4.2.2.1` and `6-tap` / averaging eighth-pel chroma bilinear interpolation over `num_ref_idx_l0_active = 1` using `8.4.1` vectors, followed by a `4x4-transform` residual + CBP against the deblocked `disable_deblocking_filter_idc = 0` reference), or `I_16x16 DC` on scene cuts. Honors High-profile PPS `transform_8x8_mode_flag` (`transform_size_8x8_flag = 0`; override with `-global ingenic-vpu.transform-8x8=off`), retries at `+6` QP on `SDE_CFG5` overflow (`mb_qp_delta`), and uses DC residuals on AE steps so CBR lowers QP (`31 -> 25` over 20 frames in `test-ingenic-vpu-e2e.sh`) instead of stalling at QP 51 `I_PCM`.
+  - *H.265 P slices (`i265e`)*: Matches T30 streams (CTB `64`, `16x16` `cu_qp_delta`, chroma QP `-3`, luma-only SAO, no scaling lists, no TMVP, `max_transform_hierarchy_depth_inter = 0`, no sign hiding, 2 merge candidates via `five_minus_max_num_merge_cand = 3`), retrying `+6` QP above 1 byte/pixel down to all-skipped (`test-ingenic-t30-rtsp.sh`).
+- **DMMU TLB (`IOCTL_CHANNEL_PRIVATE_TLB`, `libdmmu.c`)**: Reads the page directory base from `SCH_TLBA` (`0x30`), gated by `GLBC` bits `26:21` (`JPGC`, `DBLK`, `SDE`, `EFE`, `VDMA`, `MCE`; bit `30` on older layouts) or RADIX `CFGC 0x10`/`0x1C` (bits `16:21`: `EFE`, `VDMA`, `ODMA`, `DBLK`, `MCE`, `SDE`). Walks a 1024-entry page directory (`[31:22]`) to 1024-entry page tables (`[21:12]`, bit `0` valid, PA `[31:12]`); unmapped addresses raise `SCH_STAT` bit `10`, read as `0`, and drop writes.
+- **JPEG decode (`IMP_Decoder` on T23 & T30)**: `ijpegd_decode_header` submits `T20_JPEGD_SliceInit` ending in `JPGC_TRIG = 7` (without EFE), outputting `T420` `16x16` tiles (`P0A + 256*k`, `P1A + 128*k` of 8 Cb then 8 Cr rows; non-4:2:0 MCU shapes inferred) before `c_copy_frame_t420_to_nv12` zeroes partial trailing rows:
+
+| Register | Offset | Role |
+|---|---|---|
+| `GLBI` | `0xE0004` | Components - 1 in `[5:4]`, restart markers every `NRSM + 1` MCUs (`bit 2`) |
+| `BSA` | `0xE000C` | Byte-stuffed entropy scan (retaining restart markers and `EOI`) |
+| `P0A`, `P1A` | `0xE0010`, `0xE0014` | Output luma (`P0A`) and chroma (`P1A`) `T420` tile buffers |
+| `NMCU` | `0xE0028` | Number of `16x16` MCUs minus `1` |
+| `P0C`..`P3C` | `0xE0030..` | Per-component blocks/MCU - 1 (`[7:4]`), QT (`[3:2]`), AC (`[1]`), DC (`[0]`) table selectors |
+| `MCUS` | `0xE0064` | Non-zero decoded block count; raises `JPGC_STAT` / `SCH_STAT` bit `4` |
+| `HUFB` / `HUFM` / `QMEM` / `HUFS` | `0xE1200` / `0xE1300` / `0xE1400` / `0xE1800` | `9-bit` `HUFS` starts (`HUFB`), `36-bit` top-packed canonical codes (`HUFM`: `AC0`, `DC0`, `AC1`, `DC1`), `4 x 64` zigzag quantizers (`QMEM`), and Huffman symbols (`HUFS`: `AC0` @ `0`, `AC1` @ `174`, `DC0`/`DC1` nibbles @ `162` with `DC0` low) |
+
+- **T41 standalone HELIX JPEG (`0x13280000`, `ingenic,t41-jpeg`, `drivers/video/ingenic_vpu/helix`, core INTC `0`)**: Selected via `IMP_ENC_TPYE_IVPU` (`ijpege_*`, instead of `AVPU` core 1; reset via SRBC `28`/`27`/`26`). Maps renumbered 64 KiB `helix.h` `HID_*` units (`SCH = 0`, `VDMA = 1`, `EFE = 2`, `JPGC = 3`, remainder `7`, address bit `19` set) back to HELIX offsets (`JPGC_STAT` at `+0x30008`). Tested via `test-ingenic-avpu.sh --soc t41 --ivpu` (`2560x1440` + `640x360`).
+- **Tests**: `qemu/tests/test-ingenic-vpu.py`, `qemu/tests/test-ingenic-vpu-feed.py` (`i264e_*`, `i265e_*`, `ijpege_*` via `qemu/tests/ingenic-vpu-feed.c`), `qemu/tests/test-ingenic-vpu-e2e.sh` (T21 FrameSource -> `IMP_Encoder`), and `qemu-boot/test-ingenic-jpegd.sh --soc t23|t30` (`qemu-boot/ingenic-jpegd-test.c`).
+
+### Allegro AVPU (`ingenic-avpu` on T31, T40, T41)
+
+An Allegro DVT video/JPEG encoder proxied by `avpu.ko` (`opensource/drivers/avpu`, IRQ `70` = INTC `62`) and scheduled in userspace `libimp.a` (`CoreManager.c`, `EncSliceParam.c`, `SliceHdrWriter.c`; contract in `tmp/media-contract.md` section 3). Only 4 KiB is mapped from `reg-base` (`+0x8000` on T31/T40 since T40's RTC occupies `0x132A0000`; `+0` on T41). Core `c` sits at `+0x200*c` (`0` = video, `1` = JPEG), and UID+`0x8004` returns `hw-id` (`0x72000460` T31, `0x72000760` T40, `0x71000260` T41) to satisfy `"Board ID mismatch: ... instead of 72000460"`.
+
+Encoding runs on a worker thread beside the vCPUs. Coding a `2560x1440` frame under the iothread lock held both CPUs for up to `0.8 s` while virtual time advanced, exceeding the vendor `audio.ko` microphone read timeout of `800 ms`. The worker accesses guest RAM only: register reads return zero and register writes are dropped and logged as guest errors. Device callbacks from the worker could otherwise deadlock with a vCPU waiting for that batch.
+
+- **Gen 1 register interface (T31, T40)**:
+  - `0x14` / `0x18`: Interrupt mask and W1C status (`4c+0` = Enc1 or JPEG done; `4c+2` = Enc2 done).
+  - `0x30` / `0x3F8`: Ticking `800 MHz` counter (polled non-zero) and busy flag (always reads idle).
+  - `0x3E0` / `0x3E4`: 29-bit-masked command list (`0x200-byte` entries ending on word `0` bit `31`, up to 2 Enc1, 8 Enc2, or 1 JPEG entry reading `R0`–`R10` at `0x200`–`0x228` and writing byte count at `0x234`) and launch trigger. Jobs finish after at least `200 us`, once coding completes, with non-zero RC counters and tracking of `pcm-budget`. Supports both Enc1-only slicing (`W8` bit `11`, `WC0`–`WCC`, length `0x104`, offset `0x220`) and two-pass Enc2 (`WF0`–`WFC`, length `0x1E4`).
+- **T41 Gen 2 interface (`gen=2`, `libimp` 1.2 `EncCmdRegs.c`)**:
+  - Uses per-core 4 KiB pages at `0x1000*(c + 1)` (`Enc1` at `+0`, `Enc2` at `+0x800`): command list lo/hi (`+0`), status area (`+8`), control (`+0x10`), start (`+0x18`: `2` video, `1` JPEG), busy (`+0x1C`), and IRQ done bits `2c` (Enc1/JPEG) / `2c+1` (Enc2).
+  - Each `4 KiB` command entry places Enc1 status at `0x5C0` (`gen 1` `0x104`–`0x174` shifted by `-0x118`) and Enc2 status at `0xDC0`:
+
+| Gen 2 offset | Mapping / Fields | Gen 2 JPEG (`core 1`) |
+|---|---|---|
+| `W0` (`+0x00`), `W4` (`+0x04`) | `W0`: codec `[1:0]`, `log2(LCU) - 4` `[26:24]`, last `[31]`; `W4`: `width/8 - 1` `[10:0]`, `height/8 - 1` `[26:16]` | `0x40` `R0`, `0x44` size |
+| `0x0C`, `0x60`/`0x64`/`0x68` | Maps to Gen 1 `W8` (CABAC, `cabac_init`, Enc1 slice) and `WC`/`W10`/`W14` | `0x58` tables, `0x60`/`0x68`/`0x6C`/`0x70` stream |
+| `0xA0`/`0xA8`, `0xD0`, `0x1C0`, `0x108` | Source luma/chroma (`0xA0`/`0xA8`), pitch (`0xD0`), reconstruction (`0x1C0`), reference (`0x108`) | `0x74` pitch, `0x80`/`0x88` source |
+| `0x220`/`0x22C`/`0x230`/`0x234`, `0x800`–`0x814` | Stream base/size/offset/room and Enc2 entries | `0x604` byte count written |
+
+  - `avpu_g2_entry()` maps Gen 2 entries back to Gen 1 fields and initializes T41 HEVC SPS/PPS defaults (scaling lists on, transform skip off, intra transform depth `1`).
+- **Bitstream headers and inter/B coding**: `libimp` writes `SPS`/`PPS`/`VPS`/`SEI` and the slice header after encoding completes, and the hardware model writes the slice payload starting at `stream base + offset` (re-emitting the `0x78`/`0x7C` header tail with EPB). The coders recover parameter sets only from consecutive complete `SPS + PPS` headers preceding the stream offset so stale fragment buffers (such as T40's `transform_skip_enabled_flag = 0` leftovers) are ignored.
+  - *H.264 (`hantro-h264-inter.c.inc`)*: Supports Main-profile CABAC (`cabac_init_idc = 1`, multi-slice rows via `W14`, `W10` alpha `[13:8]` / beta `[4:0]` deblocking with `disable_deblocking_filter_idc = 0`, `W90`/`WA0` references) and Baseline CAVLC (`mb_skip_run`, Exp-Golomb `mb_type`, `coded_block_pattern` Table `9-4`, `residual_block_cavlc` with neighboring `nC` across 4 `coeff_token` tables). B slices (`W3[29:28] = 0`, `RefA = WA0`, `RefB = WA8` from `ChannelMngr.c` `encode1` `TSliceBuffersEnc`) code `B_L0_16x16`, `B_L1_16x16`, `B_Bi_16x16`, or `I_16x16 DC` (never `B_Skip`/`B_Direct_16x16`, with `num_ref_idx_active = 1/1`), verified by qtest because `PYRAMIDAL` `Codec_Encode_SetGopParam` fails inside 64 MiB `libimp`.
+  - *HEVC (`hevc-enc-inter.c.inc`)*: Uses CTB `32`, intra depth `1`, transform skip (T31/T40), and `cabac_init_flag`. P slices enable real `inter` motion search (whole/half/quarter-pel with `8.5.3.3.3` 8-tap luma / 4-tap chroma filters, 5-candidate merge list with TMVP, AMVP `rqt_root_cbf`, default `8x8`/`4x4` scaling lists, `residual_coding()`, and QP capped `<= 22` instead of rate control climbing into the `40s` so 6-sample counter cells stay sharp). B slices (`hevc_enc_slice_data_b`) use bi-predicted 14-bit AMVP or intra DC with `mvd_l1_zero_flag = 0`, `slice_temporal_mvp_enabled_flag = 0`, and `initType = 2`. Overflow retries higher QP down to all-skipped so byte-count bit `30` stays clear. JPEG de-zigzags `R6` quantizers.
+- **Metrics and debug**: `-global ingenic-avpu.dump=DIR` saves streams and `avpu-<w>x<h>.<ext>.rec`/`.src` NV12 images; `trace=1|2` logs launches or register writes. Over 30 frames on T31: H.264 1080p averages `8.9 KB` I / `1.2 KB` P (`47.4 dB`), 640x360 averages `2.6 KB` / `0.65 KB` (`42.0 dB`); HEVC 1080p averages `18.3 KB` / `2.6 KB` (`43.6 dB`), 640x360 averages `3.2 KB` / `0.9 KB` (`36.6 dB`), versus `21 KB` P frames under `I_PCM`.
+- **Tests**: `python3 qemu/tests/test-ingenic-avpu.py` validates bit-exact reconstruction across CAVLC, CABAC, multi-slice, and `I0 P2 B1 P4 B3` sequences (`41-43 dB` on B frames) on T31/T40/T41 with `ffmpeg` or Docker `jrottenberg/ffmpeg`. End-to-end boot tests run via `bash qemu-boot/test-ingenic-avpu.sh [--soc t40|t31|t41]` (`qemu-boot/ingenic-avpu-enc.c`, SD extract on T31, top 8 MiB `pmemsave` on T40/T41, JPEG channels 4/5 to avoid T40 channel 0 fault, static `libimp.a` + `--no-direct` on T41 SDK image, and full-range YUV check on T40 HEVC).
+
+### Display and 2D graphics (`ingenic-lcdc`, `ingenic-dpu`, `ingenic-vo`, `ingenic-drawbox`, `ingenic-i2d`)
+
+- **`ingenic-lcdc` (T21, T23, T30, T31 `drivers/video/jz_fb_v14`, `jz-fb`, `sample_slcd`)**: Reads looping or single-frame 7-word descriptors from `CHAIN_ADDR` (`next`, buffer address, pixel stride, chain config bit `0` continue, IRQ control, UV buffer and stride) onto display `lcdc` (`screendump device=lcdc`, `fps=60`). Frame dimensions come from `SLCD_FRM_SIZE` (smart panel when `DISP_COMMON` bit `0` is set) or TFT `HDE`/`VDE`, with `GLB_CFG[18:16]` choosing `RGB555`, `RGB565`, `RGB888-in-32`, `NV12`, or `NV21` (`[21:19]` color order). Control bits cover `CHAIN_START`, `SLCD_START`/`TFT_START`, `QCK_STOP`/`GEN_STOP` (`QCK_STOPM`/`GEN_STOPM`), `FRM_END`/`DMA_END` (`INT_FLAG = ST & INTC` cleared via `CSR`), and `SLCD_CMD` word counters (`slcd-cmds`, `slcd-last`, clear `SLCD_ST`). Verified by qtest.
+- **`ingenic-dpu` (T40, T41 `fbdev/ingenic/fb_v12`, `t40-dpu`/`t41-dpu`, `sample-LCD` `/dev/fb0`)**: Follows the kernel driver contract (not enabled in shipped configs). `FRM_CFG_CTRL` bit `0` reads frame descriptors from `FRM_CFG_ADDR` (`next`, size, control bit `0` stop, write-back address and stride, four layer descriptor pointers, enables, and z-order) onto display `dpu` (`screendump device=dpu`, `frames`, `fps=60`):
+  - *Composition*: Supports `RGB555`, `ARGB1555`, `RGB565`, `RGB888`, and `ARGB8888` (`0..5` channel order), `NV12`/`NV21` (`BT.601`), nearest-neighbor scaling, per-pixel/global alpha, 2-level DMMU (`TLB_GLBC[3:0]`, `TLB_TLBA`, `JZFB_USE_TLB`), `CMP_START`/layer ends/`CMP_END`/`DISP_END` (`INT_FLAG = ST & INTC` -> IRQ `20`, cleared by `CLR_ST`), and quick/general stop (`STOP_DISP_ACK`).
+  - *Write-back & dither*: Control bit `1` writes composed frames back in `[18:16]` formats `0/1/2/3/4/6` (`ARGB8888`, `RGB565`, `RGB555`, packed YUV422 `Y0 U Y1 V` studio `BT.601` inferred, `Y`, `RGB888-in-32`), raising `WDMA_END`. Control bits `4`/`5` (`[25:20]`) and `DISP_COM` (`0x8000` bit `4`, `[21:16]`) apply 4x4 ordered dithering.
+  - *Simple RDMA (`CONFIG_INGENIC_FB_SIMPLE_RDMA`)*: Control bit `3` or `RDMA_CHAIN_CTRL` bit `0` reads 5-word descriptors from `RDMA_CHAIN_ADDR` (`0x1000`) with ctrl `[18:16]`/`[22:19]`, raising `SRD_START`/`SRD_END`/`SRD_WORKING` (`DC_CTRL` bits `1`/`4` stop).
+- **`ingenic-vo` (T41 `drivers/video/ingenic_vo`, `/dev/jz-vo`, disabled in DT)**: Models DMA reset (`TOP_STATUS` bit `0` W1C), `SIZE`, `STRIDE`, `CON_PAR`, blanking, `INT_EN`, `TRAN_EN`, frame queueing (`ADDR_INFO` bit `3`), `screendump` display output (`fps=30`), `INT_VAL`/`INT_CLC`, and the `frames` counter.
+- **`ingenic-drawbox` (`ingenic_drawbox` / `ingenic_drawbox.c` on T40, T41, `/dev/dbox`)**: Driven by `libimp` `OSD_Draw_Layer_Cover_Pic_RectLine` -> `dbox_osd`. Loads a 4-entry `COLOR_Y`/`U`/`V` palette, targets an NV12 (`YB`, `CB`, `STRIDE`, `IMG_WH`) or BGRA frame (`COLOR_MASK` for luma-only), executes 2-word box RAM entries (rectangles, corners, horizontal/vertical lines), clears state on `RESET`, and raises `CTRL` bit `4` `50 us` after `START` unless `IRQ_MASK` is set (line length and corner arm widths inferred).
+- **`ingenic-i2d` (`ingenic_i2d` / `ingenic_i2d.c` on T40, T41, `/dev/i2d`)**: Used by `IMP_FrameSource_SetI2dAttr` to transform `NV12`, `RAW8`, `RGB565`, or `ARGB8888` images (`IMG_MODE`) with `0`/`90`/`180`/`270` degree clockwise rotation, mirror, and flip onto `DST`, setting `IRQ_STATE` bit `0` `100 us` later (cleared via `IRQ_CLEAR`).
+
+### NNA pre-processors, DMA and bus monitor (`ingenic-aip`, `ingenic-bscaler`, `ingenic-nndma`, `ingenic-monitor`)
+
+- **`ingenic-aip` (T41 `drivers/video/ingenic_aip`, `/dev/jzaip_t`, `_f`, `_p` at `0x12B00000` & `0x13090000`)**: Reverse-engineered from `libaip` (`magik-toolkit InferenceKit/nna2`: `warp_*`, `crop_*`, `img_format_convert`). All three units share `CTRL`, `STAT`, `CFG`, and IRQ enable registers at `0x00`–`0x0C` (`50 us` completion; alpha zero-fill and `CFG` bit `0` `Cb/Cr` swap inferred):
+  - *Unit `T` (`+0`)*: Converts NV12 to 4-byte RGB/BGR using a signed Q20 BT.601 matrix (`1.164, 1.596, 0.391, 0.813, 2.018`, offsets `16, 128`). Byte order bits `[2:0]` encode `BGR..RGB` (`0..5`), and bit `3` moves alpha first (`BGRA = 0`, `RGBA = 5`, `ARGB = 13`).
+  - *Unit `F` (`+0x200`)*: Performs chained bilinear box resizes with Q16 scale steps, `CFG[9:7]` element widths (`1`, `4`, `8`, `16`, or `32` bytes per pixel, or dual-plane NV12).
+  - *Unit `P` (`+0x300`)*: Evaluates 15-word `3x3` inverse affine/perspective warps with out-of-bounds padding and NV12-to-4B conversion (or 1-, 2-, and 4-byte pixel copy). Chains contain `(value, reg)` pairs terminated by address bit `31`.
+- **`ingenic-bscaler` (T40 `drivers/video/ingenic_bscaler`, `/dev/bscaler0` at `0x13090000`)**: Reverse-engineered by running `libvenus` (`InferenceKit/nna1`: `bscaler_api`, `bscaler_hal`, `bscaler_segmentation`, `warp_*`, `crop_*`, `warp_covert_nv2bgr`) under user-mode QEMU:
+  - *Unit `C` (`0x00`–`0x7F`, IRQ `39`)*: Executes up to `64x64`-pixel tiled NV12 or 4-byte resize, affine, and perspective warps (`0x18` dest FIFO, `0x40`/`0x44` origins, `0x48`–`0x68` Q16 matrix, `0x04` pixel formats/pad, `0x00 = 0x201` run, `(value, reg)` chain via `0x34`/`0x38`/`0x30`, `50 us` completion, bilinear edge-repeat sampling with `128` CbCr pad >1 pixel outside). `0x28`/`0x2C`, `0x04` bits `1`/`2`/`16..18`, `0x30` bit `1`, and `0xA0`/`0xA8`/`0xF0`/`0xF4` act as storage.
+  - *Unit `T` (`0x80`–`0xFF`, IRQ `40`)*: Line-by-line NV12->4B converter (`0x84 = lines << 16 | 1` raising bit `2`; `0x80` bit `0`/`8`; `0xAC`), sharing the `0xC0..0xE0` signed Q20 `YUV->BGR` matrix (`0xE4` offsets/orders).
+  - *LZMA mode (`CONFIG_LZMADEVICE`, `drivers/lzma/lzma.c`, `jz_lzma_decompress` / `hardware_lzma.c`)*: Writing `0x00` bit `31` switches the window into LZMA mode until a C unit reset (`0x30` bit `16`), decoding full `.lzma` streams (`13-byte` header, up to `16 MiB` output) from `0x04`/`0x08` -> `0x0C` into `0x1C FINAL` (`0x10`/`0x14`/`0x18` storage; inferred from unused driver code). T41 `ingenic,t41-lzma` nodes (`0x13C00000`/`0x13D00000`) are disabled.
+- **`ingenic-nndma` (T40, T41 `0x12500000`)**: Mapped directly in userspace via `__aie_mmap` (`dma_func.cc`: `w_d2o_orasetrun`, `aie_run_nndma_rdchn`, `wrchn`; `soc-nna.ko` implements only the version ioctl). `0x0000`–`0x3FFF` holds 2048 2-word descriptors (`word 0`: DDR `[31:6]`, chain bit `0`, len `[16:12]` in `5:1`; `word 1`: len `[11:0]` in `31:20`, ORAM 64-byte offset in `19:0`). Writing `bit 31 | bytes/64 << 12 | first_desc` to `0x8000 + 4*n` (DDR->ORAM) or `0x8010 + 4*n` (ORAM->DDR) executes synchronously so `rdhwr` waits complete immediately (`0x2000` `CPU_SIMULATOR` `RCFG`/`WCFG` stays storage).
+- **`ingenic-monitor` (T40, T41 `0x130A0000`, `sample_bus_monitor`, IRQ `53`)**: Implements 6 AXI channels (`0..4, 6` at `0x100` stride) plus AHB channel `5` (`0x500`) with `INT_STA`, `INT_MASK`, and `INT_CLR`. Advances virtual cycles at `clock-hz` (`300 MHz`) to raise `TIME_SLOT_REACH` (`traffic` and `watch` counters stay `0`).
+
+---
+
 ## Tested
 
-| Image | Machine | Path | Result |
-|---|---|---|---|
-| OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` | own | `-kernel` + NOR root; flash (release SPL + U-Boot) | login, DHCP lease, U-Boot environment and JFFS2 overlay written back (`test-ingenic-boot.sh`) |
-| OpenIPC `t40`, two boots through the watchdog | `t40` | `-kernel` + NOR root, `test-ingenic-eth-reboot.sh` | `reboot -f` keeps eth0; `reboot` (ifdown: PHY powered down) loses it, SWR timeout as in firmware#2839; with `--phy-rst-gpio 71` both keep it |
-| T41LQ / NQ / XQ SDK 1.2.0 full images (8 and 16 MiB) | `t41,variant=t41lq/nq/x`, 64 / 128 / 256 MiB | flash | SPL (DDR test in cache-as-RAM), U-Boot, kernel on two cores, `Ingenic-uc1_1 login:`, telnet over the GMAC, the vendor `carrier-server` with `sensor=gc4663` and its RTSP H.265 stream pulled and decoded, `reboot` through the watchdog back to login (`test-ingenic-sdk-boot.sh`) |
-| T40N / T40XP SDK 1.2.0 full images (glibc and uClibc, 8 and 16 MiB), T30X SDK 1.0.5 | `t40,variant=t40n/t40xp` (`sensor=gc2053`), `t30,variant=t30x` | flash | the same boot, telnet and reboot cycle; on T40 `carrier-server` streams 1080p H.265 over RTSP through the IPU and AVPU; 20 pulled frames show the ISP scene (`test-ingenic-sdk-boot.sh`: the bitstream is copied off RTSP and decoded afterwards -- decoding 1080p while pulling falls behind, and live555 then drops RTP packets, a lost P picture; the app's timestamp OSD covers the counter's top row, so the counter is read from its other four) |
-| T10 camera (APK-Link) | `t10` | flash | vendor U-Boot, kernel, login, the camera application |
-| T20 camera (Jabsco) | `t20` | flash | login |
-| T21 cameras (Jabsco, CamHi) | `t21` | flash | login, the application (whose watchdog then reboots it) |
-| T31 cameras, Wyze Cam v3 | `t31` | flash | login, the ISP driver probes, DHCP lease |
-| OpenIPC `t31` + vendor modules, `sensor=gc2053` | `t31` | `-kernel` + NOR root | 1920x1080 and 640x360 NV12 frames through libimp's FrameSource (`test-ingenic-isp.sh`) |
-| OpenIPC `t21` + vendor modules, `sensor=jxf37` | `t21` | `-kernel` + NOR root | the same, DVP (`test-ingenic-isp.sh --soc t21`) |
-| OpenIPC `t23` + vendor modules, `sensor=gc2053` | `t23` | `-kernel` + NOR root | the same (`test-ingenic-isp.sh --soc t23`) |
-| OpenIPC `t23` + the T23 SDK's double firmware (`tx-isp-t23-double`), its `gc2053` / `gc2053s1` modules and `libimp.a` | `t23,sensor=gc2053,sensor1=gc2053s1` | `-kernel` + NOR root, `test-ingenic-t23-enc.sh --sensor1 gc2053s1` | one pipe takes the two sensors in turn: four H.264 streams (each sensor's 1080p and 640x360), every picture decoded, each showing its own sensor's scene; both sensors' AE run |
-| OpenIPC `t20` + vendor modules, `sensor=jxf22` | `t20` | `-kernel` + NOR root | the same, through the Apical core's DMA writers (`test-ingenic-isp.sh --soc t20`) |
-| OpenIPC `t40` + vendor modules, `sensor=gc4653` | `t40 -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t40`) |
-| OpenIPC `t31` / `t40` + vendor modules, `sensor=gc4653`; T41NQ SDK image, `gc4663`; the sensors' DOL WDR | `t31 -m 128M` / `t40` / `t41` | as above | frames in the WDR mode, the short exposure written (T40, T41: moving), under 2 % of the last frame clipped (`test-ingenic-isp.sh --wdr`) |
-| OpenIPC `t40` + vendor modules + the SDK's `sensor_gc4653s1_t40.ko`, two sensors | `t40,sensor=gc4653,sensor1=gc4653 -m 256M` | `-kernel` + NOR root | libimp in the all-cached dual mode: channel 0 (pipe 0) and channel 3 (pipe 1) at 2560x1440, 40 frames each, both pipes' AE converging on their own sensors, the scene and counter checked per pipe (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653`) |
-| OpenIPC `t40` + vendor modules + the gc4653 "s1" module twice (as `s1` and `s2`), three sensors | `t40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653 -m 256M` | `-kernel` + NOR root | libimp with `IMPISP_TOTAL_THR`, the third on VIC2 / DVP: both pipes' frames as above, VIC2 interrupting; the `snapraw` command while streaming saves `/tmp/snap0.raw` (2560x1440 x 2 bytes, an RGGB mosaic of the navy scene: R 186, G 216, B 335 on average) through the VIC MDMA (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --sensor2 gc4653 --snap-env SNAP_SNAPRAW=0_1`) |
-| T41NQ SDK 1.2.0 image + its modules, `sensor=gc4663` | `t41,variant=t41nq -m 128M` | `-kernel` + NOR root | 2560x1440 and 640x360 (`test-ingenic-isp.sh --soc t41`) |
-| the same, HLDC parameters through `/dev/tisp`, the bypass cleared through libimp | `t41,variant=t41nq`; `t40` (`--soc t40 --ldc 200,40`) | as above | the corrected frames match the uncorrected ones remapped on the host from the registers (`test-ingenic-isp.sh --soc t41 --ldc 200,40`) |
-| OpenIPC `t40` + vendor modules, two gc4653, libimp's joint mode | `t40,sensor=gc4653,sensor1=gc4653` | as above | 2560x2880 on channel 0, the main sensor's part with pipe 0's counter and the secondary's with pipe 1's, above and under (`test-ingenic-isp.sh --soc t40 --sensor1 gc4653 --joint 3`, `4`) |
-| OpenIPC `t10` + vendor modules, `sensor=jxh62` | `t10` | `-kernel` + NOR root | 1280x720 and 640x360, the sensor on bit-banged I2C (`test-ingenic-isp.sh --soc t10`) |
-| T40XP camera | `t40 -m 256M` | flash | login, the vendor application starts |
-| OpenIPC `t40` + its majestic (or `--majestic BIN`), vendor modules, `sensor=gc4653` | `t40,variant=t40n -m 128M` | `-kernel` + NOR root, `test-ingenic-majestic.sh [--audio]` | majestic starts the SDK (with the microphone on: `--audio`); a light sensor on PB17 switches it to night and back, and the switch to night writes about 980 ISP core registers the day did not (`ingenic-isp.trace-regs`) |
-| U-Boot `isvp_t31_sfcnand` (+ patch), 3.10 with `MTD_JZ_SFC_NAND`, UBI, OpenIPC t31 rootfs | `t31` | SPI NAND (`w25n01gv`) | SPL, U-Boot saves its env, UBI, SquashFS root on ubiblock, UBIFS overlay, login; a file written persists (`test-ingenic-nand.sh`) |
-| Vendor U-Boot `isvp_t41n_sfc0_nand`, SDK 4.4 `isvp_tomcat_nand_defconfig` (+ UBI_BLOCK, cmdline from U-Boot), OpenIPC t40 rootfs as UBIFS | `t41` | SPI NAND (`gd5f1gq4ub` with OOB) | SPL, U-Boot, the 4.4 driver by command table + descriptor DMA, UBIFS root, login; a file written persists (`test-ingenic-nand.sh --soc t41`, `maxcpus=1`) |
-| OpenIPC `t40` / `t31` + their libimp.so, `sensor=gc4653` / `gc2053` | `t40` / `t31` | NOR root, `test-ingenic-avpu.sh` | 2560x1440 (T40) or 1920x1080 (T31) + 640x360: 10 H.264 and 10 H.265 pictures and a JPEG per channel, all decoded with `-err_detect explode` and checked against the ISP's scene |
-| T41NQ SDK image + SDK 1.2.0 `libimp.a`, `sensor=gc4663` | `t41,variant=t41nq` | `-kernel` + NOR root, `test-ingenic-avpu.sh --soc t41` | the same at 2560x1440 + 640x360, through the gen 2 AVPU |
-| OpenIPC `t31` + SDK 1.1.5 `sample-Encoder-video` / `-jpeg` (static, `libimp.a`), `sensor=gc2053` | `t31` | `-kernel`, `init=/bin/sh`, vendor modules by hand | 20 frames (150 for main profile) of 1920x1080 + 640x360 H.264 (baseline, main, high) and H.265, 1080p and 360p JPEG snapshots; all decode with ffmpeg without errors |
-| OpenIPC `t30` + the T30 SDK's `tx-isp-t30.ko`, `sensor=ov2735b` | `t30` | `-kernel` + NOR root | 1920x1080 and 640x360 (`test-ingenic-isp.sh --soc t30 --isp-ko ...`) |
-| T30X SDK 1.0.5 full image (8 MiB), `sensor=jxf22` | `t30,variant=t30x -m 128M` | flash, user net | vendor kernel and modules, sample-RTSPServer: /main 1920x1080 and /second 640x360 H.265 over RTSP/TCP, 200 pictures each decoded without errors, the scene and the IPU's timestamp OSD (`test-ingenic-t30-rtsp.sh`) |
-| OpenIPC `t20`, `t21`, `t23`, `t30` libimp | own | `-kernel`, `test-ingenic-vpu-feed.py` | libimp's H.264 (fixed QP; CBR on T21/T23/T30) and JPEG encoders, T30's H.265: streams ffmpeg decodes with `-err_detect explode`, PSNR against the source picture |
-| OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` (their `audio.ko`) / T41NQ SDK image (its `audio.ko`) + SDK `libimp.a` | own / `t41,variant=t41nq`, `audiodev=` wav | `-kernel` + NOR root, `test-ingenic-audio.sh --soc <soc>` | IMP_AI records 16 kHz mono: the 1 kHz tone on all eight (FFT peak 1000.0 Hz; rms 5793, 11585 on T10, T20, T30); IMP_AO plays a 440 Hz sine: 2.00 s of it in the wav (peak 440.0 Hz) on all eight, T21 included (6 runs alone; an earlier 1.08 s on T21 did not come back -- the driver's flush (`dsp_ioctl_flush_ao_stream`) zeroes whatever is still queued, so a guest that falls behind on a loaded host plays less); `--rate 8000 --play-rate 16000` (two clocks): 440.0 Hz on T10, T23, T31, T40 |
-| OpenIPC `t40` / T41NQ SDK image, `--gains AI:AO` (IMP_AI_SetGain, IMP_AO_SetGain) | `t40` / `t41,variant=t41nq` | `test-ingenic-audio.sh --soc t40 --gains 12:20`, `--soc t41 --gains 27:28` | the codec's analogue gains: T40 records the tone at -6.0 dB (rms 2903 of 5793) and plays at -6.0 dB (4242 of 8464); T41 records at -6.0 dB (2903) and plays at +6.0 dB (16889 of 8464) |
-| OpenIPC `t40`, `audio.ko dmic_enable=1` + T40 SDK `libimp.a` | `t40` | `test-ingenic-audio.sh --soc t40 --dmic` | IMP_DMIC records 16 kHz: the DMIC's 1.5 kHz tone (peak 1500.0 Hz, rms 5793); with QEMU's TLB shadow entries on, 5 of 12 runs failed (see CPUs), without them 24 consecutive runs pass |
-| T41NQ SDK image, `audio.ko dmic_enable=1` + T41 SDK `libimp.a` | `t41,variant=t41nq` | `test-ingenic-audio.sh --soc t41 --dmic` | IMP_DMIC records 16 kHz through T41's own audio system DMA: the 1.5 kHz tone (peak 1500.0 Hz, rms 5793) |
-| T40N / T41NQ SDK images, their kernels' `ingenic_drawbox` and `ingenic_i2d` | `t40` / `t41` | flash, `test-ingenic-xb2blocks.sh --image` | a client draws a rectangle and a line through `/dev/dbox` and rotates a 320x192 NV12 picture 90 degrees through `/dev/i2d`: every pixel checked in the guest |
-| T41NQ SDK image, its kernel's `ingenic_aip` + magik-toolkit `libaip.a` | `t41` | flash, `test-ingenic-aip.sh --image` | the library's own bs_* calls: NV12 640x360 -> 320x180 within 0.8 of the ramps sampled at half-pixel positions, a two-box chain, NV12 -> BGRA / RGBA / ARGB matching BT.601 exactly, affine and perspective warps moving a square where the forward matrix sends it with the pad value outside |
-| T40N SDK image, its kernel's `ingenic_bscaler` + magik-toolkit nna1 `libvenus.a` (its BSCALER objects) | `t40` | flash, `test-ingenic-bscaler.sh --image` | the library's own bs_* calls: BGRA 64x32 -> 32x16 and a many-tile 32x16 -> 160x80 within 0.7 of the ramps at half-pixel positions, NV12 256x128 -> 128x64 (both planes) within 0.7, NV12 -> BGRA / RGBA / ARGB resizes and the T unit's NV12 -> BGRA / RGBA matching BT.601 exactly, affine and projective perspective warps moving a square where the forward matrix sends it with the pad value outside |
-| OpenIPC `t40` + its `soc-nna.ko`, a client with magik-toolkit nna1 `libvenus.a`'s `dma_func` | `t40` | `-kernel` + NOR root, `test-ingenic-nna.sh` | the version ioctl; libvenus's `w_d2o_orasetrun` moves two blocks DDR -> ORAM (waited with `rdhwr $9`), write channel 0 moves them back (`rdhwr $11`), byte for byte; `rdhwr $4` after an `ll` gives its physical address |
-| T41NQ SDK image + SDK `libimp.a`, `--osd` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --osd` | an IMP_OSD rectangle and line on channel 0, drawn by the DRAWBOX (its interrupt counts) and found in the decoded H.264 at their places and colours |
-| T41NQ SDK image + SDK `libimp.a`, `--ivpu` | `t41,sensor=gc4663` | `test-ingenic-avpu.sh --soc t41 --codecs jpeg --ivpu` | JPEG channels with `IMP_ENC_TPYE_IVPU` on the HELIX JPEG engine through `/dev/soc_vpu`: 2560x1440 and 640x360 pictures decode cleanly and show the scene |
-| `t41` / `t40` qtest | `t41`, `t40` | `test-ingenic.py` `test_dpu` | the DPU composes an RGB565 background, a half-transparent ARGB8888 square and an NV12 layer scaled 2x onto the display (screendump pixels), raises CMP_START / layer ends / CMP_END / DISP_END on IRQ 20, stops on the descriptor's stop bit, loops a chain and ends it with a general stop |
-| `t31` / `t41` qtest | `t31`, `t41`, `t31,sensor=gc2053` | `test-ingenic.py` `test_hash_cpu`, `test_i2c_dma`, `test_sadc_dma` | the HASH engine fed by HSDI gives hashlib's MD5, SHA-1/224/256/384/512 for one- and multi-block messages, with round and all-rounds done; the GC2053's ID read and a register write by PDMA through I2C0 (requests 0x24 / 0x25), the RX request waiting for DMARDLR + 1 bytes; the SADC's continuous scans landing in a PDMA ring as AUX1:AUX0 / AUX3:AUX2 words (request 9) -- CPU mode and the SADC's DMA inferred, see above |
-| OpenIPC `t31` + the T31 SDK's `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des` (built against the same kernel) | `t31` | `-kernel` + NOR root, `test-ingenic-crypto.sh` | AES-128 ECB and CBC (FIPS-197, SP 800-38A) and back; MD5, SHA-1/224/256/384/512 equal hashlib's; RSA-1024/2048 random vectors and the sample's own `test_rsa.h` decryptions; DTRNG words by polling and by interrupt; DES ECB of FIPS 46's example by the CPU (85e813540f0ab405), the same as triple DES with equal keys by the PDMA, and a 4 KiB triple-DES CBC round trip |
-| OpenIPC T31 kernel with `CONFIG_SERIAL_JZ47XX_UART0_DMA` + the release's root | `t31`, UART0 on a socket | `-kernel` + NOR root, `test-ingenic-uart-dma.sh --kernel` | 32 KiB of random bytes in on ttyS0 by the PDMA (32 full 1 KiB buffers, 3 of 3 runs) and back out by it, both intact |
-| OpenIPC `t21` + `ingenic-isp`, jxf37 | `t21,sensor=jxf37` | NOR root, `test-ingenic-vpu-e2e.sh` | vendor modules, FrameSource -> IMP_Encoder: H.264 CBR and a JPEG snapshot, decoded on the host |
-| OpenIPC `t23` / `t30` + the T23 / T30 SDK's libimp.a (`IMP_Decoder`) | `t23` / `t30` | NOR root, `test-ingenic-jpegd.sh --soc t23\|t30 [--jpeg FILE]` | 640x480 and 1280x720 JPEGs from ffmpeg and the snapshot libimp encoded on T21 (`test-ingenic-vpu-e2e.sh`, 640x360): Y 80.8, 81.6 and 70.5 dB against ffmpeg's decode (the snapshot above its partial last macroblock row) |
-| OpenIPC T31 / T40 kernel (MSC1 enabled) + the vendor `atbm_wlan` driver, `wpa_supplicant` | `t31,wifi=atbm` / `t40,wifi=atbm`, `wifi-psk=` | `test-ingenic-wifi.sh [--soc t40] [--psk P [--wrong-psk]]` | SDIO enumeration, firmware download, `wlan0`, association to the open or WPA2-PSK access point (4-way handshake, installed keys equal to the TK and GTK), DHCP 10.0.2.15, ping; a wrong passphrase is refused at message 2 |
-| the same, the access point's options | `-global atbm-sdio.proto= / cipher= / pmf= / rekey=` | `test-ingenic-wifi.sh --psk P --cipher tkip`, `--proto wpa --cipher tkip --rekey 10`, `--pmf required`, `--rekey 10`, `[--psk P] --powersave` | RSN/TKIP and WPA1/TKIP associate with the driver's TKIP keys matching, DHCP and ping (the station's Michael checks the model's); 3 rekeys with the GTK installed under alternating key IDs and the station still pinging; under PMF the IGTK installed and matching; power save: the driver sets the chip to mode 0x81 and traffic flows |
+### Boot and flash persistence
 
-`python3 qemu/tests/test-ingenic.py` checks the models at register
-level under qtest (no guest), including a migration round trip of `t31`,
-`t41` and a three-sensor `t40`, and the image pipeline: the GC2053's ID on I2C0, the VIC
-poll, the MSCA FIFOs and a frame painted into a queued buffer under
-`clock_step`, on T31 and through the T21, T23, T40 and T41 layouts,
-T40's second pipe on its own and beside the first (VIC1 on INTC 29,
-channel 3, its AE banks, its counter 500000 ahead), its VIC MDMA (two
-raw frames into buffers 0 and 1, 0x380, the count, status2 bit 0, the
-RGGB mosaic) and VIC2 (frame done on INTC 28), and
-on T20 and T10 the Apical slots, a DMA writer's bank and a dropped frame;
-and sound: a PDMA memory copy with its interrupt, a cyclic record ring
-filled with the tone at 16 kHz and a play ring drained at that rate,
-the DMIC's packed samples on request 13, its FIFO filling without
-DMA and its voice trigger (modes 0 and 2, rearm, silence), the AIC playing at the CPM's 48 kHz speaker clock over the codec's
-16 kHz, and the T31 codec's record gain and switches; the SSI (READ ID from a
-`w25q80` by PIO, the underrun interrupt, 300 frames looped back through
-the PDMA), the UART's DMA mode (two 32-byte bursts by the PDMA, an 8-byte
-tail for the receive timeout with IER bit 4 alone, PIO reads of it),
-AES / HASH / RSA / DTRNG against FIPS-197, SP 800-38A, hashlib and pow(),
-and the TCU's PWM pins.
+| Image / Configuration | Target & Path | Result |
+|---|---|---|
+| OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` | Own machine, `-kernel` + NOR & flash (`test-ingenic-boot.sh`) | Login, DHCP lease, U-Boot environment, and JFFS2 overlay persist across boots; `--reset` verifies fast warm reboot (`ingenic_tb_reset`) |
+| OpenIPC `t40` PHY power-down on reboot | `t40`, `test-ingenic-eth-reboot.sh` | `reboot -f` keeps `eth0`; `reboot` reproduces `firmware#2839` SWR timeout; `--phy-rst-gpio 71` (with `--expect-fixed`) keeps `eth0` across both |
+| OpenIPC T31 SPI NAND (`w25n01gv`) | U-Boot `isvp_t31_sfcnand` (+ patch), Linux 3.10 (`MTD_JZ_SFC_NAND`), UBI, `test-ingenic-nand.sh` | SPL, U-Boot environment save, UBI SquashFS `ubiblock` root, UBIFS overlay, and login; written files persist on reboot |
+| OpenIPC T41 SPI NAND (`gd5f1gq4ub` with OOB) | Vendor `isvp_t41n_sfc0_nand`, SDK 4.4 `isvp_tomcat_nand_defconfig` (+ `UBI_BLOCK`, `maxcpus=1`), `test-ingenic-nand.sh --soc t41` | SPL, U-Boot, Linux 4.4 CDT + descriptor DMA, UBIFS root, and login; written files persist on reboot |
+| Vendor SDK 1.2.0 (`t41lq`, `t41nq`, `t41xq`; `t40,variant=t40n/t40xp`) & 1.0.5 (`t30,variant=t30x`) | Full 8 / 16 MiB flash (`-m 64M`/`128M`/`256M`), `test-ingenic-sdk-boot.sh` | Dual-core 4.4 boot (`t40`/`t41`), `Ingenic-uc1_1 login:`, telnet over GMAC, `carrier-server` H.265 RTSP scene (`gc4663`/`gc2053`, 20 frames copied before host decode; counter read from bottom four rows beneath OSD), WDT reboot back to login |
+| Camera dumps (`t10` APK-Link, `t20` Jabsco, `t21` Jabsco/CamHi, `t31` Wyze Cam v3, `t40xp`) | Own machine, `flash` (`t40xp` `-m 256M`) | Vendor SPL -> U-Boot -> kernel -> login -> app start / ISP probe / DHCP (`t21` WDT reboots cleanly) |
+
+### Networking and Wi-Fi
+
+| Image / Configuration | Target & Path | Result |
+|---|---|---|
+| ATBM6031 SDIO (`t31`, `t40`, open & `wifi-psk=`) | `test-ingenic-wifi.sh [--soc t40] [--psk P [--wrong-psk]]` | SDIO enumeration, firmware download, `wlan0`, 4-way handshake with TK/GTK verification, DHCP `10.0.2.15`, ping; wrong PSK rejected at message 2 |
+| ATBM6031 AP modes (`wpa`, `tkip`, `pmf`, `rekey`, `powersave`) | `-global atbm-sdio.proto= / cipher= / pmf= / rekey=` | RSN/TKIP and WPA1/TKIP (station Michael MIC checked), 3x alternating GTK rekeys, PMF IGTK verified, power-save mode `0x81` traffic |
+| ATBM6441 IoT SDIO (`t31`) | `test-ingenic-wifi-6441.sh` | `0x6441` MAC/DHCP/ping/TCP fetch, `/dev/atbm_ioctl` AT command round-trip, `rmmod`/`insmod` reload |
+| ATBM6012B-X USB (`t31_ultimate`) | `test-ingenic-wifi-usb.sh` | `atbm6012b_wifi_usb.ko` joins open/WPA2-PSK (`10.0.2.15`, ping/TCP); `atbm603x_wifi_usb.ko` (`atbm60xx`) ignores `0x888b` as reported |
+
+### Image pipeline, WDR, HLDC and multi-sensor
+
+| Image / Configuration | Target & Path | Result |
+|---|---|---|
+| Single-sensor ISP (`t10`..`t41`, `t30` + SDK `tx-isp-t30.ko`) | Respective sensors (`jxh62`, `jxf22`, `jxf37`, `gc2053`, `ov2735b`, `gc4653`, `gc4663`) | `test-ingenic-isp.sh`: 1080p/1440p/720p and 360p NV12 frames with advancing counter, logo, and moving dot (bit-banged I2C on `t10`) |
+| DOL WDR (`t31 -m 128M`, `t40`, `t41`, `--wdr`) | `gc4653`, `gc4663`, `test-ingenic-isp.sh --wdr` | Short exposure active and converging; logo clipping under `2%` (`0.4%` vs `7.5%`) |
+| T41 & T40 HLDC (`--soc t41 --ldc 200,40`, `--soc t40 [--sensor1] --ldc`) | `/dev/tisp` + libimp bypass clear | Corrected frames match host remap (`95%` T41 vs `157` levels, `100%` T40 vs `111`, `95%` dual-pipe `ch0`+`ch3`) |
+| T40 2- & 3-sensor + `snapraw` + Joint | `sensor1=gc4653`, `sensor2=gc4653`, `--snap-env SNAP_SNAPRAW=0_1`, `--joint 3` / `4` | Dual `2560x1440` AE convergence, `VIC2` IRQ, `/tmp/snap0.raw` (`2560x1440x2` RGGB mosaic), `2560x2880` vertical joint |
+| T23 `direct_mode` & Dual-sensor | `tx-isp-t23-double`, `gc2053s1`, `test-ingenic-t23-enc.sh` | `--direct 1` (`~100` IVDC frames); `--sensor1 gc2053s1` (4 H.264 1080p/360p streams, counters `0..` & `500000..`); `--direct 2` (ch0 + sub-streams) |
+
+### Video encoders, decoders and RTSP
+
+| Image / Configuration | Target & Path | Result |
+|---|---|---|
+| `ingenic-vpu` (`t20`, `t21`, `t23`, `t30`) | `test-ingenic-vpu.py`, `test-ingenic-vpu-feed.py`, `test-ingenic-vpu-e2e.sh` | Register-level, reverse-TLB, FrameSource, and `libimp` H.264/HEVC/JPEG passes; P-slice motion (`~1/50` I_PCM); `ffmpeg -err_detect explode` PSNR verified |
+| JPEG decode (`t23`, `t30`) | `test-ingenic-jpegd.sh --soc t23` / `t30 [--jpeg FILE]` | `640x480`, `1280x720`, and T21 `640x360` snapshots decoded (`80.8`, `81.6`, `70.5 dB` Y PSNR against `ffmpeg`) |
+| `ingenic-avpu` (`t31`, `t40`, `t41`) + SDK 1.1.5 manual boot | `test-ingenic-avpu.py`, `test-ingenic-avpu.sh [--osd] [--ivpu]`, `init=/bin/sh` | CAVLC/CABAC/multi-slice/B-frame H.264, I/P/B HEVC, JPEG, T41 gen2, `IMP_OSD` DRAWBOX, standalone HELIX JPEG (`--ivpu`), SDK `sample-Encoder-video`/`-jpeg` (`init=/bin/sh`), bit-exact `rec` match (`41-43 dB`) |
+| T30X SDK live RTSP + OSD | `t30,variant=t30x -m 128M`, `jxf22`, `test-ingenic-t30-rtsp.sh` | `sample-RTSPServer` `/main` 1080p & `/second` 360p H.265 over RTSP/TCP, 200 decoded frames each with scene and IPU timestamp OSD |
+
+### Audio, digital twin, NNA, display and crypto
+
+| Image / Configuration | Target & Path | Result |
+|---|---|---|
+| OpenIPC `majestic` on T40 digital twin | `t40n`, `gc4653`, `test-ingenic-majestic.sh [--audio]` | Mic starts cleanly (`#257`); `PB17` day/night toggles write ~980 new ISP night registers vs 8–15 drift (`#258`) |
+| AIC audio (`t10`..`t41`), gains & DMIC (`t40`, `t41`) | `test-ingenic-audio.sh --soc <soc> [--gains AI:AO] [--dmic]`, `--rate 8000 --play-rate 16000` | `1000.0 Hz` record (`rms 5793`; `11585` T10/T20/T30); `2.00 s` `440.0 Hz` play (T21 `6/6` alone; `dsp_ioctl_flush_ao_stream` truncated an earlier `1.08 s` loaded run); T40 `-6.0/-6.0 dB` (`2903`, `4242/8464`), T41 `-6.0/+6.0 dB` (`2903`, `16889`); DMIC `1500.0 Hz` (`24/24` without TLB shadows vs `5/12` failures with them) |
+| Drawbox & I2D (`t40`, `t41`) | `ingenic_drawbox`, `ingenic_i2d`, `test-ingenic-xb2blocks.sh --image` | Draws rectangle/line through `/dev/dbox` and rotates `320x192` NV12 90 degrees through `/dev/i2d` (every pixel checked) |
+| AIP & BSCALER (`t41`, `t40`) | `ingenic_aip` + `libaip.a` (`test-ingenic-aip.sh`), `ingenic_bscaler` + nna1 `libvenus.a` (`test-ingenic-bscaler.sh`) | `bs_*` calls: AIP `640x360->320x180` (`< 0.8`), 2-box chain, BT.601, warps; BSCALER `64x32->32x16`, `32x16->160x80`, `256x128->128x64` (`< 0.7`), warps |
+| NNDMA (`t40`) | `soc-nna.ko` + `libvenus.a` `dma_func`, `test-ingenic-nna.sh` | Version ioctl; `w_d2o_orasetrun` moves DDR<->ORAM verified byte-for-byte with `rdhwr $9`/`$11` plus `ll; rdhwr $4` translation |
+| UART0 PDMA loopback (`t31`) | `CONFIG_SERIAL_JZ47XX_UART0_DMA`, `test-ingenic-uart-dma.sh --kernel` | 32 KiB random TX/RX loopback via 1 KiB PDMA buffers intact across `3/3` runs |
+| Crypto & RNG (`t31`) | `sample_aes`, `sample_hash`, `sample_rsa`, `sample_dtrng`, `sample_des`, `test-ingenic-crypto.sh` | `AES-128` ECB/CBC (FIPS-197, SP 800-38A); HASH vs `hashlib`; `RSA-1024/2048` (`test_rsa.h`); DTRNG polled/IRQ; DES FIPS 46 (`85e813540f0ab405`) + 4 KiB 3DES CBC PDMA |
+| Qtest suite (`python3 qemu/tests/test-ingenic.py`) | No guest (`qtest`, `t31`/`t41`/3-sensor `t40` migration) | ISP/VIC/MSCA across layouts (`clock_step`); T40 dual pipe, `VIC_MDMA` (`0x380`, `status2` bit `0`, RGGB), and `VIC2`; T10/T20 Apical; DPU (`test_dpu`); HASH CPU (`test_hash_cpu`); I2C PDMA (`test_i2c_dma`); SADC continuous PDMA (`test_sadc_dma`); PDMA/AIC/DMIC triggers/SSI `w25q80`/UART DMA/AES/RSA/DTRNG/TCU PWM |
+
+---
 
 ## Not modelled
 
-Recording past the first second with the OpenIPC `t40` release's own
-`audio.ko` and `libimp.so` (majestic, 8 kHz): after about fifty 20 ms
-frames the driver prints `get mic timeout!` and `Error: Not Find any
-irq` and libimp's record thread ends; the `pdma` and `pdmam`
-interrupts stay at 0.
+These features and blocks remain unimplemented (reads return zero or register blocks act as storage):
 
-The SDIO Wi-Fi chip (`atbm-sdio`): open, WPA2 and WPA1 with CCMP or TKIP,
-PMF and group rekeying are modelled; not WPA3-SAE (the guests'
-`wpa_supplicant` builds have no SAE code -- the `sae_*` options parse but
-nothing implements them -- so the access point side could not be
-exercised; no SAE test vectors are at hand to check one against), 802.1X /
-EAP (the same builds have no EAP methods, and an authentication server
-is out of scope), BIP (the access point sends no group-addressed robust
-management frame) or the chip's BLE side.  The SA Query answer is in but
-untested: no guest exercise makes the station send one.  `wifi=atbm`
-puts it on MSC1 of every machine, tested end to end on T31 (jzmmc) and
-T40 (SDHCI); the Xiongmai machines' USB `atbm-wifi` shares the access
-point's code and options.
-
-T30's ISP streaming with OpenIPC's own `tx-isp-t30.ko` (it never sets
-its Apical base; above), the left / right joins of T40's joint mode
-(past the scaler's limit with these sensors) and the VIC raw frame
-channel (above), a WDR mode on T23 (no modelled sensor
-has one there), the Apical DIS's motion vectors (zero: no motion), the
-SSI slave (no driver, sample or register map in any tree here; above),
-the trigger of T41's audio-system DMIC and the DMIC trigger modes other
-than 0 and 2, the DPU's TLB retry / verification registers
-(storage), T41's LDC block (below), the second sensor's main stream in
-T23's double direct mode (`direct_mode=2`: libimp queues it no buffer;
-above)
-and the blocks below read as zero or as storage.
-
-What the remaining video and compute blocks would need (survey of the
-T40/T41 SDK kernels, drivers and libimp):
-
-- T41's LDC block (0x13040000, `ingenic,t41-ldc`, core INTC 35):
-  `tx-isp-t41.ko` (H20230630a) registers it as a platform device
-  (`tx-isp-ldc.c`: resource, clocks `div_ldc` / `gate_ldc`, pads) but no
-  code programs it; `IMP_ISP_LDC_INIT` / `IMP_ISP_LDC_SetAttr` and their
-  `IMPISPLDCParams` (`LDC_ADDR_RES_SIZE`, `X_CORF`, `BROCF`, `R2_REP`,
-  `LEN_COEF`, shift tables, per the SDK's `ldclut.h`) are for an
-  "LDC-Beta" ISP build (`sample-Encoder-ldc-video.c`) that no SDK here
-  ships, so the block has no driver and no register offsets. The ISP's
-  own HLDC (above) is modelled.
-
-- The NCU of T10, T20 and T30 (0x13090000): the denoise front end
-  `jz_nvpu` programs with the VPU when libimp asks for it, polling
-  nothing (`jz_ncu.h`); the VPU raises the completion, so storage passes
-  the picture through un-denoised. (T31's base.h keeps a MONITOR_IOBASE
-  at 0x130F0000 marked "T31 delete"; the T31 SDK's `sample_bus_monitor`
-  is T40's driver, `t40-irq.h` and all, so no T31 bus monitor is
-  mapped.)
-- The NNA's compute of T40/T41: libvenus runs a network on the CPU, with
-  MXU3 vector instructions and Ingenic's own coprocessor-2 instructions
-  that feed the multiply-accumulate array from ORAM. The NNA DMA, the ORAM
-  and the hardware registers are modelled (above); those instructions
-  are not: the toolchain's libopcodes knows none of them and nothing
-  public here documents them -- 57 opcode classes (by the COP2 rs field
-  and function), 121881 instructions in the T40 build of libvenus and
-  48450 in the T41 one. Until they are, a network's first NNA instruction
-  raises Reserved Instruction (SIGILL).
-- The RISC-V core of T40/T41 (the "LEP"; T41 CCU at 0x12A00000): no
-  driver, firmware or library here starts it; it would need a RISC-V CPU
-  beside the MIPS ones and firmware these SDKs do not ship.
+- **T40 `audio.ko` capture past 1 second**: Using OpenIPC `t40`'s release `audio.ko` and `libimp.so` (`8 kHz`), capture records ~50 x `20 ms` frames before `pdma` and `pdmam` interrupts stay `0`, causing `get mic timeout!` and `Error: Not Find any irq`.
+- **Wi-Fi (`atbm-sdio`, `atbm-wifi`)**:
+  - *WPA3-SAE & 802.1X/EAP*: Guest `wpa_supplicant` builds parse `sae_*` options without SAE code (and lack EAP methods); no SAE test vectors or auth server exist here.
+  - *BIP / SA Query / BLE*: No group-addressed robust management frames are sent, station SA Query handling is implemented but untested, and BLE is unmodelled (`wifi=atbm` attaches on MSC1 across all machines, tested end-to-end on T31 and T40).
+- **ISP & VIC gaps**: OpenIPC's broken `tx-isp-t30.ko` (uninitialized `apical_io_base`), T40 left/right horizontal split-joint (`>3840` scaler width), VIC raw frame channel `ispvic_frame_channel_qbuf`, T23 WDR (no WDR T23 sensor modelled), Apical DIS non-zero motion vectors, and T23 `direct_mode=2` sensor 1 main stream (`framesource 3`, never queued by `libimp`).
+- **Peripheral gaps**: SSI slave (`0x10040000`, no driver, sample, or PDF register map in any SDK tree), trigger logic on T41 ASDMIC and `ingenic-dmic` trigger modes other than `0`/`2`, and DPU TLB retry/verification registers (storage).
+- **Remaining T40/T41 video and compute blocks (SDK 4.4 / `libimp` survey)**:
+  - **T41 LDC block (`0x13040000`, `ingenic,t41-ldc`, core INTC `35`)**: `tx-isp-t41.ko` (`H20230630a`, `tx-isp-ldc.c`) probes its resource, `div_ldc`/`gate_ldc` clocks, and pads without register programming; `IMP_ISP_LDC_INIT` / `IMP_ISP_LDC_SetAttr` / `IMPISPLDCParams` (`LDC_ADDR_RES_SIZE`, `X_CORF`, `BROCF`, `R2_REP`, `LEN_COEF`, `ldclut.h`) target an unshipped `"LDC-Beta"` (`sample-Encoder-ldc-video.c`) build. (ISP HLDC is modelled.)
+  - **NCU of T10/T20/T30 (`0x13090000`) & T31 bus monitor**: `jz_nvpu` configures `jz_ncu.h` alongside VPU runs without polling; storage passes frames through un-denoised. T31 `base.h` marks `MONITOR_IOBASE` (`0x130F0000`) `"T31 delete"`, and its `sample_bus_monitor` reuses T40 `t40-irq.h`, so no T31 bus monitor is mapped.
+  - **T40/T41 NNA compute instructions**: While ORAM and NNDMA are modelled, `libvenus` executes neural networks with proprietary coprocessor-2 (`COP2`) MAC instructions (`57` opcode classes by `rs`/function; `121881` instructions in T40 `libvenus`, `48450` in T41) undocumented in public toolchain `libopcodes`. Executing one raises Reserved Instruction (`SIGILL`).
+  - **T40/T41 RISC-V co-processor (`LEP`, T41 CCU `0x12A00000`)**: No SDK here includes firmware, drivers, or libraries to start it.
