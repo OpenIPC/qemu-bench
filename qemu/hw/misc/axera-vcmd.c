@@ -394,6 +394,8 @@ struct AxeraVcmdState {
         bool h264_api_hdr;      /* h264 holds the API's own SPS/PPS */
         HevcEncRef *hevc_ref;
         uint32_t hevc_poc;
+        HevcEncHdr hevc_hdr;
+        bool hevc_api_hdr;      /* hevc_hdr holds the API's VPS/SPS/PPS */
         uint32_t frames;
     } streams[AXERA_VCMD_STREAMS];
     uint32_t enc_jobs;
@@ -676,6 +678,47 @@ static bool axera_vcmd_h264_api_headers(AxeraVcmdState *s, uint32_t *reg,
     return false;
 }
 
+/*
+ * The same for HEVC: the VPS, SPS and PPS the API wrote in front of an IDR
+ * job's output (AX620E main: 27/50/11 bytes) -- the ones the SDP's
+ * sprop-vps/sps/pps carry. Seen on the Xiongmai App: CTB 64, 16-bit POC
+ * LSBs, two short-term RPSs, SAO, no deblocking override, VUI at 25 fps.
+ * The model's own sets (same ids, appended after them) used to replace
+ * these in-band, so a client that joined between two IDRs parsed every
+ * slice up to the next IDR against the SDP's sets: alignment_bit_equal_
+ * to_one=0 on each. The slices are now coded against the API's sets.
+ */
+static bool axera_vcmd_hevc_api_headers(AxeraVcmdState *s, uint32_t *reg,
+                                        hwaddr out_base, uint32_t w,
+                                        uint32_t h, HevcEncHdr *hdr)
+{
+    uint32_t tbl[4], sum = 0;
+    int k;
+
+    if (!reg[10] || reg[10] < sizeof(tbl) || out_base < H264_API_HDR_MAX) {
+        return false;
+    }
+    vcmd_dma_read(s, reg[10] - sizeof(tbl), tbl, sizeof(tbl),
+                  MEMTXATTRS_UNSPECIFIED);
+    for (k = ARRAY_SIZE(tbl) - 1; k >= 0; k--) {
+        uint8_t buf[H264_API_HDR_MAX];
+
+        if (!tbl[k] || sum + tbl[k] > sizeof(buf)) {
+            break;
+        }
+        sum += tbl[k];
+        vcmd_dma_read(s, out_base - sum, buf, sum, MEMTXATTRS_UNSPECIFIED);
+        if (buf[0] || buf[1] ||
+            !(buf[2] == 1 || (buf[2] == 0 && buf[3] == 1))) {
+            break;
+        }
+        if (hevc_enc_parse_headers(hdr, buf, sum)) {
+            return hdr->w == w && hdr->h == h;
+        }
+    }
+    return false;
+}
+
 static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
 {
     uint32_t mode = (reg[ENC_REG_MODE] >> ENC_MODE_SHIFT) &
@@ -844,10 +887,28 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
         if (!st->hevc_ref) {
             st->hevc_ref = hevc_enc_ref_new();
         }
-        n = hevc_enc_frame(&hevc_params_ctb32_sao, w, h, qp ? qp : 26,
-                           p_slice, p_slice ? st->hevc_poc + 1 : 0,
-                           p_slice ? st->hevc_ref : NULL, st->hevc_ref,
-                           y, w, h, stride_y, uv, stride_c, out, cap);
+        if (idr) {
+            HevcEncHdr hdr;
+
+            if (axera_vcmd_hevc_api_headers(s, reg, out_base, w, h, &hdr)) {
+                st->hevc_hdr = hdr;
+                st->hevc_api_hdr = true;
+            }
+        }
+        if (st->hevc_api_hdr) {
+            /* the API wrote (now or at an earlier IDR) the headers */
+            n = hevc_enc_hdr_frame(&st->hevc_hdr, qp ? qp : 26, p_slice,
+                                   p_slice ? st->hevc_poc + 1 : 0,
+                                   p_slice ? st->hevc_ref : NULL,
+                                   st->hevc_ref, y, w, h, stride_y, uv,
+                                   stride_c, out, cap);
+        } else {
+            /* none seen: our own VPS/SPS/PPS in front of the IDR */
+            n = hevc_enc_frame(&hevc_params_ctb32_sao, w, h, qp ? qp : 26,
+                               p_slice, p_slice ? st->hevc_poc + 1 : 0,
+                               p_slice ? st->hevc_ref : NULL, st->hevc_ref,
+                               y, w, h, stride_y, uv, stride_c, out, cap);
+        }
         if (n) {
             st->hevc_poc = p_slice ? st->hevc_poc + 1 : 0;
         }

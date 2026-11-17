@@ -1540,3 +1540,394 @@ slice:
     }
     return o;
 }
+
+/* ---- slices for a library's own parameter sets --------------------------- */
+
+typedef struct BitReader {
+    uint8_t *p;             /* the RBSP: emulation prevention removed */
+    size_t n, pos;          /* bytes, bit position */
+    bool err;
+} BitReader;
+
+static uint32_t br_u(BitReader *r, int n)
+{
+    uint32_t v = 0;
+
+    while (n--) {
+        if (r->pos >= r->n * 8) {
+            r->err = true;
+            return 0;
+        }
+        v = (v << 1) | ((r->p[r->pos >> 3] >> (7 - (r->pos & 7))) & 1);
+        r->pos++;
+    }
+    return v;
+}
+
+static uint32_t br_ue(BitReader *r)
+{
+    int z = 0;
+
+    while (!br_u(r, 1)) {
+        if (r->err || ++z > 31) {
+            r->err = true;
+            return 0;
+        }
+    }
+    return ((1u << z) - 1) + br_u(r, z);
+}
+
+static int32_t br_se(BitReader *r)
+{
+    uint32_t v = br_ue(r);
+
+    return (v & 1) ? (int32_t)((v + 1) / 2) : -(int32_t)(v / 2);
+}
+
+/* the RBSP of the NAL unit at nal (header included) into r->p */
+static void br_init(BitReader *r, const uint8_t *nal, size_t len)
+{
+    size_t i;
+    int zeros = 0;
+
+    r->p = g_malloc(len + 1);
+    r->n = r->pos = 0;
+    r->err = false;
+    for (i = 2; i < len; i++) {                 /* past the NAL header */
+        if (zeros >= 2 && nal[i] == 3) {
+            zeros = 0;
+            continue;
+        }
+        r->p[r->n++] = nal[i];
+        zeros = nal[i] ? 0 : zeros + 1;
+    }
+}
+
+static void ptl_skip(BitReader *r, int sub)
+{
+    int i;
+    bool prof[8], lvl[8];
+
+    br_u(r, 32);                                /* general_profile ... */
+    br_u(r, 32);                                /* ... flags, 43 + 1 */
+    br_u(r, 32);                                /* reserved bits, level */
+    for (i = 0; i < sub; i++) {
+        prof[i] = br_u(r, 1);
+        lvl[i] = br_u(r, 1);
+    }
+    if (sub > 0) {
+        br_u(r, 2 * (8 - sub));
+    }
+    for (i = 0; i < sub; i++) {
+        if (prof[i]) {
+            br_u(r, 32);
+            br_u(r, 32);
+            br_u(r, 24);
+        }
+        if (lvl[i]) {
+            br_u(r, 8);
+        }
+    }
+}
+
+static bool parse_sps(HevcEncHdr *h, BitReader *r)
+{
+    int sub, i, cnt[65];
+
+    br_u(r, 4);                                 /* vps id */
+    sub = br_u(r, 3);
+    br_u(r, 1);
+    ptl_skip(r, sub);
+    if (br_ue(r) != 0 || br_ue(r) != 1) {       /* sps id 0, 4:2:0 */
+        return false;
+    }
+    h->w = br_ue(r);
+    h->h = br_ue(r);
+    if (br_u(r, 1)) {                           /* conformance window */
+        br_ue(r);
+        br_ue(r);
+        br_ue(r);
+        br_ue(r);
+    }
+    if (br_ue(r) || br_ue(r)) {                 /* 8-bit only */
+        return false;
+    }
+    h->log2_poc_lsb = br_ue(r) + 4;
+    for (i = br_u(r, 1) ? 0 : sub; i <= sub; i++) {
+        br_ue(r);
+        br_ue(r);
+        br_ue(r);
+    }
+    const int log2_min_cb = br_ue(r) + 3;
+    const int log2_ctb = log2_min_cb + br_ue(r);
+    const int log2_min_tb = br_ue(r) + 2;
+    const int log2_max_tb = log2_min_tb + br_ue(r);
+    br_ue(r);                                   /* depth inter: P CUs are
+                                                 * skipped or intra */
+    h->prm.trafo_depth_intra = br_ue(r);
+    /* every CU 8x8, its TB 8x8 (chroma 4x4) */
+    if (log2_min_cb != 3 || log2_ctb < 4 || log2_ctb > 6 ||
+        log2_min_tb != 2 || log2_max_tb < 3) {
+        return false;
+    }
+    h->prm.log2_ctb = log2_ctb;
+    if (br_u(r, 1)) {                           /* scaling lists */
+        return false;
+    }
+    br_u(r, 1);                                 /* amp: CUs at MinCb */
+    h->prm.sao = br_u(r, 1);
+    if (br_u(r, 1)) {                           /* pcm */
+        return false;
+    }
+    h->num_rps = br_ue(r);
+    if (h->num_rps > 64) {
+        return false;
+    }
+    h->rps_idx = -1;
+    for (i = 0; i < h->num_rps && !r->err; i++) {
+        if (i && br_u(r, 1)) {                  /* predicted from i - 1 */
+            int j, n = 0;
+
+            br_u(r, 1);                         /* delta_rps_sign */
+            br_ue(r);                           /* abs_delta_rps_minus1 */
+            for (j = 0; j <= cnt[i - 1]; j++) {
+                if (br_u(r, 1) || br_u(r, 1)) {
+                    n++;
+                }
+            }
+            cnt[i] = n;
+        } else {
+            const uint32_t neg = br_ue(r), pos = br_ue(r);
+            uint32_t j, d0 = 1, u0 = 0;
+
+            if (neg > 16 || pos > 16 || neg + pos > 16) {
+                return false;
+            }
+            for (j = 0; j < neg + pos; j++) {
+                const uint32_t d = br_ue(r), u = br_u(r, 1);
+
+                if (j == 0) {
+                    d0 = d;
+                    u0 = u;
+                }
+            }
+            cnt[i] = neg + pos;
+            if (h->rps_idx < 0 && neg == 1 && pos == 0 && d0 == 0 && u0) {
+                h->rps_idx = i;
+            }
+        }
+    }
+    h->long_term = br_u(r, 1);
+    if (h->long_term) {
+        h->num_lt_sps = br_ue(r);
+        for (i = 0; i < h->num_lt_sps && !r->err; i++) {
+            br_u(r, h->log2_poc_lsb + 1);
+        }
+    }
+    h->tmvp = br_u(r, 1);
+    /* strong intra smoothing (32x32 TBs only) and VUI: nothing here */
+    return !r->err && h->log2_poc_lsb <= 16;
+}
+
+static bool parse_pps(HevcEncHdr *h, BitReader *r)
+{
+    h->pps_id = br_ue(r);
+    if (br_ue(r) != 0 || h->pps_id > 63) {      /* sps id */
+        return false;
+    }
+    br_u(r, 1);                                 /* dependent slices: one
+                                                 * slice per picture */
+    h->output_flag = br_u(r, 1);
+    h->extra_bits = br_u(r, 3);
+    if (br_u(r, 1)) {                           /* sign data hiding */
+        return false;
+    }
+    h->cabac_init_present = br_u(r, 1);
+    h->num_ref_l0 = br_ue(r) + 1;
+    br_ue(r);
+    h->init_qp = 26 + br_se(r);
+    if (br_u(r, 1)) {                           /* constrained intra */
+        return false;
+    }
+    h->prm.transform_skip = br_u(r, 1);
+    if (!br_u(r, 1)) {                          /* cu_qp_delta: the slice */
+        return false;                           /* data codes it */
+    }
+    const int depth = br_ue(r);
+    if (depth > h->prm.log2_ctb - 3) {
+        return false;
+    }
+    h->prm.log2_qg = depth ? h->prm.log2_ctb - depth : 0;
+    const int cb = br_se(r), cr = br_se(r);
+    if (cb != cr) {
+        return false;
+    }
+    h->prm.chroma_qp_offset = cb;
+    h->slice_chroma_qp = br_u(r, 1);
+    if (br_u(r, 1) || br_u(r, 1) ||             /* weighted pred, bipred */
+        br_u(r, 1) ||                           /* transquant bypass */
+        br_u(r, 1) || br_u(r, 1)) {             /* tiles, entropy sync */
+        return false;
+    }
+    h->lf_across_slices = br_u(r, 1);
+    h->prm.beta_offset_div2 = h->prm.tc_offset_div2 = 0;
+    if (br_u(r, 1)) {                           /* deblocking control */
+        h->deblocking_override = br_u(r, 1);
+        if (br_u(r, 1)) {                       /* deblocking off */
+            return false;
+        }
+        h->prm.beta_offset_div2 = br_se(r);
+        h->prm.tc_offset_div2 = br_se(r);
+    }
+    if (br_u(r, 1)) {                           /* scaling list data */
+        return false;
+    }
+    br_u(r, 1);                                 /* lists modification:
+                                                 * one picture, none */
+    if (br_ue(r) != 0) {                        /* parallel merge level */
+        return false;
+    }
+    h->slice_ext = br_u(r, 1);
+    if (br_u(r, 1)) {                           /* pps extensions */
+        return false;
+    }
+    return !r->err;
+}
+
+bool hevc_enc_parse_headers(HevcEncHdr *h, const uint8_t *buf, size_t len)
+{
+    bool have_vps = false, have_sps = false, have_pps = false, ok = true;
+    size_t i = 0;
+
+    memset(h, 0, sizeof(*h));
+    while (ok && i + 3 < len) {
+        size_t s, e;
+
+        if (buf[i] || buf[i + 1] || buf[i + 2] != 1) {
+            i++;
+            continue;
+        }
+        s = i + 3;
+        for (e = s; e + 2 < len; e++) {
+            if (!buf[e] && !buf[e + 1] && buf[e + 2] <= 1) {
+                break;
+            }
+        }
+        if (e + 2 >= len) {
+            e = len;
+        }
+        if (e - s >= 3) {
+            BitReader r;
+            const int type = (buf[s] >> 1) & 63;
+
+            br_init(&r, buf + s, e - s);
+            if (type == NAL_VPS) {
+                have_vps = true;
+            } else if (type == NAL_SPS) {
+                ok = parse_sps(h, &r);
+                have_sps = true;
+            } else if (type == NAL_PPS) {
+                ok = have_sps && parse_pps(h, &r);
+                have_pps = true;
+            }
+            g_free(r.p);
+        }
+        i = e;
+    }
+    return ok && have_vps && have_sps && have_pps && size_ok(h->w, h->h);
+}
+
+size_t hevc_enc_hdr_frame(const HevcEncHdr *h, int qp, bool p_slice, int poc,
+                          const HevcEncRef *ref, HevcEncRef *recon,
+                          const uint8_t *y, int sw, int sh, int ys,
+                          const uint8_t *uv, int cs,
+                          uint8_t *out, size_t cap)
+{
+    const HevcEncParams *prm = &h->prm;
+    uint8_t hdr[64];
+    BitWriter b = { .p = hdr, .cap = sizeof(hdr) };
+    int i;
+
+    qp = MIN(MAX(qp, 0), 51);
+    /* slice_segment_header() (7.3.6.1) of a picture's one slice */
+    bw_bits(&b, 1, 1);                      /* first_slice_segment_in_pic */
+    if (!p_slice) {
+        bw_bits(&b, 0, 1);                  /* no_output_of_prior_pics */
+    }
+    bw_ue(&b, h->pps_id);
+    bw_bits(&b, 0, h->extra_bits);          /* slice_reserved_flag */
+    bw_ue(&b, p_slice ? 1 : 2);             /* P / I */
+    if (h->output_flag) {
+        bw_bits(&b, 1, 1);                  /* pic_output_flag */
+    }
+    if (p_slice) {
+        bw_bits(&b, poc & ((1 << h->log2_poc_lsb) - 1), h->log2_poc_lsb);
+        if (h->rps_idx >= 0) {
+            /* the SPS's RPS {POC - 1}: short_term_ref_pic_set_idx in
+             * Ceil(Log2(num_short_term_ref_pic_sets)) bits */
+            bw_bits(&b, 1, 1);
+            for (i = 0; (1 << i) < h->num_rps; i++) {
+                continue;
+            }
+            bw_bits(&b, h->rps_idx, i);
+        } else {
+            bw_bits(&b, 0, 1);              /* an RPS of its own: */
+            if (h->num_rps) {
+                bw_bits(&b, 0, 1);          /*   not predicted, */
+            }
+            bw_ue(&b, 1);                   /*   one negative picture, */
+            bw_ue(&b, 0);                   /*   no positive ones, */
+            bw_ue(&b, 0);                   /*   delta POC -1, */
+            bw_bits(&b, 1, 1);              /*   used by this one */
+        }
+        if (h->long_term) {
+            if (h->num_lt_sps) {
+                bw_ue(&b, 0);               /* num_long_term_sps */
+            }
+            bw_ue(&b, 0);                   /* num_long_term_pics */
+        }
+        if (h->tmvp) {
+            bw_bits(&b, 0, 1);              /* slice_temporal_mvp_enabled */
+        }
+    }
+    if (prm->sao) {
+        bw_bits(&b, prm->sao_luma_only ? 2 : 3, 2); /* slice_sao_luma/chroma */
+    }
+    if (p_slice) {
+        if (h->num_ref_l0 != 1) {
+            bw_bits(&b, 1, 1);              /* num_ref_idx_active_override */
+            bw_ue(&b, 0);                   /*   one reference */
+        } else {
+            bw_bits(&b, 0, 1);
+        }
+        if (h->cabac_init_present) {
+            bw_bits(&b, prm->cabac_init_flag, 1);
+        }
+        bw_ue(&b, 1);                       /* five_minus_max_num_merge_cand */
+    }
+    bw_se(&b, qp - h->init_qp);             /* slice_qp_delta */
+    if (h->slice_chroma_qp) {
+        bw_se(&b, 0);                       /* slice_cb_qp_offset */
+        bw_se(&b, 0);                       /* slice_cr_qp_offset */
+    }
+    if (h->deblocking_override) {
+        bw_bits(&b, 0, 1);                  /* the PPS's deblocking */
+    }
+    if (h->lf_across_slices) {              /* deblocking is on */
+        bw_bits(&b, 1, 1);                  /* loop filter across slices */
+    }
+    if (h->slice_ext) {
+        bw_ue(&b, 0);                       /* header extension length */
+    }
+    bw_bits(&b, 1, 1);                      /* byte_alignment() */
+    while (b.bits) {
+        bw_bits(&b, 0, 1);
+    }
+
+    const size_t hl = nal_wrap(out, cap, p_slice ? NAL_TRAIL_R :
+                               NAL_IDR_W_RADL, hdr, b.n);
+    return hl + hevc_enc_slice_data(prm, h->w, h->h, qp, p_slice, ref, recon,
+                                    y, sw, sh, ys, uv, cs,
+                                    out + MIN(hl, cap),
+                                    cap > hl ? cap - hl : 0);
+}
