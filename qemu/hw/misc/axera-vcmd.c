@@ -391,6 +391,7 @@ struct AxeraVcmdState {
         uint32_t mode, w, h;
         uint64_t last_job;
         H264Enc h264;
+        bool h264_api_hdr;      /* h264 holds the API's own SPS/PPS */
         HevcEncRef *hevc_ref;
         uint32_t hevc_poc;
         uint32_t frames;
@@ -630,6 +631,51 @@ static bool axera_vcmd_plane_empty(const uint8_t *p, size_t n)
     return true;
 }
 
+/*
+ * The SPS and PPS the encoder API wrote in software in front of an H.264
+ * job's output (as for HEVC, see the NAL size table below): the entries
+ * it pre-filled just before swreg10 size them, and they end exactly at
+ * swreg8. Seen on the AX620E/AX620U Xiongmai App: a Main-profile SPS
+ * (level 5.2, POC type 0, frame cropping 3200x1808 -> 1800, VUI) and a
+ * CABAC PPS -- the same ones the RTSP SDP's sprop-parameter-sets carry.
+ * The slices are coded against these, so the stream says what the SDP
+ * says and keeps the API's cropping; parsed into e, true if usable.
+ */
+#define H264_API_HDR_MAX   512
+static bool axera_vcmd_h264_api_headers(AxeraVcmdState *s, uint32_t *reg,
+                                        hwaddr out_base, H264Enc *e)
+{
+    uint32_t tbl[4], sum = 0;
+    int k;
+
+    if (!reg[10] || reg[10] < sizeof(tbl) || out_base < H264_API_HDR_MAX) {
+        return false;
+    }
+    vcmd_dma_read(s, reg[10] - sizeof(tbl), tbl, sizeof(tbl),
+                  MEMTXATTRS_UNSPECIFIED);
+    for (k = ARRAY_SIZE(tbl) - 1; k >= 0; k--) {
+        uint8_t buf[H264_API_HDR_MAX];
+        H264Enc hdr = { 0 };
+
+        if (!tbl[k] || sum + tbl[k] > sizeof(buf)) {
+            break;
+        }
+        sum += tbl[k];
+        vcmd_dma_read(s, out_base - sum, buf, sum, MEMTXATTRS_UNSPECIFIED);
+        if (buf[0] || buf[1] ||
+            !(buf[2] == 1 || (buf[2] == 0 && buf[3] == 1))) {
+            break;
+        }
+        h264_enc_parse_headers(&hdr, buf, sum);
+        if (hdr.have_sps && hdr.have_pps && !hdr.unsupported) {
+            hdr.idr_pic_id = e->idr_pic_id;
+            *e = hdr;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
 {
     uint32_t mode = (reg[ENC_REG_MODE] >> ENC_MODE_SHIFT) &
@@ -763,7 +809,15 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
     out = g_malloc0(cap);
 
     if (mode == ENC_MODE_H264) {
-        if (idr) {
+        if (idr && (axera_vcmd_h264_api_headers(s, reg, out_base,
+                                                &st->h264) ||
+                    st->h264_api_hdr)) {
+            /* the API wrote (now or at an earlier IDR) the headers */
+            st->h264_api_hdr = true;
+            n = h264_enc_frame(&st->h264, true, qp ? qp : 26, mbw, mbh,
+                               y, stride_y, uv, stride_c, out, cap);
+        } else if (idr) {
+            /* no API headers seen: our own Baseline SPS/PPS */
             uint8_t hdr[128];
             size_t hdr_len = h264_enc_baseline_headers(w, h, hdr);
 
