@@ -309,6 +309,14 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-sdhci-wp.sh']
         run: bash qemu/tests/test-hisi-sdhci-wp.sh
 
+      # hisi-femac: a soft reset has to drop the RX buffers the driver
+      # posted, because the driver frees every one of them on close.  Keep
+      # them and the model DMAs into pages the guest has already handed back
+      # to the allocator, which kills it later in unrelated MM code (#326).
+      - name: FEMAC soft reset drops posted RX buffers
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-femac-reset.py']
+        run: python3 qemu/tests/test-hisi-femac-reset.py
+
       # The Ambarella S3L models driven over qtest the way the vendor kernel
       # drives them: the scratchpad that names the pending line, timers,
       # the PLL rates, the I2C conversation with the OV4689, and NAND on
