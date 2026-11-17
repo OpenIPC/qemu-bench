@@ -810,11 +810,25 @@ static void axera_create_ivps_engines(const AxeraIvpsEngineDesc *engines,
     }
 }
 
-static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
-                                 bool vin_itp_lockstep)
+/*
+ * AX_DMAPER request id the SPI NOR controller's RX FIFO handshake is
+ * routed to: BL1, U-Boot and the kernel all program reqmux field 0x01
+ * for the SPI RX channel (ch0), matching the dts "dmas = <&dma_per 1
+ * &dma_per 0>". Block-mode: see axera_dmaper_chn_blocked().
+ */
+#define AXERA_DMAPER_REQ_SPI_NOR_RX 1
+
+/*
+ * Returns AX_DMAPER, for the flash-file= SPI NOR to wire its request;
+ * spi_nor_dma says that SPI NOR exists, so its request id is handshaked.
+ */
+static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
+                                         bool vin_itp_lockstep,
+                                         bool spi_nor_dma)
 {
     /* the SC450AI, whose exposure scales axera-vin's 3A statistics */
     DeviceState *ax620e_sensor = NULL;
+    DeviceState *dmaper_dev;
 
     /*
      * vpp@4403000 (SPI 0x67), gdc@4404000 (SPI 0x68), tdp@4405000
@@ -932,6 +946,11 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
             paced |= 1ULL << ax620e_i2s[i].tx_req;
         }
         qdev_prop_set_uint64(dmaper, "paced-reqs", paced);
+        if (spi_nor_dma) {
+            qdev_prop_set_uint64(dmaper, "block-reqs",
+                                 1ULL << AXERA_DMAPER_REQ_SPI_NOR_RX);
+        }
+        dmaper_dev = dmaper;
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dmaper), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dmaper), 0, 0x048a0000);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dmaper), 1, 0x04870130, 2);
@@ -1225,6 +1244,8 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dwc3), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dwc3), 0, 0x08000000);
     }
+
+    return dmaper_dev;
 }
 
 static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
@@ -1234,6 +1255,8 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
     static struct arm_boot_info binfo;
     qemu_irq pic[AXERA_NUM_SPI];
     DeviceState *gic;
+    DeviceState *dmaper;
+    bool spi_nor;
     SysBusDevice *gicbus;
     ARMCPU *cpu[2];
     int n, i;
@@ -1454,7 +1477,11 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                    AXERA_UART0_FREQ / 16, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
 
-    axera_ax620e_periphs(pic, true, c == &ax620e_soc && smp_cpus > 1);
+    spi_nor = AXERA_MACHINE(machine)->flash_file &&
+              AXERA_MACHINE(machine)->flash_file[0] &&
+              !machine->kernel_filename;
+    dmaper = axera_ax620e_periphs(pic, true, c == &ax620e_soc && smp_cpus > 1,
+                                  spi_nor);
 
     {
         AxeraMachineState *ams = AXERA_MACHINE(machine);
@@ -1468,12 +1495,15 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
          * flash dump (kernel, rootfs) via its own real spinor_read()",
          * instead of needing BL1's own DDR training to run at all.
          */
-        if (ams->flash_file && ams->flash_file[0] && !machine->kernel_filename) {
-            DeviceState *spi_nor = qdev_new(TYPE_AXERA_SPI_NOR);
+        if (spi_nor) {
+            DeviceState *nor = qdev_new(TYPE_AXERA_SPI_NOR);
 
-            qdev_prop_set_string(spi_nor, "file", ams->flash_file);
-            sysbus_realize_and_unref(SYS_BUS_DEVICE(spi_nor), &error_fatal);
-            sysbus_mmio_map(SYS_BUS_DEVICE(spi_nor), 0, 0x01a00000);
+            qdev_prop_set_string(nor, "file", ams->flash_file);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(nor), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(nor), 0, 0x01a00000);
+            qdev_connect_gpio_out_named(nor, AXERA_SPI_NOR_DMA_RX_REQ, 0,
+                qdev_get_gpio_in_named(dmaper, AXERA_DMAPER_REQ,
+                                       AXERA_DMAPER_REQ_SPI_NOR_RX));
         }
 
         if (ams->uboot_file && ams->uboot_file[0] && !machine->kernel_filename) {
@@ -2653,7 +2683,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     }
 
     if (!c->is_ax620x) {
-        axera_ax620e_periphs(pic, false, false);
+        axera_ax620e_periphs(pic, false, false, false);
         qemu_register_reset(axera_ax620q_spl_handoff_reset,
                             (void *)(uintptr_t)(drive_get(IF_SD, 0, 1)
                                                 != NULL));

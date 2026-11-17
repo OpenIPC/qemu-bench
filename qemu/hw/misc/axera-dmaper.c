@@ -136,6 +136,7 @@ struct AxeraDmaperState {
     uint32_t reqmux_en[2];      /* +0x130 / +0x138 request enables */
     uint32_t reqmux[4];
     uint64_t paced_reqs;        /* property: request ids to honour */
+    uint64_t block_reqs;        /* property: block-mode handshake ids */
     uint64_t req_level;
     bool in_service;
     struct {
@@ -394,12 +395,28 @@ static void axera_dmaper_req_in(void *opaque, int req, int level)
     AxeraDmaperState *s = opaque;
 
     if (level) {
+        unsigned ch;
+
         s->req_level |= 1ULL << req;
         axera_dmaper_service(s);
+        /* Release a block-mode channel waiting on this request. Not
+         * inline: the request is raised from inside the peripheral's
+         * own MMIO handler, which the transfer then has to read. */
+        for (ch = 0; ch < DMAPER_MAX_CHN; ch++) {
+            if ((s->pending_chn & BIT(ch)) &&
+                axera_dmaper_chn_req(s, ch) == req) {
+                timer_mod_anticipate(&s->completion_timer,
+                                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                     AXERA_DMAPER_LATENCY_NS);
+                break;
+            }
+        }
     } else {
         s->req_level &= ~(1ULL << req);
     }
 }
+
+static bool axera_dmaper_chn_blocked(AxeraDmaperState *s, unsigned ch);
 
 static void axera_dmaper_stop_paced(AxeraDmaperState *s, uint32_t mask)
 {
@@ -408,6 +425,11 @@ static void axera_dmaper_stop_paced(AxeraDmaperState *s, uint32_t mask)
     for (ch = 0; ch < DMAPER_MAX_CHN; ch++) {
         if (mask & BIT(ch)) {
             s->pch[ch].active = false;
+            /* an aborted channel still waiting for its request must
+             * not fire on the next, unrelated, one */
+            if (axera_dmaper_chn_blocked(s, ch)) {
+                s->pending_chn &= ~BIT(ch);
+            }
         }
     }
 }
@@ -451,17 +473,35 @@ static const MemoryRegionOps axera_dmaper_reqmux_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+/*
+ * Block-mode peripheral handshake (SPI NOR RX, request id 1): the
+ * channel is armed by DMAPER_START but may only move its block once
+ * the peripheral raises its request, i.e. once its FIFO really holds
+ * the data. U-Boot's sf read starts the channel first and only then
+ * enables the SPI controller for the RX phase; copying unconditionally
+ * after the fixed latency raced that second MMIO write and, whenever
+ * the vCPU was descheduled in between, drained an empty FIFO into the
+ * destination (whole 32 KiB chunks of zeros in the squashfs U-Boot
+ * loads the kernel from). Channels routed elsewhere are unaffected.
+ */
+static bool axera_dmaper_chn_blocked(AxeraDmaperState *s, unsigned ch)
+{
+    unsigned req = axera_dmaper_chn_req(s, ch);
+
+    return (s->block_reqs & (1ULL << req)) && !(s->req_level & (1ULL << req));
+}
+
 static void axera_dmaper_timer_cb(void *opaque)
 {
     AxeraDmaperState *s = opaque;
     unsigned ch;
 
     for (ch = 0; ch < DMAPER_MAX_CHN; ch++) {
-        if (s->pending_chn & BIT(ch)) {
+        if ((s->pending_chn & BIT(ch)) && !axera_dmaper_chn_blocked(s, ch)) {
+            s->pending_chn &= ~BIT(ch);
             axera_dmaper_do_transfer(s, ch);
         }
     }
-    s->pending_chn = 0;
 }
 
 static void axera_dmaper_write(void *opaque, hwaddr offset, uint64_t value,
@@ -582,6 +622,7 @@ static void axera_dmaper_realize(DeviceState *dev, Error **errp)
 
 static const Property axera_dmaper_props[] = {
     DEFINE_PROP_UINT64("paced-reqs", AxeraDmaperState, paced_reqs, 0),
+    DEFINE_PROP_UINT64("block-reqs", AxeraDmaperState, block_reqs, 0),
 };
 
 static void axera_dmaper_class_init(ObjectClass *klass, const void *data)

@@ -71,13 +71,14 @@
 #include "qemu/module.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "hw/misc/axera-spi-nor.h"
 #include "qom/object.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "hw/arm/axera.h"
 #include <zlib.h>
 
-#define TYPE_AXERA_SPI_NOR "axera-spi-nor"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 
 #define DW_SPI_CTRL0            0x00
@@ -255,7 +256,31 @@ struct AxeraSpiNorState {
     unsigned int rxq_cap;
     unsigned int rxq_head;
     unsigned int rxq_len;
+
+    qemu_irq dma_rx_req;
 };
+
+/*
+ * DW_apb_ssi's dma_rx_req: asserted while receive DMA is enabled and
+ * the RX FIFO holds data (its burst/single request pair collapsed into
+ * one level, since AX_DMAPER moves a whole block per request here).
+ *
+ * U-Boot's DMA read path arms the AX_DMAPER channel (DMAPER_START)
+ * *before* it enables the controller for the RX phase, so the engine
+ * must not move bytes until this line says the FIFO has them. Without
+ * the handshake the engine copied after a fixed delay; whenever the
+ * vCPU thread was descheduled between those two MMIO writes for longer
+ * than that delay (host load, -smp 2), the copy drained an empty DR
+ * and stored 32 KiB of zeros at the destination -- the corrupted
+ * squashfs chunk behind "read_super_m faile" / "lzma decompress
+ * failed" / "Bad FIT kernel image format!".
+ */
+static void axera_spi_nor_update_dma_req(AxeraSpiNorState *s)
+{
+    qemu_set_irq(s->dma_rx_req,
+                 (s->mem[DW_SPI_DMACR / 4] & SPI_DMA_RDMAE) &&
+                 s->rxq_len > 0);
+}
 
 /*
  * BL1's own dw_spi_mst.c reads flash in up to 32768-byte chunks (CTRL1's
@@ -708,6 +733,7 @@ static void axera_spi_nor_ssienr_write(AxeraSpiNorState *s, uint32_t value)
         s->write_enable_latch = false;
     }
     s->ssienr = enable;
+    axera_spi_nor_update_dma_req(s);
 }
 
 static uint64_t axera_spi_nor_read(void *opaque, hwaddr offset, unsigned size)
@@ -730,6 +756,7 @@ static uint64_t axera_spi_nor_read(void *opaque, hwaddr offset, unsigned size)
         val = s->rxq[s->rxq_head];
         s->rxq_head = (s->rxq_head + 1) % s->rxq_cap;
         s->rxq_len--;
+        axera_spi_nor_update_dma_req(s);
         return val;
     default:
         if (offset < DW_SPI_SIZE) {
@@ -769,6 +796,10 @@ static void axera_spi_nor_write(void *opaque, hwaddr offset, uint64_t value,
             axera_spi_nor_cmd_byte(s, value & 0xff);
         }
         return;
+    case DW_SPI_DMACR:
+        s->mem[offset / 4] = value;
+        axera_spi_nor_update_dma_req(s);
+        return;
     default:
         if (offset < DW_SPI_SIZE) {
             s->mem[offset / 4] = value;
@@ -802,6 +833,32 @@ static void axera_spi_nor_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &axera_spi_nor_ops, s,
                           TYPE_AXERA_SPI_NOR, DW_SPI_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
+    qdev_init_gpio_out_named(dev, &s->dma_rx_req, AXERA_SPI_NOR_DMA_RX_REQ, 1);
+}
+
+/*
+ * Controller state only: a guest reboot (the camera's first-boot
+ * System_saveGpio2Env reboot, a watchdog) must not leave BL1 facing a
+ * half-latched command, a still-enabled SSI, an undrained RX queue or
+ * RDMAE -- and with it a raised DMA request -- from the kernel's last
+ * transfer. The flash array and the env/mtd override flags describe
+ * the flash itself and survive, like real NOR across a reset.
+ */
+static void axera_spi_nor_reset(DeviceState *dev)
+{
+    AxeraSpiNorState *s = AXERA_SPI_NOR(dev);
+
+    memset(s->mem, 0, sizeof(s->mem));
+    s->ssienr = false;
+    s->in_cmd_phase = false;
+    s->cmd_len = 0;
+    s->session_start_cmd_len = 0;
+    s->write_enable_latch = false;
+    s->latched_opcode = 0;
+    s->latched_addr = 0;
+    s->rxq_head = 0;
+    s->rxq_len = 0;
+    axera_spi_nor_update_dma_req(s);
 }
 
 static const Property axera_spi_nor_properties[] = {
@@ -813,6 +870,7 @@ static void axera_spi_nor_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = axera_spi_nor_realize;
+    device_class_set_legacy_reset(dc, axera_spi_nor_reset);
     device_class_set_props(dc, axera_spi_nor_properties);
 }
 
