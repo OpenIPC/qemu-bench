@@ -53,6 +53,8 @@ typedef struct AkSoCConfig {
      */
     bool        isp2;
     const char *default_sensor;
+    /* EV200: the Hantro 8290 video encoder at 0x20020000 (ak-h8290) */
+    bool        venc_h8290;
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */

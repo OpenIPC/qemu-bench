@@ -336,6 +336,12 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-anyka.py']
         run: python3 qemu/tests/test-anyka.py
 
+      # EV200's Hantro 8290 driven the way OpenIPC's ak-venc driver drives
+      # it: IDR / P / IDR / P and a JPEG, decoded with ffmpeg.
+      - name: Anyka EV200 video encoder (ak-h8290)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-ak-h8290.py']
+        run: python3 qemu/tests/test-ak-h8290.py
+
       # The SigmaStar infinity2m models driven over qtest the way the vendor
       # IPL, U-Boot and kernel drive them: mask-ROM staging of the IPL, RIU
       # storage and boot status bits, timers into the main-intc, the FSP's
