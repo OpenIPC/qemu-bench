@@ -71,18 +71,24 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/log.h"
 #include "hw/irq.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
+#include "hw/qdev-properties.h"
+#include "hw/misc/axera-dmaper.h"
 
-#define TYPE_AXERA_DMAPER "axera-dmaper"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraDmaperState, AXERA_DMAPER)
 
 #define AXERA_DMAPER_SIZE       0x400
 
+#define DMAPER_CHN_EN           0x00
+#define DMAPER_CHN_PAUSE        0x04
 #define DMAPER_START            0x0c
+#define DMAPER_PAUSE_STA        0x10
+#define DMAPER_CHN_ABORT        0xa0
 #define DMAPER_CHN_LLI_H(ch)    (0x20 + (ch) * 8)
 #define DMAPER_CHN_LLI_L(ch)    (0x24 + (ch) * 8)
 #define DMAPER_INT_GLB_MASK     0xd8
@@ -115,6 +121,29 @@ struct AxeraDmaperState {
     QEMUTimer completion_timer;
     uint32_t pending_chn;
     uint32_t mem[AXERA_DMAPER_SIZE / 4];
+
+    /*
+     * Peripheral flow control (audio). The real driver
+     * (ax_dma_per_set_req_id()) routes a channel to a peripheral
+     * request id through set/clear register pairs in the shared
+     * clk-periph syscon at 0x04870000: +0x158-8k (set) / +0x15c-8k
+     * (clear), k = ch / 5, a 6-bit request field at (ch % 5) * 6.
+     * "reqmux" below models just that 0x30-byte window (mapped by the
+     * machine over the passive syscon regbank) so the engine knows
+     * which request line paces which channel.
+     */
+    MemoryRegion reqmux_mem;
+    uint32_t reqmux_en[2];      /* +0x130 / +0x138 request enables */
+    uint32_t reqmux[4];
+    uint64_t paced_reqs;        /* property: request ids to honour */
+    uint64_t req_level;
+    bool in_service;
+    struct {
+        bool active;
+        uint64_t sar, dar, len, done;
+        unsigned unit;
+        bool dev_to_mem;
+    } pch[DMAPER_MAX_CHN];
 };
 
 /*
@@ -242,6 +271,186 @@ static void axera_dmaper_do_transfer(AxeraDmaperState *s, unsigned ch)
     axera_dmaper_update_irq(s, ch);
 }
 
+static unsigned axera_dmaper_chn_req(AxeraDmaperState *s, unsigned ch)
+{
+    return (s->reqmux[ch / 5] >> ((ch % 5) * 6)) & 0x3f;
+}
+
+static bool axera_dmaper_chn_paced(AxeraDmaperState *s, unsigned ch)
+{
+    return s->paced_reqs & (1ULL << axera_dmaper_chn_req(s, ch));
+}
+
+/*
+ * Paced (peripheral-handshake) transfer: the real ax_dma_per driver
+ * issues every LLI as its own one-block transfer -- for a cyclic
+ * (audio) descriptor its tasklet reads the channel's LLI register
+ * back, finds which period just finished, and restarts the channel on
+ * that LLI's next pointer -- so one START here still means exactly one
+ * descriptor. Unlike the memory/SPI case it may only move data while
+ * the peripheral's request line is high, one peripheral-width word at
+ * a time, which is what keeps ALSA's period interrupts at the I2S
+ * serial clock's real pace.
+ */
+static void axera_dmaper_service(AxeraDmaperState *s)
+{
+    unsigned ch;
+    bool progress = true;
+
+    if (s->in_service) {
+        return;
+    }
+    s->in_service = true;
+    while (progress) {
+        progress = false;
+        for (ch = 0; ch < DMAPER_MAX_CHN; ch++) {
+            unsigned req = axera_dmaper_chn_req(s, ch);
+            uint32_t word = 0;
+            MemTxResult r;
+
+            if (!s->pch[ch].active || !(s->req_level & (1ULL << req))) {
+                continue;
+            }
+            if (s->pch[ch].dev_to_mem) {
+                r = address_space_read(&address_space_memory, s->pch[ch].sar,
+                                       MEMTXATTRS_UNSPECIFIED, &word,
+                                       s->pch[ch].unit);
+                r |= address_space_write(&address_space_memory,
+                                         s->pch[ch].dar + s->pch[ch].done,
+                                         MEMTXATTRS_UNSPECIFIED, &word,
+                                         s->pch[ch].unit);
+            } else {
+                r = address_space_read(&address_space_memory,
+                                       s->pch[ch].sar + s->pch[ch].done,
+                                       MEMTXATTRS_UNSPECIFIED, &word,
+                                       s->pch[ch].unit);
+                r |= address_space_write(&address_space_memory,
+                                         s->pch[ch].dar,
+                                         MEMTXATTRS_UNSPECIFIED, &word,
+                                         s->pch[ch].unit);
+            }
+            if (r != MEMTX_OK) {
+                /* A rejected peripheral access never drains the FIFO,
+                 * so the request would stay high and this loop would
+                 * spin forever; park the channel instead. */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "axera-dmaper: ch%u bus error, stopping\n", ch);
+                s->pch[ch].active = false;
+                continue;
+            }
+            s->pch[ch].done += s->pch[ch].unit;
+            progress = true;
+            if (s->pch[ch].done >= s->pch[ch].len) {
+                s->pch[ch].active = false;
+                s->mem[DMAPER_INT_RAW(ch) / 4] |= CHN_TRANSF_DONE;
+                axera_dmaper_update_irq(s, ch);
+            }
+        }
+    }
+    s->in_service = false;
+}
+
+static void axera_dmaper_start_paced(AxeraDmaperState *s, unsigned ch)
+{
+    uint8_t desc[32];
+    uint64_t ctrl, data, lli_addr;
+    unsigned src_w, dst_w;
+    bool sinc, dinc;
+
+    lli_addr = ((uint64_t)s->mem[DMAPER_CHN_LLI_H(ch) / 4] << 32) |
+               s->mem[DMAPER_CHN_LLI_L(ch) / 4];
+    if (address_space_read(&address_space_memory, lli_addr,
+                           MEMTXATTRS_UNSPECIFIED, desc, sizeof(desc)) !=
+        MEMTX_OK) {
+        return;
+    }
+    ctrl = ldq_le_p(desc + 16);
+    data = ldq_le_p(desc + 24);
+    src_w = (ctrl >> 27) & 0x7;
+    dst_w = (ctrl >> 24) & 0x7;
+    sinc = (ctrl >> 31) & 1;
+    dinc = (ctrl >> 30) & 1;
+
+    s->pch[ch].sar = ldq_le_p(desc + 0);
+    s->pch[ch].dar = ldq_le_p(desc + 8);
+    s->pch[ch].len = (uint64_t)((data >> 37) & 0x3fffff) << src_w;
+    s->pch[ch].done = 0;
+    s->pch[ch].dev_to_mem = !sinc && dinc;
+    /* peripheral side's bus width; the I2S FIFO port is 32-bit */
+    s->pch[ch].unit = MIN(1u << (s->pch[ch].dev_to_mem ? src_w : dst_w), 4u);
+    s->pch[ch].active = s->pch[ch].len != 0;
+    if (getenv("AXERA_DMAPER_DEBUG")) {
+        qemu_log("axera-dmaper: paced ch%u req 0x%x lli 0x%" PRIx64
+                 " sar 0x%" PRIx64 " dar 0x%" PRIx64 " len %" PRIu64
+                 " unit %u %s\n", ch, axera_dmaper_chn_req(s, ch), lli_addr,
+                 s->pch[ch].sar, s->pch[ch].dar, s->pch[ch].len,
+                 s->pch[ch].unit, s->pch[ch].dev_to_mem ? "dev->mem" : "mem->dev");
+    }
+    axera_dmaper_service(s);
+}
+
+static void axera_dmaper_req_in(void *opaque, int req, int level)
+{
+    AxeraDmaperState *s = opaque;
+
+    if (level) {
+        s->req_level |= 1ULL << req;
+        axera_dmaper_service(s);
+    } else {
+        s->req_level &= ~(1ULL << req);
+    }
+}
+
+static void axera_dmaper_stop_paced(AxeraDmaperState *s, uint32_t mask)
+{
+    unsigned ch;
+
+    for (ch = 0; ch < DMAPER_MAX_CHN; ch++) {
+        if (mask & BIT(ch)) {
+            s->pch[ch].active = false;
+        }
+    }
+}
+
+static uint64_t axera_dmaper_reqmux_read(void *opaque, hwaddr offset,
+                                         unsigned size)
+{
+    AxeraDmaperState *s = opaque;
+
+    if (offset == 0x00 || offset == 0x08) {
+        return s->reqmux_en[offset / 8];
+    }
+    if (offset >= 0x10 && offset < 0x30) {
+        return s->reqmux[(0x2c - offset) / 8];
+    }
+    return 0;
+}
+
+static void axera_dmaper_reqmux_write(void *opaque, hwaddr offset,
+                                      uint64_t value, unsigned size)
+{
+    AxeraDmaperState *s = opaque;
+
+    if (offset == 0x00 || offset == 0x08) {
+        s->reqmux_en[offset / 8] |= value;
+    } else if (offset >= 0x10 && offset < 0x30) {
+        unsigned k = (0x2c - offset) / 8;
+
+        if (offset & 4) {
+            s->reqmux[k] &= ~value;     /* +0x15c - 8k: clear */
+        } else {
+            s->reqmux[k] |= value;      /* +0x158 - 8k: set */
+        }
+    }
+}
+
+static const MemoryRegionOps axera_dmaper_reqmux_ops = {
+    .read = axera_dmaper_reqmux_read,
+    .write = axera_dmaper_reqmux_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static void axera_dmaper_timer_cb(void *opaque)
 {
     AxeraDmaperState *s = opaque;
@@ -262,12 +471,35 @@ static void axera_dmaper_write(void *opaque, hwaddr offset, uint64_t value,
     unsigned ch;
 
     if (offset == DMAPER_START) {
-        if (value) {
-            s->pending_chn |= value;
+        uint32_t immediate = 0;
+
+        for (ch = 0; ch < DMAPER_MAX_CHN; ch++) {
+            if (!(value & BIT(ch))) {
+                continue;
+            }
+            if (axera_dmaper_chn_paced(s, ch)) {
+                axera_dmaper_start_paced(s, ch);
+            } else {
+                immediate |= BIT(ch);
+            }
+        }
+        if (immediate) {
+            s->pending_chn |= immediate;
             timer_mod(&s->completion_timer,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                      AXERA_DMAPER_LATENCY_NS);
         }
+        return;
+    }
+    if (offset == DMAPER_CHN_ABORT) {
+        /* dma_chan_terminate_all(): abort, then drop CHN_EN/PAUSE */
+        axera_dmaper_stop_paced(s, value);
+        s->mem[offset / 4] = value;
+        return;
+    }
+    if (offset == DMAPER_CHN_EN) {
+        axera_dmaper_stop_paced(s, s->mem[offset / 4] & ~value);
+        s->mem[offset / 4] = value;
         return;
     }
 
@@ -301,6 +533,11 @@ static uint64_t axera_dmaper_read(void *opaque, hwaddr offset, unsigned size)
 {
     AxeraDmaperState *s = opaque;
 
+    if (offset == DMAPER_PAUSE_STA) {
+        /* dma_chan_pause() polls bit (ch + 1) after setting PAUSE(ch);
+         * nothing here runs mid-burst, so a pause is always immediate. */
+        return s->mem[offset / 4] | (s->mem[DMAPER_CHN_PAUSE / 4] << 1);
+    }
     if (offset < AXERA_DMAPER_SIZE) {
         return s->mem[offset / 4];
     }
@@ -320,6 +557,9 @@ static void axera_dmaper_reset(DeviceState *dev)
 
     timer_del(&s->completion_timer);
     s->pending_chn = 0;
+    memset(s->pch, 0, sizeof(s->pch));
+    memset(s->reqmux, 0, sizeof(s->reqmux));
+    memset(s->reqmux_en, 0, sizeof(s->reqmux_en));
 }
 
 static void axera_dmaper_realize(DeviceState *dev, Error **errp)
@@ -332,7 +572,17 @@ static void axera_dmaper_realize(DeviceState *dev, Error **errp)
                           TYPE_AXERA_DMAPER, AXERA_DMAPER_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+    /* MMIO 1: request-mux window, 0x30 bytes at clk-periph + 0x130 */
+    memory_region_init_io(&s->reqmux_mem, OBJECT(s), &axera_dmaper_reqmux_ops,
+                          s, TYPE_AXERA_DMAPER "-reqmux", 0x30);
+    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->reqmux_mem);
+    qdev_init_gpio_in_named(dev, axera_dmaper_req_in, AXERA_DMAPER_REQ,
+                            AXERA_DMAPER_NR_REQ);
 }
+
+static const Property axera_dmaper_props[] = {
+    DEFINE_PROP_UINT64("paced-reqs", AxeraDmaperState, paced_reqs, 0),
+};
 
 static void axera_dmaper_class_init(ObjectClass *klass, const void *data)
 {
@@ -340,6 +590,7 @@ static void axera_dmaper_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = axera_dmaper_realize;
     device_class_set_legacy_reset(dc, axera_dmaper_reset);
+    device_class_set_props(dc, axera_dmaper_props);
 }
 
 static const TypeInfo axera_dmaper_info = {

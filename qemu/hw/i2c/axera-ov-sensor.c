@@ -31,6 +31,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qapi/visitor.h"
 
 #define TYPE_AXERA_OV_SENSOR "axera-ov-sensor"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraOvSensorState, AXERA_OV_SENSOR)
@@ -138,11 +139,38 @@ static void axera_ov_sensor_reset(DeviceState *dev)
     qemu_set_irq(s->streaming, 0);
 }
 
+/*
+ * "exposure" (read-only): what the AE last programmed, as integration
+ * rows times total gain, gain 1.0 = 1024 -- for an ISP model to scale
+ * its statistics by, so the AE loop closes. The OS04A10's coding (its
+ * SDK os04a10_reg.h / os04a10_ae_ctrl.c): rows 0x3501:0x3502; analog
+ * gain 0x3508[4:0]:0x3509[7:4] in 1/16; digital gain
+ * 0x350A[3:0]:0x350B:0x350C[7:6] in 1/1024. Unprogrammed gains count
+ * as 1.0.
+ */
+static void axera_ov_sensor_get_exposure(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    AxeraOvSensorState *s = AXERA_OV_SENSOR(obj);
+#define OVR(a) (s->regs[(a) - OV_REG_BASE])
+    uint64_t rows = (OVR(0x3501) << 8) | OVR(0x3502);
+    uint32_t ag = ((OVR(0x3508) & 0x1f) << 4) | (OVR(0x3509) >> 4);
+    uint32_t dg = ((OVR(0x350a) & 0xf) << 10) | (OVR(0x350b) << 2) |
+                  (OVR(0x350c) >> 6);
+    uint64_t e = rows * (ag ? ag : 16) * (dg ? dg : 1024) / 16;
+#undef OVR
+
+    visit_type_uint64(v, name, &e, errp);
+}
+
 static void axera_ov_sensor_init(Object *obj)
 {
     AxeraOvSensorState *s = AXERA_OV_SENSOR(obj);
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->streaming, "streaming", 1);
+    object_property_add(obj, "exposure", "uint64",
+                        axera_ov_sensor_get_exposure, NULL, NULL, NULL);
 }
 
 static const Property axera_ov_sensor_props[] = {

@@ -37,6 +37,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qapi/visitor.h"
 
 #define TYPE_HISI_SMARTSENS "hisi-smartsens"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiSmartSensState, HISI_SMARTSENS)
@@ -128,6 +129,41 @@ static void hisi_smartsens_reset(DeviceState *dev)
     hisi_smartsens_reset_regs(s);
 }
 
+/*
+ * "exposure" (read-only): what the AE last programmed, as integration
+ * rows times total gain, gain 1.0 = 1024 -- for an ISP model to scale
+ * its statistics by, so the AE loop closes. The SC450AI's coding
+ * (its SDK sc450ai_ae_ctrl.c tables), shared by the SC*AI family:
+ * rows in 0x3E00[3:0]:0x3E01:0x3E02[7:4]; analog gain 0x3E08 coarse
+ * (bit 5 the x3.8125 HCG step, each of bits 2-4 a x2 step) times
+ * 0x3E09 / 64; digital gain 0x3E06 coarse (0, 1, 3, 7 = x1, 2, 4, 8)
+ * times 0x3E07 / 128. Unprogrammed fine gains count as 1.0.
+ */
+static void hisi_smartsens_get_exposure(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    HisiSmartSensState *s = HISI_SMARTSENS(obj);
+#define SSR(a) (s->regs[(a) - SS_REG_BASE])
+    uint64_t rows = ((SSR(0x3e00) & 0xf) << 12) | (SSR(0x3e01) << 4) |
+                    (SSR(0x3e02) >> 4);
+    uint8_t ac = SSR(0x3e08), af = SSR(0x3e09) ? SSR(0x3e09) : 0x40;
+    uint8_t dc = SSR(0x3e06) & 0xf, df = SSR(0x3e07) ? SSR(0x3e07) : 0x80;
+    /* gain, 1.0 = 1024 << 13: coarse x3.8125 is 61/16 */
+    uint64_t g = (uint64_t)(1u << ctpop8((ac >> 2) & 7)) *
+                 ((ac & 0x20) ? 61 : 16) * af * (dc + 1) * df;
+    uint64_t e = rows * g * 1024 / (16 * 64 * 128);
+#undef SSR
+
+    visit_type_uint64(v, name, &e, errp);
+}
+
+static void hisi_smartsens_init(Object *obj)
+{
+    object_property_add(obj, "exposure", "uint64",
+                        hisi_smartsens_get_exposure, NULL, NULL, NULL);
+}
+
 static const Property hisi_smartsens_props[] = {
     DEFINE_PROP_UINT8("id_high", HisiSmartSensState, id_high, 0x00),
     DEFINE_PROP_UINT8("id_low",  HisiSmartSensState, id_low,  0x00),
@@ -166,6 +202,7 @@ static const TypeInfo hisi_smartsens_info = {
     .name          = TYPE_HISI_SMARTSENS,
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(HisiSmartSensState),
+    .instance_init = hisi_smartsens_init,
     .class_init    = hisi_smartsens_class_init,
 };
 

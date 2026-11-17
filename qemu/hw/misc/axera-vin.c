@@ -178,6 +178,18 @@ enum { ISP_LAYOUT_NONE = 0, ISP_LAYOUT_AX620E = 1, ISP_LAYOUT_AX620U = 2 };
 #define CDMA_TOP_MAX    256     /* command lists per push, at most */
 #define CDMA_SUB_MAX    8192    /* register writes per command list */
 
+/* 3A statistics: see axera_vin_ae_stats() */
+#define AE_PTN_MAX      8       /* ITP partitions per frame, at most */
+#define AE_GRID_MAX     64      /* grid rows / columns, at most */
+#define AE_SCENE_W      192     /* the scene sampled for AX620E's statistics */
+#define AE_SCENE_H      108
+
+typedef struct AxeraAePtn {
+    hwaddr grid, hist;          /* hist 0: not programmed */
+    uint32_t rows, cols;
+    uint32_t rw, rh;            /* a grid region's size, pixels */
+} AxeraAePtn;
+
 typedef struct AxeraVinOut {
     AxeraNv12Buf buf;
     bool enabled;
@@ -226,6 +238,18 @@ struct AxeraVinState {
         uint32_t w, h;
     } painted[VIN_PAINTED];
     unsigned painted_next;
+
+    /* 3A statistics */
+    DeviceState *sensor;        /* its "exposure" scales the scene */
+    uint64_t ae_ref;            /* the exposure the scene is painted at */
+    uint32_t ae_shift;          /* 8-bit luma to the statistics' scale */
+    uint32_t ae_grid_cfg, ae_region;
+    AxeraAePtn ae_ptn[AE_PTN_MAX];
+    unsigned ae_nptn;
+    uint32_t ae_black;          /* AX620U raw: the black level */
+    AxeraNv12Buf ae_raw;        /* AX620U raw: the frame (y only) */
+    bool ae_raw_set;            /* in the list being scanned */
+    AxeraPicture ae_scene;      /* the scene, at the size last asked */
 };
 
 enum { FIELD_MASK = 0, FIELD_CLEAR = 1, FIELD_RAW = 2, FIELD_STATUS = 3 };
@@ -419,6 +443,242 @@ static void axera_vin_paint(AxeraVinState *s, int n)
     s->painted[i].h = h;
 }
 
+/*
+ * 3A statistics. The AE meters what the ISP measured, not the picture
+ * painted above: with nothing measured it sees a black scene, drives
+ * exposure and gain to their maximum, and the camera App takes the
+ * resulting exposure value (AX_ISP_IQ_GetAeStatus nExpVal, shutter x
+ * gains) for night -- slow shutter, a few frames a second, an encoder
+ * stop. So what the AE reads is written here, at the addresses the
+ * command lists program, from the scene (axera-scene.h, sampled small)
+ * as exposed: its luma times the exposure the AE last gave the sensor
+ * (the sensor's "exposure" property, rows x gain) over ae-ref, the
+ * exposure at which the scene reads as painted. The loop then settles
+ * where that meets the AE's target, a short daylight shutter at unity
+ * gain for the default ae-ref.
+ *
+ * AX620E: the ISP's own statistics (ax_proton.ko
+ * isp_itp_ae_stat_wrapper_update -> itp_ae_mod_update; userspace
+ * libax_proton ax_isp_fw_stat_ae_merging_process hands them to
+ * libax_ae). The ITP AE block, 0x02497000, is programmed once per ITP
+ * partition (vertical strip) in the lists:
+ *   +0x18  grid0 (rows - 1) << 16 | (columns - 1) in this partition
+ *   +0x1c  grid0 region height << 16 | width
+ *   +0x8c  grid0 buffer >> 3: rows x columns cells, row-major
+ *   +0x90  grid1 (flicker) buffer >> 3 -- not written
+ *   +0x94  histogram buffer >> 3: 256 linear, then 64 log bins
+ * The merge lays the partitions' cells side by side (adding the
+ * boundary columns two partitions share) and adds their histograms.
+ * A cell is AX_AE_GRID_STATS_T, u32 sum[4] then u16 count[4]; a bin
+ * AX_AE_HIST_BIN_T, u32 count[4]; values U8.4 (ae-shift 4), the scale
+ * of the AE's set point (nSetPoint 32768 = 32.0 in U8.10). Every cell
+ * gets the exposed scene's mean, and the first partition's histogram
+ * its whole histogram (the others none): the AE weighs levels, not
+ * where in the picture they are.
+ *
+ * AX620U: the App's AE runs ax_3a_stat_process_by_cpu -- it does not
+ * read the ISP's IFE statistics at all but measures a small raw frame
+ * on the CPU (grid, histogram: the App's own code), the IFE raw
+ * scaler's output, its write-DMA block at list word 0x6869:
+ *   +4     (buffer - 0x40000000) >> 3, a new one each frame
+ *   +8     width << 16 | height (168 x 96 for 2688 x 1520)
+ *   +9     stride >> 3
+ * 14-bit Bayer, packed nine pixels to each 128-bit word from bit 0 up
+ * (its unpacker, format 0xe); the App takes (pixel - black level) / 64,
+ * black level 1024 (ae-black), as the 8-bit luma it meters against its
+ * set point (12288 = 12.0). The scene is written grey (R = G = B).
+ */
+static void axera_vin_ae_set(AxeraVinState *s, uint32_t key, uint32_t val)
+{
+    AxeraAePtn *p;
+
+    if (s->isp_layout == ISP_LAYOUT_AX620E && (key >> 12) == 0x02497) {
+        switch (key & 0xfff) {
+        case 0x18:
+            s->ae_grid_cfg = val;
+            break;
+        case 0x1c:
+            s->ae_region = val;
+            break;
+        case 0x8c:
+            if (s->ae_nptn == AE_PTN_MAX) {
+                return;
+            }
+            p = &s->ae_ptn[s->ae_nptn++];
+            p->grid = (hwaddr)val << 3;
+            p->hist = 0;
+            p->rows = MIN(((s->ae_grid_cfg >> 16) & 0x3ff) + 1, AE_GRID_MAX);
+            p->cols = MIN((s->ae_grid_cfg & 0x7f) + 1, AE_GRID_MAX);
+            p->rh = s->ae_region >> 16;
+            p->rw = s->ae_region & 0xffff;
+            break;
+        case 0x94:
+            if (s->ae_nptn) {
+                s->ae_ptn[s->ae_nptn - 1].hist = (hwaddr)val << 3;
+            }
+            break;
+        }
+    } else if (s->isp_layout == ISP_LAYOUT_AX620U &&
+               key >= 0x6869 && key < 0x6869 + 10) {
+        switch (key - 0x6869) {
+        case 4:
+            s->ae_raw.y = s->cdma_list_base + ((hwaddr)val << 3);
+            s->ae_raw_set = true;
+            break;
+        case 8:
+            s->ae_raw.w = val >> 16;
+            s->ae_raw.h = val & 0xffff;
+            break;
+        case 9:
+            s->ae_raw.y_stride = val << 3;
+            break;
+        }
+    }
+}
+
+/* The exposure the AE gave the sensor over ae-ref: the scene's gain */
+static double axera_vin_ae_gain(AxeraVinState *s, uint64_t *e)
+{
+    *e = 0;
+    if (s->sensor) {
+        *e = object_property_get_uint(OBJECT(s->sensor), "exposure", NULL);
+    }
+    return *e && s->ae_ref ? (double)*e / s->ae_ref : 1.0;
+}
+
+/* The scene's luma at @w x @h, kept in s->ae_scene */
+static const uint8_t *axera_vin_ae_scene(AxeraVinState *s, uint32_t w,
+                                         uint32_t h)
+{
+    if (s->ae_scene.w != ROUND_UP(w, 2) || s->ae_scene.h != ROUND_UP(h, 2)) {
+        axera_picture_alloc(&s->ae_scene, w, h);
+        axera_scene_nv12(s->ae_scene.y, s->ae_scene.w, s->ae_scene.uv,
+                         s->ae_scene.w, s->ae_scene.w, s->ae_scene.h, 0);
+    }
+    return s->ae_scene.y;
+}
+
+static void axera_vin_ae_stats(AxeraVinState *s)
+{
+    const uint8_t *y = axera_vin_ae_scene(s, AE_SCENE_W, AE_SCENE_H);
+    uint32_t bins[320][4] = { 0 };
+    uint32_t hist[256] = { 0 };
+    uint64_t e, lsum = 0, total = AE_SCENE_W * AE_SCENE_H;
+    double k = axera_vin_ae_gain(s, &e);
+    uint8_t cell[24];
+    unsigned i, r, c, b, bits = 8 + s->ae_shift;
+    double mean;
+
+    for (i = 0; i < total; i++) {
+        hist[y[i]]++;
+    }
+    /* the scene as exposed: each luma scaled by k, clipped at white */
+    for (b = 0; b < 256; b++) {
+        uint32_t l = MIN(b * k + 0.5, 255.0);
+        uint32_t lb = MIN(log2(((uint64_t)l << s->ae_shift) + 1) * 64 / bits,
+                          63);
+
+        lsum += (uint64_t)l * hist[b];
+        for (c = 0; c < 4; c++) {
+            bins[l][c] += hist[b];
+            bins[256 + lb][c] += hist[b];
+        }
+    }
+    mean = (double)lsum / total;
+    if (getenv("AXERA_AE_DEBUG") && !(s->frame % 30)) {
+        fprintf(stderr, "axera-vin: AE exposure %" PRIu64 " k %.3f mean "
+                "%.1f, %u partitions, grid %ux%u\n", e, k, mean, s->ae_nptn,
+                s->ae_ptn[0].rows, s->ae_ptn[0].cols);
+    }
+    for (b = 0; b < 320; b++) {
+        for (c = 0; c < 4; c++) {
+            bins[b][c] = cpu_to_le32(bins[b][c]);
+        }
+    }
+
+    for (i = 0; i < s->ae_nptn; i++) {
+        AxeraAePtn *p = &s->ae_ptn[i];
+        uint32_t val = mean * (1u << s->ae_shift);
+        uint32_t num = MAX(MIN(p->rw * p->rh / 4, 0xffff), 1);
+
+        /* a region's sum is a u32 */
+        num = MAX(MIN(num, 0xffffffffu / MAX(val, 1)), 1);
+        for (c = 0; c < 4; c++) {
+            stl_le_p(cell + 4 * c, num * val);
+            stw_le_p(cell + 16 + 2 * c, num);
+        }
+        for (r = 0; r < p->rows; r++) {
+            for (c = 0; c < p->cols; c++) {
+                dma_memory_write(&address_space_memory,
+                                 p->grid + 24 * (r * p->cols + c), cell,
+                                 sizeof(cell), MEMTXATTRS_UNSPECIFIED);
+            }
+        }
+        if (!p->hist) {
+            continue;
+        }
+        if (i == 0) {
+            dma_memory_write(&address_space_memory, p->hist, bins,
+                             sizeof(bins), MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dma_memory_set(&address_space_memory, p->hist, 0, sizeof(bins),
+                           MEMTXATTRS_UNSPECIFIED);
+        }
+    }
+}
+
+/* AX620U: the IFE raw scaler's frame, see "3A statistics" */
+static void axera_vin_ae_raw(AxeraVinState *s)
+{
+    AxeraNv12Buf *f = &s->ae_raw;
+    uint32_t w = f->w, h = f->h, groups = DIV_ROUND_UP(w, 9), r, g, i;
+    g_autofree uint8_t *row = NULL;
+    const uint8_t *y;
+    uint16_t lut[256];
+    uint64_t e;
+    double k;
+
+    if (!w || !h || w > 1024 || h > 1024 || f->y_stride < groups * 16) {
+        return;
+    }
+    k = axera_vin_ae_gain(s, &e);
+    for (i = 0; i < 256; i++) {
+        lut[i] = MIN(s->ae_black + i * k * 64 + 0.5, 16383.0);
+    }
+    if (getenv("AXERA_AE_DEBUG") && !(s->frame % 30)) {
+        fprintf(stderr, "axera-vin: AE exposure %" PRIu64 " k %.3f, raw "
+                "%ux%u at 0x%" HWADDR_PRIx "\n", e, k, w, h, f->y);
+    }
+    y = axera_vin_ae_scene(s, w, h);
+    row = g_malloc0(f->y_stride);
+    for (r = 0; r < h; r++) {
+        const uint8_t *yl = y + (size_t)r * s->ae_scene.w;
+
+        for (g = 0; g < groups; g++) {
+            uint64_t lo = 0, hi = 0;
+
+            for (i = 0; i < 9 && g * 9 + i < w; i++) {
+                uint64_t v = lut[yl[g * 9 + i]];
+                unsigned bit = 14 * i;
+
+                if (bit < 64) {
+                    lo |= v << bit;
+                    if (bit + 14 > 64) {
+                        hi |= v >> (64 - bit);
+                    }
+                } else {
+                    hi |= v << (bit - 64);
+                }
+            }
+            stq_le_p(row + 16 * g, lo);
+            stq_le_p(row + 16 * g + 8, hi);
+        }
+        dma_memory_write(&address_space_memory,
+                         f->y + (hwaddr)r * f->y_stride, row, f->y_stride,
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void axera_vin_reg_write(AxeraVinState *s, hwaddr off, uint32_t val,
                                 bool from_cdma);
 
@@ -431,6 +691,8 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
     for (n = 0; n < VIN_OUTS; n++) {
         s->out[n].y_set = s->out[n].uv_set = false;
     }
+    s->ae_nptn = 0;
+    s->ae_raw_set = false;
 
     for (i = 0; i < CDMA_TOP_MAX; i++) {
         uint32_t ent[2], count;
@@ -459,6 +721,8 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
                                                 le32_to_cpu(pairs[2 * n]),
                                                 true);
                         }
+                        axera_vin_ae_set(s, key,
+                                         le32_to_cpu(pairs[2 * n]));
                         if ((key >= 0x7007 && key < 0x7037) ||
                             (key >> 12) == 0x024d0) {
                             axera_vin_wdma_set(s, key,
@@ -472,6 +736,12 @@ static void axera_vin_scan_cdma(AxeraVinState *s, hwaddr top)
         if (le32_to_cpu(ent[0]) & 0x80000000u) {
             break;
         }
+    }
+    if (s->ae_nptn) {
+        axera_vin_ae_stats(s);
+    }
+    if (s->ae_raw_set) {
+        axera_vin_ae_raw(s);
     }
     if (seen) {
         for (n = 0; n < VIN_OUTS; n++) {
@@ -692,6 +962,11 @@ static const Property axera_vin_props[] = {
     DEFINE_PROP_UINT32("cdma-list-off", AxeraVinState, cdma_list_off, 0),
     DEFINE_PROP_UINT32("cdma-list-off2", AxeraVinState, cdma_list_off2, 0),
     DEFINE_PROP_UINT64("cdma-list-base", AxeraVinState, cdma_list_base, 0),
+    DEFINE_PROP_LINK("sensor", AxeraVinState, sensor, TYPE_DEVICE,
+                     DeviceState *),
+    DEFINE_PROP_UINT64("ae-ref", AxeraVinState, ae_ref, 0),
+    DEFINE_PROP_UINT32("ae-shift", AxeraVinState, ae_shift, 4),
+    DEFINE_PROP_UINT32("ae-black", AxeraVinState, ae_black, 1024),
 };
 
 static void axera_vin_realize(DeviceState *dev, Error **errp)
@@ -701,6 +976,7 @@ static void axera_vin_realize(DeviceState *dev, Error **errp)
     if (s->fps < 1 || s->fps > 240) {
         error_setg(errp, "axera-vin: fps must be 1..240, not %u", s->fps);
     }
+
 }
 
 static void axera_vin_class_init(ObjectClass *klass, const void *data)

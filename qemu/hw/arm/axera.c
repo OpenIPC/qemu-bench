@@ -53,6 +53,7 @@
 #include "hw/misc/axera-ddr-pll.h"
 #include "hw/misc/axera-dma-checksum.h"
 #include "hw/misc/axera-dmaper.h"
+#include "hw/misc/axera-i2s.h"
 #include "hw/misc/axera-gzipd.h"
 #include "hw/misc/axera-dw-spi.h"
 #include "hw/misc/axera-eip130.h"
@@ -731,6 +732,9 @@ static void axera_create_ivps_engines(const AxeraIvpsEngineDesc *engines,
 
 static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
 {
+    /* the SC450AI, whose exposure scales axera-vin's 3A statistics */
+    DeviceState *ax620e_sensor = NULL;
+
     /*
      * vpp@4403000 (SPI 0x67), gdc@4404000 (SPI 0x68), tdp@4405000
      * (SPI 0x63) and the vo@4407000 DPU (SPI 0x61, IVPS's OSD stage):
@@ -803,7 +807,71 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
      * regardless) -- see hw/misc/axera-dmaper.c's own comment for the
      * full story and why raising this is harmless for BL1.
      */
-    sysbus_create_simple(TYPE_AXERA_DMAPER, 0x048a0000, pic[0x70]);
+    {
+        /*
+         * Audio: i2s_mst@6050000 ("axera,dwc-i2s-mst") and
+         * i2s_slv@6051000 ("axera,dwc-i2s-slv"), Synopsys DW_apb_i2s
+         * (see hw/misc/axera-i2s.c). The real devicetree gives them no
+         * "interrupts" at all ("IRQ index 0 not found" is expected), so
+         * dwc-i2s.c runs them through dmaengine on THIS controller:
+         * dmas = <&dma_per 0x0f &dma_per 0x0e> (rx, tx) for i2s_mst and
+         * <0x11 0x10> for i2s_slv. Those four request ids are the only
+         * flow-controlled ones; the request-mux the driver programs
+         * lives in the clk-periph syscon (DMAPER MMIO 1, mapped over
+         * the passive "axera-clk-periph" regbank at a higher priority).
+         * i2s_slv is linked with the inner codec as bit/frame master,
+         * so it reports COMP1.MODE_EN=0 ("master"=false); i2s_mst needs
+         * MODE_EN=1 for its CBS_CFS set_fmt to succeed.
+         *
+         * i2s_slv's frame clock comes from the actt codec, not from
+         * hw_params, and runs at 16 kHz although ALSA is told 8000:
+         * the camera's capture path (libax_audio, AI dev ChnCnt=2,
+         * PeriodSize=160, /proc/ax_proc/ai) reads 320 frames per
+         * 20 ms G.711 frame and decimates by two. At 8 kHz it got
+         * 25 Readi/s, RTSP audio ran at half rate with a 400 Hz test
+         * tone coming out at 800 Hz, and the A/V muxer starved video
+         * (0 RTP video packets); at 16 kHz it is 50 Readi/s, 50 audio
+         * packets/s with the tone at 400 Hz, and video streams.
+         */
+        static const struct {
+            hwaddr base;
+            bool master;
+            uint32_t rate;
+            int rx_req, tx_req;
+        } ax620e_i2s[] = {
+            { 0x06050000, true,  8000,  0x0f, 0x0e },
+            { 0x06051000, false, 16000, 0x11, 0x10 },
+        };
+        DeviceState *dmaper = qdev_new(TYPE_AXERA_DMAPER);
+        uint64_t paced = 0;
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(ax620e_i2s); i++) {
+            paced |= 1ULL << ax620e_i2s[i].rx_req;
+            paced |= 1ULL << ax620e_i2s[i].tx_req;
+        }
+        qdev_prop_set_uint64(dmaper, "paced-reqs", paced);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dmaper), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dmaper), 0, 0x048a0000);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dmaper), 1, 0x04870130, 2);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dmaper), 0, pic[0x70]);
+
+        for (i = 0; i < ARRAY_SIZE(ax620e_i2s); i++) {
+            DeviceState *i2s = qdev_new(TYPE_AXERA_I2S);
+
+            qdev_prop_set_bit(i2s, "master", ax620e_i2s[i].master);
+            qdev_prop_set_uint32(i2s, "rate", ax620e_i2s[i].rate);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(i2s), &error_fatal);
+            sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2s), 0,
+                                    ax620e_i2s[i].base, 2);
+            qdev_connect_gpio_out_named(i2s, AXERA_I2S_DMA_RX_REQ, 0,
+                qdev_get_gpio_in_named(dmaper, AXERA_DMAPER_REQ,
+                                       ax620e_i2s[i].rx_req));
+            qdev_connect_gpio_out_named(i2s, AXERA_I2S_DMA_TX_REQ, 0,
+                qdev_get_gpio_in_named(dmaper, AXERA_DMAPER_REQ,
+                                       ax620e_i2s[i].tx_req));
+        }
+    }
 
     /*
      * dw_dmac@48b0000, "axera,axi-dma-1.01a", GIC SPI 0x71: a real
@@ -987,6 +1055,8 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
         if (camera_board) {
             DeviceState *sensor = qdev_new("hisi-smartsens");
 
+            ax620e_sensor = sensor;
+
             qdev_prop_set_uint8(sensor, "id_high", 0xBD);
             qdev_prop_set_uint8(sensor, "id_low", 0x2F);
             qdev_prop_set_uint8(sensor, "address", 0x30);
@@ -1015,6 +1085,17 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
         qdev_prop_set_uint32(vin, "cdma-list-off", 0x1004);
         /* CDMA lists arm the range-1 interrupts (YUV WDMA done, AF done) */
         qdev_prop_set_bit(vin, "cdma-irq-regs", true);
+        /* 3A statistics: see axera_vin_ae_stats() */
+        if (ax620e_sensor) {
+            object_property_set_link(OBJECT(vin), "sensor",
+                                     OBJECT(ax620e_sensor), &error_fatal);
+            /*
+             * The scene reads as painted at 118 rows (~2.5 ms) at unity
+             * gain: the App's AE (set point 32) settles at ~69 rows,
+             * well short of the night threshold (nightExp 12518971).
+             */
+            qdev_prop_set_uint64(vin, "ae-ref", 121000);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);
@@ -2410,6 +2491,17 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         qdev_prop_set_uint32(vin, "cdma-list-off", 0x83004);
         qdev_prop_set_uint32(vin, "cdma-list-off2", 0x3004);
         qdev_prop_set_uint64(vin, "cdma-list-base", 0x40000000);
+        /* 3A statistics: see axera_vin_ae_stats() */
+        if (ax620u_sensor) {
+            object_property_set_link(OBJECT(vin), "sensor",
+                                     OBJECT(ax620u_sensor), &error_fatal);
+            /*
+             * The scene reads as painted at 440 rows at unity gain: the
+             * App's AE (set point 12) settles at ~143 rows, well short
+             * of the night threshold (nightExp 8518971).
+             */
+            qdev_prop_set_uint64(vin, "ae-ref", 450000);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vin), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vin), 0, 0x02400000);
         sysbus_connect_irq(SYS_BUS_DEVICE(vin), 0, pic[0x1b]);
@@ -2432,6 +2524,24 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
                                    pic[ax620u_i2c_irq[ic]]);
             }
         }
+    }
+
+    if (c->is_ax620x) {
+        /*
+         * i2s_mst@49ac000 (Synopsys DW_apb_i2s, see hw/misc/axera-i2s.c),
+         * GIC SPI 0x74 (Linux irq 41, "49ac000.i2s_mst" in
+         * /proc/interrupts). Linked to the ES8311 codec on i2c1 0x19 by
+         * ax_audio.ko's simple-card; with an interrupt present the 4.19
+         * dwc-i2s.c runs PIO (dw_pcm_push_tx/pop_rx from its own IRQ
+         * handler), no DMA. It sits inside the passive
+         * "axera-ax620u-clk" regbank (0x049a0000-0x049c0000, priority 1)
+         * and the clk timer overlay (priority 2), so map above both.
+         */
+        DeviceState *i2s = qdev_new(TYPE_AXERA_I2S);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(i2s), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2s), 0, 0x049ac000, 3);
+        sysbus_connect_irq(SYS_BUS_DEVICE(i2s), 0, pic[0x74]);
     }
 
     if (c->is_ax620x) {

@@ -208,6 +208,8 @@ cp qemu/hw/misc/axera-ddr-phy.c    "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-ddr-phy.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-dmaper.c     "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-dmaper.h "$QEMU_DIR/include/hw/misc/"
+cp qemu/hw/misc/axera-i2s.c        "$QEMU_DIR/hw/misc/"
+cp qemu/include/hw/misc/axera-i2s.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-dma-checksum.c "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/axera-dma-checksum.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/axera-gzipd.c       "$QEMU_DIR/hw/misc/"
@@ -776,6 +778,11 @@ if ! grep -q "'axera-dmaper.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-dmaper.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added axera-dmaper.c"
+fi
+if ! grep -q "'axera-i2s.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-i2s.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added axera-i2s.c"
 fi
 if ! grep -q "'axera-dma-checksum.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_AXERA', if_true: files('axera-dma-checksum.c'))" \
