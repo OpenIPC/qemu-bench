@@ -32,6 +32,7 @@
 #include "hw/sysbus.h"
 #include "net/net.h"
 #include "net/eth.h"
+#include "net/checksum.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/dma.h"
@@ -87,6 +88,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmDwmacState, XM_DWMAC)
 #define DES0_OWN        (1u << 31)
 #define DES1_TCH        (1u << 24)
 #define DES1_TER        (1u << 25)
+#define DES1_CIC_SHIFT  27      /* checksum insertion control, 2 bits */
 #define DES1_TFS        (1u << 29)
 #define DES1_TLS        (1u << 30)
 #define DES1_TIC        (1u << 31)
@@ -117,6 +119,7 @@ struct XmDwmacState {
     uint32_t flow_ctrl, addr_hi, addr_lo;
     uint32_t bus_mode, rx_base, tx_base, status, control, intr_ena, missed;
     uint32_t cur_tx, cur_rx, cur_tx_buf, cur_rx_buf;
+    uint32_t frame_cic;     /* the frame's checksum insertion, TDES1 28:27 */
 
     uint16_t phy_bmcr;
     uint32_t regs_size;
@@ -245,6 +248,7 @@ static void xm_dwmac_tx(XmDwmacState *s)
         if (d.des1 & DES1_TFS) {
             s->frame_len = 0;
             s->frame_overflow = false;
+            s->frame_cic = (d.des1 >> DES1_CIC_SHIFT) & 3;
         }
         const uint32_t len1 = d.des1 & 0x7ff;
         const uint32_t len2 = (d.des1 & DES1_TCH) ? 0 : (d.des1 >> 11) & 0x7ff;
@@ -271,6 +275,14 @@ static void xm_dwmac_tx(XmDwmacState *s)
                               "xm-dwmac: TX frame over %d bytes dropped\n",
                               FRAME_MAX);
             } else if (s->mac_ctrl & MAC_CONTROL_TE) {
+                /* checksum insertion, as the first descriptor asked: 1 the
+                 * IPv4 header, 2 and 3 the TCP/UDP/ICMP payload as well
+                 * (whether or not the driver left the pseudo header in) */
+                if (s->frame_cic) {
+                    net_checksum_calculate(s->frame, s->frame_len,
+                                           s->frame_cic == 1 ? CSUM_IP
+                                                             : CSUM_ALL);
+                }
                 qemu_send_packet(qemu_get_queue(s->nic), s->frame,
                                  s->frame_len);
             }

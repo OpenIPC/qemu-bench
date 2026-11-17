@@ -46,6 +46,13 @@ typedef struct AkSoCConfig {
      */
     bool        av130;
     uint32_t    chip_id_av;     /* the AV130's chip ID, SYSCTRL +0x3FC */
+    /*
+     * EV200: the ISP2 at 0x20000000 (ak-isp) writes frames, and a sensor
+     * from the image-sensor catalogue answers on I2C 0; sensor= overrides
+     * it, "none" leaves the bus empty.
+     */
+    bool        isp2;
+    const char *default_sensor;
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */

@@ -18,6 +18,8 @@
 #include "hw/boards.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/misc/ak-l2.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
@@ -56,6 +58,7 @@
 #define AK_ASPEN_UART2_BASE 0x201A0000
 #define AK_ASPEN_IRQ_UART2  24
 #define AK_IRQ_L2           12
+#define AK_IRQ_ISP          1
 #define AK_IRQ_GPIO         15
 #define AK_IRQ_MAC          16
 
@@ -92,6 +95,9 @@ static const AkSoCConfig ak3918ev200_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .isp2               = true,
+    /* the lab board's (and the Gwell boards'): OpenIPC's sc1345 driver */
+    .default_sensor     = "sc1345",
 };
 
 /* AnyCloud39EV300: mach-ak39 cpu.c AKCPU_VALUE for all three parts. */
@@ -228,7 +234,22 @@ struct AkMachineState {
     MachineState parent_obj;
     char *flash_file;
     uint32_t flash_jedec;
+    char *sensor;
 };
+
+static char *ak_machine_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(AK_MACHINE(obj)->sensor);
+}
+
+static void ak_machine_set_sensor(Object *obj, const char *value,
+                                  Error **errp)
+{
+    AkMachineState *s = AK_MACHINE(obj);
+
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
+}
 
 static char *ak_machine_get_flash_file(Object *obj, Error **errp)
 {
@@ -641,6 +662,19 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         qdev_prop_set_uint32(dev, "layout", c->i2c_layout);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
+        if (n == 0 && c->isp2) {
+            const char *sns = ams->sensor ? ams->sensor : c->default_sensor;
+
+            if (sns && strcmp(sns, "none")) {
+                if (!image_sensor_known(sns)) {
+                    error_report("sensor=%s: not in the image-sensor "
+                                 "catalogue", sns);
+                    exit(1);
+                }
+                image_sensor_create((I2CBus *)qdev_get_child_bus(dev, "i2c"),
+                                    sns);
+            }
+        }
         /* the AV130's I2C interrupts are its controller's TWI bank */
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(irqc, c->av130 ? 32 + n
@@ -676,8 +710,17 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                               qdev_get_gpio_in_named(spi[0], "cs-gpio", 0));
     }
 
+    if (c->isp2) {
+        sysbus_create_simple("ak-isp", 0x20000000,
+                             qdev_get_gpio_in(irqc, AK_IRQ_ISP));
+    }
     for (n = 0; n < ARRAY_SIZE(ak_regbanks); n++) {
-        DeviceState *rb = qdev_new("hisi-regbank");
+        DeviceState *rb;
+
+        if (c->isp2 && ak_regbanks[n].base == 0x20000000) {
+            continue;
+        }
+        rb = qdev_new("hisi-regbank");
 
         qdev_prop_set_uint32(rb, "size", ak_regbanks[n].size);
         qdev_prop_set_string(rb, "name", ak_regbanks[n].name);
@@ -766,6 +809,11 @@ static void ak_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "flash-jedec",
         "JEDEC ID the SPI NOR answers with (e.g. 0xEF4017); default: the "
         "part the boot header's SPIP descriptor names");
+    object_class_property_add_str(oc, "sensor",
+        ak_machine_get_sensor, ak_machine_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "EV200: the image sensor on I2C 0, by its catalogue name "
+        "(default sc1345), or none");
 }
 
 static const TypeInfo ak_machine_info = {
