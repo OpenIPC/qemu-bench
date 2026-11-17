@@ -620,14 +620,63 @@ static const AxeraSoCConfig ax620e_soc = {
 typedef struct AxeraCpu1Wake {
     ARMCPU *target;
     uint32_t low, high;
+    bool parked;        /* CPU1 halted in BL1's wfe loop, see below */
+    bool debug;         /* AXERA_SMP_DEBUG=1 */
 } AxeraCpu1Wake;
+
+/*
+ * WFE for BL1's secondary wait loop (bl1/board/arch/arm64/start.S,
+ * start_el1: zero the mailbox, then "2: wfe; ldr mailbox; cbz x4, 2b;
+ * br x4" -- the kernel's spin-table enable-method writes
+ * secondary_holding_pen's address here, cpu-release-addr). TCG runs
+ * WFE as a plain yield, so CPU1 re-read this window ~3 million times a
+ * second for the whole of U-Boot and the kernel's early boot, each read
+ * an MMIO access under the BQL, starving CPU0 (one boot sat in U-Boot
+ * for over six minutes). On silicon WFE sleeps until the SEV the
+ * releasing CPU sends after writing the mailbox; model that: CPU1
+ * reading an empty mailbox halts itself, and the write that fills the
+ * mailbox wakes it. The loop's own code still runs unchanged -- woken,
+ * CPU1 re-reads the address and takes its own "br x4" at EL1, exactly
+ * as on hardware.
+ */
+static void axera_cpu1_park_work(CPUState *cs, run_on_cpu_data data)
+{
+    AxeraCpu1Wake *s = data.host_ptr;
+
+    if (s->parked) {
+        cs->halted = 1;
+    }
+}
+
+static void axera_cpu1_unpark_work(CPUState *cs, run_on_cpu_data data)
+{
+    cs->halted = 0;
+}
 
 static uint64_t axera_cpu1_wake_read(void *opaque, hwaddr offset,
                                      unsigned size)
 {
     AxeraCpu1Wake *s = opaque;
+    CPUState *cs = CPU(s->target);
 
+    if (current_cpu == cs && !s->low && !s->high && !s->parked) {
+        s->parked = true;
+        if (s->debug) {
+            fprintf(stderr, "axera-smp: %.3f CPU1 parks in BL1 wfe loop\n",
+                    g_get_monotonic_time() / 1e6);
+        }
+        async_run_on_cpu(cs, axera_cpu1_park_work, RUN_ON_CPU_HOST_PTR(s));
+    }
     return offset == 0 ? s->low : s->high;
+}
+
+static void axera_cpu1_unpark(AxeraCpu1Wake *s)
+{
+    if (s->parked && (s->low || s->high)) {
+        s->parked = false;
+        async_run_on_cpu(CPU(s->target), axera_cpu1_unpark_work,
+                         RUN_ON_CPU_NULL);
+    }
 }
 
 static void axera_cpu1_wake_write(void *opaque, hwaddr offset,
@@ -635,13 +684,23 @@ static void axera_cpu1_wake_write(void *opaque, hwaddr offset,
 {
     AxeraCpu1Wake *s = opaque;
 
+    if (s->debug) {
+        fprintf(stderr, "axera-smp: %.3f cpu%d writes %s=0x%" PRIx64
+                " (CPU1 %s%s)\n", g_get_monotonic_time() / 1e6,
+                current_cpu ? current_cpu->cpu_index : -1,
+                offset ? "HIGH" : "LOW", value,
+                s->target->power_state == PSCI_OFF ? "off" : "on",
+                s->parked ? ", parked" : "");
+    }
     if (offset == 4) {
         s->high = value;
+        axera_cpu1_unpark(s);
         return;
     }
 
     s->low = value;
-    if (s->low || s->high) {
+    axera_cpu1_unpark(s);
+    if ((s->low || s->high) && s->target->power_state == PSCI_OFF) {
         uint64_t addr = ((uint64_t)s->high << 32) | s->low;
 
         /*
@@ -674,6 +733,27 @@ static void axera_cpu1_wake_write(void *opaque, hwaddr offset,
                                  &error_abort);
         arm_set_cpu_on_and_reset(arm_cpu_mp_affinity(s->target));
     }
+}
+
+/*
+ * System reset (the camera reboots itself once on first boot, and on
+ * every watchdog/"reboot") has to put CPU1 back behind its power gate.
+ * The flash-file= path never calls arm_load_kernel(), whose reset hook
+ * is what normally resets every CPU; only CPU0 got
+ * axera_bootrom_cpu_reset(). CPU1 thus kept running the previous
+ * kernel (parked in its cpu_park_loop or idle) across the reboot,
+ * power_state still ON, so the next BL1's release write was a no-op
+ * and that boot's spin-table release found nobody in BL1's wfe loop.
+ * cpu_reset() honours "start-powered-off": CPU1 is off and halted
+ * again, ready for BL1 to release it as on a cold boot.
+ */
+static void axera_cpu1_wake_reset(void *opaque)
+{
+    AxeraCpu1Wake *s = opaque;
+
+    cpu_reset(CPU(s->target));
+    s->low = s->high = 0;
+    s->parked = false;
 }
 
 static const MemoryRegionOps axera_cpu1_wake_ops = {
@@ -730,7 +810,8 @@ static void axera_create_ivps_engines(const AxeraIvpsEngineDesc *engines,
     }
 }
 
-static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
+static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
+                                 bool vin_itp_lockstep)
 {
     /* the SC450AI, whose exposure scales axera-vin's 3A statistics */
     DeviceState *ax620e_sensor = NULL;
@@ -1085,6 +1166,10 @@ static void axera_ax620e_periphs(qemu_irq *pic, bool camera_board)
         qdev_prop_set_uint32(vin, "cdma-list-off", 0x1004);
         /* CDMA lists arm the range-1 interrupts (YUV WDMA done, AF done) */
         qdev_prop_set_bit(vin, "cdma-irq-regs", true);
+        /* ...and, with CPU1 online, the ITP's done events follow its
+         * job and the next frame waits for them: see
+         * axera_vin_itp_poll() */
+        qdev_prop_set_bit(vin, "itp-lockstep", vin_itp_lockstep);
         /* 3A statistics: see axera_vin_ae_stats() */
         if (ax620e_sensor) {
             object_property_set_link(OBJECT(vin), "sensor",
@@ -1305,6 +1390,8 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
         MemoryRegion *wake_mr = g_new(MemoryRegion, 1);
 
         wake->target = cpu[1];
+        wake->debug = getenv("AXERA_SMP_DEBUG") != NULL;
+        qemu_register_reset(axera_cpu1_wake_reset, wake);
         memory_region_init_io(wake_mr, OBJECT(machine), &axera_cpu1_wake_ops,
                               wake, "axera.cpu1-wake", 8);
         memory_region_add_subregion_overlap(sysmem, 0x023400dcULL, wake_mr, 2);
@@ -1367,7 +1454,7 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
                    AXERA_UART0_FREQ / 16, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
 
-    axera_ax620e_periphs(pic, true);
+    axera_ax620e_periphs(pic, true, c == &ax620e_soc && smp_cpus > 1);
 
     {
         AxeraMachineState *ams = AXERA_MACHINE(machine);
@@ -2566,7 +2653,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
     }
 
     if (!c->is_ax620x) {
-        axera_ax620e_periphs(pic, false);
+        axera_ax620e_periphs(pic, false, false);
         qemu_register_reset(axera_ax620q_spl_handoff_reset,
                             (void *)(uintptr_t)(drive_get(IF_SD, 0, 1)
                                                 != NULL));
