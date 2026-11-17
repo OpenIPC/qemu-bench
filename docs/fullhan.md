@@ -200,6 +200,21 @@ interrupt: the V200 kernels tick on channel 0, the older ones on channel 1.
 **UART** (`fh-uart`). A 16550 with registers four bytes apart plus the
 DesignWare USR (0x7C), which the vendor drivers poll instead of LSR: TX FIFO
 empty and not full, RX FIFO not empty / full from the 16550's FIFO.
+On FH8626V100 each UART also answers across the rest of its 1 MB APB slot,
+the 0x100-byte window repeating (`uart_slot_mirror`). OpenIPC's 4.19
+FH8626 kernel needs this. Its `DEBUG_LL` UART is PHYS 0xF0700000 /
+VIRT 0xFE020000, which `head.S` maps with a single 1 MB section, so until
+`paging_init()` takes over, the early console writes THR and polls LSR at
+0xF0720000. Without the mirror that read hit the unimplemented periph
+space (0), and the kernel spun before printing a line. The camera boots,
+so the hardware answers there, and the FH8626 DTS puts every peripheral
+alone in its 1 MB slot.
+With it the release kernel boots on `-kernel`, runs the OpenIPC userland
+and writes the JFFS2 overlay. It then stops at `Loading vendor modules`:
+`load_fullhan` modprobes the media drivers, and the ARC and ISP aren't
+modelled. That kernel builds no Ethernet driver (the board it was brought
+up on is Wi-Fi only), so the DHCP check in `test-fullhan-boot.sh` can't
+pass on it.
 
 **SPI** (`fh-spi`). A DW SSI. SPI0 on V200 has Fullhan's "SPIC" additions:
 CCFGR (0xF4) with the data phase's wire count, a byte swap and 32-bit
