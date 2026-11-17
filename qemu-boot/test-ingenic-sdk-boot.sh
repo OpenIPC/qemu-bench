@@ -93,7 +93,8 @@ MODEL=
 case $MODEL in
 T41_NQ) S=t41; V=t41nq ;;
 T41_LQ) S=t41; V=t41lq ;;
-T41_XQ) S=t41; V=t41x ;;     # no XQ code in the EFUSE table; X is the grade
+T41_XQ|T41_ZX) S=t41; V=t41zx ;;  # no XQ code; the SDK's SPL calls 0x6666 T41ZX
+T41_A)  S=t41; V=t41a ;;
 T41_*) S=t41; V=t41n ;;
 T40_XP) S=t40; V=t40xp ;;
 T40_*) S=t40; V=t40n ;;

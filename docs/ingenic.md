@@ -212,9 +212,17 @@ Software tells the dies and their grades apart by three registers
 `-M <soc>,variant=<grade>` sets CPPSR and the code: `t10 t10l`, `t20
 t20l t20x`, `t21n t21l t21x t21z`, `t23n t23x`, `t30n t30l t30x t30a t30z`,
 `t31n t31l t31x t31a t31zl t31zx t31al t31zc t31lc`, `t40n t40nn t40xp
-t40a`, `t41nq t41n t41l t41lq t41lc t41zl t41zn t41x`; the first of each
-SoC is its default. DRAM stays `-m`. `ipctool` run in the guest reports
-the grade (T31X, T40XP, ...).
+t40a`, `t41nq t41n t41l t41lq t41lc t41zl t41zn t41zx t41a`; the first
+of each SoC is its default. DRAM stays `-m`. `ipctool` run in the guest
+reports the grade (T31X, T40XP, ...).
+
+T41's codes are the ones its SDK's SPL prints (`Board info: T41ZX` for
+0x6666, `T41A` for 0x4444). ipctool calls 0x6666 `T41X` and does not know
+0x4444, so on `t41zx` and `t41a` it disagrees with the SPL. No code is
+known for the T41XQ: its U-Boot is the T41ZX's with another DDR skew, and
+it boots on `t41zx`. Each grade's U-Boot sizes the DDR it was built for,
+so `-m` must be at least that: 64M for L/LQ, 128M for N/NQ/A and 256M for
+ZX/XQ. With less, the T41ZX's SPL restarts over and over (seen at 64M).
 
 ## Boot
 
