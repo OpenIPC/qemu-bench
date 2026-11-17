@@ -413,6 +413,7 @@ typedef struct Pic {
     const HevcEncParams *prm;
     /* inter coding (hevc-enc-inter.c.inc), per 8x8 CU */
     bool force_intra;               /* code the CU intra, not skipped */
+    bool late;                      /* past prm->deadline_us: skip */
     uint8_t *intra;                 /* intra (else skipped / inter) */
     int16_t *mvx, *mvy;             /* its vector, quarter samples */
     uint8_t *cbfy;                  /* luma coefficients */
@@ -675,8 +676,8 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
      * analysis -- most of this function's time -- to the CUs that move.
      * Bit-exact with the full decision.
      */
-    bool early_skip = false;
-    if (p_slice && p->ref && !p->force_intra) {
+    bool early_skip = p_slice && p->ref && !p->force_intra && p->late;
+    if (p_slice && p->ref && !p->force_intra && !early_skip) {
         int sse_s = 0;
         for (y = 0; y < 8 && sse_s <= p->skip_thr; y++) {
             const int o = (y0 + y) * p->w + x0;
@@ -1216,6 +1217,10 @@ static size_t slice_data(const HevcEncParams *prm, int w, int h, int qp,
                 if (!prm->sao_luma_only) {
                     cabac_decision(&c, CTX_SAO_TYPE, 0);
                 }
+            }
+            if (prm->deadline_us && !prm->inter && p.ref && !p.late &&
+                g_get_monotonic_time() > prm->deadline_us) {
+                p.late = true;
             }
             quadtree(&p, &c, x * ctb, yy * ctb, prm->log2_ctb, qp, p_slice);
             if (x == ctbw - 1 && yy == ctbh - 1) {

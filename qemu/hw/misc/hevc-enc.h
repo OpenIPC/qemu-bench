@@ -52,6 +52,14 @@ typedef struct HevcEncParams {
     /* every CU of a P slice skipped (merge candidate 0): the least a
      * picture can take, for a stream buffer with no more room */
     bool all_skip;
+    /*
+     * A deadline, g_get_monotonic_time() microseconds, 0 for none: once
+     * it has passed, the CUs of a P slice not yet coded are skipped (the
+     * reference's picture carries over there for one frame) -- an engine
+     * whose guest driver gives up on a job that runs too long. Only the
+     * intra / skip coder (inter false) looks at it.
+     */
+    int64_t deadline_us;
 } HevcEncParams;
 
 /* XM535 / XM533's library: CTB 16, no SAO; XM530V200's: CTB 32, SAO */

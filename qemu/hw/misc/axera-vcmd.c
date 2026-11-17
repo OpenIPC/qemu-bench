@@ -122,6 +122,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 #define EXECUTING_ID_OFF   0x68
 #define VCMD_REG_WINDOW    0x100   /* front-end registers kept as storage */
 #define START_TRIGGER      BIT(0)
+#define ABORT_MODE_NOW     BIT(3)  /* else: after the current cmdbuf */
 #define IRQ_ENDCMD         BIT(0)
 /* vcmdregistertable.h: JMPD "triggered by JMP command directly" (a JMP
  * with IE set), JMPP "triggered by JMP command when hw goes to PEND
@@ -396,10 +397,16 @@ struct AxeraVcmdState {
         uint32_t hevc_poc;
         HevcEncHdr hevc_hdr;
         bool hevc_api_hdr;      /* hevc_hdr holds the API's VPS/SPS/PPS */
+        /* a job's picture becomes the reference only once the guest
+         * has taken the job (axera_vcmd_job_commit): hevc_next and its
+         * POC wait there, hevc_spare is a picture buffer to reuse */
+        HevcEncRef *hevc_next, *hevc_spare;
+        uint32_t hevc_next_poc;
         uint32_t frames;
     } streams[AXERA_VCMD_STREAMS];
     uint32_t enc_jobs;
     bool resume_deferred;   /* RDY bump arrived while a job was running */
+    bool job_aborted;       /* the guest aborted the running job */
 
     /*
      * Asynchronous encode: the software encoder takes ~100 ms of host
@@ -415,6 +422,21 @@ struct AxeraVcmdState {
      */
     bool enc_busy;
     uint32_t job_reg[CORE_REG_COUNT];
+    /*
+     * The guest's own deadline: AX620U's ax_venc arms a 200-jiffy
+     * delayed work (seen firing ~1 s after the kick) per waited command
+     * buffer (HANTRO_IOCH_WAIT_CMDBUF) and, when it fires,
+     * force-aborts and resets the core and fails the frame; the encoder
+     * library never submits another frame after that (FrmEncNum frozen,
+     * IVPS chn0 BUF_EMPTY, App "zero bitrate" reboot). The software
+     * encoder takes ~0.2 s of host time per 4K picture, but several
+     * times that on a busy host, so a job gives up coding detail once
+     * its time budget (from the kick, AXERA_VCMD_BUDGET_MS, default
+     * 300) is spent: the rest of a P picture is skipped. job_deadline_us
+     * is g_get_monotonic_time() based, 0 for no deadline.
+     */
+    int64_t job_deadline_us;
+    uint32_t late_jobs;
     hwaddr susp_addr;       /* parked command buffer, resume point */
     uint32_t susp_len, susp_word, susp_chain;
 
@@ -431,6 +453,12 @@ static void axera_vcmd_stream_clear(AxeraVcmdStream *st)
 {
     if (st->hevc_ref) {
         hevc_enc_ref_free(st->hevc_ref);
+    }
+    if (st->hevc_next) {
+        hevc_enc_ref_free(st->hevc_next);
+    }
+    if (st->hevc_spare) {
+        hevc_enc_ref_free(st->hevc_spare);
     }
     memset(st, 0, sizeof(*st));
 }
@@ -842,9 +870,9 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
     }
     if (getenv("AXERA_VCMD_STATS") && (st->frames % 50) == 0) {
         fprintf(stderr, "AXERA_VCMD_STATS: %ux%u mode %u frame %u fmt %u "
-                "stride %u/%u card %d y[0..3]=%02x%02x%02x%02x\n", w, h,
-                mode, st->frames, fmt, stride_y, stride_c, card,
-                y[0], y[1], y[2], y[3]);
+                "stride %u/%u card %d y[0..3]=%02x%02x%02x%02x late %u\n",
+                w, h, mode, st->frames, fmt, stride_y, stride_c, card,
+                y[0], y[1], y[2], y[3], s->late_jobs);
     }
     st->frames++;
 
@@ -879,14 +907,12 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
         }
     } else if (mode == ENC_MODE_HEVC) {
         bool p_slice = !idr && st->hevc_ref;
+        HevcEncRef *recon = st->hevc_spare ? st->hevc_spare
+                                           : hevc_enc_ref_new();
+        HevcEncParams prm = hevc_params_ctb32_sao;
 
-        if (idr && st->hevc_ref) {
-            hevc_enc_ref_free(st->hevc_ref);
-            st->hevc_ref = NULL;
-        }
-        if (!st->hevc_ref) {
-            st->hevc_ref = hevc_enc_ref_new();
-        }
+        st->hevc_spare = NULL;
+        prm.deadline_us = s->job_deadline_us;
         if (idr) {
             HevcEncHdr hdr;
 
@@ -897,20 +923,30 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
         }
         if (st->hevc_api_hdr) {
             /* the API wrote (now or at an earlier IDR) the headers */
-            n = hevc_enc_hdr_frame(&st->hevc_hdr, qp ? qp : 26, p_slice,
+            HevcEncHdr hdr = st->hevc_hdr;
+
+            hdr.prm.deadline_us = prm.deadline_us;
+            n = hevc_enc_hdr_frame(&hdr, qp ? qp : 26, p_slice,
                                    p_slice ? st->hevc_poc + 1 : 0,
                                    p_slice ? st->hevc_ref : NULL,
-                                   st->hevc_ref, y, w, h, stride_y, uv,
+                                   recon, y, w, h, stride_y, uv,
                                    stride_c, out, cap);
         } else {
             /* none seen: our own VPS/SPS/PPS in front of the IDR */
-            n = hevc_enc_frame(&hevc_params_ctb32_sao, w, h, qp ? qp : 26,
+            n = hevc_enc_frame(&prm, w, h, qp ? qp : 26,
                                p_slice, p_slice ? st->hevc_poc + 1 : 0,
-                               p_slice ? st->hevc_ref : NULL, st->hevc_ref,
+                               p_slice ? st->hevc_ref : NULL, recon,
                                y, w, h, stride_y, uv, stride_c, out, cap);
         }
         if (n) {
-            st->hevc_poc = p_slice ? st->hevc_poc + 1 : 0;
+            st->hevc_next = recon;
+            st->hevc_next_poc = p_slice ? st->hevc_poc + 1 : 0;
+        } else {
+            st->hevc_spare = recon;
+        }
+        if (p_slice && prm.deadline_us &&
+            g_get_monotonic_time() > prm.deadline_us) {
+            s->late_jobs++;
         }
     } else if (mode == ENC_MODE_JPEG) {
         size_t cw = mbw * 8, ch = mbh * 8, i;
@@ -1033,6 +1069,39 @@ static bool axera_vcmd_exec_chain_from(AxeraVcmdState *s, hwaddr addr,
                                        uint32_t len, uint32_t word,
                                        uint32_t chain);
 
+/*
+ * The job is over: its picture becomes the stream's reference -- unless
+ * the guest aborted the job meanwhile (see the CONTROL write) and so
+ * dropped its frame: the next P picture must then predict from the last
+ * picture the guest did send, with the POC after it, or every frame up
+ * to the next IDR fails to decode.
+ */
+static void axera_vcmd_job_commit(AxeraVcmdState *s, bool taken)
+{
+    for (int i = 0; i < AXERA_VCMD_STREAMS; i++) {
+        AxeraVcmdStream *st = &s->streams[i];
+        HevcEncRef *pic = st->hevc_next;
+
+        if (!pic) {
+            continue;
+        }
+        st->hevc_next = NULL;
+        if (taken) {
+            HevcEncRef *old = st->hevc_ref;
+
+            st->hevc_ref = pic;
+            st->hevc_poc = st->hevc_next_poc;
+            pic = old;
+        }
+        if (pic) {
+            if (st->hevc_spare) {
+                hevc_enc_ref_free(st->hevc_spare);
+            }
+            st->hevc_spare = pic;
+        }
+    }
+}
+
 static int axera_vcmd_job_worker(void *opaque)
 {
     AxeraVcmdState *s = opaque;
@@ -1050,6 +1119,7 @@ static void axera_vcmd_job_done(void *opaque, int ret)
     int k;
 
     s->enc_busy = false;
+    axera_vcmd_job_commit(s, !s->job_aborted);
     for (k = 0; k < ARRAY_SIZE(out_regs); k++) {
         s->core_reg[out_regs[k]] = s->job_reg[out_regs[k]];
     }
@@ -1063,6 +1133,19 @@ static void axera_vcmd_job_done(void *opaque, int ret)
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   AXERA_VCMD_LATENCY_NS);
     }
+}
+
+/* The deadline of a job kicked now (see job_deadline_us). */
+static int64_t axera_vcmd_deadline(void)
+{
+    static int budget_ms = -1;
+
+    if (budget_ms < 0) {
+        const char *e = getenv("AXERA_VCMD_BUDGET_MS");
+
+        budget_ms = e ? atoi(e) : 300;
+    }
+    return budget_ms > 0 ? g_get_monotonic_time() + budget_ms * 1000LL : 0;
 }
 
 static bool axera_vcmd_async(void)
@@ -1079,8 +1162,11 @@ static bool axera_vcmd_async(void)
  * runs in the background and the interpreter must park. */
 static bool axera_vcmd_kick_job(AxeraVcmdState *s)
 {
+    s->job_deadline_us = axera_vcmd_deadline();
+    s->job_aborted = false;
     if (!axera_vcmd_async()) {
         axera_vcmd_run_encode_job(s, s->core_reg);
+        axera_vcmd_job_commit(s, true);
         return false;
     }
     memcpy(s->job_reg, s->core_reg, sizeof(s->job_reg));
@@ -1340,6 +1426,29 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                      AXERA_VCMD_LATENCY_NS);
         } else {
+            /*
+             * Abort with HWIF_VCMD_ABORT_MODE 0 lets the core finish the
+             * command buffer it is executing. AX620U's ax_venc aborts and
+             * resets the core (CONTROL 0x4, register reset, CONTROL 0)
+             * when its WAIT_CMDBUF watchdog finds a frame still being
+             * encoded, and then keeps believing the core runs: it only
+             * links the next frame's buffer behind the old one and bumps
+             * RDY_CMDBUF_COUNT, never START. Dropping the running job
+             * there left the core idle with nothing to resume and the
+             * encoder stopped for good; finishing it (and carrying on
+             * into whatever was linked behind it) costs that one frame.
+             */
+            if (s->work_state == WORK_STATE_WORK &&
+                !(value & ABORT_MODE_NOW)) {
+                qemu_log_mask(LOG_GUEST_ERROR, "axera-vcmd: abort (control "
+                              "0x%x) while running (encode job %u%s): "
+                              "finishing the command buffer\n",
+                              (uint32_t)value, s->enc_jobs,
+                              s->enc_busy ? " busy" : "");
+                /* the guest drops this frame (see job_commit) */
+                s->job_aborted |= s->enc_busy;
+                break;
+            }
             /* Abort: stop immediately, no completion interrupt. */
             timer_del(&s->completion_timer);
             s->work_state = WORK_STATE_IDLE;
@@ -1404,7 +1513,9 @@ static void axera_vcmd_write(void *opaque, hwaddr offset, uint64_t value,
                 axera_vcmd_core_write(s, creg, value);
                 if (creg == ENC_REG_GEOM && (value & ENC_E_BIT) &&
                     !s->enc_busy) {
+                    s->job_deadline_us = axera_vcmd_deadline();
                     axera_vcmd_run_encode_job(s, s->core_reg);
+                    axera_vcmd_job_commit(s, true);
                 }
             }
         }
