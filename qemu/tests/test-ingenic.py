@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 CPM = 0x10000000
 INTC = 0x10001000
@@ -3950,8 +3951,8 @@ def test_t23_uhi_and_ost_irq(qemu, tmp):
     ins[loop_top] = BEQ(t4, s2, (loop_end - (loop_top + 1)) & 0xFFFF)
     for ch in '\nDONE\n':
         put_ch(ch)
-    halt_at = len(ins)
-    ins += [BEQ(zero, zero, (-1) & 0xFFFF), NOP]
+    # UHI exit(0): t9 = 1, a0 = 0, sdbbp 1.
+    ins += [ORI(25, zero, 1), ORI(a0, zero, 0), 0x7000007F]
 
     # Subroutine: putc(a2)
     labels = {'putc': len(ins)}
@@ -4023,26 +4024,17 @@ def test_t23_uhi_and_ost_irq(qemu, tmp):
     with open(elf_path, 'wb') as f:
         f.write(ehdr + phdr + b'\x00' * (0x1000 - len(ehdr) - len(phdr)) + code)
 
-    proc = subprocess.Popen(
-        [qemu, '-M', 't23,auto-mem=off', '-m', '64M', '-nographic',
-         '-monitor', 'none', '-kernel', elf_path, '-dtb', dtb, '-initrd', rd],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    lines = []
-    try:
-        while len(lines) < 3:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            lines.append(line)
-            if line == 'DONE':
-                break
-    finally:
-        proc.kill()
-        proc.wait()
+    def boot(kernel, *extra):
+        result = subprocess.run(
+            [qemu, '-M', 't23,auto-mem=off', '-m', '64M', '-nographic',
+             '-monitor', 'none', '-semihosting', '-kernel', kernel,
+             '-dtb', dtb, *extra], capture_output=True, text=True,
+            check=True, timeout=15)
+        return result.stdout.splitlines()
 
-    check('UHI stub reached DONE', len(lines) >= 2 and lines[-1] == 'DONE', True)
-    if len(lines) >= 2:
+    lines = boot(elf_path, '-initrd', rd)
+    check('UHI stub reached DONE', lines[-1], 'DONE')
+    if lines[-1] == 'DONE':
         hdr = [int(x, 16) for x in lines[0].split()]
         check('T23 L2 CP0_Config2 = 0x80000347', hdr[0], 0x80000347)
         check('UHI a0 = -2', hdr[1], 0xFFFFFFFE)
@@ -4061,6 +4053,22 @@ def test_t23_uhi_and_ost_irq(qemu, tmp):
               'linux,initrd-start = <0x1000000>' in out_dts and
               'linux,initrd-end = <0x%x>' % (0x1000000 + 6 * 64) in out_dts,
               True)
+
+    # Clear BSS in the first 64 KiB-aligned block after the uImage payload.
+    for load in (0x80010000, 0x80008000):
+        clear_bss = [LUI(t2, (load >> 16) + 1), LUI(t3, (load >> 16) + 2),
+                     SW(zero, 0, t2), ADDIU(t2, t2, 4), BNE(t2, t3, -3), NOP]
+        payload = struct.pack('<6I', *clear_bss) + code
+        header = bytearray(struct.pack('>7I4B32s', 0x27051956, 0, 0, len(payload),
+                                       load, load, zlib.crc32(payload),
+                                       5, 5, 2, 0, b'UHI test'))
+        struct.pack_into('>I', header, 4, zlib.crc32(header))
+        uimage = os.path.join(tmp, 'test-uhi.uImage')
+        with open(uimage, 'wb') as f:
+            f.write(header + payload)
+        lines = boot(uimage)
+        check('uImage at %#x reads its FDT after clearing BSS' % load,
+              lines[-1] == 'DONE' and lines[1].startswith('d00dfeed'), True)
 
 
 def test_isp_t40_pipe1(qt):
@@ -5130,6 +5138,13 @@ def main():
         test_cpm(qt, 't23')
         test_t23_soc_gaps(qt, img8)
         qt.close()
+        flash_dtb = subprocess.run(
+            [a.qemu, '-M', 't23,flash-file=' + img8_path, '-dtb', 'unused.dtb',
+             '-display', 'none', '-serial', 'none', '-S'],
+            capture_output=True, text=True, timeout=5)
+        check('flash boot rejects an external DTB',
+              (flash_dtb.returncode, '-dtb requires -kernel' in flash_dtb.stderr),
+              (1, True))
         qt = QTest(a.qemu, 't23', ['-device', 'usb-kbd'])
         test_otg_port_power(qt)
         qt.close()

@@ -756,8 +756,9 @@ static void ingenic_nand_boot(IngenicMachineState *ims)
 #define UIMAGE_MAGIC    0x27051956
 #define UIMAGE_HDR      64
 
-/* Load a uImage or ELF; returns the entry point, sets *end (physical). */
-static uint64_t ingenic_load_kernel(const char *file, hwaddr *end)
+/* A uImage describes its payload, but omits the size of the kernel's BSS. */
+static uint64_t ingenic_load_kernel(const char *file, hwaddr *end,
+                                    hwaddr *uimage_start)
 {
     g_autofree uint8_t *img = NULL;
     g_autoptr(GError) gerr = NULL;
@@ -769,6 +770,7 @@ static uint64_t ingenic_load_kernel(const char *file, hwaddr *end)
 
     if (load_elf(file, NULL, cpu_mips_kseg0_to_phys, NULL, &entry, NULL,
                  &high, NULL, ELFDATA2LSB, EM_MIPS, 1, 0) > 0) {
+        *uimage_start = HWADDR_MAX;
         *end = cpu_mips_kseg0_to_phys(NULL, high);
         return entry;
     }
@@ -810,9 +812,9 @@ static uint64_t ingenic_load_kernel(const char *file, hwaddr *end)
         error_report("ingenic: %s: cannot decompress the kernel", file);
         exit(1);
     }
-    rom_add_blob_fixed("ingenic.kernel", data, n,
-                       cpu_mips_kseg0_to_phys(NULL, load));
-    *end = cpu_mips_kseg0_to_phys(NULL, load) + n;
+    *uimage_start = cpu_mips_kseg0_to_phys(NULL, load);
+    rom_add_blob_fixed("ingenic.kernel", data, n, *uimage_start);
+    *end = *uimage_start + n;
     return (int32_t)ep;
 }
 
@@ -831,7 +833,7 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
     const IngenicSocInfo *info = ims->info;
     g_autofree char *cmdline = NULL, *mem = NULL, *rd = NULL;
     const char *append = ms->kernel_cmdline;
-    hwaddr kend, args, initrd = 0;
+    hwaddr kend, uimage_start, args, initrd = 0;
     int64_t initrd_size = 0;
     uint64_t entry;
     uint32_t *argv;
@@ -841,7 +843,7 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
     size_t pos;
     uint8_t *buf;
 
-    entry = ingenic_load_kernel(ms->kernel_filename, &kend);
+    entry = ingenic_load_kernel(ms->kernel_filename, &kend, &uimage_start);
 
     if (ms->initrd_filename) {
         initrd = INITRD_OFFSET;
@@ -927,7 +929,19 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
         }
         fdt_pack(fdt);
         dt_size = fdt_totalsize(fdt);
-        dtb_pa = ROUND_UP(initrd ? initrd + initrd_size : kend, 64 * KiB);
+        if (initrd || uimage_start == HWADDR_MAX) {
+            dtb_pa = ROUND_UP(initrd ? initrd + initrd_size : kend, 64 * KiB);
+        } else if (uimage_start >= CAR_SIZE + dt_size) {
+            /* Low KSEG0 maps the locked cache until the guest unlocks it. */
+            dtb_pa = ROUND_DOWN(uimage_start - dt_size, 8);
+        } else {
+            /* The image occupies low RAM. Leave maximum room for its BSS. */
+            dtb_pa = args >= dt_size ? ROUND_DOWN(args - dt_size, 64 * KiB) : 0;
+            if (dtb_pa < kend) {
+                error_report("ingenic: no room for DTB above the uImage");
+                exit(1);
+            }
+        }
         if (dtb_pa + dt_size > args) {
             error_report("ingenic: DTB does not fit in RAM (0x%" PRIx64 " + 0x%x)",
                          (uint64_t)dtb_pa, dt_size);
@@ -1058,6 +1072,10 @@ static void ingenic_init(MachineState *ms)
     int sensor_bus;
     int i;
 
+    if (ms->dtb && !ms->kernel_filename) {
+        error_report("ingenic: -dtb requires -kernel");
+        exit(1);
+    }
     ims->info = info;
     var = ingenic_variant(info->soc, ims->variant);
     if (!var) {
