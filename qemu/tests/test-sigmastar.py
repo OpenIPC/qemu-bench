@@ -42,6 +42,9 @@ through the menuload, the test pattern with the ISP off).
 Then the infinity6 dies (ssc325, ssc337, ssc338q, ssc377): chip IDs and boot
 straps, the MIU BIST's pattern in DRAM, the I6E MMU, the I6E FSP following
 the bond, and card detect as an input pad; SPI NAND in place of the NOR.
+On ssc337 BDMA1 at its own 16-register spacing, and mi_ao's playback
+reader: TRIG and the level, its drain rate, RD_UNDERRUN and RD_EMPTY on
+MS_IRQ 42 as the ISR masks and clears them.
 
 Ifliegen (ssc034a, ssc034b): the bond defaults, the GIC-400 and its 224
 interrupts, a timer on a level MS_IRQ line, the URDMA TX FIFO, the AES and
@@ -3428,6 +3431,134 @@ def test_i6b0_media(qemu, tmp):
         qt.close()
 
 
+def test_i6b0_audio_out(qemu, tmp):
+    print('infinity6b0 audio out: mi_ao\'s reader (mhal HalAudDma*, DMA 1)')
+    path = i6_image(tmp, 'i6o.bin')
+    qt = QTest(qemu, 'ssc337,flash-file=' + path, [])
+    try:
+        # msys_dma_fill: a pattern fill on BDMA1, banks 0x100220 on this die
+        b1 = riu(0x1002, 0x10)
+        qt.writew(riu(0x1009, 0x54 + 2), 0)     # unmask MS_IRQ 32-47
+        qt.writew(b1 + 0x02 * 4, 0x0004)        # memory fill -> MIU0
+        qt.writew(b1 + 0x03 * 4, 0x0002)        # interrupt enable
+        qt.writew(b1 + 0x06 * 4, 0x0000)
+        qt.writew(b1 + 0x07 * 4, 0x0010)        # bus 0x100000
+        qt.writew(b1 + 0x08 * 4, 0x40)
+        qt.writew(b1 + 0x09 * 4, 0)
+        qt.writew(b1 + 0x0A * 4, 0xA5A5)
+        qt.writew(b1 + 0x0B * 4, 0xA5A5)
+        qt.writew(b1 + 0x00 * 4, 1)
+        check('BDMA1 0x10 registers on: the fill lands',
+              qt.readl(DRAM + 0x100000 + 0x3C), 0xA5A5A5A5)
+        check('and raises BdmaIsr, SPI 73',
+              (qt.readw(b1 + 0x01 * 4) & 8, intc_raw(qt, 41)), (8, 1))
+        qt.writew(b1 + 0x01 * 4, 0x1C)
+        check('cleared: low', intc_raw(qt, 41), 0)
+
+        bach = riu(0x1502, 0)
+        ctl0, rd, flags = bach + 0x40 * 4, bach + 0x41 * 4, bach + 0x48 * 4
+
+        def level():
+            qt.writew(rd, qt.readw(rd) | 0x1000)
+            v = qt.readw(bach + 0x47 * 4)
+            qt.writew(rd, qt.readw(rd) & ~0x1000)
+            return v
+
+        def trig(units):
+            qt.writew(bach + 0x44 * 4, units)   # what the CPU added
+            qt.writew(rd, qt.readw(rd) ^ 0x2000)
+
+        qt.writew(bach + 0x01 * 4, 0 << 4)      # reader 8 kHz
+        qt.writew(bach + 0x77 * 4, 0xE000)      # mono, as the camera has it
+        qt.writew(rd, 0x4000)                   # HalAudDmaReset
+        qt.writew(rd, 0x0000)
+        qt.writew(bach + 0x42 * 4, 0x0022)      # MIU 0x110000
+        qt.writew(bach + 0x43 * 4, 2048 // 8)
+        qt.writew(bach + 0x46 * 4, (2048 - 512) // 8)
+        check('idle: RD_UNDERRUN, and RD_OVERRUN against a zero threshold',
+              qt.readw(flags) & 0x1C, 0x0C)
+        trig(2048 // 8)
+        check('TRIG adds 0x88 to the level', level(), 256)
+        qt.writew(ctl0, 0x0100)                 # RD_EMPTY clear pulse
+        qt.writew(ctl0, 0x0000)
+        qt.writew(ctl0, 0x2400 | 0x0002)        # UNDERRUN, EMPTY; enable
+        qt.writew(rd, qt.readw(rd) | 0x8000)
+        qt.step(20 * 10 ** 6)
+        check('20 ms at 8 kHz mono: 320 bytes played', level(), 256 - 40)
+        check('above the threshold: RD_OVERRUN only, low',
+              (qt.readw(flags) & 0x1C, intc_raw(qt, 42)), (0x08, 0))
+        qt.step(20 * 10 ** 6)
+        check('under it: RD_UNDERRUN raises the line',
+              (qt.readw(flags) & 0x1C, intc_raw(qt, 42)), (0x0C, 1))
+        qt.writew(ctl0, qt.readw(ctl0) & ~0x2000)
+        check('the ISR masks it: low', intc_raw(qt, 42), 0)
+        qt.step(200 * 10 ** 6)
+        check('run dry: RD_EMPTY latches and raises it',
+              (qt.readw(flags) & 0x10, intc_raw(qt, 42)), (0x10, 1))
+        qt.writew(ctl0, qt.readw(ctl0) | 0x0100)
+        qt.writew(ctl0, qt.readw(ctl0) & ~0x0100)
+        check('cleared while still dry: it latches again',
+              qt.readw(flags) & 0x10, 0x10)
+        qt.writew(bach + 0x01 * 4, 3 << 4)      # 16 kHz
+        trig(1024 // 8)
+        qt.writew(ctl0, qt.readw(ctl0) | 0x0100)
+        qt.writew(ctl0, qt.readw(ctl0) & ~0x0100)
+        check('refilled, then cleared: low',
+              (qt.readw(flags) & 0x10, intc_raw(qt, 42)), (0, 0))
+        qt.step(10 * 10 ** 6)
+        check('16 kHz mono: 320 bytes in 10 ms', level(), 128 - 40)
+        qt.writew(rd, qt.readw(rd) & ~0x8000)
+        qt.step(50 * 10 ** 6)
+        check('stopped: the level holds', level(), 128 - 40)
+        qt.writew(rd, qt.readw(rd) | 0x4000)
+        qt.writew(rd, qt.readw(rd) & ~0x4000)
+        check('reset: the level is gone', level(), 0)
+
+        # a clear pulse on a dry running reader, with nothing read after it
+        qt.writew(ctl0, 0x0400 | 0x0002)        # EMPTY enabled only
+        qt.writew(rd, qt.readw(rd) | 0x8000)
+        qt.writew(ctl0, qt.readw(ctl0) | 0x0100)
+        qt.writew(ctl0, qt.readw(ctl0) & ~0x0100)
+        check('cleared while dry, no read after: the line is back up',
+              intc_raw(qt, 42), 1)
+        qt.writew(ctl0, 0)
+        qt.writew(rd, 0x4000)
+        qt.writew(rd, 0x0000)
+
+        # set up in the other order: run and TRIG first, the size last
+        qt.writew(bach + 0x43 * 4, 0)
+        qt.writew(rd, 0x8000)
+        trig(0)
+        qt.writew(bach + 0x44 * 4, 512 // 8)
+        qt.writew(rd, qt.readw(rd) ^ 0x2000)    # 512 bytes, but no buffer
+        qt.writew(bach + 0x43 * 4, 2048 // 8)   # the size arrives
+        trig(1024 // 8)
+        qt.step(20 * 10 ** 6)
+        check('size written last: it still drains (16 kHz, 640 bytes in '
+              '20 ms)', level(), 128 - 80)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ssc338q,flash-file=' + path, [])
+    try:
+        b1 = riu(0x1002, 0x20)
+        qt.writew(b1 + 0x02 * 4, 0x0004)
+        qt.writew(b1 + 0x07 * 4, 0x0010)
+        qt.writew(b1 + 0x08 * 4, 0x40)
+        qt.writew(b1 + 0x0A * 4, 0x5A5A)
+        qt.writew(b1 + 0x0B * 4, 0x5A5A)
+        qt.writew(b1 + 0x00 * 4, 1)
+        check('infinity6e keeps BDMA1 0x20 registers on',
+              qt.readl(DRAM + 0x100000), 0x5A5A5A5A)
+        bach = riu(0x1502, 0)
+        qt.writew(bach + 0x47 * 4, 0x1234)
+        qt.writew(bach + 0x41 * 4, 0x8000 | 0x2000)
+        check('infinity6e: no reader, its registers are storage',
+              (qt.readw(bach + 0x47 * 4), qt.readw(bach + 0x48 * 4) & 0x1C),
+              (0x1234, 0))
+    finally:
+        qt.close()
+
+
 def test_i6c_media(qemu, tmp):
     print('infinity6c media: CMDQ, MIU MMU, the Wave5 queue and results')
     path = i6_image(tmp, 'i6c.bin')
@@ -3908,6 +4039,7 @@ def main():
     test_guest_limits(args.qemu, tmp)
     test_i6_stats_audio(args.qemu, tmp)
     test_i6b0_media(args.qemu, tmp)
+    test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)

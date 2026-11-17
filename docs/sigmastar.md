@@ -347,6 +347,12 @@ What the boot chain needs, each found by a vendor image failing without it:
   and an address with no entry reaches nothing. BDMA goes through it too.
   BDMA's address registers are full words: the 12-bit mask in the IPLs is
   theirs. Masking to 28 bits wraps those clears onto the kernel's page tables.
+- **BDMA's channels are 16 registers apart on infinity6 and 6b0**, 32 on 6e
+  and 6c: those kernels' `registers.h` put BDMA1-3 at banks `0x100220`,
+  `0x100240`, `0x100260`, against `0x100240`, `0x100280`, `0x1002C0`.
+  `msys_dma_fill` runs on BDMA1 and sleeps until its interrupt (SPI 73), so
+  with the wider spacing an `ssc337`'s first `MI_RGN_Create` (an OSD) never
+  returned. `chan-regs` on `sstar-bdma`.
 
 Not modelled: USB beyond one host and BDMA's second group on infinity6c
 (`0x1F201600`). The second SD host is bank `0x1410` on every infinity6 die,
@@ -511,7 +517,35 @@ frame of 1017 was flat. `ssc377` keeps `sstar-jpe`, not run.
 Audio capture reaches `waybeam` on `ssc337`, `ssc338q` and `ssc377`: a 1 kHz tone
 at amplitude 8000 with no RTP gaps. `mi_ai` reads the ring as two interleaved
 channels. `ssc377`'s DMA counts 16-byte units and goes through the MIU MMU; with
-8-byte units the tone overwrote the kernel. Playback (AO) is not modelled.
+8-byte units the tone overwrote the kernel.
+
+Playback (AO) is modelled on infinity6 and 6b0: `mi_ao`'s reader, DMA 1 in the
+same bank, which is infinity3's BACH reader (`sstar-i3-bach`) as `mhal.ko`'s
+`HalAudDma*` program it for index 1. The rate is `0x02` [7:4], mono `0xEE` bit
+15, and the reader drains at that rate on the virtual clock into the machine's
+`audiodev`:
+
+```
+qemu-system-arm -M ssc337,flash-file=cam.bin,audiodev=snd0 \
+    -audiodev wav,id=snd0,path=out.wav ...
+```
+
+Checked against an `ssc337` + SC2336 camera running OpenIPC, its registers read
+idle and while a 3 s, 440 Hz clip played through the HTTP `/play_audio`
+endpoint: the same rate, mono, buffer (`0x86` `0x2000`), thresholds (`0x8A` 0,
+`0x8C` `0x1FD8`), enables (`0x80` bits 1 and 10) and flags (`0x90` bits 2 and 3
+while it plays, 4 latched once it has drained). The twin, booting that
+camera's own flash, plays the clip into `out.wav`: 2.97 s of 440 Hz at the
+clip's amplitude. Two differences from infinity3's model, both from the camera:
+RD_OVERRUN is set at any level against a zero threshold, so the comparison is
+"at or over", and bit 7, which `HalAudDmaGetFlags` also reads, never sets. Not
+run on infinity6e or 6c: there `playback` is off and the reader's registers are
+storage.
+
+On that camera's firmware the streamer runs here only with `jpeg` and
+`video0` off: the JPEG channel never finishes a picture, and with video on
+the streamer crashes (SIGSEGV) a moment after the encoder's first output.
+Neither is investigated yet; audio in and out run with both off.
 
 ## Part defaults
 
