@@ -248,6 +248,7 @@ struct AxeraSpiNorState {
     unsigned int session_start_cmd_len;
     bool write_enable_latch;
     bool env_overridden;
+    bool env_from_flash;
     bool mtd_config_overridden;
     uint8_t latched_opcode;
     uint32_t latched_addr;
@@ -581,7 +582,7 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
          * that range); a read straddling its end gets the real flash
          * bytes instead of running past the end of env[].
          */
-        if (!s->env_overridden &&
+        if (!s->env_overridden && !s->env_from_flash &&
             s->latched_addr >= AXERA_ENV_OFFSET &&
             s->latched_addr < AXERA_ENV_OFFSET + AXERA_ENV_SIZE &&
             total <= AXERA_ENV_OFFSET + AXERA_ENV_SIZE - s->latched_addr) {
@@ -875,6 +876,8 @@ static void axera_spi_nor_reset(DeviceState *dev)
 
 static const Property axera_spi_nor_properties[] = {
     DEFINE_PROP_STRING("file", AxeraSpiNorState, file),
+    /* Serve the flash file's own U-Boot env instead of the synthetic one. */
+    DEFINE_PROP_BOOL("env-from-flash", AxeraSpiNorState, env_from_flash, false),
 };
 
 static void axera_spi_nor_class_init(ObjectClass *klass, const void *data)

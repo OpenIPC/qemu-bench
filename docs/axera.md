@@ -267,6 +267,11 @@ below.
   been off-CPU for 5 ms (`=0` turns it off, `QEMU_VCLOCK_STARVE_LOG=1`
   logs pauses). It does not cover every case: on a host loaded far
   beyond its cores AX620U can still miss a flash deadline.
+  OpenIPC firmware on these machines: the AX620E SPI-NOR model serves a
+  synthetic U-Boot environment by default (what the stock Xiongmai
+  firmware needs); `-global axera-spi-nor.env-from-flash=on` serves the
+  flash file's own env instead, so OpenIPC's U-Boot keeps what
+  `saveenv`/`fw_setenv` wrote.
   `QEMU_TLBI_RELAXED=1` (patch 0006) makes broadcast TLB flushes cheaper
   and roughly doubles AX620U's frame rate on a loaded host.
 - **AX620U's spin-table SMP is modelled; AX620Q's is not yet.** Both
