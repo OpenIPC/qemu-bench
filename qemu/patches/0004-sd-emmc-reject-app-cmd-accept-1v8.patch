@@ -1,0 +1,79 @@
+sd: eMMC rejects APP_CMD, advertises 1.8V in OCR
+
+Two real bugs in hw/sd/sd.c's eMMC model, found debugging why Axera's
+U-Boot (and, separately, BL1's low-level MMC driver) never gets past
+MMC probe against this project's cadence.sdhci + TYPE_EMMC wiring,
+traced with gdb breakpoints against the real guest driver:
+
+- sd_set_ocr() only ever advertised the 3.3V-and-up window
+  (R_OCR_VDD_VOLTAGE_WIN_HI_MASK). A real board's devicetree
+  sdhci-caps-mask can leave only the 1.8V bit surviving in the host's
+  own capability-derived ACMD41/CMD1 argument; ANDing that against an
+  OCR that never advertises 1.8V is always 0, so the card never
+  reaches sd_ready_state and CMD2 (ALL_SEND_CID) keeps failing,
+  looping the host's op-cond retry forever. Added
+  R_OCR_ACCEPT_SWITCH_1V8_MASK (and the matching 1.8V case in
+  sd_set_voltage(), the same shape as the existing 3.0V/3.3V cases).
+
+- sd_cmd_APP_CMD (CMD55) had no sd_is_emmc() guard, unlike every other
+  eMMC-specific branch in this file. Real eMMC silicon doesn't answer
+  CMD55 as an OCR-negotiation precursor the way SD cards do -- voltage
+  negotiation is CMD1 alone. With APP_CMD unconditionally succeeding,
+  an eMMC-configured host that still probes ACMD41 first (as this
+  project's BL1/U-Boot MMC core does) gets misled into the SD path,
+  which sd_proto_emmc's deliberately empty .acmd table can never
+  satisfy the way the host expects. Now CMD55 itself fails for an
+  eMMC device, same as real silicon, sending the host down the CMD1
+  path from the start.
+
+Verified: with both fixes plus a real -drive if=sd,index=0 backing the
+emmc@1b40000 cadence.sdhci instance, U-Boot's MMC probe on the ax630c
+machine gets past CMD2/op-cond negotiation. (BL1's own lower-level
+sdhci_cdns.c driver still stalls later, retrying CMD6/SWITCH -- a
+separate, not yet understood gap in this tree's Cadence SDHCI command-
+completion/busy-signalling model, tracked separately.)
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 40a75a4..4dbf4c9 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -334,6 +334,7 @@ static void sd_set_voltage(SDState *sd, uint16_t millivolts)
+
+     switch (millivolts) {
+     case 3001 ... 3600: /* SD_VOLTAGE_3_3V */
++    case 1701 ... 2000: /* SD_VOLTAGE_1_8V */
+     case 2001 ... 3000: /* SD_VOLTAGE_3_0V */
+         break;
+     default:
+@@ -417,7 +418,7 @@ static void sd_ocr_powerup(void *opaque)
+ static void sd_set_ocr(SDState *sd)
+ {
+     /* All voltages OK */
+-    sd->ocr = R_OCR_VDD_VOLTAGE_WIN_HI_MASK;
++    sd->ocr = R_OCR_VDD_VOLTAGE_WIN_HI_MASK | R_OCR_ACCEPT_SWITCH_1V8_MASK;
+
+     if (sd_is_spi(sd)) {
+         /*
+@@ -2185,6 +2186,23 @@ static sd_rsp_type_t sd_cmd_APP_CMD(SDState *sd, SDRequest req)
+     default:
+         break;
+     }
++    if (sd_is_emmc(sd)) {
++        /*
++         * eMMC has no APP_CMD/ACMD41 sequence: voltage negotiation is
++         * CMD1 alone. Real eMMC silicon doesn't answer CMD55 this way,
++         * so a host that gets a successful APP_CMD response here
++         * reasonably concludes it's talking to an SD card and proceeds
++         * down the ACMD41 path -- which sd_proto_emmc's empty .acmd
++         * table can then never satisfy the way the host expects, since
++         * the voltage window it builds from the SD OCR fields doesn't
++         * line up with what this model's eMMC OCR advertises. The card
++         * never reaches sd_ready_state, CMD2 keeps failing, and the
++         * host retries ACMD41 forever. Failing CMD55 itself up front,
++         * like real eMMC, sends the host down the CMD1 path from the
++         * start instead.
++         */
++        return sd_illegal;
++    }
+     if (!sd_is_spi(sd) && !sd_req_rca_same(sd, req)) {
+         return sd_r0;
+     }

@@ -54,25 +54,44 @@ static void hisi_regbank_write(void *opaque, hwaddr offset,
     }
 }
 
+/*
+ * .valid.max_access_size is 8, not 4, even though every block this
+ * model has ever needed is a plain 32-bit-register file: a handful of
+ * real drivers (confirmed live: the vendor's own closed-source camera
+ * ISP module's register-backup memcpy against axera-vin) read/write
+ * these banks 8 bytes at a time anyway -- real hardware has no
+ * trouble with that (two adjacent 32-bit registers, read/written
+ * together), but this model's own hisi_regbank_read()/_write() were
+ * rejecting anything wider than 4 outright, turning a harmless real
+ * access pattern into a guest-visible synchronous external abort.
+ * .impl stays at 4: the memory core's own generic access-size
+ * splitting turns one 8-byte request into two correctly-adjacent
+ * 4-byte offset/4 and offset/4+1 calls into the same unmodified
+ * functions below, so this needed no changes to how reads/writes
+ * actually touch `regs`.
+ */
 static const MemoryRegionOps hisi_regbank_ops = {
     .read = hisi_regbank_read,
     .write = hisi_regbank_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 4,
-    .valid.max_access_size = 4,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
 };
 
 /*
  * The same bank for blocks whose drivers use byte and halfword accesses
  * (Goke's HAL has readb/readw for every block): narrower accesses become
- * read-modify-writes of the 32-bit word.
+ * read-modify-writes of the 32-bit word. Also accepts 8-byte accesses,
+ * for the same reason as hisi_regbank_ops above.
  */
 static const MemoryRegionOps hisi_regbank_subword_ops = {
     .read = hisi_regbank_read,
     .write = hisi_regbank_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
+    .valid.max_access_size = 8,
     .impl.min_access_size = 4,
     .impl.max_access_size = 4,
 };

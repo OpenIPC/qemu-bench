@@ -1,0 +1,92 @@
+tcg: opt-in relaxed broadcast TLB flush (QEMU_TLBI_RELAXED=1)
+
+A guest broadcast TLB invalidate (ARM TLBI ...IS) normally runs as
+"safe work": every vCPU stops until all have flushed. The AX620U kernel
+flushes user ranges page by page, ~26k times a second while the camera
+App maps frame buffers, and the exclusive sections cost a quarter of
+vCPU time. With QEMU_TLBI_RELAXED=1 the issuing vCPU flushes at once
+and the others get queued work instead -- weaker than the architecture
+(another vCPU may finish its current TB on the old translation), so it
+is off by default: only 1, on, true or yes enable it. Measured ~30%
+more frames on AX620U.
+
+--- a/accel/tcg/cputlb.c	2026-11-17 05:43:12.908486793 +0000
++++ b/accel/tcg/cputlb.c	2026-11-17 05:43:12.926280201 +0000
+@@ -354,6 +354,41 @@
+  * where all queued work will be finished before execution starts
+  * again.
+  */
++/*
++ * QEMU_TLBI_RELAXED=1 (experiment): a broadcast TLB invalidate ("TLBI ...IS",
++ * ARMv7 TLBIMVAIS etc.) flushes the issuing vCPU at once and queues the
++ * others' flushes asynchronously (they run at those vCPUs' next exit
++ * check, within a TB), instead of a "synced" safe-work item, which stops
++ * every vCPU in an exclusive section per invalidated page. Linux on a
++ * 4-CPU ARMv7 guest issues tens of thousands of these per second when
++ * user mappings churn. Weaker than DSB ISH semantics: another vCPU may
++ * still use the old translation for the rest of its current TB.
++ */
++static bool tlb_flush_relaxed(void)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        const char *e = getenv("QEMU_TLBI_RELAXED");
++
++        /* an explicit yes only: unset, 0, off, "" keep the synced path */
++        on = e && (!strcmp(e, "1") || !g_ascii_strcasecmp(e, "on") ||
++                   !g_ascii_strcasecmp(e, "true") ||
++                   !g_ascii_strcasecmp(e, "yes"));
++    }
++    return on;
++}
++
++static void tlb_flush_src_cpu(CPUState *src, run_on_cpu_func fn,
++                              run_on_cpu_data d)
++{
++    if (tlb_flush_relaxed() && src == current_cpu) {
++        fn(src, d);
++    } else {
++        async_safe_run_on_cpu(src, fn, d);
++    }
++}
++
+ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
+                              run_on_cpu_data d)
+ {
+@@ -427,7 +462,7 @@
+     tlb_debug("mmu_idx: 0x%"PRIx16"\n", idxmap);
+ 
+     flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
+-    async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
++    tlb_flush_src_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
+ }
+ 
+ void tlb_flush_all_cpus_synced(CPUState *src_cpu)
+@@ -630,7 +665,7 @@
+     if (idxmap < TARGET_PAGE_SIZE) {
+         flush_all_helper(src_cpu, tlb_flush_page_by_mmuidx_async_1,
+                          RUN_ON_CPU_TARGET_PTR(addr | idxmap));
+-        async_safe_run_on_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_1,
++        tlb_flush_src_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_1,
+                               RUN_ON_CPU_TARGET_PTR(addr | idxmap));
+     } else {
+         CPUState *dst_cpu;
+@@ -650,7 +685,7 @@
+         d = g_new(TLBFlushPageByMMUIdxData, 1);
+         d->addr = addr;
+         d->idxmap = idxmap;
+-        async_safe_run_on_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_2,
++        tlb_flush_src_cpu(src_cpu, tlb_flush_page_by_mmuidx_async_2,
+                               RUN_ON_CPU_HOST_PTR(d));
+     }
+ }
+@@ -839,7 +874,7 @@
+     }
+ 
+     p = g_memdup(&d, sizeof(d));
+-    async_safe_run_on_cpu(src_cpu, tlb_flush_range_by_mmuidx_async_1,
++    tlb_flush_src_cpu(src_cpu, tlb_flush_range_by_mmuidx_async_1,
+                           RUN_ON_CPU_HOST_PTR(p));
+ }
+ 

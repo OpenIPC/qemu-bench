@@ -1,0 +1,6 @@
+#ifndef HW_MISC_AXERA_EIP130_H
+#define HW_MISC_AXERA_EIP130_H
+
+#define TYPE_AXERA_EIP130 "axera-eip130"
+
+#endif /* HW_MISC_AXERA_EIP130_H */
