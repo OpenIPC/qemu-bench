@@ -349,6 +349,13 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-ak-isp.py']
         run: python3 qemu/tests/test-ak-isp.py
 
+      # EV300's Allegro core as the SDK's encoder library drives it: the
+      # Anyka start and core-status registers, 0x1C0-byte command entries,
+      # overflow, the L2 prefetch block and JPEG, decoded with ffmpeg.
+      - name: Anyka EV300 Allegro encoder (ingenic-avpu, anyka=on)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-ak-allegro.py']
+        run: python3 qemu/tests/test-ak-allegro.py
+
       # The SigmaStar infinity2m models driven over qtest the way the vendor
       # IPL, U-Boot and kernel drive them: mask-ROM staging of the IPL, RIU
       # storage and boot status bits, timers into the main-intc, the FSP's
