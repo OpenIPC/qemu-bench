@@ -46,6 +46,29 @@ typedef struct AkSoCConfig {
      */
     bool        av130;
     uint32_t    chip_id_av;     /* the AV130's chip ID, SYSCTRL +0x3FC */
+    /*
+     * EV200, AK3918EV300: the ISP2 at 0x20000000 (ak-isp) writes frames,
+     * and a sensor from the image-sensor catalogue answers on I2C 0;
+     * sensor= overrides it, "none" leaves the bus empty.
+     */
+    bool        isp2;
+    bool        isp2_ev300;     /* the EV300 core's buffer enables and table */
+    uint32_t    isp_fps;        /* 0: ak-isp's default */
+    const char *default_sensor;
+    /*
+     * The GPIO wired to the sensor's active-low reset, or -1; the board's,
+     * not the SoC's, so sensor-reset= overrides it.
+     */
+    int         sensor_reset_gpio;
+    /* EV200: the Hantro 8290 video encoder at 0x20020000 (ak-h8290) */
+    bool        venc_h8290;
+    /*
+     * AnyCloud39EV300: the Allegro core at 0x20020000, the same encoder IP
+     * (and the same Allegro control software, run on the CPU by the SDK's
+     * libakv_encode) as the Ingenic AVPU, so it is the ingenic-avpu model
+     * with its register block at +0x8000.
+     */
+    bool        venc_allegro;
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */

@@ -17,6 +17,13 @@
  *               {0x0A, 0x0F}, {0x0B, 0x22}.
  *
  * Everything else is RAM: the sensor tables the ISP writes read back.
+ *
+ * The "reset-n" input is the part's RESETB pin, active low: while a board
+ * holds it low the sensor answers nothing on I2C (a read sees the bus's
+ * 0xFF), and releasing it brings the registers back to their defaults.  A
+ * board that does not wire it leaves the sensor running.  The PE3020-W
+ * (AK3918EV300) has it on GPIO 79; with the EVB's 49 in its device tree the
+ * F37's ID read 0xFF / 0xFF once the ISP started (OpenIPC/builder#234).
  * hisi_soi_exposure() decodes the registers an ISP model renders the
  * picture from (the SOI map the JX-F22 driver, libdrv_ms_cus_JXF22.so,
  * programs; the other JX parts share it):
@@ -57,6 +64,7 @@ struct HisiF37State {
     uint8_t  cur_reg;
     bool     have_reg;
     uint8_t  regs[F37_REG_COUNT];
+    bool     held;          /* RESETB low */
 };
 
 static void hisi_f37_reset_regs(HisiF37State *s)
@@ -72,6 +80,9 @@ static int hisi_f37_event(I2CSlave *i2c, enum i2c_event event)
 {
     HisiF37State *s = HISI_F37(i2c);
 
+    if (s->held && (event == I2C_START_SEND || event == I2C_START_RECV)) {
+        return -1;              /* in reset: no acknowledge */
+    }
     if (event == I2C_START_SEND) {
         s->have_reg = false;
     }
@@ -128,6 +139,23 @@ static void hisi_f37_sensor_exposure(Object *sensor, ImageSensorExposure *e)
     e->gain = soi.gain;
     e->width = soi.width;
     e->height = soi.height;
+}
+
+static void hisi_f37_set_reset_n(void *opaque, int n, int level)
+{
+    HisiF37State *s = opaque;
+
+    if (!level && !s->held) {
+        s->cur_reg = 0;
+        s->have_reg = false;
+        hisi_f37_reset_regs(s);
+    }
+    s->held = !level;
+}
+
+static void hisi_f37_init(Object *obj)
+{
+    qdev_init_gpio_in_named(DEVICE(obj), hisi_f37_set_reset_n, "reset-n", 1);
 }
 
 static void hisi_f37_reset(DeviceState *dev)
@@ -189,6 +217,7 @@ static void hisi_f37_register_types(void)
             .name          = TYPE_HISI_F37,
             .parent        = TYPE_I2C_SLAVE,
             .instance_size = sizeof(HisiF37State),
+            .instance_init = hisi_f37_init,
             .class_size    = sizeof(HisiSoiClass),
             .class_init    = hisi_f37_class_init,
             .interfaces    = hisi_f37_interfaces,

@@ -12,12 +12,15 @@
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "qemu/bswap.h"
+#include "qemu/cutils.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/anyka.h"
 #include "hw/boards.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/misc/ak-l2.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
@@ -56,8 +59,11 @@
 #define AK_ASPEN_UART2_BASE 0x201A0000
 #define AK_ASPEN_IRQ_UART2  24
 #define AK_IRQ_L2           12
+#define AK_IRQ_ISP          1
 #define AK_IRQ_GPIO         15
 #define AK_IRQ_MAC          16
+#define AK_IRQ_VENC         2
+#define AK_VENC_BASE        0x20020000
 
 /* arch/arm/tools/mach-types: anyka_ak39xx, every board file uses it. */
 #define AK_MACH_AK39XX      3892
@@ -72,7 +78,7 @@ static const struct {
     uint32_t size;
 } ak_regbanks[] = {
     { "ak-isp",     0x20000000, 0x20000 },
-    { "ak-venc",    0x20020000, 0x10000 },
+    { "ak-venc",    AK_VENC_BASE, 0x10000 },  /* EV200: ak-h8290 */
     { "ak-dac",     0x20110000, 0x8000 },
     { "ak-adc",     0x20118000, 0x8000 },
     { "ak-irda",    0x20160000, 0x10000 },
@@ -92,6 +98,11 @@ static const AkSoCConfig ak3918ev200_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .isp2               = true,
+    /* the lab board's (and the Gwell boards'): OpenIPC's sc1345 driver */
+    .default_sensor     = "sc1345",
+    .sensor_reset_gpio  = -1,
+    .venc_h8290         = true,
 };
 
 /* AnyCloud39EV300: mach-ak39 cpu.c AKCPU_VALUE for all three parts. */
@@ -102,8 +113,16 @@ static const AkSoCConfig ak3916ev300_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_allegro       = true,
 };
 
+/*
+ * The camera input is the HeimVision PE3020-W's (ak3918ev300-heimvision-
+ * pe3020w.dts, OpenIPC/builder#234): a JX-F37 on I2C 0 at 0x40, one MIPI
+ * lane, 25 fps, its reset on GPIO 79 (active low).  Other EV300 boards
+ * differ: the TECKIN TC100 has a JX-F23 with its reset on the EVB's GPIO 49
+ * (sensor=jxf23,sensor-reset=49).
+ */
 static const AkSoCConfig ak3918ev300_soc = {
     .desc               = "Anyka AK3918EV300 (ARM926EJ-S, 64 MB DDR2)",
     .chip_id            = 0x20160100,
@@ -111,6 +130,12 @@ static const AkSoCConfig ak3918ev300_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_allegro       = true,
+    .isp2               = true,
+    .isp2_ev300         = true,
+    .isp_fps            = 25,
+    .default_sensor     = "jxf37",
+    .sensor_reset_gpio  = 79,
 };
 
 static const AkSoCConfig ak3919ev300_soc = {
@@ -120,6 +145,7 @@ static const AkSoCConfig ak3919ev300_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_allegro       = true,
 };
 
 /*
@@ -228,7 +254,43 @@ struct AkMachineState {
     MachineState parent_obj;
     char *flash_file;
     uint32_t flash_jedec;
+    char *sensor;
+    char *sensor_reset;
 };
+
+static char *ak_machine_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(AK_MACHINE(obj)->sensor);
+}
+
+static void ak_machine_set_sensor(Object *obj, const char *value,
+                                  Error **errp)
+{
+    AkMachineState *s = AK_MACHINE(obj);
+
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
+}
+
+static char *ak_machine_get_sensor_reset(Object *obj, Error **errp)
+{
+    return g_strdup(AK_MACHINE(obj)->sensor_reset);
+}
+
+static void ak_machine_set_sensor_reset(Object *obj, const char *value,
+                                        Error **errp)
+{
+    AkMachineState *s = AK_MACHINE(obj);
+    uint64_t pin;
+
+    if (strcmp(value, "none") &&
+        (qemu_strtou64(value, NULL, 0, &pin) || pin >= 96)) {
+        error_setg(errp, "sensor-reset: a GPIO number 0..95, or none");
+        return;
+    }
+    g_free(s->sensor_reset);
+    s->sensor_reset = g_strdup(value);
+}
 
 static char *ak_machine_get_flash_file(Object *obj, Error **errp)
 {
@@ -460,6 +522,8 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     gsize img_len = 0;
     DeviceState *sysctrl, *irqc, *l2, *dev;
     DeviceState *spi[2] = { NULL, NULL };
+    DeviceState *sensor = NULL;
+    int reset_gpio;
     Object *cpuobj;
     ARMCPU *cpu;
     int n;
@@ -641,6 +705,19 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         qdev_prop_set_uint32(dev, "layout", c->i2c_layout);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base[n]);
+        if (n == 0 && c->isp2) {
+            const char *sns = ams->sensor ? ams->sensor : c->default_sensor;
+
+            if (sns && strcmp(sns, "none")) {
+                if (!image_sensor_known(sns)) {
+                    error_report("sensor=%s: not in the image-sensor "
+                                 "catalogue", sns);
+                    exit(1);
+                }
+                sensor = image_sensor_create(
+                    (I2CBus *)qdev_get_child_bus(dev, "i2c"), sns);
+            }
+        }
         /* the AV130's I2C interrupts are its controller's TWI bank */
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(irqc, c->av130 ? 32 + n
@@ -675,15 +752,77 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         qdev_connect_gpio_out(dev, c->flash_cs_gpio,
                               qdev_get_gpio_in_named(spi[0], "cs-gpio", 0));
     }
+    /*
+     * The sensor's reset, where the model has one: held while the pad is
+     * low.  The pad reads high (its pull-up) until the kernel drives it.
+     */
+    reset_gpio = c->sensor_reset_gpio;
+    if (ams->sensor_reset) {
+        reset_gpio = strcmp(ams->sensor_reset, "none") ?
+                     strtol(ams->sensor_reset, NULL, 0) : -1;
+    }
+    if (sensor && reset_gpio >= 0 &&
+        object_property_find(OBJECT(sensor), "reset-n[0]")) {
+        qdev_connect_gpio_out(dev, reset_gpio,
+                              qdev_get_gpio_in_named(sensor, "reset-n", 0));
+    }
 
+    if (c->isp2) {
+        DeviceState *isp = qdev_new("ak-isp");
+
+        qdev_prop_set_bit(isp, "ev300", c->isp2_ev300);
+        if (c->isp_fps) {
+            qdev_prop_set_uint32(isp, "fps", c->isp_fps);
+        }
+        if (sensor) {
+            object_property_set_link(OBJECT(isp), "sensor", OBJECT(sensor),
+                                     &error_fatal);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(isp), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(isp), 0, 0x20000000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(isp), 0,
+                           qdev_get_gpio_in(irqc, AK_IRQ_ISP));
+    }
     for (n = 0; n < ARRAY_SIZE(ak_regbanks); n++) {
-        DeviceState *rb = qdev_new("hisi-regbank");
+        DeviceState *rb;
 
+        if (c->isp2 && ak_regbanks[n].base == 0x20000000) {
+            continue;
+        }
+        if ((c->venc_h8290 || c->venc_allegro) &&
+            ak_regbanks[n].base == AK_VENC_BASE) {
+            continue;
+        }
+        rb = qdev_new("hisi-regbank");
         qdev_prop_set_uint32(rb, "size", ak_regbanks[n].size);
         qdev_prop_set_string(rb, "name", ak_regbanks[n].name);
         qdev_prop_set_bit(rb, "sub-word", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(rb), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(rb), 0, ak_regbanks[n].base);
+    }
+    /*
+     * EV200's video encoder, a Hantro 8290 (OpenIPC's ak-venc: "8290
+     * encoder at /dev/video0, irq 2").
+     */
+    if (c->venc_h8290) {
+        sysbus_create_simple("ak-h8290", AK_VENC_BASE,
+                             qdev_get_gpio_in(irqc, AK_IRQ_VENC));
+    }
+    /*
+     * EV300's Allegro core (OpenIPC's uio_vcodec: "Allegro encoder at [mem
+     * 0x20020000-0x2002ffff], irq 2"), interrupt mask and status at +0x8014
+     * and +0x8018: the AVPU's common registers from reg-base 0x8000, its
+     * cores, list entries and L2 prefetch as libakv_encode drives them
+     * ("anyka"), the whole 64 KiB window.
+     */
+    if (c->venc_allegro) {
+        dev = qdev_new("ingenic-avpu");
+        qdev_prop_set_uint32(dev, "reg-base", 0x8000);
+        qdev_prop_set_bit(dev, "anyka", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_VENC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           qdev_get_gpio_in(irqc, AK_IRQ_VENC));
     }
     /*
      * AV100 extras (anycloud_ak3918av100_common.dtsi): the second MIPI/CSI
@@ -766,6 +905,16 @@ static void ak_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "flash-jedec",
         "JEDEC ID the SPI NOR answers with (e.g. 0xEF4017); default: the "
         "part the boot header's SPIP descriptor names");
+    object_class_property_add_str(oc, "sensor",
+        ak_machine_get_sensor, ak_machine_set_sensor);
+    object_class_property_set_description(oc, "sensor",
+        "EV200, AK3918EV300: the image sensor on I2C 0, by its catalogue "
+        "name (default sc1345 / jxf37), or none");
+    object_class_property_add_str(oc, "sensor-reset",
+        ak_machine_get_sensor_reset, ak_machine_set_sensor_reset);
+    object_class_property_set_description(oc, "sensor-reset",
+        "the GPIO wired to the sensor's active-low reset (AK3918EV300 "
+        "default 79, the PE3020-W's), or none");
 }
 
 static const TypeInfo ak_machine_info = {

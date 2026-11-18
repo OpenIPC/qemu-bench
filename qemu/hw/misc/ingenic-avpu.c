@@ -103,11 +103,38 @@
  * done bits and JPEG's result registers land, under the lock, when the
  * whole batch is coded.  Addresses are masked to the 29 bits the bus
  * sees, so KSEG0/1 forms work too.
+ *
+ * "anyka": the AK3918EV300's core (the AnyCloud39EV300 SDK's
+ * libakv_encode 2.2, Allegro's control software run on the CPU through
+ * OpenIPC's uio_vcodec, which acks 0x14 / 0x18 and hands the library one
+ * status bit at a time).  Gen 1's command words and common registers,
+ * and otherwise (AK_* below):
+ *   0x080 + 16c / 0x084 + 16c  core c's list address / start (2 Enc1,
+ *         8 Enc2, 0x10 JPEG); libakv starts Enc1 and then Enc2 on the
+ *         same list
+ *   0x200 (c + 1) + 0x100  status: bits 0 / 2 Enc1 / Enc2 busy (libakv
+ *         asserts they are clear at a start), bit 1 the last picture ran
+ *         out of stream buffer; + 0x104 its bytes (both read by the
+ *         interrupt handler, which re-codes a picture at a higher QP on
+ *         an overflow or past the frame-size limit)
+ *   0x200 (c + 1) + 0x1C0-0x1E8  JPEG's R0-R10 (gen 1's layout), +0x1F0
+ *         status, +0x1F4 bytes, +0x1F8 bit 1 overflow; JPEG done is
+ *         interrupt bit 18, Enc1 / Enc2 done 4c / 4c + 2 as gen 1 (for
+ *         H.264 libakv unmasks Enc2's alone: EndAvcEntropy)
+ *   0x1204 / 0x1208, 0x4004-0x4014  the L2 prefetch, set up before each
+ *         picture of the channel that has it (AK_L2_*), else bypassed
+ * List entries are 0x1C0 bytes.  W8 bit 11 has Enc1 hand the slice to
+ * Enc2 on chip (no intermediate buffer), and Enc2 codes it into WF0-WFC
+ * after the header libakv wrote, no tail bits.  The status: entropy at
+ * 0x100 (bit 3 overflow) / 0x104 (bytes, no flags), Enc1's 0x130-0x16C,
+ * the 64-bit counters at 0x158-0x16C high word first.  The bus is 32 bits
+ * (DDR at 0x80000000).  libakv reads no ID register: the IDs are gen 1's.
+ *
  * "-global ingenic-avpu.dump=DIR" appends each channel's H.264 / HEVC
  * output to DIR/avpu-<w>x<h>.h264 / .h265 and writes JPEGs to
  * DIR/avpu-<n>.jpg; "-global ingenic-avpu.trace=1" logs every start and
- * command entry's words, trace=2 every register write too (LOG_UNIMP,
- * -d unimp).
+ * command entry's words and each batch's host coding time, trace=2 every
+ * register write too (LOG_UNIMP, -d unimp).
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -144,8 +171,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicAvpuState, INGENIC_AVPU)
 #define AVPU_REGS_SIZE      0x1000
 /* gen 2 (T41): the common page, then a page per core (G2_CORE) */
 #define AVPU_REGS_SIZE2     0x3000
-#define AVPU_NREGS          (AVPU_REGS_SIZE2 / 4)
+/* Anyka (EV300): the rest of the 64 KiB window, the L2 prefetch among it */
+#define AVPU_REGS_SIZE_AK   0x8000
+#define AVPU_NREGS          (AVPU_REGS_SIZE_AK / 4)
 #define AVPU_JOB_NS         200000
+/* the bus: 29 bits on Ingenic (KSEG0/1 forms alias), 32 on Anyka */
 #define AVPU_DMA_MASK       0x1fffffff
 /* the largest picture coded: past the parts' 8K, a bound on host memory */
 #define AVPU_MAX_DIM        8192
@@ -199,6 +229,39 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicAvpuState, INGENIC_AVPU)
 #define G2_BUSY             0x01C
 #define G2_STATUS1          0x5C0
 #define G2_STATUS2          0xDC0
+
+/* Anyka's core ("anyka", the header comment): offsets from reg-base */
+#define AK_CL_ADDR(c)       (0x080 + 0x10 * (c))
+#define AK_START(c)         (0x084 + 0x10 * (c))
+#define AK_START_ENC1       (1u << 1)
+#define AK_START_ENC2       (1u << 3)
+#define AK_START_JPEG       (1u << 4)
+#define AK_CORE(c)          (0x200 * ((c) + 1))
+/*
+ * The EV300 has one Allegro core, and libakv_encode starts only core 0;
+ * starts and status pages of others are not modelled (each would need its
+ * own interrupt bits, 4c and 4c + 2, which meet JPEG's 18 at core 4).
+ */
+#define AK_NCORES           1
+#define AK_STATUS           0x100
+#define AK_STATUS_ENC1      (1u << 0)
+#define AK_STATUS_OVERFLOW  (1u << 1)
+#define AK_STATUS_ENC2      (1u << 2)
+#define AK_BYTES            0x104
+#define AK_JPEG(n)          (0x1C0 + 4 * (n))
+#define AK_JPEG_STATUS      0x1F0
+#define AK_JPEG_BYTES       0x1F4
+#define AK_JPEG_FLAGS       0x1F8
+#define AK_IRQ_JPEG         (1u << 18)
+#define AK_CL_ENTRY         0x1C0
+#define AK_L2_SCRATCH0      0x1204
+#define AK_L2_SCRATCH1      0x1208
+#define AK_L2_CTRL          0x4004
+#define AK_L2_CTRL_ON       (1u << 0)
+#define AK_L2_CTRL_BYPASS   (3u << 10)
+#define AK_L2_Y             0x4008
+#define AK_L2_C             0x400C
+#define AK_L2_PITCH         0x4014
 
 #define AVPU_MAX_JOBS       16
 #define AVPU_MAX_FRAMES     4
@@ -264,6 +327,9 @@ typedef struct AvpuJob {
     uint32_t jpeg[11];          /* JPEG's R0..R10 as the batch began */
     uint32_t jpeg_bytes;        /* JPEG's results, for its registers */
     bool jpeg_wrote, jpeg_overflow;
+    uint32_t bytes;             /* Anyka: the picture's stream bytes */
+    bool overflow;              /* and whether a slice ran out of room */
+    bool coded;                 /* it wrote a stream */
 } AvpuJob;
 
 struct IngenicAvpuState {
@@ -275,6 +341,8 @@ struct IngenicAvpuState {
 
     uint32_t reg_base;
     uint8_t gen;                        /* 1: T31, T40; 2: T41 */
+    bool anyka;                         /* EV300's core: AK_* */
+    uint32_t dma_mask;
     uint32_t hw_id;                     /* ID1: the part's encoder HW ID */
     uint32_t regs[AVPU_NREGS];
     uint32_t irq_status;
@@ -311,6 +379,7 @@ struct IngenicAvpuState {
     AvpuJob run[AVPU_MAX_JOBS];
     uint32_t nrun;
     uint32_t run_pending;
+    AvpuJob *cur;                       /* the job the thread codes */
 };
 
 static void avpu_update(IngenicAvpuState *s)
@@ -327,10 +396,10 @@ static void avpu_update(IngenicAvpuState *s)
 #define AVPU_IVDC_BASE      0x80000000u
 #define AVPU_IVDC_SIZE      0x02000000u
 
-static hwaddr avpu_addr(hwaddr a)
+static hwaddr avpu_addr(const IngenicAvpuState *s, hwaddr a)
 {
     a &= 0xffffffff;
-    return a - AVPU_IVDC_BASE < AVPU_IVDC_SIZE ? a : a & AVPU_DMA_MASK;
+    return a - AVPU_IVDC_BASE < AVPU_IVDC_SIZE ? a : a & s->dma_mask;
 }
 
 /*
@@ -379,37 +448,41 @@ static void avpu_ram(hwaddr pa, uint8_t *buf, size_t n, bool write)
  * wraps to 0, as the masked address would on silicon (the IVDC's store
  * is not behind the mask and is taken as it is).
  */
-static void avpu_dma(hwaddr a, void *buf, size_t n, bool write)
+static void avpu_dma(const IngenicAvpuState *s, hwaddr a, void *buf,
+                     size_t n, bool write)
 {
-    hwaddr pa = avpu_addr(a);
+    const hwaddr mask = s->dma_mask;
+    hwaddr pa = avpu_addr(s, a);
 
     while (n) {
         size_t chunk = n;
 
-        if (pa <= AVPU_DMA_MASK && chunk > AVPU_DMA_MASK + 1 - pa) {
-            chunk = AVPU_DMA_MASK + 1 - pa;
+        if (pa <= mask && chunk > mask + 1 - pa) {
+            chunk = mask + 1 - pa;
         }
         avpu_ram(pa, buf, chunk, write);
         buf = (uint8_t *)buf + chunk;
         n -= chunk;
-        pa = (pa + chunk) & AVPU_DMA_MASK;
+        pa = (pa + chunk) & mask;
     }
 }
 
-static void avpu_read(hwaddr a, void *buf, size_t n)
+static void avpu_read(const IngenicAvpuState *s, hwaddr a, void *buf,
+                      size_t n)
 {
-    avpu_dma(a, buf, n, false);
+    avpu_dma(s, a, buf, n, false);
 }
 
-static void avpu_write_mem(hwaddr a, const void *buf, size_t n)
+static void avpu_write_mem(const IngenicAvpuState *s, hwaddr a,
+                           const void *buf, size_t n)
 {
-    avpu_dma(a & AVPU_DMA_MASK, (void *)buf, n, true);
+    avpu_dma(s, a & s->dma_mask, (void *)buf, n, true);
 }
 
-static void avpu_stl(hwaddr a, uint32_t v)
+static void avpu_stl(const IngenicAvpuState *s, hwaddr a, uint32_t v)
 {
     v = cpu_to_le32(v);
-    avpu_write_mem(a, &v, 4);
+    avpu_write_mem(s, a, &v, 4);
 }
 
 /*
@@ -458,7 +531,7 @@ static void avpu_g2_entry(const uint32_t *r, uint32_t *e)
 
 static hwaddr avpu_entry_size(const IngenicAvpuState *s)
 {
-    return s->gen == 2 ? CL_ENTRY2 : CL_ENTRY;
+    return s->gen == 2 ? CL_ENTRY2 : s->anyka ? AK_CL_ENTRY : CL_ENTRY;
 }
 
 /* entry ea of a list, in gen 1's form */
@@ -469,7 +542,7 @@ static void avpu_load_entry(IngenicAvpuState *s, hwaddr ea, uint32_t *e)
     if (s->gen == 2) {
         g_autofree uint32_t *r = g_malloc(CL_ENTRY2);
 
-        avpu_read(ea, r, CL_ENTRY2);
+        avpu_read(s, ea, r, CL_ENTRY2);
         for (i = 0; i < CL_ENTRY2 / 4; i++) {
             r[i] = le32_to_cpu(r[i]);
         }
@@ -487,7 +560,8 @@ static void avpu_load_entry(IngenicAvpuState *s, hwaddr ea, uint32_t *e)
         avpu_g2_entry(r, e);
         return;
     }
-    avpu_read(ea, e, CL_ENTRY);
+    memset(e, 0, CL_ENTRY);
+    avpu_read(s, ea, e, avpu_entry_size(s));
     for (i = 0; i < CL_ENTRY / 4; i++) {
         e[i] = le32_to_cpu(e[i]);
     }
@@ -497,6 +571,24 @@ static void avpu_load_entry(IngenicAvpuState *s, hwaddr ea, uint32_t *e)
 static void avpu_status(IngenicAvpuState *s, hwaddr ea, uint32_t off,
                         uint32_t v)
 {
+    if (s->anyka) {
+        /*
+         * Enc2's bytes (gen 1's 0x1E4) are the entropy status at 0x104, the
+         * overflow not bit 30 there but bit 3 of 0x100; the 64-bit counters
+         * are read high word first; nothing past 0x16C is status
+         */
+        if (off >= 0x1E4) {
+            off = off - 0x1E4 + 0x104;
+        }
+        if (off == 0x104) {
+            avpu_stl(s, ea + 0x100, v & (1u << 30) ? 1u << 3 : 0);
+            v &= 0x3FFFFFFF;
+        } else if (off >= 0x158 && off <= 0x16C) {
+            off ^= 4;
+        } else if (off > 0x16C) {
+            return;
+        }
+    }
     if (s->gen == 2) {
         if (off >= 0x1E4) {
             off = G2_STATUS2 + off - 0x1E4;
@@ -508,15 +600,16 @@ static void avpu_status(IngenicAvpuState *s, hwaddr ea, uint32_t off,
             return;                     /* not in gen 2's status */
         }
     }
-    avpu_stl(ea + off, v);
+    avpu_stl(s, ea + off, v);
 }
 
 /*
  * An NV12 picture pw x ph at pitch from Y / C into a w x h one (w, h the
  * multiples of 16 it is coded at) at stride w, edges replicated.
  */
-static void avpu_load_nv12(hwaddr ya, hwaddr ca, int pitch, int pw, int ph,
-                           int w, int h, uint8_t *y, uint8_t *uv)
+static void avpu_load_nv12(const IngenicAvpuState *s, hwaddr ya, hwaddr ca,
+                           int pitch, int pw, int ph, int w, int h,
+                           uint8_t *y, uint8_t *uv)
 {
     int r;
 
@@ -524,7 +617,7 @@ static void avpu_load_nv12(hwaddr ya, hwaddr ca, int pitch, int pw, int ph,
         uint8_t *l = y + (size_t)r * w;
 
         if (r < ph) {
-            avpu_read(ya + (hwaddr)r * pitch, l, pw);
+            avpu_read(s, ya + (hwaddr)r * pitch, l, pw);
             memset(l + pw, l[pw - 1], w - pw);
         } else {
             memcpy(l, y + (size_t)(ph - 1) * w, w);
@@ -538,7 +631,7 @@ static void avpu_load_nv12(hwaddr ya, hwaddr ca, int pitch, int pw, int ph,
             /* at least one Cb/Cr pair, so that one is there to replicate */
             const int cw = MAX(pw & ~1, 2);
 
-            avpu_read(ca + (hwaddr)r * pitch, l, cw);
+            avpu_read(s, ca + (hwaddr)r * pitch, l, cw);
             for (x = cw; x < w; x += 2) {
                 l[x] = l[cw - 2];
                 l[x + 1] = l[cw - 1];
@@ -552,6 +645,7 @@ static void avpu_load_nv12(hwaddr ya, hwaddr ca, int pitch, int pw, int ph,
 /* ---- the stream writer: emulation prevention, a circular buffer ---------- */
 
 typedef struct AvpuWriter {
+    const IngenicAvpuState *s;
     hwaddr base;
     uint32_t size, start, room;
     uint32_t count;                     /* bytes from start */
@@ -560,17 +654,19 @@ typedef struct AvpuWriter {
     bool full;
 } AvpuWriter;
 
-static void avpu_wr_init(AvpuWriter *w, uint32_t base, uint32_t size,
-                         uint32_t start, uint32_t room)
+static void avpu_wr_init(const IngenicAvpuState *s, AvpuWriter *w,
+                         uint32_t base, uint32_t size, uint32_t start,
+                         uint32_t room)
 {
     uint8_t prev[2] = { 1, 1 };
 
-    *w = (AvpuWriter){ .base = base, .size = size ? size : UINT32_MAX,
+    *w = (AvpuWriter){ .s = s, .base = base,
+                       .size = size ? size : UINT32_MAX,
                        .start = start, .room = room ? room : UINT32_MAX };
     /* the emulation-prevention state from the header bytes before */
     if (start >= 2 || size) {
-        avpu_read(base + (start + w->size - 2) % w->size, &prev[0], 1);
-        avpu_read(base + (start + w->size - 1) % w->size, &prev[1], 1);
+        avpu_read(s, base + (start + w->size - 2) % w->size, &prev[0], 1);
+        avpu_read(s, base + (start + w->size - 1) % w->size, &prev[1], 1);
     }
     w->zeros = prev[1] ? 0 : prev[0] ? 1 : 2;
 }
@@ -578,8 +674,8 @@ static void avpu_wr_init(AvpuWriter *w, uint32_t base, uint32_t size,
 static void avpu_wr_raw(AvpuWriter *w, uint8_t b)
 {
     if (w->count < w->room) {
-        avpu_write_mem(w->base + ((uint64_t)w->start + w->count) % w->size,
-                       &b, 1);
+        avpu_write_mem(w->s, w->base +
+                       ((uint64_t)w->start + w->count) % w->size, &b, 1);
     } else {
         w->full = true;
     }
@@ -936,7 +1032,7 @@ static void avpu_parse_headers(IngenicAvpuState *s, AvpuStream *st,
     bool sps_ok = false, pps_ok = false;
 
     buf = g_malloc(n);
-    avpu_read(base + off - n, buf, n);
+    avpu_read(s, base + off - n, buf, n);
     while (i + 5 < n) {
         if (buf[i] || buf[i + 1] || buf[i + 2] != 1) {
             i++;
@@ -1242,17 +1338,17 @@ static void avpu_enc1(IngenicAvpuState *s, hwaddr list)
             f->cabac = e[2] & (1u << 10);
             f->depth_intra = extract32(e[0], 4, 3);
             f->w10 = e[4];
-            f->rec_key = e[0x90 / 4] & AVPU_DMA_MASK;
-            f->ref_key = e[0xA0 / 4] & AVPU_DMA_MASK;
+            f->rec_key = e[0x90 / 4] & s->dma_mask;
+            f->ref_key = e[0xA0 / 4] & s->dma_mask;
             /* RefB: the slice buffers' second reference, after RefA's
              * luma / chroma (libimp ChannelMngr.c encode1) */
-            f->ref1_key = e[0xA8 / 4] & AVPU_DMA_MASK;
+            f->ref1_key = e[0xA8 / 4] & s->dma_mask;
             if (pitch < pw) {
                 pitch = ROUND_UP(pw, 16);
             }
             f->y = g_malloc((size_t)f->w * f->h);
             f->uv = g_malloc((size_t)f->w * f->h / 2);
-            avpu_load_nv12(e[0x80 / 4], e[0x84 / 4], pitch, pw, ph, f->w,
+            avpu_load_nv12(s, e[0x80 / 4], e[0x84 / 4], pitch, pw, ph, f->w,
                            f->h, f->y, f->uv);
         }
         if (f->nslices < AVPU_MAX_SLICES) {
@@ -1272,8 +1368,13 @@ static void avpu_enc1(IngenicAvpuState *s, hwaddr list)
                 next = extract32(n0, 12, 10) * lcuw + extract32(n0, 0, 10);
             }
             sl->nlcu = next > sl->first ? next - sl->first : 1;
-            if (e[2] & (1u << 11)) {
-                /* no Enc2 pass: Enc1 writes the stream itself */
+            if ((e[2] & (1u << 11)) && !s->anyka) {
+                /*
+                 * no Enc2 pass: Enc1 writes the stream itself.  Not on
+                 * Anyka's core, where the bit hands the slice to Enc2
+                 * directly (no intermediate buffer: WD0-WEC are 0) and
+                 * libakv starts Enc2 on the same list to code it
+                 */
                 avpu_code_slice(s, f, sl, e, ea, true);
             } else {
                 const uint32_t bytes = avpu_estimate(s, f, sl);
@@ -1316,7 +1417,7 @@ static void avpu_dump(IngenicAvpuState *s, const AvpuFrame *f, uint32_t base,
         return;
     }
     buf = g_malloc(win + count);
-    avpu_read(base + off - win, buf, win + count);
+    avpu_read(s, base + off - win, buf, win + count);
     for (i = 0; i + 3 < win; i++) {
         if (buf[i] || buf[i + 1] || buf[i + 2] != 1) {
             continue;
@@ -1400,7 +1501,7 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
 {
     /* the stream buffer: Enc2's, or WC0-WCC when Enc1 codes the slice */
     const int sw = by_enc1 ? 0xC0 / 4 : 0xF0 / 4;
-    const uint32_t base = e[sw] & AVPU_DMA_MASK;
+    const uint32_t base = e[sw] & s->dma_mask;
     const uint32_t size = e[sw + 1], off = e[sw + 2];
     const uint32_t room = e[sw + 3];
     const int n = MIN(extract32(e[0x78 / 4], 24, 5), 24);
@@ -1419,7 +1520,7 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
     size_t cap, bits, from = 0;
 
     avpu_parse_headers(s, st, f->codec, base, size, off);
-    avpu_wr_init(&w, base, size, off, room);
+    avpu_wr_init(s, &w, base, size, off, room);
     avpu_wr_bits(&w, tail & ((1u << n) - 1), n);
 
     if (f->codec == 1) {
@@ -1613,6 +1714,10 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                                          f->qp, from, out, capb, &pst);
             }
             avpu_wr_buf_bits(&w, out, from, MIN(bits, capb * 8));
+            if (bits > capb * 8) {
+                /* not even all-skip at QP 51 fits: cut short, say so */
+                w.full = true;
+            }
             sl->coded = true;
             if (last_slice) {
                 /*
@@ -1652,6 +1757,11 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
         avpu_status(s, ea, 0x1E4, MIN(w.count, 0x3FFFFFFFu) |
                     (w.full ? 1u << 30 : 0));
         avpu_status(s, ea, 0x1E8, 0);
+    }
+    if (s->cur) {
+        s->cur->bytes += MIN(w.count, w.room);
+        s->cur->overflow |= w.full;
+        s->cur->coded = true;
     }
     if (w.full) {
         qemu_log_mask(LOG_GUEST_ERROR, "ingenic-avpu: slice of %u bytes "
@@ -1783,7 +1893,7 @@ static void avpu_jpeg(IngenicAvpuState *s, AvpuJob *j)
         w = MIN(w, AVPU_MAX_DIM);
         h = MIN(h, AVPU_MAX_DIM);
     }
-    base = r[7] & AVPU_DMA_MASK;
+    base = r[7] & s->dma_mask;
     size = r[8];
     off = r[9];
     room = r[10] ? r[10] : (size > off ? size - off : 0);
@@ -1793,7 +1903,7 @@ static void avpu_jpeg(IngenicAvpuState *s, AvpuJob *j)
     if (pitch < w) {
         pitch = ROUND_UP(w, 16);
     }
-    avpu_read(r[6], zz, sizeof(zz));
+    avpu_read(s, r[6], zz, sizeof(zz));
     for (i = 0; i < 64; i++) {
         ql[avpu_zigzag[i]] = zz[i] ? zz[i] : 1;
         qc[avpu_zigzag[i]] = zz[64 + i] ? zz[64 + i] : 1;
@@ -1802,7 +1912,7 @@ static void avpu_jpeg(IngenicAvpuState *s, AvpuJob *j)
     uv = g_malloc((size_t)w2 * h2 / 2);
     cb = g_malloc((size_t)w2 * h2 / 4);
     cr = g_malloc((size_t)w2 * h2 / 4);
-    avpu_load_nv12(r[4], r[5], pitch, w, h, w2, h2, y, uv);
+    avpu_load_nv12(s, r[4], r[5], pitch, w, h, w2, h2, y, uv);
     for (i = 0; i < (size_t)w2 * h2 / 4; i++) {
         cb[i] = uv[2 * i];
         cr[i] = uv[2 * i + 1];
@@ -1830,10 +1940,10 @@ static void avpu_jpeg(IngenicAvpuState *s, AvpuJob *j)
                               MIN(chunk, hdr->len - done) : 0;
 
             if (h1) {
-                avpu_write_mem(base + pos, hdr->data + done, h1);
+                avpu_write_mem(s, base + pos, hdr->data + done, h1);
             }
             if (chunk > h1) {
-                avpu_write_mem(base + pos + h1,
+                avpu_write_mem(s, base + pos + h1,
                                scan + (done + h1 - hdr->len), chunk - h1);
             }
             done += chunk;
@@ -1863,6 +1973,7 @@ static void *avpu_thread(void *opaque)
 {
     IngenicAvpuState *s = opaque;
     uint32_t i;
+    int64_t t0;
 
     rcu_register_thread();      /* it walks the address space (avpu_ram) */
     qemu_mutex_lock(&s->lock);
@@ -1871,9 +1982,11 @@ static void *avpu_thread(void *opaque)
             qemu_cond_wait(&s->cond, &s->lock);
         }
         qemu_mutex_unlock(&s->lock);
+        t0 = get_clock();
         for (i = 0; i < s->nrun; i++) {
             AvpuJob *j = &s->run[i];
 
+            s->cur = j;
             switch (j->kind) {
             case START_ENC1:
                 avpu_enc1(s, j->addr);
@@ -1885,6 +1998,11 @@ static void *avpu_thread(void *opaque)
                 avpu_jpeg(s, j);
                 break;
             }
+            s->cur = NULL;
+        }
+        if (s->trace) {
+            qemu_log_mask(LOG_UNIMP, "ingenic-avpu: %u jobs coded in %"
+                          PRId64 " us\n", s->nrun, (get_clock() - t0) / 1000);
         }
         qemu_mutex_lock(&s->lock);
         s->coded = true;
@@ -1909,6 +2027,23 @@ static void avpu_finish(IngenicAvpuState *s)
         uint32_t *cregs = &s->regs[j->core * CORE_STRIDE / 4];
         uint32_t *page = &s->regs[G2_CORE(j->core) / 4];
 
+        if (s->anyka) {
+            uint32_t *ak = &s->regs[AK_CORE(j->core) / 4];
+
+            if (j->kind != START_JPEG) {
+                if (j->coded) {
+                    ak[AK_BYTES / 4] = j->bytes;
+                    ak[AK_STATUS / 4] = j->overflow ? AK_STATUS_OVERFLOW : 0;
+                }
+                continue;
+            }
+            if (j->jpeg_wrote) {
+                ak[AK_JPEG_BYTES / 4] = j->jpeg_bytes;
+            }
+            ak[AK_JPEG_STATUS / 4] = 0;
+            ak[AK_JPEG_FLAGS / 4] = j->jpeg_overflow ? 2 : 0;
+            continue;
+        }
         if (j->kind != START_JPEG) {
             continue;
         }
@@ -1964,7 +2099,9 @@ static void avpu_done(void *opaque)
         j->core = s->job_core[i];
         if (j->kind == START_JPEG) {
             for (k = 0; k < ARRAY_SIZE(j->jpeg); k++) {
-                j->jpeg[k] = s->gen == 2 ? page[avpu_g2_jpeg[k] / 4]
+                j->jpeg[k] = s->anyka ?
+                             s->regs[(AK_CORE(j->core) + AK_JPEG(k)) / 4] :
+                             s->gen == 2 ? page[avpu_g2_jpeg[k] / 4]
                                          : cregs[R_JPEG(k) / 4];
             }
         }
@@ -2027,7 +2164,7 @@ static void avpu_start(IngenicAvpuState *s, int core, uint32_t val)
             avpu_queue_full(s);
         }
         s->job_kind[s->njobs] = kinds[i];
-        s->job_addr[s->njobs] = cr[R_CL_ADDR / 4] & AVPU_DMA_MASK;
+        s->job_addr[s->njobs] = cr[R_CL_ADDR / 4] & s->dma_mask;
         s->job_core[s->njobs] = core;
         s->njobs++;
         s->pending |= (kinds[i] == START_ENC2 ? IRQ_ENC2 : IRQ_ENC1) <<
@@ -2047,7 +2184,7 @@ static void avpu_start2(IngenicAvpuState *s, int core, bool enc2,
                         uint32_t val)
 {
     const uint32_t list = s->regs[(G2_CORE(core) + (enc2 ? G2_ENC2 : 0)) / 4]
-                          & AVPU_DMA_MASK;
+                          & s->dma_mask;
     const uint32_t kind = enc2 ? START_ENC2 : (val & 2) ? START_ENC1 :
                           START_JPEG;
 
@@ -2084,6 +2221,176 @@ static void avpu_start2(IngenicAvpuState *s, int core, bool enc2,
     }
 }
 
+/*
+ * Anyka: the L2 prefetch is on for a picture when its control word has
+ * bit 0 and neither bypass bit.  libakv programs it with the picture's own
+ * source planes and pitch, so the coder (which reads the planes the list
+ * names) sees what silicon fetches through it; say so when they differ.
+ */
+static void avpu_ak_l2_check(IngenicAvpuState *s, hwaddr list)
+{
+    const uint32_t ctrl = s->regs[AK_L2_CTRL / 4];
+    uint32_t e[CL_ENTRY / 4];
+
+    if (!(ctrl & AK_L2_CTRL_ON) || (ctrl & AK_L2_CTRL_BYPASS)) {
+        return;
+    }
+    avpu_load_entry(s, list, e);
+    if (((s->regs[AK_L2_Y / 4] ^ e[0x80 / 4]) & s->dma_mask) ||
+        ((s->regs[AK_L2_C / 4] ^ e[0x84 / 4]) & s->dma_mask) ||
+        extract32(s->regs[AK_L2_PITCH / 4], 6, 13) !=
+        extract32(e[0x88 / 4], 0, 13)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ingenic-avpu: the L2 prefetch is on "
+                      "for Y 0x%x C 0x%x pitch %u, the picture is Y 0x%x C "
+                      "0x%x pitch %u; coded from the picture's\n",
+                      s->regs[AK_L2_Y / 4], s->regs[AK_L2_C / 4],
+                      extract32(s->regs[AK_L2_PITCH / 4], 6, 13),
+                      e[0x80 / 4], e[0x84 / 4], extract32(e[0x88 / 4], 0, 16));
+    }
+}
+
+/* Anyka: a start at 0x84 + 16c, the list address at 0x80 + 16c */
+static void avpu_start_ak(IngenicAvpuState *s, int core, uint32_t val)
+{
+    static const struct {
+        uint32_t bit, kind, irq;
+    } k[] = {
+        { AK_START_ENC1, START_ENC1, IRQ_ENC1 },
+        { AK_START_ENC2, START_ENC2, IRQ_ENC2 },
+        { AK_START_JPEG, START_JPEG, 0 },
+    };
+    const uint32_t list = s->regs[AK_CL_ADDR(core) / 4] & s->dma_mask;
+    int i;
+
+    if (s->trace) {
+        qemu_log_mask(LOG_UNIMP, "ingenic-avpu: core %d start 0x%x, list "
+                      "0x%x\n", core, val, list);
+        if (val & AK_START_JPEG) {
+            qemu_log_mask(LOG_UNIMP, "ingenic-avpu: JPEG");
+            for (i = 0; i < 11; i++) {
+                qemu_log_mask(LOG_UNIMP, " R%d=%08x", i,
+                              s->regs[(AK_CORE(core) + AK_JPEG(i)) / 4]);
+            }
+            qemu_log_mask(LOG_UNIMP, "\n");
+        }
+    }
+    if (val & ~(AK_START_ENC1 | AK_START_ENC2 | AK_START_JPEG)) {
+        qemu_log_mask(LOG_UNIMP, "ingenic-avpu: start 0x%x\n", val);
+    }
+    for (i = 0; i < ARRAY_SIZE(k); i++) {
+        if (!(val & k[i].bit)) {
+            continue;
+        }
+        if (k[i].kind == START_ENC1) {
+            avpu_ak_l2_check(s, list);
+        }
+        if (s->njobs == AVPU_MAX_JOBS) {
+            avpu_queue_full(s);
+        }
+        s->job_kind[s->njobs] = k[i].kind;
+        s->job_addr[s->njobs] = list;
+        s->job_core[s->njobs] = core;
+        s->njobs++;
+        s->pending |= k[i].irq ? k[i].irq << (4 * core) : AK_IRQ_JPEG;
+    }
+    if (s->njobs && !timer_pending(s->timer)) {
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                            AVPU_JOB_NS);
+    }
+}
+
+/* Anyka: a core's status, its busy bits from the jobs not yet done */
+static uint32_t avpu_ak_status(IngenicAvpuState *s, int core)
+{
+    uint32_t v = s->regs[(AK_CORE(core) + AK_STATUS) / 4];
+    uint32_t i;
+
+    for (i = 0; i < s->njobs + s->nrun; i++) {
+        const uint32_t kind = i < s->njobs ? s->job_kind[i]
+                                           : s->run[i - s->njobs].kind;
+        const uint32_t c = i < s->njobs ? s->job_core[i]
+                                        : s->run[i - s->njobs].core;
+
+        if (c == core) {
+            v |= kind == START_ENC1 ? AK_STATUS_ENC1 :
+                 kind == START_ENC2 ? AK_STATUS_ENC2 : 0;
+        }
+    }
+    return v;
+}
+
+static bool avpu_ak_is_start(hwaddr off)
+{
+    return off >= AK_CL_ADDR(0) && off < AK_CORE(0) &&
+           (off & 0xF) == (AK_START(0) & 0xF);
+}
+
+static uint64_t avpu_reg_read_ak(IngenicAvpuState *s, hwaddr off)
+{
+    if (off >= AK_CORE(0) && off < AK_CORE(AK_NCORES)) {
+        if (off % AK_CORE(0) == AK_STATUS) {
+            return avpu_ak_status(s, off / AK_CORE(0) - 1);
+        }
+        return s->regs[off / 4];
+    }
+    if (avpu_ak_is_start(off)) {
+        return 0;
+    }
+    if (off >= AVPU_REGS_SIZE && off != AK_L2_CTRL && off != AK_L2_PITCH) {
+        qemu_log_mask(LOG_UNIMP, "ingenic-avpu: read of 0x%" HWADDR_PRIx
+                      "\n", off);
+    }
+    return s->regs[off / 4];
+}
+
+/* false: not one of Anyka's own registers, the common code has it */
+static bool avpu_reg_write_ak(IngenicAvpuState *s, hwaddr off, uint32_t val)
+{
+    if (off >= AK_CORE(0) && off < AVPU_REGS_SIZE) {
+        switch (off % AK_CORE(0)) {
+        case AK_STATUS:
+        case AK_BYTES:
+        case AK_JPEG_STATUS:
+        case AK_JPEG_BYTES:
+        case AK_JPEG_FLAGS:
+            qemu_log_mask(LOG_GUEST_ERROR, "ingenic-avpu: write 0x%x to the "
+                          "read-only 0x%" HWADDR_PRIx "\n", val, off);
+            return true;
+        }
+        s->regs[off / 4] = val;
+        return true;
+    }
+    if (avpu_ak_is_start(off)) {
+        int core = (off - AK_START(0)) / 0x10;
+
+        if (core >= AK_NCORES) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ingenic-avpu: start 0x%x of core "
+                          "%d, which this block does not have\n", val, core);
+            s->regs[off / 4] = val;
+            return true;
+        }
+        avpu_start_ak(s, core, val);
+        return true;
+    }
+    if (off >= AVPU_REGS_SIZE) {
+        switch (off) {
+        case AK_L2_SCRATCH0:
+        case AK_L2_SCRATCH1:
+        case AK_L2_CTRL:
+        case AK_L2_Y:
+        case AK_L2_C:
+        case AK_L2_PITCH:
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "ingenic-avpu: write 0x%x to the "
+                          "unknown 0x%" HWADDR_PRIx "\n", val, off);
+        }
+        s->regs[off / 4] = val;
+        return true;
+    }
+    return false;
+}
+
 /* ---- registers ---------------------------------------------------------- */
 
 static uint64_t avpu_reg_read(void *opaque, hwaddr addr, unsigned size)
@@ -2093,6 +2400,9 @@ static uint64_t avpu_reg_read(void *opaque, hwaddr addr, unsigned size)
 
     if (addr < s->reg_base) {
         return 0;
+    }
+    if (s->anyka && off >= AK_CL_ADDR(0)) {
+        return avpu_reg_read_ak(s, off);
     }
     if (s->gen == 2 && off >= G2_CORE(0)) {
         switch (off & (G2_ENC2 - 1)) {
@@ -2138,6 +2448,9 @@ static void avpu_reg_write(void *opaque, hwaddr addr, uint64_t val,
     if (s->trace > 1 && off != R_TIMER_CTL) {
         qemu_log_mask(LOG_UNIMP, "ingenic-avpu: [0x%03" HWADDR_PRIx
                       "] = 0x%" PRIx64 "\n", off, val);
+    }
+    if (s->anyka && avpu_reg_write_ak(s, off, val)) {
+        return;
     }
     if (s->gen == 2 && off >= G2_CORE(0)) {
         const int core = off / G2_CORE(0) - 1;
@@ -2227,12 +2540,18 @@ static void avpu_realize(DeviceState *dev, Error **errp)
     IngenicAvpuState *s = INGENIC_AVPU(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
-    const uint32_t regs = s->gen == 2 ? AVPU_REGS_SIZE2 : AVPU_REGS_SIZE;
+    const uint32_t regs = s->anyka ? AVPU_REGS_SIZE_AK :
+                          s->gen == 2 ? AVPU_REGS_SIZE2 : AVPU_REGS_SIZE;
 
     if (s->gen < 1 || s->gen > 2) {
         error_setg(errp, "ingenic-avpu: gen %u is not 1 or 2", s->gen);
         return;
     }
+    if (s->anyka && s->gen != 1) {
+        error_setg(errp, "ingenic-avpu: Anyka's core is gen 1");
+        return;
+    }
+    s->dma_mask = s->anyka ? 0xffffffff : AVPU_DMA_MASK;
     if (s->reg_base + regs > AVPU_MMIO_SIZE || s->reg_base & 3) {
         error_setg(errp, "ingenic-avpu: reg-base 0x%x out of the block",
                    s->reg_base);
@@ -2260,6 +2579,7 @@ static int avpu_pre_save(void *opaque)
 static const Property avpu_props[] = {
     DEFINE_PROP_UINT32("reg-base", IngenicAvpuState, reg_base, 0x8000),
     DEFINE_PROP_UINT8("gen", IngenicAvpuState, gen, 1),
+    DEFINE_PROP_BOOL("anyka", IngenicAvpuState, anyka, false),
     DEFINE_PROP_UINT32("hw-id", IngenicAvpuState, hw_id, 0x72000460),
     DEFINE_PROP_STRING("dump", IngenicAvpuState, dump),
     DEFINE_PROP_UINT8("trace", IngenicAvpuState, trace, 0),
@@ -2273,12 +2593,14 @@ static const Property avpu_props[] = {
  */
 static const VMStateDescription vmstate_avpu = {
     .name = TYPE_INGENIC_AVPU,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
     .pre_save = avpu_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, IngenicAvpuState),
-        VMSTATE_UINT32_ARRAY(regs, IngenicAvpuState, AVPU_NREGS),
+        /* the window version 2 had; Anyka's larger one follows, from 3 */
+        VMSTATE_UINT32_SUB_ARRAY(regs, IngenicAvpuState, 0,
+                                 AVPU_REGS_SIZE2 / 4),
         VMSTATE_UINT32(irq_status, IngenicAvpuState),
         VMSTATE_UINT32(njobs, IngenicAvpuState),
         VMSTATE_UINT32_ARRAY(job_kind, IngenicAvpuState, AVPU_MAX_JOBS),
@@ -2286,6 +2608,9 @@ static const VMStateDescription vmstate_avpu = {
         VMSTATE_UINT32_ARRAY(job_core, IngenicAvpuState, AVPU_MAX_JOBS),
         VMSTATE_UINT32(pending, IngenicAvpuState),
         VMSTATE_UINT32(jpeg_count, IngenicAvpuState),
+        VMSTATE_SUB_ARRAY(regs, IngenicAvpuState, AVPU_REGS_SIZE2 / 4,
+                          AVPU_NREGS - AVPU_REGS_SIZE2 / 4, 3,
+                          vmstate_info_uint32, uint32_t),
         VMSTATE_END_OF_LIST()
     }
 };

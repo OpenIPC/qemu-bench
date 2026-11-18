@@ -114,6 +114,8 @@ cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-l2.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-ddrc.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/ak-av130-intc.c     "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/ak-isp.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/ak-h8290.c          "$QEMU_DIR/hw/misc/"
 cp qemu/include/hw/misc/ak-l2.h     "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/char/ak-uart.c           "$QEMU_DIR/hw/char/"
 cp qemu/hw/ssi/ak-spi.c             "$QEMU_DIR/hw/ssi/"
@@ -750,7 +752,7 @@ fi
 # interrupt controller): a tree configured before drops its entry.
 sed -i "/'ak-tick.c'/d" "$QEMU_DIR/hw/timer/meson.build"
 rm -f "$QEMU_DIR/hw/timer/ak-tick.c"
-for f in misc/ak-sysctrl misc/ak-av130-intc misc/ak-l2 misc/ak-ddrc char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
+for f in misc/ak-sysctrl misc/ak-av130-intc misc/ak-isp misc/ak-l2 misc/ak-ddrc char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
@@ -762,6 +764,18 @@ if ! grep -q "'anyka.c'" "$QEMU_DIR/hw/arm/meson.build"; then
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added anyka.c"
 fi
+# EV200's Hantro 8290 (ak-h8290.c) and EV300's Allegro core (ingenic-avpu.c,
+# the same IP as Ingenic's AVPU) code with the shared software encoders;
+# guarded per machine as for Ambarella, so an Anyka-only configuration links
+# without CONFIG_XIONGMAI or CONFIG_INGENIC.
+for b in ak-h8290.c jpeg-enc.c hantro-h264.c ingenic-avpu.c hevc-enc.c; do
+    if ! grep -q "CONFIG_ANYKA', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for ANYKA"
+    fi
+done
 
 # SigmaStar (MStar) ARMv7: Cortex-A7 SoCs behind the RIU (hw/arm/sigmastar.c).
 # Same guarded appends as Anyka, for a fresh tree and an existing one alike.
@@ -1592,9 +1606,13 @@ for sym in USB_DWC2 SDHCI BITBANG_I2C; do
         echo "  hw/mips/Kconfig: INGENIC now selects $sym"
     fi
 done
+# Each file's own CONFIG_INGENIC line, not just its name: ingenic-avpu.c is
+# also Anyka's EV300 encoder (CONFIG_ANYKA, added above), and a fresh tree
+# that matched the name alone left it out of the MIPS build.
 for f in $(cd qemu && find hw -name 'ingenic*.c' ! -path 'hw/mips/*' 2>/dev/null); do
     d=$(dirname "$f"); b=$(basename "$f")
-    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+    if ! grep -q "CONFIG_INGENIC', if_true: files('$b')" \
+            "$QEMU_DIR/$d/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
             >> "$QEMU_DIR/$d/meson.build"
         echo "  $d/meson.build: added $b"

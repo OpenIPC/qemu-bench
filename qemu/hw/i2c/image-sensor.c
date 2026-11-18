@@ -77,6 +77,7 @@ static const ImageSensorSpec image_sensors[] = {
     GC16("gc4663", 0x29, 0x4653),
 
     /* SmartSens */
+    SC("sc1345", 0xDA23),       /* OpenIPC's Anyka EV200 driver */
     SC("sc2235", 0x2235),
     SC_DISC("sc2235e", 0x2232, 0x20),
     SC_DISC("sc2235p", 0x2232, 0x01),
