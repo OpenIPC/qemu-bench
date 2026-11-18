@@ -1688,7 +1688,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        soc: [fh8852v200, fh8852v100]
+        soc: [fh8852v200, fh8852v100, fh8626v100]
     steps:
       - uses: actions/checkout@v4
 

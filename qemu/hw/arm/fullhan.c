@@ -102,6 +102,7 @@ typedef struct FhSoCConfig {
     uint32_t ddr_mbit;          /* PMU 0x334 */
     uint32_t pll_scheme;        /* fh-pmu: where the system PLL is */
     uint32_t tmr_prediv;        /* fh-pmu: scheme 2's PLL1 prediv, 0: 10 */
+    bool tmr_div_low;           /* fh-pmu: the divider in CLK_DIV5[7:0] */
     const char *sensor;         /* default sensor= */
     uint32_t swrst_base;        /* fh-pmu: 0 for 0x040 */
     uint32_t spc_io_status;     /* PMU 0x054, FH8632's variant */
@@ -307,7 +308,8 @@ static const FhSoCConfig fh8626v100_soc = {
     .chip_id            = 0x18112301,
     .ddr_mbit           = 512,
     .pll_scheme         = 2,
-    .tmr_prediv         = 1,
+    .tmr_prediv         = 6,
+    .tmr_div_low        = true,
     .sensor             = "gc2053",
     .swrst_base         = 0x04C,
     .timer_irq          = 3,
@@ -757,6 +759,9 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
     qdev_prop_set_uint32(pmu, "pll-scheme", c->pll_scheme);
     if (c->tmr_prediv) {
         qdev_prop_set_uint32(pmu, "tmr-prediv", c->tmr_prediv);
+    }
+    if (c->tmr_div_low) {
+        qdev_prop_set_uint32(pmu, "tmr-div-lsb", 0);
     }
     if (c->swrst_base) {
         qdev_prop_set_uint32(pmu, "swrst-base", c->swrst_base);

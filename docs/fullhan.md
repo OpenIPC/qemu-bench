@@ -163,11 +163,20 @@ qemu-system-arm -M fh8852v200,flash-file=qemu-boot/openipc-fh8852v200-nor-8mb.bi
 ```
 
 The MTD device is `spi_flash` under the 3.0.8 kernels and `spi0.0` under
-4.9. OpenIPC's kernels have no RAM disk driver, so `-initrd` cannot carry
-the SquashFS; `qemu-boot/test-fullhan-boot.sh` (the CI's) boots `-kernel`
-with the rootfs in a synthetic NOR image and checks the login prompt, a
-DHCP lease and the JFFS2 overlay written back to the image. The first login
-asks the camera's owner to accept majestic's EULA.
+4.9 and FH8626V100's 4.19. OpenIPC's kernels have no RAM disk driver, so
+`-initrd` cannot carry the SquashFS; `qemu-boot/test-fullhan-boot.sh` (the
+CI's) boots `-kernel` with the rootfs in a synthetic NOR image and checks
+the login prompt, a DHCP lease and the JFFS2 overlay written back to the
+image. The image's env partition holds a valid U-Boot environment, as a
+camera's does: with no `/etc/fw_env.config`, OpenIPC's `fw_printenv` looks
+for one by CRC, and when there is none it CRCs 64-256 KiB at every 4 KiB of
+the flash -- seconds per call under TCG, a dozen calls before login.
+FH8626V100's release reaches login in under 20 s; its kernel builds no
+Ethernet driver (the board it was brought up on is Wi-Fi only), so the
+DHCP check is skipped there, and it boots with `mem=64M` and `osmem=64M`
+in that environment (its DT reserves CMA and the ARC's memory up to the
+top of 64 MB, and `load_fullhan` writes `osmem` and reboots until it reads
+64M). The first login asks the camera's owner to accept majestic's EULA.
 
 ## Devices
 
@@ -183,9 +192,16 @@ PLL0 on V100; VCO = 24 MHz x M / (N + 1), / (P + 1) / DIVVCO), / (CLK_DIV5
 [27:24] + 1) / (CLK_DIV5[23:16] + 1) -- or on FH8632 / FH8626V100 from PLL1
 = 24 MHz x M / N / 2^OD, / 10 (FH8632's `tmr0_clk` prediv; FH8626V100's
 kernel has none, `tmr-prediv` 1) / (CLK_DIV5[23:16] + 1). The reset values
-give 1 MHz (FH8626V100: 10 MHz, which its kernel runs at without touching
-the divider), which the U-Boots also program; the V100 and FH865x kernels
-set 50 MHz through the same divider.
+give 1 MHz, which the U-Boots also program; the V100 and FH865x kernels
+set 50 MHz through the same divider. FH8626V100 is the exception: PLL1 / 6
+(`dw_100m_clk`) / (CLK_DIV5[7:0] + 1), as OpenIPC's 4.19
+`clk-fh8626v100.c` computes it -- the only source that names the field;
+no FH8626V100 SDK, and no dump here to read DIV5 from. [7:0] resets to 9:
+10 MHz, which the vendor 3.0.8 kernel runs at without touching the
+divider, and the 4.19 kernel sets its DT's 50 MHz. Counting [23:16]
+instead left that kernel's clock at 10 MHz while it reckoned 50: guest
+time ran 5x slow, a 10 s wait took 55 s, and the watchdog it fed on that
+time reset the machine after login.
 
 **Interrupt controller** (`fh-intc`). The DW APB ICTL: enable, mask, force,
 raw / status / final status in low/high pairs. The 4.9 kernel's handler
@@ -209,12 +225,6 @@ VIRT 0xFE020000, which `head.S` maps with a single 1 MB section, so until
 space (0), and the kernel spun before printing a line. The camera boots,
 so the hardware answers there, and the FH8626 DTS puts every peripheral
 alone in its 1 MB slot.
-With it the release kernel boots on `-kernel`, runs the OpenIPC userland
-and writes the JFFS2 overlay. It then stops at `Loading vendor modules`:
-`load_fullhan` modprobes the media drivers, and the ARC and ISP aren't
-modelled. That kernel builds no Ethernet driver (the board it was brought
-up on is Wi-Fi only), so the DHCP check in `test-fullhan-boot.sh` can't
-pass on it.
 
 **SPI** (`fh-spi`). A DW SSI. SPI0 on V200 has Fullhan's "SPIC" additions:
 CCFGR (0xF4) with the data phase's wire count, a byte swap and 32-bit
@@ -358,6 +368,15 @@ glue (ring placement, notification, ready flag, block size). So
 `media_process.ko` does; `media_process_no_sc.ko`, shipped alongside, loads
 without the ARC. Video and audio (the internal codec is the ARC
 firmware's) need that material from the vendor.
+
+OpenIPC's FH8626V100 kernel (4.19) drives the ARC itself: a remoteproc
+driver (`fh8626_arc.c`; the boot words at PMU 0x2000, run at 0x2010 bit 4,
+doorbells 0x1E4 to the ARC and 0x1F0 to the ARM) and an ARC600 firmware
+built from source (`fh8626-arc-firmware`, `/lib/firmware/fh8626-arc.elf`)
+that announces one RPMsg endpoint, `rpmsg-arc-echo`, and echoes on it. The
+driver sets no auto-boot and nothing in the image starts it, so login does
+not wait on it. Running that firmware here would take an ARCompact core,
+or a stand-in that plays its echo protocol on the vrings.
 
 Also: PWM (registers read as zero; the drivers only program it), the IR
 receiver, the internal Ethernet PHY's training. The V100 U-Boot reads the

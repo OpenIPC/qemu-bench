@@ -27,8 +27,13 @@
  * The clock tree the kernels compute (mach-fh/clock.c).  On FH8632 and
  * FH8626V100 ("pll-scheme" 2) the timers run from PLL1 = 24 MHz * M / N /
  * 2^OD (M 7:0, N 11:8, OD 17:16), resetting to 600 MHz, / 10 / (CLK_DIV5
- * [23:16] + 1) -- FH8632's tmr0_clk prediv; FH8626V100's kernel has none
- * ("tmr-prediv" 1) and runs its timers at 10 MHz.  On the later dies, from the system PLL's
+ * [23:16] + 1) -- FH8632's tmr0_clk prediv.  FH8626V100 divides by 6 into
+ * dw_100m_clk, then by CLK_DIV5[7:0] + 1 ("tmr-prediv" 6, "tmr-div-lsb" 0):
+ * OpenIPC's 4.19 clk-fh8626v100.c, the only source that names the field.
+ * That field resets to 9, so the vendor 3.0.8 kernel, which never touches
+ * the divider, still runs its timers at 10 MHz; the 4.19 kernel sets the
+ * rate its DT asks for (50 MHz on the bulb board).  [23:16] keeps its 0x3B,
+ * PTS's divider to that kernel.  On the later dies, from the system PLL's
  * P output, VCO = 24 MHz * M / (N + 1), P = VCO / (P + 1) / DIVVCO (its
  * control register's bits 11:8), is PLL2 (0x64, control 0x68) on
  * FH885xV200 / FH865x and PLL0 (0x10, control 0x18) on the V100 dies
@@ -94,6 +99,7 @@ struct FhPmuState {
     uint32_t boot_mode;
     uint32_t pll_scheme;
     uint32_t tmr_prediv;
+    uint32_t tmr_div_lsb;
     uint32_t swrst_base;
     uint32_t spc_io_status;
 };
@@ -156,7 +162,8 @@ static void fh_pmu_update_clocks(FhPmuState *s)
     } else {
         src = fh_pmu_pll_p(s) / (((div5 >> 24) & 0xF) + 1);
     }
-    clock_update_hz(s->tmr_clk, src / (((div5 >> 16) & 0xFF) + 1));
+    clock_update_hz(s->tmr_clk,
+                    src / (((div5 >> s->tmr_div_lsb) & 0xFF) + 1));
 }
 
 static bool fh_pmu_is_swrst(FhPmuState *s, hwaddr off)
@@ -265,6 +272,9 @@ static void fh_pmu_reset(DeviceState *dev)
     s->regs[PMU_CLK_DIV5 >> 2] = 0x0B63C700;
     if (s->pll_scheme == 2) {
         s->regs[PMU_CLK_DIV5 >> 2] = 0x003BC700;    /* 600 / 10 / 60 */
+        if (s->tmr_div_lsb == 0) {
+            s->regs[PMU_CLK_DIV5 >> 2] |= 9;        /* 600 / 6 / 10 */
+        }
     }
     s->pts_latch = 0;
     qemu_set_irq(s->wdt_pause, 0);
@@ -291,6 +301,8 @@ static const Property fh_pmu_props[] = {
     DEFINE_PROP_UINT32("boot-mode", FhPmuState, boot_mode, 2),
     DEFINE_PROP_UINT32("pll-scheme", FhPmuState, pll_scheme, 0),
     DEFINE_PROP_UINT32("tmr-prediv", FhPmuState, tmr_prediv, 10),
+    /* where in CLK_DIV5 the timers' 8-bit divider is */
+    DEFINE_PROP_UINT32("tmr-div-lsb", FhPmuState, tmr_div_lsb, 16),
     DEFINE_PROP_UINT32("swrst-base", FhPmuState, swrst_base, PMU_SWRST_BASE),
     /* FH8632: its variant in bits 5:0 (fh_chipid.c) */
     DEFINE_PROP_UINT32("spc-io-status", FhPmuState, spc_io_status, 0),
