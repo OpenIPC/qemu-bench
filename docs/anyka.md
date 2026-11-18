@@ -31,7 +31,7 @@ is header-encrypted and was not usable.
 |---|---|---|---|---|
 | `ak3918ev200` | `0x20150200` | 64 MiB | 5 | the 4.4 port also accepts `0x20120100` |
 | `ak3916ev300` | `0x20160100` | 64 MiB | 5 | the AK3916EV301 dump boots here |
-| `ak3918ev300` | `0x20160100` | 64 MiB | 5 | |
+| `ak3918ev300` | `0x20160100` | 64 MiB | 5 | camera input: the HeimVision PE3020-W's JX-F37 (reset on GPIO 79), see below |
 | `ak3919ev300` | `0x20160100` | 128 MiB¹ | 5 | |
 | `ak3918ev330` | `0x20160101` | 64 MiB | 10 | eFuse reader, I2C v2, flash CS on GPIO 25 |
 | `ak3919ev330` | `0x20160101` | 128 MiB | 10 | U-Boot of the dump prints `ramsize: 08000000` |
@@ -71,7 +71,7 @@ appended DTB.
 |---|---|---|
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
 | `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
-| `0x20000000` | ISP / VI (interrupt 1) | EV200 `ak-isp`, others storage |
+| `0x20000000` | ISP / VI (interrupt 1) | EV200 and AK3918EV300 `ak-isp`, others storage |
 | `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core | EV200 `ak-h8290`, others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
@@ -224,19 +224,68 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   regardless), slices, restart markers, rotation, RGB input.
   `-global ak-h8290.dump-dir=DIR` keeps each job. `qemu/tests/test-ak-h8290.py`
   plays the driver under qtest and decodes the result with ffmpeg.
-- **EV200 ISP** (`ak-isp`): the frames of the ISP2 as OpenIPC's `ak-cam`
-  drives it through the SDK-derived `ak39_isp2.c` (EV200 build), not the
-  image processing. Most of its configuration is a register table in DRAM
-  (`+0x18` holds its address): the model reads the buffer addresses
-  (block 5 words 25..30 for buffer 1, block 1 words 31..48 for 2..4) and
-  the main / sub sizes (block 4 words 31 / 33) from it. `GEN_CTRL` bit 20
-  starts capture, bits 15..18 / 21..24 enable each buffer's main / sub
-  output; every frame period (`-global ak-isp.fps=N`, default 15) the
-  core writes an I420 test pattern -- bars, a moving block, the frame
-  number as 16 black/white cells along the bottom -- into the buffer it
-  is on, raises `FRAME_ALL_DONE`, and reports the next enabled buffer in
-  `STATUS` 23:22, the order `ak_isp_irq_work()` expects. The sensor is the
-  catalogue's `sc1345` on I2C 0 (`sensor=` picks another, or `none`).
+- **ISP2** (`ak-isp`, EV200 and AK3918EV300): the frames of the ISP2 as
+  OpenIPC's kernel drives it through the SDK-derived `ak39_isp2.c` -- on
+  EV200 from `ak-cam`, on EV300 from the soc_camera host `ak_camera.c` --
+  not the image processing. Most of its configuration is a register table
+  in DRAM (`+0x18` holds its address), fetched when `REG_UPDATE` (`+0x1C`)
+  is written: a table written but not loaded is not seen. The model reads
+  the crop window (block 1 words 0 / 1), the buffer addresses (block 5
+  words 25..30 for buffer 1, block 1 words 31..48 for 2..4), the main /
+  sub sizes and the per-channel frame control from it. `GEN_CTRL` bit 20
+  starts capture; every frame period (`-global ak-isp.fps=N`; 15 on EV200,
+  25 on EV300) the core takes the crop window out of the sensor's frame,
+  scales it to each channel, writes a test pattern -- bars, a moving
+  block, the frame number as 16 black/white cells along the bottom -- into
+  the buffer it is on, raises `FRAME_ALL_DONE`, and reports the next
+  enabled buffer in `STATUS` 23:22, the order `ak_isp_irq_work()` expects.
+  The two parts differ (`ev300=on`, the driver's `CONFIG_CPU_AK3918EV200`):
+
+  | | EV200 | EV300 |
+  |---|---|---|
+  | buffer enables | `GEN_CTRL` 15..18 main, 21..24 sub | `+0x14` 31..28 main, 27..24 sub, 23..20 channel 3, buffer 1 at the top |
+  | register table | 3424 bytes, block 4 / 5 at 3152 / 3292 | 3540 bytes, block 4 / 5 at 3188 / 3396 |
+  | channel sizes | block 4 words 31 / 33, 12 + 12 bits | block 4 words 48 / 50, 13 + 13 bits |
+  | chroma | `UV_MODE` clear: I420 | `UV_MODE` set (`0x7 << 10`): NV12 at the U address |
+  | sensor | `sc1345` on I2C 0 | `jxf37` on I2C 0 at 0x40 |
+
+  The model holds the driver to what it programs, as silicon does. An empty
+  crop window (the EV300 release kernel sets it only from `VIDIOC_S_CROP`)
+  writes nothing, though the frame completes; the sub picture goes where
+  the table says, which on EV300 is `main + w * h * 3 / 2`, outside the
+  V4L2 buffer, at the size `VIDIOC_S_PARM` raw `{1, w, h}` set (none: not
+  written); on EV300 a sensor that has not been set up or is held in reset
+  sends no frames. Not modelled: statistics (the 3A reads zeros), 3D-NR,
+  OSD, channel 3, the MIPI receiver (frames flow whatever the D-PHY at
+  `0x20400000` is set to), the scaler's limits, frame-control values other
+  than 0 and `0xFF`. The comment at the top of `hw/misc/ak-isp.c` lists
+  what is a guess. `qemu/tests/test-ak-isp.py` drives both parts under
+  qtest.
+- **The AK3918EV300 camera input** is the HeimVision PE3020-W's
+  (`ak3918ev300-heimvision-pe3020w.dts`, OpenIPC/builder#234): the JX-F37
+  on I2C 0 at 0x40, its active-low reset on GPIO 79. The sensor model
+  (`hisi-f37`) has a `reset-n` input: while the pad is low it answers
+  nothing (the ID reads `0xff/0xff`, as it did on the camera with the
+  EVB's GPIO 49 in its device tree) and comes back with its registers at
+  their defaults. `sensor=` picks another catalogue sensor and
+  `sensor-reset=N|none` the GPIO (the TECKIN TC100: `sensor=jxf23,
+  sensor-reset=49`). The released PE3020-W image probes it as on the
+  camera:
+
+  ```
+  f22_set_power_on
+  aksensor 0-0030: probe_sensors Probing Sensor ID: 0xf37
+  f22_set_power_on
+  ak_camera 20000000.isp: AK Camera driver attached to camera 0
+  ak_camera 20000000.isp: AK Camera driver detached from camera 0
+  ak_camera 20000000.isp: AK Camera driver loaded
+  ```
+
+  and when Majestic opens `/dev/video0`, `ak_camera 20000000.isp: ISP
+  tuning /etc/sensor/jxf37.conf, 2 styles` (in the kernel log; the console
+  is quiet by then). That release's Majestic then stops where the camera
+  did: `anyka: sensor 1920x1080@25`, `/proc/self/pagemap reports no frame
+  numbers ...`, `Cannot start SDK`, before it starts the ISP.
 - **The EV200 camera pipeline end to end**: with both models, OpenIPC's
   ak3918ev200 image boots to `ak-venc` on `/dev/video0` and `ak-cam` on
   `/dev/video1` / `/dev/video2` as on the board, and Majestic's EV200 path
@@ -364,9 +413,10 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 ## Not modelled
 
 The MCI's L2 DMA data path, the ISP's image processing and statistics
-(EV200's frames are `ak-isp`; the other parts' ISP is storage), the EV300 /
-EV330 video encoder (EV200's is `ak-h8290`), audio codec, SAR ADC. Only the
-EV200 has a sensor on I2C (`sc1345` by default). On the AV100 the second MIPI/CSI
+(EV200's and AK3918EV300's frames are `ak-isp`; the other parts' ISP is
+storage), the EV300 / EV330 video encoder (EV200's is `ak-h8290`), audio
+codec, SAR ADC. Only the EV200 and the AK3918EV300 have a sensor on I2C
+(`sc1345` / `jxf37` by default). On the AV100 the second MIPI/CSI
 input, the NPU (`0x21300000`) and the video pipe (`0x212`--`0x215`) are the
 `ak-apb` catch-all (reads 0): the vendor modules probe and map them but no
 frames flow. The second L2 buffer (`0x201A8000` / `0x58000000`) and the
