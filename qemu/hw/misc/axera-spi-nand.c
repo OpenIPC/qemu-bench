@@ -232,6 +232,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNandState, AXERA_SPI_NAND)
 #define OP_PAGE_READ            0x13
 #define OP_READ_FROM_CACHE      0x03
 #define OP_READ_FROM_CACHE_X4   0x6b
+#define OP_READ_FROM_CACHE_FAST 0x0b
+#define OP_READ_FROM_CACHE_X2   0x3b
 #define OP_PROGRAM_LOAD         0x02
 #define OP_PROGRAM_LOAD_X4      0x32
 #define OP_PROGRAM_LOAD_RDM     0x84
@@ -282,6 +284,8 @@ struct AxeraSpiNandState {
     uint32_t program_idx;
     bool debug;
     bool ser_seen;      /* guest drives chip select through SER */
+    /* SER when the open PROGRAM_LOAD began: see the SER write */
+    uint32_t ser_at_load;
     uint8_t program_cache[SPINAND_CACHE_SIZE];
 
     uint8_t rxq[AXERA_SPI_NAND_RXQ_MAX];
@@ -315,13 +319,23 @@ static int axera_spi_nand_cmd_len(uint8_t opcode)
     case OP_WREN:
     case OP_WRDI:
         return 1;
-    case OP_READID:            /* cmd + 1 dummy byte */
+    case OP_READID:
+        /*
+         * The ID is ready after the opcode alone: a driver that sends the
+         * dummy byte (BL1, the SDK U-Boot, Linux 4.19) has it parsed as a
+         * RESET that does nothing here, and mainline U-Boot, which sends
+         * none (SPINAND_READID_OP(0, ...)), gets its 4 bytes. Both read
+         * the Macronix ID from id[1]/id[2], after the leading dummy.
+         */
+        return 1;
     case OP_GET_FEATURE:       /* cmd + 1 reg addr byte */
     case OP_SET_FEATURE:       /* cmd + 1 reg addr byte */
         return 2;
     case OP_PAGE_READ:             /* cmd + 3-byte row */
     case OP_READ_FROM_CACHE:       /* cmd + 2-byte column + 1 dummy byte */
     case OP_READ_FROM_CACHE_X4:    /* same shape, x4 I/O lines for data */
+    case OP_READ_FROM_CACHE_FAST:  /* 0x0b, 0x3b: the same shape too */
+    case OP_READ_FROM_CACHE_X2:
     case OP_PROGRAM_EXECUTE:       /* cmd + 3-byte row */
     case OP_BLOCK_ERASE:           /* cmd + 3-byte row (any row in the block) */
         return 4;
@@ -370,6 +384,7 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
         s->program_column = (s->cmd_buf[1] << 8) | s->cmd_buf[2];
         s->program_idx = 0;
         s->program_active = true;
+        s->ser_at_load = s->mem[DW_SPI_SER / 4];
         break;
     case OP_PROGRAM_EXECUTE:
         {
@@ -481,6 +496,8 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
         break;
     case OP_READ_FROM_CACHE:
     case OP_READ_FROM_CACHE_X4:
+    case OP_READ_FROM_CACHE_FAST:  /* 0x0b, 0x3b: the same shape too */
+    case OP_READ_FROM_CACHE_X2:
         rxq_reset(s);
         column = (s->cmd_buf[1] << 8) | s->cmd_buf[2];
         for (i = 0; i < 4096; i++) {
@@ -582,8 +599,17 @@ static void axera_spi_nand_write(void *opaque, hwaddr offset, uint64_t value,
          * Once the guest is seen doing that, SER alone ends an open
          * PROGRAM_LOAD -- the next message (PROGRAM_EXECUTE) begins.
          */
+        /*
+         * Mainline U-Boot's designware_spi selects the slave only after
+         * the opcode, column and first FIFO-full of data are queued
+         * (the controller sends nothing until SER is set), and writes
+         * SER 0 when the operation is over. So a non-zero SER ends an
+         * open PROGRAM_LOAD only if the slave was already selected when
+         * the load began (Linux, the SDK U-Boot: SER at a message's
+         * start); SER 0 always ends it.
+         */
         s->ser_seen = true;
-        if (s->program_active) {
+        if (s->program_active && (value == 0 || s->ser_at_load != 0)) {
             if (s->debug) {
                 qemu_log("spinand: LOAD end(cs) col %u n %u\n",
                          s->program_column, s->program_idx);
@@ -686,6 +712,7 @@ static void axera_spi_nand_reset(DeviceState *dev)
     s->program_column = 0;
     s->program_idx = 0;
     s->ser_seen = false;
+    s->ser_at_load = 0;
     rxq_reset(s);
 }
 
