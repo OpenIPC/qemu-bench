@@ -102,6 +102,7 @@ typedef struct FhSoCConfig {
     uint32_t ddr_mbit;          /* PMU 0x334 */
     uint32_t pll_scheme;        /* fh-pmu: where the system PLL is */
     uint32_t tmr_prediv;        /* fh-pmu: scheme 2's PLL1 prediv, 0: 10 */
+    bool tmr_div_low;           /* fh-pmu: the divider in CLK_DIV5[7:0] */
     const char *sensor;         /* default sensor= */
     uint32_t swrst_base;        /* fh-pmu: 0 for 0x040 */
     uint32_t spc_io_status;     /* PMU 0x054, FH8632's variant */
@@ -120,6 +121,7 @@ typedef struct FhSoCConfig {
     bool ahb_dmac;
     int dmac_irq;
     int num_uart;
+    bool uart_slot_mirror;      /* each UART answers across its 1 MB slot */
     hwaddr uart_base[3];
     int uart_irq[3];
     int num_spi;
@@ -306,7 +308,8 @@ static const FhSoCConfig fh8626v100_soc = {
     .chip_id            = 0x18112301,
     .ddr_mbit           = 512,
     .pll_scheme         = 2,
-    .tmr_prediv         = 1,
+    .tmr_prediv         = 6,
+    .tmr_div_low        = true,
     .sensor             = "gc2053",
     .swrst_base         = 0x04C,
     .timer_irq          = 3,
@@ -321,6 +324,7 @@ static const FhSoCConfig fh8626v100_soc = {
     .ahb_dmac           = true,
     .dmac_irq           = 21,
     .num_uart           = 3,
+    .uart_slot_mirror   = true,
     .uart_base          = { 0xF0700000, 0xF0800000, 0xF1300000 },
     .uart_irq           = { 18, 19, 20 },
     .num_spi            = 2,
@@ -389,6 +393,70 @@ struct FhMachineState {
     char *flash_type;
     char *sensor;
     DeviceState *irqc;
+};
+
+/*
+ * A UART's 1 MB APB slot past its register window.  OpenIPC's FH8626V100
+ * kernel (4.19, mach-fullhan) needs it: its low-level debug UART is
+ * DEBUG_UART_PHYS 0xF0700000 / DEBUG_UART_VIRT 0xFE020000, and head.S maps
+ * that with one 1 MB section, VIRT & ~0xFFFFF to PHYS & ~0xFFFFF, so until
+ * paging_init() replaces the mapping, the early console writes THR and
+ * polls LSR at 0xF0720000.  The camera boots, so the slot answers there;
+ * every FH8626 peripheral sits alone in its 1 MB slot (the DTS), which is
+ * what a decoder that ignores the slot's low bits would give.  Accesses
+ * are forwarded to the UART at base + (offset mod its 0x100 window).
+ */
+#define FH_UART_WINDOW      0x100
+#define FH_UART_SLOT        (1 * MiB)
+
+static uint64_t fh_uart_mirror_read(void *opaque, hwaddr addr, unsigned size)
+{
+    hwaddr base = (hwaddr)(uintptr_t)opaque;
+    hwaddr a = base + (addr % FH_UART_WINDOW);
+
+    switch (size) {
+    case 1:
+        return address_space_ldub(&address_space_memory, a,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+    case 2:
+        return address_space_lduw_le(&address_space_memory, a,
+                                     MEMTXATTRS_UNSPECIFIED, NULL);
+    default:
+        return address_space_ldl_le(&address_space_memory, a,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+}
+
+static void fh_uart_mirror_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    hwaddr base = (hwaddr)(uintptr_t)opaque;
+    hwaddr a = base + (addr % FH_UART_WINDOW);
+
+    switch (size) {
+    case 1:
+        address_space_stb(&address_space_memory, a, val,
+                          MEMTXATTRS_UNSPECIFIED, NULL);
+        break;
+    case 2:
+        address_space_stw_le(&address_space_memory, a, val,
+                             MEMTXATTRS_UNSPECIFIED, NULL);
+        break;
+    default:
+        address_space_stl_le(&address_space_memory, a, val,
+                             MEMTXATTRS_UNSPECIFIED, NULL);
+        break;
+    }
+}
+
+static const MemoryRegionOps fh_uart_mirror_ops = {
+    .read = fh_uart_mirror_read,
+    .write = fh_uart_mirror_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
 };
 
 static char *fh_machine_get_flash_file(Object *obj, Error **errp)
@@ -692,6 +760,9 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
     if (c->tmr_prediv) {
         qdev_prop_set_uint32(pmu, "tmr-prediv", c->tmr_prediv);
     }
+    if (c->tmr_div_low) {
+        qdev_prop_set_uint32(pmu, "tmr-div-lsb", 0);
+    }
     if (c->swrst_base) {
         qdev_prop_set_uint32(pmu, "swrst-base", c->swrst_base);
     }
@@ -741,6 +812,16 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->uart_base[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            fh_irq(fms, c->uart_irq[n]));
+        if (c->uart_slot_mirror) {
+            MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+            /* Under the UART itself, over the unimplemented periph space */
+            memory_region_init_io(mr, NULL, &fh_uart_mirror_ops,
+                                  (void *)(uintptr_t)c->uart_base[n],
+                                  "fh-uart.slot", FH_UART_SLOT);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                c->uart_base[n], mr, -1);
+        }
     }
 
     for (n = 0; n < 2; n++) {

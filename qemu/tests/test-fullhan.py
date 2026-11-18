@@ -38,8 +38,10 @@ vendor drivers (docs/fullhan.md):
     kernel's 50 MHz), and a flash read on GPIO 54 drained by the AHB DMAC
     on handshake 2 through a descriptor list;
   - fh8652: the GIC-400 distributor where its kernel's init_irq maps it;
-  - fh8626v100: the block resets at 0x04C, SPI0 at 0xF0E00000 reading the
-    flash's ID, and the PLL1 / 60 timer clock its kernel runs at 10 MHz;
+  - fh8626v100: the block resets at 0x04C, UART0 answering across its
+    1 MB slot, SPI0 at 0xF0E00000 reading the flash's ID, and the
+    timer clock: 10 MHz from reset (the vendor kernel), 50 MHz once
+    DIV5[7:0] is 1 (OpenIPC's 4.19);
   - fh8632: its chip and variant IDs, the PTS counter at 0xE7000040, and
     the RTC v1's direct counter, sync bits and set-up magic;
   - outside qtest: machine state migrates to a file and back.
@@ -217,6 +219,7 @@ def test_uart(qt):
     check('USR: TX FIFO empty and not full, RX empty',
           qt.readl(UART0 + 0x7C), 0x6)
     check('component type', qt.readl(UART0 + 0xFC), 0x44570110)
+    check('no slot mirror off FH8626V100', qt.readl(UART0 + 0x20014), 0)
 
 
 def spi_cs(qt, low):
@@ -743,16 +746,36 @@ def test_fh8626(qemu, path):
         qt.writel(gpio1 + 0x00, 1 << 22)
         check('JEDEC ID through SPI0 at 0xF0E00000',
               (rx[1] << 16) | (rx[2] << 8) | rx[3], JEDEC)
-        # Its kernel's tmr0_clk: PLL1 600 / (DIV5[23:16] 0x3B + 1), no
-        # prediv -- 10 MHz from the reset value.
-        check('DIV5[23:16] at reset', (qt.readl(PMU + 0x38) >> 16) & 0xFF,
-              0x3B)
+        # tmr0_clk: PLL1 600 / 6 / (DIV5[7:0] + 1) (OpenIPC 4.19's
+        # clk-fh8626v100.c) -- 10 MHz from the reset value, which the vendor
+        # 3.0.8 kernel runs at without touching the divider.
+        div5 = qt.readl(PMU + 0x38)
+        check('DIV5[7:0] at reset', div5 & 0xFF, 9)
+        check('DIV5[23:16] at reset', (div5 >> 16) & 0xFF, 0x3B)
         qt.writel(TIMER + 0x00, 10000)          # 1 ms at 10 MHz
         qt.writel(TIMER + 0x08, 0x3)
         qt.step(900000)
         check('10 MHz: not yet at 0.9 ms', qt.readl(TIMER + 0xA8) & 1, 0)
         qt.step(200000)
         check('expired by 1.1 ms', qt.readl(TIMER + 0xA8) & 1, 1)
+        # The 4.19 kernel asks for its DT's 50 MHz: DIV5[7:0] = 1.
+        qt.writel(TIMER + 0x08, 0)
+        qt.writel(PMU + 0x38, (div5 & ~0xFF) | 1)
+        qt.writel(TIMER + 0x00, 50000)          # 1 ms at 50 MHz
+        qt.writel(TIMER + 0x08, 0x3)
+        qt.readl(TIMER + 0x0C)
+        qt.step(900000)
+        check('50 MHz: not yet at 0.9 ms', qt.readl(TIMER + 0xA8) & 1, 0)
+        qt.step(200000)
+        check('expired by 1.1 ms', qt.readl(TIMER + 0xA8) & 1, 1)
+        # Its kernel's DEBUG_LL polls LSR through a 1 MB section at
+        # 0xF0720000; UART0 answers across its slot.
+        check('LSR mirrored at 0xF0720014: THRE | TEMT',
+              qt.readl(UART0 + 0x20014) & 0x60, 0x60)
+        qt.writel(UART0 + 0x2001C, 0xA5)        # SCR through the mirror
+        check('SCR written through the mirror', qt.readl(UART0 + 0x1C), 0xA5)
+        check('UART2 mirrored at 0xF13FFF14', qt.readl(0xF13FFF14) & 0x60,
+              0x60)
     finally:
         qt.close()
 

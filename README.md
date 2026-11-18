@@ -380,7 +380,7 @@ SquashFS root from the NOR. See [docs/allwinner-cam.md](docs/allwinner-cam.md).
 | `fh8656` / `fh8658` | Cortex-A7, 128 MB in package | GIC-400 | — | —¹ |
 | `fh8852v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
 | `fh8856v100` | ARM1176JZF-S, 128 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
-| `fh8626v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor | yes |
+| `fh8626v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC 4.19 | yes |
 | `fh8632` | ARM1176JZF-S, 64 MB | DW ICTL | 3.0.8 vendor (SDK) | yes |
 
 Fullhan's camera SoCs, in `hw/arm/fullhan.c`: one memory map across five
