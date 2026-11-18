@@ -215,6 +215,7 @@ struct AkIspState {
     long src_first;             /* offset of the first FRAME */
     uint32_t src_w, src_h;
     uint8_t *src_pic;           /* the current frame, I420 */
+    uint32_t src_index;         /* its number in the recording */
     bool src_ok;
 
     /* the frame being written: per sensor column, then one row */
@@ -412,9 +413,11 @@ static void source_next(AkIspState *s)
             !strncmp(line, "FRAME", 5) &&
             fread(s->src_pic, 1, n, s->src_f) == n) {
             s->src_ok = true;
+            s->src_index++;
             return;
         }
         fseek(s->src_f, s->src_first, SEEK_SET);
+        s->src_index = 0;
     }
     qemu_log_mask(LOG_GUEST_ERROR, "ak-isp: source %s has no frames\n",
                   s->source);
@@ -767,16 +770,41 @@ static void ak_isp_unrealize(DeviceState *dev)
     g_free(s->src_pic);
 }
 
+/* A migrated source= picks the recording up where the source VM was */
+static int ak_isp_post_load(void *opaque, int version_id)
+{
+    AkIspState *s = opaque;
+    uint32_t want = s->src_index;
+
+    if (!s->src_f) {
+        return 0;
+    }
+    fseek(s->src_f, s->src_first, SEEK_SET);
+    s->src_index = 0;
+    s->src_ok = false;
+    while (s->src_index < want) {
+        uint32_t before = s->src_index;
+
+        source_next(s);
+        if (!s->src_ok || s->src_index <= before) {
+            break;      /* a shorter recording here: it went round */
+        }
+    }
+    return 0;
+}
+
 static const VMStateDescription ak_isp_vmstate = {
     .name = TYPE_AK_ISP,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
+    .post_load = ak_isp_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AkIspState, AK_ISP_NREGS),
         VMSTATE_UINT8_ARRAY(table, AkIspState, TBL_MAX),
         VMSTATE_UINT32(cur, AkIspState),
         VMSTATE_UINT32(frames, AkIspState),
         VMSTATE_TIMER_PTR(timer, AkIspState),
+        VMSTATE_UINT32_V(src_index, AkIspState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
