@@ -204,8 +204,17 @@ static void mc_luma(const PPic *p, int mx, int my, const int16_t mv[2],
 {
     const int dx = mv[0] >> 2, dy = mv[1] >> 2, fx = mv[0] & 3,
               fy = mv[1] & 3;
+    const int X0 = mx * 16 + dx, Y0 = my * 16 + dy + p->ry0;
     int x, y;
 
+    if (!(fx | fy) && X0 >= 0 && X0 + 16 <= p->f.w && Y0 >= 0 &&
+        Y0 + 16 <= p->rh) {
+        /* a whole-sample vector inside the picture: ref_y() unclamped */
+        for (y = 0; y < 16; y++) {
+            memcpy(py + y * 16, p->ry + (Y0 + y) * p->f.w + X0, 16);
+        }
+        return;
+    }
     for (y = 0; y < 16; y++) {
         for (x = 0; x < 16; x++) {
             const int X = mx * 16 + x + dx, Y = my * 16 + y + dy;
@@ -227,7 +236,16 @@ static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
     mc_luma(p, mx, my, mv, py);
     for (comp = 0; comp < 2; comp++) {
         const uint8_t *r = comp ? p->rcr : p->rcb;
+        const int x0 = mx * 8 + ix, y0 = my * 8 + iy + p->ry0 / 2;
 
+        if (!(fx | fy) && x0 >= 0 && x0 + 8 <= cw && y0 >= 0 &&
+            y0 + 8 <= ch) {
+            /* whole chroma samples inside: the weights are 64, 0, 0, 0 */
+            for (y = 0; y < 8; y++) {
+                memcpy(pc[comp] + y * 8, r + (y0 + y) * cw + x0, 8);
+            }
+            continue;
+        }
         for (y = 0; y < 8; y++) {
             for (x = 0; x < 8; x++) {
                 const int x0 = mx * 8 + x + ix;
@@ -1779,6 +1797,31 @@ static void motion_search(const PPic *p, int mx, int my, const int16_t mvp[2],
     }
 }
 
+/* the prediction is the source sample for sample: no residual to code */
+static bool pred_exact(const PPic *p, int mx, int my, const uint8_t py[256],
+                       const uint8_t pc[2][64])
+{
+    int x, y;
+
+    for (y = 0; y < 16; y++) {
+        if (memcmp(p->f.sy + (my * 16 + y) * p->f.sys + mx * 16, py + y * 16,
+                   16)) {
+            return false;
+        }
+    }
+    for (y = 0; y < 8; y++) {
+        const uint8_t *s = p->f.suv + (my * 8 + y) * p->f.scs + mx * 16;
+
+        for (x = 0; x < 8; x++) {
+            if (s[2 * x] != pc[0][y * 8 + x] ||
+                s[2 * x + 1] != pc[1][y * 8 + x]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* a P_Skip macroblock: its prediction is the picture */
 static void put_skip(PPic *p, int mx, int my, PMb *me, const int16_t mvs[2],
                      const uint8_t py[256], const uint8_t pc[2][64])
@@ -1852,9 +1895,13 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
                 st->skip++;
                 goto next;
             }
-            residual_mb(p, mx, my, py, pc, p->qp_target, &r);
             const int skip_inc = (a && a->type != PMB_SKIP) +
                                  (b && b->type != PMB_SKIP);
+            if (pred_exact(p, mx, my, py, pc)) {
+                r.cbp_luma = r.cbp_chroma = 0;  /* residual_mb()'s answer */
+            } else {
+                residual_mb(p, mx, my, py, pc, p->qp_target, &r);
+            }
             if (!r.cbp_luma && !r.cbp_chroma) {
                 put_skip_flag(p, &c, skip_inc, true);
                 put_skip(p, mx, my, me, mvs, py, pc);
