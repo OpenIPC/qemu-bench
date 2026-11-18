@@ -171,6 +171,7 @@ typedef struct AkIspLayout {
     uint32_t main_dst, sub_dst; /* block 4 words */
     uint32_t dst_bits;
     uint32_t frame_ctrl;        /* block 4 word */
+    uint32_t r5_enable;         /* block 5 word: [25] mirror, [26] flip */
     uint32_t st_w1c;            /* STATUS bits a 1 clears */
     uint32_t irq_mask;          /* interrupt-enable bits that are enables */
 } AkIspLayout;
@@ -178,6 +179,7 @@ typedef struct AkIspLayout {
 static const AkIspLayout ak_isp_ev200 = {
     .tbl_size = 3424, .blk4 = 3152, .blk5 = 3292,
     .main_dst = 31, .sub_dst = 33, .dst_bits = 12, .frame_ctrl = 34,
+    .r5_enable = 32,
     .st_w1c = 0xFFFF, .irq_mask = 0xFFFF,
 };
 
@@ -185,6 +187,7 @@ static const AkIspLayout ak_isp_ev200 = {
 static const AkIspLayout ak_isp_ev300 = {
     .tbl_size = 3540, .blk4 = 3188, .blk5 = 3396,
     .main_dst = 48, .sub_dst = 50, .dst_bits = 13, .frame_ctrl = 51,
+    .r5_enable = 35,
     .st_w1c = 0x3FFFF & ~(1u << 14), .irq_mask = 0xFFFFF,
 };
 
@@ -492,22 +495,34 @@ static void write_picture(AkIspState *s, const AkIspPlanes *p, bool nv12,
     uint32_t cut0 = tbl_word(s, 0), cut1 = tbl_word(s, 4);
     uint32_t cx = cut0 & 0x1FFF, cy = (cut0 >> 16) & 0x1FFF;
     uint32_t cw = cut1 & 0x1FFF, ch = (cut1 >> 16) & 0x1FFF;
+    /*
+     * HFILP_EN / VFILP_EN (ak_isp_set_flip_mirror): the picture is
+     * mirrored and / or flipped. Applied here to the crop window as it is
+     * written out, which for the full-frame window every driver programs
+     * is the same as mirroring the sensor frame; whether silicon mirrors
+     * before or after a narrower crop is not known.
+     */
+    uint32_t r5 = tbl_word(s, s->l->blk5 + s->l->r5_enable * 4);
+    bool hflip = r5 & (1u << 25), vflip = r5 & (1u << 26);
 
     if (!p->y) {
         return;
     }
     for (uint32_t x = 0; x < w; x++) {
-        s->xmap[x] = cx + (uint64_t)x * cw / w;
+        s->xmap[x] = cx + (uint64_t)(hflip ? w - 1 - x : x) * cw / w;
     }
     for (uint32_t y = 0; y < h; y++) {
-        pattern_row(s, cy + (uint64_t)y * ch / h, fw, fh, w, 1);
+        pattern_row(s, cy + (uint64_t)(vflip ? h - 1 - y : y) * ch / h,
+                    fw, fh, w, 1);
         put_row(p->y + (hwaddr)y * w, s->src[0], w);
     }
     if (!p->u || (!nv12 && !p->v)) {
         return;
     }
     for (uint32_t y = 0; y < h / 2; y++) {
-        pattern_row(s, cy + (uint64_t)y * 2 * ch / h, fw, fh, w / 2, 2);
+        uint32_t ry = vflip ? h / 2 - 1 - y : y;
+
+        pattern_row(s, cy + (uint64_t)ry * 2 * ch / h, fw, fh, w / 2, 2);
         if (nv12) {
             for (uint32_t x = 0; x < w / 2; x++) {
                 s->row[2 * x] = s->src[1][x];
