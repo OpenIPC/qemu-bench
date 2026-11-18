@@ -145,11 +145,14 @@ if [ $GMAC -eq 1 ]; then
     check "DHCP lease over the GMAC" 'lease of 10.0.2.15'
 fi
 if [ $ARC -eq 1 ]; then
-    # Its init script ends the line with OK or FAIL (...), after whatever
-    # the daemon prints on the way.
+    # The init script's verdict: "OK" or "FAIL (...)", after the "Starting
+    # fh8626-3ad: " prefix or on a line of its own once the daemon has
+    # printed, and before the next script starts. rcS runs the scripts in
+    # turn, so it is in the log before login:.
     if awk '/Starting fh8626-3ad:/ { f = 1 }
-            f && /FAIL/ { exit 1 }
-            f && /(^|[^A-Z])OK\r?$/ { ok = 1; exit 0 }
+            f && /(^|fh8626-3ad: )FAIL \(/ { exit 1 }
+            f && /(^|fh8626-3ad: )OK\r?$/ { ok = 1; exit 0 }
+            f && /^Starting / && !/fh8626-3ad:/ { exit 1 }
             END { exit !ok }' "$LOG"; then
         echo "  PASS: fh8626-3ad (ISP 3A daemon) started"
     else
