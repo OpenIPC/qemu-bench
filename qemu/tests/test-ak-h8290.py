@@ -562,8 +562,11 @@ def main():
           'P frames after the first (%s bytes) are smaller than the IDR (%d)' %
           (payloads[2:4], payloads[0]))
 
+    # yuvj420p: the decoder's own full-range samples.  Asking for yuv420p
+    # makes ffmpeg 6 (Ubuntu 24.04, CI) squeeze them to limited range and
+    # ffmpeg 8 not, so the same JPEG measured 28 dB on one and 33 on the other.
     jres = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'jpeg_pipe', '-i', '-',
-                           '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'],
+                           '-f', 'rawvideo', '-pix_fmt', 'yuvj420p', '-'],
                           input=jpg, capture_output=True)
     check(jres.returncode == 0 and not jres.stderr and len(jres.stdout) == fsz,
           'ffmpeg decodes the JPEG at %dx%d%s' %
