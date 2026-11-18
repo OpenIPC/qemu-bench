@@ -22,6 +22,13 @@ script plays the vendor drivers (docs/anyka.md):
     and reading STATUS clears it;
   - a full-duplex PIO transfer that fills the RX FIFO loses no TX byte, and
     an L2 read whose DMA ends in a short fraction drains the buffer;
+  - ak3918ev300l: an AK_H322L header whose script carries the one-word
+    ROM operations, the chip ID, the clock block's self-clearing apply /
+    valid bits, SPI0 at 0x21100000 with WORK_MODE, ROM word 0x24 a
+    harmless in-ROM pointer;
+  - ak3918av100 / ak3918av100x: the ANYKA322 header whose payload the ROM
+    copies from flash 0x600 (secure-boot keys behind the 0x200 header), the
+    chip ID, and the eFuse read the vendor ak_efuse.ko polls;
   - outside qtest: a flash image smaller than an erase block is refused,
     machine state migrates to a file and back on five- and ten-timer
     parts, and a file-backed flash blocks migration.
@@ -101,6 +108,8 @@ failures = 0
 def shown(v):
     if isinstance(v, (bool, str)):
         return v
+    if isinstance(v, tuple):
+        return '(%s)' % ', '.join(str(shown(x)) for x in v)
     if isinstance(v, bytes):
         return v[:8].hex() + ('...' if len(v) > 8 else '')
     return hex(v)
@@ -140,10 +149,10 @@ def make_image(path, magic=b'ANYKA_H3'):
 
 def test_boot_rom(qt, code):
     print('mask ROM')
-    stub = [0xE28F2010, 0xE8B20003, 0xE3500000, 0x15801000, 0x1AFFFFFB,
-            0xE592F000]
-    check('ROM stub at 0', [qt.readl(4 * i) for i in range(6)] == stub, True)
-    table = [qt.readl(0x18 + 4 * i) for i in range(7)]
+    stub = [0xE28F2020, 0xE8B20003, 0xE3500000, 0x15801000, 0x1AFFFFFB,
+            0xE592F000, 0, 0, 0, 0x7F00]
+    check('ROM stub at 0', [qt.readl(4 * i) for i in range(10)] == stub, True)
+    table = [qt.readl(0x28 + 4 * i) for i in range(7)]
     check('script table, delay dropped, then {0, 0} and the entry',
           table == [DDRC + 0x04, 0x0D493315, DDRC + 0x0C, 0x00000A8B,
                     0, 0, LOAD], True)
@@ -330,7 +339,7 @@ def test_rejections_and_migration(qemu, tmp, path):
                          capture_output=True, text=True, timeout=30)
     check('a 32 KiB flash image is refused',
           out.returncode != 0 and '64 KiB' in out.stderr, True)
-    for m in ('ak3918ev300', 'ak3919ev330'):
+    for m in ('ak3918ev300', 'ak3919ev330', 'ak3918av130'):
         mig = os.path.join(tmp, m + '.mig')
         out = hmp(qemu, ['-M', m, '-S'],
                   ['migrate file:' + mig, 'info migrate'])
@@ -422,6 +431,389 @@ def test_ev330(qemu, path):
         qt.close()
 
 
+SPI0_ASPEN = 0x21100000
+UART2_ASPEN = 0x201A0000
+
+
+def test_ev300l(qemu, path):
+    print('ak3918ev300l: AK_H322L header, clocks, SPI0 at 0x21100000')
+    img = bytearray(open(path, 'rb').read())
+    script = [DDRC + 0x14, 0x00423E71,
+              0x66668881, DDRC + 0xA4, 0x10000,     # poll: three words
+              DDRC + 0x0C, 0x00001A5D,
+              0x66668882, 0x54535150,               # a one-word ROM op
+              0x66668880, DDRC + 0x24, 0xFFFFFFFB,  # RMW: three words
+              0x88888888, 0]
+    img[0x2C:0x18C] = b'\0' * 0x160
+    struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x190:0x194] = b'\0' * 4                   # SPIP with no ID
+    open(path, 'wb').write(img)
+    out2 = path + '.uart2'
+    qt = QTest(qemu, 'ak3918ev300l,flash-file=%s' % path,
+               ['-serial', 'null', '-serial', 'null',
+                '-serial', 'file:' + out2])
+    try:
+        table = [qt.readl(0x28 + 4 * i) for i in range(7)]
+        check('script: poll and ROM ops dropped', table ==
+              [DDRC + 0x14, 0x00423E71, DDRC + 0x0C, 0x00001A5D,
+               0, 0, LOAD], True)
+        check('ROM word 0x24 points into the ROM', qt.readl(0x24), 0x7F00)
+        check('chip ID', qt.readl(SYSCTRL), 0x53543400)
+        qt.writel(SYSCTRL + 0x04, 0x40000024)
+        check('PLL1 adjust bit self-clears', qt.readl(SYSCTRL + 0x04),
+              0x24)
+        qt.writel(SYSCTRL + 0x08, 0x02280063)
+        check('GCLK divider valid bit self-clears',
+              qt.readl(SYSCTRL + 0x08), 0x00280063)
+        qt.writel(SYSCTRL + 0x0C, (1 << 19) | (1 << 18) | (2 << 10))
+        check('SPI0 HS clock divider valid bit self-clears',
+              qt.readl(SYSCTRL + 0x0C), (1 << 18) | (2 << 10))
+        qt.writel(SYSCTRL + 0x264, 0x1234)
+        check('pad registers past 0x200 are storage',
+              qt.readl(SYSCTRL + 0x264), 0x1234)
+        s = SPI0_ASPEN
+        qt.writel(s + 0x24, qt.readl(s + 0x24) | 1)
+        check('WORK_MODE normal mode reads back', qt.readl(s + 0x24) & 1, 1)
+        qt.writel(s, 0x72)
+        qt.writel(s + 0x0C, 1)
+        qt.writel(s + 0x18, 0x9F)
+        qt.writel(s, 0x71)
+        qt.writel(s + 0x0C, 3)
+        jedec = qt.readl(s + 0x1C) & 0xFFFFFF
+        qt.writel(s, 0x51)
+        check('RDID through SPI0 at 0x21100000 (empty SPIP: GD25Q64)',
+              int.from_bytes(jedec.to_bytes(3, 'little'), 'big'), 0xC84017)
+        # UART 2 at 0x201A0000, its TX ring at L2 + 0x1200
+        qt.writel(L2MEM + 0x1200, ord('2'))
+        qt.writel(UART2_ASPEN + 0x00, 1 << 28)
+        qt.writel(UART2_ASPEN + 0x04, (1 << 4) | (1 << 16))
+        check('UART2: TX done reads as idle',
+              (qt.readl(UART2_ASPEN + 0x04) >> 19) & 1, 1)
+        time.sleep(0.2)
+        check('UART2: byte reached the third serial port',
+              open(out2, 'rb').read(), b'2')
+    finally:
+        qt.close()
+def test_av100(qemu, tmp):
+    print('ak3918av100 / ak3918av100x: ANYKA322 0x600 header, eFuse')
+    # The AV100 ROM keeps 0x400 bytes for secure boot behind the 0x200
+    # header (pubkey 0x200, signature 0x300) and copies the payload from
+    # flash offset 0x600 to the load address.
+    code = [0xE1A00000, 0xEAFFFFFE]
+    img = bytearray(b'\xFF' * (8 << 20))
+    struct.pack_into('<I', img, 0, 0xEA00017E)
+    img[4:12] = b'ANYKA322'
+    struct.pack_into('<I', img, 0x0C, 4 * len(code))
+    struct.pack_into('<I', img, 0x20, LOAD)
+    script = [DDRC + 0x14, 0x00423E71,
+              0x66668881, DDRC + 0xA4, 0x10000,
+              0x88888888, 0]
+    struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    struct.pack_into('<%dI' % len(code), img, 0x600, *code)
+    path = os.path.join(tmp, 'av100.bin')
+    open(path, 'wb').write(img)
+
+    for machine, ram, chip in (('ak3918av100', 64, 0x53533500),
+                               ('ak3918av100x', 128, 0x53533500)):
+        qt = QTest(qemu, '%s,flash-file=%s' % (machine, path))
+        try:
+            check('%s chip ID' % machine, qt.readl(SYSCTRL), chip)
+            check('%s: payload copied from flash 0x600' % machine,
+                  qt.readl(LOAD), code[0])
+            check('%s: 0x600 header in front of U-Boot (TEXT_BASE)' % machine,
+                  qt.readl(LOAD - 0x600 + 4), 0x4B594E41)
+            # DDR size is the one difference between the two: the last word
+            # of RAM holds a value, the word past it does not.
+            end = 0x80000000 + (ram << 20)
+            qt.writel(end - 4, 0x5AA5C33C)
+            check('%s: RAM up to %d MiB' % (machine, ram),
+                  qt.readl(end - 4), 0x5AA5C33C)
+            qt.writel(end, 0x5AA5C33C)
+            check('%s: no RAM past %d MiB' % (machine, ram),
+                  qt.readl(end) != 0x5AA5C33C, True)
+            # eFuse read: bit 31 start/busy, cleared when done (the AV100's
+            # ak_efuse.ko polls SYSCTRL + 0x8C the way the EV330 reader does).
+            qt.writel(SYSCTRL + 0x8C, (1 << 31) | (1 << 21))
+            check('%s: eFuse read completes' % machine,
+                  qt.readl(SYSCTRL + 0x8C) & (3 << 30), 0)
+        finally:
+            qt.close()
+
+
+def test_av130(qemu, tmp):
+    print('ak3918av130: an AKH322LS header as the first AV130 dump has it, '
+          'timers and interrupts at 0x21100000, FIFO UART')
+    # As owner report r-5uwdebux's flash has it: magic AKH322LS, the payload
+    # from flash 0x200 (0x400 of secure-boot space, then U-Boot at 0x600) to
+    # 0x80DFFC00, so U-Boot lands at 0x80E00000; the script ends with the
+    # three-word read-modify-write that a pair-wise reading made a store to
+    # 0xFFFFFFFB.
+    code = [0xE1A00000, 0xEAFFFFFE]
+    img = bytearray(b'\xFF' * (8 << 20))
+    struct.pack_into('<I', img, 0, 0xEA000238)
+    img[4:12] = b'AKH322LS'
+    struct.pack_into('<I', img, 0x0C, 0x400 + 4 * len(code))
+    struct.pack_into('<I', img, 0x20, LOAD - 0x400)
+    script = [DDRC + 0x14, 0x00423E71,
+              0x66668881, DDRC + 0xA4, 0x10000,
+              DDRC + 0x24, 0x1,
+              0x66668882, 0x54535150,
+              0x66668880, DDRC + 0x24, 0xFFFFFFFB,
+              0x88888888, 0]
+    struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x200:0x600] = b'\0' * 0x400
+    struct.pack_into('<%dI' % len(code), img, 0x600, *code)
+    for i in range(0x10000, 0x10100):          # what the SFC reads back
+        img[i] = i * 7 & 0xFF
+    path = os.path.join(tmp, 'av130.bin')
+    open(path, 'wb').write(img)
+    out = os.path.join(tmp, 'av130-uart0.txt')
+    rx = os.path.join(tmp, 'av130-uart0-in.txt')
+    open(rx, 'wb').write(b'hi')                 # what UART0 receives
+    qt = QTest(qemu, 'ak3918av130,flash-file=%s' % path,
+               ['-chardev', 'file,id=u0,path=%s,input-path=%s' % (out, rx),
+                '-serial', 'chardev:u0'])
+    try:
+        table = [qt.readl(0x28 + 4 * i) for i in range(9)]
+        check('script: poll, ROM op and RMW dropped, nothing at 0xFFFFFFFB',
+              table[:7] == [DDRC + 0x14, 0x00423E71, DDRC + 0x24, 0x1,
+                            0, 0, LOAD - 0x400], True)
+        check('U-Boot lands at 0x80E00000', qt.readl(LOAD), code[0])
+        qt.writel(0x80000000 + (64 << 20) - 4, 0x5AA5C33C)
+        check('64 MiB of RAM', qt.readl(0x80000000 + (64 << 20) - 4),
+              0x5AA5C33C)
+        qt.writel(0x80000000 + (64 << 20), 0x5AA5C33C)
+        check('none past 64 MiB', qt.readl(0x80000000 + (64 << 20)) !=
+              0x5AA5C33C, True)
+        # The timers and interrupt controller at 0x21100000, as the AV130
+        # SDK's kernel drives them (ak_timer_common.h, ak_irq_v2.c) and its
+        # U-Boot's get_timer() reads timer 0: LOAD 0x00, VALUE 0x04, CTRL
+        # 0x08 (0 enable, 2:1 mode, 3 reload now), INTCLR 0x0C, INT_EN 0x10.
+        intc, t0, t1 = 0x21100000, 0x21110000, 0x21111000
+        qt.writel(t0 + 0x00, 12000)             # U-Boot's timer_init()
+        qt.writel(t0 + 0x14, 1)
+        qt.writel(t0 + 0x10, 1)
+        qt.writel(t0 + 0x08, 1)                 # free running
+        a = qt.readl(t0 + 0x04)
+        qt.step(250000)                         # 250 us at 12 MHz
+        qt.writel(t0 + 0x08, 1)                 # get_timer() sets bit 0 again
+        b = qt.readl(t0 + 0x04)
+        check('timer 0 counts down 3000 in 250 us', (a - b) & 0xFFFFFFFF,
+              3000)
+        check('CTRL bit 0 is the enable: it stays set',
+              qt.readl(t0 + 0x08) & 1, 1)
+        qt.writel(t0 + 0x08, (1 << 3) | 1)       # the kernel's clocksource
+        check('reload: VALUE starts again from LOAD',
+              qt.readl(t0 + 0x04), 12000)
+        qt.writel(intc + 0x04, 1 << 28)          # IRQ mask: timer 1
+        qt.writel(t1 + 0x00, 12000)
+        qt.writel(t1 + 0x10, 1)
+        qt.writel(t1 + 0x08, (2 << 1) | (1 << 3) | 1)  # one-shot clock event
+        qt.step(500000)
+        check('timer 1 one-shot: not before it expires',
+              qt.readl(t1 + 0x18), 0)
+        qt.step(600000)
+        check('timer 1 one-shot: INT_STA', qt.readl(t1 + 0x18), 1)
+        check('top status bit 28 is timer 1', qt.readl(intc + 0x08) >> 28 & 1,
+              1)
+        qt.writel(t1 + 0x0C, 1)
+        check('INTCLR clears it', qt.readl(intc + 0x08) >> 28 & 1, 0)
+        qt.writel(intc + 0x0C, 1)                # TWI bank mask: I2C 0
+        check('an idle TWI bank raises no cascade bit (13)',
+              qt.readl(intc + 0x08) >> 13 & 1, 0)
+        check('chip ID at SYSCTRL + 0x3FC', qt.readl(SYSCTRL + 0x3FC),
+              0x56573500)
+        # Periodic: VALUE runs LOAD..0, a period of LOAD + 1 ticks, and
+        # INT_STA comes as it reaches 0, not a tick before.
+        t2 = 0x21112000
+        qt.writel(t2 + 0x00, 1199)               # 100 us at 12 MHz
+        qt.writel(t2 + 0x10, 1)
+        qt.writel(t2 + 0x08, (1 << 1) | (1 << 3) | 1)
+        qt.step(99916)                           # tick 1198
+        check('periodic: not before VALUE reaches 0',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (0, 1))
+        qt.step(1)
+        check('periodic: INT_STA as VALUE reaches 0',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x0C, 1)
+        qt.step(100000)                          # one period, LOAD + 1 ticks
+        check('periodic: the next one LOAD + 1 ticks later',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x0C, 1)
+        qt.writel(t2 + 0x00, 599)                # a new LOAD, at VALUE 0
+        qt.step(49999)
+        check('new LOAD: not before its period ends', qt.readl(t2 + 0x18), 0)
+        qt.step(1)
+        check('new LOAD: INT_STA after LOAD + 1 = 600 ticks',
+              (qt.readl(t2 + 0x18), qt.readl(t2 + 0x04)), (1, 0))
+        qt.writel(t2 + 0x08, 0)
+        qt.writel(t2 + 0x0C, 1)
+        # The system controller's own events are bank 1: their mask and
+        # status stay at SYSCTRL + 0x2C / 0x30, and top bit 3 raises them.
+        qt.writel(intc + 0x04, 1 << 3)
+        qt.writel(SYSCTRL + 0x2C, 1 << 5)        # its timer 1
+        qt.writel(SYSCTRL + 0xB4, 12000)
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24) | (1 << 29))
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24))
+        qt.step(2000000)
+        check('a system controller timer reaches top bit 3',
+              qt.readl(intc + 0x08) >> 3 & 1, 1)
+        qt.writel(SYSCTRL + 0xB8, (1 << 28) | (1 << 24) | (1 << 30))
+        check('and clearing it there drops it', qt.readl(intc + 0x08) >> 3 & 1,
+              0)
+        # The kernel's reboot (ak_pm.c REBOOT_DISABLE_CACHE_MMU and
+        # REBOOT_SELF_REFRESH): the instruction after the MMU goes off is
+        # fetched from L2 memory at its virtual address, 0xF1000000, and the
+        # DRAM's self-refresh request (0x21000010 bit 23) reads back done.
+        qt.writel(0x48000040, 0xE1A0F001)        # mov pc, r1
+        check('L2 memory answers at the kernel\'s AK_VA_L2MEM',
+              qt.readl(0xF1000040), 0xE1A0F001)
+        qt.writel(0x21000010, (1 << 26) | (1 << 23) | (1 << 22))
+        check('DDRC: the self-refresh request (bit 23) reads back done',
+              qt.readl(0x21000010), (1 << 26) | (1 << 22))
+        uart = 0x20130000
+        check('UART: TX FIFO never full', qt.readl(uart + 0x18) & 4, 0)
+        for ch in b'OK':
+            qt.writel(uart + 0x0C, ch << 16)
+        check('UART: bits 23:16 of DATA go out', open(out, 'rb').read(),
+              b'OK')
+        check('UART: TX FIFO empty and TX end after a send',
+              qt.readl(uart + 0x18) & ((1 << 1) | (1 << 17)),
+              (1 << 1) | (1 << 17))
+        qt.writel(uart + 0x18, 1 << 17)
+        check('UART: TX end is write-1-to-clear',
+              qt.readl(uart + 0x18) >> 17 & 1, 0)
+        test_av130_sfc(qt)
+        # RX: two bytes from the input file, their events on UART0's
+        # interrupt (top bit 10) only while bytes wait.
+        qt.writel(intc + 0x04, 1 << 10)
+        qt.writel(uart + 0x20, (1 << 8) | (1 << 10))
+        check('UART: two bytes received', (qt.readl(uart + 0x38) >> 16) & 0x3FF,
+              2)
+        check('UART: RX threshold and timeout raised',
+              (qt.readl(uart + 0x18) >> 8) & 5, 5)
+        check('UART: on interrupt 10', qt.readl(intc + 0x08) >> 10 & 1, 1)
+        got = bytes(qt.readl(uart + 0x0C) & 0xFF for _ in range(2))
+        check('UART: the bytes, in order', got, b'hi')
+        check('UART: the RX events end with the FIFO',
+              ((qt.readl(uart + 0x18) >> 8) & 5, qt.readl(intc + 0x08) >> 10 & 1),
+              (0, 0))
+        qt.writel(uart + 0x00, (1 << 28) | (1 << 25))
+        check('UART: the RX FIFO clear (CFG 28) self-clears',
+              qt.readl(uart + 0x00), 1 << 25)
+    finally:
+        qt.close()
+
+
+SFC = 0x20120000
+SFC_XIP = 0x30000000
+
+
+def sfc_bank(qt, n, op, iface, length=0, addr=0, mask=0, match=0):
+    b = SFC + 0x200 + 0x40 * n
+    qt.writel(b + 0x00, op)
+    qt.writel(b + 0x04, addr)
+    qt.writel(b + 0x18, mask)
+    qt.writel(b + 0x1C, match)
+    qt.writel(b + 0x20, iface)
+    qt.writel(b + 0x24, length)
+
+
+def sfc_run(qt, last, dma=False):
+    qt.writel(SFC + 0x180, last | (1 << 31) | ((1 << 30) if dma else 0))
+
+
+def test_av130_sfc(qt):
+    # The AV130 U-Boot's SFC v2 driver, as hw/ssi/ak-sfc.c models it.
+    qt.writel(SFC + 0x100, 1)
+    check('SFC: XIP stop acknowledged (0x100 bit 1)',
+          qt.readl(SFC + 0x100) & 2, 2)
+    qt.writel(SFC + 0x100, 0x10)
+    check('SFC: FIFO reset self-clears', qt.readl(SFC + 0x100) & 0x10, 0)
+    check('SFC: idle', qt.readl(SFC + 0xD0) & 0x20, 0x20)
+    qt.writel(SFC + 0xC0, 0x0504)
+    # RDID: 6 bytes clocked through the bank's data register, first 4 kept
+    sfc_bank(qt, 0, 0x9F, 0x10000440, 5 << 6)
+    sfc_run(qt, 0, dma=True)
+    check('SFC: RDID done (0x0D0 bit 4)', qt.readl(SFC + 0xD0) & 0x10, 0x10)
+    check('SFC: RDID in bank 0 +0x0C, first byte low',
+          qt.readl(SFC + 0x200 + 0x0C) & 0xFFFFFF, 0x1740C8)
+    qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: done is write-1-to-clear', qt.readl(SFC + 0xD0) & 0x10, 0)
+    check('SFC: start clears itself', qt.readl(SFC + 0x180) >> 31, 0)
+    # a FIFO read of 16 bytes from the pattern at 0x10000
+    qt.writel(SFC + 0x100, 0x10)
+    sfc_bank(qt, 0, 0x03, 0x4C0, 8 | (15 << 6), 0x10000)
+    sfc_run(qt, 0)
+    words = [qt.readl(SFC + 0x184) for _ in range(4)]
+    want = [struct.unpack_from('<I', bytes((0x10000 + i) * 7 & 0xFF
+                                           for i in range(16)), 4 * k)[0]
+            for k in range(4)]
+    check('SFC: FIFO read returns the flash, little-endian', words == want,
+          True)
+    check('SFC: an empty FIFO reads 0', qt.readl(SFC + 0x184), 0)
+    # WREN, then a FIFO page program: it waits for its bytes
+    sfc_bank(qt, 0, 0x06, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    sfc_bank(qt, 0, 0x02, 0x44C0, 8 | (7 << 6), 0x20000)
+    sfc_run(qt, 0)
+    check('SFC: a program waits for the FIFO', qt.readl(SFC + 0xD0) & 0x30, 0)
+    qt.writel(SFC + 0x184, 0x44332211)
+    qt.writel(SFC + 0x184, 0x88776655)
+    check('SFC: then completes', qt.readl(SFC + 0xD0) & 0x30, 0x30)
+    check('SFC: XIP window reads what was programmed',
+          (qt.readl(SFC_XIP + 0x20000), qt.readl(SFC_XIP + 0x20004)) ==
+          (0x44332211, 0x88776655), True)
+    qt.writel(SFC + 0xD0, 0x10)
+    # WREN, then a 4 KiB erase with an RDSR poll bank behind it
+    sfc_bank(qt, 0, 0x06, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    sfc_bank(qt, 0, 0x20, 0x100040C0, 8, 0x20000)
+    sfc_bank(qt, 1, 0x05, 0x18000040, 0, 0, 0xFFFFFFFE, 0)
+    sfc_run(qt, 1, dma=True)
+    check('SFC: erase and its status poll complete',
+          qt.readl(SFC + 0xD0) & 0x10, 0x10)
+    check('SFC: the sector reads erased', qt.readl(SFC_XIP + 0x20000),
+          0xFFFFFFFF)
+    qt.writel(SFC + 0xD0, 0x10)
+    # programs one after another, no FIFO reset between: the FIFO recycles
+    ok = True
+    for k in range(3):
+        sfc_bank(qt, 0, 0x06, 0x10004040)
+        sfc_run(qt, 0, dma=True)
+        qt.writel(SFC + 0xD0, 0x10)
+        sfc_bank(qt, 0, 0x02, 0x44C0, 8 | (5 << 6), 0x21000 + 0x10 * k)
+        sfc_run(qt, 0)
+        qt.writel(SFC + 0x184, 0xA0A0A000 | k)
+        qt.writel(SFC + 0x184, 0x0000B0B0)        # 6 bytes, 2 of padding
+        ok &= bool(qt.readl(SFC + 0xD0) & 0x10)
+        ok &= qt.readl(SFC_XIP + 0x21000 + 0x10 * k) == 0xA0A0A000 | k
+        ok &= qt.readl(SFC_XIP + 0x21004 + 0x10 * k) & 0xFFFF == 0xB0B0
+        qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: repeated FIFO programs, padding dropped', ok, True)
+    # 4-byte addressing (0xB7 ... 0xE9): the XIP window follows the NOR
+    sfc_bank(qt, 0, 0xB7, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    b4 = qt.readl(SFC_XIP + 0x10000)
+    sfc_bank(qt, 0, 0xE9, 0x10004040)
+    sfc_run(qt, 0, dma=True)
+    qt.writel(SFC + 0xD0, 0x10)
+    check('SFC: XIP reads right in 4-byte mode and after it',
+          (b4, qt.readl(SFC_XIP + 0x10000)) == (want[0], want[0]), True)
+    # a poll for a status the NOR never shows: busy, not done, until the
+    # FIFO reset abandons it
+    sfc_bank(qt, 0, 0x05, 0x18000040, 0, 0, 0xFFFFFFFE, 1)
+    sfc_run(qt, 0, dma=True)
+    check('SFC: a poll that never matches is not done',
+          qt.readl(SFC + 0xD0) & 0x30, 0)
+    qt.writel(SFC + 0x100, 0x10)
+    check('SFC: the FIFO reset abandons it', qt.readl(SFC + 0xD0) & 0x20,
+          0x20)
+
+
 def main():
     ap = argparse.ArgumentParser()
     root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -451,6 +843,11 @@ def main():
     path330 = os.path.join(tmp, 'flash330.bin')
     make_image(path330, b'ANYKAH3B')
     test_ev330(args.qemu, path330)
+    path300l = os.path.join(tmp, 'flash300l.bin')
+    make_image(path300l, b'AK_H322L')
+    test_ev300l(args.qemu, path300l)
+    test_av100(args.qemu, tmp)
+    test_av130(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)

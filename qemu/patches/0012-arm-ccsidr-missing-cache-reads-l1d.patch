@@ -1,0 +1,31 @@
+target/arm: read the L1 D-cache's CCSIDR for a cache that is not there
+
+CCSIDR is UNKNOWN when CSSELR selects a cache the CPU does not have, and
+QEMU returned 0 for it.  The usual set/way clean computes log2(ways)
+from CCSIDR by shifting until 1 remains, which never ends on 0 ways.
+The Fullhan FH865x (Cortex-A7) vendor U-Boot 2010.06 writes CSSELR from a
+register still holding a delay loop's count (100, so Level 3) just
+before booting Linux, and hung there; the silicon evidently answers with
+a real cache's geometry.  Return the L1 data cache's.
+
+---
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 27ebc6f..524ce69 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -866,6 +866,15 @@ static uint64_t ccsidr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+     uint32_t index = A32_BANKED_REG_GET(env, csselr,
+                                         ri->secure & ARM_CP_SECSTATE_S);
+ 
++    /*
++     * A CSSELR naming a cache that is not there leaves CCSIDR UNKNOWN.
++     * Read the L1 data cache's rather than 0, which makes set/way loops
++     * that count ways from it spin forever: the Fullhan FH865x vendor
++     * U-Boot writes a stray value before its last D-cache clean.
++     */
++    if (!cpu->ccsidr[index]) {
++        index = 0;
++    }
+     return cpu->ccsidr[index];
+ }
+ 

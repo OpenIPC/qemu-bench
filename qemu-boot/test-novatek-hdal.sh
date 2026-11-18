@@ -149,6 +149,10 @@ if [ -n "$DISPLAY_KOS" ]; then
              kflow_ai_net kdrv_md; do
         cp "$DISPLAY_KOS/$k/$k.ko" "$WORK/initramfs/dko/"
     done
+    # kdrv_ive as the samples' build makes it (the toolchain's cannot load)
+    if [ -f "${SAMPLES:-/nonexistent}/ko/kdrv_ive.ko" ]; then
+        cp "$SAMPLES/ko/kdrv_ive.ko" "$WORK/initramfs/dko/"
+    fi
     # hd_video_output_only's 3 frames of 320x240 YUV 4:2:2, Y then CbCr
     # interleaved: the eight 75 % colour bars (BT.601)
     python3 - "$WORK/initramfs/dispin/video_frm_320_240_3_yuv422.dat" <<'PY'
@@ -252,6 +256,10 @@ if [ -d /dko ]; then
     # the MDBC motion detection engine
     \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/kdrv_md.ko" >/dev/null 2>&1
     echo "NVT-MD-INSMOD: kdrv_md rc=\$?"
+    if [ -f /dko/kdrv_ive.ko ]; then
+        \$bb chroot /mnt /bin/sh -c "insmod /tmp/dko/kdrv_ive.ko" >/dev/null 2>&1
+        echo "NVT-IVE-INSMOD: kdrv_ive rc=\$?"
+    fi
 fi
 for d in /sys/bus/platform/devices/*; do
     [ -e \$d/driver ] && echo "NVT-HDAL-BOUND: \${d##*/} \$(\$bb basename \$(\$bb readlink \$d/driver))"
@@ -281,20 +289,37 @@ for b in /dev/mmcblk0 /dev/mmcblk1; do
 done
 mkfs.vfat $SDCARD >/dev/null && mount -t vfat $SDCARD /mnt/sd
 cd /tmp/smp
-run() {         # run <sample> [keys]: the keys 4 s apart, then q ($ARGS)
+# run <sample> [keys]: the keys 4 s apart, then q ($ARGS).  With WAIT_FILE
+# and WAIT_BYTES, q waits (up to 40 s more) for the file to grow that big:
+# under load QEMU codes fewer pictures a second than silicon would.
+# push_in errors are counted apart: a sample that feeds a real-time rate
+# with a timeout of 0 drops input frames when the emulation falls behind.
+run() {
     n=$1
     shift
-    ( sleep 6; for k in "$@"; do echo "$k"; sleep 4; done; echo q ) |
-        timeout 60 ./$n $ARGS > /tmp/$n.out 2>&1
+    ( sleep 6
+      i=0
+      while [ -n "$WAIT_FILE" ] && [ $i -lt 40 ] &&
+            [ "$(size $WAIT_FILE)" -lt "$WAIT_BYTES" ]; do
+          sleep 1
+          i=$((i + 1))
+      done
+      for k in "$@"; do echo "$k"; sleep 4; done; echo q ) |
+        timeout 100 ./$n $ARGS > /tmp/$n.out 2>&1
     RC=$?
-    ERRS=$(grep -c -i 'err\|fail' /tmp/$n.out)
+    ERRS=$(grep -i 'err\|fail' /tmp/$n.out | grep -vc 'push_in error')
+    DROPS=$(grep -c 'push_in error' /tmp/$n.out)
     echo "NVT-HDAL-RUN: $n${ARGS:+ $ARGS} rc=$RC errors=$ERRS"
-    grep -i 'err\|fail' /tmp/$n.out | head -3 | sed 's/^/NVT-HDAL-ERR: /'
+    [ "$DROPS" -gt 0 ] && echo "NVT-HDAL-DROPS: $n${ARGS:+ $ARGS} $DROPS"
+    grep -i 'err\|fail' /tmp/$n.out | grep -v 'push_in error' | head -3 |
+        sed 's/^/NVT-HDAL-ERR: /'
 }
 size() {
     [ -f "$1" ] && wc -c < "$1" || echo 0
 }
+WAIT_FILE=/mnt/sd/dump_bs_main.dat WAIT_BYTES=16000
 run hd_video_record
+WAIT_FILE=
 echo "NVT-HDAL-RECORD-BYTES: $(size /mnt/sd/dump_bs_main.dat)"
 echo "NVT-HDAL-REC-B64-BEGIN"
 head -c 6000000 /mnt/sd/dump_bs_main.dat | base64
@@ -417,8 +442,37 @@ if [ -e /dev/nvt_ai_module0 ] && [ -x ./ai_op ]; then
             tr -d '\r' < /tmp/md.out | grep 'frmidx\|WRN\|ERR\|fail' |
                 sed 's/^/NVT-MD: /'
         fi
+        # the IVE: the LUT samples check themselves; IRV writes its result
+        if grep -q '^kdrv_ive ' /proc/modules && [ -x ./alg_ive_lut_sample ]; then
+            timeout 600 ./alg_ive_lut_sample > /tmp/ive.out 2>&1
+            echo "NVT-HDAL-RUN: alg_ive_lut_sample rc=$?"
+            echo "NVT-IVE-LUT: ok=$(grep -c 'data check ok' /tmp/ive.out)" \
+                 "err=$(grep -c 'data check error' /tmp/ive.out)" \
+                 "last=$(grep 'data check ok' /tmp/ive.out | tail -1 | sed 's/.*test_width=//')"
+            # (a refused trigger -- the driver's race between channels,
+            # see docs/novatek.md -- leaves the sample checking an empty
+            # buffer: then, and only then, it runs again, up to 3 tries)
+            for try in 1 2 3; do
+                dmesg -c > /dev/null
+                ( sleep 20; echo q ) | timeout 120 ./alg_ive_lut_sample_nonblocking \
+                    > /tmp/ive.out 2>&1
+                rc=$?
+                grep -q 'data check error' /tmp/ive.out &&
+                    dmesg | grep -q 'illegal in RUN state' || break
+                echo "NVT-IVE-RACE: try $try refused a trigger"
+            done
+            echo "NVT-HDAL-RUN: alg_ive_lut_sample_nonblocking rc=$rc"
+            echo "NVT-IVE-NB: t1=$(grep -c 'data check ok.*thread(1)' /tmp/ive.out)" \
+                 "t2=$(grep -c 'data check ok.*thread(2)' /tmp/ive.out)" \
+                 "err=$(grep -c 'data check error' /tmp/ive.out)"
+            timeout 120 ./alg_ive_irv_sample > /tmp/ive.out 2>&1
+            echo "NVT-HDAL-RUN: alg_ive_irv_sample rc=$?"
+            f=/mnt/sd/IVEP/1_All/05_DO/ive11246.bin
+            echo "NVT-IVE-IRV: size=$(size $f)" \
+                 "kinds=$(od -An -v -tu1 $f | tr -s ' ' '\n' | sort -u | grep -c .)"
+        fi
         rm -rf /mnt/sd/CNNLib /mnt/sd/jpg /mnt/sd/FDCNN /mnt/sd/det_results \
-            /mnt/sd/save_bmp /mnt/sd/MDBCP
+            /mnt/sd/save_bmp /mnt/sd/MDBCP /mnt/sd/IVEP
     fi
 fi
 rm -f /mnt/sd/*
@@ -518,6 +572,10 @@ if [ -n "$DISPLAY_KOS" ]; then
     expect "NVT-HDAL-BOUND: f0c60000.ai kdrv_ai[[:space:]]*\$" "AI: the engines bound by kdrv_ai"
     expect "NVT-MD-INSMOD: kdrv_md rc=0" "MD: kdrv_md loads"
     expect "NVT-HDAL-BOUND: f0c10000.md kdrv_md[[:space:]]*\$" "MD: the MDBC bound by kdrv_md"
+    if [ -f "${SAMPLES:-/nonexistent}/ko/kdrv_ive.ko" ]; then
+        expect "NVT-IVE-INSMOD: kdrv_ive rc=0" "IVE: the rebuilt kdrv_ive loads"
+        expect "NVT-HDAL-BOUND: f0d70000.ive kdrv_ive[[:space:]]*\$" "IVE: the engine bound by kdrv_ive"
+    fi
 fi
 
 if [ -n "$SAMPLES" ]; then
@@ -601,34 +659,45 @@ PY
         ffmpeg -v error -xerror -f $2 -i "$WORK/enc$1.bin" \
             -f rawvideo -pix_fmt nv12 "$WORK/dec$1.yuv" \
             > "$WORK/dec$1.log" 2>&1 || true
-        # the sample feeds the file's 30 frames round and round: find
-        # where the stream starts in it, then every decoded picture must
-        # be the next frame (PSNR), and the pictures must move
+        # the sample feeds the file's 30 frames round and round: each
+        # decoded picture must be one of them (PSNR), each the next or a
+        # few after the last (the sample drops the frames it cannot push
+        # in when the emulation falls behind), and the pictures must move
         look=$(python3 - "$WORK/initramfs/encin/video_frm_352_288_30_yuv420.dat" \
             "$WORK/dec$1.yuv" <<'PY' 2>/dev/null || true
 import math, sys
 fs = 352 * 288 * 3 // 2
 src = open(sys.argv[1], 'rb').read()
 dec = open(sys.argv[2], 'rb').read()
-ins = [src[i:i + fs] for i in range(0, len(src), fs)]
-outs = [dec[i:i + fs] for i in range(0, len(dec) - fs + 1, fs)][:60]
+ins = [src[i:i + fs][::7] for i in range(0, len(src), fs)]
+outs = [dec[i:i + fs][::7] for i in range(0, len(dec) - fs + 1, fs)][:60]
 def psnr(a, b):
-    se = sum((x - y) ** 2 for x, y in zip(a[::7], b[::7]))
-    return 99.0 if not se else 10 * math.log10(255 ** 2 * len(a[::7]) / se)
+    se = sum((x - y) ** 2 for x, y in zip(a, b))
+    return 99.0 if not se else 10 * math.log10(255 ** 2 * len(a) / se)
 if not outs:
-    print('frames=0 psnr=0 moving=0')
+    print('frames=0 psnr=0 moving=0 order=0 skips=0')
     sys.exit()
-k = max(range(len(ins)), key=lambda i: psnr(outs[0], ins[i]))
-worst = min(psnr(o, ins[(k + i) % len(ins)]) for i, o in enumerate(outs))
+best = [max(((psnr(o, f), j) for j, f in enumerate(ins))) for o in outs]
+worst = min(p for p, _ in best)
+steps = [(b[1] - a[1]) % len(ins) for a, b in zip(best, best[1:])]
 moving = sum(a != b for a, b in zip(outs, outs[1:]))
-print('frames=%d psnr=%.1f moving=%d' % (len(dec) // fs, worst, moving))
+print('frames=%d psnr=%.1f moving=%d order=%d skips=%d'
+      % (len(dec) // fs, worst, moving, all(1 <= t <= 4 for t in steps),
+         sum(t > 1 for t in steps)))
 PY
 )
         frames=$(echo "$look" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')
         psnr=$(echo "$look" | sed -n 's/.*psnr=\([0-9]*\).*/\1/p')
         moving=$(echo "$look" | sed -n 's/.*moving=\([0-9]*\).*/\1/p')
+        order=$(echo "$look" | sed -n 's/.*order=\([0-9]*\).*/\1/p')
+        drops=$(grep -a "^NVT-HDAL-DROPS: hd_video_encode_only $1 " \
+                "$WORK/console.log" | tr -d '\r' | awk '{print $NF}' || true)
+        look="$look drops=${drops:-0}"
+        # dropped input is the emulation's speed, but at most a quarter
         if [ -s "$WORK/dec$1.log" ] || [ "${frames:-0}" -lt 5 ] ||
-                [ "${psnr:-0}" -lt 30 ] || [ "${moving:-0}" -lt 4 ]; then
+                [ "${psnr:-0}" -lt 30 ] || [ "${moving:-0}" -lt 4 ] ||
+                [ "${order:-0}" != 1 ] ||
+                [ $(( ${drops:-0} * 4 )) -gt "${frames:-0}" ]; then
             bad "$3 from hd_video_encode_only decodes to the input, in order ($look; $(head -c 200 "$WORK/dec$1.log"))"
         else
             pass "$3 from hd_video_encode_only decodes to the input, in order ($look)"
@@ -919,6 +988,26 @@ print("pd=%d/3 pvd=%d/2 cars=%d/3 eyes=%d bface=%d pets=%d/2 nopet=%d %s"
                                 printf "frames=%d err=%d wrong:%s", n, err, (bad ? bad : " none") }')
                 case "$md" in "frames=11 err=0 wrong: none") pass "alg_md_sample: alarms in the moving block's frames only ($md)";;
                     *) bad "alg_md_sample: alarms in the moving block's frames only (${md:-no result})";; esac
+            fi
+            # the IVE: every width of the LUT sample checks out (4..639),
+            # both non-blocking threads check jobs, IRV writes its 6400 bytes
+            if [ -f "$SAMPLES/ko/kdrv_ive.ko" ] &&
+               [ -f "$SAMPLES/smp/alg_ive_lut_sample" ]; then
+                for smp in alg_ive_lut_sample alg_ive_lut_sample_nonblocking \
+                           alg_ive_irv_sample; do
+                    expect "NVT-HDAL-RUN: $smp rc=0" "$smp runs to its end"
+                done
+                expect "NVT-IVE-LUT: ok=636 err=0 last=639" "alg_ive_lut_sample: all 636 widths check out"
+                nb=$(grep -a '^NVT-IVE-NB: ' "$WORK/console.log" | tr -d '\r' | head -1)
+                case "$nb" in *"t1=0 "*|*"t2=0 "*|"") bad "alg_ive_lut_sample_nonblocking: both threads check out (${nb:-no result})";;
+                    *err=0) pass "alg_ive_lut_sample_nonblocking: both threads check out (${nb#NVT-IVE-NB: })";;
+                    *) bad "alg_ive_lut_sample_nonblocking: both threads check out ($nb)";; esac
+                # (the plumbing: nothing describes IRV or the edge
+                # arithmetic, so the bits themselves are not checked)
+                irv=$(grep -a '^NVT-IVE-IRV: ' "$WORK/console.log" | tr -d '\r' | head -1)
+                case "$irv" in *"size=6400 kinds=1") bad "alg_ive_irv_sample: a 6400-byte result, not uniform ($irv)";;
+                    *"size=6400 kinds="[0-9]*) pass "alg_ive_irv_sample: a 6400-byte result, not uniform (${irv#NVT-IVE-IRV: })";;
+                    *) bad "alg_ive_irv_sample: a 6400-byte result, not uniform (${irv:-no result})";; esac
             fi
         fi
     fi

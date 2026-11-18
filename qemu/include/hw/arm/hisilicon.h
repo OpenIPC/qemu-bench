@@ -182,6 +182,7 @@ typedef struct HisiSoCConfig {
     /* hisi-fmc register-map variant: 0 = HiFMC V100 (default), 1 = fmc100
      * ("lotus,fmc" on Goke xmorca / GK7206 — same IP, shuffled offsets). */
     uint32_t        fmc_variant;
+    uint8_t         fmc_flash_cs;   /* hisi-sfc350: chip select with the NOR (default 0) */
     /* FMC op/DMA-done IRQ (GIC SPI).  0 = unconnected (V100 users poll);
      * the fmc100 driver waits on an interrupt for DMA completion. */
     int             fmc_irq;
@@ -234,6 +235,10 @@ typedef struct HisiSoCConfig {
     int             num_sdhci;
     hwaddr          sdhci_bases[HISI_MAX_SDHCI];
     int             sdhci_irqs[HISI_MAX_SDHCI];
+    /* PRNSTS bit 19 the other way round from the SDHCI spec, set when the
+     * kernel's driver carries SDHCI_QUIRK_INVERTED_WRITE_PROTECT: without it
+     * a writable card reads back as write-protected and mounts read-only. */
+    bool            sdhci_wp_inverted;
 
     /* I2C (HiBVT for V2+, register-poll "hisi-i2c-v1" for CV100 family) */
     int             num_i2c;
@@ -248,6 +253,8 @@ typedef struct HisiSoCConfig {
     /* MIPI RX (CSI-2 / LVDS receiver) */
     hwaddr          mipi_rx_base;   /* 0 = no MIPI RX */
     int             mipi_rx_irq;
+    hwaddr          aiao_base;      /* 0 = AIAO stays a regbank, if listed */
+    int             aiao_irq;
 
     /* RTC (SPI-bridge internal RTC) */
     hwaddr          rtc_base;       /* 0 = no RTC */
@@ -258,6 +265,23 @@ typedef struct HisiSoCConfig {
     hwaddr          jpge_base;
     int             vedu_irq;
     int             jpge_irq;
+    /* media register layouts (hisi-vedu / -vi / -vpss "gen"): 0 = 4,
+     * the Hi3516EV200 family; 5 = Hi3516CV610 */
+    uint8_t         media_gen;
+    /* CRG reset handshakes: request registers whose bit 0 the next one
+     * echoes (hisi-crg "rst-ack"); 0 ends the list */
+    uint32_t        crg_rst_ack[4];
+    /* V5 IVE: tasks on the SVP NPU's scheduler (hisi-ive-npu); its first
+     * 64 KiB, over the "hisi-npu" bank.  IRQs: the svp_npu driver's group
+     * and IVE's */
+    hwaddr          ive_npu_base;
+    int             ive_npu_irq[2];
+    hwaddr          vpss_base;         /* 0 = none; online-mode frame source */
+    int             vpss_irq;
+    hwaddr          vi_cap_base;       /* 0 = none; VI as the frame clock */
+    hwaddr          vi_proc_base;
+    int             vi_cap_irq;
+    int             vi_proc_irq;
 
     /* Watchdog (SP805 / cmsdk-apb-watchdog) */
     hwaddr          wdt_base;       /* 0 = no watchdog */
@@ -290,6 +314,11 @@ typedef struct HisiSoCConfig {
     int             xhci_irq;
     int             xhci_slots;     /* 0 = default 4 */
     int             xhci_intrs;     /* 0 = default 1 */
+    /* The xHCI sits in a DWC3 core the kernel probes with "snps,dwc3"
+     * (dwc3/core.c), not as a bare generic-xhci: it reads the core's ID
+     * and hardware parameters past the xHCI window and soft-resets it
+     * first.  The "hisi-usb3" regbank over the window then answers them. */
+    bool            xhci_dwc3_core;
 
     /* HiSilicon HIL2V200 L2 cache controller — used by Hi3520D family
      * (CONFIG_CACHE_HIL2V200).  Vendor 3.0.x driver hangs in early init
@@ -337,11 +366,6 @@ typedef struct HisiSoCConfig {
     /* VI frame producer — periodic VI/VPSS IRQ pulses to wake the
      * vendor MPP pipeline so VENC stops timing out.  MVP scaffolding,
      * wired only on hi3516ev300 for now. */
-    hwaddr          vi_fp_base;        /* 0 = no frame producer */
-    int             vi_fp_cap_irq;     /* GIC SPI for VI_CAP0 */
-    int             vi_fp_proc_irq;    /* GIC SPI for VI_PROC0 */
-    int             vi_fp_vpss_irq;    /* GIC SPI for VPSS */
-    int             vi_fp_vedu_irq;    /* GIC SPI for VEDU */
 
     /* CPU soft-reset register offset in CRG (for SMP bringup) */
     uint32_t        cpu_srst_offset; /* 0 = disabled, e.g. 0x78 for CV500 */

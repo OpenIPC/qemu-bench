@@ -1,0 +1,323 @@
+From: OpenIPC
+Subject: [PATCH] serial: paced receive, a deeper receive FIFO, IER's RX
+ timeout bit, DMA requests
+
+For UARTs of the jz47xx kind; all off / unchanged by default.  With
+"paced" (patch 0021) bytes now also come in at the line rate, one a
+character time.  "rx-fifo": the receive FIFO depth (16 by default); with
+64 the FCR trigger levels are 1, 16, 32 and 60.  "rtoie": IER bit 4
+enables the receive timeout interrupt by itself, without RDI.
+"dma-requests": the "drq-tx" and "drq-rx" GPIO outputs request DMA while
+the FIFOs and FCR's DMA mode (DMS, bit 3) are on -- TX while the
+transmit FIFO has room, RX once the receive FIFO reaches its trigger
+level, held until that many bytes are read (one request, one burst), so
+that a tail shorter than a burst stays in the FIFO for the timeout
+interrupt.  A DMA controller serving a request accesses RBR / THR from
+within the register access that raised it, so serial-mm drops its
+re-entrancy guard when DMA requests are on.
+---
+--- a/include/hw/char/serial.h
++++ b/include/hw/char/serial.h
+@@ -75,6 +75,12 @@
+     bool paced;                     /* transmit at the line rate */
+     uint32_t tx_fifo;               /* the transmit FIFO's depth */
+     QEMUTimer *xmit_timer;          /* paced: the shift register's byte */
++    uint32_t rx_fifo;               /* the receive FIFO's depth */
++    QEMUTimer *recv_timer;          /* paced: the next byte may come in */
++    bool rtoie;                     /* IER bit 4 enables the RX timeout */
++    bool dma_requests;              /* drq-tx / drq-rx while FCR DMS */
++    uint8_t rx_burst_left;          /* bytes of the RX burst still to read */
++    qemu_irq drq_tx, drq_rx;
+     int poll_msl;
+ 
+     QEMUTimer *modem_status_poll;
+--- a/hw/char/serial.c
++++ b/hw/char/serial.c
+@@ -115,13 +115,38 @@
+     }
+ }
+ 
++/*
++ * DMA requests (dma-requests), while FIFOs and FCR's DMA mode are on: TX
++ * while the transmit FIFO has room; RX once the receive FIFO reaches its
++ * trigger level, held until that many bytes are read -- one request, one
++ * burst of the trigger level -- so that a tail shorter than that stays
++ * for the timeout interrupt.
++ */
++static void serial_update_drq(SerialState *s)
++{
++    bool dms = (s->fcr & (UART_FCR_FE | UART_FCR_DMS)) ==
++               (UART_FCR_FE | UART_FCR_DMS);
++
++    if (!s->dma_requests) {
++        return;
++    }
++    if (!dms) {
++        s->rx_burst_left = 0;
++    } else if (!s->rx_burst_left && s->recv_fifo.num >= s->recv_fifo_itl) {
++        s->rx_burst_left = s->recv_fifo_itl;
++    }
++    qemu_set_irq(s->drq_rx, s->rx_burst_left > 0);
++    qemu_set_irq(s->drq_tx, dms && !fifo8_is_full(&s->xmit_fifo));
++}
++
+ static void serial_update_irq(SerialState *s)
+ {
+     uint8_t tmp_iir = UART_IIR_NO_INT;
+ 
+     if ((s->ier & UART_IER_RLSI) && (s->lsr & UART_LSR_INT_ANY)) {
+         tmp_iir = UART_IIR_RLSI;
+-    } else if ((s->ier & UART_IER_RDI) && s->timeout_ipending) {
++    } else if (((s->ier & UART_IER_RDI) || (s->rtoie && (s->ier & 0x10))) &&
++               s->timeout_ipending) {
+         /* Note that(s->ier & UART_IER_RDI) can mask this interrupt,
+          * this is not in the specification but is observed on existing
+          * hardware.  */
+@@ -143,6 +168,7 @@
+     } else {
+         qemu_irq_lower(s->irq);
+     }
++    serial_update_drq(s);
+ }
+ 
+ static void serial_update_parameters(SerialState *s)
+@@ -240,6 +266,7 @@
+ static void serial_xmit_paced(SerialState *s)
+ {
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint8_t ch;
+ 
+     if (timer_pending(s->xmit_timer)) {
+         return;                         /* the shift register is busy */
+@@ -258,16 +285,23 @@
+         s->tsr = s->thr;
+         s->lsr |= UART_LSR_THRE;
+     }
++    /*
++     * The shift register is busy from here on: what follows can re-enter
++     * through a DMA controller writing THR, which must find it so
++     */
++    ch = s->tsr;
++    timer_mod(s->xmit_timer, now + s->char_transmit_time);
++    if (s->mcr & UART_MCR_LOOP) {
++        serial_receive1(s, &ch, 1);
++    } else {
++        qemu_chr_fe_write_all(&s->chr, &ch, 1);
++    }
+     if ((s->lsr & UART_LSR_THRE) && !s->thr_ipending) {
+         s->thr_ipending = 1;
+         serial_update_irq(s);
+-    }
+-    if (s->mcr & UART_MCR_LOOP) {
+-        serial_receive1(s, &s->tsr, 1);
+     } else {
+-        qemu_chr_fe_write_all(&s->chr, &s->tsr, 1);
++        serial_update_drq(s);           /* room in the FIFO again */
+     }
+-    timer_mod(s->xmit_timer, now + s->char_transmit_time);
+ }
+ 
+ static void serial_xmit_timer(void *opaque)
+@@ -292,6 +326,7 @@
+                 if (!s->xmit_fifo.num) {
+                     s->lsr |= UART_LSR_THRE;
+                 }
++                serial_update_drq(s);
+             } else {
+                 s->tsr = s->thr;
+                 s->lsr |= UART_LSR_THRE;
+@@ -347,13 +382,13 @@
+             s->recv_fifo_itl = 1;
+             break;
+         case UART_FCR_ITL_2:
+-            s->recv_fifo_itl = 4;
++            s->recv_fifo_itl = s->rx_fifo >= 64 ? 16 : 4;
+             break;
+         case UART_FCR_ITL_3:
+-            s->recv_fifo_itl = 8;
++            s->recv_fifo_itl = s->rx_fifo >= 64 ? 32 : 8;
+             break;
+         case UART_FCR_ITL_4:
+-            s->recv_fifo_itl = 14;
++            s->recv_fifo_itl = s->rx_fifo >= 64 ? 60 : 14;
+             break;
+         }
+     } else {
+@@ -416,8 +451,9 @@
+             s->divider = deposit32(s->divider, 8 * addr, 8, val);
+             serial_update_parameters(s);
+         } else {
++            uint8_t ier_mask = s->rtoie ? 0x1f : 0x0f;
+             uint8_t changed = (s->ier ^ val) & 0x0f;
+-            s->ier = val & 0x0f;
++            s->ier = val & ier_mask;
+             /* If the backend device is a real serial port, turn polling of the modem
+              * status lines on physical port on or off depending on UART_IER_MSI state.
+              */
+@@ -534,6 +570,9 @@
+             if(s->fcr & UART_FCR_FE) {
+                 ret = fifo8_is_empty(&s->recv_fifo) ?
+                             0 : fifo8_pop(&s->recv_fifo);
++                if (s->rx_burst_left) {
++                    s->rx_burst_left--;
++                }
+                 if (s->recv_fifo.num == 0) {
+                     s->lsr &= ~(UART_LSR_DR | UART_LSR_BI);
+                 } else {
+@@ -608,7 +647,7 @@
+ static int serial_can_receive(SerialState *s)
+ {
+     if(s->fcr & UART_FCR_FE) {
+-        if (s->recv_fifo.num < UART_FIFO_LENGTH) {
++        if (s->recv_fifo.num < s->rx_fifo) {
+             /*
+              * Advertise (fifo.itl - fifo.count) bytes when count < ITL, and 1
+              * if above. If UART_FIFO_LENGTH - fifo.count is advertised the
+@@ -644,12 +683,27 @@
+     }
+ }
+ 
++/*
++ * Paced, bytes come in at the line rate too: one a character time, so
++ * that a burst of input takes the time it takes on the wire.
++ */
+ static int serial_can_receive1(void *opaque)
+ {
+     SerialState *s = opaque;
++
++    if (s->paced) {
++        return timer_pending(s->recv_timer) ? 0 : MIN(serial_can_receive(s), 1);
++    }
+     return serial_can_receive(s);
+ }
+ 
++static void serial_recv_timer(void *opaque)
++{
++    SerialState *s = opaque;
++
++    qemu_chr_fe_accept_input(&s->chr);
++}
++
+ static void serial_receive1(void *opaque, const uint8_t *buf, int size)
+ {
+     SerialState *s = opaque;
+@@ -671,6 +725,10 @@
+         s->rbr = buf[0];
+         s->lsr |= UART_LSR_DR;
+     }
++    if (s->paced && size) {
++        timer_mod(s->recv_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  s->char_transmit_time * size);
++    }
+     serial_update_irq(s);
+ }
+ 
+@@ -878,6 +936,42 @@
+     },
+ };
+ 
++static bool serial_recv_timer_needed(void *opaque)
++{
++    SerialState *s = opaque;
++
++    return s->paced && timer_pending(s->recv_timer);
++}
++
++static const VMStateDescription vmstate_serial_recv_timer = {
++    .name = "serial/recv_timer",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = serial_recv_timer_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER_PTR(recv_timer, SerialState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static bool serial_rx_burst_needed(void *opaque)
++{
++    SerialState *s = opaque;
++
++    return s->rx_burst_left != 0;
++}
++
++static const VMStateDescription vmstate_serial_rx_burst = {
++    .name = "serial/rx_burst",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = serial_rx_burst_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8(rx_burst_left, SerialState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static const VMStateDescription vmstate_serial_poll = {
+     .name = "serial/poll",
+     .version_id = 1,
+@@ -919,6 +1013,8 @@
+         &vmstate_serial_timeout_ipending,
+         &vmstate_serial_poll,
+         &vmstate_serial_xmit_timer,
++        &vmstate_serial_rx_burst,
++        &vmstate_serial_recv_timer,
+         NULL
+     }
+ };
+@@ -953,6 +1049,7 @@
+ 
+     fifo8_reset(&s->recv_fifo);
+     fifo8_reset(&s->xmit_fifo);
++    s->rx_burst_left = 0;
+ 
+     s->last_xmit_ts = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
+@@ -1000,16 +1097,23 @@
+ 
+     s->fifo_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) fifo_timeout_int, s);
+     s->xmit_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, serial_xmit_timer, s);
++    s->recv_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, serial_recv_timer, s);
+     qemu_register_reset(serial_reset, s);
+ 
+     qemu_chr_fe_set_handlers(&s->chr, serial_can_receive1, serial_receive1,
+                              serial_event, serial_be_change, s, NULL, true);
+-    fifo8_create(&s->recv_fifo, UART_FIFO_LENGTH);
++    if (s->rx_fifo < UART_FIFO_LENGTH || s->rx_fifo > 255) {
++        error_setg(errp, "serial: rx-fifo outside %d..255", UART_FIFO_LENGTH);
++        return;
++    }
++    fifo8_create(&s->recv_fifo, s->rx_fifo);
+     if (s->tx_fifo < UART_FIFO_LENGTH) {
+         error_setg(errp, "serial: tx-fifo below %d", UART_FIFO_LENGTH);
+         return;
+     }
+     fifo8_create(&s->xmit_fifo, s->tx_fifo);
++    qdev_init_gpio_out_named(dev, &s->drq_tx, "drq-tx", 1);
++    qdev_init_gpio_out_named(dev, &s->drq_rx, "drq-rx", 1);
+     serial_reset(s);
+ }
+ 
+@@ -1049,6 +1153,9 @@
+     DEFINE_PROP_BOOL("wakeup", SerialState, wakeup, false),
+     DEFINE_PROP_BOOL("paced", SerialState, paced, false),
+     DEFINE_PROP_UINT32("tx-fifo", SerialState, tx_fifo, UART_FIFO_LENGTH),
++    DEFINE_PROP_UINT32("rx-fifo", SerialState, rx_fifo, UART_FIFO_LENGTH),
++    DEFINE_PROP_BOOL("rtoie", SerialState, rtoie, false),
++    DEFINE_PROP_BOOL("dma-requests", SerialState, dma_requests, false),
+ };
+ 
+ static void serial_class_init(ObjectClass *klass, const void *data)
+--- a/hw/char/serial-mm.c
++++ b/hw/char/serial-mm.c
+@@ -80,6 +80,11 @@
+     memory_region_init_io(&s->io, OBJECT(dev),
+                           &serial_mm_ops[smm->endianness], smm, "serial",
+                           8 << smm->regshift);
++    /*
++     * With DMA requests the DMA controller reads RBR and writes THR from
++     * within a register access that raised the request
++     */
++    s->io.disable_reentrancy_guard = s->dma_requests;
+     sysbus_init_mmio(SYS_BUS_DEVICE(smm), &s->io);
+     sysbus_init_irq(SYS_BUS_DEVICE(smm), &smm->serial.irq);
+ }

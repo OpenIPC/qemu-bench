@@ -385,12 +385,10 @@ static const GraphicHwOps nvt_ide_gfx_ops = {
 
 /* ---- registers ---- */
 
-static uint64_t nvt_ide_read(void *opaque, hwaddr off, unsigned size)
+static uint32_t nvt_ide_read_word(NvtIdeState *s, hwaddr off)
 {
-    NvtIdeState *s = opaque;
     uint32_t v;
 
-    off &= ~3;
     switch (off) {
     case IDE_CTRL:
         v = *reg(s, off) & ~CTRL_DMA_IDLE;
@@ -414,13 +412,40 @@ static uint64_t nvt_ide_read(void *opaque, hwaddr off, unsigned size)
     return *reg(s, off);
 }
 
+/*
+ * Byte and halfword accesses are served from the word.  Silicon's
+ * register file takes them, and the mask ROM relies on it: it keeps its
+ * loader-header staging, DMA flag and USB descriptor bounce buffer in the
+ * palette RAM (0x200..0x5FF) and reads the 0xAA55 tag with ldrh.
+ */
+static uint64_t nvt_ide_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t v = nvt_ide_read_word(opaque, off & ~3);
+
+    if (size == 4) {
+        return v;
+    }
+    return extract32(v, (off & 3) * 8, size * 8);
+}
+
+static void nvt_ide_write_word(NvtIdeState *s, hwaddr off, uint32_t val);
+
 static void nvt_ide_write(void *opaque, hwaddr off, uint64_t value,
                           unsigned size)
 {
     NvtIdeState *s = opaque;
-    uint32_t val = value, old;
+    uint32_t val = value;
 
-    off &= ~3;
+    if (size < 4) {
+        val = deposit32(*reg(s, off & ~3), (off & 3) * 8, size * 8, value);
+    }
+    nvt_ide_write_word(s, off & ~3, val);
+}
+
+static void nvt_ide_write_word(NvtIdeState *s, hwaddr off, uint32_t val)
+{
+    uint32_t old;
+
     if (s->trace) {
         qemu_log_mask(LOG_UNIMP, "nvt-ide: 0x%03x <- 0x%08x\n",
                       (unsigned)off, val);
@@ -457,7 +482,11 @@ static const MemoryRegionOps nvt_ide_ops = {
     .write = nvt_ide_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
-        .min_access_size = 4,
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
         .max_access_size = 4,
     },
 };

@@ -1,0 +1,33 @@
+allwinner-sdhost: the IDMAC soft reset clears itself
+
+DMAC (0x80) bit 0 resets the internal DMA controller and reads back as
+0 once that is done.  The model stored it, so a driver that sets it and
+polls for it to clear -- the Allwinner vendor U-Boot 2018.05 MMC driver
+(sun8iw19 V831) does before every IDMA transfer -- waited forever.
+
+---
+diff --git a/hw/sd/allwinner-sdhost.c b/hw/sd/allwinner-sdhost.c
+index 9d61b37..6b3b44f 100644
+--- a/hw/sd/allwinner-sdhost.c
++++ b/hw/sd/allwinner-sdhost.c
+@@ -93,6 +93,10 @@ enum {
+     SD_GCTL_SOFT_RST        = (1 << 0),
+ };
+ 
++enum {
++    SD_DMAC_SOFT_RST        = (1 << 0),
++};
++
+ enum {
+     SD_CMDR_LOAD            = (1 << 31),
+     SD_CMDR_CLKCHANGE       = (1 << 21),
+@@ -699,7 +703,8 @@ static void allwinner_sdhost_write(void *opaque, hwaddr offset,
+         s->hardware_rst = value;
+         break;
+     case REG_SD_DMAC:      /* Internal DMA Controller Control */
+-        s->dmac = value;
++        /* Soft reset (bit 0) is done at once and clears itself. */
++        s->dmac = value & ~SD_DMAC_SOFT_RST;
+         allwinner_sdhost_update_irq(s);
+         break;
+     case REG_SD_DLBA:      /* Descriptor List Base Address */

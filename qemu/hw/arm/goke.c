@@ -24,6 +24,7 @@
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/or-irq.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
@@ -284,16 +285,6 @@ static void gk_machine_set_sensor(Object *obj, const char *value,
 
 /* Sensors a GK7102 board may carry that have a model: I2C type, 7-bit
  * address on IDC 0. */
-static const struct {
-    const char *name;
-    const char *type;
-    uint8_t addr;
-} gk_sensors[] = {
-    { "jxh42", "hisi-jxh42", 0x30 },
-    { "jxh62", "hisi-jxh62", 0x30 },
-    { "f37",   "hisi-f37",   0x40 },
-};
-
 /*
  * The mask ROM's boot header, in CPU words (the flash holds each word
  * byte-swapped, see gk-sflash.c):
@@ -745,21 +736,9 @@ static void goke_common_init(MachineState *machine, const GkSoCConfig *c)
         gk_map_model(c, dev, c->idc_bases[n], "idc", 0x1000);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            gk_irq(vic, c, c->idc_irqs[n]));
-        if (n == 0 && gms->sensor && strcmp(gms->sensor, "none")) {
-            int i;
-
-            for (i = 0; i < ARRAY_SIZE(gk_sensors); i++) {
-                if (!strcmp(gms->sensor, gk_sensors[i].name)) {
-                    break;
-                }
-            }
-            if (i == ARRAY_SIZE(gk_sensors)) {
-                error_report("goke: unknown sensor '%s' (none, jxh42, "
-                             "jxh62, f37)", gms->sensor);
-                exit(1);
-            }
-            i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
-                                    gk_sensors[i].type, gk_sensors[i].addr);
+        if (n == 0) {
+            image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
+                                gms->sensor);
         }
     }
 

@@ -1,0 +1,70 @@
+sdhci: an SDIO card's interrupt is the card interrupt status
+
+Patch 0026 lets an SDIO card raise its interrupt through
+sdbus_set_sdio_irq(); have the SDHCI host reflect it as the Normal
+Interrupt Status "Card Interrupt" bit (0x100), level-sensitive while the
+card holds it and the bit is enabled in the status-enable register, the
+way the controller already refuses a write-1-clear of it.  Linux's
+sdhci core toggles the bit's status and signal enables around its SDIO
+interrupt thread.
+
+Signed-off-by: OpenIPC <dev@openipc.org>
+
+diff --git a/hw/sd/sdhci.c b/hw/sd/sdhci.c
+index 89b595c..7a5989c 100644
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -270,6 +270,25 @@ static void sdhci_set_inserted(DeviceState *dev, bool level)
+     }
+ }
+ 
++/* an SDIO card's interrupt: the level-sensitive card interrupt status */
++static void sdhci_card_int(SDHCIState *s)
++{
++    if (s->sdio_irq && (s->norintstsen & SDHC_NISEN_CARDINT)) {
++        s->norintsts |= SDHC_NIS_CARDINT;
++    } else {
++        s->norintsts &= ~SDHC_NIS_CARDINT;
++    }
++}
++
++static void sdhci_set_sdio_irq(DeviceState *dev, bool level)
++{
++    SDHCIState *s = (SDHCIState *)dev;
++
++    s->sdio_irq = level;
++    sdhci_card_int(s);
++    sdhci_update_irq(s);
++}
++
+ static void sdhci_set_readonly(DeviceState *dev, bool level)
+ {
+     SDHCIState *s = (SDHCIState *)dev;
+@@ -1315,6 +1334,7 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
+             s->norintsts |= SDHC_NIS_INSERT;
+             s->pending_insert_state = false;
+         }
++        sdhci_card_int(s);
+         sdhci_update_irq(s);
+         break;
+     case SDHC_NORINTSIGEN:
+@@ -1635,6 +1655,7 @@ static void sdhci_bus_class_init(ObjectClass *klass, const void *data)
+ 
+     sbc->set_inserted = sdhci_set_inserted;
+     sbc->set_readonly = sdhci_set_readonly;
++    sbc->set_sdio_irq = sdhci_set_sdio_irq;
+ }
+ 
+ /* --- qdev i.MX eSDHC --- */
+diff --git a/include/hw/sd/sdhci.h b/include/hw/sd/sdhci.h
+index 51fb30e..6565b47 100644
+--- a/include/hw/sd/sdhci.h
++++ b/include/hw/sd/sdhci.h
+@@ -87,6 +87,7 @@ struct SDHCIState {
+     uint16_t data_count;   /* current element in FIFO buffer */
+     uint8_t  stopped_state;/* Current SDHC state */
+     bool     pending_insert_state;
++    bool     sdio_irq;           /* an SDIO card holds its interrupt */
+     /* Buffer Data Port Register - virtual access point to R and W buffers */
+     /* Software Reset Register - always reads as 0 */
+     /* Force Event Auto CMD12 Error Interrupt Reg - write only */

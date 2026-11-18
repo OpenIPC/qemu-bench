@@ -35,10 +35,15 @@ def uboot_default_env(img):
         size = struct.unpack(">I", img[pos + 12:pos + 16])[0]
         comp = img[pos + 31]
         data = img[pos + 64:pos + 64 + size]
+        # MStar images tag the payload: "MVX1##...XVM", 32 bytes
+        if data[:3] == b"MVX" and data[29:32] == b"XVM":
+            data = data[32:]
         try:
             if comp == 1:
                 data = gzip.decompress(data)
             elif comp in (3, 5):                # LZMA, LZO-less XZ
+                data = lzma.LZMADecompressor().decompress(data)
+            elif data[:6] == b"\xfd7zXZ\x00":     # XZ under any type
                 data = lzma.LZMADecompressor().decompress(data)
         except (OSError, lzma.LZMAError):
             pos += 4
@@ -52,10 +57,15 @@ def uboot_default_env(img):
 def find_env(data):
     """default_environment[]: name=value strings up to an empty one.  It
     need not follow a NUL; env_default.h puts bootargs first when the board
-    has any, so start there, else at the text run holding bootcmd."""
+    has any, so start there, else at the text run holding bootcmd (or,
+    on a board with no default bootcmd such as the MStar I3 SDK's, at
+    bootdelay, which env_default.h puts first then)."""
     i = data.find(b"\0bootcmd=")
     if i < 0:
-        return None
+        start = data.find(b"bootdelay=")
+        if start < 0:
+            return None
+        return parse_env(data, start)
     start = i
     while start > 0 and (32 <= data[start - 1] < 127 or
                          (data[start - 1] == 0 and data[start - 2] != 0)):
@@ -65,7 +75,11 @@ def find_env(data):
         start = j
     else:
         start = data.find(b"\0", start) + 1 if data[start] else start + 1
-    end = data.find(b"\0\0", i)
+    return parse_env(data, start, i)
+
+
+def parse_env(data, start, i=None):
+    end = data.find(b"\0\0", start if i is None else i)
     env = {}
     for kv in data[start:end].split(b"\0"):
         if b"=" not in kv:

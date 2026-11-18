@@ -1,0 +1,79 @@
+sd: answer CMD11 (voltage switch) with an error, S18A only on S18R
+
+The card model left CMD11 unanswered (sd_cmd_optional).  With 1.8 V
+offered in its OCR (the S18A bit setup.sh enables for the EV300 kernels),
+a UHS host sends CMD11 after ACMD41; the Allwinner vendor Linux 4.9
+sunxi-mmc driver (sun8iw19 V831) retried the unanswered command for good
+with any SDHC card.  The card cannot switch, so it now answers R1 with
+the general error bit, on which Linux (mmc_set_uhs_voltage) skips the
+switch.  Linux then repeats ACMD41 without S18R, and the card kept
+answering S18A, which started the switch again; S18A is now reported only
+to an ACMD41 that asks for 1.8 V, as the SD specification has it, and the
+card initialises at 3.3 V.
+
+---
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -144,6 +144,7 @@
+ 
+     /* SD Memory Card Registers */
+     uint32_t ocr;
++    bool s18r;      /* the last ACMD41 asked for 1.8 V signalling */
+     uint8_t scr[8];
+     uint8_t cid[16];
+     uint8_t csd[16];
+@@ -828,7 +829,8 @@
+         sd_response_r1_make(sd, response);
+         response++;
+     }
+-    stl_be_p(response, sd->ocr & ACMD41_R3_MASK);
++    stl_be_p(response, sd->ocr & ACMD41_R3_MASK &
++                       (sd->s18r ? ~0u : ~R_OCR_ACCEPT_SWITCH_1V8_MASK));
+ }
+ 
+ static void sd_response_r6_make(SDState *sd, uint8_t *response)
+@@ -1825,6 +1827,25 @@
+     return sd_r7;
+ }
+ 
++/* CMD11 */
++static sd_rsp_type_t sd_cmd_VOLTAGE_SWITCH(SDState *sd, SDRequest req)
++{
++    /*
++     * The card offers 1.8 V signalling in its OCR (S18A, which setup.sh
++     * enables), so a UHS host asks for it with CMD11 after ACMD41, but
++     * there is nothing to switch.  Answer with the general error bit:
++     * Linux then skips the switch at once and goes on at 3.3 V.  Without
++     * a response a host can retry for good (the Allwinner vendor
++     * sunxi-mmc driver did); an error-free one makes Linux retry its
++     * whole initialisation ten times before giving up.
++     */
++    if (sd->state != sd_ready_state) {
++        return sd_invalid_state_for_cmd(sd, req);
++    }
++    sd->card_status |= R_CSR_ERROR_MASK;
++    return sd_r1;
++}
++
+ /* CMD8 */
+ static sd_rsp_type_t emmc_cmd_SEND_EXT_CSD(SDState *sd, SDRequest req)
+ {
+@@ -2298,6 +2319,8 @@
+         sd->state = sd_ready_state;
+         return sd_r1;
+     } else {
++        /* S18A answers S18R: a host that did not ask is not offered 1.8 V */
++        sd->s18r = req.arg & R_OCR_ACCEPT_SWITCH_1V8_MASK;
+         if (FIELD_EX32(sd->ocr & req.arg, OCR, VDD_VOLTAGE_WINDOW)) {
+             /*
+              * We accept any voltage.  10000 V is nothing.
+@@ -2924,7 +2947,7 @@
+         [8]  = {0,  sd_bcr,  "SEND_IF_COND", sd_cmd_SEND_IF_COND},
+         [9]  = {0,  sd_ac,   "SEND_CSD", sd_cmd_SEND_CSD},
+         [10] = {0,  sd_ac,   "SEND_CID", sd_cmd_SEND_CID},
+-        [11] = {0,  sd_ac,   "VOLTAGE_SWITCH", sd_cmd_optional},
++        [11] = {0,  sd_ac,   "VOLTAGE_SWITCH", sd_cmd_VOLTAGE_SWITCH},
+         [12] = {0,  sd_ac,   "STOP_TRANSMISSION", sd_cmd_STOP_TRANSMISSION},
+         [13] = {0,  sd_ac,   "SEND_STATUS", sd_cmd_SEND_STATUS},
+         [15] = {0,  sd_ac,   "GO_INACTIVE_STATE", sd_cmd_GO_INACTIVE_STATE},

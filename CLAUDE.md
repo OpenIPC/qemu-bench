@@ -18,7 +18,8 @@ scripts, and docs.
 **copies** every `qemu/hw/**` and `qemu/include/**` file into it, appends the
 HiSilicon entries to upstream `Kconfig`/`meson.build` files, patches
 `hw/sd/sd.c` for 1.8 V signalling, applies `qemu/patches/*.patch`, then
-configures `--target-list=arm-softmmu,aarch64-softmmu` and runs ninja.
+configures `--target-list=arm-softmmu,aarch64-softmmu,mipsel-softmmu` and runs
+ninja (mipsel for the Ingenic family).
 
 ```bash
 bash qemu/setup.sh          # bootstrap AND incremental rebuild — re-run after every edit
@@ -39,8 +40,9 @@ for f in $(cd qemu && find hw include -name 'hisi*' -o -name 'hisilicon*'); do
 done
 ```
 
-Binaries land at `qemu-src/build/qemu-system-arm` and
-`qemu-src/build/qemu-system-aarch64`; every run/test script expects them there.
+Binaries land at `qemu-src/build/qemu-system-arm`,
+`qemu-src/build/qemu-system-aarch64` and `qemu-src/build/qemu-system-mipsel`;
+every run/test script expects them there.
 
 If the system has no `libfdt-dev`, meson falls back to QEMU's vendored
 `subprojects/dtc`, whose `fdt_overlay.c` fails `-Werror=discarded-qualifiers`
@@ -50,7 +52,7 @@ or reconfigure the build tree once without werror (`setup.sh` then keeps the
 existing config and just re-runs ninja):
 
 ```bash
-cd qemu-src/build && ../configure --target-list=arm-softmmu,aarch64-softmmu \
+cd qemu-src/build && ../configure --target-list=arm-softmmu,aarch64-softmmu,mipsel-softmmu \
     --disable-docs --disable-werror && ninja -j$(nproc)
 ```
 
@@ -70,17 +72,26 @@ message, not the status, is the pass signal. `aarch64 = true` configs need
 `qemu-system-aarch64`, and there the empty file is accepted and QEMU keeps
 running, so `timeout` kills it and reports its own **124**; that is also a
 pass. Either way what fails is a QOM property error, an assert, or a core
-dump — so assert on the output, not on the exit status.
+dump — so assert on the output, not on the exit status. The Ingenic
+machines (`qemu-system-mipsel -M t31` etc.) print `ingenic: /dev/null is
+neither an ELF nor a uImage` and exit 1 the same way.
 
 Device register tests (self-contained, need a built QEMU):
 
 ```bash
 bash qemu/tests/test-hisi-wdt.sh        # SP805 watchdog
 bash qemu/tests/test-hisi-rtc.sh
+bash qemu/tests/test-hisi-sdhci-wp.sh    # SDHCI WP polarity per kernel driver
 bash qemu/tests/test-hisi-mipi-rx.sh
 bash qemu/tests/test-hisi-v1-ddr-init.sh   # V1 DDR needs the U-Boot reg_info table
+python3 qemu/tests/test-hisi-vedu.py       # V4 VEDU (H.264/H.265) + JPGE, ffmpeg-checked
+python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wide sensors)
+python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
+python3 qemu/tests/test-hisi-sensor.py     # sensor timing: frame latching, group hold, fps, violations
+python3 qemu/tests/test-hisi-aiao.py       # V4 audio DMA: capture / playback rings, rates
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
-                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py
+                                           # test-gk710x*.py, test-anyka.py, test-sigmastar.py, test-ambarella.py,
+                                           # test-ingenic.py (qemu-system-mipsel)
 ```
 
 Full-boot tests need firmware, in one of two shapes.
@@ -90,7 +101,9 @@ the CI boot matrix use) — from the GitHub release. The release publishes
 it as `openipc.<soc>-nor-lite.tgz` (the two files) or, for SoCs moved since
 OpenIPC/firmware#2638, `openipc.<soc>-nor-lite-split.tgz` (one
 `firmware.bin.<soc>`: uImage, then SquashFS); `fetch-openipc-lite.sh` takes
-either and leaves `uImage.<soc>` + `rootfs.squashfs.<soc>`:
+either and leaves `uImage.<soc>` + `rootfs.squashfs.<soc>`. When both exist it
+takes the newer: a moved SoC's plain tgz can stay in the release, frozen at the
+move (hi3516ev200's at 2026-10-25):
 
 ```bash
 bash qemu-boot/fetch-openipc-lite.sh hi3516ev300 qemu-boot
@@ -131,7 +144,18 @@ bash qemu-boot/test-linux-network.sh --soc <soc> --machine <machine> --append '<
     --qemu ./qemu-src/build/qemu-system-arm --setup-network
 bash qemu-boot/sofia-isp-ci-test.sh      # hi3516ev200 + sc2315e ISP regression
 python3 qemu-boot/test-fastboot-protocol.py /tmp/hisi-fb   # boot-ROM serial protocol
+VARIANT=neo bash qemu-boot/fetch-openipc-lite.sh hi3516cv200 qemu-boot
+bash qemu-boot/test-vtund-tunnel.sh --soc hi3516cv200   # vtund between two guests
 ```
+
+`test-vtund-tunnel.sh` boots the image twice on a QEMU socket network and
+runs each guest's script as PID 1 from the kernel command line
+(`init=/bin/sh -- -c "..."`), so nothing types at a shell. Two traps it works
+around, worth knowing for any test built that way: the guest echoes its
+command line at boot, so a result marker must be assembled at run time
+(`echo vtund-result-$r`) or the grep matches the command line; and a
+backgrounded QEMU must get `</dev/null`, or SIGTTIN stops it on its first
+read of the terminal.
 
 `test-linux-network.sh` needs `--setup-network` when run by hand: without it
 the harness assumes the caller already built the whole environment its ping and
@@ -206,9 +230,124 @@ script must land after device reset, which a reset handler does not -- and
 the boot NOR is `ak-spinor`, not m25p80, because the vendor drivers send
 fast-read dummies as ordinary TX bytes.
 
-SigmaStar/MStar infinity2m (`hw/arm/sigmastar.c`, `docs/sigmastar.md`) is a
-fourth: Cortex-A7 parts whose blocks sit in 16-bit RIU register banks at
-`0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
+Allwinner V831/V833 (`hw/arm/allwinner-v83x.c`,
+`docs/allwinner-v83x.md`) boots a camera's whole NOR image through boot0,
+OP-TEE, U-Boot and Linux. Its own blocks are the `aw-*` files (CCU, DRAM
+controller, SPI, DMA, watchdog, TWI engine), built under ALLWINNER_V83X.
+Timers, SD, legacy TWI and the EMAC are upstream's Allwinner models;
+patches 0004 to 0009 fix what the vendor drivers rely on (self-clearing
+resets, NACK interrupts, no BUS_EN in master mode, absent MDIO PHYs
+reading 0xffff). The GIC needs more than 179 lines,
+or OP-TEE leaves every interrupt secure and Linux hangs after the timer.
+`qemu-boot/test-v831-boot.sh --flash dump.bin` checks each stage up to a
+shell. Video input: `aw-vinc` paints test frames into buffers behind
+`aw-iommu` (the media masters use IOMMU addresses); `aw-ve` answers the
+VE ID CedarC's compiled-in table and its LBC check accept (0xE0/0xE4 =
+0x21110/0x21210); the sensor is the catalogue's `gc2053` on TWI1
+(y291ga), or `sensor=sp2305` at 0x3C for the y211ga; `aw-pio` reads
+inputs high (stored zeros were the YI reset button held down).
+`qemu-boot/yi-v831-prepare.sh` makes a YI image that runs as if paired.
+`aw-ve` encodes H.264: CedarC puts the headers through the bitstream
+writer and the model appends a CABAC slice coding the input picture
+(I_16x16 DC coefficients / P_Skip + I_PCM), read from the video input's
+LBC buffer in a private stand-in format (`aw-qlbc.h`); `-global
+aw-ve.dump=DIR` saves the streams for checking with a decoder. `aw-g2d`
+runs the 2D engine's register queue (scale + convert, for the app's
+motion detection). `aw-audio` captures silence so the AAC encoder and recorder run.
+
+Fullhan (`hw/arm/fullhan.c`, `docs/fullhan.md`) is one memory map of
+DesignWare blocks across five generations (FH885xV200, FH865x, FH885x V100,
+FH8626V100, FH8632), its own devices the `hw/*/fh-*.c` files under
+FULLHAN. The mask ROM stand-in loads the boot header's type-0x10 image (or
+U-Boot past FH865x's DDR-sizing ramboot). The U-Boots key their
+environment on PMU 0x330 (2 = NOR), else "bad CRC, using default
+environment". The 4.9 kernel's irq handler runs find_first_bit() on the
+ICTL's FINALSTATUS, which loads bytes: any MMIO a driver reads with byte
+loads must extract the byte itself -- with `.impl.min_access_size = 4`
+QEMU hands the handler the unaligned offset. Flash reads go through the
+SPIC in 16-bit byte-swapped frames, by DMA from a data window whose
+address the DMA walks, so window reads return the frame unshifted; QEMU's
+m25p80 counts fast-read dummies in cycles, so `fh-spi` clocks the drivers'
+one dummy byte as 8. The flash select is a GPIO, not SER. The timers'
+rate comes from the PMU's divider as a Clock (U-Boot 1 MHz, V100 / FH865x
+kernels 50 MHz, FH8626V100 10 MHz -- PLL1 with no /10, unlike FH8632).
+Patches 0012 (CCSIDR of a missing cache) and 0013 (m25p80 clears WEL) are
+for its U-Boot and 3.0.8 kernels; 0014 (dwc2 GHWCFG properties + host
+descriptor DMA) for those kernels' `fh_otg`, which refuses the probe unless
+GHWCFG2-4 allow its parameters and always uses DescDMA -- interrupt
+channels must follow the FrameList or a hub's status endpoint storms.
+OpenIPC has no Fullhan bootloader: `qemu-boot/fh-openipc-flash.sh` puts a
+release on a dump's vendor U-Boot; CI boots it with `-kernel`
+(`test-fullhan-boot.sh`).
+
+Ingenic T10/T20/T21/T23/T30/T31/T40/T41 (`hw/mips/ingenic.c`,
+`docs/ingenic.md`) are the one MIPS family, in `qemu-system-mipsel`, one
+table entry per SoC, devices `hw/*/ingenic-*.c` under INGENIC (Kconfig in
+`hw/mips`). QEMU's XBurstR1/R2 do not run these kernels: patch 0015 adds
+`XBurst1` (FPU, 32 TLB entries, Config7.WII because the kernel idles in
+`wait` with IE=0, R2 ISA for the SPL's `mfc0 $12,2`) and `XBurst2`
+(PRid company 0x13, Config4.IE=2 or `tlbinvf` is a no-op). A NOR image
+boots through a mask ROM stand-in: SPL header check, SPL into the
+cache-as-RAM window (patch 0016: KSEG0 0x80000000+32K goes to 0x1F000000
+until the first KSEG0 fetch outside it -- the T41 SPL tests DDR through
+KSEG1 underneath itself), sp = 0x80008000 (the SPL never sets it). The
+kernels size RAM from `mem=` only, and early printk uses the first UART
+with LCR != 0, so `-kernel` boots from a ROM stub that sets UART1's LCR
+and passes U-Boot's argc/argv. The SPL/U-Boot timer is the OST inside
+the TCU (+0xE0), not the kernel's OST at 0x12000000; reboot is the TCU
+watchdog. SFC END means "all data in the FIFO", not "drained" (vendor
+U-Boots wait for it after reading part of a word), and SFC DMA addresses
+are taken modulo 512 MiB (T41 passes virt_to_phys of a KSEG1 pointer).
+PLL encodings differ per SoC (`ingenic-cpm.c`); reset values are U-Boot's
+because the kernels oops before the console on a mux of 3. XBurst2's
+second core starts powered off and the CCU starts it at RER.
+OpenIPC publishes U-Boot and kernel/rootfs but no full image;
+`qemu-boot/test-ingenic-boot.sh --mode flash` lays them out and boots
+them, `--mode kernel` uses `-kernel` with the root on the NOR.
+
+Grain Media GM8135S/GM8136/GM8136S (`hw/arm/grainmedia.c`,
+`docs/grainmedia.md`) put an FA626TE -- QEMU's arm926 with MIDR
+0x66056261, which the kernel's proc-fa626te matches -- among Faraday
+blocks, its own devices the `hw/*/gm-*.c` files under GRAINMEDIA (the
+Ethernet is QEMU's FTGMAC100, the SD hosts generic-sdhci, the USB host
+QEMU's FUSBH200 EHCI inside `gm-otg`). A NOR dump boots through the vendor
+nsboot (flash 0x1000, run in SRAM), whose frequency change waits in WFI
+for the PMU's interrupt 8, then U-Boot and the 3.3 kernel, machine 758 with
+ATAGs. The FTINTC030 masks through the CPU 0 target registers (0x45C), not
+ENABLE. FTSPI020 reads fill an RX FIFO and complete when the last byte is
+in it: U-Boot waits for completion before draining. The kernel moves flash
+data with the FTDMAC020 on request line 8, run from a bottom half because
+the request rises inside the SPI controller's own register write. U-Boot
+picks bootargs by the DDRC 0x10 size code; the kernel's fmem hangs without
+`mem=` (the machine appends it), and the adda308 audio driver panics unless
+PLL1 is a rate in its table (the PMU resets to nsboot's 860 MHz). The SDK
+uImages are XIP-style (load = header address), loaded 64 bytes up.
+The vendor video graph declares a job lost ("damnit", GS panic) unless
+every engine it waits on calls back, so capture (`gm-vcap`, link lists
+and a 60 Hz sync-timer interrupt that the driver links jobs from), 3DNR,
+scaler, LCD (its vertical interrupt is the graph's clock), GM2D and the
+MCP280 H.264 encoder (`gm-h264e`) are modelled. The encoder's driver packs
+SPS / PPS / slice headers through a FIFO and the model appends real slice
+data (I_16x16 DC from `hantro-h264.c`; P: changed macroblocks I_PCM, the
+rest P_Skip, against the reference kept NV12 in the driver's REC buffer),
+so a Longse dump streams decodable H.264 over RTSP
+(`qemu-boot/test-grainmedia-rtsp.sh`, admin / admin, /ch0). ffmpeg's
+`gray` output rescales limited-range luma: compare against `yuv420p`
+planes. The ISP328 (`gm-isp`) must keep frame start / end running even
+while disabled (the driver waits on both around stop and resize) and
+synthesises statistics that its output DMA table copies to the
+algorithms' buffers. MJPEG (`gm-mcp100`) goes through the embedded CPU's
+mailbox at SRAM 0x8000 (an MMIO overlay; command byte 8 starts, 0x80
+done); the host itself packs the JPEG headers through BADR / BALR, and the
+scan comes from `nvt_pixel_jpeg_scan_rst()`. Audio (`gm-ssp`) must never
+raise FIFO overrun / underrun -- the driver tears the stream down -- so the
+FIFOs keep samples behind the 16 they report; the Longse app captures
+only with sysenv.cfg byte 0x98C set. The FTAES020 is `fh-aes` with
+`advance=on` (addresses move on between chunks).
+
+SigmaStar/MStar infinity2m, Ifado, infinity3, Iford and infinity6* (`hw/arm/sigmastar.c`,
+`docs/sigmastar.md`) are a fourth: Cortex-A7 parts whose blocks sit in
+16-bit RIU register banks at `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
 at +1). `sstar-riu` is mapped under every model as storage plus the status
 bits the boot chain polls; `-d unimp` reports hot polls and
 `-global sstar-riu.trace=<banks>` logs a bank. The machine sets
@@ -216,12 +355,35 @@ bits the boot chain polls; `-d unimp` reports hot polls and
 starts inside one 1 KiB page and covers the next is registered with a
 misaligned offset, and its first access dies in `iotlb_to_section`. Any
 machine with 512-byte-aligned MMIO blocks larger than 1 KiB is exposed to
-the same assertion. Its video decoder (`hw/misc/sstar-vpu.c`) is a WAVE5
+the same assertion. The dies differ by `SsDie`: the infinity3 (`msc313e`)
+ROM takes its IPL from NOR `0x4000` (`ipl_offset`), and its scaler driver
+reads its gamma SRAMs back entry by entry, waiting 2 s on each mismatch
+(`sstar-vip-gamma`). A boot that goes quiet with the CPU idle is often
+such a slow poll, which the hot-poll detector does not see;
+`-trace 'memory_region_ops_*'` does. Its video decoder (`hw/misc/sstar-vpu.c`) is a WAVE5
 modelled at the firmware's mailbox, decoding with libavcodec when pkg-config
 finds it at build time (CI builds without it); queued commands complete
 from a timer, because the vendor driver arms its wait for the interrupt
 after issuing the command and loses a completion raised inside the
 doorbell write.
+
+Ambarella S3L (`hw/arm/ambarella.c`, `docs/ambarella.md`) is one Cortex-A9
+machine, `s3l`, whose blocks are the `amb-*` files under AMBARELLA. It stops
+short of video: it exists so ipctool and the firmware's `load_ambarella` can
+be tested without the camera. With `-kernel` the machine generates the device
+tree, including `/iavmem`, the DSP's share of DRAM, from `-m`; Linux gets what
+is below 0x07800000. On S3L the kernel takes interrupts from one scratchpad
+register, not the banks, and all ones there means none (0x60 is S3's value).
+`iav.ko` oopses without an `/iav/vinc0` node. The sensor is off I2C until GPIO
+107 goes high (`amb-gpio`), as on the camera; `sensor-reset=off` removes that.
+With `flash-file=` and no `-kernel` it runs a camera's own BST and BLD: the first
+NAND page sits at the high vectors `0xffff0000`, which the BST copies from.
+The vendor modules load, but no microcode ships, so the DSP stays down. `flash-file=` adds NAND
+(`amb-nand`), page data alone or with spare bytes. BCH is not modelled, partitions
+come from `mtdparts=`, and a dump's bad blocks must be listed in `bad-blocks=`. Use
+a copy, or `chmod 444` it: writes go through to the file. `-m` must be over 120 MiB, so the smoke
+test above needs its default RAM. A reloading `amb-timer` repeats no faster
+than 1 us, so `RELOAD` 0 cannot pin the host.
 
 Novatek NT9856x / NA51089 (`hw/arm/novatek.c`, `docs/novatek.md`) is a
 fifth: a Cortex-A9 whose MPCore is at `0xFFD00000` (the `0xF1500000` GIC in
@@ -245,6 +407,23 @@ to `nvt_memory_cfg/uboot`, and the `LD_NVT` SHMINFO U-Boot hangs without.
 Xiongmai NOR images keep the FDT inside the loader (`XMFDT562`) and U-Boot
 LZMA-packed in `partition_boot` (`lzma` property); `qemu-boot/xmimg2flash.py`
 lays out their upgrade `*.img` files.
+A flash that starts with a real loader (header word 1 = the SRAM base, the
+entry inside it) boots through it instead: `hw/arm/nvt-bootrom.c` models the
+mask ROM (copies the loader to SRAM; stubs for its ROM routines hand their
+arguments to a C service window; the ROM image in DRAM at 0 and read-only at
+`0x80000000`), and the loader's closed DDR training runs against
+`hw/misc/nvt-ddrc.c` (done / self-clearing bits, paged PHYs). `loader=off`
+forces the stand-in. On NA51089, `rom-fallback=on` (or a `boot-strap=` that
+is not a flash strap) runs the ROM's own fallback when the flash has no
+valid loader: SD, Ethernet (its DHCP/TFTP client on `nvt-eqos`), USB and its
+UART download engine, which `defib burn` (and `burn --nic`) drive as on silicon.
+`-bios re.elf` (OpenIPC/opennovatek's reconstructed NA51089 ROM) runs the ROM
+itself instead: at 0x80000000 and in DRAM at 0, CPU from 0, model unused (`qemu-boot/test-novatek-recovery.sh`,
+`docs/novatek.md#recovery-boot`). `qemu-boot/build-novatek-loader.sh` builds the SDKs'
+loaders; `docs/novatek.md#the-real-first-stage-loader` has what each loader
+waits for. Part-number machines `nt98560` / `nt98561` (NA51089), `nt98523` /
+`nt98529` (NA51055 / NA51084), `nt98532` (NS02501), `nt98321` (NA51068)
+differ from their siblings only in RAM size and split.
 SDK `FW*.bin` packages become flash images with `qemu-boot/nvtpack2flash.py`.
 A 128/256 MiB `flash-file` is a W25N SPI NAND instead of a NOR (FDT then at
 0x40000). The controller's NAND mode (MODULE0 bit 19) sends status reads as
@@ -317,7 +496,16 @@ compensated for the unsigned alpha. Motion detection is the MDBC
 (`hw/misc/nvt-md.c`, node `md@f0c10000` -- probe takes the clock by that
 name). `kdrv_md` waits for frame end with no timeout. The algorithm is
 undocumented, so the background model is a deterministic reduced
-SuBSENSE in buffers only the engine reads. The
+SuBSENSE in buffers only the engine reads. The IVE (`hw/misc/nvt-ive.c`,
+node `ive@f0d70000`) runs a job at START with that job's registers and
+raises its frame end ~1 ms later, one per job. The driver's
+nonblocking trigger releases its lock before it leaves RUN, so on a slow
+host the other channel's trigger can be refused ("illegal in RUN state")
+and the SDK sample then checks an empty buffer: the test reruns it on
+that refusal. OpenIPC's
+`kdrv_ive.ko` cannot load (it needs `kdrv_ive_waitdone_nonblock`), so
+`build-novatek-hdal-samples.sh --kernel` rebuilds it from v1.01.007's
+objects. The
 IPP and graphics engines execute the drivers' DRAM linked lists, whose
 updates set their own interrupt enables. The SIE's single-mode outputs
 clear their enables when a frame is written, which is how `ctl_sie` hands
@@ -339,6 +527,30 @@ a key queued before the CPU runs: start QEMU with `-S` and the serial line
 on a socket (`qemu-boot/test-novatek-uboot.sh`). Keyboard input to any
 16550 that a guest resets before reading relies on
 `qemu/patches/0003-serial-fcr-rx-reset-accept-input.patch`.
+`nt98525` / `nt98528` (NA51055 / NA51084, `docs/novatek.md#nt9852x-na51055--na51084`)
+run through `novatek_common_init` with `NvtSoCConfig.na51055`: two A9s, the
+second off until the kernel writes its entry to `0xF07F8000` (the loader's
+release word, the tree's `cpu-release-addr`), and per-die tables for the
+extra UARTs / I2C, the moved hash, the 4-window AI and 5-window SIE nodes
+(`na51055_media_override`) and the dual-DDR arbiter. The NT9852x kernel
+picks the CG PLL table by chip ID, so `nvt-cg` has a `layout` property
+(1: `0x4821`, 2: `0x5021`). A missing PLL8 hangs the boot silently in
+`read_current_timer()` before the console comes up.
+`nt98323` (NA51068, `docs/novatek.md#nt98323-na51068`) is its own file,
+`hw/arm/novatek-na51068.c`: Faraday-derived blocks, not NA51089's. It reuses
+`nvt-cg` (layout 3), `nvt-top`, `nvt-wdt`, `nvt-otp` and `nvt-flash` (with
+`spi020=on`, a FTSPI020 register front end on the same NOR/NAND engine), and
+adds `hw/timer/nvt-fttmr010.c`. `-kernel` needs the SDK board tree as
+`-dtb`. With `flash-file` alone it calls novatek.c's `nvt_flash_boot()` (exported in
+`novatek.h`; it also accepts the `nvt,nvt_spi020_nor/nand` compatibles), and the SDK
+U-Boot runs. `nvt-cg` layout 3 drops writes to PLL16, which U-Boot sets
+to 1400 MHz, so `periph_clk` stays 100 MHz. `qemu-boot/build-na51068-sdk.sh` builds
+U-Boot (writing the missing `ModelConfig.mk`, LZ-packing with the SDK's
+`bfc`), the 4.9.118 kernel, the tree and a 32 MiB `nor.bin`; `--nand` the NT98321 NAND EVB and
+a 128 MiB `nand.bin`; `--test-drivers` the drivers the SDK leaves off. NA51068-only models:
+`hw/gpio/nvt-ftgpio010.c`, `hw/i2c/nvt-ftiic010.c`, `hw/dma/nvt-ftdmac030.c`,
+`hw/misc/nvt-na51068-misc.c` (PWM, IR, thermal); reused: `nvt-rtc`, `nvt-usb`, `nvt-crypto`,
+`nvt-hash` (with `iv-reversed`, which NA51055 needs too), `nvt-rsa`, `generic-sdhci`.
 `nt98533` (NS02501, `docs/novatek.md#nt98533-ns02501`) is NA51089's
 peripherals at the same addresses around two Cortex-A32s (a Cortex-A7
 here), a GIC-400 at `0xFFF01000` and the generic timer, with its own init
@@ -353,6 +565,18 @@ The aarch64 `nt98332` (NA51103, `docs/novatek.md#nt98332-na51103`) shares
 must have its security extensions (the vendor U-Boot regroups every IRQ
 otherwise), and only a flash boot or `-kernel` with the firmware's `-dtb`.
 Its flash keeps the FDT (`XMFDT32G`) and U-Boot LZMA-packed (`nvt-lzma.c`).
+By default (`-smp 3`: 2 A53s + boot core) a flash with a loader runs
+Xiongmai's AArch32 loader on an extra Cortex-A7 boot core in its own CPU
+cluster (IO also at 0xF0000000); its RMR write (`na51103_rmr_write`) stops
+it and starts the A53s at EL3 in AArch64 at 0, into the firmware's BL31
+(EL2 on, no QEMU PSCI). `loader=off` / `-smp 2` / `-kernel`: the stand-in.
+`nt98633` (NA51090, 4 A53s) is the same init with `na51090_map`
+(`NvtA64Map`: the blocks that moved); its default `-smp 5` runs its loader
+through BL31 (nvt-ddrc `na51090`: psdk, the PHY command 11 pattern echo,
+the QSEN level / gate; the trampoline's mailboxes in the core communicator
+at 0x2_F0160000); `-smp 4` / `loader=off`: the stand-in.
+The ROM's table stubs live at 0x7C00 (loaders scribble on 0x10 / 0x100),
+and its lzma_inflate returns the unpacked length.
 Do not edit the vendor device tree from machine code; board settings go in
 the U-Boot environment in the image (`qemu-boot/uboot-env.py`). Its media
 blocks are `nvt-engine` instances (fire, run the link list, report done; no
@@ -415,9 +639,163 @@ in this order:
   `chip_variant` (and `v1_chip_id_88`/`_8c` for the V1 quartet) or firmware
   prints `Wrong chip-id`/`hiunknown` and `load_hisilicon` bails before loading
   any vendor module. CI greps for exactly this.
-- **Sensors** are I2C/SSI slave models in `qemu/hw/i2c/` and `qemu/hw/ssi/`,
-  selected by name in a `strcmp` chain in `hisilicon_common_init()`
-  (`imx335`, `imx307`, `f37`, `gc2053`, `sc2315e`, … , or `none`).
+- **Sensors** are I2C slave models in `qemu/hw/i2c/`, shared by every family
+  and built for every target. `sensor=` names one from the catalogue in
+  `hw/i2c/image-sensor.c` (name, model, 7-bit address, chip ID): add a part
+  there, not in a machine, and every machine takes it through
+  `image_sensor_create()`. A part new to the catalogue usually needs only a
+  line: SmartSens and GalaxyCore parts share a model. Take its ID from the
+  vendor driver. An ISP reads a sensor through the `image-sensor` interface
+  (`image_sensor_exposure()`); a model implements it from its registers. The
+  plain Sony models, `hisi-mis2006` and `hisi-sp2305` do not yet: on an ISP
+  that needs a picture from the sensor they are found but draw nothing.
+  The Xiongmai machines also take a QOM type name (`sensor=hisi-imx335`) plus
+  `sensor-addr=`; `xm-sensor` is a generic register-file sensor whose ID comes
+  from `-global xm-sensor.regs=` (`docs/xiongmai.md`). The SSI `imx122` stays
+  in `hisilicon_common_init()`.
+- **Video encoding (V4: EV200/EV300/18EV300/16DV200, GK7205V200 family)** is
+  `hisi-vedu` (`docs/hisilicon-venc.md`). The HiMPP driver writes only a few
+  VEDU MMIO registers per picture; the rest is a register image in DDR at
+  VEDU+0x58 that the engine fetches at START. Output goes into a per-channel
+  stream ring of 64-byte-header packets the driver itself parses (type,
+  last-slice / slice-type byte, channel id -- it panics on a wrong one --
+  PTS); the driver writes the SPS/PPS/VPS/SEI and JFIF header packets, the
+  model appends the slice or scan and moves the ring's write-pointer cell.
+  H.264 slice headers are the model's own, H.265 ones the driver's bits from
+  the image (0x404-0x42c). JPGE is plain MMIO, quantisers as 2^23/q
+  reciprocals. Completion is on a virtual-time timer, never inside START.
+  `-global hisi-vedu.dump-dir=DIR` keeps each channel's stream,
+  `trace=on` logs every access and the image at START.
+  `qemu-boot/test-hisi-venc.sh` runs the vendor stack (`VENC_SendFrame`, no
+  VI) under the OpenIPC release; its guest program needs a 32-bit-`off_t`
+  `mmap()` shim, because the release's MPI libraries are uClibc builds.
+  V5 (cv608 / cv610 / cv613, `media_gen = 5` → `hisi-vedu.gen=5`) keeps the
+  image and the ring. Its front end moved: the image address is at 0x08,
+  START at 0x0c, and a second register set at +0x10 that the driver queues
+  while the first encodes. The picture size (0x44) and QP (0x60) are in the
+  image, and the engine writes rate-control statistics back to image +
+  0xb10 (0xb28, the macroblock count, is a divisor). JPGE runs from an image
+  too, its quantisers at 0x300 / 0x400 / 0x500. `test-hisi-vedu.py --gen 5`
+  (CI) and `test-hisi-v5-venc.sh --sdk DIR` (local; the guest links the
+  SDK's static MPI libraries) test it. `hisi-vi` / `hisi-vpss` gen 5
+  (`HISI_V5_VIDEO_PIPE`, SPI 65 / 67 / 71) run the V5 online pipeline,
+  so majestic streams from the default `sc4336p`:
+  - VI_CAP's top status (0xf4 / 0xe4) is derived: write channel at bit 8,
+    FE at bit 16. FE end is bit 8.
+  - VI_PROC is raw 0x310 masked by 0xf0 into 0x314; online it raises start
+    (bit 10) with end (bit 0).
+  - VPSS keeps V4's interrupts, but its channel registers moved: the
+    address words are packed, Y at +8, C at +0xc.
+  - The sys driver's VPSS / VGS resets poll CRG+0x9b44 / 0x9ec4 with no
+    delay (`hisi-crg` `rst-ack`).
+  - The 5.10 i2c-bsp repeats write programs with JMP2 (0x19, LOOP2 / DST2
+    at 0xb8 / 0xbc).
+  - ISP statistics: the BE buffer pointers moved to VIPROC 0x560-0x56c;
+    the rest of the layout is V4's, with AE zones up to 32 x 32.
+  - The driver reprograms a buffer address right after reading it, so a
+    frame goes to the addresses latched at its start (`stt_latch`).
+  - lib_awb stays inside the sensor's calibrated range, so cv6xx scenes are
+    lit at the SC4336P's grey (light-r 625 / light-b 565), and the
+    scenario's warm light is 700 / 520.
+  - Offline (only when software asks: the online limit is 3200 wide), VI_PROC
+    starts at 0x300 / head 0x368 (slot 1: 0x360 / 0x364), and the done
+    status is bits 1 + 11 on 0x310 / 0x370.
+  - Each strip's node holds the array pointers (0x560-0x56c) and, at 0x4dc,
+    a block with a 0x100-byte header of globals. VPSS's node head is 0x368.
+  - VI ticks while its port (0x1000 bit 31) is on, because the driver
+    enables capture per frame.
+  - `test-hisi-v5-sample-venc.sh` (local) runs the SDK sample online and
+    `--offline`. Its VPSS group is `EARLY_END`: the driver unmasks the
+    delay interrupt (bit 8) and hands channels on only at an EOF without
+    START. Its channel 1 is low delay (0x400 bit 4 + chn, tunnel word at
+    0x4a8 + 4 x chn): the driver sends a frame only between START and the
+    channel's tunnel interrupt (0x1000 << chn). So in either mode
+    `hisi-vpss` raises START, tunnel, delay and EOF apart.
+  - IVE is not a block of its own on V5: each op is a 576-byte task in a
+    ring in DDR that the SVP NPU's task scheduler runs (`hisi-ive-npu`,
+    0x14000000, SPI 76). The model follows the ring's links (+6 id, +8
+    next) and computes the op named by the code at +288; the NPU models
+    the driver loads are shared between ops and are never run. 34 ops
+    are modelled, their pixel work in `hisi-ive-ops.c`, shared with V4's
+    `hisi-ive` (`test-hisi-ive-npu.py`, CI; `test-hisi-v5-sample-ive.sh
+    --sdk`, local: the SDK's memory test, and its sobel against numpy).
+    Resize is the one op whose parameters are not in the task: they are
+    in a block whose address is at +64, and its task carries no op code
+    and no size. The engine's rounding is in neither the driver nor the
+    SDK, so the ops' arithmetic is fitted against a CV608 board:
+    `ive-v5-capture.sh --board HOST --qemu` runs every op through the MPI
+    on both and compares the outputs byte for byte (references in
+    `qemu/tests/data/`). Some ops are a sequence the MPI submits, not one
+    task: canny_hys_edge reads a mag_and_ang result from the ctrl's mem
+    (its classes are 1 not-an-edge, 0 weak, 2 seed, and the seeds are
+    thinned in raster order), and st_cand_corner runs norm_grad, op 25,
+    16bit_to_8bit, a threshold, a 3x3 maximum and op 26. The Shi-Tomasi
+    measure is still open (#268). LK is the one op modelled to a
+    tolerance and not exactly: a 7x7 window, the Sobel over 8 as the
+    gradient, Cramer's rule truncated towards minus infinity, which
+    places a point within 0.03 pixels of the board. GMM2 keeps 3 to 5 Gaussians of
+    8 bytes per pixel and updates them with shifts that round towards
+    +infinity (`docs/ive-registers.md`). majestic's motion
+    detection would use it, but reads VPSS extended channel 3, which is
+    not modelled (#273).
+  - The SC4336P's 4M mode leaves HTS at reset: the catalogue's `hts`
+    (2800) and `pclk` (126 MHz) make VTS 1500 30 fps. It counts exposure
+    in rows (`exp-rows`), and 0x3E06 is its digital gain's coarse step.
+    `test-hisi-scenario.sh --soc hi3516cv610` runs in CI.
+  In front of it on the EV200-class machines (Goke rebrands too), `hisi-vi` (the
+  frame clock: VI_CAP's write-channel start / early / end bits, VI_PROC's
+  start / end) and `hisi-vpss` (paints its channels, then frame start +
+  end) run the online pipeline, so majestic and the SDK's own
+  `sample_venc` stream from `sensor=sc2315e` (Goke releases have no SC2315E
+  config in `/etc/sensors`: use `sensor=sc2335` there)
+  (`test-hisi-majestic.sh`, `test-hisi-sample-venc.sh --sdk`). VI runs only
+  while VPSS's online video is enabled: an interrupt for a pipe that does
+  not exist oopses the driver (or while pipe 0's write channel is on,
+  which also starts the clock in offline mode). A sensor wider than 2304
+  (`sensor=imx335`, `gc4653` on hi3516ev300) runs VI offline: the driver
+  starts the pipe per frame (VI_PROC 0x300), and VPSS, armed by its 0x304,
+  loads the node list at its 0x2f8 then (register images in DDR, one per
+  vertical strip; the model paints the strips' widths as one picture) and
+  raises no interrupt. VEDU's source stride is image 0x1f4, not 0x160
+  (the 64-aligned reference stride). Compressed VPSS channels use a private
+  half-height stand-in shared with `hisi-vedu`. Use `-icount shift=0`, or
+  frames overtake the driver on a slow host. `hisi-vi` also writes the
+  ISP's statistics (front-end AE histogram, backend AE histogram, zones
+  and AWB, the STT layouts in openhisilicon's `isp_stt_define.h`). They
+  come from the scene in front of the camera, `hisi-scene` at
+  `/machine/scene` (`docs/hisilicon-digital-twin.md`): grey bars by
+  default, or `-global hisi-scene.file=` a PPM / PFM picture. It is lit
+  by `light` / `light-r` / `light-b` (settable at runtime with QMP
+  `qom-set`) times the sensor's exposure × gain (`image-sensor`, one
+  frame late), so AE and AWB converge. VPSS paints the same scene through
+  the frame's exposure, WB gains and gamma. The SmartSens and 16-bit
+  GalaxyCore models keep a sensor's timing once an ISP drives their frames
+  (`sensor-sync.h`, `image_sensor_frame_start()`). Writes to exposure,
+  gain and VTS latch at the next frame start, and the SmartSens group hold
+  (0x3812) holds them. VI's frame clock is HTS x VTS / `pclk`. Datasheet
+  violations (exposure beyond the frame, mode registers written while
+  streaming) are counted (QOM `violations`) and logged with
+  `-d guest_errors`. `-global hisi-smartsens.trace-i2c=on` logs every write
+  with its frame and line, and `late-latch=N` makes the Nth latch that
+  changes a register land a frame late (a fault, once; `latches` counts
+  them). Families without a frame clock see writes apply
+  at once, as before. Scenarios: `-global hisi-scene.timeline=FILE` plays
+  timed scene changes (`20 light=150`, ramps `a..b prop=x->y`), and
+  `-global hisi-vi.record=FILE` writes a CSV line for each frame.
+  `qemu-boot/twin-metrics.py` turns the CSV into settle time, overshoot,
+  level and AWB residual per segment. `qemu-boot/test-hisi-scenario.sh`
+  runs majestic through a scenario (CI on hi3516ev200), enforcing AE, AWB
+  and the timeline. lib_hiawb froze in some runs (#252) on releases whose
+  `open_isp.ko` never switched the online STT buffer (openhisilicon#295;
+  HiSilicon's VI, unlike Goke's, does not call the frame-start switch).
+  An AWB zone's count is every pixel of the zone:
+  lib_hiawb leaves its gains alone unless the zones' average count passes
+  1024. Offline, each strip's VIPROC node (0x2f8 chain) has its own
+  statistics block (S_ISP_STT_REGS_TYPE) at the address in its 0x5d0.
+  The ISP driver's per-frame work runs on the front end's
+  FSTART / FEND (VI_CAP 0x200f0, SPI 43, shared with capture), and a
+  port status (0x10f0) with error bits set makes it skip the frame.
+  `-global hisi-vi.stats-trace=on` prints what AE / AWB see.
 
 ## Adding a SoC or a device
 
@@ -467,10 +845,35 @@ boots ~14 SoCs (HiSilicon, Goke, Xiongmai) to a login prompt, plus dedicated
 Linux ping+curl, and SPI-NOR erase/program steps. Everything runs under TCG on
 GitHub runners, so a boot iteration is minutes — smoke-test locally first.
 
+A PR or master push runs only the jobs its paths reach; the weekly `schedule`
+run (and `workflow_dispatch`) runs everything. The `select` job's
+`.github/scripts/ci-select.py` decides. A model reaches the family its file
+name names, the families qemu/setup.sh builds it under, and transitively every
+family whose code names its QOM type, TYPE_ macro or header (a header only
+through its includers). HiSilicon is resolved per machine: a model runs the
+jobs and rows (`boot`, and `venc-hisilicon`'s in `.github/ci/venc-matrix.yml`)
+of the machines whose `HisiSoCConfig` names its type or sets the field that
+guards its creation (`if (c->ive_npu_base)`, `for (...; n < c->num_himci;
+...)`); the build job checks that map against QEMU's own device trees
+(`--check-machines`). A sensor model runs only where it is attached: machines
+whose `default_sensor` it is, and jobs, rows and qtests that name it
+(`sensor=sc2315e`) -- not everywhere the catalogue is included. Scripts reach
+the jobs whose workflow text names them. setup.sh, ci.yml, hisilicon.c (a
+change inside one SoC's config runs that SoC), the sensor catalogue and the
+matrix files are read by their diff. Docs run nothing. Anything unrecognised runs everything. Dry-run
+a change with `git diff --name-only master | python3
+.github/scripts/ci-select.py --stdin --base master`; `--explain <path>` shows
+what a path reaches. A new job must go into the script's `JOB_FAMILIES` and
+`ci-gate`'s `needs`, and a
+new qtest step needs an `if:` on its `qtests` entry: `--self-test`, run in
+`select`, fails the PR otherwise. The only required check is `CI Gate`, which
+fails if a job select asked for did not succeed.
+
 ## Conventions
 
 Commit subjects are `<area>: <imperative summary> (#PR)` where area is a
-family (`hisilicon`, `xiongmai`, `goke`, `anyka`, `sigmastar`, `novatek`), a
+family (`hisilicon`, `xiongmai`, `goke`, `anyka`, `sigmastar`, `novatek`,
+`grainmedia`), a
 device (`hisi-fmc`, `hisi-gmac`), a machine (`hi3516cv610`, `nt98332`), `ci` or
 `docs`. Bodies are substantial: what the vendor DTS/SDK says, why the old value
 was wrong, what boots now that did not, and issue references

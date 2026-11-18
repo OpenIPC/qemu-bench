@@ -2,7 +2,14 @@
  * SigmaStar / MStar BDMA (RIU bank 0x1002, 0x1F200400).
  *
  * Four byte-DMA channels, 0x20 RIU registers (0x80 bytes) apart
- * (drivers/sstar/bdma/infinity2m/kernel_bdma.h):
+ * (drivers/sstar/bdma/infinity2m/kernel_bdma.h).  On infinity6 and
+ * infinity6b0 they are 0x10 apart ("chan-regs"): those kernels put
+ * BDMA1 at bank 0x100220, BDMA2 at 0x100240 and BDMA3 at 0x100260
+ * (registers.h, GET_BASE_ADDR_BY_BANK doubles the offset), where
+ * infinity6e and 6c have 0x100240, 0x100280 and 0x1002C0.  msys_dma_fill
+ * runs on BDMA1 and waits for its interrupt, so with the wider spacing
+ * its writes land in channel 0's spare registers, nothing runs, and the
+ * first MI_RGN_Create on an ssc337 waits for ever.
  *
  *   +0x00 trigger (bit 0, self-clearing)
  *   +0x01 status, write 1 to clear: bit 1 busy, bit 2 interrupt,
@@ -14,8 +21,8 @@
  *   +0x0A/0B the fill pattern (source 4)
  *
  * Ports: 0/1 MIU (DRAM from bus address 0, or IMI), 4 memory fill
- * (source), 5 the SPI NOR (source), 11 the FSP's outside write buffer
- * (destination).  The boot ROM copies the IPL from flash to IMI with
+ * (source), 5 the SPI NOR (source), 6 the XZ decoder (destination, Iford),
+ * 11 the FSP's outside write buffer (destination).  The boot ROM copies the IPL from flash to IMI with
  * source 5; U-Boot programs pages with MIU -> FSP (HAL_FSP_Write_BDMA:
  * path 0x2B40) and fires the FSP after triggering the channel.
  * Transfers complete inside the trigger write.
@@ -31,12 +38,14 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/ssi/sstar-fsp.h"
+#include "hw/misc/sstar-xzdec.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -67,6 +76,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarBdmaState, SSTAR_BDMA)
 #define PORT_MIU1           1
 #define PORT_FILL           4
 #define PORT_SPI            5
+#define PORT_XZDEC          6       /* destination, Iford */
 #define PORT_FSP            11
 
 #define DRAM_BASE           0x20000000
@@ -77,6 +87,9 @@ struct SstarBdmaState {
 
     MemoryRegion iomem;
     SstarFspState *fsp;
+    SstarXzdecState *xzdec;
+    uint32_t addr_mask;     /* MIU addresses it reaches, 512 MiB by default */
+    uint32_t chan_regs;     /* RIU registers from one channel to the next */
     uint16_t regs[BDMA_NUM_CHAN][BDMA_CHAN_REGS];
     qemu_irq irq[BDMA_NUM_CHAN];
 };
@@ -86,13 +99,14 @@ static uint32_t reg32(uint16_t *r, int lo)
     return r[lo] | ((uint32_t)r[lo + 1] << 16);
 }
 
-static hwaddr bdma_mem_addr(uint16_t *r, uint32_t a)
+static hwaddr bdma_mem_addr(SstarBdmaState *s, uint16_t *r, uint32_t a)
 {
     /* Bus addresses: DRAM from 0, as the drivers program them. */
     if (((r[R_MISC] >> 12) & 0x3) == MISC_MEM_IMI) {
-        return IMI_BASE + (a & 0xFFFF);
+        /* Iford's IPL reads into IMI above 64 KiB (0xA0010980) */
+        return IMI_BASE + (a & 0xFFFFF);
     }
-    return DRAM_BASE + (a & 0x1FFFFFFF);
+    return DRAM_BASE + (a & s->addr_mask);
 }
 
 static void bdma_update_irq(SstarBdmaState *s, int ch)
@@ -120,7 +134,7 @@ static void bdma_run(SstarBdmaState *s, int ch)
         switch (src) {
         case PORT_MIU0:
         case PORT_MIU1:
-            dma_memory_read(&address_space_memory, bdma_mem_addr(r, sa), buf,
+            dma_memory_read(&address_space_memory, bdma_mem_addr(s, r, sa), buf,
                             n, MEMTXATTRS_UNSPECIFIED);
             break;
         case PORT_FILL:
@@ -144,12 +158,17 @@ static void bdma_run(SstarBdmaState *s, int ch)
         switch (dst) {
         case PORT_MIU0:
         case PORT_MIU1:
-            dma_memory_write(&address_space_memory, bdma_mem_addr(r, da),
+            dma_memory_write(&address_space_memory, bdma_mem_addr(s, r, da),
                              buf, n, MEMTXATTRS_UNSPECIFIED);
             break;
         case PORT_FSP:
             if (s->fsp) {
                 sstar_fsp_push_outside(s->fsp, buf, n);
+            }
+            break;
+        case PORT_XZDEC:
+            if (s->xzdec) {
+                sstar_xzdec_push(s->xzdec, buf, n);
             }
             break;
         default:
@@ -175,7 +194,10 @@ static uint64_t sstar_bdma_read(void *opaque, hwaddr off, unsigned size)
     if ((off & 3) >= 2) {
         return 0;
     }
-    v = s->regs[reg / BDMA_CHAN_REGS][reg % BDMA_CHAN_REGS];
+    if (reg / s->chan_regs >= BDMA_NUM_CHAN) {
+        return 0;
+    }
+    v = s->regs[reg / s->chan_regs][reg % s->chan_regs];
     if (off & 1) {
         return v >> 8;
     }
@@ -187,11 +209,15 @@ static void sstar_bdma_write(void *opaque, hwaddr off, uint64_t val,
 {
     SstarBdmaState *s = opaque;
     int reg = (off >> 2) & 0x7F;
-    int ch = reg / BDMA_CHAN_REGS;
-    uint16_t *r = s->regs[ch];
+    int ch = reg / s->chan_regs;
+    uint16_t *r;
     uint16_t v = val;
 
-    reg %= BDMA_CHAN_REGS;
+    if (ch >= BDMA_NUM_CHAN) {
+        return;
+    }
+    r = s->regs[ch];
+    reg %= s->chan_regs;
     if ((off & 3) >= 2) {
         return;
     }
@@ -242,6 +268,16 @@ static void sstar_bdma_reset(DeviceState *dev)
     }
 }
 
+static void sstar_bdma_realize(DeviceState *dev, Error **errp)
+{
+    SstarBdmaState *s = SSTAR_BDMA(dev);
+
+    if (s->chan_regs < R_PATTERN_L + 2 || s->chan_regs > BDMA_CHAN_REGS) {
+        error_setg(errp, "sstar-bdma: chan-regs must be %d to %d",
+                   R_PATTERN_L + 2, BDMA_CHAN_REGS);
+    }
+}
+
 static void sstar_bdma_init(Object *obj)
 {
     SstarBdmaState *s = SSTAR_BDMA(obj);
@@ -256,8 +292,12 @@ static void sstar_bdma_init(Object *obj)
 }
 
 static const Property sstar_bdma_props[] = {
+    DEFINE_PROP_UINT32("addr-mask", SstarBdmaState, addr_mask, 0x1FFFFFFF),
+    DEFINE_PROP_UINT32("chan-regs", SstarBdmaState, chan_regs, BDMA_CHAN_REGS),
     DEFINE_PROP_LINK("fsp", SstarBdmaState, fsp, TYPE_SSTAR_FSP,
                      SstarFspState *),
+    DEFINE_PROP_LINK("xzdec", SstarBdmaState, xzdec, TYPE_SSTAR_XZDEC,
+                     SstarXzdecState *),
 };
 
 static const VMStateDescription vmstate_sstar_bdma = {
@@ -277,6 +317,7 @@ static void sstar_bdma_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_legacy_reset(dc, sstar_bdma_reset);
     device_class_set_props(dc, sstar_bdma_props);
+    dc->realize = sstar_bdma_realize;
     dc->vmsd = &vmstate_sstar_bdma;
 }
 

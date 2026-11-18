@@ -1,0 +1,55 @@
+mips: per-SoC PRId and L1 size properties
+
+The Ingenic T-series share a core model across dies that differ in what
+they report: the T20 reads PRId 0x00d00101 where the others read
+0x00d00100, and the T21 and T23 have 16 KiB L1 caches.  "prid" and
+"l1-kib" override the model at reset (0 keeps it).
+
+diff --git a/target/mips/cpu.c b/target/mips/cpu.c
+index 5855c0b..d2ad0b4 100644
+--- a/target/mips/cpu.c
++++ b/target/mips/cpu.c
+@@ -202,6 +202,16 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
+     env->CP0_Config0 = deposit32(env->cpu_model->CP0_Config0,
+                                  CP0C0_BE, 1, cpu->is_big_endian);
+     env->CP0_Config1 = env->cpu_model->CP0_Config1;
++    if (cpu->prid) {
++        env->CP0_PRid = cpu->prid;
++    }
++    if (cpu->l1_kib) {
++        /* sets = 64 << S: KiB * 1024 / 32-byte lines / 8 ways */
++        int sets = ctz32(cpu->l1_kib * 1024 / 32 / 8) - 6;
++
++        env->CP0_Config1 = deposit32(env->CP0_Config1, CP0C1_IS, 3, sets);
++        env->CP0_Config1 = deposit32(env->CP0_Config1, CP0C1_DS, 3, sets);
++    }
+     env->CP0_Config2 = env->cpu_model->CP0_Config2;
+     env->CP0_Config3 = env->cpu_model->CP0_Config3;
+     env->CP0_Config4 = env->cpu_model->CP0_Config4;
+@@ -542,6 +552,8 @@ static const Property mips_cpu_properties[] = {
+     DEFINE_PROP_BOOL("big-endian", MIPSCPU, is_big_endian, TARGET_BIG_ENDIAN),
+     DEFINE_PROP_UINT32("car-size", MIPSCPU, car_size, 0),
+     DEFINE_PROP_UINT64("car-phys", MIPSCPU, car_phys, 0),
++    DEFINE_PROP_UINT32("prid", MIPSCPU, prid, 0),
++    DEFINE_PROP_UINT32("l1-kib", MIPSCPU, l1_kib, 0),
+ };
+ 
+ #ifdef CONFIG_TCG
+diff --git a/target/mips/cpu.h b/target/mips/cpu.h
+index 4d8b5fd..dfc1c79 100644
+--- a/target/mips/cpu.h
++++ b/target/mips/cpu.h
+@@ -1220,6 +1220,13 @@ struct ArchCPU {
+     uint32_t car_size;
+     uint64_t car_phys;
+     bool car_active;
++    /*
++     * Per-SoC overrides of a model's PRId and L1 cache size (one model,
++     * several dies); 0 keeps the model's.  l1_kib describes both L1
++     * caches as 8-way with 32-byte lines.
++     */
++    uint32_t prid;
++    uint32_t l1_kib;
+ };
+ 
+ /**

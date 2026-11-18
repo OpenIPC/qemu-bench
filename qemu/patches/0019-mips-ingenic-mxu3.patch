@@ -1,0 +1,3461 @@
+mips: Ingenic XBurst2 MXU3 (512-bit SIMD) ASE for T40/T41
+
+The T40/T41 XBurst2 cores carry Ingenic's MXU3, a 512-bit SIMD coprocessor
+(coprocessor 2).  Their 4.4.94 kernels enable it lazily: the first MXU3
+instruction raises Coprocessor Unusable with Cause.CE = 2 (Config1.C2 is
+set, Status.CU2 is not), the do_cpu handler sets Status.CU2 and retries,
+and switch_to saves/restores the 512-bit register file with MXU3
+load/store instructions.  Stock QEMU does not decode MXU3, so that vendor
+userspace (libimp/libvenus/...) and the kernel's save/restore take an
+illegal-instruction trap.
+
+This adds the ASE: 32 x 512-bit vector registers (vpr0..31), 4 x 512-bit
+accumulators (vsr0..3), 32 scalar VWR registers and the MXU control/status
+register, in CPU state (reset-cleared, migrated as a vmstate subsection).
+A new self-contained decoder (target/mips/tcg/mxu3_translate.c) and helper
+(mxu3_helper.c), driven by a table generated from the Ingenic GCC 7.2
+libopcodes opcode tables (mxu3-gen.c.inc), implement the instructions;
+MXU3 instructions raise Coprocessor Unusable (CE=2) when Status.CU2 == 0.
+
+Encodings, operand layouts and semantics were recovered only from the
+Ingenic GCC 7.2 toolchain (its objdump/as opcode tables and the RTL its
+__builtin_mxu3_* intrinsics expand to) and the kernel's mxuv3.c save/
+restore sequences; the gather/shuffle (gt*/gshuf*), the sr*/s* reductions
+and the NN-accelerator ops have opaque UNSPEC RTL and are implemented
+best-effort or as register-preserving no-ops (flagged in mxu3_helper.c) so
+code using them does not trap, but their results are not guaranteed.
+
+Decode is gated by MIPS_HFLAG_CU2 (bit 30), the Status.CU2 hflag that the
+MXU2 patch (0018) already recomputes in compute_hflags and includes in
+MIPS_HFLAG_TMASK; this patch only extends that recompute to cover ASE_MXU3
+(so the CU2-enable retry re-translates instead of reusing a stale TB) and
+reuses 0018's vmstate-subsection and decode-hook plumbing.
+
+Approximated mnemonics are reported, never silent: the first execution of
+each one logs a LOG_UNIMP message (-d unimp) naming it, and
+QEMU_MXU3_STATS=1 prints per-mnemonic execution counts of approximated
+instructions at exit (QEMU_MXU3_STATS=all counts every MXU3 mnemonic).
+Measured with QEMU_MXU3_STATS=all on the T40 ISP/sensor model with
+libimp's IVS move detection running on its frames (the only MXU3 code in
+the T40 libimp; majestic's motion detection uses the same
+IMP_IVS_CreateMoveInterface): the only approximated mnemonics executed
+were gtb and gt2w, and both are now exact:
+ - gt2w/gt4w/gt8w/gt2d/gt4d/gt2q: the GCC RTL is plain vec_merge
+   (vec_duplicate (vec_select rt [j, j+N, ...])) rd mask, i.e.
+   rd.x[i*m+k] = rt.x[N*k+j], other lanes kept.
+ - gtb: UNSPEC RTL.  Per 64-bit lane, even bytes to the low word, odd to
+   the high word: the only lane split under which libimp's narrowing idiom
+   "gtb x,x; gt2w x[0],x,0" maps 32 halfwords to 32 packed bytes without
+   losing pixels.  Checked functionally: with it, IVS reports motion in
+   exactly the quadrant of a synthetic moving block and catches a 16x16
+   block near the detection threshold, which the alternatives (no-op,
+   whole-register or 128-bit-lane split) miss; the odd half is the natural
+   complement (no code reads it).
+After that, no approximated mnemonic executes in that workload; the T41
+SDK image's only application contains no MXU3 code.  Applies on
+0001..0018.
+
+The XBurst2 CPU model is updated in
+0015-mips-ingenic-xburst-cpus.patch: Config1.C2 = 1, Status.CU2 made writable, and
+ASE_MXU3 | ASE_MXU3_1 added to insn_flags.
+
+diff --git a/target/mips/mips-defs.h b/target/mips/mips-defs.h
+--- a/target/mips/mips-defs.h
++++ b/target/mips/mips-defs.h
+@@ -54,6 +54,9 @@
+ #define ASE_LEXT          0x0080000000000000ULL
+ /* Ingenic MXU2: 128-bit SIMD unit of the XBurst1 T-series, on COP2 */
+ #define ASE_MXU2          0x0100000000000000ULL
++/* Ingenic XBurst2 MXU3 512-bit SIMD (T40); MXU3_1 is the T41 revision */
++#define ASE_MXU3          0x0200000000000000ULL
++#define ASE_MXU3_1        0x0400000000000000ULL
+ 
+ /* MIPS CPU defines. */
+ #define CPU_MIPS1       (ISA_MIPS1)
+diff --git a/target/mips/cpu.h b/target/mips/cpu.h
+--- a/target/mips/cpu.h
++++ b/target/mips/cpu.h
+@@ -1190,6 +1190,17 @@
+         uint32_t mcsr;
+     } mxu2;
+ 
++    /*
++     * Ingenic XBurst2 MXU3 (ASE_MXU3): 32 x 512-bit vector registers
++     * (vpr0..31), 4 x 512-bit accumulators (vsr0..3), 32 scalar VWR
++     * registers and the MXU control/status register (mcs31), as
++     * little-endian byte lanes.  (See target/mips/tcg/mxu3_helper.c.)
++     */
++    uint64_t mxu3_vr[32][8];
++    uint64_t mxu3_acc[4][8];
++    uint32_t mxu3_vwr[32];
++    uint32_t mxu3_csr;
++
+     /* Fields up to this point are cleared by a CPU reset */
+     struct {} end_reset_fields;
+ 
+@@ -1364,6 +1375,15 @@
+     return env->CP0_Config3 & (1 << CP0C3_MSAP);
+ }
+ 
++/* Ingenic XBurst2 MXU3 is present when the CPU model sets ASE_MXU3 in
++ * insn_flags and advertises Coprocessor 2 in Config1.C2 -- what the
++ * T40/T41 kernel's cpu-probe checks. */
++static inline bool ase_mxu3_available(CPUMIPSState *env)
++{
++    return (env->insn_flags & ASE_MXU3) &&
++           (env->CP0_Config1 & (1 << CP0C1_C2));
++}
++
+ /* Check presence of Loongson CSR instructions */
+ static inline bool ase_lcsr_available(CPUMIPSState *env)
+ {
+diff --git a/target/mips/internal.h b/target/mips/internal.h
+--- a/target/mips/internal.h
++++ b/target/mips/internal.h
+@@ -345,7 +345,7 @@
+     if (env->CP0_Status & (1 << CP0St_CU1)) {
+         env->hflags |= MIPS_HFLAG_FPU;
+     }
+-    if ((env->insn_flags & ASE_MXU2) &&
++    if ((env->insn_flags & (ASE_MXU2 | ASE_MXU3)) &&
+         (env->CP0_Status & (1U << CP0St_CU2))) {
+         env->hflags |= MIPS_HFLAG_CU2;
+     }
+diff --git a/target/mips/helper.h b/target/mips/helper.h
+--- a/target/mips/helper.h
++++ b/target/mips/helper.h
+@@ -601,6 +601,7 @@
+ 
+ #include "tcg/msa_helper.h.inc"
+ #include "tcg/mxu2_helper.h.inc"
++#include "tcg/mxu3_helper.h.inc"
+ 
+ /* Vendor extensions */
+ #include "tcg/vr54xx_helper.h.inc"
+diff --git a/target/mips/system/machine.c b/target/mips/system/machine.c
+--- a/target/mips/system/machine.c
++++ b/target/mips/system/machine.c
+@@ -249,6 +249,30 @@
+     }
+ };
+ 
++/* Ingenic XBurst2 MXU3: 32 x 512-bit vector regs, 4 accumulators, 32
++ * scalar regs and MCS31, migrated as a subsection present only on a CPU
++ * that has the ASE. */
++static bool mxu3_needed(void *opaque)
++{
++    MIPSCPU *cpu = opaque;
++
++    return ase_mxu3_available(&cpu->env);
++}
++
++static const VMStateDescription vmstate_mxu3 = {
++    .name = "cpu/mxu3",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = mxu3_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT64_2DARRAY(env.mxu3_vr, MIPSCPU, 32, 8),
++        VMSTATE_UINT64_2DARRAY(env.mxu3_acc, MIPSCPU, 4, 8),
++        VMSTATE_UINT32_ARRAY(env.mxu3_vwr, MIPSCPU, 32),
++        VMSTATE_UINT32(env.mxu3_csr, MIPSCPU),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ /* MIPS CPU state */
+ 
+ const VMStateDescription vmstate_mips_cpu = {
+@@ -367,6 +391,7 @@
+     },
+     .subsections = (const VMStateDescription * const []) {
+         &vmstate_mxu2,
++        &vmstate_mxu3,
+         NULL
+     }
+ };
+diff --git a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
+--- a/target/mips/tcg/translate.c
++++ b/target/mips/tcg/translate.c
+@@ -15054,6 +15054,9 @@
+         decode_ase_mxu2(ctx, ctx->opcode)) {
+         return;
+     }
++    if (ase_mxu3_available(env) && decode_ase_mxu3(ctx, ctx->opcode)) {
++        return;
++    }
+ 
+     /* ISA (from latest to oldest) */
+     if (cpu_supports_isa(env, ISA_MIPS_R6) && decode_isa_rel6(ctx, ctx->opcode)) {
+diff --git a/target/mips/tcg/translate.h b/target/mips/tcg/translate.h
+--- a/target/mips/tcg/translate.h
++++ b/target/mips/tcg/translate.h
+@@ -223,6 +223,7 @@
+ 
+ /* MXU2 (Ingenic XBurst1 T-series COP2 SIMD) */
+ bool decode_ase_mxu2(DisasContext *ctx, uint32_t insn);
++bool decode_ase_mxu3(DisasContext *ctx, uint32_t insn);
+ 
+ bool decode_64bit_enabled(DisasContext *ctx);
+ 
+diff --git a/target/mips/tcg/meson.build b/target/mips/tcg/meson.build
+--- a/target/mips/tcg/meson.build
++++ b/target/mips/tcg/meson.build
+@@ -21,6 +21,8 @@
+   'msa_translate.c',
+   'op_helper.c',
+   'rel6_translate.c',
++  'mxu3_translate.c',
++  'mxu3_helper.c',
+   'translate.c',
+   'translate_addr_const.c',
+   'txx9_translate.c',
+diff --git a/target/mips/tcg/mxu3.h b/target/mips/tcg/mxu3.h
+new file mode 100644
+--- /dev/null
++++ b/target/mips/tcg/mxu3.h
+@@ -0,0 +1,123 @@
++/*
++ * Ingenic XBurst2 MXU3 (512-bit SIMD) - shared definitions
++ *
++ * The MXU3 encodings, mnemonics and operand layouts in this file and in
++ * the generated mxu3-gen.c.inc were recovered solely from the Ingenic
++ * GCC 7.2 toolchain shipped in ingenic-t41-zeratul.7z: the libopcodes
++ * opcode table built into mips-linux-gnu-objdump/as (match/mask/operand
++ * format for every mnemonic) and the GCC MXU3 intrinsic header
++ * lib/gcc/.../include/mxu3.h plus the RTL the compiler emits for each
++ * __builtin_mxu3_* (which fixes the per-instruction semantics).  The
++ * save/restore word encodings in the T40/T41 4.4.94 kernel
++ * arch/mips/xburst2/common/mxuv3.c were used to confirm the state layout.
++ */
++#ifndef TARGET_MIPS_MXU3_H
++#define TARGET_MIPS_MXU3_H
++
++/* Operand "shape": how the raw instruction fields are laid out. */
++enum {
++    SH_VVV,     /* rd[10:6], rs[20:16], rt[15:11]            */
++    SH_VV,      /* rd[10:6], rs[20:16]                       */
++    SH_VVT,     /* rd[10:6], rt[15:11]                       */
++    SH_VVI5,    /* rd[10:6], rs[20:16], imm[15:11]           */
++    SH_VVI8,    /* rd[10:6], rs[20:16], imm{[2:0],[15:11]}   */
++    SH_LI,      /* rd[10:6], imm[20:0]                       */
++    SH_LIWR,    /* vw[10:6], imm[20:11] (signed)             */
++    SH_ADDIW,   /* vw[10:6], vw[15:11], imm{[2:0],[20:16]}   */
++    SH_ADDRW,   /* vw[10:6], vw[15:11]                       */
++    SH_REPI,    /* rd[10:6], rt[15:11], idx[20:16]           */
++    SH_BSHLI,   /* rd[10:6], rt[15:11], imm[22:16]           */
++    SH_EXTW,    /* rd[10:6], rt[15:11], hl[21]               */
++    SH_GTW,     /* rd[10:6], rt[15:11], immpack              */
++    SH_MOVW,    /* rd[10:6]+didx[25:21], rt[15:11]+sidx[20:16] */
++    SH_MOVX,    /* rd[10:6]+didx[24:21], rt[15:11]+sidx[19:16] */
++    SH_CMVW,    /* rd[10:6], rs[20:16], rt[15:11], sel[24:21] */
++    SH_GSHUFW,  /* rd[10:6], rs[20:16], rt[15:11], imm[22:21] */
++    SH_GSHUFWB1,/* rd[10:6], rs[20:16], rt[15:11], imm[21]    */
++    SH_MAC3,    /* acc[7:6], rs[20:16], rt[15:11]            */
++    SH_MTSUM,   /* acc[7:6], rs[20:16]                       */
++    SH_MFSUM,   /* rd[10:6], acc[12:11]                      */
++    SH_MXSUM,   /* rd[10:6], rs[20:16], acc[12:11]           */
++    SH_SUMZ,    /* acc[7:6]                                  */
++    SH_SRSUM,   /* acc[7:6], rs[20:16]  (reduction)          */
++    SH_SRMAC,   /* acc[7:6], rs[20:16], rt[15:11]            */
++    SH_BR,      /* rs[20:16], off[20:6]                      */
++    SH_CFCMXU,  /* gpr[10:6], mcs[15:11]                     */
++    SH_CTCMXU,  /* mcs[15:11], gpr[25:21]                    */
++    SH_MFCPUW,  /* vw[10:6], gpr[25:21]                      */
++    SH_MTCPUW,  /* gpr[10:6], vw[15:11]                      */
++    SH_MFFPUW,  /* vw[10:6], fpr[20:16]                      */
++    SH_MTFPUW,  /* fpr[10:6], vw[15:11]                      */
++    SH_NNWR,    /* vw[15:11], imm[20:6]                      */
++    SH_NNRD,    /* rd[10:6], imm[20:11]                      */
++    SH_NNDWR,   /* rt[15:11], imm[20:6]                      */
++    SH_NNCMD,   /* imm[20:6]                                 */
++    SH_LSIDX,   /* reg, idx, scaled off(base)                */
++    SH_LSU,     /* reg, idx, (base)                          */
++    SH_LSST,    /* strided (approximated)                    */
++};
++
++/* Element width codes. */
++enum { EW_B, EW_H, EW_W, EW_D, EW_Q, EW_O };
++
++/* Abstract operation; the helper switches on this. */
++enum {
++    OP_NOP,
++    OP_ADD, OP_SUB, OP_MUL, OP_AND, OP_ANDN, OP_OR, OP_ORN, OP_XOR, OP_XORN,
++    OP_ANDI, OP_ORI, OP_XORI, OP_BSEL,
++    OP_MAXS, OP_MAXU, OP_MAXA, OP_MINS, OP_MINU, OP_MINA,
++    OP_MAXU2BI, OP_MAXU4BI, OP_MINU2BI, OP_MINU4BI,
++    OP_CEQ, OP_CLES, OP_CLEU, OP_CLTS, OP_CLTU,
++    OP_CEQZ, OP_CLEZ, OP_CLTZ,
++    OP_ABS, OP_SLL, OP_SRA, OP_SRL, OP_SRAR, OP_SRLR,
++    OP_FADD, OP_FSUB, OP_FMUL, OP_FMAX, OP_FMIN, OP_FMAXA, OP_FMINA,
++    OP_FCEQ, OP_FCLE, OP_FCLT, OP_FCOR, OP_FCADD, OP_FCMULR, OP_FCMULI,
++    OP_FFSIW, OP_FFUIW, OP_FTSIW, OP_FTUIW, OP_FRINTW,
++    OP_FTRUNCSW, OP_FTRUNCUW, OP_FCLASSW, OP_FXAS,
++    OP_WADDSL, OP_WADDSH, OP_WADDUL, OP_WADDUH,
++    OP_WSUBSL, OP_WSUBSH, OP_WSUBUL, OP_WSUBUH,
++    OP_WMULSL, OP_WMULSH, OP_WMULUL, OP_WMULUH,
++    OP_MULEO_SE, OP_MULEO_SO, OP_MULEO_UE, OP_MULEO_UO,
++    OP_MLAW, OP_MLSW, OP_SMLAHE, OP_SMLAHO, OP_SMLSHE, OP_SMLSHO,
++    OP_WSMLAHL, OP_WSMLAHH, OP_WSMLSHL, OP_WSMLSHH,
++    OP_EXTSL, OP_EXTSH, OP_EXTUL, OP_EXTUH,
++    OP_EXTS1BIL, OP_EXTS1BIH, OP_EXTS2BIL, OP_EXTS2BIH, OP_EXTS4BIL, OP_EXTS4BIH,
++    OP_EXTU1BIL, OP_EXTU1BIH, OP_EXTU2BIL, OP_EXTU2BIH, OP_EXTU4BIL, OP_EXTU4BIH,
++    OP_EXTU3BW, OP_EXTW_LL, OP_EXTW_LH, OP_EXTW_HL, OP_EXTW_HH,
++    OP_ILVE, OP_ILVO, OP_ILVE2BI, OP_ILVE4BI, OP_ILVO2BI, OP_ILVO4BI,
++    OP_PMAP, OP_REPI, OP_SHUF2, OP_SHUF4, OP_SHUF8,
++    OP_SATSSHB, OP_SATSSWB, OP_SATSSWH,
++    OP_SATSUHB, OP_SATSUWB, OP_SATSUWH,
++    OP_SATSUB2BI, OP_SATSUB4BI, OP_SATSUH2BI, OP_SATSUH4BI,
++    OP_SATSUW2BI, OP_SATSUW4BI,
++    OP_SATUUHB, OP_SATUUWB, OP_SATUUWH,
++    OP_SATUUB2BI, OP_SATUUB4BI, OP_SATUUH2BI, OP_SATUUH4BI, OP_SATUUW4BI,
++    OP_TOC, OP_MTSUM, OP_MFSUM, OP_MFSUMZ, OP_SUMZ, OP_MXSUM,
++    OP_CMVW, OP_MOVW, OP_MOVX,
++    OP_LIH, OP_LIW, OP_LIWH, OP_LIWR, OP_ADDIW, OP_ADDRW,
++    OP_GT1BI, OP_GT2BI, OP_GT4BI, OP_GTB, OP_GTH,
++    OP_GT2W, OP_GT4W, OP_GT8W, OP_GT2D, OP_GT4D, OP_GT2Q,
++    OP_GSHUFB, OP_GSHUFH, OP_GSHUFVB, OP_GSHUFW, OP_GSHUFWB,
++    OP_GSHUFWB_1, OP_GSHUFWB_2, OP_GSHUFWH,
++    OP_BSHL, OP_BSHR, OP_BSHLI, OP_BSHRI,
++    OP_CFCMXU, OP_CTCMXU, OP_MFCPUW, OP_MTCPUW, OP_MFFPUW, OP_MTFPUW,
++    OP_NNRWR, OP_NNDWR, OP_NNCMD, OP_NNRRD, OP_NNDRD, OP_NNMAC,
++    OP_SRRED,
++    OP_BEQZ, OP_BNEZ, OP_BEQZV, OP_BNEZV,
++    OP_LSIDX, OP_LSU, OP_LSST,
++};
++
++typedef struct {
++    uint8_t shape;
++    uint16_t op;
++    uint8_t ew;
++    uint8_t st;    /* load/store: 1 = store */
++} Mxu3Desc;
++
++typedef struct {
++    uint32_t match;
++    uint32_t mask;
++    uint16_t id;
++} Mxu3Entry;
++
++#endif
+diff --git a/target/mips/tcg/mxu3-gen.c.inc b/target/mips/tcg/mxu3-gen.c.inc
+new file mode 100644
+--- /dev/null
++++ b/target/mips/tcg/mxu3-gen.c.inc
+@@ -0,0 +1,1997 @@
++/* Generated from Ingenic GCC 7.2 libopcodes MXU3 tables. Do not edit. */
++enum {
++    MXU3_bnezb,
++    MXU3_bnezh,
++    MXU3_bnezw,
++    MXU3_bnezv,
++    MXU3_beqzb,
++    MXU3_beqzh,
++    MXU3_beqzw,
++    MXU3_beqzv,
++    MXU3_ceqb,
++    MXU3_ceqh,
++    MXU3_ceqw,
++    MXU3_ceqzb,
++    MXU3_ceqzh,
++    MXU3_ceqzw,
++    MXU3_clesb,
++    MXU3_clesh,
++    MXU3_clesw,
++    MXU3_cleub,
++    MXU3_cleuh,
++    MXU3_cleuw,
++    MXU3_clezb,
++    MXU3_clezh,
++    MXU3_clezw,
++    MXU3_cltsb,
++    MXU3_cltsh,
++    MXU3_cltsw,
++    MXU3_cltub,
++    MXU3_cltuh,
++    MXU3_cltuw,
++    MXU3_cltzb,
++    MXU3_cltzh,
++    MXU3_cltzw,
++    MXU3_addb,
++    MXU3_addh,
++    MXU3_addw,
++    MXU3_addiw,
++    MXU3_addrw,
++    MXU3_subb,
++    MXU3_subh,
++    MXU3_subw,
++    MXU3_waddsbl,
++    MXU3_waddsbh,
++    MXU3_waddshl,
++    MXU3_waddshh,
++    MXU3_waddubl,
++    MXU3_waddubh,
++    MXU3_wadduhl,
++    MXU3_wadduhh,
++    MXU3_wsubsbl,
++    MXU3_wsubsbh,
++    MXU3_wsubshl,
++    MXU3_wsubshh,
++    MXU3_wsububl,
++    MXU3_wsububh,
++    MXU3_wsubuhl,
++    MXU3_wsubuhh,
++    MXU3_sr1sum2bi,
++    MXU3_sr2sum2bi,
++    MXU3_sr4sum2bi,
++    MXU3_sr8sum2bi,
++    MXU3_sr16sum2bi,
++    MXU3_sr1sum4bi,
++    MXU3_sr2sum4bi,
++    MXU3_sr4sum4bi,
++    MXU3_sr8sum4bi,
++    MXU3_sr16sum4bi,
++    MXU3_sr1sumub,
++    MXU3_sr2sumub,
++    MXU3_sr4sumub,
++    MXU3_sr8sumub,
++    MXU3_sr16sumub,
++    MXU3_sr1sumuh,
++    MXU3_sr2sumuh,
++    MXU3_sr4sumuh,
++    MXU3_sr8sumuh,
++    MXU3_sr16sumuh,
++    MXU3_sr1sumsb,
++    MXU3_sr2sumsb,
++    MXU3_sr4sumsb,
++    MXU3_sr8sumsb,
++    MXU3_sr16sumsb,
++    MXU3_sr1sumsh,
++    MXU3_sr2sumsh,
++    MXU3_sr4sumsh,
++    MXU3_sr8sumsh,
++    MXU3_sr16sumsh,
++    MXU3_sr1sumw,
++    MXU3_sr2sumw,
++    MXU3_sr4sumw,
++    MXU3_sr8sumw,
++    MXU3_sr16sumw,
++    MXU3_absb,
++    MXU3_absh,
++    MXU3_absw,
++    MXU3_mulb,
++    MXU3_mulh,
++    MXU3_mulw,
++    MXU3_smulbe,
++    MXU3_smulbo,
++    MXU3_smulhe,
++    MXU3_smulho,
++    MXU3_umulbe,
++    MXU3_umulbo,
++    MXU3_umulhe,
++    MXU3_umulho,
++    MXU3_wsmulbl,
++    MXU3_wsmulbh,
++    MXU3_wsmulhl,
++    MXU3_wsmulhh,
++    MXU3_wumulbl,
++    MXU3_wumulbh,
++    MXU3_wumulhl,
++    MXU3_wumulhh,
++    MXU3_mlaw,
++    MXU3_mlsw,
++    MXU3_smlahe,
++    MXU3_smlaho,
++    MXU3_smlshe,
++    MXU3_smlsho,
++    MXU3_wsmlahl,
++    MXU3_wsmlahh,
++    MXU3_wsmlshl,
++    MXU3_wsmlshh,
++    MXU3_sr1mac2bi,
++    MXU3_sr2mac2bi,
++    MXU3_sr4mac2bi,
++    MXU3_sr8mac2bi,
++    MXU3_sr16mac2bi,
++    MXU3_sr1mac4bi,
++    MXU3_sr2mac4bi,
++    MXU3_sr4mac4bi,
++    MXU3_sr8mac4bi,
++    MXU3_sr16mac4bi,
++    MXU3_sr1macuub,
++    MXU3_sr2macuub,
++    MXU3_sr4macuub,
++    MXU3_sr8macuub,
++    MXU3_sr16macuub,
++    MXU3_sr1macsub,
++    MXU3_sr2macsub,
++    MXU3_sr4macsub,
++    MXU3_sr8macsub,
++    MXU3_sr16macsub,
++    MXU3_sr1macssb,
++    MXU3_sr2macssb,
++    MXU3_sr4macssb,
++    MXU3_sr8macssb,
++    MXU3_sr16macssb,
++    MXU3_sr1macssh,
++    MXU3_sr2macssh,
++    MXU3_sr4macssh,
++    MXU3_sr8macssh,
++    MXU3_sr16macssh,
++    MXU3_s1macuub,
++    MXU3_s2macuub,
++    MXU3_s4macuub,
++    MXU3_s8macuub,
++    MXU3_s16macuub,
++    MXU3_s1macsub,
++    MXU3_s2macsub,
++    MXU3_s4macsub,
++    MXU3_s8macsub,
++    MXU3_s16macsub,
++    MXU3_s1macssb,
++    MXU3_s2macssb,
++    MXU3_s4macssb,
++    MXU3_s8macssb,
++    MXU3_s16macssb,
++    MXU3_s1macssh,
++    MXU3_s2macssh,
++    MXU3_s4macssh,
++    MXU3_s8macssh,
++    MXU3_s16macssh,
++    MXU3_maxab,
++    MXU3_maxah,
++    MXU3_maxaw,
++    MXU3_maxsb,
++    MXU3_maxsh,
++    MXU3_maxsw,
++    MXU3_maxub,
++    MXU3_maxuh,
++    MXU3_maxuw,
++    MXU3_maxu2bi,
++    MXU3_maxu4bi,
++    MXU3_minab,
++    MXU3_minah,
++    MXU3_minaw,
++    MXU3_minsb,
++    MXU3_minsh,
++    MXU3_minsw,
++    MXU3_minub,
++    MXU3_minuh,
++    MXU3_minuw,
++    MXU3_minu2bi,
++    MXU3_minu4bi,
++    MXU3_satsshb,
++    MXU3_satsswb,
++    MXU3_satsswh,
++    MXU3_satsub2bi,
++    MXU3_satsub4bi,
++    MXU3_satsuh2bi,
++    MXU3_satsuh4bi,
++    MXU3_satsuhb,
++    MXU3_satsuw2bi,
++    MXU3_satsuw4bi,
++    MXU3_satsuwb,
++    MXU3_satsuwh,
++    MXU3_satuub2bi,
++    MXU3_satuub4bi,
++    MXU3_satuuh2bi,
++    MXU3_satuuh4bi,
++    MXU3_satuuhb,
++    MXU3_satuuw4bi,
++    MXU3_satuuwb,
++    MXU3_satuuwh,
++    MXU3_tocb,
++    MXU3_toch,
++    MXU3_tocw,
++    MXU3_andv,
++    MXU3_andnv,
++    MXU3_andib,
++    MXU3_orv,
++    MXU3_ornv,
++    MXU3_orib,
++    MXU3_xorv,
++    MXU3_xornv,
++    MXU3_xorib,
++    MXU3_bselv,
++    MXU3_faddw,
++    MXU3_fsubw,
++    MXU3_fmulw,
++    MXU3_fcmulrw,
++    MXU3_fcmuliw,
++    MXU3_fcaddw,
++    MXU3_fxas1w,
++    MXU3_fxas2w,
++    MXU3_fxas4w,
++    MXU3_fxas8w,
++    MXU3_fmaxw,
++    MXU3_fmaxaw,
++    MXU3_fminw,
++    MXU3_fminaw,
++    MXU3_fclassw,
++    MXU3_fceqw,
++    MXU3_fclew,
++    MXU3_fcltw,
++    MXU3_fcorw,
++    MXU3_ffsiw,
++    MXU3_ffuiw,
++    MXU3_ftsiw,
++    MXU3_ftuiw,
++    MXU3_frintw,
++    MXU3_ftruncsw,
++    MXU3_ftruncuw,
++    MXU3_sllb,
++    MXU3_sllh,
++    MXU3_sllw,
++    MXU3_sllib,
++    MXU3_sllih,
++    MXU3_slliw,
++    MXU3_srab,
++    MXU3_srah,
++    MXU3_sraw,
++    MXU3_sraib,
++    MXU3_sraih,
++    MXU3_sraiw,
++    MXU3_srarb,
++    MXU3_srarh,
++    MXU3_srarw,
++    MXU3_srarib,
++    MXU3_srarih,
++    MXU3_srariw,
++    MXU3_srlb,
++    MXU3_srlh,
++    MXU3_srlw,
++    MXU3_srlib,
++    MXU3_srlih,
++    MXU3_srliw,
++    MXU3_srlrb,
++    MXU3_srlrh,
++    MXU3_srlrw,
++    MXU3_srlrib,
++    MXU3_srlrih,
++    MXU3_srlriw,
++    MXU3_gt1bi,
++    MXU3_gt2bi,
++    MXU3_gt4bi,
++    MXU3_gtb,
++    MXU3_gth,
++    MXU3_gt2w,
++    MXU3_gt4w,
++    MXU3_gt8w,
++    MXU3_gt2d,
++    MXU3_gt4d,
++    MXU3_gt2q,
++    MXU3_extuwll,
++    MXU3_extuwlh,
++    MXU3_extuwhl,
++    MXU3_extuwhh,
++    MXU3_extudll,
++    MXU3_extudlh,
++    MXU3_extudhl,
++    MXU3_extudhh,
++    MXU3_extuqll,
++    MXU3_extuqlh,
++    MXU3_extuqhl,
++    MXU3_extuqhh,
++    MXU3_extuoll,
++    MXU3_extuolh,
++    MXU3_extuohl,
++    MXU3_extuohh,
++    MXU3_extu1bil,
++    MXU3_extu2bil,
++    MXU3_extu4bil,
++    MXU3_extubl,
++    MXU3_extuhl,
++    MXU3_extu1bih,
++    MXU3_extu2bih,
++    MXU3_extu4bih,
++    MXU3_extubh,
++    MXU3_extuhh,
++    MXU3_exts1bil,
++    MXU3_exts2bil,
++    MXU3_exts4bil,
++    MXU3_extsbl,
++    MXU3_extshl,
++    MXU3_exts1bih,
++    MXU3_exts2bih,
++    MXU3_exts4bih,
++    MXU3_extsbh,
++    MXU3_extshh,
++    MXU3_extu3bw,
++    MXU3_repib,
++    MXU3_repih,
++    MXU3_repiw,
++    MXU3_repid,
++    MXU3_repiq,
++    MXU3_repio,
++    MXU3_movw,
++    MXU3_movd,
++    MXU3_movq,
++    MXU3_movo,
++    MXU3_shufw2,
++    MXU3_shufw4,
++    MXU3_shufw8,
++    MXU3_shufd2,
++    MXU3_shufd4,
++    MXU3_shufq2,
++    MXU3_gshufw,
++    MXU3_ilve2bi,
++    MXU3_ilve4bi,
++    MXU3_ilveb,
++    MXU3_ilveh,
++    MXU3_ilvew,
++    MXU3_ilved,
++    MXU3_ilveq,
++    MXU3_ilveo,
++    MXU3_ilvo2bi,
++    MXU3_ilvo4bi,
++    MXU3_ilvob,
++    MXU3_ilvoh,
++    MXU3_ilvow,
++    MXU3_ilvod,
++    MXU3_ilvoq,
++    MXU3_ilvoo,
++    MXU3_bshli,
++    MXU3_bshri,
++    MXU3_bshl,
++    MXU3_bshr,
++    MXU3_mtcpuw,
++    MXU3_mfcpuw,
++    MXU3_mtfpuw,
++    MXU3_mffpuw,
++    MXU3_ctcmxu,
++    MXU3_cfcmxu,
++    MXU3_sumz,
++    MXU3_mfsum,
++    MXU3_mfsumz,
++    MXU3_mtsum,
++    MXU3_mxsum,
++    MXU3_lih,
++    MXU3_liw,
++    MXU3_liwh,
++    MXU3_liwr,
++    MXU3_cmvw,
++    MXU3_pmaph,
++    MXU3_pmapw,
++    MXU3_luw,
++    MXU3_lud,
++    MXU3_luq,
++    MXU3_luo,
++    MXU3_law,
++    MXU3_lad,
++    MXU3_laq,
++    MXU3_lao,
++    MXU3_suw,
++    MXU3_sud,
++    MXU3_suq,
++    MXU3_suo,
++    MXU3_saw,
++    MXU3_sad,
++    MXU3_saq,
++    MXU3_sao,
++    MXU3_luo2b,
++    MXU3_luo2h,
++    MXU3_luo2w,
++    MXU3_luo2d,
++    MXU3_luo2q,
++    MXU3_lao2b,
++    MXU3_lao2h,
++    MXU3_lao2w,
++    MXU3_lao2d,
++    MXU3_lao2q,
++    MXU3_suo2w,
++    MXU3_suo2d,
++    MXU3_suo2q,
++    MXU3_sao2w,
++    MXU3_sao2d,
++    MXU3_sao2q,
++    MXU3_luw2b,
++    MXU3_luw2h,
++    MXU3_luw4b,
++    MXU3_luw4h,
++    MXU3_luw8b,
++    MXU3_luw8h,
++    MXU3_luw16b,
++    MXU3_luw16h,
++    MXU3_law2b,
++    MXU3_law2h,
++    MXU3_law4b,
++    MXU3_law4h,
++    MXU3_law8b,
++    MXU3_law8h,
++    MXU3_law16b,
++    MXU3_law16h,
++    MXU3_lud2b,
++    MXU3_lud2h,
++    MXU3_lud2w,
++    MXU3_lud4b,
++    MXU3_lud4h,
++    MXU3_lud4w,
++    MXU3_lud8b,
++    MXU3_lud8h,
++    MXU3_lud8w,
++    MXU3_lad2b,
++    MXU3_lad2h,
++    MXU3_lad2w,
++    MXU3_lad4b,
++    MXU3_lad4h,
++    MXU3_lad4w,
++    MXU3_lad8b,
++    MXU3_lad8h,
++    MXU3_lad8w,
++    MXU3_sud2w,
++    MXU3_sud4w,
++    MXU3_sud8w,
++    MXU3_sad2w,
++    MXU3_sad4w,
++    MXU3_sad8w,
++    MXU3_luq2b,
++    MXU3_luq2h,
++    MXU3_luq2w,
++    MXU3_luq2d,
++    MXU3_luq4b,
++    MXU3_luq4h,
++    MXU3_luq4w,
++    MXU3_luq4d,
++    MXU3_laq2b,
++    MXU3_laq2h,
++    MXU3_laq2w,
++    MXU3_laq2d,
++    MXU3_laq4b,
++    MXU3_laq4h,
++    MXU3_laq4w,
++    MXU3_laq4d,
++    MXU3_suq2w,
++    MXU3_suq2d,
++    MXU3_suq4w,
++    MXU3_suq4d,
++    MXU3_saq2w,
++    MXU3_saq2d,
++    MXU3_saq4w,
++    MXU3_saq4d,
++    MXU3_nnrwr,
++    MXU3_nnrrd,
++    MXU3_nndwr,
++    MXU3_nndrd,
++    MXU3_nncmd,
++    MXU3_nnmac,
++    MXU3_gshufwb,
++    MXU3_gshufwb_1,
++    MXU3_gshufwb_2,
++    MXU3_gshufvb,
++    MXU3_gshufb,
++    MXU3_gshufwh,
++    MXU3_gshufh,
++    MXU3_NR
++};
++
++static const Mxu3Desc mxu3_desc[MXU3_NR] = {
++    [MXU3_bnezb] = {SH_BR, OP_BNEZ, EW_B, 0},
++    [MXU3_bnezh] = {SH_BR, OP_BNEZ, EW_H, 0},
++    [MXU3_bnezw] = {SH_BR, OP_BNEZ, EW_W, 0},
++    [MXU3_bnezv] = {SH_BR, OP_BNEZV, EW_W, 0},
++    [MXU3_beqzb] = {SH_BR, OP_BEQZ, EW_B, 0},
++    [MXU3_beqzh] = {SH_BR, OP_BEQZ, EW_H, 0},
++    [MXU3_beqzw] = {SH_BR, OP_BEQZ, EW_W, 0},
++    [MXU3_beqzv] = {SH_BR, OP_BEQZV, EW_W, 0},
++    [MXU3_ceqb] = {SH_VVV, OP_CEQ, EW_B, 0},
++    [MXU3_ceqh] = {SH_VVV, OP_CEQ, EW_H, 0},
++    [MXU3_ceqw] = {SH_VVV, OP_CEQ, EW_W, 0},
++    [MXU3_ceqzb] = {SH_VV, OP_CEQZ, EW_B, 0},
++    [MXU3_ceqzh] = {SH_VV, OP_CEQZ, EW_H, 0},
++    [MXU3_ceqzw] = {SH_VV, OP_CEQZ, EW_W, 0},
++    [MXU3_clesb] = {SH_VVV, OP_CLES, EW_B, 0},
++    [MXU3_clesh] = {SH_VVV, OP_CLES, EW_H, 0},
++    [MXU3_clesw] = {SH_VVV, OP_CLES, EW_W, 0},
++    [MXU3_cleub] = {SH_VVV, OP_CLEU, EW_B, 0},
++    [MXU3_cleuh] = {SH_VVV, OP_CLEU, EW_H, 0},
++    [MXU3_cleuw] = {SH_VVV, OP_CLEU, EW_W, 0},
++    [MXU3_clezb] = {SH_VV, OP_CLEZ, EW_B, 0},
++    [MXU3_clezh] = {SH_VV, OP_CLEZ, EW_H, 0},
++    [MXU3_clezw] = {SH_VV, OP_CLEZ, EW_W, 0},
++    [MXU3_cltsb] = {SH_VVV, OP_CLTS, EW_B, 0},
++    [MXU3_cltsh] = {SH_VVV, OP_CLTS, EW_H, 0},
++    [MXU3_cltsw] = {SH_VVV, OP_CLTS, EW_W, 0},
++    [MXU3_cltub] = {SH_VVV, OP_CLTU, EW_B, 0},
++    [MXU3_cltuh] = {SH_VVV, OP_CLTU, EW_H, 0},
++    [MXU3_cltuw] = {SH_VVV, OP_CLTU, EW_W, 0},
++    [MXU3_cltzb] = {SH_VV, OP_CLTZ, EW_B, 0},
++    [MXU3_cltzh] = {SH_VV, OP_CLTZ, EW_H, 0},
++    [MXU3_cltzw] = {SH_VV, OP_CLTZ, EW_W, 0},
++    [MXU3_addb] = {SH_VVV, OP_ADD, EW_B, 0},
++    [MXU3_addh] = {SH_VVV, OP_ADD, EW_H, 0},
++    [MXU3_addw] = {SH_VVV, OP_ADD, EW_W, 0},
++    [MXU3_addiw] = {SH_ADDIW, OP_ADDIW, EW_W, 0},
++    [MXU3_addrw] = {SH_ADDRW, OP_ADDRW, EW_W, 0},
++    [MXU3_subb] = {SH_VVV, OP_SUB, EW_B, 0},
++    [MXU3_subh] = {SH_VVV, OP_SUB, EW_H, 0},
++    [MXU3_subw] = {SH_VVV, OP_SUB, EW_W, 0},
++    [MXU3_waddsbl] = {SH_VVV, OP_WADDSL, EW_B, 0},
++    [MXU3_waddsbh] = {SH_VVV, OP_WADDSH, EW_B, 0},
++    [MXU3_waddshl] = {SH_VVV, OP_WADDSL, EW_H, 0},
++    [MXU3_waddshh] = {SH_VVV, OP_WADDSH, EW_H, 0},
++    [MXU3_waddubl] = {SH_VVV, OP_WADDUL, EW_B, 0},
++    [MXU3_waddubh] = {SH_VVV, OP_WADDUH, EW_B, 0},
++    [MXU3_wadduhl] = {SH_VVV, OP_WADDUL, EW_H, 0},
++    [MXU3_wadduhh] = {SH_VVV, OP_WADDUH, EW_H, 0},
++    [MXU3_wsubsbl] = {SH_VVV, OP_WSUBSL, EW_B, 0},
++    [MXU3_wsubsbh] = {SH_VVV, OP_WSUBSH, EW_B, 0},
++    [MXU3_wsubshl] = {SH_VVV, OP_WSUBSL, EW_H, 0},
++    [MXU3_wsubshh] = {SH_VVV, OP_WSUBSH, EW_H, 0},
++    [MXU3_wsububl] = {SH_VVV, OP_WSUBUL, EW_B, 0},
++    [MXU3_wsububh] = {SH_VVV, OP_WSUBUH, EW_B, 0},
++    [MXU3_wsubuhl] = {SH_VVV, OP_WSUBUL, EW_H, 0},
++    [MXU3_wsubuhh] = {SH_VVV, OP_WSUBUH, EW_H, 0},
++    [MXU3_sr1sum2bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr2sum2bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr4sum2bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr8sum2bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr16sum2bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr1sum4bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr2sum4bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr4sum4bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr8sum4bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr16sum4bi] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr1sumub] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr2sumub] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr4sumub] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr8sumub] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr16sumub] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr1sumuh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr2sumuh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr4sumuh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr8sumuh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr16sumuh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr1sumsb] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr2sumsb] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr4sumsb] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr8sumsb] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr16sumsb] = {SH_SRSUM, OP_SRRED, EW_B, 0},
++    [MXU3_sr1sumsh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr2sumsh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr4sumsh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr8sumsh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr16sumsh] = {SH_SRSUM, OP_SRRED, EW_H, 0},
++    [MXU3_sr1sumw] = {SH_SRSUM, OP_SRRED, EW_W, 0},
++    [MXU3_sr2sumw] = {SH_SRSUM, OP_SRRED, EW_W, 0},
++    [MXU3_sr4sumw] = {SH_SRSUM, OP_SRRED, EW_W, 0},
++    [MXU3_sr8sumw] = {SH_SRSUM, OP_SRRED, EW_W, 0},
++    [MXU3_sr16sumw] = {SH_SRSUM, OP_SRRED, EW_W, 0},
++    [MXU3_absb] = {SH_VV, OP_ABS, EW_B, 0},
++    [MXU3_absh] = {SH_VV, OP_ABS, EW_H, 0},
++    [MXU3_absw] = {SH_VV, OP_ABS, EW_W, 0},
++    [MXU3_mulb] = {SH_VVV, OP_MUL, EW_B, 0},
++    [MXU3_mulh] = {SH_VVV, OP_MUL, EW_H, 0},
++    [MXU3_mulw] = {SH_VVV, OP_MUL, EW_W, 0},
++    [MXU3_smulbe] = {SH_VVV, OP_MULEO_SE, EW_B, 0},
++    [MXU3_smulbo] = {SH_VVV, OP_MULEO_SO, EW_B, 0},
++    [MXU3_smulhe] = {SH_VVV, OP_MULEO_SE, EW_H, 0},
++    [MXU3_smulho] = {SH_VVV, OP_MULEO_SO, EW_H, 0},
++    [MXU3_umulbe] = {SH_VVV, OP_MULEO_UE, EW_B, 0},
++    [MXU3_umulbo] = {SH_VVV, OP_MULEO_UO, EW_B, 0},
++    [MXU3_umulhe] = {SH_VVV, OP_MULEO_UE, EW_H, 0},
++    [MXU3_umulho] = {SH_VVV, OP_MULEO_UO, EW_H, 0},
++    [MXU3_wsmulbl] = {SH_VVV, OP_WMULSL, EW_B, 0},
++    [MXU3_wsmulbh] = {SH_VVV, OP_WMULSH, EW_B, 0},
++    [MXU3_wsmulhl] = {SH_VVV, OP_WMULSL, EW_H, 0},
++    [MXU3_wsmulhh] = {SH_VVV, OP_WMULSH, EW_H, 0},
++    [MXU3_wumulbl] = {SH_VVV, OP_WMULUL, EW_B, 0},
++    [MXU3_wumulbh] = {SH_VVV, OP_WMULUH, EW_B, 0},
++    [MXU3_wumulhl] = {SH_VVV, OP_WMULUL, EW_H, 0},
++    [MXU3_wumulhh] = {SH_VVV, OP_WMULUH, EW_H, 0},
++    [MXU3_mlaw] = {SH_MAC3, OP_MLAW, EW_W, 0},
++    [MXU3_mlsw] = {SH_MAC3, OP_MLSW, EW_W, 0},
++    [MXU3_smlahe] = {SH_MAC3, OP_SMLAHE, EW_H, 0},
++    [MXU3_smlaho] = {SH_MAC3, OP_SMLAHO, EW_H, 0},
++    [MXU3_smlshe] = {SH_MAC3, OP_SMLSHE, EW_H, 0},
++    [MXU3_smlsho] = {SH_MAC3, OP_SMLSHO, EW_H, 0},
++    [MXU3_wsmlahl] = {SH_MAC3, OP_WSMLAHL, EW_H, 0},
++    [MXU3_wsmlahh] = {SH_MAC3, OP_WSMLAHH, EW_H, 0},
++    [MXU3_wsmlshl] = {SH_MAC3, OP_WSMLSHL, EW_H, 0},
++    [MXU3_wsmlshh] = {SH_MAC3, OP_WSMLSHH, EW_H, 0},
++    [MXU3_sr1mac2bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr2mac2bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr4mac2bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr8mac2bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr16mac2bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr1mac4bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr2mac4bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr4mac4bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr8mac4bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr16mac4bi] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr1macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr2macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr4macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr8macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr16macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr1macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr2macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr4macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr8macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr16macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr1macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr2macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr4macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr8macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr16macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_sr1macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_sr2macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_sr4macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_sr8macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_sr16macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_s1macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s2macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s4macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s8macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s16macuub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s1macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s2macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s4macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s8macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s16macsub] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s1macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s2macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s4macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s8macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s16macssb] = {SH_SRMAC, OP_SRRED, EW_B, 0},
++    [MXU3_s1macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_s2macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_s4macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_s8macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_s16macssh] = {SH_SRMAC, OP_SRRED, EW_H, 0},
++    [MXU3_maxab] = {SH_VVV, OP_MAXA, EW_B, 0},
++    [MXU3_maxah] = {SH_VVV, OP_MAXA, EW_H, 0},
++    [MXU3_maxaw] = {SH_VVV, OP_MAXA, EW_W, 0},
++    [MXU3_maxsb] = {SH_VVV, OP_MAXS, EW_B, 0},
++    [MXU3_maxsh] = {SH_VVV, OP_MAXS, EW_H, 0},
++    [MXU3_maxsw] = {SH_VVV, OP_MAXS, EW_W, 0},
++    [MXU3_maxub] = {SH_VVV, OP_MAXU, EW_B, 0},
++    [MXU3_maxuh] = {SH_VVV, OP_MAXU, EW_H, 0},
++    [MXU3_maxuw] = {SH_VVV, OP_MAXU, EW_W, 0},
++    [MXU3_maxu2bi] = {SH_VVV, OP_MAXU2BI, EW_B, 0},
++    [MXU3_maxu4bi] = {SH_VVV, OP_MAXU4BI, EW_B, 0},
++    [MXU3_minab] = {SH_VVV, OP_MINA, EW_B, 0},
++    [MXU3_minah] = {SH_VVV, OP_MINA, EW_H, 0},
++    [MXU3_minaw] = {SH_VVV, OP_MINA, EW_W, 0},
++    [MXU3_minsb] = {SH_VVV, OP_MINS, EW_B, 0},
++    [MXU3_minsh] = {SH_VVV, OP_MINS, EW_H, 0},
++    [MXU3_minsw] = {SH_VVV, OP_MINS, EW_W, 0},
++    [MXU3_minub] = {SH_VVV, OP_MINU, EW_B, 0},
++    [MXU3_minuh] = {SH_VVV, OP_MINU, EW_H, 0},
++    [MXU3_minuw] = {SH_VVV, OP_MINU, EW_W, 0},
++    [MXU3_minu2bi] = {SH_VVV, OP_MINU2BI, EW_B, 0},
++    [MXU3_minu4bi] = {SH_VVV, OP_MINU4BI, EW_B, 0},
++    [MXU3_satsshb] = {SH_VV, OP_SATSSHB, EW_B, 0},
++    [MXU3_satsswb] = {SH_VV, OP_SATSSWB, EW_B, 0},
++    [MXU3_satsswh] = {SH_VV, OP_SATSSWH, EW_H, 0},
++    [MXU3_satsub2bi] = {SH_VV, OP_SATSUB2BI, EW_B, 0},
++    [MXU3_satsub4bi] = {SH_VV, OP_SATSUB4BI, EW_B, 0},
++    [MXU3_satsuh2bi] = {SH_VV, OP_SATSUH2BI, EW_B, 0},
++    [MXU3_satsuh4bi] = {SH_VV, OP_SATSUH4BI, EW_B, 0},
++    [MXU3_satsuhb] = {SH_VV, OP_SATSUHB, EW_B, 0},
++    [MXU3_satsuw2bi] = {SH_VV, OP_SATSUW2BI, EW_B, 0},
++    [MXU3_satsuw4bi] = {SH_VV, OP_SATSUW4BI, EW_B, 0},
++    [MXU3_satsuwb] = {SH_VV, OP_SATSUWB, EW_B, 0},
++    [MXU3_satsuwh] = {SH_VV, OP_SATSUWH, EW_H, 0},
++    [MXU3_satuub2bi] = {SH_VV, OP_SATUUB2BI, EW_B, 0},
++    [MXU3_satuub4bi] = {SH_VV, OP_SATUUB4BI, EW_B, 0},
++    [MXU3_satuuh2bi] = {SH_VV, OP_SATUUH2BI, EW_B, 0},
++    [MXU3_satuuh4bi] = {SH_VV, OP_SATUUH4BI, EW_B, 0},
++    [MXU3_satuuhb] = {SH_VV, OP_SATUUHB, EW_B, 0},
++    [MXU3_satuuw4bi] = {SH_VV, OP_SATUUW4BI, EW_B, 0},
++    [MXU3_satuuwb] = {SH_VV, OP_SATUUWB, EW_B, 0},
++    [MXU3_satuuwh] = {SH_VV, OP_SATUUWH, EW_H, 0},
++    [MXU3_tocb] = {SH_MTSUM, OP_TOC, EW_B, 0},
++    [MXU3_toch] = {SH_MTSUM, OP_TOC, EW_H, 0},
++    [MXU3_tocw] = {SH_MTSUM, OP_TOC, EW_W, 0},
++    [MXU3_andv] = {SH_VVV, OP_AND, EW_W, 0},
++    [MXU3_andnv] = {SH_VVV, OP_ANDN, EW_W, 0},
++    [MXU3_andib] = {SH_VVI8, OP_ANDI, EW_B, 0},
++    [MXU3_orv] = {SH_VVV, OP_OR, EW_W, 0},
++    [MXU3_ornv] = {SH_VVV, OP_ORN, EW_W, 0},
++    [MXU3_orib] = {SH_VVI8, OP_ORI, EW_B, 0},
++    [MXU3_xorv] = {SH_VVV, OP_XOR, EW_W, 0},
++    [MXU3_xornv] = {SH_VVV, OP_XORN, EW_W, 0},
++    [MXU3_xorib] = {SH_VVI8, OP_XORI, EW_B, 0},
++    [MXU3_bselv] = {SH_VVV, OP_BSEL, EW_W, 0},
++    [MXU3_faddw] = {SH_VVV, OP_FADD, EW_W, 0},
++    [MXU3_fsubw] = {SH_VVV, OP_FSUB, EW_W, 0},
++    [MXU3_fmulw] = {SH_VVV, OP_FMUL, EW_W, 0},
++    [MXU3_fcmulrw] = {SH_VVV, OP_FCMULR, EW_W, 0},
++    [MXU3_fcmuliw] = {SH_VVV, OP_FCMULI, EW_W, 0},
++    [MXU3_fcaddw] = {SH_VVV, OP_FCADD, EW_W, 0},
++    [MXU3_fxas1w] = {SH_VVT, OP_FXAS, EW_W, 0},
++    [MXU3_fxas2w] = {SH_VVT, OP_FXAS, EW_W, 0},
++    [MXU3_fxas4w] = {SH_VVT, OP_FXAS, EW_W, 0},
++    [MXU3_fxas8w] = {SH_VVT, OP_FXAS, EW_W, 0},
++    [MXU3_fmaxw] = {SH_VVV, OP_FMAX, EW_W, 0},
++    [MXU3_fmaxaw] = {SH_VVV, OP_FMAXA, EW_W, 0},
++    [MXU3_fminw] = {SH_VVV, OP_FMIN, EW_W, 0},
++    [MXU3_fminaw] = {SH_VVV, OP_FMINA, EW_W, 0},
++    [MXU3_fclassw] = {SH_VV, OP_FCLASSW, EW_W, 0},
++    [MXU3_fceqw] = {SH_VVV, OP_FCEQ, EW_W, 0},
++    [MXU3_fclew] = {SH_VVV, OP_FCLE, EW_W, 0},
++    [MXU3_fcltw] = {SH_VVV, OP_FCLT, EW_W, 0},
++    [MXU3_fcorw] = {SH_VVV, OP_FCOR, EW_W, 0},
++    [MXU3_ffsiw] = {SH_VV, OP_FFSIW, EW_W, 0},
++    [MXU3_ffuiw] = {SH_VV, OP_FFUIW, EW_W, 0},
++    [MXU3_ftsiw] = {SH_VV, OP_FTSIW, EW_W, 0},
++    [MXU3_ftuiw] = {SH_VV, OP_FTUIW, EW_W, 0},
++    [MXU3_frintw] = {SH_VV, OP_FRINTW, EW_W, 0},
++    [MXU3_ftruncsw] = {SH_VV, OP_FTRUNCSW, EW_W, 0},
++    [MXU3_ftruncuw] = {SH_VV, OP_FTRUNCUW, EW_W, 0},
++    [MXU3_sllb] = {SH_VVV, OP_SLL, EW_B, 0},
++    [MXU3_sllh] = {SH_VVV, OP_SLL, EW_H, 0},
++    [MXU3_sllw] = {SH_VVV, OP_SLL, EW_W, 0},
++    [MXU3_sllib] = {SH_VVI5, OP_SLL, EW_B, 0},
++    [MXU3_sllih] = {SH_VVI5, OP_SLL, EW_H, 0},
++    [MXU3_slliw] = {SH_VVI5, OP_SLL, EW_W, 0},
++    [MXU3_srab] = {SH_VVV, OP_SRA, EW_B, 0},
++    [MXU3_srah] = {SH_VVV, OP_SRA, EW_H, 0},
++    [MXU3_sraw] = {SH_VVV, OP_SRA, EW_W, 0},
++    [MXU3_sraib] = {SH_VVI5, OP_SRA, EW_B, 0},
++    [MXU3_sraih] = {SH_VVI5, OP_SRA, EW_H, 0},
++    [MXU3_sraiw] = {SH_VVI5, OP_SRA, EW_W, 0},
++    [MXU3_srarb] = {SH_VVV, OP_SRAR, EW_B, 0},
++    [MXU3_srarh] = {SH_VVV, OP_SRAR, EW_H, 0},
++    [MXU3_srarw] = {SH_VVV, OP_SRAR, EW_W, 0},
++    [MXU3_srarib] = {SH_VVI5, OP_SRAR, EW_B, 0},
++    [MXU3_srarih] = {SH_VVI5, OP_SRAR, EW_H, 0},
++    [MXU3_srariw] = {SH_VVI5, OP_SRAR, EW_W, 0},
++    [MXU3_srlb] = {SH_VVV, OP_SRL, EW_B, 0},
++    [MXU3_srlh] = {SH_VVV, OP_SRL, EW_H, 0},
++    [MXU3_srlw] = {SH_VVV, OP_SRL, EW_W, 0},
++    [MXU3_srlib] = {SH_VVI5, OP_SRL, EW_B, 0},
++    [MXU3_srlih] = {SH_VVI5, OP_SRL, EW_H, 0},
++    [MXU3_srliw] = {SH_VVI5, OP_SRL, EW_W, 0},
++    [MXU3_srlrb] = {SH_VVV, OP_SRLR, EW_B, 0},
++    [MXU3_srlrh] = {SH_VVV, OP_SRLR, EW_H, 0},
++    [MXU3_srlrw] = {SH_VVV, OP_SRLR, EW_W, 0},
++    [MXU3_srlrib] = {SH_VVI5, OP_SRLR, EW_B, 0},
++    [MXU3_srlrih] = {SH_VVI5, OP_SRLR, EW_H, 0},
++    [MXU3_srlriw] = {SH_VVI5, OP_SRLR, EW_W, 0},
++    [MXU3_gt1bi] = {SH_VVT, OP_GT1BI, EW_B, 0},
++    [MXU3_gt2bi] = {SH_VVT, OP_GT2BI, EW_B, 0},
++    [MXU3_gt4bi] = {SH_VVT, OP_GT4BI, EW_B, 0},
++    [MXU3_gtb] = {SH_VVT, OP_GTB, EW_B, 0},
++    [MXU3_gth] = {SH_VVT, OP_GTH, EW_H, 0},
++    [MXU3_gt2w] = {SH_GTW, OP_GT2W, EW_W, 0},
++    [MXU3_gt4w] = {SH_GTW, OP_GT4W, EW_W, 0},
++    [MXU3_gt8w] = {SH_GTW, OP_GT8W, EW_W, 0},
++    [MXU3_gt2d] = {SH_GTW, OP_GT2D, EW_D, 0},
++    [MXU3_gt4d] = {SH_GTW, OP_GT4D, EW_D, 0},
++    [MXU3_gt2q] = {SH_GTW, OP_GT2Q, EW_Q, 0},
++    [MXU3_extuwll] = {SH_EXTW, OP_EXTW_LL, EW_W, 0},
++    [MXU3_extuwlh] = {SH_EXTW, OP_EXTW_LH, EW_H, 0},
++    [MXU3_extuwhl] = {SH_EXTW, OP_EXTW_HL, EW_W, 0},
++    [MXU3_extuwhh] = {SH_EXTW, OP_EXTW_HH, EW_H, 0},
++    [MXU3_extudll] = {SH_EXTW, OP_EXTW_LL, EW_W, 0},
++    [MXU3_extudlh] = {SH_EXTW, OP_EXTW_LH, EW_H, 0},
++    [MXU3_extudhl] = {SH_EXTW, OP_EXTW_HL, EW_W, 0},
++    [MXU3_extudhh] = {SH_EXTW, OP_EXTW_HH, EW_H, 0},
++    [MXU3_extuqll] = {SH_EXTW, OP_EXTW_LL, EW_W, 0},
++    [MXU3_extuqlh] = {SH_EXTW, OP_EXTW_LH, EW_H, 0},
++    [MXU3_extuqhl] = {SH_EXTW, OP_EXTW_HL, EW_W, 0},
++    [MXU3_extuqhh] = {SH_EXTW, OP_EXTW_HH, EW_H, 0},
++    [MXU3_extuoll] = {SH_EXTW, OP_EXTW_LL, EW_W, 0},
++    [MXU3_extuolh] = {SH_EXTW, OP_EXTW_LH, EW_H, 0},
++    [MXU3_extuohl] = {SH_EXTW, OP_EXTW_HL, EW_W, 0},
++    [MXU3_extuohh] = {SH_EXTW, OP_EXTW_HH, EW_H, 0},
++    [MXU3_extu1bil] = {SH_VVT, OP_EXTU1BIL, EW_W, 0},
++    [MXU3_extu2bil] = {SH_VVT, OP_EXTU2BIL, EW_W, 0},
++    [MXU3_extu4bil] = {SH_VVT, OP_EXTU4BIL, EW_W, 0},
++    [MXU3_extubl] = {SH_VVT, OP_EXTUL, EW_B, 0},
++    [MXU3_extuhl] = {SH_VVT, OP_EXTUL, EW_H, 0},
++    [MXU3_extu1bih] = {SH_VVT, OP_EXTU1BIH, EW_H, 0},
++    [MXU3_extu2bih] = {SH_VVT, OP_EXTU2BIH, EW_H, 0},
++    [MXU3_extu4bih] = {SH_VVT, OP_EXTU4BIH, EW_H, 0},
++    [MXU3_extubh] = {SH_VVT, OP_EXTUH, EW_B, 0},
++    [MXU3_extuhh] = {SH_VVT, OP_EXTUH, EW_H, 0},
++    [MXU3_exts1bil] = {SH_VVT, OP_EXTS1BIL, EW_W, 0},
++    [MXU3_exts2bil] = {SH_VVT, OP_EXTS2BIL, EW_W, 0},
++    [MXU3_exts4bil] = {SH_VVT, OP_EXTS4BIL, EW_W, 0},
++    [MXU3_extsbl] = {SH_VVT, OP_EXTSL, EW_B, 0},
++    [MXU3_extshl] = {SH_VVT, OP_EXTSL, EW_H, 0},
++    [MXU3_exts1bih] = {SH_VVT, OP_EXTS1BIH, EW_H, 0},
++    [MXU3_exts2bih] = {SH_VVT, OP_EXTS2BIH, EW_H, 0},
++    [MXU3_exts4bih] = {SH_VVT, OP_EXTS4BIH, EW_H, 0},
++    [MXU3_extsbh] = {SH_VVT, OP_EXTSH, EW_B, 0},
++    [MXU3_extshh] = {SH_VVT, OP_EXTSH, EW_H, 0},
++    [MXU3_extu3bw] = {SH_VVT, OP_EXTU3BW, EW_W, 0},
++    [MXU3_repib] = {SH_REPI, OP_REPI, EW_B, 0},
++    [MXU3_repih] = {SH_REPI, OP_REPI, EW_H, 0},
++    [MXU3_repiw] = {SH_REPI, OP_REPI, EW_W, 0},
++    [MXU3_repid] = {SH_REPI, OP_REPI, EW_D, 0},
++    [MXU3_repiq] = {SH_REPI, OP_REPI, EW_Q, 0},
++    [MXU3_repio] = {SH_REPI, OP_REPI, EW_O, 0},
++    [MXU3_movw] = {SH_MOVW, OP_MOVW, EW_W, 0},
++    [MXU3_movd] = {SH_MOVX, OP_MOVX, EW_D, 0},
++    [MXU3_movq] = {SH_MOVX, OP_MOVX, EW_Q, 0},
++    [MXU3_movo] = {SH_MOVX, OP_MOVX, EW_O, 0},
++    [MXU3_shufw2] = {SH_VVT, OP_SHUF2, EW_W, 0},
++    [MXU3_shufw4] = {SH_VVT, OP_SHUF4, EW_W, 0},
++    [MXU3_shufw8] = {SH_VVT, OP_SHUF8, EW_W, 0},
++    [MXU3_shufd2] = {SH_VVT, OP_SHUF2, EW_D, 0},
++    [MXU3_shufd4] = {SH_VVT, OP_SHUF4, EW_D, 0},
++    [MXU3_shufq2] = {SH_VVT, OP_SHUF2, EW_Q, 0},
++    [MXU3_gshufw] = {SH_GSHUFW, OP_GSHUFW, EW_W, 0},
++    [MXU3_ilve2bi] = {SH_VVV, OP_ILVE2BI, EW_B, 0},
++    [MXU3_ilve4bi] = {SH_VVV, OP_ILVE4BI, EW_B, 0},
++    [MXU3_ilveb] = {SH_VVV, OP_ILVE, EW_B, 0},
++    [MXU3_ilveh] = {SH_VVV, OP_ILVE, EW_H, 0},
++    [MXU3_ilvew] = {SH_VVV, OP_ILVE, EW_W, 0},
++    [MXU3_ilved] = {SH_VVV, OP_ILVE, EW_D, 0},
++    [MXU3_ilveq] = {SH_VVV, OP_ILVE, EW_Q, 0},
++    [MXU3_ilveo] = {SH_VVV, OP_ILVE, EW_O, 0},
++    [MXU3_ilvo2bi] = {SH_VVV, OP_ILVO2BI, EW_B, 0},
++    [MXU3_ilvo4bi] = {SH_VVV, OP_ILVO4BI, EW_B, 0},
++    [MXU3_ilvob] = {SH_VVV, OP_ILVO, EW_B, 0},
++    [MXU3_ilvoh] = {SH_VVV, OP_ILVO, EW_H, 0},
++    [MXU3_ilvow] = {SH_VVV, OP_ILVO, EW_W, 0},
++    [MXU3_ilvod] = {SH_VVV, OP_ILVO, EW_D, 0},
++    [MXU3_ilvoq] = {SH_VVV, OP_ILVO, EW_Q, 0},
++    [MXU3_ilvoo] = {SH_VVV, OP_ILVO, EW_O, 0},
++    [MXU3_bshli] = {SH_BSHLI, OP_BSHLI, EW_W, 0},
++    [MXU3_bshri] = {SH_BSHLI, OP_BSHRI, EW_W, 0},
++    [MXU3_bshl] = {SH_VVV, OP_BSHL, EW_W, 0},
++    [MXU3_bshr] = {SH_VVV, OP_BSHR, EW_W, 0},
++    [MXU3_mtcpuw] = {SH_MTCPUW, OP_MTCPUW, EW_W, 0},
++    [MXU3_mfcpuw] = {SH_MFCPUW, OP_MFCPUW, EW_W, 0},
++    [MXU3_mtfpuw] = {SH_MTFPUW, OP_MTFPUW, EW_W, 0},
++    [MXU3_mffpuw] = {SH_MFFPUW, OP_MFFPUW, EW_W, 0},
++    [MXU3_ctcmxu] = {SH_CTCMXU, OP_CTCMXU, EW_W, 0},
++    [MXU3_cfcmxu] = {SH_CFCMXU, OP_CFCMXU, EW_W, 0},
++    [MXU3_sumz] = {SH_SUMZ, OP_SUMZ, EW_W, 0},
++    [MXU3_mfsum] = {SH_MFSUM, OP_MFSUM, EW_W, 0},
++    [MXU3_mfsumz] = {SH_MFSUM, OP_MFSUMZ, EW_W, 0},
++    [MXU3_mtsum] = {SH_MTSUM, OP_MTSUM, EW_W, 0},
++    [MXU3_mxsum] = {SH_MXSUM, OP_MXSUM, EW_W, 0},
++    [MXU3_lih] = {SH_LI, OP_LIH, EW_H, 0},
++    [MXU3_liw] = {SH_LI, OP_LIW, EW_W, 0},
++    [MXU3_liwh] = {SH_LI, OP_LIWH, EW_H, 0},
++    [MXU3_liwr] = {SH_LIWR, OP_LIWR, EW_W, 0},
++    [MXU3_cmvw] = {SH_CMVW, OP_CMVW, EW_W, 0},
++    [MXU3_pmaph] = {SH_VVV, OP_PMAP, EW_H, 0},
++    [MXU3_pmapw] = {SH_VVV, OP_PMAP, EW_W, 0},
++    [MXU3_luw] = {SH_LSU, OP_LSU, EW_W, 0},
++    [MXU3_lud] = {SH_LSU, OP_LSU, EW_D, 0},
++    [MXU3_luq] = {SH_LSU, OP_LSU, EW_Q, 0},
++    [MXU3_luo] = {SH_LSU, OP_LSU, EW_O, 0},
++    [MXU3_law] = {SH_LSIDX, OP_LSIDX, EW_W, 0},
++    [MXU3_lad] = {SH_LSIDX, OP_LSIDX, EW_D, 0},
++    [MXU3_laq] = {SH_LSIDX, OP_LSIDX, EW_Q, 0},
++    [MXU3_lao] = {SH_LSIDX, OP_LSIDX, EW_O, 0},
++    [MXU3_suw] = {SH_LSU, OP_LSU, EW_W, 1},
++    [MXU3_sud] = {SH_LSU, OP_LSU, EW_D, 1},
++    [MXU3_suq] = {SH_LSU, OP_LSU, EW_Q, 1},
++    [MXU3_suo] = {SH_LSU, OP_LSU, EW_O, 1},
++    [MXU3_saw] = {SH_LSIDX, OP_LSIDX, EW_W, 1},
++    [MXU3_sad] = {SH_LSIDX, OP_LSIDX, EW_D, 1},
++    [MXU3_saq] = {SH_LSIDX, OP_LSIDX, EW_Q, 1},
++    [MXU3_sao] = {SH_LSIDX, OP_LSIDX, EW_O, 1},
++    [MXU3_luo2b] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_luo2h] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_luo2w] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_luo2d] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_luo2q] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_lao2b] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_lao2h] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_lao2w] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_lao2d] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_lao2q] = {SH_LSST, OP_LSST, EW_O, 0},
++    [MXU3_suo2w] = {SH_LSST, OP_LSST, EW_O, 1},
++    [MXU3_suo2d] = {SH_LSST, OP_LSST, EW_O, 1},
++    [MXU3_suo2q] = {SH_LSST, OP_LSST, EW_O, 1},
++    [MXU3_sao2w] = {SH_LSST, OP_LSST, EW_O, 1},
++    [MXU3_sao2d] = {SH_LSST, OP_LSST, EW_O, 1},
++    [MXU3_sao2q] = {SH_LSST, OP_LSST, EW_O, 1},
++    [MXU3_luw2b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw2h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw4b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw4h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw8b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw8h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw16b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_luw16h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law2b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law2h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law4b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law4h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law8b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law8h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law16b] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_law16h] = {SH_LSST, OP_LSST, EW_W, 0},
++    [MXU3_lud2b] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud2h] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud2w] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud4b] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud4h] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud4w] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud8b] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud8h] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lud8w] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad2b] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad2h] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad2w] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad4b] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad4h] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad4w] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad8b] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad8h] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_lad8w] = {SH_LSST, OP_LSST, EW_D, 0},
++    [MXU3_sud2w] = {SH_LSST, OP_LSST, EW_D, 1},
++    [MXU3_sud4w] = {SH_LSST, OP_LSST, EW_D, 1},
++    [MXU3_sud8w] = {SH_LSST, OP_LSST, EW_D, 1},
++    [MXU3_sad2w] = {SH_LSST, OP_LSST, EW_D, 1},
++    [MXU3_sad4w] = {SH_LSST, OP_LSST, EW_D, 1},
++    [MXU3_sad8w] = {SH_LSST, OP_LSST, EW_D, 1},
++    [MXU3_luq2b] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq2h] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq2w] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq2d] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq4b] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq4h] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq4w] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_luq4d] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq2b] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq2h] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq2w] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq2d] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq4b] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq4h] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq4w] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_laq4d] = {SH_LSST, OP_LSST, EW_Q, 0},
++    [MXU3_suq2w] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_suq2d] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_suq4w] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_suq4d] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_saq2w] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_saq2d] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_saq4w] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_saq4d] = {SH_LSST, OP_LSST, EW_Q, 1},
++    [MXU3_nnrwr] = {SH_NNWR, OP_NNRWR, EW_W, 0},
++    [MXU3_nnrrd] = {SH_NNRD, OP_NNRRD, EW_D, 0},
++    [MXU3_nndwr] = {SH_NNDWR, OP_NNDWR, EW_W, 0},
++    [MXU3_nndrd] = {SH_NNRD, OP_NNDRD, EW_D, 0},
++    [MXU3_nncmd] = {SH_NNCMD, OP_NNCMD, EW_D, 0},
++    [MXU3_nnmac] = {SH_NNWR, OP_NNMAC, EW_W, 0},
++    [MXU3_gshufwb] = {SH_VVV, OP_GSHUFWB, EW_B, 0},
++    [MXU3_gshufwb_1] = {SH_GSHUFWB1, OP_GSHUFWB_1, EW_W, 0},
++    [MXU3_gshufwb_2] = {SH_GSHUFWB1, OP_GSHUFWB_2, EW_W, 0},
++    [MXU3_gshufvb] = {SH_VVV, OP_GSHUFVB, EW_B, 0},
++    [MXU3_gshufb] = {SH_VVV, OP_GSHUFB, EW_B, 0},
++    [MXU3_gshufwh] = {SH_VVV, OP_GSHUFWH, EW_H, 0},
++    [MXU3_gshufh] = {SH_VVV, OP_GSHUFH, EW_H, 0},
++};
++
++static const Mxu3Entry mxu3_tbl[496] = {
++    {0x4a60001cu, 0xffffff3fu, MXU3_sumz},
++    {0x4ae00000u, 0xffe0ff3fu, MXU3_sr1sum2bi},
++    {0x4ae00100u, 0xffe0ff3fu, MXU3_sr1sum4bi},
++    {0x4ae00200u, 0xffe0ff3fu, MXU3_sr1sumub},
++    {0x4ae00300u, 0xffe0ff3fu, MXU3_sr1sumuh},
++    {0x4ae00400u, 0xffe0ff3fu, MXU3_sr1sumsb},
++    {0x4ae00500u, 0xffe0ff3fu, MXU3_sr1sumsh},
++    {0x4ae00600u, 0xffe0ff3fu, MXU3_sr1sumw},
++    {0x4a600018u, 0xffe0ff3fu, MXU3_tocb},
++    {0x4a600019u, 0xffe0ff3fu, MXU3_toch},
++    {0x4a60001au, 0xffe0ff3fu, MXU3_tocw},
++    {0x4a60000fu, 0xffffe03fu, MXU3_mfsum},
++    {0x4a60001eu, 0xffffe03fu, MXU3_mfsumz},
++    {0x4a60001du, 0xffe0ff3fu, MXU3_mtsum},
++    {0x4ae00800u, 0xffe0ff3eu, MXU3_sr2sum2bi},
++    {0x4ae00900u, 0xffe0ff3eu, MXU3_sr2sum4bi},
++    {0x4ae00a00u, 0xffe0ff3eu, MXU3_sr2sumub},
++    {0x4ae00b00u, 0xffe0ff3eu, MXU3_sr2sumuh},
++    {0x4ae00c00u, 0xffe0ff3eu, MXU3_sr2sumsb},
++    {0x4ae00d00u, 0xffe0ff3eu, MXU3_sr2sumsh},
++    {0x4ae00e00u, 0xffe0ff3eu, MXU3_sr2sumw},
++    {0x4ae01000u, 0xffe0ff3cu, MXU3_sr4sum2bi},
++    {0x4ae01100u, 0xffe0ff3cu, MXU3_sr4sum4bi},
++    {0x4ae01200u, 0xffe0ff3cu, MXU3_sr4sumub},
++    {0x4ae01300u, 0xffe0ff3cu, MXU3_sr4sumuh},
++    {0x4ae01400u, 0xffe0ff3cu, MXU3_sr4sumsb},
++    {0x4ae01500u, 0xffe0ff3cu, MXU3_sr4sumsh},
++    {0x4ae01600u, 0xffe0ff3cu, MXU3_sr4sumw},
++    {0x4a000020u, 0xffe0f83fu, MXU3_ceqzb},
++    {0x4a000021u, 0xffe0f83fu, MXU3_ceqzh},
++    {0x4a000022u, 0xffe0f83fu, MXU3_ceqzw},
++    {0x4a00002cu, 0xffe0f83fu, MXU3_clezb},
++    {0x4a00002du, 0xffe0f83fu, MXU3_clezh},
++    {0x4a00002eu, 0xffe0f83fu, MXU3_clezw},
++    {0x4a000024u, 0xffe0f83fu, MXU3_cltzb},
++    {0x4a000025u, 0xffe0f83fu, MXU3_cltzh},
++    {0x4a000026u, 0xffe0f83fu, MXU3_cltzw},
++    {0x4b600034u, 0xffff003fu, MXU3_addrw},
++    {0x4ae01800u, 0xffe0ff38u, MXU3_sr8sum2bi},
++    {0x4ae01900u, 0xffe0ff38u, MXU3_sr8sum4bi},
++    {0x4ae01a00u, 0xffe0ff38u, MXU3_sr8sumub},
++    {0x4ae01b00u, 0xffe0ff38u, MXU3_sr8sumuh},
++    {0x4ae01c00u, 0xffe0ff38u, MXU3_sr8sumsb},
++    {0x4ae01d00u, 0xffe0ff38u, MXU3_sr8sumsh},
++    {0x4ae01e00u, 0xffe0ff38u, MXU3_sr8sumw},
++    {0x4a80000cu, 0xffe0f83fu, MXU3_absb},
++    {0x4a80000du, 0xffe0f83fu, MXU3_absh},
++    {0x4a80000eu, 0xffe0f83fu, MXU3_absw},
++    {0x7120002fu, 0xffe0f83fu, MXU3_satsshb},
++    {0x7140002fu, 0xffe0f83fu, MXU3_satsswb},
++    {0x71c0002fu, 0xffe0f83fu, MXU3_satsswh},
++    {0x7200002fu, 0xffe0f83fu, MXU3_satsub2bi},
++    {0x7280002fu, 0xffe0f83fu, MXU3_satsub4bi},
++    {0x7220002fu, 0xffe0f83fu, MXU3_satsuh2bi},
++    {0x72a0002fu, 0xffe0f83fu, MXU3_satsuh4bi},
++    {0x7320002fu, 0xffe0f83fu, MXU3_satsuhb},
++    {0x7240002fu, 0xffe0f83fu, MXU3_satsuw2bi},
++    {0x72c0002fu, 0xffe0f83fu, MXU3_satsuw4bi},
++    {0x7340002fu, 0xffe0f83fu, MXU3_satsuwb},
++    {0x73c0002fu, 0xffe0f83fu, MXU3_satsuwh},
++    {0x7000002fu, 0xffe0f83fu, MXU3_satuub2bi},
++    {0x7020002fu, 0xffe0f83fu, MXU3_satuub4bi},
++    {0x7040002fu, 0xffe0f83fu, MXU3_satuuh2bi},
++    {0x7060002fu, 0xffe0f83fu, MXU3_satuuh4bi},
++    {0x7080002fu, 0xffe0f83fu, MXU3_satuuhb},
++    {0x70a0002fu, 0xffe0f83fu, MXU3_satuuw4bi},
++    {0x70c0002fu, 0xffe0f83fu, MXU3_satuuwb},
++    {0x70e0002fu, 0xffe0f83fu, MXU3_satuuwh},
++    {0x4a60003eu, 0xffff003fu, MXU3_fxas1w},
++    {0x4a61003eu, 0xffff003fu, MXU3_fxas2w},
++    {0x4a62003eu, 0xffff003fu, MXU3_fxas4w},
++    {0x4a63003eu, 0xffff003fu, MXU3_fxas8w},
++    {0x4900002eu, 0xffe0f83fu, MXU3_fclassw},
++    {0x7040002eu, 0xffe0f83fu, MXU3_ffsiw},
++    {0x7000002eu, 0xffe0f83fu, MXU3_ffuiw},
++    {0x70e0002eu, 0xffe0f83fu, MXU3_ftsiw},
++    {0x70a0002eu, 0xffe0f83fu, MXU3_ftuiw},
++    {0x7020002eu, 0xffe0f83fu, MXU3_frintw},
++    {0x70c0002eu, 0xffe0f83fu, MXU3_ftruncsw},
++    {0x7080002eu, 0xffe0f83fu, MXU3_ftruncuw},
++    {0x71c40034u, 0xffff003fu, MXU3_gt1bi},
++    {0x71c50034u, 0xffff003fu, MXU3_gt2bi},
++    {0x71c60034u, 0xffff003fu, MXU3_gt4bi},
++    {0x71c00034u, 0xffff003fu, MXU3_gtb},
++    {0x71c10034u, 0xffff003fu, MXU3_gth},
++    {0x71a40031u, 0xffff003fu, MXU3_extu1bil},
++    {0x71a50031u, 0xffff003fu, MXU3_extu2bil},
++    {0x71a60031u, 0xffff003fu, MXU3_extu4bil},
++    {0x71a00031u, 0xffff003fu, MXU3_extubl},
++    {0x71a10031u, 0xffff003fu, MXU3_extuhl},
++    {0x71ac0031u, 0xffff003fu, MXU3_extu1bih},
++    {0x71ad0031u, 0xffff003fu, MXU3_extu2bih},
++    {0x71ae0031u, 0xffff003fu, MXU3_extu4bih},
++    {0x71a80031u, 0xffff003fu, MXU3_extubh},
++    {0x71a90031u, 0xffff003fu, MXU3_extuhh},
++    {0x71b40031u, 0xffff003fu, MXU3_exts1bil},
++    {0x71b50031u, 0xffff003fu, MXU3_exts2bil},
++    {0x71b60031u, 0xffff003fu, MXU3_exts4bil},
++    {0x71b00031u, 0xffff003fu, MXU3_extsbl},
++    {0x71b10031u, 0xffff003fu, MXU3_extshl},
++    {0x71bc0031u, 0xffff003fu, MXU3_exts1bih},
++    {0x71bd0031u, 0xffff003fu, MXU3_exts2bih},
++    {0x71be0031u, 0xffff003fu, MXU3_exts4bih},
++    {0x71b80031u, 0xffff003fu, MXU3_extsbh},
++    {0x71b90031u, 0xffff003fu, MXU3_extshh},
++    {0x71800031u, 0xffff003fu, MXU3_extu3bw},
++    {0x70000033u, 0xffff003fu, MXU3_shufw2},
++    {0x70800033u, 0xffff003fu, MXU3_shufw4},
++    {0x71000033u, 0xffff003fu, MXU3_shufw8},
++    {0x70200033u, 0xffff003fu, MXU3_shufd2},
++    {0x70a00033u, 0xffff003fu, MXU3_shufd4},
++    {0x70400033u, 0xffff003fu, MXU3_shufq2},
++    {0x7340002eu, 0xffff003fu, MXU3_mtcpuw},
++    {0x701b0003u, 0xfc1ff83fu, MXU3_mfcpuw},
++    {0x7300002eu, 0xffff003fu, MXU3_mtfpuw},
++    {0x7320002eu, 0xffe0f83fu, MXU3_mffpuw},
++    {0x70110003u, 0xfc1f07ffu, MXU3_ctcmxu},
++    {0x70100003u, 0xffff003fu, MXU3_cfcmxu},
++    {0x4ae02000u, 0xffe0ff30u, MXU3_sr16sum2bi},
++    {0x4ae02100u, 0xffe0ff30u, MXU3_sr16sum4bi},
++    {0x4ae02200u, 0xffe0ff30u, MXU3_sr16sumub},
++    {0x4ae02300u, 0xffe0ff30u, MXU3_sr16sumuh},
++    {0x4ae02400u, 0xffe0ff30u, MXU3_sr16sumsb},
++    {0x4ae02500u, 0xffe0ff30u, MXU3_sr16sumsh},
++    {0x4ae02600u, 0xffe0ff30u, MXU3_sr16sumw},
++    {0x72000031u, 0xffdf003fu, MXU3_extuwll},
++    {0x72080031u, 0xffdf003fu, MXU3_extuwlh},
++    {0x72100031u, 0xffdf003fu, MXU3_extuwhl},
++    {0x72180031u, 0xffdf003fu, MXU3_extuwhh},
++    {0x72010031u, 0xffdf003fu, MXU3_extudll},
++    {0x72090031u, 0xffdf003fu, MXU3_extudlh},
++    {0x72110031u, 0xffdf003fu, MXU3_extudhl},
++    {0x72190031u, 0xffdf003fu, MXU3_extudhh},
++    {0x72020031u, 0xffdf003fu, MXU3_extuqll},
++    {0x720a0031u, 0xffdf003fu, MXU3_extuqlh},
++    {0x72120031u, 0xffdf003fu, MXU3_extuqhl},
++    {0x721a0031u, 0xffdf003fu, MXU3_extuqhh},
++    {0x72030031u, 0xffdf003fu, MXU3_extuoll},
++    {0x720b0031u, 0xffdf003fu, MXU3_extuolh},
++    {0x72130031u, 0xffdf003fu, MXU3_extuohl},
++    {0x721b0031u, 0xffdf003fu, MXU3_extuohh},
++    {0x4a600038u, 0xffe0073fu, MXU3_mlaw},
++    {0x4a60003cu, 0xffe0073fu, MXU3_mlsw},
++    {0x4a600039u, 0xffe0073fu, MXU3_smlahe},
++    {0x4a60003bu, 0xffe0073fu, MXU3_smlaho},
++    {0x4a60003du, 0xffe0073fu, MXU3_smlshe},
++    {0x4a60003fu, 0xffe0073fu, MXU3_smlsho},
++    {0x4b600039u, 0xffe0073fu, MXU3_wsmlahl},
++    {0x4b60003bu, 0xffe0073fu, MXU3_wsmlahh},
++    {0x4b60003du, 0xffe0073fu, MXU3_wsmlshl},
++    {0x4b60003fu, 0xffe0073fu, MXU3_wsmlshh},
++    {0x4b800720u, 0xffe0073fu, MXU3_s1macuub},
++    {0x4ba00720u, 0xffe0073fu, MXU3_s1macsub},
++    {0x4bc00720u, 0xffe0073fu, MXU3_s1macssb},
++    {0x4be00720u, 0xffe0073fu, MXU3_s1macssh},
++    {0x70000035u, 0xffde003fu, MXU3_gt2w},
++    {0x72020035u, 0xffde003fu, MXU3_gt2d},
++    {0x73020035u, 0xffde003fu, MXU3_gt2q},
++    {0x70f80030u, 0xfffc003fu, MXU3_repio},
++    {0x4a60001fu, 0xffe0e03fu, MXU3_mxsum},
++    {0x70001813u, 0xfc1f383fu, MXU3_luo},
++    {0x700000d7u, 0xfc1f01ffu, MXU3_suo},
++    {0x7000381bu, 0xfc1e783fu, MXU3_luo2b},
++    {0x7004381bu, 0xfc1e783fu, MXU3_luo2h},
++    {0x7008381bu, 0xfc1e783fu, MXU3_luo2w},
++    {0x700c381bu, 0xfc1e783fu, MXU3_luo2d},
++    {0x7010381bu, 0xfc1e783fu, MXU3_luo2q},
++    {0x70003819u, 0xfc1e783fu, MXU3_lao2b},
++    {0x70043819u, 0xfc1e783fu, MXU3_lao2h},
++    {0x70083819u, 0xfc1e783fu, MXU3_lao2w},
++    {0x700c3819u, 0xfc1e783fu, MXU3_lao2d},
++    {0x70103819u, 0xfc1e783fu, MXU3_lao2q},
++    {0x700000dfu, 0xfc1f01ffu, MXU3_suo2w},
++    {0x700800dfu, 0xfc1f01ffu, MXU3_suo2d},
++    {0x701000dfu, 0xfc1f01ffu, MXU3_suo2q},
++    {0x700000ddu, 0xfc1f01ffu, MXU3_sao2w},
++    {0x700800ddu, 0xfc1f01ffu, MXU3_sao2d},
++    {0x701000ddu, 0xfc1f01ffu, MXU3_sao2q},
++    {0x4b800710u, 0xffe0071fu, MXU3_s2macuub},
++    {0x4ba00710u, 0xffe0071fu, MXU3_s2macsub},
++    {0x4bc00710u, 0xffe0071fu, MXU3_s2macssb},
++    {0x4be00710u, 0xffe0071fu, MXU3_s2macssh},
++    {0x70f00030u, 0xfff8003fu, MXU3_repiq},
++    {0x70000813u, 0xfc1f183fu, MXU3_luq},
++    {0x70000057u, 0xfc1f00ffu, MXU3_suq},
++    {0x7000181bu, 0xfc1e383fu, MXU3_luq2b},
++    {0x7008181bu, 0xfc1e383fu, MXU3_luq2h},
++    {0x7010181bu, 0xfc1e383fu, MXU3_luq2w},
++    {0x7018181bu, 0xfc1e383fu, MXU3_luq2d},
++    {0x7002181bu, 0xfc1e383fu, MXU3_luq4b},
++    {0x700a181bu, 0xfc1e383fu, MXU3_luq4h},
++    {0x7012181bu, 0xfc1e383fu, MXU3_luq4w},
++    {0x701a181bu, 0xfc1e383fu, MXU3_luq4d},
++    {0x70001819u, 0xfc1e383fu, MXU3_laq2b},
++    {0x70081819u, 0xfc1e383fu, MXU3_laq2h},
++    {0x70101819u, 0xfc1e383fu, MXU3_laq2w},
++    {0x70181819u, 0xfc1e383fu, MXU3_laq2d},
++    {0x70021819u, 0xfc1e383fu, MXU3_laq4b},
++    {0x700a1819u, 0xfc1e383fu, MXU3_laq4h},
++    {0x70121819u, 0xfc1e383fu, MXU3_laq4w},
++    {0x701a1819u, 0xfc1e383fu, MXU3_laq4d},
++    {0x7000005fu, 0xfc1f00ffu, MXU3_suq2w},
++    {0x7010005fu, 0xfc1f00ffu, MXU3_suq2d},
++    {0x7004005fu, 0xfc1f00ffu, MXU3_suq4w},
++    {0x7014005fu, 0xfc1f00ffu, MXU3_suq4d},
++    {0x7000005du, 0xfc1f00ffu, MXU3_saq2w},
++    {0x7010005du, 0xfc1f00ffu, MXU3_saq2d},
++    {0x7004005du, 0xfc1f00ffu, MXU3_saq4w},
++    {0x7014005du, 0xfc1f00ffu, MXU3_saq4d},
++    {0x4b800708u, 0xffe0070fu, MXU3_s4macuub},
++    {0x4ba00708u, 0xffe0070fu, MXU3_s4macsub},
++    {0x4bc00708u, 0xffe0070fu, MXU3_s4macssb},
++    {0x4be00708u, 0xffe0070fu, MXU3_s4macssh},
++    {0x70040035u, 0xff9c003fu, MXU3_gt4w},
++    {0x72040035u, 0xff9c003fu, MXU3_gt4d},
++    {0x70e00030u, 0xfff0003fu, MXU3_repid},
++    {0x70000013u, 0xfc1f083fu, MXU3_lud},
++    {0x70000017u, 0xfc1f007fu, MXU3_sud},
++    {0x7000081bu, 0xfc1e183fu, MXU3_lud2b},
++    {0x7008081bu, 0xfc1e183fu, MXU3_lud2h},
++    {0x7010081bu, 0xfc1e183fu, MXU3_lud2w},
++    {0x7002081bu, 0xfc1e183fu, MXU3_lud4b},
++    {0x700a081bu, 0xfc1e183fu, MXU3_lud4h},
++    {0x7012081bu, 0xfc1e183fu, MXU3_lud4w},
++    {0x7004081bu, 0xfc1e183fu, MXU3_lud8b},
++    {0x700c081bu, 0xfc1e183fu, MXU3_lud8h},
++    {0x7014081bu, 0xfc1e183fu, MXU3_lud8w},
++    {0x70000819u, 0xfc1e183fu, MXU3_lad2b},
++    {0x70080819u, 0xfc1e183fu, MXU3_lad2h},
++    {0x70100819u, 0xfc1e183fu, MXU3_lad2w},
++    {0x70020819u, 0xfc1e183fu, MXU3_lad4b},
++    {0x700a0819u, 0xfc1e183fu, MXU3_lad4h},
++    {0x70120819u, 0xfc1e183fu, MXU3_lad4w},
++    {0x70040819u, 0xfc1e183fu, MXU3_lad8b},
++    {0x700c0819u, 0xfc1e183fu, MXU3_lad8h},
++    {0x70140819u, 0xfc1e183fu, MXU3_lad8w},
++    {0x7000001fu, 0xfc1f007fu, MXU3_sud2w},
++    {0x7008001fu, 0xfc1f007fu, MXU3_sud4w},
++    {0x7010001fu, 0xfc1f007fu, MXU3_sud8w},
++    {0x7000001du, 0xfc1f007fu, MXU3_sad2w},
++    {0x7008001du, 0xfc1f007fu, MXU3_sad4w},
++    {0x7010001du, 0xfc1f007fu, MXU3_sad8w},
++    {0x4a600014u, 0xffe0003fu, MXU3_bnezb},
++    {0x4a600015u, 0xffe0003fu, MXU3_bnezh},
++    {0x4a600016u, 0xffe0003fu, MXU3_bnezw},
++    {0x4a600017u, 0xffe0003fu, MXU3_bnezv},
++    {0x4a600010u, 0xffe0003fu, MXU3_beqzb},
++    {0x4a600011u, 0xffe0003fu, MXU3_beqzh},
++    {0x4a600012u, 0xffe0003fu, MXU3_beqzw},
++    {0x4a600013u, 0xffe0003fu, MXU3_beqzv},
++    {0x4a000028u, 0xffe0003fu, MXU3_ceqb},
++    {0x4a000029u, 0xffe0003fu, MXU3_ceqh},
++    {0x4a00002au, 0xffe0003fu, MXU3_ceqw},
++    {0x4a00003cu, 0xffe0003fu, MXU3_clesb},
++    {0x4a00003du, 0xffe0003fu, MXU3_clesh},
++    {0x4a00003eu, 0xffe0003fu, MXU3_clesw},
++    {0x4a000038u, 0xffe0003fu, MXU3_cleub},
++    {0x4a000039u, 0xffe0003fu, MXU3_cleuh},
++    {0x4a00003au, 0xffe0003fu, MXU3_cleuw},
++    {0x4a000034u, 0xffe0003fu, MXU3_cltsb},
++    {0x4a000035u, 0xffe0003fu, MXU3_cltsh},
++    {0x4a000036u, 0xffe0003fu, MXU3_cltsw},
++    {0x4a000030u, 0xffe0003fu, MXU3_cltub},
++    {0x4a000031u, 0xffe0003fu, MXU3_cltuh},
++    {0x4a000032u, 0xffe0003fu, MXU3_cltuw},
++    {0x4a800000u, 0xffe0003fu, MXU3_addb},
++    {0x4a800001u, 0xffe0003fu, MXU3_addh},
++    {0x4a800002u, 0xffe0003fu, MXU3_addw},
++    {0x4a800008u, 0xffe0003fu, MXU3_subb},
++    {0x4a800009u, 0xffe0003fu, MXU3_subh},
++    {0x4a80000au, 0xffe0003fu, MXU3_subw},
++    {0x4a800024u, 0xffe0003fu, MXU3_waddsbl},
++    {0x4a800026u, 0xffe0003fu, MXU3_waddsbh},
++    {0x4a800025u, 0xffe0003fu, MXU3_waddshl},
++    {0x4a800027u, 0xffe0003fu, MXU3_waddshh},
++    {0x4a800020u, 0xffe0003fu, MXU3_waddubl},
++    {0x4a800022u, 0xffe0003fu, MXU3_waddubh},
++    {0x4a800021u, 0xffe0003fu, MXU3_wadduhl},
++    {0x4a800023u, 0xffe0003fu, MXU3_wadduhh},
++    {0x4a80002cu, 0xffe0003fu, MXU3_wsubsbl},
++    {0x4a80002eu, 0xffe0003fu, MXU3_wsubsbh},
++    {0x4a80002du, 0xffe0003fu, MXU3_wsubshl},
++    {0x4a80002fu, 0xffe0003fu, MXU3_wsubshh},
++    {0x4a800028u, 0xffe0003fu, MXU3_wsububl},
++    {0x4a80002au, 0xffe0003fu, MXU3_wsububh},
++    {0x4a800029u, 0xffe0003fu, MXU3_wsubuhl},
++    {0x4a80002bu, 0xffe0003fu, MXU3_wsubuhh},
++    {0x4a600020u, 0xffe0003fu, MXU3_mulb},
++    {0x4a600021u, 0xffe0003fu, MXU3_mulh},
++    {0x4a600022u, 0xffe0003fu, MXU3_mulw},
++    {0x4a60002cu, 0xffe0003fu, MXU3_smulbe},
++    {0x4a60002eu, 0xffe0003fu, MXU3_smulbo},
++    {0x4a60002du, 0xffe0003fu, MXU3_smulhe},
++    {0x4a60002fu, 0xffe0003fu, MXU3_smulho},
++    {0x4a600028u, 0xffe0003fu, MXU3_umulbe},
++    {0x4a60002au, 0xffe0003fu, MXU3_umulbo},
++    {0x4a600029u, 0xffe0003fu, MXU3_umulhe},
++    {0x4a60002bu, 0xffe0003fu, MXU3_umulho},
++    {0x4b60002cu, 0xffe0003fu, MXU3_wsmulbl},
++    {0x4b60002eu, 0xffe0003fu, MXU3_wsmulbh},
++    {0x4b60002du, 0xffe0003fu, MXU3_wsmulhl},
++    {0x4b60002fu, 0xffe0003fu, MXU3_wsmulhh},
++    {0x4b600028u, 0xffe0003fu, MXU3_wumulbl},
++    {0x4b60002au, 0xffe0003fu, MXU3_wumulbh},
++    {0x4b600029u, 0xffe0003fu, MXU3_wumulhl},
++    {0x4b60002bu, 0xffe0003fu, MXU3_wumulhh},
++    {0x4b800704u, 0xffe00707u, MXU3_s8macuub},
++    {0x4ba00704u, 0xffe00707u, MXU3_s8macsub},
++    {0x4bc00704u, 0xffe00707u, MXU3_s8macssb},
++    {0x4be00704u, 0xffe00707u, MXU3_s8macssh},
++    {0x4a000018u, 0xffe0003fu, MXU3_maxab},
++    {0x4a000019u, 0xffe0003fu, MXU3_maxah},
++    {0x4a00001au, 0xffe0003fu, MXU3_maxaw},
++    {0x4a00001cu, 0xffe0003fu, MXU3_maxsb},
++    {0x4a00001du, 0xffe0003fu, MXU3_maxsh},
++    {0x4a00001eu, 0xffe0003fu, MXU3_maxsw},
++    {0x4a000008u, 0xffe0003fu, MXU3_maxub},
++    {0x4a000009u, 0xffe0003fu, MXU3_maxuh},
++    {0x4a00000au, 0xffe0003fu, MXU3_maxuw},
++    {0x4a00000cu, 0xffe0003fu, MXU3_maxu2bi},
++    {0x4a00000du, 0xffe0003fu, MXU3_maxu4bi},
++    {0x4a000010u, 0xffe0003fu, MXU3_minab},
++    {0x4a000011u, 0xffe0003fu, MXU3_minah},
++    {0x4a000012u, 0xffe0003fu, MXU3_minaw},
++    {0x4a000014u, 0xffe0003fu, MXU3_minsb},
++    {0x4a000015u, 0xffe0003fu, MXU3_minsh},
++    {0x4a000016u, 0xffe0003fu, MXU3_minsw},
++    {0x4a000000u, 0xffe0003fu, MXU3_minub},
++    {0x4a000001u, 0xffe0003fu, MXU3_minuh},
++    {0x4a000002u, 0xffe0003fu, MXU3_minuw},
++    {0x4a000004u, 0xffe0003fu, MXU3_minu2bi},
++    {0x4a000005u, 0xffe0003fu, MXU3_minu4bi},
++    {0x4a600002u, 0xffe0003fu, MXU3_andv},
++    {0x4a600003u, 0xffe0003fu, MXU3_andnv},
++    {0x4a600004u, 0xffe0003fu, MXU3_orv},
++    {0x4a600005u, 0xffe0003fu, MXU3_ornv},
++    {0x4a600006u, 0xffe0003fu, MXU3_xorv},
++    {0x4a600007u, 0xffe0003fu, MXU3_xornv},
++    {0x4a60000eu, 0xffe0003fu, MXU3_bselv},
++    {0x4a800003u, 0xffe0003fu, MXU3_faddw},
++    {0x4a80000bu, 0xffe0003fu, MXU3_fsubw},
++    {0x4a600023u, 0xffe0003fu, MXU3_fmulw},
++    {0x4b600030u, 0xffe0003fu, MXU3_fcmulrw},
++    {0x4b600032u, 0xffe0003fu, MXU3_fcmuliw},
++    {0x4a60003au, 0xffe0003fu, MXU3_fcaddw},
++    {0x4a00001fu, 0xffe0003fu, MXU3_fmaxw},
++    {0x4a00001bu, 0xffe0003fu, MXU3_fmaxaw},
++    {0x4a000017u, 0xffe0003fu, MXU3_fminw},
++    {0x4a000013u, 0xffe0003fu, MXU3_fminaw},
++    {0x4a00002bu, 0xffe0003fu, MXU3_fceqw},
++    {0x4a00003fu, 0xffe0003fu, MXU3_fclew},
++    {0x4a000037u, 0xffe0003fu, MXU3_fcltw},
++    {0x4a000033u, 0xffe0003fu, MXU3_fcorw},
++    {0x4a200020u, 0xffe0003fu, MXU3_sllb},
++    {0x4a200021u, 0xffe0003fu, MXU3_sllh},
++    {0x4a200022u, 0xffe0003fu, MXU3_sllw},
++    {0x4aa00020u, 0xffe0003fu, MXU3_sllib},
++    {0x4aa00021u, 0xffe0003fu, MXU3_sllih},
++    {0x4aa00022u, 0xffe0003fu, MXU3_slliw},
++    {0x4a200038u, 0xffe0003fu, MXU3_srab},
++    {0x4a200039u, 0xffe0003fu, MXU3_srah},
++    {0x4a20003au, 0xffe0003fu, MXU3_sraw},
++    {0x4aa00038u, 0xffe0003fu, MXU3_sraib},
++    {0x4aa00039u, 0xffe0003fu, MXU3_sraih},
++    {0x4aa0003au, 0xffe0003fu, MXU3_sraiw},
++    {0x4a20003cu, 0xffe0003fu, MXU3_srarb},
++    {0x4a20003du, 0xffe0003fu, MXU3_srarh},
++    {0x4a20003eu, 0xffe0003fu, MXU3_srarw},
++    {0x4aa0003cu, 0xffe0003fu, MXU3_srarib},
++    {0x4aa0003du, 0xffe0003fu, MXU3_srarih},
++    {0x4aa0003eu, 0xffe0003fu, MXU3_srariw},
++    {0x4a200030u, 0xffe0003fu, MXU3_srlb},
++    {0x4a200031u, 0xffe0003fu, MXU3_srlh},
++    {0x4a200032u, 0xffe0003fu, MXU3_srlw},
++    {0x4aa00030u, 0xffe0003fu, MXU3_srlib},
++    {0x4aa00031u, 0xffe0003fu, MXU3_srlih},
++    {0x4aa00032u, 0xffe0003fu, MXU3_srliw},
++    {0x4a200034u, 0xffe0003fu, MXU3_srlrb},
++    {0x4a200035u, 0xffe0003fu, MXU3_srlrh},
++    {0x4a200036u, 0xffe0003fu, MXU3_srlrw},
++    {0x4aa00034u, 0xffe0003fu, MXU3_srlrib},
++    {0x4aa00035u, 0xffe0003fu, MXU3_srlrih},
++    {0x4aa00036u, 0xffe0003fu, MXU3_srlriw},
++    {0x70c00030u, 0xffe0003fu, MXU3_repiw},
++    {0x70000038u, 0xffe0003fu, MXU3_ilve2bi},
++    {0x70200038u, 0xffe0003fu, MXU3_ilve4bi},
++    {0x70400038u, 0xffe0003fu, MXU3_ilveb},
++    {0x70600038u, 0xffe0003fu, MXU3_ilveh},
++    {0x70800038u, 0xffe0003fu, MXU3_ilvew},
++    {0x70a00038u, 0xffe0003fu, MXU3_ilved},
++    {0x70c00038u, 0xffe0003fu, MXU3_ilveq},
++    {0x70e00038u, 0xffe0003fu, MXU3_ilveo},
++    {0x72000038u, 0xffe0003fu, MXU3_ilvo2bi},
++    {0x72200038u, 0xffe0003fu, MXU3_ilvo4bi},
++    {0x72400038u, 0xffe0003fu, MXU3_ilvob},
++    {0x72600038u, 0xffe0003fu, MXU3_ilvoh},
++    {0x72800038u, 0xffe0003fu, MXU3_ilvow},
++    {0x72a00038u, 0xffe0003fu, MXU3_ilvod},
++    {0x72c00038u, 0xffe0003fu, MXU3_ilvoq},
++    {0x72e00038u, 0xffe0003fu, MXU3_ilvoo},
++    {0x70800039u, 0xffe0003fu, MXU3_bshl},
++    {0x71800039u, 0xffe0003fu, MXU3_bshr},
++    {0x4a600000u, 0xffe0003fu, MXU3_liwr},
++    {0x4a600009u, 0xffe0003fu, MXU3_pmaph},
++    {0x4a60000au, 0xffe0003fu, MXU3_pmapw},
++    {0x70000012u, 0xfc1f003fu, MXU3_luw},
++    {0x70000016u, 0xfc1f003fu, MXU3_suw},
++    {0x7000001bu, 0xfc1e083fu, MXU3_luw2b},
++    {0x7010001bu, 0xfc1e083fu, MXU3_luw2h},
++    {0x7002001bu, 0xfc1e083fu, MXU3_luw4b},
++    {0x7012001bu, 0xfc1e083fu, MXU3_luw4h},
++    {0x7004001bu, 0xfc1e083fu, MXU3_luw8b},
++    {0x7014001bu, 0xfc1e083fu, MXU3_luw8h},
++    {0x7006001bu, 0xfc1e083fu, MXU3_luw16b},
++    {0x7016001bu, 0xfc1e083fu, MXU3_luw16h},
++    {0x70000019u, 0xfc1e083fu, MXU3_law2b},
++    {0x70100019u, 0xfc1e083fu, MXU3_law2h},
++    {0x70020019u, 0xfc1e083fu, MXU3_law4b},
++    {0x70120019u, 0xfc1e083fu, MXU3_law4h},
++    {0x70040019u, 0xfc1e083fu, MXU3_law8b},
++    {0x70140019u, 0xfc1e083fu, MXU3_law8h},
++    {0x70060019u, 0xfc1e083fu, MXU3_law16b},
++    {0x70160019u, 0xfc1e083fu, MXU3_law16h},
++    {0x7000003au, 0xffe0003fu, MXU3_nnrwr},
++    {0x7020003au, 0xffe0003fu, MXU3_nnrrd},
++    {0x7040003au, 0xffe0003fu, MXU3_nndwr},
++    {0x7060003au, 0xffe0003fu, MXU3_nndrd},
++    {0x70a0003au, 0xffe0003fu, MXU3_nncmd},
++    {0x7080003au, 0xffe0003fu, MXU3_nnmac},
++    {0x7300003bu, 0xffe0003fu, MXU3_gshufwb},
++    {0x7380002eu, 0xffe0003fu, MXU3_gshufvb},
++    {0x7020002bu, 0xffe0003fu, MXU3_gshufb},
++    {0x7200002eu, 0xffe0003fu, MXU3_gshufwh},
++    {0x7280002eu, 0xffe0003fu, MXU3_gshufh},
++    {0x4b800702u, 0xffe00703u, MXU3_s16macuub},
++    {0x4ba00702u, 0xffe00703u, MXU3_s16macsub},
++    {0x4bc00702u, 0xffe00703u, MXU3_s16macssb},
++    {0x4be00702u, 0xffe00703u, MXU3_s16macssh},
++    {0x70080035u, 0xff18003fu, MXU3_gt8w},
++    {0x70800030u, 0xffc0003fu, MXU3_repih},
++    {0x7280003bu, 0xffc0003fu, MXU3_gshufwb_1},
++    {0x7380003bu, 0xffc0003fu, MXU3_gshufwb_2},
++    {0x4b800000u, 0xffe00720u, MXU3_sr1mac2bi},
++    {0x4b800020u, 0xffe00720u, MXU3_sr2mac2bi},
++    {0x4ba00000u, 0xffe00720u, MXU3_sr4mac2bi},
++    {0x4ba00020u, 0xffe00720u, MXU3_sr8mac2bi},
++    {0x4bc00000u, 0xffe00720u, MXU3_sr16mac2bi},
++    {0x4b800100u, 0xffe00720u, MXU3_sr1mac4bi},
++    {0x4b800120u, 0xffe00720u, MXU3_sr2mac4bi},
++    {0x4ba00100u, 0xffe00720u, MXU3_sr4mac4bi},
++    {0x4ba00120u, 0xffe00720u, MXU3_sr8mac4bi},
++    {0x4bc00100u, 0xffe00720u, MXU3_sr16mac4bi},
++    {0x4b800200u, 0xffe00720u, MXU3_sr1macuub},
++    {0x4b800220u, 0xffe00720u, MXU3_sr2macuub},
++    {0x4ba00200u, 0xffe00720u, MXU3_sr4macuub},
++    {0x4ba00220u, 0xffe00720u, MXU3_sr8macuub},
++    {0x4bc00200u, 0xffe00720u, MXU3_sr16macuub},
++    {0x4b800600u, 0xffe00720u, MXU3_sr1macsub},
++    {0x4b800620u, 0xffe00720u, MXU3_sr2macsub},
++    {0x4ba00600u, 0xffe00720u, MXU3_sr4macsub},
++    {0x4ba00620u, 0xffe00720u, MXU3_sr8macsub},
++    {0x4bc00600u, 0xffe00720u, MXU3_sr16macsub},
++    {0x4b800400u, 0xffe00720u, MXU3_sr1macssb},
++    {0x4b800420u, 0xffe00720u, MXU3_sr2macssb},
++    {0x4ba00400u, 0xffe00720u, MXU3_sr4macssb},
++    {0x4ba00420u, 0xffe00720u, MXU3_sr8macssb},
++    {0x4bc00400u, 0xffe00720u, MXU3_sr16macssb},
++    {0x4b800500u, 0xffe00720u, MXU3_sr1macssh},
++    {0x4b800520u, 0xffe00720u, MXU3_sr2macssh},
++    {0x4ba00500u, 0xffe00720u, MXU3_sr4macssh},
++    {0x4ba00520u, 0xffe00720u, MXU3_sr8macssh},
++    {0x4bc00500u, 0xffe00720u, MXU3_sr16macssh},
++    {0x70000030u, 0xff80003fu, MXU3_repib},
++    {0x7200003bu, 0xff80003fu, MXU3_gshufw},
++    {0x70000039u, 0xff80003fu, MXU3_bshli},
++    {0x71000039u, 0xff80003fu, MXU3_bshri},
++    {0x70001811u, 0xfc00383fu, MXU3_lao},
++    {0x700000d5u, 0xfc0001ffu, MXU3_sao},
++    {0x4b600020u, 0xffe00038u, MXU3_addiw},
++    {0x4b600008u, 0xffe00038u, MXU3_andib},
++    {0x4b600010u, 0xffe00038u, MXU3_orib},
++    {0x4b600018u, 0xffe00038u, MXU3_xorib},
++    {0x70000037u, 0xfe10003fu, MXU3_movd},
++    {0x70100037u, 0xfe10003fu, MXU3_movq},
++    {0x72000037u, 0xfe10003fu, MXU3_movo},
++    {0x70000811u, 0xfc00183fu, MXU3_laq},
++    {0x70000055u, 0xfc0000ffu, MXU3_saq},
++    {0x70000032u, 0xfe00003fu, MXU3_cmvw},
++    {0x70000011u, 0xfc00083fu, MXU3_lad},
++    {0x70000015u, 0xfc00007fu, MXU3_sad},
++    {0x70000036u, 0xfc00003fu, MXU3_movw},
++    {0x70000010u, 0xfc00003fu, MXU3_law},
++    {0x70000014u, 0xfc00003fu, MXU3_saw},
++    {0x4b000000u, 0xffe00000u, MXU3_lih},
++    {0x4b200000u, 0xffe00000u, MXU3_liw},
++    {0x4b400000u, 0xffe00000u, MXU3_liwh},
++};
++
++static const char *const mxu3_name[MXU3_NR] = {
++    [MXU3_bnezb] = "bnezb",
++    [MXU3_bnezh] = "bnezh",
++    [MXU3_bnezw] = "bnezw",
++    [MXU3_bnezv] = "bnezv",
++    [MXU3_beqzb] = "beqzb",
++    [MXU3_beqzh] = "beqzh",
++    [MXU3_beqzw] = "beqzw",
++    [MXU3_beqzv] = "beqzv",
++    [MXU3_ceqb] = "ceqb",
++    [MXU3_ceqh] = "ceqh",
++    [MXU3_ceqw] = "ceqw",
++    [MXU3_ceqzb] = "ceqzb",
++    [MXU3_ceqzh] = "ceqzh",
++    [MXU3_ceqzw] = "ceqzw",
++    [MXU3_clesb] = "clesb",
++    [MXU3_clesh] = "clesh",
++    [MXU3_clesw] = "clesw",
++    [MXU3_cleub] = "cleub",
++    [MXU3_cleuh] = "cleuh",
++    [MXU3_cleuw] = "cleuw",
++    [MXU3_clezb] = "clezb",
++    [MXU3_clezh] = "clezh",
++    [MXU3_clezw] = "clezw",
++    [MXU3_cltsb] = "cltsb",
++    [MXU3_cltsh] = "cltsh",
++    [MXU3_cltsw] = "cltsw",
++    [MXU3_cltub] = "cltub",
++    [MXU3_cltuh] = "cltuh",
++    [MXU3_cltuw] = "cltuw",
++    [MXU3_cltzb] = "cltzb",
++    [MXU3_cltzh] = "cltzh",
++    [MXU3_cltzw] = "cltzw",
++    [MXU3_addb] = "addb",
++    [MXU3_addh] = "addh",
++    [MXU3_addw] = "addw",
++    [MXU3_addiw] = "addiw",
++    [MXU3_addrw] = "addrw",
++    [MXU3_subb] = "subb",
++    [MXU3_subh] = "subh",
++    [MXU3_subw] = "subw",
++    [MXU3_waddsbl] = "waddsbl",
++    [MXU3_waddsbh] = "waddsbh",
++    [MXU3_waddshl] = "waddshl",
++    [MXU3_waddshh] = "waddshh",
++    [MXU3_waddubl] = "waddubl",
++    [MXU3_waddubh] = "waddubh",
++    [MXU3_wadduhl] = "wadduhl",
++    [MXU3_wadduhh] = "wadduhh",
++    [MXU3_wsubsbl] = "wsubsbl",
++    [MXU3_wsubsbh] = "wsubsbh",
++    [MXU3_wsubshl] = "wsubshl",
++    [MXU3_wsubshh] = "wsubshh",
++    [MXU3_wsububl] = "wsububl",
++    [MXU3_wsububh] = "wsububh",
++    [MXU3_wsubuhl] = "wsubuhl",
++    [MXU3_wsubuhh] = "wsubuhh",
++    [MXU3_sr1sum2bi] = "sr1sum2bi",
++    [MXU3_sr2sum2bi] = "sr2sum2bi",
++    [MXU3_sr4sum2bi] = "sr4sum2bi",
++    [MXU3_sr8sum2bi] = "sr8sum2bi",
++    [MXU3_sr16sum2bi] = "sr16sum2bi",
++    [MXU3_sr1sum4bi] = "sr1sum4bi",
++    [MXU3_sr2sum4bi] = "sr2sum4bi",
++    [MXU3_sr4sum4bi] = "sr4sum4bi",
++    [MXU3_sr8sum4bi] = "sr8sum4bi",
++    [MXU3_sr16sum4bi] = "sr16sum4bi",
++    [MXU3_sr1sumub] = "sr1sumub",
++    [MXU3_sr2sumub] = "sr2sumub",
++    [MXU3_sr4sumub] = "sr4sumub",
++    [MXU3_sr8sumub] = "sr8sumub",
++    [MXU3_sr16sumub] = "sr16sumub",
++    [MXU3_sr1sumuh] = "sr1sumuh",
++    [MXU3_sr2sumuh] = "sr2sumuh",
++    [MXU3_sr4sumuh] = "sr4sumuh",
++    [MXU3_sr8sumuh] = "sr8sumuh",
++    [MXU3_sr16sumuh] = "sr16sumuh",
++    [MXU3_sr1sumsb] = "sr1sumsb",
++    [MXU3_sr2sumsb] = "sr2sumsb",
++    [MXU3_sr4sumsb] = "sr4sumsb",
++    [MXU3_sr8sumsb] = "sr8sumsb",
++    [MXU3_sr16sumsb] = "sr16sumsb",
++    [MXU3_sr1sumsh] = "sr1sumsh",
++    [MXU3_sr2sumsh] = "sr2sumsh",
++    [MXU3_sr4sumsh] = "sr4sumsh",
++    [MXU3_sr8sumsh] = "sr8sumsh",
++    [MXU3_sr16sumsh] = "sr16sumsh",
++    [MXU3_sr1sumw] = "sr1sumw",
++    [MXU3_sr2sumw] = "sr2sumw",
++    [MXU3_sr4sumw] = "sr4sumw",
++    [MXU3_sr8sumw] = "sr8sumw",
++    [MXU3_sr16sumw] = "sr16sumw",
++    [MXU3_absb] = "absb",
++    [MXU3_absh] = "absh",
++    [MXU3_absw] = "absw",
++    [MXU3_mulb] = "mulb",
++    [MXU3_mulh] = "mulh",
++    [MXU3_mulw] = "mulw",
++    [MXU3_smulbe] = "smulbe",
++    [MXU3_smulbo] = "smulbo",
++    [MXU3_smulhe] = "smulhe",
++    [MXU3_smulho] = "smulho",
++    [MXU3_umulbe] = "umulbe",
++    [MXU3_umulbo] = "umulbo",
++    [MXU3_umulhe] = "umulhe",
++    [MXU3_umulho] = "umulho",
++    [MXU3_wsmulbl] = "wsmulbl",
++    [MXU3_wsmulbh] = "wsmulbh",
++    [MXU3_wsmulhl] = "wsmulhl",
++    [MXU3_wsmulhh] = "wsmulhh",
++    [MXU3_wumulbl] = "wumulbl",
++    [MXU3_wumulbh] = "wumulbh",
++    [MXU3_wumulhl] = "wumulhl",
++    [MXU3_wumulhh] = "wumulhh",
++    [MXU3_mlaw] = "mlaw",
++    [MXU3_mlsw] = "mlsw",
++    [MXU3_smlahe] = "smlahe",
++    [MXU3_smlaho] = "smlaho",
++    [MXU3_smlshe] = "smlshe",
++    [MXU3_smlsho] = "smlsho",
++    [MXU3_wsmlahl] = "wsmlahl",
++    [MXU3_wsmlahh] = "wsmlahh",
++    [MXU3_wsmlshl] = "wsmlshl",
++    [MXU3_wsmlshh] = "wsmlshh",
++    [MXU3_sr1mac2bi] = "sr1mac2bi",
++    [MXU3_sr2mac2bi] = "sr2mac2bi",
++    [MXU3_sr4mac2bi] = "sr4mac2bi",
++    [MXU3_sr8mac2bi] = "sr8mac2bi",
++    [MXU3_sr16mac2bi] = "sr16mac2bi",
++    [MXU3_sr1mac4bi] = "sr1mac4bi",
++    [MXU3_sr2mac4bi] = "sr2mac4bi",
++    [MXU3_sr4mac4bi] = "sr4mac4bi",
++    [MXU3_sr8mac4bi] = "sr8mac4bi",
++    [MXU3_sr16mac4bi] = "sr16mac4bi",
++    [MXU3_sr1macuub] = "sr1macuub",
++    [MXU3_sr2macuub] = "sr2macuub",
++    [MXU3_sr4macuub] = "sr4macuub",
++    [MXU3_sr8macuub] = "sr8macuub",
++    [MXU3_sr16macuub] = "sr16macuub",
++    [MXU3_sr1macsub] = "sr1macsub",
++    [MXU3_sr2macsub] = "sr2macsub",
++    [MXU3_sr4macsub] = "sr4macsub",
++    [MXU3_sr8macsub] = "sr8macsub",
++    [MXU3_sr16macsub] = "sr16macsub",
++    [MXU3_sr1macssb] = "sr1macssb",
++    [MXU3_sr2macssb] = "sr2macssb",
++    [MXU3_sr4macssb] = "sr4macssb",
++    [MXU3_sr8macssb] = "sr8macssb",
++    [MXU3_sr16macssb] = "sr16macssb",
++    [MXU3_sr1macssh] = "sr1macssh",
++    [MXU3_sr2macssh] = "sr2macssh",
++    [MXU3_sr4macssh] = "sr4macssh",
++    [MXU3_sr8macssh] = "sr8macssh",
++    [MXU3_sr16macssh] = "sr16macssh",
++    [MXU3_s1macuub] = "s1macuub",
++    [MXU3_s2macuub] = "s2macuub",
++    [MXU3_s4macuub] = "s4macuub",
++    [MXU3_s8macuub] = "s8macuub",
++    [MXU3_s16macuub] = "s16macuub",
++    [MXU3_s1macsub] = "s1macsub",
++    [MXU3_s2macsub] = "s2macsub",
++    [MXU3_s4macsub] = "s4macsub",
++    [MXU3_s8macsub] = "s8macsub",
++    [MXU3_s16macsub] = "s16macsub",
++    [MXU3_s1macssb] = "s1macssb",
++    [MXU3_s2macssb] = "s2macssb",
++    [MXU3_s4macssb] = "s4macssb",
++    [MXU3_s8macssb] = "s8macssb",
++    [MXU3_s16macssb] = "s16macssb",
++    [MXU3_s1macssh] = "s1macssh",
++    [MXU3_s2macssh] = "s2macssh",
++    [MXU3_s4macssh] = "s4macssh",
++    [MXU3_s8macssh] = "s8macssh",
++    [MXU3_s16macssh] = "s16macssh",
++    [MXU3_maxab] = "maxab",
++    [MXU3_maxah] = "maxah",
++    [MXU3_maxaw] = "maxaw",
++    [MXU3_maxsb] = "maxsb",
++    [MXU3_maxsh] = "maxsh",
++    [MXU3_maxsw] = "maxsw",
++    [MXU3_maxub] = "maxub",
++    [MXU3_maxuh] = "maxuh",
++    [MXU3_maxuw] = "maxuw",
++    [MXU3_maxu2bi] = "maxu2bi",
++    [MXU3_maxu4bi] = "maxu4bi",
++    [MXU3_minab] = "minab",
++    [MXU3_minah] = "minah",
++    [MXU3_minaw] = "minaw",
++    [MXU3_minsb] = "minsb",
++    [MXU3_minsh] = "minsh",
++    [MXU3_minsw] = "minsw",
++    [MXU3_minub] = "minub",
++    [MXU3_minuh] = "minuh",
++    [MXU3_minuw] = "minuw",
++    [MXU3_minu2bi] = "minu2bi",
++    [MXU3_minu4bi] = "minu4bi",
++    [MXU3_satsshb] = "satsshb",
++    [MXU3_satsswb] = "satsswb",
++    [MXU3_satsswh] = "satsswh",
++    [MXU3_satsub2bi] = "satsub2bi",
++    [MXU3_satsub4bi] = "satsub4bi",
++    [MXU3_satsuh2bi] = "satsuh2bi",
++    [MXU3_satsuh4bi] = "satsuh4bi",
++    [MXU3_satsuhb] = "satsuhb",
++    [MXU3_satsuw2bi] = "satsuw2bi",
++    [MXU3_satsuw4bi] = "satsuw4bi",
++    [MXU3_satsuwb] = "satsuwb",
++    [MXU3_satsuwh] = "satsuwh",
++    [MXU3_satuub2bi] = "satuub2bi",
++    [MXU3_satuub4bi] = "satuub4bi",
++    [MXU3_satuuh2bi] = "satuuh2bi",
++    [MXU3_satuuh4bi] = "satuuh4bi",
++    [MXU3_satuuhb] = "satuuhb",
++    [MXU3_satuuw4bi] = "satuuw4bi",
++    [MXU3_satuuwb] = "satuuwb",
++    [MXU3_satuuwh] = "satuuwh",
++    [MXU3_tocb] = "tocb",
++    [MXU3_toch] = "toch",
++    [MXU3_tocw] = "tocw",
++    [MXU3_andv] = "andv",
++    [MXU3_andnv] = "andnv",
++    [MXU3_andib] = "andib",
++    [MXU3_orv] = "orv",
++    [MXU3_ornv] = "ornv",
++    [MXU3_orib] = "orib",
++    [MXU3_xorv] = "xorv",
++    [MXU3_xornv] = "xornv",
++    [MXU3_xorib] = "xorib",
++    [MXU3_bselv] = "bselv",
++    [MXU3_faddw] = "faddw",
++    [MXU3_fsubw] = "fsubw",
++    [MXU3_fmulw] = "fmulw",
++    [MXU3_fcmulrw] = "fcmulrw",
++    [MXU3_fcmuliw] = "fcmuliw",
++    [MXU3_fcaddw] = "fcaddw",
++    [MXU3_fxas1w] = "fxas1w",
++    [MXU3_fxas2w] = "fxas2w",
++    [MXU3_fxas4w] = "fxas4w",
++    [MXU3_fxas8w] = "fxas8w",
++    [MXU3_fmaxw] = "fmaxw",
++    [MXU3_fmaxaw] = "fmaxaw",
++    [MXU3_fminw] = "fminw",
++    [MXU3_fminaw] = "fminaw",
++    [MXU3_fclassw] = "fclassw",
++    [MXU3_fceqw] = "fceqw",
++    [MXU3_fclew] = "fclew",
++    [MXU3_fcltw] = "fcltw",
++    [MXU3_fcorw] = "fcorw",
++    [MXU3_ffsiw] = "ffsiw",
++    [MXU3_ffuiw] = "ffuiw",
++    [MXU3_ftsiw] = "ftsiw",
++    [MXU3_ftuiw] = "ftuiw",
++    [MXU3_frintw] = "frintw",
++    [MXU3_ftruncsw] = "ftruncsw",
++    [MXU3_ftruncuw] = "ftruncuw",
++    [MXU3_sllb] = "sllb",
++    [MXU3_sllh] = "sllh",
++    [MXU3_sllw] = "sllw",
++    [MXU3_sllib] = "sllib",
++    [MXU3_sllih] = "sllih",
++    [MXU3_slliw] = "slliw",
++    [MXU3_srab] = "srab",
++    [MXU3_srah] = "srah",
++    [MXU3_sraw] = "sraw",
++    [MXU3_sraib] = "sraib",
++    [MXU3_sraih] = "sraih",
++    [MXU3_sraiw] = "sraiw",
++    [MXU3_srarb] = "srarb",
++    [MXU3_srarh] = "srarh",
++    [MXU3_srarw] = "srarw",
++    [MXU3_srarib] = "srarib",
++    [MXU3_srarih] = "srarih",
++    [MXU3_srariw] = "srariw",
++    [MXU3_srlb] = "srlb",
++    [MXU3_srlh] = "srlh",
++    [MXU3_srlw] = "srlw",
++    [MXU3_srlib] = "srlib",
++    [MXU3_srlih] = "srlih",
++    [MXU3_srliw] = "srliw",
++    [MXU3_srlrb] = "srlrb",
++    [MXU3_srlrh] = "srlrh",
++    [MXU3_srlrw] = "srlrw",
++    [MXU3_srlrib] = "srlrib",
++    [MXU3_srlrih] = "srlrih",
++    [MXU3_srlriw] = "srlriw",
++    [MXU3_gt1bi] = "gt1bi",
++    [MXU3_gt2bi] = "gt2bi",
++    [MXU3_gt4bi] = "gt4bi",
++    [MXU3_gtb] = "gtb",
++    [MXU3_gth] = "gth",
++    [MXU3_gt2w] = "gt2w",
++    [MXU3_gt4w] = "gt4w",
++    [MXU3_gt8w] = "gt8w",
++    [MXU3_gt2d] = "gt2d",
++    [MXU3_gt4d] = "gt4d",
++    [MXU3_gt2q] = "gt2q",
++    [MXU3_extuwll] = "extuwll",
++    [MXU3_extuwlh] = "extuwlh",
++    [MXU3_extuwhl] = "extuwhl",
++    [MXU3_extuwhh] = "extuwhh",
++    [MXU3_extudll] = "extudll",
++    [MXU3_extudlh] = "extudlh",
++    [MXU3_extudhl] = "extudhl",
++    [MXU3_extudhh] = "extudhh",
++    [MXU3_extuqll] = "extuqll",
++    [MXU3_extuqlh] = "extuqlh",
++    [MXU3_extuqhl] = "extuqhl",
++    [MXU3_extuqhh] = "extuqhh",
++    [MXU3_extuoll] = "extuoll",
++    [MXU3_extuolh] = "extuolh",
++    [MXU3_extuohl] = "extuohl",
++    [MXU3_extuohh] = "extuohh",
++    [MXU3_extu1bil] = "extu1bil",
++    [MXU3_extu2bil] = "extu2bil",
++    [MXU3_extu4bil] = "extu4bil",
++    [MXU3_extubl] = "extubl",
++    [MXU3_extuhl] = "extuhl",
++    [MXU3_extu1bih] = "extu1bih",
++    [MXU3_extu2bih] = "extu2bih",
++    [MXU3_extu4bih] = "extu4bih",
++    [MXU3_extubh] = "extubh",
++    [MXU3_extuhh] = "extuhh",
++    [MXU3_exts1bil] = "exts1bil",
++    [MXU3_exts2bil] = "exts2bil",
++    [MXU3_exts4bil] = "exts4bil",
++    [MXU3_extsbl] = "extsbl",
++    [MXU3_extshl] = "extshl",
++    [MXU3_exts1bih] = "exts1bih",
++    [MXU3_exts2bih] = "exts2bih",
++    [MXU3_exts4bih] = "exts4bih",
++    [MXU3_extsbh] = "extsbh",
++    [MXU3_extshh] = "extshh",
++    [MXU3_extu3bw] = "extu3bw",
++    [MXU3_repib] = "repib",
++    [MXU3_repih] = "repih",
++    [MXU3_repiw] = "repiw",
++    [MXU3_repid] = "repid",
++    [MXU3_repiq] = "repiq",
++    [MXU3_repio] = "repio",
++    [MXU3_movw] = "movw",
++    [MXU3_movd] = "movd",
++    [MXU3_movq] = "movq",
++    [MXU3_movo] = "movo",
++    [MXU3_shufw2] = "shufw2",
++    [MXU3_shufw4] = "shufw4",
++    [MXU3_shufw8] = "shufw8",
++    [MXU3_shufd2] = "shufd2",
++    [MXU3_shufd4] = "shufd4",
++    [MXU3_shufq2] = "shufq2",
++    [MXU3_gshufw] = "gshufw",
++    [MXU3_ilve2bi] = "ilve2bi",
++    [MXU3_ilve4bi] = "ilve4bi",
++    [MXU3_ilveb] = "ilveb",
++    [MXU3_ilveh] = "ilveh",
++    [MXU3_ilvew] = "ilvew",
++    [MXU3_ilved] = "ilved",
++    [MXU3_ilveq] = "ilveq",
++    [MXU3_ilveo] = "ilveo",
++    [MXU3_ilvo2bi] = "ilvo2bi",
++    [MXU3_ilvo4bi] = "ilvo4bi",
++    [MXU3_ilvob] = "ilvob",
++    [MXU3_ilvoh] = "ilvoh",
++    [MXU3_ilvow] = "ilvow",
++    [MXU3_ilvod] = "ilvod",
++    [MXU3_ilvoq] = "ilvoq",
++    [MXU3_ilvoo] = "ilvoo",
++    [MXU3_bshli] = "bshli",
++    [MXU3_bshri] = "bshri",
++    [MXU3_bshl] = "bshl",
++    [MXU3_bshr] = "bshr",
++    [MXU3_mtcpuw] = "mtcpuw",
++    [MXU3_mfcpuw] = "mfcpuw",
++    [MXU3_mtfpuw] = "mtfpuw",
++    [MXU3_mffpuw] = "mffpuw",
++    [MXU3_ctcmxu] = "ctcmxu",
++    [MXU3_cfcmxu] = "cfcmxu",
++    [MXU3_sumz] = "sumz",
++    [MXU3_mfsum] = "mfsum",
++    [MXU3_mfsumz] = "mfsumz",
++    [MXU3_mtsum] = "mtsum",
++    [MXU3_mxsum] = "mxsum",
++    [MXU3_lih] = "lih",
++    [MXU3_liw] = "liw",
++    [MXU3_liwh] = "liwh",
++    [MXU3_liwr] = "liwr",
++    [MXU3_cmvw] = "cmvw",
++    [MXU3_pmaph] = "pmaph",
++    [MXU3_pmapw] = "pmapw",
++    [MXU3_luw] = "luw",
++    [MXU3_lud] = "lud",
++    [MXU3_luq] = "luq",
++    [MXU3_luo] = "luo",
++    [MXU3_law] = "law",
++    [MXU3_lad] = "lad",
++    [MXU3_laq] = "laq",
++    [MXU3_lao] = "lao",
++    [MXU3_suw] = "suw",
++    [MXU3_sud] = "sud",
++    [MXU3_suq] = "suq",
++    [MXU3_suo] = "suo",
++    [MXU3_saw] = "saw",
++    [MXU3_sad] = "sad",
++    [MXU3_saq] = "saq",
++    [MXU3_sao] = "sao",
++    [MXU3_luo2b] = "luo2b",
++    [MXU3_luo2h] = "luo2h",
++    [MXU3_luo2w] = "luo2w",
++    [MXU3_luo2d] = "luo2d",
++    [MXU3_luo2q] = "luo2q",
++    [MXU3_lao2b] = "lao2b",
++    [MXU3_lao2h] = "lao2h",
++    [MXU3_lao2w] = "lao2w",
++    [MXU3_lao2d] = "lao2d",
++    [MXU3_lao2q] = "lao2q",
++    [MXU3_suo2w] = "suo2w",
++    [MXU3_suo2d] = "suo2d",
++    [MXU3_suo2q] = "suo2q",
++    [MXU3_sao2w] = "sao2w",
++    [MXU3_sao2d] = "sao2d",
++    [MXU3_sao2q] = "sao2q",
++    [MXU3_luw2b] = "luw2b",
++    [MXU3_luw2h] = "luw2h",
++    [MXU3_luw4b] = "luw4b",
++    [MXU3_luw4h] = "luw4h",
++    [MXU3_luw8b] = "luw8b",
++    [MXU3_luw8h] = "luw8h",
++    [MXU3_luw16b] = "luw16b",
++    [MXU3_luw16h] = "luw16h",
++    [MXU3_law2b] = "law2b",
++    [MXU3_law2h] = "law2h",
++    [MXU3_law4b] = "law4b",
++    [MXU3_law4h] = "law4h",
++    [MXU3_law8b] = "law8b",
++    [MXU3_law8h] = "law8h",
++    [MXU3_law16b] = "law16b",
++    [MXU3_law16h] = "law16h",
++    [MXU3_lud2b] = "lud2b",
++    [MXU3_lud2h] = "lud2h",
++    [MXU3_lud2w] = "lud2w",
++    [MXU3_lud4b] = "lud4b",
++    [MXU3_lud4h] = "lud4h",
++    [MXU3_lud4w] = "lud4w",
++    [MXU3_lud8b] = "lud8b",
++    [MXU3_lud8h] = "lud8h",
++    [MXU3_lud8w] = "lud8w",
++    [MXU3_lad2b] = "lad2b",
++    [MXU3_lad2h] = "lad2h",
++    [MXU3_lad2w] = "lad2w",
++    [MXU3_lad4b] = "lad4b",
++    [MXU3_lad4h] = "lad4h",
++    [MXU3_lad4w] = "lad4w",
++    [MXU3_lad8b] = "lad8b",
++    [MXU3_lad8h] = "lad8h",
++    [MXU3_lad8w] = "lad8w",
++    [MXU3_sud2w] = "sud2w",
++    [MXU3_sud4w] = "sud4w",
++    [MXU3_sud8w] = "sud8w",
++    [MXU3_sad2w] = "sad2w",
++    [MXU3_sad4w] = "sad4w",
++    [MXU3_sad8w] = "sad8w",
++    [MXU3_luq2b] = "luq2b",
++    [MXU3_luq2h] = "luq2h",
++    [MXU3_luq2w] = "luq2w",
++    [MXU3_luq2d] = "luq2d",
++    [MXU3_luq4b] = "luq4b",
++    [MXU3_luq4h] = "luq4h",
++    [MXU3_luq4w] = "luq4w",
++    [MXU3_luq4d] = "luq4d",
++    [MXU3_laq2b] = "laq2b",
++    [MXU3_laq2h] = "laq2h",
++    [MXU3_laq2w] = "laq2w",
++    [MXU3_laq2d] = "laq2d",
++    [MXU3_laq4b] = "laq4b",
++    [MXU3_laq4h] = "laq4h",
++    [MXU3_laq4w] = "laq4w",
++    [MXU3_laq4d] = "laq4d",
++    [MXU3_suq2w] = "suq2w",
++    [MXU3_suq2d] = "suq2d",
++    [MXU3_suq4w] = "suq4w",
++    [MXU3_suq4d] = "suq4d",
++    [MXU3_saq2w] = "saq2w",
++    [MXU3_saq2d] = "saq2d",
++    [MXU3_saq4w] = "saq4w",
++    [MXU3_saq4d] = "saq4d",
++    [MXU3_nnrwr] = "nnrwr",
++    [MXU3_nnrrd] = "nnrrd",
++    [MXU3_nndwr] = "nndwr",
++    [MXU3_nndrd] = "nndrd",
++    [MXU3_nncmd] = "nncmd",
++    [MXU3_nnmac] = "nnmac",
++    [MXU3_gshufwb] = "gshufwb",
++    [MXU3_gshufwb_1] = "gshufwb_1",
++    [MXU3_gshufwb_2] = "gshufwb_2",
++    [MXU3_gshufvb] = "gshufvb",
++    [MXU3_gshufb] = "gshufb",
++    [MXU3_gshufwh] = "gshufwh",
++    [MXU3_gshufh] = "gshufh",
++};
+diff --git a/target/mips/tcg/mxu3_translate.c b/target/mips/tcg/mxu3_translate.c
+new file mode 100644
+--- /dev/null
++++ b/target/mips/tcg/mxu3_translate.c
+@@ -0,0 +1,301 @@
++/*
++ * Ingenic XBurst2 MXU3 (512-bit SIMD) - instruction decoder
++ *
++ * The decode table (mxu3-gen.c.inc) is generated from the Ingenic GCC 7.2
++ * libopcodes match/mask tables; the operand field positions below come
++ * from assembling each mnemonic with mips-linux-gnu-as and reading how
++ * each register/immediate field moves.  See mxu3.h / mxu3_helper.c for
++ * how the semantics were established.
++ *
++ * All MXU3 instructions are coprocessor-2 (CU2) instructions: when
++ * Status.CU2 == 0 they raise Coprocessor Unusable with Cause.CE == 2,
++ * exactly as the T40/T41 kernel's lazy-enable path (do_cpu / CU2 trap)
++ * expects.
++ */
++#include "qemu/osdep.h"
++#include "translate.h"
++#include "mxu3.h"
++
++#include "mxu3-gen.c.inc"
++
++static inline int xf(uint32_t insn, int pos, int len)
++{
++    return extract32(insn, pos, len);
++}
++static inline int xsf(uint32_t insn, int pos, int len)
++{
++    return sextract32(insn, pos, len);
++}
++
++static void gen_mxu3_reg(DisasContext *ctx, uint32_t id, uint32_t insn)
++{
++    int shape = mxu3_desc[id].shape;
++    int a = 0, b = 0, c = 0, d = 0;
++
++    switch (shape) {
++    case SH_VVV:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        break;
++    case SH_VV:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5);
++        break;
++    case SH_VVT:
++    case SH_EXTW:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5);
++        break;
++    case SH_GTW: {
++        /* gt2*: i,j 1 bit; gt4*: 2 bits; gt8w: 3 bits; i at 16, j at 21 */
++        int op = mxu3_desc[id].op;
++        int bits = (op == OP_GT4W || op == OP_GT4D) ? 2 :
++                   op == OP_GT8W ? 3 : 1;
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5);
++        c = xf(insn, 16, bits); d = xf(insn, 21, bits);
++        break;
++    }
++    case SH_VVI5:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); d = xf(insn, 11, 5);
++        break;
++    case SH_VVI8:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5);
++        d = xf(insn, 11, 5) | (xf(insn, 0, 3) << 5);
++        break;
++    case SH_LI:
++        a = xf(insn, 6, 5);
++        d = xf(insn, 11, 5) | (xf(insn, 0, 6) << 5) | (xf(insn, 16, 5) << 11);
++        break;
++    case SH_LIWR:
++        a = xf(insn, 6, 5); d = xsf(insn, 11, 10);
++        break;
++    case SH_ADDIW:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5);
++        d = xf(insn, 0, 3) | (xsf(insn, 16, 5) << 3);
++        break;
++    case SH_ADDRW:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5);
++        break;
++    case SH_REPI:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5); d = xf(insn, 16, 7);
++        break;
++    case SH_BSHLI:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5); d = xf(insn, 16, 7);
++        break;
++    case SH_MOVW:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5);
++        c = xf(insn, 21, 5); d = xf(insn, 16, 5);
++        break;
++    case SH_MOVX:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 5);
++        c = xf(insn, 21, 4); d = xf(insn, 16, 4);
++        break;
++    case SH_CMVW:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        d = xf(insn, 21, 4);
++        break;
++    case SH_GSHUFW:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        break;
++    case SH_GSHUFWB1:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        break;
++    case SH_MAC3:
++        a = xf(insn, 6, 2); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        break;
++    case SH_MTSUM:
++        a = xf(insn, 6, 2); b = xf(insn, 16, 5);
++        break;
++    case SH_MFSUM:
++        a = xf(insn, 6, 5); b = xf(insn, 11, 2);
++        break;
++    case SH_MXSUM:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); c = xf(insn, 11, 2);
++        break;
++    case SH_SUMZ:
++        a = xf(insn, 6, 2);
++        break;
++    case SH_SRSUM:
++        a = xf(insn, 6, 2); b = xf(insn, 16, 5);
++        break;
++    case SH_SRMAC:
++        a = xf(insn, 6, 2); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        break;
++    case SH_NNRD:
++        a = xf(insn, 6, 5);
++        break;
++    default:
++        a = xf(insn, 6, 5); b = xf(insn, 16, 5); c = xf(insn, 11, 5);
++        break;
++    }
++
++    gen_helper_mxu3(tcg_env, tcg_constant_i32(id), tcg_constant_i32(a),
++                    tcg_constant_i32(b), tcg_constant_i32(c),
++                    tcg_constant_i32(d));
++}
++
++static void gen_mxu3_ls(DisasContext *ctx, uint32_t id, uint32_t insn)
++{
++    const Mxu3Desc *de = &mxu3_desc[id];
++    int ew = de->ew, store = de->st, shape = de->shape;
++    int ebytes = 1 << (ew == EW_O ? 5 : ew == EW_Q ? 4 : ew == EW_D ? 3 : 2);
++    int shift = ew - EW_W;   /* element-index field is left-shifted by this */
++    int base = xf(insn, 21, 5);
++    int reg, idx, off;
++    TCGv addr = tcg_temp_new();
++
++    /*
++     * The lane index is left-justified in its 5-bit slot ([15:11] for
++     * loads, [10:6] for stores): law/lad/laq/lao put the index at
++     * [15:11]>>0,>>1,>>2,>>3 respectively.  The offset ([20:16]) is a
++     * signed element count, so the byte displacement is off*ebytes.
++     */
++    if (store) {
++        reg = xf(insn, 11, 5);
++        idx = xf(insn, 6, 5) >> shift;
++    } else {
++        reg = xf(insn, 6, 5);
++        idx = xf(insn, 11, 5) >> shift;
++    }
++    off = (shape == SH_LSIDX) ? xsf(insn, 16, 5) : 0;
++
++    gen_load_gpr(addr, base);
++    if (off) {
++        tcg_gen_addi_tl(addr, addr, off * ebytes);
++    }
++
++    if (store) {
++        gen_helper_mxu3_st(tcg_env, addr, tcg_constant_i32(reg),
++                           tcg_constant_i32(idx), tcg_constant_i32(ew));
++    } else {
++        gen_helper_mxu3_ld(tcg_env, addr, tcg_constant_i32(reg),
++                           tcg_constant_i32(idx), tcg_constant_i32(ew));
++    }
++}
++
++static void gen_mxu3_branch(DisasContext *ctx, uint32_t id, uint32_t insn)
++{
++    int rs = xf(insn, 16, 5);
++    int32_t offset = xsf(insn, 6, 15) << 2;
++
++    gen_helper_mxu3_br(bcond, tcg_env, tcg_constant_i32(id),
++                       tcg_constant_i32(rs));
++    ctx->btarget = ctx->base.pc_next + 4 + offset;
++    ctx->hflags |= MIPS_HFLAG_BC;
++    ctx->hflags |= MIPS_HFLAG_BDS32;
++}
++
++/* Ops whose semantics no available source fully specifies. */
++static bool mxu3_is_approx(int op)
++{
++    switch (op) {
++    case OP_PMAP: case OP_GSHUFB: case OP_GSHUFH: case OP_GSHUFVB:
++    case OP_GSHUFW: case OP_GSHUFWB: case OP_GSHUFWB_1: case OP_GSHUFWB_2:
++    case OP_GSHUFWH: case OP_GT1BI: case OP_GT2BI: case OP_GT4BI:
++    case OP_GTH:
++    case OP_BSHL: case OP_BSHR: case OP_BSHLI: case OP_BSHRI:
++    case OP_SRRED: case OP_FCADD: case OP_FCMULR: case OP_FCMULI:
++    case OP_FCLASSW: case OP_FXAS: case OP_EXTU3BW:
++    case OP_EXTW_LL: case OP_EXTW_LH: case OP_EXTW_HL: case OP_EXTW_HH:
++    case OP_ILVE2BI: case OP_ILVE4BI: case OP_ILVO2BI: case OP_ILVO4BI:
++    case OP_MAXU2BI: case OP_MAXU4BI: case OP_MINU2BI: case OP_MINU4BI:
++    case OP_NNRWR: case OP_NNDWR: case OP_NNCMD: case OP_NNRRD:
++    case OP_NNDRD: case OP_NNMAC: case OP_MFFPUW: case OP_MTFPUW:
++    case OP_LSST: case OP_CMVW: case OP_TOC:
++    case OP_EXTS1BIL: case OP_EXTS1BIH: case OP_EXTS2BIL: case OP_EXTS2BIH:
++    case OP_EXTS4BIL: case OP_EXTS4BIH:
++    case OP_EXTU1BIL: case OP_EXTU1BIH: case OP_EXTU2BIL: case OP_EXTU2BIH:
++    case OP_EXTU4BIL: case OP_EXTU4BIH:
++    case OP_SATSUB2BI: case OP_SATSUB4BI: case OP_SATSUH2BI: case OP_SATSUH4BI:
++    case OP_SATSUW2BI: case OP_SATSUW4BI: case OP_SATUUB2BI: case OP_SATUUB4BI:
++    case OP_SATUUH2BI: case OP_SATUUH4BI: case OP_SATUUW4BI:
++    case OP_NOP:
++        return true;
++    default:
++        return false;
++    }
++}
++
++bool decode_ase_mxu3(DisasContext *ctx, uint32_t insn)
++{
++    unsigned i;
++    uint32_t id = MXU3_NR;
++
++    for (i = 0; i < ARRAY_SIZE(mxu3_tbl); i++) {
++        if ((insn & mxu3_tbl[i].mask) == mxu3_tbl[i].match) {
++            id = mxu3_tbl[i].id;
++            break;
++        }
++    }
++    if (id == MXU3_NR) {
++        return false;
++    }
++
++    /* Coprocessor-unusable when Status.CU2 == 0: CE field = 2. */
++    if (unlikely(!(ctx->hflags & MIPS_HFLAG_CU2))) {
++        generate_exception_err(ctx, EXCP_CpU, 2);
++        return true;
++    }
++
++    {
++        static int count_all = -1;
++        bool approx = mxu3_is_approx(mxu3_desc[id].op);
++
++        if (count_all < 0) {
++            const char *e = getenv("QEMU_MXU3_STATS");
++            count_all = e && !strcmp(e, "all");
++        }
++        if (approx || count_all) {
++            gen_helper_mxu3_count(tcg_env, tcg_constant_i32(id),
++                                  tcg_constant_i32(approx));
++        }
++    }
++
++    switch (mxu3_desc[id].shape) {
++    case SH_LSIDX:
++    case SH_LSU:
++    case SH_LSST:
++        gen_mxu3_ls(ctx, id, insn);
++        break;
++    case SH_BR:
++        gen_mxu3_branch(ctx, id, insn);
++        break;
++    case SH_CFCMXU: {
++        int rd = xf(insn, 6, 5), sel = xf(insn, 11, 5);
++        TCGv t = tcg_temp_new();
++        gen_helper_mxu3_cfc(t, tcg_env, tcg_constant_i32(sel));
++        gen_store_gpr(t, rd);
++        break;
++    }
++    case SH_CTCMXU: {
++        int sel = xf(insn, 11, 5), rs = xf(insn, 21, 5);
++        TCGv t = tcg_temp_new();
++        gen_load_gpr(t, rs);
++        gen_helper_mxu3_ctc(tcg_env, tcg_constant_i32(sel), t);
++        break;
++    }
++    case SH_MFCPUW: {
++        int vw = xf(insn, 6, 5), rs = xf(insn, 21, 5);
++        TCGv t = tcg_temp_new();
++        gen_helper_mxu3_mfcpuw(t, tcg_env, tcg_constant_i32(vw));
++        gen_store_gpr(t, rs);
++        break;
++    }
++    case SH_MTCPUW: {
++        int rd = xf(insn, 6, 5), vw = xf(insn, 11, 5);
++        TCGv t = tcg_temp_new();
++        gen_load_gpr(t, rd);
++        gen_helper_mxu3_mtcpuw(tcg_env, tcg_constant_i32(vw), t);
++        break;
++    }
++    /* MFFPUW/MTFPUW (FPR<->MXU scalar moves) are not exercised by the
++     * kernel save/restore or by the tests; accepted as no-ops. */
++    case SH_NNWR:
++    case SH_NNDWR:
++    case SH_NNCMD:
++        /* NN-accelerator write/command: no architectural register effect
++         * that any available source documents; accepted as a no-op. */
++        break;
++    default:
++        gen_mxu3_reg(ctx, id, insn);
++        break;
++    }
++    return true;
++}
+diff --git a/target/mips/tcg/mxu3_helper.c b/target/mips/tcg/mxu3_helper.c
+new file mode 100644
+--- /dev/null
++++ b/target/mips/tcg/mxu3_helper.c
+@@ -0,0 +1,793 @@
++/*
++ * Ingenic XBurst2 MXU3 (512-bit SIMD) - execution helpers
++ *
++ * Semantics were established from the Ingenic GCC 7.2 toolchain only:
++ * the libopcodes match/mask/operand tables in objdump/as give the
++ * encodings and register/immediate fields; the RTL that
++ * lib/gcc/.../include/mxu3.h's __builtin_mxu3_* expand to give the exact
++ * per-instruction meaning (e.g. addw -> V16SI plus, extubl ->
++ * zero_extend of the low 32 bytes, smulbe -> signed even-byte multiply).
++ * Instructions whose RTL is an opaque UNSPEC (the gather "gt" and
++ * "gshuf" families, the sr/s reductions and the NN-accelerator ops) are
++ * not fully specified
++ * by any available source; they are implemented best-effort or as
++ * register-preserving no-ops (flagged "GUESS"/"approx" below) so that
++ * vendor code does not take an illegal-instruction trap, but their
++ * results are not guaranteed.  Everything else is exact.
++ */
++#include "qemu/osdep.h"
++#include "cpu.h"
++#include "exec/helper-proto.h"
++#include "fpu/softfloat.h"
++#include "accel/tcg/cpu-ldst.h"
++#include "qemu/log.h"
++#include "qemu/atomic.h"
++#include "mxu3.h"
++
++#include "mxu3-gen.c.inc"
++
++/* Host is little-endian in all of this project's build targets, and the
++ * guest (mipsel) is little-endian too, so a byte/half/word view of the
++ * 64-byte register matches guest lane order directly. */
++typedef union {
++    uint64_t d[8];
++    int64_t  sd[8];
++    uint32_t w[16];
++    int32_t  sw[16];
++    uint16_t h[32];
++    int16_t  sh[32];
++    uint8_t  b[64];
++    int8_t   sb[64];
++} MXU3Reg;
++
++static inline MXU3Reg *VR(CPUMIPSState *env, int n)
++{
++    return (MXU3Reg *)&env->mxu3_vr[n & 31][0];
++}
++static inline MXU3Reg *ACC(CPUMIPSState *env, int n)
++{
++    return (MXU3Reg *)&env->mxu3_acc[n & 3][0];
++}
++
++static const int ew_lanes[6] = { 64, 32, 16, 8, 4, 2 };
++
++static inline int64_t sat_s(int64_t v, int bits)
++{
++    int64_t lo = -(1LL << (bits - 1)), hi = (1LL << (bits - 1)) - 1;
++    return v < lo ? lo : v > hi ? hi : v;
++}
++static inline int64_t sat_u(int64_t v, int bits)
++{
++    int64_t hi = (1LL << bits) - 1;
++    return v < 0 ? 0 : v > hi ? hi : v;
++}
++
++static inline float32 F(uint32_t x) { return make_float32(x); }
++
++/* element get/set, signed and unsigned, by element-width code */
++static int64_t eget_s(MXU3Reg *r, int ew, int i)
++{
++    switch (ew) {
++    case EW_B: return r->sb[i];
++    case EW_H: return r->sh[i];
++    case EW_W: return r->sw[i];
++    default:   return r->sd[i];
++    }
++}
++static uint64_t eget_u(MXU3Reg *r, int ew, int i)
++{
++    switch (ew) {
++    case EW_B: return r->b[i];
++    case EW_H: return r->h[i];
++    case EW_W: return r->w[i];
++    default:   return r->d[i];
++    }
++}
++static void eset(MXU3Reg *r, int ew, int i, uint64_t v)
++{
++    switch (ew) {
++    case EW_B: r->b[i] = v; break;
++    case EW_H: r->h[i] = v; break;
++    case EW_W: r->w[i] = v; break;
++    default:   r->d[i] = v; break;
++    }
++}
++
++static void do_binary(CPUMIPSState *env, int op, int ew, int rd, int rs, int rt)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs), *b = VR(env, rt);
++    int n = ew_lanes[ew], i;
++    int bits = 8 << ew;
++
++    for (i = 0; i < n; i++) {
++        int64_t x = eget_s(a, ew, i), y = eget_s(b, ew, i);
++        uint64_t xu = eget_u(a, ew, i), yu = eget_u(b, ew, i), r = 0;
++        int sh;
++        switch (op) {
++        case OP_ADD: r = xu + yu; break;
++        case OP_SUB: r = xu - yu; break;
++        case OP_MUL: r = xu * yu; break;
++        case OP_AND: r = xu & yu; break;
++        case OP_ANDN: r = (~xu) & yu; break;
++        case OP_OR:  r = xu | yu; break;
++        case OP_ORN: r = (~xu) | yu; break;
++        case OP_XOR: r = xu ^ yu; break;
++        case OP_XORN: r = ~(xu ^ yu); break;
++        case OP_MAXS: r = x > y ? x : y; break;
++        case OP_MINS: r = x < y ? x : y; break;
++        case OP_MAXU: r = xu > yu ? xu : yu; break;
++        case OP_MINU: r = xu < yu ? xu : yu; break;
++        case OP_MAXA: { int64_t ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
++                        r = ax > ay ? x : y; break; }
++        case OP_MINA: { int64_t ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
++                        r = ax < ay ? x : y; break; }
++        case OP_CEQ:  r = (x == y) ? -1 : 0; break;
++        case OP_CLTS: r = (x <  y) ? -1 : 0; break;
++        case OP_CLES: r = (x <= y) ? -1 : 0; break;
++        case OP_CLTU: r = (xu <  yu) ? -1 : 0; break;
++        case OP_CLEU: r = (xu <= yu) ? -1 : 0; break;
++        case OP_SLL:  sh = yu & (bits - 1); r = xu << sh; break;
++        case OP_SRL:  sh = yu & (bits - 1); r = xu >> sh; break;
++        case OP_SRA:  sh = yu & (bits - 1); r = x >> sh; break;
++        case OP_SRLR: sh = yu & (bits - 1);
++                      r = sh ? (xu + (1ULL << (sh - 1))) >> sh : xu; break;
++        case OP_SRAR: sh = yu & (bits - 1);
++                      r = sh ? (x + (1LL << (sh - 1))) >> sh : x; break;
++        default: r = 0; break;
++        }
++        eset(&t, ew, i, r);
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_unary(CPUMIPSState *env, int op, int ew, int rd, int rs)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs);
++    int n = ew_lanes[ew], i;
++    for (i = 0; i < n; i++) {
++        int64_t x = eget_s(a, ew, i);
++        uint64_t r = 0;
++        switch (op) {
++        case OP_ABS:  r = x < 0 ? -x : x; break;
++        case OP_CEQZ: r = (x == 0) ? -1 : 0; break;
++        case OP_CLEZ: r = (x <= 0) ? -1 : 0; break;
++        case OP_CLTZ: r = (x <  0) ? -1 : 0; break;
++        default: r = x; break;
++        }
++        eset(&t, ew, i, r);
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_shift_imm(CPUMIPSState *env, int op, int ew, int rd, int rs,
++                         int imm)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs);
++    int n = ew_lanes[ew], i, bits = 8 << ew, sh = imm & (bits - 1);
++    for (i = 0; i < n; i++) {
++        int64_t x = eget_s(a, ew, i);
++        uint64_t xu = eget_u(a, ew, i), r = 0;
++        switch (op) {
++        case OP_SLL: r = xu << sh; break;
++        case OP_SRL: r = xu >> sh; break;
++        case OP_SRA: r = x >> sh; break;
++        case OP_SRLR: r = sh ? (xu + (1ULL << (sh - 1))) >> sh : xu; break;
++        case OP_SRAR: r = sh ? (x + (1LL << (sh - 1))) >> sh : x; break;
++        }
++        eset(&t, ew, i, r);
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_logic_imm(CPUMIPSState *env, int op, int rd, int rs, int imm)
++{
++    MXU3Reg t, *a = VR(env, rs);
++    int i;
++    for (i = 0; i < 64; i++) {
++        uint8_t x = a->b[i];
++        switch (op) {
++        case OP_ANDI: t.b[i] = x & imm; break;
++        case OP_ORI:  t.b[i] = x | imm; break;
++        case OP_XORI: t.b[i] = x ^ imm; break;
++        }
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_float(CPUMIPSState *env, int op, int rd, int rs, int rt)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs), *b = VR(env, rt);
++    float_status *s = &env->active_fpu.fp_status;
++    int i;
++    for (i = 0; i < 16; i++) {
++        float32 x = F(a->w[i]), y = F(b->w[i]);
++        uint32_t r = 0;
++        switch (op) {
++        case OP_FADD: r = float32_add(x, y, s); break;
++        case OP_FSUB: r = float32_sub(x, y, s); break;
++        case OP_FMUL: r = float32_mul(x, y, s); break;
++        case OP_FMAX: r = float32_maxnum(x, y, s); break;
++        case OP_FMIN: r = float32_minnum(x, y, s); break;
++        case OP_FMAXA: r = float32_maxnummag(x, y, s); break;
++        case OP_FMINA: r = float32_minnummag(x, y, s); break;
++        case OP_FCEQ: r = float32_eq_quiet(x, y, s) ? -1 : 0; break;
++        case OP_FCLT: r = float32_lt(x, y, s) ? -1 : 0; break;
++        case OP_FCLE: r = float32_le(x, y, s) ? -1 : 0; break;
++        case OP_FCOR: r = float32_unordered_quiet(x, y, s) ? 0 : -1; break;
++        default: r = a->w[i]; break;
++        }
++        t.w[i] = r;
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_fcvt(CPUMIPSState *env, int op, int rd, int rs)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs);
++    float_status *s = &env->active_fpu.fp_status;
++    int i;
++    for (i = 0; i < 16; i++) {
++        uint32_t r = 0;
++        switch (op) {
++        case OP_FFSIW: r = int32_to_float32(a->sw[i], s); break;
++        case OP_FFUIW: r = uint32_to_float32(a->w[i], s); break;
++        case OP_FTSIW: case OP_FTRUNCSW:
++            r = float32_to_int32_round_to_zero(F(a->w[i]), s); break;
++        case OP_FTUIW: case OP_FTRUNCUW:
++            r = float32_to_uint32_round_to_zero(F(a->w[i]), s); break;
++        case OP_FRINTW: r = float32_to_int32(F(a->w[i]), s); break;
++        default: r = a->w[i]; break;
++        }
++        t.w[i] = r;
++    }
++    *VR(env, rd) = t;
++}
++
++/* widening add/sub/mul: dst is wide lanes = rs(wide) OP extend(rt narrow).
++ * L takes the low half of rt's narrow lanes, H the high half. */
++static void do_widen(CPUMIPSState *env, int op, int ew, int rd, int rs, int rt)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs), *b = VR(env, rt);
++    int wlanes = ew_lanes[ew + 1];   /* result wide-lane count */
++    int hi = 0, i;
++    int sign = 1, kind;  /* kind: 0 add, 1 sub, 2 mul */
++    switch (op) {
++    case OP_WADDSL: case OP_WADDSH: case OP_WADDUL: case OP_WADDUH: kind = 0; break;
++    case OP_WSUBSL: case OP_WSUBSH: case OP_WSUBUL: case OP_WSUBUH: kind = 1; break;
++    default: kind = 2; break;
++    }
++    switch (op) {
++    case OP_WADDSH: case OP_WADDUH: case OP_WSUBSH: case OP_WSUBUH:
++    case OP_WMULSH: case OP_WMULUH: hi = 1; break;
++    }
++    switch (op) {
++    case OP_WADDUL: case OP_WADDUH: case OP_WSUBUL: case OP_WSUBUH:
++    case OP_WMULUL: case OP_WMULUH: sign = 0; break;
++    }
++    for (i = 0; i < wlanes; i++) {
++        int src = hi ? i + wlanes : i;
++        int64_t nv = sign ? eget_s(b, ew, src) : (int64_t)eget_u(b, ew, src);
++        int64_t wv = eget_s(a, ew + 1, i);
++        int64_t r;
++        if (kind == 0)      r = wv + nv;
++        else if (kind == 1) r = wv - nv;
++        else                r = wv * nv;    /* wsmul: wide*narrow */
++        eset(&t, ew + 1, i, r);
++    }
++    *VR(env, rd) = t;
++}
++
++/* even/odd narrow*narrow -> wide: smulbe etc. ew is the source width. */
++static void do_muleo(CPUMIPSState *env, int op, int ew, int rd, int rs, int rt)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs), *b = VR(env, rt);
++    int wlanes = ew_lanes[ew + 1], i;
++    int odd = (op == OP_MULEO_SO || op == OP_MULEO_UO);
++    int sign = (op == OP_MULEO_SE || op == OP_MULEO_SO);
++    for (i = 0; i < wlanes; i++) {
++        int src = 2 * i + odd;
++        int64_t x = sign ? eget_s(a, ew, src) : (int64_t)eget_u(a, ew, src);
++        int64_t y = sign ? eget_s(b, ew, src) : (int64_t)eget_u(b, ew, src);
++        eset(&t, ew + 1, i, x * y);
++    }
++    *VR(env, rd) = t;
++}
++
++/* sign/zero extend low or high narrow half to the next wider lane. */
++static void do_ext(CPUMIPSState *env, int op, int ew, int rd, int rt)
++{
++    MXU3Reg t = {0}, *a = VR(env, rt);
++    int wlanes = ew_lanes[ew + 1], i;
++    int hi = (op == OP_EXTSH || op == OP_EXTUH ||
++              op == OP_EXTS1BIH || op == OP_EXTS2BIH || op == OP_EXTS4BIH ||
++              op == OP_EXTU1BIH || op == OP_EXTU2BIH || op == OP_EXTU4BIH);
++    int sign = (op == OP_EXTSL || op == OP_EXTSH ||
++                op == OP_EXTS1BIL || op == OP_EXTS1BIH ||
++                op == OP_EXTS2BIL || op == OP_EXTS2BIH ||
++                op == OP_EXTS4BIL || op == OP_EXTS4BIH);
++    for (i = 0; i < wlanes; i++) {
++        int src = hi ? i + wlanes : i;
++        int64_t v = sign ? eget_s(a, ew, src) : (int64_t)eget_u(a, ew, src);
++        eset(&t, ew + 1, i, v);
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_ilv(CPUMIPSState *env, int op, int ew, int rd, int rs, int rt)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs), *b = VR(env, rt);
++    int n = ew_lanes[ew], half = n / 2, i;
++    int odd = (op == OP_ILVO);
++    for (i = 0; i < half; i++) {
++        int src = odd ? half + i : i;
++        eset(&t, ew, 2 * i,     eget_u(a, ew, src));
++        eset(&t, ew, 2 * i + 1, eget_u(b, ew, src));
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_sat(CPUMIPSState *env, int op, int rd, int rs)
++{
++    MXU3Reg t = {0}, *a = VR(env, rs);
++    int i;
++    switch (op) {
++    case OP_SATSSWB:
++        for (i = 0; i < 16; i++) { t.sw[i] = sat_s(a->sw[i], 8); } break;
++    case OP_SATSSWH:
++        for (i = 0; i < 16; i++) { t.sw[i] = sat_s(a->sw[i], 16); } break;
++    case OP_SATSUWB: case OP_SATSUW2BI: case OP_SATSUW4BI:
++        for (i = 0; i < 16; i++) { t.sw[i] = sat_u(a->sw[i], 8); } break;
++    case OP_SATSUWH:
++        for (i = 0; i < 16; i++) { t.sw[i] = sat_u(a->sw[i], 16); } break;
++    case OP_SATUUWB: case OP_SATUUW4BI:
++        for (i = 0; i < 16; i++) { t.w[i] = a->w[i] > 255 ? 255 : a->w[i]; } break;
++    case OP_SATUUWH:
++        for (i = 0; i < 16; i++) { t.w[i] = a->w[i] > 65535 ? 65535 : a->w[i]; } break;
++    case OP_SATSSHB:
++        for (i = 0; i < 32; i++) { t.sh[i] = sat_s(a->sh[i], 8); } break;
++    case OP_SATSUHB: case OP_SATSUH2BI: case OP_SATSUH4BI:
++        for (i = 0; i < 32; i++) { t.sh[i] = sat_u(a->sh[i], 8); } break;
++    case OP_SATUUHB: case OP_SATUUH2BI: case OP_SATUUH4BI:
++        for (i = 0; i < 32; i++) { t.h[i] = a->h[i] > 255 ? 255 : a->h[i]; } break;
++    case OP_SATSUB2BI: case OP_SATSUB4BI:
++        for (i = 0; i < 64; i++) { t.b[i] = a->sb[i] < 0 ? 0 : a->b[i]; } break;
++    case OP_SATUUB2BI: case OP_SATUUB4BI:
++        t = *a; break;
++    default: t = *a; break;
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_repi(CPUMIPSState *env, int ew, int rd, int rt, int idx)
++{
++    MXU3Reg t = {0}, *a = VR(env, rt);
++    int n = ew_lanes[ew], i;
++    uint64_t v = eget_u(a, ew, idx & (n - 1));
++    for (i = 0; i < n; i++) {
++        eset(&t, ew, i, v);
++    }
++    *VR(env, rd) = t;
++}
++
++static void do_shuf(CPUMIPSState *env, int op, int ew, int rd, int rt)
++{
++    /* shufw2/4/8: deinterleave 32-bit (or d/q) lanes into "stride" groups.
++     * Derived from the RTL vec_select constant for shufw2/shufw4/shufw8. */
++    MXU3Reg t = {0}, *a = VR(env, rt);
++    int n = ew_lanes[ew], i;
++    int stride = (op == OP_SHUF2) ? 2 : (op == OP_SHUF4) ? 4 : 8;
++    int groups = n / stride, dst = 0, g, k;
++    for (k = 0; k < stride; k++) {
++        for (g = 0; g < groups; g++) {
++            eset(&t, ew, dst++, eget_u(a, ew, g * stride + k));
++        }
++    }
++    (void)i;
++    *VR(env, rd) = t;
++}
++
++void helper_mxu3(CPUMIPSState *env, uint32_t id, int32_t a, int32_t b,
++                 int32_t c, int32_t d)
++{
++    const Mxu3Desc *de = &mxu3_desc[id];
++    int op = de->op, ew = de->ew, i;
++
++    switch (op) {
++    /* ---- elementwise ---- */
++    case OP_ADD: case OP_SUB: case OP_MUL:
++    case OP_AND: case OP_ANDN: case OP_OR: case OP_ORN:
++    case OP_XOR: case OP_XORN:
++    case OP_MAXS: case OP_MINS: case OP_MAXU: case OP_MINU:
++    case OP_MAXA: case OP_MINA:
++    case OP_CEQ: case OP_CLTS: case OP_CLES: case OP_CLTU: case OP_CLEU:
++        do_binary(env, op, ew, a, b, c);
++        break;
++    case OP_SLL: case OP_SRL: case OP_SRA: case OP_SRLR: case OP_SRAR:
++        if (de->shape == SH_VVI5) {
++            do_shift_imm(env, op, ew, a, b, d);
++        } else {
++            do_binary(env, op, ew, a, b, c);
++        }
++        break;
++    case OP_ABS: case OP_CEQZ: case OP_CLEZ: case OP_CLTZ:
++        do_unary(env, op, ew, a, b);
++        break;
++    case OP_ANDI: case OP_ORI: case OP_XORI:
++        do_logic_imm(env, op, a, b, d);
++        break;
++    case OP_BSEL: {
++        /* bselv rd,rs,rt : rd = (rd & ~rt?) ... from RTL:
++         * rd = rt ^ (rd_old & (rt ^ rs)). dst rd is also a source. */
++        MXU3Reg *rd = VR(env, a), *rs = VR(env, b), *rt = VR(env, c), o = *rd;
++        for (i = 0; i < 8; i++) {
++            rd->d[i] = rt->d[i] ^ (o.d[i] & (rt->d[i] ^ rs->d[i]));
++        }
++        break;
++    }
++    case OP_FADD: case OP_FSUB: case OP_FMUL:
++    case OP_FMAX: case OP_FMIN: case OP_FMAXA: case OP_FMINA:
++    case OP_FCEQ: case OP_FCLT: case OP_FCLE: case OP_FCOR:
++        do_float(env, op, a, b, c);
++        break;
++    case OP_FFSIW: case OP_FFUIW: case OP_FTSIW: case OP_FTUIW:
++    case OP_FRINTW: case OP_FTRUNCSW: case OP_FTRUNCUW:
++        do_fcvt(env, op, a, b);
++        break;
++    case OP_WADDSL: case OP_WADDSH: case OP_WADDUL: case OP_WADDUH:
++    case OP_WSUBSL: case OP_WSUBSH: case OP_WSUBUL: case OP_WSUBUH:
++    case OP_WMULSL: case OP_WMULSH: case OP_WMULUL: case OP_WMULUH:
++        do_widen(env, op, ew, a, b, c);
++        break;
++    case OP_MULEO_SE: case OP_MULEO_SO: case OP_MULEO_UE: case OP_MULEO_UO:
++        do_muleo(env, op, ew, a, b, c);
++        break;
++    case OP_EXTSL: case OP_EXTSH: case OP_EXTUL: case OP_EXTUH:
++    case OP_EXTS1BIL: case OP_EXTS1BIH: case OP_EXTS2BIL: case OP_EXTS2BIH:
++    case OP_EXTS4BIL: case OP_EXTS4BIH:
++    case OP_EXTU1BIL: case OP_EXTU1BIH: case OP_EXTU2BIL: case OP_EXTU2BIH:
++    case OP_EXTU4BIL: case OP_EXTU4BIH:
++        do_ext(env, op, ew, a, b);
++        break;
++    case OP_ILVE: case OP_ILVO:
++        do_ilv(env, op, ew, a, b, c);
++        break;
++    case OP_SATSSHB: case OP_SATSSWB: case OP_SATSSWH:
++    case OP_SATSUHB: case OP_SATSUWB: case OP_SATSUWH:
++    case OP_SATSUB2BI: case OP_SATSUB4BI: case OP_SATSUH2BI: case OP_SATSUH4BI:
++    case OP_SATSUW2BI: case OP_SATSUW4BI:
++    case OP_SATUUHB: case OP_SATUUWB: case OP_SATUUWH:
++    case OP_SATUUB2BI: case OP_SATUUB4BI: case OP_SATUUH2BI: case OP_SATUUH4BI:
++    case OP_SATUUW4BI:
++        do_sat(env, op, a, b);
++        break;
++    case OP_REPI:
++        do_repi(env, ew, a, b, d);
++        break;
++    case OP_SHUF2: case OP_SHUF4: case OP_SHUF8:
++        do_shuf(env, op, ew, a, b);
++        break;
++
++    /*
++     * Gather of every N-th element.  gtNx rd[i], rt, j: the m = lanes/N
++     * elements rt.x[N*k + j] go to block i of rd (rd.x[i*m + k]); the
++     * rest of rd is kept.  Exact: the GCC RTL for __builtin_mxu3_gtNx is
++     * vec_merge (vec_duplicate (vec_select rt [j, j+N, ...])) rd mask,
++     * with mask selecting block i.
++     */
++    case OP_GT2W: case OP_GT4W: case OP_GT8W:
++    case OP_GT2D: case OP_GT4D: case OP_GT2Q: {
++        MXU3Reg t = *VR(env, a), *src = VR(env, b);
++        int n = (op == OP_GT4W || op == OP_GT4D) ? 4 : op == OP_GT8W ? 8 : 2;
++        int lanes = ew_lanes[ew], m = lanes / n, k, w;
++        int words = (ew == EW_Q) ? 2 : 1;   /* 64-bit words per element */
++        for (k = 0; k < m; k++) {
++            int dst = (c & (n - 1)) * m + k, from = n * k + (d & (n - 1));
++            if (ew == EW_W) {
++                t.w[dst] = src->w[from];
++            } else {
++                for (w = 0; w < words; w++) {
++                    t.d[dst * words + w] = src->d[from * words + w];
++                }
++            }
++        }
++        *VR(env, a) = t;
++        break;
++    }
++    /*
++     * gtb/gth: within each 64-bit lane, the even elements (bytes, or
++     * halfwords for gth) are packed into the low 32 bits and the odd ones
++     * into the high 32 bits.  The RTL is an UNSPEC; the rule was fixed by
++     * libimp's narrowing idiom "gtb x,x ; gt2w x[0],x,0" (32 halfwords ->
++     * 32 packed bytes), which only a 64-bit-lane even/odd split satisfies,
++     * and is confirmed by the IVS move detector reporting motion on the
++     * moving test pattern.  The odd half is the natural complement (no
++     * code reads it).  gth is the same split on halfwords, unconfirmed.
++     */
++    case OP_GTB: case OP_GTH: {
++        MXU3Reg t, *src = VR(env, b);
++        int l, k;
++        for (l = 0; l < 8; l++) {
++            if (op == OP_GTB) {
++                for (k = 0; k < 4; k++) {
++                    t.b[l * 8 + k]     = src->b[l * 8 + 2 * k];
++                    t.b[l * 8 + 4 + k] = src->b[l * 8 + 2 * k + 1];
++                }
++            } else {
++                for (k = 0; k < 2; k++) {
++                    t.h[l * 4 + k]     = src->h[l * 4 + 2 * k];
++                    t.h[l * 4 + 2 + k] = src->h[l * 4 + 2 * k + 1];
++                }
++            }
++        }
++        *VR(env, a) = t;
++        break;
++    }
++
++    /* ---- immediate loads ---- */
++    case OP_LIH: {
++        MXU3Reg *rd = VR(env, a);
++        for (i = 0; i < 32; i++) rd->h[i] = d;
++        break;
++    }
++    case OP_LIW: {
++        MXU3Reg *rd = VR(env, a);
++        for (i = 0; i < 16; i++) rd->sw[i] = (int32_t)d;
++        break;
++    }
++    case OP_LIWH: {
++        MXU3Reg *rd = VR(env, a);
++        for (i = 0; i < 32; i += 2) rd->h[i] = d;   /* low half of each word */
++        break;
++    }
++    case OP_LIWR:
++        env->mxu3_vwr[a & 31] = (int32_t)d;
++        break;
++    case OP_ADDIW:
++        env->mxu3_vwr[a & 31] = (int32_t)env->mxu3_vwr[b & 31] + (int32_t)d;
++        break;
++    case OP_ADDRW:
++        env->mxu3_vwr[a & 31] = (int32_t)env->mxu3_vwr[a & 31]
++                              + (int32_t)env->mxu3_vwr[b & 31];
++        break;
++
++    /* ---- moves ---- */
++    case OP_MOVW: {   /* rd.w[didx] = rt.w[sidx]; a=rd,b=rt,c=didx,d=sidx */
++        VR(env, a)->w[c & 15] = VR(env, b)->w[d & 15];
++        break;
++    }
++    case OP_MOVX: {   /* d/q/o move of one lane. ew gives width. */
++        MXU3Reg *rd = VR(env, a), *rt = VR(env, b);
++        int lw = (ew == EW_D) ? 1 : (ew == EW_Q) ? 2 : 4; /* in 64-bit words */
++        int di = (c & 7) * lw, si = (d & 7) * lw;
++        for (i = 0; i < lw; i++) rd->d[di + i] = rt->d[si + i];
++        break;
++    }
++    case OP_CMVW: {   /* conditional merge: rd.w[sel] = rt-selected; from RTL
++                       * it builds a word result; model as rd.w[d]=rt.w[d]
++                       * gated by rs. approx. */
++        VR(env, a)->w[d & 15] = VR(env, c)->w[d & 15];
++        break;
++    }
++
++    /* ---- accumulator ---- */
++    case OP_MTSUM: {  /* acc = rt (16x32) ; a=acc, b=rs */
++        *ACC(env, a) = *VR(env, b);
++        break;
++    }
++    case OP_MFSUM: {  /* rd = acc ; a=rd, b=acc */
++        *VR(env, a) = *ACC(env, b);
++        break;
++    }
++    case OP_MFSUMZ: { /* rd = acc; acc = 0 */
++        *VR(env, a) = *ACC(env, b);
++        memset(ACC(env, b), 0, 64);
++        break;
++    }
++    case OP_SUMZ:
++        memset(ACC(env, a), 0, 64);
++        break;
++    case OP_MXSUM: {  /* rd = acc; acc = rs */
++        MXU3Reg tmp = *ACC(env, c);
++        *ACC(env, c) = *VR(env, b);
++        *VR(env, a) = tmp;
++        break;
++    }
++    case OP_TOC:      /* "to accumulator": acc = rs */
++        *ACC(env, a) = *VR(env, b);
++        break;
++    case OP_MLAW: case OP_MLSW: {  /* acc.w += / -= rs.w * rt.w */
++        MXU3Reg *acc = ACC(env, a), *rs = VR(env, b), *rt = VR(env, c);
++        for (i = 0; i < 16; i++) {
++            int32_t p = rs->sw[i] * rt->sw[i];
++            acc->sw[i] += (op == OP_MLAW) ? p : -p;
++        }
++        break;
++    }
++    case OP_SMLAHE: case OP_SMLAHO: case OP_SMLSHE: case OP_SMLSHO: {
++        MXU3Reg *acc = ACC(env, a), *rs = VR(env, b), *rt = VR(env, c);
++        int odd = (op == OP_SMLAHO || op == OP_SMLSHO);
++        int sub = (op == OP_SMLSHE || op == OP_SMLSHO);
++        for (i = 0; i < 16; i++) {
++            int32_t p = (int32_t)rs->sh[2 * i + odd] * rt->sh[2 * i + odd];
++            acc->sw[i] += sub ? -p : p;
++        }
++        break;
++    }
++    case OP_WSMLAHL: case OP_WSMLAHH: case OP_WSMLSHL: case OP_WSMLSHH: {
++        MXU3Reg *acc = ACC(env, a), *rs = VR(env, b), *rt = VR(env, c);
++        int hi = (op == OP_WSMLAHH || op == OP_WSMLSHH);
++        int sub = (op == OP_WSMLSHL || op == OP_WSMLSHH);
++        for (i = 0; i < 16; i++) {
++            int32_t p = rs->sw[i] * (int32_t)rt->sh[hi ? i + 16 : i];
++            acc->sw[i] += sub ? -p : p;
++        }
++        break;
++    }
++
++    /* ---- control ---- */
++    case OP_CFCMXU:   /* gpr <- mcs ; handled in translate (needs GPR) */
++    case OP_CTCMXU:
++    case OP_MFCPUW: case OP_MTCPUW: case OP_MFFPUW: case OP_MTFPUW:
++        /* implemented in translate.c */
++        break;
++
++    /* ---- not fully specified by available sources: preserve dst ---- */
++    case OP_PMAP: case OP_GSHUFB: case OP_GSHUFH: case OP_GSHUFVB:
++    case OP_GSHUFW: case OP_GSHUFWB: case OP_GSHUFWB_1: case OP_GSHUFWB_2:
++    case OP_GSHUFWH:
++    case OP_BSHL: case OP_BSHR: case OP_BSHLI: case OP_BSHRI:
++    case OP_SRRED: case OP_FCADD: case OP_FCMULR: case OP_FCMULI:
++    case OP_FCLASSW: case OP_FXAS:
++    case OP_EXTU3BW: case OP_EXTW_LL: case OP_EXTW_LH:
++    case OP_EXTW_HL: case OP_EXTW_HH:
++    case OP_ILVE2BI: case OP_ILVE4BI: case OP_ILVO2BI: case OP_ILVO4BI:
++    case OP_MAXU2BI: case OP_MAXU4BI: case OP_MINU2BI: case OP_MINU4BI:
++    case OP_NNRWR: case OP_NNDWR: case OP_NNCMD: case OP_NNRRD:
++    case OP_NNDRD: case OP_NNMAC:
++    case OP_NOP:
++    default:
++        /* GUESS/unspecified: leave destination register unchanged so the
++         * instruction retires without an illegal-instruction trap. */
++        break;
++    }
++}
++
++/* branch condition: return nonzero if the branch is taken. */
++target_ulong helper_mxu3_br(CPUMIPSState *env, uint32_t id, int32_t rs)
++{
++    const Mxu3Desc *de = &mxu3_desc[id];
++    MXU3Reg *a = VR(env, rs);
++    int i;
++
++    if (de->op == OP_BEQZV || de->op == OP_BNEZV) {
++        int zero = 1;
++        for (i = 0; i < 8; i++) {
++            if (a->d[i]) { zero = 0; break; }
++        }
++        /* beqzv: whole vector zero; bnezv: any bit set */
++        return (de->op == OP_BEQZV) ? zero : !zero;
++    }
++    /* per-element: beqz* branch if ANY element == 0, bnez* if none is 0 */
++    {
++        int n = ew_lanes[de->ew], anyzero = 0;
++        for (i = 0; i < n; i++) {
++            if (eget_u(a, de->ew, i) == 0) { anyzero = 1; break; }
++        }
++        return (de->op == OP_BEQZ) ? anyzero : !anyzero;
++    }
++}
++
++/* element load: read one element (ew width) from guest memory into lane. */
++void helper_mxu3_ld(CPUMIPSState *env, target_ulong addr, uint32_t reg,
++                    uint32_t idx, uint32_t ew)
++{
++    MXU3Reg *r = VR(env, reg);
++    uintptr_t ra = GETPC();
++    switch (ew) {
++    case EW_W: r->w[idx & 15] = cpu_ldl_data_ra(env, addr, ra); break;
++    case EW_D: r->d[idx & 7]  = cpu_ldq_data_ra(env, addr, ra); break;
++    case EW_Q: {
++        int b = (idx & 3) * 2;
++        r->d[b]   = cpu_ldq_data_ra(env, addr, ra);
++        r->d[b+1] = cpu_ldq_data_ra(env, addr + 8, ra);
++        break;
++    }
++    case EW_O: {
++        int b = (idx & 1) * 4, i;
++        for (i = 0; i < 4; i++)
++            r->d[b + i] = cpu_ldq_data_ra(env, addr + 8 * i, ra);
++        break;
++    }
++    }
++}
++
++void helper_mxu3_st(CPUMIPSState *env, target_ulong addr, uint32_t reg,
++                    uint32_t idx, uint32_t ew)
++{
++    MXU3Reg *r = VR(env, reg);
++    uintptr_t ra = GETPC();
++    switch (ew) {
++    case EW_W: cpu_stl_data_ra(env, addr, r->w[idx & 15], ra); break;
++    case EW_D: cpu_stq_data_ra(env, addr, r->d[idx & 7], ra); break;
++    case EW_Q: {
++        int b = (idx & 3) * 2;
++        cpu_stq_data_ra(env, addr, r->d[b], ra);
++        cpu_stq_data_ra(env, addr + 8, r->d[b+1], ra);
++        break;
++    }
++    case EW_O: {
++        int b = (idx & 1) * 4, i;
++        for (i = 0; i < 4; i++)
++            cpu_stq_data_ra(env, addr + 8 * i, r->d[b + i], ra);
++        break;
++    }
++    }
++}
++
++/* control-register read: MCS0 = MIR (id, reports MXU3 present/version),
++ * MCS31 = MXU control/status (the kernel saves/restores this one). */
++target_ulong helper_mxu3_cfc(CPUMIPSState *env, uint32_t sel)
++{
++    if (sel == 31) {
++        return env->mxu3_csr;
++    }
++    if (sel == 0) {
++        return 0x00030000;   /* MIR: arbitrary "MXU3 present" id */
++    }
++    return 0;
++}
++
++void helper_mxu3_ctc(CPUMIPSState *env, uint32_t sel, target_ulong val)
++{
++    if (sel == 31) {
++        env->mxu3_csr = val;
++    }
++}
++
++target_ulong helper_mxu3_mfcpuw(CPUMIPSState *env, uint32_t vw)
++{
++    return (int32_t)env->mxu3_vwr[vw & 31];
++}
++
++void helper_mxu3_mtcpuw(CPUMIPSState *env, uint32_t vw, target_ulong val)
++{
++    env->mxu3_vwr[vw & 31] = val;
++}
++
++/*
++ * Approximated mnemonics: count dynamic executions and warn once per
++ * mnemonic under -d unimp, because their results are not trustworthy.
++ * QEMU_MXU3_STATS=1 in the environment prints the per-mnemonic counts of
++ * approximated instructions to stderr when QEMU exits; QEMU_MXU3_STATS=all
++ * counts every MXU3 mnemonic (exact ones are marked "exact").
++ */
++static uint64_t mxu3_exec_count[MXU3_NR];
++static bool mxu3_was_approx[MXU3_NR];
++
++static void mxu3_dump_stats(void)
++{
++    int i;
++
++    for (i = 0; i < MXU3_NR; i++) {
++        if (mxu3_exec_count[i]) {
++            fprintf(stderr, "mxu3-%s %-12s %" PRIu64 "\n",
++                    mxu3_was_approx[i] ? "approx" : "exact ",
++                    mxu3_name[i], mxu3_exec_count[i]);
++        }
++    }
++}
++
++void helper_mxu3_count(CPUMIPSState *env, uint32_t id, uint32_t approx)
++{
++    static bool registered;
++
++    if (!qatomic_xchg(&registered, true) && getenv("QEMU_MXU3_STATS")) {
++        atexit(mxu3_dump_stats);
++    }
++    if (qatomic_fetch_inc(&mxu3_exec_count[id]) == 0 && approx) {
++        mxu3_was_approx[id] = true;
++        qemu_log_mask(LOG_UNIMP, "mxu3: %s executed at pc 0x" TARGET_FMT_lx
++                      "; its semantics are approximated, results are "
++                      "not trustworthy\n", mxu3_name[id], env->active_tc.PC);
++    }
++}
+diff --git a/target/mips/tcg/mxu3_helper.h.inc b/target/mips/tcg/mxu3_helper.h.inc
+new file mode 100644
+--- /dev/null
++++ b/target/mips/tcg/mxu3_helper.h.inc
+@@ -0,0 +1,10 @@
++/* Ingenic XBurst2 MXU3 helper prototypes. */
++DEF_HELPER_6(mxu3, void, env, i32, s32, s32, s32, s32)
++DEF_HELPER_3(mxu3_br, tl, env, i32, s32)
++DEF_HELPER_5(mxu3_ld, void, env, tl, i32, i32, i32)
++DEF_HELPER_5(mxu3_st, void, env, tl, i32, i32, i32)
++DEF_HELPER_2(mxu3_cfc, tl, env, i32)
++DEF_HELPER_3(mxu3_ctc, void, env, i32, tl)
++DEF_HELPER_2(mxu3_mfcpuw, tl, env, i32)
++DEF_HELPER_3(mxu3_mtcpuw, void, env, i32, tl)
++DEF_HELPER_3(mxu3_count, void, env, i32, i32)

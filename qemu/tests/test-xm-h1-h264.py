@@ -8,6 +8,12 @@ counted in RLC_CTRL[28:23]).  The headers below are the ones majestic's XM530
 backend writes (Main profile, CABAC); the model has to fit its slices to them.
 
     python3 qemu/tests/test-xm-h1-h264.py [--qemu PATH] [--keep OUT.h264]
+        [--interleave]
+
+--interleave: two channels of one size, as majestic runs its main and D1
+channels on the one H1, with different headers (majestic's Main/CABAC and a
+Baseline/CAVLC pair) and their own reference / reconstruction buffers, the
+jobs alternating; each channel's stream must decode on its own.
 """
 import argparse, atexit, math, os, shutil, subprocess, sys, tempfile
 
@@ -17,6 +23,9 @@ from importlib import import_module
 jt = import_module('test-xm-h1-jpeg')
 
 H1 = jt.H1
+# the second generation's H1 (XM533, XM535) sits where XM530V200 has its
+# JPEG engine
+H1_BASE = {'xm533': 0x21100000, 'xm535': 0x21100000}
 REG = dict(jt.REG, ENC_CTRL0=0x040, HDR_REM_MSB=0x058, HDR_REM_LSB=0x05c,
            RLC_CTRL=0x094)
 ENC_EN, MODE_H264, PIC_INTRA = 1, 3 << 1, 1 << 3
@@ -26,7 +35,44 @@ INT_ERROR, INT_BUF_FULL = 1 << 3, 1 << 5    # Hantro's ASIC_STATUS_ERROR / _BUFF
 HEADERS = bytes.fromhex('00000001274d001f8d6a0b012684000003000400000300ca10'
                         '0000000128ee0b')
 REMAINDER = 0xc8
+# --baseline: what Sofia's library writes on the second-generation XM535
+# (its 800x448 substream): Baseline profile, so CAVLC, and POC type 2
+HEADERS_BASELINE = bytes.fromhex('000000012742001f8d6a0c839a1000000300100000'
+                                 '030108400000000128ce3c')
+REMAINDER_BASELINE = 0x80
 IN_ADDR, BUF_ADDR, BUF_SIZE = 0x81000000, 0x82000000, 0x100000
+REF_LUMA, RECON_LUMA = 0x01c, 0x024
+
+
+def baseline_headers(w, h):
+    """A Baseline (CAVLC, POC type 2) SPS and PPS for w x h, as start-coded
+    NALs with emulation prevention."""
+    def ue(v):
+        v += 1
+        return '0' * (v.bit_length() - 1) + format(v, 'b')
+
+    def se(v):
+        return ue(2 * v - 1 if v > 0 else -2 * v)
+
+    def nal(head, bits):
+        bits += '1'
+        bits += '0' * (-len(bits) % 8)
+        raw = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+        out, zeros = bytearray(), 0
+        for c in raw:
+            if zeros >= 2 and c <= 3:
+                out.append(3)
+                zeros = 0
+            out.append(c)
+            zeros = zeros + 1 if c == 0 else 0
+        return b'\x00\x00\x00\x01' + bytes([head]) + bytes(out)
+
+    sps = (format(66, '08b') + '00000000' + format(31, '08b') + ue(0) +
+           ue(0) + ue(2) + ue(1) + '0' + ue(w // 16 - 1) + ue(h // 16 - 1) +
+           '1' + '1' + '0' + '0')
+    pps = (ue(0) + ue(0) + '0' + '0' + ue(0) + ue(0) + ue(0) + '0' + '00' +
+           se(0) + se(0) + se(0) + '1' + '0' + '0')
+    return nal(0x67, sps) + nal(0x68, pps)
 
 
 def main():
@@ -36,8 +82,19 @@ def main():
     ap.add_argument('--machine', default='xm530')
     ap.add_argument('--keep')
     ap.add_argument('--frames', type=int, default=4)
+    ap.add_argument('--baseline', action='store_true',
+                    help="Sofia's Baseline (CAVLC) SPS/PPS instead of majestic's")
+    ap.add_argument('--interleave', action='store_true',
+                    help='two channels of one size, different headers, alternating')
     a = ap.parse_args()
+    if a.interleave:
+        return interleave(a)
+    global HEADERS, REMAINDER, H1
+    H1 = H1_BASE.get(a.machine, H1)
     w, h, qp = 704, 576, 28           # the SPS's size
+    if a.baseline:
+        HEADERS, REMAINDER = HEADERS_BASELINE, REMAINDER_BASELINE
+        w, h = 800, 448
     fails = 0
 
     def check(ok, what):
@@ -146,6 +203,79 @@ def main():
     check(cat == stream, 'the dumped jobs concatenate into the stream')
 
     print('=== %s: H1 H.264 ===' % ('PASS' if not fails else 'FAIL'))
+    return 1 if fails else 0
+
+
+def interleave(a):
+    """Channels A (majestic's headers) and B (Baseline) at 704x576, jobs
+    alternating A, B, A, B, ...; each one's own reference/reconstruction
+    pair, swapped every job as Hantro's library does."""
+    global H1
+    H1 = H1_BASE.get(a.machine, H1)
+    w, h = 704, 576
+    fails = 0
+
+    def check(ok, what):
+        nonlocal fails
+        print(('ok   ' if ok else 'FAIL ') + what)
+        fails += not ok
+
+    src = jt.test_frame(w, h)
+    y_plane, uv = jt.to_nv12(src)
+    chans = [dict(name='A', hdr=HEADERS, rem=REMAINDER, bufs=[0x84000000, 0x84200000]),
+             dict(name='B', hdr=baseline_headers(w, h), rem=None,
+                  bufs=[0x85000000, 0x85200000])]
+    for c in chans:
+        c['stream'] = b''
+    q = jt.QTest(a.qemu, a.machine, ())
+    try:
+        q.write(IN_ADDR, y_plane)
+        q.write(IN_ADDR + w * h, uv)
+        for f in range(2 * a.frames):
+            c = chans[f % 2]
+            n_c = f // 2
+            idr = n_c % 2 == 0
+            pre = c['hdr'] if idr else b''
+            q.write(BUF_ADDR, pre)
+            out = BUF_ADDR + len(pre)
+            q.writel(H1 + REG['IN_IMG_CTRL'], (w << 12) | (jt.FMT_YUV420SP << 2))
+            q.writel(H1 + REG['OUT'], out)
+            q.writel(H1 + REG['STR_BUF_LIMIT'], BUF_SIZE - len(pre))
+            q.writel(H1 + REG['IN0'], IN_ADDR)
+            q.writel(H1 + REG['IN1'], IN_ADDR + w * h)
+            q.writel(H1 + REF_LUMA, c['bufs'][n_c % 2])
+            q.writel(H1 + RECON_LUMA, c['bufs'][(n_c + 1) % 2])
+            rem = c['rem'] if idr and c['rem'] is not None else None
+            q.writel(H1 + REG['HDR_REM_MSB'], rem << 24 if rem is not None else 0)
+            q.writel(H1 + REG['HDR_REM_LSB'], 0)
+            q.writel(H1 + REG['RLC_CTRL'], (8 if rem is not None else 0) << 23)
+            q.writel(H1 + REG['ENC_CTRL0'], 28 << 26)
+            q.writel(H1 + REG['ENC_CTRL'], ((w // 16) << 19) | ((h // 16) << 10) |
+                     MODE_H264 | (PIC_INTRA if idr else 0) | ENC_EN)
+            irq = q.readl(H1 + REG['INTERRUPT'])
+            check(bool(irq & jt.INT_FRAME_RDY),
+                  '%s%d: FRAME_RDY (0x%x)' % (c['name'], n_c, irq))
+            n = q.readl(H1 + REG['STR_BUF_LIMIT']) // 8
+            c['stream'] += pre + q.read(out, n)
+            q.writel(H1 + REG['INTERRUPT'], 0)
+    finally:
+        q.close()
+
+    tmp = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, tmp, True)
+    for c in chans:
+        path = os.path.join(tmp, c['name'] + '.h264')
+        open(path, 'wb').write(c['stream'])
+        r = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode',
+                            '-i', path, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'],
+                           capture_output=True)
+        check(r.returncode == 0 and not r.stderr, 'channel %s decodes on its own%s' %
+              (c['name'], ': ' + r.stderr.decode()[-200:] if r.stderr else ''))
+        frames = len(r.stdout) // (w * h * 3 // 2)
+        check(frames == a.frames, 'channel %s: %d of %d frames' %
+              (c['name'], frames, a.frames))
+    print('=== %s: H1 H.264, two channels interleaved ===' %
+          ('PASS' if not fails else 'FAIL'))
     return 1 if fails else 0
 
 

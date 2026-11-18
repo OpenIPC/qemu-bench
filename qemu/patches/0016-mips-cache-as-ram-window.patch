@@ -1,0 +1,84 @@
+mips: cache-as-RAM window for boot ROMs that load the SPL into the cache
+
+The Ingenic mask ROM loads the SPL into locked cache lines at KSEG0
+0x80001000 and runs it there before DDR exists; the T41 SPL then tests
+all of DDR through KSEG1, which on silicon cannot touch the running SPL.
+With the SPL in DDR it overwrites itself.  A CPU with car-size set sends
+KSEG0 [0x80000000, +car-size) to car-phys from reset until the first
+instruction fetch from KSEG0 outside the window.
+
+diff --git a/target/mips/cpu.c b/target/mips/cpu.c
+index 5989c3b..5855c0b 100644
+--- a/target/mips/cpu.c
++++ b/target/mips/cpu.c
+@@ -193,6 +193,7 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
+     if (mcc->parent_phases.hold) {
+         mcc->parent_phases.hold(obj, type);
+     }
++    cpu->car_active = cpu->car_size != 0;
+ 
+     memset(env, 0, offsetof(CPUMIPSState, end_reset_fields));
+ 
+@@ -539,6 +540,8 @@ static const struct SysemuCPUOps mips_sysemu_ops = {
+ 
+ static const Property mips_cpu_properties[] = {
+     DEFINE_PROP_BOOL("big-endian", MIPSCPU, is_big_endian, TARGET_BIG_ENDIAN),
++    DEFINE_PROP_UINT32("car-size", MIPSCPU, car_size, 0),
++    DEFINE_PROP_UINT64("car-phys", MIPSCPU, car_phys, 0),
+ };
+ 
+ #ifdef CONFIG_TCG
+diff --git a/target/mips/cpu.h b/target/mips/cpu.h
+index 5cd4c6c..4d8b5fd 100644
+--- a/target/mips/cpu.h
++++ b/target/mips/cpu.h
+@@ -1211,6 +1211,15 @@ struct ArchCPU {
+ 
+     /* Properties */
+     bool is_big_endian;
++    /*
++     * Cache-as-RAM: while car_active, KSEG0 [0x80000000, +car_size) is
++     * the RAM at car_phys instead of DDR (the boot ROM loads the SPL into
++     * locked cache lines).  The first instruction fetch from KSEG0
++     * outside that window -- the jump to the next stage -- ends it.
++     */
++    uint32_t car_size;
++    uint64_t car_phys;
++    bool car_active;
+ };
+ 
+ /**
+diff --git a/target/mips/system/physaddr.c b/target/mips/system/physaddr.c
+index b8e1a5a..37c497e 100644
+--- a/target/mips/system/physaddr.c
++++ b/target/mips/system/physaddr.c
+@@ -19,6 +19,7 @@
+ #include "qemu/osdep.h"
+ #include "cpu.h"
+ #include "exec/page-protection.h"
++#include "exec/cputlb.h"
+ #include "../internal.h"
+ 
+ static int is_seg_am_mapped(unsigned int am, bool eu, int mmu_idx)
+@@ -203,6 +204,21 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
+ #endif
+     } else if (address < KSEG1_BASE) {
+         /* kseg0 */
++        MIPSCPU *cpu = env_archcpu(env);
++
++        if (cpu->car_active) {
++            uint32_t off = (uint32_t)real_address - 0x80000000u;
++
++            if (off < cpu->car_size) {
++                *physical = cpu->car_phys + off;
++                *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
++                return TLBRET_MATCH;
++            }
++            if (access_type == MMU_INST_FETCH) {
++                cpu->car_active = false;
++                tlb_flush(env_cpu(env));
++            }
++        }
+         ret = get_segctl_physical_address(env, physical, prot, real_address,
+                                           access_type, mmu_idx,
+                                           env->CP0_SegCtl1 >> 16, 0x1FFFFFFF);

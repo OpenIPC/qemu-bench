@@ -15,6 +15,9 @@
  *               through the L2 buffer the driver assigned to this
  *               controller, not the FIFOs
  *   0x18 OUT / 0x1C IN     the 8-byte TX / RX FIFOs, a word at a time
+ *   0x20 RTIM / 0x24 WORK_MODE  EV300L / AV100 ("ASPEN" SPI0 at
+ *               0x21100000): the drivers set WORK_MODE bit 0 ("normal
+ *               mode") and spin until it reads back set; plain storage
  *
  * Chip select is CON bit 5, or a GPIO for kernels that drive it that way
  * (the EV330's, cs-gpios): the "cs-gpio" input, active low, is ORed in.
@@ -52,6 +55,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSpiState, AK_SPI)
 #define R_EXRX          0x14
 #define R_OUT           0x18
 #define R_IN            0x1C
+#define R_RTIM          0x20
+#define R_WORK_MODE     0x24
 
 #define CON_CS          (1u << 5)
 #define CON_ARRM        (1u << 1)
@@ -80,6 +85,8 @@ struct AkSpiState {
     uint32_t cnt;
     uint32_t extx;
     uint32_t exrx;
+    uint32_t rtim;
+    uint32_t work_mode;
     bool done;
     bool cs_gpio;           /* level of the cs-gpio input (1 = idle) */
 
@@ -275,6 +282,10 @@ static uint64_t ak_spi_read(void *opaque, hwaddr offset, unsigned size)
         return s->extx;
     case R_EXRX:
         return s->exrx;
+    case R_RTIM:
+        return s->rtim;
+    case R_WORK_MODE:
+        return s->work_mode;
     case R_IN:
         for (i = 0; i < 4 && !fifo8_is_empty(&s->rxfifo); i++) {
             v |= (uint32_t)fifo8_pop(&s->rxfifo) << (8 * i);
@@ -317,6 +328,12 @@ static void ak_spi_write(void *opaque, hwaddr offset, uint64_t val,
     case R_EXRX:
         s->exrx = val;
         break;
+    case R_RTIM:
+        s->rtim = val;
+        return;
+    case R_WORK_MODE:
+        s->work_mode = val;
+        return;
     case R_OUT:
         for (i = 0; i < 4 && !fifo8_is_full(&s->txfifo); i++) {
             fifo8_push(&s->txfifo, val >> (8 * i));
@@ -350,6 +367,8 @@ static void ak_spi_reset(DeviceState *dev)
     s->cnt = 0;
     s->extx = 0;
     s->exrx = 0;
+    s->rtim = 0;
+    s->work_mode = 0;
     s->done = false;
     fifo8_reset(&s->txfifo);
     fifo8_reset(&s->rxfifo);
@@ -404,7 +423,7 @@ static int ak_spi_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ak_spi = {
     .name = TYPE_AK_SPI,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = ak_spi_post_load,
     .fields = (const VMStateField[]) {
@@ -422,6 +441,9 @@ static const VMStateDescription vmstate_ak_spi = {
         VMSTATE_UINT8(txblk_pos, AkSpiState),
         VMSTATE_UINT8_ARRAY(rxblk, AkSpiState, AK_L2_BLOCK),
         VMSTATE_UINT8(rxblk_len, AkSpiState),
+        /* Version 2: the EV300L / AV100 SPI's RTIM and WORK_MODE */
+        VMSTATE_UINT32_V(rtim, AkSpiState, 2),
+        VMSTATE_UINT32_V(work_mode, AkSpiState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

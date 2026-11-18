@@ -1,0 +1,47 @@
+--- a/include/configs/isvp_common.h	2026-10-29 13:00:17.920129506 +0000
++++ b/include/configs/isvp_common.h	2026-10-29 13:45:38.356413501 +0000
+@@ -65,7 +65,8 @@
+ 	"updatetool=tftpboot\0" \
+ 	"sdcard=mmc rescan; setenv updatetool fatload mmc 0\0" \
+ 	"soc="CONFIG_SOC"\0" \
+-	CONFIG_EXTRA_SETTINGS
++	CONFIG_EXTRA_SETTINGS \
++	CONFIG_EXTRA_NAND_SETTINGS
+ 
+ #define CONFIG_ENV_OFFSET 0x40000
+ #define CONFIG_ENV_SIZE 0x10000
+@@ -111,3 +112,34 @@
+ #define CONFIG_SERVERIP 192.168.1.254
+ #define CONFIG_NETMASK 255.255.255.0
+ #define CONFIG_ETHADDR 00:00:23:34:45:66
++
++/*
++ * SPI NAND (isvp_<soc>_sfcnand): the NOR settings above do not fit.
++ * U-Boot with the NAND, UBI and UBIFS commands is ~390 KiB, read raw by
++ * an SPL that has no LZO; the environment has NAND blocks of its own at
++ * 0xC0000 and 0xE0000 (env_sfcnand is always redundant), past U-Boot and
++ * inside 1M(boot); the
++ * kernel at 0x100000, UBI on the third partition (volumes rootfs, a
++ * SquashFS through ubiblock, and rootfs_data, the UBIFS overlay that
++ * OpenIPC's /init mounts).  The partitions are the burner's table at
++ * 0x6800 (sfc_nand: 1M(boot),8M(kernel),40M(rootfs),-(data)).
++ */
++#ifdef CONFIG_SFC_NAND
++#undef CONFIG_SYS_MONITOR_LEN
++#define CONFIG_SYS_MONITOR_LEN (400 * 1024)
++#undef CONFIG_SPL_LZOP
++#undef CONFIG_ENV_OFFSET
++#undef CONFIG_ENV_SIZE
++#undef CONFIG_ENV_SECT_SIZE
++#define CONFIG_ENV_OFFSET 0xc0000
++#define CONFIG_ENV_SIZE 0x20000
++#define CONFIG_ENV_SECT_SIZE 0x20000
++#undef CONFIG_BOOTARGS
++#undef CONFIG_BOOTCOMMAND
++#define CONFIG_BOOTARGS "console=ttyS1,115200 panic=10 ubi.mtd=2 ubi.block=0,0 root=/dev/ubiblock0_0 rootfstype=squashfs init=/init mem=\\${osmem} rmem=\\${rmem} \\${extras}"
++#define CONFIG_BOOTCOMMAND "setenv bootcmd ${cmdnand}; saveenv; run bootcmd"
++#define CONFIG_EXTRA_NAND_SETTINGS \
++	"cmdnand=setenv setargs setenv bootargs ${bootargs}; run setargs; nand read ${baseaddr} 0x100000 0x800000; bootm ${baseaddr}\0"
++#else
++#define CONFIG_EXTRA_NAND_SETTINGS
++#endif

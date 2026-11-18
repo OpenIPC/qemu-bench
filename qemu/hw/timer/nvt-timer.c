@@ -323,8 +323,16 @@ static void nvt_timer_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     /* Divider 1 at 3 MHz / 3 = 1 MHz, its documented default. */
     *reg(s, TMR_CLKDIV) = 2 << 8;
+    /*
+     * Every target out of reset at the full count: the mask ROM enables
+     * timer 1 one-shot (CTRL 0x110 = 1) and counts it up as its delay and
+     * timeout clock without ever writing its target (opennovatek
+     * re/timer.c), so silicon cannot reset it to 0.
+     */
+    for (n = 0; n < TMR_NUM; n++) {
+        *treg(s, n, TMR_TARGET) = UINT32_MAX;
+    }
     /* The system timer the loader leaves running. */
-    *treg(s, 0, TMR_TARGET) = UINT32_MAX;
     *treg(s, 0, TMR_CTRL) = CTRL_EN | CTRL_FREE_RUN;
     nvt_timer_start(&s->ch[0]);
     qemu_irq_lower(s->irq);

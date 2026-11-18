@@ -21,7 +21,12 @@
  *
  * Keys, data, IV and OUT are byte strings (a register holds the next four
  * bytes, little-endian), so OUT reads the digest as the driver copies it
- * out.  A chunk that is not the last is whole 64-byte blocks.  The HMAC
+ * out.  On NA51055 and NA51068 the IV is not: their drivers
+ * (na51055_hash.c, na51068_hash.c, and na51089_hash.c when the chip ID is
+ * NA51055's) byte-reverse each word of the saved digest into it, so the
+ * IV registers hold the chaining words themselves -- "iv-reversed".  A
+ * message the driver feeds in more than one chunk (over its 384-byte
+ * buffer) depends on it.  A chunk that is not the last is whole 64-byte blocks.  The HMAC
  * padding counts the K ^ ipad block too.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -33,6 +38,7 @@
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "hw/irq.h"
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
@@ -66,6 +72,7 @@ struct NvtHashState {
     MemoryRegion iomem;
     qemu_irq irq;
     uint32_t regs[HS_REGS_SIZE / 4];
+    bool iv_reversed;
 };
 
 /* SHA-1 / SHA-256 compression */
@@ -257,7 +264,9 @@ static bool nvt_hash_run(NvtHashState *s, uint32_t cfg)
     sha_init(&c, mode & 1);
     if (cfg & CFG_IV_REGS) {
         for (i = 0; i < 8; i++) {
-            c.h[i] = bswap32(*reg(s, HS_IV + 4 * i));
+            uint32_t v = *reg(s, HS_IV + 4 * i);
+
+            c.h[i] = s->iv_reversed ? v : bswap32(v);
         }
     }
     if (hmac && (cfg & CFG_HMAC_IPAD)) {
@@ -386,11 +395,16 @@ static const VMStateDescription vmstate_nvt_hash = {
     }
 };
 
+static const Property nvt_hash_properties[] = {
+    DEFINE_PROP_BOOL("iv-reversed", NvtHashState, iv_reversed, false),
+};
+
 static void nvt_hash_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, nvt_hash_reset);
+    device_class_set_props(dc, nvt_hash_properties);
     dc->vmsd = &vmstate_nvt_hash;
 }
 

@@ -20,6 +20,11 @@
  * -d unimp as "xm-gpio: pad N high/low", which is how a test sees which pads
  * the kernel, majestic or the vendor ISP actually drive.
  *
+ * Two pads can carry a bit-banged I2C bus ("i2c-scl" / "i2c-sda"), open
+ * drain with pull-ups: a pad not driven is high unless a slave on the
+ * child bus "i2c" holds SDA low.  XM8536E boards hang an AT24C16 there,
+ * which at24c.ko checks at load.
+ *
  * Copyright (c) 2026 OpenIPC.
  * Written by Dmitry Ilyin
  *
@@ -28,6 +33,8 @@
 
 #include "qemu/osdep.h"
 #include "hw/irq.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/bitbang_i2c.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
@@ -38,7 +45,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(XmGpioState, XM_GPIO)
 
 #define XM_GPIO_SIZE        0x10000
-#define XM_GPIO_MAX_PADS    128
+#define XM_GPIO_MAX_PADS    256
 
 #define PAD_OUT_EN          (1u << 10)
 #define PAD_OUT_HIGH        (1u << 11)
@@ -50,8 +57,12 @@ struct XmGpioState {
     MemoryRegion iomem;
     uint32_t regs[XM_GPIO_SIZE / 4];
     uint32_t pads;
+    uint32_t adc_off;           /* 0, or the ADC data word: reads full scale */
     bool in_level[XM_GPIO_MAX_PADS];
     qemu_irq out[XM_GPIO_MAX_PADS];
+    uint32_t i2c_scl, i2c_sda;  /* bit-banged I2C pads, or UINT32_MAX */
+    I2CBus *i2c;
+    bitbang_i2c_interface bb;
 };
 
 /* The level a driven pad shows, or -1 when it is not driven. */
@@ -66,6 +77,12 @@ static uint64_t xm_gpio_read(void *opaque, hwaddr off, unsigned size)
     const uint32_t pad = off / 4;
     uint32_t v = s->regs[pad];
 
+    /* The ADC the vendor adc.ko reads (XM533 / XM535: select +0xCC0, data
+     * +0xCC4) is where Sofia's ADC keys sit -- the reset key among them,
+     * pressed at 0.  Nothing pulls it down here: full scale, released. */
+    if (s->adc_off && off == s->adc_off) {
+        return 0x3ff;
+    }
     if (pad < s->pads) {
         const int driven = xm_gpio_driven(v);
         const bool level = driven >= 0 ? driven : s->in_level[pad];
@@ -91,6 +108,17 @@ static void xm_gpio_write(void *opaque, hwaddr off, uint64_t val,
     s->regs[pad] = val & ~PAD_IN_LEVEL;
 
     const int after = xm_gpio_driven(s->regs[pad]);
+
+    if (s->i2c && (pad == s->i2c_scl || pad == s->i2c_sda) &&
+        after != before) {
+        /* open drain: released is the pull-up; the slave's SDA comes back */
+        const int line = pad == s->i2c_scl ? BITBANG_I2C_SCL : BITBANG_I2C_SDA;
+        const int sda = bitbang_i2c_set(&s->bb, line, after != 0);
+
+        s->in_level[s->i2c_sda] = sda;
+        s->in_level[s->i2c_scl] = 1;
+        return;
+    }
 
     if (after != before && after >= 0) {
         qemu_log_mask(LOG_UNIMP, "xm-gpio: pad %u %s\n", pad,
@@ -130,6 +158,10 @@ static void xm_gpio_reset(DeviceState *dev)
     for (pad = 0; pad < s->pads; pad++) {
         qemu_set_irq(s->out[pad], 0);
     }
+    if (s->i2c) {
+        s->in_level[s->i2c_scl] = 1;
+        s->in_level[s->i2c_sda] = 1;
+    }
 }
 
 static void xm_gpio_realize(DeviceState *dev, Error **errp)
@@ -146,10 +178,19 @@ static void xm_gpio_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     qdev_init_gpio_in(dev, xm_gpio_set_input, s->pads);
     qdev_init_gpio_out(dev, s->out, s->pads);
+    if (s->i2c_scl < s->pads && s->i2c_sda < s->pads) {
+        s->i2c = i2c_init_bus(dev, "i2c");
+        bitbang_i2c_init(&s->bb, s->i2c);
+        s->in_level[s->i2c_scl] = 1;
+        s->in_level[s->i2c_sda] = 1;
+    }
 }
 
 static const Property xm_gpio_props[] = {
     DEFINE_PROP_UINT32("pads", XmGpioState, pads, 100),
+    DEFINE_PROP_UINT32("adc-offset", XmGpioState, adc_off, 0),
+    DEFINE_PROP_UINT32("i2c-scl", XmGpioState, i2c_scl, UINT32_MAX),
+    DEFINE_PROP_UINT32("i2c-sda", XmGpioState, i2c_sda, UINT32_MAX),
 };
 
 static void xm_gpio_class_init(ObjectClass *klass, const void *data)

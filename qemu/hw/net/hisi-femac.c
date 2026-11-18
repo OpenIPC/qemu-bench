@@ -109,6 +109,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiFemacState, HISI_FEMAC)
 #define REG_GLB_IRQ_RAW         0x1338
 #define REG_MAC_FILTER_BASE     0x1400
 
+/* GLB_SOFT_RESET bits (hisi_femac.c: SOFT_RESET_ALL BIT(0)) */
+#define SOFT_RESET_ALL          (1 << 0)
+
 /* IRQ bits */
 #define IRQ_RX_RDY              (1 << 0)
 #define IRQ_TX_PER_PACKET       (1 << 1)
@@ -133,6 +136,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiFemacState, HISI_FEMAC)
 
 /* RX ring size */
 #define RX_RING_SIZE            64
+
+/*
+ * MAC_SET bits 10:0 hold the largest frame the MAC will deliver
+ * (hisi_femac.c: MAX_FRAME_SIZE_MASK GENMASK(10, 0)), and the driver both
+ * programs it and sizes every posted RX buffer to the same MAX_FRAME_SIZE.
+ */
+#define FEMAC_MAX_FRAME_SIZE_MASK       0x7ff
+#define FEMAC_MAX_FRAME_SIZE_DEFAULT    1600
 
 struct HisiFemacState {
     SysBusDevice parent;
@@ -425,6 +436,35 @@ static ssize_t hisi_femac_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
+    /*
+     * Bound the frame by the MAX_FRAME_SIZE field the driver programs into
+     * MAC_SET, because the RX ring carries bare addresses -- no length -- so
+     * this is the only size contract there is.  hisi_femac.c posts every RX
+     * buffer at exactly MAX_FRAME_SIZE (1600) and writes the same value into
+     * MAC_SET bits 10:0, and the MAC will not deliver a longer frame; a
+     * backend that hands us one (a tap with a large MTU, a jumbo frame) was
+     * written straight past the end of an skb, silently corrupting whatever
+     * the guest had after it.  That is the worst shape of bug this model can
+     * have: the damage lands later, in unrelated code, nowhere near here.
+     * hisi-gmac already bounds its RX this way -- its descriptors carry a
+     * buffer length, so it had something obvious to check against.
+     *
+     * Drop it as the MAC does, and report the frame consumed: returning -1
+     * means "no room right now", and the net layer would re-offer the same
+     * oversized frame forever, wedging the queue behind it.
+     */
+    uint32_t max_frame = s->mac_set & FEMAC_MAX_FRAME_SIZE_MASK;
+    if (max_frame == 0) {
+        /* Before the driver programs MAC_SET (U-Boot, early probe). */
+        max_frame = FEMAC_MAX_FRAME_SIZE_DEFAULT;
+    }
+    if (size > max_frame) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "hisi-femac: dropping %zu-byte frame, MAC_SET caps RX "
+                      "at %u bytes\n", size, max_frame);
+        return size;
+    }
+
     /* Pop buffer address from ring */
     uint32_t dma_addr = s->rx_ring[s->rx_ring_head];
     s->rx_ring_head = (s->rx_ring_head + 1) % RX_RING_SIZE;
@@ -438,7 +478,12 @@ static ssize_t hisi_femac_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
-    /* Push frame descriptor into FIFO: size + 4 for FCS */
+    /*
+     * Push frame descriptor into FIFO: size + 4 for FCS.  RX_FRAME_LEN is
+     * 12 bits; with the cap above, size + 4 can no longer reach 0x1000, so
+     * the mask cannot silently report a frame shorter than the bytes that
+     * were just written.
+     */
     s->iqfrm_des_fifo[s->iqfrm_des_tail] = (size + 4) & 0xfff;
     s->iqfrm_des_tail = (s->iqfrm_des_tail + 1) % RX_RING_SIZE;
     s->iqfrm_des_count++;
@@ -645,6 +690,34 @@ static void hisi_femac_write(void *opaque, hwaddr offset, uint64_t val,
         s->hostmac_h16 = val;
         break;
     case REG_GLB_SOFT_RESET:
+        /*
+         * Asserting SOFT_RESET_ALL resets the MAC, and a reset MAC has
+         * forgotten every RX buffer the driver had posted to it.  Dropping
+         * them here is not housekeeping -- it is the whole point.
+         *
+         * hisi_femac_net_close() calls hisi_femac_free_skb_rings(), which
+         * dma_unmap_single()s and frees every posted skb, and the driver
+         * brackets open/close with hisi_femac_port_reset().  Keeping the
+         * addresses across the reset left us holding kernel pointers the
+         * guest had freed and the page allocator had handed to something
+         * else; the next frame to arrive was DMA'd straight into them.
+         *
+         * The damage lands wherever those pages went, so the guest dies
+         * later in whatever walks them -- anon_vma_interval_tree_remove,
+         * __rb_insert_augmented, unmap_vmas, set_page_dirty -- with nothing
+         * pointing back at the NIC.  Removing the interface made it go away
+         * (0/8 panics with -net none, 5/8 with the NIC attached).
+         */
+        if ((val & SOFT_RESET_ALL) && !(s->soft_reset & SOFT_RESET_ALL)) {
+            s->rx_ring_head = 0;
+            s->rx_ring_tail = 0;
+            s->rx_ring_count = 0;
+            s->iqfrm_des_head = 0;
+            s->iqfrm_des_tail = 0;
+            s->iqfrm_des_count = 0;
+            s->irq_raw &= ~(IRQ_RX_RDY | IRQ_MULTI_RXRDY);
+            hisi_femac_update_irq(s);
+        }
         s->soft_reset = val;
         break;
     case REG_GLB_FWCTRL:

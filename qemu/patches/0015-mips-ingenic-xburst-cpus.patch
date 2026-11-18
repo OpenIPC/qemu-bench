@@ -1,0 +1,115 @@
+mips: XBurst1 and XBurst2 CPU models for the Ingenic T-series machines
+
+QEMU's XBurstR1 has no FPU, 16 TLB entries and Config7 = 0, so the T10..T31
+kernels (which hard-code an FPU and 32 TLB entries and idle with WAIT at
+IE=0) hang or loop in do_cpu; its R1 ISA also rejects the SPL's first
+mfc0 $12,2.  XBurstR2 is an X1000-class core that the T40/T41 4.4 kernel
+does not recognise (company 0x13, bits 15:13 = 1) and that lacks
+Config4.IE, without which tlbinvf is a no-op and the TLB is never flushed.
+
+(MXU3 variant: XBurst2 also advertises Config1.C2, a writable Status.CU2
+and ASE_MXU3 | ASE_MXU3_1 for the Ingenic MXU3 512-bit SIMD unit; see
+patch 0019.)
+
+This adds two CPU models, "XBurst1" (T10..T31) and "XBurst2" (T40, T41).
+
+XBurst1's coprocessor 2 is the Ingenic MXU2 128-bit SIMD unit, modelled by
+patch 0018; this model advertises it so the kernel enables it.  The XBurst1
+core programming manual's SOC feature table lists "Ingenic MXU2: Yes" only
+for the T-series (earlier JZ parts have the 64-bit MXU1), and the 3.10
+kernel's cpu_probe_ingenic checks Config1.C2 and, when soc_support_mxuv2()
+is true, sets MIPS_ASE_XBURSTMXUV2.  So Config1.C2 is set, insn_flags gets
+ASE_MXU2 (defined in patch 0018) instead of the earlier ASE_MXU, and
+Status.CU2 (bit 30) is made writable so the kernel's lazy CU2
+Coprocessor-Unusable trap can turn the unit on per thread.
+diff --git a/target/mips/cpu-defs.c.inc b/target/mips/cpu-defs.c.inc
+index d93b9d3..69bcaa8 100644
+--- a/target/mips/cpu-defs.c.inc
++++ b/target/mips/cpu-defs.c.inc
+@@ -343,6 +343,86 @@ const mips_def_t mips_defs[] =
+         .insn_flags = CPU_MIPS32R2 | ASE_MIPS16 | ASE_DSP | ASE_DSP_R2,
+         .mmu_type = MMU_TYPE_R4000,
+     },
++    {
++        /*
++         * Ingenic XBurst1 as the T10..T31 camera SoCs have it: the
++         * XBurstR1 core plus what their 3.10 kernels take for granted --
++         * a 32-bit FPU (FR=0, OpenIPC userspace is hard-float), 32 TLB
++         * entries, 32 KiB 8-way caches, and WAIT that wakes on a pending
++         * interrupt with IE=0 (Config7.WII, the kernel idles that way).
++         * The ISA is R2 so that $12 sel 2, which the SPL clears on its
++         * first instructions, decodes; the kernels themselves are R1.
++         *
++         * Coprocessor 2 is the Ingenic MXU2 128-bit SIMD unit (ASE_MXU2,
++         * not the 64-bit MXU1 of earlier JZ parts): the XBurst1 core
++         * manual's SOC table lists "Ingenic MXU2: Yes" only for the
++         * T-series, and the 3.10 kernel's cpu_probe sees Config1.C2 and
++         * enables XBURSTMXUV2.  C2 is advertised so the kernel takes the
++         * lazy-enable path (a CU2 Coprocessor-Unusable trap arms the unit
++         * per thread), and Status.CU2 is writable for that handler.
++         */
++        .name = "XBurst1",
++        /* the T10, T21 and T31 boot logs' "CPU0 revision is: 00d00100" */
++        .CP0_PRid = 0x00d00100,
++        .CP0_Config0 = MIPS_CONFIG0 | (0x1 << CP0C0_AR) |
++                       (MMU_TYPE_R4000 << CP0C0_MT),
++        .CP0_Config1 = MIPS_CONFIG1 | (1 << CP0C1_FP) | (31 << CP0C1_MMU) |
++                       (1 << CP0C1_IS) | (4 << CP0C1_IL) | (7 << CP0C1_IA) |
++                       (1 << CP0C1_DS) | (4 << CP0C1_DL) | (7 << CP0C1_DA) |
++                       (1 << CP0C1_C2) | (1 << CP0C1_WR),
++        .CP0_Config2 = MIPS_CONFIG2,
++        .CP0_Config3 = MIPS_CONFIG3,
++        .CP0_Config7 = 1 << CP0C7_WII,
++        .CP0_LLAddr_rw_bitmask = 0,
++        .CP0_LLAddr_shift = 4,
++        .SYNCI_Step = 32,
++        .CCRes = 2,
++        /* CU2 (bit 30) writable so the kernel can set it in the CU2 trap */
++        .CP0_Status_rw_bitmask = 0x7278FF17,
++        /* F64 for COP1X (MADD.D...: OpenIPC's musl libm); FR stays 0 */
++        .CP1_fcr0 = (1 << FCR0_F64) | (1 << FCR0_W) | (1 << FCR0_D) |
++                    (1 << FCR0_S) | (0x93 << FCR0_PRID),
++        .CP1_fcr31_rw_bitmask = 0xFF83FFFF,
++        .SEGBITS = 32,
++        .PABITS = 32,
++        .insn_flags = CPU_MIPS32R2 | ASE_MXU2,
++        .mmu_type = MMU_TYPE_R4000,
++    },
++    {
++        /*
++         * Ingenic XBurst2 (T40, T41): MIPS32R2 with an FPU, RI/XI,
++         * UserLocal and TLBINV/TLBINVF (Config4.IE=2) -- the 4.4 kernel
++         * flushes the whole TLB with one tlbinvf.  PRid company 0x13 with
++         * bits 15:13 = 1 is what the kernel's probe calls XBurst2.
++         */
++        .name = "XBurst2",
++        .CP0_PRid = 0x00132100,
++        .CP0_Config0 = MIPS_CONFIG0 | (0x1 << CP0C0_AR) |
++                       (MMU_TYPE_R4000 << CP0C0_MT),
++        .CP0_Config1 = MIPS_CONFIG1 | (1 << CP0C1_FP) | (31 << CP0C1_MMU) |
++                       (1 << CP0C1_IS) | (4 << CP0C1_IL) | (7 << CP0C1_IA) |
++                       (1 << CP0C1_DS) | (4 << CP0C1_DL) | (7 << CP0C1_DA) |
++                       (1 << CP0C1_C2) | (1 << CP0C1_PC) | (1 << CP0C1_WR),
++        .CP0_Config2 = MIPS_CONFIG2,
++        .CP0_Config3 = MIPS_CONFIG3 | (1U << CP0C3_M) | (1 << CP0C3_ULRI) |
++                       (1 << CP0C3_RXI),
++        .CP0_Config4 = MIPS_CONFIG4 | (2 << CP0C4_IE),
++        .CP0_Config7 = 1 << CP0C7_WII,
++        .CP0_LLAddr_rw_bitmask = 0,
++        .CP0_LLAddr_shift = 4,
++        .SYNCI_Step = 32,
++        .CCRes = 2,
++        .CP0_Status_rw_bitmask = 0x7678FF1F,
++        .CP0_PageGrain_rw_bitmask = (1U << CP0PG_RIE) | (1 << CP0PG_XIE),
++        .CP1_fcr0 = (1 << FCR0_F64) | (1 << FCR0_L) | (1 << FCR0_W) |
++                    (1 << FCR0_D) | (1 << FCR0_S) | (0x93 << FCR0_PRID),
++        .CP1_fcr31 = 0,
++        .CP1_fcr31_rw_bitmask = 0xFF83FFFF,
++        .SEGBITS = 32,
++        .PABITS = 32,
++        .insn_flags = CPU_MIPS32R2 | ASE_MXU3 | ASE_MXU3_1,
++        .mmu_type = MMU_TYPE_R4000,
++    },
+     {
+         .name = "XBurstR2",
+         .CP0_PRid = 0x2ed1024f,

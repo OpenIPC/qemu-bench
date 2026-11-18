@@ -5,6 +5,8 @@
  * driver (drivers/pinctrl/novatek/na51089) and the loader program, plus
  * the read-only version word:
  *
+ *   0x00 the boot straps as latched at reset: BS[3:0] the boot source the
+ *        loader's utl_get_bootsrc() reads, BS[9:8] the Ethernet PHY
  *   0xF0 TOP_VERSION_REG  bits [31:16] CHIP_ID, 0x7021 on NA51089
  *                         (plat-na51089/top.h, CHIP_NA51089); the low
  *                         half is the die revision and reads 0.
@@ -35,6 +37,7 @@ struct NvtTopState {
     MemoryRegion iomem;
     uint32_t regs[NVT_TOP_SIZE / 4];
     uint32_t chip_id;
+    uint32_t strap;
 };
 
 static uint64_t nvt_top_read(void *opaque, hwaddr offset, unsigned size)
@@ -64,7 +67,10 @@ static const MemoryRegionOps nvt_top_ops = {
     .write = nvt_top_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 4,
-    .valid.max_access_size = 4,
+    /* NA51103's loader reads the BL31 entry at 0x1200 with one 64-bit load */
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
 };
 
 static void nvt_top_reset(DeviceState *dev)
@@ -72,6 +78,7 @@ static void nvt_top_reset(DeviceState *dev)
     NvtTopState *s = NVT_TOP(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->regs[0] = s->strap;
 }
 
 static void nvt_top_init(Object *obj)
@@ -95,6 +102,7 @@ static const VMStateDescription vmstate_nvt_top = {
 
 static const Property nvt_top_properties[] = {
     DEFINE_PROP_UINT32("chip-id", NvtTopState, chip_id, 0x7021),
+    DEFINE_PROP_UINT32("strap", NvtTopState, strap, 0),
 };
 
 static void nvt_top_class_init(ObjectClass *klass, const void *data)

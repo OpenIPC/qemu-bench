@@ -45,6 +45,9 @@ struct NvtFlashState {
     uint32_t array_size;
     uint32_t size;              /* data bytes, OOB not counted */
     uint32_t jedec;
+    bool spi020;                /* NA51068's Faraday SPI020 registers */
+    qemu_irq drq;               /* SPI020: DMA request (the FTDMAC030's) */
+    QEMUBH *drq_bh;
     char *flash_file;
     int fd;
     Error *migration_blocker;

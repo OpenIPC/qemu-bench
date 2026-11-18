@@ -17,6 +17,7 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "qemu/log.h"
+#include "qemu/host-utils.h"
 #include "system/dma.h"
 #include <sys/stat.h>
 
@@ -62,6 +63,7 @@
 #define DMA_CTRL_CS_SHIFT       4
 
 /* INT_RAW_STATUS bits */
+#define INT_CMD_DONE            BIT(0)
 #define INT_DMA_DONE            BIT(1)
 
 /* SPI commands */
@@ -70,6 +72,7 @@
 #define SPI_CMD_RDSR            0x05
 #define SPI_CMD_RDSR2           0x35
 #define SPI_CMD_WRSR            0x01
+#define SPI_CMD_WRSR2           0x31
 #define SPI_CMD_RDID            0x9F
 #define SPI_CMD_READ            0x03
 #define SPI_CMD_FAST_READ       0x0B
@@ -85,11 +88,12 @@
 
 /* SPI status register bits */
 #define SPI_SR_WEL              BIT(1)
+#define SPI_SR2_QE              BIT(1)
 
-/* Flash: Winbond W25Q64 (8 MiB) */
+/* Flash: Winbond W25Q64 (8 MiB) unless a larger flash-file picks the
+ * W25Q128/256 of its size (capacity byte = log2 of the size in bytes). */
 #define NOR_JEDEC_MFR           0xEF
 #define NOR_JEDEC_TYPE          0x40
-#define NOR_JEDEC_CAP           0x17
 #define NOR_FLASH_SIZE          (8 * 1024 * 1024)
 #define NOR_SECTOR_SIZE         (64 * 1024)
 #define NOR_PAGE_SIZE           256
@@ -137,9 +141,12 @@ struct HisiSfc350State {
 
     /* Configuration properties */
     char    *flash_file;
+    uint8_t  flash_cs;      /* chip select the NOR answers on; the other is empty */
 
     /* SPI flash state */
     uint8_t  sr;
+    uint8_t  sr2;
+    uint8_t  jedec_cap;
     uint8_t *flash;
     uint32_t flash_size;
 };
@@ -178,27 +185,38 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         data_cnt = DATABUF_BYTES;
     }
 
+    /*
+     * Only one chip select carries a chip. A command to the other reaches no
+     * device: the bus floats and nothing changes state, so RDID reads back 0
+     * and a driver probing that select finds nothing. Hi3520DV200 boards have
+     * their NOR on CS1 (the XiongMai NBD6808T-PL, and the 32 MiB MX25L25635E
+     * on the lab board), which a CS0-only model hid: a kernel DT naming the
+     * wrong select still found flash here and lost it on hardware.
+     */
+    if (((s->cmd_config >> CMD_CONFIG_SEL_CS_SHIFT) & 1) != s->flash_cs) {
+        memset(s->cmd_databuf, 0, sizeof(s->cmd_databuf));
+        goto done;
+    }
+
     switch (opcode) {
     case SPI_CMD_RDID: {
-        /* Only CS0 has a flash chip; CS1 returns 0 (no chip) */
-        uint32_t cs = (s->cmd_config >> CMD_CONFIG_SEL_CS_SHIFT) & 1;
-        if (cs == 0) {
-            s->cmd_databuf[0] = NOR_JEDEC_MFR | (NOR_JEDEC_TYPE << 8) |
-                                (NOR_JEDEC_CAP << 16);
-        } else {
-            s->cmd_databuf[0] = 0;
-        }
+        /* the empty chip select returned above */
+        s->cmd_databuf[0] = NOR_JEDEC_MFR | (NOR_JEDEC_TYPE << 8) |
+                            (s->jedec_cap << 16);
         s->cmd_databuf[1] = 0;
         break;
     }
 
+    /* A status read longer than one byte gets the register again and again,
+     * as from the chip; U-Boot's "Enable QE" reads SR2 two bytes long. */
     case SPI_CMD_RDSR:
-        s->cmd_databuf[0] = s->sr;
+    case SPI_CMD_RDSR2: {
+        uint32_t rep = (opcode == SPI_CMD_RDSR ? s->sr : s->sr2) * 0x01010101u;
+        for (uint32_t i = 0; i < DIV_ROUND_UP(data_cnt, 4); i++) {
+            s->cmd_databuf[i] = rep;
+        }
         break;
-
-    case SPI_CMD_RDSR2:
-        s->cmd_databuf[0] = 0;
-        break;
+    }
 
     case SPI_CMD_WREN:
         s->sr |= SPI_SR_WEL;
@@ -209,7 +227,18 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         break;
 
     case SPI_CMD_WRSR:
-        /* Accept write but only clear WEL */
+        /* SR1 is not kept (no protection modelled); a second data byte is
+         * SR2, whose QE bit U-Boot sets and reads back ("Enable QE"). */
+        if ((s->sr & SPI_SR_WEL) && data_en && !rw_read && data_cnt >= 2) {
+            s->sr2 = (s->cmd_databuf[0] >> 8) & SPI_SR2_QE;
+        }
+        s->sr &= ~SPI_SR_WEL;
+        break;
+
+    case SPI_CMD_WRSR2:
+        if ((s->sr & SPI_SR_WEL) && data_en && !rw_read) {
+            s->sr2 = s->cmd_databuf[0] & SPI_SR2_QE;
+        }
         s->sr &= ~SPI_SR_WEL;
         break;
 
@@ -294,8 +323,15 @@ static void hisi_sfc350_exec_cmd(HisiSfc350State *s)
         break;
     }
 
-    /* Command completes instantly: clear START bit */
+done:
+    /*
+     * Command completes instantly: clear START and raise the completion bit.
+     * The v3xx driver in mainline (spi-hisi-sfc-v3xx.c) reads RAW_INT_STAT
+     * after every command and fails it with EIO unless bit 0 is set; the
+     * vendor 3.0.8 driver only polled START, so the bit went unmodelled.
+     */
     s->cmd_config &= ~CMD_CONFIG_START;
+    s->int_raw_status |= INT_CMD_DONE;
 }
 
 /* ── DMA execution ───────────────────────────────────────────────────── */
@@ -309,6 +345,11 @@ static void hisi_sfc350_exec_dma(HisiSfc350State *s)
 
     if (flash_addr + len > s->flash_size) {
         len = (flash_addr < s->flash_size) ? s->flash_size - flash_addr : 0;
+    }
+    /* As in register mode, the empty select reaches no chip: the transfer
+     * completes and moves nothing. */
+    if (((s->bus_dma_ctrl >> DMA_CTRL_CS_SHIFT) & 1) != s->flash_cs) {
+        len = 0;
     }
 
     if (len > 0) {
@@ -481,7 +522,15 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
 {
     HisiSfc350State *s = HISI_SFC350(dev);
 
+    if (s->flash_cs == 0xff) {
+        s->flash_cs = 0;
+    } else if (s->flash_cs > 1) {
+        error_setg(errp, "hisi-sfc350: flash-cs must be 0 or 1");
+        return;
+    }
+
     s->flash_size = NOR_FLASH_SIZE;
+    s->jedec_cap = 0x17;
     s->flash = g_malloc(s->flash_size);
     memset(s->flash, 0xFF, s->flash_size);
 
@@ -498,12 +547,25 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
                        s->flash_file);
             return;
         }
+        /* The window maps at most 32 MiB, so a bigger part could not be
+         * read through it; refuse rather than show a chip half of which is
+         * out of reach. */
+        if (st.st_size > MEM_WINDOW_SIZE) {
+            error_setg(errp, "hisi-sfc350: flash file '%s' is %lld bytes, "
+                       "more than the %u the controller maps",
+                       s->flash_file, (long long)st.st_size,
+                       MEM_WINDOW_SIZE);
+            return;
+        }
         uint32_t file_size = (uint32_t)st.st_size;
+        /* A part is a power of two in size: an odd-sized dump (a backup with
+         * a trailer) gets the chip that holds it, the rest erased, so what
+         * RDID says and what can be read are the same size. */
         if (file_size > s->flash_size) {
             g_free(s->flash);
-            s->flash_size = file_size;
-            s->flash = g_malloc(file_size);
-            memset(s->flash, 0xFF, file_size);
+            s->flash_size = pow2ceil(file_size);
+            s->flash = g_malloc(s->flash_size);
+            memset(s->flash, 0xFF, s->flash_size);
         }
         FILE *f = fopen(s->flash_file, "rb");
         if (!f) {
@@ -521,6 +583,14 @@ static void hisi_sfc350_realize(DeviceState *dev, Error **errp)
         }
         qemu_log("hisi-sfc350: loaded %u bytes from '%s'\n",
                  file_size, s->flash_file);
+
+        /* Answer RDID and BUS_FLASH_SIZE as the part of that size would: a
+         * 16 MiB image read as a W25Q64 gave the kernel an 8 MiB MTD, so
+         * an "-(rootfs_data)" tail partition came out wrong. */
+        if (s->flash_size > NOR_FLASH_SIZE) {
+            s->jedec_cap = 31 - clz32(s->flash_size);
+            s->bus_flash_size = 0x00;        /* 16 MiB, the field's largest */
+        }
     }
 }
 
@@ -532,6 +602,8 @@ static void hisi_sfc350_finalize(Object *obj)
 
 static const Property hisi_sfc350_properties[] = {
     DEFINE_PROP_STRING("flash-file", HisiSfc350State, flash_file),
+    /* 0xff = unset: the machine fills in its SoC's select, else CS0 */
+    DEFINE_PROP_UINT8("flash-cs", HisiSfc350State, flash_cs, 0xff),
 };
 
 static void hisi_sfc350_class_init(ObjectClass *klass, const void *data)

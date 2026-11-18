@@ -33,8 +33,8 @@
  * read format: RDES0 buffer, RDES3 OWN, IOC bit 30; write-back: RDES3 FD,
  * LD, packet length [14:0] -- without the FCS, which the driver does not
  * strip (DWC_ETH_QOS_clean_rx_irq).  A frame longer than RBSZ spans
- * descriptors; Rx stops at the tail pointer; the packet filter (MPFR,
- * MAC address registers) decides what is taken at all.  A Tx frame is
+ * descriptors; Rx stops at the tail pointer until it is written again;
+ * the packet filter (MPFR, MAC address registers) decides what is taken at all.  A Tx frame is
  * gathered across tail writes, and one too long for the MAC is dropped
  * with ES / JT in its last write-back.  yinit() polls DSR0 until RPS0 reads
  * 3 (running, waiting for a packet) and re-initialises the core until it
@@ -46,6 +46,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/nvt-bootrom.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
@@ -53,6 +54,7 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
+#include "net/checksum.h"
 #include "net/eth.h"
 #include "hw/net/mii.h"
 #include "qom/object.h"
@@ -75,6 +77,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtEqosState, NVT_EQOS)
 #define MAC_ADDR0_HI        0x0300
 #define MAC_ADDR0_LO        0x0304
 #define MTL_Q0TOMR          0x0D00
+#define TDES3_CIC_SHIFT     16
 #define DMA_MODE            0x1000
 #define DMA_ISR             0x1008
 #define DMA_DSR0            0x100C
@@ -159,8 +162,14 @@ struct NvtEqosState {
     /* the Tx frame being gathered, kept across tail-pointer writes */
     uint8_t tx_frame[EQOS_MAX_FRAME];
     uint32_t tx_len;
+    uint32_t tx_cic;                    /* the frame's checksum insertion */
+    bool rx_past_tail;                  /* the tail was written at cur_rx */
+    uint32_t dsl_unit;                  /* bytes per DSL, the bus width */
     bool tx_overflow;
     uint16_t phy[32];
+    /* the mask ROM's Ethernet boot, while it runs (nvt-bootrom.c) */
+    NvtEqosRomRx rom_rx;
+    void *rom_opaque;
 };
 
 static uint32_t *reg(NvtEqosState *s, hwaddr off)
@@ -249,7 +258,7 @@ static void nvt_eqos_update_irq(NvtEqosState *s)
 
 static uint32_t nvt_eqos_desc_size(NvtEqosState *s)
 {
-    return 16 + ((*ch(s, CH_CR) >> 18) & 7) * 8;
+    return 16 + ((*ch(s, CH_CR) >> 18) & 7) * s->dsl_unit;
 }
 
 static dma_addr_t nvt_eqos_desc(NvtEqosState *s, bool rx, uint32_t idx)
@@ -322,6 +331,7 @@ static void nvt_eqos_tx(NvtEqosState *s)
             if (d[3] & DES3_FD) {
                 s->tx_len = 0;
                 s->tx_overflow = false;
+                s->tx_cic = (d[3] >> TDES3_CIC_SHIFT) & 3;
             }
             l1 = d[2] & 0x3FFF;
             l2 = (d[2] >> 16) & 0x3FFF;
@@ -344,6 +354,12 @@ static void nvt_eqos_tx(NvtEqosState *s)
                 if (s->tx_overflow) {
                     d[3] |= TDES3_ES | TDES3_JT;
                 } else {
+                    /* TX checksum offload: the loaders' Ethernet boot */
+                    if (s->tx_cic) {
+                        net_checksum_calculate(s->tx_frame, s->tx_len,
+                                               s->tx_cic == 1 ? CSUM_IP :
+                                               CSUM_ALL);
+                    }
                     qemu_send_packet(qemu_get_queue(s->nic), s->tx_frame,
                                      s->tx_len);
                 }
@@ -372,7 +388,10 @@ static uint32_t nvt_eqos_rx_bufsz(NvtEqosState *s)
 /*
  * How many descriptors from the current one the DMA may fill: owned by it
  * and short of the tail pointer, which the DMA stops at (the driver points
- * it at the last descriptor it refilled).
+ * it at the last descriptor it refilled).  A write to the tail while the
+ * DMA waits there lets it take that descriptor: the loaders' Ethernet boot
+ * (STRGEXT_Eth.a) rewrites the same address, the last of its four, after
+ * every frame, and takes a whole file through the ring.
  */
 static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
 {
@@ -385,7 +404,7 @@ static uint32_t nvt_eqos_rx_avail(NvtEqosState *s, uint32_t want)
     }
     for (n = 0; n < want && n < ring; n++) {
         a = nvt_eqos_desc(s, true, (s->cur_rx + n) % ring);
-        if (a == *ch(s, CH_RDTP)) {
+        if (a == *ch(s, CH_RDTP) && !(n == 0 && s->rx_past_tail)) {
             break;
         }
         nvt_eqos_read_desc(a, d);
@@ -400,6 +419,9 @@ static bool nvt_eqos_can_receive(NetClientState *nc)
 {
     NvtEqosState *s = qemu_get_nic_opaque(nc);
 
+    if (s->rom_rx) {
+        return true;
+    }
     return nvt_eqos_rx_avail(s, 1) > 0;
 }
 
@@ -446,6 +468,10 @@ static ssize_t nvt_eqos_receive(NetClientState *nc, const uint8_t *buf,
     uint32_t need = DIV_ROUND_UP(size, bufsz), done = 0, i, chunk, d[4];
     dma_addr_t a;
 
+    if (s->rom_rx) {
+        s->rom_rx(s->rom_opaque, buf, size);
+        return size;
+    }
     if (!nvt_eqos_accept(s, buf, size)) {
         return size;                /* filtered out: not for us */
     }
@@ -482,6 +508,7 @@ static ssize_t nvt_eqos_receive(NetClientState *nc, const uint8_t *buf,
         *ch(s, CH_CHRDR) = a;
         *ch(s, CH_CHRBAR) = d[0];
         s->cur_rx = (s->cur_rx + 1) % ring;
+        s->rx_past_tail = false;
     }
     nvt_eqos_update_irq(s);
     return size;
@@ -511,6 +538,8 @@ static void nvt_eqos_soft_reset(NvtEqosState *s)
     s->cur_tx = s->cur_rx = 0;
     s->tx_len = 0;
     s->tx_overflow = false;
+    s->tx_cic = 0;
+    s->rx_past_tail = false;
     s->rps = RPS_STOPPED;
     s->irq_level = false;
     qemu_irq_lower(s->irq);
@@ -599,6 +628,7 @@ static void nvt_eqos_write(void *opaque, hwaddr off, uint64_t val,
         case CH_RCR:
         case CH_RDTP:
             *reg(s, off) = val;
+            s->rx_past_tail = val == nvt_eqos_desc(s, true, s->cur_rx);
             if (*ch(s, CH_RCR) & RCR_SR) {
                 s->rps = RPS_WAITING;
                 qemu_flush_queued_packets(qemu_get_queue(s->nic));
@@ -623,6 +653,27 @@ static NetClientInfo nvt_eqos_net_info = {
     .can_receive = nvt_eqos_can_receive,
     .receive = nvt_eqos_receive,
 };
+
+/*
+ * The ROM's Ethernet boot: frames to rx instead of the rings, until it
+ * detaches (rx NULL) to run a loader, which then brings the MAC up itself.
+ */
+void nvt_eqos_rom_attach(DeviceState *dev, NvtEqosRomRx rx, void *opaque)
+{
+    NvtEqosState *s = NVT_EQOS(dev);
+
+    s->rom_rx = rx;
+    s->rom_opaque = opaque;
+    /* can_receive changes: wake a backend (tap) that stopped polling */
+    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+}
+
+void nvt_eqos_rom_send(DeviceState *dev, const uint8_t *buf, size_t len)
+{
+    NvtEqosState *s = NVT_EQOS(dev);
+
+    qemu_send_packet(qemu_get_queue(s->nic), buf, len);
+}
 
 static void nvt_eqos_reset(DeviceState *dev)
 {
@@ -656,7 +707,7 @@ static void nvt_eqos_init(Object *obj)
 
 static const VMStateDescription vmstate_nvt_eqos = {
     .name = TYPE_NVT_EQOS,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtEqosState, EQOS_SIZE / 4),
@@ -668,11 +719,14 @@ static const VMStateDescription vmstate_nvt_eqos = {
         VMSTATE_UINT32(tx_len, NvtEqosState),
         VMSTATE_BOOL(tx_overflow, NvtEqosState),
         VMSTATE_UINT16_ARRAY(phy, NvtEqosState, 32),
+        VMSTATE_UINT32_V(tx_cic, NvtEqosState, 2),
+        VMSTATE_BOOL_V(rx_past_tail, NvtEqosState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
 
 static const Property nvt_eqos_properties[] = {
+    DEFINE_PROP_UINT32("dsl-unit", NvtEqosState, dsl_unit, 8),
     DEFINE_NIC_PROPERTIES(NvtEqosState, conf),
 };
 

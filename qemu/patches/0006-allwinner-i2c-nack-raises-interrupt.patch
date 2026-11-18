@@ -1,0 +1,30 @@
+allwinner-i2c: a NACK raises the interrupt too
+
+The model set STAT to "address + write, no ACK" (0x20) or "data byte
+sent, no ACK" (0x30) without setting INT_FLAG, so a driver that waits
+for the interrupt after each step -- the sun8iw19 (V831) vendor Linux
+4.9 i2c-sunxi.c, probing a camera sensor that is not there -- waited for
+its full timeout instead of seeing the NACK.  On silicon every state
+change of the TWI sets INT_FLAG, NACKs included.
+
+---
+diff --git a/hw/i2c/allwinner-i2c.c b/hw/i2c/allwinner-i2c.c
+index e6c7867..4de6057 100644
+--- a/hw/i2c/allwinner-i2c.c
++++ b/hw/i2c/allwinner-i2c.c
+@@ -308,6 +308,7 @@ static void allwinner_i2c_write(void *opaque, hwaddr offset,
+                                 extract32(s->data, 0, 1))) {
+                 /* If non zero is returned, the address is not valid */
+                 s->stat = STAT_FROM_STA(STAT_M_ADDR_WR_NACK);
++                allwinner_i2c_raise_interrupt(s);
+             } else {
+                 /* Determine if read of write */
+                 if (extract32(s->data, 0, 1)) {
+@@ -324,6 +325,7 @@ static void allwinner_i2c_write(void *opaque, hwaddr offset,
+                 /* If the target return non zero then end the transfer */
+                 s->stat = STAT_FROM_STA(STAT_M_DATA_TX_NACK);
+                 i2c_end_transfer(s->bus);
++                allwinner_i2c_raise_interrupt(s);
+             } else {
+                 s->stat = STAT_FROM_STA(STAT_M_DATA_TX_ACK);
+                 allwinner_i2c_raise_interrupt(s);

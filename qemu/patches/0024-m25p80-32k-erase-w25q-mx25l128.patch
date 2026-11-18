@@ -1,0 +1,38 @@
+m25p80: 4 KiB and 32 KiB erases on w25q64, w25q256 and mx25l12805d
+
+W25Q64 and W25Q256 take Block Erase 32KB (52h) as well as Sector Erase
+(20h) and Block Erase 64KB (D8h) (their datasheets, "Instructions");
+the 0xc22018 JEDEC ID is shared by MX25L12805D, MX25L12835F and
+MX25L12845E, and the boot loaders' and kernels' flash tables for it give
+it 4 KB and 32 KB erases as the newer parts have.  The table left those
+flags out, so every 32 KB erase (Ingenic U-Boot issues them at boot) and
+every 4 KB erase on the Macronix part logged "erase size not supported
+by device" -- the erase itself was still carried out.
+
+---
+diff --git a/hw/block/m25p80.c b/hw/block/m25p80.c
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -235,7 +235,7 @@
+     { INFO("mx25l1606e",  0xc22015,      0,  64 << 10,  32, ER_4K) },
+     { INFO("mx25l3205d",  0xc22016,      0,  64 << 10,  64, 0) },
+     { INFO("mx25l6405d",  0xc22017,      0,  64 << 10, 128, 0) },
+-    { INFO("mx25l12805d", 0xc22018,      0,  64 << 10, 256, 0) },
++    { INFO("mx25l12805d", 0xc22018,      0,  64 << 10, 256, ER_4K | ER_32K) },
+     { INFO("mx25l12855e", 0xc22618,      0,  64 << 10, 256, 0) },
+     { INFO6("mx25l25635e", 0xc22019,     0xc22019,  64 << 10, 512,
+             ER_4K | ER_32K), .sfdp_read = m25p80_sfdp_mx25l25635e },
+@@ -354,11 +354,11 @@
+     { INFO("w25q32",      0xef4016,      0,  64 << 10,  64, ER_4K) },
+     { INFO("w25q32dw",    0xef6016,      0,  64 << 10,  64, ER_4K) },
+     { INFO("w25x64",      0xef3017,      0,  64 << 10, 128, ER_4K) },
+-    { INFO("w25q64",      0xef4017,      0,  64 << 10, 128, ER_4K) },
++    { INFO("w25q64",      0xef4017,      0,  64 << 10, 128, ER_4K | ER_32K) },
+     { INFO("w25q80",      0xef5014,      0,  64 << 10,  16, ER_4K) },
+     { INFO("w25q80bl",    0xef4014,      0,  64 << 10,  16, ER_4K),
+       .sfdp_read = m25p80_sfdp_w25q80bl },
+-    { INFO("w25q256",     0xef4019,      0,  64 << 10, 512, ER_4K),
++    { INFO("w25q256",     0xef4019,      0,  64 << 10, 512, ER_4K | ER_32K),
+       .sfdp_read = m25p80_sfdp_w25q256 },
+     { INFO("w25q512jv",   0xef4020,      0,  64 << 10, 1024, ER_4K),
+       .sfdp_read = m25p80_sfdp_w25q512jv },

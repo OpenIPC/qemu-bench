@@ -60,6 +60,8 @@ struct XmSysctlState {
     uint32_t rst_offset;
     uint32_t pll_lock_mask;
     uint32_t pll_lock31_mask;
+    uint32_t read_or_offset;
+    uint32_t read_or;
     uint32_t remap_offset;      /* 0: none */
     uint32_t cpu1_offset;       /* 0: none */
     uint32_t num_init_offsets, num_init_values;
@@ -77,6 +79,9 @@ static uint64_t xm_sysctl_read(void *opaque, hwaddr offset, unsigned size)
     }
     if (offset < 32 * 4 && (s->pll_lock31_mask & (1u << (offset / 4)))) {
         return s->regs[offset / 4] | 0x80000000u;
+    }
+    if (s->read_or && offset == s->read_or_offset) {
+        return s->regs[offset / 4] | s->read_or;
     }
     return s->regs[offset / 4];
 }
@@ -171,6 +176,8 @@ static const Property xm_sysctl_properties[] = {
     DEFINE_PROP_UINT32("rst-offset", XmSysctlState, rst_offset, 0x34),
     DEFINE_PROP_UINT32("pll-lock-mask", XmSysctlState, pll_lock_mask, 0),
     DEFINE_PROP_UINT32("pll-lock31-mask", XmSysctlState, pll_lock31_mask, 0),
+    DEFINE_PROP_UINT32("read-or-offset", XmSysctlState, read_or_offset, 0),
+    DEFINE_PROP_UINT32("read-or", XmSysctlState, read_or, 0),
     DEFINE_PROP_UINT32("remap-offset", XmSysctlState, remap_offset, 0),
     DEFINE_PROP_UINT32("cpu1-offset", XmSysctlState, cpu1_offset, 0),
     DEFINE_PROP_ARRAY("init-offsets", XmSysctlState, num_init_offsets,

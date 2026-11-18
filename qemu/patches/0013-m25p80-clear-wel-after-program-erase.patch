@@ -1,0 +1,36 @@
+m25p80: clear the write enable latch when a program or erase completes
+
+A NOR flash resets WEL at the end of every Page Program, Sector / Block /
+Chip Erase (the datasheets of every part in the table); the model left
+it set until a WRDI or WRSR.  Drivers that wait for SR to read neither
+WIP nor WEL after an operation, as the Fullhan 3.0.8 kernels' m25p80
+fork does (wait_till_ready(): sr & (SR_WIP | SR_WEL)), then time out
+after 40 seconds on every erase and program -- JFFS2 put each freshly
+erased block on its bad list.  Clear the latch when the erase is done
+and when the select rises on a page program.
+
+---
+diff --git a/hw/block/m25p80.c b/hw/block/m25p80.c
+index a5336d9..84799a3 100644
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -647,6 +647,8 @@ static void flash_erase(Flash *s, int offset, FlashCMD cmd)
+     }
+     memset(s->storage + offset, 0xff, len);
+     flash_sync_area(s, offset, len);
++    /* The erase is done at once, and with it the write enable latch. */
++    s->write_enable = false;
+ }
+ 
+ static inline void flash_sync_dirty(Flash *s, int64_t newpage)
+@@ -1550,6 +1552,10 @@ static int m25p80_cs(SSIPeripheral *ss, bool select)
+         if (s->state == STATE_COLLECTING_VAR_LEN_DATA) {
+             complete_collecting_data(s);
+         }
++        /* Deselecting starts the program, which clears WEL as it ends. */
++        if (s->state == STATE_PAGE_PROGRAM) {
++            s->write_enable = false;
++        }
+         s->len = 0;
+         s->pos = 0;
+         s->state = STATE_IDLE;

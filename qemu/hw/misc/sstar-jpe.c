@@ -32,7 +32,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
-#include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -41,6 +40,9 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "hw/misc/sstar-jpeg.h"
+#include "aw-vinc-logo.h"
+#include "hw/misc/sstar-pattern.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
 
@@ -88,32 +90,13 @@ struct SstarJpeState {
 };
 
 /*
- * A baseline JPEG scan, coded with the tables of the header the driver
- * gives the engine (DQT, SOF0, DHT, SOS), of a picture of colour bars and
- * the frame number in binary at the header's size and sampling.
+ * A baseline JPEG scan (sstar-jpeg.h), coded with the tables of the
+ * header the driver gives the engine (DQT, SOF0, DHT, SOS), of the test
+ * pattern of sstar-pattern.h (the OpenIPC logo on navy, its dot) at the
+ * header's size and sampling.
  */
-typedef struct JpeTables {
-    int w, h, ncomp;
-    int hs[3], vs[3], tq[3], td[3], ta[3];
-    uint8_t q[4][64];
-    uint16_t code[8][256];      /* DC 0-3, AC 4-7 */
-    uint8_t len[8][256];
-} JpeTables;
-
-typedef struct JpeBits {
-    uint8_t *buf;
-    size_t len, cap;
-    uint32_t acc;
-    int n;
-    bool full;
-} JpeBits;
-
-static const uint8_t jpe_zigzag[64] = {
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
-    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
-    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
-    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
-};
+typedef SstarJpegTables JpeTables;
+typedef SstarJpegBits JpeBits;
 
 static bool jpe_parse(const uint8_t *b, size_t n, JpeTables *t, size_t *hdr)
 {
@@ -166,25 +149,18 @@ static bool jpe_parse(const uint8_t *b, size_t n, JpeTables *t, size_t *hdr)
             size_t o = 0;
 
             while (o + 17 <= dl) {
-                int tc = d[o] >> 4, th = d[o] & 15, tab = tc * 4 + th;
-                const uint8_t *cnt = d + o + 1, *val = d + o + 17;
-                int code = 0, v = 0, bits;
+                int tc = d[o] >> 4, th = d[o] & 15;
+                size_t used;
 
                 if (tc > 1 || th > 3) {     /* baseline: DC/AC, 0-3 */
                     return false;
                 }
-                for (bits = 1; bits <= 16; bits++) {
-                    for (k = 0; k < cnt[bits - 1]; k++) {
-                        if (o + 17 + v >= dl) {
-                            return false;
-                        }
-                        t->code[tab][val[v]] = code++;
-                        t->len[tab][val[v]] = bits;
-                        v++;
-                    }
-                    code <<= 1;
+                used = sstar_jpeg_huff_build(t, tc * 4 + th, d + o + 1,
+                                             dl - o - 1);
+                if (!used) {
+                    return false;
                 }
-                o += 17 + v;
+                o += 1 + used;
             }
         } else if (m == 0xDA) {         /* SOS: the header ends here */
             if (dl < 1 || d[0] != 3 || dl < 1 + 3 * 2) {
@@ -205,131 +181,13 @@ static bool jpe_parse(const uint8_t *b, size_t n, JpeTables *t, size_t *hdr)
     return false;
 }
 
-static void jpe_put(JpeBits *o, uint32_t v, int n)
-{
-    o->acc = (o->acc << n) | (v & ((1u << n) - 1));
-    o->n += n;
-    while (o->n >= 8) {
-        uint8_t byte = o->acc >> (o->n - 8);
-
-        o->n -= 8;
-        if (o->len + 2 > o->cap) {
-            o->full = true;
-            return;
-        }
-        o->buf[o->len++] = byte;
-        if (byte == 0xFF) {
-            o->buf[o->len++] = 0;       /* byte stuffing */
-        }
-    }
-}
-
-static void jpe_huff(JpeBits *o, const JpeTables *t, int tab, int sym)
-{
-    jpe_put(o, t->code[tab][sym], t->len[tab][sym]);
-}
-
-static void jpe_block(JpeBits *o, const JpeTables *t, int c,
-                      const uint8_t px[64], int *pred)
-{
-    static double cs[8][8];
-    static bool init;
-    double tmp[64], f[64];
-    int i, j, k, run = 0, last = 63;
-    int q[64];
-
-    if (!init) {
-        for (i = 0; i < 8; i++) {
-            for (j = 0; j < 8; j++) {
-                cs[i][j] = (i ? 0.5 : sqrt(0.125)) *
-                           cos((2 * j + 1) * i * M_PI / 16);
-            }
-        }
-        init = true;
-    }
-    for (i = 0; i < 8; i++) {           /* rows, then columns */
-        for (k = 0; k < 8; k++) {
-            double a = 0;
-
-            for (j = 0; j < 8; j++) {
-                a += cs[k][j] * (px[i * 8 + j] - 128);
-            }
-            tmp[i * 8 + k] = a;
-        }
-    }
-    for (j = 0; j < 8; j++) {
-        for (k = 0; k < 8; k++) {
-            double a = 0;
-
-            for (i = 0; i < 8; i++) {
-                a += cs[k][i] * tmp[i * 8 + j];
-            }
-            f[k * 8 + j] = a;
-        }
-    }
-    for (i = 0; i < 64; i++) {
-        int z = jpe_zigzag[i];
-        int qv = MAX(t->q[t->tq[c]][i], 1);
-
-        q[i] = (int)lround(f[z] / qv);
-    }
-    /* DC */
-    {
-        int d = q[0] - *pred, a = abs(d), n = 0;
-
-        *pred = q[0];
-        while (a >> n) {
-            n++;
-        }
-        jpe_huff(o, t, t->td[c], n);
-        if (n) {
-            jpe_put(o, d < 0 ? d - 1 : d, n);
-        }
-    }
-    while (last > 0 && !q[last]) {
-        last--;
-    }
-    for (i = 1; i <= last; i++) {
-        int a, n = 0;
-
-        if (!q[i]) {
-            run++;
-            continue;
-        }
-        while (run >= 16) {
-            jpe_huff(o, t, 4 + t->ta[c], 0xF0);
-            run -= 16;
-        }
-        a = abs(q[i]);
-        while (a >> n) {
-            n++;
-        }
-        jpe_huff(o, t, 4 + t->ta[c], run << 4 | n);
-        jpe_put(o, q[i] < 0 ? q[i] - 1 : q[i], n);
-        run = 0;
-    }
-    if (last < 63) {
-        jpe_huff(o, t, 4 + t->ta[c], 0x00);    /* EOB */
-    }
-}
-
 /* The test picture's sample of component c at (x, y), full resolution. */
 static uint8_t jpe_pixel(int c, int x, int y, int w, int h, uint32_t frame)
 {
-    static const uint8_t bars[8][3] = {
-        { 180, 128, 128 }, { 162, 44, 142 }, { 131, 156, 44 },
-        { 112, 72, 58 }, { 84, 184, 198 }, { 65, 100, 212 },
-        { 35, 212, 114 }, { 16, 128, 128 },
-    };
-    int cell = MAX(w / 40, 8);
+    uint8_t yuv[3];
 
-    if (y < cell && x < 16 * cell) {
-        if (c) {
-            return 128;
-        }
-        return (frame >> (15 - x / cell)) & 1 ? 235 : 16;
-    }
-    return bars[MIN(x * 8 / w, 7)][c];
+    sstar_pattern_pixel(frame, w, h, x, y, yuv);
+    return yuv[c];
 }
 
 static size_t jpe_encode(const JpeTables *t, uint32_t frame, uint8_t *buf,
@@ -361,13 +219,13 @@ static size_t jpe_encode(const JpeTables *t, uint32_t frame, uint8_t *buf,
                                                           t->w, t->h, frame);
                             }
                         }
-                        jpe_block(&o, t, c, px, &pred[c]);
+                        sstar_jpeg_block(&o, t, c, px, &pred[c]);
                     }
                 }
             }
         }
     }
-    jpe_put(&o, 0x7F, 7);               /* pad with ones */
+    sstar_jpeg_flush(&o);               /* pad with ones */
     if (o.len + 2 > cap) {
         return 0;
     }

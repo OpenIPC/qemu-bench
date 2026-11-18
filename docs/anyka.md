@@ -1,9 +1,14 @@
-# Anyka AK39xx (`ak3918ev200`, `ak391xev300`, `ak391xev330`)
+# Anyka AK39xx (`ak3918ev200`, `ak391xev300`, `ak391xev330`, `ak3918ev300l`, `ak3918av100`, `ak3918av100x`)
 
 Anyka's IP-camera SoCs: one ARM926EJ-S with DDR2 in the package. The memory
 map has not moved from the AK3918EV200 through the AnyCloud39EV300 parts to
 the AnyCloud V500 (EV330), so one machine file (`hw/arm/anyka.c`) covers all
-three generations with a table entry each.
+three generations with a table entry each. The AK3918EV300L and the
+AK3918AV100 family (the vendor's "ASPEN" code, despite the EV300L's name not
+an EV300) keep the map with two moves -- SPI0 to `0x21100000`, I2C 2 to
+`0x201C0000` -- and a new clock block; a flag in the table entry (`aspen`)
+selects those. The AV100 adds blocks on top (`av100`): a second MIPI/CSI
+input, an NPU and a video pipe higher in the map (`0x212`--`0x215`).
 
 ## What the SDKs support
 
@@ -12,6 +17,9 @@ three generations with a table entry each.
 | Cloud39E / EV200 | AK3918EV200 | `ak3918ev200-kernel` (4.4 port), `ak3918ev200-bsp` (U-Boot v2026.07 port), dumps | 3.4.35 vendor (dumps), 4.4.302 port | `AKSH_240` |
 | AnyCloud39EV300 | AK3916EV300, AK3918EV300, AK3919EV300 (B and C silicon revisions), AK3916EV301 | `anycloud39ev300` SDK: kernel 3.4.35 board files, U-Boot 2013.10, spiboot | 3.4.35 vendor | `ANYKA_H3` |
 | AnyCloud V500 / EV330 | AK3916EV330, AK3918EV330, AK3919EV330, and the EV331 trio (one `dt_compat` list, `mach-ak39ev330.c`) | `ak3918ev200-kernel` (`anycloud_ak39ev330*.dtsi`), dump | 4.4.192 vendor (DT) | `ANYKAH3B` |
+| AnyCloud39AV130 SDK V1.03 (one tree for several lines) | AK3918EV300L, AK3918AV100 (N/P/X/XP), AK3918AV130 (A/L/N: kernel `CONFIG_MACH_AK3918AV130`, U-Boot `CONFIG_3918AV130_CODE`) | `ANYKA_130L_SDK`: U-Boot 2019.10 (`arch-ak3918ev300l`, `arch-ak3918av100`), kernel 4.4.302 (`anycloud_ak3918ev300l*.dtsi`), dump | 4.4.282 vendor (DT) | `AK_H322L` / `AKH322LS` (EV300L), `ANYKA322` (AV100, inferred from `ak_ddr_param`) |
+| AnyCloud39AV100 SDK V1.12 | AK3918AV100 (N/P/X/XP), KM01 (N/D) | `ANYKA_AV100_SDK`: U-Boot 2019.10.0-V4.0.27 (`arch-ak3918av100`, `ak3918av100_nor_defconfig`), kernel 4.4.282 (`anycloud_ak3918av100*.dtsi`), prebuilt `image/` | 4.4.282 vendor (DT) | `ANYKA322` (confirmed: U-Boot `vectors.S` builds `ANYKAH3D`, the burn tool patches it to `ANYKA322`; `ak_secureboot` header template) |
+| AK3918AV130 | AK3918AV130 | the AnyCloud39AV130 SDK above (kernel 4.4.302 drivers `ak_irq_v2.c`, `ak_timer*.c`, `ak_uartv2.c`, `ak_nor.c`; U-Boot `ak_sfcv2.c`, `ak_serialv2.c`), and one flash dump (owner report r-5uwdebux on openipc.org): U-Boot 2019.10.0-V4.0.27 built for it (`EVB_CBD_AK3918AV130_V1.0.0`), its DTs `anyka,ak3918av130` | vendor (DT) | `AKH322LS`, payload from `0x200` to `0x80DFFC00` |
 | AK37D, AK37E | — | `#ifdef`s in the 4.4 tree's `map.h`, `irqs.h`, `ak_timer.c` only | — | — |
 
 The `Aimer39_PDK_V1.1.00` archive (AK3918 datasheet and programming guide)
@@ -27,6 +35,19 @@ is header-encrypted and was not usable.
 | `ak3919ev300` | `0x20160100` | 128 MiB¹ | 5 | |
 | `ak3918ev330` | `0x20160101` | 64 MiB | 10 | eFuse reader, I2C v2, flash CS on GPIO 25 |
 | `ak3919ev330` | `0x20160101` | 128 MiB | 10 | U-Boot of the dump prints `ramsize: 08000000` |
+| `ak3918ev300l` | `0x53543400` | 64 MiB | 10 | "ASPEN": SPI0 at `0x21100000`, clock block v2; `socinfo` prints `0x535434` |
+| `ak3918av100` | `0x53533500` | 64 MiB | 10 | ASPEN + AV100 blocks; AK3918AV100N/P, KM01N; boots the AnyCloud39AV100 SDK V1.12 firmware to login |
+| `ak3918av100x` | `0x53533500` | 128 MiB | 10 | same die, 128 MiB; AK3918AV100X/XP, KM01D |
+| `ak3918av130` | `0x53533500`¹ | 64 MiB | 5 at `0x21110000` | the AV100's map, plus its own interrupt controller and timers at `0x21100000` (`ak-av130-intc`), a FIFO UART (`ak-uart2`) and the SPI flash controller at `0x20120000` (`ak-sfc`); the dump boots to `login:`, see below |
+
+The AV100 family all read chip ID `0x53533500` (`socinfo` `0x535335`,
+"AK3918AV100-A"; the C revision is `0x53533501`, "-C"). The vendor tells the
+parts apart not by this register but by the eFuse global ID and the DDR bank
+count: `libplat_osal.so` (`osal_get_chip_type`) reads the eFuse model code
+and `osal_get_mem_bank_num` reads a DDRC bit (`0x21000000`, `0x200` = 8
+banks / 128 MiB, else 4 banks / 64 MiB). So KM01N and the 64 MiB AK3918AV100
+parts map onto `ak3918av100`, KM01D and the 128 MiB X parts onto
+`ak3918av100x`; the two machines differ only in DDR size.
 
 ¹ Not seen on a dump; `-m` overrides it.
 
@@ -52,18 +73,22 @@ appended DTB.
 | `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
 | `0x20000000` | ISP / VI | storage |
 | `0x20020000` | video encoder | storage |
-| `0x20100000` / `0x20108000` | MCI0 (SD, `-drive if=sd`) / MCI1 (SDIO) | `ak-mci` |
+| `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
 | `0x20120000` / `0x20128000` | SPI0 (boot NOR) / SPI1 | `ak-spi`, `ak-spinor` |
-| `0x20130000` / `0x20138000` | UART0 / UART1 | `ak-uart` |
+| `0x20130000` / `0x20138000` | UART0 / UART1 (UART2 at `0x201A0000`, interrupt 24, on the EV300L and AV100) | `ak-uart` |
 | `0x20140000` | L2 buffer controller | `ak-l2` |
-| `0x20150000`, `0x20190000`, `0x201A0000` | I2C 0 (1, 2 on EV330) | `ak-i2c` |
+| `0x20150000`, `0x20190000`, `0x201A0000` | I2C 0 (1, 2 on EV330; EV300L: I2C 2 at `0x201C0000`, UART 2 at `0x201A0000`) | `ak-i2c` |
 | `0x20170000` | GPIO | `ak-gpio` |
 | `0x20200000` | USB 2.0 OTG (MUSB-style) | `ak-usb` (nothing plugged in) |
 | `0x20300000` | Ethernet: Synopsys GMAC, RMII PHY at MDIO 1 | `xm-dwmac` |
 | `0x21000000` | DDR2 controller | `ak-ddrc` |
+| `0x21100000` | EV300L / AV100: SPI0 (boot NOR), the old SPI0 register set plus `+0x20` RTIM and `+0x24` WORK_MODE | `ak-spi`, `ak-spinor` |
+| `0x201A8000` / `0x58000000` | AV100: second L2 buffer controller / its SRAM (`l2-buffer_1`, interrupt 25; disabled on the single-sensor boards) | unimplemented (reads 0) |
+| `0x20400000` / `0x20500000` | AV100: MIPI0 / MIPI1 receiver (the GPIO node's second and third `reg`) | `ak-mipi` storage / unimplemented |
+| `0x21200000`--`0x21500000` | AV100: VI/ISP (`0x21200000`), NPU/CNN (`0x21300000`), video encoder (`0x21400000`), encoder bridge (`0x21500000`) | the `ak-apb` catch-all (reads 0) |
 | `0x48000000` | L2 memory, 8 KiB, mirrored over 64 KiB | `ak-l2` |
-| `0x80000000` | DDR | RAM |
+| `0x80000000` | DDR (64 MiB; 128 MiB on `ak3919*`, `ak3918av100x`) | RAM |
 
 Interrupts are SYSCTRL's: module sources 0..23 in `+0x24` (enable) and
 `+0x4C` (status), source 3 being the "system" sub-controller, whose sources
@@ -79,19 +104,41 @@ The first 512 bytes of the NOR (U-Boot port `mkaksh.py`, and every dump):
 | Offset | Content |
 |---|---|
 | `+0x00` | branch |
-| `+0x04` | magic `AKSH_240` / `ANYKA_H3` / `ANYKAH3B` |
+| `+0x04` | magic `AKSH_240` / `ANYKA_H3` / `ANYKAH3B` / `AK_H322L` (EV300L) / `ANYKA322` (AV100) |
 | `+0x0C` | payload length (it follows the header) |
-| `+0x20` | load address: `0x80E00000` (U-Boot, EV200/EV300) or `0x48000000` (EV330 first stage) |
-| `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x88888888` = end |
+| `+0x20` | load address: `0x80E00000` (U-Boot, EV200/EV300/EV300L/AV100) or `0x48000000` (EV330 first stage) |
+| `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` = three-word read-modify-write `{marker, register, mask}` (the AV130 dump clears bit 2 of DDRC `+0x24` with it), `0x66668882` = a ROM operation of one value; all skipped; `0x88888888` = end |
 | `+0x18C` | `SPIP` + the SPI NOR descriptor (JEDEC ID, size, page, erase size, partition-table block) |
 
+The AV100's `ANYKA322` payload does not follow the header at `+0x200` but at
+`+0x600`: `vectors.S` under `CONFIG_3918AV100_CODE` reserves `0x400` more
+bytes (secure boot keeps the public key at `+0x200` and the signature at
+`+0x300`; `tools/secureboot/ak_secureboot`), and the vendor U-Boot is linked
+at the load address `- 0x600` (`CONFIG_SYS_TEXT_BASE 0x80DFFA00`). The model
+copies an `ANYKA322` payload from flash `0x600`; the others still from
+`0x200`. (Signed images also write `0x84000000` at `+0x1C`; unsigned ones
+keep `6`.) `0x600` is inferred from the SDK -- no AV100 flash dump has been
+seen -- and matches what the OpenIPC U-Boot `ak3918av100` port emits.
+
 The ROM replays the script (PLLs, DDR controller), copies the payload to the
-load address and enters it. It also leaves the header in L2 memory at
+load address and enters it. The EV300L header has the EV300's fields (its
+U-Boot, linked at `0x80DFFE00`, carries it: `vectors.S` writes the generic
+`ANYKAH3D` and the burn tools patch magic and script); its payload, 0x49000
+bytes, takes in ENV, ENVBK and DTB behind U-Boot; its SPIP descriptor is
+empty, so the flash answers as a GD25Q64 unless `flash-jedec=` says
+otherwise. It also leaves the header in L2 memory at
 `0x48000200`, where the old EV200 `spiboot` loader looks for `SPIP`. The
 model is a small program at address 0 that the CPU runs out of reset, because
 the script has to land after the device resets: the EV330 script leaves its
 first stage the load parameters (SPI setup, length 0x40000, destination
 0x80E01000) in timer registers.
+
+Word `0x24` of the stub ROM is a pointer into the ROM itself (`0x7F00`),
+and the script table starts at `0x28`. The EV300L vendor U-Boot's
+`ak_spi_set_mode()` takes the platdata of the SPI bus's *parent* -- NULL --
+and read-modify-writes SPICON at "NULL->regs", the ROM word at `0x24`; on
+silicon that is a harmless ROM access, with a script word there it was an
+alignment abort and a reset loop at `Flash:`.
 
 EV330 boots in two stages: the first (4 KiB in L2 memory) runs the second
 header's DDR script itself, polls DDRC `+0x24` for "done", and streams U-Boot
@@ -99,6 +146,20 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
 
 ## Device notes
 
+- **EV300L clock block** (U-Boot `clk-ak3918ev300l.h`): 24 MHz crystal;
+  PLL1 (CPU, `+0x04`), PLL2 (`+0x08`, GCLK) and PLL3 (`+0x14`) are each
+  24 MHz × (M + 1) / (N + 1) / (OD + 1) with M 12:0, N 18:13, OD 22:19.
+  GCLK = PLL2 / (2 × (bits 24:23 + 1)). Self-clearing: `+0x04` bits 30 /
+  29 / 28 (apply PLL1 / PLL3 / PLL2), `+0x08` bit 25 (GCLK divider valid),
+  `+0x0C` and `+0x10` bits 29 / 19 / 9 (divider valid; `+0x0C` 19 is SPI0's
+  high-speed clock, divider in 17:10, enable 18, its reset `+0x20` bit 31),
+  `+0x18` bit 9 (MAC OPCLK). The header script leaves PLL1 at `0x24`
+  (888 MHz); the model resets PLL2 to 240 MHz / GCLK 60 MHz and the vendor
+  U-Boot sets 400 / 200 MHz. Pad registers run to `+0x290`. Gates (`+0x1C`,
+  1 = off) and resets (`+0x20`): MMC0 1, MMC1 2, SPI0 5, SPI1 6, UART0 7,
+  L2 buffer 0 9, GPIO 12, MAC 13. The interrupt controller, timers (EV330
+  layout, 12 MHz), watchdog (`+0xE4` / `+0xE8`), UART and L2 buffer
+  numbering are the old ones.
 - **UART** (`ak-uart`) has no data register. TX bytes go into L2 memory at
   `0x48001000 + 0x100 n`, CONF2 starts the send; received bytes land in a
   128-byte ring at `+0x80`, and DATA_CONF bits 19:13 say where the next one
@@ -141,6 +202,91 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   dongle. As plain storage the block echoed the driver's bits back as
   connect events and the hub layer retried forever.
 
+## AK3918AV130
+
+The one AV130 seen is a raw 8 MiB read sent to openipc.org (owner report
+r-5uwdebux). It was taken for an AV100 at first -- its U-Boot is the AV100
+SDK's 2019.10.0-V4.0.27 and its header magic `AKH322LS` -- but both its DTs
+say `anyka,ak3918av130` (board `EVB_CBDM_AK3918av130`; U-Boot finds 64 MiB,
+the AV130N), and the
+blocks it drives are not the AV100's:
+
+- **The header.** Payload length `0x40000` from flash `0x200` to
+  `0x80DFFC00`: the 0x400 bytes of secure-boot space go first, so flash
+  `0x600` lands at `0x80E00000`, which is where U-Boot is linked. The ROM
+  enters at the load address and runs through the zeroes (`andeq`) to it.
+  Its script ends with the three-word `0x66668880` op; read as a pair, it
+  became a store of `0x88888888` to `0xFFFFFFFB` and a data abort in the ROM.
+- **Interrupt controller and timers** at `0x21100000`
+  (`hw/misc/ak-av130-intc.c`; the SDK kernel's `ak_irq_v2.c` and
+  `ak_timer_common.h` under `CONFIG_MACH_AK3918AV130`). The system
+  controller no longer takes the interrupts:
+  - **Top bank:** `+0x00` FIQ mask, `+0x04` IRQ mask (1 = enabled),
+    `+0x08` status. Devices keep the old numbers (MCI 4/5, SFC 8, UART0 10,
+    GPIO 15, MAC 16).
+  - **Sub-banks** behind it, each a mask/status pair: TWI (I2C) at
+    `+0x0C`/`+0x10` on top bit 13, SSS `+0x14` (bit 17), NSS `+0x1C`
+    (bit 0), ISS `+0x24` (bit 1), ESS `+0x2C` (bit 2). A DT specifier is
+    `<bit bank>`. The system controller's sub-bank (bank 1, `0x0800002C`)
+    is not modelled.
+  - **Five timers** at `+0x10000 + n * 0x1000`, 12 MHz, counting down, on
+    top bits 27-31. Registers: `LOAD`, `VALUE`, `CTRL` (0 enable, 2:1
+    free / periodic / one-shot, 3 reload now), `INTCLR`, `INT_EN`, `DIV`,
+    `INT_STA`. Timer 0 is U-Boot's `get_timer()` and the kernel's
+    clocksource, timer 1 its clock event. Without them U-Boot's first
+    `udelay` never returns and the kernel never ticks.
+- **UART** (`anyka,ak3918av100plus-uart` in the U-Boot DT,
+  `anyka,ak3918av130-uart0` in the kernel's, at the old addresses): a FIFO
+  UART with a data register, not the L2-buffer UART (`ak-uart2` in
+  `hw/char/ak-uart.c`, from the SDK's `ak_serialv2.c` and `ak_uartv2.c`):
+  - `CFG` bits 28/29 clear the RX/TX FIFO and clear themselves; the
+    kernel waits on 28 when the console opens.
+  - Status: TX empty (1) and TX end (17) after a send; RX threshold (8)
+    and timeout (10) while bytes wait. `0x20` enables each status bit as
+    an interrupt.
+- **SPI flash controller** `sfc@20120000` (`hw/ssi/ak-sfc.c`), where the
+  older parts had SPI0: a list of command banks (`0x200 + 0x40 n`: opcode,
+  address, mode, data, match mask / data, interface, lengths) that it runs
+  against the boot NOR on its SSI bus, one chip-select frame each. Data
+  moves through a bank's own register (up to 4 bytes: RDID, status), the
+  `0x184` FIFO, or L2 common buffer 1 by DMA (BUFASSIGN device 0, 64-byte
+  blocks), which is how U-Boot reads the kernel. A bank with bit 27 polls
+  (RDSR until WIP is clear). `0x0D0` bit 4 is done (write 1 to clear),
+  `0x100` bit 1 acknowledges the XIP stop, bit 4 resets the FIFO. The XIP
+  window at `0x30000000` reads with 0x03; this U-Boot never uses it. All
+  of it from the U-Boot driver's behaviour; no datasheet.
+- **Elsewhere:** the GMAC is at `0x20240000` (`ethernet@0x20240000`), and
+  the I2C interrupts are on the TWI bank.
+- **Result:** U-Boot detects the GD25Q64, loads its environment, reads the
+  4.4.302-cip94 kernel (checksum OK) and the DT, and starts it. The kernel
+  brings up `ttySAK0`, reads the NOR through the SFC v2 by L2 DMA
+  (`Anyka SFCv2 driver register success`), mounts the squashfs root, and
+  reaches `AnyCloud-uc1_1 login:`. The vendor modules load. The app's
+  `device_id_decryption` step then fails ("Read and decrypt failed",
+  eleven tries) and its daemon asks for a reboot. It never touches the
+  crypto engine at `0x20180000` (no access, and neither `ak_crypto.ko` nor
+  `cryptodev.ko` is loaded); what it misses is its encrypted device ID.
+  That is left failing on purpose: making it succeed would recover a
+  camera's cloud identity from an owner's dump.
+- **Reboot** (`ak_pm.c`, `L2_LINK(standby)` with `param1` set, entered
+  from `ak3918av130_restart()` through `l2_exec_buf()`): the kernel copies
+  the code into L2 memory, prints `Y` when the copy checks out, and jumps
+  to it at its mapping, `AK_VA_L2MEM` = `0xF1000000`.
+  `REBOOT_DISABLE_CACHE_MMU()` then turns the MMU off with an `mcr`. The
+  next instruction, `mov pc` to the same code at `0x480000xx`, is one the
+  ARM926 has already fetched; QEMU fetches it again, at physical
+  `0xF1000000`, so the machine maps L2 memory there too.
+  `REBOOT_SELF_REFRESH()` then puts the DRAM in self-refresh (`ak-ddrc`:
+  `0x21000010` bit 23 reads back done) and starts the watchdog
+  (`SYSCTRL +0xE4 = 0x55000009`, `+0xE8 = 0xAA000003`), whose reset
+  boots the flash again. On the dump this is a loop: login, the
+  device-ID step, a watchdog reset about every ten seconds.
+- **Not modelled:** the crypto engine itself, the system controller's
+  interrupt bank, and the XIP windows. The DT also has a data mover
+  (`0x21120000`) and a remote processor (`0x21102000`).
+
+¹ The AV100's. The AV130's is at SYSCTRL `+0x3FC` (`0x56573500`), where ipctool reads it.
+
 ## Dumps
 
 Vendor firmware, each booted with `flash-file=` on a copy:
@@ -156,7 +302,11 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `win25q64jvs10_…` (EV200, spiboot) | `ak3918ev200` | login; an old audio library reports `CHIP(106552) unsupported` |
 | `full.bin` (AK3919EV330, U-Boot AK_V3.1.00, 4.4.192) | `ak3919ev330` | login, `anyka_ipc`; its nginx answers HTTP over the emulated Ethernet (static 192.168.1.88) |
 | `AK3918_V300s_dumps.zip`, `AK3918_V330L_dumps.zip` (AK3918EV330, U-Boot V3.1.28, 4.4.192; partitions only) | `ak3918ev330` | assembled at the `mtdparts` offsets: login; ENV, CONFIG and APP are not in the zips, so `/usr` (and `ak_eth.ko`) is missing. Flash BY25Q64A (`0x684017`) |
+| gzhongshi HVT3610S3 QQ-WiFi v2.0 (AK3918EV300L, U-Boot 2019.10.0-V4.0.25, 4.4.282, XM25QH64C; ipctool backup, rebuilt into a raw image) | `ak3918ev300l` | `GZhongshi login:`, vendor app (no sensor answers on I2C); vendor U-Boot `sf probe/read/erase/write` and `reset` (watchdog) work; matches the board's own boot log up to the PHY (absent on the board) |
 | `XM25QH64A@SOIC8.BIN` | — | the dump has bit errors throughout (`consold=ttyS@K0`); not bootable |
+| AnyCloud39AV100 SDK V1.12 firmware, assembled into an 8 MiB image (`qemu-boot/anyka-sdk-image.py`): the SDK's own U-Boot 2019.10.0-V4.0.27 (`ak3918av100_nor_defconfig`) under an `ANYKA322` header with the burn tool's 64 MiB DDR script, `image/uImage` (vendor 4.4.282), `EVB_CBDM_AK3918AV100N_V1.0.0.dtb`, `root.sqsh4`, `usr.jffs2`, `usr.sqsh4` at the burn-config offsets | `ak3918av100` | `anyka login:` (`ANYKA CPU AK3918AV100-A (ID 0x535335)`, GD25Q64 NOR, 8 MTD partitions, squashfs root, jffs2 config, APP mounted). The vendor modules load without crashing: `ak_rtc`, `ak_i2c`, `ak_efuse`, `ak_ion`, `ak_pcm`, `ak_isp`, `ak_venc_adapter`, `ak_npu`, `ak_eth`. (`ak_venc_bridge` and `ak_hcd` need symbols from `ak_venc_adapter` / usbcore loaded first, as the vendor scripts do.) |
+| the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
+| owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | `AnyCloud-uc1_1 login:` (4.4.302-cip94, NOR through the SFC by L2 DMA, squashfs root, the vendor modules load); then the app's device-ID decryption fails (left so on purpose, see above), its daemon asks for a reboot, and the watchdog reset boots it again: a loop of about ten seconds |
 
 ## Ethernet checks
 
@@ -171,4 +321,25 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 ## Not modelled
 
 The MCI's L2 DMA data path, ISP, video encoder, audio codec, SAR ADC. No
-sensor models are attached to I2C yet.
+sensor models are attached to I2C yet. On the AV100 the second MIPI/CSI
+input, the NPU (`0x21300000`) and the video pipe (`0x212`--`0x215`) are the
+`ak-apb` catch-all (reads 0): the vendor modules probe and map them but no
+frames flow. The second L2 buffer (`0x201A8000` / `0x58000000`) and the
+third MCI (`mmc2` at `0x201B0000`, SDIO Wi-Fi) are likewise unmodelled and
+disabled on the single-sensor boards.
+
+## Building an AV100 flash image
+
+The AnyCloud39AV100 SDK ships no U-Boot binary (the `*.bin` are gitignored).
+Build it from the SDK's `os/uboot` (`ak3918av100_nor_defconfig`), then wrap
+it with the header and partitions the burn tool writes:
+
+```
+python3 qemu-boot/anyka-sdk-image.py <sdk> <u-boot.bin> flash.bin --ram 64
+bash qemu-boot/run-ak3918av100.sh flash.bin ak3918av100
+```
+
+`--ram 128` with `--dtb EVB_CBDM_AK3918AV100X_V1.0.0.dtb` makes the 128 MiB
+image for `ak3918av100x`. The script reads the DDR register script from the
+SDK's `tools/burntool/SDK_CPU_DDR2.ini` and the DTB, kernel and rootfs from
+the SDK's `image/`.

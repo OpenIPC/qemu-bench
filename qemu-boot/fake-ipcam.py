@@ -11,6 +11,10 @@ every motion vector zero, deblocking off), so what the NVR decodes is
 exactly the pattern drawn here: colour bars, a moving box and a frame
 counter.
 
+ONVIF offers two profiles, the main stream (Profile_1) and the sub
+stream (Profile_2), and GetSnapshotUri's /snapshot.jpg is the main
+stream's current picture as a baseline JPEG, encoded here too.
+
 Usage (the NVR at 192.168.1.9, the camera at 192.168.1.10):
 
     python3 qemu-boot/fake-ipcam.py --http 18080 --rtsp 18554 \
@@ -36,6 +40,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 import argparse
 import base64
 import datetime
+import math
 import os
 import random
 import select
@@ -281,6 +286,7 @@ class H264Pattern:
     def picture(self):
         """The next access unit (bytes) and whether it is an IDR."""
         planes = self.draw(self.n)
+        self.last = planes                      # for the snapshot
         idr = self.n % self.gop == 0 or self.prev is None
         b = BitWriter()
         b.ue(0)                                 # first_mb_in_slice
@@ -749,13 +755,19 @@ def envelope(body):
             '<s:Body>%s</s:Body></s:Envelope>' % (NS, body)).encode()
 
 
-def onvif_body(action, srv):
+def onvif_body(action, srv, body=b""):
+    """The response to an ONVIF action.  Profile_1 is the main stream,
+    Profile_2 the sub stream (NVRs live-view their split screens from it);
+    a request naming Profile_2 or VideoEncoder_2 gets the sub stream's."""
     ip, port = srv.advertise, srv.advertise_http
-    w, h, fps = srv.stream.pat.w, srv.stream.pat.h, srv.stream.pat.fps
+    sub = b"Profile_2" in body or b"VideoEncoder_2" in body
+    pat = srv.streams["sub" if sub else "main"].pat
+    w, h, fps = pat.w, pat.h, pat.fps
     dev = "http://%s:%d/onvif/device_service" % (ip, port)
     med = "http://%s:%d/onvif/media_service" % (ip, port)
     now = datetime.datetime.now(datetime.timezone.utc)
-    venc = ('<tt:Name>VideoEncoder_1</tt:Name><tt:UseCount>1</tt:UseCount>'
+    def encoder(n, w, h):
+        return ('<tt:Name>VideoEncoder_%d</tt:Name><tt:UseCount>1</tt:UseCount>'
             '<tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>%d'
             '</tt:Width><tt:Height>%d</tt:Height></tt:Resolution>'
             '<tt:Quality>5</tt:Quality><tt:RateControl><tt:FrameRateLimit>%d'
@@ -767,16 +779,24 @@ def onvif_body(action, srv):
             '</tt:Address><tt:Port>0</tt:Port><tt:TTL>0</tt:TTL>'
             '<tt:AutoStart>false</tt:AutoStart></tt:Multicast>'
             '<tt:SessionTimeout>PT60S</tt:SessionTimeout>'
-            % (w, h, fps, srv.stream.pat.gop))
+            % (n, w, h, fps, pat.gop))
+
+    venc = encoder(2 if sub else 1, w, h)
     vsrc = ('<tt:Name>VideoSource_1</tt:Name><tt:UseCount>1</tt:UseCount>'
             '<tt:SourceToken>VideoSource_1</tt:SourceToken><tt:Bounds x="0" '
             'y="0" width="%d" height="%d"/>' % (w, h))
-    profile = ('<trt:Profiles token="Profile_1" fixed="true"><tt:Name>'
-               'mainStream</tt:Name><tt:VideoSourceConfiguration '
-               'token="VideoSourceConfig_1">%s</tt:VideoSourceConfiguration>'
-               '<tt:VideoEncoderConfiguration token="VideoEncoder_1">%s'
-               '</tt:VideoEncoderConfiguration></trt:Profiles>'
-               % (vsrc, venc))
+    def profile(n, name, p):
+        return ('<trt:Profiles token="Profile_%d" fixed="true"><tt:Name>'
+                '%s</tt:Name><tt:VideoSourceConfiguration '
+                'token="VideoSourceConfig_1">%s</tt:VideoSourceConfiguration>'
+                '<tt:VideoEncoderConfiguration token="VideoEncoder_%d">%s'
+                '</tt:VideoEncoderConfiguration></trt:Profiles>'
+                % (n, name, vsrc, n, encoder(n, p.w, p.h)))
+
+    profiles = (profile(1, "mainStream", srv.streams["main"].pat) +
+                profile(2, "subStream", srv.streams["sub"].pat))
+    one = profile(2, "subStream", pat) if sub else \
+        profile(1, "mainStream", pat)
     bodies = {
         "GetSystemDateAndTime":
             '<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>'
@@ -826,9 +846,9 @@ def onvif_body(action, srv):
             '</tt:DHCP></tt:Config></tt:IPv4></tds:NetworkInterfaces>'
             '</tds:GetNetworkInterfacesResponse>' % ip,
         "GetProfiles": '<trt:GetProfilesResponse>%s</trt:GetProfilesResponse>'
-            % profile,
+            % profiles,
         "GetProfile": '<trt:GetProfileResponse>%s</trt:GetProfileResponse>'
-            % profile.replace("trt:Profiles", "trt:Profile"),
+            % one.replace("trt:Profiles", "trt:Profile"),
         "GetVideoSources":
             '<trt:GetVideoSourcesResponse><trt:VideoSources '
             'token="VideoSource_1"><tt:Framerate>%d</tt:Framerate>'
@@ -841,19 +861,23 @@ def onvif_body(action, srv):
             '</trt:GetVideoSourceConfigurationsResponse>' % vsrc,
         "GetVideoEncoderConfigurations":
             '<trt:GetVideoEncoderConfigurationsResponse><trt:Configurations '
-            'token="VideoEncoder_1">%s</trt:Configurations>'
-            '</trt:GetVideoEncoderConfigurationsResponse>' % venc,
+            'token="VideoEncoder_1">%s</trt:Configurations><trt:Configurations '
+            'token="VideoEncoder_2">%s</trt:Configurations>'
+            '</trt:GetVideoEncoderConfigurationsResponse>'
+            % (encoder(1, srv.streams["main"].pat.w, srv.streams["main"].pat.h),
+               encoder(2, srv.streams["sub"].pat.w, srv.streams["sub"].pat.h)),
         "GetVideoEncoderConfiguration":
             '<trt:GetVideoEncoderConfigurationResponse><trt:Configuration '
-            'token="VideoEncoder_1">%s</trt:Configuration>'
-            '</trt:GetVideoEncoderConfigurationResponse>' % venc,
+            'token="VideoEncoder_%d">%s</trt:Configuration>'
+            '</trt:GetVideoEncoderConfigurationResponse>'
+            % (2 if sub else 1, venc),
         "GetStreamUri":
             '<trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>'
-            'rtsp://%s:%d/stream1</tt:Uri><tt:InvalidAfterConnect>false'
+            'rtsp://%s:%d/%s</tt:Uri><tt:InvalidAfterConnect>false'
             '</tt:InvalidAfterConnect><tt:InvalidAfterReboot>false'
             '</tt:InvalidAfterReboot><tt:Timeout>PT0S</tt:Timeout>'
             '</trt:MediaUri></trt:GetStreamUriResponse>'
-            % (ip, srv.advertise_rtsp),
+            % (ip, srv.advertise_rtsp, "sub" if sub else "stream1"),
         "GetSnapshotUri":
             '<trt:GetSnapshotUriResponse><trt:MediaUri><tt:Uri>'
             'http://%s:%d/snapshot.jpg</tt:Uri></trt:MediaUri>'
@@ -864,6 +888,25 @@ def onvif_body(action, srv):
         "SetSystemDateAndTime": '<tds:SetSystemDateAndTimeResponse/>',
         "SetVideoEncoderConfiguration":
             '<trt:SetVideoEncoderConfigurationResponse/>',
+        "GetVideoEncoderConfigurationOptions":
+            '<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>'
+            '<tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max>'
+            '</tt:QualityRange><tt:H264><tt:ResolutionsAvailable><tt:Width>%d'
+            '</tt:Width><tt:Height>%d</tt:Height></tt:ResolutionsAvailable>'
+            '<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>%d</tt:Max>'
+            '</tt:GovLengthRange><tt:FrameRateRange><tt:Min>1</tt:Min>'
+            '<tt:Max>%d</tt:Max></tt:FrameRateRange><tt:EncodingIntervalRange>'
+            '<tt:Min>1</tt:Min><tt:Max>1</tt:Max></tt:EncodingIntervalRange>'
+            '<tt:H264ProfilesSupported>Baseline</tt:H264ProfilesSupported>'
+            '</tt:H264></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>'
+            % (w, h, max(1, pat.gop), fps),
+        "GetNetworkProtocols":
+            '<tds:GetNetworkProtocolsResponse><tds:NetworkProtocols><tt:Name>'
+            'HTTP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>%d'
+            '</tt:Port></tds:NetworkProtocols><tds:NetworkProtocols><tt:Name>'
+            'RTSP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>%d'
+            '</tt:Port></tds:NetworkProtocols></tds:GetNetworkProtocolsResponse>'
+            % (port, srv.advertise_rtsp),
         "GetHostname":
             '<tds:GetHostnameResponse><tds:HostnameInformation><tt:FromDHCP>'
             'false</tt:FromDHCP><tt:Name>fake-ipcam</tt:Name>'
@@ -889,6 +932,21 @@ def soap_action(body):
 
 
 class HTTPHandler(socketserver.StreamRequestHandler):
+    def snapshot(self):
+        """The main stream's current picture as a JPEG (the pattern only:
+        a file stream has no pictures to give)."""
+        pat = self.server.streams["main"].pat
+        planes = getattr(pat, "last", None)
+        if planes:
+            code, ctype = "200 OK", "image/jpeg"
+            data = jpeg_encode(pat.w, pat.h, *planes, pat.mbw * 16)
+        else:
+            code, ctype, data = "404 Not Found", "text/plain", b"no picture"
+        log("http: GET /snapshot.jpg -> %s, %d bytes" % (code, len(data)))
+        self.wfile.write(("HTTP/1.1 %s\r\nContent-Type: %s\r\n"
+                          "Content-Length: %d\r\n\r\n"
+                          % (code, ctype, len(data))).encode() + data)
+
     def handle(self):
         while True:
             line = self.rfile.readline()
@@ -905,8 +963,13 @@ class HTTPHandler(socketserver.StreamRequestHandler):
                 k, _, v = h.partition(":")
                 hdrs[k.strip().lower()] = v.strip()
             body = self.rfile.read(int(hdrs.get("content-length", "0")))
+            if req.split(" ")[:2] == ["GET", "/snapshot.jpg"]:
+                self.snapshot()
+                if hdrs.get("connection", "").lower() == "close":
+                    return
+                continue
             action = soap_action(body)
-            resp = onvif_body(action, self.server) if action else None
+            resp = onvif_body(action, self.server, body) if action else None
             log("onvif: %s %s -> %s" % (req, action,
                                         "ok" if resp else "fault"))
             if resp:
@@ -924,6 +987,129 @@ class HTTPHandler(socketserver.StreamRequestHandler):
                              + data)
             if hdrs.get("connection", "").lower() == "close":
                 return
+
+
+# ---------------------------------------------------------------------------
+# JPEG, for the ONVIF snapshot (GetSnapshotUri)
+
+# ITU T.81 Annex K: the typical Huffman tables (code counts by length, then
+# the symbols)
+JPEG_DC_L = ([0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], range(12))
+JPEG_DC_C = ([0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0], range(12))
+JPEG_AC_L = ([0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D], bytes.fromhex(
+    "01020300041105122131410613516107227114328191a1082342b1c11552d1f0"
+    "2433627282090a161718191a25262728292a3435363738393a434445464748494a"
+    "535455565758595a636465666768696a737475767778797a838485868788898a"
+    "92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6"
+    "c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa"))
+JPEG_AC_C = ([0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77], bytes.fromhex(
+    "000102031104052131061241510761711322328108144291a1b1c109233352f0"
+    "156272d10a162434e125f11718191a262728292a35363738393a434445464748"
+    "494a535455565758595a636465666768696a737475767778797a828384858687"
+    "88898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3"
+    "c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9fa"))
+
+
+def huff_codes(table):
+    """{symbol: (code, length)} of a (counts, symbols) table."""
+    codes, code, k, syms = {}, 0, 0, list(table[1])
+    for length, count in enumerate(table[0], 1):
+        for _ in range(count):
+            codes[syms[k]] = (code, length)
+            code += 1
+            k += 1
+        code <<= 1
+    return codes
+
+
+JPEG_COS = [[(math.sqrt(0.5) if u == 0 else 1.0) *
+             math.cos((2 * x + 1) * u * math.pi / 16) / 2 for x in range(8)]
+            for u in range(8)]
+JPEG_ZIGZAG = sorted(range(64), key=lambda i: (
+    i // 8 + i % 8, (i % 8) if (i // 8 + i % 8) & 1 == 0 else i // 8))
+
+
+def jpeg_encode(w, h, y, u, v, stride):
+    """Baseline 4:2:0 JPEG of the planes (Y at stride, U / V at stride / 2,
+    padded to 16 lines), unquantised (every step 1).  A flat block -- most
+    of the pattern -- codes its DC alone; the others get the full DCT."""
+    dcl, dcc = huff_codes(JPEG_DC_L), huff_codes(JPEG_DC_C)
+    acl, acc_c = huff_codes(JPEG_AC_L), huff_codes(JPEG_AC_C)
+    out = bytearray()
+    acc = [0, 0]                                # bits, count
+
+    def put(code, n):
+        acc[0] = (acc[0] << n) | code
+        acc[1] += n
+        while acc[1] >= 8:
+            acc[1] -= 8
+            b = (acc[0] >> acc[1]) & 0xFF
+            out.append(b)
+            if b == 0xFF:
+                out.append(0)                   # byte stuffing
+
+    def coef(val, codes, run=None):
+        cat = abs(val).bit_length()
+        put(*codes[cat if run is None else (run << 4) | cat])
+        if cat:
+            put(val if val > 0 else val + (1 << cat) - 1, cat)
+
+    def block(plane, pstride, x0, y0, pred, dc, ac):
+        rows = [plane[r * pstride + x0:r * pstride + x0 + 8]
+                for r in range(y0, y0 + 8)]
+        first = rows[0][0]
+        if all(p == first for row in rows for p in row):
+            val = (first - 128) * 8             # the FDCT's DC, step 1
+            coef(val - pred, dc)
+            put(*ac[0])                         # EOB
+            return val
+        f = [[p - 128 for p in row] for row in rows]
+        t = [[sum(JPEG_COS[k][x] * f[r][x] for x in range(8))
+              for k in range(8)] for r in range(8)]
+        F = [round(sum(JPEG_COS[k][r] * t[r][j] for r in range(8)))
+             for k in range(8) for j in range(8)]
+        F = [max(-1023, min(1023, c)) for c in F]
+        coef(F[0] - pred, dc)
+        run = 0
+        for i in JPEG_ZIGZAG[1:]:
+            if F[i] == 0:
+                run += 1
+                continue
+            while run > 15:
+                put(*ac[0xF0])                  # ZRL
+                run -= 16
+            coef(F[i], ac, run)
+            run = 0
+        if run:
+            put(*ac[0])
+        return F[0]
+
+    cs = stride // 2
+    py = pu = pv = 0
+    for my in range(0, (h + 15) // 16 * 16, 16):
+        for mx in range(0, (w + 15) // 16 * 16, 16):
+            for by, bx in ((0, 0), (0, 8), (8, 0), (8, 8)):
+                py = block(y, stride, mx + bx, my + by, py, dcl, acl)
+            pu = block(u, cs, mx // 2, my // 2, pu, dcc, acc_c)
+            pv = block(v, cs, mx // 2, my // 2, pv, dcc, acc_c)
+    if acc[1]:
+        put((1 << (8 - acc[1])) - 1, 8 - acc[1])   # pad with ones
+
+    def seg(marker, body):
+        return struct.pack(">BBH", 0xFF, marker, len(body) + 2) + body
+
+    def dht(cls_id, table):
+        return bytes([cls_id]) + bytes(table[0]) + bytes(table[1])
+
+    hdr = b"\xff\xd8"
+    hdr += seg(0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0")
+    hdr += seg(0xDB, b"\x00" + b"\x01" * 64 + b"\x01" + b"\x01" * 64)
+    hdr += seg(0xC0, struct.pack(">BHHB", 8, h, w, 3) +
+               b"\x01\x22\x00\x02\x11\x01\x03\x11\x01")
+    hdr += seg(0xC4, dht(0x00, JPEG_DC_L) + dht(0x10, JPEG_AC_L) +
+               dht(0x01, JPEG_DC_C) + dht(0x11, JPEG_AC_C))
+    hdr += seg(0xDA, b"\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00")
+    return hdr + bytes(out) + b"\xff\xd9"
 
 
 # ---------------------------------------------------------------------------

@@ -8,20 +8,28 @@ desk. Vendor families covered:
 
 - **HiSilicon** V1–V5 IPC, DVR/NVR and STB SoCs, plus their Goke/XMedia
   rebrands (GK7205, GK7206, …) — the table-driven core
-- **Xiongmai** XM510 / XM530 / XM550
+- **Xiongmai** XM510 / XM530 / XM550, and XM530V200 / XM533 / XM535
 - **Goke** GK7101 / GK7102 and the GK710xS die
 - **Anyka** AK39xx
-- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375)
-- **Novatek** NT9856x, NT98533 and NT98332
+- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375), infinity3 (MSC313E, MSC316) and the infinity6 family (SSC325, SSC33x, SSC30Kx, SSC338Q, SSC37x, SSC378x)
+- **Novatek** NT9856x, NT9852x, NT98532/NT98533, NT9832x, NT98332 and NT98633
+- **Allwinner** V831 / V833
+- **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
+  FH8626V100, FH8632
+- **Grain Media** GM8135S, GM8136, GM8136S
+- **Ambarella** S3L
+- **Ingenic** T10, T20, T21, T23, T30, T31 (XBurst1) and T40, T41 (XBurst2) —
+  the one MIPS family
 
 The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
-Builds two QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 3 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 6 Anyka AK39xx (ARM926) + 4 SigmaStar (Cortex-A7) + 2 Novatek NT9856x (Cortex-A9) + 1 Novatek NT98533 (Cortex-A7 for the A32) + 2 Axera AX620Q/AX620U (Cortex-A7)
-- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 1 Novatek NT98332 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
+Builds three QEMU targets:
+- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
+- `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (73 total)
+## Supported Machines (139 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -72,10 +80,26 @@ boot with a jffs2 root. No vendor artifacts are committed here; see the script
 header for how to build them from the SDK.
 
 The three dual-core Cortex-A7 parts (`hi3516cv500`, `hi3516dv300`,
-`hi3516av300`) boot both cores with `-smp 2`, from `-kernel` and from a
+`hi3516av300`) boot both cores by default, from `-kernel` and from a
 `flash-file` image alike. As on silicon, the kernel writes a reset trampoline
 at physical 0 and clears CPU1's soft-reset bit in CRG `REG_CPU_SRST_CRG`
-(0x78), and that bit drives CPU1's power state. The default is still one CPU.
+(0x78), and that bit drives CPU1's power state. `-smp 1` still works for the
+vendor 4.9 kernel, but with a single GIC CPU interface no SPI reaches a CPU,
+and the OpenIPC neo kernel (mainline 7.0) stalls in its driver initcalls
+(#290).
+
+An OpenIPC **neo** image (mainline 7.0) needs the memory layout its device
+tree expects: 1 GiB of DDR with a 768 MiB default CMA pool, which the media
+modules allocate from. The machine's own `mem=32M` and `mmz=` are for the
+vendor kernel; with them `open_sys` cannot allocate, and every media module
+after it dereferences NULL. Pass the layout yourself (a user `mem=` and
+`mmz=` replace the machine's):
+
+```bash
+qemu-system-arm -M hi3516av300 -m 1G -kernel uImage.hi3516av300 \
+    -initrd rootfs.squashfs.hi3516av300 -nographic \
+    -append "console=ttyAMA0,115200 root=/dev/ram0 rootfstype=squashfs mem=1024M mmz_allocator=cma mmz=anonymous,0,0x82000000,768M"
+```
 The other "MP2" parts leave CPU1 offline: their vendor release methods are not
 modelled yet.
 
@@ -109,6 +133,27 @@ modelled yet.
 | `xm510` | Cortex-A5 (A9 stand-in) | PL190 VIC | 3.0.101 vendor | yes |
 | `xm530` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes |
 | `xm550` | Cortex-A5 ×2 (A9 stand-in), 128 MB | GIC | 3.10.103 vendor | yes |
+| `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm8536e` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+| `xm8520d` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+| `xm8521dv200` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
+
+³ Flash boot of a camera dump only: vendor U-Boot, kernel and Sofia, no
+OpenIPC release yet. These are the second-generation parts (#154): DDR
+behind a uMCTL2, U-Boot entered at the flash window, a latching SP804, and
+the SDIO controller moved. Sofia streams H.265 over RTSP from a test
+picture (capture, ISP, VPSS, HEVC and JPEG engines, OSD), with audio, SD
+recording, USB and an AltoBeam USB Wi-Fi dongle; multi-lens boards (spliced
+and three-camera) included. See [docs/xiongmai.md](docs/xiongmai.md).
+
+⁴ Flash boot of NVR / DVR dumps (YK NBD88X16S-KL-V3 NVR on `xm8536e`,
+AHB88X04R XVRs on `xm8520d`, AHB88X08R-LM-V3 on `xm8521dv200`): Sofia's GUI
+on HDMI, live view of IP cameras (NVR) or of the AHD receivers' test
+pictures (DVRs, NVP6158C / TP2830), H.265 / H.264 / JPEG encoding streamed
+over RTSP, SATA recording and playback, per-camera audio, USB mouse and
+stick. See [docs/xiongmai.md](docs/xiongmai.md#dvrs-and-nvrs-xm8536e--xm8520d--xm8521dv200).
 
 Not HiSilicon parts, although their BSP kernels started from HiSilicon
 templates: the memory map and the flash controller (xmsfc) are Xiongmai's own,
@@ -134,7 +179,10 @@ CI covers:
 `xm530` and `xm550` boot the `xm530_lite` release with `-smp 2`: CPU1 is
 released through `REG_SC_REMAP` and `REG_CPU1_SOFT_RST` as on silicon.
 An XM550 camera's full flash dump boots through its own U-Boot to `login:`
-with `-M xm550,flash-file=dump.bin -smp 2`.
+with `-M xm550,flash-file=dump.bin -smp 2`. Dumps of XM530V200, XM533 and
+XM535 cameras boot the same way on `xm530v200` (`-smp 2`), `xm533` and
+`xm535`, through their vendor U-Boot and kernel to Sofia. Their kernels
+print only with `xmuart=0` in the saved U-Boot environment.
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,
@@ -195,10 +243,15 @@ either was at hand.
 | `ak3919ev300` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 3.4.35 vendor | —² |
 | `ak3918ev330` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
 | `ak3919ev330` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.192 vendor (DT) | yes |
+| `ak3918ev300l` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes |
+| `ak3918av100` | ARM926EJ-S, 64 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
+| `ak3918av100x` | ARM926EJ-S, 128 MB in package | SYSCTRL (2-level) | 4.4.282 vendor (DT) | yes³ |
+| `ak3918av130` | ARM926EJ-S, 64 MB in package | own (2-level, `0x21100000`) | 4.4.302 vendor (DT) | yes⁴ |
 
 Anyka's camera SoCs, unrelated to HiSilicon: one memory map from the
-AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330), in
-`hw/arm/anyka.c`. The UART and the SPI master move their data through the
+AK3918EV200 through AnyCloud39EV300 to AnyCloud V500 (EV330) and the
+AK3918EV300L / AK3918AV100 ("ASPEN": SPI0 moved to 0x21100000, a new clock
+block), in `hw/arm/anyka.c`. The UART and the SPI master move their data through the
 L2 buffer SRAM rather than FIFOs, which `hw/misc/ak-l2.c` models with its
 block handshakes and DMA. A camera's SPI-NOR dump boots the way the mask ROM
 does -- boot-header register script, then U-Boot (EV200 / EV300) or the
@@ -210,7 +263,15 @@ The SoC list from the SDKs, the map, the boot header and the dumps tried
 are in [docs/anyka.md](docs/anyka.md).
 
 ¹ An AK3916EV301 dump.  ² Same die and models as a tested sibling; no image
-was at hand.
+was at hand.  ³ AK3918AV100 (and KM01N) / AK3918AV100X (and KM01D), which
+differ only in DDR size: images built from the AnyCloud39AV100 SDK's U-Boot
+and 4.4.282 kernel (`ANYKA322` header, U-Boot at flash 0x600) boot to
+`login:`; no camera dump has been seen.  ⁴ AK3918AV130, from one camera's
+flash (an owner report on openipc.org): U-Boot and the 4.4.302 kernel
+read the NOR through the SPI flash controller, and the kernel reaches
+`login:` on the AV130's own interrupt controller and timers
+([docs/anyka.md](docs/anyka.md#ak3918av130)), and a reboot goes through
+the vendor's L2-resident code and the watchdog, as on the chip.
 
 ### SigmaStar / MStar family (`qemu-system-arm`)
 
@@ -220,8 +281,14 @@ was at hand.
 | `ssd202d` | Cortex-A7 ×2, 128 MB in package | GIC + main-intc | — | —¹ |
 | `ssd201` | Cortex-A7 ×2, 64 MB in package | GIC + main-intc | — | —¹ |
 | `ssc375` | Cortex-A7, 128 MB in package | GIC + main-intc | 4.9.84 vendor | to userspace² |
+| `msc313e` | Cortex-A7, 64 MB in package | GIC + main-intc | 3.18.30 vendor | to RTSP³ |
+| `msc316dc`, `msc316dm` | Cortex-A7, 128 MB in package | GIC + main-intc | — | U-Boot, the IPL's own DDR set-up |
+| `ssc029` | Cortex-A32 ×2 (run as `max`), 128 MB | GICv3 | 5.10.117 vendor | to RTSP (synthetic scene, vendor AE/AWB beside it), suspend/resume, 2 CPUs |
+| `ssc029a`, `ssc029b` | Cortex-A32 ×2 (run as `max`), 512 / 256 MB | GICv3 | 5.10.117 vendor | `ssc029a`: SDK SPI NAND through OP-TEE to a shell; `ssc029b`: U-Boot with `bond=` |
+| `ssc034a`, `ssc034b` | Cortex-A7 ×2, 128 / 64 MB | GIC-400 + main-intc | 4.9.84 vendor (SDK build) | SDK IPL → TF-A → U-Boot → kernel → shell from NOR and SPI NAND, 2 CPUs, Ethernet, SD, SDK `venc_demo` to H.264/H.265 |
+| `ssc325`, `ssc325de`, `ssc327de`, `ssc333`, `ssc335`, `ssc335de`, `ssc337`, `ssc337de`, `ssc30kd`, `ssc30kq`, `ssc338q`, `ssc377`, `ssc377d`, `ssc377de`, `ssc377qe`, `ssc378de`, `ssc378qe` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
 
-SigmaStar's (formerly MStar's) infinity2m dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m, infinity3, Iford, Ifliegen and infinity6 family dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
@@ -249,12 +316,173 @@ JPEG snapshots, of a test pattern (the ISP does not process pixels), and
 microphone capture. `uuid=` gives the die ID its analytics licence is
 bound to.
 
+³ The MStar MSC313E (die "infinity3"): an unmodified 8 MiB W25Q64 dump of
+a retail camera (JX-F22 sensor) boots from NOR through the IPL at
+`0x4000`, `IPL_CUST`, U-Boot 2015.01 and Linux 3.18.30, and its own
+application runs the whole media pipeline: the sensor over I2C, an ISP
+that makes the picture (the OpenIPC logo scene) from the sensor's
+exposure and gain, with the vendor AE/AWB converging on its statistics,
+the scaler and CMDQ, and the H.264 (CAVLC/CABAC), H.265 and JPEG
+encoders, with audio, GPIO/IR-cut and the RTC; it serves HTTP and a
+decodable 1280x720 H.264 RTSP stream.
+
+### Allwinner V831 / V833 family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `v831` | Cortex-A7, 64 MB DDR2 in package | GIC-400 | 4.9.118 vendor (DT) | yes |
+| `v833` | Cortex-A7, 128 MB DDR3 in package | GIC-400 | — | —¹ |
+
+Allwinner's sun8iw19 camera dies, in `hw/arm/allwinner-v83x.c`: the H6's
+"ncat" map with one Cortex-A7 and TrustZone. A camera's SPI NOR dump boots
+as on silicon: boot0 trains DRAM and loads the boot package over SPI,
+OP-TEE drops to U-Boot in the normal world, and U-Boot reads its
+environment and GPT over SPI with DMA, the SD card, and the kernel, which
+mounts its SquashFS root from the NOR:
+`-M v831,flash-file=dump.bin -drive if=sd,...`. Flash writes go back to the
+file. The EMAC works with the vendor driver (`-nic user`), even on
+cameras that ship with Wi-Fi only. The vendor media stack runs on a
+modelled sensor, video input and IOMMU, and its H.264 encoder produces
+valid streams of a test picture (the OpenIPC logo) through the modelled video engine. A YI camera (V831) runs to a root shell and the vendor application in
+a few seconds (`qemu-boot/test-v831-boot.sh`). Its U-Boot silences the
+kernel console unless the SD card holds `/debug_tty`. Map, boot chain and
+what the firmware depends on are in
+[docs/allwinner-v83x.md](docs/allwinner-v83x.md).
+
+¹ Same die and models as `v831`; no image was at hand.
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `v3s` | Cortex-A7, 64 MB DDR2 in package | GIC-400 | — | U-Boot |
+| `v851s` | Cortex-A7, 64 MB DDR2 in package | GIC-400 | 4.9.191 OpenIPC (appended DT) | yes |
+
+The V3s and the V851s, in `hw/arm/allwinner-cam.c`: the V831's devices at
+the H3's and the D1's addresses. OpenIPC's mainline U-Boot boots on both
+from the NOR or the SD card, and on the V851s OpenIPC's kernel mounts its
+SquashFS root from the NOR. See [docs/allwinner-cam.md](docs/allwinner-cam.md).
+
+### Fullhan family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `fh8852v200` | ARM1176JZF-S, 64 MB in package | DW ICTL | 4.9.129 vendor, OpenIPC | yes |
+| `fh8856v200` | ARM1176JZF-S, 128 MB in package | DW ICTL | 4.9.129 vendor | yes |
+| `fh8858v200` | ARM1176JZF-S, 128 MB in package | DW ICTL | — | —¹ |
+| `fh8652` | Cortex-A7, 64 MB in package | GIC-400 | 4.9.129 vendor | yes |
+| `fh8656` / `fh8658` | Cortex-A7, 128 MB in package | GIC-400 | — | —¹ |
+| `fh8852v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
+| `fh8856v100` | ARM1176JZF-S, 128 MB in package | DW ICTL | 3.0.8 vendor, OpenIPC | yes |
+| `fh8626v100` | ARM1176JZF-S, 64 MB in package | DW ICTL | 3.0.8 vendor | yes |
+| `fh8632` | ARM1176JZF-S, 64 MB | DW ICTL | 3.0.8 vendor (SDK) | yes |
+
+Fullhan's camera SoCs, in `hw/arm/fullhan.c`: one memory map across five
+generations of mostly DesignWare blocks (ICTL, APB timers, UARTs, SSI with
+Fullhan's SPIC additions, AXI or AHB DMAC, I2C, GPIO, MMC, GMAC, DWC2 USB,
+watchdog) around Fullhan's PMU, RTC, AES engine and SADC, with an image sensor's ID on I2C0
+(`sensor=`, GalaxyCore / MIS2006 / JX-F37) for the vendor apps and ipcinfo. A camera's SPI NOR dump boots the way the
+mask ROM does -- U-Boot, FH8632's SPL, or past FH865x's DDR-sizing
+ramboot -- through the vendor U-Boot, which reads the flash by DMA, to the
+vendor kernel and application: `-M fh8856v200,flash-file=dump.bin -nic user`.
+Flash writes go back to the file. OpenIPC's `fh8852v200`, `fh8852v100` and
+`fh8856v100` releases boot on the vendor U-Boot, which can also fetch them
+over TFTP and write them itself, as on a camera, (`qemu-boot/fh-openipc-flash.sh`) or
+with `-kernel` (`qemu-boot/test-fullhan-boot.sh`) to a login prompt with a
+DHCP lease. The media pipeline (the ARC coprocessor, ISP, encoders) and
+audio (the ARC's) are not modelled. Map, boot chain and devices are in
+[docs/fullhan.md](docs/fullhan.md).
+
+¹ Same die and models as a tested sibling; no image was at hand.
+
+### Grain Media GM813x family (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `gm8135s` | FA626TE (ARMv5TE), 64 MB in package | FTINTC030 | 3.3.0 OpenIPC | yes |
+| `gm8136` | FA626TE (ARMv5TE), 128 MB | FTINTC030 | 3.3.0 vendor (H.264 over RTSP), OpenIPC | yes |
+| `gm8136s` | FA626TE (ARMv5TE), 128 MB in package | FTINTC030 | — | —¹ |
+
+Grain Media's camera SoCs, in `hw/arm/grainmedia.c`: a Faraday FA626TE
+(QEMU's ARM926 with the FA626TE's ID) among Faraday peripherals -- FTINTC030,
+FTTMR010, FTWDT010, FTGPIO010, FTI2C010, the command-based FTSPI020 flash
+controller paced by the FTDMAC020, FTGMAC100 Ethernet, FTSDC021 SD hosts
+and the FOTG210 USB host -- with the PMU's chip ID, boot strap and PLLs
+(the timers' PCLK), and an OmniVision sensor's ID on the I2C bus
+(`sensor=ov2715`). A camera's SPI NOR dump boots the way the mask ROM
+does: nsboot from flash 0x1000 in SRAM brings up DDR and the CPU clock,
+then the vendor U-Boot runs the vendor 3.3 kernel and the camera's
+application: `-M gm8136,flash-file=dump.bin -nic user`. Flash writes go
+back to the file. The video pipeline the vendor graph runs is modelled --
+VCAP300 capture painting the OpenIPC logo, the 3DNR, the scaler, the MCP280
+H.264 encoder producing real slices behind the driver's own headers, the
+LCD's frame clock -- so a camera dump streams decodable 1080p and D1 H.264
+(I frames and motion-following P frames) from its own RTSP server
+(`qemu-boot/test-grainmedia-rtsp.sh`). The ISP328 runs frames and feeds
+AE / AWB / AF statistics through its DMA tables, the GM2D draws OSD,
+masks and LCD blits, the MCP100 encodes MJPEG through its firmware's
+mailbox, and the FTSSP010 / ADDA308 capture a 1 kHz tone into the RTSP
+stream's audio track (or play to `-audiodev`); the SAR ADC, RTC, PWM, IR
+receiver (keys from `qom-set`), FTAES020 and pMonitor are modelled too.
+OpenIPC's `gm8136` and `gm8135` releases boot with `-kernel`
+(`qemu-boot/test-grainmedia-boot.sh`) to a login prompt with a DHCP lease
+and the JFFS2 overlay on the NOR. Map, boot chain and devices are in
+[docs/grainmedia.md](docs/grainmedia.md).
+
+### Ambarella S3L (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `s3l` | Cortex-A9 | Ambarella VIC | 3.10.104 | yes |
+
+A test bench for the Amcrest IP4M-1026E / Dahua IPC-HFW1430SN, in
+`hw/arm/ambarella.c`, with no video. The vendor kernel boots to a shell,
+`ipctool` reports the same SoC, RAM and OV4689 as the camera, and the
+firmware's `load_ambarella` loads the shipped modules. `flash-file=` adds NAND,
+so a kernel can mount a camera's UBI volumes. See
+[docs/ambarella.md](docs/ambarella.md).
+
+### Ingenic T-series (`qemu-system-mipsel`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `t10` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (camera dump) | yes |
+| `t20` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (camera dump) | yes |
+| `t21` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (two camera dumps) | yes |
+| `t23` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC | yes |
+| `t30` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC | yes |
+| `t31` | XBurst1, 64 MB | INTC | 3.10.14 OpenIPC, vendor (three camera dumps, Wyze Cam v3) | yes |
+| `t40` | 2 × XBurst2, 128 MB | core INTC + CCU | 4.4.94 OpenIPC, vendor (T40XP camera dump) | yes |
+| `t41` | 2 × XBurst2, 128 MB | core INTC + CCU | 4.4.94 vendor SDK image | yes |
+
+Ingenic's camera SoCs, in `hw/mips/ingenic.c`: little-endian MIPS32
+XBurst cores (two CPU models of our own, `qemu/patches/0015`) with the
+CPM's PLLs and dividers in each SoC's encoding, the INTC (XBurst1) or the
+per-core INTC, OSTs and CCU that start the second core (XBurst2), the TCU
+with its watchdog and the boot loaders' OST, the SFC v1/v2 flash
+controller (PIO, DMA, the v2 command table and descriptors), jzmmc SD
+hosts (SDHCI on XBurst2), the Synopsys GMAC, DW I2C, DWC2 USB, GPIO, RTC
+and EFUSE. A NOR image boots the way the mask ROM does -- the SPL in a
+cache-as-RAM window (`qemu/patches/0016`), then the SPL's own PLL and DDR
+init, U-Boot from flash 0x6800 and the kernel:
+`-M t31,flash-file=dump.bin -nic user`. Flash writes go back to the
+file. `-kernel` takes a uImage the way `bootm` passes it (argc/argv, and
+the `mem=` the kernels size memory by). All seven OpenIPC releases boot
+both ways (`qemu-boot/test-ingenic-boot.sh --mode kernel|flash`) to a
+login prompt with a DHCP lease, U-Boot's environment and the JFFS2
+overlay written to the NOR; so do the camera dumps and the T41 SDK
+image. Sound runs too: the AIC and codec with the PDMA's cyclic
+transfers, recording a test tone and playing to `-audiodev`
+(`qemu-boot/test-ingenic-audio.sh`), and the AES, HASH, RSA and DTRNG
+blocks answer the SDK's sample drivers with standard results
+(`qemu-boot/test-ingenic-crypto.sh`). Map, boot chain and devices are in
+[docs/ingenic.md](docs/ingenic.md).
+
 ### Novatek NT9856x family (`qemu-system-arm`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |
 |---------|-----|-----|--------|-------------|
 | `nt98562` | Cortex-A9, 64 MB in package | GIC | 4.19.91 vendor (DT) | yes¹ |
 | `nt98566` | Cortex-A9, 128 MB in package | GIC | 4.19.91 vendor (DT) | yes¹ |
+| `nt98560` / `nt98561` | Cortex-A9, 512 / 64 MB (same die and chip ID) | GIC | 4.19.91 vendor (DT) | via `nt98562`'s tests |
 
 Novatek's NA51089 camera dies, in `hw/arm/novatek.c`: an A9 MPCore at
 `0xFFD00000` and Novatek's own blocks from `0xF0000000` (TOP/chip ID, the
@@ -267,7 +495,9 @@ the closed DDR-training loader: the SDK's own `FW98562A.bin`, laid out by
 `qemu-boot/nvtpack2flash.py`, runs the vendor U-Boot, kernel and init
 scripts (`FLASH=nor.bin qemu-boot/run-nt98562.sh`). The 566 boards' SPI NAND
 is modelled too: `FW98566A.bin` boots from a W25N01GV to a UBIFS root
-(`qemu-boot/test-novatek-nand.sh`). SD cards attach with
+(`qemu-boot/test-novatek-nand.sh`), and so does a raw Dahua NT98566
+NAND dump. Every Novatek machine takes SPI NAND
+([docs/novatek.md](docs/novatek.md#nand-boot-on-every-machine)). SD cards attach with
 `-drive if=sd,index=0`; Linux (the release's `mmc_na51055.ko`) and the
 vendor U-Boot read and write them. An eMMC attaches to the third host
 (SDIO3) with `-drive if=sd,index=2`. The USB host (FOTG200) works under the
@@ -300,7 +530,8 @@ faces in their pictures, its pet detector (a sample of ours, as the SDK
 has none) the cat and the dog, and its face recognition network (the
 model alone in the package; the sample is ours) tells Obama from Biden.
 The MDBC motion detection engine raises the SDK sample's alarms while an
-object moves through its frames, and not otherwise.
+object moves through its frames, and not otherwise, and the IVE passes
+the SDK's self-checking LUT samples.
 The machines give Linux 128 MB and the HDAL pool 96 MB, more than the
 packages hold. The Novatek timer block
 runs, with timer 0 free at 1 MHz as the loader leaves it: the vendor
@@ -308,8 +539,42 @@ U-Boot's boot-time stamps and the HDAL read it. `reboot` works the
 vendor way, by arming the RTC's power-on alarm and powering off. SDKs, map,
 device tree, flash and boot notes are in [docs/novatek.md](docs/novatek.md).
 
+With a real first-stage loader at flash 0 the Novatek machines boot as the
+silicon does instead: a mask ROM model copies the loader to SRAM and runs it,
+and the loader's own closed DDR training, U-Boot load and SMP bring-up run
+against the models. That boots the Xiongmai NT98562 and Dahua NT98566 dumps
+and, with loaders built from the SDKs' source
+(`qemu-boot/build-novatek-loader.sh`; `--loader` in the NS02501 and NA51068
+build scripts), NT98525, NT98528, NT98533, NT98321 and NT98323 images
+from the flash file alone
+([docs/novatek.md](docs/novatek.md#the-real-first-stage-loader)). NT98332's
+and NT98633's AArch32 loaders run on an extra boot core and warm-reset the
+A53s into the firmware's own BL31 (`-smp 3` / `-smp 5`, the defaults).
+
 ¹ Ethernet works from the kernel (DHCP, a file over HTTP) and from the
 vendor U-Boot (`ping`, `dhcp`, `tftp`).
+
+### Novatek NT9852x (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98525` | 2x Cortex-A9, 512 MB | GIC | 4.19.91 vendor (DT) | yes³ |
+| `nt98528` | 2x Cortex-A9, 512 MB | GIC | 4.19.91 vendor (DT) | yes³ |
+
+Novatek's NA51055 die, which the NT9852x SDK builds one kernel for:
+NT98520 / NT98523 / NT98525 report chip ID `0x4821` (`nt98525`),
+NT98528 / NT98529 `0x5021`, CHIP_NA51084 (`nt98528`). It is NA51089's
+die with two A9 cores and a few deltas, so it shares the NT9856x
+machine code and models: three more UARTs and two more I2C controllers,
+the hash engine moved, a second CNN, five SIEs, a second DDR arbiter,
+and its own PLL register layout per chip ID. The second core starts
+the vendor way, through the loader's release word. The SDK's own
+kernel and initramfs boot to a shell on both cores with the generated
+device tree. With the SDK's modules added, Ethernet works (DHCP, ping),
+and the HDAL and AI modules bind every engine. Notes in
+[docs/novatek.md](docs/novatek.md#nt9852x-na51055--na51084).
+The SDK's NT98529 NAND pack, `FW98529A.bin`, boots from the emulated SPI
+NAND through the vendor U-Boot on both machines.
 
 ### Novatek NT98533 (`qemu-system-arm`)
 
@@ -324,11 +589,42 @@ models serve it. The machine stands in for the loader as on NT9856x, and
 the SDK's own U-Boot 2021.10 and kernel 5.10 boot from SPI NOR on both
 cores. The SD card and Ethernet work under the SDK's modules.
 `qemu-boot/build-ns02501-sdk.sh` builds everything from the SDK, and
-`qemu-boot/test-nt98533.sh` checks it. Notes in
+`qemu-boot/test-nt98533.sh` checks it. `--nand` builds the SDK's NAND
+board instead, which boots from the emulated SPI NAND. Notes in
 [docs/novatek.md](docs/novatek.md#nt98533-ns02501).
 
 ³ Built from the vendor SDK (not distributable, so not in CI beyond
 `test-novatek.py`).
+
+### Novatek NT98323 (`qemu-system-arm`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98323` | 2x Cortex-A9, 512 MB | GIC | 4.9.118 vendor (SDK DT) | yes³ |
+
+Novatek's NA51068 DVR/NVR die (NT98321 / NT98323), in
+`hw/arm/novatek-na51068.c`. It is a different design from the camera
+dies, built from Faraday-derived blocks around a dual A9 MPCore at
+`0xF9C00000`. The SDK's U-Boot boots from the 32 MiB SPI NOR, or from SPI
+NAND for the NT98321 NAND board (`flash-file=`, the machine standing in for
+the closed loader). It starts the kernel and RAMDisk from their
+partitions. Alternatively, `-kernel` with the SDK's board tree (`-dtb`)
+boots the kernel directly. Either way it comes up on both cores to a
+shell. Everything but the media blocks is modelled:
+- the FTTMR010 timer (`hw/timer/nvt-fttmr010.c`);
+- the FTGPIO010s, FTIIC010s and FTDMAC030 (`hw/gpio/nvt-ftgpio010.c`,
+  `hw/i2c/nvt-ftiic010.c`, `hw/dma/nvt-ftdmac030.c`);
+- the SPI020 flash controller (an `nvt-flash` front end, NOR and NAND);
+- the SD host, both USB 2.0 hosts and both SATA hosts;
+- both Ethernet MACs (DHCP, ping and HTTP on `eth0` and `eth1`);
+- the RTC, the watchdog (reboot), and the crypto / hash / RSA engines (all
+  22 kernel self-tests pass);
+- the PWM, IR receiver and thermal sensor (`hw/misc/nvt-na51068-misc.c`);
+- the clock generator, the OTP and the UARTs.
+
+`qemu-boot/build-na51068-sdk.sh` builds U-Boot, the kernel, the tree and
+the NOR or NAND image from the SDK.
+Notes in [docs/novatek.md](docs/novatek.md#nt98323-na51068).
 
 ### Novatek NT98332 (`qemu-system-aarch64`)
 
@@ -339,8 +635,10 @@ cores. The SD card and Ethernet work under the SDK's modules.
 Novatek's NA51103 NVR die (NT98331/NT98332/NT98631/NT98632), also in
 `hw/arm/novatek.c`: Novatek's blocks above 4 GiB at `0x2_F0000000`, most of
 them NA51089's at new offsets. A whole 16 MiB SPI NOR image boots the way
-the board does: the machine stands in for the loader (the device tree and
-U-Boot are LZMA-packed in flash, `hw/arm/nvt-lzma.c` unpacks them), and the
+the board does: the mask ROM runs Xiongmai's loader, which trains DDR and
+warm-resets into the firmware's BL31 and U-Boot (with `loader=off` or
+`-smp 2` the machine stands in for the loader: the device tree and U-Boot
+are LZMA-packed in flash, `hw/arm/nvt-lzma.c` unpacks them), and the
 vendor U-Boot loads the kernel from the squashfs, which runs the vendor NVR
 application. Its GUI shows on the QEMU display through the LCD300 model and
 takes a USB mouse; the two SATA ports take disks (`-drive if=ide`), the
@@ -361,34 +659,52 @@ H.265 too. Notes in
 | Machine | CPU | IRQ | UART0 | Kernel | Boot tested |
 |---------|-----|-----|-------|--------|-------------|
 | `ax630c` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | — | — |
-| `ax620e` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | 5.15.73 (real firmware)² | — |
+| `ax620e` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | 5.15.73 (real firmware)² | yes² |
 | `ax620q` | Cortex-A7 (AArch32), 256 MB, CPU1 not modelled | GIC-400 | `0x04880000` | — | — |
-| `ax620u` | Cortex-A7 x4 (AArch32), 1 GB, CPU1-3 not modelled | GIC-400 | `0x04990000` | 4.19.125 (real firmware)² | — |
+| `ax620u` | 4x Cortex-A7 (AArch32), 1 GB | GIC-400 | `0x04990000` | 4.19.125 (real firmware)² | yes² |
 
-Axera's camera/KVM-capture SoCs, in `hw/arm/axera.c`: a plain GIC-400 at
-`0x01850000` (same address on all four) and the ARM generic timer at
-24 MHz, so unlike the RIU/HAL-indirected families above they needed no
-device model of their own, just the map from the vendor DT. Only the GIC,
-CPU wiring and a DesignWare 8250-compatible UART0 are modelled per SoC;
-everything else sits behind `create_unimplemented_device` pending real
-register work. AX620Q and AX620U each bring extra cores up through their
-own vendor spin-table (not PSCI), which is not modelled -- only CPU0
-boots. There is no machine-built device tree yet: `-kernel` needs `-dtb`
-from the firmware's own tree, as novatek's nt98332 does.
-
-Sources: the [onekvm/linux-6.18-ax620e](https://github.com/onekvm/linux-6.18-ax620e)
-fork's devicetrees (AX630C/AX620Q), the AXERA-TECH/Sipeed vendor SDKs
-(kernel 4.19.125, no public source newer than that), and -- for AX620E
-and AX620U specifically -- the devicetree extracted directly from real
-deployed camera firmware (a Xiongmai IVG-A6 for AX620E; `dumpimage`/`dtc` on the FIT image
-inside each dump's `boot/uImage`), which also independently confirmed the
-GIC/timer/UART addresses already modelled here. Notes in
+Axera's camera/KVM-capture SoCs, in `hw/arm/axera.c`. AX620E and AX620U
+boot whole Xiongmai camera flash dumps (`-M ax620e,flash-file=...`,
+`-M ax620u,flash-file=... -smp 4`) through BL1, U-Boot and the vendor
+kernel into the stock camera App, which serves H.265/H.264 video with
+PCMA audio over RTSP, ONVIF and its web UI. The camera pipeline is
+modelled far enough to carry a picture: the OpenIPC test scene is
+painted as the ISP's output (with a simple register-driven colour model
+following the App's image settings, and AE statistics), the IVPS engines
+scale it and draw the App's OSD, the VeriSilicon VCMD/VC8000E front end
+feeds a software H.264/HEVC/JPEG encoder, and the DW I2S carries audio
+both ways. Both CPUs of AX620E and all four of AX620U come up through
+their vendor spin-tables. Notes, environment switches and limits in
 [docs/axera.md](docs/axera.md).
 
-² Confirmed from a real firmware dump's own kernel modules (`vermagic=`)
-and FIT-image kernel banner, not the public vendor SDK; AX620E and AX620U
-do not share a kernel baseline or architecture with each other despite
-being in the same chip family.
+Sources: the [onekvm/linux-6.18-ax620e](https://github.com/onekvm/linux-6.18-ax620e)
+fork's devicetrees (AX630C/AX620Q), the AXERA-TECH/Sipeed vendor SDKs,
+and -- for AX620E and AX620U -- the devicetree and kernel modules of real
+deployed camera firmware (a Xiongmai IVG-A6 for AX620E, a JFtech
+IPC_AX620U_A8 for AX620U).
+
+² Real Xiongmai camera dumps (not distributable, so not in CI); the
+kernel version is from each dump's own modules (`vermagic=`) and FIT
+kernel banner.
+
+### Novatek NT98633 (`qemu-system-aarch64`)
+
+| Machine | CPU | IRQ | Kernel | Boot tested |
+|---------|-----|-----|--------|-------------|
+| `nt98633` | 4x Cortex-A53, 2 GB | GIC-400 | 4.19.148 vendor (its own DT) | yes³ |
+
+NA51090, NT98332's four-core relative: the same machine code with the
+blocks that moved (WDT, RTC, OTP, thermal, crypto, two Ethernet MACs,
+USB, three SATA hosts, a fifth UART) in a table of its own. A whole SPI NAND
+image (with or without its spare bytes) boots the way the board does: the
+mask ROM runs its loader on a boot core, which trains DDR and warm-resets
+the A53s into the firmware's BL31, U-Boot, the kernel and the vendor NVR
+application, with all four CPUs up and Ethernet working:
+`qemu-system-aarch64 -M nt98633,flash-file=nand.bin -nographic` (`-smp 4`
+or `loader=off`: the stand-in). Notes in
+[docs/novatek.md](docs/novatek.md#nt98633-na51090).
+
+³ An N2032-8HDD NVR SPI NAND dump (not distributable, so not in CI).
 
 ### IPC family — V5 aarch64 (`qemu-system-aarch64`)
 
@@ -412,7 +728,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 73 machines build and register. Every machine marked "yes" above boots
+All 139 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -450,15 +766,27 @@ The other families' peripherals are listed in their `docs/<family>.md`.
 | **DMA (PL080)** | yes | yes | — | yes | — | — | — | — |
 | **MIPI RX** | — | — | stub | — | yes | stub | yes | yes |
 | **RTC** | — | — | yes | — | yes | yes | yes | yes |
-| **VEDU/JPGE** | — | — | stub | — | yes | stub | yes | yes |
+| **VEDU/JPGE** | — | — | stub | — | yes | stub | **encodes** | **encodes**² |
+| **VI/VPSS** | stub | stub | stub | — | stub | stub | **frames**¹ | **frames**² |
 | **Watchdog** | yes | yes | yes | yes | yes | yes | yes | yes |
-| **Sensor I2C** | — | — | — | — | — | — | yes | — |
-| **IVE (18 ops)** | — | — | — | — | — | — | **yes** | — |
+| **Sensor I2C** | — | — | — | — | — | — | yes | yes |
+| **IVE** | — | — | — | — | — | — | **18 ops** | **34 ops**³ |
 | **NPU** | — | — | — | — | — | — | — | stub |
 
-Notes: `stub` = regbank stub only. V5 (×3) = CV608/CV610/CV613 (same die, different feature
+Notes: `stub` = regbank stub only. `encodes` = H.264, H.265 and JPEG from
+the vendor VENC stack; `frames`: the VI → VPSS pipeline (online, or VI
+offline for sensors wider than 2304, IMX335 and GC4653) produces
+pictures, so majestic and the SDK's `sample_venc` stream from a sensor
+(`docs/hisilicon-venc.md`). ¹ EV200 / EV300 / 18EV300 / 16DV200 and their
+Goke rebrands. V5 (×3) = CV608/CV610/CV613 (same die, different feature
 tiers). AV100/3519V101 use GMAC (gigabit) — not emulated, boot without networking.
 IVE = Intelligent Video Engine with 18 operations validated against real IVE silicon.
+²: V5 (`gen=5`): majestic streams from an SC4336P through VI online,
+VPSS and VEDU, and its AE and AWB converge on the ISP statistics
+`hisi-vi` writes in the V5 layout (`test-hisi-majestic.sh --soc
+hi3516cv610`). ³: V5's IVE runs its ops as tasks on the SVP NPU's task
+scheduler (`hisi-ive-npu`): 32 of its ops, through `ive.ko`, their
+arithmetic fitted against a CV608 board (`docs/ive-registers.md`, "V5").
 
 ## Project Structure
 
@@ -474,15 +802,32 @@ qemu/
 ├── hw/misc/hisi-himci.c         # DW MMC (himciv200) SD/MMC controller
 ├── hw/misc/hisi-regbank.c       # Generic RAM-backed register bank
 ├── hw/misc/hisi-ive.c           # IVE: 18 ops (SAD, CCL, Sub, Thresh, Erode...)
+├── hw/misc/hisi-ive-npu.c       # V5 IVE: ops as SVP NPU tasks (34 ops)
+├── hw/misc/hisi-ive-ops.c       # IVE image ops on host buffers, shared by V4 and V5
 ├── hw/misc/hisi-fastboot.c      # Boot ROM fastboot serial protocol (defib compat)
-├── hw/misc/hisi-vedu.c          # Video encoder stub (VEDU + JPGE)
+├── hw/misc/hisi-vedu.c          # V4 / V5 video encoder: VEDU (H.264/H.265) + JPGE
+├── hw/misc/hisi-vi.c            # V4 VI capture + ISP pipe: the frame clock
+├── hw/misc/hisi-vpss.c          # V4 VPSS online / node list: paints the channels' frames
+├── hw/misc/hisi-scene.c         # V4 camera twin: the scene the sensor looks at (PPM/PFM, light)
+├── hw/i2c/sensor-sync.c         # sensor timing: frame-start latching, group hold, violations
 ├── hw/misc/hisi-mipi-rx.c       # MIPI RX controller stub
 ├── hw/misc/hisi-rtc.c           # SPI-bridge RTC device
 ├── hw/net/hisi-femac.c          # Fast Ethernet MAC + MDIO PHY stub
 ├── hw/i2c/hisi-i2c.c            # HiBVT I2C controller
 ├── hw/i2c/hisi-imx335.c         # IMX335 image sensor I2C device
 ├── include/hw/arm/hisilicon.h   # SoC config structure + constants
-├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 machines
+├── hw/arm/xiongmai.c            # Xiongmai XM510/XM530/XM550 cameras, XM8536E/XM8520D/XM8521DV200 NVR/DVRs
+├── hw/misc/xm-vo2.c             # NVR/DVR display: windows, GUI, cursor on HDMI
+├── hw/misc/xm-vc8000d.c         # Hantro VC8000D / G2 decoder (libavcodec)
+├── hw/misc/xm-h2.c              # Hantro H2 (VC8000E) encoder: H.265, H.264, JPEG
+├── hw/misc/xm-dvr-vi.c          # DVR capture of the AHD receivers' ports
+├── hw/misc/xm-dvr-vpss.c        # DVR scaler
+├── hw/misc/xm-dvr-osd.c         # DVR OSD engine (jobs complete, nothing drawn)
+├── hw/misc/xm-rtc2.c            # NVR/DVR RTC
+├── hw/i2c/nvp6158.c             # Nextchip NVP6158C AHD receiver
+├── hw/i2c/tp2830.c              # Techpoint TP2830 AHD receiver
+├── hw/usb/hcd-dwc2.c            # QEMU's DWC2 host, fixed: core soft reset, IRQ level per host
+├── hw/usb/dev-storage.c         # QEMU's USB stick, fixed: short replies cut at the host's length
 ├── hw/misc/xm-sysctl.c          # XM SYS_CTRL: soft reset, PLL lock
 ├── hw/misc/xm-ddrc.c            # XM510 uPCTL DDR controller (U-Boot)
 ├── hw/misc/xm-sfc.c             # xmsfc v1/v2 SPI-NOR controller (flash-file)
@@ -497,6 +842,66 @@ qemu/
 ├── hw/i2c/gk-idc.c              # Ambarella IDC I2C master
 ├── hw/misc/gk-remap.c           # GK710xS register layouts over the GK710x models
 ├── hw/misc/gk-dma.c             # GK710xS DMA controller (descriptor chains)
+├── hw/arm/fullhan.c             # Fullhan machines, synthetic mask ROM
+├── hw/misc/fh-pmu.c             # Fullhan PMU: chip IDs, resets, PLLs -> timer clock
+├── hw/intc/fh-intc.c            # DW APB ICTL interrupt controller
+├── hw/timer/fh-timer.c          # DW APB timers (clocked by the PMU)
+├── hw/timer/fh-pts.c            # FH8632 PTS counter (its clocksource)
+├── hw/char/fh-uart.c            # DW APB UART: 16550 + USR
+├── hw/gpio/fh-gpio.c            # DW APB GPIO (the flash's chip select)
+├── hw/ssi/fh-spi.c              # DW SSI + Fullhan SPIC (swap, data window)
+├── hw/dma/fh-axi-dmac.c         # DW AXI DMAC (FH885xV200 / FH865x)
+├── hw/dma/fh-ahb-dmac.c         # DW AHB DMAC (older dies)
+├── hw/i2c/fh-i2c.c              # DW I2C master
+├── hw/rtc/fh-rtc.c              # Fullhan RTC, command-based and v1 layouts
+├── hw/watchdog/fh-wdt.c         # DW watchdog
+├── hw/misc/fh-efuse.c           # eFuse controller
+├── hw/arm/ambarella.c           # Ambarella S3L machine, generated device tree
+├── hw/misc/amb-vic.c            # Ambarella VIC and the scratchpad that names the IRQ
+├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
+├── hw/misc/amb-rct.c            # Ambarella reset and clock tree
+├── hw/misc/amb-gpio.c           # Ambarella GPIO; 107 holds the sensor in reset
+├── hw/misc/amb-nand.c           # Ambarella FIO, FDMA and a 128 MiB NAND
+├── hw/i2c/amb-idc.c             # Ambarella IDC I2C master
+├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
+├── hw/mips/ingenic.c            # Ingenic T10..T41 machines, mask ROM stand-in, bootm
+├── hw/misc/ingenic-cpm.c        # CPM: PLL lock, divider busy, per-SoC PLL encodings
+├── hw/intc/ingenic-intc.c       # XBurst1 INTC
+├── hw/intc/ingenic-ccu.c        # XBurst2 CCU + per-core INTC, second core start
+├── hw/timer/ingenic-ost.c       # System OST; XBurst2 global and core OSTs
+├── hw/timer/ingenic-tcu.c       # TCU, watchdog (reboot), the boot loaders' OST
+├── hw/ssi/ingenic-sfc.c         # SFC v1/v2: phases, PIO, DMA, command table
+├── hw/sd/ingenic-msc.c          # jzmmc SD host, SDMA descriptors, card detect GPIO
+├── hw/net/ingenic-gmac.c        # Synopsys GMAC 3.x, 8-word descriptors, IP101G PHY
+├── hw/i2c/ingenic-i2c.c         # DW_apb_i2c master
+├── hw/gpio/ingenic-gpio.c       # GPIO with the shadow port
+├── hw/misc/ingenic-ddr.c        # DDRC/PHY: the DDR init polls
+├── hw/rtc/ingenic-rtc.c         # RTC / hibernation (power-off)
+├── hw/misc/ingenic-efuse.c      # EFUSE, blank
+├── hw/audio/ingenic-aic.c       # AIC (I2S) FIFOs + internal codec: tone in, audiodev out
+├── hw/dma/ingenic-pdma.c        # PDMA: descriptor rings, AUTO copies, request lines
+├── hw/ssi/ingenic-ssi.c         # SSI SPI masters, chip selects, PDMA requests
+├── hw/misc/ingenic-aes.c        # AES ECB/CBC by DMA or by block
+├── hw/misc/ingenic-hash.c       # MD5 / SHA-1 / SHA-2 by DMA
+├── hw/misc/ingenic-rsa.c        # RSA-1024/2048 modular exponentiation
+├── hw/misc/ingenic-dtrng.c      # true random number generator
+├── hw/misc/gm-pmu.c             # FTPMU010: chip ID, strap, PLLs -> PCLK, FCS interrupt
+├── hw/misc/gm-ddrc.c            # FTDDRC010: init done, DRAM size code
+├── hw/intc/gm-intc.c            # FTINTC030 interrupt controller (per-CPU targets)
+├── hw/timer/gm-timer.c          # FTTMR010 timers (clocked by the PMU)
+├── hw/watchdog/gm-wdt.c         # FTWDT010 watchdog (the reboot path)
+├── hw/gpio/gm-gpio.c            # FTGPIO010
+├── hw/i2c/gm-i2c.c              # FTI2C010 byte-at-a-time I2C master
+├── hw/ssi/gm-spi020.c           # FTSPI020 command-based flash controller, RX FIFO, DMA requests
+├── hw/dma/gm-dmac.c             # FTDMAC020 AHB DMA, linked lists, handshake lines
+├── hw/usb/gm-otg.c              # FOTG210: FUSBH200 EHCI + OTG glue
+├── hw/misc/gm-vcap.c            # VCAP300 capture: link lists, OpenIPC logo picture, sync timer
+├── hw/misc/gm-3dnr.c            # FT3DNR200: command lists, frame copy
+├── hw/misc/gm-scaler.c          # scaler300: link lists, UYVY scaling / fills
+├── hw/misc/gm-h264e.c           # MCP280 H.264: header FIFO + slice data (hantro-h264.c)
+├── hw/misc/gm-mcp100.c          # MCP100 codec control (embedded CPU handshake)
+├── hw/display/gm-lcd.c          # LCD200 vertical interrupt (the video graph's clock)
+├── hw/display/gm-2d.c           # GM2D 2D engine: magic, job completion
 ├── hw/arm/anyka.c               # Anyka AK39xx machines, synthetic mask ROM
 ├── hw/misc/ak-sysctrl.c         # AK39 SYSCTRL: chip ID, IRQ controller, timers, WDT, RTC
 ├── hw/misc/ak-l2.c              # L2 buffer SRAM + DMA (UART / SPI data path)
@@ -509,7 +914,7 @@ qemu/
 ├── hw/usb/ak-usb.c              # MUSB-style OTG, nothing plugged in
 ├── hw/sd/ak-mci.c               # MCI SD/MMC host (sd-bus, FIFO)
 ├── include/hw/arm/anyka.h       # AkSoCConfig
-├── hw/arm/sigmastar.c           # SigmaStar infinity2m machines, synthetic mask ROM
+├── hw/arm/sigmastar.c           # SigmaStar infinity2m/Ifado/infinity3/Iford/Ifliegen/infinity6 machines, synthetic mask ROM
 ├── hw/misc/sstar-riu.c          # RIU register file under the models, boot status bits
 ├── hw/intc/sstar-intc.c         # Main interrupt controller (masks on the way to the GIC)
 ├── hw/timer/sstar-timer.c       # PIU timers + watchdog
@@ -521,8 +926,17 @@ qemu/
 ├── hw/misc/sstar-vpu.c          # WAVE5 video decoder, firmware interface + libavcodec
 ├── hw/display/mstar-disp.c      # GOP/MOP scan-out, display-top vsync (ported)
 ├── hw/display/mstar-ge.c        # GE 2D engine (ported)
+├── hw/rtc/sstar-rtc.c           # infinity/infinity3 PM RTC (seconds counter, alarm)
+├── hw/misc/sstar-vip-gamma.c    # infinity3 scaler gamma SRAM ports (YUV, RGB)
+├── hw/misc/sstar-i3-isp.c       # infinity3 ISP/CSI: sensor scene, pixel pipeline, AE/AWB stats
+├── hw/misc/sstar-i3-scl.c       # infinity3 scaler interrupts and DMA clients
+├── hw/misc/sstar-mfe.c          # infinity3 MFE H.264 encoder (CAVLC, CABAC)
+├── hw/misc/sstar-vhe.c          # infinity3 VHE (Hantro H2v3) H.265 encoder
+├── hw/misc/sstar-i3-jpe.c       # infinity3 JPEG encoder
+├── hw/misc/sstar-i3-bach.c      # infinity3 audio DMA (playback, capture)
+├── hw/gpio/sstar-i3-gpio.c      # infinity3 GPIO, SAR ADC, PM-sleep irqchip, day/night
 ├── include/hw/arm/sigmastar.h   # SsSoCConfig
-├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98533, NT98332
+├── hw/arm/novatek.c             # Novatek NT9856x machines (generated DT), NT98533, NT98332, NT98633
 ├── hw/arm/nvt-lzma.c            # LZMA decoder for the NA51103 boot stand-in
 ├── hw/misc/nvt-dai.c            # NA51103 audio interfaces (I2S DMA, silence)
 ├── hw/misc/nvt-engine.c         # HDAL media engines: link lists, job done
@@ -579,6 +993,13 @@ qemu-boot/
 ├── run-nt98332.sh               # Novatek NT98332: NVR NOR image, GUI, mouse, SATA
 ├── run-xm530-camera.sh          # XM530 + OpenIPC as a camera on the NT98332's QEMU LAN
 ├── uboot-env.py                 # Write a U-Boot env (defaults + settings) into a flash image
+├── run-fullhan.sh               # Fullhan: boot a NOR image (dump or OpenIPC) on any fh* machine
+├── fh-openipc-flash.sh          # Fullhan: OpenIPC release onto a dump's vendor U-Boot
+├── test-fullhan-boot.sh         # Fullhan OpenIPC kernel: login, DHCP, JFFS2 written back
+├── test-s3l-boot.sh             # Ambarella S3L: ipctool and load_ambarella on a guest
+├── test-grainmedia-boot.sh      # Grain Media OpenIPC kernel: login, DHCP, JFFS2 written back
+├── test-grainmedia-rtsp.sh      # Grain Media camera dump from flash: its RTSP H.264 decodes
+├── test-ingenic-boot.sh         # Ingenic OpenIPC: -kernel or SPL+U-Boot from flash; login, DHCP, JFFS2
 ├── test-novatek-boot.sh         # NT9856x kernel to a PID-1 check script: NOR r/w, DHCP+HTTP, reboot
 ├── test-novatek-uboot.sh        # NT9856x vendor U-Boot: stop autoboot, dhcp, tftp, ping, SD card
 ├── build-novatek-test-kernel.sh # OpenIPC nt9856x kernel + EHCI/usb-storage/PWM/crypto, for the tests below
@@ -613,8 +1034,12 @@ docs/
 ├── xiongmai.md                  # XM510/XM530/XM550 memory map, with kernel sources
 ├── goke-gk710x.md               # GK7101/GK7102: the HAL, real memory map, boot
 ├── anyka.md                     # AK39xx: L2 buffer, mask ROM, boot NOR
-├── sigmastar.md                 # SigmaStar/MStar infinity2m: RIU banks, boot chain
-├── novatek.md                   # NT9856x, NT98533, NT98332: DT, loader stand-in, media
+├── fullhan.md                   # Fullhan: generations, mask ROM, SPIC, DMACs
+├── ambarella.md                 # Ambarella S3L: map, what it proves and what it does not
+├── grainmedia.md                # Grain Media GM813x: map, nsboot boot chain, video, audio, MJPEG
+├── ingenic.md                   # Ingenic T-series: map, CPUs, mask ROM and cache-as-RAM, devices
+├── sigmastar.md                 # SigmaStar/MStar infinity2m/infinity3: RIU banks, boot chain
+├── novatek.md                   # NT9856x, NT9852x, NT9853x, NT9832x, NT98332, NT98633: DT, loader stand-in, media
 ├── ive-registers.md             # IVE register map (from live EV300 capture)
 ├── ive-applications.md          # IVE-based video analytics for OpenIPC
 ├── ive-eval-methodology.md      # IVE motion/abandoned detection evaluation

@@ -168,6 +168,21 @@ static void probs_init(Prob *p, size_t n)
 }
 
 /*
+ * The header's unpacked size.  NA51090's packer ("bfc c lzma") writes the
+ * 32-bit length into both halves of the 64-bit field; read that as the
+ * length.
+ */
+static uint64_t lzma_unpack_size(const uint8_t *in)
+{
+    uint64_t unpack = ldq_le_p(in + 5);
+
+    if (unpack != UINT64_MAX && (uint32_t)(unpack >> 32) == (uint32_t)unpack) {
+        return (uint32_t)unpack;
+    }
+    return unpack;
+}
+
+/*
  * A header an encoder writes: lc/lp/pb in range, a dictionary of 2^n or
  * 3 * 2^(n-1) bytes from 4 KiB to 1 GiB (the xz/LZMA SDK presets), an
  * unpacked size that is "unknown" or below 1 GiB, and the range coder's
@@ -184,7 +199,7 @@ bool nvt_lzma_probe(const uint8_t *in, size_t inlen)
         return false;
     }
     dict = ldl_le_p(in + 1);
-    unpack = ldq_le_p(in + 5);
+    unpack = lzma_unpack_size(in);
     if (dict < 4 * KiB || dict > 1 * GiB ||
         !(is_power_of_2(dict) || (dict % 3 == 0 && is_power_of_2(dict / 3)))) {
         return false;
@@ -207,7 +222,7 @@ ssize_t nvt_lzma_decode(const uint8_t *in, size_t inlen,
     if (!nvt_lzma_probe(in, inlen)) {
         return -1;
     }
-    unpack = ldq_le_p(in + 5);
+    unpack = lzma_unpack_size(in);
     sized = unpack != UINT64_MAX;
     d = in[0];
     if (sized && unpack > outmax) {

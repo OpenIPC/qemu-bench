@@ -10,12 +10,17 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qapi/error.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
+#include "qapi/visitor.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/xiongmai.h"
+#include "hw/nvram/eeprom_at24c.h"
+#include "hw/ide/ahci-sysbus.h"
 #include "hw/boards.h"
 #include "hw/char/pl011.h"
 #include "hw/clock.h"
@@ -24,6 +29,7 @@
 #include "hw/sd/sd.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/sysbus.h"
 #include "qobject/qlist.h"
 #include "target/arm/arm-powerctl.h"
@@ -196,7 +202,15 @@ static const XmSoCConfig xm530_soc = {
     /* ...then programs PHY +0xA8 and waits for +0xB8 to echo it. */
     .ddrc_mirror        = 0x10B8,
     .ddrc_mirror_of     = 0x10A8,
+    /* 64 MB: ipcinfo --chip-name says xm530 */
+    .ddrc_bank_size     = 2,
     .gpio_base          = 0x10020000,
+    /* dwc_otg.ko registers the platform device itself: the DWC2 OTG core
+     * at 0x50300000, IRQ 76 (SPI 44), the same as the V200 series' xm_usb0.
+     * The USB Wi-Fi of these boards (XM711, ATBM6032 / XM713G) sits on it,
+     * powered by wifi_pdn.ko's pad. */
+    .usb_base           = 0x50300000,
+    .usb_irq            = 44,
     .num_regbanks       = 5,
     .regbanks           = {
         { "xm-i2c1",     0x10001000, 0x0F000 },  /* xm_i2c1, unmodelled */
@@ -216,6 +230,385 @@ static const XmSoCConfig *xm550_config(void)
         c = xm530_soc;
         c.desc = "Xiongmai XM550 (2x Cortex-A5 stand-in A9, GIC, 128 MB)";
         c.ram_size_default = 128 * MiB;
+        /* 128 MB: what makes ipcinfo --chip-name say xm550 */
+        c.ddrc_bank_size = 3;
+    }
+    return &c;
+}
+
+/*
+ * The second generation: XM530V200 (its U-Boot reports XM550V200WX2), XM533
+ * and XM535, read from camera dumps (#154).  The XM530 map with:
+ *   - the boot ROM entering flash at the window, 0x60000000, where their
+ *     U-Boot is linked -- there is no 0x08000000 text alias to start from;
+ *   - DDR behind a DesignWare uMCTL2 and its PHY at 0x20050000 (xm-umctl2)
+ *     instead of the uPCTL at 0x100B0000;
+ *   - an SP804 that latches its count (xm_sp804_latch_ops);
+ *   - the SDIO (Wi-Fi) controller moved from 0x50100000, to 0x50300000 on
+ *     XM530V200 and XM535, to 0x50200000 on XM533 (the kernels' platform
+ *     resources: IRQ 76 / 74).
+ * The kernels' static I/O map (0x10000000 and 0x20000000) is the same on
+ * all three.  Only the XM530V200 kernel is built SMP; -smp 2 is allowed on
+ * the others too, as nothing says their die has one core.
+ */
+static XmSoCConfig xm53x_v2_base(const char *desc)
+{
+    XmSoCConfig c = xm530_soc;
+
+    c.desc = desc;
+    c.sfc_text_alias = 0;
+    c.flash_entry = 0x60000000;
+    c.ddrc_base = 0;
+    c.num_ddrc_done = 0;
+    c.ddrc_mirror = 0;
+    c.ddrc_mirror_of = 0;
+    c.umctl2_base = 0x20050000;
+    /* xm_i2c.ko's bus 2 (bus n at 0x10000000 + n * 0x1000): XM535D2's two
+     * phy-0 sensors (Isp.json I2cInfo dev 2, 0x30 / 0x32) */
+    c.i2c2_base = 0x10002000;
+    c.timer_latch = true;
+    /* xm_usb0.ko's "dwc2" platform device: the DWC2 OTG core at
+     * 0x50300000, IRQ 76 (SPI 44), where XM530 had the SDIO controller;
+     * the Wi-Fi of these boards is a USB dongle (atbm, xm713g.ko).  Only
+     * XM533 keeps an SDIO slot, at 0x50200000. */
+    c.num_sdhci = 1;
+    c.usb_base = 0x50300000;
+    c.usb_irq = 44;
+    /* Isp.json probes I2C 0x30 and 0x32, one 2 MP SmartSens part per lens
+     * (isp.ko insists on 1080p timing: 1125 lines).  The "6M" in Sofia's
+     * config is the VPSS upscaling the pair.  SC2336, ID 0xCB3A. */
+    c.sensor_type = "hisi-smartsens";
+    c.sensor_addr = 0x30;
+    c.sensor_addr2 = 0x32;
+    c.sensor_id = 0xCB3A;
+    /* hx280enc as on XM530, moved: base_port 0x21100000, irq 78. */
+    c.h1_base = 0x21100000;
+    c.h1_irq = 46;
+    c.h1_max_width = 4080;  /* the main stream is 2304 wide */
+    /* VI / ISP moved too (0x32000000, 0x34000000): not modelled yet. */
+    c.vi_base = 0;
+    /* XM530's ISP regbank at 0x40000000 is last; the I2S one before it
+     * is xm-audio here */
+    c.num_regbanks = 3;
+    /* i2s.ko's AI and AO blocks, IRQ 48 / 49; XM535's and XM533's move 20
+     * ms (160 samples) an interrupt */
+    c.audio_base = 0x10060000;
+    c.audio_irqs[0] = 16;
+    c.audio_irqs[1] = 17;
+    c.audio_chunk = 160;
+    /* VI + ISP as isp.ko drives them (xm-isp2): VICU end / start, BPU,
+     * NR3D, VPSS store 0..3 (isp.ko's and vi.ko's request_irq) */
+    c.isp2 = true;
+    {
+        static const int irqs[XM_ISP2_IRQS] = { 55, 56, 30, 37, 25, 26, 35, 36, -1 };
+        memcpy(c.isp2_irqs, irqs, sizeof(irqs));
+    }
+    /* Pads up to 166 (XM533's AoEn 138, WifiPdn 166); adc.ko's ADC */
+    c.gpio_pads = 200;
+    c.gpio_adc_off = 0xCC4;
+    /* hevc.ko's HEVC engine (xm-hevc): 0x21000000 and 0x21010000, SPI 45 */
+    c.hevc_base = 0x21000000;
+    c.hevc_irq = 45;
+    /* rgn.ko's OSD engine (xm-osd), osd_int SPI 62 */
+    c.osd_base = 0x21200000;
+    c.osd_irq = 62;
+    /* isp.ko's timer45 (SPI 6) and timer7 (SPI 54): two more SP804s. */
+    c.num_timers = 4;
+    c.timer_bases[2] = 0x100D1000;
+    c.timer_irqs[2] = 6;
+    c.timer_bases[3] = 0x100D2000;
+    c.timer_irqs[3] = 54;
+    return c;
+}
+
+static const XmSoCConfig *xm530v200_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = xm53x_v2_base("Xiongmai XM530V200 / XM550V200 "
+                          "(2x Cortex-A5 stand-in A9, GIC, uMCTL2)");
+        /* 128 MiB: the loader script's MEM_ALL, Linux mem=63M and the MMZ
+         * from 0x83F00000 to the top */
+        c.ram_size_default = 128 * MiB;
+        /* its isp.ko: XM535's VI blocks, the VICU interrupt words
+         * moved; vicu_bayer_irq0/1 SPI 55 / 56, bpu_hvgen_irq SPI 31;
+         * and vpss.ko's memory-to-memory VPSS, vpss_int SPI 40 */
+        c.isp2_layout = "xm530v200";
+        /* its HEVC engine: an earlier revision of XM533's */
+        c.hevc_layout = "xm530v200";
+        /* rgn.ko's OSD engine at 0x21300000 (osd_int SPI 62 as XM535) */
+        c.osd_base = 0x21300000;
+        /* The boards' reset keys (Sofia's Device json Key: 80 on X2-WQ2,
+         * 74 on X6C-WEQ), active low: low makes Sofia restore defaults and
+         * reboot (type 10). */
+        c.num_gpio_high = 2;
+        c.gpio_high[0] = 80;
+        c.gpio_high[1] = 74;
+        /* its i2s.ko moves 256 samples an interrupt */
+        c.audio_chunk = 256;
+        /* nn.ko's NN accelerator (xm-nn), where XM535 has the OSD */
+        c.nn_base = 0x21200000;
+        c.nn_irq = 43;
+        /* no hx280enc here: 0x21100000 / SPI 46 is jpeg.ko's JPEG engine */
+        c.h1_base = 0;
+        c.jpeg_base = 0x21100000;
+        c.jpeg_irq = 46;
+        {
+            static const int irqs[XM_ISP2_IRQS] = { 55, 56, 31, -1, -1, -1, -1, -1, 40 };
+            memcpy(c.isp2_irqs, irqs, sizeof(irqs));
+        }
+    }
+    return &c;
+}
+
+/*
+ * XM8536E, the NVR part ("NBD88X16S"; kernel mach-xm8520v200, Sofia's module
+ * loader says xm580): the second-generation map with a decoder/display
+ * instead of a camera pipeline -- no VI, ISP, sensor or encoder.  256 MB at
+ * 0x80000000.  Read from the board's dump: stage 0 (flash 0), a gzip U-Boot
+ * at 0x4000 and the kernel inside the root squashfs.
+ *   - DDR: the same uMCTL2 and PHY one window lower, at 0x20040000.
+ *   - A fifth PLL: stage 0 also waits on +0x28.
+ */
+static const XmSoCConfig *xm8536e_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = xm53x_v2_base("Xiongmai XM8536E NVR "
+                          "(2x Cortex-A5 stand-in A9, GIC, uMCTL2)");
+        c.ram_size_default = 256 * MiB;
+        c.umctl2_base = 0x20040000;
+        c.sys_pll_lock31_mask |= 1u << (0x28 / 4);
+        c.sensor_type = NULL;
+        c.sensor_addr = 0;
+        c.sensor_addr2 = 0;
+        c.sensor_id = 0;
+        c.isp2 = false;
+        c.h1_base = 0;
+        /* hevc.ko's engine (xm-hevc, 0x21000000, IRQ 77 = SPI 45) is the
+         * v2 base's; the DVRs (XM8521DV200) encode with it.  jpeg.ko's at
+         * 0x21100000, IRQ 78, its registers moved (status +0x030) */
+        c.jpeg_base = 0x21100000;
+        c.jpeg_irq = 46;
+        c.jpeg_layout = "xm8521";
+        /* the engine hevc.ko drives here is XM533's ("v3": registers
+         * 2..188, 1 to +0x004, status +0x058, length +0x1D8) */
+        c.hevc_layout = "xm533";
+        /* xm_rgn.ko maps 0x34000000 and 0x21010000: not XM535's OSD */
+        c.osd_base = 0;
+        /* xm_i2s.ko / xm_i2s_ext.ko (2022): the eight-channel capture at
+         * +0x3000 on Linux IRQ 94, four more blocks on 47, 48, 49, 95 */
+        c.audio_base = 0x10060000;
+        c.audio_layout = "dvr2";
+        c.audio_irqs[0] = 62;
+        c.audio_irqs[1] = 15;
+        c.audio_irqs[2] = 16;
+        c.audio_irqs[3] = 17;
+        c.audio_irqs[4] = 63;
+        c.audio_chunk = 0;
+        c.num_timers = 2;
+        c.num_sdhci = 0;
+        /* xm_i2s_ext.ko's ES8311 codec: bus 3, 0x18; chip ID FD/FE */
+        c.codec_i2c_base = 0x10003000;
+        /* the DVRs' (XM8521DV200) AHD receivers: Sofia's /dev/xm_i2c1 */
+        c.i2c1_base = 0x10001000;
+        c.codec_addr = 0x18;
+        c.codec_regs = "0xfd:0x83,0xfe:0x11";
+        /* loadxm580 on this board variant: at24c.ko SCL=70 SDA=69 */
+        c.eeprom_scl = 70;
+        c.eeprom_sda = 69;
+        /* xm_usb.ko's two dwc2 hosts: IRQ 76 and 45 */
+        c.usb_base = 0x50300000;
+        c.usb_irq = 44;
+        c.usb2_base = 0x50400000;
+        c.usb2_irq = 13;
+        /* xm_rtc.ko's 32.768 kHz counter */
+        c.rtc2_base = 0x100A0000;
+        /* the kernel's ahci.0 platform device: IRQ 46 */
+        c.ahci_base = 0x50500000;
+        c.ahci_irq = 14;
+        /* xm_h265d.ko's hantrodec: VC8000D at 0x21200800, IRQ 84 (SPI 52) */
+        c.vc8000d_base = 0x21200000;
+        /* xm_dma.ko: a stock PL330, IRQ 50 */
+        c.pl330_base = 0x20020000;
+        c.pl330_irq = 18;
+        /* xm_vo.ko: IRQ 58, 60, 61 and 88 */
+        c.vo2_base = 0x31000000;
+        c.vo2_irqs[0] = 26;
+        c.vo2_irqs[1] = 28;
+        c.vo2_irqs[2] = 29;
+        c.vo2_irqs[3] = 56;
+        /* xm_vi.ko: 0x30000000, IRQ 69 / 70; xm_vpss.ko: 0x33000000, IRQ 65 */
+        c.dvr_vi_base = 0x30000000;
+        c.dvr_vi_irqs[0] = 37;
+        c.dvr_vi_irqs[1] = 38;
+        c.dvr_vpss_base = 0x33000000;
+        c.dvr_vpss_irq = 33;
+        /* xm_rgn.ko's OSD engine: 0x34000000, IRQ 89 */
+        c.dvr_osd_base = 0x34000000;
+        c.dvr_osd_irq = 57;
+        /* 24 ticks a microsecond (stage 0's delay, sched_clock: 24 MHz);
+         * the watchdog is that / 256 */
+        c.timer_freq = 24000000;
+        c.wdt_freq = 93750;
+        /*
+         * The kernel derives gt_clk (TWD, global timer) from +0x30: PLL
+         * select [18:17], divider [7:0], /4 at bit 20.  Stage 0's 0x001F0101
+         * gives 199.5 MHz, but QEMU's MPCore timers tick at 100 MHz; reading
+         * the divider as 3 gives 99.75 MHz.
+         */
+        c.sys_read_or_offset = 0x30;
+        c.sys_read_or = 2;
+    }
+    return &c;
+}
+
+/*
+ * XM8520D, the AHD DVR part ("AHB88X04R"; kernel arch/arm/mach-xm580): the
+ * XM8536E's peripheral map (U-Boot 2014.04 at the flash window, the latched
+ * 24 MHz SP804, VO at 0x31000000, PL330, RTC counter) with the XM530's uPCTL
+ * DDR and 128 MB, two SATA hosts and the kernel's own IRQ numbers.
+ */
+static const XmSoCConfig *xm8520d_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = *xm8536e_config();
+        c.desc = "Xiongmai XM8520D DVR (2x Cortex-A7 stand-in A9, GIC)";
+        c.ram_size_default = 128 * MiB;
+        c.umctl2_base = 0;
+        c.ddrc_base = xm530_soc.ddrc_base;
+        c.num_ddrc_done = xm530_soc.num_ddrc_done;
+        c.ddrc_done[0] = xm530_soc.ddrc_done[0];
+        c.ddrc_done[1] = xm530_soc.ddrc_done[1];
+        c.ddrc_mirror = xm530_soc.ddrc_mirror;
+        c.ddrc_mirror_of = xm530_soc.ddrc_mirror_of;
+        /* acodec.ko: the codec is on the die, not on I2C */
+        c.codec_i2c_base = 0;
+        /* the kernel's ahci.0 and ahci.1: IRQ 93 and 94 */
+        c.ahci_irq = 61;
+        /* xm_i2s.ko (2020): the AHD capture at +0x5000, HDMI at +0x6000,
+         * the codec at +0x7000; Linux IRQs 47, 48, 49 */
+        c.audio_layout = "dvr";
+        c.audio_irqs[0] = 15;
+        c.audio_irqs[1] = 16;
+        c.audio_irqs[2] = 17;
+        c.audio_irqs[3] = 0;
+        c.audio_irqs[4] = 0;
+        /* Sofia's NVP6158C on /dev/xm_i2c2 */
+        c.ahd_bus = 2;
+        c.ahd_chips = 1;
+        /* Sofia's camera k comes from VI engine (k + 2) & 3: lane A
+         * carries the NVP's port 3 (cameras 3, 4), lane B port 2 (1, 2) */
+        c.dvr_vi_vports = 0x12;
+        c.ahci2_base = 0x50600000;
+        c.ahci2_irq = 62;
+        /* xm_h265e.ko's hantroenc (H2) at 0x21000000, IRQ 77, and
+         * xm_h265d.ko's Hantro G2 at 0x21100000 (IRQ 108) instead of
+         * hevc.ko, jpeg.ko and the VC8000D */
+        c.vc8000d_base = 0;
+        c.hevc_base = 0;
+        c.jpeg_base = 0;
+        c.g2_base = 0x21100000;
+        c.h2_base = 0x21000000;
+        c.h2_irq = 45;
+        c.vo2_layout = 1;
+        /* its xm_vi.ko: IRQ 101 / 102, older VI and VPSS layouts */
+        c.dvr_layout = 1;
+        /* its xm_rgn.ko: IRQ 105 */
+        c.dvr_osd_irq = 73;
+        c.dvr_vi_irqs[0] = 69;
+        c.dvr_vi_irqs[1] = 70;
+        c.g2_irq = 76;
+        /* xm_vo.ko: IRQ 58, 60, 61 and 107 */
+        c.vo2_irqs[3] = 75;
+        /* its xm_usb.ko: the second dwc2 host (0x50400000) on IRQ 91,
+         * not the XM8521DV200's 45 */
+        c.usb2_irq = 59;
+        /* xm_vi.ko's 101/102, the codecs' 108, xm_var.ko's 118; 96 SPIs,
+         * as the kernel (NR_IRQS 128) takes no more */
+        c.num_spi = 96;
+    }
+    return &c;
+}
+
+/*
+ * XM8521DV200, the 8-channel AHD DVR part ("AHB88X08R-LM-V3"; kernel
+ * mach-xm8520v200): the XM8536E's map, with two TP2830 AHD receivers on
+ * Sofia's /dev/xm_i2c1 (0x44, 0x45) and loadxm580's at24c.ko SCL=131
+ * SDA=130.
+ */
+static const XmSoCConfig *xm8521dv200_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = *xm8536e_config();
+        c.desc = "Xiongmai XM8521DV200 DVR (2x Cortex-A7 stand-in A9, GIC, "
+                 "uMCTL2)";
+        c.ahd_bus = 1;
+        c.ahd_chips = 2;
+        /* two TP2830: this firmware runs motion detection only with
+         * Techpoint chips, and crashes without it (Product_01B8: 8x 1080N,
+         * 4-channel multiplex) */
+        c.ahd_type = "tp2830";
+        c.eeprom_scl = 131;
+        c.eeprom_sda = 130;
+        /* hevc.ko's engine as Sofia's DVR library programs it: the
+         * stream at +0x200, source strides +0x214 / +0x218 (+0x210 is a
+         * table of the library's; CTBs 32x32 without SAO) */
+        c.hevc_layout = "xm8521dv200";
+    }
+    return &c;
+}
+
+static const XmSoCConfig *xm535_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = xm53x_v2_base("Xiongmai XM535 "
+                          "(Cortex-A5 stand-in A9, GIC, uMCTL2)");
+        /* The X6E-WEQ board's reset key (Sofia's Device json: Key=95),
+         * active low: low at boot makes Sofia reboot to factory reset. */
+        c.num_gpio_high = 1;
+        c.gpio_high[0] = 95;
+        /* nn.ko's NN accelerator (xm-nn) */
+        c.nn_base = 0x21500000;
+        c.nn_irq = 43;
+    }
+    return &c;
+}
+
+static const XmSoCConfig *xm533_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = xm53x_v2_base("Xiongmai XM533 (XM530V300, \"qiandaohu\"; "
+                          "Cortex-A5 stand-in A9, GIC, uMCTL2)");
+        c.num_sdhci = 2;
+        c.sdhci_bases[1] = 0x50200000;
+        c.sdhci_irqs[1] = 42;
+        /* ...and it is the card slot (sdio1_sd.ko), Wi-Fi the first */
+        c.sd_slot = 1;
+        c.usb_base = 0;
+        /* XM530V300's own layout and lines: vicu_bayer_irq0 SPI 25,
+         * vi_yuv_store SPI 27 / 28; no BPU, NR3D or second VICU line */
+        c.isp2_layout = "xm533";
+        c.hevc_layout = "xm533";
+        c.isp2_store_lines_by_event = true;
+        /* nn.ko's defaults: cnn_base 0x21500000, int_irq 75 (SPI 43), as
+         * XM535's */
+        c.nn_base = 0x21500000;
+        c.nn_irq = 43;
+        {
+            static const int irqs[XM_ISP2_IRQS] = { 25, -1, -1, -1, 27, 28, -1, -1, -1 };
+            memcpy(c.isp2_irqs, irqs, sizeof(irqs));
+        }
     }
     return &c;
 }
@@ -223,6 +616,13 @@ static const XmSoCConfig *xm550_config(void)
 typedef struct XmMachineState {
     MachineState parent_obj;
     char *flash_file;
+    uint32_t sensor_id;         /* 0: the SoC config's */
+    char *sensor;               /* NULL: the SoC's; "none"; or a QOM type */
+    uint32_t sensor_addr;       /* with sensor_addr_set; else the SoC's */
+    bool sensor_addr_set;
+    int32_t ahd_chips;          /* with ahd_chips_set; else the SoC's */
+    bool ahd_chips_set;
+    Object *ahd0;               /* the first AHD receiver, for the VI */
 } XmMachineState;
 
 #define XM_MACHINE(obj) ((XmMachineState *)(obj))
@@ -240,6 +640,139 @@ static void xm_machine_set_flash_file(Object *obj, const char *value,
     s->flash_file = g_strdup(value);
 }
 
+static char *xm_machine_get_sensor_id(Object *obj, Error **errp)
+{
+    return g_strdup_printf("%04x", XM_MACHINE(obj)->sensor_id);
+}
+
+static void xm_machine_set_sensor_id(Object *obj, const char *value,
+                                     Error **errp)
+{
+    uint64_t v;
+
+    if (qemu_strtou64(value, NULL, 16, &v) || v > 0xffff) {
+        error_setg(errp, "sensor-id: a 16-bit hex chip ID, e.g. cb3a");
+        return;
+    }
+    XM_MACHINE(obj)->sensor_id = v;
+}
+
+static char *xm_machine_get_sensor(Object *obj, Error **errp)
+{
+    return g_strdup(XM_MACHINE(obj)->sensor);
+}
+
+static void xm_machine_set_sensor(Object *obj, const char *value,
+                                  Error **errp)
+{
+    XmMachineState *s = XM_MACHINE(obj);
+    g_free(s->sensor);
+    s->sensor = g_strdup(value);
+}
+
+static void xm_machine_get_sensor_addr(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    visit_type_uint32(v, name, &XM_MACHINE(obj)->sensor_addr, errp);
+}
+
+static void xm_machine_set_sensor_addr(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    uint32_t addr;
+
+    if (!visit_type_uint32(v, name, &addr, errp)) {
+        return;
+    }
+    if (!addr || addr > 0x7f) {
+        /* 0 is the general call: every device on the bus answers it */
+        error_setg(errp, "sensor-addr is a 7-bit I2C address, 1-0x7f");
+        return;
+    }
+    XM_MACHINE(obj)->sensor_addr = addr;
+    XM_MACHINE(obj)->sensor_addr_set = true;
+}
+
+/*
+ * The board's sensor (and its identical twin, if any) on an I2C bus, or the
+ * one sensor= and sensor-addr= name instead.  sensor-id picks the part of
+ * the SoC's own model (hisi-smartsens).
+ */
+/* A DVR's AHD receivers: NVP6158C at 0x30.. or Techpoint at 0x44.., four
+ * 1080p25 cameras each */
+static void xm_attach_ahd(const XmSoCConfig *c, XmMachineState *ms, int bus,
+                          I2CBus *i2c)
+{
+    int n, chips = ms->ahd_chips_set ? ms->ahd_chips : c->ahd_chips;
+
+    if (c->ahd_bus != bus) {
+        return;
+    }
+    for (n = 0; n < chips && n < 4; n++) {
+        I2CSlave *d = c->ahd_type ?
+            i2c_slave_create_simple(i2c, c->ahd_type, 0x44 + n) :
+            i2c_slave_create_simple(i2c, "nvp6158", 0x30 + n);
+
+        if (!n) {
+            ms->ahd0 = OBJECT(d);
+        }
+    }
+}
+
+static void xm_machine_get_ahd_chips(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    visit_type_int32(v, name, &XM_MACHINE(obj)->ahd_chips, errp);
+}
+
+static void xm_machine_set_ahd_chips(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    if (visit_type_int32(v, name, &XM_MACHINE(obj)->ahd_chips, errp)) {
+        XM_MACHINE(obj)->ahd_chips_set = true;
+    }
+}
+
+static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
+                              I2CBus *bus)
+{
+    const char *type = ms->sensor ? ms->sensor : c->sensor_type;
+    uint16_t id = ms->sensor_id ? ms->sensor_id : c->sensor_id;
+    uint8_t addrs[2] = { c->sensor_addr, c->sensor_addr2 };
+
+    if (!type || !strcmp(type, "none")) {
+        return;
+    }
+    if (image_sensor_known(ms->sensor)) {   /* sensor= the catalogue's name */
+        image_sensor_create_at(bus, ms->sensor,
+                               ms->sensor_addr_set ? ms->sensor_addr : 0);
+        return;
+    }
+    if (!object_class_dynamic_cast(object_class_by_name(type),
+                                   TYPE_I2C_SLAVE)) {
+        error_report("sensor=%s: not an I2C device model", type);
+        exit(1);
+    }
+    if (ms->sensor_addr_set) {
+        addrs[0] = ms->sensor_addr;
+        addrs[1] = 0;
+    } else if (ms->sensor) {
+        addrs[1] = 0;           /* the twin is the SoC's own model */
+    }
+    for (int i = 0; i < 2 && (i == 0 || addrs[i]); i++) {
+        I2CSlave *sns = i2c_slave_new(type, addrs[i]);
+
+        if (id && !ms->sensor) {    /* hisi-smartsens: which SC part */
+            qdev_prop_set_uint8(DEVICE(sns), "id_high", id >> 8);
+            qdev_prop_set_uint8(DEVICE(sns), "id_low", id & 0xff);
+        }
+        i2c_slave_realize_and_unref(sns, bus, &error_fatal);
+    }
+}
 /*
  * REG_SC_REMAP: address 0 is the boot flash until the guest asks for RAM
  * there, which the kernel does to plant CPU1's trampoline.
@@ -250,13 +783,31 @@ static void xm_remap(void *opaque, int n, int level)
 }
 
 /*
+ * A flash boot runs with EL3 (the 2023+ U-Boots write NSACR), and U-Boot
+ * leaves CPU0 in secure SVC for the kernel.  arm_set_cpu_on() at EL1 would
+ * start CPU1 non-secure instead: its GIC bank and CPU0's then disagree on
+ * interrupt groups, the IPIs between them are lost, and the kernel stalls
+ * once both CPUs are up.  CPU1 starts in the security state CPU0 is in.
+ */
+static ARMCPU *xm_cpu0;
+
+static int xm_cpu1_target_el(void)
+{
+    if (xm_cpu0 && arm_feature(&xm_cpu0->env, ARM_FEATURE_EL3) &&
+        !(xm_cpu0->env.cp15.scr_el3 & SCR_NS)) {
+        return 3;   /* secure SVC: what a reset leaves an AArch32 core in */
+    }
+    return 1;
+}
+
+/*
  * REG_CPU1_SOFT_RST: CPU1 leaves reset at PC 0, in the state CPU0 runs in
- * (non-secure SVC: these CPUs have no EL3 here).
+ * (SVC; secure or not as CPU0 is, see above).
  */
 static void xm_cpu1_on(CPUState *cs, run_on_cpu_data data)
 {
     const int ret = arm_set_cpu_on(arm_cpu_mp_affinity(ARM_CPU(cs)),
-                                   0, 0, 1, false);
+                                   0, 0, xm_cpu1_target_el(), false);
 
     if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm: CPU1 release failed (%d)\n", ret);
@@ -277,7 +828,7 @@ static void xm_cpu1_reset(void *opaque, int n, int level)
         }
         return;
     }
-    ret = arm_set_cpu_on(mpidr, 0, 0, 1, false);
+    ret = arm_set_cpu_on(mpidr, 0, 0, xm_cpu1_target_el(), false);
     if (ret == QEMU_ARM_POWERCTL_ALREADY_ON) {
         /*
          * Hold and release are two back-to-back register writes, and the
@@ -309,6 +860,77 @@ static void xm_flash_boot_reset(void *opaque)
     cpu_set_pc(cs, xm_flash_boot_pc);
 }
 
+/*
+ * The SP804 on the later XM53x parts latches its count.  The XM530V200
+ * kernel's clocksource writes TimerControl with bit 8 set (0x1C2), waits for
+ * bit 8 to read back clear, then reads the snapshot at +0x1C and inverts
+ * it.  A stock SP804 has no such bit or register: bit 8 stays set, the
+ * kernel gives up after six polls, and +0x1C reads 0 -- the clock never
+ * moves and the kernel prints nothing.  This window sits over each timer's
+ * control and snapshot words (timer 1's at +0x28 / +0x3C likewise) and
+ * forwards the rest to the stock model.
+ */
+#define XM_SP804_LATCH  (1u << 8)
+
+typedef struct XmSp804Latch {
+    MemoryRegion iomem;
+    MemoryRegion *timer;
+    uint32_t snap[2];
+} XmSp804Latch;
+
+static uint64_t xm_sp804_latch_read(void *opaque, hwaddr offset,
+                                    unsigned size)
+{
+    XmSp804Latch *l = opaque;
+    int n = offset >= 0x20;
+    hwaddr reg = offset & 0x1f;
+    uint64_t val = 0;
+
+    if (reg == 0x1c) {
+        return l->snap[n];
+    }
+    memory_region_dispatch_read(l->timer, offset, &val, MO_32,
+                                MEMTXATTRS_UNSPECIFIED);
+    return val;
+}
+
+static void xm_sp804_latch_write(void *opaque, hwaddr offset, uint64_t val,
+                                 unsigned size)
+{
+    XmSp804Latch *l = opaque;
+    int n = offset >= 0x20;
+    hwaddr reg = offset & 0x1f;
+
+    if (reg == 0x1c) {
+        return;
+    }
+    if (reg == 0x08 && (val & XM_SP804_LATCH)) {
+        uint64_t count = 0, ctrl = 0;
+
+        memory_region_dispatch_read(l->timer, offset - 0x08 + 0x04, &count,
+                                    MO_32, MEMTXATTRS_UNSPECIFIED);
+        l->snap[n] = count;
+        val &= ~XM_SP804_LATCH;
+        /* The stock model reloads on every control write; a latch request
+         * that leaves the control bits as they are must not restart it. */
+        memory_region_dispatch_read(l->timer, offset, &ctrl, MO_32,
+                                    MEMTXATTRS_UNSPECIFIED);
+        if (ctrl == val) {
+            return;
+        }
+    }
+    memory_region_dispatch_write(l->timer, offset, val, MO_32,
+                                 MEMTXATTRS_UNSPECIFIED);
+}
+
+static const MemoryRegionOps xm_sp804_latch_ops = {
+    .read = xm_sp804_latch_read,
+    .write = xm_sp804_latch_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 /* Secondaries wait for REG_CPU1_SOFT_RST, never for boot.c's pen: at 0 it
  * would overwrite the trampoline the kernel writes there itself. */
 static void xm_write_secondary_boot(ARMCPU *cpu,
@@ -333,9 +955,25 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 
     for (n = 0; n < smp_cpus; n++) {
         Object *o = object_new(machine->cpu_type);
-        /* The vendor kernel is entered in SVC by U-Boot; no secure world. */
+        /*
+         * -kernel enters the vendor kernel in SVC with no secure world.  A
+         * flash boot keeps EL3, as the A5 has it: the 2023+ U-Boots write
+         * NSACR in start.S to open the FPU, which is UNDEF without it, and
+         * die on the exception before printing a byte.
+         */
         if (object_property_find(o, "has_el3")) {
-            object_property_set_bool(o, "has_el3", false, &error_fatal);
+            object_property_set_bool(o, "has_el3",
+                                     XM_MACHINE(machine)->flash_file != NULL,
+                                     &error_fatal);
+        }
+        /*
+         * The stand-in A9 lacks the A5's VFPv4: MVFR1.SIMDFMAC is 0 on the
+         * A9 (0x01111111) and 1 on the A5 (0x11111111).  The vendor Sofia
+         * on the second-generation parts uses VFMA, an Illegal instruction
+         * on a plain A9.  Only the -cpu default (an A9) is touched.
+         */
+        if (!strcmp(machine->cpu_type, ARM_CPU_TYPE_NAME("cortex-a9"))) {
+            ARM_CPU(o)->isar.mvfr1 = 0x11111111;
         }
         if (object_property_find(o, "reset-cbar")) {
             object_property_set_int(o, "reset-cbar", c->mpcore_base,
@@ -350,6 +988,7 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         cpus[n] = ARM_CPU(o);
     }
     cpu = cpus[0];
+    xm_cpu0 = cpu;
 
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
 
@@ -405,6 +1044,8 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         qdev_prop_set_uint32(sys, "rst-offset", c->sys_rst);
         qdev_prop_set_uint32(sys, "pll-lock-mask", c->sys_pll_lock_mask);
         qdev_prop_set_uint32(sys, "pll-lock31-mask", c->sys_pll_lock31_mask);
+        qdev_prop_set_uint32(sys, "read-or-offset", c->sys_read_or_offset);
+        qdev_prop_set_uint32(sys, "read-or", c->sys_read_or);
         qdev_prop_set_uint32(sys, "remap-offset", c->sys_remap);
         qdev_prop_set_uint32(sys, "cpu1-offset", c->sys_cpu1_rst);
         if (c->num_sys_init) {
@@ -436,8 +1077,12 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             qdev_prop_set_array(ddrc, "mirror-reads", m);
             qdev_prop_set_array(ddrc, "mirror-of", mo);
         }
+        qdev_prop_set_uint32(ddrc, "bank-size", c->ddrc_bank_size);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(ddrc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(ddrc), 0, c->ddrc_base);
+    }
+    if (c->umctl2_base) {
+        sysbus_create_simple("xm-umctl2", c->umctl2_base, NULL);
     }
 
     for (n = 0; n < c->num_uarts; n++) {
@@ -451,6 +1096,15 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(t), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(t), 0, c->timer_bases[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(t), 0, pic[c->timer_irqs[n]]);
+        if (c->timer_latch) {
+            XmSp804Latch *l = g_new0(XmSp804Latch, 1);
+
+            l->timer = sysbus_mmio_get_region(SYS_BUS_DEVICE(t), 0);
+            memory_region_init_io(&l->iomem, NULL, &xm_sp804_latch_ops,
+                                  l, "xm-sp804-latch", 0x40);
+            memory_region_add_subregion_overlap(sysmem, c->timer_bases[n],
+                                                &l->iomem, 1);
+        }
     }
 
     if (c->sfc_base) {
@@ -495,6 +1149,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
                 xm_flash_boot_pc = c->sfc_text_alias;
             }
         }
+        if (c->flash_entry && !machine->kernel_filename) {
+            xm_flash_boot_pc = c->flash_entry;
+        }
     }
 
     if (sys && c->sys_cpu1_rst && smp_cpus > 1) {
@@ -516,7 +1173,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(sd), 0, c->sdhci_bases[n]);
         sysbus_connect_irq(SYS_BUS_DEVICE(sd), 0, pic[c->sdhci_irqs[n]]);
 
-        DriveInfo *di = drive_get(IF_SD, 0, n);
+        /* the first SD drive goes in the board's card slot */
+        DriveInfo *di = drive_get(IF_SD, 0, n == c->sd_slot ? 0 :
+                                  n == 0 ? c->sd_slot : n);
         if (di) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);
             qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
@@ -526,15 +1185,127 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         }
     }
 
+    for (n = 0; n < 2; n++) {
+        hwaddr base = n ? c->usb2_base : c->usb_base;
+        DeviceState *usb;
+
+        if (!base) {
+            continue;
+        }
+        usb = qdev_new("dwc2-usb");
+        object_property_add_const_link(OBJECT(usb), "dma-mr",
+                                       OBJECT(sysmem));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(usb), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(usb), 0, base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(usb), 0,
+                           pic[n ? c->usb2_irq : c->usb_irq]);
+    }
+
     if (c->i2c_base) {
         DeviceState *i2c = sysbus_create_simple("xm-i2c", c->i2c_base, NULL);
 
-        if (c->sensor_type) {
-            i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c, "i2c")),
-                                    c->sensor_type, c->sensor_addr);
-        }
+        xm_attach_sensors(c, XM_MACHINE(machine),
+                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+    }
+    if (c->codec_i2c_base) {
+        DeviceState *i2c = qdev_new("xm-i2c");
+        I2CSlave *codec = i2c_slave_new("xm-sensor", c->codec_addr);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2c), 0, c->codec_i2c_base, 1);
+        qdev_prop_set_uint8(DEVICE(codec), "addr-bytes", 1);
+        qdev_prop_set_string(DEVICE(codec), "regs", c->codec_regs);
+        i2c_slave_realize_and_unref(codec,
+                                    I2C_BUS(qdev_get_child_bus(i2c, "i2c")),
+                                    &error_fatal);
+    }
+    if (c->i2c1_base) {
+        /* over the bus-1.. placeholder regbank */
+        DeviceState *i2c = qdev_new("xm-i2c");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2c), 0, c->i2c1_base, 1);
+        xm_attach_ahd(c, XM_MACHINE(machine), 1,
+                      I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+    }
+    if (c->i2c2_base) {
+        /* over the bus-1.. placeholder regbank */
+        DeviceState *i2c = qdev_new("xm-i2c");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2c), 0, c->i2c2_base, 1);
+        xm_attach_sensors(c, XM_MACHINE(machine),
+                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+        xm_attach_ahd(c, XM_MACHINE(machine), 2,
+                      I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
     }
 
+    if (c->audio_base) {
+        DeviceState *au = qdev_new("xm-audio");
+
+        if (c->audio_chunk) {
+            qdev_prop_set_uint32(au, "chunk", c->audio_chunk);
+        }
+        if (c->audio_layout) {
+            qdev_prop_set_string(au, "layout", c->audio_layout);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(au), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(au), 0, c->audio_base);
+        for (n = 0; n < ARRAY_SIZE(c->audio_irqs); n++) {
+            if (c->audio_irqs[n]) {
+                sysbus_connect_irq(SYS_BUS_DEVICE(au), n,
+                                   pic[c->audio_irqs[n]]);
+            }
+        }
+    }
+    if (c->nn_base) {
+        sysbus_create_simple("xm-nn", c->nn_base, pic[c->nn_irq]);
+    }
+    if (c->jpeg_base) {
+        DeviceState *jpeg = qdev_new("xm-jpeg");
+
+        if (c->jpeg_layout) {
+            qdev_prop_set_string(jpeg, "layout", c->jpeg_layout);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(jpeg), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(jpeg), 0, c->jpeg_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(jpeg), 0, pic[c->jpeg_irq]);
+    }
+
+    if (c->hevc_base) {
+        DeviceState *hevc = qdev_new("xm-hevc");
+        if (c->hevc_layout) {
+            qdev_prop_set_string(hevc, "layout", c->hevc_layout);
+        }
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(hevc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(hevc), 0, c->hevc_base);
+        sysbus_mmio_map(SYS_BUS_DEVICE(hevc), 1, c->hevc_base + 0x10000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(hevc), 0, pic[c->hevc_irq]);
+    }
+    if (c->osd_base) {
+        sysbus_create_simple("xm-osd", c->osd_base, pic[c->osd_irq]);
+    }
+    if (c->isp2) {
+        DeviceState *isp = qdev_new("xm-isp2");
+        const int *isp2_irqs = c->isp2_irqs;
+
+        if (c->isp2_layout) {
+            qdev_prop_set_string(isp, "layout", c->isp2_layout);
+        }
+        if (c->isp2_store_lines_by_event) {
+            qdev_prop_set_uint32(isp, "store-lines", 0);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(isp), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(isp), 0, 0x30000000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(isp), 1, 0x32000000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(isp), 2, 0x34000000);
+        for (n = 0; n < XM_ISP2_IRQS; n++) {
+            if (isp2_irqs[n] >= 0) {
+                sysbus_connect_irq(SYS_BUS_DEVICE(isp), n, pic[isp2_irqs[n]]);
+            }
+        }
+    }
     if (c->vi_base) {
         DeviceState *vi = qdev_new("xm-vi");
 
@@ -550,7 +1321,14 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     }
 
     if (c->h1_base) {
-        sysbus_create_simple("xm-h1", c->h1_base, pic[c->h1_irq]);
+        DeviceState *h1 = qdev_new("xm-h1");
+
+        if (c->h1_max_width) {
+            qdev_prop_set_uint32(h1, "max-width", c->h1_max_width);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(h1), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(h1), 0, c->h1_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(h1), 0, pic[c->h1_irq]);
     }
 
     if (c->gpio_base) {
@@ -559,8 +1337,30 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         DeviceState *gpio = qdev_new(c->gpio_type ? c->gpio_type : "xm-gpio");
 
         object_property_add_child(OBJECT(machine), "xm-gpio", OBJECT(gpio));
+        if (c->gpio_pads) {
+            qdev_prop_set_uint32(gpio, "pads", c->gpio_pads);
+        }
+        if (c->gpio_adc_off) {
+            qdev_prop_set_uint32(gpio, "adc-offset", c->gpio_adc_off);
+        }
+        if (c->eeprom_scl) {
+            qdev_prop_set_uint32(gpio, "i2c-scl", c->eeprom_scl);
+            qdev_prop_set_uint32(gpio, "i2c-sda", c->eeprom_sda);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+        if (c->eeprom_scl) {
+            /* AT24C16: 2 KiB as eight 256-byte slaves, 0x50..0x57 */
+            I2CBus *bus = I2C_BUS(qdev_get_child_bus(gpio, "i2c"));
+
+            for (n = 0; n < 8; n++) {
+                at24c_eeprom_init(bus, 0x50 + n, 256);
+            }
+        }
         sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, c->gpio_base);
+        /* Pulled-up inputs: an idle active-low button reads high. */
+        for (n = 0; n < c->num_gpio_high; n++) {
+            qemu_set_irq(qdev_get_gpio_in(gpio, c->gpio_high[n]), 1);
+        }
     }
 
     if (c->wdt_base) {
@@ -572,6 +1372,99 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         qdev_connect_clock_in(wdt, "WDOGCLK", wdt_clk);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(wdt), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(wdt), 0, c->wdt_base);
+    }
+
+    if (c->rtc2_base) {
+        DeviceState *rtc = qdev_new("xm-rtc2");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(rtc), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(rtc), 0, c->rtc2_base, 1);
+    }
+    if (c->vc8000d_base) {
+        sysbus_create_simple("xm-vc8000d", c->vc8000d_base, pic[52]);
+    }
+    if (c->dvr_vi_base) {
+        DeviceState *vi = qdev_new("xm-dvr-vi");
+
+        qdev_prop_set_uint32(vi, "layout", c->dvr_layout);
+        if (c->dvr_vi_vports && XM_MACHINE(machine)->ahd0 &&
+            object_dynamic_cast(XM_MACHINE(machine)->ahd0, TYPE_XM_AHD)) {
+            qdev_prop_set_uint32(vi, "vports", c->dvr_vi_vports);
+            object_property_set_link(OBJECT(vi), "ahd",
+                                     XM_MACHINE(machine)->ahd0, &error_fatal);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vi), 0, c->dvr_vi_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vi), 0, pic[c->dvr_vi_irqs[0]]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vi), 1, pic[c->dvr_vi_irqs[1]]);
+    }
+    if (c->dvr_osd_base) {
+        sysbus_create_simple("xm-dvr-osd", c->dvr_osd_base,
+                             pic[c->dvr_osd_irq]);
+    }
+    if (c->dvr_vpss_base) {
+        DeviceState *vp = qdev_new("xm-dvr-vpss");
+
+        qdev_prop_set_uint32(vp, "layout", c->dvr_layout);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vp), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vp), 0, c->dvr_vpss_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vp), 0, pic[c->dvr_vpss_irq]);
+    }
+    if (c->h2_base) {
+        sysbus_create_simple("xm-h2", c->h2_base, pic[c->h2_irq]);
+    }
+    if (c->g2_base) {
+        DeviceState *g2 = qdev_new("xm-vc8000d");
+
+        qdev_prop_set_uint32(g2, "id", 0x80010000);
+        /* a build ID its Sofia's libvdec knows (0x1F41..0x1F66,
+         * 0xFFFC..0xFFFF): every feature, four PPUs */
+        qdev_prop_set_uint32(g2, "build-id", 0xffff);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(g2), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(g2), 0, c->g2_base - 0x800);
+        sysbus_connect_irq(SYS_BUS_DEVICE(g2), 0, pic[c->g2_irq]);
+    }
+    if (c->pl330_base) {
+        DeviceState *dma = qdev_new("pl330");
+
+        object_property_set_link(OBJECT(dma), "memory", OBJECT(sysmem),
+                                 &error_fatal);
+        /* xm_dma.ko starts its channel non-secure (DMAGO ns=1) and ends
+         * with DMASEV 0: the boot strap must make the events non-secure */
+        qdev_prop_set_uint32(dma, "INS", 0xffff);
+        qdev_prop_set_uint32(dma, "PNS", 0xffffffff);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dma), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dma), 0, c->pl330_base, 1);
+        /* Output 0 is the abort; 1.. are events.  xm_dma.ko uses event 0 */
+        sysbus_connect_irq(SYS_BUS_DEVICE(dma), 1, pic[c->pl330_irq]);
+    }
+    if (c->vo2_base) {
+        DeviceState *vo = qdev_new("xm-vo2");
+
+        qdev_prop_set_uint32(vo, "layout", c->vo2_layout);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vo), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vo), 0, c->vo2_base);
+        for (n = 0; n < 4; n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(vo), n, pic[c->vo2_irqs[n]]);
+        }
+    }
+    for (n = 0; n < 2; n++) {
+        hwaddr base = n ? c->ahci2_base : c->ahci_base;
+        DeviceState *ahci;
+        DriveInfo *hd = drive_get(IF_IDE, n, 0);
+
+        if (!base) {
+            continue;
+        }
+        ahci = qdev_new("sysbus-ahci");
+        qdev_prop_set_uint32(ahci, "num-ports", 1);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ahci), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ahci), 0, base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(ahci), 0,
+                           pic[n ? c->ahci2_irq : c->ahci_irq]);
+        if (hd) {
+            ahci_ide_create_devs(&SYSBUS_AHCI(ahci)->ahci, &hd);
+        }
     }
 
     for (n = 0; n < c->num_regbanks; n++) {
@@ -614,6 +1507,27 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         object_class_property_set_description(OBJECT_CLASS(mc),      \
             "flash-file", "SPI NOR image behind the xmsfc controller; " \
             "erases and programs are written back to it");            \
+        object_class_property_add_str(OBJECT_CLASS(mc), "sensor-id", \
+            xm_machine_get_sensor_id, xm_machine_set_sensor_id);     \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "sensor-id", "the SmartSens sensor's chip ID, hex (later " \
+            "XM53x boards; e.g. da4d for SC1346)");                  \
+        object_class_property_add_str(OBJECT_CLASS(mc), "sensor",    \
+            xm_machine_get_sensor, xm_machine_set_sensor);           \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "sensor", "image sensor model in place of the board's: an " \
+            "I2C device type (xm-sensor for a generic one), or none");            \
+        object_class_property_add(OBJECT_CLASS(mc), "sensor-addr",   \
+            "uint32", xm_machine_get_sensor_addr,                    \
+            xm_machine_set_sensor_addr, NULL, NULL);                 \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "sensor-addr", "the sensor's 7-bit I2C address");           \
+        object_class_property_add(OBJECT_CLASS(mc), "ahd-chips",     \
+            "int32", xm_machine_get_ahd_chips,                       \
+            xm_machine_set_ahd_chips, NULL, NULL);                   \
+        object_class_property_set_description(OBJECT_CLASS(mc),      \
+            "ahd-chips", "NVP6158C AHD receivers on a DVR, 4 cameras " \
+            "each (default: the board's)");                          \
     }                                                                \
     DEFINE_MACHINE_EXTENDED(namestr, MACHINE, XmMachineState,        \
                             tag##_class_init, false,                  \
@@ -622,3 +1536,9 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
 DEFINE_XM_MACHINE("xm510", xm510, xm510_soc)
 DEFINE_XM_MACHINE("xm530", xm530, xm530_soc)
 DEFINE_XM_MACHINE("xm550", xm550, (*xm550_config()))
+DEFINE_XM_MACHINE("xm530v200", xm530v200, (*xm530v200_config()))
+DEFINE_XM_MACHINE("xm533", xm533, (*xm533_config()))
+DEFINE_XM_MACHINE("xm535", xm535, (*xm535_config()))
+DEFINE_XM_MACHINE("xm8536e", xm8536e, (*xm8536e_config()))
+DEFINE_XM_MACHINE("xm8520d", xm8520d, (*xm8520d_config()))
+DEFINE_XM_MACHINE("xm8521dv200", xm8521dv200, (*xm8521dv200_config()))

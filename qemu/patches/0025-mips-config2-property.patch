@@ -1,0 +1,42 @@
+mips: a Config2 property
+
+Config2 describes the secondary cache (SS sets, SL line size, SA ways),
+which differs between dies that share a core model: the Ingenic T40 and
+T41 have a 128 KiB, 8-way L2 with 64-byte lines that the XBurst2 model
+does not describe, and their kernels print "Unified secondary cache
+0kB" and skip its maintenance.  "config2" overrides the model's at reset
+(0 keeps it).
+
+diff --git a/target/mips/cpu.c b/target/mips/cpu.c
+--- a/target/mips/cpu.c
++++ b/target/mips/cpu.c
+@@ -212,7 +212,8 @@
+         env->CP0_Config1 = deposit32(env->CP0_Config1, CP0C1_IS, 3, sets);
+         env->CP0_Config1 = deposit32(env->CP0_Config1, CP0C1_DS, 3, sets);
+     }
+-    env->CP0_Config2 = env->cpu_model->CP0_Config2;
++    env->CP0_Config2 = cpu->config2 ? cpu->config2
++                                    : env->cpu_model->CP0_Config2;
+     env->CP0_Config3 = env->cpu_model->CP0_Config3;
+     env->CP0_Config4 = env->cpu_model->CP0_Config4;
+     env->CP0_Config4_rw_bitmask = env->cpu_model->CP0_Config4_rw_bitmask;
+@@ -554,6 +555,7 @@
+     DEFINE_PROP_UINT64("car-phys", MIPSCPU, car_phys, 0),
+     DEFINE_PROP_UINT32("prid", MIPSCPU, prid, 0),
+     DEFINE_PROP_UINT32("l1-kib", MIPSCPU, l1_kib, 0),
++    DEFINE_PROP_UINT32("config2", MIPSCPU, config2, 0),
+     DEFINE_PROP_BOOL("tlb-shadow", MIPSCPU, tlb_shadow, true),
+ };
+ 
+diff --git a/target/mips/cpu.h b/target/mips/cpu.h
+--- a/target/mips/cpu.h
++++ b/target/mips/cpu.h
+@@ -1258,6 +1258,8 @@
+      */
+     uint32_t prid;
+     uint32_t l1_kib;
++    /* Config2 as a die reports it (its L2 cache); 0 keeps the model's */
++    uint32_t config2;
+     /*
+      * tlbwr keeps the entry it replaces as a hidden "shadow" translation,
+      * which saves QEMU TLB flushes as long as the guest drops mappings

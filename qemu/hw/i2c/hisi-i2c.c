@@ -20,6 +20,9 @@
  *   0x16 TX_ACK     transmit ACK (master-to-slave on reads, non-last)
  *   0x17 TX_NACK    transmit NACK (last byte of a read)
  *   0x18 JMP1       loop-back: if LOOP1 > 0, decrement & jump to DST1
+ *   0x19 JMP2       the same with LOOP2 / DST2: the V5 (Linux 5.10
+ *                   i2c-bsp) driver repeats a whole multi-register write
+ *                   program with it
  *   0x1D UP_TXF     update TX FIFO pointer (DMA-only; no-op here)
  *   0x1E TX_RS      emit REPEATED START
  *   0x1F TX_P       emit STOP
@@ -64,6 +67,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiI2cState, HISI_I2C)
 #define R_CMD_END       0x0B0
 #define R_LOOP1         0x0B0
 #define R_DST1          0x0B4
+#define R_LOOP2         0x0B8
+#define R_DST2          0x0BC
 #define R_TX_WATER      0x0C8
 #define R_RX_WATER      0x0CC
 #define R_CTRL1         0x0D0
@@ -104,6 +109,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiI2cState, HISI_I2C)
 #define CMD_TX_ACK      0x16
 #define CMD_TX_NACK     0x17
 #define CMD_JMP1        0x18
+#define CMD_JMP2        0x19
 #define CMD_UP_TXF      0x1D
 #define CMD_TX_RS       0x1E
 #define CMD_TX_P        0x1F
@@ -124,6 +130,8 @@ struct HisiI2cState {
     uint32_t     data1;
     uint32_t     loop1;
     uint32_t     dst1;
+    uint32_t     loop2;
+    uint32_t     dst2;
     uint32_t     tx_water;
     uint32_t     rx_water;
     uint32_t     ctrl1;
@@ -300,6 +308,14 @@ static void hisi_i2c_run(HisiI2cState *s)
             }
             break;
 
+        case CMD_JMP2:
+            if (s->loop2 > 0) {
+                s->loop2--;
+                s->pc = s->dst2;
+                advance = false;
+            }
+            break;
+
         case CMD_UP_TXF:
             /* DMA-mode TX FIFO update — no-op for PIO. */
             break;
@@ -365,6 +381,10 @@ static uint64_t hisi_i2c_read(void *opaque, hwaddr offset, unsigned size)
         return s->loop1;
     case R_DST1:
         return s->dst1;
+    case R_LOOP2:
+        return s->loop2;
+    case R_DST2:
+        return s->dst2;
     case R_TX_WATER:
         return s->tx_water;
     case R_RX_WATER:
@@ -444,6 +464,12 @@ static void hisi_i2c_write(void *opaque, hwaddr offset,
     case R_DST1:
         s->dst1 = value & (CMD_SLOTS - 1);
         break;
+    case R_LOOP2:
+        s->loop2 = value;
+        break;
+    case R_DST2:
+        s->dst2 = value & (CMD_SLOTS - 1);
+        break;
     case R_TX_WATER:
         s->tx_water = value & 0x7F;
         break;
@@ -515,6 +541,8 @@ static void hisi_i2c_reset(DeviceState *dev)
     s->data1 = 0;
     s->loop1 = 0;
     s->dst1 = 0;
+    s->loop2 = 0;
+    s->dst2 = 0;
     s->tx_water = 32;
     s->rx_water = 1;
     s->ctrl1 = 0;

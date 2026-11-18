@@ -43,12 +43,14 @@
 #include "system/block-backend.h"
 #include "net/net.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/clock.h"
 #include "hw/qdev-clock.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/gtimer.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
+#include "target/arm/cpregs.h"
 #include <libfdt.h>
 #include "hw/loader.h"
 #include <zlib.h>  /* crc32() for uImage header fixup */
@@ -179,6 +181,11 @@ static const HisiSoCConfig hi3516cv100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -291,6 +298,11 @@ static const HisiSoCConfig hi3518av100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -391,6 +403,11 @@ static const HisiSoCConfig hi3518cv100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -493,6 +510,11 @@ static const HisiSoCConfig hi3518ev100_soc = {
 
     .femac_base         = 0x10090000,
     .femac_irq          = 12,
+    /* USB 2.0 host, where the vendor 3.0.8 hiusb-ehci/-ohci look for it */
+    .usb_ehci_base      = 0x100b0000,
+    .usb_ehci_irq       = 15,
+    .usb_ohci_base      = 0x100a0000,
+    .usb_ohci_irq       = 16,
 
     .num_himci          = 1,
     .himci_bases        = { 0x10020000 },
@@ -1039,6 +1061,14 @@ static const HisiSoCConfig hi3516cv500_soc = {
     .extra_cmdline      = "mmz_allocator=hisi "
                           "mmz=anonymous,0,0x82000000,96M",
     .max_cpus           = 2,
+    /* Dual Cortex-A7.  Two CPUs by default, not for the second core's sake:
+     * with one CPU interface the GICv2 reads ITARGETSR as zero, the kernel's
+     * gic_get_cpumask() finds no mask ("GIC CPU mask not found - kernel will
+     * fail to boot") and every SPI targets no CPU.  The vendor 4.9 kernel
+     * gets by; the OpenIPC neo kernel (mainline 7.0) goes idle for good
+     * during the driver initcalls, its last word the console handover.
+     * The same trap as gk7202v330. */
+    .default_cpus       = 2,
 
     .ram_base           = 0x80000000,
     .sram_base          = 0x04010000,
@@ -1160,6 +1190,7 @@ static const HisiSoCConfig hi3516av300_soc = {
     .extra_cmdline      = "mmz_allocator=hisi "
                           "mmz=anonymous,0,0x82000000,96M",
     .max_cpus           = 2,
+    .default_cpus       = 2,            /* GIC CPU mask: see hi3516cv500 */
 
     .ram_base           = 0x80000000,
     .sram_base          = 0x04010000,
@@ -1288,6 +1319,7 @@ static const HisiSoCConfig hi3516dv300_soc = {
     .extra_cmdline      = "mmz_allocator=hisi "
                           "mmz=anonymous,0,0x82000000,96M",
     .max_cpus           = 2,
+    .default_cpus       = 2,            /* GIC CPU mask: see hi3516cv500 */
 
     .ram_base           = 0x80000000,
     .sram_base          = 0x04010000,
@@ -1603,6 +1635,36 @@ static const HisiSoCConfig hi3516av200_soc = {
 };
 
 /*
+ * The EV200-class V4 dies' online video pipeline: VI as the frame clock,
+ * VPSS painting the pictures (hisi-vi, hisi-vpss).  Their regbanks in
+ * HISI_V4_REGBANK_LIST stay in the list and are not mapped over them.
+ * HiSilicon's EV200 / EV300 / 18EV300 / 16DV200 and the Goke rebrands of
+ * the same die, whose gk7205v200_*.ko drive it the same way.
+ */
+/*
+ * V5 (Hi3516CV610 / CV608 / CV613) media blocks, from hi3516cv610.dtsi:
+ * vi_cap0 SPI 65 (int0; int1 = 66 stays masked), vi_proc0 SPI 67, vpss
+ * SPI 71.  They take the V5 layouts (media_gen = 5).
+ */
+#define HISI_V5_VIDEO_PIPE                          \
+    .vi_cap_base        = 0x17400000,               \
+    .vi_cap_irq         = 65,                       \
+    .vi_proc_base       = 0x17800000,               \
+    .vi_proc_irq        = 67,                       \
+    .vpss_base          = 0x17900000,               \
+    .vpss_irq           = 71,                       \
+    .ive_npu_base       = 0x14000000,               \
+    .ive_npu_irq        = { 75, 76 }
+
+#define HISI_V4_VIDEO_PIPE                                  \
+    .vi_cap_base        = 0x11000000,                       \
+    .vi_proc_base       = 0x11200000,                       \
+    .vi_cap_irq         = 43,                               \
+    .vi_proc_irq        = 44,                               \
+    .vpss_base          = 0x11400000,                       \
+    .vpss_irq           = 46
+
+/*
  * Hi3516EV300 (V4): 2019, 5M professional.  Cortex-A7 @900MHz.
  * Video: H.265/H.264, 5M(2592x1944)@15fps / 4M(2688x1520)@25fps.
  * Memory: 1Gbit DDR3L integrated (128MB).  279-pin TFBGA.
@@ -1617,16 +1679,7 @@ static const HisiSoCConfig hi3516ev300_soc = {
     .default_sensor     = "imx335",        /* Sony 5MP on EV300 ref boards */
     .hwrng_base         = 0x10080000,      /* HISEC_TRNG_CTRL (V4) */
     .hwrng_data_offset  = 0x204,
-    /* MVP video pipeline IRQ heartbeat — pulses VI_CAP0/VI_PROC0/VPSS
-     * at 25 Hz so the vendor MPP modules' IRQ handlers run and Majestic
-     * gets past its "Timeout from venc channel 0" loop.
-     * SPI numbers are GIC absolute IRQ - 32 (per /proc/interrupts the
-     * kernel shows GIC-75/76/78 for VI_CAP0/VI_PROC0/VPSS). */
-    .vi_fp_base         = 0x11FE0000,      /* unused gap above vedu/jpge */
-    .vi_fp_cap_irq      = 43,              /* VI_CAP0  = SPI 43 (GIC 75) */
-    .vi_fp_proc_irq     = 44,              /* VI_PROC0 = SPI 44 (GIC 76) */
-    .vi_fp_vpss_irq     = 46,              /* VPSS     = SPI 46 (GIC 78) */
-    .vi_fp_vedu_irq     = 47,              /* VEDU     = SPI 47 (GIC 79) */
+    HISI_V4_VIDEO_PIPE,
     /* 128 MiB on-chip DDR3L (1Gb).  Kernel gets 32 MiB, vendor mmz.ko
      * claims 96 MiB at 0x42000000 — matches the canonical EV300 layout
      * documented in OpenIPC's /usr/bin/load_hisilicon. */
@@ -1673,6 +1726,8 @@ static const HisiSoCConfig hi3516ev300_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -1680,6 +1735,8 @@ static const HisiSoCConfig hi3516ev300_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -1785,6 +1842,8 @@ static const HisiSoCConfig hi3516ev200_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -1792,6 +1851,8 @@ static const HisiSoCConfig hi3516ev200_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -1811,6 +1872,13 @@ static const HisiSoCConfig hi3516ev200_soc = {
      * "Uncompress hardware decompress overtime!" before reaching the
      * U-Boot banner.  See openhisilicon#60. */
     .gzip_base          = 0x11310000,
+
+    HISI_V4_VIDEO_PIPE,
+
+    .num_regbanks       = 1,
+    .regbanks           = {
+        { "hisi-vgs",        0x11300000, 0x10000  },
+    },
 };
 
 /*
@@ -1823,6 +1891,7 @@ static const HisiSoCConfig hi3516ev200_soc = {
  */
 static const HisiSoCConfig hi3518ev300_soc = {
     .name               = "hi3518ev300",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "HiSilicon Hi3518EV300 (Cortex-A7)",
     .cpu_type           = ARM_CPU_TYPE_NAME("cortex-a7"),
     .soc_id             = HISI_SOC_ID_18EV300,
@@ -1874,6 +1943,8 @@ static const HisiSoCConfig hi3518ev300_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -1881,6 +1952,8 @@ static const HisiSoCConfig hi3518ev300_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -1909,6 +1982,7 @@ static const HisiSoCConfig hi3518ev300_soc = {
  */
 static const HisiSoCConfig hi3516dv200_soc = {
     .name               = "hi3516dv200",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "HiSilicon Hi3516DV200 (Cortex-A7)",
     .cpu_type           = ARM_CPU_TYPE_NAME("cortex-a7"),
     .soc_id             = HISI_SOC_ID_DV200,
@@ -1960,6 +2034,8 @@ static const HisiSoCConfig hi3516dv200_soc = {
 
     .mipi_rx_base       = 0x11240000,
     .mipi_rx_irq        = 45,
+    .aiao_base          = 0x100e0000,      /* hisi-aiao, "AIO Interrupt" */
+    .aiao_irq           = 42,
 
     .rtc_base           = 0x120e0000,
     .rtc_irq            = 0,
@@ -1967,6 +2043,8 @@ static const HisiSoCConfig hi3516dv200_soc = {
     .num_sdhci          = 2,
     .sdhci_bases        = { 0x10010000, 0x10020000 },
     .sdhci_irqs         = { 30, 31 },
+    /* sdhci-hisi.c: SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */
+    .sdhci_wp_inverted  = true,
 
     .num_i2c            = 3,
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 },
@@ -2084,11 +2162,20 @@ static const HisiSoCConfig hi3516dv200_soc = {
     .femac_irq          = 33,                              \
     .mipi_rx_base       = 0x11240000,                      \
     .mipi_rx_irq        = 45,                              \
+    /* hisi-aiao: audio capture / playback DMA.  The      \
+     * hisi-aiao entry in HISI_V4_REGBANK_LIST is skipped.  \
+     */                                                    \
+    .aiao_base          = 0x100e0000,                      \
+    .aiao_irq           = 42,                              \
     .rtc_base           = 0x120e0000,                      \
     .rtc_irq            = 0,                               \
     .num_sdhci          = 2,                                \
     .sdhci_bases        = { 0x10010000, 0x10020000 },       \
     .sdhci_irqs         = { 30, 31 },                       \
+    /* sdhci-goke.c (gk7205v200 kernel), sdhci-xmedia-common.c       \
+     * (gk7205v500) and sdhci-lotus-common.c (gk7206v100) all set     \
+     * SDHCI_QUIRK_INVERTED_WRITE_PROTECT. */                         \
+    .sdhci_wp_inverted  = true,                                     \
     .num_i2c            = 3,                                \
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000 }, \
     .vedu_base          = 0x11410000,                       \
@@ -2128,6 +2215,7 @@ static const HisiSoCConfig hi3516dv200_soc = {
 
 static const HisiSoCConfig gk7205v200_soc = {
     .name               = "gk7205v200",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7205V200 (Cortex-A7, ~Hi3516EV200)",
     .soc_id             = GOKE_SOC_ID_7205V200,
     .gpio_count         = 8,
@@ -2135,6 +2223,11 @@ static const HisiSoCConfig gk7205v200_soc = {
     HISI_V4_DDR_64M,                /* EV200 die: 512Mb DDR2 */
     HISI_V4_COMMON_PERIPH,
     HISI_V4_TIMER_CLOCKS,
+    /* USB 2.0 host (gk7205v200.dtsi): the same DWC3 at 0x10030000, GIC_SPI
+     * 39, dr_mode "host" as gk7201v200 -- see there. */
+    .xhci_base          = 0x10030000,
+    .xhci_irq           = 39,
+    .xhci_dwc3_core     = true,
 };
 
 /*
@@ -2165,15 +2258,25 @@ static const HisiSoCConfig gk7205v200_soc = {
  */
 static const HisiSoCConfig gk7201v200_soc = {
     .name               = "gk7201v200",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7201V200 (Cortex-A7, ~Hi3516EV200 stripped)",
     .soc_id             = GOKE_SOC_ID_7201V200,
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 */
     HISI_V4_COMMON_PERIPH,
+    /* USB 2.0 host (xm72050200.dtsi): a DWC3 at 0x10030000, GIC_SPI 39,
+     * dr_mode "host", probed by dwc3/core.c, which hands the xHCI at the
+     * start of its window to xhci-plat.  The board's only USB port is
+     * where the Wi-Fi dongle of a Wi-Fi-only camera sits (G3-WQ-G:
+     * ATBM6012B-X, `-device atbm-wifi,pid=0x888b,chip-version=0x4a`). */
+    .xhci_base          = 0x10030000,
+    .xhci_irq           = 39,
+    .xhci_dwc3_core     = true,
 };
 
 static const HisiSoCConfig gk7205v300_soc = {
     .name               = "gk7205v300",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7205V300 (Cortex-A7, ~Hi3516EV300)",
     .soc_id             = GOKE_SOC_ID_7205V300,
     .gpio_count         = 10,
@@ -2185,6 +2288,7 @@ static const HisiSoCConfig gk7205v300_soc = {
 
 static const HisiSoCConfig gk7202v300_soc = {
     .name               = "gk7202v300",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7202V300 (Cortex-A7, ~Hi3518EV300)",
     .soc_id             = GOKE_SOC_ID_7202V300,
     .gpio_count         = 8,
@@ -2195,6 +2299,7 @@ static const HisiSoCConfig gk7202v300_soc = {
 
 static const HisiSoCConfig gk7605v100_soc = {
     .name               = "gk7605v100",
+    HISI_V4_VIDEO_PIPE,
     .desc               = "Goke GK7605V100 (Cortex-A7, ~Hi3516DV200)",
     .soc_id             = GOKE_SOC_ID_7605V100,
     .gpio_count         = 10,
@@ -2608,6 +2713,19 @@ static const HisiSoCConfig hi3516cv608_soc = {
     .rtc_irq            = 37,
 
     .vedu_base          = 0x17140000,
+    .media_gen          = 5,
+    HISI_V5_VIDEO_PIPE,
+    /*
+     * sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel /
+     * sys_hal_svp_npu0_reset_sel (mod_sys.o).  All three are offsets
+     * from crg_base, as everywhere else here; the HALs' own literals are
+     * 0x5000 smaller, because they index g_reg_crg_base_addr, which
+     * sys_hal_init sets to ioremap(0x11015000), not the CRG's base.  So
+     * their 0x4b40 / 0x4ec0 / 0x1680 are 0x11019b40 / 0x11019ec0 /
+     * 0x11016680.
+     */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0, 0x6680 },
+    .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -2636,7 +2754,8 @@ static const HisiSoCConfig hi3516cv608_soc = {
 /*
  * Hi3516CV610: V5 generation (~2023) — Dual Cortex-A7 MP2, GICv2.
  * Completely new address map (0x11xxxxxx peripherals, GIC @ 0x124xxxxx).
- * No SP804 timer — uses ARM arch timer exclusively.
+ * The kernel times with the ARM arch timer; the one SP804 below is for
+ * U-Boot's udelay().
  * FEMAC-v2 with integrated FEPHY, "nebula,sdhci" for SD/MMC.
  * FMC memory window below registers at 0x0F000000.
  */
@@ -2711,6 +2830,19 @@ static const HisiSoCConfig hi3516cv610_soc = {
     .rtc_irq            = 37,
 
     .vedu_base          = 0x17140000,
+    .media_gen          = 5,
+    HISI_V5_VIDEO_PIPE,
+    /*
+     * sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel /
+     * sys_hal_svp_npu0_reset_sel (mod_sys.o).  All three are offsets
+     * from crg_base, as everywhere else here; the HALs' own literals are
+     * 0x5000 smaller, because they index g_reg_crg_base_addr, which
+     * sys_hal_init sets to ioremap(0x11015000), not the CRG's base.  So
+     * their 0x4b40 / 0x4ec0 / 0x1680 are 0x11019b40 / 0x11019ec0 /
+     * 0x11016680.
+     */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0, 0x6680 },
+    .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -2802,6 +2934,19 @@ static const HisiSoCConfig hi3516cv613_soc = {
     .rtc_irq            = 37,
 
     .vedu_base          = 0x17140000,
+    .media_gen          = 5,
+    HISI_V5_VIDEO_PIPE,
+    /*
+     * sys_hal_vpss_reset_sel / sys_hal_vgs_reset_sel /
+     * sys_hal_svp_npu0_reset_sel (mod_sys.o).  All three are offsets
+     * from crg_base, as everywhere else here; the HALs' own literals are
+     * 0x5000 smaller, because they index g_reg_crg_base_addr, which
+     * sys_hal_init sets to ioremap(0x11015000), not the CRG's base.  So
+     * their 0x4b40 / 0x4ec0 / 0x1680 are 0x11019b40 / 0x11019ec0 /
+     * 0x11016680.
+     */
+    .crg_rst_ack        = { 0x9b40, 0x9ec0, 0x6680 },
+    .default_sensor     = "sc4336p",
     .jpge_base          = 0x171C0000,
     .vedu_irq           = 69,
     .jpge_irq           = 70,
@@ -3522,6 +3667,11 @@ static const HisiSoCConfig hi3520dv200_soc = {
     .fmc_ctrl_base      = 0x10010000,
     .fmc_mem_base       = 0x58000000,
     .fmc_type           = "hisi-sfc350",
+    /* The NOR is on CS1 on every Hi3520DV200 board seen so far: the XiongMai
+     * NBD6808T-PL (whose kernel DT says flash@1) and the lab board's
+     * MX25L25635E.  The boot ROM and U-Boot read through the memory window,
+     * which does not depend on the select. */
+    .fmc_flash_cs       = 1,
 
     .num_i2c            = 1,
     .i2c_bases          = { 0x200d0000 },
@@ -5136,6 +5286,21 @@ static void hisi_register_uart_pre_enable_reset(const HisiSoCConfig *c)
     qemu_add_machine_init_done_notifier(&nf->notifier);
 }
 
+/*
+ * ARM926EJ-S TCM region registers, absent from QEMU's arm926.  They exist on
+ * every ARM926EJ-S whether or not TCM is fitted, and the Xiongmai V1 U-Boot
+ * (2010.06, 2012 build) writes the ITCM one in its start code
+ * (mcr p15, 0, r0, c9, c1, 1 with 0xd); without it that write is an
+ * Undefined Instruction before the exception stack exists, and the board
+ * never prints a line.  No TCM is modelled: they read as zero, size 0.
+ */
+static const ARMCPRegInfo hisi_arm926_tcm_cp_reginfo[] = {
+    { .name = "DTCMRR", .cp = 15, .crn = 9, .crm = 1, .opc1 = 0, .opc2 = 0,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+    { .name = "ITCMRR", .cp = 15, .crn = 9, .crm = 1, .opc1 = 0, .opc2 = 1,
+      .access = PL1_RW, .type = ARM_CP_CONST, .resetvalue = 0 },
+};
+
 static void hisilicon_common_init(MachineState *machine,
                                   const HisiSoCConfig *c)
 {
@@ -5172,6 +5337,11 @@ static void hisilicon_common_init(MachineState *machine,
          * Goke xmorca / GK7206).  Only the hisi-fmc model has this property. */
         if (c->fmc_variant && (!c->fmc_type || !strcmp(fmc_type, "hisi-fmc"))) {
             qdev_prop_set_uint32(fmc, "variant", c->fmc_variant);
+        }
+        /* The SoC's select, unless `-global hisi-sfc350.flash-cs=` chose one. */
+        if (c->fmc_flash_cs && fmc_type && !strcmp(fmc_type, "hisi-sfc350") &&
+            object_property_get_uint(OBJECT(fmc), "flash-cs", NULL) == 0xff) {
+            qdev_prop_set_uint8(fmc, "flash-cs", c->fmc_flash_cs);
         }
 
         /*
@@ -5378,6 +5548,9 @@ static void hisilicon_common_init(MachineState *machine,
         }
         qdev_realize(DEVICE(cpuobj[n]), NULL, &error_fatal);
         cpu[n] = ARM_CPU(cpuobj[n]);
+        if (!strcmp(machine->cpu_type, ARM_CPU_TYPE_NAME("arm926"))) {
+            define_arm_cp_regs(cpu[n], hisi_arm926_tcm_cp_reginfo);
+        }
     }
 
     /* Mask-ROM ELF (-bios) is loaded once CPU 0 exists; the registered
@@ -5557,6 +5730,15 @@ static void hisilicon_common_init(MachineState *machine,
         if (c->crg_pll_lock_offset) {
             qdev_prop_set_uint32(crg, "pll-lock-offset", c->crg_pll_lock_offset);
             qdev_prop_set_uint32(crg, "pll-lock-bits", c->crg_pll_lock_bits);
+        }
+        if (c->crg_rst_ack[0]) {
+            QList *acks = qlist_new();
+
+            for (n = 0; n < ARRAY_SIZE(c->crg_rst_ack) && c->crg_rst_ack[n];
+                 n++) {
+                qlist_append_int(acks, c->crg_rst_ack[n]);
+            }
+            qdev_prop_set_array(crg, "rst-ack", acks);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(crg), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(crg), 0, c->crg_base);
@@ -5776,6 +5958,7 @@ static void hisilicon_common_init(MachineState *machine,
         qdev_prop_set_uint8(sdhci, "sd-spec-version", 3);
         qdev_prop_set_uint8(sdhci, "uhs", UHS_I);
         qdev_prop_set_uint64(sdhci, "capareg", 0x017834b4);
+        qdev_prop_set_bit(sdhci, "wp-inverted", c->sdhci_wp_inverted);
         SysBusDevice *busdev = SYS_BUS_DEVICE(sdhci);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->sdhci_bases[n]);
@@ -5805,6 +5988,15 @@ static void hisilicon_common_init(MachineState *machine,
         }
     }
 
+    /* AIAO: audio in / out DMA (V4) */
+    if (c->aiao_base) {
+        DeviceState *aiao = qdev_new("hisi-aiao");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(aiao);
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->aiao_base);
+        sysbus_connect_irq(busdev, 0, pic[c->aiao_irq]);
+    }
+
     /* MIPI RX */
     if (c->mipi_rx_base) {
         DeviceState *mipi = qdev_new("hisi-mipi-rx");
@@ -5827,16 +6019,78 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vedu_base) {
         DeviceState *vedu = qdev_new("hisi-vedu");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vedu);
+        if (c->media_gen) {
+            qdev_prop_set_uint8(vedu, "gen", c->media_gen);
+        }
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->vedu_base);
         sysbus_mmio_map(busdev, 1, c->jpge_base);
-        /* Skip the VEDU IRQ wire when hisi-vi-fp also drives it —
-         * QEMU's GIC has one input level per SPI, so two devices
-         * sharing pic[N] clobber each other (last-writer-wins). */
-        if (!c->vi_fp_vedu_irq || c->vi_fp_vedu_irq != c->vedu_irq) {
-            sysbus_connect_irq(busdev, 0, pic[c->vedu_irq]);
-        }
+        sysbus_connect_irq(busdev, 0, pic[c->vedu_irq]);
         sysbus_connect_irq(busdev, 1, pic[c->jpge_irq]);
+    }
+
+    /*
+     * V5 IVE: the SVP NPU's task scheduler, over the first 64 KiB of the
+     * "hisi-npu" bank (mapped later, below it)
+     */
+    if (c->ive_npu_base) {
+        DeviceState *ive = qdev_new("hisi-ive-npu");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(ive);
+
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map_overlap(busdev, 0, c->ive_npu_base, 1);
+        sysbus_connect_irq(busdev, 0, pic[c->ive_npu_irq[0]]);
+        sysbus_connect_irq(busdev, 1, pic[c->ive_npu_irq[1]]);
+    }
+
+    /*
+     * The scene in front of the camera (docs/hisilicon-digital-twin.md):
+     * what VI's statistics measure and VPSS's pictures show.
+     */
+    DeviceState *scene = NULL;
+    if (c->vi_cap_base) {
+        scene = qdev_new("hisi-scene");
+        object_property_add_child(OBJECT(machine), "scene", OBJECT(scene));
+        qdev_realize_and_unref(scene, NULL, &error_fatal);
+    }
+
+    /* VI: capture and the ISP pipe, the online pipeline's frame clock */
+    DeviceState *vi = NULL;
+    if (c->vi_cap_base) {
+        vi = qdev_new("hisi-vi");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(vi);
+        if (c->media_gen) {
+            qdev_prop_set_uint8(vi, "gen", c->media_gen);
+        }
+        object_property_set_link(OBJECT(vi), "scene", OBJECT(scene),
+                                 &error_fatal);
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->vi_cap_base);
+        sysbus_mmio_map(busdev, 1, c->vi_proc_base);
+        sysbus_connect_irq(busdev, 0, pic[c->vi_cap_irq]);
+        sysbus_connect_irq(busdev, 1, pic[c->vi_proc_irq]);
+    }
+
+    /* VPSS, the online pipeline's frame source */
+    if (c->vpss_base) {
+        DeviceState *vpss = qdev_new("hisi-vpss");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(vpss);
+        if (c->media_gen) {
+            qdev_prop_set_uint8(vpss, "gen", c->media_gen);
+        }
+        if (scene) {
+            object_property_set_link(OBJECT(vpss), "scene", OBJECT(scene),
+                                     &error_fatal);
+        }
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->vpss_base);
+        sysbus_connect_irq(busdev, 0, pic[c->vpss_irq]);
+        if (vi) {
+            qdev_connect_gpio_out_named(vi, "frame", 0,
+                qdev_get_gpio_in_named(vpss, "vi-frame", 0));
+            qdev_connect_gpio_out_named(vpss, "running", 0,
+                qdev_get_gpio_in_named(vi, "run", 0));
+        }
     }
 
     /* Hardware True Random Number Generator
@@ -5849,20 +6103,6 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_mmio_map(busdev, 0, c->hwrng_base);
     }
 
-    /* VI frame producer — periodic VI_CAP/VI_PROC/VPSS IRQ heartbeat
-     * to wake the vendor MPP pipeline.  MVP, EV300 only for now. */
-    if (c->vi_fp_base) {
-        DeviceState *vifp = qdev_new("hisi-vi-fp");
-        SysBusDevice *busdev = SYS_BUS_DEVICE(vifp);
-        sysbus_realize_and_unref(busdev, &error_fatal);
-        sysbus_mmio_map(busdev, 0, c->vi_fp_base);
-        sysbus_connect_irq(busdev, 0, pic[c->vi_fp_cap_irq]);
-        sysbus_connect_irq(busdev, 1, pic[c->vi_fp_proc_irq]);
-        sysbus_connect_irq(busdev, 2, pic[c->vi_fp_vpss_irq]);
-        if (c->vi_fp_vedu_irq) {
-            sysbus_connect_irq(busdev, 3, pic[c->vi_fp_vedu_irq]);
-        }
-    }
 
     /* Watchdog (SP805-compatible, reuse cmsdk-apb-watchdog) */
     if (c->wdt_base) {
@@ -5929,7 +6169,13 @@ static void hisilicon_common_init(MachineState *machine,
         }
         SysBusDevice *busdev = SYS_BUS_DEVICE(xhci);
         sysbus_realize_and_unref(busdev, &error_fatal);
-        sysbus_mmio_map(busdev, 0, c->xhci_base);
+        if (c->xhci_dwc3_core) {
+            /* Above the "hisi-usb3" regbank that covers the whole DWC3
+             * window and answers the core's global registers. */
+            sysbus_mmio_map_overlap(busdev, 0, c->xhci_base, 1);
+        } else {
+            sysbus_mmio_map(busdev, 0, c->xhci_base);
+        }
         sysbus_connect_irq(busdev, 0, pic[c->xhci_irq]);
     }
 
@@ -5961,7 +6207,11 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* Generic register banks (pin mux, DDR PHY, PWM, etc.) */
     for (n = 0; n < c->num_regbanks; n++) {
-        if (c->regbanks[n].base) {
+        if (c->regbanks[n].base &&
+            c->regbanks[n].base != c->vi_cap_base &&
+            c->regbanks[n].base != c->vi_proc_base &&
+            c->regbanks[n].base != c->vpss_base &&
+            c->regbanks[n].base != c->aiao_base) {
             /* IVE gets a proper functional device instead of regbank */
             if (!strcmp(c->regbanks[n].name, "hisi-ive")) {
                 DeviceState *ive = qdev_new("hisi-ive");
@@ -5984,11 +6234,37 @@ static void hisilicon_common_init(MachineState *machine,
             }
 
             DeviceState *rb = qdev_new("hisi-regbank");
+            bool dwc3 = c->xhci_dwc3_core &&
+                        c->regbanks[n].base == c->xhci_base;
             qdev_prop_set_uint32(rb, "size", c->regbanks[n].size);
             qdev_prop_set_string(rb, "name", c->regbanks[n].name);
+            if (dwc3) {
+                /* DCTL.CSFTRST: dwc3_soft_reset() waits for it to clear */
+                qdev_prop_set_uint32(rb, "autoclear-offset", 0xc704);
+                qdev_prop_set_uint32(rb, "autoclear-mask", 1u << 30);
+            }
 
             sysbus_realize_and_unref(SYS_BUS_DEVICE(rb), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(rb), 0, c->regbanks[n].base);
+
+            if (dwc3) {
+                /* What dwc3_core_init() and dwc3_get_dr_mode() read:
+                 * GSNPSID a DWC_usb3 2.90a; GHWPARAMS0 a dual-role core
+                 * (the device tree's dr_mode then makes it a host) with a
+                 * 64-bit master bus; GHWPARAMS3 no SuperSpeed PHY and a
+                 * UTMI+ high-speed one, as the board's USB 2.0 port. */
+                static const struct { hwaddr off; uint32_t val; } id[] = {
+                    { 0xc120, 0x5533290a },     /* GSNPSID */
+                    { 0xc140, 0x00004002 },     /* GHWPARAMS0 */
+                    { 0xc14c, 0x00000004 },     /* GHWPARAMS3 */
+                };
+                for (int k = 0; k < ARRAY_SIZE(id); k++) {
+                    address_space_stl(&address_space_memory,
+                                      c->regbanks[n].base + id[k].off,
+                                      id[k].val, MEMTXATTRS_UNSPECIFIED,
+                                      NULL);
+                }
+            }
 
             if (!strcmp(c->regbanks[n].name, "hisi-nandc")) {
                 address_space_stl(&address_space_memory,
@@ -6043,90 +6319,14 @@ static void hisilicon_common_init(MachineState *machine,
             DeviceState *sensor = qdev_new("hisi-imx122");
             qdev_realize_and_unref(sensor, ssi_bus, &error_fatal);
         } else if (sensor_name && c->num_i2c > 0 && i2c_devs[0]) {
-            BusState *i2c_bus = qdev_get_child_bus(i2c_devs[0], "i2c");
-            DeviceState *sensor = NULL;
-            uint8_t i2c_addr = 0;
+            DeviceState *sensor = image_sensor_create(
+                I2C_BUS(qdev_get_child_bus(i2c_devs[0], "i2c")), sensor_name);
 
-            if (!strcmp(sensor_name, "imx335")) {
-                sensor = qdev_new("hisi-imx335");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx307")) {
-                sensor = qdev_new("hisi-imx307");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx291")) {
-                sensor = qdev_new("hisi-imx291");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx415")) {
-                sensor = qdev_new("hisi-imx415");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "imx385")) {
-                sensor = qdev_new("hisi-imx385");
-                i2c_addr = 0x1A;
-            } else if (!strcmp(sensor_name, "f37")) {
-                sensor = qdev_new("hisi-f37");
-                i2c_addr = 0x40;
-            } else if (!strcmp(sensor_name, "gc2053")) {
-                sensor = qdev_new("hisi-gc2053");
-                i2c_addr = 0x37;
-            } else if (!strcmp(sensor_name, "sp2305")) {
-                sensor = qdev_new("hisi-sp2305");
-                i2c_addr = 0x3C;
-            } else if (!strcmp(sensor_name, "mis2006")) {
-                sensor = qdev_new("hisi-mis2006");
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "nvp6124b")) {
-                sensor = qdev_new("hisi-nvp6124b");
-                i2c_addr = 0x60;          /* 7-bit; vendor uses 0x60..0x66 */
-            } else if (!strcmp(sensor_name, "sc2315e")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x22);
-                qdev_prop_set_uint8(sensor, "id_low",  0x38);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2315")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x23);
-                qdev_prop_set_uint8(sensor, "id_low",  0x11);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2235p")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x22);
-                qdev_prop_set_uint8(sensor, "id_low",  0x32);
-                qdev_prop_set_uint8(sensor, "disc",    0x01);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2235e")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0x22);
-                qdev_prop_set_uint8(sensor, "id_low",  0x32);
-                qdev_prop_set_uint8(sensor, "disc",    0x20);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2335")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0xCB);
-                qdev_prop_set_uint8(sensor, "id_low",  0x14);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc2239")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0xCB);
-                qdev_prop_set_uint8(sensor, "id_low",  0x10);
-                i2c_addr = 0x30;
-            } else if (!strcmp(sensor_name, "sc307h")) {
-                sensor = qdev_new("hisi-smartsens");
-                qdev_prop_set_uint8(sensor, "id_high", 0xCB);
-                qdev_prop_set_uint8(sensor, "id_low",  0x1C);
-                i2c_addr = 0x30;
-            } else {
-                error_report("Unknown sensor '%s' (supported: imx291, "
-                             "imx307, imx335, imx385, imx415, f37, "
-                             "gc2053, sp2305, mis2006, nvp6124b, "
-                             "sc2235p, sc2235e, sc2315, sc2315e, sc2335, "
-                             "sc2239, sc307h, imx122, imx222; or 'none' "
-                             "to disable default)",
-                             sensor_name);
-                exit(1);
+            if (vi && sensor) {
+                /* the ISP's statistics measure the sensor's exposure */
+                object_property_set_link(OBJECT(vi), "sensor",
+                                         OBJECT(sensor), &error_fatal);
             }
-
-            qdev_prop_set_uint8(sensor, "address", i2c_addr);
-            qdev_realize_and_unref(sensor, i2c_bus, &error_fatal);
         } else if (sensor_name) {
             error_report("sensor '%s' requested but this SoC has no I2C "
                          "or matching SPI controller", sensor_name);

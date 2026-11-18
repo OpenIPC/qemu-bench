@@ -9,3 +9,6 @@ qemu-boot/ipctool
 qemu-boot/qemu-*.log
 u-boot-hi3516cv200-universal.bin
 qemu-boot/sata-*.img
+tmp/
+tmp-*.log
+__pycache__/
