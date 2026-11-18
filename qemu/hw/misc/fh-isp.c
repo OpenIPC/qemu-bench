@@ -252,7 +252,9 @@ static void fh_isp_render(FhIspState *s, FhIspChan *ch)
     double wb[3];
     uint32_t bx, x, y;
 
-    if (!w || !h || w > FRAME_MAX_W || h > FRAME_MAX_H || stride < w) {
+    /* the driver's stride is the width; a wider one is a guest error */
+    if (!w || !h || w > FRAME_MAX_W || h > FRAME_MAX_H || stride < w ||
+        stride > FRAME_MAX_W) {
         qemu_log_mask(LOG_GUEST_ERROR, "fh-isp: channel %ux%u stride %u\n",
                       ch->w, ch->h, stride);
         return;
@@ -266,7 +268,9 @@ static void fh_isp_render(FhIspState *s, FhIspChan *ch)
             for (bx = 0; bx < nbx; bx++) {
                 double lvl[3], r, g, b;
 
-                fh_isp_levels(s, (bx * 8 + 4.0) / w, (y + 4.0) / h, lvl);
+                /* the block's centre, clipped to the frame */
+                fh_isp_levels(s, (bx * 8 + MIN(8, w - bx * 8) / 2.0) / w,
+                              (y + MIN(8, h - y) / 2.0) / h, lvl);
                 r = fh_isp_gamma(lvl[0] * wb[0]);
                 g = fh_isp_gamma(lvl[1] * wb[1]);
                 b = fh_isp_gamma(lvl[2] * wb[2]);
@@ -594,10 +598,17 @@ static const VMStateDescription vmstate_fh_isp_chan = {
     },
 };
 
+static int fh_isp_post_load(void *opaque, int version_id)
+{
+    fh_isp_update_irq(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_fh_isp = {
     .name = TYPE_FH_ISP,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = fh_isp_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, FhIspState, FH_ISP_SIZE / 4),
         VMSTATE_UINT32(status, FhIspState),

@@ -205,6 +205,12 @@ if [ $ARC -eq 1 ]; then
             -o "$CAPTURE" "$(dirname "$0")/fh-v4l2-capture.c" -lgcc
     fi
     ARCLOG=$WORK/arc.log
+    for f in "$CLIENT" "$CAPTURE"; do
+        if [ "$(stat -c %s "$f")" -gt 65536 ]; then
+            echo "$f: over the 64 KiB slot it is given" >&2
+            exit 2
+        fi
+    done
     make_image "$IMG"
     # rootfs_data (0x750000) carries the boot's script, then the clients,
     # 64 KiB apart: the kernel command line holds 1024 bytes, not a script.
@@ -278,6 +284,7 @@ EOF
     check "100 NV12 frames from /dev/video0, changing" 'capture: ok'
     grep -a '^capture: [0-9]' "$ARCLOG" | head -1 | sed 's/^/  /'
     if awk '/^capture: [0-9]/ {
+                seen = 1
                 for (i = 1; i <= NF; i++) {
                     if ($i == "exposure") { e0 = $(i + 1); e1 = $(i + 3) }
                     if ($i == "gain") { g0 = $(i + 1); g1 = $(i + 3) }
@@ -288,7 +295,7 @@ EOF
                      w[1] >= 672 && w[1] <= 714 && w[2] >= 1243 && w[2] <= 1321
                 exit !ok
             }
-            END { if (!NR) exit 1 }' "$ARCLOG"; then
+            END { if (!seen) exit 1 }' "$ARCLOG"; then
         echo "  PASS: AE moved the sensor, AWB at the light's gains"
     else
         echo "  FAIL: AE moved the sensor, AWB at the light's gains"

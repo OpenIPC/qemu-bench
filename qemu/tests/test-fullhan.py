@@ -1159,6 +1159,12 @@ def test_fh8626_isp(qemu):
         if os.environ.get('FH_ISP_PPM'):
             with open(os.environ['FH_ISP_PPM'], 'wb') as f:
                 f.write(b'P5 %d %d 255\n' % (w, h) + y)
+        # a stride past the largest frame is not written (host memory)
+        qt.write(buf_c, bytes(64))
+        qt.writel(ISP + 0x9B4 + 24, 0xFFFF)
+        qt.step(80000000)
+        check('channel 2 with a 65535-byte stride: not written',
+              qt.read(buf_c, 64), bytes(64))
         qt.writel(CSI + 0x08, 0)
         qt.writel(ISP + 0x04, 0xFFFFFFFF)
         qt.step(100000000)

@@ -6,7 +6,7 @@
  *   fh-v4l2-capture <video node> <sensor subdev> <isp subdev> [frames]
  *
  * Streams NV12 through MMAP buffers and checks each one: the payload is a
- * whole frame, the sequence advances, and the picture is not blank and
+ * whole frame, the sequence advances, the picture is not blank, and it
  * changes from frame to frame (the model's scene has a moving box).  The
  * sensor's EXPOSURE and ANALOGUE_GAIN controls and the ISP's red and blue
  * balance (Q9) are read before and after: with fh8626-3ad running, its AE
@@ -290,6 +290,9 @@ void run(int argc, char **argv)
         }
         last_seq = b.sequence;
         last_y = y_mean(map[b.index]);
+        if (last_y <= 16 || last_y >= 235) {
+            fail("picture level", last_y);
+        }
         sum = checksum(map[b.index]);
         if (!got) {
             first_seq = b.sequence;
@@ -337,9 +340,6 @@ void run(int argc, char **argv)
     put("/");
     put_num(b1);
     put("\n");
-    if (last_y <= 16 || last_y >= 235) {
-        fail("picture level", last_y);
-    }
     if (changed < got / 2) {
         fail("frames changing", changed);
     }
