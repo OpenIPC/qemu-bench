@@ -237,6 +237,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicAvpuState, INGENIC_AVPU)
 #define AK_START_ENC2       (1u << 3)
 #define AK_START_JPEG       (1u << 4)
 #define AK_CORE(c)          (0x200 * ((c) + 1))
+/*
+ * The EV300 has one Allegro core, and libakv_encode starts only core 0;
+ * starts and status pages of others are not modelled (each would need its
+ * own interrupt bits, 4c and 4c + 2, which meet JPEG's 18 at core 4).
+ */
+#define AK_NCORES           1
 #define AK_STATUS           0x100
 #define AK_STATUS_ENC1      (1u << 0)
 #define AK_STATUS_OVERFLOW  (1u << 1)
@@ -2321,7 +2327,7 @@ static bool avpu_ak_is_start(hwaddr off)
 
 static uint64_t avpu_reg_read_ak(IngenicAvpuState *s, hwaddr off)
 {
-    if (off >= AK_CORE(0) && off < AVPU_REGS_SIZE) {
+    if (off >= AK_CORE(0) && off < AK_CORE(AK_NCORES)) {
         if (off % AK_CORE(0) == AK_STATUS) {
             return avpu_ak_status(s, off / AK_CORE(0) - 1);
         }
@@ -2355,7 +2361,15 @@ static bool avpu_reg_write_ak(IngenicAvpuState *s, hwaddr off, uint32_t val)
         return true;
     }
     if (avpu_ak_is_start(off)) {
-        avpu_start_ak(s, (off - AK_START(0)) / 0x10, val);
+        int core = (off - AK_START(0)) / 0x10;
+
+        if (core >= AK_NCORES) {
+            qemu_log_mask(LOG_GUEST_ERROR, "ingenic-avpu: start 0x%x of core "
+                          "%d, which this block does not have\n", val, core);
+            s->regs[off / 4] = val;
+            return true;
+        }
+        avpu_start_ak(s, core, val);
         return true;
     }
     if (off >= AVPU_REGS_SIZE) {
@@ -2580,11 +2594,13 @@ static const Property avpu_props[] = {
 static const VMStateDescription vmstate_avpu = {
     .name = TYPE_INGENIC_AVPU,
     .version_id = 3,
-    .minimum_version_id = 3,
+    .minimum_version_id = 2,
     .pre_save = avpu_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, IngenicAvpuState),
-        VMSTATE_UINT32_ARRAY(regs, IngenicAvpuState, AVPU_NREGS),
+        /* the window version 2 had; Anyka's larger one follows, from 3 */
+        VMSTATE_UINT32_SUB_ARRAY(regs, IngenicAvpuState, 0,
+                                 AVPU_REGS_SIZE2 / 4),
         VMSTATE_UINT32(irq_status, IngenicAvpuState),
         VMSTATE_UINT32(njobs, IngenicAvpuState),
         VMSTATE_UINT32_ARRAY(job_kind, IngenicAvpuState, AVPU_MAX_JOBS),
@@ -2592,6 +2608,9 @@ static const VMStateDescription vmstate_avpu = {
         VMSTATE_UINT32_ARRAY(job_core, IngenicAvpuState, AVPU_MAX_JOBS),
         VMSTATE_UINT32(pending, IngenicAvpuState),
         VMSTATE_UINT32(jpeg_count, IngenicAvpuState),
+        VMSTATE_SUB_ARRAY(regs, IngenicAvpuState, AVPU_REGS_SIZE2 / 4,
+                          AVPU_NREGS - AVPU_REGS_SIZE2 / 4, 3,
+                          vmstate_info_uint32, uint32_t),
         VMSTATE_END_OF_LIST()
     }
 };
