@@ -248,12 +248,11 @@ static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
         }
         for (y = 0; y < 8; y++) {
             for (x = 0; x < 8; x++) {
-                const int x0 = mx * 8 + x + ix;
-                const int y0 = my * 8 + y + iy + p->ry0 / 2;
-                const int xa = clampi(x0, 0, cw - 1);
-                const int xb = clampi(x0 + 1, 0, cw - 1);
-                const int ya = clampi(y0, 0, ch - 1);
-                const int yb = clampi(y0 + 1, 0, ch - 1);
+                const int sx = x0 + x, sy = y0 + y;
+                const int xa = clampi(sx, 0, cw - 1);
+                const int xb = clampi(sx + 1, 0, cw - 1);
+                const int ya = clampi(sy, 0, ch - 1);
+                const int yb = clampi(sy + 1, 0, ch - 1);
 
                 pc[comp][y * 8 + x] =
                     ((8 - fx) * (8 - fy) * r[ya * cw + xa] +
