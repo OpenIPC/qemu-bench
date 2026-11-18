@@ -170,7 +170,10 @@ if [ $ARC -eq 1 ]; then
     SCRIPT="mount -t proc p /proc; mount -t sysfs s /sys"
     SCRIPT="$SCRIPT; mount -t tmpfs t /tmp"
     SCRIPT="$SCRIPT; modprobe virtio_rpmsg_bus; modprobe rpmsg_char"
-    SCRIPT="$SCRIPT; echo start > $rp; sleep 1"
+    # The channel appears when the ARC's announcement is taken: wait for it.
+    SCRIPT="$SCRIPT; echo start > $rp; i=0"
+    SCRIPT="$SCRIPT; while [ \$i -lt 20 ] && ! ls /sys/bus/rpmsg/devices/*arc-echo*"
+    SCRIPT="$SCRIPT >/dev/null 2>&1; do sleep 1; i=\$((i + 1)); done"
     SCRIPT="$SCRIPT; for d in /sys/bus/rpmsg/devices/*arc-echo*; do"
     SCRIPT="$SCRIPT echo rpmsg_chrdev > \$d/driver_override;"
     SCRIPT="$SCRIPT echo \${d##*/} > /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind;"

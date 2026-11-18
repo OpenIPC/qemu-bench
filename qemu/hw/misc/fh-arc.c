@@ -257,21 +257,25 @@ static bool fh_arc_st(uint32_t addr, unsigned zz, uint32_t val)
     return res == MEMTX_OK;
 }
 
-/* The address an LD / ST uses, and the base register's write-back. */
-static uint32_t fh_arc_ea(FhArcState *s, unsigned b, uint32_t base,
-                          uint32_t off, unsigned aa, unsigned zz)
+/*
+ * The address an LD / ST uses, and whether the base register is to be
+ * written back (with *wb) -- only once the access has succeeded, so a
+ * faulting one leaves it as it was.
+ */
+static uint32_t fh_arc_ea(uint32_t base, uint32_t off, unsigned aa,
+                          unsigned zz, bool *update, uint32_t *wb)
 {
+    static const uint8_t scale[3] = { 2, 0, 1 };    /* word, byte, half */
+
+    *update = aa == 1 || aa == 2;
+    *wb = base + off;
     switch (aa) {
-    case 1:                                     /* .a: pre-update */
-        fh_arc_set(s, b, base + off);
-        return base + off;
     case 2:                                     /* .ab: post-update */
-        fh_arc_set(s, b, base + off);
         return base;
     case 3:                                     /* .as: scaled */
-        return base + (off << (zz == 2 ? 1 : 2));
+        return base + (off << scale[zz]);
     }
-    return base + off;
+    return base + off;                          /* also .a: pre-update */
 }
 
 static uint32_t fh_arc_lr(FhArcState *s, uint32_t aux)
@@ -540,15 +544,19 @@ static void fh_arc_step(FhArcState *s)
         uint32_t off = sext(((insn >> 15) & 1) << 8 | ((insn >> 16) & 0xFF),
                             9);
         unsigned zz = (insn >> 7) & 3;
-        uint32_t ea = fh_arc_ea(s, b, fh_arc_reg(s, &in, b), off,
-                                (insn >> 9) & 3, zz);
-        uint32_t val;
+        uint32_t ea, wb, val;
+        bool update;
 
         if (zz == 3) {
             goto insnerr;
         }
+        ea = fh_arc_ea(fh_arc_reg(s, &in, b), off, (insn >> 9) & 3, zz,
+                       &update, &wb);
         if (!fh_arc_ld(ea, zz, (insn >> 6) & 1, &val)) {
             goto memerr;
+        }
+        if (update) {
+            fh_arc_set(s, b, wb);
         }
         fh_arc_set(s, insn & 0x3F, val);
         ok = true;
@@ -560,14 +568,19 @@ static void fh_arc_step(FhArcState *s)
                             9);
         unsigned zz = (insn >> 1) & 3;
         uint32_t val = fh_arc_reg(s, &in, (insn >> 6) & 0x3F);
-        uint32_t ea;
+        uint32_t ea, wb;
+        bool update;
 
         if (zz == 3) {
             goto insnerr;
         }
-        ea = fh_arc_ea(s, b, fh_arc_reg(s, &in, b), off, (insn >> 3) & 3, zz);
+        ea = fh_arc_ea(fh_arc_reg(s, &in, b), off, (insn >> 3) & 3, zz,
+                       &update, &wb);
         if (!fh_arc_st(ea, zz, val)) {
             goto memerr;
+        }
+        if (update) {
+            fh_arc_set(s, b, wb);
         }
         s->stores++;
         ok = true;
@@ -615,8 +628,8 @@ static void fh_arc_tick(void *opaque)
     }
     if (s->stores != stores) {
         s->period_ns = FH_ARC_SLICE_NS;
-    } else if (s->period_ns < FH_ARC_IDLE_MAX_NS) {
-        s->period_ns *= 2;
+    } else {
+        s->period_ns = MIN(s->period_ns * 2, FH_ARC_IDLE_MAX_NS);
     }
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               s->period_ns);

@@ -821,10 +821,10 @@ def arc_ld(a, b, s9=0, zz=0, x=0, aa=0):
             1 << 11 | aa << 9 | zz << 7 | x << 6 | a]
 
 
-def arc_st(c, b, s9=0, zz=0):
+def arc_st(c, b, s9=0, zz=0, aa=0):
     v = s9 & 0x1FF
     return [3 << 27 | arc_b(b) | (v & 0xFF) << 16 | (v >> 8) << 15 |
-            c << 6 | 1 << 5 | zz << 1]
+            c << 6 | 1 << 5 | aa << 3 | zz << 1]
 
 
 def arc_bcc(disp, cc):
@@ -938,6 +938,22 @@ def test_fh8626_arc(qemu):
     a.add(arc_st(16, 25, 68))
     a.add(arc_alu(0x2A, 0, 20, u6=4))                   # lr IDENTITY
     a.add(arc_st(20, 25, 72))
+    a.add(arc_ld(20, 16, 1, aa=3))                      # ld.as [r16, 1]
+    a.add(arc_ld(21, 16, 1, zz=2, aa=3))                # ldh.as [r16, 1]
+    a.add(arc_st(20, 25, 84))
+    a.add(arc_st(21, 25, 88))
+    # faults: the handler ('x') logs ILINK2 and the bases, goes on at r28
+    a.add(arc_mov(24, limm=data + 0x80))
+    a.add(arc_mov(26, limm=0x40000000))         # nothing there
+    a.add(arc_mov(27, limm=data))
+    a.branch(lambda d: arc_mov(28, limm=entry + d), 'f1')
+    L['memerr'] = a.pc()
+    a.add(arc_ld(23, 26, 4, aa=2))              # ld.ab: memory error
+    L['f1'] = a.pc()
+    a.branch(lambda d: arc_mov(28, limm=entry + d), 'f2')
+    L['rsv'] = a.pc()
+    a.add(arc_ld(23, 27, 4, zz=3, aa=1))        # ld.a, reserved size
+    L['f2'] = a.pc()
     # the doorbell to the ARM, then wait for the ARM's
     a.add(arc_mov(21, limm=0xF00001F0))
     a.add(arc_mov(22, u6=1))
@@ -947,14 +963,24 @@ def test_fh8626_arc(qemu):
     a.add(arc_ld(23, 21))
     a.branch(lambda d: arc_br(23, d, 0, u6=0), 'kick')  # breq r23, 0
     a.add(arc_st(23, 25, 76))
+    a.branch(lambda d: arc_mov(28, limm=entry + d), 'end')
     L['bad'] = a.pc()
     a.add([0x78E078E0])                         # nop_s: 16-bit, not modelled
     L['sub'] = a.pc()
     a.add(arc_mov(14, u6=0x2A))
     a.add(arc_alu(0x20, 0, 0, 31))                      # j [blink]
     L['x'] = a.pc()
-    a.add(arc_st(30, 25, 80))                   # ILINK2: where it faulted
+    a.add(arc_st(30, 24, 4, aa=2))              # ILINK2: where it faulted
+    a.add(arc_st(26, 24, 4, aa=2))
+    a.add(arc_st(27, 24, 4, aa=2))
+    a.add(arc_alu(0x20, 0, 0, 28))                      # j [r28]
+    L['end'] = a.pc()
     a.add(arc_bself())
+    # the continuations are absolute: mov r28, limm
+    for i, make, label in a.fix:
+        if a.words[i] >> 27 == 4:
+            a.words[i + 1] = L[label]
+    a.fix = [f for f in a.fix if a.words[f[0]] >> 27 != 4]
     prog = a.link(L)
     # the error vectors' long immediates: both go to 'x'
     prog = prog[:8] + arc_words(arc_j(L['x'])) * 2 + prog[24:]
@@ -992,6 +1018,15 @@ def test_fh8626_arc(qemu):
         check('ld.ab wrote the base back', d[17], data + 0x104)
         check('stb and sth', qt.readl(data + 0x108), 0x56780078)
         check('LR IDENTITY: ARC600', d[18], 0x22)
+        # from r16 = data + 0x104, after the ld.ab
+        check('ld.as, ldh.as: scaled by the size (+4, +2)',
+              w([qt.readl(data + 84), qt.readl(data + 88)]),
+              w([0x56780078, 0xFFFF]))
+        f = [qt.readl(data + 0x80 + 4 * i) for i in range(9)]
+        check('ld.ab from nothing: memory error, base kept',
+              w(f[0:2]), w([L['memerr'], 0x40000000]))
+        check('ld.a of a reserved size: instruction error, base kept',
+              w([f[3], f[5]]), w([L['rsv'], data]))
         check('doorbell 0x1F0 bit 0', qt.readl(PMU + 0x1F0), 1)
         check('raises IRQ 32', qt.readl(INTC + 0x1C) & 1, 1)
         qt.writel(PMU + 0x1F0, 0)
@@ -1001,7 +1036,7 @@ def test_fh8626_arc(qemu):
         qt.step(1000)
         check('kicked: goes on at once', qt.readl(data + 76), 5)
         check('16-bit nop_s: instruction error, ILINK2',
-              qt.readl(data + 80), L['bad'])
+              qt.readl(data + 0x80 + 24), L['bad'])
         qt.writel(PMU + 0x1C4, 0)               # reset, then again
         qt.writel(PMU + 0x1C4, 1 << 18)
         qt.step(2000000)
