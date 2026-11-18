@@ -192,6 +192,13 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
         run: python3 qemu/tests/test-xm-h1-h264.py
 
+      # Two channels of one size with different headers, their jobs
+      # alternating as majestic's main and D1 channels do: each must decode
+      # on its own (one stream state per channel, chained by REF/RECON).
+      - name: Hantro H1 H.264, two channels interleaved (xm-h1)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
+        run: python3 qemu/tests/test-xm-h1-h264.py --interleave
+
       # HiSilicon V4 VEDU (H.264 / H.265) and JPGE, driven the way the
       # HiMPP driver drives them: its parameter-set packets in the stream
       # ring, its H.265 slice header bits in the register image, its JFIF

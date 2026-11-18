@@ -272,7 +272,7 @@ static uint32_t xm_h1_jpeg(XmH1State *s)
 }
 
 /* The stream state of the channel this job belongs to (see XmH1State). */
-static H264Enc *xm_h1_h264_chan(XmH1State *s, int mbw, int mbh)
+static H264Enc *xm_h1_h264_chan(XmH1State *s, int mbw, int mbh, bool idr)
 {
     const uint32_t ref = s->regs[H1_REG_ADDR_REF_LUMA / 4];
     int i, pick = -1;
@@ -282,7 +282,10 @@ static H264Enc *xm_h1_h264_chan(XmH1State *s, int mbw, int mbh)
             pick = i;
         }
     }
-    for (i = 0; i < ARRAY_SIZE(s->chan) && pick < 0; i++) {
+    /* a P picture whose reference is no stream's last: the stream of its
+     * size; an IDR that continues no stream starts one of its own, so two
+     * channels of one size stay apart */
+    for (i = 0; i < ARRAY_SIZE(s->chan) && pick < 0 && !idr; i++) {
         if (s->chan[i].used && s->chan[i].mbw == mbw &&
             s->chan[i].mbh == mbh) {
             pick = i;
@@ -318,6 +321,7 @@ static uint32_t xm_h1_h264(XmH1State *s)
                          s->regs[H1_REG_STR_HDR_REM_LSB / 4];
     uint8_t rem_bytes[8];
     uint8_t hdr[512 + 8];
+    H264Enc *enc;
     size_t hdr_at = 512;                /* the headers' start in hdr, if any */
     int i, nrem = rem_bits / 8;
 
@@ -329,7 +333,7 @@ static uint32_t xm_h1_h264(XmH1State *s)
     if (!xm_h1_geometry_ok(s, "H.264", mbw, mbh, stride)) {
         return H1_INT_ERROR;
     }
-    H264Enc *enc = xm_h1_h264_chan(s, mbw, mbh);
+    enc = xm_h1_h264_chan(s, mbw, mbh, idr);
     if (rem_bits % 8) {
         qemu_log_mask(LOG_UNIMP, "xm-h1: %d header bits, not whole bytes\n",
                       rem_bits);

@@ -28,9 +28,11 @@
 #          feeder; since the 2026-11-17 release majestic also encodes its
 #          1920x1080 main channel as H.264)
 #
-# The H1 serves every H.264 channel majestic runs, so the jobs are split by
-# the picture size in their ENC_CTRL (the .regs dump beside each job) and
-# each channel is checked on its own; --size must be one of them.
+# The H1 serves every H.264 channel majestic runs, so the jobs are split
+# into channels the way the H1 chains them -- a job's reference (0x01c) is
+# the picture its channel's last job rebuilt (0x024), from the .regs dump
+# beside each job -- and each channel is checked on its own; one of them must
+# decode at --size, with the VI frame number rising.
 #   xm510  xm510 release, mem=18M of 32M as U-Boot passes it (three VI
 #          buffers), 1 CPU, 1280x720
 #
@@ -155,26 +157,36 @@ for name in sorted(os.listdir(dump)):
 check(idrs >= 2 and not bad,
       '%d IDR jobs, %d without their own SPS/PPS (want >= 2 and 0)' % (idrs, bad))
 
-# 2./4. per channel: the jobs grouped by ENC_CTRL's picture size
-def enc_size(name):
+# 2./4. per channel: a job's reference is its channel's last reconstruction
+def regs(name):
+    r = {}
     for l in open(os.path.join(dump, name[:-len('.h264')] + '.regs')):
         a, v = l.split()
-        if int(a, 16) == 0x38:
-            v = int(v, 16)
-            return ((v >> 19) & 0x1ff) * 16, ((v >> 10) & 0x1ff) * 16
-    return 0, 0
+        r[int(a, 16)] = int(v, 16)
+    return r
 
-channels = {}
+chains = []                             # [last reconstruction, size, jobs]
 for name in sorted(os.listdir(dump)):
-    if name.endswith('.h264'):
-        channels.setdefault(enc_size(name), []).append(name)
-# coded heights round up to 16: 1080 is coded as 1088
-check(any(cw == w and h <= ch < h + 16 for cw, ch in channels),
-      'a channel at %s among %s' % (size, ', '.join(
-          '%dx%d (%d jobs)' % (cw, ch, len(n)) for (cw, ch), n in channels.items())))
+    if not name.endswith('.h264'):
+        continue
+    r = regs(name)
+    v = r.get(0x38, 0)
+    cs = (((v >> 19) & 0x1ff) * 16, ((v >> 10) & 0x1ff) * 16)
+    c = next((c for c in chains if c[0] == r.get(0x1c)), None)
+    if c is None:
+        c = [None, cs, []]
+        chains.append(c)
+    c[0] = r.get(0x24)
+    c[2].append(name)
+channels = {}
+for i, (_, cs, names) in enumerate(chains):
+    channels[(cs[0], cs[1], i)] = names
+check(len(channels) > 0, '%d channel(s): %s' % (len(channels), ', '.join(
+      '%dx%d (%d jobs)' % (cw, ch, len(n)) for (cw, ch, _), n in channels.items())))
+seen_main = False
 
-for (cw, ch), names in sorted(channels.items()):
-    tag = '%dx%d' % (cw, ch)
+for (cw, ch, ci), names in sorted(channels.items()):
+    tag = '%dx%d#%d' % (cw, ch, ci)
     stream_c = '%s.%s' % (stream, tag)
     with open(stream_c, 'wb') as out:
         for n in names:
@@ -196,9 +208,10 @@ for (cw, ch), names in sorted(channels.items()):
           (tag, frames, len(names)))
 
     # 4. xm-vi's frame number, 16 blocks of 16 px across the top left, MSB
-    # first -- at the main size; xm-vi scales it into a smaller channel
-    if pw != w:
+    # first -- on the --size channel; xm-vi scales it into the others
+    if (pw, ph) != (w, h):
         continue
+    seen_main = True
     counts = []
     for f in range(frames):
         y = r.stdout[f * fs:f * fs + pw * ph]
@@ -212,6 +225,7 @@ for (cw, ch), names in sorted(channels.items()):
           '%s: the VI frame number rises through every picture%s (%s .. %s)' %
           (tag, ' after the first %d' % settle if settle else '',
            live[:3], live[-3:]))
+check(seen_main, 'a channel decodes at %s' % size)
 sys.exit(fail)
 PY
 fi
