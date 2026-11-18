@@ -24,6 +24,13 @@
  *                   on, latched by writing 1 to PTSLO
  *   0x1FC WDT_CTRL  bit 8 pauses the watchdog's counter (GPIO "wdt-pause")
  *
+ * FH8626V100's ARC ("arc", OpenIPC's 4.19 fh8626_arc.c): 0x2000-0x200C the
+ * words it executes out of reset, 0x1C4 bit 18 its reset (0 holds it),
+ * 0x2010 bit 4 lets it run -- both together drive "arc-run" to hw/misc/
+ * fh-arc.c.  0x1E4 is the doorbell to it (a non-zero write pulses
+ * "arc-kick"), 0x1F0 bits 1:0 the one to the ARM ("arc-irq" while set):
+ * plain registers both sides read-modify-write.
+ *
  * The clock tree the kernels compute (mach-fh/clock.c).  On FH8632 and
  * FH8626V100 ("pll-scheme" 2) the timers run from PLL1 = 24 MHz * M / N /
  * 2^OD (M 7:0, N 11:8, OD 17:16), resetting to 600 MHz, / 10 / (CLK_DIV5
@@ -76,6 +83,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(FhPmuState, FH_PMU)
 #define PMU_PLL2            0x064
 #define PMU_PLL2_CTRL       0x068
 #define PMU_WDT_CTRL        0x1FC
+#define PMU_ARC_RST         0x1C4
+#define PMU_ARC_RST_N       (1u << 18)
+#define PMU_DB_TO_ARC       0x1E4
+#define PMU_DB_TO_ARM       0x1F0
+#define PMU_ARC_CTRL        0x2010
+#define PMU_ARC_CTRL_RUN    (1u << 4)
 #define PMU_PTSLO           0x22C
 #define PMU_PTSHI           0x230
 #define PMU_BOOT_MODE       0x330
@@ -87,6 +100,10 @@ struct FhPmuState {
 
     MemoryRegion iomem;
     qemu_irq wdt_pause;
+    qemu_irq arc_run;
+    qemu_irq arc_kick;
+    qemu_irq arc_irq;
+    bool arc;
     qemu_irq tmr_reset;
     Clock *tmr_clk;
     uint32_t regs[FH_PMU_SIZE / 4];
@@ -166,6 +183,17 @@ static void fh_pmu_update_clocks(FhPmuState *s)
                     src / (((div5 >> s->tmr_div_lsb) & 0xFF) + 1));
 }
 
+static void fh_pmu_update_arc(FhPmuState *s)
+{
+    if (!s->arc) {
+        return;
+    }
+    qemu_set_irq(s->arc_run,
+                 (s->regs[PMU_ARC_RST >> 2] & PMU_ARC_RST_N) &&
+                 (s->regs[PMU_ARC_CTRL >> 2] & PMU_ARC_CTRL_RUN));
+    qemu_set_irq(s->arc_irq, s->regs[PMU_DB_TO_ARM >> 2] & 3);
+}
+
 static bool fh_pmu_is_swrst(FhPmuState *s, hwaddr off)
 {
     return off >= s->swrst_base && off <= s->swrst_base + 0xC;
@@ -231,6 +259,20 @@ static void fh_pmu_write(void *opaque, hwaddr off, uint64_t val,
     if (off == PMU_WDT_CTRL) {
         qemu_set_irq(s->wdt_pause, (val >> 8) & 1);
     }
+    if (s->arc) {
+        switch (off) {
+        case PMU_DB_TO_ARC:
+            if (val) {
+                qemu_irq_pulse(s->arc_kick);
+            }
+            break;
+        case PMU_ARC_RST:
+        case PMU_ARC_CTRL:
+        case PMU_DB_TO_ARM:
+            fh_pmu_update_arc(s);
+            break;
+        }
+    }
 }
 
 static const MemoryRegionOps fh_pmu_ops = {
@@ -278,6 +320,7 @@ static void fh_pmu_reset(DeviceState *dev)
     }
     s->pts_latch = 0;
     qemu_set_irq(s->wdt_pause, 0);
+    fh_pmu_update_arc(s);
     fh_pmu_update_clocks(s);
 }
 
@@ -289,6 +332,9 @@ static void fh_pmu_init(Object *obj)
                           FH_PMU_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->wdt_pause, "wdt-pause", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->arc_run, "arc-run", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->arc_kick, "arc-kick", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->arc_irq, "arc-irq", 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->tmr_reset, "tmr-reset", 1);
     s->tmr_clk = qdev_init_clock_out(DEVICE(obj), "tmr-clk");
 }
@@ -306,6 +352,7 @@ static const Property fh_pmu_props[] = {
     DEFINE_PROP_UINT32("swrst-base", FhPmuState, swrst_base, PMU_SWRST_BASE),
     /* FH8632: its variant in bits 5:0 (fh_chipid.c) */
     DEFINE_PROP_UINT32("spc-io-status", FhPmuState, spc_io_status, 0),
+    DEFINE_PROP_BOOL("arc", FhPmuState, arc, false),
 };
 
 static const VMStateDescription vmstate_fh_pmu = {

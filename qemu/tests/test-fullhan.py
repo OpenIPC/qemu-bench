@@ -42,6 +42,10 @@ vendor drivers (docs/fullhan.md):
     1 MB slot, SPI0 at 0xF0E00000 reading the flash's ID, and the
     timer clock: 10 MHz from reset (the vendor kernel), 50 MHz once
     DIV5[7:0] is 1 (OpenIPC's 4.19);
+  - fh8626v100's ARC600 (fh-arc): a program booted through the PMU's
+    boot words, run and reset bits -- ALU, shifts, flags and conditions,
+    BL / J / BRcc, loads and stores, LR, the doorbells both ways and IRQ
+    32, the instruction-error exception, a second boot after a reset;
   - fh8632: its chip and variant IDs, the PTS counter at 0xE7000040, and
     the RTC v1's direct counter, sync bits and set-up magic;
   - outside qtest: machine state migrates to a file and back.
@@ -780,6 +784,232 @@ def test_fh8626(qemu, path):
         qt.close()
 
 
+# fh-arc: an ARCompact encoder for the formats the model decodes. Every
+# format was checked against binutils' ARC assembler: the echo firmware's
+# own words come out of it unchanged.
+ARC_LIMM = 62
+
+
+def arc_b(b):
+    return (b & 7) << 24 | (b >> 3) << 12
+
+
+def arc_alu(op, a, b, c=None, u6=None, s12=None, f=0, major=4, limm=None,
+            cc=None):
+    w = major << 27 | arc_b(b) | op << 16 | f << 15
+    if cc is not None:
+        w |= 3 << 22 | cc | ((u6 << 6 | 0x20) if u6 is not None else c << 6)
+    elif s12 is not None:
+        v = s12 & 0xFFF
+        w |= 2 << 22 | (v & 0x3F) << 6 | v >> 6
+    elif u6 is not None:
+        w |= 1 << 22 | u6 << 6 | a
+    else:
+        w |= c << 6 | a
+    return [w] + ([limm & 0xFFFFFFFF] if limm is not None else [])
+
+
+def arc_mov(b, u6=None, s12=None, limm=None, cc=None):
+    if limm is not None:
+        return arc_alu(0x0A, 0, b, ARC_LIMM, limm=limm)
+    return arc_alu(0x0A, 0, b, u6=u6, s12=s12, cc=cc)
+
+
+def arc_ld(a, b, s9=0, zz=0, x=0, aa=0):
+    v = s9 & 0x1FF
+    return [2 << 27 | arc_b(b) | (v & 0xFF) << 16 | (v >> 8) << 15 |
+            1 << 11 | aa << 9 | zz << 7 | x << 6 | a]
+
+
+def arc_st(c, b, s9=0, zz=0):
+    v = s9 & 0x1FF
+    return [3 << 27 | arc_b(b) | (v & 0xFF) << 16 | (v >> 8) << 15 |
+            c << 6 | 1 << 5 | zz << 1]
+
+
+def arc_bcc(disp, cc):
+    d = disp & 0x1FFFFF
+    return [((d >> 1) & 0x3FF) << 17 | ((d >> 11) & 0x3FF) << 6 | cc]
+
+
+def arc_bself():
+    return [1 << 16]                          # b 0
+
+
+def arc_bl(disp):
+    d = disp & 0x1FFFFFF
+    return [1 << 27 | ((d >> 2) & 0x1FF) << 18 | 1 << 17 |
+            ((d >> 11) & 0x3FF) << 6 | d >> 21]
+
+
+def arc_br(b, disp, cc, c=None, u6=None):
+    d = disp & 0x1FF
+    w = 1 << 27 | arc_b(b) | ((d >> 1) & 0x7F) << 17 | (d >> 8) << 15 | \
+        1 << 16 | cc
+    return [w | ((u6 << 6 | 0x10) if u6 is not None else c << 6)]
+
+
+def arc_j(limm):
+    return arc_alu(0x20, 0, 0, ARC_LIMM, limm=limm)
+
+
+def arc_words(words):
+    """An instruction is stored as halfwords, the most significant first."""
+    return b''.join(struct.pack('<HH', w >> 16, w & 0xFFFF) for w in words)
+
+
+class ArcProg:
+    """Words at known addresses, so branches can name their targets."""
+    def __init__(self, base):
+        self.base, self.words, self.fix = base, [], []
+
+    def pc(self):
+        return self.base + 4 * len(self.words)
+
+    def add(self, words):
+        self.words += words
+
+    def branch(self, make, label):
+        self.fix.append((len(self.words), make, label))
+        self.words += make(0)
+
+    def link(self, labels):
+        for i, make, label in self.fix:
+            disp = labels[label] - ((self.base + 4 * i) & ~3)
+            self.words[i:i + len(make(0))] = make(disp)
+        return arc_words(self.words)
+
+
+def test_fh8626_arc(qemu):
+    """FH8626V100's ARC600: booted as OpenIPC's fh8626_arc.c boots it."""
+    print('fh8626v100: the ARC (fh-arc)')
+    entry, data = 0xA1000000, 0xA1002000
+    a, L = ArcProg(entry), {}
+    a.add(arc_j(entry + 0x100))                 # vector 0: reset
+    a.branch(lambda d: arc_j(0), 'x')           # 0x08: memory error
+    a.branch(lambda d: arc_j(0), 'x')           # 0x10: instruction error
+    a.words += [0] * ((0x100 - 4 * len(a.words)) // 4)
+    a.add(arc_mov(25, limm=data))
+    a.add(arc_ld(0, 25))                        # runs, counted in memory
+    a.add(arc_alu(0x00, 0, 0, u6=1))
+    a.add(arc_st(0, 25))
+    a.add(arc_mov(1, limm=0x12345678))
+    a.add(arc_mov(2, s12=-5))
+    a.add(arc_alu(0x00, 3, 1, 2))                       # add
+    a.add(arc_alu(0x02, 4, 1, u6=8))                    # sub
+    a.add(arc_alu(0x04, 5, 1, ARC_LIMM, limm=0xFF00FF00))   # and
+    a.add(arc_alu(0x05, 6, 5, u6=0x3F))                 # or
+    a.add(arc_alu(0x06, 7, 1, ARC_LIMM, limm=0xFFFF))   # bic
+    a.add(arc_alu(0x00, 8, 1, u6=4, major=5))           # asl
+    a.add(arc_alu(0x01, 9, 1, u6=8, major=5))           # lsr
+    a.add(arc_alu(0x02, 10, 2, u6=1, major=5))          # asr
+    a.add(arc_alu(0x03, 11, 1, u6=4, major=5))          # ror
+    for n, r in enumerate(range(3, 12)):
+        a.add(arc_st(r, 25, 4 + 4 * n))
+    # cmp -5, 0x12345678: unsigned higher, signed less
+    a.add(arc_alu(0x0C, 0, 2, 1, f=1))
+    a.add(arc_mov(12, u6=0))
+    a.branch(lambda d: arc_bcc(d, 0x0D), 'hi')         # bhi
+    a.add(arc_mov(12, u6=0x10))
+    L['hi'] = a.pc()
+    a.add(arc_mov(13, u6=1, cc=0x0B))                   # mov.lt
+    a.add(arc_mov(13, u6=2, cc=0x0A))                   # mov.ge: not
+    a.add(arc_st(12, 25, 40))
+    a.add(arc_st(13, 25, 44))
+    a.branch(lambda d: arc_bl(d), 'sub')                # bl, j [blink]
+    a.add(arc_st(14, 25, 48))
+    a.add(arc_mov(15, u6=7))
+    a.branch(lambda d: arc_br(2, d, 2, c=1), 'lt')      # brlt r2, r1
+    a.add(arc_mov(15, u6=0x30))
+    L['lt'] = a.pc()
+    a.add(arc_st(15, 25, 52))
+    # loads and stores: sizes, sign extension, post-increment
+    a.add(arc_mov(16, limm=data + 0x100))
+    a.add(arc_st(1, 16))
+    a.add(arc_st(2, 16, 4))
+    a.add(arc_st(1, 16, 8, zz=1))                       # stb
+    a.add(arc_st(1, 16, 10, zz=2))                      # sth
+    a.add(arc_ld(17, 16, 4, zz=1, x=1))                 # ldb.x
+    a.add(arc_ld(18, 16, 2, zz=2))                      # ldh
+    a.add(arc_ld(19, 16, 4, aa=2))                      # ld.ab
+    a.add(arc_st(17, 25, 56))
+    a.add(arc_st(18, 25, 60))
+    a.add(arc_st(19, 25, 64))
+    a.add(arc_st(16, 25, 68))
+    a.add(arc_alu(0x2A, 0, 20, u6=4))                   # lr IDENTITY
+    a.add(arc_st(20, 25, 72))
+    # the doorbell to the ARM, then wait for the ARM's
+    a.add(arc_mov(21, limm=0xF00001F0))
+    a.add(arc_mov(22, u6=1))
+    a.add(arc_st(22, 21))
+    a.add(arc_mov(21, limm=0xF00001E4))
+    L['kick'] = a.pc()
+    a.add(arc_ld(23, 21))
+    a.branch(lambda d: arc_br(23, d, 0, u6=0), 'kick')  # breq r23, 0
+    a.add(arc_st(23, 25, 76))
+    L['bad'] = a.pc()
+    a.add([0x78E078E0])                         # nop_s: 16-bit, not modelled
+    L['sub'] = a.pc()
+    a.add(arc_mov(14, u6=0x2A))
+    a.add(arc_alu(0x20, 0, 0, 31))                      # j [blink]
+    L['x'] = a.pc()
+    a.add(arc_st(30, 25, 80))                   # ILINK2: where it faulted
+    a.add(arc_bself())
+    prog = a.link(L)
+    # the error vectors' long immediates: both go to 'x'
+    prog = prog[:8] + arc_words(arc_j(L['x'])) * 2 + prog[24:]
+
+    qt = QTest(qemu, 'fh8626v100')
+    try:
+        qt.write(entry, prog)
+        qt.write(data, bytes(0x200))
+
+        def ror16(w):
+            return (w >> 16 | w << 16) & 0xFFFFFFFF
+        for i, w in enumerate((0x266B7940, entry, 0x20200F80, entry)):
+            qt.writel(PMU + 0x2000 + 4 * i, ror16(w))
+        qt.writel(PMU + 0x2010, 1 << 4)         # run, still in reset
+        qt.step(2000000)
+        check('held in reset: nothing ran', qt.readl(data), 0)
+        qt.writel(PMU + 0x1C4, 1 << 18)         # released
+        qt.step(2000000)
+        d = [qt.readl(data + 4 * i) for i in range(21)]
+
+        def w(v):
+            return struct.pack('<%dI' % len(v), *v)
+        check('ran once from the PMU boot words', d[0], 1)
+        check('add, sub, and, or, bic',
+              w(d[1:6]), w([0x12345673, 0x12345670, 0x12005600, 0x1200563F,
+                          0x12340000]))
+        check('asl, lsr, asr, ror',
+              w(d[6:10]), w([0x23456780, 0x00123456, 0xFFFFFFFD, 0x81234567]))
+        check('cmp then bhi taken', d[10], 0)
+        check('mov.lt taken, mov.ge not', d[11], 1)
+        check('bl, j [blink]', d[12], 0x2A)
+        check('brlt taken', d[13], 7)
+        check('ldb.x, ldh, ld.ab', w(d[14:17]),
+              w([0xFFFFFFFB, 0x1234, 0x12345678]))
+        check('ld.ab wrote the base back', d[17], data + 0x104)
+        check('stb and sth', qt.readl(data + 0x108), 0x56780078)
+        check('LR IDENTITY: ARC600', d[18], 0x22)
+        check('doorbell 0x1F0 bit 0', qt.readl(PMU + 0x1F0), 1)
+        check('raises IRQ 32', qt.readl(INTC + 0x1C) & 1, 1)
+        qt.writel(PMU + 0x1F0, 0)
+        check('cleared by the ARM', qt.readl(INTC + 0x1C) & 1, 0)
+        check('waits for its doorbell', d[19], 0)
+        qt.writel(PMU + 0x1E4, 5)
+        qt.step(1000)
+        check('kicked: goes on at once', qt.readl(data + 76), 5)
+        check('16-bit nop_s: instruction error, ILINK2',
+              qt.readl(data + 80), L['bad'])
+        qt.writel(PMU + 0x1C4, 0)               # reset, then again
+        qt.writel(PMU + 0x1C4, 1 << 18)
+        qt.step(2000000)
+        check('a reset runs it again from the boot words', qt.readl(data), 2)
+    finally:
+        qt.close()
+
+
 def test_fh8632(qemu):
     print('fh8632: PTS, RTC v1')
     qt = QTest(qemu, 'fh8632')
@@ -892,6 +1122,7 @@ def main():
     test_long_header(args.qemu, os.path.join(tmp, 'flash-long.bin'))
     test_fh8652(args.qemu)
     test_fh8626(args.qemu, path)
+    test_fh8626_arc(args.qemu)
     test_fh8632(args.qemu)
     test_all_machines(args.qemu)
     test_migration(args.qemu, tmp)

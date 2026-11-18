@@ -395,8 +395,10 @@ Flash writes go back to the file. OpenIPC's `fh8852v200`, `fh8852v100` and
 `fh8856v100` releases boot on the vendor U-Boot, which can also fetch them
 over TFTP and write them itself, as on a camera, (`qemu-boot/fh-openipc-flash.sh`) or
 with `-kernel` (`qemu-boot/test-fullhan-boot.sh`) to a login prompt with a
-DHCP lease. The media pipeline (the ARC coprocessor, ISP, encoders) and
-audio (the ARC's) are not modelled. Map, boot chain and devices are in
+DHCP lease; OpenIPC's `fh8626v100` boots that way too, and its ARC600
+(`fh-arc`) runs OpenIPC's RPMsg echo firmware for the kernel's remoteproc.
+The vendors' media pipeline (their ARC firmware, ISP, encoders) and audio
+(the ARC's) are not modelled. Map, boot chain and devices are in
 [docs/fullhan.md](docs/fullhan.md).
 
 ¹ Same die and models as a tested sibling; no image was at hand.
@@ -864,6 +866,7 @@ qemu/
 ├── hw/rtc/fh-rtc.c              # Fullhan RTC, command-based and v1 layouts
 ├── hw/watchdog/fh-wdt.c         # DW watchdog
 ├── hw/misc/fh-efuse.c           # eFuse controller
+├── hw/misc/fh-arc.c             # FH8626V100 ARC600: ARCompact core run from DDR (OpenIPC's echo firmware)
 ├── hw/arm/ambarella.c           # Ambarella S3L machine, generated device tree
 ├── hw/misc/amb-vic.c            # Ambarella VIC and the scratchpad that names the IRQ
 ├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
