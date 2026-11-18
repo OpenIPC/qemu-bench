@@ -703,10 +703,11 @@ if ! grep -q "'anyka.c'" "$QEMU_DIR/hw/arm/meson.build"; then
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added anyka.c"
 fi
-# EV200's Hantro 8290 (ak-h8290.c) codes with the shared software
-# encoders; guarded per machine as for Ambarella, so an Anyka-only
-# configuration links without CONFIG_XIONGMAI.
-for b in ak-h8290.c jpeg-enc.c hantro-h264.c; do
+# EV200's Hantro 8290 (ak-h8290.c) and EV300's Allegro core (ingenic-avpu.c,
+# the same IP as Ingenic's AVPU) code with the shared software encoders;
+# guarded per machine as for Ambarella, so an Anyka-only configuration links
+# without CONFIG_XIONGMAI or CONFIG_INGENIC.
+for b in ak-h8290.c jpeg-enc.c hantro-h264.c ingenic-avpu.c hevc-enc.c; do
     if ! grep -q "CONFIG_ANYKA', if_true: files('$b')" \
             "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('$b'))" \

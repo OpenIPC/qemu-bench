@@ -111,6 +111,7 @@ static const AkSoCConfig ak3916ev300_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_allegro       = true,
 };
 
 static const AkSoCConfig ak3918ev300_soc = {
@@ -120,6 +121,7 @@ static const AkSoCConfig ak3918ev300_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_allegro       = true,
 };
 
 static const AkSoCConfig ak3919ev300_soc = {
@@ -129,6 +131,7 @@ static const AkSoCConfig ak3919ev300_soc = {
     .num_timers         = 5,
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
+    .venc_allegro       = true,
 };
 
 /*
@@ -723,7 +726,8 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         if (c->isp2 && ak_regbanks[n].base == 0x20000000) {
             continue;
         }
-        if (c->venc_h8290 && ak_regbanks[n].base == AK_VENC_BASE) {
+        if ((c->venc_h8290 || c->venc_allegro) &&
+            ak_regbanks[n].base == AK_VENC_BASE) {
             continue;
         }
         rb = qdev_new("hisi-regbank");
@@ -735,11 +739,24 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     }
     /*
      * EV200's video encoder, a Hantro 8290 (OpenIPC's ak-venc: "8290
-     * encoder at /dev/video0, irq 2").  EV300's Allegro core stays storage.
+     * encoder at /dev/video0, irq 2").
      */
     if (c->venc_h8290) {
         sysbus_create_simple("ak-h8290", AK_VENC_BASE,
                              qdev_get_gpio_in(irqc, AK_IRQ_VENC));
+    }
+    /*
+     * EV300's Allegro core (OpenIPC's uio_vcodec: "Allegro encoder at [mem
+     * 0x20020000-0x2002ffff], irq 2"), interrupt mask and status at +0x8014
+     * and +0x8018: the AVPU's register layout from reg-base 0x8000.
+     */
+    if (c->venc_allegro) {
+        dev = qdev_new("ingenic-avpu");
+        qdev_prop_set_uint32(dev, "reg-base", 0x8000);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_VENC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           qdev_get_gpio_in(irqc, AK_IRQ_VENC));
     }
     /*
      * AV100 extras (anycloud_ak3918av100_common.dtsi): the second MIPI/CSI
