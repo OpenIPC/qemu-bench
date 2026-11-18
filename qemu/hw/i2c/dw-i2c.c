@@ -174,10 +174,20 @@ static uint32_t dw_i2c_rx_pending(DwI2cState *s)
  * never happens because the kickoff interrupt that's supposed to
  * cause it never fires. Computing it live here, independent of any
  * write having happened yet, is what breaks that deadlock.
+ *
+ * Only while the adapter is enabled, though: with IC_ENABLE=0 the
+ * databook has TX_EMPTY read 0 once the (synchronous, hence always
+ * idle here) state machines have nothing left to do, so a disabled
+ * controller with TX_EMPTY still unmasked must not keep its IRQ
+ * asserted.
  */
 static uint32_t dw_i2c_effective_raw(DwI2cState *s)
 {
-    uint32_t v = s->raw_intr_stat | INTR_TX_EMPTY;
+    uint32_t v = s->raw_intr_stat;
+
+    if (s->enable & ENABLE_EN) {
+        v |= INTR_TX_EMPTY;
+    }
 
     if (dw_i2c_rx_pending(s) > s->rx_tl) {
         v |= INTR_RX_FULL;
@@ -423,10 +433,21 @@ static void dw_i2c_write(void *opaque, hwaddr offset,
 
     case R_ENABLE:
         s->enable = value & ENABLE_EN;
-        if (!(s->enable & ENABLE_EN) && s->in_transfer) {
-            i2c_end_transfer(s->bus);
-            s->in_transfer = false;
+        if (!(s->enable & ENABLE_EN)) {
+            if (s->in_transfer) {
+                i2c_end_transfer(s->bus);
+                s->in_transfer = false;
+            }
+            /*
+             * Databook: disabling flushes (and holds in reset) both
+             * FIFOs, and clears the FIFO over/underflow interrupts.
+             */
+            s->rx_head = 0;
+            s->rx_count = 0;
+            s->raw_intr_stat &= ~(INTR_RX_UNDER | INTR_RX_OVER |
+                                  INTR_TX_OVER);
         }
+        dw_i2c_update_irq(s);
         break;
 
     case R_SDA_HOLD: s->sda_hold = value; break;
@@ -490,6 +511,7 @@ static void dw_i2c_reset(DeviceState *dev)
     s->cur_is_read = false;
     s->rx_head = 0;
     s->rx_count = 0;
+    qemu_irq_lower(s->irq);
 }
 
 static void dw_i2c_init(Object *obj)

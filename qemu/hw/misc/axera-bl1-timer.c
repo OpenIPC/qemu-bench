@@ -187,11 +187,30 @@ static void axera_bl1_timer_realize(DeviceState *dev, Error **errp)
     s->expiry = timer_new_ns(QEMU_CLOCK_VIRTUAL, axera_bl1_timer_expire, s);
 }
 
+/*
+ * System reset (watchdog or reboot): stop the counter, drop any pending
+ * expiry and interrupt, and return the registers to their power-on
+ * zero state so the next boot does not inherit the previous one's
+ * hrtimer sleep.
+ */
+static void axera_bl1_timer_reset(DeviceState *dev)
+{
+    AxeraBl1TimerState *s = AXERA_BL1_TIMER(dev);
+
+    timer_del(s->expiry);
+    s->loadcount = 0;
+    s->control = 0;
+    s->enable_time_ns = 0;
+    s->raw_int = false;
+    qemu_irq_lower(s->irq);
+}
+
 static void axera_bl1_timer_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = axera_bl1_timer_realize;
+    device_class_set_legacy_reset(dc, axera_bl1_timer_reset);
 }
 
 static const TypeInfo axera_bl1_timer_info = {

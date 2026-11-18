@@ -18,6 +18,8 @@
  *
  * Confirmed variants (instance property values):
  *   OS04A10   id_reg_base=0x300A  id0=0x53  id1=0x04  id2=0x41
+ * Machines take them from the sensor catalogue (hw/i2c/image-sensor.c,
+ * sensor "os04a10"), which sets these properties.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -26,6 +28,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -139,30 +142,60 @@ static void axera_ov_sensor_reset(DeviceState *dev)
     qemu_set_irq(s->streaming, 0);
 }
 
+#define OVR(a) (s->regs[(a) - OV_REG_BASE])
+#define OVR16(a) ((OVR(a) << 8) | OVR((a) + 1))
+
 /*
- * "exposure" (read-only): what the AE last programmed, as integration
- * rows times total gain, gain 1.0 = 1024 -- for an ISP model to scale
- * its statistics by, so the AE loop closes. The OS04A10's coding (its
- * SDK os04a10_reg.h / os04a10_ae_ctrl.c): rows 0x3501:0x3502; analog
- * gain 0x3508[4:0]:0x3509[7:4] in 1/16; digital gain
+ * What the AE last programmed. The OS04A10's coding (its SDK
+ * os04a10_reg.h / os04a10_ae_ctrl.c): rows 0x3501:0x3502; analog gain
+ * 0x3508[4:0]:0x3509[7:4] in 1/16; digital gain
  * 0x350A[3:0]:0x350B:0x350C[7:6] in 1/1024. Unprogrammed gains count
- * as 1.0.
+ * as 1.0. The total gain is returned in 1/16384 (1.0 = 16 << 10).
+ */
+static uint64_t axera_ov_sensor_gain16(AxeraOvSensorState *s, uint32_t *rows)
+{
+    uint32_t ag = ((OVR(0x3508) & 0x1f) << 4) | (OVR(0x3509) >> 4);
+    uint32_t dg = ((OVR(0x350a) & 0xf) << 10) | (OVR(0x350b) << 2) |
+                  (OVR(0x350c) >> 6);
+
+    *rows = OVR16(0x3501);
+    return (uint64_t)(ag ? ag : 16) * (dg ? dg : 1024);
+}
+
+/*
+ * The image-sensor interface: exposure and gain as above, the frame
+ * length VTS at 0x380E:0x380F and the output window 0x3808-0x380B, the
+ * registers the vendor drivers' modes and fps control write
+ * (Ingenic T41 SDK os04a10.c).
+ */
+static void axera_ov_sensor_exposure(Object *obj, ImageSensorExposure *e)
+{
+    AxeraOvSensorState *s = AXERA_OV_SENSOR(obj);
+
+    e->gain = axera_ov_sensor_gain16(s, &e->lines) / 16;
+    e->vts = OVR16(0x380e);
+    e->width = OVR16(0x3808);
+    e->height = OVR16(0x380a);
+}
+
+/*
+ * "exposure" (read-only): integration rows times total gain, gain 1.0 =
+ * 1024 -- for an ISP model to scale its statistics by, so the AE loop
+ * closes (axera-vin's AE statistics read it).
  */
 static void axera_ov_sensor_get_exposure(Object *obj, Visitor *v,
                                          const char *name, void *opaque,
                                          Error **errp)
 {
     AxeraOvSensorState *s = AXERA_OV_SENSOR(obj);
-#define OVR(a) (s->regs[(a) - OV_REG_BASE])
-    uint64_t rows = (OVR(0x3501) << 8) | OVR(0x3502);
-    uint32_t ag = ((OVR(0x3508) & 0x1f) << 4) | (OVR(0x3509) >> 4);
-    uint32_t dg = ((OVR(0x350a) & 0xf) << 10) | (OVR(0x350b) << 2) |
-                  (OVR(0x350c) >> 6);
-    uint64_t e = rows * (ag ? ag : 16) * (dg ? dg : 1024) / 16;
-#undef OVR
+    uint32_t rows;
+    uint64_t e = axera_ov_sensor_gain16(s, &rows) * rows / 16;
 
     visit_type_uint64(v, name, &e, errp);
 }
+
+#undef OVR16
+#undef OVR
 
 static void axera_ov_sensor_init(Object *obj)
 {
@@ -206,6 +239,7 @@ static void axera_ov_sensor_class_init(ObjectClass *klass, const void *data)
     k->event = axera_ov_sensor_event;
     k->recv  = axera_ov_sensor_recv;
     k->send  = axera_ov_sensor_send;
+    IMAGE_SENSOR_CLASS(klass)->exposure = axera_ov_sensor_exposure;
 }
 
 static const TypeInfo axera_ov_sensor_info = {
@@ -214,6 +248,10 @@ static const TypeInfo axera_ov_sensor_info = {
     .instance_size = sizeof(AxeraOvSensorState),
     .instance_init = axera_ov_sensor_init,
     .class_init    = axera_ov_sensor_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IMAGE_SENSOR },
+        { }
+    },
 };
 
 static void axera_ov_sensor_register_types(void)

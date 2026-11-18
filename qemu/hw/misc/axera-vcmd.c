@@ -74,6 +74,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
 #include "hw/irq.h"
 #include "hw/misc/axera-vcmd.h"
 #include "hw/qdev-properties.h"
@@ -316,6 +317,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraVcmdState, AXERA_VCMD)
 #define ENC_REG_IN_LU_STRIDE    210
 #define ENC_REG_IN_CH_STRIDE    211
 #define   ENC_STRIDE_SHIFT      12
+
+/*
+ * Bounds on what a job may make the model allocate. Pictures are at most
+ * 4096x4096 (checked in axera_vcmd_run_encode_job), so a row stride of
+ * four times that is far beyond any real layout (the cameras use the
+ * width rounded up to 16 or 64). The largest stream any of the encoders
+ * can produce for such a picture is under 32 MiB (H.264's own RBSP bound
+ * is 512 bytes a macroblock), so a larger output limit gains nothing.
+ */
+#define ENC_MAX_STRIDE          16384
+#define ENC_MAX_OUT             (32 * MiB)
 
 /* Standard IJG baseline quantisation tables (ITU-T T.81 Annex K.1),
  * row-major/natural order as jpeg_enc_header/jpeg_enc_scan want. There is
@@ -747,6 +759,16 @@ static bool axera_vcmd_hevc_api_headers(AxeraVcmdState *s, uint32_t *reg,
     return false;
 }
 
+/*
+ * Bytes a plane of @rows rows @stride apart spans when each row is read
+ * @row_len bytes wide: the last row may end past the stride.
+ */
+static size_t axera_vcmd_plane_len(uint32_t stride, uint32_t rows,
+                                   uint32_t row_len)
+{
+    return (size_t)stride * (rows - 1) + MAX(stride, row_len);
+}
+
 static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
 {
     uint32_t mode = (reg[ENC_REG_MODE] >> ENC_MODE_SHIFT) &
@@ -797,10 +819,26 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
     if (!stride_c) {
         stride_c = (fmt == 0) ? w / 2 : w;
     }
+    /* planar chroma rows hold w / 2 samples, interleaved ones w */
+    if (stride_y < w || stride_y > ENC_MAX_STRIDE ||
+        stride_c < ((fmt == 0) ? w / 2 : w) || stride_c > ENC_MAX_STRIDE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "axera-vcmd: encode job with "
+                      "invalid strides (mode=%u fmt=%u %ux%u stride "
+                      "%u/%u), skipped\n", mode, fmt, w, h, stride_y,
+                      stride_c);
+        return;
+    }
     st = axera_vcmd_stream(s, mode, w, h, &fresh);
     idr = (coding_type == ENC_CODING_TYPE_I) || fresh;
 
-    y = g_malloc0((size_t)stride_y * mbh * 16);
+    /*
+     * The encoders read whole macroblocks: mbh * 16 rows of mbw * 16
+     * luma bytes, mbh * 8 rows of mbw * 16 interleaved chroma bytes, at
+     * the job's strides, so the last row may run past the stride when
+     * the width is not a multiple of 16. The buffers are sized for that
+     * (axera_vcmd_plane_len), the part past the guest's planes left 0.
+     */
+    y = g_malloc0(axera_vcmd_plane_len(stride_y, mbh * 16, mbw * 16));
     vcmd_dma_read(s, y_base, y,
                     (size_t)stride_y * mbh * 16, MEMTXATTRS_UNSPECIFIED);
 
@@ -810,8 +848,10 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
          * this model were themselves integrated against semi-planar
          * input -- see xm-h1.c). */
         size_t cw = mbw * 8, ch = mbh * 8, i;
-        g_autofree uint8_t *cb = g_malloc0((size_t)stride_c * ch);
-        g_autofree uint8_t *cr = g_malloc0((size_t)stride_c * ch);
+        g_autofree uint8_t *cb = g_malloc0(axera_vcmd_plane_len(stride_c,
+                                                                ch, cw));
+        g_autofree uint8_t *cr = g_malloc0(axera_vcmd_plane_len(stride_c,
+                                                                ch, cw));
 
         vcmd_dma_read(s, cb_base, cb,
                         (size_t)stride_c * ch, MEMTXATTRS_UNSPECIFIED);
@@ -830,7 +870,7 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
     } else {
         hwaddr uv_base = cb_base ? cb_base : cr_base;
 
-        uv = g_malloc0((size_t)stride_c * mbh * 8);
+        uv = g_malloc0(axera_vcmd_plane_len(stride_c, mbh * 8, mbw * 16));
         if (uv_base) {
             vcmd_dma_read(s, uv_base, uv,
                             (size_t)stride_c * mbh * 8,
@@ -876,7 +916,8 @@ static void axera_vcmd_run_encode_job(AxeraVcmdState *s, uint32_t *reg)
     }
     st->frames++;
 
-    cap = out_cap ? out_cap : 256 * 1024;
+    /* the core never writes past the limit; nothing needs more (above) */
+    cap = out_cap ? MIN(out_cap, ENC_MAX_OUT) : 256 * 1024;
     out = g_malloc0(cap);
 
     if (mode == ENC_MODE_H264) {
@@ -1190,7 +1231,7 @@ static bool axera_vcmd_kick_job(AxeraVcmdState *s)
  * CONTROL/timer handshake below, not real JMP chaining) are no-ops.
  */
 /*
- * Run one command buffer. Returns true and sets *next_addr/*next_len when
+ * Run one command buffer. Returns true and sets *next_addr and *next_len when
  * it ends in a JMP with RDY set, i.e. the driver has linked another
  * buffer behind it and the hardware carries straight on.
  */
@@ -1280,7 +1321,9 @@ static int axera_vcmd_exec_one(AxeraVcmdState *s, hwaddr addr,
                                  (size_t)n * 4, MEMTXATTRS_UNSPECIFIED);
             } else if (a >= CORE_REG_BASE && dst) {
                 uint32_t creg = (a - CORE_REG_BASE) / 4;
-                uint32_t k, ndst = MIN(n, CORE_REG_COUNT - creg);
+                /* registers past the core's file read back as 0 */
+                uint32_t k, ndst = creg < CORE_REG_COUNT ?
+                                   MIN(n, CORE_REG_COUNT - creg) : 0;
                 g_autofree uint32_t *out = g_new0(uint32_t, n);
 
                 for (k = 0; k < ndst; k++) {
@@ -1534,14 +1577,20 @@ static void axera_vcmd_reset(DeviceState *dev)
 {
     AxeraVcmdState *s = AXERA_VCMD(dev);
 
-    /* an encode job still running owns the stream contexts */
+    /*
+     * An encode job still running owns the stream contexts and writes
+     * guest memory: let it finish before the reset, so nothing it does
+     * lands after it. Its completion (axera_vcmd_job_done, run by
+     * aio_poll here in the main loop) must not carry on into the
+     * command buffer behind it: idle the core first.
+     */
+    s->work_state = WORK_STATE_IDLE;
+    timer_del(&s->completion_timer);
     while (s->enc_busy) {
         aio_poll(qemu_get_aio_context(), true);
     }
-    timer_del(&s->completion_timer);
     s->int_status = 0;
     s->int_ctl = 0;
-    s->work_state = WORK_STATE_IDLE;
     s->cmd_addr_lo = 0;
     s->cmd_addr_hi = 0;
     s->cmd_length = 0;

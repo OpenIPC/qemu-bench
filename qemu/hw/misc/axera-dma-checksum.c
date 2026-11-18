@@ -32,7 +32,9 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/units.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "hw/sysbus.h"
@@ -52,6 +54,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraDmaChecksumState, AXERA_DMA_CHECKSUM)
 
 #define DMADIM_XFER_DONE        BIT(0)
 
+/*
+ * BL1 only checksums boot images (tens of MiB at most); a descriptor
+ * asking for more than this is treated like an unreadable range. The
+ * range is summed through a fixed bounce buffer, never allocated whole.
+ */
+#define DMADIM_MAX_LEN          (256 * MiB)
+#define DMADIM_CHUNK            (4 * KiB)
+
 struct AxeraDmaChecksumState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -63,9 +73,9 @@ static void axera_dma_checksum_do_run(AxeraDmaChecksumState *s)
     uint64_t lli_addr;
     uint8_t desc[40];
     uint64_t sar, size_units, byte_len;
-    uint8_t *buf;
+    uint8_t buf[DMADIM_CHUNK];
     uint32_t sum = 0;
-    uint64_t i;
+    uint64_t done = 0;
 
     lli_addr = ((uint64_t)s->mem[DMADIM_LLI_BASE_H / 4] << 32) |
                s->mem[DMADIM_LLI_BASE_L / 4];
@@ -78,18 +88,32 @@ static void axera_dma_checksum_do_run(AxeraDmaChecksumState *s)
 
     sar = ldq_le_p(desc + 0);
     size_units = ldq_le_p(desc + 16);
-    byte_len = size_units * 8;
 
-    if (byte_len > 0) {
-        buf = g_malloc(byte_len);
-        if (address_space_read(&address_space_memory, sar,
-                               MEMTXATTRS_UNSPECIFIED, buf, byte_len) ==
-            MEMTX_OK) {
-            for (i = 0; i + 4 <= byte_len; i += 4) {
-                sum += ldl_le_p(buf + i);
-            }
+    if (size_units > DMADIM_MAX_LEN / 8) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "axera-dma-checksum: length 0x%" PRIx64 " * 8 exceeds "
+                      "the %u-byte limit\n", size_units,
+                      (unsigned)DMADIM_MAX_LEN);
+        byte_len = 0;
+    } else {
+        byte_len = size_units * 8;
+    }
+
+    /* byte_len is a multiple of 8, so every chunk holds whole words. */
+    while (done < byte_len) {
+        uint32_t n = MIN(byte_len - done, DMADIM_CHUNK);
+        uint32_t i;
+
+        if (address_space_read(&address_space_memory, sar + done,
+                               MEMTXATTRS_UNSPECIFIED, buf, n) != MEMTX_OK) {
+            /* Same result as before for an unreadable range: sum 0. */
+            sum = 0;
+            break;
         }
-        g_free(buf);
+        for (i = 0; i < n; i += 4) {
+            sum += ldl_le_p(buf + i);
+        }
+        done += n;
     }
 
     s->mem[DMADIM_CHECKSUME / 4] = sum;

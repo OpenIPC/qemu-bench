@@ -240,6 +240,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNandState, AXERA_SPI_NAND)
 #define OP_BLOCK_ERASE          0xd8
 
 #define REG_STATUS              0xc0
+#define STATUS_OIP              BIT(0)
+#define STATUS_WEL              BIT(1)
 
 #define AXERA_SPI_NAND_RXQ_MAX  4096
 
@@ -254,6 +256,16 @@ struct AxeraSpiNandState {
     uint8_t cmd_buf[8];
     unsigned int cmd_len;
     int pending_set_feature_addr;      /* -1 when no SET_FEATURE pending */
+    /*
+     * Write Enable Latch: set by WRITE ENABLE (0x06), cleared by WRITE
+     * DISABLE (0x04) and by every PROGRAM EXECUTE / BLOCK ERASE, which
+     * real parts ignore while it is clear. Both U-Boot's and Linux's
+     * spinand core issue WRITE ENABLE before every program/erase.
+     * Reported as status-register bit 1 like on real parts. RESET is
+     * deliberately not modelled as clearing it: controller dummy 0xff
+     * bytes already latch here as OP_RESET (see the top comment).
+     */
+    bool write_enable_latch;
     uint8_t feature_regs[256];
     uint32_t loaded_row;
 
@@ -330,6 +342,12 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
     uint32_t column, i;
 
     switch (opcode) {
+    case OP_WREN:
+        s->write_enable_latch = true;
+        break;
+    case OP_WRDI:
+        s->write_enable_latch = false;
+        break;
     case OP_PAGE_READ:
         s->loaded_row = (s->cmd_buf[1] << 16) | (s->cmd_buf[2] << 8) |
                         s->cmd_buf[3];
@@ -369,6 +387,13 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
                            (uint32_t)MIN((uint64_t)SPINAND_PAGE_SIZE,
                                          s->flash_size - off) : 0;
 
+            if (!s->write_enable_latch) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "axera-spi-nand: PROGRAM EXECUTE row 0x%x "
+                              "without WRITE ENABLE, ignored\n", row);
+                len = 0;
+            }
+            s->write_enable_latch = false;
             for (i = 0; i < len; i++) {
                 s->flash[off + i] &= s->program_cache[i];
             }
@@ -388,6 +413,13 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
                            (uint32_t)MIN((uint64_t)SPINAND_BLOCK_SIZE,
                                          s->flash_size - block_off) : 0;
 
+            if (!s->write_enable_latch) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "axera-spi-nand: BLOCK ERASE row 0x%x "
+                              "without WRITE ENABLE, ignored\n", row);
+                len = 0;
+            }
+            s->write_enable_latch = false;
             if (len) {
                 memset(s->flash + block_off, 0xff, len);
             }
@@ -411,7 +443,13 @@ static void axera_spi_nand_latch(AxeraSpiNandState *s)
          * reflect what it had just set.
          */
         rxq_reset(s);
-        rxq_push(s, s->feature_regs[s->cmd_buf[1]] & ~1);
+        if (s->cmd_buf[1] == REG_STATUS) {
+            rxq_push(s, (s->feature_regs[REG_STATUS] &
+                         ~(STATUS_OIP | STATUS_WEL)) |
+                        (s->write_enable_latch ? STATUS_WEL : 0));
+        } else {
+            rxq_push(s, s->feature_regs[s->cmd_buf[1]] & ~STATUS_OIP);
+        }
         break;
     case OP_READID:
         {
@@ -570,7 +608,6 @@ static void axera_spi_nand_write(void *opaque, hwaddr offset, uint64_t value,
              * to the same address reads back what was actually set. */
             s->feature_regs[s->pending_set_feature_addr] = value & 0xff;
             s->pending_set_feature_addr = -1;
-    s->debug = getenv("AXERA_NAND_DEBUG") && getenv("AXERA_NAND_DEBUG")[0];
             return;
         }
         if (s->cmd_len < sizeof(s->cmd_buf)) {
@@ -609,6 +646,7 @@ static void axera_spi_nand_realize(DeviceState *dev, Error **errp)
     AxeraSpiNandState *s = AXERA_SPI_NAND(dev);
 
     s->pending_set_feature_addr = -1;
+    s->debug = getenv("AXERA_NAND_DEBUG") && getenv("AXERA_NAND_DEBUG")[0];
 
     if (s->file && s->file[0]) {
         if (!g_file_get_contents(s->file, (gchar **)&s->flash,
@@ -641,6 +679,7 @@ static void axera_spi_nand_reset(DeviceState *dev)
     memset(s->feature_regs, 0, sizeof(s->feature_regs));
     s->cmd_len = 0;
     s->pending_set_feature_addr = -1;
+    s->write_enable_latch = false;
     s->loaded_row = 0;
     s->program_active = false;
     s->ssienr = false;

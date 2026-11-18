@@ -40,6 +40,7 @@
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/irq.h"
@@ -1152,17 +1153,11 @@ static DeviceState *axera_ax620e_periphs(qemu_irq *pic, bool camera_board,
          * aborting IspVi_create before it ever reaches real VIN/WDMA
          * setup. The correct ID lets the app's own lookup resolve to
          * "sc450ai" and successfully load the .so that's actually
-         * there.
+         * there. The catalogue's "sc450ai" (hw/i2c/image-sensor.c) is
+         * that part.
          */
         if (camera_board) {
-            DeviceState *sensor = qdev_new("hisi-smartsens");
-
-            ax620e_sensor = sensor;
-
-            qdev_prop_set_uint8(sensor, "id_high", 0xBD);
-            qdev_prop_set_uint8(sensor, "id_low", 0x2F);
-            qdev_prop_set_uint8(sensor, "address", 0x30);
-            qdev_realize_and_unref(sensor, BUS(i2c6_bus), &error_fatal);
+            ax620e_sensor = image_sensor_create(i2c6_bus, "sc450ai");
         }
     }
 
@@ -2395,20 +2390,14 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
              * convention. hw/i2c/axera-ov-sensor.c is a new, equally
              * generic stub for this OmniVision/OS-series protocol
              * family, written specifically from that confirmed source
-             * rather than guessed.
+             * rather than guessed. The catalogue's "os04a10"
+             * (hw/i2c/image-sensor.c) is that part, at 0x36.
              */
             {
                 DeviceState *i2c8 = ax620u_i2c_dev[8];
                 I2CBus *i2c8_bus = I2C_BUS(qdev_get_child_bus(i2c8, "i2c"));
-                DeviceState *sensor = qdev_new("axera-ov-sensor");
 
-                qdev_prop_set_uint16(sensor, "id_reg_base", 0x300A);
-                qdev_prop_set_uint8(sensor, "id0", 0x53);
-                qdev_prop_set_uint8(sensor, "id1", 0x04);
-                qdev_prop_set_uint8(sensor, "id2", 0x41);
-                qdev_prop_set_uint8(sensor, "address", 0x36);
-                qdev_realize_and_unref(sensor, BUS(i2c8_bus), &error_fatal);
-                ax620u_sensor = sensor;
+                ax620u_sensor = image_sensor_create(i2c8_bus, "os04a10");
 
                 /*
                  * expander_io@0x20 on this exact bus in the real

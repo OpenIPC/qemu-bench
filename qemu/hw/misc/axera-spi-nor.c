@@ -559,7 +559,8 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
     uint32_t ctrl1 = s->mem[DW_SPI_CTRL1 / 4];
     uint32_t dfs = (ctrl0 & SPI_DFS_MASK) + 1;
     uint32_t frame_bytes = dfs > 8 ? dfs / 8 : 1;
-    uint32_t entries = ctrl1 + 1;
+    /* CTRL1 NDF is 16 bits on the DW SSI: at most 65536 frames */
+    uint32_t entries = (ctrl1 & 0xffff) + 1;
     uint32_t total = entries * frame_bytes;
     uint32_t i;
 
@@ -574,11 +575,16 @@ static void axera_spi_nor_start_data_phase(AxeraSpiNorState *s)
          * -- the write handler below already stops storing once
          * cmd_len hits sizeof(cmd_buf)==4, so latched_addr's own
          * cmd_buf[1..3] extraction is unaffected either way.
+         *
+         * The synthetic env is only served for reads that lie entirely
+         * inside the env window (U-Boot's env_sf_load() reads exactly
+         * that range); a read straddling its end gets the real flash
+         * bytes instead of running past the end of env[].
          */
         if (!s->env_overridden &&
             s->latched_addr >= AXERA_ENV_OFFSET &&
             s->latched_addr < AXERA_ENV_OFFSET + AXERA_ENV_SIZE &&
-            total <= AXERA_ENV_SIZE) {
+            total <= AXERA_ENV_OFFSET + AXERA_ENV_SIZE - s->latched_addr) {
             uint8_t env[AXERA_ENV_SIZE];
             uint32_t off = s->latched_addr - AXERA_ENV_OFFSET;
 
@@ -715,8 +721,8 @@ static void axera_spi_nor_ssienr_write(AxeraSpiNorState *s, uint32_t value)
             axera_spi_nor_start_data_phase(s);
         }
     } else if (!enable && s->ssienr && s->in_cmd_phase &&
-              s->session_start_cmd_len >= 4 && s->cmd_len >= 4 &&
-              s->cmd_buf[0] == SPINOR_OP_PP) {
+               s->cmd_len >= 4 && s->cmd_buf[0] == SPINOR_OP_PP &&
+               (s->session_start_cmd_len >= 4 || s->cmd_len > 4)) {
         /*
          * Page Program has no RX phase at all to use as a "the whole
          * multi-session command is done" signal the way reads do --
@@ -724,9 +730,15 @@ static void axera_spi_nor_ssienr_write(AxeraSpiNorState *s, uint32_t value)
          * already latched (session_start_cmd_len >= 4) can only be
          * the data phase (the address phase's own session always
          * starts at cmd_len==1), so its falling edge unambiguously
-         * marks the end of this PP op. Reset cmd_len here so the
-         * next command's opcode byte is recognised as byte 0, not
-         * byte N of this one.
+         * marks the end of this PP op. The same holds for a session
+         * that carried opcode, address AND data bytes together
+         * (cmd_len > 4 at its falling edge, whatever it started at).
+         * A session that merely completes the address (ends at exactly
+         * cmd_len==4 -- U-Boot's opcode+address phase, or the kernel's
+         * separate 3-byte address sub-phase) is never treated as the
+         * end: its data still follows in the next session. Reset
+         * cmd_len here so the next command's opcode byte is recognised
+         * as byte 0, not byte N of this one.
          */
         s->cmd_len = 0;
         s->in_cmd_phase = false;

@@ -70,6 +70,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/units.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qemu/log.h"
@@ -102,6 +103,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraDmaperState, AXERA_DMAPER)
 
 #define DMAPER_MAX_CHN          16
 #define CHN_TRANSF_DONE         BIT(0)
+
+/*
+ * A descriptor can describe up to block_ts (22 bits) << 7 = 512 MiB.
+ * Memory-to-memory transfers are copied through a fixed bounce buffer
+ * in chunks instead of one allocation of the whole length. A side that
+ * does not increment is a peripheral FIFO register costing one bus
+ * access per byte; the largest real FIFO-side transfer is the SPI NOR
+ * RX phase (CTRL1 is 16 bits wide: at most 64 Ki frames of up to 4
+ * bytes), so such transfers are bounded well above that instead of
+ * letting one descriptor issue hundreds of millions of MMIO accesses.
+ */
+#define AXERA_DMAPER_CHUNK      (4 * KiB)
+#define AXERA_DMAPER_MAX_FIFO_XFER (1 * MiB)
 
 /* The real engine takes real time to move bytes; completing (and
  * raising the IRQ) synchronously inside the DMAPER_START write let
@@ -198,8 +212,8 @@ static void axera_dmaper_do_transfer(AxeraDmaperState *s, unsigned ch)
     uint32_t src_tr_wridth, block_ts;
     uint64_t xfer_len;
     bool sinc, dinc;
-    uint8_t *buf;
-    uint64_t i;
+    uint8_t buf[AXERA_DMAPER_CHUNK];
+    uint64_t off;
     uint64_t lli_addr;
 
     lli_addr = ((uint64_t)s->mem[DMAPER_CHN_LLI_H(ch) / 4] << 32) |
@@ -237,38 +251,51 @@ static void axera_dmaper_do_transfer(AxeraDmaperState *s, unsigned ch)
      * single peripheral register through the transfer instead of
      * walking memory.
      */
-    buf = g_malloc(xfer_len);
-
-    if (sinc) {
-        if (address_space_read(&address_space_memory, sar,
-                               MEMTXATTRS_UNSPECIFIED, buf, xfer_len) !=
-            MEMTX_OK) {
-            g_free(buf);
-            return;
-        }
-    } else {
-        for (i = 0; i < xfer_len; i++) {
-            uint32_t word = 0;
-
-            address_space_read(&address_space_memory, sar,
-                               MEMTXATTRS_UNSPECIFIED, &word, sizeof(word));
-            buf[i] = word & 0xff;
-        }
+    if ((!sinc || !dinc) && xfer_len > AXERA_DMAPER_MAX_FIFO_XFER) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "axera-dmaper: ch%u FIFO-side transfer of %" PRIu64
+                      " bytes truncated to %u\n", ch, xfer_len,
+                      (unsigned)AXERA_DMAPER_MAX_FIFO_XFER);
+        xfer_len = AXERA_DMAPER_MAX_FIFO_XFER;
     }
 
-    if (dinc) {
-        address_space_write(&address_space_memory, dar,
-                            MEMTXATTRS_UNSPECIFIED, buf, xfer_len);
-    } else {
-        for (i = 0; i < xfer_len; i++) {
-            uint32_t word = buf[i];
+    for (off = 0; off < xfer_len; off += AXERA_DMAPER_CHUNK) {
+        uint32_t n = MIN(xfer_len - off, AXERA_DMAPER_CHUNK);
+        uint32_t i;
 
-            address_space_write(&address_space_memory, dar,
-                                MEMTXATTRS_UNSPECIFIED, &word, sizeof(word));
+        if (sinc) {
+            if (address_space_read(&address_space_memory, sar + off,
+                                   MEMTXATTRS_UNSPECIFIED, buf, n) !=
+                MEMTX_OK) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "axera-dmaper: ch%u source bus error at 0x%"
+                              PRIx64 "\n", ch, sar + off);
+                return;
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                uint32_t word = 0;
+
+                address_space_read(&address_space_memory, sar,
+                                   MEMTXATTRS_UNSPECIFIED, &word,
+                                   sizeof(word));
+                buf[i] = word & 0xff;
+            }
+        }
+
+        if (dinc) {
+            address_space_write(&address_space_memory, dar + off,
+                                MEMTXATTRS_UNSPECIFIED, buf, n);
+        } else {
+            for (i = 0; i < n; i++) {
+                uint32_t word = buf[i];
+
+                address_space_write(&address_space_memory, dar,
+                                    MEMTXATTRS_UNSPECIFIED, &word,
+                                    sizeof(word));
+            }
         }
     }
-
-    g_free(buf);
 
     s->mem[DMAPER_INT_RAW(ch) / 4] |= CHN_TRANSF_DONE;
     axera_dmaper_update_irq(s, ch);

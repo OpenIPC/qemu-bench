@@ -83,7 +83,9 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/units.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "hw/sysbus.h"
@@ -122,6 +124,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraGzipdState, AXERA_GZIPD)
 
 #define TABLE_REGION_LEN (LIT_REGION_LEN + DIST_REGION_LEN + 1)
 #define BLOCK_HDR_LEN   16
+
+/* Longest LZ77 match (symbol 511 -> length 258). */
+#define MAX_MATCH_LEN   258
+
+/*
+ * Upper bound on one job's decompressed size (WDMA_CFG1 + 1). BL1 only
+ * ever runs boot images (U-Boot ~400 KiB on the real AX620E dump; at
+ * most a kernel or rootfs image of tens of MiB) through this engine, and
+ * the largest Axera machine here has 2 GiB of RAM. Anything larger is
+ * rejected up front instead of being allocated on the host. The
+ * compressed-data accumulator is bounded by the same figure plus room
+ * for per-block headers/tables on incompressible input.
+ */
+#define AXERA_GZIPD_MAX_OSIZE   (256 * MiB)
+#define AXERA_GZIPD_MAX_ACCUM   (AXERA_GZIPD_MAX_OSIZE + 16 * MiB)
 
 static const uint32_t dist_base[DIST_ALPHA] = {
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
@@ -227,7 +244,18 @@ static int decode_symbol(BitReader *br, const HuffTable *t, int cap, int alpha)
         uint32_t offset = code - t->firstcode[i];
 
         if (code >= t->firstcode[i] && offset < count_this) {
-            return t->table1[t->valptr[i] + offset];
+            /*
+             * valptr/firstcode come straight from the compressed stream:
+             * a malformed table can point the rank past this alphabet
+             * (count_this underflows when valptr > alpha). Reject it
+             * instead of indexing past table1[].
+             */
+            uint64_t idx = (uint64_t)t->valptr[i] + offset;
+
+            if (idx >= (uint64_t)alpha) {
+                return -1;
+            }
+            return t->table1[idx];
         }
     }
     return -1;
@@ -252,10 +280,10 @@ static bool blocks_fit(const uint8_t *buf, size_t avail_len, uint32_t blk_num,
             return false;
         }
         uint32_t chead0 = ldl_le_p(buf + addr);
-        uint32_t data_len = chead0 + 1;
-        uint32_t block_size = BLOCK_HDR_LEN + TABLE_REGION_LEN + data_len;
+        size_t data_len = (size_t)chead0 + 1;
+        size_t block_size = BLOCK_HDR_LEN + TABLE_REGION_LEN + data_len;
 
-        if (addr + block_size > avail_len) {
+        if (block_size > avail_len - addr) {
             return false;
         }
         addr += block_size;
@@ -278,7 +306,16 @@ static uint8_t *decode_axgzip(const uint8_t *data, uint32_t blk_num,
     size_t addr;
     uint32_t blk;
 
-    out_cap = osize + 1024;
+    /*
+     * Fixed output budget: a well-formed stream produces exactly osize
+     * bytes, so the buffer never grows; the slack only absorbs the final
+     * match of the last block. Every token emits at least one byte, so
+     * this also bounds the per-job decode work whatever ntok says.
+     */
+    if (osize == 0 || osize > AXERA_GZIPD_MAX_OSIZE) {
+        return NULL;
+    }
+    out_cap = (size_t)osize + MAX_MATCH_LEN;
     out = g_malloc(out_cap);
     out_used = 0;
 
@@ -286,7 +323,7 @@ static uint8_t *decode_axgzip(const uint8_t *data, uint32_t blk_num,
     for (blk = 0; blk < blk_num; blk++) {
         size_t block_start = addr;
         uint32_t chead0 = ldl_le_p(data + addr);
-        uint32_t data_len = chead0 + 1;
+        size_t data_len = (size_t)chead0 + 1;
         const uint8_t *table_region = data + addr + BLOCK_HDR_LEN;
         const uint8_t *lit_region = table_region;
         const uint8_t *dist_region = table_region + LIT_REGION_LEN;
@@ -298,14 +335,14 @@ static uint8_t *decode_axgzip(const uint8_t *data, uint32_t blk_num,
                   DIST_N_ENTRIES, &dist_t);
 
         uint32_t entry15_raw = extract_bits(dist_region, 300, 20);
-        uint32_t ntok = (entry15_raw + 1) * 4096;
+        uint64_t ntok = ((uint64_t)entry15_raw + 1) * 4096;
 
         const uint8_t *data_bytes = data + addr + BLOCK_HDR_LEN
                                     + TABLE_REGION_LEN;
         BitReader br = { .data = data_bytes, .pos = 0,
-                         .nbits = (size_t)data_len * 8 };
+                         .nbits = data_len * 8 };
         bool is_final = (blk == blk_num - 1);
-        uint32_t token_i = 0;
+        uint64_t token_i = 0;
 
         while (is_final ? (out_used < osize) : (token_i < ntok)) {
             int sym = decode_symbol(&br, &lit_t, LIT_CAP, LIT_ALPHA);
@@ -316,8 +353,7 @@ static uint8_t *decode_axgzip(const uint8_t *data, uint32_t blk_num,
 
             if (sym < 256) {
                 if (out_used >= out_cap) {
-                    out_cap *= 2;
-                    out = g_realloc(out, out_cap);
+                    goto fail;
                 }
                 out[out_used++] = sym;
             } else {
@@ -333,9 +369,8 @@ static uint8_t *decode_axgzip(const uint8_t *data, uint32_t blk_num,
                 if (dist == 0 || dist > out_used) {
                     goto fail;
                 }
-                while (out_cap < out_used + length) {
-                    out_cap *= 2;
-                    out = g_realloc(out, out_cap);
+                if (length > out_cap - out_used) {
+                    goto fail;
                 }
                 uint32_t k;
                 for (k = 0; k < length; k++) {
@@ -345,7 +380,7 @@ static uint8_t *decode_axgzip(const uint8_t *data, uint32_t blk_num,
             }
         }
 
-        uint32_t block_size = BLOCK_HDR_LEN + TABLE_REGION_LEN + data_len;
+        size_t block_size = BLOCK_HDR_LEN + TABLE_REGION_LEN + data_len;
         addr = block_start + block_size;
     }
 
@@ -372,6 +407,17 @@ static void axera_gzipd_reset_accum(AxeraGzipdState *s)
 
 static void axera_gzipd_append(AxeraGzipdState *s, hwaddr addr, uint32_t size)
 {
+    if (s->osize == 0 || s->osize > AXERA_GZIPD_MAX_OSIZE) {
+        /* Rejected (or never configured) job: drop its tiles. */
+        return;
+    }
+    if (size > AXERA_GZIPD_MAX_ACCUM - s->accum_len) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "axera-gzipd: compressed input exceeds %u bytes, "
+                      "dropping job\n", (unsigned)AXERA_GZIPD_MAX_ACCUM);
+        axera_gzipd_reset_accum(s);
+        return;
+    }
     if (s->accum_len + size > s->accum_cap) {
         s->accum_cap = (s->accum_len + size) * 2 + 4096;
         s->accum = g_realloc(s->accum, s->accum_cap);
@@ -396,6 +442,11 @@ static void axera_gzipd_append(AxeraGzipdState *s, hwaddr addr, uint32_t size)
                                MEMTXATTRS_UNSPECIFIED, out, out_len);
             g_free(out);
             s->mem[GZIPD_STATUS1_REG / 4] |= GZIP_COMPLETE_INTR;
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "axera-gzipd: malformed AXGZIP stream "
+                          "(%u blocks, osize %u), job dropped\n",
+                          s->blk_num, s->osize);
         }
         axera_gzipd_reset_accum(s);
     }
@@ -418,6 +469,12 @@ static void axera_gzipd_write(void *opaque, hwaddr offset, uint64_t value,
         axera_gzipd_reset_accum(s);
         s->osize = value + 1;
         s->mem[offset / 4] = value;
+        if (s->osize == 0 || s->osize > AXERA_GZIPD_MAX_OSIZE) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "axera-gzipd: output size 0x%" PRIx64 " + 1 "
+                          "exceeds the %u-byte limit, job ignored\n",
+                          value, (unsigned)AXERA_GZIPD_MAX_OSIZE);
+        }
         return;
     case GZIPD_WDMA_CFG0_REG:
         s->mem[offset / 4] = value;

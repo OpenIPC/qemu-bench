@@ -308,13 +308,20 @@ static void engine_tdp_done(void *opaque, int ret)
     AxeraIvpsEngineState *s = opaque;
 
     s->busy = false;
-    if (s->job_gen != s->gen) {
-        return;
+    /*
+     * A job from before a reset posts nothing (engine_reset() waits for
+     * it, so this is only a safety net); the empty tiles behind it and
+     * a kick queued meanwhile are newer and go ahead regardless.
+     */
+    if (s->job_gen == s->gen) {
+        s->pending |= s->job_bits;
     }
-    s->pending |= s->job_bits | s->job_tail;
+    s->pending |= s->job_tail;
     s->job_tail = 0;
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              ENGINE_DELAY_NS);
+    if (s->pending) {
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  ENGINE_DELAY_NS);
+    }
     if (s->next_bits && !s->held) {    /* a held DPU kick waits on */
         uint32_t bits = s->next_bits;
 
@@ -749,6 +756,11 @@ static bool dpu_capture_e(const uint32_t *regs, DpuJob *job)
         .galpha = DPU_REG(0x178) & 2 ? DPU_REG(0x19c) & 0xff : 255,
     };
     job->nov = dpu_ovl_valid(o);
+    if (job->w > 8192 || job->h > 8192) {
+        qemu_log_mask(LOG_GUEST_ERROR, "axera-dpu: draw rectangle %ux%u "
+                      "too large, not drawn\n", job->w, job->h);
+        return false;
+    }
     return job->nov && job->out.y && job->w && job->h;
 }
 
@@ -981,16 +993,27 @@ static void engine_reset(DeviceState *dev)
 {
     AxeraIvpsEngineState *s = AXERA_IVPS_ENGINE(dev);
 
-    memset(s->regs, 0, sizeof(s->regs));
-    memset(s->port, 0, sizeof(s->port));
-    s->status = 0;
-    s->pending = 0;
+    /*
+     * A pixel job in the worker writes guest memory and axera-fbuf
+     * pictures: wait for it, so none of it lands after the reset (on a
+     * new boot's buffers). The worker needs no BQL; its completion,
+     * engine_tdp_done(), runs here from aio_poll() in the main loop.
+     * Drop what is queued first and bump gen, so that completion
+     * neither posts done bits nor starts another job.
+     */
     s->next_bits = 0;
     s->job_tail = 0;
     s->next_tail = 0;
     s->waiter = NULL;
     s->held = false;
     s->gen++;
+    while (s->busy) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    memset(s->regs, 0, sizeof(s->regs));
+    memset(s->port, 0, sizeof(s->port));
+    s->status = 0;
+    s->pending = 0;
     timer_del(s->timer);
     timer_del(s->hold_timer);
     qemu_set_irq(s->irq, 0);

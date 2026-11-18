@@ -143,6 +143,7 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
 #include "qemu/module.h"
 #include "qom/object.h"
 #include "qemu/timer.h"
@@ -707,6 +708,8 @@ static void axera_vin_ae_stats(AxeraVinState *s)
     }
 }
 
+#define AE_RAW_MAX_STRIDE   (64 * KiB)
+
 /* AX620U: the IFE raw scaler's frame, see "3A statistics" */
 static void axera_vin_ae_raw(AxeraVinState *s)
 {
@@ -719,6 +722,12 @@ static void axera_vin_ae_raw(AxeraVinState *s)
     double k;
 
     if (!w || !h || w > 1024 || h > 1024 || f->y_stride < groups * 16) {
+        return;
+    }
+    /* a 1024-pixel row packs into 1824 bytes */
+    if (f->y_stride > AE_RAW_MAX_STRIDE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "axera-vin: AE raw stride %u too "
+                      "large, frame not written\n", f->y_stride);
         return;
     }
     k = axera_vin_ae_gain(s, &e);

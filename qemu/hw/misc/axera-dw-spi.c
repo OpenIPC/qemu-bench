@@ -119,11 +119,26 @@ static void axera_dw_spi_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
 }
 
+/*
+ * A system reset (e.g. the watchdog's) must not hand the next boot any
+ * loopback bytes still queued from an interrupted transfer, nor stale
+ * controller configuration: back to the all-zero power-on state.
+ */
+static void axera_dw_spi_reset(DeviceState *dev)
+{
+    AxeraDwSpiState *s = AXERA_DW_SPI(dev);
+
+    memset(s->mem, 0, DW_SPI_SIZE);
+    s->rxq_head = 0;
+    s->rxq_len = 0;
+}
+
 static void axera_dw_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = axera_dw_spi_realize;
+    device_class_set_legacy_reset(dc, axera_dw_spi_reset);
 }
 
 static const TypeInfo axera_dw_spi_info = {
