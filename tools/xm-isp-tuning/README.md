@@ -79,6 +79,30 @@ Applied to an OpenIPC IVG-K8 beside a stock one (dark storeroom, ISO ~20000,
 OpenIPC one a little sharper. Re-running the capture reproduces the set the
 shipped `sc465sl.bin` was exported from byte for byte.
 
+## The twin route, and why it wins
+
+`twin/xm-twin-export.py` boots the whole stock firmware in the `gk7206v11a`
+machine, lets the App bring its ISP up, and runs `attrtool dump` and
+`pqexport` inside it (static musl builds of the camera tools, linked against
+the SDK's `.a` libraries; `camera/hexout.c` carries the results out over the
+console). About ten minutes, nearly all of it typing the tools in.
+
+It reads what the App actually left in the ISP, including what it rewrites
+after the code path the Unicorn capture runs. For SC465SL that matters: the
+capture's STNR, BNR temporal, sharpen and LCE tables are not the App's live
+ones. Interpolated to a stock camera's ISO (21010, 25867), the twin's
+tables give the values that camera reports in `/proc/umap/isp` (TNR motion
+thresholds 32/65, chroma strength 248, sharpen texture 16, overshoot 86);
+the capture's give 22/43, 224, 13, 113. The static blocks (gamma, CA,
+demosaic, DPC, LCAC, BLC, shading) and the AWB calibration agree byte for
+byte between the two.
+
+So the shipped `sc465sl.bin` takes its ISP blocks from the twin and its AWB
+calibration from the capture (the App's own AWB is not in the ISP to read),
+through `xm-isp-finish` as before. The twin's scene is synthetic and bright,
+so scene-driven scalars (DRC strength, dehaze, the AWB gains) are the
+twin's daylight values; the ISO-indexed tables do not depend on that.
+
 ## Not covered
 
 - The App's night (IR) half: `--then 0x362958:1` applies it after the
@@ -90,6 +114,3 @@ shipped `sc465sl.bin` was exported from byte for byte.
   profile — the setters are named by the `xmedia_*_attr ISP_Failed` strings
   logged after each call, and the monitor entry is the thread `IspCtrl_init`
   starts.
-- The `gk7206v11a` twin boots the same stock firmware; exporting from inside
-  the twin would read the App's runtime state directly, against the twin's
-  synthetic scene.
