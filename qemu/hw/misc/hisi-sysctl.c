@@ -71,6 +71,13 @@ struct HisiSysctlState {
      */
     uint32_t v1_chip_id_88;
     uint32_t v1_chip_id_8c;
+    /*
+     * Offset of the system soft-reset register: 0x04 (SC_SYSRES) on
+     * HiSilicon, 0x08 on Goke GK7206 / XMedia xmorca (u-boot
+     * arch-xmorca/platform.h REG_SC_SYSRES; the kernel's lotus-reboot
+     * driver writes 0xdeadbeef at the DT's reboot-offset = <0x8>).
+     */
+    uint32_t sysres_offset;
     uint32_t regs[HISI_SYSCTL_NREGS];
     /*
      * Power-on image of regs[]: whatever machine init stored (SYSSTAT boot
@@ -87,13 +94,15 @@ static uint64_t hisi_sysctl_read(void *opaque, hwaddr offset, unsigned size)
 {
     HisiSysctlState *s = HISI_SYSCTL(opaque);
 
+    if (offset == s->sysres_offset) {
+        return 0;   /* SC_SYSRES: write-only, reads 0 */
+    }
+
     switch (offset) {
     case 0x00: /* SC_CTRL */
         return (s->regs[0] & ~SC_CTRL_MODE_STATUS_MASK) |
                ((s->regs[0] & SC_CTRL_MODE_CTRL_MASK)
                 << SC_CTRL_MODE_STATUS_SHIFT);
-    case 0x04: /* SC_SYSRES — system reset (write-only, read returns 0) */
-        return 0;
     case 0x88: /* V1 chip ID register (read-only, write-ignored) */
         return s->v1_chip_id_88;
     case 0x8C: /* V1 chip ID + REG_SYSSTAT (boot mode) — bits[14:8] hold
@@ -141,13 +150,15 @@ static void hisi_sysctl_write(void *opaque, hwaddr offset,
 {
     HisiSysctlState *s = HISI_SYSCTL(opaque);
 
-    switch (offset) {
-    case 0x04: /* SC_SYSRES — system reset */
+    if (offset == s->sysres_offset) {   /* SC_SYSRES — system reset */
         qemu_log_mask(LOG_UNIMP,
                       "hisi-sysctl: SC_SYSRES reset triggered (val=0x%08x)\n",
                       (uint32_t)val);
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
-        break;
+        return;
+    }
+
+    switch (offset) {
     case 0x00: /* SC_CTRL */
         s->regs[0] = (uint32_t)val;
         qemu_set_irq(s->remap_clear, !!(val & SC_CTRL_REMAP_CLEAR));
@@ -208,6 +219,7 @@ static const Property hisi_sysctl_properties[] = {
     DEFINE_PROP_UINT8("chip-variant", HisiSysctlState, chip_variant, 0),
     DEFINE_PROP_UINT32("v1-chip-id-88", HisiSysctlState, v1_chip_id_88, 0),
     DEFINE_PROP_UINT32("v1-chip-id-8c", HisiSysctlState, v1_chip_id_8c, 0),
+    DEFINE_PROP_UINT32("sysres-offset", HisiSysctlState, sysres_offset, 0x04),
 };
 
 static void hisi_sysctl_class_init(ObjectClass *klass, const void *data)

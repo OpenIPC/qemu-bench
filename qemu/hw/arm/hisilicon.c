@@ -2391,8 +2391,11 @@ static const HisiSoCConfig gk7202v330_soc = {
  * The ShiMetaPi SDK ships board configs only for xm7206v11a and xm7206v12a
  * (configs/<chip>/reg/ DDR sheets: DDR3 128M and 256M).  The variants share
  * one die map, so it lives in GK7206_XMORCA_PERIPH below and each machine
- * adds only its name, chip ID and DDR layout.  Modelled: gk7206v10 and
- * gk7206v12a (the SDK target run-gk7206.sh builds its kernel for).
+ * adds only its name, chip ID and DDR layout.  Modelled: gk7206v10,
+ * gk7206v11a and gk7206v12a (the SDK target run-gk7206.sh builds its kernel
+ * for).  With flash-file= and no -kernel, the boot ROM stand-in reads the
+ * xmorca boot header (hisi_xmorca_boot_header) and OpenIPC's U-Boot boots
+ * from SPI NOR or SPI NAND.
  *
  * DDR layout is the vendor one: Linux gets mem=32M and the rest is MMZ at
  * 0x42000000 under the *xmedia* allocator (not the HiSilicon "hisi" one the
@@ -2414,9 +2417,15 @@ static const HisiSoCConfig gk7202v330_soc = {
  * uniprocessor GIC, so a 1-CPU model makes the kernel's gic_get_cpumask()
  * read 0 ("GIC CPU mask not found — kernel will fail to boot") and wedges
  * every interrupt-driven probe.  With 2 CPU interfaces ITARGETSR reports the
- * real mask and interrupts work.  CPU1 itself never onlines — the vendor
- * "lotus,xmorca-smp" release method isn't modeled — but the kernel times out
- * on it gracefully and continues single-core (same as the DTS expects).
+ * real mask and interrupts work.
+ *
+ * CPU1 release ("lotus,xmorca-smp", SDK lotus/machine/xmorca/smp.c; the
+ * stock XM and OpenIPC kernels alike): the kernel writes
+ * "ldr pc, [pc, #-4]; .word secondary_startup" at physical 0, clears bits 7
+ * and 20 of PERI_CRG30 (CRG+0x78) and sends a wake-up SGI.  CPU1 leaves
+ * reset at PC 0 (no ATF on xmorca; Secure SVC like CPU0).  A running board
+ * reads CRG+0x78 = 0x301 with both CPUs up; the reset value below is that
+ * plus the two hold bits (bits 0/8/9 are not read back by anything here).
  *
  * Boots the vendor SDK kernel (linux-5.10.y, xmorca_defconfig) via -kernel
  * with the appended xmorca.dtb, to busybox userspace from an initramfs or
@@ -2424,6 +2433,9 @@ static const HisiSoCConfig gk7202v330_soc = {
  */
 #define GK7206_XMORCA_PERIPH                                                   \
     .max_cpus           = 2,            /* dual Cortex-A7 MP2 */               \
+    .cpu_srst_offset    = 0x78,         /* PERI_CRG30 REG_CPU_CORE_SRST */     \
+    .cpu_srst_mask      = (1 << 7) | (1 << 20), /* lotus_boot_secondary() */  \
+    .cpu_srst_reset     = 0x00100381,   /* 0x301 on a booted board + 7, 20 */ \
     .default_cpus       = 2,            /* 2 GIC CPU interfaces (ITARGETSR !RAZ) */ \
     .gpio_count         = 9,            /* GPIO0..GPIO8 @ 0x120b0000..0x120b8000 (DTS) */ \
     HISI_V4_COMMON_PERIPH,                                                     \
@@ -2433,9 +2445,32 @@ static const HisiSoCConfig gk7202v330_soc = {
     .gpio_irq_start     = 22,                                                  \
     .xmsp804_timer      = true,         /* XMedia kernel uses xmedia,sp804 */  \
     .femac_base         = 0x100d0000,   /* GMAC_REG_BASE — orca relocated FE MAC */ \
+    /* HW gzip at the V4 address (0x11310000), registers moved: the SDK's      \
+     * u-boot lotus/hw_dec/hw_decompress_v1.h.  U-Boot's hw_compressed loader  \
+     * unpacks U-Boot with it. */                                              \
+    .gzip_layout        = 1,                                                   \
+    /* SYSSTAT[1:0] boot device (arch-xmorca/platform.h get_sys_boot_mode). */ \
+    .sysstat_boot_dev   = true,                                                \
     /* DTS ethernet@100d0000 irq 0x25.  V4 common's femac_irq=33 is both wrong \
      * for orca and collides with sdhci mmc1 (also 33) below. */               \
     .femac_irq          = 37,                                                  \
+    /* The MAC there is a Faraday FTGMAC030 ("lotus,ftgmac030"), not FEMAC. */ \
+    .femac_type         = "ftgmac030",                                         \
+    /* RTC 0x120e0000: lotus SPI-bridge RTC, internal map shifted vs hisi.  \
+     * Watchdog 0x12030000: 3 SP805 cores at 0x20 stride + one shared lock  \
+     * at 0xC00 (DT wdt0 SPI 2, wdt1 SPI 3), 24 MHz (clk_24m; measured on a \
+     * running board).  Both models: hw/misc/lotus-{rtc,wdt}.c. */          \
+    .rtc_type           = "lotus-rtc",                                         \
+    .wdt_type           = "lotus-wdt",                                         \
+    .wdt_freq           = 24000000,                                            \
+    /* Soft reset at SYSCTRL+0x08, not 0x04: u-boot arch-xmorca/platform.h     \
+     * REG_SC_SYSRES, kernel DT sysctrl reboot-offset = <0x8>. */              \
+    .sysctl_sysres      = 0x08,                                                \
+    /* Audio: "lotus,aiao" is XM's own AIAO (xm_aio.ko), not the V4 one,     \
+     * and DTS aiao@100e0000 interrupts = <0 47 4> ("AIO", GIC 79).          \
+     * The acodec at 0x100f0000 stays a register bank. */                    \
+    .aiao_type          = "xm-aiao",                                           \
+    .aiao_irq           = 47,                                                  \
     /* Flash: "lotus,fmc" (fmc100) — same IP as HiFMC V100 but a shuffled      \
      * register map, and the DT "control" reg sits at 0x10000010 (not          \
      * 0x10000000).  Memory window stays at 0x14000000 (from V4 common). */    \
@@ -2449,8 +2484,24 @@ static const HisiSoCConfig gk7202v330_soc = {
      * leaves the eMMC probe waiting forever for command-complete (which is    \
      * why the sdhci node used to be DTB-disabled). */                         \
     .num_sdhci          = 3,                                                   \
-    .sdhci_bases        = { 0x10010000, 0x10040000, 0x10020000 },              \
-    .sdhci_irqs         = { 32, 33, 34 },                                      \
+    /* Listed SD slot first, so `-drive if=sd,file=...` (index 0) is the SD   \
+     * card socket: SDIO0 @0x10040000 is "mmc0" on a stock IVG-K8 (its DT    \
+     * disables the eMMC one, which reads all-zero unclocked on the board)    \
+     * and "mmc 0" in OpenIPC's U-Boot.  index=1 is the eMMC, index=2 SDIO1. */ \
+    .sdhci_bases        = { 0x10040000, 0x10010000, 0x10020000 },              \
+    .sdhci_irqs         = { 33, 32, 34 },                                      \
+    /* USB 2.0 host: DWC3 ("snps,dwc3" under "lotus,dwcusb2") at 0x10030000,  \
+     * DTS interrupts <0 38 4> (GIC 70 = xhci-hcd:usb1 on the real board),    \
+     * dr_mode "host"; dwc3/core.c hands its xHCI to xhci-plat. */            \
+    .xhci_base          = 0x10030000,                                          \
+    .xhci_irq           = 38,                                                  \
+    .xhci_dwc3_core     = true,                                                \
+    /* The board's HCSPARAMS1 reads 0x01000140: 64 slots, 1 interrupter.     \
+     * Left at 0, sysbus-xhci ends up with 1 slot (its core is re-zeroed      \
+     * after the wrapper's defaults), so a 2nd device fails "Error while      \
+     * assigning device slot ID". */                                          \
+    .xhci_slots         = 64,                                                  \
+    .xhci_intrs         = 1,                                                   \
     /* Pre-mark the SD/MMC DLL (delay-locked-loop) status registers as         \
      * locked/ready in the CRG.  The lotus,sdhci driver reads these via its    \
      * crg_regmap phandle (drivers/mmc/host/sdhci-xmorca.c) to pick a data     \
@@ -2481,7 +2532,27 @@ static const HisiSoCConfig gk7202v330_soc = {
     .uart_bases         = { 0x12040000, 0x12041000, 0x12042000, 0x12043000 },  \
     .uart_irqs          = { 11, 12, 13, 14 },                                  \
                                                                                \
-    /* 4 I2C @ 0x1206{0..3}000 (V4 common had 3; I2C wires no IRQ here). */    \
+    /* 4 I2C @ 0x1206{0..3}000 (V4 common had 3; I2C wires no IRQ here).      \
+     * "lotus,lotus-i2c": HiBVT's sequencer at other offsets (lotus-i2c). */   \
+    .i2c_type           = "lotus-i2c",                                         \
+                                                                               \
+    /* CRG+0x1e4 reports the media blocks' reset requests back; XM's sys     \
+     * HAL (xm_common.ko sys_hal_*_reset / *_reset_get) polls it after each   \
+     * reset.  request offset << 16 | request bit << 8 | status bit.          \
+     * Every entry is non-zero, as the list ends at the first zero. */       \
+    .crg_rst_sta_offset = 0x1e4,                                               \
+    .crg_rst_sta        = {                                                    \
+        0x00a40001,                     /* VEDU     0xa4[0] -> 1  */           \
+        0x00a80004,                     /* VPSS     0xa8[0] -> 4  */           \
+        0x00fc0407,                     /* VI proc  0xfc[4] -> 7  */           \
+        0x00f40408, 0x00f40509, 0x00f4060a, 0x00f4070b, /* VI port n */       \
+        0x00f4090d, 0x00f40a0e, 0x00f40b0f, 0x00f40c10, /* VI fe n */         \
+        0x00b00018,                     /* JPGE     0xb0[0] -> 24 */           \
+        0x00ac0002,                     /* VGS      0xac[0] -> 2  */           \
+        0x00bc0003,                     /* TDE      0xbc[0] -> 3  */           \
+        0x00c00005,                     /* GDC      0xc0[0] -> 5  */           \
+        0x01340105,     /* IVE 0x134[1] -> 5: its _reset_get is GDC's */  \
+    },                                                                         \
     .num_i2c            = 4,                                                   \
     .i2c_bases          = { 0x12060000, 0x12061000, 0x12062000, 0x12063000 },  \
                                                                                \
@@ -2494,12 +2565,17 @@ static const HisiSoCConfig gk7202v330_soc = {
      * VEDU relocated on orca: DTS vedu@0x11800000 with a 2nd reg window at    \
      * 0x11420000 (V4 common put the primary block at 0x11410000).  jpge_base  \
      * stays 0x11420000 — that is exactly VEDU's 2nd window on this die, mapped \
-     * as the hisi-vedu device's MMIO region 1.  DTS shares GIC SPI 45 between \
-     * VEDU and MIPI RX; QEMU's GIC has one level per input, so we keep the    \
-     * inherited vedu_irq (47, otherwise unused in this model) rather than     \
-     * clobber MIPI's pic[45].  The encoder IRQ isn't exercised on -kernel boot. \
+     * as the hisi-vedu device's MMIO region 1.  Neither engine has HiMPP's    \
+     * layout: XM's xm_vedu / xm_jpege program everything over MMIO (gen 7,    \
+     * hw/misc/hisi-vedu-xm.c.inc).  IRQs per the DTS and the stock firmware's \
+     * /proc/interrupts (VEDU_0 GIC 77, JPGE_0 GIC 72): SPI 45 and 40.  The    \
+     * DTS puts MIPI RX on SPI 45 too; hisi-mipi-rx never raises its line, so  \
+     * both sit on pic[45] without an OR gate.                                 \
      */                                                                        \
     .vedu_base          = 0x11800000,                                          \
+    .vedu_gen           = 7,                                                   \
+    .vedu_irq           = 45,                                                  \
+    .jpge_irq           = 40,                                                  \
                                                                                \
     /*                                                                         \
      * Full regbank re-list for xmorca (V4 common's array can't be             \
@@ -2513,8 +2589,10 @@ static const HisiSoCConfig gk7202v330_soc = {
      *     unmapped so the kernel drivers faulted on probe.                    \
      * Note: 2nd watchdog@12030020 (DTS) sits inside wdt@12030000's window and \
      * is left unmodelled.  hisi-jpge stays folded into hisi-vedu (see above). \
+     * VI / VPSS / VGS are lotus-vi / -vpss / -vgs (.lotus_media), not banks. \
      */                                                                        \
-    .num_regbanks       = 20,                                                  \
+    .lotus_media        = true,                                                \
+    .num_regbanks       = 16,                                                  \
     .regbanks           = {                                                    \
         { "hisi-misc",       0x12028000, 0x8000  },                            \
         { "hisi-ddr",        0x120d0000, 0x10000 },                            \
@@ -2525,12 +2603,8 @@ static const HisiSoCConfig gk7202v330_soc = {
         { "hisi-usb3",       0x10030000, 0x10000 },                            \
         { "hisi-aiao",       0x100e0000, 0x10000 },                            \
         { "hisi-acodec",     0x100f0000, 0x10000 },                            \
-        { "hisi-vi-cap",     0x11000000, 0x200000 },                           \
-        { "hisi-vi-proc",    0x11200000, 0x40000 },                            \
-        { "hisi-vgs",        0x11300000, 0x10000 },                            \
         { "hisi-ive",        0x11490000, 0x10000 },  /* orca: was 0x11320000 */ \
         { "hisi-npu",        0x11340000, 0x10000 },                            \
-        { "hisi-vpss",       0x11400000, 0x10000 },                            \
         { "hisi-lsadc",      0x120a0000, 0x1000  },  /* adc@120a0000 lotus,lsadc */ \
         { "hisi-cipher",     0x10050000, 0x10000 },  /* cipher@10050000 AES/SHA/RSA */ \
         { "hisi-vo",         0x11280000, 0x40000 },  /* vo/gfbg@11280000 display */ \
@@ -2547,6 +2621,28 @@ static const HisiSoCConfig gk7206v10_soc = {
     .kernel_mem_mb      = 32,
     .extra_cmdline      = "mmz_allocator=xmedia "
                           "mmz=anonymous,0,0x42000000,32M",
+};
+
+/* GK7206V11A — the QFN128 bin with 1Gb DDR3L (128 MiB): the SDK's
+ * xm7206v11a board config (configs/xm7206v11a/reg, "DDR3 128M"). */
+static const HisiSoCConfig gk7206v11a_soc = {
+    .name               = "gk7206v11a",
+    .desc               = "Goke GK7206V11A (Cortex-A7 MP2 + RISC-V MCU, 1.0 TOPS NPU, 4K)",
+    .soc_id             = GOKE_SOC_ID_7206V11A,
+    GK7206_XMORCA_PERIPH,
+    /* XM's IVG-K8 (board IPC_83G40): its App probes an SC4336P at 0x64 and
+     * this SC465SL at 0x60 (8-bit) and expects chip ID 0xBD82 */
+    .default_sensor     = "sc465sl",
+    /* The IVG-K8's input pins that read high (board pull-ups), measured on
+     * one running its stock firmware: GPIO DATA & ~DIR per bank.  Among
+     * them is the reset button, active low: with every input at 0 the App
+     * sees it held ("PressResetKey") and reboots (rebootV2 type 10). */
+    .gpio_input_high    = { 0x00, 0x61, 0x00, 0x20, 0x48, 0xfe, 0x7f, 0x60,
+                            0x10 },
+    .ram_size_default   = 128 * MiB,    /* embedded 1Gb DDR3L */
+    .kernel_mem_mb      = 32,
+    .extra_cmdline      = "mmz_allocator=xmedia "
+                          "mmz=anonymous,0,0x42000000,96M",
 };
 
 /* GK7206V12A — the QFN128 top bin with 2Gb DDR3L (256 MiB). */
@@ -4667,6 +4763,23 @@ static void hisilicon_cpu1_reset(void *opaque, int n, int level)
     }
 }
 
+/*
+ * System reset on a firmware boot.  Nothing else resets CPU1 there
+ * (hisilicon_maskrom_cpu_reset only handles CPU0; with -kernel,
+ * arm_load_kernel resets every CPU), so a guest restart would leave it
+ * running the old kernel's stop loop while CPU0 boots afresh, and the
+ * next kernel's release would find it "already on" ("CPU1: failed to
+ * come online").  cpu_reset() honours start-powered-off, so CPU1 is
+ * parked again until the CRG bit releases it, and the CRG register
+ * itself returns to its held reset value.
+ */
+static void hisilicon_cpu1_sys_reset(void *opaque)
+{
+    HisiCpuRelease *r = opaque;
+
+    cpu_reset(CPU(r->cpu));
+}
+
 /* ARM instruction encoding helpers for boot ROM generation */
 static inline uint32_t arm_movw(int rd, uint16_t imm16)
 {
@@ -4690,6 +4803,95 @@ static inline uint32_t arm_movt(int rd, uint16_t imm16)
  * Since QEMU DDR is already available, we simplify to a single copy
  * of the boot partition (256 KB) from flash window to DDR base.
  */
+/*
+ * Goke GK7206 (xmorca) / XMedia "lotus" boot header.  The image the mask ROM
+ * reads from flash 0 (OpenIPC u-boot include/configs/xmorca.h, the SDK's
+ * u-boot-2020.01 arch/arm/cpu/armv7/xmorca/start.S) is:
+ *
+ *   0x0000  key area (root RSA key; zero on an unsigned image)
+ *   0x0400  params: +0x00 auxcode area length, +0x04 boot code area length,
+ *           +0x08 total boot area length (boot code + its 0x200 signature),
+ *           +0x14 boot entry point, +0x38 the DDR register table the
+ *           auxcode trains DDR from (0x2000 bytes), +0x203c MCU fw length
+ *   0x27C0  unchecked area: SCS flag (0x69875AB4: do not verify), the
+ *           address the boot area is stored at in DDR, flash-empty flag
+ *           (0x435A590D: not empty)
+ *   0x2800  auxcode area ("XMORCA" image info, "Auxiliary_Code"), then the
+ *           MCU firmware area, then the boot code area, whose end carries
+ *           the magic 0x96A5784B and a 0x200-byte signature slot.
+ *
+ * On silicon the ROM loads the auxcode into SRAM and runs it -- DDR init
+ * from the register table -- then copies the whole boot area to the store
+ * address and jumps to the entry, the boot code area's reset vector.  The
+ * auxcode is closed and trains a DDR PHY that is not modelled, so like the
+ * other machines' boot ROM stand-ins this skips DDR init (RAM is usable
+ * from reset) and does the copy.  The boot code is the hw_compressed
+ * loader: it prints "System startup", unpacks U-Boot with the V4 HW gzip
+ * engine to CONFIG_SYS_TEXT_BASE and jumps there.
+ *
+ * Copying from the boot area's link address matters: the loader is linked
+ * at the store address with the 0x5800-byte header in front of it, and its
+ * absolute literals (start_armboot, the gzip payload) point into that copy.
+ */
+#define XMORCA_HDR_AUX_LEN      0x400
+#define XMORCA_HDR_BOOT_LEN     0x404
+#define XMORCA_HDR_TOTAL_LEN    0x408
+#define XMORCA_HDR_ENTRY        0x414
+#define XMORCA_HDR_MCU_FW_LEN   0x243c
+#define XMORCA_HDR_SCS_FLAG     0x27c0
+#define XMORCA_HDR_STORE_ADDR   0x27c4
+#define XMORCA_HDR_EMPTY_FLAG   0x27c8
+#define XMORCA_KEY_AREA_LEN     0x2800
+#define XMORCA_FLASH_NOT_EMPTY  0x435A590D
+#define XMORCA_BOOT_AREA_MAGIC  0x96A5784B
+
+static bool hisi_xmorca_boot_header(const HisiSoCConfig *c,
+                                    MachineState *machine,
+                                    const uint8_t *img, size_t len,
+                                    hwaddr *ram_dst, hwaddr *entry,
+                                    uint32_t *copy_sz)
+{
+    if (len < XMORCA_KEY_AREA_LEN + 0x100 ||
+        ldl_le_p(img + XMORCA_HDR_EMPTY_FLAG) != XMORCA_FLASH_NOT_EMPTY ||
+        memcmp(img + XMORCA_KEY_AREA_LEN, "XMORCA", 6) != 0) {
+        return false;
+    }
+
+    uint32_t aux_len   = ldl_le_p(img + XMORCA_HDR_AUX_LEN);
+    uint32_t boot_len  = ldl_le_p(img + XMORCA_HDR_BOOT_LEN);
+    uint32_t total_len = ldl_le_p(img + XMORCA_HDR_TOTAL_LEN);
+    uint32_t mcu_len   = ldl_le_p(img + XMORCA_HDR_MCU_FW_LEN);
+    uint32_t boot_ep   = ldl_le_p(img + XMORCA_HDR_ENTRY);
+    uint32_t store     = ldl_le_p(img + XMORCA_HDR_STORE_ADDR);
+    uint64_t code_off  = (uint64_t)XMORCA_KEY_AREA_LEN + aux_len + mcu_len;
+    uint64_t size      = code_off + MAX(total_len, boot_len);
+    /* The ROM stand-in copies whole words: bound-check what it copies. */
+    uint64_t copy      = ROUND_UP(size, 4);
+
+    if (copy > len || copy > 0x1000000 || boot_len < 0x40 ||
+        store < c->ram_base || store - c->ram_base + copy > machine->ram_size ||
+        boot_ep != store + code_off) {
+        warn_report("gk7206: flash 0 carries an xmorca boot header "
+                    "the boot ROM rejects (store 0x%x entry 0x%x size 0x%"
+                    PRIx64 ")", store, boot_ep, size);
+        return false;
+    }
+    if (code_off + boot_len + 4 > len) {
+        warn_report("gk7206: flash 0 xmorca image ends before its boot code "
+                    "area's end magic");
+        return false;
+    }
+    if (ldl_le_p(img + code_off + boot_len) != XMORCA_BOOT_AREA_MAGIC) {
+        warn_report("gk7206: boot code area lacks its 0x%x end magic",
+                    XMORCA_BOOT_AREA_MAGIC);
+    }
+
+    *ram_dst = store;
+    *entry   = boot_ep;
+    *copy_sz = copy;
+    return true;
+}
+
 static void hisilicon_write_bootrom(MemoryRegion *sysmem,
                                      const HisiSoCConfig *c,
                                      MachineState *machine)
@@ -4812,8 +5014,11 @@ static void hisilicon_write_bootrom(MemoryRegion *sysmem,
              * CRG register (not a DRAM addr), and this descriptor's own run is
              * only 2 words.  Detect the signature and resolve it explicitly.
              */
-            bool xm_handled = false;
-            if (nwords > 16 &&
+            bool xm_handled = hisi_xmorca_boot_header(c, machine,
+                                                      (const uint8_t *)data,
+                                                      len, &ram_dst,
+                                                      &uboot_entry, &copy_sz);
+            if (!xm_handled && nwords > 16 &&
                 le32_to_cpu(w[0]) == 0xeafffffe &&
                 le32_to_cpu(w[3]) == 0xdeadbeef &&
                 (le32_to_cpu(w[11]) & 0xffff0000) == 0x12010000) {
@@ -5680,6 +5885,9 @@ static void hisilicon_common_init(MachineState *machine,
         qdev_prop_set_uint8(sysctl, "chip-variant", c->chip_variant);
         qdev_prop_set_uint32(sysctl, "v1-chip-id-88", c->v1_chip_id_88);
         qdev_prop_set_uint32(sysctl, "v1-chip-id-8c", c->v1_chip_id_8c);
+        if (c->sysctl_sysres) {
+            qdev_prop_set_uint32(sysctl, "sysres-offset", c->sysctl_sysres);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sysctl), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sysctl), 0, c->sysctl_base);
         if (maskrom) {
@@ -5714,6 +5922,37 @@ static void hisilicon_common_init(MachineState *machine,
         if (fmc_nand_boot) {
             sysstat |= 0x40 | 0x400;
         }
+        /* xmorca: a two-bit boot device field; U-Boot's get_boot_media()
+         * keys the env and the flash scan on it (SPI NOR reads as 01). */
+        if (c->sysstat_boot_dev) {
+            sysstat |= fmc_nand_boot ? 0x3 : 0x1;
+            /*
+             * The auxcode the boot ROM runs leaves the trained DDR size in
+             * SC_DDRT12 (0xc0); the vendor U-Boot's dram_init() reads it
+             * (get_ddr_size(), SDK lotus/machine/xmorca/board.c).  The model
+             * skips the auxcode, so store it here.
+             */
+            address_space_stl(&address_space_memory,
+                              c->sysctl_base + 0xc0, machine->ram_size,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+            /*
+             * The efuse words at 0x10090000.  XM's media drivers (sys in
+             * xm_common.ko, and vi, venc) refuse the chip ("SDK version do
+             * NOT support this chip!!!") unless word 0x30 reads "GK" in its
+             * top half and 0xBx or 0xC0..0xDF in its low byte; vi and venc
+             * take a lighter path for x = 7 and 12.  The newer sys module
+             * OpenIPC ships (open_common.ko) also wants the low nibble in
+             * 7..13, and XM's venc switches on 8, 10 and 14: 0xB9 passes
+             * every check on the full path.
+             */
+            DeviceState *efuse = qdev_new("hisi-regbank");
+            qdev_prop_set_uint32(efuse, "size", 0x1000);
+            qdev_prop_set_string(efuse, "name", "lotus-efuse");
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(efuse), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(efuse), 0, 0x10090000);
+            address_space_stl(&address_space_memory, 0x10090030, 0x474B00B9,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+        }
         if (sysstat) {
             address_space_stl(&address_space_memory,
                               c->sysctl_base + 0x8c, sysstat,
@@ -5726,6 +5965,10 @@ static void hisilicon_common_init(MachineState *machine,
         DeviceState *crg = qdev_new("hisi-crg");
         if (c->cpu_srst_offset) {
             qdev_prop_set_uint32(crg, "cpu-srst-offset", c->cpu_srst_offset);
+        }
+        if (c->cpu_srst_mask) {
+            qdev_prop_set_uint32(crg, "cpu-srst-mask", c->cpu_srst_mask);
+            qdev_prop_set_uint32(crg, "cpu-srst-reset", c->cpu_srst_reset);
         }
         if (c->crg_pll_lock_offset) {
             qdev_prop_set_uint32(crg, "pll-lock-offset", c->crg_pll_lock_offset);
@@ -5740,6 +5983,16 @@ static void hisilicon_common_init(MachineState *machine,
             }
             qdev_prop_set_array(crg, "rst-ack", acks);
         }
+        if (c->crg_rst_sta_offset) {
+            QList *sta = qlist_new();
+
+            for (n = 0; n < ARRAY_SIZE(c->crg_rst_sta) && c->crg_rst_sta[n];
+                 n++) {
+                qlist_append_int(sta, c->crg_rst_sta[n]);
+            }
+            qdev_prop_set_uint32(crg, "rst-sta-offset", c->crg_rst_sta_offset);
+            qdev_prop_set_array(crg, "rst-sta", sta);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(crg), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(crg), 0, c->crg_base);
         if (c->cpu_srst_offset && smp_cpus > 1) {
@@ -5749,6 +6002,9 @@ static void hisilicon_common_init(MachineState *machine,
             r->kernel_boot = machine->kernel_filename != NULL;
             qdev_connect_gpio_out_named(crg, "cpu1-reset", 0,
                 qemu_allocate_irq(hisilicon_cpu1_reset, r, 0));
+            if (!r->kernel_boot) {
+                qemu_register_reset(hisilicon_cpu1_sys_reset, r);
+            }
         }
 
         /* Pre-enable clocks (mimics U-Boot init before kernel boot) */
@@ -5887,10 +6143,13 @@ static void hisilicon_common_init(MachineState *machine,
          * request and treats LOW as "pressed"; with PL061 inputs defaulting
          * to 0 the board would wrongly enter the download loop instead of
          * booting.  GPIO0_0 has a pull-up on real boards (high = not pressed). */
-        if (n == 0 && c->gpio0_input_high) {
+        uint32_t pull = (n == 0 ? c->gpio0_input_high : 0) |
+                        (n < ARRAY_SIZE(c->gpio_input_high) ?
+                         c->gpio_input_high[n] : 0);
+        if (pull) {
             HisiGpioPull *p = g_new0(HisiGpioPull, 1);
             p->dev = gp;
-            p->mask = c->gpio0_input_high;
+            p->mask = pull;
             qemu_register_reset(hisilicon_gpio_pull_reset, p);
             hisilicon_gpio_pull_reset(p);
         }
@@ -5908,7 +6167,8 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* FEMAC */
     if (c->femac_base) {
-        DeviceState *femac = qdev_new("hisi-femac");
+        DeviceState *femac = qdev_new(c->femac_type ? c->femac_type
+                                                    : "hisi-femac");
         qemu_configure_nic_device(femac, true, NULL);
         SysBusDevice *busdev = SYS_BUS_DEVICE(femac);
         sysbus_realize_and_unref(busdev, &error_fatal);
@@ -5990,7 +6250,8 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* AIAO: audio in / out DMA (V4) */
     if (c->aiao_base) {
-        DeviceState *aiao = qdev_new("hisi-aiao");
+        DeviceState *aiao = qdev_new(c->aiao_type ? c->aiao_type
+                                                   : "hisi-aiao");
         SysBusDevice *busdev = SYS_BUS_DEVICE(aiao);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->aiao_base);
@@ -6008,7 +6269,7 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* RTC (SPI-bridge) */
     if (c->rtc_base) {
-        DeviceState *rtc = qdev_new("hisi-rtc");
+        DeviceState *rtc = qdev_new(c->rtc_type ? c->rtc_type : "hisi-rtc");
         SysBusDevice *busdev = SYS_BUS_DEVICE(rtc);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->rtc_base);
@@ -6019,8 +6280,8 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vedu_base) {
         DeviceState *vedu = qdev_new("hisi-vedu");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vedu);
-        if (c->media_gen) {
-            qdev_prop_set_uint8(vedu, "gen", c->media_gen);
+        if (c->vedu_gen || c->media_gen) {
+            qdev_prop_set_uint8(vedu, "gen", c->vedu_gen ?: c->media_gen);
         }
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->vedu_base);
@@ -6048,7 +6309,7 @@ static void hisilicon_common_init(MachineState *machine,
      * what VI's statistics measure and VPSS's pictures show.
      */
     DeviceState *scene = NULL;
-    if (c->vi_cap_base) {
+    if (c->vi_cap_base || c->lotus_media) {
         scene = qdev_new("hisi-scene");
         object_property_add_child(OBJECT(machine), "scene", OBJECT(scene));
         qdev_realize_and_unref(scene, NULL, &error_fatal);
@@ -6056,6 +6317,7 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* VI: capture and the ISP pipe, the online pipeline's frame clock */
     DeviceState *vi = NULL;
+    DeviceState *lotus_vpss = NULL;     /* lotus media: VPSS paints */
     if (c->vi_cap_base) {
         vi = qdev_new("hisi-vi");
         SysBusDevice *busdev = SYS_BUS_DEVICE(vi);
@@ -6093,6 +6355,42 @@ static void hisilicon_common_init(MachineState *machine,
         }
     }
 
+    /*
+     * XMedia lotus SPC030 media (GK7206 xmorca), per its DTS and the stock
+     * firmware's /proc/interrupts: VICAP SPI 51 (vi_cap0, GIC 83), VIPROC
+     * SPI 48 (vi_proc0, 80), VPSS SPI 41 (vpss0, 73), VGS SPI 44 (76).
+     * VIPROC runs VPSS online: the task's start / early line / end.
+     */
+    if (c->lotus_media) {
+        DeviceState *lvi = qdev_new("lotus-vi");
+        DeviceState *lvpss = qdev_new("lotus-vpss");
+
+        object_property_set_link(OBJECT(lvpss), "scene", OBJECT(scene),
+                                 &error_fatal);
+        lotus_vpss = lvpss;
+        /* the ISP statistics measure the scene and tell it each frame's
+         * exposure and white balance (the sensor: below) */
+        object_property_set_link(OBJECT(lvi), "scene", OBJECT(scene),
+                                 &error_fatal);
+        vi = lvi;
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(lvi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lvi), 0, 0x11000000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lvi), 1, 0x11200000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(lvi), 0, pic[51]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(lvi), 1, pic[48]);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(lvpss), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lvpss), 0, 0x11400000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(lvpss), 0, pic[41]);
+        qdev_connect_gpio_out_named(lvi, "vpss-start", 0,
+            qdev_get_gpio_in_named(lvpss, "vi-start", 0));
+        qdev_connect_gpio_out_named(lvi, "vpss-early", 0,
+            qdev_get_gpio_in_named(lvpss, "vi-early", 0));
+        qdev_connect_gpio_out_named(lvi, "vpss-done", 0,
+            qdev_get_gpio_in_named(lvpss, "vi-done", 0));
+        sysbus_create_simple("lotus-vgs", 0x11300000, pic[44]);
+    }
+
     /* Hardware True Random Number Generator
      * (HISEC_TRNG_CTRL on V3+, RNG_GEN on V2) */
     if (c->hwrng_base) {
@@ -6105,7 +6403,16 @@ static void hisilicon_common_init(MachineState *machine,
 
 
     /* Watchdog (SP805-compatible, reuse cmsdk-apb-watchdog) */
-    if (c->wdt_base) {
+    if (c->wdt_base && c->wdt_type) {
+        DeviceState *wdt = qdev_new(c->wdt_type);
+        SysBusDevice *busdev = SYS_BUS_DEVICE(wdt);
+        qdev_prop_set_uint32(wdt, "freq", c->wdt_freq);
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, c->wdt_base);
+        for (int i = 0; i < 2 && c->wdt_irq >= 0; i++) {
+            sysbus_connect_irq(busdev, i, pic[c->wdt_irq + i]);
+        }
+    } else if (c->wdt_base) {
         Clock *wdt_clk = clock_new(OBJECT(machine), "wdt-clk");
         clock_set_hz(wdt_clk, c->wdt_freq);
         DeviceState *wdt = qdev_new("cmsdk-apb-watchdog");
@@ -6122,6 +6429,7 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->gzip_base) {
         DeviceState *gzip = qdev_new("hisi-gzip");
         SysBusDevice *busdev = SYS_BUS_DEVICE(gzip);
+        qdev_prop_set_uint32(gzip, "layout", c->gzip_layout);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->gzip_base);
     }
@@ -6266,6 +6574,20 @@ static void hisilicon_common_init(MachineState *machine,
                 }
             }
 
+            /*
+             * xmorca's temperature sensor (tsensor@120280b8, lotus/misc/
+             * tsensor.c): get_chip_temperature() waits for a non-zero
+             * reading in the low 10 bits of MISC_CTRL47 (0x120280c0) and
+             * prints "Waiting Tsensor ready" each 2 ms until it has one.
+             * A GK7206V11A at work reads 0x02A602A4 there (about 52 C).
+             */
+            if (c->sysstat_boot_dev &&
+                !strcmp(c->regbanks[n].name, "hisi-misc")) {
+                address_space_stl(&address_space_memory,
+                                  c->regbanks[n].base + 0xc0, 0x02A602A4,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+            }
+
             if (!strcmp(c->regbanks[n].name, "hisi-nandc")) {
                 address_space_stl(&address_space_memory,
                                   c->regbanks[n].base + 0x20, 0x01,
@@ -6325,6 +6647,11 @@ static void hisilicon_common_init(MachineState *machine,
             if (vi && sensor) {
                 /* the ISP's statistics measure the sensor's exposure */
                 object_property_set_link(OBJECT(vi), "sensor",
+                                         OBJECT(sensor), &error_fatal);
+            }
+            if (lotus_vpss && sensor) {
+                /* the pictures' exposure, while no ISP model sets it */
+                object_property_set_link(OBJECT(lotus_vpss), "sensor",
                                          OBJECT(sensor), &error_fatal);
             }
         } else if (sensor_name) {
@@ -6586,6 +6913,7 @@ DEFINE_HISI_MACHINE("gk7205v510", gk7205v510, gk7205v510_soc)
 DEFINE_HISI_MACHINE("gk7205v530", gk7205v530, gk7205v530_soc)
 DEFINE_HISI_MACHINE("gk7202v330", gk7202v330, gk7202v330_soc)
 DEFINE_HISI_MACHINE("gk7206v10",  gk7206v10,  gk7206v10_soc)
+DEFINE_HISI_MACHINE("gk7206v11a", gk7206v11a, gk7206v11a_soc)
 DEFINE_HISI_MACHINE("gk7206v12a", gk7206v12a, gk7206v12a_soc)
 DEFINE_HISI_MACHINE("gk7606v1",   gk7606v1,   gk7606v1_soc)
 DEFINE_HISI_MACHINE("hi3516cv608", hi3516cv608, hi3516cv608_soc)

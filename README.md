@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-arm` — 33 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (139 total)
+## Supported Machines (140 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -63,6 +63,7 @@ Builds three QEMU targets:
 | `gk7205v530` | V4/Goke V500 | Cortex-A7 | GIC | — | —¹ |
 | `gk7202v330` | V4/Goke V500 | Cortex-A7 | GIC | — | —¹ |
 | `gk7206v10` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
+| `gk7206v11a` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
 | `gk7206v12a` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
 | `hi3516cv608` | V5 | Cortex-A7 MP2 | GIC | 5.10 | — |
 | `hi3516cv610` | **V5** | Cortex-A7 MP2 | GIC | **5.10** | yes |
@@ -72,12 +73,19 @@ Builds three QEMU targets:
 them with; they build and register. The four Goke V500 parts share the
 `xmedia,sp804` timer wiring (`hisi-xmsp804.c`) that the V500 kernel needs.
 
-² `gk7206v10` and `gk7206v12a` (codename "xmorca"; same die, 64 vs 256 MiB
-embedded DDR) boot the **vendor** XMedia SDK kernel
-(linux-5.10.y, `xmorca_defconfig`) and busybox userspace, not OpenIPC — via
-`qemu-boot/run-gk7206.sh` for an initramfs boot or `FLASH=1` for a SPI-NOR
-boot with a jffs2 root. No vendor artifacts are committed here; see the script
-header for how to build them from the SDK.
+² `gk7206v10`, `gk7206v11a` and `gk7206v12a` (codename "xmorca"; same die,
+64 / 128 / 256 MiB embedded DDR) boot the **vendor** XMedia SDK kernel
+(linux-5.10.y, `xmorca_defconfig`) and busybox userspace via
+`qemu-boot/run-gk7206.sh` (an initramfs boot, or `FLASH=1` for a SPI-NOR
+boot with a jffs2 root; no vendor artifacts are committed here, see the
+script header). With `flash-file=` and no `-kernel` they boot OpenIPC's
+U-Boot from SPI NOR (or a >16 MiB SPI NAND image): the boot ROM stand-in
+reads the xmorca boot header (key area, params, auxcode, boot area) and
+copies the boot area to its store address, skipping the closed auxcode's
+DDR training; the loader unpacks U-Boot with `hisi-gzip` (`layout=1`).
+A 16 MiB NOR with U-Boot at 0 and `firmware.bin.gk7206v12a` (from
+`openipc.gk7206v12a-nor-lite-split.tgz`) at 0x50000 boots to the OpenIPC
+login prompt.
 
 The three dual-core Cortex-A7 parts (`hi3516cv500`, `hi3516dv300`,
 `hi3516av300`) boot both cores by default, from `-kernel` and from a
@@ -728,7 +736,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 139 machines build and register. Every machine marked "yes" above boots
+All 140 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.

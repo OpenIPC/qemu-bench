@@ -50,4 +50,26 @@ void hisi_scene_set_frame(HisiSceneState *s, double level,
 void hisi_scene_display_row(HisiSceneState *s, const float *rgb, int w,
                             uint8_t *y, uint8_t *vu);
 
+/*
+ * hisi_scene_display_row() as tables, for a model that renders the same
+ * grid under many exposures: component c (R, G, B) of reflectance
+ * p = (i / (n - 1))^2 * pmax adds lut[c * n + i] = { Y, V, U } in 16.16
+ * fixed point; Y = 16 + the sum, V and U = 128 + theirs (clamped to
+ * +-112).  The frame's level, tint and white balance are applied.
+ */
+void hisi_scene_display_lut(HisiSceneState *s, int n, double pmax,
+                            int32_t (*lut)[3]);
+
+/*
+ * How many frames hisi_scene_set_frame() has described: a picture model
+ * that sees it stand still knows no ISP model sets the frame's exposure.
+ */
+uint32_t hisi_scene_frame_seq(HisiSceneState *s);
+
+/* Changes whenever the source changes (a cached rendering is stale) */
+uint32_t hisi_scene_generation(HisiSceneState *s);
+
+/* The current frame as hisi_scene_set_frame() left it: level, tint, WB */
+double hisi_scene_get_frame(HisiSceneState *s, double tint[3], double wb[3]);
+
 #endif
