@@ -811,11 +811,14 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     /*
      * EV300's Allegro core (OpenIPC's uio_vcodec: "Allegro encoder at [mem
      * 0x20020000-0x2002ffff], irq 2"), interrupt mask and status at +0x8014
-     * and +0x8018: the AVPU's register layout from reg-base 0x8000.
+     * and +0x8018: the AVPU's common registers from reg-base 0x8000, its
+     * cores, list entries and L2 prefetch as libakv_encode drives them
+     * ("anyka"), the whole 64 KiB window.
      */
     if (c->venc_allegro) {
         dev = qdev_new("ingenic-avpu");
         qdev_prop_set_uint32(dev, "reg-base", 0x8000);
+        qdev_prop_set_bit(dev, "anyka", true);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_VENC_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,

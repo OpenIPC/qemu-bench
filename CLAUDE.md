@@ -92,7 +92,9 @@ python3 qemu/tests/test-hisi-aiao.py       # V4 audio DMA: capture / playback ri
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py (+ test-ak-h8290.py, EV200's
                                            # 8290 encoder; test-ak-isp.py, the ISP2 and the EV300's
-                                           # JX-F37), test-sigmastar.py, test-ambarella.py,
+                                           # JX-F37; test-ak-allegro.py, the EV300's Allegro
+                                           # encoder as libakv drives it), test-sigmastar.py,
+                                           # test-ambarella.py,
                                            # test-ingenic.py (qemu-system-mipsel)
 ```
 
