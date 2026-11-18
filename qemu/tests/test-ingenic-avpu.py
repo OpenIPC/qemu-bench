@@ -42,6 +42,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 INTC = 0x10001000
 AVPU = 0x13208000
@@ -94,6 +95,19 @@ class QTest:
 
     def step(self, ns):
         self.cmd('clock_step %d' % ns)
+
+    def done(self, status):
+        """1 ms of virtual time, then the status register once a done bit
+        is up: the model codes on a thread of its own beside the CPUs, so
+        the bits land when the host has coded the batch, which can be after
+        the next qtest command."""
+        self.step(1000000)
+        for _ in range(500):
+            v = self.readl(status)
+            if v:
+                break
+            time.sleep(0.01)
+        return v
 
     def close(self):
         self.proc.kill()
@@ -365,8 +379,7 @@ def encode(qt, name, cabac, idc, kseg, slot, pics=None, enc1=False,
             qt.writel(gen2 + 0x1000, cl1)
             qt.writel(gen2 + 0x1008, cl1 + 0x5C0)
             qt.writel(gen2 + 0x1018, 2)
-            qt.step(1000000)
-            st = qt.readl(gen2 + 0x18)
+            st = qt.done(gen2 + 0x18)
             pic = 'IDR' if idr else 'P'
             check('%s %s: Enc1 done (bit 0)' % (name, pic), st & 3, 1)
             qt.writel(gen2 + 0x18, st)
@@ -403,8 +416,7 @@ def encode(qt, name, cabac, idc, kseg, slot, pics=None, enc1=False,
             qt.writel(AVPU + 0x3E0, seg | cl2)
             qt.writel(AVPU + 0x3E4, 8)
         early = qt.readl(AVPU + 0x18)
-        qt.step(1000000)
-        st = qt.readl(AVPU + 0x18)
+        st = qt.done(AVPU + 0x18)
         pic = 'IDR' if idr else 'P'
         if k == 0:
             check('%s: not done at the start write' % name, early, 0)
@@ -638,8 +650,7 @@ def test_h264_slices(qemu, ff, tmp):
                                    for e in entries for v in e))
             qt.writel(AVPU + 0x3E0, cl1)
             qt.writel(AVPU + 0x3E4, 2)
-            qt.step(1000000)
-            st = qt.readl(AVPU + 0x18)
+            st = qt.done(AVPU + 0x18)
             qt.writel(AVPU + 0x18, st)
             for sl, (region, hlen) in enumerate(regions):
                 count = qt.readl(cl1 + 0x200 * sl + 0x104) & 0x3FFFFFFF
@@ -764,8 +775,7 @@ def test_h264_b(qemu, ff, tmp):
                                    for e in entries for v in e))
             qt.writel(AVPU + 0x3E0, cl1)
             qt.writel(AVPU + 0x3E4, 2)
-            qt.step(1000000)
-            st = qt.readl(AVPU + 0x18)
+            st = qt.done(AVPU + 0x18)
             qt.writel(AVPU + 0x18, st)
             n = 0
             for sl, (region, hlen) in enumerate(regions):
@@ -927,8 +937,7 @@ def test_hevc(qt, ff, tmp, libimp=False):
         qt.writel(AVPU + 0x3E4, 2)
         qt.writel(AVPU + 0x3E0, cl2)
         qt.writel(AVPU + 0x3E4, 8)
-        qt.step(1000000)
-        st = qt.readl(AVPU + 0x18)
+        st = qt.done(AVPU + 0x18)
         check('%s %s: Enc1 and Enc2 done' % (name, 'P' if k else 'IDR'),
               st & 5, 5)
         qt.writel(AVPU + 0x18, st)
@@ -1045,8 +1054,7 @@ def test_hevc_b(qemu, ff, tmp):
             qt.writel(AVPU + 0x3E4, 2)
             qt.writel(AVPU + 0x3E0, cl2)
             qt.writel(AVPU + 0x3E4, 8)
-            qt.step(1000000)
-            st = qt.readl(AVPU + 0x18)
+            st = qt.done(AVPU + 0x18)
             check('hevc-b %s%d: Enc1 and Enc2 done' %
                   ('IPB'[2 - typ] if typ else 'B', t), st & 5, 5)
             qt.writel(AVPU + 0x18, st)
@@ -1114,8 +1122,7 @@ def test_jpeg(qt, ff, tmp):
         qt.writel(core + 0x200 + 4 * i, v)
     qt.writel(core + 0x3F0, 1)
     qt.writel(core + 0x3E4, 1)
-    qt.step(1000000)
-    st = qt.readl(AVPU + 0x18)
+    st = qt.done(AVPU + 0x18)
     check('JPEG done (bit 4)', st & 0x11, 0x10)
     check('interrupt 62 raised', (qt.readl(INTC + 0x20) >> 30) & 1, 1)
     qt.writel(AVPU + 0x18, st)
@@ -1159,8 +1166,7 @@ def test_jpeg_bounds(qt):
             qt.writel(core + 0x200 + 4 * i, v)
         qt.writel(core + 0x3F0, 1)
         qt.writel(core + 0x3E4, 1)
-        qt.step(1000000)
-        st = qt.readl(AVPU + 0x18)
+        st = qt.done(AVPU + 0x18)
         check('JPEG %s: the job ends, QEMU still answers' % name,
               st & 0x10, 0x10)
         qt.writel(AVPU + 0x18, st)
@@ -1211,8 +1217,7 @@ def test_t41(qemu, ff, tmp):
                      (0x80, src), (0x88, src + PITCH * H)):
             qt.writel(page + o, v)
         qt.writel(page + 0x18, 1)
-        qt.step(1000000)
-        st = qt.readl(base + 0x18)
+        st = qt.done(base + 0x18)
         check('t41: JPEG done (core 1: bit 2)', st & 0xF, 4)
         qt.writel(base + 0x18, st)
         n = qt.readl(page + 0x604)

@@ -72,7 +72,7 @@ appended DTB.
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
 | `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
 | `0x20000000` | ISP / VI (interrupt 1) | EV200 and AK3918EV300 `ak-isp`, others storage |
-| `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core | EV200 `ak-h8290`, others storage |
+| `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core (registers from `+0x8000`; interrupt 2) | EV200 `ak-h8290`, EV300 `ingenic-avpu` (`anyka`), others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
 | `0x20110000` / `0x20118000` | DAC / ADC | storage |
 | `0x20120000` / `0x20128000` | SPI0 (boot NOR) / SPI1 | `ak-spi`, `ak-spinor` |
@@ -224,6 +224,34 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   regardless), slices, restart markers, rotation, RGB input.
   `-global ak-h8290.dump-dir=DIR` keeps each job. `qemu/tests/test-ak-h8290.py`
   plays the driver under qtest and decodes the result with ffmpeg.
+- **EV300 video encoder** (`ingenic-avpu` with `anyka`, reg-base
+  `0x8000`): an Allegro core without MCU, the lineage of Ingenic's AVPU.
+  The SDK's closed `libakv_encode` (2.2) runs
+  Allegro's control software on the CPU and reaches the core through
+  OpenIPC's `uio_vcodec` (`/dev/uio0`: the 64 KiB window mapped, one
+  interrupt status bit returned per `AKUIO_WAIT_IRQ`). Its contract, read
+  off the library's objects: the list address / start of core c at
+  `+0x8080 + 16c` / `+0x8084 + 16c` (Enc1 2, Enc2 8, JPEG 0x10), Enc1
+  then Enc2 started on the same list with W8 bit 11 (Enc1 feeds Enc2 on
+  chip; Enc2 writes the stream after the slice header the library put in
+  the buffer); list entries 0x1C0 bytes, the slice status written back at
+  0x100-0x16C of each; the core's status at `+0x8300` (busy bits 0 / 2,
+  bit 1 overflow) and the picture's bytes at `+0x8304`, which the
+  interrupt handler reads to re-code a picture that overflowed; JPEG's
+  R0-R10 at `+0x83C0`, its status / bytes / overflow at
+  `+0x83F0`-`+0x83F8`, done on interrupt bit 18 (Enc1 / Enc2 on 0 / 2;
+  for H.264 on its one core the library unmasks Enc2's alone, so a
+  picture ends with its entropy coding). The L2 prefetch (`+0xC004` control: bit 0 on, bits 10 / 11
+  bypass; `+0xC008` / `+0xC00C` the source planes, `+0xC014` [18:6] the
+  pitch; `+0x9204` / `+0x9208` written with it) is set up per picture
+  for the channel the library gives the L2 to, with that picture's own
+  source; the model keeps the registers and codes from the planes the
+  list names, and logs a guest error if an enabled L2 points elsewhere.
+  The library reads no ID register, only `+0x801C` (a debug switch,
+  0). Majestic's 1080p25 main and 640x360 sub channels and its JPEG
+  snapshots run on it; `qemu/tests/test-ak-allegro.py` plays the library
+  under qtest. Not modelled: the reset pulses at `+0x8010` and the clock
+  gate at `+0x8020` (registers only), SYSCTRL's encoder reset.
 - **ISP2** (`ak-isp`, EV200 and AK3918EV300): the frames of the ISP2 as
   OpenIPC's kernel drives it through the SDK-derived `ak39_isp2.c` -- on
   EV200 from `ak-cam`, on EV300 from the soc_camera host `ak_camera.c` --
@@ -414,7 +442,8 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 
 The MCI's L2 DMA data path, the ISP's image processing and statistics
 (EV200's and AK3918EV300's frames are `ak-isp`; the other parts' ISP is
-storage), the EV300 / EV330 video encoder (EV200's is `ak-h8290`), audio
+storage), the EV330 video encoder (EV200's is `ak-h8290`, EV300's
+`ingenic-avpu`), audio
 codec, SAR ADC. Only the EV200 and the AK3918EV300 have a sensor on I2C
 (`sc1345` / `jxf37` by default). On the AV100 the second MIPI/CSI
 input, the NPU (`0x21300000`) and the video pipe (`0x212`--`0x215`) are the

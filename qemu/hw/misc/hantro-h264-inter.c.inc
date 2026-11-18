@@ -204,8 +204,17 @@ static void mc_luma(const PPic *p, int mx, int my, const int16_t mv[2],
 {
     const int dx = mv[0] >> 2, dy = mv[1] >> 2, fx = mv[0] & 3,
               fy = mv[1] & 3;
+    const int X0 = mx * 16 + dx, Y0 = my * 16 + dy + p->ry0;
     int x, y;
 
+    if (!(fx | fy) && X0 >= 0 && X0 + 16 <= p->f.w && Y0 >= 0 &&
+        Y0 + 16 <= p->rh) {
+        /* a whole-sample vector inside the picture: ref_y() unclamped */
+        for (y = 0; y < 16; y++) {
+            memcpy(py + y * 16, p->ry + (Y0 + y) * p->f.w + X0, 16);
+        }
+        return;
+    }
     for (y = 0; y < 16; y++) {
         for (x = 0; x < 16; x++) {
             const int X = mx * 16 + x + dx, Y = my * 16 + y + dy;
@@ -227,7 +236,16 @@ static void mc_mb(const PPic *p, int mx, int my, const int16_t mv[2],
     mc_luma(p, mx, my, mv, py);
     for (comp = 0; comp < 2; comp++) {
         const uint8_t *r = comp ? p->rcr : p->rcb;
+        const int x0 = mx * 8 + ix, y0 = my * 8 + iy + p->ry0 / 2;
 
+        if (!(fx | fy) && x0 >= 0 && x0 + 8 <= cw && y0 >= 0 &&
+            y0 + 8 <= ch) {
+            /* whole chroma samples inside: the weights are 64, 0, 0, 0 */
+            for (y = 0; y < 8; y++) {
+                memcpy(pc[comp] + y * 8, r + (y0 + y) * cw + x0, 8);
+            }
+            continue;
+        }
         for (y = 0; y < 8; y++) {
             for (x = 0; x < 8; x++) {
                 const int x0 = mx * 8 + x + ix;
@@ -277,6 +295,100 @@ static int sad_mb_q(const PPic *p, int mx, int my, const int16_t mv[2])
 
         for (x = 0; x < 16; x++) {
             s += abs(src[x] - py[y * 16 + x]);
+        }
+    }
+    return s;
+}
+
+/*
+ * The quarter-pel refinement looks at vectors within three quarters of one
+ * integer vector, so the samples it interpolates lie in one small window:
+ * the integer samples G and the half samples b, h, j of the window, worked
+ * out once (j alone takes 36 reference reads a sample) and then looked up.
+ * The window's index 0 is integer offset -QWIN_LO from the macroblock's
+ * sample at the integer vector; the predictions are luma_q()'s exactly.
+ */
+#define QWIN_LO 2
+#define QWIN    20
+
+typedef struct QWin {
+    int x0, y0;                         /* the sample at index 0 */
+    uint8_t g[QWIN][QWIN], b[QWIN][QWIN], h[QWIN][QWIN], j[QWIN][QWIN];
+} QWin;
+
+static void qwin_fill(const PPic *p, int mx, int my, int dx, int dy, QWin *w)
+{
+    /* the integer samples the filters reach, 2 before and 3 after */
+    uint8_t r[QWIN + 5][QWIN + 5];
+    int b1[QWIN + 5][QWIN];             /* hb()'s sums, every row of r */
+    int u, v;
+
+    w->x0 = mx * 16 + dx - QWIN_LO;
+    w->y0 = my * 16 + dy - QWIN_LO;
+    for (v = 0; v < QWIN + 5; v++) {
+        for (u = 0; u < QWIN + 5; u++) {
+            r[v][u] = ref_y(p, w->x0 + u - 2, w->y0 + v - 2);
+        }
+        for (u = 0; u < QWIN; u++) {
+            b1[v][u] = tap6(r[v][u], r[v][u + 1], r[v][u + 2], r[v][u + 3],
+                            r[v][u + 4], r[v][u + 5]);
+        }
+    }
+    for (v = 0; v < QWIN; v++) {
+        for (u = 0; u < QWIN; u++) {
+            w->g[v][u] = r[v + 2][u + 2];
+            w->b[v][u] = clip255((b1[v + 2][u] + 16) >> 5);
+            w->h[v][u] = clip255((tap6(r[v][u + 2], r[v + 1][u + 2],
+                                       r[v + 2][u + 2], r[v + 3][u + 2],
+                                       r[v + 4][u + 2], r[v + 5][u + 2]) +
+                                  16) >> 5);
+            w->j[v][u] = clip255((tap6(b1[v][u], b1[v + 1][u], b1[v + 2][u],
+                                       b1[v + 3][u], b1[v + 4][u],
+                                       b1[v + 5][u]) + 512) >> 10);
+        }
+    }
+}
+
+/* luma_q() from the window: (u, v) is (x, y) in it, (u + 1, v + 1) too */
+static int qwin_luma(const QWin *w, int u, int v, int fx, int fy)
+{
+    switch (fy * 4 + fx) {
+    case 0:  return w->g[v][u];
+    case 1:  return (w->g[v][u] + w->b[v][u] + 1) >> 1;
+    case 2:  return w->b[v][u];
+    case 3:  return (w->g[v][u + 1] + w->b[v][u] + 1) >> 1;
+    case 4:  return (w->g[v][u] + w->h[v][u] + 1) >> 1;
+    case 5:  return (w->b[v][u] + w->h[v][u] + 1) >> 1;
+    case 6:  return (w->b[v][u] + w->j[v][u] + 1) >> 1;
+    case 7:  return (w->b[v][u] + w->h[v][u + 1] + 1) >> 1;
+    case 8:  return w->h[v][u];
+    case 9:  return (w->h[v][u] + w->j[v][u] + 1) >> 1;
+    case 10: return w->j[v][u];
+    case 11: return (w->j[v][u] + w->h[v][u + 1] + 1) >> 1;
+    case 12: return (w->g[v + 1][u] + w->h[v][u] + 1) >> 1;
+    case 13: return (w->h[v][u] + w->b[v + 1][u] + 1) >> 1;
+    case 14: return (w->j[v][u] + w->b[v + 1][u] + 1) >> 1;
+    default: return (w->h[v][u + 1] + w->b[v + 1][u] + 1) >> 1;
+    }
+}
+
+/* sad_mb_q() for a vector whose samples the window holds, else sad_mb_q() */
+static int sad_mb_qw(const PPic *p, const QWin *w, int mx, int my,
+                     const int16_t mv[2])
+{
+    const int fx = mv[0] & 3, fy = mv[1] & 3;
+    const int u0 = mx * 16 + (mv[0] >> 2) - w->x0;
+    const int v0 = my * 16 + (mv[1] >> 2) - w->y0;
+    int x, y, s = 0;
+
+    if (u0 < 0 || v0 < 0 || u0 + 17 > QWIN || v0 + 17 > QWIN) {
+        return sad_mb_q(p, mx, my, mv);
+    }
+    for (y = 0; y < 16; y++) {
+        const uint8_t *src = p->f.sy + (my * 16 + y) * p->f.sys + mx * 16;
+
+        for (x = 0; x < 16; x++) {
+            s += abs(src[x] - qwin_luma(w, u0 + x, v0 + y, fx, fy));
         }
     }
     return s;
@@ -1652,8 +1764,10 @@ static void motion_search(const PPic *p, int mx, int my, const int16_t mvp[2],
     /* then half and quarter samples around it */
     {
         int step, dx, dy;
+        QWin win;
 
-        best = sad_mb_q(p, mx, my, mv) +
+        qwin_fill(p, mx, my, bx, by, &win);
+        best = sad_mb_qw(p, &win, mx, my, mv) +
             lambda * (abs(mv[0] - mvp[0]) + abs(mv[1] - mvp[1])) / 4;
         for (step = 2; step >= 1; step >>= 1) {
             int16_t nb[2] = { mv[0], mv[1] };
@@ -1668,7 +1782,7 @@ static void motion_search(const PPic *p, int mx, int my, const int16_t mvp[2],
                     if ((!dx && !dy) || abs(m[0]) > 256 || abs(m[1]) > 256) {
                         continue;
                     }
-                    cost = sad_mb_q(p, mx, my, m) +
+                    cost = sad_mb_qw(p, &win, mx, my, m) +
                         lambda * (abs(m[0] - mvp[0]) + abs(m[1] - mvp[1])) / 4;
                     if (cost < best) {
                         best = cost;
@@ -1681,6 +1795,31 @@ static void motion_search(const PPic *p, int mx, int my, const int16_t mvp[2],
             mv[1] = nb[1];
         }
     }
+}
+
+/* the prediction is the source sample for sample: no residual to code */
+static bool pred_exact(const PPic *p, int mx, int my, const uint8_t py[256],
+                       const uint8_t pc[2][64])
+{
+    int x, y;
+
+    for (y = 0; y < 16; y++) {
+        if (memcmp(p->f.sy + (my * 16 + y) * p->f.sys + mx * 16, py + y * 16,
+                   16)) {
+            return false;
+        }
+    }
+    for (y = 0; y < 8; y++) {
+        const uint8_t *s = p->f.suv + (my * 8 + y) * p->f.scs + mx * 16;
+
+        for (x = 0; x < 8; x++) {
+            if (s[2 * x] != pc[0][y * 8 + x] ||
+                s[2 * x + 1] != pc[1][y * 8 + x]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* a P_Skip macroblock: its prediction is the picture */
@@ -1756,9 +1895,13 @@ static size_t p_slice_try(PPic *p, int cabac_init_idc, uint8_t *out,
                 st->skip++;
                 goto next;
             }
-            residual_mb(p, mx, my, py, pc, p->qp_target, &r);
             const int skip_inc = (a && a->type != PMB_SKIP) +
                                  (b && b->type != PMB_SKIP);
+            if (pred_exact(p, mx, my, py, pc)) {
+                r.cbp_luma = r.cbp_chroma = 0;  /* residual_mb()'s answer */
+            } else {
+                residual_mb(p, mx, my, py, pc, p->qp_target, &r);
+            }
             if (!r.cbp_luma && !r.cbp_chroma) {
                 put_skip_flag(p, &c, skip_inc, true);
                 put_skip(p, mx, my, me, mvs, py, pc);
