@@ -122,6 +122,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -204,6 +205,14 @@ struct AkIspState {
     bool ev300;
     DeviceState *sensor;
     bool warned_crop, warned_sensor, warned_ctrl, warned_ch3;
+
+    /* source=: a Y4M recording played in place of the test pattern */
+    char *source;
+    FILE *src_f;
+    long src_first;             /* offset of the first FRAME */
+    uint32_t src_w, src_h;
+    uint8_t *src_pic;           /* the current frame, I420 */
+    bool src_ok;
 
     /* the frame being written: per sensor column, then one row */
     uint8_t bar_of[MAX_W];
@@ -345,8 +354,75 @@ static const uint8_t bars[8][3] = {
  * that crosses it once every 64 frames; and the frame counter as sixteen
  * black or white cells along the bottom, so a decoded frame names itself.
  */
+/*
+ * source=FILE: a YUV4MPEG2 recording, 4:2:0 (the C420* tags, or none), read
+ * one frame per ISP frame and looped, in place of the test pattern -- so
+ * the encoder downstream codes a real camera's scene, its noise and its
+ * motion, and the stream's sizes and rate control can be compared with the
+ * camera it was recorded on. `ffmpeg -i rec.mp4 -pix_fmt yuv420p rec.y4m`
+ * makes one.
+ */
+static bool source_open(AkIspState *s, Error **errp)
+{
+    char hdr[256], *tok;
+
+    s->src_f = fopen(s->source, "rb");
+    if (!s->src_f) {
+        error_setg_errno(errp, errno, "ak-isp: source %s", s->source);
+        return false;
+    }
+    if (!fgets(hdr, sizeof(hdr), s->src_f) ||
+        strncmp(hdr, "YUV4MPEG2 ", 10)) {
+        error_setg(errp, "ak-isp: source %s is not YUV4MPEG2", s->source);
+        return false;
+    }
+    for (tok = strtok(hdr + 10, " \n"); tok; tok = strtok(NULL, " \n")) {
+        if (tok[0] == 'W') {
+            s->src_w = atoi(tok + 1);
+        } else if (tok[0] == 'H') {
+            s->src_h = atoi(tok + 1);
+        } else if (tok[0] == 'C' && strncmp(tok, "C420", 4)) {
+            error_setg(errp, "ak-isp: source %s is %s, not 4:2:0",
+                       s->source, tok);
+            return false;
+        }
+    }
+    if (!s->src_w || !s->src_h || s->src_w > 4096 || s->src_h > 4096 ||
+        (s->src_w | s->src_h) & 1) {
+        error_setg(errp, "ak-isp: source %s is %ux%u", s->source,
+                   s->src_w, s->src_h);
+        return false;
+    }
+    s->src_first = ftell(s->src_f);
+    s->src_pic = g_malloc((size_t)s->src_w * s->src_h * 3 / 2);
+    return true;
+}
+
+/* The next frame of the recording, from the start again after the last */
+static void source_next(AkIspState *s)
+{
+    size_t n = (size_t)s->src_w * s->src_h * 3 / 2;
+    char line[128];
+
+    for (int tries = 0; tries < 2; tries++) {
+        if (fgets(line, sizeof(line), s->src_f) &&
+            !strncmp(line, "FRAME", 5) &&
+            fread(s->src_pic, 1, n, s->src_f) == n) {
+            s->src_ok = true;
+            return;
+        }
+        fseek(s->src_f, s->src_first, SEEK_SET);
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "ak-isp: source %s has no frames\n",
+                  s->source);
+    s->src_ok = false;
+}
+
 static void pattern_prepare(AkIspState *s, uint32_t fw)
 {
+    if (s->src_f) {
+        source_next(s);
+    }
     for (uint32_t x = 0; x < fw; x++) {
         s->bar_of[x] = x * 8 / fw;
         s->ramp_of[x] = 16 + x * 219 / fw;
@@ -370,6 +446,17 @@ static void pattern_row(AkIspState *s, uint32_t sy, uint32_t fw, uint32_t fh,
             /* the crop window reaches past the frame: black (a guess) */
             yuv[0] = 16;
             yuv[1] = yuv[2] = 128;
+        } else if (s->src_ok) {
+            /* the recording, stretched over the sensor frame */
+            uint32_t px = (uint64_t)x * s->src_w / fw;
+            uint32_t py = (uint64_t)sy * s->src_h / fh;
+            const uint8_t *u = s->src_pic + s->src_w * s->src_h;
+            const uint8_t *v = u + (s->src_w / 2) * (s->src_h / 2);
+            uint32_t c = (py / 2) * (s->src_w / 2) + px / 2;
+
+            yuv[0] = s->src_pic[py * s->src_w + px];
+            yuv[1] = u[c];
+            yuv[2] = v[c];
         } else if (sy >= fh - fh / 16) {
             yuv[0] = s->cell_on[x] ? 235 : 16;
             yuv[1] = yuv[2] = 128;
@@ -645,6 +732,13 @@ static void ak_isp_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ak_isp_frame, s);
+    if (s->source && *s->source && !source_open(s, errp)) {
+        if (s->src_f) {
+            fclose(s->src_f);
+            s->src_f = NULL;
+        }
+        return;
+    }
 }
 
 static void ak_isp_unrealize(DeviceState *dev)
@@ -652,6 +746,10 @@ static void ak_isp_unrealize(DeviceState *dev)
     AkIspState *s = AK_ISP(dev);
 
     timer_free(s->timer);
+    if (s->src_f) {
+        fclose(s->src_f);
+    }
+    g_free(s->src_pic);
 }
 
 static const VMStateDescription ak_isp_vmstate = {
@@ -671,6 +769,7 @@ static const VMStateDescription ak_isp_vmstate = {
 static const Property ak_isp_props[] = {
     DEFINE_PROP_UINT32("fps", AkIspState, fps, 15),
     DEFINE_PROP_BOOL("ev300", AkIspState, ev300, false),
+    DEFINE_PROP_STRING("source", AkIspState, source),
     DEFINE_PROP_LINK("sensor", AkIspState, sensor, TYPE_DEVICE,
                      DeviceState *),
 };
