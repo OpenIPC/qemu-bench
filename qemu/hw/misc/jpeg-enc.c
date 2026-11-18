@@ -183,10 +183,10 @@ static void fdct_quant(const float in[64], const uint8_t q[64], int out[64])
 }
 
 static void encode_block(BitWriter *w, const float px[64], const uint8_t q[64],
-                         int comp, int *dc_pred)
+                         int tbl, int *dc_pred)
 {
-    const HuffTable *dc = &huff_dc[comp ? 1 : 0];
-    const HuffTable *ac = &huff_ac[comp ? 1 : 0];
+    const HuffTable *dc = &huff_dc[tbl];
+    const HuffTable *ac = &huff_ac[tbl];
     int coef[64], k, run = 0, size;
 
     fdct_quant(px, q, coef);
@@ -283,6 +283,16 @@ size_t jpeg_enc_scan(const uint8_t *y, int ys, const uint8_t *cb,
                      const uint8_t ql[64], const uint8_t qc[64], bool eoi,
                      uint8_t *out, size_t cap, bool *overflow)
 {
+    return jpeg_enc_scan_huff(y, ys, cb, cr, cs, w, h, ql, qc, false, eoi,
+                              out, cap, overflow);
+}
+
+size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
+                          const uint8_t *cr, int cs, int w, int h,
+                          const uint8_t ql[64], const uint8_t qc[64],
+                          bool chroma_luma_huff, bool eoi,
+                          uint8_t *out, size_t cap, bool *overflow)
+{
     BitWriter bw = { .buf = out, .cap = cap };
     int dc[3] = { 0, 0, 0 }, mx, my;
     const int mbw = (w + 15) / 16, mbh = (h + 15) / 16;
@@ -312,7 +322,8 @@ size_t jpeg_enc_scan(const uint8_t *y, int ys, const uint8_t *cb,
                                                  my * 8 + by) - 128.0f;
                     }
                 }
-                encode_block(&bw, blk, qc, 1, &dc[1 + b]);
+                encode_block(&bw, blk, qc, chroma_luma_huff ? 0 : 1,
+                             &dc[1 + b]);
             }
         }
     }

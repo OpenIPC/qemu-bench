@@ -79,6 +79,7 @@ struct HisiSceneState {
     double level;               /* the frame's white, 16-bit raw */
     double tint[3];             /* the light it was captured under */
     double wb[3];               /* the driver's white balance gains */
+    uint32_t frame_seq;         /* hisi_scene_set_frame() calls */
     uint8_t gamma[GAMMA_STEPS + 1];
 };
 
@@ -442,6 +443,24 @@ void hisi_scene_set_frame(HisiSceneState *s, double level,
     s->wb[0] = wb_r > 0 ? wb_r : 1.0;
     s->wb[1] = 1.0;
     s->wb[2] = wb_b > 0 ? wb_b : 1.0;
+    s->frame_seq++;
+}
+
+uint32_t hisi_scene_frame_seq(HisiSceneState *s)
+{
+    return s->frame_seq;
+}
+
+uint32_t hisi_scene_generation(HisiSceneState *s)
+{
+    return s->gen;
+}
+
+double hisi_scene_get_frame(HisiSceneState *s, double tint[3], double wb[3])
+{
+    memcpy(tint, s->tint, sizeof(s->tint));
+    memcpy(wb, s->wb, sizeof(s->wb));
+    return s->level;
 }
 
 void hisi_scene_display_row(HisiSceneState *s, const float *rgb, int w,
@@ -468,6 +487,33 @@ void hisi_scene_display_row(HisiSceneState *s, const float *rgb, int w,
         if (vu && !(x & 1)) {
             vu[x] = 128 + (int)lrint(MAX(MIN(224 * 0.713 * (e[0] - luma), 112), -112));
             vu[x + 1] = 128 + (int)lrint(MAX(MIN(224 * 0.564 * (e[2] - luma), 112), -112));
+        }
+    }
+}
+
+void hisi_scene_display_lut(HisiSceneState *s, int n, double pmax,
+                            int32_t (*lut)[3])
+{
+    /* the luma / colour difference weights of hisi_scene_display_row() */
+    static const double wy[3] = { 0.299, 0.587, 0.114 };
+    double k[3];
+    int i, c;
+
+    for (c = 0; c < 3; c++) {
+        k[c] = s->tint[c] * s->level / 65535.0;
+    }
+    for (c = 0; c < 3; c++) {
+        for (i = 0; i < n; i++) {
+            const double q = (double)i / (n - 1);
+            const double p = q * q * pmax;
+            const double v = MIN(MIN(p * k[c], 1.0) * s->wb[c], 1.0);
+            const double e = s->gamma[(int)(v * GAMMA_STEPS)] / 255.0;
+            int32_t *o = lut[c * n + i];
+
+            o[0] = lrint(219 * wy[c] * e * 65536);
+            /* V = 224 * 0.713 * (R' - Y'), U = 224 * 0.564 * (B' - Y') */
+            o[1] = lrint(224 * 0.713 * ((c == 0) - wy[c]) * e * 65536);
+            o[2] = lrint(224 * 0.564 * ((c == 2) - wy[c]) * e * 65536);
         }
     }
 }

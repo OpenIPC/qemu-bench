@@ -1,0 +1,72 @@
+cadence_sdhci: allow byte/halfword HRS register access
+
+cadence_sdhci_ops restricted ALL accesses to the Cadence-specific HRS
+register window to exactly 4 bytes (.valid.min_access_size = 4). Real
+Cadence SD4HC HRS registers are plain APB registers and accept byte
+and halfword accesses too, and real low-level drivers rely on that --
+e.g. Axera's vendor BL1 (boot/bl1/driver/mmc/sdhci_cdns.c) does
+readb/readw as well as readl against these same offsets, HRS06
+(eMMC control / tuning) in particular, which it accesses as a 16-bit
+register via sdhci_cdns_readw()/writew().
+
+With the old {4,4} constraint, any narrower access was rejected as
+invalid by QEMU's memory core and surfaced to the guest as an
+external abort -- for a real BL1 built from vendor source doing a
+completely ordinary 16-bit register read, this is indistinguishable
+from a genuine hardware fault: no -d unimp trace (the region exists
+and is otherwise functional), just a synchronous abort into whatever
+exception vector the guest has installed (or hasn't -- BL1 never
+installs one this early, so it's a silent, unrecoverable trap).
+
+Fix: widen .valid to {1,4}. .impl stays at {4,4} -- QEMU's generic
+sub-word access synthesis (read-modify-write through the existing
+4-byte-granular callback) handles narrower guest accesses correctly
+without any change to cadence_sdhci_read()/write() themselves, since
+both already operate on a uint32_t regs[] array indexed at 4-byte
+granularity.
+
+Found debugging why Axera's real vendor BL1 crashed inside
+mmc_select_mode() (a routine 16-bit read/modify/write of HRS06) right
+after successfully completing full eMMC card bring-up (CMD0 through
+CMD7) against this project's own axera-cadence.sdhci wiring --
+single-stepped the guest with gdb down to the exact faulting
+instruction (a readw() inside mmc_select_mode whose very next
+executed instruction after the load is the guest's own [unfixed]
+exception vector, confirmed by resolving the LR back through nm
+against a debug-symbol build of the real vendor BL1), then confirmed
+via QEMU's monitor `xp /4wx` that the *address* itself reads fine with
+a 4-byte access -- isolating the bug to access *size*, not address
+mapping.
+
+Verified: with this patch, the same BL1 binary now gets all the way
+through mmc_select_mode and into reading real data blocks off the
+(emulated) eMMC card, reaching verify_img_header() and correctly
+reporting a header-magic mismatch against a blank test image ("spl
+verify header failed") -- the expected, correct outcome for a card
+with no real boot image flashed to it, not a crash.
+diff --git a/hw/sd/cadence_sdhci.c b/hw/sd/cadence_sdhci.c
+index d576855..297e0dd 100644
+--- a/hw/sd/cadence_sdhci.c
++++ b/hw/sd/cadence_sdhci.c
+@@ -127,8 +127,20 @@ static const MemoryRegionOps cadence_sdhci_ops = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    /*
++     * Real Cadence SD4HC HRS registers (and real low-level drivers --
++     * e.g. Axera's vendor BL1, whose sdhci_cdns.c does readb/readw as
++     * well as readl against these same offsets, HRS06 in particular)
++     * accept byte and halfword APB accesses, not just 32-bit ones.
++     * With this restricted to {4,4}, any narrower access (a real
++     * driver's plain 16-bit read of a 16-bit-wide logical field like
++     * HRS06's tuning controls) was rejected as invalid and surfaced to
++     * the guest as an external abort -- QEMU's own sub-word access
++     * synthesis (read-modify-write through the .impl-sized callback)
++     * handles the splitting correctly once this allows it.
++     */
+     .valid = {
+-        .min_access_size = 4,
++        .min_access_size = 1,
+         .max_access_size = 4,
+     }
+ };

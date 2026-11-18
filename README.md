@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 32 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9)
-- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53)
+- `qemu-system-arm` — 33 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (135 total)
+## Supported Machines (140 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -63,6 +63,7 @@ Builds three QEMU targets:
 | `gk7205v530` | V4/Goke V500 | Cortex-A7 | GIC | — | —¹ |
 | `gk7202v330` | V4/Goke V500 | Cortex-A7 | GIC | — | —¹ |
 | `gk7206v10` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
+| `gk7206v11a` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
 | `gk7206v12a` | Goke/XMedia | Cortex-A7 MP2 | GIC | 5.10 | yes² |
 | `hi3516cv608` | V5 | Cortex-A7 MP2 | GIC | 5.10 | — |
 | `hi3516cv610` | **V5** | Cortex-A7 MP2 | GIC | **5.10** | yes |
@@ -72,12 +73,19 @@ Builds three QEMU targets:
 them with; they build and register. The four Goke V500 parts share the
 `xmedia,sp804` timer wiring (`hisi-xmsp804.c`) that the V500 kernel needs.
 
-² `gk7206v10` and `gk7206v12a` (codename "xmorca"; same die, 64 vs 256 MiB
-embedded DDR) boot the **vendor** XMedia SDK kernel
-(linux-5.10.y, `xmorca_defconfig`) and busybox userspace, not OpenIPC — via
-`qemu-boot/run-gk7206.sh` for an initramfs boot or `FLASH=1` for a SPI-NOR
-boot with a jffs2 root. No vendor artifacts are committed here; see the script
-header for how to build them from the SDK.
+² `gk7206v10`, `gk7206v11a` and `gk7206v12a` (codename "xmorca"; same die,
+64 / 128 / 256 MiB embedded DDR) boot the **vendor** XMedia SDK kernel
+(linux-5.10.y, `xmorca_defconfig`) and busybox userspace via
+`qemu-boot/run-gk7206.sh` (an initramfs boot, or `FLASH=1` for a SPI-NOR
+boot with a jffs2 root; no vendor artifacts are committed here, see the
+script header). With `flash-file=` and no `-kernel` they boot OpenIPC's
+U-Boot from SPI NOR (or a >16 MiB SPI NAND image): the boot ROM stand-in
+reads the xmorca boot header (key area, params, auxcode, boot area) and
+copies the boot area to its store address, skipping the closed auxcode's
+DDR training; the loader unpacks U-Boot with `hisi-gzip` (`layout=1`).
+A 16 MiB NOR with U-Boot at 0 and `firmware.bin.gk7206v12a` (from
+`openipc.gk7206v12a-nor-lite-split.tgz`) at 0x50000 boots to the OpenIPC
+login prompt.
 
 The three dual-core Cortex-A7 parts (`hi3516cv500`, `hi3516dv300`,
 `hi3516av300`) boot both cores by default, from `-kernel` and from a
@@ -654,6 +662,39 @@ H.265 too. Notes in
 
 ² A Xiongmai NBD80N36RA-KL NVR dump (not distributable, so not in CI).
 
+### Axera camera-SoC family (`qemu-system-aarch64` and `qemu-system-arm`)
+
+| Machine | CPU | IRQ | UART0 | Kernel | Boot tested |
+|---------|-----|-----|-------|--------|-------------|
+| `ax630c` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | — | — |
+| `ax620e` | 2x Cortex-A53 (AArch64), 1 GB | GIC-400 | `0x04880000` | 5.15.73 (real firmware)² | yes² |
+| `ax620q` | Cortex-A7 (AArch32), 256 MB, CPU1 not modelled | GIC-400 | `0x04880000` | — | — |
+| `ax620u` | 4x Cortex-A7 (AArch32), 1 GB | GIC-400 | `0x04990000` | 4.19.125 (real firmware)² | yes² |
+
+Axera's camera/KVM-capture SoCs, in `hw/arm/axera.c`. AX620E and AX620U
+boot whole Xiongmai camera flash dumps (`-M ax620e,flash-file=...`,
+`-M ax620u,flash-file=... -smp 4`) through BL1, U-Boot and the vendor
+kernel into the stock camera App, which serves H.265/H.264 video with
+PCMA audio over RTSP, ONVIF and its web UI. The camera pipeline is
+modelled far enough to carry a picture: the OpenIPC test scene is
+painted as the ISP's output (with a simple register-driven colour model
+following the App's image settings, and AE statistics), the IVPS engines
+scale it and draw the App's OSD, the VeriSilicon VCMD/VC8000E front end
+feeds a software H.264/HEVC/JPEG encoder, and the DW I2S carries audio
+both ways. Both CPUs of AX620E and all four of AX620U come up through
+their vendor spin-tables. Notes, environment switches and limits in
+[docs/axera.md](docs/axera.md).
+
+Sources: the [onekvm/linux-6.18-ax620e](https://github.com/onekvm/linux-6.18-ax620e)
+fork's devicetrees (AX630C/AX620Q), the AXERA-TECH/Sipeed vendor SDKs,
+and -- for AX620E and AX620U -- the devicetree and kernel modules of real
+deployed camera firmware (a Xiongmai IVG-A6 for AX620E, a JFtech
+IPC_AX620U_A8 for AX620U).
+
+² Real Xiongmai camera dumps (not distributable, so not in CI); the
+kernel version is from each dump's own modules (`vermagic=`) and FIT
+kernel banner.
+
 ### Novatek NT98633 (`qemu-system-aarch64`)
 
 | Machine | CPU | IRQ | Kernel | Boot tested |
@@ -695,7 +736,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 135 machines build and register. Every machine marked "yes" above boots
+All 140 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -936,6 +977,8 @@ qemu/
 ├── hw/i2c/nvt-i2c.c             # Novatek I2C controllers (PIO chunks)
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
+├── hw/arm/axera.c               # Axera AX630C machine: GIC-400, generic timer, DW-APB UART0
+├── include/hw/arm/axera.h       # AxeraSoCConfig
 └── setup.sh                     # Clone QEMU v10.2.0, copy sources, build
 qemu-boot/
 ├── run-cv100.sh                 # Run scripts for each boot-tested platform

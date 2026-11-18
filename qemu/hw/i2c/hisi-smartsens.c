@@ -61,6 +61,7 @@ struct HisiSmartSensState {
     uint32_t pclk;         /* pixel clock: HTS x VTS / pclk is the frame */
     uint16_t hts;          /* 0x320C/D at reset (0: none) */
     bool     exp_rows;     /* 0x3E00-02 counts rows, not half rows */
+    uint16_t gain_hcg;     /* the SC465SL's gains: its HCG factor, 1/1024 */
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -83,6 +84,7 @@ struct HisiSmartSensState {
 static const uint16_t ss_latched[] = {
     0x3E00, 0x3E01, 0x3E02, 0x3E06, 0x3E07, 0x3E08, 0x3E09,
     0x320E, 0x320F, 0x3301, 0x3632,
+    0x3E20, 0x326D,     /* the SC465SL's exposure / frame length, bits 19+ */
 };
 #define SS_GROUP_HOLD       0x3812
 
@@ -220,6 +222,21 @@ bool smartsens_exposure(Object *sensor, IngenicSensorExposure *e)
 }
 
 /*
+ * The frame length the frame in progress uses: 0x320E/F, with the
+ * SC465SL's bits 23:16 in 0x326D (sc465sl.c).
+ */
+static uint32_t smartsens_vts(HisiSmartSensState *s)
+{
+    uint32_t vts = s->applied[0x320E - SS_REG_BASE] << 8 |
+                   s->applied[0x320F - SS_REG_BASE];
+
+    if (s->gain_hcg) {
+        vts |= (uint32_t)s->applied[0x326D - SS_REG_BASE] << 16;
+    }
+    return vts;
+}
+
+/*
  * The frame around that exposure: 0x320E/F the frame length, 0x3208-B the
  * output window, as every SmartSens driver's mode tables set them.
  */
@@ -250,7 +267,26 @@ static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
         e->lines = x.lines / 2;
         e->gain = gain * 1024;
     }
-    e->vts = R16(0x320E);
+    e->vts = smartsens_vts(s);
+    if (s->gain_hcg) {
+        /*
+         * The SC465SL (GK7206 SDK sc465sl.c): rows in 0x3E20:0x3E00:
+         * 0x3E01:0x3E02[7:4] (sc465sl_update_inttime), the frame length's
+         * bits 23:16 in 0x326D; analog gain 0x3E08:0x3E09 as its
+         * again_table: coarse 0x3E08[3:0] + 1 (0, 1, 3, 7, F: x1 .. x16),
+         * bit 7 the HCG (x3.41), fine 0x3E09 / 0x20; digital gain
+         * 0x3E06[3:0] + 1 times 0x3E07 / 0x80 (dgain_table).
+         */
+        uint8_t fine = R(0x3E09) ? R(0x3E09) : 0x20;
+        uint8_t dig = R(0x3E07) ? R(0x3E07) : 0x80;
+        double gain = ((R(0x3E08) & 0xF) + 1) * (fine / 32.0) *
+                      (R(0x3E08) & 0x80 ? s->gain_hcg / 1024.0 : 1.0) *
+                      ((R(0x3E06) & 0xF) + 1) * (dig / 128.0);
+
+        e->lines = (uint32_t)R(0x3E20) << 20 | R(0x3E00) << 12 |
+                   R(0x3E01) << 4 | R(0x3E02) >> 4;
+        e->gain = gain * 1024;
+    }
     e->width = R16(0x3208);
     e->height = R16(0x320A);
 #undef R16
@@ -260,10 +296,9 @@ static void smartsens_sensor_exposure(Object *sensor, ImageSensorExposure *e)
 static int64_t smartsens_frame_ns(Object *sensor)
 {
     HisiSmartSensState *s = HISI_SMARTSENS(sensor);
-#define R16(a) (s->applied[(a) - SS_REG_BASE] << 8 | \
-                s->applied[(a) + 1 - SS_REG_BASE])
-    const uint64_t hts = R16(0x320C), vts = R16(0x320E);
-#undef R16
+    const uint64_t hts = s->applied[0x320C - SS_REG_BASE] << 8 |
+                         s->applied[0x320D - SS_REG_BASE];
+    const uint64_t vts = smartsens_vts(s);
 
     if (!s->pclk || !hts || !vts) {
         return 0;
@@ -291,21 +326,23 @@ static bool smartsens_frame_start(Object *sensor)
         }
     }
     if (sensor_sync_frame_start(&s->sync, smartsens_frame_ns(sensor),
-                                s->applied[0x320E - SS_REG_BASE] << 8 |
-                                s->applied[0x320F - SS_REG_BASE], pending)) {
+                                smartsens_vts(s), pending)) {
         for (i = 0; i < ARRAY_SIZE(ss_latched); i++) {
             s->applied[ss_latched[i] - SS_REG_BASE] =
                 s->regs[ss_latched[i] - SS_REG_BASE];
         }
     }
-    s->sync.vts = s->applied[0x320E - SS_REG_BASE] << 8 |
-                  s->applied[0x320F - SS_REG_BASE];
+    s->sync.vts = smartsens_vts(s);
     s->sync.frame_ns = smartsens_frame_ns(sensor);
     if (!s->streaming) {
         return true;
     }
     IMAGE_SENSOR_GET_CLASS(sensor)->exposure(sensor, &e);
     smartsens_exposure(sensor, &raw);
+    if (s->gain_hcg) {
+        /* the SC465SL: rows with 0x3E20's high bits (sc465sl.c) */
+        raw.lines = e.lines;
+    }
     if (!s->exp_rows) {
         /* most parts count half rows (decoded before any conversion) */
         if (e.vts && raw.lines + 4 > 2 * e.vts) {
@@ -337,6 +374,35 @@ static void smartsens_get_applied(Object *obj, Visitor *v, const char *name,
     visit_type_uint32(v, name, &value, errp);
 }
 
+/*
+ * "exposure" (read-only): what the frame in progress uses (applied[]), as integration
+ * rows times total gain, gain 1.0 = 1024 -- for an ISP model to scale
+ * its statistics by, so the AE loop closes. The SC450AI's coding
+ * (its SDK sc450ai_ae_ctrl.c tables), shared by the SC*AI family:
+ * rows in 0x3E00[3:0]:0x3E01:0x3E02[7:4]; analog gain 0x3E08 coarse
+ * (bit 5 the x3.8125 HCG step, each of bits 2-4 a x2 step) times
+ * 0x3E09 / 64; digital gain 0x3E06 coarse (0, 1, 3, 7 = x1, 2, 4, 8)
+ * times 0x3E07 / 128. Unprogrammed fine gains count as 1.0.
+ */
+static void hisi_smartsens_get_exposure(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    HisiSmartSensState *s = HISI_SMARTSENS(obj);
+#define SSR(a) (s->applied[(a) - SS_REG_BASE])
+    uint64_t rows = ((SSR(0x3e00) & 0xf) << 12) | (SSR(0x3e01) << 4) |
+                    (SSR(0x3e02) >> 4);
+    uint8_t ac = SSR(0x3e08), af = SSR(0x3e09) ? SSR(0x3e09) : 0x40;
+    uint8_t dc = SSR(0x3e06) & 0xf, df = SSR(0x3e07) ? SSR(0x3e07) : 0x80;
+    /* gain, 1.0 = 1024 << 13: coarse x3.8125 is 61/16 */
+    uint64_t g = (uint64_t)(1u << ctpop8((ac >> 2) & 7)) *
+                 ((ac & 0x20) ? 61 : 16) * af * (dc + 1) * df;
+    uint64_t e = rows * g * 1024 / (16 * 64 * 128);
+#undef SSR
+
+    visit_type_uint64(v, name, &e, errp);
+}
+
 static void hisi_smartsens_init(Object *obj)
 {
     HisiSmartSensState *s = HISI_SMARTSENS(obj);
@@ -346,6 +412,8 @@ static void hisi_smartsens_init(Object *obj)
                         NULL, NULL);
     object_property_add(obj, "vts", "uint32", smartsens_get_applied, NULL,
                         NULL, NULL);
+    object_property_add(obj, "exposure", "uint64",
+                        hisi_smartsens_get_exposure, NULL, NULL, NULL);
 }
 
 static void hisi_smartsens_realize(DeviceState *dev, Error **errp)
@@ -395,6 +463,8 @@ static const Property hisi_smartsens_props[] = {
     /* the exposure registers count whole rows (the SC4336P: its driver
      * bounds them by VTS - 10), not half rows as most parts do */
     DEFINE_PROP_BOOL("exp-rows", HisiSmartSensState, exp_rows, false),
+    /* not 0: the SC465SL's gain registers, with this HCG factor (1/1024) */
+    DEFINE_PROP_UINT16("gain-hcg", HisiSmartSensState, gain_hcg, 0),
 };
 
 /* What the guest programmed: the register file and the address pointer. */

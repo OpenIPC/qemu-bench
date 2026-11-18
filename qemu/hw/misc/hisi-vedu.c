@@ -74,6 +74,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -86,6 +87,7 @@
 #include "hantro-h264.h"
 #include "hevc-enc.h"
 #include "jpeg-enc.h"
+#include "hw/misc/lotus-vpss.h"
 
 #define TYPE_HISI_VEDU "hisi-vedu"
 OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
@@ -233,6 +235,33 @@ typedef struct VeduChannel {
     uint8_t *ref_y, *ref_uv;    /* decoder's picture, NV12 at mbw * 16 */
     bool have_ref;
     unsigned index;             /* for dump file names */
+    /*
+     * H.265 P pictures without the motion search (CUs skipped where the
+     * source did not change, else intra), or with every CU skipped, for
+     * pictures too big to code in time; and the slice data all-skipped
+     * gave for a few slice parameters: the same every time
+     */
+    bool no_search, skip_p;
+    struct {
+        HevcEncParams prm;
+        int qp;
+        uint8_t *data;
+        size_t n;
+    } skip_cache[32];
+    unsigned skip_next;
+    /*
+     * gen 7: the size of the picture hevc_ref holds, and what the last
+     * picture the model could measure gave the rate control (an all-skip
+     * picture from the cache is not read, and reports these again)
+     */
+    int ref_w, ref_h;
+    struct {
+        uint64_t sse_y, sse_c;  /* source against the decoded picture */
+        uint64_t madi;          /* sum of |sample - its 4x4 mean| */
+        uint64_t sad;           /* sum of |sample - reference| (P) */
+        uint32_t intra8;        /* 8x8 blocks not skipped */
+        bool valid;
+    } xm_st;
 } VeduChannel;
 
 struct HisiVeduState {
@@ -252,6 +281,7 @@ struct HisiVeduState {
     unsigned nchn;
     bool trace;
     char *dump_dir;
+    uint32_t inter_max_pixels, skip_min_pixels;
     uint8_t gen;                /* 4: Hi3516EV200 family, 5: Hi3516CV610 */
     /* gen 5: per register set */
     uint32_t v5_raw[2], v5_jraw[2];
@@ -265,6 +295,9 @@ struct HisiVeduState {
     uint32_t jimg[V5_JPGE_IMG_BYTES / 4];    /* the running picture's */
     uint32_t v5_jimg[2][V5_JPGE_IMG_BYTES / 4];
     bool v5_jqueued[2];
+    /* gen 7 (GK7206 xmorca): JPGE's quantisers, its SoC interrupt */
+    uint32_t xm_jq[2][64];
+    bool xm_jsoc;
 };
 
 /* ------------------------------------------------------------------ */
@@ -350,6 +383,11 @@ static void hevc_parse_nal(HevcHdrs *h, const uint8_t *p, size_t n);
 
 static void vedu_channel_free(VeduChannel *c)
 {
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(c->skip_cache); i++) {
+        g_free(c->skip_cache[i].data);
+    }
     g_free(c->ref_y);
     g_free(c->ref_uv);
     hevc_enc_ref_free(c->hevc_ref);
@@ -388,7 +426,8 @@ static bool vedu_walk(HisiVeduState *s, VeduChannel *c, uint32_t base,
         len = le32_to_cpu(hdr[0]);
         pad = le32_to_cpu(hdr[1]);
         type = le32_to_cpu(hdr[2]) & 0xff;
-        if (len < PKT_HDR || len % 64 || len > size - walked ||
+        if (len < PKT_HDR || len % (s->gen == 7 ? 8 : 64) ||
+            len > size - walked ||
             pad > len - PKT_HDR) {
             return false;
         }
@@ -1087,8 +1126,9 @@ static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
     const int n1 = len & 0xffff, n2 = len >> 16;
     uint8_t hdr[64] = { 0 }, part2[32];
     BitWriter bw = { hdr, sizeof(hdr), 0 };
-    HevcEncParams prm = { 0 };
+    HevcEncParams prm;
     HevcSlice sl;
+    bool cacheable;
     size_t n, o;
     int i;
 
@@ -1109,6 +1149,7 @@ static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
         return 0;
     }
 
+    memset(&prm, 0, sizeof(prm));   /* the cache compares it whole */
     bw_bits(&bw, 1, 1);                         /* first_slice_segment_in_pic */
     bw_bits(&bw, (img[IMG_SLC_HDR_PART1 / 4] & 0xffff) >> (16 - n1), n1);
     for (i = 0; i < n2; i++) {
@@ -1129,7 +1170,8 @@ static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
     prm.trafo_depth_intra = h->trafo_intra;
     prm.transform_skip = h->transform_skip;
     prm.cabac_init_flag = sl.cabac_init;
-    prm.inter = true;
+    prm.inter = !c->no_search || c->skip_p;
+    prm.all_skip = c->skip_p;
     prm.scaling_list = h->scaling_list;
     prm.tmvp = sl.tmvp;
     prm.trafo_depth_inter = h->trafo_inter;
@@ -1162,11 +1204,42 @@ static size_t vedu_h265_picture(VeduChannel *c, const uint32_t *img,
         }
     }
     *qp_out = sl.qp;
+    cacheable = c->skip_p && sl.type == 1 && c->hevc_ref;
+    for (i = 0; cacheable && i < (int)ARRAY_SIZE(c->skip_cache); i++) {
+        if (c->skip_cache[i].data && c->skip_cache[i].qp == sl.qp &&
+            !memcmp(&c->skip_cache[i].prm, &prm, sizeof(prm))) {
+            if (c->skip_cache[i].n > cap - o) {
+                return 0;
+            }
+            memcpy(out + o, c->skip_cache[i].data, c->skip_cache[i].n);
+            return o + c->skip_cache[i].n;   /* the reference stays */
+        }
+    }
+    if (!y) {
+        return 0;               /* asked for a cached picture only */
+    }
+    if (sl.type == 2) {
+        /* an I picture (of a new size, maybe): what was skipped before
+         * no longer applies */
+        for (i = 0; i < (int)ARRAY_SIZE(c->skip_cache); i++) {
+            g_free(c->skip_cache[i].data);
+            c->skip_cache[i].data = NULL;
+        }
+    }
     n = hevc_enc_slice_data(&prm, h->w, h->h, sl.qp, sl.type == 1,
                             sl.type == 1 ? c->hevc_ref : NULL, c->hevc_spare,
                             y, sw, sh, sw, uv, sw, out + o, cap - o);
     if (!n || n > cap - o) {
         return 0;
+    }
+    if (cacheable) {
+        unsigned k = c->skip_next++ % ARRAY_SIZE(c->skip_cache);
+
+        g_free(c->skip_cache[k].data);
+        c->skip_cache[k].prm = prm;
+        c->skip_cache[k].qp = sl.qp;
+        c->skip_cache[k].data = g_memdup2(out + o, n);
+        c->skip_cache[k].n = n;
     }
     {
         HevcEncRef *t = c->hevc_ref;
@@ -1291,6 +1364,8 @@ static uint32_t vedu_encode(HisiVeduState *s)
     return VEDU_INT_EOP;
 }
 
+#include "hisi-vedu-xm.c.inc"
+
 static void vedu_v5_update_irq(HisiVeduState *s)
 {
     bool level = false;
@@ -1309,6 +1384,11 @@ static void vedu_done(void *opaque)
 {
     HisiVeduState *s = opaque;
 
+    if (s->gen == 7) {
+        s->vedu_raw |= xm_vedu_encode(s);
+        xm_vedu_update_irq(s);
+        return;
+    }
     if (s->gen == 5) {
         s->v5_raw[s->vset] |= vedu_encode(s);
         if (s->v5_queued[!s->vset]) {
@@ -1428,8 +1508,9 @@ static uint64_t hisi_vedu_read(void *opaque, hwaddr offset, unsigned size)
     HisiVeduState *s = HISI_VEDU(opaque);
     uint32_t val;
 
-    if (s->gen == 5) {
-        val = hisi_vedu_v5_read(s, offset);
+    if (s->gen == 5 || s->gen == 7) {
+        val = s->gen == 5 ? hisi_vedu_v5_read(s, offset)
+                          : xm_vedu_read(s, offset);
         if (s->trace) {
             fprintf(stderr, "vedu R %04x = %08x\n", (int)offset, val);
         }
@@ -1465,6 +1546,10 @@ static void hisi_vedu_write(void *opaque, hwaddr offset,
     }
     if (s->gen == 5) {
         hisi_vedu_v5_write(s, offset, val);
+        return;
+    }
+    if (s->gen == 7) {
+        xm_vedu_write(s, offset, val);
         return;
     }
     switch (offset) {
@@ -1617,6 +1702,13 @@ static void jpge_done(void *opaque)
 {
     HisiVeduState *s = opaque;
 
+    if (s->gen == 7) {
+        s->jpge_raw |= xm_jpge_encode(s);
+        s->jpge_regs[XM_JPGE_FRAME_START / 4] &= ~1u;
+        s->xm_jsoc = true;
+        xm_jpge_update_irq(s);
+        return;
+    }
     if (s->gen == 5) {
         s->v5_jraw[s->jset] |= jpge_encode(s);
         if (s->v5_jqueued[!s->jset]) {
@@ -1712,8 +1804,9 @@ static uint64_t hisi_jpge_read(void *opaque, hwaddr offset, unsigned size)
     HisiVeduState *s = HISI_VEDU(opaque);
     uint32_t val;
 
-    if (s->gen == 5) {
-        val = hisi_jpge_v5_read(s, offset);
+    if (s->gen == 5 || s->gen == 7) {
+        val = s->gen == 5 ? hisi_jpge_v5_read(s, offset)
+                          : xm_jpge_read(s, offset);
         if (s->trace) {
             fprintf(stderr, "jpge R %04x = %08x\n", (int)offset, val);
         }
@@ -1749,6 +1842,10 @@ static void hisi_jpge_write(void *opaque, hwaddr offset,
     }
     if (s->gen == 5) {
         hisi_jpge_v5_write(s, offset, val);
+        return;
+    }
+    if (s->gen == 7) {
+        xm_jpge_write(s, offset, val);
         return;
     }
     switch (offset) {
@@ -1828,6 +1925,8 @@ static void hisi_vedu_reset(DeviceState *dev)
     memset(s->v5_jraw, 0, sizeof(s->v5_jraw));
     memset(s->v5_jqueued, 0, sizeof(s->v5_jqueued));
     s->jset = 0;
+    memset(s->xm_jq, 0, sizeof(s->xm_jq));
+    s->xm_jsoc = false;
     for (i = 0; i < s->nchn; i++) {
         vedu_channel_free(&s->chn[i]);
     }
@@ -1838,7 +1937,21 @@ static void hisi_vedu_reset(DeviceState *dev)
 static const Property hisi_vedu_properties[] = {
     DEFINE_PROP_BOOL("trace", HisiVeduState, trace, false),
     DEFINE_PROP_STRING("dump-dir", HisiVeduState, dump_dir),
-    /* register layout: 4 (Hi3516EV200 family) or 5 (Hi3516CV610) */
+    /*
+     * Gen 7's H.265 P pictures, which come at 25 fps up to 3840x2160: the
+     * motion search (seconds of host time per 4K picture) only up to
+     * inter-max-pixels; above it CUs are skipped where the source did not
+     * change and coded intra where it did; above skip-min-pixels every CU
+     * is skipped (the picture changes at the next IDR only).
+     */
+    DEFINE_PROP_UINT32("inter-max-pixels", HisiVeduState, inter_max_pixels,
+                       0),
+    DEFINE_PROP_UINT32("skip-min-pixels", HisiVeduState, skip_min_pixels,
+                       1920 * 1088),
+    /*
+     * register layout: 4 (Hi3516EV200 family), 5 (Hi3516CV610) or 7
+     * (Goke GK7206 / Xiongmai xmorca, hisi-vedu-xm.c.inc)
+     */
     DEFINE_PROP_UINT8("gen", HisiVeduState, gen, 4),
 };
 
@@ -1846,8 +1959,8 @@ static void hisi_vedu_realize(DeviceState *dev, Error **errp)
 {
     HisiVeduState *s = HISI_VEDU(dev);
 
-    if (s->gen != 4 && s->gen != 5) {
-        error_setg(errp, "hisi-vedu: gen must be 4 or 5");
+    if (s->gen != 4 && s->gen != 5 && s->gen != 7) {
+        error_setg(errp, "hisi-vedu: gen must be 4, 5 or 7");
     }
 }
 

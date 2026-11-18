@@ -5,7 +5,7 @@
  * machine names one here instead of keeping a table of its own.
  *
  * The IDs come from the vendor sensor drivers (Sensor_id_table in the
- * MStar libdrv_ms_cus_*.so; the Ingenic and FullHan SDKs; Sofia).
+ * MStar libdrv_ms_cus_*.so; the Ingenic, FullHan and Axera SDKs; Sofia).
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -22,19 +22,23 @@
 #define GALAXYCORE      "galaxycore-sensor"
 #define SMARTSENS       "hisi-smartsens"
 #define OV2735          "ingenic-ov2735"
+#define OMNIVISION      "axera-ov-sensor"
 
 typedef struct ImageSensorSpec {
     const char *name;
     const char *type;
     uint8_t addr;
-    uint16_t id;        /* GALAXYCORE, SMARTSENS; OV2735: its revision */
-    uint16_t id_reg;    /* GALAXYCORE: the ID's high byte */
+    uint32_t id;        /* GALAXYCORE, SMARTSENS, OMNIVISION (3 bytes);
+                         * OV2735: its revision */
+    uint16_t id_reg;    /* GALAXYCORE, OMNIVISION: the ID's high byte */
     bool reg16;         /* GALAXYCORE: 16-bit register addresses */
     uint8_t disc;       /* SMARTSENS: 0x3109 where parts share an ID */
     uint8_t gain_fine;  /* SMARTSENS: 0x3E09 at 1x, on the SC2310's layout */
     uint32_t pclk;      /* SMARTSENS: pixel clock, when known: frame timing */
     uint16_t hts;       /* SMARTSENS: HTS at reset, where a mode leaves it */
     bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
+    uint16_t gain_hcg;  /* SMARTSENS: the SC465SL's gain layout, its HCG
+                         * factor in 1/1024 */
 } ImageSensorSpec;
 
 /* GalaxyCore's register pairs; OmniVision's OV27x5/OV97x5 have the same */
@@ -91,6 +95,8 @@ static const ImageSensorSpec image_sensors[] = {
     SC("sc307h", 0xCB1C),
     SC("sc401ai", 0xCD2E),
     SC("sc431hai", 0xCD6B),
+    /* the AX620E camera boards' (sc450ai_reg.h: 0x3107:0x3108 = 0xbd2f) */
+    SC("sc450ai", 0xBD2F),
     /*
      * hi3516cv6xx: load_hisilicon's default.  Its 4M mode (sc4336p_cfg.h,
      * "27M input, 2 lanes, 10 bit, 630 Mbps, 2560x1440 30 fps") writes VTS
@@ -99,6 +105,15 @@ static const ImageSensorSpec image_sensors[] = {
      */
     { "sc4336p", SMARTSENS, 0x30, 0x9C42, .pclk = 126000000, .hts = 2800,
       .exp_rows = true },
+    /*
+     * GK7206 SDK smartsens_sc465sl: 27 MHz in, 2560x1440 12-bit; its 30 fps
+     * modes write HTS 0x546 x VTS 0xA6A, so 1350 x 2666 x 30 = 108 Mpixel/s.
+     * The ID (0x3107:0x3108 = 0xBD82) is what XM's App compares against.
+     * Its exposure counts rows (sc465sl.c: max VTS - 8), its gains are
+     * again_table / dgain_table's layout, HCG x3.41 (3492 / 1024).
+     */
+    { "sc465sl", SMARTSENS, 0x30, 0xBD82, .pclk = 108000000, .hts = 1350,
+      .exp_rows = true, .gain_hcg = 3492 },
     SC("sc501ai", 0xCE1F),
     SC("sc5035", 0x5035),
     SC("sc5238", 0x5235),
@@ -108,6 +123,9 @@ static const ImageSensorSpec image_sensors[] = {
     OV16("ov2715", 0x36, 0x2715),
     OV16("ov4689", 0x36, 0x4688),
     OV16("ov9715", 0x30, 0x9711),
+    /* the AX620U boards' (Axera SDK ov_os04a10/os04a10.c: 0x36, chip ID
+     * 0x300A:0x300B:0x300C = 0x530441) */
+    { "os04a10", OMNIVISION, 0x36, 0x530441, 0x300A },
     { "ov2735", OV2735, 0x3C, 0x05 },
     { "ov2735b", OV2735, 0x3C, 0x07 },
 
@@ -165,6 +183,12 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint32(dev, "pclk", spec->pclk);
         qdev_prop_set_uint16(dev, "hts", spec->hts);
         qdev_prop_set_bit(dev, "exp-rows", spec->exp_rows);
+        qdev_prop_set_uint16(dev, "gain-hcg", spec->gain_hcg);
+    } else if (!strcmp(spec->type, OMNIVISION)) {
+        qdev_prop_set_uint16(dev, "id_reg_base", spec->id_reg);
+        qdev_prop_set_uint8(dev, "id0", spec->id >> 16);
+        qdev_prop_set_uint8(dev, "id1", (spec->id >> 8) & 0xFF);
+        qdev_prop_set_uint8(dev, "id2", spec->id & 0xFF);
     } else if (!strcmp(spec->type, OV2735)) {
         qdev_prop_set_uint8(dev, "rev", spec->id);
     }

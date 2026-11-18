@@ -195,6 +195,7 @@ typedef struct HisiSoCConfig {
     int             gpio_irq_start; /* GIC: first SPI, one per port */
     uint32_t        gpio0_input_high; /* mask of GPIO0 input pins to drive high
                                        * (board pull-ups, e.g. update button) */
+    uint8_t         gpio_input_high[16]; /* per bank: board pull-ups */
 
     /*
      * Extra GPIO ports at non-contiguous addresses or with
@@ -214,6 +215,8 @@ typedef struct HisiSoCConfig {
     /* FEMAC (Fast Ethernet MAC) */
     hwaddr          femac_base;     /* 0 = no FEMAC */
     int             femac_irq;
+    const char     *femac_type;     /* NULL = "hisi-femac", or "ftgmac030" */
+    uint32_t        sysctl_sysres;  /* SC_SYSRES offset; 0 = 0x04 */
 
     /* GMAC (Gigabit Ethernet MAC) — for AV100, 3519V101 */
     hwaddr          gmac_base;      /* 0 = no GMAC */
@@ -255,10 +258,12 @@ typedef struct HisiSoCConfig {
     int             mipi_rx_irq;
     hwaddr          aiao_base;      /* 0 = AIAO stays a regbank, if listed */
     int             aiao_irq;
+    const char     *aiao_type;      /* NULL = "hisi-aiao", or "xm-aiao" */
 
     /* RTC (SPI-bridge internal RTC) */
     hwaddr          rtc_base;       /* 0 = no RTC */
     int             rtc_irq;
+    const char     *rtc_type;       /* NULL = "hisi-rtc", or "lotus-rtc" */
 
     /* VEDU (Video Encoder) + JPGE */
     hwaddr          vedu_base;      /* 0 = no VEDU */
@@ -268,9 +273,14 @@ typedef struct HisiSoCConfig {
     /* media register layouts (hisi-vedu / -vi / -vpss "gen"): 0 = 4,
      * the Hi3516EV200 family; 5 = Hi3516CV610 */
     uint8_t         media_gen;
+    /* hisi-vedu's own layout when it differs from media_gen's (0: the
+     * same): 7 = GK7206 / Xiongmai xmorca */
+    uint8_t         vedu_gen;
     /* CRG reset handshakes: request registers whose bit 0 the next one
      * echoes (hisi-crg "rst-ack"); 0 ends the list */
     uint32_t        crg_rst_ack[4];
+    uint32_t        crg_rst_sta_offset; /* see hisi-crg rst-sta */
+    uint32_t        crg_rst_sta[16];
     /* V5 IVE: tasks on the SVP NPU's scheduler (hisi-ive-npu); its first
      * 64 KiB, over the "hisi-npu" bank.  IRQs: the svp_npu driver's group
      * and IVE's */
@@ -282,14 +292,25 @@ typedef struct HisiSoCConfig {
     hwaddr          vi_proc_base;
     int             vi_cap_irq;
     int             vi_proc_irq;
+    /* XMedia lotus SPC030 media (GK7206 xmorca): VI (VICAP 0x11000000 +
+     * VIPROC 0x11200000), VPSS 0x11400000 and VGS 0x11300000 as lotus-vi,
+     * lotus-vpss and lotus-vgs, on the stock XM firmware's GIC SPIs */
+    bool            lotus_media;
 
     /* Watchdog (SP805 / cmsdk-apb-watchdog) */
     hwaddr          wdt_base;       /* 0 = no watchdog */
     int             wdt_irq;        /* -1 = no IRQ */
     uint32_t        wdt_freq;       /* clock frequency in Hz */
+    /* NULL = cmsdk-apb-watchdog; "lotus-wdt" = xmorca 3-core SP805 block,
+     * wdt_irq/wdt_irq+1 for cores 0/1 */
+    const char     *wdt_type;
 
     /* Hardware GZIP decompressor */
     hwaddr          gzip_base;      /* 0 = no GZIP engine */
+    uint32_t        gzip_layout;    /* hisi-gzip "layout": 1 = xmorca map */
+    /* SYSSTAT[1:0] is the boot device strap (00 eMMC 4-bit, 01 SPI NOR,
+     * 10 eMMC 8-bit, 11 SPI NAND), as on Goke xmorca / GK7206. */
+    bool            sysstat_boot_dev;
 
     /* SATA AHCI controller (sysbus-ahci) — DVR/NVR family.
      * Vendor SATA module busy-loops if the controller is absent; even a
@@ -369,6 +390,8 @@ typedef struct HisiSoCConfig {
 
     /* CPU soft-reset register offset in CRG (for SMP bringup) */
     uint32_t        cpu_srst_offset; /* 0 = disabled, e.g. 0x78 for CV500 */
+    uint32_t        cpu_srst_mask;   /* bits holding CPU1 in reset; 0 = bit 2 */
+    uint32_t        cpu_srst_reset;  /* its reset value; 0 = bits 2|4 */
 
     /* ATAGs board ID (machine_arch_type) for non-DT boots.  0 = unset; the
      * kernel uses DT compatible string instead (preferred for V3+ SoCs).
@@ -499,6 +522,7 @@ typedef struct HisiSoCConfig {
  * unknown.  The 5.10 kernel only prints the xmorca ID (/proc/soc_info);
  * no driver branches on it. */
 #define GOKE_SOC_ID_7206V10     0x72060100  /* GK7206V10, dual A7 MP2, 1.0 TOPS; placeholder */
+#define GOKE_SOC_ID_7206V11A    0x72060110  /* GK7206V11A, 1Gb DDR3L, 4K; placeholder */
 #define GOKE_SOC_ID_7206V12A    0x72060120  /* GK7206V12A, 2Gb DDR3L, 4K; placeholder */
 #define GOKE_SOC_ID_7606V1      0x76060100  /* GK7606V1, A55 4K; placeholder */
 

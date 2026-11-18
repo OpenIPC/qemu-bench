@@ -52,6 +52,14 @@ typedef struct HevcEncParams {
     /* every CU of a P slice skipped (merge candidate 0): the least a
      * picture can take, for a stream buffer with no more room */
     bool all_skip;
+    /*
+     * A deadline, g_get_monotonic_time() microseconds, 0 for none: once
+     * it has passed, the CUs of a P slice not yet coded are skipped (the
+     * reference's picture carries over there for one frame) -- an engine
+     * whose guest driver gives up on a job that runs too long. Only the
+     * intra / skip coder (inter false) looks at it.
+     */
+    int64_t deadline_us;
 } HevcEncParams;
 
 /* XM535 / XM533's library: CTB 16, no SAO; XM530V200's: CTB 32, SAO */
@@ -114,5 +122,50 @@ size_t hevc_enc_frame(const HevcEncParams *prm,
                       const uint8_t *y, int sw, int sh, int ys,
                       const uint8_t *uv, int cs,
                       uint8_t *out, size_t cap);
+
+/*
+ * The VPS / SPS / PPS a vendor library wrote itself (in software, in front
+ * of the engine's output) and the slice header fields they call for: what
+ * a stream's slices have to follow, since those -- not ours -- are what
+ * the RTSP SDP's sprop-vps/sps/pps carry to a client that joins between
+ * two IDRs.  prm: the slice data's parameters, from the same sets.
+ */
+typedef struct HevcEncHdr {
+    HevcEncParams prm;
+    int w, h;
+    int pps_id;
+    int log2_poc_lsb;
+    int num_rps;            /* the SPS's short-term RPSs */
+    int rps_idx;            /* one of them that is {POC - 1}, or -1 */
+    int num_lt_sps;
+    bool long_term;
+    bool tmvp;
+    bool output_flag;       /* output_flag_present_flag */
+    int extra_bits;         /* num_extra_slice_header_bits */
+    bool cabac_init_present;
+    int num_ref_l0;         /* num_ref_idx_l0_default_active */
+    int init_qp;
+    bool slice_chroma_qp;
+    bool deblocking_override;
+    bool lf_across_slices;
+    bool slice_ext;
+} HevcEncHdr;
+
+/*
+ * Parse the Annex B VPS / SPS / PPS in buf into h; false (h unusable) when
+ * one is missing or chooses something the slice data cannot follow.
+ */
+bool hevc_enc_parse_headers(HevcEncHdr *h, const uint8_t *buf, size_t len);
+
+/*
+ * One picture as a single slice NAL unit (IDR_W_RADL or TRAIL_R) with a
+ * slice header for h's parameter sets, and no parameter sets of its own;
+ * poc: the picture's POC (0 for the IDR, + 1 per P picture).
+ */
+size_t hevc_enc_hdr_frame(const HevcEncHdr *h, int qp, bool p_slice, int poc,
+                          const HevcEncRef *ref, HevcEncRef *recon,
+                          const uint8_t *y, int sw, int sh, int ys,
+                          const uint8_t *uv, int cs,
+                          uint8_t *out, size_t cap);
 
 #endif

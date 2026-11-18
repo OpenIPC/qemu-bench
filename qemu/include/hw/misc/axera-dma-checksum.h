@@ -1,0 +1,6 @@
+#ifndef HW_MISC_AXERA_DMA_CHECKSUM_H
+#define HW_MISC_AXERA_DMA_CHECKSUM_H
+
+#define TYPE_AXERA_DMA_CHECKSUM "axera-dma-checksum"
+
+#endif /* HW_MISC_AXERA_DMA_CHECKSUM_H */

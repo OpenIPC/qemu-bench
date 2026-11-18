@@ -1,0 +1,6 @@
+#ifndef HW_MISC_AXERA_AX620U_SMP_WAKE_H
+#define HW_MISC_AXERA_AX620U_SMP_WAKE_H
+
+#define TYPE_AXERA_AX620U_SMP_WAKE "axera-ax620u-smp-wake"
+
+#endif /* HW_MISC_AXERA_AX620U_SMP_WAKE_H */

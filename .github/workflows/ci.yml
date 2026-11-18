@@ -192,6 +192,13 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
         run: python3 qemu/tests/test-xm-h1-h264.py
 
+      # Two channels of one size with different headers, their jobs
+      # alternating as majestic's main and D1 channels do: each must decode
+      # on its own (one stream state per channel, chained by REF/RECON).
+      - name: Hantro H1 H.264, two channels interleaved (xm-h1)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
+        run: python3 qemu/tests/test-xm-h1-h264.py --interleave
+
       # HiSilicon V4 VEDU (H.264 / H.265) and JPGE, driven the way the
       # HiMPP driver drives them: its parameter-set packets in the stream
       # ring, its H.265 slice header bits in the register image, its JFIF
@@ -206,6 +213,21 @@ jobs:
       - name: HiSilicon V5 VEDU + JPGE encode (hisi-vedu gen 5)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-vedu.py']
         run: python3 qemu/tests/test-hisi-vedu.py --gen 5
+
+      # The XMedia lotus encoders (GK7206 xmorca, hisi-vedu gen 7): XM's own
+      # register layout, its stream ring with 64-byte packet headers, the
+      # P/IDR slice-header slots, 3-byte start codes, and JPGE's natural-order
+      # quantiser and format field.  ffmpeg must decode every picture.
+      - name: XMedia lotus VEDU + JPGE encode (hisi-vedu gen 7)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-vedu-xm.py']
+        run: python3 qemu/tests/test-hisi-vedu-xm.py
+
+      # The lotus RTC (hisi-rtc's SPI bridge, its own register map) and the
+      # 3-core SP805 watchdog block with one shared lock: time load and
+      # snapshot, -rtc base, a fed watchdog stays armed, an unfed one resets.
+      - name: XMedia lotus RTC + watchdog (lotus-rtc, lotus-wdt)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-lotus-rtc-wdt.py']
+        run: python3 qemu/tests/test-hisi-lotus-rtc-wdt.py
 
       # VI offline into node-driven VPSS (a sensor wider than 2304): both
       # strips of a picture painted, linear and compressed; no pipe
