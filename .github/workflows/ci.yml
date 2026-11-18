@@ -1739,6 +1739,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+          # fh8626v100 also runs its ARC: the test builds its RPMsg client
+          if [ "${{ matrix.soc }}" = fh8626v100 ]; then
+            sudo apt-get install -y --no-install-recommends \
+              gcc-arm-linux-gnueabi
+          fi
 
       - name: Download QEMU binary
         uses: actions/download-artifact@v4
@@ -1752,7 +1757,7 @@ jobs:
       - name: Download OpenIPC firmware
         run: bash qemu-boot/fetch-openipc-lite.sh ${{ matrix.soc }} qemu-boot
 
-      - name: Boot to login, DHCP over the GMAC, JFFS2 on the NOR
+      - name: Boot to login, DHCP over the GMAC, JFFS2 on the NOR (and the ARC)
         timeout-minutes: 5
         run: bash qemu-boot/test-fullhan-boot.sh --soc ${{ matrix.soc }}
 

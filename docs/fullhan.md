@@ -176,7 +176,10 @@ Ethernet driver (the board it was brought up on is Wi-Fi only), so the
 DHCP check is skipped there, and it boots with `mem=64M` and `osmem=64M`
 in that environment (its DT reserves CMA and the ARC's memory up to the
 top of 64 MB, and `load_fullhan` writes `osmem` and reboots until it reads
-64M). The first login asks the camera's owner to accept majestic's EULA.
+64M). A second boot there runs a script as PID 1 that starts the ARC and
+echoes 64 messages through it (**ARC**, below). Mind the host CPU: that
+kernel never issues WFI (`fh8626_idle()` is empty), so a guest at idle
+still takes a whole host core. The first login asks the camera's owner to accept majestic's EULA.
 
 ## Devices
 
@@ -225,6 +228,39 @@ VIRT 0xFE020000, which `head.S` maps with a single 1 MB section, so until
 space (0), and the kernel spun before printing a line. The camera boots,
 so the hardware answers there, and the FH8626 DTS puts every peripheral
 alone in its 1 MB slot.
+
+**ARC** (`fh-arc`, FH8626V100). OpenIPC's 4.19 kernel drives the ARC600
+itself (`drivers/remoteproc/fh8626_arc.c`), with a firmware built from
+source (OpenIPC/firmware `general/package/fh8626-arc-firmware`,
+`/lib/firmware/fh8626-arc.elf`). That firmware announces one RPMsg
+endpoint, `rpmsg-arc-echo` at 1024, and echoes what it is sent, polling
+split virtqueues in the shared pool at 0xA3FC0000.
+The kernel loads the ELF into the reserved 0xA3F00000 and writes four boot
+words at PMU 0x2000 (`sr entry, [INT_VECTOR_BASE]`, `j entry`). It then
+releases the reset (PMU 0x1C4 bit 18) and sets run (PMU 0x2010 bit 4).
+With both set the core starts at 0xF0002000, those words' physical
+address, and sees the ARM's physical map. The doorbells are plain PMU
+registers: 0x1E4 to the ARC (a write wakes the core at once) and 0x1F0
+bits 1:0 to the ARM (vrings, crash), which raise IRQ 32 while set.
+The core is an interpreter for ARCompact's 32-bit formats, decoded as the
+ARC600 decodes them:
+- Bcc/B, BL and BRcc;
+- LD and ST, with sizes, sign extension and write-back;
+- the ALU operations in all four operand formats, with long immediates,
+  conditions and flags;
+- the barrel shifter;
+- LR/SR, J/JL and SYNC.
+
+That is everything the firmware is built from. A 16-bit instruction, a
+delay slot or a reserved opcode takes the instruction-error exception
+(vector 0x10); the firmware reports it to the ARM as a crash. `mips`
+(default 2) sets its rate; a slice that stores nothing is taken as
+polling and backs off to 10 ms until a store or the doorbell.
+Run on the release, the kernel's `remoteproc0` comes up and the firmware
+announces its channel. Through `rpmsg_char` (bound by `driver_override`;
+`qemu-boot/fh-rpmsg-echo.c`), 64 messages of 1 to 496 bytes come back
+unchanged, and the firmware's own diagnostics read ECHO_RUNNING with no
+error.
 
 **SPI** (`fh-spi`). A DW SSI. SPI0 on V200 has Fullhan's "SPIC" additions:
 CCFGR (0xF4) with the data phase's wire count, a byte swap and 32-bit
@@ -369,14 +405,8 @@ glue (ring placement, notification, ready flag, block size). So
 without the ARC. Video and audio (the internal codec is the ARC
 firmware's) need that material from the vendor.
 
-OpenIPC's FH8626V100 kernel (4.19) drives the ARC itself: a remoteproc
-driver (`fh8626_arc.c`; the boot words at PMU 0x2000, run at 0x2010 bit 4,
-doorbells 0x1E4 to the ARC and 0x1F0 to the ARM) and an ARC600 firmware
-built from source (`fh8626-arc-firmware`, `/lib/firmware/fh8626-arc.elf`)
-that announces one RPMsg endpoint, `rpmsg-arc-echo`, and echoes on it. The
-driver sets no auto-boot and nothing in the image starts it, so login does
-not wait on it. Running that firmware here would take an ARCompact core,
-or a stand-in that plays its echo protocol on the vrings.
+That is the vendors' ARC firmware. OpenIPC's FH8626V100 ARC runs its own,
+and that is modelled (**ARC**, above).
 
 Also: PWM (registers read as zero; the drivers only program it), the IR
 receiver, the internal Ethernet PHY's training. The V100 U-Boot reads the
