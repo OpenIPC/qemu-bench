@@ -177,8 +177,12 @@ on it (**Image sensor**, below). Its kernel builds no Ethernet driver (the board
 DHCP check is skipped there, and it boots with `mem=64M` and `osmem=64M`
 in that environment (its DT reserves CMA and the ARC's memory up to the
 top of 64 MB, and `load_fullhan` writes `osmem` and reboots until it reads
-64M). A second boot there runs a script as PID 1 that starts the ARC and
-echoes 64 messages through it (**ARC**, below). Mind the host CPU: that
+64M). A second boot there runs a script as PID 1 -- written into
+rootfs_data with its clients, since the kernel command line holds 1024
+bytes -- that starts the ARC and echoes 64 messages through it (**ARC**,
+below), then starts `fh8626-3ad` and streams 100 frames from `/dev/video0`
+while the daemon's AE and AWB work on the ISP's statistics (**ISP**,
+below). Mind the host CPU: that
 kernel never issues WFI (`fh8626_idle()` is empty), so a guest at idle
 still takes a whole host core. The first login asks the camera's owner to accept majestic's EULA.
 
@@ -263,6 +267,56 @@ announces its channel. Through `rpmsg_char` (bound by `driver_override`;
 unchanged, and the firmware's own diagnostics read ECHO_RUNNING with no
 error.
 
+**CSI-2 receiver** (`fh-csi`, FH8626V100). The DesignWare CSI-2 host at
+0xF1100000 and Fullhan's wrapper at 0xF1000000, as `fh8626-csi.c` drives
+them: storage, which that driver only writes (but for the wrapper's
+read-modify-write). Its output is whether the host, its PHY and the D-PHY
+are out of reset (0x08, 0x40, 0x44), which the ISP takes as frames
+passing; error and packet status and the PHY test read-back are not
+modelled.
+
+**ISP** (`fh-isp`, FH8626V100), with the VPU inside its register window,
+at 0xE8400000, IRQ 5. No SDK or register manual describes the part; OpenIPC's
+`fh8626-isp.c` / `fh8626-vpu.c` are the only description, and the model
+gives them the frames, interrupts and statistics they are written for.
+Frames flow while the ISP runs (0x18), its input is open (0x68 bit 0), the
+CSI is up and the sensor streams, at the sensor's frame length.
+- **At a frame's start:** the status (0x04, write one to clear; 0x08
+  enables) gets PICTURE_START and VPU_START. Each VPU channel with its
+  write enable set in 0x2C latches its Y and CbCr addresses
+  (0x9AC / 0x9B0 + 12c), as does the statistics target (0x1D8). That
+  matches `vpu_chan_irq()`: the address written at an interrupt applies to
+  the next frame.
+- **At its end, after the active rows:** each open channel gets the frame,
+  linear NV12 at its output size and stride. With 0x24 bit 13 set, the zone
+  statistics go to the target: four 4 KiB banks, one per Bayer site in
+  physical order, of 16x16 {sum, count, max, min} cells. The nine AWB blocks
+  go to 0xAE0 and, with bit 16 set, the 24x16 motion bitmap to 0x1F4.
+  Then FRAME_END and VPU_END.
+The pixels are a synthetic scene:
+- **Content:** a grey gradient, six colour bars, a lamp that clips, and a
+  box that moves every frame.
+- **Light:** on the GC1054's white locus as `fh8626-3ad`'s AWB tables give
+  it (R/G 0.739, B/G 0.399, the warmer neighbour of its starting point).
+- **Level:** reflectance times rows times analog gain times the ISP's
+  digital gain (0x168[12:3], Q6), clipped at 12 bits.
+- **Frames:** white-balanced by 0x224 / 0x228 (Q9, per site), with an
+  approximate gamma.
+
+The delays are those `fh8626-3ad`'s README measured on a GC1054 board: a
+sensor write shows in the statistics published three frame events later,
+the ISP gain two. So the daemon's loops close.
+On the release, streaming 100 frames with the daemon running:
+- AE takes the exposure from 500 rows to the 25 frames/s maximum (891)
+  and adds about 1.2x of analog gain;
+- AWB moves from 512/512 to 693/1282, the light's inverse (512 / 0.739,
+  512 / 0.399).
+
+Everything else in the pipeline -- noise filters, tone curves, colour
+matrix, NR3D and its history DMA, the second statistics bank (0x1E8), the
+VPU's block means, logo and mask overlays and register-load lists, overflow
+-- is storage.
+
 **SPI** (`fh-spi`). A DW SSI. SPI0 on V200 has Fullhan's "SPIC" additions:
 CCFGR (0xF4) with the data phase's wire count, a byte swap and 32-bit
 frames, XIP registers, and a 4 KiB data window at +0x1000 where every word
@@ -327,14 +381,18 @@ With the GC1054 present, `fh8626-capture` registers its media graph:
 `fh8626-isp`, `fh8626-csi` and `gc1054 0-0021` subdevices, the camera,
 logo and VPU video nodes. Then `fh8626-3ad`, the ISP's 3A daemon, finds
 them and starts: it reads the ISP's gain range and tuning controls, then
-waits for statistics.
-Without the sensor the capture driver's async notifier never completes, no
-subdevice appears, and the daemon gives up after 10 s.
-What the twin does not do yet: the CSI and ISP registers are the
-unimplemented periph space, so no frames and no statistics arrive. On this
-release nothing would ask for them: `divinus` needs the vendor SDK's
-`libvmm.so`, which this image does not ship, and exits. The encoder's reset
-times out, and the JPEG block reads its ID as 0 (0x00038401 expected).
+waits for statistics, which arrive once something streams (**ISP**,
+below). Without the sensor the capture driver's async notifier never
+completes, no subdevice appears, and the daemon gives up after 10 s.
+On this release nothing streams by itself: `divinus` needs the vendor
+SDK's `libvmm.so`, which this image does not ship, and exits. The
+encoder's reset times out, and the JPEG block reads its ID as 0
+(0x00038401 expected); neither is modelled.
+For the GC1054 the sensor model decodes what OpenIPC's `gc1054.c` writes:
+rows in page 0's 0x03:0x04, the gain as page 1's bracket 0xB6 times the
+Q6 step in 0xB1:0xB2 (the driver's bracket table), the frame as 720 + VB
+(0x07:0x08) + 16 rows of 1732 clocks at 38.8 MHz (25 frames/s at the
+driver's default), streaming once page 3's 0x10 has its MIPI bit.
 
 **USB** (`dwc2-usb`). QEMU's DWC2 in host mode; `-device usb-storage`,
 `usb-net` and the rest plug into its root port (behind QEMU's hub). The

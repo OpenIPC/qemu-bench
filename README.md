@@ -395,10 +395,12 @@ Flash writes go back to the file. OpenIPC's `fh8852v200`, `fh8852v100` and
 `fh8856v100` releases boot on the vendor U-Boot, which can also fetch them
 over TFTP and write them itself, as on a camera, (`qemu-boot/fh-openipc-flash.sh`) or
 with `-kernel` (`qemu-boot/test-fullhan-boot.sh`) to a login prompt with a
-DHCP lease; OpenIPC's `fh8626v100` boots that way too, and its ARC600
-(`fh-arc`) runs OpenIPC's RPMsg echo firmware for the kernel's remoteproc.
-The vendors' media pipeline (their ARC firmware, ISP, encoders) and audio
-(the ARC's) are not modelled. Map, boot chain and devices are in
+DHCP lease; OpenIPC's `fh8626v100` boots that way too, its ARC600
+(`fh-arc`) runs OpenIPC's RPMsg echo firmware for the kernel's remoteproc,
+and its CSI, ISP and VPU (`fh-csi`, `fh-isp`) stream frames and statistics
+to OpenIPC's media drivers from a synthetic scene, enough for `fh8626-3ad`'s
+AE and AWB to converge. The vendors' media pipeline (their ARC firmware,
+ISP, encoders) and audio (the ARC's) are not modelled. Map, boot chain and devices are in
 [docs/fullhan.md](docs/fullhan.md).
 
 ¹ Same die and models as a tested sibling; no image was at hand.
@@ -867,6 +869,8 @@ qemu/
 ├── hw/watchdog/fh-wdt.c         # DW watchdog
 ├── hw/misc/fh-efuse.c           # eFuse controller
 ├── hw/misc/fh-arc.c             # FH8626V100 ARC600: ARCompact core run from DDR (OpenIPC's echo firmware)
+├── hw/misc/fh-csi.c             # FH8626V100 MIPI CSI-2 receiver + wrapper
+├── hw/misc/fh-isp.c             # FH8626V100 ISP + VPU: frames, statistics, IRQs for OpenIPC's media drivers
 ├── hw/arm/ambarella.c           # Ambarella S3L machine, generated device tree
 ├── hw/misc/amb-vic.c            # Ambarella VIC and the scratchpad that names the IRQ
 ├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
