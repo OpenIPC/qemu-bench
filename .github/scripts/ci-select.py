@@ -90,6 +90,7 @@ JOB_FAMILIES = {
     "boot-grainmedia": {"grainmedia"},
     "boot-ingenic": {"ingenic"},
     "majestic-ingenic": {"ingenic"},
+    "majestic-anyka": {"anyka"},
     "vtund-neo": {"hisilicon"},
     "wifi-xiongmai": {"xiongmai"},
 }
