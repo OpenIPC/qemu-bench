@@ -81,6 +81,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmH1State, XM_H1)
 #define   H1_INT_DIS                (1u << 1)
 #define   H1_INT_BIT                (1u << 0)
 #define H1_REG_ADDR_OUTPUT_STREAM   0x014
+#define H1_REG_ADDR_REF_LUMA        0x01c   /* the picture coded against */
+#define H1_REG_ADDR_RECON_LUMA      0x024   /* where this one is rebuilt */
 #define H1_REG_ADDR_IN_PLANE_0      0x02c
 #define H1_REG_ADDR_IN_PLANE_1      0x030
 #define H1_REG_ADDR_IN_PLANE_2      0x034
@@ -113,7 +115,21 @@ struct XmH1State {
     uint32_t regs[H1_REGS_SIZE / 4];
     char *dump_dir;
     uint32_t jobs;
-    H264Enc h264;
+    /*
+     * One H.264 stream state per channel the library runs.  The hardware
+     * has none: each job names its reference and reconstruction buffers,
+     * and a channel's next job references the picture this one rebuilds.
+     * The model's numbering and the SPS/PPS it codes against are per
+     * stream, so a job is matched to its channel by that chain -- with the
+     * main and a sub channel interleaved, one shared state coded the main
+     * channel's slices against the sub channel's headers.
+     */
+    struct {
+        H264Enc h264;
+        uint32_t recon;     /* the last job's ADDR_RECON_LUMA */
+        int mbw, mbh;
+        uint32_t used;      /* job number of the last use, 0: free */
+    } chan[4];
 };
 
 /* ---- JPEG (jpeg-enc.c) ---------------------------------------------- */
@@ -255,6 +271,39 @@ static uint32_t xm_h1_jpeg(XmH1State *s)
     return overflow ? H1_INT_BUF_FULL : H1_INT_FRAME_RDY;
 }
 
+/* The stream state of the channel this job belongs to (see XmH1State). */
+static H264Enc *xm_h1_h264_chan(XmH1State *s, int mbw, int mbh)
+{
+    const uint32_t ref = s->regs[H1_REG_ADDR_REF_LUMA / 4];
+    int i, pick = -1;
+
+    for (i = 0; i < ARRAY_SIZE(s->chan) && pick < 0; i++) {
+        if (s->chan[i].used && s->chan[i].recon == ref) {
+            pick = i;
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(s->chan) && pick < 0; i++) {
+        if (s->chan[i].used && s->chan[i].mbw == mbw &&
+            s->chan[i].mbh == mbh) {
+            pick = i;
+        }
+    }
+    if (pick < 0) {
+        pick = 0;
+        for (i = 1; i < ARRAY_SIZE(s->chan); i++) {
+            if (s->chan[i].used < s->chan[pick].used) {
+                pick = i;
+            }
+        }
+        memset(&s->chan[pick], 0, sizeof(s->chan[pick]));
+    }
+    s->chan[pick].recon = s->regs[H1_REG_ADDR_RECON_LUMA / 4];
+    s->chan[pick].mbw = mbw;
+    s->chan[pick].mbh = mbh;
+    s->chan[pick].used = s->jobs + 1;  /* jobs counts it after the job */
+    return &s->chan[pick].h264;
+}
+
 static uint32_t xm_h1_h264(XmH1State *s)
 {
     const uint32_t ctrl = s->regs[H1_REG_ENC_CTRL / 4];
@@ -280,6 +329,7 @@ static uint32_t xm_h1_h264(XmH1State *s)
     if (!xm_h1_geometry_ok(s, "H.264", mbw, mbh, stride)) {
         return H1_INT_ERROR;
     }
+    H264Enc *enc = xm_h1_h264_chan(s, mbw, mbh);
     if (rem_bits % 8) {
         qemu_log_mask(LOG_UNIMP, "xm-h1: %d header bits, not whole bytes\n",
                       rem_bits);
@@ -292,7 +342,7 @@ static uint32_t xm_h1_h264(XmH1State *s)
         dma_memory_read(&address_space_memory, out - 512, hdr, 512,
                         MEMTXATTRS_UNSPECIFIED);
         memcpy(hdr + 512, rem_bytes, nrem);
-        h264_enc_parse_headers(&s->h264, hdr, 512 + nrem);
+        h264_enc_parse_headers(enc, hdr, 512 + nrem);
         /* the last SPS's start code: the dump of an IDR job carries the
          * headers it was coded against, so the files concatenate into a
          * stream any decoder plays even when rate control rewrites the PPS */
@@ -314,7 +364,7 @@ static uint32_t xm_h1_h264(XmH1State *s)
 
     g_autofree uint8_t *buf = g_malloc(MAX(cap, 16));
     memcpy(buf, rem_bytes, MIN(nrem, (int)cap));
-    size_t n = h264_enc_frame(&s->h264, idr,
+    size_t n = h264_enc_frame(enc, idr,
                               H1_CTRL0_INIT_QP(s->regs[H1_REG_ENC_CTRL0 / 4]),
                               mbw, mbh, y, stride, uv, stride,
                               buf + nrem, cap > (uint32_t)nrem ? cap - nrem : 0);
@@ -412,6 +462,7 @@ static void xm_h1_reset(DeviceState *dev)
     XmH1State *s = XM_H1(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->chan, 0, sizeof(s->chan));
     qemu_irq_lower(s->irq);
 }
 

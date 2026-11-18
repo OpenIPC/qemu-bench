@@ -24,8 +24,13 @@
 # --soc picks the release, the board's mem= and RAM, the CPUs, majestic's
 # main-channel size and the settle count; the other options override it.
 #
-#   xm530  xm530 release, mem=32M of 64M, 2 CPUs, 704x576 (H.265 main
-#          channel unavailable, so H.264 is the D1 feeder)
+#   xm530  xm530 release, mem=32M of 64M, 2 CPUs, 704x576 (the D1
+#          feeder; since the 2026-11-17 release majestic also encodes its
+#          1920x1080 main channel as H.264)
+#
+# The H1 serves every H.264 channel majestic runs, so the jobs are split by
+# the picture size in their ENC_CTRL (the .regs dump beside each job) and
+# each channel is checked on its own; --size must be one of them.
 #   xm510  xm510 release, mem=18M of 32M as U-Boot passes it (three VI
 #          buffers), 1 CPU, 1280x720
 #
@@ -150,37 +155,63 @@ for name in sorted(os.listdir(dump)):
 check(idrs >= 2 and not bad,
       '%d IDR jobs, %d without their own SPS/PPS (want >= 2 and 0)' % (idrs, bad))
 
-# 2. a clean decode, one frame per job, at the expected size
-jobs = sum(n.endswith('.h264') for n in os.listdir(dump))
-r = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode', '-i', stream,
-                    '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'], capture_output=True)
-check(r.returncode == 0 and not r.stderr,
-      'ffmpeg decodes the stream (exit %d)%s' % (r.returncode,
-      ': ' + r.stderr.decode(errors='replace')[:300] if r.stderr else ''))
-info = dict(l.split('=', 1) for l in subprocess.run(
-    ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
-     'stream=width,height,profile', '-of', 'default=nw=1', stream],
-    capture_output=True, text=True).stdout.split())
-check((info.get('width'), info.get('height')) == (str(w), str(h)),
-      'picture %sx%s, want %s (%s)' % (info.get('width'), info.get('height'),
-                                       size, info.get('profile')))
-fs = w * h * 3 // 2
-frames = len(r.stdout) // fs if r.returncode == 0 else 0
-check(frames == jobs, '%d frames decoded from %d jobs' % (frames, jobs))
+# 2./4. per channel: the jobs grouped by ENC_CTRL's picture size
+def enc_size(name):
+    for l in open(os.path.join(dump, name[:-len('.h264')] + '.regs')):
+        a, v = l.split()
+        if int(a, 16) == 0x38:
+            v = int(v, 16)
+            return ((v >> 19) & 0x1ff) * 16, ((v >> 10) & 0x1ff) * 16
+    return 0, 0
 
-# 4. xm-vi's frame number, 16 blocks of 16 px across the top left, MSB first
-counts = []
-for f in range(frames):
-    y = r.stdout[f * fs:f * fs + w * h]
-    v = 0
-    for b in range(16):
-        v = (v << 1) | (y[8 * w + b * 16 + 8] > 128)
-    counts.append(v)
-live = counts[settle:]
-rising = all(b > a for a, b in zip(live, live[1:]))
-check(len(live) > 1 and rising,
-      'the VI frame number rises through every picture%s (%s .. %s)' %
-      (' after the first %d' % settle if settle else '', live[:3], live[-3:]))
+channels = {}
+for name in sorted(os.listdir(dump)):
+    if name.endswith('.h264'):
+        channels.setdefault(enc_size(name), []).append(name)
+# coded heights round up to 16: 1080 is coded as 1088
+check(any(cw == w and h <= ch < h + 16 for cw, ch in channels),
+      'a channel at %s among %s' % (size, ', '.join(
+          '%dx%d (%d jobs)' % (cw, ch, len(n)) for (cw, ch), n in channels.items())))
+
+for (cw, ch), names in sorted(channels.items()):
+    tag = '%dx%d' % (cw, ch)
+    stream_c = '%s.%s' % (stream, tag)
+    with open(stream_c, 'wb') as out:
+        for n in names:
+            out.write(open(os.path.join(dump, n), 'rb').read())
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode', '-i',
+                        stream_c, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'],
+                       capture_output=True)
+    check(r.returncode == 0 and not r.stderr,
+          '%s: ffmpeg decodes the stream (exit %d)%s' % (tag, r.returncode,
+          ': ' + r.stderr.decode(errors='replace')[:300] if r.stderr else ''))
+    info = dict(l.split('=', 1) for l in subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+         'stream=width,height', '-of', 'default=nw=1', stream_c],
+        capture_output=True, text=True).stdout.split())
+    pw, ph = int(info.get('width', 0)), int(info.get('height', 0))
+    fs = pw * ph * 3 // 2
+    frames = len(r.stdout) // fs if r.returncode == 0 and fs else 0
+    check(frames == len(names), '%s: %d frames decoded from %d jobs' %
+          (tag, frames, len(names)))
+
+    # 4. xm-vi's frame number, 16 blocks of 16 px across the top left, MSB
+    # first -- at the main size; xm-vi scales it into a smaller channel
+    if pw != w:
+        continue
+    counts = []
+    for f in range(frames):
+        y = r.stdout[f * fs:f * fs + pw * ph]
+        v = 0
+        for b in range(16):
+            v = (v << 1) | (y[8 * pw + b * 16 + 8] > 128)
+        counts.append(v)
+    live = counts[settle:]
+    rising = all(b > a for a, b in zip(live, live[1:]))
+    check(len(live) > 1 and rising,
+          '%s: the VI frame number rises through every picture%s (%s .. %s)' %
+          (tag, ' after the first %d' % settle if settle else '',
+           live[:3], live[-3:]))
 sys.exit(fail)
 PY
 fi
