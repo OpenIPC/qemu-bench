@@ -171,8 +171,9 @@ image. The image's env partition holds a valid U-Boot environment, as a
 camera's does: with no `/etc/fw_env.config`, OpenIPC's `fw_printenv` looks
 for one by CRC, and when there is none it CRCs 64-256 KiB at every 4 KiB of
 the flash -- seconds per call under TCG, a dozen calls before login.
-FH8626V100's release reaches login in under 20 s; its kernel builds no
-Ethernet driver (the board it was brought up on is Wi-Fi only), so the
+FH8626V100's release reaches login in under 20 s, booted with
+`sensor=gc1054`, its DT's sensor; the test checks that `fh8626-3ad` starts
+on it (**Image sensor**, below). Its kernel builds no Ethernet driver (the board it was brought up on is Wi-Fi only), so the
 DHCP check is skipped there, and it boots with `mem=64M` and `osmem=64M`
 in that environment (its DT reserves CMA and the ARC's memory up to the
 top of 64 MB, and `load_fullhan` writes `osmem` and reboots until it reads
@@ -317,6 +318,23 @@ read after a single address byte, so ipctool's 8-bit probe falls through
 to its 16-bit one. Detection is as far as the vendor apps get: the V200
 `ipcam` prints `detected sensor gc4653_mipi`, then fails `FH_SYS_Init`
 (the media devices need the ARC, below) and reboots the camera.
+
+OpenIPC's FH8626V100 kernel (4.19) has its own open media drivers instead,
+and its DT names the sensor: a GC1054 at I2C0 0x21, feeding the CSI
+(0xF1100000, wrapper 0xF1000000) and the ISP (0xE8400000). Boot that
+release with `sensor=gc1054`; the default GC2053 is the vendor dump's.
+With the GC1054 present, `fh8626-capture` registers its media graph:
+`fh8626-isp`, `fh8626-csi` and `gc1054 0-0021` subdevices, the camera,
+logo and VPU video nodes. Then `fh8626-3ad`, the ISP's 3A daemon, finds
+them and starts: it reads the ISP's gain range and tuning controls, then
+waits for statistics.
+Without the sensor the capture driver's async notifier never completes, no
+subdevice appears, and the daemon gives up after 10 s.
+What the twin does not do yet: the CSI and ISP registers are the
+unimplemented periph space, so no frames and no statistics arrive. On this
+release nothing would ask for them: `divinus` needs the vendor SDK's
+`libvmm.so`, which this image does not ship, and exits. The encoder's reset
+times out, and the JPEG block reads its ID as 0 (0x00038401 expected).
 
 **USB** (`dwc2-usb`). QEMU's DWC2 in host mode; `-device usb-storage`,
 `usb-net` and the rest plug into its root port (behind QEMU's hub). The
