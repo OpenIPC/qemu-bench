@@ -1606,9 +1606,13 @@ for sym in USB_DWC2 SDHCI BITBANG_I2C; do
         echo "  hw/mips/Kconfig: INGENIC now selects $sym"
     fi
 done
+# Each file's own CONFIG_INGENIC line, not just its name: ingenic-avpu.c is
+# also Anyka's EV300 encoder (CONFIG_ANYKA, added above), and a fresh tree
+# that matched the name alone left it out of the MIPS build.
 for f in $(cd qemu && find hw -name 'ingenic*.c' ! -path 'hw/mips/*' 2>/dev/null); do
     d=$(dirname "$f"); b=$(basename "$f")
-    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+    if ! grep -q "CONFIG_INGENIC', if_true: files('$b')" \
+            "$QEMU_DIR/$d/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('$b'))" \
             >> "$QEMU_DIR/$d/meson.build"
         echo "  $d/meson.build: added $b"
