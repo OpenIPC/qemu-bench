@@ -26,6 +26,11 @@
 #     programmed through the SPI controller and written back to the image
 #     (the 3.0.8 kernels' m25p80 also waits for WEL to clear after every
 #     erase and program);
+#   - fh8626v100 only: its 3A daemon starts. OpenIPC's DT puts a GC1054 at
+#     I2C0 0x21 behind the CSI and ISP, so the machine gets sensor=gc1054
+#     (its default, gc2053, is the vendor camera dump's); with no sensor
+#     the capture driver never registers the ISP subdevice fh8626-3ad
+#     waits for, and the daemon gives up after 10 s;
 #   - fh8626v100 only, in a second boot with a script as PID 1: its kernel
 #     starts the ARC (fh-arc) with OpenIPC's firmware from the image, the
 #     firmware announces rpmsg-arc-echo, and fh-rpmsg-echo.c -- copied out
@@ -56,6 +61,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 MACHINE=${MACHINE:-$SOC}
+[ "$SOC" = fh8626v100 ] && [ "$MACHINE" = fh8626v100 ] &&
+    MACHINE=fh8626v100,sensor=gc1054
 KERNEL=$DIR/uImage.$SOC
 ROOTFS=$DIR/rootfs.squashfs.$SOC
 
@@ -136,6 +143,22 @@ check "OpenIPC userland" 'Welcome to OpenIPC'
 check "login prompt" 'login:'
 if [ $GMAC -eq 1 ]; then
     check "DHCP lease over the GMAC" 'lease of 10.0.2.15'
+fi
+if [ $ARC -eq 1 ]; then
+    # The init script's verdict: "OK" or "FAIL (...)", after the "Starting
+    # fh8626-3ad: " prefix or on a line of its own once the daemon has
+    # printed, and before the next script starts. rcS runs the scripts in
+    # turn, so it is in the log before login:.
+    if awk '/Starting fh8626-3ad:/ { f = 1 }
+            f && /(^|fh8626-3ad: )FAIL \(/ { exit 1 }
+            f && /(^|fh8626-3ad: )OK\r?$/ { ok = 1; exit 0 }
+            f && /^Starting / && !/fh8626-3ad:/ { exit 1 }
+            END { exit !ok }' "$LOG"; then
+        echo "  PASS: fh8626-3ad (ISP 3A daemon) started"
+    else
+        echo "  FAIL: fh8626-3ad (ISP 3A daemon) started"
+        fail=1
+    fi
 fi
 # A JFFS2 node starts 0x1985 (little-endian) at a 4-byte boundary.
 if python3 - "$IMG" <<'EOF'
