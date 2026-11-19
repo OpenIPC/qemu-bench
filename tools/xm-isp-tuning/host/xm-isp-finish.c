@@ -20,9 +20,11 @@
  *   AWB runs on it: bypass 0, colour temperature limits from the base.
  * - BNR: AINR needs BNR's temporal half after it (ainr_pos_switch POST,
  *   tnr on); the App turns that on only when it switches AINR on. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <xmedia_awb.h>
 #include <xmedia_isp.h>
 
@@ -68,6 +70,10 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cap = argv[1], *base = argv[2], *out = argv[3];
+    if (mkdir(out, 0755) && errno != EEXIST) {
+        perror(out);
+        return 1;
+    }
     static char buf[1 << 16];
     for (const char *const *n = keep; *n; n++) {
         char p[512];

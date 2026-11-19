@@ -41,15 +41,20 @@ int main(int argc, char **argv) {
     t->ae_delay_attr.black_delay_frame = (xmedia_u16)atoi(argv[3]);
     t->sys_gain_range.max = (xmedia_u32)strtoul(argv[4], NULL, 0);
     t->gain_thres_hold = (xmedia_u32)strtoul(argv[5], NULL, 0);
-    r = xmedia_ae_set_exposure_attr(0, &e);
-    printf("AE: %d ISO points, speed %u: %#x\n", n, t->speed, r);
+    int ae = xmedia_ae_set_exposure_attr(0, &e);
+    printf("AE: %d ISO points, speed %u: %#x\n", n, t->speed, ae);
 
     xmedia_isp_ainr_attr a;
-    if (!(r = xmedia_isp_get_ainr_attr(0, &a))) {
-        a.switch_thd_low = (xmedia_u32)strtoul(argv[6], NULL, 0);
-        a.switch_thd_high = (xmedia_u32)strtoul(argv[7], NULL, 0);
-        r = xmedia_isp_set_ainr_attr(0, &a);
+    xmedia_u32 low = (xmedia_u32)strtoul(argv[6], NULL, 0);
+    xmedia_u32 high = (xmedia_u32)strtoul(argv[7], NULL, 0);
+    int ainr = xmedia_isp_get_ainr_attr(0, &a);
+    if (ainr) {
+        printf("AINR: xmedia_isp_get_ainr_attr %#x\n", ainr);
+    } else {
+        a.switch_thd_low = low;
+        a.switch_thd_high = high;
+        ainr = xmedia_isp_set_ainr_attr(0, &a);
+        printf("AINR thresholds %u/%u: %#x\n", low, high, ainr);
     }
-    printf("AINR thresholds %u/%u: %#x\n", a.switch_thd_low, a.switch_thd_high, r);
-    return 0;
+    return ae || ainr;
 }

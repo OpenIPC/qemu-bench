@@ -1,8 +1,11 @@
 /* dump: write every attribute as raw bytes to <dir>/<name>.bin
- * apply: read <dir>/<name>.bin for the names given and set them */
+ * apply: read <dir>/<name>.bin for the names given and set them
+ * Exits non-zero if any getter, setter or file failed. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <xmedia_isp.h>
 #include <xmedia_ae.h>
 #include <xmedia_awb.h>
@@ -42,25 +45,36 @@ static struct { const char *n; size_t sz; getf g; setf s; } T[] = {
 };
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
-    int dump = !strcmp(argv[1], "dump");
+    /* line-buffered, so a crash in one getter still leaves the log of the rest */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    int dump = !strcmp(argv[1], "dump"), bad = 0;
+    if (dump && mkdir(argv[2], 0755) && errno != EEXIST) {
+        perror(argv[2]);
+        return 1;
+    }
     for (size_t i = 0; i < sizeof T / sizeof *T; i++) {
         int want = dump;
         for (int a = 3; a < argc; a++) if (!strcmp(argv[a], T[i].n)) want = 1;
         if (!want) continue;
         char p[256]; snprintf(p, sizeof p, "%s/%s.bin", argv[2], T[i].n);
         void *b = calloc(1, T[i].sz);
+        if (!b) return 1;
         if (dump) {
             int r = T[i].g(0, b);
-            FILE *f = fopen(p, "wb"); fwrite(b, 1, T[i].sz, f); fclose(f);
             printf("%-18s get %#x %zu\n", T[i].n, r, T[i].sz);
+            if (r) { bad = 1; free(b); continue; }   /* no block for a failed read */
+            FILE *f = fopen(p, "wb");
+            if (!f || fwrite(b, 1, T[i].sz, f) != T[i].sz) { perror(p); bad = 1; }
+            if (f && fclose(f)) { perror(p); bad = 1; }
         } else {
             FILE *f = fopen(p, "rb");
-            if (!f) { printf("%-18s missing\n", T[i].n); continue; }
+            if (!f) { printf("%-18s missing\n", T[i].n); bad = 1; free(b); continue; }
             size_t n = fread(b, 1, T[i].sz, f); fclose(f);
             int r = n == T[i].sz ? T[i].s(0, b) : -1;
             printf("%-18s set %#x\n", T[i].n, r);
+            if (r) bad = 1;
         }
         free(b);
     }
-    return 0;
+    return bad;
 }

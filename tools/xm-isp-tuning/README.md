@@ -81,6 +81,16 @@ shipped `sc465sl.bin` was exported from byte for byte.
 
 ## The twin route, and why it wins
 
+```sh
+SDK_STATIC=<shimetapi_pico_gx>/source/gmp/lib/arm-gcc12.2.0-linux-uclibceabi/nolog/static \
+SDK_INC=... TOOLCHAIN=... tools/xm-isp-tuning/build.sh
+tools/xm-isp-tuning/twin/xm-twin-export.py stock.bin \
+    tools/xm-isp-tuning/build/twin 60 twin    # boots twin/flash.img, a copy
+# twin/<block>.bin replace the capture's ISP blocks; the AWB comes from it:
+cp capture/awb*.bin twin/
+tools/xm-isp-tuning/build/xm-isp-finish twin base final
+```
+
 `twin/xm-twin-export.py` boots the whole stock firmware in the `gk7206v11a`
 machine, lets the App bring its ISP up, and runs `attrtool dump` and
 `pqexport` inside it (static musl builds of the camera tools, linked against
