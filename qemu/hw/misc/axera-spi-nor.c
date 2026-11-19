@@ -249,6 +249,7 @@ struct AxeraSpiNorState {
     unsigned int cmd_len;
     unsigned int session_start_cmd_len;
     bool write_enable_latch;
+    bool reset_enabled;     /* RSTEN (0x66) was the previous command */
     bool env_overridden;
     bool env_from_flash;
     bool mtd_config_overridden;
@@ -451,6 +452,10 @@ static void axera_spi_nor_mark_env_overridden(AxeraSpiNorState *s,
 static void axera_spi_nor_cmd_byte(AxeraSpiNorState *s, uint8_t byte)
 {
     if (s->cmd_len == 0) {
+        /* RESET counts only straight after RSTEN, as on the flash */
+        bool reset_armed = s->reset_enabled;
+
+        s->reset_enabled = false;
         s->cmd_buf[0] = byte;
         s->cmd_len = 1;
         switch (byte) {
@@ -469,10 +474,14 @@ static void axera_spi_nor_cmd_byte(AxeraSpiNorState *s, uint8_t byte)
              * before its first read. Kept, these opcode bytes became
              * that read's opcode and address (cmd_buf 66 99 03 01).
              */
+            s->reset_enabled = true;
             s->cmd_len = 0;
             break;
         case SPINOR_OP_RESET:
-            s->write_enable_latch = false;
+            /* A RESET not preceded by RSTEN is ignored by the flash */
+            if (reset_armed) {
+                s->write_enable_latch = false;
+            }
             s->cmd_len = 0;
             break;
         case SPINOR_OP_CHIP_ERASE:
@@ -882,6 +891,7 @@ static void axera_spi_nor_reset(DeviceState *dev)
     s->cmd_len = 0;
     s->session_start_cmd_len = 0;
     s->write_enable_latch = false;
+    s->reset_enabled = false;
     s->latched_opcode = 0;
     s->latched_addr = 0;
     s->rxq_head = 0;
