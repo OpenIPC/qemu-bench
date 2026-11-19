@@ -471,6 +471,21 @@ something to make up: on the GC2083 at 25 % `fh8626-3ad` raises the
 analogue gain to 3.5x; at 4 % it takes the frame to 2700 lines (12.5
 frames/s) and the gain to 8x, then adds ISP digital gain.
 
+The GC2083's frame delays are not known: its datasheet gives no latch
+timing, and the public drivers disagree. SigmaStar's declares shutter
+and gain delays of 2 (as for its GC2053 and GC2093); the xmedia
+gk7206v100 one in openhisilicon gives exposure and gain 2 but VMAX 3,
+while that tree's other GalaxyCore drivers give VMAX 1, 2 or 3. The model
+latches exposure, gain and frame length together at a frame's start.
+`-global galaxycore-sensor.vts-delay=N` (1 or 2, GC2083 only) holds the
+frame length back N frames more, as a what-if for an AE loop's write
+order, not as the chip's behaviour; with `-d guest_errors` the sensor
+reports an exposure that runs past its frame. With OpenIPC/firmware
+#2888's `fh8626-3ad` at `light=4`, entering slow shutter: no violation
+at 0 or 1 (it writes a longer frame one frame before the exposure that
+needs it), one at 2 (`exposure 2692 rows beyond the frame (VTS 1125 -
+8)`, for one frame).
+
 **USB** (`dwc2-usb`). QEMU's DWC2 in host mode; `-device usb-storage`,
 `usb-net` and the rest plug into its root port (behind QEMU's hub). The
 4.9 kernels run it under mainline dwc2 (`fh_usb`; a module, `dwc2.ko`, in

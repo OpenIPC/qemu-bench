@@ -1263,6 +1263,40 @@ def test_fh8626_gc2083(qemu):
         qt.close()
 
 
+def test_fh8626_gc2083_vts_delay(qemu):
+    """The opt-in vts-delay: the GC2083's frame length a frame behind the
+    exposure and gain written with it (a what-if, not the chip's known
+    behaviour)."""
+    print('fh8626v100: GC2083 with vts-delay=1')
+    qt = QTest(qemu, 'fh8626v100,sensor=gc2083',
+               ['-global', 'galaxycore-sensor.vts-delay=1'])
+    w, h = 1920, 1080
+    try:
+        gc2083_write(qt, [(0x0D05, 0x05), (0x0D06, 0xC9),
+                          (0x0D41, 1125 >> 8), (0x0D42, 1125 & 0xFF)])
+        qt.writel(ISP + 0x30, (h - 1) << 16 | (w - 1))
+        qt.writel(ISP + 0x08, ~(1 << 3) & 0xFFFFFFFF)
+        qt.writel(ISP + 0x18, 1)
+        qt.writel(ISP + 0x68, 1)
+        for off in (0x08, 0x40, 0x44):
+            qt.writel(CSI + off, 1)
+        gc2083_write(qt, [(0x023E, 0x99)])
+        check('stream on: a frame starts', isp_wait_start(qt, 50000000) > 0,
+              True)
+        qt.writel(ISP + 0x04, 0xFFFFFFFF)
+        check('1125 rows, ms', round(isp_wait_start(qt, 50000000) / 1e6), 33)
+        qt.writel(ISP + 0x04, 0xFFFFFFFF)
+        gc2083_write(qt, [(0x0D41, 2250 >> 8), (0x0D42, 2250 & 0xFF)])
+        got = []
+        for _ in range(3):
+            got.append(round(isp_wait_start(qt, 100000000) / 1e6))
+            qt.writel(ISP + 0x04, 0xFFFFFFFF)
+        check('2250 rows a frame later than without the delay',
+              got == [33, 33, 67], True)
+    finally:
+        qt.close()
+
+
 JPEG = 0xE8300000
 PAE = 0xE7000000
 # Annex K luminance and chrominance quantisers, natural order, and the
@@ -1572,6 +1606,7 @@ def main():
     test_fh8626_arc(args.qemu)
     test_fh8626_isp(args.qemu)
     test_fh8626_gc2083(args.qemu)
+    test_fh8626_gc2083_vts_delay(args.qemu)
     test_fh8626_jpeg(args.qemu)
     test_fh8626_pae(args.qemu)
     test_fh8632(args.qemu)
