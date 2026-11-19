@@ -85,7 +85,9 @@ copies the boot area to its store address, skipping the closed auxcode's
 DDR training; the loader unpacks U-Boot with `hisi-gzip` (`layout=1`).
 A 16 MiB NOR with U-Boot at 0 and `firmware.bin.gk7206v12a` (from
 `openipc.gk7206v12a-nor-lite-split.tgz`) at 0x50000 boots to the OpenIPC
-login prompt.
+login prompt. `tools/xm-isp-tuning/` runs the stock firmware's App code
+under Unicorn to take Xiongmai's per-sensor ISP tuning out of a dump, as an
+SDK PQ bin.
 
 The three dual-core Cortex-A7 parts (`hi3516cv500`, `hi3516dv300`,
 `hi3516av300`) boot both cores by default, from `-kernel` and from a
