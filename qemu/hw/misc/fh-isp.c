@@ -398,7 +398,9 @@ static void fh_isp_frame_start(FhIspState *s, int64_t now)
     uint32_t en = fh_isp_r(s, ISP_VPU_ENABLE);
     int c;
 
+    /* what the sensor latched at this start sets the frame's length */
     image_sensor_frame_start(s->sensor);
+    s->frame_ns = image_sensor_frame_ns(s->sensor) ?: s->frame_ns;
     s->seq++;
     s->prev_lines = s->exp_lines;
     s->prev_gain = s->exp_gain;

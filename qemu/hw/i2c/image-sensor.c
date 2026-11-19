@@ -34,7 +34,8 @@ typedef struct ImageSensorSpec {
     bool reg16;         /* GALAXYCORE: 16-bit register addresses */
     uint8_t disc;       /* SMARTSENS: 0x3109 where parts share an ID */
     uint8_t gain_fine;  /* SMARTSENS: 0x3E09 at 1x, on the SC2310's layout */
-    uint32_t pclk;      /* SMARTSENS: pixel clock, when known: frame timing */
+    uint32_t pclk;      /* SMARTSENS, GALAXYCORE: pixel clock, when known:
+                         * frame timing */
     uint16_t hts;       /* SMARTSENS: HTS at reset, where a mode leaves it */
     bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
     uint16_t gain_hcg;  /* SMARTSENS: the SC465SL's gain layout, its HCG
@@ -73,7 +74,9 @@ static const ImageSensorSpec image_sensors[] = {
     { "gc2053s1", GALAXYCORE, 0x3F, 0x2053, 0xF0, false,
       .pclk = 74250000, .hts = 2200 },  /* T23 SDK's second sensor */
     GC8("gc2063", 0x37, 0x2063),
-    GC16("gc2083", 0x37, 0x2083),
+    /* 100 MHz: the 24 MHz reference setting's pixel clock (galaxycore.c) */
+    { "gc2083", GALAXYCORE, 0x37, 0x2083, 0x03F0, true,
+      .pclk = 100000000 },
     GC16("gc2093", 0x37, 0x2093),
     GC16("gc4653", 0x29, 0x4653),
     GC16("gc4663", 0x29, 0x4653),

@@ -1028,7 +1028,7 @@ static void fh_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "sensor",
         fh_machine_get_sensor, fh_machine_set_sensor);
     object_class_property_set_description(oc, "sensor",
-        "Image sensor on I2C 0 (none, gc4653, gc2053, gc2063, gc2093, "
+        "Image sensor on I2C 0 (none, gc4653, gc2053, gc2063, gc2083, gc2093, "
         "gc1054, mis2006, f37); default: gc4653 on FH885xV200, gc2063 on "
         "FH865x, gc2053 on the V100 dies and FH8626V100, none on FH8632");
 }
