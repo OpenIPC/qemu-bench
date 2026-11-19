@@ -12,3 +12,5 @@ qemu-boot/sata-*.img
 tmp/
 tmp-*.log
 __pycache__/
+vendor-dumps/*.bin
+vendor-dumps/*.log
