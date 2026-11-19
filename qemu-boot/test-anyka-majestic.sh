@@ -31,7 +31,14 @@
 #   --firmware  a local package in place of the nightly (the .tgz with the
 #               uImage and rootfs.squashfs); --kernel and --majestic replace
 #               the one file in it, to try a fix before it is released
-# Needs ffmpeg, ffprobe, curl, unsquashfs and mksquashfs on PATH.
+#   --timeout   seconds for the boot to reach the first frame, login prompt
+#               included (one deadline, so a hung boot still leaves the step
+#               time to print the console)
+# The EV200 nightly comes through fetch-openipc-lite.sh, which takes the
+# newer of the plain and the split release, so a chip that moves to the split
+# one is not tested on its frozen plain archive.
+# Needs ffmpeg, ffprobe, curl, unsquashfs, mksquashfs, openssl and file on
+# PATH.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -67,7 +74,7 @@ ev300) CHIP=ak3918ev300; REPO=OpenIPC/builder
        ASSET=ak3918ev300_lite_heimvision-pe3020w-nor.tgz ;;
 *) echo "--soc ev200 or ev300" >&2; exit 2 ;;
 esac
-for t in ffmpeg ffprobe curl unsquashfs mksquashfs; do
+for t in ffmpeg ffprobe curl unsquashfs mksquashfs openssl file; do
     command -v $t >/dev/null || { echo "$t is not on PATH" >&2; exit 2; }
 done
 
@@ -78,11 +85,6 @@ fetch() {       # fetch REPO ASSET OUT
     curl -sfL --retry 3 -o "$3" \
         "https://github.com/$1/releases/download/latest/$2"
 }
-if [ -z "$FW" ]; then
-    FW=$WORK/$ASSET
-    fetch "$REPO" "$ASSET" "$FW" ||
-        { echo "no $ASSET on $REPO's latest release" >&2; exit 1; }
-fi
 if [ -z "$UBOOT" ]; then
     UBOOT=$WORK/u-boot-$CHIP-nor.bin
     fetch OpenIPC/firmware "u-boot-$CHIP-nor.bin" "$UBOOT" ||
@@ -90,11 +92,24 @@ if [ -z "$UBOOT" ]; then
 fi
 rm -rf "$WORK/pkg"
 mkdir -p "$WORK/pkg"
-tar xzf "$FW" -C "$WORK/pkg"
+if [ -n "$FW" ]; then
+    NAME=$(basename "$FW")
+    tar xzf "$FW" -C "$WORK/pkg"
+elif [ "$SOC" = ev200 ]; then
+    NAME="$REPO's latest $CHIP lite NOR release"
+    bash "$HERE/fetch-openipc-lite.sh" "$CHIP" "$WORK/pkg" >/dev/null ||
+        { echo "no $NAME" >&2; exit 1; }
+else
+    NAME=$ASSET
+    FW=$WORK/$ASSET
+    fetch "$REPO" "$ASSET" "$FW" ||
+        { echo "no $ASSET on $REPO's latest release" >&2; exit 1; }
+    tar xzf "$FW" -C "$WORK/pkg"
+fi
 KERNEL=${KERNEL:-$WORK/pkg/uImage.$CHIP}
 ROOT=$WORK/pkg/rootfs.squashfs.$CHIP
 [ -f "$KERNEL" ] && [ -f "$ROOT" ] ||
-    { echo "$FW has no uImage.$CHIP / rootfs.squashfs.$CHIP" >&2; exit 1; }
+    { echo "$NAME has no uImage.$CHIP / rootfs.squashfs.$CHIP" >&2; exit 1; }
 
 RFS=$WORK/rfs
 rm -rf "$RFS"
@@ -104,7 +119,7 @@ if [ -n "$BIN" ]; then
     chmod 755 "$RFS/usr/bin/majestic"
 fi
 [ -x "$RFS/usr/bin/majestic" ] ||
-    { echo "FAIL: $(basename "$FW") has no /usr/bin/majestic"; exit 1; }
+    { echo "FAIL: $NAME has no /usr/bin/majestic"; exit 1; }
 cat > "$RFS/etc/majestic.yaml" <<'EOF'
 system:
   logLevel: debug
@@ -115,7 +130,11 @@ jpeg:
   enabled: true
 EOF
 # claimed: an unclaimed camera streams nothing
-sed -i "s|^root:[^:]*:|root:$(openssl passwd -1 12345):|" "$RFS/etc/shadow"
+HASH=$(openssl passwd -1 12345)
+[ -n "$HASH" ] || { echo "openssl passwd gave no hash" >&2; exit 1; }
+sed -i "s|^root:[^:]*:|root:$HASH:|" "$RFS/etc/shadow"
+grep -qF "root:$HASH:" "$RFS/etc/shadow" ||
+    { echo "/etc/shadow: root's password not set" >&2; exit 1; }
 # majestic logs to syslog; the checks read the console
 sed -i 's|^exit 0$|logread -f > /dev/console 2>\&1 \&\nexit 0|' "$RFS/etc/rc.local"
 grep -q '^logread -f' "$RFS/etc/rc.local" ||
@@ -150,10 +169,11 @@ CON=$WORK/console.log
     </dev/null 2>"$WORK/qemu.err" &
 QPID=$!
 trap 'kill $QPID 2>/dev/null' EXIT
+DEADLINE=$((SECONDS + TIMEOUT))
 
-# waitfor PATTERN SECONDS
+# waitfor PATTERN: until the boot's one deadline
 waitfor() {
-    for _ in $(seq "$2"); do
+    while [ $SECONDS -lt $DEADLINE ]; do
         grep -aq -E "$1" "$CON" 2>/dev/null && return 0
         kill -0 $QPID 2>/dev/null || return 1
         sleep 1
@@ -199,9 +219,9 @@ no_sdk_error() {
     ! grep -aE 'Cannot start SDK|no encoder interrupt' "$CON"
 }
 
-echo "$SOC: $(basename "$FW")"
-check 'boots to the login prompt' waitfor 'login:' "$TIMEOUT"
-check 'majestic gets the first frame' waitfor 'anyka: first frame' "$TIMEOUT"
+echo "$SOC: $NAME"
+check 'boots to the login prompt' waitfor 'login:'
+[ $fail = 0 ] && check 'majestic gets the first frame' waitfor 'anyka: first frame'
 check 'majestic starts its SDK and the encoder answers' no_sdk_error
 if [ $fail = 0 ]; then
     check 'main stream decodes (50 pictures)' decodes stream=0
