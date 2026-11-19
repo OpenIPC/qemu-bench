@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Boot the Rostelecom IPC8232SWC-WE-B VENDOR firmware from its real SPI-NAND
+# Boot the Rostelecom IPC8232SWC-WE VENDOR firmware from its real SPI-NAND
 # dump, with the SP2305 sensor attached on hibvt-i2c bus 0 (0x12060000 @0x3C)
 # so the vendor VI/ISP sensor bring-up succeeds and the VC/AgentGreen stack
 # comes all the way up.
