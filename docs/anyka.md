@@ -428,6 +428,25 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | the same, `--ram 128` with `EVB_CBDM_AK3918AV100X_V1.0.0.dtb` | `ak3918av100x` | `anyka login:`, `mem=128M memsize=128M` |
 | owner report r-5uwdebux (openipc.org): AK3918AV130, U-Boot 2019.10.0-V4.0.27, raw 8 MiB read | `ak3918av130` | `AnyCloud-uc1_1 login:` (4.4.302-cip94, NOR through the SFC by L2 DMA, squashfs root, the vendor modules load); then the app's device-ID decryption fails (left so on purpose, see above), its daemon asks for a reboot, and the watchdog reset boots it again: a loop of about ten seconds |
 
+## Majestic on the nightlies
+
+`qemu-boot/test-anyka-majestic.sh --soc ev200|ev300` boots the latest
+nightly as released and checks Majestic end to end; CI's `majestic-anyka`
+job runs it for both:
+
+| `--soc` | Image (latest release) | Machine | Checked |
+|---|---|---|---|
+| `ev200` | OpenIPC/firmware `openipc.ak3918ev200-nor-lite.tgz`, `u-boot-ak3918ev200-nor.bin` | `ak3918ev200` (SC1345, `ak-isp`, `ak-h8290`) | majestic's first frame; 50 pictures of each RTSP stream decode; `/image.jpg` is the main stream's size; no `Cannot start SDK` or stuck encoder |
+| `ev300` | OpenIPC/builder `ak3918ev300_lite_heimvision-pe3020w-nor.tgz`, firmware's `u-boot-ak3918ev300-nor.bin` | `ak3918ev300` (JX-F37, `ak-isp ev300`, `ingenic-avpu anyka`) | the same |
+
+The image is written to an 8 MiB NOR at OpenIPC's offsets and boots from its
+own U-Boot. The root changes in three ways only: root's password is set (an
+unclaimed camera streams nothing), `majestic.yaml` turns on the 640x360
+second stream, and the syslog is mirrored to the console. `--firmware`,
+`--kernel` and `--majestic` take local files in place of the release's, to
+try a fix before it ships. The Anyka twins need `-nic user` without
+`restrict=on`, which keeps the forwarded ports' replies from returning.
+
 ## Ethernet checks
 
 - EV300 `3918.bin`, U-Boot: `setenv ipaddr 10.0.2.15; setenv serverip
