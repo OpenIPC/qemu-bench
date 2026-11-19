@@ -465,6 +465,12 @@ buffers would not fit the 28 MiB CMA pool beside three 1080p capture
 buffers and the H.264 references. The JPEG engine then encodes the
 camera buffer in place, which #248's larger capture planes allow.
 
+`-global fh-isp.light=N` sets the scene's light to N % of the default
+(100: a grey card at 891 rows and 1x reads 2/3 of full scale), so AE has
+something to make up: on the GC2083 at 25 % `fh8626-3ad` raises the
+analogue gain to 3.5x; at 4 % it takes the frame to 2700 lines (12.5
+frames/s) and the gain to 8x, then adds ISP digital gain.
+
 **USB** (`dwc2-usb`). QEMU's DWC2 in host mode; `-device usb-storage`,
 `usb-net` and the rest plug into its root port (behind QEMU's hub). The
 4.9 kernels run it under mainline dwc2 (`fh_usb`; a module, `dwc2.ko`, in

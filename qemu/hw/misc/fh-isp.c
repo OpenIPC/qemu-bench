@@ -153,6 +153,7 @@ struct FhIspState {
     uint16_t motion_prev[MOTION_COLS * MOTION_ROWS];
 
     double scale;               /* level per row at unit gain, grey 1.0 */
+    uint32_t light;             /* "light": the scene's light, % */
 };
 
 static uint32_t fh_isp_r(FhIspState *s, hwaddr off)
@@ -204,8 +205,8 @@ static void fh_isp_levels(FhIspState *s, double x, double y,
                           double lvl[3])
 {
     double rgb[3];
-    double e = s->scale * s->prev_lines * (s->prev_gain / 1024.0) *
-               (s->dgain / 64.0);
+    double e = s->scale * s->light / 100.0 * s->prev_lines *
+               (s->prev_gain / 1024.0) * (s->dgain / 64.0);
     int c;
 
     fh_isp_scene(s->seq, x, y, rgb);
@@ -637,11 +638,21 @@ static const VMStateDescription vmstate_fh_isp = {
     },
 };
 
+/*
+ * "light": the scene's light in percent of the default (a grey card at
+ * 891 rows and 1x at 2/3 of full scale); -global fh-isp.light=25 dims it
+ * two stops, for AE to make up with gain or a longer frame.
+ */
+static const Property fh_isp_properties[] = {
+    DEFINE_PROP_UINT32("light", FhIspState, light, 100),
+};
+
 static void fh_isp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, fh_isp_reset);
+    device_class_set_props(dc, fh_isp_properties);
     dc->vmsd = &vmstate_fh_isp;
 }
 
