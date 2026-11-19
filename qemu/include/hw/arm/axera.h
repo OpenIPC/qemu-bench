@@ -39,6 +39,9 @@ typedef struct AxeraSoCConfig {
                                   * AX620E's real SPI NOR camera dump, false
                                   * (eMMC) for AX630C's real dev-board dump.
                                   */
+    const char *default_chip;   /* the part chip= defaults to: what the
+                                  * eFuse/bond registers report (see
+                                  * axera_chip_id_init()) */
 } AxeraSoCConfig;
 
 /*
