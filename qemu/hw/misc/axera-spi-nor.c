@@ -135,6 +135,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraSpiNorState, AXERA_SPI_NOR)
 #define SPINOR_OP_BE_32K        0x52    /* 32KiB block erase */
 #define SPINOR_OP_BE_64K        0xd8    /* 64KiB block erase */
 #define SPINOR_OP_CHIP_ERASE    0xc7
+#define SPINOR_OP_RSTEN         0x66    /* reset enable */
+#define SPINOR_OP_RESET         0x99
 #define SPINOR_OP_READID        0x90
 #define SPINOR_OP_RDID          0x9f
 #define SPINOR_OP_READ          0x03
@@ -457,6 +459,19 @@ static void axera_spi_nor_cmd_byte(AxeraSpiNorState *s, uint8_t byte)
             s->cmd_len = 0;
             break;
         case SPINOR_OP_WRDI:
+            s->write_enable_latch = false;
+            s->cmd_len = 0;
+            break;
+        case SPINOR_OP_RSTEN:
+            /*
+             * Software reset (0x66 then 0x99), each its own chip-select
+             * session with no data phase: the SDK BL1's spinor_reset(),
+             * before its first read. Kept, these opcode bytes became
+             * that read's opcode and address (cmd_buf 66 99 03 01).
+             */
+            s->cmd_len = 0;
+            break;
+        case SPINOR_OP_RESET:
             s->write_enable_latch = false;
             s->cmd_len = 0;
             break;
