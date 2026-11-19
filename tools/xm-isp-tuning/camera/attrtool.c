@@ -52,6 +52,15 @@ int main(int argc, char **argv) {
         perror(argv[2]);
         return 1;
     }
+    for (int a = 3; a < argc; a++) {
+        size_t i = 0;
+        while (i < sizeof T / sizeof *T && strcmp(argv[a], T[i].n))
+            i++;
+        if (i == sizeof T / sizeof *T) {
+            printf("%-18s unknown\n", argv[a]);
+            bad = 1;
+        }
+    }
     for (size_t i = 0; i < sizeof T / sizeof *T; i++) {
         int want = dump;
         for (int a = 3; a < argc; a++) if (!strcmp(argv[a], T[i].n)) want = 1;
