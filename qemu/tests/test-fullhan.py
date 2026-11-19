@@ -46,6 +46,11 @@ vendor drivers (docs/fullhan.md):
     boot words, run and reset bits -- ALU, shifts, flags and conditions,
     BL / J / BRcc, loads and stores, LR, the doorbells both ways and IRQ
     32, the instruction-error exception, a second boot after a reset;
+  - fh8626v100's CSI, ISP and VPU (fh-csi, fh-isp) behind a GC1054,
+    programmed as OpenIPC's drivers do: frames only with the CSI out of
+    reset, at the sensor's 40 ms, their interrupts, NV12 at the address
+    latched at the frame's start, zone and AWB statistics at the light's
+    ratios, a sensor exposure showing three frame events later;
   - fh8632: its chip and variant IDs, the PTS counter at 0xE7000040, and
     the RTC v1's direct counter, sync bits and set-up magic;
   - outside qtest: machine state migrates to a file and back.
@@ -1045,6 +1050,129 @@ def test_fh8626_arc(qemu):
         qt.close()
 
 
+ISP = 0xE8400000
+CSI = 0xF1100000
+
+
+def gc1054_write(qt, page, regs):
+    i2c_xfer(qt, 0x21, [0xFE, page], 0)
+    for reg, val in regs:
+        i2c_xfer(qt, 0x21, [reg, val], 0)
+
+
+def isp_frame_words(qt, addr, n):
+    return struct.unpack('<%dI' % n, qt.read(addr, 4 * n))
+
+
+def test_fh8626_isp(qemu):
+    """FH8626V100's CSI -> ISP -> VPU path, programmed as OpenIPC's
+    fh8626-csi.c / fh8626-isp.c / fh8626-vpu.c do it, a GC1054 in front."""
+    print('fh8626v100: CSI, ISP and VPU frames, statistics (fh-isp)')
+    qt = QTest(qemu, 'fh8626v100,sensor=gc1054')
+    buf_a, buf_b, stat = 0xA1000000, 0xA1200000, 0xA1400000
+    buf_c, w2, h2 = 0xA1600000, 320, 180         # channel 2's default
+    w, h = 1280, 720
+    try:
+        qt.write(buf_a, bytes(w * h * 3 // 2))
+        qt.write(buf_b, bytes(64))
+        # GC1054: VB 160 (25 frames/s), 891 rows, 1x, MIPI on (gc1054.c)
+        gc1054_write(qt, 0, [(0x07, 0), (0x08, 160), (0x03, 891 >> 8),
+                             (0x04, 891 & 0xFF)])
+        gc1054_write(qt, 1, [(0xB6, 0), (0xB1, 1), (0xB2, 0)])
+        # ISP: geometry, statistics on, RGGB, gains 1x, VPU channel 0
+        qt.writel(ISP + 0x30, (h - 1) << 16 | (w - 1))
+        qt.writel(ISP + 0x24, 1 << 13)
+        qt.writel(ISP + 0x168, 64 << 3)
+        qt.writel(ISP + 0x224, 512 | 512 << 16)
+        qt.writel(ISP + 0x228, 512 | 512 << 16)
+        qt.writel(ISP + 0x1D8, stat)
+        qt.writel(ISP + 0x62C, w - 1)
+        qt.writel(ISP + 0x634, h - 1)
+        qt.writel(ISP + 0x9B4, w | w << 16)
+        qt.writel(ISP + 0x9AC, buf_a)
+        qt.writel(ISP + 0x9B0, buf_a + w * h)
+        qt.write(buf_c, bytes(w2 * h2 * 3 // 2))
+        qt.writel(ISP + 0x958, (h2 - 1) << 16 | (w2 - 1))
+        qt.writel(ISP + 0x9B4 + 24, w2 | w2 << 16)
+        qt.writel(ISP + 0x9AC + 24, buf_c)
+        qt.writel(ISP + 0x9B0 + 24, buf_c + w2 * h2)
+        qt.writel(ISP + 0x2C, 1 << 17 | 1 << 19)    # channels 0 and 2
+        qt.writel(ISP + 0x08, ~(1 << 3) & 0xFFFFFFFF)
+        qt.writel(ISP + 0x18, 1)
+        qt.writel(ISP + 0x68, 1)
+        gc1054_write(qt, 3, [(0x10, 0x90)])
+        qt.step(100000000)
+        check('CSI in reset: no frames', qt.readl(ISP + 0x04), 0)
+        for off in (0x08, 0x40, 0x44):             # RESETN, PHY, D-PHY
+            qt.writel(CSI + off, 1)
+        qt.step(1000)
+        st = qt.readl(ISP + 0x04)
+        check('frame start: PICTURE_START | VPU_START', st, 1 << 13 | 1 << 15)
+        check('ISP IRQ 5', qt.readl(INTC + 0x18) & (1 << 5), 1 << 5)
+        qt.writel(ISP + 0x04, st)
+        check('write one to clear', qt.readl(INTC + 0x18) & (1 << 5), 0)
+        # the next frame's address, written at the start as the driver does
+        qt.writel(ISP + 0x9AC, buf_b)
+        qt.writel(ISP + 0x9B0, buf_b + w * h)
+        qt.step(33000000)                       # 720 of 896 rows: 32.1 ms
+        check('frame end: FRAME_END | VPU_END', qt.readl(ISP + 0x04),
+              1 << 0 | 1 << 2)
+        y = qt.read(buf_a, w * h)
+        c = qt.read(buf_a + w * h, w * h // 2)
+        check('the frame went to the address latched at its start',
+              qt.read(buf_b, 64), bytes(64))
+        check('Y plane: picture, limited range',
+              16 < sum(y[::97]) // len(y[::97]) < 235 and min(y) >= 16, True)
+        check('CbCr plane written', c[0] != 0 and c[1] != 0, True)
+        y2 = qt.read(buf_c, w2 * h2 * 3 // 2)
+        check('channel 2, 320x180: its last row and CbCr written',
+              min(y2[(h2 - 1) * w2:h2 * w2]) >= 16 and
+              min(y2[w2 * h2:]) > 0, True)
+        cells = isp_frame_words(qt, stat, 4 * 16)       # bank 0 (R), row 0
+        g = isp_frame_words(qt, stat + 0x1000, 4)       # bank 1 (Gr)
+        b = isp_frame_words(qt, stat + 0x3000, 4)       # bank 3 (B)
+        check('zone cell: count per site', cells[1], (w // 16) * (h // 16) // 4)
+        check('R / G at the light (0.739), %', round(100 * cells[0] / g[0]), 74)
+        check('B / G at the light (0.399), %', round(100 * b[0] / g[0]), 40)
+        awb = [qt.readl(ISP + 0xAE0 + 4 * i) for i in range(4)]
+        check('AWB block 0: G (two sites) / R, %',
+              round(100 * awb[1] / awb[0]), round(200 / 0.739))
+        g0 = g[0]
+        qt.writel(ISP + 0x04, 0xFFFFFFFF)
+        # half the rows, written after frame 2's start event: the stats
+        # published 3 events later -- frame 4's -- show it (fh8626-3ad's
+        # README, measured on a GC1054 board)
+        qt.step(8000000)                        # frame 2 starts
+        check('40 ms frames', qt.readl(ISP + 0x04) & (1 << 13), 1 << 13)
+        gc1054_write(qt, 0, [(0x03, 445 >> 8), (0x04, 445 & 0xFF)])
+        qt.step(33000000)                       # frame 2 ends
+        check('frame 2 at the old exposure',
+              isp_frame_words(qt, stat + 0x1000, 1)[0], g0)
+        check('frame 2 went to the new address',
+              qt.read(buf_b, 16) != bytes(16), True)
+        qt.step(40000000)                       # frame 3 ends
+        check('frame 3 still at the old exposure',
+              isp_frame_words(qt, stat + 0x1000, 1)[0], g0)
+        qt.step(40000000)                       # frame 4 ends
+        g4 = isp_frame_words(qt, stat + 0x1000, 1)[0]
+        check('frame 4 at half the exposure, %', round(100 * g4 / g0), 50)
+        if os.environ.get('FH_ISP_PPM'):
+            with open(os.environ['FH_ISP_PPM'], 'wb') as f:
+                f.write(b'P5 %d %d 255\n' % (w, h) + y)
+        # a stride past the largest frame is not written (host memory)
+        qt.write(buf_c, bytes(64))
+        qt.writel(ISP + 0x9B4 + 24, 0xFFFF)
+        qt.step(80000000)
+        check('channel 2 with a 65535-byte stride: not written',
+              qt.read(buf_c, 64), bytes(64))
+        qt.writel(CSI + 0x08, 0)
+        qt.writel(ISP + 0x04, 0xFFFFFFFF)
+        qt.step(100000000)
+        check('CSI back in reset: frames stop', qt.readl(ISP + 0x04), 0)
+    finally:
+        qt.close()
+
+
 def test_fh8632(qemu):
     print('fh8632: PTS, RTC v1')
     qt = QTest(qemu, 'fh8632')
@@ -1158,6 +1286,7 @@ def main():
     test_fh8652(args.qemu)
     test_fh8626(args.qemu, path)
     test_fh8626_arc(args.qemu)
+    test_fh8626_isp(args.qemu)
     test_fh8632(args.qemu)
     test_all_machines(args.qemu)
     test_migration(args.qemu, tmp)

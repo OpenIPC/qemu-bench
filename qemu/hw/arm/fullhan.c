@@ -25,6 +25,8 @@
  *   0xF1200000 SADC                                 hw/misc/fh-sadc.c
  *   0xE7000040 PTS (FH8632's clocksource)           hw/timer/fh-pts.c
  *   (no MMIO) FH8626V100's ARC600, run from DDR     hw/misc/fh-arc.c
+ *   0xF1100000 / 0xF1000000 FH8626V100 CSI-2 + wrapper hw/misc/fh-csi.c
+ *   0xE8400000 FH8626V100 ISP, the VPU in its window hw/misc/fh-isp.c
  *
  * (mach-fh/<soc>/chip.h and the board files of the SDKs; docs/fullhan.md
  * has the tables.)  FH865x puts a Cortex-A7 around the FH885xV200 map and
@@ -105,6 +107,7 @@ typedef struct FhSoCConfig {
     uint32_t tmr_prediv;        /* fh-pmu: scheme 2's PLL1 prediv, 0: 10 */
     bool tmr_div_low;           /* fh-pmu: the divider in CLK_DIV5[7:0] */
     int arc_irq;                /* fh-arc, FH8626V100's ARC600; 0: none */
+    int isp_irq;                /* fh-isp + fh-csi, FH8626V100's; 0: none */
     const char *sensor;         /* default sensor= */
     uint32_t swrst_base;        /* fh-pmu: 0 for 0x040 */
     uint32_t spc_io_status;     /* PMU 0x054, FH8632's variant */
@@ -313,6 +316,7 @@ static const FhSoCConfig fh8626v100_soc = {
     .tmr_prediv         = 6,
     .tmr_div_low        = true,
     .arc_irq            = 32,
+    .isp_irq            = 5,
     .sensor             = "gc2053",
     .swrst_base         = 0x04C,
     .timer_irq          = 3,
@@ -717,7 +721,7 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
     MemoryRegion *sram = g_new(MemoryRegion, 1);
     g_autofree uint8_t *img = NULL;
     gsize img_len = 0;
-    DeviceState *pmu, *dmac, *dev, *flash;
+    DeviceState *pmu, *dmac, *dev, *flash, *sensor = NULL;
     DeviceState *gpio[2], *spi[3];
     Object *cpuobj;
     int n;
@@ -898,9 +902,34 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            fh_irq(fms, c->i2c_irq[n]));
         if (n == 0) {
-            image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
-                                fms->sensor ? fms->sensor : c->sensor);
+            sensor = image_sensor_create(
+                I2C_BUS(qdev_get_child_bus(dev, "i2c")),
+                fms->sensor ? fms->sensor : c->sensor);
         }
+    }
+
+    if (c->isp_irq) {
+        /*
+         * The CSI-2 receiver and the ISP (with the VPU in its window),
+         * as OpenIPC's 4.19 media drivers drive them; frames come from
+         * the sensor above.
+         */
+        DeviceState *csi = qdev_new("fh-csi");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(csi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(csi), 0, 0xF1100000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(csi), 1, 0xF1000000);
+        dev = qdev_new("fh-isp");
+        object_property_add_child(OBJECT(machine), "isp", OBJECT(dev));
+        if (sensor) {
+            object_property_set_link(OBJECT(dev), "sensor", OBJECT(sensor),
+                                     &error_fatal);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0xE8400000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, fh_irq(fms, c->isp_irq));
+        qdev_connect_gpio_out_named(csi, "up", 0,
+                                    qdev_get_gpio_in_named(dev, "csi-up", 0));
     }
 
     /*

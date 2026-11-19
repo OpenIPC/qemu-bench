@@ -36,11 +36,19 @@
 #     firmware announces rpmsg-arc-echo, and fh-rpmsg-echo.c -- copied out
 #     of rootfs_data, where the test writes it -- gets 64 messages back.
 #     The client is built with arm-linux-gnueabi-gcc unless --echo-client
-#     names one.
+#     names one;
+#   - fh8626v100 only, in the same boot: the CSI -> ISP -> VPU frame path
+#     (fh-csi, fh-isp). With fh8626-3ad started by its own init script,
+#     fh-v4l2-capture.c (built the same way, or --capture-client) streams
+#     100 frames from /dev/video0 and checks them, and the daemon's AE and
+#     AWB act on the model's statistics: its white balance lands on the
+#     gains the model's light calls for (R/G 0.739, B/G 0.399 -> 693 and
+#     1282, Q9), within 3%.
 #
 #   bash qemu-boot/test-fullhan-boot.sh --soc fh8852v200 \
 #       [--machine fh8852v200] [--qemu ./qemu-src/build/qemu-system-arm] \
 #       [--dir qemu-boot] [--timeout 120] [--echo-client PATH]
+#       [--capture-client PATH]
 set -euo pipefail
 
 SOC=fh8852v200
@@ -49,6 +57,7 @@ QEMU=./qemu-src/build/qemu-system-arm
 DIR=qemu-boot
 TIMEOUT=120
 CLIENT=
+CAPTURE=
 while [ $# -gt 0 ]; do
     case "$1" in
         --soc) SOC=$2; shift 2 ;;
@@ -57,6 +66,7 @@ while [ $# -gt 0 ]; do
         --dir) DIR=$2; shift 2 ;;
         --timeout) TIMEOUT=$2; shift 2 ;;
         --echo-client) CLIENT=$2; shift 2 ;;
+        --capture-client) CAPTURE=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -115,6 +125,24 @@ timeout "$TIMEOUT" "$QEMU" -M "$MACHINE,flash-file=$IMG" \
 QPID=$!
 
 fail=0
+# $1: what; fh8626-3ad's init script's verdict in $LOG is OK.
+check_3ad() {
+    # "OK" or "FAIL (...)", after the "Starting fh8626-3ad: " prefix or on
+    # a line of its own once the daemon has printed, and before the next
+    # script starts. rcS runs the scripts in turn, so it is in the log
+    # before login:.
+    if awk '/Starting fh8626-3ad:/ { f = 1 }
+            f && /(^|fh8626-3ad: )FAIL \(/ { exit 1 }
+            f && /(^|fh8626-3ad: )OK\r?$/ { ok = 1; exit 0 }
+            f && /^(Starting |capture: )/ && !/fh8626-3ad:/ { exit 1 }
+            END { exit !ok }' "$LOG"; then
+        echo "  PASS: $1"
+    else
+        echo "  FAIL: $1"
+        fail=1
+    fi
+}
+
 check() {
     if grep -aq "$2" "$LOG"; then
         echo "  PASS: $1"
@@ -145,20 +173,7 @@ if [ $GMAC -eq 1 ]; then
     check "DHCP lease over the GMAC" 'lease of 10.0.2.15'
 fi
 if [ $ARC -eq 1 ]; then
-    # The init script's verdict: "OK" or "FAIL (...)", after the "Starting
-    # fh8626-3ad: " prefix or on a line of its own once the daemon has
-    # printed, and before the next script starts. rcS runs the scripts in
-    # turn, so it is in the log before login:.
-    if awk '/Starting fh8626-3ad:/ { f = 1 }
-            f && /(^|fh8626-3ad: )FAIL \(/ { exit 1 }
-            f && /(^|fh8626-3ad: )OK\r?$/ { ok = 1; exit 0 }
-            f && /^Starting / && !/fh8626-3ad:/ { exit 1 }
-            END { exit !ok }' "$LOG"; then
-        echo "  PASS: fh8626-3ad (ISP 3A daemon) started"
-    else
-        echo "  FAIL: fh8626-3ad (ISP 3A daemon) started"
-        fail=1
-    fi
+    check_3ad "fh8626-3ad (ISP 3A daemon) started"
 fi
 # A JFFS2 node starts 0x1985 (little-endian) at a 4-byte boundary.
 if python3 - "$IMG" <<'EOF'
@@ -184,28 +199,62 @@ if [ $ARC -eq 1 ]; then
         arm-linux-gnueabi-gcc -static -nostdlib -ffreestanding -Os -marm \
             -o "$CLIENT" "$(dirname "$0")/fh-rpmsg-echo.c" -lgcc
     fi
+    if [ -z "$CAPTURE" ]; then
+        CAPTURE=$WORK/fh-v4l2-capture
+        arm-linux-gnueabi-gcc -static -nostdlib -ffreestanding -Os -marm \
+            -o "$CAPTURE" "$(dirname "$0")/fh-v4l2-capture.c" -lgcc
+    fi
     ARCLOG=$WORK/arc.log
+    for f in "$CLIENT" "$CAPTURE"; do
+        if [ "$(stat -c %s "$f")" -gt 65536 ]; then
+            echo "$f: over the 64 KiB slot it is given" >&2
+            exit 2
+        fi
+    done
     make_image "$IMG"
-    dd if="$CLIENT" of="$IMG" bs=64k seek=117 conv=notrunc status=none
-    # The kernel prints its command line, so the markers are built at run
-    # time; rpmsg_chrdev binds only by driver_override.
+    # rootfs_data (0x750000) carries the boot's script, then the clients,
+    # 64 KiB apart: the kernel command line holds 1024 bytes, not a script.
+    # The kernel prints that line, and the script echoes as it runs, so
+    # the markers below are built at run time.
     rp=/sys/class/remoteproc/remoteproc0/state
-    SCRIPT="mount -t proc p /proc; mount -t sysfs s /sys"
-    SCRIPT="$SCRIPT; mount -t tmpfs t /tmp"
-    SCRIPT="$SCRIPT; modprobe virtio_rpmsg_bus; modprobe rpmsg_char"
-    # The channel appears when the ARC's announcement is taken: wait for it.
-    SCRIPT="$SCRIPT; echo start > $rp; i=0"
-    SCRIPT="$SCRIPT; while [ \$i -lt 20 ] && ! ls /sys/bus/rpmsg/devices/*arc-echo*"
-    SCRIPT="$SCRIPT >/dev/null 2>&1; do sleep 1; i=\$((i + 1)); done"
-    SCRIPT="$SCRIPT; for d in /sys/bus/rpmsg/devices/*arc-echo*; do"
-    SCRIPT="$SCRIPT echo rpmsg_chrdev > \$d/driver_override;"
-    SCRIPT="$SCRIPT echo \${d##*/} > /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind;"
-    SCRIPT="$SCRIPT done"
-    SCRIPT="$SCRIPT; dd if=/dev/mtdblock4 of=/tmp/e bs=$(stat -c %s "$CLIENT") count=1"
-    SCRIPT="$SCRIPT; chmod 755 /tmp/e; /tmp/e"
-    # the firmware's diagnostics block: state, error code
-    SCRIPT="$SCRIPT; echo arc-diag \$(devmem 0xa3f07000) \$(devmem 0xa3f07004)"
-    SCRIPT="$SCRIPT; echo stop > $rp; echo arc-test-\$((6 * 7)); sleep 600"
+    cat > "$WORK/test.sh" <<EOF
+mount -t proc p /proc; mount -t sysfs s /sys; mount -t tmpfs r /run
+cp() { dd if=/dev/mtdblock4 of=\$2 bs=65536 skip=\$1 count=1 2>/dev/null; chmod 755 \$2; }
+cp 1 /tmp/e; cp 2 /tmp/c
+modprobe virtio_rpmsg_bus; modprobe rpmsg_char
+# the channel appears when the ARC's announcement is taken
+echo start > $rp; i=0
+while [ \$i -lt 20 ] && ! ls /sys/bus/rpmsg/devices/*arc-echo* >/dev/null 2>&1; do
+    sleep 1; i=\$((i + 1))
+done
+# rpmsg_chrdev binds only by driver_override
+for d in /sys/bus/rpmsg/devices/*arc-echo*; do
+    echo rpmsg_chrdev > \$d/driver_override
+    echo \${d##*/} > /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
+done
+/tmp/e
+# the firmware's diagnostics block: state, error code
+echo arc-diag \$(devmem 0xa3f07000) \$(devmem 0xa3f07004)
+echo stop > $rp
+# the media graph, the 3A daemon as its init script starts it, frames
+for m in phy_fh8626_mipi gc1054 fh8626_capture; do modprobe \$m; done
+sleep 2
+for f in /sys/class/video4linux/v4l-subdev*/name; do
+    d=\${f%/name}; d=/dev/\${d##*/}
+    grep -q gc1054 \$f && sd=\$d
+    grep -q fh8626-isp \$f && id=\$d
+done
+/etc/init.d/S80fh8626-3ad start
+/tmp/c /dev/video0 \$sd \$id 100
+echo arc-test-\$((6 * 7))
+sleep 600
+EOF
+    dd if="$WORK/test.sh" of="$IMG" bs=64k seek=117 conv=notrunc status=none
+    dd if="$CLIENT" of="$IMG" bs=64k seek=118 conv=notrunc status=none
+    dd if="$CAPTURE" of="$IMG" bs=64k seek=119 conv=notrunc status=none
+    SCRIPT="mount -t tmpfs t /tmp"
+    SCRIPT="$SCRIPT; dd if=/dev/mtdblock4 of=/tmp/t.sh bs=$(stat -c %s "$WORK/test.sh") count=1"
+    SCRIPT="$SCRIPT; sh /tmp/t.sh"
     APPEND="mem=$MEM console=ttyS0,115200 root=/dev/mtdblock3"
     APPEND="$APPEND rootfstype=squashfs"
     APPEND="$APPEND mtdparts=$MTDID:256k(boot),64k(env),2048k(kernel),5120k(rootfs),-(rootfs_data)"
@@ -230,8 +279,30 @@ if [ $ARC -eq 1 ]; then
     check "64 messages echoed through the ARC" 'rpmsg echo: 64 ok'
     check "firmware state ECHO_RUNNING, no error" 'arc-diag 0x00000004 0x00000000'
     check "stopped" 'stopped remote processor soc:remoteproc'
+    echo "$SOC frames (fh-csi, fh-isp, fh8626-3ad on the statistics):"
+    check_3ad "fh8626-3ad started"
+    check "100 NV12 frames from /dev/video0, changing" 'capture: ok'
+    grep -a '^capture: [0-9]' "$ARCLOG" | head -1 | sed 's/^/  /'
+    if awk '/^capture: [0-9]/ {
+                seen = 1
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "exposure") { e0 = $(i + 1); e1 = $(i + 3) }
+                    if ($i == "gain") { g0 = $(i + 1); g1 = $(i + 3) }
+                    if ($i == "wb") { split($(i + 3), w, "/") }
+                }
+                sub(",", "", e1); sub(",", "", g1)
+                ok = (e1 != e0 || g1 != g0) &&
+                     w[1] >= 672 && w[1] <= 714 && w[2] >= 1243 && w[2] <= 1321
+                exit !ok
+            }
+            END { if (!seen) exit 1 }' "$ARCLOG"; then
+        echo "  PASS: AE moved the sensor, AWB at the light's gains"
+    else
+        echo "  FAIL: AE moved the sensor, AWB at the light's gains"
+        fail=1
+    fi
     if [ $fail -ne 0 ]; then
-        echo "--- ARC serial log (tail) ---"
+        echo "--- ARC / frames serial log (tail) ---"
         tail -40 "$ARCLOG"
     fi
     fail=$((fail | before))

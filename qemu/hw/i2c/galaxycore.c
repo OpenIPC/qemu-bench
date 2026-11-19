@@ -27,6 +27,7 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 
 #define TYPE_GALAXYCORE_SENSOR "galaxycore-sensor"
 OBJECT_DECLARE_SIMPLE_TYPE(GcSensorState, GALAXYCORE_SENSOR)
@@ -51,6 +52,9 @@ struct GcSensorState {
      */
     uint8_t page;
     uint8_t p0[0x100];
+    /* GC1054: page 1's analog gain, page 3's MIPI control (gc1054_*) */
+    uint8_t p1[0x100];
+    uint8_t p3[0x100];
     /*
      * The 16-bit parts: what the frame in progress uses of the registers
      * a frame takes at its start (gc_latched[]); the rest as written.
@@ -121,6 +125,10 @@ static int gc_send(I2CSlave *i2c, uint8_t data)
             s->page = data & 7;
         } else if (!s->page) {
             s->p0[s->ptr & 0xFF] = data;
+        } else if (s->page == 1) {
+            s->p1[s->ptr & 0xFF] = data;
+        } else if (s->page == 3) {
+            s->p3[s->ptr & 0xFF] = data;
         }
     }
     s->regs[s->ptr] = data;
@@ -152,6 +160,25 @@ static uint8_t gc_recv(I2CSlave *i2c)
  * are 0x0200[5:0]:0x0201, the gain shared by both frames; the model
  * reports them only once a driver has written them (0 otherwise).
  */
+/*
+ * GC1054, as OpenIPC's 4.19 gc1054.c drives it: the gain is a bracket,
+ * page 1's 0xB6, times a Q6 fine step in 0xB1[5:0]:0xB2[7:2], each
+ * bracket's base (gain at 0xB6 = n, step 64) in its gc1054_gain_table.
+ */
+static const uint16_t gc1054_gain_base[] = {
+    0x040, 0x05B, 0x07F, 0x0B6, 0x101, 0x171, 0x203, 0x2E1, 0x407, 0x5D3,
+};
+
+static uint32_t gc1054_gain(GcSensorState *s)
+{
+    unsigned b = s->p1[0xB6] < ARRAY_SIZE(gc1054_gain_base) ?
+                 s->p1[0xB6] : ARRAY_SIZE(gc1054_gain_base) - 1;
+    uint32_t q = (s->p1[0xB1] & 0x3F) << 6 | s->p1[0xB2] >> 2;
+
+    /* Q6 total, then 1.0 = 1024; before any write, 1x */
+    return q ? q * gc1054_gain_base[b] / 64 * 16 : 1024;
+}
+
 bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
 {
     GcSensorState *s = (GcSensorState *)
@@ -160,6 +187,11 @@ bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
 
     if (!s) {
         return false;
+    }
+    if (!s->reg16 && s->id == 0x1054) {
+        e->lines = (s->p0[0x03] & 0x1F) << 8 | s->p0[0x04];
+        e->gain = gc1054_gain(s);
+        return true;
     }
     if (!s->reg16) {
         e->lines = (s->p0[0x03] & 0x3F) << 8 | s->p0[0x04];
@@ -191,7 +223,29 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
     e->gain = x.gain;
     if (s->reg16) {
         e->vts = (s->applied[0x0340] & 0x3F) << 8 | s->applied[0x0341];
+    } else if (s->id == 0x1054) {
+        /* 720 rows, VB in 0x07[3:0]:0x08, and 16 more (gc1054.c) */
+        e->vts = 720 + ((s->p0[0x07] & 0x0F) << 8 | s->p0[0x08]) + 16;
+        e->width = 1280;
+        e->height = 720;
     }
+}
+
+/*
+ * GC1054: a row is 1732 periods of its 38.8 MHz timing clock (gc1054.c),
+ * so VB 160 -- the driver's default -- is 25 frames/s.  0 until the
+ * driver has started the stream (page 3's 0x10 = 0x90, MIPI on).
+ */
+static int64_t galaxycore_frame_ns(Object *sensor)
+{
+    GcSensorState *s = GALAXYCORE_SENSOR(sensor);
+    ImageSensorExposure e = { 0 };
+
+    if (s->reg16 || s->id != 0x1054 || !(s->p3[0x10] & 0x80)) {
+        return 0;
+    }
+    galaxycore_exposure_sensor(sensor, &e);
+    return muldiv64((uint64_t)e.vts * 1732, NANOSECONDS_PER_SECOND, 38800000);
 }
 
 /*
@@ -271,6 +325,8 @@ static void gc_reset(DeviceState *dev)
     s->naddr = 0;
     s->page = 0;
     memset(s->p0, 0, sizeof(s->p0));
+    memset(s->p1, 0, sizeof(s->p1));
+    memset(s->p3, 0, sizeof(s->p3));
     memcpy(s->applied, s->regs, sizeof(s->applied));
     sensor_sync_reset(&s->sync);
 }
@@ -289,7 +345,7 @@ static int gc_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_gc_sensor = {
     .name = TYPE_GALAXYCORE_SENSOR,
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 1,
     .post_load = gc_post_load,
     .fields = (const VMStateField[]) {
@@ -305,6 +361,8 @@ static const VMStateDescription vmstate_gc_sensor = {
         VMSTATE_UINT32_V(sync.violations, GcSensorState, 3),
         VMSTATE_UINT32_V(sync.latches, GcSensorState, 4),
         VMSTATE_UINT32_V(sync.late_latch, GcSensorState, 4),
+        VMSTATE_UINT8_ARRAY_V(p1, GcSensorState, 0x100, 5),
+        VMSTATE_UINT8_ARRAY_V(p3, GcSensorState, 0x100, 5),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -330,6 +388,7 @@ static void gc_class_init(ObjectClass *klass, const void *data)
     dc->realize = gc_realize;
     IMAGE_SENSOR_CLASS(klass)->exposure = galaxycore_exposure_sensor;
     IMAGE_SENSOR_CLASS(klass)->frame_start = galaxycore_frame_start;
+    IMAGE_SENSOR_CLASS(klass)->frame_ns = galaxycore_frame_ns;
 }
 
 static const TypeInfo gc_sensor_info = {
