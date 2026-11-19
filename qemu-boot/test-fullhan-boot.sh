@@ -43,7 +43,14 @@
 #     100 frames from /dev/video0 and checks them, and the daemon's AE and
 #     AWB act on the model's statistics: its white balance lands on the
 #     gains the model's light calls for (R/G 0.739, B/G 0.399 -> 693 and
-#     1282, Q9), within 3%.
+#     1282, Q9), within 3%;
+#   - fh8626v100 only, in the same boot: the PAE H.264 and JPEG encoders
+#     (fh-pae, fh-jpeg). The client feeds 20 frames through OpenIPC's
+#     fh8626-encoder (GOP 10) and one through fh8626-jpeg and writes both
+#     streams to rootfs_data, which ffmpeg then decodes here: 20 frames at
+#     1280x720, 2 IDR and 18 P, each frame's mean luma within 8 of the
+#     captured picture's; the JPEG at 1280x720. Without ffprobe on the
+#     host the streams are only found and their sizes checked.
 #
 #   bash qemu-boot/test-fullhan-boot.sh --soc fh8852v200 \
 #       [--machine fh8852v200] [--qemu ./qemu-src/build/qemu-system-arm] \
@@ -143,6 +150,68 @@ check_3ad() {
     fi
 }
 
+# The streams fh-v4l2-capture wrote to rootfs_data, decoded by ffmpeg.
+check_streams() {
+    local ymean
+    if ! python3 - "$IMG" "$WORK" <<'EOF'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()[0x750000 + 0x30000:]
+if d[:4] != b'FHEN':
+    sys.exit(1)
+jl, hl, n = struct.unpack('<III', d[4:16])
+at = 16 + ((jl + 3) & ~3)
+# both there, inside the partition, and a JPEG at least starting as one
+if not jl or not hl or n != 20 or at + hl > len(d) or \
+        d[16:18] != b'\xff\xd8' or d[at:at + 4] != b'\0\0\0\1':
+    sys.exit(1)
+open(sys.argv[2] + '/out.jpg', 'wb').write(d[16:16 + jl])
+open(sys.argv[2] + '/out.h264', 'wb').write(d[at:at + hl])
+EOF
+    then
+        echo "  FAIL: the streams in rootfs_data (lengths, markers)"
+        fail=1
+        return
+    fi
+    echo "  PASS: the streams in rootfs_data (lengths, markers)"
+    if ! command -v ffprobe >/dev/null; then
+        echo "  SKIP: decoding them (no ffprobe on this host)"
+        return
+    fi
+    check_ffprobe "H.264: 20 frames, 1280x720" "$WORK/out.h264" \
+        stream=width,height,nb_read_frames '1280,720,20'
+    check_ffprobe "H.264: IDR every 10 frames, P between" "$WORK/out.h264" \
+        frame=pict_type 'IPPPPPPPPPIPPPPPPPPP'
+    check_ffprobe "JPEG: 1280x720" "$WORK/out.jpg" stream=width,height \
+        '1280,720'
+    ymean=$(sed -n 's/^capture: .*Y mean [0-9]* -> \([0-9]*\).*/\1/p' \
+            "$ARCLOG" | head -1)
+    if ffmpeg -v error -i "$WORK/out.h264" \
+            -vf signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=- \
+            -f null - 2>"$WORK/ffmpeg.err" | awk -F= -v y="${ymean:-0}" '
+            /YAVG/ { n++; d = $2 - y; if (d < -8 || d > 8) bad++ }
+            END { exit !(n == 20 && !bad) }' && [ ! -s "$WORK/ffmpeg.err" ]
+    then
+        echo "  PASS: H.264 decodes clean, each frame's mean luma near $ymean"
+    else
+        echo "  FAIL: H.264 decodes clean, each frame's mean luma near $ymean"
+        head -5 "$WORK/ffmpeg.err"
+        fail=1
+    fi
+}
+
+# $1: what; $2: file; $3: ffprobe entries; $4: their values, joined
+check_ffprobe() {
+    local got
+    got=$(ffprobe -v error -count_frames -select_streams v:0 \
+          -show_entries "$3" -of csv=p=0 "$2" 2>&1 | tr -d '\n' | tr -d ' ')
+    if [ "$got" = "$4" ]; then
+        echo "  PASS: $1"
+    else
+        echo "  FAIL: $1 ($got)"
+        fail=1
+    fi
+}
+
 check() {
     if grep -aq "$2" "$LOG"; then
         echo "  PASS: $1"
@@ -236,16 +305,24 @@ done
 # the firmware's diagnostics block: state, error code
 echo arc-diag \$(devmem 0xa3f07000) \$(devmem 0xa3f07004)
 echo stop > $rp
-# the media graph, the 3A daemon as its init script starts it, frames
-for m in phy_fh8626_mipi gc1054 fh8626_capture; do modprobe \$m; done
+# the media graph, the 3A daemon as its init script starts it, frames,
+# and the H.264 and JPEG encoders; every node found by its name
+for m in phy_fh8626_mipi gc1054 fh8626_capture fh8626_encoder fh8626_jpeg; do
+    modprobe \$m
+done
 sleep 2
-for f in /sys/class/video4linux/v4l-subdev*/name; do
+for f in /sys/class/video4linux/*/name; do
     d=\${f%/name}; d=/dev/\${d##*/}
-    grep -q gc1054 \$f && sd=\$d
-    grep -q fh8626-isp \$f && id=\$d
+    case \$(cat \$f) in
+    gc1054*) sd=\$d ;;
+    fh8626-isp) id=\$d ;;
+    fh8626-camera) cam=\$d ;;
+    fh8626-encoder) enc=\$d ;;
+    fh8626-jpeg) jpg=\$d ;;
+    esac
 done
 /etc/init.d/S80fh8626-3ad start
-/tmp/c /dev/video0 \$sd \$id 100
+/tmp/c \$cam \$sd \$id 100 \$enc \$jpg /dev/mtdblock4
 echo arc-test-\$((6 * 7))
 sleep 600
 EOF
@@ -301,6 +378,11 @@ EOF
         echo "  FAIL: AE moved the sensor, AWB at the light's gains"
         fail=1
     fi
+    echo "$SOC encoders (fh-pae, fh-jpeg; OpenIPC's fh8626-encoder, -jpeg):"
+    check "20 frames through the H.264 encoder, one through the JPEG one" \
+        'encode: 20 frames'
+    grep -a '^encode: ' "$ARCLOG" | head -1 | sed 's/^/  /'
+    check_streams
     if [ $fail -ne 0 ]; then
         echo "--- ARC / frames serial log (tail) ---"
         tail -40 "$ARCLOG"

@@ -1739,10 +1739,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
-          # fh8626v100 also runs its ARC: the test builds its RPMsg client
+          # fh8626v100 also runs its ARC and encoders: the test builds its
+          # clients, and ffmpeg decodes the H.264 and JPEG they bring back
           if [ "${{ matrix.soc }}" = fh8626v100 ]; then
             sudo apt-get install -y --no-install-recommends \
-              gcc-arm-linux-gnueabi
+              gcc-arm-linux-gnueabi ffmpeg
           fi
 
       - name: Download QEMU binary

@@ -27,6 +27,8 @@
  *   (no MMIO) FH8626V100's ARC600, run from DDR     hw/misc/fh-arc.c
  *   0xF1100000 / 0xF1000000 FH8626V100 CSI-2 + wrapper hw/misc/fh-csi.c
  *   0xE8400000 FH8626V100 ISP, the VPU in its window hw/misc/fh-isp.c
+ *   0xE7000000 FH8626V100 PAE H.264 encoder          hw/misc/fh-pae.c
+ *   0xE8300000 FH8626V100 JPEG encoder               hw/misc/fh-jpeg.c
  *
  * (mach-fh/<soc>/chip.h and the board files of the SDKs; docs/fullhan.md
  * has the tables.)  FH865x puts a Cortex-A7 around the FH885xV200 map and
@@ -108,6 +110,8 @@ typedef struct FhSoCConfig {
     bool tmr_div_low;           /* fh-pmu: the divider in CLK_DIV5[7:0] */
     int arc_irq;                /* fh-arc, FH8626V100's ARC600; 0: none */
     int isp_irq;                /* fh-isp + fh-csi, FH8626V100's; 0: none */
+    int pae_irq;                /* fh-pae, FH8626V100's H.264; 0: none */
+    int jpeg_irq;               /* fh-jpeg, FH8626V100's; 0: none */
     const char *sensor;         /* default sensor= */
     uint32_t swrst_base;        /* fh-pmu: 0 for 0x040 */
     uint32_t spc_io_status;     /* PMU 0x054, FH8632's variant */
@@ -317,6 +321,8 @@ static const FhSoCConfig fh8626v100_soc = {
     .tmr_div_low        = true,
     .arc_irq            = 32,
     .isp_irq            = 5,
+    .pae_irq            = 4,
+    .jpeg_irq           = 8,
     .sensor             = "gc2053",
     .swrst_base         = 0x04C,
     .timer_irq          = 3,
@@ -930,6 +936,17 @@ static void fullhan_common_init(MachineState *machine, const FhSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, fh_irq(fms, c->isp_irq));
         qdev_connect_gpio_out_named(csi, "up", 0,
                                     qdev_get_gpio_in_named(dev, "csi-up", 0));
+    }
+    if (c->pae_irq) {
+        /* registers, then the QP tables the driver calls "working" */
+        dev = qdev_new("fh-pae");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0xE7000000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, 0xE7010000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, fh_irq(fms, c->pae_irq));
+    }
+    if (c->jpeg_irq) {
+        sysbus_create_simple("fh-jpeg", 0xE8300000, fh_irq(fms, c->jpeg_irq));
     }
 
     /*

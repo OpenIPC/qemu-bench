@@ -1514,6 +1514,15 @@ if ! grep -q "'fullhan.c'" "$QEMU_DIR/hw/arm/meson.build"; then
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added fullhan.c"
 fi
+# shared models: FH8626V100's JPEG and H.264 (PAE) engines code with them
+for b in jpeg-enc.c hantro-h264.c; do
+    if ! grep -q "CONFIG_FULLHAN', if_true: files('$b')" \
+            "$QEMU_DIR/hw/misc/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_FULLHAN', if_true: files('$b'))" \
+            >> "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added $b for FULLHAN"
+    fi
+done
 
 # Grain Media (hw/arm/grainmedia.c): FA626TE camera SoCs with Faraday
 # peripherals.  Its own devices are the hw/*/gm-*.c files, each built

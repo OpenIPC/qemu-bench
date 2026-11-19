@@ -3,7 +3,8 @@
  * to check the CSI -> ISP -> VPU frame path: OpenIPC's 4.19 fh8626-capture
  * driver on the twin's fh-csi / fh-isp models.
  *
- *   fh-v4l2-capture <video node> <sensor subdev> <isp subdev> [frames]
+ *   fh-v4l2-capture <video node> <sensor subdev> <isp subdev> [frames
+ *                   [<H.264 encoder> <JPEG encoder> <block device>]]
  *
  * Streams NV12 through MMAP buffers and checks each one: the payload is a
  * whole frame, the sequence advances, the picture is not blank, and it
@@ -16,6 +17,14 @@
  *   exposure <a> -> <b>, gain <c> -> <d>, wb <r>/<b> -> <r>/<b>
  *
  * then "capture: ok", or what went wrong; exits 0 only for the former.
+ *
+ * With the encoders (OpenIPC's fh8626-encoder and fh8626-jpeg, both V4L2
+ * mem2mem), the 20 frames from the 50th on -- AE and AWB have settled by
+ * then -- go through the H.264 encoder with a GOP of 10 and the last of
+ * them through the JPEG one, and both streams are written to the block
+ * device at 192 KiB: "FHEN", the JPEG's length, the H.264 stream's, the
+ * frame count (little-endian words), then the JPEG and, 4-byte aligned,
+ * the H.264.  Prints "encode: <n> frames, <a> bytes H.264, <b> bytes JPEG".
  *
  * No libc: the test copies this out of a flash partition, so it is kept to
  * a few KiB.  Static ARM EABI, raw system calls:
@@ -30,6 +39,8 @@
 
 #define NR_EXIT         1
 #define NR_WRITE        4
+#define NR_LSEEK        19
+#define NR_FSYNC        118
 #define NR_OPEN         5
 #define NR_CLOSE        6
 #define NR_IOCTL        54
@@ -42,6 +53,7 @@
 #define PROT_RW         3
 #define MAP_SHARED      1
 #define POLLIN          1
+#define POLLOUT         4
 #define EAGAIN          11
 
 /* videodev2.h, 32-bit ARM layouts */
@@ -52,7 +64,14 @@
 #define VIDIOC_STREAMON 0x40045612
 #define VIDIOC_STREAMOFF 0x40045613
 #define VIDIOC_G_CTRL   0xC008561B
+#define VIDIOC_S_CTRL   0xC008561C
+#define VIDIOC_S_FMT    0xC0CC5605
 #define BUF_TYPE_CAPTURE 1
+#define BUF_TYPE_OUTPUT 2
+#define FMT_NV12        0x3231564E
+#define FMT_H264        0x34363248
+#define FMT_JPEG        0x4745504A
+#define CID_GOP_SIZE    0x009909CB
 #define MEMORY_MMAP     1
 #define CID_EXPOSURE    0x00980911
 #define CID_ANALOGUE_GAIN 0x009E0903
@@ -63,6 +82,10 @@
 #define WIDTH           1280
 #define HEIGHT          720
 #define FRAME_BYTES     (WIDTH * HEIGHT * 3 / 2)
+#define ENC_FROM        50
+#define ENC_FRAMES      20
+#define STREAM_MAX      (480 * 1024)
+#define OUT_OFFSET      (192 * 1024)
 
 struct v4l2_requestbuffers {
     unsigned int count, type, memory, capabilities, reserved;
@@ -75,6 +98,19 @@ struct v4l2_buffer {
     unsigned int sequence, memory;
     unsigned int offset;
     unsigned int length, reserved2, reserved;
+};
+
+struct v4l2_pix_format {
+    unsigned int width, height, pixelformat, field, bytesperline, sizeimage;
+    unsigned int colorspace, priv, flags, ycbcr_enc, quantization, xfer;
+};
+
+struct v4l2_format {
+    unsigned int type;
+    union {
+        struct v4l2_pix_format pix;
+        unsigned char raw[200];
+    } fmt;
 };
 
 struct v4l2_control {
@@ -114,6 +150,17 @@ void *memset(void *d, int c, unsigned long n)
 
     while (n--) {
         *p++ = (unsigned char)c;
+    }
+    return d;
+}
+
+void *memcpy(void *d, const void *src, unsigned long n)
+{
+    unsigned char *p = d;
+    const unsigned char *q = src;
+
+    while (n--) {
+        *p++ = *q++;
     }
     return d;
 }
@@ -203,6 +250,184 @@ static unsigned long checksum(const unsigned char *f)
     return sum;
 }
 
+/* A V4L2 mem2mem encoder: NV12 in (OUTPUT), the format out (CAPTURE) */
+struct m2m {
+    long fd;
+    unsigned char *in[2], *out[2];
+    unsigned int in_len[2], out_len[2];
+    unsigned int next;
+};
+
+static void wait_fd(long fd, short events)
+{
+    struct pollfd p = { .fd = fd, .events = events };
+    long r = sys(NR_POLL, (long)&p, 1, 2000);
+
+    if (r <= 0) {
+        fail("an encoded picture (none in 2 s)", r);
+    }
+}
+
+static void m2m_bufs(struct m2m *m, unsigned int type, unsigned char **map,
+                     unsigned int *len)
+{
+    struct v4l2_requestbuffers req = { .count = 2, .type = type,
+                                       .memory = MEMORY_MMAP };
+    long r = sys(NR_IOCTL, m->fd, VIDIOC_REQBUFS, (long)&req);
+    unsigned int i;
+
+    if (r < 0 || req.count != 2) {
+        fail("encoder VIDIOC_REQBUFS", r < 0 ? r : req.count);
+    }
+    for (i = 0; i < 2; i++) {
+        struct v4l2_buffer b = { .index = i, .type = type,
+                                 .memory = MEMORY_MMAP };
+
+        r = sys(NR_IOCTL, m->fd, VIDIOC_QUERYBUF, (long)&b);
+        if (r < 0) {
+            fail("encoder VIDIOC_QUERYBUF", r);
+        }
+        r = sys6(NR_MMAP2, 0, b.length, PROT_RW, MAP_SHARED, m->fd,
+                 b.offset >> 12);
+        if (r < 0 && r > -4096) {
+            fail("encoder mmap", r);
+        }
+        map[i] = (unsigned char *)r;
+        len[i] = b.length;
+        if (type == BUF_TYPE_CAPTURE) {
+            r = sys(NR_IOCTL, m->fd, VIDIOC_QBUF, (long)&b);
+            if (r < 0) {
+                fail("encoder VIDIOC_QBUF", r);
+            }
+        }
+    }
+}
+
+static void m2m_open(struct m2m *m, const char *path, unsigned int fourcc)
+{
+    struct v4l2_format f = { .type = BUF_TYPE_OUTPUT };
+    struct v4l2_control gop = { .id = CID_GOP_SIZE, .value = 10 };
+    int type;
+    long r;
+
+    m->fd = sys(NR_OPEN, (long)path, O_RDWR | O_NONBLOCK, 0);
+    if (m->fd < 0) {
+        fail("open encoder", m->fd);
+    }
+    f.fmt.pix.width = WIDTH;
+    f.fmt.pix.height = HEIGHT;
+    f.fmt.pix.pixelformat = FMT_NV12;
+    f.fmt.pix.bytesperline = WIDTH;
+    f.fmt.pix.sizeimage = FRAME_BYTES;
+    r = sys(NR_IOCTL, m->fd, VIDIOC_S_FMT, (long)&f);
+    if (r < 0) {
+        fail("encoder VIDIOC_S_FMT (NV12)", r);
+    }
+    f.type = BUF_TYPE_CAPTURE;
+    f.fmt.pix.pixelformat = fourcc;
+    f.fmt.pix.bytesperline = 0;
+    f.fmt.pix.sizeimage = 0;
+    r = sys(NR_IOCTL, m->fd, VIDIOC_S_FMT, (long)&f);
+    if (r < 0) {
+        fail("encoder VIDIOC_S_FMT (coded)", r);
+    }
+    if (fourcc == FMT_H264) {
+        r = sys(NR_IOCTL, m->fd, VIDIOC_S_CTRL, (long)&gop);
+        if (r < 0) {
+            fail("encoder GOP_SIZE", r);
+        }
+    }
+    m2m_bufs(m, BUF_TYPE_OUTPUT, m->in, m->in_len);
+    if (m->in_len[0] < FRAME_BYTES || m->in_len[1] < FRAME_BYTES) {
+        fail("encoder input buffers (a frame)", m->in_len[0]);
+    }
+    m2m_bufs(m, BUF_TYPE_CAPTURE, m->out, m->out_len);
+    type = BUF_TYPE_OUTPUT;
+    r = sys(NR_IOCTL, m->fd, VIDIOC_STREAMON, (long)&type);
+    type = BUF_TYPE_CAPTURE;
+    if (r >= 0) {
+        r = sys(NR_IOCTL, m->fd, VIDIOC_STREAMON, (long)&type);
+    }
+    if (r < 0) {
+        fail("encoder VIDIOC_STREAMON", r);
+    }
+}
+
+/* one frame in, its coded picture appended at dst; returns its bytes */
+static unsigned long m2m_encode(struct m2m *m, const unsigned char *frame,
+                                unsigned char *dst, unsigned long room)
+{
+    unsigned int i = m->next++ % 2;
+    struct v4l2_buffer in = { .index = i, .type = BUF_TYPE_OUTPUT,
+                              .memory = MEMORY_MMAP,
+                              .bytesused = FRAME_BYTES };
+    struct v4l2_buffer out = { .type = BUF_TYPE_CAPTURE,
+                               .memory = MEMORY_MMAP };
+    unsigned long used;
+    long r;
+
+    memcpy(m->in[i], frame, FRAME_BYTES);
+    r = sys(NR_IOCTL, m->fd, VIDIOC_QBUF, (long)&in);
+    if (r < 0) {
+        fail("encoder VIDIOC_QBUF (frame)", r);
+    }
+    do {
+        wait_fd(m->fd, POLLIN);
+        r = sys(NR_IOCTL, m->fd, VIDIOC_DQBUF, (long)&out);
+    } while (r == -EAGAIN);
+    if (r < 0 || out.index >= 2 || out.bytesused > m->out_len[out.index]) {
+        fail("encoder VIDIOC_DQBUF (picture)", r < 0 ? r : out.bytesused);
+    }
+    if (out.bytesused > room) {
+        fail("room for the stream", out.bytesused);
+    }
+    /* requeueing writes the buffer back, its payload 0 */
+    used = out.bytesused;
+    memcpy(dst, m->out[out.index], used);
+    r = sys(NR_IOCTL, m->fd, VIDIOC_QBUF, (long)&out);
+    if (r < 0) {
+        fail("encoder VIDIOC_QBUF (picture)", r);
+    }
+    in.bytesused = 0;
+    do {
+        wait_fd(m->fd, POLLOUT);
+        r = sys(NR_IOCTL, m->fd, VIDIOC_DQBUF, (long)&in);
+    } while (r == -EAGAIN);
+    if (r < 0) {
+        fail("encoder VIDIOC_DQBUF (frame)", r);
+    }
+    return used;
+}
+
+/*
+ * Stop and release an encoder: the camera's and both encoders' buffers do
+ * not fit the 24 MiB CMA pool the DT gives all of them at once.
+ */
+static void m2m_close(struct m2m *m)
+{
+    int type = BUF_TYPE_OUTPUT;
+    unsigned int i;
+
+    sys(NR_IOCTL, m->fd, VIDIOC_STREAMOFF, (long)&type);
+    type = BUF_TYPE_CAPTURE;
+    sys(NR_IOCTL, m->fd, VIDIOC_STREAMOFF, (long)&type);
+    for (i = 0; i < 2; i++) {
+        sys(NR_MUNMAP, (long)m->in[i], m->in_len[i], 0);
+        sys(NR_MUNMAP, (long)m->out[i], m->out_len[i], 0);
+    }
+    sys(NR_CLOSE, m->fd, 0, 0);
+}
+
+static unsigned char streams[16 + STREAM_MAX];
+
+static void put_le32(unsigned char *p, unsigned long v)
+{
+    p[0] = v;
+    p[1] = v >> 8;
+    p[2] = v >> 16;
+    p[3] = v >> 24;
+}
+
 void run(int argc, char **argv);
 void run(int argc, char **argv)
 {
@@ -216,6 +441,11 @@ void run(int argc, char **argv)
     int type = BUF_TYPE_CAPTURE, exp0, gain0, exp1, gain1, r0, b0, r1, b1;
     long vfd, sfd, ifd, r;
     unsigned int i;
+    int encode = argc > 7;
+    struct m2m h264 = { 0 }, jpeg = { 0 };
+    unsigned long jpeg_len = 0, h264_len = 0, encoded = 0;
+    unsigned char *jpeg_out = streams + 16;
+    unsigned char *h264_out = streams + 16 + STREAM_MAX / 4;
 
     if (argc < 4) {
         put("usage: fh-v4l2-capture <video> <sensor subdev> <isp subdev> "
@@ -261,6 +491,9 @@ void run(int argc, char **argv)
             fail("VIDIOC_QBUF", r);
         }
     }
+    if (encode) {
+        m2m_open(&h264, argv[5], FMT_H264);
+    }
     r = sys(NR_IOCTL, vfd, VIDIOC_STREAMON, (long)&type);
     if (r < 0) {
         fail("VIDIOC_STREAMON", r);
@@ -301,6 +534,18 @@ void run(int argc, char **argv)
             changed++;
         }
         last_sum = sum;
+        if (encode && got >= ENC_FROM && got < ENC_FROM + ENC_FRAMES) {
+            h264_len += m2m_encode(&h264, map[b.index], h264_out + h264_len,
+                                   STREAM_MAX * 3 / 4 - h264_len);
+            encoded++;
+            if (got == ENC_FROM + ENC_FRAMES - 1) {
+                m2m_close(&h264);
+                m2m_open(&jpeg, argv[6], FMT_JPEG);
+                jpeg_len = m2m_encode(&jpeg, map[b.index], jpeg_out,
+                                      STREAM_MAX / 4);
+                m2m_close(&jpeg);
+            }
+        }
         got++;
         r = sys(NR_IOCTL, vfd, VIDIOC_QBUF, (long)&b);
         if (r < 0) {
@@ -342,6 +587,37 @@ void run(int argc, char **argv)
     put("\n");
     if (changed < got / 2) {
         fail("frames changing", changed);
+    }
+    if (encode) {
+        long bfd = sys(NR_OPEN, (long)argv[7], O_RDWR, 0);
+        unsigned long at = 16 + ((jpeg_len + 3) & ~3UL);
+
+        if (bfd < 0) {
+            fail("open block device", bfd);
+        }
+        /* the H.264 right behind the JPEG */
+        memcpy(streams + at, h264_out, h264_len);
+        memcpy(streams, "FHEN", 4);
+        put_le32(streams + 4, jpeg_len);
+        put_le32(streams + 8, h264_len);
+        put_le32(streams + 12, encoded);
+        if (sys(NR_LSEEK, bfd, OUT_OFFSET, 0) != OUT_OFFSET ||
+            sys(NR_WRITE, bfd, (long)streams, at + h264_len) !=
+            (long)(at + h264_len)) {
+            fail("writing the streams", 0);
+        }
+        sys(NR_FSYNC, bfd, 0, 0);
+        sys(NR_CLOSE, bfd, 0, 0);
+        put("encode: ");
+        put_num(encoded);
+        put(" frames, ");
+        put_num(h264_len);
+        put(" bytes H.264, ");
+        put_num(jpeg_len);
+        put(" bytes JPEG\n");
+        if (encoded != ENC_FRAMES || !h264_len || !jpeg_len) {
+            fail("encoding", encoded);
+        }
     }
     put("capture: ok\n");
     sys(NR_EXIT, 0, 0, 0);
