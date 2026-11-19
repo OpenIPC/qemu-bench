@@ -302,8 +302,19 @@ static uint32_t vi_cap_status(HisiViState *s)
                (s->cap[CAP_WCH_INT(1) / 4] ? V5_CAP_INT_WCH0 << 1 : 0) |
                (s->cap[CAP_FE_INT(0) / 4] ? V5_CAP_INT_FE0 : 0);
     }
+    /*
+     * Pipe 0's summary bit (CAP_INT bit 8) stands for the write channel's
+     * *serviceable* frame interrupts, the ones VI_COMM_CapIrqRoute clears
+     * (frame start / frame end).  WCH_INT_EARLY (bit 15) is a VPSS-only
+     * signal (VPSS_COMM_VI_EarlyIrqProc reads the WCH register directly);
+     * it is not cleared by the VI cap ISR.  Including it here kept the
+     * summary asserted after the ISR cleared start/end, so offline — where
+     * no online VPSS consumes EARLY — the cap IRQ re-fired forever
+     * ("irq 41: nobody cared", IRQ disabled).
+     */
     return s->cap[CAP_INT / 4] |
-           (s->cap[CAP_WCH_INT(0) / 4] ? CAP_INT_PIPE0 : 0);
+           ((s->cap[CAP_WCH_INT(0) / 4] & (WCH_INT_FSTART | WCH_INT_FEND)) ?
+            CAP_INT_PIPE0 : 0);
 }
 
 static void vi_update(HisiViState *s)
