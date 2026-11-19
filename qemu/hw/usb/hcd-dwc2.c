@@ -583,7 +583,7 @@ static void dwc2_attach(USBPort *port)
     trace_usb_dwc2_attach(port);
     assert(port->index == 0);
 
-    if (!port->dev || !port->dev->attached) {
+    if (!(s->hprt0 & HPRT0_PWR) || !port->dev || !port->dev->attached) {
         return;
     }
 
@@ -623,7 +623,9 @@ static void dwc2_attach(USBPort *port)
     s->fi = USB_FRMINTVL - 1;
     s->hprt0 |= HPRT0_CONNDET | HPRT0_CONNSTS;
 
-    dwc2_bus_start(s);
+    if (!timer_pending(s->eof_timer)) {
+        dwc2_bus_start(s);
+    }
     dwc2_raise_global_irq(s, GINTSTS_PRTINT);
 }
 
@@ -634,6 +636,9 @@ static void dwc2_detach(USBPort *port)
     trace_usb_dwc2_detach(port);
     assert(port->index == 0);
 
+    if (!(s->hprt0 & HPRT0_PWR)) {
+        return;
+    }
     dwc2_bus_stop(s);
 
     s->hprt0 &= ~(HPRT0_SPD_MASK | HPRT0_SUSP | HPRT0_ENA | HPRT0_CONNSTS);
@@ -841,13 +846,16 @@ static void dwc2_id_debounced(void *opaque)
     DWC2State *s = opaque;
 
     s->id_reported = true;
-    s->gintsts |= GINTSTS_CONIDSTSCHNG;
-    dwc2_update_irq(s);
+    if (!(s->gusbcfg & (GUSBCFG_FORCEHOSTMODE | GUSBCFG_FORCEDEVMODE))) {
+        s->gintsts |= GINTSTS_CONIDSTSCHNG;
+        dwc2_update_irq(s);
+    }
 }
 
 static void dwc2_id_arm(DWC2State *s)
 {
-    if (s->otg_a_device && !s->id_reported) {
+    if (s->otg_a_device && !s->id_reported &&
+        !(s->gusbcfg & (GUSBCFG_FORCEHOSTMODE | GUSBCFG_FORCEDEVMODE))) {
         timer_mod(s->id_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   100 * SCALE_MS);
     }
@@ -859,8 +867,8 @@ static void dwc2_id_arm(DWC2State *s)
  * device still on the port is detected anew (Connect Detected).  U-Boot's
  * dwc2 driver leaves the port in reset when it stops (XM8521DV200: HPRT0
  * PrtRst still set when Linux's dwc2.ko probes); on the chip the kernel
- * driver's soft reset releases it.  The other CSRs keep their values: the
- * drivers program them all again after the reset.
+ * driver's soft reset releases it. Interrupt status remains readable,
+ * but CSftRst clears the interrupt masks before restarting the port.
  */
 static void dwc2_core_soft_reset(DWC2State *s)
 {
@@ -880,11 +888,14 @@ static void dwc2_core_soft_reset(DWC2State *s)
         p->ddma_active = false;
     }
     memset(s->hreg1, 0, sizeof(s->hreg1));
+    s->gintmsk = 0;
+    s->haintmsk = 0;
+    dwc2_update_irq(s);
     dwc2_lower_host_irq(s, s->haint);
 
     s->hprt0 &= ~(HPRT0_RST | HPRT0_ENA | HPRT0_SUSP | HPRT0_RES |
                   HPRT0_ENACHG | HPRT0_OVRCURRCHG);
-    if (dev && dev->attached) {
+    if ((s->hprt0 & HPRT0_PWR) && dev && dev->attached) {
         s->hprt0 |= HPRT0_CONNSTS | HPRT0_CONNDET;
         dwc2_raise_global_irq(s, GINTSTS_PRTINT);
     }
@@ -960,6 +971,12 @@ static void dwc2_glbreg_write(void *ptr, hwaddr addr, int index, uint64_t val,
     case GAHBCFG:
         if ((val & GAHBCFG_GLBL_INTR_EN) && !(old & GAHBCFG_GLBL_INTR_EN)) {
             iflg = 1;
+        }
+        break;
+    case GUSBCFG:
+        if (val & (GUSBCFG_FORCEHOSTMODE | GUSBCFG_FORCEDEVMODE)) {
+            timer_del(s->id_timer);
+            s->id_reported = true;
         }
         break;
     case GRSTCTL:
@@ -1153,7 +1170,20 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
         val &= ~(HPRT0_OVRCURRCHG | HPRT0_ENACHG | HPRT0_ENA |
                  HPRT0_CONNDET);
         val |= tval;
-        if (!(val & HPRT0_RST) && (old & HPRT0_RST)) {
+        if (!(val & HPRT0_PWR)) {
+            dwc2_bus_stop(s);
+            val &= ~(HPRT0_CONNSTS | HPRT0_ENA | HPRT0_SUSP | HPRT0_RES |
+                     HPRT0_RST | HPRT0_SPD_MASK);
+            if (old & HPRT0_ENA) {
+                val |= HPRT0_ENACHG;
+            }
+        } else if (!(old & HPRT0_PWR) && dev && dev->attached) {
+            s->hprt0 |= HPRT0_PWR;
+            dwc2_attach(&s->uport);
+            val = (val & ~HPRT0_SPD_MASK) | (*mmio & HPRT0_SPD_MASK) |
+                  HPRT0_CONNSTS | HPRT0_CONNDET;
+        }
+        if ((val & HPRT0_PWR) && !(val & HPRT0_RST) && (old & HPRT0_RST)) {
             if (dev && dev->attached) {
                 val |= HPRT0_ENA | HPRT0_ENACHG;
                 prst = 1;
@@ -1170,14 +1200,10 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
     }
 
     if (prst) {
-        trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old,
-                                   val & ~HPRT0_CONNDET);
-        trace_usb_dwc2_hreg0_action("call usb_port_reset");
-        usb_port_reset(&s->uport);
-        val &= ~HPRT0_CONNDET;
-    } else {
-        trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old, val);
+        trace_usb_dwc2_hreg0_action("reset attached USB device");
+        usb_device_reset(dev);
     }
+    trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old, val);
 
     *mmio = val;
 
@@ -1509,12 +1535,15 @@ static void dwc2_reset_enter(Object *obj, ResetType type)
                  GHWCFG2_DYNAMIC_FIFO |
                  GHWCFG2_PERIO_EP_SUPPORTED |
                  ((s->num_chan - 1) << GHWCFG2_NUM_HOST_CHAN_SHIFT) |
+                 (s->usb_version == 2 ?
+                  (GHWCFG2_HS_PHY_TYPE_UTMI << GHWCFG2_HS_PHY_TYPE_SHIFT) : 0) |
                  (GHWCFG2_INT_DMA_ARCH << GHWCFG2_ARCHITECTURE_SHIFT) |
                  (GHWCFG2_OP_MODE_NO_SRP_CAPABLE_HOST << GHWCFG2_OP_MODE_SHIFT);
     s->ghwcfg3 = (4096 << GHWCFG3_DFIFO_DEPTH_SHIFT) |
                  (4 << GHWCFG3_PACKET_SIZE_CNTR_WIDTH_SHIFT) |
                  (4 << GHWCFG3_XFER_SIZE_CNTR_WIDTH_SHIFT);
-    s->ghwcfg4 = 0;
+    s->ghwcfg4 = GHWCFG4_UTMI_PHY_DATA_WIDTH_8_OR_16 <<
+                 GHWCFG4_UTMI_PHY_DATA_WIDTH_SHIFT;
     if (s->cfg_ghwcfg2) {
         s->ghwcfg2 = s->cfg_ghwcfg2;
     }

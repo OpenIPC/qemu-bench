@@ -77,6 +77,7 @@
 #include "migration/vmstate.h"
 #include "ingenic-isp-paint.h"
 #include "hw/i2c/hisi-soi.h"
+#include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
 #include "qom/object.h"
 
@@ -88,10 +89,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(IngenicIspState, INGENIC_ISP)
 #define VIC_SIZE        0x10000
 #define CSI_SIZE        0x1000
 #define PHY_SIZE        0x1000
+#define MAX_EXPO_DELAY  8
 
 #define MSCA_CH(n)      (s->l->ch_base + 0x100 * (n))
 
 #define VIC_CTRL        0x000
+#define VIC_PORT_SEL    0x204
+#define VIC_PORT_STATUS 0x20C
+#define VIC_MDMA_CTRL   0x300
+#define VIC_MDMA_SIZE   0x304
+#define VIC_MDMA_STRIDE 0x310
+#define VIC_MDMA_BUF0   0x318
+#define VIC_MDMA_DONE   0x380
 
 #define NUM_CH          3           /* a pipe's */
 #define MAX_PIPES       2
@@ -115,6 +124,7 @@ typedef struct IngenicIspLayout {
     uint32_t fs_bit;            /* frame start in int_sta, 0: none */
     hwaddr ch_base;             /* channel n's registers at +0x100 n */
     hwaddr ch_en;               /* bit n: channel n enabled */
+    hwaddr msca_fmt;            /* NV21 and flip bits by channel; 0: none */
     hwaddr ch_busy;             /* channel busy bits: read 0; 0: none */
     hwaddr ch_active;           /* reads ch_en's channel bits; 0: none */
     /* in a channel's block; 0 (but osize): none */
@@ -122,12 +132,14 @@ typedef struct IngenicIspLayout {
     uint16_t push_y, push_uv;   /* an empty buffer's addresses */
     uint16_t pop_y, pop_uv;     /* a filled one's: popped by reading pop_y */
     uint16_t pop_num[2];        /* its frame number */
-    uint16_t empty;             /* bit 0: the done FIFO is empty */
+    uint16_t empty, empty_uv;   /* bit 0: the done FIFO is empty */
     uint16_t full;              /* bit 1: the empty-buffer FIFO is full */
     uint16_t ystride, uvstride;
-    uint16_t clear[4];          /* a write empties the FIFOs */
+    uint16_t clear[6];          /* a write empties the FIFOs */
     hwaddr vic_sta, vic_mask, vic_clr;
     bool vic_sta2;              /* a second status/mask/ack at +4 */
+    bool raw_bggr10_left;       /* VIC MDMA: BGGR10 in bits 15:6 */
+    bool has_port_sel;          /* VIC_PORT_SEL selects the source sensor */
     uint32_t vic_fs_bit;        /* frame start in vic_sta, 0: none */
     hwaddr req, ack;            /* bit 0 of ack follows bit 0 of req; 0: none */
     /* the Tiziano 3A statistics blocks (AE0, AWB); 0: none */
@@ -141,6 +153,7 @@ typedef struct IngenicIspLayout {
                                    ADR, defog; ingenic_isp_xstats()): 1
                                    T31's, with WDR; 2 T23's, without;
                                    3 T40/T41's formats */
+    bool paint_wb;              /* apply the WB gains to MSCA output */
     /*
      * T40's second pipe (pipes 2): its channels 3..5, their enable and
      * FIFOs at pipe_ch past pipe 0's, its interrupt enable / clear /
@@ -184,7 +197,7 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         /* ae0_interrupt_static / _hist, awb_interrupt_static (SDK .ko) */
         .ae = 0xA000, .awb = 0xB000,
         .ae_static_bit = 26, .ae_hist_bit = 27, .awb_bit = 30, .stat_gen = 1,
-        .wb = 0x1804, .xstat = 1,
+        .wb = 0x1804, .paint_wb = true, .xstat = 1,
     }, {
         /*
          * tx-isp-t21.ko H20200509a: the T31 MSCA at 0x2300 (QBUF 0x32650,
@@ -217,19 +230,20 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * tisp_msca_init_chx_cfg 0x16f2c).  The pop's UV word carries a
          * tag in bits 2:0, 0 here.
          */
-        .name = "t23", .isp_size = 0x10000, .dgain = 0x1030,
+        .name = "t23", .isp_size = 0x90000, .dgain = 0x1030,
         .int_en = 0xB0, .int_sta = 0xB4, .int_clr = 0xB8, .fs_bit = 0x1000,
         .ch_base = 0xD100, .ch_en = 0xD040,
         .osize = 0x04, .csize = 0x0C, .push_y = 0x30, .push_uv = 0x50,
-        .pop_y = 0x38, .pop_uv = 0x58, .empty = 0x3C,
+        .pop_y = 0x38, .pop_uv = 0x58, .empty = 0x3C, .empty_uv = 0x5C,
         .ystride = 0x40, .uvstride = 0x60,
-        .clear = { 0x44, 0x64, 0x48, 0x68 },
+        .clear = { 0x44, 0x64, 0x48, 0x68, 0x4C, 0x6C },
         .vic_sta = 0x1E0, .vic_mask = 0x1E8, .vic_clr = 0x1F0,
-        .vic_sta2 = true,
+        .vic_sta2 = true, .vic_fs_bit = 0x10,
         /* the T31 3A blocks and bits (system_irq_func_set callers) */
         .ae = 0xA000, .awb = 0xB000,
         .ae_static_bit = 26, .ae_hist_bit = 27, .awb_bit = 30, .stat_gen = 1,
-        .wb = 0x1804,                   /* Tiziano_awb_set_gain */
+        .wb = 0x1804, .paint_wb = true, /* Tiziano_awb_set_gain */
+        .msca_fmt = 0xD050, .raw_bggr10_left = true, .has_port_sel = true,
         .xstat = 2,
         /* the double firmware's pass end (ispcore_interrupt_service_routine) */
         .sta2 = 0xC8, .sta2_en = 0xC0, .sta2_clr = 0xC4,
@@ -355,10 +369,15 @@ struct IngenicIspState {
     uint32_t light;             /* the scene's light, percent */
     uint32_t light_r, light_b;  /* its colour: the raw R and B of a white
                                    over its G, per mille */
+    uint32_t expo_delay;        /* sensor exposure pipeline delay, frames */
+    uint64_t expo_hist[2][MAX_EXPO_DELAY + 1];
+    uint8_t expo_hist_idx[2];
+    bool expo_hist_init[2];
     Object *sensor;             /* the image sensor, for its exposure */
     Object *sensor1;            /* T40: the second pipe's sensor; T23:
                                    the double firmware's second one */
     uint8_t dual_src;           /* T23 double: the sensor of this pass */
+    uint8_t vic_port_sel;       /* T23: VIC_PORT_SEL controls dual_src */
     uint8_t dual_pass_end;      /* T23 double: a pass ended, not yet told */
     uint32_t dual_sta;          /* ... and its core status bits */
     uint8_t dual_half;          /* T23 double: a pass's picture is out */
@@ -463,7 +482,7 @@ static bool ingenic_isp_dual(IngenicIspState *s)
  */
 static int ingenic_isp_src(IngenicIspState *s, int p)
 {
-    return p ? 1 : ingenic_isp_dual(s) ? s->dual_src : 0;
+    return p ? 1 : (s->vic_port_sel || ingenic_isp_dual(s)) ? s->dual_src : 0;
 }
 
 /* VIC @v's registers (T40: three VICs, 64 KiB apart) */
@@ -511,7 +530,14 @@ static void ingenic_isp_update(IngenicIspState *s)
 
 static int64_t ingenic_isp_period(IngenicIspState *s)
 {
-    return NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
+    Object *sensor = ingenic_isp_src(s, 0) ? s->sensor1 : s->sensor;
+    int64_t ns = image_sensor_frame_ns(sensor);
+
+    if (ns < NANOSECONDS_PER_SECOND / 240 ||
+        ns > NANOSECONDS_PER_SECOND * 2) {
+        ns = NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
+    }
+    return ns;
 }
 
 /* Does pipe @p take frames: its VIC started, its interrupts enabled? */
@@ -526,13 +552,21 @@ static bool ingenic_isp_pipe_running(IngenicIspState *s, int p)
            ISP_REG(PIPE_INT(p, l->int_en));
 }
 
+static bool ingenic_vic_mdma_running(IngenicIspState *s, int p)
+{
+    uint32_t ctrl = ingenic_vic_regs(s, p)[VIC_MDMA_CTRL >> 2];
+
+    return !s->l->no_vic && (p ? s->vic1_running : s->vic_running) &&
+           (ctrl & (1u << 31)) && extract32(ctrl, 16, 4);
+}
+
 static void ingenic_isp_schedule(IngenicIspState *s)
 {
-    bool run = false;
+    bool run = s->l->pipes > 1 && s->vic2_running;
     int p;
 
     for (p = 0; p < ingenic_isp_pipes(s); p++) {
-        run |= ingenic_isp_pipe_running(s, p);
+        run |= ingenic_isp_pipe_running(s, p) || ingenic_vic_mdma_running(s, p);
     }
 
     if (run && !timer_pending(s->timer)) {
@@ -602,13 +636,42 @@ static uint32_t ingenic_isp_dgain(IngenicIspState *s)
     return dg ? dg : 0x400;
 }
 
+static uint64_t ingenic_isp_delayed_level(IngenicIspState *s, int src,
+                                          uint64_t cur)
+{
+    const unsigned m = MAX_EXPO_DELAY + 1;
+    unsigned d = MIN(s->expo_delay, MAX_EXPO_DELAY);
+    unsigned idx, i;
+    uint64_t out;
+
+    if (src < 0 || src >= 2) {
+        return cur;
+    }
+    if (!s->expo_hist_init[src]) {
+        for (i = 0; i < m; i++) {
+            s->expo_hist[src][i] = cur;
+        }
+        s->expo_hist_idx[src] = 0;
+        s->expo_hist_init[src] = true;
+    }
+    idx = s->expo_hist_idx[src] % m;
+    out = d ? s->expo_hist[src][(idx + m - d) % m] : cur;
+    s->expo_hist[src][idx] = cur;
+    s->expo_hist_idx[src] = (idx + 1) % m;
+    return out;
+}
+
 static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
 {
+    int src = ingenic_isp_src(s, pipe);
     uint64_t g = (uint64_t)s->light * 256 / 100;
     uint64_t level = s->l->ae ?
-        ingenic_isp_sensor_level(ingenic_isp_src(s, pipe) ? s->sensor1 :
-                                 s->sensor) : 0;
+        ingenic_isp_sensor_level(src ? s->sensor1 : s->sensor) : 0;
 
+    if (s->l->ae) {
+        level = ingenic_isp_delayed_level(s, src,
+                                          level ? level : EXPOSURE_1X);
+    }
     if (level) {
         g = g * level / EXPOSURE_1X;
     }
@@ -616,6 +679,26 @@ static uint32_t ingenic_isp_gain(IngenicIspState *s, int pipe)
         g = g * ingenic_isp_dgain(s) / 0x400;
     }
     return MIN(MAX(g, 1), 256 * 64);
+}
+
+static void ingenic_isp_wb_gains(IngenicIspState *s, uint32_t *wb_r,
+                                 uint32_t *wb_b)
+{
+    const IngenicIspLayout *l = s->l;
+    uint32_t day_r = l->day_r ? l->day_r : 550;
+    uint32_t day_b = l->day_b ? l->day_b : 600;
+    uint32_t reg_r, reg_b;
+
+    if (!l->paint_wb) {
+        *wb_r = *wb_b = 1024;
+        return;
+    }
+    reg_r = ISP_REG(l->wb) & 0x3FFF;
+    reg_b = ISP_REG(l->wb + 4) & 0x3FFF;
+    *wb_r = reg_r ? (uint64_t)s->light_r * reg_r / 1000 :
+                    (uint64_t)s->light_r * 1024 / day_r;
+    *wb_b = reg_b ? (uint64_t)s->light_b * reg_b / 1000 :
+                    (uint64_t)s->light_b * 1024 / day_b;
 }
 
 /*
@@ -1158,8 +1241,8 @@ static void ingenic_isp_stats(IngenicIspState *s, uint32_t gain, int pipe,
                  " wb R %u B %u /1024 light %u/%u top 0x%08x short %u%s\n",
                  pipe, frame, gain, n ? (unsigned)(sum / n) : 0,
                  ae ? " ae" : "", awb ? " awb" : "",
-                 l->wb ? ISP_REG(l->wb) & 0xFFF : 0,
-                 l->wb ? ISP_REG(l->wb + 4) & 0xFFF : 0,
+                 l->wb ? ISP_REG(l->wb) & 0x3FFF : 0,
+                 l->wb ? ISP_REG(l->wb + 4) & 0x3FFF : 0,
                  s->light_r, s->light_b,
                  ISP_REG(l->xstat == 3 ? T41_TOP : T31_TOP),
                  (unsigned)(ingenic_isp_sensor_short(
@@ -1906,12 +1989,6 @@ static void ingenic_isp_xstats(IngenicIspState *s, uint32_t gain,
  * an RGGB mosaic, 10 bits right-aligned (the bit depth and alignment are
  * not documented; the driver only copies the bytes to /tmp/snapN.raw).
  */
-#define VIC_MDMA_CTRL   0x300
-#define VIC_MDMA_SIZE   0x304
-#define VIC_MDMA_STRIDE 0x310
-#define VIC_MDMA_BUF0   0x318
-#define VIC_MDMA_DONE   0x380
-
 static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
 {
     uint32_t *r = ingenic_vic_regs(s, v);
@@ -1936,11 +2013,20 @@ static void ingenic_vic_mdma(IngenicIspState *s, int v, uint32_t frame)
             Y = yuv[0];
             U = yuv[1] - 128;
             V = yuv[2] - 128;
-            /* R G / G B */
-            c = (y & 1) == 0 && (x & 1) == 0 ? Y + (1436 * V >> 10) :
-                (y & 1) && (x & 1) ? Y + (1815 * U >> 10) :
-                Y - ((352 * U + 731 * V) >> 10);
-            line[x] = cpu_to_le16(MIN(MAX(c, 0), 255) << 2);
+            if (s->l->raw_bggr10_left) {
+                /* T23 BGGR, 10-bit left-aligned (<< 6) with 64-count pedestal */
+                c = (y & 1) == 0 && (x & 1) == 0 ? Y + (1815 * U >> 10) :
+                    (y & 1) && (x & 1) ? Y + (1436 * V >> 10) :
+                    Y - ((352 * U + 731 * V) >> 10);
+                c = 64 + MIN(MAX(c, 0), 255) * (1023 - 64) / 255;
+                line[x] = cpu_to_le16(c << 6);
+            } else {
+                /* R G / G B */
+                c = (y & 1) == 0 && (x & 1) == 0 ? Y + (1436 * V >> 10) :
+                    (y & 1) && (x & 1) ? Y + (1815 * U >> 10) :
+                    Y - ((352 * U + 731 * V) >> 10);
+                line[x] = cpu_to_le16(MIN(MAX(c, 0), 255) << 2);
+            }
         }
         dma_memory_write(&address_space_memory, dst + y * stride, line,
                          2 * w, MEMTXATTRS_UNSPECIFIED);
@@ -2099,7 +2185,7 @@ static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
 
 /*
  * The frame of pipe @p: frame start, the picture into each enabled
- * channel with a queued buffer, the 3A statistics, VIC frame done.  Pipe
+ * channel with a queued buffer and the 3A statistics.  Pipe
  * 1 paints the scene with its counter 500000 ahead, so that its pictures
  * tell themselves from pipe 0's.
  */
@@ -2107,23 +2193,21 @@ static void ingenic_isp_hldc_plane(IngenicIspState *s, int p, int uv,
 /* T23 double: the pass end this long after its channels' done */
 #define DUAL_PASS_END_NS (500 * SCALE_US)
 
-static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
+static void ingenic_isp_pipe_frame(IngenicIspState *s, int p, uint32_t frame)
 {
     const IngenicIspLayout *l = s->l;
     uint32_t en = ISP_REG(PIPE_CH(p, l->ch_en));
     uint32_t gain = ingenic_isp_gain(s, p);
     uint32_t sgain = ingenic_isp_short_gain(s, p);
-    uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
+    uint32_t wb_r, wb_b;
     hwaddr int_sta = PIPE_INT(p, l->int_sta);
-    uint32_t *vic = ingenic_vic_regs(s, p);
     uint32_t sta_before = ISP_REG(int_sta);
     bool to_ivdc = false;
     int n;
 
+    ingenic_isp_wb_gains(s, &wb_r, &wb_b);
+
     ISP_REG(int_sta) |= l->fs_bit;
-    if (!l->no_vic) {
-        vic[l->vic_sta >> 2] |= l->vic_fs_bit;
-    }
     for (n = 0; n < NUM_CH; n++) {
         IngenicIspChan *c = &s->ch[p * NUM_CH + n];
         uint32_t *r = &s->isp[PIPE_CH(p, MSCA_CH(n)) >> 2];
@@ -2131,6 +2215,10 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
                         r[l->osize >> 2];
         uint32_t w = size >> 16, h = size & 0xFFFF;
         uint32_t ya, uva;
+        uint32_t msca50 = l->msca_fmt ? ISP_REG(l->msca_fmt) : 0;
+        bool vu = (msca50 & (1u << (12 + n))) != 0;
+        bool hflip = (msca50 & (1u << (16 + n))) != 0;
+        bool vflip = (msca50 & (1u << (19 + n))) != 0;
         bool ivdc;
 
         if (!(en & (1u << n)) || !c->y.count || !c->uv.count ||
@@ -2141,8 +2229,9 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
         uva = fifo_pop(&c->uv, NULL);
         ivdc = ya == IVDC_Y;
         to_ivdc |= ivdc;
-        ingenic_isp_paint(&s->paint, frame, w, h, r[l->ystride >> 2],
-                          r[l->uvstride >> 2], ya, uva, false, gain, sgain);
+        ingenic_isp_paint_ex(&s->paint, frame, w, h, r[l->ystride >> 2],
+                             r[l->uvstride >> 2], ya, uva, vu, hflip, vflip,
+                             gain, sgain, wb_r, wb_b);
         if (ingenic_isp_hldc_on(s, p)) {
             ingenic_isp_hldc_plane(s, p, 0, w, h, r[l->ystride >> 2], ya);
             ingenic_isp_hldc_plane(s, p, 1, w, h, r[l->uvstride >> 2], uva);
@@ -2177,10 +2266,6 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
     if (l->xstat && p == 0) {
         ingenic_isp_xstats(s, gain, frame);
     }
-    if (!l->no_vic) {
-        vic[l->vic_sta >> 2] |= 1;
-        ingenic_vic_mdma(s, p, frame);
-    }
     if (p == 0 && ingenic_isp_dual(s)) {
         /*
          * T23's double firmware: the pass of one sensor ends (sta2 bit
@@ -2207,7 +2292,9 @@ static void ingenic_isp_pipe_frame(IngenicIspState *s, int p)
             s->dual_pass_end = 1;
         } else {
             ISP_REG(l->sta2) |= 1u << 15;
-            s->dual_src ^= 1;
+            if (!s->vic_port_sel) {
+                s->dual_src ^= 1;
+            }
         }
     }
 }
@@ -2231,7 +2318,9 @@ static void ingenic_isp_frame(void *opaque)
         if (s->dual_pass_end) {
             ISP_REG(s->l->int_sta) |= s->dual_sta;
             ISP_REG(s->l->sta2) |= 1u << 15;
-            s->dual_src ^= 1;
+            if (!s->vic_port_sel) {
+                s->dual_src ^= 1;
+            }
             s->dual_pass_end = 0;
             s->dual_sta = 0;
         }
@@ -2243,8 +2332,17 @@ static void ingenic_isp_frame(void *opaque)
         return;
     }
     for (p = 0; p < ingenic_isp_pipes(s); p++) {
-        if (ingenic_isp_pipe_running(s, p)) {
-            ingenic_isp_pipe_frame(s, p);
+        bool pipe = ingenic_isp_pipe_running(s, p);
+        uint32_t frame = s->frame + (ingenic_isp_src(s, p) ? PIPE1_FRAME : 0);
+
+        if (pipe) {
+            ingenic_isp_pipe_frame(s, p, frame);
+        }
+        if (!s->l->no_vic && (pipe || ingenic_vic_mdma_running(s, p))) {
+            uint32_t *vic = ingenic_vic_regs(s, p);
+
+            vic[s->l->vic_sta >> 2] |= s->l->vic_fs_bit | 1;
+            ingenic_vic_mdma(s, p, frame);
         }
     }
     if (dual && s->dual_pass_end) {
@@ -2265,8 +2363,7 @@ static void ingenic_isp_frame(void *opaque)
     }
     s->frame++;
     ingenic_isp_update(s);
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              ingenic_isp_period(s));
+    ingenic_isp_schedule(s);
 }
 
 /* --- ISP core ------------------------------------------------------------ */
@@ -2357,6 +2454,8 @@ static uint64_t ingenic_isp_read(void *opaque, hwaddr off, unsigned size)
         return fifo_pop(&c->done_y, &c->pop_num);
     } else if (r == l->empty) {
         return !c->done_y.count;
+    } else if (l->empty_uv && r == l->empty_uv) {
+        return !c->done_uv.count;
     } else if (l->full && r == l->full) {
         return (c->y.count == FIFO_DEPTH) << 1;
     } else if (r == l->pop_uv) {
@@ -2412,7 +2511,7 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     if (l->sta2 && off == l->sta2_en) {
-        if ((val & ~ISP_REG(off)) & (1u << 15)) {
+        if (!s->vic_port_sel && ((val & ~ISP_REG(off)) & (1u << 15))) {
             s->dual_src = 0;        /* the first pass is the main sensor's */
         }
         s->isp[off >> 2] = val;
@@ -2440,7 +2539,8 @@ static void ingenic_isp_write(void *opaque, hwaddr off, uint64_t val,
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "ingenic-isp: ch%d UV FIFO full\n", n);
             }
-        } else if (r == l->pop_y || r == l->empty || r == l->pop_uv) {
+        } else if (r == l->pop_y || r == l->empty ||
+                   (l->empty_uv && r == l->empty_uv) || r == l->pop_uv) {
             return;
         } else if (ingenic_isp_is_clear(l, r)) {
             if (val) {
@@ -2494,12 +2594,20 @@ static void ingenic_vic_wr(IngenicIspState *s, int v, hwaddr off,
     if (off == l->vic_clr || off == l->vic_clr + two) {
         r[(l->vic_sta + off - l->vic_clr) >> 2] &= ~val;
     }
+    if (l->has_port_sel && v == 0 && off == VIC_PORT_SEL) {
+        s->vic_port_sel = 1;
+        s->dual_src = val & 1;
+        r[VIC_PORT_STATUS >> 2] = val & 1;
+    }
     if (off == VIC_MDMA_CTRL && (val & (1u << 31)) &&
         !(r[off >> 2] & (1u << 31))) {
         s->mdma_slot[v] = 0;            /* a capture starts at buffer 0 */
     }
     r[off >> 2] = val;
     ingenic_isp_update(s);
+    if (off == VIC_MDMA_CTRL) {
+        ingenic_isp_schedule(s);
+    }
 }
 
 static uint64_t ingenic_vic_read(void *opaque, hwaddr off, unsigned size)
@@ -2609,10 +2717,14 @@ static void ingenic_isp_reset(DeviceState *dev)
     s->vic1_running = false;
     s->vic2_running = false;
     s->dual_src = 0;
+    s->vic_port_sel = 0;
     s->dual_half = 0;
     s->dual_pass_end = 0;
     s->dual_sta = 0;
     memset(s->mdma_slot, 0, sizeof(s->mdma_slot));
+    memset(s->expo_hist, 0, sizeof(s->expo_hist));
+    memset(s->expo_hist_idx, 0, sizeof(s->expo_hist_idx));
+    memset(s->expo_hist_init, 0, sizeof(s->expo_hist_init));
     s->frame = 0;
     for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
         chan_clear(&s->ch[n]);
@@ -2697,12 +2809,21 @@ static void ingenic_isp_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(obj, "light-b", &s->light_b,
                                    OBJ_PROP_FLAG_READWRITE);
+    s->expo_delay = 0;
+    object_property_add_uint32_ptr(obj, "expo-delay", &s->expo_delay,
+                                   OBJ_PROP_FLAG_READWRITE);
 }
 
 static int ingenic_isp_post_load(void *opaque, int version_id)
 {
     IngenicIspState *s = opaque;
     int n;
+
+    for (n = 0; n < 2; n++) {
+        if (s->expo_hist_idx[n] > MAX_EXPO_DELAY) {
+            return -EINVAL;
+        }
+    }
 
     for (n = 0; n < NUM_CH * MAX_PIPES; n++) {
         IngenicIspChan *c = &s->ch[n];
@@ -2753,7 +2874,7 @@ static const VMStateDescription vmstate_ingenic_isp_chan = {
 
 static const VMStateDescription vmstate_ingenic_isp = {
     .name = TYPE_INGENIC_ISP,
-    .version_id = 6,
+    .version_id = 7,
     .minimum_version_id = 1,
     .post_load = ingenic_isp_post_load,
     .fields = (const VMStateField[]) {
@@ -2779,6 +2900,12 @@ static const VMStateDescription vmstate_ingenic_isp = {
         VMSTATE_UINT8_V(dual_half, IngenicIspState, 6),
         VMSTATE_UINT8_V(dual_pass_end, IngenicIspState, 6),
         VMSTATE_UINT32_V(dual_sta, IngenicIspState, 6),
+        VMSTATE_UINT8_V(vic_port_sel, IngenicIspState, 7),
+        VMSTATE_UINT32_V(expo_delay, IngenicIspState, 7),
+        VMSTATE_UINT64_2DARRAY_V(expo_hist, IngenicIspState, 2,
+                                 MAX_EXPO_DELAY + 1, 7),
+        VMSTATE_UINT8_ARRAY_V(expo_hist_idx, IngenicIspState, 2, 7),
+        VMSTATE_BOOL_ARRAY_V(expo_hist_init, IngenicIspState, 2, 7),
         VMSTATE_TIMER_PTR(timer, IngenicIspState),
         VMSTATE_END_OF_LIST()
     },

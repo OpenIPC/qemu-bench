@@ -109,6 +109,8 @@
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
+#include "system/device_tree.h"
+#include <libfdt.h>
 #include "system/qtest.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -352,6 +354,8 @@ struct IngenicMachineState {
     char *sensor;
     DeviceState *sensor_dev;        /* the sensor= model, for the ISP */
     int sensor_bus;                 /* sensor-bus=, or -1: the SoC's own */
+    int msc0_cd;                    /* msc0-cd=, or -1: the SoC's own */
+    bool auto_mem;                  /* -kernel: append mem=/rmem= if absent */
     char *sensor1;
     DeviceState *sensor1_dev;       /* sensor1=, T40's second pipe */
     char *sensor2;
@@ -752,8 +756,9 @@ static void ingenic_nand_boot(IngenicMachineState *ims)
 #define UIMAGE_MAGIC    0x27051956
 #define UIMAGE_HDR      64
 
-/* Load a uImage or ELF; returns the entry point, sets *end (physical). */
-static uint64_t ingenic_load_kernel(const char *file, hwaddr *end)
+/* A uImage describes its payload, but omits the size of the kernel's BSS. */
+static uint64_t ingenic_load_kernel(const char *file, hwaddr *end,
+                                    hwaddr *uimage_start)
 {
     g_autofree uint8_t *img = NULL;
     g_autoptr(GError) gerr = NULL;
@@ -765,6 +770,7 @@ static uint64_t ingenic_load_kernel(const char *file, hwaddr *end)
 
     if (load_elf(file, NULL, cpu_mips_kseg0_to_phys, NULL, &entry, NULL,
                  &high, NULL, ELFDATA2LSB, EM_MIPS, 1, 0) > 0) {
+        *uimage_start = HWADDR_MAX;
         *end = cpu_mips_kseg0_to_phys(NULL, high);
         return entry;
     }
@@ -806,9 +812,9 @@ static uint64_t ingenic_load_kernel(const char *file, hwaddr *end)
         error_report("ingenic: %s: cannot decompress the kernel", file);
         exit(1);
     }
-    rom_add_blob_fixed("ingenic.kernel", data, n,
-                       cpu_mips_kseg0_to_phys(NULL, load));
-    *end = cpu_mips_kseg0_to_phys(NULL, load) + n;
+    *uimage_start = cpu_mips_kseg0_to_phys(NULL, load);
+    rom_add_blob_fixed("ingenic.kernel", data, n, *uimage_start);
+    *end = *uimage_start + n;
     return (int32_t)ep;
 }
 
@@ -827,7 +833,7 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
     const IngenicSocInfo *info = ims->info;
     g_autofree char *cmdline = NULL, *mem = NULL, *rd = NULL;
     const char *append = ms->kernel_cmdline;
-    hwaddr kend, args, initrd = 0;
+    hwaddr kend, uimage_start, args, initrd = 0;
     int64_t initrd_size = 0;
     uint64_t entry;
     uint32_t *argv;
@@ -837,7 +843,7 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
     size_t pos;
     uint8_t *buf;
 
-    entry = ingenic_load_kernel(ms->kernel_filename, &kend);
+    entry = ingenic_load_kernel(ms->kernel_filename, &kend, &uimage_start);
 
     if (ms->initrd_filename) {
         initrd = INITRD_OFFSET;
@@ -859,8 +865,8 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
     if (!append || !*append) {
         append = NULL;
     }
-    mem = (append && strstr(append, "mem=")) ? g_strdup("") :
-          ingenic_mem_args(ms->ram_size);
+    mem = (!ims->auto_mem || (append && strstr(append, "mem="))) ?
+          g_strdup("") : ingenic_mem_args(ms->ram_size);
     cmdline = g_strdup_printf("%s%s%s%s%s",
         append ? append : "console=ttyS1,115200n8 panic=20 init=/init",
         append ? "" : (initrd ? " root=/dev/ram0 rootfstype=squashfs" :
@@ -884,37 +890,99 @@ static void ingenic_kernel_boot(IngenicMachineState *ims)
         g_free(s);
     }
     if (initrd && initrd + initrd_size > ms->ram_size * 5 / 8 &&
-        !(append && strstr(append, "mem="))) {
+        ims->auto_mem && !(append && strstr(append, "mem="))) {
         warn_report("ingenic: the initrd ends past mem=; pass a larger "
                     "-m or a mem= that covers 0x%" PRIx64,
                     (uint64_t)(initrd + initrd_size));
     }
 
-    /* argv[0] = "", argv[1] = command line, envp = { memsize, NULL } */
     args = ms->ram_size - KERNEL_ARGS_RESERVE;
-    buf = g_malloc0(KERNEL_ARGS_RESERVE);
-    argv = (uint32_t *)buf;
-    pos = 32;
-    argv[0] = cpu_to_le32(cpu_mips_phys_to_kseg0(NULL, args + pos));
-    pos += 1;
-    argv[1] = cpu_to_le32(cpu_mips_phys_to_kseg0(NULL, args + pos));
-    pstrcpy((char *)buf + pos, KERNEL_ARGS_RESERVE - pos - 64, cmdline);
-    pos += strlen(cmdline) + 1;
-    argv[2] = 0;
-    /* envp at +16 */
-    argv[4] = cpu_to_le32(cpu_mips_phys_to_kseg0(NULL, args + pos));
-    argv[5] = 0;
-    snprintf((char *)buf + pos, 32, "memsize=%" PRIu64, ms->ram_size / MiB);
-    rom_add_blob_fixed("ingenic.args", buf, KERNEL_ARGS_RESERVE, args);
-    g_free(buf);
+    if (ms->dtb) {
+        int dt_size, len = 0;
+        void *fdt = load_device_tree(ms->dtb, &dt_size);
+        const char *dtb_args;
+        hwaddr dtb_pa;
 
-    /* what U-Boot leaves: UART1 programmed (LCR 8N1), then bootm */
-    bl_gen_write_u32(&p, 0xb0000000 | (UART_BASE + 0x1000 + 0x0c), 0x03);
-    bl_gen_jump_kernel(&p, true, cpu_mips_phys_to_kseg0(NULL, args),
-                       true, 2,
-                       true, cpu_mips_phys_to_kseg0(NULL, args),
-                       true, cpu_mips_phys_to_kseg0(NULL, args + 16),
-                       true, 0, entry);
+        if (!fdt) {
+            exit(1);
+        }
+        qemu_fdt_add_path(fdt, "/chosen");
+        dtb_args = qemu_fdt_getprop(fdt, "/chosen", "bootargs", &len, NULL);
+        if (append) {
+            qemu_fdt_setprop_string(fdt, "/chosen", "bootargs", cmdline);
+        } else if (dtb_args && len > 0 && *dtb_args &&
+                   memchr(dtb_args, '\0', len)) {
+            const char *m = (ims->auto_mem && !strstr(dtb_args, "mem=")) ?
+                            mem : "";
+            g_autofree char *chosen = g_strdup_printf("%s%s%s%s", dtb_args,
+                                                      *m ? " " : "", m,
+                                                      rd ? rd : "");
+
+            qemu_fdt_setprop_string(fdt, "/chosen", "bootargs", chosen);
+        } else {
+            qemu_fdt_setprop_string(fdt, "/chosen", "bootargs", cmdline);
+        }
+        if (ms->initrd_filename) {
+            qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-start", initrd);
+            qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-end",
+                                  initrd + initrd_size);
+        }
+        fdt_pack(fdt);
+        dt_size = fdt_totalsize(fdt);
+        if (initrd || uimage_start == HWADDR_MAX) {
+            dtb_pa = ROUND_UP(initrd ? initrd + initrd_size : kend, 64 * KiB);
+        } else if (uimage_start >= CAR_SIZE + dt_size) {
+            /* Low KSEG0 maps the locked cache until the guest unlocks it. */
+            dtb_pa = ROUND_DOWN(uimage_start - dt_size, 8);
+        } else {
+            /* The image occupies low RAM. Leave maximum room for its BSS. */
+            dtb_pa = args >= dt_size ? ROUND_DOWN(args - dt_size, 64 * KiB) : 0;
+            if (dtb_pa < kend) {
+                error_report("ingenic: no room for DTB above the uImage");
+                exit(1);
+            }
+        }
+        if (dtb_pa + dt_size > args) {
+            error_report("ingenic: DTB does not fit in RAM (0x%" PRIx64 " + 0x%x)",
+                         (uint64_t)dtb_pa, dt_size);
+            g_free(fdt);
+            exit(1);
+        }
+        rom_add_blob_fixed("ingenic.dtb", fdt, dt_size, dtb_pa);
+        g_free(fdt);
+
+        /* UHI: a0 = -2, a1 = KSEG0(dtb); UART1 LCR 8N1 as U-Boot leaves it */
+        bl_gen_write_u32(&p, 0xb0000000 | (UART_BASE + 0x1000 + 0x0c), 0x03);
+        bl_gen_jump_kernel(&p, true, cpu_mips_phys_to_kseg0(NULL, args),
+                           true, (uint32_t)-2,
+                           true, cpu_mips_phys_to_kseg0(NULL, dtb_pa),
+                           true, 0, true, 0, entry);
+    } else {
+        /* argv[0] = "", argv[1] = command line, envp = { memsize, NULL } */
+        buf = g_malloc0(KERNEL_ARGS_RESERVE);
+        argv = (uint32_t *)buf;
+        pos = 32;
+        argv[0] = cpu_to_le32(cpu_mips_phys_to_kseg0(NULL, args + pos));
+        pos += 1;
+        argv[1] = cpu_to_le32(cpu_mips_phys_to_kseg0(NULL, args + pos));
+        pstrcpy((char *)buf + pos, KERNEL_ARGS_RESERVE - pos - 64, cmdline);
+        pos += strlen(cmdline) + 1;
+        argv[2] = 0;
+        /* envp at +16 */
+        argv[4] = cpu_to_le32(cpu_mips_phys_to_kseg0(NULL, args + pos));
+        argv[5] = 0;
+        snprintf((char *)buf + pos, 32, "memsize=%" PRIu64, ms->ram_size / MiB);
+        rom_add_blob_fixed("ingenic.args", buf, KERNEL_ARGS_RESERVE, args);
+        g_free(buf);
+
+        /* what U-Boot leaves: UART1 programmed (LCR 8N1), then bootm */
+        bl_gen_write_u32(&p, 0xb0000000 | (UART_BASE + 0x1000 + 0x0c), 0x03);
+        bl_gen_jump_kernel(&p, true, cpu_mips_phys_to_kseg0(NULL, args),
+                           true, 2,
+                           true, cpu_mips_phys_to_kseg0(NULL, args),
+                           true, cpu_mips_phys_to_kseg0(NULL, args + 16),
+                           true, 0, entry);
+    }
     rom_add_blob_fixed("ingenic.bootrom", rom, (uint8_t *)p - rom,
                        BOOTROM_BASE);
 }
@@ -1004,6 +1072,10 @@ static void ingenic_init(MachineState *ms)
     int sensor_bus;
     int i;
 
+    if (ms->dtb && !ms->kernel_filename) {
+        error_report("ingenic: -dtb requires -kernel");
+        exit(1);
+    }
     ims->info = info;
     var = ingenic_variant(info->soc, ims->variant);
     if (!var) {
@@ -1046,6 +1118,14 @@ static void ingenic_init(MachineState *ms)
              */
             object_property_set_uint(OBJECT(dev), "config2",
                                      (2 << 8) | (5 << 4) | 7, &error_abort);
+        } else if (info->soc == INGENIC_T23) {
+            /*
+             * T23 L2: 128 KiB (U-Boot isvp_t23.h / Linux sc-jz.c), 8 ways
+             * of 32-byte lines -> 512 sets (SS 3, SL 4, SA 7), Config2.M set
+             */
+            object_property_set_uint(OBJECT(dev), "config2",
+                                     (1u << 31) | (3 << 8) | (4 << 4) | 7,
+                                     &error_abort);
         }
         /*
          * No hidden tlbwr shadow entries: on two cores the T40/T41 4.4
@@ -1886,8 +1966,15 @@ static void ingenic_init(MachineState *ms)
             sysbus_connect_irq(sbd, 0, ingenic_irq(ims, i ? IRQ_MSC1 :
                                                    IRQ_MSC0));
             if (i == 0) {
+                int cd = ims->msc0_cd >= 0 ? ims->msc0_cd : info->msc0_cd;
+
+                if (cd >= info->gpio_ports * 32) {
+                    error_report("msc0-cd=%d: out of GPIO range (0..%d)",
+                                 cd, info->gpio_ports * 32 - 1);
+                    exit(1);
+                }
                 qdev_connect_gpio_out_named(dev, "cd", 0,
-                        qdev_get_gpio_in(gpio, info->msc0_cd));
+                        qdev_get_gpio_in(gpio, cd));
             }
             if (di) {
                 DeviceState *card = qdev_new(TYPE_SD_CARD);
@@ -1972,7 +2059,37 @@ static void ingenic_set_sensor(Object *obj, const char *value, Error **errp)
 
 static void ingenic_machine_instance_init(Object *obj)
 {
-    INGENIC_MACHINE(obj)->sensor_bus = -1;
+    IngenicMachineState *ims = INGENIC_MACHINE(obj);
+
+    ims->sensor_bus = -1;
+    ims->msc0_cd = -1;
+    ims->auto_mem = true;
+}
+
+static char *ingenic_get_msc0_cd(Object *obj, Error **errp)
+{
+    return g_strdup_printf("%d", INGENIC_MACHINE(obj)->msc0_cd);
+}
+
+static void ingenic_set_msc0_cd(Object *obj, const char *value, Error **errp)
+{
+    int cd;
+
+    if (qemu_strtoi(value, NULL, 0, &cd) < 0 || cd < -1) {
+        error_setg(errp, "msc0-cd: -1 or a GPIO number (port * 32 + pin)");
+        return;
+    }
+    INGENIC_MACHINE(obj)->msc0_cd = cd;
+}
+
+static bool ingenic_get_auto_mem(Object *obj, Error **errp)
+{
+    return INGENIC_MACHINE(obj)->auto_mem;
+}
+
+static void ingenic_set_auto_mem(Object *obj, bool value, Error **errp)
+{
+    INGENIC_MACHINE(obj)->auto_mem = value;
 }
 
 static char *ingenic_get_sensor_bus(Object *obj, Error **errp)
@@ -2088,14 +2205,25 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
         ingenic_get_flash_type, ingenic_set_flash_type);
     object_class_property_set_description(oc, "flash-type",
         "flash part: an m25p80 NOR, default by size w25q64 (8 MiB), "
-        "mx25l12805d (16 MiB), w25q256 (32 MiB); or a SPI NAND, w25n01gv "
-        "(128/132 MiB), gd5f1gq4ub (136 MiB), gd5f2gq4ub (256/272 MiB), "
-        "mx35lf2ge4ab (264 MiB); gd5f1gq5ue (136 MiB) by name only");
+        "mx25l12805d (16 MiB), w25q256 (32 MiB), zb25vq64 (8 MiB), "
+        "zb25vq128 (16 MiB); or a SPI NAND, w25n01gv (128/132 MiB), "
+        "gd5f1gq4ub (136 MiB), gd5f2gq4ub (256/272 MiB), mx35lf2ge4ab "
+        "(264 MiB); gd5f1gq5ue (136 MiB) by name only");
     object_class_property_add_str(oc, "variant",
         ingenic_get_variant, ingenic_set_variant);
     object_class_property_set_description(oc, "variant",
         "the grade within the family the SoC reports in CPPSR and the "
         "EFUSE (e.g. t31x, t40xp, t41lq); DRAM is still -m");
+    object_class_property_add_str(oc, "msc0-cd",
+        ingenic_get_msc0_cd, ingenic_set_msc0_cd);
+    object_class_property_set_description(oc, "msc0-cd",
+        "MSC0 card-detect GPIO (port * 32 + pin, e.g. 61 for PB29); "
+        "-1 (default) uses the SoC's reference pin");
+    object_class_property_add_bool(oc, "auto-mem",
+        ingenic_get_auto_mem, ingenic_set_auto_mem);
+    object_class_property_set_description(oc, "auto-mem",
+        "-kernel: append OpenIPC mem=/rmem= when absent from -append "
+        "(default on; off lets the DTB memory node size RAM)");
     object_class_property_add_str(oc, "sensor-bus",
         ingenic_get_sensor_bus, ingenic_set_sensor_bus);
     object_class_property_set_description(oc, "sensor-bus",
@@ -2106,13 +2234,14 @@ static void ingenic_machine_class_init(ObjectClass *oc, const void *data)
         ingenic_get_sensor, ingenic_set_sensor);
     object_class_property_set_description(oc, "sensor",
         "image sensor on the sensor I2C bus: none (default), gc2053, "
-        "gc2083, gc4653, gc4663, sc2336, sc2335, jxf37, jxf22, jxf23, jxq03, "
-        "ov2735b, ov2735");
+        "gc2083, gc4653, gc4663, sc2336, sc2335, sc1a4t, sc1a4ts1, "
+        "sc2336p, sc2336ps1, sc2337p, sc2337ps1, jxf37, jxf22, jxf23, "
+        "jxq03, ov2735b, ov2735");
     object_class_property_add_str(oc, "sensor1",
         ingenic_get_sensor1, ingenic_set_sensor1);
     object_class_property_set_description(oc, "sensor1",
-        "T40: a second image sensor, on I2C3 (CSI1, the second pipe); the "
-        "same names as sensor=");
+        "T23: second image sensor on I2C0 (MIPI port 1); T40: second image "
+        "sensor on I2C3 (CSI1, the second pipe); the same names as sensor=");
     object_class_property_add_str(oc, "sensor2",
         ingenic_get_sensor2, ingenic_set_sensor2);
     object_class_property_set_description(oc, "sensor2",

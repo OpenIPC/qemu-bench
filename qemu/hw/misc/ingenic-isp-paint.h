@@ -27,6 +27,8 @@
 #ifndef HW_MISC_INGENIC_ISP_PAINT_H
 #define HW_MISC_INGENIC_ISP_PAINT_H
 
+#include "ingenic-color.h"
+
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "aw-vinc-logo.h"
@@ -197,16 +199,26 @@ static inline uint8_t *isp_line(IngenicIspPainter *p, uint32_t n)
 
 /*
  * Frame @frame, @w x @h, into the buffer at @ya (Y) / @uva (CbCr pairs,
- * CrCb with @vu).  A stride of 0 is the width; a negative one (vertical
- * flip) walks up from the address.
+ * CrCb with @vu), optionally mirrored/flipped (@hflip/@vflip).  A stride of 0
+ * is the width; a negative one (vertical flip) walks up from the address.
  */
-static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
-                                     uint32_t w, uint32_t h, int32_t ys,
-                                     int32_t uvs, hwaddr ya, hwaddr uva,
-                                     bool vu, uint32_t gain, uint32_t sgain)
+static inline void ingenic_isp_paint_ex(IngenicIspPainter *p, uint32_t frame,
+                                        uint32_t w, uint32_t h, int32_t ys,
+                                        int32_t uvs, hwaddr ya, hwaddr uva,
+                                        bool vu, bool hflip, bool vflip,
+                                        uint32_t gain, uint32_t sgain,
+                                        uint32_t wb_r_q10, uint32_t wb_b_q10)
 {
     int dot_x = sstar_pattern_dot_x(frame);
     int cell = MAX(h / 54, 1);
+    bool wb_on = abs((int)wb_r_q10 - 1024) > 2 ||
+                 abs((int)wb_b_q10 - 1024) > 2;
+    int wb_gr = wb_on ?
+        (int)lround(pow(MAX(wb_r_q10, 1u) / 1024.0, 1.0 / 2.2) * 1024.0) :
+        1024;
+    int wb_gb = wb_on ?
+        (int)lround(pow(MAX(wb_b_q10, 1u) / 1024.0, 1.0 / 2.2) * 1024.0) :
+        1024;
     uint32_t x, y;
     uint8_t *l;
     uint8_t yuv[3];
@@ -218,14 +230,15 @@ static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
     uvs = uvs ? uvs : (int32_t)w;
     l = isp_line(p, w + 2);
     for (y = 0; y < h; y++) {
-        int py = (int64_t)y * SSTAR_PAT_H / h;
+        uint32_t sy = vflip ? h - 1 - y : y;
+        int py = (int64_t)sy * SSTAR_PAT_H / h;
         bool scene = (py >= SSTAR_PAT_LOGO_Y &&
                       py < SSTAR_PAT_LOGO_Y + AW_VINC_LOGO_H) ||
                      abs(py - SSTAR_PAT_DOT_Y) <= SSTAR_PAT_DOT_R + 1;
-        bool count = y < (uint32_t)cell * 8;
-        bool wedge = isp_wedge_row(h, y);
+        bool count = sy < (uint32_t)cell * 8;
+        bool wedge = isp_wedge_row(h, sy);
 
-        sstar_pattern_pixel(frame, w, h, 0, y, yuv);
+        sstar_pattern_pixel(frame, w, h, 0, sy, yuv);
         memset(l, lit[yuv[0]], w);
         for (x = 0; wedge && x < w; x++) {
             int i = isp_wedge_patch(w, x);
@@ -236,45 +249,87 @@ static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
         }
         for (x = 0; (scene || count) && x < w; x++) {
             if (scene) {
-                unsigned a = sstar_pattern_cover(dot_x, w, h, x, y);
+                unsigned a = sstar_pattern_cover(dot_x, w, h, x, sy);
 
                 l[x] = lit[yuv[0] + (235 - yuv[0]) * (int)a / 255];
             }
-            if (count && isp_counter_box(w, h, x, y)) {
-                l[x] = isp_counter_lit(frame, w, h, x, y) ? 235 : 16;
+            if (count && isp_counter_box(w, h, x, sy)) {
+                l[x] = isp_counter_lit(frame, w, h, x, sy) ? 235 : 16;
+            }
+        }
+        if (hflip) {
+            for (x = 0; x < w / 2; x++) {
+                uint8_t t = l[x];
+
+                l[x] = l[w - 1 - x];
+                l[w - 1 - x] = t;
             }
         }
         dma_memory_write(&address_space_memory, ya + (int64_t)y * ys, l, w,
                          MEMTXATTRS_UNSPECIFIED);
     }
     for (y = 0; y < h / 2; y++) {
-        int py = (int64_t)(2 * y) * SSTAR_PAT_H / h;
+        uint32_t sy = (vflip ? h / 2 - 1 - y : y) * 2;
+        uint32_t nw = w & ~1u;
+        int py = (int64_t)sy * SSTAR_PAT_H / h;
         bool scene = (py >= SSTAR_PAT_LOGO_Y - 2 &&
                       py < SSTAR_PAT_LOGO_Y + AW_VINC_LOGO_H) ||
                      abs(py - SSTAR_PAT_DOT_Y) <= SSTAR_PAT_DOT_R + 2;
-        bool count = 2 * y < (uint32_t)cell * 8;
-        bool wedge = isp_wedge_row(h, 2 * y);
+        bool count = sy < (uint32_t)cell * 8;
+        bool wedge = isp_wedge_row(h, sy);
         uint8_t bg[3];
 
-        sstar_pattern_pixel(frame, w, h, 0, 2 * y, bg);
+        sstar_pattern_pixel(frame, w, h, 0, sy, bg);
         for (x = 0; x + 1 < w; x += 2) {
             if (scene || wedge) {
-                ingenic_scene_pixel(frame, w, h, x, 2 * y, yuv);
+                ingenic_scene_pixel(frame, w, h, x, sy, yuv);
             } else {
                 memcpy(yuv, bg, sizeof(yuv));
             }
-            if (count && isp_counter_box(w, h, x, 2 * y)) {
+            if (count && isp_counter_box(w, h, x, sy)) {
                 yuv[1] = yuv[2] = 128;
-            } else if (gain != 256 || sgain) {
-                yuv[1] = isp_chroma(yuv[1], cs[yuv[0]]);
-                yuv[2] = isp_chroma(yuv[2], cs[yuv[0]]);
+            } else {
+                if (wb_on) {
+                    IngenicRGB rgb = ingenic_yuv_to_rgb(yuv[0], yuv[1], yuv[2]);
+                    int r = MIN((rgb.r * wb_gr + 512) >> 10, 255);
+                    int g = rgb.g;
+                    int b = MIN((rgb.b * wb_gb + 512) >> 10, 255);
+
+                    yuv[1] = MIN(MAX(128 + ((-152 * r - 298 * g + 450 * b +
+                                             512) >> 10), 16), 240);
+                    yuv[2] = MIN(MAX(128 + ((450 * r - 377 * g - 73 * b +
+                                             512) >> 10), 16), 240);
+                }
+                if (gain != 256 || sgain) {
+                    yuv[1] = isp_chroma(yuv[1], cs[yuv[0]]);
+                    yuv[2] = isp_chroma(yuv[2], cs[yuv[0]]);
+                }
             }
             l[x] = yuv[vu ? 2 : 1];
             l[x + 1] = yuv[vu ? 1 : 2];
         }
+        if (hflip) {
+            for (x = 0; x + 1 < nw / 2; x += 2) {
+                uint8_t tu = l[x], tv = l[x + 1];
+
+                l[x] = l[nw - 2 - x];
+                l[x + 1] = l[nw - 1 - x];
+                l[nw - 2 - x] = tu;
+                l[nw - 1 - x] = tv;
+            }
+        }
         dma_memory_write(&address_space_memory, uva + (int64_t)y * uvs, l,
-                         w & ~1u, MEMTXATTRS_UNSPECIFIED);
+                         nw, MEMTXATTRS_UNSPECIFIED);
     }
+}
+
+static inline void ingenic_isp_paint(IngenicIspPainter *p, uint32_t frame,
+                                     uint32_t w, uint32_t h, int32_t ys,
+                                     int32_t uvs, hwaddr ya, hwaddr uva,
+                                     bool vu, uint32_t gain, uint32_t sgain)
+{
+    ingenic_isp_paint_ex(p, frame, w, h, ys, uvs, ya, uva, vu, false, false,
+                         gain, sgain, 1024, 1024);
 }
 
 #endif /* HW_MISC_INGENIC_ISP_PAINT_H */

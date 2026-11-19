@@ -68,8 +68,10 @@ static const ImageSensorSpec image_sensors[] = {
 
     /* GalaxyCore */
     GC8("gc1054", 0x21, 0x1054),
-    GC8("gc2053", 0x37, 0x2053),
-    GC8("gc2053s1", 0x3F, 0x2053),      /* T23 SDK's second sensor */
+    { "gc2053", GALAXYCORE, 0x37, 0x2053, 0xF0, false,
+      .pclk = 74250000, .hts = 2200 },
+    { "gc2053s1", GALAXYCORE, 0x3F, 0x2053, 0xF0, false,
+      .pclk = 74250000, .hts = 2200 },  /* T23 SDK's second sensor */
     GC8("gc2063", 0x37, 0x2063),
     GC16("gc2083", 0x37, 0x2083),
     GC16("gc2093", 0x37, 0x2093),
@@ -91,7 +93,20 @@ static const ImageSensorSpec image_sensors[] = {
     { "sc2315e", SMARTSENS, 0x30, 0x2238, .disc = 0x20, .gain_fine = 0x10,
       .pclk = 74250000 },
     SC("sc2335", 0xCB14),
-    SC("sc2336", 0xCB3A),
+    { "sc2336", SMARTSENS, 0x30, 0xCB3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2336p", SMARTSENS, 0x30, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2336ps1", SMARTSENS, 0x32, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2337p", SMARTSENS, 0x30, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2337ps1", SMARTSENS, 0x32, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc1a4t", SMARTSENS, 0x30, 0xDA4D, .pclk = 72000000, .hts = 1600,
+      .exp_rows = true },
+    { "sc1a4ts1", SMARTSENS, 0x32, 0xDA4D, .pclk = 72000000, .hts = 1600,
+      .exp_rows = true },
     SC("sc307h", 0xCB1C),
     SC("sc401ai", 0xCD2E),
     SC("sc431hai", 0xCD6B),
@@ -175,6 +190,8 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_bit(dev, "reg16", spec->reg16);
         qdev_prop_set_uint16(dev, "id-reg", spec->id_reg);
         qdev_prop_set_uint16(dev, "id", spec->id);
+        qdev_prop_set_uint32(dev, "pclk", spec->pclk);
+        qdev_prop_set_uint16(dev, "hts", spec->hts);
     } else if (!strcmp(spec->type, SMARTSENS)) {
         qdev_prop_set_uint8(dev, "id_high", spec->id >> 8);
         qdev_prop_set_uint8(dev, "id_low", spec->id & 0xFF);

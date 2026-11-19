@@ -1,0 +1,22 @@
+m25p80: add Zbit ZB25VQ64 and ZB25VQ128 SPI NOR
+
+Both parts support 4 KiB and 32 KiB erases, Winbond fast-read dummy
+cycles and the SR2 quad-enable bit.
+
+---
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -368,3 +368,7 @@
+     /* Microchip */
+     { INFO("25csm04",      0x29cc00,      0x100,  64 << 10,  8, 0) },
++
++    /* Zbit */
++    { INFO("zb25vq64",     0x5e4017,      0,  64 << 10, 128, ER_4K | ER_32K) },
++    { INFO("zb25vq128",    0x5e4018,      0,  64 << 10, 256, ER_4K | ER_32K) },
+ };
+@@ -540,4 +544,5 @@
+         return MAN_NUMONYX;
+     case 0xEF:
++    case 0x5E:
+         return MAN_WINBOND;
+     case 0x01:
