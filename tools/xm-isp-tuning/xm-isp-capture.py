@@ -20,8 +20,8 @@ force on the camera, block by block, as the SDK's own structures -- ready for
 
 The AE and AWB readings the App's monitor reacts to are synthetic: ISO
 --iso, colour temperature --ct. --then ADDR:ARG calls another App function
-after the monitor stops (the profile's apply_day_night with 1 applies the
-night set).
+after the monitor stops: the profile's apply_day_night with 0 applies the
+App's IR night set, with 1 its day set.
 """
 import argparse
 import json

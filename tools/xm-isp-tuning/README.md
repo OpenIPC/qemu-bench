@@ -115,9 +115,14 @@ twin's daylight values; the ISO-indexed tables do not depend on that.
 
 ## Not covered
 
-- The App's night (IR) half: `--then 0x362958:1` applies it after the
-  monitor (the profile's `apply_day_night`), but nothing here has been
-  measured at night with IR.
+- The App's night (IR) half: `--then 0x362958:0` applies it after the
+  monitor (the profile's `apply_day_night`); `:1` is the day half. The
+  argument is the App's own (its monitor passes `mode == 0` for day, the
+  test that also picks the day DRC table). Checked one way only: with `:1`
+  the capture reproduces the twin's daylight sharpen and LCE blocks byte
+  for byte, and STNR and BNR to a few scene-driven bytes. With `:0`, those
+  blocks, dehaze and the AWB bypass differ. Nothing here has been measured
+  at night with IR.
 - Daylight: the tables are ISO-indexed, but only low light was compared.
 - Other sensors and App builds: the sensor is an argument; the addresses are
   this App build's (`app_md5` in the profile). Another build needs its own
