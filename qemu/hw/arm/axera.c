@@ -88,6 +88,7 @@ struct AxeraMachineState {
     MachineState parent_obj;
     char *flash_file;
     char *uboot_file;
+    char *chip;
 };
 
 /* CONFIG_SYS_TEXT_BASE from the vendor U-Boot's own AX630C defconfig --
@@ -245,6 +246,136 @@ static void axera_ax620q_spl_handoff_reset(void *opaque)
                          AXERA_BOOT_KEY_RELEASED, attrs, NULL);
 }
 
+/*
+ * Which part of the family this is, as the software reads it from the
+ * hardware (ipctool, the vendor ax_hwinfo driver).
+ *
+ * AX620E family: the SDK's BL1 (boot/bl1/board/board.c get_misc_info())
+ * reads eFuse block 2 (CHIP_BOND_BLK) through EFSC0's shadow register,
+ * EFSC0_BASE 0x02200000 + EFSC_SHADOW_0 0x58 + blk * 4, and takes bits
+ * 31:24 as the chip type, Hamming(7,4)-encoded (hanming_decode_74():
+ * type in bits 6:3, parity in 2:0). store_chip_type() writes the decoded
+ * type to COMMON_SYS_GLB 0x02340000 + DUMMY_SW9 0x220. Under flash-file=
+ * BL1 does that itself from the fuse word; -kernel and uboot-file= skip
+ * BL1, so the reset hook writes DUMMY_SW9 as BL1 would. Types from
+ * boot/bl1/board/include/boot_mode.h chip_type_e.
+ *
+ * AX620U family: the stock firmware's ax_hwinfo.ko names the part from
+ * ax_sys.ko's ax_ddr_bits_read() (bit 24 of the DDR controller's
+ * 0x00102068: clear on AX620U) and the bond option register 0x0222001C
+ * (all of 0x191800 set: AX620D, otherwise AX620A). 0x00102068 is a DDR
+ * controller setting the SPL programs (the stock AX620U dump's leaves
+ * 0x00010000), so under flash-file= the SPL's value wins over chip=, as
+ * on the board; chip= decides it for -kernel boots.
+ */
+#define AXERA_EFSC0_SHADOW_BLK2     (0x02200000ULL + 0x58 + 2 * 4)
+#define AXERA_DUMMY_SW9             (0x02340000ULL + 0x220)
+#define AXERA_AX620U_DDRMC_2068     0x00102068ULL
+#define AXERA_AX620U_DDR_BITS       (1U << 24)
+#define AXERA_AX620U_BOND_OPT       0x0222001cULL
+#define AXERA_AX620U_BOND_AX620D    0x00191800U
+
+static const struct {
+    const char *name;
+    bool ax620x;
+    uint32_t type;          /* chip_type_e; AX620U family: unused */
+    uint32_t ddrmc_2068;    /* AX620U family */
+    uint32_t bond_opt;      /* AX620U family */
+} axera_chips[] = {
+    { "ax620q",    false, 1 },
+    { "ax620qx",   false, 2 },
+    { "ax620v200", false, 3 },
+    { "ax630c",    false, 4 },
+    { "ax631",     false, 5 },
+    { "ax620qz",   false, 6 },
+    { "ax620qp",   false, 7 },
+    { "ax620qe",   false, 8 },
+    { "ax620qf",   false, 9 },
+    { "ax620u",    true,  0, 0, 0 },
+    { "ax620a",    true,  0, AXERA_AX620U_DDR_BITS, 0 },
+    { "ax620d",    true,  0, AXERA_AX620U_DDR_BITS, AXERA_AX620U_BOND_AX620D },
+};
+
+/* The inverse of hanming_decode_74(): the syndrome column of type bits
+ * 3..6 is 3, 5, 6, 7, and parity bits 0..2 have columns 1, 2, 4. */
+static uint8_t axera_hamming74_encode(uint32_t type)
+{
+    static const uint8_t column[4] = { 3, 5, 6, 7 };
+    uint8_t parity = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (type & (1U << i)) {
+            parity ^= column[i];
+        }
+    }
+    return (type & 0xf) << 3 | parity;
+}
+
+static void axera_chip_id_reset(void *opaque)
+{
+    int n = (uintptr_t)opaque;
+    AddressSpace *as = &address_space_memory;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+
+    if (axera_chips[n].ax620x) {
+        address_space_stl_le(as, AXERA_AX620U_DDRMC_2068,
+                             axera_chips[n].ddrmc_2068, attrs, NULL);
+        address_space_stl_le(as, AXERA_AX620U_BOND_OPT,
+                             axera_chips[n].bond_opt, attrs, NULL);
+    } else {
+        address_space_stl_le(as, AXERA_EFSC0_SHADOW_BLK2,
+                             (uint32_t)axera_hamming74_encode(
+                                 axera_chips[n].type) << 24,
+                             attrs, NULL);
+        address_space_stl_le(as, AXERA_DUMMY_SW9, axera_chips[n].type,
+                             attrs, NULL);
+    }
+}
+
+/*
+ * Registered once the machine is built, so the hook runs after the device
+ * resets: AX620U's bond option register sits in the window the smp-wake
+ * device (axera-ax620u-smp-wake.c) clears on reset.
+ */
+static size_t axera_chip_index;
+
+static void axera_chip_id_register(Notifier *notifier, void *data)
+{
+    qemu_register_reset(axera_chip_id_reset,
+                        (void *)(uintptr_t)axera_chip_index);
+}
+
+static Notifier axera_chip_id_notifier = {
+    .notify = axera_chip_id_register,
+};
+
+static void axera_chip_id_init(MachineState *machine, const AxeraSoCConfig *c)
+{
+    const char *chip = AXERA_MACHINE(machine)->chip;
+    size_t n;
+
+    if (!chip || !chip[0]) {
+        chip = c->default_chip;
+    }
+    for (n = 0; n < ARRAY_SIZE(axera_chips); n++) {
+        if (!strcmp(chip, axera_chips[n].name) &&
+            axera_chips[n].ax620x == c->is_ax620x) {
+            axera_chip_index = n;
+            qemu_add_machine_init_done_notifier(&axera_chip_id_notifier);
+            return;
+        }
+    }
+    error_report("axera: %s: chip=%s is not a part of this family; one of:",
+                 MACHINE_GET_CLASS(machine)->name, chip);
+    for (n = 0; n < ARRAY_SIZE(axera_chips); n++) {
+        if (axera_chips[n].ax620x == c->is_ax620x) {
+            error_printf("  %s\n", axera_chips[n].name);
+        }
+    }
+    exit(1);
+}
+
 typedef struct {
     ARMCPU *cpu;
     uint64_t entry;
@@ -333,6 +464,9 @@ static const struct {
      * real emmc_init_card() sequence instead.
      */
     { "axera-chipmode",     0x02390000, 0x1000 },
+    /* EFSC0, the eFuse controller: its shadow registers carry the chip
+     * type axera_chip_id_reset() presets (see axera_chip_id_init()). */
+    { "axera-efsc0",        0x02200000, 0x1000 },
     { "axera-tsensor",      0x02000000, 0x1000 },
     { "axera-clk-cpu",      0x01900000, 0x10000 },
     { "axera-clk-common",   0x02340000, 0x10000 },
@@ -580,6 +714,7 @@ static const AxeraSoCConfig ax630c_soc = {
     .ram_size_default  = 2 * GiB,
     .uart0_base        = AXERA_UART0_BASE,
     .uart0_irq         = AXERA_UART0_IRQ,
+    .default_chip      = "ax630c",   /* the NanoKVM-Pro's part */
 };
 
 /*
@@ -597,6 +732,10 @@ static const AxeraSoCConfig ax620e_soc = {
     .flash_is_nor      = true,
     .uart0_base        = AXERA_UART0_BASE,
     .uart0_irq         = AXERA_UART0_IRQ,
+    /* The camera's part is not recorded anywhere in its firmware; AX620Q
+     * is the family's camera part. Unfused (chip=ax630c) is what BL1
+     * reported here before the eFuse was modelled. */
+    .default_chip      = "ax620q",
 };
 
 /*
@@ -1277,6 +1416,7 @@ static void axera_a64_init(MachineState *machine, const AxeraSoCConfig *c)
         error_report("axera: at most %zu CPUs", ARRAY_SIZE(cpu));
         exit(1);
     }
+    axera_chip_id_init(machine, c);
 
     /*
      * flash-file= boots the real BL1, which genuinely starts at EL3
@@ -1671,6 +1811,29 @@ static void axera_machine_set_uboot_file(Object *obj, const char *value,
     s->uboot_file = g_strdup(value);
 }
 
+static char *axera_machine_get_chip(Object *obj, Error **errp)
+{
+    return g_strdup(AXERA_MACHINE(obj)->chip);
+}
+
+static void axera_machine_set_chip(Object *obj, const char *value,
+                                   Error **errp)
+{
+    AxeraMachineState *s = AXERA_MACHINE(obj);
+
+    g_free(s->chip);
+    s->chip = g_strdup(value);
+}
+
+#define AXERA_CHIP_PROPERTY(oc)                                        \
+    object_class_property_add_str(oc, "chip", axera_machine_get_chip,  \
+                                  axera_machine_set_chip);             \
+    object_class_property_set_description(oc, "chip",                 \
+        "The part the eFuse/bond registers report: ax620q, ax620qx, "  \
+        "ax620v200, ax630c, ax631, ax620qz, ax620qp, ax620qe or "      \
+        "ax620qf on the AX620E family, ax620u, ax620a or ax620d on "   \
+        "AX620U")
+
 #define DEFINE_AXERA_A64_MACHINE(namestr, tag, config)                \
     static void tag##_init(MachineState *machine)                     \
     {                                                                 \
@@ -1700,6 +1863,7 @@ static void axera_machine_set_uboot_file(Object *obj, const char *value,
             "A real U-Boot binary (CONFIG_SYS_TEXT_BASE link layout), "\
             "injected at 0x5c000400 with CPU0 starting there -- skips "\
             "BL1/SPL's own DDR/PLL bring-up, with no -kernel.");       \
+        AXERA_CHIP_PROPERTY(oc);                                       \
     }                                                                 \
     DEFINE_MACHINE_EXTENDED(namestr, AXERA_MACHINE, AxeraMachineState, \
                             tag##_class_init, false,                    \
@@ -1719,6 +1883,7 @@ static const AxeraSoCConfig ax620q_soc = {
     .ram_size_default  = 256 * MiB,
     .uart0_base        = AXERA_UART0_BASE,
     .uart0_irq         = AXERA_UART0_IRQ,
+    .default_chip      = "ax620qf",  /* as misc_info above */
 };
 
 /*
@@ -1785,6 +1950,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
         error_report("axera: at most %zu CPUs", ARRAY_SIZE(cpu));
         exit(1);
     }
+    axera_chip_id_init(machine, c);
 
     for (n = 0; n < smp_cpus; n++) {
         Object *cpuobj = object_new(machine->cpu_type);
@@ -2899,6 +3065,7 @@ static void axera_32_init(MachineState *machine, const AxeraSoCConfig *c)
             "and injects its own BL1-equivalent at its real on-dump " \
             "link address, with no -kernel. AX620U only -- AX620Q "   \
             "has no BL1 replay path yet.");                             \
+        AXERA_CHIP_PROPERTY(oc);                                       \
     }                                                                 \
     DEFINE_MACHINE_EXTENDED(namestr, AXERA_MACHINE, AxeraMachineState, \
                             tag##_class_init, false,                    \
@@ -2932,6 +3099,7 @@ static const AxeraSoCConfig ax620u_soc = {
     .is_ax620x         = true,
     .max_cpus          = 4,
     .smp_bootreg_addr  = 0x02220300ULL,
+    .default_chip      = "ax620u",   /* the dump's board: AX620U_38board */
 };
 
 DEFINE_AXERA_MACHINE("ax620u", ax620u, ax620u_soc)

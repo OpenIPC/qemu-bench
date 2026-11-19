@@ -206,6 +206,33 @@ media. `flash-file=` (BL1 included, the real boot-ROM-readable path) is
 further along but not yet complete -- see "What is not here yet"
 below.
 
+### Which part (`chip=`)
+
+Software tells the parts of a family apart by registers, and `chip=`
+sets what those registers say:
+
+- AX620E family (`ax630c`, `ax620e`, `ax620q`): the chip type in bits
+  31:24 of eFuse block 2, read through EFSC0's shadow register at
+  `0x02200060` (`EFSC0_BASE 0x02200000 + EFSC_SHADOW_0 0x58 + 2 * 4`),
+  Hamming(7,4)-encoded the way BL1's `hanming_decode_74()` decodes it,
+  and the decoded type in `DUMMY_SW9` (`0x02340220`), where BL1's
+  `store_chip_type()` leaves it. `ax620q`, `ax620qx`, `ax620v200`,
+  `ax630c`, `ax631`, `ax620qz`, `ax620qp`, `ax620qe`, `ax620qf`
+  (`boot_mode.h` `chip_type_e` 1-9). Defaults: `ax630c` on `ax630c`,
+  `ax620qf` on `ax620q` (the NanoKVM-Go, as its misc_info), `ax620q` on
+  `ax620e`.
+- AX620U family (`ax620u`): the stock `ax_hwinfo.ko`'s rule -- bit 24 of
+  the DDR controller's `0x00102068` clear is AX620U; set, it is AX620D
+  when `0x0222001C` has every bit of `0x191800`, AX620A otherwise.
+  `ax620u` (default), `ax620a`, `ax620d`. `0x00102068` is a DDR
+  controller setting the SPL writes (`0x00010000` on the stock AX620U
+  dump), so under `flash-file=` the SPL decides the DDR bit, as on the
+  board; `chip=` decides it for `-kernel`.
+
+```
+qemu-system-aarch64 -M ax620e,chip=ax630c ...
+```
+
 ## What is not here yet, and why
 
 - **Flash boot (`flash-file=`, BL1 included) is in progress, not yet
