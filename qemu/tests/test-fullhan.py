@@ -51,6 +51,11 @@ vendor drivers (docs/fullhan.md):
     reset, at the sensor's 40 ms, their interrupts, NV12 at the address
     latched at the frame's start, zone and AWB statistics at the light's
     ratios, a sensor exposure showing three frame events later;
+  - fh8626v100's JPEG (fh-jpeg) and H.264 (fh-pae) engines, programmed as
+    OpenIPC's drivers do: the JPEG's ID, a whole JFIF at the coded size,
+    rotation, decoded by PIL where it is installed; the PAE's reset, its
+    header FIFO leading the escaped payload, the bit count and interrupt,
+    a P picture predicted from the IDR's reconstruction, a small ring;
   - fh8632: its chip and variant IDs, the PTS counter at 0xE7000040, and
     the RTC v1's direct counter, sync bits and set-up magic;
   - outside qtest: machine state migrates to a file and back.
@@ -1173,6 +1178,177 @@ def test_fh8626_isp(qemu):
         qt.close()
 
 
+JPEG = 0xE8300000
+PAE = 0xE7000000
+# Annex K luminance and chrominance quantisers, natural order, and the
+# zigzag scan the driver writes them in (fh8626-jpeg.c)
+JPEG_ZIGZAG = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+JPEG_QL = [
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
+
+
+def jpeg_picture(qt, w, h, rot, src, dst):
+    """Program a picture the way fh8626_jpeg_worker() does; its SOF0 size."""
+    cw, ch = (h, w) if rot & 1 else (w, h)
+    q = bytes(JPEG_QL[z] for z in JPEG_ZIGZAG) * 2
+    for i in range(0, 128, 4):
+        qt.writel(JPEG + 0x80 + i, struct.unpack('<I', q[i:i + 4])[0])
+    qt.writel(JPEG + 0x14, ch << 16 | 0x0112)
+    qt.writel(JPEG + 0x1C, cw << 16)
+    qt.writel(JPEG + 0x3C, src)
+    qt.writel(JPEG + 0x40, src + w * h)
+    qt.writel(JPEG + 0x58, w << 16 | rot << 8 | 2 << 4 | 1)
+    qt.writel(JPEG + 0x08, 3)
+    qt.writel(JPEG + 0x34, dst)
+    qt.writel(JPEG + 0x38, dst)
+    qt.writel(JPEG + 0x50, 0x10000)
+    qt.writel(JPEG + 0x10, 0x80000001)
+    qt.step(3000000)
+    n = qt.readl(JPEG + 0x0C)
+    data = qt.read(dst, n)
+    i = data.find(b'\xff\xc0')
+    sof = data[i + 5:i + 9] if i > 0 else b''
+    return n, data, sof
+
+
+def test_fh8626_jpeg(qemu):
+    """FH8626V100's JPEG engine as OpenIPC's fh8626-jpeg.c drives it."""
+    print('fh8626v100: the JPEG encoder (fh-jpeg)')
+    qt = QTest(qemu, 'fh8626v100')
+    src, dst = 0xA1000000, 0xA1100000
+    w, h = 64, 32
+    try:
+        check('HW_ID', qt.readl(JPEG), 0x00038401)
+        # a horizontal ramp, grey chroma
+        qt.write(src, bytes(4 * x for x in range(w)) * h +
+                 bytes([128]) * (w * h // 2))
+        n, data, sof = jpeg_picture(qt, w, h, 0, src, dst)
+        check('done: INT_STATUS bit 0, IRQ 8',
+              (qt.readl(JPEG + 0x04), qt.readl(INTC + 0x18) >> 8 & 1) ==
+              (1, 1), True)
+        qt.writel(JPEG + 0x04, 1)
+        check('cleared', qt.readl(INTC + 0x18) >> 8 & 1, 0)
+        check('a whole JFIF: SOI ... EOI', data[:2] + data[-2:],
+              b'\xff\xd8\xff\xd9')
+        check('SOF0 at the coded size', sof, struct.pack('>HH', h, w))
+        try:
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(data)).convert('L')
+            row = [im.getpixel((x, 16)) for x in (2, 32, 61)]
+            check('decodes, the ramp rising left to right',
+                  im.size == (w, h) and row[0] < row[1] < row[2], True)
+        except ImportError:
+            print('  SKIP: decoding (no PIL)')
+        n, data, sof = jpeg_picture(qt, w, h, 1, src, dst)
+        check('rotated 90 degrees: SOF0 turned', sof,
+              struct.pack('>HH', w, h))
+        try:
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(data)).convert('L')
+            col = [im.getpixel((16, y)) for y in (2, 32, 61)]
+            check('the ramp runs top to bottom', col[0] < col[1] < col[2],
+                  True)
+        except ImportError:
+            pass
+    finally:
+        qt.close()
+
+
+def pae_bits(fields):
+    """An unescaped bit string from (value, width) and ('ue', v) fields."""
+    bits = ''
+    for f in fields:
+        if f[0] == 'ue':
+            v = f[1] + 1
+            bits += '0' * (v.bit_length() - 1) + format(v, 'b')
+        elif f[0] == 'se':
+            v = f[1]
+            v = 2 * v - 1 if v > 0 else -2 * v
+            v += 1
+            bits += '0' * (v.bit_length() - 1) + format(v, 'b')
+        else:
+            bits += format(f[0], '0%db' % f[1])
+    bits += '1' * (-len(bits) % 8)                  # cabac_alignment_one_bit
+    return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+
+
+def pae_picture(qt, idr, hdr, src, w, h, ring, ring_bytes, qp=30):
+    """Program a picture the way program_frame() does; the payload."""
+    bus = 0xA0000000
+    p = bytearray(0x1BC)
+    struct.pack_into('<HH', p, 4, w, h)
+    p[0x0C] = p[0x0D] = qp
+    p[0xC3] = 2 if idr else 0
+    struct.pack_into('<II', p, 0x134, (src - bus) >> 10,
+                     (src + w * h - bus) >> 10)
+    struct.pack_into('<I', p, 0x140, 0x1234)           # the context
+    struct.pack_into('<I', p, 0x14C, (ring - bus) >> 10)
+    struct.pack_into('<H', p, 0x15A, ring_bytes >> 10)
+    qt.write(0x10007E00, bytes(p))
+    qt.writel(PAE + 0x08, 3)
+    qt.writel(PAE + 0x0C, 0x3F)
+    qt.writel(PAE + 0x3000 + 0xD0, 0x01011000)
+    for i in range(0, len(hdr), 4):
+        chunk = hdr[i:i + 4]
+        qt.writel(PAE + 0x3000 + 0xB0, int.from_bytes(chunk, 'big'))
+        qt.writel(PAE + 0x3000 + 0xD0, 2 * 8 * len(chunk) - 1)
+    qt.writel(PAE + 0x3000 + 0xD0, 0x10000000)
+    qt.step(11000000)
+    bits = qt.readl(PAE + 0x3000 + 0x110)
+    return qt.readl(PAE + 0x08), bits, qt.read(ring + 16, (bits + 7) // 8)
+
+
+def test_fh8626_pae(qemu):
+    """FH8626V100's PAE H.264 engine as OpenIPC's fh8626-pae-hw.c drives
+    it; ffmpeg decodes what it makes in test-fullhan-boot.sh."""
+    print('fh8626v100: the H.264 encoder (fh-pae)')
+    qt = QTest(qemu, 'fh8626v100')
+    src, ring = 0xA1000000, 0xA1100000
+    w, h = 64, 32
+    try:
+        check('engine reset acknowledged',
+              (qt.writel(PAE + 0x18, 1 << 16), qt.readl(PAE + 0x20))[1], 1)
+        qt.write(src, bytes((x * 3 + y) & 0xFF for y in range(h)
+                            for x in range(w)) + bytes([128]) * (w * h // 2))
+        # first_mb 0, IDR (7), PPS 0, frame_num, idr_pic_id 0, POC, the two
+        # IDR flags, slice_qp_delta (QP 30 on pic_init_qp 26)
+        idr_hdr = pae_bits([('ue', 0), ('ue', 7), ('ue', 0), (0, 16),
+                            ('ue', 0), (0, 16), (0, 2), ('se', 4)])
+        st, bits, out = pae_picture(qt, True, idr_hdr, src, w, h, ring,
+                                    64 * 1024)
+        check('IDR: SLICE done, IRQ 4',
+              st & 1 == 1 and qt.readl(INTC + 0x18) >> 4 & 1 == 1, True)
+        check('the pushed header leads the payload',
+              out[:len(idr_hdr)], idr_hdr)
+        check('slice data follows it', len(out) > len(idr_hdr) + 8, True)
+        check('emulation prevention: no 00 00 0x (x <= 3) left',
+              any(out[i:i + 2] == b'\0\0' and out[i + 2] <= 3
+                  for i in range(len(out) - 2)), False)
+        idr_len = len(out)
+        # P, frame_num 1, POC 2; the same picture: it codes much smaller
+        p_hdr = pae_bits([('ue', 0), ('ue', 5), ('ue', 0), (1, 16),
+                          (2, 16), (0, 2), (0, 1), ('ue', 0), ('se', 4)])
+        st, bits, out = pae_picture(qt, False, p_hdr, src, w, h, ring,
+                                    64 * 1024)
+        check('P from the IDR\'s reconstruction: smaller', len(out) <
+              idr_len // 2 and out[:len(p_hdr)] == p_hdr, True)
+        st, bits, out = pae_picture(qt, True, idr_hdr, src, w, h, ring,
+                                    1024)
+        check('a 1 KiB ring: cut to it, not past',
+              bits <= (1024 - 16) * 8, True)
+    finally:
+        qt.close()
+
+
 def test_fh8632(qemu):
     print('fh8632: PTS, RTC v1')
     qt = QTest(qemu, 'fh8632')
@@ -1287,6 +1463,8 @@ def main():
     test_fh8626(args.qemu, path)
     test_fh8626_arc(args.qemu)
     test_fh8626_isp(args.qemu)
+    test_fh8626_jpeg(args.qemu)
+    test_fh8626_pae(args.qemu)
     test_fh8632(args.qemu)
     test_all_machines(args.qemu)
     test_migration(args.qemu, tmp)

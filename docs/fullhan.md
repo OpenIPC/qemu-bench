@@ -317,6 +317,46 @@ matrix, NR3D and its history DMA, the second statistics bank (0x1E8), the
 VPU's block means, logo and mask overlays and register-load lists, overflow
 -- is storage.
 
+**H.264 encoder** (`fh-pae`, FH8626V100), at 0xE7000000, IRQ 4, as
+OpenIPC's `fh8626-pae-hw.c` drives it. It codes Main profile with CABAC,
+one reference and one slice per picture.
+- **Registers:** the engine reset is acknowledged at 0x20. The driver
+  pushes its slice header through the TAE FIFO (0x3B0 / 0x3D0) and starts
+  the picture with 0x10000000 on 0x3D0. The engine raises bit 0 of 0x08
+  and reports at 0x3110 the bits it wrote.
+- **Frame parameters:** they are in the machine's SRAM at 0x10007E00, as
+  the driver lays them out: size, QP, slice type, deblocking and the input
+  and ring addresses in 1 KiB units. The engine is on a bus that starts at
+  DDR (the DT's `dma-ranges`), so 0 there is 0xA0000000 (`dma-base`).
+- **Output:** the slice NAL's payload goes into the ring from byte 16,
+  behind the start code and NAL header the driver writes there itself.
+  That is the driver's header bits, then slice data from the shared
+  encoder (`hantro-h264.c`: I_16x16, P_Skip, P_L0_16x16 with motion search),
+  with emulation prevention.
+- **Reference:** each context keeps its own deblocked reconstruction, keyed
+  by its reference-ring address, so contexts sharing the engine predict
+  from their own picture. The engine's reference, motion and macroblock
+  buffers in guest memory are not written, and CABAC state saved at SRAM
+  0x7A00 is left alone: every slice starts from `cabac_init_idc` 0.
+
+**JPEG encoder** (`fh-jpeg`, FH8626V100), at 0xE8300000, IRQ 8, as
+`fh8626-jpeg.c` drives it. The HW ID at 0x00 reads 0x00038401, which the
+driver checks at probe and after every picture.
+- **Output:** a whole JFIF: SOI, the quantisers from 0x80 (zigzag order),
+  SOF0 at the coded size (the driver patches in the displayed one), the
+  Annex K Huffman tables the driver loads, the scan from the shared encoder
+  (`jpeg-enc.c`), and EOI. Its length goes to 0x0C, with bit 0 of 0x04
+  set.
+- **Rotation:** the input is read turned by ENC_CTRL[9:8], 90 degrees
+  clockwise per step.
+
+On the release, 20 camera frames through `fh8626-encoder` with a GOP of 10
+decode in ffmpeg as Main profile 1280x720, IDR every tenth frame. Each
+frame's mean luma is within 8 of the captured picture's, and the JPEG
+decodes at 1280x720. The 24 MiB CMA pool the DT gives the camera and both
+encoders does not hold all their buffers at once, so the test closes the
+H.264 encoder before it opens the JPEG one.
+
 **SPI** (`fh-spi`). A DW SSI. SPI0 on V200 has Fullhan's "SPIC" additions:
 CCFGR (0xF4) with the data phase's wire count, a byte swap and 32-bit
 frames, XIP registers, and a 4 KiB data window at +0x1000 where every word
@@ -385,9 +425,10 @@ waits for statistics, which arrive once something streams (**ISP**,
 below). Without the sensor the capture driver's async notifier never
 completes, no subdevice appears, and the daemon gives up after 10 s.
 On this release nothing streams by itself: `divinus` needs the vendor
-SDK's `libvmm.so`, which this image does not ship, and exits. The
-encoder's reset times out, and the JPEG block reads its ID as 0
-(0x00038401 expected); neither is modelled.
+SDK's `libvmm.so`, which this image does not ship, and exits. OpenIPC's
+H.264 and JPEG encoders (`fh8626-encoder`, `fh8626-jpeg`, V4L2 mem2mem)
+probe and encode on `fh-pae` and `fh-jpeg` (**H.264 encoder**, **JPEG
+encoder**, below).
 For the GC1054 the sensor model decodes what OpenIPC's `gc1054.c` writes:
 rows in page 0's 0x03:0x04, the gain as page 1's bracket 0xB6 times the
 Q6 step in 0xB1:0xB2 (the driver's bracket table), the frame as 720 + VB

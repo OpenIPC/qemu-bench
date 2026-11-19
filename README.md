@@ -399,7 +399,9 @@ DHCP lease; OpenIPC's `fh8626v100` boots that way too, its ARC600
 (`fh-arc`) runs OpenIPC's RPMsg echo firmware for the kernel's remoteproc,
 and its CSI, ISP and VPU (`fh-csi`, `fh-isp`) stream frames and statistics
 to OpenIPC's media drivers from a synthetic scene, enough for `fh8626-3ad`'s
-AE and AWB to converge. The vendors' media pipeline (their ARC firmware,
+AE and AWB to converge, and its H.264 and JPEG encoders (`fh-pae`,
+`fh-jpeg`) code those frames into streams ffmpeg decodes. The vendors'
+media pipeline (their ARC firmware,
 ISP, encoders) and audio (the ARC's) are not modelled. Map, boot chain and devices are in
 [docs/fullhan.md](docs/fullhan.md).
 
@@ -871,6 +873,8 @@ qemu/
 ├── hw/misc/fh-arc.c             # FH8626V100 ARC600: ARCompact core run from DDR (OpenIPC's echo firmware)
 ├── hw/misc/fh-csi.c             # FH8626V100 MIPI CSI-2 receiver + wrapper
 ├── hw/misc/fh-isp.c             # FH8626V100 ISP + VPU: frames, statistics, IRQs for OpenIPC's media drivers
+├── hw/misc/fh-pae.c             # FH8626V100 PAE H.264 encoder (Main, CABAC) for OpenIPC's fh8626-encoder
+├── hw/misc/fh-jpeg.c            # FH8626V100 JPEG encoder for OpenIPC's fh8626-jpeg
 ├── hw/arm/ambarella.c           # Ambarella S3L machine, generated device tree
 ├── hw/misc/amb-vic.c            # Ambarella VIC and the scratchpad that names the IRQ
 ├── hw/misc/amb-timer.c          # Eight Ambarella interval timers
