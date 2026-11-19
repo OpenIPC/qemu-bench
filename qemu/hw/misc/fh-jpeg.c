@@ -97,12 +97,12 @@ static void fh_jpeg_update_irq(FhJpegState *s)
 }
 
 /*
- * The input, NV12 at stride iw for an iw x ih picture, turned rot x 90
- * degrees clockwise into planar w x h luma and w/2 x h/2 Cb and Cr.
+ * The input, an iw x ih NV12 picture at stride st, turned rot x 90 degrees
+ * clockwise into planar w x h luma and w/2 x h/2 Cb and Cr.
  */
-static void fh_jpeg_rotate(const uint8_t *y, const uint8_t *uv, int iw,
-                           int ih, int rot, uint8_t *oy, uint8_t *ocb,
-                           uint8_t *ocr, int w, int h)
+static void fh_jpeg_rotate(const uint8_t *y, const uint8_t *uv, int st,
+                           int iw, int ih, int rot, uint8_t *oy,
+                           uint8_t *ocb, uint8_t *ocr, int w, int h)
 {
     int x, r;
 
@@ -124,7 +124,7 @@ static void fh_jpeg_rotate(const uint8_t *y, const uint8_t *uv, int iw,
                 sy = x;
                 break;
             }
-            oy[r * w + x] = y[sy * iw + sx];
+            oy[r * w + x] = y[sy * st + sx];
         }
     }
     for (r = 0; r < h / 2; r++) {
@@ -145,8 +145,8 @@ static void fh_jpeg_rotate(const uint8_t *y, const uint8_t *uv, int iw,
                 sy = x;
                 break;
             }
-            ocb[r * (w / 2) + x] = uv[sy * iw + 2 * sx];
-            ocr[r * (w / 2) + x] = uv[sy * iw + 2 * sx + 1];
+            ocb[r * (w / 2) + x] = uv[sy * st + 2 * sx];
+            ocr[r * (w / 2) + x] = uv[sy * st + 2 * sx + 1];
         }
     }
 }
@@ -155,10 +155,14 @@ static void fh_jpeg_encode(FhJpegState *s)
 {
     int w = fh_jpeg_r(s, R_WIDTH_CFG) >> 16;
     int h = fh_jpeg_r(s, R_HEIGHT_CFG) >> 16;
-    int iw = fh_jpeg_r(s, R_ENC_CTRL) >> 16;
+    int st = fh_jpeg_r(s, R_ENC_CTRL) >> 16;      /* the input's stride */
     int rot = (fh_jpeg_r(s, R_ENC_CTRL) >> 8) & 3;
-    int ih = (rot & 1) ? w : h;
-    uint32_t cap = fh_jpeg_r(s, R_BS_LIMIT);
+    int iw = (rot & 1) ? h : w, ih = (rot & 1) ? w : h;
+    /*
+     * The room the guest gives, but no more than a baseline 4:2:0 picture
+     * can take (well under 3 bytes a pixel) whatever BS_LIMIT says.
+     */
+    uint32_t cap = MIN(fh_jpeg_r(s, R_BS_LIMIT), (uint32_t)w * h * 3 + 4096);
     uint32_t dst = fh_jpeg_r(s, R_BS_START);
     g_autofree uint8_t *in = NULL, *py = NULL, *pc = NULL, *out = NULL;
     g_autoptr(GByteArray) hdr = g_byte_array_new();
@@ -169,9 +173,9 @@ static void fh_jpeg_encode(FhJpegState *s)
 
     s->regs[R_STREAM_SIZE >> 2] = 0;
     if (w < 16 || h < 16 || w > MAX_DIM || h > MAX_DIM || (w & 15) ||
-        (h & 15) || iw < ((rot & 1) ? h : w) || iw > MAX_DIM) {
+        (h & 15) || st < iw || st > MAX_DIM) {
         qemu_log_mask(LOG_GUEST_ERROR, "fh-jpeg: %dx%d from rows of %d, "
-                      "rotation %d\n", w, h, iw, rot);
+                      "rotation %d\n", w, h, st, rot);
         return;
     }
     for (i = 0; i < 32; i++) {
@@ -181,15 +185,15 @@ static void fh_jpeg_encode(FhJpegState *s)
         ql[fh_jpeg_zigzag[i]] = q[i] ? q[i] : 1;
         qc[fh_jpeg_zigzag[i]] = q[64 + i] ? q[64 + i] : 1;
     }
-    in = g_malloc((size_t)iw * ih * 3 / 2);
+    in = g_malloc((size_t)st * ih * 3 / 2);
     dma_memory_read(&address_space_memory, fh_jpeg_r(s, R_Y_ADDR), in,
-                    (size_t)iw * ih, MEMTXATTRS_UNSPECIFIED);
+                    (size_t)st * ih, MEMTXATTRS_UNSPECIFIED);
     dma_memory_read(&address_space_memory, fh_jpeg_r(s, R_UV_ADDR),
-                    in + (size_t)iw * ih, (size_t)iw * ih / 2,
+                    in + (size_t)st * ih, (size_t)st * ih / 2,
                     MEMTXATTRS_UNSPECIFIED);
     py = g_malloc((size_t)w * h);
     pc = g_malloc((size_t)w * h / 2);
-    fh_jpeg_rotate(in, in + (size_t)iw * ih, iw, ih, rot, py, pc,
+    fh_jpeg_rotate(in, in + (size_t)st * ih, st, iw, ih, rot, py, pc,
                    pc + (size_t)w * h / 4, w, h);
 
     jpeg_enc_header(hdr, w, h, ql, qc);
@@ -203,6 +207,11 @@ static void fh_jpeg_encode(FhJpegState *s)
                       true, out + hdr->len, cap - hdr->len, &overflow);
     len = hdr->len + n;
     if (overflow) {
+        /*
+         * As far as it fits, with no EOI: the driver looks for one at the
+         * end and fails the picture without it ("does not fit").  The
+         * scan is byte-stuffed, so FF D9 can only be the real marker.
+         */
         qemu_log_mask(LOG_GUEST_ERROR, "fh-jpeg: %u bytes are not enough\n",
                       cap);
         len = cap;

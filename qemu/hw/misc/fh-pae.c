@@ -26,7 +26,11 @@
  * A picture is the slice NAL's payload, after the 00 00 00 01 and NAL
  * header byte the driver puts in the ring's bytes 11-15: the header bits
  * the driver pushed, the slice data, emulation prevention bytes, written
- * from the ring's byte 16 on, and its length in bits at TAE 0x110.  The
+ * from the ring's byte 16 on, and its length in bits at TAE 0x110.  A
+ * picture that does not fit the ring is written as far as it goes, and
+ * the bits it needed are reported -- more than the ring holds, which the
+ * driver takes as -ENOSPC and codes again at a higher QP -- with the
+ * reference left as it was.  The
  * slice data is the shared encoder's (hantro-h264.c: I_16x16, P_Skip,
  * P_L0_16x16 with motion search, mb_qp_delta to fit).  The reference --
  * the deblocked reconstruction, as the decoder has it -- is kept here, by
@@ -199,7 +203,8 @@ static void fh_pae_encode(FhPaeState *s)
     int w, h, mbw, mbh, qp;
     bool idr;
     uint32_t y, uv, ring, ring_bytes, key;
-    size_t hdr_bytes, n, len, cap;
+    size_t hdr_bytes, n, len = 0, cap, room;
+    bool fits;
     g_autofree uint8_t *in = NULL, *rbsp = NULL, *nal = NULL;
     H264Deblock db = { 0 };
     H264Pic *pic;
@@ -242,24 +247,45 @@ static void fh_pae_encode(FhPaeState *s)
                        !idr && r ? r->y : NULL, !idr && r ? r->uv : NULL,
                        0, false);
 
+    /*
+     * Room for the slice: the ring, but no more than a picture of I_PCM
+     * macroblocks takes (384 bytes and a little each), whatever the
+     * guest says the ring holds.
+     */
     cap = ring_bytes - 16;
     hdr_bytes = s->hdr_bits / 8;
-    rbsp = g_malloc(cap);
-    memcpy(rbsp, s->hdr, MIN(hdr_bytes, cap));
+    room = MIN(cap, (size_t)mbw * mbh * 400 + 1024);
+    rbsp = g_malloc(room);
+    memcpy(rbsp, s->hdr, hdr_bytes);
     n = h264_pic_slice_cabac(pic, !idr, 0, mbh, qp, 0, rbsp + hdr_bytes,
-                             cap - hdr_bytes, NULL);
+                             room - hdr_bytes, NULL);
+    fits = hdr_bytes + n <= room;
+    if (fits) {
+        /* escaping at most adds a byte in three */
+        nal = g_malloc((hdr_bytes + n) * 3 / 2 + 16);
+        len = fh_pae_escape(rbsp, hdr_bytes + n, nal,
+                            (hdr_bytes + n) * 3 / 2 + 16);
+        fits = len <= cap;
+    }
+    if (!fits) {
+        qemu_log_mask(LOG_GUEST_ERROR, "fh-pae: the picture does not fit "
+                      "the %u-byte ring\n", ring_bytes);
+        if (!nal) {
+            nal = g_malloc(room);
+            len = fh_pae_escape(rbsp, room, nal, room);
+        }
+        dma_memory_write(&address_space_memory, ring + 16, nal,
+                         MIN(len, cap), MEMTXATTRS_UNSPECIFIED);
+        /* more than the ring: the driver's -ENOSPC */
+        s->regs[R_TAE_BITS >> 2] = (MAX(len, cap) + 1) * 8;
+        h264_pic_free(pic);
+        return;
+    }
     if (!r) {
         r = fh_pae_ref(s, key, mbw, mbh, true);
     }
     h264_pic_finish(pic, &db, r->y, r->uv);
     h264_pic_free(pic);
-    if (hdr_bytes + n > cap) {
-        qemu_log_mask(LOG_GUEST_ERROR, "fh-pae: the %u-byte ring is too "
-                      "small\n", ring_bytes);
-        n = cap - hdr_bytes;
-    }
-    nal = g_malloc(cap);
-    len = fh_pae_escape(rbsp, hdr_bytes + n, nal, cap);
     dma_memory_write(&address_space_memory, ring + 16, nal, len,
                      MEMTXATTRS_UNSPECIFIED);
     s->regs[R_TAE_BITS >> 2] = len * 8;

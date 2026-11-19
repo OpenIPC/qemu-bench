@@ -332,9 +332,15 @@ static void m2m_open(struct m2m *m, const char *path, unsigned int fourcc)
         fail("encoder VIDIOC_S_FMT (coded)", r);
     }
     if (fourcc == FMT_H264) {
-        sys(NR_IOCTL, m->fd, VIDIOC_S_CTRL, (long)&gop);
+        r = sys(NR_IOCTL, m->fd, VIDIOC_S_CTRL, (long)&gop);
+        if (r < 0) {
+            fail("encoder GOP_SIZE", r);
+        }
     }
     m2m_bufs(m, BUF_TYPE_OUTPUT, m->in, m->in_len);
+    if (m->in_len[0] < FRAME_BYTES || m->in_len[1] < FRAME_BYTES) {
+        fail("encoder input buffers (a frame)", m->in_len[0]);
+    }
     m2m_bufs(m, BUF_TYPE_CAPTURE, m->out, m->out_len);
     type = BUF_TYPE_OUTPUT;
     r = sys(NR_IOCTL, m->fd, VIDIOC_STREAMON, (long)&type);

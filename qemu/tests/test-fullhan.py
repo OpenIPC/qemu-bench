@@ -1194,7 +1194,7 @@ JPEG_QL = [
     49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
 
 
-def jpeg_picture(qt, w, h, rot, src, dst):
+def jpeg_picture(qt, w, h, rot, src, dst, stride=None):
     """Program a picture the way fh8626_jpeg_worker() does; its SOF0 size."""
     cw, ch = (h, w) if rot & 1 else (w, h)
     q = bytes(JPEG_QL[z] for z in JPEG_ZIGZAG) * 2
@@ -1203,8 +1203,9 @@ def jpeg_picture(qt, w, h, rot, src, dst):
     qt.writel(JPEG + 0x14, ch << 16 | 0x0112)
     qt.writel(JPEG + 0x1C, cw << 16)
     qt.writel(JPEG + 0x3C, src)
-    qt.writel(JPEG + 0x40, src + w * h)
-    qt.writel(JPEG + 0x58, w << 16 | rot << 8 | 2 << 4 | 1)
+    stride = stride or w
+    qt.writel(JPEG + 0x40, src + stride * h)
+    qt.writel(JPEG + 0x58, stride << 16 | rot << 8 | 2 << 4 | 1)
     qt.writel(JPEG + 0x08, 3)
     qt.writel(JPEG + 0x34, dst)
     qt.writel(JPEG + 0x38, dst)
@@ -1259,6 +1260,22 @@ def test_fh8626_jpeg(qemu):
                   True)
         except ImportError:
             pass
+        # 180 degrees from rows padded to 96 bytes with white: the padding
+        # stays out of the picture
+        st = 96
+        qt.write(src, (bytes(4 * x for x in range(w)) + b'\xff' * (st - w))
+                 * h + (bytes([128]) * w + b'\xff' * (st - w)) * (h // 2))
+        n, data, sof = jpeg_picture(qt, w, h, 2, src, dst, stride=st)
+        try:
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(data)).convert('L')
+            row = [im.getpixel((x, 16)) for x in (2, 32, 61)]
+            check('180 degrees from padded rows: the ramp falling, no '
+                  'padding', row[0] > row[1] > row[2] and row[0] < 250, True)
+        except ImportError:
+            check('180 degrees from padded rows: a whole JFIF',
+                  data[:2] + data[-2:], b'\xff\xd8\xff\xd9')
     finally:
         qt.close()
 
@@ -1341,10 +1358,16 @@ def test_fh8626_pae(qemu):
                                     64 * 1024)
         check('P from the IDR\'s reconstruction: smaller', len(out) <
               idr_len // 2 and out[:len(p_hdr)] == p_hdr, True)
-        st, bits, out = pae_picture(qt, True, idr_hdr, src, w, h, ring,
-                                    1024)
-        check('a 1 KiB ring: cut to it, not past',
-              bits <= (1024 - 16) * 8, True)
+        # noise at QP 0, 256x128: far more than a 1 KiB ring
+        qt.write(src, bytes((i * 7919 + (i >> 5) * 104729) & 0xFF
+                            for i in range(256 * 128 * 3 // 2)))
+        qt.write(ring + 1024, b'\xa5' * 64)
+        st, bits, out = pae_picture(qt, True, idr_hdr, src, 256, 128, ring,
+                                    1024, qp=0)
+        check('a 1 KiB ring: more bits reported than it holds (-ENOSPC)',
+              bits > (1024 - 16) * 8, True)
+        check('and nothing written past it', qt.read(ring + 1024, 64),
+              b'\xa5' * 64)
     finally:
         qt.close()
 

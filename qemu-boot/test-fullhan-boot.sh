@@ -160,15 +160,19 @@ if d[:4] != b'FHEN':
     sys.exit(1)
 jl, hl, n = struct.unpack('<III', d[4:16])
 at = 16 + ((jl + 3) & ~3)
+# both there, inside the partition, and a JPEG at least starting as one
+if not jl or not hl or n != 20 or at + hl > len(d) or \
+        d[16:18] != b'\xff\xd8' or d[at:at + 4] != b'\0\0\0\1':
+    sys.exit(1)
 open(sys.argv[2] + '/out.jpg', 'wb').write(d[16:16 + jl])
 open(sys.argv[2] + '/out.h264', 'wb').write(d[at:at + hl])
 EOF
     then
-        echo "  FAIL: the streams in rootfs_data"
+        echo "  FAIL: the streams in rootfs_data (lengths, markers)"
         fail=1
         return
     fi
-    echo "  PASS: the streams in rootfs_data"
+    echo "  PASS: the streams in rootfs_data (lengths, markers)"
     if ! command -v ffprobe >/dev/null; then
         echo "  SKIP: decoding them (no ffprobe on this host)"
         return
