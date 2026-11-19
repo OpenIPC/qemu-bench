@@ -12,15 +12,18 @@
 # The image is the release's: its U-Boot, kernel and squashfs, written to
 # an 8 MiB NOR at OpenIPC's offsets (U-Boot at 0, the kernel at 0x50000, the
 # root at 0x250000) with rootfs_data erased, so U-Boot boots it with its own
-# environment as on a camera. Three changes to the root, and only these:
+# environment as on a camera. Four changes to the root, and only these:
 # root's password is 12345 (an unclaimed camera streams nothing, and is
 # claimed here as the Ingenic twin's test claims it), majestic.yaml turns
-# the 640x360 second stream on and logs at debug level, and rc.local mirrors
+# the 640x360 second stream on and logs at debug level, S31codec sets the
+# main stream's codec (--codec) after the first-boot customizer, which
+# sets its own (the PE3020-W's: H.264), and rc.local mirrors
 # the syslog, where majestic logs, to the console the checks read.
 #
 # What is checked:
 #   - majestic reaches the first frame ("anyka: first frame") and never
 #     logs "Cannot start SDK" or a stuck encoder ("no encoder interrupt");
+#   - the main stream is in the codec asked for, by ffprobe;
 #   - 50 pictures of each RTSP stream decode, by ffmpeg's own count, with
 #     ffmpeg saying nothing at error level (bar the RTP timestamps);
 #   - /image.jpg is a JPEG of the main stream's size.
@@ -28,9 +31,12 @@
 #   test-anyka-majestic.sh --soc ev200|ev300 [--firmware TGZ] [--uboot BIN]
 #                          [--kernel UIMAGE] [--majestic BIN] [--work DIR]
 #                          [--qemu Q] [--timeout SECONDS] [--keep]
+#                          [--codec h264|h265]
 #   --firmware  a local package in place of the nightly (the .tgz with the
 #               uImage and rootfs.squashfs); --kernel and --majestic replace
 #               the one file in it, to try a fix before it is released
+#   --codec     the main stream's codec (h264 by default; h265 on EV300,
+#               whose Allegro core has HEVC, the EV200's 8290 has not)
 #   --timeout   seconds for the boot to reach the first frame, login prompt
 #               included (one deadline, so a hung boot still leaves the step
 #               time to print the console)
@@ -51,6 +57,7 @@ BIN=
 WORK=
 TIMEOUT=600
 KEEP=
+CODEC=h264
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -63,6 +70,7 @@ while [ $# -gt 0 ]; do
     --qemu) QEMU=$2; shift ;;
     --timeout) TIMEOUT=$2; shift ;;
     --keep) KEEP=1 ;;
+    --codec) CODEC=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -73,6 +81,11 @@ ev200) CHIP=ak3918ev200; REPO=OpenIPC/firmware
 ev300) CHIP=ak3918ev300; REPO=OpenIPC/builder
        ASSET=ak3918ev300_lite_heimvision-pe3020w-nor.tgz ;;
 *) echo "--soc ev200 or ev300" >&2; exit 2 ;;
+esac
+case $CODEC in
+h264) PROBED=h264 ;;
+h265) PROBED=hevc ;;
+*) echo "--codec h264 or h265" >&2; exit 2 ;;
 esac
 for t in ffmpeg ffprobe curl unsquashfs mksquashfs openssl file; do
     command -v $t >/dev/null || { echo "$t is not on PATH" >&2; exit 2; }
@@ -129,6 +142,10 @@ video1:
 jpeg:
   enabled: true
 EOF
+# the codec asked for, over the customizer's (S30) and before majestic (S95)
+printf '#!/bin/sh\n[ "$1" = start ] && cli -s .video0.codec %s\nexit 0\n' \
+    "$CODEC" > "$RFS/etc/init.d/S31codec"
+chmod 755 "$RFS/etc/init.d/S31codec"
 # claimed: an unclaimed camera streams nothing
 HASH=$(openssl passwd -1 12345)
 [ -n "$HASH" ] || { echo "openssl passwd gave no hash" >&2; exit 1; }
@@ -204,6 +221,13 @@ decodes() {
         return 1
     fi
 }
+main_codec() {
+    local got
+    got=$(timeout -k 10 120 ffprobe -v error -rtsp_transport tcp -select_streams v \
+        -show_entries stream=codec_name -of csv=p=0 "$URL/stream=0")
+    [ "$got" = "$PROBED" ] ||
+        { echo "    (main stream: '${got:-nothing}', not $PROBED)"; return 1; }
+}
 snapshot() {
     local want got
     want=$(timeout -k 10 120 ffprobe -v error -rtsp_transport tcp -select_streams v \
@@ -224,6 +248,7 @@ check 'boots to the login prompt' waitfor 'login:'
 [ $fail = 0 ] && check 'majestic gets the first frame' waitfor 'anyka: first frame'
 check 'majestic starts its SDK and the encoder answers' no_sdk_error
 if [ $fail = 0 ]; then
+    check "main stream is $CODEC" main_codec
     check 'main stream decodes (50 pictures)' decodes stream=0
     check 'second stream decodes (50 pictures)' decodes stream=1
     check '/image.jpg is a JPEG of the main stream' snapshot

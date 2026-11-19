@@ -1896,7 +1896,7 @@ jobs:
           --work "$RUNNER_TEMP/majestic"
 
   majestic-anyka:
-    name: majestic on ${{ matrix.soc }} (the Anyka nightly as released)
+    name: majestic on ${{ matrix.soc }}${{ matrix.codec && format(' {0}', matrix.codec) || '' }} (the Anyka nightly as released)
     needs: [select, build]
     if: fromJSON(needs.select.outputs.jobs)['majestic-anyka']
     runs-on: ubuntu-24.04
@@ -1904,8 +1904,16 @@ jobs:
       fail-fast: false
       matrix:
         # ev200: OpenIPC/firmware's ak3918ev200 lite (ak-cam, the 8290);
-        # ev300: OpenIPC/builder's PE3020-W (ak_camera, the Allegro core)
-        soc: [ev200, ev300]
+        # ev300: OpenIPC/builder's PE3020-W (ak_camera, the Allegro core),
+        # its main stream in H.264 and again in H.265 (libakv codes HEVC
+        # on Enc1 alone, with its own parameter sets)
+        # (a list of includes alone: one job each, where an include that
+        # only adds codec to soc: ev300 would merge into that job)
+        include:
+          - soc: ev200
+          - soc: ev300
+          - soc: ev300
+            codec: h265
     steps:
       - uses: actions/checkout@v4
 
@@ -1955,6 +1963,7 @@ jobs:
         timeout-minutes: 20
         run: >-
           bash qemu-boot/test-anyka-majestic.sh --soc ${{ matrix.soc }}
+          --codec ${{ matrix.codec || 'h264' }}
           --work "$RUNNER_TEMP/anyka"
 
   boot-hi3516cv610:
