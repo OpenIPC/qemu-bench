@@ -45,6 +45,15 @@ power-cycle returns the camera to stock (verified: `.89` came back up).
    (0…0x8000000): `nand read 0x42000000 <off> 0x1000000` → `crc32` →
    `tftpput 0x42000000 0x1000000 <host>:nand_<off>.bin`, verifying each chunk's
    U-Boot crc32 against the host file. All 8 chunks matched.
+4. Assemble the 8 chunks into the single image this repo expects, in offset
+   order, and verify against `SHA256SUMS`:
+
+   ```sh
+   cat nand_00000000.bin nand_01000000.bin nand_02000000.bin nand_03000000.bin \
+       nand_04000000.bin nand_05000000.bin nand_06000000.bin nand_07000000.bin \
+       > ipc8232swc-we-vendor-nand-128mib-20261119.bin
+   sha256sum -c SHA256SUMS      # expects 7a2fd662…d59387
+   ```
 
 Scripts used: `scratchpad/dump/{tftp_wrq.py,dump_uboot.py}` (session artifacts).
 Full procedure + the no-UART-install analysis: `~/projects/cameras/rostelecom/docs/`.

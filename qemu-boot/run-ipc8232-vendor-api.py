@@ -21,27 +21,59 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU = os.path.join(REPO, "qemu-src/build/qemu-system-arm")
 FLASH = os.environ.get(
     "FLASH", os.path.join(REPO, "vendor-dumps/ipc8232swc-we-vendor-nand-128mib-20261119.bin"))
-WORK = os.environ.get("WORK", "/tmp/ipc8232-api.img")
-
 # vendor kernel cmdline (from a stock boot) + rdinit for the pre-init shell
 BOOTARGS = ("mem=70M console=ttyAMA0,115200 rootfstype=ramfs "
             "mtdparts=hinand:1024K(boot),1024K(tech),8192K(kernel),"
             "16384K(app),-(config) hw_type=1202 ubi.mtd=3,2048 rdinit=/bin/sh")
 
+# A unique throwaway copy per run (U-Boot saveenv / UBI write back to it), so
+# concurrent runs don't clobber each other; removed in the finally below. An
+# explicit WORK override is honoured and then left for the caller to manage.
 import shutil
+import tempfile
+_work_override = os.environ.get("WORK")
+if _work_override:
+    WORK, OWN_WORK = _work_override, False
+else:
+    fd, WORK = tempfile.mkstemp(prefix="ipc8232-api.", suffix=".img")
+    os.close(fd)
+    OWN_WORK = True
 shutil.copyfile(FLASH, WORK)
 
+# restrict=on isolates the guest (it must not reach the real vendor cloud with
+# the dump's identity); the host forwards bind to loopback only, since the API
+# reproduces a guest-root command injection and must not be LAN-reachable.
 cmd = [
     QEMU, "-M", "hi3516ev300,sensor=sp2305,flash-file=" + WORK,
     "-global", "hisi-fmc.nand-jedec=0xEFAA21",
     "-global", "hisi-fmc.nand-oob-size=64",
-    "-nic", "user,hostfwd=tcp::18080-:8080,hostfwd=tcp::18081-:80,"
-            "hostfwd=tcp::15540-:554",
+    "-nic", "user,restrict=on,hostfwd=tcp:127.0.0.1:18080-:8080,"
+            "hostfwd=tcp:127.0.0.1:18081-:80,hostfwd=tcp:127.0.0.1:15540-:554",
     "-nographic", "-serial", "mon:stdio",
 ]
 print("launching:", " ".join(cmd), flush=True)
 child = pexpect.spawn(cmd[0], cmd[1:], encoding="latin1", timeout=120)
 child.logfile_read = sys.stdout
+
+import atexit
+
+
+def _cleanup():
+    try:
+        child.close(force=True)
+    except Exception:
+        pass
+    if OWN_WORK:
+        try:
+            os.unlink(WORK)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup)  # fires on normal exit, exceptions and Ctrl-C
+import signal
+# SIGTERM would otherwise skip atexit; turn it into a clean SystemExit
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 # 1) interrupt U-Boot autoboot
 child.expect("Hit any key to stop autoboot")
