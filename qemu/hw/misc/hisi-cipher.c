@@ -87,6 +87,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiCipherState, HISI_CIPHER)
 #define CI_FLAG_IVSET       (1u << 21)
 #define CI_LEN_MASK         0xfffff
 #define CI_JOB_NS           10000
+#define CI_RING_MAX         128     /* the driver's CIPHER_MAX_LIST_NUM */
 
 struct HisiCipherState {
     SysBusDevice parent_obj;
@@ -210,6 +211,44 @@ static void ci_crypt(HisiCipherState *s, int ch, uint32_t ctrl,
             break;
         }
     }
+
+    /* A partial last block: the stream modes take that much keystream;
+     * ECB and CBC need whole blocks (the driver pads to them) */
+    if (len % 16) {
+        uint8_t *b = buf + (len & ~15u);
+        uint32_t n = len % 16;
+
+        switch (mode) {
+        case 2:                                 /* CFB-128 */
+            AES_encrypt(iv, tmp, &ek);
+            memcpy(prev, b, n);
+            for (uint32_t i = 0; i < n; i++) {
+                b[i] ^= tmp[i];
+            }
+            memcpy(iv, dec ? prev : b, n);
+            break;
+        case 3:                                 /* OFB */
+            AES_encrypt(iv, iv, &ek);
+            for (uint32_t i = 0; i < n; i++) {
+                b[i] ^= iv[i];
+            }
+            break;
+        case 4:                                 /* CTR */
+            AES_encrypt(iv, tmp, &ek);
+            for (uint32_t i = 0; i < n; i++) {
+                b[i] ^= tmp[i];
+            }
+            for (int i = 15; i >= 0 && !++iv[i]; i--) {
+                /* carry */
+            }
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR, "hisi-cipher: chn %d: %u bytes "
+                          "is not whole blocks for ECB / CBC; the last %u "
+                          "are left as they are\n", ch, len, n);
+            break;
+        }
+    }
 }
 
 static void ci_run_single(HisiCipherState *s)
@@ -229,14 +268,23 @@ static void ci_run_single(HisiCipherState *s)
     s->pending |= 1u << 8;
 }
 
-static void ci_run_chan(HisiCipherState *s, int ch)
+/*
+ * Runs at most one ring's worth of entries (the counts are the guest's to
+ * write, and could ask for billions); returns whether more are waiting,
+ * for the next timer tick.
+ */
+static bool ci_run_chan(HisiCipherState *s, int ch)
 {
-    uint32_t inum = *ci_chan(s, ch, CI_IBUF_NUM) ?: 128;
-    uint32_t onum = *ci_chan(s, ch, CI_OBUF_NUM) ?: 128;
+    uint32_t inum = MIN(*ci_chan(s, ch, CI_IBUF_NUM) ?: CI_RING_MAX,
+                        CI_RING_MAX);
+    uint32_t onum = MIN(*ci_chan(s, ch, CI_OBUF_NUM) ?: CI_RING_MAX,
+                        CI_RING_MAX);
     uint32_t ctrl = *ci_chan(s, ch, CI_CTRL);
+    uint32_t budget = MIN(inum, onum);
     bool done = false;
 
-    while (*ci_chan(s, ch, CI_IBUF_CNT) && *ci_chan(s, ch, CI_OBUF_CNT)) {
+    while (*ci_chan(s, ch, CI_IBUF_CNT) && *ci_chan(s, ch, CI_OBUF_CNT) &&
+           budget--) {
         uint32_t src[4], dst[4], len;
         hwaddr sa = *ci_chan(s, ch, CI_SRC_LST_SADDR) + s->in_ptr[ch] * 16;
         hwaddr da = *ci_chan(s, ch, CI_DEST_LST_SADDR) + s->out_ptr[ch] * 16;
@@ -272,30 +320,35 @@ static void ci_run_chan(HisiCipherState *s, int ch)
                 MAX(*ci_chan(s, ch, CI_INT_OCNTCFG), 1)) {
         s->pending |= 1u << (8 + ch);
     }
+    return *ci_chan(s, ch, CI_IBUF_CNT) && *ci_chan(s, ch, CI_OBUF_CNT);
 }
 
 /* Jobs complete on a timer, never inside the register write that starts
  * them: the driver's wait is armed after the write */
+static void ci_kick(HisiCipherState *s)
+{
+    if (!timer_pending(s->timer)) {
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CI_JOB_NS);
+    }
+}
+
 static void ci_job_done(void *opaque)
 {
     HisiCipherState *s = opaque;
+    bool more = false;
 
     if (*ci_reg(s, CI_CH0_CFG) & 1) {
         ci_run_single(s);
         *ci_reg(s, CI_CH0_CFG) &= ~3u;
     }
     for (int ch = 1; ch < CI_CHANS; ch++) {
-        ci_run_chan(s, ch);
+        more |= ci_run_chan(s, ch);
     }
     *ci_reg(s, CI_INT_RAW) |= s->pending;
     s->pending = 0;
     ci_update_irq(s);
-}
-
-static void ci_kick(HisiCipherState *s)
-{
-    if (!timer_pending(s->timer)) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CI_JOB_NS);
+    if (more) {
+        ci_kick(s);
     }
 }
 
