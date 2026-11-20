@@ -9,7 +9,7 @@ in `qemu-boot/`.
 
 ## ipc8232swc-we-vendor-nand-128mib-20261119.bin
 
-**Device:** Rostelecom **IPC8232SWC-WE-B** (Uniview C1L-2WN rebadge) —
+**Device:** Rostelecom **IPC8232SWC-WE** (Uniview C1L-2WN rebadge) —
 HiSilicon **hi3516ev300** + SuperPix **SP2305**, running **stock vendor
 firmware** (VC-HAL + AgentGreen, FW v5.8.0-b575710). Lab unit at `10.216.128.89`.
 
