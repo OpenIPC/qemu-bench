@@ -2514,6 +2514,13 @@ static const HisiSoCConfig gk7202v330_soc = {
     .gzip_layout        = 1,                                                   \
     /* SYSSTAT[1:0] boot device (arch-xmorca/platform.h get_sys_boot_mode). */ \
     .sysstat_boot_dev   = true,                                                \
+    /* Boot ROM speaks the HiSilicon V500 UART download protocol.  Verified   \
+     * on an XM IVG-K8 (GK7206V11A): the ROM answers the BD-00-FF-01 handshake \
+     * with its soc_id, then does a PLAINTEXT-header verify of the uploaded    \
+     * key area (magic 0x12345678, not RSA) — "Verify key fail" without it,    \
+     * "Bootrom success" with it (both seen on hardware).  In fastboot mode    \
+     * (no -kernel/-bios/flash) the model reproduces both branches. */         \
+    .fastboot_v500      = true,                                                \
     /* DTS ethernet@100d0000 irq 0x25.  V4 common's femac_irq=33 is both wrong \
      * for orca and collides with sdhci mmc1 (also 33) below. */               \
     .femac_irq          = 37,                                                  \
@@ -6882,7 +6889,8 @@ static void hisilicon_common_init(MachineState *machine,
         DeviceState *fb = qdev_new(TYPE_HISI_FASTBOOT);
         qdev_prop_set_chr(fb, "chardev", serial_hd(0));
         hisi_fastboot_setup(fb, CPU(cpu[0]), serial_hd(0),
-                            c->uart_bases[0], uart0_irq);
+                            c->uart_bases[0], uart0_irq,
+                            c->fastboot_v500, c->soc_id);
         qdev_realize(fb, NULL, &error_fatal);
 
         CPUState *cs = CPU(cpu[0]);

@@ -312,6 +312,15 @@ typedef struct HisiSoCConfig {
     /* SYSSTAT[1:0] is the boot device strap (00 eMMC 4-bit, 01 SPI NOR,
      * 10 eMMC 8-bit, 11 SPI NAND), as on Goke xmorca / GK7206. */
     bool            sysstat_boot_dev;
+    /* Boot ROM UART-download protocol used in fastboot mode (no -kernel,
+     * no flash).  false = the classic HiSilicon protocol (ROM sends 0x20,
+     * host uploads DDR/SPL/U-Boot).  true = the HiSilicon V500 protocol
+     * the Goke GK7206 ROM speaks: the host sends the BD-00-FF-01 handshake,
+     * the ROM replies with its chip id (= soc_id) and then does a plaintext
+     * verify of the uploaded key/HEAD area (magic 0x12345678, not RSA) —
+     * "Verify key fail" without it, "Bootrom success" with it.  The model
+     * reproduces both branches.  See hisi-fastboot.c. */
+    bool            fastboot_v500;
     /* XMedia xm720 die code, SYSCTRL+0x18 bits [7:4].  The xm720xxx
      * kernel's get_chipid() maps it to the chip ID (6 GK7205V500, 7 V510,
      * 8 V530, 12 GK7202V330) and returns 0 for 0; xm_pm.ko then refuses
