@@ -234,7 +234,7 @@ Mask ROM, U-Boot, and partition layouts:
 
 ### OpenIPC images
 
-OpenIPC ships `u-boot-<soc>-nor.bin` (`u-boot-t40n-universal.bin` on T40) and `-nor-lite` kernel/rootfs binaries without pre-assembled full flash images. Placing U-Boot at `0`, `uImage` at `0x50000`, and SquashFS at `0x250000` matches U-Boot's environment and boots via `flash-file=`; `qemu-boot/test-ingenic-boot.sh --mode flash` downloads OpenIPC U-Boot and builds/boots that image.
+OpenIPC ships `u-boot-<soc>-nor.bin` (`u-boot-t40n-universal.bin` on T40) and `-nor-lite` kernel/rootfs binaries without pre-assembled full flash images. Placing U-Boot at `0`, `uImage` at `0x50000`, and SquashFS at `0x250000` matches U-Boot's environment and boots via `flash-file=`; `qemu-boot/test-ingenic-boot.sh --mode flash` downloads OpenIPC U-Boot and builds/boots that image. `--mode split` boots the split layout instead: the release's `firmware.bin.<soc>` (from `openipc.<soc>-nor-lite-split.tgz`, OpenIPC/firmware#2912), a uImage and then its SquashFS at the next 64 KiB, written whole at `0x50000` under the release's U-Boot. The kernel divides it at boot (OpenIPC/linux `split_layout.c`, `CONFIG_MTD_SPLIT_LAYOUT`), and the test checks for its "split NOR layout" line, the root on the rootfs it split off (`31:4`, not the `mtdblock3` the command line names), and the JFFS2 overlay from the end of `firmware.bin`. A release without the package is a SKIP. T41's U-Boot, which the firmware release does not carry, comes from the OpenIPC/u-boot `ingenic` release.
 
 ### Vendor SDK images
 
@@ -797,7 +797,7 @@ Encoding runs on a worker thread beside the vCPUs. Coding a `2560x1440` frame un
 
 | Image / Configuration | Target & Path | Result |
 |---|---|---|
-| OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40` | Own machine, `-kernel` + NOR & flash (`test-ingenic-boot.sh`) | Login, DHCP lease, U-Boot environment, and JFFS2 overlay persist across boots; `--reset` verifies fast warm reboot (`ingenic_tb_reset`) |
+| OpenIPC `t10`, `t20`, `t21`, `t23`, `t30`, `t31`, `t40`, `t41` | Own machine, `-kernel` + NOR, flash & split NOR layout (`test-ingenic-boot.sh`) | Login, DHCP lease, U-Boot environment, and JFFS2 overlay persist across boots; `--reset` verifies fast warm reboot (`ingenic_tb_reset`) |
 | OpenIPC `t40` PHY power-down on reboot | `t40`, `test-ingenic-eth-reboot.sh` | `reboot -f` keeps `eth0`; `reboot` reproduces `firmware#2839` SWR timeout; `--phy-rst-gpio 71` (with `--expect-fixed`) keeps `eth0` across both |
 | OpenIPC T31 SPI NAND (`w25n01gv`) | U-Boot `isvp_t31_sfcnand` (+ patch), Linux 3.10 (`MTD_JZ_SFC_NAND`), UBI, `test-ingenic-nand.sh` | SPL, U-Boot environment save, UBI SquashFS `ubiblock` root, UBIFS overlay, and login; written files persist on reboot |
 | OpenIPC T41 SPI NAND (`gd5f1gq4ub` with OOB) | Vendor `isvp_t41n_sfc0_nand`, SDK 4.4 `isvp_tomcat_nand_defconfig` (+ `UBI_BLOCK`, `maxcpus=1`), `test-ingenic-nand.sh --soc t41` | SPL, U-Boot, Linux 4.4 CDT + descriptor DMA, UBIFS root, and login; written files persist on reboot |
