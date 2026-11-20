@@ -4,7 +4,10 @@
  * one interrupt (VIC 22) shared by hi3518e_viu.ko and the ISP driver.
  *
  * Offline (vi_vpss_online=0, what OpenIPC loads) capture writes each
- * frame to DDR and the VIU driver hands the buffer to VPSS.  What the
+ * frame to DDR and the VIU driver hands the buffer to VPSS.  Online
+ * (the SDK's default) the channel writes nothing, and VPSS paints its
+ * channels from this frame clock (hisi_viu_set_frame_hook,
+ * hisi_viu_paint in hw/misc/hisi-viu.h).  What the
  * drivers wait for (hi3518e_viu.o's VIU_HAL_* accessors and
  * ViuDrvInterruptRoute; the ISP's openhisilicon isp.c, ISP_ISR):
  *
@@ -67,13 +70,10 @@
 #include "hw/qdev-properties.h"
 #include "hw/i2c/image-sensor.h"
 #include "hw/misc/hisi-scene.h"
+#include "hw/misc/hisi-viu.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
-#include "qom/object.h"
-
-#define TYPE_HISI_VIU "hisi-viu"
-OBJECT_DECLARE_SIMPLE_TYPE(HisiViuState, HISI_VIU)
 
 #define VIU_SIZE            0x40000
 #define VIU_GLB_INT         0x00f0
@@ -144,7 +144,17 @@ struct HisiViuState {
     HisiSceneState *scene;
     ImageSensorExposure expo, frame_expo;
     double level;
+
+    void (*frame_hook)(void *);     /* VPSS online */
+    void *hook_opaque;
 };
+
+void hisi_viu_set_frame_hook(HisiViuState *s, void (*fn)(void *),
+                             void *opaque)
+{
+    s->frame_hook = fn;
+    s->hook_opaque = opaque;
+}
 
 static uint32_t viu_rd(HisiViuState *s, hwaddr a)
 {
@@ -209,15 +219,10 @@ static double viu_wb(HisiViuState *s, int k)
     return g ? g / 256.0 : 1.0;
 }
 
-static void viu_paint(HisiViuState *s)
+void hisi_viu_paint(HisiViuState *s, uint32_t ya, uint32_t ca, int w, int h,
+                    int ys, int cs, uint32_t n)
 {
-    uint32_t sz = viu_act(s, VIU_CH_Y_SIZE);
-    int w = (sz & 0x1fff) + 1, h = ((sz >> 16) & 0x1fff) + 1;
-    uint32_t ya = viu_act(s, VIU_CH_Y_ADDR), ca = viu_act(s, VIU_CH_C_ADDR);
-    int ys = viu_act(s, VIU_CH_Y_STRIDE) >> 16;
-    int cs = viu_act(s, VIU_CH_C_STRIDE) >> 16;
     const int sq = MAX(w / 16, 1);
-    const uint32_t n = s->frames;
     const float *grid;
     g_autofree uint8_t *line = NULL, *vu = NULL;
 
@@ -250,6 +255,17 @@ static void viu_paint(HisiViuState *s)
                              MEMTXATTRS_UNSPECIFIED);
         }
     }
+}
+
+/* Offline: the frame into the buffer the channel took at its start */
+static void viu_paint(HisiViuState *s)
+{
+    uint32_t sz = viu_act(s, VIU_CH_Y_SIZE);
+
+    hisi_viu_paint(s, viu_act(s, VIU_CH_Y_ADDR), viu_act(s, VIU_CH_C_ADDR),
+                   (sz & 0x1fff) + 1, ((sz >> 16) & 0x1fff) + 1,
+                   viu_act(s, VIU_CH_Y_STRIDE) >> 16,
+                   viu_act(s, VIU_CH_C_STRIDE) >> 16, s->frames);
 }
 
 /*
@@ -323,6 +339,10 @@ static void viu_frame_start(void *opaque)
 
     if (!viu_running(s)) {
         return;
+    }
+    /* online, VPSS ends the last frame here, as it was exposed */
+    if (s->frame_hook) {
+        s->frame_hook(s->hook_opaque);
     }
     /* VIU_HAL_SetChnRegNewer: the queued buffer is this frame's */
     if (s->newer) {
