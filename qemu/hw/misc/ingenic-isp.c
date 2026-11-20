@@ -272,7 +272,8 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
          * 0x72f10), the MSCA channels at 0x16100 + 0x100 n with the T31
          * offsets (Tzn_Msca_addr_fifo_write 0x667b4, fifo_read 0x66830),
          * enable 0x16008; VIC0 the T31 one but for its frame start, bit 4
-         * of 0x1E0 (main_fs_work, VIC ISR 0x3e2c); no polls.
+         * of 0x1E0 (main_fs_work, VIC ISR 0x3e2c); stream-off's poll of
+         * 0x204, below.
          */
         .name = "t40", .isp_size = 0x80000, .hldc = true,
         .int_en = 0x40020, .int_sta = 0x40028, .int_clr = 0x40024,
@@ -283,6 +284,14 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         .clear = { 0x9C, 0xA0, 0xA4, 0xA8 },
         .vic_sta = 0x1E0, .vic_mask = 0x1E8, .vic_clr = 0x1F0,
         .vic_sta2 = true, .vic_fs_bit = 0x10,
+        /*
+         * T41's handshake, already here: stream-off (0x733d0 in the
+         * tx-isp-t40.ko OpenIPC ships, after tisp_slake_all) sets 0x200 bit 0 and spins,
+         * without a timeout, until 0x204 bit 0 is set.  Without it every
+         * pipeline rebuild hung the stream-off until the watchdog reset
+         * the camera
+         */
+        .req = 0x200, .ack = 0x204,
         /* pipe 0's 3A as on T41 (tisp_ae_main_interrupt_static & co.) */
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
