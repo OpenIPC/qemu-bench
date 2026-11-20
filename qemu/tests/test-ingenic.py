@@ -4252,12 +4252,14 @@ def test_isp_layout(qt, soc):
     qt.writel(vic + vclr, qt.readl(vic + vsta))
     check('status cleared', (qt.readl(ISP + sta), qt.readl(vic + vsta)),
           (0, 0))
-    if soc == 't41':
-        # s_stream / suspend: set 0x200 bit 0, spin on 0x204 bit 0
+    if soc in ('t40', 't41'):
+        # stream-off / suspend: set 0x200 bit 0, spin on 0x204 bit 0
+        # without a timeout -- unanswered, the watchdog resets the camera
         qt.writel(ISP + 0x200, 1)
         check('0x204 bit 0 follows 0x200 bit 0', qt.readl(ISP + 0x204) & 1, 1)
         qt.writel(ISP + 0x200, 0)
         check('and drops with it', qt.readl(ISP + 0x204) & 1, 0)
+    if soc == 't41':
         # direct_mode: channel 0 queued the IVDC pair (0x80000000 /
         # 0x81000000) writes into the IVDC's store, raises bit 20 for the
         # frame source and leaves the done FIFO empty
