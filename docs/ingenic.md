@@ -615,8 +615,18 @@ camera does. `qemu-boot/build-ingenic-t41-kernel.sh` builds the SDK's own
 changed, so the SDK's prebuilt modules still load; the test builds it on
 first use. The twin adds three things: `S00twin` gives seedrng a
 creditable seed on every boot and turns libimp's MXU2 paths off,
-`rc.local` mirrors the syslog (`majestic -s` logs there) to the console,
-and root has a password, since an unclaimed camera streams nothing.
+`rc.local` copies the syslog lines the checks look for (`majestic -s`
+logs there) to the console, and root has a password, since an unclaimed
+camera streams nothing. Only those lines: with the whole syslog on the
+console the twin froze about one boot in three. The SDK 4.4 kernel's
+`ingenic_uart.c` turns its transmit interrupt off from the interrupt
+handler without the port lock, racing the other core's start; a race lost
+with the tty buffer full leaves the console stopped for good (UART1 `IER`
+`0x15`, `LSR` `0x60`, text queued), `logread` blocks on it, syslogd on
+`logread`, and majestic and dropbear on syslogd until the watchdog resets
+the camera. The race is the driver's, on silicon as well; two vCPU threads
+lose it far more often than two cores do, and running both on one
+(`-accel tcg,thread=single`) left the twin too slow to stream.
 
 The checks:
 
@@ -648,9 +658,9 @@ The checks:
 - the host pulls PB17 low (`qom-set /machine/gpio pb 0xfffdffff`), and
   majestic changes to night; it lets it go, and majestic changes back.
   The test reads that from `night_enabled` in `/metrics`, not from the
-  console: the console is the syslog mirrored by `logread -f`, which stops
-  following once syslogd's ring laps it, as the twin's `audio.ko` stack
-  dumps make it do on T40 with `--audio`;
+  console, which carries only the lines the checks look for, and whose
+  `logread -f` stops following once syslogd's ring laps it, as the twin's
+  `audio.ko` stack dumps make it do on T40 with `--audio`;
 - the change reaches the ISP. `-global ingenic-isp.trace-regs=on` logs
   every write to the ISP core (and the VIC) on stderr, and the test counts
   the core registers the night window writes with values the ten seconds
