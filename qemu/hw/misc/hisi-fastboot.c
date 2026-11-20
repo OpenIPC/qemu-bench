@@ -261,6 +261,12 @@ static void hisi_fastboot_v500_reply(HisiFastbootState *s)
 static bool hisi_fastboot_v500_header_ok(HisiFastbootState *s)
 {
     const uint8_t *h = s->v500_head;
+    /* The key area must be long enough to carry both the magic and the entry
+     * field (through 0x417); a shorter first transfer would leave those bytes
+     * zero-initialised and start the CPU at a bogus entry. */
+    if (s->xfer_received < sizeof(s->v500_head)) {
+        return false;
+    }
     return h[0x410] == 0x78 && h[0x411] == 0x56 &&
            h[0x412] == 0x34 && h[0x413] == 0x12;  /* 0x12345678 LE */
 }
