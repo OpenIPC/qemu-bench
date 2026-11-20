@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 33 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-arm` — 34 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (140 total)
+## Supported Machines (141 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -40,6 +40,7 @@ Builds three QEMU targets:
 | `hi3518cv100` | V1 | ARM926EJ-S | VIC | 3.0.8 | yes |
 | `hi3518ev100` | V1 | ARM926EJ-S | VIC | 3.0.8 | yes |
 | `hi3516cv200` | V2 | ARM926EJ-S | VIC | 4.9.37 | yes |
+| `hi3518ev200` | V2 | ARM926EJ-S | VIC | 4.9.37 | yes |
 | `hi3516av100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516dv100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516cv300` | V3 | ARM926EJ-S | VIC | 3.18.20 | yes |
@@ -744,7 +745,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 140 machines build and register. Every machine marked "yes" above boots
+All 141 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -808,7 +809,7 @@ arithmetic fitted against a CV608 board (`docs/ive-registers.md`, "V5").
 
 ```
 qemu/
-├── hw/arm/hisilicon.c           # HiSilicon/Goke-rebrand machines (48)
+├── hw/arm/hisilicon.c           # HiSilicon/Goke-rebrand machines (50)
 ├── hw/misc/hisi-sysctl.c        # SysCtrl (SoC ID, reset, general registers)
 ├── hw/misc/hisi-crg.c           # CRG clock/reset stub
 ├── hw/misc/hisi-fmc.c           # HiFMC V100 flash controller (CV200+, flash-file for dumps)
