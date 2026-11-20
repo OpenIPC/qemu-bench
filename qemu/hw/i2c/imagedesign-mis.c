@@ -191,6 +191,7 @@ static bool mis_frame_start(Object *sensor)
     }
     mis_exposure(sensor, &e);
     s->sync.vts = e.vts;
+    s->sync.frame_ns = mis_frame_ns(sensor);    /* the VMAX just latched */
     if (e.vts && e.lines + MIS_EXP_MARGIN > e.vts) {
         sensor_sync_violation(&s->sync, "exposure %u rows beyond the frame "
                               "(VMAX %u - %u)", e.lines, e.vts,
@@ -268,6 +269,9 @@ static const VMStateDescription vmstate_mis_sensor = {
         VMSTATE_UINT32(sync.violations, MisSensorState),
         VMSTATE_UINT32(sync.latches, MisSensorState),
         VMSTATE_UINT32(sync.late_latch, MisSensorState),
+        VMSTATE_INT64(sync.t0, MisSensorState),
+        VMSTATE_INT64(sync.frame_ns, MisSensorState),
+        VMSTATE_UINT32(sync.vts, MisSensorState),
         VMSTATE_END_OF_LIST()
     },
 };

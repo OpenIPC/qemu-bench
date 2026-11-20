@@ -127,6 +127,15 @@ static void vgs_run_job(HisiVgsState *s)
     if (!k) {
         return;
     }
+    /*
+     * A START while a job is still running queues behind it: both jobs
+     * complete together when the first one's time is up, so neither
+     * job's status bits are lost.
+     */
+    if (s->busy) {
+        s->status |= bits;
+        return;
+    }
     s->status = bits;
     s->busy = true;
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VGS_JOB_NS);
@@ -223,15 +232,25 @@ static void hisi_vgs_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
+static int hisi_vgs_post_load(void *opaque, int version_id)
+{
+    HisiVgsState *s = opaque;
+
+    qemu_set_irq(s->irq, s->regs[VGS_INT_STATUS / 4] != 0);
+    return 0;
+}
+
 static const VMStateDescription vmstate_hisi_vgs = {
     .name = TYPE_HISI_VGS,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = hisi_vgs_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, HisiVgsState, VGS_REG_SIZE / 4),
         VMSTATE_UINT32(status, HisiVgsState),
         VMSTATE_UINT32(done_id, HisiVgsState),
         VMSTATE_BOOL(busy, HisiVgsState),
+        VMSTATE_TIMER_PTR(timer, HisiVgsState),
         VMSTATE_END_OF_LIST()
     },
 };
