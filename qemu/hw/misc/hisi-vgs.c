@@ -27,8 +27,9 @@
  *     against the id it recorded, and logging if they differ -- and clears
  *     + 0x310 with the status it read.
  *
- * So the device answers with the node's own mask as the bits it raises, and
- * reports the last node of the chain in + 0xf4.
+ * So the device raises bit 1 (node done) for the job, and reports the last
+ * node of the chain in + 0xf4.  xm_vgs.ko is stricter than mod_vgs.o: its
+ * VGS_DRV_IsWrongInt wants + 0x314 [11:0] to be exactly 0x2.
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
@@ -115,12 +116,14 @@ static void vgs_run_job(HisiVgsState *s)
         }
         vgs_dump_node(s, a, node);
         /*
-         * The node's mask is the set of interrupts it is allowed to raise
-         * (the driver writes 0x34a); any of them is a completion to
-         * vgs_drv_comm_irq_proc, so a node with none still has to report
-         * one or the job is never collected.
+         * Bit 1 is "node done"; the node's mask (the driver writes 0x34a)
+         * also enables the error interrupts (bits 3, 6, 8, 9).  mod_vgs.o
+         * takes any bit as a completion, but xm_vgs.ko's
+         * VGS_DRV_IsWrongInt accepts a status of exactly 0x2 and fails
+         * the job (ProcErr, the clock turned off) on anything else, so
+         * a node that finished cleanly raises bit 1 alone.
          */
-        bits |= node[VGS_MASK / 4] & 0x3ff ? node[VGS_MASK / 4] & 0x3ff : 2;
+        bits |= 2;
         s->done_id = node[VGS_NODE_ID / 4];
         a = node[VGS_NEXT / 4];
     }
