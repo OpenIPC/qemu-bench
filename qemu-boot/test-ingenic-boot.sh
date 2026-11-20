@@ -22,8 +22,9 @@
 # rootfs and rootfs_data (OpenIPC/linux split_layout.c):
 #
 #   --mode split   the release's U-Boot at 0, as flash, and firmware.bin.<soc>
-#                  from openipc.<soc>-nor-lite-split.tgz (fetched into DIR
-#                  when missing; a release without one is a SKIP).
+#                  from openipc.<soc>-nor-lite-split.tgz, fetched into DIR
+#                  every run (a release without one is a SKIP), or with
+#                  --firmware FILE a firmware.bin built locally instead.
 #
 # The checks:
 #   - kernel up, root mounted from the NOR, "Welcome to OpenIPC", the login
@@ -43,6 +44,7 @@
 #     boot had a T40's second boot mount it at 32 s instead of 3 s).
 #
 #   bash qemu-boot/test-ingenic-boot.sh --soc t31 [--mode kernel|flash|split]
+#       [--firmware firmware.bin]
 #       [--qemu ./qemu-src/build/qemu-system-mipsel] [--dir qemu-boot]
 #       [--timeout 240] [--net] [--reset]
 set -euo pipefail
@@ -54,6 +56,7 @@ DIR=qemu-boot
 TIMEOUT=240
 NET=0
 RESET=0
+FIRMWARE=
 while [ $# -gt 0 ]; do
     case "$1" in
         --soc) SOC=$2; shift 2 ;;
@@ -63,6 +66,7 @@ while [ $# -gt 0 ]; do
         --timeout) TIMEOUT=$2; shift 2 ;;
         --net) NET=1; shift ;;
         --reset) RESET=1; shift ;;
+        --firmware) FIRMWARE=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -91,9 +95,16 @@ case $SOC in
 esac
 KERNEL=$DIR/uImage.$SOC
 ROOTFS=$DIR/rootfs.squashfs.$SOC
-FIRMWARE=$DIR/firmware.bin.$SOC
-# The split package, when the release has one; only a 404 means it has not
-if [ "$MODE" = split ] && [ ! -f "$FIRMWARE" ]; then
+# The split package, when the release has one; only a 404 means it has not.
+# Fetched every run, over any firmware.bin.<soc> an earlier one left in DIR,
+# so that what boots is the current release; --firmware boots a local build.
+FROM="the release's"
+if [ "$MODE" = split ] && [ -n "$FIRMWARE" ]; then
+    [ -f "$FIRMWARE" ] || { echo "no $FIRMWARE" >&2; exit 2; }
+    FROM="local $FIRMWARE"
+elif [ "$MODE" = split ]; then
+    FIRMWARE=$DIR/firmware.bin.$SOC
+    rm -f "$FIRMWARE"
     code=$(curl -sL --retry 3 -o "$DIR/split.$SOC.tgz" -w '%{http_code}' \
         "$URL/openipc.$SOC-nor-lite-split.tgz") || code=000
     case $code in
@@ -194,7 +205,7 @@ fi
 kill $QPID 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 
-echo "$SOC, $MODE boot:"
+if [ "$MODE" = split ]; then echo "$SOC, split boot ($FROM firmware.bin):"; else echo "$SOC, $MODE boot:"; fi
 if [ "$MODE" != kernel ]; then
     check "SPL" 'U-Boot SPL'
     # "Starting kernel" from the vendor U-Boot 2013.07, "Uncompressing
