@@ -652,10 +652,19 @@ without an end are a "CC" error and the driver drops the frame.
   camera: AE 8-bit, AWB 12-bit before the white balance gains.
 
 ```bash
-qemu-system-arm -M hi3518ev200,flash-file=dump.bin -icount shift=0 \
+qemu-system-arm -M hi3518ev200,flash-file=dump.bin -icount shift=0,sleep=off \
     -nographic -serial mon:stdio -nic user,restrict=on \
     -global hisi-vedu.dump-dir=venc
 ```
+
+Offline, the VIU driver's frame-end handler arms the next buffer and
+hands the finished one to VPSS (`ViuDrvChnProcess`). It has to run
+before the next frame starts, which on the camera is about 1.3 ms of
+vertical blanking. Without icount, the guest takes interrupts tens of
+milliseconds late while majestic starts up. The next frame then paints
+over the buffer just handed on, and the stream carries a repeated and an
+out-of-order frame (#360). `sleep=off` is needed as well: with plain
+`-icount shift=0` the boot stops at U-Boot's `USB:` step.
 
 To run OpenIPC online, set `b_arg_online=1` in `/usr/bin/load_hisilicon`
 and reboot. A Switcam HS-303 vendor dump (Rotek, MPP 1.0.4.0) streams
