@@ -50,7 +50,10 @@
  * its carrier on, and its frames travel in REMOTE_NDIS_PACKET_MSGs.
  * A CDC ACM function gets SET_CONTROL_LINE_STATE (DTR, RTS) and its bulk
  * pair is the serial port "chardev": what the gadget writes to ttyGSn
- * comes out there, what comes in there the gadget reads.  Notifications
+ * comes out there, what comes in there the gadget reads.  An adb function
+ * (FunctionFS, interface ff/42/01) is a byte stream the same way, on
+ * "adb-chardev": adb's TCP transport carries the same messages as its USB
+ * one, so "adb connect" to a socket chardev reaches adbd.  Notifications
  * are read and dropped.  Other functions enumerate and stay idle.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -149,6 +152,14 @@ enum {
     STEP_RNDIS_FILTER_RSP, STEP_ACM_DTR, STEP_DONE,
 };
 
+/* A function's bulk pair as a byte stream to a chardev */
+typedef struct RkDwc3Pipe {
+    int in, out;                /* physical endpoints, -1: none */
+    CharFrontend chr;
+    uint8_t rx[65536];          /* bytes for the gadget */
+    uint32_t rx_n;
+} RkDwc3Pipe;
+
 struct RkDwc3State {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -173,10 +184,8 @@ struct RkDwc3State {
     int ep_in, ep_out;          /* the network's bulk pair, -1: none */
     int ep_notify[4];           /* interrupt IN endpoints: read, dropped */
     int n_notify;
-    int acm_if, acm_in, acm_out;    /* CDC ACM: control interface, bulk */
-    CharFrontend chr;
-    uint8_t acm_rx[512];        /* bytes for the gadget's serial port */
-    uint32_t acm_rx_n;
+    int acm_if;                 /* CDC ACM control interface, -1: none */
+    RkDwc3Pipe acm, adb;        /* byte streams: ACM's bulk pair, adb's */
 
     uint8_t tx[MAX_FRAME];      /* the frame the gadget is sending */
     uint32_t tx_len;
@@ -307,7 +316,12 @@ static int rk_dwc3_xfer(RkDwc3State *s, int n, uint8_t *buf, uint32_t len,
                              MEMTXATTRS_UNSPECIFIED);
         }
         moved += k;
-        if (chn && k < room) {
+        /*
+         * A short packet ends the transfer: less than the TRB holds, or
+         * the data running out mid-chain on a partial packet (the host's
+         * last packet then is short, as a 24-byte adb header is)
+         */
+        if (chn && (k < room || (moved >= len && (moved % 512)))) {
             /*
              * A short packet ends the chain (CSP): this TRB is done
              * quietly, the rest of the chain is passed over and its last
@@ -412,13 +426,15 @@ static void rk_dwc3_ctl_out(RkDwc3State *s, uint8_t type, uint8_t req,
  */
 static void rk_dwc3_scan(RkDwc3State *s)
 {
-    enum { K_NONE, K_ECM, K_RNDIS, K_ACM } kind = K_NONE, data = K_NONE;
+    enum { K_NONE, K_ECM, K_RNDIS, K_ACM, K_ADB } kind = K_NONE;
+    int data = K_NONE;
     uint32_t i = 0, len = s->ctl_len;
     int cur_if = -1, comm_if = -1;
 
     s->cfg_value = len > 5 ? s->ctl[5] : 1;
     s->ecm_data_if = s->rndis_if = s->acm_if = -1;
-    s->ep_in = s->ep_out = s->acm_in = s->acm_out = -1;
+    s->ep_in = s->ep_out = s->acm.in = s->acm.out = -1;
+    s->adb.in = s->adb.out = -1;
     s->n_notify = 0;
     while (i + 2 <= len && s->ctl[i] >= 2) {
         const uint8_t *d = &s->ctl[i];
@@ -442,6 +458,9 @@ static void rk_dwc3_scan(RkDwc3State *s)
                 if (s->acm_if < 0) {
                     s->acm_if = cur_if;
                 }
+            } else if (d[5] == 0xff && d[6] == 0x42 && d[7] == 1 &&
+                       s->adb.in < 0) {
+                data = K_ADB;                       /* adb (FunctionFS) */
             } else if (d[5] == 0x0a && comm_if >= 0) {
                 /* ECM's endpoints are in alternate setting 1, the
                  * others' in 0 */
@@ -467,7 +486,9 @@ static void rk_dwc3_scan(RkDwc3State *s)
                                            data == K_RNDIS)) {
                 *(in ? &s->ep_in : &s->ep_out) = pn;
             } else if ((d[3] & 3) == 2 && data == K_ACM) {
-                *(in ? &s->acm_in : &s->acm_out) = pn;
+                *(in ? &s->acm.in : &s->acm.out) = pn;
+            } else if ((d[3] & 3) == 2 && data == K_ADB) {
+                *(in ? &s->adb.in : &s->adb.out) = pn;
             }
         }
         i += d[0];
@@ -624,6 +645,32 @@ static void rk_dwc3_rndis_tx(RkDwc3State *s)
     }
 }
 
+/* A byte stream: what the gadget sends out, what waits for it in */
+static void rk_dwc3_pipe_step(RkDwc3State *s, RkDwc3Pipe *p)
+{
+    uint8_t b[4096];
+    uint32_t n, t[4], at;
+    bool ended;
+
+    if (p->in >= 0) {
+        while ((n = rk_dwc3_xfer(s, p->in, b, sizeof(b), true, &ended)) > 0) {
+            qemu_chr_fe_write_all(&p->chr, b, n);
+        }
+    }
+    while (p->out >= 0 && p->rx_n && rk_dwc3_next_trb(s, p->out, t, &at)) {
+        /* one transfer per request: no more than its first TRB holds (a
+         * chained TRB after it is the driver's bounce buffer) */
+        n = rk_dwc3_xfer(s, p->out, p->rx, MIN(p->rx_n, t[2] & 0xffffff),
+                         false, &ended);
+        memmove(p->rx, p->rx + n, p->rx_n - n);
+        p->rx_n -= n;
+        qemu_chr_fe_accept_input(&p->chr);
+        if (!n) {
+            break;
+        }
+    }
+}
+
 /* Bulk data, once enumerated: frames both ways, notifications dropped */
 static void rk_dwc3_data_step(RkDwc3State *s)
 {
@@ -635,27 +682,8 @@ static void rk_dwc3_data_step(RkDwc3State *s)
     for (k = 0; k < s->n_notify; k++) {
         rk_dwc3_xfer(s, s->ep_notify[k], junk, sizeof(junk), true, &ended);
     }
-    if (s->acm_in >= 0) {
-        uint8_t b[512];
-        uint32_t n;
-
-        while ((n = rk_dwc3_xfer(s, s->acm_in, b, sizeof(b), true,
-                                 &ended)) > 0) {
-            qemu_chr_fe_write_all(&s->chr, b, n);
-        }
-    }
-    if (s->acm_out >= 0 && s->acm_rx_n) {
-        uint32_t t[4], at;
-
-        if (rk_dwc3_next_trb(s, s->acm_out, t, &at)) {
-            uint32_t n = rk_dwc3_xfer(s, s->acm_out, s->acm_rx, s->acm_rx_n,
-                                      false, &ended);
-
-            memmove(s->acm_rx, s->acm_rx + n, s->acm_rx_n - n);
-            s->acm_rx_n -= n;
-            qemu_chr_fe_accept_input(&s->chr);
-        }
-    }
+    rk_dwc3_pipe_step(s, &s->acm);
+    rk_dwc3_pipe_step(s, &s->adb);
     if (s->ep_in >= 0) {
         for (;;) {
             uint32_t n = rk_dwc3_xfer(s, s->ep_in, s->tx + s->tx_len,
@@ -883,38 +911,42 @@ static void rk_dwc3_reset(DeviceState *dev)
     s->ev_head = s->ev_count = 0;
     s->hstate = H_IDLE;
     s->ep_in = s->ep_out = s->ecm_data_if = -1;
-    s->rndis_if = s->acm_if = s->acm_in = s->acm_out = -1;
+    s->rndis_if = s->acm_if = s->acm.in = s->acm.out = -1;
+    s->adb.in = s->adb.out = -1;
+    s->adb.rx_n = 0;
     s->n_notify = 0;
-    s->acm_rx_n = 0;
+    s->acm.rx_n = 0;
     s->tx_len = 0;
     s->rxq_n = s->rxq_head = 0;
     timer_del(s->tick);
     rk_dwc3_update(s);
 }
 
-/* The serial port's input: as much as the buffer takes */
+/* A pipe's input: as much as its buffer takes */
 static int rk_dwc3_chr_can_read(void *opaque)
 {
-    RkDwc3State *s = opaque;
+    RkDwc3Pipe *p = opaque;
 
-    return s->acm_out >= 0 ? sizeof(s->acm_rx) - s->acm_rx_n : 0;
+    return p->out >= 0 ? sizeof(p->rx) - p->rx_n : 0;
 }
 
 static void rk_dwc3_chr_read(void *opaque, const uint8_t *buf, int size)
 {
-    RkDwc3State *s = opaque;
+    RkDwc3Pipe *p = opaque;
 
-    size = MIN(size, (int)(sizeof(s->acm_rx) - s->acm_rx_n));
-    memcpy(s->acm_rx + s->acm_rx_n, buf, size);
-    s->acm_rx_n += size;
+    size = MIN(size, (int)(sizeof(p->rx) - p->rx_n));
+    memcpy(p->rx + p->rx_n, buf, size);
+    p->rx_n += size;
 }
 
 static void rk_dwc3_realize(DeviceState *dev, Error **errp)
 {
     RkDwc3State *s = RK_DWC3(dev);
 
-    qemu_chr_fe_set_handlers(&s->chr, rk_dwc3_chr_can_read,
-                             rk_dwc3_chr_read, NULL, NULL, s, NULL, true);
+    qemu_chr_fe_set_handlers(&s->acm.chr, rk_dwc3_chr_can_read,
+                             rk_dwc3_chr_read, NULL, NULL, &s->acm, NULL, true);
+    qemu_chr_fe_set_handlers(&s->adb.chr, rk_dwc3_chr_can_read,
+                             rk_dwc3_chr_read, NULL, NULL, &s->adb, NULL, true);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &rk_dwc3_ops, s,
                           TYPE_RK_DWC3, REGS_SIZE);
@@ -929,7 +961,8 @@ static void rk_dwc3_realize(DeviceState *dev, Error **errp)
 
 static const Property rk_dwc3_properties[] = {
     DEFINE_NIC_PROPERTIES(RkDwc3State, conf),
-    DEFINE_PROP_CHR("chardev", RkDwc3State, chr),
+    DEFINE_PROP_CHR("chardev", RkDwc3State, acm.chr),
+    DEFINE_PROP_CHR("adb-chardev", RkDwc3State, adb.chr),
 };
 
 static const VMStateDescription rk_dwc3_vmstate = {

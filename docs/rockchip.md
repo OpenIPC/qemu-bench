@@ -546,7 +546,17 @@ qemu-system-arm -M rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device
 ```
 
 The RV1109 SDK's configfs gadget enumerates to "configured" as it
-ships (adb over FunctionFS, whose traffic isn't bridged). Switched to
+ships, with adb over FunctionFS:
+
+- **adb:** an adb function (interface ff/42/01) is a byte stream on
+  `-global rk-dwc3.adb-chardev=ID`. adb's TCP transport carries the same
+  messages as its USB one, so an adb client talking to a socket chardev
+  reaches the camera's adbd (`shell:` commands answer).
+- **One transfer per request:** adbd reads each 24-byte message header on
+  its own, so the stream goes out as one transfer per request, no larger
+  than the request's first TRB. A transfer that ends mid-chain on a
+  partial packet completes the chain as a short packet. Before that, the
+  payload bytes landed in the driver's bounce buffer. Switched to
 RNDIS (`echo usb_rndis_en > /tmp/.usb_config; /etc/init.d/S50usbdevice
 restart`), its usb0 runs and answers pings over
 `-nic user,model=usb-gadget,net=10.0.3.0/24` (a net apart from the
@@ -692,8 +702,8 @@ RV1103 / RV1106:
 - **RGA** 2D engine: it loads, but no jobs are modelled (majestic
   doesn't submit any).
 - **RKNN NPU** and **RVE**: storage.
-- **USB gadget functions other than CDC ECM, RNDIS and ACM:** they
-  enumerate, but no mass storage, UVC or FunctionFS traffic is bridged. PWM is modelled (`rk-pwm`), but its output level isn't.
+- **USB gadget functions other than CDC ECM, RNDIS, ACM and adb:** they
+  enumerate, but no mass storage or UVC traffic is bridged. PWM is modelled (`rk-pwm`), but its output level isn't.
 - **Audio codec** (the analogue acodec): registers only. The I2S/TDM
   FIFO paces with silence, and recordings capture zeros (or the
   `rx-tone-hz` test tone).
