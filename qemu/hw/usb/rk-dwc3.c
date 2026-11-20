@@ -48,8 +48,10 @@
  * gets REMOTE_NDIS_INITIALIZE and a packet filter (SEND_ENCAPSULATED_
  * COMMAND, each answer read with GET_ENCAPSULATED_RESPONSE), which turns
  * its carrier on, and its frames travel in REMOTE_NDIS_PACKET_MSGs.
- * Notifications are read and dropped.  Other functions enumerate and
- * stay idle.
+ * A CDC ACM function gets SET_CONTROL_LINE_STATE (DTR, RTS) and its bulk
+ * pair is the serial port "chardev": what the gadget writes to ttyGSn
+ * comes out there, what comes in there the gadget reads.  Notifications
+ * are read and dropped.  Other functions enumerate and stay idle.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -63,6 +65,8 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
+#include "chardev/char-fe.h"
+#include "hw/qdev-properties-system.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "qom/object.h"
@@ -142,7 +146,7 @@ enum {
 enum {
     STEP_DEV_DESC, STEP_SET_ADDR, STEP_CFG9, STEP_CFG, STEP_SET_CFG,
     STEP_SET_IF, STEP_RNDIS_INIT, STEP_RNDIS_INIT_RSP, STEP_RNDIS_FILTER,
-    STEP_RNDIS_FILTER_RSP, STEP_DONE,
+    STEP_RNDIS_FILTER_RSP, STEP_ACM_DTR, STEP_DONE,
 };
 
 struct RkDwc3State {
@@ -166,7 +170,13 @@ struct RkDwc3State {
     uint8_t cfg_value;
     int ecm_data_if;            /* -1: none */
     int rndis_if;               /* RNDIS control interface, -1: none */
-    int ep_in, ep_out, ep_notify;   /* physical endpoint numbers, -1 none */
+    int ep_in, ep_out;          /* the network's bulk pair, -1: none */
+    int ep_notify[4];           /* interrupt IN endpoints: read, dropped */
+    int n_notify;
+    int acm_if, acm_in, acm_out;    /* CDC ACM: control interface, bulk */
+    CharFrontend chr;
+    uint8_t acm_rx[512];        /* bytes for the gadget's serial port */
+    uint32_t acm_rx_n;
 
     uint8_t tx[MAX_FRAME];      /* the frame the gadget is sending */
     uint32_t tx_len;
@@ -395,50 +405,69 @@ static void rk_dwc3_ctl_out(RkDwc3State *s, uint8_t type, uint8_t req,
     s->ctl_len = words * 4;
 }
 
-static void rk_dwc3_ecm_scan(RkDwc3State *s)
+/*
+ * The configuration's functions: CDC ECM / RNDIS (a network) and CDC ACM
+ * (a serial port), each a control interface with its notification
+ * endpoint and a data interface after it with the bulk pair.
+ */
+static void rk_dwc3_scan(RkDwc3State *s)
 {
+    enum { K_NONE, K_ECM, K_RNDIS, K_ACM } kind = K_NONE, data = K_NONE;
     uint32_t i = 0, len = s->ctl_len;
-    int cur_if = -1, cur_alt = 0, comm_if = -1;
-    bool data_if = false;
+    int cur_if = -1, comm_if = -1;
 
     s->cfg_value = len > 5 ? s->ctl[5] : 1;
-    s->ecm_data_if = -1;
-    s->rndis_if = -1;
-    s->ep_in = s->ep_out = s->ep_notify = -1;
+    s->ecm_data_if = s->rndis_if = s->acm_if = -1;
+    s->ep_in = s->ep_out = s->acm_in = s->acm_out = -1;
+    s->n_notify = 0;
     while (i + 2 <= len && s->ctl[i] >= 2) {
         const uint8_t *d = &s->ctl[i];
 
         if (d[1] == 4 && d[0] >= 9) {               /* interface */
             cur_if = d[2];
-            cur_alt = d[3];
-            if (d[5] == 2 && d[6] == 6) {           /* CDC ECM control */
+            data = K_NONE;
+            if (d[5] == 2 && d[6] == 6) {
+                kind = K_ECM;
                 comm_if = cur_if;
-            }
-            if ((d[5] == 0xe0 && d[6] == 1 && d[7] == 3) ||
-                (d[5] == 2 && d[6] == 2 && d[7] == 0xff)) {    /* RNDIS */
+            } else if ((d[5] == 0xe0 && d[6] == 1 && d[7] == 3) ||
+                       (d[5] == 2 && d[6] == 2 && d[7] == 0xff)) {
+                kind = K_RNDIS;
                 comm_if = cur_if;
-                if (s->rndis_if < 0) {
+                if (s->rndis_if < 0 && s->ecm_data_if < 0) {
                     s->rndis_if = cur_if;
                 }
-            }
-            /* ECM's data endpoints are in alternate setting 1, RNDIS's 0 */
-            data_if = d[5] == 0x0a && comm_if >= 0 &&
-                      cur_alt == (comm_if == s->rndis_if ? 0 : 1);
-            if (data_if && s->ecm_data_if < 0) {
-                s->ecm_data_if = cur_if;
+            } else if (d[5] == 2 && d[6] == 2) {
+                kind = K_ACM;
+                comm_if = cur_if;
+                if (s->acm_if < 0) {
+                    s->acm_if = cur_if;
+                }
+            } else if (d[5] == 0x0a && comm_if >= 0) {
+                /* ECM's endpoints are in alternate setting 1, the
+                 * others' in 0 */
+                if (kind == K_ECM && d[3] == 1 && s->ecm_data_if < 0 &&
+                    s->rndis_if < 0) {
+                    s->ecm_data_if = cur_if;
+                    data = K_ECM;
+                } else if (kind == K_RNDIS && d[3] == 0 &&
+                           comm_if == s->rndis_if) {
+                    data = K_RNDIS;
+                } else if (kind == K_ACM && d[3] == 0 &&
+                           comm_if == s->acm_if) {
+                    data = K_ACM;
+                }
             }
         } else if (d[1] == 5 && d[0] >= 7) {        /* endpoint */
             int pn = ((d[2] & 0xf) << 1) | (d[2] >> 7);
+            bool in = d[2] & 0x80;
 
-            if (cur_if == comm_if && (d[3] & 3) == 3) {
-                s->ep_notify = pn;
-            } else if (data_if && cur_if == s->ecm_data_if &&
-                       (d[3] & 3) == 2) {
-                if (d[2] & 0x80) {
-                    s->ep_in = pn;
-                } else {
-                    s->ep_out = pn;
-                }
+            if ((d[3] & 3) == 3 && in && s->n_notify < 4) {
+                s->ep_notify[s->n_notify++] = pn;
+            } else if ((d[3] & 3) == 2 && (data == K_ECM ||
+                                           data == K_RNDIS)) {
+                *(in ? &s->ep_in : &s->ep_out) = pn;
+            } else if ((d[3] & 3) == 2 && data == K_ACM) {
+                *(in ? &s->acm_in : &s->acm_out) = pn;
             }
         }
         i += d[0];
@@ -466,7 +495,7 @@ static void rk_dwc3_enum_next(RkDwc3State *s)
         break;
     }
     case STEP_SET_CFG:
-        rk_dwc3_ecm_scan(s);
+        rk_dwc3_scan(s);
         rk_dwc3_ctl_start(s, 0x00, 9, s->cfg_value, 0, 0);
         break;
     case STEP_SET_IF:
@@ -482,6 +511,14 @@ static void rk_dwc3_enum_next(RkDwc3State *s)
             static const uint32_t init[] = { 2, 24, 1, 1, 0, 0x4000 };
 
             rk_dwc3_ctl_out(s, 0x21, 0, 0, s->rndis_if, init, 6);
+            break;
+        }
+        s->step = STEP_ACM_DTR;
+        /* fall through */
+    case STEP_ACM_DTR:
+        if (s->acm_if >= 0 && s->step == STEP_ACM_DTR) {
+            /* SET_CONTROL_LINE_STATE: DTR and RTS, the port opened */
+            rk_dwc3_ctl_start(s, 0x21, 0x22, 3, s->acm_if, 0);
             break;
         }
         s->step = STEP_DONE;
@@ -593,8 +630,31 @@ static void rk_dwc3_data_step(RkDwc3State *s)
     uint8_t junk[64];
     bool ended;
 
-    if (s->ep_notify >= 0) {
-        rk_dwc3_xfer(s, s->ep_notify, junk, sizeof(junk), true, &ended);
+    int k;
+
+    for (k = 0; k < s->n_notify; k++) {
+        rk_dwc3_xfer(s, s->ep_notify[k], junk, sizeof(junk), true, &ended);
+    }
+    if (s->acm_in >= 0) {
+        uint8_t b[512];
+        uint32_t n;
+
+        while ((n = rk_dwc3_xfer(s, s->acm_in, b, sizeof(b), true,
+                                 &ended)) > 0) {
+            qemu_chr_fe_write_all(&s->chr, b, n);
+        }
+    }
+    if (s->acm_out >= 0 && s->acm_rx_n) {
+        uint32_t t[4], at;
+
+        if (rk_dwc3_next_trb(s, s->acm_out, t, &at)) {
+            uint32_t n = rk_dwc3_xfer(s, s->acm_out, s->acm_rx, s->acm_rx_n,
+                                      false, &ended);
+
+            memmove(s->acm_rx, s->acm_rx + n, s->acm_rx_n - n);
+            s->acm_rx_n -= n;
+            qemu_chr_fe_accept_input(&s->chr);
+        }
     }
     if (s->ep_in >= 0) {
         for (;;) {
@@ -822,17 +882,39 @@ static void rk_dwc3_reset(DeviceState *dev)
     memset(s->ep, 0, sizeof(s->ep));
     s->ev_head = s->ev_count = 0;
     s->hstate = H_IDLE;
-    s->ep_in = s->ep_out = s->ep_notify = s->ecm_data_if = -1;
-    s->rndis_if = -1;
+    s->ep_in = s->ep_out = s->ecm_data_if = -1;
+    s->rndis_if = s->acm_if = s->acm_in = s->acm_out = -1;
+    s->n_notify = 0;
+    s->acm_rx_n = 0;
     s->tx_len = 0;
     s->rxq_n = s->rxq_head = 0;
     timer_del(s->tick);
     rk_dwc3_update(s);
 }
 
+/* The serial port's input: as much as the buffer takes */
+static int rk_dwc3_chr_can_read(void *opaque)
+{
+    RkDwc3State *s = opaque;
+
+    return s->acm_out >= 0 ? sizeof(s->acm_rx) - s->acm_rx_n : 0;
+}
+
+static void rk_dwc3_chr_read(void *opaque, const uint8_t *buf, int size)
+{
+    RkDwc3State *s = opaque;
+
+    size = MIN(size, (int)(sizeof(s->acm_rx) - s->acm_rx_n));
+    memcpy(s->acm_rx + s->acm_rx_n, buf, size);
+    s->acm_rx_n += size;
+}
+
 static void rk_dwc3_realize(DeviceState *dev, Error **errp)
 {
     RkDwc3State *s = RK_DWC3(dev);
+
+    qemu_chr_fe_set_handlers(&s->chr, rk_dwc3_chr_can_read,
+                             rk_dwc3_chr_read, NULL, NULL, s, NULL, true);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &rk_dwc3_ops, s,
                           TYPE_RK_DWC3, REGS_SIZE);
@@ -847,6 +929,7 @@ static void rk_dwc3_realize(DeviceState *dev, Error **errp)
 
 static const Property rk_dwc3_properties[] = {
     DEFINE_NIC_PROPERTIES(RkDwc3State, conf),
+    DEFINE_PROP_CHR("chardev", RkDwc3State, chr),
 };
 
 static const VMStateDescription rk_dwc3_vmstate = {

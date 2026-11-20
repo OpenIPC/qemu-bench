@@ -525,6 +525,15 @@ built into the model enumerates whatever gadget is bound:
   gets REMOTE_NDIS_INITIALIZE and a packet filter (SEND_ENCAPSULATED_COMMAND,
   each answer read back with GET_ENCAPSULATED_RESPONSE), which turns its
   carrier on. Its frames travel in REMOTE_NDIS_PACKET_MSGs.
+- **Serial:** a CDC ACM function gets SET_CONTROL_LINE_STATE (DTR, RTS),
+  and its bulk pair is the chardev `-global rk-dwc3.chardev=ID`. What
+  the gadget writes to `/dev/ttyGS0` comes out there, and what comes in
+  there the gadget reads. On OpenIPC's `g_cdc` (ECM + ACM), both work at
+  once:
+  ```
+  -chardev socket,id=gs,host=127.0.0.1,port=17777,server=on,wait=off \
+  -global rk-dwc3.chardev=gs
+  ```
 
 On OpenIPC (built-in `g_cdc`), `usb0` gets 10.0.2.15 by DHCP from QEMU's
 user network. Pings answer, and a 1.7 MB file served over the gadget
@@ -683,8 +692,8 @@ RV1103 / RV1106:
 - **RGA** 2D engine: it loads, but no jobs are modelled (majestic
   doesn't submit any).
 - **RKNN NPU** and **RVE**: storage.
-- **USB gadget functions other than CDC ECM and RNDIS:** they enumerate,
-  but no ACM, mass storage, UVC or FunctionFS traffic is bridged. PWM is modelled (`rk-pwm`), but its output level isn't.
+- **USB gadget functions other than CDC ECM, RNDIS and ACM:** they
+  enumerate, but no mass storage, UVC or FunctionFS traffic is bridged. PWM is modelled (`rk-pwm`), but its output level isn't.
 - **Audio codec** (the analogue acodec): registers only. The I2S/TDM
   FIFO paces with silence, and recordings capture zeros (or the
   `rx-tone-hz` test tone).
