@@ -24,6 +24,23 @@
  *   0x1f4  the node's ID, 0x1fc the interrupts it raises, 0x2fc the next
  * Pictures are semi-planar 4:2:0 and scaled nearest-neighbour.
  *
+ * Online (vi_vpss_online=1, the SDK's default and what vendor firmware
+ * loads) the same HAL writes the node layout into MMIO itself and no
+ * frame goes through DDR: 0x000 bit 31 turns online video on
+ * (VPSS_HAL_OnLineVideoEn), 0x010 bit 0 (VPSS_HAL_SetRegup) has the
+ * engine take the registers at the next frame start.  At each frame
+ * start VIU gives (hisi_viu_set_frame_hook) the engine finishes the last
+ * frame into the channels it took and raises 0x400 (start) with bit 0
+ * (end) (VPSS_COMM_OnLineIrqProc: clear 0x400 | 1, hand the last frame
+ * on, prepare the next, regup).  It paints each channel at its own size
+ * with VIU's scene, which is what scaling the capture would give.
+ *
+ * The VGS (0x20630000, VIC 29; hi3518e_vgs.o's VGS_HAL_*) has the same
+ * front end, and VPSS's extended channels go through it: with vgs=on
+ * this model runs its chains and completes them, painting nothing (its
+ * node layout is not decoded).  A job that never completed would keep
+ * its frame out of the pool for good.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -35,6 +52,7 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/misc/hisi-viu.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -55,6 +73,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssV2State, HISI_VPSS_V2)
 #define V2_NODE_MAX         16
 #define V2_PIC_MAX          4096
 #define V2_INT_ERR          (1u << 7)
+#define V2_ONLINE           0x0000      /* bit 31: online video */
+#define V2_REGUP            0x0010      /* bit 0: take the registers */
+#define V2_INT_SOF          (1u << 10)  /* online: a frame started */
+#define V2_INT_EOF          (1u << 0)   /* and the last one ended */
 #define V2_JOB_NS           2000000     /* a 1080p node, about 2 ms */
 
 /* the HAL's jump tables do not take the channels in order */
@@ -81,6 +103,12 @@ struct HisiVpssV2State {
     uint32_t done_id;
     uint32_t nodes;
     bool trace;
+    bool vgs;                       /* VGS: nodes complete, not painted */
+
+    /* online: the registers the frame in progress took, and VIU */
+    uint32_t act[V2_NODE_SIZE / 4];
+    uint32_t online_frames;
+    HisiViuState *viu;
 };
 
 static void v2_update_irq(HisiVpssV2State *s)
@@ -179,7 +207,9 @@ static void v2_run(HisiVpssV2State *s, uint32_t a)
             bits = V2_INT_ERR;
             break;
         }
-        v2_run_node(s, node);
+        if (!s->vgs) {
+            v2_run_node(s, node);
+        }
         bits |= node[V2_NODE_MASK / 4] & 1;
         s->done_id = node[V2_NODE_ID / 4];
         s->nodes++;
@@ -187,6 +217,51 @@ static void v2_run(HisiVpssV2State *s, uint32_t a)
     }
     s->pending = bits ? bits : 1;
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + V2_JOB_NS);
+}
+
+/* Online, at VIU's frame start: the last frame ends, the next begins */
+static void v2_online_frame(void *opaque)
+{
+    HisiVpssV2State *s = opaque;
+    const uint32_t *n = s->act;
+
+    if (s->trace) {
+        fprintf(stderr, "hisi-vpss-v2: online frame %u: ctrl %08x regup %u "
+                "chn %02x (took %02x) raw %03x\n", s->online_frames,
+                s->regs[V2_ONLINE / 4], s->regs[V2_REGUP / 4] & 1,
+                s->regs[0x008 / 4], n[0x008 / 4], s->regs[V2_INT_RAW / 4]);
+    }
+    if (!(s->regs[V2_ONLINE / 4] & (1u << 31))) {
+        return;
+    }
+    for (int c = 0; c < 4; c++) {
+        int dw, dh;
+        uint32_t st = n[v2_chn[c].stride / 4];
+
+        if (!(n[0x008 / 4] & (1u << v2_chn[c].en)) || !n[v2_chn[c].y / 4]) {
+            continue;
+        }
+        v2_size(n[v2_chn[c].size / 4], &dw, &dh);
+        if (dw < 2 || dh < 2 || dw > V2_PIC_MAX || dh > V2_PIC_MAX) {
+            continue;
+        }
+        if (s->trace) {
+            fprintf(stderr, "hisi-vpss-v2: online chn %d %dx%d y %08x c %08x "
+                    "stride %u/%u\n", c, dw, dh, n[v2_chn[c].y / 4],
+                    n[v2_chn[c].c / 4], st & 0xffff, st >> 16);
+        }
+        hisi_viu_paint(s->viu, n[v2_chn[c].y / 4], n[v2_chn[c].c / 4],
+                       dw, dh, st & 0xffff, st >> 16, s->online_frames);
+    }
+    s->online_frames++;
+    if (s->regs[V2_REGUP / 4] & 1) {
+        memcpy(s->act, s->regs, sizeof(s->act));
+        s->regs[V2_REGUP / 4] &= ~1u;
+    }
+    /* both: two starts with no end between them are a "CC" error, the
+     * frame dropped (VpssOnLineCcIntErr) */
+    s->regs[V2_INT_RAW / 4] |= V2_INT_SOF | V2_INT_EOF;
+    v2_update_irq(s);
 }
 
 /* A START while a chain runs waits for it: each has its own completion */
@@ -260,6 +335,8 @@ static void hisi_vpss_v2_reset(DeviceState *dev)
     HisiVpssV2State *s = HISI_VPSS_V2(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->act, 0, sizeof(s->act));
+    s->online_frames = 0;
     s->pending = 0;
     s->done_id = 0;
     s->has_queued = false;
@@ -272,6 +349,9 @@ static void hisi_vpss_v2_realize(DeviceState *dev, Error **errp)
     HisiVpssV2State *s = HISI_VPSS_V2(dev);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, v2_done, s);
+    if (s->viu) {
+        hisi_viu_set_frame_hook(s->viu, v2_online_frame, s);
+    }
 }
 
 static void hisi_vpss_v2_init(Object *obj)
@@ -284,14 +364,21 @@ static void hisi_vpss_v2_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     object_property_add_uint32_ptr(obj, "nodes", &s->nodes,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "online-frames", &s->online_frames,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_link(obj, "viu", TYPE_HISI_VIU, (Object **)&s->viu,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static const VMStateDescription vmstate_hisi_vpss_v2 = {
     .name = TYPE_HISI_VPSS_V2,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, HisiVpssV2State, V2_SIZE / 4),
+        VMSTATE_UINT32_ARRAY(act, HisiVpssV2State, V2_NODE_SIZE / 4),
+        VMSTATE_UINT32(online_frames, HisiVpssV2State),
         VMSTATE_UINT32(pending, HisiVpssV2State),
         VMSTATE_UINT32(done_id, HisiVpssV2State),
         VMSTATE_UINT32(queued, HisiVpssV2State),
@@ -303,6 +390,7 @@ static const VMStateDescription vmstate_hisi_vpss_v2 = {
 
 static const Property hisi_vpss_v2_properties[] = {
     DEFINE_PROP_BOOL("trace", HisiVpssV2State, trace, false),
+    DEFINE_PROP_BOOL("vgs", HisiVpssV2State, vgs, false),
 };
 
 static void hisi_vpss_v2_class_init(ObjectClass *klass, const void *data)

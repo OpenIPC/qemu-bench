@@ -677,6 +677,11 @@ static const HisiSoCConfig hi3518ev100_soc = {
     /* VIU + ISP: "ISP, VIU" on VIC 22 in the camera's /proc/interrupts */   \
     .viu_irq            = 22,                                                \
     .vpss_v2_irq        = 17,                   /* "VPSS0" */                \
+    /* hi3518e_vgs.o: VGS_HAL_Open's 0xfe730000 (VPSS's 0xfe700000 is       \
+     * 0x20600000), VGS_DRV_RequestIrq's 29; its HAL is VPSS's node front    \
+     * end (next 0x2fc, START 0x300, status 0x304 / 0x308, node ID 0x1f4) */ \
+    .vgs_v2_base        = 0x20630000,                                        \
+    .vgs_v2_irq         = 29,                                                \
     /* H.264 (hi3518e_h264e.o) and JPEG (hi3518e_jpege.o): hisi-vedu gen 2   \
      * ("VEDU_0" VIC 24, "JPEGU_0" 26) */                                    \
     .vedu_base          = 0x20620000,                                        \
@@ -6642,6 +6647,10 @@ static void hisilicon_common_init(MachineState *machine,
                 DeviceState *v2 = qdev_new("hisi-vpss-v2");
                 object_property_add_child(OBJECT(machine), "vpss",
                                           OBJECT(v2));
+                if (viu) {      /* online: VIU's frames drive it */
+                    object_property_set_link(OBJECT(v2), "viu", OBJECT(viu),
+                                             &error_fatal);
+                }
                 sysbus_realize(SYS_BUS_DEVICE(v2), &error_fatal);
                 sysbus_mmio_map(SYS_BUS_DEVICE(v2), 0, c->regbanks[n].base);
                 sysbus_connect_irq(SYS_BUS_DEVICE(v2), 0,
@@ -6810,6 +6819,19 @@ static void hisilicon_common_init(MachineState *machine,
         sysbus_realize(SYS_BUS_DEVICE(viu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(viu), 0, viu_base);
         sysbus_connect_irq(SYS_BUS_DEVICE(viu), 0, pic[c->viu_irq]);
+    }
+
+    /* CV200 VGS: VPSS's extended channels wait on its jobs, and a frame
+     * whose job never ends stays out of the pool (vendor apps that open
+     * an extended channel stop after the pool's last block) */
+    if (c->vgs_v2_irq) {
+        DeviceState *vgs = qdev_new("hisi-vpss-v2");
+
+        qdev_prop_set_bit(vgs, "vgs", true);
+        object_property_add_child(OBJECT(machine), "vgs", OBJECT(vgs));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vgs), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vgs), 0, c->vgs_v2_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vgs), 0, pic[c->vgs_v2_irq]);
     }
 
     if (flash_boot) {

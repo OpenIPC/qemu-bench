@@ -625,9 +625,23 @@ Two strips are modelled from the source and checked by
 
 ## CV200 (Hi3516CV200 / Hi3518EV200)
 
-The CV200 pipeline runs offline: `hisi-viu` writes each frame to DDR,
-`hisi-vpss-v2` scales it, and `hisi-vedu` gen 2 encodes it. The register
-maps are in the source headers of those files.
+Offline (`vi_vpss_online=0`, OpenIPC's `load_hisilicon`), `hisi-viu`
+writes each frame to DDR, `hisi-vpss-v2` scales it, and `hisi-vedu` gen 2
+encodes it. The register maps are in the source headers of those files.
+
+Online (`vi_vpss_online=1`, the SDK's default and what vendor firmware
+loads), no frame goes through DDR. The VPSS driver writes the node layout
+straight into MMIO, sets online video (`0x000` bit 31) and asks for the
+registers at the next frame (`0x010` bit 0). At each VIU frame start
+`hisi-vpss-v2` paints the channels it took for the last frame from the
+scene, then raises start (`0x400`) and end (bit 0) together. Two starts
+without an end are a "CC" error and the driver drops the frame.
+
+- **VGS** (`0x20630000`, VIC 29) has the same node front end. The
+  extended channels go through it, so it is a second `hisi-vpss-v2` with
+  `vgs=on`: its jobs complete, but nothing is painted yet. Without it, a
+  frame sent to an extended channel never comes back to its pool, and the
+  vendor app stops encoding when the pool runs out.
 
 - **VEDU gen 2** takes a register image from DDR (MMIO `0x1e0`). Its
   stream ring and packet headers are V4's, so the model moves the image's
@@ -640,8 +654,13 @@ maps are in the source headers of those files.
 ```bash
 qemu-system-arm -M hi3518ev200,flash-file=dump.bin -icount shift=0 \
     -nographic -serial mon:stdio -nic user,restrict=on \
-    -global hisi-vedu.dump-dir=/tmp/venc
+    -global hisi-vedu.dump-dir=venc
 ```
+
+To run OpenIPC online, set `b_arg_online=1` in `/usr/bin/load_hisilicon`
+and reboot. A Switcam HS-303 vendor dump (Rotek, MPP 1.0.4.0) streams
+1280x720 H.264 online. Its extended channels (5: 320x240, 11: 640x360,
+for QR scanning) get no picture yet.
 
 ## Not yet
 
