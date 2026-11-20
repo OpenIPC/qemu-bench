@@ -71,6 +71,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVgsState, HISI_VGS)
 #define VGS_CTRL_YUV        (1u << 31)
 #define VGS_DST_FMT(c)      (((c) >> 12) & 0x3f)    /* 0: semi-planar 4:2:0 */
 #define VGS_MAX_DIM         4096
+#define VGS_INT_DONE        (1u << 1)
+#define VGS_INT_BUS_ERR     (1u << 3)   /* an error xm_vgs.ko reports */
+/* pixels one START may scale: the camera's jobs are ~1 MP */
+#define VGS_JOB_PIXELS      (16 * 1024 * 1024)
 
 /* a job takes about this long; completion is never raised inside START */
 #define VGS_JOB_NS          200000
@@ -109,24 +113,29 @@ static void vgs_dump_node(HisiVgsState *s, uint32_t addr,
 }
 
 /* one plane, nearest neighbour; bpp 2 moves a 4:2:0 chroma pair */
-static void vgs_scale_plane(uint32_t src, int sw, int sh, int ss,
+static bool vgs_scale_plane(uint32_t src, int sw, int sh, int ss,
                             uint32_t dst, int dw, int dh, int ds, int bpp)
 {
     g_autofree uint8_t *in = g_malloc((size_t)ss * sh);
     g_autofree uint8_t *row = g_malloc((size_t)dw * bpp);
     int x, y;
 
-    dma_memory_read(&address_space_memory, src, in, (size_t)ss * sh,
-                    MEMTXATTRS_UNSPECIFIED);
+    if (dma_memory_read(&address_space_memory, src, in, (size_t)ss * sh,
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return false;
+    }
     for (y = 0; y < dh; y++) {
         const uint8_t *line = in + (size_t)(y * sh / dh) * ss;
 
         for (x = 0; x < dw; x++) {
             memcpy(row + x * bpp, line + (x * sw / dw) * bpp, bpp);
         }
-        dma_memory_write(&address_space_memory, dst + (uint32_t)y * ds, row,
-                         (size_t)dw * bpp, MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_write(&address_space_memory, dst + (uint32_t)y * ds,
+                             row, (size_t)dw * bpp, MEMTXATTRS_UNSPECIFIED)) {
+            return false;
+        }
     }
+    return true;
 }
 
 /*
@@ -137,8 +146,15 @@ static void vgs_scale_plane(uint32_t src, int sw, int sh, int ss,
  * Crop, CSC and the filter coefficients are not applied: the picture is
  * scaled whole, nearest neighbour, which is all the snapshot and the
  * extended channels need.  Only semi-planar 4:2:0 is written.
+ *
+ * The scaling runs inside the START write, so a job may scale at most
+ * *budget pixels; nodes past it complete unscaled (logged), and a guest
+ * cannot hold the machine with a long chain of large pictures.  Returns
+ * false when a picture cannot be read or written, which the node reports
+ * as an error.
  */
-static void vgs_scale(HisiVgsState *s, const uint32_t *node)
+static bool vgs_scale(HisiVgsState *s, const uint32_t *node,
+                      uint64_t *budget)
 {
     uint32_t sz = node[VGS_SRC_SIZE / 4], dz = node[VGS_DST_SIZE / 4];
     uint32_t sst = node[VGS_SRC_STRIDE / 4], dst = node[VGS_DST_STRIDE / 4];
@@ -150,7 +166,7 @@ static void vgs_scale(HisiVgsState *s, const uint32_t *node)
     if (!(node[VGS_SRC_CTRL / 4] & VGS_CTRL_YUV) ||
         !(node[VGS_DST_CTRL / 4] & VGS_CTRL_YUV) ||
         VGS_DST_FMT(node[VGS_DST_CTRL / 4])) {
-        return;
+        return true;
     }
     if (sw > VGS_MAX_DIM || sh > VGS_MAX_DIM || dw > VGS_MAX_DIM ||
         dh > VGS_MAX_DIM || sys < sw || scs < sw || dys < dw || dcs < dw ||
@@ -158,16 +174,28 @@ static void vgs_scale(HisiVgsState *s, const uint32_t *node)
         (sw | sh | dw | dh) & 1) {
         qemu_log_mask(LOG_GUEST_ERROR, "hisi-vgs: bad picture %dx%d/%d,%d "
                       "-> %dx%d/%d,%d\n", sw, sh, sys, scs, dw, dh, dys, dcs);
-        return;
+        return true;
     }
-    vgs_scale_plane(node[VGS_SRC_Y / 4], sw, sh, sys,
-                    node[VGS_DST_Y / 4], dw, dh, dys, 1);
-    vgs_scale_plane(node[VGS_SRC_C / 4], sw / 2, sh / 2, scs,
-                    node[VGS_DST_C / 4], dw / 2, dh / 2, dcs, 2);
+    if ((uint64_t)dw * dh > *budget) {
+        qemu_log_mask(LOG_GUEST_ERROR, "hisi-vgs: job over %d pixels, "
+                      "%dx%d left unscaled\n", VGS_JOB_PIXELS, dw, dh);
+        return true;
+    }
+    *budget -= (uint64_t)dw * dh;
+    if (!vgs_scale_plane(node[VGS_SRC_Y / 4], sw, sh, sys,
+                         node[VGS_DST_Y / 4], dw, dh, dys, 1) ||
+        !vgs_scale_plane(node[VGS_SRC_C / 4], sw / 2, sh / 2, scs,
+                         node[VGS_DST_C / 4], dw / 2, dh / 2, dcs, 2)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "hisi-vgs: picture %08x -> %08x "
+                      "not accessible\n", node[VGS_SRC_Y / 4],
+                      node[VGS_DST_Y / 4]);
+        return false;
+    }
     if (s->trace) {
         fprintf(stderr, "hisi-vgs: scale %dx%d %08x -> %dx%d %08x\n",
                 sw, sh, node[VGS_SRC_Y / 4], dw, dh, node[VGS_DST_Y / 4]);
     }
+    return true;
 }
 
 static void vgs_run_job(HisiVgsState *s)
@@ -175,6 +203,7 @@ static void vgs_run_job(HisiVgsState *s)
     uint32_t node[VGS_NODE_SIZE / 4];
     uint32_t a = s->regs[VGS_NEXT / 4];
     uint32_t bits = 0;
+    uint64_t budget = VGS_JOB_PIXELS;
     int k;
 
     for (k = 0; k < VGS_NODE_MAX && a; k++) {
@@ -190,16 +219,19 @@ static void vgs_run_job(HisiVgsState *s)
                     node[VGS_MASK / 4] & 0x3ff, node[VGS_NEXT / 4]);
         }
         vgs_dump_node(s, a, node);
-        vgs_scale(s, node);
         /*
          * Bit 1 is "node done"; the node's mask (the driver writes 0x34a)
          * also enables the error interrupts (bits 3, 6, 8, 9).  mod_vgs.o
          * takes any bit as a completion, but xm_vgs.ko's
          * VGS_DRV_IsWrongInt accepts a status of exactly 0x2 and fails
          * the job (ProcErr, the clock turned off) on anything else, so
-         * a node that finished cleanly raises bit 1 alone.
+         * a node that finished cleanly raises bit 1 alone, and one whose
+         * picture was not accessible an error bit with it.
          */
-        bits |= 2;
+        bits |= VGS_INT_DONE;
+        if (!vgs_scale(s, node, &budget)) {
+            bits |= VGS_INT_BUS_ERR;
+        }
         s->done_id = node[VGS_NODE_ID / 4];
         a = node[VGS_NEXT / 4];
     }
