@@ -566,105 +566,134 @@ static const HisiSoCConfig hi3518ev100_soc = {
  * 0x20xxxxxx peripheral space.  Uses hieth-sf in vendor kernel but FEMAC
  * in OpenIPC's 4.9+ kernel.  FMC memory window at 0x58000000 (not 0x14000000).
  */
+/* The CV200 die: hi3516cv200, and hi3518ev200 (the same silicon; SCSYSID
+ * byte 3 tells them apart) */
+#define HISI_CV200_COMMON \
+    .cpu_type           = ARM_CPU_TYPE_NAME("arm926"),                       \
+    .soc_id             = HISI_SOC_ID_CV200,                                 \
+    .chipid_byte_layout = true,            /* V2: byte-wise SCSYSID0..3 */   \
+    /* V2 RNG_GEN block — different layout from V3+ HISEC_TRNG_CTRL,         \
+     * data register at +0x004 instead of +0x204. */                         \
+    .hwrng_base         = 0x20280000,                                        \
+    .hwrng_data_offset  = 0x004,                                             \
+    /* 64 MiB on-chip DDR2 (512Mb).  Kernel gets 32 MiB, vendor mmz.ko       \
+     * claims the upper 32 MiB at 0x82000000. */                             \
+    .ram_size_default   = 64 * MiB,                                          \
+    .kernel_mem_mb      = 32,                                                \
+    .extra_cmdline      = "mmz_allocator=hisi "                              \
+                          "mmz=anonymous,0,0x82000000,32M",                  \
+    /* CV200 kernel uses the DesignWare-derived i2c-hisilicon driver         \
+     * (CON/TAR/DATA_CMD/AUTO/TX_RX layout) rather than HiBVT. */            \
+    .i2c_type           = "hisi-i2c-dw",                                     \
+                                                                             \
+    .ram_base           = 0x80000000,                                        \
+    .sram_base          = 0x04010000,                                        \
+    .sram_size          = 64 * KiB,                                          \
+                                                                             \
+    .use_gic            = false,                                             \
+    .vic_base           = 0x100D0000,                                        \
+                                                                             \
+    .sysctl_base        = 0x20050000,                                        \
+    .crg_base           = 0x20030000,                                        \
+                                                                             \
+    .num_uarts          = 3,                                                 \
+    .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },            \
+    .uart_irqs          = { 5, 30, 25 },                                     \
+                                                                             \
+    .num_timers         = 2,                                                 \
+    .timer_bases        = { 0x20000000, 0x20010000 },                        \
+    .timer_irqs         = { 3, 4 },                                          \
+    .timer_freq         = 3000000,      /* 3 MHz (APB bus / 4) */            \
+                                                                             \
+    .num_spis           = 2,                                                 \
+    .spi_bases          = { 0x200C0000, 0x200E0000 },                        \
+    .spi_irqs           = { 6, 7 },                                          \
+                                                                             \
+    .fmc_ctrl_base      = 0x10010000,                                        \
+    .fmc_mem_base       = 0x58000000,                                        \
+                                                                             \
+    .gpio_base          = 0x20140000,                                        \
+    .gpio_count         = 9,                                                 \
+    .gpio_stride        = 0x10000,                                           \
+    .gpio_irq           = 31,           /* shared for all ports (VIC) */     \
+                                                                             \
+    .dma_base           = 0x10060000,                                        \
+    .dma_irq            = 14,                                                \
+                                                                             \
+    .femac_base         = 0x10090000,                                        \
+    .femac_irq          = 12,                                                \
+                                                                             \
+    .num_himci          = 2,                                                 \
+    .himci_bases        = { 0x10020000, 0x10030000 },                        \
+    .himci_irqs         = { 18, 8 },                                         \
+                                                                             \
+    .num_i2c            = 3,                                                 \
+    .i2c_bases          = { 0x200D0000, 0x20240000, 0x20250000 },            \
+                                                                             \
+    .wdt_base           = 0x20040000,                                        \
+    .wdt_irq            = -1,                                                \
+    .wdt_freq           = 3000000,                                           \
+                                                                             \
+    /*                                                                       \
+     * CRG register defaults — mimic what U-Boot sets before booting Linux.  \
+     * The 4.9 kernel uses DT-based clocks; gate bits must be pre-enabled    \
+     * or the PL011 UART driver can't get its clock and the console is dead. \
+     */                                                                      \
+    .num_crg_defaults   = 4,                                                 \
+    .crg_defaults       = {                                                  \
+        /* UART0/1/2 + SPI0/1 clk enable, UART mux=24MHz */                  \
+        { 0xe4, (1 << 13) | (1 << 14) | (1 << 15) |                          \
+                (1 << 16) | (1 << 17) | (1 << 19) },                         \
+        { 0xc0, (1 << 1) },            /* FMC clk enable */                  \
+        { 0xec, (1 << 1) },            /* ETH clk enable */                  \
+        { 0xc4, (1 << 1) | (1 << 9) }, /* MMC0 + MMC1 clk enable */          \
+    },                                                                       \
+                                                                             \
+    /*                                                                       \
+     * Register bank stubs — vendor .ko modules access video/peripheral      \
+     * hardware during init.  Without mapped regions, reads return 0         \
+     * from QEMU's "unimplemented" handler, causing poll loops to hang.      \
+     */                                                                      \
+    .num_regbanks       = 8,                                                 \
+    .regbanks           = {                                                  \
+        { "hisi-misc",   0x20120000, 0x10000 },                              \
+        { "hisi-ddr",    0x20110000, 0x10000 },                              \
+        { "hisi-pwm",    0x20130000, 0x10000 },                              \
+        { "hisi-nandc",  0x10000000, 0x10000 },                              \
+        { "hisi-viu",    0x20580000, 0x40000 },                              \
+        { "hisi-vpss",   0x20600000, 0x10000 },                              \
+        { "hisi-aiao",   0x20650000, 0x10000 },                              \
+        /* eFuse (hi_cipher.ko hal_efuse.c, the kernel's 0xfe200000):     \
+         * 0x810 command, 0x814 status */                                 \
+        { "hisi-efuse",  0x20100000, 0x1000 },                               \
+    },                                                                       \
+    /* eFuse status: HAL_Efuse_WaitReady wants bits [29:27] = 1 and          \
+     * HAL_Efuse_WaitCipherLoadKey bit 0 (key loaded) before majestic's      \
+     * first cipher job; each waits 50 s per call without them */            \
+    .reg_presets        = { { 0x20100814, 0x08000001 } },                  \
+    /* hi_cipher.ko: REG_BASE_PHY_ADDR_CIPHER, cipher_irq (VIC 13) */         \
+    .cipher_base        = 0x100C0000,                                        \
+    .cipher_irq         = 13
+
 static const HisiSoCConfig hi3516cv200_soc = {
+    HISI_CV200_COMMON,
     .name               = "hi3516cv200",
     .desc               = "HiSilicon Hi3516CV200 (ARM926EJ-S)",
-    .cpu_type           = ARM_CPU_TYPE_NAME("arm926"),
-    .soc_id             = HISI_SOC_ID_CV200,
-    .chipid_byte_layout = true,            /* V2: byte-wise SCSYSID0..3 */
     .chip_variant       = 1,               /* 1 = 3516CV200 (vs 2=18EV200, 3=18EV201) */
-    /* V2 RNG_GEN block — different layout from V3+ HISEC_TRNG_CTRL,
-     * data register at +0x004 instead of +0x204. */
-    .hwrng_base         = 0x20280000,
-    .hwrng_data_offset  = 0x004,
-    /* 64 MiB on-chip DDR2 (512Mb).  Kernel gets 32 MiB, vendor mmz.ko
-     * claims the upper 32 MiB at 0x82000000. */
-    .ram_size_default   = 64 * MiB,
-    .kernel_mem_mb      = 32,
-    .extra_cmdline      = "mmz_allocator=hisi "
-                          "mmz=anonymous,0,0x82000000,32M",
-    /* CV200 kernel uses the DesignWare-derived i2c-hisilicon driver
-     * (CON/TAR/DATA_CMD/AUTO/TX_RX layout) rather than HiBVT. */
-    .i2c_type           = "hisi-i2c-dw",
+};
 
-    .ram_base           = 0x80000000,
-    .sram_base          = 0x04010000,
-    .sram_size          = 64 * KiB,
-
-    .use_gic            = false,
-    .vic_base           = 0x100D0000,
-
-    .sysctl_base        = 0x20050000,
-    .crg_base           = 0x20030000,
-
-    .num_uarts          = 3,
-    .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },
-    .uart_irqs          = { 5, 30, 25 },
-
-    .num_timers         = 2,
-    .timer_bases        = { 0x20000000, 0x20010000 },
-    .timer_irqs         = { 3, 4 },
-    .timer_freq         = 3000000,      /* 3 MHz (APB bus / 4) */
-
-    .num_spis           = 2,
-    .spi_bases          = { 0x200C0000, 0x200E0000 },
-    .spi_irqs           = { 6, 7 },
-
-    .fmc_ctrl_base      = 0x10010000,
-    .fmc_mem_base       = 0x58000000,
-
-    .gpio_base          = 0x20140000,
-    .gpio_count         = 9,
-    .gpio_stride        = 0x10000,
-    .gpio_irq           = 31,           /* shared for all ports (VIC) */
-
-    .dma_base           = 0x10060000,
-    .dma_irq            = 14,
-
-    .femac_base         = 0x10090000,
-    .femac_irq          = 12,
-
-    .num_himci          = 2,
-    .himci_bases        = { 0x10020000, 0x10030000 },
-    .himci_irqs         = { 18, 8 },
-
-    .num_i2c            = 3,
-    .i2c_bases          = { 0x200D0000, 0x20240000, 0x20250000 },
-
-    .wdt_base           = 0x20040000,
-    .wdt_irq            = -1,
-    .wdt_freq           = 3000000,
-
-    /*
-     * CRG register defaults — mimic what U-Boot sets before booting Linux.
-     * The 4.9 kernel uses DT-based clocks; gate bits must be pre-enabled
-     * or the PL011 UART driver can't get its clock and the console is dead.
-     */
-    .num_crg_defaults   = 4,
-    .crg_defaults       = {
-        /* UART0/1/2 + SPI0/1 clk enable, UART mux=24MHz */
-        { 0xe4, (1 << 13) | (1 << 14) | (1 << 15) |
-                (1 << 16) | (1 << 17) | (1 << 19) },
-        { 0xc0, (1 << 1) },            /* FMC clk enable */
-        { 0xec, (1 << 1) },            /* ETH clk enable */
-        { 0xc4, (1 << 1) | (1 << 9) }, /* MMC0 + MMC1 clk enable */
-    },
-
-    /*
-     * Register bank stubs — vendor .ko modules access video/peripheral
-     * hardware during init.  Without mapped regions, reads return 0
-     * from QEMU's "unimplemented" handler, causing poll loops to hang.
-     */
-    .num_regbanks       = 7,
-    .regbanks           = {
-        { "hisi-misc",   0x20120000, 0x10000 },
-        { "hisi-ddr",    0x20110000, 0x10000 },
-        { "hisi-pwm",    0x20130000, 0x10000 },
-        { "hisi-nandc",  0x10000000, 0x10000 },
-        { "hisi-viu",    0x20580000, 0x40000 },
-        { "hisi-vpss",   0x20600000, 0x10000 },
-        { "hisi-aiao",   0x20650000, 0x10000 },
-    },
+/*
+ * Hi3518EV200: the CV200 die as SCSYSID byte 3 = 2, which ipcinfo and
+ * load_hisilicon read as "hi3518ev200".  The default sensor is a SOI JX-F22
+ * on the DC (parallel) port, i2c0 0x40: the SwitCam HS303 OpenIPC camera
+ * (/etc/sensors/jxf22_i2c_1080p.ini).
+ */
+static const HisiSoCConfig hi3518ev200_soc = {
+    HISI_CV200_COMMON,
+    .name               = "hi3518ev200",
+    .desc               = "HiSilicon Hi3518EV200 (ARM926EJ-S)",
+    .chip_variant       = 2,
+    .default_sensor     = "jxf22",
 };
 
 /*
@@ -6669,6 +6698,18 @@ static void hisilicon_common_init(MachineState *machine,
             }
         }
     }
+    if (c->cipher_base) {
+        DeviceState *ci = qdev_new("hisi-cipher");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ci), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ci), 0, c->cipher_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(ci), 0, pic[c->cipher_irq]);
+    }
+
+    for (n = 0; n < HISI_MAX_REG_PRESETS && c->reg_presets[n].addr; n++) {
+        address_space_stl(&address_space_memory, c->reg_presets[n].addr,
+                          c->reg_presets[n].value, MEMTXATTRS_UNSPECIFIED,
+                          NULL);
+    }
 
     /* Sensor auto-attach via -machine sensor=<name>
      *
@@ -6953,6 +6994,7 @@ DEFINE_HISI_MACHINE("hi3518av100", hi3518av100, hi3518av100_soc)
 DEFINE_HISI_MACHINE("hi3518cv100", hi3518cv100, hi3518cv100_soc)
 DEFINE_HISI_MACHINE("hi3518ev100", hi3518ev100, hi3518ev100_soc)
 DEFINE_HISI_MACHINE("hi3516cv200", hi3516cv200, hi3516cv200_soc)
+DEFINE_HISI_MACHINE("hi3518ev200", hi3518ev200, hi3518ev200_soc)
 DEFINE_HISI_MACHINE("hi3516av100", hi3516av100, hi3516av100_soc)
 DEFINE_HISI_MACHINE("hi3516dv100", hi3516dv100, hi3516dv100_soc)
 DEFINE_HISI_MACHINE("hi3516cv300", hi3516cv300, hi3516cv300_soc)

@@ -26,6 +26,7 @@
 #define HISI_MAX_I2C      8
 #define HISI_MAX_REGBANKS 20
 #define HISI_MAX_CRG_DEFAULTS 8
+#define HISI_MAX_REG_PRESETS 8
 #define HISI_MAX_GPIO_EXTRAS 4
 
 typedef struct HisiRegbankEntry {
@@ -319,6 +320,9 @@ typedef struct HisiSoCConfig {
     /* VGS interrupt (GIC SPI): instantiate hisi-vgs for the "hisi-vgs"
      * register bank instead of a stub.  0 = stub. */
     uint32_t        vgs_irq;
+    /* CIPHER v1 (hisi-cipher, the CV200 family's hi_cipher.ko): 0 = none */
+    hwaddr          cipher_base;
+    int             cipher_irq;
 
     /* SATA AHCI controller (sysbus-ahci) — DVR/NVR family.
      * Vendor SATA module busy-loops if the controller is absent; even a
@@ -423,6 +427,9 @@ typedef struct HisiSoCConfig {
     /* CRG register defaults (mimics U-Boot clock init before kernel boot) */
     int             num_crg_defaults;
     struct { uint32_t offset; uint32_t value; } crg_defaults[HISI_MAX_CRG_DEFAULTS];
+    /* Words stored into register banks once they exist: status a vendor
+     * driver polls that nothing models (0 address ends the list) */
+    struct { hwaddr addr; uint32_t value; } reg_presets[HISI_MAX_REG_PRESETS];
 
     /* Generic RAM-backed register banks (pin mux, DDR PHY, PWM, etc.) */
     int             num_regbanks;
