@@ -92,6 +92,7 @@ JOB_FAMILIES = {
     "boot-ingenic": {"ingenic"},
     "majestic-ingenic": {"ingenic"},
     "majestic-anyka": {"anyka"},
+    "boot-rockchip-openipc": {"rockchip"},
     "vtund-neo": {"hisilicon"},
     "wifi-xiongmai": {"xiongmai"},
 }

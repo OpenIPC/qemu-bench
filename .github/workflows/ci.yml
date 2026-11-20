@@ -2200,6 +2200,49 @@ jobs:
   # A skipped job passes only when select did not ask for it: blanket-
   # accepting `skipped` would let a selector bug that narrows a real change
   # to nothing read as green.
+  boot-rockchip-openipc:
+    name: OpenIPC on ${{ matrix.soc }} (the release as published)
+    needs: [select, build]
+    if: fromJSON(needs.select.outputs.jobs)['boot-rockchip-openipc']
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        soc: [rv1106, rv1103]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfdt1 libglib2.0-0 libpixman-1-0 libslirp0 curl
+
+      - name: Download QEMU binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-arm
+          path: qemu-src/build/
+
+      - name: Make QEMU executable
+        run: chmod +x qemu-src/build/qemu-system-arm
+
+      # OpenIPC/firmware's latest release: the NAND lite rootfs (UBI) and
+      # the NOR lite kernel, as one 128 MiB SPI NAND image booted with
+      # -kernel; the milestones run from the kernel to the login prompt.
+      - name: OpenIPC ${{ matrix.soc }} to the login prompt
+        timeout-minutes: 15
+        run: |
+          W="$RUNNER_TEMP/openipc"
+          mkdir -p "$W"
+          for t in nand-lite nor-lite; do
+            curl -fsSL --retry 3 -o "$W/$t.tgz" \
+              "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.${{ matrix.soc }}-$t.tgz"
+          done
+          python3 qemu-boot/rv1106-openipc-image.py "$W/nand-lite.tgz" \
+            "$W/nor-lite.tgz" "$W/img"
+          bash qemu-boot/test-rv1106-boot.sh --openipc "$W/img" --timeout 240
+
   ci-gate:
     name: CI Gate
     needs:
@@ -2219,6 +2262,7 @@ jobs:
       - boot-ingenic
       - majestic-ingenic
       - majestic-anyka
+      - boot-rockchip-openipc
       - boot-hi3516cv610
       - boot-hi3516ev300-nand
       - vtund-neo
