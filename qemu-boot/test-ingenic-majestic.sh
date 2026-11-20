@@ -25,9 +25,9 @@
 # supervisor.  The twin adds three things: S00twin touches /tmp/closesimd
 # (libimp's MXU2 paths are not modelled), a creditable seedrng seed (the
 # machine gathers almost no entropy, and getrandom() would hold majestic
-# before it reads its config for good), and rc.local mirrors the syslog,
-# where majestic -s logs, to the console the checks read.  root's password
-# is 12345: an unclaimed camera streams nothing.
+# before it reads its config for good), and rc.local copies the syslog
+# lines the checks look for (majestic -s logs there) to the console they
+# read.  root's password is 12345: an unclaimed camera streams nothing.
 #
 # What is checked, from the console, the network and QEMU:
 #   - majestic brings the SDK up ("Ingenic SDK started");
@@ -214,8 +214,17 @@ cp /etc/twin-seed /var/lib/seedrng/seed.credit
 touch /tmp/closesimd
 EOF
 chmod 755 "$RFS/etc/init.d/S00twin"
-# majestic -s logs to syslog; the checks read the console
-sed -i 's|^exit 0$|logread -f > /dev/console 2>\&1 \&\nexit 0|' "$RFS/etc/rc.local"
+# majestic -s logs to syslog; the checks read the console, so the lines
+# they look for are copied there -- those lines only.  All of the syslog
+# froze the twin: the SDK 4.4 kernel's ingenic_uart.c turns its transmit
+# interrupt off from the interrupt handler without the port lock, racing
+# the other core's start, and a race lost with the tty buffer full leaves
+# the console stopped for good (IER 0x15, LSR 0x60, text queued).  Then
+# logread blocked on it, syslogd on logread, and every process that logs on
+# syslogd: majestic, dropbear, until the watchdog reset the camera.  The
+# race is the driver's; two vCPU threads lose it far more often than two
+# cores do, and the whole syslog at the line rate kept it losable.
+sed -i 's#^exit 0$#logread -f | grep -E "Ingenic SDK started|Cannot start SDK|get mic timeout|IMP_[A-Za-z_]+\\(\\) failed" > /dev/console 2>\&1 \&\nexit 0#' "$RFS/etc/rc.local"
 grep -q '^logread -f' "$RFS/etc/rc.local" || { echo "rc.local: no exit 0 to insert before" >&2; exit 1; }
 mksquashfs "$RFS" "$WORK/root.sq" -comp xz -noappend -quiet -all-root >/dev/null
 [ -n "$KEEP" ] || rm -rf "$RFS" "$WORK/appfs"
@@ -417,10 +426,10 @@ print('    (speaker: %.2f s at %.0f Hz)' % ((b - a) / r, hz))
 sys.exit(0 if (b - a) / r > 0.8 and 420 < hz < 460 else 1)
 PY
 }
-# night_is 0|1: majestic's own answer, from /metrics.  Not the console:
-# the console is the syslog mirrored by `logread -f`, which stops following
-# when syslogd's ring laps it -- on T40 with --audio the twin's audio.ko
-# fills the ring with stack dumps, and a mode change went unseen.
+# night_is 0|1: majestic's own answer, from /metrics.  Not the console,
+# which carries only the lines the checks grep for, and whose `logread -f`
+# stops following when syslogd's ring laps it -- on T40 with --audio the
+# twin's audio.ko fills the ring with stack dumps.
 night_is() {
     curl -s -m 10 -u root:12345 "http://127.0.0.1:$HTTP/metrics" |
         grep -qx "night_enabled $1"
