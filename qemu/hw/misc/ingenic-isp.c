@@ -283,6 +283,14 @@ static const IngenicIspLayout ingenic_isp_layouts[] = {
         .clear = { 0x9C, 0xA0, 0xA4, 0xA8 },
         .vic_sta = 0x1E0, .vic_mask = 0x1E8, .vic_clr = 0x1F0,
         .vic_sta2 = true, .vic_fs_bit = 0x10,
+        /*
+         * T41's handshake, already here: stream-off (tx-isp-t40.ko
+         * 0x733d0, after tisp_slake_all) sets 0x200 bit 0 and spins,
+         * without a timeout, until 0x204 bit 0 is set.  Without it every
+         * pipeline rebuild hung the stream-off until the watchdog reset
+         * the camera
+         */
+        .req = 0x200, .ack = 0x204,
         /* pipe 0's 3A as on T41 (tisp_ae_main_interrupt_static & co.) */
         .ae = 0x19000, .awb = 0x18000,
         .ae_static_bit = 4, .ae_hist_bit = 5, .awb_bit = 3, .stat_gen = 2,
