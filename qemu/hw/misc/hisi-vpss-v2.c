@@ -72,6 +72,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssV2State, HISI_VPSS_V2)
 #define V2_NODE_SIZE        0x400
 #define V2_NODE_MAX         16
 #define V2_PIC_MAX          4096
+/* online channels are painted from the scene, a float grid per size:
+ * CV200 sensors are 2.3 MP at most, so keep a channel within 3 MP */
+#define V2_ONLINE_PIXELS    (2048 * 1536)
 #define V2_INT_ERR          (1u << 7)
 #define V2_ONLINE           0x0000      /* bit 31: online video */
 #define V2_REGUP            0x0010      /* bit 0: take the registers */
@@ -242,7 +245,9 @@ static void v2_online_frame(void *opaque)
             continue;
         }
         v2_size(n[v2_chn[c].size / 4], &dw, &dh);
-        if (dw < 2 || dh < 2 || dw > V2_PIC_MAX || dh > V2_PIC_MAX) {
+        if (dw < 2 || dh < 2 || (int64_t)dw * dh > V2_ONLINE_PIXELS) {
+            qemu_log_mask(LOG_GUEST_ERROR, "hisi-vpss-v2: online channel "
+                          "%d %dx%d not painted\n", c, dw, dh);
             continue;
         }
         if (s->trace) {
@@ -374,11 +379,11 @@ static void hisi_vpss_v2_init(Object *obj)
 static const VMStateDescription vmstate_hisi_vpss_v2 = {
     .name = TYPE_HISI_VPSS_V2,
     .version_id = 2,
-    .minimum_version_id = 2,
+    .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, HisiVpssV2State, V2_SIZE / 4),
-        VMSTATE_UINT32_ARRAY(act, HisiVpssV2State, V2_NODE_SIZE / 4),
-        VMSTATE_UINT32(online_frames, HisiVpssV2State),
+        VMSTATE_UINT32_ARRAY_V(act, HisiVpssV2State, V2_NODE_SIZE / 4, 2),
+        VMSTATE_UINT32_V(online_frames, HisiVpssV2State, 2),
         VMSTATE_UINT32(pending, HisiVpssV2State),
         VMSTATE_UINT32(done_id, HisiVpssV2State),
         VMSTATE_UINT32(queued, HisiVpssV2State),
