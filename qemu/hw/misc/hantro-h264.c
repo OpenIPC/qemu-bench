@@ -137,6 +137,17 @@ static void parse_sps(H264Enc *e, const uint8_t *rbsp, size_t n)
     e->have_sps = true;
 }
 
+/* more_rbsp_data(): anything before the RBSP's last one bit */
+static bool pps_more_rbsp(const BitReader *r)
+{
+    size_t last = r->n * 8;
+
+    while (last > 0 && !((r->p[(last - 1) / 8] >> (7 - (last - 1) % 8)) & 1)) {
+        last--;
+    }
+    return last > 0 && r->pos < last - 1;
+}
+
 static void parse_pps(H264Enc *e, const uint8_t *rbsp, size_t n)
 {
     BitReader r = { rbsp, n, 0 };
@@ -148,9 +159,9 @@ static void parse_pps(H264Enc *e, const uint8_t *rbsp, size_t n)
     if (br_ue(&r)) {                            /* slice groups */
         e->unsupported = true;
     }
+    e->num_ref_l0 = br_ue(&r) + 1;
     br_ue(&r);
-    br_ue(&r);
-    br_bit(&r);
+    e->weighted_pred = br_bit(&r);
     br_bits(&r, 2);
     e->pic_init_qp = 26 + br_se(&r);
     br_se(&r);
@@ -158,6 +169,13 @@ static void parse_pps(H264Enc *e, const uint8_t *rbsp, size_t n)
     e->deblocking_control = br_bit(&r);
     br_bit(&r);                                 /* constrained_intra_pred */
     e->redundant_pic_cnt_present = br_bit(&r);
+    e->transform_8x8 = false;
+    if (pps_more_rbsp(&r)) {                    /* the High profile's part */
+        e->transform_8x8 = br_bit(&r);
+        if (br_bit(&r)) {                       /* pic_scaling_matrix */
+            e->unsupported = true;
+        }
+    }
     e->have_pps = true;
 }
 
@@ -1511,4 +1529,118 @@ size_t h264_enc_baseline_headers(uint32_t w, uint32_t h, uint8_t *out)
     hdrw_put(&b, 0, 2);
     hdrw_trail(&b);
     return b.n;
+}
+
+/* ---- I and P pictures with a reference (h264_enc_frame_ref) ------------- */
+
+size_t h264_enc_frame_ref(H264Enc *e, bool idr, bool p_slice, int qp,
+                          int mbw, int mbh, const uint8_t *y, int ys,
+                          const uint8_t *uv, int cs, const uint8_t *ry,
+                          const uint8_t *ruv, uint8_t *rec_y, uint8_t *rec_uv,
+                          uint8_t *out, size_t cap)
+{
+    const size_t rcap = (size_t)mbw * mbh * 800 + 1024;
+    g_autofree uint8_t *rbsp = NULL;
+    const H264Deblock db = { 0, 0, 0 };
+    BitWriter w;
+    H264Pic *pic;
+    size_t n;
+
+    if (!e->have_sps || !e->have_pps || e->unsupported) {
+        return 0;
+    }
+    if (idr) {
+        p_slice = false;
+    }
+    qp = MIN(MAX(qp, 0), 51);
+    if (idr) {
+        e->frame_num = 0;
+        e->poc = 0;
+        e->idr_pic_id = (e->idr_pic_id + 1) & 0xffff;
+    } else {
+        e->frame_num = (e->frame_num + 1) & ((1 << e->log2_max_frame_num) - 1);
+        e->poc += 2;
+    }
+    rbsp = g_malloc0(rcap);
+    w = (BitWriter) { .p = rbsp, .cap = rcap };
+
+    /* slice_header() */
+    bw_ue(&w, 0);                                       /* first_mb */
+    bw_ue(&w, p_slice ? 5 : 7);                         /* P / I, all */
+    bw_ue(&w, e->pps_id);
+    bw_bits(&w, e->frame_num, e->log2_max_frame_num);
+    if (idr) {
+        bw_ue(&w, e->idr_pic_id);
+    }
+    if (e->poc_type == 0) {
+        bw_bits(&w, e->poc & ((1 << e->log2_max_poc_lsb) - 1),
+                e->log2_max_poc_lsb);
+        if (e->bottom_field_poc_present) {
+            bw_se(&w, 0);
+        }
+    }
+    if (e->redundant_pic_cnt_present) {
+        bw_ue(&w, 0);
+    }
+    if (p_slice) {
+        if (e->num_ref_l0 != 1) {
+            bw_bits(&w, 1, 1);          /* num_ref_idx_active_override */
+            bw_ue(&w, 0);               /*   one reference */
+        } else {
+            bw_bits(&w, 0, 1);
+        }
+        bw_bits(&w, 0, 1);              /* ref_pic_list_modification_l0 */
+        if (e->weighted_pred) {
+            /* pred_weight_table(): the defaults */
+            bw_ue(&w, 0);               /* luma_log2_weight_denom */
+            bw_ue(&w, 0);               /* chroma_log2_weight_denom */
+            bw_bits(&w, 0, 1);          /* luma_weight_l0_flag */
+            bw_bits(&w, 0, 1);          /* chroma_weight_l0_flag */
+        }
+    }
+    if (idr) {                                          /* dec_ref_pic_marking */
+        bw_bits(&w, 0, 1);
+        bw_bits(&w, 0, 1);
+    } else {
+        bw_bits(&w, 0, 1);
+    }
+    if (e->cabac && p_slice) {
+        bw_ue(&w, 0);                                   /* cabac_init_idc */
+    }
+    bw_se(&w, qp - e->pic_init_qp);
+    if (e->deblocking_control) {
+        bw_ue(&w, 0);
+        bw_se(&w, 0);
+        bw_se(&w, 0);
+    }
+
+    pic = h264_pic_new(mbw, mbh, y, ys, uv, cs, p_slice ? ry : NULL,
+                       p_slice ? ruv : NULL, e->chroma_qp_offset,
+                       e->transform_8x8);
+    if (e->cabac) {
+        while (w.bits) {
+            bw_bits(&w, 1, 1);                          /* cabac_alignment */
+        }
+        n = w.n + h264_pic_slice_cabac(pic, p_slice, 0, mbh, qp, 0,
+                                       rbsp + w.n, rcap - w.n, NULL);
+    } else {
+        /* the header's last bits in their byte; the slice data after */
+        const int off = w.bits;
+
+        if (off) {
+            rbsp[w.n] = w.acc << (8 - off);
+        }
+        n = h264_pic_slice_cavlc(pic, p_slice, 0, mbh, qp, off,
+                                 rbsp + w.n, rcap - w.n, NULL);
+        if (off) {
+            const uint8_t keep = 0xff00 >> off;
+
+            rbsp[w.n] = (uint8_t)(w.acc << (8 - off)) | (rbsp[w.n] & ~keep);
+        }
+        n = (w.n * 8 + n + 7) / 8;
+    }
+    h264_pic_finish(pic, &db, rec_y, rec_uv);
+    h264_pic_free(pic);
+
+    return nal_wrap(out, cap, 3, idr ? 5 : 1, rbsp, MIN(n, rcap));
 }

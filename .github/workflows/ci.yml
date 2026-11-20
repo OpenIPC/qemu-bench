@@ -152,6 +152,10 @@ jobs:
                    fh8852v100 fh8856v100 fh8626v100 fh8632; do
             ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
           done
+          # Rockchip RV1103 / RV1106 (hw/arm/rockchip.c)
+          for m in rv1103 rv1106 rv1106g3 rv1103b rv1126 rv1109; do
+            ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
+          done
           # Grain Media (hw/arm/grainmedia.c)
           for m in gm8135s gm8136 gm8136s; do
             ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
@@ -419,6 +423,17 @@ jobs:
       - name: Fullhan devices (fh-spi, fh-axi-dmac, fh-ahb-dmac, fh-rtc, ...)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-fullhan.py']
         run: python3 qemu/tests/test-fullhan.py
+
+      # The Rockchip RV1103/RV1106 models driven over qtest the way the
+      # vendor SPL and U-Boot drive them: the mask ROM stand-in's ID block
+      # walk and the ATAGs the DDR blob leaves (SOC_INFO's thunder-boot
+      # flag included), SFC reads, DMA and page programs, the crypto v3
+      # hash descriptors with pause / RESTART, the gzip decompressor
+      # finishing in virtual time, and the hiword register files.  Booting
+      # the camera dumps needs vendor firmware (test-rv1106-boot.sh).
+      - name: Rockchip RV1106 devices (rk-sfc, rk-crypto, rk-decom, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-rockchip.py']
+        run: python3 qemu/tests/test-rockchip.py
 
       # The Grain Media models driven over qtest the way nsboot, the vendor
       # U-Boot and the 3.3 kernel drive them: the mask ROM's nsboot

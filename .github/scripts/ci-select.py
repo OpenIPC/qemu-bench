@@ -52,7 +52,7 @@ VENC_MATRIX = ".github/ci/venc-matrix.yml"
 
 FAMILIES = [
     "hisilicon", "xiongmai", "goke710x", "novatek", "ingenic", "fullhan",
-    "grainmedia", "sigmastar", "anyka", "ambarella", "allwinner",
+    "grainmedia", "sigmastar", "anyka", "ambarella", "allwinner", "rockchip",
 ]
 
 # File-name prefix -> family.  Longest match wins, so "xm510-" and "xm-" both
@@ -69,6 +69,7 @@ PREFIX_FAMILY = {
     "ak-": "anyka", "anyka": "anyka",
     "amb-": "ambarella", "ambarella": "ambarella",
     "aw-": "allwinner", "allwinner": "allwinner",
+    "rk-": "rockchip", "rockchip": "rockchip", "rv1106": "rockchip",
 }
 
 # Jobs in ci.yml, by the families whose code they exercise.  `boot` is
@@ -1287,6 +1288,7 @@ CONFIG_FAMILY = {
     "CONFIG_GRAINMEDIA": "grainmedia", "CONFIG_SIGMASTAR": "sigmastar",
     "CONFIG_ANYKA": "anyka", "CONFIG_AMBARELLA": "ambarella",
     "CONFIG_ALLWINNER_V83X": "allwinner", "CONFIG_ALLWINNER_CAM": "allwinner",
+    "CONFIG_ROCKCHIP_RV11XX": "rockchip",
 }
 
 

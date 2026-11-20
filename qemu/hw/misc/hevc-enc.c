@@ -1769,7 +1769,9 @@ static bool parse_pps(HevcEncHdr *h, BitReader *r)
     }
     h->prm.chroma_qp_offset = cb;
     h->slice_chroma_qp = br_u(r, 1);
-    if (br_u(r, 1) || br_u(r, 1) ||             /* weighted pred, bipred */
+    h->weighted_pred = br_u(r, 1);              /* P slices: a table of
+                                                 * no weights */
+    if (br_u(r, 1) ||                           /* weighted bipred */
         br_u(r, 1) ||                           /* transquant bypass */
         br_u(r, 1) || br_u(r, 1)) {             /* tiles, entropy sync */
         return false;
@@ -1907,6 +1909,13 @@ size_t hevc_enc_hdr_frame(const HevcEncHdr *h, int qp, bool p_slice, int poc,
         }
         if (h->cabac_init_present) {
             bw_bits(&b, prm->cabac_init_flag, 1);
+        }
+        if (h->weighted_pred) {
+            /* pred_weight_table() (7.3.6.3), the weights' defaults */
+            bw_ue(&b, 0);                   /* luma_log2_weight_denom */
+            bw_se(&b, 0);                   /* delta_chroma_log2_... */
+            bw_bits(&b, 0, 1);              /* luma_weight_l0_flag */
+            bw_bits(&b, 0, 1);              /* chroma_weight_l0_flag */
         }
         bw_ue(&b, 1);                       /* five_minus_max_num_merge_cand */
     }

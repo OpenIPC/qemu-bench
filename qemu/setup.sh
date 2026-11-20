@@ -108,6 +108,10 @@ cp qemu/hw/arm/grainmedia.c         "$QEMU_DIR/hw/arm/"
 for f in $(cd qemu && find hw include -name 'gm-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
+cp qemu/hw/arm/rockchip.c           "$QEMU_DIR/hw/arm/"
+for f in $(cd qemu && find hw include -name 'rk-*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
 cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/anyka.h      "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/misc/ak-sysctrl.c        "$QEMU_DIR/hw/misc/"
@@ -1577,6 +1581,70 @@ if ! grep -q "'grainmedia.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('grainmedia.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added grainmedia.c"
+fi
+
+# Rockchip RV1103 / RV1106 (hw/arm/rockchip.c): a Cortex-A7 with a GIC-400
+# and the generic timer.  Its own devices are the hw/*/rk-*.c files, each
+# built under ROCKCHIP_RV11XX.
+if ! grep -q "^config ROCKCHIP_RV11XX$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config ROCKCHIP_RV11XX
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+    select UNIMP
+    select SSI
+    select SSI_M25P80
+    select A15MPCORE
+    select I2C
+    select SD
+    select PL330
+    select USB_EHCI_SYSBUS
+    select USB_OHCI_SYSBUS
+    select OR_IRQ
+    select USB_DWC3
+KCONFIG
+    echo "  hw/arm/Kconfig: added ROCKCHIP_RV11XX"
+else
+    for sym in I2C SD PL330 USB_EHCI_SYSBUS USB_OHCI_SYSBUS OR_IRQ USB_DWC3; do
+        if ! sed -n '/^config ROCKCHIP_RV11XX$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config ROCKCHIP_RV11XX\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: ROCKCHIP_RV11XX now selects $sym"
+        fi
+    done
+fi
+for f in $(cd qemu && find hw -name 'rk-*.c' 2>/dev/null); do
+    d=$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: added $b"
+    fi
+done
+# Other families' models of the same Synopsys cores: the DW APB watchdog
+# (fh-wdt.c), the DWC EQOS GMAC (axera-eqos.c) and the DW MSHC
+# (hisi-himci.c), the generic SPI NAND (ingenic-spinand.c) the RV1126
+# boards boot from, and the shared HEVC, JPEG and H.264 encoders
+# (hevc-enc.c, jpeg-enc.c, hantro-h264.c) behind rk-vepu540c.  A source set lists a file once, whichever symbols add it.
+for f in watchdog/fh-wdt.c net/axera-eqos.c misc/hisi-himci.c \
+         block/ingenic-spinand.c misc/hevc-enc.c misc/jpeg-enc.c \
+         misc/hantro-h264.c; do
+    d=hw/$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "CONFIG_ROCKCHIP_RV11XX', if_true: files('$b')" \
+            "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: $b for ROCKCHIP_RV11XX too"
+    fi
+done
+if ! grep -q "'rockchip.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('rockchip.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added rockchip.c"
 fi
 
 # Ingenic T-series: little-endian XBurst MIPS camera SoCs (hw/mips/ingenic.c),

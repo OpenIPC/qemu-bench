@@ -1,0 +1,63 @@
+arm_gic: the GICv2 aliased CPU interface registers (AIAR, AEOIR, AHPPIR)
+
+A GICv2 with the Security Extensions has Secure-only aliases of the
+Non-secure IAR, EOIR and HPPIR at GICC + 0x20 / 0x24 / 0x28 (GICv2
+architecture spec, 4.4.13 - 4.4.15): Secure software reads 0x20 to take a
+Group 1 interrupt as the Non-secure side would.  The model logged "Bad
+offset" and read zero.
+
+Rockchip's vendor kernels with CONFIG_FIQ_GLUE (RV1103 / RV1106 / RV1126
+SDKs, for the FIQ debugger) run Linux in the Secure state, put every
+interrupt in Group 1 and take them from GICC_AIAR in gic_handle_irq():
+reading 0 there is interrupt 0 forever, and the boot hangs right after
+"Starting kernel".  Implement the three aliases for Secure accesses on a
+GIC with groups; they stay RAZ/WI for Non-secure accesses and on GICs
+without the Security Extensions.
+
+---
+diff --git a/hw/intc/arm_gic.c b/hw/intc/arm_gic.c
+index 899f133..703742d 100644
+--- a/hw/intc/arm_gic.c
++++ b/hw/intc/arm_gic.c
+@@ -1662,6 +1662,24 @@ static MemTxResult gic_cpu_read(GICState *s, int cpu, int offset,
+             *data = s->abpr[cpu];
+         }
+         break;
++    case 0x20: /* Aliased Interrupt Acknowledge */
++    case 0x28: /* Aliased Highest Priority Pending Interrupt */
++        /*
++         * GICv2 with security extensions: a Secure access sees the
++         * Non-secure (Group 1) IAR / HPPIR.  Non-secure accesses and GICs
++         * without groups: RAZ.
++         */
++        if (s->revision != 2 || !gic_has_groups(s) ||
++            gic_cpu_ns_access(s, cpu, attrs) || gic_is_vcpu(cpu)) {
++            *data = 0;
++        } else {
++            MemTxAttrs ns = attrs;
++
++            ns.secure = 0;
++            *data = offset == 0x20 ? gic_acknowledge_irq(s, cpu, ns)
++                                   : gic_get_current_pending_irq(s, cpu, ns);
++        }
++        break;
+     case 0xd0: case 0xd4: case 0xd8: case 0xdc:
+     {
+         int regno = (offset - 0xd0) / 4;
+@@ -1741,6 +1759,16 @@ static MemTxResult gic_cpu_write(GICState *s, int cpu, int offset,
+     case 0x10: /* End Of Interrupt */
+         gic_complete_irq(s, cpu, value & 0x3ff, attrs);
+         return MEMTX_OK;
++    case 0x24: /* Aliased End Of Interrupt */
++        /* Secure access: the Non-secure EOIR (see Aliased Acknowledge) */
++        if (s->revision == 2 && gic_has_groups(s) &&
++            !gic_cpu_ns_access(s, cpu, attrs) && !gic_is_vcpu(cpu)) {
++            MemTxAttrs ns = attrs;
++
++            ns.secure = 0;
++            gic_complete_irq(s, cpu, value & 0x3ff, ns);
++        }
++        return MEMTX_OK;
+     case 0x1c: /* Aliased Binary Point */
+         if (!gic_has_groups(s) || (gic_cpu_ns_access(s, cpu, attrs))) {
+             /* unimplemented, or NS access: RAZ/WI */

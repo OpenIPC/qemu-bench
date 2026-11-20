@@ -1,0 +1,50 @@
+target/arm: a board hook at WFI
+
+A power controller that turns a core off when it executes WFI ("power
+down on WFI", as Rockchip's PMU does for OP-TEE's PSCI CPU_SUSPEND and
+CPU_OFF) needs to know when that happens: the core's own code ends in
+"dsb; wfi; b ." and relies on losing power there, then comes back
+through a reset into a warm-boot entry.  Add an optional per-CPU
+wfi_hook the board sets; it runs at every WFI that is not trapped, before
+the halt.  A hook that marks the CPU off (power_state PSCI_OFF) makes the
+WFI halt it for good: cpu_has_work() is false for an off CPU.  No hook,
+no change.
+
+---
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index 39f2b2e..52bed9e 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -1092,6 +1092,13 @@ struct ArchCPU {
+     uint64_t pmceid0;
+     uint64_t pmceid1;
+     uint64_t mp_affinity; /* MP ID without feature bits */
++    /*
++     * Board hook run at every WFI before the CPU halts: a power
++     * controller that cuts a core's power when it executes WFI (a
++     * "power down on WFI" mode) marks it off here.
++     */
++    void (*wfi_hook)(ARMCPU *cpu, void *opaque);
++    void *wfi_hook_opaque;
+     /* The elements of this array are the CCSIDR values for each cache,
+      * in the order L1DCache, L1ICache, L2DCache, L2ICache, etc.
+      */
+diff --git a/target/arm/tcg/op_helper.c b/target/arm/tcg/op_helper.c
+index 4fbd219..dfb247a 100644
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -382,9 +382,14 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
+     return;
+ #else
+     CPUState *cs = env_cpu(env);
++    ARMCPU *cpu = env_archcpu(env);
+     uint32_t excp;
+     int target_el = check_wfx_trap(env, false, &excp);
+ 
++    if (cpu->wfi_hook && !target_el) {
++        cpu->wfi_hook(cpu, cpu->wfi_hook_opaque);
++    }
++
+     if (cpu_has_work(cs)) {
+         /* Don't bother to go into our "low power state" if
+          * we would just wake up immediately.

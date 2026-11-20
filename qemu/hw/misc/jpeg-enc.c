@@ -141,44 +141,62 @@ static void put_value(BitWriter *w, int v, int size)
     }
 }
 
+/*
+ * One 8-point AAN (Arai, Agui, Nakajima) forward DCT pass over d[0],
+ * d[step], ... d[7 * step], in place: the outputs are the DCT's scaled
+ * by aan_scale[k] * sqrt(8) (libjpeg's jfdctflt.c).
+ */
+static inline void aan_pass(float *d, int step)
+{
+    float t0 = d[0] + d[7 * step], t7 = d[0] - d[7 * step];
+    float t1 = d[step] + d[6 * step], t6 = d[step] - d[6 * step];
+    float t2 = d[2 * step] + d[5 * step], t5 = d[2 * step] - d[5 * step];
+    float t3 = d[3 * step] + d[4 * step], t4 = d[3 * step] - d[4 * step];
+    float t10 = t0 + t3, t13 = t0 - t3, t11 = t1 + t2, t12 = t1 - t2;
+    float z1, z2, z3, z4, z5, z11, z13;
+
+    d[0] = t10 + t11;
+    d[4 * step] = t10 - t11;
+    z1 = (t12 + t13) * 0.707106781f;
+    d[2 * step] = t13 + z1;
+    d[6 * step] = t13 - z1;
+    t10 = t4 + t5;
+    t11 = t5 + t6;
+    t12 = t6 + t7;
+    z5 = (t10 - t12) * 0.382683433f;
+    z2 = 0.541196100f * t10 + z5;
+    z4 = 1.306562965f * t12 + z5;
+    z3 = t11 * 0.707106781f;
+    z11 = t7 + z3;
+    z13 = t7 - z3;
+    d[5 * step] = z13 + z2;
+    d[3 * step] = z13 - z2;
+    d[step] = z11 + z4;
+    d[7 * step] = z11 - z4;
+}
+
 /* Forward 8x8 DCT, then quantise; out[] in zigzag order. */
 static void fdct_quant(const float in[64], const uint8_t q[64], int out[64])
 {
-    static float c[8][8];
-    static bool init;
-    float rows[64], dct[64];
-    int u, v, x, y;
+    static const float aan_scale[8] = {
+        1.0f, 1.387039845f, 1.306562965f, 1.175875602f,
+        1.0f, 0.785694958f, 0.541196100f, 0.275899379f,
+    };
+    float d[64];
+    int k;
 
-    if (!init) {
-        for (u = 0; u < 8; u++) {
-            for (x = 0; x < 8; x++) {
-                c[u][x] = (u ? 0.5f : 0.5f / sqrtf(2.0f)) *
-                          cosf((2 * x + 1) * u * (float)M_PI / 16);
-            }
-        }
-        init = true;
+    memcpy(d, in, sizeof(d));
+    for (k = 0; k < 8; k++) {
+        aan_pass(d + k * 8, 1);         /* rows */
     }
-    for (y = 0; y < 8; y++) {           /* rows: rows[y][u] */
-        for (u = 0; u < 8; u++) {
-            float acc = 0;
-            for (x = 0; x < 8; x++) {
-                acc += c[u][x] * in[y * 8 + x];
-            }
-            rows[y * 8 + u] = acc;
-        }
+    for (k = 0; k < 8; k++) {
+        aan_pass(d + k, 8);             /* columns */
     }
-    for (u = 0; u < 8; u++) {           /* columns: dct[v][u] */
-        for (v = 0; v < 8; v++) {
-            float acc = 0;
-            for (y = 0; y < 8; y++) {
-                acc += c[v][y] * rows[y * 8 + u];
-            }
-            dct[v * 8 + u] = acc;
-        }
-    }
-    for (x = 0; x < 64; x++) {
-        const int nat = zigzag[x];
-        out[x] = (int)lrintf(dct[nat] / q[nat]);
+    for (k = 0; k < 64; k++) {
+        const int nat = zigzag[k];
+        const float scale = aan_scale[nat >> 3] * aan_scale[nat & 7] * 8.0f;
+
+        out[k] = (int)lrintf(d[nat] / (scale * q[nat]));
     }
 }
 

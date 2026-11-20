@@ -1,0 +1,662 @@
+# Rockchip RV1103 / RV1106 / RV1126 (`rv1103`, `rv1106`, `rv1106g3`, `rv1103b`, `rv1126`, `rv1109`)
+
+Rockchip's single Cortex-A7 IP-camera SoCs, all in `hw/arm/rockchip.c`.
+The first three machines are one die with different in-package DDR.
+`rv1103b` is the newer RV1103B / RV1106B die (see below). They boot a camera's
+whole SPI NOR image through the vendor SPL, and on stock firmware through
+U-Boot, to the vendor 5.10 kernel and its userspace.
+
+## Sources
+
+| What | Where |
+|---|---|
+| Memory map, interrupts | `arch/arm/boot/dts/rv1106.dtsi`, rockchip-linux/kernel `develop-5.10` (the Luckfox Pico SDK 1.4 tree has the same map) |
+| SFC, crypto v3, decompressor, ATAGs, SPL | rockchip-linux/u-boot `next-dev`: `drivers/spi/rockchip_sfc.c`, `drivers/crypto/rockchip/crypto_v2.c`, `drivers/misc/rockchip_decompress.c`, `arch/arm/include/asm/arch-rockchip/rk_atags.h` |
+| I2C, GPIO, TRNG, RTC, mailbox, thunder-boot service | rockchip-linux/kernel `develop-5.10`: `drivers/i2c/busses/i2c-rk3x.c`, `drivers/gpio/gpio-rockchip.c`, `drivers/char/hw_random/rockchip-rng.c`, `drivers/rtc/rtc-rockchip.c`, `drivers/mailbox/rockchip-mailbox.c`, `drivers/soc/rockchip/rockchip_thunderboot_service.c` |
+| Sensor chip IDs | the same kernel's `drivers/media/i2c/sc2336p.c`, `sc231hai.c`, `sc3336.c`, `sc530ai.c` |
+| PLL layout | `drivers/clk/rockchip/clk_rv1106.c` (pll_rk3328 type) |
+| Boot behaviour | two Xiongmai camera dumps (below) |
+
+
+## Machines
+
+| Machine | DDR | Boot tested |
+|---|---|---|
+| `rv1103` | 64 MiB | —¹ |
+| `rv1106` | 128 MiB (RV1106G2) | XM "R5" (stock U-Boot chain), XM "G2" (thunder boot) |
+| `rv1106g3` | 256 MiB | —¹ |
+| `rv1103b` | 64 MiB | XM "RV1103" (an RV1103B despite its name; kernel 5.10.209) |
+| `rv1109` | 1 GiB, 2 cores | an RV1109 SPI NAND camera (OP-TEE 3.6, U-Boot 2017.09, kernel 4.19.111, UBIFS) |
+| `rv1126` | 1 GiB, 4 cores | —¹ |
+
+¹ Same die and models as `rv1106`; no image was at hand. `-m` overrides the
+size.
+
+### RV1126 / RV1109 (`rv1126`, `rv1109`)
+
+These are four and two Cortex-A7s with peripherals from `0xFE000000` (the
+vendor kernel's `rv1126.dtsi`, develop-4.19). They boot from SPI NAND on
+the SFC at `0xFFC90000`, through the repo's generic `ingenic-spinand`
+(`gd5f2gq4ub`, 256 MiB). The only dump at hand had lost its first 3 MiB,
+the ID block with every loader before U-Boot, and its bad blocks. So:
+
+- **Rebuilt flash:** `qemu-boot/rv1126-nand-image.py dump nand.bin`
+  rebuilds a flat image.
+  - It puts each partition from the dump's backup GPT back at its offset.
+  - It leaves the skipped bad blocks inside a UBI partition erased; UBI
+    takes them as free.
+  - It writes both GPTs and a protective MBR. U-Boot's EFI probe wants the
+    MBR first.
+- **SPL stand-in (`rk_fit_setup`):**
+  - It finds `uboot.img`, a FIT, and loads U-Boot, U-Boot's dtb right
+    after it, and OP-TEE.
+  - It writes the ATAGs and the boot source (4, SPI NAND).
+  - It enters OP-TEE in the secure world as Rockchip's `spl_optee_entry`
+    does, with `r1` = `lr` = U-Boot and `r2` = the dtb.
+  - OP-TEE then returns to U-Boot non-secure.
+- **Dummy clocks:** U-Boot sends the read-from-cache dummy as a third
+  address byte; the kernel's rkflash sends 8 dummy cycles. So on this
+  machine the SFC sends dummies as bytes (`rk-sfc,dummy-bytes`), and the
+  NAND counts one transfer (`dummy-clocks=1`).
+
+What OP-TEE and Linux need from the SoC, beyond the RV1106's models:
+
+- **CRU:** PMUCRU and CRU PLLs, with the fractional dividers as whole-word
+  registers (`rk-syscon` `plain-regs`). With hiword writes the denominator
+  stays 0, and U-Boot's clock driver divides by zero.
+- **PMU handshakes:** power domains and bus idle (`rk-syscon` `mirror`).
+  Status follows request at once, or the kernel panics in
+  `panic_on_set_idle`.
+- **PMU core power** (`0x90` mode, `0x94` request, `0x9c` status), as
+  OP-TEE's PSCI drives it:
+  - A core in power-down mode loses power at WFI. Patch 0030 adds a WFI
+    hook to QEMU's ARM CPU for this.
+  - A core powered up, or woken by an interrupt at the GIC's inputs, comes
+    out of reset at OP-TEE's trampoline `0xFF710000` in the SRAM (128 KiB).
+  - This is how the second core comes up and how cpuidle's `cpu-sleep`
+    (power-down, `local-timer-stop`) returns.
+- **`rk-timer`:** the rk3288-type timer at `0xFF660000`, the broadcast
+  clockevent of those idle states. Without it, the first idle sleeps
+  forever.
+- **RNG:** the crypto-v2 RNG at `0xFF500400`, inside the crypto block
+  (`rk-trng,crypto-v2`).
+- **VOP (`rk-vop`, `0xFFB00000`):** the display controller. Out of
+  standby it raises frame start and the line flags at 60 Hz
+  (`refresh-hz`), but only the enabled interrupts latch. Window 2, the
+  primary plane, is scanned out to a QEMU graphic console (ARGB8888,
+  RGB888 or RGB565).
+  - The scan-out reads through the VOP's IOMMU (`iommu` link, v1
+    two-level tables). `MST` is an IOVA, and the driver's IOVAs start at
+    0, so 0 is a valid buffer address.
+  - Checked: in the RV1109 guest's root shell,
+    `modetest -M rockchip -s 56:800x480` gives the SMPTE colour bars on
+    the console.
+  - Without the frame interrupt, DRM warned "vblank wait timed out".
+- **Board I2C devices (RV1109 camera):**
+  - The sensor default is the board's IMX415, at `0x1a` on I2C1. The
+    shared IMX415 model now also answers `0x311A` with `0xE0`, the chip ID
+    Rockchip's driver checks.
+  - A PCF8563-compatible RTC, the board's BM8563, is at `0x51` on I2C0
+    (`rk-pcf8563.c`, QOM type `pcf8563`). Linux registers it as `rtc0`.
+- **Audio:** the board's ES8311 codec at `0x18` on I2C4 (`rk-es8311.c`,
+  QOM type `es8311`) and the I2S/TDM controller at `0xFF800000`
+  (`rk-i2s-tdm`).
+  - The I2S FIFOs fill (capture) and drain (playback) at a sample clock
+    (`word-rate`).
+  - The FIFO levels drive the PL330's per-peripheral busy inputs for its
+    DMA requests 20 (TX) and 19 (RX).
+  - The sound card registers with the codec. Capture data is silence,
+    or with `-global rk-i2s-tdm.rx-tone-hz=1000` a 1 kHz sine at a
+    quarter of full scale in every channel, at the rate the clocks give.
+  - `arecord -D hw:0,0 -d 1 -r 16000 -c 2 -f S16_LE` records that sine:
+    16 samples a period, peaking at ±8191.
+  - The DMA's eight event interrupts are ORed onto its first line
+    (SPI 1), as on the chip. With only event 0 wired, capture stalled
+    because its period interrupts never arrived.
+  - The FIFO rate is the one the clock registers give. MCLK comes from the
+    CRU's `CLKSEL_CON(27)` parent PLL and divider, the `CON(28/29)`
+    fraction and the `CON(30)` mux. The I2S then divides it by `CLKDIV`
+    (to BCLK) and `CKR` (to LRCK). A FIFO word is one channel, or two
+    packed 16-bit samples.
+  - A 2 s, 16 kHz `arecord` takes 2.09 s: MCLK is CPLL × 128/15625 =
+    4.096 MHz, then divided by 4 and by 64.
+- **IOMMUs (`rk-iommu`):** the register interface, with nothing
+  translated. The masters behind them aren't modelled. The probe's
+  `DTE_ADDR` test and force reset pass.
+- **DMA:** QEMU's PL330 at `0xFF4E0000`, with its two interrupt lines
+  (SPI 1, 2). The I2S sound card registers with it.
+- **USB host:** QEMU's platform EHCI at `0xFFE00000`, with an OHCI
+  companion at `0xFFE10000`. The naneng PHYs report Rterm calibration
+  done. Attach devices with `-device usb-storage,drive=...,bus=usb-bus.0`.
+  The OTG port's DWC3 (`0xFFD00000`, SPI 85) is QEMU's `usb_dwc3`. It is
+  a host-only core, so the driver runs it as host. Its xHCI is
+  `usb-bus.1`.
+- **OTP:** at `0xFF5C0000`, and the secure one OP-TEE reads at
+  `0xFF5D0000` (`rk-otp`). It is unprogrammed (zeros), and programming
+  only sets bits. OP-TEE checks the status for exact values: 1 after
+  `CEB`, then 0xd after `RSTB`.
+- **Parallel NAND controller:** at `0xFFC80000`, answering "ready, no
+  chip". Otherwise rkflash waits out 100000 polls per command.
+- **NPU (`rk-npu`, `0xFFBC0000`, SPI 107):** the Vivante VIP core that
+  the SDK's `galcore.ko` (6.4.3) drives.
+  - Its identity registers give the RV1126 entry of galcore's built-in
+    feature database (chipModel 0x8000, revision 0x8003, product
+    0x05080009, eco 0x04000000, customer 0xb5). With zeros, the probe
+    fails with "Feature database is not found" and there's no
+    `/dev/galcore`; the SDK's mediaserver then dies in `_OpenDevice`.
+  - `0x000` reads IDLE_3D / IDLE_2D set, which galcore's soft reset waits
+    for.
+  - The command front end walks the stream from `0x654` once `0x658`
+    bit 16 is set: LOAD_STATE to AQ_EVENT raises that event's interrupt
+    bit, END stops, WAIT rests until the next tick, and LINK / CALL /
+    RETURN follow. The jobs' NN / TP work isn't done; outputs are
+    unwritten.
+- **RAM:** the `rv1109` default is 1 GiB. With 512 MiB (256 MiB of it the
+  ISP's CMA), the SDK's mediaserver is OOM-killed.
+- **Camera pipeline:** the SDK runs IMX415 → CSI-2 → CIF → (memory) →
+  ISP20 → ISPP → mediaserver. Its 3A library (rkaiq) takes each raw frame
+  from the CIF and queues it to the ISP's raw read DMA ("read back"). All
+  of it is modelled. mediaserver's display preview shows the scene that
+  `rk-scene.c` draws (the same one as the RV1106's ISP), and its RTSP
+  main stream (`rtsp://<board>/live/mainstream`, 4K H.265 at 25 fps)
+  decodes to it on the host. rkaiq's AE closes its loop: it moves the
+  IMX415's SHR0 and the picture follows.
+  ```
+  qemu-system-arm -M rv1109,flash-file=nand.bin -display none \
+      -nic user,hostfwd=tcp::5554-:554
+  ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:5554/live/mainstream ...
+  ```
+  - **IMX415:** it streams while STANDBY (`0x3000` bit 0) is clear. Its
+    gain (`0x3090`) is 0 dB out of reset, as on the part. Rockchip's
+    driver writes it only when AE changes it, so with the model's
+    old 0xFF the exposure overflowed.
+  - **CIF (`rk-cif`, `0xFFAE0000`, SPI 58):** MIPI channels 0..3
+    (`IDn_CTRL0` bit 0). It gives frame start / end interrupts in
+    `INTSTAT` (write 1 to clear), alternating between the FRAME0 and
+    FRAME1 buffers, at the sensor's rate (25 fps) while the sensor
+    streams. No raw data is written: what the pictures show is drawn
+    later.
+  - **ISP20:** `rk-isp32` with `readback`, at `0xFFB50000` (SPIs 52 / 54
+    / 55), under its IOMMU at `+0x1a00`. A write to `CSI2RX_CTRL0`
+    (`0x1c00`) with bit 0 set runs bits 13:12 + 1 passes (two with
+    dehaze / tone mapping), each with V_START, FRAME_IN and FRAME. The
+    last pass also ends the bridge's path to the ISPP (MI `MPFBC_FRAME`,
+    bit 31). Every pass sets the 3A statistics, in registers as the v2x
+    driver reads them: it reads them at every FRAME. With statistics only
+    on the last pass, rkaiq got an empty buffer for each first pass and
+    reported "no aec stats".
+  - **ISPP (`rk-ispp`, `0xFFB60000`, SPIs 63 / 64):** the driver starts
+    TNR, NR + SHP and FEC per frame through `CTRL_STRT`. Each stage ends
+    with its interrupt (TNR / NR + SHP + each enabled scaler / FEC). The
+    main picture (`SHARP_WR`, or `FEC_WR`) and the scalers' outputs (at
+    their sizes from the 8192-based factors) are the scene, drawn in their
+    formats (NV12 / NV16 / YUYV / UYVY, limited or full range) through
+    the ISPP's IOMMU.
+  - **RGA2 (`rk-rga2`, `0xFFAF0000`, SPI 62):** the command at `CMD_BASE`
+    is run on `CMD_CTRL`: bitblt with nearest-neighbour scaling between
+    the RGB and YUV formats, and solid fill, through the RGA's own page
+    tables. Rotation, blending and ROPs aren't done (straight copy).
+    mediaserver's preview is one of its jobs: NV12 to BGR888 for the
+    VOP's window 2.
+  - **VEPU541:** `rk-vepu540c` with `vepu541`, at `0xFFBB0000` (SPI 68),
+    with the RV1126's register offsets and DMA through its IOMMU
+    (`+0xf00`). mediaserver's 4K H.265 and the smaller streams encode.
+    Its OSD regions (8, at 16×16 block positions, an 8-bit palette index
+    per pixel) are blended into the source by the palette's alpha. The
+    palette word is Y 7:0, U 15:8, V 23:16, alpha 31:24, the HAL's order
+    and not MPP's public `MppEncOSDPltVal`. The stream carries
+    mediaserver's date / time, "Camera 01" and logo in its configured
+    #fff799.
+- **PWM (`rk-pwm`):** three blocks of four at `0xFF430000`, `0xFF440000`
+  and `0xFF550000`, with no interrupt in the RV1126's DT. The registers
+  read back. Read as zeros, every channel looked disabled, and the SDK
+  re-applied its PWMs over and over.
+- **Network:** the board's RMII PHY is at MDIO address 0 (the
+  machine's `gmac_phy`; the RV1106's integrated one is at 2). With 2
+  here, the GMAC found no PHY.
+- **VEPU2 JPEG (`rk-vepu2`, `0xFFB90000`, SPI 74, IOMMU at `+0x800`):**
+  the HAL writes the JPEG header before the output address (register
+  77). The model takes the DQT from it and writes the scan and EOI with
+  the shared `jpeg-enc.c`. Register 53 returns the bits written from the
+  8-byte-aligned start, as the HAL reads it. Inputs: NV12, I420, YUYV,
+  UYVY.
+- **NPU MMU:** galcore runs the command front end on GPU addresses once
+  it turns on the Vivante MMUv2 (`0x388` bit 0, master TLB at `0x184`,
+  loaded by LOAD_STATE). The model walks those tables. A fetch outside
+  RAM stops the front end. Before this, one hit the GIC from a timer, and
+  QEMU crashed.
+
+```
+python3 qemu-boot/rv1126-nand-image.py full.dump nand.bin
+bash qemu-boot/test-rv1106-boot.sh --machine rv1109 --flash nand.bin
+```
+
+The test passes eight milestones in about 7 s:
+
+1. OP-TEE runs.
+2. U-Boot runs, and talks to OP-TEE.
+3. The kernel is loaded from the Android boot partition.
+4. The second core comes up through PSCI.
+5. UBIFS root is mounted.
+6. init and its scripts run.
+
+### RV1103B / RV1106B (`rv1103b`)
+
+A newer die with its peripherals at `0x20000000`, from the vendor kernel's
+`rv1103b.dtsi` and the U-Boot devicetree inside the dump. It has the same
+IP blocks as the RV1106, at other addresses:
+
+- **GIC:** at `0x20411000`.
+- **IRAM:** `0x210F6000`.
+- **Console:** UART0 at `0x20540000`, 1.5 Mbaud.
+- **Flash:** the "FSPI" at `0x20D40000`, which is the SFC under another
+  name.
+- **Sensors:** on I2C4 at `0x20940000`.
+- **SD / SDIO / eMMC:** `0x20D20000`, `0x20650000`, `0x20D30000`.
+
+What differs:
+
+- **Crypto:** v4 at `0x20680000`, with `CRYPTO_VERSION_NEW` 0x04000000.
+- **RNG:** `rockchip,rkrng` at `0x20690000`. Its CTRL at 0x10 is
+  hiword-masked: SW_DRNG_REQ, then an ack in STATE, then 32 bytes at 0x70.
+- **CRU:** only DPLL and GPLL, at TOPCRU `+0x60000`.
+- **DMA:** a Rockchip controller (`rockchip,dma`, `rk-dmac`) instead of
+  the PL330, at `0x20740000` (16 logical and 8 physical channels). It runs
+  the driver's linked lists: memory-to-memory blocks at `mem-rate`
+  bytes/µs, and blocks to or from a peripheral at `dev-rate` bytes/s
+  (default 192000, 48 kHz stereo audio). The pacing stands in for the
+  requests of a peripheral that isn't modelled, so cyclic audio buffers
+  don't spin. Each block writes its position back into the command entry,
+  which is where the driver reads the residue.
+- **SAI:** at `0x20660000`, registers only: version 0x24031103, `STATUS`
+  idle and `CLR` self-clearing. The sound card registers; no samples move.
+- **OTP:** at `0x20820000`. It answers the same way as the RV1106's OTP.
+
+The boot ROM contract is the RV1106's: the SPL at DRAM 0, the boot source
+at IRAM + 0x10, and the ATAGs at 2M − 8K, with SoC 0x1103.
+
+```
+qemu-system-arm -M rv1106,flash-file=dump.bin -nographic -nic user
+```
+
+Machine options besides the flash:
+
+- `sensor=`: the image sensor at 0x30 on I2C4, from the shared catalogue
+  (`hw/i2c/image-sensor.c`); default `sc2336p`. The two dumps' devicetrees
+  list sc2336p and sc231hai there.
+- `sensor2=`: a second sensor at 0x32, for two-sensor boards such as the
+  G2; default `none`.
+- `-drive if=sd,index=0` is the SD card, `index=1` an SDIO slot and
+  `index=2` an eMMC.
+
+`flash-file=` is the camera's whole SPI NOR. Erases and programs are written
+back to it, so boot a copy. The flash is QEMU's m25p80, chosen by image size:
+`w25q64` for 8 MiB, `mx25l12805d` for 16 MiB (QEMU has no `w25q128`, and the
+vendor table accepts the Macronix ID), `w25q256` for 32 MiB.
+`flash-type=` overrides the choice.
+
+## Memory map
+
+| Address | Block | Model | Notes |
+|---|---|---|---|
+| `0x00000000` | DDR | RAM | the SPL is linked at 0 |
+| `0xFF000000` | GRF (PERI_GRF) | `rk-syscon` | reboot mode at +0x20200 |
+| `0xFF1C0000` | RTC | `rk-rtc` | host time, IRQ 98 |
+| `0xFF1F0000` | GIC-400 | `a15mpcore_priv`, 160 IRQs | dist +0x1000, cpu +0x2000; patch 0029 |
+| `0xFF300000` | PMU | `rk-syscon` | |
+| `0xFF310000`, `0xFF320000`, `0xFF450000`, `0xFF460000`, `0xFF470000` | I2C0..4 | `rk-i2c` | the sensor on I2C4; `/machine/i2cN` |
+| `0xFF380000`, `0xFF530000` + n·0x10000 | GPIO0..4 | `rk-gpio` | `/machine/gpioN` |
+| `0xFF388000` / `0xFF538000` | PMUIOC / IOC | `rk-syscon` | |
+| `0xFF3A0000` | CRU (TOPCRU at +0x10000) | `rk-syscon` | PLLs out of reset at the loader's rates, LOCK set |
+| `0xFF3C0000` | SARADC v2 | `rk-syscon` | channels read 0x3ff: no key pressed |
+| `0xFF3C8000` | TSADC | `rk-syscon` | code 530: about 40 °C |
+| `0xFF3D0000` | OTP (secure OTP +0x8000) | `rk-syscon` | INT_STATUS reads done |
+| `0xFF420000` | DMAC | QEMU's `pl330` | 8 channels, ID repeated at +0x3000 |
+| `0xFF440000` | crypto v3 | `rk-crypto` | hash engine only |
+| `0xFF448000` | TRNG v1 | `rk-trng` | host entropy |
+| `0xFF4A0000` + n·0x10000 | UART0..5 | `serial-mm` + DW extras | console UART2, IRQ 27 |
+| `0xFF520000` | hardware decompressor | `rk-decom` | gzip, zlib, LZ4 frames |
+| `0xFF5A0000` | watchdog | `fh-wdt` (DW APB) | fixed TOPs, 24 MHz |
+| `0xFF5C0000` | mailbox to the MCU | `rk-mailbox` | "MCU done" stand-in |
+| `0xFF6C0000` | system SRAM, 256 KiB | RAM | boot source id at +0x10 |
+| `0xFF9A0000`, `0xFFA90000`, `0xFFAA0000` | SDIO, eMMC, SD (DW MSHC 2.70a) | `hisi-himci` | `-drive if=sd,index=1/2/0` |
+| `0xFFA80000` | GMAC (dwmac-4.20a) | `axera-eqos` | integrated PHY 0044.1400 at MDIO 2 |
+| `0xFFAC0000` | SFC | `rk-sfc` | IRQ 53 |
+| `0xFFA00000` | ISP32 | `rk-isp32` | SPIs 105 / 104 / 103 (ISP, MI, MIPI); a scene lit by the sensor's exposure (`sensor` link), NV12 into the mainpath / bypass buffers; AE means and histograms of that scene, to registers and to the DDR stats buffer |
+| `0xFFA10000` | VICAP | `rk-vicap` | SPI 106; the to-ISP frame start / end interrupts (`GLB_INTST` bits 14 / 20) when the ISP's frames run; `toisp-on` gates them |
+| `0xFFA50000` | VEPU540C | `rk-vepu540c` | SPI 107; H.265 through the shared `hevc-enc.c`, under the HAL's own VPS/SPS/PPS; JPEG scan + EOI through `jpeg-enc.c` with the HAL header's DQT, on the thread pool; H.264 I and P pictures through `hantro-h264.c` under the HAL's SPS/PPS |
+| `0xFFB00000` | USB OTG (DWC3) | QEMU's `usb_dwc3` | SPI 54; a host-only core (so the driver runs it as host whatever `dr_mode` says), its xHCI at the base: `-device usb-*,bus=usb-bus.0` |
+| `0xFF350000`, `0xFF360000`, `0xFF490000` | PWM v2 ×3 (four channels each) | `rk-pwm` | SPIs 31 / 33 / 35; counters at 24 MHz, one-shot interrupts |
+| `0xFFAE0000` | I2S/TDM | `rk-i2s-tdm` | PL330 requests 22 / 21; fixed `word-rate` (its CRU clock isn't followed) |
+| `0xFFFF0000` | boot ROM | ROM | |
+
+Everything else from `0xFF000000` is an unimplemented-device catch-all.
+
+## Boot
+
+There is no mask ROM code to run. A stand-in finds the `RKNS` ID block
+(header v2, at flash 0x10000; 0, 0x8000, 0x20000 and 0x40000 are also
+tried). Image entries are 0x58 bytes from header + 0x78, each with
+`size << 16 | offset` in 512-byte sectors. The first entry loaded at
+`0xffffffff` is the DDR-init blob, which is closed and has nothing to train
+here, so it is skipped. The next one is the SPL, which is loaded at DRAM 0
+and run. On the G2 dump, entry 1 is data at 0x40000, not code.
+
+The stand-in recreates what the ROM and DDR blob leave behind:
+
+- **SRAM + 0x10:** boot source 3 (SPI NOR).
+- **Preloader ATAGs at `0x1FE000`** (2 MiB − 8 KiB), each with a hash word
+  of 0, meaning "accept":
+  - `CORE`
+  - `SERIAL`: UART2, 115200
+  - `DDR_MEM`: base in `bank[i]`, size in `bank[count + i]`. A size in the
+    wrong slot gives U-Boot's "Bidram Error".
+  - `SOC_INFO`: `0x1106` with `SOC_FLAGS_TDBT`. Both dumps' DDR blobs set
+    this flag. A thunder-boot SPL needs it to boot the kernel it has
+    preloaded. Without it, the SPL jumps to U-Boot, which the preloaded
+    kernel at 0x208000 and the SPL's 64 KiB environment buffer at 0x21E000
+    have already overwritten.
+
+From there the firmware runs unmodified:
+
+| Chain | What happens | Models it needs |
+|---|---|---|
+| Stock (R5) | SPL → U-Boot FIT, each image sha256-checked → U-Boot 2017.09 → kernel FIT (inside SquashFS on R5) → Linux 5.10.160 | SFC, crypto, ADC, OTP, CRU |
+| Thunder boot (G2) | SPL → meta partition, MCU firmware, U-Boot and kernel preloaded (gzip, on the decompressor) → "Jumping to Kernel(0x00208000)" → Linux 5.10.160 → erofs ramdisk root | decompressor too |
+
+## Models
+
+**`rk-sfc`.** The FSPI controller:
+
+- **Registers:** CTRL to DATA, the CS1 copy at +0x200, `VER` (property,
+  default 8), and `LEN_EXT` for version ≥ 4.
+- **Commands:** a command without an address starts at the CMD write;
+  otherwise it starts at the ADDR write.
+- **Dummies:** one `ssi_transfer` per dummy cycle.
+- **Reads:** buffered from the start of the transfer.
+- **Writes:** flushed once every byte has arrived.
+- **DMA:** `DMA_TRIGGER` copies the whole transfer.
+- **Status:** RISR TRAN_FINISH is bit 4 and DMA bit 7.
+
+**`rk-crypto`.** Crypto v3, hash engine only:
+
+- **Hashing:** a descriptor-list DMA (START / RESTART on DMA_CTL, pause and
+  last flags), done with QEMU's `qcrypto_hash`.
+- **Algorithms:** SHA1, MD5, SHA256, SHA384 and SHA512, as advertised in
+  `HASH_VERSION`. There is no SM3 or SHA-224.
+- **Digest:** in `DOUT` at 0x3a0, as big-endian words.
+
+**`rk-decom`.** The hardware decompressor:
+
+- **Formats:** gzip, zlib and raw deflate via zlib, and LZ4 frames
+  decoded here. LZ4 checks the header, block and content xxHash32 sums
+  that CTRL bits 1..3 ask for. Each bad part has its own ISR bit: header
+  1, sequence 3, checksums 13 / 14 / 15.
+- **Timing:** jobs take virtual time (`out_len / rate` µs, property `rate`,
+  default 200 bytes/µs). The thunder-boot SPL starts the kernel's
+  decompression, keeps loading, and polls STAT later, as it does on the
+  real chip.
+
+**`rk-syscon`.** Register file for CRU, GRF, PMU, IOC, OTP and SARADC:
+
+- **Writes:** hiword-mask writes, unless the `hiword` property is off.
+- **`lock-regs`:** registers whose bit 10 (PLL LOCK) always reads set.
+- **`init`:** reset values.
+- **`const`:** fixed reads, for status registers the drivers clear by
+  writing them, such as OTP's.
+
+**`rk-i2c`.** The RK3x controller, version 0 in CON:
+
+- **TX mode:** the first TXBUF byte after START is the address.
+- **Register modes:** MRXADDR, then MRXRADDR's valid register bytes, then a
+  restart to read: the kernel's combined write/read in one go.
+- **Long reads:** a further 32-byte chunk is plain RX on the open transfer.
+- **NACK:** NAKRCV, and the bus is let go.
+- **CON1 auto stop:** only used from version 5.
+- **Timing:** every transfer completes at the count write.
+
+**`rk-gpio`.** GPIO v2:
+
+- **Writes:** each control register is two hiword-masked halves (pins
+  0..15 at the offset, 16..31 at +4).
+- **Both-edge pins:** `INT_BOTHEDGE` makes a pin edge-triggered whatever
+  `INT_TYPE` says. Linux sets only `INT_BOTHEDGE` for both edges; reading
+  that pin as a level interrupt storms the G2's power key.
+- **Pins:** qdev GPIOs both ways; `input-levels` sets the inputs at reset.
+
+**`rk-trng`.** TRNG v1 with `VERSION` 0x46bc and host entropy. The kernel
+refuses other versions, and its hwrng then retries for 10 s.
+
+**`rk-rtc`.** The BCD calendar on the host clock, with an alarm:
+
+- **Writes:** only the low byte counts (the driver ORs in a key).
+- **`STATUS1`:** follows `CTRL.START` at once. The driver polls it and
+  gives up after 3 s.
+- **Trim test:** done at once, with an exact count, so no compensation.
+
+**`rk-mailbox`.** The mailbox's registers, and a stand-in for the RISC-V
+MCU's firmware. On thunder-boot boards the MCU brings the sensor up and
+then reports "done" on channel 1 (cmd 0xf00d, data 0xdeadbeef). The
+kernel's thunder-boot service waits for that report. Until it comes, the
+I2C, ISP and CIF drivers it shares with the MCU keep their interrupts off,
+and every sensor access times out. The stand-in posts the message at
+reset.
+
+**Reused models.** The rest are the same Synopsys cores modelled for other
+families:
+
+- **Watchdog:** the DW APB watchdog `fh-wdt`, with `comp-params-1`
+  advertising fixed TOPs. Without them `dw_wdt` gives up.
+- **GMAC:** the DWC EQOS `axera-eqos`, with `phy-addr` 2 and `snps-ver`
+  0x42. The PHY ID is the same as the Axera board's.
+- **SD / SDIO / eMMC:** the DW MSHC `hisi-himci`. Its VERID 270a and data
+  window at 0x200 are what `dw_mmc` expects.
+- **DMA:** QEMU's PL330. The AMBA bus reads the PrimeCell ID at the top of
+  the devicetree's 16 KiB, so the register file repeats there.
+
+**UART.** QEMU's 16550 with regshift 2. A DesignWare extras region at
++0x20 makes `USR` (0x7c) read 0x6 plus RFNE, and RFL report the receive
+FIFO. The vendor SPL polls `USR`.
+
+**GIC (patch 0029).** The vendor kernel uses `CONFIG_FIQ_GLUE`, so Linux runs
+in the secure world with every interrupt in group 1. It acknowledges through
+the aliased CPU-interface registers: `GICC_AIAR` (0x20), `AEOIR` (0x24) and
+`AHPPIR` (0x28). QEMU's GIC read those as "bad offset", and the kernel hung
+right after "Starting kernel".
+
+## Xiongmai firmware
+
+Xiongmai keeps the kernel console off unless its U-Boot environment says
+`xmuart=0`. The environment is at flash 0: 64 KiB with a CRC32 first,
+calculated over the rest. Without the variable, everything after "Starting
+kernel" / "Jumping to Kernel" is silent, with nothing wrong in the model.
+`qemu-boot/test-rv1106-boot.sh` adds the variable to its copy of any image
+that carries XM's SPI NOR code (`XmSpiNor`).
+
+No dump's root password is known, so the test stops at getty.
+
+```
+bash qemu-boot/test-rv1106-boot.sh --flash dump.bin [--log console.log]
+bash qemu-boot/test-rv1106-boot.sh --machine rv1103b --flash rv1103b.bin
+```
+
+The test checks these milestones in order:
+
+1. SPL banner
+2. SPL reading the NOR
+3. "Jumping to Kernel" or "Starting kernel"
+4. init running `rcS`
+5. getty
+
+The R5 reaches getty in about 3 s, the G2 and the RV1103B in about 34 s.
+Most of the time on the G2 and the RV1103B is their SDIO Wi-Fi driver
+(`hcc`) waiting 30 s for a card that isn't there.
+
+Messages that are expected, because the hardware isn't modelled:
+
+- the XM app reporting an unknown product. It reads its hardware ID from
+  the flash's OTP area, which no dump contains, then segfaults, so its TCP
+  servers never come up. The network itself works: with `-nic user`, the
+  R5 sets 192.168.1.10, answers ARP, and resets connections to closed
+  ports.
+- the G2's ISP: "wait thunderboot over timeout"
+- the G2's empty `mtd` partition (all zeros in the dump) failing to mount
+  as JFFS2
+
+## OpenIPC firmware (rv1106, SPI NAND, `-kernel`)
+
+OpenIPC's own RV1106 release boots on the `rv1106` machine to its login
+prompt, in about 6 s. Unlike the vendor dumps, its root has no password.
+
+```
+python3 qemu-boot/rv1106-openipc-image.py \
+    openipc.rv1106-nand-lite.tgz openipc.rv1106-nor-lite.tgz img/
+bash qemu-boot/test-rv1106-boot.sh --openipc img/
+```
+
+- **Image:** the script builds a 128 MiB data-only NAND image with the
+  release's UBI at 1 MiB and partitions given by `mtdparts=spi-nand0:…`.
+  The kernel and devicetree (Luckfox Pico Pro) come from the NOR
+  release's `zboot.img`, an Android boot image whose second stage is an
+  RSCE blob.
+- **NAND:** `flash-type=w25n01gv` (any `ingenic-spinand` part) puts the
+  SFC in NAND mode on a machine whose dumps use NOR. Mainline Linux's
+  SPI NAND driver finds it as "Winbond SPI NAND".
+- **Secure boot:** `-kernel` on the RV1103/RV1106 machines starts Linux
+  in the secure world, as the vendor U-Boot leaves it, since there's no
+  secure firmware. Booted non-secure, every interrupt stays in GIC
+  group 0 and the first timer tick never comes.
+- **U-Boot environment:** the image carries one at 0x40000 (64 KiB,
+  CRC32 first). OpenIPC's `fw_printenv` has no `fw_env.config`, so it
+  searches the MTD partitions in order for a valid CRC, mapping each
+  one whole. Without an environment it maps the 127 MiB UBI partition
+  into 96 MiB of RAM, and `rcS` thrashes forever in `check_mac`.
+- **Camera pipeline:** with `sensor=sc3336` (the Luckfox board's),
+  majestic runs the whole chain. The vendor modules load, the sensor is
+  detected, and the Rockchip camera library starts. `rk-isp32` writes
+  its test picture to the mainpath and bypass buffers, and
+  `rk-vepu540c` encodes it to H.265 (1698 frames, none lost or timed
+  out). A dump of the encoder output decodes in ffmpeg with no errors:
+  2304×1296, GOP 5.
+  - The kernel MPP (kmpp) writes the VPS/SPS/PPS before BSBS, and the
+    model parses them. The PPS sets `weighted_pred_flag`, so P slices
+    carry a default `pred_weight_table()` (added to `hevc-enc.c`).
+  - The reference for a P frame is the reconstruction the previous job
+    wrote at the address this one reads (`rfpw` → `rfpr`).
+  - JPEG (the snapshot channel, from the mainpath) runs alongside, with
+    no frames lost on either path. The HAL writes SOI..SOS, and the model
+    writes the scan and EOI with that header's DQT. A 2304×1296 scan
+    takes about 11 ms of host time, on QEMU's thread pool.
+    `jpeg-enc.c`'s DCT is now AAN, 2.2× faster and byte-identical on
+    the benchmark picture.
+  - H.264 jobs (`ENC_PIC` standard 0) are coded by the shared H.264
+    encoder under the HAL's SPS/PPS, through `h264_enc_frame_ref` (new):
+    - an IDR when `SYNT_NAL` says so, an I slice when `SYNT_SLI0`'s type
+      is 2, else a P slice with inter coding against the previous
+      picture's reconstruction (one reference, a default weight table
+      when the PPS weights);
+    - the reconstruction follows the `RFPW` → `RFPR` addresses.
+
+    The qtest decodes an IDR, an unchanged P and a shifted P in ffmpeg,
+    under libx264's baseline (CAVLC) and main (CABAC) headers. The
+    shifted P is 16–19 bytes against a 51–63-byte IDR.
+  - Sensor → ISP: the frame is a scene: a grey gradient, colour bars, a
+    clipping lamp and a moving box. It's lit by the sensor model's
+    exposure (integration lines × gain, read through
+    `image_sensor_exposure()`), and the frame period follows the
+    sensor's frame length. Setting the SC3336's exposure registers over
+    I2C changes the picture: mean Y went from 44 to 98 at 0x3e01 = 0x40.
+  - Statistics in memory: the RV1106 driver runs as `ISP_V32`
+    (`rd_stats_from_ddr`). The ISP writes `struct isp32_stat` to
+    `MI_3A_WR_BASE` (0x197c, latched at frame start): AE means at 0x000,
+    0x390, 0x720 and 0xab0, and histograms at 0xc00 to 0x1800. AF and
+    AWB (0x1c00, 0x2b00) aren't written.
+  - Frame sync: with the sensor behind VICAP, the camera library takes
+    its start-of-frame events from the CSI-2 subdevice. rkcif queues
+    them from VICAP's to-ISP frame-start interrupt, which `rk-vicap` now
+    raises at each ISP frame start.
+  - The ISP's frames now run only while VICAP's to-ISP channel is on and
+    the sensor streams (`image_sensor_streaming()`, from SmartSens
+    0x0100). That keeps the CSI-2 and ISP sequence counters equal
+    (checked with gdb: 465 and 465).
+  - The vendor AE loop closes. majestic starts at the SC3336 driver's
+    initial exposure (mean Y 44) and settles at mean Y 104 within 2 s.
+    Exposure is forced down by hand over I2C, and AE restores it within
+    a second. What it took, found with gdb in the stripped
+    `librkaiq.so` (via Ghidra string cross-references, hardware
+    breakpoints at the library's base + offset):
+    1. Frame syncs from VICAP's to-ISP FS interrupt (`rk-vicap`).
+    2. The ISP's frames gated on VICAP's channel and the sensor's
+       stream, so the frame-sync and statistics counters match.
+    3. Every enabled statistics block must report done. With only big
+       window 1, AE's pre-process found the AE statistics invalid and
+       skipped the algorithm. That meant no `AE_PRE_RES` message, and
+       every analyzer group behind it waited, which is why no
+       parameters were ever queued. Now all three big windows (0x4400,
+       0x4600, 0x4700) and all four histograms report done.
+    4. The statistics go to memory at `MI_3A_WR_BASE`, at 0x197c.
+
+  - 3A statistics in registers (the lite ISP's path): the driver reads
+    them at each frame end. `rk-isp32` sets `MEAS_DONE` (bit 31 of each block's
+    control register, write-one-to-clear) and the block's 3A raw-status
+    bit, and supplies mid-grey, neutral values. The camera library's
+    "AWB stats invalid" messages stopped (from one per frame to 0).
+  - `MI_WR_CTRL2`'s self-update bits latch a path's shadows at once. When
+    the driver restarts a path that paused for lack of buffers, it
+    enables it, self-updates and disables it again, all within one
+    frame. With shadows taken only at frame start, the path stayed off
+    and its buffers never came back. That was the intermittent mainpath
+    or bypass stall, worst under host load. Since the fix, 8 of 8
+    four-at-once runs lose no frames, where the batch before lost frames
+    in 4 of 4.
+- **RV1103:** the same script builds OpenIPC's RV1103 release (Luckfox
+  Pico Plus devicetree), which boots on `-M rv1103` with
+  `--machine rv1103 --openipc DIR`. In 64 MiB the kernel's 32 MiB CMA
+  doesn't fit, so the image adds `rk_dma_heap_cma=24M` (Rockchip's
+  DMA-heap reservation, which the vendor U-Boot passes). With it,
+  majestic runs the whole camera pipeline with no frames lost.
+- **First login:** OpenIPC asks the camera's owner to set a root
+  password and to accept the Majestic EULA in person. The test stops at
+  the login prompt.
+
+## Not modelled
+
+RV1103 / RV1106:
+
+- **Capture front end:** VICAP (rkcif, `0xFFA10000`) only raises its
+  to-ISP frame start / end interrupts: no DMA capture to memory
+  (readback or raw dumps), and no MIPI interrupts. The CSI-2 host and
+  D-PHY are storage. The ISP renders the sensor's scene itself, at the
+  sensor's exposure.
+- **ISP processing:** the ISP's own white balance, colour and tone
+  settings aren't applied (fixed gamma, neutral light). AWB and AF
+  statistics aren't produced from the scene.
+- **Encoder:** H.265 P slices use the shared encoder's simple inter
+  coding (skip, or intra where the picture changed). There's no
+  link-table mode, no online (DVBM) mode, no wrap reference buffers,
+  and no OSD or ROI. RKVENC-PP (`0xFFA60000`) is storage.
+- **RGA** 2D engine: it loads, but no jobs are modelled (majestic
+  doesn't submit any).
+- **RKNN NPU** and **RVE**: storage.
+- **USB device mode:** the DWC3 is a host only. Its gadget side
+  (OpenIPC's gadgetfs, RNDIS) isn't modelled. PWM is modelled (`rk-pwm`),
+  but its output level isn't.
+- **Audio codec** (the analogue acodec): registers only. The I2S/TDM
+  FIFO paces with silence, and recordings capture zeros (or the
+  `rx-tone-hz` test tone).
+- **RISC-V MCU:** the SPL loads its firmware to `0xFF6FF000` and starts
+  it; only its final mailbox message is stood in for.
+- **XM firmware:** XM's App on the G2 dump needs the `HWID` U-Boot
+  variable that the dump lacks (see Xiongmai firmware).
+
+RV1109 / RV1126:
+
+- AWB and AF statistics from the scene (AWB is neutral). The ISPP's
+  params buffers run short now and then ("no free ispp params buffer").
+- The VEPU2's H.264 (its JPEG is modelled) and the VDPU decoders.
+- rkaiq's "no free ispp params buffer" now and then: its threads run late
+  under emulation (the CIF's "frame drop to dummy buf" too). That's not a
+  missing model.
+- The NPU's computation (only its command front end and events run), so
+  mediaserver's face detection drops its frames.
+- No microphone: the I2S RX path gives silence, or the `rx-tone-hz` tone.

@@ -149,6 +149,7 @@ typedef struct HevcEncHdr {
     bool deblocking_override;
     bool lf_across_slices;
     bool slice_ext;
+    bool weighted_pred;     /* P slices carry a pred_weight_table() */
 } HevcEncHdr;
 
 /*
