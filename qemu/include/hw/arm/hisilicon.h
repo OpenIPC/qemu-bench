@@ -275,7 +275,7 @@ typedef struct HisiSoCConfig {
      * the Hi3516EV200 family; 5 = Hi3516CV610 */
     uint8_t         media_gen;
     /* hisi-vedu's own layout when it differs from media_gen's (0: the
-     * same): 7 = GK7206 / Xiongmai xmorca */
+     * same): 2 = Hi3516CV200 / Hi3518EV200, 7 = GK7206 / Xiongmai xmorca */
     uint8_t         vedu_gen;
     /* CRG reset handshakes: request registers whose bit 0 the next one
      * echoes (hisi-crg "rst-ack"); 0 ends the list */
@@ -323,6 +323,12 @@ typedef struct HisiSoCConfig {
     /* CIPHER v1 (hisi-cipher, the CV200 family's hi_cipher.ko): 0 = none */
     hwaddr          cipher_base;
     int             cipher_irq;
+    /* CV200 VIU + ISP (hisi-viu) over the "hisi-viu" bank: its VIC line,
+     * 0 = the bank stays a stub */
+    int             viu_irq;
+    /* CV200 VPSS node engine (hisi-vpss-v2) over the "hisi-vpss" bank:
+     * its VIC line, 0 = the bank stays a stub */
+    int             vpss_v2_irq;
 
     /* SATA AHCI controller (sysbus-ahci) — DVR/NVR family.
      * Vendor SATA module busy-loops if the controller is absent; even a

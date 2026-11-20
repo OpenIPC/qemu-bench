@@ -673,7 +673,17 @@ static const HisiSoCConfig hi3518ev100_soc = {
     .reg_presets        = { { 0x20100814, 0x08000001 } },                  \
     /* hi_cipher.ko: REG_BASE_PHY_ADDR_CIPHER, cipher_irq (VIC 13) */         \
     .cipher_base        = 0x100C0000,                                        \
-    .cipher_irq         = 13
+    .cipher_irq         = 13,                                                \
+    /* VIU + ISP: "ISP, VIU" on VIC 22 in the camera's /proc/interrupts */   \
+    .viu_irq            = 22,                                                \
+    .vpss_v2_irq        = 17,                   /* "VPSS0" */                \
+    /* H.264 (hi3518e_h264e.o) and JPEG (hi3518e_jpege.o): hisi-vedu gen 2   \
+     * ("VEDU_0" VIC 24, "JPEGU_0" 26) */                                    \
+    .vedu_base          = 0x20620000,                                        \
+    .jpge_base          = 0x20660000,                                        \
+    .vedu_irq           = 24,                                                \
+    .jpge_irq           = 26,                                                \
+    .vedu_gen           = 2
 
 static const HisiSoCConfig hi3516cv200_soc = {
     HISI_CV200_COMMON,
@@ -6386,7 +6396,7 @@ static void hisilicon_common_init(MachineState *machine,
      * what VI's statistics measure and VPSS's pictures show.
      */
     DeviceState *scene = NULL;
-    if (c->vi_cap_base || c->lotus_media) {
+    if (c->vi_cap_base || c->lotus_media || c->viu_irq) {
         scene = qdev_new("hisi-scene");
         object_property_add_child(OBJECT(machine), "scene", OBJECT(scene));
         qdev_realize_and_unref(scene, NULL, &error_fatal);
@@ -6394,6 +6404,14 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* VI: capture and the ISP pipe, the online pipeline's frame clock */
     DeviceState *vi = NULL;
+    DeviceState *viu = NULL;            /* CV200: capture + ISP in one */
+    hwaddr viu_base = 0;
+    if (c->viu_irq) {
+        viu = qdev_new("hisi-viu");
+        object_property_set_link(OBJECT(viu), "scene", OBJECT(scene),
+                                 &error_fatal);
+        object_property_add_child(OBJECT(machine), "viu", OBJECT(viu));
+    }
     DeviceState *lotus_vpss = NULL;     /* lotus media: VPSS paints */
     if (c->vi_cap_base) {
         vi = qdev_new("hisi-vi");
@@ -6618,6 +6636,25 @@ static void hisilicon_common_init(MachineState *machine,
                 continue;
             }
 
+            /* CV200: VPSS is a node engine (hisi-vpss-v2) behind VI offline */
+            if (c->vpss_v2_irq && !strcmp(c->regbanks[n].name,
+                                          "hisi-vpss")) {
+                DeviceState *v2 = qdev_new("hisi-vpss-v2");
+                object_property_add_child(OBJECT(machine), "vpss",
+                                          OBJECT(v2));
+                sysbus_realize(SYS_BUS_DEVICE(v2), &error_fatal);
+                sysbus_mmio_map(SYS_BUS_DEVICE(v2), 0, c->regbanks[n].base);
+                sysbus_connect_irq(SYS_BUS_DEVICE(v2), 0,
+                                   pic[c->vpss_v2_irq]);
+                continue;
+            }
+            /* CV200: VIU + ISP (hisi-viu), realized once the sensor is
+             * linked to it, after this loop */
+            if (viu && !strcmp(c->regbanks[n].name, "hisi-viu")) {
+                viu_base = c->regbanks[n].base;     /* mapped once linked */
+                continue;
+            }
+
             /*
              * VGS: the engine behind VPSS's extended channels, where a SoC
              * gives its interrupt (hisi-vgs: the node-list contract of
@@ -6748,6 +6785,10 @@ static void hisilicon_common_init(MachineState *machine,
             DeviceState *sensor = image_sensor_create(
                 I2C_BUS(qdev_get_child_bus(i2c_devs[0], "i2c")), sensor_name);
 
+            if (viu && sensor) {
+                object_property_set_link(OBJECT(viu), "sensor",
+                                         OBJECT(sensor), &error_fatal);
+            }
             if (vi && sensor) {
                 /* the ISP's statistics measure the sensor's exposure */
                 object_property_set_link(OBJECT(vi), "sensor",
@@ -6763,6 +6804,12 @@ static void hisilicon_common_init(MachineState *machine,
                          "or matching SPI controller", sensor_name);
             exit(1);
         }
+    }
+
+    if (viu) {
+        sysbus_realize(SYS_BUS_DEVICE(viu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(viu), 0, viu_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(viu), 0, pic[c->viu_irq]);
     }
 
     if (flash_boot) {
