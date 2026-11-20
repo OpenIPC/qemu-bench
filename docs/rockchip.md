@@ -521,7 +521,10 @@ built into the model enumerates whatever gadget is bound:
   descriptors, sets address 1 and the configuration.
 - **Data:** if the configuration has a CDC ECM function, the host selects
   its data interface's alternate setting 1 and bridges its bulk
-  endpoints to `-nic ...,model=usb-gadget`.
+  endpoints to `-nic ...,model=usb-gadget`. An RNDIS function instead
+  gets REMOTE_NDIS_INITIALIZE and a packet filter (SEND_ENCAPSULATED_COMMAND,
+  each answer read back with GET_ENCAPSULATED_RESPONSE), which turns its
+  carrier on. Its frames travel in REMOTE_NDIS_PACKET_MSGs.
 
 On OpenIPC (built-in `g_cdc`), `usb0` gets 10.0.2.15 by DHCP from QEMU's
 user network. Pings answer, and a 1.7 MB file served over the gadget
@@ -533,8 +536,12 @@ qemu-system-arm -M rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device
     -nic user,model=usb-gadget,hostfwd=tcp::18080-:8080
 ```
 
-The RV1109 SDK's configfs gadget (adb over FunctionFS) enumerates to
-"configured", but its traffic isn't bridged.
+The RV1109 SDK's configfs gadget enumerates to "configured" as it
+ships (adb over FunctionFS, whose traffic isn't bridged). Switched to
+RNDIS (`echo usb_rndis_en > /tmp/.usb_config; /etc/init.d/S50usbdevice
+restart`), its usb0 runs and answers pings over
+`-nic user,model=usb-gadget,net=10.0.3.0/24` (a net apart from the
+GMAC's).
 
 A gotcha: the driver chains a 2-byte bounce TRB after each unaligned OUT
 request, with the IOC on the bounce. A short packet has to complete the
@@ -676,9 +683,8 @@ RV1103 / RV1106:
 - **RGA** 2D engine: it loads, but no jobs are modelled (majestic
   doesn't submit any).
 - **RKNN NPU** and **RVE**: storage.
-- **USB gadget functions other than CDC ECM:** they enumerate, but only
-  ECM's data is bridged (no RNDIS, ACM, mass storage, UVC or FunctionFS
-  traffic). PWM is modelled (`rk-pwm`), but its output level isn't.
+- **USB gadget functions other than CDC ECM and RNDIS:** they enumerate,
+  but no ACM, mass storage, UVC or FunctionFS traffic is bridged. PWM is modelled (`rk-pwm`), but its output level isn't.
 - **Audio codec** (the analogue acodec): registers only. The I2S/TDM
   FIFO paces with silence, and recordings capture zeros (or the
   `rx-tone-hz` test tone).

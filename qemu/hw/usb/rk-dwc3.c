@@ -44,8 +44,12 @@
  * the configuration has a CDC Ethernet (ECM) function, selects its data
  * interface's alternate setting 1 and bridges its bulk endpoints to the
  * network backend ("netdev"): each request the gadget sends IN is a frame
- * out, each frame in fills the next OUT TRBs.  Its notifications are
- * read and dropped.  Other functions enumerate and stay idle.
+ * out, each frame in fills the next OUT TRBs.  An RNDIS function instead
+ * gets REMOTE_NDIS_INITIALIZE and a packet filter (SEND_ENCAPSULATED_
+ * COMMAND, each answer read with GET_ENCAPSULATED_RESPONSE), which turns
+ * its carrier on, and its frames travel in REMOTE_NDIS_PACKET_MSGs.
+ * Notifications are read and dropped.  Other functions enumerate and
+ * stay idle.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -137,7 +141,8 @@ enum {
 
 enum {
     STEP_DEV_DESC, STEP_SET_ADDR, STEP_CFG9, STEP_CFG, STEP_SET_CFG,
-    STEP_SET_IF, STEP_DONE,
+    STEP_SET_IF, STEP_RNDIS_INIT, STEP_RNDIS_INIT_RSP, STEP_RNDIS_FILTER,
+    STEP_RNDIS_FILTER_RSP, STEP_DONE,
 };
 
 struct RkDwc3State {
@@ -160,6 +165,7 @@ struct RkDwc3State {
     bool ctl_in;
     uint8_t cfg_value;
     int ecm_data_if;            /* -1: none */
+    int rndis_if;               /* RNDIS control interface, -1: none */
     int ep_in, ep_out, ep_notify;   /* physical endpoint numbers, -1 none */
 
     uint8_t tx[MAX_FRAME];      /* the frame the gadget is sending */
@@ -375,6 +381,20 @@ static void rk_dwc3_ctl_start(RkDwc3State *s, uint8_t type, uint8_t req,
     s->hstate = H_SETUP;
 }
 
+/* A class request with an OUT data stage: @len bytes of @data */
+static void rk_dwc3_ctl_out(RkDwc3State *s, uint8_t type, uint8_t req,
+                            uint16_t value, uint16_t index,
+                            const uint32_t *data, int words)
+{
+    int i;
+
+    rk_dwc3_ctl_start(s, type, req, value, index, words * 4);
+    for (i = 0; i < words; i++) {
+        stl_le_p(&s->ctl[4 * i], data[i]);
+    }
+    s->ctl_len = words * 4;
+}
+
 static void rk_dwc3_ecm_scan(RkDwc3State *s)
 {
     uint32_t i = 0, len = s->ctl_len;
@@ -383,6 +403,7 @@ static void rk_dwc3_ecm_scan(RkDwc3State *s)
 
     s->cfg_value = len > 5 ? s->ctl[5] : 1;
     s->ecm_data_if = -1;
+    s->rndis_if = -1;
     s->ep_in = s->ep_out = s->ep_notify = -1;
     while (i + 2 <= len && s->ctl[i] >= 2) {
         const uint8_t *d = &s->ctl[i];
@@ -393,7 +414,16 @@ static void rk_dwc3_ecm_scan(RkDwc3State *s)
             if (d[5] == 2 && d[6] == 6) {           /* CDC ECM control */
                 comm_if = cur_if;
             }
-            data_if = d[5] == 0x0a && comm_if >= 0 && cur_alt == 1;
+            if ((d[5] == 0xe0 && d[6] == 1 && d[7] == 3) ||
+                (d[5] == 2 && d[6] == 2 && d[7] == 0xff)) {    /* RNDIS */
+                comm_if = cur_if;
+                if (s->rndis_if < 0) {
+                    s->rndis_if = cur_if;
+                }
+            }
+            /* ECM's data endpoints are in alternate setting 1, RNDIS's 0 */
+            data_if = d[5] == 0x0a && comm_if >= 0 &&
+                      cur_alt == (comm_if == s->rndis_if ? 0 : 1);
             if (data_if && s->ecm_data_if < 0) {
                 s->ecm_data_if = cur_if;
             }
@@ -440,12 +470,37 @@ static void rk_dwc3_enum_next(RkDwc3State *s)
         rk_dwc3_ctl_start(s, 0x00, 9, s->cfg_value, 0, 0);
         break;
     case STEP_SET_IF:
-        if (s->ecm_data_if >= 0) {
+        if (s->ecm_data_if >= 0 && s->rndis_if < 0) {
             rk_dwc3_ctl_start(s, 0x01, 11, 1, s->ecm_data_if, 0);
             break;
         }
         s->step++;
         /* fall through */
+    case STEP_RNDIS_INIT:
+        if (s->rndis_if >= 0) {
+            /* REMOTE_NDIS_INITIALIZE_MSG: v1.0, 16 KiB transfers */
+            static const uint32_t init[] = { 2, 24, 1, 1, 0, 0x4000 };
+
+            rk_dwc3_ctl_out(s, 0x21, 0, 0, s->rndis_if, init, 6);
+            break;
+        }
+        s->step = STEP_DONE;
+        s->hstate = H_RUN;
+        break;
+    case STEP_RNDIS_INIT_RSP:
+    case STEP_RNDIS_FILTER_RSP:
+        /* GET_ENCAPSULATED_RESPONSE: the gadget queued it at once */
+        rk_dwc3_ctl_start(s, 0xa1, 1, 0, s->rndis_if, sizeof(s->ctl));
+        break;
+    case STEP_RNDIS_FILTER: {
+        /* REMOTE_NDIS_SET_MSG OID_GEN_CURRENT_PACKET_FILTER: directed,
+         * multicast, all multicast, broadcast -- the gadget's carrier on */
+        static const uint32_t set[] = { 5, 32, 2, 0x0001010e, 4, 20, 0,
+                                        0x0f };
+
+        rk_dwc3_ctl_out(s, 0x21, 0, 0, s->rndis_if, set, 8);
+        break;
+    }
     default:
         s->hstate = H_RUN;
         break;
@@ -483,9 +538,12 @@ static void rk_dwc3_ctl_step(RkDwc3State *s)
         if (!rk_dwc3_next_trb(s, sn, t, &at)) {
             return;
         }
-        s->ctl_len = rk_dwc3_ctl_data(s, sn, s->ctl,
-                                      s->ctl_in ? MIN(wlen, sizeof(s->ctl)) : 0,
-                                      s->ctl_in);
+        if (s->ctl_in) {
+            s->ctl_len = rk_dwc3_ctl_data(s, sn, s->ctl,
+                                          MIN(wlen, sizeof(s->ctl)), true);
+        } else {
+            rk_dwc3_ctl_data(s, sn, s->ctl, MIN(s->ctl_len, wlen), false);
+        }
         s->hstate = H_STATUS;
         rk_dwc3_ep_event(s, s->ctl_in ? 0 : 1, EV_NOTREADY,
                          EVST_CTRL_STATUS, 0);
@@ -509,6 +567,26 @@ static void rk_dwc3_ctl_step(RkDwc3State *s)
     }
 }
 
+/* RNDIS: the frames in the REMOTE_NDIS_PACKET_MSGs of one transfer */
+static void rk_dwc3_rndis_tx(RkDwc3State *s)
+{
+    uint32_t off = 0;
+
+    while (off + 44 <= s->tx_len) {
+        const uint8_t *m = &s->tx[off];
+        uint32_t mlen = ldl_le_p(m + 4), doff = ldl_le_p(m + 8);
+        uint32_t dlen = ldl_le_p(m + 12);
+
+        if (ldl_le_p(m) != 1 || mlen < 44 || off + mlen > s->tx_len) {
+            break;
+        }
+        if (8 + doff + dlen <= mlen) {
+            qemu_send_packet(qemu_get_queue(s->nic), m + 8 + doff, dlen);
+        }
+        off += mlen;
+    }
+}
+
 /* Bulk data, once enumerated: frames both ways, notifications dropped */
 static void rk_dwc3_data_step(RkDwc3State *s)
 {
@@ -526,7 +604,9 @@ static void rk_dwc3_data_step(RkDwc3State *s)
             if (!ended) {
                 break;
             }
-            if (s->tx_len && s->nic) {
+            if (s->tx_len && s->nic && s->rndis_if >= 0) {
+                rk_dwc3_rndis_tx(s);
+            } else if (s->tx_len && s->nic) {
                 qemu_send_packet(qemu_get_queue(s->nic), s->tx, s->tx_len);
             }
             s->tx_len = 0;
@@ -697,8 +777,22 @@ static ssize_t rk_dwc3_receive(NetClientState *nc, const uint8_t *buf,
         return len;                             /* dropped */
     }
     k = (s->rxq_head + s->rxq_n) % RXQ;
-    memcpy(s->rxq[k], buf, len);
-    s->rxq_len[k] = len;
+    if (s->rndis_if >= 0) {
+        /* REMOTE_NDIS_PACKET_MSG: the data 36 bytes after DataOffset */
+        if (len + 44 > MAX_FRAME) {
+            return len;
+        }
+        memset(s->rxq[k], 0, 44);
+        stl_le_p(s->rxq[k], 1);
+        stl_le_p(s->rxq[k] + 4, 44 + len);
+        stl_le_p(s->rxq[k] + 8, 36);
+        stl_le_p(s->rxq[k] + 12, len);
+        memcpy(s->rxq[k] + 44, buf, len);
+        s->rxq_len[k] = 44 + len;
+    } else {
+        memcpy(s->rxq[k], buf, len);
+        s->rxq_len[k] = len;
+    }
     s->rxq_n++;
     return len;
 }
@@ -729,6 +823,7 @@ static void rk_dwc3_reset(DeviceState *dev)
     s->ev_head = s->ev_count = 0;
     s->hstate = H_IDLE;
     s->ep_in = s->ep_out = s->ep_notify = s->ecm_data_if = -1;
+    s->rndis_if = -1;
     s->tx_len = 0;
     s->rxq_n = s->rxq_head = 0;
     timer_del(s->tick);
