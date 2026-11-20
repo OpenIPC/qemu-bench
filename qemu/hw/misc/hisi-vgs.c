@@ -46,7 +46,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(HisiVgsState, HISI_VGS)
 
 #define VGS_REG_SIZE        0x1000
-#define VGS_NODE_SIZE       0x400    /* the image's registers the driver sets */
+#define VGS_NODE_SIZE       0x690    /* xm_vgs.ko's node stride */
 #define VGS_NODE_MAX        64
 
 #define VGS_MASK            0x0f0
@@ -56,6 +56,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVgsState, HISI_VGS)
 #define VGS_INT_CLR         0x310
 #define VGS_INT_STATUS      0x314
 #define VGS_MISC            0x330
+
+/* xm720 node: the picture in, scaled to the picture out (see vgs_scale) */
+#define VGS_SRC_SIZE        0x404    /* (w - 1) | (h - 1) << 16 */
+#define VGS_SRC_CTRL        0x408    /* bit 31: load YUV */
+#define VGS_SRC_Y           0x464
+#define VGS_SRC_C           0x46c
+#define VGS_SRC_STRIDE      0x474    /* Y | C << 16 */
+#define VGS_DST_SIZE        0x538
+#define VGS_DST_CTRL        0x53c    /* bit 31: write YUV, [17:12] format */
+#define VGS_DST_Y           0x544
+#define VGS_DST_C           0x55c
+#define VGS_DST_STRIDE      0x564
+#define VGS_CTRL_YUV        (1u << 31)
+#define VGS_DST_FMT(c)      (((c) >> 12) & 0x3f)    /* 0: semi-planar 4:2:0 */
+#define VGS_MAX_DIM         4096
 
 /* a job takes about this long; completion is never raised inside START */
 #define VGS_JOB_NS          200000
@@ -78,9 +93,7 @@ struct HisiVgsState {
 
 /*
  * Each node is dumped as its own file, so the layout can be read off a
- * real run (-global hisi-vgs.dump-dir=DIR).  The fields below 0xf0 are not
- * decoded yet (#273); until they are, a job completes without touching the
- * destination, which is what the driver needs to make progress.
+ * real run (-global hisi-vgs.dump-dir=DIR).
  */
 static void vgs_dump_node(HisiVgsState *s, uint32_t addr,
                           const uint32_t *node)
@@ -93,6 +106,68 @@ static void vgs_dump_node(HisiVgsState *s, uint32_t addr,
     path = g_strdup_printf("%s/vgs-node-%04u-%08x.bin", s->dump_dir,
                            s->dumped++, addr);
     g_file_set_contents(path, (const char *)node, VGS_NODE_SIZE, NULL);
+}
+
+/* one plane, nearest neighbour; bpp 2 moves a 4:2:0 chroma pair */
+static void vgs_scale_plane(uint32_t src, int sw, int sh, int ss,
+                            uint32_t dst, int dw, int dh, int ds, int bpp)
+{
+    g_autofree uint8_t *in = g_malloc((size_t)ss * sh);
+    g_autofree uint8_t *row = g_malloc((size_t)dw * bpp);
+    int x, y;
+
+    dma_memory_read(&address_space_memory, src, in, (size_t)ss * sh,
+                    MEMTXATTRS_UNSPECIFIED);
+    for (y = 0; y < dh; y++) {
+        const uint8_t *line = in + (size_t)(y * sh / dh) * ss;
+
+        for (x = 0; x < dw; x++) {
+            memcpy(row + x * bpp, line + (x * sw / dw) * bpp, bpp);
+        }
+        dma_memory_write(&address_space_memory, dst + (uint32_t)y * ds, row,
+                         (size_t)dw * bpp, MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
+/*
+ * xm_vgs.ko's VGS_DRV_SetReg_CurImg / _DestImg write the pictures into the
+ * node: sizes as (w - 1) | (h - 1) << 16, Y and C addresses, strides Y |
+ * C << 16 -- the layout read off dumped nodes, scaling VPSS channel 1
+ * (1280x720) into the extended channels and the JPEG channels' pictures.
+ * Crop, CSC and the filter coefficients are not applied: the picture is
+ * scaled whole, nearest neighbour, which is all the snapshot and the
+ * extended channels need.  Only semi-planar 4:2:0 is written.
+ */
+static void vgs_scale(HisiVgsState *s, const uint32_t *node)
+{
+    uint32_t sz = node[VGS_SRC_SIZE / 4], dz = node[VGS_DST_SIZE / 4];
+    uint32_t sst = node[VGS_SRC_STRIDE / 4], dst = node[VGS_DST_STRIDE / 4];
+    int sw = (sz & 0xffff) + 1, sh = (sz >> 16) + 1;
+    int dw = (dz & 0xffff) + 1, dh = (dz >> 16) + 1;
+    int sys = sst & 0xffff, scs = sst >> 16;
+    int dys = dst & 0xffff, dcs = dst >> 16;
+
+    if (!(node[VGS_SRC_CTRL / 4] & VGS_CTRL_YUV) ||
+        !(node[VGS_DST_CTRL / 4] & VGS_CTRL_YUV) ||
+        VGS_DST_FMT(node[VGS_DST_CTRL / 4])) {
+        return;
+    }
+    if (sw > VGS_MAX_DIM || sh > VGS_MAX_DIM || dw > VGS_MAX_DIM ||
+        dh > VGS_MAX_DIM || sys < sw || scs < sw || dys < dw || dcs < dw ||
+        sys > 2 * VGS_MAX_DIM || scs > 2 * VGS_MAX_DIM ||
+        (sw | sh | dw | dh) & 1) {
+        qemu_log_mask(LOG_GUEST_ERROR, "hisi-vgs: bad picture %dx%d/%d,%d "
+                      "-> %dx%d/%d,%d\n", sw, sh, sys, scs, dw, dh, dys, dcs);
+        return;
+    }
+    vgs_scale_plane(node[VGS_SRC_Y / 4], sw, sh, sys,
+                    node[VGS_DST_Y / 4], dw, dh, dys, 1);
+    vgs_scale_plane(node[VGS_SRC_C / 4], sw / 2, sh / 2, scs,
+                    node[VGS_DST_C / 4], dw / 2, dh / 2, dcs, 2);
+    if (s->trace) {
+        fprintf(stderr, "hisi-vgs: scale %dx%d %08x -> %dx%d %08x\n",
+                sw, sh, node[VGS_SRC_Y / 4], dw, dh, node[VGS_DST_Y / 4]);
+    }
 }
 
 static void vgs_run_job(HisiVgsState *s)
@@ -115,6 +190,7 @@ static void vgs_run_job(HisiVgsState *s)
                     node[VGS_MASK / 4] & 0x3ff, node[VGS_NEXT / 4]);
         }
         vgs_dump_node(s, a, node);
+        vgs_scale(s, node);
         /*
          * Bit 1 is "node done"; the node's mask (the driver writes 0x34a)
          * also enables the error interrupts (bits 3, 6, 8, 9).  mod_vgs.o
