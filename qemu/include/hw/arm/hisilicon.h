@@ -311,6 +311,14 @@ typedef struct HisiSoCConfig {
     /* SYSSTAT[1:0] is the boot device strap (00 eMMC 4-bit, 01 SPI NOR,
      * 10 eMMC 8-bit, 11 SPI NAND), as on Goke xmorca / GK7206. */
     bool            sysstat_boot_dev;
+    /* XMedia xm720 die code, SYSCTRL+0x18 bits [7:4].  The xm720xxx
+     * kernel's get_chipid() maps it to the chip ID (6 GK7205V500, 7 V510,
+     * 8 V530, 12 GK7202V330) and returns 0 for 0; xm_pm.ko then refuses
+     * to load, and xm_vi / xm_venc with it.  0 = not stored. */
+    uint8_t         xm_die_code;
+    /* VGS interrupt (GIC SPI): instantiate hisi-vgs for the "hisi-vgs"
+     * register bank instead of a stub.  0 = stub. */
+    uint32_t        vgs_irq;
 
     /* SATA AHCI controller (sysbus-ahci) — DVR/NVR family.
      * Vendor SATA module busy-loops if the controller is absent; even a

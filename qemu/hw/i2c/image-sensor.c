@@ -23,6 +23,7 @@
 #define SMARTSENS       "hisi-smartsens"
 #define OV2735          "ingenic-ov2735"
 #define OMNIVISION      "axera-ov-sensor"
+#define IMAGEDESIGN     "imagedesign-mis"
 
 typedef struct ImageSensorSpec {
     const char *name;
@@ -147,6 +148,11 @@ static const ImageSensorSpec image_sensors[] = {
     { "ov2735", OV2735, 0x3C, 0x05 },
     { "ov2735b", OV2735, 0x3C, 0x07 },
 
+    /* ImageDesign: MIS2008 and MIS2009 are one die and both read 0x2008
+     * at 0x3000 (ipctool's "mis2008_i2c" on a GK7205V510 MIS2009 camera) */
+    { "mis2008", IMAGEDESIGN, 0x30, 0x2008 },
+    { "mis2009", IMAGEDESIGN, 0x30, 0x2008 },
+
     /* others */
     { "mis2006", "hisi-mis2006", 0x30 },
     { "sp2305", "hisi-sp2305", 0x3C },
@@ -209,6 +215,8 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint8(dev, "id0", spec->id >> 16);
         qdev_prop_set_uint8(dev, "id1", (spec->id >> 8) & 0xFF);
         qdev_prop_set_uint8(dev, "id2", spec->id & 0xFF);
+    } else if (!strcmp(spec->type, IMAGEDESIGN)) {
+        qdev_prop_set_uint16(dev, "id", spec->id);
     } else if (!strcmp(spec->type, OV2735)) {
         qdev_prop_set_uint8(dev, "rev", spec->id);
     }

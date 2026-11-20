@@ -1190,6 +1190,9 @@ bash qemu-boot/mk-ev300-nand.sh        # u-boot + release rootfs.ubi (UBIFS, /bo
 bash qemu-boot/run-ev300-nand.sh
 ```
 
+A stock Zenointel SD-2N-4G dump (MIS2009 sensor) boots the same way and
+streams H.264; add `-icount shift=0`.
+
 `nand-jedec` overrides the READ-ID and `nand-oob-size` the spare-area size
 (128 for GD5F1GM7, 64 for W25N01GV) for firmware whose ID table differs —
 e.g. the OpenIPC ev300 U-Boot wants W25N01GV
