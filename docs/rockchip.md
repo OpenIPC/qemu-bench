@@ -325,7 +325,7 @@ vendor table accepts the Macronix ID), `w25q256` for 32 MiB.
 | `0xFFA00000` | ISP32 | `rk-isp32` | SPIs 105 / 104 / 103 (ISP, MI, MIPI); a scene lit by the sensor's exposure (`sensor` link), NV12 into the mainpath / bypass buffers; AE means and histograms of that scene, to registers and to the DDR stats buffer |
 | `0xFFA10000` | VICAP | `rk-vicap` | SPI 106; the to-ISP frame start / end interrupts (`GLB_INTST` bits 14 / 20) when the ISP's frames run; `toisp-on` gates them |
 | `0xFFA50000` | VEPU540C | `rk-vepu540c` | SPI 107; H.265 through the shared `hevc-enc.c`, under the HAL's own VPS/SPS/PPS; JPEG scan + EOI through `jpeg-enc.c` with the HAL header's DQT, on the thread pool; H.264 I and P pictures through `hantro-h264.c` under the HAL's SPS/PPS |
-| `0xFFB00000` | USB OTG (DWC3) | QEMU's `usb_dwc3` | SPI 54; a host-only core (so the driver runs it as host whatever `dr_mode` says), its xHCI at the base: `-device usb-*,bus=usb-bus.0` |
+| `0xFFB00000` | USB OTG (DWC3) | QEMU's `usb_dwc3`, or `rk-dwc3` with `usb-otg=device` | SPI 54; host: a host-only core (the driver runs it as host whatever `dr_mode` says), its xHCI at the base, `-device usb-*,bus=usb-bus.0`; device: see USB gadget |
 | `0xFF350000`, `0xFF360000`, `0xFF490000` | PWM v2 ×3 (four channels each) | `rk-pwm` | SPIs 31 / 33 / 35; counters at 24 MHz, one-shot interrupts |
 | `0xFFAE0000` | I2S/TDM | `rk-i2s-tdm` | PL330 requests 22 / 21; fixed `word-rate` (its CRU clock isn't followed) |
 | `0xFFFF0000` | boot ROM | ROM | |
@@ -503,6 +503,44 @@ Messages that are expected, because the hardware isn't modelled:
 - the G2's empty `mtd` partition (all zeros in the dump) failing to mount
   as JFFS2
 
+## USB gadget (`usb-otg=device`)
+
+With `-M rv1106,usb-otg=device` (or `rv1103`, `rv1109`, `rv1126`), the
+OTG port's DWC3 is `rk-dwc3` (`hw/usb/rk-dwc3.c`). It's a device-only
+core, so the kernel's dwc3 driver runs it as a gadget, and a USB host
+built into the model enumerates whatever gadget is bound:
+
+- **Registers:** the DWC3's device side: event ring and count
+  (`GEVNT*`), `DCTL` run and soft reset, `DSTS`, and the endpoint
+  commands (Start / Update / End Transfer, stall). Transfers are TRB
+  lists, with chains, links and CSP short packets.
+- **Enumeration:** when the driver sets RUN, the host resets the bus
+  (reset, then connect done at high speed) and drives endpoint 0 the way
+  the driver's control state machine expects: the SETUP packet, the data
+  stage, XferNotReady(STATUS), then the status stage. It reads the
+  descriptors, sets address 1 and the configuration.
+- **Data:** if the configuration has a CDC ECM function, the host selects
+  its data interface's alternate setting 1 and bridges its bulk
+  endpoints to `-nic ...,model=usb-gadget`.
+
+On OpenIPC (built-in `g_cdc`), `usb0` gets 10.0.2.15 by DHCP from QEMU's
+user network. Pings answer, and a 1.7 MB file served over the gadget
+arrives with the same md5:
+
+```
+qemu-system-arm -M rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device \
+    -kernel zImage -dtb rv1106.dtb -append "$(cat cmdline)" \
+    -nic user,model=usb-gadget,hostfwd=tcp::18080-:8080
+```
+
+The RV1109 SDK's configfs gadget (adb over FunctionFS) enumerates to
+"configured", but its traffic isn't bridged.
+
+A gotcha: the driver chains a 2-byte bounce TRB after each unaligned OUT
+request, with the IOC on the bounce. A short packet has to complete the
+chain at that last TRB (CSP). Raising the event on the short TRB instead
+delivered every frame one frame late.
+
 ## OpenIPC firmware (rv1106, SPI NAND, `-kernel`)
 
 OpenIPC's own RV1106 release boots on the `rv1106` machine to its login
@@ -638,9 +676,9 @@ RV1103 / RV1106:
 - **RGA** 2D engine: it loads, but no jobs are modelled (majestic
   doesn't submit any).
 - **RKNN NPU** and **RVE**: storage.
-- **USB device mode:** the DWC3 is a host only. Its gadget side
-  (OpenIPC's gadgetfs, RNDIS) isn't modelled. PWM is modelled (`rk-pwm`),
-  but its output level isn't.
+- **USB gadget functions other than CDC ECM:** they enumerate, but only
+  ECM's data is bridged (no RNDIS, ACM, mass storage, UVC or FunctionFS
+  traffic). PWM is modelled (`rk-pwm`), but its output level isn't.
 - **Audio codec** (the analogue acodec): registers only. The I2S/TDM
   FIFO paces with silence, and recordings capture zeros (or the
   `rx-tone-hz` test tone).

@@ -662,6 +662,7 @@ struct RkMachineState {
     char *flash_type;
     char *sensor;
     char *sensor2;
+    char *usb_otg;              /* "host" (default) or "device" */
     DeviceState *gic;
     DeviceState *pl330;
     DeviceState *cam_sensor;    /* the camera I2C bus's first sensor */
@@ -712,6 +713,24 @@ static void rk_machine_set_sensor(Object *obj, const char *value,
 
     g_free(s->sensor);
     s->sensor = g_strdup(value);
+}
+
+static char *rk_machine_get_usb_otg(Object *obj, Error **errp)
+{
+    return g_strdup(RK_MACHINE(obj)->usb_otg ?: "host");
+}
+
+static void rk_machine_set_usb_otg(Object *obj, const char *value,
+                                   Error **errp)
+{
+    RkMachineState *s = RK_MACHINE(obj);
+
+    if (strcmp(value, "host") && strcmp(value, "device")) {
+        error_setg(errp, "usb-otg: host or device, not '%s'", value);
+        return;
+    }
+    g_free(s->usb_otg);
+    s->usb_otg = g_strdup(value);
 }
 
 static char *rk_machine_get_sensor2(Object *obj, Error **errp)
@@ -1754,7 +1773,13 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(ohci), 0, c->ohci_base);
         sysbus_connect_irq(SYS_BUS_DEVICE(ohci), 0, rk_irq(s, c->ohci_irq));
     }
-    if (c->dwc3_base) {
+    if (c->dwc3_base && s->usb_otg && !strcmp(s->usb_otg, "device")) {
+        dev = qdev_new("rk-dwc3");
+        qemu_configure_nic_device(dev, false, "usb-gadget");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->dwc3_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, rk_irq(s, c->dwc3_irq));
+    } else if (c->dwc3_base) {
         /*
          * QEMU's DWC3 reports a host-only core (GHWPARAMS0 mode 1): the
          * driver then runs it as a host whatever dr_mode the DT asks
@@ -1969,6 +1994,12 @@ static void rk_machine_class_init(ObjectClass *oc, const void *data)
         rk_machine_get_sensor2, rk_machine_set_sensor2);
     object_class_property_set_description(oc, "sensor2",
         "Second sensor, at 0x32 (two-sensor boards); default none");
+    object_class_property_add_str(oc, "usb-otg",
+        rk_machine_get_usb_otg, rk_machine_set_usb_otg);
+    object_class_property_set_description(oc, "usb-otg",
+        "The OTG port's role: host (QEMU's DWC3 + xHCI; default) or device "
+        "(rk-dwc3: the gadget enumerated by a built-in host, a CDC ECM "
+        "function bridged to -nic ...,model=usb-gadget)");
 }
 
 static const TypeInfo rk_machine_info = {

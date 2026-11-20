@@ -720,6 +720,56 @@ def test_i2s_tone(qemu, path):
         qt.close()
 
 
+def test_dwc3_gadget(qemu, path):
+    """usb-otg=device: the DWC3's device side and the host built into it,
+    driven as the dwc3 driver does for the first control transfer."""
+    qt = QTest(qemu, 'rv1106,flash-file=%s,usb-otg=device' % path)
+    try:
+        U, EV, T0, T1, BUF = (0xFFB00000, 0x07a00000, 0x07a10000,
+                              0x07a10100, 0x07a20000)
+        check(qt.readl(U + 0xc140) & 3 == 0 and qt.readl(U + 0xc70c) >> 22 & 1,
+              'DWC3 device: a device-only core, halted until RUN')
+        qt.writel(U + 0xc400, EV)
+        qt.writel(U + 0xc404, 0)
+        qt.writel(U + 0xc408, 0x1000)
+        trb = struct.pack('<4I', BUF, 0, 8, 1 | 2 | 0x20 | 0x400 | 0x800)
+        qt.write(T0, trb)                        # SETUP TRB, HWO
+        qt.writel(U + 0xc804, T0)                # ep0 PAR1
+        qt.writel(U + 0xc80c, 0x400 | 6)         # Start Transfer
+        r = qt.readl(U + 0xc80c)
+        check(not r & 0x400 and (r >> 16) & 0x7f,
+              'DWC3 Start Transfer: done at once, a resource index')
+        qt.writel(U + 0xc704, 1 << 31)           # RUN
+        check(not qt.readl(U + 0xc70c) >> 22 & 1, 'DWC3 running: not halted')
+        qt.cmd('clock_step 1000000')
+        n = qt.readl(U + 0xc40c)
+        ev = struct.unpack('<%dI' % (n // 4), qt.read(EV, n))
+        check(ev == (0x101, 0x201, 0x40),
+              'DWC3 host: reset, connect done, SETUP XferComplete (%s)' %
+              ' '.join('%x' % e for e in ev))
+        check(qt.read(BUF, 8) == bytes([0x80, 6, 0, 1, 0, 0, 64, 0]) and
+              not struct.unpack('<I', qt.read(T0 + 12, 4))[0] & 1,
+              'DWC3 host: GET_DESCRIPTOR(device) in the setup TRB, HWO off')
+        qt.writel(U + 0xc40c, n)
+        check(qt.readl(U + 0xc40c) == 0, 'DWC3 GEVNTCOUNT: the driver\'s '
+              'write takes the handled events off')
+        desc = bytes([18, 1, 0, 2, 0, 0, 0, 64, 0x6b, 0x1d, 4, 1, 0, 1,
+                      1, 2, 3, 1])
+        qt.write(BUF + 0x100, desc)
+        qt.write(T1, struct.pack('<4I', BUF + 0x100, 0, 18,
+                                 1 | 2 | 0x50 | 0x400 | 0x800))
+        qt.writel(U + 0xc814, T1)                # ep1 IN: the data stage
+        qt.writel(U + 0xc81c, 0x400 | 6)
+        qt.cmd('clock_step 1000000')
+        n = qt.readl(U + 0xc40c)
+        ev = struct.unpack('<%dI' % (n // 4), qt.read(EV + 12, n))
+        check(ev[:2] == (0x42, 0x20c0),
+              'DWC3 host: data IN XferComplete, then XferNotReady(STATUS) '
+              'on ep0 OUT (%s)' % ' '.join('%x' % e for e in ev))
+    finally:
+        qt.close()
+
+
 def test_uart(qt):
     usr = qt.readl(UART2 + 0x7c)
     check(usr & 0x6 == 0x6, 'UART2 USR: TX FIFO not full and empty (0x%x)' % usr)
@@ -1378,6 +1428,7 @@ def main():
     finally:
         qt.close()
     test_i2s_tone(args.qemu, path)
+    test_dwc3_gadget(args.qemu, path)
     test_refused(args.qemu, tmp)
     test_machines(args.qemu, path)
     test_rv1103b(args.qemu, path)
