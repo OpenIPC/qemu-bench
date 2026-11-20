@@ -149,7 +149,7 @@ struct HisiFastbootState {
     uint32_t chip_id;       /* returned in the handshake reply            */
     bool v500_resync;       /* drop bytes until the first HEAD magic 0xFE */
     uint8_t v500_head[0x418]; /* first bytes of the key area, for the verify */
-    uint32_t v500_boot_off; /* boot-code offset from the header load-addr field */
+    uint32_t v500_entry;    /* absolute boot entry (the header load-addr field) */
 
     /* Frame accumulation */
     uint8_t rxbuf[FB_RXBUF_SIZE];
@@ -333,10 +333,11 @@ static void hisi_fastboot_process_head(HisiFastbootState *s)
     s->xfer_received = 0;
     s->next_seq = 1;
 
-    /* Track U-Boot/boot entry address.  On V500 the boot code sits boot_off
-     * into the image that is loaded at xfer_addr, so the ROM runs it there. */
+    /* Track the boot entry.  Classic: the U-Boot HEAD's own address.  V500
+     * (gk7206): the ROM jumps to the header's ABSOLUTE entry field, wherever
+     * BOOT was loaded — so a wrong load base lands the jump off the image. */
     if (s->step == FB_STEP_UBOOT) {
-        s->entry_addr = s->xfer_addr + (s->v500 ? s->v500_boot_off : 0);
+        s->entry_addr = s->v500 ? s->v500_entry : s->xfer_addr;
     }
 
     qemu_log_mask(LOG_UNIMP,
@@ -488,12 +489,16 @@ static void hisi_fastboot_process_tail(HisiFastbootState *s)
                 hisi_fastboot_v500_verify_fail(s);
                 return;
             }
-            /* Header OK: remember boot_off from the load-addr field (@0x414)
-             * so the boot area's entry can be computed. */
-            s->v500_boot_off = (s->v500_head[0x414]        |
-                                s->v500_head[0x415] << 8   |
-                                s->v500_head[0x416] << 16  |
-                                (uint32_t)s->v500_head[0x417] << 24) & 0xFFFFF;
+            /* Header OK: remember the ABSOLUTE boot entry from the load-addr
+             * field (@0x414).  The gk7206 ROM jumps there regardless of where
+             * BOOT was loaded (confirmed on hardware): loading BOOT at
+             * 0x41000000 jumps to 0x40706000 and the agent never runs; loading
+             * it at the image's natural base 0x40700000 lands the entry on the
+             * agent. */
+            s->v500_entry = s->v500_head[0x414]        |
+                            s->v500_head[0x415] << 8   |
+                            s->v500_head[0x416] << 16  |
+                            (uint32_t)s->v500_head[0x417] << 24;
         }
         s->step++;
         if (s->step >= FB_STEP_DONE) {
