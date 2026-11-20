@@ -637,11 +637,12 @@ registers at the next frame (`0x010` bit 0). At each VIU frame start
 scene, then raises start (`0x400`) and end (bit 0) together. Two starts
 without an end are a "CC" error and the driver drops the frame.
 
-- **VGS** (`0x20630000`, VIC 29) has the same node front end. The
-  extended channels go through it, so it is a second `hisi-vpss-v2` with
-  `vgs=on`: its jobs complete, but nothing is painted yet. Without it, a
-  frame sent to an extended channel never comes back to its pool, and the
-  vendor app stops encoding when the pool runs out.
+- **VGS** (`0x20630000`, VIC 29) is the same node engine, a second
+  `hisi-vpss-v2`. The extended channels go through it. Its nodes have
+  VPSS's layout: the source at `0x020` / `0x10c`-`0x114`, and the
+  output in the channel-1 slot (`0x008` bit 3, `0x064`, `0x150`-`0x158`).
+  Without it, a frame sent to an extended channel never comes back to its
+  pool, and the vendor app stops encoding when the pool runs out.
 
 - **VEDU gen 2** takes a register image from DDR (MMIO `0x1e0`). Its
   stream ring and packet headers are V4's, so the model moves the image's
@@ -668,8 +669,8 @@ out-of-order frame (#360). `sleep=off` is needed as well: with plain
 
 To run OpenIPC online, set `b_arg_online=1` in `/usr/bin/load_hisilicon`
 and reboot. A Switcam HS-303 vendor dump (Rotek, MPP 1.0.4.0) streams
-1280x720 H.264 online. Its extended channels (5: 320x240, 11: 640x360,
-for QR scanning) get no picture yet.
+1280x720 H.264 online, and VGS scales it into its extended channels
+(5: 320x240, 11: 640x360, for QR scanning).
 
 ## Not yet
 

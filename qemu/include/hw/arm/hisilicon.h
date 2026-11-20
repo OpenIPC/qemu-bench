@@ -329,7 +329,7 @@ typedef struct HisiSoCConfig {
     /* CV200 VPSS node engine (hisi-vpss-v2) over the "hisi-vpss" bank:
      * its VIC line, 0 = the bank stays a stub */
     int             vpss_v2_irq;
-    /* CV200 VGS: the same node front end (hisi-vpss-v2, vgs=on), which
+    /* CV200 VGS: the same node front end (a second hisi-vpss-v2), which
      * VPSS's extended channels go through; 0 = absent */
     hwaddr          vgs_v2_base;
     int             vgs_v2_irq;

@@ -6827,7 +6827,6 @@ static void hisilicon_common_init(MachineState *machine,
     if (c->vgs_v2_irq) {
         DeviceState *vgs = qdev_new("hisi-vpss-v2");
 
-        qdev_prop_set_bit(vgs, "vgs", true);
         object_property_add_child(OBJECT(machine), "vgs", OBJECT(vgs));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vgs), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(vgs), 0, c->vgs_v2_base);
