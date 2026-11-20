@@ -2325,6 +2325,7 @@ static const HisiSoCConfig gk7205v500_soc = {
     .name               = "gk7205v500",
     .desc               = "Goke GK7205V500 (Cortex-A7, 0.5 TOPS NPU)",
     .soc_id             = GOKE_SOC_ID_7205V500,
+    .xm_die_code        = 6,               /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 MCP */
     HISI_V4_COMMON_PERIPH,
@@ -2336,17 +2337,39 @@ static const HisiSoCConfig gk7205v510_soc = {
     .name               = "gk7205v510",
     .desc               = "Goke GK7205V510 (Cortex-A7, 1.0 TOPS NPU)",
     .soc_id             = GOKE_SOC_ID_7205V510,
-    .gpio_count         = 8,
+    .default_sensor     = "mis2009",       /* Zenointel SD-2N-4G, i2c0 0x30 */
+    .xm_die_code        = 7,               /* SYSCTRL+0x18 [7:4] */
+    /* The vendor xm720xxx DTS has a PL061 at 0x120b8000 (SPI 24), and
+     * boards use GPIO 64-73 (Zenointel SD-2N-4G: reset key 64, PTZ
+     * steppers 69/72/73).  GPIO8_0 is that reset key, active low with a
+     * board pull-up: read as 0 the vendor sys daemon sees it held,
+     * restores defaults and reboots, and U-Boot then erases config. */
+    .gpio_count         = 10,
+    .gpio_input_high    = { [8] = 0x01 },
+    /* xm720xxx DTS: VI_CAP 0x11000000 / VI_PROC 0x11200000 (SPI 43 / 44),
+     * VPSS 0x11400000 (SPI 46) -- the V4 EV200/EV300 media map. */
+    HISI_V4_VIDEO_PIPE,
     HISI_V4_DDR_128M,               /* 1Gb DDR3 MCP */
     HISI_V4_COMMON_PERIPH,
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
+    /* USB 2.0 host (xm720xxx DTS usb3-0/dwc3@0x10030000): DWC3, SPI 39,
+     * dr_mode "host", as on gk7205v200.  The SD-2N-4G's LTE modem is on
+     * it; without the controller the vendor app's wireless code finds no
+     * USB devices. */
+    .xhci_base          = 0x10030000,
+    .xhci_irq           = 39,
+    .xhci_dwc3_core     = true,
+    /* xm720xxx DTS vgs@11300000, SPI 49: xm_vgs.ko's VGS_HAL_* front end
+     * (next node 0xf8, start 0x300, int 0x310 / 0x314) is hisi-vgs */
+    .vgs_irq            = 49,
 };
 
 static const HisiSoCConfig gk7205v530_soc = {
     .name               = "gk7205v530",
     .desc               = "Goke GK7205V530 (Cortex-A7, 1.0 TOPS NPU, ext DDR)",
     .soc_id             = GOKE_SOC_ID_7205V530,
+    .xm_die_code        = 8,               /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_128M,               /* external DDR, 128 MiB typical */
     HISI_V4_COMMON_PERIPH,
@@ -2358,6 +2381,7 @@ static const HisiSoCConfig gk7202v330_soc = {
     .name               = "gk7202v330",
     .desc               = "Goke GK7202V330 (Cortex-A7, 0.5 TOPS NPU, no FEPHY)",
     .soc_id             = GOKE_SOC_ID_7202V330,
+    .xm_die_code        = 12,              /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 MCP */
     HISI_V4_COMMON_PERIPH,
@@ -5894,6 +5918,30 @@ static void hisilicon_common_init(MachineState *machine,
             qdev_connect_gpio_out_named(sysctl, "remap-clear", 0,
                 qemu_allocate_irq(hisilicon_maskrom_remap, maskrom, 0));
         }
+        if (c->xm_die_code) {
+            /*
+             * Power-on value: the first reset captures it (por_regs).
+             * The die code is fused too: the OTP block at 0x100a0000
+             * (xm720 xm_sys.ko SYS_HAL_Init maps it), word 0x28 bits
+             * [7:4].  The vendor xm_sys.ko's SYS_ModInit accepts only
+             * xm720 codes there; otherwise it prints "SDK version do NOT
+             * support this chip!!!" and stays down, and VI_SetDevAttr then
+             * fails SYS_NOTREADY (0xa0108010).  xm_pm.ko reads its
+             * tsensor trim from the same block (+0x2c).
+             */
+            DeviceState *otp = qdev_new("hisi-regbank");
+
+            address_space_stl(&address_space_memory, c->sysctl_base + 0x18,
+                              (uint32_t)c->xm_die_code << 4,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+            qdev_prop_set_uint32(otp, "size", 0x10000);
+            qdev_prop_set_string(otp, "name", "xm720-otp");
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(otp), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(otp), 0, 0x100a0000);
+            address_space_stl(&address_space_memory, 0x100a0028,
+                              (uint32_t)c->xm_die_code << 4,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+        }
 
         /*
          * Pinstrap injection for -bios mask-ROM runs.  Real silicon
@@ -6538,6 +6586,21 @@ static void hisilicon_common_init(MachineState *machine,
                 SysBusDevice *busdev = SYS_BUS_DEVICE(nnie);
                 sysbus_realize_and_unref(busdev, &error_fatal);
                 sysbus_mmio_map(busdev, 0, c->regbanks[n].base);
+                continue;
+            }
+
+            /*
+             * VGS: the engine behind VPSS's extended channels, where a SoC
+             * gives its interrupt (hisi-vgs: the node-list contract of
+             * HiSilicon's V4 / V5 vgs drivers and XMedia's xm720 xm_vgs.ko).
+             * Without one it stays a register bank nothing drives.
+             */
+            if (c->vgs_irq && !strcmp(c->regbanks[n].name, "hisi-vgs")) {
+                DeviceState *vgs = qdev_new("hisi-vgs");
+                SysBusDevice *busdev = SYS_BUS_DEVICE(vgs);
+                sysbus_realize_and_unref(busdev, &error_fatal);
+                sysbus_mmio_map(busdev, 0, c->regbanks[n].base);
+                sysbus_connect_irq(busdev, 0, pic[c->vgs_irq]);
                 continue;
             }
 
