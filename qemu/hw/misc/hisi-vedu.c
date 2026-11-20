@@ -2051,6 +2051,10 @@ static void hisi_vedu_reset(DeviceState *dev)
     }
     memset(s->chn, 0, sizeof(s->chn));
     s->nchn = 0;
+    s->g2_size = 0;
+    /* the status is gone: so are the lines it held up */
+    qemu_set_irq(s->vedu_irq, 0);
+    qemu_set_irq(s->jpge_irq, 0);
 }
 
 static const Property hisi_vedu_properties[] = {

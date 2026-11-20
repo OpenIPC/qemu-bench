@@ -54,6 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVpssV2State, HISI_VPSS_V2)
 #define V2_NODE_SIZE        0x400
 #define V2_NODE_MAX         16
 #define V2_PIC_MAX          4096
+#define V2_INT_ERR          (1u << 7)
 #define V2_JOB_NS           2000000     /* a 1080p node, about 2 ms */
 
 /* the HAL's jump tables do not take the channels in order */
@@ -75,6 +76,8 @@ struct HisiVpssV2State {
 
     uint32_t regs[V2_SIZE / 4];
     uint32_t pending;               /* raw bits the job raises */
+    uint32_t queued;                /* a chain started while one ran */
+    bool has_queued;
     uint32_t done_id;
     uint32_t nodes;
     bool trace;
@@ -126,7 +129,9 @@ static void v2_run_node(HisiVpssV2State *s, const uint32_t *n)
     v2_size(n[0x020 / 4], &sw, &sh);
     sys = n[0x114 / 4] & 0xffff;
     scs = n[0x114 / 4] >> 16;
-    if (!sy || sw > V2_PIC_MAX || sh > V2_PIC_MAX) {
+    if (!sy || sw < 2 || sh < 2 || sw > V2_PIC_MAX || sh > V2_PIC_MAX) {
+        qemu_log_mask(LOG_GUEST_ERROR, "hisi-vpss-v2: node source %dx%d at "
+                      "0x%08x not processed\n", sw, sh, sy);
         return;
     }
     for (int c = 0; c < 4; c++) {
@@ -138,7 +143,7 @@ static void v2_run_node(HisiVpssV2State *s, const uint32_t *n)
             continue;
         }
         v2_size(n[v2_chn[c].size / 4], &dw, &dh);
-        if (dw > V2_PIC_MAX || dh > V2_PIC_MAX) {
+        if (dw < 2 || dh < 2 || dw > V2_PIC_MAX || dh > V2_PIC_MAX) {
             continue;
         }
         if (s->trace) {
@@ -155,10 +160,14 @@ static void v2_run_node(HisiVpssV2State *s, const uint32_t *n)
     }
 }
 
-static void v2_start(HisiVpssV2State *s)
+/*
+ * Runs the chain at 0x2fc: its last node's ID and the interrupts it
+ * raises are the job's.  A node that cannot be read ends the chain with
+ * the error bit (7), which the driver reports without panicking.
+ */
+static void v2_run(HisiVpssV2State *s, uint32_t a)
 {
     uint32_t node[V2_NODE_SIZE / 4];
-    uint32_t a = s->regs[V2_NEXT / 4];
     uint32_t bits = 0;
     int k;
 
@@ -167,6 +176,7 @@ static void v2_start(HisiVpssV2State *s)
                             MEMTXATTRS_UNSPECIFIED)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "hisi-vpss-v2: node at 0x%08x unreadable\n", a);
+            bits = V2_INT_ERR;
             break;
         }
         v2_run_node(s, node);
@@ -175,11 +185,19 @@ static void v2_start(HisiVpssV2State *s)
         s->nodes++;
         a = node[V2_NEXT / 4];
     }
-    if (k) {
-        s->pending |= bits ? bits : 1;
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  V2_JOB_NS);
+    s->pending = bits ? bits : 1;
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + V2_JOB_NS);
+}
+
+/* A START while a chain runs waits for it: each has its own completion */
+static void v2_start(HisiVpssV2State *s)
+{
+    if (timer_pending(s->timer)) {
+        s->queued = s->regs[V2_NEXT / 4];
+        s->has_queued = true;
+        return;
     }
+    v2_run(s, s->regs[V2_NEXT / 4]);
 }
 
 static void v2_done(void *opaque)
@@ -190,6 +208,10 @@ static void v2_done(void *opaque)
     s->regs[V2_INT_RAW / 4] |= s->pending;
     s->pending = 0;
     v2_update_irq(s);
+    if (s->has_queued) {
+        s->has_queued = false;
+        v2_run(s, s->queued);
+    }
 }
 
 static uint64_t hisi_vpss_v2_read(void *opaque, hwaddr offset, unsigned size)
@@ -240,6 +262,7 @@ static void hisi_vpss_v2_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     s->pending = 0;
     s->done_id = 0;
+    s->has_queued = false;
     timer_del(s->timer);
     qemu_set_irq(s->irq, 0);
 }
@@ -271,6 +294,8 @@ static const VMStateDescription vmstate_hisi_vpss_v2 = {
         VMSTATE_UINT32_ARRAY(regs, HisiVpssV2State, V2_SIZE / 4),
         VMSTATE_UINT32(pending, HisiVpssV2State),
         VMSTATE_UINT32(done_id, HisiVpssV2State),
+        VMSTATE_UINT32(queued, HisiVpssV2State),
+        VMSTATE_BOOL(has_queued, HisiVpssV2State),
         VMSTATE_TIMER_PTR(timer, HisiVpssV2State),
         VMSTATE_END_OF_LIST()
     },

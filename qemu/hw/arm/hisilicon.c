@@ -6636,12 +6636,7 @@ static void hisilicon_common_init(MachineState *machine,
                 continue;
             }
 
-            /*
-             * VGS: the engine behind VPSS's extended channels, where a SoC
-             * gives its interrupt (hisi-vgs: the node-list contract of
-             * HiSilicon's V4 / V5 vgs drivers and XMedia's xm720 xm_vgs.ko).
-             * Without one it stays a register bank nothing drives.
-             */
+            /* CV200: VPSS is a node engine (hisi-vpss-v2) behind VI offline */
             if (c->vpss_v2_irq && !strcmp(c->regbanks[n].name,
                                           "hisi-vpss")) {
                 DeviceState *v2 = qdev_new("hisi-vpss-v2");
@@ -6653,11 +6648,19 @@ static void hisilicon_common_init(MachineState *machine,
                                    pic[c->vpss_v2_irq]);
                 continue;
             }
+            /* CV200: VIU + ISP (hisi-viu), realized once the sensor is
+             * linked to it, after this loop */
             if (viu && !strcmp(c->regbanks[n].name, "hisi-viu")) {
                 viu_base = c->regbanks[n].base;     /* mapped once linked */
                 continue;
             }
 
+            /*
+             * VGS: the engine behind VPSS's extended channels, where a SoC
+             * gives its interrupt (hisi-vgs: the node-list contract of
+             * HiSilicon's V4 / V5 vgs drivers and XMedia's xm720 xm_vgs.ko).
+             * Without one it stays a register bank nothing drives.
+             */
             if (c->vgs_irq && !strcmp(c->regbanks[n].name, "hisi-vgs")) {
                 DeviceState *vgs = qdev_new("hisi-vgs");
                 SysBusDevice *busdev = SYS_BUS_DEVICE(vgs);

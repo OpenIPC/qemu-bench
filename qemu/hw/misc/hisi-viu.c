@@ -23,7 +23,8 @@
  *   0x1098 / 0x10b8  Y / C stride in bits 31:16
  *   0x10f0 / 0x10f8  channel 0 status / mask, write 1s to clear: bit 0 a
  *           frame ended (ViuDrvChnIntProcess queues the next buffer and
- *           hands on the last; it fires whether or not the channel wrote)
+ *           hands on the last; it rises whether or not the channel wrote
+ *           or is unmasked)
  *   0x200f0 / 0x200f8  the ISP's status / mask, write 1s to clear: bit 0
  *           frame start (the 3A wake-up and register sync), bit 1 the
  *           input formatter, bit 6 frame end
@@ -40,7 +41,8 @@
  *   0x22140..0x22154   AWB global R / G / B means (12-bit, before the
  *                      white balance), count, count min / max
  *   0x22188 / 0x2218c  AWB zone port, three words a zone: G << 16 | R,
- *                      count << 16 | B, max << 16 | min
+ *                      count << 16 | B, then the counts above / below the
+ *                      thresholds (0 here)
  *   0x21110..0x21116   white balance gains, 8.8, 16-bit each: Gr, R, Gb, B
  * The ISP code reads and writes bytes and halfwords, so the register file
  * is byte-addressed.
@@ -111,6 +113,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiViuState, HISI_VIU)
 #define ISP_INT_FEND        0x40
 
 #define VIU_FRAME_NS        (NANOSECONDS_PER_SECOND / 30)
+#define VIU_FRAME_NS_MIN    (NANOSECONDS_PER_SECOND / 1000)
+#define VIU_FRAME_NS_MAX    NANOSECONDS_PER_SECOND
 #define ZONE_COLS           17
 #define ZONE_ROWS           15
 #define ZONES               (ZONE_COLS * ZONE_ROWS)
@@ -152,11 +156,6 @@ static void viu_wr(HisiViuState *s, hwaddr a, uint32_t v)
     stl_le_p(s->regs + a, v);
 }
 
-static void viu_wr16(HisiViuState *s, hwaddr a, uint16_t v)
-{
-    stw_le_p(s->regs + a, v);
-}
-
 static void viu_update_irq(HisiViuState *s)
 {
     uint32_t g = 0;
@@ -194,7 +193,10 @@ static void viu_schedule(HisiViuState *s)
     if (s->sensor) {
         ns = image_sensor_frame_ns(s->sensor);
     }
-    s->frame_ns = ns > 0 ? ns : VIU_FRAME_NS;
+    /* a sensor's timing is the guest's to program: keep the frame clock
+     * between 1000 and 1 frames a second */
+    s->frame_ns = ns > 0 ? MIN(MAX(ns, VIU_FRAME_NS_MIN), VIU_FRAME_NS_MAX)
+                         : VIU_FRAME_NS;
     timer_mod(s->start_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->frame_ns);
 }
@@ -292,7 +294,8 @@ static void viu_stats(HisiViuState *s, const double tint[3])
                         (b >> 8);
         s->awb_zone[z * 3] = (g >> 4) << 16 | (r >> 4);
         s->awb_zone[z * 3 + 1] = cnt << 16 | (b >> 4);
-        s->awb_zone[z * 3 + 2] = cnt << 16;
+        s->awb_zone[z * 3 + 2] = 0;    /* counts beyond the thresholds:
+                                         * a camera's global ones read 0 */
     }
     for (int c = 0; c < 3; c++) {
         sum[c] /= GRID_W * GRID_H;
@@ -379,9 +382,9 @@ static void viu_frame_end(void *opaque)
         viu_paint(s);
         s->frames++;
     }
-    if (viu_rd(s, VIU_CH_MASK)) {
-        viu_wr(s, VIU_CH_INT, viu_rd(s, VIU_CH_INT) | 1);
-    }
+    /* the status rises whether or not it is unmasked; the mask only
+     * gates the interrupt (viu_update_irq) */
+    viu_wr(s, VIU_CH_INT, viu_rd(s, VIU_CH_INT) | 1);
     viu_wr(s, VIU_ISP_INT, viu_rd(s, VIU_ISP_INT) | ISP_INT_FEND);
     viu_update_irq(s);
 }
