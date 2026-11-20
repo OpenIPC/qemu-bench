@@ -265,6 +265,7 @@ cp qemu/hw/misc/hisi-sfc350.c      "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vedu.c qemu/hw/misc/hisi-vedu-xm.c.inc "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vpss.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-vi.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-vgs.c          "$QEMU_DIR/hw/misc/"
 # XMedia lotus SPC030 media (GK7206 xmorca): VI, VPSS, VGS
 cp qemu/hw/misc/lotus-vi.c qemu/hw/misc/lotus-vpss.c qemu/hw/misc/lotus-vgs.c \
                                     "$QEMU_DIR/hw/misc/"
@@ -311,6 +312,7 @@ cp qemu/hw/i2c/axera-pcal6416a.c   "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/sensor-sync.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/include/hw/i2c/sensor-sync.h "$QEMU_DIR/include/hw/i2c/"
 cp qemu/hw/i2c/galaxycore.c        "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/imagedesign-mis.c   "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-v1.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-dw.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/dw-i2c.c            "$QEMU_DIR/hw/i2c/"
@@ -1177,7 +1179,7 @@ done
 
 # hw/misc/meson.build
 if ! grep -q hisi-sysctl "$QEMU_DIR/hw/misc/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c', 'hisi-vpss.c', 'hisi-vi.c', 'hisi-scene.c', 'hisi-ive-npu.c', 'hisi-ive-ops.c', 'lotus-vi.c', 'lotus-vpss.c', 'lotus-vgs.c'))" \
+    echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('hisi-sysctl.c', 'hisi-crg.c', 'hisi-fmc.c', 'hisi-sfc350.c', 'hisi-himci.c', 'hisi-regbank.c', 'hisi-vedu.c', 'hisi-mipi-rx.c', 'hisi-rtc.c', 'hisi-ive.c', 'hisi-nnie.c', 'hisi-fastboot.c', 'hisi-gzip.c', 'hisi-hwrng.c', 'hisi-l2cache.c', 'hisi-xmsp804.c', 'hisi-ddrc-v1.c', 'hisi-vpss.c', 'hisi-vi.c', 'hisi-scene.c', 'hisi-ive-npu.c', 'hisi-ive-ops.c', 'lotus-vi.c', 'lotus-vpss.c', 'lotus-vgs.c', 'hisi-vgs.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  patched hw/misc/meson.build"
 else
@@ -1241,6 +1243,11 @@ else
         sed -i "s/'hisi-ive-ops.c'/'hisi-ive-ops.c', 'lotus-vi.c', 'lotus-vpss.c', 'lotus-vgs.c'/" \
             "$QEMU_DIR/hw/misc/meson.build"
         echo "  hw/misc/meson.build: added lotus-vi.c, lotus-vpss.c, lotus-vgs.c"
+    fi
+    if ! grep -q "'hisi-vgs.c'" "$QEMU_DIR/hw/misc/meson.build"; then
+        sed -i "s/'lotus-vgs.c'/'lotus-vgs.c', 'hisi-vgs.c'/" \
+            "$QEMU_DIR/hw/misc/meson.build"
+        echo "  hw/misc/meson.build: added hisi-vgs.c"
     fi
 fi
 
@@ -1381,7 +1388,7 @@ fi
 sed -i -E "/CONFIG_(HISI_I2C|FULLHAN|GRAINMEDIA|INGENIC)/s/'(hisi-(imx[0-9]+|f37|gc2053|sp2305|mis2006|nvp6124b|smartsens)|galaxycore|ingenic-ov2735)\.c'(, )?//g" \
     "$QEMU_DIR/hw/i2c/meson.build"
 if ! grep -q "'image-sensor.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_I2C', if_true: files('image-sensor.c', 'sensor-sync.c', 'imx323.c', 'galaxycore.c', 'hisi-f37.c', 'hisi-imx291.c', 'hisi-imx307.c', 'hisi-imx335.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c', 'hisi-sp2305.c', 'ingenic-ov2735.c'))" \
+    echo "system_ss.add(when: 'CONFIG_I2C', if_true: files('image-sensor.c', 'sensor-sync.c', 'imx323.c', 'galaxycore.c', 'imagedesign-mis.c', 'hisi-f37.c', 'hisi-imx291.c', 'hisi-imx307.c', 'hisi-imx335.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c', 'hisi-sp2305.c', 'ingenic-ov2735.c'))" \
         >> "$QEMU_DIR/hw/i2c/meson.build"
     echo "  hw/i2c/meson.build: added the image sensors"
 fi
@@ -1389,6 +1396,11 @@ if ! grep -q "'sensor-sync.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
     sed -i "s/'image-sensor.c', /'image-sensor.c', 'sensor-sync.c', /" \
         "$QEMU_DIR/hw/i2c/meson.build"
     echo "  hw/i2c/meson.build: added sensor-sync.c"
+fi
+if ! grep -q "'imagedesign-mis.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+    sed -i "s/'galaxycore.c', /'galaxycore.c', 'imagedesign-mis.c', /" \
+        "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added imagedesign-mis.c"
 fi
 
 # hw/ssi/Kconfig
