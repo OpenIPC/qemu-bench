@@ -438,6 +438,18 @@ def test_isp32(qt):
           '%d pixels (%d)' % (64 * 16, total))
     qt.writel(P + 0x5000, qt.readl(P + 0x5000))  # the driver's done write
     check(qt.readl(P + 0x5000) == 1, 'ISP32 3A: MEAS_DONE cleared by W1C')
+    # colour processing: contrast 0.5, brightness +40 (the picture here
+    # is the flat grey of an unprogrammed exposure: Y only)
+    y0 = qt.read(buf, 1)[0]
+    qt.writel(P + 0x804, 0x40)
+    qt.writel(P + 0x808, 40)
+    qt.writel(P + 0x80c, 0x80)
+    qt.writel(P + 0x800, 1)
+    qt.cmd('clock_step 33400000')
+    y1 = qt.read(buf, 1)[0]
+    check(y1 == round(y0 * 0.5) + 40,
+          'ISP32 CPROC: Y %d -> %d (contrast 0.5, brightness +40)' % (y0, y1))
+    qt.writel(P + 0x800, 0)
     # the driver's restart of a paused path: enable, self-update, disable;
     # the shadows must take the new buffer and the enable at once
     qt.writel(P + 0x1400, 0)                    # paused

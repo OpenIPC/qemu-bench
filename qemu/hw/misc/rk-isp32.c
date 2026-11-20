@@ -51,7 +51,10 @@
  * count (rk-scene.c, shared with the ISPP), in reflectance, times
  * integration lines x gain (a grey card at RK_SCENE_NOMINAL_LINES and 1x is
  * two thirds of the 12-bit range) under a neutral light, in 8x8 blocks.  Gamma (square root) and BT.601 limited
- * range make the NV12.  So the vendor AE, which reads the statistics
+ * range make the NV12, through the colour processing (CPROC, 0x800: CTRL
+ * bit 0, CONTRAST and SATURATION Q1.7, BRIGHTNESS signed, HUE signed in
+ * 90/128 degree steps) when the IQ turns it on -- majestic's image
+ * settings land there.  So the vendor AE, which reads the statistics
  * below and writes the sensor's exposure over I2C, sees its own changes.
  *
  * The 3A statistics the lite ISP's driver reads from registers at FRAME
@@ -94,6 +97,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
@@ -167,6 +171,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define MP_SELF_UPD     (1u << 4)
 #define BP_SELF_UPD     (1u << 6)
 
+#define R_CPROC_CTRL    0x0800      /* colour processing: bit 0 enable */
+#define R_CPROC_CONTRAST 0x0804     /* Q1.7, 0x80 = 1 */
+#define R_CPROC_BRIGHT  0x0808      /* signed, added to Y */
+#define R_CPROC_SAT     0x080c      /* Q1.7 */
+#define R_CPROC_HUE     0x0810      /* signed, 90 / 128 degree steps */
 #define R_AE_BIG        0x4400
 #define R_AE_LITE       0x4500
 #define R_AE_BIG2       0x4600
@@ -237,6 +246,27 @@ static int64_t rk_isp32_half_frame(RkIsp32State *s)
 }
 
 /*
+ * Colour processing (CPROC), as the ISP applies it after the statistics:
+ * Y scaled by the contrast and offset by the brightness, the chroma
+ * rotated by the hue and scaled by the saturation.
+ */
+static void rk_isp32_cproc(RkIsp32State *s, uint8_t yuv[3])
+{
+    double con = (REG(s, R_CPROC_CONTRAST) & 0xff) / 128.0;
+    double sat = (REG(s, R_CPROC_SAT) & 0xff) / 128.0;
+    double bri = (int8_t)REG(s, R_CPROC_BRIGHT);
+    double hue = (int8_t)REG(s, R_CPROC_HUE) * (M_PI / 2) / 128;
+    double u = yuv[1] - 128.0, v = yuv[2] - 128.0;
+    double y = yuv[0] * con + bri;
+    double u2 = (u * cos(hue) + v * sin(hue)) * sat + 128;
+    double v2 = (v * cos(hue) - u * sin(hue)) * sat + 128;
+
+    yuv[0] = y < 0 ? 0 : y > 255 ? 255 : lrint(y);
+    yuv[1] = u2 < 0 ? 0 : u2 > 255 ? 255 : lrint(u2);
+    yuv[2] = v2 < 0 ? 0 : v2 > 255 ? 255 : lrint(v2);
+}
+
+/*
  * The frame now ending: each 8x8 block's raw levels at the sensor's
  * exposure, its NV12, and the statistics of those levels.
  */
@@ -278,6 +308,9 @@ static void rk_isp32_render(RkIsp32State *s)
             big[zb][3]++;
             s->hist[(uint32_t)lvl[1] >> 4] += BLK * BLK;
             rk_scene_yuv(lvl, true, &s->blk_yuv[b * 3]);
+            if (REG(s, R_CPROC_CTRL) & 1) {
+                rk_isp32_cproc(s, &s->blk_yuv[b * 3]);
+            }
         }
     }
     /* zone means: G 12-bit, B and R 10-bit */

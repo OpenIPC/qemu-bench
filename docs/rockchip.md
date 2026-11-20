@@ -692,8 +692,10 @@ RV1103 / RV1106:
   (readback or raw dumps), and no MIPI interrupts. The CSI-2 host and
   D-PHY are storage. The ISP renders the sensor's scene itself, at the
   sensor's exposure.
-- **ISP processing:** the ISP's own white balance, colour and tone
-  settings aren't applied (fixed gamma, neutral light). AWB and AF
+- **ISP processing:** the ISP's white balance and tone settings aren't
+  applied (fixed gamma, neutral light). Only the colour processing is:
+  CPROC at `0x800` (contrast, brightness, saturation, hue), when the IQ
+  turns it on. AWB and AF
   statistics aren't produced from the scene.
 - **Encoder:** H.265 P slices use the shared encoder's simple inter
   coding (skip, or intra where the picture changed). There's no
