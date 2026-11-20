@@ -2369,6 +2369,12 @@ static const HisiSoCConfig gk7205v500_soc = {
     .name               = "gk7205v500",
     .desc               = "Goke GK7205V500 (Cortex-A7, 0.5 TOPS NPU)",
     .soc_id             = GOKE_SOC_ID_7205V500,
+    /* Boot ROM speaks the HiSilicon V500 UART protocol — the same BD-00-FF-01
+     * handshake + plaintext-header verify as the gk7206, replying with soc_id.
+     * Modelled by analogy with the gk7206 (hardware-verified there); defib
+     * routes the whole gk7205v5x0 family to HiSiliconV500, and chip id
+     * 0x72050510 was read off a real GK7205V510 via this handshake. */
+    .fastboot_v500      = true,
     .xm_die_code        = 6,               /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 MCP */
@@ -2381,6 +2387,7 @@ static const HisiSoCConfig gk7205v510_soc = {
     .name               = "gk7205v510",
     .desc               = "Goke GK7205V510 (Cortex-A7, 1.0 TOPS NPU)",
     .soc_id             = GOKE_SOC_ID_7205V510,
+    .fastboot_v500      = true,            /* V500 UART boot ROM (see gk7205v500) */
     .default_sensor     = "mis2009",       /* Zenointel SD-2N-4G, i2c0 0x30 */
     .xm_die_code        = 7,               /* SYSCTRL+0x18 [7:4] */
     /* The vendor xm720xxx DTS has a PL061 at 0x120b8000 (SPI 24), and
@@ -2413,6 +2420,7 @@ static const HisiSoCConfig gk7205v530_soc = {
     .name               = "gk7205v530",
     .desc               = "Goke GK7205V530 (Cortex-A7, 1.0 TOPS NPU, ext DDR)",
     .soc_id             = GOKE_SOC_ID_7205V530,
+    .fastboot_v500      = true,            /* V500 UART boot ROM (see gk7205v500) */
     .xm_die_code        = 8,               /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_128M,               /* external DDR, 128 MiB typical */

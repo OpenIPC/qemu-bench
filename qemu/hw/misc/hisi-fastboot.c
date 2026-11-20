@@ -68,6 +68,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiFastbootState, HISI_FASTBOOT)
 #define FB_V500_MAGIC2  0xFF
 #define FB_V500_MAGIC3  0x01
 #define FB_V500_FRAME_LEN  14
+/* V500 boot images load at this base; the header entry field is base + the
+ * boot-code file offset (0x40706000 on gk7206, 0x40707000 on gk7205v5x0). */
+#define FB_V500_IMAGE_BASE  0x40700000u
 
 /* State machine phases */
 enum {
@@ -340,10 +343,21 @@ static void hisi_fastboot_process_head(HisiFastbootState *s)
     s->next_seq = 1;
 
     /* Track the boot entry.  Classic: the U-Boot HEAD's own address.  V500
-     * (gk7206): the ROM jumps to the header's ABSOLUTE entry field, wherever
-     * BOOT was loaded — so a wrong load base lands the jump off the image. */
+     * differs by family (both confirmed against the respective hardware):
+     *   - gk7206: the ROM jumps to the header's ABSOLUTE entry field, wherever
+     *     BOOT was loaded — a wrong load base lands the jump off the image.
+     *   - gk7205v5x0: the ROM jumps to the BOOT download address + boot_off
+     *     (a probe read pc=0x41007000, not the 0x40707000 the field holds), so
+     *     the absolute entry's low bits are the only part that matters. */
     if (s->step == FB_STEP_UBOOT) {
-        s->entry_addr = s->v500 ? s->v500_entry : s->xfer_addr;
+        if (!s->v500) {
+            s->entry_addr = s->xfer_addr;
+        } else if ((s->chip_id & 0xFFFF0000u) == 0x72060000u) {   /* gk7206 */
+            s->entry_addr = s->v500_entry;
+        } else {                                                  /* gk7205v5x0 */
+            uint32_t boot_off = s->v500_entry - FB_V500_IMAGE_BASE;
+            s->entry_addr = s->xfer_addr + boot_off;
+        }
     }
 
     qemu_log_mask(LOG_UNIMP,
