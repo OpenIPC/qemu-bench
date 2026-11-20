@@ -8,7 +8,8 @@ script plays the vendor drivers (docs/anyka.md):
     staged where the ROM puts them (stub + table at 0, U-Boot at its load
     address, the header behind it and in L2 memory at 0x48000200);
   - ak-sysctrl: chip ID, a one-shot timer expiring into the timer's
-    sub-interrupt and the cascaded module interrupt, the RTC link;
+    sub-interrupt and the cascaded module interrupt, the RTC link, the
+    SAR-ADC1 samples from the ain0 / ain1 / bat properties;
   - ak-uart: a byte put in L2 memory and started from CONF2 reaches the
     serial backend, TX-done reads as idle;
   - ak-spi + ak-spinor: JEDEC ID by PIO, a fast read whose dummy byte is a
@@ -191,6 +192,22 @@ def test_sysctrl(qt):
     check('RTC register round trip', qt.readl(SYSCTRL + 0x54) & 0x3FFF,
           0x1234)
     check('RTC ready', (qt.readl(SYSCTRL + 0x30) >> 7) & 1, 1)
+    # SAR-ADC1 samples: AIN0 9:0, AIN1 19:10, BAT 29:20; a lit room on both
+    # inputs by default.
+    check('SAR samples, default', qt.readl(SYSCTRL + 0x68),
+          930 | 930 << 10)
+
+
+def test_sar_inputs(qemu, path):
+    print('ak-sysctrl SAR inputs')
+    qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path,
+               ['-global', 'ak-sysctrl.ain0=12',
+                '-global', 'ak-sysctrl.bat=0x3ff'])
+    try:
+        check('AIN0 covered, AIN1 lit, BAT full', qt.readl(SYSCTRL + 0x68),
+              12 | 930 << 10 | 0x3ff << 20)
+    finally:
+        qt.close()
 
 
 def test_uart(qt, out):
@@ -846,6 +863,7 @@ def main():
     path300l = os.path.join(tmp, 'flash300l.bin')
     make_image(path300l, b'AK_H322L')
     test_ev300l(args.qemu, path300l)
+    test_sar_inputs(args.qemu, path)
     test_av100(args.qemu, tmp)
     test_av130(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)

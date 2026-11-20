@@ -16,6 +16,13 @@
  *   0xE4 / 0xE8 watchdog           0xF4..0x118  timers 6..10 (EV330 only)
  *   0x8C        EV330 eFuse read: bit 31 starts and is busy, 30 also busy;
  *               the fuse words come back in 0x90 / 0x94 (all blank here)
+ *   0x68        SAR-ADC1 samples: AIN0 in bits 9:0, AIN1 in 19:10, BAT in
+ *               29:20, 10 bits of the 3.3 V AVCC each (mach-anycloud
+ *               ak_adc1.c). They come from the "ain0", "ain1" and "bat"
+ *               properties, which qom-set changes while the guest runs, so
+ *               a test can cover and uncover a photocell. The default is a
+ *               lit room on both inputs (930, about 3.0 V, what the
+ *               PE3020-W's photocell reads in light).
  *
  * Interrupt numbering (mach/irqs.h, identical on EV200 / EV300 / EV330):
  * the module bit n of 0x24 / 0x4C is source n; sub-interrupt bit 0 is the
@@ -69,6 +76,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 #define R_INT_STATUS        (0x4C / 4)
 #define R_RTC_CONF          (0x50 / 4)
 #define R_RTC_DATA          (0x54 / 4)
+#define R_SAR_SMP_DAT       (0x68 / 4)
 #define R_EFUSE_CTRL        (0x8C / 4)
 #define R_WDT_CFG1          (0xE4 / 4)
 #define R_WDT_CFG2          (0xE8 / 4)
@@ -147,6 +155,7 @@ struct AkSysctrlState {
     uint32_t num_timers;
     bool has_efuse;
     bool clk_v2;
+    uint32_t ain[3];            /* SAR-ADC1 AIN0, AIN1, BAT; 10 bits each */
 };
 
 /* CTRL1 / CTRL2 offsets of timer n (1-based in the vendor's naming). */
@@ -318,6 +327,9 @@ static uint64_t ak_sysctrl_read(void *opaque, hwaddr offset, unsigned size)
         return ak_sub_status(s);
     case R_INT_STATUS:
         return ak_int_status(s);
+    case R_SAR_SMP_DAT:
+        return (s->ain[0] & 0x3ff) | (s->ain[1] & 0x3ff) << 10 |
+               (s->ain[2] & 0x3ff) << 20;
     default:
         return s->regs[offset / 4];
     }
@@ -518,6 +530,16 @@ static void ak_sysctrl_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->fiq);
     qdev_init_gpio_in(DEVICE(obj), ak_sysctrl_set_irq, 32);
+
+    /* Not qdev properties: those cannot be set once the device is realized,
+     * and these are the outside world, which changes while the guest runs. */
+    s->ain[0] = s->ain[1] = 930;
+    object_property_add_uint32_ptr(obj, "ain0", &s->ain[0],
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "ain1", &s->ain[1],
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "bat", &s->ain[2],
+                                   OBJ_PROP_FLAG_READWRITE);
 }
 
 static const Property ak_sysctrl_properties[] = {

@@ -70,7 +70,7 @@ appended DTB.
 | Address | Block | Model |
 |---|---|---|
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
-| `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
+| `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse, SAR-ADC1 samples (`ain0` / `ain1` / `bat`, settable with `qom-set` while the guest runs) | `ak-sysctrl` |
 | `0x20000000` | ISP / VI (interrupt 1) | EV200 and AK3918EV300 `ak-isp`, others storage |
 | `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core (registers from `+0x8000`; interrupt 2) | EV200 `ak-h8290`, EV300 `ingenic-avpu` (`anyka`), others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
