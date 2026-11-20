@@ -623,6 +623,26 @@ online, or with `--offline` in `VI_OFFLINE_VPSS_ONLINE`:
 Two strips are modelled from the source and checked by
 `test-hisi-isp.py --gen 5`; no shipped sensor makes the driver use them.
 
+## CV200 (Hi3516CV200 / Hi3518EV200)
+
+The CV200 pipeline runs offline: `hisi-viu` writes each frame to DDR,
+`hisi-vpss-v2` scales it, and `hisi-vedu` gen 2 encodes it. The register
+maps are in the source headers of those files.
+
+- **VEDU gen 2** takes a register image from DDR (MMIO `0x1e0`). Its
+  stream ring and packet headers are V4's, so the model moves the image's
+  fields into the V4 layout and encodes the same way. JPGE (`0x20660000`)
+  is not modelled.
+- **ISP statistics** are read through indexed ports (AE histogram, AE
+  zones, AWB zones), not by DMA. The scales were taken from a running
+  camera: AE 8-bit, AWB 12-bit before the white balance gains.
+
+```bash
+qemu-system-arm -M hi3518ev200,flash-file=dump.bin -icount shift=0 \
+    -nographic -serial mon:stdio -nic user,restrict=on \
+    -global hisi-vedu.dump-dir=/tmp/venc
+```
+
 ## Not yet
 
 - **AF, the local-average (LA) and dehaze statistics** are not produced.
