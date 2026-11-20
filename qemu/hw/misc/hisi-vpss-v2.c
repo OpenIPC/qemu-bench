@@ -35,11 +35,13 @@
  * on, prepare the next, regup).  It paints each channel at its own size
  * with VIU's scene, which is what scaling the capture would give.
  *
- * The VGS (0x20630000, VIC 29; hi3518e_vgs.o's VGS_HAL_*) has the same
- * front end, and VPSS's extended channels go through it: with vgs=on
- * this model runs its chains and completes them, painting nothing (its
- * node layout is not decoded).  A job that never completed would keep
- * its frame out of the pool for good.
+ * The VGS (0x20630000, VIC 29; hi3518e_vgs.o's VGS_HAL_*) is the same
+ * engine, a second instance: VPSS's extended channels go through it.  Its
+ * nodes have VPSS's layout -- a vendor dump's scale the 1280x720 channel 1
+ * (source 0x020 / 0x10c-0x114) into 640x360 and 320x240 through the
+ * channel-1 slot (0x008 bit 3, 0x064, 0x150-0x158) -- so they run here
+ * as they are.  A job that never completed would keep its frame out of
+ * the pool for good.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -106,7 +108,6 @@ struct HisiVpssV2State {
     uint32_t done_id;
     uint32_t nodes;
     bool trace;
-    bool vgs;                       /* VGS: nodes complete, not painted */
 
     /* online: the registers the frame in progress took, and VIU */
     uint32_t act[V2_NODE_SIZE / 4];
@@ -210,9 +211,7 @@ static void v2_run(HisiVpssV2State *s, uint32_t a)
             bits = V2_INT_ERR;
             break;
         }
-        if (!s->vgs) {
-            v2_run_node(s, node);
-        }
+        v2_run_node(s, node);
         bits |= node[V2_NODE_MASK / 4] & 1;
         s->done_id = node[V2_NODE_ID / 4];
         s->nodes++;
@@ -395,7 +394,6 @@ static const VMStateDescription vmstate_hisi_vpss_v2 = {
 
 static const Property hisi_vpss_v2_properties[] = {
     DEFINE_PROP_BOOL("trace", HisiVpssV2State, trace, false),
-    DEFINE_PROP_BOOL("vgs", HisiVpssV2State, vgs, false),
 };
 
 static void hisi_vpss_v2_class_init(ObjectClass *klass, const void *data)
