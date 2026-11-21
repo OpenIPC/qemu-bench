@@ -30,6 +30,9 @@ script plays the vendor drivers (docs/anyka.md):
   - ak3918av100 / ak3918av100x: the ANYKA322 header whose payload the ROM
     copies from flash 0x600 (secure-boot keys behind the 0x200 header), the
     chip ID, and the eFuse read the vendor ak_efuse.ko polls;
+  - the ak-sysctrl watchdog: a feed defers expiry, magic close disables it,
+    an expiry is reported with when it was last fed, and the kernel's
+    two-count restart resets without being reported;
   - outside qtest: a flash image smaller than an erase block is refused,
     machine state migrates to a file and back on five- and ten-timer
     parts, and a file-backed flash blocks migration.
@@ -39,6 +42,7 @@ script plays the vendor drivers (docs/anyka.md):
 import argparse
 import atexit
 import os
+import re
 import shutil
 import socket
 import struct
@@ -196,6 +200,56 @@ def test_sysctrl(qt):
     # inputs by default.
     check('SAR samples, default', qt.readl(SYSCTRL + 0x68),
           930 | 930 << 10)
+
+
+WDT_CFG1 = SYSCTRL + 0xE4
+WDT_CFG2 = SYSCTRL + 0xE8
+WDT_HZ = 46875                      # ak_top_wdt.c: 21.333 us a count
+
+
+def wdt_feed(qt, counts):
+    """What ak_top_wdt.c's wdt_keepalive() writes: the load, enable, then
+    enable + feed."""
+    qt.writel(WDT_CFG1, 0x55 << 24 | counts)
+    qt.writel(WDT_CFG2, 0xAA << 24 | 1)
+    qt.writel(WDT_CFG2, 0xAA << 24 | 3)
+
+
+def test_watchdog(qemu, path):
+    print('ak-sysctrl watchdog')
+    qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path)
+    err = os.path.join(qt.dir, 'qemu.err')
+
+    def log():
+        return open(err).read()
+
+    try:
+        wdt_feed(qt, WDT_HZ)                    # 1 s
+        qt.step(500 * 1000000)
+        wdt_feed(qt, WDT_HZ)                    # fed again at 0.5 s
+        qt.step(800 * 1000000)
+        check('a feed defers expiry', log().count('watchdog expired'), 0)
+        qt.step(500 * 1000000)
+        check('unfed, it expires and says so',
+              log().count('watchdog expired'), 1)
+        m = re.search(r'last fed ([0-9.]+) s ago with a ([0-9.]+) s timeout',
+                      log())
+        check('... with when it was last fed and the timeout',
+              bool(m) and abs(float(m.group(1)) - 1) < 0.01 and
+              m.group(2) == '1.000', True)
+        # Disabled after a feed, as the driver's magic close does.
+        wdt_feed(qt, WDT_HZ)
+        qt.writel(WDT_CFG2, 0xAA << 24)
+        qt.step(2000 * 1000000)
+        check('disabled, it stays quiet', log().count('watchdog expired'), 1)
+        # The kernel's restart hook: wdt_keepalive(2). A reboot, not an
+        # expiry worth reporting.
+        wdt_feed(qt, 2)
+        qt.step(1000000)
+        check('restart (2 counts) is not reported',
+              log().count('watchdog expired'), 1)
+    finally:
+        qt.close()
 
 
 def test_sar_inputs(qemu, path):
@@ -864,6 +918,7 @@ def main():
     make_image(path300l, b'AK_H322L')
     test_ev300l(args.qemu, path300l)
     test_sar_inputs(args.qemu, path)
+    test_watchdog(args.qemu, path)
     test_av100(args.qemu, tmp)
     test_av130(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)

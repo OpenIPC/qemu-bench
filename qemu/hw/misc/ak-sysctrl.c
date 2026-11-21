@@ -40,6 +40,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -48,6 +49,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
+#include "system/watchdog.h"
 #include "qom/object.h"
 #include "system/runstate.h"
 
@@ -143,6 +145,10 @@ struct AkSysctrlState {
     uint16_t rtc[RTC_NREGS];
     ptimer_state *wdt;
     uint32_t wdt_load;
+    /* Diagnostics only, so not migrated: what the running count started
+     * from and when, to say how a reset came about. */
+    uint32_t wdt_run_load;
+    int64_t wdt_fed_ms;
 
     uint32_t chip_id;
     uint32_t chip_id_av;        /* AV130: the ID at +0x3FC, 0 = none */
@@ -256,10 +262,33 @@ static void ak_timer_write_ctrl2(AkTimer *t, uint32_t val)
     }
 }
 
+/*
+ * A count this short is the kernel restarting the board, not a watchdog
+ * that went unfed: mach-ak39ev330.c's restart hook is wdt_enable() plus
+ * wdt_keepalive(2), two counts (43 us). Below 1 ms the reset is a plain
+ * reboot, as it always was; anything longer is reported, because on this
+ * machine the watchdog is the only thing that resets the board and an
+ * expiry would otherwise look exactly like a `reboot`.
+ */
+#define AK_WDT_RESTART_COUNTS   (AK_WDT_FREQ / 1000)
+
 static void ak_wdt_expire(void *opaque)
 {
-    qemu_log_mask(LOG_GUEST_ERROR, "ak-sysctrl: watchdog reset\n");
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    AkSysctrlState *s = opaque;
+
+    if (s->wdt_run_load < AK_WDT_RESTART_COUNTS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ak-sysctrl: watchdog reset "
+                      "(restart)\n");
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
+    warn_report("ak-sysctrl: watchdog expired: last fed %.3f s ago with "
+                "a %.3f s timeout",
+                (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - s->wdt_fed_ms) /
+                    1000.0,
+                (double)s->wdt_run_load / AK_WDT_FREQ);
+    /* Reset by default; -action watchdog=pause|none|... applies. */
+    watchdog_perform_action();
 }
 
 static void ak_wdt_write_cfg2(AkSysctrlState *s, uint32_t val)
@@ -268,7 +297,9 @@ static void ak_wdt_write_cfg2(AkSysctrlState *s, uint32_t val)
     if (!(val & WDT_EN)) {
         ptimer_stop(s->wdt);
     } else if (val & WDT_FEED) {
-        ptimer_set_limit(s->wdt, MAX(s->wdt_load, 1), 1);
+        s->wdt_run_load = MAX(s->wdt_load, 1);
+        s->wdt_fed_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        ptimer_set_limit(s->wdt, s->wdt_run_load, 1);
         ptimer_run(s->wdt, 1);
     }
     ptimer_transaction_commit(s->wdt);
@@ -468,6 +499,8 @@ static void ak_sysctrl_reset(DeviceState *dev)
     ptimer_stop(s->wdt);
     ptimer_transaction_commit(s->wdt);
     s->wdt_load = 0;
+    s->wdt_run_load = 0;
+    s->wdt_fed_ms = 0;
 
     /*
      * Real time, 14 bits a register: seconds+minutes / hours+day /
