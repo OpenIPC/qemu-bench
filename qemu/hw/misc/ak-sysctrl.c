@@ -16,13 +16,24 @@
  *   0xE4 / 0xE8 watchdog           0xF4..0x118  timers 6..10 (EV330 only)
  *   0x8C        EV330 eFuse read: bit 31 starts and is busy, 30 also busy;
  *               the fuse words come back in 0x90 / 0x94 (all blank here)
- *   0x68        SAR-ADC1 samples: AIN0 in bits 9:0, AIN1 in 19:10, BAT in
- *               29:20, 10 bits of the 3.3 V AVCC each (mach-anycloud
- *               ak_adc1.c). They come from the "ain0", "ain1" and "bat"
- *               properties, which qom-set changes while the guest runs, so
- *               a test can cover and uncover a photocell. The default is a
- *               lit room on both inputs (930, about 3.0 V, what the
- *               PE3020-W's photocell reads in light).
+ *   0x68        SAR-ADC1 samples, from the "ain0", "ain1" and "bat"
+ *               properties: millivolts at the pin, which qom-set changes
+ *               while the guest runs, so a test can cover and uncover a
+ *               photocell. The default is a lit room on both inputs
+ *               (3000 mV, what the PE3020-W's photocell gives in light).
+ *               How a sample gets there is the chip's:
+ *    - EV330 (and the default): always there, AIN0 in bits 9:0, AIN1 in
+ *               19:10, BAT in 29:20, 10 bits of the 3.3 V AVCC each
+ *               (mach-anycloud ak_adc1.c's EV330 reader);
+ *    - EV300 ("sar-ev300"): one conversion at a time, 12 bits in 11:0
+ *               against 3.0 V. 0x5C bit 0 starts it and 0x6C bit 0 says it
+ *               is ready (cleared by writing 0). It reads its input only
+ *               when the converter is clocked (0x0C bit 3), out of reset
+ *               (0x20 bit 30), and powered (0xA0 bit 0 clear), and the
+ *               input is selected (0x5C bit 5) and enabled (0xA0 bit 5):
+ *               otherwise the sample is 0, which is what an EV330-style
+ *               read of this silicon gets. AIN0 only, the one input whose
+ *               analog enable is known (OpenIPC/builder#234).
  *
  * Interrupt numbering (mach/irqs.h, identical on EV200 / EV300 / EV330):
  * the module bit n of 0x24 / 0x4C is source n; sub-interrupt bit 0 is the
@@ -78,7 +89,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 #define R_INT_STATUS        (0x4C / 4)
 #define R_RTC_CONF          (0x50 / 4)
 #define R_RTC_DATA          (0x54 / 4)
+#define R_SAR_IF_CFG        (0x5C / 4)
 #define R_SAR_SMP_DAT       (0x68 / 4)
+#define R_SAR_STATUS        (0x6C / 4)
+#define R_SAR_ACR2          (0xA0 / 4)
 #define R_EFUSE_CTRL        (0x8C / 4)
 #define R_WDT_CFG1          (0xE4 / 4)
 #define R_WDT_CFG2          (0xE8 / 4)
@@ -162,7 +176,8 @@ struct AkSysctrlState {
     uint32_t num_timers;
     bool has_efuse;
     bool clk_v2;
-    uint32_t ain[3];            /* SAR-ADC1 AIN0, AIN1, BAT; 10 bits each */
+    uint32_t ain[3];            /* SAR-ADC1 AIN0, AIN1, BAT; mV at the pin */
+    bool sar_ev300;
 };
 
 /* CTRL1 / CTRL2 offsets of timer n (1-based in the vendor's naming). */
@@ -273,6 +288,50 @@ static void ak_timer_write_ctrl2(AkTimer *t, uint32_t val)
  */
 #define AK_WDT_RESTART_COUNTS   (AK_WDT_FREQ / 1000)
 
+/* SAR-ADC1 (see the register list at the top). */
+#define SAR_EV330_AVCC_MV   3300
+#define SAR_EV300_VREF_MV   3000
+#define SAR_CLK_EN          (1u << 3)       /* 0x0C */
+#define SAR_RESET_RELEASE   (1u << 30)      /* 0x20 */
+#define SAR_CFG_START       (1u << 0)       /* 0x5C */
+#define SAR_CFG_AIN0        (1u << 5)
+#define SAR_STATUS_READY    (1u << 0)       /* 0x6C */
+#define SAR_ACR2_POWER_DOWN (1u << 0)       /* 0xA0 */
+#define SAR_ACR2_AIN0       (1u << 5)
+#define R_RESET_CTRL        (0x20 / 4)
+
+static uint32_t ak_sar_scale(uint32_t mv, uint32_t ref_mv, unsigned bits)
+{
+    uint32_t full = (1u << bits) - 1;
+    uint64_t raw = (uint64_t)mv << bits;
+
+    raw /= ref_mv;
+    return raw > full ? full : raw;
+}
+
+static uint32_t ak_sar_ev330(uint32_t mv)
+{
+    return ak_sar_scale(mv, SAR_EV330_AVCC_MV, 10);
+}
+
+static void ak_sar_ev300_convert(AkSysctrlState *s)
+{
+    uint32_t acr2 = s->regs[R_SAR_ACR2];
+    bool live = (s->regs[R_SPI0_CLK] & SAR_CLK_EN) &&
+                (s->regs[R_RESET_CTRL] & SAR_RESET_RELEASE) &&
+                !(acr2 & SAR_ACR2_POWER_DOWN);
+    uint32_t sample = 0;
+
+    if (live && (s->regs[R_SAR_IF_CFG] & SAR_CFG_AIN0) &&
+        (acr2 & SAR_ACR2_AIN0)) {
+        sample = ak_sar_scale(s->ain[0], SAR_EV300_VREF_MV, 12);
+    }
+    /* The conversion is quick next to the driver's 250 us poll: done by the
+     * time anyone looks. */
+    s->regs[R_SAR_SMP_DAT] = sample;
+    s->regs[R_SAR_STATUS] |= SAR_STATUS_READY;
+}
+
 static void ak_wdt_expire(void *opaque)
 {
     AkSysctrlState *s = opaque;
@@ -360,8 +419,11 @@ static uint64_t ak_sysctrl_read(void *opaque, hwaddr offset, unsigned size)
     case R_INT_STATUS:
         return ak_int_status(s);
     case R_SAR_SMP_DAT:
-        return (s->ain[0] & 0x3ff) | (s->ain[1] & 0x3ff) << 10 |
-               (s->ain[2] & 0x3ff) << 20;
+        if (s->sar_ev300) {
+            return s->regs[R_SAR_SMP_DAT];
+        }
+        return ak_sar_ev330(s->ain[0]) | ak_sar_ev330(s->ain[1]) << 10 |
+               ak_sar_ev330(s->ain[2]) << 20;
     default:
         return s->regs[offset / 4];
     }
@@ -431,6 +493,14 @@ static void ak_sysctrl_write(void *opaque, hwaddr offset, uint64_t val,
     case R_RTC_CONF:
         s->regs[R_RTC_CONF] = val & ~RTC_CONF_GO;
         ak_rtc_command(s, val);
+        return;
+    case R_SAR_IF_CFG:
+        s->regs[R_SAR_IF_CFG] = val;
+        if (s->sar_ev300 && (val & SAR_CFG_START)) {
+            ak_sar_ev300_convert(s);
+        }
+        return;
+    case R_SAR_SMP_DAT:
         return;
     case R_WDT_CFG1:
         if ((val >> 24) == WDT_CFG1_KEY) {
@@ -567,7 +637,7 @@ static void ak_sysctrl_init(Object *obj)
 
     /* Not qdev properties: those cannot be set once the device is realized,
      * and these are the outside world, which changes while the guest runs. */
-    s->ain[0] = s->ain[1] = 930;
+    s->ain[0] = s->ain[1] = 3000;
     object_property_add_uint32_ptr(obj, "ain0", &s->ain[0],
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint32_ptr(obj, "ain1", &s->ain[1],
@@ -583,6 +653,7 @@ static const Property ak_sysctrl_properties[] = {
     DEFINE_PROP_UINT32("num-timers", AkSysctrlState, num_timers, 5),
     DEFINE_PROP_BOOL("has-efuse", AkSysctrlState, has_efuse, false),
     DEFINE_PROP_BOOL("clk-v2", AkSysctrlState, clk_v2, false),
+    DEFINE_PROP_BOOL("sar-ev300", AkSysctrlState, sar_ev300, false),
 };
 
 static const VMStateDescription vmstate_ak_timer = {

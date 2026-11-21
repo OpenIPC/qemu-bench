@@ -114,6 +114,7 @@ static const AkSoCConfig ak3916ev300_soc = {
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
     .venc_allegro       = true,
+    .sar_ev300          = true,
 };
 
 /*
@@ -131,6 +132,7 @@ static const AkSoCConfig ak3918ev300_soc = {
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
     .venc_allegro       = true,
+    .sar_ev300          = true,
     .isp2               = true,
     .isp2_ev300         = true,
     .isp_fps            = 25,
@@ -146,6 +148,7 @@ static const AkSoCConfig ak3919ev300_soc = {
     .flash_cs_gpio      = -1,
     .i2c_layout         = 1,
     .venc_allegro       = true,
+    .sar_ev300          = true,
 };
 
 /*
@@ -553,6 +556,7 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
     qdev_prop_set_uint32(sysctrl, "num-timers", c->num_timers);
     qdev_prop_set_bit(sysctrl, "has-efuse", c->has_efuse);
     qdev_prop_set_bit(sysctrl, "clk-v2", c->aspen);
+    qdev_prop_set_bit(sysctrl, "sar-ev300", c->sar_ev300);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(sysctrl), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sysctrl), 0, AK_SYSCTRL_BASE);
     if (c->av130) {

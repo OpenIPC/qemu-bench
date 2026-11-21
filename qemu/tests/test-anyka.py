@@ -9,7 +9,9 @@ script plays the vendor drivers (docs/anyka.md):
     address, the header behind it and in L2 memory at 0x48000200);
   - ak-sysctrl: chip ID, a one-shot timer expiring into the timer's
     sub-interrupt and the cascaded module interrupt, the RTC link, the
-    SAR-ADC1 samples from the ain0 / ain1 / bat properties;
+    SAR-ADC1 samples from the ain0 / ain1 / bat properties (millivolts):
+    EV330's three packed 10-bit fields, EV300's 12-bit conversion on
+    demand of a powered, enabled AIN0;
   - ak-uart: a byte put in L2 memory and started from CONF2 reaches the
     serial backend, TX-done reads as idle;
   - ak-spi + ak-spinor: JEDEC ID by PIO, a fast read whose dummy byte is a
@@ -196,10 +198,13 @@ def test_sysctrl(qt):
     check('RTC register round trip', qt.readl(SYSCTRL + 0x54) & 0x3FFF,
           0x1234)
     check('RTC ready', (qt.readl(SYSCTRL + 0x30) >> 7) & 1, 1)
-    # SAR-ADC1 samples: AIN0 9:0, AIN1 19:10, BAT 29:20; a lit room on both
-    # inputs by default.
-    check('SAR samples, default', qt.readl(SYSCTRL + 0x68),
-          930 | 930 << 10)
+    # SAR-ADC1 on an EV300: nothing in the sample register until a
+    # conversion -- what the EV330 reader got here (0 mV, builder#234) --
+    # then a lit room, saturating the 3.0 V reference.
+    check('EV300 SAR: no sample without a conversion',
+          qt.readl(SYSCTRL + 0x68), 0)
+    check('EV300 SAR: AIN0 in a lit room', ev300_sar_ain0(qt),
+          (True, 0xFFF))
 
 
 WDT_CFG1 = SYSCTRL + 0xE4
@@ -290,14 +295,52 @@ def test_watchdog_migration(qemu, tmp):
         dst.close()
 
 
-def test_sar_inputs(qemu, path):
+def ev300_sar_ain0(qt, power=True, enable=True):
+    """mach-anycloud ak_adc1.c's EV300 sequence (adc1_ev300_init(), then
+    adc1_ev300_read() of AIN0): returns (ready, 12-bit sample)."""
+    def update(off, mask, val):
+        v = qt.readl(SYSCTRL + off)
+        qt.writel(SYSCTRL + off, (v & ~mask) | (val & mask))
+    update(0x0C, 1 << 3, 0)                     # clock off, divider, on
+    update(0x0C, 7, 7)
+    update(0x0C, 1 << 3, 1 << 3)
+    update(0x20, 1 << 30, 1 << 30)              # out of reset
+    update(0x60, 0xFFFFFF, 1500 | 18 << 16)
+    update(0x5C, 0x3FFFFF, 1 << 8 | 1 << 14)    # idle
+    update(0xA0, 1 | 1 << 3 | 1 << 5, 1)        # powered down, 3.0 V ref
+    update(0x6C, 1, 0)
+    update(0xA0, 1 | 1 << 5, (0 if power else 1) | (1 << 5 if enable else 0))
+    update(0x5C, 7 << 5, 1 << 5)                # AIN0
+    update(0x6C, 1, 0)
+    update(0x5C, 1, 1)                          # start
+    ready = bool(qt.readl(SYSCTRL + 0x6C) & 1)
+    sample = qt.readl(SYSCTRL + 0x68) & 0xFFF
+    update(0x5C, 1 | 7 << 5, 0)
+    update(0xA0, 1 | 1 << 5, 1)
+    update(0x6C, 1, 0)
+    return ready, sample
+
+
+def test_sar_inputs(qemu, path, path330):
     print('ak-sysctrl SAR inputs')
-    qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path,
-               ['-global', 'ak-sysctrl.ain0=12',
-                '-global', 'ak-sysctrl.bat=0x3ff'])
+    # The properties are millivolts at the pin; a covered photocell is
+    # about 39 mV on the PE3020-W (builder#234).
+    extra = ['-global', 'ak-sysctrl.ain0=39',
+             '-global', 'ak-sysctrl.bat=3300']
+    qt = QTest(qemu, 'ak3919ev330,flash-file=%s' % path330, extra)
     try:
-        check('AIN0 covered, AIN1 lit, BAT full', qt.readl(SYSCTRL + 0x68),
-              12 | 930 << 10 | 0x3ff << 20)
+        check('EV330: AIN0 covered, AIN1 lit, BAT full, 10 bits of 3.3 V',
+              qt.readl(SYSCTRL + 0x68), 12 | 930 << 10 | 0x3ff << 20)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path, extra)
+    try:
+        check('EV300: AIN0 covered, 12 bits of 3.0 V', ev300_sar_ain0(qt),
+              (True, 39 * 4096 // 3000))
+        check('EV300: an input left disabled reads 0',
+              ev300_sar_ain0(qt, enable=False), (True, 0))
+        check('EV300: powered down, it reads 0',
+              ev300_sar_ain0(qt, power=False), (True, 0))
     finally:
         qt.close()
 
@@ -955,7 +998,7 @@ def main():
     path300l = os.path.join(tmp, 'flash300l.bin')
     make_image(path300l, b'AK_H322L')
     test_ev300l(args.qemu, path300l)
-    test_sar_inputs(args.qemu, path)
+    test_sar_inputs(args.qemu, path, path330)
     test_watchdog(args.qemu, path)
     test_watchdog_migration(args.qemu, tmp)
     test_av100(args.qemu, tmp)
