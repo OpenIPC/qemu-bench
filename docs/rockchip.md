@@ -950,12 +950,32 @@ RV1103 / RV1106:
   ISP's current pipe and posts each frame end to rockit. It posts no
   quarter-frame events (1–3), and it ignores AVS and the log buffer.
 - **RKVENC-PP** (`rk-vepu-pp`, `0xFFA60000`, SPI 108), the encoder's
-  pre-processor for the smart features: jobs complete but nothing is
-  computed. The kernel (kmpp `mpp_rkvenc_pp.c`) writes the job, then
-  `ENC_STRT` (0x10) = 1, and waits for `INT_STA` (0x2c) bit 0. The model
-  sets it after `job-ns` (500 µs). The motion and occlusion results stay
-  as they were. As storage, every job timed out: about 360
+  pre-processor for the smart features. The kernel (kmpp
+  `mpp_rkvenc_pp.c`) writes the job, then `ENC_STRT` (0x10) = 1, and waits
+  for `INT_STA` (0x2c) bit 0, which the model sets after `job-ns`
+  (500 µs). As storage, every job had timed out: about 360
   "rk_vcodec: ... processing time out" per XM R5 boot.
+  - Motion detection is computed. The picture (`ENC_PIC_RSL` 0x38, luma at
+    0x10c, stride 0x118) is downscaled 4 × 4, as the hardware does. Each
+    8 × 8 block there (32 × 32 of the picture) is compared with the last
+    picture. Its flag is set when the SAD exceeds `MD_CON_BASE` (0x404)
+    bits 15:4.
+  - The flags go to 0x400, one bit a block, `MD_STO_STRD` (0x40c, 64)
+    bytes a block row: block x of row y is bit x % 8 of byte
+    y × stride + x / 8. That is how the RV1103B kernel's
+    `vepu_pp_get_blk8_move_flag()` reads them.
+  - Rockit's IVS maps the buffer unchanged (a dma-buf from
+    `VENC_IOCTL_NODE_PP_GET_RESULT`). It reads it the same way (28 bits a
+    row at 896 pixels), cleans it up morphologically and returns the
+    connected regions as objects.
+  - On the XM R5 (896×512, threshold 40) the scene's moving box flags
+    9–21 of the 28 × 16 blocks a frame. The App's motion task gets one
+    object from `RK_MPI_IVS_GetResults` each time and counts the 29-pixel
+    grid cells it covers: 25–40, against 12 for sensitivity level 3
+    (the table is 32, 20, 12, 5, 3, 1). So it reports motion. Its
+    "u8Enable:0" in the log is a second flag; `bEnabled` turns the task
+    on.
+  - Smear, weighted prediction and occlusion results stay as they were.
 - **Encoder OSD:** blended into the source before coding. The layout is
   kmpp's `vepu540c_osd_reg` (public in ticklab/rockchip-kmpp):
   - eight regions of nine words from 0x3000: cfg0 (on, format, alpha

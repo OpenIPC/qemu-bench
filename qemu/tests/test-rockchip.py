@@ -621,6 +621,25 @@ def test_vepu_pp(qt):
     check(qt.readl(P + 0x2c) == 1, 'RKVENC-PP: the job done (INT_STA bit 0)')
     qt.writel(P + 0x28, 0x3f)
     check(qt.readl(P + 0x2c) == 0, 'RKVENC-PP: INT_CLR clears it')
+    # motion: a 128x64 picture, two jobs; a 32x32 square moves into
+    # block (2, 1) -- its bit (byte 64 + 0, bit 2) is the only one set
+    src, md, w, h = 0x01000000, 0x01100000, 128, 64
+    qt.write(src, bytes(w * h))
+    qt.writel(P + 0x038, (w // 8 - 1) | (h // 8 - 1) << 16)
+    qt.writel(P + 0x10c, src)
+    qt.writel(P + 0x118, w)
+    qt.writel(P + 0x400, md)
+    qt.writel(P + 0x404, 40 << 4 | 3)           # thres_sad 40, cur + ref
+    qt.writel(P + 0x40c, 64)
+    qt.writel(P + 0x10, 1)
+    for y in range(32, 64):
+        qt.write(src + y * w + 64, b'\xc8' * 32)
+    qt.write(md, b'\xff' * 128)
+    qt.writel(P + 0x10, 1)
+    flags = qt.read(md, 128)
+    check(flags[64] == 1 << 2 and flags.count(0) == 127,
+          'RKVENC-PP motion: only block (2, 1) flagged (%s)'
+          % flags[:2].hex() + flags[64:66].hex())
 
 
 def test_vepu540c(qt):
