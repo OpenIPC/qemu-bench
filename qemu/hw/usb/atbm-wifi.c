@@ -59,6 +59,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(AtbmState, ATBM_WIFI)
 /* 0x0acc017c's low byte: 0x49 ARES_B (xm713g.ko: XM713G), 0x4a AresLite
  * (6012B_x.ko, which only carries AresLite firmware: ATBM6012B-X) */
 #define CHIP_ARES_LITE      0x4a
+/* 0x30: OCEANUS, the ATBM6132CU (XM232's and XM535D2's atbm6132c.ko /
+ * 6132cu.ko, chip type 17): the only version that driver carries firmware
+ * for (firmware_usb_wifi_bt_comb_ocea.h); with any other its loader hits
+ * BUG() ("can't find firmware.h") */
+#define CHIP_OCEANUS        0x30
 #define CPU_HOLD            (1u << 8)
 
 #define EP_IN               1
@@ -225,6 +230,18 @@ static void atbm_send(AtbmState *s, uint16_t id, const void *body, size_t n)
 /* firmwareCap: data frames are not confirmed one by one (the driver is
  * built with CONFIG_TX_NO_CONFIRM and refuses an LMAC without it) */
 #define CAP_NO_CONFIRM      (1u << 3)
+/*
+ * The OCEANUS driver's probe refuses an LMAC without two more ("LMAC NOT
+ * ... <ERROR>", then a WARN and the unbind), read from its capability
+ * table (name, mask pairs in .data) and its startup handler:
+ *   - CAPABILITIES_BLE, 0x2000 in firmwareCap;
+ *   - CAPABILITIES_VIFADDR_LOCAL_BIT, BIT(18): bit 2 of firmwareCap2, the
+ *     upper half, which follows Config[3].
+ * (The extended word after a reserved half-word is not needed: its bit 1
+ * is EXCAPABILITIES_WIFI6.)
+ */
+#define CAP_BLE             (1u << 13)
+#define CAP2_VIFADDR_LOCAL  (1u << (18 - 16))
 
 #define MIB_DOT11_STATION_ID    0x0000
 
@@ -247,6 +264,10 @@ static void atbm_startup(void *opaque)
     pstrcpy((char *)b + 20, 128, "qemu atbm");
     stl_le_p(b + 148, 1 << 16 | 8);     /* Config[0]: interfaces, stations */
     stl_le_p(b + 160, 4);               /* Config[3]: NumOfHwXmitedAddr */
+    if (s->chip_version == CHIP_OCEANUS) {
+        stw_le_p(b + 10, CAP_NO_CONFIRM | CAP_BLE);
+        stw_le_p(b + 164, CAP2_VIFADDR_LOCAL);  /* firmwareCap2 */
+    }
     s->fw_running = true;
     atbm_send(s, WSM_STARTUP_IND, b, sizeof(b));
 }
@@ -649,8 +670,18 @@ static NetClientInfo atbm_net_info = {
  *   +0 flag, +4 usb_len (1538 at least) / usb_id, +8 len / id,
  * then the body; len counts from +0.  The id's low 6 bits are the
  * command, bits 6..9 the interface, 13..15 the driver's sequence.
+ *
+ * The OCEANUS driver's header is 32 bytes: its wsm_cmd_send() writes the
+ * length at +0, a checksum of +0..+6 at +7, and len / id at +28, so the
+ * body starts at +32 (WSM_TX's fields move by the same 20 bytes).
  */
 #define TX_HDR              12
+#define TX_HDR_OCEANUS      32
+
+static size_t atbm_tx_hdr(AtbmState *s)
+{
+    return s->chip_version == CHIP_OCEANUS ? TX_HDR_OCEANUS : TX_HDR;
+}
 
 static void atbm_confirm(AtbmState *s, uint16_t cmd, const void *body,
                          size_t n)
@@ -661,32 +692,147 @@ static void atbm_confirm(AtbmState *s, uint16_t cmd, const void *body,
     atbm_send(s, WSM_CNF | cmd, b, 4 + n);
 }
 
+/*
+ * OCEANUS's BLE controller, as far as the host's start-up needs it.  The
+ * driver passes HCI packets from its BLE character device (Sofia's
+ * ble_app, a NimBLE host) out as WSM id 0x09c0, H4 type first.  Towards
+ * the host, atbm_rx_tasklet_process_encap() sends ids 0x903 and 0x904
+ * (masked with 0xd3f) to ieee80211_ble_dev_recv(), which hands the
+ * message on whole, its id rewritten 2 or 1; the body is the H4 packet,
+ * type byte first, as on the way out (without it the host never sees its
+ * HCI_Reset complete, and resets again).  Every command completes at once with status 0,
+ * and the reads the host makes return a plausible LE-only controller.
+ * There is no radio: nothing advertises or connects.
+ */
+#define WSM_BLE_TX          0x09c0
+#define WSM_BLE_EVENT       0x0903
+#define H4_CMD              0x01
+#define H4_EVENT            0x04
+#define HCI_EV_CMD_COMPLETE 0x0e
+
+static void atbm_hci_cmd(AtbmState *s, uint16_t opcode)
+{
+    uint8_t ev[1 + 3 + 3 + 1 + 64] = { H4_EVENT, HCI_EV_CMD_COMPLETE, 0, 1 };
+    uint8_t *r = ev + 7;        /* return parameters, after the status */
+    size_t n = 0;
+
+    stw_le_p(ev + 4, opcode);
+    ev[6] = 0;                  /* status: success */
+    switch (opcode) {
+    case 0x1001:                /* Read Local Version Information */
+        r[0] = 9;               /* HCI 5.0 */
+        stw_le_p(r + 1, 0);
+        r[3] = 9;
+        stw_le_p(r + 4, 0xffff);        /* no manufacturer */
+        stw_le_p(r + 6, 0);
+        n = 8;
+        break;
+    case 0x1002:                /* Read Local Supported Commands */
+        memset(r, 0xff, 64);
+        n = 64;
+        break;
+    case 0x1003:                /* Read Local Supported Features */
+        r[4] = 0x60;            /* LE supported, BR/EDR not supported */
+        n = 8;
+        break;
+    case 0x1005:                /* Read Buffer Size */
+        stw_le_p(r, 251);
+        stw_le_p(r + 3, 8);
+        n = 7;
+        break;
+    case 0x1009:                /* Read BD_ADDR */
+        for (int i = 0; i < 6; i++) {
+            r[i] = s->conf.macaddr.a[5 - i];
+        }
+        r[0] ^= 1;              /* not the Wi-Fi address */
+        n = 6;
+        break;
+    case 0x2002:                /* LE Read Buffer Size */
+        stw_le_p(r, 251);
+        r[2] = 8;
+        n = 3;
+        break;
+    case 0x2003:                /* LE Read Local Supported Features */
+    case 0x201c:                /* LE Read Supported States */
+        n = 8;
+        break;
+    case 0x2018:                /* LE Rand */
+        for (int i = 0; i < 8; i++) {
+            r[i] = 0x5a ^ (i * 37);
+        }
+        n = 8;
+        break;
+    case 0x2007:                /* LE Read Advertising Physical Channel Tx Power */
+        n = 1;
+        break;
+    case 0x200f:                /* LE Read White List Size */
+    case 0x202a:                /* LE Read Resolving List Size */
+        r[0] = 8;
+        n = 1;
+        break;
+    case 0x2023:                /* LE Read Suggested Default Data Length */
+        stw_le_p(r, 27);
+        stw_le_p(r + 2, 328);
+        n = 4;
+        break;
+    case 0x202f:                /* LE Read Maximum Data Length */
+        stw_le_p(r, 251);
+        stw_le_p(r + 2, 2120);
+        stw_le_p(r + 4, 251);
+        stw_le_p(r + 6, 2120);
+        n = 8;
+        break;
+    }
+    ev[2] = 4 + n;              /* parameter length */
+    if (s->trace) {
+        qemu_log("atbm: HCI command 0x%04x\n", opcode);
+    }
+    atbm_send(s, WSM_BLE_EVENT, ev, 3 + ev[2]);
+}
+
 static void atbm_wsm_out(AtbmState *s, const uint8_t *d, size_t n)
 {
+    const size_t hdr = atbm_tx_hdr(s);
     uint16_t len, id, cmd;
 
-    if (n < TX_HDR) {
+    if (n < hdr) {
         return;
     }
-    len = MIN(lduw_le_p(d + 8), n);
-    id = lduw_le_p(d + 10);
+    len = MIN(lduw_le_p(d + hdr - 4), n);
+    id = lduw_le_p(d + hdr - 2);
     cmd = id & 0x3f;
     if (s->trace) {
-        GString *hex = qemu_hexdump_line(NULL, d + TX_HDR,
-                                         MIN(len > TX_HDR ? len - TX_HDR : 0,
+        GString *hex = qemu_hexdump_line(NULL, d + hdr,
+                                         MIN(len > hdr ? len - hdr : 0,
                                              32), 4, 0);
 
         qemu_log("atbm: <- 0x%04x len %u: %s\n", id, len, hex->str);
         g_string_free(hex, true);
     }
-    d += TX_HDR;
-    len = len > TX_HDR ? len - TX_HDR : 0;
+    d += hdr;
+    len = len > hdr ? len - hdr : 0;
+
+    /*
+     * OCEANUS carries BLE beside Wi-Fi: HCI packets go out as id 0x09c0
+     * (bits 6..9 all set, bit 11), H4 type first -- the host's first is
+     * 01 03 0c 00, HCI_Reset.  They take no WSM confirm: one throws the
+     * driver's buffer count and its wait for the next confirm off
+     * (WARNINGs in wsm_release_tx_buffer and wsm_handle_rx).  A command
+     * gets its HCI event instead (atbm_hci_cmd).
+     */
+    if (s->chip_version == CHIP_OCEANUS && (id & 0x0fff) == WSM_BLE_TX) {
+        if (len >= 4 && d[0] == H4_CMD) {
+            atbm_hci_cmd(s, lduw_le_p(d + 1));
+        }
+        return;
+    }
 
     switch (cmd) {
     case WSM_FIRMWARE_CHECK:
         break;
     case WSM_TX:
         if (len + TX_HDR > TX_FRAME + 2) {
+            /* the TX_ offsets count from a 12-byte header */
             const uint8_t *w = d - TX_HDR;
             const size_t fo = TX_FRAME +
                               (w[TX_FLAGS] & WSM_TX_2BYTES_SHIFT ? 2 : 0);
@@ -855,7 +1001,8 @@ static void atbm_handle_data(USBDevice *dev, USBPacket *p)
         break;
     case USB_TOKEN_OUT: {
         g_autofree uint8_t *buf = NULL;
-        uint8_t hdr[TX_HDR];
+        uint8_t hdr[TX_HDR_OCEANUS];
+        const size_t hl = atbm_tx_hdr(s);
 
         if (p->ep->nr != EP_OUT) {
             p->status = USB_RET_STALL;
@@ -866,9 +1013,9 @@ static void atbm_handle_data(USBDevice *dev, USBPacket *p)
          * its access point. NAK it, untaken, until the air is free (the
          * timer wakes the endpoint), and the backlog builds in the driver.
          */
-        if (s->tx_rate && p->iov.size >= TX_HDR &&
-            iov_to_buf(p->iov.iov, p->iov.niov, 0, hdr, TX_HDR) == TX_HDR &&
-            (lduw_le_p(hdr + 10) & 0x3f) == WSM_TX) {
+        if (s->tx_rate && p->iov.size >= hl &&
+            iov_to_buf(p->iov.iov, p->iov.niov, 0, hdr, hl) == hl &&
+            (lduw_le_p(hdr + hl - 2) & 0x3f) == WSM_TX) {
             int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
             if (now < s->air_busy) {
