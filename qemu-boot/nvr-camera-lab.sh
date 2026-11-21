@@ -89,9 +89,20 @@ dnsmasq --no-daemon --conf-file=/dev/null --interface=br0 --bind-interfaces \
     --dhcp-leasefile="$WORK/leases" > "$WORK/dnsmasq.log" 2>&1 &
 DNSMASQ=$!
 
+# Xiongmai hi3536cv100 NVR device trees strap the HiGMAC PHY at MDIO address 2
+# (mdio@100a03c0/ethernet-phy@2), where the OpenIPC default is 1; hand the
+# model that address so the recorder's eth0 comes up. nvr_phy is empty or two
+# fixed tokens, so the unquoted split below is intentional.
+nvr_phy=""
+case $NVR_MACHINE in
+    hi3536cv100*) nvr_phy="-global hisi-gmac.phy-addr=2" ;;
+esac
+
+# shellcheck disable=SC2086
 "$QEMU" -M "$NVR_MACHINE,flash-file=$WORK/nvr-flash.bin" -m 512M -nographic \
     -monitor none -serial "unix:$WORK/nvr.sock,server=on,wait=off" \
     -nic tap,ifname=tap0,script=no,downscript=no \
+    $nvr_phy \
     > "$WORK/nvr-qemu.log" 2>&1 &
 NVR=$!
 

@@ -174,8 +174,11 @@ or ONVIF auth is refused). The camera's scene — hence motion — is driven ove
 QMP (`qom-set /machine/scene light N`). `onvif-notify-probe.py` is a
 stdlib-only WS-BaseNotification consumer: it subscribes with HTTP Digest and
 dumps every `wsnt:Notify`, so a reporter's capture can be reproduced and a fix
-A/B-tested. `hi3536cv100` needs `hisi-gmac` `phy-addr` = 2 (its NVR device
-trees strap the PHY there); the machine config sets it.
+A/B-tested. An `hi3536cv100` Xiongmai NVR dump needs `hisi-gmac` `phy-addr` = 2
+(its device trees strap the PHY at `mdio@100a03c0/ethernet-phy@2`), where the
+OpenIPC default is 1; `nvr-camera-lab.sh` passes `-global hisi-gmac.phy-addr=2`
+for an `hi3536cv100` NVR, and the `phy-addr` property can set it for any other
+firmware whose DT straps the PHY elsewhere.
 
 `test-vtund-tunnel.sh` boots the image twice on a QEMU socket network and
 runs each guest's script as PID 1 from the kernel command line
