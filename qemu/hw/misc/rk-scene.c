@@ -57,6 +57,11 @@ void rk_scene_yuv(const double level[3], bool limited, uint8_t yuv[3])
     for (c = 0; c < 3; c++) {
         v[c] = rk_scene_gamma(level[c]);
     }
+    rk_scene_yuv8(v, limited, yuv);
+}
+
+void rk_scene_yuv8(const double v[3], bool limited, uint8_t yuv[3])
+{
     if (limited) {
         yuv[0] = 16 + (65.481 * v[0] + 128.553 * v[1] + 24.966 * v[2]) / 255;
         yuv[1] = 128 + (-37.797 * v[0] - 74.203 * v[1] + 112.0 * v[2]) / 255;

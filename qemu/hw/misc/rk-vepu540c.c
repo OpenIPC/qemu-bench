@@ -102,6 +102,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkVepuState, RK_VEPU540C)
 #define REGS_SIZE       0x6000
 
 #define R_ENC_START     0x010
+#define R_DVBM_CFG      0x060   /* bits 1:0: start on the ISP's frame */
+#define DVBM_ARM        3u      /* the connect alone writes 0x15 */
 #define R_INT_EN        0x020
 #define R_INT_MSK       0x024
 #define R_INT_CLR       0x028
@@ -207,6 +209,7 @@ struct RkVepuState {
     const RkVepuMap *m;
     bool vepu541;               /* the RV1126's register map, no JPEG */
     Object *iommu;
+    bool dvbm_armed;            /* DVBM_CFG enabled: the ISP's next frame */
 };
 
 typedef struct RkVepuJpegWork {
@@ -299,6 +302,135 @@ static void rk_vepu_osd(RkVepuState *s, uint8_t *y, int ys, uint8_t *uv,
                     pc[0] = (((p >> 8) & 0xff) * a + pc[0] * (255 - a)) / 255;
                     pc[1] = (((p >> 16) & 0xff) * a + pc[1] * (255 - a)) /
                             255;
+                }
+            }
+        }
+    }
+}
+
+/*
+ * VEPU540C's OSD (kmpp vepu540c_common.h vepu540c_osd_reg, written by
+ * vepu540c_set_osd): eight regions of nine words from 0x3000 for H.264 /
+ * H.265 and again from 0x3138 for JPEG --
+ *   +0x00 cfg0  bit 0 on, 11:8 format (VEPU541_FMT_: 0 BGRA8888, 1 BGR888,
+ *               2 BGR565, 3 ARGB1555), 12 alpha swap, 13 R/B swap,
+ *               21:14 background alpha, 29:22 foreground alpha
+ *   +0x04 cfg1  left x 13:0, top y 27:14 (pixels)
+ *   +0x08 cfg2  right x, bottom y, inclusive
+ *   +0x0c       the picture's address (through the IOMMU)
+ *   +0x14 cfg5  stride in bytes, 16:0
+ * then 0x120 on (0x3120 / 0x3258) the RGB->YUV matrix (9-bit signed
+ * Y/U/V rows of R, G, B weights, /256) and its offsets.  A 1555 pixel's
+ * alpha bit picks
+ * the foreground or background alpha (XM's text: 240 and 0); a BGRA8888
+ * pixel's own alpha scales the foreground one.
+ */
+#define OSD540_BASE     0x3000      /* H.264 / H.265 (osd_comb_cfg) */
+#define OSD540_JPEG     0x3138      /* JPEG (osd_jpeg_cfg) */
+#define OSD540_CSC      0x120       /* the matrix, after the 8 regions */
+
+static int rk_vepu_s9(uint32_t v)
+{
+    return (v & 0x100) ? (int)(v & 0x1ff) - 0x200 : (int)(v & 0x1ff);
+}
+
+static void rk_vepu_osd540c(RkVepuState *s, hwaddr base, uint8_t *y, int ys,
+                            uint8_t *uv, int cs, int w, int h)
+{
+    uint32_t c0 = REG(s, base + OSD540_CSC), c1 = REG(s, base + OSD540_CSC + 4);
+    uint32_t c2 = REG(s, base + OSD540_CSC + 8);
+    uint32_t co = REG(s, base + OSD540_CSC + 12);
+    int m[3][3] = {
+        { rk_vepu_s9(c0), rk_vepu_s9(c0 >> 9), rk_vepu_s9(c0 >> 18) },
+        { rk_vepu_s9(c1), rk_vepu_s9(c1 >> 9), rk_vepu_s9(c1 >> 18) },
+        { rk_vepu_s9(c2), rk_vepu_s9(c2 >> 9), rk_vepu_s9(c2 >> 18) },
+    };
+    int ofs[3] = { co & 0xff, (co >> 8) & 0xff, (co >> 16) & 0xff };
+    int n;
+
+    if (!c0) {                          /* no matrix: BT.601 full range */
+        static const int d[3][3] = {
+            { 77, 150, 29 }, { -43, -85, 128 }, { 128, -107, -21 },
+        };
+        memcpy(m, d, sizeof(m));
+        ofs[1] = ofs[2] = 128;
+    }
+    for (n = 0; n < 8; n++) {
+        hwaddr b = base + 0x24 * n;
+        uint32_t cfg0 = REG(s, b), cfg1 = REG(s, b + 4), cfg2 = REG(s, b + 8);
+        uint32_t addr = REG(s, b + 0xc), stride = REG(s, b + 0x14) & 0x1ffff;
+        int fmt = (cfg0 >> 8) & 0xf, bpp;
+        bool aswap = cfg0 & (1u << 12), rbswap = cfg0 & (1u << 13);
+        int bg = (cfg0 >> 14) & 0xff, fg = (cfg0 >> 22) & 0xff;
+        int x0 = cfg1 & 0x3fff, y0 = (cfg1 >> 14) & 0x3fff;
+        int x1 = (cfg2 & 0x3fff) + 1, y1 = ((cfg2 >> 14) & 0x3fff) + 1;
+        g_autofree uint8_t *row = NULL;
+        int r, c;
+
+        if (!(cfg0 & 1) || !addr || x1 <= x0 || y1 <= y0) {
+            continue;
+        }
+        bpp = fmt == 0 ? 4 : fmt == 1 ? 3 : (fmt == 2 || fmt == 3) ? 2 : 0;
+        if (!bpp) {
+            qemu_log_mask(LOG_UNIMP, "rk-vepu540c: OSD format %d\n", fmt);
+            continue;
+        }
+        stride = MAX(stride, (uint32_t)(x1 - x0) * bpp);
+        row = g_malloc(stride);
+        for (r = y0; r < y1 && r < h; r++) {
+            rk_vepu_dma_read(s, addr + (uint32_t)(r - y0) * stride, row,
+                             stride, MEMTXATTRS_UNSPECIFIED);
+            for (c = x0; c < x1 && c < w; c++) {
+                const uint8_t *p = row + (c - x0) * bpp;
+                int rgb[3], a, k, v;
+                uint8_t *py = &y[r * ys + c];
+
+                if (fmt == 3) {         /* ARGB1555, or RGBA5551 swapped */
+                    uint32_t q = p[0] | p[1] << 8;
+                    bool on = aswap ? q & 1 : q >> 15;
+
+                    if (aswap) {
+                        q >>= 1;
+                    }
+                    rgb[0] = ((q >> 10) & 0x1f) * 255 / 31;
+                    rgb[1] = ((q >> 5) & 0x1f) * 255 / 31;
+                    rgb[2] = (q & 0x1f) * 255 / 31;
+                    a = on ? fg : bg;
+                } else if (fmt == 2) {  /* BGR565 */
+                    uint32_t q = p[0] | p[1] << 8;
+
+                    rgb[0] = ((q >> 11) & 0x1f) * 255 / 31;
+                    rgb[1] = ((q >> 5) & 0x3f) * 255 / 63;
+                    rgb[2] = (q & 0x1f) * 255 / 31;
+                    a = fg;
+                } else {                /* B, G, R (, A) in memory */
+                    const uint8_t *q = (fmt == 0 && aswap) ? p + 1 : p;
+
+                    rgb[2] = q[0];
+                    rgb[1] = q[1];
+                    rgb[0] = q[2];
+                    a = fmt == 0 ? (aswap ? p[0] : p[3]) * fg / 255 : fg;
+                }
+                if (rbswap) {
+                    int t = rgb[0];
+
+                    rgb[0] = rgb[2];
+                    rgb[2] = t;
+                }
+                if (!a) {
+                    continue;
+                }
+                for (k = 0; k < 3; k++) {
+                    v = (m[k][0] * rgb[0] + m[k][1] * rgb[1] +
+                         m[k][2] * rgb[2] + 128) / 256 + ofs[k];
+                    v = MIN(MAX(v, 0), 255);
+                    if (k == 0) {
+                        *py = (v * a + *py * (255 - a)) / 255;
+                    } else if (!(r & 1) && !(c & 1)) {
+                        uint8_t *pc = &uv[(r / 2) * cs + c + k - 1];
+
+                        *pc = (v * a + *pc * (255 - a)) / 255;
+                    }
                 }
             }
         }
@@ -438,7 +570,11 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
                     (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
     rk_vepu_dma_read(s, REG(s, s->m->src1), uv,
                     (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
-    rk_vepu_osd(s, y, ys, uv, cs, w, h);
+    if (s->vepu541) {
+        rk_vepu_osd(s, y, ys, uv, cs, w, h);
+    } else {
+        rk_vepu_osd540c(s, OSD540_BASE, y, ys, uv, cs, w, h);
+    }
 
     if (p_slice) {
         ref = rk_vepu_ref(s, REG(s, s->m->rfpr), false);
@@ -603,6 +739,10 @@ static bool rk_vepu_jpeg_start(RkVepuState *s)
                     (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
     rk_vepu_dma_read(s, REG(s, R_JSRC1), uv,
                     (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
+    if (!s->vepu541) {
+        /* the snapshot's own OSD set */
+        rk_vepu_osd540c(s, OSD540_JPEG, wk->y, ys, uv, cs, w, h);
+    }
     for (i = 0; i < (w / 2) * (h / 2); i++) {
         const uint8_t *p = uv + (i / (w / 2)) * cs + (i % (w / 2)) * 2;
 
@@ -641,7 +781,11 @@ static size_t rk_vepu_h264(RkVepuState *s, uint8_t *out, size_t cap,
                     (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
     rk_vepu_dma_read(s, REG(s, s->m->src1), uv,
                     (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
-    rk_vepu_osd(s, y, ys, uv, cs, w, h);
+    if (s->vepu541) {
+        rk_vepu_osd(s, y, ys, uv, cs, w, h);
+    } else {
+        rk_vepu_osd540c(s, OSD540_BASE, y, ys, uv, cs, w, h);
+    }
     if (!idr) {
         prev = rk_vepu_ref(s, REG(s, s->m->rfpr), false);
     }
@@ -765,6 +909,16 @@ static void rk_vepu_write(void *opaque, hwaddr off, uint64_t val,
             rk_vepu_run(s);
         }
         return;
+    } else if (off == R_DVBM_CFG && !s->vepu541) {
+        /*
+         * Hardware DVBM ("online mode 2"): the driver writes the frame's
+         * registers and then DVBM_CFG with bits 1:0 set (0x4000b)
+         * instead of ENC_START; the ISP's next mainpath frame end starts
+         * the job.  Connecting the ISP alone writes 0x15.
+         */
+        REG(s, off) = val;
+        s->dvbm_armed = (val & DVBM_ARM) == DVBM_ARM;
+        return;
     } else if (off == s->m->int_clr) {
         REG(s, s->m->int_sta) &= ~val;
     } else if (off == s->m->int_sta) {
@@ -778,6 +932,17 @@ static void rk_vepu_write(void *opaque, hwaddr off, uint64_t val,
         }
     }
     rk_vepu_update(s);
+}
+
+/* the ISP's mainpath frame end, through the DVBM link */
+static void rk_vepu_dvbm_frame(void *opaque, int n, int level)
+{
+    RkVepuState *s = opaque;
+
+    if (level && s->dvbm_armed && !s->pending) {
+        s->dvbm_armed = false;
+        rk_vepu_run(s);
+    }
 }
 
 static const MemoryRegionOps rk_vepu_ops = {
@@ -803,6 +968,7 @@ static void rk_vepu_reset(DeviceState *dev)
     }
     s->jobs = 0;
     s->pending = 0;
+    s->dvbm_armed = false;
     s->gen++;
     rk_vepu_update(s);
 }
@@ -816,6 +982,7 @@ static void rk_vepu_realize(DeviceState *dev, Error **errp)
                           TYPE_RK_VEPU540C, REGS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    qdev_init_gpio_in_named(dev, rk_vepu_dvbm_frame, "dvbm-frame", 1);
     s->done = timer_new_ns(QEMU_CLOCK_VIRTUAL, rk_vepu_done, s);
 }
 

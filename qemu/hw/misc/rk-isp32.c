@@ -28,12 +28,15 @@
  * RV1106 ISP has no IOMMU), and FRAME_IN (bit 5) and FRAME (bit 1) are
  * raised,
  * with the MI's MP_FRAME (bit 0) and BP_FRAME (bit 25).  The driver's
- * stop checks read the shadows, so a path disabled stops at the next
- * frame start.  MI_WR_CTRL2's self-update bits (4 MP, 6 BP) latch that
- * path's shadows at once: a paused path the driver restarts with a new
- * buffer is enabled, self-updated and disabled again (capture_v32.c
- * update_mi), so the one frame is written; latched only at frame start
- * the path stayed off and the stream stalled for good.  Three interrupt
+ * stop checks read the shadows.  They take the configuration at the
+ * frame end -- the MP's only with MI_CTRL's auto-update (bit 13) on --
+ * or at once: MI_WR_CTRL2's self-update bits (4 MP, 6 BP), or
+ * MI_WR_INIT's soft update (0x1404 bit 4, every path).  A paused path the
+ * driver restarts with a new buffer while the ISP is idle (ISP_DEBUG2's
+ * output line 0) is enabled, self-updated and disabled again
+ * (capture_v32.c update_mi): the shadows keep the one frame's enable,
+ * so it is written.  ISP_DEBUG2 (0x64c) reads 0 until a frame has run,
+ * then the output height.  Three interrupt
  * lines: ISP, MI and MIPI (never raised), and "vicap-fs" / "vicap-fe"
  * pulsed at the frame's start and end for VICAP's to-ISP interrupts
  * (rk-vicap.c), from which the 3A library takes its frame sync.  With
@@ -129,6 +132,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define R_3A_ICR        0x05dc
 
 #define R_MI_CTRL       0x1400
+#define R_MI_WR_INIT    0x1404      /* bit 4: shadows updated at once */
+#define MI_INIT_SOFT_UPD (1u << 4)
+#define MI_MP_AUTOUPD   (1u << 13)  /* MI_CTRL: MP shadows at frame end */
+#define R_ISP_DEBUG2    0x064c      /* bits 13:0 the output line */
+#define R_V33_ENH_IIR_RW  0x3aa8    /* ISP V33: IIR row reads, RD_P bit 8 */
+#define R_V33_HIST_RW     0x3ca0    /*   answered with RDATA_VAL bit 9 */
+#define V33_IIR_RD_P      (1u << 8)
+#define V33_IIR_RDATA_VAL (1u << 9)
 #define R_MP_Y_BASE     0x1408
 #define R_MP_Y_SIZE     0x140c
 #define R_MP_CB_BASE    0x141c
@@ -142,6 +153,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define R_MI_ICR        0x1504
 #define R_MI_ISR        0x1508
 #define R_MP_LLENGTH    0x15e8
+#define R_SP_Y_BASE     0x143c      /* the self path (ISP V33) */
+#define R_SP_Y_SIZE     0x1440
+#define R_SP_LLENGTH    0x144c
+#define R_SP_CB_BASE    0x1450
+#define R_SP_CB_SIZE    0x1454
+#define R_SP_Y_SHD      0x14a0
+#define R_SP_CB_SHD     0x14a8
 #define R_BP_CTRL       0x1600
 #define R_BP_Y_BASE     0x1604
 #define R_BP_Y_SIZE     0x1608
@@ -160,10 +178,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define ISP_FRAME_IN    (1u << 5)
 #define ISP_V_START     (1u << 6)
 #define MI_MP_FRAME     (1u << 0)
+#define MI_SP_FRAME     (1u << 1)
 #define MI_BP_FRAME     (1u << 25)
 #define MI_MPFBC_FRAME  (1u << 31)
 #define READBACK_NS     4000000     /* a pass over the frame in memory */
 #define MI_MP_ENABLE    (1u << 0)
+#define MI_SP_ENABLE    (1u << 1)
+#define MI_SHD_SP_IN    (1u << 1)
+#define MI_SHD_SP_OUT   (1u << 17)
+#define MI_SP_AUTOUPD   (1u << 14)
+#define SP_SELF_UPD     (1u << 5)
 #define MI_SHD_MP_IN    (1u << 0)
 #define MI_SHD_MP_OUT   (1u << 16)
 #define BP_ENABLE       (1u << 0)
@@ -191,6 +215,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define MEAS_DONE       (1u << 31)
 #define HIST_BINS       256
 #define AWB_WP          4096        /* white points per illuminant */
+#define R_CCM_CTRL      0x0700      /* bit 0: the colour matrix on */
+#define R_CCM_COEFF     0x0704      /* per row R, G, B: c0 | c1 << 16, c2 |
+                                       offset << 16; I + C / 128 */
+#define R_GOC_CTRL      0x0900      /* gamma out: bit 0 on, 1 equidistant,
+                                       2 the last segment 4x dense */
+#define R_GOC_OFFSET    0x0904
+#define R_GOC_Y0        0x0910      /* 49 12-bit samples, two a word */
+#define GOC_N           49
+#define R_AWB1_GAIN_G   0x0530      /* as AWB_GAIN0: rkaiq's result */
+#define R_AWB1_GAIN_RB  0x0534
+#define R_AWB_GAIN0_G   0x0538      /* green_b << 16 | green_r, Q8 */
+#define R_AWB_GAIN0_RB  0x053c      /* red << 16 | blue, Q8 */
+#define ISP_AWB_ENA     (1u << 7)   /* ISP_CTRL0: apply the AWB gains */
+#define AWB_DDR         0x2b00      /* struct isp32_rawawb_meas_stat */
+#define AWB_ZONES       15          /* ramdata: 15 x 15 zones */
 #define LEVEL_MAX       RK_SCENE_LEVEL_MAX
 #define BLK             8           /* the scene is flat at this scale */
 #define AE_LITE_N       5           /* zones a side */
@@ -201,6 +240,7 @@ struct RkIsp32State {
     MemoryRegion iomem;
     qemu_irq irq_isp, irq_mi, irq_mipi;
     qemu_irq vicap_fs, vicap_fe;    /* the frame's start / end, to VICAP */
+    qemu_irq dvbm;                  /* a mainpath frame written, to VEPU */
     bool source_gated;      /* frames only while the source sends them */
     bool source_on;
     QEMUTimer *timer;
@@ -211,6 +251,7 @@ struct RkIsp32State {
     uint32_t port_idx[4];   /* AE big, hist big, hist lite, AWB RAM reads */
     bool in_frame;          /* between V_START and the frame end */
     bool readback;          /* ISP20: frames run by read-back triggers */
+    bool v33;               /* ISP V33 (RV1103B): its IIR read handshake */
     uint32_t passes;        /* read-back passes left in this frame */
     Object *sensor;
 
@@ -222,6 +263,14 @@ struct RkIsp32State {
     uint32_t ae_lite[AE_LITE_N * AE_LITE_N];
     uint32_t stats_base;    /* MI_3A_WR_BASE latched at frame start */
     uint32_t hist[HIST_BINS];
+
+    /* the sensor's raw response to white, per mille of green's */
+    uint32_t raw_r, raw_b;
+    /* white points of the frame now ending: neutral, unclipped blocks */
+    uint32_t awb_n;
+    uint64_t awb_rgain, awb_bgain;      /* sums of G/R and G/B, Q8 */
+    uint64_t awb_zone[AWB_ZONES * AWB_ZONES][4];    /* R, G, B, white */
+    float goc_lut[4096];    /* this frame's gamma out, level -> 0..255 */
 };
 
 #define REG(s, off) ((s)->regs[(off) / 4])
@@ -267,6 +316,60 @@ static void rk_isp32_cproc(RkIsp32State *s, uint8_t yuv[3])
 }
 
 /*
+ * Gamma out (GOC): a 12-bit level through the 49-point curve the IQ
+ * programs, to 0..255.  Log segments: 0..8 by 1, then four steps of each
+ * doubling width up to 2048, then 2048..4095 in eight steps of 256 when
+ * the last segment is dense (or four of 512); equidistant: 48 steps of
+ * 4096 / 48.  Without GOC the output is linear.
+ */
+static double rk_isp32_goc(RkIsp32State *s, double x)
+{
+    uint32_t ctrl = REG(s, R_GOC_CTRL);
+    double px[GOC_N];
+    int i, n = 0;
+
+    if (!(ctrl & 1)) {
+        return x * 255 / LEVEL_MAX;
+    }
+    if (ctrl & 2) {
+        for (n = 0; n < GOC_N; n++) {
+            px[n] = MIN(n * 4096.0 / 48, LEVEL_MAX);
+        }
+    } else {
+        int step = 1, v = 0;
+
+        while (v <= 8) {
+            px[n++] = v++;
+        }
+        for (v = 8; v < 2048; ) {
+            step = v / 4;
+            for (i = 0; i < 4; i++) {
+                v += step;
+                px[n++] = v;
+            }
+        }
+        step = ctrl & 4 ? 256 : 512;
+        while (v < 4096 && n < GOC_N) {
+            v += step;
+            px[n++] = MIN(v, 4095);
+        }
+    }
+    x = MAX(MIN(x, LEVEL_MAX), 0);
+    for (i = 1; i < n; i++) {
+        if (x <= px[i] || i == n - 1) {
+            uint32_t w0 = REG(s, R_GOC_Y0 + 4 * ((i - 1) / 2));
+            uint32_t w1 = REG(s, R_GOC_Y0 + 4 * (i / 2));
+            double y0 = ((i - 1) & 1 ? w0 >> 16 : w0) & 0xfff;
+            double y1 = (i & 1 ? w1 >> 16 : w1) & 0xfff;
+            double t = (x - px[i - 1]) / MAX(px[i] - px[i - 1], 1);
+
+            return MIN(MAX(y0 + (y1 - y0) * MIN(t, 1), 0), 4095) * 255 / 4095;
+        }
+    }
+    return 0;
+}
+
+/*
  * The frame now ending: each 8x8 block's raw levels at the sensor's
  * exposure, its NV12, and the statistics of those levels.
  */
@@ -276,7 +379,9 @@ static void rk_isp32_render(RkIsp32State *s)
     uint32_t bw = DIV_ROUND_UP(MAX(w, 1), BLK), bh = DIV_ROUND_UP(MAX(h, 1), BLK);
     uint64_t lite[AE_LITE_N * AE_LITE_N][4] = { { 0 } };
     uint64_t big[AE_BIG_N * AE_BIG_N][4] = { { 0 } };
-    double k;
+    double k, gain[3] = { 1, 1, 1 }, ccm[3][4];
+    bool ccm_on;
+    double resp[3] = { s->raw_r / 1000.0, 1, s->raw_b / 1000.0 };
     uint32_t bx, by, i;
     int c;
 
@@ -290,6 +395,38 @@ static void rk_isp32_render(RkIsp32State *s)
         s->bh = bh;
     }
     memset(s->hist, 0, sizeof(s->hist));
+    memset(s->awb_zone, 0, sizeof(s->awb_zone));
+    for (i = 0; i < 4096; i++) {
+        s->goc_lut[i] = rk_isp32_goc(s, i);
+    }
+    /* colour correction: each row's deltas from identity, Q7, + offset */
+    ccm_on = REG(s, R_CCM_CTRL) & 1;
+    for (c = 0; c < 3; c++) {
+        uint32_t w0 = REG(s, R_CCM_COEFF + 8 * c);
+        uint32_t w1 = REG(s, R_CCM_COEFF + 8 * c + 4);
+
+        ccm[c][0] = (int16_t)w0 / 128.0;
+        ccm[c][1] = (int16_t)(w0 >> 16) / 128.0;
+        ccm[c][2] = (int16_t)w1 / 128.0;
+        ccm[c][3] = (int16_t)(w1 >> 16);
+    }
+    s->awb_n = 0;
+    s->awb_rgain = s->awb_bgain = 0;
+    if (REG(s, R_ISP_CTRL0) & ISP_AWB_ENA) {
+        /* gain0 and the AWB1 gains rkaiq writes its result to, in series */
+        static const hwaddr at[2][2] = {
+            { R_AWB_GAIN0_G, R_AWB_GAIN0_RB },
+            { R_AWB1_GAIN_G, R_AWB1_GAIN_RB },
+        };
+
+        for (i = 0; i < 2; i++) {
+            uint32_t g = REG(s, at[i][0]), rb = REG(s, at[i][1]);
+
+            gain[0] *= (rb >> 16) / 256.0;
+            gain[1] *= ((g & 0xffff) + (g >> 16)) / 512.0;
+            gain[2] *= (rb & 0xffff) / 256.0;
+        }
+    }
     for (by = 0; by < bh; by++) {
         for (bx = 0; bx < bw; bx++) {
             uint32_t b = by * bw + bx;
@@ -297,17 +434,47 @@ static void rk_isp32_render(RkIsp32State *s)
             uint32_t zl = (by * AE_LITE_N / bh) * AE_LITE_N + bx * AE_LITE_N / bw;
             uint32_t zb = (by * AE_BIG_N / bh) * AE_BIG_N + bx * AE_BIG_N / bw;
 
+            uint32_t za = (by * AWB_ZONES / bh) * AWB_ZONES +
+                          bx * AWB_ZONES / bw;
+            double out[3];
+
             rk_scene_rgb(s->frame, (bx + 0.5) / bw, (by + 0.5) / bh, rgb);
             for (c = 0; c < 3; c++) {
-                lvl[c] = MIN(rgb[c] * k, LEVEL_MAX);
+                lvl[c] = MIN(rgb[c] * k * resp[c], LEVEL_MAX);
                 s->blk_lvl[b * 3 + c] = lvl[c];
                 lite[zl][c] += lvl[c];
                 big[zb][c] += lvl[c];
+                s->awb_zone[za][c] += lvl[c];
+                out[c] = MIN(lvl[c] * gain[c], LEVEL_MAX);
             }
             lite[zl][3]++;
             big[zb][3]++;
+            /* a white point: grey in the scene, neither dark nor clipped */
+            if (fabs(rgb[0] - rgb[1]) < 0.02 && fabs(rgb[2] - rgb[1]) < 0.02 &&
+                lvl[1] > LEVEL_MAX / 64 && MAX(lvl[0], MAX(lvl[1], lvl[2])) <
+                LEVEL_MAX * 0.95) {
+                s->awb_n++;
+                s->awb_rgain += lrint(256 * lvl[1] / MAX(lvl[0], 1));
+                s->awb_bgain += lrint(256 * lvl[1] / MAX(lvl[2], 1));
+                s->awb_zone[za][3]++;
+            }
             s->hist[(uint32_t)lvl[1] >> 4] += BLK * BLK;
-            rk_scene_yuv(lvl, true, &s->blk_yuv[b * 3]);
+            if (ccm_on) {
+                double in[3] = { out[0], out[1], out[2] };
+
+                for (c = 0; c < 3; c++) {
+                    double v = in[c] + ccm[c][3];
+
+                    for (i = 0; i < 3; i++) {
+                        v += ccm[c][i] * in[i];
+                    }
+                    out[c] = MIN(MAX(v, 0), LEVEL_MAX);
+                }
+            }
+            for (c = 0; c < 3; c++) {
+                out[c] = s->goc_lut[MIN((uint32_t)out[c], 4095)];
+            }
+            rk_scene_yuv8(out, true, &s->blk_yuv[b * 3]);
             if (REG(s, R_CPROC_CTRL) & 1) {
                 rk_isp32_cproc(s, &s->blk_yuv[b * 3]);
             }
@@ -348,35 +515,47 @@ static void rk_isp32_draw(RkIsp32State *s, uint32_t y_base, uint32_t y_size,
     uint32_t w = REG(s, R_ISP_OUT_H) & 0x3fff;
     uint32_t h = REG(s, R_ISP_OUT_V) & 0x3fff;
     g_autofree uint8_t *yl = NULL, *cl = NULL;
-    uint32_t x, y;
+    uint32_t tw, th, x, y, last = UINT32_MAX;
 
     if (!y_base || !w || !h || !s->blk_yuv) {
         return;
     }
-    stride = MAX(stride, w);
-    if (y_size) {
-        h = MIN(h, y_size / stride);
+    /*
+     * The path's own size, its resizer's output: the line length (in
+     * pixels) wide, the Y buffer's lines tall -- the frame scaled to it
+     * by nearest neighbour.
+     */
+    tw = stride ? stride : w;
+    th = y_size ? MIN(y_size / tw, 0x3fff) : h;
+    if (!th) {
+        return;
     }
-    yl = g_malloc0(stride);
-    cl = g_malloc0(stride);
-    for (y = 0; y < h; y++) {
-        const uint8_t *row = s->blk_yuv + (y / BLK) * s->bw * 3;
+    yl = g_malloc0(tw);
+    cl = g_malloc0(tw);
+    for (y = 0; y < th; y++) {
+        uint32_t sy = (uint64_t)y * h / th;
+        const uint8_t *row = s->blk_yuv + MIN(sy / BLK, s->bh - 1) * s->bw * 3;
 
-        if (y % BLK == 0) {
-            for (x = 0; x < w; x++) {
-                yl[x] = row[(x / BLK) * 3];
-            }
-            for (x = 0; x + 1 < w; x += 2) {
-                cl[x] = row[(x / BLK) * 3 + 1];
-                cl[x + 1] = row[(x / BLK) * 3 + 2];
+        if (sy / BLK != last) {
+            last = sy / BLK;
+            for (x = 0; x < tw; x++) {
+                uint32_t b = MIN((uint64_t)x * w / tw / BLK, s->bw - 1) * 3;
+
+                yl[x] = row[b];
+                if (!(x & 1)) {
+                    /* the pair's Cb, Cr: the even pixel's */
+                    cl[x] = row[b + 1];
+                    if (x + 1 < tw) {
+                        cl[x + 1] = row[b + 2];
+                    }
+                }
             }
         }
-        dma_memory_write(&address_space_memory, y_base + y * stride, yl,
-                         stride, MEMTXATTRS_UNSPECIFIED);
-        if (c_base && !(y & 1) && (!c_size || (y / 2 + 1) * stride <= c_size)) {
-            dma_memory_write(&address_space_memory,
-                             c_base + (y / 2) * stride, cl, stride,
-                             MEMTXATTRS_UNSPECIFIED);
+        dma_memory_write(&address_space_memory, y_base + y * tw, yl, tw,
+                         MEMTXATTRS_UNSPECIFIED);
+        if (c_base && !(y & 1) && (!c_size || (y / 2 + 1) * tw <= c_size)) {
+            dma_memory_write(&address_space_memory, c_base + (y / 2) * tw,
+                             cl, tw, MEMTXATTRS_UNSPECIFIED);
         }
     }
 }
@@ -439,6 +618,47 @@ static void rk_isp32_stats(RkIsp32State *s)
     memset(s->port_idx, 0, sizeof(s->port_idx));
 }
 
+/*
+ * The white-balance statistics, struct isp32_rawawb_meas_stat at 0x2b00:
+ * per zone the mean R, G, B (18 bits each) and its white points (10),
+ * then for each of the four illuminants the sums of G/R and G/B (Q8) over
+ * the white points and their count, for the normal and the big window.
+ * Every illuminant sees the same white points.
+ */
+static void rk_isp32_awb_ddr(RkIsp32State *s)
+{
+    uint64_t ram[AWB_ZONES * AWB_ZONES];
+    uint32_t sum[4][8];
+    int i, c;
+
+    for (i = 0; i < AWB_ZONES * AWB_ZONES; i++) {
+        uint64_t n, m[3];
+
+        n = MAX(DIV_ROUND_UP(s->bw * s->bh, AWB_ZONES * AWB_ZONES), 1);
+        for (c = 0; c < 3; c++) {
+            m[c] = MIN(s->awb_zone[i][c] / n, 0x3ffff);
+        }
+        ram[i] = cpu_to_le64(m[2] | m[1] << 18 | m[0] << 36 |
+                             MIN(s->awb_zone[i][3], 0x3ff) << 54);
+    }
+    dma_memory_write(&address_space_memory, s->stats_base + AWB_DDR,
+                     ram, sizeof(ram), MEMTXATTRS_UNSPECIFIED);
+    for (i = 0; i < 4; i++) {
+        /* rkaiq takes sum / count as the gain itself: no fraction bits */
+        sum[i][0] = cpu_to_le32(MIN((s->awb_rgain + 128) >> 8, UINT32_MAX));
+        sum[i][1] = cpu_to_le32(MIN((s->awb_bgain + 128) >> 8, UINT32_MAX));
+        sum[i][2] = cpu_to_le32(s->awb_n);
+        sum[i][3] = cpu_to_le32(s->awb_n);
+        sum[i][4] = sum[i][0];
+        sum[i][5] = sum[i][1];
+        sum[i][6] = sum[i][2];
+        sum[i][7] = 0;
+    }
+    dma_memory_write(&address_space_memory,
+                     s->stats_base + AWB_DDR + sizeof(ram) + 8,
+                     sum, sizeof(sum), MEMTXATTRS_UNSPECIFIED);
+}
+
 /* The frame's means and histograms where the driver reads them: DDR. */
 static void rk_isp32_stats_ddr(RkIsp32State *s)
 {
@@ -472,14 +692,25 @@ static void rk_isp32_stats_ddr(RkIsp32State *s)
         dma_memory_write(&address_space_memory, s->stats_base + hist_at[i],
                          le, sizeof(le), MEMTXATTRS_UNSPECIFIED);
     }
+    rk_isp32_awb_ddr(s);
 }
 
 static void rk_isp32_latch_mp(RkIsp32State *s)
 {
-    REG(s, R_MI_CTRL_SHD) = (REG(s, R_MI_CTRL) & MI_MP_ENABLE) ?
-                            (MI_SHD_MP_IN | MI_SHD_MP_OUT) : 0;
+    REG(s, R_MI_CTRL_SHD) = (REG(s, R_MI_CTRL_SHD) &
+                             ~(MI_SHD_MP_IN | MI_SHD_MP_OUT)) |
+        ((REG(s, R_MI_CTRL) & MI_MP_ENABLE) ? MI_SHD_MP_IN | MI_SHD_MP_OUT : 0);
     REG(s, R_MP_Y_SHD) = REG(s, R_MP_Y_BASE);
     REG(s, R_MP_CB_SHD) = REG(s, R_MP_CB_BASE);
+}
+
+static void rk_isp32_latch_sp(RkIsp32State *s)
+{
+    REG(s, R_MI_CTRL_SHD) = (REG(s, R_MI_CTRL_SHD) &
+                             ~(MI_SHD_SP_IN | MI_SHD_SP_OUT)) |
+        ((REG(s, R_MI_CTRL) & MI_SP_ENABLE) ? MI_SHD_SP_IN | MI_SHD_SP_OUT : 0);
+    REG(s, R_SP_Y_SHD) = REG(s, R_SP_Y_BASE);
+    REG(s, R_SP_CB_SHD) = REG(s, R_SP_CB_BASE);
 }
 
 static void rk_isp32_latch_bp(RkIsp32State *s)
@@ -515,6 +746,9 @@ static void rk_isp32_readback_tick(RkIsp32State *s)
             }
             s->frame++;
             REG(s, R_MI_RIS) |= mi;
+            if (mi & MI_MP_FRAME) {
+                qemu_irq_pulse(s->dvbm);
+            }
         }
     }
     rk_isp32_update(s);
@@ -533,8 +767,6 @@ static void rk_isp32_frame_begin(RkIsp32State *s, bool online)
         }
         qemu_irq_pulse(s->vicap_fs);
     }
-    rk_isp32_latch_mp(s);
-    rk_isp32_latch_bp(s);
     s->stats_base = REG(s, R_MI_3A_BASE);
     REG(s, R_ISP_RIS) |= ISP_V_START;
     s->in_frame = true;
@@ -556,6 +788,12 @@ static void rk_isp32_frame_end(RkIsp32State *s, bool online)
                       REG(s, R_MP_LLENGTH));
         mi |= MI_MP_FRAME;
     }
+    if (REG(s, R_MI_CTRL_SHD) & MI_SHD_SP_OUT) {
+        rk_isp32_draw(s, REG(s, R_SP_Y_SHD), REG(s, R_SP_Y_SIZE),
+                      REG(s, R_SP_CB_SHD), REG(s, R_SP_CB_SIZE),
+                      REG(s, R_SP_LLENGTH));
+        mi |= MI_SP_FRAME;
+    }
     if (REG(s, R_MI_CTRL2_SHD) & BP_EN_OUT_SHD) {
         rk_isp32_draw(s, REG(s, R_BP_Y_SHD), REG(s, R_BP_Y_SIZE),
                       REG(s, R_BP_CB_SHD), REG(s, R_BP_CB_SIZE),
@@ -567,6 +805,21 @@ static void rk_isp32_frame_end(RkIsp32State *s, bool online)
     REG(s, R_ISP_RIS) |= ISP_FRAME_IN | ISP_FRAME;
     REG(s, R_MI_RIS) |= mi;
     s->in_frame = false;
+    if (mi & MI_MP_FRAME) {
+        qemu_irq_pulse(s->dvbm);
+    }
+    /*
+     * The shadows take the configuration for the next frame here, at
+     * the frame end: the MP's with MI_CTRL's auto-update on (else only
+     * a self- or soft update moves them), the bypass path's always.
+     */
+    if (REG(s, R_MI_CTRL) & MI_MP_AUTOUPD) {
+        rk_isp32_latch_mp(s);
+    }
+    if (REG(s, R_MI_CTRL) & MI_SP_AUTOUPD) {
+        rk_isp32_latch_sp(s);
+    }
+    rk_isp32_latch_bp(s);
 }
 
 static void rk_isp32_tick(void *opaque)
@@ -655,6 +908,9 @@ static uint64_t rk_isp32_read(void *opaque, hwaddr off, unsigned size)
 
         return *k < HIST_BINS ? s->hist[(*k)++] : 0;
     }
+    case R_ISP_DEBUG2:
+        /* lines out: 0 until the ISP has run a frame, then the height */
+        return s->frame || s->in_frame ? REG(s, R_ISP_OUT_V) & 0x3fff : 0;
     case R_AWB_RAM:                             /* per-block RGB: none */
         s->port_idx[3]++;
         return 0;
@@ -678,6 +934,8 @@ static void rk_isp32_write(void *opaque, hwaddr off, uint64_t val,
     case R_MI_CTRL_SHD:
     case R_MP_Y_SHD:
     case R_MP_CB_SHD:
+    case R_SP_Y_SHD:
+    case R_SP_CB_SHD:
     case R_BP_Y_SHD:
     case R_BP_CB_SHD:
     case R_MI_CTRL2_SHD:
@@ -704,11 +962,29 @@ static void rk_isp32_write(void *opaque, hwaddr off, uint64_t val,
                 ((s->regs[off / 4] & MEAS_DONE) & ~(uint32_t)val);
             return;
         }
+        if (s->v33 && (off == R_V33_ENH_IIR_RW || off == R_V33_HIST_RW)) {
+            /* the row's IIR data is ready at once (it reads as stored) */
+            s->regs[off / 4] = (val & ~V33_IIR_RDATA_VAL) |
+                               (val & V33_IIR_RD_P ? V33_IIR_RDATA_VAL : 0);
+            return;
+        }
+        if (off == R_MI_WR_INIT) {
+            /* SOFT_UPD (bit 4): every path's shadows take the config now */
+            if (val & MI_INIT_SOFT_UPD) {
+                rk_isp32_latch_mp(s);
+                rk_isp32_latch_sp(s);
+                rk_isp32_latch_bp(s);
+            }
+            return;
+        }
         if (off == R_MI_CTRL2) {
             /* the self-update bits act at once and do not stay set */
-            s->regs[off / 4] = val & ~(MP_SELF_UPD | BP_SELF_UPD);
+            s->regs[off / 4] = val & ~(MP_SELF_UPD | SP_SELF_UPD | BP_SELF_UPD);
             if (val & MP_SELF_UPD) {
                 rk_isp32_latch_mp(s);
+            }
+            if (val & SP_SELF_UPD) {
+                rk_isp32_latch_sp(s);
             }
             if (val & BP_SELF_UPD) {
                 rk_isp32_latch_bp(s);
@@ -726,6 +1002,7 @@ static void rk_isp32_write(void *opaque, hwaddr off, uint64_t val,
             return;
         }
         if (off == R_CSI2RX_CTRL0 && (val & 1) && !s->passes &&
+            (REG(s, R_ISP_CTRL0) & ISP_ENABLE) &&
             !(s->source_gated && s->source_on)) {
             /*
              * Multi-sensor ISP32: VICAP wrote the raw frame to memory and
@@ -736,6 +1013,16 @@ static void rk_isp32_write(void *opaque, hwaddr off, uint64_t val,
             timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       READBACK_NS / 2);
             return;
+        }
+        if (off == R_ISP_CTRL0 && !(val & ISP_ENABLE) && s->passes) {
+            /*
+             * The ISP stopped: a read-back pass in flight ends with it,
+             * no frame end follows (the driver has already given the
+             * frame's buffers back to VICAP's stream, which may be gone).
+             */
+            s->passes = 0;
+            s->in_frame = false;
+            timer_del(s->timer);
         }
         if (off == R_ISP_CTRL0 && (val & ISP_ENABLE) && !was_on) {
             s->in_frame = false;
@@ -780,14 +1067,18 @@ static void rk_isp32_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(sbd, &s->irq_mipi);
     qdev_init_gpio_out_named(dev, &s->vicap_fs, "vicap-fs", 1);
     qdev_init_gpio_out_named(dev, &s->vicap_fe, "vicap-fe", 1);
+    qdev_init_gpio_out_named(dev, &s->dvbm, "dvbm", 1);
     qdev_init_gpio_in_named(dev, rk_isp32_source_on, "source-on", 1);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rk_isp32_tick, s);
 }
 
 static const Property rk_isp32_properties[] = {
     DEFINE_PROP_UINT32("fps", RkIsp32State, fps, 30),
+    DEFINE_PROP_UINT32("raw-r", RkIsp32State, raw_r, 606),
+    DEFINE_PROP_UINT32("raw-b", RkIsp32State, raw_b, 588),
     DEFINE_PROP_BOOL("source-gated", RkIsp32State, source_gated, false),
     DEFINE_PROP_BOOL("readback", RkIsp32State, readback, false),
+    DEFINE_PROP_BOOL("v33", RkIsp32State, v33, false),
     DEFINE_PROP_LINK("sensor", RkIsp32State, sensor, TYPE_DEVICE, Object *),
 };
 

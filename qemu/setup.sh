@@ -1605,10 +1605,12 @@ config ROCKCHIP_RV11XX
     select USB_OHCI_SYSBUS
     select OR_IRQ
     select USB_DWC3
+    select BITBANG_I2C
+    select AT24C
 KCONFIG
     echo "  hw/arm/Kconfig: added ROCKCHIP_RV11XX"
 else
-    for sym in I2C SD PL330 USB_EHCI_SYSBUS USB_OHCI_SYSBUS OR_IRQ USB_DWC3; do
+    for sym in I2C SD PL330 USB_EHCI_SYSBUS USB_OHCI_SYSBUS OR_IRQ USB_DWC3 BITBANG_I2C AT24C; do
         if ! sed -n '/^config ROCKCHIP_RV11XX$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config ROCKCHIP_RV11XX\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym

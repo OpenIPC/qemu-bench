@@ -67,6 +67,7 @@
 #include "hw/irq.h"
 #include "hw/or-irq.h"
 #include "hw/loader.h"
+#include "qemu/cutils.h"
 #include "hw/misc/unimp.h"
 #include "hw/qdev-properties.h"
 #include "hw/ssi/ssi.h"
@@ -81,6 +82,8 @@
 #include "target/arm/cpu.h"
 #include "target/arm/arm-powerctl.h"
 #include "qemu/main-loop.h"
+#include "hw/i2c/bitbang_i2c.h"
+#include "hw/nvram/eeprom_at24c.h"
 
 #define RK_DDR_BASE         0x00000000
 #define RK_BOOTROM_BASE     0xFFFF0000
@@ -240,6 +243,7 @@ static const uint32_t rv1103b_cru_init[] = {
     0x60040, 0x204d, 0x60044, 0x1041,       /* DPLL 24 * 77 / 2 */
     0x60060, 0x2063, 0x60064, 0x1041,       /* GPLL 24 * 99 / 2 */
     0x60280, 0x0005,                        /* MODE_CON: normal */
+    0x00a28, 0x00f0,                        /* SOFTRST(10): HPMCU held */
 };
 
 typedef struct RkSoCConfig {
@@ -290,6 +294,8 @@ typedef struct RkSoCConfig {
     int i2s_irq;
     int i2s_drq[2];             /* PL330 peripheral requests: TX, RX */
     bool i2s_clk_rv1126;        /* its MCLK from the RV1126 CRU layout */
+    bool i2s_clk_rv1106;        /* its MCLK from the RV1106 CRU layout */
+    bool isp_v33;               /* the ISP is V33 (RV1103B) */
     hwaddr isp_base;            /* ISP32: frames in online mode */
     bool isp_readback;          /* ISP20: frames read back from memory */
     hwaddr vicap_base;          /* VICAP: the to-ISP frame interrupts */
@@ -304,8 +310,15 @@ typedef struct RkSoCConfig {
     int ispp_irq[2];            /* ISPP, FEC */
     int cif_irq;
     hwaddr npu_base;            /* RV1126 NPU (Vivante, galcore) */
+    hwaddr rknpu_base;          /* RV1106 / RV1103B RKNPU */
+    hwaddr vepu_pp_base;        /* RV1106 RKVENC-PP */
+    hwaddr saradc_v1_base;      /* RV1126 SARADC v1 (rk3399's) */
+    int saradc_v1_irq;
+    int vepu_pp_irq;
+    int rknpu_irq;
     int npu_irq;
     hwaddr vepu_base;           /* VEPU540C H.265 encoder */
+    hwaddr hpmcu_base;          /* RV1103B HPMCU mailbox (wrap encoding) */
     bool vepu541;               /* ... the RV1126's VEPU541 */
     hwaddr vepu2_base;          /* VEPU2: JPEG (RV1126) */
     int vepu2_irq;
@@ -430,9 +443,16 @@ typedef struct RkSoCConfig {
     .vicap_irq      = 106,                                              \
     .vepu_base      = 0xFFA50000,                                       \
     .vepu_irq       = 107,                                              \
-    .i2s_base       = 0xFFAE0000,   /* the fixed word-rate: no CRU */   \
+    .i2s_base       = 0xFFAE0000,                                       \
+    .i2s_clk_rv1106 = true,                                             \
     .i2s_irq        = 80,                                               \
-    .i2s_drq        = { 22, 21 }
+    .i2s_drq        = { 22, 21 },                                       \
+    .rga_base       = 0xFF980000,   /* "rockchip,rga2_core0" */          \
+    .rga_irq        = 87,                                               \
+    .rknpu_base     = 0xFF660000,   /* "rockchip,rv1106-rknpu" */        \
+    .rknpu_irq      = 109,                                              \
+    .vepu_pp_base   = 0xFFA60000,   /* "rockchip,rkvenc-pp-rv1106" */    \
+    .vepu_pp_irq    = 108
 
 static const RkSoCConfig rv1103_soc = {
     .desc = "Rockchip RV1103 (Cortex-A7, 64 MiB DDR2)",
@@ -494,8 +514,9 @@ static const RkSoCConfig rv1103b_soc = {
                         0x20930000, 0x20940000 },
     .i2c_irq        = { 63, 64, 65, 66, 67 },
     .sensor_bus     = 4,
-    .gpio_base      = { 0x20520000, 0x20840000, 0x20D80000 },
-    .gpio_irq       = { 75, 83, 79 },
+    /* the devicetree's gpio1 is 0x20D80000 and gpio2 0x20840000 */
+    .gpio_base      = { 0x20520000, 0x20D80000, 0x20840000 },
+    .gpio_irq       = { 75, 79, 83 },
     .trng_base      = 0x20690000,
     .trng_irq       = 46,
     .rkrng          = true,
@@ -511,6 +532,20 @@ static const RkSoCConfig rv1103b_soc = {
     .rkdma_base     = 0x20740000,
     .rkdma_irq      = 0,
     .sai_base       = 0x20660000,
+    /* "rockchip,rv1103b-rkisp" (ISP V33), "rv1103b-cif", "rga2" */
+    .isp_base       = 0x20D00000,
+    .isp_irq        = { 60, 59, 58 },
+    .isp_v33        = true,
+    .vicap_base     = 0x20D10000,
+    .vicap_irq      = 57,
+    .rga_base       = 0x20640000,
+    .rga_irq        = 48,
+    .rknpu_base     = 0x20F00000,           /* "rockchip,rv1103b-rknpu" */
+    .rknpu_irq      = 50,
+    /* "rockchip,rkv-encoder-rv1103b" (VEPU500): the VEPU540C's layout */
+    .vepu_base      = 0x20E80000,
+    .vepu_irq       = 62,
+    .hpmcu_base     = 0x20A10000,           /* rockit's vmcu, mailbox */
 };
 
 /*
@@ -571,6 +606,8 @@ static const RkSoCConfig rv1103b_soc = {
     .vepu2_base     = 0xFFB90000,   /* its IOMMU at +0x800 */           \
     .vepu2_irq      = 74,                                               \
     .npu_base       = 0xFFBC0000,                                       \
+    .saradc_v1_base = 0xFF5E0000,                                       \
+    .saradc_v1_irq  = 40,                                               \
     .npu_irq        = 107,                                              \
     .vop_base       = 0xFFB00000,                                       \
     .vop_irq        = 59,                                               \
@@ -665,9 +702,15 @@ struct RkMachineState {
     char *usb_otg;              /* "host" (default) or "device" */
     char *gpio_high;            /* pins that idle high, "4C0/0A2" */
     uint32_t gpio_levels[5];    /* parsed gpio_high, per bank */
+    char *tb_isp;               /* "ADDR:CAMS[:STRIDE]": the MCU's ISP heads */
+    char *gc6160;               /* "CLK:DATA": the motor driver's GPIOs */
+    int gc_clk, gc_data;        /* parsed, Linux GPIO numbers; -1 none */
+    uint64_t tb_addr;
+    uint32_t tb_cams, tb_stride;
     DeviceState *gic;
     DeviceState *pl330;
     DeviceState *cam_sensor;    /* the camera I2C bus's first sensor */
+    DeviceState *cam_sensor2;   /* and the second, at 0x32, if any */
     DeviceState *iommu[16];     /* per RkSoCConfig.iommu_base */
 
     /* the PMU's core power control (rk_cpupwr_*) */
@@ -771,6 +814,156 @@ static void rk_machine_set_gpio_high(Object *obj, const char *value,
     memcpy(s->gpio_levels, lv, sizeof(lv));
     g_free(s->gpio_high);
     s->gpio_high = g_strdup(value);
+}
+
+static char *rk_machine_get_gc6160(Object *obj, Error **errp)
+{
+    return g_strdup(RK_MACHINE(obj)->gc6160 ?: "");
+}
+
+/* "70:75": the clock and data GPIOs, as Linux numbers (bank * 32 + pin) */
+static void rk_machine_set_gc6160(Object *obj, const char *value,
+                                  Error **errp)
+{
+    RkMachineState *s = RK_MACHINE(obj);
+    g_auto(GStrv) f = g_strsplit(value, ":", 2);
+    uint64_t clk, data;
+
+    if (!f[0] || !f[1] || qemu_strtou64(f[0], NULL, 0, &clk) ||
+        qemu_strtou64(f[1], NULL, 0, &data) || clk >= 160 || data >= 160 ||
+        clk == data) {
+        error_setg(errp, "gc6160: CLK:DATA (Linux GPIO numbers), not '%s'",
+                   value);
+        return;
+    }
+    s->gc_clk = clk;
+    s->gc_data = data;
+    g_free(s->gc6160);
+    s->gc6160 = g_strdup(value);
+}
+
+/*
+ * The GC6160 pan / tilt motor and IR-cut driver of XM's PTZ boards
+ * (XmMotor.ko, g_useI2c=3, gpio_pin=CLK,DATA): an I2C device bit-banged
+ * on two GPIOs, the main chip at 0x26 and two sub chips at 0x20 / 0x22
+ * (8-bit addresses).  Each is a 256-byte register file: the driver
+ * reads back what it wrote ("ircut close fail, retry to close" without
+ * it).  The lines idle high, the board's pull-ups.
+ */
+static void rk_machine_gc6160(RkMachineState *s, DeviceState **gpio,
+                              int nbanks)
+{
+    DeviceState *br;
+    I2CBus *bus;
+    int cb = s->gc_clk / 32, cp = s->gc_clk % 32;
+    int db = s->gc_data / 32, dp = s->gc_data % 32;
+
+    if (!s->gc6160 || cb >= nbanks || db >= nbanks) {
+        return;
+    }
+    br = qdev_new(TYPE_GPIO_I2C);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(br), &error_fatal);
+    qdev_connect_gpio_out(gpio[cb], cp, qdev_get_gpio_in(br, 1));   /* SCL */
+    qdev_connect_gpio_out(gpio[db], dp, qdev_get_gpio_in(br, 0));   /* SDA */
+    qdev_connect_gpio_out(br, 0, qdev_get_gpio_in(gpio[db], dp));
+    bus = I2C_BUS(qdev_get_child_bus(br, "i2c"));
+    at24c_eeprom_init(bus, 0x26 >> 1, 256);
+    at24c_eeprom_init(bus, 0x20 >> 1, 256);
+    at24c_eeprom_init(bus, 0x22 >> 1, 256);
+}
+
+static char *rk_machine_get_tb_isp(Object *obj, Error **errp)
+{
+    return g_strdup(RK_MACHINE(obj)->tb_isp ?: "");
+}
+
+/*
+ * "0x8b0000:2[:11245]": the ISP's reserved memory (its devicetree
+ * memory-region), the cameras, and each camera's block size there --
+ * sizeof(struct rkisp32_thunderboot_resmem_head) in the kernel's
+ * layout, 11245 in XM's RV1106G2 kernel.
+ */
+static void rk_machine_set_tb_isp(Object *obj, const char *value,
+                                  Error **errp)
+{
+    RkMachineState *s = RK_MACHINE(obj);
+    g_auto(GStrv) f = g_strsplit(value, ":", 3);
+    uint64_t addr, cams, stride = 11245;
+
+    if (!f[0] || !f[1] || qemu_strtou64(f[0], NULL, 0, &addr) ||
+        qemu_strtou64(f[1], NULL, 0, &cams) || !cams || cams > 4 ||
+        (f[2] && (qemu_strtou64(f[2], NULL, 0, &stride) || stride < 100))) {
+        error_setg(errp, "tb-isp: ADDR:CAMERAS[:STRIDE], not '%s'", value);
+        return;
+    }
+    s->tb_addr = addr;
+    s->tb_cams = cams;
+    s->tb_stride = stride;
+    g_free(s->tb_isp);
+    s->tb_isp = g_strdup(value);
+}
+
+/*
+ * The MCU's thunder-boot result for the ISP driver (rkisp_chk_tb_over):
+ * per camera, at its block, struct rkisp_thunderboot_resmem_head's
+ * enable, complete = RKISP_TB_OK (1), one frame, the size, the cameras
+ * and its index.  The ISP parameters after the 100-byte head stay zero.
+ * Copied in at every reset, as the MCU writes it before Linux runs.
+ */
+#define TB_AWB_GAIN     (100 + 4645)
+#define TB_MODULES      0x7fc0020ull   /* ISP32_MODULE_RAWAE0..AWB_GAIN */
+
+static void rk_machine_tb_isp(RkMachineState *s)
+{
+    g_autofree uint8_t *b = NULL;
+    uint32_t i;
+
+    if (!s->tb_cams) {
+        return;
+    }
+    b = g_malloc0(s->tb_stride * s->tb_cams);
+    for (i = 0; i < s->tb_cams; i++) {
+        uint8_t *h = b + i * s->tb_stride;
+
+        stw_le_p(h + 0, 1);                     /* enable */
+        stw_le_p(h + 2, 1);                     /* complete: OK */
+        stw_le_p(h + 4, 1);                     /* frm_total */
+        stw_le_p(h + 10, 1920);
+        stw_le_p(h + 12, 1080);
+        stw_le_p(h + 14, s->tb_cams);           /* camera_num */
+        stw_le_p(h + 16, i);                    /* camera_index */
+        /* the MCU's last exposure, Q16: 10 ms at unity gain */
+        stl_le_p(h + 20, 655);                  /* exp_time[0], s */
+        stl_le_p(h + 32, 65536);                /* exp_gain[0] */
+        stl_le_p(h + 68, 65536);                /* exp_isp_dgain[0] */
+        if (s->tb_stride >= TB_AWB_GAIN + 32) {
+            /*
+             * The modules the MCU ran: the 3A statistics (RAWAE 0..3,
+             * RAWHIST 0..3, RAWAWB) and the AWB gains, enabled -- rkaiq
+             * takes no frame's statistics unless every block reports.
+             */
+            stq_le_p(h + 100, TB_MODULES);      /* module_en_update */
+            stq_le_p(h + 108, TB_MODULES);      /* module_ens */
+            /*
+             * The ISP parameters' white balance (isp32_awb_gain_cfg at
+             * 4645 into isp32_isp_params_cfg, after the head): rkaiq's
+             * fast AWB starts from it.  AWB1 a daylight white (R 1.52,
+             * B 1.71, Q8), the three AWB0 gains unity.
+             */
+            static const uint16_t g[16] = {
+                0x100, 0x100, 0x1b7, 0x185,
+                0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100, 0x100,
+                0x100, 0x100, 0x100, 0x100,
+            };
+            int k;
+
+            for (k = 0; k < 16; k++) {
+                stw_le_p(h + TB_AWB_GAIN + 2 * k, g[k]);
+            }
+        }
+    }
+    rom_add_blob_fixed("rockchip.tb-isp", b, s->tb_stride * s->tb_cams,
+                       s->tb_addr);
 }
 
 static char *rk_machine_get_sensor2(Object *obj, Error **errp)
@@ -1355,7 +1548,7 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c);
 
 static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
 {
-    DeviceState *dev;
+    DeviceState *dev, *gpio[5] = { NULL };
     SysBusDevice *sbd;
     I2CBus *sensor_bus = NULL, *bus[5] = { NULL };
     int i;
@@ -1393,14 +1586,21 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
         s->cam_sensor = image_sensor_create_at(sensor_bus,
                                     s->sensor ? s->sensor : "sc2336p", 0x30);
     }
-    image_sensor_create_at(sensor_bus, s->sensor2 ? s->sensor2 : "none",
-                           0x32);
+    s->cam_sensor2 = image_sensor_create_at(sensor_bus,
+                                    s->sensor2 ? s->sensor2 : "none", 0x32);
+
+    rk_machine_tb_isp(s);
 
     /* /machine/gpioN: a test drives a pin with set_irq_in */
+    if (s->gc6160) {                    /* its lines idle high */
+        s->gpio_levels[s->gc_clk / 32] |= 1u << (s->gc_clk % 32);
+        s->gpio_levels[s->gc_data / 32] |= 1u << (s->gc_data % 32);
+    }
     for (i = 0; i < 5 && c->gpio_base[i]; i++) {
         g_autofree char *name = g_strdup_printf("gpio%d", i);
 
         dev = qdev_new("rk-gpio");
+        gpio[i] = dev;
         qdev_prop_set_uint32(dev, "input-levels", s->gpio_levels[i]);
         object_property_add_child(OBJECT(s), name, OBJECT(dev));
         sbd = SYS_BUS_DEVICE(dev);
@@ -1408,6 +1608,7 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
         sysbus_mmio_map(sbd, 0, c->gpio_base[i]);
         sysbus_connect_irq(sbd, 0, rk_irq(s, c->gpio_irq[i]));
     }
+    rk_machine_gc6160(s, gpio, i);
 
     if (c->trng_base) {
         dev = qdev_new("rk-trng");
@@ -1527,7 +1728,7 @@ static DeviceState *rk_iommu_at(RkMachineState *s, const RkSoCConfig *c,
 /* Ethernet, the MMC hosts and audio */
 static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
 {
-    DeviceState *dev;
+    DeviceState *dev, *isp = NULL;
     SysBusDevice *sbd;
     int i;
 
@@ -1536,6 +1737,7 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         /* online behind VICAP: frames only while it sends them */
         qdev_prop_set_bit(dev, "source-gated", c->vicap_base != 0);
         qdev_prop_set_bit(dev, "readback", c->isp_readback);
+        qdev_prop_set_bit(dev, "v33", c->isp_v33);
         if (s->cam_sensor) {
             /* the scene is lit by its exposure */
             object_property_set_link(OBJECT(dev), "sensor",
@@ -1543,6 +1745,7 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         }
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
+        isp = dev;
         /* under the IOMMU mapped inside its window */
         sysbus_mmio_map_overlap(sbd, 0, c->isp_base, -1);
         for (i = 0; i < 3; i++) {
@@ -1551,6 +1754,15 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         if (c->vicap_base) {
             DeviceState *vicap = qdev_new("rk-vicap");
 
+            /* each MIPI host's frames are its sensor's scene */
+            if (s->cam_sensor) {
+                object_property_set_link(OBJECT(vicap), "sensor0",
+                                         OBJECT(s->cam_sensor), &error_fatal);
+            }
+            if (s->cam_sensor2) {
+                object_property_set_link(OBJECT(vicap), "sensor1",
+                                         OBJECT(s->cam_sensor2), &error_fatal);
+            }
             sysbus_realize_and_unref(SYS_BUS_DEVICE(vicap), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(vicap), 0, c->vicap_base);
             sysbus_connect_irq(SYS_BUS_DEVICE(vicap), 0,
@@ -1613,6 +1825,18 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         sysbus_create_simple("rk-pwm", c->pwm_base[i],
                              c->pwm_irq[i] ? rk_irq(s, c->pwm_irq[i]) : NULL);
     }
+    if (c->saradc_v1_base) {
+        sysbus_create_simple("rk-saradc-v1", c->saradc_v1_base,
+                             rk_irq(s, c->saradc_v1_irq));
+    }
+    if (c->vepu_pp_base) {
+        sysbus_create_simple("rk-vepu-pp", c->vepu_pp_base,
+                             rk_irq(s, c->vepu_pp_irq));
+    }
+    if (c->rknpu_base) {
+        sysbus_create_simple("rk-rknpu", c->rknpu_base,
+                             rk_irq(s, c->rknpu_irq));
+    }
     if (c->npu_base) {
         dev = qdev_new("rk-npu");
         sbd = SYS_BUS_DEVICE(dev);
@@ -1634,10 +1858,33 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         /* under an IOMMU mapped inside its window */
         sysbus_mmio_map_overlap(sbd, 0, c->vepu_base, -1);
         sysbus_connect_irq(sbd, 0, rk_irq(s, c->vepu_irq));
+        if (isp && c->hpmcu_base) {
+            /* the HPMCU starts online jobs for the ISP's current pipe */
+            DeviceState *mcu = qdev_new("rk-hpmcu");
+
+            qdev_prop_set_uint64(mcu, "vepu-base", c->vepu_base);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(mcu), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(mcu), 0, c->hpmcu_base);
+            qdev_connect_gpio_out_named(isp, "dvbm", 0,
+                qdev_get_gpio_in_named(mcu, "isp-frame", 0));
+            qdev_connect_gpio_out_named(mcu, "vepu-start", 0,
+                qdev_get_gpio_in_named(dev, "dvbm-frame", 0));
+        } else if (isp) {
+            /* DVBM: the ISP's mainpath frames start online jobs */
+            qdev_connect_gpio_out_named(isp, "dvbm", 0,
+                qdev_get_gpio_in_named(dev, "dvbm-frame", 0));
+        }
     }
     if (c->i2s_base && s->pl330) {
         /* its DMA requests stall the PL330's waits until the FIFO moves */
         dev = qdev_new("rk-i2s-tdm");
+        if (c->i2s_clk_rv1106) {
+            /* its MCLK from the RV1106 TOPCRU (CLKSEL at +0x10300) */
+            qdev_prop_set_uint64(dev, "cru-base", c->cru_base + 0x10200);
+            qdev_prop_set_bit(dev, "clk-rv1106", true);
+            qdev_prop_set_uint64(dev, "cpll-addr", c->cru_base + 0x10020);
+            qdev_prop_set_uint64(dev, "gpll-addr", c->cru_base + 0x10060);
+        }
         if (c->i2s_clk_rv1126) {
             /* its sample clock from the CRU's MCLK (the RV1126 layout) */
             qdev_prop_set_uint64(dev, "cru-base", c->cru_base + 0x10000);
@@ -1927,13 +2174,16 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->otp_base);
     }
-    dev = qdev_new("rk-syscon");
-    qdev_prop_set_uint32(dev, "size", 0x1000);
-    qdev_prop_set_bit(dev, "hiword", false);
-    rk_prop_list(dev, "const", rv1106_saradc_const,
-                 ARRAY_SIZE(rv1106_saradc_const));
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->saradc_base);
+    if (!c->saradc_v1_base) {
+        /* SARADC v2: constant readings (a v1 is its own model) */
+        dev = qdev_new("rk-syscon");
+        qdev_prop_set_uint32(dev, "size", 0x1000);
+        qdev_prop_set_bit(dev, "hiword", false);
+        rk_prop_list(dev, "const", rv1106_saradc_const,
+                     ARRAY_SIZE(rv1106_saradc_const));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->saradc_base);
+    }
 
     dev = qdev_new("rk-syscon");
     qdev_prop_set_uint32(dev, "size", 0x1000);
@@ -2041,6 +2291,18 @@ static void rk_machine_class_init(ObjectClass *oc, const void *data)
         "The OTG port's role: host (QEMU's DWC3 + xHCI; default) or device "
         "(rk-dwc3: the gadget enumerated by a built-in host, a CDC ECM "
         "function bridged to -nic ...,model=usb-gadget)");
+    object_class_property_add_str(oc, "gc6160",
+        rk_machine_get_gc6160, rk_machine_set_gc6160);
+    object_class_property_set_description(oc, "gc6160",
+        "XM's GC6160 motor / IR-cut driver, bit-banged I2C on two GPIOs: "
+        "CLK:DATA as Linux GPIO numbers (XmMotor.ko's gpio_pin; 70:75 on "
+        "the XM RV1103B)");
+    object_class_property_add_str(oc, "tb-isp",
+        rk_machine_get_tb_isp, rk_machine_set_tb_isp);
+    object_class_property_set_description(oc, "tb-isp",
+        "Stand in for the MCU's thunder-boot result to the ISP driver: "
+        "ADDR:CAMERAS[:STRIDE] (the ISP's reserved memory, e.g. "
+        "0x8b0000:2 on the XM G2)");
     object_class_property_add_str(oc, "gpio-high",
         rk_machine_get_gpio_high, rk_machine_set_gpio_high);
     object_class_property_set_description(oc, "gpio-high",

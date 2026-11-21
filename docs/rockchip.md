@@ -1,4 +1,5 @@
-# Rockchip RV1103 / RV1106 / RV1126 (`rv1103`, `rv1106`, `rv1106g3`, `rv1103b`, `rv1126`, `rv1109`)
+# Rockchip RV1103 / RV1106 / RV1126 (`rv1103`, `rv1106`, `rv1106g3`,
+`rv1103b`, `rv1126`, `rv1109`)
 
 Rockchip's single Cortex-A7 IP-camera SoCs, all in `hw/arm/rockchip.c`.
 The first three machines are one die with different in-package DDR.
@@ -271,6 +272,56 @@ What differs:
 - **SAI:** at `0x20660000`, registers only: version 0x24031103, `STATUS`
   idle and `CLR` self-clearing. The sound card registers; no samples move.
 - **OTP:** at `0x20820000`. It answers the same way as the RV1106's OTP.
+- **Camera:** ISP V33 ("rockchip,rv1103b-rkisp", `0x20D00000`, SPI 60 /
+  59 / 58), VICAP (`0x20D10000`, SPI 57) and RGA2 (`0x20640000`, SPI 48).
+  These are the RV1106's models (`rk-isp32` with `v33`, `rk-vicap`,
+  `rk-rga2`).
+  - The V33 driver reads its histogram and enhancement IIR rows through
+    a handshake: a row ID with `RD_P` (bit 8) written to `HIST_RW` (0x3ca0)
+    or `ENH_IIR_RW` (0x3aa8). The model answers `RDATA_VAL` (bit 9) at
+    once. Without it every frame logged "hist read:0 timeout".
+  - V33 adds the self path: MI_CTRL bit 1, Y base 0x143c, size 0x1440,
+    line length 0x144c, CbCr 0x1450 / 0x1454, shadows 0x14a0 / 0x14a8,
+    self-update MI_CTRL2 bit 5, auto-update MI_CTRL bit 14, MI frame
+    bit 1. Each path is drawn at its own size, the frame scaled to its
+    line length and Y size.
+  - The encoder ("rockchip,rkv-encoder-rv1103b", `rkvenc_500`,
+    `0x20E80000`, SPI 62) is the RV1106's `rk-vepu540c`. The VEPU500
+    keeps the VEPU540C's layout: interrupts at 0x20–0x2c, `ENC_START`
+    0x10 = 0x100, status from 0x4000. (Read from the annotated
+    `mpp_rkvenc_500` and `hal_h265e_vepu500` in a public RV1103B SDK
+    build.)
+  - The XM App's main stream is online ("set online mode 2", hardware
+    DVBM). The driver never writes `ENC_START` for it: it writes the
+    frame's registers, then `DVBM_CFG` (0x60) = 0x4000b. Connecting the
+    ISP alone writes 0x15, so bits 1:0 together arm the encoder. The
+    ISP's mainpath frame end ("dvbm" GPIO) starts the armed job
+    ("dvbm-frame").
+  - On the RV1103B that start goes through the HPMCU (`rk-hpmcu`). This
+    small RISC-V core runs rockit's `hpmcu_wrap.bin`, loaded with
+    `rockit.ko en_mcu=1 mcu_fw_addr=0x210f6000`. The firmware polls the
+    ISP's line counter (`ISP_DEBUG2`) and feeds the encoder the lines
+    written so far (0x18). It writes `ENC_START` itself for the pipe the
+    ISP is on (VEPU 0x308 bits 13:12), and posts events through the
+    mailbox at `0x20A10000`: B2A_CMD (+0x18) a sequence 12, 13, 14, and
+    B2A_DAT (+0x1c) `pipe << 16 | event`, where 4 is the frame end.
+    rockit's thread polls B2A_CMD every millisecond, and each new event
+    releases `vvi_mb_get`, which hands the wrap buffer on for the next
+    frame.
+  - The model takes rockit's commands (A2B_DAT then A2B_CMD: 3 wrap start
+    with the pipe, 4 end, 7/8/9 the frame the ISP starts as `pipe |
+    frame << 2`). At each mainpath frame end it starts an armed encoder
+    for the current pipe and posts event 4.
+  - `vmcu_probe` gives up ("mcu status is not reset") unless CRU
+    `SOFTRST_CON(10)` (0x20000A28) bit 4 holds the core in reset, so the
+    machine sets bits 7:4 there.
+  - Without the HPMCU model only the first online frame was ever encoded,
+    and the App logged "exist nobit ... Reason = 2(enc_stop)" every
+    second; that wasn't the XM low-power MCU's `GetMcuPower timeout`.
+    The App now streams 1920x1080 H.265 on the main channel (about 11 KB
+    P frames) with no nobit and no encoder timeouts.
+  - The board has no Ethernet: `stmmac.ko` ships but the App doesn't load
+    it, so this dump can't serve RTSP without Wi-Fi.
 
 The boot ROM contract is the RV1106's: the SPL at DRAM 0, the boot source
 at IRAM + 0x10, and the ATAGs at 2M − 8K, with SoC 0x1103.
@@ -290,6 +341,26 @@ Machine options besides the flash:
   holds them, `/`-separated: bank, port, pin (`4C0/0A2`). Any other
   input nothing drives reads 0. The G2's reset button is `4C0` (see
   Xiongmai firmware).
+- `gc6160=CLK:DATA`: XM's GC6160 pan / tilt motor and IR-cut driver
+  (`XmMotor.ko`, `g_useI2c=3`). It is an I2C device bit-banged on two
+  GPIOs, given as Linux GPIO numbers (bank × 32 + pin, the module's
+  `gpio_pin`).
+  - Its main chip is at 0x26 and the sub chips at 0x20 / 0x22 (8-bit
+    addresses). Each is a 256-byte register file (QEMU's `gpio_i2c`
+    bridge and three AT24C).
+  - The driver releases SDA by turning the pin to an input, so an input
+    pin drives the line high, the board's pull-up. Both lines idle high.
+  - Without it the driver logs "ircut close fail, retry to close": it
+    reads back what it wrote. `70:75` (GPIO2_A6, GPIO2_B3) on the XM
+    RV1103B.
+- `tb-isp=ADDR:CAMERAS[:STRIDE]`: stands in for the MCU's
+  thunder-boot result to the ISP driver (`rkisp_chk_tb_over`). It is
+  written at reset into the ISP's reserved memory (its devicetree
+  `memory-region`), one block per camera, STRIDE bytes apart (default
+  11245, XM's RV1106G2 kernel). Each block holds: enable, complete = OK,
+  one frame, 1920×1080, the camera count and index, 10 ms at unity gain
+  (Q16), and the AWB1 gains of a daylight white in the ISP parameters
+  after the 100-byte head. The G2 takes `tb-isp=0x8b0000:2`.
 - `-drive if=sd,index=0` is the SD card, `index=1` an SDIO slot and
   `index=2` an eMMC.
 
@@ -502,8 +573,17 @@ Messages that are expected, because the hardware isn't modelled:
   ID block (below). The network itself works: with `-nic user`, the R5
   sets 192.168.1.10, answers ARP, and resets connections to closed ports.
 - the G2's ISP: "wait thunderboot over timeout"
-- on the G2, mpp's "nobit" and `Yuv_getChnFrame` timeouts: the
-  thunder-boot capture of its two sensors isn't modelled
+- on the G2, sometimes, `Yuv_getChnFrame` timeouts on the second camera's
+  AI channel (VPSS group 1, channel 1, 640x384), about one every 2 s.
+  - It showed in 1 boot of 5. In the others both cameras' detectors ran
+    about 600 frames each in 180 s, with rockiva reporting 0 objects.
+  - When it happens, the channel's frames keep coming (its RGA buffer
+    recycles as often as camera 0's), but the one frame rockiva took
+    first is never released.
+  - rockit's repeated "AVS ... release mb buf_id(207)" lines are normal
+    buffer reuse; the fd printed is stale.
+  - Without `tb-isp` the kernel asks VICAP for online capture of both
+    sensors, which isn't modelled (mpp's "nobit").
 - the G2's empty `mtd` partition (all zeros in the dump) failing to mount
   as JFFS2
 
@@ -516,6 +596,35 @@ the U-Boot environment at flash 0. A dump without one makes the App
 report an unknown product and stop. A block from another camera works
 once its product ID is patched to the dump's model: the App then prints
 `ID(Encr): 0x0241(IPC_LPG-R4C-WEQ)` on the G2.
+
+The product ID (`/usr/jsons/IPC_PRODUCT_TYPES.json` lists each name's)
+comes from two HWID fields: XmService's `(hwinfo(0x0d) & 0x1f) << 8 |
+(hwinfo(0x21) & 0xff)`, where LibCrypto's `get_dvr_hwinfo` reads field
+0x0d as byte 13 >> 3. The R5 (`IPC_R5-WQ`, 0x401) needs field 0x0d = 4
+and model byte 0x01. With the block at 0x9FC00 too, its App prints
+`ID(Encr): 0x0401(IPC_R5-WQ)`. Its sensor is an SC231HAI
+(`sensor=sc231hai`), and its reset button is GPIO4_C0 like the G2's
+(`gpio-high=4C0`). On the first boot the App writes `osmem` to the
+environment and reboots; after that its video runs: the mainpath
+delivers, with no encoder time-outs. Its AI channel waits on the NPU. Its
+RTSP stream works over the GMAC with user networking on the App's
+subnet, e.g. `-nic user,net=192.168.1.0/24,host=192.168.1.2,dhcpstart=
+192.168.1.15,hostfwd=tcp::18554-192.168.1.15:554` and
+`rtsp://127.0.0.1:18554/user=admin&password=&channel=1&stream=0.sdp`.
+That gives H.265 2880×1616 at about 12 fps with A-law audio. It shows the
+model's scene, neutral, with XM's timestamp and title OSD.
+
+The RV1103B dump (`IPC_LPG-R4C-WEQ-N`) is 0x241 like the G2, so the G2's
+block works unchanged. Its `/usr` is cramfs (7-Zip extracts it; the
+image's own `fsck.cramfs` reports CRC errors). Boot it with
+`-M rv1103b,gpio-high=0A0,sensor2=sc2336p,gc6160=70:75`. The reset button
+is GPIO0_A0. The RV1103B's GPIO1 is at `0x20D80000` and GPIO2 at
+`0x20840000` (the devicetree's aliases); until the machine followed them,
+the board's bank 2 pins answered as bank 1.
+The board's SC2337P sits at 0x32 and has the SC2336P's chip ID
+(0x9b3a). Both cameras run, through VICAP and the ISP (vir0 online, vir1
+read back). The mainpath, self path (800×448) and bypass path
+(640×360) all deliver frames to the App.
 
 ### Reset button
 
@@ -566,7 +675,8 @@ user network. Pings answer, and a 1.7 MB file served over the gadget
 arrives with the same md5:
 
 ```
-qemu-system-arm -M rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device \
+qemu-system-arm -M
+rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device \
     -kernel zImage -dtb rv1106.dtb -append "$(cat cmdline)" \
     -nic user,model=usb-gadget,hostfwd=tcp::18080-:8080
 ```
@@ -667,8 +777,39 @@ bash qemu-boot/test-rv1106-boot.sh --openipc img/
   - Statistics in memory: the RV1106 driver runs as `ISP_V32`
     (`rd_stats_from_ddr`). The ISP writes `struct isp32_stat` to
     `MI_3A_WR_BASE` (0x197c, latched at frame start): AE means at 0x000,
-    0x390, 0x720 and 0xab0, and histograms at 0xc00 to 0x1800. AF and
-    AWB (0x1c00, 0x2b00) aren't written.
+    0x390, 0x720 and 0xab0, histograms at 0xc00 to 0x1800, and AWB at
+    0x2b00. AF (0x1c00) isn't written.
+  - White balance: like a real Bayer sensor, the raw response isn't
+    neutral. White reads R/G 0.606 and B/G 0.588 (`rk-isp32` properties
+    `raw-r` and `raw-b`, per mille), a white on the SC3336 IQ's
+    illuminant range. The AWB statistics (`isp32_rawawb_meas_stat` at
+    0x2b00) give per zone the mean R, G, B and the white points. Per
+    illuminant they give the sums of G/R and G/B over the white points,
+    and the white-point count. rkaiq takes sum ÷ count as the gain,
+    with no fraction bits; with Q8 sums its gains ran away to 0x7ff.
+    White points are the scene's grey blocks above 1/64 of full scale:
+    at 1/16 the first, dark frames had too few, AWB settled on its
+    default, and smart-run never ran it again. rkaiq writes its result
+    to the AWB1 gains (`wbgainApplyPosition(1)`). With them applied,
+    majestic's grey comes out at Cb 128 and Cr 126–127, where the
+    unbalanced raw gives 117 and 116.
+  - Colour matrix (CCM, 0x700, on with bit 0): per output row R, G, B
+    the registers hold the matrix minus the identity in Q7 (c0 | c1 << 16,
+    c2 | offset << 16). majestic's rows sum to 0, e.g. R (113, -93, -20),
+    and shrink as the gain rises. It's applied to the 12-bit levels after
+    white balance, before gamma.
+  - Gamma out (GOC, 0x900): the IQ's 49-point curve maps each 12-bit
+    level to the output. majestic programs CTRL 5 (on, log segments,
+    the last segment dense): x at 0–8 by 1, then four steps per
+    doubling up to 2048, then steps of 256. The curve is 2.2-gamma
+    (y(1) = 93 of 4095). Without GOC the output is linear, as in the
+    hardware. With it, majestic's grey gradient reads Y 108 / 152 at
+    top and bottom (the fixed square-root curve gave 100 / 145).
+  - rkaiq's log: with a shell (`init=/bin/sh`, then the inittab
+    sysinit lines), restart majestic with
+    `persist_camera_engine_log=0xfffffff4` and its output in a file.
+    The AWB lines (`WPNo`, `wbgain_s6`, `processing awb_gain_algo`)
+    show what it measured and applied.
   - Frame sync: with the sensor behind VICAP, the camera library takes
     its start-of-frame events from the CSI-2 subdevice. rkcif queues
     them from VICAP's to-ISP frame-start interrupt, which `rk-vicap` now
@@ -724,41 +865,149 @@ RV1103 / RV1106:
 - **Capture front end:** VICAP (rkcif, `0xFFA10000`) raises its to-ISP
   frame start / end interrupts. Its two MIPI hosts' ID0 DMA capture
   (0x100 and 0x300) runs at 30 fps with frame start / end interrupts,
-  ping-pong between the two buffers, but writes no pixels. The ISP
-  renders the sensor's scene itself, at the sensor's exposure. The
-  CSI-2 host and D-PHY are storage.
+  ping-pong between the two buffers. A frame whose turn comes while the
+  last frame's end is still unacknowledged is dropped. Both ends pending
+  at once (the guest a whole frame late, which emulation can be) give
+  `frame_phase` 3. The RV1103B kernel's
+  `rkcif_assign_check_buffer_update_toisp` then dereferences a NULL
+  buffer in its dual update and panics (3 boots in 8 before the drop,
+  none in 8 after). Each frame is written: the scene
+  at the host's sensor's exposure (host 0 the sensor at 0x30, host 1
+  the one at 0x32). It is BGGR through the same raw response as the
+  ISP's. RAW10/RAW12 are MIPI-packed when the line stride (VLW) is short
+  of two bytes a pixel; otherwise they are 16-bit. RAW8 is one byte. The
+  ISP still renders its own picture on read-back. The CSI-2 host and
+  D-PHY are storage.
 - **Multi-sensor read-back:** a CSI2RX_CTRL0 write with bit 0 set
   runs one ISP32 pass over the frame in memory, with the mainpath, BP
-  and statistics written. The G2's XM kernel asks VICAP for online
-  capture with two sensors, which it can't run, so the G2 App gets no
-  frames. `video_rkisp.rdbk_auto=1` forces read-back, and one frame
-  then gets through. rkaiq then waits on the MCU's thunder-boot result,
-  which isn't modelled.
-- **ISP processing:** the ISP's white balance and tone settings aren't
-  applied (fixed gamma, neutral light). Only the colour processing is:
-  CPROC at `0x800` (contrast, brightness, saturation, hue), when the IQ
-  turns it on. AWB and AF
-  statistics aren't produced from the scene.
+  and statistics written.
+  - Without a thunder-boot result, the G2's XM kernel asks VICAP for
+    online capture with two sensors, which it can't run.
+  - With `tb-isp=0x8b0000:2` the kernel picks read-back itself. rkaiq
+    initialises both cameras from the header (`ffexp:0.01,1,1`,
+    `ffwb:1.52,1,1,1.71`), and the first frame goes through VICAP → DDR
+    → ISP.
+  - The header's ISP parameters enable the statistics modules (RAWAE
+    0–3, RAWHIST 0–3, RAWAWB, the AWB gains: `module_ens` 0x7fc0020).
+    Zeroed, every 3A block was off on the first frame. rkaiq then never
+    ran its algorithms, so it never queued the first parameters that
+    start the frame's second pass (`first params for fast`).
+  - Each read-back pass needs the mainpath's frame end when the
+    mainpath is on. When the driver pauses the path, it soft-updates
+    the shadows (`MI_WR_INIT` bit 4, 0x1404) and builds its end mask from
+    them. The model now latches the MP and BP shadows on that write.
+    Before, stale shadows stalled the ISP after a few frames.
+  - With those and the RGA, the G2 App's video runs: both cameras about
+    30 fps through read-back, the mainpath at 41 ms a frame, the H.265
+    encoders started, and no `nobit` or `processStream` time-outs. Run
+    for six minutes, it stays up (no reboot or suspend), at about 7000
+    mainpath frames a camera. Its
+    object detector fails (`rockiva ... run error -1`): the NPU doesn't
+    compute.
+- **ISP processing:** of the tone stages only gamma out is applied (no
+  DRC, dehaze or 3D LUT). The colour matrix (CCM) is applied without its
+  high-luma fade (`alp_y`). White balance and colour processing are
+  applied too: the AWB gains (gain0 at 0x538 and
+  AWB1 at 0x530, multiplied together, when ISP_CTRL0 bit 7 is set) and
+  CPROC at `0x800` (contrast, brightness, saturation, hue). Each grey
+  block is a white point for every illuminant: the xy ranges rkaiq
+  programs aren't applied, so AWB lands a few per cent short of the
+  exact gains. AF statistics aren't produced from the scene.
 - **Encoder:** H.265 P slices use the shared encoder's simple inter
   coding (skip, or intra where the picture changed). There's no
-  link-table mode, no online (DVBM) mode, no wrap reference buffers,
-  and no OSD or ROI. RKVENC-PP (`0xFFA60000`) is storage.
-- **RGA** 2D engine: it loads, but no jobs are modelled (majestic
-  doesn't submit any).
-- **RKNN NPU** and **RVE**: storage.
+  link-table mode, no wrap reference buffers and no ROI. Online (DVBM)
+  jobs start at the ISP's mainpath frame end, with the whole frame
+  already written; the line-by-line handshake (0x18) isn't modelled.
+- **HPMCU** (`rk-hpmcu`, RV1103B mailbox `0x20A10000`): its firmware is
+  modelled by what it does, not run. It starts armed online jobs for the
+  ISP's current pipe and posts each frame end to rockit. It posts no
+  quarter-frame events (1–3), and it ignores AVS and the log buffer.
+- **RKVENC-PP** (`rk-vepu-pp`, `0xFFA60000`, SPI 108), the encoder's
+  pre-processor for the smart features: jobs complete but nothing is
+  computed. The kernel (kmpp `mpp_rkvenc_pp.c`) writes the job, then
+  `ENC_STRT` (0x10) = 1, and waits for `INT_STA` (0x2c) bit 0. The model
+  sets it after `job-ns` (500 µs). The motion and occlusion results stay
+  as they were. As storage, every job timed out: about 360
+  "rk_vcodec: ... processing time out" per XM R5 boot.
+- **Encoder OSD:** blended into the source before coding. The layout is
+  kmpp's `vepu540c_osd_reg` (public in ticklab/rockchip-kmpp):
+  - eight regions of nine words from 0x3000: cfg0 (on, format, alpha
+    swap, R/B swap, background and foreground alpha); left/top and
+    right/bottom in pixels, inclusive; the picture's address; the stride;
+  - the RGB→YUV matrix at 0x3120.
+  ARGB1555, BGRA8888, BGR888 and BGR565 are drawn; the palette formats
+  aren't. XM's App draws its timestamp and "CAM01" title this way, in
+  ARGB1555 with both swaps on. majestic leaves the block at zero.
+- **RGA:** the RV1106's RGA2 (`0xFF980000`, SPI 87, "rockchip,rga2_core0")
+  is `rk-rga2`, the RV1109's model: bitblt and colour fill, with scaling
+  and YUV/RGB conversion, no rotation or blending. The 5.10 multi-RGA
+  driver drives it as it does the RV1109's. The XM G2 App scales its
+  sub-streams and AI frames through it. Without it every job timed out,
+  and the App's video pipeline stalled (`nobit`).
+- **RKNN NPU** (`rk-rknpu`; RV1106 `0xFF660000` SPI 109, RV1103B
+  `0x20F00000` SPI 50): jobs complete but nothing is computed. The rknpu
+  driver submits a job: the first task's command stream at PC_DATA_ADDR
+  (0x10), the last task's interrupt mask at INT_MASK (0x20), the task
+  count in PC_TASK_CONTROL 15:0 (0x30), then a pulse on PC_OP_EN (0x08).
+  After `task-ns` per task (200 µs) the model sets INT_STATUS (0x28) to
+  the mask; that is what the driver's `rknpu_fuzz_status()` compares.
+  The XM Apps' AI jobs then finish instead of timing out.
+  - Each task is a stream of 64-bit commands, `target << 48 | value << 16
+    | register`, that ends with the PC's op enable (target 0x0081,
+    register 0x0008). Addresses in it are offsets from PC_DMA_BASE_ADDR
+    (0x34). The PC's 0x0010 points to the next task, and the DPU's 0x4020
+    is the output.
+  - A task writes only the registers that change, so the model keeps the
+    DPU's values across tasks.
+  - At the end of a job, every DPU output cube is filled with 0x80, the
+    INT8 minimum. The cube is width 0x4030 + 1 × height 0x4034 + 1, in
+    16-channel surfaces (0x403c + 1 channels). The surface stride is
+    0x4024 in 16-byte units; 0 means the surfaces are packed.
+  - A detector's scores then come out as low as they go: rockiva reports
+    0 objects. With the outputs left as they were, the R5 decoded 128
+    phantom objects a frame. Post-processing them took seconds per frame,
+    which starved the AI's VPSS channel (group 0, channel 2, 896×512)
+    after its first few frames. The AI now runs about 2 frames a second
+    instead of one every 7 s, and its `getChnFrame` no longer times out.
+- **RVE**: storage.
 - **USB gadget functions other than CDC ECM, RNDIS, ACM and adb:** they
-  enumerate, but no mass storage or UVC traffic is bridged. PWM is modelled (`rk-pwm`), but its output level isn't.
+  enumerate, but no mass storage or UVC traffic is bridged. PWM is
+  modelled (`rk-pwm`), but its output level isn't.
 - **Audio codec** (the analogue acodec): registers only. The I2S/TDM
-  FIFO paces with silence, and recordings capture zeros (or the
-  `rx-tone-hz` test tone).
+  sample clock on the RV1106 comes from the TOPCRU, as on the RV1126:
+  - the source is `CLKSEL_CON(17)` TX / `(19)` RX (bit 7 GPLL / CPLL,
+    bits 6:2 the divider);
+  - the fraction is CON(18) / (20);
+  - the MCLK mux is CON(19) / (21) bits 1:0;
+  - the I2S's own MCLK→BCLK and BCLK→LRCK dividers follow.
+  A rate above 2 M words a second (unprogrammed dividers) falls back to
+  the fixed `word-rate`. At the fixed 96 k words a second, the XM R5's
+  recorder ran fast and rockit logged "timestamp jump" (141 in a boot);
+  now it logs none. The FIFO carries the samples: `-global
+  rk-i2s-tdm.rx-file=mic.wav` (16-bit
+  PCM, looped; a mono file feeds every channel) is what the camera
+  records. `-global rk-i2s-tdm.tx-file=spk.wav` saves what it plays, in
+  the TX format (16-bit, TXCR's channels, the clock's frame rate). The
+  header is kept current every 100 ms and when playback stops. Without
+  either, recordings are silence (or the `rx-tone-hz` tone), and played
+  audio goes nowhere. QEMU's own audio backends aren't used: their
+  real-time pace doesn't match the guest's virtual clock.
 - **RISC-V MCU:** the SPL loads its firmware to `0xFF6FF000` and starts
   it; only its final mailbox message is stood in for.
-- **XM firmware:** the G2's thunder-boot capture: its two sensors
-  deliver no frames to the App, and its SDIO Wi-Fi co-processor
-  (`hichannel`) isn't there.
+- **XM firmware:** the G2's SDIO Wi-Fi co-processor (`hichannel`) isn't
+  there, so the App has no network. Its video runs with `tb-isp` and
+  `sensor2` (see Multi-sensor read-back).
 
 RV1109 / RV1126:
 
+- The SARADC (`0xFF5E0000`, SPI 40) is the RK3399's v1, `rk-saradc-v1`:
+  - CTRL (0x08): channel in bits 2:0, power-up (bit 3) starts a
+    conversion, bit 6 reports it done (and interrupts with bit 5).
+    A conversion is done at once.
+  - Every channel reads full scale (`channel-level`), so the volume and
+    recovery keys read released.
+  The RV1106's constant v2 block had been mapped there, and U-Boot
+  logged "Key Error: volume up failed to read saradc".
 - AWB and AF statistics from the scene (AWB is neutral). The ISPP's
   params buffers run short now and then ("no free ispp params buffer").
 - The VEPU2's H.264 (its JPEG is modelled) and the VDPU decoders.
@@ -767,4 +1016,5 @@ RV1109 / RV1126:
   missing model.
 - The NPU's computation (only its command front end and events run), so
   mediaserver's face detection drops its frames.
-- No microphone: the I2S RX path gives silence, or the `rx-tone-hz` tone.
+- The microphone is a file: the I2S RX path plays `rk-i2s-tdm.rx-file`
+  (or silence, or the `rx-tone-hz` tone), and `tx-file` saves playback.

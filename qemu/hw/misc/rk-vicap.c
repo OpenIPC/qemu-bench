@@ -32,8 +32,14 @@
  *                     start, bit 8 + p frame p end, for ID0
  *   +0x9c FRAME_NUM_VC0: counts frame starts
  * An enabled DMA capture runs at "frame-ns" (30 fps): start into buffer
- * p, end FRAME_ACTIVE of the period later, then the other buffer.  The
- * raw frame isn't written: the ISP draws its own picture on read-back.
+ * p, end FRAME_ACTIVE of the period later, then the other buffer.  At
+ * the end the frame is in the buffer: the scene (rk-scene.c) at the
+ * host's sensor's exposure ("sensor0" / "sensor1"), BGGR Bayer, through
+ * the sensor's raw response ("raw-r" / "raw-b", per mille of green's),
+ * ID0_CTRL1 (+0x04) height << 16 | width, +0x34 VLW the line stride:
+ * RAW10 / RAW12 (ID0_CTRL0 bits 3:1 = 1 / 2) are MIPI-packed when the
+ * stride is short of two bytes a pixel, else 16 bits a pixel; RAW8 one
+ * byte.  The ISP draws its own picture on read-back all the same.
  * Everything else is storage.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -45,6 +51,9 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "qemu/timer.h"
+#include "system/dma.h"
+#include "system/address-spaces.h"
+#include "hw/misc/rk-scene.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
 
@@ -61,6 +70,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkVicapState, RK_VICAP)
 #define M_ID0_CTRL0     0x00
 #define M_FRM0_ADDR     0x24
 #define M_FRM1_ADDR     0x28
+#define M_ID0_CTRL1     0x04
+#define M_VLW           0x34
 #define M_INTEN         0x74
 #define M_INTSTAT       0x78
 #define M_FRAME_NUM     0x9c
@@ -82,6 +93,9 @@ struct RkVicapState {
     bool in_frame[MIPI_HOSTS];
     uint32_t phase[MIPI_HOSTS];     /* the buffer being written: 0 or 1 */
     uint64_t frame_ns;              /* property: a frame's period */
+    Object *sensor[MIPI_HOSTS];     /* properties: each host's sensor */
+    uint32_t raw_r, raw_b;          /* the sensor's response, per mille */
+    uint32_t seq[MIPI_HOSTS];       /* frames captured: moves the scene */
 };
 
 
@@ -107,6 +121,88 @@ static bool rk_vicap_dma_on(RkVicapState *s, int h)
     return (MREG(s, h, M_ID0_CTRL0) & 1) && MREG(s, h, M_FRM0_ADDR);
 }
 
+/* One Bayer line of the scene: row @y's colours (even rows B G, odd G R) */
+static uint32_t rk_vicap_line(RkVicapState *s, int h, uint32_t w,
+                              uint32_t y, uint32_t ht, int bits,
+                              bool packed, uint8_t *out)
+{
+    double k = rk_scene_scale(s->sensor[h]);
+    double resp[3] = { s->raw_r / 1000.0, 1, s->raw_b / 1000.0 };
+    int shift = 12 - bits;
+    uint32_t x, n = 0;
+
+    for (x = 0; x < w; x += 8) {
+        double rgb[3];
+        uint32_t v[2], i;
+
+        rk_scene_rgb(s->seq[h], (x + 4.0) / w, ((y & ~7u) + 4.0) / ht, rgb);
+        /* even row: B, G; odd row: G, R */
+        v[0] = MIN(rgb[y & 1 ? 1 : 2] * k * resp[y & 1 ? 1 : 2],
+                   RK_SCENE_LEVEL_MAX);
+        v[1] = MIN(rgb[y & 1 ? 0 : 1] * k * resp[y & 1 ? 0 : 1],
+                   RK_SCENE_LEVEL_MAX);
+        for (i = 0; i < 8 && x + i < w; i++) {
+            uint32_t p = (shift >= 0 ? v[i & 1] >> shift : v[i & 1] << -shift);
+
+            if (bits == 8) {
+                out[n++] = p;
+            } else if (!packed) {
+                out[n++] = p;
+                out[n++] = p >> 8;
+            } else if (bits == 10) {
+                /* MIPI RAW10: four high bytes, then their low 2 bits */
+                uint32_t j = (x + i) % 4, base = (x + i) / 4 * 5;
+
+                out[base + j] = p >> 2;
+                out[base + 4] = (j ? out[base + 4] : 0) | (p & 3) << (2 * j);
+                n = base + 5;
+            } else {
+                /* MIPI RAW12: two high bytes, then their low nibbles */
+                uint32_t j = (x + i) % 2, base = (x + i) / 2 * 3;
+
+                out[base + j] = p >> 4;
+                out[base + 2] = (j ? out[base + 2] : 0) | (p & 15) << (4 * j);
+                n = base + 3;
+            }
+        }
+    }
+    return n;
+}
+
+/* The frame now ending into buffer @p of host @h */
+static void rk_vicap_write_frame(RkVicapState *s, int h, int p)
+{
+    uint32_t ctrl0 = MREG(s, h, M_ID0_CTRL0);
+    uint32_t size = MREG(s, h, M_ID0_CTRL1);
+    uint32_t w = size & 0x3fff, ht = (size >> 16) & 0x3fff;
+    uint32_t stride = MREG(s, h, M_VLW);
+    uint32_t addr = MREG(s, h, p ? M_FRM1_ADDR : M_FRM0_ADDR);
+    int type = (ctrl0 >> 1) & 7;
+    int bits = type == 1 ? 10 : type == 2 ? 12 : 8;
+    bool packed = bits > 8 && stride < 2 * w;
+    g_autofree uint8_t *even = NULL, *odd = NULL;
+    uint8_t *line[2];
+    uint32_t y, n[2] = { 0, 0 };
+
+    if (!addr || !w || !ht || type > 2 || !stride) {
+        return;
+    }
+    even = g_malloc0(MAX(stride, 2 * w));
+    odd = g_malloc0(MAX(stride, 2 * w));
+    line[0] = even;
+    line[1] = odd;
+    for (y = 0; y < ht; y++) {
+        /* the scene is flat in 8-row bands: two lines a band */
+        if (y % 8 < 2) {
+            n[y & 1] = rk_vicap_line(s, h, w, y, ht, bits, packed,
+                                     line[y & 1]);
+        }
+        dma_memory_write(&address_space_memory, addr + y * stride,
+                         line[y & 1], MIN(n[y & 1], stride),
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void rk_vicap_host_tick(RkVicapState *s, int h)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -115,12 +211,26 @@ static void rk_vicap_host_tick(RkVicapState *s, int h)
         s->in_frame[h] = false;
         return;
     }
+    if (!s->in_frame[h] &&
+        (MREG(s, h, M_INTSTAT) & (CSI_FE(0) | CSI_FE(1)))) {
+        /*
+         * The last frame's end isn't handled yet: the sensor's next frame
+         * is dropped, as when the DMA has nowhere to go.  (Both buffers'
+         * ends pending at once -- the guest a whole frame late, which
+         * emulation does -- trips the rkcif driver: frame_phase 3 in
+         * rkcif_assign_check_buffer_update_toisp's dual update.)
+         */
+        timer_mod(s->timer[h], now + s->frame_ns);
+        return;
+    }
     if (!s->in_frame[h]) {
         MREG(s, h, M_INTSTAT) |= CSI_FS(s->phase[h]);
         MREG(s, h, M_FRAME_NUM)++;
         s->in_frame[h] = true;
         timer_mod(s->timer[h], now + FRAME_ACTIVE(s->frame_ns));
     } else {
+        rk_vicap_write_frame(s, h, s->phase[h]);
+        s->seq[h]++;
         MREG(s, h, M_INTSTAT) |= CSI_FE(s->phase[h]);
         s->phase[h] ^= 1;
         s->in_frame[h] = false;
@@ -258,17 +368,22 @@ static void rk_vicap_init(Object *obj)
 static const Property rk_vicap_properties[] = {
     DEFINE_PROP_UINT64("frame-ns", RkVicapState, frame_ns,
                        NANOSECONDS_PER_SECOND / 30),
+    DEFINE_PROP_LINK("sensor0", RkVicapState, sensor[0], TYPE_DEVICE, Object *),
+    DEFINE_PROP_LINK("sensor1", RkVicapState, sensor[1], TYPE_DEVICE, Object *),
+    DEFINE_PROP_UINT32("raw-r", RkVicapState, raw_r, 606),
+    DEFINE_PROP_UINT32("raw-b", RkVicapState, raw_b, 588),
 };
 
 static const VMStateDescription rk_vicap_vmstate = {
     .name = TYPE_RK_VICAP,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, RkVicapState, REGS_SIZE / 4),
         VMSTATE_TIMER_PTR_ARRAY(timer, RkVicapState, MIPI_HOSTS),
         VMSTATE_BOOL_ARRAY(in_frame, RkVicapState, MIPI_HOSTS),
         VMSTATE_UINT32_ARRAY(phase, RkVicapState, MIPI_HOSTS),
+        VMSTATE_UINT32_ARRAY(seq, RkVicapState, MIPI_HOSTS),
         VMSTATE_END_OF_LIST()
     }
 };

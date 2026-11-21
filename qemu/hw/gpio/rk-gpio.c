@@ -89,10 +89,14 @@ static void rk_gpio_update(RkGpioState *s)
     s->raw &= edge;
     s->raw |= ~edge & s->regs[G_INT_EN] & ~(lv ^ pol);
 
+    /*
+     * What the pin drives: its output level, or nothing -- the board's
+     * pull-up -- as an input.  An open-drain line (a bit-banged I2C SDA)
+     * is released by turning the pin to an input.
+     */
     for (i = 0; i < 32; i++) {
-        if (s->regs[G_DDR] & (1u << i)) {
-            qemu_set_irq(s->out[i], (lv >> i) & 1);
-        }
+        qemu_set_irq(s->out[i], s->regs[G_DDR] & (1u << i)
+                                ? (lv >> i) & 1 : 1);
     }
     s->last_level = lv;
     qemu_set_irq(s->irq, !!(s->raw & ~s->regs[G_INT_MASK]));

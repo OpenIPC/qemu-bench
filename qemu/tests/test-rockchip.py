@@ -404,7 +404,8 @@ def test_isp32(qt):
     qt.writel(P + 0x141c, buf + 64 * 16)
     qt.writel(P + 0x1420, 64 * 8)
     qt.writel(P + 0x15e8, 64)       # Y line length
-    qt.writel(P + 0x1400, 1)        # MI: mainpath on
+    qt.writel(P + 0x1400, 1 | 1 << 13)  # MI: mainpath on, auto-update
+    qt.writel(P + 0x1404, 1 << 4)   # MI_WR_INIT: soft update, shadows now
     qt.writel(P + 0x5bc, 0x62)      # IMSC: V_START, FRAME_IN, FRAME
     qt.writel(P + 0x14f8, 1)        # MI IMSC: MP_FRAME
     i2c_reg_write(qt, 0x30, 0x0100, 1)  # the sensor streams
@@ -413,7 +414,7 @@ def test_isp32(qt):
     qt.cmd('clock_step 16700000')   # half a frame at 30 fps
     check(qt.readl(P + 0x5c4) == 0x40, 'ISP32 V_START at frame start')
     check(qt.readl(P + 0x1474) == 0x10001 and qt.readl(P + 0x1478) == buf,
-          'ISP32 MI shadows latched at frame start')
+          'ISP32 MI shadows from the soft update')
     qt.writel(P + 0x5c8, 0x40)
     qt.cmd('clock_step 16700000')
     check(qt.readl(P + 0x5c4) == 0x22 and qt.readl(P + 0x1500) == 1,
@@ -464,6 +465,164 @@ def test_isp32(qt):
     qt.writel(P + 0x400, 0)
 
 
+def test_vicap_dma(qt):
+    # MIPI host 0's ID0 DMA capture: a 64x16 RAW10 frame, MIPI-packed
+    # (80 bytes a line), BGGR, at ping-pong buffer 0
+    V = 0xFFA10000
+    buf = 0x01300000
+    w, h = 64, 16
+    qt.write(buf, bytes(w * 2 * h))
+    i2c_reg_write(qt, 0x30, 0x0100, 1)
+    qt.writel(V + 0x104, h << 16 | w)           # ID0_CTRL1: size
+    qt.writel(V + 0x134, w * 10 // 8)           # VLW
+    qt.writel(V + 0x124, buf)                   # FRM0
+    qt.writel(V + 0x128, buf + 0x10000)         # FRM1
+    qt.writel(V + 0x174, 0x0303)                # INTEN: FS, FE
+    qt.writel(V + 0x100, 0x13)                  # capture, RAW10
+    qt.cmd('clock_step 40000000')               # past the first frame end
+    st = qt.readl(V + 0x178)
+    check(st & 0x101 == 0x101,
+          'VICAP DMA: frame 0 start and end in INTSTAT (0x%x)' % st)
+    qt.writel(V + 0x178, st)
+    check(qt.readl(V + 0x178) == 0, 'VICAP DMA: INTSTAT write-1-to-clear')
+    d = qt.read(buf, 2 * w * 10 // 8)
+
+    def px(line, i):
+        g = line[i // 4 * 5:i // 4 * 5 + 5]
+        return g[i % 4] << 2 | (g[4] >> (2 * (i % 4)) & 3)
+    even, odd = d[:80], d[80:160]
+    b, g0, g1, r = px(even, 0), px(even, 1), px(odd, 0), px(odd, 1)
+    check(g0 > 0 and abs(g0 - g1) <= 1 and b < g0 and r < g0,
+          'VICAP DMA: the grey scene in BGGR through a sensor\'s response '
+          '(B %d G %d G %d R %d)' % (b, g0, g1, r))
+    check(abs(r / g0 - 0.606) < 0.02 and abs(b / g0 - 0.588) < 0.02,
+          'VICAP DMA: R/G %.3f B/G %.3f (0.606, 0.588)' % (r / g0, b / g0))
+    qt.writel(V + 0x100, 0)
+
+
+def test_isp32_colour(qt):
+    # white balance, colour matrix and gamma out on a 64x40 frame: block
+    # row 0 is the grey gradient, row 2 the colour bars (bar 0 red at x 8)
+    P = 0xFFA00000
+    w, h = 64, 40
+    buf = 0x01000000
+    qt.writel(P + 0x59c, w)
+    qt.writel(P + 0x5a0, h)
+    qt.writel(P + 0x1408, buf)
+    qt.writel(P + 0x140c, w * h)
+    qt.writel(P + 0x141c, buf + w * h)
+    qt.writel(P + 0x1420, w * h // 2)
+    qt.writel(P + 0x15e8, w)
+    qt.writel(P + 0x1400, 1 | 1 << 13)
+    qt.writel(P + 0x1404, 1 << 4)
+    qt.writel(0xFFA10780, 1)
+
+    def frame():
+        qt.cmd('clock_step 33400000')
+        qt.cmd('clock_step 33400000')
+        uv = qt.read(buf + w * h, w * h // 2)
+        y = qt.read(buf, w * h)
+        # (Y, Cb, Cr) at block (bx, by)
+        return lambda bx, by: (y[(by * 8 + 4) * w + bx * 8 + 4],
+                               uv[(by * 4 + 2) * w + bx * 8 + 4],
+                               uv[(by * 4 + 2) * w + bx * 8 + 5])
+
+    qt.writel(P + 0x400, 1)                     # ISP on, no AWB gains
+    px = frame()
+    raw = px(1, 0)
+    check(raw[1] < 128 and raw[2] < 128,
+          'ISP32: the raw response is green, like a Bayer sensor\'s '
+          '(grey Cb/Cr %d/%d)' % raw[1:])
+    # AWB gains that undo the response (R/G 0.606, B/G 0.588), Q8
+    qt.writel(P + 0x538, 256 << 16 | 256)
+    qt.writel(P + 0x53c, round(256 / 0.606) << 16 | round(256 / 0.588))
+    qt.writel(P + 0x530, 256 << 16 | 256)       # AWB1: unity
+    qt.writel(P + 0x534, 256 << 16 | 256)
+    qt.writel(P + 0x400, 1 | 1 << 7)            # AWB gains on
+    px = frame()
+    g = px(1, 0)
+    check(abs(g[1] - 128) <= 1 and abs(g[2] - 128) <= 1,
+          'ISP32 AWB gains: grey comes out neutral (Cb/Cr %d/%d)' % g[1:])
+    red = px(1, 2)
+    check(red[2] > 140 and red[1] < 128,
+          'ISP32: the red bar is red (Cb/Cr %d/%d)' % red[1:])
+    # a colour matrix swapping R and B: (I + C / 128), C rows Q7
+    def pack(a, b):
+        return (a & 0xffff) | (b & 0xffff) << 16
+    qt.writel(P + 0x704, pack(-128, 0))         # R row: -R + 0 G
+    qt.writel(P + 0x708, pack(128, 0))          #        + B
+    qt.writel(P + 0x70c, pack(0, 0))            # G row: identity
+    qt.writel(P + 0x710, pack(0, 0))
+    qt.writel(P + 0x714, pack(128, 0))          # B row: + R
+    qt.writel(P + 0x718, pack(-128, 0))         #        - B
+    qt.writel(P + 0x700, 1)
+    px = frame()
+    blue = px(1, 2)
+    check(blue[1] > 140 and blue[2] < 128,
+          'ISP32 CCM: R and B swapped, the red bar turns blue (Cb/Cr %d/%d)'
+          % blue[1:])
+    qt.writel(P + 0x700, 0)
+    # gamma out: a flat curve at full scale
+    for i in range(25):
+        qt.writel(P + 0x910 + 4 * i, 4095 << 16 | 4095)
+    qt.writel(P + 0x900, 5)
+    px = frame()
+    check(px(1, 0)[0] == 235, 'ISP32 GOC: a curve flat at 4095 gives '
+          'Y 235 (%d)' % px(1, 0)[0])
+    qt.writel(P + 0x900, 0)
+    qt.writel(P + 0x400, 0)
+
+
+def test_rknpu(qt):
+    # RKNPU (rknpu_job.c): a 3-task job ends after 3 x 200 us with
+    # INT_STATUS = INT_MASK and the task counter at 3; INT_CLEAR clears
+    N = 0xFF660000
+    qt.writel(N + 0x20, 0x300)                  # INT_MASK: the last task's
+    qt.writel(N + 0x24, 0x1ffff)                # INT_CLEAR
+    qt.writel(N + 0x30, (0x6 << 16) | 3)        # 3 tasks
+    qt.writel(N + 0x10, 0x01000000)             # PC_DATA_ADDR
+    qt.writel(N + 0x08, 1)
+    qt.writel(N + 0x08, 0)
+    qt.cmd('clock_step 500000')
+    check(qt.readl(N + 0x28) == 0, 'RKNPU: not done before 3 tasks\' time')
+    qt.cmd('clock_step 200000')
+    check(qt.readl(N + 0x28) == 0x300 and qt.readl(N + 0x3c) == 3,
+          'RKNPU: INT_STATUS = INT_MASK, 3 tasks done')
+    qt.writel(N + 0x24, 0x1ffff)
+    check(qt.readl(N + 0x28) == 0, 'RKNPU: INT_CLEAR')
+    # a one-task job whose DPU writes a 2x1x16 cube at DMA base + 0x1000:
+    # the cube reads INT8's minimum after it, the byte past it untouched
+    base = 0x01000000
+    cmds = [(0x1001, 0x4020, 0x1000), (0x1001, 0x4024, 0),
+            (0x1001, 0x4030, 1), (0x1001, 0x4034, 0), (0x1001, 0x403c, 15),
+            (0x0101, 0x0010, 0), (0x0081, 0x0008, 0x1d)]
+    qt.write(base, b''.join(struct.pack('<Q', t << 48 | v << 16 | r)
+                            for t, r, v in cmds))
+    qt.write(base + 0x1000, bytes(33))
+    qt.writel(N + 0x30, (0x6 << 16) | 1)
+    qt.writel(N + 0x10, base)
+    qt.writel(N + 0x34, base)                   # PC_DMA_BASE_ADDR
+    qt.writel(N + 0x08, 1)
+    qt.writel(N + 0x08, 0)
+    qt.cmd('clock_step 300000')
+    out = qt.read(base + 0x1000, 33)
+    check(out[:32] == b'\x80' * 32 and out[32] == 0,
+          'RKNPU: the DPU output cube blanked to 0x80 (%s)' % out.hex())
+    qt.writel(N + 0x24, 0x1ffff)
+
+
+def test_vepu_pp(qt):
+    # RKVENC-PP (kmpp mpp_rkvenc_pp.c): ENC_STRT, then INT_STA bit 0
+    P = 0xFFA60000
+    qt.writel(P + 0x20, 0x3f)                   # INT_EN
+    qt.writel(P + 0x28, 0x3f)
+    qt.writel(P + 0x10, 1)                      # ENC_STRT
+    qt.cmd('clock_step 600000')
+    check(qt.readl(P + 0x2c) == 1, 'RKVENC-PP: the job done (INT_STA bit 0)')
+    qt.writel(P + 0x28, 0x3f)
+    check(qt.readl(P + 0x2c) == 0, 'RKVENC-PP: INT_CLR clears it')
+
+
 def test_vepu540c(qt):
     V = 0xFFA50000
     src, bs = 0x01100000, 0x01200000
@@ -498,6 +657,55 @@ def test_vepu540c(qt):
           'VEPU540C QP_SUM is the QP times the 8x8 blocks')
     qt.writel(V + 0x28, 1)
     check(qt.readl(V + 0x2c) == 0, 'VEPU540C INT_CLR clears it')
+
+
+def test_vepu540c_osd(qt):
+    """VEPU540C OSD (kmpp's vepu540c_osd_reg at 0x3000): an ARGB1555
+    region of opaque white pixels lands in the coded picture."""
+    V = 0xFFA50000
+    src, bs, rec, osd = 0x01100000, 0x01200000, 0x01300000, 0x01400000
+    qt.write(bs, bytes(256))
+    w, h = 64, 16
+    qt.write(src, bytes([60]) * (w * h))
+    qt.write(src + w * h, bytes([128]) * (w * h // 2))
+    qt.write(osd, bytes([0xff, 0xff]) * (16 * 8))   # A=1, R=G=B=31
+    regs = {
+        0x280: src, 0x284: src + w * h, 0x334: w, 0x338: w,
+        0x28c: rec, 0x294: rec,
+        0x2b0: bs + 0xffff, 0x2b4: bs, 0x2b8: bs, 0x2bc: bs,
+        0x300: 1 | (10 << 8), 0x310: (w // 8 - 1) | ((h // 8 - 1) << 16),
+        0x318: 6 << 2, 0x3b0: 19, 0x3bc: 2 << 15, 0x3c0: 10 << 16,
+        0x020: 1,
+        # region 0: on, ARGB1555, foreground alpha 255, x 16..31, y 0..7
+        0x3000: 1 | 3 << 8 | 255 << 22, 0x3004: 16 | 0 << 14,
+        0x3008: 31 | 7 << 14, 0x300c: osd, 0x3014: 32,
+    }
+    for off, v in regs.items():
+        qt.writel(V + off, v)
+    qt.writel(V + 0x10, 0x100)
+    qt.cmd('clock_step 2000000')
+    import shutil
+    import subprocess
+    if not shutil.which('ffmpeg'):
+        print('skip VEPU540C OSD: no ffmpeg')
+        qt.writel(V + 0x3000, 0)
+        qt.writel(V + 0x28, 1)
+        return
+    stream = qt.read(bs, qt.readl(V + 0x4000))
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'hevc', '-i', '-',
+                        '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+                       input=stream, capture_output=True)
+    y = r.stdout[:w * h]
+    if len(y) < w * h:
+        check(False, 'VEPU540C OSD: the picture decodes (%s)' %
+              r.stderr.decode()[:80])
+        return
+    inside, outside = y[2 * w + 20], y[2 * w + 40]
+    check(inside > 200 and 50 < outside < 70,
+          'VEPU540C OSD: white over the region (Y %d), the source beside '
+          'it (Y %d)' % (inside, outside))
+    qt.writel(V + 0x3000, 0)
+    qt.writel(V + 0x28, 1)
 
 
 def test_vepu540c_hevc_detail(qt):
@@ -785,6 +993,47 @@ def test_i2s_tone(qemu, path):
         qt.close()
 
 
+def test_i2s_files(qemu, path, tmp):
+    """rx-file: capture reads a WAV's samples; tx-file: playback is saved."""
+    import wave
+    rx, tx = os.path.join(tmp, 'mic.wav'), os.path.join(tmp, 'spk.wav')
+    with wave.open(rx, 'wb') as f:
+        f.setnchannels(2)
+        f.setsampwidth(2)
+        f.setframerate(48000)
+        f.writeframes(b''.join(struct.pack('<hh', 100 * i, -100 * i)
+                               for i in range(64)))
+    qt = QTest(qemu, 'rv1106,flash-file=' + path,
+               ('-global', 'rk-i2s-tdm.rx-file=' + rx,
+                '-global', 'rk-i2s-tdm.tx-file=' + tx))
+    try:
+        I = 0xFFAE0000
+        qt.writel(I + 0x04, 15)     # RXCR: 16-bit stereo, packed
+        qt.writel(I + 0x00, 15)     # TXCR: the same
+        qt.writel(I + 0x1c, 2)      # RX start
+        qt.cmd('clock_step 1000000')
+        w = [qt.readl(I + 0x28) for _ in range(8)]
+        got = [((x & 0xffff) ^ 0x8000) - 0x8000 for x in w] + \
+              [((x >> 16) ^ 0x8000) - 0x8000 for x in w]
+        check(got[:8] == [100 * i for i in range(8)] and
+              got[8:] == [-100 * i for i in range(8)],
+              'I2S rx-file: the WAV\'s left and right samples in order')
+        for i in range(16):         # 16 stereo frames played
+            qt.writel(I + 0x24, (i * 7 & 0xffff) | ((-i * 7) & 0xffff) << 16)
+        qt.writel(I + 0x1c, 3)      # TX on too
+        qt.cmd('clock_step 1000000')
+        qt.writel(I + 0x1c, 0)      # stop: the header's sizes are written
+    finally:
+        qt.close()
+    with wave.open(tx, 'rb') as f:
+        fr = f.readframes(f.getnframes())
+        smp = struct.unpack('<%dh' % (len(fr) // 2), fr)
+        check(f.getnchannels() == 2 and f.getsampwidth() == 2 and
+              list(smp[:8]) == [0, 0, 7, -7, 14, -14, 21, -21],
+              'I2S tx-file: a 16-bit stereo WAV of what was played '
+              '(%d Hz, %d frames)' % (f.getframerate(), f.getnframes()))
+
+
 def test_dwc3_gadget(qemu, path):
     """usb-otg=device: the DWC3's device side and the host built into it,
     driven as the dwc3 driver does for the first control transfer."""
@@ -1010,6 +1259,25 @@ def test_machines(qemu, path):
             qt.close()
 
 
+def test_tb_isp(qemu, path):
+    """tb-isp=: the MCU's thunder-boot result in the ISP's reserved memory."""
+    qt = QTest(qemu, 'rv1106,flash-file=%s,tb-isp=0x8b0000:2' % path)
+    try:
+        def w16(a):
+            return int.from_bytes(qt.read(a, 2), 'little')
+        A, S = 0x8b0000, 11245
+        check(w16(A) == 1 and w16(A + 2) == 1 and w16(A + 14) == 2 and
+              w16(A + 16) == 0 and w16(A + S + 16) == 1 and
+              w16(A + S + 2) == 1 and w16(A + 10) == 1920,
+              'tb-isp: both cameras\' heads: enable, complete OK, 2 cameras, '
+              'index 0 / 1, 1920 wide')
+        check(qt.readl(A + 20) == 655 and qt.readl(A + 32) == 65536 and
+              w16(A + 100 + 4645 + 6) == 0x185,
+              'tb-isp: 10 ms at unity gain (Q16), AWB1 R gain 1.52 (Q8)')
+    finally:
+        qt.close()
+
+
 def test_gpio_high(qemu, path):
     # a reset button's pull-up: GPIO4_C0 (pin 16) and GPIO0_A2 idle high
     qt = QTest(qemu, 'rv1106,flash-file=%s,gpio-high=4C0/0A2' % path)
@@ -1021,9 +1289,65 @@ def test_gpio_high(qemu, path):
         qt.close()
 
 
+def gc6160_xfer(qt, wr, nread=0):
+    # bit-banged I2C on GPIO2 (0x20840000): CLK pin 6, DATA pin 11,
+    # open drain as XmMotor.ko drives it -- a 1 is the pin turned input
+    G, CLK, DAT = 0x20840000, 1 << 6, 1 << 11
+
+    def pin(bit, level):
+        if level:
+            qt.writel(G + 0x08, bit << 16)              # DDR: input
+        else:
+            qt.writel(G + 0x00, bit << 16)              # DR 0
+            qt.writel(G + 0x08, bit << 16 | bit)        # DDR: output
+
+    def sda():
+        return 1 if qt.readl(G + 0x70) & DAT else 0
+
+    def clock(bit):
+        pin(DAT, bit)
+        pin(CLK, 1)
+        b = sda()
+        pin(CLK, 0)
+        return b
+
+    def byte(v):
+        for i in range(7, -1, -1):
+            clock((v >> i) & 1)
+        return clock(1) == 0                            # ACK
+
+    def start():
+        pin(DAT, 1); pin(CLK, 1); pin(DAT, 0); pin(CLK, 0)
+
+    acks = []
+    start()
+    for v in wr:
+        acks.append(byte(v))
+    out = b''
+    if nread:
+        start()                                         # repeated start
+        acks.append(byte(0x27))                         # 0x26 | read
+        for n in range(nread):
+            v = 0
+            for _ in range(8):
+                v = v << 1 | clock(1)
+            clock(1 if n == nread - 1 else 0)           # NACK the last
+            out += bytes([v])
+    pin(DAT, 0); pin(CLK, 1); pin(DAT, 1)               # stop
+    return acks, out
+
+
 def test_rv1103b(qemu, path):
-    qt = QTest(qemu, 'rv1103b,flash-file=' + path)
+    qt = QTest(qemu, 'rv1103b,flash-file=' + path + ',gc6160=70:75')
     try:
+        # GC6160 (XM PTZ motor / IR cut) on bit-banged I2C, GPIO2 6 / 11
+        acks, _ = gc6160_xfer(qt, [0x26, 0x16, 0x5a])
+        acks2, out = gc6160_xfer(qt, [0x26, 0x16], 1)
+        check(all(acks) and all(acks2) and out == b'\x5a',
+              'rv1103b gc6160: register 0x16 written and read back (%s %s)'
+              % (acks + acks2, out.hex()))
+        acks, _ = gc6160_xfer(qt, [0x28, 0x00])
+        check(not acks[0], 'rv1103b gc6160: no device at 0x28 (NACK)')
         check(qt.read(0, 16) == bytes(range(16)), 'rv1103b: SPL at DRAM 0')
         check(qt.readl(0x210F6000 + 0x10) == 3,
               'rv1103b: boot source at IRAM 0x210F6000 + 0x10')
@@ -1068,6 +1392,19 @@ def test_rv1103b(qemu, path):
         sai = 0x20660000
         check(qt.readl(sai + 0x70) == 0x24031103 and qt.readl(sai + 0x6c) & 2,
               'SAI VERSION 2403, STATUS FS idle')
+        # HPMCU: held in reset (rockit's vmcu_probe insists), released by
+        # a hiword write; its mailbox keeps A2B and posts no event before
+        # an ISP frame
+        check(qt.readl(0x20000A28) & 0xf0 == 0xf0,
+              'rv1103b CRU SOFTRST(10): HPMCU held in reset')
+        qt.writel(0x20000A28, 0x00f00000)
+        check(qt.readl(0x20000A28) & 0xf0 == 0, 'HPMCU reset released')
+        mb = 0x20A10000
+        qt.writel(mb + 0x0c, 1)
+        qt.writel(mb + 0x08, 3)                         # wrap start, pipe 1
+        check(qt.readl(mb + 0x08) == 3 and qt.readl(mb + 0x0c) == 1,
+              'HPMCU mailbox: A2B_CMD / A2B_DAT')
+        check(qt.readl(mb + 0x18) == 0, 'HPMCU: no event before a frame')
     finally:
         qt.close()
 
@@ -1161,6 +1498,12 @@ def test_rv1109(qemu, tmp):
         stub = struct.unpack('<9I', qt.read(0, 36))
         check(stub[6] == 0x400000 and stub[8] == 0x400000,
               'entry stub: r1 = lr = U-Boot, no OP-TEE: straight to it')
+        A = 0xFF5E0000                          # SARADC v1 (rk3399's)
+        qt.writel(A + 0x08, 1 << 3 | 1 << 5 | 2)    # power up, irq, ch 2
+        check(qt.readl(A + 0x08) & (1 << 6) and qt.readl(A + 0x00) == 0x3ff,
+              'SARADC v1: conversion done at once, full scale (keys up)')
+        qt.writel(A + 0x08, 0)
+        check(not qt.readl(A + 0x08) & (1 << 6), 'SARADC v1: done cleared')
         check(qt.readl(0xFF700010) == 4, 'boot source SPI NAND at IRAM + 0x10')
         PMU = 0xFF3E0000
         qt.writel(PMU + 0x110, 0x00020002)          # power off ISPP (bit 1)
@@ -1492,9 +1835,14 @@ def main():
         cap = qt.readl(U)
         check(cap & 0xff and cap >> 16 == 0x100,
               'DWC3 xHCI at its base: CAPLENGTH, HCIVERSION 1.00 (0x%x)' % cap)
+        test_rknpu(qt)
+        test_vepu_pp(qt)
         test_isp32(qt)
+        test_isp32_colour(qt)
+        test_vicap_dma(qt)
         test_vepu540c(qt)
         test_vepu540c_jpeg(qt)
+        test_vepu540c_osd(qt)
         test_vepu540c_hevc_detail(qt)
         test_vepu540c_h264(qt)
         test_i2c(qt)
@@ -1505,10 +1853,12 @@ def main():
     finally:
         qt.close()
     test_i2s_tone(args.qemu, path)
+    test_i2s_files(args.qemu, path, tmp)
     test_dwc3_gadget(args.qemu, path)
     test_refused(args.qemu, tmp)
     test_machines(args.qemu, path)
     test_gpio_high(args.qemu, path)
+    test_tb_isp(args.qemu, path)
     test_rv1103b(args.qemu, path)
     test_rv1109(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))

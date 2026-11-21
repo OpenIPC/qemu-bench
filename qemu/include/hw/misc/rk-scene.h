@@ -33,4 +33,7 @@ uint8_t rk_scene_gamma(double level);
 /* Y, Cb, Cr of raw levels R, G, B: BT.601, limited or full range. */
 void rk_scene_yuv(const double level[3], bool limited, uint8_t yuv[3]);
 
+/* The same from R, G, B already through a gamma curve, 0..255. */
+void rk_scene_yuv8(const double v[3], bool limited, uint8_t yuv[3]);
+
 #endif
