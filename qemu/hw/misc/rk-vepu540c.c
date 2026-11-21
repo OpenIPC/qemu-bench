@@ -94,6 +94,7 @@
 #include "hantro-h264.h"
 #include "block/thread-pool.h"
 #include "hw/misc/rk-iommu.h"
+#include "system/cpu-timers.h"
 
 #define TYPE_RK_VEPU540C "rk-vepu540c"
 OBJECT_DECLARE_SIMPLE_TYPE(RkVepuState, RK_VEPU540C)
@@ -389,6 +390,7 @@ static bool rk_vepu_headers(RkVepuState *s, HevcEncHdr *hdr, uint32_t *len)
             uint32_t from = (i && !buf[i - 1]) ? i - 1 : i;
 
             if (hevc_enc_parse_headers(hdr, buf + from, back - from)) {
+                hdr->prm.intra_ac = true;   /* the residual, not just DC */
                 *len = back - from;
                 return true;
             }
@@ -454,7 +456,10 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
                                ref ? ref->pic : NULL, recon,
                                y, w, h, ys, uv, cs, out, cap);
     } else {
-        n = hevc_enc_frame(&hevc_params_ctb32_sao, w, h, qp, p_slice, poc,
+        HevcEncParams prm = hevc_params_ctb32_sao;
+
+        prm.intra_ac = true;
+        n = hevc_enc_frame(&prm, w, h, qp, p_slice, poc,
                            ref ? ref->pic : NULL, recon,
                            y, w, h, ys, uv, cs, out, cap);
     }
@@ -698,8 +703,17 @@ static void rk_vepu_run(RkVepuState *s)
     cap = MIN(cap, 16 << 20);
     if (rk_vepu_stnd(s) <= 1 && cap) {   /* 2: JPEG alone */
         out = g_malloc(cap);
+        /*
+         * The encode runs here, in the vCPU's register write; the guest's
+         * clock stands still meanwhile, so the job costs it "job-ns" as on
+         * the chip whatever the host takes.  Without that, a slow 4K
+         * picture outlasted the driver's task timeout, the driver reset
+         * the encoder mid-job and never got back in step.
+         */
+        cpu_disable_ticks();
         n = rk_vepu_stnd(s) == 1 ? rk_vepu_hevc(s, out, cap, &qp)
                                          : rk_vepu_h264(s, out, cap, &qp);
+        cpu_enable_ticks();
         if (n > cap) {
             n = 0;              /* truncated: nothing usable */
         }

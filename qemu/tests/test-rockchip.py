@@ -500,6 +500,59 @@ def test_vepu540c(qt):
     check(qt.readl(V + 0x2c) == 0, 'VEPU540C INT_CLR clears it')
 
 
+def test_vepu540c_hevc_detail(qt):
+    """H.265 with the whole intra residual: a 2-pixel checkerboard over a
+    gradient (all AC) decodes in ffmpeg close to its source, IDR and P."""
+    import shutil
+    import subprocess
+    if not shutil.which('ffmpeg'):
+        print('skip VEPU540C H.265 detail: no ffmpeg')
+        return
+    V = 0xFFA50000
+    w, h = 64, 32
+    src, bs = 0x01900000, 0x01a00000
+    pics = [bytes(min(255, 40 + 2 * x + 3 * r + (60 if (x // 2 + r // 2 + sh)
+                                                 % 2 else 0))
+                  for r in range(h) for x in range(w)) for sh in (0, 0, 1)]
+    stream = b''
+    for k, y in enumerate(pics):
+        qt.write(src, y + bytes([128]) * (w * h // 2))
+        rf = 0x01b00000 + 0x20000 * k
+        at = bs + len(stream)
+        regs = {
+            0x280: src, 0x284: src + w * h, 0x334: w, 0x338: w,
+            0x28c: rf, 0x294: rf - 0x20000 if k else rf,
+            0x2b0: bs + 0xfffff, 0x2b4: bs, 0x2b8: at, 0x2bc: bs,
+            0x300: 1 | (22 << 8),
+            0x310: (w // 8 - 1) | ((h // 8 - 1) << 16),
+            0x318: 6 << 2,
+            0x3b0: 19 if k == 0 else 1,             # IDR_W_RADL, TRAIL_R
+            0x3bc: (2 if k == 0 else 1) << 15,      # I, P
+            0x3c0: 22 << 16, 0x3c4: k,
+            0x020: 1,
+        }
+        for off, v in regs.items():
+            qt.writel(V + off, v)
+        qt.writel(V + 0x10, 0x100)
+        qt.cmd('clock_step 2000000')
+        n = qt.readl(V + 0x4000)
+        qt.writel(V + 0x28, 1)
+        stream += qt.read(at, n)
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'hevc', '-i', '-',
+                        '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+                       input=stream, capture_output=True)
+    dec = r.stdout
+    errs = []
+    for k in range(min(len(dec) // (w * h), 3)):
+        d = dec[k * w * h:(k + 1) * w * h]
+        e = [abs(a - b) for a, b in zip(d, pics[k])]
+        errs.append((max(e), round(sum(e) / len(e), 2)))
+    check(len(errs) == 3 and not r.stderr and
+          all(m <= 32 and mean <= 10 for m, mean in errs),   # DC only: 64, 28
+          'VEPU540C H.265 detail (AC residual): 3 pictures decode clean, '
+          'Y error (max, mean) %s %s' % (errs, r.stderr[:80]))
+
+
 def test_vepu540c_h264(qt):
     """libx264's SPS / PPS as the HAL's (baseline: CAVLC, main: CABAC); an
     IDR, a P picture of the same source and one of a shifted source decode
@@ -1431,6 +1484,7 @@ def main():
         test_isp32(qt)
         test_vepu540c(qt)
         test_vepu540c_jpeg(qt)
+        test_vepu540c_hevc_detail(qt)
         test_vepu540c_h264(qt)
         test_i2c(qt)
         test_gpio(qt)

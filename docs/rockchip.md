@@ -607,6 +607,14 @@ bash qemu-boot/test-rv1106-boot.sh --openipc img/
     carry a default `pred_weight_table()` (added to `hevc-enc.c`).
   - The reference for a P frame is the reconstruction the previous job
     wrote at the address this one reads (`rfpw` → `rfpr`).
+  - Intra CUs code the AC residual too (`intra_ac`): an 8×8 luma and
+    two 4×4 chroma transforms, quantised at the job's QP. A CU whose
+    variance is below the quantiser step stays DC-only. Edges and OSD
+    text come out sharp: on a checkerboard at QP 22 the error is 26 max
+    and 8.3 mean, against 64 and 28 for DC alone.
+  - The guest clock stands still while a job encodes
+    (`cpu_disable_ticks`), so a heavy picture does not trip mpp's
+    timeouts; the job costs only its modelled `job-ns`.
   - JPEG (the snapshot channel, from the mainpath) runs alongside, with
     no frames lost on either path. The HAL writes SOI..SOS, and the model
     writes the scan and EOI with that header's DQT. A 2304×1296 scan
