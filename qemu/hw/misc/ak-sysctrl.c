@@ -145,8 +145,9 @@ struct AkSysctrlState {
     uint16_t rtc[RTC_NREGS];
     ptimer_state *wdt;
     uint32_t wdt_load;
-    /* Diagnostics only, so not migrated: what the running count started
-     * from and when, to say how a reset came about. */
+    /* What the running count started from and when: the first decides
+     * whether a run-out is the kernel's restart or an expiry, so it is
+     * migrated (version 3); the second only times the warning. */
     uint32_t wdt_run_load;
     int64_t wdt_fed_ms;
 
@@ -598,13 +599,23 @@ static const VMStateDescription vmstate_ak_timer = {
 
 static int ak_sysctrl_post_load(void *opaque, int version_id)
 {
+    AkSysctrlState *s = opaque;
+
+    /*
+     * An older stream does not say what the running count started from.
+     * The last load written is the best guess, and keeps a long timeout an
+     * expiry (with the configured watchdog action) rather than a reboot.
+     */
+    if (version_id < 3) {
+        s->wdt_run_load = s->wdt_load;
+    }
     ak_sysctrl_update(opaque);
     return 0;
 }
 
 static const VMStateDescription vmstate_ak_sysctrl = {
     .name = TYPE_AK_SYSCTRL,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = ak_sysctrl_post_load,
     .fields = (const VMStateField[]) {
@@ -624,6 +635,8 @@ static const VMStateDescription vmstate_ak_sysctrl = {
         VMSTATE_SUB_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS_V1,
                           AK_SYSCTRL_NREGS - AK_SYSCTRL_NREGS_V1, 2,
                           vmstate_info_uint32, uint32_t),
+        VMSTATE_UINT32_V(wdt_run_load, AkSysctrlState, 3),
+        VMSTATE_INT64_V(wdt_fed_ms, AkSysctrlState, 3),
         VMSTATE_END_OF_LIST()
     }
 };

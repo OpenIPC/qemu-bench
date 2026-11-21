@@ -252,6 +252,44 @@ def test_watchdog(qemu, path):
         qt.close()
 
 
+def test_watchdog_migration(qemu, tmp):
+    """An armed watchdog migrated mid-count is still an expiry on the other
+    side -- reported, and through -action watchdog= -- not a reboot."""
+    print('ak-sysctrl watchdog across migration')
+    mon = os.path.join(tmp, 'wdt-mon.sock')
+    mig = os.path.join(tmp, 'wdt.mig')
+    src = QTest(qemu, 'ak3918ev300',
+                ['-monitor', 'unix:%s,server=on,wait=off' % mon])
+    try:
+        wdt_feed(src, WDT_HZ)                   # 1 s
+        src.step(200 * 1000000)
+        m = socket.socket(socket.AF_UNIX)
+        m.connect(mon)
+        m.sendall(('migrate file:%s\n' % mig).encode())
+        for _ in range(100):
+            m.sendall(b'info migrate\n')
+            time.sleep(0.1)
+            m.settimeout(0.2)
+            try:
+                if b'completed' in m.recv(65536):
+                    break
+            except socket.timeout:
+                pass
+        m.close()
+    finally:
+        src.close()
+    dst = QTest(qemu, 'ak3918ev300',
+                ['-incoming', 'file:' + mig, '-action', 'watchdog=none'])
+    try:
+        time.sleep(1)
+        dst.step(2000 * 1000000)
+        log = open(os.path.join(dst.dir, 'qemu.err')).read()
+        check('migrated, a run-out is still an expiry',
+              log.count('watchdog expired'), 1)
+    finally:
+        dst.close()
+
+
 def test_sar_inputs(qemu, path):
     print('ak-sysctrl SAR inputs')
     qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path,
@@ -919,6 +957,7 @@ def main():
     test_ev300l(args.qemu, path300l)
     test_sar_inputs(args.qemu, path)
     test_watchdog(args.qemu, path)
+    test_watchdog_migration(args.qemu, tmp)
     test_av100(args.qemu, tmp)
     test_av130(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)
