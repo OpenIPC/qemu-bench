@@ -70,7 +70,7 @@ appended DTB.
 | Address | Block | Model |
 |---|---|---|
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
-| `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse, SAR-ADC1 samples (`ain0` / `ain1` / `bat`, settable with `qom-set` while the guest runs) | `ak-sysctrl` |
+| `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse, SAR-ADC1 samples (`ain0` / `ain1` / `bat` in millivolts at the pin, default 3000 on AIN0/AIN1, settable with `qom-set` while the guest runs; see below) | `ak-sysctrl` |
 | `0x20000000` | ISP / VI (interrupt 1) | EV200 and AK3918EV300 `ak-isp`, others storage |
 | `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core (registers from `+0x8000`; interrupt 2) | EV200 `ak-h8290`, EV300 `ingenic-avpu` (`anyka`), others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
@@ -170,6 +170,19 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   a 300.000 s timeout`, and goes through QEMU's watchdog action, so
   `-action watchdog=pause` stops the machine where it was instead of
   rebooting it.
+- **SAR-ADC1** differs between the chips. The EV330 (and the model's
+  default) leaves three packed 10-bit samples of the 3.3 V AVCC in `+0x68`
+  all the time. The EV300 parts (`sar-ev300`, OpenIPC/builder#234) convert
+  one input at a time: `+0x5C` bit 0 starts a conversion of the input
+  selected in bits 7:5 (bit 5 AIN0), `+0x6C` bit 0 says it is ready
+  (written 0 to clear), and `+0x68` bits 11:0 hold 12 bits against 3.0 V.
+  The input is read only when the converter is clocked (`+0x0C` bit 3), out
+  of reset (`+0x20` bit 30), powered (`+0xA0` bit 0 clear), and the input
+  is enabled (`+0xA0` bit 5, AIN0 only); otherwise the sample is 0. That is
+  the 0 mV a kernel with the EV330 reader gets on an EV300, so the twin
+  shows it too. A lit PE3020-W photocell (3000 mV) saturates at 4095,
+  2999 mV, as the camera does; `qom-set ... ain0 39` is the same photocell
+  covered.
 - **UART** (`ak-uart`) has no data register. TX bytes go into L2 memory at
   `0x48001000 + 0x100 n`, CONF2 starts the send; received bytes land in a
   128-byte ring at `+0x80`, and DATA_CONF bits 19:13 say where the next one

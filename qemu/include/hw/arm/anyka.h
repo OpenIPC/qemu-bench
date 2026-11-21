@@ -69,6 +69,7 @@ typedef struct AkSoCConfig {
      * with its register block at +0x8000.
      */
     bool        venc_allegro;
+    bool        sar_ev300;      /* SAR-ADC1 converts on demand, 12 bits */
 } AkSoCConfig;
 
 #endif /* HW_ARM_ANYKA_H */
