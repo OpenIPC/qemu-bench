@@ -19,8 +19,15 @@
  * re-applies its PWMs over and over.  The counter runs from the PWM clock
  * ("clock-hz", 24 MHz on these SoCs: xin24m), divided as CTRL says, from
  * 0 up to the period and over again; a one-shot channel stops after
- * repeats + 1 periods, clears its enable and raises its interrupt.  The
- * output level is not modelled.  Capture mode counts nothing.
+ * repeats + 1 periods, clears its enable and raises its interrupt.
+ * Capture mode counts nothing.
+ *
+ * The output is not a waveform; its level is the QOM property "outputN"
+ * (read only): how much of the time channel N's pin is high, in permille.
+ * A running channel is high for duty / period with a positive duty
+ * polarity (CTRL bit 3), for the rest of the period with a negative one.
+ * A stopped one sits at its inactive level (bit 4): 1000 high, 0 low.
+ * An IR LED's or a backlight's brightness reads off it.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -33,6 +40,7 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include "qapi/visitor.h"
 
 #define TYPE_RK_PWM "rk-pwm"
 OBJECT_DECLARE_SIMPLE_TYPE(RkPwmState, RK_PWM)
@@ -128,6 +136,29 @@ static uint32_t rk_pwm_cnt(RkPwmState *s, int n)
     return ticks % rk_pwm_period_ticks(s, n);
 }
 
+/* permille of the time channel @n's output is high */
+static uint32_t rk_pwm_output(RkPwmState *s, int n)
+{
+    uint32_t c = REG(s, CH(n, R_CTRL));
+    uint64_t period = rk_pwm_period_ticks(s, n);
+    uint64_t duty = MIN((uint64_t)REG(s, CH(n, R_DUTY)), period);
+    uint32_t active;
+
+    if (!(c & CTRL_EN) || CTRL_MODE(c) > MODE_CONT) {
+        return (c & (1u << 4)) ? 1000 : 0;
+    }
+    active = duty * 1000 / period;
+    return (c & (1u << 3)) ? active : 1000 - active;
+}
+
+static void rk_pwm_get_output(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    uint32_t val = rk_pwm_output(RK_PWM(obj), (uintptr_t)opaque);
+
+    visit_type_uint32(v, name, &val, errp);
+}
+
 static uint64_t rk_pwm_read(void *opaque, hwaddr off, unsigned size)
 {
     RkPwmState *s = opaque;
@@ -201,7 +232,11 @@ static void rk_pwm_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     for (n = 0; n < NCH; n++) {
+        g_autofree char *name = g_strdup_printf("output%d", n);
+
         s->timer[n] = timer_new_ns(QEMU_CLOCK_VIRTUAL, cbs[n], s);
+        object_property_add(obj, name, "uint32", rk_pwm_get_output, NULL,
+                            NULL, (void *)(uintptr_t)n);
     }
 }
 

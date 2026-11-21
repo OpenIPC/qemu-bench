@@ -290,6 +290,7 @@ typedef struct RkSoCConfig {
     const char *sensor_default; /* NULL: sc2336p at 0x30 */
     int i2c_rtc_bus;            /* a PCF8563 / BM8563 at 0x51, 0: none */
     int codec_bus;              /* an ES8311 at 0x18 (bus index + 1) */
+    int dsi_bridge_bus;         /* an SN65DSI8x at 0x2c (bus index + 1) */
     hwaddr i2s_base;            /* I2S/TDM, paced through the PL330 */
     int i2s_irq;
     int i2s_drq[2];             /* PL330 peripheral requests: TX, RX */
@@ -652,6 +653,7 @@ static const RkSoCConfig rv1103b_soc = {
     .sensor_default = "imx415",     /* the RV1109 board's, at 0x1a */   \
     .i2c_rtc_bus    = 0 + 1,        /* BM8563 on I2C0 (bus index + 1) */\
     .codec_bus      = 4 + 1,        /* ES8311 on I2C4 */                \
+    .dsi_bridge_bus = 3 + 1,        /* SN65DSI8x on I2C3 */             \
     .i2s_base       = 0xFF800000,                                       \
     .i2s_irq        = 46,                                               \
     .i2s_drq        = { 20, 19 },   /* the devicetree's dmas */         \
@@ -1573,6 +1575,21 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
     if (c->codec_bus) {
         i2c_slave_create_simple(bus[c->codec_bus - 1], "es8311", 0x18);
     }
+    if (c->dsi_bridge_bus) {
+        /*
+         * The RV1109 board's TI SN65DSI8x MIPI DSI -> LVDS bridge for its
+         * 800x480 panel, which /app/mipi_4lane_800x480.sh programs with
+         * i2cset at boot (23 "Error: Write failed" with nothing there):
+         * a register file, its ID at 0x00..0x08 ("DSI85" reversed, then
+         * the revision).  No LVDS is produced.
+         */
+        static const uint8_t sn65dsi_id[] = {
+            0x35, 0x38, 0x49, 0x53, 0x44, 0x20, 0x20, 0x20, 0x01,
+        };
+
+        at24c_eeprom_init_rom(bus[c->dsi_bridge_bus - 1], 0x2c, 256,
+                              sn65dsi_id, sizeof(sn65dsi_id));
+    }
     /*
      * The camera boards' sensors answer at 0x30 and, on two-sensor
      * boards, 0x32 (the vendor devicetrees list sc2336p and sc231hai
@@ -1821,9 +1838,18 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
     if (c->rga_base) {
         sysbus_create_simple("rk-rga2", c->rga_base, rk_irq(s, c->rga_irq));
     }
+    /* /machine/pwmN: its outputN properties read the pins' levels */
     for (i = 0; i < ARRAY_SIZE(c->pwm_base) && c->pwm_base[i]; i++) {
-        sysbus_create_simple("rk-pwm", c->pwm_base[i],
-                             c->pwm_irq[i] ? rk_irq(s, c->pwm_irq[i]) : NULL);
+        g_autofree char *name = g_strdup_printf("pwm%d", i);
+
+        dev = qdev_new("rk-pwm");
+        object_property_add_child(OBJECT(s), name, OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, c->pwm_base[i]);
+        if (c->pwm_irq[i]) {
+            sysbus_connect_irq(sbd, 0, rk_irq(s, c->pwm_irq[i]));
+        }
     }
     if (c->saradc_v1_base) {
         sysbus_create_simple("rk-saradc-v1", c->saradc_v1_base,

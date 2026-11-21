@@ -44,7 +44,7 @@ script plays the mask ROM's successors (docs/rockchip.md):
 """
 import time
 import argparse, atexit, gzip, hashlib, os, shutil, struct, subprocess, sys
-import tempfile
+import socket, tempfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(__file__))
@@ -962,6 +962,98 @@ def test_pwm(qt, P, who):
     check(qt.readl(P + 0x40) == 0, '%s PWM: INTSTS write 1 to clear' % who)
 
 
+def qmp_qom_get(sock_path, path, prop):
+    import json
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock_path)
+    f = s.makefile('rw', buffering=1)
+    f.readline()                                            # greeting
+    for c in ({'execute': 'qmp_capabilities'},
+              {'execute': 'qom-get',
+               'arguments': {'path': path, 'property': prop}}):
+        f.write(json.dumps(c) + '\n'); f.flush()
+        while True:
+            r = json.loads(f.readline())
+            if 'return' in r or 'error' in r:
+                break
+    s.close()
+    return r.get('return')
+
+
+def test_pwm_output(qemu, path):
+    # rk-pwm's outputN: the pin's high time in permille, polarity-aware
+    tmp = tempfile.mkdtemp()
+    qsock = os.path.join(tmp, 'qmp.sock')
+    qt = QTest(qemu, 'rv1106,flash-file=' + path,
+               ('-qmp', 'unix:%s,server=on,wait=off' % qsock))
+    try:
+        P = 0xFF350000
+        get = lambda n: qmp_qom_get(qsock, '/machine/pwm0', 'output%d' % n)
+        check(get(1) == 0, 'PWM output1: stopped, inactive low -> 0')
+        qt.writel(P + 0x1c, 1 << 4)                 # stopped, inactive high
+        check(get(1) == 1000, 'PWM output1: stopped, inactive high -> 1000')
+        qt.writel(P + 0x14, 999)                    # 1000 clocks
+        qt.writel(P + 0x18, 250)
+        qt.writel(P + 0x1c, 1 << 3 | 1 << 1 | 1)    # duty high, continuous
+        check(get(1) == 250, 'PWM output1: 25%% duty high -> %r' % get(1))
+        qt.writel(P + 0x1c, 1 << 1 | 1)             # duty low
+        check(get(1) == 750, 'PWM output1: 25%% duty low -> %r' % get(1))
+    finally:
+        qt.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_sd_write(qemu, path):
+    # DW MSHC SD write with BYTCNT 0 (undefined length, as the RV1106
+    # vendor kernel writes): the IDMAC chain says how much, CMD12 ends it
+    tmp = tempfile.mkdtemp()
+    img = os.path.join(tmp, 'sd.img')
+    with open(img, 'wb') as f:
+        f.truncate(8 << 20)
+    qt = QTest(qemu, 'rv1106,flash-file=' + path,
+               ('-drive', 'if=sd,index=0,format=raw,file=' + img))
+    try:
+        M = SDMMC
+        R = 1 << 6
+
+        def cmd(idx, arg=0, flags=R):
+            qt.writel(M + 0x44, 0xffffffff)         # RINTSTS clear
+            qt.writel(M + 0x28, arg)
+            qt.writel(M + 0x2c, 1 << 31 | flags | idx)
+            return qt.readl(M + 0x30)
+
+        qt.writel(M + 0x04, 1)                      # PWREN
+        cmd(0, 0, 0)
+        cmd(8, 0x1aa)
+        for _ in range(10):
+            cmd(55)
+            if cmd(41, 0x40ff8000) & 1 << 31:
+                break
+        cmd(2, 0, R | 1 << 7)
+        rca = cmd(3) & 0xffff0000
+        cmd(7, rca)
+        buf, desc = 0x01000000, 0x01100000
+        qt.write(buf, b'OPENENDED' * 113 + b'!!!!!!!')         # 1024 bytes
+        qt.write(desc, struct.pack('<4I', 1 << 31 | 1 << 2 | 1 << 3,
+                                   1024, buf, 0))  # OWN, LD, FS
+        qt.writel(M + 0x00, 1 << 25)                # CTRL: use IDMAC
+        qt.writel(M + 0x80, 1 << 7 | 1 << 1)        # BMOD: DE, FB
+        qt.writel(M + 0x88, desc)                   # DBADDR
+        qt.writel(M + 0x1c, 512)                    # BLKSIZ
+        qt.writel(M + 0x20, 0)                      # BYTCNT 0
+        # sector 8; the 8 MiB card is standard capacity: a byte address
+        cmd(25, 8 * 512, R | 1 << 8 | 1 << 9 | 1 << 10)
+        cmd(12, 0, R | 1 << 14)
+        d = qt.read(desc, 4)
+    finally:
+        qt.close()
+    data = open(img, 'rb').read()
+    shutil.rmtree(tmp, ignore_errors=True)
+    check(data[8 * 512:8 * 512 + 1024] == b'OPENENDED' * 113 + b'!!!!!!!'
+          and not struct.unpack('<I', d)[0] & 1 << 31,
+          'SD: CMD25 with BYTCNT 0 writes the IDMAC chain (2 blocks)')
+
+
 def test_i2s_rv1106(qt):
     I = 0xFFAE0000                  # no CRU-derived clock: word-rate 96000
     qt.writel(I + 0x1c, 2)          # RX start
@@ -1493,6 +1585,20 @@ def test_rv1109(qemu, tmp):
         f.write(b'PAGE@0x500000..' + bytes(range(256)))
     qt = QTest(qemu, 'rv1109,flash-file=' + nand)
     try:
+        # the board's SN65DSI8x DSI -> LVDS bridge on I2C3 at 0x2c: its ID
+        # register file ("DSI85" reversed) answers an 8-bit address read
+        i2c3 = 0xFF520000
+        qt.writel(i2c3 + 0x1c, 0xff)
+        qt.writel(i2c3 + 0x08, (0x2c << 1) | (1 << 24))         # MRXADDR
+        qt.writel(i2c3 + 0x0c, 0x00 | 1 << 24)                  # reg 0x00
+        qt.writel(i2c3 + 0x00, 1 | 1 << 1 | 1 << 3 | 1 << 5 | 1 << 6)
+        qt.writel(i2c3 + 0x14, 8)
+        ipd = qt.readl(i2c3 + 0x1c)
+        idb = struct.pack('<2I', qt.readl(i2c3 + 0x200),
+                          qt.readl(i2c3 + 0x204))
+        qt.writel(i2c3 + 0x00, qt.readl(i2c3) & ~(1 << 3) | 1 << 4)
+        check(not ipd & 0x40 and idb == b'58ISD   ',
+              'rv1109 I2C3 0x2c: SN65DSI8x ID %r' % idb)
         check(qt.read(0x400000, len(uboot)) == uboot,
               'rv1109 SPL stand-in: U-Boot from the FIT at its load address')
         stub = struct.unpack('<9I', qt.read(0, 36))
@@ -1860,6 +1966,8 @@ def main():
     test_gpio_high(args.qemu, path)
     test_tb_isp(args.qemu, path)
     test_rv1103b(args.qemu, path)
+    test_pwm_output(args.qemu, path)
+    test_sd_write(args.qemu, path)
     test_rv1109(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)

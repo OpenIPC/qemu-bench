@@ -99,6 +99,11 @@ What OP-TEE and Linux need from the SoC, beyond the RV1106's models:
     Rockchip's driver checks.
   - A PCF8563-compatible RTC, the board's BM8563, is at `0x51` on I2C0
     (`rk-pcf8563.c`, QOM type `pcf8563`). Linux registers it as `rtc0`.
+  - The board's TI SN65DSI8x MIPI DSI → LVDS bridge, for its 800×480
+    panel, is at `0x2c` on I2C3. It is a 256-byte register file (an
+    AT24C) whose ID reads "58ISD   " at 0x00. `/app/mipi_4lane_800x480.sh`
+    programs it with `i2cset` at boot; with nothing there it logged 23
+    "Error: Write failed". No LVDS is produced.
 - **Audio:** the board's ES8311 codec at `0x18` on I2C4 (`rk-es8311.c`,
   QOM type `es8311`) and the I2S/TDM controller at `0xFF800000`
   (`rk-i2s-tdm`).
@@ -363,6 +368,13 @@ Machine options besides the flash:
   after the 100-byte head. The G2 takes `tb-isp=0x8b0000:2`.
 - `-drive if=sd,index=0` is the SD card, `index=1` an SDIO slot and
   `index=2` an eMMC.
+  - The vendor kernel writes with BYTCNT 0: an undefined-length transfer
+    (DW MSHC databook), with the IDMAC chain setting the length and a
+    CMD12 ending it on the card. The shared MSHC model (`hisi-himci`)
+    used to take 0 as nothing to move, so every write was lost.
+  - Now the XM R5 App formats a card in its own WFS layout on the first
+    boot (768 MiB recordings + 256 MiB snapshots on a 1 GiB image) and
+    records to it after that. A blank image is enough; it ignores FAT.
 
 `flash-file=` is the camera's whole SPI NOR. Erases and programs are written
 back to it, so boot a copy. The flash is QEMU's m25p80, chosen by image size:
@@ -971,8 +983,12 @@ RV1103 / RV1106:
     instead of one every 7 s, and its `getChnFrame` no longer times out.
 - **RVE**: storage.
 - **USB gadget functions other than CDC ECM, RNDIS, ACM and adb:** they
-  enumerate, but no mass storage or UVC traffic is bridged. PWM is
-  modelled (`rk-pwm`), but its output level isn't.
+  enumerate, but no mass storage or UVC traffic is bridged.
+- **PWM** (`rk-pwm`, `/machine/pwmN`): no waveform. Each channel's level
+  is the read-only QOM property `outputN`: the permille of time its pin is
+  high, from duty / period and the duty polarity (CTRL bit 3), or the
+  inactive level (bit 4) when it is stopped. For example
+  `qom-get /machine/pwm0 output1` reads an IR LED's brightness.
 - **Audio codec** (the analogue acodec): registers only. The I2S/TDM
   sample clock on the RV1106 comes from the TOPCRU, as on the RV1126:
   - the source is `CLKSEL_CON(17)` TX / `(19)` RX (bit 7 GPLL / CPLL,

@@ -225,7 +225,14 @@ static void hisi_himci_do_data(HisiHimciState *s, uint32_t idmac_addr,
 {
     AddressSpace *as = &address_space_memory;
     uint32_t desc_addr = idmac_addr;
-    uint32_t remaining = s->bytcnt;
+    /*
+     * BYTCNT 0 is an undefined-length transfer (the DW MSHC databook): the
+     * descriptor chain says how much, a CMD12 ends it on the card.  The
+     * RV1106 vendor kernel writes that way -- with 0 taken as nothing to
+     * move, every CMD25 sent no data and SD writes were lost.
+     */
+    bool open_ended = s->bytcnt == 0;
+    uint32_t remaining = open_ended ? UINT32_MAX : s->bytcnt;
     uint8_t buf[4096];
 
     /*
@@ -244,7 +251,7 @@ static void hisi_himci_do_data(HisiHimciState *s, uint32_t idmac_addr,
      * while a pathological chain is stopped in proportion to what it claimed
      * to move rather than to what it could name.
      */
-    uint64_t budget = (uint64_t)remaining / 512 + 1024;
+    uint64_t budget = open_ended ? 65536 : (uint64_t)remaining / 512 + 1024;
 
     while (remaining > 0) {
         if (budget-- == 0) {
