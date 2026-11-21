@@ -160,6 +160,16 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   L2 buffer 0 9, GPIO 12, MAC 13. The interrupt controller, timers (EV330
   layout, 12 MHz), watchdog (`+0xE4` / `+0xE8`), UART and L2 buffer
   numbering are the old ones.
+- **Watchdog** (`ak-sysctrl` `+0xE4` / `+0xE8`, 21.333 us a count, at most
+  357 s). `ak_top_wdt.c` writes the load to CFG1 (`0x55` key), then CFG2
+  enable, then enable + feed (`0xAA` key); magic close writes CFG2 `0xAA`
+  with enable clear, which stops it. It is also how the board reboots: the
+  kernel's restart hook feeds it a two-count load. That case (under 1 ms)
+  resets quietly. A longer load that runs out is an expiry and says so on
+  stderr, e.g. `ak-sysctrl: watchdog expired: last fed 300.000 s ago with
+  a 300.000 s timeout`, and goes through QEMU's watchdog action, so
+  `-action watchdog=pause` stops the machine where it was instead of
+  rebooting it.
 - **UART** (`ak-uart`) has no data register. TX bytes go into L2 memory at
   `0x48001000 + 0x100 n`, CONF2 starts the send; received bytes land in a
   128-byte ring at `+0x80`, and DATA_CONF bits 19:13 say where the next one
