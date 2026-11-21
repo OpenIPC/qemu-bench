@@ -663,6 +663,8 @@ struct RkMachineState {
     char *sensor;
     char *sensor2;
     char *usb_otg;              /* "host" (default) or "device" */
+    char *gpio_high;            /* pins that idle high, "4C0/0A2" */
+    uint32_t gpio_levels[5];    /* parsed gpio_high, per bank */
     DeviceState *gic;
     DeviceState *pl330;
     DeviceState *cam_sensor;    /* the camera I2C bus's first sensor */
@@ -731,6 +733,44 @@ static void rk_machine_set_usb_otg(Object *obj, const char *value,
     }
     g_free(s->usb_otg);
     s->usb_otg = g_strdup(value);
+}
+
+static char *rk_machine_get_gpio_high(Object *obj, Error **errp)
+{
+    return g_strdup(RK_MACHINE(obj)->gpio_high ?: "");
+}
+
+/*
+ * "4C0/0A2": bank, port letter A..D, pin 0..7.  An input nothing drives
+ * reads 0 in the model; a board pull-up (a reset button's, say) is listed
+ * here instead.
+ */
+static void rk_machine_set_gpio_high(Object *obj, const char *value,
+                                     Error **errp)
+{
+    RkMachineState *s = RK_MACHINE(obj);
+    g_auto(GStrv) pins = g_strsplit(value, "/", -1);
+    uint32_t lv[5] = { 0 };
+    int i;
+
+    for (i = 0; pins[i]; i++) {
+        const char *p = pins[i];
+        int c;
+
+        if (!*p) {
+            continue;
+        }
+        c = g_ascii_toupper(p[1]);
+        if (strlen(p) != 3 || p[0] < '0' || p[0] > '4' ||
+            c < 'A' || c > 'D' || p[2] < '0' || p[2] > '7') {
+            error_setg(errp, "gpio-high: '%s' is not a pin like 4C0", p);
+            return;
+        }
+        lv[p[0] - '0'] |= 1u << ((c - 'A') * 8 + p[2] - '0');
+    }
+    memcpy(s->gpio_levels, lv, sizeof(lv));
+    g_free(s->gpio_high);
+    s->gpio_high = g_strdup(value);
 }
 
 static char *rk_machine_get_sensor2(Object *obj, Error **errp)
@@ -1361,6 +1401,7 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
         g_autofree char *name = g_strdup_printf("gpio%d", i);
 
         dev = qdev_new("rk-gpio");
+        qdev_prop_set_uint32(dev, "input-levels", s->gpio_levels[i]);
         object_property_add_child(OBJECT(s), name, OBJECT(dev));
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
@@ -2000,6 +2041,11 @@ static void rk_machine_class_init(ObjectClass *oc, const void *data)
         "The OTG port's role: host (QEMU's DWC3 + xHCI; default) or device "
         "(rk-dwc3: the gadget enumerated by a built-in host, a CDC ECM "
         "function bridged to -nic ...,model=usb-gadget)");
+    object_class_property_add_str(oc, "gpio-high",
+        rk_machine_get_gpio_high, rk_machine_set_gpio_high);
+    object_class_property_set_description(oc, "gpio-high",
+        "Input pins that idle high, as a board pull-up holds them: "
+        "'/'-separated bank, port and pin (4C0/0A2); others read 0");
 }
 
 static const TypeInfo rk_machine_info = {

@@ -1010,6 +1010,17 @@ def test_machines(qemu, path):
             qt.close()
 
 
+def test_gpio_high(qemu, path):
+    # a reset button's pull-up: GPIO4_C0 (pin 16) and GPIO0_A2 idle high
+    qt = QTest(qemu, 'rv1106,flash-file=%s,gpio-high=4C0/0A2' % path)
+    try:
+        check(qt.readl(0xFF560070) == 1 << 16, 'gpio-high: GPIO4 EXT_PORT')
+        check(qt.readl(0xFF380070) == 1 << 2, 'gpio-high: GPIO0 EXT_PORT')
+        check(qt.readl(0xFF530070) == 0, 'gpio-high: GPIO1 reads 0')
+    finally:
+        qt.close()
+
+
 def test_rv1103b(qemu, path):
     qt = QTest(qemu, 'rv1103b,flash-file=' + path)
     try:
@@ -1497,6 +1508,7 @@ def main():
     test_dwc3_gadget(args.qemu, path)
     test_refused(args.qemu, tmp)
     test_machines(args.qemu, path)
+    test_gpio_high(args.qemu, path)
     test_rv1103b(args.qemu, path)
     test_rv1109(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))

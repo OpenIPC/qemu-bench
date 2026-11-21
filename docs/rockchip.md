@@ -286,6 +286,10 @@ Machine options besides the flash:
   list sc2336p and sc231hai there.
 - `sensor2=`: a second sensor at 0x32, for two-sensor boards such as the
   G2; default `none`.
+- `gpio-high=`: input pins that idle high, as a pull-up on the board
+  holds them, `/`-separated: bank, port, pin (`4C0/0A2`). Any other
+  input nothing drives reads 0. The G2's reset button is `4C0` (see
+  Xiongmai firmware).
 - `-drive if=sd,index=0` is the SD card, `index=1` an SDIO slot and
   `index=2` an eMMC.
 
@@ -494,14 +498,36 @@ Most of the time on the G2 and the RV1103B is their SDIO Wi-Fi driver
 
 Messages that are expected, because the hardware isn't modelled:
 
-- the XM app reporting an unknown product. It reads its hardware ID from
-  the flash's OTP area, which no dump contains, then segfaults, so its TCP
-  servers never come up. The network itself works: with `-nic user`, the
-  R5 sets 192.168.1.10, answers ARP, and resets connections to closed
-  ports.
+- the XM app reporting an unknown product, when the dump has no hardware
+  ID block (below). The network itself works: with `-nic user`, the R5
+  sets 192.168.1.10, answers ARP, and resets connections to closed ports.
 - the G2's ISP: "wait thunderboot over timeout"
+- on the G2, mpp's "nobit" and `Yuv_getChnFrame` timeouts: the
+  thunder-boot capture of its two sensors isn't modelled
 - the G2's empty `mtd` partition (all zeros in the dump) failing to mount
   as JFFS2
+
+### Hardware ID
+
+XM's LibCrypto reads a 1 KiB hardware ID block (magic `D2 D4`) from the
+NOR 1 KiB below the environment it uses. On the Rockchip NOR dumps that
+environment is at 0xA0000, so the block is at 0x9FC00, not just below
+the U-Boot environment at flash 0. A dump without one makes the App
+report an unknown product and stop. A block from another camera works
+once its product ID is patched to the dump's model: the App then prints
+`ID(Encr): 0x0241(IPC_LPG-R4C-WEQ)` on the G2.
+
+### Reset button
+
+The G2's App reads its reset button on GPIO4_C0 (`"ResetGpio": [4, 16]`
+in `/usr/jsons/LIBXMDVR.json`, XMFV-encoded). The button pulls the pin
+low, and the model's undriven input reads 0, so the App sees a held
+button. About 10 s into its Wi-Fi wait it reboots ("LowPower reset key
+reboot"). `gpio-high=4C0` releases it, and the App then keeps running:
+
+```
+qemu-system-arm -M rv1106,flash-file=g2.bin,gpio-high=4C0 -nographic -nic user
+```
 
 ## USB gadget (`usb-otg=device`)
 
@@ -719,8 +745,9 @@ RV1103 / RV1106:
   `rx-tone-hz` test tone).
 - **RISC-V MCU:** the SPL loads its firmware to `0xFF6FF000` and starts
   it; only its final mailbox message is stood in for.
-- **XM firmware:** XM's App on the G2 dump needs the `HWID` U-Boot
-  variable that the dump lacks (see Xiongmai firmware).
+- **XM firmware:** the G2's thunder-boot capture: its two sensors
+  deliver no frames to the App, and its SDIO Wi-Fi co-processor
+  (`hichannel`) isn't there.
 
 RV1109 / RV1126:
 
