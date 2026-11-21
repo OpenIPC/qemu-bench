@@ -18,17 +18,24 @@ only.
 """
 import argparse, os, secrets, socket, sys, threading, time
 import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEV = "/onvif/device_service"
 EVT = "/onvif/event_service"
+WSNT = "http://docs.oasis-open.org/wsn/b-2"
+
+MAX_BODY = 1 << 20      # a Notify is a few KiB; nothing legitimate nears this
+READ_TIMEOUT_S = 5.0    # a stalled sender must not pin a handler thread
 
 
-def opener_for(host, user, password):
+def opener_for(host, port, user, password):
     handlers = [urllib.request.ProxyHandler({})]  # lab LAN: never via a proxy
     if user:
         mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        mgr.add_password(None, f"http://{host}/", user, password)
+        # Scope the credential to the exact authority soap() requests, port
+        # included, or Digest lookup misses when --port is not 80.
+        mgr.add_password(None, f"http://{host}:{port}/", user, password)
         handlers.append(urllib.request.HTTPDigestAuthHandler(mgr))
     return urllib.request.build_opener(*handlers)
 
@@ -73,15 +80,33 @@ def main():
     path = "/notify/" + secrets.token_urlsafe(12)
 
     class H(BaseHTTPRequestHandler):
-        def do_POST(self):
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            data = self.rfile.read(n) if n else b""
-            if self.client_address[0] == dut_ip and self.path == path:
-                with lock:
-                    bodies.append(data)
-            self.send_response(202)
+        timeout = READ_TIMEOUT_S
+
+        def _reply(self, code):
+            self.send_response(code)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def do_POST(self):
+            # The listener binds a reachable interface, so trust nothing:
+            # reject an unexpected sender or path before reading the body,
+            # and cap the length, so a stranger cannot pin a handler thread.
+            if self.client_address[0] != dut_ip or self.path != path:
+                self._reply(404)
+                return
+            try:
+                n = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                n = -1
+            if n < 0 or n > MAX_BODY:
+                self._reply(413 if n > MAX_BODY else 411)
+                return
+            data = self.rfile.read(n) if n else b""
+            if len(data) != n:
+                return  # sender went away mid-body
+            with lock:
+                bodies.append(data)
+            self._reply(202)
 
         def log_message(self, *_):
             pass
@@ -93,7 +118,7 @@ def main():
     consumer = f"http://{host_ip}:{srv.server_port}{path}"
     print(f"consumer listening at {consumer}", file=sys.stderr)
 
-    opener = opener_for(a.host, a.user, a.password)
+    opener = opener_for(a.host, a.port, a.user, a.password)
     sub_body = (
         "<wsnt:Subscribe><wsnt:ConsumerReference>"
         f"<wsa:Address>{consumer}</wsa:Address>"
@@ -120,11 +145,17 @@ def main():
             open(os.path.join(a.out, f"notify-{i:03d}.xml"), "wb").write(b)
         print(f"bodies written to {a.out}")
     for i, b in enumerate(caught):
-        t = b.decode(errors="replace")
-        n = t.count("NotificationMessage")
-        changed = "Changed" in t
-        print(f"  POST {i}: {n} NotificationMessage(s)"
-              f"{'  [has Changed]' if changed else ''}")
+        try:
+            root = ET.fromstring(b)
+            msgs = root.iter(f"{{{WSNT}}}NotificationMessage")
+            n = sum(1 for _ in msgs)
+            changed = any(
+                m.get("PropertyOperation") == "Changed"
+                for m in root.iter("{http://www.onvif.org/ver10/schema}Message"))
+        except ET.ParseError:
+            n, changed = -1, False
+        label = f"{n} NotificationMessage(s)" if n >= 0 else "unparseable body"
+        print(f"  POST {i}: {label}{'  [has Changed]' if changed else ''}")
 
 
 if __name__ == "__main__":

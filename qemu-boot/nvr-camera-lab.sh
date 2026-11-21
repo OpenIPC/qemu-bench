@@ -95,18 +95,22 @@ DNSMASQ=$!
     > "$WORK/nvr-qemu.log" 2>&1 &
 NVR=$!
 
+# The camera's disk arguments vary (full image vs split kernel+rootfs) and may
+# hold spaces, so pass them as positional parameters rather than splitting an
+# unquoted string.
+cam_boot() {
+    "$QEMU" "$@" -icount shift=0 -nographic -monitor none \
+        -serial "unix:$WORK/cam.sock,server=on,wait=off" \
+        -qmp "unix:$WORK/cam-qmp.sock,server=on,wait=off" \
+        -nic tap,ifname=tap1,script=no,downscript=no,mac=52:54:00:12:34:57 \
+        > "$WORK/cam-qemu.log" 2>&1 &
+}
 if [ -n "$CAM_FLASH" ]; then
-    CAM_DISK="-M $CAM_MACHINE,flash-file=$WORK/cam-flash.bin"
+    cam_boot -M "$CAM_MACHINE,flash-file=$WORK/cam-flash.bin"
 else
-    CAM_DISK="-M $CAM_MACHINE -kernel $CAM_KERNEL -initrd $CAM_ROOTFS \
-        -append console=ttyAMA0,115200 mem=32M mmz_allocator=hisi root=/dev/ram0 rootfstype=squashfs"
+    cam_boot -M "$CAM_MACHINE" -kernel "$CAM_KERNEL" -initrd "$CAM_ROOTFS" \
+        -append "console=ttyAMA0,115200 mem=32M mmz_allocator=hisi root=/dev/ram0 rootfstype=squashfs"
 fi
-# shellcheck disable=SC2086
-"$QEMU" $CAM_DISK -icount shift=0 -nographic -monitor none \
-    -serial "unix:$WORK/cam.sock,server=on,wait=off" \
-    -qmp "unix:$WORK/cam-qmp.sock,server=on,wait=off" \
-    -nic tap,ifname=tap1,script=no,downscript=no,mac=52:54:00:12:34:57 \
-    > "$WORK/cam-qemu.log" 2>&1 &
 CAM=$!
 
 cleanup() { kill "$NVR" "$CAM" "$DNSMASQ" 2>/dev/null || true; }
@@ -127,4 +131,6 @@ cat <<EOF
   Dropping you into a shell inside the lab namespace. Exit it to tear down.
 EOF
 
-exec "${SHELL:-/bin/sh}"
+# Run the shell as a child, not exec, so control returns here and the EXIT
+# trap tears the guests and dnsmasq down when the shell is left.
+"${SHELL:-/bin/sh}"
