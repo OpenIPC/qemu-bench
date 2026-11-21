@@ -270,12 +270,27 @@ What differs:
   the PL330, at `0x20740000` (16 logical and 8 physical channels). It runs
   the driver's linked lists: memory-to-memory blocks at `mem-rate`
   bytes/µs, and blocks to or from a peripheral at `dev-rate` bytes/s
-  (default 192000, 48 kHz stereo audio). The pacing stands in for the
-  requests of a peripheral that isn't modelled, so cyclic audio buffers
-  don't spin. Each block writes its position back into the command entry,
-  which is where the driver reads the residue.
-- **SAI:** at `0x20660000`, registers only: version 0x24031103, `STATUS`
-  idle and `CLR` self-clearing. The sound card registers; no samples move.
+  (default 192000, 48 kHz stereo audio), so cyclic audio buffers don't
+  spin. Blocks to or from the SAI run at the SAI's own rate instead: the
+  peripheral is the side whose address doesn't increment. Each block
+  writes its position back into the command entry, which is where the
+  driver reads the residue.
+- **SAI** (`rk-sai`, `0x20660000`): version 0x24031103, `STATUS` idle,
+  `CLR` self-clearing.
+  - Its frame rate is mclk / MDIV (CKR 14:3) / FW (FSCR 11:0). The mclk
+    is the TOPCRU's `mclk_sai_src`: `CLKSEL_CON(35)` 11:10 picks GPLL /
+    (`CON(20)` 4:0 + 1), that times the `CON(21)` fraction, or 12 MHz.
+  - The DMA's byte rate is that times the channels (SNB × CSR) times
+    2 bytes a sample (S16; 1 for S8, 4 above). The XM App captures 8 kHz
+    stereo: mclk 2.048 MHz, MDIV 4, FW 64, 32000 B/s. The fixed 192000
+    had run it six times fast.
+  - Up to 16 bits, two samples share a FIFO word, low half first. The
+    32-bit DMA moves the words into the S16 buffer as they are.
+  - `-global rk-sai.rx-file=mic.wav` (16-bit PCM, looped; a mono file
+    feeds every channel) is what the camera records. `-global
+    rk-sai.tx-file=spk.wav` saves playback at the stream's rate and
+    channels; the header is kept current every 100 ms and when playback
+    stops. Without them, capture is silence.
 - **OTP:** at `0x20820000`. It answers the same way as the RV1106's OTP.
 - **Camera:** ISP V33 ("rockchip,rv1103b-rkisp", `0x20D00000`, SPI 60 /
   59 / 58), VICAP (`0x20D10000`, SPI 57) and RGA2 (`0x20640000`, SPI 48).

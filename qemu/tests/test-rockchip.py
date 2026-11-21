@@ -1532,6 +1532,73 @@ def test_rk_dmac(qt):
     check(qt.readl(D + 0x18) == 0, 'rk-dmac: IS write-1-to-clear')
 
 
+def test_sai_files(qemu, path):
+    # RV1103B SAI at 8 kHz stereo S16 from the CRU (mclk 2.048 MHz:
+    # GPLL 1188 MHz x 64 / 37125, MDIV 4, FW 64): its DMA rate, packed
+    # capture words from rx-file, playback into tx-file, and an RKDMA
+    # capture block paced at the SAI's rate
+    tmp = tempfile.mkdtemp()
+    rx, tx = os.path.join(tmp, 'rx.wav'), os.path.join(tmp, 'tx.wav')
+    pcm = b''.join(struct.pack('<hh', 100 * i, -100 * i) for i in range(64))
+    with open(rx, 'wb') as f:
+        f.write(b'RIFF' + struct.pack('<I', 36 + len(pcm)) + b'WAVEfmt ' +
+                struct.pack('<IHHIIHH', 16, 1, 2, 8000, 32000, 4, 16) +
+                b'data' + struct.pack('<I', len(pcm)) + pcm)
+    qt = QTest(qemu, 'rv1103b,flash-file=' + path,
+               ('-global', 'rk-sai.rx-file=' + rx,
+                '-global', 'rk-sai.tx-file=' + tx))
+    try:
+        cru, sai = 0x20000000, 0x20660000
+        qt.writel(cru + 0x60300 + 20 * 4, 0x001f0000)       # src = GPLL
+        qt.writel(cru + 0x60300 + 21 * 4, 64 << 16 | 37125)  # the fraction
+        qt.writel(cru + 0x60300 + 35 * 4, 0x0c000400)       # mclk: frac
+        qt.writel(sai + 0x18, 3 << 3)                       # CKR MDIV 4
+        qt.writel(sai + 0x04, 63)                           # FSCR FW 64
+        qt.writel(sai + 0x08, 15 | 1 << 11)                 # RX S16, 2 ch
+        qt.writel(sai + 0x00, 15 | 1 << 11)                 # TX the same
+        words = [qt.readl(sai + 0x34) for _ in range(3)]
+        want = [(100 * i & 0xffff) | (-100 * i & 0xffff) << 16
+                for i in range(3)]
+        check(words == want, 'SAI RXDR: S16 stereo frames, packed (%s)'
+              % ['%08x' % w for w in words])
+        qt.writel(sai + 0x10, 1 << 2)                       # XFER TXS
+        for i in range(4):
+            qt.writel(sai + 0x30, (i & 0xffff) | (-i & 0xffff) << 16)
+        qt.writel(sai + 0x10, 0)                            # stop: synced
+        # an RKDMA capture block from RXDR: 3200 bytes at 32000 B/s
+        D, cmd, lli, dst = 0x20740000, 0x300000, 0x300040, 0x320000
+        qt.writel(sai + 0x10, 0)
+        qt.writel(sai + 0x10, 1 << 3)                       # XFER RXS
+        qt.write(cmd, struct.pack('<16I', *([0] * 5 + [lli] + [0] * 10)))
+        qt.write(lli, struct.pack('<16I', 1 | 2 | 8,
+                                  2 << 2 | 1 << 16 | 2 << 18,
+                                  sai + 0x34, dst, 3200, 0, 0, 2 << 8,
+                                  *[0] * 8))
+        qt.writel(D + 0x04, 0x00050005)
+        L = D + 0x40 + 2 * 0x40
+        qt.writel(L + 0x00, 0x00010001)
+        qt.writel(L + 0x18, 1)
+        qt.writel(L + 0x08, cmd)
+        qt.writel(L + 0x0c, 0x00010001)
+        qt.cmd('clock_step 90000000')                       # 90 ms
+        early = qt.readl(L + 0x14) & 1
+        qt.cmd('clock_step 20000000')                       # 110 ms
+        check(not early and qt.readl(L + 0x14) & 1,
+              'RKDMA from the SAI: 3200 bytes take 100 ms at 32000 B/s')
+        frames = struct.unpack('<4h', qt.read(dst, 8))
+        check(frames == (0, 0, 100, -100),
+              'RKDMA from the SAI: the file\'s frames in memory %s'
+              % (frames,))
+    finally:
+        qt.close()
+    w = open(tx, 'rb').read() if os.path.exists(tx) else b''
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok = (len(w) >= 44 + 16 and struct.unpack('<HI', w[22:28]) == (2, 8000)
+          and struct.unpack('<8h', w[44:60]) ==
+          (0, 0, 1, -1, 2, -2, 3, -3))
+    check(ok, 'SAI tx-file: 8 kHz stereo WAV, the words unpacked')
+
+
 def fdt(tree):
     """A flattened devicetree from {name: value | {subnodes}}: enough for a
     FIT's /images (strings and u32s)."""
@@ -1968,6 +2035,7 @@ def main():
     test_rv1103b(args.qemu, path)
     test_pwm_output(args.qemu, path)
     test_sd_write(args.qemu, path)
+    test_sai_files(args.qemu, path)
     test_rv1109(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)

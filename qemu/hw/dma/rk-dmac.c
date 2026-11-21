@@ -35,7 +35,10 @@
  * blocks at "mem-rate" bytes per microsecond, blocks to or from a
  * peripheral at "dev-rate" bytes per second -- the request pacing of a
  * peripheral that is not modelled (default 192000: 48 kHz stereo 16-bit
- * audio), without which a cyclic audio buffer would spin.
+ * audio), without which a cyclic audio buffer would spin.  A peripheral
+ * that knows its own rate is linked as "pace": a block whose fixed
+ * address lies in [pace-base, pace-base + pace-size) moves at its
+ * "tx-byte-rate" (to it) or "rx-byte-rate" (from it) -- the SAI's.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -108,6 +111,8 @@ struct RkDmacState {
     uint32_t pch[NPCH][GRP / 4];
     uint32_t mem_rate;      /* bytes per microsecond */
     uint32_t dev_rate;      /* bytes per second */
+    Object *pace;           /* link: a peripheral with its own rates */
+    uint64_t pace_base, pace_size;
 };
 
 static void rk_dmac_update_irq(RkDmacState *s)
@@ -190,7 +195,21 @@ static void rk_dmac_run(RkDmacState *s, RkDmacChan *c)
     len = rk_dmac_block(s, c, d);
     dev = (d[7] >> 8) & 3;
     if (dev) {
-        ns = len * NANOSECONDS_PER_SECOND / MAX(s->dev_rate, 1);
+        uint64_t rate = s->dev_rate;
+        /* the peripheral is the side whose address does not move */
+        bool to_dev = d[1] & CTL1_ARINCR;
+        uint32_t fixed = to_dev ? d[3] : d[2];
+
+        if (s->pace && fixed >= s->pace_base &&
+            fixed < s->pace_base + s->pace_size) {
+            uint64_t r = object_property_get_uint(s->pace, to_dev ?
+                                                  "tx-byte-rate" :
+                                                  "rx-byte-rate", NULL);
+            if (r) {
+                rate = r;
+            }
+        }
+        ns = len * NANOSECONDS_PER_SECOND / MAX(rate, 1);
     } else {
         ns = len * 1000 / MAX(s->mem_rate, 1);
     }
@@ -373,6 +392,9 @@ static void rk_dmac_init(Object *obj)
 static const Property rk_dmac_properties[] = {
     DEFINE_PROP_UINT32("mem-rate", RkDmacState, mem_rate, 400),
     DEFINE_PROP_UINT32("dev-rate", RkDmacState, dev_rate, 192000),
+    DEFINE_PROP_LINK("pace", RkDmacState, pace, TYPE_OBJECT, Object *),
+    DEFINE_PROP_UINT64("pace-base", RkDmacState, pace_base, 0),
+    DEFINE_PROP_UINT64("pace-size", RkDmacState, pace_size, 0),
 };
 
 static const VMStateDescription rk_dmac_chan_vmstate = {

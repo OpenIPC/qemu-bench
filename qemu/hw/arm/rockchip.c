@@ -144,16 +144,6 @@ static const uint32_t rv1106_tsadc_const[] = {
     0x2c, 530,
 };
 
-/*
- * SAI (sound/soc/rockchip/rockchip_sai.c), version 0x24031103 -- "2403"
- * for the RV1103B.  The driver waits for CLR (0x14) to self-clear and
- * for STATUS (0x6c) to report the frame sync and both FIFOs idle.  No
- * samples move: the registers only, so the sound card comes up.
- */
-static const uint32_t rk_sai_const[] = {
-    0x14, 0, 0x6c, 0xf, 0x70, 0x24031103,
-};
-
 static const uint32_t rv1106_otp_status[] = {
     0x0304, 0xffff, 0x8304, 0xffff,
 };
@@ -1550,7 +1540,7 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c);
 
 static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
 {
-    DeviceState *dev, *gpio[5] = { NULL };
+    DeviceState *dev, *gpio[5] = { NULL }, *sai;
     SysBusDevice *sbd;
     I2CBus *sensor_bus = NULL, *bus[5] = { NULL };
     int i;
@@ -1653,17 +1643,25 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
     if (c->dmac_base) {
         rk_create_pl330(s, c);
     }
+    sai = NULL;
     if (c->sai_base) {
-        dev = qdev_new("rk-syscon");
-        qdev_prop_set_uint32(dev, "size", 0x1000);
-        qdev_prop_set_bit(dev, "hiword", false);
-        rk_prop_list(dev, "const", rk_sai_const, ARRAY_SIZE(rk_sai_const));
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->sai_base);
+        /* its samples move through the RKDMA, at its own rate */
+        sai = qdev_new("rk-sai");
+        qdev_prop_set_uint64(sai, "cru-base", c->cru_base);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sai), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sai), 0, c->sai_base);
     }
     if (c->rkdma_base) {
-        sysbus_create_simple("rk-dmac", c->rkdma_base,
-                             rk_irq(s, c->rkdma_irq));
+        dev = qdev_new("rk-dmac");
+        if (sai) {
+            object_property_set_link(OBJECT(dev), "pace", OBJECT(sai),
+                                     &error_fatal);
+            qdev_prop_set_uint64(dev, "pace-base", c->sai_base);
+            qdev_prop_set_uint64(dev, "pace-size", 0x1000);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->rkdma_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, rk_irq(s, c->rkdma_irq));
     }
     if (c->mbox_base) {
         /*
