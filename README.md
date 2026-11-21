@@ -29,7 +29,7 @@ Builds three QEMU targets:
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (141 total)
+## Supported Machines (142 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -147,6 +147,7 @@ modelled yet.
 | `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm232` | ARMv7 (A9 stand-in), UP | GIC | 3.10.103 vendor | partial⁵ |
 | `xm8536e` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 | `xm8520d` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 | `xm8521dv200` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
@@ -194,6 +195,12 @@ with `-M xm550,flash-file=dump.bin -smp 2`. Dumps of XM530V200, XM533 and
 XM535 cameras boot the same way on `xm530v200` (`-smp 2`), `xm533` and
 `xm535`, through their vendor U-Boot and kernel to Sofia. Their kernels
 print only with `xmuart=0` in the saved U-Boot environment.
+
+⁵ `xm232`: an XM232 camera dump (X6S-WEQ-H) boots its vendor U-Boot,
+kernel, media modules, Sofia and its ATBM6132CU Wi-Fi + BLE (`atbm-wifi`
+with `chip-version=0x30`), but its VI / ISP and HEVC blocks are not
+modelled yet, and Sofia restarts the camera shortly after start-up. See
+[docs/xiongmai.md](docs/xiongmai.md#xm232).
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,
@@ -745,7 +752,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 141 machines build and register. Every machine marked "yes" above boots
+All 142 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.

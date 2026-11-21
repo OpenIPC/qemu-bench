@@ -235,9 +235,11 @@ U-Boots and kernels:
 
   Sofia comes up, finds no sensor or Wi-Fi card, and after a while reboots
   the camera itself (`xmsfc_shutdown`, `Restarting system.`). The machine
-  reset brings it back through U-Boot. XM210, XM212 and XM232 dumps from the
-  same issue are RISC-V parts (`auipc gp` / `csrw mtvec` at flash offset 0)
-  and are out of scope for `qemu-system-arm`.
+  reset brings it back through U-Boot. The XM210 dump from the same issue
+  is a RISC-V part (`auipc gp` / `csrw mtvec` at flash offset 0) and out of
+  scope for `qemu-system-arm`; XM212's has not been looked at. XM232 is ARM
+  ([XM232](#xm232)): it was first taken for RISC-V with XM210, but its
+  flash 0 holds a header, not code.
 
 ### Video (xm-isp2, xm-hevc, xm-osd, xm-nn)
 
@@ -511,8 +513,76 @@ whose release has no ATBM driver: there it checks that `dwc_otg` and
 `--wlandev` on an image that has a profile (firmware#2316).
 
 Not modelled: WPA3-SAE and 802.1X (the guests' `wpa_supplicant` has
-neither; see `docs/ingenic.md`); XM535D2's `6132cu.ko` and XM533's SDIO
-SSV6158.
+neither; see `docs/ingenic.md`) and XM533's SDIO SSV6158. The ATBM6132CU
+(XM232's `atbm6132c.ko`, XM535D2's `6132cu.ko`) takes `chip-version=0x30`;
+see [XM232](#xm232).
+
+## XM232
+
+Read from an X6S-WEQ-H dump (V5.03.C01, 2026; U-Boot `CPU: XM232W1`,
+kernel `mach-xm232`):
+
+```sh
+qemu-system-arm -M xm232,flash-file=dump.bin -nographic \
+    -netdev user,id=w,net=192.168.50.0/24 \
+    -device atbm-wifi,bus=usb-bus.0,port=1,netdev=w,chip-version=0x30
+```
+
+The second-generation map (U-Boot 2014.04 at the flash window, uMCTL2,
+latching SP804, UARTs, GMAC, SFC v2), with these differences:
+  - **Boot.** Flash 0 is a 32-byte header (two signature words, then
+    zeros). The vector table is at +0x20 and its literals point into
+    0x600001xx, so U-Boot is linked with the header in front and the boot
+    ROM enters at window + 0x20 (`flash_entry`). Entered at the window the
+    CPU runs the header and branches to 0x60b8d908, which is what made the
+    part look like a non-ARM one at first.
+  - **Flash layout.** No kernel partition: the uImage is `/boot/uImage` in
+    the romfs cramfs, loaded with `cramfsload`.
+    `mtdparts=xm_sfc:0x40000(boot),0x2A0000(romfs),0x410000(usr),0x40000(custom),0x80000(music),0x50000(mtd)`.
+    The environment (64 KiB at 0x30000, CRC32 first) has `xmuart=1`;
+    `qemu-boot/uboot-env.py` cannot read this U-Boot (it expects one
+    LZMA-packed), so set `xmuart=0` by rewriting the block and its CRC.
+  - **64 MB** (`MEM_ALL=64` in the loader script; `mem=33M`). The kernel is
+    uniprocessor.
+  - **Interrupts** (Linux number - 32 = SPI), from each module's
+    `request_irq()` and platform resources: `sdio0_sd.ko` 51,
+    `xm_usb0.ko`'s DWC2 at **0x50200000**, IRQ 55 (not 0x50300000 / 76),
+    `i2s.ko` 45 / 46, `xm_wdt.ko` 48, `dma.ko` 47 (its own engine at
+    0x20020000, not a PL330), `hevc.ko` 56. The UART, GMAC and timer lines
+    are XM530's.
+  - **Media.** `isp.ko` calls itself `XM210V200_ISP`; VI is `vi_mu.ko`
+    (`xm232_vi.c`, up to two sensors online, mode 3 here), `vi_bpu.ko` and
+    `vpss_bpu.ko`, all in a 64 MiB window at 0x30000000 (IRQs 64, 85, 86, 88,
+    89, 90). `hevc.ko` maps 0x21000000, 0x21010000, 0x21100000, 0x21F00000
+    and 0x30071080. There is no hx280enc, JPEG engine or NN. None of this is
+    modelled yet (`xm-isp2` and `xm-hevc` are off on this machine); the
+    modules load and Sofia starts without frames. Isp.json names two SC2336
+    on `xm_i2c` bus 0 (0x30, 0x32), which the machine provides.
+  - **Wi-Fi + BLE: ATBM6132CU** ("OCEANUS"), `atbm6132c.ko` (also
+    XM535D2's `6132cu.ko`), on the USB core. With `chip-version=0x30`
+    `atbm-wifi` speaks its dialect:
+    - 0x30 is the only chip version this driver has firmware for (chip type
+      17, `firmware_usb_wifi_bt_comb_ocea.h`); any other hits `BUG()` in the
+      loader ("can't find firmware.h").
+    - Its startup check wants `CAPABILITIES_BLE` (0x2000 in firmwareCap)
+      and `CAPABILITIES_VIFADDR_LOCAL_BIT` (bit 18, in firmwareCap2 after
+      Config[3]), read from the driver's capability table.
+    - Its command header is 32 bytes, not 12: length at +0, a checksum at
+      +7, the WSM len / id at +28, the body at +32.
+    - HCI goes out as WSM id 0x09c0, H4 type first, and takes no WSM
+      confirm (one throws the driver's buffer count off). The model
+      completes each command with an HCI Command Complete, sent as id 0x903
+      with the H4 type byte (0x04) first; `ble_app` (NimBLE) syncs and
+      starts its smart-config advertising. Nothing goes on air.
+
+    The driver comes up as `eth3` and scans. Without the dongle (or with
+    another chip version) `wlandaemon` finds no card, reloads the driver
+    and reboots the camera.
+
+**Open.** About 45 s into a boot Sofia restarts the camera
+(`xmsfc_shutdown`, `Restarting system.`) without logging why; the console
+login gives no shell to look. The VI / ISP / VPSS and HEVC blocks need
+models of their own before Sofia can stream.
 
 ## DVRs and NVRs (XM8536E / XM8520D / XM8521DV200)
 
