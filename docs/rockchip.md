@@ -327,7 +327,7 @@ vendor table accepts the Macronix ID), `w25q256` for 32 MiB.
 | `0xFFA80000` | GMAC (dwmac-4.20a) | `axera-eqos` | integrated PHY 0044.1400 at MDIO 2 |
 | `0xFFAC0000` | SFC | `rk-sfc` | IRQ 53 |
 | `0xFFA00000` | ISP32 | `rk-isp32` | SPIs 105 / 104 / 103 (ISP, MI, MIPI); a scene lit by the sensor's exposure (`sensor` link), NV12 into the mainpath / bypass buffers; AE means and histograms of that scene, to registers and to the DDR stats buffer |
-| `0xFFA10000` | VICAP | `rk-vicap` | SPI 106; the to-ISP frame start / end interrupts (`GLB_INTST` bits 14 / 20) when the ISP's frames run; `toisp-on` gates them |
+| `0xFFA10000` | VICAP | `rk-vicap` | SPI 106; the to-ISP frame start / end interrupts (`GLB_INTST` bits 14 / 20) when the ISP's frames run; `toisp-on` gates them; MIPI ID0 DMA capture frame interrupts (`INTSTAT` +0x78) |
 | `0xFFA50000` | VEPU540C | `rk-vepu540c` | SPI 107; H.265 through the shared `hevc-enc.c`, under the HAL's own VPS/SPS/PPS; JPEG scan + EOI through `jpeg-enc.c` with the HAL header's DQT, on the thread pool; H.264 I and P pictures through `hantro-h264.c` under the HAL's SPS/PPS |
 | `0xFFB00000` | USB OTG (DWC3) | QEMU's `usb_dwc3`, or `rk-dwc3` with `usb-otg=device` | SPI 54; host: a host-only core (the driver runs it as host whatever `dr_mode` says), its xHCI at the base, `-device usb-*,bus=usb-bus.0`; device: see USB gadget |
 | `0xFF350000`, `0xFF360000`, `0xFF490000` | PWM v2 ×3 (four channels each) | `rk-pwm` | SPIs 31 / 33 / 35; counters at 24 MHz, one-shot interrupts |
@@ -721,11 +721,19 @@ bash qemu-boot/test-rv1106-boot.sh --openipc img/
 
 RV1103 / RV1106:
 
-- **Capture front end:** VICAP (rkcif, `0xFFA10000`) only raises its
-  to-ISP frame start / end interrupts: no DMA capture to memory
-  (readback or raw dumps), and no MIPI interrupts. The CSI-2 host and
-  D-PHY are storage. The ISP renders the sensor's scene itself, at the
-  sensor's exposure.
+- **Capture front end:** VICAP (rkcif, `0xFFA10000`) raises its to-ISP
+  frame start / end interrupts. Its two MIPI hosts' ID0 DMA capture
+  (0x100 and 0x300) runs at 30 fps with frame start / end interrupts,
+  ping-pong between the two buffers, but writes no pixels. The ISP
+  renders the sensor's scene itself, at the sensor's exposure. The
+  CSI-2 host and D-PHY are storage.
+- **Multi-sensor read-back:** a CSI2RX_CTRL0 write with bit 0 set
+  runs one ISP32 pass over the frame in memory, with the mainpath, BP
+  and statistics written. The G2's XM kernel asks VICAP for online
+  capture with two sensors, which it can't run, so the G2 App gets no
+  frames. `video_rkisp.rdbk_auto=1` forces read-back, and one frame
+  then gets through. rkaiq then waits on the MCU's thunder-boot result,
+  which isn't modelled.
 - **ISP processing:** the ISP's white balance and tone settings aren't
   applied (fixed gamma, neutral light). Only the colour processing is:
   CPROC at `0x800` (contrast, brightness, saturation, hue), when the IQ

@@ -524,13 +524,74 @@ static void rk_isp32_readback_tick(RkIsp32State *s)
     }
 }
 
+/* frame start: the configuration takes effect */
+static void rk_isp32_frame_begin(RkIsp32State *s, bool online)
+{
+    if (online) {
+        if (s->sensor) {
+            image_sensor_frame_start(s->sensor);
+        }
+        qemu_irq_pulse(s->vicap_fs);
+    }
+    rk_isp32_latch_mp(s);
+    rk_isp32_latch_bp(s);
+    s->stats_base = REG(s, R_MI_3A_BASE);
+    REG(s, R_ISP_RIS) |= ISP_V_START;
+    s->in_frame = true;
+}
+
+/* frame end: the picture lands in the latched buffers */
+static void rk_isp32_frame_end(RkIsp32State *s, bool online)
+{
+    uint32_t mi = 0;
+
+    rk_isp32_render(s);
+    rk_isp32_stats_ddr(s);
+    if (online) {
+        qemu_irq_pulse(s->vicap_fe);
+    }
+    if (REG(s, R_MI_CTRL_SHD) & MI_SHD_MP_OUT) {
+        rk_isp32_draw(s, REG(s, R_MP_Y_SHD), REG(s, R_MP_Y_SIZE),
+                      REG(s, R_MP_CB_SHD), REG(s, R_MP_CB_SIZE),
+                      REG(s, R_MP_LLENGTH));
+        mi |= MI_MP_FRAME;
+    }
+    if (REG(s, R_MI_CTRL2_SHD) & BP_EN_OUT_SHD) {
+        rk_isp32_draw(s, REG(s, R_BP_Y_SHD), REG(s, R_BP_Y_SIZE),
+                      REG(s, R_BP_CB_SHD), REG(s, R_BP_CB_SIZE),
+                      REG(s, R_BP_LLENGTH));
+        mi |= MI_BP_FRAME;
+    }
+    s->frame++;
+    rk_isp32_stats(s);
+    REG(s, R_ISP_RIS) |= ISP_FRAME_IN | ISP_FRAME;
+    REG(s, R_MI_RIS) |= mi;
+    s->in_frame = false;
+}
+
 static void rk_isp32_tick(void *opaque)
 {
     RkIsp32State *s = opaque;
-    uint32_t mi = 0;
 
     if (s->readback) {
         rk_isp32_readback_tick(s);
+        return;
+    }
+
+    if (s->passes) {
+        /* a read-back pass over the frame VICAP left in memory */
+        if (!s->in_frame) {
+            rk_isp32_frame_begin(s, false);
+            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      READBACK_NS / 2);
+        } else {
+            rk_isp32_frame_end(s, false);
+            s->passes = 0;
+            /* back to watching the online source */
+            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      2 * rk_isp32_half_frame(s));
+        }
+        rk_isp32_update(s);
         return;
     }
 
@@ -547,38 +608,9 @@ static void rk_isp32_tick(void *opaque)
         return;
     }
     if (!s->in_frame) {
-        /* frame start: the configuration takes effect */
-        if (s->sensor) {
-            image_sensor_frame_start(s->sensor);
-        }
-        qemu_irq_pulse(s->vicap_fs);
-        rk_isp32_latch_mp(s);
-        rk_isp32_latch_bp(s);
-        s->stats_base = REG(s, R_MI_3A_BASE);
-        REG(s, R_ISP_RIS) |= ISP_V_START;
-        s->in_frame = true;
+        rk_isp32_frame_begin(s, true);
     } else {
-        /* frame end: the picture lands in the latched buffers */
-        rk_isp32_render(s);
-        rk_isp32_stats_ddr(s);
-        qemu_irq_pulse(s->vicap_fe);
-        if (REG(s, R_MI_CTRL_SHD) & MI_SHD_MP_OUT) {
-            rk_isp32_draw(s, REG(s, R_MP_Y_SHD), REG(s, R_MP_Y_SIZE),
-                          REG(s, R_MP_CB_SHD), REG(s, R_MP_CB_SIZE),
-                          REG(s, R_MP_LLENGTH));
-            mi |= MI_MP_FRAME;
-        }
-        if (REG(s, R_MI_CTRL2_SHD) & BP_EN_OUT_SHD) {
-            rk_isp32_draw(s, REG(s, R_BP_Y_SHD), REG(s, R_BP_Y_SIZE),
-                          REG(s, R_BP_CB_SHD), REG(s, R_BP_CB_SIZE),
-                          REG(s, R_BP_LLENGTH));
-            mi |= MI_BP_FRAME;
-        }
-        s->frame++;
-        rk_isp32_stats(s);
-        REG(s, R_ISP_RIS) |= ISP_FRAME_IN | ISP_FRAME;
-        REG(s, R_MI_RIS) |= mi;
-        s->in_frame = false;
+        rk_isp32_frame_end(s, true);
     }
     rk_isp32_update(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -691,6 +723,18 @@ static void rk_isp32_write(void *opaque, hwaddr off, uint64_t val,
                 timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                           READBACK_NS / 2);
             }
+            return;
+        }
+        if (off == R_CSI2RX_CTRL0 && (val & 1) && !s->passes &&
+            !(s->source_gated && s->source_on)) {
+            /*
+             * Multi-sensor ISP32: VICAP wrote the raw frame to memory and
+             * the driver starts one pass over it (rkisp_trigger_read_back).
+             */
+            s->passes = 1;
+            s->in_frame = false;
+            timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      READBACK_NS / 2);
             return;
         }
         if (off == R_ISP_CTRL0 && (val & ISP_ENABLE) && !was_on) {
