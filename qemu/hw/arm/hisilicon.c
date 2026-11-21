@@ -4291,6 +4291,9 @@ static const HisiSoCConfig hi3536cv100_soc = {
     .gmac_base          = 0x100a0000,
     .gmac_irq           = 16,
     .gmac_desc_size     = 16,
+    /* NVR DTs (arch/arm/boot/dts/hi3536c*.dtsi) wire the PHY at
+     * mdio@100a03c0/ethernet-phy@2 — address 2, not the usual 1. */
+    .gmac_phy_addr      = 2,
 
     .num_i2c            = 1,
     .i2c_bases          = { 0x120c0000 },
@@ -6292,6 +6295,9 @@ static void hisilicon_common_init(MachineState *machine,
         }
         if (c->gmac_rx_offset) {
             qdev_prop_set_uint32(gmac, "rx-pkt-offset", c->gmac_rx_offset);
+        }
+        if (c->gmac_phy_addr) {
+            qdev_prop_set_uint8(gmac, "phy-addr", c->gmac_phy_addr);
         }
         SysBusDevice *busdev = SYS_BUS_DEVICE(gmac);
         sysbus_realize_and_unref(busdev, &error_fatal);

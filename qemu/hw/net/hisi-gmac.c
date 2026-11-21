@@ -201,6 +201,13 @@ struct HisiGmacState {
     /* Descriptor size in bytes (16 or 32; CONFIG_HIGMAC_DESC_4_WORD). */
     uint32_t desc_size_bytes;
 
+    /* MDIO address of the single emulated PHY.  Most HiSilicon dies strap it
+     * at 1, but some vendor device trees place it elsewhere — e.g. the
+     * hi3536cv100 NVR DTs (mdio@100a03c0/ethernet-phy@2) use address 2, and
+     * the kernel's higmacv300 never finds a PHY at 1 there, so no netdev
+     * comes up.  Configurable via "phy-addr". */
+    uint8_t phy_addr;
+
     /* Offset into each RX buffer at which the MAC DMAs the frame.  The newer
      * "gmac-v5" vendor driver (Hi3519DV500) allocates buffers at offset 0 and
      * skb_reserve(NET_IP_ALIGN) on RX, so it expects the frame 2 bytes in; the
@@ -256,7 +263,7 @@ static void hisi_gmac_mdio_exec(HisiGmacState *s)
     int phy_addr = (cmd >> BIT_PHY_ADDR_OFFSET) & 0x1F;
     int reg = cmd & 0x1F;
 
-    if (phy_addr != PHY_ADDR) {
+    if (phy_addr != s->phy_addr) {
         /* No chip at this address */
         s->mdio_data = 0xFFFF << 16;
         s->mdio_cmd &= ~MDIO_START;
@@ -723,6 +730,9 @@ static const Property hisi_gmac_properties[] = {
     /* RX DMA offset into each buffer (NET_IP_ALIGN).  0 for hi_gmac_v200,
      * 2 for the gmac-v5 driver (Hi3519DV500). */
     DEFINE_PROP_UINT32("rx-pkt-offset", HisiGmacState, rx_pkt_offset, 0),
+    /* MDIO address of the emulated PHY; strapped at 1 on most dies, 2 on the
+     * hi3536cv100 NVR device trees. */
+    DEFINE_PROP_UINT8("phy-addr", HisiGmacState, phy_addr, PHY_ADDR),
 };
 
 static void hisi_gmac_class_init(ObjectClass *klass, const void *data)

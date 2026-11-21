@@ -229,6 +229,9 @@ typedef struct HisiSoCConfig {
     /* RX DMA offset (NET_IP_ALIGN) the MAC writes each frame at.  0 (default)
      * for hi_gmac_v200; 2 for the gmac-v5 driver (Hi3519DV500/Hi3516DV500). */
     int             gmac_rx_offset;
+    /* MDIO address of the emulated PHY (0 = device default of 1).  Set to 2
+     * for hi3536cv100, whose NVR device trees place the PHY there. */
+    int             gmac_phy_addr;
 
     /* SD/MMC — himciv200 (older SoCs) */
     int             num_himci;
