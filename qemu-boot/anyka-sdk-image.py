@@ -7,7 +7,8 @@
 What the SDK's burn tool (tools/burntool, config_av100_<n>MB_spinor.txt)
 writes, at its offsets, into an 8 MiB image:
 
-    0x000000  UBOOT   u-boot.bin, its first 0x600 bytes the boot header
+    0x000000  UBOOT   u-boot.bin: the 0x200-byte boot header, 1 KiB of
+                      secure-boot space, then U-Boot at 0x600
     0x037000  ENV     tools/burntool/env_av100_<n>M_spinor.img
     0x038000  ENVBK   the same
     0x039000  DTB     image/<board>.dtb
@@ -18,8 +19,10 @@ writes, at its offsets, into an 8 MiB image:
 
 The burn tool also patches the boot header that U-Boot's vectors.S
 reserves (magic "ANYKAH3D" in the build, 0x200 bytes plus 1 KiB on the
-AV100, CONFIG_SYS_TEXT_BASE 0x80DFFA00 = load address - 0x600): magic
-"ANYKA322", the length the ROM copies, and the DDR register script from
+AV100, CONFIG_SYS_TEXT_BASE 0x80DFFA00): magic "ANYKA322", the load
+address and the length the ROM copies from flash 0x200 -- 0x80DFFC00 and
+from there on, secure-boot space included, as on the AK3918AV100N flash of
+owner report r-s9hgnp86 -- and the DDR register script from
 tools/burntool/SDK_CPU_DDR2.ini (<n>M_Ram_Param1 = 888/444 MHz, Param2 =
 860/430). The script is encoded the way the vendor's tool did on an
 AK3918EV300L camera's flash: {address, value} pairs, a poll marker
@@ -37,9 +40,10 @@ import struct
 import sys
 
 FLASH = 8 << 20
-HDR = 0x600                 # AV100: 0x200 header + 1 KiB (vectors.S)
+HDR = 0x200                 # the ROM copies from here, on the AV100 too
 SCRIPT, SPIP = 0x2C, 0x18C
-LOAD = 0x80E00000
+LOAD = 0x80E00000           # where U-Boot's own code starts (flash 0x600)
+ROM_LOAD = 0x80DFFC00       # where the ROM copies flash 0x200 to
 KERNEL = 0x49000
 
 POLL, OP, END = 0x66668881, 0x66668882, 0x88888888
@@ -106,6 +110,7 @@ def main():
     uboot[4:12] = b'ANYKA322'
     # What the ROM copies: everything up to the kernel partition.
     struct.pack_into('<I', uboot, 0x0C, KERNEL - HDR)
+    struct.pack_into('<I', uboot, 0x20, ROM_LOAD)
     script = ddr_script(os.path.join(burn, 'SDK_CPU_DDR2.ini'), a.ram,
                         1 if a.freq == 888 else 2)
     uboot[SCRIPT:SPIP] = bytes(SPIP - SCRIPT)

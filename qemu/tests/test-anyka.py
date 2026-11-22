@@ -647,20 +647,22 @@ def test_ev300l(qemu, path):
     finally:
         qt.close()
 def test_av100(qemu, tmp):
-    print('ak3918av100 / ak3918av100x: ANYKA322 0x600 header, eFuse')
-    # The AV100 ROM keeps 0x400 bytes for secure boot behind the 0x200
-    # header (pubkey 0x200, signature 0x300) and copies the payload from
-    # flash offset 0x600 to the load address.
+    print('ak3918av100 / ak3918av100x: ANYKA322 header, eFuse')
+    # The AV100 keeps 0x400 bytes for secure boot behind the 0x200 header
+    # (pubkey 0x200, signature 0x300). The ROM copies from flash 0x200, as
+    # on the other chips; the vendor's header covers the secure-boot space
+    # (load 0x80DFFC00), so U-Boot at 0x600 lands at 0x80E00000.
     code = [0xE1A00000, 0xEAFFFFFE]
     img = bytearray(b'\xFF' * (8 << 20))
     struct.pack_into('<I', img, 0, 0xEA00017E)
     img[4:12] = b'ANYKA322'
-    struct.pack_into('<I', img, 0x0C, 4 * len(code))
-    struct.pack_into('<I', img, 0x20, LOAD)
+    struct.pack_into('<I', img, 0x0C, 0x400 + 4 * len(code))
+    struct.pack_into('<I', img, 0x20, LOAD - 0x400)
     script = [DDRC + 0x14, 0x00423E71,
               0x66668881, DDRC + 0xA4, 0x10000,
               0x88888888, 0]
     struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x200:0x600] = bytes(0x400)    # unsigned: no key, no signature
     struct.pack_into('<%dI' % len(code), img, 0x600, *code)
     path = os.path.join(tmp, 'av100.bin')
     open(path, 'wb').write(img)
@@ -670,9 +672,11 @@ def test_av100(qemu, tmp):
         qt = QTest(qemu, '%s,flash-file=%s' % (machine, path))
         try:
             check('%s chip ID' % machine, qt.readl(SYSCTRL), chip)
-            check('%s: payload copied from flash 0x600' % machine,
+            check('%s: flash 0x600 at 0x80E00000' % machine,
                   qt.readl(LOAD), code[0])
-            check('%s: 0x600 header in front of U-Boot (TEXT_BASE)' % machine,
+            check('%s: secure-boot space copied in front of it' % machine,
+                  qt.readl(LOAD - 0x400), 0)
+            check('%s: header in front of that (TEXT_BASE)' % machine,
                   qt.readl(LOAD - 0x600 + 4), 0x4B594E41)
             # DDR size is the one difference between the two: the last word
             # of RAM holds a value, the word past it does not.
