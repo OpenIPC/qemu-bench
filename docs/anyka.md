@@ -110,15 +110,21 @@ The first 512 bytes of the NOR (U-Boot port `mkaksh.py`, and every dump):
 | `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` = three-word read-modify-write `{marker, register, mask}` (the AV130 dump clears bit 2 of DDRC `+0x24` with it), `0x66668882` = a ROM operation of one value; all skipped; `0x88888888` = end |
 | `+0x18C` | `SPIP` + the SPI NOR descriptor (JEDEC ID, size, page, erase size, partition-table block) |
 
-The AV100's `ANYKA322` payload does not follow the header at `+0x200` but at
-`+0x600`: `vectors.S` under `CONFIG_3918AV100_CODE` reserves `0x400` more
-bytes (secure boot keeps the public key at `+0x200` and the signature at
-`+0x300`; `tools/secureboot/ak_secureboot`), and the vendor U-Boot is linked
-at the load address `- 0x600` (`CONFIG_SYS_TEXT_BASE 0x80DFFA00`). The model
-copies an `ANYKA322` payload from flash `0x600`; the others still from
-`0x200`. (Signed images also write `0x84000000` at `+0x1C`; unsigned ones
-keep `6`.) `0x600` is inferred from the SDK -- no AV100 flash dump has been
-seen -- and matches what the OpenIPC U-Boot `ak3918av100` port emits.
+The AV100's ROM copies from `+0x200`, as the others' do. `vectors.S` under
+`CONFIG_3918AV100_CODE` reserves `0x400` bytes of secure-boot space behind
+the header (public key at `+0x200`, signature at `+0x300`;
+`tools/secureboot/ak_secureboot`), and the vendor's header covers it: load
+address `0x80DFFC00`, length from `+0x200`, so U-Boot at flash `0x600` lands
+at `0x80E00000` and the ROM enters through the zeroes (`andeq`); the vendor
+U-Boot is linked at `0x80DFFA00`, the header's address. That is the one AV100
+flash dump seen, owner report r-s9hgnp86 (AK3918AV100N, U-Boot
+2019.10.0-V4.0.21), the same as the AV130's below. The model used to copy an
+`ANYKA322` payload from `0x600`, inferred from the SDK before any dump: it left
+that dump's U-Boot `0x400` below where it runs (no output at all), and booted
+an OpenIPC header made to the same inference, load `0x80E00000` with the
+length from `0x600`, which on the chip puts U-Boot `0x400` too high and its
+last `0x400` bytes uncopied. (Signed images also write `0x84000000` at
+`+0x1C`; unsigned ones keep `6`.)
 
 The ROM replays the script (PLLs, DDR controller), copies the payload to the
 load address and enters it. The EV300L header has the EV300's fields (its

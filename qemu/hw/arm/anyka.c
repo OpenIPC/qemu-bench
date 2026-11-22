@@ -329,8 +329,7 @@ static void ak_machine_set_flash_jedec(Object *obj, Visitor *v,
  *
  *   +0x00  branch, for a ROM that enters at the header
  *   +0x04  magic: "AKSH_240" (EV200), "ANYKA_H3" (EV300), "ANYKAH3B" (EV330),
- *          "AK_H322L" / "AKH322LS" (EV300L), "ANYKA322" (AV100, inferred
- *          from ak_ddr_param's table)
+ *          "AK_H322L" / "AKH322LS" (EV300L), "ANYKA322" (AV100)
  *   +0x0C  length of what follows the header      +0x20  load address
  *   +0x2C  register script, {address, value} pairs, with markers in the
  *          address word: 0x66668888 = wait <value> (delay units),
@@ -406,20 +405,19 @@ static bool ak_boot_header_ok(const uint8_t *img, gsize len)
 }
 
 /*
- * The AV100's header is 0x600 bytes: vectors.S reserves 1 KiB more behind
- * the usual 0x200 (CONFIG_3918AV100_CODE) and U-Boot is linked at the load
- * address - 0x600 (CONFIG_SYS_TEXT_BASE 0x80DFFA00), so the payload the
- * ROM copies to the load address starts at flash offset 0x600.
+ * The AV100 is no exception: its ROM copies from flash 0x200 as the others'
+ * do. vectors.S reserves 1 KiB of secure-boot space behind the header
+ * (CONFIG_3918AV100_CODE), and the vendor's header covers it: load address
+ * 0x80DFFC00, length from 0x200, so U-Boot at flash 0x600 lands at
+ * 0x80E00000 and the ROM enters through the zeroes (andeq). That is the
+ * one AV100 dump seen, owner report r-s9hgnp86 (AK3918AV100N), as it is
+ * the AV130's; a model copying from 0x600 left that dump's U-Boot 0x400
+ * below where it runs, and booted a header the ROM would not.
  */
-static uint32_t ak_boot_header_len(const uint8_t *img)
-{
-    return !memcmp(img + 4, "ANYKA322", 8) ? 0x600 : AK_HDR_LEN;
-}
-
 static void ak_boot_rom_setup(const uint8_t *img, gsize len,
                               MachineState *machine, const char *path)
 {
-    uint32_t hlen = ak_boot_header_len(img);
+    uint32_t hlen = AK_HDR_LEN;
     uint32_t plen = ldl_le_p(img + 0x0C);
     uint32_t load = ldl_le_p(img + 0x20);
     GArray *rom = g_array_new(false, false, sizeof(uint32_t));
