@@ -99,7 +99,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 
 #define CPU_PLL_APPLY       (1u << 28)
 #define EFUSE_BUSY          (3u << 30)
+/*
+ * EV200 / EV330 CSI clocks (kernel ak39ev330_clk.c): the PCLK divider is
+ * bits 25:20, enabled by bit 28, the SCLK (sensor MCLK) divider bits 15:10,
+ * enabled by bit 18.  Bits 29 and 19 are their "divider valid" bits, which
+ * the hardware clears once the new divider runs.  AliOS Things on an
+ * AK3918EV201 sets bit 19 and waits for it to clear.
+ */
 #define PERI_PLL2_APPLY     (1u << 29)
+#define PERI_PLL2_SCLK_VLD  (1u << 19)
 /*
  * EV300L / AV100 clock block (U-Boot clk-ak3918ev300l.h): writes that
  * take effect when the clock settles, self-clearing.
@@ -480,7 +488,7 @@ static void ak_sysctrl_write(void *opaque, hwaddr offset, uint64_t val,
             s->regs[R_PERI_PLL2] = val & ~(1u << 9);
             return;
         }
-        s->regs[R_PERI_PLL2] = val & ~PERI_PLL2_APPLY;
+        s->regs[R_PERI_PLL2] = val & ~(PERI_PLL2_APPLY | PERI_PLL2_SCLK_VLD);
         return;
     case R_EFUSE_CTRL:
         /* A read of the (blank) fuses is over before the next access. */

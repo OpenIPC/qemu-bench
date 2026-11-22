@@ -31,10 +31,13 @@
 #   test-anyka-majestic.sh --soc ev200|ev300 [--firmware TGZ] [--uboot BIN]
 #                          [--kernel UIMAGE] [--majestic BIN] [--work DIR]
 #                          [--qemu Q] [--timeout SECONDS] [--keep]
-#                          [--codec h264|h265]
+#                          [--codec h264|h265] [--sensor NAME]
 #   --firmware  a local package in place of the nightly (the .tgz with the
 #               uImage and rootfs.squashfs); --kernel and --majestic replace
 #               the one file in it, to try a fix before it is released
+#   --sensor    another catalogue sensor in place of the machine's own
+#               (sensor=, e.g. gc1054 or sc2335 on EV200), to check that
+#               its driver and tuning bring up the stream
 #   --codec     the main stream's codec (h264 by default; h265 on EV300,
 #               whose Allegro core has HEVC, the EV200's 8290 has not)
 #   --timeout   seconds for the boot to reach the first frame, login prompt
@@ -58,6 +61,7 @@ WORK=
 TIMEOUT=600
 KEEP=
 CODEC=h264
+SENSOR=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -71,6 +75,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT=$2; shift ;;
     --keep) KEEP=1 ;;
     --codec) CODEC=$2; shift ;;
+    --sensor) SENSOR=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -180,7 +185,7 @@ CON=$WORK/console.log
 : > "$CON"
 # not restrict=on: on the Anyka machines it keeps the forwarded ports'
 # replies from coming back
-"$QEMU" -M "$CHIP,flash-file=$WORK/nor.bin" -display none \
+"$QEMU" -M "$CHIP,flash-file=$WORK/nor.bin${SENSOR:+,sensor=$SENSOR}" -display none \
     -serial file:"$CON" -monitor none \
     -nic user,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
     </dev/null 2>"$WORK/qemu.err" &
