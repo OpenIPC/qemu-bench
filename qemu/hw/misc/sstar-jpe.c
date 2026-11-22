@@ -21,6 +21,10 @@
  * The names are the Ifliegen SDK's (sgs_mi.ko's debug information,
  * hal_jpe_ios.c), whose JPE is this one.
  *
+ * Its addresses go through the MIU's MMU where the die has one
+ * (sstar_miu_page), a page at a time, a page with no entry skipped:
+ * infinity6c's buffers are MMA, VPA addresses.
+ *
  * Here a fired frame completes "done-us" later with a placeholder in the
  * output buffer: the end-of-image marker, no picture.  Everything else in
  * the bank is storage.
@@ -41,6 +45,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/misc/sstar-jpeg.h"
+#include "hw/misc/sstar-riu.h"
 #include "aw-vinc-logo.h"
 #include "hw/misc/sstar-pattern.h"
 #include "migration/vmstate.h"
@@ -240,11 +245,37 @@ static void sstar_jpe_update_irq(SstarJpeState *s)
                             INT_BITS));
 }
 
-static hwaddr jpe_dram(uint32_t miu16)
+/* memory as the engine sees it, through the MIU's MMU a page at a time */
+static MemTxResult jpe_mem(uint32_t miu16, void *buf, size_t len,
+                           bool write)
 {
-    hwaddr a = (hwaddr)miu16 << 4;
+    uint64_t a = (uint64_t)miu16 << 4;
+    uint8_t *p = buf;
+    MemTxResult r = MEMTX_OK;
 
-    return a < SS_DRAM_BASE ? SS_DRAM_BASE + a : a;
+    while (len) {
+        uint64_t m;
+        bool missed;
+        size_t n = sstar_miu_page(a, len, &m, &missed);
+        hwaddr pa = m < SS_DRAM_BASE ? SS_DRAM_BASE + m : m;
+
+        /* a page with no MMU entry: nothing is behind it on the bus */
+        if (missed) {
+            if (!write) {
+                memset(p, 0, n);
+            }
+            r |= MEMTX_DECODE_ERROR;
+        } else {
+            r |= write ? dma_memory_write(&address_space_memory, pa, p, n,
+                                          MEMTXATTRS_UNSPECIFIED)
+                       : dma_memory_read(&address_space_memory, pa, p, n,
+                                         MEMTXATTRS_UNSPECIFIED);
+        }
+        a += n;
+        p += n;
+        len -= n;
+    }
+    return r;
 }
 
 static void jpe_set32(SstarJpeState *s, int reg, uint32_t v)
@@ -276,8 +307,7 @@ static void sstar_jpe_frame_done(void *opaque)
     if (out && cap > HDR_MAX && (s->regs[R_HDR_CTRL] & 1) && ha &&
         hlen <= HDR_MAX) {
         buf = g_malloc(cap);
-        if (dma_memory_read(&address_space_memory, jpe_dram(ha), buf, hlen,
-                            MEMTXATTRS_UNSPECIFIED) == MEMTX_OK &&
+        if (jpe_mem(ha, buf, hlen, false) == MEMTX_OK &&
             jpe_parse(buf, hlen, &t, &hdr) && hdr <= hlen) {
             size_t n = jpe_encode(&t, s->frames, buf + hlen, cap - hlen);
 
@@ -294,8 +324,7 @@ static void sstar_jpe_frame_done(void *opaque)
         len = sizeof(eoi);
     }
     if (out) {
-        dma_memory_write(&address_space_memory, jpe_dram(out), buf, len,
-                         MEMTXATTRS_UNSPECIFIED);
+        jpe_mem(out, buf, len, true);
     }
     s->frames++;
     jpe_set32(s, R_RO_OBUF_SADR, out);
@@ -305,8 +334,8 @@ static void sstar_jpe_frame_done(void *opaque)
     jpe_set32(s, R_RO_WBYTE_CNT, len);
     s->regs[R_INT_STATUS] |= INT_FRAME_DONE;
     if (s->trace) {
-        qemu_log("sstar-jpe: frame done, %zu bytes at 0x%08" PRIx64 "\n",
-                 len, (uint64_t)jpe_dram(out));
+        qemu_log("sstar-jpe: frame done, %zu bytes at MIU 0x%08" PRIx64
+                 "\n", len, (uint64_t)out << 4);
     }
     sstar_jpe_update_irq(s);
 }

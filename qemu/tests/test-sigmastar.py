@@ -3757,6 +3757,33 @@ def test_i6c_ispscl(qemu, tmp):
         qt.close()
 
 
+def test_i6c_jpe_mmu(qemu, tmp):
+    print('infinity6c JPE: the output buffer through the MIU MMU')
+    path = i6_image(tmp, 'i6cj.bin')
+    jpe = riu(0x1232, 0)
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101))       # MIU 0x3FF00000 is the CPU's
+                                          # 0x22000000
+        for a in (0x22000000, 0x2200000C, 0x3FF00000, 0x3FF0000C):
+            qt.writel(a, 0)
+        out, end = 0x3FF00000 >> 4, (0x3FF00000 + 0x10000 - 1) >> 4
+        qt.writew(jpe + 0x51 * 4, out & 0xFFFF)
+        qt.writew(jpe + 0x52 * 4, out >> 16)
+        qt.writew(jpe + 0x53 * 4, end & 0xFFFF)
+        qt.writew(jpe + 0x54 * 4, end >> 16)
+        qt.writew(jpe + 0x20 * 4, 0)
+        qt.writew(jpe, 1)
+        qt.step(100 * 1000000)
+        check('JPE: frame done', qt.readw(jpe + 0x22 * 4) & 1, 1)
+        check('JPE: the end-of-image marker where the MMU maps the buffer',
+              qt.readw(0x2200000E), 0xD9FF)
+        check('JPE: nothing at the untranslated address',
+              qt.readl(0x3FF0000C), 0)
+    finally:
+        qt.close()
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4148,6 +4175,7 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
