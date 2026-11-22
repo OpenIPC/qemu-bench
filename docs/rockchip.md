@@ -1189,9 +1189,13 @@ RV1103 / RV1106:
   real-time pace doesn't match the guest's virtual clock.
 - **RISC-V MCU:** the SPL loads its firmware to `0xFF6FF000` and starts
   it; only its final mailbox message is stood in for.
-- **XM firmware:** the G2's SDIO Wi-Fi co-processor (`hichannel`) isn't
-  there, so the App has no network. Its video runs with `tb-isp` and
-  `sensor2` (see Multi-sensor read-back).
+- **XM firmware:** without `wifi=ws73` the G2's and RV1103B's SDIO Wi-Fi
+  co-processor (`hichannel`) isn't there, so their Apps have no network.
+  With it, the chip's firmware is modelled by its answers only (see
+  `wifi=ws73`): no 802.11, no AP scan or join (cmd 0x20's Wi-Fi list),
+  no PIR events (cmd 0xa3), no wake-up from the network while in AOV,
+  and the RV1103B's `wlan0` keeps a zero MAC. The G2's video runs with
+  `tb-isp` and `sensor2` (see Multi-sensor read-back).
 
 RV1109 / RV1126:
 
