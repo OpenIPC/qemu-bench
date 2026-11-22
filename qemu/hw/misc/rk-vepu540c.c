@@ -209,6 +209,8 @@ struct RkVepuState {
     const RkVepuMap *m;
     bool vepu541;               /* the RV1126's register map, no JPEG */
     bool inter;                 /* property: H.265 P with motion search */
+    bool trace;                 /* property: log each picture */
+    char *dump;                 /* property: H.265 out to dump.<width> */
     Object *iommu;
     bool dvbm_armed;            /* DVBM_CFG enabled: the ISP's next frame */
 };
@@ -597,6 +599,12 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
     } else {
         have_hdr = rk_vepu_headers(s, &hdr, &hdr_len);
     }
+    if (s->trace) {
+        qemu_log("rk-vepu540c %ux%u %s poc %d qp %d rfpr 0x%x%s rfpw 0x%x "
+                 "hdr %d\n", w, h, p_slice ? "P" : "I", poc, qp,
+                 REG(s, s->m->rfpr), p_slice ? (ref ? "" : " (none)") : "",
+                 REG(s, s->m->rfpw), have_hdr);
+    }
     /* coded into a fresh picture: the reference may be the same buffer */
     recon = hevc_enc_ref_new();
     if (have_hdr) {
@@ -871,8 +879,23 @@ static void rk_vepu_run(RkVepuState *s)
         n = rk_vepu_stnd(s) == 1 ? rk_vepu_hevc(s, out, cap, &qp)
                                          : rk_vepu_h264(s, out, cap, &qp);
         cpu_enable_ticks();
+        if (s->trace && n > cap) {
+            qemu_log("rk-vepu540c: %zu bytes do not fit the %zu left\n",
+                     (size_t)n, (size_t)cap);
+        }
         if (n > cap) {
             n = 0;              /* truncated: nothing usable */
+        }
+        if (s->dump && n && rk_vepu_stnd(s) == 1) {
+            uint32_t rsl = REG(s, s->m->enc_rsl);
+            g_autofree char *f = g_strdup_printf("%s.%u", s->dump,
+                                                 ((rsl & 0x7ff) + 1) * 8);
+            FILE *fp = fopen(f, "ab");
+
+            if (fp) {
+                fwrite(out, 1, n, fp);
+                fclose(fp);
+            }
         }
         if (n) {
             rk_vepu_ring_rw(s, bs, out, n, true);
@@ -1003,6 +1026,8 @@ static const Property rk_vepu_properties[] = {
     DEFINE_PROP_UINT32("job-ns", RkVepuState, job_ns, 1000000),
     DEFINE_PROP_BOOL("vepu541", RkVepuState, vepu541, false),
     DEFINE_PROP_BOOL("inter", RkVepuState, inter, false),
+    DEFINE_PROP_BOOL("trace", RkVepuState, trace, false),
+    DEFINE_PROP_STRING("dump", RkVepuState, dump),
     DEFINE_PROP_LINK("iommu", RkVepuState, iommu, "rk-iommu", Object *),
 };
 
