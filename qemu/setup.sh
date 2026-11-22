@@ -262,6 +262,7 @@ cp qemu/hw/misc/hisi-crg.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-fmc.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-himci.c        "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-regbank.c      "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/hisi-pwm.c          "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-aiao.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-aiao.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/hisi-sfc350.c      "$QEMU_DIR/hw/misc/"
@@ -1185,8 +1186,9 @@ fi
 
 # shared coders for hisi-vedu: H.264 slices (H.265 slices, JPEG scans);
 # hisi-aiao, the V4 audio DMA; xm-aiao, XM's (GK7206V11A)
-# lotus-rtc/lotus-wdt, GK7206 (xmorca) RTC and 3-core SP805 watchdog block
-for b in hantro-h264.c hevc-enc.c jpeg-enc.c hisi-aiao.c xm-aiao.c lotus-rtc.c lotus-wdt.c; do
+# lotus-rtc/lotus-wdt, GK7206 (xmorca) RTC and 3-core SP805 watchdog block;
+# hisi-pwm, the PWM controller every HiSilicon IPC part carries
+for b in hantro-h264.c hevc-enc.c jpeg-enc.c hisi-aiao.c xm-aiao.c lotus-rtc.c lotus-wdt.c hisi-pwm.c; do
     if ! grep -q "CONFIG_HISI_MISC', if_true: files('$b')" \
             "$QEMU_DIR/hw/misc/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_HISI_MISC', if_true: files('$b'))" \

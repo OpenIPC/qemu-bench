@@ -255,6 +255,14 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-ive-npu.py']
         run: python3 qemu/tests/test-hisi-ive-npu.py
 
+      # The PWM block on every HiSilicon IPC family: reads 0 while its CRG
+      # word gates it, counts at the clock the word's source field picks,
+      # latches a duty on CTRL (V1 on the enable edge only), V5's minus-one
+      # encoding and av100's second bank.
+      - name: HiSilicon PWM (hisi-pwm)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-pwm.py']
+        run: python3 qemu/tests/test-hisi-pwm.py
+
       # The ISP statistics hisi-vi writes (front-end and backend AE
       # histograms, AE / AWB zones, globals) in the driver's STT layouts,
       # and the front-end interrupt the ISP's per-frame work runs from.

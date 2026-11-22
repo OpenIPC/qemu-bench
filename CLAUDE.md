@@ -89,6 +89,7 @@ python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wid
 python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
 python3 qemu/tests/test-hisi-sensor.py     # sensor timing: frame latching, group hold, fps, violations
 python3 qemu/tests/test-hisi-aiao.py       # V4 audio DMA: capture / playback rings, rates
+python3 qemu/tests/test-hisi-pwm.py        # PWM on every family: clock gate, rate, latch, V5 layout
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py (+ test-ak-h8290.py, EV200's
                                            # 8290 encoder; test-ak-isp.py, the ISP2 and the EV300's
@@ -148,6 +149,7 @@ bash qemu-boot/test-linux-network.sh --soc <soc> --machine <machine> --append '<
     --qemu ./qemu-src/build/qemu-system-arm --setup-network
 bash qemu-boot/sofia-isp-ci-test.sh      # hi3516ev200 + sc2315e ISP regression
 python3 qemu-boot/test-fastboot-protocol.py /tmp/hisi-fb   # boot-ROM serial protocol
+bash qemu-boot/test-hisi-majestic-pwm.sh --soc hi3516cv610 --majestic BIN  # majestic's dimmable lamp (V4, V5)
 VARIANT=neo bash qemu-boot/fetch-openipc-lite.sh hi3516cv200 qemu-boot
 bash qemu-boot/test-vtund-tunnel.sh --soc hi3516cv200   # vtund between two guests
 ```

@@ -77,6 +77,15 @@ struct HisiCrgState {
     uint32_t rst_sta_offset;
     uint32_t num_rst_sta;
     uint32_t *rst_sta;
+    /*
+     * The PWM block's soft reset ("pwm-rst-offset" / "pwm-rst-mask"),
+     * forwarded as the "pwm-reset" level: hisi-pwm returns its channels
+     * to their defaults while it is held, as silicon does, and a pulse
+     * the PWM block never sees an access during would otherwise be lost.
+     */
+    uint32_t pwm_rst_offset;
+    uint32_t pwm_rst_mask;
+    qemu_irq pwm_reset;
 };
 
 static bool is_pll_status_reg(hwaddr offset)
@@ -179,6 +188,10 @@ static void hisi_crg_write(void *opaque, hwaddr offset,
         !(old & s->cpu_srst_mask) != !(val & s->cpu_srst_mask)) {
         qemu_set_irq(s->cpu1_reset, !!(val & s->cpu_srst_mask));
     }
+    if (s->pwm_rst_mask && offset == s->pwm_rst_offset &&
+        !(old & s->pwm_rst_mask) != !(val & s->pwm_rst_mask)) {
+        qemu_set_irq(s->pwm_reset, !!(val & s->pwm_rst_mask));
+    }
 }
 
 static const MemoryRegionOps hisi_crg_ops = {
@@ -197,6 +210,7 @@ static void hisi_crg_init(Object *obj)
                           TYPE_HISI_CRG, HISI_CRG_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->cpu1_reset, "cpu1-reset", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->pwm_reset, "pwm-reset", 1);
 }
 
 static void hisi_crg_reset(DeviceState *dev)
@@ -220,6 +234,8 @@ static const Property hisi_crg_properties[] = {
     DEFINE_PROP_UINT32("cpu-srst-reset", HisiCrgState, cpu_srst_reset,
                        CPU1_SRST_REQ | DBG1_SRST_REQ),
     DEFINE_PROP_UINT32("pll-lock-offset", HisiCrgState, pll_lock_offset, 0),
+    DEFINE_PROP_UINT32("pwm-rst-offset", HisiCrgState, pwm_rst_offset, 0),
+    DEFINE_PROP_UINT32("pwm-rst-mask", HisiCrgState, pwm_rst_mask, 0),
     DEFINE_PROP_UINT32("pll-lock-bits", HisiCrgState, pll_lock_bits, 0),
     DEFINE_PROP_ARRAY("rst-ack", HisiCrgState, num_rst_ack, rst_ack,
                       qdev_prop_uint32, uint32_t),
