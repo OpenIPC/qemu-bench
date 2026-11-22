@@ -1927,8 +1927,8 @@ static const HisiSoCConfig hi3516ev300_soc = {
      * HISI_V4_COMMON_PERIPH macro) plus EV300-specific IVE. */
     .num_regbanks       = 9,
     .regbanks           = {
-        /* The PWM block and the three pad-mux banks majestic's dimmable
-         * lamp muxes a pad through (HISI_V4_REGBANK_LIST has them too) */
+        /* The PWM block and the three pad-mux banks a lamp's pad is
+         * muxed through (HISI_V4_REGBANK_LIST has them too) */
         { "hisi-pwm",        0x12080000, 0x10000  },
         { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
         { "hisi-iocfg-core", 0x120c0000, 0x10000  },
@@ -2036,8 +2036,8 @@ static const HisiSoCConfig hi3516ev200_soc = {
 
     .num_regbanks       = 5,
     .regbanks           = {
-        /* The PWM block and the three pad-mux banks majestic's dimmable
-         * lamp muxes a pad through (HISI_V4_REGBANK_LIST has them too) */
+        /* The PWM block and the three pad-mux banks a lamp's pad is
+         * muxed through (HISI_V4_REGBANK_LIST has them too) */
         { "hisi-pwm",        0x12080000, 0x10000  },
         { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
         { "hisi-iocfg-core", 0x120c0000, 0x10000  },
@@ -2139,6 +2139,16 @@ static const HisiSoCConfig hi3518ev300_soc = {
      * "Uncompress hardware decompress overtime!" before reaching the
      * U-Boot banner.  See openhisilicon#60. */
     .gzip_base          = 0x11310000,
+
+    /* The PWM block and the three pad-mux banks a lamp's pad is muxed
+     * through, as on hi3516ev300 (same die) */
+    .num_regbanks       = 4,
+    .regbanks           = {
+        { "hisi-pwm",        0x12080000, 0x10000  },
+        { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
+        { "hisi-iocfg-core", 0x120c0000, 0x10000  },
+        { "hisi-iocfg-ahb",  0x100c0000, 0x10000  },
+    },
 };
 
 /*
@@ -2231,6 +2241,16 @@ static const HisiSoCConfig hi3516dv200_soc = {
      * "Uncompress hardware decompress overtime!" before reaching the
      * U-Boot banner.  See openhisilicon#60. */
     .gzip_base          = 0x11310000,
+
+    /* The PWM block and the three pad-mux banks a lamp's pad is muxed
+     * through, as on hi3516ev300 (same die) */
+    .num_regbanks       = 4,
+    .regbanks           = {
+        { "hisi-pwm",        0x12080000, 0x10000  },
+        { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
+        { "hisi-iocfg-core", 0x120c0000, 0x10000  },
+        { "hisi-iocfg-ahb",  0x100c0000, 0x10000  },
+    },
 };
 
 /*
@@ -5739,6 +5759,7 @@ static void hisilicon_common_init(MachineState *machine,
     int num_pic = 0;
     int n;
     SysBusDevice *fmc_irq_dev = NULL; /* FMC, IRQ-connected after pic[] is built */
+    DeviceState *crg_dev = NULL;      /* hisi-pwm takes its soft reset */
     bool flash_boot = false;  /* true when booting from SPI NOR flash dump */
     bool fmc_nand_boot = false; /* true when the FMC boot flash is SPI NAND */
     bool bios_boot = machine->firmware && machine->firmware[0];
@@ -6208,6 +6229,11 @@ static void hisilicon_common_init(MachineState *machine,
     /* CRG — same caveat as sysctl: STB family uses a different layout. */
     if (c->crg_base) {
         DeviceState *crg = qdev_new("hisi-crg");
+        crg_dev = crg;
+        if (c->pwm.channels && c->pwm.reset_mask) {
+            qdev_prop_set_uint32(crg, "pwm-rst-offset", c->pwm.crg_offset);
+            qdev_prop_set_uint32(crg, "pwm-rst-mask", c->pwm.reset_mask);
+        }
         if (c->cpu_srst_offset) {
             qdev_prop_set_uint32(crg, "cpu-srst-offset", c->cpu_srst_offset);
         }
@@ -6860,6 +6886,10 @@ static void hisilicon_common_init(MachineState *machine,
                 object_property_add_child(OBJECT(machine), "pwm", OBJECT(pwm));
                 sysbus_realize_and_unref(SYS_BUS_DEVICE(pwm), &error_fatal);
                 sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 0, c->regbanks[n].base);
+                if (crg_dev && p->reset_mask) {
+                    qdev_connect_gpio_out_named(crg_dev, "pwm-reset", 0,
+                        qdev_get_gpio_in_named(pwm, "reset", 0));
+                }
                 continue;
             }
 

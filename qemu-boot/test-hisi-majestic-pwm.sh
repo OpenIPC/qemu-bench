@@ -87,8 +87,8 @@ fi
 KERNEL=$WORK/uImage.$REL
 [ -f "$KERNEL" ] || KERNEL=$WORK/kernel.$REL
 
-RFS=$WORK/rfs
-rm -rf "$RFS"
+RFS=$(mktemp -d "$WORK/rfs.XXXXXX")
+rmdir "$RFS"        # unsquashfs makes it, and refuses one that exists
 unsquashfs -q -d "$RFS" "$WORK/rootfs.squashfs.$REL" >/dev/null
 cp "$BIN" "$RFS/usr/bin/majestic"
 chmod 755 "$RFS/usr/bin/majestic"

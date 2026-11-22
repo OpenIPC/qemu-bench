@@ -56,6 +56,8 @@ MACHINES = {
     'hi3516dv300': (0x12070000, 0x12010000, 'V4A'),
     'hi3516ev200': (0x12080000, 0x12010000, 'V4'),
     'hi3516ev300': (0x12080000, 0x12010000, 'V4'),
+    'hi3518ev300': (0x12080000, 0x12010000, 'V4'),
+    'hi3516dv200': (0x12080000, 0x12010000, 'V4'),
     'gk7205v200':  (0x12080000, 0x12010000, 'V4'),
     'gk7205v500':  (0x12080000, 0x12010000, 'GK500'),
     'hi3516cv608': (0x11080000, 0x11010000, 'V5'),
@@ -140,6 +142,12 @@ def run(qemu, name):
         qmp = QMP(tmp)
         b = Block(qt, base, crg, FAM[fam])
         last = b.channels - 1
+
+        # after reset, before any run: the mirrors read 0
+        b.clock(0)
+        if b.layout != 'v5':
+            check(name, qt.readl(b.ch(0) + 0x14) == 0,
+                  'ST1 reads a high time before any run', fails)
 
         # gated: takes the write, keeps nothing
         b.clock(on=False)
@@ -230,11 +238,19 @@ def run(qemu, name):
         check(name, qmp.get('ch0-high-ns') == ns(hi2),
               'enable edge: high %s ns, want %d' %
               (qmp.get('ch0-high-ns'), ns(hi2)), fails)
-        # invert
+        # invert, on a duty that is not its own mirror image (50 % is), and
+        # through the enable edge so it loads on every family
+        qt.writel(c + b.CTRL, 0)
+        qt.writel(c + b.CFG1, 624 if b.layout == 'v5' else 1875)
         qt.writel(c + b.CTRL, 0x7)
-        check(name, qmp.get('ch0-high-ns') == ns(per - hi2),
+        check(name, qmp.get('ch0-high-ns') == ns(per - hi),
               'inverted: high %s ns, want %d' %
-              (qmp.get('ch0-high-ns'), ns(per - hi2)), fails)
+              (qmp.get('ch0-high-ns'), ns(per - hi)), fails)
+        if b.edge:
+            # V1: a polarity change on a running channel waits for the edge
+            qt.writel(c + b.CTRL, 0x5)
+            check(name, qmp.get('ch0-high-ns') == ns(per - hi),
+                  'V1 took a polarity change without the enable edge', fails)
         # a zero duty is not dark: the floor
         qt.writel(c + b.CTRL, 0)
         qt.writel(c + b.CFG1, 0)
@@ -245,6 +261,16 @@ def run(qemu, name):
               (qmp.get('ch0-high-ns'), floor), fails)
         if b.layout != 'v5':
             check(name, qt.readl(c + 0x14) == 2, 'ST1 does not read 2', fails)
+
+        # the CRG's soft reset puts the block back to its defaults
+        if b.reset:
+            qt.writel(b.crg, qt.readl(b.crg) | b.reset)
+            qt.writel(b.crg, qt.readl(b.crg) & ~b.reset)
+            check(name, qmp.get('ch0-enabled') is False,
+                  'a channel runs on through the soft reset', fails)
+            check(name, qt.readl(c + b.CTRL) == 0,
+                  'CTRL survives the soft reset', fails)
+            qt.writel(c + b.CTRL, 0x5)
 
         # gating a running block stops the output
         b.clock(on=False)

@@ -42,6 +42,14 @@
  *    count twice, a known time apart -- gives this model's rate back.
  *  - A high time of 0 is not dark: the output keeps a floor of 2 ticks
  *    (classic; ST1 reads 2) or 1 tick (v5, duty 0 is "1 cycle").
+ *  - The CRG's soft reset for the block (the "reset" GPIO input, which
+ *    hisi-crg drives from the same bit "reset-mask" names) puts every
+ *    channel back to its defaults, so a driver that pulses it starts clean.
+ *
+ * A run counts at the rate it was loaded with.  A source change takes
+ * effect at the next load, which is when every driver here makes one (they
+ * reprogram a channel disabled); a source switched under a running
+ * channel is not modelled.
  *
  * The output is published as QOM properties per channel, for a test to
  * read over QMP: chN-enabled, chN-period-ns, chN-high-ns (time the pad is
@@ -76,8 +84,10 @@ typedef struct HisiPwmChannel {
     uint32_t cfg0, cfg1, cfg2, ctrl;
     uint32_t run_period, run_high, run_ctrl; /* what the output is doing */
     uint32_t run_count;                      /* periods the run emits */
+    uint32_t run_hz;                         /* the clock it was loaded at */
     int64_t start_ns;                        /* when the run was loaded */
     bool running;
+    bool loaded;                             /* ever, since reset */
 } HisiPwmChannel;
 
 struct HisiPwmState {
@@ -134,6 +144,8 @@ static uint64_t hisi_pwm_ticks(HisiPwmState *s, uint32_t v)
 
 static void hisi_pwm_load(HisiPwmState *s, HisiPwmChannel *c)
 {
+    hisi_pwm_clock(s, &c->run_hz);
+    c->loaded = true;
     c->run_period = c->cfg0;
     c->run_high = c->cfg1;
     c->run_ctrl = c->ctrl;
@@ -150,6 +162,7 @@ static uint32_t hisi_pwm_remaining(HisiPwmState *s, HisiPwmChannel *c)
     if (!c->running || (c->run_ctrl & CTRL_KEEP) || !hisi_pwm_clock(s, &hz)) {
         return 0;
     }
+    hz = c->run_hz;
     uint64_t period = hisi_pwm_ticks(s, c->run_period);
     if (!period) {
         return 0;
@@ -219,8 +232,8 @@ static uint64_t hisi_pwm_read(void *opaque, hwaddr off, unsigned size)
     case 0x04: return c->cfg1;
     case 0x08: return c->cfg2;
     case 0x0c: return c->ctrl;
-    case 0x10: return c->run_period;
-    case 0x14: return c->run_high < 2 ? 2 : c->run_high;
+    case 0x10: return c->loaded ? c->run_period : 0;
+    case 0x14: return !c->loaded ? 0 : c->run_high < 2 ? 2 : c->run_high;
     case 0x18: return (hisi_pwm_remaining(s, c) << 12) | (c->cfg2 & 0x3ff);
     default:   return 0;
     }
@@ -305,6 +318,7 @@ static void hisi_pwm_output(HisiPwmState *s, int n, bool *on,
     if (!(c->run_ctrl & CTRL_KEEP) && hisi_pwm_remaining(s, c) == 0) {
         return; /* a bounded run that has finished */
     }
+    hz = c->run_hz;
     uint64_t period = hisi_pwm_ticks(s, c->run_period);
     uint64_t high = hisi_pwm_ticks(s, c->run_high);
     if (s->layout != LAYOUT_V5 && high < 2) {
@@ -355,14 +369,25 @@ static void hisi_pwm_get_clock(Object *obj, Visitor *v, const char *name,
     visit_type_uint32(v, name, &hz, errp);
 }
 
-static void hisi_pwm_reset(DeviceState *dev)
+static void hisi_pwm_defaults(HisiPwmState *s)
 {
-    HisiPwmState *s = HISI_PWM(dev);
-
     for (unsigned i = 0; i < HISI_PWM_MAX_CH; i++) {
         memset(&s->ch[i], 0, sizeof(s->ch[i]));
         s->ch[i].cfg0 = s->cfg0_reset;
         s->ch[i].cfg1 = s->cfg1_reset;
+    }
+}
+
+static void hisi_pwm_reset(DeviceState *dev)
+{
+    hisi_pwm_defaults(HISI_PWM(dev));
+}
+
+/* The CRG's soft reset for this block: held, it holds the defaults. */
+static void hisi_pwm_reset_in(void *opaque, int n, int level)
+{
+    if (level) {
+        hisi_pwm_defaults(HISI_PWM(opaque));
     }
 }
 
@@ -383,6 +408,7 @@ static void hisi_pwm_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &hisi_pwm_ops, s,
                           TYPE_HISI_PWM, s->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    qdev_init_gpio_in_named(dev, hisi_pwm_reset_in, "reset", 1);
 
     for (unsigned n = 0; n < s->channels; n++) {
         for (unsigned k = 0; k < 3; k++) {
