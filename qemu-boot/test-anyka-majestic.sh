@@ -32,12 +32,18 @@
 #                          [--kernel UIMAGE] [--majestic BIN] [--work DIR]
 #                          [--qemu Q] [--timeout SECONDS] [--keep]
 #                          [--codec h264|h265] [--sensor NAME]
+#                          [--sensor-reset N|none]
 #   --firmware  a local package in place of the nightly (the .tgz with the
 #               uImage and rootfs.squashfs); --kernel and --majestic replace
 #               the one file in it, to try a fix before it is released
 #   --sensor    another catalogue sensor in place of the machine's own
 #               (sensor=, e.g. gc1054 or sc2335 on EV200), to check that
 #               its driver and tuning bring up the stream
+#   --sensor-reset  the GPIO the sensor's reset is wired to (sensor-reset=),
+#               for a kernel whose device tree is another board's: the
+#               generic ak3918ev300_lite kernel boots the EVB's tree, reset
+#               49, where the machine models the PE3020-W's 79, and without
+#               it the sensor answers its ID but sends no frame
 #   --codec     the main stream's codec (h264 by default; h265 on EV300,
 #               whose Allegro core has HEVC, the EV200's 8290 has not)
 #   --timeout   seconds for the boot to reach the first frame, login prompt
@@ -62,6 +68,7 @@ TIMEOUT=600
 KEEP=
 CODEC=h264
 SENSOR=
+SENSOR_RESET=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -76,6 +83,13 @@ while [ $# -gt 0 ]; do
     --keep) KEEP=1 ;;
     --codec) CODEC=$2; shift ;;
     --sensor) SENSOR=$2; shift ;;
+    --sensor-reset)
+        # it goes into -M's comma list: a GPIO 0..95 or none, nothing else
+        case $2 in
+        none|[0-9]|[1-8][0-9]|9[0-5]) SENSOR_RESET=$2 ;;
+        *) echo "--sensor-reset: a GPIO number 0..95, or none" >&2; exit 2 ;;
+        esac
+        shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -185,7 +199,7 @@ CON=$WORK/console.log
 : > "$CON"
 # not restrict=on: on the Anyka machines it keeps the forwarded ports'
 # replies from coming back
-"$QEMU" -M "$CHIP,flash-file=$WORK/nor.bin${SENSOR:+,sensor=$SENSOR}" -display none \
+"$QEMU" -M "$CHIP,flash-file=$WORK/nor.bin${SENSOR:+,sensor=$SENSOR}${SENSOR_RESET:+,sensor-reset=$SENSOR_RESET}" -display none \
     -serial file:"$CON" -monitor none \
     -nic user,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
     </dev/null 2>"$WORK/qemu.err" &
