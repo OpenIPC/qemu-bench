@@ -43,6 +43,12 @@
  * DrvVcodecWave5VpuReadRegV2): 0x100 the picture's id from 0x1C0, 0x104 its
  * error bits.
  *
+ * The queue runs one picture at a time, and the next one only once the
+ * host has taken the last one's done (cleared its ENC_PIC reason): the
+ * done register names a single instance, so a second completion before
+ * DrvVcodecIrqHandler ran would replace the first, whose channel would
+ * then wait for ever (main and sub stream of one sensor, back to back).
+ *
  * A source on the scaler's hardware ring comes straight from the scaler: it
  * holds a few lines, never a frame (sstar_i6e_scl_ring()).
  *
@@ -174,6 +180,7 @@ struct SstarWave5State {
     uint32_t cq_wr;
     uint32_t fire_id;
     bool cq_busy;
+    bool done_unacked;          /* a queued picture's done, not taken */
     bool trace;
 };
 
@@ -250,6 +257,9 @@ static void wave5_done(void *opaque)
         wave5_dump(s);
         /* bit 24: the low byte is the instance (DrvVcodecIrqHandler) */
         *wave5_reg(s, R_DONE_INST) = 1u << 24 | s->pending_inst;
+        /* held until the host clears it, if it is told at all */
+        s->done_unacked = !!(*wave5_reg(s, R_INT_ENABLE) &
+                             s->pending_reason);
     } else {
         *wave5_reg(s, R_DONE_INST) |= 1u << s->pending_inst;
     }
@@ -461,8 +471,10 @@ static void wave5_command(SstarWave5State *s)
         *wave5_reg(s, R_PC) = 0x1000;
         s->cq_base = *wave5_reg(s, R_CQ_BASE);
         s->cq_rd = s->cq_wr = 0;
+        s->done_unacked = false;
         break;
     case CMD_CREATE:
+        s->done_unacked = false;
         hevc_enc_ref_free(in->ref);
         memset(in, 0, sizeof(*in));
         in->dump = *wave5_reg(s, R_CQ_DUMP);
@@ -535,7 +547,7 @@ static void wave5_cq_run(SstarWave5State *s)
     uint32_t page[WAVE5_CQ_PAGE / 4];
     uint32_t off;
 
-    while (!s->cq_busy && s->cq_rd != s->cq_wr) {
+    while (!s->cq_busy && !s->done_unacked && s->cq_rd != s->cq_wr) {
         wave5_mem(s, s->cq_base + s->cq_rd * WAVE5_CQ_PAGE, page, sizeof(page),
                   false);
         if (s->trace) {
@@ -577,6 +589,15 @@ static uint64_t sstar_wave5_read(void *opaque, hwaddr off, unsigned size)
     }
 }
 
+/* The host has the last completion, or will not be told of it: go on */
+static void wave5_release(SstarWave5State *s)
+{
+    if (s->done_unacked) {
+        s->done_unacked = false;
+        wave5_cq_run(s);
+    }
+}
+
 static void sstar_wave5_write(void *opaque, hwaddr off, uint64_t val,
                               unsigned size)
 {
@@ -591,10 +612,15 @@ static void sstar_wave5_write(void *opaque, hwaddr off, uint64_t val,
         }
         *wave5_reg(s, R_INT_REASON) &= ~(uint32_t)val;
         wave5_update_irq(s);
+        if (val & CMD_ENC_PIC) {
+            wave5_release(s);
+        }
         break;
     case R_VINT_CLEAR:
         *wave5_reg(s, R_VINT_STS) = 0;
         wave5_update_irq(s);
+        /* the handler's last write, after it read the done instance */
+        wave5_release(s);
         break;
     case R_HOST_INT:
     case R_CORE_START:
@@ -612,6 +638,10 @@ static void sstar_wave5_write(void *opaque, hwaddr off, uint64_t val,
         *wave5_reg(s, off) = val;
         if (off == R_INT_ENABLE) {
             wave5_update_irq(s);
+            /* no picture's end is told any more: nothing to hold for */
+            if (!(val & CMD_ENC_PIC)) {
+                wave5_release(s);
+            }
         }
         break;
     }
@@ -636,6 +666,7 @@ static void sstar_wave5_reset(DeviceState *dev)
         memset(&s->inst[i], 0, sizeof(s->inst[i]));
     }
     s->cq_base = s->cq_rd = s->cq_wr = 0;
+    s->done_unacked = false;
     s->cq_busy = false;
     timer_del(s->done);
     qemu_set_irq(s->irq, 0);

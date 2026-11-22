@@ -3784,6 +3784,83 @@ def test_i6c_jpe_mmu(qemu, tmp):
         qt.close()
 
 
+def i6c_wave5_two(qemu, tmp, ack):
+    """Two instances' pictures queued at once; the host takes the first
+    picture's end by ack: 'reason' (REASON_CLEAR with ENC_PIC), 'vint'
+    (VINT_CLEAR only) or 'poll' (the ENC_PIC interrupt switched off)."""
+    path = i6_image(tmp, 'i6cw.bin')
+    wave = 0x1F34D000
+    base = 0x3FF00000
+    dram = 0x22000000
+    src = 0x01100000
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101, 0x102))  # base, 0x3FF00000, is VPA
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        for inst, dump in ((0, 0x20000), (1, 0x24000)):
+            qt.writel(wave + 0x14C, dump)
+            cmd(0x0008, inst=inst)
+            qt.writel(wave + 0x11C, 64 << 16 | 64)
+            qt.writel(wave + 0x130, 2 << 16)
+            cmd(0x0200, inst=inst)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + src + i, 0x20406080)
+        for n, (inst, bs, fire) in enumerate(((0, 0x40000, 0x55),
+                                              (1, 0x50000, 0x66))):
+            p = dram + n * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x10, inst)
+            qt.writel(p + 0x18, bs)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x48, src)
+            qt.writel(p + 0x4C, src + 64 * 64)
+            qt.writel(p + 0x54, 64 << 16 | 64)
+            qt.writel(p + 0xC0, fire)
+        qt.writel(wave + 0x1F8, 2)          # both pictures queued at once
+        qt.step(20 * 1000000)
+        check('Wave5: the first picture done',
+              qt.readl(wave + 0x1E8), 1 << 24 | 0)
+        check('Wave5: the second waits for the host to take it',
+              qt.readl(wave + 0x1F4), 1)
+        check('Wave5: the first one\'s results', qt.readl(dram + 0x20000),
+              0x55)
+        if ack == 'reason':
+            qt.writel(wave + 0x34, 0x100)
+            qt.writel(wave + 0x3C, 1)
+        elif ack == 'vint':
+            qt.writel(wave + 0x3C, 1)
+        else:
+            qt.writel(wave + 0x48, 0xBD40 & ~0x100)
+        qt.step(20 * 1000000)
+        check('Wave5 (%s): then the second, named on its own' % ack,
+              qt.readl(wave + 0x1E8), 1 << 24 | 1)
+        check('Wave5 (%s): the queue drained' % ack, qt.readl(wave + 0x1F4), 2)
+        check('Wave5: the second one\'s results', qt.readl(dram + 0x24000),
+              0x66)
+    finally:
+        qt.close()
+
+
+def test_i6c_wave5_two(qemu, tmp):
+    print('infinity6c Wave5: two instances queued, one done at a time')
+    for ack in ('reason', 'vint', 'poll'):
+        i6c_wave5_two(qemu, tmp, ack)
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4175,6 +4252,7 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_wave5_two(args.qemu, tmp)
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
