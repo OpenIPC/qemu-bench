@@ -208,6 +208,7 @@ struct RkVepuState {
     uint32_t gen;               /* reset count: stale JPEG work is dropped */
     const RkVepuMap *m;
     bool vepu541;               /* the RV1126's register map, no JPEG */
+    bool inter;                 /* property: H.265 P with motion search */
     Object *iommu;
     bool dvbm_armed;            /* DVBM_CFG enabled: the ISP's next frame */
 };
@@ -523,6 +524,17 @@ static bool rk_vepu_headers(RkVepuState *s, HevcEncHdr *hdr, uint32_t *len)
 
             if (hevc_enc_parse_headers(hdr, buf + from, back - from)) {
                 hdr->prm.intra_ac = true;   /* the residual, not just DC */
+                if (s->inter) {
+                    /*
+                     * real inter coding, within what the slice header
+                     * says: no temporal MVP, MaxNumMergeCand 4
+                     */
+                    hdr->prm.inter = true;
+                    hdr->prm.tmvp = false;
+                    hdr->prm.max_merge_cand = 4;
+                    hdr->prm.scaling_list = false;
+                    hdr->prm.sign_hiding = false;
+                }
                 *len = back - from;
                 return true;
             }
@@ -595,6 +607,7 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
         HevcEncParams prm = hevc_params_ctb32_sao;
 
         prm.intra_ac = true;
+        prm.inter = s->inter;           /* our own SPS / PPS say so */
         n = hevc_enc_frame(&prm, w, h, qp, p_slice, poc,
                            ref ? ref->pic : NULL, recon,
                            y, w, h, ys, uv, cs, out, cap);
@@ -989,6 +1002,7 @@ static void rk_vepu_realize(DeviceState *dev, Error **errp)
 static const Property rk_vepu_properties[] = {
     DEFINE_PROP_UINT32("job-ns", RkVepuState, job_ns, 1000000),
     DEFINE_PROP_BOOL("vepu541", RkVepuState, vepu541, false),
+    DEFINE_PROP_BOOL("inter", RkVepuState, inter, false),
     DEFINE_PROP_LINK("iommu", RkVepuState, iommu, "rk-iommu", Object *),
 };
 

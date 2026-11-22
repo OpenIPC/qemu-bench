@@ -780,6 +780,72 @@ def test_vepu540c_hevc_detail(qt):
           'Y error (max, mean) %s %s' % (errs, r.stderr[:80]))
 
 
+def test_vepu540c_inter(qemu, path):
+    """inter=on: a picture moving 3 pixels a frame; the P pictures (motion
+    search, residual) come out a fraction of the intra one and decode in
+    ffmpeg close to their sources."""
+    import shutil
+    import subprocess
+    if not shutil.which('ffmpeg'):
+        print('skip VEPU540C inter: no ffmpeg')
+        return
+    sizes = {}
+    for inter in (False, True):
+        qt = QTest(qemu, 'rv1106,flash-file=' + path,
+                   ('-global', 'rk-vepu540c.inter=%s' % ('on' if inter
+                                                         else 'off'),))
+        try:
+            V = 0xFFA50000
+            w, h = 64, 40                # a partial CTB row
+            src, bs = 0x01900000, 0x01a00000
+            pics = [bytes((40 + ((x + 3 * k) * 7 + r * 5) % 160) & 0xff
+                          for r in range(h) for x in range(w))
+                    for k in range(4)]
+            stream, lens = b'', []
+            for k, y in enumerate(pics):
+                qt.write(src, y + bytes([128]) * (w * h // 2))
+                rf = 0x01b00000 + 0x20000 * k
+                at = bs + len(stream)
+                regs = {
+                    0x280: src, 0x284: src + w * h, 0x334: w, 0x338: w,
+                    0x28c: rf, 0x294: rf - 0x20000 if k else rf,
+                    0x2b0: bs + 0xfffff, 0x2b4: bs, 0x2b8: at, 0x2bc: bs,
+                    0x300: 1 | (26 << 8),
+                    0x310: (w // 8 - 1) | ((h // 8 - 1) << 16),
+                    0x318: 6 << 2,
+                    0x3b0: 19 if k == 0 else 1,
+                    0x3bc: (2 if k == 0 else 1) << 15,
+                    0x3c0: 26 << 16, 0x3c4: k,
+                    0x020: 1,
+                }
+                for off, v in regs.items():
+                    qt.writel(V + off, v)
+                qt.writel(V + 0x10, 0x100)
+                qt.cmd('clock_step 2000000')
+                n = qt.readl(V + 0x4000)
+                qt.writel(V + 0x28, 1)
+                lens.append(n)
+                stream += qt.read(at, n)
+        finally:
+            qt.close()
+        r = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'hevc', '-i', '-',
+                            '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+                           input=stream, capture_output=True)
+        errs = []
+        for k in range(min(len(r.stdout) // (w * h), 4)):
+            d = r.stdout[k * w * h:(k + 1) * w * h]
+            e = [abs(a - b) for a, b in zip(d, pics[k])]
+            errs.append((max(e), round(sum(e) / len(e), 2)))
+        sizes[inter] = (lens, errs, r.stderr[:80])
+    lens, errs, err = sizes[True]
+    p_off = sum(sizes[False][0][1:])
+    check(len(errs) == 4 and not err and all(m <= 40 and mean <= 8
+                                             for m, mean in errs) and
+          sum(lens[1:]) < p_off * 0.7,
+          'VEPU540C inter: moving picture decodes clean %s, P bytes %d '
+          'against %d without inter %s' % (errs, sum(lens[1:]), p_off, err))
+
+
 def test_vepu540c_h264(qt):
     """libx264's SPS / PPS as the HAL's (baseline: CAVLC, main: CABAC); an
     IDR, a P picture of the same source and one of a shifted source decode
@@ -2261,6 +2327,7 @@ def main():
     test_pwm_output(args.qemu, path)
     test_sd_write(args.qemu, path)
     test_ws73(args.qemu, path)
+    test_vepu540c_inter(args.qemu, path)
     test_sai_files(args.qemu, path)
     test_sai_audiodev(args.qemu, path)
     test_rv1109(args.qemu, tmp)

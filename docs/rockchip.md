@@ -1038,8 +1038,19 @@ RV1103 / RV1106:
   programs aren't applied, so AWB lands a few per cent short of the
   exact gains. AF statistics aren't produced from the scene.
 - **Encoder:** H.265 P slices use the shared encoder's simple inter
-  coding (skip, or intra where the picture changed). There's no
-  link-table mode, no wrap reference buffers and no ROI. Online (DVBM)
+  coding (skip, or intra where the picture changed).
+  `-global rk-vepu540c.inter=on` turns on its real inter coding instead:
+  a motion search with sub-sample refinement, merge / AMVP and a coded
+  residual, within what the HAL's SPS / PPS allow (no temporal MVP, four
+  merge candidates). A qtest picture moving 3 pixels a frame decodes
+  clean, with P pictures 60 % of the skip/intra ones. It stays off by
+  default, for two reasons. On the XM R5 (2880x1616) the search is
+  slow, recording 384 frames where the default records 1704 in the same
+  time. And its P pictures came out larger (181 KB against 38 KB), with
+  a corrupted strip along the bottom rows: the HAL's 16x16 QP groups in
+  the last, half-height CTB row, a case the model's own headers don't
+  produce. There's no link-table mode (no devicetree here sets
+  `rockchip,task-capacity`), no wrap reference buffers and no ROI. Online (DVBM)
   jobs start at the ISP's mainpath frame end, with the whole frame
   already written; the line-by-line handshake (0x18) isn't modelled.
 - **HPMCU** (`rk-hpmcu`, RV1103B mailbox `0x20A10000`): its firmware is

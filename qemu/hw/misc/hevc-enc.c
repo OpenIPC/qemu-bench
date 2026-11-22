@@ -1753,8 +1753,7 @@ static bool parse_sps(HevcEncHdr *h, BitReader *r)
     const int log2_ctb = log2_min_cb + br_ue(r);
     const int log2_min_tb = br_ue(r) + 2;
     const int log2_max_tb = log2_min_tb + br_ue(r);
-    br_ue(r);                                   /* depth inter: P CUs are
-                                                 * skipped or intra */
+    h->prm.trafo_depth_inter = br_ue(r);        /* for inter coding */
     h->prm.trafo_depth_intra = br_ue(r);
     /* every CU 8x8, its TB 8x8 (chroma 4x4) */
     if (log2_min_cb != 3 || log2_ctb < 4 || log2_ctb > 6 ||
