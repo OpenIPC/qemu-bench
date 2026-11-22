@@ -36,6 +36,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/module.h"
 #include "qemu/bswap.h"
 #include "hw/irq.h"
@@ -95,6 +96,10 @@ struct Ws73State {
 
     SDBus *sdbus;
     qemu_irq wake;              /* the chip's interrupt pin, rising */
+    qemu_irq host_wake;         /* wakes the sleeping SoC (a key line) */
+    QEMUTimer *host_wake_timer;
+    bool host_asleep;           /* the host suspended syschannel (AOV) */
+    int64_t host_wake_at;       /* the last wake pulse, ns */
     uint16_t rca;
 
     uint8_t fn0[FN0_WINDOW];
@@ -290,7 +295,7 @@ static bool ws73_can_receive(NetClientState *nc)
 {
     Ws73State *s = qemu_get_nic_opaque(nc);
 
-    return s->rxq_count < RXQ_MAX;
+    return s->host_asleep || s->rxq_count < RXQ_MAX;
 }
 
 static ssize_t ws73_receive(NetClientState *nc, const uint8_t *buf,
@@ -303,6 +308,29 @@ static ssize_t ws73_receive(NetClientState *nc, const uint8_t *buf,
      * syschannel oopses on a data frame before wlan0 is set up (slirp's
      * router advertisements come early): nothing until the App talks
      */
+    if (s->host_asleep) {
+        /*
+         * The SoC sleeps (XM's AOV) and the chip keeps the link: a
+         * connection to the station wakes it, as the chip pulls the
+         * host's wake-up key line; the frame itself is dropped, the
+         * client's retransmission finds the host back up.  At most a
+         * pulse every 3 s.
+         */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        bool syn = size >= 14 + 20 + 20 && lduw_be_p(buf + 12) == 0x0800 &&
+                   buf[14 + 9] == 6 &&
+                   (buf[14 + ((buf[14] & 15) * 4) + 13] & 0x12) == 0x02;
+
+        if (syn && now - s->host_wake_at > 3 * NANOSECONDS_PER_SECOND) {
+            if (s->trace) {
+                qemu_log("ws73: a connection while the host sleeps: wake it\n");
+            }
+            s->host_wake_at = now;
+            qemu_set_irq(s->host_wake, 1);
+            timer_mod(s->host_wake_timer, now + 200 * SCALE_MS);
+        }
+        return size;
+    }
     if (!s->ip_sent || size + 4 + HCC_HDR > PKT_MAX) {
         return size;
     }
@@ -388,11 +416,13 @@ static void h2d_msg(Ws73State *s, uint32_t bits)
          * again and waits for the station's state anew
          */
         s->ip_sent = false;
+        s->host_asleep = false;
         s->rxq_head = s->rxq_count = 0;
         d2h_msg(s, D2H_BSP_READY);
     }
     if (bits & (1u << H2D_SUSPEND)) {
         d2h_msg(s, D2H_SUSPEND_ACK);
+        s->host_asleep = true;
     }
 }
 
@@ -710,12 +740,22 @@ static bool get_readonly(SDState *sd)
     return false;
 }
 
+static void ws73_host_wake_end(void *opaque)
+{
+    Ws73State *s = opaque;
+
+    qemu_set_irq(s->host_wake, 0);
+}
+
 static void ws73_realize(DeviceState *dev, Error **errp)
 {
     Ws73State *s = WS73_SDIO(dev);
 
     s->sdbus = SD_BUS(qdev_get_parent_bus(dev));
     qdev_init_gpio_out_named(dev, &s->wake, "wake", 1);
+    qdev_init_gpio_out_named(dev, &s->host_wake, "host-wake", 1);
+    s->host_wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      ws73_host_wake_end, s);
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&ws73_net_info, &s->conf,
                           object_get_typename(OBJECT(s)), dev->id,
@@ -730,6 +770,7 @@ static void ws73_reset(DeviceState *dev)
     s->rca = 0;
     s->io_left = 0;
     s->ip_sent = false;
+    s->host_asleep = false;
     s->rxq_head = s->rxq_count = 0;
     cccr_reset(s);
 }

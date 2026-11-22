@@ -2004,6 +2004,13 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
             /* its interrupt: the GPIO XM's syschannel asks for */
             qdev_connect_gpio_out_named(card, "wake", 0,
                 qdev_get_gpio_in(gpio, c->ws73_irq % 32));
+            /*
+             * Its host wake-up in XM's AOV: the power key's line
+             * (GPIO0_A2, gpio-keys, a wake-up source) on both boards
+             */
+            qdev_connect_gpio_out_named(card, "host-wake", 0,
+                qdev_get_gpio_in(DEVICE(object_resolve_path_component(
+                                     OBJECT(s), "gpio0")), 2));
         } else if (di) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);
 

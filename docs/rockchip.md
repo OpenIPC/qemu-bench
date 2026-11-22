@@ -1092,6 +1092,15 @@ RV1103 / RV1106:
     - The G2's power key is GPIO0_A2 too, and the same press wakes it
       (`inputs` 4, then 0: its `gpio-high=4C0` is on bank 4). DVRIP
       answers about 5 s after the press.
+    - A connection wakes it as well. From the host's suspend message
+      (16) to its next wait-ready (14), the WS73 model takes every frame
+      from the netdev. A TCP SYN for the station pulses its `host-wake`
+      output (wired to GPIO0_A2, the key's line) for 200 ms, at most
+      every 3 s, and the frame is dropped. The App wakes as for the key
+      and binds the Wi-Fi again, and the client's retransmission gets
+      through: a DVRIP login answers 8–10 s after the first try, with no
+      key press. How the real chip wakes the SoC isn't known; the key
+      line is the wake-up source the App already watches.
 
 - **RKVENC-PP** (`rk-vepu-pp`, `0xFFA60000`, SPI 108), the encoder's
   pre-processor for the smart features. The kernel (kmpp
@@ -1193,8 +1202,9 @@ RV1103 / RV1106:
   co-processor (`hichannel`) isn't there, so their Apps have no network.
   With it, the chip's firmware is modelled by its answers only (see
   `wifi=ws73`): no 802.11, no AP scan or join (cmd 0x20's Wi-Fi list),
-  no PIR events (cmd 0xa3), no wake-up from the network while in AOV,
-  and the RV1103B's `wlan0` keeps a zero MAC. The G2's video runs with
+  no PIR events (cmd 0xa3), no `WAKEUP_REASON` report after a wake-up
+  (a connection wakes the SoC through the power key's line), and the
+  RV1103B's `wlan0` keeps a zero MAC. The G2's video runs with
   `tb-isp` and `sensor2` (see Multi-sensor read-back).
 
 RV1109 / RV1126:
