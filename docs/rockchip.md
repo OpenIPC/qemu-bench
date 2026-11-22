@@ -1037,23 +1037,30 @@ RV1103 / RV1106:
   block is a white point for every illuminant: the xy ranges rkaiq
   programs aren't applied, so AWB lands a few per cent short of the
   exact gains. AF statistics aren't produced from the scene.
-- **Encoder:** H.265 P slices use the shared encoder's simple inter
-  coding (skip, or intra where the picture changed).
-  `-global rk-vepu540c.inter=on` turns on its real inter coding instead:
-  a motion search with sub-sample refinement, merge / AMVP and a coded
-  residual, within what the HAL's SPS / PPS allow (no temporal MVP, four
-  merge candidates). A qtest picture moving 3 pixels a frame decodes
-  clean, with P pictures 60 % of the skip/intra ones. On the XM R5
-  (2880x1616, the HAL's own VPS / SPS / PPS) its stream decodes without
-  an error, P pictures about half the I pictures' size. It stays off by
-  default because the search is slow: 149 main-stream pictures in 100 s
-  of host time against 666. The guest's clock stands still during the
-  job, so the firmware sees no difference, but everything else waits.
-  `-global rk-vepu540c.trace=on` logs each picture (size, type, QP, the
-  reference addresses) and `dump=PREFIX` appends each H.265 picture to
-  `PREFIX.<width>`. The HAL writes the parameter sets itself, so put
-  them in front to decode one; streams carved from an SD card's WFS
-  aren't reliable for this.
+- **Encoder:** H.265 P slices use the shared encoder's real inter coding
+  (`hevc-enc-inter.c.inc`): a motion search with sub-sample refinement,
+  merge / AMVP and a coded residual, within what the HAL's SPS / PPS
+  allow (no temporal MVP, four merge candidates).
+  - A merge candidate whose prediction is within HM's skip threshold
+    (`skip_threshold()`, the bits a coded CU would take at lambda) is
+    skipped, as the I-picture path's CUs are; one equal to the source is
+    taken at once.
+  - A candidate within about 4 levels a sample, its brightness aside
+    (an exposure step moves every sample alike), is kept with its
+    residual instead of searching.
+  - On the XM R5 (2880x1616) a P picture typically takes 40 ms of host
+    time and 2 KB (99.7 % of its CUs skipped). Exposure steps take up to
+    0.4 s, coded as residuals rather than left stale: 499 main pictures
+    in 100 s against 663 with `-global rk-vepu540c.inter=off` (the older
+    skip-or-intra coding).
+  - The streams of the R5, G2, RV1103B (two cameras stitched, 1920x2160)
+    and RV1109 (VEPU541, 1080p and 4K) decode in ffmpeg without errors.
+  - `-global rk-vepu540c.trace=on` logs each picture (size, type, QP,
+    the reference addresses, host time). `dump=PREFIX` appends each
+    H.265 picture to `PREFIX.<w>x<h>.<stream buffer>`, one file a
+    channel, with the HAL's parameter sets before each IDR, ready for
+    ffmpeg. Streams carved from an SD card's WFS aren't reliable for
+    this.
   There's no link-table mode (no devicetree here sets
   `rockchip,task-capacity`), no wrap reference buffers and no ROI. Online (DVBM)
   jobs start at the ISP's mainpath frame end, with the whole frame

@@ -620,6 +620,25 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
                            ref ? ref->pic : NULL, recon,
                            y, w, h, ys, uv, cs, out, cap);
     }
+    if (s->dump && n && n <= cap) {
+        /* PREFIX.<width>x<height>.<stream buffer>: one file a channel,
+         * the HAL's parameter sets before each IDR */
+        g_autofree char *f = g_strdup_printf("%s.%dx%d.%08x", s->dump, w, h,
+                                             REG(s, s->m->bsbt));
+        FILE *fp = fopen(f, "ab");
+
+        if (fp) {
+            if (!p_slice && hdr_len) {
+                g_autofree uint8_t *hb = g_malloc(hdr_len);
+
+                rk_vepu_dma_read(s, REG(s, s->m->bsbs) - hdr_len, hb, hdr_len,
+                                 MEMTXATTRS_UNSPECIFIED);
+                fwrite(hb, 1, hdr_len, fp);
+            }
+            fwrite(out, 1, n, fp);
+            fclose(fp);
+        }
+    }
     rec = rk_vepu_ref(s, REG(s, s->m->rfpw), true);
     hevc_enc_ref_free(rec->pic);
     rec->pic = recon;
@@ -875,27 +894,22 @@ static void rk_vepu_run(RkVepuState *s)
          * picture outlasted the driver's task timeout, the driver reset
          * the encoder mid-job and never got back in step.
          */
+        int64_t t0 = g_get_monotonic_time();
+
         cpu_disable_ticks();
         n = rk_vepu_stnd(s) == 1 ? rk_vepu_hevc(s, out, cap, &qp)
                                          : rk_vepu_h264(s, out, cap, &qp);
         cpu_enable_ticks();
+        if (s->trace) {
+            qemu_log("rk-vepu540c: %zu bytes in %" PRId64 " us\n", (size_t)n,
+                     g_get_monotonic_time() - t0);
+        }
         if (s->trace && n > cap) {
             qemu_log("rk-vepu540c: %zu bytes do not fit the %zu left\n",
                      (size_t)n, (size_t)cap);
         }
         if (n > cap) {
             n = 0;              /* truncated: nothing usable */
-        }
-        if (s->dump && n && rk_vepu_stnd(s) == 1) {
-            uint32_t rsl = REG(s, s->m->enc_rsl);
-            g_autofree char *f = g_strdup_printf("%s.%u", s->dump,
-                                                 ((rsl & 0x7ff) + 1) * 8);
-            FILE *fp = fopen(f, "ab");
-
-            if (fp) {
-                fwrite(out, 1, n, fp);
-                fclose(fp);
-            }
         }
         if (n) {
             rk_vepu_ring_rw(s, bs, out, n, true);
@@ -1025,9 +1039,9 @@ static void rk_vepu_realize(DeviceState *dev, Error **errp)
 static const Property rk_vepu_properties[] = {
     DEFINE_PROP_UINT32("job-ns", RkVepuState, job_ns, 1000000),
     DEFINE_PROP_BOOL("vepu541", RkVepuState, vepu541, false),
-    DEFINE_PROP_BOOL("inter", RkVepuState, inter, false),
+    DEFINE_PROP_BOOL("inter", RkVepuState, inter, true),
     DEFINE_PROP_BOOL("trace", RkVepuState, trace, false),
-    DEFINE_PROP_STRING("dump", RkVepuState, dump),
+    DEFINE_PROP_STRING("dump", RkVepuState, dump),     /* debugging */
     DEFINE_PROP_LINK("iommu", RkVepuState, iommu, "rk-iommu", Object *),
 };
 
