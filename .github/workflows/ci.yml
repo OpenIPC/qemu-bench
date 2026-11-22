@@ -290,9 +290,10 @@ jobs:
         run: python3 qemu/tests/test-xm-hevc.py
 
       # XM232: the VI store and BPU statistics (xm-vimu), the NN
-      # accelerator's colour converter and runs (xm-vta), adc.ko's
-      # calibration inputs and the media blocks' DDR alias.
-      - name: XM232 media (xm-vimu, xm-vta)
+      # accelerator's colour converter and runs (xm-vta), dma.ko's copy
+      # engine (xm-dmac), adc.ko's calibration inputs and the media
+      # blocks' DDR alias.
+      - name: XM232 media (xm-vimu, xm-vta, xm-dmac)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-xm232.py']
         run: python3 qemu/tests/test-xm-xm232.py
 

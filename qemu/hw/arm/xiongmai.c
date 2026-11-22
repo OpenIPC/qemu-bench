@@ -601,7 +601,8 @@ static const XmSoCConfig *xm535_config(void)
  *     45 / 46, xm_wdt.ko 48, dma.ko 47, hevc.ko 56.
  *   - Media: VI + ISP in one window at 0x30000000 (xm-vimu), the HEVC /
  *     H.264 engine at 0x21000000 with its own overlay regions (xm-hevc,
- *     layout xm232), the NN accelerator at 0x22000000 (xm-vta); no
+ *     layout xm232), the NN accelerator at 0x22000000 (xm-vta), dma.ko's
+ *     copy engine at 0x20020000 (xm-dmac); no
  *     hx280enc or JPEG engine.  The media blocks address the DDR at
  *     0x90000000 as well.
  */
@@ -638,6 +639,8 @@ static const XmSoCConfig *xm232_config(void)
         /* XmVtaMte.ko's vta_ip_base and vta_irq_num 59 (SPI 27) */
         c.vta_base = 0x22000000;
         c.vta_irq = 27;
+        /* dma.ko's copy engine (Sofia's AI frame fetch), IRQ 47 (SPI 15) */
+        c.dmac_irq = 15;
         c.vimu_irqs[0] = 32;
         c.vimu_irqs[1] = 56;
         c.vimu_irqs[2] = 57;
@@ -1378,6 +1381,14 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     }
     if (c->vta_base) {
         sysbus_create_simple("xm-vta", c->vta_base, pic[c->vta_irq]);
+    }
+    if (c->dmac_irq) {
+        DeviceState *dmac = qdev_new("xm-dmac");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dmac), &error_fatal);
+        /* over the "xm-dma" placeholder regbank */
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dmac), 0, 0x20020000, 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dmac), 0, pic[c->dmac_irq]);
     }
     if (c->vimu) {
         DeviceState *vimu = qdev_new("xm-vimu");

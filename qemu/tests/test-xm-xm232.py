@@ -16,7 +16,9 @@ and the machine's DDR alias do with them:
     inside it (Sofia's reset key is ADC channel 2);
   - the VTA's colour converter: NV12 to 3-byte pixels by the programmed
     coefficients, done at +0x8F4 (written 1 to clear);
-  - a VTA network run: +0x008 set and +0x218 idle (0x30) a millisecond on.
+  - a VTA network run: +0x008 set and +0x218 idle (0x30) a millisecond on;
+  - dma.ko's copy engine: two blocks as its ioctl and interrupt handler
+    run them, the data copied, the done status raised and cleared.
 
     python3 qemu/tests/test-xm-xm232.py [--qemu PATH]
 """
@@ -34,6 +36,7 @@ ST_EN, ST_Y, ST_YS, ST_YSIZE, ST_C, ST_CS, ST_DONE, ST_ACK = (
 AWB = 0x4B000
 VTA = 0x22000000
 GPIO = 0x10020000
+DMAC = 0x20020000
 BUF = 0x82000000          # in the MMZ, as vb.ko hands buffers out
 FPS = 12                  # xm-vimu's default, per sensor; two sensors
 
@@ -153,6 +156,29 @@ def main():
         check(q.readl(VTA + 0x008) == 1, 'and its done bit, the interrupt, set')
         q.writel(VTA + 0x008, 0)
         check(q.readl(VTA + 0x008) == 0, 'XmVtaMte.ko\'s 0 clears it')
+
+        # dma.ko: 32 KiB in two 16 KiB blocks, source in the media view
+        src, dst, n = BUF + 0x500000, BUF + 0x600000, 0x8000
+        pattern = bytes((i * 7 + (i >> 8)) & 0xff for i in range(n))
+        q.write(src, pattern)
+        q.write(dst, b'\0' * n)
+        q.writel(DMAC + 0x010, 0)
+        for blk in range(2):
+            o = blk * 0x4000
+            q.writel(DMAC + 0x100, src + 0x10000000 + o)
+            q.writel(DMAC + 0x108, dst + o)
+            q.writel(DMAC + 0x110, 0x4000 // 8 - 1)
+            q.writel(DMAC + 0x180, 2)
+            q.writel(DMAC + 0x190, 2)
+            q.writel(DMAC + 0x010, 3)
+            q.writel(DMAC + 0x018, q.readl(DMAC + 0x018) | 0x101)
+            q.cmd('clock_step 100000')
+            st = q.readl(DMAC + 0x188)
+            check(st == 2, 'DMA block %d done (status 0x%x)' % (blk, st))
+            check(q.readl(DMAC + 0x018) & 1 == 0, 'and its channel off again')
+            q.writel(DMAC + 0x198, st)
+            check(q.readl(DMAC + 0x188) == 0, 'the handler\'s write clears it')
+        check(q.read(dst, n) == pattern, 'the 32 KiB copied')
     finally:
         q.close()
     print('=== %s: xm232 ===' % ('PASS' if not fails else 'FAIL'))

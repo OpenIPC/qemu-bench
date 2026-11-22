@@ -641,8 +641,16 @@ latching SP804, UARTs, GMAC, SFC v2), with these differences:
     another chip version) `wlandaemon` finds no card, reloads the driver
     and reboots the camera.
 
-**Open.** `dma.ko`'s engine (0x20020000) is a placeholder (`dma timeout`
-on the console). `wlandaemon`'s QR-code Wi-Fi setup fails on real hardware too: its
+    - **xm-dmac**: `dma.ko`'s copy engine (0x20020000, SPI 15), which
+      Sofia's AI frame fetch (`xm_ai_getframe_doublecam*`) uses through
+      `/dev/dma` to copy VI frames to the detector: source +0x100,
+      destination +0x108, 8-byte transfers − 1 at +0x110, +0x010 3 on,
+      +0x018 bits 0 / 8 start the channel (it reads 0 when the block is
+      done), done status +0x188 masked by +0x190, cleared by writing it to
+      +0x198; `dma.ko` copies 16 KiB a block and starts the next from its
+      interrupt. Without it every copy waits out 200 ms (`dma timeout`).
+
+**Open.** `wlandaemon`'s QR-code Wi-Fi setup fails on real hardware too: its
 static media library sends `mmz.ko` ioctls with a 0x2C-byte argument where
 this `mmz.ko` takes 0x30 (`mmz: ioctl cmd error`). For debugging: Sofia
 logs to `/var/sofia.log`; the `isp` daemon, which Sofia starts as
