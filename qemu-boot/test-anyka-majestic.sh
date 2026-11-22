@@ -83,7 +83,13 @@ while [ $# -gt 0 ]; do
     --keep) KEEP=1 ;;
     --codec) CODEC=$2; shift ;;
     --sensor) SENSOR=$2; shift ;;
-    --sensor-reset) SENSOR_RESET=$2; shift ;;
+    --sensor-reset)
+        # it goes into -M's comma list: a GPIO 0..95 or none, nothing else
+        case $2 in
+        none|[0-9]|[1-8][0-9]|9[0-5]) SENSOR_RESET=$2 ;;
+        *) echo "--sensor-reset: a GPIO number 0..95, or none" >&2; exit 2 ;;
+        esac
+        shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
