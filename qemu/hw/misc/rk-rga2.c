@@ -646,13 +646,18 @@ static void rk_rga2_done(void *opaque)
 
         dma_memory_read(&address_space_memory, REG(s, R_CMD_BASE), c,
                         sizeof(c), MEMTXATTRS_UNSPECIFIED);
-        RGA_TRACE(s, "done mode %u src %ux%u dst %ux%u dst0 0x%x, int en 0x%x",
-                  le32_to_cpu(c[0]) & 7,
+        RGA_TRACE(s, "done mode %u src_info 0x%x alpha0 0x%x src %ux%u dst "
+                  "%ux%u dst0 0x%x, int en 0x%x",
+                  le32_to_cpu(c[0]) & 7, le32_to_cpu(c[1]),
+                  le32_to_cpu(c[0x50 / 4]),
                   (le32_to_cpu(c[0x1c / 4]) & 0x1fff) + 1,
                   ((le32_to_cpu(c[0x1c / 4]) >> 16) & 0x1fff) + 1,
                   (le32_to_cpu(c[0x4c / 4]) & 0x1fff) + 1,
                   ((le32_to_cpu(c[0x4c / 4]) >> 16) & 0x1fff) + 1,
                   le32_to_cpu(c[0x3c / 4]), REG(s, R_INT));
+        RGA_TRACE(s, "  src0 0x%x vir %u mmu 0x%x", le32_to_cpu(c[0x08 / 4]),
+                  le32_to_cpu(c[0x18 / 4]) & 0xffff,
+                  le32_to_cpu(c[0x6c / 4]));
     }
     rk_rga2_update(s);
 }

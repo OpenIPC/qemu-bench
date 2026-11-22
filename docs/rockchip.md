@@ -1028,8 +1028,18 @@ RV1103 / RV1106:
     mainpath frames a camera. Its
     object detector fails (`rockiva ... run error -1`): the NPU doesn't
     compute.
-- **ISP processing:** of the tone stages only gamma out is applied (no
-  DRC, dehaze or 3D LUT). The colour matrix (CCM) is applied without its
+- **ISP processing:** of the tone stages gamma out and the 3D LUT are
+  applied; DRC and dehaze aren't. The 3D LUT (`isp_params_v32.c`
+  isp_3dlut_config) is a 9 x 9 x 9 lattice over the colour after the
+  CCM, R fastest, then G, then B. Each entry is one word: B in bits
+  9:0, G in 21:10, R in 31:22 (R and B 10-bit, G 12-bit). The table is
+  read from MI_LUT_3D_RD_BASE (0x1940, WSIZE 0x1950 = 729) while
+  `3DLUT_CTRL` (0x3E00) bit 0 is set, trilinear between the points. The
+  XM R5's rkaiq loads the identity. `-global rk-isp32.lut3d=off` skips
+  it. DRC (0x3900) and dehaze (0x3C00) are on in that firmware, but the
+  kernel only loads their parameters (gain / compression curves,
+  bilateral sigmas, dehaze thresholds); what the silicon does with them
+  isn't documented, so they aren't guessed at. The colour matrix (CCM) is applied without its
   high-luma fade (`alp_y`). White balance and colour processing are
   applied too: the AWB gains (gain0 at 0x538 and
   AWB1 at 0x530, multiplied together, when ISP_CTRL0 bit 7 is set) and

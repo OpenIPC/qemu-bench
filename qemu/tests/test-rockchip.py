@@ -562,6 +562,26 @@ def test_isp32_colour(qt):
           'ISP32 CCM: R and B swapped, the red bar turns blue (Cb/Cr %d/%d)'
           % blue[1:])
     qt.writel(P + 0x700, 0)
+    # 3D LUT (9 x 9 x 9, R fastest; B 9:0, G 21:10, R 31:22): R and B
+    # swapped in the table turns the red bar blue too
+    L = 0x01400000
+    words = []
+    for b in range(9):
+        for g in range(9):
+            for r in range(9):
+                rr, gg, bb = min(r * 128, 1023), min(g * 512, 4095), \
+                    min(b * 128, 1023)
+                words.append(rr | gg << 10 | bb << 22)   # R into B, B into R
+    qt.write(L, struct.pack('<729I', *words))
+    qt.writel(P + 0x1940, L)
+    qt.writel(P + 0x1950, 729)
+    qt.writel(P + 0x3e00, 1)
+    px = frame()
+    lut = px(1, 2)
+    check(lut[1] > 140 and lut[2] < 128,
+          'ISP32 3D LUT: R and B swapped in the table, the red bar turns '
+          'blue (Cb/Cr %d/%d)' % lut[1:])
+    qt.writel(P + 0x3e00, 0)
     # gamma out: a flat curve at full scale
     for i in range(25):
         qt.writel(P + 0x910 + 4 * i, 4095 << 16 | 4095)

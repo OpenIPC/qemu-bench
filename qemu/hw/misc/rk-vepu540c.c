@@ -600,8 +600,9 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
         have_hdr = rk_vepu_headers(s, &hdr, &hdr_len);
     }
     if (s->trace) {
-        qemu_log("rk-vepu540c %ux%u %s poc %d qp %d rfpr 0x%x%s rfpw 0x%x "
-                 "hdr %d\n", w, h, p_slice ? "P" : "I", poc, qp,
+        qemu_log("rk-vepu540c %ux%u %s poc %d qp %d src 0x%x rfpr 0x%x%s "
+                 "rfpw 0x%x hdr %d\n", w, h, p_slice ? "P" : "I", poc, qp,
+                 REG(s, s->m->src0),
                  REG(s, s->m->rfpr), p_slice ? (ref ? "" : " (none)") : "",
                  REG(s, s->m->rfpw), have_hdr);
     }

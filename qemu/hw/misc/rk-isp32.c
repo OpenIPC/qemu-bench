@@ -224,6 +224,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define HIST_BINS       256
 #define AWB_WP          4096        /* white points per illuminant */
 #define R_CCM_CTRL      0x0700      /* bit 0: the colour matrix on */
+#define R_LUT3D_RD_BASE 0x1940      /* the 3D LUT's table in memory */
+#define R_LUT3D_WSIZE   0x1950      /* its entries (729: 9 x 9 x 9) */
+#define R_LUT3D_CTRL    0x3e00      /* bit 0 the 3D LUT on */
+#define LUT3D_N         9
 #define R_CCM_COEFF     0x0704      /* per row R, G, B: c0 | c1 << 16, c2 |
                                        offset << 16; I + C / 128 */
 #define R_GOC_CTRL      0x0900      /* gamma out: bit 0 on, 1 equidistant,
@@ -261,6 +265,7 @@ struct RkIsp32State {
     bool readback;          /* ISP20: frames run by read-back triggers */
     bool v33;               /* ISP V33 (RV1103B): its IIR read handshake */
     bool trace;             /* log frames and read-back triggers */
+    bool lut3d_en;          /* property: apply the 3D LUT */
     uint32_t passes;        /* read-back passes left in this frame */
     Object *sensor;
 
@@ -280,6 +285,7 @@ struct RkIsp32State {
     uint64_t awb_rgain, awb_bgain;      /* sums of G/R and G/B, Q8 */
     uint64_t awb_zone[AWB_ZONES * AWB_ZONES][4];    /* R, G, B, white */
     float goc_lut[4096];    /* this frame's gamma out, level -> 0..255 */
+    uint32_t lut3d[LUT3D_N * LUT3D_N * LUT3D_N]; /* this frame's 3D LUT */
 };
 
 #define REG(s, off) ((s)->regs[(off) / 4])
@@ -382,6 +388,9 @@ static double rk_isp32_goc(RkIsp32State *s, double x)
  * The frame now ending: each 8x8 block's raw levels at the sensor's
  * exposure, its NV12, and the statistics of those levels.
  */
+static bool rk_isp32_lut3d_load(RkIsp32State *s);
+static void rk_isp32_lut3d(RkIsp32State *s, double v[3]);
+
 static void rk_isp32_render(RkIsp32State *s)
 {
     uint32_t w = REG(s, R_ISP_OUT_H) & 0x3fff, h = REG(s, R_ISP_OUT_V) & 0x3fff;
@@ -389,7 +398,7 @@ static void rk_isp32_render(RkIsp32State *s)
     uint64_t lite[AE_LITE_N * AE_LITE_N][4] = { { 0 } };
     uint64_t big[AE_BIG_N * AE_BIG_N][4] = { { 0 } };
     double k, gain[3] = { 1, 1, 1 }, ccm[3][4];
-    bool ccm_on;
+    bool ccm_on, lut3d_on;
     double resp[3] = { s->raw_r / 1000.0, 1, s->raw_b / 1000.0 };
     uint32_t bx, by, i;
     int c;
@@ -410,6 +419,7 @@ static void rk_isp32_render(RkIsp32State *s)
     }
     /* colour correction: each row's deltas from identity, Q7, + offset */
     ccm_on = REG(s, R_CCM_CTRL) & 1;
+    lut3d_on = rk_isp32_lut3d_load(s);
     for (c = 0; c < 3; c++) {
         uint32_t w0 = REG(s, R_CCM_COEFF + 8 * c);
         uint32_t w1 = REG(s, R_CCM_COEFF + 8 * c + 4);
@@ -480,6 +490,9 @@ static void rk_isp32_render(RkIsp32State *s)
                     out[c] = MIN(MAX(v, 0), LEVEL_MAX);
                 }
             }
+            if (lut3d_on) {
+                rk_isp32_lut3d(s, out);
+            }
             for (c = 0; c < 3; c++) {
                 out[c] = s->goc_lut[MIN((uint32_t)out[c], 4095)];
             }
@@ -514,6 +527,62 @@ static void rk_isp32_render(RkIsp32State *s)
         REG(s, R_AE_BIG + 0x30 + 0x10 * c) = v;
         REG(s, R_AE_BIG2 + 0x30 + 0x10 * c) = v;
         REG(s, R_AE_BIG3 + 0x30 + 0x10 * c) = v;
+    }
+}
+
+/*
+ * The 3D LUT (isp_params_v32.c isp_3dlut_config): a 9 x 9 x 9 lattice over
+ * the colour after the CCM, R fastest then G then B, one word an entry --
+ * B in bits 9:0, G 21:10, R 31:22 (R and B 10-bit, G 12-bit) -- read from
+ * MI_LUT_3D_RD_BASE; between the lattice points trilinear.  rkaiq's
+ * default is the identity (R / B in steps of 128, G of 512).
+ */
+static bool rk_isp32_lut3d_load(RkIsp32State *s)
+{
+    uint32_t n = REG(s, R_LUT3D_WSIZE), i;
+
+    if (!s->lut3d_en || s->readback || !(REG(s, R_LUT3D_CTRL) & 1) ||
+        n != LUT3D_N * LUT3D_N * LUT3D_N || !REG(s, R_LUT3D_RD_BASE)) {
+        return false;
+    }
+    dma_memory_read(&address_space_memory, REG(s, R_LUT3D_RD_BASE), s->lut3d,
+                    sizeof(s->lut3d), MEMTXATTRS_UNSPECIFIED);
+    for (i = 0; i < n; i++) {
+        s->lut3d[i] = le32_to_cpu(s->lut3d[i]);
+    }
+    ISP_TRACE(s, "3D LUT at 0x%x: %08x %08x %08x .. %08x",
+              REG(s, R_LUT3D_RD_BASE), s->lut3d[0], s->lut3d[1],
+              s->lut3d[9], s->lut3d[728]);
+    return true;
+}
+
+/* @v (R, G, B levels, 12-bit) through the 3D LUT */
+static void rk_isp32_lut3d(RkIsp32State *s, double v[3])
+{
+    double f[3], o[3] = { 0, 0, 0 };
+    int i0[3], c, k;
+
+    for (c = 0; c < 3; c++) {
+        double x = MIN(MAX(v[c], 0), LEVEL_MAX) * (LUT3D_N - 1) /
+                   (LEVEL_MAX + 1.0);
+
+        i0[c] = MIN((int)x, LUT3D_N - 2);
+        f[c] = x - i0[c];
+    }
+    for (k = 0; k < 8; k++) {
+        int r = i0[0] + (k & 1), g = i0[1] + ((k >> 1) & 1),
+            b = i0[2] + ((k >> 2) & 1);
+        double wgt = ((k & 1) ? f[0] : 1 - f[0]) *
+                     (((k >> 1) & 1) ? f[1] : 1 - f[1]) *
+                     (((k >> 2) & 1) ? f[2] : 1 - f[2]);
+        uint32_t e = s->lut3d[(b * LUT3D_N + g) * LUT3D_N + r];
+
+        o[0] += wgt * ((e >> 22) & 0x3ff) * 4;      /* 10 -> 12 bits */
+        o[1] += wgt * ((e >> 10) & 0xfff);
+        o[2] += wgt * (e & 0x3ff) * 4;
+    }
+    for (c = 0; c < 3; c++) {
+        v[c] = MIN(o[c], LEVEL_MAX);
     }
 }
 
@@ -786,8 +855,11 @@ static void rk_isp32_frame_end(RkIsp32State *s, bool online)
 {
     uint32_t mi = 0;
 
-    ISP_TRACE(s, "frame %u end %s mi_shd 0x%x", s->frame,
-              online ? "online" : "read-back", REG(s, R_MI_CTRL_SHD));
+    ISP_TRACE(s, "frame %u end %s mi_shd 0x%x mp_y 0x%x bp %d bp_y 0x%x "
+              "out %ux%u", s->frame, online ? "online" : "read-back",
+              REG(s, R_MI_CTRL_SHD), REG(s, R_MP_Y_SHD),
+              !!(REG(s, R_MI_CTRL2_SHD) & BP_EN_OUT_SHD), REG(s, R_BP_Y_SHD),
+              REG(s, R_ISP_OUT_H) & 0x3fff, REG(s, R_ISP_OUT_V) & 0x3fff);
 
     rk_isp32_render(s);
     rk_isp32_stats_ddr(s);
@@ -1101,6 +1173,7 @@ static const Property rk_isp32_properties[] = {
     DEFINE_PROP_BOOL("readback", RkIsp32State, readback, false),
     DEFINE_PROP_BOOL("v33", RkIsp32State, v33, false),
     DEFINE_PROP_BOOL("trace", RkIsp32State, trace, false),
+    DEFINE_PROP_BOOL("lut3d", RkIsp32State, lut3d_en, true),
     DEFINE_PROP_LINK("sensor", RkIsp32State, sensor, TYPE_DEVICE, Object *),
 };
 
