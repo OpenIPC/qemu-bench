@@ -107,6 +107,9 @@ static const ImageSensorSpec image_sensors[] = {
       .exp_rows = true },
     { "sc2337ps1", SMARTSENS, 0x32, 0x9B3A, .pclk = 79200000, .hts = 2200,
       .exp_rows = true },
+    /* the SC1346 reads the SC1A4T's ID: AliOS's camera_sc1346 takes it */
+    { "sc1346", SMARTSENS, 0x30, 0xDA4D, .pclk = 72000000, .hts = 1600,
+      .exp_rows = true },
     { "sc1a4t", SMARTSENS, 0x30, 0xDA4D, .pclk = 72000000, .hts = 1600,
       .exp_rows = true },
     { "sc1a4ts1", SMARTSENS, 0x32, 0xDA4D, .pclk = 72000000, .hts = 1600,
