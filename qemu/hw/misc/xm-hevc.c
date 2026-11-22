@@ -119,6 +119,8 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
+#include "qemu/notify.h"
+#include "system/system.h"
 #include "qapi/error.h"
 #include "qom/object.h"
 #include "system/dma.h"
@@ -284,6 +286,7 @@ struct XmHevcState {
     GAsyncQueue *done;
     QEMUBH *done_bh;
     uint32_t gen;               /* bumped by reset: stale jobs are dropped */
+    Notifier exit;              /* writes the H.264 dumps still pending */
 };
 
 typedef struct XmHevcJob {
@@ -376,7 +379,7 @@ static void xm_hevc_osd_region(uint8_t *y, uint8_t *uv, int w, int h, int sw,
             }
             y[(size_t)sy * ys + sx] = osd_blend(y[(size_t)sy * ys + sx],
                                                 c >> 16, c >> 24);
-            if (!(sy & 1)) {
+            if (!(sy & 1) && sy / 2 < sh / 2 && (sx & ~1) + 1 < cs) {
                 uint8_t *p = &uv[(size_t)(sy / 2) * cs + (sx & ~1)];
 
                 p[0] = osd_blend(p[0], c >> 8, c >> 24);
@@ -744,7 +747,8 @@ static void xm_hevc_encode_job(XmHevcState *s, int w, int h, int sw,
                                uint32_t len_reg, const XmHevcJob *avc)
 {
     if (w < 8 || h < 8 || w > 8192 || h > 8192 || (w & 7) || (h & 7) ||
-        sw < 2 || sh < 2 || sw > 8192 || sh > 8192 || ys < sw || cs < sw ||
+        sw < 2 || sh < 2 || sw > 8192 || sh > 8192 || (sw & 1) || (sh & 1) ||
+        ys < sw || cs < sw ||
         ys > XM_HEVC_MAX_STRIDE || cs > XM_HEVC_MAX_STRIDE ||
         !y_pa || !uv_pa || !out_pa || !cap) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-hevc: job %dx%d from %dx%d "
@@ -1009,7 +1013,9 @@ static void xm_hevc_jpeg232(XmHevcState *s, int w, int h, int sw, int sh)
     bool overflow;
 
     R(s, X2_JPEG_LEN) = 0;
+    /* NV12 in whole chroma pairs and rows */
     if (w < 8 || h < 8 || w > 8192 || h > 8192 || sw < 2 || sh < 2 ||
+        sw > 8192 || sh > 8192 || (sw & 1) || (sh & 1) ||
         ys < sw || cs < sw || ys > XM_HEVC_MAX_STRIDE ||
         cs > XM_HEVC_MAX_STRIDE || !out || !cap) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-hevc: snapshot %dx%d not done\n",
@@ -1051,13 +1057,16 @@ static void xm_hevc_jpeg232(XmHevcState *s, int w, int h, int sw, int sh)
             cr[(size_t)py * cw + px] = c[sx + 1];
         }
     }
-    g_autofree uint8_t *jpg = g_malloc(cap);
+    /* no more than a 4:2:2 scan of the picture can take: the guest's free
+     * count can be anything */
+    const uint32_t room = MIN(cap, (uint32_t)((size_t)w * h * 4 + 4096));
+    g_autofree uint8_t *jpg = g_malloc(room);
     const size_t n = jpeg_enc_scan_422(y, w, cb, cr, cw, w, h, q[0], q[1],
-                                       false, jpg, cap, &overflow);
+                                       false, jpg, room, &overflow);
 
     if (overflow) {
         qemu_log_mask(LOG_GUEST_ERROR, "xm-hevc: snapshot over %u bytes\n",
-                      cap);
+                      room);
     }
     dma_memory_write(&address_space_memory, out, jpg, n,
                      MEMTXATTRS_UNSPECIFIED);
@@ -1281,8 +1290,7 @@ static void xm_hevc_reset(DeviceState *dev)
     /* the H.264 streams start over: codec, deblocking, pending dumps (the
      * worker drops its references itself when it sees the new gen) */
     for (int i = 0; i < ARRAY_SIZE(s->avc_streams); i++) {
-        g_free(s->avc_streams[i].dump_path);
-        g_free(s->avc_streams[i].dump);
+        xm_hevc_avc_dump_flush(s, i);       /* its headers are in place */
     }
     memset(s->avc_streams, 0, sizeof(s->avc_streams));
     xm_hevc_update(s);
@@ -1305,6 +1313,15 @@ static void xm_hevc_init(Object *obj)
     s->done_bh = qemu_bh_new(xm_hevc_done, s);
     /* one worker: jobs complete in order, as the engine's would */
     s->pool = g_thread_pool_new(xm_hevc_work, NULL, 1, FALSE, NULL);
+}
+
+static void xm_hevc_exit(Notifier *n, void *data)
+{
+    XmHevcState *s = container_of(n, XmHevcState, exit);
+
+    for (int i = 0; i < ARRAY_SIZE(s->avc_streams); i++) {
+        xm_hevc_avc_dump_flush(s, i);
+    }
 }
 
 static void xm_hevc_realize(DeviceState *dev, Error **errp)
@@ -1335,6 +1352,11 @@ static void xm_hevc_realize(DeviceState *dev, Error **errp)
         s->xm232 = true;
         s->ref_off = 0x114;
         s->recon_off = 0x11C;
+        if (s->dump_dir) {
+            /* the last H.264 job of each stream waits for its headers */
+            s->exit.notify = xm_hevc_exit;
+            qemu_add_exit_notifier(&s->exit);
+        }
     } else {
         error_setg(errp, "xm-hevc: unknown layout '%s'", s->layout);
     }

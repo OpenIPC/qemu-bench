@@ -16,6 +16,7 @@
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
+#include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/dma.h"
@@ -93,7 +94,12 @@ static void xm_vta_csc(XmVtaState *s)
     const int s0 = R(CSC_ROW0 + 12) & 31, s1 = R(CSC_ROW1 + 16) & 31;
     const int s2 = R(CSC_ROW2 + 12) & 31;
 
-    if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || st < w || ost < 3 * w) {
+    /* NV12: whole chroma pairs and rows; strides no longer than a row of
+     * the largest picture needs */
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || (w & 1) || (h & 1) ||
+        st < w || st > 4096 || ost < 3 * w || ost > 3 * 4096) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-vta: conversion %dx%d (strides "
+                      "%d / %d) not done\n", w, h, st, ost);
         return;
     }
     g_autofree uint8_t *y = g_malloc((size_t)st * h);
