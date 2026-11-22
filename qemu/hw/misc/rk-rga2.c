@@ -557,6 +557,52 @@ static void rga_blit_general(const uint32_t *cmd, const RgaPic *src,
     }
 }
 
+/*
+ * NV12 to NV12, scaled: what the general path below does pixel by pixel
+ * (the nearest source pixel, its chroma pair), a row of bytes at a time.
+ * The XM R5's 1920x1080 -> 2880x1616 upscale took 14 ms that way.
+ */
+static void rga_scale_nv12(const RgaPic *src, const RgaPic *dst,
+                           uint8_t *sy_row, uint8_t *sc_row, uint8_t *o)
+{
+    g_autofree uint32_t *xm = g_new(uint32_t, dst->w);
+    bool swap = !!src->uv_swap != !!dst->uv_swap;
+    uint32_t x, y, last = UINT32_MAX, lastc = UINT32_MAX;
+    uint32_t cw = dst->w & ~1u;
+
+    for (x = 0; x < dst->w; x++) {
+        xm[x] = (uint64_t)x * src->w / dst->w;
+    }
+    for (y = 0; y < dst->h; y++) {
+        uint32_t sy = (uint64_t)y * src->h / dst->h;
+
+        if (sy != last) {
+            rga_mem(src, src->base[0] + sy * src->stride, sy_row, src->w,
+                    false);
+            last = sy;
+        }
+        for (x = 0; x < dst->w; x++) {
+            o[x] = sy_row[xm[x]];
+        }
+        rga_mem(dst, dst->base[0] + y * dst->stride, o, dst->w, true);
+        if (dst->y_only || (y & 1)) {
+            continue;
+        }
+        if (sy / 2 != lastc) {
+            rga_mem(src, src->base[1] + (sy / 2) * src->stride, sc_row,
+                    (src->w & ~1u) + 2, false);
+            lastc = sy / 2;
+        }
+        for (x = 0; x < cw; x += 2) {
+            const uint8_t *c = sc_row + (xm[x] & ~1u);
+
+            o[x] = c[swap];
+            o[x + 1] = c[!swap];
+        }
+        rga_mem(dst, dst->base[1] + (y / 2) * dst->stride, o, cw, true);
+    }
+}
+
 static void rk_rga2_run(RkRga2State *s)
 {
     uint32_t cmd[32];
@@ -610,6 +656,10 @@ static void rk_rga2_run(RkRga2State *s)
         rga_blit_general(cmd, &src, &dst, in, out, t0, t1, t2);
         return;
     }
+    if (src.fmt == 0xa && dst.fmt == 0xa) {
+        rga_scale_nv12(&src, &dst, t0, t1, t2);
+        return;
+    }
     for (y = 0; y < dst.h; y++) {
         uint32_t sy = (uint64_t)y * src.h / dst.h;
 
@@ -637,8 +687,10 @@ static void rk_rga2_run(RkRga2State *s)
 static void rk_rga2_done(void *opaque)
 {
     RkRga2State *s = opaque;
+    int64_t t0 = g_get_monotonic_time();
 
     rk_rga2_run(s);
+    t0 = g_get_monotonic_time() - t0;
     REG(s, R_STATUS) = 0;
     s->ints |= INT_ALL_DONE;
     if (s->trace) {
@@ -647,14 +699,14 @@ static void rk_rga2_done(void *opaque)
         dma_memory_read(&address_space_memory, REG(s, R_CMD_BASE), c,
                         sizeof(c), MEMTXATTRS_UNSPECIFIED);
         RGA_TRACE(s, "done mode %u src_info 0x%x alpha0 0x%x src %ux%u dst "
-                  "%ux%u dst0 0x%x, int en 0x%x",
+                  "%ux%u dst0 0x%x, int en 0x%x, %" PRId64 " us",
                   le32_to_cpu(c[0]) & 7, le32_to_cpu(c[1]),
                   le32_to_cpu(c[0x50 / 4]),
                   (le32_to_cpu(c[0x1c / 4]) & 0x1fff) + 1,
                   ((le32_to_cpu(c[0x1c / 4]) >> 16) & 0x1fff) + 1,
                   (le32_to_cpu(c[0x4c / 4]) & 0x1fff) + 1,
                   ((le32_to_cpu(c[0x4c / 4]) >> 16) & 0x1fff) + 1,
-                  le32_to_cpu(c[0x3c / 4]), REG(s, R_INT));
+                  le32_to_cpu(c[0x3c / 4]), REG(s, R_INT), t0);
         RGA_TRACE(s, "  src0 0x%x vir %u mmu 0x%x", le32_to_cpu(c[0x08 / 4]),
                   le32_to_cpu(c[0x18 / 4]) & 0xffff,
                   le32_to_cpu(c[0x6c / 4]));

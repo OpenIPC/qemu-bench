@@ -854,6 +854,7 @@ static void rk_isp32_frame_begin(RkIsp32State *s, bool online)
 static void rk_isp32_frame_end(RkIsp32State *s, bool online)
 {
     uint32_t mi = 0;
+    int64_t t0;
 
     ISP_TRACE(s, "frame %u end %s mi_shd 0x%x mp_y 0x%x bp %d bp_y 0x%x "
               "out %ux%u", s->frame, online ? "online" : "read-back",
@@ -861,6 +862,7 @@ static void rk_isp32_frame_end(RkIsp32State *s, bool online)
               !!(REG(s, R_MI_CTRL2_SHD) & BP_EN_OUT_SHD), REG(s, R_BP_Y_SHD),
               REG(s, R_ISP_OUT_H) & 0x3fff, REG(s, R_ISP_OUT_V) & 0x3fff);
 
+    t0 = g_get_monotonic_time();
     rk_isp32_render(s);
     rk_isp32_stats_ddr(s);
     if (online) {
@@ -884,6 +886,8 @@ static void rk_isp32_frame_end(RkIsp32State *s, bool online)
                       REG(s, R_BP_LLENGTH));
         mi |= MI_BP_FRAME;
     }
+    ISP_TRACE(s, "frame %u drawn in %" PRId64 " us", s->frame,
+              g_get_monotonic_time() - t0);
     s->frame++;
     rk_isp32_stats(s);
     REG(s, R_ISP_RIS) |= ISP_FRAME_IN | ISP_FRAME;

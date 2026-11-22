@@ -95,6 +95,7 @@
 #include "block/thread-pool.h"
 #include "hw/misc/rk-iommu.h"
 #include "system/cpu-timers.h"
+#include "system/qtest.h"
 
 #define TYPE_RK_VEPU540C "rk-vepu540c"
 OBJECT_DECLARE_SIMPLE_TYPE(RkVepuState, RK_VEPU540C)
@@ -213,7 +214,33 @@ struct RkVepuState {
     char *dump;                 /* property: H.265 out to dump.<width> */
     Object *iommu;
     bool dvbm_armed;            /* DVBM_CFG enabled: the ISP's next frame */
+    bool sync;                  /* property: code in the register write */
+    struct RkVepuVidWork *vid;  /* the video half on the thread pool */
+    QEMUTimer *late;            /* its deadline: wait for it there */
+    GArray *held;               /* register writes while it runs */
 };
+
+/*
+ * The video half of a job, coded on the thread pool while the guest runs
+ * on.  It reads the register file, which holds still meanwhile: writes to
+ * it wait in "held" until the half is applied.
+ */
+typedef struct RkVepuVidWork {
+    RkVepuState *s;
+    uint32_t gen;
+    uint32_t bs, qp, blocks;
+    size_t cap, n;
+    int64_t t0, us;
+    QemuEvent ev;               /* set when coding is done */
+    bool applied;               /* its results are in the registers */
+} RkVepuVidWork;
+
+typedef struct RkVepuHeld {
+    hwaddr off;
+    uint32_t val;
+} RkVepuHeld;
+
+#define VID_DEADLINE_NS (150 * SCALE_MS)
 
 typedef struct RkVepuJpegWork {
     RkVepuState *s;
@@ -545,6 +572,67 @@ static bool rk_vepu_headers(RkVepuState *s, HevcEncHdr *hdr, uint32_t *len)
     return false;
 }
 
+/*
+ * MPP's "debreath" I picture is two jobs.  Pass 1 codes the frame as a P
+ * picture with ENC_PIC cur_frm_ref (bit 2) and rec_fbc_dis (bit 31): its
+ * reconstruction goes uncompressed to RFPW_B (0x290).  Pass 2 is the IDR,
+ * from that buffer: SRC_FMT src_rcne (bit 6), SRC0 at the buffer, SRC1
+ * two strides in, chroma stride three.  In that layout each pair of luma
+ * rows is followed by their CbCr row (S = the width aligned to 16):
+ * luma row r at (r / 2) * 3S + (r & 1) * S, CbCr row c at 2S + c * 3S.
+ */
+#define R_RFPW_B        0x290
+#define ENC_PIC_CUR_REF (1u << 2)
+#define ENC_PIC_NOFBC   (1u << 31)
+#define SRC_FMT_RCNE    (1u << 6)
+
+static bool rk_vepu_rcne(RkVepuState *s)
+{
+    return !s->vepu541 && (REG(s, s->m->src_fmt) & SRC_FMT_RCNE);
+}
+
+/* Read an rcne source into packed planes, w a row */
+static void rk_vepu_read_rcne(RkVepuState *s, int w, int h, uint8_t *y,
+                              uint8_t *uv)
+{
+    uint32_t y0 = REG(s, s->m->src0), c0 = REG(s, s->m->src1);
+    int ys = rk_vepu_ystride(s), cs = rk_vepu_cstride(s);
+    int r;
+
+    for (r = 0; r < h; r++) {
+        rk_vepu_dma_read(s, y0 + (r >> 1) * cs + (r & 1) * ys,
+                         y + (size_t)r * w, w, MEMTXATTRS_UNSPECIFIED);
+    }
+    for (r = 0; r < h / 2; r++) {
+        rk_vepu_dma_read(s, c0 + r * cs, uv + (size_t)r * w, w,
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
+/* Pass 1's reconstruction (NV12 planes) to RFPW_B in the rcne layout */
+static void rk_vepu_write_pass1(RkVepuState *s, int w, int h,
+                                const uint8_t *y, int ys,
+                                const uint8_t *uv, int cs)
+{
+    uint32_t base = REG(s, R_RFPW_B);
+    uint32_t S = ROUND_UP(w, 16);
+    g_autofree uint8_t *blk = g_malloc0(3 * S);
+    int r;
+
+    if (s->vepu541 || !base ||
+        (REG(s, s->m->enc_pic) & (ENC_PIC_CUR_REF | ENC_PIC_NOFBC)) !=
+        (ENC_PIC_CUR_REF | ENC_PIC_NOFBC)) {
+        return;
+    }
+    for (r = 0; r < h / 2; r++) {
+        memcpy(blk, y + (size_t)(2 * r) * ys, w);
+        memcpy(blk + S, y + (size_t)(2 * r + 1) * ys, w);
+        memcpy(blk + 2 * S, uv + (size_t)r * cs, w);
+        rk_vepu_dma_write(s, base + r * 3 * S, blk, 3 * S,
+                          MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
                            uint32_t *qp_out)
 {
@@ -578,15 +666,22 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
     if (cs < w) {
         cs = ys;
     }
+    if (rk_vepu_rcne(s)) {
+        ys = cs = w;
+    }
     y = g_malloc((size_t)ys * h);
     uv = g_malloc((size_t)cs * (h / 2));
-    rk_vepu_dma_read(s, REG(s, s->m->src0), y,
-                    (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
-    rk_vepu_dma_read(s, REG(s, s->m->src1), uv,
-                    (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
+    if (rk_vepu_rcne(s)) {
+        rk_vepu_read_rcne(s, w, h, y, uv);
+    } else {
+        rk_vepu_dma_read(s, REG(s, s->m->src0), y,
+                        (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
+        rk_vepu_dma_read(s, REG(s, s->m->src1), uv,
+                        (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
+    }
     if (s->vepu541) {
         rk_vepu_osd(s, y, ys, uv, cs, w, h);
-    } else {
+    } else if (!rk_vepu_rcne(s)) {      /* pass 1 drew it already */
         rk_vepu_osd540c(s, OSD540_BASE, y, ys, uv, cs, w, h);
     }
 
@@ -638,6 +733,21 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
             }
             fwrite(out, 1, n, fp);
             fclose(fp);
+        }
+    }
+    if (n) {
+        const uint8_t *ry, *rcb, *rcr;
+
+        hevc_enc_ref_planes(recon, &ry, &rcb, &rcr);
+        if (ry && (REG(s, s->m->enc_pic) & ENC_PIC_NOFBC)) {
+            g_autofree uint8_t *ruv = g_malloc((size_t)w * (h / 2));
+            int i;
+
+            for (i = 0; i < (w / 2) * (h / 2); i++) {
+                ruv[2 * i] = rcb[i];
+                ruv[2 * i + 1] = rcr[i];
+            }
+            rk_vepu_write_pass1(s, w, h, ry, w, ruv, w);
         }
     }
     rec = rk_vepu_ref(s, REG(s, s->m->rfpw), true);
@@ -816,15 +926,22 @@ static size_t rk_vepu_h264(RkVepuState *s, uint8_t *out, size_t cap,
     cs = cs ? cs : ys;
     /* whole macroblocks: rows past the picture repeat nothing useful,
      * but stay inside our buffers */
+    if (rk_vepu_rcne(s)) {
+        ys = cs = w;
+    }
     y = g_malloc0((size_t)ys * mbh * 16);
     uv = g_malloc0((size_t)cs * mbh * 8);
-    rk_vepu_dma_read(s, REG(s, s->m->src0), y,
-                    (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
-    rk_vepu_dma_read(s, REG(s, s->m->src1), uv,
-                    (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
+    if (rk_vepu_rcne(s)) {
+        rk_vepu_read_rcne(s, w, h, y, uv);
+    } else {
+        rk_vepu_dma_read(s, REG(s, s->m->src0), y,
+                        (size_t)ys * h, MEMTXATTRS_UNSPECIFIED);
+        rk_vepu_dma_read(s, REG(s, s->m->src1), uv,
+                        (size_t)cs * (h / 2), MEMTXATTRS_UNSPECIFIED);
+    }
     if (s->vepu541) {
         rk_vepu_osd(s, y, ys, uv, cs, w, h);
-    } else {
+    } else if (!rk_vepu_rcne(s)) {
         rk_vepu_osd540c(s, OSD540_BASE, y, ys, uv, cs, w, h);
     }
     if (!idr) {
@@ -856,6 +973,9 @@ static size_t rk_vepu_h264(RkVepuState *s, uint8_t *out, size_t cap,
         h264_enc_frame_ref(&avc, idr, p_slice, qp ? qp : 30, mbw, mbh,
                            y, ys, uv, cs, ref_y, ref_uv, rec_y, rec_uv,
                            out, cap) : 0;
+    if (n) {
+        rk_vepu_write_pass1(s, w, h, rec_y, mbw * 16, rec_uv, mbw * 16);
+    }
     rec = rk_vepu_ref(s, REG(s, s->m->rfpw), true);
     rec->avc = avc;
     g_free(rec->ry);
@@ -867,14 +987,105 @@ static size_t rk_vepu_h264(RkVepuState *s, uint8_t *out, size_t cap,
     return n;
 }
 
+static void rk_vepu_write(void *opaque, hwaddr off, uint64_t val,
+                          unsigned size);
+
+/* Code the picture: the thread pool's half (no BQL), or in place */
+static void rk_vepu_vid_code(RkVepuVidWork *wk)
+{
+    RkVepuState *s = wk->s;
+    g_autofree uint8_t *out = g_malloc(wk->cap);
+    uint32_t qp = 0;
+    size_t n;
+
+    n = rk_vepu_stnd(s) == 1 ? rk_vepu_hevc(s, out, wk->cap, &qp)
+                             : rk_vepu_h264(s, out, wk->cap, &qp);
+    wk->us = g_get_monotonic_time() - wk->t0;
+    if (s->trace && n > wk->cap) {
+        qemu_log("rk-vepu540c: %zu bytes do not fit the %zu left\n",
+                 n, wk->cap);
+    }
+    if (n > wk->cap) {
+        n = 0;                  /* truncated: nothing usable */
+    }
+    if (n) {
+        rk_vepu_ring_rw(s, wk->bs, out, n, true);
+    }
+    wk->n = n;
+    wk->qp = qp;
+    qemu_event_set(&wk->ev);
+}
+
+static int rk_vepu_vid_work(void *opaque)
+{
+    rk_vepu_vid_code(opaque);
+    return 0;
+}
+
+/* Its results into the status registers, the held writes replayed (BQL) */
+static void rk_vepu_vid_apply(RkVepuVidWork *wk)
+{
+    RkVepuState *s = wk->s;
+    guint i;
+
+    if (wk->applied) {
+        return;
+    }
+    wk->applied = true;
+    if (s->trace) {
+        qemu_log("rk-vepu540c: %zu bytes in %" PRId64 " us\n", wk->n, wk->us);
+    }
+    REG(s, s->m->st_len) = wk->n;
+    REG(s, s->m->st_qp) = wk->qp * wk->blocks;
+    if (s->vid == wk) {
+        s->vid = NULL;
+        timer_del(s->late);
+    }
+    rk_vepu_finish_half(s);
+    for (i = 0; i < s->held->len; i++) {
+        RkVepuHeld *h = &g_array_index(s->held, RkVepuHeld, i);
+
+        rk_vepu_write(s, h->off, h->val, 4);
+    }
+    g_array_set_size(s->held, 0);
+}
+
+static void rk_vepu_vid_done(void *opaque, int ret)
+{
+    RkVepuVidWork *wk = opaque;
+
+    if (wk->gen == wk->s->gen) {
+        rk_vepu_vid_apply(wk);
+    }
+    qemu_event_destroy(&wk->ev);
+    g_free(wk);
+}
+
+/* Still coding at the deadline: wait for it with the guest's clock stopped */
+static void rk_vepu_vid_wait(RkVepuState *s)
+{
+    RkVepuVidWork *wk = s->vid;
+
+    if (wk) {
+        cpu_disable_ticks();
+        qemu_event_wait(&wk->ev);
+        cpu_enable_ticks();
+        rk_vepu_vid_apply(wk);
+    }
+}
+
+static void rk_vepu_late(void *opaque)
+{
+    rk_vepu_vid_wait(opaque);
+}
+
 static void rk_vepu_run(RkVepuState *s)
 {
     uint32_t bs = REG(s, s->m->bsbs), bot = REG(s, s->m->bsbb), top = REG(s, s->m->bsbt);
     uint32_t rd = REG(s, s->m->bsbr);
-    uint32_t rsl = REG(s, s->m->enc_rsl), qp = 0;
+    uint32_t rsl = REG(s, s->m->enc_rsl);
     uint32_t blocks = ((rsl & 0x7ff) + 1) * (((rsl >> 16) & 0x7ff) + 1);
-    size_t cap, n = 0;
-    g_autofree uint8_t *out = NULL;
+    size_t cap;
 
     s->jobs++;
     /* room up to the reader, or to the top of a buffer that is not one */
@@ -886,38 +1097,8 @@ static void rk_vepu_run(RkVepuState *s)
         cap = top >= bs ? (size_t)top - bs + 1 : 0;
     }
     cap = MIN(cap, 16 << 20);
-    if (rk_vepu_stnd(s) <= 1 && cap) {   /* 2: JPEG alone */
-        out = g_malloc(cap);
-        /*
-         * The encode runs here, in the vCPU's register write; the guest's
-         * clock stands still meanwhile, so the job costs it "job-ns" as on
-         * the chip whatever the host takes.  Without that, a slow 4K
-         * picture outlasted the driver's task timeout, the driver reset
-         * the encoder mid-job and never got back in step.
-         */
-        int64_t t0 = g_get_monotonic_time();
-
-        cpu_disable_ticks();
-        n = rk_vepu_stnd(s) == 1 ? rk_vepu_hevc(s, out, cap, &qp)
-                                         : rk_vepu_h264(s, out, cap, &qp);
-        cpu_enable_ticks();
-        if (s->trace) {
-            qemu_log("rk-vepu540c: %zu bytes in %" PRId64 " us\n", (size_t)n,
-                     g_get_monotonic_time() - t0);
-        }
-        if (s->trace && n > cap) {
-            qemu_log("rk-vepu540c: %zu bytes do not fit the %zu left\n",
-                     (size_t)n, (size_t)cap);
-        }
-        if (n > cap) {
-            n = 0;              /* truncated: nothing usable */
-        }
-        if (n) {
-            rk_vepu_ring_rw(s, bs, out, n, true);
-        }
-    }
-    REG(s, s->m->st_len) = n;
-    REG(s, s->m->st_qp) = qp * blocks;
+    REG(s, s->m->st_len) = 0;
+    REG(s, s->m->st_qp) = 0;
     if (s->m->jpeg) {
         REG(s, R_ST_JPEG_LEN) = 0;
     }
@@ -925,6 +1106,37 @@ static void rk_vepu_run(RkVepuState *s)
     if (s->m->jpeg && (REG(s, R_JPEG_CFG) >> 31) &&
         rk_vepu_jpeg_start(s)) {
         s->pending++;
+    }
+    if (rk_vepu_stnd(s) <= 1 && cap) {   /* 2: JPEG alone */
+        RkVepuVidWork *wk = g_new0(RkVepuVidWork, 1);
+
+        wk->s = s;
+        wk->gen = s->gen;
+        wk->bs = bs;
+        wk->cap = cap;
+        wk->blocks = blocks;
+        wk->t0 = g_get_monotonic_time();
+        qemu_event_init(&wk->ev, false);
+        s->pending++;
+        if (s->sync || qtest_enabled()) {
+            /*
+             * Coded here, in the vCPU's register write, with the guest's
+             * clock stopped: the job costs it "job-ns" whatever the host
+             * takes.
+             */
+            cpu_disable_ticks();
+            rk_vepu_vid_code(wk);
+            cpu_enable_ticks();
+            rk_vepu_vid_apply(wk);
+            qemu_event_destroy(&wk->ev);
+            g_free(wk);
+        } else {
+            s->vid = wk;
+            timer_mod(s->late, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      VID_DEADLINE_NS);
+            thread_pool_submit_aio(rk_vepu_vid_work, wk, rk_vepu_vid_done,
+                                   wk);
+        }
     }
     timer_mod(s->done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->job_ns);
 }
@@ -954,6 +1166,13 @@ static void rk_vepu_write(void *opaque, hwaddr off, uint64_t val,
 {
     RkVepuState *s = opaque;
 
+    if (s->vid && off != s->m->int_clr && off != s->m->int_sta &&
+        off != s->m->int_en && off != s->m->int_msk) {
+        RkVepuHeld h = { off, val };
+
+        g_array_append_val(s->held, h);
+        return;
+    }
     if (off == s->m->enc_start) {
         REG(s, off) = val;
         if (((val >> 8) & 3) == 1) {
@@ -1009,6 +1228,15 @@ static void rk_vepu_reset(DeviceState *dev)
     RkVepuState *s = RK_VEPU540C(dev);
     int i;
 
+    if (s->vid) {
+        /* the worker uses the references: let it finish first */
+        qemu_event_wait(&s->vid->ev);
+        s->vid = NULL;
+    }
+    if (s->held) {
+        g_array_set_size(s->held, 0);
+    }
+    timer_del(s->late);
     memset(s->regs, 0, sizeof(s->regs));
     timer_del(s->done);
     for (i = 0; i < NREFS; i++) {
@@ -1035,12 +1263,15 @@ static void rk_vepu_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     qdev_init_gpio_in_named(dev, rk_vepu_dvbm_frame, "dvbm-frame", 1);
     s->done = timer_new_ns(QEMU_CLOCK_VIRTUAL, rk_vepu_done, s);
+    s->late = timer_new_ns(QEMU_CLOCK_VIRTUAL, rk_vepu_late, s);
+    s->held = g_array_new(false, false, sizeof(RkVepuHeld));
 }
 
 static const Property rk_vepu_properties[] = {
     DEFINE_PROP_UINT32("job-ns", RkVepuState, job_ns, 1000000),
     DEFINE_PROP_BOOL("vepu541", RkVepuState, vepu541, false),
     DEFINE_PROP_BOOL("inter", RkVepuState, inter, true),
+    DEFINE_PROP_BOOL("sync", RkVepuState, sync, false),
     DEFINE_PROP_BOOL("trace", RkVepuState, trace, false),
     DEFINE_PROP_STRING("dump", RkVepuState, dump),     /* debugging */
     DEFINE_PROP_LINK("iommu", RkVepuState, iommu, "rk-iommu", Object *),

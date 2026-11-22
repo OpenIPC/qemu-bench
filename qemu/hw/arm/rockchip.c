@@ -723,6 +723,8 @@ struct RkMachineState {
     int gc_clk, gc_data;        /* parsed, Linux GPIO numbers; -1 none */
     uint64_t tb_addr;
     uint32_t tb_cams, tb_stride;
+    bool tb_off;                /* tb-isp=off: not even from the meta */
+    uint32_t meta_cams;         /* rk_cam_num in the flash's meta */
     DeviceState *gic;
     DeviceState *pl330;
     DeviceState *cam_sensor;    /* the camera I2C bus's first sensor */
@@ -923,6 +925,13 @@ static void rk_machine_set_tb_isp(Object *obj, const char *value,
     g_auto(GStrv) f = g_strsplit(value, ":", 3);
     uint64_t addr, cams, stride = 11245;
 
+    if (!strcmp(value, "off")) {
+        s->tb_off = true;
+        s->tb_cams = 0;
+        g_free(s->tb_isp);
+        s->tb_isp = g_strdup(value);
+        return;
+    }
     if (!f[0] || !f[1] || qemu_strtou64(f[0], NULL, 0, &addr) ||
         qemu_strtou64(f[1], NULL, 0, &cams) || !cams || cams > 4 ||
         (f[2] && (qemu_strtou64(f[2], NULL, 0, &stride) || stride < 100))) {
@@ -943,6 +952,59 @@ static void rk_machine_set_tb_isp(Object *obj, const char *value,
  * and its index.  The ISP parameters after the 100-byte head stay zero.
  * Copied in at every reset, as the MCU writes it before Linux runs.
  */
+/*
+ * Without tb-isp, the head's place comes from the flash's thunder-boot
+ * meta partition (Rockchip's "RKMT", which SPL loads for the kernel): its
+ * CMDL item's meta_load_addr + meta_part_size is where the ISP's reserved
+ * memory follows it, and rk_cam_num the cameras.  The XM G2's says
+ * 0x800000 + 0xb0000 and 2: tb-isp=0x8b0000:2.  Only a board with two
+ * cameras or more needs it (one camera runs online), so only those get it.
+ */
+static void rk_machine_tb_from_meta(RkMachineState *s, const uint8_t *img,
+                                    size_t len)
+{
+    uint64_t load = 0, size = 0, cams = 0;
+    size_t o, i;
+
+    if (!img) {
+        return;
+    }
+    for (o = 0; o + 0x2000 <= MIN(len, 4 << 20); o += 0x1000) {
+        if (memcmp(img + o, "RKMT", 4)) {
+            continue;
+        }
+        for (i = o; i + 5 < MIN(len, o + 0x20000); i += 4) {
+            g_autofree char *c = NULL;
+            g_auto(GStrv) kv = NULL;
+            int k;
+
+            if (memcmp(img + i, "CMDL ", 5)) {
+                continue;
+            }
+            c = g_strndup((const char *)img + i + 5,
+                          MIN(1024, len - i - 5));
+            kv = g_strsplit(c, " ", 0);
+            for (k = 0; kv[k]; k++) {
+                if (g_str_has_prefix(kv[k], "meta_load_addr=")) {
+                    qemu_strtou64(kv[k] + 15, NULL, 0, &load);
+                } else if (g_str_has_prefix(kv[k], "meta_part_size=")) {
+                    qemu_strtou64(kv[k] + 15, NULL, 0, &size);
+                } else if (g_str_has_prefix(kv[k], "rk_cam_num=")) {
+                    qemu_strtou64(kv[k] + 11, NULL, 0, &cams);
+                }
+            }
+            break;
+        }
+        break;
+    }
+    s->meta_cams = cams;
+    if (!s->tb_cams && !s->tb_off && load && size && cams >= 2 && cams <= 4) {
+        s->tb_addr = load + size;
+        s->tb_cams = cams;
+        s->tb_stride = 11245;
+    }
+}
+
 #define TB_AWB_GAIN     (100 + 4645)
 #define TB_MODULES      0x7fc0020ull   /* ISP32_MODULE_RAWAE0..AWB_GAIN */
 
@@ -1634,8 +1696,11 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
         s->cam_sensor = image_sensor_create_at(sensor_bus,
                                     s->sensor ? s->sensor : "sc2336p", 0x30);
     }
+    /* a second camera the meta speaks of: the first one's model */
     s->cam_sensor2 = image_sensor_create_at(sensor_bus,
-                                    s->sensor2 ? s->sensor2 : "none", 0x32);
+                         s->sensor2 ? s->sensor2 :
+                         s->meta_cams >= 2 ? (s->sensor ? s->sensor : "sc2336p")
+                                           : "none", 0x32);
 
     rk_machine_tb_isp(s);
 
@@ -2049,6 +2114,7 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
             exit(1);
         }
     }
+    rk_machine_tb_from_meta(s, img, img_len);
 
     ncpu = machine->smp.cpus;
     for (i = 0; i < ncpu; i++) {
@@ -2409,7 +2475,8 @@ static void rk_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "tb-isp",
         "Stand in for the MCU's thunder-boot result to the ISP driver: "
         "ADDR:CAMERAS[:STRIDE] (the ISP's reserved memory, e.g. "
-        "0x8b0000:2 on the XM G2)");
+        "0x8b0000:2 on the XM G2; by default from the flash's thunder-boot "
+        "meta when it names two cameras; off: none)");
     object_class_property_add_str(oc, "gpio-high",
         rk_machine_get_gpio_high, rk_machine_set_gpio_high);
     object_class_property_set_description(oc, "gpio-high",

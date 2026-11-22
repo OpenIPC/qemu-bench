@@ -866,6 +866,72 @@ def test_vepu540c_inter(qemu, path):
           'against %d without inter %s' % (errs, sum(lens[1:]), p_off, err))
 
 
+def test_vepu540c_debreath(qt):
+    """MPP's debreath I picture: pass 1 (a P picture with cur_frm_ref and
+    rec_fbc_dis) leaves its reconstruction uncompressed at RFPW_B, two
+    luma rows then their CbCr row; pass 2 codes the IDR from there
+    (src_rcne) and decodes to the picture pass 1 saw."""
+    import shutil
+    import subprocess
+    if not shutil.which('ffmpeg'):
+        print('skip VEPU540C debreath: no ffmpeg')
+        return
+    V = 0xFFA50000
+    w, h = 64, 40
+    src, bs, pb = 0x01600000, 0x01700000, 0x01800000
+    pics = [bytes((40 + x * 2 + r * 3 + 9 * k) & 0xff for r in range(h)
+                  for x in range(w)) for k in range(2)]
+    stream = b''
+    qt.write(pb, bytes(w * h * 3 // 2))
+
+    def job(k, regs):
+        nonlocal stream
+        at = bs + len(stream)
+        base = {
+            0x2b0: bs + 0xfffff, 0x2b4: bs, 0x2b8: at, 0x2bc: bs,
+            0x310: (w // 8 - 1) | ((h // 8 - 1) << 16),
+            0x3c0: 26 << 16, 0x3c4: k, 0x020: 1,
+        }
+        base.update(regs)
+        for off, v in base.items():
+            qt.writel(V + off, v)
+        qt.writel(V + 0x10, 0x100)
+        qt.cmd('clock_step 2000000')
+        n = qt.readl(V + 0x4000)
+        qt.writel(V + 0x28, 1)
+        stream += qt.read(at, n)
+
+    common = {0x280: src, 0x284: src + w * h, 0x288: 0, 0x334: w,
+              0x338: w, 0x318: 6 << 2}
+    qt.write(src, pics[0] + bytes([128]) * (w * h // 2))
+    job(0, {**common, 0x28c: 0x01b00000, 0x290: 0x01b40000,
+            0x294: 0x01b00000, 0x300: 1 | (26 << 8),
+            0x3b0: 19, 0x3bc: 2 << 15})
+    qt.write(src, pics[1] + bytes([128]) * (w * h // 2))
+    job(1, {**common, 0x28c: 0, 0x290: pb, 0x294: 0x01b00000,
+            0x300: 1 | 4 | (26 << 8) | (1 << 31),
+            0x3b0: 1, 0x3bc: 1 << 15})
+    saved = qt.read(pb, w * h * 3 // 2)
+    luma = b''.join(saved[(r // 2) * 3 * w + (r & 1) * w:][:w]
+                    for r in range(h))
+    e1 = max(abs(a - b) for a, b in zip(luma, pics[1]))
+    qt.write(src, bytes(w * h * 3 // 2))        # not what pass 2 reads
+    job(0, {0x280: pb, 0x284: pb + 2 * w, 0x288: 0, 0x334: w,
+            0x338: 3 * w, 0x318: (6 << 2) | (1 << 6),
+            0x28c: 0x01b00000, 0x290: 0x01b40000, 0x294: 0x01b00000,
+            0x300: 1 | (26 << 8), 0x3b0: 19, 0x3bc: 2 << 15})
+    r = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'hevc', '-i', '-',
+                        '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+                       input=stream, capture_output=True)
+    frames = [r.stdout[i * w * h:(i + 1) * w * h]
+              for i in range(len(r.stdout) // (w * h))]
+    e2 = (max(abs(a - b) for a, b in zip(frames[2], pics[1]))
+          if len(frames) == 3 else 999)
+    check(e1 <= 24 and e2 <= 32 and not r.stderr,
+          'VEPU540C debreath: pass 1 saves its reconstruction (max err %d), '
+          'pass 2 codes it (max err %d) %s' % (e1, e2, r.stderr[:80]))
+
+
 def test_vepu540c_h264(qt):
     """libx264's SPS / PPS as the HAL's (baseline: CAVLC, main: CABAC); an
     IDR, a P picture of the same source and one of a shifted source decode
@@ -1595,6 +1661,27 @@ def test_tb_isp(qemu, path):
               'tb-isp: 10 ms at unity gain (Q16), AWB1 R gain 1.52 (Q8)')
     finally:
         qt.close()
+    # without tb-isp: from the flash's thunder-boot meta (RKMT), its CMDL
+    # item's meta_load_addr + meta_part_size, for rk_cam_num cameras
+    meta = os.path.join(os.path.dirname(path), 'meta.bin')
+    img = bytearray(open(path, 'rb').read())
+    img[0xa0000:0xa0004] = b'RKMT'
+    cmdl = (b'CMDL meta_load_addr=0x00700000 meta_part_size=0x00050000 '
+            b'rk_cam_fps=12 rk_cam_num=2 rk_cam_w=1920\0')
+    img[0xa0c00:0xa0c00 + len(cmdl)] = cmdl
+    open(meta, 'wb').write(img)
+    for opt, want in (('', 1), (',tb-isp=off', 0)):
+        qt = QTest(qemu, 'rv1106,flash-file=%s%s' % (meta, opt))
+        try:
+            A = 0x750000
+            got = (int.from_bytes(qt.read(A + 2, 2), 'little'),
+                   int.from_bytes(qt.read(A + 11245 + 16, 2), 'little'))
+            check(got == ((1, 1) if want else (0, 0)),
+                  ('tb-isp unset: the heads from the meta, at 0x700000 + '
+                   '0x50000, two cameras %s' if want else
+                   'tb-isp=off: no heads despite the meta %s') % (got,))
+        finally:
+            qt.close()
 
 
 def test_gpio_high(qemu, path):
@@ -2173,6 +2260,38 @@ def test_rv1109(qemu, tmp):
         px = qt.read(D2, 4)
         check(120 <= px[0] <= 136 and px[0] == px[1] == px[2],
               'RGA2 blend: 50%% white over black is grey (%s)' % px.hex())
+        # NV12 -> NV12 scaled (the fast path): the nearest source pixel and
+        # its chroma pair, as the general path picks them
+        sw, sh, dw, dh = 20, 10, 28, 14
+        SY, SC, DY, DC = 0x084c0000, 0x084c1000, 0x084d0000, 0x084d1000
+        sy_ = bytes((7 * x + 13 * r) & 0xff for r in range(sh)
+                    for x in range(sw))
+        sc_ = bytes((3 * x + 29 * r + 50) & 0xff for r in range(sh // 2)
+                    for x in range(sw))
+        qt.write(SY, sy_)
+        qt.write(SC, sc_)
+        c = [0] * 32
+        c[0x04 // 4] = 0xa
+        c[0x08 // 4], c[0x0c // 4] = SY, SC
+        c[0x18 // 4], c[0x1c // 4] = sw // 4, (sw - 1) | (sh - 1) << 16
+        c[0x38 // 4] = 0xa
+        c[0x3c // 4], c[0x40 // 4] = DY, DC
+        c[0x48 // 4], c[0x4c // 4] = dw // 4, (dw - 1) | (dh - 1) << 16
+        qt.write(cmd, struct.pack('<32I', *c))
+        qt.writel(G + 0x004, 1)
+        qt.cmd('clock_step 1000000')
+        ey = bytes(sy_[(y * sh // dh) * sw + x * sw // dw]
+                   for y in range(dh) for x in range(dw))
+        ec = bytearray()
+        for y in range(0, dh, 2):
+            r = (y * sh // dh) // 2
+            for x in range(0, dw, 2):
+                sx = (x * sw // dw) & ~1
+                ec += sc_[r * sw + sx:r * sw + sx + 2]
+        gy, gc = qt.read(DY, dw * dh), qt.read(DC, dw * dh // 2)
+        check(gy == ey and gc == bytes(ec),
+              'RGA2 NV12 -> NV12 scaled 20x10 -> 28x14: nearest pixels '
+              '(luma %s, chroma %s)' % (gy == ey, gc == bytes(ec)))
         # VEPU541: the VEPU540C model at the RV1126's offsets (IOMMU off)
         V = 0xFFBB0000
         src, bs = 0x08500000, 0x08600000
@@ -2328,6 +2447,7 @@ def main():
         test_vepu540c_osd(qt)
         test_vepu540c_hevc_detail(qt)
         test_vepu540c_h264(qt)
+        test_vepu540c_debreath(qt)
         test_i2c(qt)
         test_gpio(qt)
         test_trng(qt)

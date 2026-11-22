@@ -452,6 +452,16 @@ Machine options besides the flash:
   one frame, 1920×1080, the camera count and index, 10 ms at unity gain
   (Q16), and the AWB1 gains of a daylight white in the ISP parameters
   after the 100-byte head. The G2 takes `tb-isp=0x8b0000:2`.
+  - Without `tb-isp`, the machine reads the flash's thunder-boot meta
+    partition (Rockchip's `RKMT`, which SPL loads for the kernel). Its
+    CMDL item gives `meta_load_addr` + `meta_part_size`, where the ISP's
+    reserved memory follows the meta, and `rk_cam_num`. With two
+    cameras or more, the heads go there: on the G2, 0x800000 + 0xb0000 =
+    0x8b0000 and 2, the same as `tb-isp=0x8b0000:2`. One camera runs
+    online and gets none. `tb-isp=off` writes none even then.
+  - With the meta naming two cameras, `sensor2` defaults to the first
+    sensor's model, so `-M rv1106,flash-file=g2.bin,gpio-high=4C0` alone
+    runs both of the G2's cameras.
 - `-drive if=sd,index=0` is the SD card, `index=1` an SDIO slot and
   `index=2` an eMMC.
   - The vendor kernel writes with BYTCNT 0: an undefined-length transfer
@@ -706,7 +716,7 @@ Messages that are expected, because the hardware isn't modelled:
       a hand-off inside rockit at start-up, not understood further.
   - rockit's repeated "AVS ... release mb buf_id(207)" lines are normal
     buffer reuse; the fd printed is stale.
-  - Without `tb-isp` the kernel asks VICAP for online capture of both
+  - With `tb-isp=off` the kernel asks VICAP for online capture of both
     sensors, which isn't modelled (mpp's "nobit").
 - the G2's empty `mtd` partition (all zeros in the dump) failing to mount
   as JFFS2
@@ -872,9 +882,15 @@ bash qemu-boot/test-rv1106-boot.sh --openipc img/
     variance is below the quantiser step stays DC-only. Edges and OSD
     text come out sharp: on a checkerboard at QP 22 the error is 26 max
     and 8.3 mean, against 64 and 28 for DC alone.
-  - The guest clock stands still while a job encodes
-    (`cpu_disable_ticks`), so a heavy picture does not trip mpp's
-    timeouts; the job costs only its modelled `job-ns`.
+  - H.265 and H.264 pictures are coded on QEMU's thread pool while the
+    guest runs on. The frame is done when both `job-ns` and the coding
+    have passed. Register writes made meanwhile are held and applied
+    after the picture, so the job reads a stable register set. A picture
+    still coding 150 ms of guest time after its start is waited for with
+    the guest clock stopped (`cpu_disable_ticks`), so a heavy picture
+    can't trip mpp's timeouts. `-global rk-vepu540c.sync=on` codes in
+    the register write instead, with the clock stopped throughout, as
+    before; qtest always does.
   - JPEG (the snapshot channel, from the mainpath) runs alongside, with
     no frames lost on either path. The HAL writes SOI..SOS, and the model
     writes the scan and EOI with that header's DQT. A 2304×1296 scan
@@ -1007,7 +1023,8 @@ RV1103 / RV1106:
   and statistics written.
   - Without a thunder-boot result, the G2's XM kernel asks VICAP for
     online capture with two sensors, which it can't run.
-  - With `tb-isp=0x8b0000:2` the kernel picks read-back itself. rkaiq
+  - With the thunder-boot heads (from the meta, or
+    `tb-isp=0x8b0000:2`) the kernel picks read-back itself. rkaiq
     initialises both cameras from the header (`ffexp:0.01,1,1`,
     `ffwb:1.52,1,1,1.71`), and the first frame goes through VICAP → DDR
     → ISP.
@@ -1062,7 +1079,17 @@ RV1103 / RV1106:
     time and 2 KB (99.7 % of its CUs skipped). Exposure steps take up to
     0.4 s, coded as residuals rather than left stale: 499 main pictures
     in 100 s against 663 with `-global rk-vepu540c.inter=off` (the older
-    skip-or-intra coding).
+    skip-or-intra coding). With coding on the thread pool and the RGA's
+    NV12 scaling path, it's 1108 main and 1102 sub pictures in 100 s.
+  - MPP's "debreath" I picture is two jobs. Pass 1 is a P picture with
+    `ENC_PIC` cur_frm_ref (bit 2) and rec_fbc_dis (bit 31). Its
+    reconstruction goes uncompressed to `RFPW_B` (0x290): each pair of
+    luma rows, then their CbCr row, at a stride of the width rounded up
+    to 16. Pass 2 codes the IDR from that buffer, with `SRC_FMT`
+    src_rcne (bit 6) set, `SRC1` two strides in and a chroma stride of
+    3x. The XM R5 codes every IDR after the first this way. Before this
+    was modelled, those IDRs read an unwritten buffer and the main
+    stream went dark green from the second GOP.
   - The streams of the R5, G2, RV1103B (two cameras stitched, 1920x2160)
     and RV1109 (VEPU541, 1080p and 4K) decode in ffmpeg without errors.
   - `-global rk-vepu540c.trace=on` logs each picture (size, type, QP,
@@ -1189,7 +1216,13 @@ RV1103 / RV1106:
   is `rk-rga2`, the RV1109's model: bitblt and colour fill, with scaling
   and YUV/RGB conversion, rotation (90 / 180 / 270), mirroring, and
   blending by the source's alpha (the Porter-Duff modes and global
-  alphas aren't decoded). `-global rk-rga2.trace=on` logs each job. The 5.10 multi-RGA
+  alphas aren't decoded). NV12 to NV12 scaling, with no rotation or
+  blending, takes a path that copies rows of bytes. It picks the same
+  pixels as the general path (the nearest source pixel and its chroma
+  pair). The XM R5's 1920x1080 → 2880x1616 upscale takes 2 ms of host
+  time there, against 14 ms per pixel. `-global rk-rga2.trace=on` logs
+  each job with its host time; `rk-isp32.trace=on` logs each frame's.
+  The 5.10 multi-RGA
   driver drives it as it does the RV1109's. The XM G2 App scales its
   sub-streams and AI frames through it. Without it every job timed out,
   and the App's video pipeline stalled (`nobit`).
@@ -1259,8 +1292,9 @@ RV1103 / RV1106:
   `wifi=ws73`): no 802.11, no AP scan or join (cmd 0x20's Wi-Fi list),
   no `WAKEUP_REASON` report after a wake-up (a connection, the PIR or
   `cloud-wake` wakes the SoC through the power key's line), and no real
-  cloud keep-alive session. The G2's video runs with
-  `tb-isp` and `sensor2` (see Multi-sensor read-back).
+  cloud keep-alive session. The G2's video runs as it boots: the
+  thunder-boot heads and `sensor2` come from its meta (see
+  Multi-sensor read-back).
 
 RV1109 / RV1126:
 
