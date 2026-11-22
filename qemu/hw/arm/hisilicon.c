@@ -2526,6 +2526,7 @@ static const HisiSoCConfig gk7205v500_soc = {
     .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
+    .wdt_freq           = 24000000, /* xm720 wtd.ko: 24 MHz, see gk7205v510 */
 };
 
 static const HisiSoCConfig gk7205v510_soc = {
@@ -2550,6 +2551,16 @@ static const HisiSoCConfig gk7205v510_soc = {
     .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
+    /* The xm720 SDK's wtd.ko (WTD_SocStart/WTD_SocReset) programs the
+     * SP805 WDOGLOAD as timeout_s * 24000000 / 2 (0x16e3600 = 24 MHz; the
+     * /2 is SP805's two-stage reset), so the watchdog clock is 24 MHz, not
+     * the 3 MHz HISI_V4_COMMON_PERIPH default.  Measured on the SD-2N-4G
+     * dump: with 3 MHz, `echo timeout 5 > /proc/wtdCfg` + stop feeding bit
+     * at ~35 s instead of 5 s (8x slow).  The vendor app (hunter) arms a
+     * 60 s dog and feeds it from userspace; the post-upgrade reboot is a
+     * feed-starvation reset, so at 3 MHz the twin only rebooted ~8 min
+     * after a firmware upgrade instead of ~60 s. */
+    .wdt_freq           = 24000000,
     /* USB 2.0 host (xm720xxx DTS usb3-0/dwc3@0x10030000): DWC3, SPI 39,
      * dr_mode "host", as on gk7205v200.  The SD-2N-4G's LTE modem is on
      * it; without the controller the vendor app's wireless code finds no
@@ -2574,6 +2585,7 @@ static const HisiSoCConfig gk7205v530_soc = {
     .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
+    .wdt_freq           = 24000000, /* xm720 wtd.ko: 24 MHz, see gk7205v510 */
 };
 
 static const HisiSoCConfig gk7202v330_soc = {
@@ -2587,6 +2599,7 @@ static const HisiSoCConfig gk7202v330_soc = {
     .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* same GK7205V500 register family / goke V500 kernel */
+    .wdt_freq           = 24000000, /* xm720 wtd.ko: 24 MHz, see gk7205v510 */
 };
 
 /*

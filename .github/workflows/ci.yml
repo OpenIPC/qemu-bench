@@ -230,6 +230,14 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-lotus-rtc-wdt.py']
         run: python3 qemu/tests/test-hisi-lotus-rtc-wdt.py
 
+      # Goke V500 (xm720) SP805 watchdog runs at 24 MHz, not the 3 MHz
+      # family default: the counter decrements at 24 MHz and a 2 s timeout
+      # expires ~1 s per stage, so the post-upgrade feed-starvation reboot
+      # resets in seconds, not minutes.
+      - name: Goke V500 watchdog clock (gk7205v5xx / gk7202v330)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-v4-wdt-clock.py']
+        run: python3 qemu/tests/test-hisi-v4-wdt-clock.py
+
       # VI offline into node-driven VPSS (a sensor wider than 2304): both
       # strips of a picture painted, linear and compressed; no pipe
       # interrupt after a stop; online again after an offline run.
