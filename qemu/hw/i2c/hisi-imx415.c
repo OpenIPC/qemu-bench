@@ -6,14 +6,19 @@
  *   1. Setting I2C addr 0x34 (8-bit) = 0x1A (7-bit slave addr)
  *   2. Reading reg 0x3B00: must be 0x2E (programmed) or 0x28 (POR default)
  *
- * Returning 0x28 at 0x3B00 satisfies the IMX415 branch.  All other
+ * Returning 0x28 at 0x3B00 satisfies the IMX415 branch.  Rockchip's
+ * kernel driver (drivers/media/i2c/imx415.c) reads 0x311A instead, the
+ * part's chip ID, 0xE0.  All other
  * registers read back as 0xFF (uninitialized) so earlier branches in
  * the probe (IMX347, IMX334, IMX335, IMX322, IMX323) all fall through.
  *
  * The exposure registers (datasheet, and the vendor drivers' sensor_imx415
  * tables): VMAX 0x3024-0x3026, SHR0 0x3050-0x3052, GAIN_PCG 0x3090-0x3091 in
  * 0.3 dB steps.  What integrates is VMAX - SHR0 rows.  The registers read 0xFF
- * until the driver programs them, so nothing is exposed before then.
+ * until the driver programs them, so nothing is exposed before then --
+ * except the gain, 0 dB out of reset as on the part (Rockchip's driver
+ * only writes it when the AE changes it); codes past 240 (72 dB) clamp.
+ * It streams while STANDBY (0x3000) bit 0 is clear -- 0xFF until then.
  *
  * Reference: ipctool/src/sensors.c detect_sony_sensor() lines 202-209
  *
@@ -63,6 +68,11 @@ static void hisi_imx415_reset_regs(HisiIMX415State *s)
     memset(s->regs, 0xFF, sizeof(s->regs));
     /* IMX415 datasheet p.46: 0x3B00 default after reset is 0x28 */
     s->regs[0x3B00 - IMX415_REG_BASE] = 0x28;
+    /* the chip ID Rockchip's imx415 driver checks (IMX415_REG_CHIP_ID) */
+    s->regs[0x311A - IMX415_REG_BASE] = 0xE0;
+    /* GAIN_PCG_0: 0 dB out of reset; Rockchip's driver leaves it there */
+    s->regs[0x3090 - IMX415_REG_BASE] = 0x00;
+    s->regs[0x3091 - IMX415_REG_BASE] = 0x00;
 }
 
 static int hisi_imx415_event(I2CSlave *i2c, enum i2c_event event)
@@ -136,9 +146,15 @@ static void hisi_imx415_exposure(Object *sensor, ImageSensorExposure *e)
 
     e->lines = vmax > shr ? vmax - shr : 1;
     e->vts = vmax;
-    e->gain = lrint(1024 * pow(10, g * 0.3 / 20));
+    e->gain = lrint(1024 * pow(10, MIN(g, 240) * 0.3 / 20));   /* 72 dB */
     e->width = 3840;
     e->height = 2160;
+}
+
+/* STANDBY (0x3000) bit 0 clear: streaming, as Rockchip's driver starts it */
+static bool hisi_imx415_streaming(Object *sensor)
+{
+    return !(HISI_IMX415(sensor)->regs[0] & 1);
 }
 
 static void hisi_imx415_set_xclr(void *opaque, int n, int level)
@@ -204,6 +220,7 @@ static void hisi_imx415_class_init(ObjectClass *klass, const void *data)
     k->recv  = hisi_imx415_recv;
     k->send  = hisi_imx415_send;
     IMAGE_SENSOR_CLASS(klass)->exposure = hisi_imx415_exposure;
+    IMAGE_SENSOR_CLASS(klass)->streaming = hisi_imx415_streaming;
 }
 
 static const TypeInfo hisi_imx415_info = {

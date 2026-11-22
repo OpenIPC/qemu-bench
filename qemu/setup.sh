@@ -60,6 +60,8 @@ cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h26
 cp qemu/hw/misc/hevc-enc.c qemu/hw/misc/hevc-enc.h qemu/hw/misc/hevc-enc-inter.c.inc \
                                     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h "$QEMU_DIR/hw/misc/"
+# the baseline JPEG decoder behind rk-vdpu2
+cp qemu/hw/misc/jpeg-dec.c qemu/hw/misc/jpeg-dec.h "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/xm-sensor.c          "$QEMU_DIR/hw/i2c/"
@@ -109,6 +111,10 @@ for f in $(cd qemu && find hw include -name 'fh-*' 2>/dev/null); do
 done
 cp qemu/hw/arm/grainmedia.c         "$QEMU_DIR/hw/arm/"
 for f in $(cd qemu && find hw include -name 'gm-*' 2>/dev/null); do
+    cp "qemu/$f" "$QEMU_DIR/$f"
+done
+cp qemu/hw/arm/rockchip.c           "$QEMU_DIR/hw/arm/"
+for f in $(cd qemu && find hw include -name 'rk-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
 cp qemu/hw/arm/anyka.c              "$QEMU_DIR/hw/arm/"
@@ -198,6 +204,12 @@ if ! grep -q "atbm-sdio" "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('atbm-sdio.c'))" \
         >> "$QEMU_DIR/hw/net/meson.build"
     echo "  hw/net/meson.build: added atbm-sdio.c"
+fi
+cp qemu/hw/net/ws73-sdio.c          "$QEMU_DIR/hw/net/"
+if ! grep -q "ws73-sdio" "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('ws73-sdio.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  hw/net/meson.build: added ws73-sdio.c"
 fi
 if ! grep -q "atbm6441-sdio" "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('atbm6441-sdio.c'))" \
@@ -1624,6 +1636,74 @@ if ! grep -q "'grainmedia.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('grainmedia.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added grainmedia.c"
+fi
+
+# Rockchip RV1103 / RV1106 (hw/arm/rockchip.c): a Cortex-A7 with a GIC-400
+# and the generic timer.  Its own devices are the hw/*/rk-*.c files, each
+# built under ROCKCHIP_RV11XX.
+if ! grep -q "^config ROCKCHIP_RV11XX$" "$QEMU_DIR/hw/arm/Kconfig"; then
+    cat >> "$QEMU_DIR/hw/arm/Kconfig" <<'KCONFIG'
+
+config ROCKCHIP_RV11XX
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+    select UNIMP
+    select SSI
+    select SSI_M25P80
+    select A15MPCORE
+    select I2C
+    select SD
+    select PL330
+    select USB_EHCI_SYSBUS
+    select USB_OHCI_SYSBUS
+    select OR_IRQ
+    select USB_DWC3
+    select BITBANG_I2C
+    select AT24C
+KCONFIG
+    echo "  hw/arm/Kconfig: added ROCKCHIP_RV11XX"
+else
+    for sym in I2C SD PL330 USB_EHCI_SYSBUS USB_OHCI_SYSBUS OR_IRQ USB_DWC3 BITBANG_I2C AT24C; do
+        if ! sed -n '/^config ROCKCHIP_RV11XX$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
+                grep -q "select $sym\$"; then
+            sed -i "/^config ROCKCHIP_RV11XX\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
+}" "$QEMU_DIR/hw/arm/Kconfig"
+            echo "  hw/arm/Kconfig: ROCKCHIP_RV11XX now selects $sym"
+        fi
+    done
+fi
+for f in $(cd qemu && find hw -name 'rk-*.c' 2>/dev/null); do
+    d=$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "'$b'" "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: added $b"
+    fi
+done
+# Other families' models of the same Synopsys cores: the DW APB watchdog
+# (fh-wdt.c), the DWC EQOS GMAC (axera-eqos.c) and the DW MSHC
+# (hisi-himci.c), the generic SPI NAND (ingenic-spinand.c) the RV1126
+# boards boot from, and the shared HEVC, JPEG and H.264 encoders
+# (hevc-enc.c, jpeg-enc.c, hantro-h264.c) behind rk-vepu540c, and the JPEG
+# decoder (jpeg-dec.c) behind rk-vdpu2.  A source set lists a file once,
+# whichever symbols add it.
+for f in watchdog/fh-wdt.c net/axera-eqos.c misc/hisi-himci.c \
+         block/ingenic-spinand.c misc/hevc-enc.c misc/jpeg-enc.c \
+         misc/hantro-h264.c misc/jpeg-dec.c; do
+    d=hw/$(dirname "$f"); b=$(basename "$f")
+    if ! grep -q "CONFIG_ROCKCHIP_RV11XX', if_true: files('$b')" \
+            "$QEMU_DIR/$d/meson.build"; then
+        echo "system_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('$b'))" \
+            >> "$QEMU_DIR/$d/meson.build"
+        echo "  $d/meson.build: $b for ROCKCHIP_RV11XX too"
+    fi
+done
+if ! grep -q "'rockchip.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('rockchip.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added rockchip.c"
 fi
 
 # Ingenic T-series: little-endian XBurst MIPS camera SoCs (hw/mips/ingenic.c),

@@ -109,6 +109,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiHimciState, HISI_HIMCI)
 #define INT_RE    (1u << 1)
 #define INT_CD    (1u << 2)
 #define INT_DTO   (1u << 3)
+#define INT_TXDR  (1u << 4)
 #define INT_RTO   (1u << 8)
 #define INT_HLE   (1u << 12)
 
@@ -138,7 +139,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiHimciState, HISI_HIMCI)
 
 /* Fixed register values */
 #define VERID_VALUE  0x5342270A
-#define HCON_VALUE   0x00
+#define HCON_VALUE   (1u << 7)   /* H_DATA_WIDTH: a 32-bit FIFO */
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
@@ -147,6 +148,7 @@ struct HisiHimciState {
     MemoryRegion iomem;
     qemu_irq irq;
     SDBus sdbus;
+    bool sdio_level;        /* an SDIO card holds its interrupt */
 
     uint32_t ctrl, pwren, clkdiv, clksrc, clkena;
     uint32_t tmout, ctype, blksiz, bytcnt;
@@ -164,13 +166,14 @@ struct HisiHimciState {
     uint32_t cardthrctl, uhs_reg_ext, tuning_ctrl;
 
     /* PIO FIFO state — populated when a DATA_EXPECTED command runs
-     * without DMA (BMOD_DE=0 and CTRL_USE_IDMAC=0).  The guest reads
+     * without DMA (BMOD_DE=0).  The guest reads
      * via MCI_FIFO_DATA_BASE; STATUS bits 17..29 expose FIFO_COUNT
      * in 32-bit words, which the av300 mask-ROM polls before each
      * 4-byte FIFO read. */
     uint8_t  fifo_buf[MCI_FIFO_SIZE];
     uint32_t fifo_len;       /* bytes currently in FIFO */
     uint32_t fifo_rd_off;    /* read cursor (bytes) */
+    uint32_t pio_wr_want;    /* a PIO write: the bytes still to come */
 };
 
 /* ── IRQ ───────────────────────────────────────────────────────────── */
@@ -225,7 +228,14 @@ static void hisi_himci_do_data(HisiHimciState *s, uint32_t idmac_addr,
 {
     AddressSpace *as = &address_space_memory;
     uint32_t desc_addr = idmac_addr;
-    uint32_t remaining = s->bytcnt;
+    /*
+     * BYTCNT 0 is an undefined-length transfer (the DW MSHC databook): the
+     * descriptor chain says how much, a CMD12 ends it on the card.  The
+     * RV1106 vendor kernel writes that way -- with 0 taken as nothing to
+     * move, every CMD25 sent no data and SD writes were lost.
+     */
+    bool open_ended = s->bytcnt == 0;
+    uint32_t remaining = open_ended ? UINT32_MAX : s->bytcnt;
     uint8_t buf[4096];
 
     /*
@@ -244,7 +254,7 @@ static void hisi_himci_do_data(HisiHimciState *s, uint32_t idmac_addr,
      * while a pathological chain is stopped in proportion to what it claimed
      * to move rather than to what it could name.
      */
-    uint64_t budget = (uint64_t)remaining / 512 + 1024;
+    uint64_t budget = open_ended ? 65536 : (uint64_t)remaining / 512 + 1024;
 
     while (remaining > 0) {
         if (budget-- == 0) {
@@ -322,25 +332,53 @@ static void hisi_himci_do_data(HisiHimciState *s, uint32_t idmac_addr,
  * Used by the direct CMD register path (U-Boot) and clock-update bypass.
  */
 /*
- * PIO data-transfer fallback used when neither BMOD_DE nor
- * CTRL_USE_IDMAC is set — the av300 mask-ROM reads SD blocks this way.
- * Drain bytcnt bytes from the SD bus into the FIFO buffer; the guest
- * then reads from MCI_FIFO_DATA_BASE 4 bytes at a time.  Writes are
- * symmetric but the mask-ROM never exercises them.
+ * PIO, when BMOD does not enable the IDMAC: the av300 mask-ROM reads SD
+ * blocks this way.
+ * A read drains bytcnt bytes from the SD bus into the FIFO buffer; the
+ * guest then reads from MCI_FIFO_DATA_BASE 4 bytes at a time.  A write
+ * asks for the data (TXDR) and goes to the card once bytcnt bytes are
+ * in the FIFO: Linux's dw_mmc writes short SDIO transfers (an SDIO
+ * register, under 16 bytes) this way.  Returns whether the transfer is
+ * over.
  */
-static void hisi_himci_do_pio(HisiHimciState *s, bool is_write)
+static bool hisi_himci_do_pio(HisiHimciState *s, bool is_write)
 {
     uint32_t want = s->bytcnt;
     if (want > sizeof(s->fifo_buf)) {
         want = sizeof(s->fifo_buf);
     }
-    if (is_write) {
-        sdbus_write_data(&s->sdbus, s->fifo_buf, want);
-    } else {
-        sdbus_read_data(&s->sdbus, s->fifo_buf, want);
-    }
-    s->fifo_len = want;
     s->fifo_rd_off = 0;
+    if (is_write) {
+        s->fifo_len = 0;
+        s->pio_wr_want = want;
+        if (want) {
+            s->rintsts |= INT_TXDR;
+            return false;
+        }
+        return true;
+    }
+    sdbus_read_data(&s->sdbus, s->fifo_buf, want);
+    s->fifo_len = want;
+    return true;
+}
+
+/* the guest's word into a PIO write's FIFO; the last one sends it */
+static void hisi_himci_pio_push(HisiHimciState *s, uint32_t val)
+{
+    if (!s->pio_wr_want) {
+        return;
+    }
+    if (s->fifo_len + 4 <= sizeof(s->fifo_buf)) {
+        stl_le_p(s->fifo_buf + s->fifo_len, val);
+    }
+    s->fifo_len += 4;
+    if (s->fifo_len >= s->pio_wr_want) {
+        sdbus_write_data(&s->sdbus, s->fifo_buf, s->pio_wr_want);
+        s->pio_wr_want = 0;
+        s->fifo_len = 0;
+        s->rintsts = (s->rintsts & ~INT_TXDR) | INT_DTO;
+        hisi_himci_update_irq(s);
+    }
 }
 
 static void hisi_himci_exec_cmd(HisiHimciState *s, uint32_t cmd_val,
@@ -351,13 +389,20 @@ static void hisi_himci_exec_cmd(HisiHimciState *s, uint32_t cmd_val,
     if ((cmd_val & CMD_DATA_EXPECTED) &&
         !(s->rintsts & INT_RTO)) {
         bool is_write = (cmd_val & CMD_RW_WRITE) != 0;
-        if ((s->bmod & BMOD_DE) || (s->ctrl & CTRL_USE_IDMAC)) {
+        bool done = true;
+
+        /*
+         * The IDMAC moves data only while BMOD enables it: Linux turns
+         * that off for a PIO transfer and leaves CTRL's USE_IDMAC on
+         */
+        if (s->bmod & BMOD_DE) {
             hisi_himci_do_data(s, s->dbaddr, is_write);
         } else {
-            /* PIO fallback — drain the bus into the internal FIFO. */
-            hisi_himci_do_pio(s, is_write);
+            done = hisi_himci_do_pio(s, is_write);
         }
-        s->rintsts |= INT_DTO;
+        if (done) {
+            s->rintsts |= INT_DTO;
+        }
     }
 
     s->rintsts |= INT_CD;
@@ -479,7 +524,8 @@ static uint64_t hisi_himci_read(void *opaque, hwaddr offset, unsigned size)
     case MCI_STATUS: {
         /* Expose FIFO_COUNT (in 32-bit words) in bits 17..29 so the
          * mask-ROM's PIO read loop can poll for available data. */
-        uint32_t avail_bytes = (s->fifo_rd_off < s->fifo_len)
+        uint32_t avail_bytes = s->pio_wr_want ? 0 :  /* a write drains */
+                               (s->fifo_rd_off < s->fifo_len)
                              ? (s->fifo_len - s->fifo_rd_off) : 0;
         uint32_t words = avail_bytes / 4;
         if (words > 0x1FFF) words = 0x1FFF;
@@ -560,6 +606,12 @@ static void hisi_himci_write(void *opaque, hwaddr offset,
         break;
     case MCI_RINTSTS:
         s->rintsts &= ~(uint32_t)val;
+        if (s->pio_wr_want) {
+            s->rintsts |= INT_TXDR;     /* the FIFO still wants data */
+        }
+        if (s->sdio_level) {
+            s->rintsts |= 1u << 16;     /* the card still holds it */
+        }
         hisi_himci_update_irq(s);
         break;
     case MCI_FIFOTH:      s->fifoth = val;    break;
@@ -595,6 +647,9 @@ static void hisi_himci_write(void *opaque, hwaddr offset,
     case MCI_UHS_REG_EXT:  s->uhs_reg_ext = val;   break;
     case MCI_TUNING_CTRL:  s->tuning_ctrl = val;   break;
     default:
+        if (offset >= MCI_FIFO_DATA_BASE && offset <= MCI_FIFO_DATA_END) {
+            hisi_himci_pio_push(s, val);
+        }
         break;
     }
 }
@@ -681,6 +736,7 @@ static void hisi_himci_reset(DeviceState *dev)
 
     s->fifo_len = 0;
     s->fifo_rd_off = 0;
+    s->pio_wr_want = 0;
 
     qemu_set_irq(s->irq, 0);
 }
@@ -691,11 +747,31 @@ static void hisi_himci_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, hisi_himci_reset);
 }
 
+/*
+ * An SDIO card's interrupt (DAT1): RINTSTS bit 16, the card's SDIO
+ * interrupt as dw_mmc reads it (SDMMC_INT_SDIO(0)), following the level
+ */
+#define INT_SDIO0       (1u << 16)
+
+static void hisi_himci_set_sdio_irq(DeviceState *dev, bool level)
+{
+    HisiHimciState *s = HISI_HIMCI(dev);
+
+    s->sdio_level = level;
+    if (level) {
+        s->rintsts |= INT_SDIO0;
+    } else {
+        s->rintsts &= ~INT_SDIO0;
+    }
+    hisi_himci_update_irq(s);
+}
+
 static void hisi_himci_bus_class_init(ObjectClass *klass, const void *data)
 {
     SDBusClass *sbc = SD_BUS_CLASS(klass);
     sbc->set_inserted = hisi_himci_set_inserted;
     sbc->set_readonly = hisi_himci_set_readonly;
+    sbc->set_sdio_irq = hisi_himci_set_sdio_irq;
 }
 
 static const TypeInfo hisi_himci_types[] = {

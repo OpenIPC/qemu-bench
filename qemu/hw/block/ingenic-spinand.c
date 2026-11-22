@@ -35,9 +35,14 @@
  *              WEL and clear it.  FF RESET.
  *
  * Dummy clocks are one transfer each, as in m25p80 and as the SFC model
- * sends DMYBITS.  Operations complete at once; with busy-polls = n the
- * first n status reads after a page read, program or erase still show
- * OIP, to exercise the drivers' polls.
+ * sends DMYBITS; "dummy-clocks" (default 8) is how many transfers the
+ * read-from-cache dummy takes.  A controller that sends a dummy byte as
+ * one transfer (the Rockchip SFC with dummy-bytes, where U-Boot folds
+ * the dummy into a third address byte) pairs with 1.
+ *
+ * Operations complete at once; with busy-polls = n the first n status
+ * reads after a page read, program or erase still show OIP, to exercise
+ * the drivers' polls.
  *
  * The protection register comes up with the block-protect bits set (as
  * on the parts); with any of BP bits 6:3 set, program and erase fail
@@ -128,6 +133,7 @@ struct SpiNandState {
 
     BlockBackend *blk;
     uint32_t busy_polls;
+    uint32_t dummy_clocks;
     char *ecc_fail;         /* "p[-q][,...]" */
     uint32_t *ecc_ranges;    /* first, last; n_ecc_ranges pairs */
     uint32_t n_ecc_ranges;
@@ -383,7 +389,7 @@ static void spinand_addr_done(SpiNandState *s)
     switch (s->cmd) {
     case 0x03: case 0x0b: case 0x3b: case 0x6b:
         s->pos = spinand_column(s, s->addr, true);
-        s->nbytes = DUMMY_CLOCKS;
+        s->nbytes = s->dummy_clocks;
         s->state = ST_DUMMY;
         return;
     case 0x02: case 0x32:
@@ -591,6 +597,8 @@ static void spinand_reset(DeviceState *dev)
 static const Property spinand_props[] = {
     DEFINE_PROP_DRIVE("drive", SpiNandState, blk),
     DEFINE_PROP_UINT32("busy-polls", SpiNandState, busy_polls, 0),
+    DEFINE_PROP_UINT32("dummy-clocks", SpiNandState, dummy_clocks,
+                       DUMMY_CLOCKS),
     DEFINE_PROP_STRING("ecc-fail", SpiNandState, ecc_fail),
 };
 

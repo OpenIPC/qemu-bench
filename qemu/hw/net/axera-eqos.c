@@ -123,7 +123,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(AxeraEqosState, AXERA_EQOS)
 #define TPS_STOPPED         0
 #define TPS_SUSPENDED       6
 
-#define PHY_ADDR            1
 #define EQOS_MAX_FRAME      9018
 
 struct AxeraEqosState {
@@ -143,6 +142,8 @@ struct AxeraEqosState {
     uint32_t tx_len;
     bool tx_overflow;
     uint16_t phy[32];
+    uint8_t phy_addr;                   /* property, MDIO address */
+    uint8_t snps_ver;                   /* property, MAC_VR SNPSVER */
 };
 
 static uint32_t *reg(AxeraEqosState *s, hwaddr off)
@@ -178,8 +179,8 @@ static void axera_eqos_mdio(AxeraEqosState *s, uint32_t val)
     const int pa = (val >> 21) & 0x1F, ra = (val >> 16) & 0x1F;
 
     if ((val & MDIO_GOC_READ) == MDIO_GOC_READ) {
-        *reg(s, MAC_MDIO_DATA) = pa == PHY_ADDR ? s->phy[ra] : 0xFFFF;
-    } else if (pa == PHY_ADDR) {
+        *reg(s, MAC_MDIO_DATA) = pa == s->phy_addr ? s->phy[ra] : 0xFFFF;
+    } else if (pa == s->phy_addr) {
         uint16_t v = *reg(s, MAC_MDIO_DATA);
 
         switch (ra) {
@@ -520,7 +521,7 @@ static ssize_t axera_eqos_receive(NetClientState *nc, const uint8_t *pkt,
 static void axera_eqos_soft_reset(AxeraEqosState *s)
 {
     memset(s->regs, 0, sizeof(s->regs));
-    *reg(s, MAC_VR) = 0x00001041;               /* SNPSVER 4.10 */
+    *reg(s, MAC_VR) = 0x1000 | s->snps_ver;    /* SNPSVER: 0x41 = 4.10 */
     /* MII, half duplex, MDIO; no checksum offload, MMC or timestamps. */
     *reg(s, MAC_HFR0) = (1u << 0) | (1u << 2) | (1u << 5);
     *reg(s, MAC_HFR1) = 5 | (5 << 6);           /* 4 KiB Rx / Tx FIFOs */
@@ -694,6 +695,9 @@ static const VMStateDescription vmstate_axera_eqos = {
 
 static const Property axera_eqos_properties[] = {
     DEFINE_NIC_PROPERTIES(AxeraEqosState, conf),
+    /* the same core elsewhere: RV1106's dwmac-4.20a has its PHY at 2 */
+    DEFINE_PROP_UINT8("phy-addr", AxeraEqosState, phy_addr, 1),
+    DEFINE_PROP_UINT8("snps-ver", AxeraEqosState, snps_ver, 0x41),
 };
 
 static void axera_eqos_class_init(ObjectClass *klass, const void *data)

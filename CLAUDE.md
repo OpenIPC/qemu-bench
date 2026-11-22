@@ -419,6 +419,49 @@ a copy, or `chmod 444` it: writes go through to the file. `-m` must be over 120 
 test above needs its default RAM. A reloading `amb-timer` repeats no faster
 than 1 us, so `RELOAD` 0 cannot pin the host.
 
+Rockchip RV1103/RV1106 (`hw/arm/rockchip.c`, `docs/rockchip.md`;
+machines `rv1103`, `rv1106`, `rv1106g3`) boot a camera's whole NOR image.
+A mask ROM stand-in skips the ID block's DDR blob, runs the SPL at DRAM 0,
+and writes the blob's ATAGs at `0x1FE000`. Two of them are easy to get
+wrong. In `DDR_MEM`, the sizes follow all the bases (`bank[count + i]`).
+`SOC_INFO` must carry `SOC_FLAGS_TDBT`, or a thunder-boot SPL jumps to a
+U-Boot that its preloaded kernel has overwritten. The `rk-*` files are the
+SFC, the crypto v3 hash engine (the SPL sha256-checks every FIT image), the
+gzip decompressor and a hiword-mask register file. The rest are I2C (the
+sensor from `sensor=` on I2C4), GPIO v2, TRNG, RTC and the MCU mailbox.
+The GMAC, watchdog and SD controllers reuse `axera-eqos`, `fh-wdt` and
+`hisi-himci`, and the DMA controller is QEMU's `pl330`. Thunder-boot
+kernels keep the I2C/ISP interrupts off until the RISC-V MCU reports
+"done" on mailbox channel 1, and `rk-mailbox` posts that report at reset.
+A GPIO v2 pin with `INT_BOTHEDGE` set is edge-triggered whatever
+`INT_TYPE` says. Patch 0029 adds the
+GIC's aliased CPU-interface registers (`AIAR`/`AEOIR`/`AHPPIR`): the vendor
+kernel runs Linux secure under `CONFIG_FIQ_GLUE` and hangs after "Starting
+kernel" without them. Xiongmai images need `xmuart=0` in the U-Boot
+environment, or the kernel console stays silent;
+`qemu-boot/test-rv1106-boot.sh --flash dump.bin` adds it and checks each
+stage up to getty. `rv1103b` is the newer RV1103B/RV1106B die, with
+peripherals at `0x20000000`. It is the same config-driven machine, with
+crypto v4, the `rkrng` RNG (`rk-trng,rkrng=on`) and FSPI = the SFC. Its
+Rockchip DMA controller (not a PL330) is `hw/dma/rk-dmac.c`. That model
+paces blocks to or from a peripheral at `dev-rate`, so cyclic audio
+doesn't spin. `rv1126`/`rv1109` boot a SPI NAND camera with a different
+stand-in: the dump had lost its ID block, so `rk_fit_setup` loads OP-TEE
+and U-Boot from the FIT and enters OP-TEE secure, as the SPL would.
+`qemu-boot/rv1126-nand-image.py` rebuilds the flat NAND image from a
+bad-block-skipping dump. OP-TEE's PSCI powers cores through the PMU and
+expects a core in power-down mode to lose power at WFI. Patch 0030 adds a
+WFI hook for that. The core then comes back on an interrupt at the
+trampoline at `0xFF710000`; without this, SMP and cpuidle hang.
+The RV1126 also has its OTP (`rk-otp`, OP-TEE wants exact status values)
+and the Rockchip timer that wakes idle cores (`rk-timer`). It has register
+models of the IOMMU with v1 translation (`rk-iommu`), and the VOP
+(`rk-vop`): frame IRQ, and scan-out to a QEMU console through its IOMMU.
+The driver's IOVAs start at 0, so `MST` 0 is a real buffer. There are
+also platform EHCI and OHCI USB, the PL330 DMA and a PCF8563/BM8563 RTC.
+The sensor is the board's IMX415 at `0x1a`; the shared model answers its
+`0x311A` chip ID.
+
 Novatek NT9856x / NA51089 (`hw/arm/novatek.c`, `docs/novatek.md`) is a
 fifth: a Cortex-A9 whose MPCore is at `0xFFD00000` (the `0xF1500000` GIC in
 the SDK headers is stale) with Novatek blocks from `0xF0000000`. With

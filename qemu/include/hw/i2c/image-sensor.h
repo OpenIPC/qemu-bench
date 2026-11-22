@@ -35,6 +35,8 @@ typedef struct ImageSensorClass {
     bool (*frame_start)(Object *sensor);
     /* Optional: the frame's length its registers set, 0 when not known */
     int64_t (*frame_ns)(Object *sensor);
+    /* Optional: whether it streams (sends frames); absent: always */
+    bool (*streaming)(Object *sensor);
 } ImageSensorClass;
 
 #define IMAGE_SENSOR_CLASS(klass) \
@@ -53,6 +55,12 @@ bool image_sensor_frame_start(Object *sensor);
 
 /* The frame length @sensor's registers set, ns; 0 when not modelled */
 int64_t image_sensor_frame_ns(Object *sensor);
+
+/*
+ * Whether @sensor streams: an ISP model behind it sees frames only then.
+ * True for a model that does not say.
+ */
+bool image_sensor_streaming(Object *sensor);
 
 /* Whether the catalogue has a sensor called @name. */
 bool image_sensor_known(const char *name);

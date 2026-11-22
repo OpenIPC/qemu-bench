@@ -49,6 +49,14 @@ typedef struct HevcEncParams {
     int max_merge_cand;
     bool sign_hiding;
     int cu_qp;
+    /*
+     * Intra CUs (I slices, and P slices' where nothing in the reference
+     * comes close) with their whole residual: DC prediction, the 8x8 / 4x4
+     * transforms and residual_coding() of every level, instead of the DC
+     * coefficient alone -- the picture at its own resolution rather than
+     * 8x8 blocks.  Off: the DC-only CUs (bit-exact with before).
+     */
+    bool intra_ac;
     /* every CU of a P slice skipped (merge candidate 0): the least a
      * picture can take, for a stream buffer with no more room */
     bool all_skip;
@@ -149,6 +157,7 @@ typedef struct HevcEncHdr {
     bool deblocking_override;
     bool lf_across_slices;
     bool slice_ext;
+    bool weighted_pred;     /* P slices carry a pred_weight_table() */
 } HevcEncHdr;
 
 /*

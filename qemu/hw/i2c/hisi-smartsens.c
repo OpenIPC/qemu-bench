@@ -493,6 +493,11 @@ static const VMStateDescription vmstate_hisi_smartsens = {
     }
 };
 
+static bool smartsens_streaming(Object *sensor)
+{
+    return HISI_SMARTSENS(sensor)->streaming;
+}
+
 static void hisi_smartsens_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -508,6 +513,7 @@ static void hisi_smartsens_class_init(ObjectClass *klass, const void *data)
     IMAGE_SENSOR_CLASS(klass)->exposure = smartsens_sensor_exposure;
     IMAGE_SENSOR_CLASS(klass)->frame_start = smartsens_frame_start;
     IMAGE_SENSOR_CLASS(klass)->frame_ns = smartsens_frame_ns;
+    IMAGE_SENSOR_CLASS(klass)->streaming = smartsens_streaming;
 }
 
 static const TypeInfo hisi_smartsens_info = {

@@ -932,6 +932,29 @@ static int pred_sse(const Pic *p, int x0, int y0, const uint8_t py[64],
     return e;
 }
 
+/*
+ * The luma SAD of a prediction against the source with their mean
+ * difference taken out: what is left once the residual's DC has taken up
+ * a change of brightness (an exposure step moves every sample alike)
+ */
+static int pred_sad(const Pic *p, int x0, int y0, const uint8_t py[64])
+{
+    int x, y, e = 0, sum = 0, mean;
+
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) {
+            sum += p->cy[(y0 + y) * p->w + x0 + x] - py[y * 8 + x];
+        }
+    }
+    mean = sum >= 0 ? (sum + 32) / 64 : -((-sum + 32) / 64);
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) {
+            e += abs(p->cy[(y0 + y) * p->w + x0 + x] - py[y * 8 + x] - mean);
+        }
+    }
+    return e;
+}
+
 /* the SAD an intra DC CU would leave: each 4x4's mean removed */
 static int intra_dc_err(const Pic *p, int x0, int y0)
 {
@@ -1087,8 +1110,9 @@ static Mv search_cu(const Pic *p, int x0, int y0, const Mv amvp[2],
         }
         best = nb;
     }
-    /* then half and quarter samples around the full-sample best */
-    for (int step = 2; step >= 1 && best_cost; step >>= 1) {
+    /* then half and quarter samples around the full-sample best, unless
+     * that is already close */
+    for (int step = 2; step >= 1 && best_cost > 128; step >>= 1) {
         Mv nb = best;
 
         for (int dy = -step; dy <= step; dy += step) {
@@ -1123,6 +1147,7 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
     uint8_t py[64], pc[2][16];
     InterRes r;
     int nm, i, skip_idx = -1, skip_sse = INT_MAX;
+    int near_idx = -1, near_sad = INT_MAX;
 
     if (!p->ref) {
         /* nothing to refer to: intra (the decoder's picture unknown) */
@@ -1151,11 +1176,47 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
         return;
     }
 
-    /* skip: a merge candidate whose prediction leaves nothing to code */
+    /*
+     * skip: a merge candidate whose prediction leaves nothing to code.
+     * One that equals the source exactly (a still part of the scene) is
+     * taken at once: its residual is zero, no transform needed; a vector
+     * already tried is not tried again.
+     */
     for (i = 0; i < nm; i++) {
-        int e;
+        int e, j;
 
+        for (j = 0; j < i && !mv_eq(merge[j], merge[i]); j++) {
+            continue;
+        }
+        if (j < i) {
+            continue;
+        }
         mc_cu(p, x0, y0, merge[i], py, pc);
+        e = pred_sse(p, x0, y0, py, pc);
+        if (!e) {
+            skip_idx = i;
+            break;
+        }
+        if (e <= p->skip_thr) {
+            /*
+             * skipped as the intra-only pictures' CUs are: the distortion
+             * costs no more than the bits a coded CU would take at lambda
+             * (skip_threshold()) -- no residual worth its bits
+             */
+            if (e < skip_sse) {
+                skip_sse = e;
+                skip_idx = i;
+            }
+            continue;
+        }
+        e = pred_sad(p, x0, y0, py);
+        if (e < near_sad) {
+            near_sad = e;
+            near_idx = i;
+        }
+        if (skip_idx >= 0) {
+            continue;           /* a skip already qualifies */
+        }
         inter_residual(p, x0, y0, py, pc, &r);
         if (r.cy || r.ccb || r.ccr) {
             continue;
@@ -1180,8 +1241,55 @@ static void encode_cu_inter(Pic *p, Cabac *c, int x0, int y0)
         return;
     }
 
-    /* motion search: the candidates, a grid, then a diamond (2 samples) */
-    best = search_cu(p, x0, y0, amvp, merge, nm, lambda);
+    /*
+     * No merge candidate is the zero vector's copy of the reference (the
+     * neighbours moved, the CU did not): that copy within the skip
+     * threshold is coded as AMVP motion 0 and no residual (rqt_root_cbf
+     * 0), as the intra-only pictures skip
+     */
+    {
+        const Mv z = { 0, 0 };
+        int zi;
+
+        for (zi = 0; zi < nm && !mv_eq(merge[zi], z); zi++) {
+            continue;
+        }
+        if (zi == nm) {
+            mc_cu(p, x0, y0, z, py, pc);
+            if (pred_sse(p, x0, y0, py, pc) <= p->skip_thr) {
+                int aidx = mvd_bits(amvp[1].x) + mvd_bits(amvp[1].y) <
+                           mvd_bits(amvp[0].x) + mvd_bits(amvp[0].y);
+
+                cabac_decision(c, CTX_SKIP + ctx, 0);
+                cabac_decision(c, CTX_PRED_MODE, 0);    /* inter */
+                cabac_decision(c, CTX_PART_MODE, 1);    /* 2Nx2N */
+                cabac_decision(c, CTX_MERGE_FLAG, 0);
+                put_mvd(c, -amvp[aidx].x, -amvp[aidx].y);
+                cabac_decision(c, CTX_MVP, aidx);
+                cabac_decision(c, CTX_ROOT_CBF, 0);
+                memset(&r, 0, sizeof(r));
+                inter_recon(p, x0, y0, py, pc, &r);
+                cu_motion(p, cu, false, z, false);
+                p->cbfy[cu] = 0;
+                p->cuqp[cu] = p->qp_delta_coded ? p->qp : p->qg_pred;
+                p->qp_prev = p->cuqp[cu];
+                p->done[cu] = 1;
+                return;
+            }
+        }
+    }
+
+    /*
+     * motion search: the candidates, a grid, then a diamond (2 samples) --
+     * unless a merge candidate already predicts the CU to within about 4
+     * levels a sample, its brightness aside (a still scene whose exposure
+     * stepped): it is kept, with its residual
+     */
+    if (near_idx >= 0 && near_sad <= 256) {
+        best = merge[near_idx];
+    } else {
+        best = search_cu(p, x0, y0, amvp, merge, nm, lambda);
+    }
 
     mc_cu(p, x0, y0, best, py, pc);
     inter_residual(p, x0, y0, py, pc, &r);

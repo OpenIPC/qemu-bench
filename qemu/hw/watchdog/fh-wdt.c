@@ -59,6 +59,7 @@ struct FhWdtState {
     bool stat;
     bool paused;
     uint32_t freq;
+    uint32_t comp_params_1;
 };
 
 static uint32_t fh_wdt_period(FhWdtState *s)
@@ -113,7 +114,7 @@ static uint64_t fh_wdt_read(void *opaque, hwaddr off, unsigned size)
         fh_wdt_update(s);
         return 0;
     case 0xF4:                  /* COMP_PARAMS_1: 32-bit counter, TOP 0..15 */
-        return 0x10 << 8 | 0x2;
+        return s->comp_params_1;
     case 0xF8:
         return 0x3130332A;      /* "103*" */
     case 0xFC:
@@ -210,6 +211,12 @@ static void fh_wdt_init(Object *obj)
 
 static const Property fh_wdt_props[] = {
     DEFINE_PROP_UINT32("freq", FhWdtState, freq, 1000000),
+    /*
+     * 0x1002: 32-bit counter, user TOPs.  Rockchip's (dw_wdt on RV1106)
+     * sets USE_FIX_TOP, bit 6: without it Linux finds no TOPs array and
+     * gives up on the watchdog.
+     */
+    DEFINE_PROP_UINT32("comp-params-1", FhWdtState, comp_params_1, 0x1002),
 };
 
 static const VMStateDescription vmstate_fh_wdt = {

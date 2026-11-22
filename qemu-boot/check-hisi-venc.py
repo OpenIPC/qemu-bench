@@ -43,10 +43,15 @@ def check(path, codec, frames, min_frames=0, rising=False):
         return "does not decode cleanly: " + err.stderr.strip()[:300]
 
     w, h = probe(path, fmt)
+    # Only the counter's row is read: ffmpeg crops each frame to it.  The
+    # whole frames of an 8-minute stream came to 13 GB here, and a hosted
+    # CI runner (16 GB) was killed in this step.
+    row = min(16, h // 24)
     raw = subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", fmt, "-i", path, "-f", "rawvideo",
+        ["ffmpeg", "-v", "error", "-f", fmt, "-i", path,
+         "-vf", "format=gray,crop=%d:1:0:%d" % (w, row), "-f", "rawvideo",
          "-pix_fmt", "gray", "-"], check=True, capture_output=True).stdout
-    n = len(raw) // (w * h)
+    n = len(raw) // w
     if rising:
         if n < min_frames:
             return "%d frames, expected at least %d" % (n, min_frames)
@@ -54,12 +59,11 @@ def check(path, codec, frames, min_frames=0, rising=False):
         return "%d frames, expected %d" % (n, frames)
     last = -1
     for i in range(n):
-        y = raw[i * w * h:(i + 1) * w * h]
-        row = min(16, h // 24)
+        y = raw[i * w:(i + 1) * w]
         value = 0
         for bit in range(16):
             x = bit * (w // 16) + w // 32
-            value = value << 1 | (y[row * w + x] > 128)
+            value = value << 1 | (y[x] > 128)
         if rising and value <= last:
             return "frame %d carries counter %d after %d" % (i, value, last)
         if not rising and value != i:

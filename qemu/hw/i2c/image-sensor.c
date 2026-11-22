@@ -114,6 +114,11 @@ static const ImageSensorSpec image_sensors[] = {
       .exp_rows = true },
     { "sc1a4ts1", SMARTSENS, 0x32, 0xDA4D, .pclk = 72000000, .hts = 1600,
       .exp_rows = true },
+    /* RV1106 camera boards' (Rockchip kernel drivers/media/i2c: CHIP_ID
+     * at 0x3107:0x3108) */
+    SC("sc231hai", 0xCB6A),
+    SC("sc3336", 0xCC41),
+    SC("sc530ai", 0x8E39),
     SC("sc307h", 0xCB1C),
     SC("sc401ai", 0xCD2E),
     SC("sc431hai", 0xCD6B),
@@ -262,6 +267,17 @@ int64_t image_sensor_frame_ns(Object *sensor)
     }
     k = IMAGE_SENSOR_GET_CLASS(sensor);
     return k->frame_ns ? k->frame_ns(sensor) : 0;
+}
+
+bool image_sensor_streaming(Object *sensor)
+{
+    ImageSensorClass *k;
+
+    if (!object_dynamic_cast(sensor, TYPE_IMAGE_SENSOR)) {
+        return true;
+    }
+    k = IMAGE_SENSOR_GET_CLASS(sensor);
+    return !k->streaming || k->streaming(sensor);
 }
 
 static const TypeInfo image_sensor_info = {

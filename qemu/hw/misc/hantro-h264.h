@@ -16,6 +16,9 @@ typedef struct H264Enc {
     int pps_id, pic_init_qp, chroma_qp_offset;
     bool cabac, bottom_field_poc_present, deblocking_control;
     bool redundant_pic_cnt_present;
+    /* for P pictures (h264_enc_frame_ref) */
+    int num_ref_l0;             /* num_ref_idx_l0_default_active */
+    bool weighted_pred, transform_8x8;
     /* picture numbering across jobs */
     int frame_num, poc, idr_pic_id;
 } H264Enc;
@@ -38,6 +41,22 @@ size_t h264_enc_baseline_headers(uint32_t w, uint32_t h, uint8_t *out);
 size_t h264_enc_frame(H264Enc *e, bool idr, int qp, int mbw, int mbh,
                       const uint8_t *y, int ys, const uint8_t *uv, int cs,
                       uint8_t *out, size_t cap);
+
+/*
+ * As h264_enc_frame, with P pictures too: an I (IDR if idr) or P picture,
+ * one slice, with the header for e's SPS / PPS (a P slice refers to one
+ * picture, the last; a default pred_weight_table when the PPS weights),
+ * coded by the H264Pic coder against ry / ruv (NV12 at stride mbw * 16,
+ * mbh * 16 rows; NULL for a P picture: every macroblock intra), and the
+ * reconstruction, deblocked, left in rec_y / rec_uv for the next one.
+ * Returns the bytes it needed (more than cap: truncated), or 0 when the
+ * headers seen do not allow it.
+ */
+size_t h264_enc_frame_ref(H264Enc *e, bool idr, bool p_slice, int qp,
+                          int mbw, int mbh, const uint8_t *y, int ys,
+                          const uint8_t *uv, int cs, const uint8_t *ry,
+                          const uint8_t *ruv, uint8_t *rec_y, uint8_t *rec_uv,
+                          uint8_t *out, size_t cap);
 
 /*
  * Slice data only, for engines whose drivers write the headers: the

@@ -662,9 +662,19 @@ static int skip_threshold(int qp)
 }
 
 /* one 8x8 CU at luma (x0, y0) */
+/* hevc-enc-inter.c.inc's transform, quantisation and residual_coding() */
+static void fwd_quant(const Pic *p, const int *res, int log2, int qp,
+                      bool inter, int *lev);
+static void dequant_inv(const Pic *p, const int *lev, int log2, int qp,
+                        bool inter, int *res);
+static void residual_full(Pic *p, Cabac *c, int *lev, int log2, int cidx);
+
 static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
 {
-    int pred[64], x, y, comp;
+    /* with prm->intra_ac: the whole residual, transformed, as levels */
+    int lev8[64], lev4[2][16], rec_y[64], rec_c[2][16];
+    bool ac = p->prm->intra_ac;
+    int pred[64], x, y, comp, k;
     int lev_c[2], pred_c[2][16], r_c[2];
     const int cw = p->w >> 3, cu = (y0 >> 3) * cw + (x0 >> 3);
     const int cs = p->w / 2;
@@ -712,7 +722,7 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
         }
     }
     qp = p->qp;
-    const int lev_y = dc_level((sum + (sum < 0 ? -32 : 32)) / 64, qp, 3);
+    int lev_y = dc_level((sum + (sum < 0 ? -32 : 32)) / 64, qp, 3);
     const int r_y = dc_residual(lev_y, qp, 3);
 
     /* chroma, 4x4 at (x0/2, y0/2) */
@@ -732,6 +742,76 @@ static void encode_cu(Pic *p, Cabac *c, int x0, int y0, int qp, bool p_slice)
         lev_c[comp] = dc_level((t + (t < 0 ? -8 : 8)) / 16, qpc, 2);
         r_c[comp] = dc_residual(lev_c[comp], qpc, 2);
     }
+    if (ac) {
+        /*
+         * Only where it pays: a CU whose residual around its mean varies
+         * by less than about half a quantiser step quantises to its DC
+         * anyway, and flat CUs are most of a camera picture -- the
+         * transforms of every CU of a 4K frame would outlast the driver's
+         * job timeout.
+         */
+        const double qstep = pow(2.0, (qp - 4) / 6.0);
+        int64_t sq = 0;
+
+        for (y = 0; y < 8; y++) {
+            for (x = 0; x < 8; x++) {
+                const int d = p->cy[(y0 + y) * p->w + x0 + x] -
+                              pred[y * 8 + x];
+                sq += d * d;
+            }
+        }
+        /* the variance (64 samples) against (qstep / 2)^2 */
+        ac = (sq - (int64_t)sum * sum / 64) * 4 > 64 * qstep * qstep;
+    }
+    if (ac) {
+        /* DC prediction, the residual through the 8x8 / 4x4 transforms:
+         * the picture at its own resolution, not the blocks' means */
+        int res[64], nz;
+
+        for (y = 0; y < 8; y++) {
+            for (x = 0; x < 8; x++) {
+                res[y * 8 + x] = p->cy[(y0 + y) * p->w + x0 + x] -
+                                 pred[y * 8 + x];
+            }
+        }
+        fwd_quant(p, res, 3, qp, false, lev8);
+        for (k = nz = 0; k < 64; k++) {
+            nz |= lev8[k];
+        }
+        lev_y = nz;
+        dequant_inv(p, lev8, 3, qp, false, res);
+        for (k = 0; k < 64; k++) {
+            rec_y[k] = clip1(pred[k] + (nz ? res[k] : 0));
+        }
+        for (comp = 0; comp < 2; comp++) {
+            const uint8_t *src = comp ? p->ccr : p->ccb;
+
+            for (y = 0; y < 4; y++) {
+                for (x = 0; x < 4; x++) {
+                    res[y * 4 + x] = src[(y0 / 2 + y) * cs + x0 / 2 + x] -
+                                     pred_c[comp][y * 4 + x];
+                }
+            }
+            fwd_quant(p, res, 2, qpc, false, lev4[comp]);
+            for (k = nz = 0; k < 16; k++) {
+                nz |= lev4[comp][k];
+            }
+            lev_c[comp] = nz;
+            dequant_inv(p, lev4[comp], 2, qpc, false, res);
+            for (k = 0; k < 16; k++) {
+                rec_c[comp][k] = clip1(pred_c[comp][k] + (nz ? res[k] : 0));
+            }
+        }
+    } else {
+        for (k = 0; k < 64; k++) {
+            rec_y[k] = clip1(pred[k] + r_y);
+        }
+        for (comp = 0; comp < 2; comp++) {
+            for (k = 0; k < 16; k++) {
+                rec_c[comp][k] = clip1(pred_c[comp][k] + r_c[comp]);
+            }
+        }
+    }
 
 p_cu:
     if (p_slice) {
@@ -746,7 +826,7 @@ p_cu:
                 const int o = (y0 + y) * p->w + x0;
                 for (x = 0; x < 8; x++) {
                     const int src = p->cy[o + x];
-                    const int di = clip1(pred[y * 8 + x] + r_y) - src;
+                    const int di = rec_y[y * 8 + x] - src;
                     const int ds = p->ref->y[o + x] - src;
                     sse_i += di * di;
                     sse_s += ds * ds;
@@ -758,8 +838,7 @@ p_cu:
                 for (y = 0; y < 4; y++) {
                     const int o = (y0 / 2 + y) * cs + x0 / 2;
                     for (x = 0; x < 4; x++) {
-                        const int di = clip1(pred_c[comp][y * 4 + x] +
-                                             r_c[comp]) - src[o + x];
+                        const int di = rec_c[comp][y * 4 + x] - src[o + x];
                         const int ds = ref[o + x] - src[o + x];
                         sse_i += di * di;
                         sse_s += ds * ds;
@@ -816,26 +895,33 @@ p_cu:
         p->qp_delta_coded = true;
     }
     if (lev_y) {
-        residual_dc(c, lev_y, 3, false, p->prm->transform_skip);
+        if (ac) {
+            residual_full(p, c, lev8, 3, 0);
+        } else {
+            residual_dc(c, lev_y, 3, false, p->prm->transform_skip);
+        }
     }
     for (comp = 0; comp < 2; comp++) {
         if (lev_c[comp]) {
-            residual_dc(c, lev_c[comp], 2, true, p->prm->transform_skip);
+            if (ac) {
+                residual_full(p, c, lev4[comp], 2, comp + 1);
+            } else {
+                residual_dc(c, lev_c[comp], 2, true, p->prm->transform_skip);
+            }
         }
     }
 
     /* reconstruct */
     for (y = 0; y < 8; y++) {
         for (x = 0; x < 8; x++) {
-            p->y[(y0 + y) * p->w + x0 + x] = clip1(pred[y * 8 + x] + r_y);
+            p->y[(y0 + y) * p->w + x0 + x] = rec_y[y * 8 + x];
         }
     }
     for (comp = 0; comp < 2; comp++) {
         uint8_t *plane = comp ? p->cr : p->cb;
         for (y = 0; y < 4; y++) {
             for (x = 0; x < 4; x++) {
-                plane[(y0 / 2 + y) * cs + x0 / 2 + x] =
-                    clip1(pred_c[comp][y * 4 + x] + r_c[comp]);
+                plane[(y0 / 2 + y) * cs + x0 / 2 + x] = rec_c[comp][y * 4 + x];
             }
         }
     }
@@ -1667,8 +1753,7 @@ static bool parse_sps(HevcEncHdr *h, BitReader *r)
     const int log2_ctb = log2_min_cb + br_ue(r);
     const int log2_min_tb = br_ue(r) + 2;
     const int log2_max_tb = log2_min_tb + br_ue(r);
-    br_ue(r);                                   /* depth inter: P CUs are
-                                                 * skipped or intra */
+    h->prm.trafo_depth_inter = br_ue(r);        /* for inter coding */
     h->prm.trafo_depth_intra = br_ue(r);
     /* every CU 8x8, its TB 8x8 (chroma 4x4) */
     if (log2_min_cb != 3 || log2_ctb < 4 || log2_ctb > 6 ||
@@ -1769,7 +1854,9 @@ static bool parse_pps(HevcEncHdr *h, BitReader *r)
     }
     h->prm.chroma_qp_offset = cb;
     h->slice_chroma_qp = br_u(r, 1);
-    if (br_u(r, 1) || br_u(r, 1) ||             /* weighted pred, bipred */
+    h->weighted_pred = br_u(r, 1);              /* P slices: a table of
+                                                 * no weights */
+    if (br_u(r, 1) ||                           /* weighted bipred */
         br_u(r, 1) ||                           /* transquant bypass */
         br_u(r, 1) || br_u(r, 1)) {             /* tiles, entropy sync */
         return false;
@@ -1907,6 +1994,13 @@ size_t hevc_enc_hdr_frame(const HevcEncHdr *h, int qp, bool p_slice, int poc,
         }
         if (h->cabac_init_present) {
             bw_bits(&b, prm->cabac_init_flag, 1);
+        }
+        if (h->weighted_pred) {
+            /* pred_weight_table() (7.3.6.3), the weights' defaults */
+            bw_ue(&b, 0);                   /* luma_log2_weight_denom */
+            bw_se(&b, 0);                   /* delta_chroma_log2_... */
+            bw_bits(&b, 0, 1);              /* luma_weight_l0_flag */
+            bw_bits(&b, 0, 1);              /* chroma_weight_l0_flag */
         }
         bw_ue(&b, 1);                       /* five_minus_max_num_merge_cand */
     }
