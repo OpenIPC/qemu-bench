@@ -18,7 +18,10 @@ XM232's engine codes H.264 too (xm232-h264), under the library's CAVLC SPS,
 PPS and slice header, which the script writes in front of the output as
 Sofia's library does, the slice header's bits past its last whole byte in
 +0x52C / +0x530; the stream ffmpeg decodes is those headers and the slice
-data the guest finds at the output.
+data the guest finds at the output.  On XM232 the last job also takes a
+snapshot (+0x5C8): a 4:2:2 JPEG scan under the quantisers given as
+65536 / q at +0x1000, which must decode, behind the header the library
+would write, to the picture.
 
     python3 qemu/tests/test-xm-hevc.py [--qemu PATH] [--machine M] [--keep DIR]
 """
@@ -53,6 +56,9 @@ LAYOUTS = {
     'xm232-h264': dict(X2, h264=True),
 }
 X2_HDR_BITS, X2_HDR_NBITS = 0x52C, 0x530
+X2_JPEG_ON, X2_JPEG_FREE, X2_JPEG_OUT, X2_JPEG_LEN, X2_JPEG_QT = (
+    0x5C8, 0x5D4, 0x5FC, 0x614, 0x1000)
+JPEG_ADDR = 0x82800000
 
 
 class Bits:
@@ -141,6 +147,11 @@ def main():
     sys.exit(1 if fails else 0)
 
 
+def psnr_plane(p, q_):
+    mse = sum((x - y) ** 2 for x, y in zip(p, q_)) / len(p)
+    return 99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)
+
+
 def run(a, machine, L):
     w, h, qp = 640, 360, 30
     fails = 0
@@ -177,6 +188,16 @@ def run(a, machine, L):
             q.write(IN_ADDR, yp)
             q.write(IN_ADDR + w * h, cp)
             q.write(OUT_ADDR, b'\xa5' * 64)
+            snap = machine == 'xm232' and f == 2
+            if snap:
+                lq, cq = jt.scaled(jt.LUMA_QT, 80), jt.scaled(jt.CHROMA_QT, 80)
+                for t, tab in enumerate((lq, cq)):
+                    for i in range(64):
+                        q.writel(HEVC + X2_JPEG_QT + (t * 64 + i) * 4,
+                                 round(65536 / tab[jt.ZIGZAG[i]]))
+                q.writel(HEVC + X2_JPEG_OUT, JPEG_ADDR)
+                q.writel(HEVC + X2_JPEG_FREE, BUF_SIZE)
+                q.writel(HEVC + X2_JPEG_ON, 1)
             if h264:
                 hdr, pend, nbits = h264_headers(w, h, f, qp)
                 q.write(OUT_ADDR - len(hdr), hdr)
@@ -205,6 +226,14 @@ def run(a, machine, L):
             check(0 < n < BUF_SIZE, 'job %d: %d bytes of slice data' % (f, n))
             sizes.append(n)
             data = q.read(OUT_ADDR, n)
+            if snap:
+                jn = q.readl(HEVC + X2_JPEG_LEN)
+                check(0 < jn < BUF_SIZE, 'job %d: a %d-byte snapshot scan' % (f, jn))
+                scan = q.read(JPEG_ADDR, jn)
+                hdr422 = jt.jfif_header(w, h, lq, cq).replace(
+                    bytes([3, 1, 0x22, 0]), bytes([3, 1, 0x21, 0]), 1)
+                jpeg = hdr422 + scan + b'\xff\xd9'
+                q.writel(HEVC + X2_JPEG_ON, 0)
             if h264:
                 stream += hdr + data
             else:
@@ -224,6 +253,20 @@ def run(a, machine, L):
     check(len(sizes) == 3 and sizes[1] < sizes[2] < sizes[0],
           'a P picture with a change costs more, still less than the IDR')
 
+    if machine == 'xm232':
+        import io
+        from PIL import Image
+        try:
+            im = Image.open(io.BytesIO(jpeg))
+            im.load()
+            ok = im.size == (w, h)
+        except Exception:           # noqa: BLE001
+            ok, im = False, None
+        check(ok, 'the snapshot decodes, %dx%d, 4:2:2' % (w, h))
+        if im:
+            yy = im.convert('YCbCr').split()[0].tobytes()
+            v = psnr_plane(yy, sources[2][0])
+            check(v > 30, 'snapshot luma: %.1f dB against the picture' % v)
     if not h264:
         stream = b''.join(open(os.path.join(dump, f), 'rb').read()
                           for f in sorted(os.listdir(dump)))

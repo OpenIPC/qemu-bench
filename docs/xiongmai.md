@@ -591,10 +591,27 @@ latching SP804, UARTs, GMAC, SFC v2), with these differences:
       last whole byte to the engine before it (+0x52C / +0x530); a job with
       such bits, or a stream that had them, is H.264, coded by
       `hantro-h264`'s picture coder (P pictures inter-predicted from the
-      reconstruction the job names). rgn.ko's OSD is the engine's own
-      overlay regions (+0x2A4 on, +0x2A8 + 0x24·n), 2 bits a pixel as
-      XM535's. `-global xm-hevc.dump-dir=DIR` keeps H.264 jobs as
-      `frame-NNNNN-WxH.h264`. No JPEG is coded (snapshots are headers only).
+      reconstruction the job names). No register names the codec: a job
+      with no such bits whose gap holds the stream's last HEVC slice is
+      H.265. rgn.ko's OSD is the engine's own overlay regions (+0x2A4 on,
+      +0x2A8 + 0x24·n), 2 bits a pixel as XM535's. A snapshot (DVRIP
+      OPSNAP, cloud alarms) rides along a sub-stream picture: +0x5C8 on, a
+      baseline 4:2:2 scan to +0x5FC (room +0x5D4, length +0x614) under the
+      quantisers +0x1000 holds as 65536 / q in zigzag order; the library
+      writes SOI..SOS (Annex K tables) in front and EOI after.
+      `-global xm-hevc.dump-dir=DIR` keeps H.264 jobs as
+      `frame-NNNNN-WxH.h264`.
+
+      This board's Sofia streams H.265 only if the product allows it: its
+      `custom` partition's `CustomConfig/Encode.json` says
+      `"VencType": ["H264"]` (the tokens are H264, H264PLUS, H265,
+      H265PLUS), and over DVRIP Sofia advertises H.264 alone
+      (`CompressionMask` 0x80) and refuses `Simplify.Encode` with H.265 (Ret
+      606) even with H265 listed. To try it, rebuild the cramfs at 0x6F0000
+      with `["H264", "H265"]` and `"Compression": "H.265"` in
+      `CustomConfig/AVEnc.custom`, and erase the `mtd` partition
+      (0x7B0000, the saved configuration) so the defaults apply: both
+      streams then come out H.265.
     - **xm-vta**: the "VTA" NN accelerator (0x22000000, SPI 27,
       `XmVtaMte.ko`), which Sofia's person detector drives through
       `/dev/mem`. Its colour converter (+0x800: NV12 to 3-byte int8 pixels by
@@ -624,9 +641,8 @@ latching SP804, UARTs, GMAC, SFC v2), with these differences:
     another chip version) `wlandaemon` finds no card, reloads the driver
     and reboots the camera.
 
-**Open.** JPEG snapshots (the engine's +0x5C8 side job) are not coded.
-The H.265 path is checked under qtest only: this firmware's Sofia streams
-H.264. `wlandaemon`'s QR-code Wi-Fi setup fails on real hardware too: its
+**Open.** `dma.ko`'s engine (0x20020000) is a placeholder (`dma timeout`
+on the console). `wlandaemon`'s QR-code Wi-Fi setup fails on real hardware too: its
 static media library sends `mmz.ko` ioctls with a 0x2C-byte argument where
 this `mmz.ko` takes 0x30 (`mmz: ioctl cmd error`). For debugging: Sofia
 logs to `/var/sofia.log`; the `isp` daemon, which Sofia starts as

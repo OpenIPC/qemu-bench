@@ -197,11 +197,12 @@ XM535 cameras boot the same way on `xm530v200` (`-smp 2`), `xm533` and
 print only with `xmuart=0` in the saved U-Boot environment.
 
 ⁵ `xm232`: flash boot of an XM232 camera dump (X6S-WEQ-H): vendor U-Boot,
-kernel and Sofia, which streams H.264 over RTSP from a test picture (two
-lenses time-multiplexed on one VI and spliced, ISP statistics, the
-HEVC / H.264 engine with its OSD, the NN accelerator), with audio and its
-ATBM6132CU Wi-Fi + BLE (`atbm-wifi` with `chip-version=0x30`). No JPEG
-snapshots. See [docs/xiongmai.md](docs/xiongmai.md#xm232).
+kernel and Sofia, which streams H.264 (H.265 with the product config
+allowing it) over RTSP from a test picture (two lenses time-multiplexed
+on one VI and spliced, ISP statistics, the HEVC / H.264 engine with its
+OSD and JPEG snapshots, the NN accelerator), with audio and its
+ATBM6132CU Wi-Fi + BLE (`atbm-wifi` with `chip-version=0x30`). See
+[docs/xiongmai.md](docs/xiongmai.md#xm232).
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,

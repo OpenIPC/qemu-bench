@@ -281,9 +281,10 @@ jobs:
         run: python3 qemu/tests/test-xm-h1-h264.py --baseline --machine xm535
 
       # The second generation's HEVC engines (XM535, XM533, XM530V200,
-      # XM232 layouts; XM232's in H.264 too): slice data under the
-      # library's headers, P pictures that skip blocks against the previous
-      # job's reconstruction; ffmpeg decodes the stream.
+      # XM232 layouts; XM232's in H.264 too, with a JPEG snapshot): slice
+      # data under the library's headers, P pictures that skip blocks
+      # against the previous job's reconstruction; ffmpeg decodes the
+      # stream.
       - name: HEVC engines (xm-hevc)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-hevc.py']
         run: python3 qemu/tests/test-xm-hevc.py

@@ -98,11 +98,10 @@
  * 5 / -2).  The same engine codes H.264 (Sofia's default on the X6S-WEQ-H,
  * Main profile, CAVLC): see xm_hevc_xm232_avc() for how a job's codec is
  * told and xm_hevc_work_h264() for the coding.  rgn.ko's overlays are the
- * engine's own regions (xm_hevc_osd232()).  The second window is hevc.ko's
- * line-mode block (0x21010000), RAM here; the encoder does not wait for
- * lines.  No JPEG is coded: its length reads 0, and a snapshot comes out
- * as the library's headers alone (Sofia starts its JPEG channel only on
- * demand).
+ * engine's own regions (xm_hevc_osd232()); snapshots ride along a
+ * picture as a 4:2:2 JPEG scan (xm_hevc_jpeg232()).  The second window is
+ * hevc.ko's line-mode block (0x21010000), RAM here; the encoder does not
+ * wait for lines.
  *
  * dump-dir (-global xm-hevc.dump-dir=DIR) keeps every job on the host as
  * frame-NNNNN.hevc, a whole access unit with headers equal to the
@@ -125,6 +124,7 @@
 #include "system/dma.h"
 #include "hevc-enc.h"
 #include "hantro-h264.h"
+#include "jpeg-enc.h"
 
 #define TYPE_XM_HEVC "xm-hevc"
 OBJECT_DECLARE_SIMPLE_TYPE(XmHevcState, XM_HEVC)
@@ -212,6 +212,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmHevcState, XM_HEVC)
 #define X2_SRC_W        0x184
 #define X2_SRC_H        0x188
 #define X2_JPEG_LEN     0x614
+/*
+ * A snapshot (+0x5C8 bit 0): a baseline 4:2:2 JPEG scan of the job's
+ * picture to +0x5FC, at most +0x5D4 bytes, its length back at +0x614; the
+ * library writes SOI..SOS in front of it after the job (Annex K Huffman
+ * tables, the quantisers +0x1000 holds as 65536 / q, luma then chroma,
+ * zigzag order) and EOI after it.  The snapshot rides along one of the
+ * stream's pictures (the library also sets +0x08C 2 then): the picture is
+ * coded as ever, or Sofia sends an empty slice.
+ */
+#define X2_JPEG_ON      0x5C8
+#define X2_JPEG_FREE    0x5D4
+#define X2_JPEG_OUT     0x5FC
+#define X2_JPEG_QT      0x1000
 /* an H.264 job: the slice header bits the library's last whole byte did
  * not take, left-aligned in a byte, and how many */
 #define X2_HDR_BITS     0x52C
@@ -599,7 +612,6 @@ static void xm_hevc_set_done(XmHevcState *s)
 {
     if (s->xm232) {
         R(s, X2_END) = X2_ST_DONE;
-        R(s, X2_JPEG_LEN) = 0;
     } else if (s->v3) {
         R(s, V3_STATUS) = ST_DONE;
     } else {
@@ -801,9 +813,11 @@ static void xm_hevc_encode(XmHevcState *s, int w, int h, int sw, int sh,
  * before the output after the job, H.264 and H.265 alike, but an H.264
  * slice header seldom ends on a byte: the bits past its last whole byte
  * come before the job, in +0x52C / +0x530, and an H.265 one is byte
- * aligned.  So a job with bits there is H.264, and so is one whose gap
- * still holds an H.264 slice from the stream's last picture, or whose
- * stream (by its encoded size) was H.264 before.  The deblocking the
+ * aligned, and no register says which.  So a job with bits there is
+ * H.264, and so is one whose gap still holds an H.264 slice from the
+ * stream's last picture, or whose stream (by its encoded size) was H.264
+ * before -- unless the gap holds an HEVC slice: a stream Sofia switched
+ * to H.265 is coded so from its second picture on.  The deblocking the
  * decoder runs comes from that last slice header (the engine's first byte
  * after it holds its last bits).
  */
@@ -956,6 +970,11 @@ static bool xm_hevc_xm232_avc(XmHevcState *s, XmHevcJob *a, int ew, int eh)
         xm_hevc_avc_deblock(s, buf, sizeof(buf), st,
                             &s->avc_streams[slot].db);
         h264 = true;
+    } else if (st < GAP && !h264 && buf[st + 1] == 1 && !(buf[st] & 0x81) &&
+               (buf[st] >> 1) <= 21) {
+        /* an HEVC slice (its NAL header's second byte is 1; an H.264
+         * slice header's starts with a 1 bit): the stream switched */
+        s->avc_streams[slot].h264 = false;
     }
     h264 |= s->avc_streams[slot].h264;
     s->avc_streams[slot].h264 = h264;
@@ -981,6 +1000,70 @@ static void xm_hevc_v3_job(XmHevcState *s)
                    V3_OUT_LEN);
 }
 
+/* an xm232 snapshot: w x h from the job's source (sw x sh, NV12) */
+static void xm_hevc_jpeg232(XmHevcState *s, int w, int h, int sw, int sh)
+{
+    const int ys = R(s, X2_SRC_YS), cs = R(s, X2_SRC_CS);
+    const uint32_t out = R(s, X2_JPEG_OUT), cap = R(s, X2_JPEG_FREE);
+    uint8_t zz[2][64], q[2][64];
+    bool overflow;
+
+    R(s, X2_JPEG_LEN) = 0;
+    if (w < 8 || h < 8 || w > 8192 || h > 8192 || sw < 2 || sh < 2 ||
+        ys < sw || cs < sw || ys > XM_HEVC_MAX_STRIDE ||
+        cs > XM_HEVC_MAX_STRIDE || !out || !cap) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-hevc: snapshot %dx%d not done\n",
+                      w, h);
+        return;
+    }
+    for (int t = 0; t < 2; t++) {
+        for (int i = 0; i < 64; i++) {
+            const uint32_t r = s->regs[(X2_JPEG_QT + (t * 64 + i) * 4) / 4];
+
+            zz[t][i] = r ? MIN(MAX((65536 + r / 2) / r, 1), 255) : 255;
+        }
+        jpeg_enc_dezigzag(zz[t], q[t]);
+    }
+    g_autofree uint8_t *sy = g_malloc((size_t)ys * sh);
+    g_autofree uint8_t *suv = g_malloc((size_t)cs * (sh / 2));
+    g_autofree uint8_t *y = g_malloc((size_t)w * h);
+    const int cw = (w + 1) / 2;
+    g_autofree uint8_t *cb = g_malloc((size_t)cw * h);
+    g_autofree uint8_t *cr = g_malloc((size_t)cw * h);
+
+    dma_memory_read(&address_space_memory, R(s, X2_SRC_Y), sy,
+                    (size_t)ys * sh, MEMTXATTRS_UNSPECIFIED);
+    dma_memory_read(&address_space_memory, R(s, X2_SRC_C), suv,
+                    (size_t)cs * (sh / 2), MEMTXATTRS_UNSPECIFIED);
+    xm_hevc_osd232(s, sy, suv, w, h, sw, sh, ys, cs);
+    for (int py = 0; py < h; py++) {
+        const int srow = MIN(py * sh / h, sh - 1);
+        const uint8_t *c = &suv[(size_t)MIN(srow / 2, sh / 2 - 1) * cs];
+
+        for (int px = 0; px < w; px++) {
+            y[(size_t)py * w + px] = sy[(size_t)srow * ys +
+                                        MIN(px * sw / w, sw - 1)];
+        }
+        for (int px = 0; px < cw; px++) {
+            const int sx = MIN(2 * px * sw / w, sw - 1) & ~1;
+
+            cb[(size_t)py * cw + px] = c[sx];
+            cr[(size_t)py * cw + px] = c[sx + 1];
+        }
+    }
+    g_autofree uint8_t *jpg = g_malloc(cap);
+    const size_t n = jpeg_enc_scan_422(y, w, cb, cr, cw, w, h, q[0], q[1],
+                                       false, jpg, cap, &overflow);
+
+    if (overflow) {
+        qemu_log_mask(LOG_GUEST_ERROR, "xm-hevc: snapshot over %u bytes\n",
+                      cap);
+    }
+    dma_memory_write(&address_space_memory, out, jpg, n,
+                     MEMTXATTRS_UNSPECIFIED);
+    R(s, X2_JPEG_LEN) = n;
+}
+
 /* the picture is coded at the 8x8 minimum CU multiple the SPS gives; the
  * source size is +0x184 / +0x188 when the engine scales (+0x180) */
 static void xm_hevc_xm232_job(XmHevcState *s)
@@ -990,6 +1073,13 @@ static void xm_hevc_xm232_job(XmHevcState *s)
     const bool scale = R(s, X2_SCALE) & 1;
     XmHevcJob avc;
     bool h264;
+
+    if (R(s, X2_JPEG_ON) & 1) {
+        xm_hevc_jpeg232(s, ew, eh, scale ? R(s, X2_SRC_W) + 1 : ew,
+                        scale ? R(s, X2_SRC_H) + 1 : eh);
+    } else {
+        R(s, X2_JPEG_LEN) = 0;
+    }
 
     h264 = xm_hevc_xm232_avc(s, &avc, ew, eh);
 
