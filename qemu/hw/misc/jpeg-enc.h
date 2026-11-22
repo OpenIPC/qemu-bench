@@ -32,6 +32,18 @@ size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
                           bool chroma_luma_huff, bool eoi,
                           uint8_t *out, size_t cap, bool *overflow);
 
+/*
+ * The same in 4:2:2 (Y sampled 2x1: 16x8 MCUs of Y0 Y1 Cb Cr), the
+ * chroma planes (w + 1) / 2 wide and h high.
+ */
+size_t jpeg_enc_scan_422(const uint8_t *y, int ys, const uint8_t *cb,
+                         const uint8_t *cr, int cs, int w, int h,
+                         const uint8_t ql[64], const uint8_t qc[64], bool eoi,
+                         uint8_t *out, size_t cap, bool *overflow);
+
+/* a quantiser table from zigzag (DQT) order to natural order */
+void jpeg_enc_dezigzag(const uint8_t zz[64], uint8_t natural[64]);
+
 /* SOI, DQT, SOF0, DHT (Annex K) and SOS for such a scan */
 void jpeg_enc_header(GByteArray *b, int w, int h, const uint8_t ql[64],
                      const uint8_t qc[64]);
