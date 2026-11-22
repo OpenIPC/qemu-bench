@@ -513,7 +513,7 @@ def test_scene_file(qemu, path):
                for x in range(w // 2))
     with open(y4m, 'wb') as f:
         f.write(b'YUV4MPEG2 W%d H%d F25:1 C420jpeg\n' % (w, h))
-        f.write(b'FRAME\n' + yp + up + vp)
+        f.write(b'FRAME Ip XYSCSS=420JPEG\n' + yp + up + vp)  # tagged
     qt = QTest(qemu, 'rv1106,flash-file=%s,scene=%s' % (path, y4m))
     try:
         P, buf = 0xFFA00000, 0x01000000

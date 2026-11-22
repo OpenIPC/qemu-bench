@@ -29,6 +29,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -178,11 +179,18 @@ static void rk_crypto_run(RkCryptoState *s, uint32_t addr)
             }
         }
         if (d[1] && s->hash) {
-            buf = g_malloc(d[1]);
-            dma_memory_read(&address_space_memory, d[0], buf, d[1],
-                            MEMTXATTRS_UNSPECIFIED);
-            if (qcrypto_hash_update(s->hash, (char *)buf, d[1], &err) < 0) {
-                error_report_err(err);
+            /* in 64 KiB pieces: the length is the guest's, up to 4 GiB */
+            uint32_t done, n;
+
+            buf = g_realloc(buf, 64 * KiB);
+            for (done = 0; done < d[1]; done += n) {
+                n = MIN(d[1] - done, 64 * KiB);
+                dma_memory_read(&address_space_memory, d[0] + done, buf, n,
+                                MEMTXATTRS_UNSPECIFIED);
+                if (qcrypto_hash_update(s->hash, (char *)buf, n, &err) < 0) {
+                    error_report_err(err);
+                    break;
+                }
             }
         }
         if (d[4] & LLI_USER_LAST) {

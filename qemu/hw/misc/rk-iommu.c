@@ -180,8 +180,10 @@ bool rk_iommu_dma_read(Object *obj, uint32_t iova, void *buf, uint32_t len)
         if (!rk_iommu_translate(obj, iova, &pa)) {
             return false;
         }
-        dma_memory_read(&address_space_memory, pa, p, n,
-                        MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_read(&address_space_memory, pa, p, n,
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            return false;
+        }
         p += n;
         iova += n;
         len -= n;
@@ -201,8 +203,10 @@ bool rk_iommu_dma_write(Object *obj, uint32_t iova, const void *buf,
         if (!rk_iommu_translate(obj, iova, &pa)) {
             return false;
         }
-        dma_memory_write(&address_space_memory, pa, p, n,
-                         MEMTXATTRS_UNSPECIFIED);
+        if (dma_memory_write(&address_space_memory, pa, p, n,
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            return false;
+        }
         p += n;
         iova += n;
         len -= n;

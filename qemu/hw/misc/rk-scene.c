@@ -19,7 +19,7 @@
 static struct {
     FILE *f;
     uint32_t w, h, frames, cur;
-    long first;
+    long *at;                   /* each frame's pixels in the file */
     size_t fsize;
     uint8_t *pic;
     float lin[256];
@@ -32,50 +32,88 @@ bool rk_scene_has_source(void)
 
 bool rk_scene_set_source(const char *path, Error **errp)
 {
+    g_autoptr(GArray) at = g_array_new(false, false, sizeof(long));
     char hdr[256], *tok;
-    long end;
-    int i;
+    uint32_t w = 0, h = 0;
+    size_t fsize;
+    FILE *f;
+    int i, c;
 
-    rk_src.f = fopen(path, "rb");
-    if (!rk_src.f) {
+    f = fopen(path, "rb");
+    if (!f) {
         error_setg_errno(errp, errno, "rk-scene: %s", path);
         return false;
     }
-    if (!fgets(hdr, sizeof(hdr), rk_src.f) ||
-        strncmp(hdr, "YUV4MPEG2 ", 10)) {
+    if (!fgets(hdr, sizeof(hdr), f) || strncmp(hdr, "YUV4MPEG2 ", 10)) {
         error_setg(errp, "rk-scene: %s is not YUV4MPEG2", path);
-        return false;
+        goto fail;
     }
     for (tok = strtok(hdr + 10, " \n"); tok; tok = strtok(NULL, " \n")) {
         if (tok[0] == 'W') {
-            rk_src.w = atoi(tok + 1);
+            w = atoi(tok + 1);
         } else if (tok[0] == 'H') {
-            rk_src.h = atoi(tok + 1);
+            h = atoi(tok + 1);
         } else if (tok[0] == 'C' && strncmp(tok, "C420", 4)) {
             error_setg(errp, "rk-scene: %s is %s, not 4:2:0", path, tok);
-            return false;
+            goto fail;
         }
     }
-    if (!rk_src.w || !rk_src.h || rk_src.w > 8192 || rk_src.h > 8192 ||
-        (rk_src.w | rk_src.h) & 1) {
-        error_setg(errp, "rk-scene: %s is %ux%u", path, rk_src.w, rk_src.h);
-        return false;
+    if (!w || !h || w > 8192 || h > 8192 || (w | h) & 1) {
+        error_setg(errp, "rk-scene: %s is %ux%u", path, w, h);
+        goto fail;
     }
-    rk_src.first = ftell(rk_src.f);
-    rk_src.fsize = (size_t)rk_src.w * rk_src.h * 3 / 2;
-    fseek(rk_src.f, 0, SEEK_END);
-    end = ftell(rk_src.f);
-    rk_src.frames = (end - rk_src.first) / (rk_src.fsize + 6);
-    if (!rk_src.frames) {
+    fsize = (size_t)w * h * 3 / 2;
+    /*
+     * Each frame: "FRAME", its tags (any, to the newline), the pixels --
+     * the frames' places, found once
+     */
+    for (;;) {
+        long pos;
+
+        if (!fgets(hdr, sizeof(hdr), f) || strncmp(hdr, "FRAME", 5)) {
+            break;
+        }
+        while (!strchr(hdr, '\n')) {           /* a long tag line */
+            if (!fgets(hdr, sizeof(hdr), f)) {
+                break;
+            }
+        }
+        pos = ftell(f);
+        if (fseek(f, fsize, SEEK_CUR) || (c = fgetc(f)) == EOF) {
+            /* the last frame may end the file */
+            fseek(f, 0, SEEK_END);
+            if (ftell(f) - pos >= (long)fsize) {
+                g_array_append_val(at, pos);
+            }
+            break;
+        }
+        ungetc(c, f);
+        g_array_append_val(at, pos);
+    }
+    if (!at->len) {
         error_setg(errp, "rk-scene: %s has no frames", path);
-        return false;
+        goto fail;
     }
-    rk_src.pic = g_malloc(rk_src.fsize);
+    if (rk_src.f) {                             /* a second scene= */
+        fclose(rk_src.f);
+    }
+    g_free(rk_src.pic);
+    g_free(rk_src.at);
+    rk_src.f = f;
+    rk_src.w = w;
+    rk_src.h = h;
+    rk_src.fsize = fsize;
+    rk_src.frames = at->len;
+    rk_src.at = (long *)g_array_free(g_steal_pointer(&at), false);
+    rk_src.pic = g_malloc(fsize);
     rk_src.cur = UINT32_MAX;
     for (i = 0; i < 256; i++) {
         rk_src.lin[i] = 0.9 * pow(i / 255.0, 2.2);
     }
     return true;
+fail:
+    fclose(f);
+    return false;
 }
 
 static void rk_scene_src_rgb(uint32_t seq, double x, double y, double rgb[3])
@@ -85,9 +123,7 @@ static void rk_scene_src_rgb(uint32_t seq, double x, double y, double rgb[3])
     double yy, u, v, r, g, b;
 
     if (n != rk_src.cur) {
-        /* "FRAME\n" before each picture: the frames are all one size */
-        fseek(rk_src.f, rk_src.first + (long)n * (rk_src.fsize + 6) + 6,
-              SEEK_SET);
+        fseek(rk_src.f, rk_src.at[n], SEEK_SET);
         if (fread(rk_src.pic, 1, rk_src.fsize, rk_src.f) != rk_src.fsize) {
             memset(rk_src.pic, 128, rk_src.fsize);
         }

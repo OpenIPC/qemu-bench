@@ -132,10 +132,24 @@ static void rga_mem(const RgaPic *p, uint32_t a, void *buf, uint32_t len,
         hwaddr pa = a;
 
         if (p->mmu) {
+            /*
+             * The RGA2's own table holds plain page addresses, no valid
+             * bit (the kernel's rga2_mmu_info.c); a table read that fails
+             * maps nothing: a read gives zeros, a write is dropped.
+             */
             uint32_t pte = 0;
 
-            dma_memory_read(&address_space_memory, p->mmu + (a >> 12) * 4,
-                            &pte, 4, MEMTXATTRS_UNSPECIFIED);
+            if (dma_memory_read(&address_space_memory,
+                                p->mmu + (a >> 12) * 4, &pte, 4,
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                if (!wr) {
+                    memset(q, 0, n);
+                }
+                q += n;
+                a += n;
+                len -= n;
+                continue;
+            }
             pa = (le32_to_cpu(pte) & ~0xfffu) | (a & 0xfff);
         }
         if (wr) {

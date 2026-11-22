@@ -370,6 +370,7 @@ static void rk_dmac_reset(DeviceState *dev)
         memset(s->lch[i].regs, 0, sizeof(s->lch[i].regs));
         s->lch[i].cur = 0;
     }
+    rk_dmac_update_irq(s);
 }
 
 static void rk_dmac_init(Object *obj)

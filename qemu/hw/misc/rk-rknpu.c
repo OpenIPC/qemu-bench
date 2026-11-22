@@ -119,6 +119,12 @@ static void rk_rknpu_blank(RkRknpuState *s)
     uint32_t base = REG(s, R_PC_DMA_BASE);
     hwaddr pc = REG(s, R_PC_DATA_ADDR);
     int tasks = MAX(REG(s, R_TASK_CTRL) & 0xffff, 1);
+    /*
+     * The commands walked a job, all tasks together: a detector's 185
+     * tasks are some 25000; a guest's 65535 tasks of 4096 aren't walked
+     * in one go of the main loop.
+     */
+    int budget = 1 << 20;
     int t, i;
 
     s->jobs++;
@@ -126,7 +132,7 @@ static void rk_rknpu_blank(RkRknpuState *s)
         qemu_log("rk-rknpu: job %" PRIu64 ", %d tasks, base 0x%x\n",
                  s->jobs, tasks, base);
     }
-    for (t = 0; t < tasks && pc; t++) {
+    for (t = 0; t < tasks && pc && budget > 0; t++) {
         uint32_t next = 0;
         bool dpu = false;
 
@@ -147,7 +153,7 @@ static void rk_rknpu_blank(RkRknpuState *s)
             qemu_log("\n");
         }
 
-        for (i = 0; i < MAX_TASK_CMDS; i++) {
+        for (i = 0; i < MAX_TASK_CMDS && budget-- > 0; i++) {
             uint64_t q = address_space_ldq_le(&address_space_memory,
                                               pc + i * 8,
                                               MEMTXATTRS_UNSPECIFIED, NULL);

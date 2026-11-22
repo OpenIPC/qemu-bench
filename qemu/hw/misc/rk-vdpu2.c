@@ -136,7 +136,9 @@ static uint32_t rk_vdpu2_jpeg(RkVdpu2State *s)
     JpegDecImage img;
     const char *err = "";
 
-    if (!mbw || !mbh || !rk_vdpu2_soi(s, strm, &start)) {
+    /* the VDPU2's limit is 8192 x 8192; beyond it the job is refused */
+    if (!mbw || !mbh || mbw > 512 || mbh > 512 ||
+        !rk_vdpu2_soi(s, strm, &start)) {
         qemu_log_mask(LOG_GUEST_ERROR, "rk-vdpu2: no JPEG at 0x%x\n", strm);
         return INT_IRQ | INT_ERR;
     }

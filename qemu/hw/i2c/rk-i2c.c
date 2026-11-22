@@ -372,6 +372,7 @@ static void rk_i2c_reset(DeviceState *dev)
     memset(s->txbuf, 0, sizeof(s->txbuf));
     memset(s->rxbuf, 0, sizeof(s->rxbuf));
     s->started = s->active = s->reading = false;
+    rk_i2c_update_irq(s);
 }
 
 static void rk_i2c_init(Object *obj)

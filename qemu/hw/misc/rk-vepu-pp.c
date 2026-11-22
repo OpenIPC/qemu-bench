@@ -76,6 +76,7 @@ struct RkVepuPpState {
     uint32_t job_ns;            /* property: a job's time */
     uint8_t *md_ref;            /* the last picture, downscaled 4 x 4 */
     uint32_t md_ref_w, md_ref_h;
+    uint32_t md_ref_len;        /* md_ref_w x md_ref_h, for migration */
 };
 
 #define REG(s, off) ((s)->regs[(off) / 4])
@@ -106,8 +107,11 @@ static void rk_vepu_pp_motion(RkVepuPpState *s)
     bool ref;
     uint32_t x, y, i, j;
 
-    if (!(con & MD_CUR_EN) || w > MD_MAX_W || h > MD_MAX_H || !stride ||
-        !mstride || bw > mstride * 8) {
+    /* the guest's strides: below the width, or the flags' beyond what
+     * a picture of MD_MAX_W needs, the job is not ours to do */
+    if (!(con & MD_CUR_EN) || w > MD_MAX_W || h > MD_MAX_H ||
+        stride < w || stride > 0x10000 || !mstride ||
+        mstride > 0x1000 || bw > mstride * 8) {
         return;
     }
     cur = g_malloc(dw * dh);
@@ -150,6 +154,7 @@ static void rk_vepu_pp_motion(RkVepuPpState *s)
     s->md_ref = g_steal_pointer(&cur);
     s->md_ref_w = dw;
     s->md_ref_h = dh;
+    s->md_ref_len = dw * dh;
 }
 
 static uint64_t rk_vepu_pp_read(void *opaque, hwaddr off, unsigned size)
@@ -199,7 +204,7 @@ static void rk_vepu_pp_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     g_free(s->md_ref);
     s->md_ref = NULL;
-    s->md_ref_w = s->md_ref_h = 0;
+    s->md_ref_w = s->md_ref_h = s->md_ref_len = 0;
     rk_vepu_pp_update(s);
 }
 
@@ -218,13 +223,30 @@ static const Property rk_vepu_pp_properties[] = {
     DEFINE_PROP_UINT32("job-ns", RkVepuPpState, job_ns, 500000),
 };
 
+/* the incoming reference replaces ours (VMS_ALLOC allocates afresh) */
+static int rk_vepu_pp_pre_load(void *opaque)
+{
+    RkVepuPpState *s = opaque;
+
+    g_free(s->md_ref);
+    s->md_ref = NULL;
+    return 0;
+}
+
 static const VMStateDescription rk_vepu_pp_vmstate = {
     .name = TYPE_RK_VEPU_PP,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = rk_vepu_pp_pre_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, RkVepuPpState, REGS_SIZE / 4),
         VMSTATE_TIMER_PTR(done, RkVepuPpState),
+        /* the motion reference: without it the next job flags nothing */
+        VMSTATE_UINT32_V(md_ref_w, RkVepuPpState, 2),
+        VMSTATE_UINT32_V(md_ref_h, RkVepuPpState, 2),
+        VMSTATE_UINT32_V(md_ref_len, RkVepuPpState, 2),
+        VMSTATE_VBUFFER_ALLOC_UINT32(md_ref, RkVepuPpState, 2, NULL,
+                                     md_ref_len),
         VMSTATE_END_OF_LIST()
     }
 };

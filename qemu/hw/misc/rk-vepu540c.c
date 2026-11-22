@@ -633,6 +633,16 @@ static void rk_vepu_write_pass1(RkVepuState *s, int w, int h,
     }
 }
 
+/*
+ * A picture and strides the hardware can take (8192 a side, as its 13-bit
+ * fields and line buffers allow): the guest's registers size host buffers,
+ * so a job beyond it is refused rather than allocated.
+ */
+static bool rk_vepu_sane(int w, int h, int ys, int cs)
+{
+    return w <= 8192 && h <= 8192 && ys <= 8192 && cs <= 8192;
+}
+
 static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
                            uint32_t *qp_out)
 {
@@ -668,6 +678,9 @@ static size_t rk_vepu_hevc(RkVepuState *s, uint8_t *out, size_t cap,
     }
     if (rk_vepu_rcne(s)) {
         ys = cs = w;
+    }
+    if (!rk_vepu_sane(w, h, ys, cs)) {
+        return 0;
     }
     y = g_malloc((size_t)ys * h);
     uv = g_malloc((size_t)cs * (h / 2));
@@ -874,7 +887,11 @@ static bool rk_vepu_jpeg_start(RkVepuState *s)
         return false;
     }
     ys = MAX(ys, w);
-    cs = cs ? cs : ys;
+    cs = MAX(cs ? cs : ys, w);          /* below the width: not NV12 */
+    if (!rk_vepu_sane(w, h, ys, cs)) {
+        g_free(wk);
+        return false;
+    }
     wk->s = s;
     wk->gen = s->gen;
     wk->w = w;
@@ -923,11 +940,14 @@ static size_t rk_vepu_h264(RkVepuState *s, uint8_t *out, size_t cap,
 
     *qp_out = qp;
     ys = MAX(ys, w);
-    cs = cs ? cs : ys;
+    cs = MAX(cs ? cs : ys, w);          /* below the width: not NV12 */
     /* whole macroblocks: rows past the picture repeat nothing useful,
      * but stay inside our buffers */
     if (rk_vepu_rcne(s)) {
         ys = cs = w;
+    }
+    if (!rk_vepu_sane(w, h, ys, cs)) {
+        return 0;
     }
     y = g_malloc0((size_t)ys * mbh * 16);
     uv = g_malloc0((size_t)cs * mbh * 8);

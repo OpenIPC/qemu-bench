@@ -851,8 +851,8 @@ user network. Pings answer, and a 1.7 MB file served over the gadget
 arrives with the same md5:
 
 ```
-qemu-system-arm -M
-rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device \
+qemu-system-arm \
+    -M rv1106,flash-file=nand.bin,flash-type=w25n01gv,usb-otg=device \
     -kernel zImage -dtb rv1106.dtb -append "$(cat cmdline)" \
     -nic user,model=usb-gadget,hostfwd=tcp::18080-:8080
 ```

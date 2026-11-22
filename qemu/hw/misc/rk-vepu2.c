@@ -173,8 +173,10 @@ static void rk_vepu2_run(RkVepu2State *s)
     }
     ys = MAX(ys, w);
     py = g_malloc((size_t)w * h);
-    pu = g_malloc((size_t)(w / 2) * (h / 2) + 1);
-    pv = g_malloc((size_t)(w / 2) * (h / 2) + 1);
+    /* (h + 1) / 2 chroma rows: the y fill can leave h odd, and the scan
+     * reads its last half row */
+    pu = g_malloc0((size_t)(w / 2) * ((h + 1) / 2) + 1);
+    pv = g_malloc0((size_t)(w / 2) * ((h + 1) / 2) + 1);
     if (fmt == 2 || fmt == 3) {                 /* packed 4:2:2 */
         raw = g_malloc((size_t)ys * 2);
         for (y = 0; y < h; y++) {

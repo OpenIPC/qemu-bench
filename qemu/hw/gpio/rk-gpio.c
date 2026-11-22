@@ -195,6 +195,7 @@ static void rk_gpio_reset(DeviceState *dev)
     s->in = s->input_levels;
     s->raw = 0;
     s->last_level = rk_gpio_levels(s);
+    rk_gpio_update(s);                  /* the pins and IRQ as reset left them */
 }
 
 static void rk_gpio_get_inputs(Object *obj, Visitor *v, const char *name,

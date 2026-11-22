@@ -30,6 +30,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
@@ -109,7 +110,8 @@ static void rk_sfc_update_irq(RkSfcState *s)
 static uint32_t rk_sfc_xfer_len(RkSfcState *s)
 {
     if (s->version >= 4 && (s->len_ctrl & 1)) {
-        return s->len_ext;
+        /* no flash here is bigger: a guest's 4 GiB isn't buffered */
+        return MIN(s->len_ext, 256 * MiB);
     }
     return extract32(s->cmd, 16, 14);
 }

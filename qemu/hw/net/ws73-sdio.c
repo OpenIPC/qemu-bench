@@ -395,9 +395,11 @@ static ssize_t ws73_receive(NetClientState *nc, const uint8_t *buf,
          * client's retransmission finds the host back up.  At most a
          * pulse every 3 s.
          */
-        bool syn = size >= 14 + 20 + 20 && lduw_be_p(buf + 12) == 0x0800 &&
-                   buf[14 + 9] == 6 &&
-                   (buf[14 + ((buf[14] & 15) * 4) + 13] & 0x12) == 0x02;
+        size_t ihl = (size >= 15 ? buf[14] & 15 : 0) * 4;
+        /* the TCP flags at the IP header's end + 13, within the frame */
+        bool syn = ihl >= 20 && size >= 14 + ihl + 20 &&
+                   lduw_be_p(buf + 12) == 0x0800 && buf[14 + 9] == 6 &&
+                   (buf[14 + ihl + 13] & 0x12) == 0x02;
 
         if (syn) {
             ws73_wake_host(s, "a connection");

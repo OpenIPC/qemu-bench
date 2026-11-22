@@ -2270,7 +2270,8 @@ jobs:
           done
           python3 qemu-boot/rv1106-openipc-image.py "$W/nand-lite.tgz" \
             "$W/nor-lite.tgz" "$W/img"
-          bash qemu-boot/test-rv1106-boot.sh --openipc "$W/img" --timeout 240
+          bash qemu-boot/test-rv1106-boot.sh --machine ${{ matrix.soc }} \
+            --openipc "$W/img" --timeout 240
 
   ci-gate:
     name: CI Gate

@@ -61,11 +61,12 @@ static void pcf8563_now(Pcf8563State *s, struct tm *tm)
 static void pcf8563_check_alarm(Pcf8563State *s, const struct tm *tm)
 {
     const uint8_t *a = &s->regs[R_ALARM_MIN];
-    bool hit = !(a[0] & 0x80) || from_bcd(a[0] & 0x7f) == tm->tm_min;
+    /* AE (bit 7) set disables a field: disabled, or matching, it holds */
+    bool hit = (a[0] & 0x80) || from_bcd(a[0] & 0x7f) == tm->tm_min;
 
-    hit &= !(a[1] & 0x80) || from_bcd(a[1] & 0x3f) == tm->tm_hour;
-    hit &= !(a[2] & 0x80) || from_bcd(a[2] & 0x3f) == tm->tm_mday;
-    hit &= !(a[3] & 0x80) || (a[3] & 7) == tm->tm_wday;
+    hit &= (a[1] & 0x80) || from_bcd(a[1] & 0x3f) == tm->tm_hour;
+    hit &= (a[2] & 0x80) || from_bcd(a[2] & 0x3f) == tm->tm_mday;
+    hit &= (a[3] & 0x80) || (a[3] & 7) == tm->tm_wday;
     if (hit && (a[0] & a[1] & a[2] & a[3] & 0x80) == 0) {
         s->regs[R_CTRL2] |= CTRL2_AF;
     }

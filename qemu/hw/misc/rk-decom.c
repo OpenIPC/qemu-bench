@@ -371,8 +371,12 @@ static void rk_decom_run(RkDecomState *s)
     s->out_len = 0;
     s->error = true;
     s->err_isr = ISR_HDERR;
-    if (!limit) {
-        limit = UINT32_MAX;
+    /*
+     * No limit, or one beyond any DDR here: what a kernel or ramdisk
+     * unpacks to fits in 256 MiB; a guest's bomb stops there.
+     */
+    if (!limit || limit > 256 * MiB) {
+        limit = 256 * MiB;
     }
     if (ctrl & 1) {
         /* gzip: 16 + 15; zlib: 15; raw deflate: -15 */

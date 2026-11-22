@@ -185,7 +185,11 @@ bool jpeg_dec_decode(const uint8_t *buf, size_t len, JpegDecImage *img,
                 int pq = buf[p] >> 4, tq = buf[p] & 3;
 
                 p++;
-                for (i = 0; i < 64 && p < end; i++) {
+                if (end - p < (pq ? 128 : 64)) {
+                    *err = "short DQT";
+                    return false;
+                }
+                for (i = 0; i < 64; i++) {
                     qt[tq][jd_zigzag[i]] = pq ? buf[p] << 8 | buf[p + 1]
                                               : buf[p];
                     p += pq ? 2 : 1;
@@ -212,10 +216,18 @@ bool jpeg_dec_decode(const uint8_t *buf, size_t len, JpegDecImage *img,
             }
             break;
         case 0xdd:                      /* DRI */
+            if (end - p < 2) {
+                *err = "short DRI";
+                return false;
+            }
             restart = buf[p] << 8 | buf[p + 1];
             break;
         case 0xc0:                      /* SOF0, SOF1: baseline / extended */
         case 0xc1:
+            if (end - p < 6 || end - p < 6 + 3 * (size_t)buf[p + 5]) {
+                *err = "short SOF";
+                return false;
+            }
             if (buf[p] != 8) {
                 *err = "not 8-bit";
                 return false;
@@ -251,10 +263,14 @@ bool jpeg_dec_decode(const uint8_t *buf, size_t len, JpegDecImage *img,
             *err = "not a baseline JPEG";
             return false;
         case 0xda: {                    /* SOS: the scan */
-            int ns = buf[p], mx, my, mcux, mcuy, rst = 0;
+            int ns = p < end ? buf[p] : 0, mx, my, mcux, mcuy, rst = 0;
             int32_t pred[3] = { 0 };
             JdBits b;
 
+            if (end - p < 1 || end - p < 1 + 2 * (size_t)ns) {
+                *err = "short SOS";
+                return false;
+            }
             if (!sof || ns != img->ncomp) {
                 *err = "unsupported scan";
                 return false;

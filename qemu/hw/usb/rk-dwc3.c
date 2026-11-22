@@ -329,11 +329,13 @@ static int rk_dwc3_xfer(RkDwc3State *s, int n, uint8_t *buf, uint32_t len,
              * OUT request carries the IOC.
              */
             uint32_t u[4], ua;
+            int hops = 0;
 
             t[2] = (t[2] & ~0xffffffu) | (room - k);
             t[3] &= ~TRB_HWO;
             rk_dwc3_trb_wr(at, t);
-            for (ua = at + 16;; ua += 16) {
+            /* a ring with no end (a LINK to itself, CHN all round) is cut */
+            for (ua = at + 16; hops < 4096; ua += 16, hops++) {
                 rk_dwc3_trb_rd(ua, u);
                 if (TRB_TYPE(u[3]) == TRBT_LINK) {
                     ua = u[0] - 16;
@@ -439,6 +441,9 @@ static void rk_dwc3_scan(RkDwc3State *s)
     while (i + 2 <= len && s->ctl[i] >= 2) {
         const uint8_t *d = &s->ctl[i];
 
+        if (d[0] > len - i) {
+            break;                      /* a descriptor past the data */
+        }
         if (d[1] == 4 && d[0] >= 9) {               /* interface */
             cur_if = d[2];
             data = K_NONE;
@@ -479,6 +484,11 @@ static void rk_dwc3_scan(RkDwc3State *s)
         } else if (d[1] == 5 && d[0] >= 7) {        /* endpoint */
             int pn = ((d[2] & 0xf) << 1) | (d[2] >> 7);
             bool in = d[2] & 0x80;
+
+            if (pn >= NEPS) {
+                i += d[0];
+                continue;               /* beyond the core's endpoints */
+            }
 
             if ((d[3] & 3) == 3 && in && s->n_notify < 4) {
                 s->ep_notify[s->n_notify++] = pn;
@@ -635,10 +645,11 @@ static void rk_dwc3_rndis_tx(RkDwc3State *s)
         uint32_t mlen = ldl_le_p(m + 4), doff = ldl_le_p(m + 8);
         uint32_t dlen = ldl_le_p(m + 12);
 
-        if (ldl_le_p(m) != 1 || mlen < 44 || off + mlen > s->tx_len) {
+        /* bounds without wrapping: the lengths are the guest's */
+        if (ldl_le_p(m) != 1 || mlen < 44 || mlen > s->tx_len - off) {
             break;
         }
-        if (8 + doff + dlen <= mlen) {
+        if (doff <= mlen - 8 && dlen <= mlen - 8 - doff) {
             qemu_send_packet(qemu_get_queue(s->nic), m + 8 + doff, dlen);
         }
         off += mlen;
