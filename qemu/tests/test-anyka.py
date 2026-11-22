@@ -662,6 +662,7 @@ def test_av100(qemu, tmp):
               0x66668881, DDRC + 0xA4, 0x10000,
               0x88888888, 0]
     struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x200:0x600] = bytes(0x400)    # unsigned: no key, no signature
     struct.pack_into('<%dI' % len(code), img, 0x600, *code)
     path = os.path.join(tmp, 'av100.bin')
     open(path, 'wb').write(img)
