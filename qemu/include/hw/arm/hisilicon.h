@@ -35,6 +35,25 @@ typedef struct HisiRegbankEntry {
     uint32_t    size;
 } HisiRegbankEntry;
 
+/*
+ * The PWM controller (hisi-pwm), one per SoC.  channels == 0 leaves a
+ * "hisi-pwm" regbank entry a plain register bank.  The clock word is
+ * crg_offset into the CRG, or none at all when crg_offset is 0; the
+ * model reads it on every access, so whatever the guest writes there is
+ * what gates and clocks the block.
+ */
+typedef struct HisiPwmConfig {
+    uint8_t     layout;      /* 0 classic 0x20, 1 av100 split bank, 2 V5 */
+    uint8_t     channels;
+    bool        edge_latch;  /* V1: the duty loads on the enable edge only */
+    uint32_t    crg_offset;
+    uint32_t    gate_mask;   /* bits that must be set for a clock */
+    uint32_t    reset_mask;  /* bits that hold the block in reset */
+    uint8_t     mux_shift, mux_width;
+    uint32_t    rates[4];    /* Hz per mux value; rates[0] without a mux */
+    uint32_t    cfg0_reset, cfg1_reset;
+} HisiPwmConfig;
+
 typedef struct HisiSoCConfig {
     const char     *name;
     const char     *desc;
@@ -452,6 +471,9 @@ typedef struct HisiSoCConfig {
     /* Words stored into register banks once they exist: status a vendor
      * driver polls that nothing models (0 address ends the list) */
     struct { hwaddr addr; uint32_t value; } reg_presets[HISI_MAX_REG_PRESETS];
+
+    /* The PWM controller behind the "hisi-pwm" regbank entry */
+    HisiPwmConfig   pwm;
 
     /* Generic RAM-backed register banks (pin mux, DDR PHY, PWM, etc.) */
     int             num_regbanks;
