@@ -583,6 +583,72 @@ static const XmSoCConfig *xm535_config(void)
     return &c;
 }
 
+/*
+ * XM232 (U-Boot "CPU: XM232W1", kernel mach-xm232, uniprocessor), read from
+ * the X6S-WEQ-H dump (V5.03.C01, 2026): the second-generation map -- U-Boot
+ * 2014.04 at the flash window, the uMCTL2, the latching SP804, the same
+ * UARTs, GMAC and SFC -- with its own interrupt lines and media blocks.
+ *   - Flash 0 is a 32-byte header (a signature word pair, then zeros); the
+ *     vector table is at +0x20 and its literals point into 0x600001xx, so
+ *     U-Boot is linked with the header in front and the boot ROM enters at
+ *     window + 0x20.  Entered at the window itself the CPU runs the header
+ *     and branches to 0x60b8d908.
+ *   - 64 MB: the loader script's MEM_ALL; Linux mem=33M, the MMZ above it.
+ *   - The kernel (the cramfs romfs's /boot/uImage) is built UP.
+ *   - Interrupts, from each module's request_irq() and platform resources
+ *     (Linux number - 32 = SPI): sdio0_sd.ko IRQ 51, xm_usb0.ko's dwc2 at
+ *     0x50200000 IRQ 55 (not XM530V200's 0x50300000 / 76), i2s.ko AI / AO
+ *     45 / 46, xm_wdt.ko 48, dma.ko 47, hevc.ko 56.
+ *   - Media: VI + ISP in one window at 0x30000000 (xm-vimu), the HEVC /
+ *     H.264 engine at 0x21000000 with its own overlay regions (xm-hevc,
+ *     layout xm232), the NN accelerator at 0x22000000 (xm-vta), dma.ko's
+ *     copy engine at 0x20020000 (xm-dmac); no
+ *     hx280enc or JPEG engine.  The media blocks address the DDR at
+ *     0x90000000 as well.
+ */
+static const XmSoCConfig *xm232_config(void)
+{
+    static XmSoCConfig c;
+
+    if (!c.desc) {
+        c = xm53x_v2_base("Xiongmai XM232 (Cortex-A stand-in A9, GIC, "
+                          "uMCTL2)");
+        c.max_cpus = 1;
+        c.flash_entry = 0x60000020;
+        c.ram_size_default = 64 * MiB;
+        c.sdhci_irqs[0] = 19;
+        c.usb_base = 0x50200000;
+        c.usb_irq = 23;
+        c.audio_irqs[0] = 13;
+        c.audio_irqs[1] = 14;
+        c.h1_base = 0;
+        /* hevc.ko's engine (xm-hevc, layout xm232), h265 SPI 24 */
+        c.hevc_base = 0x21000000;
+        c.hevc_irq = 24;
+        c.hevc_layout = "xm232";
+        c.osd_base = 0;
+        c.isp2 = false;
+        /* Isp.json: two SC2336 on xm_i2c bus 0, 0x30 and 0x32 */
+        c.i2c2_base = 0;
+        /* isp.ko's vicu_bayer_irq SPI 32 and bpu_hvgen_irq SPI 56,
+         * vi_mu.ko's vi_sel SPI 57, isp.ko's mux_timer_irq SPI 58 */
+        c.vimu = true;
+        /* vb.ko's buffers, as VI, ISP and the HEVC engine are given them:
+         * the MMZ (0x82300000 up) at 0x92300000 */
+        c.ram_media_alias = 0x90000000;
+        /* XmVtaMte.ko's vta_ip_base and vta_irq_num 59 (SPI 27) */
+        c.vta_base = 0x22000000;
+        c.vta_irq = 27;
+        /* dma.ko's copy engine (Sofia's AI frame fetch), IRQ 47 (SPI 15) */
+        c.dmac_irq = 15;
+        c.vimu_irqs[0] = 32;
+        c.vimu_irqs[1] = 56;
+        c.vimu_irqs[2] = 57;
+        c.vimu_irqs[3] = 58;
+    }
+    return &c;
+}
+
 static const XmSoCConfig *xm533_config(void)
 {
     static XmSoCConfig c;
@@ -991,6 +1057,13 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     xm_cpu0 = cpu;
 
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
+    if (c->ram_media_alias) {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(alias, NULL, "xm.ram-media", machine->ram, 0,
+                                 memory_region_size(machine->ram));
+        memory_region_add_subregion(sysmem, c->ram_media_alias, alias);
+    }
 
     if (c->sram_size) {
         MemoryRegion *sram = g_new(MemoryRegion, 1);
@@ -1306,6 +1379,26 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             }
         }
     }
+    if (c->vta_base) {
+        sysbus_create_simple("xm-vta", c->vta_base, pic[c->vta_irq]);
+    }
+    if (c->dmac_irq) {
+        DeviceState *dmac = qdev_new("xm-dmac");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dmac), &error_fatal);
+        /* over the "xm-dma" placeholder regbank */
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dmac), 0, 0x20020000, 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dmac), 0, pic[c->dmac_irq]);
+    }
+    if (c->vimu) {
+        DeviceState *vimu = qdev_new("xm-vimu");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vimu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vimu), 0, 0x30000000);
+        for (n = 0; n < ARRAY_SIZE(c->vimu_irqs); n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(vimu), n, pic[c->vimu_irqs[n]]);
+        }
+    }
     if (c->vi_base) {
         DeviceState *vi = qdev_new("xm-vi");
 
@@ -1539,6 +1632,7 @@ DEFINE_XM_MACHINE("xm550", xm550, (*xm550_config()))
 DEFINE_XM_MACHINE("xm530v200", xm530v200, (*xm530v200_config()))
 DEFINE_XM_MACHINE("xm533", xm533, (*xm533_config()))
 DEFINE_XM_MACHINE("xm535", xm535, (*xm535_config()))
+DEFINE_XM_MACHINE("xm232", xm232, (*xm232_config()))
 DEFINE_XM_MACHINE("xm8536e", xm8536e, (*xm8536e_config()))
 DEFINE_XM_MACHINE("xm8520d", xm8520d, (*xm8520d_config()))
 DEFINE_XM_MACHINE("xm8521dv200", xm8521dv200, (*xm8521dv200_config()))

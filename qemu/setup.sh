@@ -41,6 +41,9 @@ cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-ddrc.c           "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-umctl2.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-isp2.c           "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-vimu.c qemu/hw/misc/xm-pattern.c.inc qemu/hw/misc/xm-vta.c \
+   qemu/hw/misc/xm-dmac.c \
+                                    "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-osd.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-nn.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-jpeg.c qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h \
@@ -517,6 +520,16 @@ if ! grep -q xm-isp2 "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-isp2.c"
 fi
+if ! grep -q xm-vimu "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vimu.c', 'xm-vta.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-vimu.c"
+fi
+if ! grep -q xm-dmac "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-dmac.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-dmac.c"
+fi
 if ! grep -q xm-osd "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-osd.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
@@ -567,7 +580,8 @@ if ! grep -q hantro-h264 "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added hantro-h264.c"
 fi
-if ! grep -q xm-vi "$QEMU_DIR/hw/misc/meson.build"; then
+# the file name in full: "xm-vi" alone also matches xm-vimu.c's line
+if ! grep -q "'xm-vi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-vi.c"

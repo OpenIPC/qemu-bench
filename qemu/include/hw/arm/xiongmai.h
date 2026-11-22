@@ -131,6 +131,15 @@ typedef struct XmSoCConfig {
      * ISP's isp_irqs frame interrupts from isp_irq. */
     hwaddr      vi_base;
     bool        isp2;           /* second generation: xm-isp2 instead */
+    bool        vimu;           /* XM232: xm-vimu at 0x30000000 */
+    /* where the media blocks see the DDR as well (XM232's VB hands them
+     * addresses at 0x90000000 + offset); 0 = nowhere else */
+    hwaddr      ram_media_alias;
+    hwaddr      vta_base;       /* XM232 NN accelerator (xm-vta), 0 = none */
+    int         vta_irq;
+    int         dmac_irq;       /* XM232 dma.ko engine (xm-dmac) at
+                                 * 0x20020000, over the regbank; 0 = none */
+    int         vimu_irqs[4];   /* its SPIs: VICU, BPU, vi_sel, mux timer */
     const char *isp2_layout;    /* xm-isp2 layout; NULL = xm535 */
     bool        isp2_store_lines_by_event;  /* store IRQs per event */
 #define XM_ISP2_IRQS 9

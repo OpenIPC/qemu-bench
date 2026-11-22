@@ -79,9 +79,17 @@ static uint64_t xm_gpio_read(void *opaque, hwaddr off, unsigned size)
 
     /* The ADC the vendor adc.ko reads (XM533 / XM535: select +0xCC0, data
      * +0xCC4) is where Sofia's ADC keys sit -- the reset key among them,
-     * pressed at 0.  Nothing pulls it down here: full scale, released. */
+     * pressed at 0 (Sofia's key numbers 250..253: channels 0..3).  Nothing
+     * pulls them down here: 992 of 1023, released.  XM232's adc.ko first
+     * calibrates against ten reference inputs (select bits 7:4 = 5..14, 0
+     * to 252 in its units, a step apart) and converts by interpolating
+     * between them, so those read a ramp, and a key must read below the top
+     * reference: one above them all, or equal to the lowest, converts to 0,
+     * pressed, and Sofia restores the factory settings and reboots. */
     if (s->adc_off && off == s->adc_off) {
-        return 0x3ff;
+        const uint32_t in = (s->regs[(s->adc_off - 4) / 4] >> 4) & 0xF;
+
+        return in >= 5 && in <= 14 ? (in - 5) * 113 : 992;
     }
     if (pad < s->pads) {
         const int driven = xm_gpio_driven(v);
