@@ -3699,6 +3699,28 @@ def test_i6c_bdma_mmu(qemu, tmp):
         qt.close()
 
 
+def test_i6c_bdma_irq(qemu, tmp):
+    print('infinity6c BDMA: the four channels on one interrupt, SPI 72')
+    path = i6_image(tmp, 'i6ci.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        for ch in (0, 1, 2, 3):
+            qt.writel(DRAM + 0x300000, 0)
+            b = BDMA + ch * 0x80
+            qt.writew(b + 0x0A * 4, 0x5A5A)
+            qt.writew(b + 0x0B * 4, 0x5A5A)
+            bdma_run(qt, ch, 0x0004, 0, 0x300000, 4, misc=2)
+            # bdma_run clears done (bit 3); the interrupt is bit 2
+            check('BDMA ch%d: done raises MS_IRQ 40 (SPI 72)' % ch,
+                  intc_raw(qt, 40), 1)
+            check('BDMA ch%d: not SPI 73, bdma1\'s' % ch, intc_raw(qt, 41), 0)
+            qt.writew(b + 0x01 * 4, 4)
+            check('BDMA ch%d: clearing bit 2 drops it' % ch,
+                  intc_raw(qt, 40), 0)
+    finally:
+        qt.close()
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4090,6 +4112,7 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)

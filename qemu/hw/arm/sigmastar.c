@@ -2052,8 +2052,15 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             SS_SPI_BDMA0, SS_SPI_BDMA1, SS_SPI_BDMA2, SS_SPI_BDMA3,
         };
 
-        if (c->die == SS_DIE_IFLIEGEN) {
-            /* bdma0-3 share INT_IRQ_BDMA (DTS); msys copies on channel 2 */
+        if (c->die == SS_DIE_IFLIEGEN || c->die == SS_DIE_INFINITY6C) {
+            /*
+             * bdma0-3 share INT_IRQ_BDMA (DTS); msys copies on channel 2.
+             * infinity6c likewise: its kernel's HalBdma device 0 is
+             * these four channels on SPI 72 ("BdmaIsr", HalBdma_ISR
+             * polls each), where msys_dma_fill_lineoffset runs on
+             * channel 1 and waits for it; the DTS's SPI 73 is "bdma1",
+             * another block at 0x1F201600.
+             */
             DeviceState *or = qdev_new(TYPE_OR_IRQ);
 
             qdev_prop_set_uint16(or, "num-lines", 4);
