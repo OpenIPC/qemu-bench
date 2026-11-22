@@ -191,6 +191,11 @@ What OP-TEE and Linux need from the SoC, beyond the RV1106's models:
     driver reads them: it reads them at every FRAME. With statistics only
     on the last pass, rkaiq got an empty buffer for each first pass and
     reported "no aec stats".
+  - **CIF (`rk-cif`):** a channel whose last frame end is still
+    pending skips the next frame, as the RV1106's VICAP does. With both
+    buffers' ends pending at once (the guest a frame late), the rkcif
+    driver's `rkcif_assign_new_buffer_pingpong` dereferenced NULL and
+    panicked (2 boots in 4 when slowed down; none in 10 after).
   - **ISPP (`rk-ispp`, `0xFFB60000`, SPIs 63 / 64):** the driver starts
     TNR, NR + SHP and FEC per frame through `CTRL_STRT`. Each stage ends
     with its interrupt (TNR / NR + SHP + each enabled scaler / FEC). The
@@ -226,6 +231,25 @@ What OP-TEE and Linux need from the SoC, beyond the RV1106's models:
   the shared `jpeg-enc.c`. Register 53 returns the bits written from the
   8-byte-aligned start, as the HAL reads it. Inputs: NV12, I420, YUYV,
   UYVY.
+- **VDPU2 JPEG decode (`rk-vdpu2`, `0xFFB90400`, SPI 73, the VEPU2's
+  IOMMU):** MPP gives it JPEG only on this SoC (`osal/mpp_soc.c`:
+  `vdpu2_jpeg_fix`). The HAL (`hal_jpegd_vdpu2.c`) parses the headers
+  itself and points reg64 at the scan, 8-byte aligned, inside the packet
+  buffer, which starts with the whole file from SOI on a page boundary.
+  So the model goes back to SOI and decodes the file with the shared
+  baseline decoder (`jpeg-dec.c`; 4:2:0 / 4:2:2 / 4:4:4 / grey, restart
+  intervals). It writes the picture at the macroblock size from reg120:
+  luma at reg63, interleaved CbCr at the JPEG's own sampling at reg131.
+  Then reg55 gets IRQ | READY (0x11) and reg57's start bit clears.
+  Progressive and arithmetic JPEGs (and the H.264 / VP8 modes the RV1126
+  doesn't use) end with the stream-error bit (0x1000).
+  - Checked with MPP's own `mpi_dec_test`, cross-built static (MPP
+    linked as its merged static archive alone, or its singletons register
+    twice and abort) and pushed over adb (`-M rv1109,usb-otg=device`, see
+    USB gadget). `mpi_dec_test -t 8 -i s.jpg -o o.yuv -n 1 -w 640 -h 360`
+    decodes a 640x360 photo in 129 ms. The NV12 it saves matches
+    ffmpeg's decode of the file at 68 dB PSNR (IDCT rounding). Before the
+    model, the job timed out after 2 s.
 - **NPU MMU:** galcore runs the command front end on GPU addresses once
   it turns on the Vivante MMUv2 (`0x388` bit 0, master TLB at `0x184`,
   loaded by LOAD_STATE). The model walks those tables. A fetch outside
@@ -444,6 +468,16 @@ Machine options besides the flash:
   - Without it the driver logs "ircut close fail, retry to close": it
     reads back what it wrote. `70:75` (GPIO2_A6, GPIO2_B3) on the XM
     RV1103B.
+- `scene=FILE.y4m`: a YUV4MPEG2 recording (4:2:0, 8-bit) the cameras
+  see, looped one frame per sensor frame, in place of the test pattern.
+  Its samples go back to linear light (BT.601 limited, 2.2 gamma; white
+  at reflectance 0.9), so the sensor's exposure still lights them and AE
+  closes its loop as on the pattern. VICAP's DDR capture and the ISP32
+  and ISPP renders all sample it. The ISP32 renders a recording in
+  2 x 2 blocks rather than the pattern's 8 x 8; `-global
+  rk-isp32.block=N` sets the block (1..16, 0 for that default). On the
+  R5 at 2 that costs about 45 ms of host time a frame, against 3 ms.
+  `ffmpeg -i rec.mp4 -pix_fmt yuv420p rec.y4m` makes one.
 - `tb-isp=ADDR:CAMERAS[:STRIDE]`: stands in for the MCU's
   thunder-boot result to the ISP driver (`rkisp_chk_tb_over`). It is
   written at reset into the ISP's reserved memory (its devicetree
@@ -720,6 +754,14 @@ Messages that are expected, because the hardware isn't modelled:
     sensors, which isn't modelled (mpp's "nobit").
 - the G2's empty `mtd` partition (all zeros in the dump) failing to mount
   as JFFS2
+- on the RV1109 under a heavy host load (several boots at once with
+  `-d unimp`), sometimes no `mediaserver`: it aborts with `terminate
+  called after throwing an instance of 'DBus::Error'` ("The name
+  rockchip.StorageManager was not provided"), having asked
+  `storage_manager` over D-Bus before that registered. The guest then
+  idles with no video. This is a start-up race in the SDK's services
+  that slow emulation widens (2 boots in 6 seen); it isn't a model
+  fault.
 
 ### Hardware ID
 
@@ -1052,8 +1094,11 @@ RV1103 / RV1106:
   9:0, G in 21:10, R in 31:22 (R and B 10-bit, G 12-bit). The table is
   read from MI_LUT_3D_RD_BASE (0x1940, WSIZE 0x1950 = 729) while
   `3DLUT_CTRL` (0x3E00) bit 0 is set, trilinear between the points. The
-  XM R5's rkaiq loads the identity. `-global rk-isp32.lut3d=off` skips
-  it. DRC (0x3900) and dehaze (0x3C00) are on in that firmware, but the
+  XM R5's rkaiq loads a table that is the identity at most points but
+  moves some colours (entry 64, R 1 G 7 B 0: R 105 for 128, G 3688 for
+  3584). A table that is the identity everywhere (to a level) is
+  skipped, as it changes nothing. `-global rk-isp32.lut3d=off` skips
+  any. DRC (0x3900) and dehaze (0x3C00) are on in that firmware, but the
   kernel only loads their parameters (gain / compression curves,
   bilateral sigmas, dehaze thresholds); what the silicon does with them
   isn't documented, so they aren't guessed at. The colour matrix (CCM) is applied without its
@@ -1061,9 +1106,13 @@ RV1103 / RV1106:
   applied too: the AWB gains (gain0 at 0x538 and
   AWB1 at 0x530, multiplied together, when ISP_CTRL0 bit 7 is set) and
   CPROC at `0x800` (contrast, brightness, saturation, hue). Each grey
-  block is a white point for every illuminant: the xy ranges rkaiq
-  programs aren't applied, so AWB lands a few per cent short of the
-  exact gains. AF statistics aren't produced from the scene.
+  block is a white point for every illuminant; the xy ranges rkaiq
+  programs aren't applied. That isn't needed for the scene's neutral
+  light: on the XM R5, rkaiq's AWB1 gains (R/G 1.653, B/G 1.700) are
+  within 0.2 % of the exact 1/0.606 and 1/0.588. Neutral greys come out
+  at U = V = 128. The YUV conversion now rounds; it had truncated a
+  grey's 127.9999 to 127, a one-level green cast everywhere. AF
+  statistics aren't produced from the scene.
 - **Encoder:** H.265 P slices use the shared encoder's real inter coding
   (`hevc-enc-inter.c.inc`): a motion search with sub-sample refinement,
   merge / AMVP and a coded residual, within what the HAL's SPS / PPS
@@ -1241,6 +1290,12 @@ RV1103 / RV1106:
     is the output.
   - A task writes only the registers that change, so the model keeps the
     DPU's values across tasks.
+  - `-global rk-rknpu.trace=on` logs each job and each task's commands
+    (`target:register=value`). The XM R5's detector is 185 tasks an
+    inference: 152 convolutions (CNA + CORE + DPU + DPU RDMA), 21 DPU-only
+    element-wise steps and 12 PPU poolings. Their register layout is
+    Mesa's rocket driver's (`src/gallium/drivers/rocket/registers.xml`),
+    the RK3588 NPU's.
   - At the end of a job, every DPU output cube is filled with 0x80, the
     INT8 minimum. The cube is width 0x4030 + 1 × height 0x4034 + 1, in
     16-channel surfaces (0x403c + 1 channels). The surface stride is
@@ -1308,7 +1363,11 @@ RV1109 / RV1126:
   logged "Key Error: volume up failed to read saradc".
 - AWB and AF statistics from the scene (AWB is neutral). The ISPP's
   params buffers run short now and then ("no free ispp params buffer").
-- The VEPU2's H.264 (its JPEG is modelled) and the VDPU decoders.
+- The rkvdec (`0xFFB80000`, H.264 / H.265 decode; MPP's
+  `vdpu341_lite`) probes but takes no jobs. The RV1109 camera's own
+  software never decodes. (The VDPU2's JPEG decode is modelled, and the
+  VEPU2 is JPEG-only on this SoC, MPP's `vepu2_jpeg`: H.264 and H.265
+  encode on the VEPU541, which is modelled.)
 - rkaiq's "no free ispp params buffer" now and then: its threads run late
   under emulation (the CIF's "frame drop to dummy buf" too). That's not a
   missing model.

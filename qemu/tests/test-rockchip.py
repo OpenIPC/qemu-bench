@@ -500,6 +500,47 @@ def test_vicap_dma(qt):
     qt.writel(V + 0x100, 0)
 
 
+def test_scene_file(qemu, path):
+    """scene=: a Y4M recording in place of the test pattern -- red on the
+    left, blue on the right comes out of the ISP so."""
+    w, h = 64, 40
+    y4m = os.path.join(os.path.dirname(path), 'scene.y4m')
+    # BT.601 limited: red (81, 90, 240), blue (41, 240, 110)
+    yp = bytes(81 if x < w // 2 else 41 for _ in range(h) for x in range(w))
+    up = bytes(90 if x < w // 4 else 240 for _ in range(h // 2)
+               for x in range(w // 2))
+    vp = bytes(240 if x < w // 4 else 110 for _ in range(h // 2)
+               for x in range(w // 2))
+    with open(y4m, 'wb') as f:
+        f.write(b'YUV4MPEG2 W%d H%d F25:1 C420jpeg\n' % (w, h))
+        f.write(b'FRAME\n' + yp + up + vp)
+    qt = QTest(qemu, 'rv1106,flash-file=%s,scene=%s' % (path, y4m))
+    try:
+        P, buf = 0xFFA00000, 0x01000000
+        for off, v in ((0x59c, w), (0x5a0, h), (0x1408, buf),
+                       (0x140c, w * h), (0x141c, buf + w * h),
+                       (0x1420, w * h // 2), (0x15e8, w),
+                       (0x1400, 1 | 1 << 13), (0x1404, 1 << 4)):
+            qt.writel(P + off, v)
+        i2c_reg_write(qt, 0x30, 0x0100, 1)      # the sensor streams
+        qt.writel(0xFFA10780, 1)
+        qt.writel(P + 0x538, 256 << 16 | 256)
+        qt.writel(P + 0x53c, round(256 / 0.606) << 16 | round(256 / 0.588))
+        qt.writel(P + 0x530, 256 << 16 | 256)
+        qt.writel(P + 0x534, 256 << 16 | 256)
+        qt.writel(P + 0x400, 1 | 1 << 7)
+        qt.cmd('clock_step 33400000')
+        qt.cmd('clock_step 33400000')
+        uv = qt.read(buf + w * h, w * h // 2)
+        left = uv[10 * w + 8:10 * w + 10]
+        right = uv[10 * w + 48:10 * w + 50]
+        check(left[1] > left[0] + 40 and right[0] > right[1] + 40,
+              'scene=: a red left half and a blue right half (Cb/Cr %s, %s)'
+              % (tuple(left), tuple(right)))
+    finally:
+        qt.close()
+
+
 def test_isp32_colour(qt):
     # white balance, colour matrix and gamma out on a 64x40 frame: block
     # row 0 is the grey gradient, row 2 the colour bars (bar 0 red at x 8)
@@ -1104,6 +1145,57 @@ def test_vepu2_jpeg(qt):
     except Exception as e:
         check(False, 'VEPU2 JPEG decodes: %s' % e)
     qt.writel(V + 4 * 109, 0)
+
+
+def test_vdpu2_jpeg(qt):
+    """RV1126 VDPU2 JPEG decode: the scan's position in reg64 (8-byte
+    aligned, in the packet buffer that starts with SOI), NV12 out at the
+    macroblock size; the same picture PIL decodes."""
+    try:
+        from PIL import Image
+        import io
+    except ImportError:
+        print('skip VDPU2 JPEG: no PIL')
+        return
+    D = 0xFFB90400
+    w, h = 64, 48
+    pkt, oy = 0x08a00000, 0x08b00000
+    oc = oy + w * h
+    rgb = bytes(v for r in range(h) for x in range(w)
+                for v in (4 * x, 5 * r, 2 * x + 2 * r))  # smooth: no wraps
+    f = io.BytesIO()
+    Image.frombytes('RGB', (w, h), rgb).save(f, 'JPEG', quality=85,
+                                             subsampling=2)
+    jfif = f.getvalue()
+    sos = jfif.index(b'\xff\xda')
+    scan = sos + 2 + (jfif[sos + 2] << 8 | jfif[sos + 3])
+    off = scan & ~7
+    qt.write(pkt, jfif)
+    for idx, v in {53: 3, 64: pkt + off, 51: len(jfif) - off,
+                   120: (w // 16) << 23 | (h // 16) << 11,
+                   122: (scan & 7) * 8 << 26, 63: oy, 131: oc}.items():
+        qt.writel(D + 4 * idx, v)
+    qt.writel(D + 4 * 57, 1)
+    qt.cmd('clock_step 2000000')
+    st = qt.readl(D + 4 * 55)
+    check(st & 0x11 == 0x11 and not qt.readl(D + 4 * 57) & 1,
+          'VDPU2 JPEG decode done (INT 0x%x)' % st)
+    ref = Image.open(io.BytesIO(jfif)).convert('YCbCr')
+    ry = ref.split()[0].tobytes()
+    gy = qt.read(oy, w * h)
+    gc = qt.read(oc, w * h // 2)
+    ey = max(abs(a - b) for a, b in zip(gy, ry))
+    fcb = ref.split()[1].tobytes()
+    ec = sum(abs(gc[2 * (r * (w // 2) + x)] -
+                 (fcb[2 * r * w + 2 * x] + fcb[2 * r * w + 2 * x + 1] +
+                  fcb[(2 * r + 1) * w + 2 * x] +
+                  fcb[(2 * r + 1) * w + 2 * x + 1]) / 4)
+             for r in range(h // 2) for x in range(w // 2)) / (w * h / 4)
+    check(ey <= 4 and ec <= 3,
+          'VDPU2 JPEG: luma as PIL decodes it (max error %d), Cb as its '
+          '2 x 2 mean (mean error %.1f)' % (ey, ec))
+    qt.writel(D + 4 * 55, 0)
+    check(not qt.readl(D + 4 * 55) & 1, 'VDPU2: the driver clears INT')
 
 
 def test_pwm(qt, P, who):
@@ -2142,14 +2234,28 @@ def test_rv1109(qemu, tmp):
                 i2c_reg_write(qt, 0x1a, r, v)       # VMAX 2000, SHR0 1000
         finally:
             I2C4 = saved
-        qt.cmd('clock_step 100000000')              # two and a half frames
-        st = qt.readl(C + 0x128)
-        check(st & 0x303 == 0x303 and qt.readl(C + 0x14c) >= 2 and
-              qt.readl(C + 0x134) & 0x3fff == 2160,
-              'CIF: frame 0 / 1 start and end at 25 fps, frame number, '
-              'lines (0x%x)' % st)
+        def cif_until(bit):
+            seen = 0
+            for _ in range(40):                     # 200 ms at most
+                qt.cmd('clock_step 5000000')
+                seen |= qt.readl(C + 0x128)
+                if seen & bit:
+                    break
+            return seen
+        st = cif_until(0x100)                       # FRAME0's end
+        check(st & 0x101 == 0x101 and qt.readl(C + 0x134) & 0x3fff == 2160,
+              'CIF: frame 0 start and end at 25 fps, lines (0x%x)' % st)
         qt.writel(C + 0x128, st)
         check(qt.readl(C + 0x128) == 0, 'CIF: INTSTAT write 1 to clear')
+        st = cif_until(0x200)                       # then FRAME1's
+        n = qt.readl(C + 0x14c)
+        check(st & 0x202 == 0x202 and n >= 2,
+              'CIF: then frame 1, frame number %d (0x%x)' % (n, st))
+        qt.cmd('clock_step 100000000')              # FRAME1's end not handled
+        check(qt.readl(C + 0x14c) == n,
+              'CIF: a frame end left pending skips the next frames '
+              '(frame number %d)' % qt.readl(C + 0x14c))
+        qt.writel(C + 0x128, qt.readl(C + 0x128))
         qt.writel(C + 0x80, 0)
         P = 0xFFB50000
         qt.writel(P + 0x59c, 64)                    # ISP out 64 x 32
@@ -2348,6 +2454,7 @@ def test_rv1109(qemu, tmp):
             print('skip VEPU541 OSD decode: no ffmpeg')
         test_pwm(qt, 0xFF430000, 'rv1109')
         test_vepu2_jpeg(qt)
+        test_vdpu2_jpeg(qt)
         check(qt.readl(0xFFD0C120) == 0x5533330a and
               qt.readl(0xFFD00000) >> 16 == 0x100,
               'rv1109 OTG DWC3: GSNPSID, its xHCI at 0xFFD00000')
@@ -2463,6 +2570,7 @@ def main():
     test_machines(args.qemu, path)
     test_gpio_high(args.qemu, path)
     test_tb_isp(args.qemu, path)
+    test_scene_file(args.qemu, path)
     test_rv1103b(args.qemu, path)
     test_pwm_output(args.qemu, path)
     test_sd_write(args.qemu, path)

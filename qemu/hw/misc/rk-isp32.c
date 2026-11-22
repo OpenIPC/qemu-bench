@@ -243,7 +243,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define AWB_DDR         0x2b00      /* struct isp32_rawawb_meas_stat */
 #define AWB_ZONES       15          /* ramdata: 15 x 15 zones */
 #define LEVEL_MAX       RK_SCENE_LEVEL_MAX
-#define BLK             8           /* the scene is flat at this scale */
+#define BLK             (s->blk)    /* the scene is flat at this scale */
 #define AE_LITE_N       5           /* zones a side */
 #define AE_BIG_N        15
 
@@ -280,6 +280,8 @@ struct RkIsp32State {
 
     /* the sensor's raw response to white, per mille of green's */
     uint32_t raw_r, raw_b;
+    uint32_t block;             /* property: render block, 0 auto */
+    uint32_t blk;               /* this frame's */
     /* white points of the frame now ending: neutral, unclipped blocks */
     uint32_t awb_n;
     uint64_t awb_rgain, awb_bgain;      /* sums of G/R and G/B, Q8 */
@@ -314,16 +316,28 @@ static int64_t rk_isp32_half_frame(RkIsp32State *s)
  * Y scaled by the contrast and offset by the brightness, the chroma
  * rotated by the hue and scaled by the saturation.
  */
-static void rk_isp32_cproc(RkIsp32State *s, uint8_t yuv[3])
+/* CPROC's settings, worked out once a frame */
+typedef struct RkCproc {
+    double con, sat_c, sat_s, bri;
+} RkCproc;
+
+static void rk_isp32_cproc_prep(RkIsp32State *s, RkCproc *p)
 {
-    double con = (REG(s, R_CPROC_CONTRAST) & 0xff) / 128.0;
     double sat = (REG(s, R_CPROC_SAT) & 0xff) / 128.0;
-    double bri = (int8_t)REG(s, R_CPROC_BRIGHT);
     double hue = (int8_t)REG(s, R_CPROC_HUE) * (M_PI / 2) / 128;
+
+    p->con = (REG(s, R_CPROC_CONTRAST) & 0xff) / 128.0;
+    p->bri = (int8_t)REG(s, R_CPROC_BRIGHT);
+    p->sat_c = cos(hue) * sat;
+    p->sat_s = sin(hue) * sat;
+}
+
+static void rk_isp32_cproc(const RkCproc *p, uint8_t yuv[3])
+{
     double u = yuv[1] - 128.0, v = yuv[2] - 128.0;
-    double y = yuv[0] * con + bri;
-    double u2 = (u * cos(hue) + v * sin(hue)) * sat + 128;
-    double v2 = (v * cos(hue) - u * sin(hue)) * sat + 128;
+    double y = yuv[0] * p->con + p->bri;
+    double u2 = u * p->sat_c + v * p->sat_s + 128;
+    double v2 = v * p->sat_c - u * p->sat_s + 128;
 
     yuv[0] = y < 0 ? 0 : y > 255 ? 255 : lrint(y);
     yuv[1] = u2 < 0 ? 0 : u2 > 255 ? 255 : lrint(u2);
@@ -391,19 +405,34 @@ static double rk_isp32_goc(RkIsp32State *s, double x)
 static bool rk_isp32_lut3d_load(RkIsp32State *s);
 static void rk_isp32_lut3d(RkIsp32State *s, double v[3]);
 
+/*
+ * The render's block: 8 pixels for the flat test pattern; a recording
+ * (scene=) is detailed, so 2 by default -- a quarter of the pixels
+ * computed, at four times the 8-pixel cost.  "block" sets it.
+ */
+static uint32_t rk_isp32_blk(RkIsp32State *s)
+{
+    return s->block ? MIN(s->block, 16) : rk_scene_has_source() ? 2 : 8;
+}
+
 static void rk_isp32_render(RkIsp32State *s)
 {
     uint32_t w = REG(s, R_ISP_OUT_H) & 0x3fff, h = REG(s, R_ISP_OUT_V) & 0x3fff;
-    uint32_t bw = DIV_ROUND_UP(MAX(w, 1), BLK), bh = DIV_ROUND_UP(MAX(h, 1), BLK);
+    uint32_t blk = rk_isp32_blk(s);
+    uint32_t bw = DIV_ROUND_UP(MAX(w, 1), blk), bh = DIV_ROUND_UP(MAX(h, 1), blk);
     uint64_t lite[AE_LITE_N * AE_LITE_N][4] = { { 0 } };
     uint64_t big[AE_BIG_N * AE_BIG_N][4] = { { 0 } };
     double k, gain[3] = { 1, 1, 1 }, ccm[3][4];
-    bool ccm_on, lut3d_on;
+    bool ccm_on, lut3d_on, cproc_on;
+    RkCproc cp;
     double resp[3] = { s->raw_r / 1000.0, 1, s->raw_b / 1000.0 };
     uint32_t bx, by, i;
     int c;
 
     k = rk_scene_scale(s->sensor);
+    s->blk = blk;
+    cproc_on = REG(s, R_CPROC_CTRL) & 1;
+    rk_isp32_cproc_prep(s, &cp);
     if (bw != s->bw || bh != s->bh) {
         g_free(s->blk_yuv);
         g_free(s->blk_lvl);
@@ -497,8 +526,8 @@ static void rk_isp32_render(RkIsp32State *s)
                 out[c] = s->goc_lut[MIN((uint32_t)out[c], 4095)];
             }
             rk_scene_yuv8(out, true, &s->blk_yuv[b * 3]);
-            if (REG(s, R_CPROC_CTRL) & 1) {
-                rk_isp32_cproc(s, &s->blk_yuv[b * 3]);
+            if (cproc_on) {
+                rk_isp32_cproc(&cp, &s->blk_yuv[b * 3]);
             }
         }
     }
@@ -553,7 +582,22 @@ static bool rk_isp32_lut3d_load(RkIsp32State *s)
     ISP_TRACE(s, "3D LUT at 0x%x: %08x %08x %08x .. %08x",
               REG(s, R_LUT3D_RD_BASE), s->lut3d[0], s->lut3d[1],
               s->lut3d[9], s->lut3d[728]);
-    return true;
+    /*
+     * The identity (each point its own colour, to a level) changes
+     * nothing: skipped, it costs nothing -- a third of a detailed
+     * frame's render (scene=) otherwise.
+     */
+    for (i = 0; i < n; i++) {
+        uint32_t e = s->lut3d[i], r = i % LUT3D_N, g = i / LUT3D_N % LUT3D_N;
+        uint32_t b = i / (LUT3D_N * LUT3D_N);
+
+        if (abs((int)((e >> 22) & 0x3ff) - (int)MIN(r * 128, 1023)) > 1 ||
+            abs((int)((e >> 10) & 0xfff) - (int)MIN(g * 512, 4095)) > 1 ||
+            abs((int)(e & 0x3ff) - (int)MIN(b * 128, 1023)) > 1) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* @v (R, G, B levels, 12-bit) through the 3D LUT */
@@ -1172,6 +1216,7 @@ static void rk_isp32_realize(DeviceState *dev, Error **errp)
 static const Property rk_isp32_properties[] = {
     DEFINE_PROP_UINT32("fps", RkIsp32State, fps, 30),
     DEFINE_PROP_UINT32("raw-r", RkIsp32State, raw_r, 606),
+    DEFINE_PROP_UINT32("block", RkIsp32State, block, 0),
     DEFINE_PROP_UINT32("raw-b", RkIsp32State, raw_b, 588),
     DEFINE_PROP_BOOL("source-gated", RkIsp32State, source_gated, false),
     DEFINE_PROP_BOOL("readback", RkIsp32State, readback, false),

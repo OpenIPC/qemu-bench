@@ -47,6 +47,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/rk-scene.h"
 #include "qapi/error.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
@@ -318,6 +319,7 @@ typedef struct RkSoCConfig {
     bool vepu541;               /* ... the RV1126's VEPU541 */
     hwaddr vepu2_base;          /* VEPU2: JPEG (RV1126) */
     int vepu2_irq;
+    int vdpu2_irq;              /* VDPU2: JPEG decode, at vepu2_base + 0x400 */
     int vepu_irq;
     hwaddr gpio_base[5];
     int gpio_irq[5];
@@ -619,6 +621,7 @@ static const RkSoCConfig rv1103b_soc = {
     .vepu541        = true,                                             \
     .vepu2_base     = 0xFFB90000,   /* its IOMMU at +0x800 */           \
     .vepu2_irq      = 74,                                               \
+    .vdpu2_irq      = 73,                                               \
     .npu_base       = 0xFFBC0000,                                       \
     .saradc_v1_base = 0xFF5E0000,                                       \
     .saradc_v1_irq  = 40,                                               \
@@ -905,6 +908,12 @@ static void rk_machine_gc6160(RkMachineState *s, DeviceState **gpio,
     at24c_eeprom_init(bus, 0x26 >> 1, 256);
     at24c_eeprom_init(bus, 0x20 >> 1, 256);
     at24c_eeprom_init(bus, 0x22 >> 1, 256);
+}
+
+static void rk_machine_set_scene(Object *obj, const char *value,
+                                 Error **errp)
+{
+    rk_scene_set_source(value, errp);
 }
 
 static char *rk_machine_get_tb_isp(Object *obj, Error **errp)
@@ -1942,6 +1951,17 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, c->vepu2_base);
         sysbus_connect_irq(sbd, 0, rk_irq(s, c->vepu2_irq));
+
+        /* the VDPU2 (JPEG decode) beside it, behind the same IOMMU */
+        dev = qdev_new("rk-vdpu2");
+        if (mmu) {
+            object_property_set_link(OBJECT(dev), "iommu", OBJECT(mmu),
+                                     &error_fatal);
+        }
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, c->vepu2_base + 0x400);
+        sysbus_connect_irq(sbd, 0, rk_irq(s, c->vdpu2_irq));
     }
     if (c->rga_base) {
         sysbus_create_simple("rk-rga2", c->rga_base, rk_irq(s, c->rga_irq));
@@ -2477,6 +2497,10 @@ static void rk_machine_class_init(ObjectClass *oc, const void *data)
         "ADDR:CAMERAS[:STRIDE] (the ISP's reserved memory, e.g. "
         "0x8b0000:2 on the XM G2; by default from the flash's thunder-boot "
         "meta when it names two cameras; off: none)");
+    object_class_property_add_str(oc, "scene", NULL, rk_machine_set_scene);
+    object_class_property_set_description(oc, "scene",
+        "A YUV4MPEG2 (4:2:0) recording the cameras see, looped, in place "
+        "of the test pattern");
     object_class_property_add_str(oc, "gpio-high",
         rk_machine_get_gpio_high, rk_machine_set_gpio_high);
     object_class_property_set_description(oc, "gpio-high",

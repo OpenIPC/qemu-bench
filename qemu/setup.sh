@@ -1637,10 +1637,12 @@ done
 # (fh-wdt.c), the DWC EQOS GMAC (axera-eqos.c) and the DW MSHC
 # (hisi-himci.c), the generic SPI NAND (ingenic-spinand.c) the RV1126
 # boards boot from, and the shared HEVC, JPEG and H.264 encoders
-# (hevc-enc.c, jpeg-enc.c, hantro-h264.c) behind rk-vepu540c.  A source set lists a file once, whichever symbols add it.
+# (hevc-enc.c, jpeg-enc.c, hantro-h264.c) behind rk-vepu540c, and the JPEG
+# decoder (jpeg-dec.c) behind rk-vdpu2.  A source set lists a file once,
+# whichever symbols add it.
 for f in watchdog/fh-wdt.c net/axera-eqos.c misc/hisi-himci.c \
          block/ingenic-spinand.c misc/hevc-enc.c misc/jpeg-enc.c \
-         misc/hantro-h264.c; do
+         misc/hantro-h264.c misc/jpeg-dec.c; do
     d=hw/$(dirname "$f"); b=$(basename "$f")
     if ! grep -q "CONFIG_ROCKCHIP_RV11XX', if_true: files('$b')" \
             "$QEMU_DIR/$d/meson.build"; then

@@ -38,6 +38,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
@@ -73,6 +74,8 @@ struct RkRknpuState {
 
     uint32_t regs[NREGS];
     uint32_t task_ns;           /* property: a task's time */
+    bool trace;                 /* property: log each task's commands */
+    uint64_t jobs;
     /* the DPU's output registers: tasks write only what changes */
     uint32_t dpu_dst, dpu_surf, dpu_w, dpu_h, dpu_ch;
 };
@@ -118,9 +121,31 @@ static void rk_rknpu_blank(RkRknpuState *s)
     int tasks = MAX(REG(s, R_TASK_CTRL) & 0xffff, 1);
     int t, i;
 
+    s->jobs++;
+    if (s->trace) {
+        qemu_log("rk-rknpu: job %" PRIu64 ", %d tasks, base 0x%x\n",
+                 s->jobs, tasks, base);
+    }
     for (t = 0; t < tasks && pc; t++) {
         uint32_t next = 0;
         bool dpu = false;
+
+        if (s->trace) {
+            qemu_log("rk-rknpu: task %d at 0x%" HWADDR_PRIx ":", t, pc);
+            for (i = 0; i < MAX_TASK_CMDS; i++) {
+                uint64_t q = address_space_ldq_le(&address_space_memory,
+                                                  pc + i * 8,
+                                                  MEMTXATTRS_UNSPECIFIED,
+                                                  NULL);
+
+                qemu_log(" %04x:%04x=%08x", (uint32_t)(q >> 48),
+                         (uint32_t)(q & 0xffff), (uint32_t)(q >> 16));
+                if ((q >> 48) == 0x0081 && (q & 0xffff) == 0x0008) {
+                    break;
+                }
+            }
+            qemu_log("\n");
+        }
 
         for (i = 0; i < MAX_TASK_CMDS; i++) {
             uint64_t q = address_space_ldq_le(&address_space_memory,
@@ -246,6 +271,7 @@ static void rk_rknpu_init(Object *obj)
 
 static const Property rk_rknpu_properties[] = {
     DEFINE_PROP_UINT32("task-ns", RkRknpuState, task_ns, 200000),
+    DEFINE_PROP_BOOL("trace", RkRknpuState, trace, false),
 };
 
 static const VMStateDescription rk_rknpu_vmstate = {

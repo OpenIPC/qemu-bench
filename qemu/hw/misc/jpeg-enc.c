@@ -281,19 +281,18 @@ void jpeg_enc_header(GByteArray *b, int w, int h, const uint8_t ql[64],
 }
 
 
-/* the Huffman codes, built once */
+/* the Huffman codes, built once (encoders' thread-pool workers race here) */
 static void huff_init(void)
 {
-    static bool done;
+    static gsize done;
 
-    if (done) {
-        return;
+    if (g_once_init_enter(&done)) {
+        huff_build(&huff_dc[0], dc_luma_bits, dc_vals);
+        huff_build(&huff_dc[1], dc_chroma_bits, dc_vals);
+        huff_build(&huff_ac[0], ac_luma_bits, ac_luma_vals);
+        huff_build(&huff_ac[1], ac_chroma_bits, ac_chroma_vals);
+        g_once_init_leave(&done, 1);
     }
-    huff_build(&huff_dc[0], dc_luma_bits, dc_vals);
-    huff_build(&huff_dc[1], dc_chroma_bits, dc_vals);
-    huff_build(&huff_ac[0], ac_luma_bits, ac_luma_vals);
-    huff_build(&huff_ac[1], ac_chroma_bits, ac_chroma_vals);
-    done = true;
 }
 
 size_t jpeg_enc_scan(const uint8_t *y, int ys, const uint8_t *cb,

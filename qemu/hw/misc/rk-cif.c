@@ -20,7 +20,8 @@
  *   0x14c + 4n FRAME_NUM_VCn  frame number, counted per frame start
  *
  * Frames alternate between the FRAME0 and FRAME1 buffers, starting with
- * FRAME0 when capture is enabled.  They come at the sensor's frame rate
+ * FRAME0 when capture is enabled.  A channel whose last frame end is
+ * still pending skips the next frame.  They come at the sensor's frame rate
  * ("sensor" link: its frame period, or "fps") while it streams; the end
  * is half a frame after the start.
  *
@@ -110,6 +111,19 @@ static void rk_cif_tick(void *opaque)
         s->active = 0;
         if (!s->sensor || image_sensor_streaming(s->sensor)) {
             s->active = rk_cif_enabled(s);
+        }
+        for (n = 0; n < NCH; n++) {
+            /*
+             * The channel's last frame end isn't handled yet: this frame
+             * is dropped, as when the DMA has nowhere to go.  Both
+             * buffers' ends pending at once -- the guest a whole frame
+             * late, which a slow emulation is -- made the rkcif driver's
+             * rkcif_assign_new_buffer_pingpong dereference NULL (2 boots
+             * in 4, four RV1109s under gdb with -d unimp).
+             */
+            if (REG(s, R_INTSTAT) & (FE(n, 0) | FE(n, 1))) {
+                s->active &= ~(1u << n);
+            }
         }
         for (n = 0; n < NCH; n++) {
             if (s->active & (1u << n)) {

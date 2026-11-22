@@ -21,6 +21,13 @@
 void rk_scene_rgb(uint32_t seq, double x, double y, double rgb[3]);
 
 /*
+ * Play a YUV4MPEG2 (4:2:0) recording, looped, in place of the test
+ * pattern (the machine's scene=).
+ */
+bool rk_scene_set_source(const char *path, Error **errp);
+bool rk_scene_has_source(void);
+
+/*
  * Raw level per unit reflectance at @sensor's exposure (integration lines
  * x gain; a grey card at RK_SCENE_NOMINAL_LINES and 1x is two thirds of
  * full scale).  Nominal without a sensor or before it is programmed.
