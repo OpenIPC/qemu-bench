@@ -48,7 +48,7 @@ All addresses and IRQ numbers are from the official SDK device trees:
 | USB DWC3 | — | — | 0x10030000 | 39 | Synopsys DWC3 | Missing |
 | Watchdog | 0x12080000 | — | 0x12030000 | 2 | hi_wdg | Missing |
 | RTC | 0x12090000 | 2 | 0x120e0000 | 0 | hi_rtc / hi35xx-rtc | Missing |
-| PWM | 0x12130000 | — | — | — | hi3516cv300-pwm | Missing |
+| PWM | 0x12130000 | — | 0x12080000 | — | hi3516cv300-pwm | `hisi-pwm` |
 | ADC (LSADC) | — | — | 0x120a0000 | 4 | hisi-lsadc | Missing |
 | Cipher | — | — | 0x10050000 | 34 | hisi-cipher | Missing |
 | MISC | — | — | 0x12028000 | — | HiSilicon | Missing |
@@ -282,8 +282,38 @@ Compatible: `snps,dwc3`. High-speed only. PHY: `hixvp-usb2-phy`.
 
 ## 15. PWM
 
-- **CV300**: 0x12130000, compatible `hi3516cv300-pwm`, 4 channels
-- **EV300**: Not present in device tree
+Modelled by `hisi-pwm` (`qemu/hw/misc/hisi-pwm.c`) on every IPC machine:
+
+- The block reads 0 while its CRG word gates it or holds it in reset.
+- It counts at the rate the word's source field selects.
+- A duty latches on a CTRL write, and on V1 only on the enable edge.
+- Each channel's output is published over QOM: `/machine/pwm`, properties
+  `chN-enabled`, `chN-period-ns`, `chN-high-ns` and `clock-hz`.
+
+The rows below give the block, the channel count and the CRG word, with the
+bit meanings and rates.
+
+| family | block | ch | CRG word | bits | rates |
+|---|---|---|---|---|---|
+| V1 cv100 / 18ev100 / 18av100 / 18cv100 | 0x20130000 | 3 | +0x38 | bit 1 gate | 3 MHz |
+| V2 cv200 / 18ev200 | 0x20130000 | 4 | +0x38 | bit 1 gate, bit 2 source | 3 / 50 MHz |
+| V2A av100 / dv100 | 0x20130000, ch 4-7 at +0x1000 | 8 | +0x38 | as V2 | 3 / 50 MHz |
+| V3 cv300 / ev100 | 0x12130000 | 4 | +0x38 | as V2 | 3 / 50 MHz |
+| V3A 3519v101 / av200 | 0x12130000 | 8 | +0xdc | as V2 | 3 / 50 MHz |
+| V4A cv500 / av300 / dv300 | 0x12070000 | 2 | +0x1bc | bit 7 gate, bit 6 reset, [9:8] source | 3 / 50 / 24 / 24 MHz |
+| V4 ev200 / ev300 / gk7205v200 family | 0x12080000 | 4 | +0x1bc | as V4A | as V4A |
+| gk7205v500 / v510 / v530 / gk7202v330 | 0x12080000 | 12 | +0x1bc | as V4A | as V4A |
+| V5 cv608 / cv610 / cv613 | 0x11080000, stride 0x100, minus-one | 8 | +0x4598 | bit 4 gate, bit 0 reset, [13:12] source | 1 / 24 / 198 MHz |
+
+The sources:
+
+- **V4A**: measured on a lab hi3516av300. Stock `0x01802802` reads 0; bit 7
+  wakes the block; sources 0 / 1 / 2 measured 2997703 / 50026950 /
+  24011375 Hz; only channels 0 and 1 decode.
+- **V1, V2, V3, V4**: measured on lab boards, by sampling a bounded run's
+  remaining-periods count twice (the method in OpenIPC/majestic#324).
+- **V2A, V3A, V5**: from the vendor drivers, openhisilicon `kernel/pwm/` and
+  the kernels' `pwm-bsp.c` / `clk_*.c`.
 
 ---
 
@@ -491,7 +521,7 @@ All media blocks are HiSilicon proprietary and require the vendor kernel.
 | USB | — | — | Missing |
 | Watchdog | — | — | Missing |
 | RTC | — | — | Missing |
-| PWM | — | — | Missing |
+| PWM | — | — | `hisi-pwm` |
 | ADC | — | — | Missing |
 | Cipher | — | — | Missing |
 | Pinmux | — | — | Missing |

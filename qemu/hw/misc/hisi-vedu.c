@@ -125,6 +125,43 @@ OBJECT_DECLARE_SIMPLE_TYPE(HisiVeduState, HISI_VEDU)
 #define IMG_PTS_HI          0x4a8
 #define IMG_WORDS           (0x1000 / 4)
 
+/*
+ * gen 2: the Hi3516CV200 / Hi3518EV200 VEDU (0x20620000, VIC 24) as
+ * hi3518e_h264e.o drives it.  MMIO (VEDU_HAL_*, H264E_DRV_ReadRegs, and
+ * the registers of one picture traced under majestic):
+ *   0x000  status: raw & mask (bit 0 end of picture, bit 1 buffer full)
+ *   0x004  mask (0x40000003), 0x00c clear, 0x010 START (1)
+ *   0x0a8  the picture's stream bits (rate control reads it back);
+ *          0x0b94 bits 1:0 nonzero mean an error; statistics 0xa20..0xa40
+ *   0x1e0  physical address of the register image
+ *   0x350  bits 21:16 the picture's QP
+ * The image (offsets in it):
+ *   0x000 / 0x004  source luma / chroma (NV21), 0x018 their strides
+ *                  (luma | chroma << 16), 0x058 the size (width - 1 |
+ *                  (height - 1) << 16)
+ *   0x240  stream ring base, 0x24c its size, 0x244 / 0x248 the addresses
+ *          of its read / write pointer cells
+ * The ring and its packets are V4's (below); the image is copied into the
+ * V4 layout and encoded as V4 pictures are.
+ */
+#define G2_VEDU_STATUS      0x0000
+#define G2_VEDU_MASK        0x0004
+#define G2_VEDU_CLR         0x000c
+#define G2_VEDU_START       0x0010
+#define G2_VEDU_BITS        0x00a8
+#define G2_VEDU_IMAGE       0x01e0
+#define G2_VEDU_QP          0x0350
+#define G2_INT_EOP          (1u << 0)
+#define G2_INT_BUF_FULL     (1u << 1)
+#define G2_IMG_SRC_Y        0x000
+#define G2_IMG_SRC_C        0x004
+#define G2_IMG_SRC_STRIDE   0x018
+#define G2_IMG_PIC_SIZE     0x058
+#define G2_IMG_STRM_BASE    0x240
+#define G2_IMG_STRM_RP      0x244
+#define G2_IMG_STRM_WP      0x248
+#define G2_IMG_STRM_SIZE    0x24c
+
 /* JPGE MMIO */
 #define JPGE_INTSTAT        0x0000  /* 0 done, 1 error, 5 ring full, 7 back */
 #define JPGE_INTEN          0x0004
@@ -277,6 +314,7 @@ struct HisiVeduState {
     uint32_t vedu_raw;
     uint32_t jpge_raw;
     uint32_t img[IMG_WORDS];
+    uint32_t g2_size;           /* gen 2: the picture size from the image */
     VeduChannel chn[VEDU_MAX_CHN];
     unsigned nchn;
     bool trace;
@@ -1284,6 +1322,7 @@ static uint32_t vedu_encode(HisiVeduState *s)
 {
     const uint32_t *img = s->img;
     const uint32_t size_reg = s->gen == 5 ? img[V5_IMG_PIC_SIZE / 4]
+                            : s->gen == 2 ? s->g2_size
                                           : s->vedu_regs[VEDU_PIC_SIZE / 4];
     const int w = (size_reg & 0xffff) + 1, h = (size_reg >> 16) + 1;
     /* H.265 codes at its slice header's QP; that one goes in the stats */
@@ -1361,6 +1400,9 @@ static uint32_t vedu_encode(HisiVeduState *s)
     if (s->gen == 5) {
         vedu_v5_stats(s, c->codec == CODEC_H265, total, qp, mbw * mbh);
     }
+    if (s->gen == 2) {
+        s->vedu_regs[G2_VEDU_BITS / 4] = n * 8;
+    }
     return VEDU_INT_EOP;
 }
 
@@ -1378,6 +1420,14 @@ static void vedu_v5_update_irq(HisiVeduState *s)
     qemu_set_irq(s->vedu_irq, level);
 }
 
+static void g2_vedu_update_irq(HisiVeduState *s)
+{
+    uint32_t st = s->vedu_raw & s->vedu_regs[G2_VEDU_MASK / 4];
+
+    s->vedu_regs[G2_VEDU_STATUS / 4] = st;
+    qemu_set_irq(s->vedu_irq, st != 0);
+}
+
 static void vedu_v5_run(HisiVeduState *s, unsigned k);
 
 static void vedu_done(void *opaque)
@@ -1387,6 +1437,14 @@ static void vedu_done(void *opaque)
     if (s->gen == 7) {
         s->vedu_raw |= xm_vedu_encode(s);
         xm_vedu_update_irq(s);
+        return;
+    }
+    if (s->gen == 2) {
+        uint32_t raw = vedu_encode(s);
+
+        s->vedu_raw |= (raw & VEDU_INT_EOP ? G2_INT_EOP : 0) |
+                       (raw & VEDU_INT_BUF_FULL ? G2_INT_BUF_FULL : 0);
+        g2_vedu_update_irq(s);
         return;
     }
     if (s->gen == 5) {
@@ -1432,6 +1490,49 @@ static void vedu_start(HisiVeduState *s, uint32_t image)
     vedu_fetch(s, image, s->img);
     timer_mod(s->vedu_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VEDU_DONE_NS);
+}
+
+/* gen 2: the CV200 image, its fields moved to where vedu_encode reads */
+static void g2_vedu_start(HisiVeduState *s)
+{
+    g_autofree uint32_t *g2 = g_new0(uint32_t, IMG_WORDS);
+
+    vedu_fetch(s, s->vedu_regs[G2_VEDU_IMAGE / 4], g2);
+    memset(s->img, 0, sizeof(s->img));
+    s->img[IMG_SRC_Y / 4] = g2[G2_IMG_SRC_Y / 4];
+    s->img[IMG_SRC_C / 4] = g2[G2_IMG_SRC_C / 4];
+    s->img[IMG_SRC_STRIDE / 4] = g2[G2_IMG_SRC_STRIDE / 4];
+    s->img[IMG_STRM_BASE / 4] = g2[G2_IMG_STRM_BASE / 4];
+    s->img[IMG_STRM_SIZE / 4] = g2[G2_IMG_STRM_SIZE / 4];
+    s->img[IMG_STRM_RP / 4] = g2[G2_IMG_STRM_RP / 4];
+    s->img[IMG_STRM_WP / 4] = g2[G2_IMG_STRM_WP / 4];
+    s->img[IMG_SLICE_QP / 4] = (s->vedu_regs[G2_VEDU_QP / 4] >> 16) & 0x3f;
+    s->g2_size = g2[G2_IMG_PIC_SIZE / 4];
+    timer_mod(s->vedu_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VEDU_DONE_NS);
+}
+
+static void g2_vedu_write(HisiVeduState *s, hwaddr offset, uint32_t val)
+{
+    switch (offset) {
+    case G2_VEDU_STATUS:
+        return;
+    case G2_VEDU_CLR:
+        s->vedu_raw &= ~val;
+        g2_vedu_update_irq(s);
+        return;
+    case G2_VEDU_MASK:
+        s->vedu_regs[offset / 4] = val;
+        g2_vedu_update_irq(s);
+        return;
+    case G2_VEDU_START:
+        s->vedu_regs[offset / 4] = val;
+        if (val & 1) {
+            g2_vedu_start(s);
+        }
+        return;
+    }
+    s->vedu_regs[offset / 4] = val;
 }
 
 static uint32_t hisi_vedu_v5_read(HisiVeduState *s, hwaddr offset)
@@ -1508,6 +1609,13 @@ static uint64_t hisi_vedu_read(void *opaque, hwaddr offset, unsigned size)
     HisiVeduState *s = HISI_VEDU(opaque);
     uint32_t val;
 
+    if (s->gen == 2) {
+        val = s->vedu_regs[offset / 4];
+        if (s->trace) {
+            fprintf(stderr, "vedu R %04x = %08x\n", (int)offset, val);
+        }
+        return val;
+    }
     if (s->gen == 5 || s->gen == 7) {
         val = s->gen == 5 ? hisi_vedu_v5_read(s, offset)
                           : xm_vedu_read(s, offset);
@@ -1550,6 +1658,10 @@ static void hisi_vedu_write(void *opaque, hwaddr offset,
     }
     if (s->gen == 7) {
         xm_vedu_write(s, offset, val);
+        return;
+    }
+    if (s->gen == 2) {
+        g2_vedu_write(s, offset, val);
         return;
     }
     switch (offset) {
@@ -1804,6 +1916,9 @@ static uint64_t hisi_jpge_read(void *opaque, hwaddr offset, unsigned size)
     HisiVeduState *s = HISI_VEDU(opaque);
     uint32_t val;
 
+    if (s->gen == 2) {
+        return s->jpge_regs[offset / 4];    /* not modelled yet */
+    }
     if (s->gen == 5 || s->gen == 7) {
         val = s->gen == 5 ? hisi_jpge_v5_read(s, offset)
                           : xm_jpge_read(s, offset);
@@ -1846,6 +1961,10 @@ static void hisi_jpge_write(void *opaque, hwaddr offset,
     }
     if (s->gen == 7) {
         xm_jpge_write(s, offset, val);
+        return;
+    }
+    if (s->gen == 2) {
+        s->jpge_regs[offset / 4] = val;     /* not modelled yet */
         return;
     }
     switch (offset) {
@@ -1932,6 +2051,10 @@ static void hisi_vedu_reset(DeviceState *dev)
     }
     memset(s->chn, 0, sizeof(s->chn));
     s->nchn = 0;
+    s->g2_size = 0;
+    /* the status is gone: so are the lines it held up */
+    qemu_set_irq(s->vedu_irq, 0);
+    qemu_set_irq(s->jpge_irq, 0);
 }
 
 static const Property hisi_vedu_properties[] = {
@@ -1959,8 +2082,8 @@ static void hisi_vedu_realize(DeviceState *dev, Error **errp)
 {
     HisiVeduState *s = HISI_VEDU(dev);
 
-    if (s->gen != 4 && s->gen != 5 && s->gen != 7) {
-        error_setg(errp, "hisi-vedu: gen must be 4, 5 or 7");
+    if (s->gen != 2 && s->gen != 4 && s->gen != 5 && s->gen != 7) {
+        error_setg(errp, "hisi-vedu: gen must be 2, 4, 5 or 7");
     }
 }
 

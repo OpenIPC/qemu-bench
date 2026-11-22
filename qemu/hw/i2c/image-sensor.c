@@ -23,6 +23,7 @@
 #define SMARTSENS       "hisi-smartsens"
 #define OV2735          "ingenic-ov2735"
 #define OMNIVISION      "axera-ov-sensor"
+#define IMAGEDESIGN     "imagedesign-mis"
 
 typedef struct ImageSensorSpec {
     const char *name;
@@ -34,7 +35,8 @@ typedef struct ImageSensorSpec {
     bool reg16;         /* GALAXYCORE: 16-bit register addresses */
     uint8_t disc;       /* SMARTSENS: 0x3109 where parts share an ID */
     uint8_t gain_fine;  /* SMARTSENS: 0x3E09 at 1x, on the SC2310's layout */
-    uint32_t pclk;      /* SMARTSENS: pixel clock, when known: frame timing */
+    uint32_t pclk;      /* SMARTSENS, GALAXYCORE: pixel clock, when known:
+                         * frame timing */
     uint16_t hts;       /* SMARTSENS: HTS at reset, where a mode leaves it */
     bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
     uint16_t gain_hcg;  /* SMARTSENS: the SC465SL's gain layout, its HCG
@@ -68,10 +70,14 @@ static const ImageSensorSpec image_sensors[] = {
 
     /* GalaxyCore */
     GC8("gc1054", 0x21, 0x1054),
-    GC8("gc2053", 0x37, 0x2053),
-    GC8("gc2053s1", 0x3F, 0x2053),      /* T23 SDK's second sensor */
+    { "gc2053", GALAXYCORE, 0x37, 0x2053, 0xF0, false,
+      .pclk = 74250000, .hts = 2200 },
+    { "gc2053s1", GALAXYCORE, 0x3F, 0x2053, 0xF0, false,
+      .pclk = 74250000, .hts = 2200 },  /* T23 SDK's second sensor */
     GC8("gc2063", 0x37, 0x2063),
-    GC16("gc2083", 0x37, 0x2083),
+    /* 100 MHz: the 24 MHz reference setting's pixel clock (galaxycore.c) */
+    { "gc2083", GALAXYCORE, 0x37, 0x2083, 0x03F0, true,
+      .pclk = 100000000 },
     GC16("gc2093", 0x37, 0x2093),
     GC16("gc4653", 0x29, 0x4653),
     GC16("gc4663", 0x29, 0x4653),
@@ -91,10 +97,25 @@ static const ImageSensorSpec image_sensors[] = {
     { "sc2315e", SMARTSENS, 0x30, 0x2238, .disc = 0x20, .gain_fine = 0x10,
       .pclk = 74250000 },
     SC("sc2335", 0xCB14),
-    SC("sc2336", 0xCB3A),
+    { "sc2336", SMARTSENS, 0x30, 0xCB3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2336p", SMARTSENS, 0x30, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2336ps1", SMARTSENS, 0x32, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2337p", SMARTSENS, 0x30, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    { "sc2337ps1", SMARTSENS, 0x32, 0x9B3A, .pclk = 79200000, .hts = 2200,
+      .exp_rows = true },
+    /* the SC1346 reads the SC1A4T's ID: AliOS's camera_sc1346 takes it */
+    { "sc1346", SMARTSENS, 0x30, 0xDA4D, .pclk = 72000000, .hts = 1600,
+      .exp_rows = true },
+    { "sc1a4t", SMARTSENS, 0x30, 0xDA4D, .pclk = 72000000, .hts = 1600,
+      .exp_rows = true },
+    { "sc1a4ts1", SMARTSENS, 0x32, 0xDA4D, .pclk = 72000000, .hts = 1600,
+      .exp_rows = true },
     /* RV1106 camera boards' (Rockchip kernel drivers/media/i2c: CHIP_ID
      * at 0x3107:0x3108) */
-    SC("sc2336p", 0x9B3A),
     SC("sc231hai", 0xCB6A),
     SC("sc3336", 0xCC41),
     SC("sc530ai", 0x8E39),
@@ -134,6 +155,11 @@ static const ImageSensorSpec image_sensors[] = {
     { "os04a10", OMNIVISION, 0x36, 0x530441, 0x300A },
     { "ov2735", OV2735, 0x3C, 0x05 },
     { "ov2735b", OV2735, 0x3C, 0x07 },
+
+    /* ImageDesign: MIS2008 and MIS2009 are one die and both read 0x2008
+     * at 0x3000 (ipctool's "mis2008_i2c" on a GK7205V510 MIS2009 camera) */
+    { "mis2008", IMAGEDESIGN, 0x30, 0x2008 },
+    { "mis2009", IMAGEDESIGN, 0x30, 0x2008 },
 
     /* others */
     { "mis2006", "hisi-mis2006", 0x30 },
@@ -181,6 +207,8 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_bit(dev, "reg16", spec->reg16);
         qdev_prop_set_uint16(dev, "id-reg", spec->id_reg);
         qdev_prop_set_uint16(dev, "id", spec->id);
+        qdev_prop_set_uint32(dev, "pclk", spec->pclk);
+        qdev_prop_set_uint16(dev, "hts", spec->hts);
     } else if (!strcmp(spec->type, SMARTSENS)) {
         qdev_prop_set_uint8(dev, "id_high", spec->id >> 8);
         qdev_prop_set_uint8(dev, "id_low", spec->id & 0xFF);
@@ -195,6 +223,8 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint8(dev, "id0", spec->id >> 16);
         qdev_prop_set_uint8(dev, "id1", (spec->id >> 8) & 0xFF);
         qdev_prop_set_uint8(dev, "id2", spec->id & 0xFF);
+    } else if (!strcmp(spec->type, IMAGEDESIGN)) {
+        qdev_prop_set_uint16(dev, "id", spec->id);
     } else if (!strcmp(spec->type, OV2735)) {
         qdev_prop_set_uint8(dev, "rev", spec->id);
     }

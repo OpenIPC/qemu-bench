@@ -12,6 +12,23 @@
  * 16-bit part answers 0 when it was given a single address byte -- the
  * 8-bit probe ipctool tries first must fall through to its 16-bit one.
  *
+ * GC2083, from its datasheet (GC2083 CSP Datasheet V0.0, sections 9.5 and
+ * 9.8 and the register list): shutter 0x0D03[5:0]:0x0D04 and frame
+ * length 0x0D41[5:0]:0x0D42 in rows, line length 0x0D05[3:0]:0x0D06 in
+ * units of two pixel clocks, output window 0x0195..0x0198, column gain
+ * 0x00B8[5:0]:0x00B9[5:0] and pregain 0x00B1[3:0]:0x00B2[7:2], both Q6;
+ * the registers hold its reset values until a driver writes them.  It
+ * streams once the MIPI output enable (0x023E bit 7) is set -- the last
+ * write of the init tables (OpenIPC/linux's 4.19 gc2083.c, the HiSilicon
+ * gc2083_ctrl.c: 0x99); its frame period is then frame length x line
+ * length over the pixel clock ("pclk": 100 MHz in the 24 MHz reference
+ * setting those tables use, 1125 rows of 2962 clocks at 30 frames/s).
+ * Not modelled: the analog PGA (0x00D0, 0x0DC1), whose curve the
+ * datasheet does not give -- below 53x the column gain, which the
+ * drivers' gain tables step with it, carries the total; above, their
+ * last steps raise only the PGA, so the model stops at 53x times the
+ * pregain.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -40,6 +57,8 @@ struct GcSensorState {
     bool reg16;
     uint16_t id_reg;
     uint16_t id;
+    uint32_t pclk;
+    uint16_t hts;
     bool trace;
 
     uint16_t ptr;
@@ -60,6 +79,13 @@ struct GcSensorState {
      * a frame takes at its start (gc_latched[]); the rest as written.
      */
     uint8_t applied[GC_REGS];
+    /*
+     * GC2083 "vts-delay": the frame length (0x0D41, 0x0D42) latched up to
+     * GC2083_VTS_DELAY_MAX frames after the rest; vts_q[0] is what the
+     * last frame start took in, vts_q[n - 1] what the next one applies.
+     */
+    uint32_t vts_delay;
+    uint8_t vts_q[2][2];
     char name[24];
     SensorSync sync;
 };
@@ -72,8 +98,31 @@ struct GcSensorState {
 static const uint16_t gc_latched[] = {
     0x0200, 0x0201, 0x0202, 0x0203, 0x020E, 0x020F, 0x02B3, 0x02B4,
     0x02B8, 0x02B9, 0x02D9, 0x0515, 0x0519, 0x0340, 0x0341,
-    /* GC2083: its exposure and gain, where galaxycore_exposure() reads them */
-    0x0D03, 0x0D04, 0x00B8, 0x00B9,
+    /* GC2083: its exposure, gain and frame length, where
+     * galaxycore_exposure() reads them */
+    0x0D03, 0x0D04, 0x00B8, 0x00B9, 0x00B1, 0x00B2, 0x0D41, 0x0D42,
+};
+
+#define GC2083_ID           0x2083
+#define GC2083_VTS_DELAY_MAX 2
+
+static bool gc_vts_delayed(GcSensorState *s, uint16_t a)
+{
+    return s->vts_delay && s->id == GC2083_ID &&
+           (a == 0x0D41 || a == 0x0D42);
+}
+
+/* GC2083's reset values of the registers the model reads (datasheet) */
+static const struct {
+    uint16_t reg;
+    uint8_t val;
+} gc2083_defaults[] = {
+    { 0x0D03, 0x00 }, { 0x0D04, 0x10 },     /* shutter 16 */
+    { 0x0D05, 0x04 }, { 0x0D06, 0x48 },     /* line length 2 x 1096 */
+    { 0x0D41, 0x04 }, { 0x0D42, 0x65 },     /* frame length 1125 */
+    { 0x0195, 0x04 }, { 0x0196, 0x38 },     /* window 1080 rows */
+    { 0x0197, 0x07 }, { 0x0198, 0x38 },     /* by 1848 columns */
+    { 0x00B1, 0x01 }, { 0x00B2, 0x00 },     /* pregain 1x */
 };
 
 static bool gc_is_latched(uint16_t a)
@@ -119,6 +168,11 @@ static int gc_send(I2CSlave *i2c, uint8_t data)
     sensor_sync_write(&s->sync, s->ptr, data);
     if (s->reg16 && (!s->sync.latching || !gc_is_latched(s->ptr))) {
         s->applied[s->ptr] = data;
+        if (s->ptr == 0x0D41 || s->ptr == 0x0D42) {
+            /* before streaming: at once, the whole pipeline */
+            s->vts_q[0][s->ptr - 0x0D41] = data;
+            s->vts_q[1][s->ptr - 0x0D41] = data;
+        }
     }
     if (!s->reg16) {
         if (s->ptr == 0xFE) {
@@ -144,7 +198,8 @@ static uint8_t gc_recv(I2CSlave *i2c)
     if (s->reg16 && s->naddr == 1) {
         return 0;
     }
-    val = s->regs[s->ptr];
+    val = (!s->reg16 && !s->page && s->ptr != 0xFE) ?
+          s->p0[s->ptr & 0xFF] : s->regs[s->ptr];
     s->ptr = (s->ptr + 1) & gc_mask(s);
     return val;
 }
@@ -155,8 +210,9 @@ static uint8_t gc_recv(I2CSlave *i2c)
  * 0x0202:0x0203 (GC4653; T41's GC4663 the same); the gain the analog
  * gain table's last stage, 0xB8:0xB9 (0x02B8:0x02B9 on the GC4653), in
  * 1/64 -- the tables' coarse steps sit in other registers, but these
- * track the total.  In the two-exposure (DOL) WDR mode of the GC4653 /
- * GC4663 drivers (gc*_set_integration_time_short) the short frame's rows
+ * track the total; on the GC2083 times its pregain (see the top).  In
+ * the two-exposure (DOL) WDR mode of the GC4653 / GC4663 drivers
+ * (gc*_set_integration_time_short) the short frame's rows
  * are 0x0200[5:0]:0x0201, the gain shared by both frames; the model
  * reports them only once a driver has written them (0 otherwise).
  */
@@ -198,8 +254,16 @@ bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
         e->gain = (s->p0[0xB8] << 6 | (s->p0[0xB9] & 0x3F)) * 16;
         e->gain = e->gain ? e->gain : 1024;
         return true;
-    } else if (s->id == 0x2083) {
-        e->lines = s->applied[0x0D03] << 8 | s->applied[0x0D04];
+    } else if (s->id == GC2083_ID) {
+        uint32_t col = (s->applied[0x00B8] & 0x3F) << 6 |
+                       (s->applied[0x00B9] & 0x3F);
+        uint32_t pre = (s->applied[0x00B1] & 0x0F) << 6 |
+                       s->applied[0x00B2] >> 2;
+
+        e->lines = (s->applied[0x0D03] & 0x3F) << 8 | s->applied[0x0D04];
+        /* Q6 x Q6, then 1.0 = 1024; a gain left at 0 is 1x */
+        e->gain = (col ? col : 64) * (pre ? pre : 64) / 4;
+        return true;
     } else {
         e->lines = s->applied[0x0202] << 8 | s->applied[0x0203];
         e->short_lines = (s->applied[0x0200] & 0x3F) << 8 |
@@ -221,13 +285,19 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
     galaxycore_exposure(sensor, &x);
     e->lines = x.lines;
     e->gain = x.gain;
-    if (s->reg16) {
+    if (s->id == GC2083_ID && s->reg16) {
+        e->vts = (s->applied[0x0D41] & 0x3F) << 8 | s->applied[0x0D42];
+        e->width = (s->regs[0x0197] & 0x0F) << 8 | s->regs[0x0198];
+        e->height = (s->regs[0x0195] & 0x07) << 8 | s->regs[0x0196];
+    } else if (s->reg16) {
         e->vts = (s->applied[0x0340] & 0x3F) << 8 | s->applied[0x0341];
     } else if (s->id == 0x1054) {
         /* 720 rows, VB in 0x07[3:0]:0x08, and 16 more (gc1054.c) */
         e->vts = 720 + ((s->p0[0x07] & 0x0F) << 8 | s->p0[0x08]) + 16;
         e->width = 1280;
         e->height = 720;
+    } else if (s->id == 0x2053 || s->id == 0x2063) {
+        e->vts = (s->p0[0x41] & 0x3F) << 8 | s->p0[0x42];
     }
 }
 
@@ -235,17 +305,38 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
  * GC1054: a row is 1732 periods of its 38.8 MHz timing clock (gc1054.c),
  * so VB 160 -- the driver's default -- is 25 frames/s.  0 until the
  * driver has started the stream (page 3's 0x10 = 0x90, MIPI on).
+ * GC2083: 0 until its MIPI output is on (0x023E bit 7), then its frame
+ * length times its line length (0x0D05:0x0D06, x2) over "pclk".
+ * The other parts: HTS x VTS over the pixel clock, when a machine gives
+ * both ("pclk", "hts"); 0 otherwise.
  */
 static int64_t galaxycore_frame_ns(Object *sensor)
 {
     GcSensorState *s = GALAXYCORE_SENSOR(sensor);
     ImageSensorExposure e = { 0 };
 
-    if (s->reg16 || s->id != 0x1054 || !(s->p3[0x10] & 0x80)) {
-        return 0;
+    if (!s->reg16 && s->id == 0x1054) {
+        if (!(s->p3[0x10] & 0x80)) {
+            return 0;
+        }
+        galaxycore_exposure_sensor(sensor, &e);
+        return muldiv64((uint64_t)e.vts * 1732, NANOSECONDS_PER_SECOND,
+                        38800000);
     }
     galaxycore_exposure_sensor(sensor, &e);
-    return muldiv64((uint64_t)e.vts * 1732, NANOSECONDS_PER_SECOND, 38800000);
+    if (s->reg16 && s->id == GC2083_ID) {
+        uint32_t hts = ((s->regs[0x0D05] & 0x0F) << 8 | s->regs[0x0D06]) * 2;
+
+        if (!(s->regs[0x023E] & 0x80) || !s->pclk || !hts || !e.vts) {
+            return 0;
+        }
+        return muldiv64((uint64_t)hts * e.vts, NANOSECONDS_PER_SECOND,
+                        s->pclk);
+    }
+    if (!s->pclk || !s->hts || !e.vts) {
+        return 0;
+    }
+    return (int64_t)s->hts * e.vts * NANOSECONDS_PER_SECOND / s->pclk;
 }
 
 /*
@@ -264,13 +355,26 @@ static bool galaxycore_frame_start(Object *sensor)
         return false;           /* the 8-bit parts apply writes at once */
     }
     for (i = 0; i < ARRAY_SIZE(gc_latched); i++) {
-        if (s->applied[gc_latched[i]] != s->regs[gc_latched[i]]) {
+        if (!gc_vts_delayed(s, gc_latched[i]) &&
+            s->applied[gc_latched[i]] != s->regs[gc_latched[i]]) {
             pending = true;
         }
     }
     if (sensor_sync_frame_start(&s->sync, 0, 0, pending)) {
         for (i = 0; i < ARRAY_SIZE(gc_latched); i++) {
-            s->applied[gc_latched[i]] = s->regs[gc_latched[i]];
+            if (!gc_vts_delayed(s, gc_latched[i])) {
+                s->applied[gc_latched[i]] = s->regs[gc_latched[i]];
+            }
+        }
+        if (gc_vts_delayed(s, 0x0D41)) {
+            /* the frame length a frame (or two) behind the rest */
+            unsigned n = MIN(s->vts_delay, GC2083_VTS_DELAY_MAX);
+
+            s->applied[0x0D41] = s->vts_q[n - 1][0];
+            s->applied[0x0D42] = s->vts_q[n - 1][1];
+            memcpy(s->vts_q[1], s->vts_q[0], 2);
+            s->vts_q[0][0] = s->regs[0x0D41];
+            s->vts_q[0][1] = s->regs[0x0D42];
         }
     }
     galaxycore_exposure_sensor(sensor, &e);
@@ -327,7 +431,20 @@ static void gc_reset(DeviceState *dev)
     memset(s->p0, 0, sizeof(s->p0));
     memset(s->p1, 0, sizeof(s->p1));
     memset(s->p3, 0, sizeof(s->p3));
+    if (!s->reg16) {
+        s->p0[s->id_reg & 0xFF] = s->id >> 8;
+        s->p0[(s->id_reg + 1) & 0xFF] = s->id & 0xFF;
+    }
+    if (s->reg16 && s->id == GC2083_ID) {
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(gc2083_defaults); i++) {
+            s->regs[gc2083_defaults[i].reg] = gc2083_defaults[i].val;
+        }
+    }
     memcpy(s->applied, s->regs, sizeof(s->applied));
+    s->vts_q[0][0] = s->vts_q[1][0] = s->regs[0x0D41];
+    s->vts_q[0][1] = s->vts_q[1][1] = s->regs[0x0D42];
     sensor_sync_reset(&s->sync);
 }
 
@@ -337,15 +454,22 @@ static int gc_post_load(void *opaque, int version_id)
 {
     GcSensorState *s = opaque;
 
+    if (version_id < 2 && !s->reg16) {
+        memcpy(s->p0, s->regs, sizeof(s->p0));
+    }
     if (version_id < 3) {
         memcpy(s->applied, s->regs, sizeof(s->applied));
+    }
+    if (version_id < 6) {
+        s->vts_q[0][0] = s->vts_q[1][0] = s->applied[0x0D41];
+        s->vts_q[0][1] = s->vts_q[1][1] = s->applied[0x0D42];
     }
     return 0;
 }
 
 static const VMStateDescription vmstate_gc_sensor = {
     .name = TYPE_GALAXYCORE_SENSOR,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .post_load = gc_post_load,
     .fields = (const VMStateField[]) {
@@ -363,6 +487,7 @@ static const VMStateDescription vmstate_gc_sensor = {
         VMSTATE_UINT32_V(sync.late_latch, GcSensorState, 4),
         VMSTATE_UINT8_ARRAY_V(p1, GcSensorState, 0x100, 5),
         VMSTATE_UINT8_ARRAY_V(p3, GcSensorState, 0x100, 5),
+        VMSTATE_UINT8_2DARRAY_V(vts_q, GcSensorState, 2, 2, 6),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -371,7 +496,18 @@ static const Property gc_properties[] = {
     DEFINE_PROP_BOOL("reg16", GcSensorState, reg16, false),
     DEFINE_PROP_UINT16("id-reg", GcSensorState, id_reg, 0xF0),
     DEFINE_PROP_UINT16("id", GcSensorState, id, 0x2053),
+    DEFINE_PROP_UINT32("pclk", GcSensorState, pclk, 0),
+    DEFINE_PROP_UINT16("hts", GcSensorState, hts, 0),
     DEFINE_PROP_BOOL("trace", GcSensorState, trace, false),
+    /*
+     * GC2083 only, opt in: its frame length takes effect 1 or 2 frames
+     * after the exposure and gain written with it.  Not what the chip is
+     * known to do -- the datasheet gives no latch timing, and the public
+     * drivers disagree (SigmaStar: shutter and gain 2; the xmedia
+     * gk7206v100 driver: exposure and gain 2, VMAX 3) -- but a what-if
+     * for an AE loop's write order: does its exposure stay in the frame?
+     */
+    DEFINE_PROP_UINT32("vts-delay", GcSensorState, vts_delay, 0),
 };
 
 static void gc_class_init(ObjectClass *klass, const void *data)

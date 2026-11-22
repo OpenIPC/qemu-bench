@@ -70,7 +70,7 @@ appended DTB.
 | Address | Block | Model |
 |---|---|---|
 | `0x00000000` | mask ROM, 32 KiB | synthetic ROM (below) |
-| `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse | `ak-sysctrl` |
+| `0x08000000` | system control: chip ID, PLLs, clock gates, resets, the interrupt controller, timers, watchdog, RTC link, EV330 eFuse, SAR-ADC1 samples (`ain0` / `ain1` / `bat` in millivolts at the pin, default 3000 on AIN0/AIN1, settable with `qom-set` while the guest runs; see below) | `ak-sysctrl` |
 | `0x20000000` | ISP / VI (interrupt 1) | EV200 and AK3918EV300 `ak-isp`, others storage |
 | `0x20020000` | video encoder: EV200 a Hantro 8290 (H.264, JPEG; interrupt 2), EV300 an Allegro core (registers from `+0x8000`; interrupt 2) | EV200 `ak-h8290`, EV300 `ingenic-avpu` (`anyka`), others storage |
 | `0x20100000` / `0x20108000` | MCI0 / MCI1; `-drive if=sd` is the TF slot: MCI0, but MCI1 on the EV300L and AV100 (their DTs put the card on mmc1, pads 31-36, power GPIO 50) | `ak-mci` |
@@ -110,15 +110,21 @@ The first 512 bytes of the NOR (U-Boot port `mkaksh.py`, and every dump):
 | `+0x2C` | register script: `{address, value}` pairs; address `0x66668888` = delay, `0x66668881` = three-word poll, `0x66668880` = three-word read-modify-write `{marker, register, mask}` (the AV130 dump clears bit 2 of DDRC `+0x24` with it), `0x66668882` = a ROM operation of one value; all skipped; `0x88888888` = end |
 | `+0x18C` | `SPIP` + the SPI NOR descriptor (JEDEC ID, size, page, erase size, partition-table block) |
 
-The AV100's `ANYKA322` payload does not follow the header at `+0x200` but at
-`+0x600`: `vectors.S` under `CONFIG_3918AV100_CODE` reserves `0x400` more
-bytes (secure boot keeps the public key at `+0x200` and the signature at
-`+0x300`; `tools/secureboot/ak_secureboot`), and the vendor U-Boot is linked
-at the load address `- 0x600` (`CONFIG_SYS_TEXT_BASE 0x80DFFA00`). The model
-copies an `ANYKA322` payload from flash `0x600`; the others still from
-`0x200`. (Signed images also write `0x84000000` at `+0x1C`; unsigned ones
-keep `6`.) `0x600` is inferred from the SDK -- no AV100 flash dump has been
-seen -- and matches what the OpenIPC U-Boot `ak3918av100` port emits.
+The AV100's ROM copies from `+0x200`, as the others' do. `vectors.S` under
+`CONFIG_3918AV100_CODE` reserves `0x400` bytes of secure-boot space behind
+the header (public key at `+0x200`, signature at `+0x300`;
+`tools/secureboot/ak_secureboot`), and the vendor's header covers it: load
+address `0x80DFFC00`, length from `+0x200`, so U-Boot at flash `0x600` lands
+at `0x80E00000` and the ROM enters through the zeroes (`andeq`); the vendor
+U-Boot is linked at `0x80DFFA00`, the header's address. That is the one AV100
+flash dump seen, owner report r-s9hgnp86 (AK3918AV100N, U-Boot
+2019.10.0-V4.0.21), the same as the AV130's below. The model used to copy an
+`ANYKA322` payload from `0x600`, inferred from the SDK before any dump: it left
+that dump's U-Boot `0x400` below where it runs (no output at all), and booted
+an OpenIPC header made to the same inference, load `0x80E00000` with the
+length from `0x600`, which on the chip puts U-Boot `0x400` too high and its
+last `0x400` bytes uncopied. (Signed images also write `0x84000000` at
+`+0x1C`; unsigned ones keep `6`.)
 
 The ROM replays the script (PLLs, DDR controller), copies the payload to the
 load address and enters it. The EV300L header has the EV300's fields (its
@@ -160,6 +166,29 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   L2 buffer 0 9, GPIO 12, MAC 13. The interrupt controller, timers (EV330
   layout, 12 MHz), watchdog (`+0xE4` / `+0xE8`), UART and L2 buffer
   numbering are the old ones.
+- **Watchdog** (`ak-sysctrl` `+0xE4` / `+0xE8`, 21.333 us a count, at most
+  357 s). `ak_top_wdt.c` writes the load to CFG1 (`0x55` key), then CFG2
+  enable, then enable + feed (`0xAA` key); magic close writes CFG2 `0xAA`
+  with enable clear, which stops it. It is also how the board reboots: the
+  kernel's restart hook feeds it a two-count load. That case (under 1 ms)
+  resets quietly. A longer load that runs out is an expiry and says so on
+  stderr, e.g. `ak-sysctrl: watchdog expired: last fed 300.000 s ago with
+  a 300.000 s timeout`, and goes through QEMU's watchdog action, so
+  `-action watchdog=pause` stops the machine where it was instead of
+  rebooting it.
+- **SAR-ADC1** differs between the chips. The EV330 (and the model's
+  default) leaves three packed 10-bit samples of the 3.3 V AVCC in `+0x68`
+  all the time. The EV300 parts (`sar-ev300`, OpenIPC/builder#234) convert
+  one input at a time: `+0x5C` bit 0 starts a conversion of the input
+  selected in bits 7:5 (bit 5 AIN0), `+0x6C` bit 0 says it is ready
+  (written 0 to clear), and `+0x68` bits 11:0 hold 12 bits against 3.0 V.
+  The input is read only when the converter is clocked (`+0x0C` bit 3), out
+  of reset (`+0x20` bit 30), powered (`+0xA0` bit 0 clear), and the input
+  is enabled (`+0xA0` bit 5, AIN0 only); otherwise the sample is 0. That is
+  the 0 mV a kernel with the EV330 reader gets on an EV300, so the twin
+  shows it too. A lit PE3020-W photocell (3000 mV) saturates at 4095,
+  2999 mV, as the camera does; `qom-set ... ain0 39` is the same photocell
+  covered.
 - **UART** (`ak-uart`) has no data register. TX bytes go into L2 memory at
   `0x48001000 + 0x100 n`, CONF2 starts the send; received bytes land in a
   128-byte ring at `+0x80`, and DATA_CONF bits 19:13 say where the next one
@@ -420,6 +449,7 @@ Vendor firmware, each booted with `flash-file=` on a copy:
 | `V380E2_…` (AK3918EV200 + U-Boot) | `ak3918ev200` | login, vendor app with audio decode |
 | `fullflash_…_MX25L6405D_…_AK3918EV200` (spiboot) | `ak3918ev200` | login, vendor app |
 | `win25q64jvs10_…` (EV200, spiboot) | `ak3918ev200` | login; an old audio library reports `CHIP(106552) unsupported` |
+| an AK3918EV201 camera with AliOS Things (4 MiB BY25Q32ES; header `AKSH_240`, U-Boot 2019.10.0-V4.0.25 `S200W_EVB_CBD_AK3918EV201`, DTB `anyka,ak39ev200`) | `ak3918ev200`, `sensor=sc1346` | AOS-R-3.4.3 mounts its romfs and littlefs partitions and starts the vendor app: the `sc1346` driver takes the sensor, the ISP opens at 1280x720, eth0 links. Its clock code sets the CSI SCLK divider in SYSCTRL `+0x18` (bits 15:10, enable 18) and waits for bit 19, the divider's "valid", to clear, as the model now does. No model for its ATBM603x SDIO Wi-Fi (the app retries it), the audio DAC or the RTC |
 | `full.bin` (AK3919EV330, U-Boot AK_V3.1.00, 4.4.192) | `ak3919ev330` | login, `anyka_ipc`; its nginx answers HTTP over the emulated Ethernet (static 192.168.1.88) |
 | `AK3918_V300s_dumps.zip`, `AK3918_V330L_dumps.zip` (AK3918EV330, U-Boot V3.1.28, 4.4.192; partitions only) | `ak3918ev330` | assembled at the `mtdparts` offsets: login; ENV, CONFIG and APP are not in the zips, so `/usr` (and `ak_eth.ko`) is missing. Flash BY25Q64A (`0x684017`) |
 | gzhongshi HVT3610S3 QQ-WiFi v2.0 (AK3918EV300L, U-Boot 2019.10.0-V4.0.25, 4.4.282, XM25QH64C; ipctool backup, rebuilt into a raw image) | `ak3918ev300l` | `GZhongshi login:`, vendor app (no sensor answers on I2C); vendor U-Boot `sf probe/read/erase/write` and `reset` (watchdog) work; matches the board's own boot log up to the PHY (absent on the board) |

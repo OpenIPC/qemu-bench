@@ -623,6 +623,55 @@ online, or with `--offline` in `VI_OFFLINE_VPSS_ONLINE`:
 Two strips are modelled from the source and checked by
 `test-hisi-isp.py --gen 5`; no shipped sensor makes the driver use them.
 
+## CV200 (Hi3516CV200 / Hi3518EV200)
+
+Offline (`vi_vpss_online=0`, OpenIPC's `load_hisilicon`), `hisi-viu`
+writes each frame to DDR, `hisi-vpss-v2` scales it, and `hisi-vedu` gen 2
+encodes it. The register maps are in the source headers of those files.
+
+Online (`vi_vpss_online=1`, the SDK's default and what vendor firmware
+loads), no frame goes through DDR. The VPSS driver writes the node layout
+straight into MMIO, sets online video (`0x000` bit 31) and asks for the
+registers at the next frame (`0x010` bit 0). At each VIU frame start
+`hisi-vpss-v2` paints the channels it took for the last frame from the
+scene, then raises start (`0x400`) and end (bit 0) together. Two starts
+without an end are a "CC" error and the driver drops the frame.
+
+- **VGS** (`0x20630000`, VIC 29) is the same node engine, a second
+  `hisi-vpss-v2`. The extended channels go through it. Its nodes have
+  VPSS's layout: the source at `0x020` / `0x10c`-`0x114`, and the
+  output in the channel-1 slot (`0x008` bit 3, `0x064`, `0x150`-`0x158`).
+  Without it, a frame sent to an extended channel never comes back to its
+  pool, and the vendor app stops encoding when the pool runs out.
+
+- **VEDU gen 2** takes a register image from DDR (MMIO `0x1e0`). Its
+  stream ring and packet headers are V4's, so the model moves the image's
+  fields into the V4 layout and encodes the same way. JPGE (`0x20660000`)
+  is not modelled.
+- **ISP statistics** are read through indexed ports (AE histogram, AE
+  zones, AWB zones), not by DMA. The scales were taken from a running
+  camera: AE 8-bit, AWB 12-bit before the white balance gains.
+
+```bash
+qemu-system-arm -M hi3518ev200,flash-file=dump.bin -icount shift=0,sleep=off \
+    -nographic -serial mon:stdio -nic user,restrict=on \
+    -global hisi-vedu.dump-dir=venc
+```
+
+Offline, the VIU driver's frame-end handler arms the next buffer and
+hands the finished one to VPSS (`ViuDrvChnProcess`). It has to run
+before the next frame starts, which on the camera is about 1.3 ms of
+vertical blanking. Without icount, the guest takes interrupts tens of
+milliseconds late while majestic starts up. The next frame then paints
+over the buffer just handed on, and the stream carries a repeated and an
+out-of-order frame (#360). `sleep=off` is needed as well: with plain
+`-icount shift=0` the boot stops at U-Boot's `USB:` step.
+
+To run OpenIPC online, set `b_arg_online=1` in `/usr/bin/load_hisilicon`
+and reboot. A Switcam HS-303 vendor dump (Rotek, MPP 1.0.4.0) streams
+1280x720 H.264 online, and VGS scales it into its extended channels
+(5: 320x240, 11: 640x360, for QR scanning).
+
 ## Not yet
 
 - **AF, the local-average (LA) and dehaze statistics** are not produced.

@@ -1575,16 +1575,12 @@ static void deblock(Frame *f, const DbMb *mbs, int cqp, int off_a, int off_b,
             /* luma */
             for (dir = 0; dir < 2; dir++) {
                 for (e = 0; e < 4; e++) {
-                    /*
-                     * At the picture's edge there's no neighbour (bs 0,
-                     * nothing filtered): q itself, not the row above or the
-                     * column left of the array -- outside it, and on an
-                     * encoder's thread-pool worker, whose arena begins
-                     * with mbs, unmapped (QEMU crashed).
-                     */
-                    const bool edge = !e && (dir == 0 ? mx == 0 : my == 0);
-                    const DbMb *pm = e || edge ? q :
-                                     dir == 0 ? q - 1 : q - f->mbw;
+                    /* the picture's edge has no neighbour to read: its
+                     * bS is 0 */
+                    if (!e && (dir == 0 ? mx == 0 : my == 0)) {
+                        continue;
+                    }
+                    const DbMb *pm = e ? q : dir == 0 ? q - 1 : q - f->mbw;
                     const int qpav = (pm->qp + q->qp + 1) >> 1;
                     const int ia = clampi(qpav + off_a, 0, 51);
                     const int ib = clampi(qpav + off_b, 0, 51);
@@ -1612,11 +1608,10 @@ static void deblock(Frame *f, const DbMb *mbs, int cqp, int off_a, int off_b,
 
                 for (dir = 0; dir < 2; dir++) {
                     for (e = 0; e < 4; e += 2) {
-                        /* at the picture's edge: q, as for luma */
-                        const bool edge = !e &&
-                                          (dir == 0 ? mx == 0 : my == 0);
-                        const DbMb *pm = e || edge ? q :
-                                         dir == 0 ? q - 1 : q - f->mbw;
+                        if (!e && (dir == 0 ? mx == 0 : my == 0)) {
+                            continue;
+                        }
+                        const DbMb *pm = e ? q : dir == 0 ? q - 1 : q - f->mbw;
                         const int qpav = (chroma_qp(pm->qp, cqp) +
                                           chroma_qp(q->qp, cqp) + 1) >> 1;
                         const int ia = clampi(qpav + off_a, 0, 51);

@@ -89,6 +89,7 @@ python3 qemu/tests/test-hisi-vpss.py       # V4 VI offline + VPSS node list (wid
 python3 qemu/tests/test-hisi-isp.py        # V4 ISP statistics (FE / BE STT, AE / AWB)
 python3 qemu/tests/test-hisi-sensor.py     # sensor timing: frame latching, group hold, fps, violations
 python3 qemu/tests/test-hisi-aiao.py       # V4 audio DMA: capture / playback rings, rates
+python3 qemu/tests/test-hisi-pwm.py        # PWM on every family: clock gate, rate, latch, V5 layout
 python3 qemu/tests/test-novatek.py         # one per non-HiSilicon family: test-xm-*.py,
                                            # test-gk710x*.py, test-anyka.py (+ test-ak-h8290.py, EV200's
                                            # 8290 encoder; test-ak-isp.py, the ISP2 and the EV300's
@@ -148,9 +149,38 @@ bash qemu-boot/test-linux-network.sh --soc <soc> --machine <machine> --append '<
     --qemu ./qemu-src/build/qemu-system-arm --setup-network
 bash qemu-boot/sofia-isp-ci-test.sh      # hi3516ev200 + sc2315e ISP regression
 python3 qemu-boot/test-fastboot-protocol.py /tmp/hisi-fb   # boot-ROM serial protocol
+bash qemu-boot/test-hisi-majestic-pwm.sh --soc hi3516cv610 --majestic BIN  # majestic's dimmable lamp (V4, V5)
 VARIANT=neo bash qemu-boot/fetch-openipc-lite.sh hi3516cv200 qemu-boot
 bash qemu-boot/test-vtund-tunnel.sh --soc hi3516cv200   # vtund between two guests
 ```
+
+Two-guest NVR + camera lab (ONVIF / NVR-integration troubleshooting, e.g.
+OpenIPC/majestic#379 where an NVR ignores a camera's motion Notify):
+
+```bash
+# boots an NVR dump and an OpenIPC camera on a namespace-private DHCP LAN
+# (192.168.50.0/24), then drops into a shell inside it; exit tears it all down
+bash qemu-boot/nvr-camera-lab.sh \
+    --nvr-flash ~/dumps/nvr.bin --nvr-machine hi3536cv100 \
+    --cam-flash ~/images/openipc-hi3516ev200-nor-lite-8mb.bin \
+    --cam-machine hi3516ev200,sensor=sc2315e
+# from the lab shell: capture exactly what the camera pushes (no deps)
+python3 qemu-boot/onvif-notify-probe.py --host <cam-ip> \
+    --user admin --password <pw> --seconds 20 --out /tmp/notify
+```
+
+`--cam-flash` wants a *full* OpenIPC image (openipc.org `download_full_image`),
+not the split `-kernel`/`-initrd` bundle: majestic needs a writable overlay to
+hold the EULA acceptance, the root password and `onvif.password` (set the last,
+or ONVIF auth is refused). The camera's scene — hence motion — is driven over
+QMP (`qom-set /machine/scene light N`). `onvif-notify-probe.py` is a
+stdlib-only WS-BaseNotification consumer: it subscribes with HTTP Digest and
+dumps every `wsnt:Notify`, so a reporter's capture can be reproduced and a fix
+A/B-tested. An `hi3536cv100` Xiongmai NVR dump needs `hisi-gmac` `phy-addr` = 2
+(its device trees strap the PHY at `mdio@100a03c0/ethernet-phy@2`), where the
+OpenIPC default is 1; `nvr-camera-lab.sh` passes `-global hisi-gmac.phy-addr=2`
+for an `hi3536cv100` NVR, and the `phy-addr` property can set it for any other
+firmware whose DT straps the PHY elsewhere.
 
 `test-vtund-tunnel.sh` boots the image twice on a QEMU socket network and
 runs each guest's script as PID 1 from the kernel command line

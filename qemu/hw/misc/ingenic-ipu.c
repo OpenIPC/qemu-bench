@@ -29,7 +29,8 @@
  *       C4 = Bv (x 1024, U = -Ru R - Gu G + Bu B, V = Rv R - Gv G - Bv B),
  *       OFSET_PARA = Y offset | UV offset << 16.
  *   CSC (cmd IPU_CMD_CSC): the NV12 background converted to NV21
- *     (D_FMT [2:0] = 3) or to 32-bit RGB (D_FMT 0x40, BGRA bytes) at
+ *     (D_FMT [2:0] = 3) or to 32-bit RGB (D_FMT 0x00 ARGB, 0x28 ABGR, 0x40
+ *     RGBA, 0x68 BGRA; global alpha when CH_BK_GLOBAL_ALPHA is set) at
  *     OUT_ADDR, or to HSV (D_FMT 0x4: three planes, ipu_csc_hsv()).
  *
  * TRIGGER (0x74) bit 3 resets the unit: every register to 0 (the driver
@@ -48,6 +49,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "ingenic-color.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -459,11 +461,8 @@ static void ipu_csc_hsv(IngenicIpuState *s, int w, int h, uint8_t *yl,
         ipu_read(ya + (hwaddr)y * ys, yl, w);
         ipu_read(uva + (hwaddr)(y / 2) * uvs, uvl, (w + 1) & ~1);
         for (x = 0; x < w; x++) {
-            int c = (yl[x] - 16) * 1192;
-            int d = uvl[x & ~1] - 128, e = uvl[(x & ~1) + 1] - 128;
-            int r = clamp255((c + 1634 * e) >> 10);
-            int g = clamp255((c - 401 * d - 833 * e) >> 10);
-            int b = clamp255((c + 2066 * d) >> 10);
+            IngenicRGB rgb = ingenic_yuv_to_rgb(yl[x], uvl[x & ~1], uvl[x | 1]);
+            int r = rgb.r, g = rgb.g, b = rgb.b;
             int mx = MAX(r, MAX(g, b)), mn = MIN(r, MIN(g, b));
             int dl = mx - mn, hue = 0;
 
@@ -531,19 +530,48 @@ static void ipu_csc(IngenicIpuState *s, int w, int h)
         return;
     }
     oys = oys ? oys : w * 4;
-    for (y = 0; y < h; y++) {
-        ipu_read(ya + (hwaddr)y * ys, yl, w);
-        ipu_read(uva + (hwaddr)(y / 2) * uvs, uvl, (w + 1) & ~1);
-        for (x = 0; x < w; x++) {
-            int c = (yl[x] - 16) * 1192;
-            int d = uvl[x & ~1] - 128, e = uvl[(x & ~1) + 1] - 128;
+    {
+        uint32_t bk = R(s, R_OSD_BK_PARA);
+        uint8_t alpha = (bk & (1u << 1)) ? ((bk >> 3) & 0xff) : 0xff;
+        struct ByteOrder { int a, r, g, b; } order;
 
-            out[4 * x + 0] = clamp255((c + 2066 * d) >> 10);
-            out[4 * x + 1] = clamp255((c - 401 * d - 833 * e) >> 10);
-            out[4 * x + 2] = clamp255((c + 1634 * e) >> 10);
-            out[4 * x + 3] = 0xff;
+        /*
+         * The v13 CSC driver programs these output codes; bit 4 selects
+         * the input block layout independently.
+         */
+        switch (dfmt & 0x6f) {
+        case 0x00: /* ARGB */
+            order = (struct ByteOrder) { 0, 1, 2, 3 };
+            break;
+        case 0x28: /* ABGR */
+            order = (struct ByteOrder) { 0, 3, 2, 1 };
+            break;
+        case 0x40: /* RGBA */
+            order = (struct ByteOrder) { 3, 0, 1, 2 };
+            break;
+        case 0x68: /* BGRA */
+            order = (struct ByteOrder) { 3, 2, 1, 0 };
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "ingenic-ipu: unsupported CSC D_FMT %#x\n",
+                          dfmt);
+            return;
         }
-        ipu_write(oya + (hwaddr)y * oys, out, w * 4);
+
+        for (y = 0; y < h; y++) {
+            ipu_read(ya + (hwaddr)y * ys, yl, w);
+            ipu_read(uva + (hwaddr)(y / 2) * uvs, uvl, (w + 1) & ~1);
+            for (x = 0; x < w; x++) {
+                IngenicRGB rgb = ingenic_yuv_to_rgb(yl[x], uvl[x & ~1],
+                                                     uvl[x | 1]);
+
+                out[4 * x + order.a] = alpha;
+                out[4 * x + order.r] = rgb.r;
+                out[4 * x + order.g] = rgb.g;
+                out[4 * x + order.b] = rgb.b;
+            }
+            ipu_write(oya + (hwaddr)y * oys, out, w * 4);
+        }
     }
 }
 

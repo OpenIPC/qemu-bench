@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 CPM = 0x10000000
 INTC = 0x10001000
@@ -127,6 +128,12 @@ class QTest:
 
     def readl(self, a):
         return int(self.cmd('readl 0x%x' % a).split()[1], 16)
+
+    def writew(self, a, v):
+        self.cmd('writew 0x%x 0x%x' % (a, v))
+
+    def readw(self, a):
+        return int(self.cmd('readw 0x%x' % a).split()[1], 16)
 
     def write(self, a, data):
         self.cmd('write 0x%x 0x%x 0x%s' % (a, len(data), data.hex()))
@@ -239,6 +246,11 @@ def test_cpm(qt, soc):
     if soc == 't31':
         qt.writel(CPM + 0x74, (1 << 28) | (1 << 27) | 13)
         check('SSICDR: BUSY is bit 27', qt.readl(CPM + 0x74) & (1 << 27), 0)
+    if soc == 't23':
+        check('T23 reset dividers (VPU/SFC/CIM/ISP)',
+              (qt.readl(CPM + 0x30), qt.readl(CPM + 0x74),
+               qt.readl(CPM + 0x7C), qt.readl(CPM + 0x80)),
+              (0x40000002, 0x4000000B, 0x40000031, 0x40000004))
     qt.writel(CPM + 0x70, (0x1F << 20) | 3)
     check('I2S M/N divider kept whole', qt.readl(CPM + 0x70), (0x1F << 20) | 3)
     qt.writel(CPM + 0x38, 0x5A5A)
@@ -1686,6 +1698,46 @@ def test_otg_host(qt):
     qt.step(200 * 1000 * 1000)
     check('reported once: no second change', qt.readl(OTG + 0x14) & (1 << 28),
           0)
+
+
+def test_otg_port_power(qt):
+    port, hfnum, gintsts = OTG + 0x440, OTG + 0x408, OTG + 0x14
+    power, sof = 1 << 12, 1 << 3
+    connected = qt.readl(port) & 0x60001  # speed and connection status
+    check('USB keyboard connected', connected & 1, 1)
+    qt.writel(OTG + 0x18, 1 << 24)  # GINTMSK.PrtIntMsk
+    qt.writel(OTG + 0x418, 1)       # HAINTMSK channel 0
+    qt.writel(OTG + 0x10, 1)
+    check('soft reset masks interrupts and latches the powered connection',
+          (qt.readl(OTG + 0x18), qt.readl(OTG + 0x418), qt.readl(port) & 3),
+          (0, 0, 3))
+    qt.step(3_000_000)
+    qt.writel(port, 0)
+    qt.writel(OTG + 0x10, 1)  # core soft reset with port power off
+    qt.writel(gintsts, sof)
+    frame = qt.readl(hfnum) & 0xffff
+    qt.step(3_000_000)
+    check('port power off stops frames and SOF',
+          (qt.readl(port) & 0x60005, qt.readl(hfnum) & 0xffff,
+           qt.readl(gintsts) & sof), (0, frame, 0))
+    qt.writel(port, power)
+    qt.step(3_000_000)
+    check('power on restores connection, speed and SOF',
+          (qt.readl(port) & 0x60001, (qt.readl(hfnum) & 0xffff) != frame,
+           qt.readl(gintsts) & sof), (connected, True, sof))
+    qt.writel(port, power | 2)  # acknowledge the power-on connection
+    qt.writel(gintsts, sof)
+    qt.step(500_000)
+    qt.writel(port, power)
+    qt.step(500_000)
+    check('writing power again preserves the next full-speed SOF',
+          qt.readl(gintsts) & sof, sof)
+    check('power is already on: no new connection or port interrupt',
+          (qt.readl(port) & 2, qt.readl(gintsts) & (1 << 24)), (0, 0))
+    qt.writel(port, power | (1 << 8))
+    qt.writel(port, power)
+    check('reset enables the port at the negotiated speed without reconnect',
+          qt.readl(port) & 0x6000f, connected | 0x0c)
 
 
 def _migrate_qtest(qemu, machine, qt, out):
@@ -3377,6 +3429,8 @@ def test_isp_stats_t21(qt):
 
     qt.writel(ISP + 0x408, 0x400 << 16)
     m1 = navy()
+    qt.writel(ISP + 0x408, 0x800)
+    check('an unused green gain lane defaults to unity', navy(), m1)
     qt.writel(ISP + 0x408, 0x800 << 16)
     m2 = navy()
     check('digital gain 2.0 at 0x408: the navy zone x2',
@@ -3508,6 +3562,515 @@ def test_isp_t23_dual(qt):
           [0, 1, 0, 1])
 
 
+def test_t23_soc_gaps(qt, img):
+    """T23 gaps fixed for Linux 4.19 CIP: ZB25VQ64 NOR, SmartSens/GalaxyCore
+    sensors with 16-bit I2C access, 0x90000 ISP LUT, empty_uv, VIC_PORT_SEL,
+    0xD050 UV order & flips, and raw VIC_MDMA."""
+    print('T23 NOR, 16-bit I2C sensors, and ISP/VIC gaps')
+    # ZB25VQ64 JEDEC ID
+    sfc_v1(qt, 0x9F, length=3)
+    check('ZB25VQ64 READ ID', qt.readl(SFC + 0x1000) & 0xFFFFFF, 0x17405E)
+    sfc_v1(qt, 0x03, addr=0x0, alen=3, length=16, dma=SCRATCH)
+    check('ZB25VQ64 read data', qt.read(SCRATCH, 16), bytes(img[:16]))
+    sfc_v1(qt, 0x0B, addr=0x100, alen=3, dummy=8, length=16, dma=SCRATCH + 0x20)
+    check('ZB25VQ64 FAST_READ (8 dummy clocks)',
+          qt.read(SCRATCH + 0x20, 16), bytes(img[0x100:0x110]))
+
+    # 16-bit writew/readw on ingenic-i2c DATA_CMD + sc1a4t/sc1a4ts1 + 0x0100
+    def i2c16_xfer(addr, reg16, read_n=0, wr_val=None):
+        qt.writel(I2C0 + 0x6C, 0)
+        qt.writel(I2C0 + 0x04, addr)
+        qt.writel(I2C0 + 0x6C, 1)
+        qt.writew(I2C0 + 0x10, reg16 >> 8)
+        qt.writew(I2C0 + 0x10, reg16 & 0xFF)
+        if wr_val is not None:
+            qt.writew(I2C0 + 0x10, wr_val | (1 << 9))
+            return []
+        for i in range(read_n):
+            qt.writew(I2C0 + 0x10, (1 << 8) | (1 << 10 if i == 0 else 0) |
+                      (1 << 9 if i == read_n - 1 else 0))
+        return [qt.readw(I2C0 + 0x10) & 0xFF for _ in range(read_n)]
+
+    check('sc1a4t (0x30) ID via 16-bit I2C', i2c16_xfer(0x30, 0x3107, 2),
+          [0xDA, 0x4D])
+    check('sc1a4ts1 (0x32) ID via 16-bit I2C', i2c16_xfer(0x32, 0x3107, 2),
+          [0xDA, 0x4D])
+    i2c16_xfer(0x30, 0x0100, wr_val=1)
+    check('sc1a4t 0x0100 reads back streaming=1', i2c16_xfer(0x30, 0x0100, 1),
+          [1])
+    i2c16_xfer(0x30, 0x0100, wr_val=0)
+    check('sc1a4t 0x0100 reads back streaming=0', i2c16_xfer(0x30, 0x0100, 1),
+          [0])
+
+    # GalaxyCore page-0 readback (gc2053 at 0x37 on I2C0? test in separate call,
+    # or check LUT / ISP / VIC here)
+    qt.writel(ISP + 0x80000, 0x12345678)
+    check('T23 ISP 0x90000 window at 0x80000', qt.readl(ISP + 0x80000),
+          0x12345678)
+
+    ch0 = ISP + 0xD100
+    w, h = 216, 108
+    buf = 0x00400000
+    qt.writel(ch0 + 0x0C, w << 16 | h)
+    qt.writel(ch0 + 0x40, w)
+    qt.writel(ch0 + 0x60, w)
+    check('empty_uv before frame', (qt.readl(ch0 + 0x3C), qt.readl(ch0 + 0x5C)),
+          (1, 1))
+    # Lock dual_src to sensor 1 via VIC_PORT_SEL even with 0xC0 bit 15 armed
+    qt.writel(VIC + 0x204, 0xFFFFFFFF)
+    check('VIC_PORT_STATUS tracks VIC_PORT_SEL', qt.readl(VIC + 0x20C) & 1, 1)
+    qt.writel(ISP + 0xC0, 0x8000)
+    qt.writel(ISP + 0xB0, 0xFFFFFFFF)
+    qt.writel(ISP + 0xD040, 1)
+    qt.writel(VIC + 0x00, 1)
+    got = []
+    for _ in range(2):
+        qt.writel(ch0 + 0x30, buf)
+        qt.writel(ch0 + 0x50, buf + w * h)
+        qt.step(41 * 1000 * 1000)
+        got.append(1 if qt.read(buf + 9 * w + 7, 1)[0] > 150 else 0)
+        check('empty/empty_uv before pop',
+              (qt.readl(ch0 + 0x3C), qt.readl(ch0 + 0x5C)), (0, 0))
+        qt.readl(ch0 + 0x38)
+        check('empty/empty_uv after pop',
+              (qt.readl(ch0 + 0x3C), qt.readl(ch0 + 0x5C)), (1, 1))
+        qt.writel(ISP + 0xC4, qt.readl(ISP + 0xC8))
+        qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    check('VIC_PORT_SEL keeps sensor 1 selected', got, [1, 1])
+
+    # 0xD050 NV21 + HFLIP + VFLIP
+    qt.writel(ISP + 0xD050, 0x7)
+    qt.writel(ch0 + 0x30, buf)
+    qt.writel(ch0 + 0x50, buf + w * h)
+    qt.step(41 * 1000 * 1000)
+    ref_y = qt.read(buf, w * h)
+    ref_uv = qt.read(buf + w * h, w * h // 2)
+    qt.readl(ch0 + 0x38)
+    qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    qt.writel(ISP + 0xC4, qt.readl(ISP + 0xC8))
+
+    qt.writel(ISP + 0xD050, 0x7 | (1 << 12) | (1 << 16) | (1 << 19))
+    qt.writel(ch0 + 0x30, buf)
+    qt.writel(ch0 + 0x50, buf + w * h)
+    qt.step(41 * 1000 * 1000)
+    flip_y = qt.read(buf, w * h)
+    flip_uv = qt.read(buf + w * h, w * h // 2)
+    qt.readl(ch0 + 0x38)
+    # The wedge row (near the bottom, asymmetric left patches) is independent
+    # of the frame counter; a mid-picture navy row has Cb != Cr for NV21 check
+    r = h * 1000 // 1080
+    check('0xD050 HFLIP+VFLIP mirrors Y wedge row',
+          flip_y[(h - 1 - r) * w:(h - r) * w],
+          ref_y[r * w:(r + 1) * w][::-1])
+    cr = 10
+    rc = ref_uv[cr * w:(cr + 1) * w]
+    fc = flip_uv[(h // 2 - 1 - cr) * w:(h // 2 - cr) * w]
+    check('0xD050 NV21 swaps UV + HFLIP+VFLIP',
+          (fc[0], fc[1], rc[0] != rc[1]), (rc[-1], rc[-2], True))
+
+    # WB chroma response (0x1804 / 0x1808), VTS frame timing, and expo-delay
+    qt.writel(ISP + 0xD050, 0x7)
+    qt.writel(VIC + 0x300, 0)
+    qt.writel(ISP + 0xB0, 0xFFFFFFFF)
+    qt.writel(ISP + 0xD040, 1)
+    qt.writel(VIC + 0x00, 1)
+    # Neutral wedge patch row in UV (patch 2 around x=30, y_luma=r -> y_uv=r//2)
+    wx = (w * (32 + 2 * 112 + 48) // 1920) & ~1
+    wy = (r & ~1) // 2
+
+    def grab_wb(wb_r, wb_b, lr=550, lb=600, step_ns=41 * 1000 * 1000):
+        qt.qom_set('/machine/isp', 'light-r', lr)
+        qt.qom_set('/machine/isp', 'light-b', lb)
+        qt.writel(ISP + 0x1804, (0x400 << 16) | wb_r if wb_r else 0)
+        qt.writel(ISP + 0x1808, (0x400 << 16) | wb_b if wb_b else 0)
+        qt.writel(ch0 + 0x30, buf)
+        qt.writel(ch0 + 0x50, buf + w * h)
+        qt.step(step_ns)
+        if qt.readl(ch0 + 0x3C) & 1:
+            return None
+        qt.readl(ch0 + 0x38)
+        qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+        uv_p = qt.read(buf + w * h + wy * w + wx, 2)
+        cnt_uv = qt.read(buf + w * h + 2 * w + 4, 2)
+        return uv_p[0], uv_p[1], cnt_uv[0], cnt_uv[1]
+
+    cb_lo, cr_lo, _, _ = grab_wb(1024, 1024)
+    cb_mid, cr_mid, cnt_cb, cnt_cr = grab_wb(1862, 1707)
+    cb_hi, cr_hi, _, _ = grab_wb(2800, 2600)
+    check('0x1804/0x1808 WB scales neutral-patch Cr/Cb monotonically',
+          (cr_lo < cr_mid < cr_hi, cb_lo < cb_mid < cb_hi), (True, True))
+    check('converged daylight WB keeps grey wedge neutral & counter chroma 128',
+          (abs(cb_mid - 128) <= 1, abs(cr_mid - 128) <= 1,
+           cnt_cb, cnt_cr), (True, True, 128, 128))
+    # Warm illuminant (900 / 350) compensated by AWB gains (1138 / 2926)
+    cb_warm, cr_warm, _, _ = grab_wb(1138, 2926, lr=900, lb=350)
+    check('warm light + AWB gains returns grey wedge to neutral',
+          (abs(cb_warm - 128) <= 1, abs(cr_warm - 128) <= 1), (True, True))
+    qt.qom_set('/machine/isp', 'light-r', 550)
+    qt.qom_set('/machine/isp', 'light-b', 600)
+    qt.writel(ISP + 0x1804, 0)
+    qt.writel(ISP + 0x1808, 0)
+
+    # Sensor VTS frame timing on sc1a4ts1 (0x32, active via VIC_PORT_SEL=1):
+    # pclk=72 MHz, hts=1600 -> VTS=3600 gives an 80 ms frame period
+    i2c16_xfer(0x32, 0x320E, wr_val=3600 >> 8)
+    i2c16_xfer(0x32, 0x320F, wr_val=3600 & 0xFF)
+    # Flush the timer armed under the previous period
+    grab_wb(0, 0, step_ns=45 * 1000 * 1000)
+    qt.writel(ch0 + 0x30, buf)
+    qt.writel(ch0 + 0x50, buf + w * h)
+    qt.step(50 * 1000 * 1000)
+    check('VTS=3600 (80 ms): not done at 50 ms', qt.readl(ch0 + 0x3C) & 1, 1)
+    qt.step(35 * 1000 * 1000)
+    check('VTS=3600 (80 ms): done by 85 ms', qt.readl(ch0 + 0x3C) & 1, 0)
+    qt.readl(ch0 + 0x38)
+    qt.writel(ISP + 0xB8, qt.readl(ISP + 0xB4))
+    i2c16_xfer(0x32, 0x320E, wr_val=0)
+    i2c16_xfer(0x32, 0x320F, wr_val=0)
+    grab_wb(0, 0, step_ns=85 * 1000 * 1000)
+
+    # Configurable N-frame exposure pipeline delay (expo-delay=2)
+    def sc_expo(lines):
+        i2c16_xfer(0x32, 0x3E00, wr_val=(lines >> 12) & 0xF)
+        i2c16_xfer(0x32, 0x3E01, wr_val=(lines >> 4) & 0xFF)
+        i2c16_xfer(0x32, 0x3E02, wr_val=(lines << 4) & 0xF0)
+
+    qt.qom_set('/machine/isp', 'expo-delay', 2)
+    sc_expo(500)
+    for _ in range(3):
+        grab_wb(0, 0)
+    y_base = qt.read(buf + r * w + wx, 1)[0]
+    sc_expo(2000)
+    ys = []
+    for _ in range(3):
+        grab_wb(0, 0)
+        ys.append(qt.read(buf + r * w + wx, 1)[0])
+    check('expo-delay=2 holds old exposure for 2 frames then applies on 3rd',
+          (ys[0] == y_base, ys[1] == y_base, ys[2] > y_base + 20),
+          (True, True, True))
+    qt.qom_set('/machine/isp', 'expo-delay', 0)
+
+    # Raw VIC_MDMA with ISP_INT_MASK == 0: 10-bit << 6 BGGR with >= 64 black level
+    qt.writel(ISP + 0xB0, 0)
+    qt.writel(ISP + 0xB8, 0xFFFFFFFF)
+    qt.writel(ISP + 0xC4, 0xFFFFFFFF)
+    qt.writel(ch0 + 0x30, buf)
+    qt.writel(ch0 + 0x50, buf + w * h)
+    qt.write(buf, b'queued')
+    qt.writel(VIC + 0x00, 0)
+    qt.writel(VIC + 0x1F0, 0xFFFFFFFF)
+    qt.writel(VIC + 0x1F4, 0xFFFFFFFF)
+    raw = 0x00500000
+    rw, rh = 32, 32
+    qt.writel(VIC + 0x304, (rw << 16) | rh)
+    qt.writel(VIC + 0x310, rw * 2)
+    qt.writel(VIC + 0x318, raw)
+    qt.writel(VIC + 0x300, 0x80010020)
+    qt.writel(VIC + 0x00, 1)
+    qt.step(41 * 1000 * 1000)
+    check('VIC_MDMA runs with ISP_INT_MASK == 0',
+          (qt.readl(VIC + 0x1E4) & 1, qt.readl(VIC + 0x380)), (1, raw))
+    check('raw frame leaves the queued ISP buffer and both status banks alone',
+          (qt.readl(ch0 + 0x3C), qt.read(buf, 6), qt.readl(ISP + 0xB4),
+           qt.readl(ISP + 0xC8)), (1, b'queued', 0, 0))
+    qt.writel(ISP + 0xB0, 0xFFFFFFFF)
+    qt.step(41_000_000)
+    check('enabling the ISP completes the previously queued buffer',
+          (qt.readl(ch0 + 0x3C), qt.readl(ch0 + 0x38)), (0, buf))
+    pixels = struct.unpack('<%dH' % (rw * rh), qt.read(raw, rw * rh * 2))
+    check('T23 VIC_MDMA 10-bit << 6 alignment & black pedestal',
+          (all((p & 0x3F) == 0 for p in pixels),
+           min(p >> 6 for p in pixels) >= 64), (True, True))
+
+
+def test_galaxycore_page0(qt):
+    """GalaxyCore 8-bit page-0 register readback alongside chip ID."""
+    print('galaxycore page-0 readback')
+
+    def i2c8_write(reg, val):
+        qt.writel(I2C0 + 0x6C, 0)
+        qt.writel(I2C0 + 0x04, 0x37)
+        qt.writel(I2C0 + 0x6C, 1)
+        qt.writel(I2C0 + 0x10, reg)
+        qt.writel(I2C0 + 0x10, val | (1 << 9))
+
+    for page in (1, 0x80):
+        i2c8_write(0xFE, page)
+        check('GC2053 page selector %#x reads back' % page,
+              i2c_read_reg(qt, I2C0, 0x37, 0xFE, 1), [page])
+    i2c8_write(0xFE, 0x00)
+    i2c8_write(0x03, 0x12)
+    check('GC2053 page 0 reg 0x03 reads back 0x12',
+          i2c_read_reg(qt, I2C0, 0x37, 0x03, 1), [0x12])
+    check('GC2053 page 0 ID intact', i2c_read_reg(qt, I2C0, 0x37, 0xF0, 2),
+          [0x20, 0x53])
+
+
+def test_t23_uhi_and_ost_irq(qemu, tmp):
+    """Boot a minimal MIPS32 ELF with -dtb and -M t23,auto-mem=off in TCG mode:
+    check L2 CP0_Config2, UHI registers a0=-2 / a1=KSEG0(dtb), /chosen fixups,
+    and OST_SYS TER.CH1 gating on live CPU IP4."""
+    print('T23 L2 Config2, -dtb UHI boot, and OST_SYS TER.CH1 IP4 gate')
+    if not shutil.which('dtc'):
+        print('  SKIP: dtc not installed')
+        return
+
+    dts = ('/dts-v1/;\n'
+           '/ {\n'
+           '    #address-cells = <1>;\n'
+           '    #size-cells = <1>;\n'
+           '    chosen {\n'
+           '        bootargs = "console=ttyS1,115200n8 uhi-test";\n'
+           '    };\n'
+           '};\n')
+    dtb = os.path.join(tmp, 'test-uhi.dtb')
+    subprocess.run(['dtc', '-q', '-I', 'dts', '-O', 'dtb', '-o', dtb],
+                   input=dts.encode(), check=True)
+    rd = os.path.join(tmp, 'test-uhi-rd.bin')
+    with open(rd, 'wb') as f:
+        f.write(b'RDTEST' * 64)
+
+    # Tiny MIPS32 LE bare-metal test program loaded at 0x80100000
+    def LUI(rt, imm): return (0x0F << 26) | (rt << 16) | (imm & 0xFFFF)
+    def ORI(rt, rs, imm): return (0x0D << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF)
+    def ADDIU(rt, rs, imm): return (0x09 << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF)
+    def ANDI(rt, rs, imm): return (0x0C << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF)
+    def LW(rt, off, b): return (0x23 << 26) | (b << 21) | (rt << 16) | (off & 0xFFFF)
+    def LBU(rt, off, b): return (0x24 << 26) | (b << 21) | (rt << 16) | (off & 0xFFFF)
+    def SW(rt, off, b): return (0x2B << 26) | (b << 21) | (rt << 16) | (off & 0xFFFF)
+    def SB(rt, off, b): return (0x28 << 26) | (b << 21) | (rt << 16) | (off & 0xFFFF)
+    def SLL(rd, rt, sa): return (rt << 16) | (rd << 11) | (sa << 6)
+    def OR(rd, rs, rt): return (rs << 21) | (rt << 16) | (rd << 11) | 0x25
+    def SRLV(rd, rt, rs): return (rs << 21) | (rt << 16) | (rd << 11) | 6
+    def ADDU(rd, rs, rt): return (rs << 21) | (rt << 16) | (rd << 11) | 0x21
+    def BNE(rs, rt, o): return (0x05 << 26) | (rs << 21) | (rt << 16) | (o & 0xFFFF)
+    def BEQ(rs, rt, o): return (0x04 << 26) | (rs << 21) | (rt << 16) | (o & 0xFFFF)
+    def SLTIU(rt, rs, i): return (0x0B << 26) | (rs << 21) | (rt << 16) | (i & 0xFFFF)
+    def BAL(o): return (0x01 << 26) | (0x11 << 16) | (o & 0xFFFF)
+    def JR(rs): return (rs << 21) | 0x08
+    def MFC0(rt, rd, s=0): return (0x10 << 26) | (rt << 16) | (rd << 11) | (s & 7)
+    NOP = 0
+
+    zero, v0, v1, a0, a1, a2, t0, t1, t2, t3, t4, t5, s0, s1, s2, ra = \
+        0, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 16, 17, 18, 31
+
+    ins = []
+    # Main runs first, jumps over subroutines or puts subroutines at end
+    # Save a0 -> s0, a1 -> s1; t0 = 0xB0031000 (UART1)
+    ins += [
+        ADDU(s0, a0, zero),
+        ADDU(s1, a1, zero),
+        LUI(t0, 0xB003),
+        ORI(t0, t0, 0x1000),
+    ]
+    # Placeholders patched once subroutine offsets are known:
+    patches = []
+
+    def call_hex(reg_val, label='hex32'):
+        ins.append(ADDU(a2, reg_val, zero))
+        patches.append((len(ins), label))
+        ins.append(0)
+        ins.append(NOP)
+
+    def put_ch(ch):
+        ins.append(ORI(a2, zero, ord(ch)))
+        patches.append((len(ins), 'putc'))
+        ins.append(0)
+        ins.append(NOP)
+
+    # C2, A0, A1
+    ins.append(MFC0(t1, 16, 2))
+    call_hex(t1)
+    put_ch(' ')
+    call_hex(s0)
+    put_ch(' ')
+    call_hex(s1)
+    put_ch(' ')
+
+    # OST_SYS (0xB2000000) TER.CH1 gating on CP0 Cause bit 12 (IP4)
+    ins += [
+        LUI(t2, 0xB200),
+        SW(zero, 0x04, t2),             # TER = 0
+        SW(zero, 0x10, t2),             # TMR = 0
+        ORI(t3, zero, 100),
+        SW(t3, 0x14, t2),               # T1DFR = 100
+        ORI(t3, zero, 1),
+        SW(t3, 0x0C, t2),               # TFR = 1 while TER = 0
+        MFC0(t1, 13, 0),
+        ANDI(t1, t1, 0x1000),
+    ]
+    call_hex(t1)
+    put_ch(' ')
+    ins += [
+        ORI(t3, zero, 1),
+        SW(t3, 0x34, t2),               # TESR = 1
+        NOP, NOP, NOP,
+        MFC0(t1, 13, 0),
+        ANDI(t1, t1, 0x1000),
+    ]
+    call_hex(t1)
+    put_ch(' ')
+    ins += [
+        ORI(t3, zero, 1),
+        SW(t3, 0x38, t2),               # TECR = 1
+        NOP, NOP, NOP,
+        MFC0(t1, 13, 0),
+        ANDI(t1, t1, 0x1000),
+        SW(zero, 0x0C, t2),
+    ]
+    call_hex(t1)
+    put_ch('\n')
+
+    # Decode big-endian FDT totalsize from s1 + 4 and dump s1[0..totalsize-1]
+    ins += [
+        LBU(t2, 4, s1), SLL(t2, t2, 24),
+        LBU(t3, 5, s1), SLL(t3, t3, 16), OR(t2, t2, t3),
+        LBU(t3, 6, s1), SLL(t3, t3, 8), OR(t2, t2, t3),
+        LBU(t3, 7, s1), OR(s2, t2, t3),  # s2 = totalsize
+        ADDU(t4, zero, zero),            # idx = 0
+    ]
+    loop_top = len(ins)
+    ins += [
+        BEQ(t4, s2, 0),                  # patched below to loop_end
+        NOP,
+        ADDU(t3, s1, t4),
+        LBU(a2, 0, t3),
+    ]
+    patches.append((len(ins), 'hex8'))
+    ins += [
+        0,
+        NOP,
+        ADDIU(t4, t4, 1),
+    ]
+    loop_back_at = len(ins)
+    ins += [
+        BEQ(zero, zero, (loop_top - (loop_back_at + 1)) & 0xFFFF),
+        NOP,
+    ]
+    loop_end = len(ins)
+    ins[loop_top] = BEQ(t4, s2, (loop_end - (loop_top + 1)) & 0xFFFF)
+    for ch in '\nDONE\n':
+        put_ch(ch)
+    # UHI exit(0): t9 = 1, a0 = 0, sdbbp 1.
+    ins += [ORI(25, zero, 1), ORI(a0, zero, 0), 0x7000007F]
+
+    # Subroutine: putc(a2)
+    labels = {'putc': len(ins)}
+    ins += [
+        LBU(v0, 0x14, t0),
+        ANDI(v0, v0, 0x20),
+        BEQ(v0, zero, -3),
+        NOP,
+        SB(a2, 0, t0),
+        JR(ra),
+        NOP,
+    ]
+
+    # Subroutine: hex8(a2 low byte) -> prints 2 hex chars, clobbers t3, t5, v0, v1
+    labels['hex8'] = len(ins)
+    ins += [ORI(t5, zero, 4)]
+    h8_loop = len(ins)
+    ins += [
+        SRLV(v0, a2, t5),
+        ANDI(v0, v0, 0xF),
+        SLTIU(v1, v0, 10),
+        BNE(v1, zero, 2),
+        ADDIU(v0, v0, ord('0')),
+        ADDIU(v0, v0, ord('a') - ord('0') - 10),
+        LBU(t3, 0x14, t0),
+        ANDI(t3, t3, 0x20),
+        BEQ(t3, zero, -3),
+        NOP,
+        SB(v0, 0, t0),
+        BNE(t5, zero, (h8_loop - (len(ins) + 12)) & 0xFFFF),
+        ADDIU(t5, t5, -4),
+        JR(ra),
+        NOP,
+    ]
+
+    # Subroutine: hex32(a2) -> prints 8 hex chars
+    labels['hex32'] = len(ins)
+    ins += [ORI(t5, zero, 28)]
+    h32_loop = len(ins)
+    ins += [
+        SRLV(v0, a2, t5),
+        ANDI(v0, v0, 0xF),
+        SLTIU(v1, v0, 10),
+        BNE(v1, zero, 2),
+        ADDIU(v0, v0, ord('0')),
+        ADDIU(v0, v0, ord('a') - ord('0') - 10),
+        LBU(t3, 0x14, t0),
+        ANDI(t3, t3, 0x20),
+        BEQ(t3, zero, -3),
+        NOP,
+        SB(v0, 0, t0),
+        BNE(t5, zero, (h32_loop - (len(ins) + 12)) & 0xFFFF),
+        ADDIU(t5, t5, -4),
+        JR(ra),
+        NOP,
+    ]
+
+    for idx, name in patches:
+        ins[idx] = BAL((labels[name] - (idx + 1)) & 0xFFFF)
+
+    code = b''.join(struct.pack('<I', w) for w in ins)
+    elf_path = os.path.join(tmp, 'test-uhi.elf')
+    ehdr = struct.pack('<16sHHIIIIIHHHHHH',
+                       b'\x7fELF\x01\x01\x01' + b'\x00' * 9,
+                       2, 8, 1, 0x80100000, 52, 0, 0x50001005,
+                       52, 32, 1, 0, 0, 0)
+    phdr = struct.pack('<IIIIIIII', 1, 0x1000, 0x80100000, 0x00100000,
+                       len(code), len(code), 7, 0x1000)
+    with open(elf_path, 'wb') as f:
+        f.write(ehdr + phdr + b'\x00' * (0x1000 - len(ehdr) - len(phdr)) + code)
+
+    def boot(kernel, *extra):
+        result = subprocess.run(
+            [qemu, '-M', 't23,auto-mem=off', '-m', '64M', '-nographic',
+             '-monitor', 'none', '-semihosting', '-kernel', kernel,
+             '-dtb', dtb, *extra], capture_output=True, text=True,
+            check=True, timeout=15)
+        return result.stdout.splitlines()
+
+    lines = boot(elf_path, '-initrd', rd)
+    check('UHI stub reached DONE', lines[-1], 'DONE')
+    if lines[-1] == 'DONE':
+        hdr = [int(x, 16) for x in lines[0].split()]
+        check('T23 L2 CP0_Config2 = 0x80000347', hdr[0], 0x80000347)
+        check('UHI a0 = -2', hdr[1], 0xFFFFFFFE)
+        check('UHI a1 in KSEG0', hdr[2] >> 28, 8)
+        check('OST_SYS TER.CH1 gates live CPU IP4',
+              tuple(hdr[3:6]), (0, 0x1000, 0))
+        fdt = bytes.fromhex(lines[1])
+        check('FDT magic at a1', struct.unpack('>I', fdt[:4])[0], 0xD00DFEED)
+        out_dts = subprocess.run(
+            ['dtc', '-q', '-I', 'dtb', '-O', 'dts'],
+            input=fdt, capture_output=True, check=True).stdout.decode()
+        check('auto-mem=off kept DTB bootargs without mem=',
+              'bootargs = "console=ttyS1,115200n8 uhi-test rd_start=' in out_dts
+              and 'mem=' not in out_dts, True)
+        check('DTB /chosen carries linux,initrd-start/end',
+              'linux,initrd-start = <0x1000000>' in out_dts and
+              'linux,initrd-end = <0x%x>' % (0x1000000 + 6 * 64) in out_dts,
+              True)
+
+    # Clear BSS in the first 64 KiB-aligned block after the uImage payload.
+    for load in (0x80010000, 0x80008000):
+        clear_bss = [LUI(t2, (load >> 16) + 1), LUI(t3, (load >> 16) + 2),
+                     SW(zero, 0, t2), ADDIU(t2, t2, 4), BNE(t2, t3, -3), NOP]
+        payload = struct.pack('<6I', *clear_bss) + code
+        header = bytearray(struct.pack('>7I4B32s', 0x27051956, 0, 0, len(payload),
+                                       load, load, zlib.crc32(payload),
+                                       5, 5, 2, 0, b'UHI test'))
+        struct.pack_into('>I', header, 4, zlib.crc32(header))
+        uimage = os.path.join(tmp, 'test-uhi.uImage')
+        with open(uimage, 'wb') as f:
+            f.write(header + payload)
+        lines = boot(uimage)
+        check('uImage at %#x reads its FDT after clearing BSS' % load,
+              lines[-1] == 'DONE' and lines[1].startswith('d00dfeed'), True)
+
+
 def test_isp_t40_pipe1(qt):
     """T40's second pipe: VIC1, channels 3..5, its interrupts and 3A"""
     print('ingenic-isp (T40 second pipe)')
@@ -3637,6 +4200,30 @@ def test_isp_t40_mdma(qt):
     qt.writel(vic2 + 0x00, 0)
 
 
+def test_isp_neutral_wedge(qt, soc):
+    en, _, _, ch, ch_en, push_y, push_uv, pop_y, _, size, vic, _, _ = ISP_LAYOUTS[soc]
+    wb = 0x604 if soc == 't21' else 0x4004
+    w, h = 216, 108
+    y = 0x400000
+    uv = y + w * h
+    qt.writel(ISP + ch + size, w << 16 | h)
+    qt.writel(ISP + ch_en, 1)
+    qt.writel(vic, 1)
+    qt.writel(ISP + en, 0xffffffff)
+    for red, blue in ((0, 0), (5600, 3800)):
+        qt.writel(ISP + wb, red)
+        qt.writel(ISP + wb + 4, blue)
+        qt.writel(ISP + ch + push_y, y)
+        qt.writel(ISP + ch + push_uv, uv)
+        qt.step(50_000_000)
+        check('%s finished frame at WB %d/%d' % (soc, red, blue),
+              qt.readl(ISP + ch + pop_y), y)
+        # Sample the middle of the third grey wedge patch in the NV12 plane.
+        offset = (h * 1000 // 1080 // 2) * w + ((w * 304 // 1920) & ~1)
+        check('%s neutral Cb/Cr at WB %d/%d' % (soc, red, blue),
+              tuple(qt.read(uv + offset, 2)), (128, 128))
+
+
 def test_isp_layout(qt, soc):
     print('ingenic-isp (%s layout)' % soc)
     (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
@@ -3665,12 +4252,14 @@ def test_isp_layout(qt, soc):
     qt.writel(vic + vclr, qt.readl(vic + vsta))
     check('status cleared', (qt.readl(ISP + sta), qt.readl(vic + vsta)),
           (0, 0))
-    if soc == 't41':
-        # s_stream / suspend: set 0x200 bit 0, spin on 0x204 bit 0
+    if soc in ('t40', 't41'):
+        # stream-off / suspend: set 0x200 bit 0, spin on 0x204 bit 0
+        # without a timeout -- unanswered, the watchdog resets the camera
         qt.writel(ISP + 0x200, 1)
         check('0x204 bit 0 follows 0x200 bit 0', qt.readl(ISP + 0x204) & 1, 1)
         qt.writel(ISP + 0x200, 0)
         check('and drops with it', qt.readl(ISP + 0x204) & 1, 0)
+    if soc == 't41':
         # direct_mode: channel 0 queued the IVDC pair (0x80000000 /
         # 0x81000000) writes into the IVDC's store, raises bit 20 for the
         # frame source and leaves the done FIFO empty
@@ -3927,6 +4516,33 @@ def test_ipu(qt, soc):
     check('HSV: red hue about 0', min(hp[2], 360 - hp[2]) <= 3, True)
     check('HSV: red saturated and bright', (sp[2] > 240, vp[2] > 240),
           (True, True))
+    # CSC RGB channel orders (D_FMT 0x00/0x28/0x40/0x68) & CH_BK_GLOBAL_ALPHA
+    w, h = 4, 2
+    qt.write(bg, bytes([120]) * (w * h) + bytes([160, 200]) * (w * h // 4))
+    for dfmt, bk, want in (
+        (0x00, (1 << 20) | (1 << 1) | (0x5A << 3), (0x5A, 235, 49, 185)),
+        (0x28, (1 << 20) | (1 << 1) | (0x5A << 3), (0x5A, 185, 49, 235)),
+        (0x40, (1 << 20) | (1 << 1) | (0x5A << 3), (235, 49, 185, 0x5A)),
+        (0x68, (1 << 20) | (1 << 1) | (0x5A << 3), (185, 49, 235, 0x5A)),
+        (0x68, (1 << 20), (185, 49, 235, 0xFF)),
+        (0x08, 1 << 20, (0xa5,) * 4),
+        (0x20, 1 << 20, (0xa5,) * 4),
+    ):
+        qt.write(out, bytes([0xa5]) * 4)
+        qt.writel(ipu + 0x74, 1 << 3)
+        qt.writel(ipu + 0x18, w << 16 | h)
+        qt.writel(ipu + 0x0C, bg)
+        qt.writel(ipu + 0x10, bg + w * h)
+        qt.writel(ipu + 0x1C, w)
+        qt.writel(ipu + 0x20, w << 16 | w)
+        qt.writel(ipu + 0x08, dfmt)
+        qt.writel(ipu + 0x24, out)
+        qt.writel(ipu + 0x2C, w * 4)
+        qt.writel(ipu + 0x12C, bk)
+        qt.writel(ipu + 0x74, 1)
+        qt.step(200 * 1000)
+        check('CSC D_FMT 0x%02x alpha 0x%02x' % (dfmt, want[3] if dfmt & 0x40 else want[0]),
+              tuple(qt.read(out, 4)), want)
 
 
 def test_rtc_efuse(qt, rtc=RTC):
@@ -4129,6 +4745,132 @@ def test_gmac_phy_props(qemu):
           '-1 (not wired) or a pin' in r.stderr, True)
 
 
+def test_gmac_riwt(qemu, tmp):
+    print('ingenic-gmac DMA_RIWT RX coalescing watchdog')
+    net_sock = os.path.join(tmp, 'gmac-riwt.sock')
+    qt = QTest(qemu, 't23', ['-netdev', 'stream,id=n0,server=on,addr.type=unix,'
+                                        'addr.path=%s' % net_sock,
+                             '-global', 'ingenic-gmac.netdev=n0'])
+    peer = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            peer.connect(net_sock)
+            break
+        except OSError:
+            time.sleep(0.02)
+    desc0, desc1 = SCRATCH, SCRATCH + 0x10
+    buf0, buf1 = SCRATCH + 0x100, SCRATCH + 0x900
+    # Desc 0: OWN | RDES1_DIC (suppress immediate RI), Desc 1: OWN | RER (no DIC)
+    qt.write(desc0, struct.pack('<4I', 1 << 31, (1 << 31) | 2048, buf0, 0))
+    qt.write(desc1, struct.pack('<4I', 1 << 31, (1 << 15) | 2048, buf1, 0))
+    qt.writel(GMAC + 0x100C, desc0)                     # DMA_RX_BASE
+    qt.writel(GMAC + 0x1024, 10)                        # DMA_RIWT (~20480 ns)
+    qt.writel(GMAC + 0x101C, (1 << 16) | (1 << 6))      # NIE | RIE
+    qt.writel(GMAC + 0x00, 1 << 2)                      # MAC_CONFIG.RE
+    qt.writel(GMAC + 0x1018, 1 << 1)                    # DMA_OPMODE.SR
+
+    pkt = b'\xff' * 6 + b'\x02\x00\x00\x00\x00\x01\x08\x00' + bytes(46)
+    peer.sendall(struct.pack('>I', len(pkt)) + pkt)
+    for _ in range(100):
+        if (qt.readl(desc0) >> 31) == 0:
+            break
+        time.sleep(0.005)
+    check('DIC descriptor completed (OWN cleared)', qt.readl(desc0) >> 31, 0)
+    check('RDES1_DIC suppresses immediate ST_RI',
+          qt.readl(GMAC + 0x1014) & ((1 << 16) | (1 << 6)), 0)
+    qt.step(10000)
+    check('no ST_RI before DMA_RIWT expires',
+          qt.readl(GMAC + 0x1014) & (1 << 6), 0)
+    qt.step(15000)
+    check('DMA_RIWT fires ST_RI | ST_NIS on expiry',
+          qt.readl(GMAC + 0x1014) & ((1 << 16) | (1 << 6)),
+          (1 << 16) | (1 << 6))
+    check('GMAC IRQ 55 pending in INTC',
+          (qt.readl(INTC + 0x20) >> (55 - 32)) & 1, 1)
+
+    # Re-arm Desc 0 (DIC) + Desc 1 (no DIC) with longer RIWT; verify non-DIC
+    # completion asserts ST_RI immediately and cancels the RIWT timer.
+    qt.writel(GMAC + 0x1014, 0x0001ffff)
+    qt.writel(GMAC + 0x1024, 100)                       # ~204.8 us
+    qt.writel(GMAC + 0x100C, desc0)
+    qt.write(desc0, struct.pack('<4I', 1 << 31, (1 << 31) | 2048, buf0, 0))
+    qt.write(desc1, struct.pack('<4I', 1 << 31, (1 << 15) | 2048, buf1, 0))
+    peer.sendall(struct.pack('>I', len(pkt)) + pkt +
+                 struct.pack('>I', len(pkt)) + pkt)
+    for _ in range(100):
+        if (qt.readl(desc1) >> 31) == 0:
+            break
+        time.sleep(0.005)
+    check('non-DIC descriptor asserts ST_RI immediately',
+          qt.readl(GMAC + 0x1014) & (1 << 6), 1 << 6)
+    qt.writel(GMAC + 0x1014, 0x0001ffff)
+    qt.step(300000)
+    check('cancelled RIWT does not re-fire ST_RI after clear',
+          qt.readl(GMAC + 0x1014) & (1 << 6), 0)
+
+    # Idle VMState must omit ingenic-gmac/riwt for v1 snapshot compatibility,
+    # whereas an armed RIWT timer must migrate its subsection and fire on dst.
+    mig_idle = os.path.join(tmp, 'mig-gmac-idle')
+    qt.qmp('migrate', uri='exec:cat > %s' % mig_idle)
+    for _ in range(100):
+        if qt.qmp('query-migrate').get('status') in ('completed', 'failed'):
+            break
+        time.sleep(0.05)
+    with open(mig_idle, 'rb') as f:
+        check('idle GMAC omits ingenic-gmac/riwt subsection',
+              b'ingenic-gmac/riwt' not in f.read(), True)
+    peer.close()
+    qt.close()
+
+    net_sock2 = os.path.join(tmp, 'gmac-riwt2.sock')
+    qt = QTest(qemu, 't23', ['-netdev', 'stream,id=n0,server=on,addr.type=unix,'
+                                        'addr.path=%s' % net_sock2,
+                             '-global', 'ingenic-gmac.netdev=n0'])
+    peer = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            peer.connect(net_sock2)
+            break
+        except OSError:
+            time.sleep(0.02)
+    qt.write(desc0, struct.pack('<4I', 1 << 31, (1 << 31) | 2048, buf0, 0))
+    qt.write(desc1, struct.pack('<4I', 1 << 31, (1 << 15) | 2048, buf1, 0))
+    qt.writel(GMAC + 0x100C, desc0)
+    qt.writel(GMAC + 0x1024, 50)                        # ~102.4 us
+    qt.writel(GMAC + 0x101C, (1 << 16) | (1 << 6))
+    qt.writel(GMAC + 0x00, 1 << 2)
+    qt.writel(GMAC + 0x1018, 1 << 1)
+    peer.sendall(struct.pack('>I', len(pkt)) + pkt)
+    for _ in range(100):
+        if (qt.readl(desc0) >> 31) == 0:
+            break
+        time.sleep(0.005)
+    qt.step(40000)
+    mig_armed = os.path.join(tmp, 'mig-gmac-armed')
+    qt.qmp('migrate', uri='exec:cat > %s' % mig_armed)
+    for _ in range(100):
+        if qt.qmp('query-migrate').get('status') in ('completed', 'failed'):
+            break
+        time.sleep(0.05)
+    peer.close()
+    qt.close()
+    with open(mig_armed, 'rb') as f:
+        check('armed GMAC emits ingenic-gmac/riwt subsection',
+              b'ingenic-gmac/riwt' in f.read(), True)
+    qt_dst = QTest(qemu, 't23', ['-incoming', 'exec:cat %s' % mig_armed])
+    for _ in range(100):
+        if qt_dst.qmp('query-status').get('status') != 'inmigrate':
+            break
+        time.sleep(0.05)
+    check('migrated armed RIWT has not fired yet on destination',
+          qt_dst.readl(GMAC + 0x1014) & (1 << 6), 0)
+    qt_dst.step(150000)
+    check('migrated armed RIWT fires ST_RI | ST_NIS on destination',
+          qt_dst.readl(GMAC + 0x1014) & ((1 << 16) | (1 << 6)),
+          (1 << 16) | (1 << 6))
+    qt_dst.close()
+
+
 def test_migration(qemu, machine, tmp):
     print('migration round trip (%s)' % machine)
     out = os.path.join(tmp, 'mig')
@@ -4277,6 +5019,7 @@ def main():
         test_gmac_phy_pdown(qt)
         qt.close()
         test_gmac_phy_props(a.qemu)
+        test_gmac_riwt(a.qemu, tmp)
         qt = QTest(a.qemu, 't40')
         test_drawbox(qt)
         test_i2d(qt)
@@ -4319,6 +5062,7 @@ def main():
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp(qt)
         test_i2c_dma(qt)
+        test_galaxycore_page0(qt)
         qt.close()
         qt = QTest(a.qemu, 't31,sensor=gc2053')
         test_isp_stats(qt)
@@ -4362,6 +5106,8 @@ def main():
         for soc in ISP_LAYOUTS:
             qt = QTest(a.qemu, soc)
             test_isp_layout(qt, soc)
+            if soc in ('t21', 't40', 't41'):
+                test_isp_neutral_wedge(qt, soc)
             qt.close()
         # T23's second sensor (the SDK's gc2053s1) beside the first on I2C0
         qt = QTest(a.qemu, 't23,sensor=gc2053,sensor1=gc2053s1')
@@ -4382,10 +5128,29 @@ def main():
             qt = QTest(a.qemu, soc)
             test_jpgc_decode(qt, soc)
             qt.close()
-        for soc in ('t30', 't31', 't41'):
+        for soc in ('t23', 't30', 't31', 't41'):
             qt = QTest(a.qemu, soc)
             test_ipu(qt, soc)
             qt.close()
+
+        img8_path = img_path + '.8m'
+        img8 = make_image(img8_path, 8 << 20)
+        qt = QTest(a.qemu, 't23,flash-file=%s,flash-type=zb25vq64,'
+                   'sensor=sc1a4t,sensor1=sc1a4ts1,msc0-cd=61' % img8_path)
+        test_cpm(qt, 't23')
+        test_t23_soc_gaps(qt, img8)
+        qt.close()
+        flash_dtb = subprocess.run(
+            [a.qemu, '-M', 't23,flash-file=' + img8_path, '-dtb', 'unused.dtb',
+             '-display', 'none', '-serial', 'none', '-S'],
+            capture_output=True, text=True, timeout=5)
+        check('flash boot rejects an external DTB',
+              (flash_dtb.returncode, '-dtb requires -kernel' in flash_dtb.stderr),
+              (1, True))
+        qt = QTest(a.qemu, 't23', ['-device', 'usb-kbd'])
+        test_otg_port_power(qt)
+        qt.close()
+        test_t23_uhi_and_ost_irq(a.qemu, tmp)
 
         for soc in ('t20', 't40', 't41'):
             qt = QTest(a.qemu, soc)
@@ -4438,6 +5203,7 @@ def main():
         test_sdio_6441_migration(a.qemu, tmp)
         test_otg_migration(a.qemu, tmp)
         test_migration(a.qemu, 't41', tmp)
+        test_migration(a.qemu, 't23,sensor=sc1a4t,sensor1=sc1a4ts1', tmp)
         test_migration(a.qemu, 't40,sensor=gc4653,sensor1=gc4653,sensor2=gc4653',
                        tmp)
     finally:

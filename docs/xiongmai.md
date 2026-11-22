@@ -235,9 +235,11 @@ U-Boots and kernels:
 
   Sofia comes up, finds no sensor or Wi-Fi card, and after a while reboots
   the camera itself (`xmsfc_shutdown`, `Restarting system.`). The machine
-  reset brings it back through U-Boot. XM210, XM212 and XM232 dumps from the
-  same issue are RISC-V parts (`auipc gp` / `csrw mtvec` at flash offset 0)
-  and are out of scope for `qemu-system-arm`.
+  reset brings it back through U-Boot. The XM210 dump from the same issue
+  is a RISC-V part (`auipc gp` / `csrw mtvec` at flash offset 0) and out of
+  scope for `qemu-system-arm`; XM212's has not been looked at. XM232 is ARM
+  ([XM232](#xm232)): it was first taken for RISC-V with XM210, but its
+  flash 0 holds a header, not code.
 
 ### Video (xm-isp2, xm-hevc, xm-osd, xm-nn)
 
@@ -252,7 +254,10 @@ logo with a moving dot, as the Allwinner models do:
     is drawn where the frame lands. Multi-lens boards draw each lens with
     the dot at its own phase: XM530V200 X6C and XM535D1 splice two lenses
     into one stream, XM535D2 serves three cameras.
-  - **xm-hevc**: the HEVC engines (layouts `xm535`, `xm533`, `xm530v200`).
+  - **xm-vimu**, **xm-vta**: XM232's VI + ISP and NN accelerator; see
+    [XM232](#xm232).
+  - **xm-hevc**: the HEVC engines (layouts `xm535`, `xm533`, `xm530v200`;
+    `xm232`, which codes H.264 too, is in [XM232](#xm232)).
     The vendor library writes the parameter sets and slice header; the
     model writes the slice data (`hevc-enc.c`) under them, so its CABAC
     must follow the library's choices: CTB 16 without SAO (XM535, XM533)
@@ -511,8 +516,147 @@ whose release has no ATBM driver: there it checks that `dwc_otg` and
 `--wlandev` on an image that has a profile (firmware#2316).
 
 Not modelled: WPA3-SAE and 802.1X (the guests' `wpa_supplicant` has
-neither; see `docs/ingenic.md`); XM535D2's `6132cu.ko` and XM533's SDIO
-SSV6158.
+neither; see `docs/ingenic.md`) and XM533's SDIO SSV6158. The ATBM6132CU
+(XM232's `atbm6132c.ko`, XM535D2's `6132cu.ko`) takes `chip-version=0x30`;
+see [XM232](#xm232).
+
+## XM232
+
+Read from an X6S-WEQ-H dump (V5.03.C01, 2026; U-Boot `CPU: XM232W1`,
+kernel `mach-xm232`):
+
+```sh
+qemu-system-arm -M xm232,flash-file=dump.bin -nographic \
+    -nic user,restrict=on,net=192.168.1.0/24,host=192.168.1.1,dhcpstart=192.168.1.10,hostfwd=tcp:127.0.0.1:5554-192.168.1.10:554 \
+    -netdev user,id=w,restrict=on,net=192.168.50.0/24 \
+    -device atbm-wifi,bus=usb-bus.0,port=1,netdev=w,chip-version=0x30
+ffprobe -rtsp_transport tcp 'rtsp://127.0.0.1:5554/user=admin&password=&channel=1&stream=0.sdp?real_stream'
+```
+
+Sofia streams H.264 over RTSP a minute or so into the boot: `stream=0`
+2304x2592 (the two lenses, one above the other, upscaled), `stream=1`
+640x720, each with G.711 audio, the clock and title OSD on both. The board
+leases its address over DHCP (`dhcpstart` puts it where the forward
+points); `restrict=on` keeps Sofia's cloud traffic in.
+
+The second-generation map (U-Boot 2014.04 at the flash window, uMCTL2,
+latching SP804, UARTs, GMAC, SFC v2), with these differences:
+  - **Boot.** Flash 0 is a 32-byte header (two signature words, then
+    zeros). The vector table is at +0x20 and its literals point into
+    0x600001xx, so U-Boot is linked with the header in front and the boot
+    ROM enters at window + 0x20 (`flash_entry`). Entered at the window the
+    CPU runs the header and branches to 0x60b8d908, which is what made the
+    part look like a non-ARM one at first.
+  - **Flash layout.** No kernel partition: the uImage is `/boot/uImage` in
+    the romfs cramfs, loaded with `cramfsload`.
+    `mtdparts=xm_sfc:0x40000(boot),0x2A0000(romfs),0x410000(usr),0x40000(custom),0x80000(music),0x50000(mtd)`.
+    The environment (64 KiB at 0x30000, CRC32 first) has `xmuart=1`;
+    `qemu-boot/uboot-env.py` cannot read this U-Boot (it expects one
+    LZMA-packed), so set `xmuart=0` by rewriting the block and its CRC.
+  - **64 MB** (`MEM_ALL=64` in the loader script; `mem=33M`). The kernel is
+    uniprocessor.
+  - **Interrupts** (Linux number - 32 = SPI), from each module's
+    `request_irq()` and platform resources: `sdio0_sd.ko` 51,
+    `xm_usb0.ko`'s DWC2 at **0x50200000**, IRQ 55 (not 0x50300000 / 76),
+    `i2s.ko` 45 / 46, `xm_wdt.ko` 48, `dma.ko` 47 (its own engine at
+    0x20020000, not a PL330), `hevc.ko` 56. The UART, GMAC and timer lines
+    are XM530's.
+  - **Reset key on the ADC.** Sofia's key 252 is ADC channel 2, and
+    XM232's `adc.ko` calibrates first: it reads ten reference inputs
+    (select bits 7:4 = 5..14 at +0xCC0) and converts a channel by
+    interpolating between them. A flat ADC (as the XM533 / XM535 one could
+    be) converts to 0, "pressed", and Sofia restores the factory settings
+    and reboots about 45 s in (`rebootV2` type 25). `xm-gpio` answers the
+    references with a ramp and the channels at 992, released.
+  - **Media** (`loadmod` mode 3: two SC2336 time-multiplexed on one VI,
+    spliced into one picture). The media blocks address the DDR at
+    0x90000000 as well (vb.ko hands out the MMZ at 0x92300000 up; the
+    machine's `ram_media_alias`).
+    - **xm-vimu**: VI + ISP in one window, 0x30000000 + 68 MiB. Each period
+      the VICU takes the sensor `isp.ko` selects at +0x10008: its mux timer
+      at frame start (`mux_timer_irq`, SPI 58), then `vicu_bayer_irq` (SPI
+      32), `bpu_hvgen_irq` (SPI 56), the store and `vi_sel` (SPI 57,
+      `vi_mu.ko`). Three store channels per sensor (1920x1080, 640x360,
+      512x288) at +0x73000 + 0x4000·n, set up at `vi_sel`'s "go" (+0x10014)
+      and done at +0x90. The BPU's zone statistics (AWB at +0x4B000, one
+      block per sensor at +0x82000 / +0x92000: 512 zones of R / G / B sums)
+      describe a grey, lit scene. The `isp` daemon's auto scene judges day
+      and night from them, and without them it goes to night, whose table
+      this firmware leaves empty: `isp` faults (`isp_monitor`) and Sofia
+      runs blind.
+    - **xm-hevc**, layout `xm232` (0x21000000, `h265` SPI 24): XM535's CTB
+      16 HEVC, and the same engine in H.264, which this firmware uses for
+      both streams (Main profile, CAVLC). The library writes SPS / PPS and
+      slice header after the job, and hands the header's bits past its
+      last whole byte to the engine before it (+0x52C / +0x530); a job with
+      such bits, or a stream that had them, is H.264, coded by
+      `hantro-h264`'s picture coder (P pictures inter-predicted from the
+      reconstruction the job names). No register names the codec: a job
+      with no such bits whose gap holds the stream's last HEVC slice is
+      H.265. rgn.ko's OSD is the engine's own overlay regions (+0x2A4 on,
+      +0x2A8 + 0x24·n), 2 bits a pixel as XM535's. A snapshot (DVRIP
+      OPSNAP, cloud alarms) rides along a sub-stream picture: +0x5C8 on, a
+      baseline 4:2:2 scan to +0x5FC (room +0x5D4, length +0x614) under the
+      quantisers +0x1000 holds as 65536 / q in zigzag order; the library
+      writes SOI..SOS (Annex K tables) in front and EOI after.
+      `-global xm-hevc.dump-dir=DIR` keeps H.264 jobs as
+      `frame-NNNNN-WxH.h264`.
+
+      This board's Sofia streams H.265 only if the product allows it: its
+      `custom` partition's `CustomConfig/Encode.json` says
+      `"VencType": ["H264"]` (the tokens are H264, H264PLUS, H265,
+      H265PLUS), and over DVRIP Sofia advertises H.264 alone
+      (`CompressionMask` 0x80) and refuses `Simplify.Encode` with H.265 (Ret
+      606) even with H265 listed. To try it, rebuild the cramfs at 0x6F0000
+      with `["H264", "H265"]` and `"Compression": "H.265"` in
+      `CustomConfig/AVEnc.custom`, and erase the `mtd` partition
+      (0x7B0000, the saved configuration) so the defaults apply: both
+      streams then come out H.265.
+    - **xm-vta**: the "VTA" NN accelerator (0x22000000, SPI 27,
+      `XmVtaMte.ko`), which Sofia's person detector drives through
+      `/dev/mem`. Its colour converter (+0x800: NV12 to 3-byte int8 pixels by
+      programmed coefficients) is modelled; network runs (+0x000, the
+      model's instruction stream) complete with nothing computed, so nobody
+      is detected. Without it every run times out after 5 s, the detector's
+      outputs stay unset and Sofia's `Smart_Proc` thread faults about 30 s
+      after start.
+  - **Wi-Fi + BLE: ATBM6132CU** ("OCEANUS"), `atbm6132c.ko` (also
+    XM535D2's `6132cu.ko`), on the USB core. With `chip-version=0x30`
+    `atbm-wifi` speaks its dialect:
+    - 0x30 is the only chip version this driver has firmware for (chip type
+      17, `firmware_usb_wifi_bt_comb_ocea.h`); any other hits `BUG()` in the
+      loader ("can't find firmware.h").
+    - Its startup check wants `CAPABILITIES_BLE` (0x2000 in firmwareCap)
+      and `CAPABILITIES_VIFADDR_LOCAL_BIT` (bit 18, in firmwareCap2 after
+      Config[3]), read from the driver's capability table.
+    - Its command header is 32 bytes, not 12: length at +0, a checksum at
+      +7, the WSM len / id at +28, the body at +32.
+    - HCI goes out as WSM id 0x09c0, H4 type first, and takes no WSM
+      confirm (one throws the driver's buffer count off). The model
+      completes each command with an HCI Command Complete, sent as id 0x903
+      with the H4 type byte (0x04) first; `ble_app` (NimBLE) syncs and
+      starts its smart-config advertising. Nothing goes on air.
+
+    The driver comes up as `eth3` and scans. Without the dongle (or with
+    another chip version) `wlandaemon` finds no card, reloads the driver
+    and reboots the camera.
+
+    - **xm-dmac**: `dma.ko`'s copy engine (0x20020000, SPI 15), which
+      Sofia's AI frame fetch (`xm_ai_getframe_doublecam*`) uses through
+      `/dev/dma` to copy VI frames to the detector: source +0x100,
+      destination +0x108, 8-byte transfers − 1 at +0x110, +0x010 3 on,
+      +0x018 bits 0 / 8 start the channel (it reads 0 when the block is
+      done), done status +0x188 masked by +0x190, cleared by writing it to
+      +0x198; `dma.ko` copies 16 KiB a block and starts the next from its
+      interrupt. Without it every copy waits out 200 ms (`dma timeout`).
+
+**Open.** `wlandaemon`'s QR-code Wi-Fi setup fails on real hardware too: its
+static media library sends `mmz.ko` ioctls with a 0x2C-byte argument where
+this `mmz.ko` takes 0x30 (`mmz: ioctl cmd error`). For debugging: Sofia
+logs to `/var/sofia.log`; the `isp` daemon, which Sofia starts as
+`isp -v p &`, logs nowhere, so bind-mount a wrapper over `/usr/bin/isp`
+before Sofia starts to keep its output; `echo 1 >
+/proc/sys/kernel/print-fatal-signals` names a faulting thread and its PC.
 
 ## DVRs and NVRs (XM8536E / XM8520D / XM8521DV200)
 

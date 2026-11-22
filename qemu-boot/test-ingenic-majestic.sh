@@ -25,9 +25,9 @@
 # supervisor.  The twin adds three things: S00twin touches /tmp/closesimd
 # (libimp's MXU2 paths are not modelled), a creditable seedrng seed (the
 # machine gathers almost no entropy, and getrandom() would hold majestic
-# before it reads its config for good), and rc.local mirrors the syslog,
-# where majestic -s logs, to the console the checks read.  root's password
-# is 12345: an unclaimed camera streams nothing.
+# before it reads its config for good), and rc.local copies the syslog
+# lines the checks look for (majestic -s logs there) to the console they
+# read.  root's password is 12345: an unclaimed camera streams nothing.
 #
 # What is checked, from the console, the network and QEMU:
 #   - majestic brings the SDK up ("Ingenic SDK started");
@@ -42,6 +42,16 @@
 #     silent);
 #   - 50 pictures of each RTSP stream decode (ffmpeg's own count, with no
 #     error), and /image.jpg is a JPEG of the main stream's size;
+#   - with --rebuilds N, majestic rebuilds its pipeline N times
+#     (jpeg.enabled off and on through the API, which stops and restarts
+#     the ISP stream) and /image.jpg answers after every one; the kernel
+#     log, read over SSH after each, must hold no "scheduling while
+#     atomic", Oops or OST interrupt storm ("couldn't find ostfr").  The
+#     sleeping-in-atomic reports of a CONFIG_DEBUG_ATOMIC_SLEEP kernel
+#     (--kernel) are counted by the vendor-module function they come
+#     from.  --tx-isp KO swaps the release's tx-isp module for one built
+#     elsewhere (openingenic), to compare the two;
+#   - the watchdog never resets the camera (QEMU's -d guest_errors);
 #   - a setting written through the API reads back, and with --reboot it
 #     survives a power cycle;
 #   - day/night from a light sensor: PB17 is nightMode.lightSensorPin, and
@@ -59,9 +69,10 @@
 #                            [--sdk DIR] [--kernel UIMAGE] [--reboot]
 #                            [--work DIR] [--qemu Q] [--timeout SECONDS]
 #                            [--min-night-regs N] [--keep]
+#                            [--rebuilds N] [--tx-isp KO]
 #   --sdk  the extracted Ingenic-SDK-T41-1.2.0-20230713 (default $T41_SDK);
 #          the test skips (exit 0) without it, as the other T41 tests do
-# Needs ffmpeg and ffprobe on PATH.
+# Needs ffmpeg and ffprobe on PATH, and sshpass for --rebuilds.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -76,6 +87,8 @@ KEEP=
 SDK=${T41_SDK:-}
 KERNEL=
 REBOOT=
+REBUILDS=
+TXISP_KO=
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -90,6 +103,8 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT=$2; shift ;;
     --min-night-regs) MIN_NIGHT=$2; shift ;;
     --keep) KEEP=1 ;;
+    --rebuilds) REBUILDS=$2; shift ;;
+    --tx-isp) TXISP_KO=$(realpath "$2"); shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -143,6 +158,9 @@ if [ -n "$BIN" ]; then
     cp "$BIN" "$RFS/usr/bin/majestic"
     chmod 755 "$RFS/usr/bin/majestic"
 fi
+if [ $SOC = t40 ] && [ -n "$TXISP_KO" ]; then
+    cp "$TXISP_KO" "$RFS"/lib/modules/*/ingenic/tx-isp-t40.ko
+fi
 if [ $SOC = t41 ]; then
     cp "$SDK"/sdk/lib/uclibc/{libimp,libalog,libsysutils}.so "$RFS/usr/lib/"
     # the image: SPL + U-Boot, the uImage at 0x40000, the root at 0x2C0000
@@ -155,6 +173,7 @@ PY
     jefferson -d "$WORK/appfs" "$WORK/appfs.jffs2" >/dev/null
     mkdir -p "$RFS/lib/modules/t41"
     cp "$WORK"/appfs/lib/modules/*.ko "$RFS/lib/modules/t41/"
+    [ -z "$TXISP_KO" ] || cp "$TXISP_KO" "$RFS/lib/modules/t41/tx-isp-t41.ko"
     cp "$WORK/appfs/etc/sensor/$SENSOR-t41.bin" "$RFS/etc/sensor/"
     # OpenIPC's sensor file, for the GC4653's GC4663 sibling (same address
     # and size)
@@ -214,8 +233,17 @@ cp /etc/twin-seed /var/lib/seedrng/seed.credit
 touch /tmp/closesimd
 EOF
 chmod 755 "$RFS/etc/init.d/S00twin"
-# majestic -s logs to syslog; the checks read the console
-sed -i 's|^exit 0$|logread -f > /dev/console 2>\&1 \&\nexit 0|' "$RFS/etc/rc.local"
+# majestic -s logs to syslog; the checks read the console, so the lines
+# they look for are copied there -- those lines only.  All of the syslog
+# froze the twin: the SDK 4.4 kernel's ingenic_uart.c turns its transmit
+# interrupt off from the interrupt handler without the port lock, racing
+# the other core's start, and a race lost with the tty buffer full leaves
+# the console stopped for good (IER 0x15, LSR 0x60, text queued).  Then
+# logread blocked on it, syslogd on logread, and every process that logs on
+# syslogd: majestic, dropbear, until the watchdog reset the camera.  The
+# race is the driver's; two vCPU threads lose it far more often than two
+# cores do, and the whole syslog at the line rate kept it losable.
+sed -i 's#^exit 0$#logread -f | grep -E "Ingenic SDK started|Cannot start SDK|get mic timeout|IMP_[A-Za-z_]+\\(\\) failed" > /dev/console 2>\&1 \&\nexit 0#' "$RFS/etc/rc.local"
 grep -q '^logread -f' "$RFS/etc/rc.local" || { echo "rc.local: no exit 0 to insert before" >&2; exit 1; }
 mksquashfs "$RFS" "$WORK/root.sq" -comp xz -noappend -quiet -all-root >/dev/null
 [ -n "$KEEP" ] || rm -rf "$RFS" "$WORK/appfs"
@@ -244,9 +272,9 @@ PY
 
 TRACE=$WORK/isp-trace.log
 MON=$(mktemp -u /tmp/twin.XXXXXX.sock)     # sun_path is 108 bytes
-read -r RTSP HTTP <<< "$(python3 -c '
+read -r RTSP HTTP SSHP <<< "$(python3 -c '
 import socket
-s = [socket.socket() for _ in range(2)]
+s = [socket.socket() for _ in range(3)]
 for x in s: x.bind(("127.0.0.1", 0))
 print(*(x.getsockname()[1] for x in s))')"
 QPID=
@@ -272,9 +300,10 @@ boot() {
     : > "$CON"
     "$QEMU" -M "$MACHINE,flash-file=$WORK/nor.bin$AUDIODEV" -m 128M \
         "${AUDIOOUT[@]}" \
-        -global ingenic-isp.trace-regs=on -display none -serial file:"$CON" \
+        -global ingenic-isp.trace-regs=on -d guest_errors \
+        -display none -serial file:"$CON" \
         -monitor unix:"$MON",server,nowait \
-        -nic user,restrict=on,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80 \
+        -nic user,restrict=on,hostfwd=tcp:127.0.0.1:$RTSP-:554,hostfwd=tcp:127.0.0.1:$HTTP-:80,hostfwd=tcp:127.0.0.1:$SSHP-:22 \
         -kernel "$KERNEL" \
         -append "console=ttyS1,115200n8 root=/dev/mtdblock3 rootfstype=squashfs init=/init mtdparts=$MTDID:256k(boot),64k(env),${KERN_KB}k(kernel),${ROOT_KB}k(rootfs),-(rootfs_data) $MEM" \
         </dev/null 2>>"$TRACE" &
@@ -417,10 +446,10 @@ print('    (speaker: %.2f s at %.0f Hz)' % ((b - a) / r, hz))
 sys.exit(0 if (b - a) / r > 0.8 and 420 < hz < 460 else 1)
 PY
 }
-# night_is 0|1: majestic's own answer, from /metrics.  Not the console:
-# the console is the syslog mirrored by `logread -f`, which stops following
-# when syslogd's ring laps it -- on T40 with --audio the twin's audio.ko
-# fills the ring with stack dumps, and a mode change went unseen.
+# night_is 0|1: majestic's own answer, from /metrics.  Not the console,
+# which carries only the lines the checks grep for, and whose `logread -f`
+# stops following when syslogd's ring laps it -- on T40 with --audio the
+# twin's audio.ko fills the ring with stack dumps.
 night_is() {
     curl -s -m 10 -u root:12345 "http://127.0.0.1:$HTTP/metrics" |
         grep -qx "night_enabled $1"
@@ -453,6 +482,54 @@ if grep -aq 'Ingenic SDK started' "$CON"; then
     check "the main stream decodes" decodes stream=0
     check "the second stream decodes" decodes stream=1
     check "/image.jpg is a JPEG of the main stream's size" snapshot
+
+    if [ -n "$REBUILDS" ]; then
+        gsh() {
+            timeout 120 sshpass -p 12345 ssh -p "$SSHP" -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+                -o ConnectTimeout=30 root@127.0.0.1 "$@"
+        }
+        KM=$WORK/kmsg.log
+        gsh 'dmesg -c' > "$KM" 2>&1 || true
+        echo "=== rebuilds start" >> "$KM"
+        ok=0
+        for i in $(seq "$REBUILDS"); do
+            for v in false true; do
+                curl -s -m 60 -u root:12345 -o /dev/null -X POST \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"jpeg\":{\"enabled\":$v}}" \
+                    "http://127.0.0.1:$HTTP/api/v1/config" ||
+                    echo "    rebuild $i: POST $v failed"
+                sleep 3
+            done
+            # the pipeline takes a while to come back: 503 until it has
+            for t in $(seq 30); do
+                c=$(curl -s -m 60 -u root:12345 -o /dev/null -w '%{http_code}' \
+                    "http://127.0.0.1:$HTTP/image.jpg") || c=timeout
+                [ "$c" = 200 ] && break
+                sleep 2
+            done
+            [ "$c" = 200 ] && ok=$((ok + 1)) || echo "    rebuild $i: /image.jpg $c"
+            echo "=== after rebuild $i" >> "$KM"
+            # over SSH, not the console: the release lowers the console
+            # log level, and raising it floods the UART (see rc.local above)
+            gsh 'dmesg -c' >> "$KM" 2>&1 || echo "    rebuild $i: no kernel log"
+        done
+        echo "    ($ok of $REBUILDS rebuilds answered /image.jpg)"
+        n() { grep -ac "$1" "$KM" || true; }
+        echo "    scheduling while atomic: $(n 'scheduling while atomic')," \
+             "Oops: $(n 'Oops'), OST storm: $(n "couldn't find ostfr")"
+        # where a debug kernel caught a sleep in atomic context: the first
+        # vendor-module frame of each report
+        awk '/sleeping function called from invalid context/ { f = 1; next }
+             f && /Position:.*\[/ { sub(/.*Position:/, ""); sub(/\+.*/, "");
+                                    n[$0]++; f = 0 }
+             END { for (k in n) printf "    sleep in atomic context via %s: %d\n", k, n[k] }' "$KM"
+        check "every rebuild gives a picture" [ "$ok" = "$REBUILDS" ]
+        check "no scheduling while atomic, Oops or OST storm" \
+            [ "$(( $(n 'scheduling while atomic') + $(n 'Oops') + $(n "couldn't find ostfr") ))" = 0 ]
+        check "the main stream decodes after the rebuilds" decodes stream=0
+    fi
     # The speaker on T41, whose SDK audio.ko the twin plays through
     if [ "$SPEAKER" = true ]; then
         check "the microphone is heard on /audio.pcm" mic
@@ -506,6 +583,10 @@ PY
 fi
 if cat "$WORK"/console.*.log | grep -aq -E 'IMP_[A-Za-z_]+\(\) failed|Cannot start SDK'; then
     cat "$WORK"/console.*.log | grep -a -E 'IMP_[A-Za-z_]+\(\) failed|Cannot start SDK' | sed 's/\x1b\[[0-9;]*m//g' | head -5
+fi
+if grep -q 'ingenic-tcu: watchdog reset' "$TRACE"; then
+    echo "  FAIL: the watchdog reset the camera"
+    fail=1
 fi
 if cat "$WORK"/console.*.log | grep -aq -E 'Oops|Kernel panic'; then
     echo "  FAIL: kernel trouble"

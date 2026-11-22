@@ -114,7 +114,9 @@ static void ost_latch(IngenicOstState *s, int ch)
 
 static void ost_update_irq(IngenicOstState *s)
 {
-    qemu_set_irq(s->irq, (s->tfr & ~s->tmr & CH1) != 0);
+    bool en = s->layout != 0 || (s->ter & CH1);
+
+    qemu_set_irq(s->irq, en && (s->tfr & ~s->tmr & CH1) != 0);
 }
 
 /* Fold elapsed matches of counter 1 into TFR and arm the next one. */

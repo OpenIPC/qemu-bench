@@ -114,6 +114,60 @@
 #define HISI_V1_DDRC_BASE       0x20110000
 #define HISI_V1_DDRPHY_BASE     0x20120400
 
+
+/*
+ * PWM controllers (hisi-pwm), one family per line.  Where each number comes
+ * from:
+ *  - V1/V2/V3 clock words, channel counts and rates: measured on lab boards
+ *    by sampling a bounded run's remaining-periods count twice, a known time
+ *    apart (OpenIPC/majestic#324): 2998268 Hz on hi3516cv100, 2998269 /
+ *    49.9 MHz on hi3518ev200, 3002068 / 50025208 Hz on hi3516cv300.  V1
+ *    implements bit 1 only; from V2 bit 2 picks 50 MHz.  V1 loads a new duty
+ *    on the enable edge alone (OpenIPC/majestic#321).
+ *  - V2A (hi3516av100): openhisilicon kernel/pwm/hi3516av100/pwm.c, eight
+ *    channels with 4-7 in a second bank at +0x1000; the clock word is the
+ *    cv200 one (the vendor demo_config writes 0x20030038 = 0x6).
+ *  - V3A (hi3519v101 / hi3516av200): base from openhisilicon pwm_arch.h and
+ *    the DT (pwm@12130000), eight channels; the vendor demo_config writes
+ *    0x120100DC = 0x6, read here with the V3 bit meanings.
+ *  - V4A (hi3516cv500 / av300 / dv300): the kernel's clk-hi3516cv500.c puts
+ *    the gate at CRG+0x1bc bit 7, the mux at [9:8] = {3, 50, 24, 24} MHz and
+ *    the reset at bit 6.  Measured on a lab hi3516av300: stock 0x01802802
+ *    leaves the block reading 0, bit 7 wakes it, mux 0/1/2 gave 2997703 /
+ *    50026950 / 24011375 Hz, and only channels 0 and 1 decode.
+ *  - V4 (ev200 / ev300 / gk7205v200): the same word and bits; the field's
+ *    0x282 is mux 2 and the gate, measured 24011028 Hz.  The XMedia
+ *    gk7205v500 family is the same block with twelve channels; its vendor
+ *    pwm.ko sets bit 7 alone, which is 3 MHz (measured 2998271 Hz).
+ *  - V5 (hi3516cv6xx): the kernel's pwm-bsp.c and clk_hi3516cv610.c, gate
+ *    CRG+0x4598 bit 4, reset bit 0, mux [13:12] = {1, 24, 198} MHz.
+ */
+#define HISI_PWM_V1     { .layout = 0, .channels = 3, .edge_latch = true,  \
+        .crg_offset = 0x38, .gate_mask = 0x2, .rates = { 3000000 },        \
+        .cfg0_reset = 0x18f, .cfg1_reset = 0x3e8 }
+#define HISI_PWM_V2     { .layout = 0, .channels = 4,                      \
+        .crg_offset = 0x38, .gate_mask = 0x2, .mux_shift = 2,              \
+        .mux_width = 1, .rates = { 3000000, 50000000 } }
+#define HISI_PWM_V2A    { .layout = 1, .channels = 8,                      \
+        .crg_offset = 0x38, .gate_mask = 0x2, .mux_shift = 2,              \
+        .mux_width = 1, .rates = { 3000000, 50000000 } }
+#define HISI_PWM_V3     HISI_PWM_V2
+#define HISI_PWM_V3A    { .layout = 0, .channels = 8,                      \
+        .crg_offset = 0xdc, .gate_mask = 0x2, .mux_shift = 2,              \
+        .mux_width = 1, .rates = { 3000000, 50000000 } }
+#define HISI_PWM_V4_WORD(n)  { .layout = 0, .channels = (n),               \
+        .crg_offset = 0x1bc, .gate_mask = 0x80, .reset_mask = 0x40,        \
+        .mux_shift = 8, .mux_width = 2,                                    \
+        .rates = { 3000000, 50000000, 24000000, 24000000 },                \
+        .cfg0_reset = 0x18f, .cfg1_reset = 0xc7 }
+#define HISI_PWM_V4A    HISI_PWM_V4_WORD(2)
+#define HISI_PWM_V4     HISI_PWM_V4_WORD(4)
+#define HISI_PWM_GK500  HISI_PWM_V4_WORD(12)
+#define HISI_PWM_V5     { .layout = 2, .channels = 8,                      \
+        .crg_offset = 0x4598, .gate_mask = 0x10, .reset_mask = 0x1,        \
+        .mux_shift = 12, .mux_width = 2,                                   \
+        .rates = { 1000000, 24000000, 198000000 } }
+
 /*
  * Hi3516CV100 (V1): pre-2015, 2M mainstream.  ARM926EJ-S @550MHz.
  * Video: H.264, 1080P@30fps.  Memory: 64MB DDR2.
@@ -151,6 +205,7 @@ static const HisiSoCConfig hi3516cv100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .pwm                = HISI_PWM_V1,
     .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
     .crg_pll_lock_bits  = 0xf,
 
@@ -226,10 +281,12 @@ static const HisiSoCConfig hi3516cv100_soc = {
      * hardware during init.  Without mapped regions, reads return 0
      * from QEMU's "unimplemented" handler, causing poll loops to hang.
      */
-    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
+    .num_regbanks       = 8,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
         { "hisi-vpss",   0x20600000, 0x10000 },
@@ -268,6 +325,7 @@ static const HisiSoCConfig hi3518av100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .pwm                = HISI_PWM_V1,
     .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
     .crg_pll_lock_bits  = 0xf,
 
@@ -334,10 +392,12 @@ static const HisiSoCConfig hi3518av100_soc = {
         { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
-    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
+    .num_regbanks       = 8,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
         { "hisi-vpss",   0x20600000, 0x10000 },
@@ -373,6 +433,7 @@ static const HisiSoCConfig hi3518cv100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .pwm                = HISI_PWM_V1,
     .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
     .crg_pll_lock_bits  = 0xf,
 
@@ -439,10 +500,12 @@ static const HisiSoCConfig hi3518cv100_soc = {
         { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
-    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
+    .num_regbanks       = 8,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
         { "hisi-vpss",   0x20600000, 0x10000 },
@@ -480,6 +543,7 @@ static const HisiSoCConfig hi3518ev100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .pwm                = HISI_PWM_V1,
     .crg_pll_lock_offset = 0xe8,        /* 4 PLL lock bits */
     .crg_pll_lock_bits  = 0xf,
 
@@ -546,10 +610,12 @@ static const HisiSoCConfig hi3518ev100_soc = {
         { 0x14, 0x00683064 },               /* CRG5: BPLL refdiv/fbdiv  */
     },
 
-    .num_regbanks       = 7,     /* DDRC: hisi-ddrc-v1 */
+    .num_regbanks       = 8,     /* DDRC: hisi-ddrc-v1 */
     .regbanks           = {
         { "hisi-misc",   0x20120000, 0x10000 },
         { "hisi-pwm",    0x20130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },
         { "hisi-nandc",  0x10000000, 0x10000 },
         { "hisi-viu",    0x20580000, 0x40000 },
         { "hisi-vpss",   0x20600000, 0x10000 },
@@ -566,105 +632,151 @@ static const HisiSoCConfig hi3518ev100_soc = {
  * 0x20xxxxxx peripheral space.  Uses hieth-sf in vendor kernel but FEMAC
  * in OpenIPC's 4.9+ kernel.  FMC memory window at 0x58000000 (not 0x14000000).
  */
+/* The CV200 die: hi3516cv200, and hi3518ev200 (the same silicon; SCSYSID
+ * byte 3 tells them apart) */
+#define HISI_CV200_COMMON \
+    .cpu_type           = ARM_CPU_TYPE_NAME("arm926"),                       \
+    .soc_id             = HISI_SOC_ID_CV200,                                 \
+    .chipid_byte_layout = true,            /* V2: byte-wise SCSYSID0..3 */   \
+    /* V2 RNG_GEN block — different layout from V3+ HISEC_TRNG_CTRL,         \
+     * data register at +0x004 instead of +0x204. */                         \
+    .hwrng_base         = 0x20280000,                                        \
+    .hwrng_data_offset  = 0x004,                                             \
+    /* 64 MiB on-chip DDR2 (512Mb).  Kernel gets 32 MiB, vendor mmz.ko       \
+     * claims the upper 32 MiB at 0x82000000. */                             \
+    .ram_size_default   = 64 * MiB,                                          \
+    .kernel_mem_mb      = 32,                                                \
+    .extra_cmdline      = "mmz_allocator=hisi "                              \
+                          "mmz=anonymous,0,0x82000000,32M",                  \
+    /* CV200 kernel uses the DesignWare-derived i2c-hisilicon driver         \
+     * (CON/TAR/DATA_CMD/AUTO/TX_RX layout) rather than HiBVT. */            \
+    .i2c_type           = "hisi-i2c-dw",                                     \
+                                                                             \
+    .ram_base           = 0x80000000,                                        \
+    .sram_base          = 0x04010000,                                        \
+    .sram_size          = 64 * KiB,                                          \
+                                                                             \
+    .use_gic            = false,                                             \
+    .vic_base           = 0x100D0000,                                        \
+                                                                             \
+    .sysctl_base        = 0x20050000,                                        \
+    .crg_base           = 0x20030000,                                        \
+    .pwm                = HISI_PWM_V2,                                   \
+                                                                             \
+    .num_uarts          = 3,                                                 \
+    .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },            \
+    .uart_irqs          = { 5, 30, 25 },                                     \
+                                                                             \
+    .num_timers         = 2,                                                 \
+    .timer_bases        = { 0x20000000, 0x20010000 },                        \
+    .timer_irqs         = { 3, 4 },                                          \
+    .timer_freq         = 3000000,      /* 3 MHz (APB bus / 4) */            \
+                                                                             \
+    .num_spis           = 2,                                                 \
+    .spi_bases          = { 0x200C0000, 0x200E0000 },                        \
+    .spi_irqs           = { 6, 7 },                                          \
+                                                                             \
+    .fmc_ctrl_base      = 0x10010000,                                        \
+    .fmc_mem_base       = 0x58000000,                                        \
+                                                                             \
+    .gpio_base          = 0x20140000,                                        \
+    .gpio_count         = 9,                                                 \
+    .gpio_stride        = 0x10000,                                           \
+    .gpio_irq           = 31,           /* shared for all ports (VIC) */     \
+                                                                             \
+    .dma_base           = 0x10060000,                                        \
+    .dma_irq            = 14,                                                \
+                                                                             \
+    .femac_base         = 0x10090000,                                        \
+    .femac_irq          = 12,                                                \
+                                                                             \
+    .num_himci          = 2,                                                 \
+    .himci_bases        = { 0x10020000, 0x10030000 },                        \
+    .himci_irqs         = { 18, 8 },                                         \
+                                                                             \
+    .num_i2c            = 3,                                                 \
+    .i2c_bases          = { 0x200D0000, 0x20240000, 0x20250000 },            \
+                                                                             \
+    .wdt_base           = 0x20040000,                                        \
+    .wdt_irq            = -1,                                                \
+    .wdt_freq           = 3000000,                                           \
+                                                                             \
+    /*                                                                       \
+     * CRG register defaults — mimic what U-Boot sets before booting Linux.  \
+     * The 4.9 kernel uses DT-based clocks; gate bits must be pre-enabled    \
+     * or the PL011 UART driver can't get its clock and the console is dead. \
+     */                                                                      \
+    .num_crg_defaults   = 4,                                                 \
+    .crg_defaults       = {                                                  \
+        /* UART0/1/2 + SPI0/1 clk enable, UART mux=24MHz */                  \
+        { 0xe4, (1 << 13) | (1 << 14) | (1 << 15) |                          \
+                (1 << 16) | (1 << 17) | (1 << 19) },                         \
+        { 0xc0, (1 << 1) },            /* FMC clk enable */                  \
+        { 0xec, (1 << 1) },            /* ETH clk enable */                  \
+        { 0xc4, (1 << 1) | (1 << 9) }, /* MMC0 + MMC1 clk enable */          \
+    },                                                                       \
+                                                                             \
+    /*                                                                       \
+     * Register bank stubs — vendor .ko modules access video/peripheral      \
+     * hardware during init.  Without mapped regions, reads return 0         \
+     * from QEMU's "unimplemented" handler, causing poll loops to hang.      \
+     */                                                                      \
+    .num_regbanks       = 9,                                                 \
+    .regbanks           = {                                                  \
+        { "hisi-misc",   0x20120000, 0x10000 },                              \
+        { "hisi-ddr",    0x20110000, 0x10000 },                              \
+        { "hisi-pwm",    0x20130000, 0x10000 },                              \
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },                          \
+        { "hisi-nandc",  0x10000000, 0x10000 },                              \
+        { "hisi-viu",    0x20580000, 0x40000 },                              \
+        { "hisi-vpss",   0x20600000, 0x10000 },                              \
+        { "hisi-aiao",   0x20650000, 0x10000 },                              \
+        /* eFuse (hi_cipher.ko hal_efuse.c, the kernel's 0xfe200000):     \
+         * 0x810 command, 0x814 status */                                 \
+        { "hisi-efuse",  0x20100000, 0x1000 },                               \
+    },                                                                       \
+    /* eFuse status: HAL_Efuse_WaitReady wants bits [29:27] = 1 and          \
+     * HAL_Efuse_WaitCipherLoadKey bit 0 (key loaded) before majestic's      \
+     * first cipher job; each waits 50 s per call without them */            \
+    .reg_presets        = { { 0x20100814, 0x08000001 } },                  \
+    /* hi_cipher.ko: REG_BASE_PHY_ADDR_CIPHER, cipher_irq (VIC 13) */         \
+    .cipher_base        = 0x100C0000,                                        \
+    .cipher_irq         = 13,                                                \
+    /* VIU + ISP: "ISP, VIU" on VIC 22 in the camera's /proc/interrupts */   \
+    .viu_irq            = 22,                                                \
+    .vpss_v2_irq        = 17,                   /* "VPSS0" */                \
+    /* hi3518e_vgs.o: VGS_HAL_Open's 0xfe730000 (VPSS's 0xfe700000 is       \
+     * 0x20600000), VGS_DRV_RequestIrq's 29; its HAL is VPSS's node front    \
+     * end (next 0x2fc, START 0x300, status 0x304 / 0x308, node ID 0x1f4) */ \
+    .vgs_v2_base        = 0x20630000,                                        \
+    .vgs_v2_irq         = 29,                                                \
+    /* H.264 (hi3518e_h264e.o) and JPEG (hi3518e_jpege.o): hisi-vedu gen 2   \
+     * ("VEDU_0" VIC 24, "JPEGU_0" 26) */                                    \
+    .vedu_base          = 0x20620000,                                        \
+    .jpge_base          = 0x20660000,                                        \
+    .vedu_irq           = 24,                                                \
+    .jpge_irq           = 26,                                                \
+    .vedu_gen           = 2
+
 static const HisiSoCConfig hi3516cv200_soc = {
+    HISI_CV200_COMMON,
     .name               = "hi3516cv200",
     .desc               = "HiSilicon Hi3516CV200 (ARM926EJ-S)",
-    .cpu_type           = ARM_CPU_TYPE_NAME("arm926"),
-    .soc_id             = HISI_SOC_ID_CV200,
-    .chipid_byte_layout = true,            /* V2: byte-wise SCSYSID0..3 */
     .chip_variant       = 1,               /* 1 = 3516CV200 (vs 2=18EV200, 3=18EV201) */
-    /* V2 RNG_GEN block — different layout from V3+ HISEC_TRNG_CTRL,
-     * data register at +0x004 instead of +0x204. */
-    .hwrng_base         = 0x20280000,
-    .hwrng_data_offset  = 0x004,
-    /* 64 MiB on-chip DDR2 (512Mb).  Kernel gets 32 MiB, vendor mmz.ko
-     * claims the upper 32 MiB at 0x82000000. */
-    .ram_size_default   = 64 * MiB,
-    .kernel_mem_mb      = 32,
-    .extra_cmdline      = "mmz_allocator=hisi "
-                          "mmz=anonymous,0,0x82000000,32M",
-    /* CV200 kernel uses the DesignWare-derived i2c-hisilicon driver
-     * (CON/TAR/DATA_CMD/AUTO/TX_RX layout) rather than HiBVT. */
-    .i2c_type           = "hisi-i2c-dw",
+};
 
-    .ram_base           = 0x80000000,
-    .sram_base          = 0x04010000,
-    .sram_size          = 64 * KiB,
-
-    .use_gic            = false,
-    .vic_base           = 0x100D0000,
-
-    .sysctl_base        = 0x20050000,
-    .crg_base           = 0x20030000,
-
-    .num_uarts          = 3,
-    .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000 },
-    .uart_irqs          = { 5, 30, 25 },
-
-    .num_timers         = 2,
-    .timer_bases        = { 0x20000000, 0x20010000 },
-    .timer_irqs         = { 3, 4 },
-    .timer_freq         = 3000000,      /* 3 MHz (APB bus / 4) */
-
-    .num_spis           = 2,
-    .spi_bases          = { 0x200C0000, 0x200E0000 },
-    .spi_irqs           = { 6, 7 },
-
-    .fmc_ctrl_base      = 0x10010000,
-    .fmc_mem_base       = 0x58000000,
-
-    .gpio_base          = 0x20140000,
-    .gpio_count         = 9,
-    .gpio_stride        = 0x10000,
-    .gpio_irq           = 31,           /* shared for all ports (VIC) */
-
-    .dma_base           = 0x10060000,
-    .dma_irq            = 14,
-
-    .femac_base         = 0x10090000,
-    .femac_irq          = 12,
-
-    .num_himci          = 2,
-    .himci_bases        = { 0x10020000, 0x10030000 },
-    .himci_irqs         = { 18, 8 },
-
-    .num_i2c            = 3,
-    .i2c_bases          = { 0x200D0000, 0x20240000, 0x20250000 },
-
-    .wdt_base           = 0x20040000,
-    .wdt_irq            = -1,
-    .wdt_freq           = 3000000,
-
-    /*
-     * CRG register defaults — mimic what U-Boot sets before booting Linux.
-     * The 4.9 kernel uses DT-based clocks; gate bits must be pre-enabled
-     * or the PL011 UART driver can't get its clock and the console is dead.
-     */
-    .num_crg_defaults   = 4,
-    .crg_defaults       = {
-        /* UART0/1/2 + SPI0/1 clk enable, UART mux=24MHz */
-        { 0xe4, (1 << 13) | (1 << 14) | (1 << 15) |
-                (1 << 16) | (1 << 17) | (1 << 19) },
-        { 0xc0, (1 << 1) },            /* FMC clk enable */
-        { 0xec, (1 << 1) },            /* ETH clk enable */
-        { 0xc4, (1 << 1) | (1 << 9) }, /* MMC0 + MMC1 clk enable */
-    },
-
-    /*
-     * Register bank stubs — vendor .ko modules access video/peripheral
-     * hardware during init.  Without mapped regions, reads return 0
-     * from QEMU's "unimplemented" handler, causing poll loops to hang.
-     */
-    .num_regbanks       = 7,
-    .regbanks           = {
-        { "hisi-misc",   0x20120000, 0x10000 },
-        { "hisi-ddr",    0x20110000, 0x10000 },
-        { "hisi-pwm",    0x20130000, 0x10000 },
-        { "hisi-nandc",  0x10000000, 0x10000 },
-        { "hisi-viu",    0x20580000, 0x40000 },
-        { "hisi-vpss",   0x20600000, 0x10000 },
-        { "hisi-aiao",   0x20650000, 0x10000 },
-    },
+/*
+ * Hi3518EV200: the CV200 die as SCSYSID byte 3 = 2, which ipcinfo and
+ * load_hisilicon read as "hi3518ev200".  The default sensor is a SOI JX-F22
+ * on the DC (parallel) port, i2c0 0x40: the SwitCam HS303 OpenIPC camera
+ * (/etc/sensors/jxf22_i2c_1080p.ini).
+ */
+static const HisiSoCConfig hi3518ev200_soc = {
+    HISI_CV200_COMMON,
+    .name               = "hi3518ev200",
+    .desc               = "HiSilicon Hi3518EV200 (ARM926EJ-S)",
+    .chip_variant       = 2,
+    .default_sensor     = "jxf22",
 };
 
 /*
@@ -701,6 +813,7 @@ static const HisiSoCConfig hi3516av100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .pwm                = HISI_PWM_V2A,
 
     .num_uarts          = 4,
     .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000, 0x20230000 },
@@ -757,11 +870,13 @@ static const HisiSoCConfig hi3516av100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
-    .num_regbanks       = 8,
+    .num_regbanks       = 9,
     .regbanks           = {
         { "hisi-misc",       0x20120000, 0x10000 },
         { "hisi-ddr",        0x20110000, 0x10000 },
         { "hisi-pwm",        0x20130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },
         { "hisi-nandc",      0x10000000, 0x1000  },
         /* USB/SNAND left unmapped — regbanks store poll-bit writes
          * causing infinite loops in EHCI handshake and SPI NAND OP */
@@ -801,6 +916,7 @@ static const HisiSoCConfig hi3516dv100_soc = {
 
     .sysctl_base        = 0x20050000,
     .crg_base           = 0x20030000,
+    .pwm                = HISI_PWM_V2A,
 
     .num_uarts          = 4,
     .uart_bases         = { 0x20080000, 0x20090000, 0x200A0000, 0x20230000 },
@@ -853,11 +969,13 @@ static const HisiSoCConfig hi3516dv100_soc = {
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
 
-    .num_regbanks       = 8,
+    .num_regbanks       = 9,
     .regbanks           = {
         { "hisi-misc",       0x20120000, 0x10000 },
         { "hisi-ddr",        0x20110000, 0x10000 },
         { "hisi-pwm",        0x20130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x200f0000, 0x10000 },
         { "hisi-nandc",      0x10000000, 0x1000  },
         { "hisi-regulator",  0x20270000, 0x1000  },
         { "hisi-viu",        0x20580000, 0x40000 },
@@ -906,6 +1024,7 @@ static const HisiSoCConfig hi3516cv300_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V3,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x12100000, 0x12101000, 0x12102000 },
@@ -945,6 +1064,14 @@ static const HisiSoCConfig hi3516cv300_soc = {
     .wdt_base           = 0x12080000,
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
+
+    /* The PWM block (0x12130000, hi3516cv300.dtsi pwm@12130000) */
+    .num_regbanks       = 2,
+    .regbanks           = {
+        { "hisi-pwm",        0x12130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x12040000, 0x10000 },
+    },
 };
 
 /*
@@ -980,6 +1107,7 @@ static const HisiSoCConfig hi3516ev100_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V3,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x12100000, 0x12101000, 0x12102000 },
@@ -1019,6 +1147,14 @@ static const HisiSoCConfig hi3516ev100_soc = {
     .wdt_base           = 0x12080000,
     .wdt_irq            = -1,
     .wdt_freq           = 3000000,
+
+    /* The PWM block (0x12130000, hi3516cv300.dtsi pwm@12130000) */
+    .num_regbanks       = 2,
+    .regbanks           = {
+        { "hisi-pwm",        0x12130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x12040000, 0x10000 },
+    },
 };
 
 /*
@@ -1081,6 +1217,7 @@ static const HisiSoCConfig hi3516cv500_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4A,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x120A0000, 0x120A1000, 0x120A2000 },
@@ -1151,13 +1288,15 @@ static const HisiSoCConfig hi3516cv500_soc = {
 
     .cpu_srst_offset    = 0x78,         /* REG_CPU_SRST_CRG for SMP bringup */
 
-    .num_regbanks       = 12,
+    .num_regbanks       = 13,
     .regbanks           = {
         { "hisi-misc",       0x12030000, 0x8000  },
         { "hisi-ddr",        0x12060000, 0x10000 },
         { "hisi-iocfg",      0x12040000, 0x10000 },
         { "hisi-iocfg2",     0x10FF0000, 0x10000 },
         { "hisi-pwm",        0x12070000, 0x10000 },
+        /* pad mux bank carrying PWM0/PWM1 (iocfg_reg60/61) */
+        { "hisi-iocfg-vi",   0x111f0000, 0x10000 },
         { "hisi-usb3",       0x100E0000, 0x10000 },
         { "hisi-vi-cap",     0x11300000, 0x100000 },
         { "hisi-vi-proc",    0x11000000, 0x40000 },
@@ -1203,6 +1342,7 @@ static const HisiSoCConfig hi3516av300_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4A,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x120A0000, 0x120A1000, 0x120A2000 },
@@ -1271,13 +1411,15 @@ static const HisiSoCConfig hi3516av300_soc = {
 
     .cpu_srst_offset    = 0x78,
 
-    .num_regbanks       = 18,
+    .num_regbanks       = 19,
     .regbanks           = {
         { "hisi-misc",       0x12030000, 0x8000  },
         { "hisi-ddr",        0x12060000, 0x10000 },
         { "hisi-iocfg",      0x12040000, 0x10000 },
         { "hisi-iocfg2",     0x10FF0000, 0x10000 },
         { "hisi-pwm",        0x12070000, 0x10000 },
+        /* pad mux bank carrying PWM0/PWM1 (iocfg_reg60/61) */
+        { "hisi-iocfg-vi",   0x111f0000, 0x10000 },
         { "hisi-usb3",       0x100E0000, 0x10000 },
         { "hisi-vi-cap",     0x11300000, 0x100000 },
         { "hisi-vi-proc",    0x11000000, 0x40000 },
@@ -1332,6 +1474,7 @@ static const HisiSoCConfig hi3516dv300_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4A,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x120A0000, 0x120A1000, 0x120A2000 },
@@ -1400,13 +1543,15 @@ static const HisiSoCConfig hi3516dv300_soc = {
 
     .cpu_srst_offset    = 0x78,
 
-    .num_regbanks       = 11,
+    .num_regbanks       = 12,
     .regbanks           = {
         { "hisi-misc",       0x12030000, 0x8000  },
         { "hisi-ddr",        0x12060000, 0x10000 },
         { "hisi-iocfg",      0x12040000, 0x10000 },
         { "hisi-iocfg2",     0x10FF0000, 0x10000 },
         { "hisi-pwm",        0x12070000, 0x10000 },
+        /* pad mux bank carrying PWM0/PWM1 (iocfg_reg60/61) */
+        { "hisi-iocfg-vi",   0x111f0000, 0x10000 },
         { "hisi-usb3",       0x100E0000, 0x10000 },
         { "hisi-vi-cap",     0x11300000, 0x100000 },
         { "hisi-vi-proc",    0x11000000, 0x40000 },
@@ -1454,6 +1599,7 @@ static const HisiSoCConfig hi3519v101_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V3A,
 
     .num_uarts          = 5,
     .uart_bases         = { 0x12100000, 0x12101000, 0x12102000,
@@ -1513,12 +1659,14 @@ static const HisiSoCConfig hi3519v101_soc = {
         { 0x04, (24 << 12) | 792 },
     },
 
-    .num_regbanks       = 10,
+    .num_regbanks       = 11,
     .regbanks           = {
         { "hisi-misc",       0x12030000, 0x10000 },
         { "hisi-ddr",        0x12060000, 0x10000 },
         { "hisi-iocfg",      0x12160000, 0x10000 },
         { "hisi-pwm",        0x12130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x12040000, 0x10000 },
         { "hisi-usb-ehci",   0x10120000, 0x10000 },
         { "hisi-usb-ohci",   0x10110000, 0x10000 },
         { "hisi-vi-cap",     0x11380000, 0x100000 },
@@ -1564,6 +1712,7 @@ static const HisiSoCConfig hi3516av200_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V3A,
 
     .num_uarts          = 5,
     .uart_bases         = { 0x12100000, 0x12101000, 0x12102000,
@@ -1619,12 +1768,14 @@ static const HisiSoCConfig hi3516av200_soc = {
         { 0x04, (24 << 12) | 792 },
     },
 
-    .num_regbanks       = 10,
+    .num_regbanks       = 11,
     .regbanks           = {
         { "hisi-misc",       0x12030000, 0x10000 },
         { "hisi-ddr",        0x12060000, 0x10000 },
         { "hisi-iocfg",      0x12160000, 0x10000 },
         { "hisi-pwm",        0x12130000, 0x10000 },
+        /* pad mux (muxctrl_reg*, where ipctool puts the PWM pads) */
+        { "hisi-muxctrl",    0x12040000, 0x10000 },
         { "hisi-usb-ehci",   0x10120000, 0x10000 },
         { "hisi-usb-ohci",   0x10110000, 0x10000 },
         { "hisi-vi-cap",     0x11380000, 0x100000 },
@@ -1699,6 +1850,7 @@ static const HisiSoCConfig hi3516ev300_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x12040000, 0x12041000, 0x12042000 },
@@ -1773,8 +1925,14 @@ static const HisiSoCConfig hi3516ev300_soc = {
      * panic ("VI_COMM_ProcIrqRoute line 1993").  Layout from the
      * V4 family map (also used by the Goke variants via the
      * HISI_V4_COMMON_PERIPH macro) plus EV300-specific IVE. */
-    .num_regbanks       = 5,
+    .num_regbanks       = 9,
     .regbanks           = {
+        /* The PWM block and the three pad-mux banks a lamp's pad is
+         * muxed through (HISI_V4_REGBANK_LIST has them too) */
+        { "hisi-pwm",        0x12080000, 0x10000  },
+        { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
+        { "hisi-iocfg-core", 0x120c0000, 0x10000  },
+        { "hisi-iocfg-ahb",  0x100c0000, 0x10000  },
         { "hisi-vi-cap",     0x11000000, 0x200000 },
         { "hisi-vi-proc",    0x11200000, 0x40000  },
         { "hisi-vgs",        0x11300000, 0x10000  },
@@ -1815,6 +1973,7 @@ static const HisiSoCConfig hi3516ev200_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x12040000, 0x12041000, 0x12042000 },
@@ -1875,8 +2034,14 @@ static const HisiSoCConfig hi3516ev200_soc = {
 
     HISI_V4_VIDEO_PIPE,
 
-    .num_regbanks       = 1,
+    .num_regbanks       = 5,
     .regbanks           = {
+        /* The PWM block and the three pad-mux banks a lamp's pad is
+         * muxed through (HISI_V4_REGBANK_LIST has them too) */
+        { "hisi-pwm",        0x12080000, 0x10000  },
+        { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
+        { "hisi-iocfg-core", 0x120c0000, 0x10000  },
+        { "hisi-iocfg-ahb",  0x100c0000, 0x10000  },
         { "hisi-vgs",        0x11300000, 0x10000  },
     },
 };
@@ -1916,6 +2081,7 @@ static const HisiSoCConfig hi3518ev300_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x12040000, 0x12041000, 0x12042000 },
@@ -1973,6 +2139,16 @@ static const HisiSoCConfig hi3518ev300_soc = {
      * "Uncompress hardware decompress overtime!" before reaching the
      * U-Boot banner.  See openhisilicon#60. */
     .gzip_base          = 0x11310000,
+
+    /* The PWM block and the three pad-mux banks a lamp's pad is muxed
+     * through, as on hi3516ev300 (same die) */
+    .num_regbanks       = 4,
+    .regbanks           = {
+        { "hisi-pwm",        0x12080000, 0x10000  },
+        { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
+        { "hisi-iocfg-core", 0x120c0000, 0x10000  },
+        { "hisi-iocfg-ahb",  0x100c0000, 0x10000  },
+    },
 };
 
 /*
@@ -2007,6 +2183,7 @@ static const HisiSoCConfig hi3516dv200_soc = {
 
     .sysctl_base        = 0x12020000,
     .crg_base           = 0x12010000,
+    .pwm                = HISI_PWM_V4,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x12040000, 0x12041000, 0x12042000 },
@@ -2064,6 +2241,16 @@ static const HisiSoCConfig hi3516dv200_soc = {
      * "Uncompress hardware decompress overtime!" before reaching the
      * U-Boot banner.  See openhisilicon#60. */
     .gzip_base          = 0x11310000,
+
+    /* The PWM block and the three pad-mux banks a lamp's pad is muxed
+     * through, as on hi3516ev300 (same die) */
+    .num_regbanks       = 4,
+    .regbanks           = {
+        { "hisi-pwm",        0x12080000, 0x10000  },
+        { "hisi-iocfg-vio",  0x112c0000, 0x10000  },
+        { "hisi-iocfg-core", 0x120c0000, 0x10000  },
+        { "hisi-iocfg-ahb",  0x100c0000, 0x10000  },
+    },
 };
 
 /*
@@ -2144,6 +2331,7 @@ static const HisiSoCConfig hi3516dv200_soc = {
     .gic_num_spi        = 128,                              \
     .sysctl_base        = 0x12020000,                       \
     .crg_base           = 0x12010000,                       \
+    .pwm                = HISI_PWM_V4,                  \
     .num_uarts          = 3,                                \
     .uart_bases         = { 0x12040000, 0x12041000, 0x12042000 }, \
     .uart_irqs          = { 7, 8, 9 },                     \
@@ -2325,9 +2513,17 @@ static const HisiSoCConfig gk7205v500_soc = {
     .name               = "gk7205v500",
     .desc               = "Goke GK7205V500 (Cortex-A7, 0.5 TOPS NPU)",
     .soc_id             = GOKE_SOC_ID_7205V500,
+    /* Boot ROM speaks the HiSilicon V500 UART protocol — the same BD-00-FF-01
+     * handshake + plaintext-header verify as the gk7206, replying with soc_id.
+     * Modelled by analogy with the gk7206 (hardware-verified there); defib
+     * routes the whole gk7205v5x0 family to HiSiliconV500, and chip id
+     * 0x72050510 was read off a real GK7205V510 via this handshake. */
+    .fastboot_v500      = true,
+    .xm_die_code        = 6,               /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 MCP */
     HISI_V4_COMMON_PERIPH,
+    .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
 };
@@ -2336,20 +2532,46 @@ static const HisiSoCConfig gk7205v510_soc = {
     .name               = "gk7205v510",
     .desc               = "Goke GK7205V510 (Cortex-A7, 1.0 TOPS NPU)",
     .soc_id             = GOKE_SOC_ID_7205V510,
-    .gpio_count         = 8,
+    .fastboot_v500      = true,            /* V500 UART boot ROM (see gk7205v500) */
+    .default_sensor     = "mis2009",       /* Zenointel SD-2N-4G, i2c0 0x30 */
+    .xm_die_code        = 7,               /* SYSCTRL+0x18 [7:4] */
+    /* The vendor xm720xxx DTS has a PL061 at 0x120b8000 (SPI 24), and
+     * boards use GPIO 64-73 (Zenointel SD-2N-4G: reset key 64, PTZ
+     * steppers 69/72/73).  GPIO8_0 is that reset key, active low with a
+     * board pull-up: read as 0 the vendor sys daemon sees it held,
+     * restores defaults and reboots, and U-Boot then erases config. */
+    .gpio_count         = 10,
+    .gpio_input_high    = { [8] = 0x01 },
+    /* xm720xxx DTS: VI_CAP 0x11000000 / VI_PROC 0x11200000 (SPI 43 / 44),
+     * VPSS 0x11400000 (SPI 46) -- the V4 EV200/EV300 media map. */
+    HISI_V4_VIDEO_PIPE,
     HISI_V4_DDR_128M,               /* 1Gb DDR3 MCP */
     HISI_V4_COMMON_PERIPH,
+    .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
+    /* USB 2.0 host (xm720xxx DTS usb3-0/dwc3@0x10030000): DWC3, SPI 39,
+     * dr_mode "host", as on gk7205v200.  The SD-2N-4G's LTE modem is on
+     * it; without the controller the vendor app's wireless code finds no
+     * USB devices. */
+    .xhci_base          = 0x10030000,
+    .xhci_irq           = 39,
+    .xhci_dwc3_core     = true,
+    /* xm720xxx DTS vgs@11300000, SPI 49: xm_vgs.ko's VGS_HAL_* front end
+     * (next node 0xf8, start 0x300, int 0x310 / 0x314) is hisi-vgs */
+    .vgs_irq            = 49,
 };
 
 static const HisiSoCConfig gk7205v530_soc = {
     .name               = "gk7205v530",
     .desc               = "Goke GK7205V530 (Cortex-A7, 1.0 TOPS NPU, ext DDR)",
     .soc_id             = GOKE_SOC_ID_7205V530,
+    .fastboot_v500      = true,            /* V500 UART boot ROM (see gk7205v500) */
+    .xm_die_code        = 8,               /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_128M,               /* external DDR, 128 MiB typical */
     HISI_V4_COMMON_PERIPH,
+    .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* goke V500 kernel uses xmedia,sp804 */
 };
@@ -2358,9 +2580,11 @@ static const HisiSoCConfig gk7202v330_soc = {
     .name               = "gk7202v330",
     .desc               = "Goke GK7202V330 (Cortex-A7, 0.5 TOPS NPU, no FEPHY)",
     .soc_id             = GOKE_SOC_ID_7202V330,
+    .xm_die_code        = 12,              /* SYSCTRL+0x18 [7:4] */
     .gpio_count         = 8,
     HISI_V4_DDR_64M,                /* 512Mb DDR2 MCP */
     HISI_V4_COMMON_PERIPH,
+    .pwm                = HISI_PWM_GK500, /* twelve channels */
     HISI_V4_NPU_REGBANKS,
     .xmsp804_timer      = true,     /* same GK7205V500 register family / goke V500 kernel */
 };
@@ -2439,6 +2663,7 @@ static const HisiSoCConfig gk7202v330_soc = {
     .default_cpus       = 2,            /* 2 GIC CPU interfaces (ITARGETSR !RAZ) */ \
     .gpio_count         = 9,            /* GPIO0..GPIO8 @ 0x120b0000..0x120b8000 (DTS) */ \
     HISI_V4_COMMON_PERIPH,                                                     \
+    .pwm                = { 0 },        /* not modelled: plain regbank */      \
     /* 9 GPIO banks on GIC SPI 22..30 (DTS gpio_chip irqs 0x16..0x1e).  Must   \
      * follow the macro, which sets the wrong V4 gpio_irq_start=16 — a 16-base \
      * would put GPIO3..5 on 19..21 and clobber the SPIs below. */             \
@@ -2451,6 +2676,13 @@ static const HisiSoCConfig gk7202v330_soc = {
     .gzip_layout        = 1,                                                   \
     /* SYSSTAT[1:0] boot device (arch-xmorca/platform.h get_sys_boot_mode). */ \
     .sysstat_boot_dev   = true,                                                \
+    /* Boot ROM speaks the HiSilicon V500 UART download protocol.  Verified   \
+     * on an XM IVG-K8 (GK7206V11A): the ROM answers the BD-00-FF-01 handshake \
+     * with its soc_id, then does a PLAINTEXT-header verify of the uploaded    \
+     * key area (magic 0x12345678, not RSA) — "Verify key fail" without it,    \
+     * "Bootrom success" with it (both seen on hardware).  In fastboot mode    \
+     * (no -kernel/-bios/flash) the model reproduces both branches. */         \
+    .fastboot_v500      = true,                                                \
     /* DTS ethernet@100d0000 irq 0x25.  V4 common's femac_irq=33 is both wrong \
      * for orca and collides with sdhci mmc1 (also 33) below. */               \
     .femac_irq          = 37,                                                  \
@@ -2767,6 +2999,7 @@ static const HisiSoCConfig hi3516cv608_soc = {
 
     .sysctl_base        = 0x11020000,
     .crg_base           = 0x11010000,
+    .pwm                = HISI_PWM_V5,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x11040000, 0x11041000, 0x11042000 },
@@ -2879,6 +3112,7 @@ static const HisiSoCConfig hi3516cv610_soc = {
 
     .sysctl_base        = 0x11020000,
     .crg_base           = 0x11010000,
+    .pwm                = HISI_PWM_V5,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x11040000, 0x11041000, 0x11042000 },
@@ -2988,6 +3222,7 @@ static const HisiSoCConfig hi3516cv613_soc = {
 
     .sysctl_base        = 0x11020000,
     .crg_base           = 0x11010000,
+    .pwm                = HISI_PWM_V5,
 
     .num_uarts          = 3,
     .uart_bases         = { 0x11040000, 0x11041000, 0x11042000 },
@@ -4208,6 +4443,12 @@ static const HisiSoCConfig hi3536cv100_soc = {
     .gmac_base          = 0x100a0000,
     .gmac_irq           = 16,
     .gmac_desc_size     = 16,
+    /* The HiGMAC PHY MDIO address is left at the "phy-addr" property default
+     * (1), which is what the OpenIPC hi3536cv100 firmware straps and what the
+     * CI boot/ping gate expects.  Xiongmai NVR DTs
+     * (arch/arm/boot/dts/hi3536c*.dtsi) wire it at mdio@100a03c0/ethernet-phy@2
+     * instead; boot such a dump with -global hisi-gmac.phy-addr=2
+     * (qemu-boot/nvr-camera-lab.sh sets this for an hi3536cv100 NVR). */
 
     .num_i2c            = 1,
     .i2c_bases          = { 0x120c0000 },
@@ -5518,6 +5759,7 @@ static void hisilicon_common_init(MachineState *machine,
     int num_pic = 0;
     int n;
     SysBusDevice *fmc_irq_dev = NULL; /* FMC, IRQ-connected after pic[] is built */
+    DeviceState *crg_dev = NULL;      /* hisi-pwm takes its soft reset */
     bool flash_boot = false;  /* true when booting from SPI NOR flash dump */
     bool fmc_nand_boot = false; /* true when the FMC boot flash is SPI NAND */
     bool bios_boot = machine->firmware && machine->firmware[0];
@@ -5894,6 +6136,30 @@ static void hisilicon_common_init(MachineState *machine,
             qdev_connect_gpio_out_named(sysctl, "remap-clear", 0,
                 qemu_allocate_irq(hisilicon_maskrom_remap, maskrom, 0));
         }
+        if (c->xm_die_code) {
+            /*
+             * Power-on value: the first reset captures it (por_regs).
+             * The die code is fused too: the OTP block at 0x100a0000
+             * (xm720 xm_sys.ko SYS_HAL_Init maps it), word 0x28 bits
+             * [7:4].  The vendor xm_sys.ko's SYS_ModInit accepts only
+             * xm720 codes there; otherwise it prints "SDK version do NOT
+             * support this chip!!!" and stays down, and VI_SetDevAttr then
+             * fails SYS_NOTREADY (0xa0108010).  xm_pm.ko reads its
+             * tsensor trim from the same block (+0x2c).
+             */
+            DeviceState *otp = qdev_new("hisi-regbank");
+
+            address_space_stl(&address_space_memory, c->sysctl_base + 0x18,
+                              (uint32_t)c->xm_die_code << 4,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+            qdev_prop_set_uint32(otp, "size", 0x10000);
+            qdev_prop_set_string(otp, "name", "xm720-otp");
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(otp), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(otp), 0, 0x100a0000);
+            address_space_stl(&address_space_memory, 0x100a0028,
+                              (uint32_t)c->xm_die_code << 4,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+        }
 
         /*
          * Pinstrap injection for -bios mask-ROM runs.  Real silicon
@@ -5963,6 +6229,11 @@ static void hisilicon_common_init(MachineState *machine,
     /* CRG — same caveat as sysctl: STB family uses a different layout. */
     if (c->crg_base) {
         DeviceState *crg = qdev_new("hisi-crg");
+        crg_dev = crg;
+        if (c->pwm.channels && c->pwm.reset_mask) {
+            qdev_prop_set_uint32(crg, "pwm-rst-offset", c->pwm.crg_offset);
+            qdev_prop_set_uint32(crg, "pwm-rst-mask", c->pwm.reset_mask);
+        }
         if (c->cpu_srst_offset) {
             qdev_prop_set_uint32(crg, "cpu-srst-offset", c->cpu_srst_offset);
         }
@@ -6186,6 +6457,9 @@ static void hisilicon_common_init(MachineState *machine,
         if (c->gmac_rx_offset) {
             qdev_prop_set_uint32(gmac, "rx-pkt-offset", c->gmac_rx_offset);
         }
+        if (c->gmac_phy_addr) {
+            qdev_prop_set_uint8(gmac, "phy-addr", c->gmac_phy_addr);
+        }
         SysBusDevice *busdev = SYS_BUS_DEVICE(gmac);
         sysbus_realize_and_unref(busdev, &error_fatal);
         sysbus_mmio_map(busdev, 0, c->gmac_base);
@@ -6309,7 +6583,7 @@ static void hisilicon_common_init(MachineState *machine,
      * what VI's statistics measure and VPSS's pictures show.
      */
     DeviceState *scene = NULL;
-    if (c->vi_cap_base || c->lotus_media) {
+    if (c->vi_cap_base || c->lotus_media || c->viu_irq) {
         scene = qdev_new("hisi-scene");
         object_property_add_child(OBJECT(machine), "scene", OBJECT(scene));
         qdev_realize_and_unref(scene, NULL, &error_fatal);
@@ -6317,6 +6591,14 @@ static void hisilicon_common_init(MachineState *machine,
 
     /* VI: capture and the ISP pipe, the online pipeline's frame clock */
     DeviceState *vi = NULL;
+    DeviceState *viu = NULL;            /* CV200: capture + ISP in one */
+    hwaddr viu_base = 0;
+    if (c->viu_irq) {
+        viu = qdev_new("hisi-viu");
+        object_property_set_link(OBJECT(viu), "scene", OBJECT(scene),
+                                 &error_fatal);
+        object_property_add_child(OBJECT(machine), "viu", OBJECT(viu));
+    }
     DeviceState *lotus_vpss = NULL;     /* lotus media: VPSS paints */
     if (c->vi_cap_base) {
         vi = qdev_new("hisi-vi");
@@ -6541,6 +6823,76 @@ static void hisilicon_common_init(MachineState *machine,
                 continue;
             }
 
+            /* CV200: VPSS is a node engine (hisi-vpss-v2) behind VI offline */
+            if (c->vpss_v2_irq && !strcmp(c->regbanks[n].name,
+                                          "hisi-vpss")) {
+                DeviceState *v2 = qdev_new("hisi-vpss-v2");
+                object_property_add_child(OBJECT(machine), "vpss",
+                                          OBJECT(v2));
+                if (viu) {      /* online: VIU's frames drive it */
+                    object_property_set_link(OBJECT(v2), "viu", OBJECT(viu),
+                                             &error_fatal);
+                }
+                sysbus_realize(SYS_BUS_DEVICE(v2), &error_fatal);
+                sysbus_mmio_map(SYS_BUS_DEVICE(v2), 0, c->regbanks[n].base);
+                sysbus_connect_irq(SYS_BUS_DEVICE(v2), 0,
+                                   pic[c->vpss_v2_irq]);
+                continue;
+            }
+            /* CV200: VIU + ISP (hisi-viu), realized once the sensor is
+             * linked to it, after this loop */
+            if (viu && !strcmp(c->regbanks[n].name, "hisi-viu")) {
+                viu_base = c->regbanks[n].base;     /* mapped once linked */
+                continue;
+            }
+
+            /*
+             * VGS: the engine behind VPSS's extended channels, where a SoC
+             * gives its interrupt (hisi-vgs: the node-list contract of
+             * HiSilicon's V4 / V5 vgs drivers and XMedia's xm720 xm_vgs.ko).
+             * Without one it stays a register bank nothing drives.
+             */
+            if (c->vgs_irq && !strcmp(c->regbanks[n].name, "hisi-vgs")) {
+                DeviceState *vgs = qdev_new("hisi-vgs");
+                SysBusDevice *busdev = SYS_BUS_DEVICE(vgs);
+                sysbus_realize_and_unref(busdev, &error_fatal);
+                sysbus_mmio_map(busdev, 0, c->regbanks[n].base);
+                sysbus_connect_irq(busdev, 0, pic[c->vgs_irq]);
+                continue;
+            }
+
+            /* PWM: a working controller where the SoC says which one */
+            if (!strcmp(c->regbanks[n].name, "hisi-pwm") && c->pwm.channels) {
+                const HisiPwmConfig *p = &c->pwm;
+                DeviceState *pwm = qdev_new("hisi-pwm");
+                qdev_prop_set_uint32(pwm, "size", c->regbanks[n].size);
+                qdev_prop_set_uint32(pwm, "layout", p->layout);
+                qdev_prop_set_uint32(pwm, "channels", p->channels);
+                qdev_prop_set_bit(pwm, "edge-latch", p->edge_latch);
+                if (p->crg_offset) {
+                    qdev_prop_set_uint64(pwm, "crg-addr",
+                                         c->crg_base + p->crg_offset);
+                }
+                qdev_prop_set_uint32(pwm, "gate-mask", p->gate_mask);
+                qdev_prop_set_uint32(pwm, "reset-mask", p->reset_mask);
+                qdev_prop_set_uint32(pwm, "mux-shift", p->mux_shift);
+                qdev_prop_set_uint32(pwm, "mux-width", p->mux_width);
+                qdev_prop_set_uint32(pwm, "rate0", p->rates[0]);
+                qdev_prop_set_uint32(pwm, "rate1", p->rates[1]);
+                qdev_prop_set_uint32(pwm, "rate2", p->rates[2]);
+                qdev_prop_set_uint32(pwm, "rate3", p->rates[3]);
+                qdev_prop_set_uint32(pwm, "cfg0-reset", p->cfg0_reset);
+                qdev_prop_set_uint32(pwm, "cfg1-reset", p->cfg1_reset);
+                object_property_add_child(OBJECT(machine), "pwm", OBJECT(pwm));
+                sysbus_realize_and_unref(SYS_BUS_DEVICE(pwm), &error_fatal);
+                sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 0, c->regbanks[n].base);
+                if (crg_dev && p->reset_mask) {
+                    qdev_connect_gpio_out_named(crg_dev, "pwm-reset", 0,
+                        qdev_get_gpio_in_named(pwm, "reset", 0));
+                }
+                continue;
+            }
+
             DeviceState *rb = qdev_new("hisi-regbank");
             bool dwc3 = c->xhci_dwc3_core &&
                         c->regbanks[n].base == c->xhci_base;
@@ -6606,6 +6958,18 @@ static void hisilicon_common_init(MachineState *machine,
             }
         }
     }
+    if (c->cipher_base) {
+        DeviceState *ci = qdev_new("hisi-cipher");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ci), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ci), 0, c->cipher_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(ci), 0, pic[c->cipher_irq]);
+    }
+
+    for (n = 0; n < HISI_MAX_REG_PRESETS && c->reg_presets[n].addr; n++) {
+        address_space_stl(&address_space_memory, c->reg_presets[n].addr,
+                          c->reg_presets[n].value, MEMTXATTRS_UNSPECIFIED,
+                          NULL);
+    }
 
     /* Sensor auto-attach via -machine sensor=<name>
      *
@@ -6644,6 +7008,10 @@ static void hisilicon_common_init(MachineState *machine,
             DeviceState *sensor = image_sensor_create(
                 I2C_BUS(qdev_get_child_bus(i2c_devs[0], "i2c")), sensor_name);
 
+            if (viu && sensor) {
+                object_property_set_link(OBJECT(viu), "sensor",
+                                         OBJECT(sensor), &error_fatal);
+            }
             if (vi && sensor) {
                 /* the ISP's statistics measure the sensor's exposure */
                 object_property_set_link(OBJECT(vi), "sensor",
@@ -6659,6 +7027,24 @@ static void hisilicon_common_init(MachineState *machine,
                          "or matching SPI controller", sensor_name);
             exit(1);
         }
+    }
+
+    if (viu) {
+        sysbus_realize(SYS_BUS_DEVICE(viu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(viu), 0, viu_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(viu), 0, pic[c->viu_irq]);
+    }
+
+    /* CV200 VGS: VPSS's extended channels wait on its jobs, and a frame
+     * whose job never ends stays out of the pool (vendor apps that open
+     * an extended channel stop after the pool's last block) */
+    if (c->vgs_v2_irq) {
+        DeviceState *vgs = qdev_new("hisi-vpss-v2");
+
+        object_property_add_child(OBJECT(machine), "vgs", OBJECT(vgs));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vgs), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vgs), 0, c->vgs_v2_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(vgs), 0, pic[c->vgs_v2_irq]);
     }
 
     if (flash_boot) {
@@ -6731,7 +7117,8 @@ static void hisilicon_common_init(MachineState *machine,
         DeviceState *fb = qdev_new(TYPE_HISI_FASTBOOT);
         qdev_prop_set_chr(fb, "chardev", serial_hd(0));
         hisi_fastboot_setup(fb, CPU(cpu[0]), serial_hd(0),
-                            c->uart_bases[0], uart0_irq);
+                            c->uart_bases[0], uart0_irq,
+                            c->fastboot_v500, c->soc_id);
         qdev_realize(fb, NULL, &error_fatal);
 
         CPUState *cs = CPU(cpu[0]);
@@ -6890,6 +7277,7 @@ DEFINE_HISI_MACHINE("hi3518av100", hi3518av100, hi3518av100_soc)
 DEFINE_HISI_MACHINE("hi3518cv100", hi3518cv100, hi3518cv100_soc)
 DEFINE_HISI_MACHINE("hi3518ev100", hi3518ev100, hi3518ev100_soc)
 DEFINE_HISI_MACHINE("hi3516cv200", hi3516cv200, hi3516cv200_soc)
+DEFINE_HISI_MACHINE("hi3518ev200", hi3518ev200, hi3518ev200_soc)
 DEFINE_HISI_MACHINE("hi3516av100", hi3516av100, hi3516av100_soc)
 DEFINE_HISI_MACHINE("hi3516dv100", hi3516dv100, hi3516dv100_soc)
 DEFINE_HISI_MACHINE("hi3516cv300", hi3516cv300, hi3516cv300_soc)

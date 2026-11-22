@@ -304,15 +304,19 @@ size_t jpeg_enc_scan(const uint8_t *y, int ys, const uint8_t *cb,
                               out, cap, overflow);
 }
 
-size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
-                          const uint8_t *cr, int cs, int w, int h,
-                          const uint8_t ql[64], const uint8_t qc[64],
-                          bool chroma_luma_huff, bool eoi,
-                          uint8_t *out, size_t cap, bool *overflow)
+/* 4:2:0 (v2: 16x16 MCUs, chroma half high) or 4:2:2 (16x8, chroma full
+ * height) */
+static size_t jpeg_enc_scan_sub(const uint8_t *y, int ys, const uint8_t *cb,
+                                const uint8_t *cr, int cs, int w, int h,
+                                const uint8_t ql[64], const uint8_t qc[64],
+                                bool chroma_luma_huff, bool v2, bool eoi,
+                                uint8_t *out, size_t cap, bool *overflow)
 {
     BitWriter bw = { .buf = out, .cap = cap };
     int dc[3] = { 0, 0, 0 }, mx, my;
-    const int mbw = (w + 15) / 16, mbh = (h + 15) / 16;
+    const int mh = v2 ? 16 : 8;
+    const int mbw = (w + 15) / 16, mbh = (h + mh - 1) / mh;
+    const int ch = v2 ? (h + 1) / 2 : h;
 
     huff_init();
     for (my = 0; my < mbh; my++) {
@@ -320,8 +324,8 @@ size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
             float blk[64];
             int b, bx, by;
 
-            for (b = 0; b < 4; b++) {               /* Y: 2x2 blocks */
-                const int ox = mx * 16 + (b & 1) * 8, oy = my * 16 + (b >> 1) * 8;
+            for (b = 0; b < (v2 ? 4 : 2); b++) {    /* Y: 2x2 or 2x1 blocks */
+                const int ox = mx * 16 + (b & 1) * 8, oy = my * mh + (b >> 1) * 8;
                 for (by = 0; by < 8; by++) {
                     for (bx = 0; bx < 8; bx++) {
                         blk[by * 8 + bx] = px_at(y, ys, w, h, ox + bx,
@@ -334,8 +338,8 @@ size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
                 const uint8_t *p = b ? cr : cb;
                 for (by = 0; by < 8; by++) {
                     for (bx = 0; bx < 8; bx++) {
-                        blk[by * 8 + bx] = px_at(p, cs, (w + 1) / 2,
-                                                 (h + 1) / 2, mx * 8 + bx,
+                        blk[by * 8 + bx] = px_at(p, cs, (w + 1) / 2, ch,
+                                                 mx * 8 + bx,
                                                  my * 8 + by) - 128.0f;
                     }
                 }
@@ -351,4 +355,30 @@ size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
     }
     *overflow = bw.overflow;
     return bw.n;
+}
+
+size_t jpeg_enc_scan_huff(const uint8_t *y, int ys, const uint8_t *cb,
+                          const uint8_t *cr, int cs, int w, int h,
+                          const uint8_t ql[64], const uint8_t qc[64],
+                          bool chroma_luma_huff, bool eoi,
+                          uint8_t *out, size_t cap, bool *overflow)
+{
+    return jpeg_enc_scan_sub(y, ys, cb, cr, cs, w, h, ql, qc,
+                             chroma_luma_huff, true, eoi, out, cap, overflow);
+}
+
+size_t jpeg_enc_scan_422(const uint8_t *y, int ys, const uint8_t *cb,
+                         const uint8_t *cr, int cs, int w, int h,
+                         const uint8_t ql[64], const uint8_t qc[64], bool eoi,
+                         uint8_t *out, size_t cap, bool *overflow)
+{
+    return jpeg_enc_scan_sub(y, ys, cb, cr, cs, w, h, ql, qc, false, false,
+                             eoi, out, cap, overflow);
+}
+
+void jpeg_enc_dezigzag(const uint8_t zz[64], uint8_t natural[64])
+{
+    for (int i = 0; i < 64; i++) {
+        natural[zigzag[i]] = zz[i];
+    }
 }

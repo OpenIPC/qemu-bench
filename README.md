@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 33 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-arm` — 34 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (140 total)
+## Supported Machines (142 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -40,6 +40,7 @@ Builds three QEMU targets:
 | `hi3518cv100` | V1 | ARM926EJ-S | VIC | 3.0.8 | yes |
 | `hi3518ev100` | V1 | ARM926EJ-S | VIC | 3.0.8 | yes |
 | `hi3516cv200` | V2 | ARM926EJ-S | VIC | 4.9.37 | yes |
+| `hi3518ev200` | V2 | ARM926EJ-S | VIC | 4.9.37 | yes |
 | `hi3516av100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516dv100` | V2A | Cortex-A7 | GIC | 4.9.37 | yes |
 | `hi3516cv300` | V3 | ARM926EJ-S | VIC | 3.18.20 | yes |
@@ -146,6 +147,7 @@ modelled yet.
 | `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
+| `xm232` | ARMv7 (A9 stand-in), UP | GIC | 3.10.103 vendor | yes⁵ |
 | `xm8536e` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 | `xm8520d` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 | `xm8521dv200` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
@@ -193,6 +195,14 @@ with `-M xm550,flash-file=dump.bin -smp 2`. Dumps of XM530V200, XM533 and
 XM535 cameras boot the same way on `xm530v200` (`-smp 2`), `xm533` and
 `xm535`, through their vendor U-Boot and kernel to Sofia. Their kernels
 print only with `xmuart=0` in the saved U-Boot environment.
+
+⁵ `xm232`: flash boot of an XM232 camera dump (X6S-WEQ-H): vendor U-Boot,
+kernel and Sofia, which streams H.264 (H.265 with the product config
+allowing it) over RTSP from a test picture (two lenses time-multiplexed
+on one VI and spliced, ISP statistics, the HEVC / H.264 engine with its
+OSD and JPEG snapshots, the NN accelerator), with audio and its
+ATBM6132CU Wi-Fi + BLE (`atbm-wifi` with `chip-version=0x30`). See
+[docs/xiongmai.md](docs/xiongmai.md#xm232).
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,
@@ -744,7 +754,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 140 machines build and register. Every machine marked "yes" above boots
+All 142 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -808,7 +818,7 @@ arithmetic fitted against a CV608 board (`docs/ive-registers.md`, "V5").
 
 ```
 qemu/
-├── hw/arm/hisilicon.c           # HiSilicon/Goke-rebrand machines (48)
+├── hw/arm/hisilicon.c           # HiSilicon/Goke-rebrand machines (50)
 ├── hw/misc/hisi-sysctl.c        # SysCtrl (SoC ID, reset, general registers)
 ├── hw/misc/hisi-crg.c           # CRG clock/reset stub
 ├── hw/misc/hisi-fmc.c           # HiFMC V100 flash controller (CV200+, flash-file for dumps)
@@ -1189,6 +1199,9 @@ bash qemu-boot/run-gk7205v510-nand.sh nand-dump.bin
 bash qemu-boot/mk-ev300-nand.sh        # u-boot + release rootfs.ubi (UBIFS, /boot/fitImage)
 bash qemu-boot/run-ev300-nand.sh
 ```
+
+A stock Zenointel SD-2N-4G dump (MIS2009 sensor) boots the same way and
+streams H.264; add `-icount shift=0`.
 
 `nand-jedec` overrides the READ-ID and `nand-oob-size` the spare-area size
 (128 for GD5F1GM7, 64 for W25N01GV) for firmware whose ID table differs —

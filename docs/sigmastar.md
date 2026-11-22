@@ -86,6 +86,18 @@ whole SPI NOR; erases and programs go back to it, so boot a copy.
 `-kernel` boots a kernel directly; the vendor kernel builds its device tree
 from the ATAGs (`atags_to_fdt`).
 
+A Xiongmai NVR prints on the kernel console only with `xmuart=0` in the U-Boot
+environment (`qemu-boot/sstar-env.py nvr.bin xmuart=0`); without it the flash-file
+boot is silent after `Starting kernel`, though the stack still comes up — a
+later 16-channel build (NBD80S16S, `V4.03.R11.7601`, App built 2026-04-08) boots
+to its full XM services this way, answering DVRIP on `192.168.1.9:34567`.
+To watch the whole boot on an image kept byte-for-byte as shipped (no env edit),
+`qemu-boot/mstar-nvr-boot.sh --flash nvr.bin` instead boots the vendor `uImage`
+with the exact bootargs recovered read-only from the dump's own U-Boot default
+environment (the `nor0:` `mtdparts`, `console=ttyS0`, and the expanded
+`mma_heap=` reservations), leaving a live console; `--check` self-tests that the
+NVR userspace reaches "running".
+
 ## Iford (`ssc029`)
 
 Iford is a later generation than the other dies here. Linux is 5.10 and

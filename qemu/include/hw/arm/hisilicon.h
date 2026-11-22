@@ -26,6 +26,7 @@
 #define HISI_MAX_I2C      8
 #define HISI_MAX_REGBANKS 20
 #define HISI_MAX_CRG_DEFAULTS 8
+#define HISI_MAX_REG_PRESETS 8
 #define HISI_MAX_GPIO_EXTRAS 4
 
 typedef struct HisiRegbankEntry {
@@ -33,6 +34,25 @@ typedef struct HisiRegbankEntry {
     hwaddr      base;     /* 0 = skip */
     uint32_t    size;
 } HisiRegbankEntry;
+
+/*
+ * The PWM controller (hisi-pwm), one per SoC.  channels == 0 leaves a
+ * "hisi-pwm" regbank entry a plain register bank.  The clock word is
+ * crg_offset into the CRG, or none at all when crg_offset is 0; the
+ * model reads it on every access, so whatever the guest writes there is
+ * what gates and clocks the block.
+ */
+typedef struct HisiPwmConfig {
+    uint8_t     layout;      /* 0 classic 0x20, 1 av100 split bank, 2 V5 */
+    uint8_t     channels;
+    bool        edge_latch;  /* V1: the duty loads on the enable edge only */
+    uint32_t    crg_offset;
+    uint32_t    gate_mask;   /* bits that must be set for a clock */
+    uint32_t    reset_mask;  /* bits that hold the block in reset */
+    uint8_t     mux_shift, mux_width;
+    uint32_t    rates[4];    /* Hz per mux value; rates[0] without a mux */
+    uint32_t    cfg0_reset, cfg1_reset;
+} HisiPwmConfig;
 
 typedef struct HisiSoCConfig {
     const char     *name;
@@ -228,6 +248,9 @@ typedef struct HisiSoCConfig {
     /* RX DMA offset (NET_IP_ALIGN) the MAC writes each frame at.  0 (default)
      * for hi_gmac_v200; 2 for the gmac-v5 driver (Hi3519DV500/Hi3516DV500). */
     int             gmac_rx_offset;
+    /* MDIO address of the emulated PHY (0 = device default of 1).  Set to 2
+     * for hi3536cv100, whose NVR device trees place the PHY there. */
+    int             gmac_phy_addr;
 
     /* SD/MMC — himciv200 (older SoCs) */
     int             num_himci;
@@ -274,7 +297,7 @@ typedef struct HisiSoCConfig {
      * the Hi3516EV200 family; 5 = Hi3516CV610 */
     uint8_t         media_gen;
     /* hisi-vedu's own layout when it differs from media_gen's (0: the
-     * same): 7 = GK7206 / Xiongmai xmorca */
+     * same): 2 = Hi3516CV200 / Hi3518EV200, 7 = GK7206 / Xiongmai xmorca */
     uint8_t         vedu_gen;
     /* CRG reset handshakes: request registers whose bit 0 the next one
      * echoes (hisi-crg "rst-ack"); 0 ends the list */
@@ -311,6 +334,36 @@ typedef struct HisiSoCConfig {
     /* SYSSTAT[1:0] is the boot device strap (00 eMMC 4-bit, 01 SPI NOR,
      * 10 eMMC 8-bit, 11 SPI NAND), as on Goke xmorca / GK7206. */
     bool            sysstat_boot_dev;
+    /* Boot ROM UART-download protocol used in fastboot mode (no -kernel,
+     * no flash).  false = the classic HiSilicon protocol (ROM sends 0x20,
+     * host uploads DDR/SPL/U-Boot).  true = the HiSilicon V500 protocol
+     * the Goke GK7206 ROM speaks: the host sends the BD-00-FF-01 handshake,
+     * the ROM replies with its chip id (= soc_id) and then does a plaintext
+     * verify of the uploaded key/HEAD area (magic 0x12345678, not RSA) —
+     * "Verify key fail" without it, "Bootrom success" with it.  The model
+     * reproduces both branches.  See hisi-fastboot.c. */
+    bool            fastboot_v500;
+    /* XMedia xm720 die code, SYSCTRL+0x18 bits [7:4].  The xm720xxx
+     * kernel's get_chipid() maps it to the chip ID (6 GK7205V500, 7 V510,
+     * 8 V530, 12 GK7202V330) and returns 0 for 0; xm_pm.ko then refuses
+     * to load, and xm_vi / xm_venc with it.  0 = not stored. */
+    uint8_t         xm_die_code;
+    /* VGS interrupt (GIC SPI): instantiate hisi-vgs for the "hisi-vgs"
+     * register bank instead of a stub.  0 = stub. */
+    uint32_t        vgs_irq;
+    /* CIPHER v1 (hisi-cipher, the CV200 family's hi_cipher.ko): 0 = none */
+    hwaddr          cipher_base;
+    int             cipher_irq;
+    /* CV200 VIU + ISP (hisi-viu) over the "hisi-viu" bank: its VIC line,
+     * 0 = the bank stays a stub */
+    int             viu_irq;
+    /* CV200 VPSS node engine (hisi-vpss-v2) over the "hisi-vpss" bank:
+     * its VIC line, 0 = the bank stays a stub */
+    int             vpss_v2_irq;
+    /* CV200 VGS: the same node front end (a second hisi-vpss-v2), which
+     * VPSS's extended channels go through; 0 = absent */
+    hwaddr          vgs_v2_base;
+    int             vgs_v2_irq;
 
     /* SATA AHCI controller (sysbus-ahci) — DVR/NVR family.
      * Vendor SATA module busy-loops if the controller is absent; even a
@@ -415,6 +468,12 @@ typedef struct HisiSoCConfig {
     /* CRG register defaults (mimics U-Boot clock init before kernel boot) */
     int             num_crg_defaults;
     struct { uint32_t offset; uint32_t value; } crg_defaults[HISI_MAX_CRG_DEFAULTS];
+    /* Words stored into register banks once they exist: status a vendor
+     * driver polls that nothing models (0 address ends the list) */
+    struct { hwaddr addr; uint32_t value; } reg_presets[HISI_MAX_REG_PRESETS];
+
+    /* The PWM controller behind the "hisi-pwm" regbank entry */
+    HisiPwmConfig   pwm;
 
     /* Generic RAM-backed register banks (pin mux, DDR PHY, PWM, etc.) */
     int             num_regbanks;

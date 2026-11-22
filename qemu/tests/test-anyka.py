@@ -8,7 +8,10 @@ script plays the vendor drivers (docs/anyka.md):
     staged where the ROM puts them (stub + table at 0, U-Boot at its load
     address, the header behind it and in L2 memory at 0x48000200);
   - ak-sysctrl: chip ID, a one-shot timer expiring into the timer's
-    sub-interrupt and the cascaded module interrupt, the RTC link;
+    sub-interrupt and the cascaded module interrupt, the RTC link, the
+    SAR-ADC1 samples from the ain0 / ain1 / bat properties (millivolts):
+    EV330's three packed 10-bit fields, EV300's 12-bit conversion on
+    demand of a powered, enabled AIN0;
   - ak-uart: a byte put in L2 memory and started from CONF2 reaches the
     serial backend, TX-done reads as idle;
   - ak-spi + ak-spinor: JEDEC ID by PIO, a fast read whose dummy byte is a
@@ -29,6 +32,9 @@ script plays the vendor drivers (docs/anyka.md):
   - ak3918av100 / ak3918av100x: the ANYKA322 header whose payload the ROM
     copies from flash 0x600 (secure-boot keys behind the 0x200 header), the
     chip ID, and the eFuse read the vendor ak_efuse.ko polls;
+  - the ak-sysctrl watchdog: a feed defers expiry, magic close disables it,
+    an expiry is reported with when it was last fed, and the kernel's
+    two-count restart resets without being reported;
   - outside qtest: a flash image smaller than an erase block is refused,
     machine state migrates to a file and back on five- and ten-timer
     parts, and a file-backed flash blocks migration.
@@ -38,6 +44,7 @@ script plays the vendor drivers (docs/anyka.md):
 import argparse
 import atexit
 import os
+import re
 import shutil
 import socket
 import struct
@@ -191,6 +198,151 @@ def test_sysctrl(qt):
     check('RTC register round trip', qt.readl(SYSCTRL + 0x54) & 0x3FFF,
           0x1234)
     check('RTC ready', (qt.readl(SYSCTRL + 0x30) >> 7) & 1, 1)
+    # SAR-ADC1 on an EV300: nothing in the sample register until a
+    # conversion -- what the EV330 reader got here (0 mV, builder#234) --
+    # then a lit room, saturating the 3.0 V reference.
+    check('EV300 SAR: no sample without a conversion',
+          qt.readl(SYSCTRL + 0x68), 0)
+    check('EV300 SAR: AIN0 in a lit room', ev300_sar_ain0(qt),
+          (True, 0xFFF))
+
+
+WDT_CFG1 = SYSCTRL + 0xE4
+WDT_CFG2 = SYSCTRL + 0xE8
+WDT_HZ = 46875                      # ak_top_wdt.c: 21.333 us a count
+
+
+def wdt_feed(qt, counts):
+    """What ak_top_wdt.c's wdt_keepalive() writes: the load, enable, then
+    enable + feed."""
+    qt.writel(WDT_CFG1, 0x55 << 24 | counts)
+    qt.writel(WDT_CFG2, 0xAA << 24 | 1)
+    qt.writel(WDT_CFG2, 0xAA << 24 | 3)
+
+
+def test_watchdog(qemu, path):
+    print('ak-sysctrl watchdog')
+    qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path)
+    err = os.path.join(qt.dir, 'qemu.err')
+
+    def log():
+        return open(err).read()
+
+    try:
+        wdt_feed(qt, WDT_HZ)                    # 1 s
+        qt.step(500 * 1000000)
+        wdt_feed(qt, WDT_HZ)                    # fed again at 0.5 s
+        qt.step(800 * 1000000)
+        check('a feed defers expiry', log().count('watchdog expired'), 0)
+        qt.step(500 * 1000000)
+        check('unfed, it expires and says so',
+              log().count('watchdog expired'), 1)
+        m = re.search(r'last fed ([0-9.]+) s ago with a ([0-9.]+) s timeout',
+                      log())
+        check('... with when it was last fed and the timeout',
+              bool(m) and abs(float(m.group(1)) - 1) < 0.01 and
+              m.group(2) == '1.000', True)
+        # Disabled after a feed, as the driver's magic close does.
+        wdt_feed(qt, WDT_HZ)
+        qt.writel(WDT_CFG2, 0xAA << 24)
+        qt.step(2000 * 1000000)
+        check('disabled, it stays quiet', log().count('watchdog expired'), 1)
+        # The kernel's restart hook: wdt_keepalive(2). A reboot, not an
+        # expiry worth reporting.
+        wdt_feed(qt, 2)
+        qt.step(1000000)
+        check('restart (2 counts) is not reported',
+              log().count('watchdog expired'), 1)
+    finally:
+        qt.close()
+
+
+def test_watchdog_migration(qemu, tmp):
+    """An armed watchdog migrated mid-count is still an expiry on the other
+    side -- reported, and through -action watchdog= -- not a reboot."""
+    print('ak-sysctrl watchdog across migration')
+    mon = os.path.join(tmp, 'wdt-mon.sock')
+    mig = os.path.join(tmp, 'wdt.mig')
+    src = QTest(qemu, 'ak3918ev300',
+                ['-monitor', 'unix:%s,server=on,wait=off' % mon])
+    try:
+        wdt_feed(src, WDT_HZ)                   # 1 s
+        src.step(200 * 1000000)
+        m = socket.socket(socket.AF_UNIX)
+        m.connect(mon)
+        m.sendall(('migrate file:%s\n' % mig).encode())
+        for _ in range(100):
+            m.sendall(b'info migrate\n')
+            time.sleep(0.1)
+            m.settimeout(0.2)
+            try:
+                if b'completed' in m.recv(65536):
+                    break
+            except socket.timeout:
+                pass
+        m.close()
+    finally:
+        src.close()
+    dst = QTest(qemu, 'ak3918ev300',
+                ['-incoming', 'file:' + mig, '-action', 'watchdog=none'])
+    try:
+        time.sleep(1)
+        dst.step(2000 * 1000000)
+        log = open(os.path.join(dst.dir, 'qemu.err')).read()
+        check('migrated, a run-out is still an expiry',
+              log.count('watchdog expired'), 1)
+    finally:
+        dst.close()
+
+
+def ev300_sar_ain0(qt, power=True, enable=True):
+    """mach-anycloud ak_adc1.c's EV300 sequence (adc1_ev300_init(), then
+    adc1_ev300_read() of AIN0): returns (ready, 12-bit sample)."""
+    def update(off, mask, val):
+        v = qt.readl(SYSCTRL + off)
+        qt.writel(SYSCTRL + off, (v & ~mask) | (val & mask))
+    update(0x0C, 1 << 3, 0)                     # clock off, divider, on
+    update(0x0C, 7, 7)
+    update(0x0C, 1 << 3, 1 << 3)
+    update(0x20, 1 << 30, 1 << 30)              # out of reset
+    update(0x60, 0xFFFFFF, 1500 | 18 << 16)
+    update(0x5C, 0x3FFFFF, 1 << 8 | 1 << 14)    # idle
+    update(0xA0, 1 | 1 << 3 | 1 << 5, 1)        # powered down, 3.0 V ref
+    update(0x6C, 1, 0)
+    update(0xA0, 1 | 1 << 5, (0 if power else 1) | (1 << 5 if enable else 0))
+    update(0x5C, 7 << 5, 1 << 5)                # AIN0
+    update(0x6C, 1, 0)
+    update(0x5C, 1, 1)                          # start
+    ready = bool(qt.readl(SYSCTRL + 0x6C) & 1)
+    sample = qt.readl(SYSCTRL + 0x68) & 0xFFF
+    update(0x5C, 1 | 7 << 5, 0)
+    update(0xA0, 1 | 1 << 5, 1)
+    update(0x6C, 1, 0)
+    return ready, sample
+
+
+def test_sar_inputs(qemu, path, path330):
+    print('ak-sysctrl SAR inputs')
+    # The properties are millivolts at the pin; a covered photocell is
+    # about 39 mV on the PE3020-W (builder#234).
+    extra = ['-global', 'ak-sysctrl.ain0=39',
+             '-global', 'ak-sysctrl.bat=3300']
+    qt = QTest(qemu, 'ak3919ev330,flash-file=%s' % path330, extra)
+    try:
+        check('EV330: AIN0 covered, AIN1 lit, BAT full, 10 bits of 3.3 V',
+              qt.readl(SYSCTRL + 0x68), 12 | 930 << 10 | 0x3ff << 20)
+    finally:
+        qt.close()
+    qt = QTest(qemu, 'ak3918ev300,flash-file=%s' % path, extra)
+    try:
+        check('EV300: AIN0 covered, 12 bits of 3.0 V', ev300_sar_ain0(qt),
+              (True, 39 * 4096 // 3000))
+        check('EV300: an input left disabled reads 0',
+              ev300_sar_ain0(qt, enable=False), (True, 0))
+        check('EV300: powered down, it reads 0',
+              ev300_sar_ain0(qt, power=False), (True, 0))
+    finally:
+        qt.close()
 
 
 def test_uart(qt, out):
@@ -495,20 +647,22 @@ def test_ev300l(qemu, path):
     finally:
         qt.close()
 def test_av100(qemu, tmp):
-    print('ak3918av100 / ak3918av100x: ANYKA322 0x600 header, eFuse')
-    # The AV100 ROM keeps 0x400 bytes for secure boot behind the 0x200
-    # header (pubkey 0x200, signature 0x300) and copies the payload from
-    # flash offset 0x600 to the load address.
+    print('ak3918av100 / ak3918av100x: ANYKA322 header, eFuse')
+    # The AV100 keeps 0x400 bytes for secure boot behind the 0x200 header
+    # (pubkey 0x200, signature 0x300). The ROM copies from flash 0x200, as
+    # on the other chips; the vendor's header covers the secure-boot space
+    # (load 0x80DFFC00), so U-Boot at 0x600 lands at 0x80E00000.
     code = [0xE1A00000, 0xEAFFFFFE]
     img = bytearray(b'\xFF' * (8 << 20))
     struct.pack_into('<I', img, 0, 0xEA00017E)
     img[4:12] = b'ANYKA322'
-    struct.pack_into('<I', img, 0x0C, 4 * len(code))
-    struct.pack_into('<I', img, 0x20, LOAD)
+    struct.pack_into('<I', img, 0x0C, 0x400 + 4 * len(code))
+    struct.pack_into('<I', img, 0x20, LOAD - 0x400)
     script = [DDRC + 0x14, 0x00423E71,
               0x66668881, DDRC + 0xA4, 0x10000,
               0x88888888, 0]
     struct.pack_into('<%dI' % len(script), img, 0x2C, *script)
+    img[0x200:0x600] = bytes(0x400)    # unsigned: no key, no signature
     struct.pack_into('<%dI' % len(code), img, 0x600, *code)
     path = os.path.join(tmp, 'av100.bin')
     open(path, 'wb').write(img)
@@ -518,9 +672,11 @@ def test_av100(qemu, tmp):
         qt = QTest(qemu, '%s,flash-file=%s' % (machine, path))
         try:
             check('%s chip ID' % machine, qt.readl(SYSCTRL), chip)
-            check('%s: payload copied from flash 0x600' % machine,
+            check('%s: flash 0x600 at 0x80E00000' % machine,
                   qt.readl(LOAD), code[0])
-            check('%s: 0x600 header in front of U-Boot (TEXT_BASE)' % machine,
+            check('%s: secure-boot space copied in front of it' % machine,
+                  qt.readl(LOAD - 0x400), 0)
+            check('%s: header in front of that (TEXT_BASE)' % machine,
                   qt.readl(LOAD - 0x600 + 4), 0x4B594E41)
             # DDR size is the one difference between the two: the last word
             # of RAM holds a value, the word past it does not.
@@ -846,6 +1002,9 @@ def main():
     path300l = os.path.join(tmp, 'flash300l.bin')
     make_image(path300l, b'AK_H322L')
     test_ev300l(args.qemu, path300l)
+    test_sar_inputs(args.qemu, path, path330)
+    test_watchdog(args.qemu, path)
+    test_watchdog_migration(args.qemu, tmp)
     test_av100(args.qemu, tmp)
     test_av130(args.qemu, tmp)
     test_rejections_and_migration(args.qemu, tmp, path)

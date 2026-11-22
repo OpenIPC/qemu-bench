@@ -83,7 +83,8 @@
  * of the command words, cabac_init_flag from W8 [9:8], and SAO, transform
  * skip, the scaling lists, TMVP and the inter transform depth as the
  * channel's SPS / PPS say once a stream buffer has them in front of the
- * offset (before that: T31 libimp's).  JPEG writes the whole
+ * offset (before that: T31 libimp's, or on Anyka libakv's -- no transform
+ * skip, quantization groups of the CTB / 4).  JPEG writes the whole
  * file, SOI to EOI (libimp has no marker code: JPEG_Encoder.c generateNals
  * is empty), from R4 / R5 (source Y / C), R6 (tables: luma and chroma
  * quantisers in zigzag order at bytes 0 and 64), R7-R10 (stream base,
@@ -110,8 +111,8 @@
  * status bit at a time).  Gen 1's command words and common registers,
  * and otherwise (AK_* below):
  *   0x080 + 16c / 0x084 + 16c  core c's list address / start (2 Enc1,
- *         8 Enc2, 0x10 JPEG); libakv starts Enc1 and then Enc2 on the
- *         same list
+ *         8 Enc2, 0x10 JPEG); for H.264 libakv starts Enc1 and then
+ *         Enc2 on the same list, for HEVC Enc1 alone
  *   0x200 (c + 1) + 0x100  status: bits 0 / 2 Enc1 / Enc2 busy (libakv
  *         asserts they are clear at a start), bit 1 the last picture ran
  *         out of stream buffer; + 0x104 its bytes (both read by the
@@ -123,9 +124,12 @@
  *         H.264 libakv unmasks Enc2's alone: EndAvcEntropy)
  *   0x1204 / 0x1208, 0x4004-0x4014  the L2 prefetch, set up before each
  *         picture of the channel that has it (AK_L2_*), else bypassed
- * List entries are 0x1C0 bytes.  W8 bit 11 has Enc1 hand the slice to
- * Enc2 on chip (no intermediate buffer), and Enc2 codes it into WF0-WFC
- * after the header libakv wrote, no tail bits.  The status: entropy at
+ * List entries are 0x1C0 bytes.  For H.264, W8 bit 11 has Enc1 hand the
+ * slice to Enc2 on chip (no intermediate buffer), and Enc2 codes it into
+ * WF0-WFC after the header libakv wrote, no tail bits.  For HEVC, libakv
+ * starts Enc1 alone and gives it the stream buffer, WC0-WCC (offset 0x820
+ * as for H.264), as T31 libimp does; WC0 is 0 in its H.264 entries, and
+ * that tells the two apart.  The status: entropy at
  * 0x100 (bit 3 overflow) / 0x104 (bytes, no flags), Enc1's 0x130-0x16C,
  * the 64-bit counters at 0x158-0x16C high word first.  The bus is 32 bits
  * (DDR at 0x80000000).  libakv reads no ID register: the IDs are gen 1's.
@@ -1008,12 +1012,18 @@ static bool avpu_h264_pps(AvpuStream *st, const uint8_t *r, size_t n)
     return true;
 }
 
+/*
+ * How far in front of a slice's offset the parameter sets are looked for:
+ * T31 libimp's offset is 0x220, libakv's 0x820, with its VPS from byte 1
+ */
+#define AVPU_HDR_WIN    4096u
+
 /* SPS / PPS / VPS in the bytes libimp wrote before the slice */
 static void avpu_parse_headers(IngenicAvpuState *s, AvpuStream *st,
                                int codec, uint32_t base, uint32_t size,
                                uint32_t off)
 {
-    const uint32_t n = MIN(off, 2048u);
+    const uint32_t n = MIN(off, AVPU_HDR_WIN);
     g_autofree uint8_t *buf = NULL;
     size_t i = 0;
 
@@ -1071,6 +1081,7 @@ static void avpu_parse_headers(IngenicAvpuState *s, AvpuStream *st,
     }
     if (pps_ok) {
         st->hevc = scratch.hevc;
+        st->hevc_qg_depth = scratch.hevc_qg_depth;
         st->hevc_sps = st->hevc_pps = true;
     }
 }
@@ -1368,12 +1379,15 @@ static void avpu_enc1(IngenicAvpuState *s, hwaddr list)
                 next = extract32(n0, 12, 10) * lcuw + extract32(n0, 0, 10);
             }
             sl->nlcu = next > sl->first ? next - sl->first : 1;
-            if ((e[2] & (1u << 11)) && !s->anyka) {
+            if ((e[2] & (1u << 11)) && (!s->anyka || e[0xC0 / 4])) {
                 /*
-                 * no Enc2 pass: Enc1 writes the stream itself.  Not on
-                 * Anyka's core, where the bit hands the slice to Enc2
-                 * directly (no intermediate buffer: WD0-WEC are 0) and
-                 * libakv starts Enc2 on the same list to code it
+                 * no Enc2 pass: Enc1 writes the stream itself.  On
+                 * Anyka's core only when the entry gives Enc1 a stream
+                 * buffer (WC0-WCC: libakv's HEVC, which starts Enc1
+                 * alone); its H.264 entries leave them 0, and there the
+                 * bit hands the slice to Enc2 directly (no intermediate
+                 * buffer: WD0-WEC are 0), which libakv starts on the same
+                 * list to code it
                  */
                 avpu_code_slice(s, f, sl, e, ea, true);
             } else {
@@ -1407,7 +1421,7 @@ static void avpu_enc1(IngenicAvpuState *s, hwaddr list)
 static void avpu_dump(IngenicAvpuState *s, const AvpuFrame *f, uint32_t base,
                       uint32_t off, uint32_t count)
 {
-    const uint32_t win = MIN(off, 2048u);
+    const uint32_t win = MIN(off, AVPU_HDR_WIN);
     g_autofree char *path = NULL;
     g_autofree uint8_t *buf = NULL;
     uint32_t i, from = win, ps = win;
@@ -1540,9 +1554,12 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
             .chroma_qp_offset = f->cqp,
             .trafo_depth_intra = st->hevc_sps ? st->hevc.trafo_depth_intra
                                               : f->depth_intra,
-            /* T31 libimp's PPS enables transform skip, T41's (gen 2) not */
+            /*
+             * T31 libimp's PPS enables transform skip, T41's (gen 2) and
+             * Anyka libakv's not
+             */
             .transform_skip = st->hevc_pps ? st->hevc.transform_skip :
-                              s->gen != 2,
+                              s->gen != 2 && !s->anyka,
             /* the slice header's cabac_init_flag: W8 [9:8] as for AVC */
             .cabac_init_flag = f->type != 2 && f->idc,
             /*
@@ -1567,9 +1584,18 @@ static void avpu_code_slice(IngenicAvpuState *s, AvpuFrame *f, AvpuSlice *sl,
                           1 << prm.log2_ctb);
             prm.log2_ctb = MIN(MAX(prm.log2_ctb, 4), 6);
         }
-        /* the PPS's quantization groups, as the decoder will take them */
-        if (st->hevc_pps && st->hevc_qg_depth > 0) {
-            prm.log2_qg = MAX(prm.log2_ctb - st->hevc_qg_depth, 3);
+        /*
+         * the PPS's quantization groups, as the decoder will take them;
+         * before a PPS is seen, libakv's (diff_cu_qp_delta_depth 2) on
+         * Anyka, libimp's (the CTB) elsewhere
+         */
+        {
+            const int qgd = st->hevc_pps ? st->hevc_qg_depth :
+                            s->anyka ? 2 : 0;
+
+            if (qgd > 0) {
+                prm.log2_qg = MAX(prm.log2_ctb - qgd, 3);
+            }
         }
         if (f->nslices > 1) {
             qemu_log_mask(LOG_UNIMP, "ingenic-avpu: HEVC picture of %d "

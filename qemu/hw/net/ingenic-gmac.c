@@ -253,6 +253,7 @@ struct IngenicGmacState {
     NICState *nic;
     NICConf conf;
     QEMUTimer *rx_retry;
+    QEMUTimer *riwt_timer;
 
     uint32_t mac[MAC_REGS];
     uint32_t bus_mode, rx_base, tx_base, status, opmode, intr_ena, missed;
@@ -573,6 +574,14 @@ static void gmac_rx_retry(void *opaque)
     }
 }
 
+static void gmac_riwt_cb(void *opaque)
+{
+    IngenicGmacState *s = opaque;
+
+    s->status |= ST_RI;
+    gmac_update_irq(s);
+}
+
 static bool gmac_addr_match(IngenicGmacState *s, const uint8_t *da)
 {
     for (int i = 0; i < 32; i++) {
@@ -676,7 +685,14 @@ static ssize_t gmac_receive(NetClientState *nc, const uint8_t *buf,
                 des0 |= RDES0_FT;
             }
             if (!(d.des1 & RDES1_DIC)) {
+                timer_del(s->riwt_timer);
                 s->status |= ST_RI;
+            } else if (s->riwt && !(s->status & ST_RI) &&
+                       !timer_pending(s->riwt_timer)) {
+                /* 256 CSR clocks per RWT unit (~2048 ns at 125 MHz) */
+                timer_mod(s->riwt_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          (int64_t)s->riwt * 2048);
             }
         }
         gmac_write_des0(at, des0);
@@ -725,6 +741,7 @@ static void gmac_mac_defaults(IngenicGmacState *s)
 static void gmac_soft_reset(IngenicGmacState *s)
 {
     timer_del(s->rx_retry);
+    timer_del(s->riwt_timer);
     gmac_mac_defaults(s);
     s->bus_mode = BUS_RESET_VALUE;
     s->rx_base = s->tx_base = 0;
@@ -895,6 +912,7 @@ static void gmac_dma_write(IngenicGmacState *s, hwaddr off, uint32_t val)
             s->status |= ST_RPS;
             s->rx_suspended = false;
             timer_del(s->rx_retry);
+            timer_del(s->riwt_timer);
         }
         if (val & OP_ST) {
             gmac_tx(s);
@@ -912,6 +930,9 @@ static void gmac_dma_write(IngenicGmacState *s, hwaddr off, uint32_t val)
         break;
     case DMA_RIWT:
         s->riwt = val & 0xff;
+        if (!s->riwt) {
+            timer_del(s->riwt_timer);
+        }
         break;
     case DMA_AXI_BUS:
         s->axi_bus = val;
@@ -977,6 +998,7 @@ static void gmac_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->mmio);
     sysbus_init_irq(sbd, &s->irq);
     s->rx_retry = timer_new_ns(QEMU_CLOCK_VIRTUAL, gmac_rx_retry, s);
+    s->riwt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gmac_riwt_cb, s);
 
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&gmac_net_info, &s->conf,
@@ -1018,6 +1040,24 @@ static const VMStateDescription vmstate_ingenic_gmac_phy_rst = {
     }
 };
 
+static bool gmac_riwt_needed(void *opaque)
+{
+    IngenicGmacState *s = opaque;
+
+    return timer_pending(s->riwt_timer);
+}
+
+static const VMStateDescription vmstate_ingenic_gmac_riwt = {
+    .name = TYPE_INGENIC_GMAC "/riwt",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = gmac_riwt_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER_PTR(riwt_timer, IngenicGmacState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_ingenic_gmac = {
     .name = TYPE_INGENIC_GMAC,
     .version_id = 1,
@@ -1048,6 +1088,7 @@ static const VMStateDescription vmstate_ingenic_gmac = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_ingenic_gmac_phy_rst,
+        &vmstate_ingenic_gmac_riwt,
         NULL
     }
 };

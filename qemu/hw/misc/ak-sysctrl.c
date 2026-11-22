@@ -16,6 +16,24 @@
  *   0xE4 / 0xE8 watchdog           0xF4..0x118  timers 6..10 (EV330 only)
  *   0x8C        EV330 eFuse read: bit 31 starts and is busy, 30 also busy;
  *               the fuse words come back in 0x90 / 0x94 (all blank here)
+ *   0x68        SAR-ADC1 samples, from the "ain0", "ain1" and "bat"
+ *               properties: millivolts at the pin, which qom-set changes
+ *               while the guest runs, so a test can cover and uncover a
+ *               photocell. The default is a lit room on both inputs
+ *               (3000 mV, what the PE3020-W's photocell gives in light).
+ *               How a sample gets there is the chip's:
+ *    - EV330 (and the default): always there, AIN0 in bits 9:0, AIN1 in
+ *               19:10, BAT in 29:20, 10 bits of the 3.3 V AVCC each
+ *               (mach-anycloud ak_adc1.c's EV330 reader);
+ *    - EV300 ("sar-ev300"): one conversion at a time, 12 bits in 11:0
+ *               against 3.0 V. 0x5C bit 0 starts it and 0x6C bit 0 says it
+ *               is ready (cleared by writing 0). It reads its input only
+ *               when the converter is clocked (0x0C bit 3), out of reset
+ *               (0x20 bit 30), and powered (0xA0 bit 0 clear), and the
+ *               input is selected (0x5C bit 5) and enabled (0xA0 bit 5):
+ *               otherwise the sample is 0, which is what an EV330-style
+ *               read of this silicon gets. AIN0 only, the one input whose
+ *               analog enable is known (OpenIPC/builder#234).
  *
  * Interrupt numbering (mach/irqs.h, identical on EV200 / EV300 / EV330):
  * the module bit n of 0x24 / 0x4C is source n; sub-interrupt bit 0 is the
@@ -33,6 +51,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -41,6 +60,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
+#include "system/watchdog.h"
 #include "qom/object.h"
 #include "system/runstate.h"
 
@@ -69,13 +89,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkSysctrlState, AK_SYSCTRL)
 #define R_INT_STATUS        (0x4C / 4)
 #define R_RTC_CONF          (0x50 / 4)
 #define R_RTC_DATA          (0x54 / 4)
+#define R_SAR_IF_CFG        (0x5C / 4)
+#define R_SAR_SMP_DAT       (0x68 / 4)
+#define R_SAR_STATUS        (0x6C / 4)
+#define R_SAR_ACR2          (0xA0 / 4)
 #define R_EFUSE_CTRL        (0x8C / 4)
 #define R_WDT_CFG1          (0xE4 / 4)
 #define R_WDT_CFG2          (0xE8 / 4)
 
 #define CPU_PLL_APPLY       (1u << 28)
 #define EFUSE_BUSY          (3u << 30)
+/*
+ * EV200 / EV330 CSI clocks (kernel ak39ev330_clk.c): the PCLK divider is
+ * bits 25:20, enabled by bit 28, the SCLK (sensor MCLK) divider bits 15:10,
+ * enabled by bit 18.  Bits 29 and 19 are their "divider valid" bits, which
+ * the hardware clears once the new divider runs.  AliOS Things on an
+ * AK3918EV201 sets bit 19 and waits for it to clear.
+ */
 #define PERI_PLL2_APPLY     (1u << 29)
+#define PERI_PLL2_SCLK_VLD  (1u << 19)
 /*
  * EV300L / AV100 clock block (U-Boot clk-ak3918ev300l.h): writes that
  * take effect when the clock settles, self-clearing.
@@ -135,6 +167,11 @@ struct AkSysctrlState {
     uint16_t rtc[RTC_NREGS];
     ptimer_state *wdt;
     uint32_t wdt_load;
+    /* What the running count started from and when: the first decides
+     * whether a run-out is the kernel's restart or an expiry, so it is
+     * migrated (version 3); the second only times the warning. */
+    uint32_t wdt_run_load;
+    int64_t wdt_fed_ms;
 
     uint32_t chip_id;
     uint32_t chip_id_av;        /* AV130: the ID at +0x3FC, 0 = none */
@@ -147,6 +184,8 @@ struct AkSysctrlState {
     uint32_t num_timers;
     bool has_efuse;
     bool clk_v2;
+    uint32_t ain[3];            /* SAR-ADC1 AIN0, AIN1, BAT; mV at the pin */
+    bool sar_ev300;
 };
 
 /* CTRL1 / CTRL2 offsets of timer n (1-based in the vendor's naming). */
@@ -247,10 +286,77 @@ static void ak_timer_write_ctrl2(AkTimer *t, uint32_t val)
     }
 }
 
+/*
+ * A count this short is the kernel restarting the board, not a watchdog
+ * that went unfed: mach-ak39ev330.c's restart hook is wdt_enable() plus
+ * wdt_keepalive(2), two counts (43 us). Below 1 ms the reset is a plain
+ * reboot, as it always was; anything longer is reported, because on this
+ * machine the watchdog is the only thing that resets the board and an
+ * expiry would otherwise look exactly like a `reboot`.
+ */
+#define AK_WDT_RESTART_COUNTS   (AK_WDT_FREQ / 1000)
+
+/* SAR-ADC1 (see the register list at the top). */
+#define SAR_EV330_AVCC_MV   3300
+#define SAR_EV300_VREF_MV   3000
+#define SAR_CLK_EN          (1u << 3)       /* 0x0C */
+#define SAR_RESET_RELEASE   (1u << 30)      /* 0x20 */
+#define SAR_CFG_START       (1u << 0)       /* 0x5C */
+#define SAR_CFG_AIN0        (1u << 5)
+#define SAR_STATUS_READY    (1u << 0)       /* 0x6C */
+#define SAR_ACR2_POWER_DOWN (1u << 0)       /* 0xA0 */
+#define SAR_ACR2_AIN0       (1u << 5)
+#define R_RESET_CTRL        (0x20 / 4)
+
+static uint32_t ak_sar_scale(uint32_t mv, uint32_t ref_mv, unsigned bits)
+{
+    uint32_t full = (1u << bits) - 1;
+    uint64_t raw = (uint64_t)mv << bits;
+
+    raw /= ref_mv;
+    return raw > full ? full : raw;
+}
+
+static uint32_t ak_sar_ev330(uint32_t mv)
+{
+    return ak_sar_scale(mv, SAR_EV330_AVCC_MV, 10);
+}
+
+static void ak_sar_ev300_convert(AkSysctrlState *s)
+{
+    uint32_t acr2 = s->regs[R_SAR_ACR2];
+    bool live = (s->regs[R_SPI0_CLK] & SAR_CLK_EN) &&
+                (s->regs[R_RESET_CTRL] & SAR_RESET_RELEASE) &&
+                !(acr2 & SAR_ACR2_POWER_DOWN);
+    uint32_t sample = 0;
+
+    if (live && (s->regs[R_SAR_IF_CFG] & SAR_CFG_AIN0) &&
+        (acr2 & SAR_ACR2_AIN0)) {
+        sample = ak_sar_scale(s->ain[0], SAR_EV300_VREF_MV, 12);
+    }
+    /* The conversion is quick next to the driver's 250 us poll: done by the
+     * time anyone looks. */
+    s->regs[R_SAR_SMP_DAT] = sample;
+    s->regs[R_SAR_STATUS] |= SAR_STATUS_READY;
+}
+
 static void ak_wdt_expire(void *opaque)
 {
-    qemu_log_mask(LOG_GUEST_ERROR, "ak-sysctrl: watchdog reset\n");
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    AkSysctrlState *s = opaque;
+
+    if (s->wdt_run_load < AK_WDT_RESTART_COUNTS) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ak-sysctrl: watchdog reset "
+                      "(restart)\n");
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
+    warn_report("ak-sysctrl: watchdog expired: last fed %.3f s ago with "
+                "a %.3f s timeout",
+                (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - s->wdt_fed_ms) /
+                    1000.0,
+                (double)s->wdt_run_load / AK_WDT_FREQ);
+    /* Reset by default; -action watchdog=pause|none|... applies. */
+    watchdog_perform_action();
 }
 
 static void ak_wdt_write_cfg2(AkSysctrlState *s, uint32_t val)
@@ -259,7 +365,9 @@ static void ak_wdt_write_cfg2(AkSysctrlState *s, uint32_t val)
     if (!(val & WDT_EN)) {
         ptimer_stop(s->wdt);
     } else if (val & WDT_FEED) {
-        ptimer_set_limit(s->wdt, MAX(s->wdt_load, 1), 1);
+        s->wdt_run_load = MAX(s->wdt_load, 1);
+        s->wdt_fed_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        ptimer_set_limit(s->wdt, s->wdt_run_load, 1);
         ptimer_run(s->wdt, 1);
     }
     ptimer_transaction_commit(s->wdt);
@@ -318,6 +426,12 @@ static uint64_t ak_sysctrl_read(void *opaque, hwaddr offset, unsigned size)
         return ak_sub_status(s);
     case R_INT_STATUS:
         return ak_int_status(s);
+    case R_SAR_SMP_DAT:
+        if (s->sar_ev300) {
+            return s->regs[R_SAR_SMP_DAT];
+        }
+        return ak_sar_ev330(s->ain[0]) | ak_sar_ev330(s->ain[1]) << 10 |
+               ak_sar_ev330(s->ain[2]) << 20;
     default:
         return s->regs[offset / 4];
     }
@@ -374,7 +488,7 @@ static void ak_sysctrl_write(void *opaque, hwaddr offset, uint64_t val,
             s->regs[R_PERI_PLL2] = val & ~(1u << 9);
             return;
         }
-        s->regs[R_PERI_PLL2] = val & ~PERI_PLL2_APPLY;
+        s->regs[R_PERI_PLL2] = val & ~(PERI_PLL2_APPLY | PERI_PLL2_SCLK_VLD);
         return;
     case R_EFUSE_CTRL:
         /* A read of the (blank) fuses is over before the next access. */
@@ -387,6 +501,14 @@ static void ak_sysctrl_write(void *opaque, hwaddr offset, uint64_t val,
     case R_RTC_CONF:
         s->regs[R_RTC_CONF] = val & ~RTC_CONF_GO;
         ak_rtc_command(s, val);
+        return;
+    case R_SAR_IF_CFG:
+        s->regs[R_SAR_IF_CFG] = val;
+        if (s->sar_ev300 && (val & SAR_CFG_START)) {
+            ak_sar_ev300_convert(s);
+        }
+        return;
+    case R_SAR_SMP_DAT:
         return;
     case R_WDT_CFG1:
         if ((val >> 24) == WDT_CFG1_KEY) {
@@ -456,6 +578,8 @@ static void ak_sysctrl_reset(DeviceState *dev)
     ptimer_stop(s->wdt);
     ptimer_transaction_commit(s->wdt);
     s->wdt_load = 0;
+    s->wdt_run_load = 0;
+    s->wdt_fed_ms = 0;
 
     /*
      * Real time, 14 bits a register: seconds+minutes / hours+day /
@@ -518,6 +642,16 @@ static void ak_sysctrl_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->fiq);
     qdev_init_gpio_in(DEVICE(obj), ak_sysctrl_set_irq, 32);
+
+    /* Not qdev properties: those cannot be set once the device is realized,
+     * and these are the outside world, which changes while the guest runs. */
+    s->ain[0] = s->ain[1] = 3000;
+    object_property_add_uint32_ptr(obj, "ain0", &s->ain[0],
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "ain1", &s->ain[1],
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "bat", &s->ain[2],
+                                   OBJ_PROP_FLAG_READWRITE);
 }
 
 static const Property ak_sysctrl_properties[] = {
@@ -527,6 +661,7 @@ static const Property ak_sysctrl_properties[] = {
     DEFINE_PROP_UINT32("num-timers", AkSysctrlState, num_timers, 5),
     DEFINE_PROP_BOOL("has-efuse", AkSysctrlState, has_efuse, false),
     DEFINE_PROP_BOOL("clk-v2", AkSysctrlState, clk_v2, false),
+    DEFINE_PROP_BOOL("sar-ev300", AkSysctrlState, sar_ev300, false),
 };
 
 static const VMStateDescription vmstate_ak_timer = {
@@ -543,13 +678,23 @@ static const VMStateDescription vmstate_ak_timer = {
 
 static int ak_sysctrl_post_load(void *opaque, int version_id)
 {
+    AkSysctrlState *s = opaque;
+
+    /*
+     * An older stream does not say what the running count started from.
+     * The last load written is the best guess, and keeps a long timeout an
+     * expiry (with the configured watchdog action) rather than a reboot.
+     */
+    if (version_id < 3) {
+        s->wdt_run_load = s->wdt_load;
+    }
     ak_sysctrl_update(opaque);
     return 0;
 }
 
 static const VMStateDescription vmstate_ak_sysctrl = {
     .name = TYPE_AK_SYSCTRL,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = ak_sysctrl_post_load,
     .fields = (const VMStateField[]) {
@@ -569,6 +714,8 @@ static const VMStateDescription vmstate_ak_sysctrl = {
         VMSTATE_SUB_ARRAY(regs, AkSysctrlState, AK_SYSCTRL_NREGS_V1,
                           AK_SYSCTRL_NREGS - AK_SYSCTRL_NREGS_V1, 2,
                           vmstate_info_uint32, uint32_t),
+        VMSTATE_UINT32_V(wdt_run_load, AkSysctrlState, 3),
+        VMSTATE_INT64_V(wdt_fed_ms, AkSysctrlState, 3),
         VMSTATE_END_OF_LIST()
     }
 };

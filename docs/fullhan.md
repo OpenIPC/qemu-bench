@@ -401,6 +401,7 @@ partition; OpenIPC's `ipcinfo -s` and majestic probe the same bus.
 | `gc4653` | 0x29 | 16-bit | 0x03F0/1 = 0x46 0x53 | FH885xV200 |
 | `gc2063` | 0x37 | 8-bit | 0xF0/1 = 0x20 0x63 | FH865x |
 | `gc2053` | 0x37 | 8-bit | 0xF0/1 = 0x20 0x53 | V100, FH8626V100 |
+| `gc2083` | 0x37 | 16-bit | 0x03F0/1 = 0x20 0x83 | |
 | `gc2093` | 0x37 | 16-bit | 0x03F0/1 = 0x20 0x93 | |
 | `gc1054` | 0x21 | 8-bit | 0xF0/1 = 0x10 0x54 | |
 | `mis2006` | 0x30 | 16-bit | 0x3000/1 = 0x20 0x06 | |
@@ -434,6 +435,56 @@ rows in page 0's 0x03:0x04, the gain as page 1's bracket 0xB6 times the
 Q6 step in 0xB1:0xB2 (the driver's bracket table), the frame as 720 + VB
 (0x07:0x08) + 16 rows of 1732 clocks at 38.8 MHz (25 frames/s at the
 driver's default), streaming once page 3's 0x10 has its MIPI bit.
+
+For the GC2083 (`sensor=gc2083`; the Tenda CP3 V2.2's, behind the
+`gc2083` driver of OpenIPC/linux#248) the model follows the GC2083
+datasheet: shutter 0x0D03:0x0D04 and frame length 0x0D41:0x0D42 in rows,
+latched at a frame's start; a row of 2 x 0x0D05:0x0D06 clocks at the
+100 MHz of the 24 MHz reference setting, so 1125 rows of 2962 clocks are
+30 frames/s; the gain the column gain 0xB8:0xB9 times the pregain
+0xB1:0xB2, both Q6; the 1920x1080 window from 0x0195..0x0198; streaming
+once 0x023E has its MIPI bit (the init tables write 0x99 last). The
+analog PGA (0x00D0, 0x0DC1) has no curve in the datasheet and is not
+modelled: the drivers' gain tables step the column gain with it up to
+about 53x, and their last six steps (59x to 148x) raise the PGA alone,
+which the model does not see. No OpenIPC release has a GC2083 DT yet, so
+the boot test cannot run it; with #248's kernel it does (below).
+
+Running #248's kernel: build `fh8626_defconfig` with
+`ARM_APPENDED_DTB`, `ARM_ATAG_DTB_COMPAT` and
+`ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER` (OpenIPC's kernel config
+has them) and the media drivers built in, append
+`fh8626v100-tenda-cp3-v22.dtb` to the zImage, wrap it with `mkimage`
+(load and entry 0xA0008000) and boot it like the release, on
+`fh8626v100,sensor=gc2083`, with `gc2083.ko` (a module only) from a
+`rootfs_data` slot. `fh-v4l2-capture.c` built with `-DWIDTH=1920
+-DHEIGHT=1080` captures 100 frames and encodes 20 to H.264 and one to
+JPEG at 1080p. The client hands camera buffers to the encoders as
+dma-bufs (`VIDIOC_EXPBUF`), as a streamer does: their own MMAP input
+buffers would not fit the 28 MiB CMA pool beside three 1080p capture
+buffers and the H.264 references. The JPEG engine then encodes the
+camera buffer in place, which #248's larger capture planes allow.
+
+`-global fh-isp.light=N` sets the scene's light to N % of the default
+(100: a grey card at 891 rows and 1x reads 2/3 of full scale), so AE has
+something to make up: on the GC2083 at 25 % `fh8626-3ad` raises the
+analogue gain to 3.5x; at 4 % it takes the frame to 2700 lines (12.5
+frames/s) and the gain to 8x, then adds ISP digital gain.
+
+The GC2083's frame delays are not known: its datasheet gives no latch
+timing, and the public drivers disagree. SigmaStar's declares shutter
+and gain delays of 2 (as for its GC2053 and GC2093); the xmedia
+gk7206v100 one in openhisilicon gives exposure and gain 2 but VMAX 3,
+while that tree's other GalaxyCore drivers give VMAX 1, 2 or 3. The model
+latches exposure, gain and frame length together at a frame's start.
+`-global galaxycore-sensor.vts-delay=N` (1 or 2, GC2083 only) holds the
+frame length back N frames more, as a what-if for an AE loop's write
+order, not as the chip's behaviour; with `-d guest_errors` the sensor
+reports an exposure that runs past its frame. With OpenIPC/firmware
+#2888's `fh8626-3ad` at `light=4`, entering slow shutter: no violation
+at 0 or 1 (it writes a longer frame one frame before the exposure that
+needs it), one at 2 (`exposure 2692 rows beyond the frame (VTS 1125 -
+8)`, for one frame).
 
 **USB** (`dwc2-usb`). QEMU's DWC2 in host mode; `-device usb-storage`,
 `usb-net` and the rest plug into its root port (behind QEMU's hub). The

@@ -180,8 +180,10 @@ static uint8_t hisi_smartsens_recv(I2CSlave *i2c)
     HisiSmartSensState *s = HISI_SMARTSENS(i2c);
     uint8_t val = 0xFF;
 
-    if (s->cur_reg >= SS_REG_BASE &&
-        s->cur_reg < SS_REG_BASE + SS_REG_COUNT) {
+    if (s->cur_reg == 0x0100) {
+        val = s->streaming;
+    } else if (s->cur_reg >= SS_REG_BASE &&
+               s->cur_reg < SS_REG_BASE + SS_REG_COUNT) {
         val = s->regs[s->cur_reg - SS_REG_BASE];
     }
     s->cur_reg++;
