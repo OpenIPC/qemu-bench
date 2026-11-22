@@ -580,7 +580,8 @@ if ! grep -q hantro-h264 "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added hantro-h264.c"
 fi
-if ! grep -q xm-vi "$QEMU_DIR/hw/misc/meson.build"; then
+# the file name in full: "xm-vi" alone also matches xm-vimu.c's line
+if ! grep -q "'xm-vi.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vi.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-vi.c"
