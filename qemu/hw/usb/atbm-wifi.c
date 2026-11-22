@@ -216,13 +216,18 @@ static void atbm_send(AtbmState *s, uint16_t id, const void *body, size_t n)
 #define WSM_SCAN_DONE_IND   0x0806
 #define WSM_NEED_TX_CONFIRM (1u << 8)   /* in wsm_tx.htTxParameters */
 
-/* struct wsm_tx after the header (the old rate policy: no TxRateRetry):
- * packetID, maxTxRate, queueId, more, flags, reserved, expireTime,
- * htTxParameters, then the 802.11 frame */
-#define TX_PACKET_ID        12
-#define TX_FLAGS            19
-#define TX_HT_PARAMS        28
-#define TX_FRAME            32
+/* struct wsm_tx after the header (12 bytes, 32 on OCEANUS), the old rate
+ * policy (no TxRateRetry): packetID, maxTxRate, queueId, more, flags,
+ * reserved, expireTime, htTxParameters, then the 802.11 frame.  OCEANUS
+ * (atbm6132c.ko) has a word more before htTxParameters, so that and the
+ * frame are 4 bytes later, and its frame is never shifted: its flags set
+ * 0x80 on protected data (0xa0), whose header still starts at +24, the
+ * CCMP header's 8 bytes left for the chip after it. */
+#define TX_PACKET_ID        0
+#define TX_FLAGS            7
+#define TX_HT_PARAMS        16
+#define TX_FRAME            20
+#define TX_OCEANUS_EXTRA    4
 /* in flags: the frame starts two bytes later, for its payload's alignment
  * (a QoS data header is 26 bytes) */
 #define WSM_TX_2BYTES_SHIFT 0x80
@@ -830,22 +835,25 @@ static void atbm_wsm_out(AtbmState *s, const uint8_t *d, size_t n)
     switch (cmd) {
     case WSM_FIRMWARE_CHECK:
         break;
-    case WSM_TX:
-        if (len + TX_HDR > TX_FRAME + 2) {
-            /* the TX_ offsets count from a 12-byte header */
-            const uint8_t *w = d - TX_HDR;
-            const size_t fo = TX_FRAME +
-                              (w[TX_FLAGS] & WSM_TX_2BYTES_SHIFT ? 2 : 0);
+    case WSM_TX: {
+        const size_t ex = s->chip_version == CHIP_OCEANUS ?
+                          TX_OCEANUS_EXTRA : 0;
 
-            ap_tx(s, w + fo, len + TX_HDR - fo, (id >> 6) & 0xf);
-            if (ldl_le_p(w + TX_HT_PARAMS) & WSM_NEED_TX_CONFIRM) {
+        if (len > TX_FRAME + ex + 2) {
+            const size_t fo = TX_FRAME + ex +
+                              (!ex && (d[TX_FLAGS] & WSM_TX_2BYTES_SHIFT) ?
+                               2 : 0);
+
+            ap_tx(s, d + fo, len - fo, (id >> 6) & 0xf);
+            if (ldl_le_p(d + TX_HT_PARAMS + ex) & WSM_NEED_TX_CONFIRM) {
                 uint8_t b[4 + 4 + 4 + 4 + 4] = { 0 };
 
-                memcpy(b, w + TX_PACKET_ID, 4);
+                memcpy(b, d + TX_PACKET_ID, 4);
                 atbm_send(s, WSM_CNF | WSM_TX, b, sizeof(b));
             }
         }
         break;
+    }
     case WSM_ADD_KEY:
         atbm_wpa_add_key(&s->wpa, d, len);
         atbm_confirm(s, cmd, NULL, 0);
