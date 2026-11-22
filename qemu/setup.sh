@@ -60,6 +60,8 @@ cp qemu/hw/misc/hantro-h264.c qemu/hw/misc/hantro-h264.h qemu/hw/misc/hantro-h26
 cp qemu/hw/misc/hevc-enc.c qemu/hw/misc/hevc-enc.h qemu/hw/misc/hevc-enc-inter.c.inc \
                                     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h "$QEMU_DIR/hw/misc/"
+# the baseline JPEG decoder behind rk-vdpu2
+cp qemu/hw/misc/jpeg-dec.c qemu/hw/misc/jpeg-dec.h "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-vi.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/i2c/xm-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/xm-sensor.c          "$QEMU_DIR/hw/i2c/"
