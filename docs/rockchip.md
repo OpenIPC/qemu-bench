@@ -408,8 +408,10 @@ Machine options besides the flash:
     then sets up `eth2`, its name for the Wi-Fi interface, and leaves
     "wait wifi connect". On the RV1103B `wlan0` is already up when the
     MAC comes, and syschannel refuses it ("cannot set address; device
-    running!"), so that board's frames still go out from
-    00:00:00:00:00:00. slirp answers them all the same.
+    running!"). The station's MAC is the chip's, though, so the model
+    puts it in every frame the host sends (as the source, and as ARP's
+    sender) and hands frames for it back to the host's MAC. On the
+    network both boards are 52:54:00:12:34:56, whatever `wlan0` has.
   - The App asks for the charge state with cmd 0x95 and waits half a
     second for cmd 0xa4 (bit 0 a charger, bit 1 full). The model answers
     0, on battery. Unanswered, the App logged "get charge state failed"
@@ -1101,6 +1103,18 @@ RV1103 / RV1106:
       through: a DVRIP login answers 8–10 s after the first try, with no
       key press. How the real chip wakes the SoC isn't known; the key
       line is the wake-up source the App already watches.
+    - The PIR sensor sits on the chip's MCU side: `pir` on
+      `/machine/ws73` (QMP `qom-set`, true / false) is its output. Awake,
+      the chip reports each edge (cmd 0xa3, 1 / 0; the App logs "GET PIR
+      STATUS"). Asleep, a rising edge wakes the host, and the chip
+      reports the PIR once the App talks to it again. The App's own
+      query (cmd 6) gets the state.
+    - Cloud keep-alive: after each bind the App gives the chip its
+      server (cmd 0x01: a little-endian port, the address as text);
+      `cloud-server` on `/machine/ws73` reads it (`172.25.123.1:6612` on
+      the RV1103B). The chip keeps no real TCP session there. Instead
+      `cloud-wake` (set true) stands for the server's wake-up through it
+      and wakes a sleeping host.
 
 - **RKVENC-PP** (`rk-vepu-pp`, `0xFFA60000`, SPI 108), the encoder's
   pre-processor for the smart features. The kernel (kmpp
@@ -1140,7 +1154,9 @@ RV1103 / RV1106:
   ARGB1555 with both swaps on. majestic leaves the block at zero.
 - **RGA:** the RV1106's RGA2 (`0xFF980000`, SPI 87, "rockchip,rga2_core0")
   is `rk-rga2`, the RV1109's model: bitblt and colour fill, with scaling
-  and YUV/RGB conversion, no rotation or blending. The 5.10 multi-RGA
+  and YUV/RGB conversion, rotation (90 / 180 / 270), mirroring, and
+  blending by the source's alpha (the Porter-Duff modes and global
+  alphas aren't decoded). `-global rk-rga2.trace=on` logs each job. The 5.10 multi-RGA
   driver drives it as it does the RV1109's. The XM G2 App scales its
   sub-streams and AI frames through it. Without it every job timed out,
   and the App's video pipeline stalled (`nobit`).
@@ -1194,17 +1210,23 @@ RV1103 / RV1106:
   the TX format (16-bit, TXCR's channels, the clock's frame rate). The
   header is kept current every 100 ms and when playback stops. Without
   either, recordings are silence (or the `rx-tone-hz` tone), and played
-  audio goes nowhere. QEMU's own audio backends aren't used: their
-  real-time pace doesn't match the guest's virtual clock.
+  audio goes nowhere. With `-global rk-i2s-tdm.audiodev=ID` (or
+  `rk-sai.audiodev`, the RV1103B's) and an `-audiodev`, playback goes to
+  a QEMU audio backend too and capture comes from it. The guest keeps
+  its virtual-clock pace; a 16384-sample ring takes up the difference,
+  dropping the oldest samples when the backend is behind and giving
+  silence when it has none. A wav backend needs `out.frequency=` at the
+  stream's rate (the I2S at 96 kHz packed stereo by default, the XM
+  RV1103B's SAI at 8 kHz), else it mixes to 44.1 kHz.
 - **RISC-V MCU:** the SPL loads its firmware to `0xFF6FF000` and starts
   it; only its final mailbox message is stood in for.
 - **XM firmware:** without `wifi=ws73` the G2's and RV1103B's SDIO Wi-Fi
   co-processor (`hichannel`) isn't there, so their Apps have no network.
   With it, the chip's firmware is modelled by its answers only (see
   `wifi=ws73`): no 802.11, no AP scan or join (cmd 0x20's Wi-Fi list),
-  no PIR events (cmd 0xa3), no `WAKEUP_REASON` report after a wake-up
-  (a connection wakes the SoC through the power key's line), and the
-  RV1103B's `wlan0` keeps a zero MAC. The G2's video runs with
+  no `WAKEUP_REASON` report after a wake-up (a connection, the PIR or
+  `cloud-wake` wakes the SoC through the power key's line), and no real
+  cloud keep-alive session. The G2's video runs with
   `tb-isp` and `sensor2` (see Multi-sensor read-back).
 
 RV1109 / RV1126:

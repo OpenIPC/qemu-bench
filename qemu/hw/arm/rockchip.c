@@ -1999,6 +1999,7 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
                                            OBJECT(s), bank));
 
             qemu_configure_nic_device(card, true, NULL);
+            object_property_add_child(OBJECT(s), "ws73", OBJECT(card));
             qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                    &error_fatal);
             /* its interrupt: the GPIO XM's syschannel asks for */

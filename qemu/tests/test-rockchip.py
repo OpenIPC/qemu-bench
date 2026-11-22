@@ -1239,6 +1239,34 @@ def test_i2s_files(qemu, path, tmp):
               '(%d Hz, %d frames)' % (f.getframerate(), f.getnframes()))
 
 
+def test_i2s_audiodev(qemu, path, tmp):
+    """audiodev: playback reaches a QEMU audio backend (here wav)."""
+    import wave
+    out = os.path.join(tmp, 'be.wav')
+    qt = QTest(qemu, 'rv1106,flash-file=' + path,
+               ('-audiodev', 'wav,id=a0,out.frequency=96000,path=' + out,
+                '-global', 'rk-i2s-tdm.audiodev=a0'))
+    try:
+        I = 0xFFAE0000
+        qt.writel(I + 0x00, 15)     # TXCR: 16-bit stereo, packed
+        for i in range(16):
+            qt.writel(I + 0x24, (i * 7 & 0xffff) | ((-i * 7) & 0xffff) << 16)
+        qt.writel(I + 0x1c, 1)      # TX on
+        qt.cmd('clock_step 500000000')
+        qt.writel(I + 0x1c, 0)
+        qt.proc.terminate()         # a clean exit: the backend's WAV header
+        qt.proc.wait()
+    finally:
+        qt.close()
+    with wave.open(out, 'rb') as f:
+        fr = f.readframes(f.getnframes())
+    smp = list(struct.unpack('<%dh' % (len(fr) // 2), fr))
+    want = [7, -7, 14, -14, 21, -21]
+    hit = any(smp[i:i + 6] == want for i in range(len(smp) - 6))
+    check(hit, 'I2S audiodev: the played samples in the backend\'s WAV '
+          '(%d samples)' % len(smp))
+
+
 def test_dwc3_gadget(qemu, path):
     """usb-otg=device: the DWC3's device side and the host built into it,
     driven as the dwc3 driver does for the first control transfer."""
@@ -1729,6 +1757,41 @@ def test_sai_files(qemu, path):
     check(ok, 'SAI tx-file: 8 kHz stereo WAV, the words unpacked')
 
 
+def test_sai_audiodev(qemu, path):
+    # the SAI's playback into a QEMU audio backend (wav, at 8 kHz)
+    import wave
+    tmp = tempfile.mkdtemp()
+    out = os.path.join(tmp, 'be.wav')
+    qt = QTest(qemu, 'rv1103b,flash-file=' + path,
+               ('-audiodev', 'wav,id=a0,out.frequency=8000,path=' + out,
+                '-global', 'rk-sai.audiodev=a0'))
+    try:
+        cru, sai = 0x20000000, 0x20660000
+        qt.writel(cru + 0x60300 + 20 * 4, 0x001f0000)
+        qt.writel(cru + 0x60300 + 21 * 4, 64 << 16 | 37125)
+        qt.writel(cru + 0x60300 + 35 * 4, 0x0c000400)
+        qt.writel(sai + 0x18, 3 << 3)
+        qt.writel(sai + 0x04, 63)
+        qt.writel(sai + 0x00, 15 | 1 << 11)                 # TX S16, 2 ch
+        qt.writel(sai + 0x10, 1 << 2)
+        for i in range(8):
+            qt.writel(sai + 0x30, (i * 9 & 0xffff) | (-i * 9 & 0xffff) << 16)
+        qt.cmd('clock_step 500000000')
+        qt.writel(sai + 0x10, 0)
+        qt.proc.terminate()
+        qt.proc.wait()
+    finally:
+        qt.close()
+    with wave.open(out, 'rb') as f:
+        fr = f.readframes(f.getnframes())
+    shutil.rmtree(tmp, ignore_errors=True)
+    smp = list(struct.unpack('<%dh' % (len(fr) // 2), fr))
+    want = [9, -9, 18, -18, 27, -27]
+    check(any(smp[i:i + 6] == want for i in range(len(smp) - 6)),
+          'SAI audiodev: the played frames in the backend\'s WAV '
+          '(%d samples)' % len(smp))
+
+
 def fdt(tree):
     """A flattened devicetree from {name: value | {subnodes}}: enough for a
     FIT's /images (strings and u32s)."""
@@ -1993,6 +2056,37 @@ def test_rv1109(qemu, tmp):
         qt.cmd('clock_step 1000000')
         check(qt.read(D + 4 * 32 * 15 + 4 * 31, 4) == b'\xff\x00\x00\xff',
               'RGA2 colour fill: the last pixel red')
+        # rotation: a 4 x 2 RGBA picture turned 90 degrees clockwise is
+        # 2 x 4; mirrored in x, its first row is its last pixel
+        S2, D2 = 0x08480000, 0x084a0000
+        pix = [bytes([16 * i, 0, 0, 255]) for i in range(8)]  # row-major
+        qt.write(S2, b''.join(pix))
+        def blit(info, act_dst, alpha=0):
+            c = [0] * 32
+            c[0x04 // 4] = info                     # RGBA8888 + rot / mirror
+            c[0x08 // 4], c[0x18 // 4], c[0x1c // 4] = S2, 4, 3 | 1 << 16
+            c[0x3c // 4], c[0x48 // 4], c[0x4c // 4] = D2, 4, act_dst
+            c[0x50 // 4] = alpha
+            qt.write(cmd, struct.pack('<32I', *c))
+            qt.writel(G + 0x004, 1)
+            qt.cmd('clock_step 1000000')
+        blit(1 << 10, 1 | 3 << 16)                  # 90: 2 wide, 4 high
+        rot = [qt.read(D2 + 16 * r + 4 * c, 4)[0] for r in range(4)
+               for c in range(2)]
+        check(rot == [64, 0, 80, 16, 96, 32, 112, 48],
+              'RGA2 rotate 90: 4 x 2 -> 2 x 4, column 0 bottom-up (%s)' % rot)
+        blit(1 << 12, 3 | 1 << 16)                  # x mirror
+        mir = [qt.read(D2 + 16 * r + 4 * c, 4)[0] for r in range(2)
+               for c in range(4)]
+        check(mir == [48, 32, 16, 0, 112, 96, 80, 64],
+              'RGA2 mirror x (%s)' % mir)
+        # blending: half-transparent white over black: grey
+        qt.write(S2, bytes([255, 255, 255, 128]) * 8)
+        qt.write(D2, bytes([0, 0, 0, 255]) * 8)
+        blit(0, 3 | 1 << 16, alpha=1)
+        px = qt.read(D2, 4)
+        check(120 <= px[0] <= 136 and px[0] == px[1] == px[2],
+              'RGA2 blend: 50%% white over black is grey (%s)' % px.hex())
         # VEPU541: the VEPU540C model at the RV1126's offsets (IOMMU off)
         V = 0xFFBB0000
         src, bs = 0x08500000, 0x08600000
@@ -2156,6 +2250,7 @@ def main():
     finally:
         qt.close()
     test_i2s_tone(args.qemu, path)
+    test_i2s_audiodev(args.qemu, path, tmp)
     test_i2s_files(args.qemu, path, tmp)
     test_dwc3_gadget(args.qemu, path)
     test_refused(args.qemu, tmp)
@@ -2167,6 +2262,7 @@ def main():
     test_sd_write(args.qemu, path)
     test_ws73(args.qemu, path)
     test_sai_files(args.qemu, path)
+    test_sai_audiodev(args.qemu, path)
     test_rv1109(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)

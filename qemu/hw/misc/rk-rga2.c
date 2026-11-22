@@ -30,8 +30,13 @@
  * R/B swap, V first with U/V swap); destination 0xc / 0xe packed 4:2:2
  * UYVY / YUYV (0xd / 0xf their 4:2:0, written as 4:2:2).  The copy scales
  * by nearest neighbour; YUV <-> RGB is BT.601 limited (mode 1), full (2)
- * or BT.709 limited (3).  Rotation, mirroring, blending, ROPs, palettes and
- * patterns are not done: those jobs copy (or fill) straight.
+ * or BT.709 limited (3).  SRC_INFO bits 11:10 rotate the source 90, 180
+ * or 270 degrees clockwise (the destination's size is the rotated one),
+ * bits 12 / 13 mirror it in x / y.  With ALPHA_CTRL0 (0x50) bit 0 set the
+ * source goes over what the destination holds, weighted by the source's
+ * own alpha (none: opaque); its Porter-Duff modes and global alphas are
+ * not decoded.  ROPs, palettes and patterns are not done: those jobs
+ * copy (or fill) straight.
  *
  * A job runs on a timer JOB_NS after it starts, then raises "all done".
  *
@@ -75,6 +80,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkRga2State, RK_RGA2)
 #define C_DST_BASE0     (0x3c / 4)
 #define C_DST_VIR       (0x48 / 4)
 #define C_DST_ACT       (0x4c / 4)
+#define C_ALPHA_CTRL0   (0x50 / 4)
 #define C_MMU_CTRL1     (0x6c / 4)
 #define C_MMU_SRC       (0x70 / 4)
 #define C_MMU_DST       (0x78 / 4)
@@ -461,6 +467,96 @@ static void rga_pic(const uint32_t *cmd, bool dst, RgaPic *p)
     p->mmu = (mmu & 1) ? (hwaddr)cmd[dst ? C_MMU_DST : C_MMU_SRC] << 4 : 0;
 }
 
+/* a source pixel in the destination's space (YUV or RGBA) */
+static void rga_convert(const RgaPic *src, const RgaPic *dst,
+                        const uint8_t *a, uint8_t *b)
+{
+    if (rga_is_yuv(src->fmt) == rga_is_yuv(dst->fmt)) {
+        memcpy(b, a, 4);
+    } else if (rga_is_yuv(src->fmt)) {
+        rga_yuv2rgb(src->csc, a, b);
+        b[3] = 255;
+    } else {
+        rga_rgb2yuv(dst->csc, a, b);
+    }
+}
+
+/*
+ * The copy with rotation, mirroring or blending: the whole source in, each
+ * destination pixel taken back through the rotation and mirror
+ */
+static void rga_blit_general(const uint32_t *cmd, const RgaPic *src,
+                             const RgaPic *dst, uint8_t *in, uint8_t *out,
+                             uint8_t *t0, uint8_t *t1, uint8_t *t2)
+{
+    int rot = (cmd[C_SRC_INFO] >> 10) & 3;
+    bool mx = cmd[C_SRC_INFO] & (1u << 12), my = cmd[C_SRC_INFO] & (1u << 13);
+    bool blend = cmd[C_ALPHA_CTRL0] & 1;
+    bool src_alpha = !rga_is_yuv(src->fmt) && src->fmt != 1 && src->fmt != 2 &&
+                     src->fmt != 3 && src->fmt != 4;
+    g_autofree uint8_t *pic = NULL, *under = NULL;
+    uint32_t x, y;
+
+    if ((uint64_t)src->w * src->h > 4096 * 4096) {
+        return;
+    }
+    pic = g_malloc((size_t)src->w * src->h * 4);
+    for (y = 0; y < src->h; y++) {
+        rga_read_row(src, y, pic + (size_t)y * src->w * 4, t0, t1, t2);
+    }
+    if (blend) {
+        under = g_malloc0(4 * MAX_DIM);
+    }
+    for (y = 0; y < dst->h; y++) {
+        if (blend) {
+            rga_read_row(dst, y, under, t0, t1, t2);
+        }
+        for (x = 0; x < dst->w; x++) {
+            /* where in the source, rotated clockwise by rot * 90 */
+            uint64_t u = x, v = y, sx, sy;
+
+            switch (rot) {
+            case 0:
+                sx = u * src->w / dst->w;
+                sy = v * src->h / dst->h;
+                break;
+            case 1:                 /* 90: dst x runs up the source */
+                sx = v * src->w / dst->h;
+                sy = src->h - 1 - u * src->h / dst->w;
+                break;
+            case 2:
+                sx = src->w - 1 - u * src->w / dst->w;
+                sy = src->h - 1 - v * src->h / dst->h;
+                break;
+            default:                /* 270 */
+                sx = src->w - 1 - v * src->w / dst->h;
+                sy = u * src->h / dst->w;
+                break;
+            }
+            if (mx) {
+                sx = src->w - 1 - sx;
+            }
+            if (my) {
+                sy = src->h - 1 - sy;
+            }
+            const uint8_t *a = pic + ((size_t)sy * src->w + sx) * 4;
+            uint8_t *b = out + 4 * x;
+
+            rga_convert(src, dst, a, b);
+            if (blend) {
+                unsigned al = src_alpha ? a[3] : 255, i;
+                uint8_t *c = under + 4 * x;
+
+                for (i = 0; i < 3; i++) {
+                    b[i] = (b[i] * al + c[i] * (255 - al) + 127) / 255;
+                }
+                b[3] = al + c[3] * (255 - al) / 255;
+            }
+        }
+        rga_write_row(dst, y, out, t0, t1, t2);
+    }
+}
+
 static void rk_rga2_run(RkRga2State *s)
 {
     uint32_t cmd[32];
@@ -508,6 +604,10 @@ static void rk_rga2_run(RkRga2State *s)
     }
     if (mode != 0) {
         qemu_log_mask(LOG_UNIMP, "rk-rga2: render mode %u\n", mode);
+        return;
+    }
+    if (((cmd[C_SRC_INFO] >> 10) & 0xf) || (cmd[C_ALPHA_CTRL0] & 1)) {
+        rga_blit_general(cmd, &src, &dst, in, out, t0, t1, t2);
         return;
     }
     for (y = 0; y < dst.h; y++) {

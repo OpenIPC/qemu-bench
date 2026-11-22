@@ -34,6 +34,12 @@
  * channels and frame rate TXCR and the clock give, at the first word
  * played); otherwise they go nowhere.
  *
+ * With "audiodev" the played samples go to a QEMU audio backend too, and
+ * capture comes from it (before the file or the tone).  The guest's pace
+ * stays the virtual clock's: a ring between the two takes the
+ * difference, dropping the oldest samples when the backend falls behind
+ * and giving silence when it has none yet.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -51,11 +57,13 @@
 #include "qapi/error.h"
 #include "qemu/notify.h"
 #include "system/system.h"
+#include "qemu/audio.h"
 
 #define TYPE_RK_I2S_TDM "rk-i2s-tdm"
 OBJECT_DECLARE_SIMPLE_TYPE(RkI2sTdmState, RK_I2S_TDM)
 
 #define R_TXFIFOLR  0x0c
+#define AUDIO_RING  16384       /* samples between the guest and the backend */
 #define R_DMACR     0x10
 #define R_INTSR     0x18
 #define R_XFER      0x1c
@@ -102,6 +110,13 @@ struct RkI2sTdmState {
     uint32_t tx_bytes, tx_word; /* data written; words into this frame */
     int64_t tx_hdr_ns;          /* when the header was last updated */
     Notifier exit;              /* the header's final sizes at exit */
+
+    AudioBackend *audio_be;     /* property "audiodev" */
+    SWVoiceOut *vout;
+    SWVoiceIn *vin;
+    uint32_t out_fs, out_ch, in_fs, in_ch;
+    int16_t aring[2][AUDIO_RING];   /* 0 playback, 1 capture */
+    uint32_t ahead[2], acount[2];
 };
 
 /* The 16-bit samples of TX word @w in the TX format (two when packed) */
@@ -158,6 +173,99 @@ static void rk_i2s_tx_sync(RkI2sTdmState *s)
     }
 }
 
+/* ---- the QEMU audio backend ------------------------------------------ */
+
+static void rk_i2s_ring_put(RkI2sTdmState *s, int r, int16_t v)
+{
+    if (s->acount[r] == AUDIO_RING) {           /* drop the oldest */
+        s->ahead[r] = (s->ahead[r] + 1) % AUDIO_RING;
+        s->acount[r]--;
+    }
+    s->aring[r][(s->ahead[r] + s->acount[r]) % AUDIO_RING] = v;
+    s->acount[r]++;
+}
+
+static void rk_i2s_out_cb(void *opaque, int avail)
+{
+    RkI2sTdmState *s = opaque;
+
+    while (avail >= 2 && s->acount[0]) {
+        uint32_t n = MIN(s->acount[0], AUDIO_RING - s->ahead[0]);
+        size_t done;
+
+        n = MIN(n, (uint32_t)avail / 2);
+        done = AUD_write(s->vout, &s->aring[0][s->ahead[0]], n * 2);
+        if (!done) {
+            break;
+        }
+        s->ahead[0] = (s->ahead[0] + done / 2) % AUDIO_RING;
+        s->acount[0] -= done / 2;
+        avail -= done;
+    }
+}
+
+static void rk_i2s_in_cb(void *opaque, int avail)
+{
+    RkI2sTdmState *s = opaque;
+    int16_t buf[512];
+
+    while (avail >= 2) {
+        size_t got = AUD_read(s->vin, buf, MIN((size_t)avail, sizeof(buf)));
+        size_t i;
+
+        if (!got) {
+            break;
+        }
+        for (i = 0; i < got / 2; i++) {
+            rk_i2s_ring_put(s, 1, buf[i]);
+        }
+        avail -= got;
+    }
+}
+
+/* the voice for @fs frames a second of @ch channels, (re)opened to match */
+static void rk_i2s_voice(RkI2sTdmState *s, bool in, uint32_t fs, uint32_t ch)
+{
+    struct audsettings as = {
+        .freq = fs, .nchannels = ch, .fmt = AUDIO_FORMAT_S16, .endianness = 0,
+    };
+
+    if (!s->audio_be || !fs || !ch) {
+        return;
+    }
+    if (in) {
+        if (s->in_fs == fs && s->in_ch == ch) {
+            return;                 /* open, or tried and failed */
+        }
+        if (s->vin) {
+            AUD_close_in(s->audio_be, s->vin);
+        }
+        s->vin = AUD_open_in(s->audio_be, NULL, "rk-i2s.in", s,
+                             rk_i2s_in_cb, &as);
+        s->in_fs = fs;
+        s->in_ch = ch;
+        s->acount[1] = 0;
+        if (s->vin) {
+            AUD_set_active_in(s->vin, true);
+        }
+    } else {
+        if (s->out_fs == fs && s->out_ch == ch) {
+            return;
+        }
+        if (s->vout) {
+            AUD_close_out(s->audio_be, s->vout);
+        }
+        s->vout = AUD_open_out(s->audio_be, NULL, "rk-i2s.out", s,
+                               rk_i2s_out_cb, &as);
+        s->out_fs = fs;
+        s->out_ch = ch;
+        s->acount[0] = 0;
+        if (s->vout) {
+            AUD_set_active_out(s->vout, true);
+        }
+    }
+}
+
 /* @n words leave the TX FIFO for the line: into the WAV, if one */
 static void rk_i2s_tx_out(RkI2sTdmState *s, uint32_t n)
 {
@@ -170,6 +278,15 @@ static void rk_i2s_tx_out(RkI2sTdmState *s, uint32_t n)
         uint32_t w = s->txq[s->txq_head];
 
         s->txq_head = (s->txq_head + 1) % FIFO_DEPTH;
+        if (s->audio_be) {
+            int16_t smp[2];
+            int k = rk_i2s_tx_samples(s, w, smp), i;
+
+            rk_i2s_voice(s, false, MAX(s->rate[0] / per_frame, 1), ch);
+            for (i = 0; i < k && s->vout; i++) {
+                rk_i2s_ring_put(s, 0, smp[i]);
+            }
+        }
         if (s->tx_path && !s->tx_fp) {
             s->tx_fp = fopen(s->tx_path, "wb+");
             s->tx_bytes = 0;
@@ -392,6 +509,32 @@ static uint32_t rk_i2s_rx_word(RkI2sTdmState *s)
     double fs = (double)s->rate[1] / per_frame;
     int32_t v;
 
+    if (s->audio_be) {
+        /* the backend's samples, silence while it has none */
+        int16_t smp[2] = { 0, 0 };
+        int i, k = packed ? 2 : 1;
+
+        rk_i2s_voice(s, true, MAX((uint32_t)fs, 1), ch);
+        for (i = 0; i < k; i++) {
+            if (s->acount[1]) {
+                smp[i] = s->aring[1][s->ahead[1]];
+                s->ahead[1] = (s->ahead[1] + 1) % AUDIO_RING;
+                s->acount[1]--;
+            }
+        }
+        if (s->vin) {
+            if (packed) {
+                return (uint16_t)smp[0] | (uint32_t)(uint16_t)smp[1] << 16;
+            }
+            v = smp[0];
+            if (vdw > 16) {
+                v *= 1 << (vdw - 16);
+            } else {
+                v >>= 16 - vdw;
+            }
+            return (uint32_t)v & (vdw >= 32 ? ~0u : (1u << vdw) - 1);
+        }
+    }
     if (s->rx_frames) {
         /* the file's samples for this word's channels */
         const int16_t *f = s->rx_pcm + (frame % s->rx_frames) * s->rx_ch;
@@ -524,6 +667,7 @@ static const Property rk_i2s_properties[] = {
     DEFINE_PROP_UINT32("rx-tone-hz", RkI2sTdmState, tone_hz, 0),
     DEFINE_PROP_STRING("rx-file", RkI2sTdmState, rx_path),
     DEFINE_PROP_STRING("tx-file", RkI2sTdmState, tx_path),
+    DEFINE_AUDIO_PROPERTIES(RkI2sTdmState, audio_be),
     DEFINE_PROP_UINT64("cru-base", RkI2sTdmState, cru_base, 0),
     DEFINE_PROP_BOOL("clk-rv1106", RkI2sTdmState, clk_rv1106, false),
     DEFINE_PROP_UINT64("cpll-addr", RkI2sTdmState, pll_addr[0], 0),
@@ -569,6 +713,9 @@ static void rk_i2s_realize(DeviceState *dev, Error **errp)
 {
     RkI2sTdmState *s = RK_I2S_TDM(dev);
 
+    if (s->audio_be && !AUD_backend_check(&s->audio_be, errp)) {
+        return;
+    }
     if (s->rx_path) {
         rk_i2s_load_rx(s, errp);
     }

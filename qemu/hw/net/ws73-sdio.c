@@ -100,6 +100,8 @@ struct Ws73State {
     QEMUTimer *host_wake_timer;
     bool host_asleep;           /* the host suspended syschannel (AOV) */
     int64_t host_wake_at;       /* the last wake pulse, ns */
+    bool pir;                   /* the PIR sensor's output (QOM "pir") */
+    char cloud[48];             /* the App's cloud server, host:port */
     uint16_t rca;
 
     uint8_t fn0[FN0_WINDOW];
@@ -125,6 +127,7 @@ struct Ws73State {
 
     bool trace;
     bool ip_sent;
+    uint8_t host_mac[6];        /* what the host's wlan0 sends from */
     uint8_t battery;            /* property: the charge left, % */
     NICConf conf;
     NICState *nic;
@@ -232,6 +235,22 @@ static void d2h_frame(Ws73State *s, uint8_t cmd, const uint8_t *data,
 }
 
 /* a frame from the App (a syschannel message's payload) */
+/* pull the sleeping host's wake-up line, at most every 3 s */
+static void ws73_wake_host(Ws73State *s, const char *why)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (now - s->host_wake_at <= 3 * NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    if (s->trace) {
+        qemu_log("ws73: %s while the host sleeps: wake it\n", why);
+    }
+    s->host_wake_at = now;
+    qemu_set_irq(s->host_wake, 1);
+    timer_mod(s->host_wake_timer, now + 200 * SCALE_MS);
+}
+
 static void h2d_frame(Ws73State *s, const uint8_t *f, uint32_t n)
 {
     if (n < 4 || f[0] != 0x7b || f[1] > n) {
@@ -264,6 +283,12 @@ static void h2d_frame(Ws73State *s, const uint8_t *f, uint32_t n)
         d2h_frame(s, 0x09, s->conf.macaddr.a, 6);
         d2h_frame(s, 0x08, ip, sizeof(ip));
         d2h_frame(s, 0x01, &dhcp_ok, 1);
+        if (s->pir) {
+            /* what woke it, if the PIR did: the sensor still sees it */
+            static const uint8_t on = 1;
+
+            d2h_frame(s, 0xa3, &on, 1);
+        }
     }
     switch (f[2]) {
     case 0x95: {
@@ -277,6 +302,32 @@ static void h2d_frame(Ws73State *s, const uint8_t *f, uint32_t n)
         d2h_frame(s, 0xa4, &on_battery, 1);
         break;
     }
+    case 0x01:
+        /*
+         * The App's cloud server, for the chip to keep a TCP keep-alive
+         * with while the SoC sleeps (and to be woken through): a
+         * little-endian port, then the address as text (34 bytes)
+         */
+        if (f[1] >= 4 + 3) {
+            char host[35] = "";
+            uint32_t m = MIN(f[1] - 4 - 2, sizeof(host) - 1);
+
+            memcpy(host, f + 5, m);
+            host[m] = 0;
+            snprintf(s->cloud, sizeof(s->cloud), "%s:%u", host,
+                     lduw_le_p(f + 3));
+            if (s->trace) {
+                qemu_log("ws73: cloud server %s\n", s->cloud);
+            }
+        }
+        break;
+    case 0x06: {
+        /* the PIR's state, which the MCU side reads: cmd 0xa3 */
+        uint8_t v = s->pir;
+
+        d2h_frame(s, 0xa3, &v, 1);
+        break;
+    }
     case 0x13: {
         /*
          * GetMcuPower: the MCU's ADC result, cmd 0x0b ("Get ADC Sample
@@ -287,6 +338,34 @@ static void h2d_frame(Ws73State *s, const uint8_t *f, uint32_t n)
         d2h_frame(s, 0x0b, adc, sizeof(adc));
         break;
     }
+    }
+}
+
+/*
+ * The station's MAC is the chip's: what goes on the air carries it,
+ * whatever the host's wlan0 has (XM's syschannel refuses the App's
+ * "ifconfig hw ether" while wlan0 is up, so on the RV1103B it stays
+ * 00:00:00:00:00:00).  The chip puts its MAC in as the source (and as
+ * ARP's sender), and hands frames for it back to the host's MAC.
+ */
+static void ws73_tx_mac(Ws73State *s, uint8_t *f, uint32_t n)
+{
+    memcpy(s->host_mac, f + 6, 6);
+    memcpy(f + 6, s->conf.macaddr.a, 6);
+    if (n >= 14 + 28 && lduw_be_p(f + 12) == 0x0806 &&
+        !memcmp(f + 14 + 8, s->host_mac, 6)) {
+        memcpy(f + 14 + 8, s->conf.macaddr.a, 6);   /* ARP sender */
+    }
+}
+
+static void ws73_rx_mac(Ws73State *s, uint8_t *f, uint32_t n)
+{
+    if (!memcmp(f, s->conf.macaddr.a, 6)) {
+        memcpy(f, s->host_mac, 6);
+    }
+    if (n >= 14 + 28 && lduw_be_p(f + 12) == 0x0806 &&
+        !memcmp(f + 14 + 18, s->conf.macaddr.a, 6)) {
+        memcpy(f + 14 + 18, s->host_mac, 6);        /* ARP target */
     }
 }
 
@@ -316,18 +395,12 @@ static ssize_t ws73_receive(NetClientState *nc, const uint8_t *buf,
          * client's retransmission finds the host back up.  At most a
          * pulse every 3 s.
          */
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         bool syn = size >= 14 + 20 + 20 && lduw_be_p(buf + 12) == 0x0800 &&
                    buf[14 + 9] == 6 &&
                    (buf[14 + ((buf[14] & 15) * 4) + 13] & 0x12) == 0x02;
 
-        if (syn && now - s->host_wake_at > 3 * NANOSECONDS_PER_SECOND) {
-            if (s->trace) {
-                qemu_log("ws73: a connection while the host sleeps: wake it\n");
-            }
-            s->host_wake_at = now;
-            qemu_set_irq(s->host_wake, 1);
-            timer_mod(s->host_wake_timer, now + 200 * SCALE_MS);
+        if (syn) {
+            ws73_wake_host(s, "a connection");
         }
         return size;
     }
@@ -340,6 +413,7 @@ static ssize_t ws73_receive(NetClientState *nc, const uint8_t *buf,
     stw_be_p(m, size);
     m[2] = m[3] = 0;
     memcpy(m + 4, buf, size);
+    ws73_rx_mac(s, m + 4, size);
     d2h_packet(s, HCC_WIFI_DATA, m, size + 4);
     return size;
 }
@@ -352,7 +426,7 @@ static NetClientInfo ws73_net_info = {
 };
 
 /* the host's FIFO write: a descriptor, then hcc packets */
-static void h2d_packets(Ws73State *s, const uint8_t *b, uint32_t len)
+static void h2d_packets(Ws73State *s, uint8_t *b, uint32_t len)
 {
     uint32_t off = TX_DESCR;
 
@@ -379,6 +453,7 @@ static void h2d_packets(Ws73State *s, const uint8_t *b, uint32_t len)
                          tot, flen, off, len);
             }
             if (flen >= 14 && flen <= pay - 4) {
+                ws73_tx_mac(s, b + off + HCC_HDR + 4, flen);
                 qemu_send_packet(qemu_get_queue(s->nic),
                                  b + off + HCC_HDR + 4, flen);
             }
@@ -747,6 +822,62 @@ static void ws73_host_wake_end(void *opaque)
     qemu_set_irq(s->host_wake, 0);
 }
 
+/*
+ * QOM "pir": the PIR sensor, which hangs off the chip's MCU side.  A
+ * rising edge wakes a sleeping host (XM's AOV) or, awake, is reported
+ * at once (cmd 0xa3, 1); the falling edge reports 0.
+ */
+static bool ws73_get_pir(Object *obj, Error **errp)
+{
+    return WS73_SDIO(obj)->pir;
+}
+
+static void ws73_set_pir(Object *obj, bool v, Error **errp)
+{
+    Ws73State *s = WS73_SDIO(obj);
+    uint8_t d = v;
+
+    if (v == s->pir) {
+        return;
+    }
+    s->pir = v;
+    if (s->trace) {
+        qemu_log("ws73: PIR %s\n", v ? "on" : "off");
+    }
+    if (s->host_asleep) {
+        if (v) {
+            ws73_wake_host(s, "the PIR");
+        }
+    } else if (s->ip_sent) {
+        d2h_frame(s, 0xa3, &d, 1);
+    }
+}
+
+/*
+ * QOM "cloud-server" (read only): what the App asked the chip to keep
+ * alive.  "cloud-wake": the server's wake-up through that connection --
+ * the chip keeps no real TCP session here, so this stands in for it: a
+ * sleeping host is woken as for a local connection.
+ */
+static char *ws73_get_cloud(Object *obj, Error **errp)
+{
+    return g_strdup(WS73_SDIO(obj)->cloud);
+}
+
+static bool ws73_get_false(Object *obj, Error **errp)
+{
+    return false;
+}
+
+static void ws73_set_cloud_wake(Object *obj, bool v, Error **errp)
+{
+    Ws73State *s = WS73_SDIO(obj);
+
+    if (v && s->host_asleep) {
+        ws73_wake_host(s, "the cloud");
+    }
+}
+
 static void ws73_realize(DeviceState *dev, Error **errp)
 {
     Ws73State *s = WS73_SDIO(dev);
@@ -754,6 +885,10 @@ static void ws73_realize(DeviceState *dev, Error **errp)
     s->sdbus = SD_BUS(qdev_get_parent_bus(dev));
     qdev_init_gpio_out_named(dev, &s->wake, "wake", 1);
     qdev_init_gpio_out_named(dev, &s->host_wake, "host-wake", 1);
+    object_property_add_bool(OBJECT(dev), "pir", ws73_get_pir, ws73_set_pir);
+    object_property_add_str(OBJECT(dev), "cloud-server", ws73_get_cloud, NULL);
+    object_property_add_bool(OBJECT(dev), "cloud-wake", ws73_get_false,
+                             ws73_set_cloud_wake);
     s->host_wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                       ws73_host_wake_end, s);
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
@@ -771,6 +906,7 @@ static void ws73_reset(DeviceState *dev)
     s->io_left = 0;
     s->ip_sent = false;
     s->host_asleep = false;
+    s->cloud[0] = 0;
     s->rxq_head = s->rxq_count = 0;
     cccr_reset(s);
 }

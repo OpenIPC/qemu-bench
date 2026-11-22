@@ -29,7 +29,10 @@
  * right-justified; up to 16 bits, two share a FIFO word (low half
  * first), as the 32-bit DMA moves them to and from an S16 buffer -- the
  * RV1103B XM App captures 8 kHz stereo S16 at 8000 words a second.  Without them the sound card's streams run on time
- * and carry silence.
+ * and carry silence.  With "audiodev" playback goes to a QEMU audio
+ * backend as well and capture comes from it (before the file), through a
+ * ring that takes up the difference between the guest's virtual pace and
+ * the backend's real one.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -46,6 +49,7 @@
 #include "qemu/notify.h"
 #include "system/system.h"
 #include "qom/object.h"
+#include "qemu/audio.h"
 
 #define TYPE_RK_SAI "rk-sai"
 OBJECT_DECLARE_SIMPLE_TYPE(RkSaiState, RK_SAI)
@@ -69,6 +73,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkSaiState, RK_SAI)
 #define XFER_TXS        (1u << 2)
 
 #define OSC_HALF_HZ     12000000
+#define SAI_RING        16384   /* samples between guest and backend */
 
 struct RkSaiState {
     SysBusDevice parent_obj;
@@ -85,7 +90,109 @@ struct RkSaiState {
     uint32_t tx_bytes;
     int64_t tx_hdr_ns;
     Notifier exit;
+
+    AudioBackend *audio_be;     /* property "audiodev" */
+    SWVoiceOut *vout;
+    SWVoiceIn *vin;
+    uint32_t out_fs, out_ch, in_fs, in_ch;
+    int16_t aring[2][SAI_RING];     /* 0 playback, 1 capture */
+    uint32_t ahead[2], acount[2];
 };
+
+static void rk_sai_ring_put(RkSaiState *s, int r, int16_t v)
+{
+    if (s->acount[r] == SAI_RING) {             /* drop the oldest */
+        s->ahead[r] = (s->ahead[r] + 1) % SAI_RING;
+        s->acount[r]--;
+    }
+    s->aring[r][(s->ahead[r] + s->acount[r]) % SAI_RING] = v;
+    s->acount[r]++;
+}
+
+static void rk_sai_out_cb(void *opaque, int avail)
+{
+    RkSaiState *s = opaque;
+
+    while (avail >= 2 && s->acount[0]) {
+        uint32_t n = MIN(s->acount[0], SAI_RING - s->ahead[0]);
+        size_t done;
+
+        n = MIN(n, (uint32_t)avail / 2);
+        done = AUD_write(s->vout, &s->aring[0][s->ahead[0]], n * 2);
+        if (!done) {
+            break;
+        }
+        s->ahead[0] = (s->ahead[0] + done / 2) % SAI_RING;
+        s->acount[0] -= done / 2;
+        avail -= done;
+    }
+}
+
+static void rk_sai_in_cb(void *opaque, int avail)
+{
+    RkSaiState *s = opaque;
+    int16_t buf[512];
+
+    while (avail >= 2) {
+        size_t got = AUD_read(s->vin, buf, MIN((size_t)avail, sizeof(buf)));
+        size_t i;
+
+        if (!got) {
+            break;
+        }
+        for (i = 0; i < got / 2; i++) {
+            rk_sai_ring_put(s, 1, buf[i]);
+        }
+        avail -= got;
+    }
+}
+
+static uint32_t rk_sai_fs(RkSaiState *s);
+static uint32_t rk_sai_channels(RkSaiState *s, bool tx);
+
+/* the voice for the stream's rate and channels, (re)opened to match */
+static void rk_sai_voice(RkSaiState *s, bool in)
+{
+    uint32_t fs = rk_sai_fs(s), ch = rk_sai_channels(s, !in);
+    struct audsettings as = {
+        .freq = fs, .nchannels = ch, .fmt = AUDIO_FORMAT_S16, .endianness = 0,
+    };
+
+    if (!s->audio_be || !fs || !ch) {
+        return;
+    }
+    if (in) {
+        if (s->in_fs == fs && s->in_ch == ch) {
+            return;                 /* open, or tried and failed */
+        }
+        if (s->vin) {
+            AUD_close_in(s->audio_be, s->vin);
+        }
+        s->vin = AUD_open_in(s->audio_be, NULL, "rk-sai.in", s,
+                             rk_sai_in_cb, &as);
+        s->in_fs = fs;
+        s->in_ch = ch;
+        s->acount[1] = 0;
+        if (s->vin) {
+            AUD_set_active_in(s->vin, true);
+        }
+    } else {
+        if (s->out_fs == fs && s->out_ch == ch) {
+            return;
+        }
+        if (s->vout) {
+            AUD_close_out(s->audio_be, s->vout);
+        }
+        s->vout = AUD_open_out(s->audio_be, NULL, "rk-sai.out", s,
+                               rk_sai_out_cb, &as);
+        s->out_fs = fs;
+        s->out_ch = ch;
+        s->acount[0] = 0;
+        if (s->vout) {
+            AUD_set_active_out(s->vout, true);
+        }
+    }
+}
 
 #define REG(s, off) ((s)->regs[(off) / 4])
 
@@ -169,6 +276,18 @@ static int32_t rk_sai_rx_sample(RkSaiState *s, uint64_t k)
     int vdw = (REG(s, R_RXCR) & 0x1f) + 1;
     int32_t v;
 
+    if (s->audio_be) {
+        rk_sai_voice(s, true);
+    }
+    if (s->vin) {
+        v = 0;                      /* the backend's, silence while none */
+        if (s->acount[1]) {
+            v = s->aring[1][s->ahead[1]];
+            s->ahead[1] = (s->ahead[1] + 1) % SAI_RING;
+            s->acount[1]--;
+        }
+        return vdw > 16 ? v * (1 << (vdw - 16)) : v >> (16 - vdw);
+    }
     if (!s->rx_frames) {
         return 0;
     }
@@ -236,6 +355,18 @@ static void rk_sai_tx_word(RkSaiState *s, uint32_t w)
     int vdw = (REG(s, R_TXCR) & 0x1f) + 1;
     int16_t smp;
 
+    if (s->audio_be) {
+        rk_sai_voice(s, false);
+        if (s->vout) {
+            if (vdw <= 16) {
+                rk_sai_ring_put(s, 0, (int16_t)(w << (16 - vdw)));
+                rk_sai_ring_put(s, 0, (int16_t)((w >> 16) << (16 - vdw)));
+            } else {
+                rk_sai_ring_put(s, 0,
+                                (int32_t)(w << (32 - vdw)) >> 16);
+            }
+        }
+    }
     if (!s->tx_path) {
         return;
     }
@@ -373,6 +504,9 @@ static void rk_sai_realize(DeviceState *dev, Error **errp)
 {
     RkSaiState *s = RK_SAI(dev);
 
+    if (s->audio_be && !AUD_backend_check(&s->audio_be, errp)) {
+        return;
+    }
     if (s->rx_path && *s->rx_path) {
         rk_sai_load_rx(s, errp);
     }
@@ -405,6 +539,7 @@ static const Property rk_sai_properties[] = {
     DEFINE_PROP_UINT64("cru-base", RkSaiState, cru_base, 0x20000000),
     DEFINE_PROP_STRING("rx-file", RkSaiState, rx_path),
     DEFINE_PROP_STRING("tx-file", RkSaiState, tx_path),
+    DEFINE_AUDIO_PROPERTIES(RkSaiState, audio_be),
 };
 
 static const VMStateDescription rk_sai_vmstate = {
