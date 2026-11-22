@@ -3861,6 +3861,43 @@ def test_i6c_wave5_two(qemu, tmp):
         i6c_wave5_two(qemu, tmp, ack)
 
 
+def test_i6c_cmdq_mask(qemu, tmp):
+    print('infinity6c CMDQ: the interrupt mask is reg 0x47')
+    path = i6_image(tmp, 'i6cq.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        e = riu(0x1126, 0)                  # engine 4
+        buf = 0x300000
+        target = riu(0x1033, 0x10)
+        word = (target - RIU) // 4
+        qt.writel(DRAM + buf, 0x1234 << 16 | 0xFFFF)
+        qt.writel(DRAM + buf + 4, 0x11 << 24 | word)   # write, raising SW 1
+        qt.writel(DRAM + buf + 8, 0)
+        qt.writel(DRAM + buf + 12, 0)
+        qt.writew(e + 0x47 * 4, 0xFFFF)     # HalCmdqSetIsrMsk(all)
+        qt.writew(e + 0x04 * 4, (buf >> 4) & 0xFFFF)
+        qt.writew(e + 0x05 * 4, buf >> 20)
+        qt.writew(e + 0x06 * 4, ((buf + 0x1000) >> 4) - 1 & 0xFFFF)
+        qt.writew(e + 0x07 * 4, ((buf + 0x1000) >> 4) - 1 >> 16)
+        qt.writew(e + 0x01 * 4, 1)
+        qt.writew(e + 0x09 * 4, (buf + 16) >> 20)
+        qt.writew(e + 0x08 * 4, ((buf + 16) >> 4) & 0xFFFF)
+        check('CMDQ: the command ran', qt.readw(target), 0x1234)
+        check('CMDQ: its software interrupt in the raw status, reg 0x45',
+              qt.readw(e + 0x45 * 4) & 2, 2)
+        check('CMDQ: not in the final status, reg 0x44, while masked',
+              qt.readw(e + 0x44 * 4) & 2, 0)
+        check('CMDQ: masked in reg 0x47, no interrupt (MS_IRQ 17, SPI 49)',
+              intc_raw(qt, 17), 0)
+        qt.writew(e + 0x47 * 4, 0xFFFD)
+        check('CMDQ: unmasked there, it is raised', intc_raw(qt, 17), 1)
+        check('CMDQ: and in the final status', qt.readw(e + 0x44 * 4) & 2, 2)
+        qt.writew(e + 0x48 * 4, 2)
+        check('CMDQ: and the clear drops it', intc_raw(qt, 17), 0)
+    finally:
+        qt.close()
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4252,6 +4289,7 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_cmdq_mask(args.qemu, tmp)
     test_i6c_wave5_two(args.qemu, tmp)
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)

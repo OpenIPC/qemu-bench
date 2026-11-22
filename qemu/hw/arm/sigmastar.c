@@ -2184,6 +2184,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         dev = qdev_new("sstar-cmdq");
         if (i6c) {
             qdev_prop_set_uint32(dev, "idle-bits", 1u << 11);
+            /* HalCmdqSetIsrMsk: the mask is reg 0x47 */
+            qdev_prop_set_bit(dev, "mask-hi", true);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         {
