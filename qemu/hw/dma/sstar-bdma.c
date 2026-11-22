@@ -27,6 +27,12 @@
  * path 0x2B40) and fires the FSP after triggering the channel.
  * Transfers complete inside the trigger write.
  *
+ * The MIU ports are a bus master behind the MIU's MMU where the die
+ * has one (sstar_miu_page), taken one MMU page at a time while the MMU is
+ * on, and skipped where a page has no entry: infinity6c's
+ * mi_sys clears its MMA buffers, VPA addresses, with pattern fills
+ * (msys_dma_fill, MI_SYS_Dma_MemsetPa).
+ *
  * The port decoding and the IMI select follow Daniel Palmer's mstar_bdma.c
  * (github.com/fifteenhex/qemu, mstar-clean), checked against the vendor
  * register map above.
@@ -45,6 +51,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/ssi/sstar-fsp.h"
+#include "hw/misc/sstar-riu.h"
 #include "hw/misc/sstar-xzdec.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
@@ -99,14 +106,24 @@ static uint32_t reg32(uint16_t *r, int lo)
     return r[lo] | ((uint32_t)r[lo + 1] << 16);
 }
 
-static hwaddr bdma_mem_addr(SstarBdmaState *s, uint16_t *r, uint32_t a)
+/*
+ * An MIU port's address on the bus; *n is cut to what fits in the MMU's
+ * page (all of it while the MMU is off), and *missed set for a page with
+ * no entry.
+ */
+static hwaddr bdma_mem_addr(SstarBdmaState *s, uint16_t *r, uint32_t a,
+                            uint32_t *n, bool *missed)
 {
+    uint64_t pa;
+
+    *missed = false;
     /* Bus addresses: DRAM from 0, as the drivers program them. */
     if (((r[R_MISC] >> 12) & 0x3) == MISC_MEM_IMI) {
         /* Iford's IPL reads into IMI above 64 KiB (0xA0010980) */
         return IMI_BASE + (a & 0xFFFFF);
     }
-    return DRAM_BASE + (a & s->addr_mask);
+    *n = sstar_miu_page(a, *n, &pa, missed);
+    return DRAM_BASE + (pa & s->addr_mask);
 }
 
 static void bdma_update_irq(SstarBdmaState *s, int ch)
@@ -130,12 +147,26 @@ static void bdma_run(SstarBdmaState *s, int ch)
     while (len) {
         uint32_t n = MIN(len, sizeof(buf));
         uint32_t i;
+        hwaddr sp = 0, dp = 0;
+        bool smiss = false, dmiss = false;
+
+        /* on an MIU side, no further than the MMU's page */
+        if (src == PORT_MIU0 || src == PORT_MIU1) {
+            sp = bdma_mem_addr(s, r, sa, &n, &smiss);
+        }
+        if (dst == PORT_MIU0 || dst == PORT_MIU1) {
+            dp = bdma_mem_addr(s, r, da, &n, &dmiss);
+        }
 
         switch (src) {
         case PORT_MIU0:
         case PORT_MIU1:
-            dma_memory_read(&address_space_memory, bdma_mem_addr(s, r, sa), buf,
-                            n, MEMTXATTRS_UNSPECIFIED);
+            if (smiss) {
+                memset(buf, 0, n);
+            } else {
+                dma_memory_read(&address_space_memory, sp, buf, n,
+                                MEMTXATTRS_UNSPECIFIED);
+            }
             break;
         case PORT_FILL:
             for (i = 0; i < n; i++) {
@@ -158,8 +189,10 @@ static void bdma_run(SstarBdmaState *s, int ch)
         switch (dst) {
         case PORT_MIU0:
         case PORT_MIU1:
-            dma_memory_write(&address_space_memory, bdma_mem_addr(s, r, da),
-                             buf, n, MEMTXATTRS_UNSPECIFIED);
+            if (!dmiss) {
+                dma_memory_write(&address_space_memory, dp, buf, n,
+                                 MEMTXATTRS_UNSPECIFIED);
+            }
             break;
         case PORT_FSP:
             if (s->fsp) {

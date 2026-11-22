@@ -69,5 +69,11 @@ void sstar_riu_add_defaults(SstarRiuState *s, const SstarRegDefault *table);
 /* Iford's MIU MMU: a bus master's address as MIU sees it; else unchanged */
 uint64_t sstar_miu_xlate(uint64_t addr);
 bool sstar_miu_missed(uint64_t addr);
+/*
+ * The part of [addr, addr + len) up to the MMU's next page boundary (all of
+ * it while the MMU is off), its translation in *pa, and whether that page
+ * has no entry (*missed: nothing is behind it, so the access is skipped).
+ */
+size_t sstar_miu_page(uint64_t addr, size_t len, uint64_t *pa, bool *missed);
 
 #endif /* HW_MISC_SSTAR_RIU_H */

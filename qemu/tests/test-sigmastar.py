@@ -3650,6 +3650,55 @@ def test_i6c_media(qemu, tmp):
         qt.close()
 
 
+def i6c_mmu(qt, pages):
+    """infinity6c's MIU MMU: VPA region 1 in 128 KiB pages, VPA page
+    0xFF8 + n (MIU 0x3FF00000 up) to the PA page pages[n]."""
+    mmu = riu(0x1659, 0)
+    qt.writew(mmu, 0)
+    qt.writew(mmu + 0x05 * 4, 1)
+    qt.writew(mmu + 0x06 * 4, 0)
+    for n, pa in enumerate(pages):
+        qt.writew(mmu + 0x03 * 4, pa)
+        qt.writew(mmu + 0x02 * 4, 0x8000 | (0xFF8 + n))
+        qt.writew(mmu + 0x0A * 4, 3)
+    qt.writew(mmu, (2 << 1) | 1)
+
+
+def test_i6c_bdma_mmu(qemu, tmp):
+    print('infinity6c BDMA: MIU ports through the MIU MMU')
+    path = i6_image(tmp, 'i6cb.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x105))         # two pages, not adjacent
+        for a in (0x22000000, 0x2201FF00, 0x220A0000, 0x3FF1FF00):
+            qt.writel(a, 0)
+        b = BDMA
+        qt.writew(b + 0x0A * 4, 0x0323)
+        qt.writew(b + 0x0B * 4, 0x0323)
+        # a pattern fill (port 4) into MIU 0, across a VPA page boundary
+        st = bdma_run(qt, 0, 0x0004, 0, 0x3FF1FF00, 0x200)
+        check('BDMA: the fill completes', st & 8, 8)
+        check('BDMA: the first page as the MMU maps it',
+              qt.readl(0x2201FF00), 0x03230323)
+        check('BDMA: the next page, mapped elsewhere',
+              qt.readl(0x220A0000), 0x03230323)
+        check('BDMA: nothing at the untranslated address',
+              qt.readl(0x3FF1FF00), 0)
+        # and a copy out of the VPA region, back to plain DRAM
+        qt.writel(0x220A0004, 0x12345678)
+        bdma_run(qt, 0, 0x0000, 0x3FF20004, 0x00300000, 4)
+        check('BDMA: a copy reads through the MMU too',
+              qt.readl(DRAM + 0x300000), 0x12345678)
+        # a VPA page with no entry: nothing is behind it, nothing written
+        qt.writel(0x3FF40000, 0)
+        st = bdma_run(qt, 0, 0x0004, 0, 0x3FF40000, 0x100)
+        check('BDMA: a fill into an unmapped page completes', st & 8, 8)
+        check('BDMA: and lands nowhere, not at the untranslated address',
+              qt.readl(0x3FF40000), 0)
+    finally:
+        qt.close()
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4041,6 +4090,7 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 
