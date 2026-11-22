@@ -3721,6 +3721,42 @@ def test_i6c_bdma_irq(qemu, tmp):
         qt.close()
 
 
+def test_i6c_ispscl(qemu, tmp):
+    print('infinity6c IspScl: VIF in realtime, the frame events on SPI 56')
+    path = i6_image(tmp, 'i6cs.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        di = riu(0x130C, 0)
+        check('the write DMA is off', qt.readw(riu(0x1358, 0)) & 1, 0)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(100 * 1000000)
+        check('HalIspSclIsr group 1 (0x00): the frame\'s end',
+              qt.readw(di + 0x03 * 4) & 1, 1)
+        check('group 2 (0x04): its line-count hit',
+              qt.readw(di + 0x07 * 4) & 1, 1)
+        check('group 6 (0x14): its start', qt.readw(di + 0x17 * 4) & 1, 1)
+        check('MS_IRQ 24, SPI 56, the "ispscl" node', intc_raw(qt, 24), 1)
+        for g in (0x00, 0x04, 0x14):
+            qt.writew(di + (g + 2) * 4, 0xFFFF)
+        check('cleared, the line drops', intc_raw(qt, 24), 0)
+        for g in (0x00, 0x04, 0x14):
+            qt.writew(di + g * 4, 0xFFFF)
+        qt.step(100 * 1000000)
+        check('masked, it stays down', intc_raw(qt, 24), 0)
+        for g in (0x00, 0x04, 0x14):
+            qt.writew(di + (g + 2) * 4, 0xFFFF)
+            qt.writew(di + g * 4, 0)
+        qt.writew(riu(0x1358, 0), 1)        # write DMA on, no buffer queued
+        qt.step(100 * 1000000)
+        check('write DMA on, no buffer: the frame end all the same',
+              qt.readw(di + 0x03 * 4) & 1, 1)
+        check('and its start', qt.readw(di + 0x17 * 4) & 1, 1)
+    finally:
+        qt.close()
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4112,6 +4148,7 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_ispscl(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)

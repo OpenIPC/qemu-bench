@@ -58,8 +58,13 @@
  *
  * Bank 0x130C, SPI 56, four groups of mask, force, clear, status at 0x00,
  * 0x04, 0x10, 0x14: bit 0 of the last is the frame's start, of the second
- * its line-count hit, of the first its end.  Each frame with a buffer queued the Bayer data goes there, 10 bits a
- * pixel, four to five bytes, least significant first.  That packing is a
+ * its line-count hit, of the first its end.  "ispscl" (infinity6c):
+ * the bank is also the ISP-to-scaler interrupt, HalIspSclIsr's (SPI 56,
+ * "IspScl"), which mi_scl waits for each frame, so the three are raised
+ * every frame whatever the write DMA does: off (VIF feeding the ISP in
+ * realtime), or on with no buffer queued.  Each frame with a buffer queued
+ * the Bayer data goes there, 10 bits a pixel, four to five bytes, least
+ * significant first.  That packing is a
  * guess: the ISP here never reads it back, it works from the sensor's frame
  * directly, RDMA or no RDMA.
  *
@@ -174,6 +179,7 @@ struct SstarIfordIspState {
     int fifo_n;
     uint32_t done;                  /* the last buffer done, MIU >> 4 */
     bool sensor_window;
+    bool ispscl;
     bool ae_grid_32;
 };
 
@@ -467,12 +473,15 @@ static void isp_vif_dma(SstarIfordIspState *s)
     g_autofree uint8_t *line = NULL;
     int x, y;
 
-    if (!(s->wd[WD_CTRL] & WD_EN)) {
+    if (!(s->wd[WD_CTRL] & WD_EN) && !s->ispscl) {
         return;
     }
     s->di[DI_STATUS(DI_START)] |= 1;
     s->di[DI_STATUS(DI_LINE)] |= 1;
-    if (s->fifo_n && pitch >= row) {
+    if (s->ispscl) {
+        s->di[DI_STATUS(DI_END)] |= 1;
+    }
+    if ((s->wd[WD_CTRL] & WD_EN) && s->fifo_n && pitch >= row) {
         base = s->fifo[0];
         memmove(s->fifo, s->fifo + 1, --s->fifo_n * sizeof(s->fifo[0]));
         line = g_malloc(row);
@@ -712,6 +721,7 @@ static const Property isp_props[] = {
                      SstarRiuState *),
     DEFINE_PROP_BOOL("trace", SstarIfordIspState, trace, false),
     DEFINE_PROP_BOOL("sensor-window", SstarIfordIspState, sensor_window, false),
+    DEFINE_PROP_BOOL("ispscl", SstarIfordIspState, ispscl, false),
     DEFINE_PROP_BOOL("ae-grid-32", SstarIfordIspState, ae_grid_32, false),
 };
 

@@ -2417,6 +2417,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                               c->die == SS_DIE_INFINITY6C);
             qdev_prop_set_bit(pipe, "ae-grid-32",
                               c->die == SS_DIE_INFINITY6C);
+            qdev_prop_set_bit(pipe, "ispscl",
+                              c->die == SS_DIE_INFINITY6C);
             object_property_set_link(OBJECT(pipe), "sensor", OBJECT(dev),
                                      &error_fatal);
             object_property_set_link(OBJECT(pipe), "riu", OBJECT(riu),
