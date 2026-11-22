@@ -254,7 +254,10 @@ logo with a moving dot, as the Allwinner models do:
     is drawn where the frame lands. Multi-lens boards draw each lens with
     the dot at its own phase: XM530V200 X6C and XM535D1 splice two lenses
     into one stream, XM535D2 serves three cameras.
-  - **xm-hevc**: the HEVC engines (layouts `xm535`, `xm533`, `xm530v200`).
+  - **xm-vimu**, **xm-vta**: XM232's VI + ISP and NN accelerator; see
+    [XM232](#xm232).
+  - **xm-hevc**: the HEVC engines (layouts `xm535`, `xm533`, `xm530v200`;
+    `xm232`, which codes H.264 too, is in [XM232](#xm232)).
     The vendor library writes the parameter sets and slice header; the
     model writes the slice data (`hevc-enc.c`) under them, so its CABAC
     must follow the library's choices: CTB 16 without SAO (XM535, XM533)
@@ -524,9 +527,17 @@ kernel `mach-xm232`):
 
 ```sh
 qemu-system-arm -M xm232,flash-file=dump.bin -nographic \
-    -netdev user,id=w,net=192.168.50.0/24 \
+    -nic user,restrict=on,net=192.168.1.0/24,host=192.168.1.1,dhcpstart=192.168.1.10,hostfwd=tcp:127.0.0.1:5554-192.168.1.10:554 \
+    -netdev user,id=w,restrict=on,net=192.168.50.0/24 \
     -device atbm-wifi,bus=usb-bus.0,port=1,netdev=w,chip-version=0x30
+ffprobe -rtsp_transport tcp 'rtsp://127.0.0.1:5554/user=admin&password=&channel=1&stream=0.sdp?real_stream'
 ```
+
+Sofia streams H.264 over RTSP a minute or so into the boot: `stream=0`
+2304x2592 (the two lenses, one above the other, upscaled), `stream=1`
+640x720, each with G.711 audio, the clock and title OSD on both. The board
+leases its address over DHCP (`dhcpstart` puts it where the forward
+points); `restrict=on` keeps Sofia's cloud traffic in.
 
 The second-generation map (U-Boot 2014.04 at the flash window, uMCTL2,
 latching SP804, UARTs, GMAC, SFC v2), with these differences:
@@ -550,14 +561,48 @@ latching SP804, UARTs, GMAC, SFC v2), with these differences:
     `i2s.ko` 45 / 46, `xm_wdt.ko` 48, `dma.ko` 47 (its own engine at
     0x20020000, not a PL330), `hevc.ko` 56. The UART, GMAC and timer lines
     are XM530's.
-  - **Media.** `isp.ko` calls itself `XM210V200_ISP`; VI is `vi_mu.ko`
-    (`xm232_vi.c`, up to two sensors online, mode 3 here), `vi_bpu.ko` and
-    `vpss_bpu.ko`, all in a 64 MiB window at 0x30000000 (IRQs 64, 85, 86, 88,
-    89, 90). `hevc.ko` maps 0x21000000, 0x21010000, 0x21100000, 0x21F00000
-    and 0x30071080. There is no hx280enc, JPEG engine or NN. None of this is
-    modelled yet (`xm-isp2` and `xm-hevc` are off on this machine); the
-    modules load and Sofia starts without frames. Isp.json names two SC2336
-    on `xm_i2c` bus 0 (0x30, 0x32), which the machine provides.
+  - **Reset key on the ADC.** Sofia's key 252 is ADC channel 2, and
+    XM232's `adc.ko` calibrates first: it reads ten reference inputs
+    (select bits 7:4 = 5..14 at +0xCC0) and converts a channel by
+    interpolating between them. A flat ADC (as the XM533 / XM535 one could
+    be) converts to 0, "pressed", and Sofia restores the factory settings
+    and reboots about 45 s in (`rebootV2` type 25). `xm-gpio` answers the
+    references with a ramp and the channels at 992, released.
+  - **Media** (`loadmod` mode 3: two SC2336 time-multiplexed on one VI,
+    spliced into one picture). The media blocks address the DDR at
+    0x90000000 as well (vb.ko hands out the MMZ at 0x92300000 up; the
+    machine's `ram_media_alias`).
+    - **xm-vimu**: VI + ISP in one window, 0x30000000 + 68 MiB. Each period
+      the VICU takes the sensor `isp.ko` selects at +0x10008: its mux timer
+      at frame start (`mux_timer_irq`, SPI 58), then `vicu_bayer_irq` (SPI
+      32), `bpu_hvgen_irq` (SPI 56), the store and `vi_sel` (SPI 57,
+      `vi_mu.ko`). Three store channels per sensor (1920x1080, 640x360,
+      512x288) at +0x73000 + 0x4000·n, set up at `vi_sel`'s "go" (+0x10014)
+      and done at +0x90. The BPU's zone statistics (AWB at +0x4B000, one
+      block per sensor at +0x82000 / +0x92000: 512 zones of R / G / B sums)
+      describe a grey, lit scene. The `isp` daemon's auto scene judges day
+      and night from them, and without them it goes to night, whose table
+      this firmware leaves empty: `isp` faults (`isp_monitor`) and Sofia
+      runs blind.
+    - **xm-hevc**, layout `xm232` (0x21000000, `h265` SPI 24): XM535's CTB
+      16 HEVC, and the same engine in H.264, which this firmware uses for
+      both streams (Main profile, CAVLC). The library writes SPS / PPS and
+      slice header after the job, and hands the header's bits past its
+      last whole byte to the engine before it (+0x52C / +0x530); a job with
+      such bits, or a stream that had them, is H.264, coded by
+      `hantro-h264`'s picture coder (P pictures inter-predicted from the
+      reconstruction the job names). rgn.ko's OSD is the engine's own
+      overlay regions (+0x2A4 on, +0x2A8 + 0x24·n), 2 bits a pixel as
+      XM535's. `-global xm-hevc.dump-dir=DIR` keeps H.264 jobs as
+      `frame-NNNNN-WxH.h264`. No JPEG is coded (snapshots are headers only).
+    - **xm-vta**: the "VTA" NN accelerator (0x22000000, SPI 27,
+      `XmVtaMte.ko`), which Sofia's person detector drives through
+      `/dev/mem`. Its colour converter (+0x800: NV12 to 3-byte int8 pixels by
+      programmed coefficients) is modelled; network runs (+0x000, the
+      model's instruction stream) complete with nothing computed, so nobody
+      is detected. Without it every run times out after 5 s, the detector's
+      outputs stay unset and Sofia's `Smart_Proc` thread faults about 30 s
+      after start.
   - **Wi-Fi + BLE: ATBM6132CU** ("OCEANUS"), `atbm6132c.ko` (also
     XM535D2's `6132cu.ko`), on the USB core. With `chip-version=0x30`
     `atbm-wifi` speaks its dialect:
@@ -579,10 +624,15 @@ latching SP804, UARTs, GMAC, SFC v2), with these differences:
     another chip version) `wlandaemon` finds no card, reloads the driver
     and reboots the camera.
 
-**Open.** About 45 s into a boot Sofia restarts the camera
-(`xmsfc_shutdown`, `Restarting system.`) without logging why; the console
-login gives no shell to look. The VI / ISP / VPSS and HEVC blocks need
-models of their own before Sofia can stream.
+**Open.** JPEG snapshots (the engine's +0x5C8 side job) are not coded.
+The H.265 path is checked under qtest only: this firmware's Sofia streams
+H.264. `wlandaemon`'s QR-code Wi-Fi setup fails on real hardware too: its
+static media library sends `mmz.ko` ioctls with a 0x2C-byte argument where
+this `mmz.ko` takes 0x30 (`mmz: ioctl cmd error`). For debugging: Sofia
+logs to `/var/sofia.log`; the `isp` daemon, which Sofia starts as
+`isp -v p &`, logs nowhere, so bind-mount a wrapper over `/usr/bin/isp`
+before Sofia starts to keep its output; `echo 1 >
+/proc/sys/kernel/print-fatal-signals` names a faulting thread and its PC.
 
 ## DVRs and NVRs (XM8536E / XM8520D / XM8521DV200)
 

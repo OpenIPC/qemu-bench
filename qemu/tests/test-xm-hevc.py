@@ -3,7 +3,7 @@
 hevc.ko do, and check that ffmpeg decodes what they produce.
 
 No guest: QEMU runs under qtest and this script plays the driver, on each
-engine layout (XM535's, XM533's and XM530V200's).  The library writes the
+engine layout (XM535's, XM533's, XM530V200's and XM232's).  The library writes the
 parameter sets and slice headers itself, so the engine writes only the slice
 data; the model's dump-dir keeps each job as a whole access unit with the
 library's headers, and that stream is what ffmpeg decodes.
@@ -13,6 +13,12 @@ block skipped: small, and nearly the same picture -- the encoder may code a
 block again where that beats copying it), and a P picture with a square
 added (the blocks around it coded again).  Each P job names the previous job's
 reconstruction buffer as its reference, as the library does.
+
+XM232's engine codes H.264 too (xm232-h264), under the library's CAVLC SPS,
+PPS and slice header, which the script writes in front of the output as
+Sofia's library does, the slice header's bits past its last whole byte in
++0x52C / +0x530; the stream ffmpeg decodes is those headers and the slice
+data the guest finds at the output.
 
     python3 qemu/tests/test-xm-hevc.py [--qemu PATH] [--machine M] [--keep DIR]
 """
@@ -35,11 +41,90 @@ V1 = dict(start=0x000, start_val=1, ack=0x018, ack_val=1, status=0x074,
 V3 = dict(start=0x004, start_val=1, ack=0x030, ack_val=3, status=0x058,
           w=0x034, h=0x038, type=0x040, qp=0x044, free=0x1D4, y=0x1E0,
           c=0x1E4, ref=0x1E8, recon=0x1F0, len=0x1D8)
+X2 = dict(start=0x000, start_val=1, ack=0x028, ack_val=2, status=0x0B8,
+          done=2, w=0x078, h=0x07C, type=0x088, qp=0x090, free=0x0D0,
+          y=0x10C, c=0x110, ref=0x114, recon=0x11C, out=0x13C, ys=0x154,
+          cs=0x158, len=0x174)
 LAYOUTS = {
     'xm535': V1,
     'xm533': dict(V3, out=0x210, ys=0x224, cs=0x228),
     'xm530v200': dict(V3, out=0x200, ys=0x214, cs=0x218),
+    'xm232': X2,
+    'xm232-h264': dict(X2, h264=True),
 }
+X2_HDR_BITS, X2_HDR_NBITS = 0x52C, 0x530
+
+
+class Bits:
+    """An RBSP writer, Exp-Golomb included."""
+    def __init__(self):
+        self.bits = []
+
+    def u(self, v, n):
+        self.bits += [(v >> (n - 1 - i)) & 1 for i in range(n)]
+
+    def ue(self, v):
+        v += 1
+        n = v.bit_length()
+        self.u(0, n - 1)
+        self.u(v, n)
+
+    def se(self, v):
+        self.ue(2 * v - 1 if v > 0 else -2 * v)
+
+    def trailing(self):
+        self.u(1, 1)
+        while len(self.bits) % 8:
+            self.u(0, 1)
+
+    def whole(self):
+        n = len(self.bits) // 8 * 8
+        return bytes(int(''.join(map(str, self.bits[i:i + 8])), 2)
+                     for i in range(0, n, 8))
+
+
+def escape(rbsp):
+    o, z = bytearray(), 0
+    for b in rbsp:
+        if z >= 2 and b <= 3:
+            o.append(3)
+            z = 0
+        o.append(b)
+        z = z + 1 if b == 0 else 0
+    return bytes(o)
+
+
+def h264_headers(w, h, f, qp):
+    """Sofia's: Main profile, CAVLC, frame_num 10 bits, POC type 2; an IDR
+    then P pictures, each with the slice header's last bits apart."""
+    out = b''
+    if f == 0:
+        b = Bits()
+        b.u(0x274d0033, 32)
+        b.ue(0); b.ue(6); b.ue(2); b.ue(1); b.u(0, 1)
+        b.ue(w // 16 - 1); b.ue(h // 16 - 1)
+        b.u(1, 1); b.u(1, 1); b.u(0, 1); b.u(0, 1)
+        b.trailing()
+        out += b'\0\0\0\1' + escape(b.whole())
+        b = Bits()
+        b.u(0x28, 8)
+        b.ue(0); b.ue(0); b.u(0, 1); b.u(0, 1); b.ue(0); b.ue(0); b.ue(0)
+        b.u(0, 1); b.u(0, 2); b.se(0); b.se(0); b.se(0)
+        b.u(1, 1); b.u(0, 1); b.u(0, 1)
+        b.trailing()
+        out += b'\0\0\0\1' + b.whole()
+    b = Bits()
+    b.u(0x25 if f == 0 else 0x21, 8)
+    b.ue(0); b.ue(7 if f == 0 else 5); b.ue(0); b.u(f, 10)
+    if f == 0:
+        b.ue(0); b.u(0, 2)
+    else:
+        b.u(1, 1); b.ue(0); b.u(0, 1); b.u(0, 1)
+    b.se(qp - 26); b.ue(0); b.se(-2); b.se(5)
+    whole = b.whole()
+    rest = b.bits[len(whole) * 8:]
+    pend = int(''.join(map(str, rest)) + '0' * (8 - len(rest)), 2) if rest else 0
+    return out + b'\0\0\0\1' + escape(whole), pend, len(rest)
 
 
 def main():
@@ -59,10 +144,15 @@ def main():
 def run(a, machine, L):
     w, h, qp = 640, 360, 30
     fails = 0
+    h264 = L.get('h264', False)
+    if h264:
+        h = 352                     # whole macroblocks: no cropping
+    machine_name = machine
+    machine = machine.split('-')[0]
 
     def check(ok, what):
         nonlocal fails
-        print(('ok   ' if ok else 'FAIL ') + machine + ': ' + what)
+        print(('ok   ' if ok else 'FAIL ') + machine_name + ': ' + what)
         fails += not ok
 
     src = jt.test_frame(w, h)
@@ -81,11 +171,17 @@ def run(a, machine, L):
     atexit.register(shutil.rmtree, dump, True)
     q = jt.QTest(a.qemu, machine, ('-global', 'xm-hevc.dump-dir=' + dump))
     sizes = []
+    stream = b''
     try:
         for f, (yp, cp) in enumerate(sources):
             q.write(IN_ADDR, yp)
             q.write(IN_ADDR + w * h, cp)
             q.write(OUT_ADDR, b'\xa5' * 64)
+            if h264:
+                hdr, pend, nbits = h264_headers(w, h, f, qp)
+                q.write(OUT_ADDR - len(hdr), hdr)
+                q.writel(HEVC + X2_HDR_BITS, pend)
+                q.writel(HEVC + X2_HDR_NBITS, nbits)
             regs = {'w': w - 1, 'h': h - 1, 'type': 1 if f else 0, 'qp': qp,
                     'free': BUF_SIZE, 'y': IN_ADDR, 'c': IN_ADDR + w * h,
                     'ref': RECON[(f + 1) % 2], 'recon': RECON[f % 2],
@@ -101,37 +197,43 @@ def run(a, machine, L):
             for _ in range(2000):
                 q.cmd('clock_step 1000000')
                 st = q.readl(HEVC + L['status'])
-                if st & 3 == 3:
+                if st & 3 == L.get('done', 3):
                     break
                 time.sleep(0.002)
-            check(st & 3 == 3, 'job %d done (status 0x%x)' % (f, st))
+            check(st & 3 == L.get('done', 3), 'job %d done (status 0x%x)' % (f, st))
             n = q.readl(HEVC + L['len'])
             check(0 < n < BUF_SIZE, 'job %d: %d bytes of slice data' % (f, n))
             sizes.append(n)
             data = q.read(OUT_ADDR, n)
-            dumped = sorted(os.listdir(dump))
-            au = open(os.path.join(dump, dumped[-1]), 'rb').read() if dumped else b''
-            check(au.endswith(data), 'job %d: the guest\'s slice data ends the dumped '
-                  'access unit' % f)
+            if h264:
+                stream += hdr + data
+            else:
+                dumped = sorted(os.listdir(dump))
+                au = open(os.path.join(dump, dumped[-1]), 'rb').read() if dumped else b''
+                check(au.endswith(data), 'job %d: the guest\'s slice data ends the dumped '
+                      'access unit' % f)
             q.writel(HEVC + L['ack'], L['ack_val'])
             if 'sw' in L:           # XM535's driver also clears start
                 q.writel(HEVC + L['start'], 0)
     finally:
         q.close()
 
-    check(len(sizes) == 3 and sizes[1] * 10 < sizes[0],
+    # H.264's P picture also refines the IDR's DC-only macroblocks
+    check(len(sizes) == 3 and sizes[1] * (2 if h264 else 10) < sizes[0],
           'an unchanged P picture is small (%s bytes)' % sizes)
     check(len(sizes) == 3 and sizes[1] < sizes[2] < sizes[0],
           'a P picture with a change costs more, still less than the IDR')
 
-    stream = b''.join(open(os.path.join(dump, f), 'rb').read()
-                      for f in sorted(os.listdir(dump)))
+    if not h264:
+        stream = b''.join(open(os.path.join(dump, f), 'rb').read()
+                          for f in sorted(os.listdir(dump)))
+    ext = 'h264' if h264 else 'hevc'
     if a.keep:
         os.makedirs(a.keep, exist_ok=True)
-        open(os.path.join(a.keep, machine + '.hevc'), 'wb').write(stream)
+        open(os.path.join(a.keep, machine_name + '.' + ext), 'wb').write(stream)
     tmp = tempfile.mkdtemp()
     atexit.register(shutil.rmtree, tmp, True)
-    path = os.path.join(tmp, 'out.hevc')
+    path = os.path.join(tmp, 'out.' + ext)
     open(path, 'wb').write(stream)
     r = subprocess.run(['ffmpeg', '-v', 'error', '-err_detect', 'explode',
                         '-i', path, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-'],
@@ -161,8 +263,10 @@ def run(a, machine, L):
     v = psnr(frames[1], frames[0])
     check(v > 40, 'the unchanged P picture is the IDR\'s: %.1f dB' % v)
     for f in (0, 2):
+        # H.264: I_16x16 DC macroblocks, deblocked; HEVC: 8x8 DC blocks
         v = psnr(frames[f][:w * h], blocks(sources[f][0]))
-        check(v > 25, 'frame %d luma: %.1f dB against the 8x8 block means' % (f, v))
+        check(v > (20 if h264 else 25),
+              'frame %d luma: %.1f dB against the 8x8 block means' % (f, v))
     sq = frames[2][110 * w + 140]
     check(sq > 200, 'the square is there in the last picture (luma %d)' % sq)
     return fails

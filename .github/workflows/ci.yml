@@ -280,13 +280,20 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-h1-h264.py']
         run: python3 qemu/tests/test-xm-h1-h264.py --baseline --machine xm535
 
-      # The second generation's HEVC engines (XM535, XM533, XM530V200
-      # layouts): slice data under the library's headers, P pictures that
-      # skip blocks against the previous job's reconstruction; ffmpeg
-      # decodes the dump-dir stream.
+      # The second generation's HEVC engines (XM535, XM533, XM530V200,
+      # XM232 layouts; XM232's in H.264 too): slice data under the
+      # library's headers, P pictures that skip blocks against the previous
+      # job's reconstruction; ffmpeg decodes the stream.
       - name: HEVC engines (xm-hevc)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-hevc.py']
         run: python3 qemu/tests/test-xm-hevc.py
+
+      # XM232: the VI store and BPU statistics (xm-vimu), the NN
+      # accelerator's colour converter and runs (xm-vta), adc.ko's
+      # calibration inputs and the media blocks' DDR alias.
+      - name: XM232 media (xm-vimu, xm-vta)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-xm232.py']
+        run: python3 qemu/tests/test-xm-xm232.py
 
       # The XM530 pad controller as the gpio-xm530 kernel driver and the
       # vendor ISP drive it: output levels, input lines, mux bits kept.

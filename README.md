@@ -147,7 +147,7 @@ modelled yet.
 | `xm530v200` | Cortex-A5 ×2 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm533` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
 | `xm535` | Cortex-A5 (A9 stand-in) | GIC | 3.10.103 vendor | yes³ |
-| `xm232` | ARMv7 (A9 stand-in), UP | GIC | 3.10.103 vendor | partial⁵ |
+| `xm232` | ARMv7 (A9 stand-in), UP | GIC | 3.10.103 vendor | yes⁵ |
 | `xm8536e` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 | `xm8520d` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
 | `xm8521dv200` | 2× Cortex-A7 (A9 stand-in) | GIC | 3.10.103 vendor | yes⁴ |
@@ -196,11 +196,12 @@ XM535 cameras boot the same way on `xm530v200` (`-smp 2`), `xm533` and
 `xm535`, through their vendor U-Boot and kernel to Sofia. Their kernels
 print only with `xmuart=0` in the saved U-Boot environment.
 
-⁵ `xm232`: an XM232 camera dump (X6S-WEQ-H) boots its vendor U-Boot,
-kernel, media modules, Sofia and its ATBM6132CU Wi-Fi + BLE (`atbm-wifi`
-with `chip-version=0x30`), but its VI / ISP and HEVC blocks are not
-modelled yet, and Sofia restarts the camera shortly after start-up. See
-[docs/xiongmai.md](docs/xiongmai.md#xm232).
+⁵ `xm232`: flash boot of an XM232 camera dump (X6S-WEQ-H): vendor U-Boot,
+kernel and Sofia, which streams H.264 over RTSP from a test picture (two
+lenses time-multiplexed on one VI and spliced, ISP statistics, the
+HEVC / H.264 engine with its OSD, the NN accelerator), with audio and its
+ATBM6132CU Wi-Fi + BLE (`atbm-wifi` with `chip-version=0x30`). No JPEG
+snapshots. See [docs/xiongmai.md](docs/xiongmai.md#xm232).
 
 CI covers login, both CPUs, guest reboot and clock on both. On `xm530` it
 also runs the network check and the flash tests: erase/program,

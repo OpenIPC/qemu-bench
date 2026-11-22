@@ -599,7 +599,11 @@ static const XmSoCConfig *xm535_config(void)
  *     (Linux number - 32 = SPI): sdio0_sd.ko IRQ 51, xm_usb0.ko's dwc2 at
  *     0x50200000 IRQ 55 (not XM530V200's 0x50300000 / 76), i2s.ko AI / AO
  *     45 / 46, xm_wdt.ko 48, dma.ko 47, hevc.ko 56.
- *   - No hx280enc, JPEG engine or NN: hevc.ko maps 0x21100000 itself.
+ *   - Media: VI + ISP in one window at 0x30000000 (xm-vimu), the HEVC /
+ *     H.264 engine at 0x21000000 with its own overlay regions (xm-hevc,
+ *     layout xm232), the NN accelerator at 0x22000000 (xm-vta); no
+ *     hx280enc or JPEG engine.  The media blocks address the DDR at
+ *     0x90000000 as well.
  */
 static const XmSoCConfig *xm232_config(void)
 {
@@ -617,11 +621,27 @@ static const XmSoCConfig *xm232_config(void)
         c.audio_irqs[0] = 13;
         c.audio_irqs[1] = 14;
         c.h1_base = 0;
-        c.hevc_base = 0;
+        /* hevc.ko's engine (xm-hevc, layout xm232), h265 SPI 24 */
+        c.hevc_base = 0x21000000;
+        c.hevc_irq = 24;
+        c.hevc_layout = "xm232";
         c.osd_base = 0;
         c.isp2 = false;
         /* Isp.json: two SC2336 on xm_i2c bus 0, 0x30 and 0x32 */
         c.i2c2_base = 0;
+        /* isp.ko's vicu_bayer_irq SPI 32 and bpu_hvgen_irq SPI 56,
+         * vi_mu.ko's vi_sel SPI 57, isp.ko's mux_timer_irq SPI 58 */
+        c.vimu = true;
+        /* vb.ko's buffers, as VI, ISP and the HEVC engine are given them:
+         * the MMZ (0x82300000 up) at 0x92300000 */
+        c.ram_media_alias = 0x90000000;
+        /* XmVtaMte.ko's vta_ip_base and vta_irq_num 59 (SPI 27) */
+        c.vta_base = 0x22000000;
+        c.vta_irq = 27;
+        c.vimu_irqs[0] = 32;
+        c.vimu_irqs[1] = 56;
+        c.vimu_irqs[2] = 57;
+        c.vimu_irqs[3] = 58;
     }
     return &c;
 }
@@ -1034,6 +1054,13 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     xm_cpu0 = cpu;
 
     memory_region_add_subregion(sysmem, c->ram_base, machine->ram);
+    if (c->ram_media_alias) {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(alias, NULL, "xm.ram-media", machine->ram, 0,
+                                 memory_region_size(machine->ram));
+        memory_region_add_subregion(sysmem, c->ram_media_alias, alias);
+    }
 
     if (c->sram_size) {
         MemoryRegion *sram = g_new(MemoryRegion, 1);
@@ -1347,6 +1374,18 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
             if (isp2_irqs[n] >= 0) {
                 sysbus_connect_irq(SYS_BUS_DEVICE(isp), n, pic[isp2_irqs[n]]);
             }
+        }
+    }
+    if (c->vta_base) {
+        sysbus_create_simple("xm-vta", c->vta_base, pic[c->vta_irq]);
+    }
+    if (c->vimu) {
+        DeviceState *vimu = qdev_new("xm-vimu");
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vimu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vimu), 0, 0x30000000);
+        for (n = 0; n < ARRAY_SIZE(c->vimu_irqs); n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(vimu), n, pic[c->vimu_irqs[n]]);
         }
     }
     if (c->vi_base) {
