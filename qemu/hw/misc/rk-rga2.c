@@ -41,6 +41,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
+#include "hw/qdev-properties.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -85,7 +86,15 @@ struct RkRga2State {
     QEMUTimer *timer;
     uint32_t regs[REGS_SIZE / 4];
     uint32_t ints;              /* INT status bits 3:0 */
+    bool trace;                 /* property: log jobs and interrupts */
 };
+
+#define RGA_TRACE(s, fmt, ...) do {                                     \
+    if ((s)->trace) {                                                   \
+        qemu_log("rk-rga2 %" PRId64 " " fmt "\n",                        \
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000, ## __VA_ARGS__); \
+    }                                                                   \
+} while (0)
 
 #define REG(s, off) ((s)->regs[(off) / 4])
 
@@ -532,6 +541,19 @@ static void rk_rga2_done(void *opaque)
     rk_rga2_run(s);
     REG(s, R_STATUS) = 0;
     s->ints |= INT_ALL_DONE;
+    if (s->trace) {
+        uint32_t c[32];
+
+        dma_memory_read(&address_space_memory, REG(s, R_CMD_BASE), c,
+                        sizeof(c), MEMTXATTRS_UNSPECIFIED);
+        RGA_TRACE(s, "done mode %u src %ux%u dst %ux%u dst0 0x%x, int en 0x%x",
+                  le32_to_cpu(c[0]) & 7,
+                  (le32_to_cpu(c[0x1c / 4]) & 0x1fff) + 1,
+                  ((le32_to_cpu(c[0x1c / 4]) >> 16) & 0x1fff) + 1,
+                  (le32_to_cpu(c[0x4c / 4]) & 0x1fff) + 1,
+                  ((le32_to_cpu(c[0x4c / 4]) >> 16) & 0x1fff) + 1,
+                  le32_to_cpu(c[0x3c / 4]), REG(s, R_INT));
+    }
     rk_rga2_update(s);
 }
 
@@ -557,6 +579,8 @@ static void rk_rga2_write(void *opaque, hwaddr off, uint64_t val,
         return;
     case R_CMD_CTRL:
         if (val & 1) {
+            RGA_TRACE(s, "start cmd 0x%x%s", REG(s, R_CMD_BASE),
+                      timer_pending(s->timer) ? " (one still running)" : "");
             REG(s, R_STATUS) = 1;
             timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       JOB_NS);
@@ -565,6 +589,7 @@ static void rk_rga2_write(void *opaque, hwaddr off, uint64_t val,
     case R_STATUS:
         return;
     case R_INT:
+        RGA_TRACE(s, "int wr 0x%x (status 0x%x)", (uint32_t)val, s->ints);
         s->ints &= ~((val >> 4) & 0xf);
         REG(s, R_INT) = val & ~0xffu;
         rk_rga2_update(s);
@@ -614,11 +639,16 @@ static const VMStateDescription rk_rga2_vmstate = {
     }
 };
 
+static const Property rk_rga2_props[] = {
+    DEFINE_PROP_BOOL("trace", RkRga2State, trace, false),
+};
+
 static void rk_rga2_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, rk_rga2_reset);
+    device_class_set_props(dc, rk_rga2_props);
     dc->vmsd = &rk_rga2_vmstate;
 }
 

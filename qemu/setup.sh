@@ -200,6 +200,12 @@ if ! grep -q "atbm-sdio" "$QEMU_DIR/hw/net/meson.build"; then
         >> "$QEMU_DIR/hw/net/meson.build"
     echo "  hw/net/meson.build: added atbm-sdio.c"
 fi
+cp qemu/hw/net/ws73-sdio.c          "$QEMU_DIR/hw/net/"
+if ! grep -q "ws73-sdio" "$QEMU_DIR/hw/net/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_ROCKCHIP_RV11XX', if_true: files('ws73-sdio.c'))" \
+        >> "$QEMU_DIR/hw/net/meson.build"
+    echo "  hw/net/meson.build: added ws73-sdio.c"
+fi
 if ! grep -q "atbm6441-sdio" "$QEMU_DIR/hw/net/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_INGENIC', if_true: files('atbm6441-sdio.c'))" \
         >> "$QEMU_DIR/hw/net/meson.build"

@@ -102,6 +102,7 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "qemu/module.h"
+#include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -181,6 +182,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkIsp32State, RK_ISP32)
 #define MI_SP_FRAME     (1u << 1)
 #define MI_BP_FRAME     (1u << 25)
 #define MI_MPFBC_FRAME  (1u << 31)
+#define ISP_TRACE(s, fmt, ...) do {                                   \
+    if ((s)->trace) {                                                   \
+        qemu_log("rk-isp32 %" PRId64 " " fmt "\n",                    \
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000, ## __VA_ARGS__); \
+    }                                                                   \
+} while (0)
+
 #define READBACK_NS     4000000     /* a pass over the frame in memory */
 #define MI_MP_ENABLE    (1u << 0)
 #define MI_SP_ENABLE    (1u << 1)
@@ -252,6 +260,7 @@ struct RkIsp32State {
     bool in_frame;          /* between V_START and the frame end */
     bool readback;          /* ISP20: frames run by read-back triggers */
     bool v33;               /* ISP V33 (RV1103B): its IIR read handshake */
+    bool trace;             /* log frames and read-back triggers */
     uint32_t passes;        /* read-back passes left in this frame */
     Object *sensor;
 
@@ -777,6 +786,9 @@ static void rk_isp32_frame_end(RkIsp32State *s, bool online)
 {
     uint32_t mi = 0;
 
+    ISP_TRACE(s, "frame %u end %s mi_shd 0x%x", s->frame,
+              online ? "online" : "read-back", REG(s, R_MI_CTRL_SHD));
+
     rk_isp32_render(s);
     rk_isp32_stats_ddr(s);
     if (online) {
@@ -1001,6 +1013,15 @@ static void rk_isp32_write(void *opaque, hwaddr off, uint64_t val,
             }
             return;
         }
+        if (off == R_CSI2RX_CTRL0 && (val & 1)) {
+            ISP_TRACE(s, "read-back trigger 0x%x: passes %u en %d src %d",
+                      (uint32_t)val, s->passes,
+                      !!(REG(s, R_ISP_CTRL0) & ISP_ENABLE), s->source_on);
+        }
+        if (off == R_ISP_CTRL0 && (was_on != !!(val & ISP_ENABLE))) {
+            ISP_TRACE(s, "ISP %s, passes %u", val & ISP_ENABLE ? "on" : "off",
+                      s->passes);
+        }
         if (off == R_CSI2RX_CTRL0 && (val & 1) && !s->passes &&
             (REG(s, R_ISP_CTRL0) & ISP_ENABLE) &&
             !(s->source_gated && s->source_on)) {
@@ -1079,6 +1100,7 @@ static const Property rk_isp32_properties[] = {
     DEFINE_PROP_BOOL("source-gated", RkIsp32State, source_gated, false),
     DEFINE_PROP_BOOL("readback", RkIsp32State, readback, false),
     DEFINE_PROP_BOOL("v33", RkIsp32State, v33, false),
+    DEFINE_PROP_BOOL("trace", RkIsp32State, trace, false),
     DEFINE_PROP_LINK("sensor", RkIsp32State, sensor, TYPE_DEVICE, Object *),
 };
 

@@ -26,6 +26,14 @@
  * written: status registers whose "done" bits the drivers poll and then
  * clear by writing them (OTP's INT_STATUS).
  *
+ * wake-mode / wake-mode-bit / wake-timeout make it a PMU with a timed
+ * wake-up: when a write sets wake-mode-bit in the wake-mode register
+ * while the wake-timeout register (whole words, 32 kHz cycles) is not 0,
+ * a timer runs that long and then takes CPU 0 out of WFI.  The kernel's
+ * suspend code enables the PMU's power mode and waits in WFI; XM's AOV
+ * writes the time-out itself.  The power-down is not modelled: the code
+ * after the WFI resumes as from a sleep cut short.  "trace" logs writes.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -35,6 +43,9 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
+#include "hw/core/cpu.h"
+#include "exec/cpu-interrupt.h"
 
 #define TYPE_RK_SYSCON "rk-syscon"
 OBJECT_DECLARE_SIMPLE_TYPE(RkSysconState, RK_SYSCON)
@@ -61,7 +72,22 @@ struct RkSysconState {
     uint32_t *plain;
     uint32_t num_mirror;
     uint32_t *mirror;
+    uint32_t wake_mode, wake_mode_bit, wake_timeout;
+    QEMUTimer *wake_timer;
+    bool trace;
 };
+
+static void rk_syscon_wake(void *opaque)
+{
+    CPUState *cs = qemu_get_cpu(0);
+
+    if (((RkSysconState *)opaque)->trace) {
+        qemu_log("rk-syscon: wake-up time-out, the core wakes\n");
+    }
+    if (cs) {
+        cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
+    }
+}
 
 static bool rk_syscon_is_lock(RkSysconState *s, hwaddr off)
 {
@@ -113,21 +139,37 @@ static void rk_syscon_write(void *opaque, hwaddr off, uint64_t val,
 {
     RkSysconState *s = opaque;
     uint32_t *r = &s->regs[off / 4];
-
+    uint32_t old = *r;
     uint32_t i;
+    bool plain = !s->hiword || (s->wake_timeout && off == s->wake_timeout);
 
+    if (s->trace) {
+        qemu_log("rk-syscon %" PRId64 " %" HWADDR_PRIx " wr 0x%04x = 0x%08x\n",
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000,
+                 memory_region_get_ram_addr(&s->iomem) == RAM_ADDR_INVALID ?
+                 s->iomem.addr : 0, (uint32_t)off, (uint32_t)val);
+    }
     for (i = 0; i < s->num_plain; i++) {
         if (s->plain[i] == (off & ~3)) {
-            *r = val;
-            return;
+            plain = true;
         }
     }
-    if (s->hiword) {
+    if (plain) {
+        *r = val;
+    } else {
         uint32_t mask = val >> 16;
 
         *r = (*r & ~mask) | (val & mask);
-    } else {
-        *r = val;
+    }
+    if (s->wake_mode_bit && off == s->wake_mode && s->wake_timer) {
+        if ((*r & s->wake_mode_bit) && !(old & s->wake_mode_bit) &&
+            s->regs[s->wake_timeout / 4]) {
+            timer_mod(s->wake_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      muldiv64(s->regs[s->wake_timeout / 4],
+                               NANOSECONDS_PER_SECOND, 32768));
+        } else if (!(*r & s->wake_mode_bit)) {
+            timer_del(s->wake_timer);
+        }
     }
 }
 
@@ -145,6 +187,9 @@ static void rk_syscon_reset(DeviceState *dev)
     uint32_t i;
 
     memset(s->regs, 0, s->size);
+    if (s->wake_timer) {
+        timer_del(s->wake_timer);
+    }
     for (i = 0; i + 1 < s->num_init; i += 2) {
         if (s->init[i] < s->size) {
             s->regs[s->init[i] / 4] = s->init[i + 1];
@@ -161,6 +206,9 @@ static void rk_syscon_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &rk_syscon_ops, s,
                           TYPE_RK_SYSCON, s->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    if (s->wake_mode_bit) {
+        s->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rk_syscon_wake, s);
+    }
 }
 
 static const Property rk_syscon_props[] = {
@@ -176,6 +224,10 @@ static const Property rk_syscon_props[] = {
                       qdev_prop_uint32, uint32_t),
     DEFINE_PROP_ARRAY("mirror", RkSysconState, num_mirror, mirror,
                       qdev_prop_uint32, uint32_t),
+    DEFINE_PROP_UINT32("wake-mode", RkSysconState, wake_mode, 0),
+    DEFINE_PROP_UINT32("wake-mode-bit", RkSysconState, wake_mode_bit, 0),
+    DEFINE_PROP_UINT32("wake-timeout", RkSysconState, wake_timeout, 0),
+    DEFINE_PROP_BOOL("trace", RkSysconState, trace, false),
 };
 
 static void rk_syscon_class_init(ObjectClass *oc, const void *data)

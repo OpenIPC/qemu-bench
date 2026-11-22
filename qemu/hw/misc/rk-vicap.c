@@ -47,6 +47,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -79,6 +80,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RkVicapState, RK_VICAP)
 #define CSI_FS(p)       (1u << (p))
 #define CSI_FE(p)       (1u << (8 + (p)))
 
+#define TOISP_SRC(v)    (((v) >> 3) & 0x1f)  /* 0..3 MIPI, 4.. memory */
 #define TOISP_FS(n)     (1u << (14 + 3 * (n)))
 #define TOISP_END(n)    (1u << (20 + 3 * (n)))
 
@@ -87,12 +89,14 @@ struct RkVicapState {
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq toisp_on;
+    uint32_t toisp_more[2];         /* memory-source sends queued */
 
     uint32_t regs[REGS_SIZE / 4];
     QEMUTimer *timer[MIPI_HOSTS];
     bool in_frame[MIPI_HOSTS];
     uint32_t phase[MIPI_HOSTS];     /* the buffer being written: 0 or 1 */
     uint64_t frame_ns;              /* property: a frame's period */
+    bool trace;                     /* property: log register writes */
     Object *sensor[MIPI_HOSTS];     /* properties: each host's sensor */
     uint32_t raw_r, raw_b;          /* the sensor's response, per mille */
     uint32_t seq[MIPI_HOSTS];       /* frames captured: moves the scene */
@@ -269,8 +273,25 @@ static void rk_vicap_frame(RkVicapState *s, bool end)
     for (n = 0; n < 2; n++) {
         if (REG(s, ctrl[n]) & 1) {
             REG(s, R_GLB_INTST) |= end ? TOISP_END(n) : TOISP_FS(n);
+            /*
+             * A channel fed from memory (source ID 4 and up, the frame a
+             * MIPI host captured to DDR) sends one frame a write: the
+             * driver writes the control again for each.  So the ISP runs
+             * at the rate the driver feeds it, and stops when it stops
+             * -- as XM's AOV single-frame mode needs to drain its
+             * encoders.  A MIPI source (0..3) streams.
+             */
+            if (end && TOISP_SRC(REG(s, ctrl[n])) >= 4) {
+                if (s->toisp_more[n]) {
+                    s->toisp_more[n]--;
+                } else {
+                    REG(s, ctrl[n]) &= ~1;
+                }
+            }
         }
     }
+    qemu_set_irq(s->toisp_on, ((REG(s, R_TOISP0_CTRL) |
+                                REG(s, R_TOISP1_CTRL)) & 1));
     rk_vicap_update(s);
 }
 
@@ -301,6 +322,11 @@ static void rk_vicap_write(void *opaque, hwaddr off, uint64_t val,
     RkVicapState *s = opaque;
     int h;
 
+    if (s->trace && off != R_GLB_INTST) {
+        qemu_log("rk-vicap %" PRId64 " wr 0x%04x = 0x%08x\n",
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000,
+                 (uint32_t)off, (uint32_t)val);
+    }
     if (off == R_GLB_INTST) {
         REG(s, R_GLB_INTST) &= ~val;
         rk_vicap_update(s);
@@ -312,6 +338,11 @@ static void rk_vicap_write(void *opaque, hwaddr off, uint64_t val,
             rk_vicap_update(s);
             return;
         }
+    }
+    if ((off == R_TOISP0_CTRL || off == R_TOISP1_CTRL) && (val & 1) &&
+        (REG(s, off) & 1) && TOISP_SRC(val) >= 4) {
+        /* sent again before the last frame ended: one more frame */
+        s->toisp_more[off == R_TOISP1_CTRL]++;
     }
     s->regs[off / 4] = val;
     for (h = 0; h < MIPI_HOSTS; h++) {
@@ -341,6 +372,7 @@ static void rk_vicap_reset(DeviceState *dev)
     int h;
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->toisp_more[0] = s->toisp_more[1] = 0;
     for (h = 0; h < MIPI_HOSTS; h++) {
         timer_del(s->timer[h]);
         s->in_frame[h] = false;
@@ -368,6 +400,7 @@ static void rk_vicap_init(Object *obj)
 static const Property rk_vicap_properties[] = {
     DEFINE_PROP_UINT64("frame-ns", RkVicapState, frame_ns,
                        NANOSECONDS_PER_SECOND / 30),
+    DEFINE_PROP_BOOL("trace", RkVicapState, trace, false),
     DEFINE_PROP_LINK("sensor0", RkVicapState, sensor[0], TYPE_DEVICE, Object *),
     DEFINE_PROP_LINK("sensor1", RkVicapState, sensor[1], TYPE_DEVICE, Object *),
     DEFINE_PROP_UINT32("raw-r", RkVicapState, raw_r, 606),

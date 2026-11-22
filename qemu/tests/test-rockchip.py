@@ -999,6 +999,25 @@ def qmp_qom_get(sock_path, path, prop):
     return r.get('return')
 
 
+def qmp_qom_set(sock_path, path, prop, value):
+    import json
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock_path)
+    f = s.makefile('rw', buffering=1)
+    f.readline()                                            # greeting
+    for c in ({'execute': 'qmp_capabilities'},
+              {'execute': 'qom-set',
+               'arguments': {'path': path, 'property': prop,
+                             'value': value}}):
+        f.write(json.dumps(c) + '\n'); f.flush()
+        while True:
+            r = json.loads(f.readline())
+            if 'return' in r or 'error' in r:
+                break
+    s.close()
+    return r
+
+
 def test_pwm_output(qemu, path):
     # rk-pwm's outputN: the pin's high time in permille, polarity-aware
     tmp = tempfile.mkdtemp()
@@ -1017,6 +1036,15 @@ def test_pwm_output(qemu, path):
         check(get(1) == 250, 'PWM output1: 25%% duty high -> %r' % get(1))
         qt.writel(P + 0x1c, 1 << 1 | 1)             # duty low
         check(get(1) == 750, 'PWM output1: 25%% duty low -> %r' % get(1))
+        # rk-gpio "inputs": a key pressed at run time, seen on EXT_PORT
+        G = 0xFF380000
+        before = qt.readl(G + 0x70)
+        qmp_qom_set(qsock, '/machine/gpio0', 'inputs', before | 1 << 2)
+        pressed = qt.readl(G + 0x70)
+        qmp_qom_set(qsock, '/machine/gpio0', 'inputs', before)
+        check(pressed == before | 1 << 2 and qt.readl(G + 0x70) == before,
+              'GPIO inputs (qom-set): GPIO0_A2 pressed and released '
+              '(%x %x)' % (before, pressed))
     finally:
         qt.close()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1064,6 +1092,17 @@ def test_sd_write(qemu, path):
         cmd(25, 8 * 512, R | 1 << 8 | 1 << 9 | 1 << 10)
         cmd(12, 0, R | 1 << 14)
         d = qt.read(desc, 4)
+        # PIO, as dw_mmc sends a short transfer: BMOD's IDMAC off, CTRL's
+        # USE_IDMAC left on; TXDR asks for the data, DTO once it is in
+        hcon = qt.readl(M + 0x70)
+        qt.writel(M + 0x80, 0)                      # BMOD: no IDMAC
+        qt.writel(M + 0x20, 512)                    # BYTCNT
+        cmd(24, 16 * 512, R | 1 << 9 | 1 << 10)
+        pio_before = qt.readl(M + 0x44)
+        pio = b'PIOWRITE' * 64
+        for i in range(0, 512, 4):
+            qt.writel(M + 0x200, struct.unpack_from('<I', pio, i)[0])
+        pio_after = qt.readl(M + 0x44)
     finally:
         qt.close()
     data = open(img, 'rb').read()
@@ -1071,6 +1110,61 @@ def test_sd_write(qemu, path):
     check(data[8 * 512:8 * 512 + 1024] == b'OPENENDED' * 113 + b'!!!!!!!'
           and not struct.unpack('<I', d)[0] & 1 << 31,
           'SD: CMD25 with BYTCNT 0 writes the IDMAC chain (2 blocks)')
+    check((hcon >> 7) & 7 == 1, 'MSHC HCON: a 32-bit FIFO (0x%x)' % hcon)
+    check(pio_before & 1 << 4 and not pio_before & 1 << 3
+          and pio_after & 1 << 3 and not pio_after & 1 << 4
+          and data[16 * 512:17 * 512] == pio,
+          'SD: a PIO write asks for its data (TXDR), DTO once the FIFO has '
+          'the block (0x%x, 0x%x)' % (pio_before, pio_after))
+
+
+def test_ws73(qemu, path):
+    # wifi=ws73: the SDIO card on the RV1106's SDIO slot (MSHC 1),
+    # enumerated as the kernel does, then a host message by PIO
+    qt = QTest(qemu, 'rv1106,flash-file=' + path + ',wifi=ws73')
+    try:
+        M = 0xFF9A0000
+        R = 1 << 6
+
+        def cmd(idx, arg=0, flags=R):
+            qt.writel(M + 0x44, 0xffffffff)         # RINTSTS clear
+            qt.writel(M + 0x28, arg)
+            qt.writel(M + 0x2c, 1 << 31 | flags | idx)
+            return qt.readl(M + 0x30)
+
+        def cmd52(fn, addr, data=None):
+            arg = fn << 28 | addr << 9
+            if data is not None:
+                arg |= 1 << 31 | data
+            return cmd(52, arg) & 0xff
+
+        qt.writel(M + 0x04, 1)                      # PWREN
+        ocr = cmd(5, 0)
+        ready = cmd(5, 0x00ff8000)
+        rca = cmd(3) & 0xffff0000
+        cmd(7, rca)
+        cccr = cmd52(0, 0x00)
+        cis = cmd52(0, 0x09) | cmd52(0, 0x0a) << 8 | cmd52(0, 0x0b) << 16
+        manf = bytes(cmd52(0, cis + i) for i in range(6))
+        cmd52(0, 0x02, 0x02)                        # enable function 1
+        # WRITE_MSG (0x24) = 1 << 14 by CMD53, 4 bytes by PIO: the host's
+        # wait-ready; the chip answers with message 8 ("BSP ready")
+        qt.writel(M + 0x80, 0)                      # BMOD: no IDMAC
+        qt.writel(M + 0x1c, 4)
+        qt.writel(M + 0x20, 4)
+        cmd(53, 1 << 31 | 1 << 28 | 1 << 26 | 0x24 << 9 | 4,
+            R | 1 << 9 | 1 << 10)
+        qt.writel(M + 0x200, 1 << 14)
+        st = cmd52(1, 0x08)
+    finally:
+        qt.close()
+    check(ocr >> 28 & 7 == 1 and ready & 1 << 31,
+          'ws73: CMD5 one function, then ready (%08x %08x)' % (ocr, ready))
+    check(cccr == 0x43 and manf == bytes([0x20, 4, 0xd1, 0x12, 0x73, 0]),
+          'ws73: CCCR 0x%02x, CIS at 0x%x: MANFID 0x12D1 / 0x0073 (%s)'
+          % (cccr, cis, manf.hex()))
+    check(st & 1 << 2, 'ws73: WRITE_MSG wait-ready by PIO, the chip answers '
+          '(INT_STATUS 0x%02x)' % st)
 
 
 def test_i2s_rv1106(qt):
@@ -1479,6 +1573,23 @@ def test_rv1103b(qemu, path):
             SFC = saved
         check(jedec == 0x1820c2, 'rv1103b FSPI: JEDEC ID %06x' % jedec)
         check(qt.readl(0x20680000 + 0x6f0) == 0x04000000, 'crypto v4')
+        # DDRC (DW uMCTL2): STAT follows the suspend code's self-refresh
+        ddrc = 0x20C00000
+        st0 = qt.readl(ddrc + 0x04)
+        qt.writel(ddrc + 0x30, 1 << 5)              # PWRCTL selfref_sw
+        st1 = qt.readl(ddrc + 0x04)
+        qt.writel(ddrc + 0x30, 0)
+        check(st0 & 7 == 1 and st1 & 7 == 3 and (st1 >> 4) & 3 == 2
+              and qt.readl(ddrc + 0x04) & 7 == 1,
+              'rv1103b DDRC: STAT normal, self-refresh by software, normal '
+              '(%x %x)' % (st0, st1))
+        # PMU: hiword registers, the time-out a whole word (32 kHz cycles)
+        pmu = 0x20510000
+        qt.writel(pmu + 0x4094, 0x16666)            # 2.8 s, as XM's AOV
+        qt.writel(pmu + 0x4020, 0xffff0f47)
+        check(qt.readl(pmu + 0x4094) == 0x16666
+              and qt.readl(pmu + 0x4020) == 0x0f47,
+              'rv1103b PMU: time-out stored whole, wake-up config hiword')
         rng = 0x20690000
         qt.writel(rng + 0x10, 0xffff0000)
         qt.writel(rng + 0x10, 0xffff0008)                  # SW_DRNG_REQ
@@ -2054,6 +2165,7 @@ def main():
     test_rv1103b(args.qemu, path)
     test_pwm_output(args.qemu, path)
     test_sd_write(args.qemu, path)
+    test_ws73(args.qemu, path)
     test_sai_files(args.qemu, path)
     test_rv1109(args.qemu, tmp)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))

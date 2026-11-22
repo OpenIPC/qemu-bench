@@ -20,7 +20,8 @@
  *
  * Pins are qdev GPIOs both ways: inputs set what an input pin reads
  * (property "input-levels" for their state at reset), outputs follow DR
- * on the pins set to output.
+ * on the pins set to output.  "inputs" reads and sets every input pin at
+ * run time (QMP qom-set): a key press, a PIR sensor, a wake-up line.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -33,6 +34,7 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include "qapi/visitor.h"
 
 #define TYPE_RK_GPIO "rk-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(RkGpioState, RK_GPIO)
@@ -195,6 +197,27 @@ static void rk_gpio_reset(DeviceState *dev)
     s->last_level = rk_gpio_levels(s);
 }
 
+static void rk_gpio_get_inputs(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    RkGpioState *s = RK_GPIO(obj);
+
+    visit_type_uint32(v, name, &s->in, errp);
+}
+
+static void rk_gpio_set_inputs(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    RkGpioState *s = RK_GPIO(obj);
+    uint32_t val;
+
+    if (!visit_type_uint32(v, name, &val, errp)) {
+        return;
+    }
+    s->in = val;
+    rk_gpio_update(s);
+}
+
 static void rk_gpio_init(Object *obj)
 {
     RkGpioState *s = RK_GPIO(obj);
@@ -206,6 +229,8 @@ static void rk_gpio_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     qdev_init_gpio_in(dev, rk_gpio_set_input, 32);
     qdev_init_gpio_out(dev, s->out, 32);
+    object_property_add(obj, "inputs", "uint32", rk_gpio_get_inputs,
+                        rk_gpio_set_inputs, NULL, NULL);
 }
 
 static const Property rk_gpio_properties[] = {

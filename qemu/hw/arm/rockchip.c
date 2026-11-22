@@ -310,6 +310,11 @@ typedef struct RkSoCConfig {
     int npu_irq;
     hwaddr vepu_base;           /* VEPU540C H.265 encoder */
     hwaddr hpmcu_base;          /* RV1103B HPMCU mailbox (wrap encoding) */
+    hwaddr ddrc_base;           /* DW uMCTL2: the suspend code's handshake */
+    uint32_t pmu_wake_mode;     /* PMU syscon: PWR_MODE_CON (bit 0 on) */
+    uint32_t pmu_wake_timeout;  /* ... and its 32 kHz wake-up time-out */
+    const uint32_t *pmu_plain;  /* PMU registers written as whole words */
+    int n_pmu_plain;
     bool vepu541;               /* ... the RV1126's VEPU541 */
     hwaddr vepu2_base;          /* VEPU2: JPEG (RV1126) */
     int vepu2_irq;
@@ -331,6 +336,8 @@ typedef struct RkSoCConfig {
     hwaddr gmac_base;
     int gmac_irq;
     uint8_t gmac_phy;           /* its PHY's MDIO address */
+    uint8_t ws73_irq;           /* wifi=ws73: XM's board's interrupt pin,
+                                 * a Linux GPIO number (syschannel.ko) */
     hwaddr mmc_base[3];         /* SD, SDIO, eMMC: -drive if=sd,index=n */
     int mmc_irq[3];
     hwaddr mbox_base;
@@ -443,7 +450,11 @@ typedef struct RkSoCConfig {
     .rknpu_base     = 0xFF660000,   /* "rockchip,rv1106-rknpu" */        \
     .rknpu_irq      = 109,                                              \
     .vepu_pp_base   = 0xFFA60000,   /* "rockchip,rkvenc-pp-rv1106" */    \
-    .vepu_pp_irq    = 108
+    .vepu_pp_irq    = 108,                                              \
+    .ws73_irq       = 70,           /* G2: GPIO2_A6 */                  \
+    .ddrc_base      = 0xFF800000,                                       \
+    .pmu_wake_mode  = 0x04,         /* the kernel's suspend code */     \
+    .pmu_wake_timeout = 0x48        /* XM's AOV suspend time x 32.768 */
 
 static const RkSoCConfig rv1103_soc = {
     .desc = "Rockchip RV1103 (Cortex-A7, 64 MiB DDR2)",
@@ -466,10 +477,16 @@ static const RkSoCConfig rv1106_soc = {
  * the SFC by another name.  The boot ROM contract is the RV1106's:
  * IRAM at 0x210F6000 (boot source at +0x10), ATAGs at 2M - 8K.
  */
+/* the RV1103B PMU's time-out and the counters around it: whole words */
+static const uint32_t rv1103b_pmu_plain[] = {
+    0x4080, 0x4084, 0x4088, 0x408c, 0x4090, 0x4094, 0x4098, 0x409c,
+};
+
 static const RkSoCConfig rv1103b_soc = {
     .desc = "Rockchip RV1103B / RV1106B (Cortex-A7, 64 MiB DDR2)",
     .ram_size_default = 64 * MiB,
     .soc_id         = 0x1103,
+    .ws73_irq       = 68,           /* XM's board: GPIO2_A4 */
     .periph_base    = 0x20000000,
     .periph_size    = 0x01200000,
     .gic_base       = 0x20410000,
@@ -537,6 +554,12 @@ static const RkSoCConfig rv1103b_soc = {
     .vepu_base      = 0x20E80000,
     .vepu_irq       = 62,
     .hpmcu_base     = 0x20A10000,           /* rockit's vmcu, mailbox */
+    .ddrc_base      = 0x20C00000,
+    .pmu_base       = 0x20510000,
+    .pmu_wake_mode  = 0x4004,       /* PMU1 PWR_MODE_CON */
+    .pmu_wake_timeout = 0x4094,
+    .pmu_plain      = rv1103b_pmu_plain,
+    .n_pmu_plain    = ARRAY_SIZE(rv1103b_pmu_plain),
 };
 
 /*
@@ -696,6 +719,7 @@ struct RkMachineState {
     uint32_t gpio_levels[5];    /* parsed gpio_high, per bank */
     char *tb_isp;               /* "ADDR:CAMS[:STRIDE]": the MCU's ISP heads */
     char *gc6160;               /* "CLK:DATA": the motor driver's GPIOs */
+    char *wifi;                 /* the SDIO slot's Wi-Fi: "ws73" */
     int gc_clk, gc_data;        /* parsed, Linux GPIO numbers; -1 none */
     uint64_t tb_addr;
     uint32_t tb_cams, tb_stride;
@@ -806,6 +830,23 @@ static void rk_machine_set_gpio_high(Object *obj, const char *value,
     memcpy(s->gpio_levels, lv, sizeof(lv));
     g_free(s->gpio_high);
     s->gpio_high = g_strdup(value);
+}
+
+static char *rk_machine_get_wifi(Object *obj, Error **errp)
+{
+    return g_strdup(RK_MACHINE(obj)->wifi ?: "");
+}
+
+static void rk_machine_set_wifi(Object *obj, const char *value, Error **errp)
+{
+    RkMachineState *s = RK_MACHINE(obj);
+
+    if (*value && strcmp(value, "ws73")) {
+        error_setg(errp, "wifi: ws73 or nothing, not '%s'", value);
+        return;
+    }
+    g_free(s->wifi);
+    s->wifi = *value ? g_strdup(value) : NULL;
 }
 
 static char *rk_machine_get_gc6160(Object *obj, Error **errp)
@@ -1630,6 +1671,10 @@ static void rk_create_more(RkMachineState *s, const RkSoCConfig *c)
     if (c->rtc_base) {
         sysbus_create_simple("rk-rtc", c->rtc_base, rk_irq(s, c->rtc_irq));
     }
+    if (c->ddrc_base) {
+        sysbus_create_simple("rk-ddrc", c->ddrc_base, NULL);
+    }
+
 
     /* DW APB watchdog; the kernel's dw_wdt reads its clock as 24 MHz */
     dev = qdev_new("fh-wdt");
@@ -1927,7 +1972,8 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
 
     /* GMAC: dwmac-4.20a with a PHY at the SoC's / board's MDIO address */
     dev = qdev_new("axera-eqos");
-    qemu_configure_nic_device(dev, true, NULL);
+    /* with the Wi-Fi the default -nic is the chip's: wlan0 is the net */
+    qemu_configure_nic_device(dev, !s->wifi || !*s->wifi, NULL);
     qdev_prop_set_uint8(dev, "phy-addr", c->gmac_phy);
     qdev_prop_set_uint8(dev, "snps-ver", 0x42);
     sbd = SYS_BUS_DEVICE(dev);
@@ -1944,7 +1990,21 @@ static void rk_create_tail(RkMachineState *s, const RkSoCConfig *c)
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, c->mmc_base[i]);
         sysbus_connect_irq(sbd, 0, rk_irq(s, c->mmc_irq[i]));
-        if (di) {
+        if (i == 1 && s->wifi && !strcmp(s->wifi, "ws73")) {
+            /* XM's battery boards: a WS73 on the SDIO slot */
+            DeviceState *card = qdev_new("ws73-sdio");
+            g_autofree char *bank = g_strdup_printf("gpio%d",
+                                                     c->ws73_irq / 32);
+            DeviceState *gpio = DEVICE(object_resolve_path_component(
+                                           OBJECT(s), bank));
+
+            qemu_configure_nic_device(card, true, NULL);
+            qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                   &error_fatal);
+            /* its interrupt: the GPIO XM's syschannel asks for */
+            qdev_connect_gpio_out_named(card, "wake", 0,
+                qdev_get_gpio_in(gpio, c->ws73_irq % 32));
+        } else if (di) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);
 
             qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
@@ -2058,7 +2118,17 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
     }
     rk_syscon(c->grf_base, c->grf_size, NULL, 0, NULL, 0);
     if (c->pmu_base) {
-        rk_syscon(c->pmu_base, 0x10000, NULL, 0, NULL, 0);
+        DeviceState *pmu = rk_syscon_new(0x10000, NULL, 0, NULL, 0);
+
+        rk_prop_list(pmu, "plain-regs", c->pmu_plain, c->n_pmu_plain);
+        if (c->pmu_wake_timeout) {
+            /* a timed wake-up from the kernel's suspend (XM's AOV) */
+            qdev_prop_set_uint32(pmu, "wake-mode", c->pmu_wake_mode);
+            qdev_prop_set_uint32(pmu, "wake-mode-bit", 1);
+            qdev_prop_set_uint32(pmu, "wake-timeout", c->pmu_wake_timeout);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, c->pmu_base);
     }
     if (c->pmuioc_base) {
         rk_syscon(c->pmuioc_base, 0x8000, NULL, 0, NULL, 0);
@@ -2315,6 +2385,11 @@ static void rk_machine_class_init(ObjectClass *oc, const void *data)
         "The OTG port's role: host (QEMU's DWC3 + xHCI; default) or device "
         "(rk-dwc3: the gadget enumerated by a built-in host, a CDC ECM "
         "function bridged to -nic ...,model=usb-gadget)");
+    object_class_property_add_str(oc, "wifi",
+        rk_machine_get_wifi, rk_machine_set_wifi);
+    object_class_property_set_description(oc, "wifi",
+        "A Wi-Fi chip on the SDIO slot: ws73 (XM's battery boards, the G2 "
+        "and the RV1103B)");
     object_class_property_add_str(oc, "gc6160",
         rk_machine_get_gc6160, rk_machine_set_gc6160);
     object_class_property_set_description(oc, "gc6160",

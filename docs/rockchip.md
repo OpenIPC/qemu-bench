@@ -360,7 +360,76 @@ Machine options besides the flash:
 - `gpio-high=`: input pins that idle high, as a pull-up on the board
   holds them, `/`-separated: bank, port, pin (`4C0/0A2`). Any other
   input nothing drives reads 0. The G2's reset button is `4C0` (see
-  Xiongmai firmware).
+  Xiongmai firmware). At run time each bank's `inputs` property (QMP `qom-set
+  /machine/gpioN inputs`, a bit a pin) sets every input pin: a key
+  press, a PIR sensor.
+- `wifi=ws73`: a HiSilicon WS73 SDIO Wi-Fi chip (vendor 0x12D1,
+  product 0x0073) on the SDIO slot, as XM's battery boards (G2, RV1103B)
+  carry it. The host driver is XM's `syschannel.ko`, HiSilicon's `hcc`
+  transport, which is public in the WS73 Linux SDK
+  (`driver/platform/hcc/host/hcc_sdio_host.c`). The chip runs its own
+  firmware, so nothing is downloaded.
+  - The card enumerates: CCCR, the CIS with MANFID 0x12D1 / 0x0073, and
+    function 1. The MSHC passes an SDIO card's interrupt through as
+    RINTSTS bit 16. It also does PIO writes, which is how Linux's dw_mmc
+    sends transfers under 16 bytes such as an SDIO register: TXDR asks
+    for the data, and the card gets it once the FIFO holds the whole
+    transfer. The IDMAC moves data only while BMOD enables it, and HCON
+    reports a 32-bit FIFO (it said 16-bit before).
+  - Function 1 has the FIFO (0x00), `INT_STATUS` / `INT_ENABLE` (0x08 /
+    0x09: bit 0 data ready, 2 message), `WRITE_MSG` (0x24: one bit per
+    host message) and the extend area at 0x30. The host reads that area
+    on every interrupt: `int_stat`, `msg_stat`, `xfer_count`,
+    `credit_info`, then the buffer lengths.
+  - Host messages are `1 << n` in `WRITE_MSG`.
+    `syschannel_host_wait_ready` sends 14 and waits for 8 ("BSP ready").
+    Before the SoC sleeps the host sends 16 and waits for the suspend
+    ack, 15. Without that ack the RV1103B's App decides the channel is
+    stuck ("FuncStuck: unbind Syschannel") and reboots. The driver loads
+    in about 4 s; without the chip it spent 30 s waiting for the SDIO
+    card and 33 s retrying.
+  - The chip interrupts on a GPIO, not on DAT1: XM's driver sets
+    `g_sdio_intr_mode` 1 and asks for a rising-edge GPIO: Linux GPIO 70
+    (GPIO2_A6) on the G2, 68 (GPIO2_A4) on the RV1103B board. The model
+    drives that pin while anything is pending.
+  - Packets both ways are `hcc` ones: a header (bits 7:4 service, 3:0
+    sub-type, the queue, a 16-bit length that includes the header), then
+    the payload, 32-byte aligned. Each host write starts with a 64-byte
+    descriptor. XM's queues are 0 for syschannel messages and 1 for
+    `wlan0`'s Ethernet frames; the chip names the RX queue in the extend
+    area. Both payloads are a big-endian length, two bytes, the data.
+  - The messages carry XM's App protocol to the chip's firmware
+    (`UartControlWlan`, `7B len cmd … sum` frames). The real chip joins
+    the AP and runs DHCP. The model instead answers the App's first
+    command with the station's MAC (cmd 9, the NIC's, which the App sets
+    on `eth2` with `ifconfig`; without it `wlan0` sends from
+    00:00:00:00:00:00), the address (cmd 8: slirp's 10.0.2.15/24,
+    gateway 10.0.2.2, DNS 10.0.2.3) and "DHCP SUCESS" (cmd 1). The App
+    then sets up `eth2`, its name for the Wi-Fi interface, and leaves
+    "wait wifi connect". On the RV1103B `wlan0` is already up when the
+    MAC comes, and syschannel refuses it ("cannot set address; device
+    running!"), so that board's frames still go out from
+    00:00:00:00:00:00. slirp answers them all the same.
+  - The App asks for the charge state with cmd 0x95 and waits half a
+    second for cmd 0xa4 (bit 0 a charger, bit 1 full). The model answers
+    0, on battery. Unanswered, the App logged "get charge state failed"
+    every 2 s.
+  - The RV1103B's App asks for the battery level with cmd 0x13
+    (`GetMcuPower`). The model answers with cmd 0x0b, the MCU's ADC
+    result: 0x31, 0, then the percentage, which is `-global
+    ws73-sdio.battery=N` (default 90). Unanswered, it logged a time-out
+    and "bat not get" every 2 s.
+  - `wlan0`'s frames go to the default `-nic` (the GMAC gets one only
+    when it is named), so `-nic user,hostfwd=tcp::34567-:34567` reaches
+    the App's DVRIP port over Wi-Fi. Frames are dropped until the App's
+    first command, because syschannel oopses on one before `wlan0` is up
+    (slirp's router advertisements come early).
+  - The G2's firmware has no RTSP server: port 554 is closed.
+  - Both boards answer DVRIP over Wi-Fi (`NetWork.NetCommon` shows
+    the MAC 00:11:22:33:44:55). Left idle, the RV1103B's App goes to AOV
+    sleep after about a minute: it turns TCP TX off, closes the channel
+    and lets the SDIO card go, because the real chip keeps the link while
+    the SoC sleeps.
 - `gc6160=CLK:DATA`: XM's GC6160 pan / tilt motor and IR-cut driver
   (`XmMotor.ko`, `g_useI2c=3`). It is an I2C device bit-banged on two
   GPIOs, given as Linux GPIO numbers (bank × 32 + pin, the module's
@@ -592,7 +661,8 @@ The test checks these milestones in order:
 
 The R5 reaches getty in about 3 s, the G2 and the RV1103B in about 34 s.
 Most of the time on the G2 and the RV1103B is their SDIO Wi-Fi driver
-(`hcc`) waiting 30 s for a card that isn't there.
+(`hcc`) waiting 30 s for a card that isn't there. With `wifi=ws73` the
+card is there, and the driver loads in about 4 s.
 
 Messages that are expected, because the hardware isn't modelled:
 
@@ -602,11 +672,36 @@ Messages that are expected, because the hardware isn't modelled:
 - the G2's ISP: "wait thunderboot over timeout"
 - on the G2, sometimes, `Yuv_getChnFrame` timeouts on the second camera's
   AI channel (VPSS group 1, channel 1, 640x384), about one every 2 s.
-  - It showed in 1 boot of 5. In the others both cameras' detectors ran
-    about 600 frames each in 180 s, with rockiva reporting 0 objects.
-  - When it happens, the channel's frames keep coming (its RGA buffer
-    recycles as often as camera 0's), but the one frame rockiva took
-    first is never released.
+  This is a race in XM's App, which emulation timing widens; it isn't a
+  model fault.
+  - It shows in about 1 boot in 10 (more when the guest runs slower,
+    such as with tracing on or many emulators in parallel). In the
+    others both cameras' detectors run about 600 frames each in 180 s,
+    and rockiva reports 0 objects.
+  - The App starts feeding both detectors before its second
+    `ROCKIVA_DETECT_Init` has returned. That init sets the frame-release
+    callback (`ROCKIVA_SetFrameReleaseCallback`). When cam 1's first
+    frame is done before then, rockiva has no callback to give it back
+    to (`NotifyRelease` with no "before callback" line), and the frame
+    is never released.
+  - In the failing boot seen, the second init took 2 s, all of it
+    printing RKNN's per-layer profile at `rt_log_level=5`. Normally it
+    takes about 0.2 s.
+  - The channel's frames keep coming (its RGA buffer recycles as often
+    as camera 0's), but with that one frame held the channel has none
+    left to give.
+  - Separately, about 1 boot in 15 freezes both cameras' AI channels
+    from the start (`u32TimeRef` stuck). This is not a model stall
+    either.
+    - The ISP keeps running (`-global rk-isp32.trace=on -D file` logs
+      each read-back trigger and frame end).
+    - So does the RGA (`-global rk-rga2.trace=on` logs each job with its
+      sizes), including the 1920x1080 → 640x384 scale that feeds both AI
+      channels.
+    - What stops is the App's 640x384 → 640x384 copy, made after each
+      frame it gets from the channel: 2 jobs instead of about 600. The
+      frames are made, but `GetChnFrame` never hands them over. That is
+      a hand-off inside rockit at start-up, not understood further.
   - rockit's repeated "AVS ... release mb buf_id(207)" lines are normal
     buffer reuse; the fd printed is stale.
   - Without `tb-isp` the kernel asks VICAP for online capture of both
@@ -949,6 +1044,55 @@ RV1103 / RV1106:
   modelled by what it does, not run. It starts armed online jobs for the
   ISP's current pipe and posts each frame end to rockit. It posts no
   quarter-frame events (1–3), and it ignores AVS and the log buffer.
+  - XM's AOV (always-on video) sleep runs, with `wifi=ws73`. The
+    RV1103B's App goes to AOV after about a minute idle:
+    - It hands the Wi-Fi to the chip and switches the cameras to single
+      frames (`AOV_MODE_SINGLE_FRAME`). It drains each encoder until
+      `GetStream` times out, takes one frame and writes `mem` to
+      `/sys/power/state`.
+    - Draining needs VICAP to stop feeding the ISP. A TOISP channel whose
+      source is memory (source ID 4 and up: the frame a MIPI host
+      captured to DDR, as the two-sensor RV1103B runs) sends one frame
+      per control write. The driver writes it for each frame, so the ISP
+      runs at the rate it is fed (12 fps here) and stops when the driver
+      stops. A MIPI source (0–3, the single-sensor R5's) streams. Before,
+      camera 0's encoder never ran dry and the App never left the switch.
+    - The kernel's sleep code takes the DRAM out of the DDR controller's
+      low-power modes and into self-refresh. `rk-ddrc` (DW uMCTL2 at
+      0x20C00000) answers its STAT polls.
+    - It then sets up the PMU (an `rk-syscon` with a timed wake-up,
+      0x20510000) and enters WFI. The App writes the wake-up time-out
+      itself, through `/dev/mem`: its suspend time × 32.768, in 32 kHz
+      cycles at +0x4094 (0x16666 for 2.8 s). When the power mode is
+      enabled (PWR_MODE_CON +0x4004 bit 0), the model arms a timer for
+      the time-out, and at the end the core leaves WFI.
+    - The G2 (RV1106) does the same after about 45 s idle: its DDR
+      controller at 0xFF800000, the PMU time-out at 0xFF300048 and
+      PWR_MODE_CON at +0x04, with an 850 ms suspend time. Before, it
+      hung in the sleep code and the watchdog rebooted it.
+    - The logic isn't powered down. The kernel prints "Failed to suspend"
+      after the WFI and resumes as from a sleep cut short (`PM: suspend
+      exit`). The App wakes (`AovWake`), checks its PIR and AI result on
+      the frame, and sleeps again: a cycle every 2.8 s, as on the
+      camera.
+    - A key press ends AOV. The power key is GPIO0_A2 (gpio-keys, a wake
+      source), and `inputs` on `/machine/gpio0` presses it at run time:
+      ```
+      {"execute": "qom-set", "arguments": {"path": "/machine/gpio0",
+       "property": "inputs", "value": 5}}
+      ```
+      Then set it back to 1 (with `gpio-high=0A0`, GPIO0_A0 stays high).
+      The kernel resumes on it ("Resume caused by IRQ 52, GPIO Key
+      Power"). The App sees the key (`iIrqStat 1`), wakes fully
+      (`m_iAovWakeReason 1`, `AovQuit`), binds syschannel again (the SDIO
+      card re-probes) and reports "connect AP, after". DVRIP answers over
+      the Wi-Fi about 5 s after the press. The chip model reports the
+      station again (MAC, address, DHCP) after every host wait-ready, so
+      the second bind finds the network the same as the first.
+    - The G2's power key is GPIO0_A2 too, and the same press wakes it
+      (`inputs` 4, then 0: its `gpio-high=4C0` is on bank 4). DVRIP
+      answers about 5 s after the press.
+
 - **RKVENC-PP** (`rk-vepu-pp`, `0xFFA60000`, SPI 108), the encoder's
   pre-processor for the smart features. The kernel (kmpp
   `mpp_rkvenc_pp.c`) writes the job, then `ENC_STRT` (0x10) = 1, and waits
