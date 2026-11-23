@@ -1314,23 +1314,130 @@ static void rk_write_atags(const RkSoCConfig *c, uint64_t ram_size)
  * 0.  An image with an address is data the ROM copies there: thunder-boot
  * IDBs carry the ISP's fast-AE tables this way (flag 0x10007, at 0x40000).
  */
+static const gsize rk_idb_probe[] = { 0x0, 0x10000, 0x8000, 0x20000, 0x40000 };
+
+/*
+ * The older ID block (header v1, the RV1126's and RK3399's, U-Boot
+ * tools/rkcommon.c struct header0_info): sector 0 is RC4-scrambled with a
+ * fixed key and holds magic 0x0ff0aa55, init_offset (0x0c, sectors),
+ * init_size (0x1fa) and init_boot_size (0x1fc, both sectors from
+ * init_offset).  The DDR blob is [init_offset, + init_size), the SPL the
+ * rest up to init_boot_size; their data is plain when disable_rc4 (0x08)
+ * is set, as mkimage's rksd writes it.
+ */
+static void rk_rc4(uint8_t *buf, size_t len)
+{
+    static const uint8_t key[16] = {
+        124, 78, 3, 4, 85, 5, 9, 7, 45, 44, 123, 56, 23, 13, 23, 17
+    };
+    uint8_t st[256], t;
+    unsigned i, j = 0, k = 0;
+
+    for (i = 0; i < 256; i++) {
+        st[i] = i;
+    }
+    for (i = 0; i < 256; i++) {
+        j = (j + st[i] + key[i % 16]) & 0xff;
+        t = st[i]; st[i] = st[j]; st[j] = t;
+    }
+    for (i = j = 0; k < len; k++) {
+        i = (i + 1) & 0xff;
+        j = (j + st[i]) & 0xff;
+        t = st[i]; st[i] = st[j]; st[j] = t;
+        buf[k] ^= st[(st[i] + st[j]) & 0xff];
+    }
+}
+
+static bool rk_boot_rom_setup_v1(const uint8_t *img, gsize len,
+                                 const RkSoCConfig *c, uint64_t ram_size)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(rk_idb_probe); i++) {
+        gsize hdr = rk_idb_probe[i];
+        uint8_t h[512];
+        uint32_t off, init, total, src, size;
+
+        if (hdr + 512 > len) {
+            continue;
+        }
+        memcpy(h, img + hdr, 512);
+        rk_rc4(h, 512);
+        if (ldl_le_p(h) != 0x0ff0aa55) {
+            continue;
+        }
+        if (!ldl_le_p(h + 8)) {
+            error_report("rockchip: v1 ID block at 0x%zx has RC4-scrambled "
+                         "images", hdr);
+            return false;
+        }
+        off = lduw_le_p(h + 0x0c);
+        init = lduw_le_p(h + 0x1fa);
+        total = lduw_le_p(h + 0x1fc);
+        src = hdr + (off + init) * 512;
+        size = total > init ? (total - init) * 512 : 0;
+        if (!size || src >= len) {
+            error_report("rockchip: v1 ID block at 0x%zx has no SPL", hdr);
+            return false;
+        }
+        size = MIN(size, len - src);
+        rom_add_blob_fixed("rockchip.idb1", img + src, size, RK_DDR_BASE);
+        rk_write_atags(c, ram_size);
+        {
+            uint32_t id = cpu_to_le32(BROM_BOOT_SPINOR);
+
+            rom_add_blob_fixed("rockchip.bootsource", &id, 4,
+                               c->sram_base + 0x10);
+        }
+        return true;
+    }
+    return false;
+}
+
+/* An ID block, either kind, at one of the places the ROM looks */
+static bool rk_has_idb(const uint8_t *img, gsize len)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(rk_idb_probe); i++) {
+        gsize hdr = rk_idb_probe[i];
+        uint8_t h[4];
+
+        if (hdr + 512 > len) {
+            continue;
+        }
+        if (!memcmp(img + hdr, "RKNS", 4)) {
+            return true;
+        }
+        memcpy(h, img + hdr, 4);
+        rk_rc4(h, 4);
+        if (ldl_le_p(h) == 0x0ff0aa55) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool rk_boot_rom_setup(const uint8_t *img, gsize len,
                               const RkSoCConfig *c, uint64_t ram_size)
 {
-    static const gsize probe[] = { 0x0, 0x10000, 0x8000, 0x20000, 0x40000 };
+    const gsize *probe = rk_idb_probe;
     gsize hdr = 0;
     uint32_t nimg, n, runs = 0;
     bool spl = false;
     int i;
 
-    for (i = 0; i < ARRAY_SIZE(probe); i++) {
+    for (i = 0; i < ARRAY_SIZE(rk_idb_probe); i++) {
         if (probe[i] + 0x800 <= len && !memcmp(img + probe[i], "RKNS", 4)) {
             hdr = probe[i];
             break;
         }
     }
-    if (i == ARRAY_SIZE(probe)) {
-        error_report("rockchip: no RKNS ID block in the flash image");
+    if (i == ARRAY_SIZE(rk_idb_probe)) {
+        if (rk_boot_rom_setup_v1(img, len, c, ram_size)) {
+            return true;
+        }
+        error_report("rockchip: no ID block in the flash image");
         return false;
     }
     nimg = MIN((ldl_le_p(img + hdr + 8) >> 16) & 0xff, 4);
@@ -2443,9 +2550,13 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
     arm_load_kernel(ARM_CPU(cpuobj), machine, &binfo);
 
     if (!machine->kernel_filename && img) {
-        bool ok = c->boot_fit ? rk_fit_setup(img, img_len, c, machine->ram_size)
-                              : rk_boot_rom_setup(img, img_len, c,
-                                                  machine->ram_size);
+        /*
+         * The RV1126 dump at hand lost its ID block, so that machine
+         * starts U-Boot from the FIT -- unless the image has one
+         */
+        bool fit = c->boot_fit && !rk_has_idb(img, img_len);
+        bool ok = fit ? rk_fit_setup(img, img_len, c, machine->ram_size)
+                      : rk_boot_rom_setup(img, img_len, c, machine->ram_size);
         if (!ok) {
             exit(1);
         }

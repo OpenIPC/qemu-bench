@@ -1712,7 +1712,7 @@ def test_refused(qemu, tmp):
     blank = os.path.join(tmp, 'blank.bin')
     open(blank, 'wb').write(b'\xff' * FLASH_SIZE)
     rc, err = run(blank)
-    check(rc != 0 and 'no RKNS' in err, 'a flash without an ID block is refused')
+    check(rc != 0 and 'no ID block' in err, 'a flash without an ID block is refused')
     bad = os.path.join(tmp, 'bad.bin')
     # sector 0x7fff from the ID block is 0x100fe00: past a 16 MiB flash
     make_image(bad, [entry(4, 1, 0xffffffff), entry(0x7fff, 0x10, 0xffffffff)])
