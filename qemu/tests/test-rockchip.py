@@ -1725,6 +1725,83 @@ def test_refused(qemu, tmp):
     check(rc != 0 and 'no SPL' in err, 'an ID block with no SPL is refused')
 
 
+RK_RC4_KEY = bytes([124, 78, 3, 4, 85, 5, 9, 7, 45, 44, 123, 56, 23, 13,
+                    23, 17])
+
+
+def rk_rc4(data):
+    st, j = list(range(256)), 0
+    for i in range(256):
+        j = (j + st[i] + RK_RC4_KEY[i % 16]) & 0xff
+        st[i], st[j] = st[j], st[i]
+    out, i, j = bytearray(data), 0, 0
+    for k in range(len(out)):
+        i = (i + 1) & 0xff
+        j = (j + st[i]) & 0xff
+        st[i], st[j] = st[j], st[i]
+        out[k] ^= st[(st[i] + st[j]) & 0xff]
+    return bytes(out)
+
+
+def make_image_v1(path, size, boot_sectors=None):
+    """The older ID block (U-Boot tools/rkcommon.c header0_info, as mkimage
+    -T rksd writes it): RC4-scrambled sector 0, images plain from sector 4,
+    the DDR blob (4 sectors) then the SPL (2 sectors) at flash 0."""
+    img = bytearray(b'\xff' * size)
+    ddr = b'110BDDR!' * 256                     # 2 KiB, never run
+    spl = bytes((i * 5 + 1) & 0xff for i in range(1024))
+    hdr = bytearray(512)
+    struct.pack_into('<I', hdr, 0, 0x0ff0aa55)
+    struct.pack_into('<I', hdr, 8, 1)           # disable_rc4: images plain
+    struct.pack_into('<H', hdr, 0x0c, 4)        # init_offset
+    struct.pack_into('<H', hdr, 0x1fa, 4)       # init_size: the DDR blob
+    struct.pack_into('<H', hdr, 0x1fc, boot_sectors or 6)  # + the SPL
+    img[0:512] = rk_rc4(bytes(hdr))
+    img[0x800:0x800 + len(ddr)] = ddr
+    img[0x1000:0x1000 + len(spl)] = spl
+    open(path, 'wb').write(img)
+    return spl
+
+
+def test_boot_rom_v1(qemu, tmp):
+    """-M rv1126 boots a v1 ID block, and the boot source follows the flash"""
+    for part, size, source in (('mx25l12805d', 16 << 20, 3),
+                               ('w25n01gv', 128 << 20, 4)):
+        path = os.path.join(tmp, 'v1-%s.bin' % part)
+        spl = make_image_v1(path, size)
+        qt = QTest(qemu, 'rv1126,flash-file=%s,flash-type=%s' % (path, part))
+        try:
+            check(qt.read(0, len(spl)) == spl,
+                  'v1 ID block (%s): SPL after the DDR blob at DRAM 0' % part)
+            check(qt.readl(0xFF700000 + 0x10) == source,
+                  'v1 ID block (%s): boot source %d at SRAM+0x10'
+                  % (part, source))
+        finally:
+            qt.close()
+    path = os.path.join(tmp, 'v1-short.bin')
+    make_image_v1(path, 16 << 20, boot_sectors=0xffff)   # SPL past the end
+    p = subprocess.run([qemu, '-M', 'rv1126,flash-file=%s,flash-type='
+                        'mx25l12805d' % path, '-display', 'none',
+                        '-nodefaults', '-serial', 'null', '-S', '-machine',
+                        'accel=qtest', '-qtest', 'null'],
+                       capture_output=True, text=True, timeout=30)
+    check(p.returncode != 0 and 'outside the flash image' in p.stderr,
+          'a v1 ID block whose SPL runs past the flash is refused')
+
+
+def test_cru_reset(qt, spl):
+    """The CRU's global soft reset resets the machine: ROM blobs come back"""
+    GLB_SRST_FST = 0xFF3B0C08
+    qt.write(0, bytes(len(spl)))
+    qt.writel(GLB_SRST_FST, 0x1234)             # not the magic: nothing
+    check(qt.read(0, len(spl)) == bytes(len(spl)),
+          'GLB_SRST_FST: another value does not reset')
+    qt.writel(GLB_SRST_FST, 0xfdb9)
+    qt.cmd('clock_step 1000000')
+    check(qt.read(0, len(spl)) == spl,
+          'GLB_SRST_FST = 0xfdb9: the machine resets (the SPL is back)')
+
+
 def test_machines(qemu, path):
     for m, ram in (('rv1103', 64 << 20), ('rv1106', 128 << 20),
                    ('rv1106g3', 256 << 20)):
@@ -2560,6 +2637,7 @@ def main():
         test_trng(qt)
         test_rtc(qt)
         test_misc(qt)
+        test_cru_reset(qt, spl)                 # last: it resets
     finally:
         qt.close()
     test_i2s_tone(args.qemu, path)
@@ -2567,6 +2645,7 @@ def main():
     test_i2s_files(args.qemu, path, tmp)
     test_dwc3_gadget(args.qemu, path)
     test_refused(args.qemu, tmp)
+    test_boot_rom_v1(args.qemu, tmp)
     test_machines(args.qemu, path)
     test_gpio_high(args.qemu, path)
     test_tb_isp(args.qemu, path)
