@@ -38,6 +38,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/runstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/qdev-properties.h"
@@ -74,6 +75,7 @@ struct RkSysconState {
     uint32_t *mirror;
     uint32_t wake_mode, wake_mode_bit, wake_timeout;
     QEMUTimer *wake_timer;
+    uint32_t srst_fst;
     bool trace;
 };
 
@@ -161,6 +163,15 @@ static void rk_syscon_write(void *opaque, hwaddr off, uint64_t val,
 
         *r = (*r & ~mask) | (val & mask);
     }
+    /*
+     * The CRU's global soft resets: the magic written to GLB_SRST_FST
+     * (0xfdb9) or GLB_SRST_SND (0xeca8) resets the chip
+     */
+    if ((s->srst_fst && off == s->srst_fst && val == 0xfdb9) ||
+        (s->srst_fst && off == s->srst_fst + 4 && val == 0xeca8)) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
     if (s->wake_mode_bit && off == s->wake_mode && s->wake_timer) {
         if ((*r & s->wake_mode_bit) && !(old & s->wake_mode_bit) &&
             s->regs[s->wake_timeout / 4]) {
@@ -228,6 +239,8 @@ static const Property rk_syscon_props[] = {
     DEFINE_PROP_UINT32("wake-mode-bit", RkSysconState, wake_mode_bit, 0),
     DEFINE_PROP_UINT32("wake-timeout", RkSysconState, wake_timeout, 0),
     DEFINE_PROP_BOOL("trace", RkSysconState, trace, false),
+    /* GLB_SRST_FST's offset (SND the next word): 0, none */
+    DEFINE_PROP_UINT32("srst-fst", RkSysconState, srst_fst, 0),
 };
 
 static void rk_syscon_class_init(ObjectClass *oc, const void *data)

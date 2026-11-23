@@ -248,6 +248,7 @@ typedef struct RkSoCConfig {
     hwaddr grf_base;
     uint32_t grf_size;
     hwaddr pmu_base;            /* 0: none (as for every base below) */
+    uint32_t cru_srst_fst;       /* GLB_SRST_FST in the CRU (0: none) */
     hwaddr cru_base;
     uint32_t cru_size;
     const uint32_t *cru_lock;
@@ -385,6 +386,7 @@ typedef struct RkSoCConfig {
     .grf_size       = 0x68000,                                          \
     .pmu_base       = 0xFF300000,                                       \
     .cru_base       = 0xFF3A0000,                                       \
+    .cru_srst_fst   = 0x10C08,      /* TOPCRU + 0xc08 */                \
     .cru_size       = 0x20000,                                          \
     .cru_lock       = rv1106_cru_lock,                                  \
     .n_cru_lock     = ARRAY_SIZE(rv1106_cru_lock),                      \
@@ -498,6 +500,7 @@ static const RkSoCConfig rv1103b_soc = {
     .grf_size       = 0x61000,
     .cru_base       = 0x20000000,
     .cru_size       = 0x81000,
+    .cru_srst_fst   = 0x60C08,      /* TOPCRU + 0xc08 */
     .cru_lock       = rv1103b_cru_lock,
     .n_cru_lock     = ARRAY_SIZE(rv1103b_cru_lock),
     .cru_init       = rv1103b_cru_init,
@@ -638,6 +641,7 @@ static const RkSoCConfig rv1103b_soc = {
     .n_pmu_mirror   = ARRAY_SIZE(rv1126_pmu_mirror),                    \
     .cru_base       = 0xFF480000,                                       \
     .cru_size       = 0x20000,                                          \
+    .cru_srst_fst   = 0x10408,      /* CRU (0xff490000) + 0x408 */      \
     .cru_lock       = rv1126_cru_lock,                                  \
     .n_cru_lock     = ARRAY_SIZE(rv1126_cru_lock),                      \
     .cru_init       = rv1126_cru_init,                                  \
@@ -2383,6 +2387,7 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
     dev = rk_syscon_new(c->cru_size, c->cru_lock, c->n_cru_lock,
                         c->cru_init, c->n_cru_init);
     rk_prop_list(dev, "plain-regs", c->cru_frac, c->n_cru_frac);
+    qdev_prop_set_uint32(dev, "srst-fst", c->cru_srst_fst);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->cru_base);
 

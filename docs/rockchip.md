@@ -553,7 +553,11 @@ Everything else from `0xFF000000` is an unimplemented-device catch-all.
 
 There is no mask ROM code to run. A stand-in finds the `RKNS` ID block
 (header v2, at flash 0x10000; 0, 0x8000, 0x20000 and 0x40000 are also
-tried). Image entries are 0x58 bytes from header + 0x78, each with
+tried).
+
+The CRU's global soft reset resets the machine: `0xfdb9` written to
+`GLB_SRST_FST` or `0xeca8` to `GLB_SRST_SND` (RV1106 0xff3b0c08, RV1103B
+0x20060c08, RV1126 0xff490408), as U-Boot's `reset` does. Image entries are 0x58 bytes from header + 0x78, each with
 `size << 16 | offset` in 512-byte sectors. The first entry loaded at
 `0xffffffff` is the DDR-init blob, which is closed and has nothing to train
 here, so it is skipped. The next one is the SPL, which is loaded at DRAM 0
