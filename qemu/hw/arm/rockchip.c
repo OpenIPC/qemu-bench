@@ -2515,11 +2515,14 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, c->decom_base);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, rk_irq(s, c->decom_irq));
 
-    /* a SPI NAND part named on the command line makes it a NAND board */
-    spi_nand = c->spi_nand ||
-        (s->flash_type &&
-         object_class_dynamic_cast(object_class_by_name(s->flash_type),
-                                   "ingenic-spinand"));
+    /*
+     * A part named on the command line decides: SPI NAND or NOR (an
+     * RV1126 board with SPI NOR, a NAND RV1106); else the machine's own
+     */
+    spi_nand = s->flash_type ?
+        !!object_class_dynamic_cast(object_class_by_name(s->flash_type),
+                                    "ingenic-spinand") :
+        c->spi_nand;
     dev = qdev_new("rk-sfc");
     qdev_prop_set_bit(dev, "dummy-bytes", spi_nand);
     sbd = SYS_BUS_DEVICE(dev);
