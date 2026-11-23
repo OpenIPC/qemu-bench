@@ -1349,7 +1349,8 @@ static void rk_rc4(uint8_t *buf, size_t len)
 }
 
 static bool rk_boot_rom_setup_v1(const uint8_t *img, gsize len,
-                                 const RkSoCConfig *c, uint64_t ram_size)
+                                 const RkSoCConfig *c, uint64_t ram_size,
+                                 uint32_t source)
 {
     int i;
 
@@ -1380,11 +1381,16 @@ static bool rk_boot_rom_setup_v1(const uint8_t *img, gsize len,
             error_report("rockchip: v1 ID block at 0x%zx has no SPL", hdr);
             return false;
         }
-        size = MIN(size, len - src);
+        if (size > len - src) {
+            error_report("rockchip: v1 ID block at 0x%zx: its SPL (0x%x "
+                         "bytes at 0x%x) is outside the flash image", hdr,
+                         size, src);
+            return false;
+        }
         rom_add_blob_fixed("rockchip.idb1", img + src, size, RK_DDR_BASE);
         rk_write_atags(c, ram_size);
         {
-            uint32_t id = cpu_to_le32(BROM_BOOT_SPINOR);
+            uint32_t id = cpu_to_le32(source);
 
             rom_add_blob_fixed("rockchip.bootsource", &id, 4,
                                c->sram_base + 0x10);
@@ -1419,7 +1425,8 @@ static bool rk_has_idb(const uint8_t *img, gsize len)
 }
 
 static bool rk_boot_rom_setup(const uint8_t *img, gsize len,
-                              const RkSoCConfig *c, uint64_t ram_size)
+                              const RkSoCConfig *c, uint64_t ram_size,
+                              uint32_t source)
 {
     const gsize *probe = rk_idb_probe;
     gsize hdr = 0;
@@ -1434,7 +1441,7 @@ static bool rk_boot_rom_setup(const uint8_t *img, gsize len,
         }
     }
     if (i == ARRAY_SIZE(rk_idb_probe)) {
-        if (rk_boot_rom_setup_v1(img, len, c, ram_size)) {
+        if (rk_boot_rom_setup_v1(img, len, c, ram_size, source)) {
             return true;
         }
         error_report("rockchip: no ID block in the flash image");
@@ -1466,7 +1473,7 @@ static bool rk_boot_rom_setup(const uint8_t *img, gsize len,
     }
     rk_write_atags(c, ram_size);
     {
-        uint32_t id = cpu_to_le32(BROM_BOOT_SPINOR);
+        uint32_t id = cpu_to_le32(source);
 
         rom_add_blob_fixed("rockchip.bootsource", &id, 4, c->sram_base + 0x10);
     }
@@ -1665,7 +1672,8 @@ static const MemoryRegionOps rk_cpupwr_ops = {
  * boot source (SPI NAND) are what the SPL leaves.
  */
 static bool rk_fit_setup(const uint8_t *img, gsize len,
-                         const RkSoCConfig *c, uint64_t ram_size)
+                         const RkSoCConfig *c, uint64_t ram_size,
+                         uint32_t source)
 {
     gsize off;
 
@@ -1731,7 +1739,7 @@ static bool rk_fit_setup(const uint8_t *img, gsize len,
                 cpu_to_le32(dt ? load + size : 0),
                 cpu_to_le32(tee ? tee_entry : load),
             };
-            uint32_t id = cpu_to_le32(BROM_BOOT_SPINAND);
+            uint32_t id = cpu_to_le32(source);
 
             rom_add_blob_fixed("rockchip.u-boot", data, size, load);
             if (dt) {
@@ -2557,9 +2565,13 @@ static void rockchip_common_init(MachineState *machine, const RkSoCConfig *c)
          * The RV1126 dump at hand lost its ID block, so that machine
          * starts U-Boot from the FIT -- unless the image has one
          */
+        /* the boot source the ROM reports: the flash it booted from */
+        uint32_t source = spi_nand ? BROM_BOOT_SPINAND : BROM_BOOT_SPINOR;
         bool fit = c->boot_fit && !rk_has_idb(img, img_len);
-        bool ok = fit ? rk_fit_setup(img, img_len, c, machine->ram_size)
-                      : rk_boot_rom_setup(img, img_len, c, machine->ram_size);
+        bool ok = fit ? rk_fit_setup(img, img_len, c, machine->ram_size,
+                                     source)
+                      : rk_boot_rom_setup(img, img_len, c, machine->ram_size,
+                                          source);
         if (!ok) {
             exit(1);
         }

@@ -557,7 +557,8 @@ tried). It also takes the older v1 ID block, the RV1126's: sector 0
 RC4-scrambled with Rockchip's fixed key, magic `0x0ff0aa55`, the DDR blob
 from `init_offset` for `init_size` sectors and the SPL up to
 `init_boot_size` (U-Boot's `tools/rkcommon.c`, as `mkimage -T rksd`
-writes it, images unscrambled). The `rv1126` and `rv1109` machines take
+writes it, images unscrambled); one whose SPL runs past the flash is
+refused. The `rv1126` and `rv1109` machines take
 this path when the flash has an ID block, and start U-Boot from the FIT
 (below) when it has none.
 
@@ -571,7 +572,8 @@ and run. On the G2 dump, entry 1 is data at 0x40000, not code.
 
 The stand-in recreates what the ROM and DDR blob leave behind:
 
-- **SRAM + 0x10:** boot source 3 (SPI NOR).
+- **SRAM + 0x10:** the boot source: 3 for SPI NOR, 4 for SPI NAND (the
+  flash the machine has, as `flash-type=` or its default makes it).
 - **Preloader ATAGs at `0x1FE000`** (2 MiB − 8 KiB), each with a hash word
   of 0, meaning "accept":
   - `CORE`
