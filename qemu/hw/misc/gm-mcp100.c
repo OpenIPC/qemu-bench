@@ -479,7 +479,10 @@ static void gm_mcp100_mpeg4(GmMcp100State *s, unsigned cmd)
     Mpeg4Enc e = { 0 };
     int rounding = gm_mcp100_node32(s, N4_ROUNDING) & 1;
 
-    if (mw && mh && mw <= 128 && mh <= 128) {
+    if (cmd != CMD_ENCODE_N && fmt != 3) {
+        /* no picture: the job ends with no bytes */
+        qemu_log_mask(LOG_UNIMP, "gm-mcp100: MPEG-4 input format %u\n", fmt);
+    } else if (mw && mh && mw <= 128 && mh <= 128) {
         g_autofree uint8_t *src = g_malloc0(luma * 3 / 2);
         g_autofree uint8_t *ref = g_malloc0(luma * 3 / 2);
         g_autofree uint8_t *rec = g_malloc0(luma * 3 / 2);
@@ -506,12 +509,7 @@ static void gm_mcp100_mpeg4(GmMcp100State *s, unsigned cmd)
         }
         gm_mcp100_vop_header(s, &e, cmd != CMD_ENCODE_N, rounding);
         if (cmd != CMD_ENCODE_N) {
-            if (fmt == 3) {
-                gm_mcp100_fetch422(s, ps, e.w, e.h);
-            } else {
-                qemu_log_mask(LOG_UNIMP, "gm-mcp100: MPEG-4 input format "
-                              "%u\n", fmt);
-            }
+            gm_mcp100_fetch422(s, ps, e.w, e.h);
             if (!e.intra_vop) {
                 gm_mcp100_planes(s, N4_REF, pr, luma, false);
             }

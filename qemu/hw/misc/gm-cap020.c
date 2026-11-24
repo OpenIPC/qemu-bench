@@ -122,7 +122,7 @@ static void cap_paint(GmCap020State *s, int p, const uint32_t *dma)
     const uint32_t size = s->regs[(0x18 + 0x10 * p) / 4];
     const uint32_t fmt = extract32(s->regs[R_FORMAT / 4], 8 * p, 8);
     const uint32_t pitch = s->regs[(0x218 + 4 * p) / 4] * 4;
-    const int w = extract32(size, 0, 12), h = extract32(size, 16, 12);
+    const int w = extract32(size, 0, 12) & ~1, h = extract32(size, 16, 12);
     int x, y, i, j;
 
     if (w < 2 || h < 2 || !dma[0]) {
@@ -211,7 +211,7 @@ static void cap_path(GmCap020State *s, int p)
             for (b = 0; b < 4; b++) {
                 m |= be & (1u << b) ? 0xFFu << (8 * b) : 0;
             }
-            if (off < CAP_SIZE / 4) {
+            if (off / 4 < CAP_NREGS) {
                 s->regs[off / 4] = (s->regs[off / 4] & ~m) | (v & m);
             }
             break;

@@ -426,7 +426,11 @@ ISP, encoders) and audio (the ARC's) are not modelled. Map, boot chain and devic
 | `gm8135s` | FA626TE (ARMv5TE), 64 MB in package | FTINTC030 | 3.3.0 OpenIPC | yes |
 | `gm8136` | FA626TE (ARMv5TE), 128 MB | FTINTC030 | 3.3.0 vendor (H.264 over RTSP), OpenIPC | yes |
 | `gm8136s` | FA626TE (ARMv5TE), 128 MB in package | FTINTC030 | — | —¹ |
-| `gm8126` | FA626TE (ARMv5TE), 128 MB | FTINTC010 | 2.6.28 vendor (MPEG-4 over RTSP, H.264) | yes |
+| `gm8126` | FA626TE (ARMv5TE), 128 MB | FTINTC010 | 2.6.28 vendor (MPEG-4 over RTSP, H.264), 7.3 OpenIPC | by hand² |
+
+² Vendor firmware from a private dump, and OpenIPC's U-Boot, kernel and root
+filesystem: neither can be fetched by CI, which runs the register tests
+(`qemu/tests/test-grainmedia-gm8126.py`) only.
 
 Grain Media's camera SoCs, in `hw/arm/grainmedia.c`: a Faraday FA626TE
 (QEMU's ARM926 with the FA626TE's ID) among Faraday peripherals -- FTINTC030,

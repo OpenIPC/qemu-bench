@@ -98,6 +98,7 @@ static void ftmac_desc(hwaddr a, uint32_t *d, bool write)
     int i;
 
     if (!write) {
+        memset(d, 0, 12);       /* where there is no memory, none owned */
         dma_memory_read(&address_space_memory, a, d, 12,
                         MEMTXATTRS_UNSPECIFIED);
         for (i = 0; i < 3; i++) {
@@ -191,6 +192,31 @@ static bool ftmac_wanted(GmFtmac110State *s, const uint8_t *buf)
     return !memcmp(mac, buf, 6);
 }
 
+/* do the descriptors from the current one take a frame? */
+static bool ftmac_room(GmFtmac110State *s, size_t len)
+{
+    hwaddr a = s->rx;
+    size_t room = 0;
+    int i;
+
+    for (i = 0; i < FTMAC_MAX_DESC && room < len; i++) {
+        uint32_t d[3], n, pad;
+
+        ftmac_desc(a, d, false);
+        n = d[1] & 0x7FF;
+        pad = !i && !(d[2] & 2) ? 2 : 0;
+        if (!(d[0] & DES_OWN) || n <= pad) {
+            return false;
+        }
+        room += n - pad;
+        a = d[1] & DES_END ? s->regs[R_RXBASE / 4] : a + 16;
+        if (a == s->rx) {
+            break;
+        }
+    }
+    return room >= len;
+}
+
 static ssize_t ftmac_receive(NetClientState *nc, const uint8_t *buf,
                              size_t size)
 {
@@ -200,24 +226,22 @@ static ssize_t ftmac_receive(NetClientState *nc, const uint8_t *buf,
     bool first = true;
 
     if ((s->regs[R_MACCR / 4] & (CR_RDMA | CR_RCV)) != (CR_RDMA | CR_RCV) ||
-        !ftmac_link(s) || size > 1518 || size < ETH_HLEN || !ftmac_wanted(s, buf)) {
+        !ftmac_link(s) || size > 1518 || size < ETH_HLEN ||
+        !ftmac_wanted(s, buf)) {
         return size;
+    }
+    if (!ftmac_room(s, len)) {
+        s->regs[R_ISR / 4] |= INT_NORXBUF;
+        ftmac_update(s);
+        return 0;               /* kept until there is */
     }
     memcpy(frame, buf, size);
     while (done < len) {
         uint32_t d[3], n, pad;
 
         ftmac_desc(s->rx, d, false);
-        if (!(d[0] & DES_OWN)) {
-            s->regs[R_ISR / 4] |= INT_NORXBUF;
-            ftmac_update(s);
-            return first ? 0 : size;
-        }
         n = d[1] & 0x7FF;
         pad = first && !(d[2] & 2) ? 2 : 0;
-        if (n <= pad) {
-            return size;
-        }
         n = MIN(len - done, n - pad);
         dma_memory_write(&address_space_memory, d[2] + pad, frame + done, n,
                          MEMTXATTRS_UNSPECIFIED);
@@ -307,7 +331,8 @@ static void ftmac_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     s->regs[off / 4] = val;
     if (off == R_TXPD) {
         ftmac_transmit(s);
-    } else if (off == R_RXPD || off == R_MACCR) {
+    } else if (off == R_RXPD || off == R_MACCR || off == R_IMR) {
+        /* the drivers give buffers back without a register; then unmask */
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
     }
     ftmac_update(s);

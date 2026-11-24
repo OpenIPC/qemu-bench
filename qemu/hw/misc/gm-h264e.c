@@ -516,12 +516,15 @@ static bool gm_h264e_m2_source(GmH264eState *s, int w, int h, uint8_t *y,
     int r, x, i, j;
 
     if (fmt == 0x65) {                  /* packed 4:2:2 */
-        const int stride = (s->vcache[0] + s->vcache[1] + w / 16) * 32;
-        g_autofree uint8_t *src = g_malloc0((size_t)stride * h);
+        const uint64_t line = ((uint64_t)s->vcache[0] + s->vcache[1] +
+                               w / 16) * 32;
+        const int stride = MIN(line, 8192);
+        g_autofree uint8_t *src = NULL;
 
-        if (stride > 8192) {
+        if (line > 8192 || stride < w * 2) {
             return false;
         }
+        src = g_malloc0((size_t)stride * h);
         dma_memory_read(&address_space_memory,
                         (hwaddr)s->vcache[0x18 / 4] << 2, src,
                         (size_t)stride * h, MEMTXATTRS_UNSPECIFIED);
@@ -529,12 +532,13 @@ static bool gm_h264e_m2_source(GmH264eState *s, int w, int h, uint8_t *y,
         return true;
     }
     if (fmt == 0x60) {                  /* planar 4:2:0 */
-        const int stride = (s->vcache[0] + s->vcache[1] + w / 16) * 16;
+        const uint32_t stride = (s->vcache[0] + s->vcache[1] + w / 16) * 16;
         g_autofree uint8_t *line = g_malloc0(w);
 
         for (r = 0; r < h; r++) {
             dma_memory_read(&address_space_memory,
-                            ((hwaddr)s->vcache[0x10 / 4] << 2) + r * stride,
+                            ((hwaddr)s->vcache[0x10 / 4] << 2) +
+                            (hwaddr)r * stride,
                             y + r * w, w, MEMTXATTRS_UNSPECIFIED);
         }
         for (r = 0; r < h; r++) {       /* Cb rows, then Cr rows */
@@ -542,7 +546,7 @@ static bool gm_h264e_m2_source(GmH264eState *s, int w, int h, uint8_t *y,
 
             dma_memory_read(&address_space_memory,
                             ((hwaddr)s->vcache[(c ? 0x18 : 0x14) / 4] << 2) +
-                            row * (stride / 2), line, w / 2,
+                            (hwaddr)row * (stride / 2), line, w / 2,
                             MEMTXATTRS_UNSPECIFIED);
             for (x = 0; x < w / 2; x++) {
                 uv[row * w + x * 2 + c] = line[x];
@@ -640,7 +644,17 @@ static void gm_h264e_encode_slice(GmH264eState *s)
             s->pic_uv = g_malloc(pw * ph / 2);
             memset(s->pic_uv, 128, pw * ph / 2);
             if (s->mcp200) {
-                gm_h264e_m2_source(s, pw, ph, s->pic_y, s->pic_uv);
+                if (!gm_h264e_m2_source(s, pw, ph, s->pic_y, s->pic_uv)) {
+                    /* nothing coded: the job ends with its headers only */
+                    qemu_log_mask(LOG_UNIMP, "gm-h264e: source not read\n");
+                    g_free(s->pic_y);
+                    g_free(s->pic_uv);
+                    s->pic_y = s->pic_uv = NULL;
+                    s->pending = IRQ_SLICE_DONE;
+                    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                        GM_H264E_SLICE_NS);
+                    return;
+                }
             } else {
                 dma_memory_read(&address_space_memory,
                                 s->regs[R_CUR_TOP / 4] -

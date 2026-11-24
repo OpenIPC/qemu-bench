@@ -297,6 +297,21 @@ static void gm8126_init(MachineState *machine)
         }
     }
 
+    di = drive_get(IF_MTD, 0, 0);
+    if (!img && di) {
+        BlockBackend *blk = blk_by_legacy_dinfo(di);
+        int64_t len = blk_getlength(blk);
+
+        if (len > 0 && len <= 64 * MiB) {
+            img = g_malloc(len);
+            img_len = len;
+            if (blk_pread(blk, 0, len, img, 0) < 0) {
+                error_report("gm8126: cannot read the mtd drive");
+                exit(1);
+            }
+        }
+    }
+
     cpu = object_new(machine->cpu_type);
     object_property_set_uint(cpu, "midr", GM8126_MIDR, &error_fatal);
     qdev_realize(DEVICE(cpu), NULL, &error_fatal);
@@ -439,7 +454,8 @@ static void gm8126_init(MachineState *machine)
     } else {
         arm_load_kernel(ARM_CPU(cpu), machine, &binfo);
         if (img) {
-            gm8126_boot_rom(img, img_len, gms->flash_file);
+            gm8126_boot_rom(img, img_len, gms->flash_file ? gms->flash_file
+                                                          : "the mtd drive");
         }
     }
 }
