@@ -9,7 +9,10 @@
  * Descriptors are 16 bytes: word 0 bit 31 the owner (set: the MAC), word 1
  * bit 31 the ring's end and bits 10:0 the buffer size, word 2 the buffer.
  * Transmit: word 1 bits 28 / 27 first / last segment.  Receive: word 0
- * bits 29 / 28 first / last segment, bits 10:0 the frame length.
+ * bits 29 / 28 first / last segment, bits 10:0 the frame length.  A frame
+ * starts at a half-word that is not word aligned: the address' bit 1 is
+ * forced on (Faraday's U-Boot driver says the receive DMA takes no other;
+ * the GM8126 kernel driver gives word addresses and reads two bytes in).
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -61,7 +64,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(GmFtmac110State, GM_FTMAC110)
 #define CR_RCV          (1u << 8)
 #define CR_HT_MULTI     (1u << 9)
 #define CR_RCV_ALL      (1u << 12)
-#define CR_RXALIGN      (1u << 13)      /* frames two bytes in: inferred */
 #define CR_MULTI        (1u << 17)
 #define CR_BROAD        (1u << 18)
 
@@ -194,9 +196,7 @@ static ssize_t ftmac_receive(NetClientState *nc, const uint8_t *buf,
     }
     memcpy(frame, buf, size);
     while (done < len) {
-        const uint32_t pad = first && (s->regs[R_MACCR / 4] & CR_RXALIGN)
-                             ? 2 : 0;
-        uint32_t d[3], n;
+        uint32_t d[3], n, pad;
 
         ftmac_desc(s->rx, d, false);
         if (!(d[0] & DES_OWN)) {
@@ -205,6 +205,7 @@ static ssize_t ftmac_receive(NetClientState *nc, const uint8_t *buf,
             return first ? 0 : size;
         }
         n = d[1] & 0x7FF;
+        pad = first && !(d[2] & 2) ? 2 : 0;
         if (n <= pad) {
             return size;
         }

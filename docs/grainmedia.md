@@ -478,7 +478,8 @@ gm-h264e.dump=DIR` save the encoded streams.
   P, 6 not coded). The command is latched: creating an encoder clears the
   mailbox under a running job. `mpeg4-enc.c.inc` codes H.263-quantised I
   and P VOPs with zero motion against the driver's reconstruction buffer.
-- **Ethernet** receives frames two bytes into the first buffer.
+- **Ethernet** receives frames at half-word addresses: two bytes into a
+  word-aligned buffer. The UART clock is 30 MHz / 16.
 
 Assumed: the chip ID (`0x812620`, MP), PLL1 reading back shifted left by
 one (with both, `rom.bin` and the kernel agree on every clock), MACCR bit 13 as the two-byte offset's switch, and the 4:2:2

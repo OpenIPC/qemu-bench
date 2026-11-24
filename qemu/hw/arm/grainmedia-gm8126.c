@@ -328,7 +328,8 @@ static void gm8126_init(MachineState *machine)
 
     for (n = 0; n < ARRAY_SIZE(gm8126_uarts); n++) {
         serial_mm_init(sysmem, gm8126_uarts[n].base, 2,
-                       IRQ(gm8126_uarts[n].irq), 25000000 / 16, serial_hd(n),
+                       IRQ(gm8126_uarts[n].irq), 30000000 / 16 / 16,
+                       serial_hd(n),
                        DEVICE_LITTLE_ENDIAN);
     }
     for (n = 0; n < ARRAY_SIZE(gm8126_gpios); n++) {
