@@ -44,7 +44,8 @@
  * error bits.
  *
  * The queue runs one picture at a time, and the next one only once the
- * host has taken the last one's done (cleared its ENC_PIC reason): the
+ * host has taken the last one's done (cleared its ENC_PIC reason or the
+ * interrupt), switched that interrupt off or destroyed its instance: the
  * done register names a single instance, so a second completion before
  * DrvVcodecIrqHandler ran would replace the first, whose channel would
  * then wait for ever (main and sub stream of one sensor, back to back).
@@ -181,6 +182,7 @@ struct SstarWave5State {
     uint32_t fire_id;
     bool cq_busy;
     bool done_unacked;          /* a queued picture's done, not taken */
+    uint32_t done_inst;         /* whose it is */
     bool trace;
 };
 
@@ -260,6 +262,7 @@ static void wave5_done(void *opaque)
         /* held until the host clears it, if it is told at all */
         s->done_unacked = !!(*wave5_reg(s, R_INT_ENABLE) &
                              s->pending_reason);
+        s->done_inst = s->pending_inst;
     } else {
         *wave5_reg(s, R_DONE_INST) |= 1u << s->pending_inst;
     }
@@ -474,7 +477,6 @@ static void wave5_command(SstarWave5State *s)
         s->done_unacked = false;
         break;
     case CMD_CREATE:
-        s->done_unacked = false;
         hevc_enc_ref_free(in->ref);
         memset(in, 0, sizeof(*in));
         in->dump = *wave5_reg(s, R_CQ_DUMP);
@@ -626,7 +628,14 @@ static void sstar_wave5_write(void *opaque, hwaddr off, uint64_t val,
     case R_CORE_START:
         *wave5_reg(s, off) = val;
         if (val & 1) {
+            uint32_t inst = *wave5_reg(s, R_INSTANCE) & 0xFFFF;
+
             wave5_command(s);
+            /* the held completion's instance is gone: nobody takes it */
+            if (*wave5_reg(s, R_COMMAND) == CMD_DESTROY &&
+                inst % WAVE5_INSTANCES == s->done_inst) {
+                wave5_release(s);
+            }
         }
         break;
     case R_CQ_WR:
@@ -667,6 +676,7 @@ static void sstar_wave5_reset(DeviceState *dev)
     }
     s->cq_base = s->cq_rd = s->cq_wr = 0;
     s->done_unacked = false;
+    s->done_inst = 0;
     s->cq_busy = false;
     timer_del(s->done);
     qemu_set_irq(s->irq, 0);

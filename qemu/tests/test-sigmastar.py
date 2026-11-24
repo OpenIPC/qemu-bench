@@ -3787,7 +3787,8 @@ def test_i6c_jpe_mmu(qemu, tmp):
 def i6c_wave5_two(qemu, tmp, ack):
     """Two instances' pictures queued at once; the host takes the first
     picture's end by ack: 'reason' (REASON_CLEAR with ENC_PIC), 'vint'
-    (VINT_CLEAR only) or 'poll' (the ENC_PIC interrupt switched off)."""
+    (VINT_CLEAR only), 'poll' (the ENC_PIC interrupt switched off) or
+    'destroy' (its instance destroyed)."""
     path = i6_image(tmp, 'i6cw.bin')
     wave = 0x1F34D000
     base = 0x3FF00000
@@ -3838,9 +3839,23 @@ def i6c_wave5_two(qemu, tmp, ack):
               qt.readl(wave + 0x1F4), 1)
         check('Wave5: the first one\'s results', qt.readl(dram + 0x20000),
               0x55)
+        # another instance coming or going does not take it
+        cmd(0x0008, inst=2)
+        qt.writel(wave + 0x1F8, 2)          # the queue's doorbell again
+        qt.step(20 * 1000000)
+        check('Wave5 (%s): still held after a third instance\'s CREATE' % ack,
+              qt.readl(wave + 0x1E8), 1 << 24 | 0)
+        check('Wave5 (%s): and the second not started' % ack,
+              qt.readl(wave + 0x1F4), 1)
+        cmd(0x0020, inst=2)
+        qt.step(20 * 1000000)
+        check('Wave5 (%s): nor after its DESTROY' % ack,
+              qt.readl(wave + 0x1F4), 1)
         if ack == 'reason':
             qt.writel(wave + 0x34, 0x100)
             qt.writel(wave + 0x3C, 1)
+        elif ack == 'destroy':
+            cmd(0x0020, inst=0)
         elif ack == 'vint':
             qt.writel(wave + 0x3C, 1)
         else:
@@ -3857,7 +3872,7 @@ def i6c_wave5_two(qemu, tmp, ack):
 
 def test_i6c_wave5_two(qemu, tmp):
     print('infinity6c Wave5: two instances queued, one done at a time')
-    for ack in ('reason', 'vint', 'poll'):
+    for ack in ('reason', 'vint', 'poll', 'destroy'):
         i6c_wave5_two(qemu, tmp, ack)
 
 
