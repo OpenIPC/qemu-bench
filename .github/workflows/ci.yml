@@ -1837,6 +1837,18 @@ jobs:
         timeout-minutes: 6
         run: bash qemu-boot/test-grainmedia-boot.sh --soc ${{ matrix.soc }}
 
+      # The digital twin (docs/grainmedia.md): an OV2715 in front of a
+      # lit scene, the vendor's fisp_algorithm.ko AE / AWB closing the
+      # loop through gm-isp's statistics; the light drops to a quarter,
+      # comes back, turns warmer, and twin-metrics.py checks the record.
+      - name: A lighting scenario through the vendor AE / AWB
+        if: matrix.soc == 'gm8136'
+        timeout-minutes: 20
+        run: |
+          bash qemu-boot/test-grainmedia-scenario.sh \
+            --qemu ./qemu-src/build/qemu-system-arm --timeout 1000 \
+            --work "$RUNNER_TEMP/scenario"
+
   boot-ingenic:
     name: Boot ${{ matrix.soc }} (${{ matrix.mode }})
     needs: [select, build]

@@ -51,6 +51,15 @@ void hisi_scene_display_row(HisiSceneState *s, const float *rgb, int w,
                             uint8_t *y, uint8_t *vu);
 
 /*
+ * The same, with a gain for each of R, G and B (1.0 = none), for an ISP
+ * whose white balance has its own G gain or that applies a global gain
+ * after the sensor: the picture clips at the sensor's full scale, then
+ * multiplies by these.
+ */
+void hisi_scene_set_frame_gains(HisiSceneState *s, double level,
+                                const double tint[3], const double gain[3]);
+
+/*
  * hisi_scene_display_row() as tables, for a model that renders the same
  * grid under many exposures: component c (R, G, B) of reflectance
  * p = (i / (n - 1))^2 * pmax adds lut[c * n + i] = { Y, V, U } in 16.16

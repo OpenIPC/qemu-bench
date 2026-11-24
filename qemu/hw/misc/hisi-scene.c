@@ -446,6 +446,19 @@ void hisi_scene_set_frame(HisiSceneState *s, double level,
     s->frame_seq++;
 }
 
+void hisi_scene_set_frame_gains(HisiSceneState *s, double level,
+                                const double tint[3], const double gain[3])
+{
+    int c;
+
+    s->level = level;
+    memcpy(s->tint, tint, sizeof(s->tint));
+    for (c = 0; c < 3; c++) {
+        s->wb[c] = gain[c] > 0 ? gain[c] : 1.0;
+    }
+    s->frame_seq++;
+}
+
 uint32_t hisi_scene_frame_seq(HisiSceneState *s)
 {
     return s->frame_seq;

@@ -332,6 +332,7 @@ cp qemu/hw/i2c/axera-pcal6416a.c   "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/sensor-sync.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/include/hw/i2c/sensor-sync.h "$QEMU_DIR/include/hw/i2c/"
 cp qemu/hw/i2c/galaxycore.c        "$QEMU_DIR/hw/i2c/"
+cp qemu/hw/i2c/ov2710.c            "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/imagedesign-mis.c   "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-v1.c       "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/i2c/hisi-i2c-dw.c       "$QEMU_DIR/hw/i2c/"
@@ -1435,7 +1436,7 @@ fi
 sed -i -E "/CONFIG_(HISI_I2C|FULLHAN|GRAINMEDIA|INGENIC)/s/'(hisi-(imx[0-9]+|f37|gc2053|sp2305|mis2006|nvp6124b|smartsens)|galaxycore|ingenic-ov2735)\.c'(, )?//g" \
     "$QEMU_DIR/hw/i2c/meson.build"
 if ! grep -q "'image-sensor.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
-    echo "system_ss.add(when: 'CONFIG_I2C', if_true: files('image-sensor.c', 'sensor-sync.c', 'imx323.c', 'galaxycore.c', 'imagedesign-mis.c', 'hisi-f37.c', 'hisi-imx291.c', 'hisi-imx307.c', 'hisi-imx335.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c', 'hisi-sp2305.c', 'ingenic-ov2735.c'))" \
+    echo "system_ss.add(when: 'CONFIG_I2C', if_true: files('image-sensor.c', 'sensor-sync.c', 'imx323.c', 'galaxycore.c', 'ov2710.c', 'imagedesign-mis.c', 'hisi-f37.c', 'hisi-imx291.c', 'hisi-imx307.c', 'hisi-imx335.c', 'hisi-imx385.c', 'hisi-imx415.c', 'hisi-mis2006.c', 'hisi-nvp6124b.c', 'hisi-smartsens.c', 'hisi-sp2305.c', 'ingenic-ov2735.c'))" \
         >> "$QEMU_DIR/hw/i2c/meson.build"
     echo "  hw/i2c/meson.build: added the image sensors"
 fi
@@ -1448,6 +1449,11 @@ if ! grep -q "'imagedesign-mis.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
     sed -i "s/'galaxycore.c', /'galaxycore.c', 'imagedesign-mis.c', /" \
         "$QEMU_DIR/hw/i2c/meson.build"
     echo "  hw/i2c/meson.build: added imagedesign-mis.c"
+fi
+if ! grep -q "'ov2710.c'" "$QEMU_DIR/hw/i2c/meson.build"; then
+    sed -i "s/'galaxycore.c', /'galaxycore.c', 'ov2710.c', /" \
+        "$QEMU_DIR/hw/i2c/meson.build"
+    echo "  hw/i2c/meson.build: added ov2710.c"
 fi
 
 # hw/ssi/Kconfig
@@ -1614,6 +1620,15 @@ else
             echo "  hw/arm/Kconfig: GRAINMEDIA now selects $sym"
         fi
     done
+fi
+# the scene in front of the camera (hisi-scene.c, docs/
+# hisilicon-digital-twin.md) is Grain Media's too; a source set takes a
+# file once, so this sits beside HISI_MISC's
+if ! grep -q "CONFIG_GRAINMEDIA', if_true: files('hisi-scene.c')" \
+        "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('hisi-scene.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added hisi-scene.c for GRAINMEDIA"
 fi
 for f in $(cd qemu && find hw -name 'gm-*.c' 2>/dev/null); do
     d=$(dirname "$f"); b=$(basename "$f")

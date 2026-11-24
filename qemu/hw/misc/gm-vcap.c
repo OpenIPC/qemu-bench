@@ -28,9 +28,15 @@
  * -- unless the path control byte's bit 7 blocks the DMA -- then writes
  * the status slot (ready, frame mode, the frame count; DMA write done) and
  * sets the channel's LL done bit (0x55B0, the cascade's 0x55B4 bit 0).
- * The picture is the Allwinner capture model's: the OpenIPC logo on navy
- * with a sliding dot, drawn to the scaler output size (+0x10 + 4p) so
- * every path shows the same scene.
+ * The picture is drawn to the scaler output size (+0x10 + 4p), so every
+ * path shows the same scene.  Once the ISP measures the scene in front of
+ * the camera (hisi-scene, the "scene" link; gm-isp publishes each frame's
+ * exposure, light and white balance), it is that scene as the ISP renders
+ * it (hisi_scene_display_row(): the gains, then a 1/2.2 gamma -- not the
+ * ISP's own curve), with the frame number as 16 binary squares along the
+ * top twelfth; the scene sampled at no more than 2048 points a side.  A
+ * reset waits for the ISP's next frame.  Before that, and without a sensor, it is the Allwinner
+ * capture model's: the OpenIPC logo on navy with a sliding dot.
  *
  * The driver links queued jobs into the lists only from the sync timer
  * interrupt (0x55AC bit 0), so while capture is enabled (0x5404 bit 31)
@@ -59,6 +65,7 @@
 #include "system/dma.h"
 #include "qom/object.h"
 #include "aw-vinc-logo.h"
+#include "hw/misc/hisi-scene.h"
 
 #define TYPE_GM_VCAP "gm-vcap"
 OBJECT_DECLARE_SIMPLE_TYPE(GmVcapState, GM_VCAP)
@@ -108,6 +115,8 @@ struct GmVcapState {
     uint32_t frames;
     uint32_t version;
     uint32_t caps;
+    HisiSceneState *scene;
+    uint32_t scene_seq;         /* the scene's frame count at reset */
 };
 
 static void gm_vcap_update(GmVcapState *s)
@@ -210,6 +219,55 @@ static void gm_vcap_pixel(int px, int py, int dot_x, uint8_t *yuv)
     }
 }
 
+/*
+ * The scene is sampled at most this many points a side, whatever the
+ * scaler size the guest asks for, so the cached grid stays bounded
+ */
+#define GM_VCAP_SCENE_MAX   2048
+
+/* the scene as the ISP renders it, UYVY, the frame number on top */
+static void gm_vcap_paint_scene(GmVcapState *s, hwaddr dst, int w, int h,
+                                int x0, int y0, int sw, int sh,
+                                uint32_t gap, uint8_t *line)
+{
+    const int gw = MIN(sw, GM_VCAP_SCENE_MAX), gh = MIN(sh, GM_VCAP_SCENE_MAX);
+    const float *grid = hisi_scene_grid(s->scene, gw, gh);
+    const int sq = MAX(sw / 16, 1);
+    g_autofree uint8_t *yl = g_malloc(w);
+    g_autofree uint8_t *vu = g_malloc(w + 2);
+    g_autofree float *row = g_new(float, (size_t)w * 3);
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        if (y0 + y < sh / 12) {
+            for (x = 0; x < w; x++) {
+                yl[x] = (s->frames >> (15 - MIN((x0 + x) / sq, 15))) & 1 ?
+                        235 : 16;
+            }
+            memset(vu, 128, w);
+        } else {
+            const float *g = grid + (size_t)((int64_t)(y0 + y) * gh / sh) *
+                                    gw * 3;
+
+            for (x = 0; x < w; x++) {
+                memcpy(&row[x * 3],
+                       &g[(int64_t)(x0 + x) * gw / sw * 3],
+                       3 * sizeof(float));
+            }
+            hisi_scene_display_row(s->scene, row, w, yl, vu);
+        }
+        for (x = 0; x < w; x += 2) {
+            line[x * 2 + 0] = vu[x + 1];                /* U */
+            line[x * 2 + 1] = yl[x];
+            line[x * 2 + 2] = vu[x];                    /* V */
+            line[x * 2 + 3] = yl[x + 1];
+        }
+        dma_memory_write(&address_space_memory,
+                         dst + (hwaddr)y * (w * 2 + gap * 8), line, w * 2,
+                         MEMTXATTRS_UNSPECIFIED);
+    }
+}
+
 static void gm_vcap_paint(GmVcapState *s, uint32_t base, int p)
 {
     const uint32_t ctl = extract32(s->regs[(base + 0x00) / 4], p * 8, 8);
@@ -239,6 +297,10 @@ static void gm_vcap_paint(GmVcapState *s, uint32_t base, int p)
         sh = y1 + 1;
     }
     line = g_malloc(w * 2);
+    if (s->scene && hisi_scene_frame_seq(s->scene) != s->scene_seq) {
+        gm_vcap_paint_scene(s, dst, w, h, x0, y0, sw, sh, gap, line);
+        return;
+    }
     for (y = 0; y < h; y++) {
         const int py = (int64_t)(y0 + y) * PAT_H / sh;
 
@@ -452,7 +514,19 @@ static void gm_vcap_reset(DeviceState *dev)
     timer_del(s->timer);
     memset(s->regs, 0, sizeof(s->regs));
     s->ticks = s->frames = 0;
+    /* the scene as the ISP measured it before: not this run's */
+    s->scene_seq = s->scene ? hisi_scene_frame_seq(s->scene) : 0;
     gm_vcap_update(s);
+}
+
+static void gm_vcap_init(Object *obj)
+{
+    GmVcapState *s = GM_VCAP(obj);
+
+    object_property_add_link(obj, "scene", TYPE_HISI_SCENE,
+                             (Object **)&s->scene,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static void gm_vcap_realize(DeviceState *dev, Error **errp)
@@ -474,13 +548,14 @@ static const Property gm_vcap_props[] = {
 
 static const VMStateDescription vmstate_gm_vcap = {
     .name = TYPE_GM_VCAP,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, GmVcapState),
         VMSTATE_UINT32_ARRAY(regs, GmVcapState, GM_VCAP_NREGS),
         VMSTATE_UINT32(ticks, GmVcapState),
         VMSTATE_UINT32(frames, GmVcapState),
+        VMSTATE_UINT32_V(scene_seq, GmVcapState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -499,6 +574,7 @@ static const TypeInfo gm_vcap_info = {
     .name           = TYPE_GM_VCAP,
     .parent         = TYPE_SYS_BUS_DEVICE,
     .instance_size  = sizeof(GmVcapState),
+    .instance_init  = gm_vcap_init,
     .class_init     = gm_vcap_class_init,
 };
 
