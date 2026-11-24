@@ -158,7 +158,7 @@ jobs:
             ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
           done
           # Grain Media (hw/arm/grainmedia.c)
-          for m in gm8135s gm8136 gm8136s; do
+          for m in gm8126 gm8135s gm8136 gm8136s; do
             ./qemu-src/build/qemu-system-arm -machine help | grep -E "^$m "
           done
           # Ingenic T-series (hw/mips/ingenic.c), the mipsel target
@@ -475,6 +475,10 @@ jobs:
       - name: Grain Media devices (gm-spi020, gm-dmac, gm-intc, gm-timer, ...)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-grainmedia.py']
         run: python3 qemu/tests/test-grainmedia.py
+
+      - name: Grain Media GM8126 devices (gm-intc010, gm-cap020, gm-ftmac110, ...)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-grainmedia-gm8126.py']
+        run: python3 qemu/tests/test-grainmedia-gm8126.py
 
       # Ingenic: the mask ROM stand-in and cache-as-RAM, CPM PLL/divider
       # handshakes in each SoC's encoding, the DDR init polls, the TCU's

@@ -109,7 +109,9 @@ cp qemu/hw/arm/fullhan.c            "$QEMU_DIR/hw/arm/"
 for f in $(cd qemu && find hw include -name 'fh-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
-cp qemu/hw/arm/grainmedia.c         "$QEMU_DIR/hw/arm/"
+cp qemu/hw/arm/grainmedia.c qemu/hw/arm/grainmedia-gm8126.c \
+                                    "$QEMU_DIR/hw/arm/"
+cp qemu/hw/misc/mpeg4-enc.c.inc     "$QEMU_DIR/hw/misc/"
 for f in $(cd qemu && find hw include -name 'gm-*' 2>/dev/null); do
     cp "qemu/$f" "$QEMU_DIR/$f"
 done
@@ -1651,6 +1653,11 @@ if ! grep -q "'grainmedia.c'" "$QEMU_DIR/hw/arm/meson.build"; then
     echo "arm_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('grainmedia.c'))" \
         >> "$QEMU_DIR/hw/arm/meson.build"
     echo "  hw/arm/meson.build: added grainmedia.c"
+fi
+if ! grep -q "'grainmedia-gm8126.c'" "$QEMU_DIR/hw/arm/meson.build"; then
+    echo "arm_ss.add(when: 'CONFIG_GRAINMEDIA', if_true: files('grainmedia-gm8126.c'))" \
+        >> "$QEMU_DIR/hw/arm/meson.build"
+    echo "  hw/arm/meson.build: added grainmedia-gm8126.c"
 fi
 
 # Rockchip RV1103 / RV1106 (hw/arm/rockchip.c): a Cortex-A7 with a GIC-400

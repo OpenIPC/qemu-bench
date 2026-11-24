@@ -16,7 +16,7 @@ desk. Vendor families covered:
 - **Allwinner** V831 / V833
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
   FH8626V100, FH8632
-- **Grain Media** GM8135S, GM8136, GM8136S
+- **Grain Media** GM8126, GM8135S, GM8136, GM8136S
 - **Ambarella** S3L
 - **Ingenic** T10, T20, T21, T23, T30, T31 (XBurst1) and T40, T41 (XBurst2) —
   the one MIPS family
@@ -25,11 +25,11 @@ The project was called `qemu-hisilicon` until the other families arrived;
 GitHub redirects the old URL.
 
 Builds three QEMU targets:
-- `qemu-system-arm` — 34 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 3 Grain Media GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
+- `qemu-system-arm` — 34 IPC + 11 DVR/NVR + 1 STB (ARMv7-A) + 9 Xiongmai + 4 Goke GK710x/GK710xS (ARM1176) + 9 Anyka AK39xx (ARM926) + 29 SigmaStar (Cortex-A7, or `max` for the A32 and A35 parts) + 4 Novatek NT9856x (Cortex-A9) + 4 Novatek NT9852x (2x Cortex-A9) + 2 Novatek NT9832x (2x Cortex-A9) + 2 Novatek NT98532/NT98533 (Cortex-A7 for the A32) + 2 Allwinner V83x (Cortex-A7) + 7 Fullhan (ARM1176) + 3 Fullhan FH865x (Cortex-A7) + 4 Grain Media GM8126 / GM813x (FA626TE) + 1 Ambarella S3L (Cortex-A9) + 2 Axera AX620Q/AX620U (Cortex-A7)
 - `qemu-system-aarch64` — 3 IPC + 1 STB (ARMv8-A, Cortex-A53/A55) + 2 Novatek NT98332/NT98633 (Cortex-A53) + 2 Axera AX630C/AX620E (Cortex-A53)
 - `qemu-system-mipsel` — 6 Ingenic XBurst1 + 2 Ingenic XBurst2 (dual-core)
 
-## Supported Machines (142 total)
+## Supported Machines (143 total)
 
 ### IPC family — V1 through V5 (`qemu-system-arm`)
 
@@ -426,6 +426,11 @@ ISP, encoders) and audio (the ARC's) are not modelled. Map, boot chain and devic
 | `gm8135s` | FA626TE (ARMv5TE), 64 MB in package | FTINTC030 | 3.3.0 OpenIPC | yes |
 | `gm8136` | FA626TE (ARMv5TE), 128 MB | FTINTC030 | 3.3.0 vendor (H.264 over RTSP), OpenIPC | yes |
 | `gm8136s` | FA626TE (ARMv5TE), 128 MB in package | FTINTC030 | — | —¹ |
+| `gm8126` | FA626TE (ARMv5TE), 128 MB | FTINTC010 | 2.6.28 vendor (MPEG-4 over RTSP, H.264), 7.3 OpenIPC | by hand² |
+
+² Vendor firmware from a private dump, and OpenIPC's U-Boot, kernel and root
+filesystem: neither can be fetched by CI, which runs the register tests
+(`qemu/tests/test-grainmedia-gm8126.py`) only.
 
 Grain Media's camera SoCs, in `hw/arm/grainmedia.c`: a Faraday FA626TE
 (QEMU's ARM926 with the FA626TE's ID) among Faraday peripherals -- FTINTC030,
@@ -756,7 +761,7 @@ placeholder: it builds and registers, but does not boot yet. Much of its config
 is inherited from GK7206 and several values — DDR size among them — are still
 unverified against the vendor SDK.
 
-All 142 machines build and register. Every machine marked "yes" above boots
+All 143 machines build and register. Every machine marked "yes" above boots
 OpenIPC or vendor firmware to a shell prompt (artifacts/scripts staged in
 `qemu-boot/run-<machine>.sh`); `-machine help` on either binary is the
 authoritative list.
@@ -897,6 +902,7 @@ qemu/
 ├── hw/misc/amb-nand.c           # Ambarella FIO, FDMA and a 128 MiB NAND
 ├── hw/i2c/amb-idc.c             # Ambarella IDC I2C master
 ├── hw/arm/grainmedia.c          # Grain Media GM813x machines, mask ROM stand-in
+├── hw/arm/grainmedia-gm8126.c   # Grain Media GM8126 machine
 ├── hw/mips/ingenic.c            # Ingenic T10..T41 machines, mask ROM stand-in, bootm
 ├── hw/misc/ingenic-cpm.c        # CPM: PLL lock, divider busy, per-SoC PLL encodings
 ├── hw/intc/ingenic-intc.c       # XBurst1 INTC

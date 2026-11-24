@@ -115,6 +115,8 @@ struct GmDmacState {
     uint32_t tc_raw;
     uint32_t ea_raw;
     uint32_t req;               /* request line levels */
+    bool running;               /* in gm_dmac_run() */
+    bool again;                 /* and called meanwhile */
 };
 
 static uint32_t gm_dmac_tc_status(GmDmacState *s)
@@ -335,10 +337,25 @@ static void gm_dmac_run(void *opaque)
     GmDmacState *s = opaque;
     int n;
 
+    /*
+     * Reading an SD card's data polls the event loop, which may run this
+     * again: the transfer under way goes on by itself, and another one
+     * gets its turn after it.
+     */
+    if (s->running) {
+        s->again = true;
+        return;
+    }
+    s->running = true;
+    s->again = false;
     if (s->cr & CR_ENABLE) {
         for (n = 0; n < GM_DMAC_CHANS; n++) {
             gm_dmac_run_chan(s, n);
         }
+    }
+    s->running = false;
+    if (s->again) {
+        qemu_bh_schedule(s->bh);
     }
     gm_dmac_update(s);
 }
@@ -348,8 +365,10 @@ static void gm_dmac_set_req(void *opaque, int n, int level)
     GmDmacState *s = opaque;
 
     if (level) {
+        if (!(s->req & (1u << n))) {
+            qemu_bh_schedule(s->bh);
+        }
         s->req |= 1u << n;
-        qemu_bh_schedule(s->bh);
     } else {
         s->req &= ~(1u << n);
     }

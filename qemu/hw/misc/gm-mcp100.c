@@ -52,12 +52,15 @@
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "hw/misc/nvt-pixel.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "qom/object.h"
+#include <math.h>
+#include "mpeg4-enc.c.inc"
 
 #define TYPE_GM_MCP100 "gm-mcp100"
 OBJECT_DECLARE_SIMPLE_TYPE(GmMcp100State, GM_MCP100)
@@ -71,6 +74,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GmMcp100State, GM_MCP100)
 #define GM_MCP100_JOB_NS    5000000
 #define GM_MCP100_MAX_MCUS  256         /* per side: 4096 pixels */
 
+#define R_VADR              0x044
 #define R_BADR              0x04C
 #define R_BALR              0x050
 #define R_VLDSTS            0x074
@@ -103,7 +107,38 @@ OBJECT_DECLARE_SIMPLE_TYPE(GmMcp100State, GM_MCP100)
 #define N_BITSLEN           0xD4
 #define N_DONE              0xD8
 
+#define CMD_ENCODE_I        4
+#define CMD_ENCODE_P        5
+#define CMD_ENCODE_N        6
 #define CMD_ENCODE_JPEG     8
+
+/*
+ * The Share_Node_Enc of the MPEG-4 encoder: the driver's Encoder_x from
+ * +0x04, then its current and reference FRAMEINFOs (fmpeg4_drv.ko of the
+ * GM8126, "new" 2012 build).
+ */
+#define N4_VOL              0x024
+#define N4_PRED             0x2BC
+#define N4_MB_W             0x300
+#define N4_MB_H             0x304
+#define N4_WIDTH            0x2D8
+#define N4_ROI_W            0x2F0
+#define N4_ROI_H            0x2F4
+#define N4_FINCR            0x308
+#define N4_FBASE            0x30C
+#define N4_ROUNDING         0x310
+#define N4_MODULE_BASE      0x384
+#define N4_BITSTREAM        0x38C
+#define N4_IMG_FMT          0x390
+#define N4_CUR              0x3A4
+#define N4_REF              0x3FC
+#define F_QUANT             0x00
+#define F_TYPE              0x04
+#define F_ROUNDING          0x08
+#define F_SECONDS           0x0C
+#define F_TICKS             0x10
+#define F_IMAGE             0x20        /* Y, Cb, Cr physical */
+#define F_RECON             0x38
 
 /* the DMA wrapper */
 #define W_WIDTH             0x08
@@ -125,6 +160,9 @@ struct GmMcp100State {
     /* the header bit packer */
     uint32_t bs_phy;
     uint32_t hdr_len;
+    bool packer_off;
+    uint8_t job;
+    char *dump;
     uint32_t acc;
     int acc_bits;
     uint8_t hdr[GM_MCP100_HDR_MAX];
@@ -321,11 +359,210 @@ static void gm_mcp100_encode(GmMcp100State *s)
     gm_mcp100_update(s);
 }
 
+static int m4_log2bin(uint32_t v)
+{
+    return v ? 32 - clz32(v) : 0;
+}
+
+/* VOS / VO / VOL headers, as the driver's BitstreamWriteVolHeader() */
+static void gm_mcp100_vol(GmMcp100State *s, Mpeg4Enc *e)
+{
+    const uint32_t base = gm_mcp100_node32(s, N4_FBASE);
+
+    m4_put(e, 0x00000100, 32);          /* video object */
+    m4_put(e, 0x00000120, 32);          /* video object layer */
+    m4_put(e, 2, 10);                   /* simple object type */
+    m4_put(e, 216, 11);                 /* 1:1, 4:2:0, low delay, rectangle */
+    m4_put(e, 1, 1);
+    m4_put(e, base, 16);
+    m4_put(e, 1, 1);
+    m4_put(e, 1, 1);                    /* fixed VOP rate */
+    m4_put(e, gm_mcp100_node32(s, N4_FINCR),
+           MAX(m4_log2bin(base - 1), 1));
+    m4_put(e, 1, 1);
+    m4_put(e, gm_mcp100_node32(s, N4_ROI_W), 13);
+    m4_put(e, 1, 1);
+    m4_put(e, gm_mcp100_node32(s, N4_ROI_H), 13);
+    m4_put(e, 1, 1);
+    m4_put(e, 4, 4);                    /* progressive, no OBMC / sprite */
+    m4_put(e, 0, 1);                    /* H.263 quantisation */
+    m4_put(e, 12, 4);                   /* no resync markers */
+    m4_stuff(e);
+}
+
+static void gm_mcp100_vop_header(GmMcp100State *s, Mpeg4Enc *e, bool coded,
+                                 int rounding)
+{
+    const uint32_t base = gm_mcp100_node32(s, N4_FBASE);
+    int32_t sec = gm_mcp100_node32(s, N4_MODULE_BASE);
+
+    if (sec < 0) {
+        sec = gm_mcp100_node32(s, N4_CUR + F_SECONDS);
+    }
+    m4_put(e, 0x000001B6, 32);
+    m4_put(e, e->intra_vop ? 0 : 1, 2);
+    for (sec = MIN(sec, 60); sec > 0; sec--) {
+        m4_put(e, 1, 1);
+    }
+    m4_put(e, 0, 1);
+    m4_put(e, 1, 1);
+    m4_put(e, gm_mcp100_node32(s, N4_CUR + F_TICKS),
+           MAX(m4_log2bin(base - 1), 1));
+    m4_put(e, 1, 1);
+    m4_put(e, coded, 1);
+    if (!coded) {
+        m4_stuff(e);
+        return;
+    }
+    if (!e->intra_vop) {
+        m4_put(e, rounding, 1);
+    }
+    m4_put(e, 0, 3);                    /* intra_dc_vlc_thr: always */
+    m4_put(e, e->q, 5);
+    if (!e->intra_vop) {
+        m4_put(e, 1, 3);
+    }
+}
+
+static void gm_mcp100_planes(GmMcp100State *s, uint32_t frame, uint8_t **p,
+                             size_t luma, bool write)
+{
+    int c;
+
+    for (c = 0; c < 3; c++) {
+        const hwaddr a = gm_mcp100_node32(s, frame + F_RECON + 4 * c);
+        const size_t n = c ? luma / 4 : luma;
+
+        if (write) {
+            dma_memory_write(&address_space_memory, a, p[c], n,
+                             MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dma_memory_read(&address_space_memory, a, p[c], n,
+                            MEMTXATTRS_UNSPECIFIED);
+        }
+    }
+}
+
+/*
+ * The source through the DMA wrapper: packed 4:2:2, rows of the picture's
+ * width.  Both UYVY orders come from the capture block as it is set up.
+ */
+static void gm_mcp100_fetch422(GmMcp100State *s, uint8_t **p, int w, int h)
+{
+    const uint32_t stride = gm_mcp100_node32(s, N4_WIDTH) * 2;
+    const hwaddr base = gm_mcp100_node32(s, N4_CUR + F_IMAGE);
+    g_autofree uint8_t *row = g_malloc0(w * 2);
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        dma_memory_read(&address_space_memory, base + (hwaddr)y * stride,
+                        row, w * 2, MEMTXATTRS_UNSPECIFIED);
+        for (x = 0; x < w; x++) {
+            p[0][y * w + x] = row[x * 2 + 1];
+        }
+        for (x = 0; x < w / 2; x++) {
+            const int o = (y / 2) * (w / 2) + x;
+
+            p[1][o] = y & 1 ? (p[1][o] + row[x * 4] + 1) / 2 : row[x * 4];
+            p[2][o] = y & 1 ? (p[2][o] + row[x * 4 + 2] + 1) / 2
+                            : row[x * 4 + 2];
+        }
+    }
+}
+
+static void gm_mcp100_mpeg4(GmMcp100State *s, unsigned cmd)
+{
+    const uint32_t mw = gm_mcp100_node32(s, N4_MB_W);
+    const uint32_t mh = gm_mcp100_node32(s, N4_MB_H);
+    const hwaddr bs = gm_mcp100_node32(s, N4_BITSTREAM);
+    const size_t luma = (size_t)mw * 16 * mh * 16;
+    const uint32_t fmt = gm_mcp100_node32(s, N4_IMG_FMT);
+    Mpeg4Enc e = { 0 };
+    int rounding = gm_mcp100_node32(s, N4_ROUNDING) & 1;
+
+    if (cmd != CMD_ENCODE_N &&
+        (fmt != 3 || gm_mcp100_node32(s, N4_WIDTH) < mw * 16)) {
+        /* no picture: the job ends with no bytes */
+        qemu_log_mask(LOG_UNIMP, "gm-mcp100: MPEG-4 input format %u, width "
+                      "%u\n", fmt, gm_mcp100_node32(s, N4_WIDTH));
+    } else if (mw && mh && mw <= 128 && mh <= 128) {
+        g_autofree uint8_t *src = g_malloc0(luma * 3 / 2);
+        g_autofree uint8_t *ref = g_malloc0(luma * 3 / 2);
+        g_autofree uint8_t *rec = g_malloc0(luma * 3 / 2);
+        g_autofree uint8_t *out = g_malloc(luma * 2 + 4096);
+        uint8_t *ps[3] = { src, src + luma, src + luma * 5 / 4 };
+        uint8_t *pr[3] = { ref, ref + luma, ref + luma * 5 / 4 };
+        uint8_t *pc[3] = { rec, rec + luma, rec + luma * 5 / 4 };
+        int c;
+
+        e.out = out;
+        e.cap = luma * 2 + 4096;
+        e.w = mw * 16;
+        e.h = mh * 16;
+        e.q = MIN(MAX(gm_mcp100_node32(s, N4_CUR + F_QUANT), 1), 31);
+        e.intra_vop = cmd == CMD_ENCODE_I;
+        for (c = 0; c < 3; c++) {
+            e.src[c] = ps[c];
+            e.ref[c] = pr[c];
+            e.rec[c] = pc[c];
+        }
+        rounding = e.intra_vop ? 0 : rounding ^ 1;
+        if (e.intra_vop || (gm_mcp100_node32(s, N4_VOL) & 0xFF)) {
+            gm_mcp100_vol(s, &e);
+        }
+        gm_mcp100_vop_header(s, &e, cmd != CMD_ENCODE_N, rounding);
+        if (cmd != CMD_ENCODE_N) {
+            gm_mcp100_fetch422(s, ps, e.w, e.h);
+            if (!e.intra_vop) {
+                gm_mcp100_planes(s, N4_REF, pr, luma, false);
+            }
+            m4_vop_data(&e);
+            gm_mcp100_planes(s, N4_CUR, pc, luma, true);
+        }
+        if (e.len > e.cap) {
+            qemu_log_mask(LOG_GUEST_ERROR, "gm-mcp100: VOP cut short\n");
+            e.len = e.cap;
+        }
+        dma_memory_write(&address_space_memory, bs, out, e.len,
+                         MEMTXATTRS_UNSPECIFIED);
+        if (s->dump) {                  /* one file per encoder instance */
+            g_autofree char *name =
+                g_strdup_printf("%s/mpeg4-%ux%u-%08x.m4v", s->dump, e.w, e.h,
+                                gm_mcp100_node32(s, N4_PRED));
+            FILE *f = fopen(name, "ab");
+
+            if (f) {
+                fwrite(out, 1, e.len, f);
+                fclose(f);
+            }
+        }
+        stl_le_p(&s->node[N4_ROUNDING], rounding);
+        stl_le_p(&s->node[N4_CUR + F_ROUNDING], rounding);
+        stl_le_p(&s->node[N4_CUR + F_TYPE], e.intra_vop ? 0 : 1);
+    }
+    /* what the host's FlushBitstream() adds up to the length */
+    s->regs[R_ABADR / 4] = bs + (e.len & ~63);
+    s->regs[R_BALR / 4] = e.len & 0x3C;
+    s->regs[R_VADR / 4] = (e.len & 3) * 8;
+    s->packer_off = true;               /* the flush's padding */
+    s->node[N_COMMAND] = cmd << 4;
+    s->regs[R_INT_FLAG / 4] |= INT_JPEG_DONE;
+    gm_mcp100_update(s);
+}
+
 static void gm_mcp100_job(void *opaque)
 {
     GmMcp100State *s = opaque;
+    const unsigned cmd = s->job;
 
-    if ((s->node[N_COMMAND] & 0xF) == CMD_ENCODE_JPEG) {
+    s->job = 0;
+
+    if (cmd >= CMD_ENCODE_I && cmd <= CMD_ENCODE_N) {
+        gm_mcp100_mpeg4(s, cmd);
+        return;
+    }
+
+    if (cmd == CMD_ENCODE_JPEG) {
         gm_mcp100_encode(s);
     }
 }
@@ -355,9 +592,12 @@ static void gm_mcp100_write(void *opaque, hwaddr off, uint64_t val,
         val &= ~RESET_GO;
         break;
     case R_BALR:
-        gm_mcp100_put_bits(s, s->regs[R_BADR / 4], MIN(val & 0x3F, 32));
+        if (!s->packer_off) {
+            gm_mcp100_put_bits(s, s->regs[R_BADR / 4], MIN(val & 0x3F, 32));
+        }
         break;
     case R_ABADR:
+        s->packer_off = false;
         s->bs_phy = val & ~3u;
         s->hdr_len = 0;
         s->acc = 0;
@@ -398,7 +638,11 @@ static void gm_mcp100_node_write(void *opaque, hwaddr off, uint64_t val,
     GmMcp100State *s = opaque;
 
     stn_le_p(&s->node[off], size, val);
-    if (off == N_COMMAND && (val & 0xF) == CMD_ENCODE_JPEG) {
+    if (off == N_COMMAND && ((val & 0xF) == CMD_ENCODE_JPEG ||
+                             ((val & 0xF) >= CMD_ENCODE_I &&
+                              (val & 0xF) <= CMD_ENCODE_N))) {
+        /* latched, as the firmware does: the host may touch the node again */
+        s->job = val & 0xF;
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                             GM_MCP100_JOB_NS);
     } else if (off == N_COMMAND && (val & 0xF)) {
@@ -452,6 +696,8 @@ static void gm_mcp100_reset(DeviceState *dev)
     memset(s->wrp, 0, sizeof(s->wrp));
     s->bs_phy = s->hdr_len = s->acc = 0;
     s->acc_bits = 0;
+    s->packer_off = false;
+    s->job = 0;
     gm_mcp100_update(s);
 }
 
@@ -472,9 +718,13 @@ static void gm_mcp100_realize(DeviceState *dev, Error **errp)
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gm_mcp100_job, s);
 }
 
+static const Property gm_mcp100_props[] = {
+    DEFINE_PROP_STRING("dump", GmMcp100State, dump),
+};
+
 static const VMStateDescription vmstate_gm_mcp100 = {
     .name = TYPE_GM_MCP100,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, GmMcp100State),
@@ -486,6 +736,8 @@ static const VMStateDescription vmstate_gm_mcp100 = {
         VMSTATE_UINT32(acc, GmMcp100State),
         VMSTATE_INT32(acc_bits, GmMcp100State),
         VMSTATE_UINT8_ARRAY(hdr, GmMcp100State, GM_MCP100_HDR_MAX),
+        VMSTATE_BOOL_V(packer_off, GmMcp100State, 3),
+        VMSTATE_UINT8_V(job, GmMcp100State, 3),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -496,6 +748,7 @@ static void gm_mcp100_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = gm_mcp100_realize;
     device_class_set_legacy_reset(dc, gm_mcp100_reset);
+    device_class_set_props(dc, gm_mcp100_props);
     dc->vmsd = &vmstate_gm_mcp100;
 }
 

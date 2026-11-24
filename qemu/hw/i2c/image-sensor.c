@@ -156,6 +156,8 @@ static const ImageSensorSpec image_sensors[] = {
     { "ov2715", OV2710, 0x36, 0x2715, 0x300A, .pclk = 90000000 },
     OV16("ov4689", 0x36, 0x4688),
     OV16("ov9715", 0x30, 0x9711),
+    /* PID / VER at 0x0A / 0x0B (fcap200_ov7720.ko of the GM8126) */
+    { "ov7725", GALAXYCORE, 0x21, 0x7721, 0x0A, false },
     /* the AX620U boards' (Axera SDK ov_os04a10/os04a10.c: 0x36, chip ID
      * 0x300A:0x300B:0x300C = 0x530441) */
     { "os04a10", OMNIVISION, 0x36, 0x530441, 0x300A },

@@ -1,9 +1,10 @@
-# Grain Media (`gm8135s`, `gm8136`, `gm8136s`)
+# Grain Media (`gm8126`, `gm8135s`, `gm8136`, `gm8136s`)
 
 Grain Media's GM813x IP-camera SoCs: a Faraday FA626TE (ARMv5TE) among
 Faraday peripherals, DDR at 0 and everything else from `0x90000000`. One
 machine file (`hw/arm/grainmedia.c`) covers the packages, which differ in
-the PMU's chip ID and where the DRAM sits.
+the PMU's chip ID and where the DRAM sits. The GM8126, the generation
+before, has its own file and [section](#gm8126).
 
 ## What the SDK and dumps cover
 
@@ -16,8 +17,8 @@ the PMU's chip ID and where the DRAM sits.
 | OpenIPC `gm8136` / `gm8135` releases | the kernel booted with `-kernel`, root on the NOR; `fisp328.ko`, `fisp_algorithm.ko` and `fisp_ov2715.ko` with their symbols, for the ISP's gain / pre-gamma registers and the OV2715's exposure, gain and timing |
 | [GM8136S/GM8135S Data Sheet V0.2](https://dashcamtalk.com/cams/b1w/GM8136S_GM8135S_Data_Sheet_V0.2.pdf) (Oct. 2014, 693 pp.) | the address map (Figure 3-1, which the table below matches), register chapters for the CSIRX, IVS, MAC, SDC, USB, GPIO, I2C, IR, UART, PWM and SAR ADC; only feature lists for the ISP, VCAP and H.264 (ISP: 1080p, 2-lane MIPI / sub-LVDS / 12-bit parallel, AE / AWB / AF statistics and a configurable histogram) |
 
-The SDK also carries GM8126, GM8139 and GM8287 platforms; they are not
-modelled here (GM8139's map is close to GM8136's, GM8126 has an FTINTC010).
+The SDK also carries GM8139 and GM8287 platforms, which are not modelled
+(GM8139's map is close to GM8136's).
 
 ## Machines
 
@@ -509,3 +510,79 @@ reduction, colour matrix, its gamma curve: the picture is the scene
 through exposure, white balance and a fixed 1/2.2 gamma), the MCP100's
 MPEG-4 (not in the cameras' kernels), the LCD's output, and the timing
 of the PWM outputs.
+
+## GM8126
+
+`gm8126` (`hw/arm/grainmedia-gm8126.c`): the FA626TE and Faraday blocks at
+other addresses, behind an FTINTC010. A camera dump (report `r-nz9qyrtg`,
+OV7725, kernel 2.6.28) boots from its flash through nsboot, the "burn-in"
+`rom.bin`, U-Boot 2008.10 and Linux to the vendor application, which
+streams MPEG-4 over RTSP and encodes H.264:
+
+```bash
+python3 qemu-boot/gm8126-flash.py dump.bin nor.bin    # a dump read by U-Boot
+./qemu-src/build/qemu-system-arm -M gm8126,flash-file=nor.bin,sensor=ov7725 \
+    -nographic -serial mon:stdio -nic user
+```
+
+Work on a copy. `-global gm-mcp100.dump=DIR` and `-global
+gm-h264e.dump=DIR` save the encoded streams.
+
+| Address | Block | Model | IRQ |
+|---|---|---|---|
+| `0x90000000` / `0x99000000` | AHBC / PMU | `gm-sys8126` | FCS: 8 |
+| `0x90B00000` / `0x90C00000` | FTCAP020 capture | `gm-cap020` | 32 / 33 |
+| `0x92200000` | USB OTG | `gm-otg` | 4 |
+| `0x92400000` | FTSCAL010 | `gm-scal010` | 12 |
+| `0x92500000` | FTMAC110 | `gm-ftmac110` | 3 |
+| `0x92600000` | FTDMAC020 (SSP0 RX / TX: lines 0 / 1) | `gm-dmac` | 1 |
+| `0x92800000` | FTSDC010, a micro-SD slot | `gm-sdc010` | 15 |
+| `0x94000000` / `0x94100000` | MCP200 H.264 / its wrapper | `gm-h264e` `mcp200=on` | 29 |
+| `0x94300000` | MCP100 local memory, +0x8000 mailbox, +0x20000 registers | RAM, `gm-mcp100` | 31 |
+| `0x98200000` | FTSSP010, the NOR; select GPIO0 pin 14 | `gm-ssp-spi` | 6 |
+| `0x98300000` `98400000` `98500000` `98800000` `98900000` | UART0-4 | `serial-mm` | 9 10 20 21 22 |
+| `0x99100000` / `0x99200000` / `0x99300000` | timers / watchdog / DDR | `gm-timer` `gm-wdt` `gm-ddrc` | 14 / 16 |
+| `0x99400000` / `0x99700000` / `0x99800000` | GPIO0-2 | `gm-gpio` | 13 / 17 / 25 |
+| `0x99500000` | FTINTC010 | `gm-intc010` | |
+| `0x99600000` / `0x99900000` / `0x98D00000` | I2C / RTC / SAR ADC | `gm-i2c` `gm-rtc` `gm-saradc` | 18 / 5 / 40 |
+
+- **Flash byte order.** The chip holds every 32-bit word byte-swapped,
+  because the loaders read it in 32-bit SPI frames, most significant byte
+  first; Linux reads bytes and swaps the headers itself (`winbond.c`
+  `byte_swap()`). A dump taken through U-Boot is swapped back. In it the
+  web partition is readable only after swapping.
+- **Images.** A system header at 0 (`GM8126`, image addresses, `0x55AA` at
+  0xFE); nsboot at 0x1000, `rom.bin` at 0x6000, U-Boot at 0xA6000 and
+  Linux at 0xD6000, each behind a 256-byte header (magic `0x805A474D`,
+  size at +8, a name).
+- **nsboot** writes a DDR table and polls DDRC 0x04 bit 8, remaps DDR from
+  0x10000000 to 0 (AHBC 0x88) and reads `rom.bin` by DMA, with dummies on a
+  second channel. `rom.bin` changes the clocks, waiting in WFI for
+  interrupt 8, and loads U-Boot to 0x04000000; it runs at 0x01000000.
+- **CPU.** The kernel reads the TCM region registers (CP15 c9,c1) and
+  `rom.bin` writes c1,c0,1, neither of which QEMU's arm926 has.
+- **Capture** runs lists of words in DRAM: a status, DMA addresses, byte
+  enabled register writes and the next list. Status 0x92000000 is a frame
+  done; the driver looks on the frame-start interrupt. The size written is
+  the crop size (0x18), not the active window (0x58).
+- **MPEG-4** goes through the MCP100's mailbox like MJPEG (command 4 I, 5
+  P, 6 not coded). The command is latched: creating an encoder clears the
+  mailbox under a running job. `mpeg4-enc.c.inc` codes H.263-quantised I
+  and P VOPs with zero motion against the driver's reconstruction buffer.
+- **Ethernet** receives frames at half-word addresses: two bytes into a
+  word-aligned buffer. The UART clock is
+  30 MHz / (PMU 0x78[23:18] + 1), 16 from reset.
+- **Clock gates** (PMU 0x38 / 0x3C, 1 = stopped): a gated block answers
+  nothing. Watchdog, I2C, SDC, DMAC, Ethernet, GPIO, SSP0, RTC, ADC, scaler.
+- **SD**: `-drive if=sd,format=raw,file=...` is a card in the micro-SD
+  slot, through PIO (FIFO threshold status) or the DMA controller's line 6.
+- **SSP**: the flash select passes through it, so that a fast read's dummy
+  byte is the eight transfers `m25p80` counts. The vendor code only reads
+  with 0x03; OpenIPC's U-Boot uses 0x0B.
+
+Assumed: the chip ID (`0x812620`, MP), PLL1 reading back shifted left by
+one (with both, `rom.bin` and the kernel agree on every clock), and the 4:2:2
+chroma order, which the picture and the encoders share. Not modelled: the
+ISP210 and its sensors' cameras, LCD, TV encoder, NAND, the deinterlacer,
+audio. The vendor application's JPEG snapshot times out once at
+start.
