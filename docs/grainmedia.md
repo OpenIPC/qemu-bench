@@ -445,7 +445,7 @@ gm-h264e.dump=DIR` save the encoded streams.
 | `0x92400000` | FTSCAL010 | `gm-scal010` | 12 |
 | `0x92500000` | FTMAC110 | `gm-ftmac110` | 3 |
 | `0x92600000` | FTDMAC020 (SSP0 RX / TX: lines 0 / 1) | `gm-dmac` | 1 |
-| `0x92800000` | FTSDC010, empty slot | `gm-sdc010` | 15 |
+| `0x92800000` | FTSDC010, a micro-SD slot | `gm-sdc010` | 15 |
 | `0x94000000` / `0x94100000` | MCP200 H.264 / its wrapper | `gm-h264e` `mcp200=on` | 29 |
 | `0x94300000` | MCP100 local memory, +0x8000 mailbox, +0x20000 registers | RAM, `gm-mcp100` | 31 |
 | `0x98200000` | FTSSP010, the NOR; select GPIO0 pin 14 | `gm-ssp-spi` | 6 |
@@ -481,6 +481,10 @@ gm-h264e.dump=DIR` save the encoded streams.
 - **Ethernet** receives frames at half-word addresses: two bytes into a
   word-aligned buffer. The UART clock is
   30 MHz / (PMU 0x78[23:18] + 1), 16 from reset.
+- **Clock gates** (PMU 0x38 / 0x3C, 1 = stopped): a gated block answers
+  nothing. Watchdog, I2C, SDC, DMAC, Ethernet, GPIO, SSP0, RTC, ADC, scaler.
+- **SD**: `-drive if=sd,format=raw,file=...` is a card in the micro-SD
+  slot, through PIO (FIFO threshold status) or the DMA controller's line 6.
 - **SSP**: the flash select passes through it, so that a fast read's dummy
   byte is the eight transfers `m25p80` counts. The vendor code only reads
   with 0x03; OpenIPC's U-Boot uses 0x0B.

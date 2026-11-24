@@ -44,6 +44,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(GmSys8126State, GM_SYS8126)
 
 #define SYS_SIZE    0x1000
+#define SYS_GATES       12
 #define SYS_NREGS   (0x100 / 4)
 #define SYS_OSC     30000000
 #define PMU_FCS_DONE (1u << 17)
@@ -61,7 +62,39 @@ struct GmSys8126State {
     uint64_t ram_size;
     uint32_t pmu[SYS_NREGS];
     uint32_t ahbc[SYS_NREGS];
+    qemu_irq gate[SYS_GATES];
 };
+
+/*
+ * The blocks whose clock gates (1 = stopped) the board follows, in "gate"
+ * output order; from the PMU tables of the vendor's kernel and modules.
+ */
+static const struct {
+    uint32_t reg, mask;
+} sys8126_gates[SYS_GATES] = {
+    { 0x3C, 1u << 15 },             /* 0 watchdog */
+    { 0x3C, 1u << 13 },             /* 1 I2C */
+    { 0x38, 1u << 12 },             /* 2 SDC */
+    { 0x38, 1u << 11 },             /* 3 DMAC */
+    { 0x38, 5u << 8 },              /* 4 Ethernet */
+    { 0x3C, 1u << 9 },              /* 5 GPIO0 */
+    { 0x3C, 1u << 10 },             /* 6 GPIO1 */
+    { 0x3C, 1u << 11 },             /* 7 GPIO2 */
+    { 0x3C, 1u << 5 },              /* 8 SSP0 */
+    { 0x3C, 1u << 16 },             /* 9 RTC */
+    { 0x3C, 1u << 25 },             /* 10 ADC */
+    { 0x38, 1u << 14 },             /* 11 scaler */
+};
+
+static void sys8126_update_gates(GmSys8126State *s)
+{
+    int i;
+
+    for (i = 0; i < SYS_GATES; i++) {
+        qemu_set_irq(s->gate[i], (s->pmu[sys8126_gates[i].reg / 4] &
+                                  sys8126_gates[i].mask) != 0);
+    }
+}
 
 static void sys8126_clocks(GmSys8126State *s)
 {
@@ -129,6 +162,9 @@ static void sys8126_pmu_write(void *opaque, hwaddr off, uint64_t val,
     if (off == 0x30 || off == 0x34) {
         sys8126_clocks(s);
     }
+    if (off == 0x38 || off == 0x3C) {
+        sys8126_update_gates(s);
+    }
 }
 
 static uint64_t sys8126_ahbc_read(void *opaque, hwaddr off, unsigned size)
@@ -178,6 +214,13 @@ static void sys8126_reset(DeviceState *dev)
     s->ahbc[0x18 / 4] = ctz64(s->ram_size / MiB) << 16;
     qemu_set_irq(s->fcs_irq, 0);
     sys8126_clocks(s);
+    sys8126_update_gates(s);
+}
+
+static int sys8126_post_load(void *opaque, int version_id)
+{
+    sys8126_update_gates(opaque);
+    return 0;
 }
 
 static void sys8126_init(Object *obj)
@@ -198,6 +241,7 @@ static void sys8126_realize(DeviceState *dev, Error **errp)
                           TYPE_GM_SYS8126 ".ahbc", SYS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->ahbc_mem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->fcs_irq);
+    qdev_init_gpio_out_named(dev, s->gate, "gate", SYS_GATES);
     s->fcs_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sys8126_fcs_done, s);
 }
 
@@ -210,6 +254,7 @@ static const VMStateDescription vmstate_sys8126 = {
     .name = TYPE_GM_SYS8126,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = sys8126_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(fcs_timer, GmSys8126State),
         VMSTATE_CLOCK(pclk, GmSys8126State),

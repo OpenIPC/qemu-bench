@@ -141,10 +141,20 @@ def test_sdc(qt):
     qt.writel(SDC, 0x400)
     check('reset done', qt.readl(SDC), 0)
     check('idle, no card', qt.readl(SDC + 0x28), 1 << 17)
-    qt.writel(SDC, 0x200)
+    qt.writel(SDC, 0x248)
     check('command times out', qt.readl(SDC + 0x28) & 4, 4)
     qt.writel(SDC + 0x2C, 4)
     check('cleared', qt.readl(SDC + 0x28) & 4, 0)
+
+
+def test_gates(qt):
+    print('clock gates')
+    qt.writel(SDC + 4, 0x1234)
+    qt.writel(0x99000038, 1 << 12)
+    check('a gated SDC reads 0', qt.readl(SDC + 4), 0)
+    qt.writel(SDC + 4, 0x5678)
+    qt.writel(0x99000038, 0)
+    check('and kept its register', qt.readl(SDC + 4), 0x1234)
 
 
 def test_capture(qt):
@@ -419,6 +429,7 @@ def main():
             test_sys(qt)
             test_spi(qt)
             test_sdc(qt)
+            test_gates(qt)
             test_capture(qt)
             test_scaler(qt)
             test_mpeg4(qt, args.ffmpeg)

@@ -230,6 +230,20 @@ static char *gm8126_fixup_uimage(const char *path)
     return tmp;
 }
 
+/* a block whose clock is stopped answers nothing */
+static void gm8126_gate_handler(void *opaque, int n, int level)
+{
+    memory_region_set_enabled(opaque, !level);
+}
+
+static void gm8126_gate(DeviceState *sys, int n, DeviceState *dev)
+{
+    MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+
+    qdev_connect_gpio_out_named(sys, "gate", n,
+                                qemu_allocate_irq(gm8126_gate_handler, mr, 0));
+}
+
 static DeviceState *gm8126_dev(const char *type, hwaddr base, qemu_irq irq)
 {
     DeviceState *dev = qdev_new(type);
@@ -262,7 +276,8 @@ static void gm8126_init(MachineState *machine)
     MemoryRegion *low = g_new(MemoryRegion, 1);
     g_autofree uint8_t *img = NULL;
     gsize img_len = 0;
-    DeviceState *intc, *sys, *dev, *spi, *gpio0 = NULL;
+    DeviceState *intc, *sys, *dev, *spi, *sdc, *gpio0 = NULL;
+    DriveInfo *di;
     Object *cpu;
     int n;
 
@@ -326,6 +341,7 @@ static void gm8126_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x99200000);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, IRQ(16));
+    gm8126_gate(sys, 0, dev);
 
     for (n = 0; n < ARRAY_SIZE(gm8126_uarts); n++) {
         serial_mm_init(sysmem, gm8126_uarts[n].base, 2,
@@ -336,9 +352,11 @@ static void gm8126_init(MachineState *machine)
     for (n = 0; n < ARRAY_SIZE(gm8126_gpios); n++) {
         dev = gm8126_dev("gm-gpio", gm8126_gpios[n].base,
                          IRQ(gm8126_gpios[n].irq));
+        gm8126_gate(sys, 5 + n, dev);
         gpio0 = gpio0 ? gpio0 : dev;
     }
     spi = gm8126_dev("gm-ssp-spi", 0x98200000, IRQ(6));
+    gm8126_gate(sys, 8, spi);
     gm8126_flash(gms, spi, gpio0, img_len);
 
     dev = gm8126_dev("gm-dmac", 0x92600000, IRQ(1));
@@ -346,14 +364,29 @@ static void gm8126_init(MachineState *machine)
                                 qdev_get_gpio_in_named(dev, "dma-req", 0));
     qdev_connect_gpio_out_named(spi, "dma-tx", 0,
                                 qdev_get_gpio_in_named(dev, "dma-req", 1));
+    gm8126_gate(sys, 3, dev);
     gm8126_dev("gm-otg", 0x92200000, IRQ(4));
-    gm8126_dev("gm-sdc010", 0x92800000, IRQ(15));
-    gm8126_dev("gm-rtc", 0x99900000, IRQ(5));
+    sdc = gm8126_dev("gm-sdc010", 0x92800000, IRQ(15));
+    qdev_connect_gpio_out_named(sdc, "dma-req", 0,
+                                qdev_get_gpio_in_named(dev, "dma-req", 6));
+    gm8126_gate(sys, 2, sdc);
+    di = drive_get(IF_SD, 0, 0);
+    if (di) {
+        DeviceState *card = qdev_new("sd-card");
+
+        qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(di),
+                                &error_fatal);
+        qdev_realize_and_unref(card, qdev_get_child_bus(sdc, "sd-bus"),
+                               &error_fatal);
+    }
+    dev = gm8126_dev("gm-rtc", 0x99900000, IRQ(5));
+    gm8126_gate(sys, 9, dev);
     dev = qdev_new("gm-saradc");
     object_property_add_child(OBJECT(machine), "saradc", OBJECT(dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x98D00000);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, IRQ(40));
+    gm8126_gate(sys, 10, dev);
     dev = qdev_new("fh-aes");
     qdev_prop_set_bit(dev, "advance", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
@@ -365,11 +398,13 @@ static void gm8126_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x92500000);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, IRQ(3));
+    gm8126_gate(sys, 4, dev);
 
     for (n = 0; n < ARRAY_SIZE(gm8126_caps); n++) {
         gm8126_dev("gm-cap020", gm8126_caps[n].base, IRQ(gm8126_caps[n].irq));
     }
-    gm8126_dev("gm-scal010", 0x92400000, IRQ(12));
+    dev = gm8126_dev("gm-scal010", 0x92400000, IRQ(12));
+    gm8126_gate(sys, 11, dev);
     dev = qdev_new("gm-h264e");
     qdev_prop_set_bit(dev, "mcp200", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
@@ -384,6 +419,7 @@ static void gm8126_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, IRQ(31));
 
     dev = gm8126_dev("gm-i2c", 0x99600000, IRQ(18));
+    gm8126_gate(sys, 1, dev);
     image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
                         gms->sensor);
 
