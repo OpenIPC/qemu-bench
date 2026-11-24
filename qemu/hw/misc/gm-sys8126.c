@@ -2,11 +2,14 @@
  * Grain Media GM8126 system blocks: the PMU (FTPMU010, 0x99000000) and the
  * AHB controller (FTAHBC010, 0x90000000).
  *
- * PMU (platform-GM8126/pmu.c): 0x00 the chip ID, which the kernel reads
- * shifted right by 8 (0x812620 is the GM8126 MP); 0x30 PLL1, MUL at 12:4
- * and DIV at 17:13, with the clock mode from bit 25 -- 1:0 what HCLK is
- * made of (PLL1, / 2, / 3 or PLL2 / 2); 0x34 PLL2, MUL 11:3 and DIV 16:12.
- * Both multiply 30 MHz.  PCLK is HCLK / 2 and the "pclk" clock output.
+ * PMU (platform-GM8126/pmu.c, U-Boot 2013.01 board/gm/gm8126): 0x00 the
+ * chip ID, which the kernel reads shifted right by 8 (0x812620 is the
+ * GM8126 MP); 0x30 PLL1, written with MUL at 11:3, DIV at 16:12 and the
+ * clock mode from bit 24 -- 1:0 what HCLK is made of (PLL1, / 2, / 3 or
+ * PLL2 / 2) -- and read back shifted left by one on MP parts: every
+ * reader of it uses 12:4, 17:13 and 25 (inferred; it is what makes
+ * rom.bin's and the kernel's clocks agree).  0x34 PLL2, MUL 11:3 and DIV
+ * 16:12.  Both multiply 30 MHz.  PCLK is HCLK / 2, the "pclk" output.
  * A frequency change goes as on the GM813x: 0x0C bit 2 starts it, the core
  * waits in WFI for interrupt 8, whose handler clears 0x20 bit 17.  The
  * interrupt comes a little later, or the core would take it before it
@@ -63,13 +66,13 @@ struct GmSys8126State {
 static void sys8126_clocks(GmSys8126State *s)
 {
     const uint32_t p1 = s->pmu[0x30 / 4], p2 = s->pmu[0x34 / 4];
-    const uint32_t d1 = MAX(extract32(p1, 13, 5), 1);
+    const uint32_t d1 = MAX(extract32(p1, 12, 5), 1);
     const uint32_t d2 = MAX(extract32(p2, 12, 5), 1);
-    const uint64_t pll1 = (uint64_t)SYS_OSC / d1 * extract32(p1, 4, 9);
+    const uint64_t pll1 = (uint64_t)SYS_OSC / d1 * extract32(p1, 3, 9);
     const uint64_t pll2 = (uint64_t)SYS_OSC / d2 * extract32(p2, 3, 9);
     uint64_t hclk;
 
-    switch (extract32(p1, 25, 2)) {
+    switch (extract32(p1, 24, 2)) {
     case 0:
         hclk = pll1;
         break;
@@ -98,6 +101,9 @@ static uint64_t sys8126_pmu_read(void *opaque, hwaddr off, unsigned size)
 {
     GmSys8126State *s = opaque;
 
+    if (off == 0x30 && s->chip_id >> 8 != 0x812610) {
+        return s->pmu[off / 4] << 1;
+    }
     return off / 4 < SYS_NREGS ? s->pmu[off / 4] : 0;
 }
 
@@ -137,10 +143,6 @@ static void sys8126_ahbc_write(void *opaque, hwaddr off, uint64_t val,
 {
     GmSys8126State *s = opaque;
 
-    /* nsboot turns the DDR slot into 128 MiB at 0: keep the RAM's size */
-    if (off == 0x18) {
-        val = deposit32(val, 16, 4, ctz64(s->ram_size / MiB));
-    }
     if (off / 4 < SYS_NREGS) {
         s->ahbc[off / 4] = val;
     }
@@ -170,7 +172,7 @@ static void sys8126_reset(DeviceState *dev)
     memset(s->pmu, 0, sizeof(s->pmu));
     memset(s->ahbc, 0, sizeof(s->ahbc));
     s->pmu[0] = s->chip_id;
-    s->pmu[0x30 / 4] = 18 << 4 | 1 << 13 | (2u << 2 | 2) << 25;
+    s->pmu[0x30 / 4] = 18 << 3 | 1 << 12 | (2u << 2 | 2) << 24;
     s->pmu[0x34 / 4] = 20 << 3 | 1 << 12;
     s->ahbc[0x18 / 4] = ctz64(s->ram_size / MiB) << 16;
     qemu_set_irq(s->fcs_irq, 0);

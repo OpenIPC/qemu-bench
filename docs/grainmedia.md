@@ -480,8 +480,8 @@ gm-h264e.dump=DIR` save the encoded streams.
   and P VOPs with zero motion against the driver's reconstruction buffer.
 - **Ethernet** receives frames two bytes into the first buffer.
 
-Assumed: the chip ID (`0x812620`, MP: no ID makes `rom.bin` and the kernel
-agree on PLL1), MACCR bit 13 as the two-byte offset's switch, and the 4:2:2
+Assumed: the chip ID (`0x812620`, MP), PLL1 reading back shifted left by
+one (with both, `rom.bin` and the kernel agree on every clock), MACCR bit 13 as the two-byte offset's switch, and the 4:2:2
 chroma order, which the picture and the encoders share. Not modelled: the
 ISP210 and its sensors' cameras, LCD, TV encoder, NAND, the deinterlacer,
 audio, SD cards. The vendor application's JPEG snapshot times out once at
