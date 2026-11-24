@@ -3859,6 +3859,13 @@ def test_i6c_scl_unset(qemu, tmp):
         check('SCL: with a Y buffer, the frame is there',
               qt.readl(0x20300000) != mark, True)
         check('SCL: the chroma with none is not', qt.readl(0x20000000), mark)
+        qt.writew(scl + 0x07 * 4, 0)        # and the other way round
+        qt.writew(scl + 0x27 * 4, 0x4)
+        qt.writel(0x20400000, mark)
+        qt.writew(scl, 0x10)
+        check('SCL: with a C buffer alone, the chroma is there',
+              qt.readl(0x20400000) != mark, True)
+        check('SCL: and the luma is not', qt.readl(0x20000000), mark)
     finally:
         qt.close()
 
