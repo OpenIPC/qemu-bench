@@ -3690,11 +3690,16 @@ def test_i6c_bdma_mmu(qemu, tmp):
         check('BDMA: a copy reads through the MMU too',
               qt.readl(DRAM + 0x300000), 0x12345678)
         # a VPA page with no entry: nothing is behind it, nothing written
+        # (all ones, 0xFFFF << 17, in the bits that reach DRAM)
+        reset = DRAM + (0xFFFF << 17 & 0x07FFFFFF)
+        qt.writel(reset, 0)
         qt.writel(0x3FF40000, 0)
         st = bdma_run(qt, 0, 0x0004, 0, 0x3FF40000, 0x100)
         check('BDMA: a fill into an unmapped page completes', st & 8, 8)
         check('BDMA: and lands nowhere, not at the untranslated address',
               qt.readl(0x3FF40000), 0)
+        check('BDMA: nor where a reset entry would point',
+              qt.readl(reset), 0)
     finally:
         qt.close()
 
@@ -3780,6 +3785,87 @@ def test_i6c_jpe_mmu(qemu, tmp):
               qt.readw(0x2200000E), 0xD9FF)
         check('JPE: nothing at the untranslated address',
               qt.readl(0x3FF0000C), 0)
+    finally:
+        qt.close()
+
+
+def test_i6c_mmu_miss(qemu, tmp):
+    print('infinity6c: a page with no MMU entry takes nothing')
+    path = i6_image(tmp, 'i6cm.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        # VPA region 0, MIU 0 up, so that an untranslated address is DRAM:
+        # 0x300000 is mapped to 0x2000000, the pages after it nowhere
+        mmu = riu(0x1659, 0)
+        qt.writew(mmu, 0)
+        qt.writew(mmu + 0x05 * 4, 0)
+        qt.writew(mmu + 0x06 * 4, 0)
+        qt.writew(mmu + 0x03 * 4, 0x100)
+        qt.writew(mmu + 0x02 * 4, 0x8000 | 0x18)
+        qt.writew(mmu + 0x0A * 4, 3)
+        qt.writew(mmu, (2 << 1) | 1)
+        # CMDQ: a ring in an unmapped page is not fetched from DRAM instead
+        e = riu(0x1126, 0)                  # engine 4
+        buf, target = 0x360000, riu(0x1033, 0x10)
+        old = qt.readw(target)
+        qt.writel(DRAM + buf, 0x1234 << 16 | 0xFFFF)
+        qt.writel(DRAM + buf + 4, 0x11 << 24 | (target - RIU) // 4)
+        for reg, v in ((0x04, buf >> 4), (0x06, ((buf + 0x1000) >> 4) - 1)):
+            qt.writew(e + reg * 4, v & 0xFFFF)
+            qt.writew(e + (reg + 1) * 4, v >> 16)
+        qt.writew(e + 0x01 * 4, 1)
+        qt.writew(e + 0x09 * 4, (buf + 16) >> 20)
+        qt.writew(e + 0x08 * 4, ((buf + 16) >> 4) & 0xFFFF)
+        check('CMDQ: no command from an unmapped page', qt.readw(target), old)
+        # the scaler: 1280x128 Y over a mapped page and a missing one
+        scl = riu(0x1253, 0)
+        ya, ca = 0x310000, 0x340000
+        for a in (0x22010000, 0x20320000, 0x20340000):
+            qt.writel(a, 0)
+        qt.writew(scl + 0x02 * 4, 0x50)
+        qt.writew(scl + 0x03 * 4, 128)
+        qt.writew(scl + 0x05 * 4, 0x500)
+        for n, a in ((0, ya), (0x20, ca)):
+            qt.writew(scl + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+            qt.writew(scl + (n + 0x07) * 4, a >> 20)
+        qt.writew(scl, 0x10)
+        check('SCL: the mapped page has its rows',
+              qt.readl(0x22010000) != 0, True)
+        check('SCL: the missing one lands nowhere', qt.readl(0x20320000), 0)
+        check('SCL: nor the chroma', qt.readl(0x20340000), 0)
+    finally:
+        qt.close()
+
+
+def test_i6c_scl_unset(qemu, tmp):
+    print('infinity6c scaler: an output with no buffer set writes nothing')
+    path = i6_image(tmp, 'i6cs.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        scl = riu(0x1253, 0)
+        mark = 0xC0DEC0DE
+        for a in (0x20000000, 0x20000500, 0x20300000):
+            qt.writel(a, mark)
+        qt.writew(scl + 0x02 * 4, 0x50)
+        qt.writew(scl + 0x03 * 4, 16)
+        qt.writew(scl + 0x05 * 4, 0x500)
+        for n in (0x06, 0x07, 0x26, 0x27):
+            qt.writew(scl + n * 4, 0)
+        qt.writew(scl, 0x10)
+        check('SCL: MIU 0 is left alone', qt.readl(0x20000000), mark)
+        check('SCL: and the row after', qt.readl(0x20000500), mark)
+        qt.writew(scl + 0x07 * 4, 0x3)      # Y at MIU 0x300000, no chroma
+        qt.writew(scl, 0x10)
+        check('SCL: with a Y buffer, the frame is there',
+              qt.readl(0x20300000) != mark, True)
+        check('SCL: the chroma with none is not', qt.readl(0x20000000), mark)
+        qt.writew(scl + 0x07 * 4, 0)        # and the other way round
+        qt.writew(scl + 0x27 * 4, 0x4)
+        qt.writel(0x20400000, mark)
+        qt.writew(scl, 0x10)
+        check('SCL: with a C buffer alone, the chroma is there',
+              qt.readl(0x20400000) != mark, True)
+        check('SCL: and the luma is not', qt.readl(0x20000000), mark)
     finally:
         qt.close()
 
@@ -4308,6 +4394,8 @@ def main():
     test_i6c_wave5_two(args.qemu, tmp)
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
+    test_i6c_mmu_miss(args.qemu, tmp)
+    test_i6c_scl_unset(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)

@@ -79,15 +79,11 @@
 #include "hantro-h264.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 
 #define TYPE_SSTAR_WAVE5 "sstar-wave5"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarWave5State, SSTAR_WAVE5)
 
 #define WAVE5_SIZE          0x800
-#define WAVE5_DRAM          0x20000000u
-#define WAVE5_MMU_PAGE      0x1000
 #define WAVE5_INSTANCES     8
 #define WAVE5_MAX_DIM       8192
 #define WAVE5_MAX_STRIDE    (2 * WAVE5_MAX_DIM)
@@ -189,25 +185,7 @@ struct SstarWave5State {
 static void wave5_mem(SstarWave5State *s, uint64_t miu, void *buf, size_t len,
                       bool write)
 {
-    uint8_t *p = buf;
-
-    miu += s->mem_base;
-
-    while (len) {
-        size_t n = MIN(len, WAVE5_MMU_PAGE - (miu & (WAVE5_MMU_PAGE - 1)));
-
-        /* a page with no MMU entry: nothing is behind it on the bus */
-        if (!sstar_miu_missed(miu)) {
-            dma_memory_rw(&address_space_memory,
-                          WAVE5_DRAM + sstar_miu_xlate(miu), p, n,
-                          write ? DMA_DIRECTION_FROM_DEVICE
-                                : DMA_DIRECTION_TO_DEVICE,
-                          MEMTXATTRS_UNSPECIFIED);
-        }
-        miu += n;
-        p += n;
-        len -= n;
-    }
+    sstar_miu_rw(miu + s->mem_base, buf, len, write);
 }
 
 static inline uint32_t *wave5_reg(SstarWave5State *s, uint32_t off)

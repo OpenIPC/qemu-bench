@@ -16,7 +16,10 @@
  * the ISP's last picture (sstar_iford_isp_picture()) is written to those
  * addresses as NV12, where the encoder takes it, at the output's size by
  * nearest neighbour.  The scaler's own registers beyond these are not read:
- * no crop, no filters.
+ * no crop, no filters.  infinity6c's mi_scl starts an output before it has
+ * given it a buffer: a plane whose address is still 0 is not written
+ * [assumed: MIU 0 is the kernel's, so the hardware cannot be
+ * writing a frame there].
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -31,8 +34,6 @@
 #include "hw/misc/sstar-riu.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 
 #define TYPE_SSTAR_IFORD_SCL "sstar-iford-scl"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
@@ -47,8 +48,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
 #define R_ADDR_HI           0x07
 #define CTRL_START          (1u << 4)
 
-#define SCL_DRAM_BASE       0x20000000
-#define SCL_PAGE            4096
 
 struct SstarIfordSclState {
     SysBusDevice parent_obj;
@@ -66,16 +65,7 @@ static SstarIfordSclState *scl_state;
 
 static void scl_write_mem(uint64_t miu, const uint8_t *p, size_t len)
 {
-    while (len) {
-        size_t n = MIN(len, SCL_PAGE - (miu & (SCL_PAGE - 1)));
-
-        dma_memory_write(&address_space_memory,
-                         SCL_DRAM_BASE + sstar_miu_xlate(miu), p, n,
-                         MEMTXATTRS_UNSPECIFIED);
-        miu += n;
-        p += n;
-        len -= n;
-    }
+    sstar_miu_rw(miu, (void *)p, len, true);
 }
 
 static void scl_frame(SstarIfordSclState *s)
@@ -97,7 +87,7 @@ static void scl_frame(SstarIfordSclState *s)
         s->w = w;
     }
     sstar_iford_isp_picture(s->isp, &py, &puv, &pw, &ph);
-    for (y = 0; y < h; y++) {
+    for (y = 0; ya && y < h; y++) {
         const uint8_t *in = py + (int64_t)y * ph / h * pw;
 
         if (w == pw) {
@@ -109,7 +99,7 @@ static void scl_frame(SstarIfordSclState *s)
         }
         scl_write_mem(ya + y * pitch, s->row, w);
     }
-    for (y = 0; y < h / 2; y++) {
+    for (y = 0; ca && y < h / 2; y++) {
         const uint8_t *in = puv + (int64_t)y * (ph / 2) / (h / 2) * pw;
 
         if (w == pw) {

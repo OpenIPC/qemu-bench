@@ -59,7 +59,6 @@
 #include "hw/misc/sstar-riu.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
-#include "system/dma.h"
 #include "qom/object.h"
 
 #define TYPE_SSTAR_CMDQ "sstar-cmdq"
@@ -99,7 +98,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarCmdqState, SSTAR_CMDQ)
 #define I3_START            (1u << 1)
 
 #define SS_RIU_BASE         0x1F000000
-#define SS_DRAM_BASE        0x20000000
 #define CMDQ_MAX_RUN        0x40000     /* commands per kick */
 
 typedef struct SstarCmdqEngine {
@@ -129,13 +127,6 @@ struct SstarCmdqState {
 static uint32_t eng32(SstarCmdqEngine *e, int lo)
 {
     return e->regs[lo] | ((uint32_t)e->regs[lo + 1] << 16);
-}
-
-static hwaddr cmdq_dram(uint32_t miu)
-{
-    uint64_t a = sstar_miu_xlate(miu);
-
-    return a < SS_DRAM_BASE ? SS_DRAM_BASE + a : a;
 }
 
 /* the register that masks the status: 0x47 on infinity3 and infinity6c */
@@ -304,8 +295,7 @@ static void sstar_cmdq_run(SstarCmdqState *s, int n)
                 break;
             }
         }
-        if (dma_memory_read(&address_space_memory, cmdq_dram(e->rptr), cmd,
-                            sizeof(cmd), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        if (sstar_miu_rw_cpu(e->rptr, cmd, sizeof(cmd), false) != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR, "sstar-cmdq%d: command at "
                           "0x%08x unreadable\n", n, e->rptr);
             break;

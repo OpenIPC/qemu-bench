@@ -84,8 +84,6 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "qemu/timer.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 #include <math.h>
 #include "aw-vinc-logo.h"
 #include "hw/misc/sstar-pattern.h"
@@ -126,8 +124,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordIspState, SSTAR_IFORD_ISP)
 #define ISP_DEF_H           1440
 #define ISP_MAX_DIM         8192
 
-#define ISP_DRAM_BASE       0x20000000
-#define ISP_PAGE            4096
 #define ISP_FULL            4095
 #define ISP_NO_DOT          (-100000)
 
@@ -191,18 +187,7 @@ static inline int isp_site(int x, int y)
 
 static void isp_write_mem(uint64_t miu, const void *buf, size_t len)
 {
-    const uint8_t *p = buf;
-
-    while (len) {
-        size_t n = MIN(len, ISP_PAGE - (miu & (ISP_PAGE - 1)));
-
-        dma_memory_write(&address_space_memory,
-                         ISP_DRAM_BASE + sstar_miu_xlate(miu), p, n,
-                         MEMTXATTRS_UNSPECIFIED);
-        miu += n;
-        p += n;
-        len -= n;
-    }
+    sstar_miu_rw(miu, (void *)buf, len, true);
 }
 
 /* the navy at row @y of @h, taken back through BT.601 and a 2.2 gamma */

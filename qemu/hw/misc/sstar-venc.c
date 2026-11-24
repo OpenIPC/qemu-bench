@@ -353,27 +353,10 @@ static hwaddr venc_dram(uint32_t miu16)
  * A buffer as a bus master sees it: contiguous in MIU addresses, which on
  * Iford are the MMU's and scattered over DRAM a page at a time.
  */
-#define VENC_MMU_PAGE       0x1000
-
 static void venc_mem(uint32_t miu16, uint64_t off, void *buf, size_t len,
                      bool write)
 {
-    uint64_t a = ((uint64_t)miu16 << 4) + off;
-    uint8_t *p = buf;
-
-    while (len) {
-        size_t n = MIN(len, VENC_MMU_PAGE - (a & (VENC_MMU_PAGE - 1)));
-        hwaddr d = sstar_miu_xlate(a);
-
-        d = d < SS_DRAM_BASE ? SS_DRAM_BASE + d : d;
-        dma_memory_rw(&address_space_memory, d, p, n,
-                      write ? DMA_DIRECTION_FROM_DEVICE
-                            : DMA_DIRECTION_TO_DEVICE,
-                      MEMTXATTRS_UNSPECIFIED);
-        a += n;
-        p += n;
-        len -= n;
-    }
+    sstar_miu_rw_cpu(((uint64_t)miu16 << 4) + off, buf, len, write);
 }
 
 /* prog, as everywhere: the program's MIU address, in 16-byte units */

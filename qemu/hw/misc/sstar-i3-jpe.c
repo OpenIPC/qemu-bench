@@ -184,22 +184,11 @@ static uint32_t jpe_addr(SstarI3JpeState *s, int reg)
 static void jpe_mem(SstarI3JpeState *s, uint32_t miu, void *buf, size_t len,
                     bool write)
 {
-    uint8_t *p = buf;
-
-    while (len) {
-        size_t n = MIN(len, 4096 - (miu & 4095));
-        hwaddr a = DRAM_BASE + (s->i6_irq ? sstar_miu_xlate(miu) : miu);
-
-        if (write) {
-            address_space_write(&address_space_memory, a,
-                                MEMTXATTRS_UNSPECIFIED, p, n);
-        } else {
-            address_space_read(&address_space_memory, a,
-                               MEMTXATTRS_UNSPECIFIED, p, n);
-        }
-        miu += n;
-        p += n;
-        len -= n;
+    if (s->i6_irq) {
+        sstar_miu_rw(miu, buf, len, write);
+    } else {
+        address_space_rw(&address_space_memory, DRAM_BASE + miu,
+                         MEMTXATTRS_UNSPECIFIED, buf, len, write);
     }
 }
 

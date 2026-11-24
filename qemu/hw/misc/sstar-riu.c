@@ -39,6 +39,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/misc/sstar-riu.h"
 #include "system/address-spaces.h"
+#include "system/dma.h"
 #include "system/runstate.h"
 
 #define RIU_NREGS           (SSTAR_RIU_SIZE / 4)
@@ -368,7 +369,8 @@ static int sstar_miu_lookup(SstarRiuState *s, uint64_t a, uint64_t *pa,
             return SSTAR_MIU_PASS;
         }
         e = s->mmu[(a >> pg) & (MMU_ENTRIES - 1)];
-        if (e == MMU_INVALID) {
+        /* a reset leaves all ones, wider than an entry the driver writes */
+        if (e >= MMU_INVALID) {
             return SSTAR_MIU_MISS;
         }
     }
@@ -429,6 +431,50 @@ size_t sstar_miu_page(uint64_t a, size_t len, uint64_t *pa, bool *missed)
                       ", %zu bytes skipped\n", a, len);
     }
     return len;
+}
+
+#define MIU_DRAM_BASE       0x20000000
+
+static MemTxResult sstar_miu_dma(uint64_t a, void *buf, size_t len,
+                                 bool write, bool cpu_form)
+{
+    uint8_t *p = buf;
+    MemTxResult r = MEMTX_OK;
+
+    while (len) {
+        uint64_t pa;
+        bool missed;
+        size_t n = sstar_miu_page(a, len, &pa, &missed);
+
+        if (missed) {
+            if (!write) {
+                memset(p, 0, n);
+            }
+            r |= MEMTX_DECODE_ERROR;
+        } else {
+            if (!cpu_form || pa < MIU_DRAM_BASE) {
+                pa += MIU_DRAM_BASE;
+            }
+            r |= dma_memory_rw(&address_space_memory, pa, p, n,
+                               write ? DMA_DIRECTION_FROM_DEVICE
+                                     : DMA_DIRECTION_TO_DEVICE,
+                               MEMTXATTRS_UNSPECIFIED);
+        }
+        a += n;
+        p += n;
+        len -= n;
+    }
+    return r;
+}
+
+MemTxResult sstar_miu_rw(uint64_t addr, void *buf, size_t len, bool write)
+{
+    return sstar_miu_dma(addr, buf, len, write, false);
+}
+
+MemTxResult sstar_miu_rw_cpu(uint64_t addr, void *buf, size_t len, bool write)
+{
+    return sstar_miu_dma(addr, buf, len, write, true);
 }
 
 static void sstar_miu_mmu_write(SstarRiuState *s, uint32_t reg, uint16_t v)
