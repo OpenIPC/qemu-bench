@@ -49,6 +49,19 @@
  * interrupt 29.  "-global gm-h264e.dump=DIR" appends each picture's output
  * to DIR/gm-h264e-<width>x<height>.h264, one file per stream size.
  *
+ * mcp200=on is the GM8126's older MCP200 (favc_drv.ko) behind the same
+ * coder.  Its registers: 0x00 size (MBs - 1 at 7:0 / 15:8, their count - 1
+ * at 31:16), 0x10 the QP at 9:4, 0x18 the source select, 0x1C / 0x24 the
+ * header packer (a value, then its control: 5:0 length, 6 go, 7
+ * Exp-Golomb, 8 emulation prevention, 9 trailing bits, 11 clear), 0x20 go
+ * (1 I, 3 P; bit 31 reset), 0x40 bit 0 idle, 0x44 the byte count, 0x48
+ * bit 0 the interrupt (written 0 to clear), 0x98 the DMA chain (+0x118 the
+ * reconstruction, +0x88 the reference, the chroma after the luma), 0xA8
+ * the bitstream.  Raster sources come through the wrapper (second region):
+ * 0x00 / 0x04 macroblocks left / right of the slice, 0x18 the address
+ * >> 2, 0x1C the format (0x65 packed 4:2:2), 0x20 go.  One slice a
+ * picture, as the driver is configured on the cameras seen.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -75,6 +88,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GmH264eState, GM_H264E)
 #define GM_H264E_NREGS      (GM_H264E_SIZE / 4)
 #define GM_VCACHE_SIZE      0x1000
 #define GM_VCACHE_NREGS     (GM_VCACHE_SIZE / 4)
+#define GM_M2_NREGS         (0x200 / 4)
 #define GM_H264E_SLICE_NS   1000000
 
 #define R_PARM0             0x00
@@ -151,6 +165,9 @@ struct GmH264eState {
     H264Deblock db;
 
     char *dump;
+
+    bool mcp200;
+    uint32_t m2[GM_M2_NREGS];
 };
 
 static void gm_h264e_update(GmH264eState *s)
@@ -490,6 +507,84 @@ static void gm_h264e_to_nv12(const uint8_t *src, int stride, bool yuyv, int w,
     }
 }
 
+/* MCP200: the source picture as NV12; false for one it cannot read */
+static bool gm_h264e_m2_source(GmH264eState *s, int w, int h, uint8_t *y,
+                               uint8_t *uv)
+{
+    const uint32_t chain = s->m2[0x98 / 4] & ~3u;
+    const uint32_t fmt = s->vcache[0x1C / 4];
+    int r, x, i, j;
+
+    if (fmt == 0x65) {                  /* packed 4:2:2 */
+        const int stride = (s->vcache[0] + s->vcache[1] + w / 16) * 32;
+        g_autofree uint8_t *src = g_malloc0((size_t)stride * h);
+
+        if (stride > 8192) {
+            return false;
+        }
+        dma_memory_read(&address_space_memory,
+                        (hwaddr)s->vcache[0x18 / 4] << 2, src,
+                        (size_t)stride * h, MEMTXATTRS_UNSPECIFIED);
+        gm_h264e_to_nv12(src, stride, false, w, h, y, uv);
+        return true;
+    }
+    if (fmt == 0x60) {                  /* planar 4:2:0 */
+        const int stride = (s->vcache[0] + s->vcache[1] + w / 16) * 16;
+        g_autofree uint8_t *line = g_malloc0(w);
+
+        for (r = 0; r < h; r++) {
+            dma_memory_read(&address_space_memory,
+                            ((hwaddr)s->vcache[0x10 / 4] << 2) + r * stride,
+                            y + r * w, w, MEMTXATTRS_UNSPECIFIED);
+        }
+        for (r = 0; r < h; r++) {       /* Cb rows, then Cr rows */
+            const int c = r >= h / 2, row = c ? r - h / 2 : r;
+
+            dma_memory_read(&address_space_memory,
+                            ((hwaddr)s->vcache[(c ? 0x18 : 0x14) / 4] << 2) +
+                            row * (stride / 2), line, w / 2,
+                            MEMTXATTRS_UNSPECIFIED);
+            for (x = 0; x < w / 2; x++) {
+                uv[row * w + x * 2 + c] = line[x];
+            }
+        }
+        return true;
+    }
+    /* 16x16 tiles, from the chain: 256 luma bytes, 128 interleaved chroma */
+    {
+        uint32_t d[2] = { 0 };
+        uint32_t mb = 0;
+
+        dma_memory_read(&address_space_memory, chain + 0x08, &d[0], 4,
+                        MEMTXATTRS_UNSPECIFIED);
+        dma_memory_read(&address_space_memory, chain + 0x18, &d[1], 4,
+                        MEMTXATTRS_UNSPECIFIED);
+        d[0] = le32_to_cpu(d[0]) & ~3u;
+        d[1] = le32_to_cpu(d[1]) & ~3u;
+        for (r = 0; r < h; r += 16) {
+            for (x = 0; x < w; x += 16, mb++) {
+                uint8_t t[256];
+
+                dma_memory_read(&address_space_memory, d[0] + mb * 256, t,
+                                256, MEMTXATTRS_UNSPECIFIED);
+                for (i = 0; i < 16; i++) {
+                    memcpy(y + (r + i) * w + x, t + i * 16, 16);
+                }
+                if (s->m2[0x18 / 4] & 1) {      /* Cb then Cr, 8x8 each */
+                    qemu_log_mask(LOG_UNIMP, "gm-h264e: three-plane tiles\n");
+                    return false;
+                }
+                dma_memory_read(&address_space_memory, d[1] + mb * 128, t,
+                                128, MEMTXATTRS_UNSPECIFIED);
+                for (j = 0; j < 8; j++) {
+                    memcpy(uv + (r / 2 + j) * w + x, t + j * 16, 16);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static void gm_h264e_encode_slice(GmH264eState *s)
 {
     const uint32_t p0 = s->regs[R_PARM0 / 4], p1 = s->regs[R_PARM1 / 4];
@@ -541,14 +636,19 @@ static void gm_h264e_encode_slice(GmH264eState *s)
             g_autofree uint8_t *py = NULL, *puv = NULL;
 
             gm_h264e_drop_pic(s);
-            dma_memory_read(&address_space_memory,
-                            s->regs[R_CUR_TOP / 4] -
-                            (hwaddr)first * 16 * stride,
-                            whole, stride * ph, MEMTXATTRS_UNSPECIFIED);
-            s->pic_y = g_malloc(pw * ph);
+            s->pic_y = g_malloc0(pw * ph);
             s->pic_uv = g_malloc(pw * ph / 2);
-            gm_h264e_to_nv12(whole, stride, yuyv, pw, ph, s->pic_y,
-                             s->pic_uv);
+            memset(s->pic_uv, 128, pw * ph / 2);
+            if (s->mcp200) {
+                gm_h264e_m2_source(s, pw, ph, s->pic_y, s->pic_uv);
+            } else {
+                dma_memory_read(&address_space_memory,
+                                s->regs[R_CUR_TOP / 4] -
+                                (hwaddr)first * 16 * stride,
+                                whole, stride * ph, MEMTXATTRS_UNSPECIFIED);
+                gm_h264e_to_nv12(whole, stride, yuyv, pw, ph, s->pic_y,
+                                 s->pic_uv);
+            }
             if (type == 0) {
                 py = g_malloc(pw * ph);
                 puv = g_malloc(pw * ph / 2);
@@ -560,7 +660,9 @@ static void gm_h264e_encode_slice(GmH264eState *s)
                                 pw * ph / 2, MEMTXATTRS_UNSPECIFIED);
             }
             s->pic = h264_pic_new(mbw, pic_mbh, s->pic_y, pw, s->pic_uv, pw,
-                                  py, puv, cqp, false);
+                                  py, puv,
+                                  s->mcp200 ? s->hdr.chroma_qp_offset : cqp,
+                                  false);
             s->pic_mbw = mbw;
             s->pic_mbh = pic_mbh;
         }
@@ -676,6 +778,12 @@ static void gm_h264e_done(void *opaque)
 {
     GmH264eState *s = opaque;
 
+    if (s->mcp200) {
+        s->pending = 0;
+        s->m2[0x48 / 4] |= 1;
+        qemu_set_irq(s->irq, 1);
+        return;
+    }
     s->irq_status |= s->pending;
     s->pending = 0;
     gm_h264e_update(s);
@@ -745,6 +853,129 @@ static void gm_h264e_write(void *opaque, hwaddr off, uint64_t val,
     s->regs[off / 4] = val;
 }
 
+/* ---- the MCP200's registers ---------------------------------------------- */
+
+static void gm_h264e_m2_update(GmH264eState *s)
+{
+    qemu_set_irq(s->irq, s->m2[0x48 / 4] & 1);
+}
+
+static void gm_h264e_m2_pack(GmH264eState *s, uint32_t ctl)
+{
+    const uint32_t val = s->m2[0x1C / 4];
+    const bool ep = ctl & (1u << 8);
+
+    if (ctl & (1u << 6)) {
+        if (ctl & (1u << 7)) {
+            gm_h264e_put_ue(s, val, ep);
+        } else {
+            int len = MIN(ctl & 0x3F, 32);
+
+            if (len > 16) {
+                gm_h264e_put_bits(s, len < 32 ? (val & ((1u << len) - 1)) >> 16
+                                              : val >> 16, len - 16, ep);
+                len = 16;
+            }
+            gm_h264e_put_bits(s, val & ((1u << len) - 1), len, ep);
+        }
+    }
+    if (ctl & (1u << 9)) {
+        gm_h264e_trailing(s, true);
+    }
+    if (ctl & (1u << 11)) {
+        gm_h264e_clear(s);
+    }
+}
+
+static uint32_t gm_h264e_ld(hwaddr a)
+{
+    uint32_t v = 0;
+
+    dma_memory_read(&address_space_memory, a, &v, 4, MEMTXATTRS_UNSPECIFIED);
+    return le32_to_cpu(v);
+}
+
+static void gm_h264e_m2_go(GmH264eState *s, uint32_t cmd)
+{
+    const uint32_t size = s->m2[0];
+    const uint32_t mbw = extract32(size, 0, 8) + 1;
+    const uint32_t mbh = extract32(size, 8, 8) + 1;
+    const hwaddr chain = s->m2[0x98 / 4] & ~3u;
+    const uint32_t rec = gm_h264e_ld(chain + 0x118) & ~3u;
+    const uint32_t ref = gm_h264e_ld(chain + 0x88) & ~3u;
+
+    /* as the MCP280's registers, which the coder reads */
+    s->regs[R_PARM0 / 4] = (mbh - 1) << 24 | (mbw - 1) << 8 | (mbw - 1);
+    s->regs[R_PARM1 / 4] = (mbh - 1) << 24 | ((cmd & 2) ? 0 : 2u << 12);
+    s->regs[R_PARM3 / 4] = extract32(s->m2[0x10 / 4], 4, 6) << 26;
+    s->regs[0x14 / 4] = 1u << 31;
+    s->regs[R_PARM6 / 4] = 0;
+    s->regs[R_REC_LUMA / 4] = rec;
+    s->regs[R_REC_CHROMA / 4] = rec + mbw * mbh * 256;
+    s->regs[R_ME_REF_LUMA / 4] = ref;
+    s->regs[R_ME_REF_CHROMA / 4] = ref + mbw * mbh * 256;
+    s->m2[0x40 / 4] = 0;
+    gm_h264e_encode_slice(s);
+    s->m2[0x4C / 4] = mbw * mbh * 64;
+}
+
+static uint64_t gm_h264e_m2_read(void *opaque, hwaddr off, unsigned size)
+{
+    GmH264eState *s = opaque;
+
+    switch (off) {
+    case 0x24:
+        return 0;
+    case 0x40:
+        return s->pending ? 0 : 1;
+    case 0x44:
+        return s->bs_count;
+    }
+    return off / 4 < GM_M2_NREGS ? s->m2[off / 4] : 0;
+}
+
+static void gm_h264e_m2_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    GmH264eState *s = opaque;
+
+    if (off / 4 >= GM_M2_NREGS) {
+        return;
+    }
+    switch (off) {
+    case 0x20:
+        if (val & (1u << 31)) {
+            timer_del(s->timer);
+            s->pending = 0;
+            s->m2[0x48 / 4] &= ~1u;
+            gm_h264e_clear(s);
+        } else if (val & 1) {
+            gm_h264e_m2_go(s, val);
+        }
+        break;
+    case 0x24:
+        gm_h264e_m2_pack(s, val);
+        return;
+    case 0x48:
+        s->m2[off / 4] &= val;
+        gm_h264e_m2_update(s);
+        return;
+    case 0xA8:
+        s->regs[R_BS_ADDR / 4] = val & ~3u;
+        s->regs[R_BS_SIZE / 4] = 0x200000;
+        break;
+    }
+    s->m2[off / 4] = val;
+}
+
+static const MemoryRegionOps gm_h264e_m2_ops = {
+    .read = gm_h264e_m2_read,
+    .write = gm_h264e_m2_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static const MemoryRegionOps gm_h264e_ops = {
     .read = gm_h264e_read,
     .write = gm_h264e_write,
@@ -758,7 +989,7 @@ static uint64_t gm_vcache_read(void *opaque, hwaddr off, unsigned size)
 {
     GmH264eState *s = opaque;
 
-    return s->vcache[off / 4] | (off == VC_DECODE ? 2 : 0);
+    return s->vcache[off / 4] | (off == VC_DECODE && !s->mcp200 ? 2 : 0);
 }
 
 static void gm_vcache_write(void *opaque, hwaddr off, uint64_t val,
@@ -766,7 +997,8 @@ static void gm_vcache_write(void *opaque, hwaddr off, uint64_t val,
 {
     GmH264eState *s = opaque;
 
-    s->vcache[off / 4] = val;
+    /* the MCP200's wrapper is never busy */
+    s->vcache[off / 4] = s->mcp200 && off == 0x20 ? 0 : val;
 }
 
 static const MemoryRegionOps gm_vcache_ops = {
@@ -783,6 +1015,7 @@ static void gm_h264e_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->vcache, 0, sizeof(s->vcache));
+    memset(s->m2, 0, sizeof(s->m2));
     s->irq_mask = 0x1F;
     gm_h264e_clear(s);
     gm_h264e_reset_engine(s);
@@ -795,7 +1028,8 @@ static void gm_h264e_realize(DeviceState *dev, Error **errp)
     GmH264eState *s = GM_H264E(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
-    memory_region_init_io(&s->iomem, OBJECT(s), &gm_h264e_ops, s,
+    memory_region_init_io(&s->iomem, OBJECT(s),
+                          s->mcp200 ? &gm_h264e_m2_ops : &gm_h264e_ops, s,
                           TYPE_GM_H264E, GM_H264E_SIZE);
     memory_region_init_io(&s->vcache_mem, OBJECT(s), &gm_vcache_ops, s,
                           "gm-h264e.vcache", GM_VCACHE_SIZE);
@@ -807,11 +1041,12 @@ static void gm_h264e_realize(DeviceState *dev, Error **errp)
 
 static const Property gm_h264e_props[] = {
     DEFINE_PROP_STRING("dump", GmH264eState, dump),
+    DEFINE_PROP_BOOL("mcp200", GmH264eState, mcp200, false),
 };
 
 static const VMStateDescription vmstate_gm_h264e = {
     .name = TYPE_GM_H264E,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, GmH264eState),
@@ -825,6 +1060,7 @@ static const VMStateDescription vmstate_gm_h264e = {
         VMSTATE_UINT32(bs_nbits, GmH264eState),
         VMSTATE_UINT32(bs_zeros, GmH264eState),
         VMSTATE_BOOL(bs_full, GmH264eState),
+        VMSTATE_UINT32_ARRAY_V(m2, GmH264eState, GM_M2_NREGS, 2),
         VMSTATE_END_OF_LIST()
     }
 };

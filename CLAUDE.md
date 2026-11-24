@@ -379,6 +379,12 @@ FIFOs keep samples behind the 16 they report; the Longse app captures
 only with sysenv.cfg byte 0x98C set. The FTAES020 is `fh-aes` with
 `advance=on` (addresses move on between chunks).
 
+The GM8126 (`gm8126`, `hw/arm/grainmedia-gm8126.c`, `docs/grainmedia.md`
+"GM8126") is the generation before: the same CPU and Faraday style, another
+map and an FTINTC010. Its NOR is byte-swapped per 32-bit word;
+`qemu-boot/gm8126-flash.py` converts a dump read through U-Boot. A dump
+boots from nsboot to the vendor application's MPEG-4 and H.264 streams.
+
 SigmaStar/MStar infinity2m, Ifado, infinity3, Iford and infinity6* (`hw/arm/sigmastar.c`,
 `docs/sigmastar.md`) are a fourth: Cortex-A7 parts whose blocks sit in
 16-bit RIU register banks at `0x1F000000` (register r of bank b at `0x1F000000 + b*0x200 + r*4`, high byte
