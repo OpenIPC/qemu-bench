@@ -202,8 +202,9 @@ static void gm8126_flash(Gm8126MachineState *gms, DeviceState *spi,
     if (gms->flash_file) {
         blk_unref(blk);     /* see gm_create_flash() in grainmedia.c */
     }
-    qdev_connect_gpio_out(gpio, GM8126_CS_PIN,
-                          qdev_get_gpio_in_named(dev, SSI_GPIO_CS, 0));
+    qdev_connect_gpio_out(gpio, GM8126_CS_PIN, qdev_get_gpio_in(spi, 0));
+    qdev_connect_gpio_out_named(spi, "cs", 0,
+                                qdev_get_gpio_in_named(dev, SSI_GPIO_CS, 0));
 }
 
 /* the SDK's uImages run in place: 64 bytes past the load address */

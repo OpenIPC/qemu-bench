@@ -6,8 +6,13 @@
  * enable, 2 / 3 clear the receive / transmit FIFO), 0x0C status (bit 1
  * transmit FIFO not full, 8:4 received words), 0x18 data, 0x64 the FIFO
  * depths, 0x10 ICR (bits 4 / 5 receive / transmit DMA requests "dma-rx",
- * "dma-tx", which nsboot reads the flash with).  Each data write shifts one frame, most significant bit first,
- * and queues what came back.  The chip select is a GPIO.
+ * "dma-tx", which nsboot reads the flash with).  Each data write
+ * shifts one frame, most significant bit first, and queues what came back.
+ *
+ * The chip select is a GPIO; it passes through here (gpio-in to "cs") so a
+ * fast read's dummy byte is known.  m25p80 counts eight transfers for it,
+ * one per clock, where a byte is on the wire: the other seven are made up
+ * here.
  *
  * The same block carries I2S on other ports; that is gm-ssp.
  *
@@ -48,6 +53,8 @@ struct GmSspSpiState {
     qemu_irq dma_rx, dma_tx;
     SSIBus *bus;
     uint32_t regs[SSP_NREGS];
+    qemu_irq cs;
+    uint32_t opcode, nbytes;    /* of the flash command under way */
     uint32_t rx[SSP_FIFO];
     uint32_t rx_len, rx_pos;
 };
@@ -58,6 +65,38 @@ static void ssp_spi_update(GmSspSpiState *s)
 
     qemu_set_irq(s->dma_rx, (icr & (1u << 4)) && s->rx_len);
     qemu_set_irq(s->dma_tx, (icr & (1u << 5)) && s->rx_len < SSP_FIFO);
+}
+
+static void ssp_spi_cs(void *opaque, int n, int level)
+{
+    GmSspSpiState *s = opaque;
+
+    s->nbytes = 0;
+    qemu_set_irq(s->cs, level);
+}
+
+static uint8_t ssp_spi_byte(GmSspSpiState *s, uint8_t v)
+{
+    uint32_t dummy = 0;
+    int i;
+
+    switch (s->nbytes ? s->opcode : 0) {
+    case 0x0B: case 0x3B: case 0x6B:    /* fast, dual and quad output read */
+        dummy = 4;
+        break;
+    case 0x0C: case 0x3C: case 0x6C:    /* with a 4-byte address */
+        dummy = 5;
+        break;
+    }
+    if (!s->nbytes) {
+        s->opcode = v;
+    } else if (dummy && s->nbytes == dummy) {
+        for (i = 0; i < 7; i++) {
+            ssi_transfer(s->bus, 0);
+        }
+    }
+    s->nbytes = MIN(s->nbytes + 1, 16);
+    return ssi_transfer(s->bus, v);
 }
 
 static uint64_t ssp_spi_read(void *opaque, hwaddr off, unsigned size)
@@ -98,8 +137,7 @@ static void ssp_spi_write(void *opaque, hwaddr off, uint64_t val,
         int i;
 
         for (i = bytes - 1; i >= 0; i--) {
-            r = r << 8 | (ssi_transfer(s->bus, extract32(val, 8 * i, 8)) &
-                          0xFF);
+            r = r << 8 | ssp_spi_byte(s, extract32(val, 8 * i, 8));
         }
         if (s->rx_len < SSP_FIFO) {
             s->rx[(s->rx_pos + s->rx_len++) % SSP_FIFO] = r;
@@ -136,6 +174,7 @@ static void ssp_spi_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     s->rx_len = s->rx_pos = 0;
+    s->opcode = s->nbytes = 0;
     ssp_spi_update(s);
 }
 
@@ -149,6 +188,8 @@ static void ssp_spi_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     qdev_init_gpio_out_named(dev, &s->dma_rx, "dma-rx", 1);
     qdev_init_gpio_out_named(dev, &s->dma_tx, "dma-tx", 1);
+    qdev_init_gpio_in(dev, ssp_spi_cs, 1);
+    qdev_init_gpio_out_named(dev, &s->cs, "cs", 1);
     s->bus = ssi_create_bus(dev, "ssi");
 }
 
@@ -159,6 +200,8 @@ static const VMStateDescription vmstate_ssp_spi = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GmSspSpiState, SSP_NREGS),
         VMSTATE_UINT32_ARRAY(rx, GmSspSpiState, SSP_FIFO),
+        VMSTATE_UINT32(opcode, GmSspSpiState),
+        VMSTATE_UINT32(nbytes, GmSspSpiState),
         VMSTATE_UINT32(rx_len, GmSspSpiState),
         VMSTATE_UINT32(rx_pos, GmSspSpiState),
         VMSTATE_END_OF_LIST()

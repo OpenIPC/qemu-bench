@@ -174,6 +174,7 @@ static void sys8126_reset(DeviceState *dev)
     s->pmu[0] = s->chip_id;
     s->pmu[0x30 / 4] = 18 << 3 | 1 << 12 | (2u << 2 | 2) << 24;
     s->pmu[0x34 / 4] = 20 << 3 | 1 << 12;
+    s->pmu[0x78 / 4] = 15 << 18;            /* the UARTs: 30 MHz / 16 */
     s->ahbc[0x18 / 4] = ctz64(s->ram_size / MiB) << 16;
     qemu_set_irq(s->fcs_irq, 0);
     sys8126_clocks(s);

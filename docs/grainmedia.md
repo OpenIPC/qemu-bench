@@ -479,7 +479,11 @@ gm-h264e.dump=DIR` save the encoded streams.
   mailbox under a running job. `mpeg4-enc.c.inc` codes H.263-quantised I
   and P VOPs with zero motion against the driver's reconstruction buffer.
 - **Ethernet** receives frames at half-word addresses: two bytes into a
-  word-aligned buffer. The UART clock is 30 MHz / 16.
+  word-aligned buffer. The UART clock is
+  30 MHz / (PMU 0x78[23:18] + 1), 16 from reset.
+- **SSP**: the flash select passes through it, so that a fast read's dummy
+  byte is the eight transfers `m25p80` counts. The vendor code only reads
+  with 0x03; OpenIPC's U-Boot uses 0x0B.
 
 Assumed: the chip ID (`0x812620`, MP), PLL1 reading back shifted left by
 one (with both, `rom.bin` and the kernel agree on every clock), MACCR bit 13 as the two-byte offset's switch, and the 4:2:2
