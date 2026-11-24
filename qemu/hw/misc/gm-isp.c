@@ -24,18 +24,47 @@
  *          values for consecutive registers; otherwise the value follows
  *          and further offset / value pairs, the last offset flagged
  *
- * At each frame end the model fills the statistics registers for the
- * scene, runs the output DMA table -- pairs of [31] last | [27:16] words
- * | [15:0] register offset and a destination address, which the AE / AWB
- * / AF threads then read -- and raises frame end with the ready bits of
- * the enabled units (the driver handles those at the next frame start).
- * The scene is a neutral grey of level "luma" (the algorithms' default
- * target is 100), so AE settles at once and AWB keeps unity gains: per AE
- * window i (0x28C + 8i / 0x290 + 8i, start and end x | y << 16) sums of
- * R, G, B of luma * area / 4 at 0x2800 + 0x18i; the histogram (0x2000,
- * 16-bit bins; 0x2400, 32-bit) around the level; AWB (0x2A00) ratios of
- * 1.0 (128) over the 2x2 blocks of its window; AF (0x2B00) a flat
- * texture figure per window.
+ * At each frame end the model fills the statistics registers, runs the
+ * output DMA table -- pairs of [31] last | [27:16] words | [15:0]
+ * register offset and a destination address, which the AE / AWB / AF
+ * threads then read -- and raises frame end with the ready bits of the
+ * enabled units (the driver handles those at the next frame start).
+ *
+ * The statistics: per AE window i (0x28C + 8i / 0x290 + 8i, start and end
+ * x | y << 16) sums of R, G and B at 0x2800 + 0x18i, a quarter of the
+ * window's pixels each, so that (R + 2G + B) / area is the mean level;
+ * the histogram (0x2000, 16-bit bins; 0x2400, 32-bit) of the window at
+ * 0x264, a count per 64 pixels; AWB (0x2A00) over the 2x2 blocks of its
+ * window (0x2E0): ratio sums R/G and B/G in 1/128 (rg_lvl, bg_lvl, rg,
+ * bg), the block count, and R, G, B sums; AF (0x2B00) a texture figure
+ * per window (0x314).
+ *
+ * With a sensor (the "sensor" link) they measure the scene in front of
+ * the camera (hisi-scene, docs/grainmedia.md "The digital twin"): its
+ * reflectance times the light times the exposure the sensor applied to
+ * the frame (image_sensor_exposure(); writes take effect a frame later,
+ * image_sensor_frame_start()), clipped at the sensor's full scale, then
+ * through what the driver programs (fisp328.ko's isp_hal_*):
+ *
+ *   0x250  global gain (isp_hal_set_global_gain), 1x = "gain-one"
+ *   0x254  colour gains R [9:0], G [21:12]; 0x258 B [9:0]
+ *          (isp_hal_set_color_gain), 1x = "gain-one"
+ *   0x640  AE pre-gamma, 0x670 histogram pre-gamma
+ *          (isp_hal_set_ae / hist_pre_gamma): 19 halfwords, knots x[6]
+ *          and y[6] on an 8-bit scale and seven slopes in 1/256, y =
+ *          slope0 x below x0, else y[i] + slope[i + 1] (x - x[i]); the
+ *          AE's default (fisp_algorithm.ko) is close to 1 / 2.2
+ *
+ * The scene is measured while the ISP is on (func0 bit 31), so its clock
+ * (the timeline's) starts with the driver's ISP; frames run at the
+ * sensor's own rate (HTS x VTS / pclk) once it streams.  Without a
+ * sensor, or before, the statistics describe a neutral grey of level
+ * "luma" (the algorithms' default target is 100): AE settles at once and
+ * AWB keeps unity gains.
+ *
+ * "record" writes a CSV line a frame, the columns of hisi-vi's record
+ * (qemu-boot/twin-metrics.py reads either); "stats-trace" prints what
+ * AE / AWB see once a second.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -43,6 +72,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -54,6 +84,9 @@
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "qom/object.h"
+#include "qemu/error-report.h"
+#include "hw/i2c/image-sensor.h"
+#include "hw/misc/hisi-scene.h"
 
 #define TYPE_GM_ISP "gm-isp"
 OBJECT_DECLARE_SIMPLE_TYPE(GmIspState, GM_ISP)
@@ -80,6 +113,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(GmIspState, GM_ISP)
 #define R_AE_WIN            0x28C
 #define R_AWB_WIN           0x2E0
 #define R_AF_WIN            0x314
+#define R_GLOBAL_GAIN       0x250
+#define R_COLOR_GAIN0       0x254
+#define R_COLOR_GAIN1       0x258
+#define R_AE_PRE_GAMMA      0x640
+#define R_HIST_PRE_GAMMA    0x670
+
+/* the scene is measured on a grid of one sample per GRID_DIV^2 pixels */
+#define GRID_DIV            8
 
 #define FUNC0_ON            (1u << 31)
 #define FUNC0_HIST          (1u << 11)
@@ -108,6 +149,30 @@ struct GmIspState {
     bool in_frame;              /* between frame start and end */
     uint32_t fps;
     uint32_t luma;
+    uint32_t gain_one;          /* colour / global gain register at 1x */
+
+    /* the digital twin */
+    Object *sensor;
+    HisiSceneState *scene;
+    char *record;
+    FILE *record_f;
+    bool stats_trace;
+    ImageSensorExposure expo;       /* written, for the next frame */
+    ImageSensorExposure frame_expo; /* what the frame ending now had */
+    uint32_t frames;
+    double scene_t;
+    double light;
+    double tint[3];
+    double level;
+    double wb[3];
+    uint32_t raw_mean[3];       /* the frame's raw means, 12-bit, for the
+                                 * record */
+    int gw, gh;
+    uint8_t *grid;              /* the frame's samples after the ISP gains
+                                 * and the AE pre-gamma, R G B */
+    uint16_t *lin;              /* the same before the pre-gamma, 12-bit
+                                 * as the ISP's pipeline, for AWB */
+    uint8_t *hist_y;            /* each sample's luma, histogram pre-gamma */
 };
 
 static void gm_isp_update(GmIspState *s)
@@ -136,11 +201,279 @@ static void gm_isp_put64(GmIspState *s, uint32_t off, uint64_t v)
     s->regs[off / 4 + 1] = v >> 32;
 }
 
+/* a window in grid samples, clipped to the grid; false if empty */
+static bool gm_isp_win_grid(GmIspState *s, uint32_t off, int *gx0, int *gy0,
+                            int *gx1, int *gy1)
+{
+    const uint32_t a = s->regs[off / 4], b = s->regs[off / 4 + 1];
+
+    *gx0 = MIN(extract32(a, 0, 13) / GRID_DIV, s->gw);
+    *gy0 = MIN(extract32(a, 16, 13) / GRID_DIV, s->gh);
+    *gx1 = MIN(extract32(b, 0, 13) / GRID_DIV + 1, s->gw);
+    *gy1 = MIN(extract32(b, 16, 13) / GRID_DIV + 1, s->gh);
+    return *gx1 > *gx0 && *gy1 > *gy0;
+}
+
+/* a pre-gamma curve as the driver programs it (see the top) */
+static uint32_t gm_isp_pre_gamma(GmIspState *s, uint32_t base, uint32_t v)
+{
+    uint16_t c[19];
+    int i;
+
+    for (i = 0; i < 19; i++) {
+        c[i] = s->regs[base / 4 + i / 2] >> (16 * (i & 1));
+    }
+    if (!c[0] && !c[5]) {
+        return v;                       /* not programmed: linear */
+    }
+    if (v < c[0]) {
+        return MIN((c[12] * v) >> 8, 255);
+    }
+    for (i = 5; i > 0 && v < c[i]; i--) {
+        ;
+    }
+    return MIN(c[6 + i] + ((c[13 + i] * (v - c[i])) >> 8), 255);
+}
+
+/*
+ * A frame ends: the exposure it had is what the sensor applied for it
+ * (or, for a sensor without frame timing, what was written a frame
+ * earlier), and the scene is sampled through it and the ISP's gains.
+ */
+static void gm_isp_scene_frame(GmIspState *s)
+{
+    ImageSensorExposure now = { 0 };
+    const float *refl;
+    double global, k[3], rsum[3];
+    uint8_t lut[256];
+    int i, c, n;
+
+    s->tint[0] = 0.55;
+    s->tint[1] = 1.0;
+    s->tint[2] = 0.7;
+    s->light = 600;
+    if (s->scene) {
+        s->scene_t = hisi_scene_frame_begin(s->scene);
+        s->light = hisi_scene_light(s->scene, s->tint);
+    }
+    image_sensor_exposure(s->sensor, &now);
+    if (image_sensor_frame_start(s->sensor)) {
+        s->frame_expo = now;
+    } else {
+        s->frame_expo = s->expo;
+        s->expo = now;
+    }
+    s->level = (double)s->frame_expo.lines * s->frame_expo.gain / 1024 *
+               s->light;
+
+    /* what the driver programmed: white balance and the global gain */
+    s->wb[0] = extract32(s->regs[R_COLOR_GAIN0 / 4], 0, 10);
+    s->wb[1] = extract32(s->regs[R_COLOR_GAIN0 / 4], 12, 10);
+    s->wb[2] = extract32(s->regs[R_COLOR_GAIN1 / 4], 0, 10);
+    for (c = 0; c < 3; c++) {
+        s->wb[c] = s->wb[c] ? s->wb[c] / s->gain_one : 1.0;
+    }
+    global = s->regs[R_GLOBAL_GAIN / 4] ?
+              (double)s->regs[R_GLOBAL_GAIN / 4] / s->gain_one : 1.0;
+    if (s->scene) {
+        hisi_scene_set_frame(s->scene, s->level * global, s->tint,
+                             s->wb[0] / s->wb[1], s->wb[2] / s->wb[1]);
+    }
+
+    /* a sample's 8-bit value: raw (clipped at full scale), the gains,
+     * the AE pre-gamma */
+    for (c = 0; c < 3; c++) {
+        k[c] = s->tint[c] * s->level / 65535.0;
+    }
+    for (i = 0; i < 256; i++) {
+        lut[i] = gm_isp_pre_gamma(s, R_AE_PRE_GAMMA, i);
+    }
+    s->gw = MAX((s->frame_expo.width ? s->frame_expo.width : 1920) /
+                GRID_DIV, 1);
+    s->gh = MAX((s->frame_expo.height ? s->frame_expo.height : 1080) /
+                GRID_DIV, 1);
+    n = s->gw * s->gh;
+    s->grid = g_renew(uint8_t, s->grid, (size_t)n * 3);
+    s->lin = g_renew(uint16_t, s->lin, (size_t)n * 3);
+    s->hist_y = g_renew(uint8_t, s->hist_y, n);
+    refl = s->scene ? hisi_scene_grid(s->scene, s->gw, s->gh) : NULL;
+    memset(rsum, 0, sizeof(rsum));
+    for (i = 0; i < n; i++) {
+        uint32_t lin[3];
+
+        for (c = 0; c < 3; c++) {
+            const double r = refl ? refl[i * 3 + c] : 0.5;
+            const double raw = MIN(r * k[c], 1.0);
+            const double v = MIN(raw * s->wb[c] * global, 1.0);
+
+            rsum[c] += raw;
+
+            lin[c] = lrint(v * 255);
+            s->lin[i * 3 + c] = lrint(v * 4095);
+            s->grid[i * 3 + c] = lut[lin[c]];
+        }
+        s->hist_y[i] = gm_isp_pre_gamma(s, R_HIST_PRE_GAMMA,
+                                        (lin[0] + 2 * lin[1] + lin[2]) / 4);
+    }
+    for (c = 0; c < 3; c++) {
+        s->raw_mean[c] = lrint(rsum[c] * 4095 / n);
+    }
+}
+
+static void gm_isp_record(GmIspState *s, uint32_t r, uint32_t g, uint32_t b)
+{
+    uint64_t violations = 0;
+
+    if (!s->record || !*s->record) {
+        return;
+    }
+    if (!s->record_f) {
+        s->record_f = fopen(s->record, "w");
+        if (!s->record_f) {
+            warn_report("gm-isp: cannot write the record '%s'", s->record);
+            g_free(s->record);
+            s->record = NULL;
+            return;
+        }
+        fprintf(s->record_f, "t,frame,light,light_r,light_b,lines,gain,"
+                "r,g,b,wb_r,wb_b,violations\n");
+    }
+    if (object_property_find(s->sensor, "violations")) {
+        violations = object_property_get_uint(s->sensor, "violations", NULL);
+    }
+    fprintf(s->record_f, "%.4f,%u,%.0f,%.0f,%.0f,%u,%.3f,%u,%u,%u,%.3f,%.3f,"
+            "%" PRIu64 "\n", s->scene_t, s->frames, s->light,
+            s->tint[0] * 1000, s->tint[2] * 1000, s->frame_expo.lines,
+            s->frame_expo.gain / 1024.0, r, g, b, s->wb[0] / s->wb[1],
+            s->wb[2] / s->wb[1], violations);
+    fflush(s->record_f);
+}
+
+/* the statistics of the scene, sampled by gm_isp_scene_frame() */
+static void gm_isp_scene_statistics(GmIspState *s)
+{
+    uint64_t sum[3], all[3] = { 0 }, nall = 0;
+    uint32_t hist[256] = { 0 };
+    int gx0, gy0, gx1, gy1, x, y, c, i;
+
+    /* AE: per window, a quarter of its pixels per colour */
+    for (i = 0; i < 9; i++) {
+        memset(sum, 0, sizeof(sum));
+        if (gm_isp_win_grid(s, R_AE_WIN + 8 * i, &gx0, &gy0, &gx1, &gy1)) {
+            for (y = gy0; y < gy1; y++) {
+                for (x = gx0; x < gx1; x++) {
+                    for (c = 0; c < 3; c++) {
+                        sum[c] += s->grid[(y * s->gw + x) * 3 + c];
+                    }
+                }
+            }
+            for (c = 0; c < 3; c++) {
+                all[c] += sum[c];
+            }
+            nall += (gx1 - gx0) * (gy1 - gy0);
+        }
+        for (c = 0; c < 3; c++) {
+            /* a sample stands for GRID_DIV^2 pixels, a quarter of them
+             * of this colour */
+            gm_isp_put64(s, R_AE_SUM + 0x18 * i + 8 * c,
+                         sum[c] * GRID_DIV * GRID_DIV / 4);
+        }
+        memset(&s->regs[(R_AE_CNT + 0x10 * i) / 4], 0, 16);
+    }
+
+    /* the histogram: a count per 64 pixels, one sample being 64 */
+    memset(&s->regs[R_HIST / 4], 0, 0x200);
+    memset(&s->regs[R_CE_HIST / 4], 0, 0x400);
+    if (gm_isp_win_grid(s, R_HIST_WIN, &gx0, &gy0, &gx1, &gy1)) {
+        for (y = gy0; y < gy1; y++) {
+            for (x = gx0; x < gx1; x++) {
+                hist[s->hist_y[y * s->gw + x]] += GRID_DIV * GRID_DIV / 64;
+            }
+        }
+    }
+    for (i = 0; i < 256; i++) {
+        s->regs[R_HIST / 4 + i / 2] |= MIN(hist[i], 0xFFFF) << (16 * (i & 1));
+        s->regs[R_CE_HIST / 4 + i] = hist[i];
+    }
+
+    /* AWB: over 2x2 blocks, 16 to a sample */
+    memset(sum, 0, sizeof(sum));
+    {
+        uint64_t rg = 0, bg = 0, blocks = 0;
+
+        if (gm_isp_win_grid(s, R_AWB_WIN, &gx0, &gy0, &gx1, &gy1)) {
+            for (y = gy0; y < gy1; y++) {
+                for (x = gx0; x < gx1; x++) {
+                    const uint16_t *p = &s->lin[(y * s->gw + x) * 3];
+                    const uint32_t g = MAX(p[1], 1);
+                    const uint32_t nb = GRID_DIV * GRID_DIV / 4;
+
+                    rg += (uint64_t)p[0] * 128 / g * nb;
+                    bg += (uint64_t)p[2] * 128 / g * nb;
+                    for (c = 0; c < 3; c++) {
+                        sum[c] += (p[c] >> 4) * nb;     /* 8-bit */
+                    }
+                    blocks += nb;
+                }
+            }
+        }
+        s->regs[R_AWB / 4 + 0] = rg;            /* rg_lvl */
+        s->regs[R_AWB / 4 + 1] = bg;            /* bg_lvl */
+        s->regs[R_AWB / 4 + 2] = blocks;        /* pixel_num_lvl */
+        s->regs[R_AWB / 4 + 3] = rg;
+        s->regs[R_AWB / 4 + 4] = bg;
+        s->regs[R_AWB / 4 + 5] = sum[0];
+        s->regs[R_AWB / 4 + 6] = sum[1];
+        s->regs[R_AWB / 4 + 7] = sum[2];
+        s->regs[R_AWB / 4 + 8] = blocks;
+        s->regs[R_AWB / 4 + 9] = 0;
+    }
+
+    /* AF: the window's horizontal gradient energy */
+    for (i = 0; i < 9; i++) {
+        uint64_t e = 0;
+
+        if (gm_isp_win_grid(s, R_AF_WIN + 8 * i, &gx0, &gy0, &gx1, &gy1)) {
+            for (y = gy0; y < gy1; y++) {
+                for (x = gx0 + 1; x < gx1; x++) {
+                    e += abs(s->grid[(y * s->gw + x) * 3 + 1] -
+                             s->grid[(y * s->gw + x - 1) * 3 + 1]);
+                }
+            }
+        }
+        s->regs[R_AF / 4 + i] = MIN(e * GRID_DIV * GRID_DIV, 0xFFFFFFFF);
+    }
+    s->regs[R_AF / 4 + 9] = 0;
+
+    s->frames++;
+    if (nall) {
+        for (c = 0; c < 3; c++) {
+            all[c] /= nall;
+        }
+    }
+    gm_isp_record(s, s->raw_mean[0], s->raw_mean[1], s->raw_mean[2]);
+    if (s->stats_trace && s->frames % 30 == 0) {
+        fprintf(stderr, "gm-isp: frame %u t %.2f light %.0f lines %u gain "
+                "%.2f -> AE mean R %" PRIu64 " G %" PRIu64 " B %" PRIu64
+                " (Y %" PRIu64 "), wb %.3f / %.3f / %.3f global 0x%x\n",
+                s->frames, s->scene_t, s->light, s->frame_expo.lines,
+                s->frame_expo.gain / 1024.0, all[0], all[1], all[2],
+                (all[0] + 2 * all[1] + all[2]) / 4, s->wb[0], s->wb[1],
+                s->wb[2], s->regs[R_GLOBAL_GAIN / 4]);
+    }
+}
+
 static void gm_isp_statistics(GmIspState *s)
 {
     const uint32_t y = MIN(s->luma, 255);
     uint32_t w, h, i;
     uint64_t area, n;
+
+    if (s->sensor && (s->regs[R_FUNC0 / 4] & FUNC0_ON)) {
+        gm_isp_scene_frame(s);
+        gm_isp_scene_statistics(s);
+        return;
+    }
 
     /* histograms: a narrow bell around the level */
     area = gm_isp_win_area(s, R_HIST_WIN, &w, &h);
@@ -202,6 +535,7 @@ static void gm_isp_output_dma(GmIspState *s)
         e[1] = le32_to_cpu(e[1]);
         off = e[0] & 0xFFFC;
         words = extract32(e[0], 16, 12);
+
         if (off + words * 4 <= GM_ISP_SIZE) {
             uint32_t buf[0x1000];       /* words is 12 bits */
             uint32_t i;
@@ -262,10 +596,21 @@ static void gm_isp_input_dma(GmIspState *s)
     s->regs[R_STATUS0 / 4] |= ST_IDMA_DONE;
 }
 
+/* a frame's length: the sensor's, once it streams */
+static int64_t gm_isp_period(GmIspState *s)
+{
+    int64_t ns = 0;
+
+    if (s->sensor && image_sensor_streaming(s->sensor)) {
+        ns = image_sensor_frame_ns(s->sensor);
+    }
+    return ns > 0 ? ns : NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
+}
+
 static void gm_isp_frame(void *opaque)
 {
     GmIspState *s = opaque;
-    const int64_t period = NANOSECONDS_PER_SECOND / MAX(s->fps, 1);
+    const int64_t period = gm_isp_period(s);
     const uint32_t f0 = s->regs[R_FUNC0 / 4];
 
     if (!s->in_frame) {
@@ -354,6 +699,20 @@ static void gm_isp_reset(DeviceState *dev)
     gm_isp_update(s);
 }
 
+static void gm_isp_init(Object *obj)
+{
+    GmIspState *s = GM_ISP(obj);
+
+    /* settable after realize: the machine attaches the sensor later */
+    object_property_add_link(obj, "sensor", TYPE_DEVICE, &s->sensor,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_add_link(obj, "scene", TYPE_HISI_SCENE,
+                             (Object **)&s->scene,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+}
+
 static void gm_isp_realize(DeviceState *dev, Error **errp)
 {
     GmIspState *s = GM_ISP(dev);
@@ -368,16 +727,22 @@ static void gm_isp_realize(DeviceState *dev, Error **errp)
 static const Property gm_isp_props[] = {
     DEFINE_PROP_UINT32("fps", GmIspState, fps, 30),
     DEFINE_PROP_UINT32("luma", GmIspState, luma, 100),
+    DEFINE_PROP_UINT32("gain-one", GmIspState, gain_one, 128),
+    DEFINE_PROP_STRING("record", GmIspState, record),
+    DEFINE_PROP_BOOL("stats-trace", GmIspState, stats_trace, false),
 };
 
 static const VMStateDescription vmstate_gm_isp = {
     .name = TYPE_GM_ISP,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, GmIspState),
         VMSTATE_UINT32_ARRAY(regs, GmIspState, GM_ISP_NREGS),
         VMSTATE_BOOL(in_frame, GmIspState),
+        VMSTATE_UINT32_V(frames, GmIspState, 2),
+        VMSTATE_UINT32_V(expo.lines, GmIspState, 2),
+        VMSTATE_UINT32_V(expo.gain, GmIspState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -396,6 +761,7 @@ static const TypeInfo gm_isp_info = {
     .name           = TYPE_GM_ISP,
     .parent         = TYPE_SYS_BUS_DEVICE,
     .instance_size  = sizeof(GmIspState),
+    .instance_init  = gm_isp_init,
     .class_init     = gm_isp_class_init,
 };
 

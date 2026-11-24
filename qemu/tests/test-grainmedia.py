@@ -33,12 +33,20 @@ loaders and drivers (docs/grainmedia.md):
   - gm-vcap: the capability word gmlib reads, a link-list table run on
     the sync timer painting a frame and completing its status slot;
   - gm-3dnr / gm-scaler: a job through each engine's link list;
+  - the digital twin (gm-isp + the OV2715 + hisi-scene): the ISP's
+    statistics follow the exposure and gain written over I2C -- a frame
+    late, and only once a group hold is launched -- the frame rate
+    follows HTS x VTS, the scene's light and colour (qom-set) and the
+    driver's white balance show in the AE and AWB figures, the AE
+    pre-gamma bends them, and the capture paints the scene once the ISP
+    measures it;
   - the SD hosts' SDHCI capabilities;
   - every machine: its chip ID; and a migration round trip.
 
     python3 qemu/tests/test-grainmedia.py [--qemu PATH]
 """
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -75,18 +83,23 @@ RTC = 0x91C00000
 PWM = 0x91B00000
 IRDET = 0x91600000
 PMON = 0x91D00000
+ISP = 0x93930000
 
 JEDEC = [0xC2, 0x20, 0x18]          # MX25L12805D, for a 16 MiB image
 SCRATCH = 0x01000000
 
 
 class QTest:
-    def __init__(self, qemu, machine, extra=()):
+    def __init__(self, qemu, machine, extra=(), qmp=False):
         self.dir = tempfile.mkdtemp()
         path = os.path.join(self.dir, 'qtest.sock')
         srv = socket.socket(socket.AF_UNIX)
         srv.bind(path)
         srv.listen(1)
+        qpath = os.path.join(self.dir, 'qmp.sock')
+        if qmp:
+            extra = list(extra) + ['-qmp', 'unix:%s,server=on,wait=off' %
+                                   qpath]
         self.proc = subprocess.Popen(
             [qemu, '-M', machine, '-machine', 'accel=qtest',
              '-display', 'none', '-nodefaults', '-qtest', 'unix:' + path] +
@@ -96,6 +109,27 @@ class QTest:
         srv.settimeout(20)
         self.sock, _ = srv.accept()
         self.f = self.sock.makefile('rw', buffering=1)
+        self.qmp = None
+        if qmp:
+            self.qmp = socket.socket(socket.AF_UNIX)
+            self.qmp.connect(qpath)
+            self.qf = self.qmp.makefile('rw', buffering=1)
+            self.qf.readline()                          # greeting
+            self.qmp_cmd('qmp_capabilities')
+
+    def qmp_cmd(self, cmd, **args):
+        self.qf.write(json.dumps({'execute': cmd, 'arguments': args}) + '\n')
+        self.qf.flush()
+        while True:
+            r = json.loads(self.qf.readline())
+            if 'return' in r or 'error' in r:
+                return r.get('return', r.get('error'))
+
+    def qom_set(self, path, prop, value):
+        return self.qmp_cmd('qom-set', path=path, property=prop, value=value)
+
+    def qom_get(self, path, prop):
+        return self.qmp_cmd('qom-get', path=path, property=prop)
 
     def cmd(self, line):
         self.f.write(line + '\n')
@@ -584,6 +618,165 @@ def test_vcap(qt):
     qt.writel(VCAP + 0x5404, 0)
 
 
+# ---- the digital twin ------------------------------------------------------
+
+def ov_write(qt, reg, val):
+    """One OV2715 register write over gm-i2c, as fisp_ov2715.ko does."""
+    i2c_byte(qt, 0x6C, start=True)
+    i2c_byte(qt, reg >> 8)
+    i2c_byte(qt, reg & 0xFF)
+    i2c_byte(qt, val, stop=True)
+
+
+def isp_frame_end(qt):
+    """Run to the ISP's next frame end; the AE window 0 means then."""
+    qt.writel(ISP + 0x50, 1 << 17)
+    for _ in range(200):
+        qt.step(1000000)
+        if qt.readl(ISP + 0x50) & (1 << 17):
+            break
+    area = 1920 * 1080
+    sums = [qt.readl(ISP + 0x2800 + 8 * c) |
+            (qt.readl(ISP + 0x2804 + 8 * c) << 32) for c in range(3)]
+    return [x * 4 / area for x in sums]
+
+
+def near(a, b, tol=0.03):
+    return abs(a - b) <= tol * abs(b)
+
+
+def test_isp_twin(qemu, path):
+    print('the digital twin: gm-isp + OV2715 + hisi-scene')
+    qt = QTest(qemu, 'gm8136,sensor=ov2715,flash-file=' + path, qmp=True)
+    try:
+        qt.writel(I2C + 0x00, 1)
+        # exposure 20 rows at 1x (white at a fifth of full scale), before
+        # the ISP clocks frames: at once
+        ov_write(qt, 0x3500, 0x00)
+        ov_write(qt, 0x3501, (20 << 4) >> 8)
+        ov_write(qt, 0x3502, (20 << 4) & 0xFF)
+        # one full-frame window for AE, the histogram and AWB; unity gains,
+        # no pre-gamma; the ISP on with its statistics
+        for off in (0x28C, 0x264, 0x2E0, 0x314):
+            qt.writel(ISP + off, 0)
+            qt.writel(ISP + off + 4, 1919 | (1079 << 16))
+        qt.writel(ISP + 0x250, 128)
+        qt.writel(ISP + 0x254, 128 | (128 << 12))
+        qt.writel(ISP + 0x258, 128)
+        qt.writel(ISP + 0x008, (1 << 31) | (0xF << 11))
+        isp_frame_end(qt)
+        base = isp_frame_end(qt)
+        check('scene measured: a level in range', 5 < base[1] < 250, True)
+
+        # the frame rate: HTS x VTS / 90 MHz, 2420 x 1104 at reset
+        n0 = qt.qom_get('/machine/isp/sensor', 'frame')
+        qt.step(1000000000)
+        n1 = qt.qom_get('/machine/isp/sensor', 'frame')
+        check('reset timing: 33-34 frames a second', 33 <= n1 - n0 <= 34,
+              True)
+        ov_write(qt, 0x380C, 0x0A)              # HTS 2717: the driver's
+        ov_write(qt, 0x380D, 0x9D)              # 30 frames/s
+        isp_frame_end(qt)
+        n0 = qt.qom_get('/machine/isp/sensor', 'frame')
+        qt.step(1000000000)
+        n1 = qt.qom_get('/machine/isp/sensor', 'frame')
+        check('HTS 2717: 30 frames a second', 29 <= n1 - n0 <= 30, True)
+
+        # exposure doubled: the next frame still has the old one
+        isp_frame_end(qt)
+        ov_write(qt, 0x3501, (40 << 4) >> 8)
+        ov_write(qt, 0x3502, (40 << 4) & 0xFF)
+        late = isp_frame_end(qt)
+        now = isp_frame_end(qt)
+        check('exposure applies a frame late', near(late[1], base[1]), True)
+        check('40 rows: G doubles', near(now[1], 2 * base[1]), True)
+        check('sensor reports 40 rows',
+              qt.qom_get('/machine/isp/sensor', 'lines'), 40)
+
+        # gain 2x inside a group hold: nothing until it is launched
+        ov_write(qt, 0x3212, 0x00)
+        ov_write(qt, 0x350B, 0x10)
+        ov_write(qt, 0x3212, 0x10)
+        isp_frame_end(qt)
+        held = isp_frame_end(qt)
+        check('held gain does not apply', near(held[1], now[1]), True)
+        ov_write(qt, 0x3212, 0xA0)
+        isp_frame_end(qt)
+        gain = isp_frame_end(qt)
+        check('launched: 2x gain doubles G', near(gain[1], 2 * now[1]), True)
+        ov_write(qt, 0x350B, 0x00)
+        ov_write(qt, 0x3501, (20 << 4) >> 8)
+        ov_write(qt, 0x3502, (20 << 4) & 0xFF)
+        isp_frame_end(qt)
+        base = isp_frame_end(qt)
+
+        # the light: a quarter of it, a quarter of G
+        qt.qom_set('/machine/scene', 'light', 150)
+        isp_frame_end(qt)
+        dim = isp_frame_end(qt)
+        check('a quarter of the light: a quarter of G',
+              near(dim[1], base[1] / 4, 0.05), True)
+        qt.qom_set('/machine/scene', 'light', 600)
+        isp_frame_end(qt)
+
+        # the light's colour and the white balance in R / G
+        rg = base[0] / base[1]
+        qt.qom_set('/machine/scene', 'light-r', 1100)
+        isp_frame_end(qt)
+        warm = isp_frame_end(qt)
+        check('light-r 1100: R / G x 2', near(warm[0] / warm[1], 2 * rg),
+              True)
+        qt.writel(ISP + 0x254, 64 | (128 << 12))            # R gain 0.5
+        wb = isp_frame_end(qt)
+        check('R gain 0.5 brings R / G back', near(wb[0] / wb[1], rg), True)
+        awb = [qt.readl(ISP + 0x2A00 + 4 * i) for i in range(10)]
+        check('AWB: R / G in 1/128 over its blocks', near(
+            awb[0] / awb[2], 128 * wb[0] / wb[1], 0.05), True)
+        check('AWB: block count = pixels / 4', awb[2], 1920 * 1080 // 4)
+        qt.qom_set('/machine/scene', 'light-r', 550)
+        qt.writel(ISP + 0x254, 128 | (128 << 12))
+
+        # the AE pre-gamma (fisp_algorithm.ko's default, about 1 / 2.2)
+        pg = [4, 8, 16, 32, 64, 128, 34, 50, 71, 100, 138, 187,
+              2186, 1023, 683, 454, 304, 198, 136, 0]
+        for i in range(10):
+            qt.writel(ISP + 0x640 + 4 * i, pg[2 * i] | (pg[2 * i + 1] << 16))
+        bent = isp_frame_end(qt)
+        check('pre-gamma lifts the mean', bent[1] > base[1] * 1.3, True)
+        check('violations: none', qt.qom_get('/machine/isp/sensor',
+                                             'violations'), 0)
+
+        # the capture paints the scene: frame number on top, then the bars
+        cas, lli = VCAP + 0x3E00, VCAP + 0x40000
+        buf = SCRATCH + 0x200000
+        tbl = [(0, 0x20000000 | (32 << 23)),
+               (buf, 0x40780000 | (0x3E00 + 0x198)),
+               (0, 0x40780000 | (0x3E00 + 0x19C)),
+               (1919 << 16, 0x40780000 | (0x3E00 + 0x160)),
+               (1079 << 16, 0x40780000 | (0x3E00 + 0x164)),
+               (1919 | (1079 << 16), 0x40780000 | (0x3E00 + 0x10)),
+               (2, 0x40080000 | 0x3E00),
+               (0, 0x80000000 | (0x40000 + 0x100))]
+        for i, (lo, hi) in enumerate(tbl):
+            qt.writel(lli + 0x40 + 8 * i, lo)
+            qt.writel(lli + 0x44 + 8 * i, hi)
+        qt.writel(lli + 0x100, 0)
+        qt.writel(lli + 0x104, 0x00080000 | 0x3E00)
+        qt.writel(cas + 0x1C8, 0x40)
+        qt.writel(VCAP + 0x540C, 1)
+        qt.writel(VCAP + 0x5404, 1 << 31)
+        qt.step(40000000)
+        qt.writel(VCAP + 0x5404, 0)
+        top = qt.read(buf, 4)
+        check('frame number square on top', top[1] in (16, 235), True)
+        row = qt.read(buf + 540 * 1920 * 2, 1920 * 2)
+        ys = [row[2 * x + 1] for x in (100, 1800)]
+        check('the grey bars: white on the left, dark on the right',
+              ys[0] > ys[1] + 50, True)
+    finally:
+        qt.close()
+
+
 def test_3dnr(qt):
     print('gm-3dnr')
     src, dst = SCRATCH + 0x300000, SCRATCH + 0x310000
@@ -966,6 +1159,7 @@ def main():
             test_small(qt)
         finally:
             qt.close()
+        test_isp_twin(args.qemu, path)
         test_rtc(args.qemu, 'gm8136,flash-file=' + path)
         test_machines(args.qemu)
         print('migration')

@@ -135,6 +135,16 @@ the image only has to be plausible.
 - **Fault injection:** I2C NACKs, dropped frames, late interrupts, a
   sensor that ignores group hold.
 
+## Other families
+
+The scene is not HiSilicon's alone: the Grain Media machines build
+`hisi-scene` too and put it at `/machine/scene`, where `gm-isp` measures
+it through an OV2715 (`ov2710-sensor`, SensorSync) for the vendor's
+in-kernel AE / AWB, and `gm-vcap` paints it. `gm-isp.record` writes this
+document's record, so `twin-metrics.py` scores a Grain Media scenario
+unchanged (`qemu-boot/test-grainmedia-scenario.sh`, docs/grainmedia.md
+"The digital twin").
+
 ## Validation against hardware
 
 The twin is trusted once it agrees with a camera:

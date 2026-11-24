@@ -368,9 +368,15 @@ so a Longse dump streams decodable H.264 over RTSP
 (`qemu-boot/test-grainmedia-rtsp.sh`, admin / admin, /ch0). ffmpeg's
 `gray` output rescales limited-range luma: compare against `yuv420p`
 planes. The ISP328 (`gm-isp`) must keep frame start / end running even
-while disabled (the driver waits on both around stop and resize) and
-synthesises statistics that its output DMA table copies to the
-algorithms' buffers. MJPEG (`gm-mcp100`) goes through the embedded CPU's
+while disabled (the driver waits on both around stop and resize); its
+output DMA table copies the statistics to the algorithms' buffers. With
+`sensor=ov2715` (`ov2710-sensor`) it is a digital twin: while the ISP is
+on, the statistics measure `hisi-scene` through the sensor's latched
+exposure and the driver's gains (0x250 / 0x254 / 0x258, 128 = 1x) and AE
+pre-gamma (0x640), `fisp_algorithm.ko`'s AE / AWB close the loop, and
+`gm-vcap` paints the scene (`qemu-boot/test-grainmedia-scenario.sh`, CI).
+The vendor AWB stays in the OV2715's calibrated range: light the room at
+its grey (light-r 902 / light-b 808). MJPEG (`gm-mcp100`) goes through the embedded CPU's
 mailbox at SRAM 0x8000 (an MMIO overlay; command byte 8 starts, 0x80
 done); the host itself packs the JPEG headers through BADR / BALR, and the
 scan comes from `nvt_pixel_jpeg_scan_rst()`. Audio (`gm-ssp`) must never

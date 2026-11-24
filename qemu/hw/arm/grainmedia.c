@@ -212,9 +212,8 @@ static const struct {
 };
 
 /*
- * Image sensors for sensor=, on the I2C bus where the vendor ISP modules
- * (fisp_<sensor>.ko) probe them: 16-bit register addresses, the ID in
- * two registers.
+ * sensor= names a part from the catalogue (hw/i2c/image-sensor.c), put on
+ * the I2C bus where the vendor ISP modules (fisp_<sensor>.ko) probe it.
  */
 struct GmMachineState {
     MachineState parent_obj;
@@ -416,6 +415,7 @@ static void grainmedia_common_init(MachineState *machine,
     g_autofree uint8_t *img = NULL;
     gsize img_len = 0;
     DeviceState *pmu, *dmac, *spi, *dev, *flash;
+    DeviceState *scene, *isp, *sensor;
     SysBusDevice *sbd;
     Object *cpuobj;
     int n;
@@ -547,9 +547,28 @@ static void grainmedia_common_init(MachineState *machine,
 
     sysbus_create_simple("gm-otg", GM_OTG_BASE, gm_irq(gms, GM_IRQ_OTG));
 
-    /* the video pipeline: ISP -> capture -> 3DNR / scaler -> H.264 */
-    sysbus_create_simple("gm-isp", 0x93930000, gm_irq(gms, GM_IRQ_ISP));
-    sysbus_create_simple("gm-vcap", 0x96100000, gm_irq(gms, GM_IRQ_VCAP));
+    /*
+     * the video pipeline: ISP -> capture -> 3DNR / scaler -> H.264, in
+     * front of it the scene the camera sees (docs/grainmedia.md, "The
+     * digital twin"): the ISP's statistics measure it through the
+     * sensor's exposure, the capture paints it
+     */
+    scene = qdev_new("hisi-scene");
+    object_property_add_child(OBJECT(machine), "scene", OBJECT(scene));
+    qdev_realize_and_unref(scene, NULL, &error_fatal);
+    isp = qdev_new("gm-isp");
+    object_property_add_child(OBJECT(machine), "isp", OBJECT(isp));
+    object_property_set_link(OBJECT(isp), "scene", OBJECT(scene),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(isp), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(isp), 0, 0x93930000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(isp), 0, gm_irq(gms, GM_IRQ_ISP));
+    dev = qdev_new("gm-vcap");
+    object_property_set_link(OBJECT(dev), "scene", OBJECT(scene),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x96100000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, gm_irq(gms, GM_IRQ_VCAP));
     sysbus_create_simple("gm-3dnr", 0x9B700000, gm_irq(gms, GM_IRQ_3DNR));
     sysbus_create_simple("gm-scaler", 0x96200000,
                          gm_irq(gms, GM_IRQ_SCALER));
@@ -625,7 +644,13 @@ static void grainmedia_common_init(MachineState *machine,
 
     dev = sysbus_create_simple("gm-i2c", GM_I2C_BASE,
                                gm_irq(gms, GM_IRQ_I2C));
-    image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")), gms->sensor);
+    sensor = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
+                                 gms->sensor);
+    if (sensor) {
+        /* the ISP's frames and statistics follow the sensor's exposure */
+        object_property_set_link(OBJECT(isp), "sensor", OBJECT(sensor),
+                                 &error_fatal);
+    }
 
     binfo.ram_size = machine->ram_size;
     binfo.loader_start = 0;

@@ -24,6 +24,7 @@
 #define OV2735          "ingenic-ov2735"
 #define OMNIVISION      "axera-ov-sensor"
 #define IMAGEDESIGN     "imagedesign-mis"
+#define OV2710          "ov2710-sensor"
 
 typedef struct ImageSensorSpec {
     const char *name;
@@ -31,11 +32,13 @@ typedef struct ImageSensorSpec {
     uint8_t addr;
     uint32_t id;        /* GALAXYCORE, SMARTSENS, OMNIVISION (3 bytes);
                          * OV2735: its revision */
-    uint16_t id_reg;    /* GALAXYCORE, OMNIVISION: the ID's high byte */
+    uint16_t id_reg;    /* GALAXYCORE, OMNIVISION, OV2710: the ID's high
+                         * byte */
     bool reg16;         /* GALAXYCORE: 16-bit register addresses */
     uint8_t disc;       /* SMARTSENS: 0x3109 where parts share an ID */
     uint8_t gain_fine;  /* SMARTSENS: 0x3E09 at 1x, on the SC2310's layout */
-    uint32_t pclk;      /* SMARTSENS, GALAXYCORE: pixel clock, when known:
+    uint32_t pclk;      /* SMARTSENS, GALAXYCORE, OV2710: pixel clock,
+                         * when known:
                          * frame timing */
     uint16_t hts;       /* SMARTSENS: HTS at reset, where a mode leaves it */
     bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
@@ -43,7 +46,7 @@ typedef struct ImageSensorSpec {
                          * factor in 1/1024 */
 } ImageSensorSpec;
 
-/* GalaxyCore's register pairs; OmniVision's OV27x5/OV97x5 have the same */
+/* GalaxyCore's register pairs; OmniVision's OV4689/OV97x5 have the same */
 #define GC8(n, a, i)        { n, GALAXYCORE, a, i, 0xF0, false }
 #define GC16(n, a, i)       { n, GALAXYCORE, a, i, 0x03F0, true }
 #define OV16(n, a, i)       { n, GALAXYCORE, a, i, 0x300A, true }
@@ -147,7 +150,10 @@ static const ImageSensorSpec image_sensors[] = {
 
     /* OmniVision */
     { "os04d10", "os04d10", 0x3C },
-    OV16("ov2715", 0x36, 0x2715),
+    /* exposure, gain and timing from the Grain Media fisp_ov2715.ko
+     * (ov2710.c): 90 MHz from a 27 MHz XCLK */
+    { "ov2710", OV2710, 0x36, 0x2710, 0x300A, .pclk = 90000000 },
+    { "ov2715", OV2710, 0x36, 0x2715, 0x300A, .pclk = 90000000 },
     OV16("ov4689", 0x36, 0x4688),
     OV16("ov9715", 0x30, 0x9711),
     /* the AX620U boards' (Axera SDK ov_os04a10/os04a10.c: 0x36, chip ID
@@ -223,6 +229,10 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint8(dev, "id0", spec->id >> 16);
         qdev_prop_set_uint8(dev, "id1", (spec->id >> 8) & 0xFF);
         qdev_prop_set_uint8(dev, "id2", spec->id & 0xFF);
+    } else if (!strcmp(spec->type, OV2710)) {
+        qdev_prop_set_uint16(dev, "id-reg", spec->id_reg);
+        qdev_prop_set_uint16(dev, "id", spec->id);
+        qdev_prop_set_uint32(dev, "pclk", spec->pclk);
     } else if (!strcmp(spec->type, IMAGEDESIGN)) {
         qdev_prop_set_uint16(dev, "id", spec->id);
     } else if (!strcmp(spec->type, OV2735)) {
