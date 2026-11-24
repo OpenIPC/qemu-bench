@@ -553,7 +553,18 @@ Everything else from `0xFF000000` is an unimplemented-device catch-all.
 
 There is no mask ROM code to run. A stand-in finds the `RKNS` ID block
 (header v2, at flash 0x10000; 0, 0x8000, 0x20000 and 0x40000 are also
-tried). Image entries are 0x58 bytes from header + 0x78, each with
+tried). It also takes the older v1 ID block, the RV1126's: sector 0
+RC4-scrambled with Rockchip's fixed key, magic `0x0ff0aa55`, the DDR blob
+from `init_offset` for `init_size` sectors and the SPL up to
+`init_boot_size` (U-Boot's `tools/rkcommon.c`, as `mkimage -T rksd`
+writes it, images unscrambled); one whose SPL runs past the flash is
+refused. The `rv1126` and `rv1109` machines take
+this path when the flash has an ID block, and start U-Boot from the FIT
+(below) when it has none.
+
+The CRU's global soft reset resets the machine: `0xfdb9` written to
+`GLB_SRST_FST` or `0xeca8` to `GLB_SRST_SND` (RV1106 0xff3b0c08, RV1103B
+0x20060c08, RV1126 0xff490408), as U-Boot's `reset` does. Image entries are 0x58 bytes from header + 0x78, each with
 `size << 16 | offset` in 512-byte sectors. The first entry loaded at
 `0xffffffff` is the DDR-init blob, which is closed and has nothing to train
 here, so it is skipped. The next one is the SPL, which is loaded at DRAM 0
@@ -561,7 +572,8 @@ and run. On the G2 dump, entry 1 is data at 0x40000, not code.
 
 The stand-in recreates what the ROM and DDR blob leave behind:
 
-- **SRAM + 0x10:** boot source 3 (SPI NOR).
+- **SRAM + 0x10:** the boot source: 3 for SPI NOR, 4 for SPI NAND (the
+  flash the machine has, as `flash-type=` or its default makes it).
 - **Preloader ATAGs at `0x1FE000`** (2 MiB − 8 KiB), each with a hash word
   of 0, meaning "accept":
   - `CORE`
