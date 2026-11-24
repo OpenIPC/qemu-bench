@@ -312,40 +312,78 @@ static uint16_t sstar_riu_status(SstarRiuState *s, uint32_t bank,
 
 static SstarRiuState *sstar_miu_riu;
 
-static uint64_t sstar_i6e_xlate(SstarRiuState *s, uint64_t a)
-{
-    uint16_t ctl = s->regs[(I6E_MMU_BANK << 7) | I6E_MMU_CTRL];
-    unsigned page = (ctl & 2) ? 18 : 17;
-    unsigned reach = page + 10;
-    uint16_t pa;
+/*
+ * The MIU MMU's view of a bus master's address: SSTAR_MIU_PASS when the
+ * MMU is off or the address is outside its VPA region (unchanged), else
+ * SSTAR_MIU_HIT with *pa translated, or SSTAR_MIU_MISS for a page with no
+ * entry.  *page is log2 of the MMU's page while it is on, else 0.
+ */
+enum { SSTAR_MIU_PASS, SSTAR_MIU_HIT, SSTAR_MIU_MISS };
 
-    if (!(ctl & 1) || (a >> reach) != ((ctl >> 8) & 0xF)) {
-        return a;
+static int sstar_miu_lookup(SstarRiuState *s, uint64_t a, uint64_t *pa,
+                            unsigned *page)
+{
+    uint16_t ctl, region, replace, e;
+    unsigned pg, reach;
+
+    *pa = a;
+    *page = 0;
+    if (!s) {
+        return SSTAR_MIU_PASS;
     }
-    pa = s->mmu[(a >> page) & (I6E_MMU_ENTRIES - 1)];
-    if (pa >= I6E_MMU_INVALID) {
-        qemu_log_mask(LOG_GUEST_ERROR, "sstar-riu: MMU miss at 0x%" PRIx64 "\n",
-                      a);
-        return a;
+    if (s->i6e_mmu) {
+        ctl = s->regs[(I6E_MMU_BANK << 7) | I6E_MMU_CTRL];
+        if (!(ctl & 1)) {
+            return SSTAR_MIU_PASS;
+        }
+        pg = (ctl & 2) ? 18 : 17;
+        reach = pg + 10;
+        region = (ctl >> 8) & 0xF;
+        replace = ctl >> 12;
+        *page = pg;
+        if ((a >> reach) != region) {
+            return SSTAR_MIU_PASS;
+        }
+        e = s->mmu[(a >> pg) & (I6E_MMU_ENTRIES - 1)];
+        if (e >= I6E_MMU_INVALID) {
+            return SSTAR_MIU_MISS;
+        }
+    } else {
+        ctl = s->regs[MMU_BANK << 7];
+        if (!(ctl & 1)) {
+            return SSTAR_MIU_PASS;
+        }
+        /* Iford packs both regions in reg 1, infinity6c has regs 5 and 6 */
+        if (s->iford) {
+            region = s->regs[(MMU_BANK << 7) | 1] & 0xFF;
+            replace = s->regs[(MMU_BANK << 7) | 1] >> 8;
+        } else {
+            region = s->regs[(MMU_BANK << 7) | 5];
+            replace = s->regs[(MMU_BANK << 7) | 6];
+        }
+        pg = 15 + ((ctl >> 1) & 3);
+        reach = pg + 12;
+        *page = pg;
+        if ((a >> reach) != region) {
+            return SSTAR_MIU_PASS;
+        }
+        e = s->mmu[(a >> pg) & (MMU_ENTRIES - 1)];
+        if (e == MMU_INVALID) {
+            return SSTAR_MIU_MISS;
+        }
     }
-    return ((uint64_t)(ctl >> 12) << reach) | ((uint64_t)pa << page) |
-           (a & ((1ull << page) - 1));
+    *pa = ((uint64_t)replace << reach) | ((uint64_t)e << pg) |
+          (a & ((1ull << pg) - 1));
+    return SSTAR_MIU_HIT;
 }
 
 /* A VPA address with no entry: nothing is behind it on the bus. */
 bool sstar_miu_missed(uint64_t a)
 {
-    SstarRiuState *s = sstar_miu_riu;
-    uint16_t ctl;
+    uint64_t pa;
     unsigned page;
 
-    if (!s || !s->i6e_mmu) {
-        return false;
-    }
-    ctl = s->regs[(I6E_MMU_BANK << 7) | I6E_MMU_CTRL];
-    page = (ctl & 2) ? 18 : 17;
-    return (ctl & 1) && (a >> (page + 10)) == ((ctl >> 8) & 0xF) &&
-           s->mmu[(a >> page) & (I6E_MMU_ENTRIES - 1)] >= I6E_MMU_INVALID;
+    return sstar_miu_lookup(sstar_miu_riu, a, &pa, &page) == SSTAR_MIU_MISS;
 }
 
 static void sstar_i6e_mmu_write(SstarRiuState *s, uint32_t reg, uint16_t v)
@@ -368,42 +406,29 @@ static void sstar_i6e_mmu_write(SstarRiuState *s, uint32_t reg, uint16_t v)
 
 uint64_t sstar_miu_xlate(uint64_t a)
 {
-    SstarRiuState *s = sstar_miu_riu;
-    uint16_t ctl, region, replace;
-    unsigned page, reach;
-    uint16_t pa;
+    uint64_t pa;
+    unsigned page;
 
-    if (!s) {
-        return a;
-    }
-    if (s->i6e_mmu) {
-        return sstar_i6e_xlate(s, a);
-    }
-    ctl = s->regs[MMU_BANK << 7];
-    if (!(ctl & 1)) {
-        return a;
-    }
-    /* Iford packs both regions in reg 1, infinity6c has regs 5 and 6 */
-    if (s->iford) {
-        region = s->regs[(MMU_BANK << 7) | 1] & 0xFF;
-        replace = s->regs[(MMU_BANK << 7) | 1] >> 8;
-    } else {
-        region = s->regs[(MMU_BANK << 7) | 5];
-        replace = s->regs[(MMU_BANK << 7) | 6];
-    }
-    page = 15 + ((ctl >> 1) & 3);
-    reach = page + 12;
-    if ((a >> reach) != region) {
-        return a;
-    }
-    pa = s->mmu[(a >> page) & (MMU_ENTRIES - 1)];
-    if (pa == MMU_INVALID) {
+    if (sstar_miu_lookup(sstar_miu_riu, a, &pa, &page) == SSTAR_MIU_MISS) {
         qemu_log_mask(LOG_GUEST_ERROR, "sstar-riu: MMU miss at 0x%" PRIx64 "\n",
                       a);
-        return a;
     }
-    return ((uint64_t)replace << reach) | ((uint64_t)pa << page) |
-           (a & ((1ull << page) - 1));
+    return pa;
+}
+
+size_t sstar_miu_page(uint64_t a, size_t len, uint64_t *pa, bool *missed)
+{
+    unsigned page;
+
+    *missed = sstar_miu_lookup(sstar_miu_riu, a, pa, &page) == SSTAR_MIU_MISS;
+    if (page) {
+        len = MIN(len, (1ull << page) - (a & ((1ull << page) - 1)));
+    }
+    if (*missed) {
+        qemu_log_mask(LOG_GUEST_ERROR, "sstar-riu: MMU miss at 0x%" PRIx64
+                      ", %zu bytes skipped\n", a, len);
+    }
+    return len;
 }
 
 static void sstar_miu_mmu_write(SstarRiuState *s, uint32_t reg, uint16_t v)

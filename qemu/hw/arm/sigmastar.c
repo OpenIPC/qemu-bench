@@ -2052,8 +2052,15 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             SS_SPI_BDMA0, SS_SPI_BDMA1, SS_SPI_BDMA2, SS_SPI_BDMA3,
         };
 
-        if (c->die == SS_DIE_IFLIEGEN) {
-            /* bdma0-3 share INT_IRQ_BDMA (DTS); msys copies on channel 2 */
+        if (c->die == SS_DIE_IFLIEGEN || c->die == SS_DIE_INFINITY6C) {
+            /*
+             * bdma0-3 share INT_IRQ_BDMA (DTS); msys copies on channel 2.
+             * infinity6c likewise: its kernel's HalBdma device 0 is
+             * these four channels on SPI 72 ("BdmaIsr", HalBdma_ISR
+             * polls each), where msys_dma_fill_lineoffset runs on
+             * channel 1 and waits for it; the DTS's SPI 73 is "bdma1",
+             * another block at 0x1F201600.
+             */
             DeviceState *or = qdev_new(TYPE_OR_IRQ);
 
             qdev_prop_set_uint16(or, "num-lines", 4);
@@ -2177,6 +2184,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         dev = qdev_new("sstar-cmdq");
         if (i6c) {
             qdev_prop_set_uint32(dev, "idle-bits", 1u << 11);
+            /* HalCmdqSetIsrMsk: the mask is reg 0x47 */
+            qdev_prop_set_bit(dev, "mask-hi", true);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
         {
@@ -2409,6 +2418,8 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
             qdev_prop_set_bit(pipe, "sensor-window",
                               c->die == SS_DIE_INFINITY6C);
             qdev_prop_set_bit(pipe, "ae-grid-32",
+                              c->die == SS_DIE_INFINITY6C);
+            qdev_prop_set_bit(pipe, "ispscl",
                               c->die == SS_DIE_INFINITY6C);
             object_property_set_link(OBJECT(pipe), "sensor", OBJECT(dev),
                                      &error_fatal);

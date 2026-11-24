@@ -3650,6 +3650,269 @@ def test_i6c_media(qemu, tmp):
         qt.close()
 
 
+def i6c_mmu(qt, pages):
+    """infinity6c's MIU MMU: VPA region 1 in 128 KiB pages, VPA page
+    0xFF8 + n (MIU 0x3FF00000 up) to the PA page pages[n]."""
+    mmu = riu(0x1659, 0)
+    qt.writew(mmu, 0)
+    qt.writew(mmu + 0x05 * 4, 1)
+    qt.writew(mmu + 0x06 * 4, 0)
+    for n, pa in enumerate(pages):
+        qt.writew(mmu + 0x03 * 4, pa)
+        qt.writew(mmu + 0x02 * 4, 0x8000 | (0xFF8 + n))
+        qt.writew(mmu + 0x0A * 4, 3)
+    qt.writew(mmu, (2 << 1) | 1)
+
+
+def test_i6c_bdma_mmu(qemu, tmp):
+    print('infinity6c BDMA: MIU ports through the MIU MMU')
+    path = i6_image(tmp, 'i6cb.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x105))         # two pages, not adjacent
+        for a in (0x22000000, 0x2201FF00, 0x220A0000, 0x3FF1FF00):
+            qt.writel(a, 0)
+        b = BDMA
+        qt.writew(b + 0x0A * 4, 0x0323)
+        qt.writew(b + 0x0B * 4, 0x0323)
+        # a pattern fill (port 4) into MIU 0, across a VPA page boundary
+        st = bdma_run(qt, 0, 0x0004, 0, 0x3FF1FF00, 0x200)
+        check('BDMA: the fill completes', st & 8, 8)
+        check('BDMA: the first page as the MMU maps it',
+              qt.readl(0x2201FF00), 0x03230323)
+        check('BDMA: the next page, mapped elsewhere',
+              qt.readl(0x220A0000), 0x03230323)
+        check('BDMA: nothing at the untranslated address',
+              qt.readl(0x3FF1FF00), 0)
+        # and a copy out of the VPA region, back to plain DRAM
+        qt.writel(0x220A0004, 0x12345678)
+        bdma_run(qt, 0, 0x0000, 0x3FF20004, 0x00300000, 4)
+        check('BDMA: a copy reads through the MMU too',
+              qt.readl(DRAM + 0x300000), 0x12345678)
+        # a VPA page with no entry: nothing is behind it, nothing written
+        qt.writel(0x3FF40000, 0)
+        st = bdma_run(qt, 0, 0x0004, 0, 0x3FF40000, 0x100)
+        check('BDMA: a fill into an unmapped page completes', st & 8, 8)
+        check('BDMA: and lands nowhere, not at the untranslated address',
+              qt.readl(0x3FF40000), 0)
+    finally:
+        qt.close()
+
+
+def test_i6c_bdma_irq(qemu, tmp):
+    print('infinity6c BDMA: the four channels on one interrupt, SPI 72')
+    path = i6_image(tmp, 'i6ci.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        for ch in (0, 1, 2, 3):
+            qt.writel(DRAM + 0x300000, 0)
+            b = BDMA + ch * 0x80
+            qt.writew(b + 0x0A * 4, 0x5A5A)
+            qt.writew(b + 0x0B * 4, 0x5A5A)
+            bdma_run(qt, ch, 0x0004, 0, 0x300000, 4, misc=2)
+            # bdma_run clears done (bit 3); the interrupt is bit 2
+            check('BDMA ch%d: done raises MS_IRQ 40 (SPI 72)' % ch,
+                  intc_raw(qt, 40), 1)
+            check('BDMA ch%d: not SPI 73, bdma1\'s' % ch, intc_raw(qt, 41), 0)
+            qt.writew(b + 0x01 * 4, 4)
+            check('BDMA ch%d: clearing bit 2 drops it' % ch,
+                  intc_raw(qt, 40), 0)
+    finally:
+        qt.close()
+
+
+def test_i6c_ispscl(qemu, tmp):
+    print('infinity6c IspScl: VIF in realtime, the frame events on SPI 56')
+    path = i6_image(tmp, 'i6cs.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        di = riu(0x130C, 0)
+        check('the write DMA is off', qt.readw(riu(0x1358, 0)) & 1, 0)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        qt.step(100 * 1000000)
+        check('HalIspSclIsr group 1 (0x00): the frame\'s end',
+              qt.readw(di + 0x03 * 4) & 1, 1)
+        check('group 2 (0x04): its line-count hit',
+              qt.readw(di + 0x07 * 4) & 1, 1)
+        check('group 6 (0x14): its start', qt.readw(di + 0x17 * 4) & 1, 1)
+        check('MS_IRQ 24, SPI 56, the "ispscl" node', intc_raw(qt, 24), 1)
+        for g in (0x00, 0x04, 0x14):
+            qt.writew(di + (g + 2) * 4, 0xFFFF)
+        check('cleared, the line drops', intc_raw(qt, 24), 0)
+        for g in (0x00, 0x04, 0x14):
+            qt.writew(di + g * 4, 0xFFFF)
+        qt.step(100 * 1000000)
+        check('masked, it stays down', intc_raw(qt, 24), 0)
+        for g in (0x00, 0x04, 0x14):
+            qt.writew(di + (g + 2) * 4, 0xFFFF)
+            qt.writew(di + g * 4, 0)
+        qt.writew(riu(0x1358, 0), 1)        # write DMA on, no buffer queued
+        qt.step(100 * 1000000)
+        check('write DMA on, no buffer: the frame end all the same',
+              qt.readw(di + 0x03 * 4) & 1, 1)
+        check('and its start', qt.readw(di + 0x17 * 4) & 1, 1)
+    finally:
+        qt.close()
+
+
+def test_i6c_jpe_mmu(qemu, tmp):
+    print('infinity6c JPE: the output buffer through the MIU MMU')
+    path = i6_image(tmp, 'i6cj.bin')
+    jpe = riu(0x1232, 0)
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101))       # MIU 0x3FF00000 is the CPU's
+                                          # 0x22000000
+        for a in (0x22000000, 0x2200000C, 0x3FF00000, 0x3FF0000C):
+            qt.writel(a, 0)
+        out, end = 0x3FF00000 >> 4, (0x3FF00000 + 0x10000 - 1) >> 4
+        qt.writew(jpe + 0x51 * 4, out & 0xFFFF)
+        qt.writew(jpe + 0x52 * 4, out >> 16)
+        qt.writew(jpe + 0x53 * 4, end & 0xFFFF)
+        qt.writew(jpe + 0x54 * 4, end >> 16)
+        qt.writew(jpe + 0x20 * 4, 0)
+        qt.writew(jpe, 1)
+        qt.step(100 * 1000000)
+        check('JPE: frame done', qt.readw(jpe + 0x22 * 4) & 1, 1)
+        check('JPE: the end-of-image marker where the MMU maps the buffer',
+              qt.readw(0x2200000E), 0xD9FF)
+        check('JPE: nothing at the untranslated address',
+              qt.readl(0x3FF0000C), 0)
+    finally:
+        qt.close()
+
+
+def i6c_wave5_two(qemu, tmp, ack):
+    """Two instances' pictures queued at once; the host takes the first
+    picture's end by ack: 'reason' (REASON_CLEAR with ENC_PIC), 'vint'
+    (VINT_CLEAR only), 'poll' (the ENC_PIC interrupt switched off) or
+    'destroy' (its instance destroyed)."""
+    path = i6_image(tmp, 'i6cw.bin')
+    wave = 0x1F34D000
+    base = 0x3FF00000
+    dram = 0x22000000
+    src = 0x01100000
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101, 0x102))  # base, 0x3FF00000, is VPA
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        for inst, dump in ((0, 0x20000), (1, 0x24000)):
+            qt.writel(wave + 0x14C, dump)
+            cmd(0x0008, inst=inst)
+            qt.writel(wave + 0x11C, 64 << 16 | 64)
+            qt.writel(wave + 0x130, 2 << 16)
+            cmd(0x0200, inst=inst)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + src + i, 0x20406080)
+        for n, (inst, bs, fire) in enumerate(((0, 0x40000, 0x55),
+                                              (1, 0x50000, 0x66))):
+            p = dram + n * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x10, inst)
+            qt.writel(p + 0x18, bs)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x48, src)
+            qt.writel(p + 0x4C, src + 64 * 64)
+            qt.writel(p + 0x54, 64 << 16 | 64)
+            qt.writel(p + 0xC0, fire)
+        qt.writel(wave + 0x1F8, 2)          # both pictures queued at once
+        qt.step(20 * 1000000)
+        check('Wave5: the first picture done',
+              qt.readl(wave + 0x1E8), 1 << 24 | 0)
+        check('Wave5: the second waits for the host to take it',
+              qt.readl(wave + 0x1F4), 1)
+        check('Wave5: the first one\'s results', qt.readl(dram + 0x20000),
+              0x55)
+        # another instance coming or going does not take it
+        cmd(0x0008, inst=2)
+        qt.writel(wave + 0x1F8, 2)          # the queue's doorbell again
+        qt.step(20 * 1000000)
+        check('Wave5 (%s): still held after a third instance\'s CREATE' % ack,
+              qt.readl(wave + 0x1E8), 1 << 24 | 0)
+        check('Wave5 (%s): and the second not started' % ack,
+              qt.readl(wave + 0x1F4), 1)
+        cmd(0x0020, inst=2)
+        qt.step(20 * 1000000)
+        check('Wave5 (%s): nor after its DESTROY' % ack,
+              qt.readl(wave + 0x1F4), 1)
+        if ack == 'reason':
+            qt.writel(wave + 0x34, 0x100)
+            qt.writel(wave + 0x3C, 1)
+        elif ack == 'destroy':
+            cmd(0x0020, inst=0)
+        elif ack == 'vint':
+            qt.writel(wave + 0x3C, 1)
+        else:
+            qt.writel(wave + 0x48, 0xBD40 & ~0x100)
+        qt.step(20 * 1000000)
+        check('Wave5 (%s): then the second, named on its own' % ack,
+              qt.readl(wave + 0x1E8), 1 << 24 | 1)
+        check('Wave5 (%s): the queue drained' % ack, qt.readl(wave + 0x1F4), 2)
+        check('Wave5: the second one\'s results', qt.readl(dram + 0x24000),
+              0x66)
+    finally:
+        qt.close()
+
+
+def test_i6c_wave5_two(qemu, tmp):
+    print('infinity6c Wave5: two instances queued, one done at a time')
+    for ack in ('reason', 'vint', 'poll', 'destroy'):
+        i6c_wave5_two(qemu, tmp, ack)
+
+
+def test_i6c_cmdq_mask(qemu, tmp):
+    print('infinity6c CMDQ: the interrupt mask is reg 0x47')
+    path = i6_image(tmp, 'i6cq.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        e = riu(0x1126, 0)                  # engine 4
+        buf = 0x300000
+        target = riu(0x1033, 0x10)
+        word = (target - RIU) // 4
+        qt.writel(DRAM + buf, 0x1234 << 16 | 0xFFFF)
+        qt.writel(DRAM + buf + 4, 0x11 << 24 | word)   # write, raising SW 1
+        qt.writel(DRAM + buf + 8, 0)
+        qt.writel(DRAM + buf + 12, 0)
+        qt.writew(e + 0x47 * 4, 0xFFFF)     # HalCmdqSetIsrMsk(all)
+        qt.writew(e + 0x04 * 4, (buf >> 4) & 0xFFFF)
+        qt.writew(e + 0x05 * 4, buf >> 20)
+        qt.writew(e + 0x06 * 4, ((buf + 0x1000) >> 4) - 1 & 0xFFFF)
+        qt.writew(e + 0x07 * 4, ((buf + 0x1000) >> 4) - 1 >> 16)
+        qt.writew(e + 0x01 * 4, 1)
+        qt.writew(e + 0x09 * 4, (buf + 16) >> 20)
+        qt.writew(e + 0x08 * 4, ((buf + 16) >> 4) & 0xFFFF)
+        check('CMDQ: the command ran', qt.readw(target), 0x1234)
+        check('CMDQ: its software interrupt in the raw status, reg 0x45',
+              qt.readw(e + 0x45 * 4) & 2, 2)
+        check('CMDQ: not in the final status, reg 0x44, while masked',
+              qt.readw(e + 0x44 * 4) & 2, 0)
+        check('CMDQ: masked in reg 0x47, no interrupt (MS_IRQ 17, SPI 49)',
+              intc_raw(qt, 17), 0)
+        qt.writew(e + 0x47 * 4, 0xFFFD)
+        check('CMDQ: unmasked there, it is raised', intc_raw(qt, 17), 1)
+        check('CMDQ: and in the final status', qt.readw(e + 0x44 * 4) & 2, 2)
+        qt.writew(e + 0x48 * 4, 2)
+        check('CMDQ: and the clear drops it', intc_raw(qt, 17), 0)
+    finally:
+        qt.close()
+
+
 NAND_RAW = 2048 + 64
 NAND_BLOCK = 64 * NAND_RAW
 
@@ -4041,6 +4304,12 @@ def main():
     test_i6b0_media(args.qemu, tmp)
     test_i6b0_audio_out(args.qemu, tmp)
     test_i6c_media(args.qemu, tmp)
+    test_i6c_cmdq_mask(args.qemu, tmp)
+    test_i6c_wave5_two(args.qemu, tmp)
+    test_i6c_jpe_mmu(args.qemu, tmp)
+    test_i6c_ispscl(args.qemu, tmp)
+    test_i6c_bdma_irq(args.qemu, tmp)
+    test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)
     sys.exit(1 if failures else 0)
 

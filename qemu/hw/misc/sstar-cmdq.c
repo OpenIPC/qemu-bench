@@ -37,6 +37,13 @@
  * done (drvCMDQ.h CMDQ_IRQ_STATE_*): on done the scaler driver applies a
  * size change (CHANGESIZEDONE) that a VSRC port's reconfiguration waits
  * for.  The mask is reg 0x47 (Hal_CMDQ_SetISRMSK).
+ * "mask-hi" (infinity6c): the mask is reg 0x47 there too.  mi.ko's
+ * HalCmdqSetIsrMsk writes its 16 bits to +0x11C, the high half of the
+ * 32-bit mask, and keeps +0x118; HalCmdqReadFinalIrqStatus returns +0x110
+ * (reg 0x44), the status after the mask, which MDrvCmdqStatusIsr handles
+ * and clears; HalCmdqReadIrqStatus returns +0x114 (reg 0x45), the raw
+ * status, here the same bits unmasked [assumed: only the final status is
+ * read by the ISR], with the idle bits.
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -115,6 +122,7 @@ struct SstarCmdqState {
     SstarCmdqEngine eng[CMDQ_ENGINES];
     bool trace;
     bool infinity3;
+    bool mask_hi;
     uint32_t idle_bits;
 };
 
@@ -130,6 +138,12 @@ static hwaddr cmdq_dram(uint32_t miu)
     return a < SS_DRAM_BASE ? SS_DRAM_BASE + a : a;
 }
 
+/* the register that masks the status: 0x47 on infinity3 and infinity6c */
+static int sstar_cmdq_mask_reg(SstarCmdqState *s)
+{
+    return s->infinity3 || s->mask_hi ? R_MASK_I3 : R_MASK_LO;
+}
+
 static void sstar_cmdq_update_irq(SstarCmdqState *s)
 {
     bool level = false;
@@ -139,7 +153,7 @@ static void sstar_cmdq_update_irq(SstarCmdqState *s)
         SstarCmdqEngine *e = &s->eng[n];
 
         level |= !!(e->regs[R_STATUS_LO] &
-                    ~e->regs[s->infinity3 ? R_MASK_I3 : R_MASK_LO]);
+                    ~e->regs[sstar_cmdq_mask_reg(s)]);
     }
     qemu_set_irq(s->irq, level);
 }
@@ -322,6 +336,11 @@ static uint64_t sstar_cmdq_read(void *opaque, hwaddr off, unsigned size)
         return 0;
     }
     v = e->regs[reg];
+    if (b->s->mask_hi && reg == R_STATUS_LO) {
+        v &= ~e->regs[R_MASK_I3];           /* HalCmdqReadFinalIrqStatus */
+    } else if (b->s->mask_hi && reg == R_STATUS_HI) {
+        v |= e->regs[R_STATUS_LO];          /* HalCmdqReadIrqStatus, raw */
+    }
     if (reg == R_STATUS_HI) {
         v |= b->s->idle_bits;
     }
@@ -391,6 +410,7 @@ static void sstar_cmdq_write(void *opaque, hwaddr off, uint64_t val,
         sstar_cmdq_run(s, b->n);
         break;
     case R_MASK_LO:
+    case R_MASK_I3:
         sstar_cmdq_update_irq(s);
         break;
     }
@@ -439,6 +459,7 @@ static const Property sstar_cmdq_props[] = {
     DEFINE_PROP_BOOL("trace", SstarCmdqState, trace, false),
     DEFINE_PROP_UINT32("idle-bits", SstarCmdqState, idle_bits, STATUS_HI_IDLE),
     DEFINE_PROP_BOOL("infinity3", SstarCmdqState, infinity3, false),
+    DEFINE_PROP_BOOL("mask-hi", SstarCmdqState, mask_hi, false),
 };
 
 static const VMStateDescription vmstate_sstar_cmdq_engine = {
