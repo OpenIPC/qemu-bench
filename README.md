@@ -437,13 +437,15 @@ Grain Media's camera SoCs, in `hw/arm/grainmedia.c`: a Faraday FA626TE
 FTTMR010, FTWDT010, FTGPIO010, FTI2C010, the command-based FTSPI020 flash
 controller paced by the FTDMAC020, FTGMAC100 Ethernet, FTSDC021 SD hosts
 and the FOTG210 USB host -- with the PMU's chip ID, boot strap and PLLs
-(the timers' PCLK), and an OmniVision sensor's ID on the I2C bus
-(`sensor=ov2715`). A camera's SPI NOR dump boots the way the mask ROM
+(the timers' PCLK), and an OmniVision OV2715 on the I2C bus
+(`sensor=ov2715`) whose exposure, gain and frame timing a digital twin
+measures a lit scene through: the vendor's in-kernel AE / AWB close their
+loop on it (`qemu-boot/test-grainmedia-scenario.sh`). A camera's SPI NOR dump boots the way the mask ROM
 does: nsboot from flash 0x1000 in SRAM brings up DDR and the CPU clock,
 then the vendor U-Boot runs the vendor 3.3 kernel and the camera's
 application: `-M gm8136,flash-file=dump.bin -nic user`. Flash writes go
 back to the file. The video pipeline the vendor graph runs is modelled --
-VCAP300 capture painting the OpenIPC logo, the 3DNR, the scaler, the MCP280
+VCAP300 capture painting the scene (or the OpenIPC logo), the 3DNR, the scaler, the MCP280
 H.264 encoder producing real slices behind the driver's own headers, the
 LCD's frame clock -- so a camera dump streams decodable 1080p and D1 H.264
 (I frames and motion-following P frames) from its own RTSP server

@@ -14,7 +14,8 @@ before, has its own file and [section](#gm8126).
 | `u-boot-2013.01` (`board/gm/gm8136`, `drivers/mtd/spi/spi020*.c`) | PLL/PCLK formulas, bootargs selection, SPI020 + DMA usage |
 | `gm8136_nsboot` (source and `nsboot.bin`) | the boot loader the mask ROM runs: DDR tables, frequency change, NOR system header |
 | three Longse camera dumps (MX25L12805D, 16 MiB) | the real boot chain: nsboot at 0x1000, U-Boot at 0x10000, kernel `#44` 2015, vendor application |
-| OpenIPC `gm8136` / `gm8135` releases | the kernel booted with `-kernel`, root on the NOR |
+| OpenIPC `gm8136` / `gm8135` releases | the kernel booted with `-kernel`, root on the NOR; `fisp328.ko`, `fisp_algorithm.ko` and `fisp_ov2715.ko` with their symbols, for the ISP's gain / pre-gamma registers and the OV2715's exposure, gain and timing |
+| [GM8136S/GM8135S Data Sheet V0.2](https://dashcamtalk.com/cams/b1w/GM8136S_GM8135S_Data_Sheet_V0.2.pdf) (Oct. 2014, 693 pp.) | the address map (Figure 3-1, which the table below matches), register chapters for the CSIRX, IVS, MAC, SDC, USB, GPIO, I2C, IR, UART, PWM and SAR ADC; only feature lists for the ISP, VCAP and H.264 (ISP: 1080p, 2-lane MIPI / sub-LVDS / 12-bit parallel, AE / AWB / AF statistics and a configurable histogram) |
 
 The SDK also carries GM8139 and GM8287 platforms, which are not modelled
 (GM8139's map is close to GM8136's).
@@ -73,8 +74,13 @@ cache operations are all ARMv5 CP15 ones QEMU accepts.
 | `0x93930000` | ISP328 | `gm-isp` | 43 |
 | `0x9A100000` | FTDDRC010 | `gm-ddrc` | |
 
-Everything in `0x90000000`-`0x9FFFFFFF` that is not listed as a model
-reads as zero (`grainmedia.periph`, `-d unimp` shows the accesses).
+The datasheet's Figure 3-1 places the blocks in 1 MiB windows (the
+ISP's is `0x93900000`; the driver's registers are at `0x93930000` inside
+it); it also lists the IVS
+engine at `0x9B600000`, the CSIRX at `0x9BA00000`, the sub-LVDS receiver at
+`0x9BC00000`, the de-interlacer at `0x9B000000` and TV encoder at
+`0x93500000`, none of which is modelled. Everything in
+`0x90000000`-`0x9FFFFFFF` that is not listed as a model reads as zero (`grainmedia.periph`, `-d unimp` shows the accesses).
 
 ## Boot
 
@@ -230,10 +236,13 @@ the LLD layout), with TC and error/abort status per channel.
 Byte at a time: DR then CR with TB_EN, plus START (DR is the address
 byte), STOP, NAK. SR reports byte transmitted / received / bus error (no
 ACK) a few microseconds later and clears on read; the kernel's interrupt
-mode sends the next byte from its handler. `sensor=ov2715` (the Longse
-cameras' sensor, at 0x36, ID 0x2715 at 0x300A) or `ov9715` puts a 16-bit
-register sensor stub (`galaxycore-sensor`) on the bus, which the ISP's
-`fisp_ov2715.ko` probes; the default is none.
+mode sends the next byte from its handler. `sensor=` puts a part from the
+sensor catalogue on the bus, where the ISP's `fisp_<sensor>.ko` probes it;
+the default is none. `ov2715` (the Longse cameras' sensor and
+`load_grainmedia`'s default, at 0x36, ID 0x2715 at 0x300A) is
+`ov2710-sensor`, which models the exposure, gain and frame timing (see
+"The digital twin"); `ov9715` is an ID-only stub, and with it the ISP
+keeps its neutral statistics.
 
 ### `gm-wdt` (FTWDT010)
 
@@ -272,10 +281,11 @@ back. Every engine it waits on is modelled, from the SDK's drivers:
 - **`gm-vcap` (VCAP300)** runs the driver's link lists in its SRAM at
   0x40000 -- per path a "next" table pointer in the channel block
   (+0x1C8), tables of STATUS / UPDATE (byte enables) / NEXT_CMD / NEXT_LLI
-  / NULL commands -- and at 30 frames a second paints the Allwinner
+  / NULL commands -- and at 30 frames a second paints into each completed
+  table's DMA buffer as UYVY the scene in front of the camera, once the
+  ISP measures it (see "The digital twin"), or until then the Allwinner
   capture model's picture (the OpenIPC logo on navy, a dot sliding
-  beneath it; `aw-vinc-logo.h`) into each completed table's
-  DMA buffer as UYVY, the target crop at the scaler output's scale, then
+  beneath it; `aw-vinc-logo.h`), the target crop at the scaler output's scale, then
   fills the STATUS slot (ready, frame mode, frame count, DMA done, the
   driver's channel / path IDs kept) and sets LL done (the cascade's
   0x55B4). The driver links jobs into the lists only from the 60 Hz
@@ -323,15 +333,16 @@ back. Every engine it waits on is modelled, from the SDK's drivers:
   the vertical interrupt, which is also the graph's reference clock, so
   while the LCD is enabled a 29.97 Hz timer raises INT_STATUS bit 2.
 - **`gm-isp` (ISP328)** runs frame start / end (status0 bits 16 / 17)
-  at 30 frames a second whether the ISP is on or not -- the driver waits
-  for both around every stop and resize -- executes the input DMA tables
-  the driver queues its register updates in at frame start, and at frame
-  end fills the statistics for a neutral grey scene (`luma`, default 100,
-  the AE's target: per-window R / G / B sums, histograms, AWB ratios of
-  1.0, a flat AF figure), runs the output DMA table that copies them to
-  the AE / AWB / AF threads' buffers, and raises the ready bits of the
-  enabled units with frame end. AE settles at once and AWB keeps unity
-  gains.
+  whether the ISP is on or not -- the driver waits for both around every
+  stop and resize -- at the sensor's frame rate once it streams (30
+  frames a second without one), executes the input DMA tables the driver
+  queues its register updates in at frame start, and at frame end fills
+  the statistics, runs the output DMA table that copies them to the AE /
+  AWB / AF threads' buffers, and raises the ready bits of the enabled
+  units with frame end. With a sensor and the ISP on, the statistics
+  measure the scene (see "The digital twin"); otherwise they describe a
+  neutral grey (`luma`, default 100, the AE's target): AE settles at once
+  and AWB keeps unity gains.
 - **`gm-2d` (GM2D)** executes its command lists ({register, value}
   pairs; DRAW_CMD and BLIT_CMD run the operation): lines and filled
   rectangles, blits with colour keys, rotation, nearest-neighbour scaling
@@ -352,6 +363,85 @@ back. Every engine it waits on is modelled, from the SDK's drivers:
   command 0x80 and raises INT_FLAG bit 31 (interrupt 31). A JPEG that
   would pass max_bs_thd stops early with stop_x / stop_y, as the firmware
   does. MPEG-4 is not built into the cameras' kernels.
+
+## The digital twin
+
+With `sensor=ov2715` the camera looks at a scene, and the vendor's own 3A
+loop -- `fisp_algorithm.ko`'s AE and AWB, in the kernel -- closes through
+the models: the scene, lit, through the exposure the sensor applied,
+gives the ISP's statistics; AE and AWB answer with I2C writes to the
+sensor and gains in the ISP; the next frames show them. It is
+HiSilicon's twin (`docs/hisilicon-digital-twin.md`) on Grain Media's
+registers, and shares its scene and its tools.
+
+- **The scene** is `hisi-scene` at `/machine/scene`: grey bars, or a PPM /
+  PFM (`-global hisi-scene.file=`), lit by `light` (white's 16-bit raw
+  level a row at 1x gain) and `light-r` / `light-b` (the light's colour
+  as the sensor sees it, per mille of G), settable with `qom-set` while
+  the guest runs or played from a `timeline` file.
+- **The sensor** is `ov2710-sensor` (`hw/i2c/ov2710.c`), from what
+  `fisp_ov2715.ko` writes: exposure in 0x3500-0x3502 (rows x 16), extra
+  frame rows in 0x350C / 0x350D when the exposure needs more than VTS - 6,
+  gain (1 + 0x350A[0]) x 2^(bits of 0x350B[7:4]) x (1 + 0x350B[3:0] / 16),
+  written inside a group hold (0x3212: 0x00 open, 0x10 end, 0xA0 launch).
+  The driver keeps VTS at 1104 and sets the frame rate with HTS = 90 MHz
+  / fps / VTS (2717 at 30 frames/s; its pixel clock from a 27 MHz XCLK),
+  so a frame is HTS x (VTS + extra) / 90 MHz. Exposure, gain and frame
+  length take effect at the next frame start, the group's when it is
+  launched (`hw/i2c/sensor-sync.h`: `frame`, `latches`, `violations`,
+  `trace-i2c`, `late-latch` on the sensor).
+- **The ISP** (`gm-isp`) measures the scene while the driver has it on
+  (func0 bit 31), so the scene's clock starts with the ISP. Per frame:
+  the reflectance on a grid of one sample per 8 x 8 pixels, times the
+  light, times rows x gain of the exposure the sensor applied, clipped at
+  full scale; then the white balance gains (0x254 R [9:0] / G [21:12],
+  0x258 B, 128 = 1x) and the global gain (0x250, 128 = 1x), from
+  `isp_hal_set_color_gain` / `isp_hal_set_global_gain`. AE windows (R, G, B
+  sums of a quarter of each window's pixels) go through the AE pre-gamma
+  the algorithm programs at 0x640 (19 halfwords: knots x[6], y[6] on an
+  8-bit scale, seven slopes in 1/256; its default is close to 1/2.2), the
+  histogram through the one at 0x670. AWB (0x2A00) has R / G and B / G
+  ratio sums in 1/128 over its window's 2x2 blocks, from the linear 12-bit
+  samples after the gains -- `awb_process` scales the gains it has by
+  what it measures, so it reads them after white balance. AF is the
+  window's horizontal gradient energy.
+- **The picture**: `gm-vcap` paints the scene through the same exposure,
+  light and gains with a 1/2.2 gamma (`hisi_scene_display_row()`; not the
+  ISP's own curve, `[GM]` in `isp328_<sensor>.cfg`), the frame number in
+  16 binary squares along the top twelfth, so the H.264 shows what AE and
+  AWB did.
+
+`-global gm-isp.record=FILE` writes a CSV line a measured frame with
+`hisi-vi`'s columns (scene time, light, rows, gain, raw R / G / B means,
+WB gains, sensor violations), which `qemu-boot/twin-metrics.py` reads;
+`-global gm-isp.stats-trace=on` prints what AE / AWB see once a second.
+`qemu-boot/test-grainmedia-scenario.sh` (CI, in the gm8136 boot job) boots
+the OpenIPC release with `sensor=ov2715` -- `load_grainmedia` finds it
+through `ipcinfo`, loads the ISP modules, and majestic streams -- plays a
+quarter-light dip and a warmer light, and checks the record:
+
+    t             light                 G   level settle   over exposure   gain  AWB R/B vs G
+      0.0-20.0    600 902/808         739     +0%   0.5s    21%       39  1.000  -5% / -10%
+     20.0-35.0    150 902/808         753     +2%   0.3s    19%      159  1.000  -5% / -10%
+     35.0-50.0    600 902/808         815    +10%   0.4s    23%       43  1.000  -5% / -10%
+     50.0-67.5    600 1000/760        815    +10%   0.0s     0%       43  1.000  +0% / -12%
+
+(`-icount shift=0`, so a run repeats; the warm light moves the gains
+from R 1.05 / B 1.12 to R 1.02 / B 1.15.)
+
+AE holds its level to within its dead band (`converge_th` 10 around
+`target_y` 110, in the pre-gamma's domain: about ±20 % in linear light,
+so the script holds levels to 25 %).
+AWB keeps its gains inside the sensor's calibrated range
+(`isp328_ov2715.cfg` `[AWB]`), so the scenario lights the room at a grey
+it reaches (R 0.90 / B 0.81 of G): at the `SUN_LIGHT` preset's grey (R
+164 / B 190 of 128) it stopped 10-17 % short of neutral.
+
+Inferred, not read from a driver: that the AE sums count a quarter of a
+window's pixels per colour (they are what makes the algorithm's (R + 2G +
+B) / area its luma), the AWB block ratios' unit, and where in the
+pipeline the statistics are taken relative to black level and lens
+shading (neither is modelled).
 
 ## Audio
 
@@ -415,8 +505,9 @@ other small peripherals.
 
 ## Not modelled
 
-The ISP's image processing (its frames are the capture's OpenIPC logo
-picture; the statistics describe a fixed grey scene), the MCP100's
+The ISP's own image processing (black level, lens shading, noise
+reduction, colour matrix, its gamma curve: the picture is the scene
+through exposure, white balance and a fixed 1/2.2 gamma), the MCP100's
 MPEG-4 (not in the cameras' kernels), the LCD's output, and the timing
 of the PWM outputs.
 
