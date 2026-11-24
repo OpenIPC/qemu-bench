@@ -64,8 +64,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(GmFtmac110State, GM_FTMAC110)
 #define CR_RCV          (1u << 8)
 #define CR_HT_MULTI     (1u << 9)
 #define CR_RCV_ALL      (1u << 12)
-#define CR_MULTI        (1u << 17)
-#define CR_BROAD        (1u << 18)
+#define CR_MULTI        (1u << 16)
+#define CR_BROAD        (1u << 17)
+#define CR_100M         (1u << 18)
 
 #define PHYCR_READ      (1u << 26)
 #define PHYCR_WRITE     (1u << 27)
@@ -110,6 +111,12 @@ static void ftmac_desc(hwaddr a, uint32_t *d, bool write)
     }
 }
 
+/* at the wrong speed for the link (100 Mbit, always) nothing passes */
+static bool ftmac_link(GmFtmac110State *s)
+{
+    return s->regs[R_MACCR / 4] & CR_100M;
+}
+
 static void ftmac_transmit(GmFtmac110State *s)
 {
     int n;
@@ -141,7 +148,9 @@ static void ftmac_transmit(GmFtmac110State *s)
                 l = 60;
             }
             s->txlen = 0;
-            qemu_send_packet(qemu_get_queue(s->nic), s->txbuf, l);
+            if (ftmac_link(s)) {
+                qemu_send_packet(qemu_get_queue(s->nic), s->txbuf, l);
+            }
             s->regs[R_ISR / 4] |= INT_XPKT_OK;
         }
         d[0] = 0;
@@ -191,7 +200,7 @@ static ssize_t ftmac_receive(NetClientState *nc, const uint8_t *buf,
     bool first = true;
 
     if ((s->regs[R_MACCR / 4] & (CR_RDMA | CR_RCV)) != (CR_RDMA | CR_RCV) ||
-        size > 1518 || size < ETH_HLEN || !ftmac_wanted(s, buf)) {
+        !ftmac_link(s) || size > 1518 || size < ETH_HLEN || !ftmac_wanted(s, buf)) {
         return size;
     }
     memcpy(frame, buf, size);
