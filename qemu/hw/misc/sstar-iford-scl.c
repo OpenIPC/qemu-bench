@@ -4,7 +4,10 @@
  * mi_scl.ko programs each output's write DMA from the CMDQ.  From its
  * _HAL_SCL_CHIP_SetBufCfg and the commands of a running pipeline, bank
  * 0x1253 is port 0, plane by plane, 0x20 registers apart (Y at 0, C at
- * 0x20):
+ * 0x20).  Ports 1 to 3 are the next banks, 0x1254 to 0x1256, laid out the
+ * same: OpenIPC's majestic runs its second stream from port 2 (bank 0x1255,
+ * 1280x720 into four buffers in turn, which mi_scl hands to the encoder in
+ * frame mode):
  *
  *   0x00 bit 0 enable, bit 4 start of a frame
  *   0x02 the width in 16-pixel units   0x03 the height in rows
@@ -38,7 +41,8 @@
 #define TYPE_SSTAR_IFORD_SCL "sstar-iford-scl"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
 
-#define SCL_REGS            0x80
+#define SCL_REGS            0x80        /* one port: a bank */
+#define SCL_PORTS           4
 #define PLANE_C             0x20
 #define R_CTRL              0x00
 #define R_WIDTH16           0x02
@@ -54,7 +58,7 @@ struct SstarIfordSclState {
 
     MemoryRegion iomem;
     Object *isp;
-    uint16_t regs[SCL_REGS];
+    uint16_t regs[SCL_PORTS * SCL_REGS];
     uint32_t frame;
     bool trace;
     int w;
@@ -68,13 +72,14 @@ static void scl_write_mem(uint64_t miu, const uint8_t *p, size_t len)
     sstar_miu_rw(miu, (void *)p, len, true);
 }
 
-static void scl_frame(SstarIfordSclState *s)
+static void scl_frame(SstarIfordSclState *s, int port)
 {
-    int w = s->regs[R_WIDTH16] * 16, h = s->regs[R_HEIGHT];
-    uint32_t pitch = s->regs[R_PITCH];
-    uint64_t ya = ((uint64_t)s->regs[R_ADDR_HI] << 16 | s->regs[R_ADDR_LO]) << 4;
-    uint64_t ca = ((uint64_t)s->regs[PLANE_C + R_ADDR_HI] << 16 |
-                   s->regs[PLANE_C + R_ADDR_LO]) << 4;
+    const uint16_t *pr = s->regs + port * SCL_REGS;
+    int w = pr[R_WIDTH16] * 16, h = pr[R_HEIGHT];
+    uint32_t pitch = pr[R_PITCH];
+    uint64_t ya = ((uint64_t)pr[R_ADDR_HI] << 16 | pr[R_ADDR_LO]) << 4;
+    uint64_t ca = ((uint64_t)pr[PLANE_C + R_ADDR_HI] << 16 |
+                   pr[PLANE_C + R_ADDR_LO]) << 4;
     const uint8_t *py, *puv;
     int pw, ph, x, y;
 
@@ -115,8 +120,8 @@ static void scl_frame(SstarIfordSclState *s)
         scl_write_mem(ca + y * pitch, s->row, w);
     }
     if (s->trace) {
-        qemu_log("sstar-iford-scl: frame %u %dx%d from %dx%d\n", s->frame, w, h,
-                 pw, ph);
+        qemu_log("sstar-iford-scl: port %d frame %u %dx%d from %dx%d\n", port,
+                 s->frame, w, h, pw, ph);
     }
     s->frame++;
 }
@@ -161,7 +166,7 @@ bool sstar_iford_scl_ring(uint64_t ya, int w, int h, uint8_t *dy, uint8_t *duv)
 static uint64_t scl_read(void *opaque, hwaddr off, unsigned size)
 {
     SstarIfordSclState *s = opaque;
-    int r = (off >> 2) & (SCL_REGS - 1);
+    int r = (off >> 2) % (SCL_PORTS * SCL_REGS);
     uint16_t v;
 
     if ((off & 3) >= 2) {
@@ -177,7 +182,7 @@ static uint64_t scl_read(void *opaque, hwaddr off, unsigned size)
 static void scl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     SstarIfordSclState *s = opaque;
-    int r = (off >> 2) & (SCL_REGS - 1);
+    int r = (off >> 2) % (SCL_PORTS * SCL_REGS);
     uint16_t v = s->regs[r];
 
     if ((off & 3) >= 2) {
@@ -189,9 +194,15 @@ static void scl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     } else {
         v = val;
     }
-    s->regs[r] = v;
-    if (r == R_CTRL && (v & CTRL_START)) {
-        scl_frame(s);
+    /*
+     * The start bit triggers one frame and does not stay set: mi_scl writes
+     * the control register again with masked read-modify-writes (port 2's
+     * disable, mask 0x8001, while its buffers are being freed), and a start
+     * bit left standing would write a frame to a buffer it no longer owns.
+     */
+    s->regs[r] = v & (r % SCL_REGS == R_CTRL ? ~CTRL_START : 0xFFFF);
+    if (r % SCL_REGS == R_CTRL && (v & CTRL_START)) {
+        scl_frame(s, r / SCL_REGS);
     }
 }
 
@@ -210,7 +221,7 @@ static void scl_init(Object *obj)
     SstarIfordSclState *s = SSTAR_IFORD_SCL(obj);
 
     memory_region_init_io(&s->iomem, obj, &scl_ops, s, TYPE_SSTAR_IFORD_SCL,
-                          SCL_REGS * 4);
+                          SCL_PORTS * SCL_REGS * 4);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     scl_state = s;
 }

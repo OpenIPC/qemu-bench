@@ -2563,10 +2563,35 @@ def test_ssc029(qemu, tmp):
         check('SCL: chroma is the scene\'s, not zero',
               qt.readb(0x60002000) != 0, True)
 
+        # Port 2, the next bank but one, writes its own buffers (majestic's
+        # second stream), and port 0's start does not write them
+        qt.writew(mmu, 0)
+        p2 = riu(0x1255, 0)
+        y2, c2 = 0x800000, 0x806000
+        qt.writew(p2 + 0x02 * 4, 0x50)              # 1280
+        qt.writew(p2 + 0x03 * 4, 16)
+        qt.writew(p2 + 0x05 * 4, 0x500)
+        for n, a in ((0, y2), (0x20, c2)):
+            qt.writew(p2 + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+            qt.writew(p2 + (n + 0x07) * 4, a >> 20)
+        qt.writew(scl, 0x10)
+        check('SCL: port 0\'s start leaves port 2\'s buffer alone',
+              qt.readl(DDR + y2), 0)
+        qt.writew(p2, 0x10)
+        check('SCL: port 2 writes a frame to its own buffer',
+              qt.readl(DDR + y2) != 0, True)
+        check('SCL: port 2\'s chroma is the scene\'s, not zero',
+              qt.readb(DDR + c2) != 0, True)
+        # start triggers one frame: a later write to the control register
+        # (mi_scl's masked disable) does not write the buffer again
+        qt.writel(DDR + y2, 0)
+        qt.writeb(p2 + 1, 0x00)                     # the low byte kept
+        check('SCL: the start bit does not stay set', qt.readw(p2) & 0x10, 0)
+        check('SCL: disabling the port writes no frame', qt.readl(DDR + y2), 0)
+
         # The image pipe: sensor, statistics, white balance, the scaler.  The
         # ISP's frame clock, group 0 bit 12, with the stats grids the driver
         # sets; the sensor's exposure over I2C, as the vendor's AE writes it.
-        qt.writew(mmu, 0)
         st = riu(0x131B, 0)
         ae, awb, histo = 0x500000, 0x501000, 0x509700
         for reg, base in ((0x08, ae), (0x0A, awb), (0x0C, histo)):
