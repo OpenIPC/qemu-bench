@@ -134,19 +134,35 @@ static void scl_frame(SstarIfordSclState *s, int port)
 }
 
 /*
- * infinity6c binds this output to the encoder as a ring: lines at a pitch of
+ * infinity6c binds an output to the encoder as a ring: lines at a pitch of
  * the sensor's width, fewer of them than the frame has, which the encoder
  * drains as they come.  The picture goes to it from here, as NV12 at the
- * encoder's size.
+ * encoder's size.  Both firmwares seen bind port 0 so; any port with the
+ * ring bit is taken, since scl_frame() writes no frame for it.
  */
+static bool scl_ring_port(SstarIfordSclState *s, uint64_t ya)
+{
+    int port;
+
+    for (port = 0; port < SCL_PORTS; port++) {
+        const uint16_t *pr = s->regs + port * SCL_REGS;
+
+        /* port 0 as before; ports 1 to 3 when bound as a ring */
+        if ((port == 0 || (pr[R_CTRL] & CTRL_RING)) &&
+            ya == ((uint64_t)pr[R_ADDR_HI] << 16 | pr[R_ADDR_LO]) << 4) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool sstar_iford_scl_ring(uint64_t ya, int w, int h, uint8_t *dy, uint8_t *duv)
 {
     SstarIfordSclState *s = scl_state;
     const uint8_t *py, *puv;
     int pw, ph, x, y;
 
-    if (!s || ya != ((uint64_t)s->regs[R_ADDR_HI] << 16 |
-                     s->regs[R_ADDR_LO]) << 4) {
+    if (!s || !scl_ring_port(s, ya)) {
         return false;
     }
     sstar_iford_isp_picture(s->isp, &py, &puv, &pw, &ph);

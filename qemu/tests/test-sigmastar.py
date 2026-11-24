@@ -4139,6 +4139,74 @@ def test_i6c_wave5_two(qemu, tmp):
         i6c_wave5_two(qemu, tmp, ack)
 
 
+def test_i6c_wave5_ring_port(qemu, tmp):
+    print('infinity6c Wave5: a source on a scaler ring port, whichever port')
+    path = i6_image(tmp, 'i6cr.bin')
+    wave = 0x1F34D000
+    dram = 0x22000000
+    src = 0x01100000
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101, 0x102))
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        qt.writel(wave + 0x14C, 0x20000)
+        cmd(0x0008)
+        qt.writel(wave + 0x11C, 64 << 16 | 64)
+        qt.writel(wave + 0x130, 1 << 16)    # every picture intra
+        cmd(0x0200)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + src + i, 0x80808080)
+        bs = 0x40000
+
+        def picture(k):
+            p = dram + k * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x18, bs)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x48, src)
+            qt.writel(p + 0x4C, src + 64 * 64)
+            qt.writel(p + 0x54, 64 << 16 | 64)
+            for i in range(0, 0x400, 4):
+                qt.writel(dram + bs + i, 0)
+            qt.writel(wave + 0x1F8, k + 1)
+            qt.step(20 * 1000000)
+            qt.writel(wave + 0x3C, 1)       # VINT_CLEAR: taken
+            qt.step(1000000)
+            return [qt.readl(dram + bs + i) for i in range(0, 0x400, 4)]
+
+        flat = picture(0)
+        check('Wave5: a picture from memory', any(flat), True)
+        # port 2 bound to the encoder as a ring at the source's address
+        p2 = riu(0x1255, 0)
+        qt.writew(p2 + 0x02 * 4, 0x04)              # 64
+        qt.writew(p2 + 0x03 * 4, 16)
+        qt.writew(p2 + 0x05 * 4, 64)
+        qt.writew(p2 + 0x06 * 4, (src >> 4) & 0xFFFF)
+        qt.writew(p2 + 0x07 * 4, src >> 20)
+        qt.writew(p2, 0x8001)
+        ring = picture(1)
+        check("Wave5: a source on ring port 2 is the scaler's picture, "
+              'not the memory behind it', ring != flat, True)
+        qt.writew(p2, 0x0001)                       # frame mode: memory
+        check('Wave5: the same port in frame mode is read from memory',
+              picture(2) == flat, True)
+    finally:
+        qt.close()
+
 def test_i6c_cmdq_mask(qemu, tmp):
     print('infinity6c CMDQ: the interrupt mask is reg 0x47')
     path = i6_image(tmp, 'i6cq.bin')
@@ -4570,6 +4638,7 @@ def main():
     test_i6c_media(args.qemu, tmp)
     test_i6c_cmdq_mask(args.qemu, tmp)
     test_i6c_wave5_two(args.qemu, tmp)
+    test_i6c_wave5_ring_port(args.qemu, tmp)
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_mmu_miss(args.qemu, tmp)
