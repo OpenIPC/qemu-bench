@@ -3837,6 +3837,32 @@ def test_i6c_mmu_miss(qemu, tmp):
         qt.close()
 
 
+def test_i6c_scl_unset(qemu, tmp):
+    print('infinity6c scaler: an output with no buffer set writes nothing')
+    path = i6_image(tmp, 'i6cs.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        scl = riu(0x1253, 0)
+        mark = 0xC0DEC0DE
+        for a in (0x20000000, 0x20000500, 0x20300000):
+            qt.writel(a, mark)
+        qt.writew(scl + 0x02 * 4, 0x50)
+        qt.writew(scl + 0x03 * 4, 16)
+        qt.writew(scl + 0x05 * 4, 0x500)
+        for n in (0x06, 0x07, 0x26, 0x27):
+            qt.writew(scl + n * 4, 0)
+        qt.writew(scl, 0x10)
+        check('SCL: MIU 0 is left alone', qt.readl(0x20000000), mark)
+        check('SCL: and the row after', qt.readl(0x20000500), mark)
+        qt.writew(scl + 0x07 * 4, 0x3)      # Y at MIU 0x300000, no chroma
+        qt.writew(scl, 0x10)
+        check('SCL: with a Y buffer, the frame is there',
+              qt.readl(0x20300000) != mark, True)
+        check('SCL: the chroma with none is not', qt.readl(0x20000000), mark)
+    finally:
+        qt.close()
+
+
 def i6c_wave5_two(qemu, tmp, ack):
     """Two instances' pictures queued at once; the host takes the first
     picture's end by ack: 'reason' (REASON_CLEAR with ENC_PIC), 'vint'
@@ -4362,6 +4388,7 @@ def main():
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_mmu_miss(args.qemu, tmp)
+    test_i6c_scl_unset(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)

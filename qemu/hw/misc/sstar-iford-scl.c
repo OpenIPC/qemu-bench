@@ -16,7 +16,10 @@
  * the ISP's last picture (sstar_iford_isp_picture()) is written to those
  * addresses as NV12, where the encoder takes it, at the output's size by
  * nearest neighbour.  The scaler's own registers beyond these are not read:
- * no crop, no filters.
+ * no crop, no filters.  infinity6c's mi_scl starts an output before it has
+ * given it a buffer: a plane whose address is still 0 is not written, as in
+ * sstar-i6e-scl [assumed: MIU 0 is the kernel's, so the hardware cannot be
+ * writing a frame there].
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -75,7 +78,7 @@ static void scl_frame(SstarIfordSclState *s)
     const uint8_t *py, *puv;
     int pw, ph, x, y;
 
-    if (!w || !h || w > 4096 || h > 4096 || pitch < w) {
+    if (!ya || !w || !h || w > 4096 || h > 4096 || pitch < w) {
         return;
     }
     if (s->w != w) {
@@ -96,7 +99,7 @@ static void scl_frame(SstarIfordSclState *s)
         }
         scl_write_mem(ya + y * pitch, s->row, w);
     }
-    for (y = 0; y < h / 2; y++) {
+    for (y = 0; ca && y < h / 2; y++) {
         const uint8_t *in = puv + (int64_t)y * (ph / 2) / (h / 2) * pw;
 
         if (w == pw) {
