@@ -435,6 +435,10 @@ static void gc_reset(DeviceState *dev)
         s->p0[s->id_reg & 0xFF] = s->id >> 8;
         s->p0[(s->id_reg + 1) & 0xFF] = s->id & 0xFF;
     }
+    if (s->id_reg == 0x0A) {    /* the OV77xx: OmniVision's ID too */
+        s->p0[0x1C] = 0x7F;
+        s->p0[0x1D] = 0xA2;
+    }
     if (s->reg16 && s->id == GC2083_ID) {
         int i;
 
