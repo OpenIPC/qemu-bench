@@ -368,7 +368,8 @@ static int sstar_miu_lookup(SstarRiuState *s, uint64_t a, uint64_t *pa,
             return SSTAR_MIU_PASS;
         }
         e = s->mmu[(a >> pg) & (MMU_ENTRIES - 1)];
-        if (e == MMU_INVALID) {
+        /* a reset leaves all ones, wider than an entry the driver writes */
+        if (e >= MMU_INVALID) {
             return SSTAR_MIU_MISS;
         }
     }

@@ -3690,11 +3690,16 @@ def test_i6c_bdma_mmu(qemu, tmp):
         check('BDMA: a copy reads through the MMU too',
               qt.readl(DRAM + 0x300000), 0x12345678)
         # a VPA page with no entry: nothing is behind it, nothing written
+        # (all ones, 0xFFFF << 17, in the bits that reach DRAM)
+        reset = DRAM + (0xFFFF << 17 & 0x07FFFFFF)
+        qt.writel(reset, 0)
         qt.writel(0x3FF40000, 0)
         st = bdma_run(qt, 0, 0x0004, 0, 0x3FF40000, 0x100)
         check('BDMA: a fill into an unmapped page completes', st & 8, 8)
         check('BDMA: and lands nowhere, not at the untranslated address',
               qt.readl(0x3FF40000), 0)
+        check('BDMA: nor where a reset entry would point',
+              qt.readl(reset), 0)
     finally:
         qt.close()
 
