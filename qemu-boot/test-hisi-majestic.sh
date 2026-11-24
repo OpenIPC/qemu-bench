@@ -97,7 +97,8 @@ if ! grep -q "Starting majestic: OK" "$WORK/console.log"; then
     exit 1
 fi
 case $ISP$SENSOR in
-1sc*|1gc*)      # SmartSens / GalaxyCore models report their exposure
+1sc*|1gc*|1imx335)  # SmartSens / GalaxyCore models and the IMX335 report
+                    # their exposure
     last=$(grep -a "^isp stats:" "$WORK/console.log" | tail -1)
     mean=$(echo "$last" | sed -n 's/.*G mean \([0-9]*\).*/\1/p')
     echo "AE: $last"

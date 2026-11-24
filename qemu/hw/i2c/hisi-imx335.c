@@ -10,7 +10,10 @@
  * sensor_imx335_mipi.c expo_reg, vts_reg and gain_reg): VMAX 0x3030-0x3032
  * and SHR0 0x3058-0x305A, 20 bits each, low byte first, the exposure being
  * VMAX - SHR0 rows; GAIN 0x30E8-0x30E9, 11 bits in 0.3 dB steps.  Out of
- * reset they are zero, which is one row at 0 dB, as before this was read.
+ * reset they are zero, which is one row at 0 dB.  The window, 2592x1944
+ * (its full-frame mode, SigmaStar's only one), is given only when the
+ * machine sets "window": HiSilicon's driver runs other modes too, and with
+ * no window given hisi-viu keeps the size its own registers set.
  *
  * Register space: 16-bit addresses (0x3000-0x3FFF), 8-bit data.
  * Protocol: master sends 2-byte register address, then reads/writes data.
@@ -40,6 +43,7 @@ struct HisiIMX335State {
     uint8_t  reg_ptr;       /* bytes received for register address */
     uint16_t cur_reg;       /* current register address */
     uint8_t  regs[IMX335_REG_COUNT];
+    bool     window;        /* report the 2592x1944 window */
 };
 
 static void hisi_imx335_reset_regs(HisiIMX335State *s)
@@ -128,8 +132,20 @@ static void hisi_imx335_exposure(Object *sensor, ImageSensorExposure *e)
     e->lines = vmax > shr ? vmax - shr : 1;
     e->vts = vmax;
     e->gain = lrint(1024 * pow(10, MIN(g, 240) * 0.3 / 20));   /* 72 dB */
-    e->width = 2592;
-    e->height = 1944;
+    if (s->window) {
+        e->width = 2592;
+        e->height = 1944;
+    }
+}
+
+static bool hisi_imx335_get_window(Object *obj, Error **errp)
+{
+    return HISI_IMX335(obj)->window;
+}
+
+static void hisi_imx335_set_window(Object *obj, bool value, Error **errp)
+{
+    HISI_IMX335(obj)->window = value;
 }
 
 static void hisi_imx335_reset(DeviceState *dev)
@@ -152,6 +168,10 @@ static void hisi_imx335_class_init(ObjectClass *klass, const void *data)
     k->recv = hisi_imx335_recv;
     k->send = hisi_imx335_send;
     IMAGE_SENSOR_CLASS(klass)->exposure = hisi_imx335_exposure;
+    object_class_property_add_bool(klass, "window", hisi_imx335_get_window,
+                                   hisi_imx335_set_window);
+    object_class_property_set_description(klass, "window",
+        "Report the full 2592x1944 window to the image pipeline");
 }
 
 static const TypeInfo hisi_imx335_info = {
