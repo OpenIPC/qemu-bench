@@ -2692,6 +2692,15 @@ def test_ssc029(qemu, tmp):
         qt.writeb(p2 + 1, 0x00)                     # the low byte kept
         check('SCL: the start bit does not stay set', qt.readw(p2) & 0x10, 0)
         check('SCL: disabling the port writes no frame', qt.readl(DDR + y2), 0)
+        # a ring port (bit 15, the encoder's hardware ring) writes nothing:
+        # its buffer holds a few lines, and the encoder takes the picture
+        # from the scaler (sstar_iford_scl_ring())
+        qt.writew(p2, 0x8011)
+        check('SCL: a ring port\'s start writes no frame to memory',
+              qt.readl(DDR + y2), 0)
+        qt.writew(p2, 0x0011)
+        check('SCL: the same port in frame mode writes it',
+              qt.readl(DDR + y2) != 0, True)
 
         # The image pipe: sensor, statistics, white balance, the scaler.  The
         # ISP's frame clock, group 0 bit 12, with the stats grids the driver

@@ -9,7 +9,10 @@
  * 1280x720 into four buffers in turn, which mi_scl hands to the encoder in
  * frame mode):
  *
- *   0x00 bit 0 enable, bit 4 start of a frame
+ *   0x00 bit 0 enable, bit 4 start of a frame, bit 15 a hardware ring
+ *        (set on the port bound to the encoder as a ring, clear on frame
+ *        ports: both firmwares' commands, and /proc/mi_modules/mi_scl's
+ *        "Ring" and "Frame" on a camera)
  *   0x02 the width in 16-pixel units   0x03 the height in rows
  *   0x05 the pitch in bytes
  *   0x06/0x07 the buffer, a MIU address in 16-byte units, which the MIU
@@ -18,11 +21,14 @@
  * What is modelled is the frame reaching memory: on the Y plane's start
  * the ISP's last picture (sstar_iford_isp_picture()) is written to those
  * addresses as NV12, where the encoder takes it, at the output's size by
- * nearest neighbour.  The scaler's own registers beyond these are not read:
- * no crop, no filters.  infinity6c's mi_scl starts an output before it has
- * given it a buffer: a plane whose address is still 0 is not written
- * [assumed: MIU 0 is the kernel's, so the hardware cannot be
- * writing a frame there].
+ * nearest neighbour.  A ring port writes nothing: its buffer holds a few
+ * lines, never a frame, and the encoder takes the picture from here
+ * (sstar_iford_scl_ring()); a whole frame written there ran past the ring and
+ * cost more than any other step of a frame (23 ms of 2592x1944).  The
+ * scaler's own registers beyond these are not read: no crop, no filters.
+ * infinity6c's mi_scl starts an output before it has given it a buffer: a
+ * plane whose address is still 0 is not written [assumed: MIU 0 is the
+ * kernel's, so the hardware cannot be writing a frame there].
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -51,7 +57,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
 #define R_ADDR_LO           0x06
 #define R_ADDR_HI           0x07
 #define CTRL_START          (1u << 4)
-
+#define CTRL_RING           (1u << 15)
 
 struct SstarIfordSclState {
     SysBusDevice parent_obj;
@@ -83,7 +89,8 @@ static void scl_frame(SstarIfordSclState *s, int port)
     const uint8_t *py, *puv;
     int pw, ph, x, y;
 
-    if (!w || !h || w > 4096 || h > 4096 || pitch < w) {
+    if (!w || !h || w > 4096 || h > 4096 || pitch < w ||
+        (pr[R_CTRL] & CTRL_RING)) {
         return;
     }
     if (s->w != w) {
