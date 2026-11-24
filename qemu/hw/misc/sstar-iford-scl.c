@@ -31,8 +31,6 @@
 #include "hw/misc/sstar-riu.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 
 #define TYPE_SSTAR_IFORD_SCL "sstar-iford-scl"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
@@ -47,8 +45,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
 #define R_ADDR_HI           0x07
 #define CTRL_START          (1u << 4)
 
-#define SCL_DRAM_BASE       0x20000000
-#define SCL_PAGE            4096
 
 struct SstarIfordSclState {
     SysBusDevice parent_obj;
@@ -66,16 +62,7 @@ static SstarIfordSclState *scl_state;
 
 static void scl_write_mem(uint64_t miu, const uint8_t *p, size_t len)
 {
-    while (len) {
-        size_t n = MIN(len, SCL_PAGE - (miu & (SCL_PAGE - 1)));
-
-        dma_memory_write(&address_space_memory,
-                         SCL_DRAM_BASE + sstar_miu_xlate(miu), p, n,
-                         MEMTXATTRS_UNSPECIFIED);
-        miu += n;
-        p += n;
-        len -= n;
-    }
+    sstar_miu_rw(miu, (void *)p, len, true);
 }
 
 static void scl_frame(SstarIfordSclState *s)

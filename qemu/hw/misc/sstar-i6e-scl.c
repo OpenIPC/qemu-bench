@@ -44,8 +44,6 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 
 #define TYPE_SSTAR_I6E_SCL "sstar-i6e-scl"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarI6eSclState, SSTAR_I6E_SCL)
@@ -62,8 +60,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarI6eSclState, SSTAR_I6E_SCL)
 #define R_IRQ_FLAG          0x13
 #define IRQ_WORDS           3
 
-#define SCL_DRAM_BASE       0x20000000
-#define SCL_PAGE            4096
 #define SCL_MAX_DIM         4096
 #define SCL_MMU_PAGE        (128 * KiB)
 #define SCL_RING_PAGES      256
@@ -87,18 +83,7 @@ static SstarI6eSclState *scl_state;
 
 static void scl_put(uint64_t miu, const uint8_t *p, size_t len)
 {
-    while (len) {
-        size_t n = MIN(len, SCL_PAGE - (miu & (SCL_PAGE - 1)));
-
-        if (!sstar_miu_missed(miu)) {
-            dma_memory_write(&address_space_memory,
-                             SCL_DRAM_BASE + sstar_miu_xlate(miu), p, n,
-                             MEMTXATTRS_UNSPECIFIED);
-        }
-        miu += n;
-        p += n;
-        len -= n;
-    }
+    sstar_miu_rw(miu, (void *)p, len, true);
 }
 
 static uint64_t scl_addr(SstarI6eSclState *s, int reg)

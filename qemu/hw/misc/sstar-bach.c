@@ -80,8 +80,6 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 #include "hw/irq.h"
 #include "hw/misc/sstar-riu.h"
 #include "hw/qdev-properties.h"
@@ -137,8 +135,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarBachState, SSTAR_BACH)
 #define TEST_CTRL7          R(0xEE)
 #define RD_MONO             (1u << 15)
 #define OUT_RING            (64 * KiB)
-#define SS_DRAM_BASE        0x20000000
-#define SS_PAGE             4096
 
 struct SstarBachState {
     SysBusDevice parent_obj;
@@ -291,15 +287,7 @@ static void rd_play(SstarBachState *s, uint32_t n)
 
         if (s->vout) {
             /* through the MIU's MMU where a die has one */
-            for (i = 0; i < k; ) {
-                uint32_t run = MIN(k - i,
-                                   SS_PAGE - ((a + i) & (SS_PAGE - 1)));
-
-                dma_memory_read(&address_space_memory,
-                                SS_DRAM_BASE + sstar_miu_xlate(a + i),
-                                buf + i, run, MEMTXATTRS_UNSPECIFIED);
-                i += run;
-            }
+            sstar_miu_rw(a, buf, k, false);
             for (i = 0; i < k && s->out_len < OUT_RING; i++) {
                 s->out[(s->out_head + s->out_len++) % OUT_RING] = buf[i];
             }
@@ -412,14 +400,7 @@ static void bach_fill(SstarBachState *s, uint32_t n)
             buf[i + 1] = (v >> 8) & 0xFF;
         }
         /* DMA goes through the MIU's MMU where a die has one */
-        for (i = 0; i < chunk; ) {
-            uint32_t run = MIN(chunk - i, SS_PAGE - ((a + i) & (SS_PAGE - 1)));
-
-            dma_memory_write(&address_space_memory,
-                             SS_DRAM_BASE + sstar_miu_xlate(a + i), buf + i,
-                             run, MEMTXATTRS_UNSPECIFIED);
-            i += run;
-        }
+        sstar_miu_rw(a, buf, chunk, true);
         s->wptr = (s->wptr + chunk) % size;
         n -= chunk;
     }

@@ -22,7 +22,7 @@
  * hal_jpe_ios.c), whose JPE is this one.
  *
  * Its addresses go through the MIU's MMU where the die has one
- * (sstar_miu_page), a page at a time, a page with no entry skipped:
+ * (sstar_miu_rw_cpu), a page at a time, a page with no entry skipped:
  * infinity6c's buffers are MMA, VPA addresses.
  *
  * Here a fired frame completes "done-us" later with a placeholder in the
@@ -39,8 +39,6 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
-#include "system/address-spaces.h"
-#include "system/dma.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
@@ -79,7 +77,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarJpeState, SSTAR_JPE)
 #define HDR_MAX             2048
 #define OUT_MAX             (8 * MiB)   /* a scan larger is not coded */
 #define DIM_MAX             8192
-#define SS_DRAM_BASE        0x20000000
 
 struct SstarJpeState {
     SysBusDevice parent_obj;
@@ -249,33 +246,7 @@ static void sstar_jpe_update_irq(SstarJpeState *s)
 static MemTxResult jpe_mem(uint32_t miu16, void *buf, size_t len,
                            bool write)
 {
-    uint64_t a = (uint64_t)miu16 << 4;
-    uint8_t *p = buf;
-    MemTxResult r = MEMTX_OK;
-
-    while (len) {
-        uint64_t m;
-        bool missed;
-        size_t n = sstar_miu_page(a, len, &m, &missed);
-        hwaddr pa = m < SS_DRAM_BASE ? SS_DRAM_BASE + m : m;
-
-        /* a page with no MMU entry: nothing is behind it on the bus */
-        if (missed) {
-            if (!write) {
-                memset(p, 0, n);
-            }
-            r |= MEMTX_DECODE_ERROR;
-        } else {
-            r |= write ? dma_memory_write(&address_space_memory, pa, p, n,
-                                          MEMTXATTRS_UNSPECIFIED)
-                       : dma_memory_read(&address_space_memory, pa, p, n,
-                                         MEMTXATTRS_UNSPECIFIED);
-        }
-        a += n;
-        p += n;
-        len -= n;
-    }
-    return r;
+    return sstar_miu_rw_cpu((uint64_t)miu16 << 4, buf, len, write);
 }
 
 static void jpe_set32(SstarJpeState *s, int reg, uint32_t v)

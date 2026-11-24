@@ -75,5 +75,13 @@ bool sstar_miu_missed(uint64_t addr);
  * has no entry (*missed: nothing is behind it, so the access is skipped).
  */
 size_t sstar_miu_page(uint64_t addr, size_t len, uint64_t *pa, bool *missed);
+/*
+ * A bus master's transfer through the MIU MMU, a page at a time: a page with
+ * no entry is skipped (a read gives zeros) and reported as a decode error.
+ * The second takes an untranslated address from DRAM's CPU base up as the
+ * CPU's own, for the blocks whose drivers program either.
+ */
+MemTxResult sstar_miu_rw(uint64_t addr, void *buf, size_t len, bool write);
+MemTxResult sstar_miu_rw_cpu(uint64_t addr, void *buf, size_t len, bool write);
 
 #endif /* HW_MISC_SSTAR_RIU_H */
