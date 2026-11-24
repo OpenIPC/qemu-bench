@@ -2440,6 +2440,51 @@ def test_iford_imx335(qemu, tmp):
         check('IMX335: 6 dB of gain (20 steps of 0.3), twice the mean Y '
               '(%.1f, %.1f)' % (low, gained),
               low > 0 and 1.7 < gained / low < 2.3, True)
+
+        # The scene keeps its shape in a 4:3 window: through the scaler, at
+        # 4:3 the dot is round, and an output stretched to 16:9 stretches it,
+        # as an uncropped 4:3 sensor does on silicon.  The window here is the
+        # AE grid, 32 x 32 blocks: 80 x 45 pixels each is 2560x1440 (16:9),
+        # 80 x 60 is 2560x1920 (4:3).
+        expose(1000)
+        scl = riu(0x1253, 0)
+
+        def dot_shape(w, h, rows):
+            """the dot's width over its height in a w x h output; @rows the
+            band of the height that holds it, below the logo and above the
+            wedge"""
+            ya, ca = 0x600000, 0x700000
+            qt.writew(scl + 0x02 * 4, w // 16)
+            qt.writew(scl + 0x03 * 4, h)
+            qt.writew(scl + 0x05 * 4, w)
+            for n, a in ((0, ya), (0x20, ca)):
+                qt.writew(scl + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+                qt.writew(scl + (n + 0x07) * 4, a >> 20)
+            qt.writew(scl, 0x10)
+            y0, y1 = int(h * rows[0]), int(h * rows[1])
+            reply = qt.cmd('read 0x%x 0x%x' % (DDR + ya + y0 * w,
+                                               (y1 - y0) * w))
+            pix = bytes.fromhex(reply.split()[1][2:])
+            top = max(pix)
+            xs = [i % w for i, v in enumerate(pix) if v > top * 0.6]
+            ys = [i // w for i, v in enumerate(pix) if v > top * 0.6]
+            if not xs:
+                return 0.0
+            return (max(xs) - min(xs) + 1) / (max(ys) - min(ys) + 1)
+
+        # a 16:9 window: the scene fills it, as it always did (dot 74-86 %)
+        wide_win = dot_shape(640, 360, (0.72, 0.875))
+        check('Scene: a 16:9 window and output, the dot round (w/h %.2f)' %
+              wide_win, 0.9 < wide_win < 1.1, True)
+        # a 4:3 window: the scene at one scale, centred (dot 68-77 %)
+        qt.writew(st + 0x31 * 4, 59)
+        expose(1000)
+        square = dot_shape(640, 480, (0.66, 0.785))
+        wide = dot_shape(640, 360, (0.66, 0.785))
+        check('Scene: a 4:3 window keeps its shape, a 4:3 output\'s dot '
+              'round (w/h %.2f)' % square, 0.9 < square < 1.1, True)
+        check('Scene: a 16:9 output of it stretches it 4/3 wide (w/h %.2f)' %
+              wide, 1.2 < wide < 1.45, True)
     finally:
         qt.close()
 

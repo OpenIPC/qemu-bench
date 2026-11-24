@@ -220,6 +220,48 @@ static uint16_t isp_scene_site(int dot, int w, int h, int x, int y, int c,
     return lrint(v * (1 << REFL_SHIFT));
 }
 
+/*
+ * The scene is laid out in 1920x1080 (sstar-pattern.h); a window of another
+ * shape (an IMX335's, 4:3) shows it at one scale, centred, with the
+ * background beyond it, so that it keeps its shape as a lens's view would,
+ * and an output stretched to another aspect shows that stretch, as on
+ * silicon.  A 16:9 window maps as it always did.
+ */
+static void isp_view(int w, int h, int *sw, int *sh, int *ox, int *oy)
+{
+    if ((int64_t)w * SSTAR_PAT_H >= (int64_t)h * SSTAR_PAT_W) {
+        *sh = h;
+        *sw = MIN((int64_t)h * SSTAR_PAT_W / SSTAR_PAT_H, w);
+    } else {
+        *sw = w;
+        *sh = MIN((int64_t)w * SSTAR_PAT_H / SSTAR_PAT_W, h);
+    }
+    *ox = (w - *sw) / 2;
+    *oy = (h - *sh) / 2;
+}
+
+static void isp_navy_at(int w, int h, int y, double *rgb)
+{
+    int sw, sh, ox, oy;
+
+    isp_view(w, h, &sw, &sh, &ox, &oy);
+    isp_scene_navy(MIN(MAX(y - oy, 0), sh - 1), sh, rgb);
+}
+
+static uint16_t isp_site_at(int dot, int w, int h, int x, int y, int c,
+                            const double *navy)
+{
+    int sw, sh, ox, oy;
+
+    isp_view(w, h, &sw, &sh, &ox, &oy);
+    x -= ox;
+    y -= oy;
+    if (x < 0 || y < 0 || x >= sw || y >= sh) {
+        return lrint(navy[c] * (1 << REFL_SHIFT));
+    }
+    return isp_scene_site(dot, sw, sh, x, y, c, navy);
+}
+
 static void isp_window(SstarIfordIspState *s, int w, int h)
 {
     int x, y;
@@ -242,9 +284,9 @@ static void isp_window(SstarIfordIspState *s, int w, int h)
     for (y = 0; y < h; y++) {
         double navy[3];
 
-        isp_scene_navy(y, h, navy);
+        isp_navy_at(w, h, y, navy);
         for (x = 0; x < w; x++) {
-            s->refl[y * w + x] = isp_scene_site(ISP_NO_DOT, w, h, x, y,
+            s->refl[y * w + x] = isp_site_at(ISP_NO_DOT, w, h, x, y,
                                                 isp_site(x, y), navy);
         }
     }
@@ -257,12 +299,16 @@ static void isp_sensor(SstarIfordIspState *s, const ImageSensorExposure *e)
     double expo = (double)e->lines * e->gain / 1024 * s->light / 1e6;
     uint32_t mul[3];
     int dot = sstar_pattern_dot_x(s->frames);
-    int dx0 = MAX((dot - SSTAR_PAT_DOT_R) * w / SSTAR_PAT_W - 2, 0);
-    int dx1 = MIN((dot + SSTAR_PAT_DOT_R) * w / SSTAR_PAT_W + 2, w - 1);
-    int dy0 = MAX((SSTAR_PAT_DOT_Y - SSTAR_PAT_DOT_R) * h / SSTAR_PAT_H - 2, 0);
-    int dy1 = MIN((SSTAR_PAT_DOT_Y + SSTAR_PAT_DOT_R) * h / SSTAR_PAT_H + 2,
-                  h - 1);
+    int sw, sh, ox, oy, dx0, dx1, dy0, dy1;
     int x, y;
+
+    isp_view(w, h, &sw, &sh, &ox, &oy);
+    dx0 = MAX(ox + (dot - SSTAR_PAT_DOT_R) * sw / SSTAR_PAT_W - 2, 0);
+    dx1 = MIN(ox + (dot + SSTAR_PAT_DOT_R) * sw / SSTAR_PAT_W + 2, w - 1);
+    dy0 = MAX(oy + (SSTAR_PAT_DOT_Y - SSTAR_PAT_DOT_R) * sh / SSTAR_PAT_H - 2,
+              0);
+    dy1 = MIN(oy + (SSTAR_PAT_DOT_Y + SSTAR_PAT_DOT_R) * sh / SSTAR_PAT_H + 2,
+              h - 1);
 
     /* 12 bits of output per unit reflectance, as 16.16 of a 2.14 input */
     mul[C_R] = MIN(expo * s->light_r / 1000 * ISP_FULL * 4, UINT32_MAX);
@@ -284,10 +330,10 @@ static void isp_sensor(SstarIfordIspState *s, const ImageSensorExposure *e)
     for (y = dy0; y <= dy1; y++) {
         double navy[3];
 
-        isp_scene_navy(y, h, navy);
+        isp_navy_at(w, h, y, navy);
         for (x = dx0; x <= dx1; x++) {
             int c = isp_site(x, y);
-            uint64_t v = isp_scene_site(dot, w, h, x, y, c, navy);
+            uint64_t v = isp_site_at(dot, w, h, x, y, c, navy);
 
             s->bayer[y * w + x] = MIN((v * mul[c]) >> 16, ISP_FULL);
         }
