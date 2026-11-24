@@ -2385,6 +2385,65 @@ def test_iford_storage(qemu, tmp):
         qt.close()
 
 
+def test_iford_imx335(qemu, tmp):
+    print('Iford image pipe with an IMX335: its exposure and gain registers')
+    path = os.path.join(tmp, 'iford-imx335.bin')
+    img = bytearray(b'\xFF' * 0x1000000)
+    img[0:12] = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    open(path, 'wb').write(img)
+    qt = QTest(qemu, 'ssc029,flash-file=' + path + ',sensor=imx335', [])
+    try:
+        st = riu(0x131B, 0)
+        ae, awb, histo = 0x500000, 0x501000, 0x509700
+        for reg, base in ((0x08, ae), (0x0A, awb), (0x0C, histo)):
+            qt.writew(st + reg * 4, (base >> 4) & 0xFFFF)
+            qt.writew(st + (reg + 1) * 4, base >> 20)
+        for reg, val in ((0x30, 79), (0x31, 44), (0x32, 31), (0x33, 31),
+                         (0x40, 19), (0x41, 15), (0x42, 127), (0x43, 89),
+                         (0x02, 0x1111)):
+            qt.writew(st + reg * 4, val)
+        qt.writew(riu(0x1302, 0x28), 0xEFFF)
+
+        def sensor(reg, val):
+            """one register over MIIC, 16-bit address as the IMX335 takes"""
+            i2c = 0x1F222A00
+            qt.writew(i2c + 0x00 * 4, 0)
+            qt.writeb(i2c + 0x01 * 4, 1)
+            for b in (0x1A << 1, reg >> 8, reg & 0xFF, val):
+                qt.writew(i2c + 0x02 * 4, b)
+            qt.writeb(i2c + 0x01 * 4 + 1, 1)
+
+        def mean():
+            qt.step(50000000)
+            d = [qt.readb(DDR + ae + 4 * i + 3) for i in range(32 * 32)]
+            return sum(d) / len(d)
+
+        def expose(rows, gain=0):
+            """VMAX 1125 and SHR0 below it, low byte first, as
+            sensor_imx335_mipi.c writes them; the gain in 0.3 dB steps"""
+            for base, v in ((0x3030, 1125), (0x3058, 1125 - rows)):
+                for i in range(3):
+                    sensor(base + i, (v >> (8 * i)) & 0xFF)
+            sensor(0x30E8, gain & 0xFF)
+            sensor(0x30E9, gain >> 8)
+            return mean()
+
+        dark = mean()
+        low = expose(50)
+        high = expose(100)
+        check('IMX335: out of reset one row, darker than 50 (%.1f, %.1f)' %
+              (dark, low), dark < low, True)
+        check('IMX335: twice the rows (VMAX - SHR0), twice the mean Y '
+              '(%.1f, %.1f)' % (low, high),
+              low > 0 and 1.7 < high / low < 2.3, True)
+        gained = expose(50, 20)
+        check('IMX335: 6 dB of gain (20 steps of 0.3), twice the mean Y '
+              '(%.1f, %.1f)' % (low, gained),
+              low > 0 and 1.7 < gained / low < 2.3, True)
+    finally:
+        qt.close()
+
+
 def test_ssc029(qemu, tmp):
     print('ssc029 (Iford): GICv3, the boot FSP, the DRAM test and the XZ decoder')
     path = os.path.join(tmp, 'iford.bin')
@@ -4431,6 +4490,7 @@ def main():
     test_sensor_catalogue(args.qemu)
     test_msc313e_sd(args.qemu, tmp)
     test_ssc029(args.qemu, tmp)
+    test_iford_imx335(args.qemu, tmp)
     test_ssc029_rtcpwc(args.qemu, tmp)
     test_ssc029_power_off(args.qemu, tmp)
     test_ssc029_smp(args.qemu, tmp)
