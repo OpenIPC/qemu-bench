@@ -13,7 +13,7 @@
  *   0x92500000 FTMAC110 Ethernet                    hw/net/gm-ftmac110.c
  *   0x92600000 FTDMAC020                            hw/dma/gm-dmac.c
  *   0x92700000 FTAES020                             hw/misc/fh-aes.c
- *   0x92800000 FTSDC010, no card                    hw/sd/gm-sdc010.c
+ *   0x92800000 FTSDC010, a micro-SD slot (-drive if=sd)
  *   0x94000000 MCP200 H.264 + 0x94100000 wrapper    hw/misc/gm-h264e.c
  *   0x94300000 MCP100's local memory (nsboot runs here), its mailbox at
  *              +0x8000, registers at +0x20000, 0x94200000 wrapper
@@ -460,9 +460,9 @@ static void gm8126_init(MachineState *machine)
     }
 }
 
-static void gm8126_class_init(ObjectClass *oc, const void *data)
+static void gm8126_machine(MachineClass *mc)
 {
-    MachineClass *mc = MACHINE_CLASS(oc);
+    ObjectClass *oc = OBJECT_CLASS(mc);
 
     mc->desc = "Grain Media GM8126 (FA626TE)";
     mc->init = gm8126_init;
@@ -485,17 +485,5 @@ static void gm8126_class_init(ObjectClass *oc, const void *data)
         "Image sensor on the I2C bus (none, ov7725); default: none");
 }
 
-static const TypeInfo gm8126_machine_info = {
-    .name = TYPE_GM8126_MACHINE,
-    .parent = TYPE_MACHINE,
-    .instance_size = sizeof(Gm8126MachineState),
-    .class_init = gm8126_class_init,
-    .interfaces = arm_machine_interfaces,
-};
-
-static void gm8126_machine_register_types(void)
-{
-    type_register_static(&gm8126_machine_info);
-}
-
-type_init(gm8126_machine_register_types)
+DEFINE_MACHINE_EXTENDED("gm8126", MACHINE, Gm8126MachineState,
+                        gm8126_machine, false, arm_machine_interfaces)

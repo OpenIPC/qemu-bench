@@ -490,8 +490,8 @@ gm-h264e.dump=DIR` save the encoded streams.
   with 0x03; OpenIPC's U-Boot uses 0x0B.
 
 Assumed: the chip ID (`0x812620`, MP), PLL1 reading back shifted left by
-one (with both, `rom.bin` and the kernel agree on every clock), MACCR bit 13 as the two-byte offset's switch, and the 4:2:2
+one (with both, `rom.bin` and the kernel agree on every clock), and the 4:2:2
 chroma order, which the picture and the encoders share. Not modelled: the
 ISP210 and its sensors' cameras, LCD, TV encoder, NAND, the deinterlacer,
-audio, SD cards. The vendor application's JPEG snapshot times out once at
+audio. The vendor application's JPEG snapshot times out once at
 start.

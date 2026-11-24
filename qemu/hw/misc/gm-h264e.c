@@ -705,9 +705,20 @@ static void gm_h264e_encode_slice(GmH264eState *s)
         src = g_malloc((size_t)stride * h);
         y = g_malloc((size_t)w * h);
         uv = g_malloc((size_t)w * h / 2);
-        dma_memory_read(&address_space_memory, s->regs[R_CUR_TOP / 4], src,
-                        (size_t)stride * h, MEMTXATTRS_UNSPECIFIED);
-        gm_h264e_to_nv12(src, stride, yuyv, w, h, y, uv);
+        if (s->mcp200) {
+            memset(uv, 128, (size_t)w * h / 2);
+            if (!gm_h264e_m2_source(s, w, h, y, uv)) {
+                qemu_log_mask(LOG_UNIMP, "gm-h264e: source not read\n");
+                s->pending = IRQ_SLICE_DONE;
+                timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                    GM_H264E_SLICE_NS);
+                return;
+            }
+        } else {
+            dma_memory_read(&address_space_memory, s->regs[R_CUR_TOP / 4],
+                            src, (size_t)stride * h, MEMTXATTRS_UNSPECIFIED);
+            gm_h264e_to_nv12(src, stride, yuyv, w, h, y, uv);
+        }
         cap = (size_t)nmb * 400 + 64;       /* PCM can take every MB */
         out = g_malloc0(cap);
         if (type == 2) {

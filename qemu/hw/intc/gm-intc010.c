@@ -195,10 +195,17 @@ static const VMStateDescription vmstate_intc010_bank = {
     }
 };
 
+static int intc010_post_load(void *opaque, int version_id)
+{
+    intc010_update(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_intc010 = {
     .name = TYPE_GM_INTC010,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = intc010_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(input, GmIntc010State, BANKS),
         VMSTATE_STRUCT_2DARRAY(b, GmIntc010State, 2, BANKS, 1,

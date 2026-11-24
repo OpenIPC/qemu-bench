@@ -22,6 +22,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
@@ -107,6 +108,10 @@ static void scal_run(GmScal010State *s)
             o[x * 2 + 2] = c[2];
             o[x * 2 + 3] = row[xb * 2 + 1];
         }
+    }
+    if (!split && extract32(udma, 12, 2)) {
+        qemu_log_mask(LOG_UNIMP, "gm-scal010: DMA format 0x%08x\n", udma);
+        return;
     }
     if (!split) {
         for (y = 0; y < dh; y++) {

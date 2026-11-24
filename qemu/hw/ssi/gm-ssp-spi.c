@@ -136,6 +136,10 @@ static void ssp_spi_write(void *opaque, hwaddr off, uint64_t val,
         uint32_t r = 0;
         int i;
 
+        if (!(s->regs[R_CR2 / 4] & 1)) {
+            return;                     /* off */
+        }
+
         for (i = bytes - 1; i >= 0; i--) {
             r = r << 8 | ssp_spi_byte(s, extract32(val, 8 * i, 8));
         }

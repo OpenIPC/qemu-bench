@@ -417,7 +417,8 @@ static void gm_mcp100_vop_header(GmMcp100State *s, Mpeg4Enc *e, bool coded,
     if (!e->intra_vop) {
         m4_put(e, rounding, 1);
     }
-    m4_put(e, e->q, 8);                 /* DC VLC always, the quantiser */
+    m4_put(e, 0, 3);                    /* intra_dc_vlc_thr: always */
+    m4_put(e, e->q, 5);
     if (!e->intra_vop) {
         m4_put(e, 1, 3);
     }
@@ -479,9 +480,11 @@ static void gm_mcp100_mpeg4(GmMcp100State *s, unsigned cmd)
     Mpeg4Enc e = { 0 };
     int rounding = gm_mcp100_node32(s, N4_ROUNDING) & 1;
 
-    if (cmd != CMD_ENCODE_N && fmt != 3) {
+    if (cmd != CMD_ENCODE_N &&
+        (fmt != 3 || gm_mcp100_node32(s, N4_WIDTH) < mw * 16)) {
         /* no picture: the job ends with no bytes */
-        qemu_log_mask(LOG_UNIMP, "gm-mcp100: MPEG-4 input format %u\n", fmt);
+        qemu_log_mask(LOG_UNIMP, "gm-mcp100: MPEG-4 input format %u, width "
+                      "%u\n", fmt, gm_mcp100_node32(s, N4_WIDTH));
     } else if (mw && mh && mw <= 128 && mh <= 128) {
         g_autofree uint8_t *src = g_malloc0(luma * 3 / 2);
         g_autofree uint8_t *ref = g_malloc0(luma * 3 / 2);
@@ -516,7 +519,11 @@ static void gm_mcp100_mpeg4(GmMcp100State *s, unsigned cmd)
             m4_vop_data(&e);
             gm_mcp100_planes(s, N4_CUR, pc, luma, true);
         }
-        dma_memory_write(&address_space_memory, bs, out, MIN(e.len, e.cap),
+        if (e.len > e.cap) {
+            qemu_log_mask(LOG_GUEST_ERROR, "gm-mcp100: VOP cut short\n");
+            e.len = e.cap;
+        }
+        dma_memory_write(&address_space_memory, bs, out, e.len,
                          MEMTXATTRS_UNSPECIFIED);
         if (s->dump) {                  /* one file per encoder instance */
             g_autofree char *name =
@@ -525,7 +532,7 @@ static void gm_mcp100_mpeg4(GmMcp100State *s, unsigned cmd)
             FILE *f = fopen(name, "ab");
 
             if (f) {
-                fwrite(out, 1, MIN(e.len, e.cap), f);
+                fwrite(out, 1, e.len, f);
                 fclose(f);
             }
         }
