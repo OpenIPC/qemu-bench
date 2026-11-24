@@ -2871,6 +2871,45 @@ def test_i6e_media(qemu, tmp):
             pocs.append(qt.readl(wave + 0x128))
         check('Wave5: POC runs on across a header request',
               pocs[3] - pocs[0], 3)
+        # A cascade (infinity6c's VENC to VENC bind): 0x144's high half names
+        # the channel a picture comes from [31:24] and goes to [23:16].  The
+        # sub's own source is flat; the main's is noise.  Every picture intra.
+        main, sub = 3, 4
+        flat, noisy = 0x01200000, 0x01300000
+        for n, size in ((main, 64), (sub, 32)):
+            cmd(0x0008, 0, n)
+            qt.writel(wave + 0x11C, size << 16 | size)
+            qt.writel(wave + 0x130, 1 << 16)
+            cmd(0x0200, 0, n)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + flat + i, 0x80808080)
+            v = (i * 2654435761) & 0xFFFFFFFF
+            qt.writel(0x20000000 + noisy + i, v ^ (v >> 13))
+
+        def pic(n, source, w, chans):
+            qt.writel(wave + 0x118, bs)
+            qt.writel(wave + 0x11C, 0x10000)
+            qt.writel(wave + 0x144, chans << 16)
+            qt.writel(wave + 0x148, source)
+            qt.writel(wave + 0x14C, source + w * w)
+            qt.writel(wave + 0x154, w << 16 | w)
+            cmd(0x0100, 0x02, n)
+            qt.step(10 * 1000000)
+            cmd(0x4000, 0x02, n)
+            return qt.readl(wave + 0x14C)
+
+        alone = pic(sub, flat, 32, 0xFFFF)
+        pic(main, flat, 64, 0xFF00 | sub)
+        check('Wave5 cascade: a flat main gives the sub the same picture',
+              pic(sub, noisy, 32, main << 8 | 0xFF), alone)
+        pic(main, noisy, 64, 0xFF00 | sub)
+        fed = pic(sub, flat, 32, main << 8 | 0xFF)
+        check('Wave5 cascade: the sub encodes its main\'s picture, not its '
+              'own flat source (%d bytes, alone %d)' % (fed, alone),
+              fed > alone, True)
+        check('Wave5 cascade: a high half of 0 names no channel',
+              pic(sub, flat, 32, 0), alone)
+        qt.writel(wave + 0x144, 0)
         # H.264: the instance register's high half, as mi_venc writes it
         avc = 3 << 16 | 1
         cmd(0x0008, 0, avc)
