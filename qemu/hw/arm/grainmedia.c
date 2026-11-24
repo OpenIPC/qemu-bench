@@ -646,8 +646,12 @@ static void grainmedia_common_init(MachineState *machine,
                                gm_irq(gms, GM_IRQ_I2C));
     sensor = image_sensor_create(I2C_BUS(qdev_get_child_bus(dev, "i2c")),
                                  gms->sensor);
-    if (sensor) {
-        /* the ISP's frames and statistics follow the sensor's exposure */
+    if (sensor && object_dynamic_cast(OBJECT(sensor), "ov2710-sensor")) {
+        /*
+         * the ISP's frames and statistics follow the sensor's exposure;
+         * an ID-only stub (ov9715) models none, so its ISP keeps the
+         * neutral statistics
+         */
         object_property_set_link(OBJECT(isp), "sensor", OBJECT(sensor),
                                  &error_fatal);
     }

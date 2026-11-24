@@ -130,7 +130,9 @@ static void ov_write(Ov2710State *s, uint16_t a, uint8_t v)
 {
     sensor_sync_write(&s->sync, a, v);
     if (a == OV_SYS_CTRL && (v & OV_SYS_RESET)) {
+        /* the registers' defaults, and no group left open */
         ov_registers_reset(s);
+        sensor_sync_hold(&s->sync, false);
         v &= ~OV_SYS_RESET;
     }
     if (a == OV_GROUP) {

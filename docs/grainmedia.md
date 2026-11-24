@@ -240,7 +240,8 @@ sensor catalogue on the bus, where the ISP's `fisp_<sensor>.ko` probes it;
 the default is none. `ov2715` (the Longse cameras' sensor and
 `load_grainmedia`'s default, at 0x36, ID 0x2715 at 0x300A) is
 `ov2710-sensor`, which models the exposure, gain and frame timing (see
-"The digital twin"); `ov9715` is an ID-only stub.
+"The digital twin"); `ov9715` is an ID-only stub, and with it the ISP
+keeps its neutral statistics.
 
 ### `gm-wdt` (FTWDT010)
 

@@ -167,7 +167,9 @@ struct GmIspState {
     double wb[3];
     uint32_t raw_mean[3];       /* the frame's raw means, 12-bit, for the
                                  * record */
-    int gw, gh;
+    int fw, fh;                 /* the frame, pixels */
+    int gw, gh;                 /* the grid: a sample per GRID_DIV^2 pixels,
+                                 * the last row / column partial */
     uint8_t *grid;              /* the frame's samples after the ISP gains
                                  * and the AE pre-gamma, R G B */
     uint16_t *lin;              /* the same before the pre-gamma, 12-bit
@@ -212,6 +214,13 @@ static bool gm_isp_win_grid(GmIspState *s, uint32_t off, int *gx0, int *gy0,
     *gx1 = MIN(extract32(b, 0, 13) / GRID_DIV + 1, s->gw);
     *gy1 = MIN(extract32(b, 16, 13) / GRID_DIV + 1, s->gh);
     return *gx1 > *gx0 && *gy1 > *gy0;
+}
+
+/* the pixels grid sample (x, y) stands for: fewer at a partial edge */
+static uint32_t gm_isp_cell(GmIspState *s, int x, int y)
+{
+    return MIN(GRID_DIV, s->fw - x * GRID_DIV) *
+           MIN(GRID_DIV, s->fh - y * GRID_DIV);
 }
 
 /* a pre-gamma curve as the driver programs it (see the top) */
@@ -276,8 +285,13 @@ static void gm_isp_scene_frame(GmIspState *s)
     global = s->regs[R_GLOBAL_GAIN / 4] ?
               (double)s->regs[R_GLOBAL_GAIN / 4] / s->gain_one : 1.0;
     if (s->scene) {
-        hisi_scene_set_frame(s->scene, s->level * global, s->tint,
-                             s->wb[0] / s->wb[1], s->wb[2] / s->wb[1]);
+        /* the picture: clipped at the sensor, then the same gains */
+        double g[3];
+
+        for (c = 0; c < 3; c++) {
+            g[c] = s->wb[c] * global;
+        }
+        hisi_scene_set_frame_gains(s->scene, s->level, s->tint, g);
     }
 
     /* a sample's 8-bit value: raw (clipped at full scale), the gains,
@@ -288,10 +302,10 @@ static void gm_isp_scene_frame(GmIspState *s)
     for (i = 0; i < 256; i++) {
         lut[i] = gm_isp_pre_gamma(s, R_AE_PRE_GAMMA, i);
     }
-    s->gw = MAX((s->frame_expo.width ? s->frame_expo.width : 1920) /
-                GRID_DIV, 1);
-    s->gh = MAX((s->frame_expo.height ? s->frame_expo.height : 1080) /
-                GRID_DIV, 1);
+    s->fw = s->frame_expo.width ? s->frame_expo.width : 1920;
+    s->fh = s->frame_expo.height ? s->frame_expo.height : 1080;
+    s->gw = DIV_ROUND_UP(s->fw, GRID_DIV);
+    s->gh = DIV_ROUND_UP(s->fh, GRID_DIV);
     n = s->gw * s->gh;
     s->grid = g_renew(uint8_t, s->grid, (size_t)n * 3);
     s->lin = g_renew(uint16_t, s->lin, (size_t)n * 3);
@@ -362,41 +376,42 @@ static void gm_isp_scene_statistics(GmIspState *s)
         if (gm_isp_win_grid(s, R_AE_WIN + 8 * i, &gx0, &gy0, &gx1, &gy1)) {
             for (y = gy0; y < gy1; y++) {
                 for (x = gx0; x < gx1; x++) {
+                    const uint32_t px = gm_isp_cell(s, x, y);
+
                     for (c = 0; c < 3; c++) {
-                        sum[c] += s->grid[(y * s->gw + x) * 3 + c];
+                        sum[c] += s->grid[(y * s->gw + x) * 3 + c] * px;
                     }
+                    nall += px;
                 }
             }
             for (c = 0; c < 3; c++) {
                 all[c] += sum[c];
             }
-            nall += (gx1 - gx0) * (gy1 - gy0);
         }
         for (c = 0; c < 3; c++) {
-            /* a sample stands for GRID_DIV^2 pixels, a quarter of them
-             * of this colour */
-            gm_isp_put64(s, R_AE_SUM + 0x18 * i + 8 * c,
-                         sum[c] * GRID_DIV * GRID_DIV / 4);
+            /* a quarter of the pixels are of this colour */
+            gm_isp_put64(s, R_AE_SUM + 0x18 * i + 8 * c, sum[c] / 4);
         }
         memset(&s->regs[(R_AE_CNT + 0x10 * i) / 4], 0, 16);
     }
 
-    /* the histogram: a count per 64 pixels, one sample being 64 */
+    /* the histogram: pixels, then a count per 64 of them */
     memset(&s->regs[R_HIST / 4], 0, 0x200);
     memset(&s->regs[R_CE_HIST / 4], 0, 0x400);
     if (gm_isp_win_grid(s, R_HIST_WIN, &gx0, &gy0, &gx1, &gy1)) {
         for (y = gy0; y < gy1; y++) {
             for (x = gx0; x < gx1; x++) {
-                hist[s->hist_y[y * s->gw + x]] += GRID_DIV * GRID_DIV / 64;
+                hist[s->hist_y[y * s->gw + x]] += gm_isp_cell(s, x, y);
             }
         }
     }
     for (i = 0; i < 256; i++) {
+        hist[i] /= 64;                  /* a count per 64 pixels */
         s->regs[R_HIST / 4 + i / 2] |= MIN(hist[i], 0xFFFF) << (16 * (i & 1));
         s->regs[R_CE_HIST / 4 + i] = hist[i];
     }
 
-    /* AWB: over 2x2 blocks, 16 to a sample */
+    /* AWB: over 2x2 blocks, 16 to a full sample */
     memset(sum, 0, sizeof(sum));
     {
         uint64_t rg = 0, bg = 0, blocks = 0;
@@ -406,7 +421,7 @@ static void gm_isp_scene_statistics(GmIspState *s)
                 for (x = gx0; x < gx1; x++) {
                     const uint16_t *p = &s->lin[(y * s->gw + x) * 3];
                     const uint32_t g = MAX(p[1], 1);
-                    const uint32_t nb = GRID_DIV * GRID_DIV / 4;
+                    const uint32_t nb = gm_isp_cell(s, x, y) / 4;
 
                     rg += (uint64_t)p[0] * 128 / g * nb;
                     bg += (uint64_t)p[2] * 128 / g * nb;

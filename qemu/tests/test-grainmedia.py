@@ -746,6 +746,16 @@ def test_isp_twin(qemu, path):
         check('violations: none', qt.qom_get('/machine/isp/sensor',
                                              'violations'), 0)
 
+        # a software reset (0x3008 bit 7) closes a group left open
+        ov_write(qt, 0x3212, 0x00)
+        ov_write(qt, 0x3008, 0x82)
+        ov_write(qt, 0x3501, (40 << 4) >> 8)
+        ov_write(qt, 0x3502, (40 << 4) & 0xFF)
+        isp_frame_end(qt)
+        isp_frame_end(qt)
+        check('software reset: no group left holding',
+              qt.qom_get('/machine/isp/sensor', 'lines'), 40)
+
         # the capture paints the scene: frame number on top, then the bars
         cas, lli = VCAP + 0x3E00, VCAP + 0x40000
         buf = SCRATCH + 0x200000
@@ -773,6 +783,18 @@ def test_isp_twin(qemu, path):
         ys = [row[2 * x + 1] for x in (100, 1800)]
         check('the grey bars: white on the left, dark on the right',
               ys[0] > ys[1] + 50, True)
+    finally:
+        qt.close()
+
+    # an ID-only stub models no exposure: the ISP keeps the neutral grey
+    qt = QTest(qemu, 'gm8136,sensor=ov9715,flash-file=' + path)
+    try:
+        qt.writel(ISP + 0x28C, 0)
+        qt.writel(ISP + 0x290, 1919 | (1079 << 16))
+        qt.writel(ISP + 0x008, (1 << 31) | (0xF << 11))
+        isp_frame_end(qt)
+        g = isp_frame_end(qt)[1]
+        check('sensor=ov9715: the neutral grey (luma 100)', round(g), 100)
     finally:
         qt.close()
 

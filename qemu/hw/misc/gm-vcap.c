@@ -34,7 +34,8 @@
  * exposure, light and white balance), it is that scene as the ISP renders
  * it (hisi_scene_display_row(): the gains, then a 1/2.2 gamma -- not the
  * ISP's own curve), with the frame number as 16 binary squares along the
- * top twelfth.  Before that, and without a sensor, it is the Allwinner
+ * top twelfth; the scene sampled at no more than 2048 points a side.  A
+ * reset waits for the ISP's next frame.  Before that, and without a sensor, it is the Allwinner
  * capture model's: the OpenIPC logo on navy with a sliding dot.
  *
  * The driver links queued jobs into the lists only from the sync timer
@@ -115,6 +116,7 @@ struct GmVcapState {
     uint32_t version;
     uint32_t caps;
     HisiSceneState *scene;
+    uint32_t scene_seq;         /* the scene's frame count at reset */
 };
 
 static void gm_vcap_update(GmVcapState *s)
@@ -217,15 +219,23 @@ static void gm_vcap_pixel(int px, int py, int dot_x, uint8_t *yuv)
     }
 }
 
+/*
+ * The scene is sampled at most this many points a side, whatever the
+ * scaler size the guest asks for, so the cached grid stays bounded
+ */
+#define GM_VCAP_SCENE_MAX   2048
+
 /* the scene as the ISP renders it, UYVY, the frame number on top */
 static void gm_vcap_paint_scene(GmVcapState *s, hwaddr dst, int w, int h,
                                 int x0, int y0, int sw, int sh,
                                 uint32_t gap, uint8_t *line)
 {
-    const float *grid = hisi_scene_grid(s->scene, sw, sh);
+    const int gw = MIN(sw, GM_VCAP_SCENE_MAX), gh = MIN(sh, GM_VCAP_SCENE_MAX);
+    const float *grid = hisi_scene_grid(s->scene, gw, gh);
     const int sq = MAX(sw / 16, 1);
     g_autofree uint8_t *yl = g_malloc(w);
     g_autofree uint8_t *vu = g_malloc(w + 2);
+    g_autofree float *row = g_new(float, (size_t)w * 3);
     int x, y;
 
     for (y = 0; y < h; y++) {
@@ -236,9 +246,15 @@ static void gm_vcap_paint_scene(GmVcapState *s, hwaddr dst, int w, int h,
             }
             memset(vu, 128, w);
         } else {
-            hisi_scene_display_row(s->scene,
-                                   grid + ((size_t)(y0 + y) * sw + x0) * 3,
-                                   w, yl, vu);
+            const float *g = grid + (size_t)((int64_t)(y0 + y) * gh / sh) *
+                                    gw * 3;
+
+            for (x = 0; x < w; x++) {
+                memcpy(&row[x * 3],
+                       &g[(int64_t)(x0 + x) * gw / sw * 3],
+                       3 * sizeof(float));
+            }
+            hisi_scene_display_row(s->scene, row, w, yl, vu);
         }
         for (x = 0; x < w; x += 2) {
             line[x * 2 + 0] = vu[x + 1];                /* U */
@@ -281,7 +297,7 @@ static void gm_vcap_paint(GmVcapState *s, uint32_t base, int p)
         sh = y1 + 1;
     }
     line = g_malloc(w * 2);
-    if (s->scene && hisi_scene_frame_seq(s->scene)) {
+    if (s->scene && hisi_scene_frame_seq(s->scene) != s->scene_seq) {
         gm_vcap_paint_scene(s, dst, w, h, x0, y0, sw, sh, gap, line);
         return;
     }
@@ -498,6 +514,8 @@ static void gm_vcap_reset(DeviceState *dev)
     timer_del(s->timer);
     memset(s->regs, 0, sizeof(s->regs));
     s->ticks = s->frames = 0;
+    /* the scene as the ISP measured it before: not this run's */
+    s->scene_seq = s->scene ? hisi_scene_frame_seq(s->scene) : 0;
     gm_vcap_update(s);
 }
 
@@ -530,13 +548,14 @@ static const Property gm_vcap_props[] = {
 
 static const VMStateDescription vmstate_gm_vcap = {
     .name = TYPE_GM_VCAP,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, GmVcapState),
         VMSTATE_UINT32_ARRAY(regs, GmVcapState, GM_VCAP_NREGS),
         VMSTATE_UINT32(ticks, GmVcapState),
         VMSTATE_UINT32(frames, GmVcapState),
+        VMSTATE_UINT32_V(scene_seq, GmVcapState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
