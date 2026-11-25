@@ -1184,6 +1184,20 @@ qemu-system-arm -M hi3516cv200,flash-file=$flash -m 64M -nographic \
     -global hisi-fmc.nor-single-io-only=on
 ```
 
+NOR erases and programs complete instantly by default. A flash write then
+takes seconds instead of the minute it takes on a camera, which hides
+anything that races it: a process paging from the flash being rewritten,
+a watchdog, a timeout. `hisi-fmc.erase-64k-us` and `hisi-fmc.page-program-us`
+(default `0`) keep SR1's WIP bit set for as long as the chip would. The
+W25Q128 typicals below make a 1 MB `flashcp` take 11 s, and they are what
+reproduced the fixed-slot to split sysupgrade brick on hi3518ev200:
+
+```bash
+qemu-system-arm -M hi3518ev200,flash-file=$flash -nographic \
+    -global hisi-fmc.erase-64k-us=150000 \
+    -global hisi-fmc.page-program-us=700
+```
+
 #### SPI-NAND flash boot (UBI/UBIFS)
 
 `hisi-fmc` also models a SPI-NAND chip (GigaDevice GD5F1GM7 by default:

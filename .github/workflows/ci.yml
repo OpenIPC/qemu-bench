@@ -175,6 +175,10 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-fmc-nand-erase.sh']
         run: bash qemu/tests/test-hisi-fmc-nand-erase.sh
 
+      - name: SPI-NOR erase/program timing, opt-in (hisi-fmc)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-fmc-nor-timing.sh']
+        run: bash qemu/tests/test-hisi-fmc-nor-timing.sh
+
       - name: CPU1 release via CRG soft-reset (hisi-crg, -bios path)
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-hisi-smp-release.sh']
         run: bash qemu/tests/test-hisi-smp-release.sh
