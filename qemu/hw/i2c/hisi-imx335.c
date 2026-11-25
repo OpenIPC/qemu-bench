@@ -10,10 +10,14 @@
  * sensor_imx335_mipi.c expo_reg, vts_reg and gain_reg): VMAX 0x3030-0x3032
  * and SHR0 0x3058-0x305A, 20 bits each, low byte first, the exposure being
  * VMAX - SHR0 rows; GAIN 0x30E8-0x30E9, 11 bits in 0.3 dB steps.  Out of
- * reset they are zero, which is one row at 0 dB.  The window, 2592x1944
- * (its full-frame mode, SigmaStar's only one), is given only when the
- * machine sets "window": HiSilicon's driver runs other modes too, and with
- * no window given hisi-viu keeps the size its own registers set.
+ * reset they are zero, which is one row at 0 dB.  The window is the one
+ * the mode registers set: WINMODE 0x3018 = 4 (window cropping) gives
+ * HNUM 0x302E-0x302F by Y_OUT_SIZE 0x3056-0x3057, 13 bits each, low byte
+ * first; any other WINMODE the full 2592x1944.  OpenIPC's ssc377d driver
+ * sets 2592x1920@60, 2584x1248@90 and 1944x1080@120 this way.  It is given
+ * only when the machine sets "window" (infinity6c, whose ISP takes the
+ * sensor's window): elsewhere hisi-viu and hisi-vi keep the size their own
+ * registers set.
  *
  * Register space: 16-bit addresses (0x3000-0x3FFF), 8-bit data.
  * Protocol: master sends 2-byte register address, then reads/writes data.
@@ -43,7 +47,7 @@ struct HisiIMX335State {
     uint8_t  reg_ptr;       /* bytes received for register address */
     uint16_t cur_reg;       /* current register address */
     uint8_t  regs[IMX335_REG_COUNT];
-    bool     window;        /* report the 2592x1944 window */
+    bool     window;        /* report the window the mode registers set */
 };
 
 static void hisi_imx335_reset_regs(HisiIMX335State *s)
@@ -121,6 +125,13 @@ static uint32_t imx335_reg20(HisiIMX335State *s, uint16_t reg)
     return r[0] | r[1] << 8 | (r[2] & 0xF) << 16;
 }
 
+static uint32_t imx335_reg13(HisiIMX335State *s, uint16_t reg)
+{
+    const uint8_t *r = &s->regs[reg - IMX335_REG_BASE];
+
+    return r[0] | (r[1] & 0x1F) << 8;
+}
+
 static void hisi_imx335_exposure(Object *sensor, ImageSensorExposure *e)
 {
     HisiIMX335State *s = HISI_IMX335(sensor);
@@ -133,8 +144,16 @@ static void hisi_imx335_exposure(Object *sensor, ImageSensorExposure *e)
     e->vts = vmax;
     e->gain = lrint(1024 * pow(10, MIN(g, 240) * 0.3 / 20));   /* 72 dB */
     if (s->window) {
-        e->width = 2592;
-        e->height = 1944;
+        uint32_t hnum = imx335_reg13(s, 0x302E);
+        uint32_t vout = imx335_reg13(s, 0x3056);
+
+        if ((s->regs[0x3018 - IMX335_REG_BASE] & 0xF) == 4 && hnum && vout) {
+            e->width = MIN(hnum, 2592);
+            e->height = MIN(vout, 1944);
+        } else {
+            e->width = 2592;
+            e->height = 1944;
+        }
     }
 }
 
@@ -171,7 +190,7 @@ static void hisi_imx335_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "window", hisi_imx335_get_window,
                                    hisi_imx335_set_window);
     object_class_property_set_description(klass, "window",
-        "Report the full 2592x1944 window to the image pipeline");
+        "Report the window the mode registers set to the image pipeline");
 }
 
 static const TypeInfo hisi_imx335_info = {

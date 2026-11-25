@@ -4047,6 +4047,74 @@ def test_i6c_scl_unset(qemu, tmp):
         qt.close()
 
 
+def test_i6c_imx335_window(qemu, tmp):
+    print('infinity6c with an IMX335: the window its mode registers set')
+    path = i6_image(tmp, 'i6cw2.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path + ',sensor=imx335', [])
+    try:
+        def sensor(reg, val):
+            """one register over MIIC1, 16-bit address as the IMX335
+            takes"""
+            i2c = 0x1F222A00
+            qt.writew(i2c + 0x00 * 4, 0)
+            qt.writeb(i2c + 0x01 * 4, 1)
+            for b in (0x1A << 1, reg >> 8, reg & 0xFF, val):
+                qt.writew(i2c + 0x02 * 4, b)
+            qt.writeb(i2c + 0x01 * 4 + 1, 1)
+
+        def sensor16(reg, v):
+            sensor(reg, v & 0xFF)
+            sensor(reg + 1, v >> 8)
+
+        # bright enough to find the dot: VMAX 1125, SHR0 125
+        for base, v in ((0x3030, 1125), (0x3058, 125)):
+            for i in range(3):
+                sensor(base + i, (v >> (8 * i)) & 0xFF)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        scl = riu(0x1253, 0)
+
+        def dot_shape(w, h, rows):
+            """the dot's width over its height in a w x h frame from scaler
+            port 0; @rows the band of the height that holds it"""
+            qt.step(100 * 1000000)
+            ya, ca = 0x600000, 0x700000
+            qt.writew(scl + 0x02 * 4, w // 16)
+            qt.writew(scl + 0x03 * 4, h)
+            qt.writew(scl + 0x05 * 4, w)
+            for n, a in ((0, ya), (0x20, ca)):
+                qt.writew(scl + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+                qt.writew(scl + (n + 0x07) * 4, a >> 20)
+            qt.writew(scl, 0x11)
+            y0, y1 = int(h * rows[0]), int(h * rows[1])
+            reply = qt.cmd('read 0x%x 0x%x' % (0x20000000 + ya + y0 * w,
+                                               (y1 - y0) * w))
+            pix = bytes.fromhex(reply.split()[1][2:])
+            top = max(pix)
+            xs = [i % w for i, v in enumerate(pix) if v > top * 0.6]
+            ys = [i // w for i, v in enumerate(pix) if v > top * 0.6]
+            if not xs:
+                return 0.0
+            return (max(xs) - min(xs) + 1) / (max(ys) - min(ys) + 1)
+
+        # out of reset, WINMODE 0: the full 2592x1944, 4:3.  A 16:9 frame of
+        # it stretches the dot 4/3 wide
+        full = dot_shape(640, 360, (0.66, 0.785))
+        check('IMX335 WINMODE 0: the full 4:3 window, a 16:9 frame '
+              'stretches the dot (w/h %.2f)' % full, 1.2 < full < 1.45, True)
+        # OpenIPC's 1920x1080@120 mode: WINMODE 4, HNUM 1944, Y_OUT_SIZE
+        # 1080, nearly 16:9; the same frame of it keeps the dot round
+        sensor(0x3018, 4)
+        sensor16(0x302E, 1944)
+        sensor16(0x3056, 1080)
+        crop = dot_shape(640, 360, (0.72, 0.875))
+        check('IMX335 WINMODE 4, 1944x1080: the dot round in a 16:9 frame '
+              '(w/h %.2f)' % crop, 0.9 < crop < 1.1, True)
+    finally:
+        qt.close()
+
+
 def i6c_wave5_two(qemu, tmp, ack):
     """Two instances' pictures queued at once; the host takes the first
     picture's end by ack: 'reason' (REASON_CLEAR with ENC_PIC), 'vint'
@@ -4206,6 +4274,7 @@ def test_i6c_wave5_ring_port(qemu, tmp):
               picture(2) == flat, True)
     finally:
         qt.close()
+
 
 def test_i6c_cmdq_mask(qemu, tmp):
     print('infinity6c CMDQ: the interrupt mask is reg 0x47')
@@ -4643,6 +4712,7 @@ def main():
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_mmu_miss(args.qemu, tmp)
     test_i6c_scl_unset(args.qemu, tmp)
+    test_i6c_imx335_window(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)

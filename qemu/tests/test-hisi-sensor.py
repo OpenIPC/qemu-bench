@@ -304,8 +304,9 @@ def main():
     q.close()
 
     # The IMX335 reports its exposure everywhere, but its window only where
-    # the machine asks (SigmaStar, its one 2592x1944 mode): hisi-vi and
-    # hisi-viu keep the size their own registers set
+    # the machine asks (infinity6c, whose ISP takes the window the mode
+    # registers set): hisi-vi and hisi-viu keep the size their own
+    # registers set
     q, qmp, get, wr, qom_set = machine('imx335', 'hisi-imx335', 0x1A,
                                        soc='hi3516ev300')
     check(get('window') is False,

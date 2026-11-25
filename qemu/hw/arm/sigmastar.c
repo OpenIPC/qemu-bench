@@ -2411,8 +2411,12 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         }
 
         dev = image_sensor_create(bus[c->miic_sensor_bus], sensor);
-        /* the IMX335's one mode on these dies, which the ISP's window takes */
-        if (dev && object_property_find(OBJECT(dev), "window")) {
+        /*
+         * infinity6c's ISP takes its window from the sensor: the IMX335
+         * gives the one its mode registers set
+         */
+        if (dev && c->die == SS_DIE_INFINITY6C &&
+            object_property_find(OBJECT(dev), "window")) {
             object_property_set_bool(OBJECT(dev), "window", true,
                                      &error_fatal);
         }
