@@ -2041,25 +2041,26 @@ def test_infinity2m_rtcpwc(qemu, tmp):
 
     # The counter survives a change of rtc_clock; a saved reading would not
     mig = os.path.join(tmp, 'i2m-rtc.mig')
+    started = time.monotonic()
     out = hmp(qemu, ['-M', 'ssd201', '-machine', 'accel=qtest', '-S', '-rtc',
                      'clock=host,base=2015-01-01T00:00:00'],
               ['migrate file:' + mig, 'info migrate'])
+    late = int(time.monotonic() - started) + 1
     check('RTC: ssd201 migrates', 'completed' in out, True)
     qt = QTest(qemu, 'ssd201', ['-rtc', 'clock=vm,base=2021-08-26T00:42:00',
                                 '-incoming', 'file:' + mig])
     try:
         # The source's base is its RTC time at reset, and -rtc clock=host runs
-        # on from 2015-01-01T00:00:00 while QEMU starts.  The incoming
-        # machine's own base is 2021's until the stream is loaded.
-        def migrated():
-            return 0 <= read32(1 << 2) - 1420070400 < 60
-
+        # on from 2015-01-01T00:00:00 while QEMU starts: the base is late by
+        # the seconds that tick over, at most those the source ran for.  The
+        # incoming machine's own base is 2021's until the stream is loaded.
         for _ in range(500):
-            if migrated():
+            base = read32(1 << 2)
+            if 0 <= base - 1420070400 <= late:
                 break
             time.sleep(0.01)
-        check('RTC: the base came across (0x%x)' % read32(1 << 2),
-              migrated(), True)
+        check('RTC: the base came across (0x%x, at most %d s late)' %
+              (base, late), 0 <= base - 1420070400 <= late, True)
         qt.writew(pwc + 0x0E * 4, 1)
         c = qt.readw(pwc + 0x0D * 4) << 16 | qt.readw(pwc + 0x0C * 4)
         check('RTC: the counter came across', c < 60, True)
