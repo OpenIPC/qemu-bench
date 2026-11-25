@@ -56,16 +56,19 @@
  * infinity6c cascades one channel off another (MI_SYS_BindChnPort2 from a
  * VENC output to a VENC input, bind type HW_RING: a main stream and the sub
  * stream it feeds).  The host never names the buffer between them: 0x144,
- * whose low byte is the source index, carries the channels in its high half,
- * [31:24] the channel this picture's source comes from and [23:16] the one
- * it passes on to, 0xFF for none (mi.ko MHAL_VENC_Wrapper_EncodeOneFrame,
- * from each context's bound neighbour).  The firmware hands the main's
- * picture to the sub, which encodes it at its own size; the sub's source
- * registers name a ring in the VENC device's private pool that the firmware
- * fills.  Modelled: a picture with a next channel is kept, and a picture with
- * a previous one is that channel's last, scaled by nearest neighbour.  The
- * channel numbers are taken as instance numbers, as the driver assigns both;
- * a high half of 0x0000 names no channels (wave5_cascaded()).
+ * whose low byte is the source index, carries the two neighbours in its high
+ * half: [31:24] the VPU instance this picture's source comes from and
+ * [23:16] the one it passes on to, 0xFF for none (mi.ko
+ * MHAL_VENC_Wrapper_EncodeOneFrame, from each context's bound neighbour).
+ * Each byte is the neighbour's VPU API instance index (CodecInst.instIndex),
+ * which MHAL_VENC_Wrapper_CreateInstance stores at +0x881 of its context,
+ * the number the host writes to the instance register: not the MI channel.
+ * The firmware hands the main's picture to the sub, which encodes it at its
+ * own size; the sub's source registers name a ring in the VENC device's
+ * private pool that the firmware fills.  Modelled: a picture with a next
+ * instance is kept, and a picture with a previous one is that instance's
+ * last, scaled by nearest neighbour; a high half of 0x0000 names no
+ * neighbours (wave5_cascaded()).
  *
  * The bitstream comes from hevc-enc.c: VPS, SPS and PPS for headers, IDR
  * and TRAIL_R pictures for the rest, against the stream's own reconstructed

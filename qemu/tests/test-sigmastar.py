@@ -4298,6 +4298,86 @@ def test_i6c_wave5_ring_port(qemu, tmp):
         qt.close()
 
 
+def test_i6c_wave5_cascade(qemu, tmp):
+    print('infinity6c Wave5: a cascade through the queue, as mi.ko sends it')
+    path = i6_image(tmp, 'i6cc.bin')
+    wave = 0x1F34D000
+    dram = 0x22000000
+    # the sources in pages the MIU MMU maps (VPA pages 0xFFB, 0xFFC), so
+    # what is read is what the test wrote
+    flat, noisy = 0x3FF60000, 0x3FF80000
+    host = {flat: dram + 0x60000, noisy: dram + 0x80000}
+    main, sub = 0, 1
+    dumps = {main: 0x20000, sub: 0x24000}
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101, 0x102, 0x103, 0x104))
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        # the main 64x64, the sub 32x32 it feeds; every picture intra
+        for n, size in ((main, 64), (sub, 32)):
+            qt.writel(wave + 0x14C, dumps[n])
+            cmd(0x0008, inst=n)
+            qt.writel(wave + 0x11C, size << 16 | size)
+            qt.writel(wave + 0x130, 1 << 16)
+            cmd(0x0200, inst=n)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(host[flat] + i, 0x80808080)
+            v = (i * 2654435761) & 0xFFFFFFFF
+            qt.writel(host[noisy] + i, v ^ (v >> 13))
+        bs = 0x40000
+        k = [0]
+
+        def pic(n, source, w, neighbours):
+            """one picture queued as DrvVcodecVdiWriteCmd writes it: 0x144's
+            high half (page 0x44) the VPU instances it comes from and goes
+            to; returns its bytes from the results the firmware leaves"""
+            p = dram + (k[0] % 16) * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x10, n)
+            qt.writel(p + 0x18, bs)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x44, neighbours << 16)
+            qt.writel(p + 0x48, source)
+            qt.writel(p + 0x4C, source + w * w)
+            qt.writel(p + 0x54, w << 16 | w)
+            k[0] += 1
+            qt.writel(wave + 0x1F8, k[0] % 16)
+            qt.step(20 * 1000000)
+            qt.writel(wave + 0x3C, 1)       # VINT_CLEAR: taken
+            qt.step(1000000)
+            return qt.readl(dram + dumps[n] + 0x4C)
+
+        alone = pic(sub, flat, 32, 0xFFFF)
+        check('Wave5 queue: the sub alone encodes its own source (%d bytes)'
+              % alone, alone > 0, True)
+        pic(main, flat, 64, 0xFF00 | sub)
+        check('Wave5 queue cascade: a flat main gives the sub the same '
+              'picture', pic(sub, noisy, 32, main << 8 | 0xFF), alone)
+        pic(main, noisy, 64, 0xFF00 | sub)
+        fed = pic(sub, flat, 32, main << 8 | 0xFF)
+        check('Wave5 queue cascade: the sub encodes its main\'s picture, not '
+              'its own flat source (%d bytes, alone %d)' % (fed, alone),
+              fed > alone, True)
+        check('Wave5 queue: a high half of 0 names no neighbour',
+              pic(sub, flat, 32, 0), alone)
+    finally:
+        qt.close()
+
+
 def test_i6c_cmdq_mask(qemu, tmp):
     print('infinity6c CMDQ: the interrupt mask is reg 0x47')
     path = i6_image(tmp, 'i6cq.bin')
@@ -4730,6 +4810,7 @@ def main():
     test_i6c_cmdq_mask(args.qemu, tmp)
     test_i6c_wave5_two(args.qemu, tmp)
     test_i6c_wave5_ring_port(args.qemu, tmp)
+    test_i6c_wave5_cascade(args.qemu, tmp)
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_mmu_miss(args.qemu, tmp)

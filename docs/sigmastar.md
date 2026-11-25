@@ -483,11 +483,15 @@ from port 2.
 A raptor image's second stream is a **VENC cascade**: channel 1 is bound to
 channel 0 as a ring, and the firmware passes the main's picture to it. The
 host names no buffer: picture register `0x144` carries, in its high half,
-the channel the picture comes from (bits 31-24) and the one it goes to
-(23-16), `0xFF` for none (`MHAL_VENC_Wrapper_EncodeOneFrame` in `mi.ko`).
-A channel naming a next one keeps its source picture; one naming a
-previous one encodes that picture at its own size. A high half of `0x0000`
-is no cascade: infinity6e's driver writes the index alone.
+the encoder instance the picture comes from (bits 31-24) and the one it
+goes to (23-16), `0xFF` for none (`MHAL_VENC_Wrapper_EncodeOneFrame` in
+`mi.ko`). Each byte is the VPU API instance index (`CodecInst.instIndex`,
+kept at `+0x881` of the wrapper's context by
+`MHAL_VENC_Wrapper_CreateInstance`), the number the instance register
+takes, not the MI channel. An instance naming a next one keeps its source
+picture; one naming a previous one encodes that picture at its own size. A
+high half of `0x0000` is no cascade: infinity6e's driver writes the index
+alone.
 
 Both firmwares' streams, on `-M ssc377d,sensor=imx335`:
 
