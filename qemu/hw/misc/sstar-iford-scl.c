@@ -21,10 +21,13 @@
  * What is modelled is the frame reaching memory: on the Y plane's start
  * the ISP's last picture (sstar_iford_isp_picture()) is written to those
  * addresses as NV12, where the encoder takes it, at the output's size by
- * nearest neighbour.  A ring port writes nothing: its buffer holds a few
- * lines, never a frame, and the encoder takes the picture from here
- * (sstar_iford_scl_ring()); a whole frame written there ran past the ring and
- * cost more than any other step of a frame (23 ms of 2592x1944).  The
+ * nearest neighbour.  On infinity6c ("ring", which the machine sets for that
+ * die) a ring port writes nothing: its buffer holds a few lines, never a
+ * frame, and its encoders (sstar-wave5, and the JPE through i6_irq) take the
+ * picture from here (sstar_iford_scl_ring()); a whole frame written there ran
+ * past the ring and cost more than any other step of a frame (23 ms of
+ * 2592x1944).  Iford's encoder, sstar-venc, never asks for it, so there every
+ * port's frame is written as before.  The
  * scaler's own registers beyond these are not read: no crop, no filters.
  * infinity6c's mi_scl starts an output before it has given it a buffer: a
  * plane whose address is still 0 is not written [assumed: MIU 0 is the
@@ -67,6 +70,7 @@ struct SstarIfordSclState {
     uint16_t regs[SCL_PORTS * SCL_REGS];
     uint32_t frame;
     bool trace;
+    bool ring;          /* infinity6c: ring ports feed the encoder directly */
     int w;
     uint8_t *row;
 };
@@ -90,7 +94,7 @@ static void scl_frame(SstarIfordSclState *s, int port)
     int pw, ph, x, y;
 
     if (!w || !h || w > 4096 || h > 4096 || pitch < w ||
-        (pr[R_CTRL] & CTRL_RING)) {
+        (s->ring && (pr[R_CTRL] & CTRL_RING))) {
         return;
     }
     if (s->w != w) {
@@ -137,8 +141,8 @@ static void scl_frame(SstarIfordSclState *s, int port)
  * infinity6c binds an output to the encoder as a ring: lines at a pitch of
  * the sensor's width, fewer of them than the frame has, which the encoder
  * drains as they come.  The picture goes to it from here, as NV12 at the
- * encoder's size.  Both firmwares seen bind port 0 so; any port with the
- * ring bit is taken, since scl_frame() writes no frame for it.
+ * encoder's size.  Both firmwares seen bind port 0 so; with "ring", any port
+ * with the ring bit is taken too, since scl_frame() writes no frame for it.
  */
 static bool scl_ring_port(SstarIfordSclState *s, uint64_t ya)
 {
@@ -148,7 +152,7 @@ static bool scl_ring_port(SstarIfordSclState *s, uint64_t ya)
         const uint16_t *pr = s->regs + port * SCL_REGS;
 
         /* port 0 as before; ports 1 to 3 when bound as a ring */
-        if ((port == 0 || (pr[R_CTRL] & CTRL_RING)) &&
+        if ((port == 0 || (s->ring && (pr[R_CTRL] & CTRL_RING))) &&
             ya == ((uint64_t)pr[R_ADDR_HI] << 16 | pr[R_ADDR_LO]) << 4) {
             return true;
         }
@@ -252,6 +256,7 @@ static void scl_init(Object *obj)
 static const Property scl_props[] = {
     DEFINE_PROP_LINK("isp", SstarIfordSclState, isp, TYPE_OBJECT, Object *),
     DEFINE_PROP_BOOL("trace", SstarIfordSclState, trace, false),
+    DEFINE_PROP_BOOL("ring", SstarIfordSclState, ring, false),
 };
 
 static void scl_class_init(ObjectClass *oc, const void *data)

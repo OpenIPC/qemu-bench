@@ -2692,14 +2692,11 @@ def test_ssc029(qemu, tmp):
         qt.writeb(p2 + 1, 0x00)                     # the low byte kept
         check('SCL: the start bit does not stay set', qt.readw(p2) & 0x10, 0)
         check('SCL: disabling the port writes no frame', qt.readl(DDR + y2), 0)
-        # a ring port (bit 15, the encoder's hardware ring) writes nothing:
-        # its buffer holds a few lines, and the encoder takes the picture
-        # from the scaler (sstar_iford_scl_ring())
+        # Iford: bit 15 changes nothing.  Its encoder, sstar-venc, reads
+        # memory and never takes a ring from the scaler, so the frame is
+        # written as before (infinity6c's ring: test_i6c_scl_ring)
         qt.writew(p2, 0x8011)
-        check('SCL: a ring port\'s start writes no frame to memory',
-              qt.readl(DDR + y2), 0)
-        qt.writew(p2, 0x0011)
-        check('SCL: the same port in frame mode writes it',
+        check('SCL (Iford): a port with bit 15 still writes its frame',
               qt.readl(DDR + y2) != 0, True)
 
         # The image pipe: sensor, statistics, white balance, the scaler.  The
@@ -4047,6 +4044,31 @@ def test_i6c_scl_unset(qemu, tmp):
         qt.close()
 
 
+def test_i6c_scl_ring(qemu, tmp):
+    print('infinity6c scaler: a ring port writes no frame to memory')
+    path = i6_image(tmp, 'i6cr2.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        p2 = riu(0x1255, 0)
+        y2 = 0x800000
+        qt.writew(p2 + 0x02 * 4, 0x50)              # 1280
+        qt.writew(p2 + 0x03 * 4, 16)
+        qt.writew(p2 + 0x05 * 4, 0x500)
+        qt.writew(p2 + 0x06 * 4, (y2 >> 4) & 0xFFFF)
+        qt.writew(p2 + 0x07 * 4, y2 >> 20)
+        # bit 15, the encoder's hardware ring: its buffer holds a few
+        # lines, and the encoder takes the picture from the scaler
+        # (sstar_iford_scl_ring(), test_i6c_wave5_ring_port)
+        qt.writew(p2, 0x8011)
+        check('SCL: a ring port\'s start writes no frame to memory',
+              qt.readl(0x20000000 + y2), 0)
+        qt.writew(p2, 0x0011)
+        check('SCL: the same port in frame mode writes it',
+              qt.readl(0x20000000 + y2) != 0, True)
+    finally:
+        qt.close()
+
+
 def test_i6c_imx335_window(qemu, tmp):
     print('infinity6c with an IMX335: the window its mode registers set')
     path = i6_image(tmp, 'i6cw2.bin')
@@ -4712,6 +4734,7 @@ def main():
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_mmu_miss(args.qemu, tmp)
     test_i6c_scl_unset(args.qemu, tmp)
+    test_i6c_scl_ring(args.qemu, tmp)
     test_i6c_imx335_window(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
