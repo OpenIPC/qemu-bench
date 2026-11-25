@@ -453,14 +453,14 @@ driver compares the build digits in the image.
 
 | Block | infinity6e, infinity6b0 | infinity6c |
 |---|---|---|
-| Sensor | `sensor=` on MIIC1, as `ipctool` looks for it; `imx415` on infinity6e, `imx307` on infinity6b0 | the same, `imx415` |
+| Sensor | `sensor=` on MIIC1, as `ipctool` looks for it; `imx415` on infinity6e, `imx307` on infinity6b0 | the same: `imx415`, or `imx335` (exposure and gain decoded as the IMX415's) |
 | VIF | `sstar-vif` with `i6e`, bank `0x1304`: per channel, mask reg `0x0B`, clear `0x0D`, status `0x0E` | `sstar-vif`, bank `0x1308`, Iford's layout |
 | ISP top | `sstar-isp`, bank `0x1302`, five interrupt groups. On infinity6b0 group 0 bit 1 too: `mi_vpe` counts frames on it, and drops a realtime channel's first ten against that count, for ever if it does not move | `sstar-isp`, seven groups |
 | Picture | `sstar-iford-isp` with `sensor-window`: the scene through the sensor's exposure | the same |
-| Scaler output | `sstar-i6e-scl`: bank `0x1213`, `0x1215`; interrupts bank `0x1218` | `sstar-iford-scl`, bank `0x1253` |
+| Scaler output | `sstar-i6e-scl`: bank `0x1213`, `0x1215`; interrupts bank `0x1218` | `sstar-iford-scl`, ports 0 to 3 in banks `0x1253`-`0x1256` |
 | CMDQ | `sstar-cmdq`, Ifado's four banks | twelve, banks `0x1120`, `0x1123`-`0x1129`, `0x1360`-`0x1363`; idle is status bit 27 alone |
 | MIU MMU | infinity6e: bank `0x1013`; infinity6b0 has none | bank `0x1659` as Iford, init done bit 9, regions in regs 5 and 6, and the CPU's window at `0x60000000` |
-| Encoder | `sstar-wave5` at `0x1F345200`: host commands, H.265 from `hevc-enc.c` | `sstar-wave5` at `0x1F34D000`: the same, and pictures through a queue |
+| Encoder | `sstar-wave5` at `0x1F345200`: host commands, H.265 from `hevc-enc.c` | `sstar-wave5` at `0x1F34D000`: the same, pictures through a queue, and cascaded channels |
 | CPU | Cortex-A7 | QEMU's ARMv8 `max`, saying A35: userland built for the A35 traps on a plain A7 |
 
 VPE to VENC is a **hardware ring**: on `ssc338q` the port's buffer holds 138
@@ -470,6 +470,43 @@ frame is never in memory. The scaler gives the frame straight to the encoder
 (`sstar_i6e_scl_ring()`, `sstar_iford_scl_ring()`). infinity6b0's ring is a
 whole frame, which the encoder reads like a whole-buffer bind; both bind types
 stream there.
+
+infinity6c's scaler has four outputs, one bank each from `0x1253`, laid out
+alike: reg `0x00` bit 0 enable, bit 4 start of a frame, bit 15 a hardware
+ring; `0x02` the width in 16-pixel units, `0x03` the height, `0x05` the
+pitch, `0x06`/`0x07` the Y buffer in 16-byte units, the C plane `0x20`
+registers on. A port in frame mode gets the picture written on its start; a
+ring port gets none, since the encoder takes the picture from the scaler.
+The start bit does not stay set. OpenIPC's majestic runs its second stream
+from port 2.
+
+A raptor image's second stream is a **VENC cascade**: channel 1 is bound to
+channel 0 as a ring, and the firmware passes the main's picture to it. The
+host names no buffer: picture register `0x144` carries, in its high half,
+the encoder instance the picture comes from (bits 31-24) and the one it
+goes to (23-16), `0xFF` for none (`MHAL_VENC_Wrapper_EncodeOneFrame` in
+`mi.ko`). Each byte is the VPU API instance index (`CodecInst.instIndex`,
+kept at `+0x881` of the wrapper's context by
+`MHAL_VENC_Wrapper_CreateInstance`), the number the instance register
+takes, not the MI channel. An instance naming a next one keeps its source
+picture; one naming a previous one encodes that picture at its own size. A
+high half of `0x0000` is no cascade: infinity6e's driver writes the index
+alone.
+
+Both firmwares' streams, on `-M ssc377d,sensor=imx335`:
+
+| Image | Main | Sub |
+|---|---|---|
+| OpenIPC `ssc377d` lite with majestic | H.264 2592x1944, through the ring | H.264 1280x720 (or 1280x960, `.video1.size`), scaler port 2 |
+| Thingino with raptor (a JL12D2 flash image) | H.264 2592x1944, through the ring | H.264 1280x960, the cascade |
+
+majestic's default H.265 main does not open: it reports a parameter set of
+4294967292 bytes, and its SDP has no PPS. Set `.video0.codec h264`; the
+image ships with `.video1` off, so set `.video1.enabled true` for the sub.
+OpenIPC's `ssc377d` lite image asks for the majestic EULA and a new
+password at the first login, and its watchdog reboots the board when
+majestic stops: change its settings with `cli -s` (or its API, which saves
+`/etc/majestic.yaml`) and boot the copy again.
 
 infinity6c's driver (`codec40`) queues pictures: sixteen 256-byte pages in
 memory, each an image of registers `0x100`-`0x1FF`, named by `0x16C` at

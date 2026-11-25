@@ -53,6 +53,23 @@
  * A source on the scaler's hardware ring comes straight from the scaler: it
  * holds a few lines, never a frame (sstar_i6e_scl_ring()).
  *
+ * infinity6c cascades one channel off another (MI_SYS_BindChnPort2 from a
+ * VENC output to a VENC input, bind type HW_RING: a main stream and the sub
+ * stream it feeds).  The host never names the buffer between them: 0x144,
+ * whose low byte is the source index, carries the two neighbours in its high
+ * half: [31:24] the VPU instance this picture's source comes from and
+ * [23:16] the one it passes on to, 0xFF for none (mi.ko
+ * MHAL_VENC_Wrapper_EncodeOneFrame, from each context's bound neighbour).
+ * Each byte is the neighbour's VPU API instance index (CodecInst.instIndex),
+ * which MHAL_VENC_Wrapper_CreateInstance stores at +0x881 of its context,
+ * the number the host writes to the instance register: not the MI channel.
+ * The firmware hands the main's picture to the sub, which encodes it at its
+ * own size; the sub's source registers name a ring in the VENC device's
+ * private pool that the firmware fills.  Modelled: a picture with a next
+ * instance is kept, and a picture with a previous one is that instance's
+ * last, scaled by nearest neighbour; a high half of 0x0000 names no
+ * neighbours (wave5_cascaded()).
+ *
  * The bitstream comes from hevc-enc.c: VPS, SPS and PPS for headers, IDR
  * and TRAIL_R pictures for the rest, against the stream's own reconstructed
  * picture.  The instance register's high half is the codec, 3 for AVC, seen
@@ -111,6 +128,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarWave5State, SSTAR_WAVE5)
 #define R_RD_PTR            0x114
 #define R_BS_START          0x118       /* also the write pointer's read */
 #define R_BS_SIZE           0x11C
+#define R_SRC_IDX           0x144       /* [31:24] from, [23:16] to: cascade */
 #define R_SRC_Y             0x148
 #define R_SRC_CB            0x14C
 #define R_SRC_STRIDE        0x154
@@ -157,6 +175,8 @@ typedef struct Wave5Inst {
     HevcEncRef *ref;
     bool avc;
     H264Enc h264;
+    uint8_t *pic_y, *pic_uv;    /* the last source, for a cascaded sub */
+    uint32_t pic_w, pic_h;
 } Wave5Inst;
 
 struct SstarWave5State {
@@ -254,8 +274,8 @@ static void wave5_done(void *opaque)
 }
 
 /* NV12 from the planes the command names; the encoder's input */
-static void wave5_source(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
-                         uint8_t **uv, uint32_t *ys, uint32_t *cs)
+static void wave5_source_read(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
+                              uint8_t **uv, uint32_t *ys, uint32_t *cs)
 {
     uint32_t stride = *wave5_reg(s, R_SRC_STRIDE);
     size_t ylen, clen;
@@ -283,6 +303,96 @@ static void wave5_source(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
     }
     wave5_mem(s, *wave5_reg(s, R_SRC_Y) - s->mem_base, *y, ylen, false);
     wave5_mem(s, *wave5_reg(s, R_SRC_CB) - s->mem_base, *uv, clen, false);
+}
+
+static void wave5_inst_clear(Wave5Inst *in)
+{
+    hevc_enc_ref_free(in->ref);
+    g_free(in->pic_y);
+    g_free(in->pic_uv);
+    memset(in, 0, sizeof(*in));
+}
+
+/*
+ * 0x144 names channels only when its high half is set: a channel cannot feed
+ * itself, and "none" is 0xFF, so 0x0000 there is a driver that does not
+ * cascade (infinity6e's writes the source index alone).
+ */
+static bool wave5_cascaded(SstarWave5State *s)
+{
+    return (*wave5_reg(s, R_SRC_IDX) >> 16) != 0;
+}
+
+/* A cascaded channel's picture: the last one its main took, at its size */
+static bool wave5_cascade_in(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
+                             uint8_t **uv, uint32_t *ys, uint32_t *cs)
+{
+    uint32_t from = *wave5_reg(s, R_SRC_IDX) >> 24;
+    Wave5Inst *m = &s->inst[from % WAVE5_INSTANCES];
+    uint32_t w = in->width, h = in->height, x, l;
+
+    if (!wave5_cascaded(s) || from == 0xFF || m == in || !m->pic_y || !w ||
+        !h) {
+        return false;
+    }
+    *y = g_malloc((size_t)w * h);
+    *uv = g_malloc((size_t)w * (h / 2));
+    for (l = 0; l < h; l++) {
+        const uint8_t *src = m->pic_y + (size_t)l * m->pic_h / h * m->pic_w;
+
+        for (x = 0; x < w; x++) {
+            (*y)[(size_t)l * w + x] = src[(size_t)x * m->pic_w / w];
+        }
+    }
+    for (l = 0; l < h / 2; l++) {
+        const uint8_t *src = m->pic_uv +
+                             (size_t)l * (m->pic_h / 2) / (h / 2) * m->pic_w;
+
+        for (x = 0; x + 1 < w; x += 2) {
+            uint32_t px = MIN((size_t)x * m->pic_w / w, m->pic_w - 2) & ~1;
+
+            (*uv)[(size_t)l * w + x] = src[px];
+            (*uv)[(size_t)l * w + x + 1] = src[px + 1];
+        }
+    }
+    *ys = *cs = w;
+    return true;
+}
+
+/* A main channel keeps the picture it took for the channel it feeds */
+static void wave5_cascade_keep(SstarWave5State *s, Wave5Inst *in,
+                               const uint8_t *y, const uint8_t *uv,
+                               uint32_t ys, uint32_t cs)
+{
+    uint32_t to = (*wave5_reg(s, R_SRC_IDX) >> 16) & 0xFF;
+    uint32_t w = in->width, h = in->height, l;
+
+    if (!wave5_cascaded(s) || to == 0xFF || w < 2 || !h) {
+        return;
+    }
+    if (in->pic_w != w || in->pic_h != h) {
+        g_free(in->pic_y);
+        g_free(in->pic_uv);
+        in->pic_y = g_malloc((size_t)w * h);
+        in->pic_uv = g_malloc((size_t)w * (h / 2));
+        in->pic_w = w;
+        in->pic_h = h;
+    }
+    for (l = 0; l < h; l++) {
+        memcpy(in->pic_y + (size_t)l * w, y + (size_t)l * ys, w);
+    }
+    for (l = 0; l < h / 2; l++) {
+        memcpy(in->pic_uv + (size_t)l * w, uv + (size_t)l * cs, w);
+    }
+}
+
+static void wave5_source(SstarWave5State *s, Wave5Inst *in, uint8_t **y,
+                         uint8_t **uv, uint32_t *ys, uint32_t *cs)
+{
+    if (!wave5_cascade_in(s, in, y, uv, ys, cs)) {
+        wave5_source_read(s, in, y, uv, ys, cs);
+    }
+    wave5_cascade_keep(s, in, *y, *uv, *ys, *cs);
 }
 
 /* One access unit into the instance's buffer; returns its bytes */
@@ -455,14 +565,12 @@ static void wave5_command(SstarWave5State *s)
         s->done_unacked = false;
         break;
     case CMD_CREATE:
-        hevc_enc_ref_free(in->ref);
-        memset(in, 0, sizeof(*in));
+        wave5_inst_clear(in);
         in->dump = *wave5_reg(s, R_CQ_DUMP);
         in->avc = *wave5_reg(s, R_INSTANCE) >> 16 == WAVE5_CODEC_AVC;
         break;
     case CMD_DESTROY:
-        hevc_enc_ref_free(in->ref);
-        memset(in, 0, sizeof(*in));
+        wave5_inst_clear(in);
         break;
     case CMD_SET_PARAM:
         /* W5_CMD_ENC_SEQ_SRC_SIZE, height << 16 | width (option 0) */
@@ -649,8 +757,7 @@ static void sstar_wave5_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     for (i = 0; i < WAVE5_INSTANCES; i++) {
-        hevc_enc_ref_free(s->inst[i].ref);
-        memset(&s->inst[i], 0, sizeof(s->inst[i]));
+        wave5_inst_clear(&s->inst[i]);
     }
     s->cq_base = s->cq_rd = s->cq_wr = 0;
     s->done_unacked = false;

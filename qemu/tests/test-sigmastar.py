@@ -2385,6 +2385,110 @@ def test_iford_storage(qemu, tmp):
         qt.close()
 
 
+def test_iford_imx335(qemu, tmp):
+    print('Iford image pipe with an IMX335: its exposure and gain registers')
+    path = os.path.join(tmp, 'iford-imx335.bin')
+    img = bytearray(b'\xFF' * 0x1000000)
+    img[0:12] = b'\x06\x00\x00\xEAIPL_' + struct.pack('<I', 0x200)
+    open(path, 'wb').write(img)
+    qt = QTest(qemu, 'ssc029,flash-file=' + path + ',sensor=imx335', [])
+    try:
+        st = riu(0x131B, 0)
+        ae, awb, histo = 0x500000, 0x501000, 0x509700
+        for reg, base in ((0x08, ae), (0x0A, awb), (0x0C, histo)):
+            qt.writew(st + reg * 4, (base >> 4) & 0xFFFF)
+            qt.writew(st + (reg + 1) * 4, base >> 20)
+        for reg, val in ((0x30, 79), (0x31, 44), (0x32, 31), (0x33, 31),
+                         (0x40, 19), (0x41, 15), (0x42, 127), (0x43, 89),
+                         (0x02, 0x1111)):
+            qt.writew(st + reg * 4, val)
+        qt.writew(riu(0x1302, 0x28), 0xEFFF)
+
+        def sensor(reg, val):
+            """one register over MIIC, 16-bit address as the IMX335 takes"""
+            i2c = 0x1F222A00
+            qt.writew(i2c + 0x00 * 4, 0)
+            qt.writeb(i2c + 0x01 * 4, 1)
+            for b in (0x1A << 1, reg >> 8, reg & 0xFF, val):
+                qt.writew(i2c + 0x02 * 4, b)
+            qt.writeb(i2c + 0x01 * 4 + 1, 1)
+
+        def mean():
+            qt.step(50000000)
+            d = [qt.readb(DDR + ae + 4 * i + 3) for i in range(32 * 32)]
+            return sum(d) / len(d)
+
+        def expose(rows, gain=0):
+            """VMAX 1125 and SHR0 below it, low byte first, as
+            sensor_imx335_mipi.c writes them; the gain in 0.3 dB steps"""
+            for base, v in ((0x3030, 1125), (0x3058, 1125 - rows)):
+                for i in range(3):
+                    sensor(base + i, (v >> (8 * i)) & 0xFF)
+            sensor(0x30E8, gain & 0xFF)
+            sensor(0x30E9, gain >> 8)
+            return mean()
+
+        dark = mean()
+        low = expose(50)
+        high = expose(100)
+        check('IMX335: out of reset one row, darker than 50 (%.1f, %.1f)' %
+              (dark, low), dark < low, True)
+        check('IMX335: twice the rows (VMAX - SHR0), twice the mean Y '
+              '(%.1f, %.1f)' % (low, high),
+              low > 0 and 1.7 < high / low < 2.3, True)
+        gained = expose(50, 20)
+        check('IMX335: 6 dB of gain (20 steps of 0.3), twice the mean Y '
+              '(%.1f, %.1f)' % (low, gained),
+              low > 0 and 1.7 < gained / low < 2.3, True)
+
+        # The scene keeps its shape in a 4:3 window: through the scaler, at
+        # 4:3 the dot is round, and an output stretched to 16:9 stretches it,
+        # as an uncropped 4:3 sensor does on silicon.  The window here is the
+        # AE grid, 32 x 32 blocks: 80 x 45 pixels each is 2560x1440 (16:9),
+        # 80 x 60 is 2560x1920 (4:3).
+        expose(1000)
+        scl = riu(0x1253, 0)
+
+        def dot_shape(w, h, rows):
+            """the dot's width over its height in a w x h output; @rows the
+            band of the height that holds it, below the logo and above the
+            wedge"""
+            ya, ca = 0x600000, 0x700000
+            qt.writew(scl + 0x02 * 4, w // 16)
+            qt.writew(scl + 0x03 * 4, h)
+            qt.writew(scl + 0x05 * 4, w)
+            for n, a in ((0, ya), (0x20, ca)):
+                qt.writew(scl + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+                qt.writew(scl + (n + 0x07) * 4, a >> 20)
+            qt.writew(scl, 0x10)
+            y0, y1 = int(h * rows[0]), int(h * rows[1])
+            reply = qt.cmd('read 0x%x 0x%x' % (DDR + ya + y0 * w,
+                                               (y1 - y0) * w))
+            pix = bytes.fromhex(reply.split()[1][2:])
+            top = max(pix)
+            xs = [i % w for i, v in enumerate(pix) if v > top * 0.6]
+            ys = [i // w for i, v in enumerate(pix) if v > top * 0.6]
+            if not xs:
+                return 0.0
+            return (max(xs) - min(xs) + 1) / (max(ys) - min(ys) + 1)
+
+        # a 16:9 window: the scene fills it, as it always did (dot 74-86 %)
+        wide_win = dot_shape(640, 360, (0.72, 0.875))
+        check('Scene: a 16:9 window and output, the dot round (w/h %.2f)' %
+              wide_win, 0.9 < wide_win < 1.1, True)
+        # a 4:3 window: the scene at one scale, centred (dot 68-77 %)
+        qt.writew(st + 0x31 * 4, 59)
+        expose(1000)
+        square = dot_shape(640, 480, (0.66, 0.785))
+        wide = dot_shape(640, 360, (0.66, 0.785))
+        check('Scene: a 4:3 window keeps its shape, a 4:3 output\'s dot '
+              'round (w/h %.2f)' % square, 0.9 < square < 1.1, True)
+        check('Scene: a 16:9 output of it stretches it 4/3 wide (w/h %.2f)' %
+              wide, 1.2 < wide < 1.45, True)
+    finally:
+        qt.close()
+
+
 def test_ssc029(qemu, tmp):
     print('ssc029 (Iford): GICv3, the boot FSP, the DRAM test and the XZ decoder')
     path = os.path.join(tmp, 'iford.bin')
@@ -2563,10 +2667,41 @@ def test_ssc029(qemu, tmp):
         check('SCL: chroma is the scene\'s, not zero',
               qt.readb(0x60002000) != 0, True)
 
+        # Port 2, the next bank but one, writes its own buffers (majestic's
+        # second stream), and port 0's start does not write them
+        qt.writew(mmu, 0)
+        p2 = riu(0x1255, 0)
+        y2, c2 = 0x800000, 0x806000
+        qt.writew(p2 + 0x02 * 4, 0x50)              # 1280
+        qt.writew(p2 + 0x03 * 4, 16)
+        qt.writew(p2 + 0x05 * 4, 0x500)
+        for n, a in ((0, y2), (0x20, c2)):
+            qt.writew(p2 + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+            qt.writew(p2 + (n + 0x07) * 4, a >> 20)
+        qt.writew(scl, 0x10)
+        check('SCL: port 0\'s start leaves port 2\'s buffer alone',
+              qt.readl(DDR + y2), 0)
+        qt.writew(p2, 0x10)
+        check('SCL: port 2 writes a frame to its own buffer',
+              qt.readl(DDR + y2) != 0, True)
+        check('SCL: port 2\'s chroma is the scene\'s, not zero',
+              qt.readb(DDR + c2) != 0, True)
+        # start triggers one frame: a later write to the control register
+        # (mi_scl's masked disable) does not write the buffer again
+        qt.writel(DDR + y2, 0)
+        qt.writeb(p2 + 1, 0x00)                     # the low byte kept
+        check('SCL: the start bit does not stay set', qt.readw(p2) & 0x10, 0)
+        check('SCL: disabling the port writes no frame', qt.readl(DDR + y2), 0)
+        # Iford: bit 15 changes nothing.  Its encoder, sstar-venc, reads
+        # memory and never takes a ring from the scaler, so the frame is
+        # written as before (infinity6c's ring: test_i6c_scl_ring)
+        qt.writew(p2, 0x8011)
+        check('SCL (Iford): a port with bit 15 still writes its frame',
+              qt.readl(DDR + y2) != 0, True)
+
         # The image pipe: sensor, statistics, white balance, the scaler.  The
         # ISP's frame clock, group 0 bit 12, with the stats grids the driver
         # sets; the sensor's exposure over I2C, as the vendor's AE writes it.
-        qt.writew(mmu, 0)
         st = riu(0x131B, 0)
         ae, awb, histo = 0x500000, 0x501000, 0x509700
         for reg, base in ((0x08, ae), (0x0A, awb), (0x0C, histo)):
@@ -2846,6 +2981,45 @@ def test_i6e_media(qemu, tmp):
             pocs.append(qt.readl(wave + 0x128))
         check('Wave5: POC runs on across a header request',
               pocs[3] - pocs[0], 3)
+        # A cascade (infinity6c's VENC to VENC bind): 0x144's high half names
+        # the channel a picture comes from [31:24] and goes to [23:16].  The
+        # sub's own source is flat; the main's is noise.  Every picture intra.
+        main, sub = 3, 4
+        flat, noisy = 0x01200000, 0x01300000
+        for n, size in ((main, 64), (sub, 32)):
+            cmd(0x0008, 0, n)
+            qt.writel(wave + 0x11C, size << 16 | size)
+            qt.writel(wave + 0x130, 1 << 16)
+            cmd(0x0200, 0, n)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + flat + i, 0x80808080)
+            v = (i * 2654435761) & 0xFFFFFFFF
+            qt.writel(0x20000000 + noisy + i, v ^ (v >> 13))
+
+        def pic(n, source, w, chans):
+            qt.writel(wave + 0x118, bs)
+            qt.writel(wave + 0x11C, 0x10000)
+            qt.writel(wave + 0x144, chans << 16)
+            qt.writel(wave + 0x148, source)
+            qt.writel(wave + 0x14C, source + w * w)
+            qt.writel(wave + 0x154, w << 16 | w)
+            cmd(0x0100, 0x02, n)
+            qt.step(10 * 1000000)
+            cmd(0x4000, 0x02, n)
+            return qt.readl(wave + 0x14C)
+
+        alone = pic(sub, flat, 32, 0xFFFF)
+        pic(main, flat, 64, 0xFF00 | sub)
+        check('Wave5 cascade: a flat main gives the sub the same picture',
+              pic(sub, noisy, 32, main << 8 | 0xFF), alone)
+        pic(main, noisy, 64, 0xFF00 | sub)
+        fed = pic(sub, flat, 32, main << 8 | 0xFF)
+        check('Wave5 cascade: the sub encodes its main\'s picture, not its '
+              'own flat source (%d bytes, alone %d)' % (fed, alone),
+              fed > alone, True)
+        check('Wave5 cascade: a high half of 0 names no channel',
+              pic(sub, flat, 32, 0), alone)
+        qt.writel(wave + 0x144, 0)
         # H.264: the instance register's high half, as mi_venc writes it
         avc = 3 << 16 | 1
         cmd(0x0008, 0, avc)
@@ -3870,6 +4044,99 @@ def test_i6c_scl_unset(qemu, tmp):
         qt.close()
 
 
+def test_i6c_scl_ring(qemu, tmp):
+    print('infinity6c scaler: a ring port writes no frame to memory')
+    path = i6_image(tmp, 'i6cr2.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        p2 = riu(0x1255, 0)
+        y2 = 0x800000
+        qt.writew(p2 + 0x02 * 4, 0x50)              # 1280
+        qt.writew(p2 + 0x03 * 4, 16)
+        qt.writew(p2 + 0x05 * 4, 0x500)
+        qt.writew(p2 + 0x06 * 4, (y2 >> 4) & 0xFFFF)
+        qt.writew(p2 + 0x07 * 4, y2 >> 20)
+        # bit 15, the encoder's hardware ring: its buffer holds a few
+        # lines, and the encoder takes the picture from the scaler
+        # (sstar_iford_scl_ring(), test_i6c_wave5_ring_port)
+        qt.writew(p2, 0x8011)
+        check('SCL: a ring port\'s start writes no frame to memory',
+              qt.readl(0x20000000 + y2), 0)
+        qt.writew(p2, 0x0011)
+        check('SCL: the same port in frame mode writes it',
+              qt.readl(0x20000000 + y2) != 0, True)
+    finally:
+        qt.close()
+
+
+def test_i6c_imx335_window(qemu, tmp):
+    print('infinity6c with an IMX335: the window its mode registers set')
+    path = i6_image(tmp, 'i6cw2.bin')
+    qt = QTest(qemu, 'ssc377,flash-file=' + path + ',sensor=imx335', [])
+    try:
+        def sensor(reg, val):
+            """one register over MIIC1, 16-bit address as the IMX335
+            takes"""
+            i2c = 0x1F222A00
+            qt.writew(i2c + 0x00 * 4, 0)
+            qt.writeb(i2c + 0x01 * 4, 1)
+            for b in (0x1A << 1, reg >> 8, reg & 0xFF, val):
+                qt.writew(i2c + 0x02 * 4, b)
+            qt.writeb(i2c + 0x01 * 4 + 1, 1)
+
+        def sensor16(reg, v):
+            sensor(reg, v & 0xFF)
+            sensor(reg + 1, v >> 8)
+
+        # bright enough to find the dot: VMAX 1125, SHR0 125
+        for base, v in ((0x3030, 1125), (0x3058, 125)):
+            for i in range(3):
+                sensor(base + i, (v >> (8 * i)) & 0xFF)
+        isp = riu(0x1302, 0)
+        qt.writew(isp + 0x28 * 4, 0)
+        qt.writew(isp, 1)
+        scl = riu(0x1253, 0)
+
+        def dot_shape(w, h, rows):
+            """the dot's width over its height in a w x h frame from scaler
+            port 0; @rows the band of the height that holds it"""
+            qt.step(100 * 1000000)
+            ya, ca = 0x600000, 0x700000
+            qt.writew(scl + 0x02 * 4, w // 16)
+            qt.writew(scl + 0x03 * 4, h)
+            qt.writew(scl + 0x05 * 4, w)
+            for n, a in ((0, ya), (0x20, ca)):
+                qt.writew(scl + (n + 0x06) * 4, (a >> 4) & 0xFFFF)
+                qt.writew(scl + (n + 0x07) * 4, a >> 20)
+            qt.writew(scl, 0x11)
+            y0, y1 = int(h * rows[0]), int(h * rows[1])
+            reply = qt.cmd('read 0x%x 0x%x' % (0x20000000 + ya + y0 * w,
+                                               (y1 - y0) * w))
+            pix = bytes.fromhex(reply.split()[1][2:])
+            top = max(pix)
+            xs = [i % w for i, v in enumerate(pix) if v > top * 0.6]
+            ys = [i // w for i, v in enumerate(pix) if v > top * 0.6]
+            if not xs:
+                return 0.0
+            return (max(xs) - min(xs) + 1) / (max(ys) - min(ys) + 1)
+
+        # out of reset, WINMODE 0: the full 2592x1944, 4:3.  A 16:9 frame of
+        # it stretches the dot 4/3 wide
+        full = dot_shape(640, 360, (0.66, 0.785))
+        check('IMX335 WINMODE 0: the full 4:3 window, a 16:9 frame '
+              'stretches the dot (w/h %.2f)' % full, 1.2 < full < 1.45, True)
+        # OpenIPC's 1920x1080@120 mode: WINMODE 4, HNUM 1944, Y_OUT_SIZE
+        # 1080, nearly 16:9; the same frame of it keeps the dot round
+        sensor(0x3018, 4)
+        sensor16(0x302E, 1944)
+        sensor16(0x3056, 1080)
+        crop = dot_shape(640, 360, (0.72, 0.875))
+        check('IMX335 WINMODE 4, 1944x1080: the dot round in a 16:9 frame '
+              '(w/h %.2f)' % crop, 0.9 < crop < 1.1, True)
+    finally:
+        qt.close()
+
+
 def i6c_wave5_two(qemu, tmp, ack):
     """Two instances' pictures queued at once; the host takes the first
     picture's end by ack: 'reason' (REASON_CLEAR with ENC_PIC), 'vint'
@@ -3960,6 +4227,155 @@ def test_i6c_wave5_two(qemu, tmp):
     print('infinity6c Wave5: two instances queued, one done at a time')
     for ack in ('reason', 'vint', 'poll', 'destroy'):
         i6c_wave5_two(qemu, tmp, ack)
+
+
+def test_i6c_wave5_ring_port(qemu, tmp):
+    print('infinity6c Wave5: a source on a scaler ring port, whichever port')
+    path = i6_image(tmp, 'i6cr.bin')
+    wave = 0x1F34D000
+    dram = 0x22000000
+    src = 0x01100000
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101, 0x102))
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        qt.writel(wave + 0x14C, 0x20000)
+        cmd(0x0008)
+        qt.writel(wave + 0x11C, 64 << 16 | 64)
+        qt.writel(wave + 0x130, 1 << 16)    # every picture intra
+        cmd(0x0200)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(0x20000000 + src + i, 0x80808080)
+        bs = 0x40000
+
+        def picture(k):
+            p = dram + k * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x18, bs)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x48, src)
+            qt.writel(p + 0x4C, src + 64 * 64)
+            qt.writel(p + 0x54, 64 << 16 | 64)
+            for i in range(0, 0x400, 4):
+                qt.writel(dram + bs + i, 0)
+            qt.writel(wave + 0x1F8, k + 1)
+            qt.step(20 * 1000000)
+            qt.writel(wave + 0x3C, 1)       # VINT_CLEAR: taken
+            qt.step(1000000)
+            return [qt.readl(dram + bs + i) for i in range(0, 0x400, 4)]
+
+        flat = picture(0)
+        check('Wave5: a picture from memory', any(flat), True)
+        # port 2 bound to the encoder as a ring at the source's address
+        p2 = riu(0x1255, 0)
+        qt.writew(p2 + 0x02 * 4, 0x04)              # 64
+        qt.writew(p2 + 0x03 * 4, 16)
+        qt.writew(p2 + 0x05 * 4, 64)
+        qt.writew(p2 + 0x06 * 4, (src >> 4) & 0xFFFF)
+        qt.writew(p2 + 0x07 * 4, src >> 20)
+        qt.writew(p2, 0x8001)
+        ring = picture(1)
+        check("Wave5: a source on ring port 2 is the scaler's picture, "
+              'not the memory behind it', ring != flat, True)
+        qt.writew(p2, 0x0001)                       # frame mode: memory
+        check('Wave5: the same port in frame mode is read from memory',
+              picture(2) == flat, True)
+    finally:
+        qt.close()
+
+
+def test_i6c_wave5_cascade(qemu, tmp):
+    print('infinity6c Wave5: a cascade through the queue, as mi.ko sends it')
+    path = i6_image(tmp, 'i6cc.bin')
+    wave = 0x1F34D000
+    dram = 0x22000000
+    # the sources in pages the MIU MMU maps (VPA pages 0xFFB, 0xFFC), so
+    # what is read is what the test wrote
+    flat, noisy = 0x3FF60000, 0x3FF80000
+    host = {flat: dram + 0x60000, noisy: dram + 0x80000}
+    main, sub = 0, 1
+    dumps = {main: 0x20000, sub: 0x24000}
+    qt = QTest(qemu, 'ssc377,flash-file=' + path, [])
+    try:
+        i6c_mmu(qt, (0x100, 0x101, 0x102, 0x103, 0x104))
+        qt.writel(wave + 0x48, 0xBD40)
+        qt.writel(wave + 0x16C, 0)
+        qt.writel(wave + 0x100, 1)
+        qt.writel(wave + 0x6C, 1)
+
+        def cmd(c, opt=0, inst=0):
+            qt.writel(wave + 0x104, opt)
+            qt.writel(wave + 0x110, inst)
+            qt.writel(wave + 0x70, 1)
+            qt.writel(wave + 0x100, c)
+            qt.writel(wave + 0x38, 1)
+
+        # the main 64x64, the sub 32x32 it feeds; every picture intra
+        for n, size in ((main, 64), (sub, 32)):
+            qt.writel(wave + 0x14C, dumps[n])
+            cmd(0x0008, inst=n)
+            qt.writel(wave + 0x11C, size << 16 | size)
+            qt.writel(wave + 0x130, 1 << 16)
+            cmd(0x0200, inst=n)
+        for i in range(0, 64 * 96, 4):
+            qt.writel(host[flat] + i, 0x80808080)
+            v = (i * 2654435761) & 0xFFFFFFFF
+            qt.writel(host[noisy] + i, v ^ (v >> 13))
+        bs = 0x40000
+        k = [0]
+
+        def pic(n, source, w, neighbours):
+            """one picture queued as DrvVcodecVdiWriteCmd writes it: 0x144's
+            high half (page 0x44) the VPU instances it comes from and goes
+            to; returns its bytes from the results the firmware leaves"""
+            p = dram + (k[0] % 16) * 0x100
+            for i in range(0, 0x100, 4):
+                qt.writel(p + i, 0)
+            qt.writel(p + 0x00, 0x0100)
+            qt.writel(p + 0x04, 0x02)
+            qt.writel(p + 0x10, n)
+            qt.writel(p + 0x18, bs)
+            qt.writel(p + 0x1C, 0x10000)
+            qt.writel(p + 0x44, neighbours << 16)
+            qt.writel(p + 0x48, source)
+            qt.writel(p + 0x4C, source + w * w)
+            qt.writel(p + 0x54, w << 16 | w)
+            k[0] += 1
+            qt.writel(wave + 0x1F8, k[0] % 16)
+            qt.step(20 * 1000000)
+            qt.writel(wave + 0x3C, 1)       # VINT_CLEAR: taken
+            qt.step(1000000)
+            return qt.readl(dram + dumps[n] + 0x4C)
+
+        alone = pic(sub, flat, 32, 0xFFFF)
+        check('Wave5 queue: the sub alone encodes its own source (%d bytes)'
+              % alone, alone > 0, True)
+        pic(main, flat, 64, 0xFF00 | sub)
+        check('Wave5 queue cascade: a flat main gives the sub the same '
+              'picture', pic(sub, noisy, 32, main << 8 | 0xFF), alone)
+        pic(main, noisy, 64, 0xFF00 | sub)
+        fed = pic(sub, flat, 32, main << 8 | 0xFF)
+        check('Wave5 queue cascade: the sub encodes its main\'s picture, not '
+              'its own flat source (%d bytes, alone %d)' % (fed, alone),
+              fed > alone, True)
+        check('Wave5 queue: a high half of 0 names no neighbour',
+              pic(sub, flat, 32, 0), alone)
+    finally:
+        qt.close()
 
 
 def test_i6c_cmdq_mask(qemu, tmp):
@@ -4367,6 +4783,7 @@ def main():
     test_sensor_catalogue(args.qemu)
     test_msc313e_sd(args.qemu, tmp)
     test_ssc029(args.qemu, tmp)
+    test_iford_imx335(args.qemu, tmp)
     test_ssc029_rtcpwc(args.qemu, tmp)
     test_ssc029_power_off(args.qemu, tmp)
     test_ssc029_smp(args.qemu, tmp)
@@ -4392,10 +4809,14 @@ def main():
     test_i6c_media(args.qemu, tmp)
     test_i6c_cmdq_mask(args.qemu, tmp)
     test_i6c_wave5_two(args.qemu, tmp)
+    test_i6c_wave5_ring_port(args.qemu, tmp)
+    test_i6c_wave5_cascade(args.qemu, tmp)
     test_i6c_jpe_mmu(args.qemu, tmp)
     test_i6c_ispscl(args.qemu, tmp)
     test_i6c_mmu_miss(args.qemu, tmp)
     test_i6c_scl_unset(args.qemu, tmp)
+    test_i6c_scl_ring(args.qemu, tmp)
+    test_i6c_imx335_window(args.qemu, tmp)
     test_i6c_bdma_irq(args.qemu, tmp)
     test_i6c_bdma_mmu(args.qemu, tmp)
     print('%d failure(s)' % failures)

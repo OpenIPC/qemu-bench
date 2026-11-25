@@ -302,6 +302,18 @@ def main():
           'a violation' % (get('lines'), get('vts')))
     qmp.close()
     q.close()
+
+    # The IMX335 reports its exposure everywhere, but its window only where
+    # the machine asks (infinity6c, whose ISP takes the window the mode
+    # registers set): hisi-vi and hisi-viu keep the size their own
+    # registers set
+    q, qmp, get, wr, qom_set = machine('imx335', 'hisi-imx335', 0x1A,
+                                       soc='hi3516ev300')
+    check(get('window') is False,
+          'IMX335 on hi3516ev300: no fixed window (window=%s)' %
+          get('window'))
+    qmp.close()
+    q.close()
     print('%d failure(s)' % fails)
     return 1 if fails else 0
 

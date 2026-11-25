@@ -2411,6 +2411,15 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
         }
 
         dev = image_sensor_create(bus[c->miic_sensor_bus], sensor);
+        /*
+         * infinity6c's ISP takes its window from the sensor: the IMX335
+         * gives the one its mode registers set
+         */
+        if (dev && c->die == SS_DIE_INFINITY6C &&
+            object_property_find(OBJECT(dev), "window")) {
+            object_property_set_bool(OBJECT(dev), "window", true,
+                                     &error_fatal);
+        }
         if (dev && (iford || c->die == SS_DIE_INFINITY6C)) {
             DeviceState *scl = qdev_new("sstar-iford-scl");
             DeviceState *pipe = qdev_new("sstar-iford-isp");
@@ -2437,6 +2446,7 @@ static void sigmastar_common_init(MachineState *machine, const SsSoCConfig *c)
                                         qdev_get_gpio_in(pipe, 0));
             object_property_set_link(OBJECT(scl), "isp", OBJECT(pipe),
                                      &error_fatal);
+            qdev_prop_set_bit(scl, "ring", c->die == SS_DIE_INFINITY6C);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(scl), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(scl), 0,
                             SSTAR_RIU_ADDR(0x1253, 0));

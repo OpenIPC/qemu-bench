@@ -4,9 +4,15 @@
  * mi_scl.ko programs each output's write DMA from the CMDQ.  From its
  * _HAL_SCL_CHIP_SetBufCfg and the commands of a running pipeline, bank
  * 0x1253 is port 0, plane by plane, 0x20 registers apart (Y at 0, C at
- * 0x20):
+ * 0x20).  Ports 1 to 3 are the next banks, 0x1254 to 0x1256, laid out the
+ * same: OpenIPC's majestic runs its second stream from port 2 (bank 0x1255,
+ * 1280x720 into four buffers in turn, which mi_scl hands to the encoder in
+ * frame mode):
  *
- *   0x00 bit 0 enable, bit 4 start of a frame
+ *   0x00 bit 0 enable, bit 4 start of a frame, bit 15 a hardware ring
+ *        (set on the port bound to the encoder as a ring, clear on frame
+ *        ports: both firmwares' commands, and /proc/mi_modules/mi_scl's
+ *        "Ring" and "Frame" on a camera)
  *   0x02 the width in 16-pixel units   0x03 the height in rows
  *   0x05 the pitch in bytes
  *   0x06/0x07 the buffer, a MIU address in 16-byte units, which the MIU
@@ -15,11 +21,17 @@
  * What is modelled is the frame reaching memory: on the Y plane's start
  * the ISP's last picture (sstar_iford_isp_picture()) is written to those
  * addresses as NV12, where the encoder takes it, at the output's size by
- * nearest neighbour.  The scaler's own registers beyond these are not read:
- * no crop, no filters.  infinity6c's mi_scl starts an output before it has
- * given it a buffer: a plane whose address is still 0 is not written
- * [assumed: MIU 0 is the kernel's, so the hardware cannot be
- * writing a frame there].
+ * nearest neighbour.  On infinity6c ("ring", which the machine sets for that
+ * die) a ring port writes nothing: its buffer holds a few lines, never a
+ * frame, and its encoders (sstar-wave5, and the JPE through i6_irq) take the
+ * picture from here (sstar_iford_scl_ring()); a whole frame written there ran
+ * past the ring and cost more than any other step of a frame (23 ms of
+ * 2592x1944).  Iford's encoder, sstar-venc, never asks for it, so there every
+ * port's frame is written as before.  The
+ * scaler's own registers beyond these are not read: no crop, no filters.
+ * infinity6c's mi_scl starts an output before it has given it a buffer: a
+ * plane whose address is still 0 is not written [assumed: MIU 0 is the
+ * kernel's, so the hardware cannot be writing a frame there].
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -38,7 +50,8 @@
 #define TYPE_SSTAR_IFORD_SCL "sstar-iford-scl"
 OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
 
-#define SCL_REGS            0x80
+#define SCL_REGS            0x80        /* one port: a bank */
+#define SCL_PORTS           4
 #define PLANE_C             0x20
 #define R_CTRL              0x00
 #define R_WIDTH16           0x02
@@ -47,16 +60,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SstarIfordSclState, SSTAR_IFORD_SCL)
 #define R_ADDR_LO           0x06
 #define R_ADDR_HI           0x07
 #define CTRL_START          (1u << 4)
-
+#define CTRL_RING           (1u << 15)
 
 struct SstarIfordSclState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     Object *isp;
-    uint16_t regs[SCL_REGS];
+    uint16_t regs[SCL_PORTS * SCL_REGS];
     uint32_t frame;
     bool trace;
+    bool ring;          /* infinity6c: ring ports feed the encoder directly */
     int w;
     uint8_t *row;
 };
@@ -68,17 +82,19 @@ static void scl_write_mem(uint64_t miu, const uint8_t *p, size_t len)
     sstar_miu_rw(miu, (void *)p, len, true);
 }
 
-static void scl_frame(SstarIfordSclState *s)
+static void scl_frame(SstarIfordSclState *s, int port)
 {
-    int w = s->regs[R_WIDTH16] * 16, h = s->regs[R_HEIGHT];
-    uint32_t pitch = s->regs[R_PITCH];
-    uint64_t ya = ((uint64_t)s->regs[R_ADDR_HI] << 16 | s->regs[R_ADDR_LO]) << 4;
-    uint64_t ca = ((uint64_t)s->regs[PLANE_C + R_ADDR_HI] << 16 |
-                   s->regs[PLANE_C + R_ADDR_LO]) << 4;
+    const uint16_t *pr = s->regs + port * SCL_REGS;
+    int w = pr[R_WIDTH16] * 16, h = pr[R_HEIGHT];
+    uint32_t pitch = pr[R_PITCH];
+    uint64_t ya = ((uint64_t)pr[R_ADDR_HI] << 16 | pr[R_ADDR_LO]) << 4;
+    uint64_t ca = ((uint64_t)pr[PLANE_C + R_ADDR_HI] << 16 |
+                   pr[PLANE_C + R_ADDR_LO]) << 4;
     const uint8_t *py, *puv;
     int pw, ph, x, y;
 
-    if (!w || !h || w > 4096 || h > 4096 || pitch < w) {
+    if (!w || !h || w > 4096 || h > 4096 || pitch < w ||
+        (s->ring && (pr[R_CTRL] & CTRL_RING))) {
         return;
     }
     if (s->w != w) {
@@ -115,26 +131,42 @@ static void scl_frame(SstarIfordSclState *s)
         scl_write_mem(ca + y * pitch, s->row, w);
     }
     if (s->trace) {
-        qemu_log("sstar-iford-scl: frame %u %dx%d from %dx%d\n", s->frame, w, h,
-                 pw, ph);
+        qemu_log("sstar-iford-scl: port %d frame %u %dx%d from %dx%d\n", port,
+                 s->frame, w, h, pw, ph);
     }
     s->frame++;
 }
 
 /*
- * infinity6c binds this output to the encoder as a ring: lines at a pitch of
+ * infinity6c binds an output to the encoder as a ring: lines at a pitch of
  * the sensor's width, fewer of them than the frame has, which the encoder
  * drains as they come.  The picture goes to it from here, as NV12 at the
- * encoder's size.
+ * encoder's size.  Both firmwares seen bind port 0 so; with "ring", any port
+ * with the ring bit is taken too, since scl_frame() writes no frame for it.
  */
+static bool scl_ring_port(SstarIfordSclState *s, uint64_t ya)
+{
+    int port;
+
+    for (port = 0; port < SCL_PORTS; port++) {
+        const uint16_t *pr = s->regs + port * SCL_REGS;
+
+        /* port 0 as before; ports 1 to 3 when bound as a ring */
+        if ((port == 0 || (s->ring && (pr[R_CTRL] & CTRL_RING))) &&
+            ya == ((uint64_t)pr[R_ADDR_HI] << 16 | pr[R_ADDR_LO]) << 4) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool sstar_iford_scl_ring(uint64_t ya, int w, int h, uint8_t *dy, uint8_t *duv)
 {
     SstarIfordSclState *s = scl_state;
     const uint8_t *py, *puv;
     int pw, ph, x, y;
 
-    if (!s || ya != ((uint64_t)s->regs[R_ADDR_HI] << 16 |
-                     s->regs[R_ADDR_LO]) << 4) {
+    if (!s || !scl_ring_port(s, ya)) {
         return false;
     }
     sstar_iford_isp_picture(s->isp, &py, &puv, &pw, &ph);
@@ -161,7 +193,7 @@ bool sstar_iford_scl_ring(uint64_t ya, int w, int h, uint8_t *dy, uint8_t *duv)
 static uint64_t scl_read(void *opaque, hwaddr off, unsigned size)
 {
     SstarIfordSclState *s = opaque;
-    int r = (off >> 2) & (SCL_REGS - 1);
+    int r = (off >> 2) % (SCL_PORTS * SCL_REGS);
     uint16_t v;
 
     if ((off & 3) >= 2) {
@@ -177,7 +209,7 @@ static uint64_t scl_read(void *opaque, hwaddr off, unsigned size)
 static void scl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     SstarIfordSclState *s = opaque;
-    int r = (off >> 2) & (SCL_REGS - 1);
+    int r = (off >> 2) % (SCL_PORTS * SCL_REGS);
     uint16_t v = s->regs[r];
 
     if ((off & 3) >= 2) {
@@ -189,9 +221,15 @@ static void scl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     } else {
         v = val;
     }
-    s->regs[r] = v;
-    if (r == R_CTRL && (v & CTRL_START)) {
-        scl_frame(s);
+    /*
+     * The start bit triggers one frame and does not stay set: mi_scl writes
+     * the control register again with masked read-modify-writes (port 2's
+     * disable, mask 0x8001, while its buffers are being freed), and a start
+     * bit left standing would write a frame to a buffer it no longer owns.
+     */
+    s->regs[r] = v & (r % SCL_REGS == R_CTRL ? ~CTRL_START : 0xFFFF);
+    if (r % SCL_REGS == R_CTRL && (v & CTRL_START)) {
+        scl_frame(s, r / SCL_REGS);
     }
 }
 
@@ -210,7 +248,7 @@ static void scl_init(Object *obj)
     SstarIfordSclState *s = SSTAR_IFORD_SCL(obj);
 
     memory_region_init_io(&s->iomem, obj, &scl_ops, s, TYPE_SSTAR_IFORD_SCL,
-                          SCL_REGS * 4);
+                          SCL_PORTS * SCL_REGS * 4);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     scl_state = s;
 }
@@ -218,6 +256,7 @@ static void scl_init(Object *obj)
 static const Property scl_props[] = {
     DEFINE_PROP_LINK("isp", SstarIfordSclState, isp, TYPE_OBJECT, Object *),
     DEFINE_PROP_BOOL("trace", SstarIfordSclState, trace, false),
+    DEFINE_PROP_BOOL("ring", SstarIfordSclState, ring, false),
 };
 
 static void scl_class_init(ObjectClass *oc, const void *data)
