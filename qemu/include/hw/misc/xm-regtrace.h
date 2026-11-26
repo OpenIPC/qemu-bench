@@ -11,6 +11,9 @@
 
 #include "qemu/timer.h"
 
+/* Each device file opens the log for itself; one says why it can't. */
+bool xm_regtrace_warned __attribute__((weak));
+
 static inline FILE *xm_regtrace_file(void)
 {
     static FILE *f;
@@ -24,6 +27,10 @@ static inline FILE *xm_regtrace_file(void)
             f = fopen(p, "a");
             if (f) {
                 setvbuf(f, NULL, _IOLBF, 0);
+            } else if (!xm_regtrace_warned) {
+                xm_regtrace_warned = true;
+                fprintf(stderr, "XM_REGTRACE: cannot open %s: %s\n",
+                        p, strerror(errno));
             }
         }
     }
