@@ -151,6 +151,8 @@ typedef struct XmSoCConfig {
     hwaddr      nn_base;        /* xm-nn; 0 = none */
     hwaddr      fft_base;       /* xm-fft (XM533 ive.ko); 0 = none */
     int         fft_irq;
+    hwaddr      vo_base;        /* xm-vo (XM530V200 vo.ko); 0 = none */
+    int         vo_irq;
     hwaddr      usb_base;       /* DWC2 OTG core in host mode; 0 = none */
     int         usb_irq;
     hwaddr      codec_i2c_base; /* an xm-i2c bus with an audio codec on it */

@@ -47,6 +47,7 @@ cp qemu/hw/misc/xm-vimu.c qemu/hw/misc/xm-pattern.c.inc qemu/hw/misc/xm-vta.c \
 cp qemu/hw/misc/xm-osd.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-nn.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-fft.c            "$QEMU_DIR/hw/misc/"
+cp qemu/hw/misc/xm-vo.c             "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-jpeg.c qemu/hw/misc/jpeg-enc.c qemu/hw/misc/jpeg-enc.h \
                                     "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-audio.c          "$QEMU_DIR/hw/misc/"
@@ -581,6 +582,11 @@ if ! grep -q xm-fft "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-fft.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-fft.c"
+fi
+if ! grep -q xm-vo "$QEMU_DIR/hw/misc/meson.build"; then
+    echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vo.c'))" \
+        >> "$QEMU_DIR/hw/misc/meson.build"
+    echo "  hw/misc/meson.build: added xm-vo.c"
 fi
 if ! grep -q xm-audio "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-audio.c'))" \
