@@ -443,7 +443,9 @@ blocks it drives are not the AV100's:
   - FLUSHFIFO is a strobe.
 
   The DMA block at `+0x200` is storage, and FIFOs are 64 bytes, so this
-  covers enumeration, not bulk traffic. With
+  covers enumeration, not bulk traffic. With a device on the port the
+  machine does not migrate, because the transfer state is not in the
+  stream; with the port empty it does. With
   `-device atbm-wifi,pid=0x6162,port=1`, the high-speed ATBM6132 as the
   Yoton WS03 has it (OpenIPC/firmware#2962), the vendor's
   `usb-common`/`usbcore`/`ak_hcd` enumerate `007a:6162`.

@@ -19,8 +19,8 @@
  * on the cameras' Wi-Fi dongles.  The registers at 0x200 are the MUSB
  * HSDMA block: kept as storage, no transfer is moved by it yet.  Interrupt
  * 0 is the core's (ak_hcd's usb_add_hcd()), 1 the DMA's.  The MUSB state
- * is not in the migration stream (hcd-musb has none); a snapshot taken
- * with a device on the port comes back with the port reset.
+ * is not in the migration stream: with the port empty there is none to
+ * keep, and a device on the port blocks migration (hcd-musb.c).
  */
 
 #include "qemu/osdep.h"

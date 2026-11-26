@@ -29,9 +29,15 @@
  *   - high-speed devices on the port;
  *   - byte access to the CSRs and MAXPs, and 32-bit access to register
  *     pairs (TX / RX FIFOADDR);
- *   - INTRTX / INTRRX latch whatever INTRTXE / INTRRXE say;
+ *   - INTRUSB / INTRTX / INTRRX latch whatever their enables say;
  *   - every REQPKT is an IN token; FLUSHFIFO is a strobe;
- *   - EP0's FIFO at 0 from reset, and FIFO RAM no guest value overruns.
+ *   - a transaction to an address nobody has fails with H_ERROR;
+ *   - EP0's FIFO at 0 from reset, and no FIFO access or packet beyond
+ *     FIFO RAM, whatever the guest programs;
+ *   - wide FIFO reads take the bytes in order;
+ *   - reset cancels transfers and clears every endpoint; detaching stops
+ *     a device's scheduled completions too;
+ *   - a device on the port blocks migration (none of it is in the stream).
  */
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
@@ -39,6 +45,9 @@
 #include "hw/usb/hcd-musb.h"
 #include "hw/irq.h"
 #include "hw/hw.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "migration/blocker.h"
 
 /* Common USB registers */
 #define MUSB_HDRC_FADDR         0x00    /* 8-bit */
@@ -349,21 +358,63 @@ struct MUSBState {
     bool single_point;
 
     /*
-     * 32 KiB of FIFO RAM, as FIFOADDR (8-byte units, 12 bits) can name,
-     * and room past its end for the most a FIFO pointer can move from
-     * there (fifostart up to 1023 plus 64 bytes), so no guest value
-     * reaches outside the array.
+     * 32 KiB of FIFO RAM, as FIFOADDR (8-byte units, 12 bits) can name.
+     * Every FIFO access and packet is bounded by its end
+     * (musb_fifo_room()), whatever FIFOADDR and the FIFO offsets say.
      */
-    uint8_t buf[0x8000 + 0x800];
+    uint8_t buf[0x8000];
+
+    Error *migration_blocker;   /* while a device is on the port */
 
         /* Duplicating the world since 2008!...  probably we should have 32
          * logical, single endpoints instead.  */
     MUSBEndPoint ep[16];
 };
 
+static void musb_usb_irq_update(MUSBState *s);
+static void musb_txrx_irq_update(MUSBState *s);
+
 void musb_reset(MUSBState *s)
 {
-    int i;
+    int i, dir;
+
+    /*
+     * Endpoints back to their reset state: what a transfer left in flight
+     * or scheduled is cancelled first, then everything but the packet and
+     * timer objects themselves is cleared.
+     */
+    for (i = 0; i < 16; i ++) {
+        MUSBEndPoint *ep = &s->ep[i];
+
+        for (dir = 0; dir < 2; dir++) {
+            if (usb_packet_is_inflight(&ep->packey[dir].p)) {
+                usb_cancel_packet(&ep->packey[dir].p);
+            }
+            if (ep->intv_timer[dir]) {
+                timer_del(ep->intv_timer[dir]);
+            }
+            ep->faddr[dir] = 0;
+            ep->haddr[dir] = 0;
+            ep->hport[dir] = 0;
+            ep->csr[dir] = 0;
+            ep->type[dir] = 0;
+            ep->interval[dir] = 0;
+            ep->timeout[dir] = 0;
+            /* EP0's FIFO is fixed at 0; the others start there until set. */
+            ep->buf[dir] = s->buf;
+            ep->fifolen[dir] = 0;
+            ep->fifostart[dir] = 0;
+            ep->fifoaddr[dir] = 0;
+            ep->status[dir] = 0;
+            ep->ext_size[dir] = 0;
+            ep->interrupt[dir] = 0;
+            ep->delayed_cb[dir] = NULL;
+            ep->maxp[dir] = 0x40;
+        }
+        ep->rxcount = 0;
+        ep->config = 0;
+        ep->fifosize = 64;
+    }
 
     s->faddr = 0x00;
     s->devctl = 0;
@@ -382,18 +433,8 @@ void musb_reset(MUSBState *s)
 
     /* TODO: _DW */
     s->ep[0].config = MGC_M_CONFIGDATA_SOFTCONE | MGC_M_CONFIGDATA_DYNFIFO;
-    for (i = 0; i < 16; i ++) {
-        /* EP0's FIFO is fixed at 0; the others start there until set. */
-        s->ep[i].buf[0] = s->buf;
-        s->ep[i].buf[1] = s->buf;
-        s->ep[i].fifosize = 64;
-        s->ep[i].maxp[0] = 0x40;
-        s->ep[i].maxp[1] = 0x40;
-        s->ep[i].musb = s;
-        s->ep[i].epnum = i;
-        usb_packet_init(&s->ep[i].packey[0].p);
-        usb_packet_init(&s->ep[i].packey[1].p);
-    }
+    musb_usb_irq_update(s);
+    musb_txrx_irq_update(s);
 }
 
 struct MUSBState *musb_init(DeviceState *parent_device, int gpio_base)
@@ -403,6 +444,12 @@ struct MUSBState *musb_init(DeviceState *parent_device, int gpio_base)
 
     for (i = 0; i < musb_irq_max; i++) {
         s->irqs[i] = qdev_get_gpio_in(parent_device, gpio_base + i);
+    }
+    for (i = 0; i < 16; i ++) {
+        s->ep[i].musb = s;
+        s->ep[i].epnum = i;
+        usb_packet_init(&s->ep[i].packey[0].p);
+        usb_packet_init(&s->ep[i].packey[1].p);
     }
 
     musb_reset(s);
@@ -425,15 +472,28 @@ static void musb_vbus_set(MUSBState *s, int level)
     qemu_set_irq(s->irqs[musb_set_vbus], level);
 }
 
+/*
+ * INTRUSB latches its events whatever INTRUSBE says, as INTRTX / INTRRX
+ * do below; the enables only gate the interrupt lines, and a later write
+ * of INTRUSBE raises what was latched while masked.
+ */
+static void musb_usb_irq_update(MUSBState *s)
+{
+    int i;
+
+    for (i = 0; i <= musb_irq_vbus_error; i++) {
+        qemu_set_irq(s->irqs[i], (s->intr & s->mask) >> i & 1);
+    }
+}
+
 static void musb_intr_set(MUSBState *s, int line, int level)
 {
     if (!level) {
         s->intr &= ~(1 << line);
-        qemu_irq_lower(s->irqs[line]);
-    } else if (s->mask & (1 << line)) {
+    } else {
         s->intr |= 1 << line;
-        qemu_irq_raise(s->irqs[line]);
     }
+    musb_usb_irq_update(s);
 }
 
 /*
@@ -542,7 +602,22 @@ static void musb_session_update(MUSBState *s, int prev_dev, int prev_sess)
 static void musb_attach(USBPort *port)
 {
     MUSBState *s = (MUSBState *) port->opaque;
+    Error *err = NULL;
 
+    /*
+     * Nothing of a transfer (packets in flight, endpoint timers, FIFO
+     * contents) is in the migration stream, so a machine with a device on
+     * the port does not migrate; with the port empty it does.
+     */
+    if (!s->migration_blocker) {
+        error_setg(&s->migration_blocker,
+                   "musb: USB host state with a device attached is not "
+                   "migrated");
+        /* Refused only while a migration runs: say so and carry on. */
+        if (migrate_add_blocker(&s->migration_blocker, &err) < 0) {
+            warn_report_err(err);
+        }
+    }
     musb_intr_set(s, musb_irq_vbus_request, 1);
     musb_session_update(s, 0, s->session);
 }
@@ -552,6 +627,9 @@ static void musb_detach(USBPort *port)
     MUSBState *s = (MUSBState *) port->opaque;
 
     musb_async_cancel_device(s, port->dev);
+    if (s->migration_blocker) {
+        migrate_del_blocker(&s->migration_blocker);
+    }
 
     musb_intr_set(s, musb_irq_disconnect, 1);
     musb_session_update(s, 1, s->session);
@@ -641,6 +719,12 @@ static int musb_timeout(int ttype, int speed, int val)
     hw_error("bad interval\n");
 }
 
+/* Bytes of FIFO RAM from the start of an endpoint's FIFO to its end. */
+static int musb_fifo_room(MUSBEndPoint *ep, int dir)
+{
+    return sizeof(ep->musb->buf) - (ep->buf[dir] - ep->musb->buf);
+}
+
 static void musb_packet(MUSBState *s, MUSBEndPoint *ep,
                 int epnum, int pid, int len, USBCallback cb, int dir)
 {
@@ -663,17 +747,25 @@ static void musb_packet(MUSBState *s, MUSBEndPoint *ep,
     ep->delayed_cb[dir] = cb;
 
     /* A wild guess on the FADDR semantics... */
+    ep->packey[dir].ep = ep;
+    ep->packey[dir].dir = dir;
     dev = usb_find_device(&s->port,
                           s->single_point ? s->faddr : ep->faddr[idx]);
     if (dev == NULL) {
+        /*
+         * Nobody answers at that address: the transaction fails as the
+         * core's do after their retries (H_ERROR and the endpoint's
+         * interrupt), and its FIFO state is reset.
+         */
+        ep->status[dir] = USB_RET_NODEV;
+        cb(&ep->packey[dir].p, ep);
         return;
     }
+    len = MIN(len, musb_fifo_room(ep, idx));
     uep = usb_ep_get(dev, pid, ep->type[idx] & 0xf);
     id = pid | (dev->addr << 16) | (uep->nr << 8);
     usb_packet_setup(&ep->packey[dir].p, pid, uep, 0, id, false, true);
     usb_packet_addbuf(&ep->packey[dir].p, ep->buf[idx], len);
-    ep->packey[dir].ep = ep;
-    ep->packey[dir].dir = dir;
 
     usb_handle_packet(dev, &ep->packey[dir].p);
 
@@ -860,12 +952,18 @@ static void musb_async_cancel_device(MUSBState *s, USBDevice *dev)
 
     for (ep = 0; ep < 16; ep++) {
         for (dir = 0; dir < 2; dir++) {
-            if (!usb_packet_is_inflight(&s->ep[ep].packey[dir].p) ||
-                s->ep[ep].packey[dir].p.ep->dev != dev) {
+            USBPacket *p = &s->ep[ep].packey[dir].p;
+
+            if (!p->ep || p->ep->dev != dev) {
                 continue;
             }
-            usb_cancel_packet(&s->ep[ep].packey[dir].p);
-            /* status updates needed here? */
+            if (usb_packet_is_inflight(p)) {
+                usb_cancel_packet(p);
+            }
+            /* A completion already scheduled must not report either. */
+            if (s->ep[ep].intv_timer[dir]) {
+                timer_del(s->ep[ep].intv_timer[dir]);
+            }
         }
     }
 }
@@ -960,6 +1058,9 @@ static uint8_t musb_read_fifo(MUSBEndPoint *ep)
     /* In DMA mode clear RXPKTRDY and set REQPKT automatically
      * (if AUTOREQ is set) */
 
+    if (ep->fifostart[1] + ep->fifolen[1] >= musb_fifo_room(ep, 1)) {
+        return 0;                       /* past the end of FIFO RAM */
+    }
     ep->csr[1] &= ~MGC_M_RXCSR_FIFOFULL;
     value=ep->buf[1][ep->fifostart[1] + ep->fifolen[1] ++];
     TRACE("EP%d 0x%02x, %d", ep->epnum, value, ep->fifolen[1] );
@@ -975,6 +1076,9 @@ static void musb_write_fifo(MUSBEndPoint *ep, uint8_t value)
         return;
      }
 
+     if (ep->fifostart[0] + ep->fifolen[0] >= musb_fifo_room(ep, 0)) {
+        return;                         /* past the end of FIFO RAM */
+     }
      ep->buf[0][ep->fifostart[0] + ep->fifolen[0] ++] = value;
      ep->csr[0] |= MGC_M_TXCSR_FIFONOTEMPTY;
 }
@@ -1405,6 +1509,7 @@ static void musb_writeb(void *opaque, hwaddr addr, uint32_t value)
         break;
     case MUSB_HDRC_INTRUSBE:
         s->mask = value & 0xff;
+        musb_usb_irq_update(s);
         break;
     case MUSB_HDRC_INDEX:
         s->idx = value & 0xf;
@@ -1505,7 +1610,9 @@ static uint32_t musb_readh(void *opaque, hwaddr addr)
 
     case MUSB_HDRC_FIFO ... (MUSB_HDRC_FIFO + 0x3f):
         ep = ((addr - MUSB_HDRC_FIFO) >> 2) & 0xf;
-        return (musb_read_fifo(s->ep + ep) | musb_read_fifo(s->ep + ep) << 8);
+        /* One byte after the other, the first in the low byte. */
+        i = musb_read_fifo(s->ep + ep);
+        return i | musb_read_fifo(s->ep + ep) << 8;
 
     default:
         return musb_readb(s, addr) | (musb_readb(s, addr | 1) << 8);
@@ -1578,10 +1685,16 @@ static uint32_t musb_readw(void *opaque, hwaddr addr)
     switch (addr) {
     case MUSB_HDRC_FIFO ... (MUSB_HDRC_FIFO + 0x3f):
         ep = ((addr - MUSB_HDRC_FIFO) >> 2) & 0xf;
-        return ( musb_read_fifo(s->ep + ep)       |
-                 musb_read_fifo(s->ep + ep) << 8  |
-                 musb_read_fifo(s->ep + ep) << 16 |
-                 musb_read_fifo(s->ep + ep) << 24 );
+        {
+            uint32_t v = 0;
+            int b;
+
+            /* One byte after the other, the first in the low byte. */
+            for (b = 0; b < 4; b++) {
+                v |= (uint32_t)musb_read_fifo(s->ep + ep) << (8 * b);
+            }
+            return v;
+        }
     default:
         return musb_readh(s, addr) | musb_readh(s, addr + 2) << 16;
     };
