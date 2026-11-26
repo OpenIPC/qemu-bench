@@ -597,7 +597,10 @@ static void xm_isp2_bpu_done(void *opaque)
     }
     s->bpu[BPU_ST / 4] = 1;
     /* isp.ko may start the next channel's job before this one is done
-     * (two sensors' frames arriving together): one completion per start */
+     * (two sensors' frames arriving together): one completion per start.
+     * Per start, not per RDMA_KICK: XM530V200's isp.ko never writes the
+     * kick, and XM535's writes it for either VICU (+0x10034 / +0x11034),
+     * up to a frame after the start; the kick only delays a completion. */
     if (s->bpu_pending && --s->bpu_pending) {
         timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   2 * SCALE_MS);
