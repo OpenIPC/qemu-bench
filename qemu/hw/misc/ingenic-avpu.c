@@ -346,6 +346,18 @@ struct IngenicAvpuState {
     uint32_t reg_base;
     uint8_t gen;                        /* 1: T31, T40; 2: T41 */
     bool anyka;                         /* EV300's core: AK_* */
+    /*
+     * Fault injection and what it shows, runtime QOM properties (qom-set /
+     * qom-get), not migrated:
+     *   drop-irqs     a finished batch raises no interrupt, as if the line
+     *                 were lost; counted in irqs-dropped
+     *   resets        how many times the "reset" GPIO in has put the core
+     *                 into reset (the AK3918EV300's MODULE_RESET_CON1 bit 20)
+     */
+    bool drop_irqs;
+    uint32_t irqs_dropped;
+    uint32_t resets;
+    bool in_reset;
     uint32_t dma_mask;
     uint32_t hw_id;                     /* ID1: the part's encoder HW ID */
     uint32_t regs[AVPU_NREGS];
@@ -2086,7 +2098,11 @@ static void avpu_finish(IngenicAvpuState *s)
             cregs[R_JPEG_FLAGS / 4] = j->jpeg_overflow ? 2 : 0;
         }
     }
-    s->irq_status |= s->run_pending;
+    if (s->drop_irqs && s->run_pending) {
+        s->irqs_dropped++;
+    } else {
+        s->irq_status |= s->run_pending;
+    }
     s->nrun = 0;
     s->run_pending = 0;
     s->busy = s->coded = false;
@@ -2463,6 +2479,11 @@ static void avpu_reg_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     IngenicAvpuState *s = opaque;
+
+    /* a core held in reset takes no programming and starts nothing */
+    if (s->in_reset) {
+        return;
+    }
     hwaddr off = addr - s->reg_base;
 
     if (addr < s->reg_base) {
@@ -2561,6 +2582,34 @@ static void avpu_reset(DeviceState *dev)
     avpu_update(s);
 }
 
+static bool avpu_get_drop_irqs(Object *obj, Error **errp)
+{
+    return INGENIC_AVPU(obj)->drop_irqs;
+}
+
+static void avpu_set_drop_irqs(Object *obj, bool value, Error **errp)
+{
+    INGENIC_AVPU(obj)->drop_irqs = value;
+}
+
+/*
+ * The core held in reset: everything it was doing is dropped, as at
+ * power-on, and it stays there, writes ignored, until the line drops. A
+ * batch already on the worker thread is finished first (a picture is coded
+ * in one piece there); the reset then clears its done bits, so the guest
+ * never sees it complete.
+ */
+static void avpu_set_reset(void *opaque, int n, int level)
+{
+    IngenicAvpuState *s = opaque;
+
+    if (level && !s->in_reset) {
+        s->resets++;
+        avpu_reset(DEVICE(s));
+    }
+    s->in_reset = level;
+}
+
 static void avpu_realize(DeviceState *dev, Error **errp)
 {
     IngenicAvpuState *s = INGENIC_AVPU(dev);
@@ -2593,6 +2642,24 @@ static void avpu_realize(DeviceState *dev, Error **errp)
     qemu_cond_init(&s->cond);
     qemu_thread_create(&s->thread, "avpu", avpu_thread, s,
                        QEMU_THREAD_DETACHED);
+}
+
+/*
+ * Not qdev properties, which cannot be set once the device is realized:
+ * faults are injected while the guest runs. Here rather than in realize so
+ * that -global sets them from the start too.
+ */
+static void avpu_init(Object *obj)
+{
+    IngenicAvpuState *s = INGENIC_AVPU(obj);
+
+    qdev_init_gpio_in_named(DEVICE(obj), avpu_set_reset, "reset", 1);
+    object_property_add_bool(obj, "drop-irqs", avpu_get_drop_irqs,
+                             avpu_set_drop_irqs);
+    object_property_add_uint32_ptr(obj, "irqs-dropped", &s->irqs_dropped,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "resets", &s->resets,
+                                   OBJ_PROP_FLAG_READ);
 }
 
 /* a batch in flight is finished first: its pictures are not migrated */
@@ -2655,6 +2722,7 @@ static const TypeInfo avpu_info = {
     .name           = TYPE_INGENIC_AVPU,
     .parent         = TYPE_SYS_BUS_DEVICE,
     .instance_size  = sizeof(IngenicAvpuState),
+    .instance_init  = avpu_init,
     .class_init     = avpu_class_init,
 };
 

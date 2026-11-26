@@ -175,7 +175,14 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   stderr, e.g. `ak-sysctrl: watchdog expired: last fed 300.000 s ago with
   a 300.000 s timeout`, and goes through QEMU's watchdog action, so
   `-action watchdog=pause` stops the machine where it was instead of
-  rebooting it.
+  rebooting it. Expiries every 7.5 minutes or so with Majestic's 300 s
+  watchdog on are the guest's tick, not this model. The EV300 kernel's
+  clock event handler cleared the timer's expired flag after programming
+  the next event, so a vCPU stall of over 1 ms lost that event, and with it
+  the tick for good. Jiffies stop (`/proc/timer_list`), the `ak_ce_timer`
+  count in `/proc/interrupts` stops, `/proc/uptime` falls back by 358 s at
+  each wrap of the clocksource, and the 150 s keepalive never comes due.
+  The fix is OpenIPC/linux#325 (`ak_timer.c`: clear first).
 - **SAR-ADC1** differs between the chips. The EV330 (and the model's
   default) leaves three packed 10-bit samples of the 3.3 V AVCC in `+0x68`
   all the time. The EV300 parts (`sar-ev300`, OpenIPC/builder#234) convert
@@ -189,6 +196,20 @@ from flash offset 0x1200 through L2 buffer 0 by DMA.
   shows it too. A lit PE3020-W photocell (3000 mV) saturates at 4095,
   2999 mV, as the camera does; `qom-set ... ain0 39` is the same photocell
   covered.
+- **Fault injection** for the camera's stop paths (QOM properties, `-global`
+  at start or `qom-set` while the guest runs; not migrated):
+  - `ak-isp` `stuck-busy`: STATUS bit 14 (ISP_UNDER_WORKING) reads set, as
+    for a core that never finishes the frame it is writing. The capture
+    stop waits 200 ms for it, then gives up: `[ak_isp_vi_stop_capturing]
+    reg10 b14 not clear`.
+  - `ingenic-avpu` `drop-irqs`: a finished picture raises no interrupt, as
+    if the line were lost (counted in `irqs-dropped`). libakv's wait for it
+    never returns, and Majestic logs `anyka: the capture thread is stuck in
+    the encoder; releasing it` when it stops.
+  - `ingenic-avpu` `resets` (read-only) counts the video resets:
+    `ak-sysctrl` `+0x20` bit 20 drives the encoder's `reset` GPIO, and
+    holding it puts the core back at its power-on state. OpenIPC's
+    `uio_vcodec` pulses it for 5 ms on open.
 - **UART** (`ak-uart`) has no data register. TX bytes go into L2 memory at
   `0x48001000 + 0x100 n`, CONF2 starts the send; received bytes land in a
   128-byte ring at `+0x80`, and DATA_CONF bits 19:13 say where the next one

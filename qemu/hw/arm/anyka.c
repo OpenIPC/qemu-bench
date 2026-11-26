@@ -825,6 +825,8 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_VENC_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            qdev_get_gpio_in(irqc, AK_IRQ_VENC));
+        qdev_connect_gpio_out_named(sysctrl, "video-reset", 0,
+                                    qdev_get_gpio_in_named(dev, "reset", 0));
     }
     /*
      * AV100 extras (anycloud_ak3918av100_common.dtsi): the second MIPI/CSI
