@@ -36,6 +36,7 @@ cp qemu/hw/arm/hisilicon.c          "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/hisilicon.h  "$QEMU_DIR/include/hw/arm/"
 cp qemu/hw/arm/xiongmai.c           "$QEMU_DIR/hw/arm/"
 cp qemu/include/hw/arm/xiongmai.h   "$QEMU_DIR/include/hw/arm/"
+cp qemu/include/hw/misc/xm-regtrace.h "$QEMU_DIR/include/hw/misc/"
 cp qemu/hw/misc/xm-sfc.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-sysctl.c         "$QEMU_DIR/hw/misc/"
 cp qemu/hw/misc/xm-ddrc.c           "$QEMU_DIR/hw/misc/"
@@ -583,7 +584,7 @@ if ! grep -q xm-fft "$QEMU_DIR/hw/misc/meson.build"; then
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-fft.c"
 fi
-if ! grep -q xm-vo "$QEMU_DIR/hw/misc/meson.build"; then
+if ! grep -q "'xm-vo.c'" "$QEMU_DIR/hw/misc/meson.build"; then
     echo "system_ss.add(when: 'CONFIG_XIONGMAI', if_true: files('xm-vo.c'))" \
         >> "$QEMU_DIR/hw/misc/meson.build"
     echo "  hw/misc/meson.build: added xm-vo.c"

@@ -30,8 +30,12 @@ static inline FILE *xm_regtrace_file(void)
     return f;
 }
 
-/* 'U' or 'K': the CPU mode of the access (hw/arm/xiongmai.c) */
-char xm_regtrace_mode(void);
+/*
+ * 'U' or 'K': the CPU mode of the access (hw/arm/xiongmai.c). Weak: the
+ * sensor models are linked into targets without the Xiongmai machines
+ * (qemu-system-mipsel), where it resolves to NULL and lines say '-'.
+ */
+char xm_regtrace_mode(void) __attribute__((weak));
 
 static inline void xm_regtrace(const char *dev, uint64_t addr, uint64_t val)
 {
@@ -40,7 +44,7 @@ static inline void xm_regtrace(const char *dev, uint64_t addr, uint64_t val)
     if (f) {
         fprintf(f, "%.6f %c %s %08" PRIx64 " %08" PRIx64 "\n",
                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9,
-                xm_regtrace_mode(), dev, addr, val);
+                xm_regtrace_mode ? xm_regtrace_mode() : '-', dev, addr, val);
     }
 }
 

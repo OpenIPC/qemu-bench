@@ -321,6 +321,14 @@ jobs:
         if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-xm232.py']
         run: python3 qemu/tests/test-xm-xm232.py
 
+      # XM_REGTRACE, the second generation's register write log that
+      # openxiongmai's capture tools read: off unless set, one line per
+      # write (time, CPU mode, device, offset, value) from XM232's VI, its
+      # encoder and the system controller, and XM530V200's ISP and OSD.
+      - name: Xiongmai register write log (XM_REGTRACE)
+        if: fromJSON(needs.select.outputs.qtests)['qemu/tests/test-xm-regtrace.py']
+        run: python3 qemu/tests/test-xm-regtrace.py
+
       # The XM530 pad controller as the gpio-xm530 kernel driver and the
       # vendor ISP drive it: output levels, input lines, mux bits kept.
       - name: XM530 pad GPIO (xm-gpio)

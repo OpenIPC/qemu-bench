@@ -291,6 +291,30 @@ With `-smp 2` the XM530V200 pipeline stalls after a while: isp.ko stops
 starting BPU jobs (both ISP buffers end up off its free and BPU lists).
 Run it uniprocessor.
 
+`sensor-id=` also takes the value of SmartSens' variant register 0x801e,
+which tells parts with one chip ID apart: `sensor-id=9b3a/00` (SC2336P /
+SC2337P).
+
+### Register write log (XM_REGTRACE)
+
+`XM_REGTRACE=<file>` in qemu's environment appends one line per guest
+register write of the second generation's media blocks and sensor:
+
+```
+4.218733 K isp2.bpu 00000100 00000022
+4.218741 U sensor 00303e09 00000010
+```
+
+The virtual time in seconds; `K` or `U`, the CPU mode of the write (kernel
+or user: a vendor library writing the registers it mapped through
+`/dev/mem` shows as `U`); the device; the offset into its window; the
+value. Devices: xm-isp2's `isp2.vi`, `isp2.bpu` and `isp2.vpss`,
+`vimu` (XM232), `hevc` and `hevc2`, `osd`, `sysctl`, and `sensor`,
+whose offset is `bus << 24 | address << 16 | register`. Unset, nothing is
+logged. openxiongmai's capture tools (`tools/xmv200-capture`) merge the
+vendor modules' ioctls into the same file from gdb and generate libxmv200's
+sensor tunings from it. `qemu/tests/test-xm-regtrace.py` checks it.
+
 ### Audio (xm-audio)
 
 `i2s.ko` moves 16-bit mono samples by programmed I/O through two I2S
