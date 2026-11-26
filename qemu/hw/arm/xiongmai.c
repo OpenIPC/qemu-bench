@@ -718,7 +718,12 @@ static void xm_machine_set_flash_file(Object *obj, const char *value,
 
 static char *xm_machine_get_sensor_id(Object *obj, Error **errp)
 {
-    return g_strdup_printf("%04x", XM_MACHINE(obj)->sensor_id);
+    XmMachineState *s = XM_MACHINE(obj);
+
+    /* the /EXT the setter took, so the value can be set back as is */
+    return s->sensor_id && s->sensor_ext <= 0xff ?
+        g_strdup_printf("%04x/%02x", s->sensor_id, s->sensor_ext) :
+        g_strdup_printf("%04x", s->sensor_id);
 }
 
 static void xm_machine_set_sensor_id(Object *obj, const char *value,
