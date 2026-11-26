@@ -19,6 +19,7 @@ from PIL import Image
 H1 = 0x20070000
 REG = dict(INTERRUPT=0x004, AXI_CTRL=0x008, OUT=0x014, IN0=0x02c, IN1=0x030,
            IN2=0x034, ENC_CTRL=0x038, IN_IMG_CTRL=0x03c, STR_BUF_LIMIT=0x060,
+           HDR_REM_MSB=0x058, HDR_REM_LSB=0x05c, RLC_CTRL=0x094,
            LUMA_Q=0x100, CHROMA_Q=0x140, ID=0x000)
 INT_FRAME_RDY, ENC_EN, MODE_JPEG, PIC_INTRA = 1 << 2, 1, 2 << 1, 1 << 3
 FMT_YUV420SP = 1                      # hantro_enc_fmt: 0 planar, 1 semi-planar
@@ -163,6 +164,31 @@ def main():
         check(0 < n < OUT_SIZE, 'STR_BUF_LIMIT reports %d scan bytes' % n)
         scan = q.read(OUT_ADDR, n)
         check(scan.endswith(b'\xff\xd9'), 'scan ends with EOI')
+
+        # Hantro's own JPEG library (Xiongmai's XM533/XM535 snapshots): the
+        # header up to an 8-byte aligned output pointer, the rest of it in
+        # STR_HDR_REM_MSB/LSB, RLC_CTRL[28:23] bits of it, for the H1 to
+        # write ahead of the scan
+        hdr = jfif_header(w, h, lq, cq)
+        al = len(hdr) & ~7
+        tail = hdr[al:]
+        check(0 < len(tail) < 8, 'the header leaves %d bytes past %d' % (len(tail), al))
+        rem = int.from_bytes(tail.ljust(8, b'\0'), 'big')
+        out2 = OUT_ADDR + OUT_SIZE
+        q.write(out2, hdr[:al])
+        q.writel(H1 + REG['INTERRUPT'], 0)
+        q.writel(H1 + REG['OUT'], out2 + al)
+        q.writel(H1 + REG['STR_BUF_LIMIT'], OUT_SIZE)
+        q.writel(H1 + REG['HDR_REM_MSB'], rem >> 32)
+        q.writel(H1 + REG['HDR_REM_LSB'], rem & 0xffffffff)
+        q.writel(H1 + REG['RLC_CTRL'], len(tail) * 8 << 23)
+        q.writel(H1 + REG['ENC_CTRL'], ((w // 16) << 19) | ((h // 16) << 10) |
+                 MODE_JPEG | PIC_INTRA | ENC_EN)
+        n2 = q.readl(H1 + REG['STR_BUF_LIMIT']) // 8
+        check(n2 == n + len(tail), 'STR_BUF_LIMIT counts the header\'s %d bytes too (%d)'
+              % (len(tail), n2))
+        whole = q.read(out2, al + n2)
+        check(whole == hdr + scan, 'the header\'s remainder goes out ahead of the same scan')
     finally:
         q.close()
 
@@ -183,10 +209,10 @@ def main():
         check(p_ref > 40, 'within %.1f dB of libjpeg\'s own encode (> 40)' % p_ref)
         # dump-dir: the model's own JFIF of the same job
         dumped = sorted(f for f in os.listdir(dump) if f.endswith('.jpg'))
-        check(len(dumped) == 1, 'dump-dir holds the job as %s' % (dumped or 'nothing'))
-        if dumped:
-            d = Image.open(os.path.join(dump, dumped[0])); d.load()
-            check(d.tobytes() == out.tobytes(), 'the dumped JPEG decodes to the same image')
+        check(len(dumped) == 2, 'dump-dir holds the jobs as %s' % (dumped or 'nothing'))
+        for f in dumped:
+            d = Image.open(os.path.join(dump, f)); d.load()
+            check(d.tobytes() == out.tobytes(), 'the dumped %s decodes to the same image' % f)
         check(any(f.endswith('.regs') for f in os.listdir(dump)), 'dump-dir holds the job\'s registers')
     except Exception as e:                  # noqa: BLE001 -- report and fail
         check(False, 'decodes: %s' % e)

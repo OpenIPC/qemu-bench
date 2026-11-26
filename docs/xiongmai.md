@@ -374,7 +374,11 @@ itself, and EOI after the scan. The model writes only the entropy-coded
 scan, with the encoder shared with `xm-h1` (`jpeg-enc.c`).
 `-global xm-jpeg.dump-dir=DIR` keeps each job as a whole JPEG. XM535 and
 XM533 have no `jpeg.ko`: their snapshots go through the H1 at the same
-address.
+address. The library writes the header up to an 8-byte aligned output
+pointer and hands the H1 the rest of it (7 bytes of SOS on these builds) in
++0x058/+0x05C, +0x094[28:23] bits of it, as for H.264; `xm-h1` writes those
+ahead of the scan, or the SOS ends after its first component (ffmpeg:
+`decode_sos: index(3) out of components`).
 
 ### USB and Wi-Fi
 
