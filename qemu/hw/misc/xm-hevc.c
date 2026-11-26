@@ -97,7 +97,9 @@
  * Its library's SPS / PPS are XM535's (CTB 16, no SAO, beta / tc offsets
  * 5 / -2).  The same engine codes H.264 (Sofia's default on the X6S-WEQ-H,
  * Main profile, CAVLC): see xm_hevc_xm232_avc() for how a job's codec is
- * told and xm_hevc_work_h264() for the coding.  rgn.ko's overlays are the
+ * told (+0x3C8, the rate control word, 0x29 for H.264 and 0x1E for H.265;
+ * otherwise from its header bits and the headers before the output) and
+ * xm_hevc_work_h264() for the coding.  rgn.ko's overlays are the
  * engine's own regions (xm_hevc_osd232()); snapshots ride along a
  * picture as a 4:2:2 JPEG scan (xm_hevc_jpeg232()).  The second window is
  * hevc.ko's line-mode block (0x21010000), RAM here; the encoder does not
@@ -232,6 +234,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(XmHevcState, XM_HEVC)
  * not take, left-aligned in a byte, and how many */
 #define X2_HDR_BITS     0x52C
 #define X2_HDR_NBITS    0x530
+/*
+ * The rate control word that differs between Sofia's H.264 and H.265 jobs,
+ * the only register besides the two above that does: 0x29 on every H.264
+ * job, 0x1E on every H.265 one (its library writes it before each job).
+ */
+#define X2_RC_CODEC     0x3C8
+#define X2_RC_H264      0x29
+#define X2_RC_H265      0x1E
 #define X2_ST_DONE      2
 
 struct XmHevcState {
@@ -953,6 +963,20 @@ static bool xm_hevc_xm232_avc(XmHevcState *s, XmHevcJob *a, int ew, int eh)
         s->avc_streams[slot].h = eh;
         s->avc_streams[slot].h264 = false;
         s->avc_streams[slot].db = (H264Deblock){ 0 };
+    }
+    /*
+     * The job says H.265 (rate control word): so it is, whatever the gap
+     * before the output holds.  The gap is only what the stream buffer had
+     * before: a buffer allocated where an earlier H.264 stream's was keeps
+     * that stream's NALs there, and taken as this stream's they made a new
+     * H.265 stream code as H.264.
+     */
+    if (R(s, X2_RC_CODEC) == X2_RC_H265) {
+        s->avc_streams[slot].h264 = false;
+        return false;
+    }
+    if (R(s, X2_RC_CODEC) == X2_RC_H264) {
+        h264 = true;
     }
     if (out >= GAP) {
         dma_memory_read(&address_space_memory, out - GAP, buf, sizeof(buf),
