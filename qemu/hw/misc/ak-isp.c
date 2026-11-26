@@ -150,6 +150,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AkIspState, AK_ISP)
 #define   ST_FRAME_ALL_DONE (1u << 0)
 #define   ST_MAIN_DONE      (1u << 1)
 #define   ST_SUB_DONE       (1u << 2)
+#define   ST_UNDER_WORKING  (1u << 14)
 #define   ST_SUB_ID_SHIFT   20
 #define   ST_MAIN_ID_SHIFT  22
 #define REG_INTEN           0x14
@@ -208,6 +209,13 @@ struct AkIspState {
     bool ev300;
     DeviceState *sensor;
     bool warned_crop, warned_sensor, warned_ctrl, warned_ch3;
+    /*
+     * "stuck-busy", fault injection (qom-set while the guest runs, not
+     * migrated): STATUS bit 14, ISP_UNDER_WORKING, reads set, as for a core
+     * that never finishes the frame it is writing. The driver's capture stop
+     * waits 200 ms for that bit to clear.
+     */
+    bool stuck_busy;
 
     /* source=: a Y4M recording played in place of the test pattern */
     char *source;
@@ -662,6 +670,9 @@ static uint64_t ak_isp_read(void *opaque, hwaddr off, unsigned size)
 {
     AkIspState *s = opaque;
 
+    if (off == REG_STATUS && s->stuck_busy) {
+        return s->regs[off / 4] | ST_UNDER_WORKING;
+    }
     if (off / 4 < AK_ISP_NREGS) {
         return s->regs[off / 4];
     }
@@ -738,6 +749,23 @@ static void ak_isp_reset(DeviceState *dev)
     s->cur = 0;
     s->frames = 0;
     qemu_set_irq(s->irq, 0);
+}
+
+static bool ak_isp_get_stuck_busy(Object *obj, Error **errp)
+{
+    return AK_ISP(obj)->stuck_busy;
+}
+
+static void ak_isp_set_stuck_busy(Object *obj, bool value, Error **errp)
+{
+    AK_ISP(obj)->stuck_busy = value;
+}
+
+/* Not a qdev property: it is set while the guest runs (and by -global) */
+static void ak_isp_init(Object *obj)
+{
+    object_property_add_bool(obj, "stuck-busy", ak_isp_get_stuck_busy,
+                             ak_isp_set_stuck_busy);
 }
 
 static void ak_isp_realize(DeviceState *dev, Error **errp)
@@ -832,6 +860,7 @@ static const TypeInfo ak_isp_info = {
     .name          = TYPE_AK_ISP,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(AkIspState),
+    .instance_init = ak_isp_init,
     .class_init    = ak_isp_class_init,
 };
 

@@ -321,6 +321,23 @@ def main():
     finally:
         q.close()
 
+    # ---- fault injection: a core that never finishes its frame ---------
+    q = QTest(a.qemu, 'ak3918ev300', ['-global', 'ak-isp.stuck-busy=on'])
+    try:
+        check(q.readl(ISP + STATUS) & (1 << 14),
+              'stuck-busy: STATUS bit 14 (ISP_UNDER_WORKING) reads set')
+        q.writel(ISP + STATUS, 1 << 14)
+        check(q.readl(ISP + STATUS) & (1 << 14),
+              'stuck-busy: and stays set when written')
+    finally:
+        q.close()
+    q = QTest(a.qemu, 'ak3918ev300')
+    try:
+        check(q.readl(ISP + STATUS) & (1 << 14) == 0,
+              'without it, bit 14 reads clear')
+    finally:
+        q.close()
+
     print('%d failure(s)' % fails if fails else 'all ok')
     return 1 if fails else 0
 

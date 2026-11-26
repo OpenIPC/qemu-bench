@@ -158,7 +158,7 @@ def slice_header(idr, k, first_mb):
 
 
 def picture(qt, k, y, uv, slices, room=None, l2_wrong=False,
-            l2_bypass=False):
+            l2_bypass=False, lost_irq=False):
     """One picture of len(slices) slices (their first MB rows), coded the
     way libakv starts it.  Returns ([(region, header length, bytes)],
     status of 0x8018, core status, core bytes)."""
@@ -212,8 +212,21 @@ def picture(qt, k, y, uv, slices, room=None, l2_wrong=False,
     qt.writel(R + 0x80, cl)
     qt.writel(R + 0x84, 8)
     early, busy = qt.readl(R + 0x18), qt.readl(R + 0x300)
-    st = wait_done(qt, 5)
     what = 'IDR' if idr else 'P%d' % k
+    if lost_irq:
+        # drop-irqs: the core finishes, the interrupt never comes
+        for _ in range(400):
+            qt.step(1000000)
+            if qt.readl(R + 0x300) & 5 == 0:
+                break
+            time.sleep(0.02)
+        check('%s, interrupt dropped: the core finishes (0x8300 idle)'
+              % what, qt.readl(R + 0x300) & 5, 0)
+        check('%s, interrupt dropped: no done bits, no module interrupt'
+              % what, (qt.readl(R + 0x18) & 5,
+                       qt.readl(MOD_STATUS) >> 2 & 1), (0, 0))
+        return None
+    st = wait_done(qt, 5)
     check('%s: not done inside the start write' % what, early & 5, 0)
     check('%s: Enc1 and Enc2 busy meanwhile (0x8300 bits 0, 2)' % what,
           busy & 5, 5)
@@ -358,6 +371,32 @@ def run(qt, ff, tmp):
         check('JPEG %dx%d' % (W, H), len(raw), W * H)
 
 
+def faults(qemu):
+    """drop-irqs and the video reset: what OpenIPC's uio_vcodec does when
+    a picture never reports back (AKUIO_UNBLOCK_CHANNEL, then a reset of
+    the core at the last close: MODULE_RESET_CON1 bit 20 for 5 ms)."""
+    print('faults: a lost interrupt, then the video reset')
+    qt = avpu.QTest(qemu, 'ak3918ev300',
+                    ['-global', 'ingenic-avpu.drop-irqs=on'])
+    try:
+        core_init(qt)
+        y, uv = avpu.picture()
+        picture(qt, 0, y, uv, [0], lost_irq=True)
+        check('before the reset: the interrupt mask as set',
+              qt.readl(R + 0x14), 4)
+        qt.writel(SYSCTRL + 0x20, qt.readl(SYSCTRL + 0x20) | 1 << 20)
+        qt.step(5000000)
+        qt.writel(SYSCTRL + 0x20, qt.readl(SYSCTRL + 0x20) & ~(1 << 20))
+        check('video reset (0x08000020 bit 20): the core is back at its '
+              'reset state (mask 0, nothing pending, idle)',
+              (qt.readl(R + 0x14), qt.readl(R + 0x18),
+               qt.readl(R + 0x300) & 5), (0, 0, 0))
+        check('and its ID is still there (0x8004)',
+              qt.readl(R + 0x04), 0x72000460)
+    finally:
+        qt.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=os.path.join(
@@ -375,6 +414,7 @@ def main():
             run(qt, ff, tmp)
         finally:
             qt.close()
+        faults(args.qemu)
     finally:
         if not args.keep:
             shutil.rmtree(tmp, ignore_errors=True)

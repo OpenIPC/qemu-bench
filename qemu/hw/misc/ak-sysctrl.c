@@ -160,6 +160,7 @@ struct AkSysctrlState {
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq fiq;
+    qemu_irq video_reset;       /* 0x20 bit 20, to the encoder */
 
     uint32_t regs[AK_SYSCTRL_NREGS];
     uint32_t level;             /* module interrupt inputs */
@@ -307,6 +308,13 @@ static void ak_timer_write_ctrl2(AkTimer *t, uint32_t val)
 #define SAR_ACR2_POWER_DOWN (1u << 0)       /* 0xA0 */
 #define SAR_ACR2_AIN0       (1u << 5)
 #define R_RESET_CTRL        (0x20 / 4)
+/*
+ * MODULE_RESET_CON1 bit 20 (AK39_SRESET_VIDEO) holds the video encoder in
+ * reset: OpenIPC's uio_vcodec pulses it for 5 ms on open, and on the last
+ * close. It drives the "video-reset" GPIO out, which the machine wires to
+ * the encoder model.
+ */
+#define VIDEO_RESET         (1u << 20)      /* 0x20 */
 
 static uint32_t ak_sar_scale(uint32_t mv, uint32_t ref_mv, unsigned bits)
 {
@@ -522,6 +530,10 @@ static void ak_sysctrl_write(void *opaque, hwaddr offset, uint64_t val,
             ak_wdt_write_cfg2(s, val);
         }
         return;
+    case R_RESET_CTRL:
+        s->regs[R_RESET_CTRL] = val;
+        qemu_set_irq(s->video_reset, !!(val & VIDEO_RESET));
+        break;
     default:
         s->regs[offset / 4] = val;
         break;
@@ -642,6 +654,7 @@ static void ak_sysctrl_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->fiq);
     qdev_init_gpio_in(DEVICE(obj), ak_sysctrl_set_irq, 32);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->video_reset, "video-reset", 1);
 
     /* Not qdev properties: those cannot be set once the device is realized,
      * and these are the outside world, which changes while the guest runs. */
