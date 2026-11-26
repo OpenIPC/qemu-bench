@@ -48,6 +48,8 @@
 #define AK_AV130_MAC_BASE   0x20240000      /* ethernet@0x20240000 */
 #define AK_AV130_INTC_BASE  0x21100000
 #define AK_AV130_IRQ_SYSCTRL 3              /* top bit: bank 1, SYSCTRL */
+#define AK_AV130_IRQ_USB     18             /* the DT's usb@20200000: */
+#define AK_AV130_IRQ_USB_DMA 19             /*   <0x12 0>, <0x13 0> */
 #define AK_AV130_L2_VA      0xF1000000      /* the kernel's AK_VA_L2MEM */
 #define AK_L2_MEM_BASE      0x48000000
 #define AK_DDR_BASE         0x80000000
@@ -746,7 +748,22 @@ static void anyka_common_init(MachineState *machine, const AkSoCConfig *c)
                                    &error_fatal);
         }
     }
-    sysbus_create_simple("ak-usb", AK_USB_BASE, NULL);
+    /*
+     * The AV130's USB is a MUSB host (hw/usb/hcd-musb.c behind ak-usb), so
+     * a -device on its bus is what the vendor's ak_hcd enumerates.  The
+     * other parts keep the empty port: their interrupt numbers are not
+     * known, and their nightly twins must not change.
+     */
+    dev = qdev_new("ak-usb");
+    qdev_prop_set_bit(dev, "host", c->av130);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AK_USB_BASE);
+    if (c->av130) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           qdev_get_gpio_in(irqc, AK_AV130_IRQ_USB));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                           qdev_get_gpio_in(irqc, AK_AV130_IRQ_USB_DMA));
+    }
     sysbus_create_simple("ak-ddrc", AK_DDRC_BASE, NULL);
     dev = sysbus_create_simple("ak-gpio", AK_GPIO_BASE,
                                qdev_get_gpio_in(irqc, AK_IRQ_GPIO));
