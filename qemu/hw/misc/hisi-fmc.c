@@ -379,11 +379,31 @@ static void hisi_fmc_busy(HisiFmcState *s, uint64_t us)
     }
 }
 
+static bool hisi_fmc_nor_busy(HisiFmcState *s)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->busy_until_ns;
+}
+
 /* SR1 as the chip would answer now: WIP while an erase or program runs. */
 static uint8_t hisi_fmc_sr(HisiFmcState *s)
 {
-    bool wip = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->busy_until_ns;
-    return s->sr | (wip ? 0x01 : 0);
+    return s->sr | (hisi_fmc_nor_busy(s) ? 0x01 : 0);
+}
+
+/* A NOR chip ignores every program and erase it is sent while WIP is set
+ * (only status reads get through), so a guest that does not poll SR1 first
+ * loses the operation on silicon. Drop it here too, and say so: that guest
+ * has a bug the instant model hid. Never true with the timing off. */
+static bool hisi_fmc_nor_refuses(HisiFmcState *s, const char *what)
+{
+    if (!hisi_fmc_nor_busy(s)) {
+        return false;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "hisi-fmc: %s sent while the NOR is busy (WIP), ignored\n",
+                  what);
+    s->sr &= ~SPI_SR_WEL;
+    return true;
 }
 
 /*
@@ -571,6 +591,9 @@ static bool hisi_fmc_exec_nor_reg_op(HisiFmcState *s)
      * and flashcp/sysupgrade).  WPS block protection still applies.
      */
     case SPI_CMD_PAGE_PROGRAM:
+        if (hisi_fmc_nor_refuses(s, "PROGRAM")) {
+            break;
+        }
         if (addr < s->flash_size) {
             if (hisi_fmc_block_is_locked(s, addr)) {
                 qemu_log_mask(LOG_GUEST_ERROR,
@@ -614,6 +637,9 @@ static bool hisi_fmc_exec_nor_reg_op(HisiFmcState *s)
          * U-Boot's SD-card auto-update (product/hiupdate) — kernel and rootfs
          * both landed as new & old, and the board would not boot.
          */
+        if (hisi_fmc_nor_refuses(s, "ERASE")) {
+            break;
+        }
         uint32_t addr_en = (s->variant == FMC_VARIANT_FMC100)
                            ? FMC100_OP_ADDR_EN : FMC_OP_ADDR_EN;
         uint32_t erase_addr;
@@ -647,8 +673,15 @@ static bool hisi_fmc_exec_nor_reg_op(HisiFmcState *s)
     }
 
     case SPI_CMD_CHIP_ERASE:
+        if (hisi_fmc_nor_refuses(s, "CHIP ERASE")) {
+            break;
+        }
         memset(s->flash, 0xFF, s->flash_size);
         hisi_fmc_flush_to_file(s, 0, s->flash_size);
+        /* About one 64 KiB erase per block: W25Q128's 40 s typical for
+         * 256 blocks at 150 ms each. */
+        hisi_fmc_busy(s, (uint64_t)s->erase_64k_us *
+                         (s->flash_size / NOR_SECTOR_SIZE));
         s->sr &= ~SPI_SR_WEL;
         break;
 
@@ -873,6 +906,9 @@ static void hisi_fmc_exec_dma_nor(HisiFmcState *s)
          * no soc -> sysupgrade aborts), jffs2 overlay writes ("Node totlen
          * 0xffffffff") and flashcp.  Always program; WPS protection applies.
          */
+        if (hisi_fmc_nor_refuses(s, "DMA WRITE")) {
+            return;
+        }
         if (hisi_fmc_block_is_locked(s, addr)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "hisi-fmc: DMA WRITE blocked — addr 0x%x is WPS-locked\n",
@@ -1078,7 +1114,10 @@ static void hisi_fmc_ctrl_write(void *opaque, hwaddr offset,
                  * failed! reg: 0x2".  Measured on a gk7205v200: with WEL set
                  * (SR1 0x02) and SR3 0x08, FMC_STATUS reads 0x02 with FMC_CMD
                  * = 15h as with 05h. */
-                s->status = hisi_fmc_sr(s);
+                /* WIP is the NOR's: a dual-flash board with the NAND
+                 * selected sees the NAND's status, timed NOR or not. */
+                s->status = hisi_fmc_current_flash_sel(s) == FLASH_TYPE_SPI_NOR
+                            ? hisi_fmc_sr(s) : s->sr;
                 if (s->variant == FMC_VARIANT_FMC100) {
                     s->iobuf[0] = s->status;
                 }
