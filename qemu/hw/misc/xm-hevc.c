@@ -113,6 +113,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -1147,6 +1148,7 @@ static void xm_hevc_write(void *opaque, hwaddr off, uint64_t val,
 {
     XmHevcState *s = XM_HEVC(opaque);
 
+    xm_regtrace("hevc", off, val);
     if (s->xm232) {
         switch (off) {
         case X2_START:
@@ -1262,6 +1264,7 @@ static void xm_hevc2_write(void *opaque, hwaddr off, uint64_t val,
 {
     XmHevcState *s = XM_HEVC(opaque);
 
+    xm_regtrace("hevc2", off, val);
     s->regs2[off / 4] = val;
     if (s->v3 && off == 0 && (val & 1)) {
         s->regs2[0x0C / 4] = 1;

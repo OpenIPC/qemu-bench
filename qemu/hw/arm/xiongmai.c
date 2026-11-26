@@ -30,6 +30,7 @@
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/image-sensor.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/sysbus.h"
 #include "qobject/qlist.h"
 #include "target/arm/arm-powerctl.h"
@@ -801,6 +802,14 @@ static void xm_machine_set_ahd_chips(Object *obj, Visitor *v,
     if (visit_type_int32(v, name, &XM_MACHINE(obj)->ahd_chips, errp)) {
         XM_MACHINE(obj)->ahd_chips_set = true;
     }
+}
+
+char xm_regtrace_mode(void)
+{
+    if (!current_cpu) {
+        return '-';
+    }
+    return (ARM_CPU(current_cpu)->env.uncached_cpsr & 0x1f) == 0x10 ? 'U' : 'K';
 }
 
 static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,

@@ -32,6 +32,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
@@ -147,6 +148,7 @@ static int hisi_smartsens_send(I2CSlave *i2c, uint8_t data)
     } else {
         uint16_t addr = ((uint16_t)s->reg_buf[0] << 8) | s->reg_buf[1];
 
+        xm_regtrace("sensor", ((uint32_t)i2c->address << 16) | addr, data);
         sensor_sync_write(&s->sync, addr, data);
         if (addr == 0x0100) {
             s->streaming = data & 1;
