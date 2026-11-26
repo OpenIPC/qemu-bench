@@ -114,6 +114,16 @@ struct MStarDispState {
 #define TOP_VSYNC_BIT       (1 << 3)
 
 /*
+ * MOP vsync interrupt (bank 0x1405), from the i2m MHAL's _HalDispIrq*:
+ * reg 0x02 bit 0 is the pending flag the mi_disp ISR reads, reg 0x0C bit 0
+ * its mask; the HAL acks by setting the mask bit and clearing it again, so
+ * setting the mask drops the flag. The interrupt line is the GOP vsync one.
+ */
+#define MOP_IRQ_FLAG        0x08
+#define MOP_IRQ_MASK        0x30
+#define MOP_IRQ_VSYNC       (1 << 0)
+
+/*
  * MOP (video/overlay) windows: 16 of them, 0x40 bytes apart from MOP +
  * 0x200 (banks 0x1406/0x1407). Each scans a semi-planar YUV420 (NV12)
  * surface into a rectangle of the screen, scaled by source/destination
@@ -454,6 +464,11 @@ static void mstar_disp_vblank(void *opaque)
     s->topregs[TOP_VSYNC_FLAG / 4] |= TOP_VSYNC_BIT;
     mstar_disp_update_top_irq(s);
 
+    /* MOP vsync: latch its flag unless masked */
+    if (!(s->mopregs[MOP_IRQ_MASK / 4] & MOP_IRQ_VSYNC)) {
+        s->mopregs[MOP_IRQ_FLAG / 4] |= MOP_IRQ_VSYNC;
+    }
+
     /*
      * The GOP/fbdev vsync is a separate interrupt with no status
      * register; the driver just counts it and wakes its vsync wait
@@ -548,7 +563,14 @@ static void mstar_disp_mop_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr & 2) {
         return;
     }
+    if ((addr & ~3) == MOP_IRQ_FLAG) {
+        return;                 /* status: read only */
+    }
     s->mopregs[addr / 4] = riu_reg_merge(s->mopregs, addr, val, size);
+    if ((addr & ~3) == MOP_IRQ_MASK &&
+        (s->mopregs[MOP_IRQ_MASK / 4] & MOP_IRQ_VSYNC)) {
+        s->mopregs[MOP_IRQ_FLAG / 4] &= ~MOP_IRQ_VSYNC;
+    }
 }
 
 static const MemoryRegionOps mstar_disp_mop_ops = {
