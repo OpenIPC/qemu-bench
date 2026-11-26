@@ -393,6 +393,15 @@ def faults(qemu):
                qt.readl(R + 0x300) & 5), (0, 0, 0))
         check('and its ID is still there (0x8004)',
               qt.readl(R + 0x04), 0x72000460)
+        qt.writel(SYSCTRL + 0x20, qt.readl(SYSCTRL + 0x20) | 1 << 20)
+        qt.writel(R + 0x14, 4)
+        qt.writel(R + 0x84, 2)
+        qt.step(5000000)
+        check('held in reset: programming ignored, nothing starts',
+              (qt.readl(R + 0x14), qt.readl(R + 0x300) & 5), (0, 0))
+        qt.writel(SYSCTRL + 0x20, qt.readl(SYSCTRL + 0x20) & ~(1 << 20))
+        qt.writel(R + 0x14, 4)
+        check('released: programming lands again', qt.readl(R + 0x14), 4)
     finally:
         qt.close()
 

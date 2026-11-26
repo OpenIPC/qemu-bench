@@ -2479,6 +2479,11 @@ static void avpu_reg_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     IngenicAvpuState *s = opaque;
+
+    /* a core held in reset takes no programming and starts nothing */
+    if (s->in_reset) {
+        return;
+    }
     hwaddr off = addr - s->reg_base;
 
     if (addr < s->reg_base) {
@@ -2587,7 +2592,13 @@ static void avpu_set_drop_irqs(Object *obj, bool value, Error **errp)
     INGENIC_AVPU(obj)->drop_irqs = value;
 }
 
-/* The core held in reset: everything it was doing is dropped, as at power-on */
+/*
+ * The core held in reset: everything it was doing is dropped, as at
+ * power-on, and it stays there, writes ignored, until the line drops. A
+ * batch already on the worker thread is finished first (a picture is coded
+ * in one piece there); the reset then clears its done bits, so the guest
+ * never sees it complete.
+ */
 static void avpu_set_reset(void *opaque, int n, int level)
 {
     IngenicAvpuState *s = opaque;

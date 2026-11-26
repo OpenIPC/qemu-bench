@@ -607,6 +607,8 @@ static void ak_sysctrl_reset(DeviceState *dev)
         s->rtc[1] = ((tm.tm_wday & 7) << 10) | (tm.tm_mday << 5) | tm.tm_hour;
         s->rtc[2] = (MAX(tm.tm_year - 80, 0) << 4) | (tm.tm_mon + 1);
     }
+    /* the register is clear again, and so is the encoder's reset line */
+    qemu_set_irq(s->video_reset, !!(s->regs[R_RESET_CTRL] & VIDEO_RESET));
     ak_sysctrl_update(s);
 }
 
@@ -701,6 +703,8 @@ static int ak_sysctrl_post_load(void *opaque, int version_id)
     if (version_id < 3) {
         s->wdt_run_load = s->wdt_load;
     }
+    /* a video reset held across the migration still holds the encoder */
+    qemu_set_irq(s->video_reset, !!(s->regs[R_RESET_CTRL] & VIDEO_RESET));
     ak_sysctrl_update(opaque);
     return 0;
 }
