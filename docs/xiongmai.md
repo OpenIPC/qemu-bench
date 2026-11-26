@@ -309,7 +309,8 @@ The virtual time in seconds; `K` or `U`, the CPU mode of the write (kernel
 or user: a vendor library writing the registers it mapped through
 `/dev/mem` shows as `U`); the device; the offset into its window; the
 value. Devices: xm-isp2's `isp2.vi`, `isp2.bpu` and `isp2.vpss`,
-`vimu` (XM232), `hevc` and `hevc2`, `osd`, `sysctl`, and `sensor`,
+`vimu` (XM232), `hevc` and `hevc2`, `osd`, `vo` (XM530V200's video
+output), `fft` (XM533's FFT engine), `sysctl`, and `sensor`,
 whose offset is `bus << 24 | address << 16 | register`. Unset, nothing is
 logged. openxiongmai's capture tools (`tools/xmv200-capture`) merge the
 vendor modules' ioctls into the same file from gdb and generate libxmv200's

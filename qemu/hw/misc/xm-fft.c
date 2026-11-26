@@ -5,6 +5,7 @@
  * reads 9 (done) and acknowledges with 0 to +0x18.
  *
  * Jobs complete a millisecond after they start and compute nothing.
+ * Writes go to the XM_REGTRACE log as "fft".
  *
  * Copyright (c) 2026 OpenIPC.
  *
@@ -12,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "qemu/timer.h"
@@ -57,6 +59,7 @@ static void xm_fft_write(void *opaque, hwaddr off, uint64_t val,
 {
     XmFftState *s = XM_FFT(opaque);
 
+    xm_regtrace("fft", off, val);
     switch (off) {
     case FFT_GO:
         s->regs[off / 4] = val;

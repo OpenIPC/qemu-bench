@@ -10,8 +10,9 @@ both in hex. openxiongmai's capture tools (tools/xmv200-capture) read it.
   - set, writes to XM232's VI/ISP window (xm-vimu), its encoder (xm-hevc,
     layout xm232) and the system controller come out in order, one line
     each, in that format;
-  - on the XM530V200, the xm-isp2 blocks log under "isp2.<block>" and the
-    OSD engine under "osd".
+  - on the XM530V200, the xm-isp2 blocks log under "isp2.<block>", the
+    OSD engine under "osd" and the video output under "vo";
+  - on the XM533, the FFT engine logs under "fft".
 
     python3 qemu/tests/test-xm-regtrace.py [--qemu PATH]
 """
@@ -84,12 +85,20 @@ def main():
     # XM530V200: xm-isp2's blocks and the OSD engine
     t = os.path.join(d, 'v200.trace')
     run(a.qemu, 'xm530v200', t, [(0x30000100, 0x11), (0x32000100, 0x22),
-                                 (0x21300100, 0x33)])
+                                 (0x21300100, 0x33), (0x31000100, 0x44)])
     rec = {(m.group(3), int(m.group(4), 16), int(m.group(5), 16))
            for m in map(LINE.match, lines(t)) if m}
     check(('isp2.vi', 0x100, 0x11) in rec, 'xm530v200: VICU window as isp2.vi')
     check(('isp2.bpu', 0x100, 0x22) in rec, 'xm530v200: BPU as isp2.bpu')
     check(('osd', 0x100, 0x33) in rec, 'xm530v200: OSD engine as osd')
+    check(('vo', 0x100, 0x44) in rec, 'xm530v200: video output as vo')
+
+    # XM533: the FFT engine (ive.ko)
+    t = os.path.join(d, 'xm533.trace')
+    run(a.qemu, 'xm533', t, [(0x21300000, 0x55)])
+    rec = {(m.group(3), int(m.group(4), 16), int(m.group(5), 16))
+           for m in map(LINE.match, lines(t)) if m}
+    check(('fft', 0x0, 0x55) in rec, 'xm533: FFT engine as fft')
 
     print('%s: %d failure(s)' % (os.path.basename(__file__), fails))
     sys.exit(1 if fails else 0)
