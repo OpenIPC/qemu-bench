@@ -2292,22 +2292,23 @@ jobs:
       - name: Make QEMU executable
         run: chmod +x qemu-src/build/qemu-system-arm
 
-      # OpenIPC/firmware's latest release: the NAND lite rootfs (UBI) and
-      # the NOR lite kernel, as one 128 MiB SPI NAND image booted with
-      # -kernel; the milestones run from the kernel to the login prompt.
+      # OpenIPC/firmware's latest release, both packages: the NAND lite
+      # one (UBIFS root, the kernel FIT beside it) as a 128 MiB SPI NAND
+      # image and the split NOR one (firmware.bin) as a 16 MiB SPI NOR
+      # image, each booted with -kernel; the milestones run from the
+      # kernel to the login prompt.
       - name: OpenIPC ${{ matrix.soc }} to the login prompt
         timeout-minutes: 15
         run: |
           W="$RUNNER_TEMP/openipc"
           mkdir -p "$W"
-          for t in nand-lite nor-lite; do
+          for t in nand-lite nor-lite-split; do
             curl -fsSL --retry 3 -o "$W/$t.tgz" \
               "https://github.com/OpenIPC/firmware/releases/download/latest/openipc.${{ matrix.soc }}-$t.tgz"
+            python3 qemu-boot/rv1106-openipc-image.py "$W/$t.tgz" "$W/$t"
+            bash qemu-boot/test-rv1106-boot.sh --machine ${{ matrix.soc }} \
+              --openipc "$W/$t" --timeout 240
           done
-          python3 qemu-boot/rv1106-openipc-image.py "$W/nand-lite.tgz" \
-            "$W/nor-lite.tgz" "$W/img"
-          bash qemu-boot/test-rv1106-boot.sh --machine ${{ matrix.soc }} \
-            --openipc "$W/img" --timeout 240
 
   ci-gate:
     name: CI Gate

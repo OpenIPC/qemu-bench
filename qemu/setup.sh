@@ -137,6 +137,8 @@ cp qemu/hw/ssi/ak-spinor.c          "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/ssi/ak-sfc.c             "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/gpio/ak-gpio.c           "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/usb/ak-usb.c             "$QEMU_DIR/hw/usb/"
+cp qemu/hw/usb/hcd-musb.c           "$QEMU_DIR/hw/usb/"
+cp qemu/include/hw/usb/hcd-musb.h   "$QEMU_DIR/include/hw/usb/"
 cp qemu/hw/i2c/ak-i2c.c             "$QEMU_DIR/hw/i2c/"
 cp qemu/hw/sd/ak-mci.c              "$QEMU_DIR/hw/sd/"
 cp qemu/hw/arm/sigmastar.c          "$QEMU_DIR/hw/arm/"
@@ -785,10 +787,11 @@ config ANYKA
     select I2C
     select XM_DWMAC
     select SD
+    select USB
 KCONFIG
     echo "  hw/arm/Kconfig: added ANYKA"
 else
-    for sym in I2C XM_DWMAC SD; do
+    for sym in I2C XM_DWMAC SD USB; do
         if ! sed -n '/^config ANYKA$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config ANYKA\$/,/^\$/{/select SSI\$/a\\    select $sym
@@ -801,7 +804,7 @@ fi
 # interrupt controller): a tree configured before drops its entry.
 sed -i "/'ak-tick.c'/d" "$QEMU_DIR/hw/timer/meson.build"
 rm -f "$QEMU_DIR/hw/timer/ak-tick.c"
-for f in misc/ak-sysctrl misc/ak-av130-intc misc/ak-isp misc/ak-l2 misc/ak-ddrc char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb i2c/ak-i2c sd/ak-mci; do
+for f in misc/ak-sysctrl misc/ak-av130-intc misc/ak-isp misc/ak-l2 misc/ak-ddrc char/ak-uart ssi/ak-spi ssi/ak-spinor ssi/ak-sfc gpio/ak-gpio usb/ak-usb usb/hcd-musb i2c/ak-i2c sd/ak-mci; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_ANYKA', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"

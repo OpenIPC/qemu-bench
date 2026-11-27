@@ -80,7 +80,7 @@ appended DTB.
 | `0x20140000` | L2 buffer controller | `ak-l2` |
 | `0x20150000`, `0x20190000`, `0x201A0000` | I2C 0 (1, 2 on EV330; EV300L: I2C 2 at `0x201C0000`, UART 2 at `0x201A0000`) | `ak-i2c` |
 | `0x20170000` | GPIO | `ak-gpio` |
-| `0x20200000` | USB 2.0 OTG (MUSB-style) | `ak-usb` (nothing plugged in) |
+| `0x20200000` | USB 2.0 OTG (MUSB-style) | `ak-usb`: a MUSB host on the AV130 (`hcd-musb`), nothing plugged in elsewhere |
 | `0x20300000` | Ethernet: Synopsys GMAC, RMII PHY at MDIO 1 | `xm-dwmac` |
 | `0x21000000` | DDR2 controller | `ak-ddrc` |
 | `0x21100000` | EV300L / AV100: SPI0 (boot NOR), the old SPI0 register set plus `+0x20` RTIM and `+0x24` WORK_MODE | `ak-spi`, `ak-spinor` |
@@ -425,6 +425,35 @@ blocks it drives are not the AV100's:
   `0x100` bit 1 acknowledges the XIP stop, bit 4 resets the FIFO. The XIP
   window at `0x30000000` reads with 0x03; this U-Boot never uses it. All
   of it from the U-Boot driver's behaviour; no datasheet.
+- **USB** (`usb@20200000`, interrupts 18 and 19): a Mentor MUSB core,
+  modelled as a host with one port (`hw/usb/hcd-musb.c`, QEMU v9.0.0's
+  model that upstream dropped with the TUSB6010 boards, behind `ak-usb`).
+  `-device <usb device>,port=1` plugs into it. The `port=1` matters: without
+  it QEMU puts a full-speed `usb-hub` on the only port, and the device is
+  enumerated behind it at full speed. The vendor's prebuilt `ak_hcd`
+  (`ak_otg_hshcd.c`) drives the core in ways the upstream model did not
+  follow, so the model changed in five places:
+  - it writes the CSRs a byte at a time, and a write to a CSR's high byte
+    does not resend its packet;
+  - it runs EP0 with INTRTXE clear and polls INTRTX, so INTRTX/INTRRX
+    latch whatever the enables say;
+  - it names the device in FADDR, as a core built without multipoint does;
+  - every REQPKT is an IN token, so a control transfer's status stage
+    reaches the device;
+  - FLUSHFIFO is a strobe.
+
+  The DMA block at `+0x200` is storage, and FIFOs are 64 bytes, so this
+  covers enumeration, not bulk traffic. With a device on the port the
+  machine does not migrate, because the transfer state is not in the
+  stream; with the port empty it does. With
+  `-device atbm-wifi,pid=0x6162,port=1`, the high-speed ATBM6132 as the
+  Yoton WS03 has it (OpenIPC/firmware#2962), the vendor's
+  `usb-common`/`usbcore`/`ak_hcd` enumerate `007a:6162`.
+  OpenIPC's own `usbcore` gives the board's
+  `USB_PID_IN(OverFlow): len=18, ep->length=0` / `device descriptor
+  read/64, error -75` until `struct usb_device` is laid out the SDK's way.
+  The cause: the SDK kernel moves `dev` to the end, and `ak_hcd` reads
+  `ep_in[]` at offset 136.
 - **Elsewhere:** the GMAC is at `0x20240000` (`ethernet@0x20240000`), and
   the I2C interrupts are on the TWI bank.
 - **Result:** U-Boot detects the GD25Q64, loads its environment, reads the
@@ -451,6 +480,10 @@ blocks it drives are not the AV100's:
   (`SYSCTRL +0xE4 = 0x55000009`, `+0xE8 = 0xAA000003`), whose reset
   boots the flash again. On the dump this is a loop: login, the
   device-ID step, a watchdog reset about every ten seconds.
+- **Seen, not fixed:** typed console input reaches OpenIPC's AV130
+  kernel only as the first byte. UART0's data register holds it, interrupt
+  10 stays masked, and the shell never answers. Scripted runs use
+  `init=` a script in the rootfs instead.
 - **Not modelled:** the crypto engine itself, the system controller's
   interrupt bank, and the XIP windows. The DT also has a data mover
   (`0x21120000`) and a remote processor (`0x21102000`).
