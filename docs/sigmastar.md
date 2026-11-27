@@ -22,7 +22,7 @@ from there too.
 
 | Machine | Die | Cores | DRAM | Bond (chiptop +0x120) | Chip ID (`0x1F003C00`) | Boot tested |
 |---|---|---|---|---|---|---|
-| `ssr621q` | infinity2m | 2× Cortex-A7 | 256 MiB | `0x1E` | `0xF0` | yes: IPL → U-Boot → kernel → Sofia GUI |
+| `ssr621q` | infinity2m | 2× Cortex-A7 | 256 MiB | `0x1B` | `0xF0` | yes: IPL → U-Boot → kernel → Sofia GUI |
 | `ssd202d` | infinity2m | 2× Cortex-A7 | 128 MiB | `0x1E` | `0xF0` | — |
 | `ssd201` | infinity2m | 2× Cortex-A7 | 64 MiB | `0x1D` | `0xF0` | — |
 | `ssc375` | Ifado | 1× Cortex-A7 | 128 MiB | `0x15` | `0xF0`¹ | IPL → U-Boot → DHBoot → kernel → rootfs |
@@ -72,6 +72,12 @@ chip ID, so `0xF0` is a placeholder.
 The SSR621Q is the infinity2m die in Xiongmai's 4/8/16-channel NVRs, with
 SATA, HDMI and the video decoder bonded out. Its IPL reads the bond strap to
 pick the DRAM profile and reports `256MB` and `BIST0_0001-OK` here.
+
+The bond is `0x1B`, which a real SSR621Q's IPL prints as `D-1b`. Xiongmai's
+IPL (gf77b33a) sets `miupll_233MHz` for it. The i2m SDK's IPL (g6759541,
+the only one in that SDK) knows only `0x1D` and `0x1E`: it prints `unknown
+miupll` and goes on here, but on silicon it leaves the DDR unset and hangs
+after `cpupll init done`. `bond=0x1E` gives the SSD202D's path.
 
 ```
 qemu-system-arm -M ssr621q,flash-file=nvr.bin -serial mon:stdio \
@@ -605,7 +611,7 @@ print a warning naming the evidence unless `-m` sets the size.
 
 | Part | SKU | DRAM | Status | Source | Package / bond |
 |---|---|---|---|---|---|
-| `ssr621q` | SSC010A | 256 MiB | sourced | retail U-Boot `LX_MEM=0xFF00000`; vendor `ssc010a-s01a-2Gb` DTS | bond `0x1E`, source not rechecked |
+| `ssr621q` | SSC010A | 256 MiB | sourced | retail U-Boot `LX_MEM=0xFF00000`; vendor `ssc010a-s01a-2Gb` DTS | bond `0x1B`, printed by a real SSR621Q's IPL (`D-1b`) |
 | `ssd202d` | SSC010A | 128 MiB | sourced | kernel `mstar_get_package_type`: SSC010A is `QFN_DDR3_128MB`; DTS `0x07E00000` | QFN, bond `0x1E` from the capture |
 | `ssd201` | SSC011A | 64 MiB | partly | DTS `0x03E00000`; that SSD201 is SSC011A is inferred | bond `0x1D` from the capture |
 | `ssc375` | SSC032B | 128 MiB | sourced | retail Dahua `mem=128M` | bond `0x15`, WB1G DDR3 in its IPL |

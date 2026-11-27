@@ -209,7 +209,7 @@ def test_riu(qt):
     check('MIU BIST done', qt.readw(riu(0x1012, 0x70)) & 0x8000, 0x8000)
     check('l3bridge flush done', qt.readw(riu(0x1022, 0x10)) & 0x1000,
           0x1000)
-    check('bond strap', qt.readw(riu(0x101E, 0x48)), 0x1E)
+    check('bond strap', qt.readw(riu(0x101E, 0x48)), 0x1B)  # SSR621Q
     check('chip ID', qt.readw(riu(0x001E, 0x00)), 0xF0)
     check('UTMI calibration done', qt.readw(riu(0x1425, 0x1E)) & 2, 2)
     check('clkgen reset value', qt.readw(riu(0x1038, 0x33)), 0x1101)
