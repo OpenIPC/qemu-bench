@@ -31,9 +31,11 @@
 # (Android boot image), Linux and buildroot's init; the milestones are
 # those instead.
 #
-# An OpenIPC release boots from SPI NAND on the rv1106 machine with
-# -kernel (no vendor loader): --openipc DIR, the directory
-# qemu-boot/rv1106-openipc-image.py writes.  Its milestones run to the
+# An OpenIPC release boots on the rv1106 machine with -kernel (no vendor
+# loader): --openipc DIR, the directory qemu-boot/rv1106-openipc-image.py
+# writes -- nand.bin from the NAND package (SPI NAND, UBIFS root), or
+# nor.bin from the split NOR package (SPI NOR, the kernel splits
+# firmware.bin and mounts its squashfs).  Its milestones run to the
 # login prompt, with user networking for its DHCP.
 #
 #   [--machine rv1106] [--qemu ./qemu-src/build/qemu-system-arm]
@@ -50,6 +52,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --flash) FLASH=$2; shift 2 ;;
         --openipc) OPENIPC=$(realpath "$2"); FLASH=$OPENIPC/nand.bin
+                   [ -f "$FLASH" ] || FLASH=$OPENIPC/nor.bin
                    shift 2 ;;
         --machine) MACHINE=$2; shift 2 ;;
         --qemu) QEMU=$2; shift 2 ;;
@@ -66,7 +69,13 @@ case "$MACHINE" in
     rv1126|rv1109) FAMILY=rv1126 ;;
     *) FAMILY=rv1106 ;;
 esac
-[ -n "$OPENIPC" ] && FAMILY=openipc
+FLASHTYPE=
+if [ -n "$OPENIPC" ]; then
+    case "$FLASH" in
+        */nand.bin) FAMILY=openipc-nand; FLASHTYPE=,flash-type=w25n01gv ;;
+        *) FAMILY=openipc-nor ;;
+    esac
+fi
 
 WORK=$(mktemp -d)
 QPID=
@@ -103,8 +112,8 @@ open(path, 'wb').write(d)
 print('note Xiongmai image: xmuart=0 added to the environment copy')
 PY
 
-if [ "$FAMILY" = openipc ]; then
-    "$QEMU" -M "$MACHINE,flash-file=$WORK/flash.bin,flash-type=w25n01gv" \
+if [ -n "$OPENIPC" ]; then
+    "$QEMU" -M "$MACHINE,flash-file=$WORK/flash.bin$FLASHTYPE" \
         -kernel "$OPENIPC/zImage" -dtb "$OPENIPC/rv1106.dtb" \
         -append "$(cat "$OPENIPC/cmdline")" -nographic \
         -monitor none -serial "unix:$WORK/ser.sock,server=on,wait=on" \
@@ -151,12 +160,22 @@ if family == 'rv1126':
         (b'Run /sbin/init', 'init runs'),
         (b'Starting logging', 'init scripts run'),
     ]
-if family == 'openipc':
+if family == 'openipc-nand':
     steps = [
         (b'Linux version', 'Linux starts in the secure world'),
         (b'Winbond SPI NAND was found', 'SPI NAND on the SFC'),
         (b'ubi0: attached mtd3', 'UBI attached'),
-        (b'VFS: Mounted root (squashfs', 'rootfs mounted from ubiblock'),
+        (b'VFS: Mounted root (ubifs', 'rootfs mounted from UBIFS'),
+    ]
+if family == 'openipc-nor':
+    steps = [
+        (b'Linux version', 'Linux starts in the secure world'),
+        (b'split NOR layout, kernel', 'the kernel splits firmware.bin'),
+        (b'VFS: Mounted root (squashfs filesystem) readonly on device 31:4',
+         'root on the rootfs it split off'),
+    ]
+if family.startswith('openipc'):
+    steps += [
         (b'Run /sbin/init', 'init runs'),
         (b'Starting network', 'rcS passes fw_printenv'),
         (b'Starting majestic', 'majestic started'),
