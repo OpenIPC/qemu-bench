@@ -198,6 +198,11 @@ def main():
     img[at:at + len(blob)] = blob
 
     os.makedirs(out, exist_ok=True)
+    # the test boots whichever image the directory holds: drop the other
+    # package's from an earlier run
+    other = "nor.bin" if name == "nand.bin" else "nand.bin"
+    if os.path.exists(os.path.join(out, other)):
+        os.remove(os.path.join(out, other))
     for f, data in ((name, img), ("zImage", zimage), ("rv1106.dtb", dtb),
                     ("cmdline", cmdline.encode())):
         with open(os.path.join(out, f), "wb") as fh:
