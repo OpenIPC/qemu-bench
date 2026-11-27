@@ -1,4 +1,4 @@
-# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd20x`, `ssc375`, `msc313e`, `ssc029`, `ssc034`, infinity6 dies)
+# SigmaStar / MStar ARMv7 (`ssr621q`, `ssd201`, `ssd202d`, `ssc375`, `msc313e`, `ssc029`, `ssc034`, infinity6 dies)
 
 SigmaStar's (formerly MStar's) Cortex-A7 SoCs share one memory map whatever
 the family: DRAM (the MIU0 window) at `0x20000000`, the SPI NOR read window at

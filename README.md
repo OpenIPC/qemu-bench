@@ -11,7 +11,7 @@ desk. Vendor families covered:
 - **Xiongmai** XM510 / XM530 / XM550, and XM530V200 / XM533 / XM535
 - **Goke** GK7101 / GK7102 and the GK710xS die
 - **Anyka** AK39xx
-- **SigmaStar / MStar** infinity2m (SSD20x, SSR621Q, SSC375), infinity3 (MSC313E, MSC316) and the infinity6 family (SSC325, SSC33x, SSC30Kx, SSC338Q, SSC37x, SSC378x)
+- **SigmaStar / MStar** infinity2m (SSD201, SSD202D, SSR621Q), Ifado (SSC375), infinity3 (MSC313E, MSC316) and the infinity6 family (SSC325, SSC33x, SSC30Kx, SSC338Q, SSC37x, SSC378x)
 - **Novatek** NT9856x, NT9852x, NT98532/NT98533, NT9832x, NT98332 and NT98633
 - **Allwinner** V831 / V833
 - **Fullhan** FH8852 / FH8856 (V100 and V200), FH8858V200, FH865x,
@@ -308,7 +308,7 @@ the vendor's L2-resident code and the watchdog, as on the chip.
 | `ssc034a`, `ssc034b` | Cortex-A7 ×2, 128 / 64 MB | GIC-400 + main-intc | 4.9.84 vendor (SDK build) | SDK IPL → TF-A → U-Boot → kernel → shell from NOR and SPI NAND, 2 CPUs, Ethernet, SD, SDK `venc_demo` to H.264/H.265 |
 | `ssc325`, `ssc325de`, `ssc327de`, `ssc333`, `ssc335`, `ssc335de`, `ssc337`, `ssc337de`, `ssc30kd`, `ssc30kq`, `ssc338q`, `ssc377`, `ssc377d`, `ssc377de`, `ssc377qe`, `ssc378de`, `ssc378qe` | Cortex-A7 / A35 (A35 run as QEMU's ARMv8 `max`) ×1-2, 64-256 MB | GIC-400 / GICv3 | OpenIPC 4.9.84 / 5.10.61 | vendor and OpenIPC U-Boot, OpenIPC to login on `ssc325`, `ssc337`, `ssc338q`, `ssc377`; H.265 through the vendor stack on `ssc337`, `ssc338q`, `ssc377` |
 
-SigmaStar's (formerly MStar's) infinity2m, infinity3, Iford, Ifliegen and infinity6 family dies, in `hw/arm/sigmastar.c`:
+SigmaStar's (formerly MStar's) infinity2m, Ifado, infinity3, Iford, Ifliegen and infinity6 family dies, in `hw/arm/sigmastar.c`:
 every peripheral behind the RIU's 16-bit register banks at `0x1F000000`. An
 SSR621Q NVR's SPI-NOR dump boots the way the mask ROM does -- the board's own
 IPL into IMI, `IPL_CUST`, U-Boot, the kernel from the romfs squashfs -- to
