@@ -11,6 +11,16 @@
  * registers keep what is written, the interrupt status never reports
  * anything and DEVCTL never sees a device on the line, which is what the
  * driver finds on a board with the port empty.
+ *
+ * With "host" set (the AV130, whose two interrupts the machine wires) the
+ * core is a Mentor MUSB host instead (hw/usb/hcd-musb.c) with one port on
+ * its own USB bus, so `-device usb-kbd` and the like plug in and the
+ * vendor's prebuilt ak_hcd enumerates them over EP0 through the FIFO, as
+ * on the cameras' Wi-Fi dongles.  The registers at 0x200 are the MUSB
+ * HSDMA block: kept as storage, no transfer is moved by it yet.  Interrupt
+ * 0 is the core's (ak_hcd's usb_add_hcd()), 1 the DMA's.  The MUSB state
+ * is not in the migration stream: with the port empty there is none to
+ * keep, and a device on the port blocks migration (hcd-musb.c).
  */
 
 #include "qemu/osdep.h"
@@ -18,6 +28,9 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
+#include "hw/usb/hcd-musb.h"
 
 #define TYPE_AK_USB "ak-usb"
 OBJECT_DECLARE_SIMPLE_TYPE(AkUsbState, AK_USB)
@@ -38,7 +51,34 @@ struct AkUsbState {
 
     MemoryRegion iomem;
     uint8_t regs[AK_USB_SIZE];
+
+    bool host;
+    MUSBState *musb;
+    uint32_t lines;             /* level of each musb_irq_* source */
+    qemu_irq irq;
+    qemu_irq dma_irq;
 };
+
+/* The musb_irq_* sources that are interrupts (not VBUS / session). */
+#define AK_USB_CORE_LINES   (((1u << musb_irq_max) - 1) & \
+                             ~(1u << musb_set_vbus | 1u << musb_set_session))
+
+static void ak_usb_musb_line(void *opaque, int line, int level)
+{
+    AkUsbState *s = opaque;
+
+    if (level) {
+        s->lines |= 1u << line;
+    } else {
+        s->lines &= ~(1u << line);
+    }
+    qemu_set_irq(s->irq, !!(s->lines & AK_USB_CORE_LINES));
+}
+
+static unsigned ak_usb_size_index(unsigned size)
+{
+    return size == 1 ? 0 : size == 2 ? 1 : 2;
+}
 
 static bool ak_usb_is_status(hwaddr offset)
 {
@@ -52,6 +92,10 @@ static uint64_t ak_usb_read(void *opaque, hwaddr offset, unsigned size)
     AkUsbState *s = opaque;
     uint64_t val = 0;
     unsigned i;
+
+    if (s->host && offset < R_DMA_INTR) {
+        return musb_read[ak_usb_size_index(size)](s->musb, offset);
+    }
 
     for (i = 0; i < size; i++) {
         hwaddr a = offset + i;
@@ -73,6 +117,10 @@ static void ak_usb_write(void *opaque, hwaddr offset, uint64_t val,
     AkUsbState *s = opaque;
     unsigned i;
 
+    if (s->host && offset < R_DMA_INTR) {
+        musb_write[ak_usb_size_index(size)](s->musb, offset, val);
+        return;
+    }
     for (i = 0; i < size; i++) {
         s->regs[offset + i] = val >> (8 * i);
     }
@@ -93,6 +141,24 @@ static void ak_usb_reset(DeviceState *dev)
     AkUsbState *s = AK_USB(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    if (s->musb) {
+        musb_reset(s->musb);
+        s->lines = 0;
+        qemu_irq_lower(s->irq);
+    }
+}
+
+static void ak_usb_realize(DeviceState *dev, Error **errp)
+{
+    AkUsbState *s = AK_USB(dev);
+
+    if (!s->host) {
+        return;
+    }
+    qdev_init_gpio_in(dev, ak_usb_musb_line, musb_irq_max);
+    s->musb = musb_init(dev, 0);
+    /* ak_hcd addresses the device through FADDR, not TXFUNCADDR. */
+    musb_set_single_point(s->musb, true);
 }
 
 static void ak_usb_init(Object *obj)
@@ -102,7 +168,13 @@ static void ak_usb_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &ak_usb_ops, s, TYPE_AK_USB,
                           AK_USB_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->dma_irq);
 }
+
+static const Property ak_usb_properties[] = {
+    DEFINE_PROP_BOOL("host", AkUsbState, host, false),
+};
 
 static const VMStateDescription vmstate_ak_usb = {
     .name = TYPE_AK_USB,
@@ -119,7 +191,9 @@ static void ak_usb_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_ak_usb;
+    dc->realize = ak_usb_realize;
     device_class_set_legacy_reset(dc, ak_usb_reset);
+    device_class_set_props(dc, ak_usb_properties);
 }
 
 static const TypeInfo ak_usb_info = {

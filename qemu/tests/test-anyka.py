@@ -35,6 +35,12 @@ script plays the vendor drivers (docs/anyka.md):
   - the ak-sysctrl watchdog: a feed defers expiry, magic close disables it,
     an expiry is reported with when it was last fed, and the kernel's
     two-count restart resets without being reported;
+  - ak3918av130's USB, a MUSB host (hcd-musb behind ak-usb) with a
+    high-speed 007a:6162 on its port, driven as the vendor's ak_hcd drives
+    it: CSRs written a byte at a time, EP0's interrupt disabled and INTRTX
+    polled, the device named by FADDR; GET_DESCRIPTOR, SET_ADDRESS with
+    its status stage reaching the device, and the descriptor again at the
+    new address (OpenIPC/firmware#2962);
   - outside qtest: a flash image smaller than an erase block is refused,
     machine state migrates to a file and back on five- and ten-timer
     parts, and a file-backed flash blocks migration.
@@ -99,6 +105,18 @@ class QTest:
 
     def readl(self, a):
         return int(self.cmd('readl 0x%x' % a).split()[1], 16)
+
+    def writeb(self, a, v):
+        self.cmd('writeb 0x%x 0x%x' % (a, v))
+
+    def readb(self, a):
+        return int(self.cmd('readb 0x%x' % a).split()[1], 16)
+
+    def writew(self, a, v):
+        self.cmd('writew 0x%x 0x%x' % (a, v))
+
+    def readw(self, a):
+        return int(self.cmd('readw 0x%x' % a).split()[1], 16)
 
     def step(self, ns):
         self.cmd('clock_step %d' % ns)
@@ -505,6 +523,18 @@ def test_rejections_and_migration(qemu, tmp, path):
               ['migrate file:' + os.path.join(tmp, 'blocked.mig')])
     check('file-backed flash blocks migration', 'written through' in out,
           True)
+    out = hmp(qemu, ['-M', 'ak3918av130', '-S',
+                     '-device', 'atbm-wifi,pid=0x6162,port=1'],
+              ['migrate file:' + os.path.join(tmp, 'usb.mig')])
+    check('ak3918av130: a USB device on the port blocks migration',
+          'not migrated' in out, True)
+    out = hmp(qemu, ['-M', 'ak3918av130', '-S',
+                     '-device', 'atbm-wifi,pid=0x6162,port=1,id=w'],
+              ['device_del w', 'info usb',
+               'migrate file:' + os.path.join(tmp, 'unplugged.mig'),
+               'info migrate'])
+    check('... unplugged, it migrates again',
+          'completed' in out and 'not migrated' not in out, True)
 
 
 def test_misc(qt):
@@ -865,6 +895,162 @@ SFC = 0x20120000
 SFC_XIP = 0x30000000
 
 
+USB = 0x20200000
+AV130_INTC = 0x21100000
+
+
+def usb_ep0(qt, setup=None, csr0=None):
+    """One EP0 stage as ak_hcd runs it; returns INTRTX and CSR0 after."""
+    qt.writeb(USB + 0x0E, 0)                    # INDEX
+    if setup is not None:
+        for b in setup:
+            qt.writeb(USB + 0x20, b)            # the EP0 FIFO
+    qt.writeb(USB + 0x12, csr0)                 # CSR0, a byte write
+    qt.step(1000000)
+    return qt.readw(USB + 0x02), qt.readb(USB + 0x12)
+
+
+def usb_read_fifo0(qt, n, width):
+    """n bytes from the EP0 FIFO, read width bytes at a time."""
+    data = b''
+    while len(data) < n:
+        if width == 4:
+            data += struct.pack('<I', qt.readl(USB + 0x20))
+        elif width == 2:
+            data += struct.pack('<H', qt.readw(USB + 0x20))
+        else:
+            data += bytes([qt.readb(USB + 0x20)])
+    return data[:n]
+
+
+def usb_get_device_descriptor(qt, width=1):
+    tx, csr = usb_ep0(qt, [0x80, 6, 0, 1, 0, 0, 0x40, 0], 0x0A)
+    ok = tx == 1 and not csr & 0x02             # SETUPPKT | TXPKTRDY sent
+    tx, csr = usb_ep0(qt, csr0=0x20)            # REQPKT
+    n = qt.readw(USB + 0x18)                    # COUNT0
+    data = usb_read_fifo0(qt, n, width)
+    ok = ok and tx == 1 and csr & 0x01          # RXPKTRDY
+    usb_ep0(qt, csr0=0x00)                      # RXPKTRDY cleared
+    tx, _ = usb_ep0(qt, csr0=0x42)              # STATUSPKT | TXPKTRDY
+    return ok and tx == 1, data
+
+
+def test_av130_usb(qemu):
+    print('ak3918av130: USB host, a high-speed 007a:6162 enumerated over '
+          'EP0 as ak_hcd does it')
+    qt = QTest(qemu, 'ak3918av130',
+               ['-device', 'atbm-wifi,pid=0x6162,port=1'])
+    try:
+        qt.writeb(USB + 0x01, 0x21)             # POWER: HSENAB | SUSPENDM
+        qt.writeb(USB + 0x0B, 0xF7)             # INTRUSBE, but SOF
+        qt.writew(USB + 0x06, 0)                # INTRTXE: EP0 polled
+        qt.writew(USB + 0x08, 0)                # INTRRXE
+        qt.writeb(USB + 0x60, 1)                # DEVCTL: session
+        check('connect on interrupt 18 (the DT\'s first)',
+              qt.readl(AV130_INTC + 0x08) >> 18 & 1, 1)
+        check('INTRUSB: connect, cleared by the read',
+              (qt.readb(USB + 0x0A), qt.readb(USB + 0x0A)), (0x10, 0))
+        check('DEVCTL: host, a full / high-speed device',
+              qt.readb(USB + 0x60) & 0x44, 0x44)
+        qt.writeb(USB + 0x01, 0x29)             # bus reset
+        qt.writeb(USB + 0x01, 0x21)
+        check('POWER: high speed negotiated (HSENAB | HSMODE)',
+              qt.readb(USB + 0x01) & 0x30, 0x30)
+
+        qt.writeb(USB + 0x00, 0)                # FADDR: the default address
+        ok, desc = usb_get_device_descriptor(qt)
+        check('GET_DESCRIPTOR at address 0: SETUP, IN, status, INTRTX '
+              'latched with INTRTXE clear', ok, True)
+        check('the 18-byte device descriptor, 007a:6162, EP0 64 bytes',
+              (len(desc), desc[:2], desc[7], desc[8:12]),
+              (18, b'\x12\x01', 64, b'\x7a\x00\x62\x61'))
+        check('no interrupt line once INTRTX is read',
+              (qt.readw(USB + 0x02), qt.readl(AV130_INTC + 0x08) >> 18 & 1),
+              (0, 0))
+
+        tx, _ = usb_ep0(qt, [0, 5, 5, 0, 0, 0, 0, 0], 0x0A)
+        st, csr = usb_ep0(qt, csr0=0x60)        # status IN: REQPKT
+        check('SET_ADDRESS 5: SETUP, and a status IN to the device',
+              (tx, st, csr & 0x41), (1, 1, 0x41))
+        check('the status IN carried no data', qt.readw(USB + 0x18), 0)
+        usb_ep0(qt, csr0=0x00)
+        qt.writeb(USB + 0x13, 0x01)             # CSR0 high byte: FLUSHFIFO
+        check('a write to the high byte of CSR0 sends nothing',
+              qt.readw(USB + 0x02), 0)
+
+        qt.writeb(USB + 0x00, 5)                # FADDR names the device
+        ok, desc = usb_get_device_descriptor(qt)
+        check('GET_DESCRIPTOR at address 5 (FADDR, not TXFUNCADDR)',
+              (ok, desc[8:12]), (True, b'\x7a\x00\x62\x61'))
+
+        for width in (2, 4):
+            ok, wide = usb_get_device_descriptor(qt, width)
+            check('the descriptor read %d bytes at a time, in order' % width,
+                  (ok, wide), (True, desc))
+
+        qt.writeb(USB + 0x00, 9)                # nobody at address 9
+        tx, csr = usb_ep0(qt, [0x80, 6, 0, 1, 0, 0, 0x40, 0], 0x0A)
+        check('a SETUP to an absent address fails: INTRTX, CSR0 H_ERROR',
+              (tx, csr & 0x12), (1, 0x10))
+        usb_ep0(qt, csr0=0x00)
+
+        qt.writeb(USB + 0x0E, 1)                # INDEX 1
+        qt.writel(USB + 0x64, 0x0010 << 16 | 0x0008)
+        check('TX / RX FIFOADDR set by one 32-bit write',
+              (qt.readw(USB + 0x64), qt.readw(USB + 0x66)), (0x0008, 0x0010))
+        # EP1's FIFO at the last 8 bytes of FIFO RAM, filled and sent to
+        # the absent address again and again: nothing is written past the
+        # end, and EP0 still works after.
+        qt.writew(USB + 0x64, 0x0FFF)
+        for _ in range(40):
+            for b in range(80):
+                qt.writeb(USB + 0x24, b)
+            qt.writeb(USB + 0x12, 0x01)         # TXCSR: TXPKTRDY
+        qt.writeb(USB + 0x00, 5)
+        ok, again = usb_get_device_descriptor(qt)
+        check('FIFO writes past the end of FIFO RAM are dropped; EP0 works',
+              (ok, again), (True, desc))
+
+        # A machine reset (the watchdog's two-count restart, as the kernel
+        # reboots) leaves no endpoint state behind: CSR0 left with H_ERROR
+        # reads clear, the device is back at address 0, and it enumerates
+        # again.
+        qt.writeb(USB + 0x00, 9)
+        usb_ep0(qt, [0x80, 6, 0, 1, 0, 0, 0x40, 0], 0x0A)
+        wdt_feed(qt, 2)
+        qt.step(10 * 1000000)
+        qt.writeb(USB + 0x0E, 0)
+        check('after a reset: CSR0, FADDR, DEVCTL clear',
+              (qt.readb(USB + 0x12), qt.readb(USB + 0x00),
+               qt.readb(USB + 0x60) & 0x01), (0, 0, 0))
+        qt.writeb(USB + 0x01, 0x21)
+        qt.writeb(USB + 0x0B, 0xF7)
+        qt.writeb(USB + 0x60, 1)
+        qt.readb(USB + 0x0A)
+        qt.writeb(USB + 0x01, 0x29)
+        qt.writeb(USB + 0x01, 0x21)
+        ok, again = usb_get_device_descriptor(qt)
+        check('... and the device enumerates again at address 0',
+              (ok, again), (True, desc))
+    finally:
+        qt.close()
+
+    # A connect while INTRUSBE masks it is latched, and raises the line
+    # once enabled.
+    qt = QTest(qemu, 'ak3918av130',
+               ['-device', 'atbm-wifi,pid=0x6162,port=1'])
+    try:
+        qt.writeb(USB + 0x0B, 0)                # INTRUSBE: nothing
+        qt.writeb(USB + 0x60, 1)                # session: the connect
+        line = qt.readl(AV130_INTC + 0x08) >> 18 & 1
+        qt.writeb(USB + 0x0B, 0xF7)
+        check('a masked connect: no line, latched, raised when enabled',
+              (line, qt.readl(AV130_INTC + 0x08) >> 18 & 1,
+               qt.readb(USB + 0x0A) & 0x10), (0, 1, 0x10))
+    finally:
+        qt.close()
+
+
 def sfc_bank(qt, n, op, iface, length=0, addr=0, mask=0, match=0):
     b = SFC + 0x200 + 0x40 * n
     qt.writel(b + 0x00, op)
@@ -1007,6 +1193,7 @@ def main():
     test_watchdog_migration(args.qemu, tmp)
     test_av100(args.qemu, tmp)
     test_av130(args.qemu, tmp)
+    test_av130_usb(args.qemu)
     test_rejections_and_migration(args.qemu, tmp, path)
     print('%s: %d failure(s)' % ('FAIL' if failures else 'PASS', failures))
     sys.exit(1 if failures else 0)
