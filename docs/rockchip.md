@@ -891,22 +891,36 @@ request, with the IOC on the bounce. A short packet has to complete the
 chain at that last TRB (CSP). Raising the event on the short TRB instead
 delivered every frame one frame late.
 
-## OpenIPC firmware (rv1106, SPI NAND, `-kernel`)
+## OpenIPC firmware (rv1106, SPI NAND or NOR, `-kernel`)
 
 OpenIPC's own RV1106 release boots on the `rv1106` machine to its login
-prompt, in about 6 s. Unlike the vendor dumps, its root has no password.
+prompt, in about 6 s, from either of its packages. Unlike the vendor
+dumps, its root has no password.
 
 ```
-python3 qemu-boot/rv1106-openipc-image.py \
-    openipc.rv1106-nand-lite.tgz openipc.rv1106-nor-lite.tgz img/
-bash qemu-boot/test-rv1106-boot.sh --openipc img/
+python3 qemu-boot/rv1106-openipc-image.py openipc.rv1106-nand-lite.tgz nand/
+bash qemu-boot/test-rv1106-boot.sh --openipc nand/
+python3 qemu-boot/rv1106-openipc-image.py openipc.rv1106-nor-lite-split.tgz nor/
+bash qemu-boot/test-rv1106-boot.sh --openipc nor/
 ```
 
-- **Image:** the script builds a 128 MiB data-only NAND image with the
-  release's UBI at 1 MiB and partitions given by `mtdparts=spi-nand0:…`.
-  The kernel and devicetree (Luckfox Pico Pro) come from the NOR
-  release's `zboot.img`, an Android boot image whose second stage is an
-  RSCE blob.
+The packages are in the layouts of OpenIPC/firmware#2954 (2026-11-25);
+the older ones (`zboot.img`, a `kernel` UBI volume and a squashfs root
+on ubiblock) are not supported any more.
+
+- **NAND image:** a 128 MiB data-only NAND image with the release's
+  UBI at 1 MiB and partitions given by `mtdparts=spi-nand0:…`. The UBI
+  holds `rootfs` (UBIFS, `root=ubi0:rootfs`, with the kernel inside as
+  `/boot/fitImage`) and `rootfs_data`. The kernel and devicetree
+  (`<soc>-nand.dtb`, Luckfox Pico Pro) come from the package's
+  `fitImage.<soc>`, the same FIT.
+- **NOR image:** 16 MiB with the package's `firmware.bin.<soc>` at
+  0x50000: a multi-file uImage (zImage, `<soc>-nor.dtb`, which makes the
+  SFC's flash `jedec,spi-nor`), then the squashfs at the next 64 KiB.
+  The kernel's split layout (`CONFIG_MTD_SPLIT_LAYOUT`, OpenIPC/linux
+  #324) reads the two headers, registers kernel, rootfs and rootfs_data
+  itself, and mounts the root from its rootfs (31:4), ignoring
+  `mtdparts=` and `root=`. The test checks for both.
 - **NAND:** `flash-type=w25n01gv` (any `ingenic-spinand` part) puts the
   SFC in NAND mode on a machine whose dumps use NOR. Mainline Linux's
   SPI NAND driver finds it as "Winbond SPI NAND".
@@ -914,7 +928,7 @@ bash qemu-boot/test-rv1106-boot.sh --openipc img/
   in the secure world, as the vendor U-Boot leaves it, since there's no
   secure firmware. Booted non-secure, every interrupt stays in GIC
   group 0 and the first timer tick never comes.
-- **U-Boot environment:** the image carries one at 0x40000 (64 KiB,
+- **U-Boot environment:** both images carry one at 0x40000 (64 KiB,
   CRC32 first). OpenIPC's `fw_printenv` has no `fw_env.config`, so it
   searches the MTD partitions in order for a valid CRC, mapping each
   one whole. Without an environment it maps the 127 MiB UBI partition
