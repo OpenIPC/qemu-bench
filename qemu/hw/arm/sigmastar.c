@@ -287,13 +287,16 @@ static const SstarRegDefault ss_i2m_defaults[] = {
  * SATA, HDMI and the video decoder bonded out and DDR3 in the package.
  * The vendor DTS (model "INFINITY2M SSC010A-S01A-S") has memory at
  * 0x20000000 and the U-Boot bootargs LX_MEM=0xFF00000: 256 MiB.
+ * Bond 0x1B, as a real SSR621Q's IPL prints it ("D-1b"). Xiongmai's IPL
+ * (gf77b33a) sets miupll_233MHz for it; the i2m SDK's (g6759541) knows
+ * only 0x1D and 0x1E, prints "unknown miupll" and hangs on silicon.
  */
 static const SsSoCConfig ssr621q_soc = {
     .desc               = "SigmaStar SSR621Q (infinity2m, 2x Cortex-A7)",
     .num_cpus           = 2,
     .ram_size_default   = 256 * MiB,
     .chip_id            = 0xF0,
-    .bond               = 0x1E,
+    .bond               = 0x1B,
     .flash_jedec        = 0xC22018,         /* MX25L12835F, 16 MiB */
 };
 
