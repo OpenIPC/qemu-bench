@@ -32,6 +32,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/image-sensor.h"
 #include "hw/i2c/ingenic-sensor.h"
@@ -62,6 +63,8 @@ struct HisiSmartSensState {
     uint16_t hts;          /* 0x320C/D at reset (0: none) */
     bool     exp_rows;     /* 0x3E00-02 counts rows, not half rows */
     uint16_t gain_hcg;     /* the SC465SL's gains: its HCG factor, 1/1024 */
+    uint8_t reg_801e;  /* SC2336P/SC2337P variant register */
+    uint8_t bus;       /* board bus number (XM_REGTRACE) */
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -147,6 +150,8 @@ static int hisi_smartsens_send(I2CSlave *i2c, uint8_t data)
     } else {
         uint16_t addr = ((uint16_t)s->reg_buf[0] << 8) | s->reg_buf[1];
 
+        xm_regtrace("sensor", ((uint32_t)s->bus << 24) |
+                    ((uint32_t)i2c->address << 16) | addr, data);
         sensor_sync_write(&s->sync, addr, data);
         if (addr == 0x0100) {
             s->streaming = data & 1;
@@ -182,6 +187,8 @@ static uint8_t hisi_smartsens_recv(I2CSlave *i2c)
 
     if (s->cur_reg == 0x0100) {
         val = s->streaming;
+    } else if (s->cur_reg == 0x801e) {
+        val = s->reg_801e;
     } else if (s->cur_reg >= SS_REG_BASE &&
                s->cur_reg < SS_REG_BASE + SS_REG_COUNT) {
         val = s->regs[s->cur_reg - SS_REG_BASE];
@@ -467,6 +474,9 @@ static const Property hisi_smartsens_props[] = {
     DEFINE_PROP_BOOL("exp-rows", HisiSmartSensState, exp_rows, false),
     /* not 0: the SC465SL's gain registers, with this HCG factor (1/1024) */
     DEFINE_PROP_UINT16("gain-hcg", HisiSmartSensState, gain_hcg, 0),
+    DEFINE_PROP_UINT8("reg_801e", HisiSmartSensState, reg_801e, 0xff),
+    /* the board's bus number, for the XM_REGTRACE log only */
+    DEFINE_PROP_UINT8("bus",     HisiSmartSensState, bus,     0x00),
 };
 
 /* What the guest programmed: the register file and the address pointer. */

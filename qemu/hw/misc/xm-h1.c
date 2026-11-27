@@ -23,7 +23,10 @@
  *
  * JPEG: baseline, 4:2:0, the Annex K Huffman tables hantro_jpeg puts in the
  * header, ending with EOI.  The frame completes before the start write
- * returns.
+ * returns.  As for H.264 below, the header bytes past an 8-byte aligned
+ * ADDR_OUTPUT_STREAM come in STR_HDR_REM_MSB/LSB (RLC_CTRL[28:23] bits of
+ * them) and go out first: Hantro's JPEG library (Xiongmai's XM533/XM535
+ * snapshots) ends its header there, mainline Linux leaves them 0.
  *
  * H.264 (mode 3): Hantro's library writes the SPS and PPS itself, up to an
  * 8-byte aligned ADDR_OUTPUT_STREAM, and hands the H1 the bits that did not
@@ -200,6 +203,10 @@ static uint32_t xm_h1_jpeg(XmH1State *s)
     const int w = mbw * 16, h = mbh * 16;
     const int stride = H1_IN_ROW_LEN(img) ? H1_IN_ROW_LEN(img) : w;
     const int fmt = H1_IN_FMT(img);
+    const int rem_bits = H1_RLC_STR_OFFS(s->regs[H1_REG_RLC_CTRL / 4]);
+    const uint64_t rem = ((uint64_t)s->regs[H1_REG_STR_HDR_REM_MSB / 4] << 32) |
+                         s->regs[H1_REG_STR_HDR_REM_LSB / 4];
+    const int nrem = rem_bits / 8;
     uint8_t ql[64], qc[64];
     uint8_t *y, *cb, *cr, *out;
     bool overflow;
@@ -211,6 +218,10 @@ static uint32_t xm_h1_jpeg(XmH1State *s)
     }
     if (!xm_h1_geometry_ok(s, "JPEG", mbw, mbh, stride)) {
         return H1_INT_ERROR;
+    }
+    if (rem_bits % 8) {
+        qemu_log_mask(LOG_UNIMP, "xm-h1: %d header bits, not whole bytes\n",
+                      rem_bits);
     }
     for (i = 0; i < 64; i++) {
         const uint32_t lw = s->regs[H1_REG_JPEG_LUMA_QUAT / 4 + i / 4];
@@ -244,9 +255,16 @@ static uint32_t xm_h1_jpeg(XmH1State *s)
     }
 
     const uint32_t cap = xm_h1_out_cap(s, mbw, mbh);
-    out = g_malloc(MAX(cap, 1));
-    const size_t n = jpeg_enc_scan(y, stride, cb, cr, stride / 2, w, h, ql, qc,
-                                   true, out, cap, &overflow);
+    out = g_malloc(MAX(cap, 16));
+    for (i = 0; i < nrem && i < (int)cap; i++) {
+        out[i] = rem >> (56 - 8 * i);
+    }
+    const size_t n = cap > (uint32_t)nrem ?
+        jpeg_enc_scan(y, stride, cb, cr, stride / 2, w, h, ql, qc, true,
+                      out + nrem, cap - nrem, &overflow) + nrem : 0;
+    if (cap <= (uint32_t)nrem) {
+        overflow = true;
+    }
     if (overflow) {
         /* nothing is written: the driver sees BUFF_FULL, not a short scan */
         qemu_log_mask(LOG_GUEST_ERROR, "xm-h1: JPEG output over the %u-byte "
@@ -261,7 +279,7 @@ static uint32_t xm_h1_jpeg(XmH1State *s)
     if (s->dump_dir && !overflow) {
         g_autoptr(GByteArray) f = g_byte_array_new();
         jpeg_enc_header(f, w, h, ql, qc);
-        g_byte_array_append(f, out, n);
+        g_byte_array_append(f, out + nrem, n - nrem);
         xm_h1_dump(s, "jpg", f->data, f->len);
     }
     g_free(out);

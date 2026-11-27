@@ -32,6 +32,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -192,6 +193,7 @@ struct XmIsp2State {
     uint32_t sns_w, sns_h;      /* the sensor's active output */
     uint64_t frames;
     bool end_phase;
+    uint32_t phase;             /* quarter frames, see xm_isp2_frame */
     uint32_t store_lines;       /* 0: one line per event, not per channel */
     char *layout;
     const XmIsp2Layout *l;
@@ -199,6 +201,7 @@ struct XmIsp2State {
     uint32_t store_frame[STORE_CHANNELS];
     bool bpu_offline;           /* seen a BPU_START: jobs, not a timing gen */
     bool bpu_started;           /* a BPU_START not yet followed by RDMA_KICK */
+    uint32_t bpu_pending;       /* offline BPU starts not yet completed */
     bool trace;
 };
 
@@ -242,15 +245,56 @@ static void xm_isp2_update(XmIsp2State *s)
 
 static void xm_isp2_store_pattern(XmIsp2State *s, int c);
 
+/*
+ * The time from the last event to the one of s->phase. A frame's end comes
+ * its active time after its start; the rest of the period is blanking. The
+ * XM535 isp.ko queues a frame of a sensor sharing its VICU for the BPU at
+ * the next frame start, and drops it when that comes over 40 ms (the
+ * channel's tThr1) after its end, as half of a 12 fps period would. Two
+ * VICUs start a quarter period apart.
+ */
+#define XM_ISP2_BLANK_NS (30 * SCALE_MS)
+
+static int64_t xm_isp2_phase_ns(XmIsp2State *s, bool two)
+{
+    int64_t period = NANOSECONDS_PER_SECOND / s->fps;
+    int64_t blank = MIN(XM_ISP2_BLANK_NS, period / 2);
+
+    if (!two) {
+        return s->phase >= 2 ? period - blank : blank;
+    }
+    blank = MAX(blank, period / 4 + SCALE_MS);
+    switch (s->phase) {
+    case 1:                     /* VICU1 start */
+    case 3:                     /* VICU1 end */
+        return period / 4;
+    case 2:                     /* VICU0 end */
+        return period - blank - period / 4;
+    default:                    /* VICU0 start */
+        return blank - period / 4;
+    }
+}
+
 static void xm_isp2_frame(void *opaque)
 {
     XmIsp2State *s = XM_ISP2(opaque);
 
     const uint32_t *vicu = s->l->vicu;
+    /* Two sensors are not phase-locked: their frame starts and ends come a
+     * quarter frame apart (phases 0..3: VICU0 start, VICU1 start, VICU0
+     * end, VICU1 end). isp.ko's frame-end handler sets the BPU's
+     * new-parameters mask to its own channel alone, so ends arriving
+     * together leave one channel's parameters never taken. */
+    const bool two = s->vicus > 1 && vicu[1];
+    const int only = two ? (s->phase & 1) : -1;
     uint32_t v;
 
+    s->end_phase = s->phase >= 2;
     /* only what vicu_run enabled: +0x40 frame end, +0x50 frame start */
     for (v = 0; v < s->vicus && v < 2 && vicu[v]; v++) {
+        if (only >= 0 && v != (uint32_t)only) {
+            continue;
+        }
         if (s->end_phase) {
             s->vi[(vicu[v] + VICU_LINE(s)) / 4] = s->sns_h;
         }
@@ -262,6 +306,9 @@ static void xm_isp2_frame(void *opaque)
             s->vi[(vicu[v] + VICU_DONE(s)) / 4] = 1;
             s->vi[(vicu[v] + VICU_ST(s)) / 4] = 1;
         }
+    }
+    if (only > 0) {
+        goto next;
     }
     if (s->l->vicu_int && s->end_phase &&
         s->vi[(s->l->vicu_int + 0x40) / 4]) {
@@ -308,10 +355,11 @@ static void xm_isp2_frame(void *opaque)
             s->store[(b + 0x5C) / 4] = 1;
         }
     }
-    s->end_phase = !s->end_phase;
+next:
+    s->phase = (s->phase + (two ? 1 : 2)) & 3;
     xm_isp2_update(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / s->fps / 2);
+              xm_isp2_phase_ns(s, two));
 }
 
 #include "xm-pattern.c.inc"
@@ -521,6 +569,7 @@ static void name##_write(void *opaque, hwaddr off, uint64_t val,            \
 {                                                                           \
     XmIsp2State *s = XM_ISP2(opaque);                                       \
     XM_ISP2_TRACE(s, #arr, off, val);                                       \
+    xm_regtrace("isp2." #arr, off, val);                                    \
     s->arr[off / 4] = val;                                                  \
     if (s->arr == s->vpss) {                                                \
         xm_isp2_vpss_written(s, off, val);                                  \
@@ -547,6 +596,15 @@ static void xm_isp2_bpu_done(void *opaque)
         xm_isp2_vpss_inline(s);
     }
     s->bpu[BPU_ST / 4] = 1;
+    /* isp.ko may start the next channel's job before this one is done
+     * (two sensors' frames arriving together): one completion per start.
+     * Per start, not per RDMA_KICK: XM530V200's isp.ko never writes the
+     * kick, and XM535's writes it for either VICU (+0x10034 / +0x11034),
+     * up to a frame after the start; the kick only delays a completion. */
+    if (s->bpu_pending && --s->bpu_pending) {
+        timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  2 * SCALE_MS);
+    }
     xm_isp2_update(s);
 }
 
@@ -561,12 +619,15 @@ static void xm_isp2_bpu_write(void *opaque, hwaddr off, uint64_t val,
     XmIsp2State *s = XM_ISP2(opaque);
 
     XM_ISP2_TRACE(s, "bpu", off, val);
+    xm_regtrace("isp2.bpu", off, val);
     s->bpu[off / 4] = val;
     if (off == BPU_START && val) {
         s->bpu_started = true;
         s->bpu_offline = true;
-        timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  2 * SCALE_MS);
+        if (!s->bpu_pending++) {
+            timer_mod(s->bpu_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      2 * SCALE_MS);
+        }
     }
     xm_isp2_update(s);
 }
@@ -614,8 +675,10 @@ static void xm_isp2_reset(DeviceState *dev)
     s->vpss_pending = 0;
     timer_del(s->vpss_timer);
     timer_del(s->bpu_timer);
+    s->bpu_pending = 0;
     s->frames = 0;
     s->end_phase = false;
+    s->phase = 0;
     s->bpu_offline = false;
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / s->fps);

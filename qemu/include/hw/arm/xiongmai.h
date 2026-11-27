@@ -149,6 +149,10 @@ typedef struct XmSoCConfig {
     int         hevc_irq;
     const char *hevc_layout;    /* xm-hevc "layout"; NULL = its default */
     hwaddr      nn_base;        /* xm-nn; 0 = none */
+    hwaddr      fft_base;       /* xm-fft (XM533 ive.ko); 0 = none */
+    int         fft_irq;
+    hwaddr      vo_base;        /* xm-vo (XM530V200 vo.ko); 0 = none */
+    int         vo_irq;
     hwaddr      usb_base;       /* DWC2 OTG core in host mode; 0 = none */
     int         usb_irq;
     hwaddr      codec_i2c_base; /* an xm-i2c bus with an audio codec on it */
@@ -167,6 +171,7 @@ typedef struct XmSoCConfig {
     const char *audio_layout;   /* xm-audio "layout"; NULL: AI, AO */
     uint32_t    audio_chunk;    /* xm-audio "chunk"; 0 = its default */
     int         osd_irq;
+    bool        osd_swap12;     /* xm-osd: the XM535's colour order */
     int         num_gpio_high;  /* pads whose input reads high (pull-ups) */
     uint32_t    gpio_pads;      /* 0 = the model's 100 */
     uint32_t    gpio_adc_off;   /* xm-gpio adc-offset; 0 = none */

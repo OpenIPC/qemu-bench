@@ -30,6 +30,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
@@ -246,6 +247,7 @@ static void xm_vimu_write(void *opaque, hwaddr off, uint64_t val,
 {
     XmVimuState *s = XM_VIMU(opaque);
 
+    xm_regtrace("vimu", off, val);
     if (s->trace_writes) {
         fprintf(stderr, "xm-vimu: W %07" HWADDR_PRIx " %08" PRIx64 "\n",
                 off, val);

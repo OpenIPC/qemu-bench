@@ -30,6 +30,7 @@
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/image-sensor.h"
+#include "hw/misc/xm-regtrace.h"
 #include "hw/sysbus.h"
 #include "qobject/qlist.h"
 #include "target/arm/arm-powerctl.h"
@@ -339,6 +340,9 @@ static const XmSoCConfig *xm530v200_config(void)
         c.hevc_layout = "xm530v200";
         /* rgn.ko's OSD engine at 0x21300000 (osd_int SPI 62 as XM535) */
         c.osd_base = 0x21300000;
+        /* vo.ko's video output: 0x31000000, IRQ 59 (SPI 27) */
+        c.vo_base = 0x31000000;
+        c.vo_irq = 27;
         /* The boards' reset keys (Sofia's Device json Key: 80 on X2-WQ2,
          * 74 on X6C-WEQ), active low: low makes Sofia restore defaults and
          * reboot (type 10). */
@@ -579,6 +583,8 @@ static const XmSoCConfig *xm535_config(void)
         /* nn.ko's NN accelerator (xm-nn) */
         c.nn_base = 0x21500000;
         c.nn_irq = 43;
+        /* rgn.ko writes 2-bit colours 1 and 2 the other way round */
+        c.osd_swap12 = true;
     }
     return &c;
 }
@@ -671,6 +677,9 @@ static const XmSoCConfig *xm533_config(void)
          * XM535's */
         c.nn_base = 0x21500000;
         c.nn_irq = 43;
+        /* ive.ko's FFT engine: 0x21300000, IRQ 95 (SPI 63) */
+        c.fft_base = 0x21300000;
+        c.fft_irq = 63;
         {
             static const int irqs[XM_ISP2_IRQS] = { 25, -1, -1, -1, 27, 28, -1, -1, -1 };
             memcpy(c.isp2_irqs, irqs, sizeof(irqs));
@@ -689,6 +698,7 @@ typedef struct XmMachineState {
     int32_t ahd_chips;          /* with ahd_chips_set; else the SoC's */
     bool ahd_chips_set;
     Object *ahd0;               /* the first AHD receiver, for the VI */
+    uint32_t sensor_ext;        /* 0x801e, 0x1ff: the model's default */
 } XmMachineState;
 
 #define XM_MACHINE(obj) ((XmMachineState *)(obj))
@@ -708,19 +718,30 @@ static void xm_machine_set_flash_file(Object *obj, const char *value,
 
 static char *xm_machine_get_sensor_id(Object *obj, Error **errp)
 {
-    return g_strdup_printf("%04x", XM_MACHINE(obj)->sensor_id);
+    XmMachineState *s = XM_MACHINE(obj);
+
+    /* the /EXT the setter took, so the value can be set back as is */
+    return s->sensor_id && s->sensor_ext <= 0xff ?
+        g_strdup_printf("%04x/%02x", s->sensor_id, s->sensor_ext) :
+        g_strdup_printf("%04x", s->sensor_id);
 }
 
 static void xm_machine_set_sensor_id(Object *obj, const char *value,
                                      Error **errp)
 {
-    uint64_t v;
+    uint64_t v, ext = 0x1ff;
+    const char *end;
 
-    if (qemu_strtou64(value, NULL, 16, &v) || v > 0xffff) {
-        error_setg(errp, "sensor-id: a 16-bit hex chip ID, e.g. cb3a");
+    /* "cb3a", or "9b3a/00": the chip ID and the value of 0x801e, which
+     * tells SmartSens variants apart (SC2336P / SC2337P) */
+    if (qemu_strtou64(value, &end, 16, &v) || v > 0xffff ||
+        (*end == '/' && (qemu_strtou64(end + 1, NULL, 16, &ext) || ext > 0xff)) ||
+        (*end && *end != '/')) {
+        error_setg(errp, "sensor-id: a 16-bit hex chip ID, e.g. cb3a or 9b3a/00");
         return;
     }
     XM_MACHINE(obj)->sensor_id = v;
+    XM_MACHINE(obj)->sensor_ext = ext;
 }
 
 static char *xm_machine_get_sensor(Object *obj, Error **errp)
@@ -803,8 +824,16 @@ static void xm_machine_set_ahd_chips(Object *obj, Visitor *v,
     }
 }
 
+char xm_regtrace_mode(void)
+{
+    if (!current_cpu) {
+        return '-';
+    }
+    return (ARM_CPU(current_cpu)->env.uncached_cpsr & 0x1f) == 0x10 ? 'U' : 'K';
+}
+
 static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
-                              I2CBus *bus)
+                              I2CBus *bus, uint8_t busno)
 {
     const char *type = ms->sensor ? ms->sensor : c->sensor_type;
     uint16_t id = ms->sensor_id ? ms->sensor_id : c->sensor_id;
@@ -835,6 +864,12 @@ static void xm_attach_sensors(const XmSoCConfig *c, XmMachineState *ms,
         if (id && !ms->sensor) {    /* hisi-smartsens: which SC part */
             qdev_prop_set_uint8(DEVICE(sns), "id_high", id >> 8);
             qdev_prop_set_uint8(DEVICE(sns), "id_low", id & 0xff);
+            if (ms->sensor_id && ms->sensor_ext <= 0xff) {
+                qdev_prop_set_uint8(DEVICE(sns), "reg_801e", ms->sensor_ext);
+            }
+        }
+        if (!strcmp(type, "hisi-smartsens")) {
+            qdev_prop_set_uint8(DEVICE(sns), "bus", busno);
         }
         i2c_slave_realize_and_unref(sns, bus, &error_fatal);
     }
@@ -1278,7 +1313,7 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         DeviceState *i2c = sysbus_create_simple("xm-i2c", c->i2c_base, NULL);
 
         xm_attach_sensors(c, XM_MACHINE(machine),
-                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")), 0);
     }
     if (c->codec_i2c_base) {
         DeviceState *i2c = qdev_new("xm-i2c");
@@ -1308,7 +1343,8 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(i2c), 0, c->i2c2_base, 1);
         xm_attach_sensors(c, XM_MACHINE(machine),
-                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
+                          I2C_BUS(qdev_get_child_bus(i2c, "i2c")),
+                          (c->i2c2_base >> 12) & 0xf);
         xm_attach_ahd(c, XM_MACHINE(machine), 2,
                       I2C_BUS(qdev_get_child_bus(i2c, "i2c")));
     }
@@ -1334,6 +1370,12 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
     if (c->nn_base) {
         sysbus_create_simple("xm-nn", c->nn_base, pic[c->nn_irq]);
     }
+    if (c->vo_base) {
+        sysbus_create_simple("xm-vo", c->vo_base, pic[c->vo_irq]);
+    }
+    if (c->fft_base) {
+        sysbus_create_simple("xm-fft", c->fft_base, pic[c->fft_irq]);
+    }
     if (c->jpeg_base) {
         DeviceState *jpeg = qdev_new("xm-jpeg");
 
@@ -1357,7 +1399,12 @@ static void xiongmai_common_init(MachineState *machine, const XmSoCConfig *c)
         sysbus_connect_irq(SYS_BUS_DEVICE(hevc), 0, pic[c->hevc_irq]);
     }
     if (c->osd_base) {
-        sysbus_create_simple("xm-osd", c->osd_base, pic[c->osd_irq]);
+        DeviceState *osd = qdev_new("xm-osd");
+
+        qdev_prop_set_bit(osd, "swap12", c->osd_swap12);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(osd), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(osd), 0, c->osd_base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(osd), 0, pic[c->osd_irq]);
     }
     if (c->isp2) {
         DeviceState *isp = qdev_new("xm-isp2");

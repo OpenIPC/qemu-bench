@@ -18,7 +18,11 @@ XM232's engine codes H.264 too (xm232-h264), under the library's CAVLC SPS,
 PPS and slice header, which the script writes in front of the output as
 Sofia's library does, the slice header's bits past its last whole byte in
 +0x52C / +0x530; the stream ffmpeg decodes is those headers and the slice
-data the guest finds at the output.  On XM232 the last job also takes a
+data the guest finds at the output.  xm232-rc-h265 is an H.265 GOP whose
+jobs say so as Sofia's do (rate control word +0x3C8 = 0x1E) while the
+bytes before the output still hold an earlier H.264 stream's headers, as a
+new stream's buffer allocated where an H.264 stream's was does: the model
+must code H.265.  On XM232 the last job also takes a
 snapshot (+0x5C8): a 4:2:2 JPEG scan under the quantisers given as
 65536 / q at +0x1000, which must decode, behind the header the library
 would write, to the picture.
@@ -54,8 +58,10 @@ LAYOUTS = {
     'xm530v200': dict(V3, out=0x200, ys=0x214, cs=0x218),
     'xm232': X2,
     'xm232-h264': dict(X2, h264=True),
+    'xm232-rc-h265': dict(X2, stale_h264=True),
 }
 X2_HDR_BITS, X2_HDR_NBITS = 0x52C, 0x530
+X2_RC_CODEC, X2_RC_H265 = 0x3C8, 0x1E
 X2_JPEG_ON, X2_JPEG_FREE, X2_JPEG_OUT, X2_JPEG_LEN, X2_JPEG_QT = (
     0x5C8, 0x5D4, 0x5FC, 0x614, 0x1000)
 JPEG_ADDR = 0x82800000
@@ -203,6 +209,13 @@ def run(a, machine, L):
                 q.write(OUT_ADDR - len(hdr), hdr)
                 q.writel(HEVC + X2_HDR_BITS, pend)
                 q.writel(HEVC + X2_HDR_NBITS, nbits)
+            if L.get('stale_h264'):
+                # an H.265 job, as its rate control word says, over an
+                # earlier H.264 stream's headers
+                stale = h264_headers(w, h, f, qp)[0]
+                q.write(OUT_ADDR - len(stale), stale)
+                q.writel(HEVC + X2_HDR_NBITS, 0)
+                q.writel(HEVC + X2_RC_CODEC, X2_RC_H265)
             regs = {'w': w - 1, 'h': h - 1, 'type': 1 if f else 0, 'qp': qp,
                     'free': BUF_SIZE, 'y': IN_ADDR, 'c': IN_ADDR + w * h,
                     'ref': RECON[(f + 1) % 2], 'recon': RECON[f % 2],
