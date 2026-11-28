@@ -892,6 +892,12 @@ unknown`, as on the reporter's camera (OpenIPC/firmware#1889). A
 `load_novatek` that releases the reset pin and opens the clock gate
 before asking again gets `imx415`.
 
+`sensor=os05a10` puts an OmniVision OS05A10 at 0x36 (0x6C 8-bit), the
+sensor of the Reolink E340. It answers with two IDs, both read from that
+camera's sensor: the usual 0x530541 at 0x300A..0x300C, and 0x1C050A01 at
+0x6000..0x6003, the one Novatek's `nvt_sen_os05a10.ko` probes. The
+OmniVision model's registers reach 0x6FFF for it.
+
 `test-novatek-boot.sh` runs with `sensor=sc401ai` and checks three
 adapters, `i2cdetect` finding 0x30, and the release's own `ipcinfo`
 naming the part. `test-novatek.py` replays the driver's chunk sequences:
