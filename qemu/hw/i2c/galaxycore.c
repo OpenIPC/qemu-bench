@@ -29,6 +29,15 @@
  * last steps raise only the PGA, so the model stops at 53x times the
  * pregain.
  *
+ * GC1084 (T23's 720p part, OpenIPC/openingenic#58's t23/gc1084.c and
+ * Ingenic's T23 driver H20240222a it follows) keeps the GC2083's
+ * shutter 0x0D03:0x0D04, frame length 0x0D41:0x0D42, line length
+ * 0x0D05:0x0D06 in units of two clocks, window 0x0195..0x0198, column
+ * gain 0x00B8:0x00B9 and MIPI enable 0x023E bit 7 (its init table
+ * writes 0x98 there, next to last, and has no separate stream-on).  Its "pclk" is twice the driver's SCLK: 2222 x 2
+ * clocks x 750 rows at 99.99 MHz is 30 frames/s, and set_fps's VTS 900
+ * is 25.  No reset values are modelled; the driver writes them all.
+ *
  * Copyright (c) 2026 OpenIPC.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -104,6 +113,11 @@ static const uint16_t gc_latched[] = {
 };
 
 #define GC2083_ID           0x2083
+#define GC1084_ID           0x1084
+
+/* GC1084 keeps GC2083's shutter, frame/line length and MIPI enable */
+#define GC_D_LAYOUT(s)      ((s)->reg16 && \
+                             ((s)->id == GC2083_ID || (s)->id == GC1084_ID))
 #define GC2083_VTS_DELAY_MAX 2
 
 static bool gc_vts_delayed(GcSensorState *s, uint16_t a)
@@ -254,7 +268,7 @@ bool galaxycore_exposure(Object *sensor, IngenicSensorExposure *e)
         e->gain = (s->p0[0xB8] << 6 | (s->p0[0xB9] & 0x3F)) * 16;
         e->gain = e->gain ? e->gain : 1024;
         return true;
-    } else if (s->id == GC2083_ID) {
+    } else if (GC_D_LAYOUT(s)) {
         uint32_t col = (s->applied[0x00B8] & 0x3F) << 6 |
                        (s->applied[0x00B9] & 0x3F);
         uint32_t pre = (s->applied[0x00B1] & 0x0F) << 6 |
@@ -285,7 +299,7 @@ static void galaxycore_exposure_sensor(Object *sensor, ImageSensorExposure *e)
     galaxycore_exposure(sensor, &x);
     e->lines = x.lines;
     e->gain = x.gain;
-    if (s->id == GC2083_ID && s->reg16) {
+    if (GC_D_LAYOUT(s)) {
         e->vts = (s->applied[0x0D41] & 0x3F) << 8 | s->applied[0x0D42];
         e->width = (s->regs[0x0197] & 0x0F) << 8 | s->regs[0x0198];
         e->height = (s->regs[0x0195] & 0x07) << 8 | s->regs[0x0196];
@@ -324,7 +338,7 @@ static int64_t galaxycore_frame_ns(Object *sensor)
                         38800000);
     }
     galaxycore_exposure_sensor(sensor, &e);
-    if (s->reg16 && s->id == GC2083_ID) {
+    if (GC_D_LAYOUT(s)) {
         uint32_t hts = ((s->regs[0x0D05] & 0x0F) << 8 | s->regs[0x0D06]) * 2;
 
         if (!(s->regs[0x023E] & 0x80) || !s->pclk || !hts || !e.vts) {

@@ -25,7 +25,7 @@
 #        [--isp-ko FILE]
 #
 # Sensors: t31 gc2053 (MIPI, the default), sc2336, gc2083; t21 jxf37 (DVP);
-# t23 gc2053, sc2336; t20 jxf22; t10 jxh62 (720p, bit-banged I2C); t30 ov2735b; t40 gc4653 (MIPI, I2C1);
+# t23 gc2053, sc2336, gc1084; t20 jxf22; t10 jxh62 (720p, bit-banged I2C); t30 ov2735b; t40 gc4653 (MIPI, I2C1);
 # t41 gc4663, from the T41 SDK's own flash image (--image).
 # --include overrides the IMP header directory.  --isp-ko puts FILE in the
 # rootfs in place of its tx-isp-<soc>.ko: OpenIPC's tx-isp-t30.ko oopses
@@ -130,7 +130,7 @@ t41) SENSOR=${SENSOR:-gc4663}; INC=${INC:-$SDK41/include}; LIBIMP=sdk41
 *) echo "no ISP test for $SOC" >&2; exit 2 ;;
 esac
 case $SENSOR in
-gc2053|gc2083) ADDR=0x37 ;;
+gc2053|gc2083|gc1084) ADDR=0x37 ;;
 sc2336|sc2335) ADDR=0x30 ;;
 jxf37|jxf22) ADDR=0x40 ;;
 jxh62) ADDR=0x30 ;;

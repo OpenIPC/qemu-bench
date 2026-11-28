@@ -81,6 +81,9 @@ static const ImageSensorSpec image_sensors[] = {
     /* 100 MHz: the 24 MHz reference setting's pixel clock (galaxycore.c) */
     { "gc2083", GALAXYCORE, 0x37, 0x2083, 0x03F0, true,
       .pclk = 100000000 },
+    /* 2222 x 2 clocks x 750 rows x 30 fps (openingenic t23/gc1084.c) */
+    { "gc1084", GALAXYCORE, 0x37, 0x1084, 0x03F0, true,
+      .pclk = 99990000 },
     GC16("gc2093", 0x37, 0x2093),
     GC16("gc4653", 0x29, 0x4653),
     GC16("gc4663", 0x29, 0x4653),
