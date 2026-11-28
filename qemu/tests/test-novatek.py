@@ -56,7 +56,9 @@ plays the vendor drivers (docs/novatek.md):
     not sticking, a
     polled byte on an empty bus with TDR_EMPTY / RDR_FULL, four packets
     in one TDR write fetching the JEDEC ID of a w25q80 put on one bus,
-    two-byte packets, RDR_FULL through INTEN on interrupts 35 / 36 / 37;
+    two-byte packets reaching it as two bytes each in both bit orders,
+    RDR_FULL through INTEN on interrupts 35 / 36 / 37, and the interrupt
+    and "cs" lines driven again after a migration;
   - nvt-pwm, the way pwm-na51055.c drives it: PERIOD and its extension,
     ENABLE starting a channel (and its "out" line, high with a nonzero
     duty), DISABLE stopping it with INT_STS and SPI 26, a cycle-count run
@@ -1167,6 +1169,15 @@ def spi_word(qt, base, val, packets=1):
     return qt.readl(base + 0x20)
 
 
+def spi_cs(qt, base, level, slave=None):
+    """nvt_spi_set_npcs(), then the board's wire from "cs" to a slave."""
+    qt.writel(base + 0x00, SPI_EN | (SPI_CS if level else 0))
+    level = bool(qt.readl(base + 0x00) & SPI_CS)
+    if slave:
+        qt.cmd('set_irq_in %s ssi-gpio-cs 0 %d' % (slave, level))
+    return level
+
+
 def test_spi(qt):
     print('nvt-spi (a w25q80 on one bus)')
     base, spi = NVT_SPI[1]
@@ -1198,6 +1209,29 @@ def test_spi(qt):
           'JEDEC ID ef 50 14 after the command byte, on one bus',
           sorted('%08x' % (v or 0) for v in ids),
           ['00000000', '00000000', '1450ef00'])
+
+    # The machine attaches no slave and wires "cs" to nothing.  A flash
+    # from the command line has no chip select wire, so its CS input never
+    # moves and it sees no end of a command.  The read above is the
+    # flash's first command since reset and needs no boundary.  A second
+    # command does, so spi_cs() drives the flash's CS input to the level
+    # SPICS_VALUE reads back, as a board that attaches a slave would wire
+    # it.
+    base = NVT_SPI[[bool(v) for v in ids].index(True)][0]
+    flash = '/machine/peripheral/flash'
+    for lsb, tdr, want, order in (
+            (False, 0x00009F00, 0x501400EF, 'the high byte first'),
+            (True, 0x0000009F, 0x1450EF00, 'LSB first, the low byte first')):
+        spi_cs(qt, base, 1, flash)
+        spi_setup(qt, base, lsb=lsb, bits=16)
+        spi_cs(qt, base, 0, flash)
+        check('two two-byte packets go out as four bytes, %s: JEDEC ID ef '
+              '50 14 after the command byte' % order,
+              '%08x' % (spi_word(qt, base, tdr, packets=2) or 0),
+              '%08x' % want)
+    spi_cs(qt, base, 1, flash)
+    spi_setup(qt, base)
+
     base, spi = next(c for c, v in zip(NVT_SPI, ids) if v == 0)
     check('a byte on an empty bus completes and reads 0',
           spi_word(qt, base, 0xA5), 0)
@@ -4920,6 +4954,56 @@ def test_migration(qemu, tmp):
               'Assertion' not in out, True)
 
 
+def test_spi_migration(qemu, tmp):
+    """nvt-spi drives its interrupt and "cs" lines again after a load."""
+    print('nvt-spi migration')
+    mon = os.path.join(tmp, 'spi-mon.sock')
+    mig = os.path.join(tmp, 'spi.mig')
+    base = NVT_SPI[1][0]
+    args = ['-monitor', 'unix:%s,server,nowait' % mon]
+    qt = QTest(qemu, 'nt98566', args)
+    try:
+        spi_setup(qt, base)
+        qt.writel(base + 0x1C, SPI_RDRF)
+        qt.writel(base + 0x24, 0)               # RDR_FULL: interrupt pending
+        check('saved with RDR_FULL enabled and pending, CS low',
+              (qt.readl(base + 0x18), spi_cs(qt, base, 0)),
+              (SPI_TDRE | SPI_RDRF, False))
+        monitor(mon, 'migrate file:' + mig)
+        for _ in range(100):
+            if 'completed' in monitor(mon, 'info migrate'):
+                break
+            time.sleep(0.05)
+    finally:
+        qt.close()
+    # qtest intercepts one named line of one device, and reports a line
+    # when its level changes from the last one it saw, 0 at first.  The
+    # reset puts "cs" high in its view before the load.
+    for line, what, want in (
+            ('cs', '"cs" is low after the load', False),
+            ('sysbus-irq', 'the interrupt line is high after the load',
+             True)):
+        os.unlink(mon)
+        qt = QTest(qemu, 'nt98566', args + ['-incoming', 'defer'])
+        try:
+            qt.cmd('irq_intercept_out /machine/nvt-spi1 ' + line)
+            monitor(mon, 'system_reset')
+            qt.readl(base + 0x00)
+            before = qt.irqs.get(0)
+            monitor(mon, 'migrate_incoming file:' + mig)
+            for _ in range(100):
+                if 'running' in monitor(mon, 'info status'):
+                    break
+                time.sleep(0.05)
+            check('the registers are loaded back',
+                  (qt.readl(base + 0x00), qt.readl(base + 0x1C)),
+                  (SPI_EN, SPI_RDRF))
+            check(what, (before, qt.irqs.get(0)),
+                  (True if line == 'cs' else None, want))
+        finally:
+            qt.close()
+
+
 def imx415_answers(qt):
     """ipcinfo's probe: the sensor's 7-bit 0x1A, an empty write."""
     sts = i2c_chunk(qt, 2, 0x1A << 1, start=True, stop=True)
@@ -5530,7 +5614,8 @@ def run(args, tmp):
     finally:
         qt.close()
 
-    qt = QTest(args.qemu, 'nt98566', ['-device', 'w25q80,bus=spi'])
+    qt = QTest(args.qemu, 'nt98566',
+               ['-device', 'w25q80,bus=spi,id=flash'])
     try:
         test_spi(qt)
     finally:
@@ -5663,6 +5748,7 @@ def run(args, tmp):
     test_nt98323_periph(args.qemu, tmp)
     test_adc_thermal(args.qemu, tmp)
     test_migration(args.qemu, tmp)
+    test_spi_migration(args.qemu, tmp)
     test_imx415_power(args.qemu, tmp)
     test_rtc_no_crystal(args.qemu, args.qemu_aarch64)
 

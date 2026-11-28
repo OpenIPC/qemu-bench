@@ -30,12 +30,28 @@
  *
  * A TDR write completes at once.  TDR_EMPTY always reads set, and
  * RDR_FULL reads set from the write until RDR is read.  spi_wait_tdre()
- * and spi_wait_rdrf() poll for exactly these two bits.  Each packet is
- * one word on the SSI bus, 8 or 16 bits wide, with the value the driver
- * wrote.  Clock mode (IO), bit order and sample delay are stored for the
- * driver to read back and for a slave model to look up, and otherwise
- * ignored.  An empty bus reads 0.  "cs" follows SPICS_VALUE.  The driver
- * also drives a cs-gpios pad, which the GPIO model handles.
+ * and spi_wait_rdrf() poll for exactly these two bits.
+ *
+ * The SSI bus carries one byte per transfer.  A two-byte packet is two
+ * transfers, the high byte first, or the low byte first when LSB first is
+ * set, and the two bytes that come back fill the same places in RDR.
+ * This order follows from the driver and the Linux SPI convention.  It
+ * has not been measured on hardware.  The driver selects two-byte packets
+ * for bits_per_word 16, writes each word to TDR as the CPU holds it
+ * (tx_data[1] << 8 | tx_data[0]), reads it back from RDR the same way and
+ * sets LSB first from SPI_LSB_FIRST.  A Linux SPI word leaves most
+ * significant bit first unless that flag is set.
+ *
+ * Every byte reaches the slave with the value the driver wrote, in either
+ * bit order.  Clock mode (IO) and sample delay are stored for the driver
+ * to read back and for a slave model to look up, and otherwise ignored.
+ * An empty bus reads 0.
+ *
+ * "cs" follows SPICS_VALUE.  A board that attaches a slave connects "cs"
+ * to the slave's CS input.  The NT9856x machines attach none, and a slave
+ * added with -device has no such connection, so its CS input never
+ * changes and it sees no end of a command.  The driver also drives a
+ * cs-gpios pad, which the GPIO model handles.
  *
  * The reset values are not in the driver (setup writes every register it
  * depends on); CTRL resets with SPICS_VALUE set, the CS pin idle.
@@ -69,6 +85,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NvtSpiState, NVT_SPI)
 #define CTRL_KEPT       (CTRL_EN | CTRL_CS)
 /* DMA_EN, RDSTS_EN, GYRO_EN: the modes with no model */
 #define CTRL_MODE_START ((1u << 2) | (1u << 4) | (1u << 6))
+#define CONFIG_LSB      (1u << 0)
 #define CONFIG_PKTLEN   (1u << 2)
 #define STS_TDR_EMPTY   (1u << 0)
 #define STS_RDR_FULL    (1u << 1)
@@ -107,12 +124,16 @@ static void nvt_spi_shift(NvtSpiState *s, uint32_t tdr)
     uint32_t cfg = *reg(s, SPI_CONFIG);
     int bits = cfg & CONFIG_PKTLEN ? 16 : 8;
     /* TDR holds 32 bits: four one-byte packets, two two-byte ones */
-    int n = MIN(extract32(cfg, 4, 2) + 1, 32 / bits), i;
+    int n = MIN(extract32(cfg, 4, 2) + 1, 32 / bits), i, b, at;
     uint32_t rdr = 0;
 
     for (i = 0; i < n; i++) {
-        rdr = deposit32(rdr, i * bits, bits,
-                        ssi_transfer(s->bus, extract32(tdr, i * bits, bits)));
+        for (b = 0; b < bits; b += 8) {
+            /* byte order within a packet: see the note at the top */
+            at = i * bits + (cfg & CONFIG_LSB ? b : bits - 8 - b);
+            rdr = deposit32(rdr, at, 8,
+                            ssi_transfer(s->bus, extract32(tdr, at, 8)));
+        }
     }
     *reg(s, SPI_RDR) = rdr;
     *reg(s, SPI_STS) |= STS_RDR_FULL;
@@ -191,10 +212,17 @@ static void nvt_spi_init(Object *obj)
     s->bus = ssi_create_bus(DEVICE(obj), "spi");
 }
 
+static int nvt_spi_post_load(void *opaque, int version_id)
+{
+    nvt_spi_update(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_nvt_spi = {
     .name = TYPE_NVT_SPI,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = nvt_spi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, NvtSpiState, SPI_REGS_SIZE / 4),
         VMSTATE_END_OF_LIST()

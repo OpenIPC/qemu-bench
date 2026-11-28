@@ -932,11 +932,24 @@ there:
   storage.
 
 Each instance has an SSI bus, `spi`, and a `cs` GPIO line that follows
-SPICS_VALUE; the machine names them `nvt-spi0..2`. A packet is one word
-on the bus, 8 or 16 bits, with the value the driver wrote. Clock mode
-and bit order are left to the slave model. Nothing is attached, and an
-empty bus reads 0. The reset values are not in the driver; CTRL resets
-with SPICS_VALUE set (CS high).
+SPICS_VALUE; the machine names them `nvt-spi0..2`. The bus carries one
+byte per transfer. A two-byte packet is two transfers, the high byte
+first, or the low byte first when LSB first is set, and the two bytes
+that come back fill the same places in RDR. This order follows from the
+driver and the Linux SPI convention and has not been measured on
+hardware. The driver selects two-byte packets for `bits_per_word` 16,
+writes each word to TDR as the CPU holds it and sets LSB first from
+`SPI_LSB_FIRST`, and a Linux SPI word leaves most significant bit first
+unless that flag is set. Every byte reaches the slave with the value the
+driver wrote; clock mode and the bit order within a byte are left to the
+slave model. The interrupt and `cs` lines are driven again after a
+migration.
+
+Nothing is attached, and an empty bus reads 0. A board that attaches a
+slave connects `cs` to the slave's CS input. A slave added from the
+command line with `-device …,bus=spi` has no such connection, so its CS
+input never changes and it sees no end of a command. The reset values
+are not in the driver; CTRL resets with SPICS_VALUE set (CS high).
 
 Without the block the registers read 0 and `nvt_spi_setup()` never
 returns, so a firmware that loads an SPI device driver at boot hangs in
