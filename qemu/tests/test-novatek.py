@@ -51,6 +51,12 @@ plays the vendor drivers (docs/novatek.md):
     four-byte chunks, the DT / DR / BERR status and SPI 41, a NACK from an
     empty address followed by the driver's lone STOP, an i2cdetect-style
     quick write, and the empty second and third controllers;
+  - nvt-spi, the way spi-na51055.c drives it: the SPI_EN and SPICS_VALUE
+    read-backs nvt_spi_setup() loops on, the "cs" line, the mode strobes
+    not sticking, a
+    polled byte on an empty bus with TDR_EMPTY / RDR_FULL, four packets
+    in one TDR write fetching the JEDEC ID of a w25q80 put on one bus,
+    two-byte packets, RDR_FULL through INTEN on interrupts 35 / 36 / 37;
   - nvt-pwm, the way pwm-na51055.c drives it: PERIOD and its extension,
     ENABLE starting a channel (and its "out" line, high with a nonzero
     duty), DISABLE stopping it with INT_STS and SPI 26, a cycle-count run
@@ -1126,6 +1132,92 @@ def test_i2c(qt):
     for base, name in ((I2C1, 'I2C 1'), (I2C2, 'I2C 2')):
         sts = i2c_chunk(qt, 1, 0x30 << 1, start=True, stop=True, base=base)
         check('%s is empty' % name, sts & I2C_BERR, I2C_BERR)
+
+
+# ---- nvt-spi -----------------------------------------------------------------
+
+NVT_SPI = ((0xF0230000, 35), (0xF0320000, 36), (0xF0340000, 37))
+SPI_EN, SPI_CS = 1 << 0, 1 << 1
+SPI_TDRE, SPI_RDRF = 1 << 0, 1 << 1
+
+
+def spi_setup(qt, base, lsb=False, bits=8):
+    """nvt_spi_setup() for mode 3: False where the driver would spin."""
+    qt.writel(base + 0x04, 0x1300C)         # CPOL, CPHA, IO out, order
+    qt.writel(base + 0x14, 1 << 16)         # latch_clk_shift
+    cfg = qt.readl(base + 0x08) & ~5
+    qt.writel(base + 0x08, cfg | lsb | (4 if bits == 16 else 0))
+    qt.writel(base + 0x00, SPI_EN)
+    if not qt.readl(base + 0x00) & SPI_EN:
+        return False
+    # nvt_spi_set_npcs(SPI_INACTIVE_CS)
+    qt.writel(base + 0x00, qt.readl(base + 0x00) | SPI_CS)
+    return bool(qt.readl(base + 0x00) & SPI_CS)
+
+
+def spi_word(qt, base, val, packets=1):
+    """One round of nvt_spi_transfer_polled(): TDRE, TDR, RDRF, RDR."""
+    cfg = qt.readl(base + 0x08) & ~0x30     # spi_set_packet_count()
+    qt.writel(base + 0x08, cfg | {1: 0, 2: 1, 4: 3}[packets] << 4)
+    if not qt.readl(base + 0x18) & SPI_TDRE:
+        return None
+    qt.writel(base + 0x24, val)
+    if not qt.readl(base + 0x18) & SPI_RDRF:
+        return None
+    return qt.readl(base + 0x20)
+
+
+def test_spi(qt):
+    print('nvt-spi (a w25q80 on one bus)')
+    base, spi = NVT_SPI[1]
+    qt.cmd('irq_intercept_out /machine/nvt-spi1 cs')
+    check('reset: CS idle high, TDR empty, RDR not full',
+          (qt.readl(base + 0x00), qt.readl(base + 0x18)), (SPI_CS, SPI_TDRE))
+    qt.writel(base + 0x00, SPI_EN)
+    check('SPI_EN reads back (nvt_spi_setup() loops until it does)',
+          qt.readl(base + 0x00), SPI_EN)
+    check('nvt_spi_setup(): SPI_EN, then SPICS_VALUE, both read back',
+          spi_setup(qt, base, lsb=True), True)
+    check('"cs" is high while deselected', qt.irqs.get(0), True)
+    check('IO, CONFIG, DLY_CHAIN keep what setup wrote',
+          (qt.readl(base + 0x04), qt.readl(base + 0x08),
+           qt.readl(base + 0x14)), (0x1300C, 1, 1 << 16))
+    qt.writel(base + 0x00, SPI_EN | SPI_CS | 1 << 2)
+    check('DMA_EN does not stick: no DMA mode, and no DMA status',
+          qt.readl(base + 0x00), SPI_EN | SPI_CS)
+    qt.writel(base + 0x00, SPI_EN)          # nvt_spi_set_cs(): select
+    check('select: SPICS_VALUE 0 reads back, "cs" low',
+          (qt.readl(base + 0x00), qt.irqs.get(0)), (SPI_EN, False))
+
+    # which bus the command line's flash landed on is QEMU's choice
+    ids = []
+    for b, _ in NVT_SPI:
+        spi_setup(qt, b)
+        ids.append(spi_word(qt, b, 0x9F, packets=4))
+    check('four packets per TDR write, the first from the low byte: '
+          'JEDEC ID ef 50 14 after the command byte, on one bus',
+          sorted('%08x' % (v or 0) for v in ids),
+          ['00000000', '00000000', '1450ef00'])
+    base, spi = next(c for c, v in zip(NVT_SPI, ids) if v == 0)
+    check('a byte on an empty bus completes and reads 0',
+          spi_word(qt, base, 0xA5), 0)
+    check('reading RDR drops RDR_FULL', qt.readl(base + 0x18), SPI_TDRE)
+    spi_setup(qt, base, bits=16)
+    check('two two-byte packets complete too',
+          spi_word(qt, base, 0x12345678, packets=2), 0)
+    check('CONFIG: PKTLEN 2 bytes, PKT_CNT 2', qt.readl(base + 0x08), 0x14)
+
+    for n, (b, irq) in enumerate(NVT_SPI):
+        gic_enable(qt, irq)
+        qt.writel(b + 0x1C, SPI_RDRF)
+        idle = gic_pending(qt, irq)
+        qt.writel(b + 0x24, 0)
+        full = gic_pending(qt, irq)
+        qt.readl(b + 0x20)
+        check('bus %d: RDR_FULL through INTEN raises interrupt %d until RDR '
+              'is read' % (n, irq), (idle, full, gic_pending(qt, irq)),
+              (False, True, False))
+        qt.writel(b + 0x1C, 0)
 
 
 # ---- nvt-pwm -----------------------------------------------------------------
@@ -4150,6 +4242,10 @@ def test_fdt(qemu, tmp):
     check('three I2C nodes under the names i2c-nvt.c clocks by',
           find_nodes(data, ['i2c@f0220000', 'i2c2@f0350000',
                             'i2c3@f03a0000']).count(-1), 0)
+    check('three SPI nodes under the names spi-na51055.c clocks by',
+          find_nodes(data, ['spi@f0230000', 'spi@f0320000',
+                            'spi@f0340000']).count(-1) == 0 and
+          data.count(b'nvt,nvt_spi\0') == 3, True)
     check('the NOR under spinor.c', b'nvt,nvt_spinor\0' in data and
           b'spi_nor.0\0' in data, True)
 
@@ -4211,6 +4307,8 @@ def test_na51055(qemu, tmp):
         check('ai node with CNN2 (0xF0D60000), sie with SIE5 (0xF0D80000)',
               b'\xf0\xd6\x00\x00' in data and b'\xf0\xd8\x00\x00' in data,
               True)
+        check('no SPI nodes: their interrupts on this die are not known',
+              b'nvt,nvt_spi\0' in data, False)
         check('SDIO1 card detect on C_GPIO 9', b'cd_gpio\0' in data, True)
 
         qt = QTest(qemu, machine, ['-kernel', kernel])
@@ -5429,6 +5527,12 @@ def run(args, tmp):
     qt = QTest(args.qemu, 'nt98566,sensor=sc401ai')
     try:
         test_i2c(qt)
+    finally:
+        qt.close()
+
+    qt = QTest(args.qemu, 'nt98566', ['-device', 'w25q80,bus=spi'])
+    try:
+        test_spi(qt)
     finally:
         qt.close()
 

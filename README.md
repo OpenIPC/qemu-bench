@@ -1006,6 +1006,7 @@ qemu/
 ├── hw/net/nvt-eqos.c            # DWC Ethernet QoS (GMAC 4.x) + embedded PHY
 ├── hw/usb/nvt-usb.c             # Novatek FOTG200 host: FUSBH200 EHCI + OTG glue
 ├── hw/i2c/nvt-i2c.c             # Novatek I2C controllers (PIO chunks)
+├── hw/ssi/nvt-spi.c             # Novatek SPI masters (polled packets, SSI bus)
 ├── include/hw/arm/novatek.h     # NvtSoCConfig
 ├── include/hw/arm/goke.h        # GkSoCConfig
 ├── hw/arm/axera.c               # Axera AX630C machine: GIC-400, generic timer, DW-APB UART0
