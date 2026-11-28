@@ -3492,6 +3492,68 @@ ISP_LAYOUTS = {
 }
 
 
+def i2c_read_reg16(qt, base, addr, reg, n=1):
+    """Registers of a 16-bit-addressed sensor, read from @reg on"""
+    qt.writel(base + 0x6C, 0)
+    qt.writel(base + 0x04, addr)
+    qt.writel(base + 0x6C, 1)
+    qt.writel(base + 0x10, reg >> 8)
+    qt.writel(base + 0x10, reg & 0xFF)
+    for i in range(n):
+        qt.writel(base + 0x10, (1 << 8) | (1 << 10 if i == 0 else 0) |
+                  (1 << 9 if i == n - 1 else 0))
+    return [qt.readl(base + 0x10) & 0xFF for i in range(qt.readl(base + 0x78))]
+
+
+def test_gc1084_t23(qt):
+    """A GC1084 as openingenic's t23/gc1084.c drives it: 1280x720 at HTS
+    2222 (2 clocks a unit) x VTS 750, 30 frames/s from a 49.995 MHz SCLK,
+    and its set_fps writing VTS 900 for 25"""
+    print('t23 sensor=gc1084')
+    S = '/machine/isp/sensor'
+    (en, sta, clr, ch0, ch_en, push_y, push_uv, pop_y, empty, size, vic,
+     vsta, vclr) = ISP_LAYOUTS['t23']
+    check('GC1084 ID at I2C0 0x37, 0x03F0', i2c_read_reg16(qt, I2C0, 0x37,
+          0x03F0, 2), [0x10, 0x84])
+    check('one address byte (an 8-bit probe) reads 0',
+          i2c_read_reg(qt, I2C0, 0x37, 0xF0, 1), [0])
+    for reg, val in ((0x0D05, 0x08), (0x0D06, 0xAE),     # HTS 2222
+                     (0x0D41, 0x02), (0x0D42, 0xEE),     # VTS 750
+                     (0x0195, 0x02), (0x0196, 0xD0),     # 720 rows
+                     (0x0197, 0x05), (0x0198, 0x00),     # 1280 columns
+                     (0x0D03, 0x01), (0x0D04, 0x00),     # shutter 256
+                     (0x00B8, 0x01), (0x00B9, 0x00)):    # column gain 1x
+        i2c_write_reg16(qt, I2C0, 0x37, reg, val)
+    qt.writel(vic + 0x00, 1)
+    qt.writel(ISP + en, 0xFFFFFFFF)
+
+    def fps():
+        # frame starts (status bit 12) in a second, the ISP paced by the
+        # sensor's frame_ns
+        n = 0
+        qt.writel(ISP + clr, qt.readl(ISP + sta))
+        for _ in range(200):
+            qt.step(5 * 1000 * 1000)
+            if qt.readl(ISP + sta) & 0x1000:
+                n += 1
+                qt.writel(ISP + clr, qt.readl(ISP + sta))
+        return n
+
+    qt.step(100 * 1000 * 1000)
+    i2c_write_reg16(qt, I2C0, 0x37, 0x023E, 0x98)        # MIPI on
+    qt.step(100 * 1000 * 1000)
+    check('MIPI on: the shutter and VTS it reads',
+          (qt.qom_get(S, 'lines'), qt.qom_get(S, 'vts')), (256, 750))
+    n = fps()
+    check('2222 x 2 x 750 at 99.99 MHz: 30 frames/s (%d)' % n,
+          29 <= n <= 31, True)
+    i2c_write_reg16(qt, I2C0, 0x37, 0x0D41, 0x03)        # set_fps(25)
+    i2c_write_reg16(qt, I2C0, 0x37, 0x0D42, 0x84)
+    qt.step(100 * 1000 * 1000)
+    n = fps()
+    check('VTS 900: 25 frames/s (%d)' % n, 24 <= n <= 26, True)
+
+
 def test_isp_t23_dual(qt):
     """T23's double firmware: one pipe, the two sensors' pictures in turn"""
     print('ingenic-isp (t23 double firmware: two sensors through one pipe)')
@@ -5109,6 +5171,9 @@ def main():
             if soc in ('t21', 't40', 't41'):
                 test_isp_neutral_wedge(qt, soc)
             qt.close()
+        qt = QTest(a.qemu, 't23,sensor=gc1084')
+        test_gc1084_t23(qt)
+        qt.close()
         # T23's second sensor (the SDK's gc2053s1) beside the first on I2C0
         qt = QTest(a.qemu, 't23,sensor=gc2053,sensor1=gc2053s1')
         print('t23 sensor1=')

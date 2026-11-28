@@ -435,7 +435,7 @@ Pass `-M <soc>,sensor=<name>` (on `I2C0`; `I2C1` on T40; `sensor-bus=<n>` overri
 
 | Sensor(s) | I2C address | Model / driver ID | Notes |
 |---|---|---|---|
-| `gc2053`, `gc2083` | `0x37` | `galaxycore-sensor` | `gc2083` uses 16-bit registers |
+| `gc2053`, `gc2083`, `gc1084` | `0x37` | `galaxycore-sensor` | `gc2083` and `gc1084` use 16-bit registers; `gc1084` is T23's 720p part (openingenic `t23/gc1084.c`) |
 | `gc4653`, `gc4663` | `0x29` | `galaxycore-sensor` | 16-bit registers; T40 (`I2C1`) and T41 |
 | `sc2336`, `sc2335`, `sc1a4t`, `sc2336p`, `sc2337p` | `0x30` | `hisi-smartsens` | Single/main sensor |
 | `sc1a4ts1`, `sc2336ps1`, `sc2337ps1` | `0x32` | `hisi-smartsens` | Secondary sensor (`sensor1=`) |
