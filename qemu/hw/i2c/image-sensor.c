@@ -44,6 +44,8 @@ typedef struct ImageSensorSpec {
     bool exp_rows;      /* SMARTSENS: exposure in rows, not half rows */
     uint16_t gain_hcg;  /* SMARTSENS: the SC465SL's gain layout, its HCG
                          * factor in 1/1024 */
+    uint16_t alt_id_reg; /* OMNIVISION: a second, four-byte ID where the */
+    uint32_t alt_id;     /* part has one */
 } ImageSensorSpec;
 
 /* GalaxyCore's register pairs; OmniVision's OV4689/OV97x5 have the same */
@@ -161,6 +163,10 @@ static const ImageSensorSpec image_sensors[] = {
     /* the AX620U boards' (Axera SDK ov_os04a10/os04a10.c: 0x36, chip ID
      * 0x300A:0x300B:0x300C = 0x530441) */
     { "os04a10", OMNIVISION, 0x36, 0x530441, 0x300A },
+    /* the Reolink E340's, as its sensor reads: 0x530541 at 0x300A, and
+     * 0x1c050a01 at 0x6000, the ID Novatek's nvt_sen_os05a10.ko probes */
+    { "os05a10", OMNIVISION, 0x36, 0x530541, 0x300A,
+      .alt_id_reg = 0x6000, .alt_id = 0x1c050a01 },
     { "ov2735", OV2735, 0x3C, 0x05 },
     { "ov2735b", OV2735, 0x3C, 0x07 },
 
@@ -231,6 +237,8 @@ DeviceState *image_sensor_create_at(I2CBus *bus, const char *name,
         qdev_prop_set_uint8(dev, "id0", spec->id >> 16);
         qdev_prop_set_uint8(dev, "id1", (spec->id >> 8) & 0xFF);
         qdev_prop_set_uint8(dev, "id2", spec->id & 0xFF);
+        qdev_prop_set_uint16(dev, "id_alt_reg", spec->alt_id_reg);
+        qdev_prop_set_uint32(dev, "id_alt", spec->alt_id);
     } else if (!strcmp(spec->type, OV2710)) {
         qdev_prop_set_uint16(dev, "id-reg", spec->id_reg);
         qdev_prop_set_uint16(dev, "id", spec->id);

@@ -18,6 +18,11 @@
  *
  * Confirmed variants (instance property values):
  *   OS04A10   id_reg_base=0x300A  id0=0x53  id1=0x04  id2=0x41
+ *   OS05A10   id_reg_base=0x300A  id0=0x53  id1=0x05  id2=0x41
+ *             id_alt_reg=0x6000   id_alt=0x1c050a01
+ * The OS05A10 answers with a second, four-byte ID at 0x6000..0x6003 (read
+ * from a Reolink E340's sensor), and that one is what Novatek's
+ * nvt_sen_os05a10.ko probes (its SENSOR_ID 0x1c050a01).
  * Machines take them from the sensor catalogue (hw/i2c/image-sensor.c,
  * sensor "os04a10"), which sets these properties.
  *
@@ -32,6 +37,7 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/visitor.h"
@@ -39,7 +45,7 @@
 #define TYPE_AXERA_OV_SENSOR "axera-ov-sensor"
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraOvSensorState, AXERA_OV_SENSOR)
 
-#define OV_REG_COUNT 0x1000
+#define OV_REG_COUNT 0x4000
 #define OV_REG_BASE  0x3000
 
 struct AxeraOvSensorState {
@@ -50,6 +56,8 @@ struct AxeraOvSensorState {
     uint8_t  id0;
     uint8_t  id1;
     uint8_t  id2;
+    uint16_t id_alt_reg;   /* a second, four-byte ID; 0 = the part has none */
+    uint32_t id_alt;
 
     /* I2C state */
     uint8_t  reg_buf[2];   /* register address accumulator (big-endian) */
@@ -73,6 +81,10 @@ static void axera_ov_sensor_reset_regs(AxeraOvSensorState *s)
         s->regs[s->id_reg_base - OV_REG_BASE] = s->id0;
         s->regs[s->id_reg_base + 1 - OV_REG_BASE] = s->id1;
         s->regs[s->id_reg_base + 2 - OV_REG_BASE] = s->id2;
+    }
+    if (s->id_alt_reg >= OV_REG_BASE &&
+        s->id_alt_reg + 3 < OV_REG_BASE + OV_REG_COUNT) {
+        stl_be_p(&s->regs[s->id_alt_reg - OV_REG_BASE], s->id_alt);
     }
 }
 
@@ -212,12 +224,14 @@ static const Property axera_ov_sensor_props[] = {
     DEFINE_PROP_UINT8("id0", AxeraOvSensorState, id0, 0x00),
     DEFINE_PROP_UINT8("id1", AxeraOvSensorState, id1, 0x00),
     DEFINE_PROP_UINT8("id2", AxeraOvSensorState, id2, 0x00),
+    DEFINE_PROP_UINT16("id_alt_reg", AxeraOvSensorState, id_alt_reg, 0),
+    DEFINE_PROP_UINT32("id_alt", AxeraOvSensorState, id_alt, 0),
 };
 
 static const VMStateDescription vmstate_axera_ov_sensor = {
     .name = TYPE_AXERA_OV_SENSOR,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,     /* 2: registers up to 0x6FFF */
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, AxeraOvSensorState),
         VMSTATE_UINT8_ARRAY(reg_buf, AxeraOvSensorState, 2),
