@@ -46,6 +46,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(AxeraOvSensorState, AXERA_OV_SENSOR)
 
 #define OV_REG_COUNT 0x4000
+#define OV_REG_COUNT_V1 0x1000  /* what a version 1 migration stream holds */
 #define OV_REG_BASE  0x3000
 
 struct AxeraOvSensorState {
@@ -230,14 +231,23 @@ static const Property axera_ov_sensor_props[] = {
 
 static const VMStateDescription vmstate_axera_ov_sensor = {
     .name = TYPE_AXERA_OV_SENSOR,
-    .version_id = 2,     /* 2: registers up to 0x6FFF */
-    .minimum_version_id = 2,
+    /*
+     * Version 1 held the registers 0x3000..0x3FFF only. They keep their
+     * place in the stream so that a version 1 stream (an OS04A10's) still
+     * loads; the registers above them, up to 0x6FFF, follow as a version 2
+     * field, and a version 1 stream leaves them as reset set them.
+     */
+    .version_id = 2,
+    .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, AxeraOvSensorState),
         VMSTATE_UINT8_ARRAY(reg_buf, AxeraOvSensorState, 2),
         VMSTATE_UINT8(reg_ptr, AxeraOvSensorState),
         VMSTATE_UINT16(cur_reg, AxeraOvSensorState),
-        VMSTATE_UINT8_ARRAY(regs, AxeraOvSensorState, OV_REG_COUNT),
+        VMSTATE_UINT8_SUB_ARRAY(regs, AxeraOvSensorState, 0, OV_REG_COUNT_V1),
+        VMSTATE_SUB_ARRAY(regs, AxeraOvSensorState, OV_REG_COUNT_V1,
+                          OV_REG_COUNT - OV_REG_COUNT_V1, 2,
+                          vmstate_info_uint8, uint8_t),
         VMSTATE_END_OF_LIST()
     }
 };
