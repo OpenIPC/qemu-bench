@@ -87,6 +87,7 @@ From `nvt-basic.dtsi`, `nvt-peri.dtsi` and U-Boot's
 | SDIO 3 (eMMC host) | `0xF0510000` | 32 | `nvt-sdio`, an eMMC from `-drive if=sd,index=2` |
 | PWM | `0xF0210000` | 26 | `nvt-pwm` |
 | I2C 1 / 2 / 3 | `0xF0220000` / `0xF0350000` / `0xF03A0000` | 41 / 42 / 60 | `nvt-i2c` (`/dev/i2c-0..2`); `sensor=` puts a sensor on the first |
+| SPI 1 / 2 / 3 | `0xF0230000` / `0xF0320000` / `0xF0340000` | 35 / 36 / 37 | `nvt-spi` (`spi0..2`), empty buses |
 | USB 2.0 (FOTG200) | `0xF0600000`, alias `0xFF600000` | 27 | `nvt-usb`, host side; devices from `-device usb-*` |
 | OTP / eFuse | `0xF0660000` | | `nvt-otp`, blank |
 | Crypto (AES, DES, 3DES) | `0xF0620000` | 38 | `nvt-crypto` |
@@ -898,6 +899,74 @@ naming the part. `test-novatek.py` replays the driver's chunk sequences:
 the chip-ID read (address write, repeated START, read), writes and reads
 that span two chunks, a NACK and its STOP, and the `i2cdetect` quick
 write.
+
+## SPI
+
+`nvt-spi` is the general-purpose SPI master `spi-na51055.c` drives
+(`nvt,nvt_spi`, registers in `plat-na51089/spi_reg.h`). The NT9856x has
+three of them, for external chips such as a lens-motor driver. The
+addresses and interrupts are from the Reolink E340's stock device tree
+(NT98566). The generated tree has the same three nodes, named `spi@…`
+because the driver gets its clock by device name (`f0340000.spi`), with
+`nvt-devname` 0..2 (the bus number) and `dma-support = <0>`. The OpenIPC
+kernel has the driver built in and registers `spi0..2` from them.
+
+The driver sets a bus up and moves every transfer through the data
+registers, polling with no timeout, so each bit it waits for has to be
+there:
+
+- **CTRL (0x00):** SPI_EN (bit 0) and SPICS_VALUE (bit 1, the level forced
+  on the CS pin) read back as written. `nvt_spi_setup()` rewrites SPI_EN
+  until it reads back set, and `nvt_spi_set_npcs()` re-reads until
+  SPICS_VALUE matches.
+- **CONFIG (0x08):** packet length (bit 2: one byte or two), packets per
+  TDR write ([5:4], less one), LSB first (bit 0).
+- **TDR (0x24) / RDR (0x20):** a TDR write shifts the packets out, the
+  first from the low bits, and RDR holds what came back in the same
+  places.
+- **STS (0x18):** TDR_EMPTY (bit 0) always reads set, and RDR_FULL
+  (bit 1) reads set from a TDR write until RDR is read. A transfer
+  completes as soon as it is written. INTEN (0x1C) has the same bits, and
+  the interrupt is STS & INTEN.
+- IO (clock mode, pin direction), TIMING, DLY_CHAIN and the rest are
+  storage.
+
+Each instance has an SSI bus, `spi`, and a `cs` GPIO line that follows
+SPICS_VALUE; the machine names them `nvt-spi0..2`. The bus carries one
+byte per transfer. A two-byte packet is two transfers, the high byte
+first, or the low byte first when LSB first is set, and the two bytes
+that come back fill the same places in RDR. This order follows from the
+driver and the Linux SPI convention and has not been measured on
+hardware. The driver selects two-byte packets for `bits_per_word` 16,
+writes each word to TDR as the CPU holds it and sets LSB first from
+`SPI_LSB_FIRST`, and a Linux SPI word leaves most significant bit first
+unless that flag is set. Every byte reaches the slave with the value the
+driver wrote; clock mode and the bit order within a byte are left to the
+slave model. The interrupt and `cs` lines are driven again after a
+migration.
+
+Nothing is attached, and an empty bus reads 0. A board that attaches a
+slave connects `cs` to the slave's CS input. A slave added from the
+command line with `-device …,bus=spi` has no such connection, so its CS
+input never changes and it sees no end of a command. The reset values
+are not in the driver; CTRL resets with SPICS_VALUE set (CS high).
+
+Without the block the registers read 0 and `nvt_spi_setup()` never
+returns, so a firmware that loads an SPI device driver at boot hangs in
+that `insmod`. The E340's stock firmware does this with its lens-motor
+driver, `nvt_mtr_an41908.ko` (AN41908 on bus 1, mode 3, LSB first, CS
+active high). On an empty bus that driver reads zeros back, does not
+treat them as an error, and returns.
+
+NA51055 has the same block (`na51055-clk.c` lists the same three
+addresses, and two more), but no device tree here gives its interrupts,
+so the NT9852x machines leave it out.
+
+`test-novatek.py` replays the driver: setup with its two read-back
+loops, the `cs` line, polled bytes on an empty bus, four packets in one
+TDR write reading the JEDEC ID of a `w25q80` put on a bus with
+`-device w25q80,bus=spi`, two-byte packets, and each instance's
+interrupt.
 
 ## PWM
 
@@ -2127,6 +2196,11 @@ way: `bash qemu-boot/run-nt98562.sh -drive if=sd,format=raw,file=sd.img`.
 - I2C's DMA (VD-synchronised) transfers, and sensors other than the two
   SmartSens IDs, with nothing behind their registers (no MIPI, ISP or
   frames).
+- The SPI masters' DMA mode (the driver uses it only with
+  `dma-support = <1>`; the mode never starts, so such a tree would wait
+  for its interrupt forever), their flash-status and gyro polling modes,
+  the clock rate and sample delay, and any slave: no AN41908 motor
+  driver, so no lens position.
 - PWM micro-step (motor) mode, the cycle counters (CCNT), and the clock
   generator's real PWM dividers (cycle runs are timed at a nominal 30 MHz).
 - The Novatek timer's other cores (its DST routing and their status

@@ -165,6 +165,22 @@ static const struct {
 };
 
 /*
+ * NA51089's general-purpose SPI masters.  Addresses and interrupts are
+ * from the Reolink E340's stock device tree (spi@f0230000 / f0320000 /
+ * f0340000, "nvt,nvt_spi"); no other tree at hand has them.  spi-na51055.c
+ * names its clock after the device ("f0340000.spi") and takes the bus
+ * number from nvt-devname, the index here.
+ */
+static const struct {
+    hwaddr base;
+    int irq;
+} nvt_spi[] = {
+    { 0xF0230000, 35 },
+    { 0xF0320000, 36 },
+    { 0xF0340000, 37 },
+};
+
+/*
  * sensor= on I2C 0, where ipcinfo's Novatek HAL probes: the catalogue's
  * parts, of which OpenIPC's firmware has a driver (nvt_sen_<name>.ko) for
  * sc401ai and sc501ai.
@@ -946,6 +962,20 @@ static void *nvt_build_fdt(const struct arm_boot_info *info, int *size)
                             "nvt,nvt_pwm");
     qemu_fdt_setprop_cells(fdt, "/pwm@f0210000", "reg", NVT_PWM_BASE, 0x2000);
     nvt_fdt_irq(fdt, "/pwm@f0210000", NVT_IRQ_PWM);
+
+    /* dma-support 0, so the driver polls; DMA mode is not modelled. */
+    for (n = c->na51055 ? -1 : (int)ARRAY_SIZE(nvt_spi) - 1; n >= 0; n--) {
+        upath = g_strdup_printf("/spi@%" HWADDR_PRIx, nvt_spi[n].base);
+        qemu_fdt_add_subnode(fdt, upath);
+        qemu_fdt_setprop_string(fdt, upath, "compatible", "nvt,nvt_spi");
+        qemu_fdt_setprop_cells(fdt, upath, "reg", nvt_spi[n].base, 0x100);
+        nvt_fdt_irq(fdt, upath, nvt_spi[n].irq);
+        qemu_fdt_setprop_cell(fdt, upath, "dma-support", 0);
+        qemu_fdt_setprop_cell(fdt, upath, "nvt-devname", n);
+        qemu_fdt_setprop_cell(fdt, upath, "#address-cells", 1);
+        qemu_fdt_setprop_cell(fdt, upath, "#size-cells", 0);
+        g_free(upath);
+    }
 
     for (n = nvt_num_i2c(c) - 1; n >= 0; n--) {
         upath = g_strdup_printf("/%s@%" HWADDR_PRIx, nvt_i2c_node(n),
@@ -1870,6 +1900,21 @@ static void novatek_common_init(MachineState *machine, const NvtSoCConfig *c)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, NVT_PWM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[NVT_IRQ_PWM]);
+
+    /*
+     * NA51055 has the block too (its clock table lists these addresses),
+     * but no tree here gives its interrupts, so it stays unwired there.
+     * Named, so a board can reach each one's "spi" bus and "cs" line.
+     */
+    for (n = 0; !c->na51055 && n < ARRAY_SIZE(nvt_spi); n++) {
+        g_autofree char *name = g_strdup_printf("nvt-spi%d", n);
+
+        dev = qdev_new("nvt-spi");
+        object_property_add_child(OBJECT(machine), name, OBJECT(dev));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvt_spi[n].base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, pic[nvt_spi[n].irq]);
+    }
 
     for (n = 0; n < nvt_num_i2c(c); n++) {
         dev = sysbus_create_simple("nvt-i2c", nvt_i2c_base(n),

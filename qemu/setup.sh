@@ -270,6 +270,7 @@ cp qemu/hw/misc/nvt-ir.c            "$QEMU_DIR/hw/misc/"
 cp qemu/hw/gpio/nvt-gpio.c          "$QEMU_DIR/hw/gpio/"
 cp qemu/hw/rtc/nvt-rtc.c            "$QEMU_DIR/hw/rtc/"
 cp qemu/hw/ssi/nvt-flash.c          "$QEMU_DIR/hw/ssi/"
+cp qemu/hw/ssi/nvt-spi.c            "$QEMU_DIR/hw/ssi/"
 cp qemu/hw/sd/nvt-sdio.c            "$QEMU_DIR/hw/sd/"
 cp qemu/hw/net/nvt-eqos.c           "$QEMU_DIR/hw/net/"
 cp qemu/hw/usb/nvt-usb.c            "$QEMU_DIR/hw/usb/"
@@ -943,10 +944,11 @@ config NOVATEK
     select SDHCI
     select AT24C
     select USB_XHCI_SYSBUS
+    select SSI
 KCONFIG
     echo "  hw/arm/Kconfig: added NOVATEK"
 else
-    for sym in A9MPCORE ARM_GIC PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C AHCI_SYSBUS SDHCI AT24C USB_XHCI_SYSBUS; do
+    for sym in A9MPCORE ARM_GIC PL310 PTIMER SERIAL_MM UNIMP HISI_MISC SD USB_EHCI_SYSBUS HISI_I2C AHCI_SYSBUS SDHCI AT24C USB_XHCI_SYSBUS SSI; do
         if ! sed -n '/^config NOVATEK$/,/^$/p' "$QEMU_DIR/hw/arm/Kconfig" | \
                 grep -q "select $sym\$"; then
             sed -i "/^config NOVATEK\$/,/^\$/{/depends on TCG \&\& ARM\$/a\\    select $sym
@@ -955,7 +957,7 @@ else
         fi
     done
 fi
-for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-pixel misc/nvt-gfx misc/nvt-ai misc/nvt-md misc/nvt-ive misc/nvt-audio misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 display/nvt-ide display/nvt-dsi timer/nvt-timer timer/nvt-fttmr010 timer/nvt-hrtimer gpio/nvt-ftgpio010 i2c/nvt-ftiic010 dma/nvt-ftdmac030 misc/nvt-na51068-misc misc/nvt-adc misc/nvt-ddrc misc/nvt-hwcopy misc/nvt-ir gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
+for f in misc/nvt-top misc/nvt-cg misc/nvt-wdt misc/nvt-otp misc/nvt-pwm misc/nvt-crypto misc/nvt-hash misc/nvt-rsa misc/nvt-media misc/nvt-pixel misc/nvt-gfx misc/nvt-ai misc/nvt-md misc/nvt-ive misc/nvt-audio misc/nvt-dai misc/nvt-engine misc/nvt-hdmi display/nvt-lcd300 display/nvt-ide display/nvt-dsi timer/nvt-timer timer/nvt-fttmr010 timer/nvt-hrtimer gpio/nvt-ftgpio010 i2c/nvt-ftiic010 dma/nvt-ftdmac030 misc/nvt-na51068-misc misc/nvt-adc misc/nvt-ddrc misc/nvt-hwcopy misc/nvt-ir gpio/nvt-gpio rtc/nvt-rtc ssi/nvt-flash ssi/nvt-spi sd/nvt-sdio net/nvt-eqos usb/nvt-usb i2c/nvt-i2c; do
     if ! grep -q "'${f#*/}.c'" "$QEMU_DIR/hw/${f%/*}/meson.build"; then
         echo "system_ss.add(when: 'CONFIG_NOVATEK', if_true: files('${f#*/}.c'))" \
             >> "$QEMU_DIR/hw/${f%/*}/meson.build"
